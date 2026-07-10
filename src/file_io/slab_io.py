@@ -24,14 +24,11 @@ The legacy ``use_ffi_io: bool`` kwarg is still accepted on every entry
 point and silently coerced via :func:`_normalize_slab_backend` — pass
 the enum in new code.
 
-Three primitives:
+One primitive:
 
 - ``SlabIO`` — context manager for files that see multiple writes
   (the isdf_fitting zeta loop, ppm_sigma stream).  Opens once,
-  creates/ensures datasets, writes/reads/accumulates, closes.
-- ``write_slab`` / ``read_slab`` / ``accumulate_slab`` — single-shot
-  free functions, open+op+close.  Equivalent to a one-line ``with
-  SlabIO(...) as io: io.X(...)``.
+  creates/ensures datasets, writes/reads, closes.
 
 All methods accept an ``offset`` N-tuple giving where the local slab
 lands in the dataset.  ``valid_shape`` defaults to ``A.shape`` for
@@ -50,12 +47,7 @@ import jax
 
 from ._slab_io_allgather import _AllgatherBackend
 
-__all__ = [
-    "SlabIO",
-    "write_slab",
-    "read_slab",
-    "accumulate_slab",
-]
+__all__ = ["SlabIO"]
 
 
 def _normalize_slab_backend(backend, use_ffi_io):
@@ -286,89 +278,3 @@ class SlabIO:
         if as_numpy and not isinstance(arr, np.ndarray):
             arr = np.asarray(jax.device_get(arr))
         return arr
-
-    def accumulate_slab(
-        self,
-        name: str,
-        A,
-        *,
-        offset: Sequence[int] | None = None,
-    ) -> None:
-        """``dset[offset : offset+A.shape] += A`` (read-modify-write).
-
-        Used by the Σ_c(ω) stream-mode accumulator in ppm_sigma.  The
-        default backend does the gather-then-rank-0-RMW that
-        ppm_sigma already does today; the FFI backend does a collective
-        read → add → collective write at the same hyperslab, which
-        lifts today's single-process restriction on stream mode.
-        """
-        self._backend.accumulate_slab(name, A, offset=offset)
-
-
-# ---------------------------------------------------------------------------
-# Single-shot free functions
-# ---------------------------------------------------------------------------
-def write_slab(
-    path: str,
-    ds_name: str,
-    A,
-    *,
-    offset: Sequence[int] | None = None,
-    global_shape: Sequence[int] | None = None,
-    valid_shape: Sequence[int] | None = None,
-    mesh=None,
-    mode: str = "a",
-    chunks: Sequence[int] | None = None,
-    attrs: dict | None = None,
-    backend=None,
-    use_ffi_io: bool | None = None,
-) -> None:
-    """Open + write + close for a one-off dataset write."""
-    with SlabIO(path, mode=mode, mesh=mesh,
-                backend=backend, use_ffi_io=use_ffi_io) as io:
-        gshape = global_shape if global_shape is not None else tuple(A.shape)
-        # Pre-create with user-provided chunks/attrs on first write.
-        io.create_dataset(
-            ds_name, shape=gshape, dtype=A.dtype,
-            chunks=chunks, attrs=attrs)
-        io.write_slab(
-            ds_name, A, offset=offset, global_shape=gshape,
-            valid_shape=valid_shape)
-
-
-def read_slab(
-    path: str,
-    ds_name: str,
-    *,
-    shape: Sequence[int] | None = None,
-    dtype=None,
-    offset: Sequence[int] | None = None,
-    valid_shape: Sequence[int] | None = None,
-    mesh=None,
-    partition_spec=None,
-    backend=None,
-    use_ffi_io: bool | None = None,
-) -> jax.Array:
-    """Open + read + close for a one-off dataset read."""
-    with SlabIO(path, mode="r", mesh=mesh,
-                backend=backend, use_ffi_io=use_ffi_io) as io:
-        return io.read_slab(
-            ds_name, shape=shape, dtype=dtype, offset=offset,
-            valid_shape=valid_shape,
-            mesh=mesh, partition_spec=partition_spec)
-
-
-def accumulate_slab(
-    path: str,
-    ds_name: str,
-    A,
-    *,
-    offset: Sequence[int] | None = None,
-    mesh=None,
-    backend=None,
-    use_ffi_io: bool | None = None,
-) -> None:
-    """Open + read-modify-write + close for a one-off accumulate."""
-    with SlabIO(path, mode="a", mesh=mesh,
-                backend=backend, use_ffi_io=use_ffi_io) as io:
-        io.accumulate_slab(ds_name, A, offset=offset)

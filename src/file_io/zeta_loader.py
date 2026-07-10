@@ -1,52 +1,37 @@
-"""``ZetaLoader`` — single entry point for ζ(r) loading from ``zeta_q.h5``.
+"""``ZetaLoader`` — the single reader for ``zeta_q.h5``.
 
-Mirrors :class:`file_io.wfn_loader.WfnLoader`: one ``.load`` call covers
-the common windows, ``q`` strings give symbolic ranges, header attrs
-match the legacy :class:`ZetaReader` 1:1.
+One class covers both read surfaces (they were previously split across a
+``ZetaReader``/``ZetaLoader`` pair with duplicated header/lifecycle code;
+merged 2026-07-09):
 
-API
----
+* **Slab API** (the production V_q reader of record):
+  :meth:`read_zeta_r_slab` / :meth:`read_zeta_G_slab` — explicit
+  ``(q_offset, q_count, mu_offset, mu_count)`` windows, ``valid_mu``
+  trailing-μ zero-fill for padded reads.
+* **Load API** (WfnLoader-shaped, test bench + future consumers):
+  :meth:`load` — symbolic ``q='ibz' | 'full_bz' | seq[int]`` ranges,
+  μ slices, and the IBZ→full-BZ symmetry unfold of ζ(r).
 
-::
+Header surface: eager :class:`MfHeader` attributes (``nspin``,
+``kgrid``, ``fft_grid``, ``sym_matrices``, …) and :class:`IsdfHeader`
+attributes (``vertex_mu_L``, ``r_mu_fft_idx``, ``n_rmu``,
+``zeta_layout``, …) — same names ``WFNReader`` exposes, so a
+``ZetaLoader`` drops in wherever a ``WFNReader`` was used for header
+information.
 
-    with ZetaLoader(path, mesh=mesh_xy) as loader:
-        # mf_header + isdf_header attrs — same names ZetaReader exposes.
-        loader.nspin, loader.fft_grid, loader.n_rmu, loader.vertex_mu_L
+On-disk layouts: legacy r-space files store ``zeta_q`` shape
+``(n_q, n_rtot, n_rmu)``; G-flat files store ``zeta_q_G`` shape
+``(n_q, n_rmu_padded, ngkmax)`` (WFN.h5 ``coeffs`` style, per-q sphere
+from ``isdf_header/gvec_components``).  IBZ-only q-axes are detected
+from the disk shape (``q_layout``); full-BZ callers unfold post-V_q via
+:func:`common.symmetry_maps.unfold_v_q` (or ``load(q='full_bz')`` for
+the r-space ζ itself).
 
-        # On-disk q-layout (IBZ-only or full-BZ) — detected from disk shape.
-        loader.q_layout           # 'ibz' | 'full_bz'
-        loader.n_q_on_disk        # rows in ``zeta_q``
-        loader.n_q_full           # ∏ kgrid (always)
-        loader.zeta_is_done       # restart guard, False until writer's mark.
-
-        # Slice-style read.  q='ibz' returns every on-disk q; q='full_bz'
-        # returns the symmetry-unfolded full-BZ ζ (see Pass-2 note below).
-        # ``layout='r_space'`` is the default (legacy callers).  Once V_q
-        # is fully on the G-flat path, the default flips to ``'G_flat'``.
-        zeta = loader.load(
-            q='ibz',                                 # 'ibz' | 'full_bz' | seq[int]
-            mu=(0, n_rmu),                           # half-open μ range; None = all
-            sharding=P(None, None, ('x', 'y')),      # default for r_space
-            layout='r_space',
-        )
-
-Backends
---------
-* ``eager``   — host h5py read, then ``jax.device_put``.  Single-process,
-  CPU JAX, or small files.
-* ``phdf5``   — collective FFI read via :class:`SlabIO`.  Multi-rank GPU
-  + 2-D mesh; same path the existing ``ZetaReader`` uses.
-* ``auto``    — ``phdf5`` if a multi-process mesh is present, else
-  ``eager``.
-
-Pass-2 plan
------------
-``q='full_bz'`` is rejected with ``NotImplementedError`` in Pass-1.
-The mathematically-correct unfold is ``ζ_full[q, r, μ] = ζ_ibz[i(q),
-S_{s(q)}·r + τ_{s(q)}, π_{s(q)}^{-1}(μ)]``  (eq. 3 of
-``reports/zeta_ibz_2026-05-11/report.md``).  The r-permutation table
-needs ``compute_rgrid_sym_perm`` to land before this can be wired —
-adding that in a follow-up commit alongside the ``q='full_bz'`` test.
+I/O backend: all data reads go through one :class:`SlabIO` handle, held
+open for the loader's lifetime to amortise open/close on the FFI
+backend.  ``backend`` takes the same :class:`~gw.gw_config.SlabIOBackend`
+value every other SlabIO consumer uses (``None`` = SlabIO's own
+auto-route).  Use as a context manager or call :meth:`close`.
 """
 from __future__ import annotations
 
@@ -73,7 +58,7 @@ LayoutSpec = Literal["r_space", "G_flat"]
 
 
 class ZetaLoader:
-    """Reader for ``zeta_q.h5`` with a :class:`WfnLoader`-shaped surface."""
+    """Reader for ``zeta_q.h5`` produced by ``isdf_fitting.fit_zeta_to_h5``."""
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -83,72 +68,52 @@ class ZetaLoader:
         path: str | Path,
         *,
         mesh: Mesh | None = None,
-        backend: Literal["auto", "eager", "phdf5"] = "auto",
+        backend=None,
         mode: str = "r",
     ) -> None:
         self._path = str(path)
         self._mesh = mesh
 
-        if backend == "auto":
-            backend = self._auto_pick_backend()
-        if backend not in ("eager", "phdf5"):
-            raise ValueError(f"unknown backend {backend!r}")
-        if backend == "phdf5" and mesh is None:
-            raise ValueError(
-                "ZetaLoader: backend='phdf5' requires a Mesh; pass mesh=...")
-        self.backend = backend
-
-        # Read both headers in one open; reused by load() for shape probes.
-        # Dataset name depends on layout: ``zeta_q`` (r-space, legacy)
-        # vs ``zeta_q_G`` (G-flat — WFN.h5 ``coeffs`` style, padded to
-        # ``ngkmax``).
+        # Read both headers + the ζ dataset shape in one open.
         with h5.File(self._path, "r") as f:
             mf = read_mf_header_from_file(f)
             isdf = read_isdf_header_from_file(f)
             _ds_name = ('zeta_q_G' if isdf.zeta_layout == 'G_flat'
-                         else 'zeta_q')
+                        else 'zeta_q')
             zeta_shape = tuple(int(x) for x in f[_ds_name].shape)
         self._mf = mf
         self._isdf = isdf
         self._zeta_dataset_name = _ds_name
+        self._zeta_disk_shape = zeta_shape
 
-        # mf_header attribute surface — same names ZetaReader exposes
-        # (drop-in source for callers).
+        # mf_header + isdf_header attribute surfaces (WFNReader-shaped).
         bind_mf_attrs(self, mf)
-
-        # isdf_header attribute surface.
         bind_isdf_attrs(self, isdf)
 
         # On-disk q-axis classification.  Dataset shape differs by layout:
-        #   r-space: (n_q_disk, n_rtot,        n_rmu) — n_rtot at axis 1
-        #   G-flat:  (n_q_disk, n_rmu_padded,  ngkmax) — μ at axis 1
-        # so ``n_rtot_disk`` is meaningful only for the r-space case.
+        #   r-space: (n_q_disk, n_rtot,       n_rmu)  — n_rtot at axis 1
+        #   G-flat:  (n_q_disk, n_rmu_padded, ngkmax) — μ at axis 1
         self.n_q_on_disk = int(zeta_shape[0])
         if self.zeta_layout == 'G_flat':
-            self.n_rtot_disk = None
+            # ``n_rtot_disk`` is kept meaningful (= ∏ fft_grid) for code
+            # that probes the r-extent; n_G_sph_disk is the per-q padded
+            # sphere size.
+            nx, ny, nz = (int(s) for s in self.fft_grid)
+            self.n_rtot_disk = nx * ny * nz
             self.n_rmu_disk = int(zeta_shape[1])
+            self.n_G_sph_disk = int(zeta_shape[2])
         else:
             self.n_rtot_disk = int(zeta_shape[1])
             self.n_rmu_disk = int(zeta_shape[2])
+            self.n_G_sph_disk = None
         self.n_q_full = int(np.prod(self.kgrid))
         self.q_layout: Literal["ibz", "full_bz"] = (
             "full_bz" if self.n_q_on_disk == self.n_q_full else "ibz")
 
         # SlabIO handle (held open for the loader's lifetime so the
-        # phdf5 FFI ctx is reused across reads — same pattern as the
-        # existing ZetaReader).  SlabIO's own backend autoselect picks
-        # the right path from the mesh; ``backend`` on ZetaLoader is
-        # currently advisory (eager vs phdf5 affects the validation
-        # above, not yet the slab read).
+        # phdf5 FFI ctx is reused across reads).
         self._slab_io: SlabIO | None = SlabIO(
-            self._path, mode=mode, mesh=mesh)
-
-    # ------------------------------------------------------------------
-    def _auto_pick_backend(self) -> str:
-        # Multi-rank GPU + mesh ⇒ phdf5; everything else ⇒ eager.
-        if self._mesh is not None and jax.process_count() > 1:
-            return "phdf5"
-        return "eager"
+            self._path, mode=mode, mesh=mesh, backend=backend)
 
     # ------------------------------------------------------------------
     def close(self) -> None:
@@ -180,7 +145,148 @@ class ZetaLoader:
         return self._slab_io
 
     # ------------------------------------------------------------------
-    # The load contract
+    # Slab API (production V_q reader of record)
+    # ------------------------------------------------------------------
+    def read_zeta_r_slab(
+        self,
+        *,
+        q_offset: int,
+        q_count: int,
+        mu_offset: int,
+        mu_count: int,
+        mesh: Mesh | None = None,
+        partition_spec=P(None, None, ('x', 'y')),
+        valid_mu: int | None = None,
+    ) -> jax.Array:
+        """Read an r-space ζ slab.
+
+        Returns ``(q_count, n_rtot, mu_count)`` complex128, sharded
+        per ``partition_spec``.  Trailing μ pad slots are zero-filled
+        when ``mu_offset + mu_count`` exceeds the logical extent and
+        ``valid_mu`` is set.
+        """
+        if mesh is None:
+            mesh = self._mesh
+        n_rtot = self.n_rtot_disk
+        valid_count = (mu_count if valid_mu is None else valid_mu)
+        return self.slab_io.read_slab(
+            'zeta_q',
+            shape=(int(q_count), int(n_rtot), int(mu_count)),
+            valid_shape=(int(q_count), int(n_rtot), int(valid_count)),
+            dtype=np.complex128,
+            offset=(int(q_offset), 0, int(mu_offset)),
+            mesh=mesh,
+            partition_spec=partition_spec,
+        )
+
+    def read_zeta_G_slab(
+        self,
+        *,
+        q_offset: int,
+        q_count: int,
+        mu_offset: int,
+        mu_count: int,
+        qvec_batch_frac: jax.Array,
+        sphere_idx: jax.Array | None,
+        mesh: Mesh | None = None,
+        valid_mu: int | None = None,
+    ) -> jax.Array:
+        """Read ζ in G-flat layout.
+
+        G-flat-on-disk files return the ``(Q, μ, ngkmax)`` slab directly
+        (per-q phase already baked in by the writer).  Legacy r-space
+        files go through: r-space slab read → per-q Bloch phase → 3D FFT
+        (μ-sharded) → sphere gather (:func:`_do_disk_to_G`).
+
+        Returns
+        -------
+        zeta_G : jax.Array
+            Shape ``(q_count, μ_per_rank, n_G_sph)`` complex128,
+            sharded ``P(None, ('x','y'), None)``.
+
+        Parameters
+        ----------
+        q_offset, q_count : int
+            Slab range along the on-disk q axis.  Caller-managed
+            indexing — under IBZ-only layouts the offset is the IBZ
+            index.
+        mu_offset, mu_count : int
+            Slab range along the μ axis (centroid axis).
+        qvec_batch_frac : jax.Array
+            ``(Q, 3)`` fractional q-vectors in kgrid units (BGW
+            wrapped-to-(-nk/2, nk/2) divided by kgrid).  Used to apply
+            the per-q FFT-box phase separably on the r-space path;
+            ignored for G-flat-on-disk files.
+        sphere_idx : jax.Array | None
+            Flat-FFT indices that define the G-sphere (or None to
+            keep the full FFT box).
+        mesh : Mesh | None
+            Override of the loader's stored mesh.
+        valid_mu : int | None
+            Logical μ extent if smaller than ``mu_count`` (pad-aware
+            reads).
+        """
+        if mesh is None:
+            mesh = self._mesh
+
+        nx, ny, nz = (int(s) for s in self.fft_grid)
+        n_rtot = nx * ny * nz
+        if sphere_idx is not None:
+            n_G_sph = int(np.asarray(sphere_idx).shape[0])
+        else:
+            n_G_sph = n_rtot
+        sphere_jx = (jnp.asarray(sphere_idx, dtype=jnp.int32)
+                     if sphere_idx is not None else None)
+
+        if self.zeta_layout == 'G_flat':
+            # File is already G-flat.  Read the (q_count, mu_count,
+            # ngkmax) slab directly.  ``qvec_batch_frac`` is ignored
+            # — the per-q phase is already baked into the on-disk
+            # tensor by the writer.  The G-axis on disk is now a
+            # **per-q** WFN.h5-style sphere of size ``ngkmax``
+            # (positions vary per q via ``isdf_header/gvec_components``),
+            # so a single shared ``sphere_idx`` can NOT be used to
+            # narrow with one ``jnp.take`` — that would pick the same
+            # disk position for every q, which is per-q wrong.
+            # The proper per-q scatter to a consumer's shared sphere
+            # via the components table belongs in the V_q wrapper and
+            # is not implemented here yet.
+            n_G_sph_disk = int(self.n_G_sph_disk)
+            valid_count = (mu_count if valid_mu is None else int(valid_mu))
+            zeta_g_disk = self.slab_io.read_slab(
+                self._zeta_dataset_name,
+                shape=(int(q_count), int(mu_count), n_G_sph_disk),
+                valid_shape=(int(q_count), int(valid_count), n_G_sph_disk),
+                dtype=np.complex128,
+                offset=(int(q_offset), int(mu_offset), 0),
+                mesh=mesh,
+                partition_spec=P(None, ('x', 'y'), None),
+            )
+            if sphere_jx is not None and n_G_sph != n_G_sph_disk:
+                raise NotImplementedError(
+                    "ZetaLoader.read_zeta_G_slab: on-disk per-q sphere "
+                    f"(ngkmax={n_G_sph_disk}) ≠ caller's shared sphere "
+                    f"(n_G_sph={n_G_sph}).  Per-q → shared-sphere "
+                    "scatter via gvec_components is not yet wired into "
+                    "the V_q hot loop; pass sphere_idx=None to consume "
+                    "the raw slab, or refit with the r-space writer.")
+            return zeta_g_disk
+
+        # Legacy 'r_space' path: read r-space slab + FFT + sphere gather.
+        zeta_disk = self.read_zeta_r_slab(
+            q_offset=q_offset, q_count=q_count,
+            mu_offset=mu_offset, mu_count=mu_count,
+            mesh=mesh, valid_mu=valid_mu,
+        )
+
+        return _do_disk_to_G(
+            zeta_disk, qvec_batch_frac,
+            mesh_xy=mesh, fft_shape=(nx, ny, nz),
+            n_G_sph=n_G_sph, sphere_idx=sphere_jx,
+        )
+
+    # ------------------------------------------------------------------
+    # Load API (WfnLoader-shaped)
     # ------------------------------------------------------------------
     def load(
         self,
@@ -200,9 +306,8 @@ class ZetaLoader:
         q
             ``'ibz'``      — every row on disk (works for both IBZ and
                               full-BZ on-disk layouts).
-            ``'full_bz'``  — symmetry-unfolded full-BZ ζ.  Not yet
-                              implemented (Pass-2; raises
-                              ``NotImplementedError``).
+            ``'full_bz'``  — symmetry-unfolded full-BZ ζ (r-space files
+                              only; G-flat unfold not yet wired).
             ``Sequence[int]`` — explicit row indices into the on-disk
                               q-axis.  For IBZ-on-disk layouts these are
                               IBZ-row indices.
@@ -212,9 +317,7 @@ class ZetaLoader:
         sharding
             Output partition spec.  Defaults to the layout-appropriate
             spec (``P(None, None, ('x','y'))`` for ``r_space``,
-            ``P(None, ('x','y'), None)`` for ``G_flat``).  Pass ``None``
-            to keep the default; pass an explicit ``PartitionSpec`` to
-            override.
+            ``P(None, ('x','y'), None)`` for ``G_flat``).
         layout
             ``'r_space'``   — ``(Q, n_rtot, μ)`` complex128 (default).
             ``'G_flat'``    — ``(Q, μ/p_prod, n_G_sph)`` complex128.
@@ -242,13 +345,6 @@ class ZetaLoader:
                         else P(None, ('x', 'y'), None))
 
         # --- Disk-native G-flat: read direct, no FFT ------------------
-        # The current writer always produces G-flat on disk
-        # — slab on disk is ``(Q, μ, ngkmax)``, WFN.h5 ``coeffs`` style.
-        # Reading ``layout='r_space'`` would require an inverse FFT
-        # we don't support yet; ``layout='G_flat'`` returns the slab as-is
-        # (caller's sphere_idx / qvec_frac are accepted for API
-        # symmetry but only used to scatter into the consumer's
-        # shared sphere downstream).
         if self.zeta_layout == 'G_flat':
             if layout == 'r_space':
                 raise NotImplementedError(
@@ -288,13 +384,12 @@ class ZetaLoader:
         if layout == 'r_space':
             return zeta_r
 
-        # layout == 'G_flat' — same pipeline as the legacy ZetaReader.
+        # layout == 'G_flat' — same disk→G pipeline as read_zeta_G_slab.
         if qvec_frac is None or sphere_idx is None:
             raise ValueError(
                 "ZetaLoader.load(layout='G_flat') requires both "
                 "``qvec_frac`` and ``sphere_idx`` (used for the per-q "
                 "FFT-box phase and sphere gather).")
-        from .zeta_reader import _do_disk_to_G
         nx, ny, nz = (int(s) for s in self.fft_grid)
         n_G_sph = int(np.asarray(sphere_idx).shape[0])
         return _do_disk_to_G(
@@ -432,11 +527,8 @@ class ZetaLoader:
         """
         full_to_irr_idx, full_to_irr_sym, r_perm, mu_perm = (
             self._full_bz_unfold_tables())
-        n_q_full = int(self.n_q_full)
-        n_rtot = int(self.n_rtot_disk)
 
         # Slice mu_perm columns to the requested μ window.
-        mu_slice = slice(mu_lo, mu_lo + mu_count)
         # inv_mu[s, μ_new] = μ_old such that mu_perm[s, μ_old] = μ_new.
         inv_mu_full = np.argsort(mu_perm, axis=-1).astype(np.int32)  # (n_sym, n_rmu)
         # When μ window != full μ axis, inv_mu needs to be clipped to
@@ -492,7 +584,7 @@ class ZetaLoader:
         if _is_contiguous(q_indices):
             q_offset = int(q_indices[0])
             q_count = int(q_indices.size)
-            return self._slab_io.read_slab(
+            return self.slab_io.read_slab(
                 'zeta_q_G',
                 shape=(q_count, mu_count, ngkmax),
                 valid_shape=(q_count, valid_mu, ngkmax),
@@ -504,7 +596,7 @@ class ZetaLoader:
 
         rows = []
         for qi in q_indices:
-            row = self._slab_io.read_slab(
+            row = self.slab_io.read_slab(
                 'zeta_q_G',
                 shape=(1, mu_count, ngkmax),
                 valid_shape=(1, valid_mu, ngkmax),
@@ -537,7 +629,7 @@ class ZetaLoader:
         if _is_contiguous(q_indices):
             q_offset = int(q_indices[0])
             q_count = int(q_indices.size)
-            return self._slab_io.read_slab(
+            return self.slab_io.read_slab(
                 'zeta_q',
                 shape=(q_count, self.n_rtot_disk, mu_count),
                 valid_shape=(q_count, self.n_rtot_disk, valid_mu),
@@ -552,7 +644,7 @@ class ZetaLoader:
         # for diagnostics) but not the V_q hot loop.
         rows = []
         for qi in q_indices:
-            row = self._slab_io.read_slab(
+            row = self.slab_io.read_slab(
                 'zeta_q',
                 shape=(1, self.n_rtot_disk, mu_count),
                 valid_shape=(1, self.n_rtot_disk, valid_mu),
@@ -566,8 +658,84 @@ class ZetaLoader:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Internal: r-space slab → G-flat — module-level so the jitted helpers
+# cache across calls and don't recompile per-ZetaLoader instance.
 # ---------------------------------------------------------------------------
+
+_disk_to_G_cache: dict = {}
+
+
+def _do_disk_to_G(
+    zeta_disk: jax.Array,
+    qvec_batch_frac: jax.Array,
+    *,
+    mesh_xy: Mesh,
+    fft_shape: tuple[int, int, int],
+    n_G_sph: int,
+    sphere_idx: jax.Array | None,
+) -> jax.Array:
+    """r-space ζ slab + per-q fractional q-vec → G-flat ζ.
+
+    Pipeline: transpose → reshape to ``(Q, μ, nx, ny, nz)`` → apply
+    separable per-q Bloch phase ``exp(-2πi q·r)`` via
+    :func:`common.wfn_transforms.apply_bloch_phase` → 3D FFT (μ-sharded)
+    → sphere gather.
+
+    Cached by ``(mesh_xy, shape, n_G_sph, sphere_idx)``.
+    """
+    from common.fft_helpers import make_sharded_fftn_3d
+    from common.wfn_transforms import apply_bloch_phase
+
+    nx, ny, nz = (int(s) for s in fft_shape)
+    n_rtot = nx * ny * nz
+    Q, n_rtot_in, mu_total = (int(s) for s in zeta_disk.shape)
+    if n_rtot_in != n_rtot:
+        raise ValueError(
+            f"_do_disk_to_G: ζ slab n_rtot={n_rtot_in} disagrees with "
+            f"FFT grid product {n_rtot}.")
+
+    key = (
+        id(mesh_xy), Q, mu_total, nx, ny, nz, int(n_G_sph),
+        id(sphere_idx),
+    )
+    fn = _disk_to_G_cache.get(key)
+    if fn is None:
+        blk_xy_sh = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+        blk_xy_5d_sh = NamedSharding(
+            mesh_xy, P(None, ('x', 'y'), None, None, None))
+        local_fftn = make_sharded_fftn_3d(
+            mesh_xy, P(None, ('x', 'y'), None, None, None),
+            P(None, ('x', 'y'), None, None, None))
+        qvec_sh = NamedSharding(mesh_xy, P(None, None))
+        zeta_disk_sh = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+
+        @partial(
+            jax.jit,
+            in_shardings=(zeta_disk_sh, qvec_sh),
+            out_shardings=blk_xy_sh,
+        )
+        def _f(z, qvec_frac):
+            # (Q, n_rtot, mu) → (Q, mu, n_rtot) → (Q, mu, nx, ny, nz)
+            z = jax.lax.with_sharding_constraint(
+                jnp.transpose(z, (0, 2, 1)), blk_xy_sh)
+            Qd, mu_d, _ = z.shape
+            z5 = z.reshape(Qd, mu_d, nx, ny, nz)
+            z5 = apply_bloch_phase(z5, qvec_frac, (nx, ny, nz), sign=-1)
+            z5 = jax.lax.with_sharding_constraint(z5, blk_xy_5d_sh)
+            box = local_fftn(z5)
+            box = jax.lax.with_sharding_constraint(
+                box.reshape(Qd, mu_d, n_rtot), blk_xy_sh)
+            if sphere_idx is not None:
+                z_G = jnp.take(box, sphere_idx, axis=-1)
+            else:
+                z_G = box
+            return jax.lax.with_sharding_constraint(z_G, blk_xy_sh)
+
+        _disk_to_G_cache[key] = _f
+        fn = _f
+
+    return fn(zeta_disk, qvec_batch_frac)
+
 
 def _is_contiguous(arr: np.ndarray) -> bool:
     if arr.size <= 1:

@@ -13,7 +13,6 @@ This module contains:
 
 from .wfn_loader import WfnLoader
 from .zeta_loader import ZetaLoader
-from .zeta_reader import ZetaReader  # legacy slab-only reader (kept for now)
 # Back-compat alias: every active caller uses ``WFNReader(path)`` as a
 # pure-metadata accessor today.  ``WfnLoader`` covers that surface 1:1
 # (mf_header attributes mirrored verbatim; ``_filename`` exposed for

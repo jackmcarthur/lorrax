@@ -396,14 +396,14 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			# μ × ν tiling / in-V_q FFT — see
 			# gw.v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5.
 			from .v_q_bispinor import compute_V_q_bispinor_g_flat_to_h5
-			from file_io.zeta_reader import ZetaReader
-			with ZetaReader(zeta_h5_path, mesh=mesh_xy,
+			from file_io.zeta_loader import ZetaLoader
+			with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
 			                backend=cfg.backend.slab_io) as zc, \
-			     ZetaReader(zeta_T_paths[0], mesh=mesh_xy,
+			     ZetaLoader(zeta_T_paths[0], mesh=mesh_xy,
 			                backend=cfg.backend.slab_io) as zt1, \
-			     ZetaReader(zeta_T_paths[1], mesh=mesh_xy,
+			     ZetaLoader(zeta_T_paths[1], mesh=mesh_xy,
 			                backend=cfg.backend.slab_io) as zt2, \
-			     ZetaReader(zeta_T_paths[2], mesh=mesh_xy,
+			     ZetaLoader(zeta_T_paths[2], mesh=mesh_xy,
 			                backend=cfg.backend.slab_io) as zt3:
 				with mesh_xy:
 					compute_V_q_bispinor_g_flat_to_h5(
@@ -450,11 +450,11 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# Scalar (non-bispinor) path.  ``compute_all_V_q`` dispatches on
 		# the on-disk ζ layout: G-flat (the only thing fit_zeta writes)
 		# routes to ``v_q_g_flat.compute_all_V_q_g_flat``; any other
-		# layout raises.  ``ZetaReader`` is the V_q reader of record —
+		# layout raises.  ``ZetaLoader`` is the V_q reader of record —
 		# it serves the writer's per-q WFN.h5-style G-sphere directly.
-		from file_io.zeta_reader import ZetaReader
+		from file_io.zeta_loader import ZetaLoader
 		with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
-			with ZetaReader(zeta_h5_path, mesh=mesh_xy,
+			with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
 			                backend=cfg.backend.slab_io) as zeta_io:
 				with mesh_xy:
 					V_q_raw, G0_all = compute_all_V_q(

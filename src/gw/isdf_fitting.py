@@ -206,11 +206,6 @@ def fit_zeta_to_h5(
     from gw.gw_config import SlabIOBackend
     if slab_io_backend is None:
         slab_io_backend = SlabIOBackend.H5PY_ALLGATHER
-    # Treat both per-rank-parallel-write PHDF5 backends (FFI on GPU,
-    # mpi_host on CPU) as the "fast write" path; only H5PY_ALLGATHER
-    # uses the rank-0-gather code below.
-    use_ffi_io = slab_io_backend in (
-        SlabIOBackend.PHDF5_FFI, SlabIOBackend.PHDF5_HOST)
 
     # P0 — entry of ζ-fit.  Captures the persistent state set up by
     # ``prepare_isdf_and_wavefunctions`` BEFORE ζ-fit starts: ψ at
@@ -527,7 +522,7 @@ def fit_zeta_to_h5(
     # (n_G_sph = n_rtot) — slow disk path, kept for sanity checks.
     if q_irr_frac is None:
         # Full-BZ q-vectors with BGW wrap, then / kgrid — same convention
-        # the V_q consumer's disk→G path (``zeta_reader._do_disk_to_G``)
+        # the V_q consumer's disk→G path (``zeta_loader._do_disk_to_G``)
         # expects, via the local ``_bgw_wrap_q``.
         _kgrid_arr_for_qfrac = np.asarray(meta.kgrid, dtype=np.float64)
         q_irr_frac = (_bgw_wrap_q(sym.kvecs_asints)
@@ -569,7 +564,7 @@ def fit_zeta_to_h5(
 
     # ``zeta_q.h5`` carries the BGW-style ``mf_header`` verbatim from
     # the source WFN so any downstream consumer (the new
-    # :class:`file_io.zeta_reader.ZetaReader`, or anything else that
+    # :class:`file_io.zeta_loader.ZetaLoader`, or anything else that
     # speaks the WFN.h5 header) sees the same crystal / k-grid / G-grid
     # / symmetry view.  ``isdf_header`` holds ζ-specific metadata only
     # — centroids in FFT-grid + fractional coords, density label,

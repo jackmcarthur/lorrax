@@ -26,7 +26,7 @@ from common.coulomb_sphere import compute_per_q_bare_coulomb_components
 from file_io.isdf_header import IsdfHeader, write_isdf_header
 from file_io.mf_header import copy_mf_header
 from file_io.zeta_loader import ZetaLoader
-from file_io.zeta_reader import ZetaReader
+ZetaReader = ZetaLoader  # merged 2026-07-09; slab API lives on ZetaLoader
 from gw.v_q_bispinor import (
     compute_V_q_bispinor_g_flat_to_h5,
     _make_per_q_v_builder_for_tile,

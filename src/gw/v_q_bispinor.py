@@ -152,8 +152,8 @@ def _make_per_q_v_builder_for_tile(
 
 def compute_V_q_bispinor_g_flat_to_h5(
     *,
-    zeta_C_loader,                              # ZetaReader/Loader, charge ζ (G-flat)
-    zeta_T_loaders: tuple,                      # length-3 ZetaReader/Loader, μ_L=1,2,3 (G-flat)
+    zeta_C_loader,                              # ZetaLoader, charge ζ (G-flat)
+    zeta_T_loaders: tuple,                      # length-3 ZetaLoader, μ_L=1,2,3 (G-flat)
     output_h5_path: Path | str,
     mesh_xy: Mesh,
     kgrid: tuple[int, int, int],

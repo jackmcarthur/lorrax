@@ -14,10 +14,8 @@ from __future__ import annotations
 
 import functools
 import os
-import queue
 import shutil
 import subprocess
-import threading
 from typing import Sequence
 
 import jax
@@ -381,7 +379,7 @@ class _FfiBackend:
         # corrupt HDF5 metadata.
         self._deferred_attrs: list[tuple[str, object]] = []
         # Python-level async writer.  ``write_slab`` enqueues a callable
-        # here; ``_dispatch_worker`` pops it and calls
+        # here; the ``AsyncDispatcher`` worker pops it and calls
         # ``jax.jit(shard_map(_per_rank))(A).block_until_ready()``.
         # Rationale: XLA's ``ffi::Future`` async mechanism registers the
         # Future with XLA's scheduler but still blocks the caller
@@ -419,17 +417,9 @@ class _FfiBackend:
         #   K=4:           12.91 → 18.50 GB (flat) / 92 s zeta_fit
         # K=2 gives identical throughput to K=4 on this system (writer
         # saturates) while saving 2 × zeta_chunk/rank.
-        self._dispatch_queue: queue.Queue = queue.Queue(maxsize=2)
-        self._dispatch_pending: int = 0          # protected by _pending_mu
-        self._pending_mu = threading.Lock()
-        self._pending_cv = threading.Condition(self._pending_mu)
-        self._dispatch_error: BaseException | None = None
-        self._dispatch_worker = threading.Thread(
-            target=self._dispatch_loop,
-            name=f"phdf5-dispatch-{path}",
-            daemon=True,
-        )
-        self._dispatch_worker.start()
+        from common.async_io import AsyncDispatcher
+        self._dispatcher = AsyncDispatcher(
+            name=f"phdf5-dispatch-{path}", maxsize=2)
 
     # ------------------------------------------------------------------
     def create_dataset(
@@ -476,39 +466,9 @@ class _FfiBackend:
         self._deferred_attrs.append((name, value))
 
     # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    def _dispatch_loop(self) -> None:
-        """Drain ``_dispatch_queue`` in FIFO order.
-
-        Each queue entry is a callable ``() -> None`` that performs the
-        jit dispatch + block_until_ready.  We catch and stash any
-        exception so the main thread can re-raise it on the next
-        enqueue or at close() time, rather than silently losing it.
-        """
-        while True:
-            task = self._dispatch_queue.get()
-            if task is None:
-                return
-            try:
-                task()
-            except BaseException as exc:  # noqa: BLE001
-                with self._pending_cv:
-                    if self._dispatch_error is None:
-                        self._dispatch_error = exc
-            finally:
-                with self._pending_cv:
-                    self._dispatch_pending -= 1
-                    self._pending_cv.notify_all()
-
     def _drain_pending(self) -> None:
-        """Block main thread until all queued tasks finish."""
-        with self._pending_cv:
-            while self._dispatch_pending > 0:
-                self._pending_cv.wait()
-        if self._dispatch_error is not None:
-            err = self._dispatch_error
-            self._dispatch_error = None
-            raise err
+        """Block main thread until all queued write tasks finish."""
+        self._dispatcher.drain()
 
     # ------------------------------------------------------------------
     def _introspect_dataset(self, name: str) -> tuple[tuple[int, ...], "np.dtype"]:
@@ -632,9 +592,7 @@ class _FfiBackend:
             tok = sm(A, offset_arr, valid_shape_arr)
             tok.block_until_ready()
 
-        with self._pending_cv:
-            self._dispatch_pending += 1
-        self._dispatch_queue.put(_task)
+        self._dispatcher.submit(_task)
 
     # ------------------------------------------------------------------
     # FFI read padding contract: output ``shape`` is equal-block
@@ -719,28 +677,6 @@ class _FfiBackend:
         return result
 
     # ------------------------------------------------------------------
-    def accumulate_slab(
-        self,
-        name: str,
-        A,
-        *,
-        offset: Sequence[int] | None = None,
-    ) -> None:
-        """dset[off:off+A.shape] += A — collective read-modify-write."""
-        if not isinstance(A, jax.Array):
-            A = jnp.asarray(A)
-        if not isinstance(A.sharding, NamedSharding) or A.sharding.mesh is not self.mesh:
-            A = jax.device_put(A, _replicated_sharding(self.mesh, A.ndim))
-
-        off = tuple(offset) if offset is not None else tuple([0] * A.ndim)
-        existing = self.read_slab(
-            name, shape=tuple(A.shape), dtype=A.dtype,
-            offset=off, mesh=self.mesh, partition_spec=A.sharding.spec,
-        )
-        A_new = existing + A
-        self.write_slab(name, A_new, offset=off, global_shape=None)
-
-    # ------------------------------------------------------------------
     def close(self) -> None:
         # Drain pending writes on the Python worker thread, then stop
         # the worker, THEN close the MPI-IO handle.  Order matters:
@@ -756,8 +692,7 @@ class _FfiBackend:
         _rank0 = (jax.process_index() == 0)
         _verbose = _rank0 and bool(
             os.environ.get("LORRAX_PHDF5_CLOSE_VERBOSE", "1") != "0")
-        with self._pending_mu:
-            _pending = self._dispatch_pending
+        _pending = self._dispatcher.pending
         if _verbose:
             print(f"  [SlabIO.close] draining {_pending} pending writes "
                   f"for {os.path.basename(self.path)} …", flush=True)
@@ -768,8 +703,7 @@ class _FfiBackend:
             print(f"  [SlabIO.close] Python dispatch drained in "
                   f"{_t_drain:.1f} s; joining writer thread", flush=True)
         _t0 = _time.perf_counter()
-        self._dispatch_queue.put(None)          # shutdown sentinel
-        self._dispatch_worker.join()
+        self._dispatcher.close()                # drain + poison pill + join
         _t_join = _time.perf_counter() - _t0
         if self.fh:
             if _verbose:

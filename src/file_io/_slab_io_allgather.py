@@ -264,31 +264,6 @@ class _AllgatherBackend:
         return jnp.asarray(host)
 
     # ------------------------------------------------------------------
-    def accumulate_slab(
-        self,
-        name: str,
-        A,
-        *,
-        offset: Sequence[int] | None = None,
-    ) -> None:
-        """``dset[offset : offset+count] += A`` — read-modify-write.
-
-        Used by the ppm_sigma Σ_c(ω) stream mode.  Default backend:
-        gather A, then rank-0 reads the existing slab, adds, writes back.
-        """
-        host = _to_host(A)
-        local_shape = tuple(host.shape)
-        off = tuple(offset) if offset is not None else tuple([0] * len(local_shape))
-
-        if _rank0() and self._file is not None:
-            dset = self._file[name]
-            slicer = tuple(slice(o, o + s) for o, s in zip(off, local_shape))
-            buf = np.asarray(dset[slicer], dtype=host.dtype)
-            buf = buf + host
-            dset[slicer] = buf
-        _barrier(f"slab_io_accumulate/{name}")
-
-    # ------------------------------------------------------------------
     def close(self) -> None:
         if self._read_file is not None:
             self._read_file.close()

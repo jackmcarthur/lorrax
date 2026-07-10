@@ -364,32 +364,6 @@ class _MpiHostBackend:
         return result
 
     # ------------------------------------------------------------------
-    def accumulate_slab(
-        self,
-        name: str,
-        A,
-        *,
-        offset: Sequence[int] | None = None,
-    ) -> None:
-        """``dset[off:off+A.shape] += A`` via collective RMW.
-
-        Mirrors the FFI backend: each rank reads its hyperslab, adds
-        its local A shard, writes back.  Drains before/after to keep
-        the read + write rounds non-interleaved.
-        """
-        if not isinstance(A, jax.Array):
-            A = jnp.asarray(A)
-        off = tuple(offset) if offset is not None else tuple([0] * A.ndim)
-
-        existing = self.read_slab(
-            name, shape=tuple(A.shape), dtype=A.dtype,
-            offset=off, mesh=self.mesh,
-            partition_spec=A.sharding.spec if isinstance(
-                A.sharding, NamedSharding) else None,
-        )
-        self.write_slab(name, existing + A, offset=off, global_shape=None)
-
-    # ------------------------------------------------------------------
     def close(self) -> None:
         # Flush deferred small writes via h5py.  All ranks call
         # create_dataset (it's collective under parallel HDF5); we

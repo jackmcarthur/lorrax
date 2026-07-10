@@ -1264,7 +1264,7 @@ def accumulate_rchunk_to_gflat(
 # Bloch-phase formula lives.  Used by:
 #   * ψ-r box pipeline (post-IFFT, sign='+'):    to_rbox / to_rmu / to_rchunk
 #     for ``ψ_nk(r) = exp(+2πi k·r) · u_nk(r)``
-#   * ζ-r → G FFT (pre-FFT, sign='-'):           file_io.zeta_reader._do_disk_to_G
+#   * ζ-r → G FFT (pre-FFT, sign='-'):           file_io.zeta_loader._do_disk_to_G
 #     for ``z_q,μ(r) = exp(-2πi q·r) ζ_q,μ(r)``
 #     before scattering onto the (q + G) sphere.
 

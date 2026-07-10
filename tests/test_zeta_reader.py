@@ -19,7 +19,7 @@ from jax.sharding import Mesh
 
 from file_io.mf_header import copy_mf_header
 from file_io.isdf_header import IsdfHeader, write_isdf_header
-from file_io.zeta_reader import ZetaReader
+from file_io.zeta_loader import ZetaLoader as ZetaReader
 
 # Reuse the synthetic-WFN helper from the header tests.
 from tests.test_mf_isdf_header_roundtrip import _make_fake_wfn
@@ -107,7 +107,10 @@ def test_zeta_reader_context_manager_closes(tmp_path, single_device_mesh):
     zr = ZetaReader(out_path, mesh=single_device_mesh)
     assert zr.slab_io is not None
     zr.close()
-    assert zr.slab_io is None
+    # merged ZetaLoader contract: use-after-close raises instead of
+    # returning None (catches stale-handle bugs at the seam).
+    with pytest.raises(RuntimeError):
+        _ = zr.slab_io
     # double-close is a no-op
     zr.close()
 

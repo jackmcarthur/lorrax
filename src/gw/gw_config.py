@@ -261,6 +261,11 @@ _DEFAULTS = {
     # ``process_allgather`` + rank-0 ``h5py`` path as a fallback for
     # non-Lustre filesystems or systems without the FFI ``.so`` built.
     "use_ffi_io": True,
+    # Explicit SlabIO backend override: "auto" (default — route by
+    # use_ffi_io + platform, see from_input_file) | "phdf5_ffi" |
+    # "phdf5_host" | "h5py_allgather".  Every enum value is reachable
+    # from the input file; auto keeps the legacy use_ffi_io semantics.
+    "slab_io": "auto",
     # ψ(G) source for the ISDF r-chunk loop.  Both modes keep ψ(G) on
     # the HOST in per-rank band-sharded layout and pull one band-chunk
     # at a time into the jit via io_callback — never more than one bc
@@ -1201,6 +1206,11 @@ class LorraxConfig:
         #
         # User-facing: same ``cohsex.in`` works on both backends.
         _use_ffi_io_in = bool(_g("use_ffi_io"))
+        _slab_io_in = str(_g("slab_io")).strip().lower()
+        if _slab_io_in not in ("auto", "phdf5_ffi", "phdf5_host", "h5py_allgather"):
+            raise ValueError(
+                f"slab_io={_slab_io_in!r} invalid; expected auto / phdf5_ffi "
+                f"/ phdf5_host / h5py_allgather.")
         _cusolvermp_charge = str(_g("cusolvermp_charge")).strip().lower()
         _cusolvermp_lu = str(_g("cusolvermp_lu")).strip().lower()
         try:
@@ -1249,6 +1259,12 @@ class LorraxConfig:
                     "Forcing 'off' (in-tree per-q jnp.linalg.solve)."
                 )
                 _cusolvermp_lu = "off"
+        if _slab_io_in != "auto":
+            # Explicit backend: no platform second-guessing — a wrong
+            # choice fails loudly at SlabIO open (e.g. phdf5_ffi on CPU),
+            # which beats silently running a different backend than the
+            # input file says.
+            _slab_io_choice = SlabIOBackend(_slab_io_in)
         backend = BackendConfig(
             slab_io=_slab_io_choice,
             gspace_io=GspaceIO(str(_g("gspace_mode")).strip().lower()),

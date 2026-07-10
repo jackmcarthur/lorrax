@@ -41,7 +41,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 if TYPE_CHECKING:
     from file_io.zeta_loader import ZetaLoader
-    from file_io.zeta_reader import ZetaReader
 
 
 # ---------------------------------------------------------------------------
@@ -253,27 +252,17 @@ def _pick_g_chunk(ngkmax: int, target: int = 4096) -> int:
 def _make_read_all_ibz(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
     """Return ``read_all_ibz(n_q_ibz) -> (n_q_ibz, n_rmu_padded, ngkmax)``.
 
-    Both :class:`ZetaLoader` (test bench) and :class:`ZetaReader`
-    (production) can serve a G-flat slab; their call signatures differ.
-    Detect which one we have once, then dispatch.  The batched single-
-    call form avoids the ``n_q_ibz`` separate ``read_slab`` closures
-    (each one a distinct ``_FfiBackend.read_slab.<locals>._per_rank``
-    closure id) that would each cost a JAX trace cache miss.
+    One read shape: ``ZetaLoader.read_zeta_G_slab`` with the padded-μ
+    contract — read ``n_rmu_padded`` rows (zero-filled past the logical
+    extent via ``valid_mu``), which is what the V_q kernels consume.
+    The batched single-call form avoids the ``n_q_ibz`` separate
+    ``read_slab`` closures (each one a distinct
+    ``_FfiBackend.read_slab.<locals>._per_rank`` closure id) that would
+    each cost a JAX trace cache miss.
     """
-    has_load = callable(getattr(zeta_loader, 'load', None))
-    has_read_slab = callable(getattr(zeta_loader, 'read_zeta_G_slab', None))
-    if not (has_load or has_read_slab):
-        raise TypeError(
-            "v_q_g_flat: zeta_loader must expose .load() (ZetaLoader) "
-            "or .read_zeta_G_slab() (ZetaReader); got "
-            f"{type(zeta_loader).__name__} with neither.")
     n_rmu_logical = int(zeta_loader.n_rmu)
-    spec = P(None, ('x', 'y'), None)
 
     def read_all_ibz(n_q_ibz: int) -> jax.Array:
-        if has_load:
-            return zeta_loader.load(
-                q=list(range(int(n_q_ibz))), layout='G_flat', sharding=spec)
         return zeta_loader.read_zeta_G_slab(
             q_offset=0, q_count=int(n_q_ibz),
             mu_offset=0, mu_count=int(n_rmu_padded),
@@ -494,7 +483,7 @@ def _compute_V_q_g_flat_one_tile(
 # ---------------------------------------------------------------------------
 
 def compute_all_V_q_g_flat(
-    zeta_loader,                       # ZetaLoader | ZetaReader (G-flat)
+    zeta_loader,                       # ZetaLoader (G-flat)
     *,
     kgrid: tuple[int, int, int],
     fft_grid: tuple[int, int, int],
