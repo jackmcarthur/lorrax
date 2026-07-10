@@ -34,10 +34,27 @@ reports/slate_linalg_ffi_2026-07-10/report.md for the full matrix):
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import numpy as np
 import pytest
+
+# CLI multi-rank mode: jax.distributed.initialize must run before ANY
+# XLA-backend touch — including the availability probe below — so it
+# happens at import time when this module is the entry point of a
+# multi-task launch.
+if __name__ == "__main__":
+    os.environ.setdefault("JAX_ENABLE_X64", "1")
+    os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+    if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
+        try:
+            from ffi.common.ffi_loader import get_lib as _get_lib
+            _get_lib().lrx_slate_init_mpi()
+        except Exception as _exc:
+            print(f"slate_init_mpi skipped: {_exc}", flush=True)
+        import jax
+        jax.distributed.initialize(local_device_ids=[0])
 
 # ---------------------------------------------------------------------------
 # Availability probes (module import must stay cheap + exception-free).
@@ -557,15 +574,7 @@ _CLI_CELLS = [
 
 
 def _cli_main():
-    import os
-    if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
-        try:
-            from ffi.common.ffi_loader import get_lib
-            get_lib().lrx_slate_init_mpi()
-        except Exception as exc:
-            print(f"slate_init_mpi skipped: {exc}", flush=True)
-        import jax
-        jax.distributed.initialize(local_device_ids=[0])
+    # Distributed init already happened at import time (top of module).
     import jax
 
     ap = argparse.ArgumentParser()
