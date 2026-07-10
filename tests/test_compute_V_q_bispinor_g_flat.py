@@ -32,7 +32,7 @@ from gw.v_q_bispinor import (
     _make_per_q_v_builder_for_tile,
     UNIQUE_TILES, tile_dataset_name,
 )
-from tests.test_mf_isdf_header_roundtrip import _make_fake_wfn
+from tests.test_file_io import _make_fake_wfn
 
 
 @pytest.fixture

@@ -34,19 +34,21 @@ fixtures) so the ζ-fit/V_q are not redone per gate: restart≡fresh, μ-pad
 flips (gnppm + bispinor), kij↔kij_stream, SC-iter-1≡one-shot, fixed-point
 frozen rotations, IBZ≡full-BZ.  Every major 2026 bug class lives here.
 
-**Tier 3 — unit tests**: only what the gates cannot see — config parsing
-(`test_qp_solver_config`), quadrature math vs analytic values
-(`test_minimax_quadrature`), TRS/symmetry-unfold invariants on synthetic
-data (`test_symmetry_unfold`), loader/IO contracts (`test_wfn_loader_eager`,
-`test_zeta_reader`, `test_slab_io_ffi_contract`, `test_mf_isdf_header_roundtrip`),
+**Tier 3 — unit tests** (17 files): only what the gates cannot see —
+config parsing (`test_qp_solver_config`), quadrature math vs analytic
+values (`test_minimax_quadrature`), TRS/symmetry-unfold invariants on
+synthetic data (`test_symmetry_unfold`), loader/IO contracts
+(`test_wfn_loader_eager`, `test_file_io` — headers + ZetaReader + SlabIO),
 kernel identities vs independent references (`test_wfn_transforms`,
-`test_zq_from_psi_sm_bit_identity`, `test_compute_all_V_q_g_flat`,
-`test_compute_V_q_bispinor_g_flat`, `test_per_q_sphere`), head-fit sign
-regressions (`test_head_correction`), planner floors
-(`test_band_chunk_size_floor`), QSGW band partition (`test_band_partition`),
-restart pad roundtrip (`test_restart_pad_roundtrip`), BGW eqp format
-(`test_eqp_bgw`), plus ONE kmeans smoke test (`test_kmeans_smoke` — kmeans
-is a fixture-generation tool; deeper breakage fails visibly at regen).
+`test_zq_from_psi_sm_bit_identity` — z_q streaming + PsiGStore slicer,
+`test_compute_all_V_q_g_flat` — incl. per-q Coulomb sphere,
+`test_compute_V_q_bispinor_g_flat`, `test_sigma_x_bispinor`), head-fit
+sign regressions (`test_head_correction`), PPM window freeze
+(`test_sigma_ppm_gates` G2), planner floors (`test_band_chunk_size_floor`),
+QSGW band partition (`test_band_partition`), restart pad roundtrip
+(`test_restart_pad_roundtrip`), BGW eqp format (`test_eqp_bgw`), plus ONE
+kmeans smoke test (`test_kmeans_smoke` — kmeans is a fixture-generation
+tool; deeper breakage fails visibly at regen).
 
 **`extra` marker** (deselected by default via pyproject `addopts`; run
 with `-m extra`): tooling/experimental/out-of-repo-fixture suites —
