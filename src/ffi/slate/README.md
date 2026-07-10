@@ -261,6 +261,16 @@ mesh, skipif-clean without the host lib) + the CLI matrix under
 (e.g. ScaLAPACK getrf for the `distributed_lu` axis) join the same
 library and registration table.
 
+Dual-lib caveat (GPU nodes): both SLATE builds install `libslate.so.2`,
+so when the CUDA FFI library loads first its `libslate` satisfies the
+host library's DT_NEEDED too — the in-process `*_cpu` tests on a GPU
+node exercise the host HANDLERS (`fromScaLAPACK` + `Target::HostTask`)
+against the cuda-built SLATE running host-side.  That is a supported
+SLATE configuration, and the `gpu_backend=none` binary itself is
+validated where it actually deploys — CPU nodes, where only the host
+library loads (bare-metal Milan runs: 7/7 pytest, 2×2 + 4×1 CLI clean,
+2026-07-10).
+
 Tests under `src/common/slate_*_test.py` and `slate_*_bench.py`; run
 via `lxrun` (inside an `lxalloc`-created allocation).
 

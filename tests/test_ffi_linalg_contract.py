@@ -22,6 +22,11 @@ nodes too: ``jax.ffi.ffi_call`` picks the handler by lowering platform)
 and skip cleanly when the host library is absent.  Multi-rank CPU
 meshes: run the CLI mode under ``JAX_PLATFORMS=cpu`` (non-slate cells
 are skipped there; ``--only slate`` narrows the log to the same set).
+Note: when BOTH libraries are loaded (GPU node), the shared
+``libslate.so.2`` soname means the host handlers run against the
+already-loaded cuda-build SLATE (host-side execution) — the
+``gpu_backend=none`` binary is exercised on CPU nodes, where the host
+library loads alone (see src/ffi/slate/README.md "Dual-lib caveat").
 
 Multi-rank findings this file pins (see
 reports/slate_linalg_ffi_2026-07-10/report.md for the full matrix):
@@ -60,7 +65,8 @@ if __name__ == "__main__":
         # Platform must be EXPLICIT here: get_lib(None) asks
         # jax.default_backend(), which would initialize XLA before
         # jax.distributed.initialize.
-        _plat = "CUDA" if "cuda" in os.environ["JAX_PLATFORMS"] else "cpu"
+        from ffi.common.ffi_loader import platform_from_env
+        _plat = platform_from_env()
         try:
             from ffi.common.ffi_loader import get_lib as _get_lib
             _get_lib(_plat).lrx_slate_init_mpi()

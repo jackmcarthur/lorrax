@@ -59,7 +59,7 @@ def open_file(path: str, *, mesh: Mesh, mode: str = "w") -> int:
     """
     if mode not in _MODE_FLAGS:
         raise ValueError(f"mode must be w/a/r; got {mode!r}")
-    ffi_loader.get_lib()
+    ffi_loader.get_lib("CUDA")
     p, q = validate_mesh_2d(mesh)
     if p * q != jax.process_count():
         raise ValueError(
@@ -81,7 +81,7 @@ def close_file(path_or_handle) -> None:
     """Collective close.  Accepts either a path (the original open_file
     argument) or the int handle returned from open_file."""
     global _FILE_CTXS
-    ffi_loader.get_lib()
+    ffi_loader.get_lib("CUDA")
     with _LOCK:
         if isinstance(path_or_handle, str):
             ctx = _FILE_CTXS.pop(path_or_handle, None)
@@ -98,7 +98,7 @@ def _atexit_close_all() -> None:
     """Close any files still open at process exit — catches forgotten
     close_file calls.  Runs on every process."""
     try:
-        ffi_loader.get_lib()
+        ffi_loader.get_lib("CUDA")
     except Exception:
         return
     with _LOCK:

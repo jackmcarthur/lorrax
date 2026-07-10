@@ -103,6 +103,9 @@ _ERR_CAP = 512
 
 
 def _default_platform() -> str:
+    # NOTE: jax.default_backend() INITIALIZES the XLA backend.  Code that
+    # runs before jax.distributed.initialize (multi-rank CLI drivers) must
+    # not call get_lib(None) — use get_lib(platform_from_env()) instead.
     backend = jax.default_backend()
     if backend in ("gpu", "cuda"):
         return "CUDA"
@@ -111,6 +114,17 @@ def _default_platform() -> str:
     raise RuntimeError(
         f"lorrax_ffi: no FFI library for JAX backend {backend!r} "
         f"(supported: cuda, cpu).")
+
+
+def platform_from_env(default: str = "CUDA") -> str:
+    """Resolve the FFI platform from ``JAX_PLATFORMS`` WITHOUT touching the
+    JAX backend — safe before ``jax.distributed.initialize``.  The first
+    entry wins, mirroring how JAX picks its default backend from the list.
+    """
+    first = os.environ.get("JAX_PLATFORMS", "").split(",")[0].strip().lower()
+    if not first:
+        return default
+    return "CUDA" if first in ("cuda", "gpu") else "cpu"
 
 
 def _candidate_paths(platform: str) -> list[Path]:
@@ -438,14 +452,20 @@ def phdf5_open_dataset_ro(ctx_handle: int, ds_name: str) -> int:
 
 
 # ---- slate ----------------------------------------------------------------
-def create_slate_context(rank: int, world_size: int, p: int, q: int) -> int:
+# The slate lifecycle exists in BOTH platform libraries (context.cc is pure
+# MPI); ``platform`` selects which one serves the call.  A SlateCtx handle is
+# platform-agnostic — pass the platform of the mesh being operated on so the
+# call never forces the OTHER platform's library to load (e.g. a CPU-mesh op
+# on a machine whose CUDA library is absent).
+def create_slate_context(rank: int, world_size: int, p: int, q: int,
+                         platform: Optional[str] = None) -> int:
     """Collective create of a SLATE context; returns opaque int64 handle.
 
     Inits MPI_THREAD_MULTIPLE if not already inited, then dups
     MPI_COMM_WORLD for SLATE's exclusive use.  Raises RuntimeError on
     failure with a message from the .so's error buffer.
     """
-    lib = get_lib()
+    lib = get_lib(platform)
     err = ctypes.create_string_buffer(_ERR_CAP)
     h = lib.lrx_slate_context_create(
         int(rank), int(world_size), int(p), int(q), err, _ERR_CAP)
@@ -456,7 +476,8 @@ def create_slate_context(rank: int, world_size: int, p: int, q: int) -> int:
 
 
 def create_slate_subrow_context(rank: int, world_size: int,
-                                Px: int, Py: int) -> int:
+                                Px: int, Py: int,
+                                platform: Optional[str] = None) -> int:
     """Collective create of a SLATE sub-row context; returns int64 handle.
 
     The sub-comm is MPI_COMM_WORLD split by x-coordinate (color=x_rank,
@@ -464,7 +485,7 @@ def create_slate_subrow_context(rank: int, world_size: int,
     for batched ops where each X-row independently processes a slice of
     a 3-D (Nbatch, N, N) input distributed as P('x', None, 'y').
     """
-    lib = get_lib()
+    lib = get_lib(platform)
     err = ctypes.create_string_buffer(_ERR_CAP)
     h = lib.lrx_slate_subrow_context_create(
         int(rank), int(world_size), int(Px), int(Py), err, _ERR_CAP)
@@ -475,12 +496,13 @@ def create_slate_subrow_context(rank: int, world_size: int,
     return int(h)
 
 
-def destroy_slate_context(ctx_handle: int) -> None:
-    get_lib().lrx_slate_context_destroy(int(ctx_handle))
+def destroy_slate_context(ctx_handle: int,
+                          platform: Optional[str] = None) -> None:
+    get_lib(platform).lrx_slate_context_destroy(int(ctx_handle))
 
 
-def slate_init_mpi() -> None:
+def slate_init_mpi(platform: Optional[str] = None) -> None:
     """Eagerly init MPI_THREAD_MULTIPLE from outside SLATE's hot path.
     Idempotent; no-op if MPI is already initialized.
     """
-    get_lib().lrx_slate_init_mpi()
+    get_lib(platform).lrx_slate_init_mpi()

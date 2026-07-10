@@ -25,8 +25,10 @@ def _init():
     if os.environ.get(_DIST):
         return
     try:
-        from ffi.common.ffi_loader import get_lib
-        get_lib().lrx_slate_init_mpi()
+        from ffi.common.ffi_loader import get_lib, platform_from_env
+        # Explicit platform: get_lib(None) would initialize the XLA backend
+        # (jax.default_backend()) BEFORE jax.distributed.initialize below.
+        get_lib(platform_from_env()).lrx_slate_init_mpi()
     except Exception as _e:
         pass
     if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
