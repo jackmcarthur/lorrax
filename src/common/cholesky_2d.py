@@ -38,6 +38,18 @@ import numpy as np
 from jax import lax
 from jax.experimental.shard_map import shard_map
 from jax.scipy.linalg import solve_triangular
+
+# jax 0.9 tracks varying-manual-axes (VMA) inside shard_map and its strict
+# CPU check requires the fori_loop carry below to be pcast to 'varying'.
+# jax <= 0.8 has no VMA tracking — every value inside shard_map is
+# implicitly device-varying — so the identity is the correct (and only
+# possible) behavior there.  Guarded here so one source runs on both the
+# 0.7.2 production container and jax-0.9 venvs.
+try:
+    _pcast = lax.pcast
+except AttributeError:  # jax < 0.9
+    def _pcast(x, axes, *, to):
+        return x
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
@@ -183,8 +195,8 @@ def cholesky_2d_single(mesh: Mesh, J: int, b: int):
             # fori_loop carry must be marked varying on ('x','y') because
             # ``fill_panel`` writes per-device-conditionally.  GPU is more
             # forgiving, but the CPU check is the spec-correct one.
-            panel_init = lax.pcast(jnp.zeros((J, b, b), dtype),
-                                   ('x', 'y'), to='varying')
+            panel_init = _pcast(jnp.zeros((J, b, b), dtype),
+                                ('x', 'y'), to='varying')
             
             def fill_panel(i_loc, panel):
                 i_glob = my_row_start + i_loc
