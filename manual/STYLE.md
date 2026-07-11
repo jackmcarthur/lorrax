@@ -5,6 +5,11 @@ every section of this manual. Read them immediately before writing and imitate t
 directly: sentence rhythm, punctuation habits, and information density, not a vague
 "tone".
 
+The cardinal rule is to never overexplain. Target the description density of a long
+PRB; drafts to date run about 1.5x over that. State the equation, the knob, and the
+consequence once each. A sentence that explains why the previous sentence is true,
+when no referee would have asked, gets deleted.
+
 That prose is dense declarative sentences, each adding new technical content.
 Tradeoffs appear in the same sentence as the feature they qualify ("significant
 speedups, with potential memory tradeoffs, relative to the canonical $O(N^4)$
