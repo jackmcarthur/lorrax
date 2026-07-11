@@ -8,7 +8,10 @@ directly: sentence rhythm, punctuation habits, and information density, not a va
 The cardinal rule is to never overexplain. Target the description density of a long
 PRB; drafts to date run about 1.5x over that. State the equation, the knob, and the
 consequence once each. A sentence that explains why the previous sentence is true,
-when no referee would have asked, gets deleted.
+when no referee would have asked, gets deleted. Never spell out a consequence the
+audience infers on their own, prefer one representative example to an enumeration
+("matrix inversion and Cholesky decomposition", not a list of every routine), and
+keep mathematical objects out of prose that does not need them.
 
 That prose is dense declarative sentences, each adding new technical content.
 Tradeoffs appear in the same sentence as the feature they qualify ("significant
