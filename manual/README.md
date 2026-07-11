@@ -3,7 +3,9 @@
 One Markdown file per section, LaTeX math inline (`$...$`, `$$...$$`), no serious LaTeX
 formatting yet. Figures are placeholders: `<!-- FIGURE: description -->`. The governing
 outline, editorial threads (T1–T5), and pre-writing task list live in
-[`00_outline.md`](00_outline.md).
+[`00_outline.md`](00_outline.md). **Prose register is governed by
+[`STYLE.md`](STYLE.md) — read it before writing or revising any section.** §1.1 and
+§1.3 are the reference implementations.
 
 ## Status
 
