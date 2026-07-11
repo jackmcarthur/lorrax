@@ -12,13 +12,13 @@ outline, editorial threads (T1–T5), and pre-writing task list live in
 | Chapter | State |
 |---|---|
 | 00 Outline | current |
-| 01 Introduction | drafted; 3-lens review applied 2026-07-10 |
-| 02 Installation | drafted |
-| 03 Tutorial | drafted (tutorial numbers TODO: needs reference run) |
-| 04 GW in real space and real time | drafted; 3-lens review applied 2026-07-10 |
-| 05 ISDF | drafted; 3-lens review applied 2026-07-10 |
-| 06 The Coulomb interaction | drafted; 3-lens review applied 2026-07-10 |
-| 07 Frequency integration | drafted (blockers 1/2 resolved from code; §7.6 periodic numbers blocked on task 5 gate run) |
+| 01 Introduction | drafted; reviewed; PRL-density sweep 2026-07-11 |
+| 02 Installation | drafted; PRL-density sweep 2026-07-11 |
+| 03 Tutorial | drafted; PRL-density sweep 2026-07-11 (numbers TODO: reference run) |
+| 04 GW in real space and real time | drafted; reviewed; PRL-density sweep 2026-07-11 |
+| 05 ISDF | drafted; reviewed; PRL-density sweep 2026-07-11 |
+| 06 The Coulomb interaction | drafted; reviewed; PRL-density sweep 2026-07-11 |
+| 07 Frequency integration | drafted; PRL-density sweep 2026-07-11 (§7.6 periodic numbers blocked on gate run) |
 | 08 Bispinor GW | not started |
 | 09 Supporting formalisms | not started |
 | 10–13 Reference + architecture | not started |
