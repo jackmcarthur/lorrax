@@ -1,9 +1,15 @@
 # Quickstart
 
 This runs one complete static-COHSEX calculation end-to-end on a fresh clone — the bundled
-regression fixture — with **no GPU and no native (FFI) build**. It is the one command
-guaranteed to exist and succeed, and the fastest way to confirm LORRAX works on your
-machine.
+regression fixture — with **no native (FFI) build**. It is the fastest way to confirm LORRAX
+works on your machine.
+
+!!! warning "Memory requirement"
+    The fixture materializes a ~**17 GiB** array on a single device (LORRAX only tiles large
+    arrays across a multi-GPU mesh). Run it on a **GPU with ≥ 24 GB**, on **multiple GPUs**,
+    or on **CPU with ≥ ~20 GB RAM** (`JAX_PLATFORMS=cpu`). A smaller box will OOM with
+    `RESOURCE_EXHAUSTED` — that is sizing, not a build failure. See
+    [Generic cloud GPU](installation/cloud.md#two-things-decide-whether-it-runs-driver-and-memory).
 
 ## 1. Install (pure-JAX, CPU)
 
@@ -50,6 +56,7 @@ On NERSC Perlmutter, `lxpre cohsex.in <N>` runs steps 1–3 in one command; see
 ## Where to next
 
 - [Installation](installation/index.md) — GPU (CUDA 13), container, and from-source tracks
+- [Generic cloud GPU](installation/cloud.md) — AWS / RunPod / Vast / Lambda, driver + memory sizing
 - [FFI native libraries](installation/ffi-native-libs.md) — distributed `eigh`, sharded
   HDF5, SLATE
 - [Theory overview](theory/overview.md) and [physics](theory/physics.md)

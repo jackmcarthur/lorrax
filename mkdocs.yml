@@ -55,6 +55,7 @@ nav:
   - Installation:
       - Overview: installation/index.md
       - FFI native libraries: installation/ffi-native-libs.md
+      - Generic cloud GPU: installation/cloud.md
       - Perlmutter (NERSC): installation/perlmutter.md
       - Environment reference: ENVIRONMENT_COMPREHENSIVE.md
   - User guide:

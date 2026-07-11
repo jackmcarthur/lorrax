@@ -15,6 +15,7 @@ from the matrix below; the pure-JAX core works with zero native libraries.
 | Config | OS | CUDA | JAX | MPI | parallel HDF5 | Runtime | FFI features | Tested |
 |---|---|---|---|---|---|---|---|---|
 | **Pure-JAX (no FFI)** | any | 13 or none | ≥0.9 | — | — | bare venv | none (serial only) | CI / CPU |
+| **Generic single cloud GPU** | Linux x86_64 | 13 (driver ≥580) | ≥0.9 | — | — | bare venv / container | none (serial only) | pure-JAX verified (Blackwell, CUDA 13.2); needs ≥24 GB VRAM — see [Cloud](cloud.md) |
 | **NERSC Perlmutter (reference)** | SLES 15 | 12.9 (staged native libs) | ≥0.9 | Cray MPICH | cray-hdf5-parallel | Shifter | all | 1–4 nodes × 4 A100 |
 | **Generic Cray EX** | — | 12.x/13.x | ≥0.9 | Cray MPICH | cray-hdf5-parallel | Apptainer | all | untested |
 | **Generic SLURM + OpenMPI** | Linux x86_64 | 12.x/13.x | ≥0.9 | OpenMPI 4/5 + UCX | conda-forge `hdf5=*mpi_openmpi*` | Apptainer / bare venv | all | untested |
@@ -53,7 +54,9 @@ note in `pyproject.toml`, which is authoritative for all Python-side pins.
 LORRAX runs inside the NVIDIA JAX image (`nvcr.io/nvidia/jax:25.04-py3`). On NERSC the
 container runtime is **Shifter** (see [Perlmutter](perlmutter.md)); on other clusters use
 **Apptainer** or **Singularity**. The container provides JAX + CUDA; LORRAX `src/` and the
-staged native libraries are bind-mounted in.
+staged native libraries are bind-mounted in. For a rented cloud GPU (AWS / RunPod / Vast /
+Lambda), a ready-to-adapt pure-JAX image is at [`Dockerfile.cloud`](../../Dockerfile.cloud);
+provider choice, driver, and memory sizing are in [Generic cloud GPU](cloud.md).
 
 !!! note "TODO"
     A worked, copy-paste Apptainer/Singularity invocation (image pull, `--nv`, the
@@ -75,5 +78,6 @@ for non-NERSC users and is documented separately:
 
 - [`docs/ENVIRONMENT_COMPREHENSIVE.md`](../ENVIRONMENT_COMPREHENSIVE.md) — the full
   environment / JAX-config / troubleshooting reference this page summarizes
+- [Generic cloud GPU](cloud.md) — AWS / RunPod / Vast / Lambda: driver, memory sizing, provider table
 - [Perlmutter](perlmutter.md) — the NERSC reference cluster (module, `lxrun`/`lxpre`)
 - `src/ffi/PORTING.md` — the FFI porting checklist (in the repo, not the site)

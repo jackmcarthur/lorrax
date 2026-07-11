@@ -1,0 +1,41 @@
+# Generic cloud-GPU image for LORRAX (pure-JAX track, no FFI).
+#
+# Builds the pure-JAX stack (centroids, wavefunction loading, serial/single-node GW) on top
+# of NVIDIA's JAX image. This is the portable, no-Cray path for AWS / RunPod / Vast / Lambda
+# / any Ubuntu+NVIDIA host with driver >= 580. The distributed FFI stack (cuSolverMp eigh,
+# sharded parallel HDF5, SLATE) is NOT built here — see docs/installation/ffi-native-libs.md.
+#
+# Build:  docker build -t lorrax:cloud -f Dockerfile.cloud .
+# Run:    docker run --gpus all -it lorrax:cloud \
+#           uv run python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
+#         (needs a >=24 GB GPU for the bundled fixture; see docs/installation/cloud.md)
+# Apptainer/Singularity on HPC clouds:
+#         apptainer build lorrax.sif docker-daemon://lorrax:cloud && apptainer run --nv lorrax.sif
+
+FROM nvcr.io/nvidia/jax:25.04-py3
+
+# JAX/HDF5 runtime defaults (match the project's recommendations)
+ENV JAX_ENABLE_X64=1 \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 \
+    HDF5_USE_FILE_LOCKING=FALSE
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv (user-local), on PATH
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+WORKDIR /workspace/lorrax
+COPY . .
+
+# Resolve project deps from the lockfile. The base image already provides a CUDA-13 JAX;
+# uv reconciles the rest of the pinned stack against it.
+RUN uv sync --frozen
+
+# Smoke check at build time: JAX imports and the package resolves.
+RUN uv run python -c "import jax; print('jax', jax.__version__, jax.default_backend())"
+
+CMD ["bash"]
