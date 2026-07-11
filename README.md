@@ -10,10 +10,10 @@ The package requires as input the BerkeleyGW format wavefunction file `WFN.h5`. 
 
 The main drivers are located in `src/`:
 - **ISDF initialization**: `centroid/kmeans_isdf.py` (k-means algorithm) + `centroid/kmeans_cli.py` (CLI entrypoint, `python -m centroid.kmeans_cli`)
-- **Wavefunction loading**: `common/load_wfns.py` (ISDF basis fitting by least squares, memory bottlenecks)
+- **Wavefunction loading**: `common/wfn_transforms.py` (band-chunked FFTs, centroid extraction, memory bottlenecks)
 - **GW quasiparticle energies**: `gw/gw_jax.py` (main driver), `gw/w_isdf.py` (screened interaction builder)
 
-Available as console commands: `gw_jax`, `lorrax-gw`, `lorrax-centroids` (= `centroid.kmeans_cli`), `lorrax-bse`.
+Available as console commands: `gw_jax`, `lorrax-gw`, `lorrax-centroids` (= `centroid.kmeans_cli`).
 
 ## Quick start
 

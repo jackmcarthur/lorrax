@@ -49,7 +49,7 @@ On NERSC Perlmutter, `lxpre cohsex.in <N>` runs steps 1–3 in one command; see
 
 ## Where to next
 
-- [Installation](installation/index.md) — GPU (CUDA 12), container, and from-source tracks
+- [Installation](installation/index.md) — GPU (CUDA 13), container, and from-source tracks
 - [FFI native libraries](installation/ffi-native-libs.md) — distributed `eigh`, sharded
   HDF5, SLATE
 - [Theory overview](theory/overview.md) and [physics](theory/physics.md)

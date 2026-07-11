@@ -26,7 +26,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/gw/qsgw_utils.py` | QSGW fixed-point solver, Σ^xc I/O | Self-consistent GW |
 | `src/gw/kin_ion_io.py` | Kinetic + ionic Hamiltonian I/O | `kin_ion.h5` issues |
 | `src/common/isdf_fitting.py` | CCT/ZCT, pair-density kernels, zeta solve | Zeta fitting, pair density |
-| `src/common/load_wfns.py` | Wavefunction loading + band-chunked FFT | WFN load path |
+| `src/common/wfn_transforms.py` | Wavefunction loading + band-chunked FFT | WFN load path |
 | `src/common/cholesky_2d.py` | 2D-blocked Cholesky for sharded CCT | Cholesky issues |
 | `src/common/fft_helpers.py` | Flat-k FFT helpers | FFT plumbing |
 | `src/common/gvec_fft_box.py` | Sphere ↔ FFT-box gather | V_q G-space build |

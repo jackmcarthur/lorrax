@@ -26,8 +26,8 @@ Authoritative source: [`pyproject.toml`](../pyproject.toml). No docker images, n
 | Package | Version | Purpose |
 |---|---|---|
 | **Python** | ≥3.12 | Language runtime |
-| **jax[cuda12]** | ≥0.5.3,<0.6 | Array ops, autodiff, GPU acceleration (matches the container + CUDA-12.9 FFI) |
-| **jaxlib** | ≥0.5.3,<0.6 | JAX backend |
+| **jax[cuda13]** | ≥0.9 | Array ops, autodiff, GPU acceleration (CUDA-13 wheels bundle the runtime) |
+| **jaxlib** | ≥0.9 | JAX backend |
 | **numpy** | ≥2.3.1 | Arrays, host-side I/O |
 | **scipy** | ≥1.16.0 | Linear algebra, FFTs (host) |
 | **h5py** | ≥3.14.0 | HDF5 I/O (host path) |
@@ -42,7 +42,7 @@ Declared under `[dependency-groups]` in `pyproject.toml`:
 | Group | Contents | When |
 |---|---|---|
 | `dev` | flake8, pytest | Everywhere |
-| `jax` | Explicit `jax[cuda12]` + jaxlib pin | If uv resolves without extras |
+| `jax` | Explicit `jax[cuda13]` + jaxlib pin | If uv resolves without extras |
 | `build` | cmake, ninja, nanobind, scikit-build-core | Building the FFI C++ shared object `liblorrax_ffi.so` (§5) |
 | `profile` | tensorboard, tensorboard-plugin-profile, xprof | JAX/XProf traces |
 
@@ -75,7 +75,6 @@ Console scripts (from `pyproject.toml`):
 lorrax-gw        = "gw.gw_jax:main"
 gw_jax           = "gw.gw_jax:main"          # alias
 lorrax-centroids = "centroid.kmeans_cli:main"
-lorrax-bse       = "bse.bse_isdf:main"
 ```
 
 One `.venv/` per machine, gitignored. Let uv use its global cache.
@@ -459,7 +458,7 @@ RuntimeError: No GPU/TPU found, falling back to CPU.
 1. `nvidia-smi` — are GPUs visible at all?
 2. `python -c "import jax; print(jax.default_backend())"` — should print `gpu`
 3. `echo $CUDA_VISIBLE_DEVICES` — inside Shifter this is set by `select_gpu.sh` to `$SLURM_LOCALID`
-4. `pip list | grep jax` — jaxlib must be the CUDA build (`jax[cuda12]`)
+4. `pip list | grep jax` — jaxlib must be the CUDA build (`jax[cuda13]`)
 
 ### 8.2 Out-of-memory
 

@@ -14,10 +14,10 @@ from the matrix below; the pure-JAX core works with zero native libraries.
 
 | Config | OS | CUDA | JAX | MPI | parallel HDF5 | Runtime | FFI features | Tested |
 |---|---|---|---|---|---|---|---|---|
-| **Pure-JAX (no FFI)** | any | 12 or none | ≥0.5.3,<0.6 | — | — | bare venv | none (serial only) | CI / CPU |
-| **NERSC Perlmutter (reference)** | SLES 15 | 12.9 | 0.5.x | Cray MPICH | cray-hdf5-parallel | Shifter | all | 1–4 nodes × 4 A100 |
-| **Generic Cray EX** | — | 12.x | 0.5.x | Cray MPICH | cray-hdf5-parallel | Apptainer | all | untested |
-| **Generic SLURM + OpenMPI** | Linux x86_64 | 12.x | 0.5.x | OpenMPI 4/5 + UCX | conda-forge `hdf5=*mpi_openmpi*` | Apptainer / bare venv | all | untested |
+| **Pure-JAX (no FFI)** | any | 13 or none | ≥0.9 | — | — | bare venv | none (serial only) | CI / CPU |
+| **NERSC Perlmutter (reference)** | SLES 15 | 12.9 (staged native libs) | ≥0.9 | Cray MPICH | cray-hdf5-parallel | Shifter | all | 1–4 nodes × 4 A100 |
+| **Generic Cray EX** | — | 12.x/13.x | ≥0.9 | Cray MPICH | cray-hdf5-parallel | Apptainer | all | untested |
+| **Generic SLURM + OpenMPI** | Linux x86_64 | 12.x/13.x | ≥0.9 | OpenMPI 4/5 + UCX | conda-forge `hdf5=*mpi_openmpi*` | Apptainer / bare venv | all | untested |
 
 Only the pure-JAX path works with **zero native libs**. Everything distributed needs the
 [FFI native-library stack](ffi-native-libs.md).
@@ -42,17 +42,11 @@ uv sync                                            # editable install; puts src/
 uv run python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
 ```
 
-For a GPU (CUDA 12) JAX build, install the `cuda12` extra:
-
-```bash
-uv sync --extra cuda12      # jax[cuda12]>=0.5.3,<0.6
-```
-
-!!! note
-    The package pins `jax[cuda12]>=0.5.3,<0.6` — the line the production container ships
-    and the CUDA-12.9 FFI links against. A CUDA-13 / JAX≥0.9 configuration is a separate,
-    untested matrix row (`jax[cuda13]>=0.9.0`), not the default, because the native `.so`
-    is validated against CUDA 12.9.
+`uv sync` installs the GPU build by default: the package pins `jax[cuda13]>=0.9.0`,
+and the CUDA-13 wheels bundle the CUDA runtime (no system CUDA install needed; a
+recent NVIDIA driver is required). A CUDA-12 row on the same JAX-0.9 line is a
+plausible future support-matrix entry but is not offered as an extra — see the
+note in `pyproject.toml`, which is authoritative for all Python-side pins.
 
 ## Track 2 — container
 
