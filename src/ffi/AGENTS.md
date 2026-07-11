@@ -11,6 +11,7 @@ ships five targets, all validated on NERSC Perlmutter (1–4 nodes × 4×A100):
 | `cusolvermg` | cuSOLVERMg (single-proc multi-GPU, in-container) | 1 proc × N GPUs | `common.cusolvermg_eigh_test` | F64 @ n∈{128, 2048}, err ≲ 2e-11.  No production consumer (benchmarks only) |
 | `slate` | SLATE (MPI + GPU tile linalg; AMD-portable path) | 1 proc per GPU | `common.slate_cholesky_trsm_test`, `common.slate_batched_test`, contract tests | potrf/trsm/heev ~1e-16/1e-14 on p==q or 1-D meshes; see [`slate/README.md`](slate/README.md) |
 | `phdf5`      | parallel HDF5 via MPI-IO (read + write sharded slabs) | 1 proc per GPU | `common.phdf5_write_test`, `common.phdf5_multi_offset_test` | 0.000e+00 round-trip; 4 / 9 GB/s write / read @ 16 GPUs. See [`phdf5/ARCHITECTURE.md`](phdf5/ARCHITECTURE.md) for the async-design rationale and the non-obvious pitfalls encountered along the way. |
+| `scalapack` | ScaLAPACK from Cray LibSci (HOST platform — JAX CPU backend) | 1 proc per rank | `tests/test_ffi_linalg_contract.py` (`scalapack_*` cells) | pXgetrf+pXgetrs fused per-q LU (`distributed_lu = scalapack`); square + 1-D meshes (square-block requirement); zero extra link deps (libsci already in `liblorrax_ffi_host.so`) |
 
 Multi-process targets share the same bootstrap pattern (KV-store broadcast
 of a unique handle → `cal_comm_create` / `H5Fcreate`) — the scaffold for

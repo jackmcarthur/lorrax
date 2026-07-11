@@ -350,6 +350,32 @@ def check_cublasmp_wsolve(mesh, dtype, nq=2, n=32, pref=0.37):
         assert res < 1e-11, f"q={q}: w_solve residual {res:.3e}"
 
 
+def check_scalapack_lu(mesh, dtype, nq=2, n=32, nrhs=16, herm=True):
+    """Host-platform twin of check_cusolvermp_lu — ScaLAPACK pXgetrf+
+    pXgetrs (Cray LibSci) through ffi.scalapack, same math contract."""
+    from ffi.scalapack import batched_distributed_solve_lu
+    rng = np.random.default_rng(11)
+    if herm:
+        A_np = _herm(rng, nq, n, dtype)     # Hermitian INDEFINITE
+    else:
+        A_np = _rng_mat(rng, (nq, n, n), dtype) + n * np.eye(n)[None]
+        A_np = A_np.astype(dtype)
+    B_np = _rng_mat(rng, (nq, n, nrhs), dtype)
+
+    def solve():
+        A = _put(A_np, mesh, (None, "x", "y"))
+        B = _put(B_np, mesh, (None, "x", "y"))
+        return _gather(batched_distributed_solve_lu(A, B, mesh=mesh))
+
+    X1 = solve()
+    X2 = solve()
+    assert np.array_equal(X1, X2), "scalapack solve_lu rerun not bit-deterministic"
+    for q in range(nq):
+        res = (np.linalg.norm(A_np[q] @ X1[q] - B_np[q])
+               / max(np.linalg.norm(B_np[q]), 1.0))
+        assert res < 1e-10, f"q={q}: res={res:.3e}"
+
+
 def check_slate_chol_trsm(mesh, dtype, n=32, m=32):
     """Includes the rectangular-RHS case (m != n) that used to abort the
     whole multi-rank job via an uncatchable blas::Error."""
@@ -625,6 +651,38 @@ def test_slate_eigh_true_eigenvectors_cpu(mesh_cpu11, dtype):
     check_slate_eigh(mesh_cpu11, dtype)
 
 
+@needs_host_ffi
+@pytest.mark.parametrize("dtype", ["complex128", "float64"])
+def test_scalapack_solve_lu_hermitian_indefinite_cpu(mesh_cpu11, dtype):
+    check_scalapack_lu(mesh_cpu11, dtype)
+
+
+@needs_host_ffi
+def test_scalapack_solve_lu_general_cpu(mesh_cpu11):
+    check_scalapack_lu(mesh_cpu11, "complex128", herm=False)
+
+
+@needs_host_ffi
+def test_scalapack_resolver_and_host_only_guard(mesh_cpu11):
+    """distributed_lu=scalapack resolves to scalapack_lu (explicit only —
+    auto never picks it); a GPU-device mesh is rejected loudly."""
+    from isdf.core import _resolve_solver_kind_transverse
+    assert _resolve_solver_kind_transverse(
+        mesh_cpu11, "scalapack") == "scalapack_lu"
+    assert _resolve_solver_kind_transverse(
+        mesh_cpu11, "auto") != "scalapack_lu"
+    import jax
+    from ffi.scalapack import batched_distributed_solve_lu
+    gpus = [d for d in jax.devices() if d.platform in ("gpu", "cuda")]
+    if gpus:
+        from jax.sharding import Mesh
+        gpu_mesh = Mesh(np.asarray(gpus[:1]).reshape(1, 1), ("x", "y"))
+        A = jax.numpy.zeros((1, 8, 8), dtype="complex128")
+        B = jax.numpy.zeros((1, 8, 4), dtype="complex128")
+        with pytest.raises(ValueError, match="host-only"):
+            batched_distributed_solve_lu(A, B, mesh=gpu_mesh)
+
+
 # ---------------------------------------------------------------------------
 # CLI mode — the multi-rank matrix.  Same checks on a PxQ process mesh.
 # ---------------------------------------------------------------------------
@@ -658,6 +716,14 @@ _CLI_CELLS = [
                                           nrhs=16)),
     ("slate_eigh", True,
      lambda mesh, dt: check_slate_eigh(mesh, dt, n=64)),
+    # Host-only (skipped on CUDA backends by the platform gate below).
+    # No needs_square: scalapack's square-block requirement is satisfied
+    # on square AND 1-D meshes (g = n/max(p,q)); p!=q with both >1 GUARDs.
+    ("scalapack_lu", False,
+     lambda mesh, dt: check_scalapack_lu(mesh, dt, n=64, nrhs=32)),
+    ("scalapack_lu_general", False,
+     lambda mesh, dt: check_scalapack_lu(mesh, dt, n=64, nrhs=32,
+                                         herm=False)),
 ]
 
 
@@ -680,9 +746,14 @@ def _cli_main():
     for name, needs_square, fn in _CLI_CELLS:
         if args.only and args.only not in name:
             continue
-        if is_cpu and not name.startswith("slate"):
+        if is_cpu and not name.startswith(("slate", "scalapack")):
             if jax.process_index() == 0:
                 print(f"SKIP {name}[{args.mesh}] (CUDA-only backend)",
+                      flush=True)
+            continue
+        if not is_cpu and name.startswith("scalapack"):
+            if jax.process_index() == 0:
+                print(f"SKIP {name}[{args.mesh}] (host-only backend)",
                       flush=True)
             continue
         for dt in ("complex128", "float64"):

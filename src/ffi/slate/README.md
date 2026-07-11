@@ -257,9 +257,10 @@ still fails loudly with build pointers when the library is absent).
 
 Tests: `tests/test_ffi_linalg_contract.py::test_slate_*_cpu` (1×1 CPU
 mesh, skipif-clean without the host lib) + the CLI matrix under
-`JAX_PLATFORMS=cpu` for multi-rank CPU meshes.  Future host backends
-(e.g. ScaLAPACK getrf for the `distributed_lu` axis) join the same
-library and registration table.
+`JAX_PLATFORMS=cpu` for multi-rank CPU meshes.  The first additional
+host backend landed the same way: `ffi.scalapack` (Cray LibSci
+pXgetrf+pXgetrs, `distributed_lu = scalapack`) compiles into the same
+library and registration table — see `src/ffi/scalapack/`.
 
 Dual-lib caveat (GPU nodes): both SLATE builds install `libslate.so.2`,
 so when the CUDA FFI library loads first its `libslate` satisfies the

@@ -72,6 +72,7 @@ message(STATUS "SLATE (host): found via ${LORRAX_SLATE_HOST_INSTALL_DIR}")
 add_library(lorrax_ffi_host SHARED
     ../../../slate/cpp/context.cc
     ../../../slate/cpp/host_ffi.cc
+    ../../../scalapack/cpp/solve_lu_ffi.cc
 )
 
 set_target_properties(lorrax_ffi_host PROPERTIES

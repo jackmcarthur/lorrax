@@ -69,13 +69,15 @@ _CUDA_TARGET_SYMBOLS = {
 }
 
 # Host variants of the slate targets (src/ffi/slate/cpp/host_ffi.cc) —
-# same target names as the CUDA table, registered under platform="cpu".
+# same target names as the CUDA table, registered under platform="cpu" —
+# plus the host-only ScaLAPACK targets (src/ffi/scalapack/, Cray LibSci).
 _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_eigh":              "SlateEighHostFfi",
     "lorrax_slate_potrf":             "SlatePotrfHostFfi",
     "lorrax_slate_trsm":              "SlateTrsmHostFfi",
     "lorrax_slate_batched_potrf":     "SlateBatchedPotrfHostFfi",
     "lorrax_slate_batched_trsm":      "SlateBatchedTrsmHostFfi",
+    "lorrax_scalapack_batched_solve_lu": "ScalapackBatchedSolveLuHostFfi",
 }
 
 # Per-platform library spec: .so filename, env-var override, in-tree build
