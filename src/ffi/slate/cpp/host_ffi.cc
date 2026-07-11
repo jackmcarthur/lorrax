@@ -31,10 +31,14 @@
 // we ask the MOSI layer for a host-valid tile and copy it out, rather than
 // assuming heev wrote through a wrapped user buffer.
 //
-// Concurrency note (same property as the device handlers): each handler
-// issues MPI collectives on the context's dup'd comm, so concurrent
-// invocations on the same comm would be rank-order-unsafe.  Call sites are
-// data-dependent chains (one collective op in flight at a time).
+// Concurrency: each handler issues MPI collectives on the context's dup'd
+// comm, and XLA's CPU runtime DOES execute independent ffi_calls
+// concurrently on its intra-op thread pool (observed e2e 2026-07-11: the
+// per-q potrf calls of factor_c_q raced, matching collectives in a
+// rank-dependent order — one corrupted q tile, intermittent).  Every
+// dispatch below therefore serializes on host_collective_mutex() (ctx.h),
+// shared with the scalapack host handlers that use the same comms.  The
+// CUDA handlers are serialized by the XLA stream and take no lock.
 
 #include <complex>
 #include <cstdint>
@@ -119,6 +123,8 @@ static ffi::Error PotrfDispatch(
 {
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
     if (ctx == nullptr) return null_ctx_error("slate.potrf(host)");
+    std::lock_guard<std::mutex> lock(
+        lorrax_ffi::slate::host_collective_mutex());
 
     const auto dtype = A.element_type();
     if (L_out->element_type() != dtype) {
@@ -233,6 +239,8 @@ static ffi::Error TrsmDispatch(
 {
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
     if (ctx == nullptr) return null_ctx_error("slate.trsm(host)");
+    std::lock_guard<std::mutex> lock(
+        lorrax_ffi::slate::host_collective_mutex());
 
     const auto dtype = A.element_type();
     if (B.element_type() != dtype || X_out->element_type() != dtype) {
@@ -352,6 +360,8 @@ static ffi::Error EighDispatch(
 {
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
     if (ctx == nullptr) return null_ctx_error("slate.eigh(host)");
+    std::lock_guard<std::mutex> lock(
+        lorrax_ffi::slate::host_collective_mutex());
 
     const auto dtype = A.element_type();
     if (Q_out->element_type() != dtype) {
@@ -450,6 +460,8 @@ static ffi::Error BatchedPotrfDispatch(
 {
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
     if (ctx == nullptr) return null_ctx_error("slate.batched_potrf(host)");
+    std::lock_guard<std::mutex> lock(
+        lorrax_ffi::slate::host_collective_mutex());
 
     const auto dtype = A.element_type();
     if (L_out->element_type() != dtype) {
@@ -565,6 +577,8 @@ static ffi::Error BatchedTrsmDispatch(
 {
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
     if (ctx == nullptr) return null_ctx_error("slate.batched_trsm(host)");
+    std::lock_guard<std::mutex> lock(
+        lorrax_ffi::slate::host_collective_mutex());
 
     const auto dtype = A.element_type();
     if (B.element_type() != dtype || X_out->element_type() != dtype) {

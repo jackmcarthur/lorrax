@@ -229,6 +229,10 @@ static ffi::Error SolveLuDispatch(
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "scalapack.solve_lu: ctx_handle is null");
     }
+    // Same-comm collective serialization vs the slate host handlers —
+    // see host_collective_mutex() in slate/cpp/ctx.h.
+    std::lock_guard<std::mutex> lock(
+        lorrax_ffi::slate::host_collective_mutex());
     const auto dtype = A.element_type();
     if (B.element_type() != dtype || X_out->element_type() != dtype) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
