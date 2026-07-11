@@ -65,10 +65,16 @@ G bibliography (all method citations; the home for every "Appendix G" reference)
 
 ## Pre-writing tasks (blockers for Ch. 7/8/App. A)
 
-1. Read `fit_gn_ppm_from_wc_pair`; fix the GN B-normalization statement
-   (physics.md vs GN guide contradict: B/(ω²−Ω²) vs 2BΩ/(ω²−Ω²)).
-2. Verify shipped window scheme (three-window core/stripe/slab) and retire the
-   six-window design note explicitly.
+1. ~~GN B-normalization~~ **RESOLVED 2026-07-10** from `minimax_screening.py:406-423`:
+   model is W_c = 2BΩ/(ω²−Ω²) = B[1/(ω−Ω) − 1/(ω+Ω)]; Ω² = −z²W_c(z)/(W_c(0)−W_c(z)),
+   B = −½W_c(0)Ω, validity Re Ω² > 0. The GN guide was right; `docs/theory/physics.md`
+   §6.9 states B/(ω²−Ω²) and NEEDS UPSTREAM CORRECTION. NB the q→0 head fit uses the
+   *other* normalization (B_h/(ω²−Ω_h²), R_h = B_h/2Ω_h) — App. B must state both.
+2. ~~Window scheme~~ **RESOLVED 2026-07-10** from `ppm_windows.py:250-353`: three
+   windows (core ≤T/HGL; a_stripe E>T/GL; b_slab Ω>T/GL), T = ω_max + edge_factor·ξ,
+   A_core = 2T/ξ; 4 branches {occ,emp}×{±ω}, one crossing branch per half. The
+   six-window note (`dev/notes/NEW_WINDOW_MINIMAX_GUIDELINES.md`) is unshipped design
+   — archive it.
 3. Pin bispinor cost exponents (×4 memory / ×16 runtime claim) against the planner.
 4. Confirm the non-sym-reduced stage list for Appendix A (P_k pair-density k-sum).
 5. Fresh periodic Σ(ω)-vs-BGW gate before §7.6 prints accuracy numbers.

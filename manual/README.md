@@ -16,7 +16,7 @@ outline, editorial threads (T1–T5), and pre-writing task list live in
 | 04 GW in real space and real time | drafted; 3-lens review applied 2026-07-10 |
 | 05 ISDF | drafted; 3-lens review applied 2026-07-10 |
 | 06 The Coulomb interaction | drafted; 3-lens review applied 2026-07-10 |
-| 07 Frequency integration | blocked on pre-writing tasks 1/2/5 (see outline) |
+| 07 Frequency integration | drafted (blockers 1/2 resolved from code; §7.6 periodic numbers blocked on task 5 gate run) |
 | 08 Bispinor GW | not started |
 | 09 Supporting formalisms | not started |
 | 10–13 Reference + architecture | not started |
