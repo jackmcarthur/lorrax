@@ -28,11 +28,14 @@ for the impatient") and never restate what the previous paragraph established. I
 lists and tables, fragments are correct and complete sentences are padding. Bullets
 are for genuinely enumerable things (files, flags, steps), nothing conceptual.
 
-House facts: the full name is "the LOw-scaling Real-space Real-Axis eXcited state
-package in BerkeleyGW". Quantum ESPRESSO is the "DFT starting point", never the
-"front end". No code besides Quantum ESPRESSO and BerkeleyGW is named; write "the
-majority of $O(N^3)$-scaling GW codes" and similar. Forward references are bare
-parentheticals like (§5.4). Bold marks file paths and input keys, nothing else.
+Describe everything in the parlance the quantum chemistry and electronic structure
+community actually uses, not the first generic phrase that comes to mind. When
+naming a method, a role, or a relationship between codes, check how the README,
+the source, and the literature say it and use that; if unsure, look it up rather
+than improvise. No code besides Quantum ESPRESSO and BerkeleyGW is named; write
+"the majority of $O(N^3)$-scaling GW codes" and similar. Forward references are
+bare parentheticals like (§5.4). Bold marks file paths and input keys, nothing
+else.
 
 When in doubt, cut the sentence in half and drop the label. Sections 1.1 and 1.3
 are the reference implementations.
