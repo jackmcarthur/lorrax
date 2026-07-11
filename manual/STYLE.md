@@ -37,5 +37,6 @@ than improvise. No code besides Quantum ESPRESSO and BerkeleyGW is named; write
 bare parentheticals like (§5.4). Bold marks file paths and input keys, nothing
 else.
 
-When in doubt, cut the sentence in half and drop the label. Sections 1.1 and 1.3
-are the reference implementations.
+When in doubt, cut the sentence in half and drop the label. Section 1.1, as
+revised by the lead author, is the reference implementation; diff your draft
+against its register before committing.
