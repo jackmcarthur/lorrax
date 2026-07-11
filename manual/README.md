@@ -10,12 +10,12 @@ outline, editorial threads (T1–T5), and pre-writing task list live in
 | Chapter | State |
 |---|---|
 | 00 Outline | current |
-| 01 Introduction | drafted |
+| 01 Introduction | drafted; 3-lens review applied 2026-07-10 |
 | 02 Installation | not started |
 | 03 Tutorial | not started |
-| 04 GW in real space and real time | drafted |
-| 05 ISDF | drafted |
-| 06 The Coulomb interaction | drafted |
+| 04 GW in real space and real time | drafted; 3-lens review applied 2026-07-10 |
+| 05 ISDF | drafted; 3-lens review applied 2026-07-10 |
+| 06 The Coulomb interaction | drafted; 3-lens review applied 2026-07-10 |
 | 07 Frequency integration | blocked on pre-writing tasks 1/2/5 (see outline) |
 | 08 Bispinor GW | not started |
 | 09 Supporting formalisms | not started |

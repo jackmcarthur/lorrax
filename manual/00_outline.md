@@ -49,15 +49,19 @@ Part II — Theory & Methods (~22 pp)
 
 Part III — Reference (~14 pp)
 10. Workflow & files · 11. Complete input reference (regenerated from `gw_config.py`;
-    + BSE CLI + bandstructure CLI; CI-diffed) · 12. Running at scale
+    + BSE CLI + bandstructure CLI; CI-diffed) · 12. Running at scale: 12.1 execution
+    model · 12.2 memory planning · 12.3 distributed linear algebra · 12.4 parallel
+    I/O · 12.5 troubleshooting
 
 Part IV — Architecture (~5 pp)
-13. Code architecture (module map, distribution model as T2 final resolution, host
-    memory discipline, FFI, tests)
+13. Code architecture: 13.1 module map · 13.2 distribution model (T2 final
+    resolution) · 13.3 host-memory discipline · 13.4 FFI layer · 13.5 testing &
+    frozen gates
 
 Appendices (~7 pp)
 A symmetry (unfold equations; sym-reduced vs not ledger) · B q→0 head/wings ·
-C minimax tables · D file formats · E BGW comparison cookbook · F symbols/units
+C minimax tables · D file formats · E BGW comparison cookbook · F symbols/units ·
+G bibliography (all method citations; the home for every "Appendix G" reference)
 
 ## Pre-writing tasks (blockers for Ch. 7/8/App. A)
 
@@ -68,8 +72,8 @@ C minimax tables · D file formats · E BGW comparison cookbook · F symbols/uni
 3. Pin bispinor cost exponents (×4 memory / ×16 runtime claim) against the planner.
 4. Confirm the non-sym-reduced stage list for Appendix A (P_k pair-density k-sum).
 5. Fresh periodic Σ(ω)-vs-BGW gate before §7.6 prints accuracy numbers.
-6. Bibliography: add Godby–Needs (absent from repo); collect Kim 2020, Hackbusch,
-   Golub–Welsch, Wan–Międlar, Hybertsen–Louie, Leon MPA set.
+6. Bibliography (home: Appendix G): add Godby–Needs (absent from repo); collect Kim
+   2020, Hackbusch, Golub–Welsch, Wan–Międlar, Hybertsen–Louie, Leon MPA set.
 
 ## Source-material map (freq chapter)
 
