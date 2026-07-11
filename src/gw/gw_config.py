@@ -788,7 +788,7 @@ class BackendConfig:
     gspace_io: GspaceIO
     screening_solver: ScreeningSolver
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
-    distributed_lu: str        # "auto" | "off" | "cusolvermp"
+    distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
 
     def summary(self) -> str:
@@ -1326,6 +1326,14 @@ class LorraxConfig:
                     "available via explicit distributed_lu = scalapack."
                 )
                 _dist_lu = "off"
+        elif _dist_lu == "scalapack":
+            # Host-only backend on a non-CPU JAX backend: reject at parse
+            # time — the alternative is a ValueError hours later at the
+            # first transverse solve, after the C_q build.
+            raise ValueError(
+                "distributed_lu=scalapack is host-only (Cray LibSci) but "
+                "the JAX backend is not CPU; use distributed_lu = "
+                "auto|off|cusolvermp on GPU runs.")
         if _slab_io_in != "auto":
             # Explicit backend: no platform second-guessing — a wrong
             # choice fails loudly at SlabIO open (e.g. phdf5_ffi on CPU),

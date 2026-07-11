@@ -958,6 +958,14 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> st
     if override in ('on', 'cusolvermp'):
         return 'cusolvermp_lu' if is_2d else 'lu'
     if override == 'scalapack':
+        plat = mesh_xy.devices.flat[0].platform
+        if plat != 'cpu':
+            # Defense-in-depth for direct callers — gw_config already
+            # rejects scalapack on non-CPU backends at parse time.
+            raise ValueError(
+                f"distributed_lu=scalapack is host-only (Cray LibSci) but "
+                f"the mesh devices are {plat!r}; use distributed_lu = "
+                f"auto|off|cusolvermp on GPU meshes.")
         _require_scalapack_ffi()
         if px > 1 and py > 1 and px != py:
             raise ValueError(
