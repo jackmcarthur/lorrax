@@ -242,7 +242,11 @@ class WfnLoader:
         Rules:
           * Mesh missing → eager (single-device / laptop / pytest).
           * Single-process JAX → eager (no benefit from collective FFI).
-          * Multi-process JAX + mesh provided + FFI .so loadable → phdf5.
+          * Multi-process JAX + mesh provided + CUDA FFI .so loadable →
+            phdf5.  The probe must pin the CUDA library: the phdf5 FFI
+            lives only there, and a bare get_lib() on a CPU backend would
+            "succeed" by loading the slate-only host library and then
+            crash at the first open_file.
           * Anything else → eager.
         """
         if self._mesh is None:
@@ -254,7 +258,7 @@ class WfnLoader:
             return "eager"
         try:
             from ffi.common.ffi_loader import get_lib
-            get_lib()
+            get_lib("CUDA")
             from ffi.phdf5 import open_file as _of  # noqa: F401
             return "phdf5"
         except Exception:

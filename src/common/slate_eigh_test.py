@@ -32,8 +32,10 @@ def _init():
     # Eagerly init MPI_THREAD_MULTIPLE BEFORE JAX touches anything, so PMI
     # is fresh from srun.  phdf5's init_mpi_eager pattern; reused here.
     try:
-        from ffi.common.ffi_loader import get_lib
-        get_lib().lrx_slate_init_mpi()
+        from ffi.common.ffi_loader import get_lib, platform_from_env
+        # Explicit platform: get_lib(None) would initialize the XLA backend
+        # (jax.default_backend()) BEFORE jax.distributed.initialize below.
+        get_lib(platform_from_env()).lrx_slate_init_mpi()
     except Exception as _e:
         print(f"slate_init_mpi skipped: {_e}", flush=True)
     if int(os.environ.get("SLURM_NTASKS", "1")) > 1:

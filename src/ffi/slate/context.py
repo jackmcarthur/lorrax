@@ -36,6 +36,7 @@ from jax.sharding import Mesh
 from ..common import ffi_loader
 
 __all__ = [
+    "ensure_registered",
     "get_or_init_context",
     "get_or_init_subrow_context",
     "validate_mesh",
@@ -45,8 +46,28 @@ __all__ = [
 MeshKey = Tuple[int, int]  # (p, q)
 
 _LOCK = threading.Lock()
-_CACHE: Dict[MeshKey, int] = {}
-_SUBROW_CACHE: Dict[MeshKey, int] = {}
+# (p, q) -> (handle, ffi platform that created it).  A SlateCtx is pure MPI
+# and platform-agnostic, so a GPU mesh and a CPU mesh of the same shape share
+# one ctx; the platform is remembered only so teardown goes through a library
+# that is definitely loaded.
+_CACHE: Dict[MeshKey, Tuple[int, str]] = {}
+_SUBROW_CACHE: Dict[MeshKey, Tuple[int, str]] = {}
+
+
+def _mesh_platform(mesh: Mesh) -> str:
+    plat = mesh.devices.flat[0].platform
+    return "CUDA" if plat in ("gpu", "cuda") else "cpu"
+
+
+def ensure_registered(mesh: Mesh) -> None:
+    """Load + register the FFI library for the MESH's device platform.
+
+    ``jax.ffi.ffi_call`` resolves the target registered for the lowering
+    platform, so the library that matters is the one matching the mesh's
+    devices — not necessarily the default backend (e.g. slate ops on a
+    CPU-device mesh inside a GPU-backend process).  Idempotent.
+    """
+    ffi_loader.get_lib(_mesh_platform(mesh))
 
 
 def validate_mesh(mesh: Mesh, *, require_square: bool = False) -> Tuple[int, int]:
@@ -123,12 +144,13 @@ def validate_tile_layout(n: int, nb: int, p: int, q: int, *, what: str,
 
 
 def _make_ctx(mesh: Mesh) -> int:
-    ffi_loader.get_lib()
+    ensure_registered(mesh)
     rank  = int(jax.process_index())
     world = int(jax.process_count())
     p, q  = validate_mesh(mesh)
     return int(ffi_loader.create_slate_context(
-        rank=rank, world_size=world, p=p, q=q))
+        rank=rank, world_size=world, p=p, q=q,
+        platform=_mesh_platform(mesh)))
 
 
 def get_or_init_context(mesh: Mesh) -> int:
@@ -138,21 +160,22 @@ def get_or_init_context(mesh: Mesh) -> int:
     """
     key = validate_mesh(mesh)
     with _LOCK:
-        h = _CACHE.get(key)
-        if h is not None:
-            return h
+        entry = _CACHE.get(key)
+        if entry is not None:
+            return entry[0]
         h = _make_ctx(mesh)
-        _CACHE[key] = h
+        _CACHE[key] = (h, _mesh_platform(mesh))
         return h
 
 
 def _make_subrow_ctx(mesh: Mesh) -> int:
-    ffi_loader.get_lib()
+    ensure_registered(mesh)
     rank  = int(jax.process_index())
     world = int(jax.process_count())
     Px, Py = validate_mesh(mesh)
     return int(ffi_loader.create_slate_subrow_context(
-        rank=rank, world_size=world, Px=Px, Py=Py))
+        rank=rank, world_size=world, Px=Px, Py=Py,
+        platform=_mesh_platform(mesh)))
 
 
 def get_or_init_subrow_context(mesh: Mesh) -> int:
@@ -166,28 +189,24 @@ def get_or_init_subrow_context(mesh: Mesh) -> int:
     """
     key = validate_mesh(mesh)
     with _LOCK:
-        h = _SUBROW_CACHE.get(key)
-        if h is not None:
-            return h
+        entry = _SUBROW_CACHE.get(key)
+        if entry is not None:
+            return entry[0]
         h = _make_subrow_ctx(mesh)
-        _SUBROW_CACHE[key] = h
+        _SUBROW_CACHE[key] = (h, _mesh_platform(mesh))
         return h
 
 
 def _atexit_teardown() -> None:
-    try:
-        ffi_loader.get_lib()
-    except Exception:
-        return
-    for _, h in list(_CACHE.items()):
+    for _, (h, plat) in list(_CACHE.items()):
         try:
-            ffi_loader.destroy_slate_context(int(h))
+            ffi_loader.destroy_slate_context(int(h), platform=plat)
         except Exception:
             pass
     _CACHE.clear()
-    for _, h in list(_SUBROW_CACHE.items()):
+    for _, (h, plat) in list(_SUBROW_CACHE.items()):
         try:
-            ffi_loader.destroy_slate_context(int(h))
+            ffi_loader.destroy_slate_context(int(h), platform=plat)
         except Exception:
             pass
     _SUBROW_CACHE.clear()

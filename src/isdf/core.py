@@ -898,8 +898,28 @@ def _require_slate_ffi() -> None:
             "distributed_cholesky=slate requested but the SLATE FFI is "
             f"unavailable ({exc}).  Build it with "
             "src/ffi/slate/scripts/build_perlmutter.sh + "
-            "src/ffi/common/cpp/build.sh, or use "
+            "src/ffi/common/cpp/build.sh (CUDA) or "
+            "src/ffi/common/cpp/host/build_host.sh (CPU backend), or use "
             "distributed_cholesky = auto|off|cusolvermp."
+        ) from exc
+
+
+def _require_scalapack_ffi() -> None:
+    """Raise with an actionable message unless the ScaLAPACK host FFI is
+    loadable.  Host-only optional dependency (Cray LibSci via
+    liblorrax_ffi_host.so): nothing imports it unless the input file
+    explicitly selects ``distributed_lu = scalapack``.
+    """
+    try:
+        from ffi.common.ffi_loader import get_lib
+        get_lib("cpu")
+        from ffi.scalapack import batched_distributed_solve_lu  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(
+            "distributed_lu=scalapack requested but the ScaLAPACK host FFI "
+            f"is unavailable ({exc}).  Build it with "
+            "src/ffi/common/cpp/host/build_host.sh (host-only backend — on "
+            "GPU meshes use distributed_lu = auto|off|cusolvermp)."
         ) from exc
 
 
@@ -921,6 +941,11 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> st
       ``off``        → force per-q ``jnp.linalg.solve``.
       ``cusolvermp`` → force cuSolverMp (still falls back on 1D meshes;
                        legacy alias ``on``).
+      ``scalapack``  → ScaLAPACK ``pXgetrf``+``pXgetrs`` from Cray LibSci
+                       — the host/CPU-backend backend (liblorrax_ffi_host).
+                       EXPLICIT choice, never auto-picked; fails loudly if
+                       the host FFI is absent, and requires a square or
+                       1-D mesh (pXgetrf needs square blocks).
       ``auto`` (default) → cuSolverMp on true 2D, legacy otherwise.
       (No ``slate`` value: a SLATE getrf wrapper does not exist yet.)
     """
@@ -932,6 +957,23 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> st
         return 'lu'
     if override in ('on', 'cusolvermp'):
         return 'cusolvermp_lu' if is_2d else 'lu'
+    if override == 'scalapack':
+        plat = mesh_xy.devices.flat[0].platform
+        if plat != 'cpu':
+            # Defense-in-depth for direct callers — gw_config already
+            # rejects scalapack on non-CPU backends at parse time.
+            raise ValueError(
+                f"distributed_lu=scalapack is host-only (Cray LibSci) but "
+                f"the mesh devices are {plat!r}; use distributed_lu = "
+                f"auto|off|cusolvermp on GPU meshes.")
+        _require_scalapack_ffi()
+        if px > 1 and py > 1 and px != py:
+            raise ValueError(
+                f"distributed_lu=scalapack: mesh {px}x{py} unsupported — "
+                f"pXgetrf needs square descriptor blocks, which the "
+                f"one-tile-per-rank layout only gives on square or 1-D "
+                f"meshes.")
+        return 'scalapack_lu'
 
     return 'cusolvermp_lu' if is_2d else 'lu'
 
@@ -1296,20 +1338,20 @@ def solve_zeta(
 
     solver_kind = _resolve_solver_kind(mesh_xy, vertex_mu_L, solver_kind)
 
-    if solver_kind == 'cusolvermp_lu' and mu_pad:
+    if solver_kind in ('cusolvermp_lu', 'scalapack_lu') and mu_pad:
         Px_ = int(mesh_xy.shape['x'])
         Py_ = int(mesh_xy.shape['y'])
         if (n_log % Px_) or (n_log % Py_):
             # The indefinite solve MUST run at the logical extent (see
-            # ``n_rmu_logical`` above), but cuSolverMp's block-cyclic
+            # ``n_rmu_logical`` above), but the distributed block-cyclic
             # descriptors need n % Px == n % Py == 0.  Fall back to the
             # per-q replicated LU, which runs at any logical extent.
             import warnings
             warnings.warn(
                 f"solve_zeta: n_rmu_logical={n_log} not divisible by the "
                 f"{Px_}x{Py_} mesh axes; transverse LU falls back from "
-                f"cuSolverMp to the per-q jnp.linalg.solve path so the "
-                f"solve can run at the logical extent.")
+                f"the distributed backend to the per-q jnp.linalg.solve "
+                f"path so the solve can run at the logical extent.")
             solver_kind = 'lu'
 
     if solver_kind == 'cusolvermp_cholesky':
@@ -1339,12 +1381,17 @@ def solve_zeta(
             return zeta_out[:, :, :n_zchunk]
         return zeta_out
 
-    if solver_kind == 'cusolvermp_lu':
+    if solver_kind in ('cusolvermp_lu', 'scalapack_lu'):
         # Distributed getrf+getrs for the transverse channels.  L_q here
         # is the *unfactored* CCT^μ (Hermitian indefinite) — factor_c_q
         # passes it through.  Same input sharding, output reshard, and
-        # column padding pattern as the cholesky branch.
-        from ffi.cusolvermp import batched_distributed_solve_lu
+        # column padding pattern as the cholesky branch.  The two
+        # backends share this branch verbatim — identical call contract;
+        # scalapack is the host/CPU-backend twin (Cray LibSci).
+        if solver_kind == 'scalapack_lu':
+            from ffi.scalapack import batched_distributed_solve_lu
+        else:
+            from ffi.cusolvermp import batched_distributed_solve_lu
         Px = int(mesh_xy.shape['x'])
         Py = int(mesh_xy.shape['y'])
         # getrs descB requires NRHS % Py == 0 (see pad_last_axis_to).

@@ -168,8 +168,10 @@ of scope; cuSOLVERMp is the answer if you need rectangular meshes.
                   + `get_or_init_subrow_context` for the batched sub-comm.
 - `cpp/ctx.h`           — `SlateCtx` struct.
 - `cpp/context.cc`      — `lrx_slate_{context,subrow_context}_create/destroy/init_mpi`.
-- `cpp/{eigh,potrf,trsm}_ffi.cc` — XLA FFI handlers per op.
-- `cpp/batched_{potrf,trsm}_ffi.cc` — batched variants (sub-row comm).
+- `cpp/{eigh,potrf,trsm}_ffi.cc` — XLA FFI handlers per op (CUDA).
+- `cpp/batched_{potrf,trsm}_ffi.cc` — batched variants (sub-row comm, CUDA).
+- `cpp/host_ffi.cc` — host-platform variants of all five handlers
+  (JAX CPU backend; compiled only into `liblorrax_ffi_host.so`).
 - `scripts/stage_cray.sh` — populate `$HOME/software/lorrax_slate_cray/stage`
   with libsci + libmpi_gtl_cuda + xpmem + lustreapi (run once per
   module update).
@@ -225,18 +227,50 @@ export LORRAX_FFI_SO=$LORRAX_FFI_BUILD_DIR/liblorrax_ffi.so   # loader override
 export LORRAX_SLATE_INSTALL_DIR=...                            # LDLIB override
 ```
 
-### CPU story (status)
+### CPU story — host platform SUPPORTED (2026-07-10)
 
-The SLATE *library* is CPU-ready (the `cpu` build passes potrf/trsm/heev
-on Milan nodes at machine precision).  The FFI layer is **GPU-only**:
-every handler binds `PlatformStream<cudaStream_t>`, stages with
-`cudaMemcpyAsync`, builds matrices via `fromDevices()`, hardcodes
-`Target::Devices`, and `ffi_loader.py` registers `platform="CUDA"` only —
-and `liblorrax_ffi.so` hard-links cuSOLVERMp/NCCL/cudart.  A CPU port
-needs host handler variants (`fromScaLAPACK` + `Target::HostTask`,
-plain `memcpy`, no stream ctx), a CUDA-free .so target, and per-platform
-registration (`platform="Host"`).  See
-`reports/slate_linalg_ffi_2026-07-10/report.md` (P2) for the estimate.
+The slate ops run on the JAX CPU backend through host handler variants
+(`cpp/host_ffi.cc`): `fromScaLAPACK()` on the host buffers (same 2-D
+block-cyclic layout + GridOrder::Col as `fromDevices`, so the local
+transposes, comm rank-remap, and every mesh/tile validation carry
+unchanged), `Target::HostTask`, plain `memcpy` staging, no stream ctx.
+They compile ONLY into a separate CUDA-free library:
+
+```
+bash src/ffi/common/cpp/host/build_host.sh     # → host/build/liblorrax_ffi_host.so
+```
+
+built host-side (Cray PE, no container) against the `cpu`
+(`gpu_backend=none`) SLATE install, with the XLA FFI headers staged from
+the container's jaxlib (the runtime the .so must match).  The script
+fails if the result links any CUDA-stack library.
+
+`ffi_loader.py` registers the host handlers under `platform="cpu"` and
+the CUDA ones under `platform="CUDA"` — same target names, so
+`jax.ffi.ffi_call` sites resolve by lowering platform exactly like
+jaxlib's cpu (lapack) vs CUDA (cusolver) kernel split.  Wrapper call
+sites pick the library from the MESH's device platform
+(`context.ensure_registered`), so slate-on-CPU-devices works even inside
+a GPU-backend process.  Input-file selection: `distributed_cholesky =
+slate` now passes through on the CPU backend (still never auto-picked;
+still fails loudly with build pointers when the library is absent).
+
+Tests: `tests/test_ffi_linalg_contract.py::test_slate_*_cpu` (1×1 CPU
+mesh, skipif-clean without the host lib) + the CLI matrix under
+`JAX_PLATFORMS=cpu` for multi-rank CPU meshes.  The first additional
+host backend landed the same way: `ffi.scalapack` (Cray LibSci
+pXgetrf+pXgetrs, `distributed_lu = scalapack`) compiles into the same
+library and registration table — see `src/ffi/scalapack/`.
+
+Dual-lib caveat (GPU nodes): both SLATE builds install `libslate.so.2`,
+so when the CUDA FFI library loads first its `libslate` satisfies the
+host library's DT_NEEDED too — the in-process `*_cpu` tests on a GPU
+node exercise the host HANDLERS (`fromScaLAPACK` + `Target::HostTask`)
+against the cuda-built SLATE running host-side.  That is a supported
+SLATE configuration, and the `gpu_backend=none` binary itself is
+validated where it actually deploys — CPU nodes, where only the host
+library loads (bare-metal Milan runs: 7/7 pytest, 2×2 + 4×1 CLI clean,
+2026-07-10).
 
 Tests under `src/common/slate_*_test.py` and `slate_*_bench.py`; run
 via `lxrun` (inside an `lxalloc`-created allocation).

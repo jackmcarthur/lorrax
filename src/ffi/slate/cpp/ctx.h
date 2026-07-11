@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <mpi.h>
 
 namespace lorrax_ffi::slate {
@@ -29,5 +30,19 @@ struct SlateCtx {
     MPI_Comm comm = MPI_COMM_NULL; // remapped comm passed to SLATE
     bool     owns_comm = false;
 };
+
+// Serialization for the HOST-platform handlers (slate host_ffi.cc +
+// scalapack solve_lu_ffi.cc).  XLA's CPU runtime may execute independent
+// ffi_calls concurrently on its intra-op thread pool; two handlers
+// issuing MPI collectives on the same (dup'd) comm from different
+// threads match collectives in a rank-dependent order — silent
+// corruption (observed e2e: per-q potrf calls, one corrupted q tile,
+// intermittent).  The CUDA handlers are serialized by the XLA stream
+// and do not take this lock.  One mutex per shared object (inline
+// static), covering every comm the ctx cache hands out.
+inline std::mutex& host_collective_mutex() {
+    static std::mutex m;
+    return m;
+}
 
 }  // namespace lorrax_ffi::slate

@@ -29,8 +29,7 @@ import jax.numpy as jnp
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
-from ..common.ffi_loader import get_lib
-from .context import (get_or_init_context, validate_mesh,
+from .context import (ensure_registered, get_or_init_context, validate_mesh,
                       validate_tile_layout)
 
 __all__ = ["SlateLowerL", "distributed_cholesky"]
@@ -89,7 +88,7 @@ def distributed_cholesky(
             f"distributed_cholesky: n={n} must be divisible by both mesh "
             f"axes ({p},{q}).")
 
-    get_lib()
+    ensure_registered(mesh)
     ctx_handle = get_or_init_context(mesh)
 
     # Default tile size divides by the larger grid axis so each rank

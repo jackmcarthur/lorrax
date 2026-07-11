@@ -14,6 +14,20 @@ cuBLASMp, SLATE, NCCL, MPI) is absent — ``_ffi_skip_reason`` probes by
 actually loading the library.  Nothing here may fail on a machine
 without the FFI stack.
 
+Host platform: the slate ops also have CPU-backend handlers
+(``liblorrax_ffi_host.so``, registered under platform="cpu" — see
+src/ffi/slate/cpp/host_ffi.cc).  The ``*_cpu`` tests run the SAME check
+bodies on a 1x1 mesh of CPU devices in this very process (works on GPU
+nodes too: ``jax.ffi.ffi_call`` picks the handler by lowering platform)
+and skip cleanly when the host library is absent.  Multi-rank CPU
+meshes: run the CLI mode under ``JAX_PLATFORMS=cpu`` (non-slate cells
+are skipped there; ``--only slate`` narrows the log to the same set).
+Note: when BOTH libraries are loaded (GPU node), the shared
+``libslate.so.2`` soname means the host handlers run against the
+already-loaded cuda-build SLATE (host-side execution) — the
+``gpu_backend=none`` binary is exercised on CPU nodes, where the host
+library loads alone (see src/ffi/slate/README.md "Dual-lib caveat").
+
 Multi-rank findings this file pins (see
 reports/slate_linalg_ffi_2026-07-10/report.md for the full matrix):
 
@@ -48,13 +62,21 @@ if __name__ == "__main__":
     os.environ.setdefault("JAX_ENABLE_X64", "1")
     os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
     if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
+        # Platform must be EXPLICIT here: get_lib(None) asks
+        # jax.default_backend(), which would initialize XLA before
+        # jax.distributed.initialize.
+        from ffi.common.ffi_loader import platform_from_env
+        _plat = platform_from_env()
         try:
             from ffi.common.ffi_loader import get_lib as _get_lib
-            _get_lib().lrx_slate_init_mpi()
+            _get_lib(_plat).lrx_slate_init_mpi()
         except Exception as _exc:
             print(f"slate_init_mpi skipped: {_exc}", flush=True)
         import jax
-        jax.distributed.initialize(local_device_ids=[0])
+        if _plat == "CUDA":
+            jax.distributed.initialize(local_device_ids=[0])
+        else:
+            jax.distributed.initialize()
 
 # ---------------------------------------------------------------------------
 # Availability probes (module import must stay cheap + exception-free).
@@ -78,20 +100,51 @@ def _ffi_skip_reason():
         return "contract tests are single-process (use the CLI mode)"
     try:
         from ffi.common.ffi_loader import get_lib
-        get_lib()
+        get_lib("CUDA")
     except Exception as exc:
         return f"liblorrax_ffi.so unavailable: {exc}"
+    return None
+
+
+def _host_ffi_skip_reason():
+    """Return None if liblorrax_ffi_host.so loads, else the skip reason.
+
+    The host library is CUDA-free (slate + MPI only), so this probe
+    passes on CPU-only machines where ``_ffi_skip_reason`` skips.
+    """
+    try:
+        import jax
+        jax.devices("cpu")
+    except Exception as exc:
+        return f"jax cpu backend unavailable: {exc}"
+    if jax.process_count() != 1:
+        return "contract tests are single-process (use the CLI mode)"
+    try:
+        from ffi.common.ffi_loader import get_lib
+        get_lib("cpu")
+    except Exception as exc:
+        return f"liblorrax_ffi_host.so unavailable: {exc}"
     return None
 
 
 _SKIP = _ffi_skip_reason()
 needs_ffi = pytest.mark.skipif(_SKIP is not None, reason=_SKIP or "")
 
+_HOST_SKIP = _host_ffi_skip_reason()
+needs_host_ffi = pytest.mark.skipif(_HOST_SKIP is not None,
+                                    reason=_HOST_SKIP or "")
+
 
 def _mesh_1x1():
     import jax
     from jax.sharding import Mesh
     return Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+
+
+def _mesh_cpu_1x1():
+    import jax
+    from jax.sharding import Mesh
+    return Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
 
 
 def _mesh_from_arg(spec):
@@ -295,6 +348,32 @@ def check_cublasmp_wsolve(mesh, dtype, nq=2, n=32, pref=0.37):
         res = (np.linalg.norm(W1[q] - W_ref)
                / max(np.linalg.norm(W_ref), 1.0))
         assert res < 1e-11, f"q={q}: w_solve residual {res:.3e}"
+
+
+def check_scalapack_lu(mesh, dtype, nq=2, n=32, nrhs=16, herm=True):
+    """Host-platform twin of check_cusolvermp_lu — ScaLAPACK pXgetrf+
+    pXgetrs (Cray LibSci) through ffi.scalapack, same math contract."""
+    from ffi.scalapack import batched_distributed_solve_lu
+    rng = np.random.default_rng(11)
+    if herm:
+        A_np = _herm(rng, nq, n, dtype)     # Hermitian INDEFINITE
+    else:
+        A_np = _rng_mat(rng, (nq, n, n), dtype) + n * np.eye(n)[None]
+        A_np = A_np.astype(dtype)
+    B_np = _rng_mat(rng, (nq, n, nrhs), dtype)
+
+    def solve():
+        A = _put(A_np, mesh, (None, "x", "y"))
+        B = _put(B_np, mesh, (None, "x", "y"))
+        return _gather(batched_distributed_solve_lu(A, B, mesh=mesh))
+
+    X1 = solve()
+    X2 = solve()
+    assert np.array_equal(X1, X2), "scalapack solve_lu rerun not bit-deterministic"
+    for q in range(nq):
+        res = (np.linalg.norm(A_np[q] @ X1[q] - B_np[q])
+               / max(np.linalg.norm(B_np[q]), 1.0))
+        assert res < 1e-10, f"q={q}: res={res:.3e}"
 
 
 def check_slate_chol_trsm(mesh, dtype, n=32, m=32):
@@ -538,6 +617,73 @@ def test_slate_tile_layout_validation():
 
 
 # ---------------------------------------------------------------------------
+# Host platform (JAX CPU backend) — the same slate check bodies on a 1x1
+# mesh of CPU devices, exercising liblorrax_ffi_host.so's handlers
+# (fromScaLAPACK + Target::HostTask) through the unchanged Python wrappers.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def mesh_cpu11():
+    return _mesh_cpu_1x1()
+
+
+@needs_host_ffi
+@pytest.mark.parametrize("dtype", ["complex128", "float64"])
+def test_slate_cholesky_trsm_cpu(mesh_cpu11, dtype):
+    check_slate_chol_trsm(mesh_cpu11, dtype)
+
+
+@needs_host_ffi
+@pytest.mark.parametrize("m", [16, 48])
+def test_slate_trsm_rectangular_rhs_cpu(mesh_cpu11, m):
+    check_slate_chol_trsm(mesh_cpu11, "complex128", n=32, m=m)
+
+
+@needs_host_ffi
+def test_slate_batched_cholesky_trsm_cpu(mesh_cpu11):
+    check_slate_batched(mesh_cpu11, "complex128")
+
+
+@needs_host_ffi
+@pytest.mark.parametrize("dtype", ["complex128", "float64"])
+def test_slate_eigh_true_eigenvectors_cpu(mesh_cpu11, dtype):
+    check_slate_eigh(mesh_cpu11, dtype)
+
+
+@needs_host_ffi
+@pytest.mark.parametrize("dtype", ["complex128", "float64"])
+def test_scalapack_solve_lu_hermitian_indefinite_cpu(mesh_cpu11, dtype):
+    check_scalapack_lu(mesh_cpu11, dtype)
+
+
+@needs_host_ffi
+def test_scalapack_solve_lu_general_cpu(mesh_cpu11):
+    check_scalapack_lu(mesh_cpu11, "complex128", herm=False)
+
+
+@needs_host_ffi
+def test_scalapack_resolver_and_host_only_guard(mesh_cpu11):
+    """distributed_lu=scalapack resolves to scalapack_lu (explicit only —
+    auto never picks it); a GPU-device mesh is rejected loudly."""
+    from isdf.core import _resolve_solver_kind_transverse
+    assert _resolve_solver_kind_transverse(
+        mesh_cpu11, "scalapack") == "scalapack_lu"
+    assert _resolve_solver_kind_transverse(
+        mesh_cpu11, "auto") != "scalapack_lu"
+    import jax
+    from ffi.scalapack import batched_distributed_solve_lu
+    gpus = [d for d in jax.devices() if d.platform in ("gpu", "cuda")]
+    if gpus:
+        from jax.sharding import Mesh
+        gpu_mesh = Mesh(np.asarray(gpus[:1]).reshape(1, 1), ("x", "y"))
+        A = jax.numpy.zeros((1, 8, 8), dtype="complex128")
+        B = jax.numpy.zeros((1, 8, 4), dtype="complex128")
+        with pytest.raises(ValueError, match="host-only"):
+            batched_distributed_solve_lu(A, B, mesh=gpu_mesh)
+
+
+# ---------------------------------------------------------------------------
 # CLI mode — the multi-rank matrix.  Same checks on a PxQ process mesh.
 # ---------------------------------------------------------------------------
 
@@ -570,6 +716,14 @@ _CLI_CELLS = [
                                           nrhs=16)),
     ("slate_eigh", True,
      lambda mesh, dt: check_slate_eigh(mesh, dt, n=64)),
+    # Host-only (skipped on CUDA backends by the platform gate below).
+    # No needs_square: scalapack's square-block requirement is satisfied
+    # on square AND 1-D meshes (g = n/max(p,q)); p!=q with both >1 GUARDs.
+    ("scalapack_lu", False,
+     lambda mesh, dt: check_scalapack_lu(mesh, dt, n=64, nrhs=32)),
+    ("scalapack_lu_general", False,
+     lambda mesh, dt: check_scalapack_lu(mesh, dt, n=64, nrhs=32,
+                                         herm=False)),
 ]
 
 
@@ -584,10 +738,23 @@ def _cli_main():
     mesh = _mesh_from_arg(args.mesh)
     px = int(mesh.shape["x"])
     py = int(mesh.shape["y"])
+    is_cpu = jax.default_backend() == "cpu"
+    if jax.process_index() == 0:
+        print(f"backend={jax.default_backend()} mesh={args.mesh}", flush=True)
 
     failures = 0
     for name, needs_square, fn in _CLI_CELLS:
         if args.only and args.only not in name:
+            continue
+        if is_cpu and not name.startswith(("slate", "scalapack")):
+            if jax.process_index() == 0:
+                print(f"SKIP {name}[{args.mesh}] (CUDA-only backend)",
+                      flush=True)
+            continue
+        if not is_cpu and name.startswith("scalapack"):
+            if jax.process_index() == 0:
+                print(f"SKIP {name}[{args.mesh}] (host-only backend)",
+                      flush=True)
             continue
         for dt in ("complex128", "float64"):
             tag = f"{name}[{args.mesh},{dt}]"
@@ -627,8 +794,7 @@ if __name__ == "__main__":
 # (factor_c_q wiring; see isdf.core._resolve_solver_kind_charge)
 # ---------------------------------------------------------------------------
 
-@needs_ffi
-def test_factor_c_q_slate_matches_reference():
+def check_factor_c_q_slate(mesh):
     """factor_c_q(solver_kind='slate_cholesky') returns a conventional L
     equal to the numpy Cholesky (1×1 mesh), so downstream solve_zeta's
     triangular-solve branch consumes it unchanged."""
@@ -637,7 +803,6 @@ def test_factor_c_q_slate_matches_reference():
     from jax.sharding import NamedSharding, PartitionSpec as P
     from isdf.core import factor_c_q, _resolve_solver_kind_charge
 
-    mesh = _mesh_1x1()
     assert _resolve_solver_kind_charge(mesh, "slate") == "slate_cholesky"
 
     rng = np.random.default_rng(7)
@@ -654,6 +819,18 @@ def test_factor_c_q_slate_matches_reference():
     # Determinism: second call bit-identical.
     L2 = np.asarray(factor_c_q(C_dev, mesh, solver_kind="slate_cholesky"))
     assert np.array_equal(L, L2)
+
+
+@needs_ffi
+def test_factor_c_q_slate_matches_reference():
+    check_factor_c_q_slate(_mesh_1x1())
+
+
+@needs_host_ffi
+def test_factor_c_q_slate_matches_reference_cpu():
+    # Same production wiring on a CPU-device mesh — the input-file
+    # ``distributed_cholesky = slate`` path a CPU-backend run takes.
+    check_factor_c_q_slate(_mesh_cpu_1x1())
 
 
 @needs_ffi

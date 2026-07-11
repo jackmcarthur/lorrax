@@ -41,9 +41,8 @@ import jax.numpy as jnp
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
-from ..common.ffi_loader import get_lib
-from .context import (get_or_init_subrow_context, validate_mesh,
-                      validate_tile_layout)
+from .context import (ensure_registered, get_or_init_subrow_context,
+                      validate_mesh, validate_tile_layout)
 
 __all__ = [
     "SlateBatchedLowerL",
@@ -66,7 +65,13 @@ _DIAG  = {"N": 0, "U": 1}
 _JIT_CACHE: dict = {}
 
 def _mesh_key(mesh: Mesh):
-    return (tuple(mesh.axis_names), tuple(int(s) for s in mesh.shape.values()))
+    # Device identity (platform + ids) must be part of the key: two meshes
+    # with the same axis names/shape but different devices (e.g. a GPU 1x1
+    # and a CPU 1x1 in one process) lower to DIFFERENT platform handlers.
+    return (tuple(mesh.axis_names),
+            tuple(int(s) for s in mesh.shape.values()),
+            mesh.devices.flat[0].platform,
+            tuple(d.id for d in mesh.devices.flat))
 
 
 @dataclass(frozen=True)
@@ -125,7 +130,7 @@ def batched_distributed_cholesky(
             f"batched_distributed_cholesky: N={n} must be divisible by "
             f"mesh 'y' axis size {Py}.")
 
-    get_lib()
+    ensure_registered(mesh)
     ctx_handle = get_or_init_subrow_context(mesh)
 
     nb_batch_local = nbatch // Px
@@ -244,7 +249,7 @@ def batched_distributed_trsm(
         raise ValueError(
             f"N={n}, M={m} must be divisible by mesh 'y' axis {Py}.")
 
-    get_lib()
+    ensure_registered(mesh)
     ctx_handle = get_or_init_subrow_context(mesh)
     nbatch_local = nbatch // Px
     nb = n // Py if block_size is None else int(block_size)

@@ -298,8 +298,10 @@ _DEFAULTS = {
     #       GPU meshes, in-tree sharded_cholesky otherwise.  slate is the
     #       portability path (Frontier/Aurora); explicit request fails
     #       loudly if the FFI/library is absent (optional dependency).
-    #   distributed_lu = auto | off | cusolvermp
-    #       transverse-channel LU (SLATE getrf wrapper not yet written).
+    #   distributed_lu = auto | off | cusolvermp | scalapack
+    #       transverse-channel LU.  scalapack = the host/CPU-backend
+    #       backend (Cray LibSci pXgetrf+pXgetrs via liblorrax_ffi_host);
+    #       explicit, never auto-picked.  (SLATE getrf not yet written.)
     # Legacy aliases (deprecation-warned): cusolvermp_charge /
     # cusolvermp_lu with values auto|on|off (on → cusolvermp).
     "distributed_cholesky": "auto",
@@ -786,7 +788,7 @@ class BackendConfig:
     gspace_io: GspaceIO
     screening_solver: ScreeningSolver
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
-    distributed_lu: str        # "auto" | "off" | "cusolvermp"
+    distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
 
     def summary(self) -> str:
@@ -1263,10 +1265,11 @@ class LorraxConfig:
             raise ValueError(
                 f"distributed_cholesky={_dist_chol!r} invalid; expected "
                 f"auto / off / cusolvermp / slate.")
-        if _dist_lu not in ("auto", "off", "cusolvermp"):
+        if _dist_lu not in ("auto", "off", "cusolvermp", "scalapack"):
             raise ValueError(
                 f"distributed_lu={_dist_lu!r} invalid; expected auto / off "
-                f"/ cusolvermp (a SLATE getrf wrapper does not exist yet).")
+                f"/ cusolvermp / scalapack (a SLATE getrf wrapper does not "
+                f"exist yet; scalapack is the host/CPU-backend option).")
         try:
             import jax as _jax
             _is_cpu_backend = _jax.default_backend() == "cpu"
@@ -1299,21 +1302,38 @@ class LorraxConfig:
                         "the system's parallel HDF5 to get PHDF5_HOST."
                     )
                     _slab_io_choice = SlabIOBackend.H5PY_ALLGATHER
-            if _dist_chol != "off":
+            if _dist_chol not in ("off", "slate"):
+                # slate passes through: it has a host-platform FFI
+                # (liblorrax_ffi_host.so, Target::HostTask) and keeps the
+                # explicit-request-fails-loudly semantics on CPU too.
                 print_fn(
                     f"  [config] distributed_cholesky={_dist_chol} "
-                    "requested but JAX backend is CPU; the cuSOLVERMp and "
-                    "SLATE FFIs are CUDA-only today.  Forcing 'off' "
-                    "(in-tree sharded_cholesky)."
+                    "requested but JAX backend is CPU; cuSOLVERMp is "
+                    "CUDA-only and auto never picks SLATE.  Forcing 'off' "
+                    "(in-tree sharded_cholesky).  SLATE's host FFI is "
+                    "available via explicit distributed_cholesky = slate."
                 )
                 _dist_chol = "off"
-            if _dist_lu != "off":
+            if _dist_lu not in ("off", "scalapack"):
+                # scalapack passes through: it is the host-platform LU
+                # backend and keeps explicit-request-fails-loudly
+                # semantics on CPU too.
                 print_fn(
                     f"  [config] distributed_lu={_dist_lu} requested "
-                    "but JAX backend is CPU; cuSOLVERMp is CUDA-only.  "
-                    "Forcing 'off' (in-tree per-q jnp.linalg.solve)."
+                    "but JAX backend is CPU; cuSOLVERMp is CUDA-only and "
+                    "auto never picks ScaLAPACK.  Forcing 'off' (in-tree "
+                    "per-q jnp.linalg.solve).  The ScaLAPACK host FFI is "
+                    "available via explicit distributed_lu = scalapack."
                 )
                 _dist_lu = "off"
+        elif _dist_lu == "scalapack":
+            # Host-only backend on a non-CPU JAX backend: reject at parse
+            # time — the alternative is a ValueError hours later at the
+            # first transverse solve, after the C_q build.
+            raise ValueError(
+                "distributed_lu=scalapack is host-only (Cray LibSci) but "
+                "the JAX backend is not CPU; use distributed_lu = "
+                "auto|off|cusolvermp on GPU runs.")
         if _slab_io_in != "auto":
             # Explicit backend: no platform second-guessing — a wrong
             # choice fails loudly at SlabIO open (e.g. phdf5_ffi on CPU),
