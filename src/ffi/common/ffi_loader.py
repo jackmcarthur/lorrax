@@ -171,38 +171,15 @@ def _set_argtypes(lib: ctypes.CDLL, platform: str) -> None:
 
 
 def _declare_cuda_stack(lib: ctypes.CDLL) -> None:
-    """NCCL / cuSOLVERMp / phdf5 lifecycle — liblorrax_ffi.so only."""
+    """NCCL / cuSOLVERMp / phdf5 lifecycle — liblorrax_ffi.so only.
 
-    lib.lrx_nccl_unique_id_bytes.argtypes = []
-    lib.lrx_nccl_unique_id_bytes.restype  = ctypes.c_int
+    The .so may be a modular build (e.g. cuSolverMp-only, no phdf5): each
+    subpackage's entry points are declared only if its symbols are present,
+    so a partial library loads without AttributeError.  Symbol presence
+    mirrors the LORRAX_FFI_HAVE_* CMake flags / api.cc #ifdef guards.
+    """
 
-    lib.lrx_fill_nccl_unique_id.argtypes = [
-        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
-    ]
-    lib.lrx_fill_nccl_unique_id.restype = ctypes.c_int
-
-    lib.lrx_create_cusolvermp_context.argtypes = [
-        ctypes.c_int,                       # rank
-        ctypes.c_int,                       # world_size
-        ctypes.c_void_p,                    # nccl_unique_id_addr
-        ctypes.c_int,                       # nccl_unique_id_nbytes
-        ctypes.c_int,                       # p
-        ctypes.c_int,                       # q
-        ctypes.c_int,                       # grid_layout_col_major
-        ctypes.POINTER(ctypes.c_int64),     # ctx_out
-        ctypes.c_char_p,                    # err_out
-        ctypes.c_int,                       # err_cap
-    ]
-    lib.lrx_create_cusolvermp_context.restype = ctypes.c_int
-
-    lib.lrx_destroy_cusolvermp_context.argtypes = [ctypes.c_int64]
-    lib.lrx_destroy_cusolvermp_context.restype  = None
-
-    lib.lrx_smoke_allreduce_sum.argtypes = [
-        ctypes.c_int64, ctypes.c_void_p, ctypes.c_int,
-    ]
-    lib.lrx_smoke_allreduce_sum.restype = ctypes.c_int
-
+    # Always present (api.cc compiles lrx_version_info unconditionally).
     lib.lrx_version_info.argtypes = [
         ctypes.POINTER(ctypes.c_int),
         ctypes.POINTER(ctypes.c_int),
@@ -210,7 +187,40 @@ def _declare_cuda_stack(lib: ctypes.CDLL) -> None:
     ]
     lib.lrx_version_info.restype = ctypes.c_int
 
-    # phdf5 lifecycle
+    if hasattr(lib, "lrx_create_cusolvermp_context"):
+        lib.lrx_nccl_unique_id_bytes.argtypes = []
+        lib.lrx_nccl_unique_id_bytes.restype  = ctypes.c_int
+
+        lib.lrx_fill_nccl_unique_id.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ]
+        lib.lrx_fill_nccl_unique_id.restype = ctypes.c_int
+
+        lib.lrx_create_cusolvermp_context.argtypes = [
+            ctypes.c_int,                       # rank
+            ctypes.c_int,                       # world_size
+            ctypes.c_void_p,                    # nccl_unique_id_addr
+            ctypes.c_int,                       # nccl_unique_id_nbytes
+            ctypes.c_int,                       # p
+            ctypes.c_int,                       # q
+            ctypes.c_int,                       # grid_layout_col_major
+            ctypes.POINTER(ctypes.c_int64),     # ctx_out
+            ctypes.c_char_p,                    # err_out
+            ctypes.c_int,                       # err_cap
+        ]
+        lib.lrx_create_cusolvermp_context.restype = ctypes.c_int
+
+        lib.lrx_destroy_cusolvermp_context.argtypes = [ctypes.c_int64]
+        lib.lrx_destroy_cusolvermp_context.restype  = None
+
+        lib.lrx_smoke_allreduce_sum.argtypes = [
+            ctypes.c_int64, ctypes.c_void_p, ctypes.c_int,
+        ]
+        lib.lrx_smoke_allreduce_sum.restype = ctypes.c_int
+
+    # phdf5 lifecycle — only in builds with LORRAX_FFI_HAVE_PHDF5.
+    if not hasattr(lib, "lrx_phdf5_open"):
+        return
     lib.lrx_phdf5_open.argtypes = [
         ctypes.c_char_p,                     # path
         ctypes.c_int, ctypes.c_int,          # p, q
@@ -246,9 +256,11 @@ def _declare_cuda_stack(lib: ctypes.CDLL) -> None:
 
 
 def _declare_slate(lib: ctypes.CDLL) -> None:
-    """SLATE context lifecycle — exported by BOTH platform libraries
-    (slate/cpp/context.cc is pure MPI and compiled into each)."""
+    """SLATE context lifecycle — present only in builds with the SLATE
+    subpackage (LORRAX_FFI_HAVE_SLATE); skipped otherwise."""
 
+    if not hasattr(lib, "lrx_slate_context_create"):
+        return
     lib.lrx_slate_context_create.argtypes = [
         ctypes.c_int,           # rank
         ctypes.c_int,           # world_size
@@ -275,6 +287,9 @@ def _declare_slate(lib: ctypes.CDLL) -> None:
 
 def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
     for target_name, cpp_symbol in _PLATFORMS[platform]["targets"].items():
+        # Modular build: skip handlers whose subpackage wasn't compiled in.
+        if not hasattr(lib, cpp_symbol):
+            continue
         fn = getattr(lib, cpp_symbol)
         try:
             jax.ffi.register_ffi_target(

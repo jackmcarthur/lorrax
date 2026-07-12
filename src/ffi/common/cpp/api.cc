@@ -2,19 +2,24 @@
 //
 // These thin wrappers let Python call the context lifecycle functions via
 // ctypes (no pybind/nanobind dependency).  The XLA FFI handlers themselves
-// are already exposed by XLA_FFI_DEFINE_HANDLER_SYMBOL as C symbols in
-// cusolvermp/cpp/eigh_ffi.cc.
+// are already exposed by XLA_FFI_DEFINE_HANDLER_SYMBOL as C symbols in the
+// per-subpackage TUs (e.g. cusolvermp/cpp/eigh_ffi.cc).
+//
+// Each subpackage's entry points are compiled only when that subpackage is
+// enabled (LORRAX_FFI_HAVE_{CUSOLVERMP,PHDF5,SLATE} defined by CMake), so a
+// partial build (e.g. cuSolverMp-only, no MPI/HDF5) links with no dangling
+// references.
 
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
 
 #include <cuda_runtime.h>
+
+#if defined(LORRAX_FFI_HAVE_CUSOLVERMP)
 #include <nccl.h>
 #include <cusolverMp.h>
-
 #include "../../cusolvermp/cpp/ctx.h"
-#include "../../phdf5/cpp/ctx.h"
 
 namespace lrx = lorrax_ffi::cusolvermp;
 
@@ -30,6 +35,10 @@ namespace lorrax_ffi::cusolvermp {
                                 uintptr_t device_ptr,
                                 int nelems);
 }
+#endif  // LORRAX_FFI_HAVE_CUSOLVERMP
+
+#if defined(LORRAX_FFI_HAVE_PHDF5)
+#include "../../phdf5/cpp/ctx.h"
 
 namespace lorrax_ffi::phdf5 {
     // Implemented in phdf5/cpp/context.cc
@@ -41,6 +50,7 @@ namespace lorrax_ffi::phdf5 {
     hid_t    open_dataset_ro(PhdfCtx* ctx, const std::string& ds_name);
     void     ensure_mpi_initialized();
 }
+#endif  // LORRAX_FFI_HAVE_PHDF5
 
 // ---------------------------------------------------------------------------
 // extern "C" ABI.  All functions set *err_out (size 512) to a message on
@@ -50,6 +60,23 @@ namespace lorrax_ffi::phdf5 {
 // ---------------------------------------------------------------------------
 
 extern "C" {
+
+// Diagnostic info: cuda runtime + driver versions (always available), and the
+// NCCL version when the cuSolverMp subpackage is built (0 otherwise).
+int lrx_version_info(int* cuda_rt, int* cuda_drv, int* nccl_ver) {
+    if (cuda_rt)  cudaRuntimeGetVersion(cuda_rt);
+    if (cuda_drv) cudaDriverGetVersion(cuda_drv);
+    if (nccl_ver) {
+#if defined(LORRAX_FFI_HAVE_CUSOLVERMP)
+        ncclGetVersion(nccl_ver);
+#else
+        *nccl_ver = 0;
+#endif
+    }
+    return 0;
+}
+
+#if defined(LORRAX_FFI_HAVE_CUSOLVERMP)
 
 int lrx_nccl_unique_id_bytes(void) {
     return static_cast<int>(sizeof(ncclUniqueId));
@@ -108,13 +135,9 @@ int lrx_smoke_allreduce_sum(int64_t ctx_handle,
         ctx_handle, reinterpret_cast<uintptr_t>(device_ptr), nelems);
 }
 
-// Diagnostic info: returns cuda runtime version and NCCL version.
-int lrx_version_info(int* cuda_rt, int* cuda_drv, int* nccl_ver) {
-    if (cuda_rt)  cudaRuntimeGetVersion(cuda_rt);
-    if (cuda_drv) cudaDriverGetVersion(cuda_drv);
-    if (nccl_ver) ncclGetVersion(nccl_ver);
-    return 0;
-}
+#endif  // LORRAX_FFI_HAVE_CUSOLVERMP
+
+#if defined(LORRAX_FFI_HAVE_PHDF5)
 
 // ---------------------------------------------------------------------------
 //  parallel-HDF5 subpackage lifecycle
@@ -200,5 +223,7 @@ int lrx_phdf5_open_dataset_ro(
         return 1;
     }
 }
+
+#endif  // LORRAX_FFI_HAVE_PHDF5
 
 }  // extern "C"

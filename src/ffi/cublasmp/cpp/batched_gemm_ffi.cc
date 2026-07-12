@@ -127,15 +127,15 @@ static ffi::Error BatchedGemmImpl(
         cublasMpMatmulDescriptorCreate(&matmulDesc, mp::ComputeTypeOf<T>::value),
         "cublasMpMatmulDescriptorCreate");
     LORRAX_CUBLASMP_CHECK(
-        cublasMpMatmulDescriptorAttributeSet(
+        cublasMpMatmulDescriptorSetAttribute(
             matmulDesc, CUBLASMP_MATMUL_DESCRIPTOR_ATTRIBUTE_TRANSA,
             &opA, sizeof(opA)),
-        "cublasMpMatmulDescriptorAttributeSet(TRANSA)");
+        "cublasMpMatmulDescriptorSetAttribute(TRANSA)");
     LORRAX_CUBLASMP_CHECK(
-        cublasMpMatmulDescriptorAttributeSet(
+        cublasMpMatmulDescriptorSetAttribute(
             matmulDesc, CUBLASMP_MATMUL_DESCRIPTOR_ATTRIBUTE_TRANSB,
             &opB, sizeof(opB)),
-        "cublasMpMatmulDescriptorAttributeSet(TRANSB)");
+        "cublasMpMatmulDescriptorSetAttribute(TRANSB)");
 
     auto cleanup = [&]() {
         cublasMpMatmulDescriptorDestroy(matmulDesc);

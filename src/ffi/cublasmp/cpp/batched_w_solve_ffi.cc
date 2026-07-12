@@ -197,12 +197,12 @@ static ffi::Error BatchedWSolveImpl(
     auto set_mm_trans = [&](cublasOperation_t opA, cublasOperation_t opB)
         -> ffi::Error {
         LORRAX_CUBLASMP_CHECK(
-            cublasMpMatmulDescriptorAttributeSet(
+            cublasMpMatmulDescriptorSetAttribute(
                 mm_desc, CUBLASMP_MATMUL_DESCRIPTOR_ATTRIBUTE_TRANSA,
                 &opA, sizeof(opA)),
             "matmulDesc TRANSA set");
         LORRAX_CUBLASMP_CHECK(
-            cublasMpMatmulDescriptorAttributeSet(
+            cublasMpMatmulDescriptorSetAttribute(
                 mm_desc, CUBLASMP_MATMUL_DESCRIPTOR_ATTRIBUTE_TRANSB,
                 &opB, sizeof(opB)),
             "matmulDesc TRANSB set");
@@ -240,10 +240,10 @@ static ffi::Error BatchedWSolveImpl(
         // gemm (use opA=C for the X^H @ chi sizing — cuBLASMp usually
         // returns the same size regardless of trans combo)
         cublasOperation_t opA = CUBLAS_OP_C, opB = CUBLAS_OP_N;
-        cublasMpMatmulDescriptorAttributeSet(
+        cublasMpMatmulDescriptorSetAttribute(
             mm_desc, CUBLASMP_MATMUL_DESCRIPTOR_ATTRIBUTE_TRANSA,
             &opA, sizeof(opA));
-        cublasMpMatmulDescriptorAttributeSet(
+        cublasMpMatmulDescriptorSetAttribute(
             mm_desc, CUBLASMP_MATMUL_DESCRIPTOR_ATTRIBUTE_TRANSB,
             &opB, sizeof(opB));
         LORRAX_CUBLASMP_CHECK(
