@@ -37,7 +37,10 @@ set(NVHPC_CUDA_SUBDIR "" CACHE STRING
 set(CUSOLVERMP_INCLUDE_DIR "" CACHE PATH
     "Alternative: explicit directory containing cusolverMp.h + cal.h")
 set(CUSOLVERMP_LIB_DIR "" CACHE PATH
-    "Alternative: explicit directory containing libcusolverMp.so + libcal.so")
+    "Alternative: explicit directory containing libcusolverMp.so (CAL no longer required)")
+set(CUBLASMP_LIB "" CACHE FILEPATH
+    "Explicit path to libcublasmp.so (pip wheels install it under a separate "
+    "nvidia/cublasmp/.../lib dir from cuSolverMp); empty = look next to libcusolverMp")
 
 # Autodetection ladder — first match wins:
 #   (a) explicit CUSOLVERMP_{INCLUDE,LIB}_DIR                (override)
@@ -432,15 +435,19 @@ target_include_directories(lorrax_ffi PRIVATE
 
 find_package(Threads REQUIRED)
 
-# libcal must be linked EXPLICITLY: context.cc references cal_comm_*
-# for the <=0.6.x CAL comm path.  The CAL-era cuBLASMp (<=0.4.x) NEEDed
-# libcal.so.0 itself, so the symbols used to resolve transitively; the
-# NCCL-era cuBLASMp (>=0.5.0) doesn't, and without this line the .so
-# fails to dlopen with "undefined symbol: cal_comm_destroy".
+# CAL removed: cuSolverMp >= 0.7.0 / cuBLASMp >= 0.5.0 take an ncclComm_t
+# directly (context.cc no longer references cal_comm_*), so libcal is not
+# linked.  This matches the modern pure-pip CUDA-13 stack
+# (nvidia-cusolvermp-cu13 + nvidia-cublasmp-cu13), which ships no libcal at
+# all.  cuBLASMp resolves from CUBLASMP_LIB when set (the pip wheels install
+# cuSolverMp and cuBLASMp under separate site-packages dirs); otherwise it
+# falls back to the single-dir NVHPC/stage layout next to libcusolverMp.
+if(NOT DEFINED CUBLASMP_LIB)
+    set(CUBLASMP_LIB "${CUSOLVERMP_LIBDIR}/libcublasmp.so")
+endif()
 target_link_libraries(lorrax_ffi PRIVATE
     "${CUSOLVERMP_LIBDIR}/libcusolverMp.so"
-    "${CUSOLVERMP_LIBDIR}/libcublasmp.so"
-    "${CUSOLVERMP_LIBDIR}/libcal.so"
+    "${CUBLASMP_LIB}"
     "${NCCL_LIBRARY}"
     "${CUDART_LIBRARY}"
     "${CUSOLVER_LIBRARY}"

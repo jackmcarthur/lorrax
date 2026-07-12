@@ -12,7 +12,6 @@
 
 #include <cuda_runtime.h>
 #include <nccl.h>
-#include <cal.h>
 #include <cusolverMp.h>
 #include <cublasmp.h>
 
@@ -21,72 +20,11 @@
 
 namespace lorrax_ffi::cusolvermp {
 
-// ---------------------------------------------------------------------------
-// CAL → NCCL bridge
-// ---------------------------------------------------------------------------
-// CAL's three user callbacks implement an allgather over host buffers.  We
-// route that through ncclAllGather by staging through a per-shim device
-// scratch buffer.
-//
-// Signature: cal_comm_create_params_t::allgather
-//   calError_t allgather(void* src, void* recv, size_t size,
-//                        void* data, void** request);
-// where `size` is bytes *per rank* (recv_buf has nranks * size bytes).
-// ---------------------------------------------------------------------------
-
-static calError_t cal_nccl_allgather(void* src, void* recv, size_t size,
-                                     void* data, void** request) {
-    auto* shim = static_cast<CalNcclShim*>(data);
-
-    int world = 0;
-    if (ncclCommCount(shim->nccl_comm, &world) != ncclSuccess) return CAL_ERROR;
-    const size_t total_bytes = size * static_cast<size_t>(world);
-
-    // (Re)allocate device scratch large enough for [send | recv].
-    const size_t need = size + total_bytes;
-    if (need > shim->d_scratch_bytes) {
-        if (shim->d_scratch) cudaFree(shim->d_scratch);
-        if (cudaMalloc(&shim->d_scratch, need) != cudaSuccess) return CAL_ERROR_CUDA;
-        shim->d_scratch_bytes = need;
-    }
-    void* d_send = shim->d_scratch;
-    void* d_recv = static_cast<char*>(d_send) + size;
-
-    // H2D our rank's payload.
-    if (cudaMemcpyAsync(d_send, src, size, cudaMemcpyHostToDevice, shim->stream)
-        != cudaSuccess) return CAL_ERROR_CUDA;
-
-    // Communicate as raw bytes (ncclChar = 1 byte).
-    if (ncclAllGather(d_send, d_recv, size, ncclChar,
-                      shim->nccl_comm, shim->stream) != ncclSuccess) {
-        return CAL_ERROR;
-    }
-
-    // D2H into CAL's recv buffer.
-    if (cudaMemcpyAsync(recv, d_recv, total_bytes, cudaMemcpyDeviceToHost,
-                        shim->stream) != cudaSuccess) return CAL_ERROR_CUDA;
-
-    // Block until done — CAL expects the data to be ready when req_test returns
-    // CAL_OK.  We signal completion by stamping the request pointer with a
-    // "done" sentinel; the cheapest synchronous completion is to sync the
-    // stream here.
-    if (cudaStreamSynchronize(shim->stream) != cudaSuccess) return CAL_ERROR_CUDA;
-
-    if (request) *request = shim;  // non-null sentinel so req_test/free see a handle
-    return CAL_OK;
-}
-
-static calError_t cal_nccl_req_test(void* request) {
-    // Our allgather already synced the stream, so every submitted request
-    // is immediately complete.
-    (void)request;
-    return CAL_OK;
-}
-
-static calError_t cal_nccl_req_free(void* request) {
-    (void)request;  // shim is owned by the Ctx; nothing to free per-request
-    return CAL_OK;
-}
+// CAL removed: cuSolverMp >= 0.7.0 and cuBLASMp >= 0.5.0 take an ncclComm_t
+// directly at grid creation, so the legacy CAL communicator and the
+// CAL->NCCL allgather bridge that fed it are gone.  This lets the FFI build
+// and link against the pure-pip, CAL-free CUDA-13 stack (nvidia-cusolvermp-cu13
+// + nvidia-cublasmp-cu13, no nvidia-libcal).  See src/ffi/PORTING.md.
 
 // ----- tiny throwing checks (for setup path; FFI handlers use Error) ------
 static void throw_if_cuda(cudaError_t st, const char* what) {
@@ -193,7 +131,17 @@ int64_t create_context(int rank, int world_size,
     const int mp_major = mp_version / 1000;
     const int mp_minor = (mp_version / 100) % 10;
     const int mp_patch = mp_version % 100;
-    const bool use_nccl_comm_path = (mp_version >= 700);
+    // The cu13 headers declare cusolverMpCreateDeviceGrid with an ncclComm_t
+    // parameter; a library older than 0.7.0 (CAL-only ABI) cannot be built
+    // against them, so the NCCL comm path is the only path.
+    if (mp_version < 700) {
+        std::ostringstream os;
+        os << "cuSolverMp " << mp_major << "." << mp_minor << "." << mp_patch
+           << " uses the removed CAL communicator ABI; LORRAX requires "
+              ">= 0.7.0 (NCCL comm path).  Install nvidia-cusolvermp-cu13 "
+              ">= 0.7.0 (see src/ffi/PORTING.md).";
+        throw std::runtime_error(os.str());
+    }
 
     // NCCL version (returned as e.g. 22603 = 2.26.3, encoded
     // major*10000 + minor*100 + patch).  Used to flag the known
@@ -209,10 +157,9 @@ int64_t create_context(int rank, int world_size,
     if (rank == 0) {
         std::fprintf(stderr,
             "[lorrax cusolverMp] library %d.%d.%d, NCCL %d.%d.%d, "
-            "comm path: %s, grid: %dx%d (%s)\n",
+            "comm path: NCCL, grid: %dx%d (%s)\n",
             mp_major, mp_minor, mp_patch,
             nccl_major, nccl_minor, nccl_patch,
-            use_nccl_comm_path ? "NCCL" : "CAL",
             p, q, grid_layout_col_major ? "col-major" : "row-major");
     }
 
@@ -230,15 +177,6 @@ int64_t create_context(int rank, int world_size,
     //     but a soft warning at NCCL < 2.27 is still useful for any
     //     future cusolverMp ≥ 0.8 binary.
     if (rank == 0) {
-        if (mp_version < 700 && p > 1 && q > 1) {
-            std::fprintf(stderr,
-                "[lorrax cusolverMp] WARNING: cuSolverMp %d.%d.%d on a 2D "
-                "process grid (%dx%d) has a known correctness bug in "
-                "getrf/getrs that returns wrong answers silently.  "
-                "Use a 1xN or Nx1 mesh, or upgrade to ≥0.7.0 (where the "
-                "comm-handle ABI shifts from CAL to NCCL).\n",
-                mp_major, mp_minor, mp_patch, p, q);
-        }
         if (mp_version >= 800 && nccl_version < 22700) {
             std::fprintf(stderr,
                 "[lorrax cusolverMp] WARNING: cuSolverMp %d.%d.%d expects "
@@ -254,48 +192,13 @@ int64_t create_context(int rank, int world_size,
         ? CUSOLVERMP_GRID_MAPPING_COL_MAJOR
         : CUSOLVERMP_GRID_MAPPING_ROW_MAJOR;
 
-    if (!use_nccl_comm_path) {
-        // 0.6.x: cusolverMpCreateDeviceGrid takes cal_comm_t.  Build a
-        // real cal_comm via cal_comm_create, plumbing the three required
-        // allgather/req_test/req_free callbacks to NCCL.
-        ctx->shim.nccl_comm = ctx->nccl_comm;
-        ctx->shim.stream    = ctx->stream;
-        cal_comm_create_params_t cp{};
-        cp.allgather    = &cal_nccl_allgather;
-        cp.req_test     = &cal_nccl_req_test;
-        cp.req_free     = &cal_nccl_req_free;
-        cp.data         = &ctx->shim;
-        cp.nranks       = world_size;
-        cp.rank         = rank;
-        cp.local_device = ctx->local_device_id;
-        calError_t cal_st = cal_comm_create(cp, &ctx->cal_comm);
-        if (cal_st != CAL_OK) {
-            std::ostringstream os;
-            os << "cal_comm_create failed: calError=" << (int)cal_st;
-            throw std::runtime_error(os.str());
-        }
-        throw_if_cusolver(
-            cusolverMpCreateDeviceGrid(ctx->handle, &ctx->grid,
-                                       reinterpret_cast<cal_comm_t>(ctx->cal_comm),
-                                       /*numRowDevices=*/p,
-                                       /*numColDevices=*/q, layout),
-            "cusolverMpCreateDeviceGrid");
-    } else {
-        // 0.7+: cusolverMpCreateDeviceGrid takes ncclComm_t directly.
-        // The cast is needed because the system cusolverMp.h on this
-        // box may declare the parameter as cal_comm_t (depending on
-        // which SDK we're built against), but the LOADED library
-        // dereferences it as ncclComm_t — we pass the right object
-        // and let the linker do its thing.  cal_comm_t and ncclComm_t
-        // are both opaque pointers at the ABI level.
-        throw_if_cusolver(
-            cusolverMpCreateDeviceGrid(
-                ctx->handle, &ctx->grid,
-                reinterpret_cast<cal_comm_t>(ctx->nccl_comm),
-                /*numRowDevices=*/p,
-                /*numColDevices=*/q, layout),
-            "cusolverMpCreateDeviceGrid");
-    }
+    // cusolverMpCreateDeviceGrid takes ncclComm_t directly (>= 0.7.0).
+    throw_if_cusolver(
+        cusolverMpCreateDeviceGrid(
+            ctx->handle, &ctx->grid, ctx->nccl_comm,
+            /*numRowDevices=*/p,
+            /*numColDevices=*/q, layout),
+        "cusolverMpCreateDeviceGrid");
 
     // Device buffer for d_info (int) used by every Syevd call.
     throw_if_cuda(cudaMalloc(&ctx->d_info, sizeof(int)), "cudaMalloc(d_info)");
@@ -322,18 +225,12 @@ void destroy_context(int64_t ctx_handle) {
     if (ctx_handle == 0) return;
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
 
-    // cuBLASMp first (it shares the CAL comm with cuSOLVERMp — tear down
+    // cuBLASMp first (it shares the NCCL comm with cuSOLVERMp — tear down
     // the client handles before we destroy the comm underneath them).
     if (ctx->cublasmp_grid)   { cublasMpGridDestroy(ctx->cublasmp_grid);     ctx->cublasmp_grid = nullptr; }
     if (ctx->cublasmp_handle) { cublasMpDestroy(ctx->cublasmp_handle);       ctx->cublasmp_handle = nullptr; }
     if (ctx->grid)     { cusolverMpDestroyGrid(ctx->grid);       ctx->grid = nullptr; }
     if (ctx->handle)   { cusolverMpDestroy(ctx->handle);         ctx->handle = nullptr; }
-    if (ctx->cal_comm) { cal_comm_destroy(ctx->cal_comm);        ctx->cal_comm = nullptr; }
-    if (ctx->shim.d_scratch) {
-        cudaFree(ctx->shim.d_scratch);
-        ctx->shim.d_scratch = nullptr;
-        ctx->shim.d_scratch_bytes = 0;
-    }
     if (ctx->ev_xla_in)  { cudaEventDestroy(ctx->ev_xla_in);     ctx->ev_xla_in = nullptr; }
     if (ctx->ev_ctx_out) { cudaEventDestroy(ctx->ev_ctx_out);    ctx->ev_ctx_out = nullptr; }
     if (ctx->stream)   { cudaStreamDestroy(ctx->stream);         ctx->stream = nullptr; }
@@ -345,46 +242,32 @@ void destroy_context(int64_t ctx_handle) {
     delete ctx;
 }
 
-// Lazy init for cuBLASMp.  Reuses the cuSOLVERMp ctx's stream and comm.
-// cublasMpGridCreate's communicator-parameter ABI shifted from cal_comm_t
-// (≤0.4.x) to ncclComm_t (≥0.5.0) — cuBLASMp's own version numbering,
-// NOT cuSolverMp's (0.7.0).  The two libraries resolve from different
-// stage dirs at runtime, so keying this dispatch on
-// ctx->cusolvermp_version silently passed an ncclComm_t to a CAL-ABI
-// cuBLASMp when the stages drifted (cusolverMp 0.7.2 + cuBLASMp 0.4.0
-// → cublasMpGridCreate status=6 on every mesh, 2026-07-10).  Ask the
-// loaded cuBLASMp itself.
+// Lazy init for cuBLASMp.  Reuses the cuSOLVERMp ctx's stream and NCCL comm.
+// cublasMpGridCreate takes an ncclComm_t directly (>= 0.5.0); the CAL
+// communicator ABI (<= 0.4.x) is no longer supported.  We still read the
+// loaded cuBLASMp version for the banner and to reject a pre-NCCL library
+// with a clear message rather than an opaque status=6.
 void ensure_cublasmp(LorraxCusolverMpCtx* ctx) {
     if (ctx->cublasmp_handle && ctx->cublasmp_grid) return;
-    int blasmp_version = 0;   // MAJOR*1000 + MINOR*100 + PATCH, e.g. 501
+    int blasmp_version = 0;   // MAJOR*1000 + MINOR*100 + PATCH, e.g. 901
     throw_if_cublasmp(cublasMpGetVersion(&blasmp_version),
                       "cublasMpGetVersion");
-    const bool use_nccl_comm_path = (blasmp_version >= 500);
     if (ctx->rank == 0) {
         std::fprintf(stderr,
-            "[lorrax cuBLASMp] library %d.%d.%d, comm path: %s\n",
+            "[lorrax cuBLASMp] library %d.%d.%d, comm path: NCCL\n",
             blasmp_version / 1000, (blasmp_version / 100) % 10,
-            blasmp_version % 100, use_nccl_comm_path ? "NCCL" : "CAL");
+            blasmp_version % 100);
     }
-    if (!use_nccl_comm_path && !ctx->cal_comm) {
+    if (blasmp_version < 500) {
         std::ostringstream os;
         os << "ensure_cublasmp: loaded cuBLASMp " << blasmp_version
-           << " uses the CAL comm ABI, but the cuSOLVERMp context (version "
-           << ctx->cusolvermp_version << ") created no CAL comm — the "
-           << "staged library generations are mismatched.  Stage a "
-           << "cuBLASMp >= 0.5.0 next to cuSOLVERMp >= 0.7.0 (see "
-           << "src/ffi/cusolvermp/scripts/stage_cublasmp_redist.sh) or "
-           << "use the <= 0.6.x cuSOLVERMp stage.";
+           << " predates the NCCL comm ABI (>= 0.5.0) that LORRAX requires; "
+           << "install nvidia-cublasmp-cu13 >= 0.9.1 (see src/ffi/PORTING.md).";
         throw std::runtime_error(os.str());
     }
-    if (use_nccl_comm_path && !ctx->nccl_comm) {
-        std::ostringstream os;
-        os << "ensure_cublasmp: loaded cuBLASMp " << blasmp_version
-           << " uses the NCCL comm ABI, but the cuSOLVERMp context (version "
-           << ctx->cusolvermp_version << ") created no NCCL comm — the "
-           << "staged library generations are mismatched.  Pair cuBLASMp "
-           << ">= 0.5.0 with cuSOLVERMp >= 0.7.0.";
-        throw std::runtime_error(os.str());
+    if (!ctx->nccl_comm) {
+        throw std::runtime_error(
+            "ensure_cublasmp: cuSOLVERMp context created no NCCL comm.");
     }
     if (!ctx->cublasmp_handle) {
         throw_if_cublasmp(
@@ -395,14 +278,9 @@ void ensure_cublasmp(LorraxCusolverMpCtx* ctx) {
         cublasMpGridLayout_t layout = ctx->grid_layout_col_major
             ? CUBLASMP_GRID_LAYOUT_COL_MAJOR
             : CUBLASMP_GRID_LAYOUT_ROW_MAJOR;
-        // cal_comm_t / ncclComm_t are both opaque pointers; cast to the
-        // declared header type and pass the correct concrete object.
-        cal_comm_t comm_arg = use_nccl_comm_path
-            ? reinterpret_cast<cal_comm_t>(ctx->nccl_comm)
-            : ctx->cal_comm;
         throw_if_cublasmp(
             cublasMpGridCreate(ctx->p, ctx->q, layout,
-                                comm_arg, &ctx->cublasmp_grid),
+                                ctx->nccl_comm, &ctx->cublasmp_grid),
             "cublasMpGridCreate");
     }
 }
