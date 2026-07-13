@@ -19,10 +19,13 @@ outline, editorial threads (T1–T5), and pre-writing task list live in
 | 05 ISDF | drafted; reviewed; PRL-density sweep 2026-07-11 |
 | 06 The Coulomb interaction | drafted; reviewed; PRL-density sweep 2026-07-11 |
 | 07 Frequency integration | drafted; PRL-density sweep 2026-07-11 (§7.6 periodic numbers blocked on gate run) |
-| 08 Bispinor GW | not started |
-| 09 Supporting formalisms | not started |
-| 10–13 Reference + architecture | not started |
-| Appendices A–F | not started |
+| 08 Bispinor GW | drafted 2026-07-13 |
+| 09 Supporting formalisms | drafted 2026-07-13 |
+| 10 Workflow & files | drafted 2026-07-13 |
+| 11 Input reference | drafted 2026-07-13 (generated against gw_config.py) |
+| 12 Running at scale | drafted 2026-07-13 |
+| 13 Architecture | drafted 2026-07-13 |
+| Appendices A–G | drafted 2026-07-13 (B/D carry verify-TODOs; G needs citation check) |
 
 ## Conventions
 
