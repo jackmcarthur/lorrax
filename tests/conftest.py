@@ -100,30 +100,90 @@ def gnppm_session(tmp_path_factory):
         "sigma_diag_gnppm_test.dat")
 
 
-@pytest.fixture(scope="session")
-def gnppm_restart_baseline(gnppm_session, tmp_path_factory):
-    """Canonical restart=true variant of the gnppm session state.
+# The canonical restart-variant input mutations: restart=true, one-shot,
+# freq-debug writers off (the kij_stream accumulation mode crashes on the
+# debug writers' None-Σ_c handling, so the baseline all dynamic variants
+# diff against uses the same debug-off config).
+GNPPM_RESTART_MUTATIONS = {
+    "restart = false": "restart = true",
+    "sigma_freq_debug_output = true": "sigma_freq_debug_output = false",
+    "sigma_debug_split_contrib = true": "sigma_debug_split_contrib = false",
+}
 
-    One-shot, freq-debug writers off (the kij_stream accumulation mode
-    crashes on the debug writers' None-Σ_c handling, so the baseline all
-    dynamic variants diff against uses the same debug-off config).
+
+@pytest.fixture(scope="session")
+def gnppm_variant_bundle(gnppm_session, tmp_path_factory):
+    """Every Tier-2 gnppm variant, run in ONE subprocess.
+
+    Each variant used to be its own ``run_gw_jax`` launch (8-14 s of which
+    only 2-9 s is compute — the rest is import + retrace, grid-independent).
+    ``tests/run_variant_bundle.py`` amortizes that across the bundle.  Run
+    dirs are prepared here exactly as the per-test launches prepared them;
+    per-variant env knobs are applied (and restored) around each in-process
+    run.  A variant failure does NOT fail this fixture — each test fails on
+    its own variant via its status entry.
     """
-    run_dir = harness.copy_fixture(
-        harness.REG / "gnppm_debug",
-        tmp_path_factory.mktemp("gnppm_restart") / "baseline",
-        tmp_from=gnppm_session.run_dir)
-    harness.mutate_input(run_dir / "gnppm_test.in", {
-        "restart = false": "restart = true",
-        "sigma_freq_debug_output = true": "sigma_freq_debug_output = false",
-        "sigma_debug_split_contrib = true": "sigma_debug_split_contrib = false",
-    })
-    res = harness.run_gw_jax(run_dir, "gnppm_test.in")
-    if res.returncode != 0:
-        pytest.fail(
-            f"gnppm restart baseline failed.\n"
-            f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
-    return _NS(run_dir=run_dir, input_name="gnppm_test.in",
-               output_name=gnppm_session.output_name, stdout=res.stdout,
+    root = tmp_path_factory.mktemp("gnppm_variants")
+
+    def prep(name, *, input_name="gnppm_test.in", restart_state=True,
+             mutations=None, env=None):
+        run_dir = harness.copy_fixture(
+            harness.REG / "gnppm_debug", root / name,
+            tmp_from=gnppm_session.run_dir if restart_state else None)
+        if mutations:
+            harness.mutate_input(run_dir / input_name, mutations)
+        return {"name": name, "run_dir": run_dir,
+                "input_name": input_name, "env": env or {}}
+
+    base = GNPPM_RESTART_MUTATIONS
+    variants = [
+        prep("baseline", mutations=base),
+        prep("pad12", mutations=base,
+             env={"LORRAX_EXTRA_MU_PAD": "12"}),
+        prep("kij_stream", mutations={
+            **base,
+            "sigma_omega_h5_file = sigma_mnk.h5":
+                "sigma_omega_accumulation = kij_stream\n"
+                "sigma_kij_h5_file = sigma_kij_stream.h5\n"
+                "sigma_omega_h5_file = sigma_mnk.h5",
+        }),
+        prep("sc_iter1", mutations={
+            **base,
+            "qp_solver = one_shot_dft":
+                "qp_solver = self_consistent\nsc_max_iter = 1",
+        }),
+        prep("fixed_point", mutations={
+            **base,
+            "qp_solver = one_shot_dft": "qp_solver = fixed_point"}),
+        # IBZ-equivalence legs (static COHSEX input in the same fixture):
+        # leg A restarts through the IBZ cascade; leg B is a FRESH full
+        # pipeline forced full-BZ-direct (covers ζ writes + V_q unfold).
+        prep("ibz_a", input_name="cohsex_ibz_test.in",
+             mutations={"restart = false": "restart = true"},
+             env={"LORRAX_FORCE_FULL_BZ": "0"}),
+        prep("ibz_b", input_name="cohsex_ibz_test.in", restart_state=False,
+             env={"LORRAX_FORCE_FULL_BZ": "1"}),
+    ]
+    results = harness.run_variant_bundle(variants, root)
+    return {
+        v["name"]: _NS(run_dir=_Path(v["run_dir"]),
+                       input_name=v["input_name"],
+                       status=results[v["name"]][0],
+                       stdout=results[v["name"]][1],
+                       session=gnppm_session)
+        for v in variants
+    }
+
+
+@pytest.fixture(scope="session")
+def gnppm_restart_baseline(gnppm_variant_bundle, gnppm_session):
+    """Canonical restart=true variant (bundle member 'baseline')."""
+    b = gnppm_variant_bundle["baseline"]
+    if b.status != "ok":
+        pytest.fail(f"gnppm restart baseline failed in bundle "
+                    f"({b.status}).\nstdout:\n{b.stdout}")
+    return _NS(run_dir=b.run_dir, input_name="gnppm_test.in",
+               output_name=gnppm_session.output_name, stdout=b.stdout,
                session=gnppm_session)
 
 

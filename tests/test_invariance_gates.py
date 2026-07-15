@@ -7,6 +7,9 @@ invariances directly — self-checking, no frozen references — and they
 run cheaply: each is a ``restart = true`` variant launched from a COPY
 of the Tier-1 gnppm session state (``conftest.gnppm_session``), so the
 dominant ζ-fit + V_q build happens once per suite, not once per gate.
+Since 2026-07-15 all gnppm variants additionally run in ONE subprocess
+(``conftest.gnppm_variant_bundle`` → ``tests/run_variant_bundle.py``),
+amortizing the per-launch import + retrace cost across the bundle.
 
 Copies are mandatory: the driver mutates the restart file in place
 (``persist_w0_and_head``).  Ports of the pre-redesign standalone gates:
@@ -26,7 +29,6 @@ Copies are mandatory: the driver mutates the restart file in place
                             either side still shows up in the comparison)
 """
 
-import shutil
 import sys
 from pathlib import Path
 
@@ -39,7 +41,6 @@ from harness import (          # noqa: E402
     census_lines,
     copy_fixture,
     eqp_column,
-    mutate_input,
     normalize_dat,
     numeric_tokens,
     parse_eqp_rows,
@@ -50,29 +51,15 @@ _GNPPM = REG / "gnppm_debug"
 _LABELS = ("sigX", "sigC", "sigXC")
 _OUT = "sigma_diag_gnppm_test.dat"
 
-# The canonical restart-variant input mutations (must match
-# conftest.gnppm_restart_baseline so variants diff against it cleanly).
-_RESTART_MUTATIONS = {
-    "restart = false": "restart = true",
-    "sigma_freq_debug_output = true": "sigma_freq_debug_output = false",
-    "sigma_debug_split_contrib = true": "sigma_debug_split_contrib = false",
-}
-
-
-def _run_restart_variant(tmp_path, session, name, *, extra_mutations=None,
-                         extra_env=None, input_name="gnppm_test.in"):
-    """Copy fixture + session restart state, mutate the input, run."""
-    run_dir = copy_fixture(_GNPPM, tmp_path / name,
-                           tmp_from=session.run_dir)
-    mutations = dict(_RESTART_MUTATIONS)
-    if extra_mutations:
-        mutations.update(extra_mutations)
-    mutate_input(run_dir / input_name, mutations)
-    res = run_gw_jax(run_dir, input_name, extra_env=extra_env)
-    if res.returncode != 0:
-        pytest.fail(f"{name} run failed.\n"
-                    f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
-    return run_dir, res.stdout
+# Variant definitions (mutations/envs) live in conftest.gnppm_variant_bundle;
+# all Tier-2 variants run in ONE subprocess (tests/run_variant_bundle.py).
+def _variant(bundle, name):
+    """Fetch a bundle member; fail THIS test if that variant crashed."""
+    v = bundle[name]
+    if v.status != "ok":
+        pytest.fail(f"{name} bundle run failed ({v.status}).\n"
+                    f"stdout:\n{v.stdout}")
+    return v.run_dir, v.stdout
 
 
 def _assert_rows_close(dir_a, dir_b, out_name, labels, atol, msg):
@@ -114,7 +101,7 @@ def test_restart_equals_fresh(gnppm_restart_baseline):
 # ===========================================================================
 
 @pytest.mark.regression
-def test_mu_pad_flip_invariance_gnppm(gnppm_restart_baseline, tmp_path):
+def test_mu_pad_flip_invariance_gnppm(gnppm_restart_baseline, gnppm_variant_bundle):
     """EXTRA_MU_PAD=12 vs 0 at fixed P=1 on the dynamic GN-PPM chain.
 
     Census / window node counts / invalid count / unfulfilled fraction and
@@ -124,9 +111,7 @@ def test_mu_pad_flip_invariance_gnppm(gnppm_restart_baseline, tmp_path):
     0.0, but the bound is kept — any REAL pad defect is O(1)).
     """
     base = gnppm_restart_baseline
-    pad_dir, pad_stdout = _run_restart_variant(
-        tmp_path, base.session, "pad12",
-        extra_env={"LORRAX_EXTRA_MU_PAD": "12"})
+    pad_dir, pad_stdout = _variant(gnppm_variant_bundle, "pad12")
 
     assert census_lines(pad_stdout) == census_lines(base.stdout), (
         "PPM census/window signature changed under a pad-extent flip at "
@@ -184,7 +169,7 @@ def test_mu_pad_flip_invariance_bispinor(bispinor_session, tmp_path):
 # ===========================================================================
 
 @pytest.mark.regression
-def test_kij_stream_parity(gnppm_restart_baseline, tmp_path):
+def test_kij_stream_parity(gnppm_restart_baseline, gnppm_variant_bundle):
     """Both accumulation modes must write the same sigma_c_kij_ev.
 
     atol=5e-12: the two modes sum windows in different associations, so
@@ -194,14 +179,7 @@ def test_kij_stream_parity(gnppm_restart_baseline, tmp_path):
     import h5py
 
     base = gnppm_restart_baseline
-    stream_dir, _ = _run_restart_variant(
-        tmp_path, base.session, "kij_stream",
-        extra_mutations={
-            "sigma_omega_h5_file = sigma_mnk.h5":
-                "sigma_omega_accumulation = kij_stream\n"
-                "sigma_kij_h5_file = sigma_kij_stream.h5\n"
-                "sigma_omega_h5_file = sigma_mnk.h5",
-        })
+    stream_dir, _ = _variant(gnppm_variant_bundle, "kij_stream")
     with h5py.File(base.run_dir / "sigma_mnk.h5", "r") as f:
         sig_host = np.asarray(f["sigma_c_kij_ev"], dtype=np.complex128)
     with h5py.File(stream_dir / "sigma_mnk.h5", "r") as f:
@@ -216,14 +194,9 @@ def test_kij_stream_parity(gnppm_restart_baseline, tmp_path):
 # ===========================================================================
 
 @pytest.mark.regression
-def test_sc_iteration1_equals_one_shot(gnppm_restart_baseline, tmp_path):
+def test_sc_iteration1_equals_one_shot(gnppm_restart_baseline, gnppm_variant_bundle):
     base = gnppm_restart_baseline
-    sc_dir, _ = _run_restart_variant(
-        tmp_path, base.session, "sc_iter1",
-        extra_mutations={
-            "qp_solver = one_shot_dft":
-                "qp_solver = self_consistent\nsc_max_iter = 1",
-        })
+    sc_dir, _ = _variant(gnppm_variant_bundle, "sc_iter1")
     _assert_rows_close(base.run_dir, sc_dir, _OUT, _LABELS, 1e-6,
                        "SC iteration 1 sigma_diag differs from one-shot G0W0")
     for fname in ("eqp0.dat", "eqp1.dat"):
@@ -243,15 +216,13 @@ def test_sc_iteration1_equals_one_shot(gnppm_restart_baseline, tmp_path):
 # ===========================================================================
 
 @pytest.mark.regression
-def test_fixed_point_frozen_qp_rotations(gnppm_restart_baseline, tmp_path):
+def test_fixed_point_frozen_qp_rotations(gnppm_restart_baseline, gnppm_variant_bundle):
     import h5py
 
     ref_file = _GNPPM / "eqp_rotations_fixedpoint_ref.npy"
     assert ref_file.exists(), f"missing frozen reference: {ref_file}"
     base = gnppm_restart_baseline
-    fp_dir, _ = _run_restart_variant(
-        tmp_path, base.session, "fixed_point",
-        extra_mutations={"qp_solver = one_shot_dft": "qp_solver = fixed_point"})
+    fp_dir, _ = _variant(gnppm_variant_bundle, "fixed_point")
     rot_file = fp_dir / "qp_wfn_rotations.h5"
     assert rot_file.exists(), f"missing {rot_file}"
     with h5py.File(rot_file, "r") as f:
@@ -269,7 +240,7 @@ def test_fixed_point_frozen_qp_rotations(gnppm_restart_baseline, tmp_path):
 # ===========================================================================
 
 @pytest.mark.regression
-def test_ibz_equals_full_bz(gnppm_session, tmp_path):
+def test_ibz_equals_full_bz(gnppm_variant_bundle):
     """Static COHSEX, IBZ cascade vs LORRAX_FORCE_FULL_BZ=1.
 
     The IBZ leg runs from the session restart state (its V_q was built
@@ -285,31 +256,18 @@ def test_ibz_equals_full_bz(gnppm_session, tmp_path):
     out_name = "sigma_diag_ibzgate.dat"
 
     # Leg A — IBZ cascade, from restart (cheap: no ζ/V_q rebuild).
-    ibz_dir = copy_fixture(_GNPPM, tmp_path / "ibz",
-                           tmp_from=gnppm_session.run_dir)
-    mutate_input(ibz_dir / "cohsex_ibz_test.in",
-                 {"restart = false": "restart = true"})
-    res_a = run_gw_jax(ibz_dir, "cohsex_ibz_test.in",
-                       extra_env={"LORRAX_FORCE_FULL_BZ": "0"})
-    if res_a.returncode != 0:
-        pytest.fail(f"IBZ leg failed.\nstdout:\n{res_a.stdout}\n"
-                    f"stderr:\n{res_a.stderr}")
+    ibz_dir, stdout_a = _variant(gnppm_variant_bundle, "ibz_a")
     # The restart path must still take the IBZ decision for the W solve
     # (timing sections only appear when the cascade slices/unfolds).
-    assert "Loaded restart tensors from H5." in res_a.stdout
-    assert "W.slice_to_ibz" in res_a.stdout, (
+    assert "Loaded restart tensors from H5." in stdout_a
+    assert "W.slice_to_ibz" in stdout_a, (
         "restart static run skipped the IBZ W-solve cascade")
-    assert "W.unfold_to_full_bz" in res_a.stdout
-    assert "orbit closure failed" not in res_a.stdout
+    assert "W.unfold_to_full_bz" in stdout_a
+    assert "orbit closure failed" not in stdout_a
 
     # Leg B — full-BZ-direct, FRESH full pipeline.
-    full_dir = copy_fixture(_GNPPM, tmp_path / "full")
-    res_b = run_gw_jax(full_dir, "cohsex_ibz_test.in",
-                       extra_env={"LORRAX_FORCE_FULL_BZ": "1"})
-    if res_b.returncode != 0:
-        pytest.fail(f"full-BZ leg failed.\nstdout:\n{res_b.stdout}\n"
-                    f"stderr:\n{res_b.stderr}")
-    assert "unfold=full-BZ" in res_b.stdout, (
+    full_dir, stdout_b = _variant(gnppm_variant_bundle, "ibz_b")
+    assert "unfold=full-BZ" in stdout_b, (
         "FORCE_FULL_BZ leg unexpectedly took the IBZ cascade")
 
     _assert_rows_close(ibz_dir, full_dir, out_name, labels, 1e-6,

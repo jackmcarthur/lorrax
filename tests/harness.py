@@ -18,6 +18,7 @@ Suite architecture (2026-07-09 redesign):
 * **Tier 3** — unit tests for what the gates cannot see.
 """
 
+import json
 import os
 import re
 import shutil
@@ -84,9 +85,8 @@ def copy_fixture(case_dir: Path, run_dir: Path, *, tmp_from: Path = None):
     return run_dir
 
 
-def run_gw_jax(run_dir, input_name, platform=None, extra_env=None,
-               timeout=900):
-    """Run ``python -m gw.gw_jax -i <input_name>`` in run_dir; return the process."""
+def gw_env(platform=None, extra_env=None):
+    """The environment every test-driven gw.gw_jax process runs under."""
     if platform is None:
         platform = requested_platform()
     env = os.environ.copy()
@@ -110,11 +110,54 @@ def run_gw_jax(run_dir, input_name, platform=None, extra_env=None,
         os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     if extra_env:
         env.update(extra_env)
+    return env
+
+
+def run_gw_jax(run_dir, input_name, platform=None, extra_env=None,
+               timeout=900):
+    """Run ``python -m gw.gw_jax -i <input_name>`` in run_dir; return the process."""
     return subprocess.run(
         [sys.executable, "-m", "gw.gw_jax", "-i", input_name],
-        cwd=run_dir, env=env, capture_output=True, text=True,
+        cwd=run_dir, env=gw_env(platform, extra_env),
+        capture_output=True, text=True, timeout=timeout, check=False,
+    )
+
+
+def run_variant_bundle(variants, spec_dir, platform=None, timeout=1800):
+    """Run prepared gw_jax variants in ONE subprocess (tests/run_variant_bundle.py).
+
+    ``variants`` = [{"name", "run_dir", "input_name", "env"}] with run dirs
+    already prepared (copy_fixture + mutate_input).  Returns
+    {name: (status, stdout)} — stdout from <run_dir>/variant_stdout.txt.
+    Raises AssertionError only if the bundle process itself died before
+    writing results; per-variant failures are reported in the mapping so
+    each test fails on its own variant.
+    """
+    spec_dir = Path(spec_dir)
+    spec_path = spec_dir / "bundle_spec.json"
+    results_path = spec_dir / "bundle_results.json"
+    spec_path.write_text(json.dumps(
+        {"variants": [{**v, "run_dir": str(v["run_dir"])} for v in variants]}))
+    proc = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "tests" / "run_variant_bundle.py"),
+         str(spec_path), str(results_path)],
+        cwd=spec_dir, env=gw_env(platform), capture_output=True, text=True,
         timeout=timeout, check=False,
     )
+    assert results_path.exists(), (
+        f"variant bundle process died before writing results "
+        f"(rc={proc.returncode}).\nstdout:\n{proc.stdout}\n"
+        f"stderr:\n{proc.stderr}")
+    results = {r["name"]: r for r in json.loads(results_path.read_text())}
+    out = {}
+    for v in variants:
+        r = results.get(v["name"], {"status": "missing", "error": ""})
+        stdout_file = Path(v["run_dir"]) / "variant_stdout.txt"
+        stdout = stdout_file.read_text() if stdout_file.exists() else ""
+        if r["status"] != "ok" and r.get("error"):
+            stdout += f"\n[bundle error]\n{r['error']}"
+        out[v["name"]] = (r["status"], stdout)
+    return out
 
 
 def parse_eqp_rows(path: Path, labels=("sigSX", "sigCOH", "sigTOT")) -> np.ndarray:
