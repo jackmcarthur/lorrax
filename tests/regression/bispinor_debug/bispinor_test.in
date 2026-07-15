@@ -15,7 +15,7 @@ sys_dim = 2
 bispinor = true
 
 centroids_file = centroids_frac_256.txt
-centroids_file_current = centroids_frac_209_current.txt
+centroids_file_current = centroids_frac_208_current.txt
 
 memory_per_device_gb = 30.0
 

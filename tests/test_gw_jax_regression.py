@@ -28,6 +28,7 @@ uses 1e-3 eV — a physical bound above its 0.12 meV BGW agreement, tight
 enough to catch a real 3D regression.
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -123,3 +124,14 @@ def test_bispinor_gnppm_matches_reference(bispinor_session):
     # transverse tiles through the IBZ cascade.
     assert "charge-centroid orbit closure failed" in bispinor_session.stdout
     assert "V_qmunu_TT_11" in bispinor_session.stdout
+    # The zeta-fit r-chunk streaming must stay MULTI-chunk: a fixture or
+    # memory-budget change that collapses it to one chunk silently stops
+    # exercising the chunk seam (2026-07-15 shrunk fixture runs 3 chunks
+    # at memory_per_device_gb=30; lower the budget if a future shrink
+    # brings this down).
+    chunk_counts = [int(m) for m in re.findall(
+        r"Zeta fitting: (\d+) r-chunks", bispinor_session.stdout)]
+    assert chunk_counts and min(chunk_counts) >= 2, (
+        f"zeta-fit chunk coverage collapsed: r-chunk counts {chunk_counts} "
+        "(need >=2 in every channel; tune memory_per_device_gb in the "
+        "fixture input)")

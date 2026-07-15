@@ -14,6 +14,29 @@ needs `whead_imfreq` alongside `vhead`/`whead_0freq` (all 0.0 here — the
 same explicit head bypass the COHSEX gate used; without it the run dies
 in `persist_w0_and_head` at the imaginary probe frequency).
 
+## 2026-07-15 regen at 25 Ry (suite-speedup: FFT grid 30×30×120 → 20×20×75)
+
+Full QE regen — NOT a re-freeze of the same physics.  The 2026-07-09 shrink
+found the fixture wall was r-chunk streaming over the FFT grid, so this regen
+attacks the grid itself: `ecutwfc` 60 → 25 Ry (3.6× fewer grid points).
+Fixture-only physics (unconverged cutoff, self-consistency freeze — the gate
+was never BGW-anchored).  Source run + provenance:
+`runs/MoS2/D_25Ry_bispinor_fixture_2026-07-15/` (QE SCF/NSCF at 25 Ry,
+nbnd=40 → `truncate_bands.py` → 34-band WFN.h5 14.8 MB (was 52.6);
+`gw.kin_ion_io`; kmeans reruns, same seeds/flags — transverse orbit set
+closed at 208 (was 209) on the new grid).
+
+- Orbit-closure properties preserved: charge non-closed (full-BZ-direct,
+  log-asserted), transverse closed (IBZ cascade, log-asserted).
+- **Chunk coverage now log-asserted**: all 4 ζ-fit passes run **3 r-chunks**
+  at `memory_per_device_gb = 30`; the gate fails if any channel drops below
+  2 chunks (the streaming seam must stay exercised — lower the memory budget
+  if a future shrink collapses it).
+- Validation: 3 consecutive fresh runs bit-identical (2160 sigma_diag values,
+  max|Δ| = 0.0; timestamp header only diff); `LORRAX_EXTRA_MU_PAD=4` pad twin
+  bit-identical (see Tier-2 gate).  Recorded driver wall 29 s warm
+  (was ~40 s at 60 Ry).
+
 ## 2026-07-09 shrink (640/668 → 256/209 centroids) + mode change
 
 Same-code re-freeze on `agent/driver-transparency`.  What changed and why
@@ -52,7 +75,7 @@ kept.  Warm wall ≈ 40 s recorded (was ≈ 100 s at 640/668 static COHSEX).
 - `bispinor_test.in` — GN-PPM bispinor input (Tier-1 gate; the Tier-2
   pad-flip gate reruns it fresh with `LORRAX_EXTRA_MU_PAD=4` — bispinor
   restart is not yet supported, see gw_init.py).
-- `centroids_frac_256.txt` / `centroids_frac_209_current.txt` — charge /
-  transverse ISDF centroid sets (seed 42).
+- `centroids_frac_256.txt` / `centroids_frac_208_current.txt` — charge /
+  transverse ISDF centroid sets (seed 42, on the 25 Ry grid).
 - `sigma_diag_bispinor_ref.dat` — frozen reference (sigX/sigC/sigXC).
 - `WFN.h5` (34 bands), `kin_ion.h5`.
