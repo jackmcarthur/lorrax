@@ -347,6 +347,29 @@ class CrossingMinimaxQuadrature:
             self.tau, self.alpha, time_axis=time_axis)
 
 
+# Mode-classification thresholds (Fix-3 census determinism, 2026-07-15).
+# Both are RELATIVE tests on magnitudes, never on a cancellation: the old
+# absolute cut |Wc0 - Wc_probe| > 1e-14 tested a *difference of near-equal
+# numbers*, so every dispersion-free element landed at the noise floor by
+# construction and flipped valid<->invalid with device-count reduction-order
+# noise (ROOT_CAUSE.md 2026-07-08, the two cross-P "divergent-Omega" flips).
+# A magnitude test only flips if the true value sits within ~1 ulp of the
+# cut — a measure-sparse population, not an accumulation point.
+_DEAD_REL = 1.0e-12
+# |Wc0| <= _DEAD_REL * per-q max|Wc0|: the element is roundoff (both the
+# pole term, B ∝ Wc0·Ω, and the static term, ∝ Wc0, are ~0 — the class
+# choice is physically irrelevant but must be decided deterministically;
+# without this gate Ω² = ω̄²·(noise/noise) can come out positive-huge and
+# pollute the valid census / window max-Ω).
+_STIFF_REL = 1.0e-8
+# |Wc0 - Wc_probe| <= _STIFF_REL * |Wc0|: no resolvable dispersion between
+# 0 and the probe — within the one-pole model, denom = Wc0·ω̄²/(Ω²+ω̄²), so
+# denom→0 means Ω→∞, where W(ω) → Wc0 identically: the static-COHSEX
+# treatment (ppm_invalid_mode='static_limit', the default) is the EXACT
+# Ω→∞ limit of the pole formula, not a fallback.  1e-8 ~ the relative
+# accuracy of the W build itself; below it the fitted Ω is meaningless.
+
+
 def fit_gn_ppm_from_wc_pair(
     Wc0_qmunu: jax.Array,
     Wc_probe_qmunu: jax.Array,
@@ -388,6 +411,23 @@ def fit_gn_ppm_from_wc_pair(
         layout; ``unfulfilled_fraction`` counts LOGICAL modes only. The fit is
         pure local algebra: no host gathers and no communication beyond
         whatever sharding is already attached to the inputs.
+
+    Notes
+    -----
+    A logical mode lands in one of four classes (see ``_DEAD_REL`` /
+    ``_STIFF_REL`` above for the determinism rationale):
+
+    - **valid**: resolvable dispersion, fitted ``Ω² > 0`` — carries the pole.
+    - **dead** (``|Wc0|`` at roundoff): invalid; both treatments give ~0.
+    - **stiff** (``|Wc0 − Wc_probe| ≤ 1e-8·|Wc0|``): invalid; the pole is
+      above the resolvable range and the static-limit treatment is its exact
+      ``Ω → ∞`` limit.
+    - **Ω² ≤ 0** (element grows toward the probe): invalid; the one-pole
+      ansatz itself fails (mixed-sign spectral weight — off-diagonal pole
+      interference).
+
+    All invalid classes get ``Ω = fallback_omega`` and are handled downstream
+    per ``ppm_invalid_mode``.
     """
 
     Wc0 = jnp.asarray(Wc0_qmunu, dtype=jnp.complex128)
@@ -404,12 +444,20 @@ def fit_gn_ppm_from_wc_pair(
     mode_mask = mu_log[:, None] & mu_log[None, :]   # (μ, ν) logical selector
 
     denom = Wc0 - Wc_probe
-    safe = jnp.abs(denom) > 1.0e-14
-    ratio = jnp.where(safe, Wc_probe / denom, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+    abs_w0 = jnp.abs(Wc0)
+    # Per-q element scale for the dead gate (pads are exact zeros; mask anyway).
+    scale_q = jnp.max(jnp.where(mode_mask, abs_w0, 0.0), axis=(-2, -1), keepdims=True)
+    dead = abs_w0 <= _DEAD_REL * scale_q
+    stiff = jnp.abs(denom) <= _STIFF_REL * abs_w0
+    resolvable = ~(dead | stiff)
+    # resolvable ⇒ |denom| > _STIFF_REL·|Wc0| > 0 strictly; the double-where
+    # keeps the dropped lane finite so no inf/nan is ever materialized.
+    safe_denom = jnp.where(resolvable, denom, jnp.asarray(1.0 + 0.0j, dtype=jnp.complex128))
+    ratio = jnp.where(resolvable, Wc_probe / safe_denom, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
     omega_sq = -(z_probe * z_probe) * ratio
     omega_sq_re = jnp.real(omega_sq)
     good = (
-        safe
+        resolvable
         & jnp.isfinite(omega_sq_re)
         & (omega_sq_re > 0.0)
         & mode_mask

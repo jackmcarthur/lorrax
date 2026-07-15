@@ -142,7 +142,10 @@ def _prepare_sigma_state(
     no mask is available), so the helper doesn't branch on None.
 
     ``keep_invalid`` is a traced bool implementing ``ppm_invalid_mode`` (BGW
-    ``invalid_gpp_mode``) for poles with fitted ``Omega^2 < 0``: False = drop
+    ``invalid_gpp_mode``) for unfittable poles — fitted ``Omega^2 <= 0``,
+    dead (roundoff-level) elements, and stiff (dispersion-free, pole above
+    the resolvable range) elements; see the class notes on
+    ``fit_gn_ppm_from_wc_pair``: False = drop
     them from the τ-pole sum (``B_mask &= valid``; BGW mode 0 / "zero", and
     also the pole-sum half of "static_limit" / BGW mode 3 — the caller adds
     the analytic static-COHSEX term for the modes flagged by
