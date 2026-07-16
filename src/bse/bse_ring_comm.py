@@ -693,30 +693,34 @@ def build_realspace_random_transition_generator(
     if n_cond_pad % px != 0 or n_val_pad % py != 0:
         raise ValueError("n_cond_pad and n_val_pad must be divisible by px/py")
 
-    c_chunk = n_cond_pad // px
     v_chunk = n_val_pad // py
 
     def _map(r, psi_c_X, psi_v_X, V_q0):
         # r: (batch, nu_local, nk), column-sharded on y.
         U_partial = jnp.einsum("MN,bNk->bMk", V_q0, r)
-        U = lax.psum(U_partial, axis_name="y")  # (batch, mu_local, nk), sharded on x
+        U = lax.psum(U_partial, axis_name="y")  # (batch, mu_local_x, nk), mu on x
 
-        axis_index_x = jnp.asarray(lax.axis_index("x"), dtype=jnp.int32)
         axis_index_y = jnp.asarray(lax.axis_index("y"), dtype=jnp.int32)
-        c_start = axis_index_x * jnp.asarray(c_chunk, dtype=jnp.int32)
         v_start = axis_index_y * jnp.asarray(v_chunk, dtype=jnp.int32)
         z = jnp.int32(0)
 
+        # v is a free output index (tiled on y) -> pre-slice its y-block.  c is
+        # NOT pre-sliced: the centroid (mu) contraction below is over the LOCAL
+        # x-slice of mu, so it must be completed across x by a psum.  Slicing c to
+        # this x-rank's block first (as an earlier version did) silently drops the
+        # off-rank mu contributions to every c — correct only at px=1 (~50% wrong
+        # at px=2).  Mirror apply_V_ring: full c, psum_scatter over x.
         nk_local, _, nspinor, mu_local = psi_c_X.shape
-        psi_c_slice = lax.dynamic_slice(
-            psi_c_X, (z, c_start, z, z), (nk_local, c_chunk, nspinor, mu_local)
-        )
         psi_v_slice = lax.dynamic_slice(
             psi_v_X, (z, v_start, z, z), (nk_local, v_chunk, nspinor, mu_local)
         )
 
-        M_X = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_slice), psi_v_slice)
-        X_local = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M_X), U)
+        M_X = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_X), psi_v_slice)  # (k,c_full,v,mu_x)
+        VX_partial = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M_X), U)          # local-mu, c full
+        # psum over x completes the mu sum across x-slices AND scatters the
+        # conduction index onto x -> (b, c_chunk_x, v_chunk_y, k).
+        X_local = lax.psum_scatter(
+            VX_partial, axis_name="x", scatter_dimension=1, tiled=True)
 
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X_local.real.dtype))
         return X_local / sqrt_nk
@@ -734,10 +738,36 @@ def build_density_snapshot_operator(
     nkx: int,
     nky: int,
     nkz: int,
+    scatter_nu_on_y: bool = False,
 ):
-    """Build a sharded map: s(c,v,k) -> d(mu) = V_q0 @ sum_k R s.
+    """Build a sharded map: s(b,c,v,k) -> d(b,mu) = V_q0 @ sum_k R s.
 
-    Returns density-space vectors in r_mu (summed over k) sharded on x.
+    The projection back from the (c,v,k) pair basis to the ISDF density
+    (centroid) basis.  ``b`` is a batch axis (one probe/trial vector per slot),
+    replicated across the mesh; ``mu`` is the centroid output index.
+
+    Two output layouts, selected at build time:
+
+    * ``scatter_nu_on_y=False`` (default): the V_q0 contraction over N is
+      completed with a plain ``psum('y')`` and ``d`` returns replicated on the
+      batch axis with ``mu`` on ``x`` — ``P(None, 'x')`` = ``(b, mu_X)``.  Used
+      by the per-vector density-snapshot callers (``bse_pseudopoles``) that
+      device_get one column at a time.
+
+    * ``scatter_nu_on_y=True``: the W-column / screened-W(omega) path, where the
+      batch axis IS the probe index ``nu`` and we want the assembled tile
+      ``W(mu_X, nu_Y)`` with no replicated ``(mu, nu)`` intermediate.  This
+      mirrors the Sigma_PPM reduce-scatter kernel
+      (``gw.ppm_tau_kernel._make_project_ri_reduce_scatter``): the same mesh
+      axis ``y`` carries BOTH the reduction (finish the V_q0 N-contraction,
+      whose partials are scattered across the ``y`` shards) AND the output
+      tiling (scatter the ``nu`` batch onto ``y``), fused into ONE
+      ``psum_scatter`` — same NCCL volume as the plain ``psum`` but the tile
+      lands ``P('x', 'y')`` = ``(mu_X, nu_Y)`` = ``sh.V`` device-local.
+      Requires ``b % py == 0`` (pad the probe block; ``padded_mu_extent`` already
+      rounds the full-basis centroid count to a multiple of ``px*py``).
+
+    Returns density-space vectors summed over k.
     """
     px, py = mesh_xy.devices.shape
     sh = make_bse_shardings(mesh_xy)
@@ -793,17 +823,29 @@ def build_density_snapshot_operator(
 
         S_total = S_total / sqrt_nk
 
-        U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)
-        U = lax.psum(U_partial, axis_name="y")  # (batch, mu_local, nk)
+        # V_q0 @ S: local N-slice partials, N tiled on y (mu on x from V_q0).
+        U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)  # (b, mu_local_x, k)
 
-        d_mu = jnp.sum(U, axis=-1)
-        return d_mu
+        if not scatter_nu_on_y:
+            U = lax.psum(U_partial, axis_name="y")  # finish N sum, replicate on y
+            return jnp.sum(U, axis=-1)              # (b, mu_local_x)
+
+        # Reduce-scatter tail (mirror of ppm_tau_kernel reduce-scatter): sum the
+        # local-N partials across y (completes the V_q0 N-contraction) AND scatter
+        # the nu batch onto y in one collective, so W lands (mu_X, nu_Y) with no
+        # replicated (mu, nu).  Local transpose first (no comms) so nu is the
+        # scatter axis; psum_scatter reduces over y and tiles nu across y.
+        d_partial = jnp.sum(U_partial, axis=-1)          # (b, mu_local_x)
+        d_local = jnp.swapaxes(d_partial, 0, 1)          # (mu_local_x, b)
+        return lax.psum_scatter(
+            d_local, axis_name="y", scatter_dimension=1, tiled=True
+        )                                                # (mu_local_x, b/py)
 
     return _shard_map_fn(
         _map,
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"), P("x", "y")),
-        out_specs=P(None, "x"),
+        out_specs=(P("x", "y") if scatter_nu_on_y else P(None, "x")),
     )
 
 
