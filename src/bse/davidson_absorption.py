@@ -32,7 +32,7 @@ from solvers.davidson import davidson, warmup_davidson_jit
 from .absorption_common import load_dipole_h5, slice_dipole_to_bse_window, write_eigenvalues_dat
 from .bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
 from .bse_io import (
-    _find_restart_file, apply_eqp_corrections,
+    _find_restart_file,
     load_bse_data_from_restart_sharded, resolve_n_occ,
 )
 from .bse_ring_comm import create_mesh_2d, make_bse_shardings
@@ -91,22 +91,10 @@ def main(argv=None):
     # test_davidson_bse: explicit n_occ-based slice, NOT nearest-energy
     # matching (which silently mis-selects bands after QP shifts).
     if args.eqp is not None:
-        n_val_eff = int(data["n_val"])
-        n_cond_eff = int(data["n_cond"])
-        with h5py.File(restart_file, "r") as f:
-            enk_full_np = np.asarray(f["enk_full"][:])
-        enk_full_np = apply_eqp_corrections(enk_full_np, args.eqp, input_file=args.input)
-        n_occ_eff = resolve_n_occ(enk_full_np, n_occ=args.n_occ, input_file=args.input)
-        val_idx = np.arange(n_occ_eff - n_val_eff, n_occ_eff)
-        cond_idx = np.arange(n_occ_eff, n_occ_eff + n_cond_eff)
-        eps_v_new = jnp.asarray(enk_full_np[:, val_idx])
-        eps_c_new = jnp.asarray(enk_full_np[:, cond_idx])
-        # Pad to multiples of (grid_y, grid_x).
-        from .bse_io import _pad_axis_to_multiple
-        eps_v_new, _ = _pad_axis_to_multiple(eps_v_new, axis=1, multiple=grid_y)
-        eps_c_new, _ = _pad_axis_to_multiple(eps_c_new, axis=1, multiple=grid_x)
-        data["eps_v"] = eps_v_new
-        data["eps_c"] = eps_c_new
+        from .bse_io import apply_eqp_and_reslice_bands
+        data["eps_v"], data["eps_c"], n_occ_eff = apply_eqp_and_reslice_bands(
+            restart_file, args.eqp, args.input,
+            int(data["n_val"]), int(data["n_cond"]), args.n_occ, grid_x, grid_y)
         if rank0:
             print(f"[davidson_absorption] applied EQP {args.eqp} (n_occ={n_occ_eff})", flush=True)
 

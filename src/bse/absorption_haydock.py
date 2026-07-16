@@ -175,14 +175,14 @@ def run_haydock(
     from .bse_io import resolve_n_occ
     n_occ = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)
     if eqp_file is not None:
-        from .bse_io import _pad_axis_to_multiple, apply_eqp_corrections
-        enk_full_np = apply_eqp_corrections(enk_full_np, eqp_file, input_file=input_file)
-        val_idx = np.arange(n_occ - n_val, n_occ)
-        cond_idx = np.arange(n_occ, n_occ + n_cond)
-        data["eps_v"] = jnp.asarray(enk_full_np[:, val_idx])
-        data["eps_c"] = jnp.asarray(enk_full_np[:, cond_idx])
-        data["eps_v"], _ = _pad_axis_to_multiple(data["eps_v"], axis=1, multiple=grid_y)
-        data["eps_c"], _ = _pad_axis_to_multiple(data["eps_c"], axis=1, multiple=grid_x)
+        # Re-slice the band window AND re-resolve n_occ on the eqp-corrected
+        # energies (a QP shift can move the gap). Overwrite n_occ so the
+        # downstream dipole slice below uses the corrected value too, rather
+        # than the stale pre-correction n_occ resolved above.
+        from .bse_io import apply_eqp_and_reslice_bands
+        data["eps_v"], data["eps_c"], n_occ = apply_eqp_and_reslice_bands(
+            restart_file, eqp_file, input_file,
+            int(data["n_val"]), int(data["n_cond"]), n_occ, grid_x, grid_y)
 
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     nk = nkx * nky * nkz

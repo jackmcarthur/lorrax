@@ -240,25 +240,13 @@ def _preview_lanczos(
         grid_x, grid_y = mesh_xy.devices.shape
         # EQP override on enk_full (BGW eqp1.dat semantics).
         if eqp_file is not None:
-            from .bse_io import apply_eqp_corrections, resolve_n_occ
-            import numpy as _np
-            # Re-derive full enk and band-slice indices to apply EQP, then
-            # update eps_v / eps_c slices in-place. Simpler: reload enk
-            # and re-apply slicing.
-            with __import__('h5py').File(restart_file, "r") as f:
-                enk_full_np = _np.asarray(f["enk_full"][:])
-            enk_full_np = apply_eqp_corrections(
-                enk_full_np, eqp_file, input_file=input_file)
-            n_occ_eff = resolve_n_occ(
-                enk_full_np, n_occ=n_occ, input_file=input_file)
-            val_idx = _np.arange(n_occ_eff - n_val, n_occ_eff)
-            cond_idx = _np.arange(n_occ_eff, n_occ_eff + n_cond)
-            data["eps_v"] = jnp.asarray(enk_full_np[:, val_idx])
-            data["eps_c"] = jnp.asarray(enk_full_np[:, cond_idx])
-            # Pad to match psi_v_X / psi_c_X band axes.
-            from .bse_io import _pad_axis_to_multiple
-            data["eps_v"], _ = _pad_axis_to_multiple(data["eps_v"], axis=1, multiple=grid_y)
-            data["eps_c"], _ = _pad_axis_to_multiple(data["eps_c"], axis=1, multiple=grid_x)
+            # Re-slice the band window on the eqp-corrected energies. Uses the
+            # loader-CLAMPED band counts (data['n_val']/data['n_cond']), not the
+            # raw CLI n_val/n_cond, so an over-request can't slice out of bounds.
+            from .bse_io import apply_eqp_and_reslice_bands
+            data["eps_v"], data["eps_c"], _ = apply_eqp_and_reslice_bands(
+                restart_file, eqp_file, input_file,
+                int(data["n_val"]), int(data["n_cond"]), n_occ, grid_x, grid_y)
         nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]
         nk = nkx * nky * nkz
         nc_pad = int(data["n_cond_pad"])

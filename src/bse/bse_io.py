@@ -793,6 +793,44 @@ def apply_eqp_corrections(
     return enk_qp
 
 
+def apply_eqp_and_reslice_bands(
+    restart_file: str,
+    eqp_file: str,
+    input_file: Optional[str],
+    n_val: int,
+    n_cond: int,
+    n_occ: Optional[int],
+    grid_x: int,
+    grid_y: int,
+) -> tuple[jax.Array, jax.Array, int]:
+    """Apply BGW ``eqp1.dat`` corrections and re-slice the BSE band window.
+
+    Reads ``enk_full`` from ``restart_file``, applies the eqp corrections, then
+    RE-resolves n_occ on the CORRECTED energies (QP shifts can move the gap)
+    before slicing ``n_val``/``n_cond`` bands around the new n_occ.  The
+    valence/conduction energy axes are padded to multiples of (grid_y, grid_x)
+    to match the loader's psi band axes.
+
+    ``n_val``/``n_cond`` must be the loader-CLAMPED counts (``data['n_val']`` /
+    ``data['n_cond']``), not raw CLI requests, or the slice can run out of
+    bounds.  Single-sourced by the sharded --eqp paths (bse_jax._preview_lanczos,
+    davidson_absorption, absorption_haydock).
+
+    Returns ``(eps_v_padded, eps_c_padded, n_occ_eff)``.
+    """
+    with h5py.File(restart_file, "r") as f:
+        enk_full_np = np.asarray(f["enk_full"][:])
+    enk_full_np = apply_eqp_corrections(enk_full_np, eqp_file, input_file=input_file)
+    n_occ_eff = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)
+    val_idx = np.arange(n_occ_eff - n_val, n_occ_eff)
+    cond_idx = np.arange(n_occ_eff, n_occ_eff + n_cond)
+    eps_v = jnp.asarray(enk_full_np[:, val_idx])
+    eps_c = jnp.asarray(enk_full_np[:, cond_idx])
+    eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=grid_y)
+    eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=grid_x)
+    return eps_v, eps_c, n_occ_eff
+
+
 def _find_restart_file(input_file: str) -> str:
     input_dir = os.path.dirname(os.path.abspath(input_file))
     candidates = []
