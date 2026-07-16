@@ -15,6 +15,17 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from runtime.padding import padded_mu_extent
 
 
+_BARE_V_FALLBACK_WARNING = (
+    "\n" + "=" * 72 + "\n"
+    "BSE WARNING: W0_qmunu not ready (missing or W0_ready=False) -- falling\n"
+    "back to BARE COULOMB V for the screened interaction W. This is NOT a\n"
+    "physical BSE calculation: excitonic binding from screening is entirely\n"
+    "absent. Re-run GW screening to produce a ready W0_qmunu before trusting\n"
+    "these results.\n"
+    + "=" * 72
+)
+
+
 class BSEData(SimpleNamespace):
     """Container for BSE calculation data."""
     pass
@@ -384,6 +395,7 @@ def load_bse_data_from_restart_sharded(
     fermi_energy: float = 0.0,
     mesh_xy: Optional[Mesh] = None,
     pad_bands: bool = True,
+    use_nohead: bool = False,
     *,
     input_file: Optional[str] = None,
     cell_volume: Optional[float] = None,
@@ -394,10 +406,21 @@ def load_bse_data_from_restart_sharded(
         raise ValueError("mesh_xy is required for sharded load")
 
     with h5py.File(restart_file, "r") as f:
-        vq_dset = f["V_qmunu"]
-        if "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
-            wq_dset = f["W0_qmunu"]
+        vq_key = "V_qmunu_nohead" if use_nohead and "V_qmunu_nohead" in f else "V_qmunu"
+        if use_nohead and vq_key == "V_qmunu":
+            print("Warning: requested --nohead but V_qmunu_nohead not found; using V_qmunu.")
+        vq_dset = f[vq_key]
+        wq_key = None
+        if use_nohead and "W0_qmunu_nohead" in f and bool(f["W0_qmunu_nohead"].attrs.get("W0_ready", False)):
+            wq_key = "W0_qmunu_nohead"
+        elif "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
+            wq_key = "W0_qmunu"
+        if wq_key is not None:
+            wq_dset = f[wq_key]
         else:
+            if use_nohead:
+                print("Warning: requested --nohead but W0_qmunu_nohead not found/ready.")
+            print(_BARE_V_FALLBACK_WARNING)
             wq_dset = vq_dset
         if "psi_full_y" not in f or "enk_full" not in f:
             raise ValueError(
@@ -947,7 +970,11 @@ def _load_ring_subset(
     # V_qmunu is now flat-q (nq, μ, μ) post-shim; q=0 is V_qmunu[0].
     V_q0 = V_qmunu[0]
     V_q0 = _pad_last_two_axes(V_q0, n_rmu_pad)
-    W_src = W0_qmunu if W0_qmunu is not None else V_qmunu
+    if W0_qmunu is not None:
+        W_src = W0_qmunu
+    else:
+        print(_BARE_V_FALLBACK_WARNING)
+        W_src = V_qmunu
     # W_src: (nq, μ, μ).  Reshape flat-q → 3-D-k and transpose to the
     # ``(μ, μ, nkx, nky, nkz)`` layout the downstream BSE machinery
     # consumes.  This is the ONE place the 3-D-k form materialises
