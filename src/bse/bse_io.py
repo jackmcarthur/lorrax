@@ -143,7 +143,12 @@ def _pad_axis_to_multiple(x: jax.Array, axis: int, multiple: int) -> tuple[jax.A
         return x, size
     pad_width = [(0, 0)] * x.ndim
     pad_width[axis] = (0, pad)
-    return jnp.pad(x, pad_width, mode="constant"), size
+    # Return the PADDED extent (size + pad), not the pre-pad size: every
+    # consumer binds this to n_val_pad/n_cond_pad and relies on it being the
+    # mesh-rounded value (e.g. bse_ring_comm's `n_cond_pad % px == 0` guard).
+    # Previously wrong only when the band count was not already a mesh
+    # multiple — invisible on all mesh-divisible validated runs.
+    return jnp.pad(x, pad_width, mode="constant"), size + pad
 
 
 def _get_local_mesh_coords(mesh_xy: Mesh) -> tuple[list[tuple[int, int]], int, int]:
