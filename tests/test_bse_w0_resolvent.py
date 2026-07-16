@@ -11,7 +11,7 @@ chain touched by the W(0) cross-check: ``inject_head=False`` loading, the
 import numpy as np
 import pytest
 import jax
-from jax.sharding import Mesh
+from jax.sharding import Mesh, PartitionSpec as P
 
 from bse import bse_io
 from bse.bse_w_exact import (
@@ -35,12 +35,20 @@ def test_w0_resolvent_matches_restart(gnppm_session):
 
     matvec, diag_h, gen, snapshot, sh = _build_rpa_resolvent(mesh, data)
     cols, _ = _select_compare_cols(T, nlog, 4, seed=0)
-    wc, resids = _resolve_wc_columns(
+    W_tile, resids = _resolve_wc_columns(
         cols, 0.0 + 0.0j, data, matvec, diag_h, gen, snapshot, sh,
         max_iter=200, tol=1e-10)
 
+    # The resolvent projects back to the assembled (mu_X, nu_Y) tile directly:
+    # the reduce-scatter snapshot must land nu on y and mu on x (P('x','y')), so
+    # no replicated (mu, nu) is ever materialized.
+    assert W_tile.sharding.spec == P("x", "y"), (
+        f"W tile carries {W_tile.sharding.spec}, expected P('x','y') = (mu_X, nu_Y)")
+
+    wc = np.asarray(jax.device_get(W_tile))     # (n_rmu, n_pad); column i = cols[i]
+    resids = np.asarray(jax.device_get(resids))
     for i, nu0 in enumerate(cols):
         tcol = T[:nlog, int(nu0)]
-        rel = float(np.linalg.norm(wc[i, :nlog] - tcol) / np.linalg.norm(tcol))
+        rel = float(np.linalg.norm(wc[:nlog, i] - tcol) / np.linalg.norm(tcol))
         assert resids[i] < 1e-6, f"col {nu0}: GMRES not converged (resid={resids[i]:.2e})"
         assert rel < 1e-6, f"col {nu0}: W(0) resolvent closure rel_err={rel:.2e} (>1e-6)"
