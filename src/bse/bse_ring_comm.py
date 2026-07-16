@@ -180,7 +180,7 @@ def _ring_sum_valence_second(
         psi_v_slice = lax.dynamic_slice(
             psi_v_X, (z, v_start, z, z), (nk, v_chunk, nspinor, mu_local)
         )
-        T = T + jnp.einsum("kvsM,bvksN->bMNtsk", psi_v_slice, buf)
+        T = T + jnp.einsum("kvtM,bvksN->bMNtsk", psi_v_slice, buf)
         buf = lax.ppermute(buf, axis_name="y", perm=perm)
         return buf, T
 
@@ -548,7 +548,7 @@ def build_bse_ring_matvec_full(
         X_full_c = lax.all_gather(X, "x", axis=1, tiled=True)
         R = jnp.einsum("kcsN,bcvk->bvksN", jnp.conj(psi_c_Y), X_full_c)
         R_full_v = lax.all_gather(R, "y", axis=1, tiled=True)
-        T = jnp.einsum("kvsM,bvksN->bMNtsk", psi_v_X, R_full_v)
+        T = jnp.einsum("kvtM,bvksN->bMNtsk", psi_v_X, R_full_v)
         return T
 
     encode_T_gather_B = _shard_map_fn(
