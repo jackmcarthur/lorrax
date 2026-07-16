@@ -218,6 +218,62 @@ def _read_psi_mu_sharded(
     return psi_global
 
 
+def _resolve_munu_reader(
+    dset: h5py.Dataset,
+    kgrid: Optional[tuple[int, int, int]] = None,
+):
+    """Resolve ``(n_rmu, n_rnu, nkx, nky, nkz, read_slab)`` for a V/W μν dataset.
+
+    Single source of the on-disk layout shim both sharded readers need.
+    Handles three layouts:
+
+      * 8-D legacy ``(1, npol, npol, nkx, nky, nkz, μ, ν)`` — kgrid from shape.
+      * 6-D transitional ``(1, npol, npol, nq, μ, ν)``.
+      * 3-D flat-q ``(nq, μ, ν)``.
+
+    For the 6-D/3-D layouts the caller must pass ``kgrid=(nkx, nky, nkz)`` (or
+    the dataset must carry a ``'kgrid'`` attribute).  ``read_slab(mu0, mu1,
+    nu0, nu1)`` returns the ``(μ, ν, nkx, nky, nkz)`` slab for that μ/ν block;
+    q=0 is the ``(0, 0, 0)`` k-slice.
+    """
+    if dset.ndim == 8:
+        n_rmu = int(dset.shape[6])
+        n_rnu = int(dset.shape[7])
+        nkx, nky, nkz = (int(s) for s in dset.shape[3:6])
+        read_slab = lambda mu0, mu1, nu0, nu1: np.transpose(
+            dset[0, 0, 0, :, :, :, mu0:mu1, nu0:nu1], (3, 4, 0, 1, 2))
+        return n_rmu, n_rnu, nkx, nky, nkz, read_slab
+    if dset.ndim == 6:
+        n_rmu = int(dset.shape[-2])
+        n_rnu = int(dset.shape[-1])
+        nq = int(dset.shape[3])
+        _flat = lambda mu0, mu1, nu0, nu1: np.asarray(
+            dset[0, 0, 0, :, mu0:mu1, nu0:nu1])
+    else:  # 3-D flat-q
+        n_rmu = int(dset.shape[-2])
+        n_rnu = int(dset.shape[-1])
+        nq = int(dset.shape[0])
+        _flat = lambda mu0, mu1, nu0, nu1: np.asarray(
+            dset[:, mu0:mu1, nu0:nu1])
+    if kgrid is not None:
+        nkx, nky, nkz = (int(v) for v in kgrid)
+    elif 'kgrid' in dset.attrs:
+        nkx, nky, nkz = (int(v) for v in dset.attrs['kgrid'])
+    else:
+        raise ValueError(
+            "_resolve_munu_reader: V/W dataset is flat-q but no kgrid was "
+            "passed and no 'kgrid' attribute is present; the caller must "
+            "resolve (nkx, nky, nkz) (from the top-level 'kgrid' dataset or "
+            "the WFN) and pass it in.")
+    if nkx * nky * nkz != nq:
+        raise ValueError(f"kgrid {nkx}×{nky}×{nkz} ≠ nq={nq}")
+    read_slab = (lambda mu0, mu1, nu0, nu1:
+        _flat(mu0, mu1, nu0, nu1)
+        .reshape(nkx, nky, nkz, mu1 - mu0, nu1 - nu0)
+        .transpose(3, 4, 0, 1, 2))
+    return n_rmu, n_rnu, nkx, nky, nkz, read_slab
+
+
 def _read_vq0_sharded(
     dset: h5py.Dataset,
     mu_per_x: int,
@@ -226,12 +282,12 @@ def _read_vq0_sharded(
     n_rmu_pad: int,
     dtype: np.dtype = np.complex128,
     trim: bool = True,
+    kgrid: Optional[tuple[int, int, int]] = None,
 ) -> jax.Array:
     local_coords, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
     local_x, local_y = _get_local_axis_coords(local_coords)
     _assert_local_block(local_coords, local_x, local_y)
-    n_rmu = dset.shape[6]
-    n_rnu = dset.shape[7]
+    n_rmu, n_rnu, _nkx, _nky, _nkz, read_slab = _resolve_munu_reader(dset, kgrid=kgrid)
 
     local_mu = mu_per_x * len(local_x)
     local_nu = nu_per_y * len(local_y)
@@ -247,7 +303,8 @@ def _read_vq0_sharded(
             nu_end = min(nu_start + nu_per_y, n_rnu)
             if nu_start >= n_rnu:
                 continue
-            slab = dset[0, 0, 0, 0, 0, 0, mu_start:mu_end, nu_start:nu_end]
+            # q=0 is the (0, 0, 0) k-slice of the normalized (μ, ν, k...) slab.
+            slab = read_slab(mu_start, mu_end, nu_start, nu_end)[:, :, 0, 0, 0]
             if slab.shape[0] < mu_per_x or slab.shape[1] < nu_per_y:
                 pad_mu = mu_per_x - slab.shape[0]
                 pad_nu = nu_per_y - slab.shape[1]
@@ -273,55 +330,15 @@ def _read_wq_sharded(
     n_rmu_pad: int,
     dtype: np.dtype = np.complex128,
     trim: bool = True,
+    kgrid: Optional[tuple[int, int, int]] = None,
 ) -> jax.Array:
     local_coords, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
     local_x, local_y = _get_local_axis_coords(local_coords)
     _assert_local_block(local_coords, local_x, local_y)
-    # Dataset axis-shape compat shim — handle three layouts:
-    # 8-D legacy ``(1, npol, npol, nkx, nky, nkz, μ, ν)``,
-    # 6-D transitional ``(1, npol, npol, nq, μ, ν)``,
-    # 3-D flat-q ``(nq, μ, ν)``.  Only the first carries kgrid in the
-    # shape; for the others the caller must pass kgrid via ``input_file``
-    # → WFN.  Internal BSE work below stays in the
-    # ``(μ, μ, nkx, nky, nkz)`` form, so we convert on read.
-    if dset.ndim == 8:
-        n_rmu = int(dset.shape[6])
-        n_rnu = int(dset.shape[7])
-        nkx, nky, nkz = (int(s) for s in dset.shape[3:6])
-        _read_munu_slab = lambda mu0, mu1, nu0, nu1: np.transpose(
-            dset[0, 0, 0, :, :, :, mu0:mu1, nu0:nu1], (3, 4, 0, 1, 2))
-    else:
-        if dset.ndim == 6:
-            n_rmu = int(dset.shape[-2])
-            n_rnu = int(dset.shape[-1])
-            nq = int(dset.shape[3])
-            _flat = lambda mu0, mu1, nu0, nu1: np.asarray(
-                dset[0, 0, 0, :, mu0:mu1, nu0:nu1])
-        else:  # 3-D flat-q
-            n_rmu = int(dset.shape[-2])
-            n_rnu = int(dset.shape[-1])
-            nq = int(dset.shape[0])
-            _flat = lambda mu0, mu1, nu0, nu1: np.asarray(
-                dset[:, mu0:mu1, nu0:nu1])
-        # Caller must supply kgrid; bse_io can't read WFN here without
-        # threading input_file in, so accept it as a ``dset.attrs['kgrid']``
-        # if present, or ask the caller to provide.
-        if 'kgrid' in dset.attrs:
-            nkx, nky, nkz = (int(v) for v in dset.attrs['kgrid'])
-        else:
-            raise ValueError(
-                "_load_per_axis_padded_w_block: V/W dataset is flat-q but "
-                "no 'kgrid' attribute on the dataset; restart writer must "
-                "annotate kgrid for BSE to recover the (nkx, nky, nkz) "
-                "form.  Tracked as a follow-up; needs the writer side "
-                "(tagged_arrays.write_restart_state_to_h5) to add the attr.")
-        if nkx * nky * nkz != nq:
-            raise ValueError(
-                f"kgrid {nkx}×{nky}×{nkz} ≠ nq={nq}")
-        _read_munu_slab = (lambda mu0, mu1, nu0, nu1:
-            _flat(mu0, mu1, nu0, nu1)
-            .reshape(nkx, nky, nkz, mu1 - mu0, nu1 - nu0)
-            .transpose(3, 4, 0, 1, 2))
+    # Layout shim (8-D / 6-D / 3-D-flat-q) is single-sourced in
+    # ``_resolve_munu_reader``.  Internal BSE work below stays in the
+    # ``(μ, μ, nkx, nky, nkz)`` form the reader already produces.
+    n_rmu, n_rnu, nkx, nky, nkz, _read_munu_slab = _resolve_munu_reader(dset, kgrid=kgrid)
 
     local_mu = mu_per_x * len(local_x)
     local_nu = nu_per_y * len(local_y)
@@ -457,8 +474,10 @@ def load_bse_data_from_restart_sharded(
         psi_v_Y = jax.lax.with_sharding_constraint(psi_v_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
         psi_c_Y = jax.lax.with_sharding_constraint(psi_c_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
 
-        V_q0 = _read_vq0_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy, n_rmu_pad, trim=False)
-        W_q = _read_wq_sharded(wq_dset, mu_per_x, nu_per_y, mesh_xy, n_rmu_pad, trim=False)
+        V_q0 = _read_vq0_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy, n_rmu_pad,
+                                 trim=False, kgrid=(nkx, nky, nkz))
+        W_q = _read_wq_sharded(wq_dset, mu_per_x, nu_per_y, mesh_xy, n_rmu_pad,
+                               trim=False, kgrid=(nkx, nky, nkz))
 
         # ── q=0 head: load G0_mu_nu, dual-shard X/Y, inject as rank-1 ────
         # On the (μ,ν)-sharded V_q0 and W_q tensors, the rank-1 update
@@ -484,21 +503,8 @@ def load_bse_data_from_restart_sharded(
             vhead_restart = whead_restart = None
 
     if g0_X is not None:
-        vhead_in, whead0_in = _parse_head_overrides(input_file)
-        vhead = vhead_in if vhead_in is not None else vhead_restart
-        if whead0_in is not None:
-            whead = jnp.asarray([whead0_in], dtype=jnp.complex128)
-        else:
-            whead = whead_restart
-
-        # cell_volume: caller may pass directly; otherwise pull from WFN.
-        if cell_volume is None and input_file is not None:
-            try:
-                from file_io import WfnLoader as WFNReader
-                cell_volume = float(WFNReader(_parse_wfn_path(input_file)).cell_volume)
-            except Exception as exc:
-                print(f"BSE sharded load: cell_volume unresolved ({exc}); skipping head")
-                cell_volume = None
+        vhead, whead, cell_volume = _resolve_head_params(
+            input_file, vhead_restart, whead_restart, cell_volume)
 
         if cell_volume is not None and (vhead is not None or whead is not None):
             from gw.head_correction import apply_q0_head_rank1_sharded
@@ -695,6 +701,35 @@ def _parse_head_overrides(input_file: Optional[str]):
     return vhead, whead0
 
 
+def _resolve_head_params(
+    input_file: Optional[str],
+    vhead_restart,
+    whead_restart,
+    cell_volume: Optional[float] = None,
+):
+    """Resolve ``(vhead, whead, cell_volume)`` for q=0 head injection.
+
+    cohsex.in ``vhead``/``whead_0freq`` overrides take precedence over the
+    restart-file head values; ``cell_volume`` (Bohr³) is pulled from the WFN
+    when not supplied.  Any of the three may return ``None`` (head skipped).
+    Single-sourced by both the sharded and single-device restart loaders.
+    """
+    vhead_in, whead0_in = _parse_head_overrides(input_file)
+    vhead = vhead_in if vhead_in is not None else vhead_restart
+    if whead0_in is not None:
+        whead = jnp.asarray([whead0_in], dtype=jnp.complex128)
+    else:
+        whead = whead_restart
+    if cell_volume is None and input_file is not None:
+        try:
+            from file_io import WfnLoader as WFNReader
+            cell_volume = float(WFNReader(_parse_wfn_path(input_file)).cell_volume)
+        except Exception as exc:
+            print(f"BSE head: cell_volume unresolved ({exc}); skipping head")
+            cell_volume = None
+    return vhead, whead, cell_volume
+
+
 def apply_eqp_corrections(
     enk_full: np.ndarray,
     eqp_file: str,
@@ -801,40 +836,6 @@ def _load_ring_subset(
 
     enk_full = jnp.asarray(enk_full_np)
 
-    # ── q=0 head injection (rank-1 in (μ,ν) ISDF basis) ──────────────────
-    # compute_vcoul zeroes the G=G'=0 element of v(q=0); BGW's BSE kernel
-    # uses the mini-BZ-averaged 1/q² value there. We reinstate it as a
-    # rank-1 update in the centroid basis using G0_mu_nu = ζ(0,μ,G=0).
-    # Source priority: cohsex.in overrides > restart-file values. Both
-    # vhead and whead_0freq must resolve for the W update; either is
-    # silently skipped if missing.
-    vhead_in, whead0_in = _parse_head_overrides(input_file)
-    vhead = vhead_in if vhead_in is not None else vhead_restart
-    if whead0_in is not None:
-        whead = jnp.asarray([whead0_in], dtype=jnp.complex128)
-    else:
-        whead = whead_restart
-    if G0_mu_nu is not None and (vhead is not None or whead is not None):
-        from gw.head_correction import apply_q0_head_rank1
-        # Pull cell_volume from the WFN — head update needs the 1/V_cell
-        # scaling (see scripts/checks/sigma_direct_check.py for the canonical convention).
-        from file_io import WfnLoader as WFNReader
-        wfn = WFNReader(_parse_wfn_path(input_file)) if input_file else None
-        cell_volume = float(wfn.cell_volume) if wfn is not None else None
-        if cell_volume is None:
-            print("BSE: head injection skipped — could not resolve cell_volume "
-                  "(input_file required)")
-        else:
-            V_qmunu, W0_qmunu = apply_q0_head_rank1(
-                V_qmunu, W0_qmunu, G0_mu_nu, vhead, whead, cell_volume,
-                omega_index=0)
-            v_str = (f"vhead={complex(vhead).real:.3f}"
-                     if vhead is not None else "vhead=skipped")
-            w_str = (f"whead[0]={complex(whead[0]).real:.3f}"
-                     if whead is not None else "whead=skipped")
-            print(f"BSE: q=0 head injected (rank-1 in μν, V_cell={cell_volume:.2f}): "
-                  f"{v_str}, {w_str}")
-
     # V_qmunu axis-shape compatibility shim:
     #   * legacy 8-D ``(1, npol, npol, nkx, nky, nkz, μ, μ)`` — read kgrid
     #     directly from the shape;
@@ -910,6 +911,36 @@ def _load_ring_subset(
     # inside BSE; elsewhere we keep flat-q.
     W_q = W_src.reshape(nkx, nky, nkz, n_rmu, n_rmu).transpose(3, 4, 0, 1, 2)
     W_q = _pad_first_two_axes(W_q, n_rmu_pad)
+
+    # ── q=0 head injection (rank-1 in (μ,ν) ISDF basis) ──────────────────
+    # Runs AFTER the layout shim so it operates on the normalized q=0 slice:
+    # V_q0 (μ,μ) and the (0,0,0) k-slice of W_q.  compute_vcoul zeroes the
+    # G=G'=0 element of v(q=0); we reinstate the mini-BZ-averaged head as a
+    # rank-1 update from G0_mu_nu = ζ(0,μ,G=0).  Single device → feed G0 as
+    # both the μ- and ν-axis copy to the sharded rank-1 helper.  whead is
+    # injected into W_q only when a real screened W0 is present (not the
+    # bare-V fallback).  Source priority: cohsex.in overrides > restart-file.
+    if G0_mu_nu is not None:
+        vhead, whead, cell_volume = _resolve_head_params(
+            input_file, vhead_restart, whead_restart)
+        if cell_volume is None:
+            print("BSE: head injection skipped — could not resolve cell_volume "
+                  "(input_file required)")
+        elif vhead is not None or whead is not None:
+            from gw.head_correction import apply_q0_head_rank1_sharded
+            g0_pad = _pad_last_axis(G0_mu_nu, n_rmu_pad)
+            w0_ready = W0_qmunu is not None
+            V_q0, W_head = apply_q0_head_rank1_sharded(
+                V_q0, W_q if w0_ready else None, g0_pad, g0_pad,
+                vhead, whead, cell_volume, omega_index=0)
+            if w0_ready:
+                W_q = W_head
+            v_str = (f"vhead={complex(vhead).real:.3f}"
+                     if vhead is not None else "vhead=skipped")
+            w_str = (f"whead[0]={complex(whead[0]).real:.3f}"
+                     if (whead is not None and w0_ready) else "whead=skipped")
+            print(f"BSE: q=0 head injected (rank-1 in μν, V_cell={cell_volume:.2f}): "
+                  f"{v_str}, {w_str}")
 
     key = jax.random.PRNGKey(0)
     X = jax.random.normal(key, (1, n_cond_pad, n_val_pad, nk)) + 1j * jax.random.normal(
