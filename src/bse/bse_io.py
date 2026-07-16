@@ -31,6 +31,22 @@ class BSEData(SimpleNamespace):
     pass
 
 
+def _generate_kpts_grid(nkx: int, nky: int, nkz: int) -> np.ndarray:
+    """Monkhorst-Pack style k-point grid in crystal coords [0, 1), C-order.
+
+    Returns ``(nk, 3)``.  Single consumer: ``write_eigenvectors_stream``.
+    """
+    kpts = []
+    for ix in range(nkx):
+        for iy in range(nky):
+            for iz in range(nkz):
+                kx = ix / nkx
+                ky = iy / nky
+                kz = iz / nkz if nkz > 0 else 0.0
+                kpts.append([kx, ky, kz])
+    return np.array(kpts, dtype=np.float64)
+
+
 def write_eigenvectors_stream(
     output_file: str,
     eigenvalues: jax.Array,
@@ -42,15 +58,13 @@ def write_eigenvectors_stream(
     nkz: int,
     n_write: int,
 ) -> None:
-    from .write_eigenvectors import generate_kpts_grid
-
     # BGW eigenvectors.h5 stores eigenvalues in eV (header text in
     # ``eigenvalues.dat`` says "eig (eV)"; matches BGW's BSE/diag.f90
     # write path).  Our solvers return Ry — convert here so a downstream
     # consumer using BGW conventions reads the right number.
     RYD2EV = 13.6056980659
     eigenvalues = np.asarray(jax.device_get(eigenvalues[:n_write])) * RYD2EV
-    kpts = generate_kpts_grid(nkx, nky, nkz)
+    kpts = _generate_kpts_grid(nkx, nky, nkz)
     nk = kpts.shape[0]
     ns = 1
     nQ = 1
