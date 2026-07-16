@@ -228,7 +228,6 @@ def run_pseudopoles(
     gmres_fp32: bool,
     include_W: bool,
 ) -> dict:
-    v_couples_k = bool(not include_W)
     if use_tda:
         matvec = build_bse_ring_matvec(
             mesh_xy,
@@ -236,7 +235,6 @@ def run_pseudopoles(
             data["nky"],
             data["nkz"],
             include_W=include_W,
-            v_couples_k=v_couples_k,
         )
     else:
         matvec = build_bse_ring_matvec_full(
@@ -245,7 +243,6 @@ def run_pseudopoles(
             data["nky"],
             data["nkz"],
             include_W=include_W,
-            v_couples_k=v_couples_k,
         )
 
     if include_W:
