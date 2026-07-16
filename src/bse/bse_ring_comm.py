@@ -58,6 +58,7 @@ def make_bse_shardings(mesh_xy: Mesh) -> SimpleNamespace:
         A=NamedSharding(mesh_xy, P(None, "x", "y", None, None)),
         D=NamedSharding(mesh_xy, P(None, "x", "y", None, None)),
         S=NamedSharding(mesh_xy, P(None, "y", None)),
+        S_k0=NamedSharding(mesh_xy, P(None, "y")),
         U_mu=NamedSharding(mesh_xy, P(None, "x", None)),
         d_mu=NamedSharding(mesh_xy, P(None, "x")),
     )
@@ -247,9 +248,13 @@ def apply_V_ring(
 
     _, S_total = lax.fori_loop(0, px, step_x, (A_local, S0))
 
-    S_total = S_total / sqrt_nk
+    # Exchange (q=0) is DENSE in (k,k') — SUM over k' into a k-free
+    # transition-Hartree density, one V_q0 solve, then broadcast back at every
+    # k in the decode (VERDICT.md).  k is a replicated (unsharded) axis here, so
+    # the reduction is device-local.  The two 1/sqrt_nk compose to 1/Nk.
+    S_total = jnp.sum(S_total, axis=2) / sqrt_nk  # (b, nu_local)
 
-    U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)
+    U_partial = jnp.einsum("MN,bN->bM", V_q0, S_total)  # (b, mu_local)
     U = lax.psum(U_partial, axis_name="y")
 
     v_start_local = axis_index_y * jnp.asarray(v_chunk, dtype=jnp.int32)
@@ -257,7 +262,7 @@ def apply_V_ring(
         psi_v_X, (z, v_start_local, z, z), (nk_local, v_chunk, nspinor, mu_local)
     )
     M_X = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_X), psi_v_slice_X)
-    VX_partial = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M_X), U)
+    VX_partial = jnp.einsum("kcvM,bM->bcvk", jnp.conj(M_X), U)  # broadcast over k
     VX = lax.psum_scatter(VX_partial, axis_name="x", scatter_dimension=1, tiled=True)
 
     return VX / sqrt_nk

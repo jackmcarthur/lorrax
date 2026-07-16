@@ -91,28 +91,30 @@ def build_bse_simple_matvec(
             jnp.conj(psi_c_Y), psi_v_Y, optimize=True,
         )
 
-        # S[b, ν, k] = Σ_{c,v} M_Y[k,c,v,ν] · X[b,c,v,k] / sqrt_nk.
+        # Exchange (q=0) is DENSE in (k,k') — k is SUMMED in the encode, one
+        # V_q0 solve, then broadcast back at every k in the decode (VERDICT.md).
+        # S[b, ν] = Σ_{k,c,v} M_Y[k,c,v,ν] · X[b,c,v,k] / sqrt_nk.
         # Original forward (apply_V_ring) is conj(ψ_c)·ψ_v·X — i.e. M_Y
         # itself, not conj(M_Y).  The hermitian-conjugate counterpart on
         # the back-contract uses conj(M_X) instead.
-        # Contraction over c (x-sharded in X) and v (y-sharded in X).
+        # Contraction over k (replicated), c (x-sharded in X), v (y-sharded).
         # M has c, v replicated and ν on y. XLA picks the partitioning;
-        # we tag the output P(None, "y", None).
+        # we tag the output P(None, "y").
         S = jnp.einsum(
-            'kcvN,bcvk->bNk',
+            'kcvN,bcvk->bN',
             M_Y, X, optimize=True,
         )
-        S = lax.with_sharding_constraint(S, sh.S)
+        S = lax.with_sharding_constraint(S, sh.S_k0)
         S = S / sqrt_nk
 
-        # U[b, μ, k] = V_q0[μ, ν] · S[b, ν, k].
-        # V_q0 P(x, y) on (μ, ν); S P(None, y, None) on (b, ν, k).
+        # U[b, μ] = V_q0[μ, ν] · S[b, ν].
+        # V_q0 P(x, y) on (μ, ν); S P(None, y) on (b, ν).
         # ν reduces (sharded y); output μ on x. Plain einsum + reshard hint.
         U_mu = jnp.einsum(
-            'MN,bNk->bMk',
+            'MN,bN->bM',
             V_q0, S, optimize=True,
         )
-        U_mu = lax.with_sharding_constraint(U_mu, sh.U_mu)
+        U_mu = lax.with_sharding_constraint(U_mu, sh.d_mu)
 
         # M_X[k, c, v, μ] needed to back-contract: build from psi_c_X, psi_v_X.
         M_X = jnp.einsum(
@@ -120,11 +122,11 @@ def build_bse_simple_matvec(
             jnp.conj(psi_c_X), psi_v_X, optimize=True,
         )
 
-        # HX_V[b, c, v, k] = Σ_μ M_X*[k,c,v,μ] · U_mu[b,μ,k] / sqrt_nk.
+        # HX_V[b, c, v, k] = Σ_μ M_X*[k,c,v,μ] · U_mu[b,μ] / sqrt_nk (broadcast k).
         # M_X has c, v replicated, μ on x. U_mu has μ on x. Locally μ-aligned;
         # output b, c on x (need to scatter c to x), v rep, k rep.
         HX_V = jnp.einsum(
-            'kcvM,bMk->bcvk',
+            'kcvM,bM->bcvk',
             jnp.conj(M_X), U_mu, optimize=True,
         )
         HX_V = lax.with_sharding_constraint(HX_V, sh.X)

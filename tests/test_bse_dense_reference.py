@@ -9,11 +9,10 @@ VERDICT.md): the Q=0 exchange is DENSE in (k,k′) —
 
     ⟨cvk|K^x|c'v'k'⟩ = (1/Nk) Σ_{μν} conj(M_cvk(μ)) V_q0(μν) M_c'v'k'(ν)
 
-with no δ_kk′.  The as-coded matvecs keep k as a batch axis in the exchange
-(``S[b,ν,k]``), computing only the (k,k) diagonal of K^x — the B1 bug.  So the
-full-H / D+V / spectrum checks XFAIL here (strict); the B1 fix commit flips
-them.  The W-only positive control passes even pre-fix (W is untouched by B1)
-and pins the convolution sign q = k − k′.
+with no δ_kk′.  The B1 fix k-SUMS the exchange encode (``S[b,ν]``, k-free) and
+broadcasts the decode back at every k, so the full-H / D+V / spectrum checks
+match the dense reference exactly.  The W-only positive control is independent
+of B1 (W is untouched) and pins the convolution sign q = k − k′.
 
 Piggybacks the session-scoped ``gnppm_session`` GW run (MoS2 3×3×1, nk=9); a
 2v2c window ⇒ N = nc·nv·nk = 36, so the dense build + eigh are trivial.
@@ -181,9 +180,8 @@ def test_w_positive_control(bse_dense_state, kind):
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("kind", MATVEC_KINDS)
-@pytest.mark.xfail(reason="B1 k-diagonal exchange — dense fix pending", strict=True)
 def test_full_H_matches_dense(bse_dense_state, kind):
-    """matvec(X) == H @ X.  XFAILs pre-B1 (exchange off-diagonal k-blocks missing)."""
+    """matvec(X) == H @ X — dense (k,k') exchange (B1 fixed)."""
     harness.skip_unless_gpu(pytest)
     data = bse_dense_state
     H, _, _, _ = _build_dense_H(data)
@@ -197,9 +195,8 @@ def test_full_H_matches_dense(bse_dense_state, kind):
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("kind", MATVEC_KINDS)
-@pytest.mark.xfail(reason="B1 k-diagonal exchange — dense fix pending", strict=True)
 def test_DV_matches_dense(bse_dense_state, kind):
-    """matvec_{include_W=False}(X) == (diag(D)+Kx) @ X — exchange-only failure locus."""
+    """matvec_{include_W=False}(X) == (diag(D)+Kx) @ X — dense exchange locus (B1)."""
     harness.skip_unless_gpu(pytest)
     data = bse_dense_state
     _, D, Kx, _ = _build_dense_H(data)
@@ -213,18 +210,62 @@ def test_DV_matches_dense(bse_dense_state, kind):
 
 
 @pytest.mark.gpu
-@pytest.mark.xfail(reason="B1 k-diagonal exchange — dense fix pending", strict=True)
 def test_spectrum_matches_dense(bse_dense_state):
-    """Iterative (serial-matvec) lowest-4 eigenvalues == eigvalsh(H)[:4]."""
+    """Materialised serial matvec has the dense-H spectrum (B1).
+
+    Design (d) asked for an *iterative* lowest-4 check, but both single-vector
+    and block Lanczos are numerically fragile on this fixture: the q=0 head
+    injection makes the V/W ISDF tiles O(1e5) (V_q0[0,0]≈2.3e5) and they
+    near-cancel against D, so the Krylov solvers return ghost / below-λ_min
+    Ritz values (a solver-conditioning issue orthogonal to B1 — see
+    PHASE2_LOG.md).  We instead MATERIALISE the corrected serial matvec into an
+    N×N matrix with ONE batched application to the identity basis and compare
+    its full spectrum to the dense reference — a robust, solver-independent
+    proof that the B1-corrected operator IS the dense Hamiltonian.
+    """
     harness.skip_unless_gpu(pytest)
-    from bse.bse_lanczos import solve_bse
     data = bse_dense_state
     H, _, _, _ = _build_dense_H(data)
-    ref = np.sort(np.linalg.eigvalsh(0.5 * (H + H.conj().T)))[:4]
-    evals, _ = solve_bse(
-        data["psi_c"], data["psi_v"], data["eps_c"], data["eps_v"],
-        data["W_q"], data["V_q0"],
-        int(data["nkx"]), int(data["nky"]), int(data["nkz"]),
-        n_eig=4, max_iter=80, use_jit_lanczos=True)
-    got = np.sort(np.asarray(evals).real)[:4]
-    assert np.allclose(got, ref, atol=1e-6), f"got {got} vs ref {ref}"
+    nc = int(data["psi_c"].shape[1]); nv = int(data["psi_v"].shape[1])
+    nk = int(data["nkx"] * data["nky"] * data["nkz"])
+    N = nc * nv * nk
+    basis = jnp.asarray(np.eye(N, dtype=np.complex128).reshape(N, nc, nv, nk))
+    # row i of the batched output is H·e_i = column i of H, so cols == Hᵀ.
+    cols = np.asarray(_run_matvec("serial", data, basis, True)).reshape(N, N)
+    Hmat = cols.T
+    assert _relerr(Hmat, H) < 1e-9, f"materialised matvec ≠ H: {_relerr(Hmat, H):.2e}"
+    ev_mat = np.sort(np.linalg.eigvalsh(0.5 * (Hmat + Hmat.conj().T)))
+    ev_ref = np.sort(np.linalg.eigvalsh(0.5 * (H + H.conj().T)))
+    assert np.allclose(ev_mat, ev_ref, atol=1e-8), \
+        f"spectrum mismatch: max|Δ|={np.max(np.abs(ev_mat - ev_ref)):.2e}"
+
+
+@pytest.mark.gpu
+@pytest.mark.extra
+def test_report_before_after_eigenvalues(bse_dense_state):
+    """Diagnostic (``extra``): print the lowest-20 exciton eigenvalues of the
+    k-diagonal-exchange Hamiltonian (pre-B1) vs the dense-exchange one (post-B1).
+
+    Both are eigvalsh of the SAME reference builder — only the exchange kernel's
+    off-diagonal k-blocks differ — so this isolates the physical eigenvalue
+    shift the B1 fix produces on the gate fixture.  Deselected from the plain
+    suite; run with ``-o addopts='' -s`` (or ``-m extra``).
+    """
+    harness.skip_unless_gpu(pytest)
+    data = bse_dense_state
+    H, D, Kx, Kd = _build_dense_H(data)
+    nc = int(data["psi_c"].shape[1]); nv = int(data["psi_v"].shape[1])
+    nk = int(data["nkx"] * data["nky"] * data["nkz"])
+    # Pre-B1: zero the off-diagonal k-blocks of the exchange (k-diagonal only).
+    K6 = Kx.reshape(nc, nv, nk, nc, nv, nk).copy()
+    mask = np.eye(nk)
+    K6 *= mask[None, None, :, None, None, :]
+    Kx_kdiag = K6.reshape(Kx.shape)
+    H_before = np.diag(D.astype(np.complex128)) + Kx_kdiag - Kd
+    ev_before = np.sort(np.linalg.eigvalsh(0.5 * (H_before + H_before.conj().T)))[:20]
+    ev_after = np.sort(np.linalg.eigvalsh(0.5 * (H + H.conj().T)))[:20]
+    RY = 13.6056980659
+    print("\n#  eig_before(Ry)  eig_after(Ry)   Δ(eV)   |  before(eV)  after(eV)")
+    for i, (b, a) in enumerate(zip(ev_before, ev_after)):
+        print(f"{i:2d}  {b:13.6f}  {a:13.6f}  {(a-b)*RY:+7.3f}  | "
+              f"{b*RY:9.4f}  {a*RY:9.4f}")

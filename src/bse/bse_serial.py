@@ -44,9 +44,14 @@ def apply_bse_hamiltonian_single_device(
     M = compute_pair_amplitude(psi_c, psi_v)
     sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
-    S_V = jnp.einsum("kcvN,bcvk->bNk", M, X) / sqrt_nk
-    U_V = jnp.einsum("MN,bNk->bMk", V_q0, S_V)
-    V_term = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M), U_V) / sqrt_nk
+    # Exchange (q=0) is DENSE in (k,k') — <cvk|K^x|c'v'k'> couples every k to
+    # every k' through the single V_q0 tile (VERDICT.md).  Encode k-SUMS into a
+    # k-free transition-Hartree density S[b,nu] = (1/sqrt_Nk) sum_{k'c'v'} M X,
+    # one V_q0 solve, then the decode broadcasts back at every k.  The two
+    # 1/sqrt_Nk compose to the 1/Nk the dense formula requires.
+    S_V = jnp.einsum("kcvN,bcvk->bN", M, X) / sqrt_nk
+    U_V = jnp.einsum("MN,bN->bM", V_q0, S_V)
+    V_term = jnp.einsum("kcvM,bM->bcvk", jnp.conj(M), U_V) / sqrt_nk
 
     if not include_W:
         return D_term + V_term
