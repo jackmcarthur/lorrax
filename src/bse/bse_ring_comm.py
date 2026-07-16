@@ -850,6 +850,38 @@ def build_density_snapshot_operator(
     )
 
 
+def build_density_drive_operators(mesh_xy, nkx, nky, nkz, n_cond_pad, n_val_pad):
+    """Return callable(s) to build density-driven RHS blocks in transition space.
+
+    Transition vertex: d(t,mu) = sum_s conj(psi_c(t,mu)) * psi_v(t,mu)
+    For density-space source g(mu), u = V g. Need f = d^dagger u, fbar = d^T u.
+    For complex Bloch spinors, do not assume fbar == conj(f).
+    """
+    gen = build_realspace_random_transition_generator(mesh_xy, nkx, nky, nkz, n_cond_pad, n_val_pad)
+
+    def f_op(r, psi_c_X, psi_v_X, V_q0):
+        return gen(r, psi_c_X, psi_v_X, V_q0)
+
+    def fbar_op(r, psi_c_X, psi_v_X, V_q0):
+        return gen(r, jnp.conj(psi_c_X), jnp.conj(psi_v_X), V_q0)
+
+    return f_op, fbar_op
+
+
+def build_density_readout_operator_full(mesh_xy, nkx, nky, nkz):
+    """Return a callable to compute w = V (d X + d* Y) from X_full=[X,Y]."""
+    snapshot = build_density_snapshot_operator(mesh_xy, nkx, nky, nkz)
+
+    def _readout(X_full, psi_c_Y, psi_v_Y, V_q0):
+        X = X_full[0]
+        Y = X_full[1]
+        w_x = snapshot(X, psi_c_Y, psi_v_Y, V_q0)
+        w_y = snapshot(Y, jnp.conj(psi_c_Y), jnp.conj(psi_v_Y), V_q0)
+        return w_x + w_y
+
+    return _readout
+
+
 def ring_matvec_smoke_test(px: int = 2, py: int = 2) -> None:
     devices = jax.devices()
     if len(devices) < px * py:
