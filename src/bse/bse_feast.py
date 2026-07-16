@@ -1,9 +1,12 @@
-"""FEAST setup utilities for sharded ISDF-BSE.
+"""FEAST contour-integration eigensolver for sharded ISDF-BSE.
 
-This module estimates spectral bounds with a short Lanczos run using the
-sharded BSE matvec, defines simple windows in eV, and generates FEAST
-ellipse-trapezoid quadrature nodes/weights. Output is printed to stdout
-in a physics-style report.
+Beyond setup utilities (spectral-bound estimation via a short Lanczos run,
+window definition in eV, and FEAST ellipse-trapezoid quadrature nodes/weights),
+this module implements the full FEAST solve: shifted GMRES linear solves at each
+quadrature node plus Rayleigh-Ritz eigenpair extraction (``run_feast_ritz``).
+FEAST is the DEFAULT solve route for the ``bse_jax`` CLI entry point (bse_jax.py
+runs ``bse_feast.main`` unless ``--lanczos`` is passed). Output is printed to
+stdout in a physics-style report.
 """
 from __future__ import annotations
 

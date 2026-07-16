@@ -13,8 +13,8 @@
 | File | Role | Status |
 |---|---|---|
 | `bse_jax.py`            | CLI entry, sharded driver, `_preview_lanczos` | working; `--n-reorth -1` (full reorth) is the right default for spinor BSE |
-| `bse_simple.py`         | plain-jit (μ,ν) matvec — XLA partitioner, no shard_map | fastest, default `--matvec-kind=simple` |
-| `bse_ring_comm.py`      | shard_map + ppermute / all-gather matvec | kept for memory-tight runs (`--matvec-kind=ring`) |
+| `bse_simple.py`         | plain-jit (μ,ν) matvec — XLA partitioner, no shard_map | fastest matvec, but opt-in via `--matvec-kind=simple`; the solver default is `ring`, not this (bse_lanczos.py:159) |
+| `bse_ring_comm.py`      | shard_map + ppermute / all-gather matvec | the DEFAULT matvec (`--matvec-kind=ring`); also the memory-tight choice |
 | `bse_lanczos.py`        | `solve_bse_sharded` Lanczos / block-Lanczos / convergence-driven | works; ghost eigenvalues at high N without full reorth |
 | `bse_io.py`             | restart-bundle reader, `write_eigenvectors_stream` | writer is BGW-compliant (see "Index ordering" below) |
 | `absorption_common.py`  | h5 readers + Lorentzian + Kramers-Kronig + BGW-format `.dat` writers | new |
