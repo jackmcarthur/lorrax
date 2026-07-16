@@ -188,43 +188,6 @@ def _ring_sum_valence_second(
     return T_total
 
 
-def apply_W_ring(
-    X: jax.Array,
-    psi_c_X: jax.Array,
-    psi_v_Y: jax.Array,
-    W_R: jax.Array,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    px: int,
-    py: int,
-) -> jax.Array:
-    nk = nkx * nky * nkz
-    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
-
-    c_chunk = X.shape[1]
-    v_chunk = X.shape[2]
-
-    n_rmu_local_X = psi_c_X.shape[-1]
-    n_rmu_local_Y = psi_v_Y.shape[-1]
-    R = _ring_sum_valence(X, psi_v_Y, v_chunk, py, n_rmu_local_Y)
-    T = _ring_sum_conduction(R, psi_c_X, c_chunk, px, n_rmu_local_X)
-
-    nspinor = psi_c_X.shape[2]
-    T_k = T.reshape(X.shape[0], n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nkx, nky, nkz)
-    T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm="ortho")
-    U_R = W_R[None, :, :, None, None, :, :, :] * T_R
-    U_q = jnp.fft.fftn(U_R, axes=(5, 6, 7), norm="ortho")
-    U = U_q.reshape(X.shape[0], n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nk)
-
-    A_partial = jnp.einsum("kctM,bMNtsk->bcNsk", jnp.conj(psi_c_X), U)
-    D = lax.psum_scatter(A_partial, axis_name="x", scatter_dimension=1, tiled=True)
-    WX_partial = jnp.einsum("kvsN,bcNsk->bcvk", psi_v_Y, D)
-    WX = lax.psum_scatter(WX_partial, axis_name="y", scatter_dimension=2, tiled=True)
-
-    return WX / sqrt_nk
-
-
 def apply_V_ring(
     X: jax.Array,
     psi_c_Y: jax.Array,
@@ -298,43 +261,6 @@ def apply_V_ring(
     VX = lax.psum_scatter(VX_partial, axis_name="x", scatter_dimension=1, tiled=True)
 
     return VX / sqrt_nk
-
-
-def apply_bse_hamiltonian_ring(
-    X: jax.Array,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    psi_c_X: jax.Array,
-    psi_c_Y: jax.Array,
-    psi_v_X: jax.Array,
-    psi_v_Y: jax.Array,
-    eps_c: jax.Array,
-    eps_v: jax.Array,
-    W_R: jax.Array,
-    V_q0: jax.Array,
-    px: int,
-    py: int,
-) -> jax.Array:
-    nk = nkx * nky * nkz
-    if X.shape[1] % px != 0 or X.shape[2] % py != 0:
-        raise ValueError("X band dimensions must be divisible by px/py for ring matvec")
-
-    axis_index_x = jnp.asarray(lax.axis_index("x"), dtype=jnp.int32)
-    axis_index_y = jnp.asarray(lax.axis_index("y"), dtype=jnp.int32)
-    c_chunk = X.shape[1]
-    v_chunk = X.shape[2]
-    c_chunk_i = jnp.asarray(c_chunk, dtype=jnp.int32)
-    v_chunk_i = jnp.asarray(v_chunk, dtype=jnp.int32)
-    z = jnp.int32(0)
-    eps_c_local = lax.dynamic_slice(eps_c, (z, axis_index_x * c_chunk_i), (nk, c_chunk))
-    eps_v_local = lax.dynamic_slice(eps_v, (z, axis_index_y * v_chunk_i), (nk, v_chunk))
-    delta_E = eps_c_local.T[None, :, None, :] - eps_v_local.T[None, None, :, :]
-    D_term = delta_E * X
-    V_term = apply_V_ring(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0, nk, px, py)
-    W_term = apply_W_ring(X, psi_c_X, psi_v_Y, W_R, nkx, nky, nkz, px, py)
-
-    return D_term + V_term - W_term
 
 
 def build_bse_ring_matvec(

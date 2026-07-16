@@ -9,21 +9,6 @@ import jax.numpy as jnp
 from .bse_preconditioner import energy_diff_cv_k
 
 
-def symmetrize_W_q(W_q: jax.Array, nkx: int, nky: int, nkz: int) -> jax.Array:
-    """Symmetrize W(q) to enforce W(q) = W(-q)†."""
-    qx = jnp.arange(nkx)
-    qy = jnp.arange(nky)
-    qz = jnp.arange(nkz)
-
-    minus_qx = (nkx - qx) % nkx
-    minus_qy = (nky - qy) % nky
-    minus_qz = (nkz - qz) % nkz
-
-    W_minus_q = W_q[:, :, minus_qx[:, None, None], minus_qy[None, :, None], minus_qz[None, None, :]]
-    W_minus_q_dag = jnp.conj(W_minus_q).transpose(1, 0, 2, 3, 4)
-    return (W_q + W_minus_q_dag) / 2
-
-
 def compute_pair_amplitude(psi_c: jax.Array, psi_v: jax.Array) -> jax.Array:
     """M(k,c,v,μ) = Σ_s conj(ψ_c[k,c,s,μ]) * ψ_v[k,v,s,μ]."""
     return jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c), psi_v)

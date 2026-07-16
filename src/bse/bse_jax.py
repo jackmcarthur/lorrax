@@ -13,10 +13,8 @@ init_jax_distributed()
 
 import jax
 import jax.numpy as jnp
-from jax import lax
 
 from .bse_ring_comm import (
-    apply_bse_hamiltonian_ring,
     build_bse_ring_matvec,
     build_bse_ring_matvec_full,
     create_mesh_2d,
@@ -28,7 +26,6 @@ from .bse_io import _find_restart_file, _load_ring_subset
 from .bse_serial import (
     apply_bse_hamiltonian_single_device,
     apply_bse_hamiltonian_single_device_jit,
-    symmetrize_W_q,
 )
 from .bse_lanczos import (
     block_lanczos_eig,
@@ -37,18 +34,12 @@ from .bse_lanczos import (
     solve_bse,
 )
 from .bse_io import write_eigenvectors_stream
-from .bse_preconditioner import energy_diff_cv_k
 
 jax.config.update("jax_enable_x64", True)
 
 __all__ = [
-    "apply_D",
-    "apply_bse_hamiltonian",
-    "apply_bse_hamiltonian_ring",
     "apply_bse_hamiltonian_single_device",
     "apply_bse_hamiltonian_single_device_jit",
-    "apply_V",
-    "apply_W",
     "block_lanczos_eig",
     "build_bse_ring_matvec",
     "build_bse_ring_matvec_full",
@@ -60,104 +51,11 @@ __all__ = [
     "ring_matvec_smoke_test",
     "simple_lanczos_eig",
     "solve_bse",
-    "symmetrize_W_q",
 ]
-
-
-@jax.jit
-def apply_bse_hamiltonian(
-    X: jax.Array,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    psi_c_X: jax.Array,
-    psi_c_Y: jax.Array,
-    psi_v_X: jax.Array,
-    psi_v_Y: jax.Array,
-    eps_c: jax.Array,
-    eps_v: jax.Array,
-    W_q: jax.Array,
-    V_q0: jax.Array,
-) -> jax.Array:
-    nk = nkx * nky * nkz
-    D_term = apply_D(X, eps_c, eps_v)
-    V_term = apply_V(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, V_q0, nk)
-    W_term = apply_W(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_q, nkx, nky, nkz)
-    return D_term + V_term - W_term
-
-
-def apply_D(X: jax.Array, eps_c: jax.Array, eps_v: jax.Array) -> jax.Array:
-    delta_E = energy_diff_cv_k(eps_c, eps_v)[None, :, :, :]
-    return delta_E * X
 
 
 def compute_pair_amplitude(psi_c: jax.Array, psi_v: jax.Array) -> jax.Array:
     return jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c), psi_v)
-
-
-def apply_V(
-    X: jax.Array,
-    psi_c_X: jax.Array,
-    psi_c_Y: jax.Array,
-    psi_v_X: jax.Array,
-    psi_v_Y: jax.Array,
-    V_q0: jax.Array,
-    nk: int,
-) -> jax.Array:
-    M_Y = compute_pair_amplitude(psi_c_Y, psi_v_Y)
-    S_partial = jnp.einsum("kcvN,bcvk->bNk", M_Y, X)
-    S = lax.psum(S_partial, axis_name="x")
-
-    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
-    S = S / sqrt_nk
-
-    U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S)
-    U = lax.psum(U_partial, axis_name="y")
-
-    M_X = compute_pair_amplitude(psi_c_X, psi_v_X)
-    VX_partial = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M_X), U)
-    VX = lax.psum_scatter(VX_partial, axis_name="x", scatter_dimension=1, tiled=True)
-
-    return VX / sqrt_nk
-
-
-def apply_W(
-    X: jax.Array,
-    psi_c_X: jax.Array,
-    psi_c_Y: jax.Array,
-    psi_v_X: jax.Array,
-    psi_v_Y: jax.Array,
-    W_q: jax.Array,
-    nkx: int,
-    nky: int,
-    nkz: int,
-) -> jax.Array:
-    nk = nkx * nky * nkz
-    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
-
-    nspinor = psi_c_X.shape[2]
-    n_rmu_local_Y = psi_v_Y.shape[-1]
-    n_rmu_local_X = psi_c_X.shape[-1]
-
-    R_partial = jnp.einsum("kv sN,bcvk->bcksN", jnp.conj(psi_v_Y), X)
-    T_partial = jnp.einsum("kctM,bcksN->bMNtsk", psi_c_X, R_partial)
-    T = lax.psum(T_partial, axis_name="x")
-
-    T_k = T.reshape(X.shape[0], n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nkx, nky, nkz)
-    T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm="ortho")
-
-    W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
-    U_R = W_R[None, :, :, None, None, :, :, :] * T_R
-
-    U_q = jnp.fft.fftn(U_R, axes=(5, 6, 7), norm="ortho")
-    U = U_q.reshape(X.shape[0], n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nk)
-
-    A_partial = jnp.einsum("kctM,bMNtsk->bcNsk", jnp.conj(psi_c_X), U)
-    WX_partial = jnp.einsum("kvsN,bcNsk->bcvk", psi_v_Y, A_partial)
-    WX_nu = lax.psum(WX_partial, axis_name="y")
-    WX = lax.psum_scatter(WX_nu, axis_name="x", scatter_dimension=1, tiled=True)
-
-    return WX / sqrt_nk
 
 
 def _main_random_demo() -> None:
