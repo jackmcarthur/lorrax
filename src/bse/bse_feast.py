@@ -56,6 +56,25 @@ class QuadratureSpec:
     quadrature_type: str = "ellipse"
 
 
+def ensure_W_R(data: dict, include_W: bool) -> dict:
+    """Populate ``data['W_R']`` — the 8th (real-space W) argument the ring/stack
+    matvecs and the shifted-matvec chain (``_apply_shifted_matvec``) expect.
+
+    The screened-direct term convolves the ISDF W-tile in real space, so the
+    reciprocal-space ``W_q`` (μ, ν, kx, ky, kz) is inverse-FFT'd on the k-axes.
+    For the RPA density-response / kernel (``include_W=False``) the W-term is
+    never built, so ``W_R`` is only a shape/sharding-correct placeholder and
+    ``W_q`` itself serves.  The restart loader emits ``W_q`` but not ``W_R``, so
+    every solve entry point (FEAST, spectral-bound Lanczos, ``bse_w_exact``)
+    must call this before invoking a matvec.  Mutates and returns ``data``.
+    """
+    if include_W:
+        data["W_R"] = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
+    else:
+        data["W_R"] = data["W_q"]
+    return data
+
+
 def _apply_shifted_matvec(
     matvec,
     x: jax.Array,
@@ -505,22 +524,14 @@ def run_feast_ritz(
         )
     sh = make_bse_shardings(mesh_xy)
 
-    if include_W:
-        # Convert W_q (reciprocal space) to W_R (real space) for the ring matvec.
-        data["W_R"] = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
-    else:
-        data["W_R"] = data["W_q"]
+    ensure_W_R(data, include_W)
 
     diag_h = build_preconditioner_diagonal_sharded(data, mesh_xy, include_W=include_W, use_tda=use_tda)
     data_gmres = data
     diag_h_gmres = diag_h
     runner_dtype = jnp.complex128
     if gmres_fp32:
-        data_gmres = _build_gmres_data_fp32(data)
-        if include_W:
-            data_gmres["W_R"] = jnp.fft.ifftn(data_gmres["W_q"], axes=(2, 3, 4), norm="ortho")
-        else:
-            data_gmres["W_R"] = data_gmres["W_q"]
+        data_gmres = ensure_W_R(_build_gmres_data_fp32(data), include_W)
         diag_h_gmres = _cast_with_sharding(diag_h, jnp.float32)
         runner_dtype = jnp.complex64
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
@@ -714,11 +725,7 @@ def estimate_spectral_bounds_sharded(
     Uses an adaptive Lanczos run that stops when the largest Ritz value
     (of the tridiagonal) converges to within the specified tolerances.
     """
-    data_fp32 = _build_gmres_data_fp32(data)
-    if include_W:
-        data_fp32["W_R"] = jnp.fft.ifftn(data_fp32["W_q"], axes=(2, 3, 4), norm="ortho")
-    else:
-        data_fp32["W_R"] = data_fp32["W_q"]
+    data_fp32 = ensure_W_R(_build_gmres_data_fp32(data), include_W)
 
     eps_c = data_fp32["eps_c"]
     eps_v = data_fp32["eps_v"]

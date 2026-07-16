@@ -423,8 +423,29 @@ def build_bse_ring_matvec_full(
     timed: bool = False,
     low_mem: bool = True,
     include_W: bool = True,
+    screening: bool = False,
 ):
-    """Build full (non-TDA) BSE matvec for S = [[A, B], [-B^H, -A^H]]."""
+    """Build full (non-TDA) BSE matvec for S = [[A, B], [-B^H, -A^H]].
+
+    ``screening`` selects the B-block V kernel, which fixes *which* physical
+    response the non-TDA resolvent computes:
+
+    - ``screening=False`` (default): the OPTICAL BSE.  The B (coupling) block
+      uses the excitonic exchange ``V_B`` (Henneke Eq. 2-20, conjugated pairing
+      ``⟨M_t|v|conj(M_t')⟩`` — ``apply_V_ring_B``).  With ``include_W`` this is
+      the TDHF/BSE exciton Hamiltonian.
+    - ``screening=True``: the RPA test-charge DENSITY response (the object whose
+      resolvent gives the screened Coulomb ``W = v + vχv``).  Here the B block
+      uses the SAME RING kernel ``K^A = (1/Nk)⟨M_t|v|M_t'⟩`` as the A block
+      (``apply_V_ring``), so ``A+B = D + 2V`` — the standard RPA bubble
+      resummation ``χ = χ₀(1 − vχ₀)⁻¹``.  ``include_W`` must be False (RPA
+      screening has no screened-W direct term; it IS what builds W).  See
+      ``bse_w_exact`` for the identity ``W(0) − v = v(0 − H)⁻¹v`` and its
+      per-element convention.
+    """
+    if screening and include_W:
+        raise ValueError("screening=True is the RPA density response; it has no "
+                         "screened-W direct term — pass include_W=False.")
     px, py = mesh_xy.devices.shape
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
@@ -580,7 +601,12 @@ def build_bse_ring_matvec_full(
         return D_term + V_term - W_term
 
     def _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0):
-        V_term = apply_V_ring_B(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+        # screening (RPA density response): ring kernel K^A, same as the A block
+        # (apply_V_ring_only); optical BSE: excitonic V_B (apply_V_ring_B).
+        if screening:
+            V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+        else:
+            V_term = apply_V_ring_B(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
         if not include_W:
             return V_term
         T = encode_T_ring_B(X, psi_c_Y, psi_v_X) if low_mem else encode_T_gather_B(X, psi_c_Y, psi_v_X)

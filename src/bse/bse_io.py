@@ -408,8 +408,15 @@ def load_bse_data_from_restart_sharded(
     input_file: Optional[str] = None,
     cell_volume: Optional[float] = None,
     n_occ: Optional[int] = None,
+    inject_head: bool = True,
 ) -> dict:
-    """Load BSE tensors from canonical gw_jax restart state (psi_full_y/enk_full)."""
+    """Load BSE tensors from canonical gw_jax restart state (psi_full_y/enk_full).
+
+    ``inject_head=False`` returns the head-LESS V_q0 / W_q bodies exactly as
+    stored on disk (the rank-1 q=0 head from vhead/whead is NOT added). Used by
+    body-vs-body diagnostics such as the W(0) resolvent cross-check, where both
+    sides must be head-less (bse_w_exact ``--compare-w0``).
+    """
     if mesh_xy is None:
         raise ValueError("mesh_xy is required for sharded load")
 
@@ -538,7 +545,7 @@ def load_bse_data_from_restart_sharded(
             g0_X = g0_Y = None
             vhead_restart = whead_restart = None
 
-    if g0_X is not None:
+    if g0_X is not None and inject_head:
         vhead, whead, cell_volume = _resolve_head_params(
             input_file, vhead_restart, whead_restart, cell_volume)
 
