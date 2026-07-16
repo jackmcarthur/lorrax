@@ -29,6 +29,19 @@ The W-tile seam is the single line ``U = fft_k(W_R * ifft_k(T))``: ``W_R`` is a
 shape-stable ``(μ_pad, ν_pad, nkx, nky, nkz)`` argument built ONCE outside the
 matvec, so W(ω) / ladder buildouts pass a different ``W_R`` with no change to
 encode/decode/scan.
+
+Retirement plan (NOTED, not yet executed) — the ring/gather/simple TDA matvecs
+existed only to bound ``T``'s peak; this scan bounds it strictly better, so they
+are superseded.  Consumers repointed here: ``bse_lanczos.solve_bse_sharded``
+(block-Lanczos + Davidson) and ``bse_feast`` (TDA GMRES contour solves +
+``_rayleigh_ritz`` subspace application).  Still live pending a follow-up:
+  * ``bse_ring_comm.build_bse_ring_matvec`` — used by
+    ``bse_feast.estimate_spectral_bounds_sharded`` (spectral-bound Lanczos) and
+    the equality gates.  Repoint + delete together with ``bse_simple`` and the
+    ``matvec_kind`` data key once the spectral-bound Lanczos is moved over.
+  * ``bse_ring_comm.build_bse_ring_matvec_full`` (non-TDA S=[[A,B],[-B†,-A†]]):
+    OUT OF SCOPE (B2 malformed B-encode is unfixed).  When B2 lands it should
+    reuse this module's ``_w_stack`` encode/decode rather than its own.
 """
 from __future__ import annotations
 
@@ -70,12 +83,14 @@ def build_bse_stack_matvec(
 
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
-    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
 
     # ── W term: one shard_map over ('x','y'); body = scan over the trial axis ──
     def _w_stack(X, psi_c_X, psi_v_Y, W_R):
         # Local shards: X (n_trials, c_loc, v_loc, nk); psi_c_X (nk, c_full, ns,
         # μ_loc); psi_v_Y (nk, v_full, ns, ν_loc); W_R (μ_loc, ν_loc, kx,ky,kz).
+        # sqrt_nk follows the input dtype (fp32/fp64) — drop-in for fp32 GMRES.
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
+
         def _body(carry, X_b):                       # X_b: (c_loc, v_loc, nk)
             # encode: T_b[μ,ν,t,s,k] = Σ_c ψ_c[k,c,t,μ] Σ_v conj(ψ_v[k,v,s,ν]) X_b
             Xv = lax.all_gather(X_b, "y", axis=1, tiled=True)        # (c_loc, v_full, nk)
@@ -114,6 +129,7 @@ def build_bse_stack_matvec(
     )
 
     def _matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
         # ── D term: (ε_c − ε_v) · X  (batched, local) ──────────────────────────
         delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]
         D_term = lax.with_sharding_constraint(delta_E * X, sh.X)

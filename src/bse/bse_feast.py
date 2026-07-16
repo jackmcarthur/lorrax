@@ -22,6 +22,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from solvers.quadrature import feast_ellipse_quadrature as _feast_ellipse_quadrature_generic
 from .bse_ring_comm import build_bse_ring_matvec, build_bse_ring_matvec_full, make_bse_shardings
+from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_preconditioner import energy_diff_cv_k
 import common.timing as timing
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
@@ -333,21 +334,19 @@ def _rayleigh_ritz(
             s_floor=0.0,
         )
 
-    hv = []
-    for v in vectors:
-        hv.append(
-            matvec(
-                v,
-                data["psi_c_X"],
-                data["psi_c_Y"],
-                data["psi_v_X"],
-                data["psi_v_Y"],
-                data["eps_c"],
-                data["eps_v"],
-                data["W_R"],
-                data["V_q0"],
-            )
-        )
+    args = (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
+            data["eps_c"], data["eps_v"], data["W_R"], data["V_q0"])
+    if use_tda:
+        # TDA subspace application through the trial-stack matvec: the filtered
+        # vectors are (1, nc, nv, nk), so concatenate on the leading axis into a
+        # single (n, nc, nv, nk) stack and apply H ONCE — one dispatch, one
+        # compiled program, one T-tensor (vs the old per-vector Python loop).
+        HV_batch = matvec(jnp.concatenate(vectors, axis=0), *args)
+        hv = [HV_batch[i:i + 1] for i in range(len(vectors))]
+    else:
+        # Non-TDA carries the [X, Y] pair axis (build_bse_ring_matvec_full);
+        # not covered by the stack matvec — keep the per-vector application.
+        hv = [matvec(v, *args) for v in vectors]
 
     V = jnp.stack(vectors, axis=0)
     HV = jnp.stack(hv, axis=0)
@@ -486,12 +485,15 @@ def run_feast_ritz(
     use_tda: bool = True,
 ) -> dict:
     if use_tda:
-        matvec = build_bse_ring_matvec(
+        # TDA FEAST (shifted-GMRES contour solves + Rayleigh-Ritz) runs on the
+        # trial-stack matvec — a bit-exact, dtype-adaptive drop-in for the ring
+        # matvec that also batches the Ritz subspace application in one dispatch.
+        matvec = build_bse_stack_matvec(
             mesh_xy,
             data["nkx"],
             data["nky"],
             data["nkz"],
-            include_W=include_W,
+            kernel="bse" if include_W else "rpa",
         )
     else:
         matvec = build_bse_ring_matvec_full(

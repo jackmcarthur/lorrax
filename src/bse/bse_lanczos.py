@@ -24,7 +24,7 @@ from solvers.lanczos import (
     lanczos_eig_jit,
 )
 from .bse_serial import apply_bse_hamiltonian_single_device
-from .bse_ring_comm import build_bse_ring_matvec, make_bse_shardings
+from .bse_ring_comm import make_bse_shardings
 
 
 def solve_bse(
@@ -147,22 +147,18 @@ def solve_bse_sharded(
     bs = int(block_size)
     shape = (bs, nc_pad, nv_pad, nk)
 
-    # Three matvec implementations are available:
-    #   "ring"   — shard_map + lax.ppermute (low memory peak; default).
-    #   "gather" — shard_map + lax.all_gather (higher peak, faster).
-    #   "simple" — plain jit + jnp.einsum + with_sharding_constraint;
-    #             no shard_map. XLA partitions automatically.
-    matvec_kind = data.get("matvec_kind", "ring")
-    if matvec_kind == "simple":
-        from .bse_simple import build_bse_simple_matvec
-        matvec_ring = build_bse_simple_matvec(
-            mesh_xy, nkx, nky, nkz, include_W=include_W,
-        )
-    else:
-        matvec_ring = build_bse_ring_matvec(
-            mesh_xy, nkx, nky, nkz, include_W=include_W,
-            low_mem=(matvec_kind == "ring"),
-        )
+    # Trial-stack matvec (scan-inside-shard_map): applies H to the whole
+    # (block_size / Davidson subspace) stack with ONE T-tensor alive regardless
+    # of the stack width — strictly better peak memory than the legacy
+    # ring/gather/simple matvecs (whose T scaled with the stack). Same
+    # (X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0) -> HX
+    # signature, so it is a drop-in for both the bs==1 and block paths below.
+    # The legacy ``matvec_kind`` selector is retired here; see the retirement
+    # note in bse_stack_matvec (ring/gather/simple + selector deletion pending).
+    from .bse_stack_matvec import build_bse_stack_matvec
+    matvec_ring = build_bse_stack_matvec(
+        mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
+    )
 
     # W_R = ifft_q(W_q) computed ONCE inside the outer jit. Use the
     # gw_jax custom-partitioned IFFT helper — plain ``jnp.fft.ifftn`` on
