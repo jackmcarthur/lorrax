@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import glob
 import os
-from types import SimpleNamespace
 from typing import Optional
 
 import h5py
@@ -24,11 +23,6 @@ _BARE_V_FALLBACK_WARNING = (
     "these results.\n"
     + "=" * 72
 )
-
-
-class BSEData(SimpleNamespace):
-    """Container for BSE calculation data."""
-    pass
 
 
 def _generate_kpts_grid(nkx: int, nky: int, nkz: int) -> np.ndarray:

@@ -153,8 +153,7 @@ def bse_diagonal_precond(
 
     The BSE Hamiltonian's leading diagonal element is
     ``H_diag[c, v, k] ≈ (E_c[k] − E_v[k])`` (the V & W diagonals contribute
-    a smaller correction; see ``bse_preconditioner.build_preconditioner_terms``
-    if more accuracy is needed). Davidson convergence improves dramatically
+    a smaller correction). Davidson convergence improves dramatically
     when the residual is filtered by the inverse of ``(H_diag − λ)``.
 
     Multi-process safety
