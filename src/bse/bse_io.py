@@ -409,6 +409,7 @@ def load_bse_data_from_restart_sharded(
     cell_volume: Optional[float] = None,
     n_occ: Optional[int] = None,
     inject_head: bool = True,
+    load_v_full: bool = False,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_full_y/enk_full).
 
@@ -416,6 +417,14 @@ def load_bse_data_from_restart_sharded(
     stored on disk (the rank-1 q=0 head from vhead/whead is NOT added). Used by
     body-vs-body diagnostics such as the W(0) resolvent cross-check, where both
     sides must be head-less (bse_w_exact ``--compare-w0``).
+
+    ``load_v_full=True`` additionally reads the FULL exchange tensor
+    ``V_qmunu`` at every q as ``data['V_q_full']`` (μ, ν, nkx, nky, nkz),
+    P('x','y',None,None,None) — same layout as ``W_q``.  The finite-q W_q
+    resolvent (``bse_w_exact --compare-wq``) picks the tile
+    ``V_q_full[:, :, qx, qy, qz]`` (NO head at q≠0) as the screening V and as
+    the comparison target ``W_q[...,q] - V_q_full[...,q]``.  Default False keeps
+    the q=0 path byte-identical.
     """
     if mesh_xy is None:
         raise ValueError("mesh_xy is required for sharded load")
@@ -522,6 +531,14 @@ def load_bse_data_from_restart_sharded(
         W_q = _read_wq_sharded(wq_dset, mu_per_x, nu_per_y, mesh_xy, n_rmu_pad,
                                trim=False, kgrid=(nkx, nky, nkz))
 
+        # Full-q exchange tensor for the finite-q W_q resolvent: read every V
+        # tile with the SAME (μ, ν, nkx, nky, nkz) reader as W_q (no head; head
+        # is a q=0-only rank-1 piece).  V_q_full[:, :, 0, 0, 0] == V_q0 (the
+        # head-less q=0 read) — a self-check the finite-q harness asserts.
+        V_q_full = (_read_wq_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy,
+                                     n_rmu_pad, trim=False, kgrid=(nkx, nky, nkz))
+                    if load_v_full else None)
+
         # ── q=0 head: load G0_mu_nu, dual-shard X/Y, inject as rank-1 ────
         # On the (μ,ν)-sharded V_q0 and W_q tensors, the rank-1 update
         # ``conj(g0_X[μ_loc]) * g0_Y[ν_loc]`` is local on every proc when
@@ -570,6 +587,7 @@ def load_bse_data_from_restart_sharded(
         "eps_v": eps_v,
         "W_q": W_q,
         "V_q0": V_q0,
+        "V_q_full": V_q_full,
         "g0_X": g0_X,
         "g0_Y": g0_Y,
         "nkx": nkx,

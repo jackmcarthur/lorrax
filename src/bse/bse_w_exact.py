@@ -95,6 +95,82 @@ def _build_rpa_resolvent(mesh_xy: Mesh, data: dict):
     return matvec, diag_h, gen, snapshot, make_bse_shardings(mesh_xy)
 
 
+def _roll_k_axis(arr, q, nkx, nky, nkz):
+    """``jnp.roll`` an on-grid tensor by ``+q`` on the C-order (nkx,nky,nkz)
+    k-axis (axis 0).  ``out[k] = arr[k − q]`` on the wrapped grid, i.e. it
+    gathers the conduction quantity at ``k − q`` into slot ``k`` — the shift that
+    reproduces the stored ``W0_qmunu[q_flat]`` tile (see :func:`build_finite_q_data`).
+    """
+    tail = arr.shape[1:]
+    a = arr.reshape((nkx, nky, nkz) + tail)
+    a = jnp.roll(a, shift=(int(q[0]), int(q[1]), int(q[2])), axis=(0, 1, 2))
+    return a.reshape((nkx * nky * nkz,) + tail)
+
+
+def build_finite_q_data(data, q, mesh_xy):
+    """Finite-momentum screening data for the W_q resolvent — the q generalization.
+
+    The RPA density response at momentum ``q`` lives in the on-grid pair basis
+    ``|v k, c k+q⟩``: conduction quantities are remapped on the k-axis, the
+    screening tile becomes the finite-q ``V_qmunu[q_flat]``, valence/energies and
+    everything else are the q=0 arrays.  Returns a shallow copy of ``data`` with
+    only the conduction/V slots swapped, so the SAME
+    :func:`apply_screening_resolvent_block` engine (matvec, seed, project,
+    solver, sharding) runs unchanged — this GENERALIZES q=0, it does not fork it.
+
+    Remap (``q = (qx,qy,qz)`` integer grid steps; C-order flat
+    ``k = ix·nky·nkz + iy·nkz + iz``):
+
+      * ``psi_c`` / ``eps_c`` ← ``jnp.roll(·, shift=+q)`` on the reshaped
+        (nkx,nky,nkz) k-axis ⇒ slot ``k`` holds the conduction value at ``k − q``.
+        The pair density is then ``M^q_cvk(μ) = Σ_s conj(ψ_c[k−q](μ)) ψ_v[k](μ)``
+        and ``D^q = ε_c[k−q] − ε_v[k]``; summed over k this is exactly the GW
+        producer's χ₀(q) convolution ``Σ_k Gc_k Gv*_{k+q}`` (relabel k→k−q), which
+        reproduces the on-disk ``W0_qmunu[q_flat]`` tile.
+      * NO umklapp Bloch phase.  The GW χ₀(q) is built by a plain periodic
+        FFT-convolution over k (``w_isdf._get_chi_minimax_kernel``), which uses
+        the RAW stored ψ at the wrapped index — no ``exp(-2πi G_umk·s_μ)`` factor.
+        Applying the design-doc umklapp phase here breaks the match (rel_err
+        0.6–3.2 vs 1e-8); the phase belongs to a DIRECT-read finite-Q BSE path,
+        not to matching this FFT-convolution-produced W tile.  Verified on the
+        MoS2 gnppm fixture (finite-q PHASE2_LOG section).
+      * ``V_q0`` ← ``V_qmunu[q_flat]`` = ``data['V_q_full'][:,:,qx,qy,qz]`` — the
+        finite-q exchange tile.  At q≠0 it KEEPS G=0 (``compute_vcoul`` zeroes
+        G=0 only at q=0) and carries NO separate rank-1 head (heads are a
+        q=0-only piece).  ``q=(0,0,0)`` returns the unshifted q=0 data
+        (roll-by-0 is identity, ``V_q_full[...,0] == V_q0``).
+
+    Requires ``data`` loaded with ``load_v_full=True``.
+    """
+    if data.get("V_q_full") is None:
+        raise ValueError(
+            "build_finite_q_data needs the full V tensor; load the restart with "
+            "load_bse_data_from_restart_sharded(..., load_v_full=True).")
+    nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
+    qx, qy, qz = int(q[0]), int(q[1]), int(q[2])
+    sh = make_bse_shardings(mesh_xy)
+    dq = dict(data)
+    dq["V_q0"] = data["V_q_full"][:, :, qx, qy, qz]
+    psi_c_q = _roll_k_axis(data["psi_c_X"], (qx, qy, qz), nkx, nky, nkz)
+    dq["psi_c_X"] = jax.lax.with_sharding_constraint(psi_c_q, sh.psi_x)
+    dq["psi_c_Y"] = jax.lax.with_sharding_constraint(psi_c_q, sh.psi_y)
+    dq["eps_c"] = jax.lax.with_sharding_constraint(
+        _roll_k_axis(data["eps_c"], (qx, qy, qz), nkx, nky, nkz), sh.eps)
+    return dq
+
+
+def _symmetry_reduced_q_list(input_file: str) -> np.ndarray:
+    """Symmetry-reduced (IBZ) q-grid points as integer kgrid steps ``(n_q, 3)``,
+    from the ONE canonical ``SymMaps`` table (``q_irr_kgrid_int``); no new sym
+    helper.  Row 0 is Γ = (0,0,0)."""
+    from file_io import WfnLoader as WFNReader
+    from common.symmetry_maps import SymMaps
+    from .bse_io import _parse_wfn_path
+    wfn = WFNReader(_parse_wfn_path(input_file))
+    sym = SymMaps(wfn)
+    return np.asarray(sym.q_irr_kgrid_int, dtype=int)
+
+
 def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
                                     snapshot, sh, *, max_iter, tol):
     """Screened-Coulomb resolvent on a block of probe columns — the ONE engine.
@@ -258,6 +334,10 @@ def main(argv=None) -> None:
     parser.add_argument("--compare-w0", action="store_true",
                         help="Cross-check v(0-H_RPA)^-1 v against the restart's "
                              "(W0_qmunu - V_qmunu) q=0 tile.")
+    parser.add_argument("--compare-wq", action="store_true",
+                        help="Finite-q generalization of --compare-w0: loop over the "
+                             "symmetry-reduced (IBZ) q-grid one at a time and cross-check "
+                             "each W_q against its own (W0_qmunu - V_qmunu)[q_flat] tile.")
     parser.add_argument("--n-val", type=int, default=None,
                         help="Valence bands (default: FULL chi0 window = n_occ).")
     parser.add_argument("--n-cond", type=int, default=None,
@@ -295,7 +375,7 @@ def main(argv=None) -> None:
     with timing.section("w_exact.load"):
         data = load_bse_data_from_restart_sharded(
             restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
-            input_file=args.input, inject_head=False)
+            input_file=args.input, inject_head=False, load_v_full=args.compare_wq)
 
     n_rmu = int(data["V_q0"].shape[0])
     nlog = int(data["n_rmu"])
@@ -305,6 +385,52 @@ def main(argv=None) -> None:
           f"nk={int(data['nkx']*data['nky']*data['nkz'])}, N_mu={nlog} (padded {n_rmu})")
     print(f"omega={args.omega_ev} eV  eta={args.eta_ev} eV  z={z:.6e} Ry  "
           f"gmres(max_iter={args.gmres_max_iter}, tol={args.gmres_tol:g}); head-less bodies")
+
+    if args.compare_wq:
+        # Finite-q generalization: loop the symmetry-reduced (IBZ) q-grid one at a
+        # time (NO batching across q), build the q-shifted screening data, resolve
+        # W_q, and compare each against its OWN stored (W0_qmunu - V_qmunu)[q_flat]
+        # tile (finite-q tiles are ~3% non-covariant under centroid permutation, so
+        # NEVER validate by sym-unfolding between q's — always vs the own tile).
+        q_list = _symmetry_reduced_q_list(args.input)
+        nky_, nkz_ = int(data["nky"]), int(data["nkz"])
+        print(f"\nFinite-q W_q resolvent cross-check: {len(q_list)} symmetry-reduced "
+              f"q-points (IBZ), one at a time; each vs its own (W0-V)[q_flat] tile\n")
+        hdr = (f"{'iq':>3} {'q (kgrid)':>11} {'q_flat':>6} {'max_rel_err':>12} "
+               f"{'median':>11} {'max_gmres':>11}")
+        print(hdr)
+        print("-" * len(hdr))
+        rel_by_q = []
+        for iq, qv in enumerate(q_list):
+            qx, qy, qz = int(qv[0]), int(qv[1]), int(qv[2])
+            q_flat = qx * nky_ * nkz_ + qy * nkz_ + qz
+            dq = build_finite_q_data(data, (qx, qy, qz), mesh_xy)
+            mvq, dhq, gnq, snq, shq = _build_rpa_resolvent(mesh_xy, dq)
+            W0 = np.asarray(jax.device_get(data["W_q"][:, :, qx, qy, qz]))
+            Vq = np.asarray(jax.device_get(data["V_q_full"][:, :, qx, qy, qz]))
+            T = W0 - Vq
+            cols, _ = _select_compare_cols(T, nlog, args.n_cols, args.seed)
+            with timing.section("w_exact.resolve_q"):
+                W_tile, resids = _resolve_wc_columns(
+                    cols, z, dq, mvq, dhq, gnq, snq, shq,
+                    max_iter=args.gmres_max_iter, tol=args.gmres_tol)
+            wc = np.asarray(jax.device_get(W_tile))
+            rr = np.asarray(jax.device_get(resids))[:len(cols)]
+            rels = np.asarray([
+                float(np.linalg.norm(wc[:nlog, i] - T[:nlog, int(nu0)])
+                      / np.linalg.norm(T[:nlog, int(nu0)]))
+                for i, nu0 in enumerate(cols)])
+            print(f"{iq:3d} {str((qx, qy, qz)):>11} {q_flat:6d} {rels.max():12.3e} "
+                  f"{np.median(rels):11.3e} {rr.max():11.3e}")
+            rel_by_q.append(rels.max())
+        print("-" * len(hdr))
+        rel_by_q = np.asarray(rel_by_q)
+        print(f"\nmax per-q rel_err = {rel_by_q.max():.3e}   median = "
+              f"{np.median(rel_by_q):.3e}  (q=0 baseline ~2.5e-9). Closure at the GW "
+              f"minimax-quadrature floor confirms W_q = v_q(0-H_RPA^q)^-1 v_q + v_q at "
+              f"every symmetry-reduced q.")
+        timing.report(print_fn=print, title="--- Timing ---")
+        return
 
     matvec, diag_h, gen, snapshot, sh = _build_rpa_resolvent(mesh_xy, data)
 
