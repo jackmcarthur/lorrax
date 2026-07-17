@@ -147,18 +147,27 @@ def solve_bse_sharded(
     bs = int(block_size)
     shape = (bs, nc_pad, nv_pad, nk)
 
-    # Trial-stack matvec (scan-inside-shard_map): applies H to the whole
-    # (block_size / Davidson subspace) stack with ONE T-tensor alive regardless
-    # of the stack width — strictly better peak memory than the legacy
-    # ring/gather/simple matvecs (whose T scaled with the stack). Same
-    # (X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0) -> HX
-    # signature, so it is a drop-in for both the bs==1 and block paths below.
-    # The legacy ``matvec_kind`` selector is retired here; see the retirement
-    # note in bse_stack_matvec (ring/gather/simple + selector deletion pending).
+    # nt-aware matvec dispatch (audit P-NT; measured crossover nt≈2-3,
+    # trace_dossier §1/§4). The RING matvec batches trials → collective count FIXED
+    # in block width, and is ~1.5× faster AND never larger than the stack at nt≤2
+    # (single-vector / narrow-block Lanczos). The STACK scans trials → memory FLAT
+    # (one T-tensor alive) but collectives ×nt, so it wins at nt≥3 (block-Lanczos).
+    # Davidson applies H to a WIDE subspace (m ≥ n_eig ≫ 2) irrespective of
+    # block_size, so it always takes the stack. Both builders share the 11-arg
+    # (X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y) -> HX
+    # signature → pure builder swap. No new config surface: the legacy ``matvec_kind``
+    # string selector stays retired; the choice is derived from block width here.
     from .bse_stack_matvec import build_bse_stack_matvec
-    matvec_ring = build_bse_stack_matvec(
-        mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
-    )
+    from .bse_ring_comm import build_bse_ring_matvec
+    use_stack = (solver_kind == "davidson") or (bs >= 3)
+    if use_stack:
+        bse_matvec = build_bse_stack_matvec(
+            mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
+        )
+    else:
+        bse_matvec = build_bse_ring_matvec(
+            mesh_xy, nkx, nky, nkz, include_W=include_W,
+        )
 
     # W_R = ifft_q(W_q) computed ONCE inside the outer jit. Use the
     # gw_jax custom-partitioned IFFT helper — plain ``jnp.fft.ifftn`` on
@@ -194,7 +203,7 @@ def solve_bse_sharded(
 
         def apply_H(V):    # V: (m, nc_pad, nv_pad, nk) sharded P(None,"x","y",None)
             V = jax.lax.with_sharding_constraint(V, sh.X)
-            return matvec_ring(V, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+            return bse_matvec(V, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                                eps_c, eps_v, W_R, V_q0, M_X, M_Y)
 
         bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
@@ -252,7 +261,7 @@ def solve_bse_sharded(
             def matvec(v_flat):
                 X = v_flat.reshape(shape)
                 X = jax.lax.with_sharding_constraint(X, sh.X)
-                HX = matvec_ring(
+                HX = bse_matvec(
                     X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                     eps_c, eps_v, W_R, V_q0, M_X, M_Y,
                 )
@@ -281,7 +290,7 @@ def solve_bse_sharded(
             def matvec_block(V_block):
                 X = V_block.reshape(shape)
                 X = jax.lax.with_sharding_constraint(X, sh.X)
-                HX = matvec_ring(
+                HX = bse_matvec(
                     X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                     eps_c, eps_v, W_R, V_q0, M_X, M_Y,
                 )
