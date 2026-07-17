@@ -33,8 +33,10 @@ jax.config.update("jax_enable_x64", True)
 RY_TO_EV_DEFAULT = 13.6056980659
 ELLIPSE_GAMMA_FIXED = 0.2
 
-# Cache compiled GMRES/FEAST kernels by shape + dtype (per-process).
-_GMRES_SOLVER_CACHE: dict[tuple[int, float, str], Callable] = {}
+# Cache compiled GMRES solvers per (operator id, max_iter, tol, dtype), per-process.
+# Value is (matvec, data, solver): the first two pin the operator's id() so it
+# cannot be reused by a later object while the entry is live (see _get_gmres_solver).
+_GMRES_SOLVER_CACHE: dict[tuple, tuple] = {}
 _FEAST_RUNNER_CACHE: dict[tuple[int, int, int, float, float, str], Callable] = {}
 
 
@@ -147,10 +149,21 @@ def _get_gmres_solver(
     tol: float,
     dtype: jnp.dtype,
 ) -> Callable:
-    """Return a cached JIT-compiled GMRES solver for this max_iter/tol."""
-    key = (max_iter, float(tol), str(dtype))
-    if key in _GMRES_SOLVER_CACHE:
-        return _GMRES_SOLVER_CACHE[key]
+    """Return a cached JIT-compiled GMRES solver for this operator + max_iter/tol.
+
+    The solver CLOSES OVER ``matvec`` and ``data`` (via ``_apply_shifted_matvec``),
+    so the cache key MUST include the operator identity — keying on
+    ``(max_iter, tol, dtype)`` alone silently returns the FIRST operator's solver
+    for every later operator with the same params (the finite-q W_q loop solves a
+    different screening operator per q ⇒ every q after the first got the q=0
+    operator ⇒ residual O(1)).  ``id(matvec)`` / ``id(data)`` distinguish them;
+    the cache holds a reference to both so their ``id()`` cannot be reused by a
+    later object while the entry is live (bounded: one entry per distinct
+    operator built — a handful for a q-loop, one for FEAST)."""
+    key = (id(matvec), id(data), max_iter, float(tol), str(dtype))
+    hit = _GMRES_SOLVER_CACHE.get(key)
+    if hit is not None:
+        return hit[2]
 
     def _solve(b, diag_h, z):
         one = jnp.asarray(1.0, dtype=b.dtype)
@@ -193,19 +206,42 @@ def _get_gmres_solver(
                 return w_local, H_local
 
             w, H = jax.lax.fori_loop(0, k + 1, arnoldi, (w, H))
+
+            # Reorthogonalization — a second (DGKS) classical Gram-Schmidt pass.
+            # Stiff finite-q screening operators (bse_w_exact --compare-wq: V_q
+            # carries a large G=0 Coulomb head) lose Arnoldi orthogonality
+            # catastrophically under a SINGLE pass (||VᴴV−I|| → O(1) by ~20
+            # iters), which makes the projected residual falsely tiny and the
+            # whole solve rounding-dependent (converges in numpy, DIVERGES in
+            # jit — true residual O(1)).  The second pass restores orthogonality
+            # to machine precision (||VᴴV−I|| ≲ 1e-14), so the projected residual
+            # is trustworthy for the early-exit and the reconstructed x is
+            # correct.  For well-conditioned / q=0 tiles the correction is ~1e-16
+            # (already orthogonal) so the q=0 closure is unchanged.
+            def reorth(i, carry):
+                w_local, H_local = carry
+                corr = jnp.vdot(V[i], w_local)
+                H_local = H_local.at[i, k].add(corr)
+                w_local = w_local - corr * V[i]
+                return w_local, H_local
+
+            w, H = jax.lax.fori_loop(0, k + 1, reorth, (w, H))
             h_next = jnp.linalg.norm(w)
             H = H.at[k + 1, k].set(h_next)
             v_next = jnp.where(h_next == 0.0, w, w / h_next)
             V = V.at[k + 1].set(v_next)
 
-            lhs = H.conj().T @ H
-            rhs = H.conj().T @ g
-            jitter_scale = jnp.asarray(1e-14, dtype=lhs.real.dtype)
-            jitter = jitter_scale * jnp.trace(lhs).real / jnp.maximum(
-                jnp.asarray(1.0, dtype=lhs.real.dtype), lhs.shape[0]
-            )
-            lhs = lhs + jitter * jnp.eye(lhs.shape[0], dtype=lhs.dtype)
-            y = jnp.linalg.solve(lhs, rhs)
+            # GMRES minimization min_y ‖g − H y‖ via a STABLE least-squares
+            # (QR/SVD through ``lstsq``), NOT the normal equations HᴴH — those
+            # square the Hessenberg condition number.  Finite-q screening tiles
+            # (bse_w_exact --compare-wq) carry a large G=0 Coulomb head, so
+            # cond(H) ~ 1e8 ⇒ cond(HᴴH) ~ 1e17 ≈ 1/eps, at which the normal-eq
+            # solve returns a garbage y that trips the projected early-exit with a
+            # huge TRUE residual (GMRES "converges" to a wrong x).  ``lstsq`` stays
+            # accurate at that conditioning; head-less/q=0 tiles are well
+            # conditioned so the q=0 closure is unchanged.  The trailing zero
+            # columns of the padded Hessenberg get min-norm y=0.
+            y = jnp.linalg.lstsq(H, g, rcond=None)[0]
             resid = jnp.linalg.norm(g - H @ y)
             rel = jnp.where(beta == zero, zero, resid / beta)
 
@@ -219,7 +255,7 @@ def _get_gmres_solver(
         return x, k_final
 
     solver = jax.jit(_solve)
-    _GMRES_SOLVER_CACHE[key] = solver
+    _GMRES_SOLVER_CACHE[key] = (matvec, data, solver)
     return solver
 
 
