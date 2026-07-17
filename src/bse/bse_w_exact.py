@@ -49,8 +49,8 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from .bse_feast import (
-    RY_TO_EV_DEFAULT, gmres_solve_sharded_jit, ensure_W_R,
-    build_preconditioner_diagonal_sharded, _apply_shifted_matvec,
+    RY_TO_EV_DEFAULT, ensure_W_R, build_preconditioner_diagonal_sharded,
+    _apply_shifted_matvec, _gmres_solve_core, matvec_operands,
 )
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
 from .bse_ring_comm import (
@@ -63,6 +63,12 @@ from .bse_serial import compute_pair_amplitude
 import common.timing as timing
 
 jax.config.update("jax_enable_x64", True)
+
+# Cache the compiled per-column-scan block-GMRES engine per operator structure.
+# Keyed on (id(matvec), max_iter, tol, dtype) — NOT on the per-q data — so the
+# finite-q W_q loop and the per-omega oracle sweep reuse ONE executable and every
+# q / omega after the first is dispatch-only (see _get_block_gmres_solver).
+_BLOCK_GMRES_CACHE: dict[tuple, tuple] = {}
 
 
 def _create_mesh_xy(px: int, py: int) -> Mesh:
@@ -97,15 +103,22 @@ def _build_rpa_resolvent(mesh_xy: Mesh, data: dict):
     return matvec, diag_h, gen, snapshot, make_bse_shardings(mesh_xy)
 
 
-def _roll_k_axis(arr, q, nkx, nky, nkz):
-    """``jnp.roll`` an on-grid tensor by ``+q`` on the C-order (nkx,nky,nkz)
-    k-axis (axis 0).  ``out[k] = arr[k − q]`` on the wrapped grid, i.e. it
-    gathers the conduction quantity at ``k − q`` into slot ``k`` — the shift that
-    reproduces the stored ``W0_qmunu[q_flat]`` tile (see :func:`build_finite_q_data`).
-    """
-    tail = arr.shape[1:]
-    a = arr.reshape((nkx, nky, nkz) + tail)
-    a = jnp.roll(a, shift=(int(q[0]), int(q[1]), int(q[2])), axis=(0, 1, 2))
+def _roll_k_axis_host(arr_np, q, nkx, nky, nkz):
+    """Host-side (numpy) roll of an on-grid tensor by ``+q`` on the C-order
+    (nkx,nky,nkz) k-axis (axis 0).  ``out[k] = arr[k − q]`` on the wrapped grid,
+    i.e. it gathers the conduction quantity at ``k − q`` into slot ``k`` — the
+    shift that reproduces the stored ``W0_qmunu[q_flat]`` tile (see
+    :func:`build_finite_q_data`).
+
+    Done on host (numpy), NOT device ``jnp.roll``: a static device roll bakes the
+    q-offset into the compiled program, so a different q recompiled the roll once
+    per q.  Rolling on host (arrays are small — psi_c is a few tens of MB) yields
+    the rolled array as plain DATA that ``device_put`` uploads with the target
+    sharding, so no per-q compile — the whole finite-q loop stays dispatch-only
+    after the first engine build."""
+    tail = arr_np.shape[1:]
+    a = arr_np.reshape((nkx, nky, nkz) + tail)
+    a = np.roll(a, shift=(int(q[0]), int(q[1]), int(q[2])), axis=(0, 1, 2))
     return a.reshape((nkx * nky * nkz,) + tail)
 
 
@@ -153,11 +166,14 @@ def build_finite_q_data(data, q, mesh_xy):
     sh = make_bse_shardings(mesh_xy)
     dq = dict(data)
     dq["V_q0"] = data["V_q_full"][:, :, qx, qy, qz]
-    psi_c_q = _roll_k_axis(data["psi_c_X"], (qx, qy, qz), nkx, nky, nkz)
-    dq["psi_c_X"] = jax.lax.with_sharding_constraint(psi_c_q, sh.psi_x)
-    dq["psi_c_Y"] = jax.lax.with_sharding_constraint(psi_c_q, sh.psi_y)
-    dq["eps_c"] = jax.lax.with_sharding_constraint(
-        _roll_k_axis(data["eps_c"], (qx, qy, qz), nkx, nky, nkz), sh.eps)
+    # Roll on host (see _roll_k_axis_host) so a different q needs no new compile;
+    # device_put uploads the rolled array straight into the target sharding.
+    psi_c_q = jnp.asarray(_roll_k_axis_host(
+        np.asarray(jax.device_get(data["psi_c_X"])), (qx, qy, qz), nkx, nky, nkz))
+    dq["psi_c_X"] = jax.device_put(psi_c_q, sh.psi_x)
+    dq["psi_c_Y"] = jax.device_put(psi_c_q, sh.psi_y)
+    dq["eps_c"] = jax.device_put(jnp.asarray(_roll_k_axis_host(
+        np.asarray(jax.device_get(data["eps_c"])), (qx, qy, qz), nkx, nky, nkz)), sh.eps)
     # M_X/M_Y are hoisted V-term pair amplitudes (audit P3) and are pure functions
     # of psi_c — the finite-q roll shifted psi_c, so recompute them from the ROLLED
     # conduction states.  The q=0 M's shallow-copied from `data` would be stale and
@@ -179,6 +195,51 @@ def _symmetry_reduced_q_list(input_file: str) -> np.ndarray:
     wfn = WFNReader(_parse_wfn_path(input_file))
     sym = SymMaps(wfn)
     return np.asarray(sym.q_irr_kgrid_int, dtype=int)
+
+
+def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype):
+    """Cached jitted per-column-scan block-GMRES engine for the screening
+    resolvent — the stage-2 SOLVE of :func:`apply_screening_resolvent_block`.
+
+    Returns a ``jax.jit`` function ``(rhs, diag_h, z, operands) -> (s_all, resids)``
+    that scans the per-column-independent shifted GMRES over the probe axis.  The
+    operator STRUCTURE (``matvec``, ``sh``, ``max_iter``, ``tol``) is baked into
+    the compiled program; the q- and omega-dependent tensors (``rhs``, ``diag_h``,
+    ``z``, and the ``matvec_operands`` tuple ``operands``) are RUNTIME ARGUMENTS.
+    So it compiles ONCE per operator structure and every later q / omega is
+    dispatch-only — replacing the old top-level ``lax.scan`` that closed over the
+    per-q ``data`` and recompiled the ~4.8 s scan once per q.
+
+    Cache key ``(id(matvec), max_iter, tol, dtype)`` keeps the operator-identity
+    safety: genuinely different structures (screening vs optical, TDA vs full)
+    carry distinct ``matvec`` objects and so distinct engines."""
+    key = (id(matvec), int(max_iter), float(tol), str(dtype))
+    hit = _BLOCK_GMRES_CACHE.get(key)
+    if hit is not None:
+        return hit[1]
+
+    @jax.jit
+    def _block(rhs, diag_h, z, operands):
+        # rhs: (2, nu, c, v, k) — scan the per-column GMRES over the probe axis nu.
+        rhs_scan = jnp.moveaxis(rhs, 1, 0)  # (nu, 2, c, v, k)
+
+        def _solve_col(carry, rhs_col):
+            rhs_i = rhs_col[:, None]        # (2, 1, c, v, k) — keep the matvec batch axis
+            x, _ = _gmres_solve_core(matvec, rhs_i, diag_h, z, operands,
+                                     max_iter, tol)
+            r_true = rhs_i - _apply_shifted_matvec(matvec, x, z, operands)
+            nrhs = jnp.linalg.norm(rhs_i)
+            resid = jnp.where(nrhs == 0.0, jnp.asarray(0.0, dtype=nrhs.dtype),
+                              jnp.linalg.norm(r_true) / nrhs)
+            s = jax.lax.with_sharding_constraint(x[0] + x[1], sh.X)  # (1, c, v, k)
+            return carry, (s[0], resid)
+
+        _, (s_all, resids) = jax.lax.scan(_solve_col, None, rhs_scan)
+        s_all = jax.lax.with_sharding_constraint(s_all, sh.X)        # (nu, c, v, k)
+        return s_all, resids
+
+    _BLOCK_GMRES_CACHE[key] = (matvec, _block)
+    return _block
 
 
 def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
@@ -208,7 +269,10 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
          it replaces because the GMRES norm/least-squares reductions are global
          per single column.  The scan stacks the readouts ``s = x[0] + x[1]``
          into ``sh.X`` = ``(nu, c_X, v_Y, k)`` and the per-column relative
-         residuals.
+         residuals.  Runs inside the cached, jitted :func:`_get_block_gmres_solver`
+         engine with the q/omega-dependent tensors (``rhs``, ``diag_h``, ``z``,
+         ``matvec_operands``) as RUNTIME ARGUMENTS, so it compiles ONCE per
+         operator structure and every later q / omega is dispatch-only.
 
       3. PROJECT (pair -> zeta, batched, reduce-scatter ``snapshot``).  The
          density-snapshot vertex applies the pair density then ``v``,
@@ -263,22 +327,14 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
     rhs = jax.lax.with_sharding_constraint(
         jnp.stack([f, -f], axis=0).astype(jnp.complex128), sh.X_full)  # (2, nu, c, v, k)
 
-    # --- Stage 2: SOLVE, per-column-independent GMRES via scan over nu. ---
-    rhs_scan = jnp.moveaxis(rhs, 1, 0)  # (nu, 2, c, v, k) — nu is the scan axis
-
-    def _solve_col(carry, rhs_col):
-        rhs_i = rhs_col[:, None]        # (2, 1, c, v, k) — keep the matvec batch axis
-        x, _ = gmres_solve_sharded_jit(
-            matvec, diag_h, z, rhs_i, data, max_iter=max_iter, tol=tol)
-        r_true = rhs_i - _apply_shifted_matvec(matvec, x, z, data)
-        nrhs = jnp.linalg.norm(rhs_i)
-        resid = jnp.where(nrhs == 0.0, jnp.asarray(0.0, dtype=nrhs.dtype),
-                          jnp.linalg.norm(r_true) / nrhs)
-        s = jax.lax.with_sharding_constraint(x[0] + x[1], sh.X)  # (1, c, v, k)
-        return carry, (s[0], resid)
-
-    _, (s_all, resids) = jax.lax.scan(_solve_col, None, rhs_scan)
-    s_all = jax.lax.with_sharding_constraint(s_all, sh.X)        # (nu, c, v, k)
+    # --- Stage 2: SOLVE via the cached jitted per-column-scan GMRES engine. ---
+    # The engine is keyed on the operator STRUCTURE (matvec); the q/omega-dependent
+    # operand arrays flow in as runtime args, so it compiles ONCE and every later
+    # q / omega is dispatch-only.  z is passed as a device scalar (not a Python
+    # complex) so a different omega stays a runtime arg, never a baked constant.
+    solver = _get_block_gmres_solver(matvec, sh, max_iter, tol, rhs.dtype)
+    s_all, resids = solver(rhs, diag_h, jnp.asarray(z, dtype=jnp.complex128),
+                           matvec_operands(data))
 
     # --- Stage 3: PROJECT (pair -> zeta), reduce-scatter to W(mu_X, nu_Y). ---
     W_tile = snapshot(s_all, data["psi_c_Y"], data["psi_v_Y"], data["V_q0"])
@@ -536,34 +592,57 @@ def main(argv=None) -> None:
         # NEVER validate by sym-unfolding between q's — always vs the own tile).
         q_list = _symmetry_reduced_q_list(args.input)
         nky_, nkz_ = int(data["nky"]), int(data["nkz"])
+        # Build the q-INDEPENDENT resolvent engine ONCE.  matvec / gen / snapshot
+        # depend only on (mesh, k-grid, pad sizes) — NOT on q — so they are shared
+        # across every q; only the operand DATA (rolled psi_c/eps_c, the
+        # V_qmunu[q] tile, the hoisted M's) and the preconditioner diagonal change,
+        # and those flow as RUNTIME ARGS into the single compiled block-GMRES
+        # engine.  Result: the engine compiles once (first q) and every later q is
+        # dispatch-only (PHASE2_LOG "per-q recompile elimination").
+        matvec, _, gen, snapshot, sh = _build_rpa_resolvent(mesh_xy, data)
         print(f"\nFinite-q W_q resolvent cross-check: {len(q_list)} symmetry-reduced "
-              f"q-points (IBZ), one at a time; each vs its own (W0-V)[q_flat] tile\n")
+              f"q-points (IBZ), one at a time; each vs its own (W0-V)[q_flat] tile")
+        print("shared resolvent engine (matvec/gen/snapshot) built once; per-q "
+              "operands (rolled psi_c/eps_c, V_q tile, diag_h) are runtime args\n")
         hdr = (f"{'iq':>3} {'q (kgrid)':>11} {'q_flat':>6} {'max_rel_err':>12} "
-               f"{'median':>11} {'max_gmres':>11}")
+               f"{'median':>11} {'max_gmres':>11} {'build[s]':>9} {'solve[s]':>9}")
         print(hdr)
         print("-" * len(hdr))
         rel_by_q = []
         for iq, qv in enumerate(q_list):
             qx, qy, qz = int(qv[0]), int(qv[1]), int(qv[2])
             q_flat = qx * nky_ * nkz_ + qy * nkz_ + qz
-            dq = build_finite_q_data(data, (qx, qy, qz), mesh_xy)
-            mvq, dhq, gnq, snq, shq = _build_rpa_resolvent(mesh_xy, dq)
-            W0 = np.asarray(jax.device_get(data["W_q"][:, :, qx, qy, qz]))
-            Vq = np.asarray(jax.device_get(data["V_q_full"][:, :, qx, qy, qz]))
-            T = W0 - Vq
-            cols, _ = _select_compare_cols(T, nlog, args.n_cols, args.seed)
+            # BUILD: q-shifted operands + preconditioner diagonal + probe cols.
+            t_b0 = time.perf_counter()
+            with timing.section("w_exact.wq_build"):
+                dq = build_finite_q_data(data, (qx, qy, qz), mesh_xy)
+                ensure_W_R(dq, include_W=False)
+                diag_hq = build_preconditioner_diagonal_sharded(
+                    dq, mesh_xy, include_W=False, use_tda=False)
+                W0 = np.asarray(jax.device_get(data["W_q"][:, :, qx, qy, qz]))
+                Vq = np.asarray(jax.device_get(data["V_q_full"][:, :, qx, qy, qz]))
+                T = W0 - Vq
+                cols, _ = _select_compare_cols(T, nlog, args.n_cols, args.seed)
+                jax.block_until_ready(diag_hq)
+            t_build = time.perf_counter() - t_b0
+            # SOLVE (trace+compile on the FIRST q, dispatch-only afterwards).
+            t_s0 = time.perf_counter()
             with timing.section("w_exact.resolve_q"):
                 W_tile, resids = _resolve_wc_columns(
-                    cols, z, dq, mvq, dhq, gnq, snq, shq,
+                    cols, z, dq, matvec, diag_hq, gen, snapshot, sh,
                     max_iter=args.gmres_max_iter, tol=args.gmres_tol)
-            wc = np.asarray(jax.device_get(W_tile))
-            rr = np.asarray(jax.device_get(resids))[:len(cols)]
-            rels = np.asarray([
-                float(np.linalg.norm(wc[:nlog, i] - T[:nlog, int(nu0)])
-                      / np.linalg.norm(T[:nlog, int(nu0)]))
-                for i, nu0 in enumerate(cols)])
+                jax.block_until_ready((W_tile, resids))
+            t_solve = time.perf_counter() - t_s0
+            # COMPARE: host-side rel_err vs the own (W0-V)[q_flat] tile.
+            with timing.section("w_exact.wq_compare"):
+                wc = np.asarray(jax.device_get(W_tile))
+                rr = np.asarray(jax.device_get(resids))[:len(cols)]
+                rels = np.asarray([
+                    float(np.linalg.norm(wc[:nlog, i] - T[:nlog, int(nu0)])
+                          / np.linalg.norm(T[:nlog, int(nu0)]))
+                    for i, nu0 in enumerate(cols)])
             print(f"{iq:3d} {str((qx, qy, qz)):>11} {q_flat:6d} {rels.max():12.3e} "
-                  f"{np.median(rels):11.3e} {rr.max():11.3e}")
+                  f"{np.median(rels):11.3e} {rr.max():11.3e} {t_build:9.3f} {t_solve:9.3f}")
             rel_by_q.append(rels.max())
         print("-" * len(hdr))
         rel_by_q = np.asarray(rel_by_q)
@@ -571,6 +650,8 @@ def main(argv=None) -> None:
               f"{np.median(rel_by_q):.3e}  (q=0 baseline ~2.5e-9). Closure at the GW "
               f"minimax-quadrature floor confirms W_q = v_q(0-H_RPA^q)^-1 v_q + v_q at "
               f"every symmetry-reduced q.")
+        print("solve[s] column: first q carries the one-time engine compile; "
+              "later q are warm dispatch (the per-q recompile is gone).")
         timing.report(print_fn=print, title="--- Timing ---")
         return
 
