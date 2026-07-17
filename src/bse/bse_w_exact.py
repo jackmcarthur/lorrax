@@ -40,6 +40,7 @@ compares body-to-body.
 from __future__ import annotations
 
 import math
+import time
 import numpy as np
 import h5py
 
@@ -334,6 +335,118 @@ def _parse_cols(col_str, n_mu, n_cols, seed):
     return np.arange(n_mu, dtype=int)
 
 
+def run_w_omega_chain_compare(
+    data, mesh_xy, cols, *, freqs_ev, chain_len, chain_sweep,
+    ry_to_ev, gmres_max_iter, gmres_tol, disk_tile=None, nlog=None,
+    label="", print_fn=print,
+):
+    """Validate the Lanczos-chain W(omega) model against the shifted-solve oracle.
+
+    Builds ONE block-Lanczos chain (:func:`w_omega_chain.build_w_omega_chain`) at
+    ``chain_len`` for the probe ``cols``, then for every complex frequency in
+    ``freqs_ev`` (each ``omega + i eta`` in eV — covers the static ``omega=0``,
+    imaginary-axis ``i b``, and real-axis ``a + i eta`` cases) evaluates the chain
+    at each truncated length in ``chain_sweep`` and compares to the per-omega
+    oracle ``_resolve_wc_columns`` (fresh shifted block-GMRES).  At ``omega=0``
+    also reports closure against the on-disk ``disk_tile`` (``W0 - V``), the GW
+    ground truth.  Prints a per-omega convergence table (rel_err vs chain length)
+    and a timing / omega-count break-even summary (the whole point: amortize the
+    chain build over many frequencies).  Returns a results dict for the gate.
+
+    ``cols`` are the probe density columns (``T``-largest + random mix); the chain
+    block width is ``p = len(cols)``.  ``disk_tile`` / ``nlog`` are the head-less
+    ``(W0 - V)`` numpy tile and its logical mu extent (omega=0 ground truth)."""
+    from . import w_omega_chain as woc
+
+    matvec, diag_h, gen, snapshot, sh = _build_rpa_resolvent(mesh_xy, data)
+    cols = np.asarray(cols, dtype=int)
+    p = len(cols)
+    if nlog is None:
+        nlog = int(data["n_rmu"])
+
+    def _oracle(z):
+        W_tile, resids = _resolve_wc_columns(
+            cols, z, data, matvec, diag_h, gen, snapshot, sh,
+            max_iter=gmres_max_iter, tol=gmres_tol)
+        return (np.asarray(jax.device_get(W_tile)),
+                np.asarray(jax.device_get(resids))[:p])
+
+    def _chain_eval(z, m_use=None):
+        (W_tile,) = woc.eval_w_omega_chain(chain, data, snapshot, sh, z, m_use=m_use)
+        jax.block_until_ready(W_tile)
+        return W_tile
+
+    # ---- build the chain ONCE (timed, warm) ----
+    woc.build_w_omega_chain(data, matvec, gen, sh, cols, min(2, chain_len))  # warm compile
+    t0 = time.perf_counter()
+    chain = woc.build_w_omega_chain(data, matvec, gen, sh, cols, chain_len)
+    jax.block_until_ready(chain["V_stack"])
+    t_build = time.perf_counter() - t0
+
+    sweep = sorted({int(m) for m in chain_sweep if 1 <= int(m) <= chain_len})
+    if chain_len not in sweep:
+        sweep.append(chain_len)
+
+    print_fn(f"\n=== W(omega) Lanczos-chain vs oracle{(' ' + label) if label else ''} ===")
+    print_fn(f"probe cols={list(cols)}  block p={p}  chain_len={chain_len}  "
+             f"chain build={t_build:.3f}s ({chain_len} matvecs)")
+    print_fn("chain residual ||beta_m|| by length: " + ", ".join(
+        f"m={m}:{woc.chain_residual_norm(chain, m):.2e}" for m in sweep))
+
+    results = {"t_build": t_build, "chain_len": chain_len, "by_freq": {},
+               "cols": cols, "p": p}
+
+    # timing probes (warm) at a representative interior z
+    z_probe = (1.0 + 0.2j) / ry_to_ev
+    _chain_eval(z_probe)                                    # warm
+    t_c0 = time.perf_counter(); _chain_eval(z_probe); t_chain_eval = time.perf_counter() - t_c0
+    _oracle(z_probe)                                        # warm
+    t_o0 = time.perf_counter(); _oracle(z_probe); t_oracle = time.perf_counter() - t_o0
+    results["t_chain_eval"] = t_chain_eval
+    results["t_oracle"] = t_oracle
+
+    hdr = (f"{'freq(eV)':>16} {'m':>4} {'rel_vs_oracle':>14} "
+           f"{'rel_vs_disk':>12} {'gmres_resid':>12}")
+    print_fn(hdr)
+    print_fn("-" * len(hdr))
+    for w_ev in freqs_ev:
+        w_ev = complex(w_ev)
+        z = w_ev / ry_to_ev
+        w_oracle, resid = _oracle(z)
+        is_static = abs(w_ev) < 1e-12
+        flabel = f"{w_ev.real:+.3f}{w_ev.imag:+.3f}i"
+        for m in sweep:
+            wc = np.asarray(jax.device_get(_chain_eval(z, m_use=m)))
+            rel_o = float(max(
+                np.linalg.norm(wc[:nlog, i] - w_oracle[:nlog, i])
+                / max(np.linalg.norm(w_oracle[:nlog, i]), 1e-300)
+                for i in range(p)))
+            if is_static and disk_tile is not None:
+                rel_disk = float(max(
+                    np.linalg.norm(wc[:nlog, i] - disk_tile[:nlog, int(cols[i])])
+                    / max(np.linalg.norm(disk_tile[:nlog, int(cols[i])]), 1e-300)
+                    for i in range(p)))
+            else:
+                rel_disk = np.nan
+            print_fn(f"{flabel:>16} {m:4d} {rel_o:14.3e} "
+                     f"{rel_disk:12.3e} {float(resid.max()):12.3e}")
+            results["by_freq"].setdefault(flabel, {})[m] = {
+                "rel_vs_oracle": rel_o, "rel_vs_disk": rel_disk,
+                "gmres_resid": float(resid.max())}
+        print_fn("-" * len(hdr))
+
+    # amortization / break-even
+    denom = t_oracle - t_chain_eval
+    breakeven = (t_build / denom) if denom > 0 else float("inf")
+    print_fn(f"\nTiming (warm): chain build {t_build:.3f}s | per-omega oracle "
+             f"{t_oracle*1e3:.1f} ms | per-omega chain eval {t_chain_eval*1e3:.1f} ms")
+    print_fn(f"omega-count break-even: chain wins after ~{breakeven:.1f} frequencies "
+             f"(each extra omega is ~{t_oracle/max(t_chain_eval,1e-9):.0f}x cheaper "
+             f"than a fresh oracle solve).")
+    results["breakeven_omega_count"] = breakeven
+    return results
+
+
 def main(argv=None) -> None:
     import argparse
 
@@ -347,6 +460,25 @@ def main(argv=None) -> None:
                         help="Finite-q generalization of --compare-w0: loop over the "
                              "symmetry-reduced (IBZ) q-grid one at a time and cross-check "
                              "each W_q against its own (W0_qmunu - V_qmunu)[q_flat] tile.")
+    parser.add_argument("--w-omega-chain", action="store_true",
+                        help="Full-frequency W(omega) model: build ONE block-Lanczos "
+                             "chain per q and evaluate W_q(omega)-v_q across a frequency "
+                             "grid with NO per-omega solve; validate vs the shifted-solve "
+                             "oracle (the amortized production path).")
+    parser.add_argument("--chain-len", type=int, default=32,
+                        help="Block-Lanczos chain length (blocks) for --w-omega-chain "
+                             "(the accuracy knob: ~1e-6 on the imaginary axis, ~2e-4 "
+                             "static at 32 on the MoS2 fixture; raise for tighter).")
+    parser.add_argument("--chain-sweep", type=str, default=None,
+                        help="Comma list of chain lengths for the convergence table "
+                             "(default: 4,8,12,16,chain_len).")
+    parser.add_argument("--chain-freqs-ev", type=str, default=None,
+                        help="Comma list of complex frequencies (eV), e.g. "
+                             "'0,2j,4j,1.5+0.2j'; default samples 0, imaginary axis, "
+                             "and real axis + i*eta.")
+    parser.add_argument("--chain-q", type=str, default=None,
+                        help="Finite q as 'qx,qy,qz' kgrid steps for --w-omega-chain "
+                             "(default: also do the smallest nonzero IBZ q).")
     parser.add_argument("--n-val", type=int, default=None,
                         help="Valence bands (default: FULL chi0 window = n_occ).")
     parser.add_argument("--n-cond", type=int, default=None,
@@ -384,7 +516,8 @@ def main(argv=None) -> None:
     with timing.section("w_exact.load"):
         data = load_bse_data_from_restart_sharded(
             restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
-            input_file=args.input, inject_head=False, load_v_full=args.compare_wq)
+            input_file=args.input, inject_head=False,
+            load_v_full=(args.compare_wq or args.w_omega_chain))
 
     n_rmu = int(data["V_q0"].shape[0])
     nlog = int(data["n_rmu"])
@@ -438,6 +571,53 @@ def main(argv=None) -> None:
               f"{np.median(rel_by_q):.3e}  (q=0 baseline ~2.5e-9). Closure at the GW "
               f"minimax-quadrature floor confirms W_q = v_q(0-H_RPA^q)^-1 v_q + v_q at "
               f"every symmetry-reduced q.")
+        timing.report(print_fn=print, title="--- Timing ---")
+        return
+
+    if args.w_omega_chain:
+        # Full-frequency W(omega) model: ONE block-Lanczos chain per q, then
+        # evaluate across a frequency grid with no per-omega solve.  Validate
+        # against the shifted-solve oracle at q=0 and the smallest nonzero IBZ q.
+        if args.chain_freqs_ev:
+            freqs = [complex(s) for s in args.chain_freqs_ev.split(",") if s.strip()]
+        else:
+            freqs = [0.0, 2j, 5j, 10j, 1.5 + 0.1j, 4.0 + 0.2j, 8.0 + 0.3j]
+        if args.chain_sweep:
+            sweep = [int(s) for s in args.chain_sweep.split(",") if s.strip()]
+        else:
+            sweep = [4, 8, 12, 16, args.chain_len]
+
+        W0 = np.asarray(jax.device_get(data["W_q"][:, :, 0, 0, 0]))
+        V0 = np.asarray(jax.device_get(data["V_q0"]))
+        T0 = W0 - V0
+        cols0, _ = _select_compare_cols(T0, nlog, args.n_cols, args.seed)
+        with timing.section("w_exact.chain_q0"):
+            run_w_omega_chain_compare(
+                data, mesh_xy, cols0, freqs_ev=freqs, chain_len=args.chain_len,
+                chain_sweep=sweep, ry_to_ev=args.ry_to_ev,
+                gmres_max_iter=args.gmres_max_iter, gmres_tol=args.gmres_tol,
+                disk_tile=T0, nlog=nlog, label="q=(0,0,0)")
+
+        if args.chain_q is not None:
+            q = tuple(int(x) for x in args.chain_q.split(","))
+        else:
+            q_list = _symmetry_reduced_q_list(args.input)
+            nz = q_list[np.any(q_list != 0, axis=1)]
+            q = (tuple(int(x) for x in nz[int(np.argmin((nz.astype(np.int64) ** 2).sum(axis=1)))])
+                 if len(nz) else None)
+        if q is not None and tuple(q) != (0, 0, 0):
+            qx, qy, qz = int(q[0]), int(q[1]), int(q[2])
+            dq = build_finite_q_data(data, (qx, qy, qz), mesh_xy)
+            W0q = np.asarray(jax.device_get(data["W_q"][:, :, qx, qy, qz]))
+            Vq = np.asarray(jax.device_get(data["V_q_full"][:, :, qx, qy, qz]))
+            Tq = W0q - Vq
+            colsq, _ = _select_compare_cols(Tq, nlog, args.n_cols, args.seed)
+            with timing.section("w_exact.chain_qfinite"):
+                run_w_omega_chain_compare(
+                    dq, mesh_xy, colsq, freqs_ev=freqs, chain_len=args.chain_len,
+                    chain_sweep=sweep, ry_to_ev=args.ry_to_ev,
+                    gmres_max_iter=args.gmres_max_iter, gmres_tol=args.gmres_tol,
+                    disk_tile=Tq, nlog=nlog, label=f"q=({qx},{qy},{qz})")
         timing.report(print_fn=print, title="--- Timing ---")
         return
 
