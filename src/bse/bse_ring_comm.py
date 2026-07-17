@@ -725,11 +725,23 @@ def build_realspace_random_transition_generator(
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X_local.real.dtype))
         return X_local / sqrt_nk
 
-    return _shard_map_fn(
+    _gen = _shard_map_fn(
         _map,
         mesh=mesh_xy,
         in_specs=(P(None, "y", None), P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
         out_specs=P(None, "x", "y", None),
+    )
+    # jit the seed (zeta->pair) reshard boundary.  A bare shard_map re-traces and
+    # re-lowers to HLO on EVERY eager call (~2.5 s on the MoS2 fixture) because the
+    # trace is not memoized; wrapping it in jax.jit caches the compiled executable
+    # so repeated calls dispatch in <1 ms.  The BSE matvec is jitted for exactly
+    # this reason — the seed/project boundaries were the only un-jitted ones and
+    # dominated the W-column solve (see PHASE2_LOG "W-column resolvent profiling").
+    # Bit-faithful: same shard_map body, same in/out shardings.
+    return jax.jit(
+        _gen,
+        in_shardings=(sh.S, sh.psi_x, sh.psi_x, sh.V),
+        out_shardings=sh.X,
     )
 
 
@@ -841,11 +853,20 @@ def build_density_snapshot_operator(
             d_local, axis_name="y", scatter_dimension=1, tiled=True
         )                                                # (mu_local_x, b/py)
 
-    return _shard_map_fn(
+    _snap = _shard_map_fn(
         _map,
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"), P("x", "y")),
         out_specs=(P("x", "y") if scatter_nu_on_y else P(None, "x")),
+    )
+    # jit the projection (pair->zeta) reshard boundary — same rationale as
+    # build_realspace_random_transition_generator: cache the compiled executable
+    # instead of re-lowering the shard_map on every eager call (~2.8 s -> <3 ms).
+    # Bit-faithful.  Output sharding follows the build-time scatter_nu_on_y branch.
+    return jax.jit(
+        _snap,
+        in_shardings=(sh.X, sh.psi_y, sh.psi_y, sh.V),
+        out_shardings=(sh.V if scatter_nu_on_y else sh.d_mu),
     )
 
 
