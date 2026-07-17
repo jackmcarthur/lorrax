@@ -40,18 +40,27 @@ shape-stable ``(μ_pad, ν_pad, nkx, nky, nkz)`` argument built ONCE outside the
 matvec, so W(ω) / ladder buildouts pass a different ``W_R`` with no change to
 encode/decode/scan.
 
-Retirement plan (NOTED, not yet executed) — the ring/gather/simple TDA matvecs
-existed only to bound ``T``'s peak; this scan bounds it strictly better, so they
-are superseded.  Consumers repointed here: ``bse_lanczos.solve_bse_sharded``
-(block-Lanczos + Davidson) and ``bse_feast`` (TDA GMRES contour solves +
-``_rayleigh_ritz`` subspace application).  Still live pending a follow-up:
-  * ``bse_ring_comm.build_bse_ring_matvec`` — used by
-    ``bse_feast.estimate_spectral_bounds_sharded`` (spectral-bound Lanczos) and
-    the equality gates.  Repoint + delete together with ``bse_simple`` and the
-    ``matvec_kind`` data key once the spectral-bound Lanczos is moved over.
+The exchange (V) term is NOT stack-specific: it is the shared
+``bse_ring_comm.bse_exchange_gspmd`` (2 all-reduce), reused verbatim by the ring
+TDA / non-TDA matvecs (audit P2/C1) — single source of truth. Only the W-term
+encode/decode differs stack-vs-ring.
+
+Dispatch (audit P-NT): ``bse_lanczos.solve_bse_sharded`` routes narrow solves
+(block width ≤2: single-vector / narrow-block Lanczos) to the ring and wide ones
+(≥3: block-Lanczos, Davidson subspaces) here — the measured crossover is nt≈2-3
+(the ring batches trials → collectives fixed in width, ~1.5× faster + never larger
+at nt1; the stack scans → memory flat, wins at nt≥3).
+
+Retirement plan (NOTED, not yet executed) — the gather/simple TDA matvecs existed
+only to bound ``T``'s peak; this scan bounds it strictly better, so they are
+superseded.  Still live pending a follow-up:
+  * ``bse_ring_comm.build_bse_ring_matvec`` (ring TDA) — the narrow-nt dispatch
+    target above, ``bse_feast.estimate_spectral_bounds_sharded`` (spectral-bound
+    Lanczos), and the equality gates.  KEPT (P-NT: optimal at nt≤2).
   * ``bse_ring_comm.build_bse_ring_matvec_full`` (non-TDA S=[[A,B],[-B†,-A†]]):
-    OUT OF SCOPE (B2 malformed B-encode is unfixed).  When B2 lands it should
-    reuse this module's ``_w_stack`` encode/decode rather than its own.
+    the W(0)/finite-q resolvent operator.  Its W-term B-encode still uses the ring
+    ``encode_T_B``; when that is retired it should reuse this module's ``_w_stack``
+    encode/decode.  The V-term is already unified (``bse_exchange_gspmd``).
 """
 from __future__ import annotations
 
@@ -67,7 +76,7 @@ except ImportError:  # pragma: no cover - older JAX
     _shard_map_fn = _shard_map_mod.shard_map
 
 from common.fft_helpers import local_fftn3, local_ifftn3
-from .bse_ring_comm import make_bse_shardings
+from .bse_ring_comm import bse_exchange_gspmd, make_bse_shardings
 
 
 def build_bse_stack_matvec(
@@ -148,18 +157,13 @@ def build_bse_stack_matvec(
         # once per solve (audit P3). psi_c_Y / psi_v_X are now unused here — kept for
         # a uniform matvec signature with the ring paths; psi_c_X / psi_v_Y still
         # feed the W-term.
-        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
         # ── D term: (ε_c − ε_v) · X  (batched, local) ──────────────────────────
         delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]
         D_term = lax.with_sharding_constraint(delta_E * X, sh.X)
 
-        # ── V term: B1 dense exchange, k-summed encode + broadcast decode ──────
-        S = jnp.einsum("kcvN,bcvk->bN", M_Y, X)                   # k SUMMED → (b, ν_loc)
-        S = lax.with_sharding_constraint(S, sh.S_k0) / sqrt_nk
-        U = jnp.einsum("MN,bN->bM", V_q0, S)                      # (b, μ_loc)
-        U = lax.with_sharding_constraint(U, sh.d_mu)
-        VX = jnp.einsum("kcvM,bM->bcvk", jnp.conj(M_X), U)       # broadcast over k
-        VX = lax.with_sharding_constraint(VX, sh.X) / sqrt_nk
+        # ── V term: B1 dense exchange via the shared GSPMD form (2 all-reduce). ──
+        # Single source of truth with the ring matvecs (bse_ring_comm).
+        VX = bse_exchange_gspmd(X, M_Y, M_X, V_q0, sh, nk)
 
         if not include_W:
             return D_term + VX

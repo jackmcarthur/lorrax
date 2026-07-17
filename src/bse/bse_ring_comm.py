@@ -64,6 +64,47 @@ def make_bse_shardings(mesh_xy: Mesh) -> SimpleNamespace:
     )
 
 
+def bse_exchange_gspmd(X, M_enc, M_X, V_q0, sh, nk):
+    """B1 dense q=0 exchange (V) term via GSPMD collectives — 2 all-reduce total.
+
+    Single source of truth for the exchange used by BOTH the trial-stack matvec
+    (``bse_stack_matvec``) and the ring TDA / non-TDA matvecs below.  The exchange
+    is DENSE in (k,k′): every transition (c,v,k) couples to every (c′,v′,k′) through
+    the one V_q0 tile, so the encode k-SUMS into a k-free ζ-space density, one V_q0
+    solve, and the decode broadcasts back at every k (VERDICT.md).
+
+    Per-element (identical to ``apply_bse_hamiltonian_single_device`` — the
+    dense-reference gate):
+
+        S(b,N)      = (1/√Nk) Σ_{k,c,v} M_enc(k,c,v,N) · X(b,c,v,k)     # encode, k-SUMMED
+        U(b,M)      =          Σ_N       V_q0(M,N) · S(b,N)              # one V_q0 solve
+        VX(b,c,v,k) = (1/√Nk) Σ_M       conj(M_X(k,c,v,M)) · U(b,M)     # decode, broadcast in k
+
+    ``M_enc`` is the ENCODE pair amplitude and is the SOLE A/B-block difference:
+    ``M_Y`` = Σ_s conj(ψ_c)ψ_v (ν on y) for the A block and the RPA-screening B block
+    (kernel K^A); ``conj(M_Y)`` for the optical-BSE coupling block (excitonic V_B).
+    ``M_X`` = Σ_s conj(ψ_c)ψ_v (μ on x) is the DECODE amplitude, conjugated here; both
+    are hoisted matvec args (audit P3).  The two 1/√Nk compose to the 1/Nk the dense
+    formula requires.
+
+    Sharding (``make_bse_shardings``): ``M_enc`` P(None,None,None,'y'), ``M_X``
+    P(None,None,None,'x'), ``V_q0`` P('x','y'), ``X``/out P(None,'x','y',None).  GSPMD
+    lowers the two sharded-axis reductions — the encode (c-sum over x, v-sum folded
+    into the y-tiled S) and the V_q0 ν-sum over y — to exactly 2 all-reduce on the
+    tiny (b×ν_loc) / (b×μ_loc) S,U tensors; the decode is a k-broadcast, no collective.
+    This REPLACES the ring ``apply_V_ring``'s 6 explicit collectives / apply (2×py
+    ppermute band-rings + psum + psum_scatter) — audit P2/C1, JOINT_FINDINGS §5-6.
+    """
+    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
+    S = jnp.einsum("kcvN,bcvk->bN", M_enc, X)                 # k SUMMED → (b, ν_loc)
+    S = lax.with_sharding_constraint(S, sh.S_k0) / sqrt_nk
+    U = jnp.einsum("MN,bN->bM", V_q0, S)                      # (b, μ_loc)
+    U = lax.with_sharding_constraint(U, sh.d_mu)
+    VX = jnp.einsum("kcvM,bM->bcvk", jnp.conj(M_X), U)        # broadcast over k
+    VX = lax.with_sharding_constraint(VX, sh.X)
+    return VX / sqrt_nk
+
+
 def _ring_perm(axis_size: int) -> tuple[tuple[int, int], ...]:
     return tuple((i, (i + 1) % axis_size) for i in range(axis_size))
 
@@ -189,90 +230,6 @@ def _ring_sum_valence_second(
     return T_total
 
 
-def apply_V_ring(
-    X: jax.Array,
-    psi_c_Y: jax.Array,
-    psi_v_Y: jax.Array,
-    M_X: jax.Array,
-    V_q0: jax.Array,
-    nk: int,
-    px: int,
-    py: int,
-) -> jax.Array:
-    # ``M_X`` (nk, c_full, v_full, μ_loc): the hoisted decode-side exchange pair
-    # amplitude ``Σ_s conj(ψ_c^X) ψ_v^X`` (μ on x), precomputed ONCE per solve
-    # (audit P3) rather than rebuilt from ψ every matvec. The encode side stays
-    # fused into the ψ_c^Y/ψ_v^Y ring sum below (it is X-dependent, not hoistable).
-    nb_trial = X.shape[0]
-    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
-
-    c_chunk = X.shape[1]
-    v_chunk = X.shape[2]
-
-    axis_index_x = jnp.asarray(lax.axis_index("x"), dtype=jnp.int32)
-    axis_index_y = jnp.asarray(lax.axis_index("y"), dtype=jnp.int32)
-
-    nk_local = psi_c_Y.shape[0]
-    nspinor = psi_c_Y.shape[2]
-    nu_local = psi_c_Y.shape[-1]
-    nc_full = M_X.shape[1]
-    mu_local = M_X.shape[-1]
-
-    c_start_local = axis_index_x * jnp.asarray(c_chunk, dtype=jnp.int32)
-    z = jnp.int32(0)
-    psi_c_slice = lax.dynamic_slice(
-        psi_c_Y, (z, c_start_local, z, z), (nk_local, c_chunk, nspinor, nu_local)
-    )
-
-    A0 = jnp.zeros((nb_trial, c_chunk, nu_local, nk_local), dtype=X.dtype)
-    perm_y = _ring_perm(py)
-
-    def step_y(i, carry):
-        buf, A = carry
-        origin = (axis_index_y - jnp.asarray(i, dtype=jnp.int32)) % py
-        v_start = origin * jnp.asarray(v_chunk, dtype=jnp.int32)
-        psi_v_slice = lax.dynamic_slice(
-            psi_v_Y, (z, v_start, z, z), (nk_local, v_chunk, nspinor, nu_local)
-        )
-        R_v = jnp.einsum("kvsN,bcvk->bcksN", psi_v_slice, buf)
-        A = A + jnp.einsum("kcsN,bcksN->bcNk", jnp.conj(psi_c_slice), R_v)
-        buf = lax.ppermute(buf, axis_name="y", perm=perm_y)
-        return buf, A
-
-    _, A_local = lax.fori_loop(0, py, step_y, (X, A0))
-
-    S0 = jnp.zeros((nb_trial, nu_local, nk_local), dtype=X.dtype)
-    perm_x = _ring_perm(px)
-
-    def step_x(i, carry):
-        buf, S = carry
-        S = S + jnp.sum(buf, axis=1)
-        buf = lax.ppermute(buf, axis_name="x", perm=perm_x)
-        return buf, S
-
-    _, S_total = lax.fori_loop(0, px, step_x, (A_local, S0))
-
-    # Exchange (q=0) is DENSE in (k,k') — SUM over k' into a k-free
-    # transition-Hartree density, one V_q0 solve, then broadcast back at every
-    # k in the decode (VERDICT.md).  k is a replicated (unsharded) axis here, so
-    # the reduction is device-local.  The two 1/sqrt_nk compose to 1/Nk.
-    S_total = jnp.sum(S_total, axis=2) / sqrt_nk  # (b, nu_local)
-
-    U_partial = jnp.einsum("MN,bN->bM", V_q0, S_total)  # (b, mu_local)
-    U = lax.psum(U_partial, axis_name="y")
-
-    v_start_local = axis_index_y * jnp.asarray(v_chunk, dtype=jnp.int32)
-    # Slice this rank's y-block of the valence axis out of the hoisted M_X (was:
-    # slice ψ_v^X then contract with ψ_c^X — identical values, one fewer GEMM/iter).
-    M_X_slice = lax.dynamic_slice(
-        M_X, (z, z, v_start_local, z), (nk_local, nc_full, v_chunk, mu_local)
-    )
-    VX_partial = jnp.einsum("kcvM,bM->bcvk", jnp.conj(M_X_slice), U)  # broadcast over k
-    VX = lax.psum_scatter(VX_partial, axis_name="x", scatter_dimension=1, tiled=True)
-
-    return VX / sqrt_nk
-
-
 def build_bse_ring_matvec(
     mesh_xy: Mesh,
     nkx: int,
@@ -314,17 +271,6 @@ def build_bse_ring_matvec(
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "x"), P(None, None, None, "y")),
         out_specs=P(None, "x", "y", None, None, None),
-    )
-
-    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0):
-        return apply_V_ring(X, psi_c_Y, psi_v_Y, M_X, V_q0, nk, px, py)
-
-    apply_V_ring_only = _shard_map_fn(
-        _apply_V_ring_only,
-        mesh=mesh_xy,
-        in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
-                  P(None, None, None, "x"), P("x", "y")),
-        out_specs=P(None, "x", "y", None),
     )
 
     # Custom-partitioned FFTs on the (kx, ky, kz) axes — those axes are
@@ -381,10 +327,12 @@ def build_bse_ring_matvec(
 
     def _matvec_impl(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
                      M_X, M_Y):
-        # M_X: hoisted decode-side exchange pair amplitude (audit P3). M_Y / psi_v_X
-        # are unused here — kept for a uniform matvec signature with the stack path.
+        # V-term = B1 dense exchange via the shared GSPMD form (2 all-reduce), not the
+        # retired apply_V_ring band-ppermute rings (6 collectives) — audit P2/C1.
+        # M_Y (ν on y) is the encode amplitude, M_X (μ on x) the decode; both hoisted
+        # (audit P3). psi_c_Y / psi_v_X are unused here — kept for a uniform signature.
         D_term = apply_D_term(X, eps_c, eps_v)
-        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
+        V_term = bse_exchange_gspmd(X, M_Y, M_X, V_q0, sh, nk)
         if not include_W:
             return D_term + V_term
         T = encode_T_ring(X, psi_c_X, psi_v_Y) if low_mem else encode_T_gather(X, psi_c_X, psi_v_Y)
@@ -398,7 +346,7 @@ def build_bse_ring_matvec(
                 D_term = apply_D_term(X, eps_c, eps_v)
                 D_term.block_until_ready()
             with timing.section("bse_jax.V_term"):
-                V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
+                V_term = bse_exchange_gspmd(X, M_Y, M_X, V_q0, sh, nk)
                 V_term.block_until_ready()
             if not include_W:
                 return D_term + V_term
@@ -446,16 +394,20 @@ def build_bse_ring_matvec_full(
 
     - ``screening=False`` (default): the OPTICAL BSE.  The B (coupling) block
       uses the excitonic exchange ``V_B`` (Henneke Eq. 2-20, conjugated pairing
-      ``⟨M_t|v|conj(M_t')⟩`` — ``apply_V_ring_B``).  With ``include_W`` this is
-      the TDHF/BSE exciton Hamiltonian.
+      ``⟨M_t|v|conj(M_t')⟩`` — the encode amplitude is ``conj(M_Y)``).  With
+      ``include_W`` this is the TDHF/BSE exciton Hamiltonian.
     - ``screening=True``: the RPA test-charge DENSITY response (the object whose
       resolvent gives the screened Coulomb ``W = v + vχv``).  Here the B block
-      uses the SAME RING kernel ``K^A = (1/Nk)⟨M_t|v|M_t'⟩`` as the A block
-      (``apply_V_ring``), so ``A+B = D + 2V`` — the standard RPA bubble
+      uses the SAME exchange kernel ``K^A = (1/Nk)⟨M_t|v|M_t'⟩`` as the A block
+      (encode amplitude ``M_Y``), so ``A+B = D + 2V`` — the standard RPA bubble
       resummation ``χ = χ₀(1 − vχ₀)⁻¹``.  ``include_W`` must be False (RPA
       screening has no screened-W direct term; it IS what builds W).  See
       ``bse_w_exact`` for the identity ``W(0) − v = v(0 − H)⁻¹v`` and its
       per-element convention.
+
+    Both blocks route the exchange through the shared ``bse_exchange_gspmd`` (2
+    all-reduce), replacing the ring ``apply_V_ring``'s 6-collective band-ppermute
+    form — the resolvent SOLVE (4 sub-applies) drops 24→8 collectives (audit P2/C1).
     """
     if screening and include_W:
         raise ValueError("screening=True is the RPA density response; it has no "
@@ -524,37 +476,6 @@ def build_bse_ring_matvec_full(
         out_specs=P(None, "x", "y", None, None, None),
     )
 
-    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0):
-        return apply_V_ring(X, psi_c_Y, psi_v_Y, M_X, V_q0, nk, px, py)
-
-    apply_V_ring_only = _shard_map_fn(
-        _apply_V_ring_only,
-        mesh=mesh_xy,
-        in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
-                  P(None, None, None, "x"), P("x", "y")),
-        out_specs=P(None, "x", "y", None),
-    )
-
-    def _apply_V_ring_B(X, psi_c_Y, psi_v_Y, M_X, V_q0):
-        return apply_V_ring(
-            X,
-            jnp.conj(psi_c_Y),
-            jnp.conj(psi_v_Y),
-            M_X,
-            V_q0,
-            nk,
-            px,
-            py,
-        )
-
-    apply_V_ring_B = _shard_map_fn(
-        _apply_V_ring_B,
-        mesh=mesh_xy,
-        in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
-                  P(None, None, None, "x"), P("x", "y")),
-        out_specs=P(None, "x", "y", None),
-    )
-
     # Custom-partitioned FFTs on the (kx, ky, kz) axes — those axes are
     # ``None``-sharded in T (sh.T) and W_R (sh.W), so the FFT can run
     # locally on every device.  Plain ``jnp.fft.ifftn`` / ``fftn`` on a
@@ -607,23 +528,24 @@ def build_bse_ring_matvec_full(
         out_shardings=sh.X,
     )
 
-    def _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X):
+    def _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y):
+        # A block: D + K^A exchange (M_Y encode / M_X decode) via the shared GSPMD
+        # form (2 all-reduce), not the retired apply_V_ring rings — audit P2/C1.
         D_term = apply_D_term(X, eps_c, eps_v)
-        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
+        V_term = bse_exchange_gspmd(X, M_Y, M_X, V_q0, sh, nk)
         if not include_W:
             return D_term + V_term
         T = encode_T_ring(X, psi_c_X, psi_v_Y) if low_mem else encode_T_gather(X, psi_c_X, psi_v_Y)
         W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
         return D_term + V_term - W_term
 
-    def _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X):
-        # screening (RPA density response): ring kernel K^A, same as the A block
-        # (apply_V_ring_only); optical BSE: excitonic V_B (apply_V_ring_B). Both take
-        # the SAME hoisted M_X (audit P3) — apply_V_ring_B conjugates only ψ^Y.
-        if screening:
-            V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
-        else:
-            V_term = apply_V_ring_B(X, psi_c_Y, psi_v_Y, M_X, V_q0)
+    def _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X, M_enc_B):
+        # B (coupling) block: same shared GSPMD exchange as A, differing ONLY in the
+        # encode amplitude ``M_enc_B`` — RPA screening reuses M_Y (kernel K^A); optical
+        # BSE uses conj(M_Y) (excitonic V_B, Henneke Eq. 2-20). Decode is conj(M_X) in
+        # both. This is the old apply_V_ring_B(conj ψ) rewritten as one einsum on the
+        # hoisted pair amplitudes (audit P2/C1); the W-term B-encode is unchanged.
+        V_term = bse_exchange_gspmd(X, M_enc_B, M_X, V_q0, sh, nk)
         if not include_W:
             return V_term
         T = encode_T_ring_B(X, psi_c_Y, psi_v_X) if low_mem else encode_T_gather_B(X, psi_c_Y, psi_v_X)
@@ -632,17 +554,19 @@ def build_bse_ring_matvec_full(
 
     def _matvec_impl(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
                      M_X, M_Y):
-        # M_X: hoisted decode-side exchange pair amplitude (audit P3), shared by the
-        # A and B blocks. M_Y is unused here — kept for a uniform matvec signature.
+        # M_X (μ on x) / M_Y (ν on y): hoisted exchange pair amplitudes (audit P3).
+        # M_enc_B is the B-block encode amplitude: M_Y for RPA screening (K^A), else
+        # conj(M_Y) for the optical coupling block — one local conj, no collective.
         X = X_full[0]
         Y = X_full[1]
-        AX = _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X)
-        BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
+        M_enc_B = M_Y if screening else jnp.conj(M_Y)
+        AX = _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
+        BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X, M_enc_B)
         X_out = AX + BY
 
         # A and B are Hermitian in this formulation; reuse A(Y) and B(X).
-        AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X)
-        B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
+        AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
+        B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X, M_enc_B)
         Y_out = -B_dag_X - AY
         return jnp.stack([X_out, Y_out], axis=0)
 
@@ -651,11 +575,12 @@ def build_bse_ring_matvec_full(
                           M_X, M_Y):
             X = X_full[0]
             Y = X_full[1]
+            M_enc_B = M_Y if screening else jnp.conj(M_Y)
             with timing.section("bse_jax.D_term"):
                 D_term = apply_D_term(X, eps_c, eps_v)
                 D_term.block_until_ready()
             with timing.section("bse_jax.V_term"):
-                V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
+                V_term = bse_exchange_gspmd(X, M_Y, M_X, V_q0, sh, nk)
                 V_term.block_until_ready()
             if not include_W:
                 AX = D_term + V_term
@@ -666,12 +591,12 @@ def build_bse_ring_matvec_full(
                     W_term.block_until_ready()
                 AX = D_term + V_term - W_term
             with timing.section("bse_jax.B_term"):
-                BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
+                BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X, M_enc_B)
                 BY.block_until_ready()
             X_out = AX + BY
 
-            AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X)
-            B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
+            AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
+            B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X, M_enc_B)
             Y_out = -B_dag_X - AY
             return jnp.stack([X_out, Y_out], axis=0)
 
@@ -732,7 +657,7 @@ def build_realspace_random_transition_generator(
         # x-slice of mu, so it must be completed across x by a psum.  Slicing c to
         # this x-rank's block first (as an earlier version did) silently drops the
         # off-rank mu contributions to every c — correct only at px=1 (~50% wrong
-        # at px=2).  Mirror apply_V_ring: full c, psum_scatter over x.
+        # at px=2).  Same pattern as the exchange decode: full c, psum_scatter over x.
         nk_local, _, nspinor, mu_local = psi_c_X.shape
         psi_v_slice = lax.dynamic_slice(
             psi_v_X, (z, v_start, z, z), (nk_local, v_chunk, nspinor, mu_local)
