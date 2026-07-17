@@ -28,6 +28,93 @@ import numpy as np
 TOL_DEGENERACY_RY: float = 1.0e-6
 
 
+def round_band_window_to_closed_shell(
+    energies_kn_ry: np.ndarray,
+    b_hi: int,
+    tol_ry: float = TOL_DEGENERACY_RY,
+    direction: str = "down",
+) -> int:
+    """Round a band-window boundary so it does not split a degenerate shell.
+
+    A window boundary ``b`` (the exclusive upper index of ``[.., b)`` / the
+    inclusive lower index of ``[b, ..)``) is **degeneracy-closed** when band
+    ``b-1`` and band ``b`` are gap-separated at *every* k:
+
+        min_k( e[k, b] - e[k, b-1] ) > tol_ry .
+
+    Splitting a degenerate multiplet at a window edge makes the transition /
+    pair densities built from that window non-covariant under the crystal
+    symmetry *exactly* at the high-symmetry k where the multiplet lives — the
+    Round-2 root cause of the ISDF ζ-fit tile non-covariance
+    (``reports/bse_refactor_map_2026-07-15`` PHASE2_LOG; FINDINGS2 Task 2/3):
+    at those k the kept partial multiplet is not an irrep of the little group,
+    so ``ζ̃_{α(μ)} ≠ e^{-iG·τ} ζ̃_μ(RᵀG)`` and every downstream V_q/W_q tile
+    inherits the defect (amplified by the CCT conditioning).  This returns the
+    nearest boundary that keeps whole shells.
+
+    Uses the same contiguous-degenerate-group logic (BGW ``TOL_Degeneracy``,
+    ``Common/nrtype.f90``) as :func:`average_within_degenerate_sets`; there is
+    no separate multiplet-detector.
+
+    Parameters
+    ----------
+    energies_kn_ry : np.ndarray, shape (nk, nb)
+        DFT eigenvalues in **Rydberg**, over the k-points (and/or spins,
+        flattened onto the leading axis) whose covariance the window must
+        respect.  IBZ k-points suffice: every full-BZ k is a symmetry image of
+        an IBZ parent with identical energies, so the min-over-k gap is the
+        same.  To test the top boundary ``b_hi`` the array **must extend above
+        it** (band ``b_hi`` must exist); otherwise ``b_hi`` sits at the file
+        edge and is reported closed (no neighbour to split).
+    b_hi : int
+        The boundary to round, in ``[0, nb]``.
+    tol_ry : float
+        "Same eigenvalue" tolerance in Ry.  Default ``TOL_DEGENERACY_RY``.
+    direction : {'down', 'up'}
+        ``'down'`` — largest closed ``b <= b_hi`` (drop partial bands off the
+        top; the screening-window use).  ``'up'`` — smallest closed
+        ``b >= b_hi`` (raise a lower boundary; the degeneracy-gate valence
+        bottom).
+
+    Returns
+    -------
+    b : int
+        The rounded, degeneracy-closed boundary.  The edges ``b == 0`` and
+        ``b == nb`` are closed by definition (no band across the boundary), so
+        the search always terminates.
+    """
+    e = np.asarray(energies_kn_ry, dtype=np.float64)
+    if e.ndim != 2:
+        raise ValueError(
+            f"round_band_window_to_closed_shell: energies must be (nk, nb), "
+            f"got {e.shape}")
+    nb = e.shape[1]
+    b_hi = int(b_hi)
+    if not (0 <= b_hi <= nb):
+        raise ValueError(
+            f"round_band_window_to_closed_shell: b_hi={b_hi} outside [0, {nb}]")
+
+    def _closed(b: int) -> bool:
+        # Edges (b == 0 or b == nb): no band across the boundary → closed.
+        if b <= 0 or b >= nb:
+            return True
+        return float(np.min(e[:, b] - e[:, b - 1])) > tol_ry
+
+    if direction == "down":
+        b = b_hi
+        while b > 0 and not _closed(b):
+            b -= 1
+        return b
+    if direction == "up":
+        b = b_hi
+        while b < nb and not _closed(b):
+            b += 1
+        return b
+    raise ValueError(
+        f"round_band_window_to_closed_shell: direction must be 'down' or 'up', "
+        f"got {direction!r}")
+
+
 def average_within_degenerate_sets(
     values_kn: np.ndarray,
     energies_kn_ry: np.ndarray,

@@ -97,7 +97,66 @@ class Meta:
         # load_centroids_band_chunked; energies use a finite sentinel; pair
         # densities / Σ_X / Σ_C therefore see zero contribution from pads.
         b_id_4_user = int(nband)
+        # --- Degeneracy-close the SCREENING ISDF fit window's top boundary ---
+        # b_id_4 is the ζ/χ0 fit window top (→ gw_init.fit_zeta
+        # band_range_right = (b1, b4)).  If nband splits a degenerate multiplet
+        # at any k, the fitted ζ̃ — and every V_q/W_q tile built from it — is
+        # non-covariant under the crystal symmetry at that k (Round-2 root
+        # cause; reports/bse_refactor_map_2026-07-15 PHASE2_LOG, FINDINGS2
+        # Task 2/3).  Round the PHYSICAL window top DOWN to the largest
+        # degeneracy-closed boundary (BGW TOL_Degeneracy).  This changes
+        # SCREENING physics (drops partial-multiplet conduction bands from χ0)
+        # but NOT the σ OUTPUT band SET (b_id_3 = nelec + ncond).  b_id_3
+        # carries the IDENTICAL exposure — the σ conduction top can split a
+        # multiplet too — but closing it would drop reported QP bands, so it is
+        # deliberately left untouched here (owner decision 2026-07-16).
+        from gw.degen_average import (
+            round_band_window_to_closed_shell, TOL_DEGENERACY_RY)
+        _energies = getattr(wfn, "energies", None)
+        # wfn.energies is (nspin, nk, nband_file); flatten (spin, k) onto the
+        # leading axis so the min-k gap respects both spin channels.  A normal
+        # WFN stores nband_file ≥ nband, so the b_id_4_user boundary is testable
+        # (band b_id_4_user exists); if the file is exactly nband wide the top
+        # boundary sits at the file edge and is reported closed.  Skip when
+        # energies are absent (a mock wfn) or narrower than the window.
+        _e2 = None if _energies is None else np.asarray(_energies)
+        if _e2 is not None:
+            _e2 = _e2.reshape(-1, _e2.shape[-1])
+        if _e2 is not None and b_id_4_user <= _e2.shape[1]:
+            b4_closed = round_band_window_to_closed_shell(
+                _e2, b_id_4_user, TOL_DEGENERACY_RY, direction="down")
+            # b_id_3 ≤ b_id_4 is a hard invariant (BandSlices.from_band_edges,
+            # and physically: a reported QP band must lie inside the GF /
+            # screening band sum).  If the closed shell falls below b_id_3, the
+            # σ top splits the SAME multiplet; we do NOT reduce the σ SET, so
+            # clamp the screening window at b_id_3 and warn about the exposure.
+            if b4_closed < b_id_3:
+                if rank == 0:
+                    print(
+                        f"!!! WARNING [screening degeneracy]: nband="
+                        f"{b_id_4_user} splits a degenerate multiplet and the "
+                        f"nearest closed shell ({b4_closed}) is below the "
+                        f"σ-output top b_id_3={b_id_3}, which splits the SAME "
+                        f"multiplet. Clamping the screening window at b_id_3 "
+                        f"(no bands dropped); reduce ncond to a "
+                        f"degeneracy-closed value to close the screening "
+                        f"window.", flush=True)
+                b4_closed = b_id_3
+            if b4_closed < b_id_4_user:
+                if rank == 0:
+                    print(
+                        f"!!! WARNING [screening degeneracy]: rounding the "
+                        f"ISDF fit window top DOWN {b_id_4_user} → {b4_closed} "
+                        f"to keep whole degenerate shells (BGW TOL_Degeneracy "
+                        f"{TOL_DEGENERACY_RY:g} Ry); dropping "
+                        f"{b_id_4_user - b4_closed} conduction band(s) from "
+                        f"the χ0/W screening sum.", flush=True)
+                b_id_4_user = b4_closed
         world_size = int(jax.device_count())
+        # Compose with mesh-divisibility: round the CLOSED physical top UP to
+        # world_size with ZERO pad bands (ψ=0, sentinel energies — see the
+        # block above), NEVER with real bands, so the padded window can never
+        # re-cross into a multiplet.  Order matters: close first, pad second.
         b_id_4 = _round_up(b_id_4_user, world_size)
         # Both readers handle pad-past-file:
         #   - ``read_Gvecs_to_devices`` (legacy path): pre-zeroed buffer
