@@ -115,6 +115,7 @@ def _sharded_matvec(kind, data, X, include_W):
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from bse.bse_ring_comm import build_bse_ring_matvec, make_bse_shardings
     from bse.bse_simple import build_bse_simple_matvec
+    from bse.bse_serial import compute_pair_amplitude
 
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
     sh = make_bse_shardings(mesh)
@@ -128,6 +129,11 @@ def _sharded_matvec(kind, data, X, include_W):
         V_q0 = jax.lax.with_sharding_constraint(data["V_q0"], sh.V)
         Xs = jax.lax.with_sharding_constraint(X, sh.X)
         W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
+        # Hoisted V-term pair amplitudes (audit P3) — matvec args, not recomputed.
+        M_X = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(psi_c_X, psi_v_X), sh.psi_x)
+        M_Y = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(psi_c_Y, psi_v_Y), sh.psi_y)
         if kind == "simple":
             mv = build_bse_simple_matvec(mesh, nkx, nky, nkz, include_W=include_W)
         else:
@@ -135,7 +141,7 @@ def _sharded_matvec(kind, data, X, include_W):
                 mesh, nkx, nky, nkz, include_W=include_W,
                 low_mem=(kind == "ring"))
         HX = mv(Xs, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                data["eps_c"], data["eps_v"], W_R, V_q0)
+                data["eps_c"], data["eps_v"], W_R, V_q0, M_X, M_Y)
         HX.block_until_ready()
     return HX
 

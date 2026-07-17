@@ -93,6 +93,8 @@ def _apply_shifted_matvec(
         data["eps_v"],
         data["W_R"],
         data["V_q0"],
+        data["M_X"],  # hoisted V-term pair-amps (audit P3)
+        data["M_Y"],
     )
     return z * x - hx
 
@@ -343,6 +345,8 @@ def _build_gmres_data_fp32(data: dict) -> dict:
         "psi_c_Y": _cast_with_sharding(data["psi_c_Y"], jnp.complex64),
         "psi_v_X": _cast_with_sharding(data["psi_v_X"], jnp.complex64),
         "psi_v_Y": _cast_with_sharding(data["psi_v_Y"], jnp.complex64),
+        "M_X": _cast_with_sharding(data["M_X"], jnp.complex64),  # hoisted V-term pair-amps (P3)
+        "M_Y": _cast_with_sharding(data["M_Y"], jnp.complex64),
         "eps_c": _cast_with_sharding(data["eps_c"], jnp.float32),
         "eps_v": _cast_with_sharding(data["eps_v"], jnp.float32),
         "V_q0": _cast_with_sharding(data["V_q0"], jnp.complex64),
@@ -390,7 +394,8 @@ def _rayleigh_ritz(
         )
 
     args = (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
-            data["eps_c"], data["eps_v"], data["W_R"], data["V_q0"])
+            data["eps_c"], data["eps_v"], data["W_R"], data["V_q0"],
+            data["M_X"], data["M_Y"])  # hoisted V-term pair-amps (audit P3)
     if use_tda:
         # TDA subspace application through the trial-stack matvec: the filtered
         # vectors are (1, nc, nv, nk), so concatenate on the leading axis into a
@@ -833,6 +838,8 @@ def estimate_spectral_bounds_sharded(
             eps_v,
             data_fp32["W_R"],
             data_fp32["V_q0"],
+            data_fp32["M_X"],  # hoisted V-term pair-amps (audit P3)
+            data_fp32["M_Y"],
         )
 
         alpha = jnp.vdot(q, z).real

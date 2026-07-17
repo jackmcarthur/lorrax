@@ -58,6 +58,7 @@ from .bse_ring_comm import (
     build_density_snapshot_operator,
     make_bse_shardings,
 )
+from .bse_serial import compute_pair_amplitude
 import common.timing as timing
 
 jax.config.update("jax_enable_x64", True)
@@ -156,6 +157,14 @@ def build_finite_q_data(data, q, mesh_xy):
     dq["psi_c_Y"] = jax.lax.with_sharding_constraint(psi_c_q, sh.psi_y)
     dq["eps_c"] = jax.lax.with_sharding_constraint(
         _roll_k_axis(data["eps_c"], (qx, qy, qz), nkx, nky, nkz), sh.eps)
+    # M_X/M_Y are hoisted V-term pair amplitudes (audit P3) and are pure functions
+    # of psi_c — the finite-q roll shifted psi_c, so recompute them from the ROLLED
+    # conduction states.  The q=0 M's shallow-copied from `data` would be stale and
+    # give the wrong finite-q screening operator (M^q_cvk(μ)=Σ_s conj(ψ_c[k−q]) ψ_v[k]).
+    dq["M_X"] = jax.lax.with_sharding_constraint(
+        compute_pair_amplitude(dq["psi_c_X"], dq["psi_v_X"]), sh.psi_x)
+    dq["M_Y"] = jax.lax.with_sharding_constraint(
+        compute_pair_amplitude(dq["psi_c_Y"], dq["psi_v_Y"]), sh.psi_y)
     return dq
 
 

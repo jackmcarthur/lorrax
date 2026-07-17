@@ -124,11 +124,13 @@ def _load_data_and_matvec(
     eps_c = data["eps_c"]
     eps_v = data["eps_v"]
     V_q0 = data["V_q0"]
+    M_X = data["M_X"]  # hoisted V-term pair-amps (audit P3)
+    M_Y = data["M_Y"]
 
     def apply_H(X):
         return matvec_simple(
             X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-            eps_c, eps_v, W_R, V_q0,
+            eps_c, eps_v, W_R, V_q0, M_X, M_Y,
         )
 
     return mesh_xy, sh, data, apply_H

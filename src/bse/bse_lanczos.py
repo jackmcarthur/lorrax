@@ -189,12 +189,13 @@ def solve_bse_sharded(
         psi_v_X = data["psi_v_X"]; psi_v_Y = data["psi_v_Y"]
         eps_c   = data["eps_c"];   eps_v   = data["eps_v"]
         V_q0    = data["V_q0"];    W_q     = data["W_q"]
+        M_X     = data["M_X"];     M_Y     = data["M_Y"]  # hoisted V-term pair-amps (P3)
         W_R = _W_local_ifftn(W_q) if include_W else W_q
 
         def apply_H(V):    # V: (m, nc_pad, nv_pad, nk) sharded P(None,"x","y",None)
             V = jax.lax.with_sharding_constraint(V, sh.X)
             return matvec_ring(V, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                               eps_c, eps_v, W_R, V_q0)
+                               eps_c, eps_v, W_R, V_q0, M_X, M_Y)
 
         bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
         precond_fn = bse_diagonal_precond(
@@ -234,12 +235,14 @@ def solve_bse_sharded(
         jax.jit,
         in_shardings=(
             sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-            sh.eps, sh.eps, sh.W, sh.V,
+            sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y,
         ),
         out_shardings=(rep_eig, rep_eig, rep_eig),
-        donate_argnums=(6,),  # W_q — only used to build W_R
+        # NB: W_q (arg 6) is NOT donated — W_R = ifft(W_q) is a fresh buffer with no
+        # aliasable same-shape output, so the donation was always declined (cosmetic,
+        # no copy) and only emitted a "donated buffers not usable" warning (audit P5).
     )
-    def _full_run(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_q, V_q0):
+    def _full_run(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_q, V_q0, M_X, M_Y):
         if include_W:
             W_R = _W_local_ifftn(W_q)
         else:
@@ -251,7 +254,7 @@ def solve_bse_sharded(
                 X = jax.lax.with_sharding_constraint(X, sh.X)
                 HX = matvec_ring(
                     X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                    eps_c, eps_v, W_R, V_q0,
+                    eps_c, eps_v, W_R, V_q0, M_X, M_Y,
                 )
                 return HX.reshape(-1)
             if rtol > 0.0:
@@ -280,7 +283,7 @@ def solve_bse_sharded(
                 X = jax.lax.with_sharding_constraint(X, sh.X)
                 HX = matvec_ring(
                     X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                    eps_c, eps_v, W_R, V_q0,
+                    eps_c, eps_v, W_R, V_q0, M_X, M_Y,
                 )
                 return HX.reshape(bs, -1)
             if rtol > 0.0:
@@ -304,6 +307,7 @@ def solve_bse_sharded(
         data["psi_v_X"], data["psi_v_Y"],
         data["eps_c"], data["eps_v"],
         data["W_q"], data["V_q0"],
+        data["M_X"], data["M_Y"],
     )
     eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
     return eigenvalues, eigenvectors, n_iter_done

@@ -13,6 +13,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from runtime.padding import padded_mu_extent
 
+from .bse_serial import compute_pair_amplitude
+
 
 _BARE_V_FALLBACK_WARNING = (
     "\n" + "=" * 72 + "\n"
@@ -578,11 +580,25 @@ def load_bse_data_from_restart_sharded(
             print(f"BSE-sharded: q=0 head injected (rank-1, dual-sharded G0, "
                   f"V_cell={cell_volume:.2f}): {v_str}, {w_str}")
 
+    # Hoisted exchange pair amplitudes M(k,c,v,μ) = Σ_s conj(ψ_c) ψ_v — the V-term
+    # decode (M_X, μ on x) and encode (M_Y, ν on y) vertices. Precomputed ONCE here
+    # (audit P3) so the per-iteration BSE matvec receives them as inputs instead of
+    # rebuilding them from ψ every call. Peak-neutral; the between-matvec floor rises
+    # by ~2·M/p (reports/bse_refactor_map_2026-07-15/archive/matvec_efficiency_audit).
+    M_X = jax.lax.with_sharding_constraint(
+        compute_pair_amplitude(psi_c_X, psi_v_X),
+        NamedSharding(mesh_xy, P(None, None, None, "x")))
+    M_Y = jax.lax.with_sharding_constraint(
+        compute_pair_amplitude(psi_c_Y, psi_v_Y),
+        NamedSharding(mesh_xy, P(None, None, None, "y")))
+
     return {
         "psi_c_X": psi_c_X,
         "psi_c_Y": psi_c_Y,
         "psi_v_X": psi_v_X,
         "psi_v_Y": psi_v_Y,
+        "M_X": M_X,
+        "M_Y": M_Y,
         "eps_c": eps_c,
         "eps_v": eps_v,
         "W_q": W_q,

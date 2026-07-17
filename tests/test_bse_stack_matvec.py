@@ -42,8 +42,9 @@ def _random_stack(nt, nc, nv, nk):
 
 
 def _place(data, mesh):
-    """Shard the fixture arrays + build W_R for the stack/simple matvecs."""
+    """Shard the fixture arrays + build W_R and the hoisted pair-amps M_X/M_Y."""
     from bse.bse_ring_comm import make_bse_shardings
+    from bse.bse_serial import compute_pair_amplitude
     sh = make_bse_shardings(mesh)
     with mesh:
         out = dict(
@@ -55,6 +56,11 @@ def _place(data, mesh):
             V_q0=jax.lax.with_sharding_constraint(data["V_q0"], sh.V),
         )
         out["W_R"] = jnp.fft.ifftn(out["W_q"], axes=(2, 3, 4), norm="ortho")
+        # Hoisted V-term pair amplitudes (audit P3) — matvec args, not recomputed.
+        out["M_X"] = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(out["psi_c_X"], out["psi_v_X"]), sh.psi_x)
+        out["M_Y"] = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(out["psi_c_Y"], out["psi_v_Y"]), sh.psi_y)
     return sh, out
 
 
@@ -84,12 +90,14 @@ def test_stack_matches_dense_and_simple(bse_dense_state, kernel):
         simple_mv = build_bse_simple_matvec(mesh, nkx, nky, nkz, include_W=include_W)
         HXs = np.asarray(stack_mv(
             Xs, arr["psi_c_X"], arr["psi_c_Y"], arr["psi_v_X"], arr["psi_v_Y"],
-            data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"]))
+            data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"],
+            arr["M_X"], arr["M_Y"]))
         for t in range(nt):
             xin = jax.lax.with_sharding_constraint(Xs[t:t + 1], sh.X)
             s_t = np.asarray(simple_mv(
                 xin, arr["psi_c_X"], arr["psi_c_Y"], arr["psi_v_X"], arr["psi_v_Y"],
-                data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"]))[0].reshape(-1)
+                data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"],
+                arr["M_X"], arr["M_Y"]))[0].reshape(-1)
             got = HXs[t].reshape(-1)
             ref = Href @ np.asarray(X)[t].reshape(-1)
             assert _relerr(got, ref) < 1e-9, \
@@ -126,7 +134,8 @@ def test_stack_memory_flat_in_n_trials(bse_dense_state):
             X = jax.lax.with_sharding_constraint(
                 jnp.zeros((nt, nc, nv, nk), dtype=jnp.complex128), sh.X)
             rest = (arr["psi_c_X"], arr["psi_c_Y"], arr["psi_v_X"], arr["psi_v_Y"],
-                    data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"])
+                    data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"],
+                    arr["M_X"], arr["M_Y"])
             compiled = mv.lower(X, *rest).compile()
         return int(compiled.memory_analysis().temp_size_in_bytes)
 

@@ -193,13 +193,16 @@ def apply_V_ring(
     X: jax.Array,
     psi_c_Y: jax.Array,
     psi_v_Y: jax.Array,
-    psi_c_X: jax.Array,
-    psi_v_X: jax.Array,
+    M_X: jax.Array,
     V_q0: jax.Array,
     nk: int,
     px: int,
     py: int,
 ) -> jax.Array:
+    # ``M_X`` (nk, c_full, v_full, μ_loc): the hoisted decode-side exchange pair
+    # amplitude ``Σ_s conj(ψ_c^X) ψ_v^X`` (μ on x), precomputed ONCE per solve
+    # (audit P3) rather than rebuilt from ψ every matvec. The encode side stays
+    # fused into the ψ_c^Y/ψ_v^Y ring sum below (it is X-dependent, not hoistable).
     nb_trial = X.shape[0]
     sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
@@ -212,7 +215,8 @@ def apply_V_ring(
     nk_local = psi_c_Y.shape[0]
     nspinor = psi_c_Y.shape[2]
     nu_local = psi_c_Y.shape[-1]
-    mu_local = psi_c_X.shape[-1]
+    nc_full = M_X.shape[1]
+    mu_local = M_X.shape[-1]
 
     c_start_local = axis_index_x * jnp.asarray(c_chunk, dtype=jnp.int32)
     z = jnp.int32(0)
@@ -258,11 +262,12 @@ def apply_V_ring(
     U = lax.psum(U_partial, axis_name="y")
 
     v_start_local = axis_index_y * jnp.asarray(v_chunk, dtype=jnp.int32)
-    psi_v_slice_X = lax.dynamic_slice(
-        psi_v_X, (z, v_start_local, z, z), (nk_local, v_chunk, nspinor, mu_local)
+    # Slice this rank's y-block of the valence axis out of the hoisted M_X (was:
+    # slice ψ_v^X then contract with ψ_c^X — identical values, one fewer GEMM/iter).
+    M_X_slice = lax.dynamic_slice(
+        M_X, (z, z, v_start_local, z), (nk_local, nc_full, v_chunk, mu_local)
     )
-    M_X = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_X), psi_v_slice_X)
-    VX_partial = jnp.einsum("kcvM,bM->bcvk", jnp.conj(M_X), U)  # broadcast over k
+    VX_partial = jnp.einsum("kcvM,bM->bcvk", jnp.conj(M_X_slice), U)  # broadcast over k
     VX = lax.psum_scatter(VX_partial, axis_name="x", scatter_dimension=1, tiled=True)
 
     return VX / sqrt_nk
@@ -311,14 +316,14 @@ def build_bse_ring_matvec(
         out_specs=P(None, "x", "y", None, None, None),
     )
 
-    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0):
-        return apply_V_ring(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0, nk, px, py)
+    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0):
+        return apply_V_ring(X, psi_c_Y, psi_v_Y, M_X, V_q0, nk, px, py)
 
     apply_V_ring_only = _shard_map_fn(
         _apply_V_ring_only,
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
-                  P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
+                  P(None, None, None, "x"), P("x", "y")),
         out_specs=P(None, "x", "y", None),
     )
 
@@ -358,7 +363,10 @@ def build_bse_ring_matvec(
         _apply_W_from_T,
         in_shardings=(sh.T, sh.psi_x, sh.psi_y, sh.W),
         out_shardings=sh.X,
-        donate_argnums=(0,),  # T consumed once, no need to keep
+        # NB: T (arg 0) is NOT donated — the WX output has a different shape
+        # (nt,c,v,k) so the donation is always declined (no aliasable output) and
+        # emits no fallback copy. Dropping the cosmetic donate_argnums silences the
+        # recurring "donated buffers not usable" warning (audit P5, JOINT_FINDINGS §3).
     )
 
     def _apply_D_term(X, eps_c, eps_v):
@@ -371,9 +379,12 @@ def build_bse_ring_matvec(
         out_shardings=sh.X,
     )
 
-    def _matvec_impl(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+    def _matvec_impl(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
+                     M_X, M_Y):
+        # M_X: hoisted decode-side exchange pair amplitude (audit P3). M_Y / psi_v_X
+        # are unused here — kept for a uniform matvec signature with the stack path.
         D_term = apply_D_term(X, eps_c, eps_v)
-        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
         if not include_W:
             return D_term + V_term
         T = encode_T_ring(X, psi_c_X, psi_v_Y) if low_mem else encode_T_gather(X, psi_c_X, psi_v_Y)
@@ -381,12 +392,13 @@ def build_bse_ring_matvec(
         return D_term + V_term - W_term
 
     if timed:
-        def _matvec_timed(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+        def _matvec_timed(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
+                          M_X, M_Y):
             with timing.section("bse_jax.D_term"):
                 D_term = apply_D_term(X, eps_c, eps_v)
                 D_term.block_until_ready()
             with timing.section("bse_jax.V_term"):
-                V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+                V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
                 V_term.block_until_ready()
             if not include_W:
                 return D_term + V_term
@@ -410,6 +422,8 @@ def build_bse_ring_matvec(
             sh.eps,
             sh.W,
             sh.V,
+            sh.psi_x,
+            sh.psi_y,
         ),
         out_shardings=sh.X,
     )
@@ -510,24 +524,23 @@ def build_bse_ring_matvec_full(
         out_specs=P(None, "x", "y", None, None, None),
     )
 
-    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0):
-        return apply_V_ring(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0, nk, px, py)
+    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0):
+        return apply_V_ring(X, psi_c_Y, psi_v_Y, M_X, V_q0, nk, px, py)
 
     apply_V_ring_only = _shard_map_fn(
         _apply_V_ring_only,
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
-                  P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
+                  P(None, None, None, "x"), P("x", "y")),
         out_specs=P(None, "x", "y", None),
     )
 
-    def _apply_V_ring_B(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0):
+    def _apply_V_ring_B(X, psi_c_Y, psi_v_Y, M_X, V_q0):
         return apply_V_ring(
             X,
             jnp.conj(psi_c_Y),
             jnp.conj(psi_v_Y),
-            psi_c_X,
-            psi_v_X,
+            M_X,
             V_q0,
             nk,
             px,
@@ -538,7 +551,7 @@ def build_bse_ring_matvec_full(
         _apply_V_ring_B,
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
-                  P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
+                  P(None, None, None, "x"), P("x", "y")),
         out_specs=P(None, "x", "y", None),
     )
 
@@ -578,7 +591,10 @@ def build_bse_ring_matvec_full(
         _apply_W_from_T,
         in_shardings=(sh.T, sh.psi_x, sh.psi_y, sh.W),
         out_shardings=sh.X,
-        donate_argnums=(0,),  # T consumed once, no need to keep
+        # NB: T (arg 0) is NOT donated — the WX output has a different shape
+        # (nt,c,v,k) so the donation is always declined (no aliasable output) and
+        # emits no fallback copy. Dropping the cosmetic donate_argnums silences the
+        # recurring "donated buffers not usable" warning (audit P5, JOINT_FINDINGS §3).
     )
 
     def _apply_D_term(X, eps_c, eps_v):
@@ -591,50 +607,55 @@ def build_bse_ring_matvec_full(
         out_shardings=sh.X,
     )
 
-    def _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+    def _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X):
         D_term = apply_D_term(X, eps_c, eps_v)
-        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
         if not include_W:
             return D_term + V_term
         T = encode_T_ring(X, psi_c_X, psi_v_Y) if low_mem else encode_T_gather(X, psi_c_X, psi_v_Y)
         W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
         return D_term + V_term - W_term
 
-    def _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0):
+    def _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X):
         # screening (RPA density response): ring kernel K^A, same as the A block
-        # (apply_V_ring_only); optical BSE: excitonic V_B (apply_V_ring_B).
+        # (apply_V_ring_only); optical BSE: excitonic V_B (apply_V_ring_B). Both take
+        # the SAME hoisted M_X (audit P3) — apply_V_ring_B conjugates only ψ^Y.
         if screening:
-            V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+            V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
         else:
-            V_term = apply_V_ring_B(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+            V_term = apply_V_ring_B(X, psi_c_Y, psi_v_Y, M_X, V_q0)
         if not include_W:
             return V_term
         T = encode_T_ring_B(X, psi_c_Y, psi_v_X) if low_mem else encode_T_gather_B(X, psi_c_Y, psi_v_X)
         W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
         return V_term - W_term
 
-    def _matvec_impl(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+    def _matvec_impl(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
+                     M_X, M_Y):
+        # M_X: hoisted decode-side exchange pair amplitude (audit P3), shared by the
+        # A and B blocks. M_Y is unused here — kept for a uniform matvec signature.
         X = X_full[0]
         Y = X_full[1]
-        AX = _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
-        BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
+        AX = _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X)
+        BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
         X_out = AX + BY
 
         # A and B are Hermitian in this formulation; reuse A(Y) and B(X).
-        AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
-        B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
+        AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X)
+        B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
         Y_out = -B_dag_X - AY
         return jnp.stack([X_out, Y_out], axis=0)
 
     if timed:
-        def _matvec_timed(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+        def _matvec_timed(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
+                          M_X, M_Y):
             X = X_full[0]
             Y = X_full[1]
             with timing.section("bse_jax.D_term"):
                 D_term = apply_D_term(X, eps_c, eps_v)
                 D_term.block_until_ready()
             with timing.section("bse_jax.V_term"):
-                V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+                V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
                 V_term.block_until_ready()
             if not include_W:
                 AX = D_term + V_term
@@ -645,12 +666,12 @@ def build_bse_ring_matvec_full(
                     W_term.block_until_ready()
                 AX = D_term + V_term - W_term
             with timing.section("bse_jax.B_term"):
-                BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
+                BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
                 BY.block_until_ready()
             X_out = AX + BY
 
-            AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
-            B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
+            AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X)
+            B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
             Y_out = -B_dag_X - AY
             return jnp.stack([X_out, Y_out], axis=0)
 
@@ -668,6 +689,8 @@ def build_bse_ring_matvec_full(
             sh.eps,
             sh.W,
             sh.V,
+            sh.psi_x,
+            sh.psi_y,
         ),
         out_shardings=sh.X_full,
     )
@@ -936,7 +959,9 @@ def ring_matvec_smoke_test(px: int = 2, py: int = 2) -> None:
 
         matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
         W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
-        HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+        M_X = compute_pair_amplitude(psi_c_X, psi_v_X)
+        M_Y = compute_pair_amplitude(psi_c_Y, psi_v_Y)
+        HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
         HX.block_until_ready()
 
     print(f"HX sharding: {HX.sharding}")
@@ -998,7 +1023,9 @@ def ring_matvec_correctness_check(
         W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
 
         matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
-        HX_ring = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+        M_X = compute_pair_amplitude(psi_c_X, psi_v_X)
+        M_Y = compute_pair_amplitude(psi_c_Y, psi_v_Y)
+        HX_ring = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
         HX_ring.block_until_ready()
 
     HX_ring_host = jax.device_get(HX_ring)
@@ -1029,10 +1056,12 @@ def ring_matvec_correctness_check(
             D_ring = apply_D(X, eps_c, eps_v)
             W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
             V_ring = comp_matvec(
-                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R * 0.0, V_q0
+                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R * 0.0, V_q0,
+                M_X, M_Y
             )
             W_ring = comp_matvec(
-                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R, V_q0 * 0.0
+                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R, V_q0 * 0.0,
+                M_X, M_Y
             )
             D_ring.block_until_ready()
             V_ring.block_until_ready()

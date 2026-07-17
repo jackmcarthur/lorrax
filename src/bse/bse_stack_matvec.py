@@ -3,9 +3,19 @@
 ``build_bse_stack_matvec`` returns a jitted
 
     matvec(X[n_trials, c, v, k], psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-           eps_c, eps_v, W_R, V_q0)  ->  out[n_trials, c, v, k]
+           eps_c, eps_v, W_R, V_q0, M_X, M_Y)  ->  out[n_trials, c, v, k]
 
 for the TDA BSE (or RPA) Hamiltonian ``H = D + V - W`` (``D + V`` for RPA).
+
+The exchange pair amplitudes ``M_X`` (μ on x) and ``M_Y`` (ν on y) are pure
+functions of ψ (``compute_pair_amplitude``), so they are HOISTED to matvec inputs
+(precomputed ONCE per solve at load time, ``bse_io``) rather than rebuilt inside
+every iteration — the matvec is a per-iteration black-box jit whose ψ args XLA
+cannot hoist across calls (audit P3, ``reports/bse_refactor_map_2026-07-15/archive/
+matvec_efficiency_audit``). Peak-neutral (both M's already lived inside every call);
+only the between-matvec floor rises by ~2·M/p. ``psi_c_Y``/``psi_v_X`` are retained
+in the signature for a uniform calling convention with the ring matvecs (they now
+feed only the W-term's ``psi_c_X``/``psi_v_Y``; the V-term reads the hoisted M's).
 
 Why a stack matvec.  The four legacy TDA matvecs (ring/gather/simple/serial)
 carry the trial axis ``b`` on the direct-term tensor ``T[b, μ, ν, t, s, k]`` —
@@ -58,7 +68,6 @@ except ImportError:  # pragma: no cover - older JAX
 
 from common.fft_helpers import local_fftn3, local_ifftn3
 from .bse_ring_comm import make_bse_shardings
-from .bse_serial import compute_pair_amplitude
 
 
 def build_bse_stack_matvec(
@@ -89,6 +98,11 @@ def build_bse_stack_matvec(
         # Local shards: X (n_trials, c_loc, v_loc, nk); psi_c_X (nk, c_full, ns,
         # μ_loc); psi_v_Y (nk, v_full, ns, ν_loc); W_R (μ_loc, ν_loc, kx,ky,kz).
         # sqrt_nk follows the input dtype (fp32/fp64) — drop-in for fp32 GMRES.
+        # DTYPE SEAM: this whole W-term inherits X's dtype, so a complex64 matvec
+        # would halve the 655 MB T-tensor and every one of its ~7 HBM round-trips
+        # (the audit's measured ~2× bandwidth lever, JOINT_FINDINGS §4). It is
+        # DELIBERATELY left at complex128 (no c64 here) per owner decision
+        # (2026-07-16); the fp32-GMRES path casts upstream in bse_feast, not here.
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
         def _body(carry, X_b):                       # X_b: (c_loc, v_loc, nk)
@@ -128,19 +142,22 @@ def build_bse_stack_matvec(
         out_specs=P(None, "x", "y", None),
     )
 
-    def _matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+    def _matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
+                M_X, M_Y):
+        # M_X (μ on x) / M_Y (ν on y): hoisted exchange pair amplitudes, precomputed
+        # once per solve (audit P3). psi_c_Y / psi_v_X are now unused here — kept for
+        # a uniform matvec signature with the ring paths; psi_c_X / psi_v_Y still
+        # feed the W-term.
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
         # ── D term: (ε_c − ε_v) · X  (batched, local) ──────────────────────────
         delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]
         D_term = lax.with_sharding_constraint(delta_E * X, sh.X)
 
         # ── V term: B1 dense exchange, k-summed encode + broadcast decode ──────
-        M_Y = compute_pair_amplitude(psi_c_Y, psi_v_Y)            # ν on y
         S = jnp.einsum("kcvN,bcvk->bN", M_Y, X)                   # k SUMMED → (b, ν_loc)
         S = lax.with_sharding_constraint(S, sh.S_k0) / sqrt_nk
         U = jnp.einsum("MN,bN->bM", V_q0, S)                      # (b, μ_loc)
         U = lax.with_sharding_constraint(U, sh.d_mu)
-        M_X = compute_pair_amplitude(psi_c_X, psi_v_X)           # μ on x
         VX = jnp.einsum("kcvM,bM->bcvk", jnp.conj(M_X), U)       # broadcast over k
         VX = lax.with_sharding_constraint(VX, sh.X) / sqrt_nk
 
@@ -153,6 +170,6 @@ def build_bse_stack_matvec(
     return jax.jit(
         _matvec,
         in_shardings=(sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-                      sh.eps, sh.eps, sh.W, sh.V),
+                      sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y),
         out_shardings=sh.X,
     )
