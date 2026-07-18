@@ -94,7 +94,7 @@ PAD_EPS_GUARD_RY = 1.0e3
 # ===========================================================================
 def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                       nc_pad: int, nv_pad: int, *, n_eig: int,
-                      block_size: int, max_iter: int, n_reorth: int = 4):
+                      block_size: int, max_iter: int, n_reorth: int | None = None):
     """One jitted ``solve_path`` for a whole Q list.
 
         solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
@@ -111,6 +111,13 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
     n_flat = nc_pad * nv_pad * nk
+    if n_reorth is None:
+        # FULL reorthogonalisation by default: exciton windows are small
+        # (n_flat = nc·nv·nk ~ 10²-10⁴), the Krylov space often saturates
+        # (solvers.lanczos clamps at floor(n/bs)), and partial reorth at
+        # saturation breeds ghost duplicates.  Full reorth costs
+        # O(M·n·bs²) — negligible next to the matvec at every BSE size.
+        n_reorth = max_iter
     matvec = build_bse_stack_matvec(mesh_xy, nkx, nky, nkz, kernel="bse")
 
     @jax.jit

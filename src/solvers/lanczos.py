@@ -378,8 +378,19 @@ def block_lanczos_eig_jit(
         Random seed for initial block.
     n_reorth : int
         Window size (in *blocks*) for partial reorthogonalisation.
+
+    Krylov-exhaustion clamp: the Krylov space cannot exceed the vector
+    space, so ``max_iter`` is clamped to ``floor(n / block_size)``.
+    Running past exhaustion is not benign — the residual block collapses,
+    QR of a ~zero block returns junk directions, and the manufactured
+    α/β blocks put Ritz values ANYWHERE, including BELOW the true
+    spectrum (measured on the 4v4c MoS2 exciton window, n=144 with a
+    requested 320-dim Krylov: spurious states 60-100 meV under the dense
+    ground state).  At the clamp the Krylov space spans (almost) the
+    whole space and the extremal Ritz values are dense-quality.
     """
     bs = int(block_size)
+    max_iter = max(1, min(int(max_iter), int(n) // bs))
     T_size = bs * int(max_iter)
 
     # Initial orthonormal block via QR of random complex Gaussian.
@@ -482,11 +493,14 @@ def block_lanczos_eig_jit_converged(
     ``max_iter``).
     """
     bs = int(block_size)
-    M = int(max_iter)
+    # Krylov-exhaustion clamp — same rationale as block_lanczos_eig_jit:
+    # past floor(n/bs) blocks the residual collapses and QR manufactures
+    # junk directions with arbitrary (even sub-spectrum) Ritz values.
+    M = max(1, min(int(max_iter), int(n) // bs))
     T_size = bs * M
     if min_iter is None:
         min_iter = max(2 * check_every, max(1, n_eig // bs + 1))
-    min_iter = int(min_iter)
+    min_iter = int(min(min_iter, M))
 
     key = jax.random.PRNGKey(seed)
     k1, k2 = jax.random.split(key)
