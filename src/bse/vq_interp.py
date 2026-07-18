@@ -314,11 +314,13 @@ def _batched_vq_relF(ZG, v_all, V_ref, q_chunk=48):
     return np.concatenate(out)
 
 
-def build_cq(zx):
+def build_cq(zx, q_chunk=48):
     """C_q Gram rebuild from ψ at centroids (reference ``build_cq``,
     order-robust R-space route, arithmetic verbatim — evaluated on device,
-    one host round-trip; the R-space intermediate P_R is
-    nq·ns²·n_μ²·16 B ≈ 3.8 GB at MoS2 12×12, device-resident only):
+    q-CHUNK-accumulated: P_R = Σ_q e^{2πi q·R} Pk(q) is summed chunkwise
+    with a donated accumulator, so peak device residency is the P_R
+    intermediate (nR·ns²·n_μ²·16 B ≈ 3.8 GB at MoS2 12×12) plus ONE ψ/Pk
+    chunk — never full-ψ (9.4 GB at the nb=80 fit window) + full-Pk):
         C_q[μν] = Σ_{k,mn} conj(ρ_kmn(r_μ)) ρ_kmn(r_ν),
         ρ_kmn(r) = Σ_s conj(u_{m, wrap(k−q), s}(r)) u_{n, k, s}(r)
     with stored cell-periodic spinors at WRAPPED k labels (torus
@@ -328,22 +330,29 @@ def build_cq(zx):
     Rall = np.array([[rx, ry, rz] for rx in range(kg[0])
                      for ry in range(kg[1]) for rz in range(kg[2])])
     Rw = ((Rall + kg // 2) % kg) - (kg // 2)
+    nR = len(Rw)
     EqR_np = np.exp(2j * np.pi * (zx["qfr"] @ Rw.T))
 
-    @jax.jit
-    def _cq(psi, EqR):
-        psiX = jnp.conj(psi).transpose(0, 3, 1, 2)
-        Pk = jnp.einsum("kmna,knbr->karmb", psiX, psi)
-        P_R = (EqR.T @ Pk.reshape(nq, -1)).reshape(len(Rw), ns, n_mu,
-                                                   n_mu, ns)
-        C_R = jnp.einsum("ravmb,ravmb->rvm", jnp.conj(P_R), P_R)
-        C_q = jnp.transpose(((jnp.conj(EqR) / nq)
-                             @ C_R.reshape(len(Rw), -1)
-                             ).reshape(nq, n_mu, n_mu), (0, 2, 1))
-        return C_q
+    @partial(jax.jit, donate_argnums=(0,))
+    def _pr_acc(P_R, psi_c, EqR_c):
+        psiX = jnp.conj(psi_c).transpose(0, 3, 1, 2)
+        Pk = jnp.einsum("kmna,knbr->karmb", psiX, psi_c)
+        return P_R + (EqR_c.T @ Pk.reshape(Pk.shape[0], -1)
+                      ).reshape(P_R.shape)
 
-    return np.asarray(jax.device_get(_cq(jnp.asarray(zx["psi"]),
-                                         jnp.asarray(EqR_np))))
+    @jax.jit
+    def _cq_final(P_R, EqR):
+        C_R = jnp.einsum("ravmb,ravmb->rvm", jnp.conj(P_R), P_R)
+        return jnp.transpose(((jnp.conj(EqR) / nq)
+                              @ C_R.reshape(nR, -1)
+                              ).reshape(nq, n_mu, n_mu), (0, 2, 1))
+
+    P_R = jnp.zeros((nR, ns, n_mu, n_mu, ns), dtype=jnp.complex128)
+    for q0 in range(0, nq, q_chunk):
+        sl = slice(q0, min(q0 + q_chunk, nq))
+        P_R = _pr_acc(P_R, jnp.asarray(zx["psi"][sl]),
+                      jnp.asarray(EqR_np[sl]))
+    return np.asarray(jax.device_get(_cq_final(P_R, jnp.asarray(EqR_np))))
 
 
 def kq_index(zx, ki, qi):
@@ -408,15 +417,26 @@ def run_gates(zx, C_q):
         1e-9)
     vd = _batched_vq_relF(zx["ZG"], v_sphere_padded(zx), zx["Vqmunu"])
     log("makeVq_vs_disk_Vqmunu_allq_max", float(np.max(vd)), 5e-6)
-    # X^H X == C_q (torus convention) at q=0
+    # X^H X == C_q (torus convention) at q=0 — device Gram, k-CHUNK
+    # accumulated (the host loop + serial-BLAS zgemm cost 13.7 s at 12×12;
+    # the un-chunked X tensor would be nk·nb²·n_μ·16 B ≈ 14.7 GB at the
+    # nb=80 fit window — never materialized)
     q = 0
-    X = np.empty((zx["nk"], zx["nb"], zx["nb"], zx["n_mu"]),
-                 dtype=np.complex128)
-    for k in range(zx["nk"]):
-        kq = kq_index(zx, k, q)
-        X[k] = np.einsum("nsm,Msm->nMm", np.conj(zx["psi"][kq]), zx["psi"][k])
-    X = X.reshape(-1, zx["n_mu"])
-    log("XHX_vs_Cq_torus_q0", relF(np.conj(X.T) @ X, C_q[0]), 1e-8)
+    kqs = np.array([kq_index(zx, k, q) for k in range(zx["nk"])])
+
+    @partial(jax.jit, donate_argnums=(0,))
+    def _xhx_acc(G, psi_kq_c, psi_c):
+        X = jnp.einsum("knsm,kMsm->knMm", jnp.conj(psi_kq_c), psi_c)
+        Xf = X.reshape(-1, X.shape[-1])
+        return G + jnp.conj(Xf).T @ Xf
+
+    G = jnp.zeros((zx["n_mu"], zx["n_mu"]), dtype=jnp.complex128)
+    for k0 in range(0, zx["nk"], 16):
+        sl = slice(k0, min(k0 + 16, zx["nk"]))
+        G = _xhx_acc(G, jnp.asarray(zx["psi"][kqs[sl]]),
+                     jnp.asarray(zx["psi"][sl]))
+    log("XHX_vs_Cq_torus_q0",
+        relF(np.asarray(jax.device_get(G)), C_q[0]), 1e-8)
     for q in range(2):
         v, n = v_sphere(zx, q)
         vs, _ = v_sphere(zx, q, kind="slab_sr", alpha=0.63)
