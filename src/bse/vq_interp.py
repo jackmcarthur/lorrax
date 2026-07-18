@@ -9,11 +9,12 @@ form factors → closed-form assembly at any Q.  Arithmetic is preserved from
 the reference (whose acceptance run reproduces the §13 pins to every printed
 digit); this module adds the production seams:
 
-  * ``prepare_coarse`` runs on-device with ``P('x','y')``-sharded n_μ² tiles;
-    the per-coarse-q eigh goes through a selectable distributed-linalg
-    backend (``eigh_backend = auto|off|cusolvermp|slate`` — same dispatch
-    convention as the ζ-fit solve paths in ``isdf.core``), and the Π V Π /
-    split GEMMs are sharded matmuls on the same layout.
+  * ``prepare_coarse`` runs on-device q-BATCHED: the coarse q axis is
+    sharded ``P(('x','y'))`` over all mesh devices and each device eighs +
+    cleans + splits its own q-shard collective-free, in chunks with one
+    host round-trip each (``auto`` = this batched native path; the
+    distributed-FFI backends ``cusolvermp|slate`` stay available by
+    explicit request for tiles too large to eigh replicated).
   * ``fit_lr_model`` (the b26p LSQ) stays HOST/replicated on purpose: the
     normal blocks are (n_b ≤ 10)² per (G_z, q) — a few kilobytes, O(10⁶)
     flops total — and the solved coefficients are (n_b, n_μ) ≈ tens of kB.
@@ -276,28 +277,73 @@ def make_vq(zx, zt, q, kind="slab", alpha=None):
     return np.conj(A) @ A.T
 
 
+def v_sphere_padded(zx, kind="slab", alpha=None):
+    """Kernel rows on every stored sphere, zero-padded to ``ngkmax``:
+    (nq, ngkmax) with v = 0 beyond ngk[q].  The zero pad makes batched
+    A = ZG·√v identical to the per-q truncated ``make_vq`` factor (pad
+    channels multiply any stored junk columns to exact zeros)."""
+    v_all = np.zeros((zx["nq"], zx["ngkmax"]))
+    for q in range(zx["nq"]):
+        v, n = v_sphere(zx, q, kind, alpha)
+        v_all[q, :n] = v[:n]
+    return v_all
+
+
+def _batched_vq_relF(ZG, v_all, V_ref, q_chunk=48):
+    """relF(make_vq(q), V_ref[q]) for every q — the per-q tile rebuild
+    V = conj(A)A^T, A = ZG·√v, batched on device in q chunks (same
+    arithmetic as the host ``make_vq`` loop it replaces; measured 18.9 s →
+    ~2 s at MoS2 12×12)."""
+
+    @jax.jit
+    def _chunk(ZG_b, v_b, Vd_b):
+        A = ZG_b * jnp.sqrt(v_b)[:, None, :]
+        V = jnp.einsum("bmg,bng->bmn", jnp.conj(A), A)
+        d = V - Vd_b
+        num = jnp.linalg.norm(d.reshape(d.shape[0], -1), axis=1)
+        den = jnp.linalg.norm(Vd_b.reshape(Vd_b.shape[0], -1), axis=1)
+        return num / den
+
+    nq = ZG.shape[0]
+    out = []
+    for q0 in range(0, nq, q_chunk):
+        sl = slice(q0, min(q0 + q_chunk, nq))
+        out.append(np.asarray(jax.device_get(_chunk(
+            jnp.asarray(ZG[sl]), jnp.asarray(v_all[sl]),
+            jnp.asarray(V_ref[sl])))))
+    return np.concatenate(out)
+
+
 def build_cq(zx):
     """C_q Gram rebuild from ψ at centroids (reference ``build_cq``,
-    order-robust R-space route, arithmetic verbatim):
+    order-robust R-space route, arithmetic verbatim — evaluated on device,
+    one host round-trip; the R-space intermediate P_R is
+    nq·ns²·n_μ²·16 B ≈ 3.8 GB at MoS2 12×12, device-resident only):
         C_q[μν] = Σ_{k,mn} conj(ρ_kmn(r_μ)) ρ_kmn(r_ν),
         ρ_kmn(r) = Σ_s conj(u_{m, wrap(k−q), s}(r)) u_{n, k, s}(r)
     with stored cell-periodic spinors at WRAPPED k labels (torus
     convention, no umklapp phases; gate: X^H X == C_q)."""
-    psi = zx["psi"]
     nq, nb, ns, n_mu = zx["nq"], zx["nb"], zx["ns"], zx["n_mu"]
     kg = zx["kgrid"]
-    psiX = np.conj(psi).transpose(0, 3, 1, 2)
-    Pk = np.einsum("kmna,knbr->karmb", psiX, psi, optimize=True)
     Rall = np.array([[rx, ry, rz] for rx in range(kg[0])
                      for ry in range(kg[1]) for rz in range(kg[2])])
     Rw = ((Rall + kg // 2) % kg) - (kg // 2)
-    EqR = np.exp(2j * np.pi * (zx["qfr"] @ Rw.T))
-    P_R = (EqR.T @ Pk.reshape(nq, -1)).reshape(len(Rw), ns, n_mu, n_mu, ns)
-    C_R = np.einsum("ravmb,ravmb->rvm", np.conj(P_R), P_R, optimize=True)
-    C_q = np.transpose(((np.exp(-2j * np.pi * (zx["qfr"] @ Rw.T)) / nq)
-                        @ C_R.reshape(len(Rw), -1)
-                        ).reshape(nq, n_mu, n_mu), (0, 2, 1))
-    return C_q
+    EqR_np = np.exp(2j * np.pi * (zx["qfr"] @ Rw.T))
+
+    @jax.jit
+    def _cq(psi, EqR):
+        psiX = jnp.conj(psi).transpose(0, 3, 1, 2)
+        Pk = jnp.einsum("kmna,knbr->karmb", psiX, psi)
+        P_R = (EqR.T @ Pk.reshape(nq, -1)).reshape(len(Rw), ns, n_mu,
+                                                   n_mu, ns)
+        C_R = jnp.einsum("ravmb,ravmb->rvm", jnp.conj(P_R), P_R)
+        C_q = jnp.transpose(((jnp.conj(EqR) / nq)
+                             @ C_R.reshape(len(Rw), -1)
+                             ).reshape(nq, n_mu, n_mu), (0, 2, 1))
+        return C_q
+
+    return np.asarray(jax.device_get(_cq(jnp.asarray(zx["psi"]),
+                                         jnp.asarray(EqR_np))))
 
 
 def kq_index(zx, ki, qi):
@@ -360,8 +406,7 @@ def run_gates(zx, C_q):
                 for q in range(zx["nq"]))
     log("sphere_max|q+G|^2_minus_cutoff", max(0.0, k2max - zx["zeta_cutoff"]),
         1e-9)
-    vd = [relF(make_vq(zx, zx["ZG"][q], q), zx["Vqmunu"][q])
-          for q in range(zx["nq"])]
+    vd = _batched_vq_relF(zx["ZG"], v_sphere_padded(zx), zx["Vqmunu"])
     log("makeVq_vs_disk_Vqmunu_allq_max", float(np.max(vd)), 5e-6)
     # X^H X == C_q (torus convention) at q=0
     q = 0
@@ -423,10 +468,16 @@ def _sphere_slot(zx, q, GS):
 def _eigh_backend(C_dev, mesh_xy: Mesh, backend: str):
     """One Hermitian eigendecomposition, backend-dispatched.
 
-    ``auto``       → distributed cusolvermp on a true-2D SQUARE mesh,
-                     native (replicated) ``jnp.linalg.eigh`` otherwise —
-                     mirrors ``isdf.core._resolve_solver_kind_charge``.
-    ``off``        → force native jnp.linalg.eigh (replicated).
+    ``off``        → native jnp.linalg.eigh (replicated).  Also what
+                     ``auto`` resolves to in ``prepare_coarse``: the coarse
+                     C_q tiles are n_μ² (≈ 640²), where the q-BATCHED native
+                     path (every device eigh-ing its own q-shard) beats a
+                     distributed single-tile eigh — the FFI backends' regime
+                     is n_μ large enough that one tile must be distributed.
+                     They stay available by explicit request; note the
+                     cusolverMp FFI needs one JAX process per device (a
+                     single-process 2×2 driver mesh cannot use it — the
+                     12×12 smoke trap, WORKLOG 2026-07-18).
     ``cusolvermp`` → force the cusolverMp FFI (square 2-D mesh only).
     ``slate``      → force the SLATE FFI (portable backend, explicit-only).
 
@@ -435,19 +486,14 @@ def _eigh_backend(C_dev, mesh_xy: Mesh, backend: str):
     layout), SLATE already returns columns.  Output R is left sharded
     ``P('x','y')`` on FFI paths, replicated on the native path.
     """
-    px = int(mesh_xy.shape["x"]); py = int(mesh_xy.shape["y"])
-    is_2d_square = (px >= 2 and px == py)
-    kind = backend
-    if backend == "auto":
-        kind = "cusolvermp" if is_2d_square else "off"
-    if kind == "off":
+    if backend == "off":
         lam, R = jnp.linalg.eigh(C_dev)
         return lam, R
-    if kind == "cusolvermp":
+    if backend == "cusolvermp":
         from ffi.cusolvermp.eigh import distributed_eigh
         lam, Qraw = distributed_eigh(C_dev, mesh=mesh_xy)
         return lam, jnp.conj(Qraw).T          # raw buffer → column eigenvectors
-    if kind == "slate":
+    if backend == "slate":
         from ffi.slate.eigh import distributed_eigh
         lam, Q = distributed_eigh(C_dev, mesh=mesh_xy)
         return lam, Q                          # already true columns
@@ -455,7 +501,7 @@ def _eigh_backend(C_dev, mesh_xy: Mesh, backend: str):
 
 
 def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
-                   eigh_backend: str = "auto"):
+                   eigh_backend: str = "auto", q_chunk: int = 48):
     """STAGE 1.  Returns the coarse-side bundle ``prep``:
       S        (nq, n_μ, n_μ)  Tikhonov cleaning operators S_q (host copy,
                                nulls only)
@@ -468,69 +514,104 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
       W        (nq, nG)        LSQ weights v_LR(q+G) (head slot → 0)
       gz_cols  {gz: cols}      per-G_z column index into GS
 
-    Per-coarse-q linear algebra runs ON DEVICE with ``P('x','y')``-sharded
-    n_μ² tiles: eigh via ``_eigh_backend`` (distributed FFI on 2-D meshes),
-    then S_q = (R·g)R^H, V_c = conj(S)(V_ref − V_LR)conj(S) as sharded
-    GEMMs.  V_ref/V_LR are built from the stored ζ sphere as one
-    (n_μ × n_G) GEMM each.  n_μ is used at its LOGICAL extent here; the
-    jitted evaluator pads on output.
+    The per-coarse-q linear algebra is q-BATCHED on device in chunks of
+    ``q_chunk``, sharded ``P(('x','y'))`` on the q axis (each device owns its
+    q-shard end to end — eigh, S_q = R g_ε(Λ) R^H, V_c = conj(S)(V_ref −
+    V_LR)conj(S), ζ̃-cleaning, and the phase-factored superset gather all
+    run without collectives), with ONE host round-trip per chunk.  The
+    per-q sphere is zero-padded to ``ngkmax`` (pad channels carry v = 0, so
+    they contribute exact zeros — same arithmetic as the per-q truncation)
+    which keeps the whole stage at ≤2 XLA compiles instead of one per
+    distinct sphere size (15 at MoS2 12×12; the ``_clean_split`` census
+    finding).  ``eigh_backend='auto'`` resolves to the batched native path —
+    see ``_eigh_backend`` for when the distributed FFI backends make sense;
+    they are honored per-q if explicitly requested.  n_μ is used at its
+    LOGICAL extent here; the jitted evaluator pads on output.
     """
     nq, n_mu = zx["nq"], zx["n_mu"]
+    ngkmax = zx["ngkmax"]
     assert np.max(np.abs(zx["qfr"][:, 2])) < 1e-12, "slab pipeline needs q_z=0"
     GS = lr_gset(zx, alpha)
     nG = GS.shape[1]
     grid_xy = NamedSharding(mesh_xy, P("x", "y"))
-    row_x = NamedSharding(mesh_xy, P("x", None))
+    qb1 = NamedSharding(mesh_xy, P(("x", "y")))
+    qb2 = NamedSharding(mesh_xy, P(("x", "y"), None))
+    qb3 = NamedSharding(mesh_xy, P(("x", "y"), None, None))
 
-    @partial(jax.jit, out_shardings=(grid_xy, row_x))
-    def _clean_split(C_h, lam, R, A_ref, A_lr, ZGq):
+    # ── host geometry/kernel prep (cheap per-q numpy vector math) ────────
+    # v rows zero-padded to ngkmax (``v_sphere_padded``): pad channels
+    # multiply the (possibly junk) stored ZG columns beyond ngk[q] to exact
+    # zeros.  Superset slots outside the sphere map to the appended zero
+    # column (slot ngkmax).
+    v_ref_all = v_sphere_padded(zx)
+    v_lr_all = v_sphere_padded(zx, kind="slab_lr", alpha=alpha)
+    idx_all = np.empty((nq, nG), dtype=np.int64)
+    W = np.empty((nq, nG))
+    n_out = 0
+    for q in range(nq):
+        idx = _sphere_slot(zx, q, GS)
+        n_out += int(np.sum(idx < 0))
+        idx_all[q] = np.where(idx < 0, ngkmax, idx)
+        W[q] = v_slab_on_set(zx, zx["qfr"][q], GS, kind="slab_lr", alpha=alpha)
+
+    rmu = jnp.asarray(zx["rmu_frac"])                    # (n_μ, 3) trace const
+    GS_f = jnp.asarray(GS.T.astype(np.float64))          # (nG, 3) trace const
+
+    @partial(jax.jit, out_shardings=(qb2, qb3))
+    def _eigh_batch(C):
+        C = jax.lax.with_sharding_constraint(C, qb3)
+        lam, R = jnp.linalg.eigh(C)
+        return lam, R
+
+    @partial(jax.jit, out_shardings=(qb3, qb3, qb3))
+    def _clean_split(lam, R, ZGq, v_ref, v_lr, idx, qfr_b):
         # S_q = R g_ε(Λ) R^H  (analytic Tikhonov filter of C_q; §12.3)
-        g = lam ** 2 / (lam ** 2 + (eps_tik * lam.max()) ** 2)
-        S = (R * g[None, :]) @ jnp.conj(R).T
-        S = jax.lax.with_sharding_constraint(S, grid_xy)
+        g = lam ** 2 / (lam ** 2
+                        + (eps_tik * lam.max(axis=1, keepdims=True)) ** 2)
+        S = jnp.einsum("bmr,br,bnr->bmn", R, g, jnp.conj(R))
         Sc = jnp.conj(S)
         # V_ref − V_LR from the sphere factors A = ζ̃√v  (V = conj(A)A^T)
-        V_delta = jnp.conj(A_ref) @ A_ref.T - jnp.conj(A_lr) @ A_lr.T
-        V_delta = jax.lax.with_sharding_constraint(V_delta, grid_xy)
+        A_ref = ZGq * jnp.sqrt(v_ref)[:, None, :]
+        A_lr = ZGq * jnp.sqrt(v_lr)[:, None, :]
+        V_delta = jnp.einsum("bmg,bng->bmn", jnp.conj(A_ref), A_ref) \
+            - jnp.einsum("bmg,bng->bmn", jnp.conj(A_lr), A_lr)
         V_SRc = Sc @ V_delta @ Sc
         zt = S @ ZGq                     # cleaned ζ̃ on the sphere (rows μ)
-        return V_SRc, zt
+        # (c) phase-factored cleaned form factors on the superset
+        zt_ext = jnp.concatenate(
+            [zt, jnp.zeros((zt.shape[0], n_mu, 1), zt.dtype)], axis=2)
+        ztg = jnp.take_along_axis(zt_ext, idx[:, None, :], axis=2)
+        qG = qfr_b[:, None, :] + GS_f[None, :, :]        # (b, nG, 3)
+        ph = jnp.exp(2j * jnp.pi * jnp.einsum("mi,bgi->bmg", rmu, qG))
+        return S, V_SRc, ph * ztg
 
     S_np = np.empty((nq, n_mu, n_mu), dtype=np.complex128)
     V_SRc_np = np.empty((nq, n_mu, n_mu), dtype=np.complex128)
     Fch = np.empty((nq, n_mu, nG), dtype=np.complex128)
-    W = np.empty((nq, nG))
-    n_out = 0
-    for q in range(nq):
-        C_h = 0.5 * (C_q[q] + C_q[q].conj().T)
-        C_dev = jax.device_put(jnp.asarray(C_h), grid_xy)
-        lam, R = _eigh_backend(C_dev, mesh_xy, eigh_backend)
-        # sphere factors for V_ref and V_LR (host kernel eval, device GEMM)
-        v_ref, n = v_sphere(zx, q)
-        v_lr, _ = v_sphere(zx, q, kind="slab_lr", alpha=alpha)
-        ZGq = zx["ZG"][q][:, :n]
-        A_ref = jnp.asarray(ZGq * np.sqrt(v_ref)[None, :n])
-        A_lr = jnp.asarray(ZGq * np.sqrt(v_lr)[None, :n])
-        V_SRc_q, zt = _clean_split(C_dev, lam, R,
-                                   jax.device_put(A_ref, row_x),
-                                   jax.device_put(A_lr, row_x),
-                                   jax.device_put(jnp.asarray(ZGq), row_x))
-        V_SRc_np[q] = np.asarray(jax.device_get(V_SRc_q))
-        # host copy of S for the null battery (S = (R·g)R^H rebuilt cheaply)
-        lam_h = np.asarray(jax.device_get(lam))
-        R_h = np.asarray(jax.device_get(R))
-        g_h = lam_h ** 2 / (lam_h ** 2 + (eps_tik * lam_h.max()) ** 2)
-        S_np[q] = (R_h * g_h[None, :]) @ R_h.conj().T
-        # (c) phase-factored cleaned form factors on the superset (host)
-        zt_h = np.zeros((n_mu, zx["ngkmax"]), dtype=np.complex128)
-        zt_h[:, :n] = np.asarray(jax.device_get(zt))
-        idx = _sphere_slot(zx, q, GS)
-        n_out += int(np.sum(idx < 0))
-        zt_ext = np.concatenate([zt_h, np.zeros((n_mu, 1), np.complex128)], 1)
-        qG = zx["qfr"][q][None, :] + GS.T.astype(np.float64)
-        ph = np.exp(2j * np.pi * (zx["rmu_frac"] @ qG.T))
-        Fch[q] = ph * zt_ext[:, idx]
-        W[q] = v_slab_on_set(zx, zx["qfr"][q], GS, kind="slab_lr", alpha=alpha)
+    C_herm = 0.5 * (C_q + np.conj(np.swapaxes(C_q, 1, 2)))
+    for q0 in range(0, nq, q_chunk):
+        sl = slice(q0, min(q0 + q_chunk, nq))
+        if eigh_backend in ("auto", "off"):
+            lam, R = _eigh_batch(jax.device_put(jnp.asarray(C_herm[sl]), qb3))
+        else:
+            # explicit distributed-FFI request: per-q eigh, then the same
+            # batched post-eigh pipeline (single source for the math).
+            pairs = [_eigh_backend(jax.device_put(jnp.asarray(C_herm[q]),
+                                                  grid_xy),
+                                   mesh_xy, eigh_backend)
+                     for q in range(sl.start, sl.stop)]
+            lam = jnp.stack([p[0] for p in pairs])
+            R = jnp.stack([p[1] for p in pairs])
+        S_b, V_b, F_b = _clean_split(
+            lam, R,
+            jax.device_put(jnp.asarray(zx["ZG"][sl]), qb3),
+            jax.device_put(jnp.asarray(v_ref_all[sl]), qb2),
+            jax.device_put(jnp.asarray(v_lr_all[sl]), qb2),
+            jax.device_put(jnp.asarray(idx_all[sl]), qb2),
+            jax.device_put(jnp.asarray(zx["qfr"][sl]), qb2))
+        S_np[sl] = np.asarray(jax.device_get(S_b))
+        V_SRc_np[sl] = np.asarray(jax.device_get(V_b))
+        Fch[sl] = np.asarray(jax.device_get(F_b))
     tail = float(np.exp(-zx["zeta_cutoff"] / (4.0 * alpha ** 2)))
     print(f"  [prep] gset({alpha}) = {nG} G; {n_out} out-of-sphere (q,G) "
           f"channels zero-filled; sphere-tail bound {tail:.1e}")
@@ -774,15 +855,33 @@ def run_nulls(zx, prep, des, coeffs):
     # own F rebuild == cleaned LR tile (channel machinery consistency;
     # bounded by the out-of-sphere zero-fill)
     rr = []
-    for q in range(zx["nq"]):
-        Sc = np.conj(prep["S"][q])
-        VLRc = Sc @ make_vq(zx, zx["ZG"][q], q, kind="slab_lr",
-                            alpha=prep["alpha"]) @ Sc
-        qG = zx["qfr"][q][None, :] + prep["GS"].T.astype(np.float64)
-        zt = np.exp(-2j * np.pi * (zx["rmu_frac"] @ qG.T)) * prep["Fch"][q]
-        v = prep["W"][q]
-        A = zt * np.sqrt(v)[None, :]
-        rr.append(relF(np.conj(A) @ A.T, VLRc))
+    # own F rebuild vs Sc·V_LR·Sc, batched on device in q chunks (same
+    # per-q arithmetic as the host loop it replaces; 6.9 s → ~1 s at 12×12)
+    v_lr_all = v_sphere_padded(zx, kind="slab_lr", alpha=prep["alpha"])
+    GS_f = jnp.asarray(prep["GS"].T.astype(np.float64))
+    rmu = jnp.asarray(zx["rmu_frac"])
+
+    @jax.jit
+    def _rebuild_chunk(ZG_b, v_b, S_b, Fch_b, W_b, qfr_b):
+        A_lr = ZG_b * jnp.sqrt(v_b)[:, None, :]
+        VLR = jnp.einsum("bmg,bng->bmn", jnp.conj(A_lr), A_lr)
+        Sc = jnp.conj(S_b)
+        VLRc = Sc @ VLR @ Sc
+        qG = qfr_b[:, None, :] + GS_f[None, :, :]
+        zt = jnp.exp(-2j * jnp.pi
+                     * jnp.einsum("mi,bgi->bmg", rmu, qG)) * Fch_b
+        A = zt * jnp.sqrt(W_b)[:, None, :]
+        V = jnp.einsum("bmg,bng->bmn", jnp.conj(A), A)
+        d = (V - VLRc).reshape(V.shape[0], -1)
+        return (jnp.linalg.norm(d, axis=1)
+                / jnp.linalg.norm(VLRc.reshape(VLRc.shape[0], -1), axis=1))
+
+    for q0 in range(0, zx["nq"], 48):
+        sl = slice(q0, min(q0 + 48, zx["nq"]))
+        rr.extend(np.asarray(jax.device_get(_rebuild_chunk(
+            jnp.asarray(zx["ZG"][sl]), jnp.asarray(v_lr_all[sl]),
+            jnp.asarray(prep["S"][sl]), jnp.asarray(prep["Fch"][sl]),
+            jnp.asarray(prep["W"][sl]), jnp.asarray(zx["qfr"][sl])))))
     log("F_own_rebuild_vs_cleaned_LR_tile_max", float(np.max(rr)), 1e-6)
     assert ok, "vq_interp null battery FAILED — stop"
 
