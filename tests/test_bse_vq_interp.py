@@ -105,17 +105,20 @@ def test_eval_jit_parity_sharding_census(vq_state):
 
 @pytest.mark.gpu
 def test_eval_on_grid_is_stencil_exact(vq_state):
-    """At a TRAINING q with full training, the trig stencil is a delta:
-    the SR part returns that q's own cleaned tile exactly (null-level)."""
+    """With a grid-RESOLVING R set the trig stencil is a delta: the SR
+    part returns a training q's own cleaned tile exactly (the reference
+    run_nulls exact-stencil identity, pytest-visible).  The production
+    nR7 stencil is a least-squares fit — NOT a delta at full training —
+    so exactness is asserted on the full R lattice only."""
     vqi, zx = vq_state["vqi"], vq_state["zx"]
     prep, des, coeffs = vq_state["prep"], vq_state["des"], vq_state["coeffs"]
     q0 = 2
-    V = vqi.eval_vq_host(zx, prep, des, coeffs, zx["qfr"][q0])
-    # subtract the model LR: what remains must be V_SRc[q0] to stencil
-    # exactness (the model LR is smooth — identical arithmetic both sides)
-    R7 = vqi.stencil_r7(zx)
-    pinvF = vqi.stencil_pinv(zx["qfr"], R7)
-    w = np.exp(-2j * np.pi * (zx["qfr"][q0] @ R7.T)) @ pinvF
+    kg = zx["kgrid"]
+    Rfull = np.array([[i - kg[0] // 2, j - kg[1] // 2, 0]
+                      for i in range(kg[0]) for j in range(kg[1])])
+    pinvF = vqi.stencil_pinv(zx["qfr"], Rfull)
+    w = np.exp(-2j * np.pi * (zx["qfr"][q0] @ Rfull.T)) @ pinvF
     V_SR = np.tensordot(w, prep["V_SRc_np"], axes=(0, 0))
     assert vqi.relF(V_SR, prep["V_SRc_np"][q0]) <= 1e-9
+    V = vqi.eval_vq_host(zx, prep, des, coeffs, zx["qfr"][q0])
     assert np.isfinite(np.linalg.norm(V))
