@@ -157,30 +157,31 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
 def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
                             n_rmu_pad, mesh_xy):
     """Reshape the htransform bundle over the concatenated {k+Q} list into
-    per-Q conduction caches, padded to the loader's mesh extents.
+    per-Q conduction caches, padded to the loader's mesh extents — one
+    jitted reshape+pad+reshard, no host round-trip (the bundle stays on
+    device; at 40 path points the old device_get→np.pad→2×device_put moved
+    ~1.7 GB through the host).
 
     Returns (psi_cQ_X, psi_cQ_Y, eps_cQ):
         psi_cQ_[XY]: (nQ, nk, nc_pad, ns, n_rmu_pad), μ on x / y
         eps_cQ:      (nQ, nk, nc_pad) — pad bands at +PAD_EPS_GUARD_RY
     """
-    psi = np.asarray(jax.device_get(bundle.psi_rmu_Y))    # (nQ·nk, nc, ns, n_μ)
-    eps = np.asarray(jax.device_get(bundle.enk_full))     # (nQ·nk, nc)
-    ns = psi.shape[2]
-    psi = psi.reshape(nQ, nk, n_cond, ns, n_rmu)
-    eps = eps.reshape(nQ, nk, n_cond)
-    if n_rmu_pad > n_rmu:
-        psi = np.pad(psi, ((0, 0),) * 4 + ((0, n_rmu_pad - n_rmu),))
-    if n_cond_pad > n_cond:
-        psi = np.pad(psi, ((0, 0), (0, 0), (0, n_cond_pad - n_cond),
-                           (0, 0), (0, 0)))
-        eps = np.pad(eps, ((0, 0), (0, 0), (0, n_cond_pad - n_cond)),
-                     constant_values=PAD_EPS_GUARD_RY)
     x5 = NamedSharding(mesh_xy, P(None, None, None, None, "x"))
     y5 = NamedSharding(mesh_xy, P(None, None, None, None, "y"))
     rep = NamedSharding(mesh_xy, P())
-    psi_j = jnp.asarray(psi)
-    return (jax.device_put(psi_j, x5), jax.device_put(psi_j, y5),
-            jax.device_put(jnp.asarray(eps), rep))
+
+    @partial(jax.jit, out_shardings=(x5, y5, rep))
+    def _stacks(psi, eps):
+        ns = psi.shape[2]
+        psi = psi.reshape(nQ, nk, n_cond, ns, n_rmu)
+        eps = eps.reshape(nQ, nk, n_cond)
+        psi = jnp.pad(psi, ((0, 0), (0, 0), (0, n_cond_pad - n_cond),
+                            (0, 0), (0, n_rmu_pad - n_rmu)))
+        eps = jnp.pad(eps, ((0, 0), (0, 0), (0, n_cond_pad - n_cond)),
+                      constant_values=PAD_EPS_GUARD_RY)
+        return psi, psi, eps
+
+    return _stacks(bundle.psi_rmu_Y, bundle.enk_full)
 
 
 def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data, log=print):
@@ -320,8 +321,8 @@ def main(argv=None):
               if np.linalg.norm(Qpath[i] - np.round(Qpath[i])) < 1e-9]
     if iGamma:
         gate_htransform_vs_stored(
-            np.asarray(jax.device_get(psi_cQ_X))[iGamma[0]],
-            np.asarray(jax.device_get(eps_cQ))[iGamma[0]], data)
+            np.asarray(jax.device_get(psi_cQ_X[iGamma[0]])),
+            np.asarray(jax.device_get(eps_cQ[iGamma[0]])), data)
 
     # ── V_Q tiles ────────────────────────────────────────────────────────
     t0 = time.time()
