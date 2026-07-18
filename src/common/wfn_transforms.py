@@ -864,7 +864,14 @@ def gflat_to_rmu(
             f"gflat_to_rmu: r_mu has out-of-range coords for "
             f"fft_grid {fft_grid_t}.")
 
-    cs       = int(chunk_size if chunk_size else N)
+    # Clamp the chunk to the actual row count: a chunk larger than the
+    # data only inflates the flat-axis zero-pad — and with it the
+    # per-iteration FFT box, which is sized cs·ns·n_rtot·16 B REGARDLESS
+    # of N (measured: the 3×3 nb=80 refit galerkin has N = 720 rows but
+    # an HBM-budget cs of 6103 → an 8.5× padded box, a 16.76 GiB fused
+    # alloc for ~1 GB of data).  No-op whenever cs ≤ N (production
+    # scale); pad rows are zeros truncated at out[:N] either way.
+    cs       = max(1, min(int(chunk_size if chunk_size else N), N))
     n_chunks = (N + cs - 1) // cs
     pad_N    = n_chunks * cs - N
 
@@ -1139,7 +1146,14 @@ def accumulate_rchunk_to_gflat(
             f"accumulate_rchunk_to_gflat: r-slab "
             f"[{int(r0)}, {int(r0) + r_len_i}) out of [0, {n_rtot}).")
 
-    cs       = int(chunk_size if chunk_size else N)
+    # Clamp the chunk to the actual row count: a chunk larger than the
+    # data only inflates the flat-axis zero-pad — and with it the
+    # per-iteration FFT box, which is sized cs·ns·n_rtot·16 B REGARDLESS
+    # of N (measured: the 3×3 nb=80 refit galerkin has N = 720 rows but
+    # an HBM-budget cs of 6103 → an 8.5× padded box, a 16.76 GiB fused
+    # alloc for ~1 GB of data).  No-op whenever cs ≤ N (production
+    # scale); pad rows are zeros truncated at out[:N] either way.
+    cs       = max(1, min(int(chunk_size if chunk_size else N), N))
     n_chunks = (N + cs - 1) // cs
     pad_N    = n_chunks * cs - N
 
