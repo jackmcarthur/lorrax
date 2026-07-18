@@ -93,9 +93,11 @@ def compute_wfns_fi(
                    internally (fH_q is exactly BZ-periodic, so wrapping is a
                    no-op on values; it keeps phases well-conditioned).
         return_coeffs: also return the rank-α eigenvector coefficients
-                   ``.coeffs_fi`` (nk_fi, rank, nb_fi), replicated — the
-                   per-q ζ-refit consumes them to rebuild ψ on the full
-                   r-grid through the streamed α-basis.
+                   ``.coeffs_fi`` (nk_fi, rank, nb_fi), sharded
+                   ``P(('x','y'))`` on the q axis like every ``_q_batch``
+                   output — the per-q ζ-refit consumes them to rebuild ψ on
+                   the full r-grid through the streamed α-basis (its chunk
+                   kernels reshard as needed).
         log_fn:    optional logger.
 
     Returns:
