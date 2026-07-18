@@ -951,10 +951,13 @@ def _refit_kernels(nk, nb, ns, n_mu, rank, r_chunk):
         return Xf, 0.5 * (C + jnp.conj(C).T)
 
     @jax.jit
-    def _z_chunk(c_m, B_chunk, psi_chunk, Xf):
+    def _psi_m_chunk(c_m, B_chunk):
         # ψ^{ht}_{m,k−q,s}(r) = Σ_α c_m[k,α,m] B_full[α,s,r]   (chunk of r)
-        psi_m = jnp.einsum("kam,asr->kmsr", c_m,
-                           B_chunk.reshape(rank, ns, r_chunk))
+        return jnp.einsum("kam,asr->kmsr", c_m,
+                          B_chunk.reshape(rank, ns, r_chunk))
+
+    @jax.jit
+    def _z_chunk(psi_m, psi_chunk, Xf):
         rho = jnp.einsum("kmsr,knsr->kmnr", jnp.conj(psi_m),
                          psi_chunk.reshape(nk, nb, ns, r_chunk))
         return jnp.conj(Xf).T @ rho.reshape(nk * nb * nb, r_chunk)
@@ -969,17 +972,23 @@ def _refit_kernels(nk, nb, ns, n_mu, rank, r_chunk):
         return jax.scipy.linalg.solve_triangular(
             jnp.conj(L).T, y, lower=False)
 
-    kernels = (_cq_and_x, _z_chunk, _solve_zeta)
+    kernels = (_cq_and_x, _psi_m_chunk, _z_chunk, _solve_zeta)
     _REFIT_KERNELS[key] = kernels
     return kernels
 
 
-def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print):
+def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
+             m_leg: str = "htransform"):
     """Ground-truth V at TILE momentum ``q_tile_frac`` via a per-Q ζ refit.
 
     Tile-momentum labeling matches ``V_qmunu`` / ``eval_vq``: the pair
     density carries conduction at wrap(k − q).  Returns the (n_μ, n_μ)
     host tile (Hermitian by construction).
+
+    ``m_leg``: ``"htransform"`` (production — works at ANY q) or
+    ``"stored"`` (on-grid q only: the m-leg is the stored grid ψ at the
+    wrapped index — the formulation-null configuration that isolates the
+    fit conventions from the htransform representation quality).
 
     On-grid null: ``refit_vq`` at a coarse q reproduces the stored
     ``V_qmunu[q]`` up to the Galerkin/htransform floor (printed by
@@ -995,39 +1004,65 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print):
     r_chunk = rst["r_chunk"]
     qw = np.asarray(q_tile_frac, dtype=np.float64)
     qw = qw - np.round(qw)
-    # m-leg q list: wrap(k − q) for every coarse k
-    k_frac = zx["k_int"].astype(np.float64) / zx["kgrid"][None, :]
-    qm_list = k_frac - qw[None, :]
-    bundle = compute_wfns_fi(
-        ctilde=rst["ctilde"], B_at_mu=rst["B_at_mu"],
-        enk_sigma=rst["enk_sigma"], kgrid_co=rst["kgrid_co"],
-        band_window_fi=(0, nb), mesh_xy=mesh_xy, q_list=qm_list,
-        return_coeffs=True)
-    psi_m_mu = jnp.asarray(bundle.psi_rmu_Y)          # (nk, nb, ns, n_μ)
-    c_m = jnp.asarray(bundle.coeffs_fi)               # (nk, rank, nb)
-
-    cq_and_x, z_chunk, solve_zeta = _refit_kernels(
-        nk, nb, ns, n_mu, rank, r_chunk)
-    Xf, C = cq_and_x(psi_m_mu, jnp.asarray(zx["psi"]))
     n_rp = rst["n_rp"]
+    cq_and_x, psi_m_chunk, z_chunk, solve_zeta = _refit_kernels(
+        nk, nb, ns, n_mu, rank, r_chunk)
+    psi_r = rst["psi_r"].reshape(nk, nb, ns, n_rp)
+    if m_leg == "stored":
+        kqs = np.array([kq_index_of_frac(zx, k_frac - qw) for k_frac in
+                        (zx["k_int"].astype(np.float64)
+                         / zx["kgrid"][None, :])])
+        psi_m_mu = jnp.asarray(zx["psi"][kqs])
+        c_m = None
+        psi_m_r = psi_r[jnp.asarray(kqs)]
+    else:
+        # m-leg q list: wrap(k − q) for every coarse k, via htransform
+        k_frac = zx["k_int"].astype(np.float64) / zx["kgrid"][None, :]
+        qm_list = k_frac - qw[None, :]
+        bundle = compute_wfns_fi(
+            ctilde=rst["ctilde"], B_at_mu=rst["B_at_mu"],
+            enk_sigma=rst["enk_sigma"], kgrid_co=rst["kgrid_co"],
+            band_window_fi=(0, nb), mesh_xy=mesh_xy, q_list=qm_list,
+            return_coeffs=True)
+        psi_m_mu = jnp.asarray(bundle.psi_rmu_Y)      # (nk, nb, ns, n_μ)
+        c_m = jnp.asarray(bundle.coeffs_fi)           # (nk, rank, nb)
+        psi_m_r = None
+
+    Xf, C = cq_and_x(psi_m_mu, jnp.asarray(zx["psi"]))
     Z_parts = []
     B_full = rst["B_full"].reshape(rank, ns, n_rp)
-    psi_r = rst["psi_r"].reshape(nk * nb, ns, n_rp)
+    psi_r_flat = rst["psi_r"].reshape(nk * nb, ns, n_rp)
     for r0 in range(0, n_rp, r_chunk):
+        if m_leg == "stored":
+            pm = psi_m_r[:, :, :, r0:r0 + r_chunk]
+        else:
+            pm = psi_m_chunk(
+                c_m,
+                B_full[:, :, r0:r0 + r_chunk].reshape(rank, ns * r_chunk))
         Z_parts.append(z_chunk(
-            c_m, B_full[:, :, r0:r0 + r_chunk].reshape(rank, ns * r_chunk),
-            psi_r[:, :, r0:r0 + r_chunk].reshape(nk * nb, ns * r_chunk), Xf))
+            pm,
+            psi_r_flat[:, :, r0:r0 + r_chunk].reshape(nk * nb, ns * r_chunk),
+            Xf))
     # Z columns are r slots of the PADDED grid; solve then trim the r pad
     # (pad columns are exact zeros — zero ψ ⇒ zero ρ ⇒ zero Z).
     Z = jnp.concatenate(Z_parts, axis=1)              # (n_μ, n_rp)
     zeta = solve_zeta(C, Z)[:, : rst["n_rtot"]]       # (n_μ, n_rtot)
-    # periodic-frame ζ̃ → sphere coefficients at qw → V tile
+    # periodic-frame ζ̃ → sphere coefficients at qw → V tile.
+    # STORED-ζ PHASE CONVENTION (derived from the recon/to_sphere round
+    # trip; the on-grid null pins it): the producer stores
+    #     ZG_μ(G) = e^{−2πi q·s_μ} · FFT_r[ζ̃_μ](G)
+    # i.e. the u-frame fit vector with the centroid winding phase folded
+    # in (the same e^{+i(q+G)·s_μ} the F-scheme later factors OUT).  The
+    # tile contraction conj(zt_μ) v zt_ν then carries e^{+iq·(s_μ−s_ν)}
+    # relative to the phase-free FFT — omitting it decorates V by that
+    # (μ,ν) phase (measured: 54% tile / 11% B error on the on-grid null).
     zeta_box = zeta.reshape(n_mu, zx["nx"], zx["ny"], zx["nz"])
     ztG_box = jnp.fft.fftn(zeta_box, axes=(1, 2, 3), norm="backward") \
         .reshape(n_mu, zx["n_rtot"])
     GS = _sphere_millers(zx, qw)
     fi = flat_idx(zx, GS)
     zt = np.asarray(jax.device_get(ztG_box[:, jnp.asarray(fi)]))
+    zt = np.exp(-2j * np.pi * (zx["rmu_frac"] @ qw))[:, None] * zt
     v = v_slab_on_set(zx, qw, GS)
     A = zt * np.sqrt(v)[None, :]
     V = np.conj(A) @ A.T
