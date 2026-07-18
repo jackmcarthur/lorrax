@@ -306,6 +306,20 @@ _DEFAULTS = {
     # cusolvermp_lu with values auto|on|off (on → cusolvermp).
     "distributed_cholesky": "auto",
     "distributed_lu":       "auto",
+    # Opt-in Tikhonov/ridge regularization of the charge-channel ζ-fit
+    # (relative ε; 0.0 = OFF = bit-identical historical fit).  When
+    # > 0 the fit solves the SPD normal equations (C²+ε_q²I)ζ = CZ,
+    # i.e. ζ = f_ε(C)Z with the spectral filter f_ε(λ) = λ/(λ²+ε²),
+    # with ε_q = zeta_ridge_eps · λ̂_max(C_q) per q (deterministic
+    # power-iteration λ̂, no eigh) — the "cleaned ζ" of the F-scheme
+    # study (physically inert at ε_rel 1e-4..1e-6-class on the MoS2/Si
+    # fixtures; improves V/W-tile q-covariance).  RELATIVE by design so
+    # it transfers to large systems (n_μ ~ 2e4): prefer the bottom of
+    # the window (1e-5..1e-6) there — the gapless Gram tail is longer
+    # and a too-large ε eats real signal.  Diagnose over-regularization
+    # by A/B-ing eqp/Σ_diag against zeta_ridge_eps = 0.
+    # Charge-only: rejected with bispinor = true (transverse follow-up).
+    "zeta_ridge_eps": 0.0,
     # Deprecated aliases (still parsed; warned at load; honored only when
     # the portable key above is left at "auto"):
     "cusolvermp_charge": "auto",   # auto | on | off
@@ -790,6 +804,11 @@ class BackendConfig:
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
     distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
+    # NOTE: unlike its neighbours this knob changes the SOLVED OPERATOR
+    # (Tikhonov normal equations), not just the backend — it lives here
+    # because it is consumed at the same ζ-fit solver plumbing site as
+    # distributed_cholesky/lu.  See DEFAULTS["zeta_ridge_eps"].
+    zeta_ridge_eps: float      # 0.0 = OFF (bit-identical stock fit)
 
     def summary(self) -> str:
         """One-line "what's active" for the run banner."""
@@ -799,7 +818,8 @@ class BackendConfig:
             f"screening_solver={self.screening_solver.value}, "
             f"distributed_cholesky={self.distributed_cholesky}, "
             f"distributed_lu={self.distributed_lu}, "
-            f"gamma_contract={self.gamma_contract_mode}"
+            f"gamma_contract={self.gamma_contract_mode}, "
+            f"zeta_ridge_eps={self.zeta_ridge_eps:g}"
         )
 
 
@@ -1340,6 +1360,29 @@ class LorraxConfig:
             # which beats silently running a different backend than the
             # input file says.
             _slab_io_choice = SlabIOBackend(_slab_io_in)
+        _zeta_ridge = float(_g("zeta_ridge_eps") or 0.0)
+        if _zeta_ridge < 0.0:
+            raise ValueError(
+                f"zeta_ridge_eps={_zeta_ridge:g} invalid; expected a "
+                f"RELATIVE ridge ≥ 0 (0 = off; tested inert window "
+                f"1e-6..1e-4).")
+        if _zeta_ridge > 1e-3:
+            # The F-scheme inert window was measured at ε_rel
+            # 1e-6..1e-3-class; beyond that the filter visibly rotates
+            # kernel blocks.  Warn, don't reject — diagnostics may want
+            # bigger ε on purpose.
+            print_fn(
+                f"  [config] WARNING: zeta_ridge_eps={_zeta_ridge:g} is "
+                f"above the tested inert window (≤1e-3-class); the ridge "
+                f"filter may eat physical signal.  A/B eqp against "
+                f"zeta_ridge_eps=0 before trusting results.")
+        if _zeta_ridge > 0.0 and bool(_g("bispinor")):
+            raise ValueError(
+                "zeta_ridge_eps > 0 with bispinor = true: the ζ-ridge is "
+                "charge-channel-only for now (the transverse indefinite-"
+                "CCT solve semantics need their own validation — see "
+                "isdf.core.factor_c_q).  Set zeta_ridge_eps = 0 for "
+                "bispinor runs.")
         backend = BackendConfig(
             slab_io=_slab_io_choice,
             gspace_io=GspaceIO(str(_g("gspace_mode")).strip().lower()),
@@ -1347,6 +1390,7 @@ class LorraxConfig:
             distributed_cholesky=_dist_chol,
             distributed_lu=_dist_lu,
             gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
+            zeta_ridge_eps=_zeta_ridge,
         )
         debug = DebugConfig(
             sigma_freq_debug_output=bool(_g("sigma_freq_debug_output")),

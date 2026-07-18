@@ -144,6 +144,7 @@ def fit_zeta_to_h5(
     gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
+    zeta_ridge_eps: float = 0.0,
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
@@ -194,6 +195,14 @@ def fit_zeta_to_h5(
                      holds more than one bc's ψ(G) on device.
         band_range_left: (start, end) for left wfns. Default: (b0, b3)
         band_range_right: (start, end) for right wfns. Default: (b0, b4)
+        zeta_ridge_eps: Opt-in Tikhonov ridge ε_rel for the ζ-fit
+            (cohsex.in ``zeta_ridge_eps``; 0.0 = OFF, bit-identical).
+            Charge channel only — loud-fails for vertex_mu_L ≠ 0.
+            When ON the fit solves (C²+ε_q²I)ζ = CZ with ε_q = ε_rel ·
+            λ̂_max(C_q); see ``isdf.core._zeta_ridge_normal_matrix``
+            for the exact spec and large-system guidance.  Memory: the
+            IBZ-sliced CCT (n_q_disk · n_rmu_padded² · 16 B) stays
+            alive through the r-chunk loop for the RHS premultiply.
 
     Returns:
         peak_bytes:  GPU high-water mark (peak_bytes_in_use) during chunk loop
@@ -206,6 +215,15 @@ def fit_zeta_to_h5(
     from gw.gw_config import SlabIOBackend
     if slab_io_backend is None:
         slab_io_backend = SlabIOBackend.H5PY_ALLGATHER
+
+    zeta_ridge_eps = float(zeta_ridge_eps)
+    if zeta_ridge_eps > 0.0 and int(vertex_mu_L) != 0:
+        # Charge-only for now — factor_c_q raises the same way; catch it
+        # here before any expensive setup.  See factor_c_q's
+        # zeta_ridge_eps docstring for the transverse rationale.
+        raise NotImplementedError(
+            f"zeta_ridge_eps={zeta_ridge_eps:g} with transverse channel "
+            f"μ_L={int(vertex_mu_L)}: the ζ-ridge is charge-only for now.")
 
     # P0 — entry of ζ-fit.  Captures the persistent state set up by
     # ``prepare_isdf_and_wavefunctions`` BEFORE ζ-fit starts: ψ at
@@ -422,14 +440,17 @@ def fit_zeta_to_h5(
             distributed_cholesky=distributed_cholesky,
             distributed_lu=distributed_lu)
         if int(vertex_mu_L) == 0:
+            _ridge_tag = (f", ζ-ridge eps_rel={zeta_ridge_eps:.1e}"
+                          if zeta_ridge_eps > 0.0 else "")
             print(f"  Computing L_q = chol(C_q)  [PSD, charge channel, "
-                  f"path={_resolved_solver_kind}]")
+                  f"path={_resolved_solver_kind}{_ridge_tag}]")
         else:
             print(f"  Pass through C_q  [γ̃^{vertex_mu_L} indefinite — "
                   f"path={_resolved_solver_kind}]")
         L_q = factor_c_q(
             C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
-            n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind)
+            n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
+            zeta_ridge_eps=zeta_ridge_eps)
         L_q.block_until_ready()
         print(f"  L_q: {L_q.shape}")
 
@@ -456,7 +477,12 @@ def fit_zeta_to_h5(
 
     # Free C_q to reclaim GPU memory before z-chunk loop
     # (P_k_mumu was already deleted above)
-    # This is critical for fitting within memory budget
+    # This is critical for fitting within memory budget.
+    # ζ-ridge ON: the RAW (zero-pad, IBZ-sliced) CCT must survive the
+    # r-chunk loop for the per-chunk RHS premultiply Z → C·Z inside
+    # solve_zeta — ``ridge_c_q`` keeps the reference alive
+    # (n_q_disk · n_rmu_padded² · 16 B; opt-in cost, see docstring).
+    ridge_c_q = C_q_flat if zeta_ridge_eps > 0.0 else None
     del C_q, C_q_flat
     with timing.section("zeta_fit.gc_pre_chunk_loop"):
         gc.collect()
@@ -869,6 +895,7 @@ def fit_zeta_to_h5(
                         solver_kind=_resolved_solver_kind,
                         q_irr_full_idx=q_irr_full_idx,   # Phase B: gather inside the kernel
                         cct_trace_per_q=cct_trace_per_q,
+                        ridge_c_q=ridge_c_q,
                     )
                     zeta_chunk.block_until_ready()
             finally:

@@ -831,6 +831,111 @@ def _identity_pad_block_diagonal(
     return jax.lax.with_sharding_constraint(M_id_pad, sharding)
 
 
+def _zeta_ridge_lambda_max(
+    C_q: jax.Array,
+    n_rmu_logical: int,
+    n_iter: int = 32,
+) -> jax.Array:
+    """Deterministic per-q estimate of λ_max of the LOGICAL block of CCT.
+
+    Fixed-count power iteration with the deterministic start vector
+    ``v0 ∝ mask_logical`` (ones on the logical rows, zeros on the pad
+    rows).  Both the raw zero-pad CCT and the identity-padded
+    ``block_diag(C_log, I_pad)`` are block-diagonal w.r.t. the
+    logical/pad split, so an iterate started in the logical subspace
+    stays there EXACTLY — the estimate never sees the pad block.
+
+    Returns the Rayleigh quotient ``λ̂ = v^H C v`` after ``n_iter``
+    matvecs, shape ``(nq,)`` real.  For Hermitian PSD C this is a
+    LOWER bound of λ_max with relative gap ``(λ₂/λ₁)^{2·n_iter}`` —
+    for the fast-decaying ISDF Gram spectra λ̂ ≈ λ_max to ~1e-10-class.
+    Under-estimating λ_max only SHRINKS the ridge ε = ε_rel·λ̂ (the
+    conservative direction), and the tested inert window is flat over
+    ≥2 decades of ε_rel (§12 of the F-scheme study), so the bound
+    direction is safe by construction.  No eigh anywhere.
+
+    Cost: ``n_iter`` batched (nq, n, n)·(nq, n, 1) matvecs — O(nq·K·n²),
+    negligible next to the O(nq·n³) factorization it feeds.
+    """
+    nq, n_rmu, _ = C_q.shape
+    idx = jnp.arange(n_rmu)
+    mask = (idx < n_rmu_logical).astype(C_q.dtype)
+    v0 = mask / jnp.sqrt(jnp.asarray(float(n_rmu_logical), dtype=C_q.dtype))
+    v = jnp.broadcast_to(v0[None, :, None], (nq, n_rmu, 1))
+
+    def _body(_, v):
+        w = jnp.matmul(C_q, v)
+        nrm = jnp.sqrt(jnp.sum(jnp.abs(w) ** 2, axis=(-2, -1), keepdims=True))
+        return w / jnp.maximum(nrm, 1e-300)
+
+    v = jax.lax.fori_loop(0, int(n_iter), _body, v)
+    cv = jnp.matmul(C_q, v)
+    lam = jnp.sum(jnp.conj(v) * cv, axis=(-2, -1)).real  # Rayleigh quotient
+    return lam
+
+
+def _zeta_ridge_normal_matrix(
+    C_q: jax.Array,
+    mesh_xy: Mesh,
+    *,
+    n_rmu_logical: int,
+    eps_rel: float,
+) -> tuple[jax.Array, jax.Array]:
+    """Map the identity-padded CCT onto the Tikhonov NORMAL matrix
+    ``B = block_diag(C_log² + ε_q² I, I_pad)`` for the ridge ζ-fit.
+
+    Ridge ζ-fit (opt-in, cohsex.in ``zeta_ridge_eps``): instead of
+    ``C ζ = Z`` solve the Tikhonov-regularised normal equations
+
+        (C² + ε_q² I) ζ = C Z          # per q, per element:
+        # ζ_ridge = Σ_i R_i [λ_i/(λ_i²+ε_q²)] R_i^H Z = f_ε(C) Z
+
+    i.e. the spectral filter ``f_ε(λ) = λ/(λ²+ε²)`` — identical to the
+    "cleaned ζ" of the F-scheme study (arbitrary_q_bse.md §12: the
+    Z-free Tikhonov smooth-filter whose kernel/exciton differences are
+    physically inert at ε_rel ~1e-4-class and which IMPROVES the
+    q-covariance of the V/W tiles).  No eigh: B is formed at O(n_μ³)
+    matmul cost (same class as the Cholesky it feeds) and is SPD for
+    ANY Hermitian C, so the existing charge-channel Cholesky paths
+    factor it unchanged.
+
+    ε scaling (exact spec): ``ε_q = eps_rel · λ̂_max(C_q^log)`` with
+    λ̂_max the deterministic power-iteration estimate of
+    :func:`_zeta_ridge_lambda_max` — RELATIVE to the per-q spectral
+    top, never absolute, so the knob transfers across system sizes
+    (n_μ ~ 6e2 fixtures → ~2e4-centroid production: the spectrum is
+    deeper and the junk tail longer there, but ε tracks λ_max, not the
+    tail).  Large-system caution: at large n_μ the gapless tail of the
+    ISDF Gram carries more near-degenerate REAL signal near any fixed
+    relative cutoff, so prefer the BOTTOM of the inert window
+    (1e-5..1e-6-class) and diagnose over-regularisation by A/B-ing a
+    physical contraction (eqp / Σ_diag / exciton energies) against the
+    stock fit — drift beyond the meV·1e-2 class means ε is eating
+    signal, halve it.
+
+    Pad handling: input is the identity-padded ``block_diag(C_log,
+    I_pad)`` (pad diag exactly 1), so ``C@C`` has pad block exactly
+    ``I`` and ε² is added on the LOGICAL diagonal only — the pad block
+    of B stays exactly identity and the padded-extent factorization
+    contract of :func:`factor_c_q` is unchanged.
+
+    Returns ``(B, λ̂_max_per_q)``; B sharded ``P(None, 'x', 'y')``.
+    """
+    nq, n_rmu, _ = C_q.shape
+    lam = _zeta_ridge_lambda_max(C_q, n_rmu_logical)
+    eps_q = float(eps_rel) * lam                              # (nq,)
+    idx = jnp.arange(n_rmu)
+    log_diag = (idx < n_rmu_logical).astype(C_q.dtype)        # (n,)
+    B = jnp.matmul(C_q, C_q) + (
+        (eps_q ** 2).astype(C_q.dtype)[:, None, None]
+        * jnp.diag(log_diag)[None, :, :])
+    return (
+        jax.lax.with_sharding_constraint(
+            B, NamedSharding(mesh_xy, P(None, 'x', 'y'))),
+        lam,
+    )
+
+
 def _resolve_solver_kind_charge(mesh_xy: Mesh, override: str = "auto") -> str:
     """Pick the charge-channel ζ-fit solver: cuSolverMp distributed
     potrf+potrs vs the in-tree shard_map 2D-blocked Cholesky + per-q
@@ -1001,6 +1106,7 @@ def factor_c_q(
     vertex_mu_L: int = 0,
     n_rmu_logical: int | None = None,
     solver_kind: str = 'auto',
+    zeta_ridge_eps: float = 0.0,
 ) -> jax.Array:
     """
     Compute system-matrix L_q from CCT matrix.
@@ -1065,6 +1171,21 @@ def factor_c_q(
             ``None`` (default) skips the identity-pad: input == output
             extent and the matrix is assumed to be PSD on its full
             extent (legacy mesh-divisible path).
+        zeta_ridge_eps: Relative Tikhonov ridge ε_rel for the ζ-fit
+            (cohsex.in ``zeta_ridge_eps``; default 0.0 = OFF,
+            bit-identical historical behavior).  When > 0 (charge
+            channel only) the factored operator becomes the SPD
+            normal matrix ``B = C² + ε_q²I`` with ``ε_q = ε_rel ·
+            λ̂_max(C_q)`` — see :func:`_zeta_ridge_normal_matrix` for
+            the exact spec.  The matching RHS premultiply ``Z → C Z``
+            happens in :func:`solve_zeta` via its ``ridge_c_q``
+            argument; the caller must keep the raw CCT alive and pass
+            it there.  Transverse channels (μ_L ≠ 0): NOT implemented
+            — the normal matrix IS SPD even for the indefinite
+            transverse CCT, but the transverse solve semantics
+            (logical-extent LU, device-count invariance,
+            ROOT_CAUSE.md 2026-07-08) need their own validation
+            before changing the factorization; loud-fail instead.
 
     Returns:
         L_q: ``(nq, n_rmu, n_rmu)`` at PADDED extent, sharded
@@ -1087,6 +1208,30 @@ def factor_c_q(
     # factorisation.
     C_q = _identity_pad_block_diagonal(
         C_q, n_rmu_logical=n_rmu_logical, mesh_xy=mesh_xy)
+
+    # Opt-in Tikhonov ridge (cohsex.in ``zeta_ridge_eps``): swap the
+    # factored operator C → B = C² + ε_q²I.  Charge channel only —
+    # see the kwarg docstring for the transverse rationale.
+    if float(zeta_ridge_eps) > 0.0:
+        if int(vertex_mu_L) != 0:
+            raise NotImplementedError(
+                f"zeta_ridge_eps={zeta_ridge_eps:g} requested for the "
+                f"transverse channel μ_L={int(vertex_mu_L)}.  The ridge "
+                f"normal matrix C²+ε²I is SPD even for the indefinite "
+                f"transverse CCT, but the transverse solve semantics "
+                f"(logical-extent LU, device-count invariance) need their "
+                f"own validation before the factorization changes — "
+                f"charge-only for now; run bispinor with zeta_ridge_eps=0.")
+        C_q, _ridge_lam = _zeta_ridge_normal_matrix(
+            C_q, mesh_xy, n_rmu_logical=n_rmu_logical,
+            eps_rel=float(zeta_ridge_eps))
+        if jax.process_index() == 0:
+            _lam_np = np.asarray(jax.device_get(_ridge_lam))
+            print(f"  ζ-ridge: eps_rel={float(zeta_ridge_eps):.1e}, "
+                  f"λ̂_max(C_q) ∈ [{_lam_np.min():.3e}, {_lam_np.max():.3e}] "
+                  f"→ ε_q ∈ [{float(zeta_ridge_eps)*_lam_np.min():.3e}, "
+                  f"{float(zeta_ridge_eps)*_lam_np.max():.3e}]  "
+                  f"[factoring B = C²+ε²I]")
 
     # Indefinite-CCT path: skip the Cholesky outright.  ``solve_zeta``
     # consumes C_q directly via the SVD pseudoinverse / pivoted-LU
@@ -1262,6 +1407,7 @@ def solve_zeta(
     solver_kind: str = 'auto',
     cct_trace_per_q: jax.Array | None = None,
     n_rmu_logical: int | None = None,
+    ridge_c_q: jax.Array | None = None,
 ) -> jax.Array:
     """
     Solve for zeta_q given pre-computed system matrix from
@@ -1319,6 +1465,18 @@ def solve_zeta(
                      modes (reports/device_invariance_2026-07-08/
                      ROOT_CAUSE.md).  ``None`` keeps the padded extent
                      (back-compat for mesh-divisible callers).
+        ridge_c_q:   Raw (unfactored, IBZ-sliced, zero-pad) CCT for the
+                     opt-in Tikhonov ridge fit (cohsex.in
+                     ``zeta_ridge_eps``).  When given, ``L_q`` must be
+                     the Cholesky factor of the normal matrix
+                     ``B = C²+ε²I`` from :func:`factor_c_q` and the RHS
+                     is premultiplied here: ζ = B⁻¹(C Z) = f_ε(C) Z
+                     with f_ε(λ) = λ/(λ²+ε²).  Zero pad rows/cols of C
+                     × zero pad rows of Z keep Z' pad rows exact zeros,
+                     so the logical-extent solve contract is unchanged.
+                     ``None`` (default) = stock fit, bit-identical.
+                     Charge/Cholesky solver kinds only.  Adds one
+                     transient Z-sized buffer (the matmul output).
 
     Returns:
         zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, ('x','y'), None)
@@ -1337,6 +1495,20 @@ def solve_zeta(
     mu_pad = n_rmu - n_log
 
     solver_kind = _resolve_solver_kind(mesh_xy, vertex_mu_L, solver_kind)
+
+    if ridge_c_q is not None:
+        if solver_kind in ('lu', 'cusolvermp_lu', 'scalapack_lu'):
+            raise NotImplementedError(
+                f"ridge_c_q given with solver_kind={solver_kind!r}: the "
+                f"Tikhonov ζ-ridge is charge/Cholesky-only (see "
+                f"factor_c_q's zeta_ridge_eps docstring).")
+        # Tikhonov RHS: solve (C²+ε²I) ζ = C Z.  factor_c_q factored
+        # B = C²+ε²I into L_q; premultiply the RHS by the raw C here.
+        # Batched per-q GEMM at the incoming P(None,'x','y') layout —
+        # ridge changes the operator only, not the solve parallelism.
+        Z_q = jax.lax.with_sharding_constraint(
+            jnp.matmul(ridge_c_q, Z_q),
+            NamedSharding(mesh_xy, P(None, 'x', 'y')))
 
     if solver_kind in ('cusolvermp_lu', 'scalapack_lu') and mu_pad:
         Px_ = int(mesh_xy.shape['x'])
@@ -1758,13 +1930,15 @@ def _make_fit_one_rchunk_kernel(
             mesh_xy=mesh_xy,
         )
 
-    def solve_phase(Z_q, L_q, cct_trace_per_q):
+    def solve_phase(Z_q, L_q, cct_trace_per_q, ridge_c_q=None):
         # IBZ-only solve (Phase B): L_q + cct_trace come in PRE-SLICED
         # at IBZ rows (via ``symmetry_maps.slice_q_full_to_ibz``
         # upstream in ``fit_zeta_to_h5``).  Z_q is built at full BZ by
         # ``z_q_phase``, so it gets the IBZ slice here.  When
         # ``q_irr_full_idx`` is None (write_ibz_only=False), all three
         # arrays are full-BZ and the solve runs as before.
+        # ``ridge_c_q`` (opt-in Tikhonov ζ-ridge) arrives IBZ-sliced
+        # alongside L_q; solve_zeta does the RHS premultiply.
         if q_irr_idx_j is not None:
             Z_q_for_solve = Z_q[q_irr_idx_j]
         else:
@@ -1777,7 +1951,8 @@ def _make_fit_one_rchunk_kernel(
             L_q, Z_q_for_solve, mesh_xy, q_chunk_size,
             solver_kind=solver_kind,
             cct_trace_per_q=cct_trace_per_q,
-            n_rmu_logical=int(meta.n_rmu))
+            n_rmu_logical=int(meta.n_rmu),
+            ridge_c_q=ridge_c_q)
 
     @jax.jit
     def _kernel(
@@ -1790,16 +1965,21 @@ def _make_fit_one_rchunk_kernel(
         gamma_perm,
         gamma_phase,
         cct_trace_per_q,
+        ridge_c_q=None,
     ):
         # Composed (z_q ∘ solve) under one ``@jax.jit`` — preserved for
         # the AOT memory model path which lowers a single callable.
         # Production ``fit_one_rchunk`` calls ``z_q_phase`` and
         # ``solve_phase`` directly with ``timing.section`` between, so
         # the per-r-chunk breakdown is host-visible.
+        # NOTE: the opt-in ζ-ridge (``ridge_c_q``) is NOT part of the
+        # AOT memory model — when ON it adds the persistent IBZ CCT
+        # (nq_ibz·n_μ_pad²·16 B) plus one transient Z-sized GEMM
+        # output to the true footprint.
         Z_q = z_q_phase(
             psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
             norms_l, norms_r, r_start_dyn, gamma_perm, gamma_phase)
-        return solve_phase(Z_q, L_q, cct_trace_per_q)
+        return solve_phase(Z_q, L_q, cct_trace_per_q, ridge_c_q)
 
     # Attach the un-fused phases so ``fit_one_rchunk`` can time them.
     _kernel.z_q_phase = z_q_phase
@@ -1829,6 +2009,7 @@ def fit_one_rchunk(
     solver_kind: str = 'auto',
     q_irr_full_idx: np.ndarray | None = None,
     cct_trace_per_q: jax.Array | None = None,
+    ridge_c_q: jax.Array | None = None,
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -1863,6 +2044,7 @@ def fit_one_rchunk(
          else (int(q_irr_full_idx.shape[0]),
                hash(np.asarray(q_irr_full_idx,
                                dtype=np.int32).tobytes()))),
+        ridge_c_q is not None,   # ζ-ridge on/off changes the solve HLO
     )
     fn = _fit_one_rchunk_cache.get(cache_key)
     if fn is None:
@@ -1905,7 +2087,7 @@ def fit_one_rchunk(
     _t_z = (time.perf_counter() - _t_z0) if _dbg else 0.0
     _t_s0 = time.perf_counter() if _dbg else 0.0
     with timing.section("zeta_fit.chunk.solve"):
-        zeta = fn.solve_phase(Z_q, L_q, cct_trace_per_q)
+        zeta = fn.solve_phase(Z_q, L_q, cct_trace_per_q, ridge_c_q)
         zeta.block_until_ready()
     _t_s = (time.perf_counter() - _t_s0) if _dbg else 0.0
     if _dbg and jax.process_index() == 0:

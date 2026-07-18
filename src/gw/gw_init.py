@@ -127,6 +127,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
 			write_ibz_only=_write_ibz_only_charge,
 			zeta_cutoff_ry=_zeta_cutoff,
+			zeta_ridge_eps=cfg.backend.zeta_ridge_eps,
 		)
 
 	budget_gb = mem_est.get('budget_gb', cfg.memory.per_device_gb)
