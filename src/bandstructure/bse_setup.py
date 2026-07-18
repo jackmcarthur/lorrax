@@ -160,11 +160,20 @@ def compute_wfns_fi(
     # ── Per-batch: Fourier sum + eigh + ψ-at-centroids reconstruction ────
     # Bands [b_min, b_max) selected on the eigenvalue axis (ascending), so the
     # restriction is exactly the lowest-energy ``nb_fi`` bands of the window.
+    # The q axis is sharded over ALL mesh devices (the ``_kpath_batch`` idiom,
+    # htransform.h_transform): fH_R/B are replicated, so each device builds and
+    # eigh-decomposes only its own q-rows — the eigh is the dominant cost here
+    # (measured 28 ms per rank-1152 matrix at MoS2 12×12) and runs
+    # ndev-parallel instead of replicated.
     @partial(jax.jit, static_argnames=('b_min', 'b_max'))
     def _q_batch(q_batch, fH_R, B, b_min, b_max):
+        q_batch = jax.lax.with_sharding_constraint(
+            q_batch, NamedSharding(mesh_xy, P(('x', 'y'), None)))
         phase = jnp.exp(-2j * jnp.pi * (q_batch @ R_grid.T))           # (bs, nk_co)
         fH_q = jnp.einsum('qk,kij->qij', phase, fH_R)
         fH_q = 0.5 * (fH_q + jnp.swapaxes(fH_q, -1, -2).conj())
+        fH_q = jax.lax.with_sharding_constraint(
+            fH_q, NamedSharding(mesh_xy, P(('x', 'y'), None, None)))
         lam, U = jnp.linalg.eigh(fH_q)                                  # ascending
         c = U[:, :, b_min:b_max]                                        # (bs, rank, nb_fi)
         psi = jnp.einsum('qan,asm->qnsm', c, B)                         # (bs, nb_fi, ns, n_μ)
