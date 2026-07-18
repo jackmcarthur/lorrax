@@ -439,15 +439,21 @@ def build_bse_ring_matvec_full(
     include_W: bool = True,
     screening: bool = False,
 ):
-    """Build full (non-TDA) BSE matvec for S = [[A, B], [-B^H, -A^H]].
+    """Build full (non-TDA) BSE matvec ``[X;Y] -> H[X;Y]``.
 
-    ``screening`` selects the B-block V kernel, which fixes *which* physical
-    response the non-TDA resolvent computes:
+    ``screening`` selects the coupling-block kernel AND the anti-resonant row
+    (``_antiresonant_row``), which together fix *which* physical operator this is:
 
-    - ``screening=False`` (default): the OPTICAL BSE.  The B (coupling) block
-      uses the excitonic exchange ``V_B`` (Henneke Eq. 2-20, conjugated pairing
-      ``⟨M_t|v|conj(M_t')⟩`` — ``apply_V_ring_B``).  With ``include_W`` this is
-      the TDHF/BSE exciton Hamiltonian.
+    - ``screening=False`` (default): the OPTICAL BSE, the para-Hermitian
+      ``H = [[A, B], [-B*, -A*]]`` (* = complex conjugate) with ``A`` Hermitian
+      and ``B`` complex-SYMMETRIC.  The B (coupling) block uses the excitonic
+      exchange ``V_B`` (Henneke Eq. 2-20, conjugated pairing
+      ``⟨M_t|v|conj(M_t')⟩`` — ``apply_V_ring_B``) plus the c'↔v'-swapped direct
+      term.  With ``include_W`` this is the TDHF/BSE exciton Hamiltonian; its
+      spectrum is REAL with +-omega pairs (solved by ``bse_nontda``).  NOTE: the
+      historical ``-B, -A`` anti-resonant row gave a COMPLEX spectrum for complex
+      B and was never value-validated — fixed here (PHASE2_LOG "non-TDA
+      eigensolvers").
     - ``screening=True``: the RPA test-charge DENSITY response (the object whose
       resolvent gives the screened Coulomb ``W = v + vχv``).  Here the B block
       uses the SAME RING kernel ``K^A = (1/Nk)⟨M_t|v|M_t'⟩`` as the A block
@@ -630,6 +636,36 @@ def build_bse_ring_matvec_full(
         W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
         return V_term - W_term
 
+    def _antiresonant_row(X, Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
+                          W_R, V_q0, M_X):
+        """Bottom (anti-resonant) block-row of the non-TDA operator applied to
+        ``[X; Y]``: ``Y_out``.  The physics of this row depends on ``screening``:
+
+        * ``screening=True`` (RPA test-charge density response): the coupling
+          ``B = K^A`` is Hermitian and ``A`` is Hermitian, so the operator is the
+          symplectic ``[[A, B], [-B, -A]]`` and ``Y_out = -B X - A Y``.  Validated
+          by the W(0) resolvent closure (PHASE2_LOG "W(0)").
+
+        * ``screening=False`` (OPTICAL BSE): ``A`` is Hermitian (``A = A^H``) but
+          the coupling ``B`` is complex-SYMMETRIC (``B = B^T``, NOT Hermitian).
+          The physical para-Hermitian Casida operator is ``[[A, B], [-B*, -A*]]``
+          (Onida-Reining-Rubio; Rohlfing-Louie), whose spectrum is REAL with
+          +-omega pairs, so ``Y_out = -B* X - A* Y``.  ``B* X = conj(B conj(X))``
+          and ``A* Y = conj(A conj(Y))`` reuse the SAME appliers on conjugated
+          inputs (operator ingredients unchanged), then conjugate the result — no
+          new kernel.  The naive ``-B X - A Y`` gives a COMPLEX (unphysical)
+          spectrum for complex ``B`` and was the historical, never-value-validated
+          bug (PHASE2_LOG "non-TDA eigensolvers", first checked numbers)."""
+        if screening:
+            AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X)
+            BX = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
+            return -BX - AY
+        AsY = jnp.conj(_apply_A(jnp.conj(Y), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                                eps_c, eps_v, W_R, V_q0, M_X))
+        BsX = jnp.conj(_apply_B(jnp.conj(X), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                                W_R, V_q0, M_X))
+        return -BsX - AsY
+
     def _matvec_impl(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
                      M_X, M_Y):
         # M_X: hoisted decode-side exchange pair amplitude (audit P3), shared by the
@@ -639,11 +675,8 @@ def build_bse_ring_matvec_full(
         AX = _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X)
         BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
         X_out = AX + BY
-
-        # A and B are Hermitian in this formulation; reuse A(Y) and B(X).
-        AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X)
-        B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
-        Y_out = -B_dag_X - AY
+        Y_out = _antiresonant_row(X, Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                                  eps_c, eps_v, W_R, V_q0, M_X)
         return jnp.stack([X_out, Y_out], axis=0)
 
     if timed:
@@ -670,9 +703,8 @@ def build_bse_ring_matvec_full(
                 BY.block_until_ready()
             X_out = AX + BY
 
-            AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X)
-            B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
-            Y_out = -B_dag_X - AY
+            Y_out = _antiresonant_row(X, Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                                      eps_c, eps_v, W_R, V_q0, M_X)
             return jnp.stack([X_out, Y_out], axis=0)
 
         return _matvec_timed

@@ -112,6 +112,7 @@ def solve_bse_sharded(
     solver_kind: str = "lanczos",
     davidson_n_random_init: int = 5,
     davidson_eps_shift_Ry: float = 1e-3,
+    tda: bool = True,
 ) -> Tuple[jax.Array, jax.Array]:
     """Sharded BSE Lanczos using the (μ,ν) ring matvec.
 
@@ -135,7 +136,18 @@ def solve_bse_sharded(
     and contains psi_{c,v}_{X,Y}, eps_c, eps_v, V_q0 (P("x","y")), W_q
     (P("x","y",None,None,None)), plus any q=0 head injection already
     applied at load time.
+
+    ``tda`` (default True) selects the Tamm-Dancoff resonant-only Hamiltonian
+    (the block/single-vector Lanczos + Davidson paths below).  ``tda=False``
+    dispatches to the structure-preserving full-BSE eigensolver
+    ``bse_nontda.solve_bse_nontda_sharded`` — the ONE non-TDA seam, no parallel
+    solver stack — which returns paired (X, Y) eigenvectors (X^H X - Y^H Y = +1).
     """
+    if not tda:
+        from .bse_nontda import solve_bse_nontda_sharded
+        return solve_bse_nontda_sharded(
+            data, mesh_xy, n_eig=n_eig, include_W=include_W)
+
     sh = make_bse_shardings(mesh_xy)
     nc_pad = int(data["n_cond_pad"])
     nv_pad = int(data["n_val_pad"])

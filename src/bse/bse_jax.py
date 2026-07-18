@@ -114,10 +114,13 @@ def _preview_lanczos(
     matvec_kind: str = "ring",
     n_reorth: int = -1,
     solver_kind: str = "lanczos",
+    tda: bool = True,
 ) -> None:
     restart_file = _find_restart_file(input_file)
     n_devices = jax.device_count()
-    use_sharded = n_devices > 1
+    # Non-TDA has no 1-device (``solve_bse``) path — it runs through the sharded
+    # loader + ``solve_bse_sharded(tda=False)`` on a 1x1 mesh just as well.
+    use_sharded = n_devices > 1 or not tda
 
     if use_sharded:
         # Sharded ring matvec — parallelises (μ,ν) and avoids per-iter
@@ -170,7 +173,7 @@ def _preview_lanczos(
             data, mesh_xy, n_eig=n_eig, max_iter=block_max_iter,
             include_W=include_W, block_size=block_size,
             rtol=rtol, check_every=check_every, n_reorth=n_reorth_eff,
-            solver_kind=solver_kind,
+            solver_kind=solver_kind, tda=tda,
         )
         n_done = int(n_iter_done)
         if rtol > 0:
@@ -228,6 +231,7 @@ def _preview_lanczos(
             nky,
             nkz,
             n_write,
+            use_tda=tda,
         )
 
 
@@ -489,9 +493,9 @@ if __name__ == "__main__":
         )
         raise SystemExit(0)
 
-    if not use_tda:
-        raise SystemExit("Lanczos preview currently supports TDA only. Re-run with --tda.")
-
+    # Non-TDA (full BSE) now flows through the same preview via the
+    # ``solve_bse_sharded(tda=False)`` dispatch -> ``bse_nontda`` (structure-
+    # preserving definite-pencil / product solve).  TDA stays the default.
     _preview_lanczos(
         args.input,
         args.n_val,
@@ -508,5 +512,6 @@ if __name__ == "__main__":
         matvec_kind=("gather" if args.gather_t else args.matvec_kind),
         n_reorth=args.n_reorth,
         solver_kind=args.solver,
+        tda=use_tda,
     )
     raise SystemExit(0)

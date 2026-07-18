@@ -53,7 +53,14 @@ def write_eigenvectors_stream(
     nky: int,
     nkz: int,
     n_write: int,
+    use_tda: bool = True,
 ) -> None:
+    # ``use_tda`` is written HONESTLY (was hardcoded 1).  TDA eigenvectors arrive
+    # as ``(n_write, 1, nc, nv, nk)`` (resonant X only); full-BSE (non-TDA) as
+    # ``(n_write, 2, nc, nv, nk)`` = the paired (X, Y) with X^H X - Y^H Y = +1.
+    # For non-TDA the resonant X is written to ``eigenvectors`` (so the
+    # sum-over-states absorption reads the dominant part) and the coupling Y to a
+    # sibling ``eigenvectors_coupling`` dataset (both components persisted).
     # BGW eigenvectors.h5 stores eigenvalues in eV (header text in
     # ``eigenvalues.dat`` says "eig (eV)"; matches BGW's BSE/diag.f90
     # write path).  Our solvers return Ry — convert here so a downstream
@@ -89,7 +96,7 @@ def write_eigenvectors_stream(
         params.create_dataset("ns", data=ns)
         params.create_dataset("nc", data=n_cond)
         params.create_dataset("nv", data=n_val)
-        params.create_dataset("use_tda", data=1)
+        params.create_dataset("use_tda", data=1 if use_tda else 0)
 
         kpoints = exciton_header.create_group("kpoints")
         kpoints.create_dataset("nk", data=nk)
@@ -104,26 +111,40 @@ def write_eigenvectors_stream(
             shape=(1, n_write, nk, n_cond, n_val, ns, 2),
             dtype=np.float64,
         )
+        coupling_dset = None
+        if not use_tda:
+            coupling_dset = exciton_data.create_dataset(
+                "eigenvectors_coupling",
+                shape=(1, n_write, nk, n_cond, n_val, ns, 2),
+                dtype=np.float64,
+            )
+
+        def _to_bgw(comp):
+            # comp: (nc, nv, nk) -> BGW (nk, nc, nv, ns) layout.  BGW convention:
+            # valence axis reversed (v=0 = highest valence, BSE/input_fi.f90:407);
+            # our internal slice puts v=0 at deepest valence, so flip on write.
+            c = np.transpose(comp, (2, 0, 1))[:, :, ::-1][..., None]
+            return c.real, c.imag
 
         for i in range(n_write):
             vec = jax.device_get(eigenvectors[i])
-            # Sharded path returns (block=1, nc, nv, nk); the unsharded
-            # path returns (nc, nv, nk).  Squeeze the leading block axis
-            # if present so the transpose below is unambiguous.
-            if vec.ndim == 4:
-                vec = vec[0]
-            vec = np.transpose(vec, (2, 0, 1))  # (nk, nc, nv)
-            # BGW convention: valence axis is reversed, v=0 is the highest
-            # valence band (just below the gap), counting down to deepest.
-            # Our internal slice ``val_idx = n_occ - n_val .. n_occ`` puts
-            # v=0 at the deepest valence — flip on write so the file is
-            # BGW-format-compliant (BSE/input_fi.f90:407).
-            vec = vec[:, :, ::-1]
-            vec = vec[..., None]  # (nk, nc, nv, ns)
-            evec_dset[0, i, :, :, :, :, 0] = vec.real
-            evec_dset[0, i, :, :, :, :, 1] = vec.imag
+            if use_tda:
+                # (1, nc, nv, nk) sharded or (nc, nv, nk) unsharded -> resonant X.
+                Xc = vec[0] if vec.ndim == 4 else vec
+                Yc = None
+            else:
+                # (2, nc, nv, nk) = paired (X, Y) from the non-TDA solver.
+                Xc, Yc = vec[0], vec[1]
+            re, im = _to_bgw(Xc)
+            evec_dset[0, i, :, :, :, :, 0] = re
+            evec_dset[0, i, :, :, :, :, 1] = im
+            if Yc is not None:
+                re, im = _to_bgw(Yc)
+                coupling_dset[0, i, :, :, :, :, 0] = re
+                coupling_dset[0, i, :, :, :, :, 1] = im
 
-    print(f"Wrote {n_write} eigenvectors to {output_file}")
+    print(f"Wrote {n_write} eigenvectors to {output_file}"
+          + ("" if use_tda else " (+ coupling Y)"))
 
 
 def _pad_last_axis(x: jax.Array, target: int) -> jax.Array:
