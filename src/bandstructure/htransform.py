@@ -44,7 +44,8 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              band_range: tuple[int, int],
                              rtol: float = 1e-8, log_fn=None,
                              band_chunk_size: int = 64,
-                             bispinor: bool = False):
+                             bispinor: bool = False,
+                             return_full_proj: bool = False):
     """Galerkin projection using gw_jax shared loaders.
 
     Single ('x','y') mesh throughout. ψ at centroids comes from
@@ -61,8 +62,17 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         rtol: SVD truncation tolerance (relative to s.max()).
         band_chunk_size: bands per FFT chunk inside the loader.
         bispinor: passed through to ``load_centroids_band_chunked``.
+        return_full_proj: also return the full-r α-basis projector
+            ``W_proj = L⁻¹ diag(1/s) U^H`` (rank, nk·nb), replicated.  For
+            any streamed ψ chunk (nk, bc, ns, r_c) restricted to the SAME
+            band window, ``B_full[α, s·r_c] = W_proj_bc @ ψ_flat`` evaluates
+            the α-basis on the full r-grid, so
+            ``ψ_{n,q}(r) = Σ_α c_{n,q}[α] B_full[α](r)`` reconstructs ψ at
+            ANY q off the grid — the per-Q ζ-refit consumer
+            (``bse.vq_interp.refit_vq``).
 
-    Returns ``(S, ctilde)`` matching the legacy contract.
+    Returns ``(S, ctilde, B_at_mu)`` (legacy contract), plus ``W_proj``
+    appended when ``return_full_proj``.
     """
     import time
     if log_fn is None:
@@ -210,6 +220,12 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     log_fn(f"  ctilde[0] orthogonality error: {float(ortho_err):.3e}")
     log_fn(f"  Total Galerkin: {time.time()-t0:.2f}s")
 
+    if return_full_proj:
+        # W_proj = L⁻¹ diag(1/s) U^H — the α-basis-on-full-r projector (see
+        # docstring).  (rank, nk·nb) replicated; small (≲ tens of MB).
+        W_proj = jsp_linalg.solve_triangular(L, inv_s * UH, lower=True)
+        W_proj = jax.device_put(W_proj, rep)
+        return S, ctilde, B_at_mu, W_proj
     return S, ctilde, B_at_mu
 
 
@@ -574,7 +590,7 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
 
 
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
-                    mesh_xy: Mesh | None = None):
+                    mesh_xy: Mesh | None = None, return_full_proj: bool = False):
     from file_io.centroids import load_centroids as _shared_load_centroids
 
     input_dir = os.path.dirname(os.path.abspath(input_path))
@@ -610,11 +626,15 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
         mesh_xy = _build_mesh_xy()
     band_range = (int(nsigmarange[0]), int(nsigmarange[1]))
     with mesh_xy:
-        S, ctilde, B_at_mu = streaming_galerkin_solve(
+        out = streaming_galerkin_solve(
             wfn, sym, meta, centroid_indices, mesh_xy, band_range,
             rtol=1e-8, log_fn=log_fn, bispinor=bispinor,
+            return_full_proj=return_full_proj,
         )
+    S, ctilde, B_at_mu = out[:3]
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={band_range[1]-band_range[0]}, rank={ctilde.shape[2]}")
+    if return_full_proj:
+        return wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma, out[3]
     return wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma
 
 

@@ -1,0 +1,1036 @@
+"""Arbitrary-Q bare-exchange tile V_Q — F-scheme + b26p interpolation backend.
+
+Production port of the validated reference implementation
+``runs/MoS2/A_bse_w0_resolvent_2026-07-16/primer_response_study/``
+``REFERENCE_arbitrary_q_vq.py`` (arbitrary_q_bse.md §§12-13, F_SCHEME_NOTE):
+Tikhonov clean → Gaussian SR/LR kernel split → truncated-R stencil on the
+cleaned SR tiles + ONE global b26p least-squares model of the long-range
+form factors → closed-form assembly at any Q.  Arithmetic is preserved from
+the reference (whose acceptance run reproduces the §13 pins to every printed
+digit); this module adds the production seams:
+
+  * ``prepare_coarse`` runs on-device with ``P('x','y')``-sharded n_μ² tiles;
+    the per-coarse-q eigh goes through a selectable distributed-linalg
+    backend (``eigh_backend = auto|off|cusolvermp|slate`` — same dispatch
+    convention as the ζ-fit solve paths in ``isdf.core``), and the Π V Π /
+    split GEMMs are sharded matmuls on the same layout.
+  * ``fit_lr_model`` (the b26p LSQ) stays HOST/replicated on purpose: the
+    normal blocks are (n_b ≤ 10)² per (G_z, q) — a few kilobytes, O(10⁶)
+    flops total — and the solved coefficients are (n_b, n_μ) ≈ tens of kB.
+    Sharding them buys nothing and costs collectives; the fit inputs
+    (``Fch``, ``W``) are per-q n_μ×|𝒢| blocks pulled to host once, offline.
+  * ``make_eval_vq`` builds ONE jitted evaluator whose q-DEPENDENT data
+    (target Q, the stencil-weight pseudo-inverse, the SR-tile stack, the
+    fitted coefficients) are RUNTIME ARGUMENTS — never closure constants —
+    so a whole Q-path is a single compile (the per-q-recompile lesson,
+    PHASE2_LOG "Per-q recompile elimination").  Output tile is emitted at
+    the loader's padded extent, sharded ``P('x','y')``.
+
+THE PIPELINE (per-element math; μ = ISDF centroid, s_μ its fractional
+coordinate, K = q+G Cartesian in bohr⁻¹, v = slab-truncated Coulomb):
+
+  stage 1  ``prepare_coarse`` — offline, per coarse q_j, own frame:
+    (a) Tikhonov clean WITHOUT forming Z:
+            eigh: C_q = R diag(λ) R^H
+            g_ε(λ) = λ² / (λ² + (ε_tik·λ_max)²)
+            S_q    = R g_ε(λ) R^H                     (Hermitian, ~projector)
+        so ζ_c = S_q ζ_stored and V_c = conj(S_q) V conj(S_q) — an analytic
+        filter, NOT a hard cut (hard-cut projectors rotate freely inside
+        C_q's gapless spectrum — Davis-Kahan; §12.3).
+    (b) Gaussian SR/LR split per G channel:
+            v_LR(K) = v(K) e^{−K²/4α²},   v_SR = v·(−expm1(−K²/4α²))
+            V_SRc(q_j) = conj(S) [V_ref − V_LR] conj(S)
+        LR confined to the FIXED Miller superset 𝒢(α) =
+        {G : min_{q∈BZ, q_z=0} |q+G|² ≤ 4α² ln(1/ε_LR)}.
+    (c) phase-factored LR form-factor samples on 𝒢(α):
+            F_μ(q_j;G) = e^{+2πi (q_j+G)·s_μ} (S_q ζ̃)_μ(q_j+G)
+        (centroid winding phase carried analytically — the g0-winding cure).
+
+  stage 2  ``fit_lr_model`` — ONE weighted LSQ over all coarse samples:
+        M_μ(K_∥, G_z) ≈ Σ_b c_b[μ,G_z] (K_x/2α)^p (K_y/2α)^r,
+        degrees {|G_z|=0:3, 1:2, 2:0, 3:0} → 26 complex coefficients per μ
+        TOTAL, weight w = v_LR(q+G) (the objective is then exactly
+        ‖ΔA‖²_F of the LR tile factor A = ζ̃√v_LR).  Per-q normal blocks
+        keep leave-one-out refits honest at O(n_b²).
+
+  stage 3  ``eval_vq`` — cheap, per target Q, no solve / eigh / r_tot:
+        w_j(Q) = e^{−2πi Q·R} · pinv(e^{−2πi q_j·R})       (nR7 stencil)
+        V(Q)   = Σ_j w_j V_SRc(q_j)
+               + conj(A) A^T,  A = e^{−2πi(Q+G)·s_μ} M_μ(Q+G) √v_LR(Q+G)
+
+SCOPE: slab systems with q_z = 0 coarse grids (per-G_z channels exact
+there); FULL-BZ stored ζ (nq == nk).  IBZ-only ζ storage (the IBZ cascade)
+is rejected with a clear error — unfolding ζ through the one canonical
+SymMaps sym-action is deferred work, not a parallel helper here.
+
+The ground-truth alternative (``--vq-mode=refit`` in ``bse.exciton_bands``)
+— a per-Q ζ refit from htransform full-r wavefunctions — lives in this
+module too (``refit_vq``): both are V_Q sources with one calling contract.
+
+Do NOT "improve" the model with: literal/pinned real-space moments (refuted
+twice, §12.2/§13.3), SVD learned multipoles (no low rank, §13.2), hard-cut
+cleaning in the fit gauge (the q-fiber IS the cut edge, §13.1), multi-width
+GTO ladders (conditioning, §13.2).
+"""
+from __future__ import annotations
+
+from functools import partial
+
+import h5py
+import numpy as np
+
+import jax
+import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+# pipeline constants (§13.5 production shape; reference values verbatim)
+ALPHA = 0.30          # Gaussian split width, 1/bohr; broad optimum ~1.5-2x dq
+EPS_TIK = 1e-4        # relative Tikhonov filter width (fit gauge, §13.1)
+EPS_LR = 1e-8         # Gaussian weight bound defining the LR G-superset
+DEG_B26P = {0: 3, 1: 2, 2: 0, 3: 0}   # in-plane poly degree per |G_z|
+RIDGE = 1e-11         # normal-equation ridge (lr_prep.ChannelFit.RIDGE)
+RY2MEV = 13605.693
+
+
+def relF(a, b):
+    return float(np.linalg.norm(a - b) / np.linalg.norm(b))
+
+
+# ===========================================================================
+# coarse-data loading (reference load_fixture, with paths as arguments)
+# ===========================================================================
+def load_zeta_coarse(restart_file: str, zeta_file: str) -> dict:
+    """Load the coarse-grid ζ/ψ/tile data into a plain-dict bundle ``zx``.
+
+    q-LABELING (the two wrap traps, KNOWN_SANDBOX_ERRORS 2026-07-17):
+    ``zeta_q.h5 mf_header/kpoints/rk`` stores the UNWRAPPED QE list, while
+    the stored ζ spheres are centred on the BGW-WRAPPED q (worth a measured
+    155× on the physical interp ladder).  ``np.round`` is round-half-to-even,
+    so components at exactly 1/2 need the sphere itself to pick the sign:
+    keep the candidate wrap minimising max|q+G|² over the stored sphere
+    (``_fix_sphere_wrap``).  Every downstream phase/kernel uses these
+    wrapped labels.
+
+    Requires FULL-BZ ζ storage (nq == nk).  IBZ-only storage (the IBZ
+    cascade) raises — see the module docstring.
+    """
+    zx = {"restart_file": restart_file, "zeta_file": zeta_file}
+    with h5py.File(restart_file, "r") as f:
+        zx["psi"] = f["psi_full_y"][()]          # (nk, nb, ns, n_mu) u at centroids
+        zx["kgrid"] = f["kgrid"][()].astype(int)
+        zx["Vqmunu"] = f["V_qmunu"][()]          # disk tiles (gate reference)
+        if "W0_qmunu" in f:
+            zx["W0"] = f["W0_qmunu"][()]         # screened tiles (exciton Hdir)
+        zx["enk"] = f["enk_full"][()]            # (nk, nb) Ry
+    with h5py.File(zeta_file, "r") as f:
+        zx["ZG"] = f["zeta_q_G"][()]             # (nq, n_mu, ngkmax) c128
+        zx["gvec"] = f["isdf_header/gvec_components"][()].astype(np.int64)
+        zx["ngk"] = f["isdf_header/ngk"][()].astype(int)
+        fg = f["mf_header/gspace/FFTgrid"][()].astype(int)
+        qraw = f["mf_header/kpoints/rk"][()]
+        zx["adot"] = f["mf_header/crystal/adot"][()]
+        blat = float(np.real(f["mf_header/crystal/blat"][()]))
+        # BGW stores bvec in units of blat = 2π/alat; physical bohr⁻¹
+        # (|bvec^T g|² in Ry) needs the blat factor (measured: 10.4%
+        # makeVq-vs-disk residual without it).
+        zx["bvec"] = f["mf_header/crystal/bvec"][()] * blat
+        zx["celvol"] = float(np.real(f["mf_header/crystal/celvol"][()]))
+        rmu_idx = f["isdf_header/centroids/r_mu_fft_idx"][()].astype(int)
+        zx["zeta_cutoff"] = float(f["isdf_header/zeta_cutoff_ry"][()])
+        ifmax = f["mf_header/kpoints/ifmax"][()]
+    zx["nk"], zx["nb"], zx["ns"], zx["n_mu"] = zx["psi"].shape
+    zx["nq"] = zx["ZG"].shape[0]
+    zx["ngkmax"] = zx["ZG"].shape[2]
+    zx["nx"], zx["ny"], zx["nz"] = [int(x) for x in fg]
+    zx["n_rtot"] = zx["nx"] * zx["ny"] * zx["nz"]
+    if zx["nq"] != zx["nk"]:
+        raise ValueError(
+            f"vq_interp needs FULL-BZ zeta storage: zeta_q.h5 has nq={zx['nq']} "
+            f"but the k-grid has nk={zx['nk']} (IBZ cascade active).  "
+            f"Regenerate the fit with full-BZ zeta, or wait for the IBZ-zeta "
+            f"unfold (deferred; must route through the one SymMaps sym-action).")
+    zx["qfr_raw"] = qraw[: zx["nq"]]
+    zx["qfr"] = zx["qfr_raw"] - np.round(zx["qfr_raw"])  # BGW-wrapped, pre half-fix
+    kg = zx["kgrid"]
+    zx["k_int"] = np.rint(zx["qfr_raw"] * kg[None, :]).astype(int) % kg[None, :]
+    zx["k_lookup"] = {tuple(v): i for i, v in enumerate(zx["k_int"])}
+    assert len(zx["k_lookup"]) == zx["nq"], "duplicate k labels in rk list"
+    rx = np.arange(zx["nx"]) / zx["nx"]
+    ry = np.arange(zx["ny"]) / zx["ny"]
+    rz = np.arange(zx["nz"]) / zx["nz"]
+    RX, RY, RZ = np.meshgrid(rx, ry, rz, indexing="ij")
+    zx["rfrac"] = np.stack([RX.ravel(), RY.ravel(), RZ.ravel()], 1)
+    dims = np.array([zx["nx"], zx["ny"], zx["nz"]])
+    zx["rmu_frac"] = rmu_idx / dims[None, :]     # centroid frac coords s_μ
+    zx["rmu_flat"] = ((rmu_idx[:, 0] * zx["ny"]) + rmu_idx[:, 1]) * zx["nz"] \
+        + rmu_idx[:, 2]
+    zx["nv"] = int(ifmax.ravel()[0])
+    assert np.all(ifmax == zx["nv"]), "ifmax not uniform over k"
+    _fix_sphere_wrap(zx)
+    return zx
+
+
+def _fix_sphere_wrap(zx):
+    """(reference ``_fix_sphere_wrap``) Half-boundary wrap disambiguation:
+    per q, among the ±1/2 sign candidates keep the one whose sphere fits
+    max|q+G|² ≤ cutoff.  No-op on grids without half components."""
+    changed = 0
+    for q in range(zx["nq"]):
+        base = zx["qfr_raw"][q] - np.round(zx["qfr_raw"][q])
+        cands = [[]]
+        for c in range(3):
+            opts = [0.5, -0.5] if abs(abs(base[c]) - 0.5) < 1e-9 else [base[c]]
+            cands = [cc + [o] for cc in cands for o in opts]
+        n = int(zx["ngk"][q])
+        G = zx["gvec"][q][:, :n].astype(np.float64)
+        best, bestm = None, None
+        for cc in cands:
+            qc = np.asarray(cc)
+            K = zx["bvec"].T @ (qc[:, None] + G)
+            m = float(np.max(np.sum(K * K, axis=0)))
+            if bestm is None or m < bestm:
+                best, bestm = qc, m
+        assert bestm <= zx["zeta_cutoff"] + 1e-9, \
+            f"q={q}: no candidate wrap fits the stored sphere"
+        if np.max(np.abs(best - zx["qfr"][q])) > 1e-12:
+            changed += 1
+        zx["qfr"][q] = best
+    if changed:
+        print(f"  [wrapfix] {changed} of {zx['nq']} q relabeled to the "
+              f"sphere-derived center")
+
+
+# ===========================================================================
+# grid / sphere / kernel primitives (reference arithmetic verbatim)
+# ===========================================================================
+def flat_idx(zx, gv):
+    """(3, n) int Miller → flat C-order FFT index."""
+    return ((gv[0] % zx["nx"]) * zx["ny"] + gv[1] % zx["ny"]) * zx["nz"] \
+        + gv[2] % zx["nz"]
+
+
+def recon(zx, q):
+    """ζ_q(μ, r) in the lab frame on the full FFT grid (gates only)."""
+    ZGq = zx["ZG"][q]
+    box = np.zeros((zx["n_mu"], zx["n_rtot"]), dtype=np.complex128)
+    fi = flat_idx(zx, zx["gvec"][q])
+    n = int(zx["ngk"][q])
+    box[:, fi[:n]] = ZGq[:, :n]
+    R = np.fft.ifftn(box.reshape(zx["n_mu"], zx["nx"], zx["ny"], zx["nz"]),
+                     axes=(1, 2, 3), norm="backward"
+                     ).reshape(zx["n_mu"], zx["n_rtot"])
+    return R * np.exp(2j * np.pi * (zx["rfrac"] @ zx["qfr"][q]))[None, :]
+
+
+def to_sphere(zx, zr, q):
+    """rows(r) → rows(G) on sphere(q) (gates + refit)."""
+    ph = np.exp(-2j * np.pi * (zx["rfrac"] @ zx["qfr"][q]))
+    box = np.fft.fftn((zr * ph[None, :]).reshape(-1, zx["nx"], zx["ny"],
+                                                 zx["nz"]),
+                      axes=(1, 2, 3), norm="backward"
+                      ).reshape(zr.shape[0], zx["n_rtot"])
+    fi = flat_idx(zx, zx["gvec"][q])
+    n = int(zx["ngk"][q])
+    out = np.zeros((zr.shape[0], zx["ngkmax"]), dtype=np.complex128)
+    out[:, :n] = box[:, fi[:n]]
+    return out
+
+
+def v_slab_on_set(zx, qfrac, GS, kind="slab", alpha=None):
+    """Slab-truncated Coulomb kernel on an explicit Miller set at momentum
+    ``qfrac`` (wrapped fractional), per G channel, K = q+G Cartesian (1/bohr):
+        v(K) = 8π / K² · f2d / V_cell,
+        f2d  = 1 − exp(−z_c |K_∥|) cos(K_z z_c),   z_c = π / b3_z
+    Only the true divergence K² < 1e-12 is zeroed (the q=0 G=0 slot);
+    at q ≠ 0 the finite G=0 term is part of the body (measured: zeroing it
+    moves makeVq-vs-disk from ~1e-9 to 0.33).  Split (stable expm1;
+    vSR+vLR == v to 1e-13, gated):
+        slab_lr: v · e^{−K²/4α²}      slab_sr: v · (−expm1(−K²/4α²))
+    """
+    K = zx["bvec"].T @ (np.asarray(qfrac)[:, None] + GS.astype(np.float64))
+    K2 = np.sum(K * K, axis=0)
+    zero = K2 < 1e-12
+    K2s = np.where(zero, 1.0, K2)
+    zc = np.pi / zx["bvec"][2, 2]
+    f2d = 1.0 - np.exp(-zc * np.sqrt(K[0] ** 2 + K[1] ** 2)) \
+        * np.cos(K[2] * zc)
+    v = 8.0 * np.pi / K2s * f2d / zx["celvol"]
+    if kind == "slab_lr":
+        v = v * np.exp(-K2 / (4.0 * alpha ** 2))
+    elif kind == "slab_sr":
+        v = v * (-np.expm1(-K2 / (4.0 * alpha ** 2)))
+    return np.where(zero, 0.0, v)
+
+
+def v_sphere(zx, q, kind="slab", alpha=None):
+    """Kernel on the stored sphere at coarse q.  Returns (v, n_G)."""
+    n = int(zx["ngk"][q])
+    v = v_slab_on_set(zx, zx["qfr"][q], zx["gvec"][q][:, :n], kind, alpha)
+    return v, n
+
+
+def make_vq(zx, zt, q, kind="slab", alpha=None):
+    """V[μν] = Σ_G conj(zt_μ(q+G)) v(q+G) zt_ν(q+G) on sphere(q)."""
+    v, n = v_sphere(zx, q, kind, alpha)
+    A = zt[:, :n] * np.sqrt(v)[None, :]
+    return np.conj(A) @ A.T
+
+
+def build_cq(zx):
+    """C_q Gram rebuild from ψ at centroids (reference ``build_cq``,
+    order-robust R-space route, arithmetic verbatim):
+        C_q[μν] = Σ_{k,mn} conj(ρ_kmn(r_μ)) ρ_kmn(r_ν),
+        ρ_kmn(r) = Σ_s conj(u_{m, wrap(k−q), s}(r)) u_{n, k, s}(r)
+    with stored cell-periodic spinors at WRAPPED k labels (torus
+    convention, no umklapp phases; gate: X^H X == C_q)."""
+    psi = zx["psi"]
+    nq, nb, ns, n_mu = zx["nq"], zx["nb"], zx["ns"], zx["n_mu"]
+    kg = zx["kgrid"]
+    psiX = np.conj(psi).transpose(0, 3, 1, 2)
+    Pk = np.einsum("kmna,knbr->karmb", psiX, psi, optimize=True)
+    Rall = np.array([[rx, ry, rz] for rx in range(kg[0])
+                     for ry in range(kg[1]) for rz in range(kg[2])])
+    Rw = ((Rall + kg // 2) % kg) - (kg // 2)
+    EqR = np.exp(2j * np.pi * (zx["qfr"] @ Rw.T))
+    P_R = (EqR.T @ Pk.reshape(nq, -1)).reshape(len(Rw), ns, n_mu, n_mu, ns)
+    C_R = np.einsum("ravmb,ravmb->rvm", np.conj(P_R), P_R, optimize=True)
+    C_q = np.transpose(((np.exp(-2j * np.pi * (zx["qfr"] @ Rw.T)) / nq)
+                        @ C_R.reshape(len(Rw), -1)
+                        ).reshape(nq, n_mu, n_mu), (0, 2, 1))
+    return C_q
+
+
+def kq_index(zx, ki, qi):
+    """Index of wrap(k − q) on the stored grid."""
+    d = zx["k_int"][ki] - zx["k_int"][qi]
+    return zx["k_lookup"][tuple(d % zx["kgrid"])]
+
+
+def kq_index_of_frac(zx, qfrac):
+    """Grid index of a fractional q that must lie ON the coarse grid."""
+    kg = zx["kgrid"]
+    ki = np.rint(np.asarray(qfrac) * kg).astype(int) % kg
+    assert np.max(np.abs(np.asarray(qfrac) * kg - np.rint(np.asarray(qfrac) * kg))) < 1e-8, \
+        f"{qfrac} is not on the coarse grid"
+    return zx["k_lookup"][tuple(ki)]
+
+
+def gap_window_pairs(zx, q, nvw=3, ncw=3):
+    """Spin-traced BSE exchange rows M_cvk(μ) = Σ_s conj(u_{c,k−q,s})
+    u_{v,k,s} at the centroids; top-nvw valence × bottom-ncw conduction ×
+    all k → (npair, n_μ).  These contract the tile into the physical
+    gap-window block B = M^H V M — the campaign verdict variable."""
+    nv = zx["nv"]
+    cs = list(range(nv, nv + ncw))
+    vs = list(range(nv - nvw, nv))
+    rows = np.empty((zx["nk"], ncw, nvw, zx["n_mu"]), dtype=np.complex128)
+    for k in range(zx["nk"]):
+        kq = kq_index(zx, k, q)
+        rows[k] = np.einsum("csm,vsm->cvm",
+                            np.conj(zx["psi"][kq][cs]), zx["psi"][k][vs])
+    return rows.reshape(-1, zx["n_mu"])
+
+
+def b_block(x, V):
+    """B[p,p'] = Σ_{μν} conj(x[p,μ]) V[μν] x[p',ν]."""
+    return np.conj(x) @ V @ x.T
+
+
+# ===========================================================================
+# gate battery (reference run_gates; every value printed; any FAIL stops)
+# ===========================================================================
+def run_gates(zx, C_q):
+    ok = True
+
+    def log(k, v, tol=None):
+        nonlocal ok
+        flag = "" if tol is None else ("  OK" if v <= tol else "  ** FAIL **")
+        if tol is not None and v > tol:
+            ok = False
+        print(f"    [gate] {k:<44s} {v:.3e}{flag}")
+
+    print("  [gates] vq_interp coarse data:")
+    n0 = int(zx["ngk"][0])
+    zt = to_sphere(zx, recon(zx, 0), 0)
+    log("recon_roundtrip_sphere_Gamma",
+        relF(zt[:, :n0], zx["ZG"][0][:, :n0]), 1e-13)
+    k2max = max(np.max(np.sum((zx["bvec"].T @ (zx["qfr"][q][:, None]
+                               + zx["gvec"][q][:, :int(zx["ngk"][q])]
+                               .astype(np.float64))) ** 2, axis=0))
+                for q in range(zx["nq"]))
+    log("sphere_max|q+G|^2_minus_cutoff", max(0.0, k2max - zx["zeta_cutoff"]),
+        1e-9)
+    vd = [relF(make_vq(zx, zx["ZG"][q], q), zx["Vqmunu"][q])
+          for q in range(zx["nq"])]
+    log("makeVq_vs_disk_Vqmunu_allq_max", float(np.max(vd)), 5e-6)
+    # X^H X == C_q (torus convention) at q=0
+    q = 0
+    X = np.empty((zx["nk"], zx["nb"], zx["nb"], zx["n_mu"]),
+                 dtype=np.complex128)
+    for k in range(zx["nk"]):
+        kq = kq_index(zx, k, q)
+        X[k] = np.einsum("nsm,Msm->nMm", np.conj(zx["psi"][kq]), zx["psi"][k])
+    X = X.reshape(-1, zx["n_mu"])
+    log("XHX_vs_Cq_torus_q0", relF(np.conj(X.T) @ X, C_q[0]), 1e-8)
+    for q in range(2):
+        v, n = v_sphere(zx, q)
+        vs, _ = v_sphere(zx, q, kind="slab_sr", alpha=0.63)
+        vl, _ = v_sphere(zx, q, kind="slab_lr", alpha=0.63)
+        log(f"vSR+vLR==v_q{q}",
+            float(np.max(np.abs(vs[:n] + vl[:n] - v[:n]))
+                  / max(np.max(np.abs(v[:n])), 1e-300)), 1e-13)
+    # slab-axis separability (per-G_z channels need b3 ∥ z, b1/b2 in-plane)
+    bv = zx["bvec"]
+    log("slab_axes_offdiag", float(max(np.max(np.abs(bv[2, :2])),
+                                       np.max(np.abs(bv[:2, 2])))
+                                   / np.abs(bv[2, 2])), 1e-12)
+    assert ok, "vq_interp gate battery FAILED — stop (KNOWN_SANDBOX_ERRORS rule)"
+
+
+# ===========================================================================
+# STAGE 1 — offline preparation at the coarse grid points
+# ===========================================================================
+def lr_gset(zx, alpha=ALPHA):
+    """Fixed global Miller superset of the LR channel: all G with
+    min_{q∈BZ, q_z=0} |q+G|² ≤ 4α² ln(1/ε_LR), minimised over a 13×13
+    in-plane q sample (reference ``lr_gset``, verbatim)."""
+    K2max = 4.0 * alpha ** 2 * np.log(1.0 / EPS_LR)
+    Kmax = np.sqrt(K2max)
+    nmax = [int(np.ceil(Kmax / np.linalg.norm(zx["bvec"][i]))) + 1
+            for i in range(3)]
+    gr = [np.arange(-n, n + 1) for n in nmax]
+    GX, GY, GZ = np.meshgrid(*gr, indexing="ij")
+    Gall = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], 0)
+    ts = np.linspace(-0.5, 0.5, 13, endpoint=False)
+    m = np.full(Gall.shape[1], np.inf)
+    for tx in ts:
+        for ty in ts:
+            qf = np.array([tx, ty, 0.0])
+            K = zx["bvec"].T @ (qf[:, None] + Gall.astype(np.float64))
+            m = np.minimum(m, np.sum(K * K, axis=0))
+    return np.ascontiguousarray(Gall[:, m <= K2max])
+
+
+def _sphere_slot(zx, q, GS):
+    """Miller columns of GS → stored sphere slots at q; −1 where outside
+    the sphere (channel is zero in the stored representation; Gaussian
+    weight bounded by exp(−cutoff/4α²))."""
+    n = int(zx["ngk"][q])
+    lut = {tuple(g): i for i, g in enumerate(zx["gvec"][q][:, :n].T)}
+    return np.array([lut.get(tuple(g), -1) for g in GS.T])
+
+
+def _eigh_backend(C_dev, mesh_xy: Mesh, backend: str):
+    """One Hermitian eigendecomposition, backend-dispatched.
+
+    ``auto``       → distributed cusolvermp on a true-2D SQUARE mesh,
+                     native (replicated) ``jnp.linalg.eigh`` otherwise —
+                     mirrors ``isdf.core._resolve_solver_kind_charge``.
+    ``off``        → force native jnp.linalg.eigh (replicated).
+    ``cusolvermp`` → force the cusolverMp FFI (square 2-D mesh only).
+    ``slate``      → force the SLATE FFI (portable backend, explicit-only).
+
+    Returns ``(lam, R)`` with TRUE column eigenvectors (ascending λ):
+    the cusolvermp wrapper's raw Q is conj-transposed here (its documented
+    layout), SLATE already returns columns.  Output R is left sharded
+    ``P('x','y')`` on FFI paths, replicated on the native path.
+    """
+    px = int(mesh_xy.shape["x"]); py = int(mesh_xy.shape["y"])
+    is_2d_square = (px >= 2 and px == py)
+    kind = backend
+    if backend == "auto":
+        kind = "cusolvermp" if is_2d_square else "off"
+    if kind == "off":
+        lam, R = jnp.linalg.eigh(C_dev)
+        return lam, R
+    if kind == "cusolvermp":
+        from ffi.cusolvermp.eigh import distributed_eigh
+        lam, Qraw = distributed_eigh(C_dev, mesh=mesh_xy)
+        return lam, jnp.conj(Qraw).T          # raw buffer → column eigenvectors
+    if kind == "slate":
+        from ffi.slate.eigh import distributed_eigh
+        lam, Q = distributed_eigh(C_dev, mesh=mesh_xy)
+        return lam, Q                          # already true columns
+    raise ValueError(f"eigh_backend must be auto|off|cusolvermp|slate, got {backend!r}")
+
+
+def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
+                   eigh_backend: str = "auto"):
+    """STAGE 1.  Returns the coarse-side bundle ``prep``:
+      S        (nq, n_μ, n_μ)  Tikhonov cleaning operators S_q (host copy,
+                               nulls only)
+      V_SRc    (nq, n_μ, n_μ)  cleaned short-range tiles — DEVICE stack,
+                               sharded ``P(None,'x','y')`` (the stencil data)
+      V_SRc_np (nq, n_μ, n_μ)  host copy (LOO ladders / metrics)
+      GS       (3, nG)         fixed LR Miller superset 𝒢(α)
+      Fch      (nq, n_μ, nG)   phase-factored cleaned LR form factors (host —
+                               fit input only, droppable after stage 2)
+      W        (nq, nG)        LSQ weights v_LR(q+G) (head slot → 0)
+      gz_cols  {gz: cols}      per-G_z column index into GS
+
+    Per-coarse-q linear algebra runs ON DEVICE with ``P('x','y')``-sharded
+    n_μ² tiles: eigh via ``_eigh_backend`` (distributed FFI on 2-D meshes),
+    then S_q = (R·g)R^H, V_c = conj(S)(V_ref − V_LR)conj(S) as sharded
+    GEMMs.  V_ref/V_LR are built from the stored ζ sphere as one
+    (n_μ × n_G) GEMM each.  n_μ is used at its LOGICAL extent here; the
+    jitted evaluator pads on output.
+    """
+    nq, n_mu = zx["nq"], zx["n_mu"]
+    assert np.max(np.abs(zx["qfr"][:, 2])) < 1e-12, "slab pipeline needs q_z=0"
+    GS = lr_gset(zx, alpha)
+    nG = GS.shape[1]
+    grid_xy = NamedSharding(mesh_xy, P("x", "y"))
+    row_x = NamedSharding(mesh_xy, P("x", None))
+
+    @partial(jax.jit, out_shardings=(grid_xy, row_x))
+    def _clean_split(C_h, lam, R, A_ref, A_lr, ZGq):
+        # S_q = R g_ε(Λ) R^H  (analytic Tikhonov filter of C_q; §12.3)
+        g = lam ** 2 / (lam ** 2 + (eps_tik * lam.max()) ** 2)
+        S = (R * g[None, :]) @ jnp.conj(R).T
+        S = jax.lax.with_sharding_constraint(S, grid_xy)
+        Sc = jnp.conj(S)
+        # V_ref − V_LR from the sphere factors A = ζ̃√v  (V = conj(A)A^T)
+        V_delta = jnp.conj(A_ref) @ A_ref.T - jnp.conj(A_lr) @ A_lr.T
+        V_delta = jax.lax.with_sharding_constraint(V_delta, grid_xy)
+        V_SRc = Sc @ V_delta @ Sc
+        zt = S @ ZGq                     # cleaned ζ̃ on the sphere (rows μ)
+        return V_SRc, zt
+
+    S_np = np.empty((nq, n_mu, n_mu), dtype=np.complex128)
+    V_SRc_np = np.empty((nq, n_mu, n_mu), dtype=np.complex128)
+    Fch = np.empty((nq, n_mu, nG), dtype=np.complex128)
+    W = np.empty((nq, nG))
+    n_out = 0
+    for q in range(nq):
+        C_h = 0.5 * (C_q[q] + C_q[q].conj().T)
+        C_dev = jax.device_put(jnp.asarray(C_h), grid_xy)
+        lam, R = _eigh_backend(C_dev, mesh_xy, eigh_backend)
+        # sphere factors for V_ref and V_LR (host kernel eval, device GEMM)
+        v_ref, n = v_sphere(zx, q)
+        v_lr, _ = v_sphere(zx, q, kind="slab_lr", alpha=alpha)
+        ZGq = zx["ZG"][q][:, :n]
+        A_ref = jnp.asarray(ZGq * np.sqrt(v_ref)[None, :n])
+        A_lr = jnp.asarray(ZGq * np.sqrt(v_lr)[None, :n])
+        V_SRc_q, zt = _clean_split(C_dev, lam, R,
+                                   jax.device_put(A_ref, row_x),
+                                   jax.device_put(A_lr, row_x),
+                                   jax.device_put(jnp.asarray(ZGq), row_x))
+        V_SRc_np[q] = np.asarray(jax.device_get(V_SRc_q))
+        # host copy of S for the null battery (S = (R·g)R^H rebuilt cheaply)
+        lam_h = np.asarray(jax.device_get(lam))
+        R_h = np.asarray(jax.device_get(R))
+        g_h = lam_h ** 2 / (lam_h ** 2 + (eps_tik * lam_h.max()) ** 2)
+        S_np[q] = (R_h * g_h[None, :]) @ R_h.conj().T
+        # (c) phase-factored cleaned form factors on the superset (host)
+        zt_h = np.zeros((n_mu, zx["ngkmax"]), dtype=np.complex128)
+        zt_h[:, :n] = np.asarray(jax.device_get(zt))
+        idx = _sphere_slot(zx, q, GS)
+        n_out += int(np.sum(idx < 0))
+        zt_ext = np.concatenate([zt_h, np.zeros((n_mu, 1), np.complex128)], 1)
+        qG = zx["qfr"][q][None, :] + GS.T.astype(np.float64)
+        ph = np.exp(2j * np.pi * (zx["rmu_frac"] @ qG.T))
+        Fch[q] = ph * zt_ext[:, idx]
+        W[q] = v_slab_on_set(zx, zx["qfr"][q], GS, kind="slab_lr", alpha=alpha)
+    tail = float(np.exp(-zx["zeta_cutoff"] / (4.0 * alpha ** 2)))
+    print(f"  [prep] gset({alpha}) = {nG} G; {n_out} out-of-sphere (q,G) "
+          f"channels zero-filled; sphere-tail bound {tail:.1e}")
+    V_SRc_dev = jax.device_put(jnp.asarray(V_SRc_np),
+                               NamedSharding(mesh_xy, P(None, "x", "y")))
+    return {"alpha": alpha, "eps_tik": eps_tik, "GS": GS, "S": S_np,
+            "V_SRc": V_SRc_dev, "V_SRc_np": V_SRc_np, "Fch": Fch, "W": W,
+            "gz_cols": {int(g): np.where(GS[2] == g)[0]
+                        for g in np.unique(GS[2])}}
+
+
+# ===========================================================================
+# STAGE 2 — the global b26p LR fit (host/replicated; see module docstring)
+# ===========================================================================
+def _poly_spec(d):
+    """[(a, b)] with a+b ≤ d, graded order."""
+    return [(a, t - a) for t in range(d + 1) for a in range(t + 1)]
+
+
+def _eval_basis_np(Kpar, spec, alpha):
+    """Design matrix (n_samples, nb): (K_x/2α)^p (K_y/2α)^r, real."""
+    s = 1.0 / (2.0 * alpha)
+    x, y = Kpar[0] * s, Kpar[1] * s
+    return np.stack([(x ** a) * (y ** b) if (a or b) else np.ones_like(x)
+                     for a, b in spec], 1)
+
+
+def lr_design_blocks(zx, prep, degrees=None):
+    """Per-(G_z, q) weighted normal blocks of the LR fit:
+        AtA[gz][q] = Φ^T diag(w) Φ     (nb, nb)   real basis
+        AtY[gz][q] = Φ^T diag(w) Y     (nb, n_μ)
+    with Φ the in-plane design at the (q, G) samples of channel gz,
+    w = v_LR(q+G), Y = Fch samples.  Channels with |gz| absent from
+    ``degrees`` are model-zero (dropped).  Per-q blocks make LOO refits
+    honest (target's samples excluded) at O(nb²) cost."""
+    if degrees is None:
+        degrees = DEG_B26P
+    nq = zx["nq"]
+    des = {"specs": {}, "AtA": {}, "AtY": {}, "alpha": prep["alpha"]}
+    for g, cols in prep["gz_cols"].items():
+        if abs(g) not in degrees:
+            continue
+        spec = _poly_spec(degrees[abs(g)])
+        nb = len(spec)
+        assert nb <= 0.6 * len(cols) * nq, f"gz={g}: basis under-determined"
+        AtA = np.empty((nq, nb, nb))
+        AtY = np.empty((nq, nb, zx["n_mu"]), dtype=np.complex128)
+        for q in range(nq):
+            qG = zx["qfr"][q][:, None] + prep["GS"][:, cols].astype(np.float64)
+            Kpar = (zx["bvec"].T @ qG)[:2]
+            Phi = _eval_basis_np(Kpar, spec, prep["alpha"])
+            w = prep["W"][q][cols]
+            Pw = Phi * w[:, None]
+            AtA[q] = Phi.T @ Pw
+            AtY[q] = Pw.T @ prep["Fch"][q][:, cols].T
+        des["specs"][g] = spec
+        des["AtA"][g] = AtA
+        des["AtY"][g] = AtY
+    ncoef = sum(len(s) for s in des["specs"].values())
+    print(f"  [fit] LR design: degrees {degrees} -> {ncoef} complex "
+          f"coefficients per mu (global)")
+    return des
+
+
+def fit_lr_model(des, exclude=None):
+    """STAGE 2 solve: one ridge-stabilised normal solve per G_z channel
+    over all coarse q except ``exclude``.  Returns {gz: C (nb, n_μ)} —
+    n_μ × 26 complex TOTAL for b26p."""
+    nq = next(iter(des["AtA"].values())).shape[0]
+    sel = [q for q in range(nq) if q != exclude]
+    out = {}
+    for g in des["specs"]:
+        A = des["AtA"][g][sel].sum(0)
+        Y = des["AtY"][g][sel].sum(0)
+        A = A + RIDGE * (np.trace(A) / A.shape[0]) * np.eye(A.shape[0])
+        out[g] = np.linalg.solve(A, Y)
+    return out
+
+
+# ===========================================================================
+# STAGE 3 — the ONE jitted evaluator at arbitrary target Q
+# ===========================================================================
+def stencil_r7(zx):
+    """The campaign's in-plane truncated-R stencil: 7 shortest lattice
+    vectors [i, j, 0] in the adot metric."""
+    Rall = np.array([[i, j, 0] for i in range(-2, 4) for j in range(-2, 4)])
+    d = np.sqrt(np.einsum("ri,ij,rj->r", Rall, zx["adot"], Rall))
+    return Rall[np.argsort(d)][:7]
+
+
+def stencil_pinv(q_train, Rset):
+    """Q-INDEPENDENT part of the trigonometric stencil weights:
+    pinv(F) with F_ji = e^{−2πi q_j·R_i}.  ``w(Q) = f0(Q) @ pinv(F)`` is
+    then evaluated inside the jitted ``eval_vq`` — exact (delta) when Q is
+    a training point and Rset resolves the grid."""
+    F = np.exp(-2j * np.pi * (np.asarray(q_train) @ np.asarray(Rset).T))
+    return np.linalg.pinv(F)
+
+
+def pack_coeffs(des, coeffs):
+    """Fitted b26p coefficients as a jit-friendly tuple, in the fixed
+    channel order of ``des['specs']`` (dict order is stable per build)."""
+    return tuple(jnp.asarray(coeffs[g]) for g in des["specs"])
+
+
+def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None):
+    """Build the ONE jitted arbitrary-Q evaluator.
+
+        eval_vq(Qfrac, V_SRc_stack, pinvF, coeffs_tuple) -> V(Q)
+
+    Q-DEPENDENT data enter as RUNTIME ARGUMENTS — target ``Qfrac``, the
+    SR-tile stack (whose training subset a LOO caller may swap), the
+    stencil pseudo-inverse ``pinvF`` (train-set-dependent), and the fitted
+    coefficient tuple (model/LOO-dependent) — so one compile serves every
+    Q on a path (per-q-recompile lesson).  Q-INDEPENDENT geometry (the
+    Miller superset, per-G_z column indices, polynomial specs, bvec,
+    centroid coordinates, the R stencil, slab-kernel constants) is baked
+    in as trace constants: it never changes between calls.
+
+    Per-element (module docstring, stage 3):
+        w_j(Q)   = e^{−2πi Q·R} pinv(F)                       (nR7)
+        V_SR(Q)  = Σ_j w_j V_SRc(q_j)                         (tile AXPYs)
+        M_μ(K)   = Φ(K_∥) C[gz]           per exact G_z channel, K = Q+G
+        A        = e^{−2πi(Q+G)·s_μ} M_μ √v_LR(Q+G)
+        V(Q)     = V_SR + conj(A) A^T
+
+    Output: (n_out, n_out) tile, ``P('x','y')``, n_out = ``n_rmu_pad`` (the
+    loader's padded extent; pad rows/cols zero) or the logical n_μ when
+    ``n_rmu_pad`` is None.  NO solve, NO eigh, NO r_tot object.
+    """
+    n_mu = zx["n_mu"]
+    n_out = int(n_rmu_pad) if n_rmu_pad is not None else n_mu
+    assert n_out >= n_mu
+    GS = jnp.asarray(prep["GS"].astype(np.float64))          # (3, nG)
+    bvec = jnp.asarray(zx["bvec"])
+    rmu = jnp.asarray(zx["rmu_frac"])                        # (n_μ, 3)
+    R7 = jnp.asarray(stencil_r7(zx).astype(np.float64))      # (7, 3)
+    alpha = float(prep["alpha"])
+    zc = float(np.pi / zx["bvec"][2, 2])
+    celvol = float(zx["celvol"])
+    specs = [(g, tuple(des["specs"][g]),
+              jnp.asarray(prep["gz_cols"][g], dtype=jnp.int32))
+             for g in des["specs"]]
+    grid_xy = NamedSharding(mesh_xy, P("x", "y"))
+    row_x = NamedSharding(mesh_xy, P("x", None))
+    row_y = NamedSharding(mesh_xy, P("y", None))
+
+    def _phi(Kpar, spec):
+        s = 1.0 / (2.0 * alpha)
+        x, y = Kpar[0] * s, Kpar[1] * s
+        return jnp.stack([(x ** a) * (y ** b) if (a or b) else jnp.ones_like(x)
+                          for a, b in spec], 1)
+
+    @partial(jax.jit, out_shardings=grid_xy)
+    def eval_vq(Qfrac, V_SRc_stack, pinvF, coeffs_tuple):
+        # ── SR stencil:  w(Q) = e^{−2πi Q·R} pinv(F);  V_SR = Σ_j w_j V_SRc ──
+        f0 = jnp.exp(-2j * jnp.pi * (Qfrac @ R7.T))          # (nR,)
+        w = f0 @ pinvF                                        # (n_train,)
+        V_SR = jnp.tensordot(w, V_SRc_stack, axes=(0, 0))     # (n_μ, n_μ) xy
+        V_SR = jax.lax.with_sharding_constraint(V_SR, grid_xy)
+        # ── LR model rebuild at K = Q+G (closed form, never interpolated) ──
+        K = bvec.T @ (Qfrac[:, None] + GS)                    # (3, nG)
+        M = jnp.zeros((n_mu, GS.shape[1]), dtype=jnp.complex128)
+        for i, (g, spec, cols) in enumerate(specs):
+            Phi = _phi(K[:2][:, cols], spec)                  # (ncol, nb)
+            M = M.at[:, cols].set((Phi @ coeffs_tuple[i]).T)
+        K2 = jnp.sum(K * K, axis=0)
+        zero = K2 < 1e-12                                     # q=0 G=0 slot only
+        K2s = jnp.where(zero, 1.0, K2)
+        f2d = 1.0 - jnp.exp(-zc * jnp.sqrt(K[0] ** 2 + K[1] ** 2)) \
+            * jnp.cos(K[2] * zc)
+        v = 8.0 * jnp.pi / K2s * f2d / celvol \
+            * jnp.exp(-K2 / (4.0 * alpha ** 2))
+        v = jnp.where(zero, 0.0, v)
+        qG = Qfrac[None, :] + GS.T                            # (nG, 3)
+        zt = jnp.exp(-2j * jnp.pi * (rmu @ qG.T)) * M         # (n_μ, nG)
+        A = zt * jnp.sqrt(v)[None, :]
+        A_x = jax.lax.with_sharding_constraint(A, row_x)
+        A_y = jax.lax.with_sharding_constraint(A, row_y)
+        V = V_SR + jnp.conj(A_x) @ A_y.T
+        if n_out > n_mu:
+            V = jnp.pad(V, ((0, n_out - n_mu), (0, n_out - n_mu)))
+        return jax.lax.with_sharding_constraint(V, grid_xy)
+
+    return eval_vq
+
+
+def eval_vq_host(zx, prep, des, coeffs, qfrac, train=None):
+    """Host-side reference evaluation (LOO ladders, nulls, tests) — the
+    same arithmetic as the jitted evaluator, numpy throughout."""
+    if train is None:
+        train = list(range(zx["nq"]))
+    R7 = stencil_r7(zx)
+    pinvF = stencil_pinv(zx["qfr"][train], R7)
+    f0 = np.exp(-2j * np.pi * (np.asarray(qfrac) @ R7.T))
+    w = f0 @ pinvF
+    V_SR = np.tensordot(w, prep["V_SRc_np"][train], axes=(0, 0))
+    GS = prep["GS"]
+    qf = np.asarray(qfrac, dtype=np.float64)
+    M = np.zeros((zx["n_mu"], GS.shape[1]), dtype=np.complex128)
+    Kall = zx["bvec"].T @ (qf[:, None] + GS.astype(np.float64))
+    for g, spec in des["specs"].items():
+        cols = prep["gz_cols"][g]
+        Phi = _eval_basis_np(Kall[:2][:, cols], spec, prep["alpha"])
+        M[:, cols] = (Phi @ coeffs[g]).T
+    v = v_slab_on_set(zx, qf, GS, kind="slab_lr", alpha=prep["alpha"])
+    qG = qf[None, :] + GS.T.astype(np.float64)
+    zt = np.exp(-2j * np.pi * (zx["rmu_frac"] @ qG.T)) * M
+    A = zt * np.sqrt(v)[None, :]
+    return V_SR + np.conj(A) @ A.T
+
+
+# ===========================================================================
+# nulls (must hold at machine level before any accuracy number is read)
+# ===========================================================================
+def run_nulls(zx, prep, des, coeffs):
+    ok = True
+
+    def log(k, v, tol):
+        nonlocal ok
+        flag = "  OK" if v <= tol else "  ** FAIL **"
+        if v > tol:
+            ok = False
+        print(f"    [null] {k:<44s} {v:.3e}{flag}")
+
+    # exact-stencil reproduction: with the FULL R lattice the trig weights
+    # are a delta, so "interpolating" to a training point returns its data
+    kg = zx["kgrid"]
+    Rfull = np.array([[i - kg[0] // 2, j - kg[1] // 2, 0]
+                      for i in range(kg[0]) for j in range(kg[1])])
+    q0 = 1
+    F = np.exp(-2j * np.pi * (zx["qfr"] @ Rfull.T))
+    f0 = np.exp(-2j * np.pi * (zx["qfr"][q0] @ Rfull.T))
+    w = f0 @ np.linalg.pinv(F)
+    log("exact_stencil_VSRc_train_point",
+        relF(np.tensordot(w, prep["V_SRc_np"], axes=(0, 0)),
+             prep["V_SRc_np"][q0]), 1e-9)
+    log("exact_stencil_Fch_train_point",
+        relF(np.tensordot(w, prep["Fch"], axes=(0, 0)), prep["Fch"][q0]),
+        1e-9)
+    # own F rebuild == cleaned LR tile (channel machinery consistency;
+    # bounded by the out-of-sphere zero-fill)
+    rr = []
+    for q in range(zx["nq"]):
+        Sc = np.conj(prep["S"][q])
+        VLRc = Sc @ make_vq(zx, zx["ZG"][q], q, kind="slab_lr",
+                            alpha=prep["alpha"]) @ Sc
+        qG = zx["qfr"][q][None, :] + prep["GS"].T.astype(np.float64)
+        zt = np.exp(-2j * np.pi * (zx["rmu_frac"] @ qG.T)) * prep["Fch"][q]
+        v = prep["W"][q]
+        A = zt * np.sqrt(v)[None, :]
+        rr.append(relF(np.conj(A) @ A.T, VLRc))
+    log("F_own_rebuild_vs_cleaned_LR_tile_max", float(np.max(rr)), 1e-6)
+    assert ok, "vq_interp null battery FAILED — stop"
+
+
+# ===========================================================================
+# exciton swap metric (reference build_hdir / exciton_evs, verbatim: TDA
+# gap-window Hamiltonian, direct term from stored W0; only the exchange
+# block B is swapped between truth and prediction)
+# ===========================================================================
+def build_hdir(zx, q0, nvw=3, ncw=3):
+    kg = zx["kgrid"]
+    cs = list(range(zx["nv"], zx["nv"] + ncw))
+    vs = list(range(zx["nv"] - nvw, zx["nv"]))
+    npair = zx["nk"] * ncw * nvw
+    kqs = np.array([kq_index(zx, k, q0) for k in range(zx["nk"])])
+    qkk = np.array([[zx["k_lookup"][tuple((zx["k_int"][k] - zx["k_int"][kp])
+                                          % kg)]
+                     for kp in range(zx["nk"])] for k in range(zx["nk"])])
+    D = np.array([zx["enk"][kqs[k], c] - zx["enk"][k, v]
+                  for k in range(zx["nk"]) for c in cs for v in vs])
+    psic = np.ascontiguousarray(zx["psi"][:, cs])
+    psiv = np.ascontiguousarray(zx["psi"][:, vs])
+    psic_kq = psic[kqs]
+    H = np.zeros((npair, npair), dtype=np.complex128)
+    bs = ncw * nvw
+    for k in range(zx["nk"]):
+        Tc = np.einsum("csm,KCsm->KcCm", np.conj(psic_kq[k]), psic_kq,
+                       optimize=True)
+        Tv = np.einsum("vsm,KVsm->KvVm", psiv[k], np.conj(psiv),
+                       optimize=True)
+        Wg = zx["W0"][qkk[k]]
+        blk = np.einsum("KcCm,Kmn,KvVn->KcvCV", Tc, Wg, Tv, optimize=True)
+        H[k * bs:(k + 1) * bs] = blk.transpose(1, 2, 0, 3, 4).reshape(bs,
+                                                                      npair)
+    return D, H / zx["nk"]
+
+
+def exciton_evs(zx, D, Hdir, B, nstate=4):
+    H = np.diag(D).astype(np.complex128) - Hdir + B / zx["nk"]
+    H = 0.5 * (H + np.conj(H.T))
+    return np.linalg.eigvalsh(H)[:nstate]
+
+
+# ===========================================================================
+# Per-Q ζ REFIT — the compute-don't-interpolate ground truth (§2d / §11.4)
+# ===========================================================================
+# The production default V_Q source: redo the ISDF fit AT the target
+# momentum from htransform-reconstructed full-r wavefunctions.  This is the
+# off-grid ground truth the interpolation program has been missing — every
+# off-grid accuracy number quoted for eval_vq is scored against THIS.
+#
+# Per-element (fit conventions == the GW producer, gated by the on-grid
+# null refit-vs-stored below):
+#     ρ̃_kmn(r) = Σ_s conj(u^{ht}_{m, wrap(k−q), s}(r)) u_{n, k, s}(r)
+#         (cell-periodic u at wrapped labels — torus convention, both legs;
+#          m-leg from htransform: u_m(r) = Σ_α c_{m,wrap(k−q)}[α] B_full[α](r))
+#     C_Q[μν] = Σ_{k,mn} conj(ρ̃(r_μ)) ρ̃(r_ν)
+#     Z_Q[μr] = Σ_{k,mn} conj(ρ̃(r_μ)) ρ̃(r)
+#     ζ̃_Q    = (C_Q + 1e-14·|tr C_Q|·I)⁻¹ Z_Q          (producer ridge,
+#               isdf.core._ridged_chol; Cholesky + two triangular solves)
+#     ζ̃_Q(G) = FFT_r ζ̃_Q  gathered on the sphere |bᵀ(q+G)|² ≤ cutoff
+#     V_Q    = Σ_G conj(ζ̃(G)) v(q+G) ζ̃(G)
+#
+# Scale note: this mode holds full-r ψ for the whole fit window on device
+# (~(nk·nb)·(ns·n_rtot)·16 B — ~1 GB on the MoS2 3×3 fixtures) and costs a
+# fit-scale GEMM chain per Q.  It is the EXPENSIVE mode by design; the
+# fixture-scale target is 1 GPU, minutes per Q.
+
+def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
+                  r_chunk: int = 2048):
+    """One-time refit state: htransform handles + full-r α-basis.
+
+    Returns ``rst`` dict:
+      ctilde, B_at_mu, enk_sigma, kgrid_co — htransform setup (window ==
+          the ζ-fit window; asserted against ``zx``)
+      psi_r    (nk·nb, ns·n_rp)  stored-window u on the full r-grid, device,
+                                 zero-padded on r to a multiple of r_chunk
+      B_full   (rank, ns·n_rp)   α-basis on the full r-grid = W_proj ψ_r
+      n_rtot, r_chunk, galerkin_rel — bookkeeping + printed residual
+    """
+    from gw.gw_config import read_lorrax_input
+    from bandstructure.htransform import initialize_wfns
+    from common.wfn_transforms import iter_psi_rchunk_bandwise
+
+    params = read_lorrax_input(input_file)
+    (wfn, sym, meta, _, _S, ctilde, B_at_mu, enk_sigma,
+     W_proj) = initialize_wfns(input_file, params, log_fn, mesh_xy=mesh_xy,
+                               return_full_proj=True)
+    nk, nb, rank = int(ctilde.shape[0]), int(ctilde.shape[1]), int(ctilde.shape[2])
+    ns = int(B_at_mu.shape[1])
+    assert nk == zx["nk"] and nb == zx["nb"] and ns == zx["ns"], \
+        (f"htransform window (nk={nk}, nb={nb}, ns={ns}) != zeta-fit window "
+         f"(nk={zx['nk']}, nb={zx['nb']}, ns={zx['ns']})")
+    fg = tuple(int(x) for x in meta.fft_grid)
+    assert fg == (zx["nx"], zx["ny"], zx["nz"]), \
+        f"WFN FFT grid {fg} != zeta_q.h5 grid {(zx['nx'], zx['ny'], zx['nz'])}"
+    n_rtot = zx["n_rtot"]
+
+    # Stream the stored window ψ onto the full r-grid (host assembly, one
+    # band chunk at a time), then push once to device.  Window = the σ/fit
+    # window (nelec − nval, nelec + ncond) — same as initialize_wfns used.
+    nelec = int(wfn.nelec)
+    band_range = (nelec - int(params["nval"]), nelec + int(params["ncond"]))
+    psi_r_host = np.empty((nk, nb, ns, n_rtot), dtype=np.complex128)
+    for bc_range, psi_bc in iter_psi_rchunk_bandwise(
+            wfn, sym, meta, mesh_xy, band_range, 0, n_rtot,
+            bool(params.get("bispinor", False)), band_chunk_size=16):
+        lo = bc_range[0] - band_range[0]
+        hi = bc_range[1] - band_range[0]
+        psi_r_host[:, lo:hi] = np.asarray(jax.device_get(psi_bc))
+    n_rp = ((n_rtot + r_chunk - 1) // r_chunk) * r_chunk
+    if n_rp > n_rtot:
+        psi_r_host = np.concatenate(
+            [psi_r_host, np.zeros((nk, nb, ns, n_rp - n_rtot),
+                                  dtype=np.complex128)], axis=3)
+    psi_r = jnp.asarray(psi_r_host.reshape(nk * nb, ns * n_rp))
+    del psi_r_host
+    # α-basis on full r; Galerkin fidelity printed (the refit floor at
+    # on-grid q is bounded below by this residual)
+    W_proj = jnp.asarray(W_proj)
+    # ns folds with r: W_proj columns are (nk·nb); psi_r rows likewise —
+    # but the SVD's column space folded (ns, n_mu); on full r the fold is
+    # (ns, n_rp), consistent because ψ rows carry (s, r) in C order.
+    B_full = W_proj @ psi_r                      # (rank, ns·n_rp)
+    rec = jnp.asarray(ctilde.reshape(nk * nb, rank)) @ B_full
+    gal = float(jnp.linalg.norm(rec - psi_r) / jnp.linalg.norm(psi_r))
+    log_fn(f"  [refit] Galerkin full-r residual ‖cB−ψ‖/‖ψ‖ = {gal:.3e} "
+           f"(refit-vs-stored on-grid floor is bounded by this)")
+    return {"ctilde": ctilde, "B_at_mu": B_at_mu, "enk_sigma": enk_sigma,
+            "kgrid_co": (int(meta.nkx), int(meta.nky), int(meta.nkz)),
+            "psi_r": psi_r, "B_full": B_full, "n_rtot": n_rtot,
+            "n_rp": n_rp, "r_chunk": int(r_chunk), "galerkin_rel": gal,
+            "rank": rank}
+
+
+def _sphere_millers(zx, qw):
+    """All Miller G with |bᵀ(qw+G)|² ≤ zeta_cutoff (the fit sphere at qw)."""
+    Kmax = np.sqrt(zx["zeta_cutoff"])
+    nmax = [int(np.ceil(Kmax / np.linalg.norm(zx["bvec"][i]))) + 1
+            for i in range(3)]
+    gr = [np.arange(-n, n + 1) for n in nmax]
+    GX, GY, GZ = np.meshgrid(*gr, indexing="ij")
+    Gall = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], 0)
+    K2 = np.sum((zx["bvec"].T @ (np.asarray(qw)[:, None]
+                                 + Gall.astype(np.float64))) ** 2, axis=0)
+    return np.ascontiguousarray(Gall[:, K2 <= zx["zeta_cutoff"]])
+
+
+_REFIT_KERNELS: dict = {}
+
+
+def _refit_kernels(nk, nb, ns, n_mu, rank, r_chunk):
+    """Jitted refit chunk kernels, cached on the (shape) signature so every
+    refit Q after the first is dispatch-only (per-q-recompile lesson)."""
+    key = (nk, nb, ns, n_mu, rank, r_chunk)
+    hit = _REFIT_KERNELS.get(key)
+    if hit is not None:
+        return hit
+
+    @jax.jit
+    def _cq_and_x(psi_m_mu, psi_mu):
+        # X[k,m,n,μ] = Σ_s conj(u^{ht}_{m,k−q,s}(μ)) u_{n,k,s}(μ)  (spin-traced)
+        X = jnp.einsum("kmsu,knsu->kmnu", jnp.conj(psi_m_mu), psi_mu)
+        Xf = X.reshape(nk * nb * nb, n_mu)
+        C = jnp.conj(Xf).T @ Xf
+        return Xf, 0.5 * (C + jnp.conj(C).T)
+
+    @jax.jit
+    def _z_chunk(c_m, B_chunk, psi_chunk, Xf):
+        # ψ^{ht}_{m,k−q,s}(r) = Σ_α c_m[k,α,m] B_full[α,s,r]   (chunk of r)
+        psi_m = jnp.einsum("kam,asr->kmsr", c_m,
+                           B_chunk.reshape(rank, ns, r_chunk))
+        rho = jnp.einsum("kmsr,knsr->kmnr", jnp.conj(psi_m),
+                         psi_chunk.reshape(nk, nb, ns, r_chunk))
+        return jnp.conj(Xf).T @ rho.reshape(nk * nb * nb, r_chunk)
+
+    @jax.jit
+    def _solve_zeta(C, Z):
+        # producer convention (isdf.core._ridged_chol + solve_zeta charge
+        # path): Cholesky of C + 1e-14·|tr C|·I, two triangular solves.
+        ridge = 1e-14 * jnp.abs(jnp.trace(C))
+        L = jnp.linalg.cholesky(C + ridge * jnp.eye(C.shape[0], dtype=C.dtype))
+        y = jax.scipy.linalg.solve_triangular(L, Z, lower=True)
+        return jax.scipy.linalg.solve_triangular(
+            jnp.conj(L).T, y, lower=False)
+
+    kernels = (_cq_and_x, _z_chunk, _solve_zeta)
+    _REFIT_KERNELS[key] = kernels
+    return kernels
+
+
+def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print):
+    """Ground-truth V at TILE momentum ``q_tile_frac`` via a per-Q ζ refit.
+
+    Tile-momentum labeling matches ``V_qmunu`` / ``eval_vq``: the pair
+    density carries conduction at wrap(k − q).  Returns the (n_μ, n_μ)
+    host tile (Hermitian by construction).
+
+    On-grid null: ``refit_vq`` at a coarse q reproduces the stored
+    ``V_qmunu[q]`` up to the Galerkin/htransform floor (printed by
+    ``refit_prepare``); the driver's refit gate asserts this before any
+    off-grid refit number is quoted.
+    """
+    import time as _time
+    from bandstructure.bse_setup import compute_wfns_fi
+
+    t0 = _time.time()
+    nk, nb, ns, n_mu = zx["nk"], zx["nb"], zx["ns"], zx["n_mu"]
+    rank = rst["rank"]
+    r_chunk = rst["r_chunk"]
+    qw = np.asarray(q_tile_frac, dtype=np.float64)
+    qw = qw - np.round(qw)
+    # m-leg q list: wrap(k − q) for every coarse k
+    k_frac = zx["k_int"].astype(np.float64) / zx["kgrid"][None, :]
+    qm_list = k_frac - qw[None, :]
+    bundle = compute_wfns_fi(
+        ctilde=rst["ctilde"], B_at_mu=rst["B_at_mu"],
+        enk_sigma=rst["enk_sigma"], kgrid_co=rst["kgrid_co"],
+        band_window_fi=(0, nb), mesh_xy=mesh_xy, q_list=qm_list,
+        return_coeffs=True)
+    psi_m_mu = jnp.asarray(bundle.psi_rmu_Y)          # (nk, nb, ns, n_μ)
+    c_m = jnp.asarray(bundle.coeffs_fi)               # (nk, rank, nb)
+
+    cq_and_x, z_chunk, solve_zeta = _refit_kernels(
+        nk, nb, ns, n_mu, rank, r_chunk)
+    Xf, C = cq_and_x(psi_m_mu, jnp.asarray(zx["psi"]))
+    n_rp = rst["n_rp"]
+    Z_parts = []
+    B_full = rst["B_full"].reshape(rank, ns, n_rp)
+    psi_r = rst["psi_r"].reshape(nk * nb, ns, n_rp)
+    for r0 in range(0, n_rp, r_chunk):
+        Z_parts.append(z_chunk(
+            c_m, B_full[:, :, r0:r0 + r_chunk].reshape(rank, ns * r_chunk),
+            psi_r[:, :, r0:r0 + r_chunk].reshape(nk * nb, ns * r_chunk), Xf))
+    # Z columns are r slots of the PADDED grid; solve then trim the r pad
+    # (pad columns are exact zeros — zero ψ ⇒ zero ρ ⇒ zero Z).
+    Z = jnp.concatenate(Z_parts, axis=1)              # (n_μ, n_rp)
+    zeta = solve_zeta(C, Z)[:, : rst["n_rtot"]]       # (n_μ, n_rtot)
+    # periodic-frame ζ̃ → sphere coefficients at qw → V tile
+    zeta_box = zeta.reshape(n_mu, zx["nx"], zx["ny"], zx["nz"])
+    ztG_box = jnp.fft.fftn(zeta_box, axes=(1, 2, 3), norm="backward") \
+        .reshape(n_mu, zx["n_rtot"])
+    GS = _sphere_millers(zx, qw)
+    fi = flat_idx(zx, GS)
+    zt = np.asarray(jax.device_get(ztG_box[:, jnp.asarray(fi)]))
+    v = v_slab_on_set(zx, qw, GS)
+    A = zt * np.sqrt(v)[None, :]
+    V = np.conj(A) @ A.T
+    log_fn(f"  [refit] q_tile={np.array2string(qw, precision=4)}: "
+           f"|G_sphere|={GS.shape[1]}, {_time.time()-t0:.1f}s")
+    return V

@@ -61,14 +61,18 @@ def compute_wfns_fi(
     B_at_mu: jax.Array,
     enk_sigma: jax.Array,
     kgrid_co: tuple[int, int, int],
-    kgrid_fi,
+    kgrid_fi=None,
     band_window_fi: tuple[int, int],
     mesh_xy: Mesh,
     a_band_index: int | None = None,
     batch_size: int = 32,
+    q_list=None,
+    return_coeffs: bool = False,
     log_fn=None,
 ):
-    """Recover ψ at the coarse-grid centroids on a finer uniform k-grid.
+    """Recover ψ at the coarse-grid centroids on a finer uniform k-grid —
+    or on an EXPLICIT list of arbitrary q (the arbitrary-Q generalization,
+    arbitrary_q_bse.md §1/§2a: e.g. the shifted grid {k + Q}).
 
     Args:
         ctilde:    (nk_co, nb, rank) Galerkin coeffs in the rank-α basis,
@@ -77,12 +81,21 @@ def compute_wfns_fi(
         enk_sigma: (nb, nk_co) DFT band energies in Ry.
         kgrid_co:  (nkx, nky, nkz) coarse uniform k-grid.
         kgrid_fi:  (nkx_fi, nky_fi, nkz_fi) fine k-grid; tuple/list/string.
+                   Mutually exclusive with ``q_list``.
         band_window_fi: (b_min, b_max) — sub-window of the htransform band
                    axis to keep on the fine grid (0-based, exclusive end).
         mesh_xy:   ('x','y') device mesh.
         a_band_index: optional band index for the f-transform 'a' parameter
                    (defaults to the top of the htransform window).
         batch_size: q-points per fH_q batch (≥1 jit compile reuse).
+        q_list:    optional (nq, 3) fractional q — evaluate at exactly these
+                   points instead of a uniform grid.  Wrapped to (−0.5, 0.5]
+                   internally (fH_q is exactly BZ-periodic, so wrapping is a
+                   no-op on values; it keeps phases well-conditioned).
+        return_coeffs: also return the rank-α eigenvector coefficients
+                   ``.coeffs_fi`` (nk_fi, rank, nb_fi), replicated — the
+                   per-q ζ-refit consumes them to rebuild ψ on the full
+                   r-grid through the streamed α-basis.
         log_fn:    optional logger.
 
     Returns:
@@ -93,12 +106,14 @@ def compute_wfns_fi(
                                                   via ``newton_inv`` of fH_q eigvals
             .lam_fi:     (nk_fi, nb_fi)           raw fH_q eigenvalues (= f(ε_n,q))
                                                   kept for diagnostics
+            .coeffs_fi:  (nk_fi, rank, nb_fi)     only when ``return_coeffs``
 
     Both wfn copies live on-device and are sharding-distinct so any
     contraction over (n_μ) along either mesh axis stays local.
     """
     log = log_fn if log_fn is not None else (lambda *a, **kw: None)
-    kgrid_fi = _parse_kgrid_fi(kgrid_fi)
+    if (kgrid_fi is None) == (q_list is None):
+        raise ValueError("pass exactly one of kgrid_fi / q_list")
     nb_co = int(ctilde.shape[1])
     rank = int(ctilde.shape[2])
     nspinor = int(B_at_mu.shape[1])
@@ -110,9 +125,16 @@ def compute_wfns_fi(
         raise ValueError(
             f"band_window_fi {band_window_fi} not a valid sub-range of [0, {rank})")
 
-    nq = kgrid_fi[0] * kgrid_fi[1] * kgrid_fi[2]
-    log(f"  bse_setup: {kgrid_co} → {kgrid_fi} ({nq} q-pts), "
-        f"bands [{b_min}, {b_max}) of {rank}, batch={batch_size}")
+    if q_list is None:
+        kgrid_fi = _parse_kgrid_fi(kgrid_fi)
+        nq = kgrid_fi[0] * kgrid_fi[1] * kgrid_fi[2]
+        log(f"  bse_setup: {kgrid_co} → {kgrid_fi} ({nq} q-pts), "
+            f"bands [{b_min}, {b_max}) of {rank}, batch={batch_size}")
+    else:
+        q_list = np.asarray(q_list, dtype=np.float64).reshape(-1, 3)
+        nq = q_list.shape[0]
+        log(f"  bse_setup: {kgrid_co} → explicit q-list ({nq} q-pts), "
+            f"bands [{b_min}, {b_max}) of {rank}, batch={batch_size}")
 
     # ── Build fH_R via the shared htransform core ────────────────────────
     fH_k, fH_R, (a_f, n_f, shift), _f_eps = build_fH_R(
@@ -126,8 +148,11 @@ def compute_wfns_fi(
     B_rep = jax.device_put(B_at_mu, rep)
     R_grid = jnp.asarray(build_R_grid_np(kgrid_co))
 
-    # ── Fine-grid q-points, padded to a multiple of batch_size for reuse ─
-    q_all = _uniform_kgrid_frac(kgrid_fi)
+    # ── q-points (uniform fine grid or explicit list), padded to batch ───
+    if q_list is None:
+        q_all = _uniform_kgrid_frac(kgrid_fi)
+    else:
+        q_all = jnp.asarray((q_list + 0.5) % 1.0 - 0.5)
     n_pad = (-nq) % batch_size
     q_pad = (jnp.concatenate([q_all, jnp.zeros((n_pad, 3), dtype=q_all.dtype)])
              if n_pad else q_all)
@@ -143,16 +168,20 @@ def compute_wfns_fi(
         lam, U = jnp.linalg.eigh(fH_q)                                  # ascending
         c = U[:, :, b_min:b_max]                                        # (bs, rank, nb_fi)
         psi = jnp.einsum('qan,asm->qnsm', c, B)                         # (bs, nb_fi, ns, n_μ)
-        return lam[:, b_min:b_max], psi
+        return lam[:, b_min:b_max], psi, c
 
-    lam_chunks, psi_chunks = [], []
+    lam_chunks, psi_chunks, c_chunks = [], [], []
     for i in range(0, q_pad.shape[0], batch_size):
-        lam_b, psi_b = _q_batch(q_pad[i:i+batch_size], fH_R_rep, B_rep, b_min, b_max)
+        lam_b, psi_b, c_b = _q_batch(q_pad[i:i+batch_size], fH_R_rep, B_rep, b_min, b_max)
         lam_chunks.append(lam_b)
         psi_chunks.append(psi_b)
+        if return_coeffs:
+            c_chunks.append(c_b)
         jax.block_until_ready(psi_b)
     lam_fi = jnp.concatenate(lam_chunks, axis=0)[:nq]
     psi_fi = jnp.concatenate(psi_chunks, axis=0)[:nq]
+    coeffs_fi = (jnp.concatenate(c_chunks, axis=0)[:nq]
+                 if return_coeffs else None)
 
     # ── Newton-invert lam_fi → DFT-equivalent energies ───────────────────
     @jax.jit
@@ -176,9 +205,12 @@ def compute_wfns_fi(
 
     psi_rmu_Y, psi_rmuT_X = _make_bundle(psi_fi)
     log(f"  bundle: psi_rmu_Y={psi_rmu_Y.shape}, psi_rmuT_X={psi_rmuT_X.shape}")
-    return SimpleNamespace(
+    out = SimpleNamespace(
         psi_rmu_Y=psi_rmu_Y,
         psi_rmuT_X=psi_rmuT_X,
         enk_full=energies_fi,
         lam_fi=lam_fi,
     )
+    if return_coeffs:
+        out.coeffs_fi = coeffs_fi
+    return out
