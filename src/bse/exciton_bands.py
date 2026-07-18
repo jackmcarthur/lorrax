@@ -247,6 +247,10 @@ def main(argv=None):
                     choices=("auto", "off", "cusolvermp", "slate"))
     ap.add_argument("--px", type=int, default=1)
     ap.add_argument("--py", type=int, default=1)
+    ap.add_argument("--skip-rerun-check", action="store_true",
+                    help="skip the diagnostic warm re-run of the solve scan "
+                         "(reproducibility assert + dispatch-only timing); "
+                         "the re-run costs a full second solve pass")
     ap.add_argument("--out-prefix", type=str, default="exciton_bands")
     args = ap.parse_args(argv)
 
@@ -407,19 +411,26 @@ def main(argv=None):
     evs_all = np.asarray(jax.device_get(evs_all))     # (n_solve, n_eig) Ry
     t_first = time.time() - t_c0
     tick("solve_scan_cold", t_c0)
-    # warm re-run for the census-clean per-Q cost (dispatch-only)
-    t_w0 = time.time()
-    evs2 = np.asarray(jax.device_get(
-        solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
-               data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R)))
-    t_warm = time.time() - t_w0
-    tick("solve_scan_warm", t_w0)
-    assert np.allclose(evs2, evs_all, atol=1e-10), "scan re-run not reproducible"
+    if not args.skip_rerun_check:
+        # warm re-run: census-clean per-Q cost + reproducibility assert.
+        # Pure diagnostic — 42% of a 40-pt 12×12 production wall (183 s);
+        # skip it with --skip-rerun-check once a configuration is trusted.
+        t_w0 = time.time()
+        evs2 = np.asarray(jax.device_get(
+            solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
+                   data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R)))
+        t_warm = time.time() - t_w0
+        tick("solve_scan_warm", t_w0)
+        assert np.allclose(evs2, evs_all, atol=1e-10), \
+            "scan re-run not reproducible"
+        print(f"solve_path: cold {t_first:.2f}s (incl. ONE compile), warm "
+              f"{t_warm:.2f}s = {t_warm/n_solve*1e3:.1f} ms/Q over {n_solve} Q")
+    else:
+        print(f"solve_path: cold {t_first:.2f}s (incl. ONE compile) over "
+              f"{n_solve} Q; warm re-run check SKIPPED")
     mem = solver.lower(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                        data["psi_v_X"], data["psi_v_Y"], data["eps_v"],
                        W_R).compile().memory_analysis()
-    print(f"solve_path: cold {t_first:.2f}s (incl. ONE compile), warm "
-          f"{t_warm:.2f}s = {t_warm/n_solve*1e3:.1f} ms/Q over {n_solve} Q")
     print(f"solve_path memory_analysis: temp={mem.temp_size_in_bytes/2**20:.1f} MiB "
           f"args={mem.argument_size_in_bytes/2**20:.1f} MiB "
           f"out={mem.output_size_in_bytes/2**20:.1f} MiB")
