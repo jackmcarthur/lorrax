@@ -235,6 +235,11 @@ def main(argv=None):
     ap.add_argument("--refit-points", type=str, default=None,
                     help="comma list of path indices to refit "
                          "(vq-mode=both; default ~5 evenly spaced)")
+    ap.add_argument("--refit-r-chunk", type=int, default=2048,
+                    help="r-grid chunk of the refit Z build (vq_interp."
+                         "refit_prepare); the per-chunk pair-density temp "
+                         "is (nk, nb, nb, r_chunk) c128 — shrink on dense "
+                         "k-grids (e.g. 512 at 12x12) to fit device memory")
     ap.add_argument("--alpha", type=float, default=vq_interp.ALPHA)
     ap.add_argument("--eps-tik", type=float, default=vq_interp.EPS_TIK)
     ap.add_argument("--eigh-backend", default="auto",
@@ -366,7 +371,8 @@ def main(argv=None):
         else:
             refit_idx = sorted({int(i) for i in
                                 np.linspace(1, nQ - 2, 5).round()})
-        rst = vq_interp.refit_prepare(args.input, mesh_xy, zx)
+        rst = vq_interp.refit_prepare(args.input, mesh_xy, zx,
+                                      r_chunk=args.refit_r_chunk)
         for iQ in refit_idx:
             q_tile = -Qpath[iQ]
             V_np = vq_interp.refit_vq(zx, rst, q_tile, mesh_xy)
