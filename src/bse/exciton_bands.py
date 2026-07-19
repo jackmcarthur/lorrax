@@ -13,7 +13,14 @@ every Q of a user-supplied high-symmetry path with ONE compiled engine:
     with an explicit q-list = {k + Q}): mutually consistent eigenpairs of
     one interpolated fH_{k+Q}; no shifted NSCF, no Sternheimer
     (arbitrary_q_bse.md §1/§2a-b).  htransform returns cell-periodic u at
-    wrapped labels — the same torus convention as the stored grid ψ.
+    wrapped labels — the same torus convention as the stored grid ψ.  The fH
+    is built over the FULL loaded band window (all valence + all conduction of
+    the input, e.g. nband=40 = 26v+14c), EXACTLY as the standard SP
+    bandstructure driver builds it; the BSE conduction bands are a sub-window
+    returned interior to it, guarded above by the extra conduction bands so no
+    selection boundary cuts a near-degenerate pair.  Running on a sliver
+    conduction window instead makes the off-grid caches ring 100-1000 meV
+    (spurious exciton dips); use a full-band input.
   * **Direct kernel W(k−k')** — UNCHANGED coarse tiles + coarse-k FFT
     convolution (all k-differences stay on-grid when every conduction leg
     shifts by the same Q; §2c per-element verification).  The matvec is the
@@ -240,6 +247,16 @@ def main(argv=None):
                          "refit_prepare); the per-chunk pair-density temp "
                          "is (nk, nb, nb, r_chunk) c128 — shrink on dense "
                          "k-grids (e.g. 512 at 12x12) to fit device memory")
+    ap.add_argument("--a-band", type=int, default=None,
+                    help="htransform window-RELATIVE band index whose "
+                         "bandwidth sets the f-transform width a = 4*BW "
+                         "(bandstructure.htransform._f_params_from_energies). "
+                         "Default (None) matches the standard SP driver: a "
+                         "from the top band of the full window.  Set this to a "
+                         "low-bandwidth conduction band only if the selected "
+                         "conduction caches land in the f'->0 compression zone "
+                         "(a large default a from a dispersive top guard band "
+                         "can collapse off-grid eps_c(k+Q) by eV).")
     ap.add_argument("--alpha", type=float, default=vq_interp.ALPHA)
     ap.add_argument("--eps-tik", type=float, default=vq_interp.EPS_TIK)
     ap.add_argument("--eigh-backend", default="auto",
@@ -300,9 +317,39 @@ def main(argv=None):
     tick("htransform_setup", t0)
 
     # ── conduction caches ψ_c(k+Q), ε_c(k+Q) for the whole path ──────────
+    # FULL-BAND htransform basis — the single lever that removes the off-grid
+    # window-cache ringing.  compute_wfns_fi builds fH from ALL bands in
+    # ``ctilde`` (the entire loaded window = input nval+ncond) and only
+    # RETURNS the sub-window [b_min, b_max); so a full-band ctilde gives a
+    # full-band fH regardless of how few conduction bands the BSE keeps.  With
+    # the standard driver's window (nband=40 = 26v+14c) the BSE conduction
+    # bands [b_min, b_max) sit strictly INTERIOR, guarded above by the extra
+    # conduction bands — every selection boundary stays off any near-
+    # degenerate (Kramers) pair.  A SLIVER conduction window whose top
+    # boundary cuts a near-degenerate pair instead rings 100-1000 meV off-grid
+    # (05_htransform_spbands/gap_scan; Si degeneracy root-cause 73e58f79).
     t0 = time.time()
-    nval_in = int(params["nval"])       # window offset: conduction starts here
+    nb_window = int(ctilde.shape[1])    # bands in the htransform fH (= input nval+ncond)
+    nval_in = int(params["nval"])       # window-relative CBM index (VBM = nval_in-1)
     b_min, b_max = nval_in, nval_in + n_cond
+    n_guard = nb_window - b_max         # conduction bands ABOVE the BSE selection
+    if b_max > nb_window:
+        raise ValueError(
+            f"BSE conduction window [{b_min},{b_max}) exceeds the htransform "
+            f"fH window ({nb_window} bands): raise nband in {args.input} to "
+            f">= {b_max}, or drop --n-cond to <= {nb_window - nval_in}")
+    if n_guard < 4:
+        print(f"  [warn] only {n_guard} conduction guard band(s) above the BSE "
+              f"selection — a selection boundary near a Kramers pair can ring "
+              f"off-grid; widen the input's ncond/nband (>= {b_max + 4} bands).")
+    if nb_window - nval_in > n_cond + 24:
+        print(f"  [warn] htransform fH spans {nb_window - nval_in} conduction "
+              f"bands; high oscillatory bands can push the alpha-basis past its "
+              f"ns*n_mu capacity and degrade the caches — nband=40 (26v+14c) is "
+              f"the validated MoS2 full-band window.")
+    print(f"  full-band htransform: fH over {nb_window} bands "
+          f"({nval_in}v + {nb_window - nval_in}c); BSE conduction "
+          f"[{b_min},{b_max}) = {n_cond} band(s) + {n_guard} guard(s)")
     k_frac = np.stack(np.meshgrid(np.arange(nkx) / nkx, np.arange(nky) / nky,
                                   np.arange(nkz) / nkz, indexing="ij"),
                       axis=-1).reshape(-1, 3)
@@ -310,7 +357,8 @@ def main(argv=None):
     bundle = compute_wfns_fi(
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=(nkx, nky, nkz), band_window_fi=(b_min, b_max),
-        mesh_xy=mesh_xy, q_list=q_list, log_fn=print)
+        mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
+        log_fn=print)
     psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
         bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
     tick("htransform_psi_cQ", t0)
