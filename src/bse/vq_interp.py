@@ -520,6 +520,27 @@ def _eigh_backend(C_dev, mesh_xy: Mesh, backend: str):
     raise ValueError(f"eigh_backend must be auto|off|cusolvermp|slate, got {backend!r}")
 
 
+def _to_host(x):
+    """Gather a device array to a full host numpy array on EVERY process,
+    whether it is PROCESS-SPANNING or fully addressable.
+
+    The per-q ζ-clean tiles are q-sharded ``P(('x','y'),...)`` across the whole
+    (multi-node) mesh, so on a 16-process run no single process holds the full
+    stack and ``jax.device_get`` raises; ``multihost_utils.process_allgather``
+    stitches the global array (gathering only the sharded q-axis).  It is
+    COLLECTIVE — every process must reach it in lockstep; the
+    ``prepare_coarse`` chunk loop is deterministic (same nq / q_chunk on all
+    processes), so they do.  A FULLY-ADDRESSABLE input (single-GPU run, or a
+    replicated array) must instead use ``device_get`` — ``process_allgather(
+    tiled=True)`` would DUPLICATE its leading axis by the process count.  Branch
+    on ``is_fully_addressable`` (a global property, so the collective stays in
+    lockstep); this keeps the 1-GPU path a plain device_get."""
+    if getattr(x, "is_fully_addressable", True):
+        return np.asarray(jax.device_get(x))
+    from jax.experimental import multihost_utils
+    return np.asarray(multihost_utils.process_allgather(x, tiled=True))
+
+
 def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
                    eigh_backend: str = "auto", q_chunk: int = 48):
     """STAGE 1.  Returns the coarse-side bundle ``prep``:
@@ -629,9 +650,12 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
             jax.device_put(jnp.asarray(v_lr_all[sl]), qb2),
             jax.device_put(jnp.asarray(idx_all[sl]), qb2),
             jax.device_put(jnp.asarray(zx["qfr"][sl]), qb2))
-        S_np[sl] = np.asarray(jax.device_get(S_b))
-        V_SRc_np[sl] = np.asarray(jax.device_get(V_b))
-        Fch[sl] = np.asarray(jax.device_get(F_b))
+        # process_allgather (not device_get): S_b/V_b/F_b are q-sharded qb3
+        # across the whole mesh, so on a multi-node run their shards span other
+        # processes and device_get would raise (non-addressable).
+        S_np[sl] = _to_host(S_b)
+        V_SRc_np[sl] = _to_host(V_b)
+        Fch[sl] = _to_host(F_b)
     tail = float(np.exp(-zx["zeta_cutoff"] / (4.0 * alpha ** 2)))
     print(f"  [prep] gset({alpha}) = {nG} G; {n_out} out-of-sphere (q,G) "
           f"channels zero-filled; sphere-tail bound {tail:.1e}")

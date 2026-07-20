@@ -834,11 +834,19 @@ def gflat_to_rmu(
             f"{r_mu_arr.shape}.")
     n_rmu     = int(r_mu_arr.shape[0])
     p_prod    = int(np.prod([mesh.shape[a] for a in mesh.axis_names]))
-    if nb_total % p_prod != 0:
-        raise ValueError(
-            f"gflat_to_rmu: nb_total={nb_total} not divisible by "
-            f"mesh.size={p_prod}.")
-    nb_local = nb_total // p_prod
+    # Band-flat sharding needs the band axis divisible by the mesh.  Pad it
+    # up with ZERO bands so ANY device count works: the htransform SP /
+    # galerkin entry (bandstructure.htransform.streaming_galerkin_solve)
+    # passes an un-rounded band window (e.g. nb=40 on a 16-device mesh),
+    # unlike the GW path which pre-rounds via Meta._round_up(world_size).
+    # Pad bands are ψ=0 ⇒ zero centroid samples, dropped from the output
+    # below.  No-op when nb_total already divides p_prod (nb_pad_total ==
+    # nb_total): single-node / divisible meshes stay byte-identical.
+    nb_pad_total = -(-nb_total // p_prod) * p_prod       # round up to p_prod
+    if nb_pad_total != nb_total:
+        psi_G = jnp.pad(
+            psi_G, ((0, 0), (0, nb_pad_total - nb_total), (0, 0), (0, 0)))
+    nb_local = nb_pad_total // p_prod
     N        = nk * nb_local
 
     # Round-6 canonical-accessor path: accept either a numpy g_index
@@ -986,7 +994,16 @@ def gflat_to_rmu(
         return jax.jit(_kernel)
 
     fn = _cached_jit('gflat_to_rmu', key, build)
-    return fn(psi_G, g_index_dev_canonical)
+    out = fn(psi_G, g_index_dev_canonical)     # (nk, nb_pad_total, ns, n_rmu)
+    if nb_pad_total != nb_total:
+        # Drop the zero pad-bands.  Replicate the band axis first (bands off
+        # the mesh) so the slice to the logical nb_total — which need not
+        # divide the mesh — is well defined; the sole caller
+        # (load_centroids_band_chunked) reshards immediately afterwards, so
+        # this transient gather is not a lasting replicated buffer.
+        out = jax.lax.with_sharding_constraint(out, NamedSharding(mesh, P()))
+        out = out[:, :nb_total]
+    return out
 
 
 # ---------------------------------------------------------------------------

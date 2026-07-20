@@ -76,12 +76,27 @@ from functools import partial
 
 import numpy as np
 
+# LORRAX distributed bootstrap — SINGLE-SOURCED in ``runtime/`` (the same three
+# calls gw.gw_jax / psp.run_nscf use; runtime.__init__ owns the SLURM-aware
+# ``jax.distributed.initialize`` pattern).  ``set_default_env()`` must run
+# BEFORE ``import jax`` (JAX reads its env at import); ``init_jax_distributed()``
+# must run BEFORE any ``jax.devices()`` / mesh creation so a multi-node srun
+# (one process per GPU, CUDA_VISIBLE_DEVICES=$SLURM_LOCALID) yields the full
+# global device set.  Both are idempotent and no-ops in single-process runs
+# (sentinel guard + proc_count<=1), so the 1-GPU path is byte-unchanged.
+from runtime import set_default_env
+set_default_env()
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 jax.config.update("jax_enable_x64", True)
+
+from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
+init_jax_distributed()
+fallback_to_cpu_if_no_gpu_backend()
 
 from solvers.lanczos import block_lanczos_eig_jit
 from common.fft_helpers import make_sharded_ifftn_3d
@@ -94,6 +109,29 @@ from . import vq_interp
 
 RY2EV = 13.6056980659
 PAD_EPS_GUARD_RY = 1.0e3
+
+
+def _gather_host(x):
+    """Gather a ``jax.Array`` to a full host numpy array, identical on every
+    process, whether it is REPLICATED or PROCESS-SPANNING.
+
+    ``jax.device_get`` raises on an array whose shards live on OTHER processes
+    (the diagnostic gate's Q-shifted ψ_c is μ-sharded ``P(...,'x')``, so on a
+    16-process / 4-node run no single process holds it all) — those need
+    ``multihost_utils.process_allgather``, which stitches the full logical
+    array (gathering only the sharded axes) on every process.  But a
+    FULLY-ADDRESSABLE array (replicated, or single-process) must NOT go through
+    ``process_allgather(tiled=True)`` — that concatenates each process's full
+    copy and DUPLICATES the leading axis (e.g. eps_c (144,·) → (16·144,·)).  So
+    branch on ``is_fully_addressable``: ``device_get`` when the whole array is
+    local, ``process_allgather`` only when shards are remote.  The branch is a
+    global property (identical on every process), so the collective stays in
+    lockstep.  On one process everything is fully addressable ⇒ plain device_get.
+    """
+    if getattr(x, "is_fully_addressable", True):
+        return np.asarray(jax.device_get(x))
+    from jax.experimental import multihost_utils
+    return np.asarray(multihost_utils.process_allgather(x, tiled=True))
 
 
 # ===========================================================================
@@ -198,8 +236,8 @@ def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data, log=print):
     contracted).  Values printed; hard-fails only on gross breakage (>0.5
     overlap loss / >0.1 Ry ε drift) — htransform accuracy is
     centroid-count-governed and reported, not silently trusted."""
-    eps_st = np.asarray(jax.device_get(data["eps_c"]))    # (nk, nc_pad)
-    psi_st = np.asarray(jax.device_get(data["psi_c_X"]))  # (nk, nc_pad, ns, μ_pad)
+    eps_st = _gather_host(data["eps_c"])                  # (nk, nc_pad)
+    psi_st = _gather_host(data["psi_c_X"])                # (nk, nc_pad, ns, μ_pad)
     nc = int(data["n_cond"])
     nmu = int(data["n_rmu"])
     eps_ht = np.asarray(eps_cQ_gamma)[:, :nc]
@@ -301,7 +339,25 @@ def main(argv=None):
     def tick(name, t0):
         timers[name] = timers.get(name, 0.0) + (time.time() - t0)
 
+    # Rank-0 I/O guard.  In a multi-node run (one process per GPU) the file
+    # writes (.dat / .png) and progress prints must run on process 0 ONLY —
+    # otherwise 16 processes race on the same paths.  Non-I/O host numpy (Q
+    # path / k-roll construction, the per-Q mini-BZ head QMC) runs redundantly
+    # on every process; it is deterministic, so all processes agree and the
+    # sharded solve consumes identical operands.  ``log`` is the rank-0 print;
+    # it is also threaded into the heavy helpers as ``log_fn`` so their
+    # progress is not emitted 16×.
+    _rank0 = jax.process_index() == 0
+
+    def log(*a, **k):
+        if _rank0:
+            print(*a, **k)
+
     mesh_xy = _create_mesh_xy(args.px, args.py)
+    log(f"[dist] jax.device_count()={jax.device_count()} "
+        f"process_count()={jax.process_count()} "
+        f"local_device_count()={jax.local_device_count()}; "
+        f"mesh_xy.shape={dict(mesh_xy.shape)} (px={args.px}, py={args.py})")
 
     # ── Q path from the ONE K_POINTS crystal_b machinery ─────────────────
     from gw.gw_config import read_lorrax_input
@@ -325,24 +381,27 @@ def main(argv=None):
     n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
     nv_pad, nc_pad = int(data["n_val_pad"]), int(data["n_cond_pad"])
     n_rmu, n_rmu_pad = int(data["n_rmu"]), int(data["n_rmu_pad"])
-    # pad-ε guard on the valence side (loader zero-pads; see module doc)
+    # pad-ε guard on the valence side (loader zero-pads; see module doc).
+    # Done ON DEVICE (jnp.where) to preserve the loader's sharding: a host
+    # device_get→jnp.asarray round-trip would fail on a process-spanning shard
+    # in a multi-node run AND drop the sharding.
     if nv_pad > n_val:
-        eps_v = np.asarray(jax.device_get(data["eps_v"]))
-        eps_v[:, n_val:] = -PAD_EPS_GUARD_RY
-        data["eps_v"] = jnp.asarray(eps_v)
+        _band_ax = jnp.arange(nv_pad)
+        data["eps_v"] = jnp.where(_band_ax[None, :] >= n_val,
+                                  -PAD_EPS_GUARD_RY, data["eps_v"])
     tick("load_bse", t0)
 
     # ── htransform setup + Q path ────────────────────────────────────────
     t0 = time.time()
     (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
-     enk_sigma) = ht.initialize_wfns(args.input, params, print,
+     enk_sigma) = ht.initialize_wfns(args.input, params, log,
                                      mesh_xy=mesh_xy)
     kpath_frac, x_path, node_idx, node_labels, _gp = ht.initialize_kpath(
         wfn, params)
     Qpath = np.asarray(kpath_frac, dtype=np.float64)
     nQ = Qpath.shape[0]
-    print(f"Q path: {nQ} points, nodes at {list(map(int, node_idx))} "
-          f"labels {node_labels}")
+    log(f"Q path: {nQ} points, nodes at {list(map(int, node_idx))} "
+        f"labels {node_labels}")
     tick("htransform_setup", t0)
 
     # ── conduction caches ψ_c(k+Q), ε_c(k+Q) for the whole path ──────────
@@ -379,11 +438,11 @@ def main(argv=None):
             f"fH window ({nb_window} bands): raise nband in {args.input} to "
             f">= {b_max}, or drop --n-cond to <= {nb_window - nval_in}")
     if n_guard < 4:
-        print(f"  [warn] only {n_guard} conduction guard band(s) above the BSE "
-              f"selection — a selection boundary near a Kramers pair can ring "
-              f"off-grid; widen the input's ncond/nband (>= {b_max + 4} bands).")
+        log(f"  [warn] only {n_guard} conduction guard band(s) above the BSE "
+            f"selection — a selection boundary near a Kramers pair can ring "
+            f"off-grid; widen the input's ncond/nband (>= {b_max + 4} bands).")
     if n_guard > 16:
-        print(f"  [warn] htransform fH spans {nb_window} bands with {n_guard} "
+        log(f"  [warn] htransform fH spans {nb_window} bands with {n_guard} "
               f"conduction guards above the BSE window — a LARGE interp window "
               f"does NOT improve (and past a system-dependent cliff WRECKS) the "
               f"returned conduction ENERGIES.  fH=Σf(ε)ccᴴ needs orthonormal "
@@ -393,9 +452,9 @@ def main(argv=None):
               f"nband≤48, 7 meV at 64, ~955 meV at 80.  min-sval does not see "
               f"this; the on-grid gate does.  Keep nband just above the BSE "
               f"window unless the on-grid gate stays <~20 meV.")
-    print(f"  full-band htransform: fH over {nb_window} bands "
-          f"({nval_in}v + {nb_window - nval_in}c); BSE conduction "
-          f"[{b_min},{b_max}) = {n_cond} band(s) + {n_guard} guard(s)")
+    log(f"  full-band htransform: fH over {nb_window} bands "
+        f"({nval_in}v + {nb_window - nval_in}c); BSE conduction "
+        f"[{b_min},{b_max}) = {n_cond} band(s) + {n_guard} guard(s)")
     k_frac = np.stack(np.meshgrid(np.arange(nkx) / nkx, np.arange(nky) / nky,
                                   np.arange(nkz) / nkz, indexing="ij"),
                       axis=-1).reshape(-1, 3)
@@ -404,7 +463,7 @@ def main(argv=None):
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=(nkx, nky, nkz), band_window_fi=(b_min, b_max),
         mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
-        log_fn=print)
+        log_fn=log)
     psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
         bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
     tick("htransform_psi_cQ", t0)
@@ -414,8 +473,8 @@ def main(argv=None):
               if np.linalg.norm(Qpath[i] - np.round(Qpath[i])) < 1e-9]
     if iGamma:
         gate_htransform_vs_stored(
-            np.asarray(jax.device_get(psi_cQ_X[iGamma[0]])),
-            np.asarray(jax.device_get(eps_cQ[iGamma[0]])), data)
+            _gather_host(psi_cQ_X[iGamma[0]]),
+            _gather_host(eps_cQ[iGamma[0]]), data, log=log)
 
     # ── V_Q tiles ────────────────────────────────────────────────────────
     t0 = time.time()
@@ -434,8 +493,8 @@ def main(argv=None):
     head_mbz = (bool(args.head_minibz_average)
                 if args.head_minibz_average is not None
                 else bool(params.get("head_minibz_average", False)))
-    print(f"  arbitrary-Q head: {'mini-BZ cell average' if head_mbz else 'point value'} "
-          f"(head_minibz_average={head_mbz})")
+    log(f"  arbitrary-Q head: {'mini-BZ cell average' if head_mbz else 'point value'} "
+        f"(head_minibz_average={head_mbz})")
     eval_vq = vq_interp.make_eval_vq(zx, prep, des, mesh_xy, n_rmu_pad,
                                      head_minibz_average=head_mbz)
     pinvF = jnp.asarray(vq_interp.stencil_pinv(
@@ -512,9 +571,15 @@ def main(argv=None):
         mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_eig=args.n_eig,
         block_size=args.block_size, max_iter=args.max_iter)
     t_c0 = time.time()
-    evs_all = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
+    evs_dev = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                      data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R)
-    evs_all = np.asarray(jax.device_get(evs_all))     # (n_solve, n_eig) Ry
+    # The block-Lanczos Ritz values come from a small replicated eigh(T) — the
+    # scan output is fully addressable on every process, so the rank-0
+    # ``device_get`` below reconstructs the whole (n_solve, n_eig) table
+    # (no cross-process gather needed).  Logged so the run proves it.
+    log(f"[dist] evs sharding={evs_dev.sharding}, "
+        f"fully_addressable={evs_dev.is_fully_addressable}")
+    evs_all = _gather_host(evs_dev)                   # (n_solve, n_eig) Ry
     t_first = time.time() - t_c0
     tick("solve_scan_cold", t_c0)
     if not args.skip_rerun_check:
@@ -522,92 +587,95 @@ def main(argv=None):
         # Pure diagnostic — 42% of a 40-pt 12×12 production wall (183 s);
         # skip it with --skip-rerun-check once a configuration is trusted.
         t_w0 = time.time()
-        evs2 = np.asarray(jax.device_get(
+        evs2 = _gather_host(
             solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
-                   data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R)))
+                   data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R))
         t_warm = time.time() - t_w0
         tick("solve_scan_warm", t_w0)
         assert np.allclose(evs2, evs_all, atol=1e-10), \
             "scan re-run not reproducible"
-        print(f"solve_path: cold {t_first:.2f}s (incl. ONE compile), warm "
-              f"{t_warm:.2f}s = {t_warm/n_solve*1e3:.1f} ms/Q over {n_solve} Q")
+        log(f"solve_path: cold {t_first:.2f}s (incl. ONE compile), warm "
+            f"{t_warm:.2f}s = {t_warm/n_solve*1e3:.1f} ms/Q over {n_solve} Q")
     else:
-        print(f"solve_path: cold {t_first:.2f}s (incl. ONE compile) over "
-              f"{n_solve} Q; warm re-run check SKIPPED")
+        log(f"solve_path: cold {t_first:.2f}s (incl. ONE compile) over "
+            f"{n_solve} Q; warm re-run check SKIPPED")
     mem = solver.lower(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                        data["psi_v_X"], data["psi_v_Y"], data["eps_v"],
                        W_R).compile().memory_analysis()
-    print(f"solve_path memory_analysis: temp={mem.temp_size_in_bytes/2**20:.1f} MiB "
-          f"args={mem.argument_size_in_bytes/2**20:.1f} MiB "
-          f"out={mem.output_size_in_bytes/2**20:.1f} MiB")
+    log(f"solve_path memory_analysis: temp={mem.temp_size_in_bytes/2**20:.1f} MiB "
+        f"args={mem.argument_size_in_bytes/2**20:.1f} MiB "
+        f"out={mem.output_size_in_bytes/2**20:.1f} MiB")
 
     evs_path = evs_all[:nQ]
     evs_refit = {iQ: evs_all[nQ + j] for j, iQ in enumerate(refit_idx)}
 
-    # ── outputs ──────────────────────────────────────────────────────────
-    labels = [(lbl or "") for lbl in node_labels]
-    dat = args.out_prefix + ".dat"
-    with open(dat, "w", encoding="utf8") as fh:
-        fh.write("# Exciton bandstructure E_S(Q), TDA, LORRAX\n")
-        fh.write(f"# input: {os.path.abspath(args.input)}\n")
-        fh.write(f"# window: n_val={n_val} n_cond={n_cond}; n_eig={args.n_eig}; "
-                 f"kgrid {nkx}x{nky}x{nkz}; vq_mode={args.vq_mode}\n")
-        fh.write("# conventions: |v k, c k+Q>; exchange tile at wrap(-Q) "
-                 "keeps G=0 at finite Q (energy_loss); Gamma uses the "
-                 "production q=0 head-body tile; energies in eV\n")
-        fh.write(f"# nodes: {' '.join(f'{int(i)}:{l}' for i, l in zip(node_idx, labels))}\n")
-        fh.write("# iQ  s_path  Qx  Qy  Qz  mode  E_1..E_neig (eV)\n")
-        for iQ in range(nQ):
-            row = " ".join(f"{e*RY2EV:.6f}" for e in evs_path[iQ])
-            fh.write(f"{iQ:4d} {x_path[iQ]:.6f} "
-                     f"{Qpath[iQ][0]: .6f} {Qpath[iQ][1]: .6f} "
-                     f"{Qpath[iQ][2]: .6f} interp {row}\n")
+    # ── outputs (rank 0 ONLY — the .dat / .png writes and the plot must not
+    #    race across the 16 processes; evs_all is fully addressable on every
+    #    process, so rank 0 holds the complete table) ──────────────────────
+    if _rank0:
+        labels = [(lbl or "") for lbl in node_labels]
+        dat = args.out_prefix + ".dat"
+        with open(dat, "w", encoding="utf8") as fh:
+            fh.write("# Exciton bandstructure E_S(Q), TDA, LORRAX\n")
+            fh.write(f"# input: {os.path.abspath(args.input)}\n")
+            fh.write(f"# window: n_val={n_val} n_cond={n_cond}; n_eig={args.n_eig}; "
+                     f"kgrid {nkx}x{nky}x{nkz}; vq_mode={args.vq_mode}\n")
+            fh.write("# conventions: |v k, c k+Q>; exchange tile at wrap(-Q) "
+                     "keeps G=0 at finite Q (energy_loss); Gamma uses the "
+                     "production q=0 head-body tile; energies in eV\n")
+            fh.write(f"# nodes: {' '.join(f'{int(i)}:{l}' for i, l in zip(node_idx, labels))}\n")
+            fh.write("# iQ  s_path  Qx  Qy  Qz  mode  E_1..E_neig (eV)\n")
+            for iQ in range(nQ):
+                row = " ".join(f"{e*RY2EV:.6f}" for e in evs_path[iQ])
+                fh.write(f"{iQ:4d} {x_path[iQ]:.6f} "
+                         f"{Qpath[iQ][0]: .6f} {Qpath[iQ][1]: .6f} "
+                         f"{Qpath[iQ][2]: .6f} interp {row}\n")
+            for iQ in refit_idx:
+                row = " ".join(f"{e*RY2EV:.6f}" for e in evs_refit[iQ])
+                fh.write(f"{iQ:4d} {x_path[iQ]:.6f} "
+                         f"{Qpath[iQ][0]: .6f} {Qpath[iQ][1]: .6f} "
+                         f"{Qpath[iQ][2]: .6f} refit  {row}\n")
+        print(f"Wrote {dat}")
+
+        if refit_idx:
+            print("\ninterp vs refit (ground truth) at spot-check Q:")
+            hdr = f"{'iQ':>4} {'s':>8} " + " ".join(
+                f"{'dE'+str(j+1)+'(meV)':>10}" for j in range(args.n_eig))
+            print(hdr)
+            for iQ in refit_idx:
+                d = (evs_path[iQ] - evs_refit[iQ]) * RY2EV * 1e3
+                print(f"{iQ:4d} {x_path[iQ]:8.4f} "
+                      + " ".join(f"{v:10.3f}" for v in d))
+
+        # plot (Agg; no display)
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(6.4, 4.4))
+        for b in range(args.n_eig):
+            ax.plot(x_path, evs_path[:, b] * RY2EV, lw=1.2, color="C0",
+                    alpha=0.9, label="interp" if b == 0 else None)
         for iQ in refit_idx:
-            row = " ".join(f"{e*RY2EV:.6f}" for e in evs_refit[iQ])
-            fh.write(f"{iQ:4d} {x_path[iQ]:.6f} "
-                     f"{Qpath[iQ][0]: .6f} {Qpath[iQ][1]: .6f} "
-                     f"{Qpath[iQ][2]: .6f} refit  {row}\n")
-    print(f"Wrote {dat}")
+            ax.scatter(np.full(args.n_eig, x_path[iQ]), evs_refit[iQ] * RY2EV,
+                       s=22, facecolors="none", edgecolors="C3", zorder=5,
+                       label="refit (ground truth)" if iQ == refit_idx[0] else None)
+        ticks = x_path[np.asarray(node_idx, dtype=int)]
+        for xpos in ticks:
+            ax.axvline(xpos, color="k", lw=0.6, alpha=0.3)
+        ax.set_xticks(ticks, labels)
+        ax.set_xlim(x_path[0], x_path[-1])
+        ax.set_ylabel("$E_S(Q)$ (eV)")
+        ax.set_title("Exciton bandstructure (TDA)")
+        ax.legend(loc="best", fontsize="small")
+        fig.tight_layout()
+        png = args.out_prefix + ".png"
+        fig.savefig(png, dpi=180)
+        print(f"Wrote {png}")
 
-    if refit_idx:
-        print("\ninterp vs refit (ground truth) at spot-check Q:")
-        hdr = f"{'iQ':>4} {'s':>8} " + " ".join(
-            f"{'dE'+str(j+1)+'(meV)':>10}" for j in range(args.n_eig))
-        print(hdr)
-        for iQ in refit_idx:
-            d = (evs_path[iQ] - evs_refit[iQ]) * RY2EV * 1e3
-            print(f"{iQ:4d} {x_path[iQ]:8.4f} "
-                  + " ".join(f"{v:10.3f}" for v in d))
-
-    # plot (Agg; no display)
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(6.4, 4.4))
-    for b in range(args.n_eig):
-        ax.plot(x_path, evs_path[:, b] * RY2EV, lw=1.2, color="C0",
-                alpha=0.9, label="interp" if b == 0 else None)
-    for iQ in refit_idx:
-        ax.scatter(np.full(args.n_eig, x_path[iQ]), evs_refit[iQ] * RY2EV,
-                   s=22, facecolors="none", edgecolors="C3", zorder=5,
-                   label="refit (ground truth)" if iQ == refit_idx[0] else None)
-    ticks = x_path[np.asarray(node_idx, dtype=int)]
-    for xpos in ticks:
-        ax.axvline(xpos, color="k", lw=0.6, alpha=0.3)
-    ax.set_xticks(ticks, labels)
-    ax.set_xlim(x_path[0], x_path[-1])
-    ax.set_ylabel("$E_S(Q)$ (eV)")
-    ax.set_title("Exciton bandstructure (TDA)")
-    ax.legend(loc="best", fontsize="small")
-    fig.tight_layout()
-    png = args.out_prefix + ".png"
-    fig.savefig(png, dpi=180)
-    print(f"Wrote {png}")
-
-    print("\n--- timings (s) ---")
-    for k, v in timers.items():
-        print(f"  {k:<22s} {v:9.2f}")
-    print(f"  {'TOTAL':<22s} {time.time()-t_wall:9.2f}")
+        print("\n--- timings (s) ---")
+        for k, v in timers.items():
+            print(f"  {k:<22s} {v:9.2f}")
+        print(f"  {'TOTAL':<22s} {time.time()-t_wall:9.2f}")
     return 0
 
 
