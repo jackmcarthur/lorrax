@@ -541,8 +541,199 @@ def _to_host(x):
     return np.asarray(multihost_utils.process_allgather(x, tiled=True))
 
 
+def _recon_body(lam, evec, ZG, v_ref, v_lr, *, gram, gram_outer, gemm, conj,
+                constr, eps_tik):
+    """The Tikhonov clean → SR/LR split RECONSTRUCTION, expressed ONCE and
+    dispatched to a matmul BACKEND (``gram``/``gram_outer``/``gemm``/``conj``/
+    ``constr`` primitives).  ``off``/``auto`` pass the replicated-batched
+    (XLA local dot) primitives; the distributed-recon path passes cuBLASMp
+    primitives that keep every n_μ×n_μ intermediate 2-D sharded
+    ``P(None,'x','y')`` (no per-proc replication of a full tile).  The
+    ARITHMETIC below is backend-agnostic; only the layout/BLAS differ.
+
+    Per-element (b = q-batch index, μ/ν = centroid, r = eigen index, G = sphere
+    channel; the eigenvector convention is the backend's — ``gram`` absorbs it):
+        g_ε(λ)_br = λ_br² / (λ_br² + (ε_tik·max_r λ_br)²)               (real)
+        S_bμν     = Σ_r  evec·g·evecᴴ                    (= R g_ε Rᴴ)   [gram]
+        A_ref_bμG = ZG_bμG · √v_ref_bG,   A_lr_bμG = ZG_bμG · √v_lr_bG
+        Vδ_bμν    = Σ_G conj(A_ref_bμG) A_ref_bνG − (lr)                [gram_outer]
+        V_SRc_bμν = Σ_ρσ conj(S)_bμρ Vδ_bρσ conj(S)_bσν                [gemm∘gemm]
+        zt_bμG    = Σ_ρ S_bμρ ZG_bρG                                    [gemm]
+    Returns ``(S, V_SRc, zt)`` in the backend's native layout; the shared
+    phase-factoring of ``zt`` → ``Fch`` runs on host in ``prepare_coarse``.
+    """
+    g = lam ** 2 / (lam ** 2 + (eps_tik * lam.max(axis=1, keepdims=True)) ** 2)
+    S = gram(evec, g)                                   # R g_ε(Λ) Rᴴ (Hermitian)
+    Sc = conj(S)
+    A_ref = constr(ZG * jnp.sqrt(v_ref)[:, None, :])    # ζ̃·√v_ref (rows μ)
+    A_lr = constr(ZG * jnp.sqrt(v_lr)[:, None, :])
+    V_delta = gram_outer(A_ref) - gram_outer(A_lr)      # conj(A)Aᵀ, V_ref − V_LR
+    V_SRc = gemm(gemm(Sc, V_delta), Sc)                 # conj(S) Vδ conj(S)
+    zt = gemm(S, ZG)                                    # cleaned ζ̃ on the sphere
+    return S, V_SRc, zt
+
+
+def _replicated_prims(qb3):
+    """Replicated-batched (default) reconstruction primitives — the q axis is
+    the only sharded axis (qb3 = ``P(('x','y'),None,None)``); μ/ν/G replicated
+    per device, so each step is a per-q LOCAL XLA dot.  These reproduce the
+    original ``_clean_split`` einsums verbatim (bit-identical default path)."""
+    return dict(
+        gram=lambda evec, g: jnp.einsum("bmr,br,bnr->bmn", evec, g,
+                                        jnp.conj(evec)),
+        gram_outer=lambda A: jnp.einsum("bmg,bng->bmn", jnp.conj(A), A),
+        gemm=lambda A, B: A @ B,
+        conj=jnp.conj,
+        constr=lambda A: jax.lax.with_sharding_constraint(A, qb3),
+    )
+
+
+def _distributed_prims(mesh_xy: Mesh):
+    """2-D-distributed reconstruction primitives — every n_μ×n_μ operand and
+    result is sharded ``P(None,'x','y')`` over the FULL mesh and each matmul
+    runs through the cuBLASMp batched distributed GEMM, so NO full tile is ever
+    replicated on one proc (per-proc residency = n_μ/Px × n_μ/Py).
+
+    cuBLASMp constraints handled here (ffi/cublasmp/batched.py): the mesh must
+    be square (Px==Py) and ``transb`` must be ``'N'`` on a multi-rank grid.
+      * ``gram`` (S = evecᴴ diag(g) evec, RAW cusolverMp buffer convention)
+        uses ``transa='C'`` — allowed on multi-rank — so R = conj(Qraw)ᵀ is
+        NEVER materialised (no transpose reshard): S_μν = Σ_r conj(Qraw_rμ) g_r
+        Qraw_rν, exactly R g Rᴴ.
+      * ``gram_outer`` and ``gemm`` need op(B)=Aᵀ / B; op(B)≠N is rank-divergent
+        on cuBLASMp so the transpose operand is PRE-materialised on the JAX side
+        (``swapaxes`` + sharding constraint → still full-mesh 2-D sharded, one
+        all-to-all, never replicated).
+    """
+    sh3 = NamedSharding(mesh_xy, P(None, "x", "y"))
+    from ffi.cublasmp import batched_distributed_gemm
+    _zc: dict = {}
+
+    def _zeros(shape):
+        # sharded zeros with NO replicated intermediate (out_shardings=sh3):
+        # cuBLASMp requires C even at beta=0 and donates it.
+        fn = _zc.get(shape)
+        if fn is None:
+            fn = jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
+                         out_shardings=sh3)
+            _zc[shape] = fn
+        return fn()
+
+    def gemm(A, B):
+        # D_bmn = Σ_k A_bmk B_bkn  (transa=transb='N', both P(None,'x','y'))
+        nq, m, n = A.shape[0], int(A.shape[1]), int(B.shape[2])
+        return batched_distributed_gemm(A, B, _zeros((nq, m, n)), mesh=mesh_xy,
+                                        transa="N", transb="N")
+
+    def gram(evec, g):
+        # S_bmn = Σ_r conj(evec_brm) (g_br evec_brn)   (transa='C', transb='N')
+        nq, n = evec.shape[0], int(evec.shape[1])
+        Bs = jax.lax.with_sharding_constraint(g[:, :, None] * evec, sh3)
+        return batched_distributed_gemm(evec, Bs, _zeros((nq, n, n)),
+                                        mesh=mesh_xy, transa="C", transb="N")
+
+    def gram_outer(A):
+        # V_bmn = Σ_g conj(A_bmg) A_bng ;  right operand = Aᵀ (pre-transposed)
+        nq, m = A.shape[0], int(A.shape[1])
+        AT = jax.lax.with_sharding_constraint(jnp.swapaxes(A, 1, 2), sh3)
+        return batched_distributed_gemm(jnp.conj(A), AT, _zeros((nq, m, m)),
+                                        mesh=mesh_xy, transa="N", transb="N")
+
+    return dict(gram=gram, gram_outer=gram_outer, gemm=gemm, conj=jnp.conj,
+                constr=lambda A: jax.lax.with_sharding_constraint(A, sh3))
+
+
+def _pad_g(a, ngk_pad):
+    """Zero-pad the trailing G axis of a host array to ``ngk_pad`` (pad
+    channels carry v=0 / ζ̃=0 → exact-zero contributions; needed because
+    cuBLASMp's one-tile-per-rank layout requires the contraction dim divisible
+    by both mesh axes)."""
+    ng = a.shape[-1]
+    if ng >= ngk_pad:
+        return a
+    pad = [(0, 0)] * (a.ndim - 1) + [(0, ngk_pad - ng)]
+    return np.pad(a, pad)
+
+
+def _resolve_distributed_recon(distributed_recon, eigh_backend, n_mu, mem_gb):
+    """Decide whether to run the 2-D-distributed cuBLASMp reconstruction.
+
+    ``False``/``None`` → replicated-batched (the small-n_μ DEFAULT).  ``True``
+    → on (requires cusolvermp).  ``"auto"`` → on iff the eigh backend is a
+    distributed FFI AND a single replicated n_μ×n_μ c128 tile exceeds 10% of
+    the per-device budget (below that the replicated-batched path is faster —
+    the 640 case must not regress)."""
+    if distributed_recon in (False, None, 0):
+        return False
+    if isinstance(distributed_recon, str):
+        if distributed_recon.lower() == "auto":
+            if eigh_backend != "cusolvermp":
+                return False
+            tile_gb = (n_mu * n_mu * 16) / 1e9
+            budget = mem_gb if mem_gb and mem_gb > 0 else 28.0
+            return tile_gb > 0.10 * budget
+        return distributed_recon.lower() in ("1", "true", "on", "yes")
+    return bool(distributed_recon)
+
+
+def _dist_recon_q_chunk(q_chunk, n_mu, mesh_xy, mem_gb):
+    """q-chunk for the distributed recon: per proc holds ~N_LIVE 2-D-sharded
+    n_μ² tiles of (n_μ/Px)(n_μ/Py) c128 (R,S,Sc,Vδ,T1,V_SRc,zt + workspace);
+    cap the chunk so that stays within the device budget.  THIS q-chunk is the
+    memory knob that REPLACES 'the tile must fit replicated per proc'."""
+    if not mem_gb or mem_gb <= 0:
+        return q_chunk
+    Px = int(mesh_xy.shape["x"])
+    Py = int(mesh_xy.shape["y"])
+    per_q_per_proc = (n_mu / Px) * (n_mu / Py) * 16       # one tile, bytes/proc
+    n_live = 8.0
+    cap = int((mem_gb * 1e9) / (n_live * per_q_per_proc))
+    return max(1, min(q_chunk, cap))
+
+
+def _recon_distributed_chunk(C_h, ZG_h, vref_h, vlr_h, mesh_xy, eigh_backend,
+                             eps_tik, prims, ngk_pad):
+    """One q-chunk of the 2-D-distributed reconstruction: per-q distributed
+    eigh (cusolverMp — R stays 2-D sharded ``P('x','y')``), then the
+    SINGLE-SOURCE ``_recon_body`` with cuBLASMp primitives.  Every n_μ×n_μ
+    intermediate is ``P(None,'x','y')`` over the whole mesh — no full tile on
+    one proc.
+
+    ``eigh_backend`` must be 'cusolvermp': its RAW eigenvector buffer Qraw
+    (Qraw.conj().T = columns) feeds ``gram`` via transa='C' with NO transpose
+    reshard.  ('slate' returns TRUE columns — the raw-buffer conversion is
+    deferred; use cusolvermp for distributed recon.)
+    """
+    if eigh_backend != "cusolvermp":
+        raise ValueError(
+            f"distributed_recon requires eigh_backend='cusolvermp' (raw-buffer "
+            f"gram, no reshard); got {eigh_backend!r}.  Native/'off' eigh "
+            f"returns a REPLICATED R (nothing to distribute); 'slate' column "
+            f"eigenvectors need a raw-buffer conversion (deferred).")
+    from ffi.cusolvermp.eigh import distributed_eigh
+    sh2 = NamedSharding(mesh_xy, P("x", "y"))
+    sh3 = NamedSharding(mesh_xy, P(None, "x", "y"))
+    nqc = int(C_h.shape[0])
+    # per-q 2-D-sharded eigh; Qraw stays P('x','y') (RAW cusolverMp buffer).
+    lams, Qs = [], []
+    for i in range(nqc):
+        w, Qraw = distributed_eigh(
+            jax.device_put(jnp.asarray(C_h[i]), sh2), mesh=mesh_xy)
+        lams.append(w)
+        Qs.append(Qraw)
+    lam = jnp.stack(lams)                                       # (nqc,n_μ) repl
+    evec = jax.lax.with_sharding_constraint(jnp.stack(Qs), sh3)  # (nqc,n_μ,n_μ)
+    # G-pad the sphere factors to ngk_pad (zeros → exact); 2-D shard ZG, keep
+    # the tiny v rows (O(n_μ)) replicated.
+    ZG = jax.device_put(jnp.asarray(_pad_g(ZG_h, ngk_pad)), sh3)
+    vref = jnp.asarray(_pad_g(vref_h, ngk_pad))                 # (nqc,ngk_pad)
+    vlr = jnp.asarray(_pad_g(vlr_h, ngk_pad))
+    return _recon_body(lam, evec, ZG, vref, vlr, eps_tik=eps_tik, **prims)
+
+
 def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
-                   eigh_backend: str = "auto", q_chunk: int = 48):
+                   eigh_backend: str = "auto", q_chunk: int = 48,
+                   distributed_recon=False, mem_per_device_gb: float = 0.0):
     """STAGE 1.  Returns the coarse-side bundle ``prep``:
       S        (nq, n_μ, n_μ)  Tikhonov cleaning operators S_q (host copy,
                                nulls only)
@@ -595,8 +786,8 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
         idx_all[q] = np.where(idx < 0, ngkmax, idx)
         W[q] = v_slab_on_set(zx, zx["qfr"][q], GS, kind="slab_lr", alpha=alpha)
 
-    rmu = jnp.asarray(zx["rmu_frac"])                    # (n_μ, 3) trace const
-    GS_f = jnp.asarray(GS.T.astype(np.float64))          # (nG, 3) trace const
+    rmu_np = zx["rmu_frac"]                              # (n_μ, 3)
+    GS_f_np = GS.T.astype(np.float64)                    # (nG, 3)
 
     @partial(jax.jit, out_shardings=(qb2, qb3))
     def _eigh_batch(C):
@@ -604,58 +795,88 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
         lam, R = jnp.linalg.eigh(C)
         return lam, R
 
+    _prims_repl = _replicated_prims(qb3)
+
     @partial(jax.jit, out_shardings=(qb3, qb3, qb3))
-    def _clean_split(lam, R, ZGq, v_ref, v_lr, idx, qfr_b):
-        # S_q = R g_ε(Λ) R^H  (analytic Tikhonov filter of C_q; §12.3)
-        g = lam ** 2 / (lam ** 2
-                        + (eps_tik * lam.max(axis=1, keepdims=True)) ** 2)
-        S = jnp.einsum("bmr,br,bnr->bmn", R, g, jnp.conj(R))
-        Sc = jnp.conj(S)
-        # V_ref − V_LR from the sphere factors A = ζ̃√v  (V = conj(A)A^T)
-        A_ref = ZGq * jnp.sqrt(v_ref)[:, None, :]
-        A_lr = ZGq * jnp.sqrt(v_lr)[:, None, :]
-        V_delta = jnp.einsum("bmg,bng->bmn", jnp.conj(A_ref), A_ref) \
-            - jnp.einsum("bmg,bng->bmn", jnp.conj(A_lr), A_lr)
-        V_SRc = Sc @ V_delta @ Sc
-        zt = S @ ZGq                     # cleaned ζ̃ on the sphere (rows μ)
-        # (c) phase-factored cleaned form factors on the superset
-        zt_ext = jnp.concatenate(
-            [zt, jnp.zeros((zt.shape[0], n_mu, 1), zt.dtype)], axis=2)
-        ztg = jnp.take_along_axis(zt_ext, idx[:, None, :], axis=2)
-        qG = qfr_b[:, None, :] + GS_f[None, :, :]        # (b, nG, 3)
-        ph = jnp.exp(2j * jnp.pi * jnp.einsum("mi,bgi->bmg", rmu, qG))
-        return S, V_SRc, ph * ztg
+    def _clean_split(lam, R, ZGq, v_ref, v_lr):
+        # replicated-batched reconstruction (default) — the SINGLE-SOURCE
+        # ``_recon_body`` with the local-dot primitives (bit-identical to the
+        # original per-q einsums).  Phase-factoring of ``zt`` → Fch is the
+        # shared host step below.
+        return _recon_body(lam, R, ZGq, v_ref, v_lr,
+                           eps_tik=eps_tik, **_prims_repl)
+
+    def _phase_fch(zt_h, sl):
+        # SHARED host phase-factoring (both backends): F_μ(q;G) =
+        # e^{+2πi (q+G)·s_μ} (S ζ̃)_μ(q+G) on the LR superset.  ``idx_all``
+        # maps a superset slot to its sphere column (or ngkmax → appended zero
+        # column when outside the sphere); take_along_axis then gathers.  The
+        # distributed backend pads zt on G to ngk_pad ≥ ngkmax — trim first so
+        # the ngkmax zero-column sentinel is unambiguous.
+        ztt = zt_h[:, :, :ngkmax]
+        zt_ext = np.concatenate(
+            [ztt, np.zeros((ztt.shape[0], n_mu, 1), ztt.dtype)], axis=2)
+        ztg = np.take_along_axis(zt_ext, idx_all[sl][:, None, :], axis=2)
+        qG = zx["qfr"][sl][:, None, :] + GS_f_np[None, :, :]   # (b, nG, 3)
+        ph = np.exp(2j * np.pi * np.einsum("mi,bgi->bmg", rmu_np, qG))
+        return ph * ztg
+
+    # ── recon backend selection ─────────────────────────────────────────
+    # distributed_recon (True|"auto"): keep every n_μ×n_μ tile 2-D sharded
+    # P(None,'x','y') and reconstruct via cuBLASMp, so a single n_μ² tile
+    # NEVER lands whole on one proc (per-proc = n_μ/Px × n_μ/Py).  Requires a
+    # 2-D-sharded eigh (cusolvermp: R stays P('x','y') straight off the FFI).
+    # "auto" turns it on only when one replicated tile is a large fraction of
+    # the device budget (small-n_μ default stays replicated-batched).
+    use_dist = _resolve_distributed_recon(
+        distributed_recon, eigh_backend, n_mu, mem_per_device_gb)
+    prims_dist = _distributed_prims(mesh_xy) if use_dist else None
+    lcm_xy = int(np.lcm(int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])))
+    ngk_pad = ((ngkmax + lcm_xy - 1) // lcm_xy) * lcm_xy
+    qdchunk = _dist_recon_q_chunk(q_chunk, n_mu, mesh_xy, mem_per_device_gb) \
+        if use_dist else q_chunk
+    if use_dist:
+        print(f"  [prep] distributed-recon ON (cuBLASMp, eigh={eigh_backend}): "
+              f"n_μ={n_mu} 2-D sharded {mesh_xy.shape['x']}×{mesh_xy.shape['y']}"
+              f" → {n_mu // int(mesh_xy.shape['x'])}×"
+              f"{n_mu // int(mesh_xy.shape['y'])}/proc; ngk {ngkmax}→{ngk_pad}; "
+              f"q_chunk={qdchunk}")
 
     S_np = np.empty((nq, n_mu, n_mu), dtype=np.complex128)
     V_SRc_np = np.empty((nq, n_mu, n_mu), dtype=np.complex128)
     Fch = np.empty((nq, n_mu, nG), dtype=np.complex128)
     C_herm = 0.5 * (C_q + np.conj(np.swapaxes(C_q, 1, 2)))
-    for q0 in range(0, nq, q_chunk):
-        sl = slice(q0, min(q0 + q_chunk, nq))
-        if eigh_backend in ("auto", "off"):
-            lam, R = _eigh_batch(jax.device_put(jnp.asarray(C_herm[sl]), qb3))
+    step = qdchunk if use_dist else q_chunk
+    for q0 in range(0, nq, step):
+        sl = slice(q0, min(q0 + step, nq))
+        if use_dist:
+            S_b, V_b, zt_b = _recon_distributed_chunk(
+                C_herm[sl], zx["ZG"][sl], v_ref_all[sl], v_lr_all[sl],
+                mesh_xy, eigh_backend, eps_tik, prims_dist, ngk_pad)
         else:
-            # explicit distributed-FFI request: per-q eigh, then the same
-            # batched post-eigh pipeline (single source for the math).
-            pairs = [_eigh_backend(jax.device_put(jnp.asarray(C_herm[q]),
-                                                  grid_xy),
-                                   mesh_xy, eigh_backend)
-                     for q in range(sl.start, sl.stop)]
-            lam = jnp.stack([p[0] for p in pairs])
-            R = jnp.stack([p[1] for p in pairs])
-        S_b, V_b, F_b = _clean_split(
-            lam, R,
-            jax.device_put(jnp.asarray(zx["ZG"][sl]), qb3),
-            jax.device_put(jnp.asarray(v_ref_all[sl]), qb2),
-            jax.device_put(jnp.asarray(v_lr_all[sl]), qb2),
-            jax.device_put(jnp.asarray(idx_all[sl]), qb2),
-            jax.device_put(jnp.asarray(zx["qfr"][sl]), qb2))
-        # process_allgather (not device_get): S_b/V_b/F_b are q-sharded qb3
-        # across the whole mesh, so on a multi-node run their shards span other
-        # processes and device_get would raise (non-addressable).
+            if eigh_backend in ("auto", "off"):
+                lam, R = _eigh_batch(
+                    jax.device_put(jnp.asarray(C_herm[sl]), qb3))
+            else:
+                # explicit distributed-FFI eigh, replicated-batched recon:
+                # per-q eigh then the SAME _recon_body (single source).
+                pairs = [_eigh_backend(jax.device_put(jnp.asarray(C_herm[q]),
+                                                      grid_xy),
+                                       mesh_xy, eigh_backend)
+                         for q in range(sl.start, sl.stop)]
+                lam = jnp.stack([p[0] for p in pairs])
+                R = jnp.stack([p[1] for p in pairs])
+            S_b, V_b, zt_b = _clean_split(
+                lam, R,
+                jax.device_put(jnp.asarray(zx["ZG"][sl]), qb3),
+                jax.device_put(jnp.asarray(v_ref_all[sl]), qb2),
+                jax.device_put(jnp.asarray(v_lr_all[sl]), qb2))
+        # process_allgather (not device_get): the recon tiles span the whole
+        # mesh, so on a multi-node run their shards live on other processes and
+        # device_get would raise (non-addressable).
         S_np[sl] = _to_host(S_b)
         V_SRc_np[sl] = _to_host(V_b)
-        Fch[sl] = _to_host(F_b)
+        Fch[sl] = _phase_fch(_to_host(zt_b), sl)
     tail = float(np.exp(-zx["zeta_cutoff"] / (4.0 * alpha ** 2)))
     print(f"  [prep] gset({alpha}) = {nG} G; {n_out} out-of-sphere (q,G) "
           f"channels zero-filled; sphere-tail bound {tail:.1e}")

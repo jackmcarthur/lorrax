@@ -324,6 +324,17 @@ def main(argv=None):
                          "``head_minibz_average`` key; default (unset) uses it.")
     ap.add_argument("--eigh-backend", default="auto",
                     choices=("auto", "off", "cusolvermp", "slate"))
+    ap.add_argument("--distributed-recon", default="off",
+                    choices=("off", "on", "auto"),
+                    help="V_Q coarse-prep reconstruction backend.  'off' "
+                         "(default) = replicated-batched per-q clean/split "
+                         "(small-n_μ efficient).  'on'/'auto' = 2-D-distributed "
+                         "cuBLASMp reconstruction (requires --eigh-backend "
+                         "cusolvermp): every n_μ×n_μ tile stays sharded "
+                         "P(None,'x','y') so a single tile NEVER lands whole on "
+                         "one proc (generalises to n_μ² that can't fit "
+                         "replicated).  'auto' = on only when one replicated "
+                         "tile exceeds 10%% of the device budget.")
     ap.add_argument("--px", type=int, default=1)
     ap.add_argument("--py", type=int, default=1)
     ap.add_argument("--skip-rerun-check", action="store_true",
@@ -482,9 +493,20 @@ def main(argv=None):
     zx = vq_interp.load_zeta_coarse(restart_file, zeta_file)
     C_q = vq_interp.build_cq(zx)
     vq_interp.run_gates(zx, C_q)
+    _mem_gb = float(params.get("memory_per_device_gb", 0.0) or 0.0)
+    if _mem_gb <= 0:
+        try:
+            from common.gpu_utils import get_device_memory_gb
+            _mem_gb = float(get_device_memory_gb())
+        except Exception:
+            _mem_gb = 0.0
+    _drecon = ("auto" if args.distributed_recon == "auto"
+               else (args.distributed_recon == "on"))
     prep = vq_interp.prepare_coarse(zx, C_q, mesh_xy, alpha=args.alpha,
                                     eps_tik=args.eps_tik,
-                                    eigh_backend=args.eigh_backend)
+                                    eigh_backend=args.eigh_backend,
+                                    distributed_recon=_drecon,
+                                    mem_per_device_gb=_mem_gb)
     des = vq_interp.lr_design_blocks(zx, prep)
     coeffs = vq_interp.fit_lr_model(des)
     vq_interp.run_nulls(zx, prep, des, coeffs)
