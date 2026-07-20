@@ -83,7 +83,14 @@ def compute_wfns_fi(
         kgrid_fi:  (nkx_fi, nky_fi, nkz_fi) fine k-grid; tuple/list/string.
                    Mutually exclusive with ``q_list``.
         band_window_fi: (b_min, b_max) — sub-window of the htransform band
-                   axis to keep on the fine grid (0-based, exclusive end).
+                   axis to RETURN on the fine grid (0-based, exclusive end).
+                   fH is ALWAYS built from every band in ``ctilde`` (the full
+                   loaded window); this window only selects which eigenpairs
+                   are returned.  So a full-band ctilde yields a full-band fH
+                   regardless of the sub-window — the returned conduction bands
+                   sit interior to it, guarded by the bands above b_max.  This
+                   is the single fH builder (shared with the SP driver's
+                   ``htransform.build_fH_R``); there is no windowed variant.
         mesh_xy:   ('x','y') device mesh.
         a_band_index: optional band index for the f-transform 'a' parameter
                    (defaults to the top of the htransform window).
@@ -160,8 +167,13 @@ def compute_wfns_fi(
              if n_pad else q_all)
 
     # ── Per-batch: Fourier sum + eigh + ψ-at-centroids reconstruction ────
-    # Bands [b_min, b_max) selected on the eigenvalue axis (ascending), so the
-    # restriction is exactly the lowest-energy ``nb_fi`` bands of the window.
+    # fH_q is the FULL-band Hamiltonian (all bands in ctilde).  Bands
+    # [b_min, b_max) are selected on the eigenvalue axis (ascending): f(eps) is
+    # monotone in eps, so ascending eigenvalue index == ascending energy, and
+    # this slice is exactly the lowest-energy ``nb_fi`` bands at/above b_min —
+    # identical to the SP driver's sort-then-keep, but returning eigenVECTORS
+    # too.  The guard bands above b_max stay in fH (they shape the
+    # interpolation) but are not returned, so every returned band is interior.
     # The q axis is sharded over ALL mesh devices (the ``_kpath_batch`` idiom,
     # htransform.h_transform): fH_R/B are replicated, so each device builds and
     # eigh-decomposes only its own q-rows — the eigh is the dominant cost here
