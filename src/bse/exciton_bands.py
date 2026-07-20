@@ -277,6 +277,13 @@ def main(argv=None):
                          "can collapse off-grid eps_c(k+Q) by eV).")
     ap.add_argument("--alpha", type=float, default=vq_interp.ALPHA)
     ap.add_argument("--eps-tik", type=float, default=vq_interp.EPS_TIK)
+    ap.add_argument("--head-minibz-average", action="store_true", default=None,
+                    help="Per-Q mini-BZ Coulomb head cell-averaging: replace "
+                         "the finite-Q exchange head POINT value v(Q+G*) with "
+                         "the mini-BZ cell average <v_LR(Q+G*)>_mBZ (fixes the "
+                         "4-13%% near-Γ/zone-boundary head error, "
+                         "arbitrary_q_bse.md §16.4).  Overrides the cohsex.in "
+                         "``head_minibz_average`` key; default (unset) uses it.")
     ap.add_argument("--eigh-backend", default="auto",
                     choices=("auto", "off", "cusolvermp", "slate"))
     ap.add_argument("--px", type=int, default=1)
@@ -422,7 +429,15 @@ def main(argv=None):
     des = vq_interp.lr_design_blocks(zx, prep)
     coeffs = vq_interp.fit_lr_model(des)
     vq_interp.run_nulls(zx, prep, des, coeffs)
-    eval_vq = vq_interp.make_eval_vq(zx, prep, des, mesh_xy, n_rmu_pad)
+    # Per-Q mini-BZ head cell-averaging: CLI --head-minibz-average overrides
+    # the cohsex.in ``head_minibz_average`` key (default off = point value).
+    head_mbz = (bool(args.head_minibz_average)
+                if args.head_minibz_average is not None
+                else bool(params.get("head_minibz_average", False)))
+    print(f"  arbitrary-Q head: {'mini-BZ cell average' if head_mbz else 'point value'} "
+          f"(head_minibz_average={head_mbz})")
+    eval_vq = vq_interp.make_eval_vq(zx, prep, des, mesh_xy, n_rmu_pad,
+                                     head_minibz_average=head_mbz)
     pinvF = jnp.asarray(vq_interp.stencil_pinv(
         zx["qfr"], vq_interp.stencil_r7(zx)))
     coeffs_packed = vq_interp.pack_coeffs(des, coeffs)
@@ -443,9 +458,18 @@ def main(argv=None):
             V_rows.append(_hermitize(v_gamma))       # production q=0 tile
             continue
         q_tile = -Qpath[iQ]                          # tile momentum = wrap(−Q)
-        q_tile = jnp.asarray(q_tile - np.round(q_tile))
-        V_rows.append(_hermitize(eval_vq(q_tile, prep["V_SRc"], pinvF,
-                                         coeffs_packed)))
+        q_tile_np = q_tile - np.round(q_tile)
+        q_tile = jnp.asarray(q_tile_np)
+        if head_mbz:
+            gstar, head_val = vq_interp.minibz_head_vlr(
+                zx, prep, q_tile_np, alpha=args.alpha)
+            V_rows.append(_hermitize(eval_vq(
+                q_tile, prep["V_SRc"], pinvF, coeffs_packed,
+                jnp.asarray(head_val, dtype=jnp.float64),
+                jnp.asarray(gstar, dtype=jnp.int32))))
+        else:
+            V_rows.append(_hermitize(eval_vq(q_tile, prep["V_SRc"], pinvF,
+                                             coeffs_packed)))
         n_eval_calls += 1
     if args.vq_mode == "refit":
         raise SystemExit("--vq-mode=refit alone is not wired; use "

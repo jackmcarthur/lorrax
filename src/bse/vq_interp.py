@@ -737,10 +737,57 @@ def pack_coeffs(des, coeffs):
     return tuple(jnp.asarray(coeffs[g]) for g in des["specs"])
 
 
-def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None):
+def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
+                    qmc_reps=10, n_coarse=250_000, seed_offset=0):
+    """Host-side mini-BZ CELL AVERAGE of the LR-slab head at target Q.
+
+    Returns ``(gstar, head_val)``:
+
+      ``gstar``    = ``argmin_G |Q+G|²`` over the stored Miller superset
+                     ``prep['GS']`` — the umklapp bringing Q nearest Γ.
+      ``head_val`` = ``<v_LR(Q+G*)>_mBZ / celvol`` (real), in the SAME units
+                     as ``eval_vq``'s stored ``v[gstar]`` point value, so the
+                     evaluator injects it by a straight slot replacement.
+
+    2D slab: pure in-plane adaptive MC (the head is a ``|Q|`` cusp, not a
+    ``1/q²`` pole — no analytic sphere, BGW ``minibzaverage_2d``).  Only the
+    LR channel is averaged; the SR body already carries ``v_SR(Q+G*)`` once
+    (arbitrary_q_bse.md §16 no-double-count).  The winding ``e^{-i2θ}`` is
+    untouched — it rides the phase-factored ζ̃ model in ``eval_vq``; this
+    scalar supplies the magnitude only.  Single-sources
+    :func:`gw.coulomb.base.minibz_average`.
+    """
+    from gw.coulomb.base import (minibz_voronoi_batches, minibz_average,
+                                 minibz_inscribed_sphere_r2)
+    if alpha is None:
+        alpha = float(prep["alpha"])
+    GS = np.asarray(prep["GS"], dtype=np.float64)          # (3, nG)
+    bvec = np.asarray(zx["bvec"], dtype=np.float64)
+    celvol = float(zx["celvol"])
+    kgrid = tuple(int(s) for s in zx["kgrid"])
+    Qf = np.asarray(Qfrac, dtype=np.float64)
+    K = bvec.T @ (Qf[:, None] + GS)                        # (3, nG) cartesian Q+G
+    K2 = np.sum(K * K, axis=0)
+    gstar = int(np.argmin(K2))
+    shift_cart = K[:, gstar]                               # cartesian Q+G*
+    dq = minibz_voronoi_batches(
+        bvec, kgrid, nsamples=nsamples, method="sobol",
+        qmc_reps=qmc_reps, nmax=3, is_2d=True, seed_offset=seed_offset)
+    q0sph2 = minibz_inscribed_sphere_r2(bvec, kgrid, is_2d=True)
+    head_bare = minibz_average(
+        shift_cart, dq, kind="slab_lr", celvol=celvol,
+        n_kpts=int(np.prod(kgrid)), q0sph2=q0sph2, alpha=alpha,
+        zc=float(np.pi / bvec[2, 2]), analytic_sphere=False,
+        adaptive=True, n_coarse=n_coarse)
+    return gstar, float(head_bare) / celvol
+
+
+def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None,
+                 head_minibz_average: bool = False):
     """Build the ONE jitted arbitrary-Q evaluator.
 
-        eval_vq(Qfrac, V_SRc_stack, pinvF, coeffs_tuple) -> V(Q)
+        eval_vq(Qfrac, V_SRc_stack, pinvF, coeffs_tuple) -> V(Q)          (default)
+        eval_vq(Qfrac, V_SRc_stack, pinvF, coeffs_tuple, head_val, gstar) (mini-BZ)
 
     Q-DEPENDENT data enter as RUNTIME ARGUMENTS — target ``Qfrac``, the
     SR-tile stack (whose training subset a LOO caller may swap), the
@@ -758,6 +805,18 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None):
         A        = e^{−2πi(Q+G)·s_μ} M_μ √v_LR(Q+G)
         V(Q)     = V_SR + conj(A) A^T
 
+    ``head_minibz_average`` (config ``head_minibz_average``): when True the
+    evaluator takes two extra runtime args ``head_val`` (real
+    ``<v_LR(Q+G*)>_mBZ / celvol`` from :func:`minibz_head_vlr`) and ``gstar``
+    (the ``argmin_G|Q+G|`` slot), and REPLACES the LR channel's ``v[gstar]``
+    POINT value with the mini-BZ CELL AVERAGE before building A.  Only the
+    magnitude scalar changes: the phase-factored ζ̃ model ``zt`` (which
+    carries the 2D winding ``e^{-i2θ}``) and the SR body ``V_SR`` (which
+    carries ``v_SR(Q+G*)`` once) are UNTOUCHED — arbitrary_q_bse.md §16
+    no-double-count.  Default False keeps the 4-arg point-value evaluator
+    bit-identical (the shared body's injection is a ``jnp.where`` gated on a
+    sentinel ``gstar=-1``, an exact no-op).
+
     Output: (n_out, n_out) tile, ``P('x','y')``, n_out = ``n_rmu_pad`` (the
     loader's padded extent; pad rows/cols zero) or the logical n_μ when
     ``n_rmu_pad`` is None.  NO solve, NO eigh, NO r_tot object.
@@ -766,6 +825,7 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None):
     n_out = int(n_rmu_pad) if n_rmu_pad is not None else n_mu
     assert n_out >= n_mu
     GS = jnp.asarray(prep["GS"].astype(np.float64))          # (3, nG)
+    nG = int(GS.shape[1])
     bvec = jnp.asarray(zx["bvec"])
     rmu = jnp.asarray(zx["rmu_frac"])                        # (n_μ, 3)
     R7 = jnp.asarray(stencil_r7(zx).astype(np.float64))      # (7, 3)
@@ -785,8 +845,7 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None):
         return jnp.stack([(x ** a) * (y ** b) if (a or b) else jnp.ones_like(x)
                           for a, b in spec], 1)
 
-    @partial(jax.jit, out_shardings=grid_xy)
-    def eval_vq(Qfrac, V_SRc_stack, pinvF, coeffs_tuple):
+    def _body(Qfrac, V_SRc_stack, pinvF, coeffs_tuple, head_val, gstar):
         # ── SR stencil:  w(Q) = e^{−2πi Q·R} pinv(F);  V_SR = Σ_j w_j V_SRc ──
         f0 = jnp.exp(-2j * jnp.pi * (Qfrac @ R7.T))          # (nR,)
         w = f0 @ pinvF                                        # (n_train,)
@@ -806,6 +865,10 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None):
         v = 8.0 * jnp.pi / K2s * f2d / celvol \
             * jnp.exp(-K2 / (4.0 * alpha ** 2))
         v = jnp.where(zero, 0.0, v)
+        # mini-BZ head: replace the LR POINT value at G*=gstar with the
+        # cell-averaged <v_LR(Q+G*)>_mBZ.  Sentinel gstar=-1 (off path) →
+        # arange==-1 all-False → v unchanged, exact no-op (bit-identical).
+        v = jnp.where(jnp.arange(nG) == gstar, head_val, v)
         qG = Qfrac[None, :] + GS.T                            # (nG, 3)
         zt = jnp.exp(-2j * jnp.pi * (rmu @ qG.T)) * M         # (n_μ, nG)
         A = zt * jnp.sqrt(v)[None, :]
@@ -815,6 +878,18 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None):
         if n_out > n_mu:
             V = jnp.pad(V, ((0, n_out - n_mu), (0, n_out - n_mu)))
         return jax.lax.with_sharding_constraint(V, grid_xy)
+
+    if head_minibz_average:
+        @partial(jax.jit, out_shardings=grid_xy)
+        def eval_vq(Qfrac, V_SRc_stack, pinvF, coeffs_tuple, head_val, gstar):
+            return _body(Qfrac, V_SRc_stack, pinvF, coeffs_tuple,
+                         head_val, gstar)
+    else:
+        @partial(jax.jit, out_shardings=grid_xy)
+        def eval_vq(Qfrac, V_SRc_stack, pinvF, coeffs_tuple):
+            return _body(Qfrac, V_SRc_stack, pinvF, coeffs_tuple,
+                         jnp.asarray(0.0, dtype=jnp.float64),
+                         jnp.asarray(-1, dtype=jnp.int32))
 
     return eval_vq
 

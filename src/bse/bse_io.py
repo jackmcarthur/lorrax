@@ -600,6 +600,32 @@ def load_bse_data_from_restart_sharded(
                      if whead is not None else "whead=skipped")
             print(f"BSE-sharded: q=0 head injected (rank-1, dual-sharded G0, "
                   f"V_cell={cell_volume:.2f}): {v_str}, {w_str}")
+        else:
+            # §16.5 latent-bug guard: G0_mu_nu is present and inject_head is
+            # True, but the rank-1 head was NOT injected because vhead/whead
+            # both resolve to None (no cohsex.in override, no restart scalars)
+            # and/or cell_volume is unknown.  Previously silent → a head-LESS
+            # q=0 exchange tile with no trace.  Recompute is NON-TRIVIAL here
+            # (the loader has no wfn/meta/sym/S_cart to rebuild <v>_mBZ), so
+            # warn loudly and name the fix (add vhead/whead to the restart or
+            # a cohsex.in override).
+            import warnings
+            reasons = []
+            if cell_volume is None:
+                reasons.append("cell_volume unknown (WFN not passed)")
+            if vhead is None and whead is None:
+                reasons.append("vhead/whead both unresolved "
+                               "(no cohsex.in override, no restart scalars)")
+            msg = (
+                "BSE q=0 head NOT injected though G0_mu_nu is present and "
+                f"inject_head=True: {', '.join(reasons)}.  The q=0 exchange "
+                "tile is HEAD-LESS (missing the rank-1 (vhead/V_cell)·conj(g0)g0 "
+                "term) — exciton binding energies will be under-bound at the "
+                "zone centre.  FIX: add ``vhead``/``whead_0freq`` to cohsex.in, "
+                "or write ``vhead``/``whead`` datasets into the restart.  "
+                "(Recompute-from-WFN is not available at the loader.)")
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+            print(f"BSE-sharded: [WARN] {msg}")
 
     # Hoisted exchange pair amplitudes M(k,c,v,μ) = Σ_s conj(ψ_c) ψ_v — the V-term
     # decode (M_X, μ on x) and encode (M_Y, ν on y) vertices. Precomputed ONCE here

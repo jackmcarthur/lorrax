@@ -53,16 +53,21 @@ def compute_q0_averages(
 	nsamples: int = 2**18,
 	method: str = "sobol",
 	qmc_reps: int = 10,
+	analytic_sphere: bool = False,
 ):
 	"""Compute q=0 averages (vc0_mean, wcoul0) for the system's dimensionality.
 
 	Thin compatibility wrapper around the dimension-aware ``CoulombKernel``
 	in :mod:`gw.coulomb`.  The branching logic that used to live here is
-	now distributed across the per-dim kernel modules.
+	now distributed across the per-dim kernel modules.  ``analytic_sphere``
+	(``head_minibz_average``) adds the Baldereschi-Tosatti analytic sphere
+	term (3D) / widens the Voronoi fold (both dims) to the q→0 head; default
+	False keeps the historical pure-Sobol average bit-identical.
 	"""
 	from .coulomb import get_kernel
 	return get_kernel(getattr(meta, 'sys_dim', None)).q0_average(
 		wfn, meta,
 		S_cart=S_cart, epshead=epshead,
 		nsamples=nsamples, method=method, qmc_reps=qmc_reps,
+		analytic_sphere=analytic_sphere,
 	)

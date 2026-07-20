@@ -12,7 +12,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from common import Meta
-from .base import SysDim, sample_minibz_qpoints
+from .base import (SysDim, sample_minibz_qpoints, minibz_average,
+                   minibz_voronoi_batches, minibz_inscribed_sphere_r2)
 
 
 class Slab2D:
@@ -47,6 +48,42 @@ class Slab2D:
         f2d = 2.0 * (1.0 - jnp.exp(-zc * kxy))
         return base * f2d
 
+    def v_head_minibz_avg(
+        self, wfn, meta: Meta, shift_frac, *,
+        alpha: float | None = None,
+        kind: str = "slab",
+        nsamples: int = 2**18,
+        method: str = "sobol",
+        qmc_reps: int = 10,
+        n_coarse: int = 250_000,
+    ) -> float:
+        """Mini-BZ CELL AVERAGE of the slab Coulomb head at a FINITE shift.
+
+        ``shift_frac`` — fractional ``Q + G*`` (the smallest-|Q+G|
+        umklapp).  Returns ``<v_slab(Q+G*)>_mBZ`` in **bare** units (no
+        ``1/celvol``).  In-plane pure adaptive MC — the 2D head is a ``|Q|``
+        cusp, not a ``1/q²`` pole, so no inscribed-sphere split (BGW
+        ``minibzaverage_2d``, ``minibzaverage.f90:97-186``).  ``kind`` picks
+        the bare ``slab`` or the Gaussian ``slab_lr`` (b26p SR/LR) channel.
+
+        This is the finite-q cell-average path §16.4 flagged missing for the
+        2D slab (the stored ``V_qmunu`` body uses a POINT value); it shares
+        the single-source :func:`base.minibz_average` with the 3D head and
+        the BSE per-Q ``eval_vq`` head.
+        """
+        bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
+        kgrid = (meta.nkx, meta.nky, meta.nkz)
+        shift_cart = np.asarray(shift_frac, dtype=np.float64) @ bvec
+        dq = minibz_voronoi_batches(
+            bvec, kgrid, nsamples=nsamples, method=method,
+            qmc_reps=qmc_reps, nmax=3, is_2d=True)
+        q0sph2 = minibz_inscribed_sphere_r2(bvec, kgrid, is_2d=True)
+        return minibz_average(
+            shift_cart, dq, kind=kind, celvol=float(wfn.cell_volume),
+            n_kpts=int(meta.nkx * meta.nky * meta.nkz), q0sph2=q0sph2,
+            alpha=alpha, zc=float(np.pi / bvec[2, 2]),
+            analytic_sphere=False, adaptive=True, n_coarse=n_coarse)
+
     def q0_average(
         self, wfn, meta: Meta, *,
         S_cart=None,
@@ -54,12 +91,18 @@ class Slab2D:
         nsamples: int = 2**18,
         method: str = "sobol",
         qmc_reps: int = 10,
+        analytic_sphere: bool = False,
     ):
         bvec = jnp.asarray(wfn.blat * wfn.bvec, dtype=jnp.float64)
         zc = jnp.pi / bvec[2, 2]
 
+        # 2D head is a |Q| cusp, not a 1/q² pole → no analytic sphere term;
+        # the flag only widens the Voronoi fold (nmax 1→3, BGW ncell=3).
+        # Default (flag off) keeps nmax=1 → bit-identical.
+        nmax = 3 if analytic_sphere else 1
         batches = sample_minibz_qpoints(
             wfn, meta, nsamples=nsamples, method=method, qmc_reps=qmc_reps,
+            nmax=nmax,
         )
         # Sobol path uses the per-rep formula with the *cosine* term included
         # (since rq.z is exactly zero by construction, cos(qz·zc) == 1, but

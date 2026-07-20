@@ -6,7 +6,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from common import Meta
-from .base import SysDim, sample_minibz_qpoints
+from .base import (SysDim, sample_minibz_qpoints, minibz_average,
+                   minibz_inscribed_sphere_r2)
 
 
 class Bulk3D:
@@ -36,13 +37,32 @@ class Bulk3D:
         nsamples: int = 2**18,
         method: str = "sobol",
         qmc_reps: int = 10,
+        analytic_sphere: bool = False,
     ):
+        # ``analytic_sphere`` (head_minibz_average): add the analytic
+        # Baldereschi-Tosatti sphere term to the q→0 head so vc0_mean is
+        # seed-independent (the pure-Sobol mean has a few tiny δq → 8π/|δq|²
+        # blow-ups that make it drift between seeds).  nmax 1→3 widens the
+        # Voronoi fold (BGW ncell=3) for skewed cells.  Default False keeps
+        # the historical pure-Sobol average bit-identical.
+        nmax = 3 if analytic_sphere else 1
         batches = sample_minibz_qpoints(
             wfn, meta, nsamples=nsamples, method=method, qmc_reps=qmc_reps,
+            nmax=nmax,
         )
-        # vc0_mean: average v(q) across all sampled q-points, then mean over reps.
-        means = [jnp.mean(self._vq_isotropic(rq)) for rq in batches]
-        vc0_mean = jnp.mean(jnp.stack(means))
+        if analytic_sphere:
+            bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
+            kgrid = (meta.nkx, meta.nky, meta.nkz)
+            q0sph2 = minibz_inscribed_sphere_r2(bvec, kgrid, is_2d=False)
+            n_kpts = int(meta.nkx * meta.nky * meta.nkz)
+            vc0_mean = jnp.asarray(minibz_average(
+                np.zeros(3), [np.asarray(b) for b in batches],
+                kind="bulk_3d", celvol=float(wfn.cell_volume), n_kpts=n_kpts,
+                q0sph2=q0sph2, analytic_sphere=True), dtype=jnp.float64)
+        else:
+            # vc0_mean: average v(q) across all sampled q-points, mean over reps.
+            means = [jnp.mean(self._vq_isotropic(rq)) for rq in batches]
+            vc0_mean = jnp.mean(jnp.stack(means))
 
         if S_cart is not None:
             # Anisotropic screened: w0 = ⟨ v / (1 - v · qᵀSq) ⟩ on the same q's.
