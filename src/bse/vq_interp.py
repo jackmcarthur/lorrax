@@ -75,6 +75,7 @@ GTO ladders (conditioning, §13.2).
 """
 from __future__ import annotations
 
+import os
 from functools import partial
 
 import h5py
@@ -762,7 +763,7 @@ def pack_coeffs(des, coeffs):
 
 
 def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
-                    qmc_reps=10, n_coarse=250_000, seed_offset=0):
+                    qmc_reps=10, n_coarse=250_000, seed_offset=0, kgrid=None):
     """Host-side mini-BZ CELL AVERAGE of the LR-slab head at target Q.
 
     Returns ``(gstar, head_val)``:
@@ -780,6 +781,12 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     untouched — it rides the phase-factored ζ̃ model in ``eval_vq``; this
     scalar supplies the magnitude only.  Single-sources
     :func:`gw.coulomb.base.minibz_average`.
+
+    ``kgrid`` overrides ``zx['kgrid']`` for the mini-BZ CELL SIZE — the
+    ``bse_k_grid`` coarse→fine init passes the FINE k-grid here so the q=0
+    exchange head is the (smaller) fine mini-BZ average, not the coarse one
+    (the head magnitude scales with the mini-BZ cell area).  Default None uses
+    the stored coarse grid (the exciton_bands Q-path convention, unchanged).
     """
     from gw.coulomb.base import (minibz_voronoi_batches, minibz_average,
                                  minibz_inscribed_sphere_r2)
@@ -788,7 +795,8 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     GS = np.asarray(prep["GS"], dtype=np.float64)          # (3, nG)
     bvec = np.asarray(zx["bvec"], dtype=np.float64)
     celvol = float(zx["celvol"])
-    kgrid = tuple(int(s) for s in zx["kgrid"])
+    kgrid = (tuple(int(s) for s in zx["kgrid"]) if kgrid is None
+             else tuple(int(s) for s in kgrid))
     Qf = np.asarray(Qfrac, dtype=np.float64)
     K = bvec.T @ (Qf[:, None] + GS)                        # (3, nG) cartesian Q+G
     K2 = np.sum(K * K, axis=0)
@@ -916,6 +924,53 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None,
                          jnp.asarray(-1, dtype=jnp.int32))
 
     return eval_vq
+
+
+def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None,
+                       *, zeta_file=None, alpha=ALPHA, eps_tik=EPS_TIK,
+                       eigh_backend="auto", head_minibz_average=False,
+                       run_diagnostics=True, log_fn=print):
+    """ONE arbitrary-Q exchange-tile model build (stages 1-3), packaged.
+
+    This is the SINGLE orchestration of the ``vq_interp`` pipeline
+    (``load_zeta_coarse`` → ``build_cq`` → gates → ``prepare_coarse`` →
+    ``lr_design_blocks`` → ``fit_lr_model`` → nulls → ``make_eval_vq`` +
+    stencil pieces).  BOTH the ``exciton_bands`` Q-path driver and the general
+    BSE init's ``bse_k_grid`` coarse→fine densification call this — there is no
+    second copy of the setup sequence.
+
+    Returns a ``SimpleNamespace`` with every handle the per-Q evaluation needs:
+        .zx, .prep, .des, .coeffs        the fitted coarse-side model
+        .eval_vq                         the ONE jitted evaluator (Q runtime arg)
+        .pinvF                           stencil pseudo-inverse (Q-independent)
+        .coeffs_packed                   jit-friendly coefficient tuple
+        .head_minibz_average             whether eval_vq takes (head_val, gstar)
+
+    ``zeta_file`` defaults to ``zeta_q.h5`` beside ``restart_file``.  ``eval_vq``
+    at a target Q is then a single dispatch (see ``make_eval_vq`` /
+    ``minibz_head_vlr``).
+    """
+    from types import SimpleNamespace
+    if zeta_file is None:
+        zeta_file = os.path.join(os.path.dirname(restart_file), "zeta_q.h5")
+    zx = load_zeta_coarse(restart_file, zeta_file)
+    C_q = build_cq(zx)
+    if run_diagnostics:
+        run_gates(zx, C_q)
+    prep = prepare_coarse(zx, C_q, mesh_xy, alpha=alpha, eps_tik=eps_tik,
+                          eigh_backend=eigh_backend)
+    des = lr_design_blocks(zx, prep)
+    coeffs = fit_lr_model(des)
+    if run_diagnostics:
+        run_nulls(zx, prep, des, coeffs)
+    eval_vq = make_eval_vq(zx, prep, des, mesh_xy, n_rmu_pad,
+                           head_minibz_average=head_minibz_average)
+    pinvF = jnp.asarray(stencil_pinv(zx["qfr"], stencil_r7(zx)))
+    coeffs_packed = pack_coeffs(des, coeffs)
+    return SimpleNamespace(
+        zx=zx, prep=prep, des=des, coeffs=coeffs, eval_vq=eval_vq,
+        pinvF=pinvF, coeffs_packed=coeffs_packed,
+        head_minibz_average=head_minibz_average)
 
 
 def eval_vq_host(zx, prep, des, coeffs, qfrac, train=None):

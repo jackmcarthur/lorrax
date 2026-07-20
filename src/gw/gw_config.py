@@ -342,6 +342,18 @@ _DEFAULTS = {
     # The winding (2D e^{-i2θ}) is unaffected — only the head magnitude is
     # averaged; the phase-factored ζ̃ rank-1 structure carries the direction.
     "head_minibz_average": False,
+    # BSE fine-grid densification.  When set to "NX NY NZ" (or "NX,NY,NZ") and
+    # DIFFERENT from the coarse restart/WFN grid, the GENERAL BSE init
+    # (``bse_io.load_bse_data_from_restart_sharded``) interpolates the ENTIRE
+    # BSE problem — ψ, QP ε (htransform fH), V_Q exchange (vq_interp), and the
+    # W direct term (zero-pad in R) — from the coarse grid onto this fine grid
+    # BEFORE any solve, so EVERY BSE solver (exciton_bands / feast / nontda /
+    # kpm / resolvent) transparently runs on the fine grid.  Each fine length
+    # must be a positive multiple of the matching coarse length (coarse BZ ⊂
+    # fine BZ).  Empty (default) or == the coarse grid → the coarse ``data``
+    # bundle is returned byte-identically (fast path untouched).  Subsumes the
+    # exciton_bands ``--w-coarse-grid`` W-only flag for the direct term.
+    "bse_k_grid": "",
     "bare_coulomb_cutoff": None,
     # ζ-sphere cutoff (Ry).  When the writer emits zeta_q_G with per-q
     # WFN.h5-style spheres, this is the cutoff used to define the per-q

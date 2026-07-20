@@ -484,18 +484,11 @@ def main(argv=None):
             _gather_host(psi_cQ_X[iGamma[0]]),
             _gather_host(eps_cQ[iGamma[0]]), data, log=log)
 
-    # ── V_Q tiles ────────────────────────────────────────────────────────
+    # ── V_Q tiles ─ ONE shared arbitrary-Q model build.  The bse_k_grid
+    #    coarse→fine general init (bse_io) calls the SAME
+    #    ``vq_interp.build_vq_evaluator`` — there is a single exchange-interp
+    #    orchestration, not one here and one there. ─────────────────────────
     t0 = time.time()
-    zeta_file = os.path.join(os.path.dirname(restart_file), "zeta_q.h5")
-    zx = vq_interp.load_zeta_coarse(restart_file, zeta_file)
-    C_q = vq_interp.build_cq(zx)
-    vq_interp.run_gates(zx, C_q)
-    prep = vq_interp.prepare_coarse(zx, C_q, mesh_xy, alpha=args.alpha,
-                                    eps_tik=args.eps_tik,
-                                    eigh_backend=args.eigh_backend)
-    des = vq_interp.lr_design_blocks(zx, prep)
-    coeffs = vq_interp.fit_lr_model(des)
-    vq_interp.run_nulls(zx, prep, des, coeffs)
     # Per-Q mini-BZ head cell-averaging: CLI --head-minibz-average overrides
     # the cohsex.in ``head_minibz_average`` key (default off = point value).
     head_mbz = (bool(args.head_minibz_average)
@@ -503,11 +496,12 @@ def main(argv=None):
                 else bool(params.get("head_minibz_average", False)))
     log(f"  arbitrary-Q head: {'mini-BZ cell average' if head_mbz else 'point value'} "
         f"(head_minibz_average={head_mbz})")
-    eval_vq = vq_interp.make_eval_vq(zx, prep, des, mesh_xy, n_rmu_pad,
-                                     head_minibz_average=head_mbz)
-    pinvF = jnp.asarray(vq_interp.stencil_pinv(
-        zx["qfr"], vq_interp.stencil_r7(zx)))
-    coeffs_packed = vq_interp.pack_coeffs(des, coeffs)
+    vqm = vq_interp.build_vq_evaluator(
+        restart_file, mesh_xy, n_rmu_pad, alpha=args.alpha,
+        eps_tik=args.eps_tik, eigh_backend=args.eigh_backend,
+        head_minibz_average=head_mbz, log_fn=log)
+    zx, prep = vqm.zx, vqm.prep
+    eval_vq, pinvF, coeffs_packed = vqm.eval_vq, vqm.pinvF, vqm.coeffs_packed
     tick("vq_prepare", t0)
 
     grid_xy = NamedSharding(mesh_xy, P("x", "y"))
