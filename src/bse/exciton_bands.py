@@ -214,10 +214,27 @@ def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data, log=print):
         B = B / np.linalg.norm(B, axis=1, keepdims=True)
         s = np.linalg.svd(A.conj() @ B.T, compute_uv=False)
         smin = min(smin, float(s.min()))
-    log(f"  [gate] htransform@Γ vs stored: max|Δε_c| = {d_eps*RY2EV*1e3:.3f} meV, "
+    d_meV = d_eps * RY2EV * 1e3
+    log(f"  [gate] htransform@Γ vs stored: max|Δε_c| = {d_meV:.3f} meV, "
         f"conduction-subspace overlap min-sval = {smin:.4f}")
-    assert d_eps < 0.1 and smin > 0.5, \
-        "htransform conduction cache grossly inconsistent with the stored grid"
+    # The min-sval (subspace overlap) does NOT see energy corruption: an
+    # over-packed interp window keeps the ψ_c SPAN (min-sval healthy) while the
+    # recovered conduction ENERGIES drift by ~eV (640c/nband=80: min-sval 0.86
+    # but on-grid |Δε_c| ~955 meV — 10_lorrax_exciton_bands_80interp_8v8c).  So
+    # the ENERGY gate is the authoritative interp-basis check, tightened here.
+    if d_meV > 20.0:
+        log(f"  [warn] on-grid conduction ENERGY error {d_meV:.1f} meV ≫ the "
+            f"~1-2 meV htransform floor — the interp basis is over-packed: "
+            f"640-scale centroids cannot orthonormalize high oscillatory bands, "
+            f"so their non-orthonormal Galerkin coeffs pollute fH=Σf(ε)ccᴴ.  "
+            f"Reduce nband toward the BSE window (a few guard bands).")
+    assert d_eps < 0.05 and smin > 0.5, (
+        f"htransform conduction cache grossly inconsistent with the stored grid "
+        f"(max|Δε_c|={d_meV:.1f} meV, min-sval={smin:.3f}) — interp basis broken. "
+        f"The htransform fH energy recovery needs orthonormal Galerkin coeffs; "
+        f"640-scale centroids cannot carry a full 80-band window (per-band "
+        f"capacity finding: runs/MoS2/04_mos2_12x12_bands_2026-07-18/"
+        f"10_lorrax_exciton_bands_80interp_8v8c).")
     return d_eps, smin
 
 
@@ -328,6 +345,17 @@ def main(argv=None):
     # degenerate (Kramers) pair.  A SLIVER conduction window whose top
     # boundary cuts a near-degenerate pair instead rings 100-1000 meV off-grid
     # (05_htransform_spbands/gap_scan; Si degeneracy root-cause 73e58f79).
+    #
+    # But the interp window is TWO-SIDED: too small rings off-grid (above),
+    # too LARGE corrupts on-grid.  fH = Σ_n f(ε_n) c_n c_nᴴ recovers energies
+    # via eigvals=f(ε_n) ONLY if the Galerkin coeffs c_n are orthonormal; a
+    # fixed 640-scale centroid set cannot orthonormalize high oscillatory bands
+    # (Gram error → 40% for the top bands), so packing a full 80-band window
+    # pollutes eps_c(k+Q) — on-grid |Δε_c| cliffs from ~1 meV (nband≤48) to
+    # ~955 meV (nband=80) for MoS2/640c, invisible to the subspace min-sval but
+    # caught by the tightened on-grid ENERGY gate.  So keep nband MODEST: a few
+    # guard bands above the BSE window (nband≈40-48 for an 8v8c MoS2 run), not
+    # maximal.  Reconciliation: 10_lorrax_exciton_bands_80interp_8v8c.
     t0 = time.time()
     nb_window = int(ctilde.shape[1])    # bands in the htransform fH (= input nval+ncond)
     nval_in = int(params["nval"])       # window-relative CBM index (VBM = nval_in-1)
@@ -342,11 +370,17 @@ def main(argv=None):
         print(f"  [warn] only {n_guard} conduction guard band(s) above the BSE "
               f"selection — a selection boundary near a Kramers pair can ring "
               f"off-grid; widen the input's ncond/nband (>= {b_max + 4} bands).")
-    if nb_window - nval_in > n_cond + 24:
-        print(f"  [warn] htransform fH spans {nb_window - nval_in} conduction "
-              f"bands; high oscillatory bands can push the alpha-basis past its "
-              f"ns*n_mu capacity and degrade the caches — nband=40 (26v+14c) is "
-              f"the validated MoS2 full-band window.")
+    if n_guard > 16:
+        print(f"  [warn] htransform fH spans {nb_window} bands with {n_guard} "
+              f"conduction guards above the BSE window — a LARGE interp window "
+              f"does NOT improve (and past a system-dependent cliff WRECKS) the "
+              f"returned conduction ENERGIES.  fH=Σf(ε)ccᴴ needs orthonormal "
+              f"Galerkin coeffs; 640-scale centroids cannot orthonormalize high "
+              f"oscillatory bands (Gram error →40%% for the top bands), so they "
+              f"pollute eps_c(k+Q).  MoS2/640c on-grid |Δε_c|: ~1 meV at "
+              f"nband≤48, 7 meV at 64, ~955 meV at 80.  min-sval does not see "
+              f"this; the on-grid gate does.  Keep nband just above the BSE "
+              f"window unless the on-grid gate stays <~20 meV.")
     print(f"  full-band htransform: fH over {nb_window} bands "
           f"({nval_in}v + {nb_window - nval_in}c); BSE conduction "
           f"[{b_min},{b_max}) = {n_cond} band(s) + {n_guard} guard(s)")
