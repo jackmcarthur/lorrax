@@ -100,7 +100,8 @@ fallback_to_cpu_if_no_gpu_backend()
 
 from solvers.lanczos import block_lanczos_eig_jit
 from common.fft_helpers import make_sharded_ifftn_3d
-from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
+from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
+                     decimate_W_q_to_subgrid, pad_W_R_to_grid)
 from .bse_ring_comm import make_bse_shardings
 from .bse_serial import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
@@ -324,6 +325,17 @@ def main(argv=None):
                          "``head_minibz_average`` key; default (unset) uses it.")
     ap.add_argument("--eigh-backend", default="auto",
                     choices=("auto", "off", "cusolvermp", "slate"))
+    ap.add_argument("--distributed-recon", default="off",
+                    choices=("off", "on", "auto"),
+                    help="V_Q coarse-prep reconstruction backend.  'off' "
+                         "(default) = replicated-batched per-q clean/split "
+                         "(small-n_μ efficient).  'on'/'auto' = 2-D-distributed "
+                         "cuBLASMp reconstruction (requires --eigh-backend "
+                         "cusolvermp): every n_μ×n_μ tile stays sharded "
+                         "P(None,'x','y') so a single tile NEVER lands whole on "
+                         "one proc (generalises to n_μ² that can't fit "
+                         "replicated).  'auto' = on only when one replicated "
+                         "tile exceeds 10%% of the device budget.")
     ap.add_argument("--px", type=int, default=1)
     ap.add_argument("--py", type=int, default=1)
     ap.add_argument("--skip-rerun-check", action="store_true",
@@ -331,6 +343,13 @@ def main(argv=None):
                          "(reproducibility assert + dispatch-only timing); "
                          "the re-run costs a full second solve pass")
     ap.add_argument("--out-prefix", type=str, default="exciton_bands")
+    ap.add_argument("--w-coarse-grid", type=str, default=None,
+                    help="NX,NY,NZ — sample the screened W on this COARSE BZ "
+                         "sub-grid (a divisor of the WFN/BSE grid), then "
+                         "zero-pad W_R back to the fine grid (exact trig "
+                         "interpolation) for the direct term.  Enables cheap "
+                         "coarse-W + fine exciton sampling.  Default (unset) "
+                         "keeps the native fine W byte-identical.")
     args = ap.parse_args(argv)
 
     t_wall = time.time()
@@ -482,9 +501,20 @@ def main(argv=None):
     zx = vq_interp.load_zeta_coarse(restart_file, zeta_file)
     C_q = vq_interp.build_cq(zx)
     vq_interp.run_gates(zx, C_q)
+    _mem_gb = float(params.get("memory_per_device_gb", 0.0) or 0.0)
+    if _mem_gb <= 0:
+        try:
+            from common.gpu_utils import get_device_memory_gb
+            _mem_gb = float(get_device_memory_gb())
+        except Exception:
+            _mem_gb = 0.0
+    _drecon = ("auto" if args.distributed_recon == "auto"
+               else (args.distributed_recon == "on"))
     prep = vq_interp.prepare_coarse(zx, C_q, mesh_xy, alpha=args.alpha,
                                     eps_tik=args.eps_tik,
-                                    eigh_backend=args.eigh_backend)
+                                    eigh_backend=args.eigh_backend,
+                                    distributed_recon=_drecon,
+                                    mem_per_device_gb=_mem_gb)
     des = vq_interp.lr_design_blocks(zx, prep)
     coeffs = vq_interp.fit_lr_model(des)
     vq_interp.run_nulls(zx, prep, des, coeffs)
@@ -566,7 +596,27 @@ def main(argv=None):
     sh = make_bse_shardings(mesh_xy)
     _ifftn = make_sharded_ifftn_3d(mesh_xy, sh.W.spec, sh.W.spec,
                                    axes=(2, 3, 4), norm="ortho")
-    W_R = _ifftn(data["W_q"])
+    if args.w_coarse_grid is None:
+        W_R = _ifftn(data["W_q"])                 # fast path: native fine W (byte-identical)
+    else:
+        cg = tuple(int(s) for s in args.w_coarse_grid.split(","))
+        if len(cg) != 3:
+            raise ValueError("--w-coarse-grid expects NX,NY,NZ")
+        if cg == (nkx, nky, nkz):
+            W_R = _ifftn(data["W_q"])             # equal grids → no-op, byte-identical
+        else:
+            # Coarse-W → fine direct term.  Sub-sample the fine W_q onto the
+            # coarse BZ sub-grid (same ISDF μ-basis; q=0 head-tile preserved),
+            # ifft to the coarse R-lattice, then ZERO-PAD R back to the fine
+            # grid = exact trig interpolation of W(k) that passes through the
+            # coarse samples.  The convolution then runs on the fine grid with
+            # the fine (nkx,nky,nkz) solver — cheap coarse W, fine excitons.
+            W_q_coarse = decimate_W_q_to_subgrid(data["W_q"], cg)
+            W_R_coarse = _ifftn(W_q_coarse)
+            W_R = pad_W_R_to_grid(W_R_coarse, (nkx, nky, nkz))
+            W_R = jax.device_put(W_R, sh.W)       # restore μ/ν sharding on the padded R-tensor
+            log(f"[coarse-W] W sampled on {cg[0]}x{cg[1]}x{cg[2]} sub-grid of "
+                f"{nkx}x{nky}x{nkz}, zero-padded in R (trig-interp to fine grid)")
     solver = build_path_solver(
         mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_eig=args.n_eig,
         block_size=args.block_size, max_iter=args.max_iter)

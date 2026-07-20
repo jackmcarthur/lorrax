@@ -178,6 +178,133 @@ def _pad_first_two_axes(x: jax.Array, target: int) -> jax.Array:
     return jnp.pad(x, pad_width, mode="constant")
 
 
+def _zeropad_R_axis(x: jax.Array, axis: int, n_fine: int) -> jax.Array:
+    """Spectral zero-pad one real-space (R) axis from a coarse to a fine k-lattice.
+
+    ``x`` is a real-space tensor whose ``axis`` is the R-lattice DUAL to a
+    COARSE BZ axis of length ``n_c = x.shape[axis]`` (i.e. an ``ifft`` over that
+    BZ axis already happened).  We embed the ``n_c`` coarse Fourier coefficients
+    into ``n_fine`` slots so that an ``fft`` back to ``n_fine`` BZ points is the
+    exact band-limited trigonometric interpolant of the coarse ``W(k)`` — which,
+    because the coarse BZ points are a subset of the fine ones (``n_fine`` a
+    multiple of ``n_c``), passes THROUGH the coarse samples exactly.
+
+    Per-element R-lattice index map (the crux).  numpy/JAX FFT order maps array
+    index ``i∈[0,N)`` to the physical lattice-vector rep ``n = fftfreq(N)*N``:
+
+        n = i        for 0 ≤ i < ⌈N/2⌉     (the non-negative reps 0,1,…)
+        n = i − N    for ⌈N/2⌉ ≤ i < N      (the negative reps …,−2,−1, wrapped)
+
+    For even ``N`` the single Nyquist rep ``n = −N/2`` sits at ``i = N/2`` (it is
+    in the negative branch here — kept single-sided, NOT split; sample agreement
+    is exact regardless, and single-sided = "coarse WS cell, zero outside",
+    which is precisely the requested zero-pad).  Embedding coarse→fine with
+    ``s = ⌈n_c/2⌉ = (n_c+1)//2`` non-negative reps:
+
+        coarse i_c ∈ [0, s)      (reps n = 0 … s−1)      → fine i_f = i_c
+        coarse i_c ∈ [s, n_c)    (reps n = −(n_c−s) … −1) → fine i_f = i_c + (n_fine − n_c)
+
+    i.e. the low block keeps its indices, the high (negative-freq) block slides
+    to the TOP of the fine axis, and the gap ``i_f ∈ [s, n_fine − (n_c−s))`` is
+    ZERO (the high-|R| coefficients absent from the coarse cell — incl. the
+    fine-only Nyquist and the absent coarse ``+n_c/2``).  Realised as
+    ``concat([low, zeros, high])`` — the textbook fft zero-insertion, exact for
+    any parity of ``n_c``.
+
+    NOTE: scale is applied ONCE by the caller (``pad_W_R_to_grid``), not here.
+    """
+    n_c = x.shape[axis]
+    if n_fine == n_c:
+        return x
+    if n_fine < n_c or n_fine % n_c != 0:
+        raise ValueError(
+            f"_zeropad_R_axis: fine length {n_fine} must be a positive multiple "
+            f"of the coarse length {n_c} (coarse BZ points ⊂ fine BZ points).")
+    s = (n_c + 1) // 2
+    lo = jax.lax.slice_in_dim(x, 0, s, axis=axis)
+    hi = jax.lax.slice_in_dim(x, s, n_c, axis=axis)
+    zshape = list(x.shape)
+    zshape[axis] = n_fine - n_c
+    zeros = jnp.zeros(zshape, dtype=x.dtype)
+    return jnp.concatenate([lo, zeros, hi], axis=axis)
+
+
+def pad_W_R_to_grid(W_R_coarse: jax.Array,
+                    fine_grid: tuple[int, int, int]) -> jax.Array:
+    """Zero-pad a coarse-k-grid real-space ``W_R`` onto a finer k-lattice.
+
+    Enables a CHEAP coarse-grid W (e.g. GW/W on 6×6) to drive the BSE direct
+    term on an arbitrarily FINE interpolated exciton sampling (e.g. 12×12):
+    zero-padding in R is EXACT trigonometric interpolation in k that agrees
+    with the coarse ``W(k)`` at the coarse sub-k-points that coincide with the
+    fine grid (they do when each fine length is a multiple of the coarse one).
+
+    Parameters
+    ----------
+    W_R_coarse : (..., ncx, ncy, ncz)
+        Screened interaction on the real-space (R) lattice DUAL to a COARSE BZ
+        grid, i.e. ``ifftn(W_q_coarse, axes=last-3, norm='ortho')``.  Leading
+        axes (μ, ν, spin, …) are carried through untouched; only the trailing
+        three (kx, ky, kz) R-axes are re-embedded.
+    fine_grid : (nfx, nfy, nfz)
+        Target BZ grid.  Each ``nf`` must be a positive multiple of the matching
+        coarse length (so the coarse BZ ⊂ fine BZ).
+
+    Returns
+    -------
+    W_R_fine : (..., nfx, nfy, nfz)
+        Such that ``fftn(W_R_fine, norm='ortho')`` sampled at the fine BZ points
+        coinciding with the coarse grid equals ``W_q_coarse`` bit-close, i.e.
+        ``W_R_fine == ifftn(W_q_fine_interpolant, norm='ortho')`` — a drop-in for
+        the matvec's ``W_R`` on the FINE grid.
+
+    Scale.  ortho FFTs carry ``1/√N``, and ``N`` grows coarse→fine.  For the
+    fine ``fft`` of the embedded coefficients to reproduce the coarse samples,
+    the padded tensor is multiplied by ``√(∏nf / ∏nc)`` (= 2 for 6×6×1→12×12×1).
+
+    Degenerate ``fine_grid == coarse shape``: returns ``W_R_coarse`` UNCHANGED
+    (exact byte-identical no-op — scale is 1 and no axis is padded).
+    """
+    if W_R_coarse.ndim < 3:
+        raise ValueError(
+            f"pad_W_R_to_grid: expected trailing (kx,ky,kz) axes, got ndim="
+            f"{W_R_coarse.ndim}")
+    coarse_grid = tuple(int(s) for s in W_R_coarse.shape[-3:])
+    fine_grid = tuple(int(s) for s in fine_grid)
+    if fine_grid == coarse_grid:
+        return W_R_coarse                         # exact no-op (fast path)
+    out = W_R_coarse
+    for ax, nf in zip((-3, -2, -1), fine_grid):
+        out = _zeropad_R_axis(out, ax, nf)
+    n_c_tot = coarse_grid[0] * coarse_grid[1] * coarse_grid[2]
+    n_f_tot = fine_grid[0] * fine_grid[1] * fine_grid[2]
+    scale = jnp.sqrt(jnp.asarray(n_f_tot / n_c_tot, dtype=out.real.dtype))
+    return out * scale
+
+
+def decimate_W_q_to_subgrid(W_q: jax.Array,
+                            coarse_grid: tuple[int, int, int]) -> jax.Array:
+    """Sub-sample a fine-grid ``W_q`` onto a coarse BZ sub-grid (every m-th q).
+
+    ``W_q`` is ``(μ, ν, nfx, nfy, nfz)`` on a FINE BZ grid; returns the tiles at
+    the coarse sub-grid BZ points ``q_j = j·(nf/nc)`` (which coincide with a
+    coarse ``nc``-point grid since ``nf`` is a multiple of ``nc``).  This is the
+    honest "what a coarse-grid W sampling looks like, in the SAME ISDF μ-basis"
+    — used to drive ``pad_W_R_to_grid`` from a single fine restart (the q=0 tile,
+    incl. its rank-1 head, is preserved because q=0 is on both grids).
+    """
+    nf = tuple(int(s) for s in W_q.shape[-3:])
+    coarse_grid = tuple(int(s) for s in coarse_grid)
+    for a, (f, c) in enumerate(zip(nf, coarse_grid)):
+        if c <= 0 or f % c != 0:
+            raise ValueError(
+                f"decimate_W_q_to_subgrid: fine axis {a} length {f} must be a "
+                f"positive multiple of coarse {c}.")
+    rx, ry, rz = (nf[0] // coarse_grid[0], nf[1] // coarse_grid[1],
+                  nf[2] // coarse_grid[2])
+    return W_q[:, :, ::rx, ::ry, ::rz]
+
+
 def _pad_axis_to_multiple(x: jax.Array, axis: int, multiple: int) -> tuple[jax.Array, int]:
     size = x.shape[axis]
     pad = (-size) % multiple
