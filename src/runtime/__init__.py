@@ -89,6 +89,10 @@ def _resolve_coordinator_address() -> str:
     coord = os.environ.get("JAX_COORDINATOR_ADDRESS")
     if coord:
         return coord
+    # bfit-analysis: LORRAX_COORD_PORT lets a shared-allocation --overlap step
+    # pick a UNIQUE port (JAX's SLURM auto-detect derives the port from
+    # SLURM_JOBID, so every overlap step on a shared salloc collides on it).
+    _port = os.environ.get("LORRAX_COORD_PORT", "12355")
     nodelist = os.environ.get("SLURM_NODELIST")
     if nodelist:
         try:
@@ -97,13 +101,13 @@ def _resolve_coordinator_address() -> str:
                 capture_output=True, text=True, check=True,
             )
             first_host = result.stdout.strip().split("\n")[0]
-            return f"{first_host}:12355"
+            return f"{first_host}:{_port}"
         except Exception:
             pass
     host = (os.environ.get("SLURMD_NODENAME")
             or os.environ.get("HOSTNAME")
             or "localhost")
-    return f"{host}:12355"
+    return f"{host}:{_port}"
 
 
 def init_jax_distributed() -> None:
@@ -137,17 +141,24 @@ def init_jax_distributed() -> None:
     cv = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     n_local = len([x for x in cv.split(",") if x.strip()]) if cv else 0
     init_kwargs = {"local_device_ids": list(range(n_local))} if n_local else {}
-    try:
-        jax.distributed.initialize(**init_kwargs)
-        os.environ[_DISTRIBUTED_SENTINEL] = "1"
-        return
-    except Exception:
-        pass
+    # bfit-analysis: when LORRAX_COORD_PORT is set, SKIP JAX's no-args SLURM
+    # auto-detect (which hardcodes a SLURM_JOBID-derived port that collides
+    # across shared-allocation --overlap steps) and go straight to the explicit
+    # coordinator form with our unique port.
+    _force_explicit = bool(os.environ.get("LORRAX_COORD_PORT"))
+    if not _force_explicit:
+        try:
+            jax.distributed.initialize(**init_kwargs)
+            os.environ[_DISTRIBUTED_SENTINEL] = "1"
+            return
+        except Exception:
+            pass
 
     jax.distributed.initialize(
         coordinator_address=_resolve_coordinator_address(),
         num_processes=proc_count,
         process_id=_resolve_proc_id(),
+        **init_kwargs,
     )
     os.environ[_DISTRIBUTED_SENTINEL] = "1"
 

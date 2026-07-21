@@ -233,6 +233,73 @@ def fit_ppm(
     B = jax.lax.with_sharding_constraint(jnp.asarray(b_qmunu), q_shard)
     valid_mask = jax.lax.with_sharding_constraint(jnp.asarray(valid_qmunu), q_shard)
     Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
+
+    # --- BFIT ANALYSIS (agent/gw-ppm-bfit-analysis; env-gated, default no-op) ---
+    # Owner-hypothesis test: route near-invalid poles (fitted ω̃ = Ω below a
+    # small floor, i.e. ω̃²≈0⁺) OUT of the dynamic pole sum by flipping their
+    # valid flag → the invalid class picks them up (ppm_invalid_mode, default
+    # static_limit).  Symmetric high-Ω cap knob for the complementary test.
+    # Both operate purely on valid_mask; Ω is ω̃ in Ry (real, ≥0).
+    _floor = os.environ.get("LORRAX_OMEGA_FLOOR_RY")
+    _cap = os.environ.get("LORRAX_OMEGA_CAP_RY")
+    if _floor is not None:
+        _f = float(_floor)
+        valid_mask = valid_mask & (jnp.real(Omega) >= _f)
+        if print_fn is not None:
+            print_fn(f"  [BFIT] OMEGA_FLOOR_RY={_f:.4g}: near-invalid (ω̃<{_f} Ry) "
+                     f"routed to invalid/static")
+    if _cap is not None:
+        _c = float(_cap)
+        valid_mask = valid_mask & (jnp.real(Omega) <= _c)
+        if print_fn is not None:
+            print_fn(f"  [BFIT] OMEGA_CAP_RY={_c:.4g}: high-Ω (ω̃>{_c} Ry) "
+                     f"routed to invalid/static")
+    valid_mask = jax.lax.with_sharding_constraint(valid_mask, q_shard)
+
+    _dump = os.environ.get("LORRAX_BFIT_DUMP")
+    if _dump is not None and print_fn is not None:
+        import numpy as _np
+        from jax.experimental.multihost_utils import process_allgather as _pag
+        RY = float(RYD_TO_EV)
+        Om = _np.asarray(_pag(jnp.real(Omega), tiled=True))          # ω̃ (Ry)
+        aB = _np.abs(_np.asarray(_pag(B, tiled=True)))               # |B| (Ry)
+        aW0 = _np.abs(_np.asarray(_pag(Wc0_q, tiled=True)))          # |Wc0| (Ry)
+        aWi = _np.abs(_np.asarray(_pag(Wci_q, tiled=True)))          # |Wci| (Ry)
+        vm = _np.asarray(_pag(valid_mask, tiled=True)).astype(bool)
+        try:
+            _proc0 = (jax.process_index() == 0)
+        except Exception:
+            _proc0 = True
+        if _proc0:
+            _np.savez_compressed(
+                _dump,
+                omega_ry=Om.astype(_np.float32), absB_ry=aB.astype(_np.float32),
+                absWc0_ry=aW0.astype(_np.float32), absWci_ry=aWi.astype(_np.float32),
+                valid=vm, n_mu_logical=_np.int64(n_mu_logical), probe_ry=_np.float64(abs(z)))
+            Ov = Om[vm]; Bv = aB[vm]; W0v = aW0[vm]
+            def _pc(a, p): return float(_np.percentile(a, p)) if a.size else 0.0
+            print_fn(f"  [BFIT] dump -> {_dump}.npz  (nvalid={int(vm.sum())})")
+            print_fn(f"  [BFIT] valid ω̃(eV): min={Ov.min()*RY if Ov.size else 0:.3e} "
+                     f"p0.1={_pc(Ov,0.1)*RY:.4f} p1={_pc(Ov,1)*RY:.4f} "
+                     f"med={_pc(Ov,50)*RY:.3f} p99={_pc(Ov,99)*RY:.3f} "
+                     f"max={Ov.max()*RY if Ov.size else 0:.3f}")
+            for thr_ry in (0.001, 0.01, 0.05, 0.1, 0.5):
+                sel = Ov < thr_ry
+                if sel.sum():
+                    print_fn(f"  [BFIT] near-invalid ω̃<{thr_ry}Ry: n={int(sel.sum())} "
+                             f"({100.0*sel.sum()/max(Ov.size,1):.3g}%) "
+                             f"max|B|={Bv[sel].max()*RY:.3e}eV "
+                             f"max|Wc0|={W0v[sel].max()*RY:.3e}eV")
+                else:
+                    print_fn(f"  [BFIT] near-invalid ω̃<{thr_ry}Ry: n=0")
+            for thr_ry in (2.0, 3.0, 5.0):
+                sel = Ov > thr_ry
+                if sel.sum():
+                    print_fn(f"  [BFIT] high-Ω ω̃>{thr_ry}Ry: n={int(sel.sum())} "
+                             f"max|B|={Bv[sel].max()*RY:.3e}eV "
+                             f"max|Wc0|={W0v[sel].max()*RY:.3e}eV")
+    # --- end BFIT ANALYSIS ---
+
     t1 = _t.perf_counter()
 
     # ω_p in PPMBuildResult historically meant the imaginary-axis magnitude;
