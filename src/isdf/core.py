@@ -831,23 +831,60 @@ def _identity_pad_block_diagonal(
     return jax.lax.with_sharding_constraint(M_id_pad, sharding)
 
 
-def _resolve_solver_kind_charge(mesh_xy: Mesh, override: str = "auto") -> str:
-    """Pick the charge-channel ζ-fit solver: cuSolverMp distributed
-    potrf+potrs vs the in-tree shard_map 2D-blocked Cholesky + per-q
-    triangular solve.
+# Replication cap for the mesh-INVARIANT charge Cholesky.  When the whole
+# CCT stack (nq, n_μ, n_μ) c128 fits under this many bytes on one device we
+# factor it with a fully-replicated dense ``jnp.linalg.cholesky`` (exact,
+# grid-agnostic); only genuinely large stacks fall back to the distributed
+# cuSolverMp potrf.  4 GiB covers every current production fit (MoS2 6×6
+# n_μ=1600 → 1.5 GiB, CrI3 6×6 80Ry n_μ≈1800 → ≤1.9 GiB, Si IBZ) and
+# excludes only the full-BZ Si 4×4×4 60Ry stack (nq=64, n_μ=2400 → 24 GiB).
+# See reports/gw_zeta_mesh_invariance_2026-07-20 for the drift this removes.
+_REPLICATED_CHOL_MAX_STACK_BYTES = 4 * 1024**3
 
-    Default policy (2026-05-12): use cuSolverMp on **true 2D meshes**
-    (px≥2 AND py≥2); the in-tree ``sharded_cholesky`` runs many small
-    NCCL all-reduces per panel which become the dominant GPU stream
-    consumer at production scale (CrI3 6×6 80 Ry n_rmu≈1500 sees ~tens
-    of seconds in the panel loop).  cuSolverMp bundles the whole
-    distributed Cholesky into one FFI call per q.
 
-    Tradeoff: at small scales (MoS2 3×3, n_rmu=640, 2×2 mesh) the FFI
-    setup overhead exceeds the savings — measured cholesky 3.6 s
-    (cuSolverMp) vs 1.3 s (sharded) on a 2×2 mesh.  Total wall
-    difference ~0.5 s, within run-to-run noise.  We accept the small
-    overhead for the larger-scale win.
+def _replicate_charge_ok(nq: int | None, n_rmu: int | None) -> bool:
+    """True when the charge CCT stack ``(nq, n_μ, n_μ)`` c128 fits under the
+    replication cap — the criterion for the mesh-invariant dense Cholesky
+    over the grid-dependent distributed cuSolverMp potrf.
+
+    Requires both ``nq`` and ``n_rmu`` (the ζ-fit caller passes them from
+    ``C_q.shape[0]`` and ``meta.n_rmu``); ``None`` — direct callers that
+    don't supply them — keeps the legacy distributed policy so nothing off
+    the GW ζ-fit path changes behaviour.
+    """
+    if nq is None or n_rmu is None:
+        return False
+    return int(nq) * int(n_rmu) ** 2 * 16 <= _REPLICATED_CHOL_MAX_STACK_BYTES
+
+
+def _resolve_solver_kind_charge(
+    mesh_xy: Mesh, override: str = "auto",
+    n_rmu: int | None = None, nq: int | None = None,
+) -> str:
+    """Pick the charge-channel ζ-fit solver: fully-replicated dense
+    Cholesky (mesh-invariant, the default for fit-size tiles) vs the
+    distributed cuSolverMp potrf+potrs vs the in-tree shard_map 2D-blocked
+    Cholesky + per-q triangular solve.
+
+    Default policy (2026-07-20): **replicated dense Cholesky** whenever the
+    CCT stack fits on one device (:func:`_replicate_charge_ok`).  The
+    distributed cuSolverMp potrf is block-cyclic — its partial-sum
+    regrouping depends on the process grid ``(px, py)`` — so at large,
+    mildly rank-deficient n_μ (MoS2 6×6, 1600 centroids) the factor drifts
+    ~0.3% between a 2×2 and a 4×4 grid, and the GN-PPM pole construction
+    amplifies that into tens-of-eV Σ_c garbage on non-16-GPU meshes.  The
+    replicated ``jnp.linalg.cholesky`` runs on the whole matrix on every
+    device (one dense potrf per q), so L_q is bit-identical across device
+    counts and process grids.  This mirrors the eigh-backend policy in
+    ``bse/vq_interp`` (native batched by default; FFI backends reserved for
+    tiles too large to replicate).  See
+    ``reports/gw_zeta_mesh_invariance_2026-07-20``.
+
+    Above the replication cap the older policy applies: cuSolverMp on
+    **true 2D meshes** (px≥2 AND py≥2) — it bundles the distributed
+    Cholesky into one FFI call per q, vs the in-tree ``sharded_cholesky``'s
+    many small NCCL all-reduces per panel — otherwise the in-tree sharded
+    path.
 
     Override via cohsex.in ``distributed_cholesky``:
       ``off``        → force the in-tree sharded Cholesky.
@@ -859,8 +896,9 @@ def _resolve_solver_kind_charge(mesh_xy: Mesh, override: str = "auto") -> str:
                        guarded 1×q case (SLATE stride assert; see
                        tests/test_ffi_linalg_contract.py) rather than
                        silently running a different backend.
-      ``auto`` (default) → cuSolverMp on true 2D, sharded otherwise
-                       (slate is never auto-picked).
+      ``auto`` (default) → replicated dense for fit-size stacks, else
+                       cuSolverMp on true 2D / sharded otherwise (neither
+                       cuSolverMp nor slate is auto-picked below the cap).
     """
     px = int(mesh_xy.shape['x'])
     py = int(mesh_xy.shape['y'])
@@ -879,7 +917,11 @@ def _resolve_solver_kind_charge(mesh_xy: Mesh, override: str = "auto") -> str:
                 f"{py}×1 or square mesh, or a different backend.")
         return 'slate_cholesky'
 
-    # auto (or unrecognised) → default policy.
+    # auto (or unrecognised) → default policy.  Fit-size stacks factor with
+    # the mesh-invariant replicated dense Cholesky; larger stacks keep the
+    # distributed / sharded policy.
+    if _replicate_charge_ok(nq, n_rmu):
+        return 'replicated_cholesky'
     return 'cusolvermp_cholesky' if is_2d else 'sharded_cholesky'
 
 
@@ -982,16 +1024,102 @@ def _resolve_solver_kind(
     mesh_xy: Mesh, vertex_mu_L: int, solver_kind: str,
     distributed_cholesky: str = "auto",
     distributed_lu: str = "auto",
+    n_rmu: int | None = None,
+    nq: int | None = None,
 ) -> str:
     """Single source of truth for the ``auto`` resolution.  Transverse
     channels (γ̃^i, μ_L≠0) take ``_resolve_solver_kind_transverse``;
     charge channel takes ``_resolve_solver_kind_charge``.
+
+    ``n_rmu`` (logical centroid count) and ``nq`` (per-q factor batch =
+    ``C_q.shape[0]``) let the charge resolver pick the mesh-invariant
+    replicated dense Cholesky for fit-size stacks; the ζ-fit caller passes
+    them (``isdf_fitting.fit_zeta_to_h5``).  A concrete ``solver_kind`` is
+    returned unchanged (so ``factor_c_q`` / ``solve_zeta`` re-resolving the
+    already-resolved kind need not repeat them).
     """
     if solver_kind != 'auto':
         return solver_kind
     if int(vertex_mu_L) != 0:
         return _resolve_solver_kind_transverse(mesh_xy, distributed_lu)
-    return _resolve_solver_kind_charge(mesh_xy, distributed_cholesky)
+    return _resolve_solver_kind_charge(
+        mesh_xy, distributed_cholesky, n_rmu=n_rmu, nq=nq)
+
+
+_replicated_chol_cache = {}  # replicated dense Cholesky kernel (keyed by shape)
+
+
+def _factor_c_q_replicated(
+    C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
+    zeta_ridge: float = 0.0,
+) -> jax.Array:
+    """Dense, fully REPLICATED Cholesky of the identity-padded charge CCT.
+
+    Mesh-invariant by construction: the factorisation runs on the
+    fully-replicated LOGICAL block — one dense ``jnp.linalg.cholesky``
+    (potrf) per q on whole tiles — so L_q is bit-identical across device
+    counts and process grids, unlike the block-cyclic cuSolverMp potrf
+    whose partial-sum regrouping depends on ``(px, py)``.  This is the
+    single code path for both the ``'replicated_cholesky'`` auto pick
+    (fit-size n_μ on any mesh) and every single-device / 1-D-degenerate
+    mesh (where a dense factor is the only option).
+
+    Ridge (two per-q scalar terms, so both mesh-invariant):
+
+      ridge = [ 1e-14·|tr(C)|  +  zeta_ridge·|tr(C)|/n ] · I
+
+    * The hard ``1e-14·|tr(C)|`` FLOOR is unchanged from the historical
+      single-device path — it lifts the tiny negative eigenvalues that
+      appear with more centroids than band pairs so ``potrf`` stays real.
+      With ``zeta_ridge == 0`` (the default) the factor is bit-identical to
+      that path (the frozen-golden contract).
+    * ``zeta_ridge`` (a fraction of the mean diagonal tr(C)/n, default 0) is
+      the OPT-IN Tikhonov term that CONDITIONS a near-singular CCT (n_μ
+      over-complete for the pair-density rank), so ζ = (C+εI)⁻¹Z stops
+      amplifying the ULP-level, mesh-dependent pair-density (C_q/Z_q)
+      difference — the per-rank shard dims select different cuBLAS GEMM
+      algorithms — into a grid-dependent V_q.  MoS2 6×6 (n_μ=1600) needs
+      ε≈1e-4 to bring cross-grid Re Σ_c agreement from O(10 eV) to ~10 meV.
+      It PERTURBS the physical result (the regularised answer is
+      ε-dependent on this ill-posed fit), hence opt-in.  ``LORRAX_ZETA_RIDGE``
+      overrides it for tuning.  See reports/gw_zeta_mesh_invariance_2026-07-20.
+
+    Factorise at the LOGICAL extent and re-embed identity in the pad block
+    (√1 = 1) — see :func:`_identity_pad_block_diagonal`.  Both trace terms
+    and the potrf regroup partial sums when the matrix extent changes, so
+    factorising at the logical (not padded) extent keeps the factor
+    pad-extent-invariant (the fixed-P invariance gate).
+    """
+    import os as _os
+    nq, n_rmu, _ = C_q.shape
+    n_log = int(n_rmu_logical)
+    ridge_extra = float(_os.environ.get("LORRAX_ZETA_RIDGE", str(zeta_ridge)))
+    out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    rep_sh = NamedSharding(mesh_xy, P())
+    key = (id(mesh_xy), int(nq), int(n_rmu), n_log, float(ridge_extra))
+    if key not in _replicated_chol_cache:
+        _re = ridge_extra
+        @partial(jax.jit, out_shardings=out_sh)
+        def _fn(C):
+            def _ridged_chol(C_log):
+                # Replicate the logical block so every device factors the
+                # WHOLE matrix — this is what makes the factor grid-agnostic
+                # (the distributed potrf's block-cyclic accumulation is not).
+                C_log = jax.lax.with_sharding_constraint(C_log, rep_sh)
+                tr = jnp.abs(jnp.trace(C_log, axis1=-2, axis2=-1))
+                # Floor (1e-14·|tr|, bit-identical to the historical path)
+                # + opt-in conditioning term (ε·|tr|/n).  Per-q scalars.
+                ridge_scalar = (1e-14 * tr + _re * tr / n_log)[:, None, None]
+                ridge = ridge_scalar * jnp.eye(n_log, dtype=C_log.dtype)[None, :, :]
+                return jnp.linalg.cholesky(C_log + ridge)
+            L_log = solve_at_logical(
+                _ridged_chol, n_log, (C,), pad_axes=(-2, -1))
+            # Pad-block factor = identity (√1 = 1): re-embed via the shared
+            # helper (no-op when n_log == n_rmu).
+            return _identity_pad_block_diagonal(
+                L_log, n_rmu_logical=n_log, mesh_xy=mesh_xy)
+        _replicated_chol_cache[key] = _fn
+    return _replicated_chol_cache[key](C_q)
 
 
 def factor_c_q(
@@ -1001,6 +1129,7 @@ def factor_c_q(
     vertex_mu_L: int = 0,
     n_rmu_logical: int | None = None,
     solver_kind: str = 'auto',
+    zeta_ridge: float = 0.0,
 ) -> jax.Array:
     """
     Compute system-matrix L_q from CCT matrix.
@@ -1097,6 +1226,22 @@ def factor_c_q(
 
     solver_kind = _resolve_solver_kind(mesh_xy, vertex_mu_L=0, solver_kind=solver_kind)
 
+    Pr = mesh_xy.shape['x']
+    Pc = mesh_xy.shape['y']
+
+    # Replicated dense Cholesky — the mesh-INVARIANT charge factor.  Fires
+    # for the 'replicated_cholesky' auto pick (fit-size n_μ on any mesh) AND
+    # for any single-device / 1-D-degenerate mesh, where a dense factor is
+    # the only option (the 2D-blocked shard_map kernel needs a true 2-D
+    # mesh; cuSolverMp needs one process per device).  ONE code path — see
+    # _factor_c_q_replicated for why L_q is grid-agnostic.  On 1×1 meshes
+    # this also sidesteps a JAX 0.9 shard_map+scan carry-type failure in the
+    # blocked kernel.
+    if (solver_kind == 'replicated_cholesky'
+            or mesh_xy.devices.size == 1 or (Pr == 1 and Pc == 1)):
+        return _factor_c_q_replicated(
+            C_q, mesh_xy, n_rmu_logical, zeta_ridge=zeta_ridge)
+
     if solver_kind == 'cusolvermp_cholesky':
         # Distributed potrf on C_q at P(None,'x','y'); returns the raw
         # lower-triangular factor.  Downstream solve_zeta rebuilds the
@@ -1128,41 +1273,6 @@ def factor_c_q(
         return jax.lax.with_sharding_constraint(
             jnp.stack(L_rows, axis=0),
             NamedSharding(mesh_xy, P(None, 'x', 'y')))
-
-    Pr = mesh_xy.shape['x']
-    Pc = mesh_xy.shape['y']
-
-    # On 1x1 meshes, JAX 0.9 can fail in the shard_map+scan blocked kernel with:
-    # "scan body function carry input and carry output must have equal types ...
-    # varying manual axes do not match". Use dense batched Cholesky in this case.
-    if mesh_xy.devices.size == 1 or (Pr == 1 and Pc == 1):
-        # Regularize C_q: the pair density matrix can be numerically
-        # rank-deficient (more centroids than band pairs), producing
-        # tiny negative eigenvalues that break Cholesky. Add a small
-        # ridge proportional to the trace to ensure positive definiteness.
-        #
-        # Factorise at the LOGICAL extent and re-embed: both the ridge
-        # trace and the blocked cuSOLVER potrf regroup partial sums
-        # when the matrix extent changes, so factorising at the padded
-        # extent makes the factor (and everything downstream) depend
-        # on the pad extent.  Slicing is free on a single device; at
-        # zero pad the slice/embed are no-ops and this path is
-        # bit-identical to the historical one.  (The multi-device
-        # 2D-blocked / cuSolverMp paths below cannot slice — their
-        # block-cyclic layout needs the mesh-divisible extent; their
-        # residual pad-extent sensitivity is the measured ≤1e-7 rel.)
-        def _ridged_chol(C_log):
-            trace_per_q = jnp.trace(C_log, axis1=-2, axis2=-1)
-            ridge = (1e-14 * jnp.abs(trace_per_q)[:, None, None]
-                     * jnp.eye(n_rmu_logical)[None, :, :])
-            return jnp.linalg.cholesky(C_log + ridge)
-
-        L_q_dense = solve_at_logical(
-            _ridged_chol, n_rmu_logical, (C_q,), pad_axes=(-2, -1))
-        # Pad-block factor = identity (√1 = 1): re-embed via the shared
-        # helper instead of re-deriving the diag construction here.
-        return _identity_pad_block_diagonal(
-            L_q_dense, n_rmu_logical=n_rmu_logical, mesh_xy=mesh_xy)
 
     # 2D-blocked path: requires n_rmu divisible into mesh-friendly tiles.
     # The caller is expected to pass C_q at PADDED μ extent
@@ -1300,12 +1410,18 @@ def solve_zeta(
                      vs jnp.linalg.solve.  Output sharding is identical
                      in both branches.
         solver_kind: 'auto' (default) defers to :func:`_resolve_solver_kind`;
-                     explicit values are 'sharded_cholesky' (legacy 2D
+                     explicit values are 'replicated_cholesky' (mesh-
+                     invariant dense factor from :func:`_factor_c_q_replicated`;
+                     back-solve shares the 'sharded_cholesky' per-q
+                     triangular path — L is replicated, r-columns sharded,
+                     so ζ is grid-agnostic), 'sharded_cholesky' (legacy 2D
                      blocked chol + per-q triangular solve), 'lu' (per-q
                      pivoted-LU for transverse channels),
                      'cusolvermp_cholesky' (distributed potrs via FFI),
                      or 'cusolvermp_lu' (distributed getrf+getrs via FFI
-                     for the transverse channels).
+                     for the transverse channels).  'replicated_cholesky'
+                     and 'sharded_cholesky' take the same back-solve branch
+                     below (neither matches the cuSolverMp/scalapack guards).
         n_rmu_logical: Logical centroid count.  When given and smaller
                      than the padded input extent, every per-q dense
                      solve (pivoted LU AND the per-q triangular

@@ -306,6 +306,20 @@ _DEFAULTS = {
     # cusolvermp_lu with values auto|on|off (on → cusolvermp).
     "distributed_cholesky": "auto",
     "distributed_lu":       "auto",
+    # Charge ζ-fit OPT-IN Tikhonov ridge ε (added ON TOP of the fixed
+    # 1e-14·|tr| non-singularity floor, as a fraction of the mean CCT
+    # diagonal tr(C)/n): C_q ← C_q + [1e-14·|tr| + ε·|tr|/n]·I before the
+    # replicated Cholesky.  A per-q SCALAR, so mesh-invariant.  Default 0.0
+    # ⇒ bit-identical to the historical factor (frozen-golden contract).  A
+    # POSITIVE ε conditions a NEAR-SINGULAR CCT (n_μ over-complete for the
+    # system's pair-density rank) so ζ = (C+εI)⁻¹Z stops amplifying the
+    # ULP-level, mesh-dependent pair-density (cuBLAS-GEMM-per-shard-dim)
+    # roundoff into a grid-dependent V_q.  MoS2 6×6 (n_μ=1600) needs ε≈1e-4
+    # to bring cross-grid Re Σ_c agreement from O(10 eV) to ~10 meV.  It
+    # PERTURBS the physical result (the regularised answer is ε-dependent on
+    # this ill-posed fit) — hence opt-in, a physics call.  Env override
+    # LORRAX_ZETA_RIDGE.  See reports/gw_zeta_mesh_invariance_2026-07-20.
+    "zeta_ridge":           0.0,
     # Deprecated aliases (still parsed; warned at load; honored only when
     # the portable key above is left at "auto"):
     "cusolvermp_charge": "auto",   # auto | on | off
@@ -789,6 +803,7 @@ class BackendConfig:
     screening_solver: ScreeningSolver
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
     distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
+    zeta_ridge: float          # charge-CCT Tikhonov ridge ε (rel. to tr/n)
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
 
     def summary(self) -> str:
@@ -799,6 +814,7 @@ class BackendConfig:
             f"screening_solver={self.screening_solver.value}, "
             f"distributed_cholesky={self.distributed_cholesky}, "
             f"distributed_lu={self.distributed_lu}, "
+            f"zeta_ridge={self.zeta_ridge:g}, "
             f"gamma_contract={self.gamma_contract_mode}"
         )
 
@@ -1346,6 +1362,7 @@ class LorraxConfig:
             screening_solver=_LEGACY_ISDF_MEMORY_MODE[isdf_memory_mode],
             distributed_cholesky=_dist_chol,
             distributed_lu=_dist_lu,
+            zeta_ridge=float(_g("zeta_ridge")),
             gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
         )
         debug = DebugConfig(
