@@ -143,7 +143,7 @@ def fit_zeta_to_h5(
     distributed_lu: str = "auto",
     zeta_ridge: float = 0.0,
     charge_zeta_solve: str = "cholesky",
-    zeta_rcond: float = 1e-10,
+    zeta_rcond: float = 1e-6,
     gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,

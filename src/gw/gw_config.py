@@ -330,7 +330,17 @@ _DEFAULTS = {
     # historical replicated/cuSolverMp Cholesky path (bit-identical to the
     # pre-feature behavior; the selectable alternative).
     "charge_zeta_solve":    "rank_truncate",   # rank_truncate | cholesky
-    "zeta_rcond":           1e-10,             # rank-truncation cutoff (·λ_max)
+    # Rank-truncation cutoff (relative to λ_max, per q).  DEFAULT 1e-6 —
+    # roughly the pair-density GEMM noise floor.  An over-complete basis needs
+    # it: at MoS2 4×4/1204c, 1e-10 only partially recovers (MAE 1.4 eV vs BGW)
+    # while 1e-8/1e-6/1e-4 all collapse to ~0.04 eV.  It is NOT free on a
+    # well-conditioned basis, though: bulk Si 4×4×4/960c (the BGW-anchored
+    # si_cohsex_3d gate) does have eigenvalues below 1e-6·λ_max, and 1e-6
+    # shifts its sigTOT by 1.02 meV (1e-8 would cost only 0.054 meV — the same
+    # over-complete cure at 20× less drift; see the sweep table in
+    # docs/docs_gwjax/COHSEX_INPUT.md).  Env override LORRAX_ZETA_RCOND.
+    # reports/gw_rank_truncation_2026-07-20 + gw_conduction_postfix_2026-07-21.
+    "zeta_rcond":           1e-6,
     # Deprecated aliases (still parsed; warned at load; honored only when
     # the portable key above is left at "auto"):
     "cusolvermp_charge": "auto",   # auto | on | off
