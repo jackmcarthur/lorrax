@@ -117,6 +117,7 @@ def main(argv=None):
     psi_v_X, psi_v_Y = data["psi_v_X"], data["psi_v_Y"]
     eps_c, eps_v = data["eps_c"], data["eps_v"]
     V_q0 = data["V_q0"]
+    M_X, M_Y = data["M_X"], data["M_Y"]  # hoisted V-term pair-amps (audit P3)
 
     # The simple matvec's workspace scales worse than linearly with the
     # batch axis m (~m^1.5; 4.5 GB at m=10 → 88 GB at m=50). The state
@@ -128,17 +129,17 @@ def main(argv=None):
     # Pass psi_*, eps_*, W_R, V_q0 as arguments to the jit'd function;
     # the outer apply_H is plain python that forwards them at call time.
     @jax.jit
-    def matvec_scan(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+    def matvec_scan(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y):
         def body(carry, x_one):
             Hx = matvec_simple(x_one[None], psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                               eps_c, eps_v, W_R, V_q0)
+                               eps_c, eps_v, W_R, V_q0, M_X, M_Y)
             return carry, Hx[0]
         _, HX = jax.lax.scan(body, None, X)
         return HX
 
     def apply_H(X):
         return matvec_scan(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                           eps_c, eps_v, W_R, V_q0)
+                           eps_c, eps_v, W_R, V_q0, M_X, M_Y)
 
     # ── Initial subspace ───────────────────────────────────────────────
     V0 = init_bse_subspace(

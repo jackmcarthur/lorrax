@@ -367,6 +367,30 @@ _DEFAULTS = {
                                    #   Needed when nq * n_rmu^2 exceeds VRAM.
                                    # auto → high_mem for back-compat.
     "mc_average_vcoul_body": True,
+    # Per-Q mini-BZ Coulomb head cell-averaging (BGW minibzaverage_3d/2d).
+    # False (default) = current behavior, BIT-IDENTICAL: the q→0 head is the
+    # pure-Sobol mini-BZ mean and every finite-Q exchange head is the analytic
+    # POINT value v(Q+G*).  True routes the head through
+    # ``gw.coulomb.base.minibz_average``: the q→0 3D head gains the analytic
+    # Baldereschi-Tosatti sphere term (seed-independent), the Voronoi fold
+    # widens (nmax 1→3), and the BSE arbitrary-Q ``eval_vq`` head becomes the
+    # mini-BZ CELL AVERAGE ``<v_LR(Q+G*)>_mBZ`` (fixes the 4-13% near-Γ /
+    # zone-boundary point-vs-cell-average error, arbitrary_q_bse.md §16.4).
+    # The winding (2D e^{-i2θ}) is unaffected — only the head magnitude is
+    # averaged; the phase-factored ζ̃ rank-1 structure carries the direction.
+    "head_minibz_average": False,
+    # BSE fine-grid densification.  When set to "NX NY NZ" (or "NX,NY,NZ") and
+    # DIFFERENT from the coarse restart/WFN grid, the GENERAL BSE init
+    # (``bse_io.load_bse_data_from_restart_sharded``) interpolates the ENTIRE
+    # BSE problem — ψ, QP ε (htransform fH), V_Q exchange (vq_interp), and the
+    # W direct term (zero-pad in R) — from the coarse grid onto this fine grid
+    # BEFORE any solve, so EVERY BSE solver (exciton_bands / feast / nontda /
+    # kpm / resolvent) transparently runs on the fine grid.  Each fine length
+    # must be a positive multiple of the matching coarse length (coarse BZ ⊂
+    # fine BZ).  Empty (default) or == the coarse grid → the coarse ``data``
+    # bundle is returned byte-identically (fast path untouched).  Subsumes the
+    # exciton_bands ``--w-coarse-grid`` W-only flag for the direct term.
+    "bse_k_grid": "",
     "bare_coulomb_cutoff": None,
     # ζ-sphere cutoff (Ry).  When the writer emits zeta_q_G with per-q
     # WFN.h5-style spheres, this is the cutoff used to define the per-q
@@ -678,6 +702,7 @@ class HeadConfig:
     whead_0freq: float | None     # explicit override W_h[ω=0]
     whead_imfreq: float | None    # explicit override W_h[iω_p]
     mc_average_vcoul_body: bool
+    head_minibz_average: bool      # per-Q mini-BZ head cell-average (default off)
     bare_coulomb_cutoff: float | None
     zeta_cutoff: float | None
     use_bgw_vcoul: bool
@@ -1191,6 +1216,7 @@ class LorraxConfig:
             whead_0freq=_g("whead_0freq"),
             whead_imfreq=_g("whead_imfreq"),
             mc_average_vcoul_body=bool(_g("mc_average_vcoul_body")),
+            head_minibz_average=bool(_g("head_minibz_average")),
             bare_coulomb_cutoff=_g("bare_coulomb_cutoff"),
             zeta_cutoff=_g("zeta_cutoff"),
             use_bgw_vcoul=bool(_g("use_bgw_vcoul")),

@@ -22,6 +22,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from solvers.quadrature import feast_ellipse_quadrature as _feast_ellipse_quadrature_generic
 from .bse_ring_comm import build_bse_ring_matvec, build_bse_ring_matvec_full, make_bse_shardings
+from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_preconditioner import energy_diff_cv_k
 import common.timing as timing
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
@@ -32,8 +33,14 @@ jax.config.update("jax_enable_x64", True)
 RY_TO_EV_DEFAULT = 13.6056980659
 ELLIPSE_GAMMA_FIXED = 0.2
 
-# Cache compiled GMRES/FEAST kernels by shape + dtype (per-process).
-_GMRES_SOLVER_CACHE: dict[tuple[int, float, str], Callable] = {}
+# Cache compiled GMRES solvers per (operator id, max_iter, tol, dtype), per-process.
+# The operator STRUCTURE (matvec) fixes the compiled program; the per-q / per-omega
+# operand arrays are RUNTIME ARGUMENTS (see matvec_operands / _gmres_solve_core), so
+# ONE compiled engine serves every q and omega — the key needs id(matvec) only.
+# Genuinely different structures (screening vs optical, TDA vs full) build distinct
+# matvec objects and so get distinct entries.  Value is (matvec, solver): the matvec
+# reference pins its id() so it cannot be reused by a later object while live.
+_GMRES_SOLVER_CACHE: dict[tuple, tuple] = {}
 _FEAST_RUNNER_CACHE: dict[tuple[int, int, int, float, float, str], Callable] = {}
 
 
@@ -55,24 +62,52 @@ class QuadratureSpec:
     quadrature_type: str = "ellipse"
 
 
+def ensure_W_R(data: dict, include_W: bool) -> dict:
+    """Populate ``data['W_R']`` — the 8th (real-space W) argument the ring/stack
+    matvecs and the shifted-matvec chain (``_apply_shifted_matvec``) expect.
+
+    The screened-direct term convolves the ISDF W-tile in real space, so the
+    reciprocal-space ``W_q`` (μ, ν, kx, ky, kz) is inverse-FFT'd on the k-axes.
+    For the RPA density-response / kernel (``include_W=False``) the W-term is
+    never built, so ``W_R`` is only a shape/sharding-correct placeholder and
+    ``W_q`` itself serves.  The restart loader emits ``W_q`` but not ``W_R``, so
+    every solve entry point (FEAST, spectral-bound Lanczos, ``bse_w_exact``)
+    must call this before invoking a matvec.  Mutates and returns ``data``.
+    """
+    if include_W:
+        data["W_R"] = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
+    else:
+        data["W_R"] = data["W_q"]
+    return data
+
+
+def matvec_operands(data: dict) -> tuple:
+    """The 10 operand arrays the ring/stack matvec consumes after ``x``, in the
+    matvec's positional order ``(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
+    W_R, V_q0, M_X, M_Y)``.
+
+    Pulling these out of ``data`` and threading them as RUNTIME ARGUMENTS through
+    the jitted solve (instead of closing over the ``data`` dict) is what lets ONE
+    compiled shifted-solve engine serve every q / omega: the operator (``matvec``)
+    fixes the compiled STRUCTURE, the operands are just values that change per q, so
+    a finite-q loop reuses the same executable instead of recompiling once per q
+    (see ``bse_w_exact`` compare-wq)."""
+    return (
+        data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
+        data["eps_c"], data["eps_v"], data["W_R"], data["V_q0"],
+        data["M_X"], data["M_Y"],  # M_X/M_Y: hoisted V-term pair-amps (audit P3)
+    )
+
+
 def _apply_shifted_matvec(
     matvec,
     x: jax.Array,
     z: complex,
-    data: dict,
+    operands: tuple,
 ) -> jax.Array:
-    hx = matvec(
-        x,
-        data["psi_c_X"],
-        data["psi_c_Y"],
-        data["psi_v_X"],
-        data["psi_v_Y"],
-        data["eps_c"],
-        data["eps_v"],
-        data["W_R"],
-        data["V_q0"],
-    )
-    return z * x - hx
+    """``(z I - H) x`` for the shifted linear solve.  ``operands`` is the
+    :func:`matvec_operands` 10-tuple (runtime args, NOT a closed-over dict)."""
+    return z * x - matvec(x, *operands)
 
 
 def build_preconditioner_diagonal_sharded(
@@ -120,86 +155,129 @@ def build_preconditioner_diagonal_sharded(
     return jax.lax.with_sharding_constraint(diag_full, diag_sharding)
 
 
+def _gmres_solve_core(matvec, b, diag_h, z, operands, max_iter, tol):
+    """Diagonally right-preconditioned GMRES with a while-loop early exit.
+
+    Pure function of its RUNTIME args ``(b, diag_h, z, operands)``; ``matvec`` /
+    ``max_iter`` / ``tol`` are the static structure.  ``operands`` is the
+    :func:`matvec_operands` 10-tuple — threading it as an argument (not a
+    closed-over ``data`` dict) is why one compiled solve serves every q / omega
+    (see :func:`_get_gmres_solver`).  Returns ``(x, k_iters)``."""
+    one = jnp.asarray(1.0, dtype=b.dtype)
+    m_inv = one / (z - diag_h)
+    if m_inv.ndim == b.ndim - 1:
+        m_inv = m_inv[None, ...]
+
+    x0 = m_inv * b
+    r0 = b - _apply_shifted_matvec(matvec, x0, z, operands).astype(b.dtype)
+    beta = jnp.linalg.norm(r0)
+
+    zero = jnp.asarray(0.0, dtype=beta.dtype)
+    v0 = jnp.where(beta == zero, r0, r0 / beta)
+
+    v_shape = (max_iter + 1,) + b.shape
+    z_shape = (max_iter,) + b.shape
+    V = jnp.zeros(v_shape, dtype=b.dtype).at[0].set(v0)
+    Z = jnp.zeros(z_shape, dtype=b.dtype)
+    H = jnp.zeros((max_iter + 1, max_iter), dtype=b.dtype)
+    g = jnp.zeros((max_iter + 1,), dtype=b.dtype).at[0].set(beta)
+    y = jnp.zeros((max_iter,), dtype=b.dtype)
+
+    def cond(state):
+        k, rel, *_ = state
+        return jnp.logical_and(k < max_iter, rel > tol)
+
+    def body(state):
+        k, rel, V, Z, H, g, y = state
+
+        v_k = V[k]
+        z_k = m_inv * v_k
+        Z = Z.at[k].set(z_k)
+        w = _apply_shifted_matvec(matvec, z_k, z, operands).astype(b.dtype)
+
+        def arnoldi(i, carry):
+            w_local, H_local = carry
+            h = jnp.vdot(V[i], w_local)
+            H_local = H_local.at[i, k].set(h)
+            w_local = w_local - h * V[i]
+            return w_local, H_local
+
+        w, H = jax.lax.fori_loop(0, k + 1, arnoldi, (w, H))
+
+        # Reorthogonalization — a second (DGKS) classical Gram-Schmidt pass.
+        # Stiff finite-q screening operators (bse_w_exact --compare-wq: V_q
+        # carries a large G=0 Coulomb head) lose Arnoldi orthogonality
+        # catastrophically under a SINGLE pass (||VᴴV−I|| → O(1) by ~20
+        # iters), which makes the projected residual falsely tiny and the
+        # whole solve rounding-dependent (converges in numpy, DIVERGES in
+        # jit — true residual O(1)).  The second pass restores orthogonality
+        # to machine precision (||VᴴV−I|| ≲ 1e-14), so the projected residual
+        # is trustworthy for the early-exit and the reconstructed x is
+        # correct.  For well-conditioned / q=0 tiles the correction is ~1e-16
+        # (already orthogonal) so the q=0 closure is unchanged.
+        def reorth(i, carry):
+            w_local, H_local = carry
+            corr = jnp.vdot(V[i], w_local)
+            H_local = H_local.at[i, k].add(corr)
+            w_local = w_local - corr * V[i]
+            return w_local, H_local
+
+        w, H = jax.lax.fori_loop(0, k + 1, reorth, (w, H))
+        h_next = jnp.linalg.norm(w)
+        H = H.at[k + 1, k].set(h_next)
+        v_next = jnp.where(h_next == 0.0, w, w / h_next)
+        V = V.at[k + 1].set(v_next)
+
+        # GMRES minimization min_y ‖g − H y‖ via a STABLE least-squares
+        # (QR/SVD through ``lstsq``), NOT the normal equations HᴴH — those
+        # square the Hessenberg condition number.  Finite-q screening tiles
+        # (bse_w_exact --compare-wq) carry a large G=0 Coulomb head, so
+        # cond(H) ~ 1e8 ⇒ cond(HᴴH) ~ 1e17 ≈ 1/eps, at which the normal-eq
+        # solve returns a garbage y that trips the projected early-exit with a
+        # huge TRUE residual (GMRES "converges" to a wrong x).  ``lstsq`` stays
+        # accurate at that conditioning; head-less/q=0 tiles are well
+        # conditioned so the q=0 closure is unchanged.  The trailing zero
+        # columns of the padded Hessenberg get min-norm y=0.
+        y = jnp.linalg.lstsq(H, g, rcond=None)[0]
+        resid = jnp.linalg.norm(g - H @ y)
+        rel = jnp.where(beta == zero, zero, resid / beta)
+
+        return k + 1, rel, V, Z, H, g, y
+
+    rel0 = jnp.asarray(jnp.inf, dtype=beta.dtype)
+    init = (0, rel0, V, Z, H, g, y)
+    k_final, _, V, Z, H, g, y = jax.lax.while_loop(cond, body, init)
+
+    x = x0 + jnp.tensordot(y, Z, axes=(0, 0))
+    return x, k_final
+
+
 def _get_gmres_solver(
     matvec,
-    data: dict,
     max_iter: int,
     tol: float,
     dtype: jnp.dtype,
 ) -> Callable:
-    """Return a cached JIT-compiled GMRES solver for this max_iter/tol."""
-    key = (max_iter, float(tol), str(dtype))
-    if key in _GMRES_SOLVER_CACHE:
-        return _GMRES_SOLVER_CACHE[key]
+    """Return a cached JIT-compiled GMRES solver for this operator + max_iter/tol.
 
-    def _solve(b, diag_h, z):
-        one = jnp.asarray(1.0, dtype=b.dtype)
-        m_inv = one / (z - diag_h)
-        if m_inv.ndim == b.ndim - 1:
-            m_inv = m_inv[None, ...]
+    The solver takes ``(b, diag_h, z, operands)`` — the operator STRUCTURE
+    (``matvec``) is the only thing baked into the compiled program; the operand
+    arrays (``matvec_operands``) are runtime args.  So a finite-q W_q loop, which
+    solves a different screening operator per q, reuses ONE executable (it just
+    passes a different operand tuple) instead of recompiling per q.  The cache key
+    is ``(id(matvec), max_iter, tol, dtype)`` — genuinely different operator
+    structures (screening vs optical, TDA vs full) build distinct ``matvec``
+    objects and so get distinct entries; the cache holds a reference to ``matvec``
+    so its ``id()`` cannot be reused by a later object while the entry is live."""
+    key = (id(matvec), max_iter, float(tol), str(dtype))
+    hit = _GMRES_SOLVER_CACHE.get(key)
+    if hit is not None:
+        return hit[1]
 
-        x0 = m_inv * b
-        r0 = b - _apply_shifted_matvec(matvec, x0, z, data).astype(b.dtype)
-        beta = jnp.linalg.norm(r0)
-
-        zero = jnp.asarray(0.0, dtype=beta.dtype)
-        v0 = jnp.where(beta == zero, r0, r0 / beta)
-
-        v_shape = (max_iter + 1,) + b.shape
-        z_shape = (max_iter,) + b.shape
-        V = jnp.zeros(v_shape, dtype=b.dtype).at[0].set(v0)
-        Z = jnp.zeros(z_shape, dtype=b.dtype)
-        H = jnp.zeros((max_iter + 1, max_iter), dtype=b.dtype)
-        g = jnp.zeros((max_iter + 1,), dtype=b.dtype).at[0].set(beta)
-        y = jnp.zeros((max_iter,), dtype=b.dtype)
-
-        def cond(state):
-            k, rel, *_ = state
-            return jnp.logical_and(k < max_iter, rel > tol)
-
-        def body(state):
-            k, rel, V, Z, H, g, y = state
-
-            v_k = V[k]
-            z_k = m_inv * v_k
-            Z = Z.at[k].set(z_k)
-            w = _apply_shifted_matvec(matvec, z_k, z, data).astype(b.dtype)
-
-            def arnoldi(i, carry):
-                w_local, H_local = carry
-                h = jnp.vdot(V[i], w_local)
-                H_local = H_local.at[i, k].set(h)
-                w_local = w_local - h * V[i]
-                return w_local, H_local
-
-            w, H = jax.lax.fori_loop(0, k + 1, arnoldi, (w, H))
-            h_next = jnp.linalg.norm(w)
-            H = H.at[k + 1, k].set(h_next)
-            v_next = jnp.where(h_next == 0.0, w, w / h_next)
-            V = V.at[k + 1].set(v_next)
-
-            lhs = H.conj().T @ H
-            rhs = H.conj().T @ g
-            jitter_scale = jnp.asarray(1e-14, dtype=lhs.real.dtype)
-            jitter = jitter_scale * jnp.trace(lhs).real / jnp.maximum(
-                jnp.asarray(1.0, dtype=lhs.real.dtype), lhs.shape[0]
-            )
-            lhs = lhs + jitter * jnp.eye(lhs.shape[0], dtype=lhs.dtype)
-            y = jnp.linalg.solve(lhs, rhs)
-            resid = jnp.linalg.norm(g - H @ y)
-            rel = jnp.where(beta == zero, zero, resid / beta)
-
-            return k + 1, rel, V, Z, H, g, y
-
-        rel0 = jnp.asarray(jnp.inf, dtype=beta.dtype)
-        init = (0, rel0, V, Z, H, g, y)
-        k_final, _, V, Z, H, g, y = jax.lax.while_loop(cond, body, init)
-
-        x = x0 + jnp.tensordot(y, Z, axes=(0, 0))
-        return x, k_final
-
-    solver = jax.jit(_solve)
-    _GMRES_SOLVER_CACHE[key] = solver
+    solver = jax.jit(
+        lambda b, diag_h, z, operands: _gmres_solve_core(
+            matvec, b, diag_h, z, operands, max_iter, tol))
+    _GMRES_SOLVER_CACHE[key] = (matvec, solver)
     return solver
 
 
@@ -208,13 +286,15 @@ def gmres_solve_sharded_jit(
     diag_h: jax.Array,
     z: complex,
     b: jax.Array,
-    data: dict,
+    operands: tuple,
     max_iter: int,
     tol: float,
 ) -> tuple[jax.Array, jax.Array]:
-    """JIT GMRES with diagonal right-preconditioner and while-loop stopping."""
-    solver = _get_gmres_solver(matvec, data, max_iter, tol, b.dtype)
-    return solver(b, diag_h, z)
+    """JIT GMRES with diagonal right-preconditioner and while-loop stopping.
+
+    ``operands`` is the :func:`matvec_operands` 10-tuple (runtime args)."""
+    solver = _get_gmres_solver(matvec, max_iter, tol, b.dtype)
+    return solver(b, diag_h, z, operands)
 
 
 def _get_feast_runner(
@@ -235,6 +315,7 @@ def _get_feast_runner(
 
     def _run(X_batch, z_nodes, w_weights, diag_h):
         # X_batch: (n_ritz, 1, nc, nv, nk)
+        operands = matvec_operands(data)  # runtime args threaded to the shifted solve
         filtered = jnp.zeros_like(X_batch, dtype=X_batch.dtype)
         iters = jnp.zeros((n_ritz, n_quad), dtype=jnp.int32)
         scale = jnp.asarray(ry_to_ev, dtype=z_nodes.dtype)
@@ -248,7 +329,7 @@ def _get_feast_runner(
                 z = z_nodes[j] / scale
                 w = w_weights[j] / scale
                 y, k_used = gmres_solve_sharded_jit(
-                    matvec, diag_h, z, x, data, max_iter=max_iter, tol=tol
+                    matvec, diag_h, z, x, operands, max_iter=max_iter, tol=tol
                 )
                 if use_conjugate_symmetry:
                     two = jnp.asarray(2.0, dtype=jnp.real(w).dtype)
@@ -287,6 +368,8 @@ def _build_gmres_data_fp32(data: dict) -> dict:
         "psi_c_Y": _cast_with_sharding(data["psi_c_Y"], jnp.complex64),
         "psi_v_X": _cast_with_sharding(data["psi_v_X"], jnp.complex64),
         "psi_v_Y": _cast_with_sharding(data["psi_v_Y"], jnp.complex64),
+        "M_X": _cast_with_sharding(data["M_X"], jnp.complex64),  # hoisted V-term pair-amps (P3)
+        "M_Y": _cast_with_sharding(data["M_Y"], jnp.complex64),
         "eps_c": _cast_with_sharding(data["eps_c"], jnp.float32),
         "eps_v": _cast_with_sharding(data["eps_v"], jnp.float32),
         "V_q0": _cast_with_sharding(data["V_q0"], jnp.complex64),
@@ -333,21 +416,20 @@ def _rayleigh_ritz(
             s_floor=0.0,
         )
 
-    hv = []
-    for v in vectors:
-        hv.append(
-            matvec(
-                v,
-                data["psi_c_X"],
-                data["psi_c_Y"],
-                data["psi_v_X"],
-                data["psi_v_Y"],
-                data["eps_c"],
-                data["eps_v"],
-                data["W_R"],
-                data["V_q0"],
-            )
-        )
+    args = (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
+            data["eps_c"], data["eps_v"], data["W_R"], data["V_q0"],
+            data["M_X"], data["M_Y"])  # hoisted V-term pair-amps (audit P3)
+    if use_tda:
+        # TDA subspace application through the trial-stack matvec: the filtered
+        # vectors are (1, nc, nv, nk), so concatenate on the leading axis into a
+        # single (n, nc, nv, nk) stack and apply H ONCE — one dispatch, one
+        # compiled program, one T-tensor (vs the old per-vector Python loop).
+        HV_batch = matvec(jnp.concatenate(vectors, axis=0), *args)
+        hv = [HV_batch[i:i + 1] for i in range(len(vectors))]
+    else:
+        # Non-TDA carries the [X, Y] pair axis (build_bse_ring_matvec_full);
+        # not covered by the stack matvec — keep the per-vector application.
+        hv = [matvec(v, *args) for v in vectors]
 
     V = jnp.stack(vectors, axis=0)
     HV = jnp.stack(hv, axis=0)
@@ -486,12 +568,15 @@ def run_feast_ritz(
     use_tda: bool = True,
 ) -> dict:
     if use_tda:
-        matvec = build_bse_ring_matvec(
+        # TDA FEAST (shifted-GMRES contour solves + Rayleigh-Ritz) runs on the
+        # trial-stack matvec — a bit-exact, dtype-adaptive drop-in for the ring
+        # matvec that also batches the Ritz subspace application in one dispatch.
+        matvec = build_bse_stack_matvec(
             mesh_xy,
             data["nkx"],
             data["nky"],
             data["nkz"],
-            include_W=include_W,
+            kernel="bse" if include_W else "rpa",
         )
     else:
         matvec = build_bse_ring_matvec_full(
@@ -503,22 +588,14 @@ def run_feast_ritz(
         )
     sh = make_bse_shardings(mesh_xy)
 
-    if include_W:
-        # Convert W_q (reciprocal space) to W_R (real space) for the ring matvec.
-        data["W_R"] = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
-    else:
-        data["W_R"] = data["W_q"]
+    ensure_W_R(data, include_W)
 
     diag_h = build_preconditioner_diagonal_sharded(data, mesh_xy, include_W=include_W, use_tda=use_tda)
     data_gmres = data
     diag_h_gmres = diag_h
     runner_dtype = jnp.complex128
     if gmres_fp32:
-        data_gmres = _build_gmres_data_fp32(data)
-        if include_W:
-            data_gmres["W_R"] = jnp.fft.ifftn(data_gmres["W_q"], axes=(2, 3, 4), norm="ortho")
-        else:
-            data_gmres["W_R"] = data_gmres["W_q"]
+        data_gmres = ensure_W_R(_build_gmres_data_fp32(data), include_W)
         diag_h_gmres = _cast_with_sharding(diag_h, jnp.float32)
         runner_dtype = jnp.complex64
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
@@ -712,11 +789,7 @@ def estimate_spectral_bounds_sharded(
     Uses an adaptive Lanczos run that stops when the largest Ritz value
     (of the tridiagonal) converges to within the specified tolerances.
     """
-    data_fp32 = _build_gmres_data_fp32(data)
-    if include_W:
-        data_fp32["W_R"] = jnp.fft.ifftn(data_fp32["W_q"], axes=(2, 3, 4), norm="ortho")
-    else:
-        data_fp32["W_R"] = data_fp32["W_q"]
+    data_fp32 = ensure_W_R(_build_gmres_data_fp32(data), include_W)
 
     eps_c = data_fp32["eps_c"]
     eps_v = data_fp32["eps_v"]
@@ -788,6 +861,8 @@ def estimate_spectral_bounds_sharded(
             eps_v,
             data_fp32["W_R"],
             data_fp32["V_q0"],
+            data_fp32["M_X"],  # hoisted V-term pair-amps (audit P3)
+            data_fp32["M_Y"],
         )
 
         alpha = jnp.vdot(q, z).real

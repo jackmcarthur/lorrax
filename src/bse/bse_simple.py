@@ -55,7 +55,12 @@ def build_bse_simple_matvec(
 
     The returned matvec is a single jit'd function:
         matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-               eps_c, eps_v, W_R, V_q0)  → HX
+               eps_c, eps_v, W_R, V_q0, M_X, M_Y)  → HX
+
+    ``M_X`` (μ on x) / ``M_Y`` (ν on y) are the hoisted exchange pair amplitudes
+    (audit P3), precomputed once per solve; ``psi_c_Y``/``psi_v_X`` are retained
+    only for a uniform signature with the other matvecs (the W-term reads
+    ``psi_c_X``/``psi_v_Y``; the V-term reads the hoisted M's).
 
     All collectives are XLA-generated from einsums + sharding hints.
     The (kx, ky, kz) ifft/fft around the W contraction is wrapped with
@@ -76,55 +81,50 @@ def build_bse_simple_matvec(
 
     def _matvec(
         X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-        eps_c, eps_v, W_R, V_q0,
+        eps_c, eps_v, W_R, V_q0, M_X, M_Y,
     ):
+        # M_X (μ on x) / M_Y (ν on y): hoisted exchange pair amplitudes, precomputed
+        # once per solve (audit P3). psi_c_Y / psi_v_X are unused here — kept for a
+        # uniform matvec signature; psi_c_X / psi_v_Y still feed the W-term.
         # ── D term:  (ε_c − ε_v) · X  — purely local, no comm ──────────
         delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]
         D_term = delta_E * X
         D_term = lax.with_sharding_constraint(D_term, sh.X)
 
         # ── V term (q=0 exchange, rank-1 in the centroid basis) ────────
-        # Build M[k, c, v, ν] = Σ_s conj(ψ_c_Y[k,c,s,ν]) · ψ_v_Y[k,v,s,ν].
-        # Both inputs have ν on y, c & v replicated. Output: c, v rep, ν on y.
-        M_Y = jnp.einsum(
-            'kcsN,kvsN->kcvN',
-            jnp.conj(psi_c_Y), psi_v_Y, optimize=True,
-        )
+        # M_Y[k, c, v, ν] = Σ_s conj(ψ_c_Y) · ψ_v_Y (ν on y, c & v replicated), hoisted.
 
-        # S[b, ν, k] = Σ_{c,v} M_Y[k,c,v,ν] · X[b,c,v,k] / sqrt_nk.
+        # Exchange (q=0) is DENSE in (k,k') — k is SUMMED in the encode, one
+        # V_q0 solve, then broadcast back at every k in the decode (VERDICT.md).
+        # S[b, ν] = Σ_{k,c,v} M_Y[k,c,v,ν] · X[b,c,v,k] / sqrt_nk.
         # Original forward (apply_V_ring) is conj(ψ_c)·ψ_v·X — i.e. M_Y
         # itself, not conj(M_Y).  The hermitian-conjugate counterpart on
         # the back-contract uses conj(M_X) instead.
-        # Contraction over c (x-sharded in X) and v (y-sharded in X).
+        # Contraction over k (replicated), c (x-sharded in X), v (y-sharded).
         # M has c, v replicated and ν on y. XLA picks the partitioning;
-        # we tag the output P(None, "y", None).
+        # we tag the output P(None, "y").
         S = jnp.einsum(
-            'kcvN,bcvk->bNk',
+            'kcvN,bcvk->bN',
             M_Y, X, optimize=True,
         )
-        S = lax.with_sharding_constraint(S, sh.S)
+        S = lax.with_sharding_constraint(S, sh.S_k0)
         S = S / sqrt_nk
 
-        # U[b, μ, k] = V_q0[μ, ν] · S[b, ν, k].
-        # V_q0 P(x, y) on (μ, ν); S P(None, y, None) on (b, ν, k).
+        # U[b, μ] = V_q0[μ, ν] · S[b, ν].
+        # V_q0 P(x, y) on (μ, ν); S P(None, y) on (b, ν).
         # ν reduces (sharded y); output μ on x. Plain einsum + reshard hint.
         U_mu = jnp.einsum(
-            'MN,bNk->bMk',
+            'MN,bN->bM',
             V_q0, S, optimize=True,
         )
-        U_mu = lax.with_sharding_constraint(U_mu, sh.U_mu)
+        U_mu = lax.with_sharding_constraint(U_mu, sh.d_mu)
 
-        # M_X[k, c, v, μ] needed to back-contract: build from psi_c_X, psi_v_X.
-        M_X = jnp.einsum(
-            'kcsM,kvsM->kcvM',
-            jnp.conj(psi_c_X), psi_v_X, optimize=True,
-        )
-
-        # HX_V[b, c, v, k] = Σ_μ M_X*[k,c,v,μ] · U_mu[b,μ,k] / sqrt_nk.
+        # M_X[k, c, v, μ] (μ on x) is the hoisted back-contract vertex.
+        # HX_V[b, c, v, k] = Σ_μ M_X*[k,c,v,μ] · U_mu[b,μ] / sqrt_nk (broadcast k).
         # M_X has c, v replicated, μ on x. U_mu has μ on x. Locally μ-aligned;
         # output b, c on x (need to scatter c to x), v rep, k rep.
         HX_V = jnp.einsum(
-            'kcvM,bMk->bcvk',
+            'kcvM,bM->bcvk',
             jnp.conj(M_X), U_mu, optimize=True,
         )
         HX_V = lax.with_sharding_constraint(HX_V, sh.X)
@@ -178,7 +178,7 @@ def build_bse_simple_matvec(
         _matvec,
         in_shardings=(
             sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-            sh.eps, sh.eps, sh.W, sh.V,
+            sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y,
         ),
         out_shardings=sh.X,
     )

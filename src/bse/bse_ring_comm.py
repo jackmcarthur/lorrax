@@ -58,6 +58,7 @@ def make_bse_shardings(mesh_xy: Mesh) -> SimpleNamespace:
         A=NamedSharding(mesh_xy, P(None, "x", "y", None, None)),
         D=NamedSharding(mesh_xy, P(None, "x", "y", None, None)),
         S=NamedSharding(mesh_xy, P(None, "y", None)),
+        S_k0=NamedSharding(mesh_xy, P(None, "y")),
         U_mu=NamedSharding(mesh_xy, P(None, "x", None)),
         d_mu=NamedSharding(mesh_xy, P(None, "x")),
     )
@@ -192,13 +193,16 @@ def apply_V_ring(
     X: jax.Array,
     psi_c_Y: jax.Array,
     psi_v_Y: jax.Array,
-    psi_c_X: jax.Array,
-    psi_v_X: jax.Array,
+    M_X: jax.Array,
     V_q0: jax.Array,
     nk: int,
     px: int,
     py: int,
 ) -> jax.Array:
+    # ``M_X`` (nk, c_full, v_full, μ_loc): the hoisted decode-side exchange pair
+    # amplitude ``Σ_s conj(ψ_c^X) ψ_v^X`` (μ on x), precomputed ONCE per solve
+    # (audit P3) rather than rebuilt from ψ every matvec. The encode side stays
+    # fused into the ψ_c^Y/ψ_v^Y ring sum below (it is X-dependent, not hoistable).
     nb_trial = X.shape[0]
     sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
@@ -211,7 +215,8 @@ def apply_V_ring(
     nk_local = psi_c_Y.shape[0]
     nspinor = psi_c_Y.shape[2]
     nu_local = psi_c_Y.shape[-1]
-    mu_local = psi_c_X.shape[-1]
+    nc_full = M_X.shape[1]
+    mu_local = M_X.shape[-1]
 
     c_start_local = axis_index_x * jnp.asarray(c_chunk, dtype=jnp.int32)
     z = jnp.int32(0)
@@ -247,17 +252,22 @@ def apply_V_ring(
 
     _, S_total = lax.fori_loop(0, px, step_x, (A_local, S0))
 
-    S_total = S_total / sqrt_nk
+    # Exchange (q=0) is DENSE in (k,k') — SUM over k' into a k-free
+    # transition-Hartree density, one V_q0 solve, then broadcast back at every
+    # k in the decode (VERDICT.md).  k is a replicated (unsharded) axis here, so
+    # the reduction is device-local.  The two 1/sqrt_nk compose to 1/Nk.
+    S_total = jnp.sum(S_total, axis=2) / sqrt_nk  # (b, nu_local)
 
-    U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)
+    U_partial = jnp.einsum("MN,bN->bM", V_q0, S_total)  # (b, mu_local)
     U = lax.psum(U_partial, axis_name="y")
 
     v_start_local = axis_index_y * jnp.asarray(v_chunk, dtype=jnp.int32)
-    psi_v_slice_X = lax.dynamic_slice(
-        psi_v_X, (z, v_start_local, z, z), (nk_local, v_chunk, nspinor, mu_local)
+    # Slice this rank's y-block of the valence axis out of the hoisted M_X (was:
+    # slice ψ_v^X then contract with ψ_c^X — identical values, one fewer GEMM/iter).
+    M_X_slice = lax.dynamic_slice(
+        M_X, (z, z, v_start_local, z), (nk_local, nc_full, v_chunk, mu_local)
     )
-    M_X = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_X), psi_v_slice_X)
-    VX_partial = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M_X), U)
+    VX_partial = jnp.einsum("kcvM,bM->bcvk", jnp.conj(M_X_slice), U)  # broadcast over k
     VX = lax.psum_scatter(VX_partial, axis_name="x", scatter_dimension=1, tiled=True)
 
     return VX / sqrt_nk
@@ -306,14 +316,14 @@ def build_bse_ring_matvec(
         out_specs=P(None, "x", "y", None, None, None),
     )
 
-    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0):
-        return apply_V_ring(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0, nk, px, py)
+    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0):
+        return apply_V_ring(X, psi_c_Y, psi_v_Y, M_X, V_q0, nk, px, py)
 
     apply_V_ring_only = _shard_map_fn(
         _apply_V_ring_only,
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
-                  P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
+                  P(None, None, None, "x"), P("x", "y")),
         out_specs=P(None, "x", "y", None),
     )
 
@@ -353,7 +363,10 @@ def build_bse_ring_matvec(
         _apply_W_from_T,
         in_shardings=(sh.T, sh.psi_x, sh.psi_y, sh.W),
         out_shardings=sh.X,
-        donate_argnums=(0,),  # T consumed once, no need to keep
+        # NB: T (arg 0) is NOT donated — the WX output has a different shape
+        # (nt,c,v,k) so the donation is always declined (no aliasable output) and
+        # emits no fallback copy. Dropping the cosmetic donate_argnums silences the
+        # recurring "donated buffers not usable" warning (audit P5, JOINT_FINDINGS §3).
     )
 
     def _apply_D_term(X, eps_c, eps_v):
@@ -366,9 +379,12 @@ def build_bse_ring_matvec(
         out_shardings=sh.X,
     )
 
-    def _matvec_impl(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+    def _matvec_impl(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
+                     M_X, M_Y):
+        # M_X: hoisted decode-side exchange pair amplitude (audit P3). M_Y / psi_v_X
+        # are unused here — kept for a uniform matvec signature with the stack path.
         D_term = apply_D_term(X, eps_c, eps_v)
-        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
         if not include_W:
             return D_term + V_term
         T = encode_T_ring(X, psi_c_X, psi_v_Y) if low_mem else encode_T_gather(X, psi_c_X, psi_v_Y)
@@ -376,12 +392,13 @@ def build_bse_ring_matvec(
         return D_term + V_term - W_term
 
     if timed:
-        def _matvec_timed(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+        def _matvec_timed(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
+                          M_X, M_Y):
             with timing.section("bse_jax.D_term"):
                 D_term = apply_D_term(X, eps_c, eps_v)
                 D_term.block_until_ready()
             with timing.section("bse_jax.V_term"):
-                V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+                V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
                 V_term.block_until_ready()
             if not include_W:
                 return D_term + V_term
@@ -405,6 +422,8 @@ def build_bse_ring_matvec(
             sh.eps,
             sh.W,
             sh.V,
+            sh.psi_x,
+            sh.psi_y,
         ),
         out_shardings=sh.X,
     )
@@ -418,8 +437,35 @@ def build_bse_ring_matvec_full(
     timed: bool = False,
     low_mem: bool = True,
     include_W: bool = True,
+    screening: bool = False,
 ):
-    """Build full (non-TDA) BSE matvec for S = [[A, B], [-B^H, -A^H]]."""
+    """Build full (non-TDA) BSE matvec ``[X;Y] -> H[X;Y]``.
+
+    ``screening`` selects the coupling-block kernel AND the anti-resonant row
+    (``_antiresonant_row``), which together fix *which* physical operator this is:
+
+    - ``screening=False`` (default): the OPTICAL BSE, the para-Hermitian
+      ``H = [[A, B], [-B*, -A*]]`` (* = complex conjugate) with ``A`` Hermitian
+      and ``B`` complex-SYMMETRIC.  The B (coupling) block uses the excitonic
+      exchange ``V_B`` (Henneke Eq. 2-20, conjugated pairing
+      ``⟨M_t|v|conj(M_t')⟩`` — ``apply_V_ring_B``) plus the c'↔v'-swapped direct
+      term.  With ``include_W`` this is the TDHF/BSE exciton Hamiltonian; its
+      spectrum is REAL with +-omega pairs (solved by ``bse_nontda``).  NOTE: the
+      historical ``-B, -A`` anti-resonant row gave a COMPLEX spectrum for complex
+      B and was never value-validated — fixed here (PHASE2_LOG "non-TDA
+      eigensolvers").
+    - ``screening=True``: the RPA test-charge DENSITY response (the object whose
+      resolvent gives the screened Coulomb ``W = v + vχv``).  Here the B block
+      uses the SAME RING kernel ``K^A = (1/Nk)⟨M_t|v|M_t'⟩`` as the A block
+      (``apply_V_ring``), so ``A+B = D + 2V`` — the standard RPA bubble
+      resummation ``χ = χ₀(1 − vχ₀)⁻¹``.  ``include_W`` must be False (RPA
+      screening has no screened-W direct term; it IS what builds W).  See
+      ``bse_w_exact`` for the identity ``W(0) − v = v(0 − H)⁻¹v`` and its
+      per-element convention.
+    """
+    if screening and include_W:
+        raise ValueError("screening=True is the RPA density response; it has no "
+                         "screened-W direct term — pass include_W=False.")
     px, py = mesh_xy.devices.shape
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
@@ -484,24 +530,23 @@ def build_bse_ring_matvec_full(
         out_specs=P(None, "x", "y", None, None, None),
     )
 
-    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0):
-        return apply_V_ring(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0, nk, px, py)
+    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0):
+        return apply_V_ring(X, psi_c_Y, psi_v_Y, M_X, V_q0, nk, px, py)
 
     apply_V_ring_only = _shard_map_fn(
         _apply_V_ring_only,
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
-                  P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
+                  P(None, None, None, "x"), P("x", "y")),
         out_specs=P(None, "x", "y", None),
     )
 
-    def _apply_V_ring_B(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0):
+    def _apply_V_ring_B(X, psi_c_Y, psi_v_Y, M_X, V_q0):
         return apply_V_ring(
             X,
             jnp.conj(psi_c_Y),
             jnp.conj(psi_v_Y),
-            psi_c_X,
-            psi_v_X,
+            M_X,
             V_q0,
             nk,
             px,
@@ -512,7 +557,7 @@ def build_bse_ring_matvec_full(
         _apply_V_ring_B,
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
-                  P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
+                  P(None, None, None, "x"), P("x", "y")),
         out_specs=P(None, "x", "y", None),
     )
 
@@ -552,7 +597,10 @@ def build_bse_ring_matvec_full(
         _apply_W_from_T,
         in_shardings=(sh.T, sh.psi_x, sh.psi_y, sh.W),
         out_shardings=sh.X,
-        donate_argnums=(0,),  # T consumed once, no need to keep
+        # NB: T (arg 0) is NOT donated — the WX output has a different shape
+        # (nt,c,v,k) so the donation is always declined (no aliasable output) and
+        # emits no fallback copy. Dropping the cosmetic donate_argnums silences the
+        # recurring "donated buffers not usable" warning (audit P5, JOINT_FINDINGS §3).
     )
 
     def _apply_D_term(X, eps_c, eps_v):
@@ -565,45 +613,82 @@ def build_bse_ring_matvec_full(
         out_shardings=sh.X,
     )
 
-    def _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+    def _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X):
         D_term = apply_D_term(X, eps_c, eps_v)
-        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
         if not include_W:
             return D_term + V_term
         T = encode_T_ring(X, psi_c_X, psi_v_Y) if low_mem else encode_T_gather(X, psi_c_X, psi_v_Y)
         W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
         return D_term + V_term - W_term
 
-    def _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0):
-        V_term = apply_V_ring_B(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+    def _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X):
+        # screening (RPA density response): ring kernel K^A, same as the A block
+        # (apply_V_ring_only); optical BSE: excitonic V_B (apply_V_ring_B). Both take
+        # the SAME hoisted M_X (audit P3) — apply_V_ring_B conjugates only ψ^Y.
+        if screening:
+            V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
+        else:
+            V_term = apply_V_ring_B(X, psi_c_Y, psi_v_Y, M_X, V_q0)
         if not include_W:
             return V_term
         T = encode_T_ring_B(X, psi_c_Y, psi_v_X) if low_mem else encode_T_gather_B(X, psi_c_Y, psi_v_X)
         W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
         return V_term - W_term
 
-    def _matvec_impl(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+    def _antiresonant_row(X, Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
+                          W_R, V_q0, M_X):
+        """Bottom (anti-resonant) block-row of the non-TDA operator applied to
+        ``[X; Y]``: ``Y_out``.  The physics of this row depends on ``screening``:
+
+        * ``screening=True`` (RPA test-charge density response): the coupling
+          ``B = K^A`` is Hermitian and ``A`` is Hermitian, so the operator is the
+          symplectic ``[[A, B], [-B, -A]]`` and ``Y_out = -B X - A Y``.  Validated
+          by the W(0) resolvent closure (PHASE2_LOG "W(0)").
+
+        * ``screening=False`` (OPTICAL BSE): ``A`` is Hermitian (``A = A^H``) but
+          the coupling ``B`` is complex-SYMMETRIC (``B = B^T``, NOT Hermitian).
+          The physical para-Hermitian Casida operator is ``[[A, B], [-B*, -A*]]``
+          (Onida-Reining-Rubio; Rohlfing-Louie), whose spectrum is REAL with
+          +-omega pairs, so ``Y_out = -B* X - A* Y``.  ``B* X = conj(B conj(X))``
+          and ``A* Y = conj(A conj(Y))`` reuse the SAME appliers on conjugated
+          inputs (operator ingredients unchanged), then conjugate the result — no
+          new kernel.  The naive ``-B X - A Y`` gives a COMPLEX (unphysical)
+          spectrum for complex ``B`` and was the historical, never-value-validated
+          bug (PHASE2_LOG "non-TDA eigensolvers", first checked numbers)."""
+        if screening:
+            AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X)
+            BX = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
+            return -BX - AY
+        AsY = jnp.conj(_apply_A(jnp.conj(Y), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                                eps_c, eps_v, W_R, V_q0, M_X))
+        BsX = jnp.conj(_apply_B(jnp.conj(X), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                                W_R, V_q0, M_X))
+        return -BsX - AsY
+
+    def _matvec_impl(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
+                     M_X, M_Y):
+        # M_X: hoisted decode-side exchange pair amplitude (audit P3), shared by the
+        # A and B blocks. M_Y is unused here — kept for a uniform matvec signature.
         X = X_full[0]
         Y = X_full[1]
-        AX = _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
-        BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
+        AX = _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X)
+        BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
         X_out = AX + BY
-
-        # A and B are Hermitian in this formulation; reuse A(Y) and B(X).
-        AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
-        B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
-        Y_out = -B_dag_X - AY
+        Y_out = _antiresonant_row(X, Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                                  eps_c, eps_v, W_R, V_q0, M_X)
         return jnp.stack([X_out, Y_out], axis=0)
 
     if timed:
-        def _matvec_timed(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+        def _matvec_timed(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
+                          M_X, M_Y):
             X = X_full[0]
             Y = X_full[1]
             with timing.section("bse_jax.D_term"):
                 D_term = apply_D_term(X, eps_c, eps_v)
                 D_term.block_until_ready()
             with timing.section("bse_jax.V_term"):
-                V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+                V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
                 V_term.block_until_ready()
             if not include_W:
                 AX = D_term + V_term
@@ -614,13 +699,12 @@ def build_bse_ring_matvec_full(
                     W_term.block_until_ready()
                 AX = D_term + V_term - W_term
             with timing.section("bse_jax.B_term"):
-                BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
+                BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
                 BY.block_until_ready()
             X_out = AX + BY
 
-            AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
-            B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
-            Y_out = -B_dag_X - AY
+            Y_out = _antiresonant_row(X, Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                                      eps_c, eps_v, W_R, V_q0, M_X)
             return jnp.stack([X_out, Y_out], axis=0)
 
         return _matvec_timed
@@ -637,6 +721,8 @@ def build_bse_ring_matvec_full(
             sh.eps,
             sh.W,
             sh.V,
+            sh.psi_x,
+            sh.psi_y,
         ),
         out_shardings=sh.X_full,
     )
@@ -662,39 +748,55 @@ def build_realspace_random_transition_generator(
     if n_cond_pad % px != 0 or n_val_pad % py != 0:
         raise ValueError("n_cond_pad and n_val_pad must be divisible by px/py")
 
-    c_chunk = n_cond_pad // px
     v_chunk = n_val_pad // py
 
     def _map(r, psi_c_X, psi_v_X, V_q0):
         # r: (batch, nu_local, nk), column-sharded on y.
         U_partial = jnp.einsum("MN,bNk->bMk", V_q0, r)
-        U = lax.psum(U_partial, axis_name="y")  # (batch, mu_local, nk), sharded on x
+        U = lax.psum(U_partial, axis_name="y")  # (batch, mu_local_x, nk), mu on x
 
-        axis_index_x = jnp.asarray(lax.axis_index("x"), dtype=jnp.int32)
         axis_index_y = jnp.asarray(lax.axis_index("y"), dtype=jnp.int32)
-        c_start = axis_index_x * jnp.asarray(c_chunk, dtype=jnp.int32)
         v_start = axis_index_y * jnp.asarray(v_chunk, dtype=jnp.int32)
         z = jnp.int32(0)
 
+        # v is a free output index (tiled on y) -> pre-slice its y-block.  c is
+        # NOT pre-sliced: the centroid (mu) contraction below is over the LOCAL
+        # x-slice of mu, so it must be completed across x by a psum.  Slicing c to
+        # this x-rank's block first (as an earlier version did) silently drops the
+        # off-rank mu contributions to every c — correct only at px=1 (~50% wrong
+        # at px=2).  Mirror apply_V_ring: full c, psum_scatter over x.
         nk_local, _, nspinor, mu_local = psi_c_X.shape
-        psi_c_slice = lax.dynamic_slice(
-            psi_c_X, (z, c_start, z, z), (nk_local, c_chunk, nspinor, mu_local)
-        )
         psi_v_slice = lax.dynamic_slice(
             psi_v_X, (z, v_start, z, z), (nk_local, v_chunk, nspinor, mu_local)
         )
 
-        M_X = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_slice), psi_v_slice)
-        X_local = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M_X), U)
+        M_X = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_X), psi_v_slice)  # (k,c_full,v,mu_x)
+        VX_partial = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M_X), U)          # local-mu, c full
+        # psum over x completes the mu sum across x-slices AND scatters the
+        # conduction index onto x -> (b, c_chunk_x, v_chunk_y, k).
+        X_local = lax.psum_scatter(
+            VX_partial, axis_name="x", scatter_dimension=1, tiled=True)
 
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X_local.real.dtype))
         return X_local / sqrt_nk
 
-    return _shard_map_fn(
+    _gen = _shard_map_fn(
         _map,
         mesh=mesh_xy,
         in_specs=(P(None, "y", None), P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
         out_specs=P(None, "x", "y", None),
+    )
+    # jit the seed (zeta->pair) reshard boundary.  A bare shard_map re-traces and
+    # re-lowers to HLO on EVERY eager call (~2.5 s on the MoS2 fixture) because the
+    # trace is not memoized; wrapping it in jax.jit caches the compiled executable
+    # so repeated calls dispatch in <1 ms.  The BSE matvec is jitted for exactly
+    # this reason — the seed/project boundaries were the only un-jitted ones and
+    # dominated the W-column solve (see PHASE2_LOG "W-column resolvent profiling").
+    # Bit-faithful: same shard_map body, same in/out shardings.
+    return jax.jit(
+        _gen,
+        in_shardings=(sh.S, sh.psi_x, sh.psi_x, sh.V),
+        out_shardings=sh.X,
     )
 
 
@@ -703,10 +805,36 @@ def build_density_snapshot_operator(
     nkx: int,
     nky: int,
     nkz: int,
+    scatter_nu_on_y: bool = False,
 ):
-    """Build a sharded map: s(c,v,k) -> d(mu) = V_q0 @ sum_k R s.
+    """Build a sharded map: s(b,c,v,k) -> d(b,mu) = V_q0 @ sum_k R s.
 
-    Returns density-space vectors in r_mu (summed over k) sharded on x.
+    The projection back from the (c,v,k) pair basis to the ISDF density
+    (centroid) basis.  ``b`` is a batch axis (one probe/trial vector per slot),
+    replicated across the mesh; ``mu`` is the centroid output index.
+
+    Two output layouts, selected at build time:
+
+    * ``scatter_nu_on_y=False`` (default): the V_q0 contraction over N is
+      completed with a plain ``psum('y')`` and ``d`` returns replicated on the
+      batch axis with ``mu`` on ``x`` — ``P(None, 'x')`` = ``(b, mu_X)``.  Used
+      by the per-vector density-snapshot callers (``bse_pseudopoles``) that
+      device_get one column at a time.
+
+    * ``scatter_nu_on_y=True``: the W-column / screened-W(omega) path, where the
+      batch axis IS the probe index ``nu`` and we want the assembled tile
+      ``W(mu_X, nu_Y)`` with no replicated ``(mu, nu)`` intermediate.  This
+      mirrors the Sigma_PPM reduce-scatter kernel
+      (``gw.ppm_tau_kernel._make_project_ri_reduce_scatter``): the same mesh
+      axis ``y`` carries BOTH the reduction (finish the V_q0 N-contraction,
+      whose partials are scattered across the ``y`` shards) AND the output
+      tiling (scatter the ``nu`` batch onto ``y``), fused into ONE
+      ``psum_scatter`` — same NCCL volume as the plain ``psum`` but the tile
+      lands ``P('x', 'y')`` = ``(mu_X, nu_Y)`` = ``sh.V`` device-local.
+      Requires ``b % py == 0`` (pad the probe block; ``padded_mu_extent`` already
+      rounds the full-basis centroid count to a multiple of ``px*py``).
+
+    Returns density-space vectors summed over k.
     """
     px, py = mesh_xy.devices.shape
     sh = make_bse_shardings(mesh_xy)
@@ -762,17 +890,38 @@ def build_density_snapshot_operator(
 
         S_total = S_total / sqrt_nk
 
-        U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)
-        U = lax.psum(U_partial, axis_name="y")  # (batch, mu_local, nk)
+        # V_q0 @ S: local N-slice partials, N tiled on y (mu on x from V_q0).
+        U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)  # (b, mu_local_x, k)
 
-        d_mu = jnp.sum(U, axis=-1)
-        return d_mu
+        if not scatter_nu_on_y:
+            U = lax.psum(U_partial, axis_name="y")  # finish N sum, replicate on y
+            return jnp.sum(U, axis=-1)              # (b, mu_local_x)
 
-    return _shard_map_fn(
+        # Reduce-scatter tail (mirror of ppm_tau_kernel reduce-scatter): sum the
+        # local-N partials across y (completes the V_q0 N-contraction) AND scatter
+        # the nu batch onto y in one collective, so W lands (mu_X, nu_Y) with no
+        # replicated (mu, nu).  Local transpose first (no comms) so nu is the
+        # scatter axis; psum_scatter reduces over y and tiles nu across y.
+        d_partial = jnp.sum(U_partial, axis=-1)          # (b, mu_local_x)
+        d_local = jnp.swapaxes(d_partial, 0, 1)          # (mu_local_x, b)
+        return lax.psum_scatter(
+            d_local, axis_name="y", scatter_dimension=1, tiled=True
+        )                                                # (mu_local_x, b/py)
+
+    _snap = _shard_map_fn(
         _map,
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"), P("x", "y")),
-        out_specs=P(None, "x"),
+        out_specs=(P("x", "y") if scatter_nu_on_y else P(None, "x")),
+    )
+    # jit the projection (pair->zeta) reshard boundary — same rationale as
+    # build_realspace_random_transition_generator: cache the compiled executable
+    # instead of re-lowering the shard_map on every eager call (~2.8 s -> <3 ms).
+    # Bit-faithful.  Output sharding follows the build-time scatter_nu_on_y branch.
+    return jax.jit(
+        _snap,
+        in_shardings=(sh.X, sh.psi_y, sh.psi_y, sh.V),
+        out_shardings=(sh.V if scatter_nu_on_y else sh.d_mu),
     )
 
 
@@ -842,7 +991,9 @@ def ring_matvec_smoke_test(px: int = 2, py: int = 2) -> None:
 
         matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
         W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
-        HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+        M_X = compute_pair_amplitude(psi_c_X, psi_v_X)
+        M_Y = compute_pair_amplitude(psi_c_Y, psi_v_Y)
+        HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
         HX.block_until_ready()
 
     print(f"HX sharding: {HX.sharding}")
@@ -904,7 +1055,9 @@ def ring_matvec_correctness_check(
         W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
 
         matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
-        HX_ring = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+        M_X = compute_pair_amplitude(psi_c_X, psi_v_X)
+        M_Y = compute_pair_amplitude(psi_c_Y, psi_v_Y)
+        HX_ring = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
         HX_ring.block_until_ready()
 
     HX_ring_host = jax.device_get(HX_ring)
@@ -935,10 +1088,12 @@ def ring_matvec_correctness_check(
             D_ring = apply_D(X, eps_c, eps_v)
             W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
             V_ring = comp_matvec(
-                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R * 0.0, V_q0
+                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R * 0.0, V_q0,
+                M_X, M_Y
             )
             W_ring = comp_matvec(
-                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R, V_q0 * 0.0
+                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R, V_q0 * 0.0,
+                M_X, M_Y
             )
             D_ring.block_until_ready()
             V_ring.block_until_ready()
