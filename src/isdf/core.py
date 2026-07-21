@@ -1065,7 +1065,7 @@ def _factor_c_q_replicated(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
     zeta_ridge: float = 0.0,
     charge_zeta_solve: str = 'cholesky',
-    zeta_rcond: float = 1e-6,
+    zeta_rcond: float = 1e-8,
 ) -> jax.Array:
     """Dense, fully REPLICATED factor of the identity-padded charge CCT.
 
@@ -1178,7 +1178,7 @@ def factor_c_q(
     n_rmu_logical: int | None = None,
     solver_kind: str = 'auto',
     zeta_ridge: float = 0.0,
-    zeta_rcond: float = 1e-6,
+    zeta_rcond: float = 1e-8,
 ) -> jax.Array:
     """
     Compute system-matrix L_q from CCT matrix.

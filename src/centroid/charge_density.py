@@ -1,6 +1,16 @@
-"""Charge-density providers for k-means ISDF centroid selection.
+"""Weighting-density providers for k-means ISDF centroid selection.
 
-Two sources are supported:
+The k-means weight decides WHERE the ISDF quadrature has points, hence
+which states the ISDF can represent at all.  Two weights are offered
+(``kmeans_cli --centroid-weight``):
+
+* ``charge_density`` — the ground-state (OCCUPIED) ρ(r), sources 1 & 2
+  below.  Correct for valence/near-gap work; starves any region the
+  occupied states do not occupy.
+* ``band_range`` — :func:`rho_from_band_range`, w(r) = Σ_{n∈range} Σ_k
+  w_k |ψ_nk(r)|² over the bands the calculation actually uses.
+
+Two ρ(r) sources are supported:
 
 1. ``rho_from_qe_save(save_dir)`` — read the already-symmetrized valence
    density from QE's ``<prefix>.save/charge-density.hdf5``. This is what QE
@@ -142,6 +152,131 @@ def rho_from_wfn_ibz(
     wfn_k = _load_wfn_k_fftbox_ibz(wfn, n_val)
     rho_jax = compute_valence_density(wfn_k, sym, wfn)
     return np.asarray(rho_jax, dtype=np.float64)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Source 3: band-range weight — Σ_{n ∈ range} Σ_k w_k |ψ_nk(r)|²
+# ═══════════════════════════════════════════════════════════════════════
+
+def symmetrize_on_grid(field: np.ndarray, sym_ops: np.ndarray) -> np.ndarray:
+    """Average ``field`` over a symmorphic integer point group on the grid.
+
+    ``sym_ops`` are the r-action matrices ``M`` (BGW ``Rinv``, τ=0) of a
+    group that maps the FFT grid to itself, e.g. the output of
+    :func:`centroid.orbit_syms.recover_symmorphic_density_point_group`.
+    Returns ``(1/|G|) Σ_M field[(M·n) mod N]`` — invariant because the
+    group is closed.
+    """
+    f = np.asarray(field, dtype=np.float64)
+    N = np.asarray(f.shape, dtype=np.int64)
+    ops = np.asarray(sym_ops, dtype=np.int64).reshape(-1, 3, 3)
+    if ops.shape[0] <= 1:
+        return f
+    ix, iy, iz = np.meshgrid(*(np.arange(n) for n in N), indexing="ij")
+    n_idx = np.stack([ix.ravel(), iy.ravel(), iz.ravel()], axis=1)   # (P,3)
+    flat = f.ravel()
+    acc = np.zeros_like(flat)
+    for M in ops:
+        img = (n_idx @ M.T) % N[None, :]
+        acc += flat[img[:, 0] * (N[1] * N[2]) + img[:, 1] * N[2] + img[:, 2]]
+    return (acc / ops.shape[0]).reshape(f.shape)
+
+
+def rho_from_band_range(
+    wfn: WFNReader,
+    band_range: tuple[int, int],
+    *,
+    sym_ops: np.ndarray | None = None,
+    chunk_gb: float = 4.0,
+    verbose: bool = True,
+) -> np.ndarray:
+    """k-means weight from the density of the BAND RANGE IN USE.
+
+    ``w(r) = Σ_{n ∈ [b_lo, b_hi)} Σ_k w_k |ψ_nk(r)|²`` (the k-average over
+    the WFN's stored k-set, using its k-weights), in the same
+    normalisation as :func:`rho_from_qe_save`.
+
+    WHY THIS FEATURE EXISTS: the occupied-only ρ(r) is entirely inside the
+    slab, so a ρ-weighted k-means puts ZERO centroids in the vacuum and the
+    vacuum-localized far-conduction states have no quadrature support —
+    their ⟨nk|V_H|nk⟩ (a pure centroid sum) comes back +139.75 eV where the
+    truth is −139.6 eV, and the whole error lands on Vxc = E_dft − kin_ion
+    − V_H (|ΔVxc| vs QE correlates with the vacuum weight at +0.958).
+    Weighting by the bands actually in use puts centroids where those
+    states live.
+
+    Parameters
+    ----------
+    wfn : open ``WFNReader`` (only ``_filename``/``kweights``/
+        ``cell_volume`` are used; ψ is streamed through ``WfnLoader``).
+    band_range : ``(b_lo, b_hi)``, 0-based half-open.
+    sym_ops : optional (n_op, 3, 3) integer r-action matrices.  The raw
+        k-sum is NOT point-group symmetric (star members contribute
+        un-rotated |ψ|² at each r); pass the recovered density point group
+        to symmetrize, so the weight cannot itself break the k-star
+        symmetry the orbit closure is there to protect.
+    chunk_gb : band-chunk size target for the r-space buffer.
+
+    Returns
+    -------
+    (Nx, Ny, Nz) float64 real-space weight on the WFN FFT grid.
+    """
+    import jax
+    from jax.sharding import Mesh
+    from file_io.wfn_loader import WfnLoader
+    from common.wfn_transforms import to_rbox
+
+    b_lo, b_hi = int(band_range[0]), int(band_range[1])
+    if b_hi <= b_lo:
+        raise ValueError(f"empty band range: {band_range}")
+
+    with WfnLoader(wfn._filename) as loader:
+        nb_file = int(loader.nbands)
+        if b_hi > nb_file:
+            raise ValueError(
+                f"--weight-bands upper edge {b_hi} exceeds the WFN's "
+                f"{nb_file} bands; lower it or regenerate the NSCF.")
+        fft_grid = tuple(int(s) for s in loader.fft_grid)
+        n_r = int(np.prod(fft_grid))
+        nspinor = int(loader.nspinor)
+        g_index = loader.box_index(k="ibz")
+        n_k = int(g_index.shape[0])
+        kw = np.asarray(wfn.kweights, dtype=np.float64)[:n_k]
+        mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+        # r-space buffer is (n_k, nb, nspinor, Nr) complex128 → size the
+        # band chunk against the budget (≥1 band, ≤ the whole range).
+        per_band = n_k * nspinor * n_r * 16
+        nb_chunk = int(max(1, min(b_hi - b_lo,
+                                  (chunk_gb * 1024 ** 3) // max(per_band, 1))))
+        scale = float(np.sqrt(n_r / float(wfn.cell_volume)))
+        kw_j = jnp.asarray(kw).reshape(-1, 1, 1, 1, 1, 1)  # (n_k,b,s,x,y,z)
+        w = jnp.zeros(fft_grid, dtype=jnp.float64)
+        if verbose:
+            print(f"[band_range weight] bands [{b_lo},{b_hi}) over {n_k} "
+                  f"stored k (Σw_k={kw.sum():.4f}), grid {fft_grid}, "
+                  f"chunk={nb_chunk} bands")
+        for lo in range(b_lo, b_hi, nb_chunk):
+            hi = min(lo + nb_chunk, b_hi)
+            psi = loader.load(bands=(lo, hi), k="ibz")
+            psi_r = to_rbox(psi, g_index, fft_grid, mesh=mesh, norm="ortho")
+            psi_r = psi_r[:, :hi - lo] * scale     # drop band-axis pad rows
+            w = w + jnp.sum(
+                (psi_r.real ** 2 + psi_r.imag ** 2) * kw_j, axis=(0, 1, 2))
+        w = np.asarray(jax.device_get(w), dtype=np.float64)
+
+    if sym_ops is not None:
+        n_op = int(np.asarray(sym_ops).reshape(-1, 3, 3).shape[0])
+        w_sym = symmetrize_on_grid(w, sym_ops)
+        if verbose:
+            dev = float(np.max(np.abs(w_sym - w)) / (np.max(np.abs(w)) or 1.0))
+            print(f"[band_range weight] symmetrized over {n_op} op(s); "
+                  f"raw k-sum asymmetry was {dev:.2e} (relative)")
+        w = w_sym
+    if verbose:
+        print(f"[band_range weight] Σ_r w = {w.sum():.4f} over {b_hi - b_lo} "
+              f"bands (same normalisation as rho_from_qe_save, whose Σ_r ρ "
+              f"covers the {int(wfn.nelec)} occupied)")
+    return w
 
 
 # ═══════════════════════════════════════════════════════════════════════

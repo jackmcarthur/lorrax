@@ -30,18 +30,20 @@ whead_0freq = 150.395600
 use_chunked_isdf = true
 memory_per_device_gb = 28
 
-# PINNED, deliberately off the production default (zeta_rcond = 1e-6).
+# zeta_rcond DELIBERATELY UNSET -> runs at the production default (1e-8).
 # This fixture is the BGW ANCHOR (tests/README.md: "Do not shrink/re-freeze"),
-# so its reference must stay the number that was validated against BerkeleyGW
-# at MAE 0.12 meV — not a LORRAX self-freeze.  Si 4x4x4 / 960 centroids is NOT
-# rank-truncation-free: its charge CCT spectrum does extend below 1e-6*lambda_max,
-# and the production default costs it ~1 meV.  Measured drift of sigTOT vs this
-# frozen reference (reports/gw_conduction_postfix_2026-07-21, si_rcond_sweep.sh):
+# so it must stay honest against BerkeleyGW (MAE 0.12 meV, max|d| 0.48 meV) and
+# not become a LORRAX self-freeze.  Si 4x4x4 / 960 centroids is NOT
+# rank-truncation-free: its charge CCT spectrum does extend below the cut.
+# Measured drift of sigTOT vs the 1e-10 freeze
+# (reports/gw_conduction_postfix_2026-07-21, si_rcond_sweep.sh):
 #   rcond    1e-9    1e-8    1e-7    1e-6    1e-5    1e-4
 #   max|d|  0.001   0.054   0.417   1.021   2.918  37.218   meV
-# 1e-6 exceeds the 0.48 meV BGW max|delta|, so the anchor is held at 1e-10 and
-# the rcond sensitivity is measured explicitly instead of being frozen away.
-zeta_rcond = 1e-10
+# The old 1e-6 default cost 1.021 meV -- ABOVE the 0.48 meV BGW max|d| -- which
+# is why this fixture used to pin 1e-10.  At the 1e-8 default the drift is
+# 0.054 meV, ~9x inside the BGW envelope and ~20x inside the 1e-3 eV gate atol,
+# so the pin is no longer needed and the anchor now exercises the SHIPPING
+# code path (reports/gw_bandrange_centroids_2026-07-21).
 
 sigma_freq_debug_output = true
 sigma_debug_split_contrib = true
