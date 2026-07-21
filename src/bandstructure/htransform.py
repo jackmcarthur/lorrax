@@ -40,6 +40,22 @@ def _build_mesh_xy() -> Mesh:
 _accum_G_cache: dict = {}
 
 
+# Ceiling on ONE streamed ψ band-chunk in the Galerkin build.
+#
+# ``iter_psi_rchunk_bandwise`` is called below with the whole r-axis
+# (r0 = 0, r_end = meta.n_rtot), so the only lever on the chunk's size is the
+# band count, and ``to_rchunk`` materialises the chunk as a single REPLICATED
+# (nk, bc, nspinor, n_rtot) complex128 array — it is not sharded by the mesh
+# (verified: the same allocation appears on a 1×1 and a 2×2 mesh).  One band of
+# it costs nk·nspinor·n_rtot·16 B, which is 0.81 GB/band on the converged MoS2
+# reference (nk=144, n_rtot=174 960).  So the historical fixed default of 64
+# bands per chunk asks for 51.6 GB, and even a 48-band window asks for 38.7 GB
+# — enough to OOM an A100-80GB once the BSE/GW restart tensors are resident.
+# The cap makes the default size-aware; band chunking is a pure accumulation
+# split (G = Σ_chunks Q Qᴴ), so this changes memory only, never the result.
+_GALERKIN_CHUNK_MAX_BYTES = 6 * 1024 ** 3
+
+
 def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              band_range: tuple[int, int],
                              rtol: float = 1e-8, log_fn=None,
@@ -60,7 +76,10 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         mesh_xy: 2D ``('x','y')`` device mesh.
         band_range: ``(b_start, b_end)`` — bands included in the SVD basis.
         rtol: SVD truncation tolerance (relative to s.max()).
-        band_chunk_size: bands per FFT chunk inside the loader.
+        band_chunk_size: bands per FFT chunk inside the loader.  Treated as a
+            CEILING, not a fixed size: it is lowered so one streamed ψ chunk
+            ``(nk, bc, nspinor, n_rtot)`` complex128 stays under
+            ``_GALERKIN_CHUNK_MAX_BYTES`` (see below).
         bispinor: passed through to ``load_centroids_band_chunked``.
         return_full_proj: also return the full-r α-basis projector
             ``W_proj = L⁻¹ diag(1/s) U^H`` (rank, nk·nb), replicated.  For
@@ -87,9 +106,16 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     rep = NamedSharding(mesh_xy, P())               # fully replicated
     grid_xy = NamedSharding(mesh_xy, P('x', 'y'))   # (rank, rank) face
 
+    # Size the band chunk to the ψ box rather than trusting a fixed default.
+    bytes_per_band = nk * nspinor * int(meta.n_rtot) * 16
+    bc_cap = max(1, int(_GALERKIN_CHUNK_MAX_BYTES // max(1, bytes_per_band)))
+    band_chunk_size = max(1, min(int(band_chunk_size), bc_cap, nb))
+
     log_fn(
         f"  Streaming Galerkin: nk={nk}, nb={nb}, nr={meta.n_rtot}, "
-        f"n_mu={n_mu}, mesh=({mesh_xy.shape['x']}x{mesh_xy.shape['y']})"
+        f"n_mu={n_mu}, mesh=({mesh_xy.shape['x']}x{mesh_xy.shape['y']}), "
+        f"band_chunk={band_chunk_size} "
+        f"({bytes_per_band * band_chunk_size / 1024**3:.2f} GB/chunk)"
     )
 
     # ── 1. Load ψ at centroids (band-sharded internally on 'y') ──
