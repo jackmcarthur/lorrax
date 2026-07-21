@@ -467,9 +467,17 @@ def main(argv=None):
                                   np.arange(nkz) / nkz, indexing="ij"),
                       axis=-1).reshape(-1, 3)
     q_list = (Qpath[:, None, :] + k_frac[None, :, :]).reshape(-1, 3)
+    # kgrid_co is the COARSE grid that ``ctilde`` lives on (= the WFN/restart
+    # grid, from ``meta``), NOT ``(nkx,nky,nkz)`` — those come from ``data`` and
+    # are the FINE grid after a ``bse_k_grid`` coarse→fine densification, which
+    # ``k_frac`` above correctly uses for the fine BSE k-sum.  ``build_fH_R``
+    # ifft-reshapes ctilde's k-axis into ``kgrid_co``, so it MUST equal
+    # ``prod(coarse)``; passing the fine grid crashes (36-k ctilde ≠ 12×12).
+    # No-op when bse_k_grid is unset (data grid == meta grid).
+    kgrid_co_ct = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     bundle = compute_wfns_fi(
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
-        kgrid_co=(nkx, nky, nkz), band_window_fi=(b_min, b_max),
+        kgrid_co=kgrid_co_ct, band_window_fi=(b_min, b_max),
         mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
         log_fn=log)
     psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(

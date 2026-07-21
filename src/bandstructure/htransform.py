@@ -105,7 +105,12 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # FFI seam: today gather to replicated, run dense SVD on each device
     # (small for our sizes); swap for distributed SVD when n_μ scales up.
     t1 = time.time()
-    A = psi_rmu_Y.reshape(nk * nb, nspinor * n_mu)
+    # Trim the sharding-pad: load_centroids_band_chunked pads the n_μ axis to a
+    # multiple of the device count, but the TRUE centroid count is
+    # ``n_mu = centroid_indices.shape[0]`` (= the restart's n_rmu).  Without this
+    # trim a centroid count not divisible by the device count (e.g. 1496 on 16
+    # GPU → padded 1504) reshape-crashes here.  No-op when already divisible.
+    A = psi_rmu_Y[..., :n_mu].reshape(nk * nb, nspinor * n_mu)
     A = jax.device_put(A, rep)
     del psi_rmu_Y
 

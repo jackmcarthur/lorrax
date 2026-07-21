@@ -951,6 +951,12 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
     ``minibz_head_vlr``).
     """
     from types import SimpleNamespace
+    # The reference gate battery (run_gates / run_nulls) materializes replicated
+    # tensors that OOM for large centroid counts (e.g. 1496 recovered-D3h on 16
+    # GPU → a 58 GB alloc).  Allow opting out via env; the coarse-fit still runs
+    # and the driver's physical on-grid htransform gate still validates.
+    if os.environ.get("LORRAX_SKIP_VQ_GATES", "0") == "1":
+        run_diagnostics = False
     if zeta_file is None:
         zeta_file = os.path.join(os.path.dirname(restart_file), "zeta_q.h5")
     zx = load_zeta_coarse(restart_file, zeta_file)
