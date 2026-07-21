@@ -320,6 +320,17 @@ _DEFAULTS = {
     # this ill-posed fit) — hence opt-in, a physics call.  Env override
     # LORRAX_ZETA_RIDGE.  See reports/gw_zeta_mesh_invariance_2026-07-20.
     "zeta_ridge":           0.0,
+    # Charge ζ-solve conditioner (μ_L=0 channel only).  "rank_truncate"
+    # (DEFAULT) = rank-revealing eigh pseudo-inverse: drop eigenvalues
+    # < zeta_rcond·λ_max before inverting, so the near-null directions of
+    # the over-complete charge CCT (n_μ > pair-density rank, κ~1e13) are
+    # removed at the source instead of amplified by plain Cholesky into
+    # O(1) V_q errors that GN-PPM magnifies to tens of eV (the conduction
+    # Σc blow-up / device-count / nband instability).  "cholesky" = the
+    # historical replicated/cuSolverMp Cholesky path (bit-identical to the
+    # pre-feature behavior; the selectable alternative).
+    "charge_zeta_solve":    "rank_truncate",   # rank_truncate | cholesky
+    "zeta_rcond":           1e-10,             # rank-truncation cutoff (·λ_max)
     # Deprecated aliases (still parsed; warned at load; honored only when
     # the portable key above is left at "auto"):
     "cusolvermp_charge": "auto",   # auto | on | off
@@ -804,6 +815,8 @@ class BackendConfig:
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
     distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
     zeta_ridge: float          # charge-CCT Tikhonov ridge ε (rel. to tr/n)
+    charge_zeta_solve: str     # "rank_truncate" | "cholesky"
+    zeta_rcond: float          # rank-truncation cutoff (·λ_max)
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
 
     def summary(self) -> str:
@@ -814,8 +827,12 @@ class BackendConfig:
             f"screening_solver={self.screening_solver.value}, "
             f"distributed_cholesky={self.distributed_cholesky}, "
             f"distributed_lu={self.distributed_lu}, "
-            f"zeta_ridge={self.zeta_ridge:g}, "
-            f"gamma_contract={self.gamma_contract_mode}"
+            f"charge_zeta_solve={self.charge_zeta_solve}"
+            + (f"(rcond={self.zeta_rcond:g})"
+               if self.charge_zeta_solve == 'rank_truncate' else '')
+            + (f", zeta_ridge={self.zeta_ridge:g}"
+               if self.zeta_ridge else '')
+            + f", gamma_contract={self.gamma_contract_mode}"
         )
 
 
@@ -1286,6 +1303,11 @@ class LorraxConfig:
                 f"distributed_lu={_dist_lu!r} invalid; expected auto / off "
                 f"/ cusolvermp / scalapack (a SLATE getrf wrapper does not "
                 f"exist yet; scalapack is the host/CPU-backend option).")
+        _charge_zeta_solve = str(_g("charge_zeta_solve")).strip().lower()
+        if _charge_zeta_solve not in ("rank_truncate", "cholesky"):
+            raise ValueError(
+                f"charge_zeta_solve={_charge_zeta_solve!r} invalid; expected "
+                f"rank_truncate / cholesky.")
         try:
             import jax as _jax
             _is_cpu_backend = _jax.default_backend() == "cpu"
@@ -1363,6 +1385,8 @@ class LorraxConfig:
             distributed_cholesky=_dist_chol,
             distributed_lu=_dist_lu,
             zeta_ridge=float(_g("zeta_ridge")),
+            charge_zeta_solve=_charge_zeta_solve,
+            zeta_rcond=float(_g("zeta_rcond")),
             gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
         )
         debug = DebugConfig(

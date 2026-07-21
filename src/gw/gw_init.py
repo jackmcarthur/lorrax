@@ -125,6 +125,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			distributed_cholesky=cfg.backend.distributed_cholesky,
 			distributed_lu=cfg.backend.distributed_lu,
 			zeta_ridge=cfg.backend.zeta_ridge,
+			charge_zeta_solve=cfg.backend.charge_zeta_solve,
+			zeta_rcond=cfg.backend.zeta_rcond,
 			gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
 			write_ibz_only=_write_ibz_only_charge,
 			zeta_cutoff_ry=_zeta_cutoff,

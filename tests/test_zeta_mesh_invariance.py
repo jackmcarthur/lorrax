@@ -103,9 +103,108 @@ def _worker() -> int:
     return 0
 
 
-def test_zeta_fit_charge_factor_solve_is_mesh_invariant():
-    """factor_c_q + solve_zeta (charge, auto) give bit-identical L_q and ζ
-    across CPU meshes {1×1, 1×2, 2×1, 2×2, 1×4, 4×1}."""
+def _worker_rank_truncate() -> int:
+    """Child process: build a NEAR-SINGULAR (over-complete) SPD CCT, factor
+    + solve with the rank-truncation path on every mesh.  Asserts the
+    auto-resolved kind is ``replicated_rank_truncate`` and reports (a) the
+    worst cross-mesh frob-rel for the pseudo-inverse factor B and ζ, and
+    (b) the amplification ratio ‖ζ_chol‖/‖ζ_rt‖ on a single mesh — the
+    conditioning the truncation buys vs plain (floored) Cholesky."""
+    import numpy as np
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from isdf import factor_c_q, solve_zeta
+    from isdf.core import _resolve_solver_kind
+
+    devs = jax.devices()
+    if len(devs) < _NDEV:
+        print(json.dumps({"skip": f"only {len(devs)} devices"}))
+        return 0
+
+    # Near-singular charge CCT: designed spectrum with r≪n_μ "signal"
+    # eigenvalues O(1) and the rest ~1e-13 (κ≈1e13) — the over-complete
+    # n_μ > pair-density-rank regime that makes plain Cholesky amplify.
+    rng = np.random.default_rng(20260721)
+    nq, n_mu, n_rhs, r = 4, 64, 24, 40
+    rcond = 1e-10
+    C = np.empty((nq, n_mu, n_mu), dtype=np.complex128)
+    for iq in range(nq):
+        M = (rng.standard_normal((n_mu, n_mu))
+             + 1j * rng.standard_normal((n_mu, n_mu)))
+        Q, _ = np.linalg.qr(M)                            # Haar-ish unitary
+        evals = np.concatenate([rng.uniform(0.5, 2.0, r),
+                                np.full(n_mu - r, 1e-13)])
+        Ciq = (Q * evals) @ np.conj(Q.T)
+        C[iq] = 0.5 * (Ciq + np.conj(Ciq.T))             # kill fp asymmetry
+    Zrhs = (rng.standard_normal((nq, n_mu, n_rhs))
+            + 1j * rng.standard_normal((nq, n_mu, n_rhs))).astype(np.complex128)
+
+    mesh_shapes = [(1, 1), (1, 2), (2, 1), (2, 2), (1, 4), (4, 1)]
+    B_ref = zeta_ref = None
+    worst_B = worst_z = 0.0
+    kinds = {}
+    zeta_rt_2x2 = None
+    for (px, py) in mesh_shapes:
+        mesh = Mesh(np.asarray(devs[: px * py]).reshape(px, py), ('x', 'y'))
+        kind = _resolve_solver_kind(mesh, 0, 'auto', n_rmu=n_mu, nq=nq,
+                                    charge_zeta_solve='rank_truncate')
+        kinds[f"{px}x{py}"] = kind
+        assert kind == 'replicated_rank_truncate', (
+            f"auto resolver picked {kind!r} on {px}x{py} for fit-size n_μ "
+            f"with charge_zeta_solve=rank_truncate; expected "
+            f"'replicated_rank_truncate'")
+        in_sh = NamedSharding(mesh, P(None, 'x', 'y'))
+        C_dev = jax.device_put(jnp.asarray(C), in_sh)
+        Z_dev = jax.device_put(jnp.asarray(Zrhs), in_sh)
+        B = factor_c_q(C_dev, mesh, vertex_mu_L=0, n_rmu_logical=n_mu,
+                       solver_kind=kind, zeta_rcond=rcond)
+        zeta = solve_zeta(B, Z_dev, mesh, q_chunk_size=nq,
+                          solver_kind=kind, n_rmu_logical=n_mu)
+        B_np = np.asarray(jax.device_get(B))
+        z_np = np.asarray(jax.device_get(zeta))
+        if B_ref is None:
+            B_ref, zeta_ref = B_np, z_np
+        else:
+            worst_B = max(worst_B, float(
+                np.linalg.norm(B_np - B_ref) / max(np.linalg.norm(B_ref), 1e-300)))
+            worst_z = max(worst_z, float(
+                np.linalg.norm(z_np - zeta_ref) / max(np.linalg.norm(zeta_ref), 1e-300)))
+        if (px, py) == (2, 2):
+            zeta_rt_2x2 = z_np
+
+    # Conditioning demonstration: the SAME singular CCT through the plain
+    # (1e-14·|tr| floored) Cholesky path amplifies the near-null modes.
+    mesh22 = Mesh(np.asarray(devs[:4]).reshape(2, 2), ('x', 'y'))
+    in_sh = NamedSharding(mesh22, P(None, 'x', 'y'))
+    C_dev = jax.device_put(jnp.asarray(C), in_sh)
+    Z_dev = jax.device_put(jnp.asarray(Zrhs), in_sh)
+    Lc = factor_c_q(C_dev, mesh22, vertex_mu_L=0, n_rmu_logical=n_mu,
+                    solver_kind='replicated_cholesky')
+    zeta_chol = np.asarray(jax.device_get(
+        solve_zeta(Lc, Z_dev, mesh22, q_chunk_size=nq,
+                   solver_kind='replicated_cholesky', n_rmu_logical=n_mu)))
+    amp = float(np.linalg.norm(zeta_chol) / max(np.linalg.norm(zeta_rt_2x2), 1e-300))
+    # ζ_rt should reconstruct Z on the range of C: C ζ ≈ P_range Z.  With the
+    # designed spectrum the range is exactly the top-r subspace; the residual
+    # of the pseudo-inverse relation ‖C ζ − Z_range‖/‖Z_range‖ is ~ULP.
+    Z_range_res = 0.0
+    for iq in range(nq):
+        w, V = np.linalg.eigh(C[iq])
+        keep = w > rcond * w.max()
+        Pr = V[:, keep] @ np.conj(V[:, keep].T)
+        Zr = Pr @ Zrhs[iq]
+        Z_range_res = max(Z_range_res, float(
+            np.linalg.norm(C[iq] @ zeta_rt_2x2[iq] - Zr)
+            / max(np.linalg.norm(Zr), 1e-300)))
+    print(json.dumps({"worst_B": worst_B, "worst_zeta": worst_z,
+                      "kinds": kinds, "amp_chol_over_rt": amp,
+                      "range_residual": Z_range_res}))
+    return 0
+
+
+def _run_worker(tag: str, timeout: int = 600):
     env = dict(os.environ)
     env["JAX_PLATFORMS"] = "cpu"
     env["JAX_ENABLE_X64"] = "1"
@@ -113,14 +212,21 @@ def test_zeta_fit_charge_factor_solve_is_mesh_invariant():
     env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "")
                         + f" --xla_force_host_platform_device_count={_NDEV}").strip()
     res = subprocess.run(
-        [sys.executable, os.path.abspath(__file__), "worker"],
-        env=env, capture_output=True, text=True, timeout=600)
+        [sys.executable, os.path.abspath(__file__), tag],
+        env=env, capture_output=True, text=True, timeout=timeout)
     assert res.returncode == 0, (
-        f"worker failed rc={res.returncode}\nSTDOUT:\n{res.stdout}\n"
+        f"worker {tag} failed rc={res.returncode}\nSTDOUT:\n{res.stdout}\n"
         f"STDERR:\n{res.stderr}")
     line = [ln for ln in res.stdout.splitlines() if ln.strip().startswith("{")]
     assert line, f"no JSON from worker.\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
-    out = json.loads(line[-1])
+    return json.loads(line[-1])
+
+
+def test_zeta_fit_charge_factor_solve_is_mesh_invariant():
+    """factor_c_q + solve_zeta (charge, cholesky alternative) give
+    bit-identical L_q and ζ across CPU meshes {1×1, 1×2, 2×1, 2×2, 1×4,
+    4×1}."""
+    out = _run_worker("worker")
     if "skip" in out:
         pytest.skip(f"cross-mesh gate: {out['skip']}")
     assert out["worst_L"] <= _TOL, (
@@ -131,7 +237,34 @@ def test_zeta_fit_charge_factor_solve_is_mesh_invariant():
         f"{out['worst_zeta']:.3e} > {_TOL:g} (solver picks: {out['kinds']})")
 
 
+def test_zeta_fit_charge_rank_truncate_is_mesh_invariant_and_conditions():
+    """Rank-truncation (the DEFAULT charge ζ-solve): on a near-singular
+    over-complete CCT (κ≈1e13) the pseudo-inverse factor B and ζ are
+    bit-identical across CPU meshes, and rank-truncation conditions the
+    solve where plain Cholesky amplifies (‖ζ_chol‖/‖ζ_rt‖ ≫ 1)."""
+    out = _run_worker("worker_rt")
+    if "skip" in out:
+        pytest.skip(f"rank-truncate gate: {out['skip']}")
+    assert out["worst_B"] <= _TOL, (
+        f"rank-truncated factor B drifts across meshes: worst frob-rel "
+        f"{out['worst_B']:.3e} > {_TOL:g} (solver picks: {out['kinds']})")
+    assert out["worst_zeta"] <= _TOL, (
+        f"rank-truncated ζ drifts across meshes: worst frob-rel "
+        f"{out['worst_zeta']:.3e} > {_TOL:g} (solver picks: {out['kinds']})")
+    # ζ solves the pseudo-inverse relation on the range of C to the ULP floor.
+    assert out["range_residual"] <= 1e-8, (
+        f"rank-truncated ζ does not reconstruct Z on range(C): "
+        f"residual {out['range_residual']:.3e}")
+    # The whole point: plain Cholesky amplifies the near-null modes by the
+    # inverse of the ~1e-13 floored eigenvalues; rank-truncation drops them.
+    assert out["amp_chol_over_rt"] >= 1e3, (
+        f"rank-truncation did not condition the near-singular solve: "
+        f"‖ζ_chol‖/‖ζ_rt‖ = {out['amp_chol_over_rt']:.3e} (expected ≫ 1)")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "worker":
         sys.exit(_worker())
+    if len(sys.argv) > 1 and sys.argv[1] == "worker_rt":
+        sys.exit(_worker_rank_truncate())
     sys.exit(test_zeta_fit_charge_factor_solve_is_mesh_invariant() or 0)

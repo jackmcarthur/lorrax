@@ -860,6 +860,7 @@ def _replicate_charge_ok(nq: int | None, n_rmu: int | None) -> bool:
 def _resolve_solver_kind_charge(
     mesh_xy: Mesh, override: str = "auto",
     n_rmu: int | None = None, nq: int | None = None,
+    charge_zeta_solve: str = "cholesky",
 ) -> str:
     """Pick the charge-channel ζ-fit solver: fully-replicated dense
     Cholesky (mesh-invariant, the default for fit-size tiles) vs the
@@ -918,10 +919,17 @@ def _resolve_solver_kind_charge(
         return 'slate_cholesky'
 
     # auto (or unrecognised) → default policy.  Fit-size stacks factor with
-    # the mesh-invariant replicated dense Cholesky; larger stacks keep the
-    # distributed / sharded policy.
+    # the mesh-invariant replicated dense factor; larger stacks keep the
+    # distributed / sharded policy.  ``charge_zeta_solve == 'rank_truncate'``
+    # (the production default) selects the rank-revealing eigh pseudo-inverse
+    # on the replicated route — the only route it applies to (a full eigh
+    # cannot be block-cyclic), so above the replication cap it silently uses
+    # the distributed Cholesky (large stacks are not the near-singular
+    # fit-size regime the truncation cures).
     if _replicate_charge_ok(nq, n_rmu):
-        return 'replicated_cholesky'
+        return ('replicated_rank_truncate'
+                if charge_zeta_solve == 'rank_truncate'
+                else 'replicated_cholesky')
     return 'cusolvermp_cholesky' if is_2d else 'sharded_cholesky'
 
 
@@ -1026,6 +1034,7 @@ def _resolve_solver_kind(
     distributed_lu: str = "auto",
     n_rmu: int | None = None,
     nq: int | None = None,
+    charge_zeta_solve: str = "cholesky",
 ) -> str:
     """Single source of truth for the ``auto`` resolution.  Transverse
     channels (γ̃^i, μ_L≠0) take ``_resolve_solver_kind_transverse``;
@@ -1033,17 +1042,20 @@ def _resolve_solver_kind(
 
     ``n_rmu`` (logical centroid count) and ``nq`` (per-q factor batch =
     ``C_q.shape[0]``) let the charge resolver pick the mesh-invariant
-    replicated dense Cholesky for fit-size stacks; the ζ-fit caller passes
-    them (``isdf_fitting.fit_zeta_to_h5``).  A concrete ``solver_kind`` is
-    returned unchanged (so ``factor_c_q`` / ``solve_zeta`` re-resolving the
-    already-resolved kind need not repeat them).
+    replicated dense factor for fit-size stacks; ``charge_zeta_solve``
+    (``'rank_truncate'`` | ``'cholesky'``) then picks the rank-revealing
+    eigh pseudo-inverse vs Cholesky on that route.  The ζ-fit caller passes
+    all three (``isdf_fitting.fit_zeta_to_h5``).  A concrete ``solver_kind``
+    is returned unchanged (so ``factor_c_q`` / ``solve_zeta`` re-resolving
+    the already-resolved kind need not repeat them).
     """
     if solver_kind != 'auto':
         return solver_kind
     if int(vertex_mu_L) != 0:
         return _resolve_solver_kind_transverse(mesh_xy, distributed_lu)
     return _resolve_solver_kind_charge(
-        mesh_xy, distributed_cholesky, n_rmu=n_rmu, nq=nq)
+        mesh_xy, distributed_cholesky, n_rmu=n_rmu, nq=nq,
+        charge_zeta_solve=charge_zeta_solve)
 
 
 _replicated_chol_cache = {}  # replicated dense Cholesky kernel (keyed by shape)
@@ -1052,19 +1064,32 @@ _replicated_chol_cache = {}  # replicated dense Cholesky kernel (keyed by shape)
 def _factor_c_q_replicated(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
     zeta_ridge: float = 0.0,
+    charge_zeta_solve: str = 'cholesky',
+    zeta_rcond: float = 1e-10,
 ) -> jax.Array:
-    """Dense, fully REPLICATED Cholesky of the identity-padded charge CCT.
+    """Dense, fully REPLICATED factor of the identity-padded charge CCT.
 
-    Mesh-invariant by construction: the factorisation runs on the
-    fully-replicated LOGICAL block — one dense ``jnp.linalg.cholesky``
-    (potrf) per q on whole tiles — so L_q is bit-identical across device
-    counts and process grids, unlike the block-cyclic cuSolverMp potrf
-    whose partial-sum regrouping depends on ``(px, py)``.  This is the
-    single code path for both the ``'replicated_cholesky'`` auto pick
-    (fit-size n_μ on any mesh) and every single-device / 1-D-degenerate
-    mesh (where a dense factor is the only option).
+    Two selectable conditioners share this ONE replicated (mesh-invariant)
+    seam — ``charge_zeta_solve`` picks which factor is returned:
 
-    Ridge (two per-q scalar terms, so both mesh-invariant):
+    * ``'rank_truncate'`` (production default) — rank-revealing ``eigh``
+      pseudo-inverse factor ``B`` with ``B Bᴴ = C⁺`` (see the WHY note
+      inside).  The back-solve is a matmul ``ζ = B(BᴴZ)``.
+    * ``'cholesky'`` — the historical lower-triangular Cholesky factor
+      ``L`` with ``L Lᴴ = C+ridge``.  Back-solve is two triangular solves.
+      Bit-identical to the pre-rank-truncation code (the frozen contract);
+      it is the selectable ALTERNATIVE.
+
+    Mesh-invariant by construction for BOTH: the factorisation runs on the
+    fully-replicated LOGICAL block — one dense ``eigh`` / ``cholesky`` per q
+    on whole tiles — so the factor is bit-identical across device counts and
+    process grids, unlike the block-cyclic cuSolverMp potrf whose partial-sum
+    regrouping depends on ``(px, py)``.  This is the single code path for the
+    ``'replicated_cholesky'`` / ``'replicated_rank_truncate'`` auto picks
+    (fit-size n_μ on any mesh) and every single-device / 1-D-degenerate mesh
+    (where a dense factor is the only option).
+
+    Cholesky ridge (two per-q scalar terms, so both mesh-invariant):
 
       ridge = [ 1e-14·|tr(C)|  +  zeta_ridge·|tr(C)|/n ] · I
 
@@ -1074,31 +1099,32 @@ def _factor_c_q_replicated(
       With ``zeta_ridge == 0`` (the default) the factor is bit-identical to
       that path (the frozen-golden contract).
     * ``zeta_ridge`` (a fraction of the mean diagonal tr(C)/n, default 0) is
-      the OPT-IN Tikhonov term that CONDITIONS a near-singular CCT (n_μ
-      over-complete for the pair-density rank), so ζ = (C+εI)⁻¹Z stops
-      amplifying the ULP-level, mesh-dependent pair-density (C_q/Z_q)
-      difference — the per-rank shard dims select different cuBLAS GEMM
-      algorithms — into a grid-dependent V_q.  MoS2 6×6 (n_μ=1600) needs
-      ε≈1e-4 to bring cross-grid Re Σ_c agreement from O(10 eV) to ~10 meV.
-      It PERTURBS the physical result (the regularised answer is
-      ε-dependent on this ill-posed fit), hence opt-in.  ``LORRAX_ZETA_RIDGE``
-      overrides it for tuning.  See reports/gw_zeta_mesh_invariance_2026-07-20.
+      an OPT-IN Tikhonov term that CONDITIONS a near-singular CCT (n_μ
+      over-complete for the pair-density rank).  ``rank_truncate`` (the
+      default) is the PRINCIPLED cure that supersedes it — drop the near-null
+      directions instead of shifting them — so the ridge stays 0 there.
+      ``LORRAX_ZETA_RIDGE`` overrides ε for tuning.
 
     Factorise at the LOGICAL extent and re-embed identity in the pad block
-    (√1 = 1) — see :func:`_identity_pad_block_diagonal`.  Both trace terms
-    and the potrf regroup partial sums when the matrix extent changes, so
-    factorising at the logical (not padded) extent keeps the factor
-    pad-extent-invariant (the fixed-P invariance gate).
+    (√1 = 1 for L; B's pad block is likewise identity and is sliced away in
+    the back-solve) — see :func:`_identity_pad_block_diagonal`.  The factor
+    regroups partial sums when the matrix extent changes, so factorising at
+    the logical (not padded) extent keeps the factor pad-extent-invariant
+    (the fixed-P invariance gate).
     """
     import os as _os
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
     ridge_extra = float(_os.environ.get("LORRAX_ZETA_RIDGE", str(zeta_ridge)))
+    rcond = float(_os.environ.get("LORRAX_ZETA_RCOND", str(zeta_rcond)))
+    mode = str(charge_zeta_solve)
     out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     rep_sh = NamedSharding(mesh_xy, P())
-    key = (id(mesh_xy), int(nq), int(n_rmu), n_log, float(ridge_extra))
+    key = (id(mesh_xy), int(nq), int(n_rmu), n_log,
+           float(ridge_extra), mode, float(rcond))
     if key not in _replicated_chol_cache:
         _re = ridge_extra
+        _rc = rcond
         @partial(jax.jit, out_shardings=out_sh)
         def _fn(C):
             def _ridged_chol(C_log):
@@ -1112,12 +1138,34 @@ def _factor_c_q_replicated(
                 ridge_scalar = (1e-14 * tr + _re * tr / n_log)[:, None, None]
                 ridge = ridge_scalar * jnp.eye(n_log, dtype=C_log.dtype)[None, :, :]
                 return jnp.linalg.cholesky(C_log + ridge)
-            L_log = solve_at_logical(
-                _ridged_chol, n_log, (C,), pad_axes=(-2, -1))
-            # Pad-block factor = identity (√1 = 1): re-embed via the shared
-            # helper (no-op when n_log == n_rmu).
+
+            def _rank_trunc_factor(C_log):
+                # WHY THIS FEATURE EXISTS: the charge CCT near-singularizes when
+                # n_μ over-completes the pair-density rank (κ~1e13); plain
+                # Cholesky then amplifies ULP/mesh/nband roundoff into O(1) V_q
+                # errors that GN-PPM magnifies to tens of eV.  Rank-truncation
+                # DROPS eigenvalues < zeta_rcond·λ_max (the near-null
+                # directions) → a conditioned, mesh-invariant ζ = C⁺Z.
+                C_log = jax.lax.with_sharding_constraint(C_log, rep_sh)
+                lam, V = jnp.linalg.eigh(C_log)      # Hermitian-SPD, λ ascending
+                lam_max = lam[..., -1:]              # (nq,1) largest λ per q
+                keep = lam > (_rc * lam_max)         # near-null cut
+                # B = V·diag(1/√λ_kept) ⇒ B Bᴴ = Σ_{keep} vᵢvᵢᴴ/λᵢ = C⁺.
+                # Double-``where`` keeps rsqrt off the dropped (tiny/≤0) modes.
+                inv_sqrt = jnp.where(
+                    keep, jax.lax.rsqrt(jnp.where(keep, lam, 1.0)), 0.0)
+                return V * inv_sqrt[..., None, :].astype(V.dtype)
+
+            factor_fn = (_rank_trunc_factor if mode == 'rank_truncate'
+                         else _ridged_chol)
+            F_log = solve_at_logical(
+                factor_fn, n_log, (C,), pad_axes=(-2, -1))
+            # Pad-block factor = identity (√1 = 1 for L; for B the pad block
+            # is sliced off in the back-solve, so identity is just a
+            # non-singular filler): re-embed via the shared helper (no-op
+            # when n_log == n_rmu).
             return _identity_pad_block_diagonal(
-                L_log, n_rmu_logical=n_log, mesh_xy=mesh_xy)
+                F_log, n_rmu_logical=n_log, mesh_xy=mesh_xy)
         _replicated_chol_cache[key] = _fn
     return _replicated_chol_cache[key](C_q)
 
@@ -1130,6 +1178,7 @@ def factor_c_q(
     n_rmu_logical: int | None = None,
     solver_kind: str = 'auto',
     zeta_ridge: float = 0.0,
+    zeta_rcond: float = 1e-10,
 ) -> jax.Array:
     """
     Compute system-matrix L_q from CCT matrix.
@@ -1194,13 +1243,18 @@ def factor_c_q(
             ``None`` (default) skips the identity-pad: input == output
             extent and the matrix is assumed to be PSD on its full
             extent (legacy mesh-divisible path).
+        zeta_rcond: rank-truncation cutoff for the
+            ``'replicated_rank_truncate'`` charge factor (drop
+            eigenvalues < ``zeta_rcond·λ_max``).  Ignored by the Cholesky
+            paths.  ``LORRAX_ZETA_RCOND`` overrides it for tuning.
 
     Returns:
         L_q: ``(nq, n_rmu, n_rmu)`` at PADDED extent, sharded
-        ``P(None, 'x', 'y')``.  Cholesky factor for
-        ``vertex_mu_L == 0`` (block-diagonal ``[L_log 0; 0 I_pad]``
-        when n_rmu_logical < n_rmu); passthrough identity-padded CCT
-        for ``vertex_mu_L ≠ 0``.
+        ``P(None, 'x', 'y')``.  For ``vertex_mu_L == 0``: the Cholesky
+        factor (block-diagonal ``[L_log 0; 0 I_pad]``) for the cholesky
+        paths, or the rank-revealing pseudo-inverse factor ``B``
+        (``B Bᴴ = C⁺``) for ``'replicated_rank_truncate'``; passthrough
+        identity-padded CCT for ``vertex_mu_L ≠ 0``.
     """
     nq, n_rmu, n_rmu2 = C_q.shape
     assert n_rmu == n_rmu2, f"C_q must be square, got {n_rmu} x {n_rmu2}"
@@ -1229,18 +1283,22 @@ def factor_c_q(
     Pr = mesh_xy.shape['x']
     Pc = mesh_xy.shape['y']
 
-    # Replicated dense Cholesky — the mesh-INVARIANT charge factor.  Fires
-    # for the 'replicated_cholesky' auto pick (fit-size n_μ on any mesh) AND
-    # for any single-device / 1-D-degenerate mesh, where a dense factor is
-    # the only option (the 2D-blocked shard_map kernel needs a true 2-D
-    # mesh; cuSolverMp needs one process per device).  ONE code path — see
-    # _factor_c_q_replicated for why L_q is grid-agnostic.  On 1×1 meshes
-    # this also sidesteps a JAX 0.9 shard_map+scan carry-type failure in the
-    # blocked kernel.
-    if (solver_kind == 'replicated_cholesky'
+    # Replicated dense factor — the mesh-INVARIANT charge factor.  Fires for
+    # the 'replicated_cholesky' / 'replicated_rank_truncate' auto picks
+    # (fit-size n_μ on any mesh) AND for any single-device / 1-D-degenerate
+    # mesh, where a dense factor is the only option (the 2D-blocked shard_map
+    # kernel needs a true 2-D mesh; cuSolverMp needs one process per device).
+    # ONE code path — see _factor_c_q_replicated for why the factor is
+    # grid-agnostic and for the rank_truncate vs cholesky choice.  On 1×1
+    # meshes this also sidesteps a JAX 0.9 shard_map+scan carry-type failure
+    # in the blocked kernel.
+    if (solver_kind in ('replicated_cholesky', 'replicated_rank_truncate')
             or mesh_xy.devices.size == 1 or (Pr == 1 and Pc == 1)):
+        _mode = ('rank_truncate' if solver_kind == 'replicated_rank_truncate'
+                 else 'cholesky')
         return _factor_c_q_replicated(
-            C_q, mesh_xy, n_rmu_logical, zeta_ridge=zeta_ridge)
+            C_q, mesh_xy, n_rmu_logical, zeta_ridge=zeta_ridge,
+            charge_zeta_solve=_mode, zeta_rcond=zeta_rcond)
 
     if solver_kind == 'cusolvermp_cholesky':
         # Distributed potrf on C_q at P(None,'x','y'); returns the raw
@@ -1418,10 +1476,14 @@ def solve_zeta(
                      blocked chol + per-q triangular solve), 'lu' (per-q
                      pivoted-LU for transverse channels),
                      'cusolvermp_cholesky' (distributed potrs via FFI),
-                     or 'cusolvermp_lu' (distributed getrf+getrs via FFI
-                     for the transverse channels).  'replicated_cholesky'
-                     and 'sharded_cholesky' take the same back-solve branch
-                     below (neither matches the cuSolverMp/scalapack guards).
+                     'cusolvermp_lu' (distributed getrf+getrs via FFI
+                     for the transverse channels), or
+                     'replicated_rank_truncate' (charge rank-truncation:
+                     ``L_q`` is the pseudo-inverse factor B, back-solve is
+                     the matmul ζ = B(BᴴZ)).  'replicated_cholesky',
+                     'sharded_cholesky' and 'replicated_rank_truncate' all
+                     take the general shard_map back-solve branch below
+                     (none matches the cuSolverMp/scalapack guards).
         n_rmu_logical: Logical centroid count.  When given and smaller
                      than the padded input extent, every per-q dense
                      solve (pivoted LU AND the per-q triangular
@@ -1582,12 +1644,21 @@ def solve_zeta(
     # well-conditioned modes.
     LU_RIDGE = 1e-12
 
+    # ``use_rank_trunc`` selects the matmul back-solve for the charge
+    # rank-truncation factor: ``L_q`` is then the pseudo-inverse factor B
+    # (B Bᴴ = C⁺) from ``_factor_c_q_replicated``, so ζ = C⁺Z = B(BᴴZ) is
+    # two matmuls, NOT a triangular solve (C⁺ is rank-deficient — its
+    # inverse does not exist, so the tri-solve would be wrong).
+    use_rank_trunc = (solver_kind == 'replicated_rank_truncate')
+
     # Cache key for solve function (includes q_chunk_size and padded size).
-    # ``use_lu`` partitions the cache so the Cholesky and LU compiles
-    # don't collide on the same key.  ``n_log`` is closure state of the
-    # kernels below (the slice extent), so it keys the cache too.
+    # ``use_lu`` / ``use_rank_trunc`` partition the cache so the three
+    # back-solve compiles don't collide on the same key.  ``n_log`` is
+    # closure state of the kernels below (the slice extent), so it keys the
+    # cache too.
     cache_key = ('solve_from_L', id(mesh_xy), nq, n_rmu, n_log,
-                 n_zchunk_padded, q_chunk_size, bool(use_lu))
+                 n_zchunk_padded, q_chunk_size, bool(use_lu),
+                 bool(use_rank_trunc))
 
     def _ridge_indef_solve(L: jax.Array, Z: jax.Array) -> jax.Array:
         """Solve (L + ε·tr(L)/n · I) · ζ = Z via pivoted LU at the
@@ -1621,11 +1692,24 @@ def solve_zeta(
                 L_log.conj().T, y, lower=False)
         return solve_at_logical(_chol_backsolve, n_log, (L,), Z)
 
+    def _pinv_matmul_logical(B: jax.Array, Z: jax.Array) -> jax.Array:
+        """Charge rank-truncation back-solve at the LOGICAL μ extent:
+        ζ = C⁺Z = B(BᴴZ), two matmuls (B is the pseudo-inverse factor,
+        B Bᴴ = C⁺).  ``solve_at_logical`` slices to the logical block
+        (dropping the identity pad — never inverted, so no LU/tri
+        amplification) and zero-refills ζ's pad rows."""
+        def _mm(B_log, Z_log):
+            return B_log @ (B_log.conj().T @ Z_log)
+        return solve_at_logical(_mm, n_log, (B,), Z)
+
     if cache_key not in _solve_cache:
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=(P(None, None), P(None, ('x', 'y'))),
                  out_specs=P(None, ('x', 'y')))
         def _sharded_cho_solve(L: jax.Array, Z_cols: jax.Array) -> jax.Array:
+            if use_rank_trunc:
+                # Charge C⁺ pseudo-inverse factor: matmul back-solve.
+                return _pinv_matmul_logical(L, Z_cols)
             if use_lu:
                 # Indefinite CCT^μ: pivoted-LU back-solve with ridge.
                 return _ridge_indef_solve(L, Z_cols)
@@ -1637,6 +1721,10 @@ def solve_zeta(
                  out_specs=P(None, None, ('x', 'y')))
         def _sharded_cho_solve_batch(L_batch: jax.Array, Z_batch: jax.Array) -> jax.Array:
             """Solve (B_q, n_rmu, n_rmu) @ (B_q, n_rmu, n_cols) -> (B_q, n_rmu, n_cols)"""
+            if use_rank_trunc:
+                # C⁺ factor matmul back-solve, per-q vmapped (same reshard
+                # plan as the Cholesky/LU paths so the caller is agnostic).
+                return jax.vmap(_pinv_matmul_logical)(L_batch, Z_batch)
             if use_lu:
                 # ``jnp.linalg.solve`` is natively batched on the leading
                 # axis and dispatches one LU factorization per q.  Same
