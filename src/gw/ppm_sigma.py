@@ -69,6 +69,8 @@ from .ppm_windows import (
     _build_windows_for_branch,
     _materialize_window_mask_B,
     _to_host_np,
+    _CROSSING_A_MAX,
+    crossing_regularization_floor,
 )
 from .ppm_tau_kernel import _get_sigma_tau_kernel
 from .ppm_accumulators import (
@@ -606,6 +608,20 @@ def compute_sigma_c_ppm_omega_grid(
     # Scalar knobs — direct reads off the validated frozen PPMConfig.
     regularization_width_ry = float(ppm_cfg.regularization_ev) / RYD_TO_EV
     edge_factor = float(ppm_cfg.window_edge_factor)
+
+    # Crossing-quadrature conditioning floor: raise ξ if the Σ_c ω-grid is wide
+    # enough that the HGL core window would be ill-conditioned (Σ|α| ~ 1e5,
+    # amplifying the mesh-sensitive per-τ operand → device-dependent Σ_c blow-up
+    # + O(1e3) eV Im).  See ppm_windows.crossing_regularization_floor.
+    omega_max_ry = float(np.max(np.abs(np.asarray(omega_values_ry, dtype=np.float64))))
+    xi_floor = crossing_regularization_floor(omega_max_ry, edge_factor)
+    if regularization_width_ry < xi_floor:
+        print_fn(
+            f"  Σc crossing conditioning: ξ raised "
+            f"{regularization_width_ry * RYD_TO_EV:.3f} → {xi_floor * RYD_TO_EV:.3f} eV "
+            f"(A_core capped at {_CROSSING_A_MAX:.0f}; the requested ξ would make the "
+            f"HGL crossing quadrature ill-conditioned)")
+        regularization_width_ry = xi_floor
     omega_batch_size = int(ppm_cfg.omega_batch_size)
     omega_accumulation = ppm_cfg.omega_accumulation
     fermi_reference = ppm_cfg.fermi_reference

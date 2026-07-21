@@ -44,6 +44,41 @@ from .minimax_screening import (
 )
 
 
+# ---------------------------------------------------------------------------
+#  Crossing-quadrature conditioning (the load-bearing fix for the conduction
+#  Σ_c instability — reports/gw_ppm_sigma_regularization_2026-07-20).
+#
+#  The HGL "core" crossing window fits its regularization target with a minimax
+#  sin-sum over the dimensionless bandwidth  A_core = 2·T/ξ = 2·ω_max/ξ + 2·edge
+#  (T = ω_max + edge·ξ).  The sin-fit is well-conditioned only for MODEST A: the
+#  exact solver's weights Σ|α_hat| jump from ~2–3 at A≲24 to ~3e4 (A=83, ξ=0.25)
+#  and ~2e5 (A=43, ξ=0.5) — an ill-conditioning that is *not even monotone in ξ*.
+#  Those O(1e4–1e5) weights are near-cancelling, so they amplify ANY perturbation
+#  of the per-τ operand σ(τ) by Σ|α|; σ(τ) carries the (large, ~1e4 in the ISDF
+#  centroid basis, and mesh-sensitive) screened W, so on a multi-device mesh the
+#  amplified perturbations do NOT cancel → Σ_c blows up to O(1e5) eV (device/mesh
+#  dependent, gap-inverting) with O(1e3) eV imaginary parts even on one device.
+#
+#  Fix: floor ξ so A_core ≤ _CROSSING_A_MAX (well-conditioned regime).  ξ is a
+#  *broadening*; the QP self-energy is evaluated off-pole (at E_DFT, away from the
+#  plasmon poles), so a coarser near-pole broadening does not move the QP energies.
+#  The floor scales with ω_max, so it only engages when the Σ_c ω-grid is wide
+#  enough to force an ill-conditioned crossing; a narrow grid keeps the user's ξ.
+_CROSSING_A_MAX = 24.0     # dimensionless bandwidth ceiling (Σ|α_hat| ~ 2–3 below)
+
+
+def crossing_regularization_floor(omega_max_ry: float, edge_factor: float) -> float:
+    """Minimum ξ (Ry) so the HGL core bandwidth A_core ≤ _CROSSING_A_MAX.
+
+    A_core = 2·ω_max/ξ + 2·edge ≤ A_max  ⇔  ξ ≥ 2·ω_max/(A_max − 2·edge).
+    Returns 0.0 when no floor is meaningful (degenerate edge/ω_max).
+    """
+    denom = _CROSSING_A_MAX - 2.0 * float(edge_factor)
+    if denom <= 1.0 or float(omega_max_ry) <= 0.0:
+        return 0.0
+    return 2.0 * float(omega_max_ry) / denom
+
+
 @dataclass(frozen=True)
 class _SigmaWindow:
     name: str
