@@ -260,15 +260,27 @@ def main():
     n_points = int(np.prod(fft_grid))
     mesh, mesh_axis = _build_mesh(args, n_points)
 
-    # Decide orbit vs non-orbit. Default heuristic: orbit if --orbit explicit
-    # OR WFN has > 1 spatial sym op AND --no-orbit not set.
-    orbit_aware = args.orbit or (int(wfn.ntran) > 1 and not args.no_orbit)
+    # Decide orbit vs non-orbit.  Unless --no-orbit, build the closure sym
+    # group with charge-density point-group recovery, then enable orbit mode
+    # when it has more than the identity.  Gating on the *recovered* group
+    # (not raw ``wfn.ntran``) makes orbit closure the default for any WFN
+    # whose density carries point-group symmetry — including reduced WFNs
+    # (non-collinear SOC stores only {E, σ_h}; a nosym run stores {E}) whose
+    # stored ntran understates the crystal symmetry and would otherwise leave
+    # ⟨nk|V_H|nk⟩ C3-broken across the k-star.
     R = Rinv = tau = None
     n_sym = 1
-    if orbit_aware:
+    orbit_aware = False
+    if not args.no_orbit:
         from .orbit_syms import build_real_space_syms
-        R, Rinv, tau = build_real_space_syms(wfn, sym)
+        R, Rinv, tau = build_real_space_syms(
+            wfn, sym, charge_density=charge_density)
         n_sym = int(R.shape[0])
+        orbit_aware = args.orbit or n_sym > 1
+    if not orbit_aware:
+        R = Rinv = tau = None
+        n_sym = 1
+    if orbit_aware:
         # In orbit mode the SAMPLED count is M_cand; the OUTPUT after unfold
         # may inflate by up to n_sym. Adjust kmeans target so the final
         # unfolded centroid count is roughly N_c.
