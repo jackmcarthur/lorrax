@@ -1,14 +1,19 @@
-# BSE module status — agent C, 2026-04-28
+# BSE module status — last revised 2026-07-22
 
-> **If you are about to run a LORRAX-vs-BGW absorption comparison, stop
-> and read [BGW_COMPARE.md](BGW_COMPARE.md) first.** It enumerates six
-> conventions (dipole operator, eqp source, head injection, SOC band
-> counting, n_occ resolution, broadening/iter-count) that *every*
-> comparison must satisfy. Skipping any of them produces silent O(1)
-> errors that look plausible. The cookbook there has the exact command
-> sequence that reproduces the validated 8×8 Si Haydock comparison.
+> **Running a LORRAX-vs-BGW absorption comparison?** Read
+> [BGW_COMPARE.md](BGW_COMPARE.md) first. It enumerates six conventions
+> (dipole operator, eqp source, head injection, SOC band counting, n_occ
+> resolution, broadening/iter-count) that *every* comparison must satisfy.
+> Skipping any produces silent O(1) errors that look plausible.
+>
+> **Running an arbitrary-Q exciton bandstructure?** Read
+> [EXCITON_BANDS.md](EXCITON_BANDS.md) first. Both failures in that pipeline
+> to date were silent — run completes, on-grid gates pass, bands wrong by eV.
+> It documents the two traps, how to gate off-grid, and the sizing rules.
 
 ## Modules
+
+Absorption / eigensolvers (the 2026-04 arc, validated vs BGW below):
 
 | File | Role | Status |
 |---|---|---|
@@ -16,11 +21,25 @@
 | `bse_simple.py`         | plain-jit (μ,ν) matvec — XLA partitioner, no shard_map | fastest matvec, but opt-in via `--matvec-kind=simple`; the solver default is `ring`, not this (bse_lanczos.py:159) |
 | `bse_ring_comm.py`      | shard_map + ppermute / all-gather matvec | the DEFAULT matvec (`--matvec-kind=ring`); also the memory-tight choice |
 | `bse_lanczos.py`        | `solve_bse_sharded` Lanczos / block-Lanczos / convergence-driven | works; ghost eigenvalues at high N without full reorth |
-| `bse_io.py`             | restart-bundle reader, `write_eigenvectors_stream` | writer is BGW-compliant (see "Index ordering" below) |
-| `absorption_common.py`  | h5 readers + Lorentzian + Kramers-Kronig + BGW-format `.dat` writers | new |
-| `absorption_eigvecs.py` | ε₂(ω) via Σ_S |⟨0\|r̂\|S⟩|²·L (sum-over-states) | new |
-| `absorption_haydock.py` | ε₂(ω) via continued fraction on (α_n, β_n) recurrence, no eigvecs | new — *the* method to use vs BGW |
+| `bse_stack_matvec.py`   | batched trial-stack matvec, one T-tensor regardless of `n_trials` | working |
+| `bse_nontda.py`         | structure-preserving non-TDA (full-BSE) eigensolver | working |
+| `bse_feast.py`          | FEAST contour-integration eigensolver | see `context/feast_accuracy_notes.md` |
+| `bse_kpm.py`            | KPM Chebyshev moments → BSE density of states | working |
+| `bse_pseudopoles.py`    | FEAST-based pseudopole construction, density-biased seeds | working |
+| `bse_io.py`             | restart-bundle reader, padding utils, `write_eigenvectors_stream` | writer is BGW-compliant (see "Index ordering" below); also `pad_W_R_to_grid` / `bse_k_grid` coarse→fine |
+| `absorption_common.py`  | h5 readers + Lorentzian + Kramers-Kronig + BGW-format `.dat` writers | working |
+| `absorption_eigvecs.py` | ε₂(ω) via Σ_S \|⟨0\|r̂\|S⟩\|²·L (sum-over-states) | working |
+| `absorption_haydock.py` | ε₂(ω) via continued fraction on (α_n, β_n), no eigvecs | *the* method to use vs BGW |
 | `eigenvectors.h5.spec`  | BGW spec, kept verbatim | reference |
+
+Finite-/arbitrary-Q and screened-W (the 2026-07 arc — see EXCITON_BANDS.md):
+
+| File | Role | Status |
+|---|---|---|
+| `vq_interp.py`          | arbitrary-Q bare-exchange tile `V_Q`, F-scheme + b26p | working; `build_vq_evaluator` is the entry point |
+| `exciton_bands.py`      | `E_S(Q)` along a Q path, finite-momentum TDA | working; single-compile `lax.scan`, `--extra-q` for the symmetry gate |
+| `w_omega_chain.py`      | full-frequency `W_q(ω)` via one block-Lanczos chain | working |
+| `bse_w_exact.py`        | exact `W_c(ω)` by shifted solves on the non-TDA RPA resolvent | cross-validation reference |
 
 ## Index ordering — read this BEFORE comparing to BGW
 
@@ -121,3 +140,36 @@ LORRAX_NGPU=1 lxrun python3 -u -m bse.absorption_eigvecs \
 - For exact per-state agreement with BGW (sub-3 meV eigenvalues, >95% per-state density): increase ISDF centroid count or implement symmetry-adapted ISDF.
 - Haydock's `‖d‖²` factor in continued fraction matches BGW's `mmts%norm = ||d||²` (verified `BSE/haydock.f90:536`); pref `16π²/(V·N_k·n_spin·n_spinor)` matches `BSE/absh.f90:46`.
 - All comparisons performed with `use_momentum` (bare p̂, divided by ΔE_DFT). For full-velocity comparison BGW would need `use_velocity` + WFNq run.
+
+## Handoff notes, 2026-07-22
+
+Cross-cutting facts established during the arbitrary-Q work that are easy to
+re-derive the hard way.
+
+**One JAX process per GPU, always.** This is the LORRAX process model, chosen
+because it is what research clusters prefer. The distributed-linalg FFIs
+(cuSOLVERMp, cuBLASMp, SLATE) requiring one process per device is a *match*,
+not a constraint to work around. Single-process multi-GPU is not a supported
+geometry — the cuSOLVERMg backend built on it has been deleted. Single-*device*
+runs are unrelated and must keep working: gates must not require 16 GPUs.
+
+**One eigh dispatcher.** `ffi.common.dispatch.dispatch_eigh` is the single
+backend switch (`auto|off|cusolvermp|slate`) for both `vq_interp`'s coarse
+`C_q` and `bandstructure/bse_setup`'s per-q `fH_q`. `vq_interp._eigh_backend`
+was deleted; do not reintroduce a parallel dispatcher. Native batched is the
+default — the FFI arms are exact but 11–41× slower per matrix and do not
+reduce the high-water mark (see EXCITON_BANDS.md § Memory).
+
+**Silent-failure pattern, twice now.** Both bugs in this arc kept the run
+alive and the usual gates green: the Galerkin Gram cross-term loss (Cholesky
+still succeeds; only `ctilde` orthogonality moves), and the charge ζ-solve
+silently downgrading from `rank_truncate` to Cholesky above a hardcoded
+replication cap (produced ζ 4.5× too large; now raises instead, and the cap
+honours `LORRAX_ZETA_REPLICATE_CAP_GIB`). When adding a knob or a fallback,
+make the unsupported path *refuse*; a config key that is parsed and quietly
+ignored has cost this project multiple days.
+
+**Gate metrics must move when the thing under test moves.** An on-grid
+`|Δε_c|` gate that returns a bit-identical number across two different fH
+windows is not measuring the window. Before trusting a gate, perturb the
+input and confirm the metric responds.

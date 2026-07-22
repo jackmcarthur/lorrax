@@ -41,7 +41,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/solvers/` | Davidson, Lanczos, Chebyshev, pseudobands | Iterative eigensolvers |
 | `src/centroid/kmeans_cli.py` / `src/centroid/kmeans_isdf.py` | ISDF centroid generation — `kmeans_cli` is the CLI (`python -m centroid.kmeans_cli`); `kmeans_isdf` is the algorithm library, no `__main__` | Centroid count / quality |
 | `src/psp/` | Pseudopotentials, dipole / kin+ion generators | `dipole.h5` or `kin_ion.h5` issues |
-| `src/bse/` | Bethe–Salpeter equation (experimental) | Optical spectra |
+| `src/bse/` | Bethe–Salpeter equation | Optical spectra; exciton dispersion `E_S(Q)` at arbitrary Q. Read `src/bse/STATUS.md`, then `BGW_COMPARE.md` (absorption) or `EXCITON_BANDS.md` (arbitrary Q) before running either |
 | `src/bandstructure/` | H-matrix interpolation (experimental) | Band-structure plots |
 
 ## Key documentation
