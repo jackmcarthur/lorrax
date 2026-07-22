@@ -48,6 +48,8 @@ def make_bse_h_tilde(matvec, data, e_center, half_width):
     eps_v = data["eps_v"]
     W_R = data["W_R"]
     V_q0 = data["V_q0"]
+    M_X = data["M_X"]  # hoisted V-term pair-amps (audit P3)
+    M_Y = data["M_Y"]
 
     dtype_real = eps_c.dtype
     e_center_jnp = jnp.asarray(e_center, dtype=dtype_real)
@@ -55,7 +57,7 @@ def make_bse_h_tilde(matvec, data, e_center, half_width):
 
     @jax.jit
     def apply_h_tilde(x):
-        hx = matvec(x, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+        hx = matvec(x, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
         return (hx - e_center_jnp * x) * inv_hw
 
     return apply_h_tilde

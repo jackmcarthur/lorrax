@@ -133,3 +133,25 @@ def bispinor_session(tmp_path_factory):
     return _run_session_case(
         tmp_path_factory, "bispinor_debug", "bispinor_test.in",
         "sigma_diag_bispinor_test.dat")
+
+
+@pytest.fixture(scope="session")
+def bse_dense_state(gnppm_session, tmp_path_factory):
+    """Padded, head-injected (px=py=1) BSE arrays from the gnppm restart.
+
+    Copies the gnppm session run dir (incl. ``tmp/`` restart state) once, then
+    loads a 2v2c BSE subset via ``bse_io._load_ring_subset`` — a plain library
+    call, no driver subprocess, so the session state is never mutated. MoS2
+    3×3×1 ⇒ nk=9 ⇒ N = nc·nv·nk = 36. Shared by the dense-reference gate and
+    the trial-stack matvec gate.
+    """
+    from bse import bse_io
+
+    run_dir = harness.copy_fixture(
+        harness.REG / "gnppm_debug",
+        tmp_path_factory.mktemp("bse_dense") / "gnppm_debug",
+        tmp_from=gnppm_session.run_dir)
+    input_path = str(run_dir / "gnppm_test.in")
+    restart = bse_io._find_restart_file(input_path)
+    return bse_io._load_ring_subset(
+        restart, n_val=2, n_cond=2, px=1, py=1, input_file=input_path)

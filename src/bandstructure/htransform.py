@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import argparse
 import numpy as np
 
@@ -40,11 +41,28 @@ def _build_mesh_xy() -> Mesh:
 _accum_G_cache: dict = {}
 
 
+# Ceiling on ONE streamed ψ band-chunk in the Galerkin build.
+#
+# ``iter_psi_rchunk_bandwise`` is called below with the whole r-axis
+# (r0 = 0, r_end = meta.n_rtot), so the only lever on the chunk's size is the
+# band count, and ``to_rchunk`` materialises the chunk as a single REPLICATED
+# (nk, bc, nspinor, n_rtot) complex128 array — it is not sharded by the mesh
+# (verified: the same allocation appears on a 1×1 and a 2×2 mesh).  One band of
+# it costs nk·nspinor·n_rtot·16 B, which is 0.81 GB/band on the converged MoS2
+# reference (nk=144, n_rtot=174 960).  So the historical fixed default of 64
+# bands per chunk asks for 51.6 GB, and even a 48-band window asks for 38.7 GB
+# — enough to OOM an A100-80GB once the BSE/GW restart tensors are resident.
+# The cap makes the default size-aware; band chunking is a pure accumulation
+# split (G = Σ_chunks Q Qᴴ), so this changes memory only, never the result.
+_GALERKIN_CHUNK_MAX_BYTES = 6 * 1024 ** 3
+
+
 def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              band_range: tuple[int, int],
                              rtol: float = 1e-8, log_fn=None,
                              band_chunk_size: int = 64,
-                             bispinor: bool = False):
+                             bispinor: bool = False,
+                             return_full_proj: bool = False):
     """Galerkin projection using gw_jax shared loaders.
 
     Single ('x','y') mesh throughout. ψ at centroids comes from
@@ -59,10 +77,22 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         mesh_xy: 2D ``('x','y')`` device mesh.
         band_range: ``(b_start, b_end)`` — bands included in the SVD basis.
         rtol: SVD truncation tolerance (relative to s.max()).
-        band_chunk_size: bands per FFT chunk inside the loader.
+        band_chunk_size: bands per FFT chunk inside the loader.  Treated as a
+            CEILING, not a fixed size: it is lowered so one streamed ψ chunk
+            ``(nk, bc, nspinor, n_rtot)`` complex128 stays under
+            ``_GALERKIN_CHUNK_MAX_BYTES`` (see below).
         bispinor: passed through to ``load_centroids_band_chunked``.
+        return_full_proj: also return the full-r α-basis projector
+            ``W_proj = L⁻¹ diag(1/s) U^H`` (rank, nk·nb), replicated.  For
+            any streamed ψ chunk (nk, bc, ns, r_c) restricted to the SAME
+            band window, ``B_full[α, s·r_c] = W_proj_bc @ ψ_flat`` evaluates
+            the α-basis on the full r-grid, so
+            ``ψ_{n,q}(r) = Σ_α c_{n,q}[α] B_full[α](r)`` reconstructs ψ at
+            ANY q off the grid — the per-Q ζ-refit consumer
+            (``bse.vq_interp.refit_vq``).
 
-    Returns ``(S, ctilde)`` matching the legacy contract.
+    Returns ``(S, ctilde, B_at_mu)`` (legacy contract), plus ``W_proj``
+    appended when ``return_full_proj``.
     """
     import time
     if log_fn is None:
@@ -77,9 +107,16 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     rep = NamedSharding(mesh_xy, P())               # fully replicated
     grid_xy = NamedSharding(mesh_xy, P('x', 'y'))   # (rank, rank) face
 
+    # Size the band chunk to the ψ box rather than trusting a fixed default.
+    bytes_per_band = nk * nspinor * int(meta.n_rtot) * 16
+    bc_cap = max(1, int(_GALERKIN_CHUNK_MAX_BYTES // max(1, bytes_per_band)))
+    band_chunk_size = max(1, min(int(band_chunk_size), bc_cap, nb))
+
     log_fn(
         f"  Streaming Galerkin: nk={nk}, nb={nb}, nr={meta.n_rtot}, "
-        f"n_mu={n_mu}, mesh=({mesh_xy.shape['x']}x{mesh_xy.shape['y']})"
+        f"n_mu={n_mu}, mesh=({mesh_xy.shape['x']}x{mesh_xy.shape['y']}), "
+        f"band_chunk={band_chunk_size} "
+        f"({bytes_per_band * band_chunk_size / 1024**3:.2f} GB/chunk)"
     )
 
     # ── 1. Load ψ at centroids (band-sharded internally on 'y') ──
@@ -95,7 +132,12 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # FFI seam: today gather to replicated, run dense SVD on each device
     # (small for our sizes); swap for distributed SVD when n_μ scales up.
     t1 = time.time()
-    A = psi_rmu_Y.reshape(nk * nb, nspinor * n_mu)
+    # Trim the sharding-pad: load_centroids_band_chunked pads the n_μ axis to a
+    # multiple of the device count, but the TRUE centroid count is
+    # ``n_mu = centroid_indices.shape[0]`` (= the restart's n_rmu).  Without this
+    # trim a centroid count not divisible by the device count (e.g. 1496 on 16
+    # GPU → padded 1504) reshape-crashes here.  No-op when already divisible.
+    A = psi_rmu_Y[..., :n_mu].reshape(nk * nb, nspinor * n_mu)
     A = jax.device_put(A, rep)
     del psi_rmu_Y
 
@@ -107,13 +149,35 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     U, s, Vh = _svd_replicated(A)
     del A
     s_host = np.asarray(s)
-    rank = int((s_host > s_host.max() * rtol).sum())
+    rank_raw = int((s_host > s_host.max() * rtol).sum())
+    # Mesh-align the retained rank.  G, its Cholesky factor, ctilde and fH all
+    # live on a (rank, rank) face sharded P('x', 'y'), so ``rank`` has to divide
+    # BOTH mesh axes.  Whenever the ψ-at-centroids matrix is genuinely
+    # rank-deficient — nk·nb at or above the ISDF column count, which is exactly
+    # the regime the band-window capacity rule is about — ``rank_raw`` is an
+    # arbitrary integer and the first ``device_put`` onto that face raises
+    #   "global size of its dimension 0 should be divisible by 4 ... equal to 4570".
+    # Round DOWN to the aligned rank: the dropped directions are the ones
+    # sitting at the rtol threshold (σ/σ_max ~ 1e-8), i.e. numerically the same
+    # decision ``rtol`` already makes, one notch tighter.
+    align = math.lcm(int(mesh_xy.shape['x']), int(mesh_xy.shape['y']))
+    rank = max(align, (rank_raw // align) * align)
+    rank = min(rank, int(s_host.size))
     U = U[:, :rank]
     s = s[:rank]
     Vh = Vh[:rank, :]                        # (rank, ns·n_μ), keep for centroid recovery
-    log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}): rank={rank}, "
-           f"σ_max={float(s_host[0]):.3e}, σ_min/{rtol:.0e}={float(s_host[rank-1]):.3e} "
+    log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}): rank={rank}"
+           + (f" (rtol rank {rank_raw} → mesh-aligned to {align})"
+              if rank != rank_raw else "")
+           + f", σ_max={float(s_host[0]):.3e}, "
+           f"σ_min/{rtol:.0e}={float(s_host[rank-1]):.3e} "
            f"({time.time()-t1:.2f}s)")
+    if rank_raw < nk * nb:
+        log_fn(f"  [warn] ψ-at-centroids is RANK-DEFICIENT: {nk*nb} states vs "
+               f"numerical rank {rank_raw} (nspinor·n_μ = {nspinor*n_mu}).  The "
+               f"Galerkin basis cannot span the band window — fH energy "
+               f"recovery will degrade.  Capacity rule: nk·nb < rank(ψ_μ) "
+               f"≤ nspinor·n_μ, i.e. nb < {rank_raw/nk:.2f} here.")
 
     coeffs = U * s[None, :]                  # (nk·nb, rank), replicated
     inv_s = (1.0 / s)[:, None]               # (rank, 1), replicated
@@ -210,6 +274,12 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     log_fn(f"  ctilde[0] orthogonality error: {float(ortho_err):.3e}")
     log_fn(f"  Total Galerkin: {time.time()-t0:.2f}s")
 
+    if return_full_proj:
+        # W_proj = L⁻¹ diag(1/s) U^H — the α-basis-on-full-r projector (see
+        # docstring).  (rank, nk·nb) replicated; small (≲ tens of MB).
+        W_proj = jsp_linalg.solve_triangular(L, inv_s * UH, lower=True)
+        W_proj = jax.device_put(W_proj, rep)
+        return S, ctilde, B_at_mu, W_proj
     return S, ctilde, B_at_mu
 
 
@@ -393,6 +463,16 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         bw = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
         weighted = ctilde_in * bw[..., None]
         fH_k = -jnp.einsum('kim,kin->kmn', weighted, jnp.conj(weighted), optimize=True)
+        # Constrain the CONTRACTION OUTPUT, not just the hermitized copy.
+        # ``ctilde`` arrives replicated, so without this the SPMD partitioner
+        # has no reason to split the (nk, rank, rank) product and materialises
+        # it — and then its transpose, and then the hermitized sum — at FULL
+        # size on every device.  Measured on MoS2 12x12 / n_mu=2412 / nb=20
+        # (rank 2880): the module wanted 57.84 GiB per device and OOMed an
+        # A100-80GB, against a true sharded footprint of 2 x 1.2 GiB on a 4x4
+        # mesh.  Pinning the einsum output makes the whole chain local.
+        # Memory-only: same values, same shardings out.
+        fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
         fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
         fH_R = local_ifftn(fH_k)
@@ -574,7 +654,7 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
 
 
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
-                    mesh_xy: Mesh | None = None):
+                    mesh_xy: Mesh | None = None, return_full_proj: bool = False):
     from file_io.centroids import load_centroids as _shared_load_centroids
 
     input_dir = os.path.dirname(os.path.abspath(input_path))
@@ -610,11 +690,15 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
         mesh_xy = _build_mesh_xy()
     band_range = (int(nsigmarange[0]), int(nsigmarange[1]))
     with mesh_xy:
-        S, ctilde, B_at_mu = streaming_galerkin_solve(
+        out = streaming_galerkin_solve(
             wfn, sym, meta, centroid_indices, mesh_xy, band_range,
             rtol=1e-8, log_fn=log_fn, bispinor=bispinor,
+            return_full_proj=return_full_proj,
         )
+    S, ctilde, B_at_mu = out[:3]
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={band_range[1]-band_range[0]}, rank={ctilde.shape[2]}")
+    if return_full_proj:
+        return wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma, out[3]
     return wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma
 
 

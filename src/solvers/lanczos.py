@@ -93,7 +93,13 @@ def block_lanczos_eig(
             Z_flat = Z_flat - proj @ Q_old
 
         Z_flat_T, R = jnp.linalg.qr(Z_flat.T)
-        beta_j = R.T
+        # P1: beta_j = R (NOT R.T).  With Z_col = Z_flat.T = Q R, the block
+        # recurrence residual is Z = Q_{j+1} R, so the sub-diagonal block of T is
+        # exactly R and the super-diagonal is R^H.  The old ``R.T`` transposed
+        # both off-diagonal blocks (they came out conj(R)/R.T instead of R/R^H),
+        # which the final (T+T^H)/2 masked for eigenVALUES but corrupted the
+        # T->Q_all mapping used for eigenVECTORS (solver_program P1).
+        beta_j = R
         beta_blocks.append(beta_j)
 
         beta_norm = jnp.linalg.norm(beta_j)
@@ -248,7 +254,8 @@ def lanczos_eig_jit(
     q0 = q0 + 1j * jax.random.normal(k2, (n,), dtype=jnp.float64)
     q0 = q0 / jnp.linalg.norm(q0)
 
-    Q = jnp.zeros((n, max_iter), dtype=jnp.complex128)
+    # +1 column so the last iteration does not overwrite Q[:, max_iter-1] (P1).
+    Q = jnp.zeros((n, max_iter + 1), dtype=jnp.complex128)
     Q = Q.at[:, 0].set(q0)
     alpha = jnp.zeros((max_iter,), dtype=jnp.float64)
     beta = jnp.zeros((max_iter,), dtype=jnp.float64)
@@ -278,7 +285,7 @@ def lanczos_eig_jit(
         beta = beta.at[j].set(beta_j)
 
         q_next = z / jnp.maximum(beta_j, 1e-15)
-        Q = Q.at[:, jnp.minimum(j + 1, max_iter - 1)].set(q_next)
+        Q = Q.at[:, j + 1].set(q_next)
 
         return (Q, alpha, beta, q_next)
 
@@ -293,7 +300,7 @@ def lanczos_eig_jit(
     idx = jnp.argsort(evals_T)[:n_eig]
     eigenvalues = evals_T[idx]
 
-    eigenvectors = (Q @ vecs_T[:, idx]).T
+    eigenvectors = (Q[:, :max_iter] @ vecs_T[:, idx]).T
     norms = jnp.linalg.norm(eigenvectors, axis=1, keepdims=True)
     eigenvectors = eigenvectors / jnp.maximum(norms, 1e-15)
 
@@ -371,8 +378,19 @@ def block_lanczos_eig_jit(
         Random seed for initial block.
     n_reorth : int
         Window size (in *blocks*) for partial reorthogonalisation.
+
+    Krylov-exhaustion clamp: the Krylov space cannot exceed the vector
+    space, so ``max_iter`` is clamped to ``floor(n / block_size)``.
+    Running past exhaustion is not benign — the residual block collapses,
+    QR of a ~zero block returns junk directions, and the manufactured
+    α/β blocks put Ritz values ANYWHERE, including BELOW the true
+    spectrum (measured on the 4v4c MoS2 exciton window, n=144 with a
+    requested 320-dim Krylov: spurious states 60-100 meV under the dense
+    ground state).  At the clamp the Krylov space spans (almost) the
+    whole space and the extremal Ritz values are dense-quality.
     """
     bs = int(block_size)
+    max_iter = max(1, min(int(max_iter), int(n) // bs))
     T_size = bs * int(max_iter)
 
     # Initial orthonormal block via QR of random complex Gaussian.
@@ -382,9 +400,11 @@ def block_lanczos_eig_jit(
           + 1j * jax.random.normal(k2, (n, bs), dtype=jnp.float64))
     Q0, _ = jnp.linalg.qr(Q0)                          # (n, bs)
 
-    # Ring buffer of all Q-blocks: (max_iter, n, bs).  alpha and beta
-    # blocks: (max_iter, bs, bs).  All pre-allocated to fit in fori_loop.
-    Q_all = jnp.zeros((int(max_iter), n, bs), dtype=jnp.complex128)
+    # Ring buffer of all Q-blocks: (max_iter + 1, n, bs) — the +1 slot holds the
+    # final Q_next so the last iteration does NOT overwrite Q_{max_iter-1} (the
+    # slot-overwrite bug, solver_program P1: it corrupted the last Krylov block
+    # in the eigenvector reconstruction).  alpha/beta: (max_iter, bs, bs).
+    Q_all = jnp.zeros((int(max_iter) + 1, n, bs), dtype=jnp.complex128)
     Q_all = Q_all.at[0].set(Q0)
     alpha_all = jnp.zeros((int(max_iter), bs, bs), dtype=jnp.complex128)
     beta_all = jnp.zeros((int(max_iter), bs, bs), dtype=jnp.complex128)
@@ -413,11 +433,11 @@ def block_lanczos_eig_jit(
         start = jnp.maximum(0, j - n_reorth)
         Z = lax.fori_loop(start, j + 1, reorth_body, Z)
 
-        # QR(Z) → next block + β_j.
+        # QR(Z) → next block + β_j.  Write to slot j+1 (always valid with the
+        # +1 buffer, 1..max_iter) — no clobber of the current Q_j.
         Q_next, beta_j = jnp.linalg.qr(Z)              # (n, bs), (bs, bs)
         beta_all = beta_all.at[j].set(beta_j)
-        next_idx = jnp.minimum(j + 1, int(max_iter) - 1)
-        Q_all = Q_all.at[next_idx].set(Q_next)
+        Q_all = Q_all.at[j + 1].set(Q_next)
         return (Q_all, alpha_all, beta_all)
 
     Q_all, alpha_all, beta_all = lax.fori_loop(
@@ -430,8 +450,8 @@ def block_lanczos_eig_jit(
     idx = jnp.argsort(evals_T)[:n_eig]
     eigenvalues = evals_T[idx]
 
-    # Q_all is (max_iter, n, bs) → reshape to (n, T_size).
-    Q_full = jnp.transpose(Q_all, (1, 0, 2)).reshape(n, T_size)
+    # Q_all is (max_iter + 1, n, bs); the T basis is the first max_iter blocks.
+    Q_full = jnp.transpose(Q_all[:int(max_iter)], (1, 0, 2)).reshape(n, T_size)
     eigenvectors = (Q_full @ vecs_T[:, idx]).T          # (n_eig, n)
     norms = jnp.linalg.norm(eigenvectors, axis=1, keepdims=True)
     eigenvectors = eigenvectors / jnp.maximum(norms, 1e-15)
@@ -473,11 +493,14 @@ def block_lanczos_eig_jit_converged(
     ``max_iter``).
     """
     bs = int(block_size)
-    M = int(max_iter)
+    # Krylov-exhaustion clamp — same rationale as block_lanczos_eig_jit:
+    # past floor(n/bs) blocks the residual collapses and QR manufactures
+    # junk directions with arbitrary (even sub-spectrum) Ritz values.
+    M = max(1, min(int(max_iter), int(n) // bs))
     T_size = bs * M
     if min_iter is None:
         min_iter = max(2 * check_every, max(1, n_eig // bs + 1))
-    min_iter = int(min_iter)
+    min_iter = int(min(min_iter, M))
 
     key = jax.random.PRNGKey(seed)
     k1, k2 = jax.random.split(key)
@@ -485,7 +508,8 @@ def block_lanczos_eig_jit_converged(
           + 1j * jax.random.normal(k2, (n, bs), dtype=jnp.float64))
     Q0, _ = jnp.linalg.qr(Q0)
 
-    Q_all = jnp.zeros((M, n, bs), dtype=jnp.complex128).at[0].set(Q0)
+    # +1 Krylov slot so the final block does not overwrite Q_{M-1} (P1).
+    Q_all = jnp.zeros((M + 1, n, bs), dtype=jnp.complex128).at[0].set(Q0)
     alpha_all = jnp.zeros((M, bs, bs), dtype=jnp.complex128)
     beta_all = jnp.zeros((M, bs, bs), dtype=jnp.complex128)
     last_evals = jnp.full((n_eig,), jnp.inf, dtype=jnp.float64)
@@ -513,7 +537,7 @@ def block_lanczos_eig_jit_converged(
 
         Q_next, beta_j = jnp.linalg.qr(Z)
         beta_all = beta_all.at[j].set(beta_j)
-        Q_all = Q_all.at[jnp.minimum(j + 1, M - 1)].set(Q_next)
+        Q_all = Q_all.at[j + 1].set(Q_next)
         return Q_all, alpha_all, beta_all
 
     def cond(state):
@@ -575,7 +599,7 @@ def block_lanczos_eig_jit_converged(
     evals_T, vecs_T = jnp.linalg.eigh(T)
     idx = jnp.argsort(evals_T)[:n_eig]
     eigenvalues = evals_T[idx]
-    Q_full = jnp.transpose(Q_all, (1, 0, 2)).reshape(n, T_size)
+    Q_full = jnp.transpose(Q_all[:M], (1, 0, 2)).reshape(n, T_size)
     eigenvectors = (Q_full @ vecs_T[:, idx]).T
     norms = jnp.linalg.norm(eigenvectors, axis=1, keepdims=True)
     eigenvectors = eigenvectors / jnp.maximum(norms, 1e-15)

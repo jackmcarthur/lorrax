@@ -335,6 +335,32 @@ Failure mode 1 is the **orbit-closure failure**: the centroid set is not orbit-c
 
 The int-snap fix (§4.3) absorbs single-op fp drift up to half a grid cell. Larger drift indicates a genuine orbit-closure failure; the `np.rint` will land on a half-grid point and the subsequent lookup fails.
 
+### 4.7 Closing Centroids When the WFN Symmetry Is Reduced
+
+The centroid set must be closed under the point group for the ISDF quadrature to
+be point-group symmetric — this matters most for `⟨nk|V_H|nk⟩` (`gw/cohsex_sigma.py:hartree`),
+a ~500 eV matrix element whose raw centroid-quadrature error, otherwise ~1e-3
+relative, becomes a multi-eV C3 split across the k-star and corrupts the QP
+dispersion (`Vxc = E_dft − kin_ion − V_H`). But the WFN's stored `mtrx` list can
+be **smaller than the crystal group**: a non-collinear SOC WFN (`no_t_rev`)
+typically exposes only `{E, σ_h}` because pw2bgw drops the C3 rotations (they need
+a spinor rotation the `mtrx` format can't carry), even though the charge density
+is fully symmetric. Closing centroids under the stored `{E, σ_h}` leaves V_H
+C3-broken.
+
+`centroid/orbit_syms.py:recover_symmorphic_density_point_group` recovers the
+symmorphic point group that leaves the **charge density** invariant (holohedry ∩
+ρ-invariance on the FFT grid). Testing ρ(r) — not bare atom positions — is the
+safe criterion: non-magnetic crystals recover the full crystal group; magnetically
+ordered crystals recover only the (smaller) magnetic group, never over-closing.
+`build_real_space_syms(…, charge_density=…)` adopts it for centroid closure only
+when it **strictly contains** the WFN's stored symmorphic group (so a WFN that
+genuinely carries non-symmorphic ops the τ=0 detector can't see, e.g. Si Fd-3m,
+is never downgraded). Only the centroid *set* is enlarged; the ζ/V_q IBZ cascade
+here (§4–5) still runs on the WFN's stored group — a D3h-closed set is trivially
+`{E, σ_h}`-closed, so the cascade then succeeds (see
+`reports/gw_vh_symmetry_2026-07-20/`).
+
 ### 4.6 `compute_rgrid_sym_perm` (Full-Grid Variant)
 
 `src/centroid/orbit_syms.py:444-551`. Same construction, but applied to every point of the FFT grid (not just the centroid subset). Returns `sym_perm[s, r_new] = r_old` — a pull-back gather. Used by the ζ-loader for the IBZ → full-BZ unfold on the r-axis (when ζ is stored only at IBZ q's and the consumer needs the full BZ). Requires $\tau \times \text{FFT\_grid}$ to be integer; the validator refuses loudly otherwise.

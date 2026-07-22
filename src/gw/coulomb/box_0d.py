@@ -36,6 +36,7 @@ class Box0D:
         nsamples=None,
         method=None,
         qmc_reps=None,
+        analytic_sphere=False,  # ignored (box head is finite; no mini-BZ avg)
     ):
         """Box: V(q=0, G=0) is finite from the WS-truncated FFT.
 

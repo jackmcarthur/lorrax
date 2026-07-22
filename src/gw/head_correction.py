@@ -136,6 +136,7 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
                 jnp.asarray(eps0.epshead, dtype=jnp.complex128),
                 meta,
                 S_cart=None,
+                analytic_sphere=bool(params.get("head_minibz_average", False)),
             )
             source = "epshead(0)" if abs(omega_val) > 1.0e-14 else "epshead"
             return HeadSample(
@@ -179,6 +180,7 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
             jnp.asarray(0.0, dtype=jnp.float64),
             meta,
             S_cart=S_cart_omega,
+            analytic_sphere=bool(params.get("head_minibz_average", False)),
         )
         source = "s_tensor" if abs(omega_val) <= 1.0e-14 else f"s_tensor(omega={omega_val} Ry)"
         return HeadSample(
@@ -226,6 +228,7 @@ class HeadResolver:
             "vhead": head.vhead,
             "whead_0freq": head.whead_0freq,
             "whead_imfreq": head.whead_imfreq,
+            "head_minibz_average": head.head_minibz_average,
         }
         self._input_dir = input_dir
         self._wfn = wfn

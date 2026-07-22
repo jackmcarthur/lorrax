@@ -24,7 +24,7 @@ from solvers.lanczos import (
     lanczos_eig_jit,
 )
 from .bse_serial import apply_bse_hamiltonian_single_device
-from .bse_ring_comm import build_bse_ring_matvec, make_bse_shardings
+from .bse_ring_comm import make_bse_shardings
 
 
 def solve_bse(
@@ -112,6 +112,7 @@ def solve_bse_sharded(
     solver_kind: str = "lanczos",
     davidson_n_random_init: int = 5,
     davidson_eps_shift_Ry: float = 1e-3,
+    tda: bool = True,
 ) -> Tuple[jax.Array, jax.Array]:
     """Sharded BSE Lanczos using the (μ,ν) ring matvec.
 
@@ -135,7 +136,18 @@ def solve_bse_sharded(
     and contains psi_{c,v}_{X,Y}, eps_c, eps_v, V_q0 (P("x","y")), W_q
     (P("x","y",None,None,None)), plus any q=0 head injection already
     applied at load time.
+
+    ``tda`` (default True) selects the Tamm-Dancoff resonant-only Hamiltonian
+    (the block/single-vector Lanczos + Davidson paths below).  ``tda=False``
+    dispatches to the structure-preserving full-BSE eigensolver
+    ``bse_nontda.solve_bse_nontda_sharded`` — the ONE non-TDA seam, no parallel
+    solver stack — which returns paired (X, Y) eigenvectors (X^H X - Y^H Y = +1).
     """
+    if not tda:
+        from .bse_nontda import solve_bse_nontda_sharded
+        return solve_bse_nontda_sharded(
+            data, mesh_xy, n_eig=n_eig, include_W=include_W)
+
     sh = make_bse_shardings(mesh_xy)
     nc_pad = int(data["n_cond_pad"])
     nv_pad = int(data["n_val_pad"])
@@ -147,22 +159,18 @@ def solve_bse_sharded(
     bs = int(block_size)
     shape = (bs, nc_pad, nv_pad, nk)
 
-    # Three matvec implementations are available:
-    #   "ring"   — shard_map + lax.ppermute (low memory peak; default).
-    #   "gather" — shard_map + lax.all_gather (higher peak, faster).
-    #   "simple" — plain jit + jnp.einsum + with_sharding_constraint;
-    #             no shard_map. XLA partitions automatically.
-    matvec_kind = data.get("matvec_kind", "ring")
-    if matvec_kind == "simple":
-        from .bse_simple import build_bse_simple_matvec
-        matvec_ring = build_bse_simple_matvec(
-            mesh_xy, nkx, nky, nkz, include_W=include_W,
-        )
-    else:
-        matvec_ring = build_bse_ring_matvec(
-            mesh_xy, nkx, nky, nkz, include_W=include_W,
-            low_mem=(matvec_kind == "ring"),
-        )
+    # Trial-stack matvec (scan-inside-shard_map): applies H to the whole
+    # (block_size / Davidson subspace) stack with ONE T-tensor alive regardless
+    # of the stack width — strictly better peak memory than the legacy
+    # ring/gather/simple matvecs (whose T scaled with the stack). Same
+    # (X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0) -> HX
+    # signature, so it is a drop-in for both the bs==1 and block paths below.
+    # The legacy ``matvec_kind`` selector is retired here; see the retirement
+    # note in bse_stack_matvec (ring/gather/simple + selector deletion pending).
+    from .bse_stack_matvec import build_bse_stack_matvec
+    matvec_ring = build_bse_stack_matvec(
+        mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
+    )
 
     # W_R = ifft_q(W_q) computed ONCE inside the outer jit. Use the
     # gw_jax custom-partitioned IFFT helper — plain ``jnp.fft.ifftn`` on
@@ -193,12 +201,13 @@ def solve_bse_sharded(
         psi_v_X = data["psi_v_X"]; psi_v_Y = data["psi_v_Y"]
         eps_c   = data["eps_c"];   eps_v   = data["eps_v"]
         V_q0    = data["V_q0"];    W_q     = data["W_q"]
+        M_X     = data["M_X"];     M_Y     = data["M_Y"]  # hoisted V-term pair-amps (P3)
         W_R = _W_local_ifftn(W_q) if include_W else W_q
 
         def apply_H(V):    # V: (m, nc_pad, nv_pad, nk) sharded P(None,"x","y",None)
             V = jax.lax.with_sharding_constraint(V, sh.X)
             return matvec_ring(V, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                               eps_c, eps_v, W_R, V_q0)
+                               eps_c, eps_v, W_R, V_q0, M_X, M_Y)
 
         bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
         precond_fn = bse_diagonal_precond(
@@ -238,12 +247,14 @@ def solve_bse_sharded(
         jax.jit,
         in_shardings=(
             sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-            sh.eps, sh.eps, sh.W, sh.V,
+            sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y,
         ),
         out_shardings=(rep_eig, rep_eig, rep_eig),
-        donate_argnums=(6,),  # W_q — only used to build W_R
+        # NB: W_q (arg 6) is NOT donated — W_R = ifft(W_q) is a fresh buffer with no
+        # aliasable same-shape output, so the donation was always declined (cosmetic,
+        # no copy) and only emitted a "donated buffers not usable" warning (audit P5).
     )
-    def _full_run(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_q, V_q0):
+    def _full_run(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_q, V_q0, M_X, M_Y):
         if include_W:
             W_R = _W_local_ifftn(W_q)
         else:
@@ -255,7 +266,7 @@ def solve_bse_sharded(
                 X = jax.lax.with_sharding_constraint(X, sh.X)
                 HX = matvec_ring(
                     X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                    eps_c, eps_v, W_R, V_q0,
+                    eps_c, eps_v, W_R, V_q0, M_X, M_Y,
                 )
                 return HX.reshape(-1)
             if rtol > 0.0:
@@ -284,7 +295,7 @@ def solve_bse_sharded(
                 X = jax.lax.with_sharding_constraint(X, sh.X)
                 HX = matvec_ring(
                     X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                    eps_c, eps_v, W_R, V_q0,
+                    eps_c, eps_v, W_R, V_q0, M_X, M_Y,
                 )
                 return HX.reshape(bs, -1)
             if rtol > 0.0:
@@ -308,6 +319,7 @@ def solve_bse_sharded(
         data["psi_v_X"], data["psi_v_Y"],
         data["eps_c"], data["eps_v"],
         data["W_q"], data["V_q0"],
+        data["M_X"], data["M_Y"],
     )
     eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
     return eigenvalues, eigenvectors, n_iter_done

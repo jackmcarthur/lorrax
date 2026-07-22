@@ -215,19 +215,22 @@ def run_haydock(
         jax.jit,
         in_shardings=(
             sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-            sh.eps, sh.eps, sh.W, sh.V,
+            sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y,
         ),
         out_shardings=(rep, rep, rep),
-        donate_argnums=(7,),  # W_q
+        # NB: W_q (arg 7) is NOT donated — W_R = ifft(W_q) is a fresh buffer with no
+        # aliasable output, so the donation was always declined (cosmetic, no copy)
+        # and only emitted a "donated buffers not usable" warning (audit P5).
     )
-    def _full_run(d_seed, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_q, V_q0):
+    def _full_run(d_seed, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_q, V_q0,
+                  M_X, M_Y):
         W_R = _W_local_ifftn(W_q)
 
         def matvec_block(X_block):
             X_block = jax.lax.with_sharding_constraint(X_block, sh.X)
             return matvec_ring(
                 X_block, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                eps_c, eps_v, W_R, V_q0,
+                eps_c, eps_v, W_R, V_q0, M_X, M_Y,
             )
 
         return haydock_recursion_block(matvec_block, d_seed, n_iter)
@@ -237,6 +240,7 @@ def run_haydock(
         d_block,
         data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
         data["eps_c"], data["eps_v"], data["W_q"], data["V_q0"],
+        data["M_X"], data["M_Y"],
     )
     alphas = np.asarray(alphas)
     betas = np.asarray(betas)

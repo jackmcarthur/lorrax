@@ -124,6 +124,32 @@ def build_parser() -> argparse.ArgumentParser:
                         "'_current') and a header comment naming the "
                         "density, so a downstream gw_jax run can read both "
                         "files unambiguously.")
+    p.add_argument("--centroid-weight",
+                   choices=("charge_density", "band_range"),
+                   default=None,
+                   help="WHICH density weights the k-means, i.e. where the "
+                        "ISDF quadrature gets points. 'band_range' (DEFAULT "
+                        "for --density-mode scalar) = Σ_{n∈range} Σ_k w_k "
+                        "|ψ_nk(r)|² over the bands the calculation actually "
+                        "uses. 'charge_density' = the ground-state OCCUPIED "
+                        "ρ(r) (the historical weight, and the default for "
+                        "--density-mode current). Occupied-"
+                        "only weighting is entirely inside a slab, so a 2D "
+                        "system gets ZERO centroids in the vacuum and its "
+                        "vacuum-localized far-conduction states have no "
+                        "quadrature support — ⟨nk|V_H|nk⟩ comes back "
+                        "sign-wrong (+140 eV vs −140 eV on MoS2) and the "
+                        "error lands on Vxc. Use 'band_range' when the σ "
+                        "window reaches into vacuum-like states.")
+    p.add_argument("--weight-bands", type=str, default=None,
+                   metavar="LO:HI",
+                   help="Explicit 0-based half-open band range for "
+                        "--centroid-weight band_range. Default is the σ "
+                        "window (0, n_val+n_cond) resolved exactly like the "
+                        "pivoted-Cholesky prune window (see --prune-n-val / "
+                        "--prune-n-cond). Sweep HI from n_val (occupied-"
+                        "only) to n_val+n_cond to trade slab resolution "
+                        "against vacuum support.")
     p.add_argument("--out-suffix", type=str, default=None,
                    help="Suffix appended to the output filename.  Default "
                         "is '' for --density-mode scalar and '_current' "
@@ -141,6 +167,20 @@ _P_PER_SHARD_MIN = 100_000
 """NCCL-latency floor: shard only when each device sees ≥ this many points
 (measured on Si 4×4×4: P=110k / 4 GPUs gave a slower run than single-device
 because allreduce dominated the 1 ms local compute)."""
+
+
+def _resolve_sigma_window(args, wfn) -> tuple[int, int]:
+    """``(n_val, n_cond)`` of the σ window — the bands the ISDF must span.
+
+    Single source of truth for both consumers: the pivoted-Cholesky prune
+    band ranges and the ``band_range`` k-means weight.
+    """
+    n_val = (int(args.prune_n_val) if args.prune_n_val is not None
+             else int(wfn.nelec))
+    nb_total = int(wfn.nbands)
+    n_cond = (int(args.prune_n_cond) if args.prune_n_cond is not None
+              else min(n_val, nb_total - n_val))
+    return n_val, n_cond
 
 
 def _build_mesh(args, n_points: int) -> tuple[Mesh, tuple[str, ...]]:
@@ -247,28 +287,81 @@ def main():
     avec_ang = np.asarray(wfn.avec) * float(wfn.alat) * BOHR_TO_ANG
     print(f"Charge density shape: {charge_density.shape}")
     print(f"Lattice lengths: {np.linalg.norm(avec_ang, axis=1)} Å")
-
-    rho_jax = jnp.asarray(charge_density, dtype=jnp.float64)
-    if args.rho_power != 1.0:
-        # Clip to non-negative before power (QE iFFT can leave tiny < 0
-        # noise) and tell the user we're using a non-default exponent.
-        rho_jax = jnp.maximum(rho_jax, 0.0) ** float(args.rho_power)
-        print(f"k-means weight: ρ(r)^{args.rho_power:g} "
-              f"(asymptotic centroid density ∝ ρ^{0.6*args.rho_power:.3f})")
     avec_jax = jnp.asarray(avec_ang, dtype=jnp.float64)
 
     n_points = int(np.prod(fft_grid))
     mesh, mesh_axis = _build_mesh(args, n_points)
 
-    # Decide orbit vs non-orbit. Default heuristic: orbit if --orbit explicit
-    # OR WFN has > 1 spatial sym op AND --no-orbit not set.
-    orbit_aware = args.orbit or (int(wfn.ntran) > 1 and not args.no_orbit)
+    # Decide orbit vs non-orbit.  Unless --no-orbit, build the closure sym
+    # group with charge-density point-group recovery, then enable orbit mode
+    # when it has more than the identity.  Gating on the *recovered* group
+    # (not raw ``wfn.ntran``) makes orbit closure the default for any WFN
+    # whose density carries point-group symmetry — including reduced WFNs
+    # (non-collinear SOC stores only {E, σ_h}; a nosym run stores {E}) whose
+    # stored ntran understates the crystal symmetry and would otherwise leave
+    # ⟨nk|V_H|nk⟩ C3-broken across the k-star.
     R = Rinv = tau = None
     n_sym = 1
-    if orbit_aware:
+    orbit_aware = False
+    if not args.no_orbit:
         from .orbit_syms import build_real_space_syms
-        R, Rinv, tau = build_real_space_syms(wfn, sym)
+        R, Rinv, tau = build_real_space_syms(
+            wfn, sym, charge_density=charge_density)
         n_sym = int(R.shape[0])
+        orbit_aware = args.orbit or n_sym > 1
+    if not orbit_aware:
+        R = Rinv = tau = None
+        n_sym = 1
+
+    # ── k-means weight ───────────────────────────────────────────────────
+    # WHY band_range EXISTS: occupied-only ρ(r) is entirely inside the slab,
+    # so the weighted k-means places ZERO centroids in the vacuum and the
+    # vacuum-localized far-conduction states have no quadrature support —
+    # ⟨nk|V_H|nk⟩ (a pure centroid sum) is then sign-wrong and the whole
+    # error lands on Vxc = E_dft − kin_ion − V_H.
+    with timing.section("setup.weight"):
+        if args.centroid_weight is None:      # scalar defaults to band_range
+            args.centroid_weight = ("band_range" if args.density_mode == "scalar"
+                                    else "charge_density")
+        if args.centroid_weight == "band_range":
+            if args.density_mode != "scalar":
+                raise ValueError(
+                    "--centroid-weight band_range applies to the scalar "
+                    "(charge) channel; --density-mode current already "
+                    "weights by its own occupied-state current.")
+            if args.weight_bands is not None:
+                b_lo, b_hi = (int(v) for v in args.weight_bands.split(":"))
+            else:
+                _nv, _nc = _resolve_sigma_window(args, wfn)
+                b_lo, b_hi = 0, _nv + _nc
+            # τ=0 is required for the plain-index grid symmetrization; the
+            # recovered density point group is symmorphic by construction,
+            # a WFN group may not be.
+            _ops = (np.asarray(Rinv) if Rinv is not None
+                    and np.allclose(np.asarray(tau), 0.0, atol=1e-8) else None)
+            print(f"k-means weight: band_range Σ_{{n∈[{b_lo},{b_hi})}} "
+                  f"Σ_k w_k|ψ_nk|²"
+                  f"{'' if _ops is None else f' (symmetrized, {len(_ops)} ops)'}")
+            from .charge_density import rho_from_band_range
+            weight = rho_from_band_range(wfn, (b_lo, b_hi), sym_ops=_ops)
+            weight_label = (f"band-range density Σ_{{n∈[{b_lo},{b_hi})}} "
+                            f"Σ_k w_k|ψ_nk(r)|²")
+        else:
+            weight = charge_density
+            weight_label = ("scalar charge density ρ(r)"
+                            if args.density_mode == "scalar" else
+                            "Gordon-decomposed Pauli current "
+                            "Σ_{n,k,i}(j^Gordon_{n,k,i}(r))²")
+
+    rho_jax = jnp.asarray(weight, dtype=jnp.float64)
+    if args.rho_power != 1.0:
+        # Clip to non-negative before power (QE iFFT can leave tiny < 0
+        # noise) and tell the user we're using a non-default exponent.
+        rho_jax = jnp.maximum(rho_jax, 0.0) ** float(args.rho_power)
+        print(f"k-means weight: (weight)^{args.rho_power:g} "
+              f"(asymptotic centroid density ∝ w^{0.6*args.rho_power:.3f})")
+
+    if orbit_aware:
         # In orbit mode the SAMPLED count is M_cand; the OUTPUT after unfold
         # may inflate by up to n_sym. Adjust kmeans target so the final
         # unfolded centroid count is roughly N_c.
@@ -333,7 +426,7 @@ def main():
             if n_dups > 0:
                 print(f"⚠ {n_dups} duplicates; redistributing to nearby grid points...")
                 centroids_snapped = ensure_unique_centroids(
-                    centroids_frac, fft_grid, rho=charge_density,
+                    centroids_frac, fft_grid, rho=weight,
                 )
                 n_unique = centroids_snapped.shape[0]
                 centroid_indices = (np.round(centroids_snapped * np.asarray(fft_grid))
@@ -351,13 +444,8 @@ def main():
                         if orbit_id_arr is not None else N_c)
         print(f"\nPivoted-Cholesky prune: {n_unique} → {N_c}"
               f"{f' (target {n_orbit_keep} orbits)' if orbit_id_arr is not None else ''}")
-        # Resolve n_val/n_cond defaults the same way the legacy path did
-        # so we can compute explicit band ranges for the v×(v+c) variant.
-        _n_val_eff = (int(args.prune_n_val) if args.prune_n_val is not None
-                      else int(wfn.nelec))
-        _nb_total = int(wfn.nbands)
-        _n_cond_eff = (int(args.prune_n_cond) if args.prune_n_cond is not None
-                       else min(_n_val_eff, _nb_total - _n_val_eff))
+        # Same σ window the band_range weight uses (one resolver).
+        _n_val_eff, _n_cond_eff = _resolve_sigma_window(args, wfn)
         _max_band = _n_val_eff + _n_cond_eff
         _prune_kwargs: dict = dict(
             wfn=wfn, sym=sym, cand_idx=centroid_indices,
@@ -394,15 +482,10 @@ def main():
                   if args.out_suffix is not None
                   else ("" if args.density_mode == "scalar" else "_current"))
     out_file = f"centroids_frac_{n_unique}{out_suffix}.txt"
-    if args.density_mode == "scalar":
-        density_label = "scalar charge density ρ(r)"
-    else:
-        density_label = ("Gordon-decomposed Pauli current "
-                         "Σ_{n,k,i}(j^Gordon_{n,k,i}(r))²")
     header = (
         f"x y z (snapped to FFT grid {fft_grid}, {n_unique} unique)\n"
-        f"density: {args.density_mode}\n"
-        f"weight: {density_label}\n"
+        f"density: {args.density_mode}  centroid-weight: {args.centroid_weight}\n"
+        f"weight: {weight_label}\n"
         f"intended channels: "
         f"{'γ̃^0 (charge) ISDF' if args.density_mode == 'scalar' else 'γ̃^{1,2,3} (current) ISDF'}"
     )

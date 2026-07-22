@@ -306,6 +306,43 @@ _DEFAULTS = {
     # cusolvermp_lu with values auto|on|off (on → cusolvermp).
     "distributed_cholesky": "auto",
     "distributed_lu":       "auto",
+    # Charge ζ-fit OPT-IN Tikhonov ridge ε (added ON TOP of the fixed
+    # 1e-14·|tr| non-singularity floor, as a fraction of the mean CCT
+    # diagonal tr(C)/n): C_q ← C_q + [1e-14·|tr| + ε·|tr|/n]·I before the
+    # replicated Cholesky.  A per-q SCALAR, so mesh-invariant.  Default 0.0
+    # ⇒ bit-identical to the historical factor (frozen-golden contract).  A
+    # POSITIVE ε conditions a NEAR-SINGULAR CCT (n_μ over-complete for the
+    # system's pair-density rank) so ζ = (C+εI)⁻¹Z stops amplifying the
+    # ULP-level, mesh-dependent pair-density (cuBLAS-GEMM-per-shard-dim)
+    # roundoff into a grid-dependent V_q.  MoS2 6×6 (n_μ=1600) needs ε≈1e-4
+    # to bring cross-grid Re Σ_c agreement from O(10 eV) to ~10 meV.  It
+    # PERTURBS the physical result (the regularised answer is ε-dependent on
+    # this ill-posed fit) — hence opt-in, a physics call.  Env override
+    # LORRAX_ZETA_RIDGE.  See reports/gw_zeta_mesh_invariance_2026-07-20.
+    "zeta_ridge":           0.0,
+    # Charge ζ-solve conditioner (μ_L=0 channel only).  "rank_truncate"
+    # (DEFAULT) = rank-revealing eigh pseudo-inverse: drop eigenvalues
+    # < zeta_rcond·λ_max before inverting, so the near-null directions of
+    # the over-complete charge CCT (n_μ > pair-density rank, κ~1e13) are
+    # removed at the source instead of amplified by plain Cholesky into
+    # O(1) V_q errors that GN-PPM magnifies to tens of eV (the conduction
+    # Σc blow-up / device-count / nband instability).  "cholesky" = the
+    # historical replicated/cuSolverMp Cholesky path (bit-identical to the
+    # pre-feature behavior; the selectable alternative).
+    "charge_zeta_solve":    "rank_truncate",   # rank_truncate | cholesky
+    # Rank-truncation cutoff (relative to λ_max, per q).  DEFAULT 1e-8 —
+    # the LOW end of the over-complete recovery plateau.  An over-complete
+    # basis needs it: at MoS2 4×4/1204c, 1e-10 only partially recovers (MAE
+    # 1.4 eV vs BGW) while the whole 1e-8…1e-4 plateau collapses to ~0.04 eV
+    # — so pick the plateau's low end, because truncation is NOT free on a
+    # well-conditioned basis: bulk Si 4×4×4/960c (the BGW-anchored
+    # si_cohsex_3d gate) does have eigenvalues below the cut, and 1e-6 drifts
+    # its sigTOT by 1.021 meV where 1e-8 costs only 0.054 meV — the identical
+    # over-complete cure at ~20× less drift (sweep table in
+    # docs/docs_gwjax/COHSEX_INPUT.md).  Env override LORRAX_ZETA_RCOND.
+    # Mirrored by the isdf/core.py + gw/isdf_fitting.py signature defaults.
+    # reports/gw_rank_truncation_2026-07-20 + gw_bandrange_centroids_2026-07-21.
+    "zeta_rcond":           1e-8,
     # Deprecated aliases (still parsed; warned at load; honored only when
     # the portable key above is left at "auto"):
     "cusolvermp_charge": "auto",   # auto | on | off
@@ -330,6 +367,30 @@ _DEFAULTS = {
                                    #   Needed when nq * n_rmu^2 exceeds VRAM.
                                    # auto → high_mem for back-compat.
     "mc_average_vcoul_body": True,
+    # Per-Q mini-BZ Coulomb head cell-averaging (BGW minibzaverage_3d/2d).
+    # False (default) = current behavior, BIT-IDENTICAL: the q→0 head is the
+    # pure-Sobol mini-BZ mean and every finite-Q exchange head is the analytic
+    # POINT value v(Q+G*).  True routes the head through
+    # ``gw.coulomb.base.minibz_average``: the q→0 3D head gains the analytic
+    # Baldereschi-Tosatti sphere term (seed-independent), the Voronoi fold
+    # widens (nmax 1→3), and the BSE arbitrary-Q ``eval_vq`` head becomes the
+    # mini-BZ CELL AVERAGE ``<v_LR(Q+G*)>_mBZ`` (fixes the 4-13% near-Γ /
+    # zone-boundary point-vs-cell-average error, arbitrary_q_bse.md §16.4).
+    # The winding (2D e^{-i2θ}) is unaffected — only the head magnitude is
+    # averaged; the phase-factored ζ̃ rank-1 structure carries the direction.
+    "head_minibz_average": False,
+    # BSE fine-grid densification.  When set to "NX NY NZ" (or "NX,NY,NZ") and
+    # DIFFERENT from the coarse restart/WFN grid, the GENERAL BSE init
+    # (``bse_io.load_bse_data_from_restart_sharded``) interpolates the ENTIRE
+    # BSE problem — ψ, QP ε (htransform fH), V_Q exchange (vq_interp), and the
+    # W direct term (zero-pad in R) — from the coarse grid onto this fine grid
+    # BEFORE any solve, so EVERY BSE solver (exciton_bands / feast / nontda /
+    # kpm / resolvent) transparently runs on the fine grid.  Each fine length
+    # must be a positive multiple of the matching coarse length (coarse BZ ⊂
+    # fine BZ).  Empty (default) or == the coarse grid → the coarse ``data``
+    # bundle is returned byte-identically (fast path untouched).  Subsumes the
+    # exciton_bands ``--w-coarse-grid`` W-only flag for the direct term.
+    "bse_k_grid": "",
     "bare_coulomb_cutoff": None,
     # ζ-sphere cutoff (Ry).  When the writer emits zeta_q_G with per-q
     # WFN.h5-style spheres, this is the cutoff used to define the per-q
@@ -641,6 +702,7 @@ class HeadConfig:
     whead_0freq: float | None     # explicit override W_h[ω=0]
     whead_imfreq: float | None    # explicit override W_h[iω_p]
     mc_average_vcoul_body: bool
+    head_minibz_average: bool      # per-Q mini-BZ head cell-average (default off)
     bare_coulomb_cutoff: float | None
     zeta_cutoff: float | None
     use_bgw_vcoul: bool
@@ -789,6 +851,9 @@ class BackendConfig:
     screening_solver: ScreeningSolver
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
     distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
+    zeta_ridge: float          # charge-CCT Tikhonov ridge ε (rel. to tr/n)
+    charge_zeta_solve: str     # "rank_truncate" | "cholesky"
+    zeta_rcond: float          # rank-truncation cutoff (·λ_max)
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
 
     def summary(self) -> str:
@@ -799,7 +864,12 @@ class BackendConfig:
             f"screening_solver={self.screening_solver.value}, "
             f"distributed_cholesky={self.distributed_cholesky}, "
             f"distributed_lu={self.distributed_lu}, "
-            f"gamma_contract={self.gamma_contract_mode}"
+            f"charge_zeta_solve={self.charge_zeta_solve}"
+            + (f"(rcond={self.zeta_rcond:g})"
+               if self.charge_zeta_solve == 'rank_truncate' else '')
+            + (f", zeta_ridge={self.zeta_ridge:g}"
+               if self.zeta_ridge else '')
+            + f", gamma_contract={self.gamma_contract_mode}"
         )
 
 
@@ -1146,6 +1216,7 @@ class LorraxConfig:
             whead_0freq=_g("whead_0freq"),
             whead_imfreq=_g("whead_imfreq"),
             mc_average_vcoul_body=bool(_g("mc_average_vcoul_body")),
+            head_minibz_average=bool(_g("head_minibz_average")),
             bare_coulomb_cutoff=_g("bare_coulomb_cutoff"),
             zeta_cutoff=_g("zeta_cutoff"),
             use_bgw_vcoul=bool(_g("use_bgw_vcoul")),
@@ -1270,6 +1341,11 @@ class LorraxConfig:
                 f"distributed_lu={_dist_lu!r} invalid; expected auto / off "
                 f"/ cusolvermp / scalapack (a SLATE getrf wrapper does not "
                 f"exist yet; scalapack is the host/CPU-backend option).")
+        _charge_zeta_solve = str(_g("charge_zeta_solve")).strip().lower()
+        if _charge_zeta_solve not in ("rank_truncate", "cholesky"):
+            raise ValueError(
+                f"charge_zeta_solve={_charge_zeta_solve!r} invalid; expected "
+                f"rank_truncate / cholesky.")
         try:
             import jax as _jax
             _is_cpu_backend = _jax.default_backend() == "cpu"
@@ -1346,6 +1422,9 @@ class LorraxConfig:
             screening_solver=_LEGACY_ISDF_MEMORY_MODE[isdf_memory_mode],
             distributed_cholesky=_dist_chol,
             distributed_lu=_dist_lu,
+            zeta_ridge=float(_g("zeta_ridge")),
+            charge_zeta_solve=_charge_zeta_solve,
+            zeta_rcond=float(_g("zeta_rcond")),
             gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
         )
         debug = DebugConfig(

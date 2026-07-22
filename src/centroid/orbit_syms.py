@@ -27,10 +27,122 @@ import jax.numpy as jnp
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Charge-density point group (recovery of symmetry a reduced WFN dropped)
+# ─────────────────────────────────────────────────────────────────────────
+
+def recover_symmorphic_density_point_group(
+    avec: np.ndarray,
+    charge_density: np.ndarray,
+    *,
+    tol_rho: float = 1e-3,
+) -> np.ndarray:
+    """Symmorphic (τ=0) point group that leaves the charge density invariant.
+
+    Why this exists — the V_H C3-symmetry fix
+    -----------------------------------------
+    ⟨nk|V_H|nk⟩ is built as an ISDF **centroid quadrature** (``gw/
+    cohsex_sigma.py:hartree``: ``Σ_{μν} ρ_{mn}(k,r_μ)·V_q[0](μ,ν)·ρ(r_ν)``).
+    A raw centroid sum is only point-group symmetric across a k-star if the
+    centroid set ``{r_μ}`` is closed under the point group.  Because V_H is
+    a large matrix element (~500 eV — the full electron-electron Hartree,
+    ~30× Σ_x), the centroid-placement-dependent quadrature error is
+    amplified into a multi-eV C3 split of ⟨nk|V_H|nk⟩ across equivalent k,
+    which corrupts the QP dispersion (Vxc = E_dft − kin_ion − V_H).
+
+    Orbit-closing the centroids fixes it — but the orbit must be closed
+    under the **crystal** point group, and the WFN's stored symmetry list
+    can be *smaller* than that.  A non-collinear SOC MoS₂ WFN, for example,
+    stores only ``ntran=2`` = {E, σ_h}: pw2bgw drops the C3 rotations (they
+    would need a spinor rotation the BGW ``mtrx`` format can't carry), even
+    though the crystal — and the charge density — are fully D3h symmetric.
+    Closing centroids under the stored {E, σ_h} leaves V_H C3-broken.
+
+    The physically-correct group to close under is the one that leaves the
+    ground-state **charge density** invariant: for a non-magnetic crystal
+    that is the full crystal point group; for a magnetically-ordered
+    crystal it is the (smaller) magnetic point group.  Testing invariance
+    of the QE-symmetrized ρ(r) directly recovers the former without
+    over-closing the latter — a bare atom-position test would wrongly add
+    the ops broken by magnetic order.
+
+    Method
+    ------
+    1. Enumerate the holohedry: integer matrices ``M`` (entries in
+       {−1,0,1}, valid for a primitive-cell fractional basis of any of the
+       7 crystal systems) with ``Mᵀ G M = G`` where ``G = avec·avecᵀ`` is
+       the real-space metric.  These are the r-action (BGW ``Rinv``)
+       matrices of every metric-preserving point operation.
+    2. Keep the ``M`` under which the density grid is invariant:
+       ``ρ[M·n mod N] ≈ ρ[n]`` for every FFT-grid index ``n`` (M maps the
+       grid to itself because it is integer).  Non-symmorphic ops (τ≠0)
+       fail this τ=0 test and are conservatively omitted — safe, because a
+       WFN that genuinely carries non-symmorphic ops already exposes them
+       (see :func:`build_real_space_syms`, which keeps the larger group).
+
+    Parameters
+    ----------
+    avec : (3, 3) real
+        Real-space lattice vectors as rows (any length unit — only the
+        metric shape matters).
+    charge_density : (Nx, Ny, Nz) real
+        Point-group-symmetrized ground-state density on the FFT grid
+        (e.g. QE's ``charge-density.hdf5``).
+    tol_rho : float
+        Relative tolerance ``max|ρ[Mn]−ρ[n]| / max|ρ|`` for calling an op
+        a density symmetry.
+
+    Returns
+    -------
+    Rinv : (n_op, 3, 3) int32
+        The r-action matrices of the recovered symmorphic density point
+        group (τ = 0).  Always contains the identity; closed under the
+        group operation by construction.
+    """
+    A = np.asarray(avec, dtype=np.float64)
+    G = A @ A.T
+    # Scale-relative tolerance: ``avec`` carries ~1e-7 float roundoff (e.g.
+    # √3/2 ≈ 0.8660253) that propagates into G, so an exact-integer test on
+    # Mᵀ G M is too brittle.  A true point op reproduces G to that roundoff
+    # (~1e-6·|G|); a non-op differs by O(|G|).  1e-4·max|G| cleanly separates
+    # them for any lattice (alat-normalized or Bohr; hexagonal off-diagonal
+    # ±0.5 vs a wrong op's O(1) mismatch).
+    gtol = 1e-4 * float(np.max(np.abs(G)))
+
+    # 1. Holohedry: integer M with Mᵀ G M = G.
+    import itertools
+    holo = []
+    for entries in itertools.product((-1, 0, 1), repeat=9):
+        M = np.array(entries, dtype=np.int64).reshape(3, 3)
+        if abs(round(np.linalg.det(M))) != 1:
+            continue
+        if np.max(np.abs(M.T @ G @ M - G)) <= gtol:
+            holo.append(M)
+
+    # 2. Density-invariance filter on the FFT grid.
+    rho = np.asarray(charge_density, dtype=np.float64)
+    N = np.asarray(rho.shape, dtype=np.int64)
+    scale = float(np.max(np.abs(rho))) or 1.0
+    ix, iy, iz = np.meshgrid(np.arange(N[0]), np.arange(N[1]), np.arange(N[2]),
+                             indexing="ij")
+    n_idx = np.stack([ix.ravel(), iy.ravel(), iz.ravel()], axis=1)  # (P,3)
+    rho_flat = rho.ravel()
+    keep = []
+    for M in holo:
+        img = (n_idx @ M.T) % N[None, :]                # r' = M·n  (mod grid)
+        img_flat = img[:, 0] * (N[1] * N[2]) + img[:, 1] * N[2] + img[:, 2]
+        if np.max(np.abs(rho_flat[img_flat] - rho_flat)) <= tol_rho * scale:
+            keep.append(M)
+    if not keep:                                        # identity always works
+        keep = [np.eye(3, dtype=np.int64)]
+    return np.asarray(keep, dtype=np.int32)
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Build sym table (host)
 # ─────────────────────────────────────────────────────────────────────────
 
-def build_real_space_syms(wfn, sym, validate: bool = True):
+def build_real_space_syms(wfn, sym, validate: bool = True, *,
+                          charge_density=None):
     """Spatial-only sym data for r-space orbit construction.
 
     Parameters
@@ -38,6 +150,17 @@ def build_real_space_syms(wfn, sym, validate: bool = True):
     wfn, sym : LORRAX WFNReader / SymMaps.
     validate : if True, run ``sym.validate_atomic_symmetries(wfn)`` and
         raise if it returns failures.
+    charge_density : (Nx, Ny, Nz) real, optional
+        The k-means weighting density.  When supplied, the symmorphic
+        point group that leaves it invariant is recovered
+        (:func:`recover_symmorphic_density_point_group`); if that group
+        strictly contains the WFN's stored group, it is used for centroid
+        orbit closure instead.  This recovers point-group symmetry a
+        reduced WFN (e.g. non-collinear SOC, which stores only {E, σ_h})
+        dropped, so ⟨nk|V_H|nk⟩ becomes C3-symmetric across the k-star.
+        The downstream ζ / V_q IBZ cascade continues to use the WFN's
+        stored group; only the centroid *set* is closed under the larger
+        (density) group — which is all a scalar quadrature needs.
 
     Returns
     -------
@@ -51,11 +174,32 @@ def build_real_space_syms(wfn, sym, validate: bool = True):
                 f"sym data fails atomic-orbit closure: {failures[:3]}"
             )
     n_sym = int(wfn.ntran)
+    Rinv_wfn = np.asarray(sym.Rinv_grid[:n_sym], dtype=np.int32)
+    tau_wfn = np.asarray(wfn.translations[:n_sym], dtype=np.float64) / (2.0 * np.pi)
+
+    if charge_density is not None:
+        Rinv_rho = recover_symmorphic_density_point_group(
+            np.asarray(wfn.avec), charge_density)
+        wfn_symmorphic = np.allclose(tau_wfn, 0.0, atol=1e-6)
+        rho_set = {M.tobytes() for M in Rinv_rho}
+        wfn_in_rho = all(M.tobytes() in rho_set for M in Rinv_wfn)
+        # Only adopt the density group when it is a strict superset of the
+        # WFN group (i.e. the WFN symmetry is reduced).  Requiring the WFN
+        # ops ⊆ density group AND symmorphic guards against ever *losing* a
+        # non-symmorphic op the WFN carries but the τ=0 detector can't see.
+        if wfn_symmorphic and wfn_in_rho and Rinv_rho.shape[0] > n_sym:
+            print(f"  [orbit] WFN stores {n_sym} sym op(s); recovered "
+                  f"{Rinv_rho.shape[0]}-op symmorphic point group from the "
+                  f"charge density — closing centroids under the larger group "
+                  f"(fixes V_H k-star symmetry).")
+            Rinv = Rinv_rho
+            R = np.rint(np.linalg.inv(Rinv)).astype(np.int32)
+            tau = np.zeros((Rinv.shape[0], 3), dtype=np.float64)
+            return (jnp.asarray(R), jnp.asarray(Rinv), jnp.asarray(tau))
+
     R = jnp.asarray(np.asarray(sym.R_grid[:n_sym], dtype=np.int32))
-    Rinv = jnp.asarray(np.asarray(sym.Rinv_grid[:n_sym], dtype=np.int32))
-    tau = jnp.asarray(
-        np.asarray(wfn.translations[:n_sym], dtype=np.float64) / (2.0 * np.pi)
-    )
+    Rinv = jnp.asarray(Rinv_wfn)
+    tau = jnp.asarray(tau_wfn)
     return R, Rinv, tau
 
 

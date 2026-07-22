@@ -141,6 +141,9 @@ def fit_zeta_to_h5(
     solver_kind: str = 'auto',
     distributed_cholesky: str = "auto",
     distributed_lu: str = "auto",
+    zeta_ridge: float = 0.0,
+    charge_zeta_solve: str = "cholesky",
+    zeta_rcond: float = 1e-8,
     gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
@@ -416,20 +419,30 @@ def fit_zeta_to_h5(
     # otherwise be amplified by 10^4–10^6).
     with timing.section("zeta_fit.cholesky"):
         # Resolve once so the banner reflects what actually runs and
-        # downstream callees skip their own 'auto' fallback.
+        # downstream callees skip their own 'auto' fallback.  Pass the
+        # factor batch (nq = C_q_flat.shape[0], IBZ-sliced above when the
+        # cascade fires) and the logical centroid count so the charge
+        # resolver can pick the mesh-invariant replicated dense Cholesky for
+        # fit-size stacks (see _resolve_solver_kind_charge).
         _resolved_solver_kind = _resolve_solver_kind(
             mesh_xy, int(vertex_mu_L), solver_kind,
             distributed_cholesky=distributed_cholesky,
-            distributed_lu=distributed_lu)
+            distributed_lu=distributed_lu,
+            n_rmu=int(n_rmu), nq=int(C_q_flat.shape[0]),
+            charge_zeta_solve=charge_zeta_solve)
         if int(vertex_mu_L) == 0:
-            print(f"  Computing L_q = chol(C_q)  [PSD, charge channel, "
+            _how = ("rank-truncated pinv"
+                    if _resolved_solver_kind == 'replicated_rank_truncate'
+                    else "chol(C_q)")
+            print(f"  Computing L_q = {_how}  [PSD, charge channel, "
                   f"path={_resolved_solver_kind}]")
         else:
             print(f"  Pass through C_q  [γ̃^{vertex_mu_L} indefinite — "
                   f"path={_resolved_solver_kind}]")
         L_q = factor_c_q(
             C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
-            n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind)
+            n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
+            zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond)
         L_q.block_until_ready()
         print(f"  L_q: {L_q.shape}")
 

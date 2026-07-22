@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import glob
 import os
+from functools import partial
 from typing import Optional
 
 import h5py
@@ -12,6 +13,8 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from runtime.padding import padded_mu_extent
+
+from .bse_serial import compute_pair_amplitude
 
 
 _BARE_V_FALLBACK_WARNING = (
@@ -51,7 +54,14 @@ def write_eigenvectors_stream(
     nky: int,
     nkz: int,
     n_write: int,
+    use_tda: bool = True,
 ) -> None:
+    # ``use_tda`` is written HONESTLY (was hardcoded 1).  TDA eigenvectors arrive
+    # as ``(n_write, 1, nc, nv, nk)`` (resonant X only); full-BSE (non-TDA) as
+    # ``(n_write, 2, nc, nv, nk)`` = the paired (X, Y) with X^H X - Y^H Y = +1.
+    # For non-TDA the resonant X is written to ``eigenvectors`` (so the
+    # sum-over-states absorption reads the dominant part) and the coupling Y to a
+    # sibling ``eigenvectors_coupling`` dataset (both components persisted).
     # BGW eigenvectors.h5 stores eigenvalues in eV (header text in
     # ``eigenvalues.dat`` says "eig (eV)"; matches BGW's BSE/diag.f90
     # write path).  Our solvers return Ry — convert here so a downstream
@@ -87,7 +97,7 @@ def write_eigenvectors_stream(
         params.create_dataset("ns", data=ns)
         params.create_dataset("nc", data=n_cond)
         params.create_dataset("nv", data=n_val)
-        params.create_dataset("use_tda", data=1)
+        params.create_dataset("use_tda", data=1 if use_tda else 0)
 
         kpoints = exciton_header.create_group("kpoints")
         kpoints.create_dataset("nk", data=nk)
@@ -102,26 +112,40 @@ def write_eigenvectors_stream(
             shape=(1, n_write, nk, n_cond, n_val, ns, 2),
             dtype=np.float64,
         )
+        coupling_dset = None
+        if not use_tda:
+            coupling_dset = exciton_data.create_dataset(
+                "eigenvectors_coupling",
+                shape=(1, n_write, nk, n_cond, n_val, ns, 2),
+                dtype=np.float64,
+            )
+
+        def _to_bgw(comp):
+            # comp: (nc, nv, nk) -> BGW (nk, nc, nv, ns) layout.  BGW convention:
+            # valence axis reversed (v=0 = highest valence, BSE/input_fi.f90:407);
+            # our internal slice puts v=0 at deepest valence, so flip on write.
+            c = np.transpose(comp, (2, 0, 1))[:, :, ::-1][..., None]
+            return c.real, c.imag
 
         for i in range(n_write):
             vec = jax.device_get(eigenvectors[i])
-            # Sharded path returns (block=1, nc, nv, nk); the unsharded
-            # path returns (nc, nv, nk).  Squeeze the leading block axis
-            # if present so the transpose below is unambiguous.
-            if vec.ndim == 4:
-                vec = vec[0]
-            vec = np.transpose(vec, (2, 0, 1))  # (nk, nc, nv)
-            # BGW convention: valence axis is reversed, v=0 is the highest
-            # valence band (just below the gap), counting down to deepest.
-            # Our internal slice ``val_idx = n_occ - n_val .. n_occ`` puts
-            # v=0 at the deepest valence — flip on write so the file is
-            # BGW-format-compliant (BSE/input_fi.f90:407).
-            vec = vec[:, :, ::-1]
-            vec = vec[..., None]  # (nk, nc, nv, ns)
-            evec_dset[0, i, :, :, :, :, 0] = vec.real
-            evec_dset[0, i, :, :, :, :, 1] = vec.imag
+            if use_tda:
+                # (1, nc, nv, nk) sharded or (nc, nv, nk) unsharded -> resonant X.
+                Xc = vec[0] if vec.ndim == 4 else vec
+                Yc = None
+            else:
+                # (2, nc, nv, nk) = paired (X, Y) from the non-TDA solver.
+                Xc, Yc = vec[0], vec[1]
+            re, im = _to_bgw(Xc)
+            evec_dset[0, i, :, :, :, :, 0] = re
+            evec_dset[0, i, :, :, :, :, 1] = im
+            if Yc is not None:
+                re, im = _to_bgw(Yc)
+                coupling_dset[0, i, :, :, :, :, 0] = re
+                coupling_dset[0, i, :, :, :, :, 1] = im
 
-    print(f"Wrote {n_write} eigenvectors to {output_file}")
+    print(f"Wrote {n_write} eigenvectors to {output_file}"
+          + ("" if use_tda else " (+ coupling Y)"))
 
 
 def _pad_last_axis(x: jax.Array, target: int) -> jax.Array:
@@ -153,6 +177,133 @@ def _pad_first_two_axes(x: jax.Array, target: int) -> jax.Array:
     pad_width[0] = (0, max(0, pad0))
     pad_width[1] = (0, max(0, pad1))
     return jnp.pad(x, pad_width, mode="constant")
+
+
+def _zeropad_R_axis(x: jax.Array, axis: int, n_fine: int) -> jax.Array:
+    """Spectral zero-pad one real-space (R) axis from a coarse to a fine k-lattice.
+
+    ``x`` is a real-space tensor whose ``axis`` is the R-lattice DUAL to a
+    COARSE BZ axis of length ``n_c = x.shape[axis]`` (i.e. an ``ifft`` over that
+    BZ axis already happened).  We embed the ``n_c`` coarse Fourier coefficients
+    into ``n_fine`` slots so that an ``fft`` back to ``n_fine`` BZ points is the
+    exact band-limited trigonometric interpolant of the coarse ``W(k)`` — which,
+    because the coarse BZ points are a subset of the fine ones (``n_fine`` a
+    multiple of ``n_c``), passes THROUGH the coarse samples exactly.
+
+    Per-element R-lattice index map (the crux).  numpy/JAX FFT order maps array
+    index ``i∈[0,N)`` to the physical lattice-vector rep ``n = fftfreq(N)*N``:
+
+        n = i        for 0 ≤ i < ⌈N/2⌉     (the non-negative reps 0,1,…)
+        n = i − N    for ⌈N/2⌉ ≤ i < N      (the negative reps …,−2,−1, wrapped)
+
+    For even ``N`` the single Nyquist rep ``n = −N/2`` sits at ``i = N/2`` (it is
+    in the negative branch here — kept single-sided, NOT split; sample agreement
+    is exact regardless, and single-sided = "coarse WS cell, zero outside",
+    which is precisely the requested zero-pad).  Embedding coarse→fine with
+    ``s = ⌈n_c/2⌉ = (n_c+1)//2`` non-negative reps:
+
+        coarse i_c ∈ [0, s)      (reps n = 0 … s−1)      → fine i_f = i_c
+        coarse i_c ∈ [s, n_c)    (reps n = −(n_c−s) … −1) → fine i_f = i_c + (n_fine − n_c)
+
+    i.e. the low block keeps its indices, the high (negative-freq) block slides
+    to the TOP of the fine axis, and the gap ``i_f ∈ [s, n_fine − (n_c−s))`` is
+    ZERO (the high-|R| coefficients absent from the coarse cell — incl. the
+    fine-only Nyquist and the absent coarse ``+n_c/2``).  Realised as
+    ``concat([low, zeros, high])`` — the textbook fft zero-insertion, exact for
+    any parity of ``n_c``.
+
+    NOTE: scale is applied ONCE by the caller (``pad_W_R_to_grid``), not here.
+    """
+    n_c = x.shape[axis]
+    if n_fine == n_c:
+        return x
+    if n_fine < n_c or n_fine % n_c != 0:
+        raise ValueError(
+            f"_zeropad_R_axis: fine length {n_fine} must be a positive multiple "
+            f"of the coarse length {n_c} (coarse BZ points ⊂ fine BZ points).")
+    s = (n_c + 1) // 2
+    lo = jax.lax.slice_in_dim(x, 0, s, axis=axis)
+    hi = jax.lax.slice_in_dim(x, s, n_c, axis=axis)
+    zshape = list(x.shape)
+    zshape[axis] = n_fine - n_c
+    zeros = jnp.zeros(zshape, dtype=x.dtype)
+    return jnp.concatenate([lo, zeros, hi], axis=axis)
+
+
+def pad_W_R_to_grid(W_R_coarse: jax.Array,
+                    fine_grid: tuple[int, int, int]) -> jax.Array:
+    """Zero-pad a coarse-k-grid real-space ``W_R`` onto a finer k-lattice.
+
+    Enables a CHEAP coarse-grid W (e.g. GW/W on 6×6) to drive the BSE direct
+    term on an arbitrarily FINE interpolated exciton sampling (e.g. 12×12):
+    zero-padding in R is EXACT trigonometric interpolation in k that agrees
+    with the coarse ``W(k)`` at the coarse sub-k-points that coincide with the
+    fine grid (they do when each fine length is a multiple of the coarse one).
+
+    Parameters
+    ----------
+    W_R_coarse : (..., ncx, ncy, ncz)
+        Screened interaction on the real-space (R) lattice DUAL to a COARSE BZ
+        grid, i.e. ``ifftn(W_q_coarse, axes=last-3, norm='ortho')``.  Leading
+        axes (μ, ν, spin, …) are carried through untouched; only the trailing
+        three (kx, ky, kz) R-axes are re-embedded.
+    fine_grid : (nfx, nfy, nfz)
+        Target BZ grid.  Each ``nf`` must be a positive multiple of the matching
+        coarse length (so the coarse BZ ⊂ fine BZ).
+
+    Returns
+    -------
+    W_R_fine : (..., nfx, nfy, nfz)
+        Such that ``fftn(W_R_fine, norm='ortho')`` sampled at the fine BZ points
+        coinciding with the coarse grid equals ``W_q_coarse`` bit-close, i.e.
+        ``W_R_fine == ifftn(W_q_fine_interpolant, norm='ortho')`` — a drop-in for
+        the matvec's ``W_R`` on the FINE grid.
+
+    Scale.  ortho FFTs carry ``1/√N``, and ``N`` grows coarse→fine.  For the
+    fine ``fft`` of the embedded coefficients to reproduce the coarse samples,
+    the padded tensor is multiplied by ``√(∏nf / ∏nc)`` (= 2 for 6×6×1→12×12×1).
+
+    Degenerate ``fine_grid == coarse shape``: returns ``W_R_coarse`` UNCHANGED
+    (exact byte-identical no-op — scale is 1 and no axis is padded).
+    """
+    if W_R_coarse.ndim < 3:
+        raise ValueError(
+            f"pad_W_R_to_grid: expected trailing (kx,ky,kz) axes, got ndim="
+            f"{W_R_coarse.ndim}")
+    coarse_grid = tuple(int(s) for s in W_R_coarse.shape[-3:])
+    fine_grid = tuple(int(s) for s in fine_grid)
+    if fine_grid == coarse_grid:
+        return W_R_coarse                         # exact no-op (fast path)
+    out = W_R_coarse
+    for ax, nf in zip((-3, -2, -1), fine_grid):
+        out = _zeropad_R_axis(out, ax, nf)
+    n_c_tot = coarse_grid[0] * coarse_grid[1] * coarse_grid[2]
+    n_f_tot = fine_grid[0] * fine_grid[1] * fine_grid[2]
+    scale = jnp.sqrt(jnp.asarray(n_f_tot / n_c_tot, dtype=out.real.dtype))
+    return out * scale
+
+
+def decimate_W_q_to_subgrid(W_q: jax.Array,
+                            coarse_grid: tuple[int, int, int]) -> jax.Array:
+    """Sub-sample a fine-grid ``W_q`` onto a coarse BZ sub-grid (every m-th q).
+
+    ``W_q`` is ``(μ, ν, nfx, nfy, nfz)`` on a FINE BZ grid; returns the tiles at
+    the coarse sub-grid BZ points ``q_j = j·(nf/nc)`` (which coincide with a
+    coarse ``nc``-point grid since ``nf`` is a multiple of ``nc``).  This is the
+    honest "what a coarse-grid W sampling looks like, in the SAME ISDF μ-basis"
+    — used to drive ``pad_W_R_to_grid`` from a single fine restart (the q=0 tile,
+    incl. its rank-1 head, is preserved because q=0 is on both grids).
+    """
+    nf = tuple(int(s) for s in W_q.shape[-3:])
+    coarse_grid = tuple(int(s) for s in coarse_grid)
+    for a, (f, c) in enumerate(zip(nf, coarse_grid)):
+        if c <= 0 or f % c != 0:
+            raise ValueError(
+                f"decimate_W_q_to_subgrid: fine axis {a} length {f} must be a "
+                f"positive multiple of coarse {c}.")
+    rx, ry, rz = (nf[0] // coarse_grid[0], nf[1] // coarse_grid[1],
+                  nf[2] // coarse_grid[2])
+    return W_q[:, :, ::rx, ::ry, ::rz]
 
 
 def _pad_axis_to_multiple(x: jax.Array, axis: int, multiple: int) -> tuple[jax.Array, int]:
@@ -396,6 +547,191 @@ def _read_wq_sharded(
     return w_global
 
 
+def _parse_grid_spec(spec) -> Optional[tuple[int, int, int]]:
+    """Parse a ``bse_k_grid`` value → ``(nx, ny, nz)`` or ``None`` (unset).
+
+    Accepts ``"NX NY NZ"``, ``"NX,NY,NZ"``, a 3-tuple/list, or an empty
+    string / None (→ ``None``).  Single source for both the cohsex.in key and
+    any driver flag.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, (tuple, list)):
+        parts = list(spec)
+    else:
+        s = str(spec).strip()
+        if not s:
+            return None
+        parts = s.replace(",", " ").split()
+    if len(parts) != 3:
+        raise ValueError(f"bse_k_grid must have 3 integers, got {spec!r}")
+    return tuple(int(x) for x in parts)
+
+
+def _resolve_bse_k_grid(bse_k_grid, input_file: Optional[str]):
+    """Resolve the fine grid: explicit ``bse_k_grid`` arg wins; else read the
+    ``bse_k_grid`` key from ``input_file`` (cohsex.in).  Returns a 3-tuple or
+    ``None`` (feature off)."""
+    fine = _parse_grid_spec(bse_k_grid)
+    if fine is not None:
+        return fine
+    if input_file is not None and os.path.isfile(input_file):
+        try:
+            from gw.gw_config import read_lorrax_input
+            return _parse_grid_spec(read_lorrax_input(input_file).get("bse_k_grid"))
+        except Exception as exc:               # config parse must never crash load
+            print(f"BSE: bse_k_grid config read failed ({exc}); feature off")
+    return None
+
+
+def _interpolate_bse_data_to_grid(
+    data: dict,
+    fine_grid: tuple[int, int, int],
+    restart_file: str,
+    input_file: str,
+    mesh_xy: Mesh,
+    *,
+    log_fn=print,
+) -> dict:
+    """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
+
+    The single coarse→fine densification the ``bse_k_grid`` knob drives, living
+    in the GENERAL init so EVERY solver consumes a fine-grid bundle unchanged.
+    Reuses the exact machinery the exciton_bands Q-path uses — no second copy:
+
+      * ψ_{v,c}(k) and QP ε_{v,c}(k) on the fine mesh ← ONE htransform fH
+        (``bandstructure.htransform.initialize_wfns`` +
+        ``bandstructure.bse_setup.compute_wfns_fi`` with ``kgrid_fi=fine_grid``);
+        the fH is built over the full loaded band window and only the BSE
+        sub-window [nval−n_val, nval+n_cond) is returned (interior, guarded).
+      * V_Q exchange q=0 tile ← ``bse.vq_interp.build_vq_evaluator`` (the SAME
+        builder exciton_bands calls) evaluated at Q=0 with the FINE mini-BZ
+        head (``minibz_head_vlr(..., kgrid=fine_grid)``).  A Q=0 exciton's
+        exchange is the single q=0 tile (dense in k,k'); the fine k-grid's
+        exchange "q-set" is therefore just q=0.
+      * W direct ← ``pad_W_R_to_grid`` (coarse→fine zero-pad in R = exact trig
+        interpolation), fft'd back to a fine ``W_q`` so each solver's own
+        ``ifftn(W_q)`` reproduces the padded ``W_R``.  This is the mechanism the
+        exciton_bands ``--w-coarse-grid`` flag runs; ``bse_k_grid`` drives it
+        automatically (the banner below is the "W-pad fired" proof).
+
+    Band dims (n_val/n_cond and their mesh-pads), n_rmu(_pad), and the q=0 head
+    projectors g0 are grid-INVARIANT and carried through untouched; only the k
+    axis (and W's k-axes) change.  Returns a new bundle with the SAME keys.
+    """
+    from bandstructure import htransform as ht
+    from bandstructure.bse_setup import compute_wfns_fi
+    from gw.gw_config import read_lorrax_input
+
+    from . import vq_interp
+
+    coarse_grid = (int(data["nkx"]), int(data["nky"]), int(data["nkz"]))
+    fine_grid = tuple(int(s) for s in fine_grid)
+    for a, (f, c) in enumerate(zip(fine_grid, coarse_grid)):
+        if c <= 0 or f <= 0 or f % c != 0:
+            raise ValueError(
+                f"bse_k_grid axis {a}: fine {f} must be a positive multiple of "
+                f"the coarse restart grid {c} (coarse BZ ⊂ fine BZ).")
+    n_val = int(data["n_val"]); n_cond = int(data["n_cond"])
+    nv_pad = int(data["n_val_pad"]); nc_pad = int(data["n_cond_pad"])
+    n_rmu = int(data["n_rmu"]); n_rmu_pad = int(data["n_rmu_pad"])
+    nk_f = fine_grid[0] * fine_grid[1] * fine_grid[2]
+    log_fn(f"[bse_k_grid] coarse {coarse_grid[0]}x{coarse_grid[1]}x{coarse_grid[2]}"
+           f" → fine {fine_grid[0]}x{fine_grid[1]}x{fine_grid[2]} "
+           f"({nk_f} k-pts); interpolating ψ/ε (htransform), V_Q (vq_interp), "
+           f"W (zero-pad in R)")
+
+    params = read_lorrax_input(input_file)
+
+    # ── ψ_{v,c}(k_fine), ε_{v,c}(k_fine): ONE htransform fH ───────────────
+    (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
+     enk_sigma) = ht.initialize_wfns(input_file, params, log_fn, mesh_xy=mesh_xy)
+    nb_window = int(ctilde.shape[1])
+    nval_in = int(params["nval"])          # window-relative CBM index
+    b_min, b_max = nval_in - n_val, nval_in + n_cond
+    if b_min < 0 or b_max > nb_window:
+        raise ValueError(
+            f"bse_k_grid BSE window [{b_min},{b_max}) escapes the htransform fH "
+            f"window [0,{nb_window}); the input's nval/nband must load "
+            f">= {n_val} valence and >= {n_cond} conduction guard bands.")
+    bundle = compute_wfns_fi(
+        ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
+        kgrid_co=coarse_grid, kgrid_fi=fine_grid,
+        band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, log_fn=log_fn)
+
+    x4 = NamedSharding(mesh_xy, P(None, None, None, "x"))
+    y4 = NamedSharding(mesh_xy, P(None, None, None, "y"))
+    rep = NamedSharding(mesh_xy, P())
+
+    @partial(jax.jit, out_shardings=(x4, y4, x4, y4, rep, rep))
+    def _split_pad(psi, enk):
+        # psi (nk_f, n_val+n_cond, ns, n_mu); enk (nk_f, n_val+n_cond).
+        psi_v = psi[:, :n_val]
+        psi_c = psi[:, n_val:n_val + n_cond]
+        psi_v = jnp.pad(psi_v, ((0, 0), (0, nv_pad - n_val), (0, 0),
+                                (0, n_rmu_pad - psi.shape[3])))
+        psi_c = jnp.pad(psi_c, ((0, 0), (0, nc_pad - n_cond), (0, 0),
+                                (0, n_rmu_pad - psi.shape[3])))
+        eps_v = jnp.pad(enk[:, :n_val], ((0, 0), (0, nv_pad - n_val)))
+        eps_c = jnp.pad(enk[:, n_val:n_val + n_cond], ((0, 0), (0, nc_pad - n_cond)))
+        return (jax.lax.with_sharding_constraint(psi_v, x4),
+                jax.lax.with_sharding_constraint(psi_v, y4),
+                jax.lax.with_sharding_constraint(psi_c, x4),
+                jax.lax.with_sharding_constraint(psi_c, y4),
+                eps_v, eps_c)
+
+    psi_v_X, psi_v_Y, psi_c_X, psi_c_Y, eps_v, eps_c = _split_pad(
+        bundle.psi_rmu_Y, bundle.enk_full)
+    M_X = jax.lax.with_sharding_constraint(
+        compute_pair_amplitude(psi_c_X, psi_v_X), x4)
+    M_Y = jax.lax.with_sharding_constraint(
+        compute_pair_amplitude(psi_c_Y, psi_v_Y), y4)
+
+    # ── V_Q exchange q=0 tile on the fine grid (SAME vq_interp builder) ───
+    # A Q=0 exciton's exchange kernel is DENSE in (k,k') through the ONE q=0
+    # tile (bse_serial.apply_bse_hamiltonian_single_device); so the fine
+    # k-grid's exchange q-set is just q=0.  We eval it with the FINE mini-BZ
+    # head (the head magnitude scales with the mini-BZ cell area, which shrinks
+    # coarse→fine); the body is the b26p/stencil model reproduced at the q=0
+    # training point (run_nulls certifies the reproduction).
+    vqm = vq_interp.build_vq_evaluator(
+        restart_file, mesh_xy, n_rmu_pad, head_minibz_average=True,
+        log_fn=log_fn)
+    gstar, head_val = vq_interp.minibz_head_vlr(
+        vqm.zx, vqm.prep, np.zeros(3), kgrid=fine_grid)
+    V_q0 = vqm.eval_vq(jnp.zeros(3), vqm.prep["V_SRc"], vqm.pinvF,
+                       vqm.coeffs_packed,
+                       jnp.asarray(head_val, dtype=jnp.float64),
+                       jnp.asarray(gstar, dtype=jnp.int32))
+    V_q0 = 0.5 * (V_q0 + jnp.conj(V_q0).T)     # Hermitize (stencil residue)
+    V_q0 = jax.device_put(V_q0, NamedSharding(mesh_xy, P("x", "y")))
+    log_fn(f"[bse_k_grid] V_q0 exchange tile via vq_interp eval_vq(Q=0), "
+           f"fine mini-BZ head <v_LR>={head_val:.4f} (gstar={gstar})")
+
+    # ── W direct: coarse W_q → ifft(R) → zero-pad R → fine → fft back ─────
+    W_sh = NamedSharding(mesh_xy, P("x", "y", None, None, None))
+    W_R_coarse = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
+    W_R_fine = pad_W_R_to_grid(W_R_coarse, fine_grid)
+    W_q_fine = jnp.fft.fftn(W_R_fine, axes=(2, 3, 4), norm="ortho")
+    W_q_fine = jax.device_put(W_q_fine, W_sh)
+    log_fn(f"[bse_k_grid] W zero-padded in R "
+           f"{coarse_grid[0]}x{coarse_grid[1]}x{coarse_grid[2]}→"
+           f"{fine_grid[0]}x{fine_grid[1]}x{fine_grid[2]} "
+           f"(exact trig-interp; direct term now on the fine grid)")
+
+    out = dict(data)
+    out.update({
+        "psi_c_X": psi_c_X, "psi_c_Y": psi_c_Y,
+        "psi_v_X": psi_v_X, "psi_v_Y": psi_v_Y,
+        "M_X": M_X, "M_Y": M_Y,
+        "eps_c": eps_c, "eps_v": eps_v,
+        "W_q": W_q_fine, "V_q0": V_q0,
+        "V_q_full": None,                       # finite-q resolvent not a fine use
+        "nkx": fine_grid[0], "nky": fine_grid[1], "nkz": fine_grid[2],
+    })
+    return out
+
+
 def load_bse_data_from_restart_sharded(
     restart_file: str,
     n_val: int = 4,
@@ -408,8 +744,34 @@ def load_bse_data_from_restart_sharded(
     input_file: Optional[str] = None,
     cell_volume: Optional[float] = None,
     n_occ: Optional[int] = None,
+    inject_head: bool = True,
+    load_v_full: bool = False,
+    bse_k_grid=None,
 ) -> dict:
-    """Load BSE tensors from canonical gw_jax restart state (psi_full_y/enk_full)."""
+    """Load BSE tensors from canonical gw_jax restart state (psi_full_y/enk_full).
+
+    ``bse_k_grid`` (``(nx,ny,nz)`` / ``"nx ny nz"`` / ``None``) turns on
+    fine-grid densification: when set and DIFFERENT from the coarse restart
+    grid, the ENTIRE bundle (ψ, QP ε, V_Q exchange, W direct) is interpolated
+    onto that grid via :func:`_interpolate_bse_data_to_grid` BEFORE returning,
+    so every downstream solver runs on the fine grid transparently.  When
+    ``None`` the value is read from the cohsex.in ``bse_k_grid`` key (via
+    ``input_file``); unset or == the coarse grid → the coarse bundle is
+    returned byte-identically (fast path untouched).
+
+    ``inject_head=False`` returns the head-LESS V_q0 / W_q bodies exactly as
+    stored on disk (the rank-1 q=0 head from vhead/whead is NOT added). Used by
+    body-vs-body diagnostics such as the W(0) resolvent cross-check, where both
+    sides must be head-less (bse_w_exact ``--compare-w0``).
+
+    ``load_v_full=True`` additionally reads the FULL exchange tensor
+    ``V_qmunu`` at every q as ``data['V_q_full']`` (μ, ν, nkx, nky, nkz),
+    P('x','y',None,None,None) — same layout as ``W_q``.  The finite-q W_q
+    resolvent (``bse_w_exact --compare-wq``) picks the tile
+    ``V_q_full[:, :, qx, qy, qz]`` (NO head at q≠0) as the screening V and as
+    the comparison target ``W_q[...,q] - V_q_full[...,q]``.  Default False keeps
+    the q=0 path byte-identical.
+    """
     if mesh_xy is None:
         raise ValueError("mesh_xy is required for sharded load")
 
@@ -515,6 +877,14 @@ def load_bse_data_from_restart_sharded(
         W_q = _read_wq_sharded(wq_dset, mu_per_x, nu_per_y, mesh_xy, n_rmu_pad,
                                trim=False, kgrid=(nkx, nky, nkz))
 
+        # Full-q exchange tensor for the finite-q W_q resolvent: read every V
+        # tile with the SAME (μ, ν, nkx, nky, nkz) reader as W_q (no head; head
+        # is a q=0-only rank-1 piece).  V_q_full[:, :, 0, 0, 0] == V_q0 (the
+        # head-less q=0 read) — a self-check the finite-q harness asserts.
+        V_q_full = (_read_wq_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy,
+                                     n_rmu_pad, trim=False, kgrid=(nkx, nky, nkz))
+                    if load_v_full else None)
+
         # ── q=0 head: load G0_mu_nu, dual-shard X/Y, inject as rank-1 ────
         # On the (μ,ν)-sharded V_q0 and W_q tensors, the rank-1 update
         # ``conj(g0_X[μ_loc]) * g0_Y[ν_loc]`` is local on every proc when
@@ -538,7 +908,7 @@ def load_bse_data_from_restart_sharded(
             g0_X = g0_Y = None
             vhead_restart = whead_restart = None
 
-    if g0_X is not None:
+    if g0_X is not None and inject_head:
         vhead, whead, cell_volume = _resolve_head_params(
             input_file, vhead_restart, whead_restart, cell_volume)
 
@@ -553,16 +923,57 @@ def load_bse_data_from_restart_sharded(
                      if whead is not None else "whead=skipped")
             print(f"BSE-sharded: q=0 head injected (rank-1, dual-sharded G0, "
                   f"V_cell={cell_volume:.2f}): {v_str}, {w_str}")
+        else:
+            # §16.5 latent-bug guard: G0_mu_nu is present and inject_head is
+            # True, but the rank-1 head was NOT injected because vhead/whead
+            # both resolve to None (no cohsex.in override, no restart scalars)
+            # and/or cell_volume is unknown.  Previously silent → a head-LESS
+            # q=0 exchange tile with no trace.  Recompute is NON-TRIVIAL here
+            # (the loader has no wfn/meta/sym/S_cart to rebuild <v>_mBZ), so
+            # warn loudly and name the fix (add vhead/whead to the restart or
+            # a cohsex.in override).
+            import warnings
+            reasons = []
+            if cell_volume is None:
+                reasons.append("cell_volume unknown (WFN not passed)")
+            if vhead is None and whead is None:
+                reasons.append("vhead/whead both unresolved "
+                               "(no cohsex.in override, no restart scalars)")
+            msg = (
+                "BSE q=0 head NOT injected though G0_mu_nu is present and "
+                f"inject_head=True: {', '.join(reasons)}.  The q=0 exchange "
+                "tile is HEAD-LESS (missing the rank-1 (vhead/V_cell)·conj(g0)g0 "
+                "term) — exciton binding energies will be under-bound at the "
+                "zone centre.  FIX: add ``vhead``/``whead_0freq`` to cohsex.in, "
+                "or write ``vhead``/``whead`` datasets into the restart.  "
+                "(Recompute-from-WFN is not available at the loader.)")
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+            print(f"BSE-sharded: [WARN] {msg}")
 
-    return {
+    # Hoisted exchange pair amplitudes M(k,c,v,μ) = Σ_s conj(ψ_c) ψ_v — the V-term
+    # decode (M_X, μ on x) and encode (M_Y, ν on y) vertices. Precomputed ONCE here
+    # (audit P3) so the per-iteration BSE matvec receives them as inputs instead of
+    # rebuilding them from ψ every call. Peak-neutral; the between-matvec floor rises
+    # by ~2·M/p (reports/bse_refactor_map_2026-07-15/archive/matvec_efficiency_audit).
+    M_X = jax.lax.with_sharding_constraint(
+        compute_pair_amplitude(psi_c_X, psi_v_X),
+        NamedSharding(mesh_xy, P(None, None, None, "x")))
+    M_Y = jax.lax.with_sharding_constraint(
+        compute_pair_amplitude(psi_c_Y, psi_v_Y),
+        NamedSharding(mesh_xy, P(None, None, None, "y")))
+
+    data = {
         "psi_c_X": psi_c_X,
         "psi_c_Y": psi_c_Y,
         "psi_v_X": psi_v_X,
         "psi_v_Y": psi_v_Y,
+        "M_X": M_X,
+        "M_Y": M_Y,
         "eps_c": eps_c,
         "eps_v": eps_v,
         "W_q": W_q,
         "V_q0": V_q0,
+        "V_q_full": V_q_full,
         "g0_X": g0_X,
         "g0_Y": g0_Y,
         "nkx": nkx,
@@ -576,6 +987,20 @@ def load_bse_data_from_restart_sharded(
         "n_cond_pad": n_cond_pad,
         "fermi_energy": fermi_energy,
     }
+
+    # ── bse_k_grid coarse→fine densification (general BSE init) ───────────
+    # Explicit arg wins; else read the ``bse_k_grid`` key from the cohsex.in.
+    # None/unset or == the coarse grid → return the coarse bundle above
+    # UNTOUCHED (fast path, byte-identical — the on-grid identity guarantee).
+    fine_grid = _resolve_bse_k_grid(bse_k_grid, input_file)
+    if fine_grid is not None and fine_grid != (nkx, nky, nkz):
+        if input_file is None:
+            raise ValueError(
+                "bse_k_grid densification needs input_file (cohsex.in) to run "
+                "the htransform ψ/ε and vq_interp V_Q interpolation.")
+        data = _interpolate_bse_data_to_grid(
+            data, fine_grid, restart_file, input_file, mesh_xy)
+    return data
 
 
 def read_bgw_eqp(eqp_file: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

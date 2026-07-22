@@ -301,6 +301,27 @@ def make_jittable_local_fftn_3d(
         axes=axes,
     )
 
+def local_ifftn3(x_local, *, axes: tuple[int, ...] = (-3, -2, -1), norm: str | None = None):
+    """Device-local N-D IFFT — the inner kernel of :func:`make_sharded_ifftn_3d`.
+
+    Call this DIRECTLY from code that is already inside a ``shard_map`` (shard_map
+    cannot nest): the operand is a device-local shard whose FFT axes are
+    replicated, so a plain ``jnp.fft.ifftn`` runs entirely on-device.  The
+    ``make_sharded_ifftn_3d`` factory below is just this kernel wrapped in a
+    ``shard_map`` for auto-partitioned callers.  ONE source for the local FFT.
+    """
+    return jnp.fft.ifftn(x_local, axes=axes, norm=norm)
+
+
+def local_fftn3(x_local, *, axes: tuple[int, ...] = (-3, -2, -1), norm: str | None = None):
+    """Device-local N-D forward FFT — inner kernel of :func:`make_sharded_fftn_3d`.
+
+    Forward counterpart of :func:`local_ifftn3`; call directly from inside a
+    ``shard_map``.
+    """
+    return jnp.fft.fftn(x_local, axes=axes, norm=norm)
+
+
 def make_sharded_ifftn_3d(
 	mesh: Mesh,
 	in_spec: P,
@@ -320,11 +341,10 @@ def make_sharded_ifftn_3d(
     Returns:
         A function that performs 3D IFFT on sharded data
     """
-    def _local_ifftn(x_local):
-        # Each device runs FFT on its local shard independently
-        return jnp.fft.ifftn(x_local, axes=axes, norm=norm)
+    def _wrap(x_local):
+        return local_ifftn3(x_local, axes=axes, norm=norm)
 
-    return shard_map(_local_ifftn, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
+    return shard_map(_wrap, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
 
 def make_sharded_fftn_3d(
 	mesh: Mesh,
@@ -339,10 +359,10 @@ def make_sharded_fftn_3d(
 
     This is the forward-FFT counterpart to make_sharded_ifftn_3d.
     """
-    def _local_fftn(x_local):
-        return jnp.fft.fftn(x_local, axes=axes, norm=norm)
+    def _wrap(x_local):
+        return local_fftn3(x_local, axes=axes, norm=norm)
 
-    return shard_map(_local_fftn, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
+    return shard_map(_wrap, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
 
 
 # ============================================================================

@@ -16,6 +16,55 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from file_io import WfnLoader as WFNReader
 
 
+def kgrid_shift_map(nkx, nky, nkz, q_off):
+    """C-order fold + umklapp G for the on-grid shift ``k -> k + q_off``.
+
+    The ONE place the ``k + q`` integer arithmetic lives (finite-momentum
+    remap of on-grid conduction/valence tensors — the ``jnp.roll`` in the BSE
+    W_q / exciton-Q loaders derives its offsets from here).  Pure numpy; no new
+    class.  ``q_off`` is an integer grid-step vector (may be negative).
+
+    Per-element (full-BZ k = (ix, iy, iz), C-order flat
+    ``k = ix·nky·nkz + iy·nkz + iz``; ``q_off = (qx, qy, qz)``):
+
+        jx = ix + qx ;  kpx = jx mod nkx ;  Gx = jx // nkx      (floor div)
+        (same for y, z)
+        kpq_index[k] = kpx·nky·nkz + kpy·nkz + kpz
+        G_umk[k]     = (Gx, Gy, Gz)          integer reciprocal-lattice wrap
+
+    So ``arr[kpq_index]`` gathers the value at ``k + q_off`` into slot ``k``,
+    i.e. it equals ``jnp.roll(arr_reshaped, shift=(-qx, -qy, -qz),
+    axis=(0, 1, 2)).reshape(nk, ...)`` on the C-order (nkx, nky, nkz) k-axis
+    (verified by the identity ``kpq_index == roll`` in the finite-q gate).
+    ``G_umk`` is the wrap count on each axis; for ``0 <= q < nk`` it is in
+    ``{0, 1}``, and it drives the umklapp Bloch phase
+    ``exp(-2πi G_umk · s_μ)`` at centroid fractional coords ``s_μ`` when the
+    stored ψ is the cell-periodic part ``u_{n,k}`` (see the finite-q W_q
+    derivation in reports/bse_refactor_map_2026-07-15/PHASE2_LOG.md).
+
+    Returns
+    -------
+    kpq_index : (nk,) int32   C-order gather index of ``k + q_off``.
+    G_umk     : (nk, 3) int32 per-k reciprocal-lattice wrap.
+    """
+    nkx, nky, nkz = int(nkx), int(nky), int(nkz)
+    qx, qy, qz = (int(v) for v in q_off)
+    ix, iy, iz = np.meshgrid(
+        np.arange(nkx), np.arange(nky), np.arange(nkz), indexing="ij")
+    jx = ix.reshape(-1) + qx
+    jy = iy.reshape(-1) + qy
+    jz = iz.reshape(-1) + qz
+    kpx = np.mod(jx, nkx)
+    kpy = np.mod(jy, nky)
+    kpz = np.mod(jz, nkz)
+    Gx = jx // nkx
+    Gy = jy // nky
+    Gz = jz // nkz
+    kpq_index = (kpx * nky * nkz + kpy * nkz + kpz).astype(np.int32)
+    G_umk = np.stack([Gx, Gy, Gz], axis=1).astype(np.int32)
+    return kpq_index, G_umk
+
+
 def find_irreducible_bz_points(full_kgrid_int, sym_mats_k, *, irr_kgrid_int=None):
     """For each row of ``full_kgrid_int`` (a full-BZ point in integer kgrid
     coords), find which IBZ point + ``sym_mats_k`` row maps onto it.
