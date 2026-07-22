@@ -153,17 +153,94 @@ def run_multiprocess(n: int, repeats: int) -> int:
     return 0
 
 
+def run_dispatch(sizes, repeats: int, batch: int, backend: str) -> int:
+    """The dispatch question: q-BATCHED native vs ONE distributed tile.
+
+    This is the measurement ``ffi.common.dispatch.dispatch_eigh`` cites for
+    choosing a backend, and the one ``bandstructure.bse_setup`` faces per q.
+    Both arms decompose the SAME kind of matrix — Hermitian complex128,
+    ``(n, n)`` — and are reported as **ms per matrix**, the only comparable
+    unit:
+
+      native  ``jnp.linalg.eigh`` on ``(batch, n, n)`` sharded
+              ``P(('x','y'), None, None)``: each device solves
+              ``batch/ndev`` WHOLE matrices concurrently.  Costs
+              ``batch/ndev · n²·16`` bytes per device, so it stops fitting
+              first.
+      ffi     ``dispatch_eigh`` on ONE ``(n, n)`` sharded ``P('x','y')``:
+              the whole mesh works on one matrix, ``n²·16/ndev`` per device.
+
+    One JAX process per GPU (the LORRAX process model), square mesh.
+    """
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from ffi.common.dispatch import dispatch_eigh
+
+    world = jax.process_count()
+    p = int(round(np.sqrt(world)))
+    if p * p != world:
+        _log(f"ERROR: world={world} is not a square process mesh")
+        return 2
+    mesh = Mesh(np.asarray(jax.devices()).reshape(p, p), ("x", "y"))
+    ndev = int(mesh.devices.size)
+    _log(f"\n=== dispatch mode: {p}x{p} mesh, {ndev} devices, "
+         f"batch={batch}, complex128 ===")
+    _log(f"{'n':>7} {'native ms/mat':>15} {'ffi ms/mat':>13} "
+         f"{'ffi/native':>11}  (batch/ndev = {batch // ndev} per device)")
+
+    rng = np.random.default_rng(3)
+    for n in sizes:
+        if n % p:
+            _log(f"{n:>7}  skipped (n not divisible by mesh axis {p})")
+            continue
+        z = (rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n)))
+        A_np = (0.5 * (z + np.conj(z.T)) + n * np.eye(n)).astype(np.complex128)
+
+        A_b = jax.device_put(jnp.broadcast_to(jnp.asarray(A_np), (batch, n, n)),
+                             NamedSharding(mesh, P(("x", "y"), None, None)))
+        f_nat = jax.jit(jnp.linalg.eigh)
+        t_nat = _median_ms(lambda: f_nat(A_b), repeats) / batch
+
+        A_1 = jax.device_put(jnp.asarray(A_np), NamedSharding(mesh, P("x", "y")))
+        t_ffi = _median_ms(lambda: dispatch_eigh(A_1, mesh, backend), repeats)
+
+        _log(f"{n:>7} {t_nat:>15.1f} {t_ffi:>13.1f} {t_ffi / t_nat:>11.2f}")
+    return 0
+
+
+def _median_ms(fn, repeats: int) -> float:
+    """Warm-up excluded; median of ``repeats`` wall times in ms."""
+    jax.block_until_ready(fn())
+    ts = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        jax.block_until_ready(fn())
+        ts.append((time.perf_counter() - t0) * 1000.0)
+    return float(np.median(ts))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["single", "mp"], required=True)
+    ap.add_argument("--mode", choices=["single", "mp", "dispatch"],
+                    required=True)
     ap.add_argument("-n", type=int, default=2048)
+    ap.add_argument("--sizes", default="512,1024,2048,4096",
+                    help="dispatch mode: comma-separated matrix sizes")
+    ap.add_argument("--batch", type=int, default=32,
+                    help="dispatch mode: q per native batch "
+                         "(bse_setup's batch_size default)")
+    ap.add_argument("--backend", default="cusolvermp",
+                    choices=("cusolvermp", "slate"))
     ap.add_argument("--repeats", type=int, default=5)
     args = ap.parse_args()
 
     if args.mode == "single":
         return run_single_process(args.n, args.repeats)
-    else:
-        return run_multiprocess(args.n, args.repeats)
+    if args.mode == "dispatch":
+        from runtime import init_jax_distributed
+        init_jax_distributed()
+        return run_dispatch([int(v) for v in args.sizes.split(",")],
+                            args.repeats, args.batch, args.backend)
+    return run_multiprocess(args.n, args.repeats)
 
 
 if __name__ == "__main__":
