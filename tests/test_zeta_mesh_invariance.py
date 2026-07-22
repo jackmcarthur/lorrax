@@ -204,10 +204,41 @@ def _worker_rank_truncate() -> int:
     return 0
 
 
-def _run_worker(tag: str, timeout: int = 600):
+def _worker_cap() -> int:
+    """Child process: the replication-cap CONTRACT for the production
+    ``charge_zeta_solve='rank_truncate'``.  Reports what the auto resolver
+    returns for the two real MoS2 12×12 / n_μ=2412 ζ stacks — IBZ (nq=74,
+    6.42 GiB) and full-BZ (nq=144, 12.48 GiB) — under whatever cap the
+    parent set via ``LORRAX_ZETA_REPLICATE_CAP_GIB``."""
+    import numpy as np
+    import jax
+    from jax.sharding import Mesh
+
+    import isdf.core as core
+
+    devs = jax.devices()
+    if len(devs) < 4:
+        print(json.dumps({"skip": f"only {len(devs)} devices"}))
+        return 0
+    mesh = Mesh(np.asarray(devs[:4]).reshape(2, 2), ('x', 'y'))
+    res = {"cap_gib": core._REPLICATED_CHOL_MAX_STACK_BYTES / 1024 ** 3}
+    for tag, nq in (("ibz74", 74), ("fullbz144", 144)):
+        for solve in ("rank_truncate", "cholesky"):
+            try:
+                res[f"{tag}_{solve}"] = core._resolve_solver_kind_charge(
+                    mesh, "auto", n_rmu=2412, nq=nq, charge_zeta_solve=solve)
+            except ValueError as exc:
+                res[f"{tag}_{solve}"] = f"RAISE:{exc}"
+    print(json.dumps(res))
+    return 0
+
+
+def _run_worker(tag: str, timeout: int = 600, env_extra: dict | None = None):
     env = dict(os.environ)
     env["JAX_PLATFORMS"] = "cpu"
     env["JAX_ENABLE_X64"] = "1"
+    if env_extra:
+        env.update(env_extra)
     # Append so any pre-existing XLA_FLAGS survive.
     env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "")
                         + f" --xla_force_host_platform_device_count={_NDEV}").strip()
@@ -262,7 +293,52 @@ def test_zeta_fit_charge_rank_truncate_is_mesh_invariant_and_conditions():
         f"‖ζ_chol‖/‖ζ_rt‖ = {out['amp_chol_over_rt']:.3e} (expected ≫ 1)")
 
 
+def test_rank_truncate_refuses_above_the_replication_cap():
+    """``charge_zeta_solve='rank_truncate'`` must RAISE — never silently
+    downgrade — when the CCT stack exceeds the replication cap, and the cap
+    itself must be raisable from the environment.
+
+    The silent downgrade cost two sessions: the MoS2 12×12 / n_μ=2412
+    FULL-BZ ζ stack (nq=144, 12.48 GiB) fell back to the distributed
+    cuSolverMp Cholesky, and the ζ came out 4.5× too large — rebuilding V_q
+    to relF 16–32 instead of 1.8e-15 (reports/bse_exciton_smooth_2026-07-21,
+    logs/zeta_fullbz_BAD_cholesky_fallback.log).  Both real stacks of that
+    campaign are pinned here: IBZ nq=74 (6.42 GiB, needs cap ≥ 8) and
+    full-BZ nq=144 (12.48 GiB, needs cap ≥ 13)."""
+    default = _run_worker("worker_cap")
+    if "skip" in default:
+        pytest.skip(f"cap gate: {default['skip']}")
+    assert default["cap_gib"] == pytest.approx(4.0), \
+        f"default replication cap changed: {default['cap_gib']} GiB"
+    # Below the cap nothing changes; above it rank_truncate refuses while the
+    # cholesky alternative still resolves to the distributed factor.
+    for tag in ("ibz74", "fullbz144"):
+        assert default[f"{tag}_rank_truncate"].startswith("RAISE:"), (
+            f"{tag} above the 4 GiB cap silently downgraded to "
+            f"{default[f'{tag}_rank_truncate']!r} instead of raising")
+        assert default[f"{tag}_cholesky"] == "cusolvermp_cholesky"
+
+    raised = _run_worker("worker_cap",
+                         env_extra={"LORRAX_ZETA_REPLICATE_CAP_GIB": "8"})
+    assert raised["cap_gib"] == pytest.approx(8.0), \
+        "LORRAX_ZETA_REPLICATE_CAP_GIB did not raise the cap"
+    assert raised["ibz74_rank_truncate"] == "replicated_rank_truncate", \
+        f"nq=74 (6.42 GiB) must pass under an 8 GiB cap, got " \
+        f"{raised['ibz74_rank_truncate']!r}"
+    assert raised["fullbz144_rank_truncate"].startswith("RAISE:"), \
+        "nq=144 (12.48 GiB) must still refuse under an 8 GiB cap"
+
+    full = _run_worker("worker_cap",
+                       env_extra={"LORRAX_ZETA_REPLICATE_CAP_GIB": "16"})
+    assert full["ibz74_rank_truncate"] == "replicated_rank_truncate"
+    assert full["fullbz144_rank_truncate"] == "replicated_rank_truncate", \
+        f"nq=144 must pass under a 16 GiB cap, got " \
+        f"{full['fullbz144_rank_truncate']!r}"
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "worker_cap":
+        sys.exit(_worker_cap())
     if len(sys.argv) > 1 and sys.argv[1] == "worker":
         sys.exit(_worker())
     if len(sys.argv) > 1 and sys.argv[1] == "worker_rt":

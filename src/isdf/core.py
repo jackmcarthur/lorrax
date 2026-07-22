@@ -839,7 +839,11 @@ def _identity_pad_block_diagonal(
 # n_μ=1600 → 1.5 GiB, CrI3 6×6 80Ry n_μ≈1800 → ≤1.9 GiB, Si IBZ) and
 # excludes only the full-BZ Si 4×4×4 60Ry stack (nq=64, n_μ=2400 → 24 GiB).
 # See reports/gw_zeta_mesh_invariance_2026-07-20 for the drift this removes.
-_REPLICATED_CHOL_MAX_STACK_BYTES = 4 * 1024**3
+# Raise it with LORRAX_ZETA_REPLICATE_CAP_GIB when the stack is bigger but the
+# device budget allows (full-BZ MoS2 12×12 n_μ=2412 is 13.4 GiB and NEEDS the
+# rank truncation — see _resolve_solver_kind_charge).
+_REPLICATED_CHOL_MAX_STACK_BYTES = int(
+    float(os.environ.get("LORRAX_ZETA_REPLICATE_CAP_GIB", "4")) * 1024**3)
 
 
 def _replicate_charge_ok(nq: int | None, n_rmu: int | None) -> bool:
@@ -923,13 +927,23 @@ def _resolve_solver_kind_charge(
     # distributed / sharded policy.  ``charge_zeta_solve == 'rank_truncate'``
     # (the production default) selects the rank-revealing eigh pseudo-inverse
     # on the replicated route — the only route it applies to (a full eigh
-    # cannot be block-cyclic), so above the replication cap it silently uses
-    # the distributed Cholesky (large stacks are not the near-singular
-    # fit-size regime the truncation cures).
+    # cannot be block-cyclic).  Above the cap we therefore CANNOT honour it,
+    # and we refuse rather than downgrade: the 2026-07-21 full-BZ 12×12 fit
+    # (13.4 GiB, just over the cap) silently fell back and returned ζ 4.5×
+    # too large, rebuilding V_q to relF 16–32 instead of 1.8e-15.
     if _replicate_charge_ok(nq, n_rmu):
         return ('replicated_rank_truncate'
                 if charge_zeta_solve == 'rank_truncate'
                 else 'replicated_cholesky')
+    if charge_zeta_solve == 'rank_truncate':
+        need = int(nq) * int(n_rmu) ** 2 * 16 / 1024**3 if nq and n_rmu else 0.0
+        raise ValueError(
+            f"charge_zeta_solve='rank_truncate' needs the replicated route, "
+            f"but the CCT stack (nq={nq}, n_mu={n_rmu}) is {need:.2f} GiB > "
+            f"the {_REPLICATED_CHOL_MAX_STACK_BYTES / 1024**3:.2f} GiB cap.  "
+            f"Set LORRAX_ZETA_REPLICATE_CAP_GIB={-(-need // 1) + 1:.0f} if the "
+            f"device budget allows, or charge_zeta_solve='cholesky' to accept "
+            f"the distributed factor (NOT rank-conditioned — verify V_q).")
     return 'cusolvermp_cholesky' if is_2d else 'sharded_cholesky'
 
 

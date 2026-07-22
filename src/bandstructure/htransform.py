@@ -52,9 +52,13 @@ _accum_G_cache: dict = {}
 # reference (nk=144, n_rtot=174 960).  So the historical fixed default of 64
 # bands per chunk asks for 51.6 GB, and even a 48-band window asks for 38.7 GB
 # — enough to OOM an A100-80GB once the BSE/GW restart tensors are resident.
-# The cap makes the default size-aware; band chunking is a pure accumulation
-# split (G = Σ_chunks Q Qᴴ), so this changes memory only, never the result.
-_GALERKIN_CHUNK_MAX_BYTES = 6 * 1024 ** 3
+# The cap makes the default size-aware.  Splitting the band axis is NOT a pure
+# accumulation split — see the G-accumulation block below — so the loop sums
+# band chunks into Q first and only then forms Q Qᴴ; this constant therefore
+# changes memory and the number of ψ re-reads, never the result.
+# Override with LORRAX_GALERKIN_CHUNK_GIB (GiB, float).
+_GALERKIN_CHUNK_MAX_BYTES = int(
+    float(os.environ.get("LORRAX_GALERKIN_CHUNK_GIB", "6")) * 1024 ** 3)
 
 
 def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
@@ -118,6 +122,10 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         f"band_chunk={band_chunk_size} "
         f"({bytes_per_band * band_chunk_size / 1024**3:.2f} GB/chunk)"
     )
+    if band_chunk_size < nb:
+        log_fn(f"  (band axis split into "
+               f"{(nb + band_chunk_size - 1)//band_chunk_size} chunks; G is "
+               f"accumulated r-outer / band-inner so the split stays exact)")
 
     # ── 1. Load ψ at centroids (band-sharded internally on 'y') ──
     t0 = time.time()
@@ -184,16 +192,45 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     UH = U.conj().T                          # (rank, nk·nb), replicated
     del U
 
-    # ── 3. G = Σ_chunks Q_chunk Q_chunk^H, streaming over r-chunks ──
-    # Inside each chunk:
-    #   Q_chunk = inv_s · UH @ ψ_r_chunk   (psi sharded P(...,'y') on r-axis)
-    #   G_chunk = Q_chunk @ Q_chunk^H      (rank,rank), psum over 'y'
-    # JIT-cached by (n_rchunk, n_bchunk, rank).
+    # ── 3. G = Q Q^H with Q = inv_s · U^H ψ, streamed r-OUTER / band-INNER ──
+    #
+    # Q[α, x] = Σ_{k,n} inv_s[α] U^H[α,(k,n)] ψ[(k,n), x]  — the contraction
+    # runs over the PAIR index (k, n) and is FREE in x = (spinor, r).  So:
+    #
+    #   * splitting x (the r axis) and summing G over the pieces is EXACT —
+    #     G = Σ_rc Q_rc Q_rc^H, because each Q_rc is a disjoint column block;
+    #   * splitting the CONTRACTED (k, n) axis and summing G over the pieces
+    #     is NOT — Σ_bc Q_bc Q_bc^H drops every bc ≠ bc' cross term of
+    #     (Σ_bc Q_bc)(Σ_bc' Q_bc')^H.
+    #
+    # The band chunks must therefore be summed INTO Q before the outer
+    # product, which is what this loop does.  Getting that backwards is a
+    # silent wrong answer, not a crash: G stays Hermitian positive-definite,
+    # Cholesky succeeds, and the only symptom is that ctilde comes out
+    # non-orthonormal — ``ctilde[0] orthogonality error`` jumps to ~0.5 —
+    # so fH = Σ_n f(ε_n) c_n c_n^H no longer has eigenvalues f(ε_n) and the
+    # recovered energies drift by ~1.7 eV.  Measured on MoS2 12x12 30 Ry /
+    # n_μ=640 / nb=40, on-grid max|Δε_c| vs the stored grid:
+    #   one band chunk (nb ≤ band_chunk_size)  0.63 meV
+    #   two band chunks, G summed per chunk    1742.48 meV
+    # It stayed hidden while ``band_chunk_size`` defaulted to a fixed 64 ≥ nb
+    # (one chunk, no cross terms to lose) and surfaced when the chunk was
+    # sized to the ψ box instead.
     n_rtot = meta.fft_grid[0] * meta.fft_grid[1] * meta.fft_grid[2]
     band_chunk_ranges = [
         (b_start + i * band_chunk_size, min(b_start + (i + 1) * band_chunk_size, b_end))
         for i in range((nb + band_chunk_size - 1) // band_chunk_size)
     ]
+    # r-chunk holds one Q block (rank, nspinor·r_len) plus the ψ tile
+    # (nk, band_chunk, nspinor, r_len); size it so both stay inside the budget.
+    # Q spans the FULL r axis.  ``iter_psi_rchunk_bandwise`` is only ever
+    # exercised with (r_start, r_len) = (0, n_rtot) — handing it an interior
+    # r_start aborts inside XLA — and Q at full r costs
+    # rank·nspinor·n_rtot·16 sharded over 'y', which is 6.6 GB/device at the
+    # largest case here (MoS2 12x12 / n_μ=2412 / rank 4700 on a 4x4 mesh).
+    # The ψ tile stays band-chunked, so the streaming property that
+    # ``band_chunk_size`` buys is unchanged; only Q is now carried across the
+    # band loop, which is exactly what makes the split exact.
 
     def _make_accum_kernel(rank_, bc_size, nspinor_, mesh_, sharding_y, sharding_xy):
         key = (id(mesh_), rank_, bc_size, nspinor_)
@@ -201,8 +238,8 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         if fn is not None:
             return fn
 
-        @partial(jax.jit, donate_argnums=(2,), out_shardings=sharding_xy)
-        def _accum(UH_bc, inv_s, psi_bc, G_in):
+        @partial(jax.jit, donate_argnums=(2, 3), out_shardings=sharding_y)
+        def _accum(UH_bc, inv_s, psi_bc, Q_in):
             # UH_bc: (rank, nk·bc) replicated; inv_s: (rank,1) replicated
             # psi_bc: (nk, bc, ns, r_chunk) sharded P(None,None,None,'y')
             # Reshape psi so the contraction axis is (nk·bc) and the
@@ -211,20 +248,37 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             nkv, bcv, nsv, rcv = psi_bc.shape
             psi_flat = psi_bc.reshape(nkv * bcv, nsv * rcv)  # (nk·bc, ns·r_chunk)
             Q = inv_s * (UH_bc @ psi_flat)                   # (rank, ns·r_chunk), sharded on 'y'
-            Q = jax.lax.with_sharding_constraint(Q, sharding_y)
-            return G_in + (Q @ Q.conj().T)                   # (rank, rank), sharded P('x','y')
+            return Q_in + jax.lax.with_sharding_constraint(Q, sharding_y)
 
         _accum_G_cache[key] = _accum
         return _accum
 
-    sharding_y = NamedSharding(mesh_xy, P(None, 'y'))
+    # Q is carried ACROSS the band loop now, so unlike the old per-chunk
+    # transient it is a live buffer for the whole accumulation — split it over
+    # BOTH mesh axes, not just 'y'.  At MoS2 12x12 / n_μ=2412 / rank 4700 that
+    # is 26.3 GB global: 6.6 GB/device on 'y' alone (times two for the
+    # in+out pair the loop needs) versus 1.6 GB/device over ('x','y').
+    sharding_y = NamedSharding(mesh_xy, P(None, ('x', 'y')))
+    grid_xy_G = grid_xy
+
+    @partial(jax.jit, donate_argnums=(0, 1), out_shardings=grid_xy_G)
+    def _fold_G(Q, G_in):
+        return G_in + (Q @ Q.conj().T)                       # (rank, rank) P('x','y')
+
     G = jax.device_put(jnp.zeros((rank, rank), dtype=jnp.complex128), grid_xy)
 
     t2 = time.time()
     chunk_count = 0
     UH_kb = UH.reshape(rank, nk, nb)  # for band-chunk slicing
+    # Allocate Q ALREADY SHARDED.  ``device_put(jnp.zeros(...), sharding)``
+    # builds the whole (rank, nspinor·n_rtot) array on one device first and
+    # only then distributes it — 23.4 GB in a single allocation at MoS2
+    # 12x12 / n_μ=2412, which OOMs the card before the sharded copy exists.
+    Q = jax.jit(lambda: jnp.zeros((rank, nspinor * n_rtot),
+                                  dtype=jnp.complex128),
+                out_shardings=sharding_y)()
     for bc_range, psi_bc_Y in iter_psi_rchunk_bandwise(
-            wfn, sym, meta, mesh_xy, band_range, 0, meta.n_rtot, bispinor,
+            wfn, sym, meta, mesh_xy, band_range, 0, n_rtot, bispinor,
             band_chunk_size=band_chunk_size,
             band_chunk_ranges=band_chunk_ranges):
         bc = bc_range[1] - bc_range[0]
@@ -232,11 +286,15 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         bc_hi = bc_range[1] - b_start
         UH_bc = UH_kb[:, :, bc_lo:bc_hi].reshape(rank, nk * bc)
 
-        accum = _make_accum_kernel(rank, bc, nspinor, mesh_xy, sharding_y, grid_xy)
-        G = accum(UH_bc, inv_s, psi_bc_Y, G)
+        accum = _make_accum_kernel(rank, bc, nspinor, mesh_xy,
+                                   sharding_y, grid_xy)
+        Q = accum(UH_bc, inv_s, psi_bc_Y, Q)
         chunk_count += 1
+    G = _fold_G(Q, G)
+    del Q
     jax.block_until_ready(G)
-    log_fn(f"  G accumulation: {chunk_count} chunk(s), {time.time()-t2:.2f}s")
+    log_fn(f"  G accumulation: {chunk_count} band chunk(s) summed into Q, "
+           f"then one Q Qᴴ fold, {time.time()-t2:.2f}s")
 
     # ── 4. Cholesky on G ──
     # FFI seam: gw_jax's factor_c_q (which has dual 1×1-dense /
