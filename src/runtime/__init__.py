@@ -123,6 +123,16 @@ def init_jax_distributed() -> None:
     derived from CUDA_VISIBLE_DEVICES.  First try that; on failure
     fall back to the explicit ``(coordinator_address, num_processes,
     process_id)`` form.
+
+    ``JAX_COORDINATOR_ADDRESS``, when set, SKIPS the auto-detected form and
+    goes straight to the explicit one.  Auto-detection derives the coordinator
+    port from ``SLURM_JOB_ID``, so every step of one allocation lands on the
+    SAME port: two concurrent runs in a shared interactive allocation (two
+    agents attached to one salloc, or one agent's two launches) join each
+    other's coordinator and die with ``ABORTED: task N unexpectedly tried to
+    connect with a different incarnation``, or hang until srun SIGKILLs them.
+    Set a per-launch address (``--env=JAX_COORDINATOR_ADDRESS=$HOST:$PORT``
+    with a port unique to the launch) to keep the runs independent.
     """
     if os.environ.get(_DISTRIBUTED_SENTINEL):
         return
@@ -137,17 +147,23 @@ def init_jax_distributed() -> None:
     cv = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     n_local = len([x for x in cv.split(",") if x.strip()]) if cv else 0
     init_kwargs = {"local_device_ids": list(range(n_local))} if n_local else {}
-    try:
-        jax.distributed.initialize(**init_kwargs)
-        os.environ[_DISTRIBUTED_SENTINEL] = "1"
-        return
-    except Exception:
-        pass
+    if not os.environ.get("JAX_COORDINATOR_ADDRESS"):
+        try:
+            jax.distributed.initialize(**init_kwargs)
+            os.environ[_DISTRIBUTED_SENTINEL] = "1"
+            return
+        except Exception:
+            pass
 
+    # ``local_device_ids`` matters on BOTH paths: without it the explicit form
+    # assumes each process owns every local GPU and dies with
+    # "CUDA_ERROR_INVALID_DEVICE: invalid device ordinal" under the one-GPU-
+    # per-process binding select_gpu.sh sets up.
     jax.distributed.initialize(
         coordinator_address=_resolve_coordinator_address(),
         num_processes=proc_count,
         process_id=_resolve_proc_id(),
+        **init_kwargs,
     )
     os.environ[_DISTRIBUTED_SENTINEL] = "1"
 

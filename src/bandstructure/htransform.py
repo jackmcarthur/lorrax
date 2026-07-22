@@ -957,6 +957,13 @@ def main(argv=None):
     parser.add_argument("--a-band", type=int, default=None,
                         help="Band index (0-based) whose bandwidth sets 'a'. "
                              "E.g. nval+ncond_keep-1. Default: top band.")
+    parser.add_argument("--eigh-backend", default="auto",
+                        choices=("auto", "off", "cusolvermp", "slate"),
+                        help="Eigensolver for the fH_q eigendecomposition of "
+                             "the get_centroids_fi handoff.  auto|off = the "
+                             "q-batched native path; cusolvermp|slate spread "
+                             "ONE (rank, rank) tile over the mesh via the "
+                             "distributed-linalg FFI (wide band windows).")
     args = parser.parse_args(argv)
     log = _make_logger(args.verbose)
 
@@ -988,7 +995,8 @@ def main(argv=None):
                 kgrid_co=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
                 kgrid_fi=params["kgrid_fi"],
                 band_window_fi=(b_min, b_max),
-                mesh_xy=mesh_xy, a_band_index=args.a_band, log_fn=log,
+                mesh_xy=mesh_xy, a_band_index=args.a_band,
+                eigh_backend=args.eigh_backend, log_fn=log,
             )
         log(f"BSE setup: psi_rmu_Y={wfns_fi.psi_rmu_Y.shape} "
             f"P{wfns_fi.psi_rmu_Y.sharding.spec}, "

@@ -85,6 +85,8 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from ffi.common.dispatch import dispatch_eigh
+
 # pipeline constants (§13.5 production shape; reference values verbatim)
 ALPHA = 0.30          # Gaussian split width, 1/bohr; broad optimum ~1.5-2x dq
 EPS_TIK = 1e-4        # relative Tikhonov filter width (fit gauge, §13.1)
@@ -518,41 +520,6 @@ def _sphere_slot(zx, q, GS):
     return np.array([lut.get(tuple(g), -1) for g in GS.T])
 
 
-def _eigh_backend(C_dev, mesh_xy: Mesh, backend: str):
-    """One Hermitian eigendecomposition, backend-dispatched.
-
-    ``off``        → native jnp.linalg.eigh (replicated).  Also what
-                     ``auto`` resolves to in ``prepare_coarse``: the coarse
-                     C_q tiles are n_μ² (≈ 640²), where the q-BATCHED native
-                     path (every device eigh-ing its own q-shard) beats a
-                     distributed single-tile eigh — the FFI backends' regime
-                     is n_μ large enough that one tile must be distributed.
-                     They stay available by explicit request; note the
-                     cusolverMp FFI needs one JAX process per device (a
-                     single-process 2×2 driver mesh cannot use it — the
-                     12×12 smoke trap, WORKLOG 2026-07-18).
-    ``cusolvermp`` → force the cusolverMp FFI (square 2-D mesh only).
-    ``slate``      → force the SLATE FFI (portable backend, explicit-only).
-
-    Returns ``(lam, R)`` with TRUE column eigenvectors (ascending λ):
-    the cusolvermp wrapper's raw Q is conj-transposed here (its documented
-    layout), SLATE already returns columns.  Output R is left sharded
-    ``P('x','y')`` on FFI paths, replicated on the native path.
-    """
-    if backend == "off":
-        lam, R = jnp.linalg.eigh(C_dev)
-        return lam, R
-    if backend == "cusolvermp":
-        from ffi.cusolvermp.eigh import distributed_eigh
-        lam, Qraw = distributed_eigh(C_dev, mesh=mesh_xy)
-        return lam, jnp.conj(Qraw).T          # raw buffer → column eigenvectors
-    if backend == "slate":
-        from ffi.slate.eigh import distributed_eigh
-        lam, Q = distributed_eigh(C_dev, mesh=mesh_xy)
-        return lam, Q                          # already true columns
-    raise ValueError(f"eigh_backend must be auto|off|cusolvermp|slate, got {backend!r}")
-
-
 def _to_host(x):
     """Gather a device array to a full host numpy array on EVERY process,
     whether it is PROCESS-SPANNING or fully addressable.
@@ -600,7 +567,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     which keeps the whole stage at ≤2 XLA compiles instead of one per
     distinct sphere size (15 at MoS2 12×12; the ``_clean_split`` census
     finding).  ``eigh_backend='auto'`` resolves to the batched native path —
-    see ``_eigh_backend`` for when the distributed FFI backends make sense;
+    see ``ffi.common.dispatch.dispatch_eigh`` for when the FFI backends win;
     they are honored per-q if explicitly requested.  n_μ is used at its
     LOGICAL extent here; the jitted evaluator pads on output.
 
@@ -700,7 +667,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
         else:
             # explicit distributed-FFI request: per-q eigh, then the same
             # batched post-eigh pipeline (single source for the math).
-            pairs = [_eigh_backend(jax.device_put(
+            pairs = [dispatch_eigh(jax.device_put(
                                        jnp.asarray(C_herm(slice(q, q + 1))[0]),
                                        grid_xy),
                                    mesh_xy, eigh_backend)

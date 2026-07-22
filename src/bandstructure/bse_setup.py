@@ -23,6 +23,7 @@ the X/Y reshard.
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 from functools import partial
 
@@ -30,6 +31,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+from ffi.common.dispatch import dispatch_eigh, EIGH_BACKENDS
 
 from .htransform import build_fH_R, build_R_grid_np, newton_inv
 
@@ -68,6 +71,7 @@ def compute_wfns_fi(
     batch_size: int = 32,
     q_list=None,
     return_coeffs: bool = False,
+    eigh_backend: str = "auto",
     log_fn=None,
 ):
     """Recover ψ at the coarse-grid centroids on a finer uniform k-grid —
@@ -94,7 +98,9 @@ def compute_wfns_fi(
         mesh_xy:   ('x','y') device mesh.
         a_band_index: optional band index for the f-transform 'a' parameter
                    (defaults to the top of the htransform window).
-        batch_size: q-points per fH_q batch (≥1 jit compile reuse).
+        batch_size: q-points per fH_q batch on the NATIVE eigh path (≥1 jit
+                   compile reuse).  Ignored by the FFI backends, which
+                   decompose one q at a time by construction.
         q_list:    optional (nq, 3) fractional q — evaluate at exactly these
                    points instead of a uniform grid.  Wrapped to (−0.5, 0.5]
                    internally (fH_q is exactly BZ-periodic, so wrapping is a
@@ -105,6 +111,12 @@ def compute_wfns_fi(
                    output — the per-q ζ-refit consumes them to rebuild ψ on
                    the full r-grid through the streamed α-basis (its chunk
                    kernels reshard as needed).
+        eigh_backend: which Hermitian eigensolver decomposes fH_q —
+                   ``auto|off`` (default) keeps the q-BATCHED native path,
+                   ``cusolvermp|slate`` route ONE (rank, rank) tile at a time
+                   through the distributed-linalg FFI.  See the eigh comment
+                   in the batch loop below for which regime is which, and
+                   ``ffi.common.dispatch.dispatch_eigh`` for the backends.
         log_fn:    optional logger.
 
     Returns:
@@ -177,7 +189,7 @@ def compute_wfns_fi(
     q_pad = (jnp.concatenate([q_all, jnp.zeros((n_pad, 3), dtype=q_all.dtype)])
              if n_pad else q_all)
 
-    # ── Per-batch: Fourier sum + eigh + ψ-at-centroids reconstruction ────
+    # ── Per-q(-batch): Fourier sum → eigh → ψ-at-centroids reconstruction ─
     # fH_q is the FULL-band Hamiltonian (all bands in ctilde).  Bands
     # [b_min, b_max) are selected on the eigenvalue axis (ascending): f(eps) is
     # monotone in eps, so ascending eigenvalue index == ascending energy, and
@@ -185,16 +197,43 @@ def compute_wfns_fi(
     # identical to the SP driver's sort-then-keep, but returning eigenVECTORS
     # too.  The guard bands above b_max stay in fH (they shape the
     # interpolation) but are not returned, so every returned band is interior.
-    # The q axis is sharded over ALL mesh devices (the ``_kpath_batch`` idiom,
-    # htransform.h_transform): after ONE all-to-all each device holds whole
-    # (rank, rank) matrices for its own q-rows and eigh-decomposes them — the
-    # eigh is the dominant cost here (measured 28 ms per rank-1152 matrix at
-    # MoS2 12×12) and runs ndev-parallel instead of replicated.
-    @partial(jax.jit, static_argnames=('b_min', 'b_max'))
-    def _q_batch(q_batch, fH_R, B, b_min, b_max):
-        q_batch = jax.lax.with_sharding_constraint(
-            q_batch, NamedSharding(mesh_xy, P(('x', 'y'), None)))
-        phase = jnp.exp(-2j * jnp.pi * (q_batch @ R_grid.T))           # (bs, nk_co)
+    if eigh_backend not in EIGH_BACKENDS:
+        raise ValueError(f"eigh_backend must be one of {EIGH_BACKENDS}, "
+                         f"got {eigh_backend!r}")
+    native = eigh_backend in ("auto", "off")
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+
+    # The two stages either side of the eigh are plain traceable functions,
+    # shared verbatim by both backends; only the JIT BOUNDARIES differ.  The
+    # native path keeps eigh + projection inside ONE jit — split apart, the
+    # full (bs, rank, rank) eigenvector batch becomes a materialised jit output
+    # instead of being fused away down to the nb_fi columns actually kept
+    # (10.1 GiB/device at bs=32 / rank 4452; it killed a 16 × A100-80GB run).
+    def _fourier(q, fH_R, batched):
+        """fH_q = Σ_R e^{-2πi q·R} fH_R.
+
+        ``batched``: q is (bs, 3) and the output ends q-SHARDED — the
+        ``_kpath_batch`` idiom (htransform.h_transform), one all-to-all after
+        which each device owns whole (rank, rank) matrices for its own q-rows
+        and the native eigh runs ndev-parallel (28 ms per rank-1152 matrix at
+        MoS2 12×12).  Costs batch_size/ndev WHOLE matrices per device.
+
+        Otherwise q is (3,) and the single matrix is left (i, j)-sharded
+        ``P('x','y')`` — never whole on any device, rank²·16/ndev instead.
+        That is the FFI eigh's input layout; its hermitizing transpose IS a
+        collective (rank²·16 B all-to-all, 22 MB/device at rank 4716 on 16
+        devices), the price of not materialising the matrix.
+        """
+        if not batched:
+            fH_q = jnp.einsum('k,kij->ij', jnp.exp(-2j * jnp.pi * (R_grid @ q)),
+                              fH_R)
+            grid = NamedSharding(mesh_xy, P('x', 'y'))
+            fH_q = jax.lax.with_sharding_constraint(fH_q, grid)
+            return jax.lax.with_sharding_constraint(
+                0.5 * (fH_q + jnp.conj(fH_q).T), grid)
+        q = jax.lax.with_sharding_constraint(
+            q, NamedSharding(mesh_xy, P(('x', 'y'), None)))
+        phase = jnp.exp(-2j * jnp.pi * (q @ R_grid.T))                 # (bs, nk_co)
         # fH_R is (i, j)-sharded and the sum runs over R only → local.  Pin the
         # contraction OUTPUT to that same (i, j) layout: left free, XLA
         # materialises the whole (bs, rank, rank) batch on every device before
@@ -208,20 +247,78 @@ def compute_wfns_fi(
         # other way round costs a second all-to-all for ``swapaxes``.
         fH_q = jax.lax.with_sharding_constraint(
             fH_q, NamedSharding(mesh_xy, P(('x', 'y'), None, None)))
-        fH_q = 0.5 * (fH_q + jnp.swapaxes(fH_q, -1, -2).conj())
-        lam, U = jnp.linalg.eigh(fH_q)                                  # ascending
-        c = U[:, :, b_min:b_max]                                        # (bs, rank, nb_fi)
-        psi = jnp.einsum('qan,asm->qnsm', c, B)                         # (bs, nb_fi, ns, n_μ)
-        return lam[:, b_min:b_max], psi, c
+        return 0.5 * (fH_q + jnp.swapaxes(fH_q, -1, -2).conj())
+
+    def _project(lam, U, B, b_min, b_max):
+        """Band-window slice + ψ_n,q(r_μ) = Σ_α c_n,q[α] B_at_μ[α, s, μ].
+
+        Leading-axis agnostic (``...``): the native path hands it a whole
+        q-batch, the FFI path one q.  ONE reconstruction for both backends.
+        """
+        c = U[..., b_min:b_max]                                # (..., rank, nb_fi)
+        psi = jnp.einsum('...an,asm->...nsm', c, B)            # (..., nb_fi, ns, n_μ)
+        return lam[..., b_min:b_max], psi, c
+
+    @partial(jax.jit, static_argnames=('b_min', 'b_max'))
+    def _q_batch(q_batch, fH_R, B, b_min, b_max):
+        """Native: Fourier sum → batched eigh → projection, ONE fused jit."""
+        lam, U = dispatch_eigh(_fourier(q_batch, fH_R, True), mesh_xy, "off")
+        return _project(lam, U, B, b_min, b_max)
+
+    @jax.jit
+    def _fH_q_one(q, fH_R):
+        return _fourier(q, fH_R, False)
+
+    @partial(jax.jit, static_argnames=('b_min', 'b_max'))
+    def _project_one(lam, U, B, b_min, b_max):
+        return _project(lam, U, B, b_min, b_max)
+
+    # Backend choice = parallel-over-q vs parallel-within-matrix.  The native
+    # path eigh-es ``batch_size/ndev`` WHOLE (rank, rank) matrices per device
+    # concurrently; the FFI path spreads ONE matrix over the whole mesh and
+    # walks q serially.  At rank 4716 that is 356 MB/matrix on one device vs
+    # 22 MB/device on 16 GPUs — so the FFI backends are what make a window too
+    # wide for the batched path runnable at all, at the cost of nq sequential
+    # distributed solves.  Native stays the default.
+    if not native:
+        if px != py:
+            raise ValueError(
+                f"eigh_backend={eigh_backend!r} needs a SQUARE mesh (both FFI "
+                f"eigh wrappers reject p != q — cusolverMpSyevd DEADLOCKS on "
+                f"rectangular blocks); got {px}x{py}.")
+        if rank % px or rank % py:
+            raise ValueError(
+                f"eigh_backend={eigh_backend!r} needs rank ({rank}) divisible "
+                f"by both mesh axes ({px}, {py}).  ``streaming_galerkin_solve`` "
+                f"mesh-aligns the retained SVD rank to lcm(px, py); a ctilde "
+                f"built on a different mesh has to be refit on this one.")
+        log(f"  fH_q eigh: {eigh_backend} FFI, ONE (rank {rank})² tile "
+            f"distributed over the {px}x{py} mesh, {nq} q serially")
 
     lam_chunks, psi_chunks, c_chunks = [], [], []
-    for i in range(0, q_pad.shape[0], batch_size):
-        lam_b, psi_b, c_b = _q_batch(q_pad[i:i+batch_size], fH_R, B_rep, b_min, b_max)
-        lam_chunks.append(lam_b)
-        psi_chunks.append(psi_b)
+
+    def _emit(lam_s, psi_s, c_s):
+        lam_chunks.append(lam_s if lam_s.ndim == 2 else lam_s[None])
+        psi_chunks.append(psi_s if psi_s.ndim == 4 else psi_s[None])
         if return_coeffs:
-            c_chunks.append(c_b)
-        jax.block_until_ready(psi_b)
+            c_chunks.append(c_s if c_s.ndim == 3 else c_s[None])
+        jax.block_until_ready(psi_chunks[-1])
+
+    if native:
+        for i in range(0, q_pad.shape[0], batch_size):
+            _emit(*_q_batch(q_pad[i:i + batch_size], fH_R, B_rep, b_min, b_max))
+    else:
+        t_eigh = time.time()
+        for i in range(nq):        # no batch padding: one q, one solve
+            lam_q, U_q = dispatch_eigh(_fH_q_one(q_pad[i], fH_R),
+                                       mesh_xy, eigh_backend)
+            _emit(*_project_one(lam_q, U_q, B_rep, b_min, b_max))
+            # nq SERIAL distributed solves is a long, silent stretch — log the
+            # rate so a stall is distinguishable from slow progress.
+            if (i + 1) % 32 == 0 or i + 1 == nq:
+                dt = time.time() - t_eigh
+                log(f"    fH_q eigh {i + 1}/{nq} q  {dt:.0f}s  "
+                    f"{1e3 * dt / (i + 1):.0f} ms/q")
     lam_fi = jnp.concatenate(lam_chunks, axis=0)[:nq]
     psi_fi = jnp.concatenate(psi_chunks, axis=0)[:nq]
     coeffs_fi = (jnp.concatenate(c_chunks, axis=0)[:nq]

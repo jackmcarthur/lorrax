@@ -332,7 +332,17 @@ def main(argv=None):
                          "arbitrary_q_bse.md §16.4).  Overrides the cohsex.in "
                          "``head_minibz_average`` key; default (unset) uses it.")
     ap.add_argument("--eigh-backend", default="auto",
-                    choices=("auto", "off", "cusolvermp", "slate"))
+                    choices=("auto", "off", "cusolvermp", "slate"),
+                    help="Hermitian eigensolver for BOTH distributed-eigh "
+                         "sites: the coarse exchange tiles C_q (vq_interp) and "
+                         "the htransform fH_q (bse_setup).  auto|off = the "
+                         "q-BATCHED native path (every device solves its own "
+                         "q-shard).  cusolvermp|slate route ONE tile at a time "
+                         "through the distributed-linalg FFI — the regime "
+                         "where a single matrix no longer fits on one device "
+                         "(a WIDE fH band window), at the cost of nq "
+                         "sequential solves.  Needs a square mesh and one JAX "
+                         "process per device.")
     ap.add_argument("--px", type=int, default=1)
     ap.add_argument("--py", type=int, default=1)
     ap.add_argument("--skip-rerun-check", action="store_true",
@@ -529,7 +539,7 @@ def main(argv=None):
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=kgrid_co_ct, band_window_fi=(b_min, b_max),
         mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
-        log_fn=log)
+        eigh_backend=args.eigh_backend, log_fn=log)
     psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
         bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
     tick("htransform_psi_cQ", t0)

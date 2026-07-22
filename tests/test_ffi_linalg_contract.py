@@ -78,6 +78,17 @@ if __name__ == "__main__":
         else:
             jax.distributed.initialize()
 
+# h5py has to bind its HDF5 BEFORE anything dlopens liblorrax_ffi.so: the
+# FFI library links the Cray parallel HDF5 out of /lorrax_phdf5, and h5py
+# imported afterwards initialises against those symbols and dies with
+# "ValueError: Not a datatype (not a datatype)".  The availability probes
+# below dlopen the FFI library at module import, and the production-wiring
+# checks import LORRAX modules that pull h5py — so the order is forced here.
+try:                                     # noqa: E402
+    import h5py                          # noqa: F401
+except Exception:
+    pass
+
 # ---------------------------------------------------------------------------
 # Availability probes (module import must stay cheap + exception-free).
 # ---------------------------------------------------------------------------
@@ -695,6 +706,13 @@ _CLI_CELLS = [
     ("scalapack_lu_general", False,
      lambda mesh, dt: check_scalapack_lu(mesh, dt, n=64, nrhs=32,
                                          herm=False)),
+    # Production wiring: the htransform fH_q eigh routed through the FFI.
+    # rank=64 divides 1/2/4, so the same cell runs on every mesh the
+    # wrappers accept.  dtype is ignored (fH_q is complex by construction).
+    ("bse_setup_eigh_cusolvermp", True,
+     lambda mesh, dt: check_compute_wfns_fi_backend(mesh, "cusolvermp")),
+    ("bse_setup_eigh_slate", True,
+     lambda mesh, dt: check_compute_wfns_fi_backend(mesh, "slate")),
 ]
 
 
@@ -810,3 +828,110 @@ def test_resolver_never_auto_picks_slate():
     mesh = _mesh_1x1()
     assert _resolve_solver_kind_charge(mesh, "auto") != "slate_cholesky"
     assert _resolve_solver_kind_charge(mesh, "off") == "sharded_cholesky"
+
+
+# ---------------------------------------------------------------------------
+# eigh_backend = cusolvermp | slate — the htransform fH_q wiring
+# (bandstructure.bse_setup.compute_wfns_fi; ffi.common.dispatch.dispatch_eigh)
+# ---------------------------------------------------------------------------
+
+def _synthetic_htransform(nk_grid=(2, 2, 1), nb=4, rank=64, n_mu=6, ns=2,
+                          seed=5):
+    """A small but STRUCTURALLY REAL htransform input triple.
+
+    ``ctilde`` must be band-orthonormal per k (that is what
+    ``streaming_galerkin_solve`` produces, and what makes the eigenvalues of
+    fH_q = Σ_n f(ε_n) c_n c_nᴴ equal f(ε_n) at the coarse k), otherwise the
+    recovered energies are meaningless and a backend comparison would be
+    comparing two kinds of garbage.  Built by QR.
+    """
+    import numpy as _np
+    rng = _np.random.default_rng(seed)
+    nk = nk_grid[0] * nk_grid[1] * nk_grid[2]
+    ct = _np.empty((nk, nb, rank), dtype=_np.complex128)
+    for k in range(nk):
+        z = (rng.standard_normal((rank, nb))
+             + 1j * rng.standard_normal((rank, nb)))
+        q, _ = _np.linalg.qr(z)                     # (rank, nb), orthonormal
+        ct[k] = _np.conj(q.T)
+    # Dispersive, ascending, non-degenerate energies (Ry).
+    enk = (_np.linspace(-0.6, 0.4, nb)[:, None]
+           + 0.05 * _np.cos(2 * _np.pi * _np.arange(nk) / nk)[None, :])
+    B = (rng.standard_normal((rank, ns, n_mu))
+         + 1j * rng.standard_normal((rank, ns, n_mu)))
+    return ct, enk, B, nk_grid
+
+
+def check_compute_wfns_fi_backend(mesh, backend, dtype="complex128"):
+    """``compute_wfns_fi(eigh_backend=<ffi>)`` == the native batched path.
+
+    Gates the two things a backend swap can break: the EIGENVALUES (hence the
+    Newton-inverted energies, which are what the on-grid gate measures) and
+    the eigenVECTOR convention (cusolvermp returns a raw conj-transposed
+    buffer, SLATE true columns — a wrong choice there silently returns a
+    transposed ψ).  ψ is compared through the WINDOW DENSITY MATRIX
+    Σ_n ψ_n ψ_nᴴ, which is invariant under both the per-band phase and any
+    unitary mixing inside a degenerate group — the only comparison that is
+    well posed for eigenvectors.  A transposed or mis-conjugated Q changes it.
+    """
+    import jax
+    import jax.numpy as jnp
+    from bandstructure.bse_setup import compute_wfns_fi
+
+    ct, enk, B, kgrid = _synthetic_htransform()
+    kw = dict(ctilde=jnp.asarray(ct), B_at_mu=jnp.asarray(B),
+              enk_sigma=jnp.asarray(enk), kgrid_co=kgrid,
+              band_window_fi=(1, 3), mesh_xy=mesh, kgrid_fi=(4, 4, 1),
+              batch_size=8)
+    with mesh:
+        ref = compute_wfns_fi(eigh_backend="off", **kw)
+        got = compute_wfns_fi(eigh_backend=backend, **kw)
+
+    lam_r, lam_g = np.asarray(ref.lam_fi), np.asarray(got.lam_fi)
+    e_r, e_g = np.asarray(ref.enk_full), np.asarray(got.enk_full)
+    dlam = float(np.max(np.abs(lam_r - lam_g)))
+    de = float(np.max(np.abs(e_r - e_g)))
+    assert dlam < 1e-10, f"{backend}: fH_q eigenvalues differ by {dlam:.3e}"
+    assert de < 1e-10, f"{backend}: recovered energies differ by {de:.3e} Ry"
+
+    def _dm(psi):
+        p = np.asarray(psi).reshape(psi.shape[0], psi.shape[1], -1)
+        return np.einsum("qni,qnj->qij", p, np.conj(p))
+
+    D_r, D_g = _dm(ref.psi_rmu_Y), _dm(got.psi_rmu_Y)
+    dpsi = float(np.max(np.abs(D_r - D_g)) / max(np.max(np.abs(D_r)), 1e-300))
+    assert dpsi < 1e-9, \
+        f"{backend}: window density matrix differs from native by {dpsi:.3e}"
+
+
+@needs_ffi
+def test_compute_wfns_fi_cusolvermp_matches_native(mesh11):
+    check_compute_wfns_fi_backend(mesh11, "cusolvermp")
+
+
+@needs_ffi
+def test_compute_wfns_fi_slate_matches_native(mesh11):
+    check_compute_wfns_fi_backend(mesh11, "slate")
+
+
+@needs_host_ffi
+def test_compute_wfns_fi_slate_matches_native_cpu(mesh_cpu11):
+    # Host platform: the same wiring a CPU-backend run takes.  This is the
+    # cell that runs on a machine with no GPU at all.
+    check_compute_wfns_fi_backend(mesh_cpu11, "slate")
+
+
+def test_compute_wfns_fi_rejects_bad_backend():
+    """Pure python — an unknown backend name must fail loudly, not silently
+    fall back to the replicated path."""
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from jax.sharding import Mesh
+    from bandstructure.bse_setup import compute_wfns_fi
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    ct, enk, B, kgrid = _synthetic_htransform()
+    with pytest.raises(ValueError, match="eigh_backend"):
+        compute_wfns_fi(ctilde=jnp.asarray(ct), B_at_mu=jnp.asarray(B),
+                        enk_sigma=jnp.asarray(enk), kgrid_co=kgrid,
+                        band_window_fi=(1, 3), mesh_xy=mesh,
+                        kgrid_fi=(2, 2, 1), eigh_backend="replicated")
