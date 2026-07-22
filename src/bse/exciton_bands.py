@@ -294,8 +294,16 @@ def main(argv=None):
     ap.add_argument("--block-size", type=int, default=8)
     ap.add_argument("--max-iter", type=int, default=40,
                     help="block-Lanczos iterations (Krylov = block·iter)")
-    ap.add_argument("--vq-mode", choices=("interp", "refit", "both"),
+    ap.add_argument("--vq-mode", choices=("interp", "refit", "both", "ongrid"),
                     default="interp")
+    ap.add_argument("--eqp", type=str, default=None,
+                    help="BGW-format eqp1.dat (the one LORRAX's GW writes): "
+                         "run the whole BSE on QUASIPARTICLE energies instead "
+                         "of DFT.  Both legs are corrected — the stored "
+                         "valence/conduction eps from the restart AND the "
+                         "htransform's enk_sigma, so the interpolated "
+                         "eps_c(k+Q) is a QP band and the on-grid gate "
+                         "compares QP against QP.")
     ap.add_argument("--refit-points", type=str, default=None,
                     help="comma list of path indices to refit "
                          "(vq-mode=both; default ~5 evenly spaced)")
@@ -383,7 +391,8 @@ def main(argv=None):
     restart_file = _find_restart_file(args.input)
     data = load_bse_data_from_restart_sharded(
         restart_file, n_val=args.n_val, n_cond=args.n_cond,
-        mesh_xy=mesh_xy, input_file=args.input, inject_head=True)
+        mesh_xy=mesh_xy, input_file=args.input, inject_head=True,
+        load_v_full=(args.vq_mode == "ongrid"))
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     nk = nkx * nky * nkz
     n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
@@ -393,6 +402,37 @@ def main(argv=None):
     # Done ON DEVICE (jnp.where) to preserve the loader's sharding: a host
     # device_get→jnp.asarray round-trip would fail on a process-spanning shard
     # in a multi-node run AND drop the sharding.
+    # ── QP energies (--eqp) ───────────────────────────────────────────────
+    # BOTH legs of the pair basis have to move together or the diagonal
+    # D_Q = eps_c(k+Q) - eps_v(k) mixes QP conduction with DFT valence.  The
+    # stored leg is re-sliced here (n_occ is RE-resolved on the corrected
+    # energies, so a QP-driven gap change cannot mis-slice); the interpolated
+    # leg is corrected below, right after ``initialize_wfns``.
+    #
+    # ``input_file=None`` on purpose: with it, apply_eqp_corrections asserts the
+    # eqp file is IBZ-sized (nk_ibz == sym.nk_red).  LORRAX's own GW writes
+    # eqp1.dat on the FULL BZ (one block per k of the WFN, same order), so the
+    # energy-matching branch is the correct one and it maps 1:1 here.
+    enk_qp_full = None
+    if args.eqp:
+        from .bse_io import (apply_eqp_and_reslice_bands, apply_eqp_corrections,
+                             resolve_n_occ)
+        import h5py as _h5py
+        with _h5py.File(restart_file, "r") as _f:
+            _enk_dft_full = np.asarray(_f["enk_full"][:])
+        # n_occ has to come from the WFN's ``ifmax`` (via ``input_file``), but
+        # ``input_file`` cannot be handed to apply_eqp_and_reslice_bands — it
+        # would reach apply_eqp_corrections' IBZ branch and assert.  Resolve it
+        # here and pass it explicitly instead.
+        n_occ_in = resolve_n_occ(_enk_dft_full, input_file=args.input)
+        data["eps_v"], data["eps_c"], n_occ_qp = apply_eqp_and_reslice_bands(
+            restart_file, args.eqp, None, n_val, n_cond, n_occ_in,
+            mesh_xy.devices.shape[0], mesh_xy.devices.shape[1])
+        enk_qp_full = apply_eqp_corrections(_enk_dft_full, args.eqp)
+        _shift_ev = (enk_qp_full - _enk_dft_full) * RY2EV
+        log(f"  [eqp] {os.path.basename(args.eqp)}: n_occ={n_occ_qp}, "
+            f"QP shifts min/max = {_shift_ev.min():+.4f} / {_shift_ev.max():+.4f} eV; "
+            f"BSE runs on QUASIPARTICLE energies")
     if nv_pad > n_val:
         _band_ax = jnp.arange(nv_pad)
         data["eps_v"] = jnp.where(_band_ax[None, :] >= n_val,
@@ -404,6 +444,16 @@ def main(argv=None):
     (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
      enk_sigma) = ht.initialize_wfns(args.input, params, log,
                                      mesh_xy=mesh_xy)
+    if enk_qp_full is not None:
+        # The interpolated leg.  ``initialize_wfns(eqp_file=...)`` is NOT used:
+        # its ``htransform.read_eqp_energies`` expects the "n=… EQP=…" text
+        # form, not the columnar eqp1.dat LORRAX's GW writes, and it swallows
+        # the parse failure with a log line — i.e. it would silently leave DFT
+        # energies in place.  One parser (``bse_io.read_bgw_eqp``) for both legs.
+        _b0 = int(wfn.nelec) - int(params["nval"])
+        _b1 = int(wfn.nelec) + int(params["ncond"])
+        enk_sigma = jnp.asarray(enk_qp_full[:, _b0:_b1].T)      # (nb, nk) Ry
+        log(f"  [eqp] htransform enk_sigma <- QP bands [{_b0},{_b1})")
     kpath_frac, x_path, node_idx, node_labels, _gp = ht.initialize_kpath(
         wfn, params)
     Qpath = np.asarray(kpath_frac, dtype=np.float64)
@@ -497,19 +547,43 @@ def main(argv=None):
     #    ``vq_interp.build_vq_evaluator`` — there is a single exchange-interp
     #    orchestration, not one here and one there. ─────────────────────────
     t0 = time.time()
-    # Per-Q mini-BZ head cell-averaging: CLI --head-minibz-average overrides
-    # the cohsex.in ``head_minibz_average`` key (default off = point value).
-    head_mbz = (bool(args.head_minibz_average)
-                if args.head_minibz_average is not None
-                else bool(params.get("head_minibz_average", False)))
-    log(f"  arbitrary-Q head: {'mini-BZ cell average' if head_mbz else 'point value'} "
-        f"(head_minibz_average={head_mbz})")
-    vqm = vq_interp.build_vq_evaluator(
-        restart_file, mesh_xy, n_rmu_pad, alpha=args.alpha,
-        eps_tik=args.eps_tik, eigh_backend=args.eigh_backend,
-        head_minibz_average=head_mbz, log_fn=log)
-    zx, prep = vqm.zx, vqm.prep
-    eval_vq, pinvF, coeffs_packed = vqm.eval_vq, vqm.pinvF, vqm.coeffs_packed
+    # Q ON the coarse BZ grid needs NO exchange model at all: the production
+    # tile V_qmunu[wrap(−Q)] IS the answer, and the driver already uses exactly
+    # that at the one on-grid point it always has (Γ, below).  ``--vq-mode
+    # ongrid`` extends that existing special case to every on-grid Q — no
+    # interpolation error, no b26p stencil, no ζ.  It also makes the exciton
+    # bandstructure runnable on a restart whose ζ is stored IBZ-only (the
+    # D3h-orbit-closure cascade), which ``vq_interp`` refuses.  Cost: the full
+    # (μ, ν, nkx, nky, nkz) exchange tensor alongside W_q.
+    ongrid = (args.vq_mode == "ongrid")
+    kgrid_bse = np.array([nkx, nky, nkz], dtype=np.int64)
+    if ongrid:
+        frac = Qpath * kgrid_bse[None, :]
+        off = np.max(np.abs(frac - np.round(frac)))
+        if off > 1e-6:
+            raise SystemExit(
+                f"--vq-mode=ongrid needs every Q on the {nkx}x{nky}x{nkz} BSE "
+                f"grid; the path is off by {off:.3e} grid units.  Use a "
+                f"K_POINTS block whose segments land on the grid, or "
+                f"--vq-mode=interp (which needs FULL-BZ ζ storage).")
+        log(f"  exchange: EXACT on-grid tiles V_qmunu[wrap(-Q)] "
+            f"({nQ} Q, all on the {nkx}x{nky}x{nkz} grid) — no interpolation")
+        head_mbz = False
+        zx = prep = eval_vq = pinvF = coeffs_packed = None
+    else:
+        # Per-Q mini-BZ head cell-averaging: CLI --head-minibz-average overrides
+        # the cohsex.in ``head_minibz_average`` key (default off = point value).
+        head_mbz = (bool(args.head_minibz_average)
+                    if args.head_minibz_average is not None
+                    else bool(params.get("head_minibz_average", False)))
+        log(f"  arbitrary-Q head: {'mini-BZ cell average' if head_mbz else 'point value'} "
+            f"(head_minibz_average={head_mbz})")
+        vqm = vq_interp.build_vq_evaluator(
+            restart_file, mesh_xy, n_rmu_pad, alpha=args.alpha,
+            eps_tik=args.eps_tik, eigh_backend=args.eigh_backend,
+            head_minibz_average=head_mbz, log_fn=log)
+        zx, prep = vqm.zx, vqm.prep
+        eval_vq, pinvF, coeffs_packed = vqm.eval_vq, vqm.pinvF, vqm.coeffs_packed
     tick("vq_prepare", t0)
 
     grid_xy = NamedSharding(mesh_xy, P("x", "y"))
@@ -528,6 +602,13 @@ def main(argv=None):
             continue
         q_tile = -Qpath[iQ]                          # tile momentum = wrap(−Q)
         q_tile_np = q_tile - np.round(q_tile)
+        if ongrid:
+            ix, iy, iz = (np.round(q_tile_np * kgrid_bse).astype(int)
+                          % kgrid_bse)
+            V_rows.append(_hermitize(
+                jax.device_put(data["V_q_full"][:, :, ix, iy, iz], grid_xy)))
+            n_eval_calls += 1
+            continue
         q_tile = jnp.asarray(q_tile_np)
         if head_mbz:
             gstar, head_val = vq_interp.minibz_head_vlr(

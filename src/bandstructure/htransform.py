@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import argparse
 import numpy as np
 
@@ -148,13 +149,35 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     U, s, Vh = _svd_replicated(A)
     del A
     s_host = np.asarray(s)
-    rank = int((s_host > s_host.max() * rtol).sum())
+    rank_raw = int((s_host > s_host.max() * rtol).sum())
+    # Mesh-align the retained rank.  G, its Cholesky factor, ctilde and fH all
+    # live on a (rank, rank) face sharded P('x', 'y'), so ``rank`` has to divide
+    # BOTH mesh axes.  Whenever the ψ-at-centroids matrix is genuinely
+    # rank-deficient — nk·nb at or above the ISDF column count, which is exactly
+    # the regime the band-window capacity rule is about — ``rank_raw`` is an
+    # arbitrary integer and the first ``device_put`` onto that face raises
+    #   "global size of its dimension 0 should be divisible by 4 ... equal to 4570".
+    # Round DOWN to the aligned rank: the dropped directions are the ones
+    # sitting at the rtol threshold (σ/σ_max ~ 1e-8), i.e. numerically the same
+    # decision ``rtol`` already makes, one notch tighter.
+    align = math.lcm(int(mesh_xy.shape['x']), int(mesh_xy.shape['y']))
+    rank = max(align, (rank_raw // align) * align)
+    rank = min(rank, int(s_host.size))
     U = U[:, :rank]
     s = s[:rank]
     Vh = Vh[:rank, :]                        # (rank, ns·n_μ), keep for centroid recovery
-    log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}): rank={rank}, "
-           f"σ_max={float(s_host[0]):.3e}, σ_min/{rtol:.0e}={float(s_host[rank-1]):.3e} "
+    log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}): rank={rank}"
+           + (f" (rtol rank {rank_raw} → mesh-aligned to {align})"
+              if rank != rank_raw else "")
+           + f", σ_max={float(s_host[0]):.3e}, "
+           f"σ_min/{rtol:.0e}={float(s_host[rank-1]):.3e} "
            f"({time.time()-t1:.2f}s)")
+    if rank_raw < nk * nb:
+        log_fn(f"  [warn] ψ-at-centroids is RANK-DEFICIENT: {nk*nb} states vs "
+               f"numerical rank {rank_raw} (nspinor·n_μ = {nspinor*n_mu}).  The "
+               f"Galerkin basis cannot span the band window — fH energy "
+               f"recovery will degrade.  Capacity rule: nk·nb < rank(ψ_μ) "
+               f"≤ nspinor·n_μ, i.e. nb < {rank_raw/nk:.2f} here.")
 
     coeffs = U * s[None, :]                  # (nk·nb, rank), replicated
     inv_s = (1.0 / s)[:, None]               # (rank, 1), replicated
@@ -440,6 +463,16 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         bw = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
         weighted = ctilde_in * bw[..., None]
         fH_k = -jnp.einsum('kim,kin->kmn', weighted, jnp.conj(weighted), optimize=True)
+        # Constrain the CONTRACTION OUTPUT, not just the hermitized copy.
+        # ``ctilde`` arrives replicated, so without this the SPMD partitioner
+        # has no reason to split the (nk, rank, rank) product and materialises
+        # it — and then its transpose, and then the hermitized sum — at FULL
+        # size on every device.  Measured on MoS2 12x12 / n_mu=2412 / nb=20
+        # (rank 2880): the module wanted 57.84 GiB per device and OOMed an
+        # A100-80GB, against a true sharded footprint of 2 x 1.2 GiB on a 4x4
+        # mesh.  Pinning the einsum output makes the whole chain local.
+        # Memory-only: same values, same shardings out.
+        fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
         fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
         fH_R = local_ifftn(fH_k)

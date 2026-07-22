@@ -151,9 +151,20 @@ def compute_wfns_fi(
         a_band_index=a_band_index, log_fn=log)
     del fH_k  # diagnostic-only here; not needed downstream
 
-    # Replicate fH_R + B_at_mu so each q-batch is a local matmul + eigh.
+    # fH_R stays SHARDED P(None, 'x', 'y') — the (rank, rank) face is split
+    # across the mesh, the lattice-R axis is not.  The q-Fourier sum contracts
+    # ONLY over R, so every device can build its own (i, j) tile of fH_q with no
+    # communication at all; the single collective is the reshard onto the q axis
+    # just before the eigh (see ``_q_batch``).  B_at_mu is replicated — it is
+    # (rank, ns, n_μ), three orders smaller.
+    #
+    # It used to be ``jax.device_put(fH_R, rep)``.  That is nk_co · rank² · 16 B
+    # on EVERY device (MoS2 12×12, n_μ=2412: 11 GiB at nb=16 rising to 50 GiB at
+    # nb≥36) and, because the source is sharded, JAX routes it through
+    # ``x._value`` — a host gather of the same size per process.  It was the
+    # single reason a converged k-grid could not run the htransform at any
+    # device count (gw_converged_12x12_80ry_2026-07-21 §5, next-step #2).
     rep = NamedSharding(mesh_xy, P())
-    fH_R_rep = jax.device_put(fH_R, rep)
     B_rep = jax.device_put(B_at_mu, rep)
     R_grid = jnp.asarray(build_R_grid_np(kgrid_co))
 
@@ -175,19 +186,29 @@ def compute_wfns_fi(
     # too.  The guard bands above b_max stay in fH (they shape the
     # interpolation) but are not returned, so every returned band is interior.
     # The q axis is sharded over ALL mesh devices (the ``_kpath_batch`` idiom,
-    # htransform.h_transform): fH_R/B are replicated, so each device builds and
-    # eigh-decomposes only its own q-rows — the eigh is the dominant cost here
-    # (measured 28 ms per rank-1152 matrix at MoS2 12×12) and runs
-    # ndev-parallel instead of replicated.
+    # htransform.h_transform): after ONE all-to-all each device holds whole
+    # (rank, rank) matrices for its own q-rows and eigh-decomposes them — the
+    # eigh is the dominant cost here (measured 28 ms per rank-1152 matrix at
+    # MoS2 12×12) and runs ndev-parallel instead of replicated.
     @partial(jax.jit, static_argnames=('b_min', 'b_max'))
     def _q_batch(q_batch, fH_R, B, b_min, b_max):
         q_batch = jax.lax.with_sharding_constraint(
             q_batch, NamedSharding(mesh_xy, P(('x', 'y'), None)))
         phase = jnp.exp(-2j * jnp.pi * (q_batch @ R_grid.T))           # (bs, nk_co)
+        # fH_R is (i, j)-sharded and the sum runs over R only → local.  Pin the
+        # contraction OUTPUT to that same (i, j) layout: left free, XLA
+        # materialises the whole (bs, rank, rank) batch on every device before
+        # the reshard below (measured: 9 batches × 11.4 GiB at nb=36 / rank
+        # 4716 — the OOM that made the wide windows unmeasurable).
         fH_q = jnp.einsum('qk,kij->qij', phase, fH_R)
-        fH_q = 0.5 * (fH_q + jnp.swapaxes(fH_q, -1, -2).conj())
+        fH_q = jax.lax.with_sharding_constraint(
+            fH_q, NamedSharding(mesh_xy, P(None, 'x', 'y')))
+        # Reshard (i,j)→q FIRST, then hermitize: on the q-sharded layout each
+        # device owns whole matrices, so the transpose is local.  Doing it the
+        # other way round costs a second all-to-all for ``swapaxes``.
         fH_q = jax.lax.with_sharding_constraint(
             fH_q, NamedSharding(mesh_xy, P(('x', 'y'), None, None)))
+        fH_q = 0.5 * (fH_q + jnp.swapaxes(fH_q, -1, -2).conj())
         lam, U = jnp.linalg.eigh(fH_q)                                  # ascending
         c = U[:, :, b_min:b_max]                                        # (bs, rank, nb_fi)
         psi = jnp.einsum('qan,asm->qnsm', c, B)                         # (bs, nb_fi, ns, n_μ)
@@ -195,7 +216,7 @@ def compute_wfns_fi(
 
     lam_chunks, psi_chunks, c_chunks = [], [], []
     for i in range(0, q_pad.shape[0], batch_size):
-        lam_b, psi_b, c_b = _q_batch(q_pad[i:i+batch_size], fH_R_rep, B_rep, b_min, b_max)
+        lam_b, psi_b, c_b = _q_batch(q_pad[i:i+batch_size], fH_R, B_rep, b_min, b_max)
         lam_chunks.append(lam_b)
         psi_chunks.append(psi_b)
         if return_coeffs:
