@@ -555,6 +555,13 @@ def main(argv=None):
         log_fn=log)
     psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
         bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
+    # Everything the htransform produced is now copied into the conduction
+    # stacks and nothing below reads it again.  Drop it before the V_Q model
+    # build: ``vq_interp.build_cq`` process_allgathers C_q to host, which is
+    # ONE (n_stencil, n_μ, n_μ) c128 allocation — 16.8 GB at n_μ = 2412 — and
+    # it OOMs if the htransform's leftovers are still resident.  ``bundle``
+    # alone is ψ at every (Q, k) in both shardings.
+    del bundle, ctilde, B_at_mu, enk_sigma
     tick("htransform_psi_cQ", t0)
 
     # on-grid gate at the first Γ node (path convention: starts at Γ)
