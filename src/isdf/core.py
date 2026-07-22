@@ -1170,6 +1170,42 @@ def _factor_c_q_replicated(
     return _replicated_chol_cache[key](C_q)
 
 
+# Largest REPLICATED q-batch handed to one dense factor call.  The factor is
+# per-q independent (one eigh / cholesky per matrix), but its device workspace
+# scales with the batch: measured ~0.30 GB per q at n_μ = 2416, so the full-BZ
+# MoS2 12×12 stack (nq = 144) asks XLA for a single 42.55 GB allocation and
+# dies on an 80 GB card, while the IBZ stack (nq = 74) fits.  Batching keeps the
+# workspace bounded by nq_chunk instead of nq — the q axis is not a physics
+# knob here, so the split is invisible to the result.
+_REPLICATED_FACTOR_MAX_BATCH_BYTES = 4 * 1024**3
+
+
+def _replicated_factor_q_chunk(nq: int, n_rmu: int) -> int:
+    """q-batch size for :func:`factor_c_q_replicated_batched`."""
+    per_q = max(1, int(n_rmu) ** 2 * 16)
+    return max(1, min(int(nq), _REPLICATED_FACTOR_MAX_BATCH_BYTES // per_q))
+
+
+def factor_c_q_replicated_batched(
+    C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int, **kw
+) -> jax.Array:
+    """:func:`_factor_c_q_replicated` over q in bounded batches.
+
+    Per-q independent, so concatenating the batches reproduces the one-shot
+    call; only the XLA workspace differs.  A single batch (every stack that
+    already fitted) takes the identical code path it always did.
+    """
+    nq, n_rmu, _ = C_q.shape
+    step = _replicated_factor_q_chunk(nq, n_rmu)
+    if step >= nq:
+        return _factor_c_q_replicated(C_q, mesh_xy, n_rmu_logical, **kw)
+    parts = [_factor_c_q_replicated(C_q[q0:min(q0 + step, nq)], mesh_xy,
+                                    n_rmu_logical, **kw)
+             for q0 in range(0, nq, step)]
+    return jax.device_put(jnp.concatenate(parts, axis=0),
+                          NamedSharding(mesh_xy, P(None, 'x', 'y')))
+
+
 def factor_c_q(
     C_q: jax.Array,
     mesh_xy: Mesh,
@@ -1296,7 +1332,7 @@ def factor_c_q(
             or mesh_xy.devices.size == 1 or (Pr == 1 and Pc == 1)):
         _mode = ('rank_truncate' if solver_kind == 'replicated_rank_truncate'
                  else 'cholesky')
-        return _factor_c_q_replicated(
+        return factor_c_q_replicated_batched(
             C_q, mesh_xy, n_rmu_logical, zeta_ridge=zeta_ridge,
             charge_zeta_solve=_mode, zeta_rcond=zeta_rcond)
 

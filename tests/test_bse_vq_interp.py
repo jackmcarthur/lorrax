@@ -49,7 +49,7 @@ def vq_state():
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1),
                 axis_names=("x", "y"))
     zx = vqi.load_zeta_coarse(f"{FX}/isdf_tensors_640.h5", f"{FX}/zeta_q.h5")
-    C_q = vqi.build_cq(zx)
+    C_q = vqi.build_cq(zx, mesh)
     vqi.run_gates(zx, C_q)                 # hard machine-level gates
     with mesh:
         prep = vqi.prepare_coarse(zx, C_q, mesh)

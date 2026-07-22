@@ -115,31 +115,46 @@ def load_zeta_coarse(restart_file: str, zeta_file: str) -> dict:
 
     Requires FULL-BZ ζ storage (nq == nk).  IBZ-only storage (the IBZ
     cascade) raises — see the module docstring.
+
+    THE THREE BIG q-STACKS STAY ON DISK.  ``ZG`` (nq, n_μ, ngkmax),
+    ``Vqmunu`` and ``W0`` (nq, n_μ, n_μ) are read-only and every consumer
+    slices them on the q axis, so they are kept as open ``h5py`` datasets
+    and pulled per q-chunk instead of being materialised per process.  At
+    the converged MoS2 reference (nq = 144, n_μ = 2412, ngkmax = 8603) ζ
+    alone is **47.8 GB**; four ranks per Perlmutter GPU node (251 GB) cannot
+    hold it, which is what confined the exciton driver to ``--vq-mode
+    ongrid``.  Lazy, the resident host cost is ψ (3.7 GB) plus one q-chunk.
+    Same principle as the ψ(G) host cache in the GW path: large read-only
+    caches are pulled per slice, never carried.
     """
     zx = {"restart_file": restart_file, "zeta_file": zeta_file}
-    with h5py.File(restart_file, "r") as f:
-        zx["psi"] = f["psi_full_y"][()]          # (nk, nb, ns, n_mu) u at centroids
-        zx["kgrid"] = f["kgrid"][()].astype(int)
-        zx["Vqmunu"] = f["V_qmunu"][()]          # disk tiles (gate reference)
-        if "W0_qmunu" in f:
-            zx["W0"] = f["W0_qmunu"][()]         # screened tiles (exciton Hdir)
-        zx["enk"] = f["enk_full"][()]            # (nk, nb) Ry
-    with h5py.File(zeta_file, "r") as f:
-        zx["ZG"] = f["zeta_q_G"][()]             # (nq, n_mu, ngkmax) c128
-        zx["gvec"] = f["isdf_header/gvec_components"][()].astype(np.int64)
-        zx["ngk"] = f["isdf_header/ngk"][()].astype(int)
-        fg = f["mf_header/gspace/FFTgrid"][()].astype(int)
-        qraw = f["mf_header/kpoints/rk"][()]
-        zx["adot"] = f["mf_header/crystal/adot"][()]
-        blat = float(np.real(f["mf_header/crystal/blat"][()]))
-        # BGW stores bvec in units of blat = 2π/alat; physical bohr⁻¹
-        # (|bvec^T g|² in Ry) needs the blat factor (measured: 10.4%
-        # makeVq-vs-disk residual without it).
-        zx["bvec"] = f["mf_header/crystal/bvec"][()] * blat
-        zx["celvol"] = float(np.real(f["mf_header/crystal/celvol"][()]))
-        rmu_idx = f["isdf_header/centroids/r_mu_fft_idx"][()].astype(int)
-        zx["zeta_cutoff"] = float(f["isdf_header/zeta_cutoff_ry"][()])
-        ifmax = f["mf_header/kpoints/ifmax"][()]
+    # NOT a context manager: the file handles outlive this call so the
+    # lazy datasets below stay readable.  ``zx`` owns them.
+    fr = h5py.File(restart_file, "r")
+    zx["_h5_restart"] = fr
+    zx["psi"] = fr["psi_full_y"][()]          # (nk, nb, ns, n_mu) u at centroids
+    zx["kgrid"] = fr["kgrid"][()].astype(int)
+    zx["Vqmunu"] = fr["V_qmunu"]              # LAZY — disk tiles (gate reference)
+    if "W0_qmunu" in fr:
+        zx["W0"] = fr["W0_qmunu"]             # LAZY — screened tiles (Hdir)
+    zx["enk"] = fr["enk_full"][()]            # (nk, nb) Ry
+    fz = h5py.File(zeta_file, "r")
+    zx["_h5_zeta"] = fz
+    zx["ZG"] = fz["zeta_q_G"]                 # LAZY — (nq, n_mu, ngkmax) c128
+    zx["gvec"] = fz["isdf_header/gvec_components"][()].astype(np.int64)
+    zx["ngk"] = fz["isdf_header/ngk"][()].astype(int)
+    fg = fz["mf_header/gspace/FFTgrid"][()].astype(int)
+    qraw = fz["mf_header/kpoints/rk"][()]
+    zx["adot"] = fz["mf_header/crystal/adot"][()]
+    blat = float(np.real(fz["mf_header/crystal/blat"][()]))
+    # BGW stores bvec in units of blat = 2π/alat; physical bohr⁻¹
+    # (|bvec^T g|² in Ry) needs the blat factor (measured: 10.4%
+    # makeVq-vs-disk residual without it).
+    zx["bvec"] = fz["mf_header/crystal/bvec"][()] * blat
+    zx["celvol"] = float(np.real(fz["mf_header/crystal/celvol"][()]))
+    rmu_idx = fz["isdf_header/centroids/r_mu_fft_idx"][()].astype(int)
+    zx["zeta_cutoff"] = float(fz["isdf_header/zeta_cutoff_ry"][()])
+    ifmax = fz["mf_header/kpoints/ifmax"][()]
     zx["nk"], zx["nb"], zx["ns"], zx["n_mu"] = zx["psi"].shape
     zx["nq"] = zx["ZG"].shape[0]
     zx["ngkmax"] = zx["ZG"].shape[2]
@@ -315,17 +330,27 @@ def _batched_vq_relF(ZG, v_all, V_ref, q_chunk=48):
     return np.concatenate(out)
 
 
-def build_cq(zx, q_chunk=48):
+def build_cq(zx, mesh_xy: Mesh, q_chunk=48):
     """C_q Gram rebuild from ψ at centroids (reference ``build_cq``,
     order-robust R-space route, arithmetic verbatim — evaluated on device,
     q-CHUNK-accumulated: P_R = Σ_q e^{2πi q·R} Pk(q) is summed chunkwise
     with a donated accumulator, so peak device residency is the P_R
-    intermediate (nR·ns²·n_μ²·16 B ≈ 3.8 GB at MoS2 12×12) plus ONE ψ/Pk
-    chunk — never full-ψ (9.4 GB at the nb=80 fit window) + full-Pk):
+    intermediate plus ONE ψ/Pk chunk — never full-ψ (9.4 GB at the nb=80
+    fit window) + full-Pk):
         C_q[μν] = Σ_{k,mn} conj(ρ_kmn(r_μ)) ρ_kmn(r_ν),
         ρ_kmn(r) = Σ_s conj(u_{m, wrap(k−q), s}(r)) u_{n, k, s}(r)
     with stored cell-periodic spinors at WRAPPED k labels (torus
-    convention, no umklapp phases; gate: X^H X == C_q)."""
+    convention, no umklapp phases; gate: X^H X == C_q).
+
+    P_R (nR, ns, n_μ, n_μ, ns) is sharded on the (μ, ν) FACE — the same
+    ``P('x','y')`` layout every other tile in this module lives on — because
+    replicated it is nR·ns²·n_μ²·16 B, i.e. 3.8 GB at the 6×6 / n_μ = 1496
+    fixture but **53.6 GB at the converged 12×12 / n_μ = 2412 reference**,
+    which no single device holds.  R and q stay unsharded, so BOTH
+    contractions (the q-Fourier accumulation and the R-Fourier transform
+    back) are device-local: no collectives, only the final host gather.
+    The einsums replace the original reshape-matmuls verbatim — a reshape
+    that flattens ns·n_μ·n_μ·ns would destroy the face sharding."""
     nq, nb, ns, n_mu = zx["nq"], zx["nb"], zx["ns"], zx["n_mu"]
     kg = zx["kgrid"]
     Rall = np.array([[rx, ry, rz] for rx in range(kg[0])
@@ -333,27 +358,34 @@ def build_cq(zx, q_chunk=48):
     Rw = ((Rall + kg // 2) % kg) - (kg // 2)
     nR = len(Rw)
     EqR_np = np.exp(2j * np.pi * (zx["qfr"] @ Rw.T))
+    rep = NamedSharding(mesh_xy, P())
+    face5 = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
+    face3 = NamedSharding(mesh_xy, P(None, "x", "y"))
 
-    @partial(jax.jit, donate_argnums=(0,))
+    @partial(jax.jit, donate_argnums=(0,), out_shardings=face5)
     def _pr_acc(P_R, psi_c, EqR_c):
         psiX = jnp.conj(psi_c).transpose(0, 3, 1, 2)
-        Pk = jnp.einsum("kmna,knbr->karmb", psiX, psi_c)
-        return P_R + (EqR_c.T @ Pk.reshape(Pk.shape[0], -1)
-                      ).reshape(P_R.shape)
+        Pk = jax.lax.with_sharding_constraint(
+            jnp.einsum("kmna,knbr->karmb", psiX, psi_c), face5)
+        return P_R + jnp.einsum("kR,kavmb->Ravmb", EqR_c, Pk)
 
-    @jax.jit
+    @partial(jax.jit, out_shardings=face3)
     def _cq_final(P_R, EqR):
-        C_R = jnp.einsum("ravmb,ravmb->rvm", jnp.conj(P_R), P_R)
-        return jnp.transpose(((jnp.conj(EqR) / nq)
-                              @ C_R.reshape(nR, -1)
-                              ).reshape(nq, n_mu, n_mu), (0, 2, 1))
+        C_R = jax.lax.with_sharding_constraint(
+            jnp.einsum("ravmb,ravmb->rvm", jnp.conj(P_R), P_R), face3)
+        return jnp.einsum("qr,rvm->qmv", jnp.conj(EqR) / nq, C_R)
 
-    P_R = jnp.zeros((nR, ns, n_mu, n_mu, ns), dtype=jnp.complex128)
+    # Allocate the accumulator ALREADY SHARDED.  ``device_put(jnp.zeros(...))``
+    # would materialise the whole 53.6 GB on one device first and only then
+    # reshard — the allocation that OOMs an 80 GB card at n_μ = 2412.
+    P_R = jax.jit(lambda: jnp.zeros((nR, ns, n_mu, n_mu, ns),
+                                    dtype=jnp.complex128),
+                  out_shardings=face5)()
     for q0 in range(0, nq, q_chunk):
         sl = slice(q0, min(q0 + q_chunk, nq))
-        P_R = _pr_acc(P_R, jnp.asarray(zx["psi"][sl]),
-                      jnp.asarray(EqR_np[sl]))
-    return np.asarray(jax.device_get(_cq_final(P_R, jnp.asarray(EqR_np))))
+        P_R = _pr_acc(P_R, jax.device_put(jnp.asarray(zx["psi"][sl]), rep),
+                      jax.device_put(jnp.asarray(EqR_np[sl]), rep))
+    return _to_host(_cq_final(P_R, jax.device_put(jnp.asarray(EqR_np), rep)))
 
 
 def kq_index(zx, ki, qi):
@@ -543,13 +575,15 @@ def _to_host(x):
 
 
 def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
-                   eigh_backend: str = "auto", q_chunk: int = 48):
+                   eigh_backend: str = "auto", q_chunk: int = 48,
+                   keep_host_mirrors: bool = True):
     """STAGE 1.  Returns the coarse-side bundle ``prep``:
       S        (nq, n_μ, n_μ)  Tikhonov cleaning operators S_q (host copy,
-                               nulls only)
+                               nulls only) — ``None`` without host mirrors
       V_SRc    (nq, n_μ, n_μ)  cleaned short-range tiles — DEVICE stack,
                                sharded ``P(None,'x','y')`` (the stencil data)
-      V_SRc_np (nq, n_μ, n_μ)  host copy (LOO ladders / metrics)
+      V_SRc_np (nq, n_μ, n_μ)  host copy (LOO ladders / metrics) — ``None``
+                               without host mirrors
       GS       (3, nG)         fixed LR Miller superset 𝒢(α)
       Fch      (nq, n_μ, nG)   phase-factored cleaned LR form factors (host —
                                fit input only, droppable after stage 2)
@@ -569,9 +603,27 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     see ``_eigh_backend`` for when the distributed FFI backends make sense;
     they are honored per-q if explicitly requested.  n_μ is used at its
     LOGICAL extent here; the jitted evaluator pads on output.
+
+    ``q_chunk`` is a CEILING, lowered to keep the host-side ζ read bounded:
+    the chunk is read whole on every process before it is device_put, and at
+    the converged reference (n_μ = 2412, ngkmax = 8603) one q is 332 MB, so
+    48 q is 15.9 GB per rank — 64 GB per 4-rank Perlmutter node, on top of
+    C_q and the two (nq, n_μ, n_μ) host stacks.  It stays a whole number of
+    mesh shards so the q axis still device_puts evenly.
+
+    ``keep_host_mirrors=False`` drops ``S`` and ``V_SRc_np``.  They are read
+    ONLY by ``run_nulls`` and ``eval_vq_host`` (the LOO ladders), so with the
+    diagnostics off they are 2 × nq·n_μ²·16 B of dead weight — 26.8 GB per
+    process at the converged reference, which is 107 GB of a 251 GB node once
+    four ranks share it, and it is what OOM-kills the node.  ``V_SRc`` is then
+    assembled straight from the per-chunk device shards, never via a host
+    round-trip.
     """
     nq, n_mu = zx["nq"], zx["n_mu"]
     ngkmax = zx["ngkmax"]
+    ndev = int(mesh_xy.devices.size)
+    q_chunk = int(min(q_chunk, nq,
+                      max(ndev, ndev * (5e9 // (n_mu * ngkmax * 16 * ndev)))))
     assert np.max(np.abs(zx["qfr"][:, 2])) < 1e-12, "slab pipeline needs q_z=0"
     GS = lr_gset(zx, alpha)
     nG = GS.shape[1]
@@ -627,19 +679,30 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
         ph = jnp.exp(2j * jnp.pi * jnp.einsum("mi,bgi->bmg", rmu, qG))
         return S, V_SRc, ph * ztg
 
-    S_np = np.empty((nq, n_mu, n_mu), dtype=np.complex128)
-    V_SRc_np = np.empty((nq, n_mu, n_mu), dtype=np.complex128)
+    S_np = (np.empty((nq, n_mu, n_mu), dtype=np.complex128)
+            if keep_host_mirrors else None)
+    V_SRc_np = (np.empty((nq, n_mu, n_mu), dtype=np.complex128)
+                if keep_host_mirrors else None)
+    V_dev_chunks = []
     Fch = np.empty((nq, n_mu, nG), dtype=np.complex128)
-    C_herm = 0.5 * (C_q + np.conj(np.swapaxes(C_q, 1, 2)))
+
+    def C_herm(sl):
+        """Hermitised C_q, PER CHUNK.  A whole-array copy is another
+        nq·n_μ²·16 B on every process — 13.4 GB at the converged reference,
+        which four ranks per node cannot afford beside C_q itself."""
+        c = C_q[sl]
+        return 0.5 * (c + np.conj(np.swapaxes(c, -2, -1)))
+
     for q0 in range(0, nq, q_chunk):
         sl = slice(q0, min(q0 + q_chunk, nq))
         if eigh_backend in ("auto", "off"):
-            lam, R = _eigh_batch(jax.device_put(jnp.asarray(C_herm[sl]), qb3))
+            lam, R = _eigh_batch(jax.device_put(jnp.asarray(C_herm(sl)), qb3))
         else:
             # explicit distributed-FFI request: per-q eigh, then the same
             # batched post-eigh pipeline (single source for the math).
-            pairs = [_eigh_backend(jax.device_put(jnp.asarray(C_herm[q]),
-                                                  grid_xy),
+            pairs = [_eigh_backend(jax.device_put(
+                                       jnp.asarray(C_herm(slice(q, q + 1))[0]),
+                                       grid_xy),
                                    mesh_xy, eigh_backend)
                      for q in range(sl.start, sl.stop)]
             lam = jnp.stack([p[0] for p in pairs])
@@ -654,14 +717,21 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
         # process_allgather (not device_get): S_b/V_b/F_b are q-sharded qb3
         # across the whole mesh, so on a multi-node run their shards span other
         # processes and device_get would raise (non-addressable).
-        S_np[sl] = _to_host(S_b)
-        V_SRc_np[sl] = _to_host(V_b)
+        if keep_host_mirrors:
+            S_np[sl] = _to_host(S_b)
+            V_SRc_np[sl] = _to_host(V_b)
+        else:
+            V_dev_chunks.append(V_b)
         Fch[sl] = _to_host(F_b)
     tail = float(np.exp(-zx["zeta_cutoff"] / (4.0 * alpha ** 2)))
     print(f"  [prep] gset({alpha}) = {nG} G; {n_out} out-of-sphere (q,G) "
-          f"channels zero-filled; sphere-tail bound {tail:.1e}")
-    V_SRc_dev = jax.device_put(jnp.asarray(V_SRc_np),
-                               NamedSharding(mesh_xy, P(None, "x", "y")))
+          f"channels zero-filled; sphere-tail bound {tail:.1e}"
+          f"{'' if keep_host_mirrors else '; host mirrors dropped'}")
+    stencil_sh = NamedSharding(mesh_xy, P(None, "x", "y"))
+    V_SRc_dev = (jax.device_put(V_SRc_np, stencil_sh) if keep_host_mirrors
+                 else jax.jit(lambda *c: jnp.concatenate(c, axis=0),
+                              out_shardings=stencil_sh)(*V_dev_chunks))
+    del V_dev_chunks
     return {"alpha": alpha, "eps_tik": eps_tik, "GS": GS, "S": S_np,
             "V_SRc": V_SRc_dev, "V_SRc_np": V_SRc_np, "Fch": Fch, "W": W,
             "gz_cols": {int(g): np.where(GS[2] == g)[0]
@@ -960,11 +1030,13 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
     if zeta_file is None:
         zeta_file = os.path.join(os.path.dirname(restart_file), "zeta_q.h5")
     zx = load_zeta_coarse(restart_file, zeta_file)
-    C_q = build_cq(zx)
+    C_q = build_cq(zx, mesh_xy)
     if run_diagnostics:
         run_gates(zx, C_q)
+    # The host mirrors exist for run_nulls / eval_vq_host only — same switch.
     prep = prepare_coarse(zx, C_q, mesh_xy, alpha=alpha, eps_tik=eps_tik,
-                          eigh_backend=eigh_backend)
+                          eigh_backend=eigh_backend,
+                          keep_host_mirrors=run_diagnostics)
     des = lr_design_blocks(zx, prep)
     coeffs = fit_lr_model(des)
     if run_diagnostics:
@@ -1085,6 +1157,10 @@ def build_hdir(zx, q0, nvw=3, ncw=3):
     psic = np.ascontiguousarray(zx["psi"][:, cs])
     psiv = np.ascontiguousarray(zx["psi"][:, vs])
     psic_kq = psic[kqs]
+    # ``zx["W0"]`` is a lazy h5py dataset (see load_zeta_coarse) and the q
+    # lookup below is an unsorted permutation, which h5py cannot fancy-index.
+    # This diagnostic wants every q anyway, so materialise once here.
+    W0 = zx["W0"][()]
     H = np.zeros((npair, npair), dtype=np.complex128)
     bs = ncw * nvw
     for k in range(zx["nk"]):
@@ -1092,7 +1168,7 @@ def build_hdir(zx, q0, nvw=3, ncw=3):
                        optimize=True)
         Tv = np.einsum("vsm,KVsm->KvVm", psiv[k], np.conj(psiv),
                        optimize=True)
-        Wg = zx["W0"][qkk[k]]
+        Wg = W0[qkk[k]]
         blk = np.einsum("KcCm,Kmn,KvVn->KcvCV", Tc, Wg, Tv, optimize=True)
         H[k * bs:(k + 1) * bs] = blk.transpose(1, 2, 0, 3, 4).reshape(bs,
                                                                       npair)
