@@ -149,6 +149,7 @@ from common.minimax import (
     evaluate_crossing,
     # Imaginary-axis
     solve_noncrossing_imag, noncrossing_imag_grids,
+    noncrossing_complex_grids,
 )
 
 # Noncrossing: 1/x ≈ Σ w_l exp(-t_l x)  on [1, R]
@@ -161,9 +162,21 @@ N, A_est = predict_N_crossing(xi_eff_target=0.2, E_bw=10.0, target_error=0.01/70
 tau, w, info = build_crossing_quadrature(N, xi_eff_target=0.2, E_bw=10.0)
 xi_0 = info['xi_0']
 
-# Imaginary-axis: x/(x²+ω²) ≈ Σ w_l exp(-t_l x)
+# Imaginary-axis dispersive component: x/(x²+ω²) ≈ Σ w_l exp(-t_l x)
 tau, w, err = solve_noncrossing_imag(N=11, R=52.0, omega_hat=16.3)
+
+# Full noncrossing resolvent: 1/(x+iω) with real nodes and complex weights
+tau, w, N, err = noncrossing_complex_grids(R=52.0, omega_hat=16.3, eps=1e-6)
 ```
+
+The complex fit solves the dispersive $x/(x^2+\omega^2)$ and absorptive
+$\omega/(x^2+\omega^2)$ components independently and concatenates their nodes.
+Each component is certified at $\epsilon/\sqrt{2}$, which bounds the complex
+magnitude error by $\epsilon$. Fits whose dimensionless weight L1 norm exceeds
+$10^4$ are skipped in the automatic node search to reject severe cancellation.
+This construction covers noncrossing off-axis denominators. A sample whose real
+frequency lies inside the transition continuum still requires the separate global
+crossing/complex-time construction.
 
 ## 6.1 Shipped quadrature tables
 

@@ -216,6 +216,82 @@ def test_crossing_solver_hgl_error_is_dense_and_well_conditioned():
     assert dense_error < 1.0e-6
     assert np.sum(np.abs(alpha)) < 1.0
 
+
+def test_imag_solver_stops_at_target_without_large_weight_cancellation():
+    """Tolerance-aware polishing should not trade conditioning for excess digits."""
+    R = 10.0
+    omega_hat = 1.0
+    tau, alpha, _node_count, reported_error = (
+        minimax_core.noncrossing_imag_grids(
+            R, omega_hat, 1.0e-6, N_max=16)
+    )
+
+    x_dense = np.geomspace(1.0, R, 20_001)
+    target = x_dense / (x_dense**2 + omega_hat**2)
+    dense_error = np.max(np.abs(
+        target - np.exp(-np.outer(x_dense, tau)) @ alpha
+    ))
+
+    assert reported_error < 1.0e-6
+    assert dense_error < 1.0e-6
+    assert np.sum(np.abs(alpha)) < 1.0e4
+
+
+def test_complex_noncrossing_resolvent_is_dense_grid_certified():
+    R = 8.0
+    omega_hat = 2.0
+    target_error = 2.0e-5
+    tau, alpha, _node_count, reported_error = (
+        minimax_core.noncrossing_complex_grids(
+            R, omega_hat, target_error, N_max=24)
+    )
+
+    x_dense = np.geomspace(1.0, R, 20_001)
+    target = 1.0 / (x_dense + 1j * omega_hat)
+    dense_error = np.max(np.abs(
+        target - np.exp(-np.outer(x_dense, tau)) @ alpha
+    ))
+
+    assert np.iscomplexobj(alpha)
+    assert reported_error < target_error
+    assert dense_error < target_error
+
+
+def test_complex_interval_rescales_and_preserves_complex_weights(monkeypatch):
+    tau_hat = np.array([0.5, 1.5], dtype=np.float64)
+    alpha_hat = np.array([0.25 - 0.5j, -0.1j], dtype=np.complex128)
+    err_hat = 8.0e-7
+    monkeypatch.setattr(
+        ms,
+        "_solve_noncrossing_complex_scaled_cached",
+        lambda *args, **kwargs: (tau_hat, alpha_hat, err_hat),
+    )
+
+    quad = ms.solve_laplace_minimax_complex_interval(
+        2.0, 20.0, 3.0, target_error=1.0e-6, max_nodes=16)
+    nodes = quad.to_minimax_nodes(time_axis="real")
+
+    np.testing.assert_allclose(quad.tau, tau_hat / 2.0)
+    np.testing.assert_allclose(quad.alpha, alpha_hat / 2.0)
+    np.testing.assert_allclose(np.asarray(nodes.alpha), alpha_hat / 2.0)
+    assert quad.max_error == err_hat / 2.0
+
+
+def test_minimax_disk_cache_preserves_complex_weights(tmp_path, monkeypatch):
+    monkeypatch.setenv("LORRAX_MINIMAX_CACHE_DIR", str(tmp_path))
+    payload = {"solver": "complex-test", "revision": 1}
+    tau = np.array([0.25, 1.0], dtype=np.float64)
+    alpha = np.array([0.4 - 0.2j, -0.3j], dtype=np.complex128)
+
+    ms._store_minimax_disk_cache("complex-test", payload, tau, alpha, 1.0e-7)
+    loaded = ms._load_minimax_disk_cache("complex-test", payload)
+
+    assert loaded is not None
+    tau_loaded, alpha_loaded, error_loaded = loaded
+    np.testing.assert_array_equal(tau_loaded, tau)
+    np.testing.assert_array_equal(alpha_loaded, alpha)
+    assert error_loaded == 1.0e-7
+
 # ===========================================================================
 #  real-axis quadrature vs analytic kernel (was test_real_axis_quadrature.py)
 # ===========================================================================

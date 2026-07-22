@@ -430,9 +430,22 @@ def evaluate_noncrossing(x, tau, w):
 # IMAGINARY-AXIS: x/(x²+ω²) on [1, R] with exponential sums
 # ================================================================
 
-def _imag_target(x, omega_hat):
-    """x/(x^2 + omega_hat^2) on the evaluation grid."""
-    return x / (x**2 + omega_hat**2)
+def _imag_target(x, omega_hat, component="dispersive"):
+    """A real component of ``1 / (x + i*omega_hat)``.
+
+    ``dispersive`` is ``x/(x^2+omega_hat^2)`` and is the existing pure
+    imaginary-frequency chi0 target. ``absorptive`` is the positive
+    Lorentzian ``omega_hat/(x^2+omega_hat^2)``; multiplying its fitted
+    weights by ``-1j`` supplies the imaginary part of the resolvent.
+    """
+    denom = x**2 + omega_hat**2
+    if component == "dispersive":
+        return x / denom
+    if component == "absorptive":
+        return omega_hat / denom
+    raise ValueError(
+        f"Unknown imaginary-axis target component={component!r}; "
+        "expected 'dispersive' or 'absorptive'.")
 
 
 def _imag_varpro_residual(s, x_grid, g, W_sqrt):
@@ -473,11 +486,13 @@ def _imag_solve_once(s_init, x_grid, g, s_lo, s_hi, weights=None):
     return s, w
 
 
-def _imag_solve_at_R(N, Ri, omega_hat, s_init, lawson_iter=4):
+def _imag_solve_at_R(N, Ri, omega_hat, s_init, lawson_iter=4, *,
+                     component="dispersive", target_error=None,
+                     error_grid=None):
     """Solve at a single R with Lawson IRLS."""
     M = max(200, 15 * N)
     x_grid = np.exp(np.linspace(0, np.log(Ri), M))
-    g = _imag_target(x_grid, omega_hat)
+    g = _imag_target(x_grid, omega_hat, component)
 
     s_lo = -np.log(2.0 * Ri) - 1.0
     s_hi = np.log(max(5.0 * N, 10.0)) + 1.0
@@ -486,6 +501,11 @@ def _imag_solve_at_R(N, Ri, omega_hat, s_init, lawson_iter=4):
     s, w = _imag_solve_once(s_init, x_grid, g, s_lo, s_hi)
 
     for k in range(lawson_iter):
+        if target_error is not None and error_grid is not None:
+            approx = np.exp(-np.outer(error_grid, np.exp(s))) @ w
+            error_target = _imag_target(error_grid, omega_hat, component)
+            if np.max(np.abs(error_target - approx)) < float(target_error):
+                break
         Phi = np.exp(-np.outer(x_grid, np.exp(s)))
         e = g - Phi @ w
         ae = np.abs(e)
@@ -497,7 +517,8 @@ def _imag_solve_at_R(N, Ri, omega_hat, s_init, lawson_iter=4):
     return s, w
 
 
-def solve_noncrossing_imag(N, R, omega_hat, lawson_iter=4):
+def solve_noncrossing_imag(N, R, omega_hat, lawson_iter=4, *,
+                           target_error=None, component="dispersive"):
     """Compute N-point minimax quadrature for x/(x^2+omega_hat^2) on [1, R].
 
     Uses continuation in R from R=2, same as the static solver.
@@ -511,6 +532,10 @@ def solve_noncrossing_imag(N, R, omega_hat, lawson_iter=4):
     omega_hat : float
         Dimensionless imaginary frequency omega_p / x_min.
         omega_hat = 0 recovers the static 1/x case (up to normalization).
+    target_error : float, optional
+        Dense-grid absolute error at which Lawson polishing may stop.
+    component : {'dispersive', 'absorptive'}
+        Real component to fit. The default preserves the historical chi0 target.
 
     Returns
     -------
@@ -520,7 +545,8 @@ def solve_noncrossing_imag(N, R, omega_hat, lawson_iter=4):
     """
     M_eval = max(1000, 40 * N)
     x_eval = np.exp(np.linspace(0, np.log(R), M_eval))
-    g_eval = _imag_target(x_eval, omega_hat)
+    component = str(component).strip().lower()
+    g_eval = _imag_target(x_eval, omega_hat, component)
 
     s_lo = -np.log(2.0 * R) - 1.0
     s_hi = np.log(max(5.0 * N, 10.0)) + 1.0
@@ -536,7 +562,13 @@ def solve_noncrossing_imag(N, R, omega_hat, lawson_iter=4):
 
         s_ = s0.copy()
         for Ri in R_sched:
-            s_, w_ = _imag_solve_at_R(N, Ri, omega_hat, s_, lawson_iter=lawson_iter)
+            final_stage = Ri == R_sched[-1]
+            s_, w_ = _imag_solve_at_R(
+                N, Ri, omega_hat, s_, lawson_iter=lawson_iter,
+                component=component,
+                target_error=target_error if final_stage else None,
+                error_grid=x_eval if final_stage else None,
+            )
 
         t_ = np.exp(s_)
         approx = np.exp(-np.outer(x_eval, t_)) @ w_
@@ -546,12 +578,23 @@ def solve_noncrossing_imag(N, R, omega_hat, lawson_iter=4):
     s_hack = np.log(np.pi**2 * (np.arange(1, N + 1) - 0.5)
                     / (2.0 * np.log(4.0 * R)))
     best_s, best_w, best_err = _try_init(s_hack)
+    best_l1 = np.sum(np.abs(best_w))
 
     s_unif = np.linspace(s_lo + 0.5, s_hi - 0.5, N)
-    s2, w2 = _imag_solve_at_R(N, R, omega_hat, s_unif, lawson_iter=lawson_iter)
+    s2, w2 = _imag_solve_at_R(
+        N, R, omega_hat, s_unif, lawson_iter=lawson_iter,
+        component=component, target_error=target_error, error_grid=x_eval,
+    )
     t2 = np.exp(s2)
     err2 = np.max(np.abs(g_eval - np.exp(-np.outer(x_eval, t2)) @ w2))
-    if err2 < best_err:
+    l1_2 = np.sum(np.abs(w2))
+    both_acceptable = (
+        target_error is not None
+        and best_err < float(target_error)
+        and err2 < float(target_error)
+    )
+    if (both_acceptable and l1_2 < best_l1) or (
+            not both_acceptable and err2 < best_err):
         best_s, best_w, best_err = s2, w2, err2
 
     t = np.exp(best_s)
@@ -559,16 +602,62 @@ def solve_noncrossing_imag(N, R, omega_hat, lawson_iter=4):
     return t[order], best_w[order], best_err
 
 
-def noncrossing_imag_grids(R, omega_hat, eps, N_start=2, N_max=60):
+def noncrossing_imag_grids(R, omega_hat, eps, N_start=2, N_max=60, *,
+                           component="dispersive", max_weight_l1=1.0e4):
     """Find minimum N achieving error < eps.
+
+    Fits with a larger weight L1 norm than ``max_weight_l1`` are skipped to
+    avoid accepting a nominally accurate result dominated by cancellation.
 
     Returns t, w, N, err.
     """
     for N in range(N_start, N_max + 1):
-        t, w, err = solve_noncrossing_imag(N, R, omega_hat)
-        if err < eps:
+        t, w, err = solve_noncrossing_imag(
+            N, R, omega_hat, target_error=eps, component=component)
+        conditioned = (
+            max_weight_l1 is None
+            or np.sum(np.abs(w)) <= float(max_weight_l1)
+        )
+        if err < eps and conditioned:
             return t, w, N, err
     return t, w, N_max, err
+
+
+def noncrossing_complex_grids(R, omega_hat, eps, N_start=2, N_max=60):
+    """Fit ``1/(x+i*omega_hat)`` with real nodes and complex weights.
+
+    The dispersive and absorptive components are solved independently and
+    concatenated. Giving each component ``eps/sqrt(2)`` certifies the complex
+    magnitude error below ``eps`` on the dense evaluation grid.
+    """
+    zero_frequency = abs(float(omega_hat)) < 1e-30
+    component_eps = float(eps) if zero_frequency else float(eps) / np.sqrt(2.0)
+    tau_re, w_re, _n_re, _err_re = noncrossing_imag_grids(
+        R, omega_hat, component_eps, N_start=N_start, N_max=N_max,
+        component="dispersive",
+    )
+
+    if zero_frequency:
+        return tau_re, w_re.astype(np.complex128), len(tau_re), _err_re
+
+    tau_im, w_im, _n_im, _err_im = noncrossing_imag_grids(
+        R, omega_hat, component_eps, N_start=N_start, N_max=N_max,
+        component="absorptive",
+    )
+    tau = np.concatenate([tau_re, tau_im])
+    w = np.concatenate([
+        w_re.astype(np.complex128),
+        -1j * w_im.astype(np.complex128),
+    ])
+    order = np.argsort(tau)
+    tau = tau[order]
+    w = w[order]
+
+    x_eval = np.exp(np.linspace(0, np.log(R), max(2000, 60 * len(tau))))
+    target = 1.0 / (x_eval + 1j * omega_hat)
+    approx = np.exp(-np.outer(x_eval, tau)) @ w
+    err = np.max(np.abs(target - approx))
+    return tau, w, len(tau), err
 
 
 def evaluate_noncrossing_imag(x, t, w):

@@ -442,7 +442,7 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
     # Fold the chi0 prefactor (-2 · exp(-τ·E_gap)) into α so the τ-scan
     # body can apply a single weighted add per node.  ``MinimaxNodes``
     # carries both in complex128; τ has Im=0 for the Laplace quad.
-    alpha_chi = -2.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+    alpha_chi = -2.0 * np.asarray(quad.alpha, dtype=np.complex128) * np.exp(-tau * E_gap)
     nodes = MinimaxNodes(
         t=jnp.asarray(tau, dtype=jnp.complex128),
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
@@ -481,7 +481,7 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
     tau = np.asarray(quad.tau, dtype=np.float64)
     if len(tau) == 0:
         return  # compute_chi0 falls through to a static-zeros path — nothing to compile
-    alpha_chi = -2.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+    alpha_chi = -2.0 * np.asarray(quad.alpha, dtype=np.complex128) * np.exp(-tau * E_gap)
     nodes = MinimaxNodes(
         t=jnp.asarray(tau, dtype=jnp.complex128),
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
@@ -531,4 +531,3 @@ def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, solver=None, memory_mode=N
         solver=ScreeningSolver.JAX_NATIVE, dtype=V_q.dtype, n_rmu=n_rmu,
     )
     solve_fn.lower(V_q, chi0_q, pref).compile()
-

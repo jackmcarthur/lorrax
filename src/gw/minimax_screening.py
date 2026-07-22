@@ -205,7 +205,9 @@ def _load_minimax_disk_cache(namespace: str, payload: dict[str, object]) -> tupl
     try:
         with np.load(path, allow_pickle=False) as data:
             tau = np.asarray(data["tau"], dtype=np.float64)
-            w = np.asarray(data["w"], dtype=np.float64)
+            w_raw = np.asarray(data["w"])
+            w_dtype = np.complex128 if np.iscomplexobj(w_raw) else np.float64
+            w = np.asarray(w_raw, dtype=w_dtype)
             err = float(data["err"][()])
         return tau, w, err
     except Exception:
@@ -228,7 +230,10 @@ def _store_minimax_disk_cache(
             np.savez_compressed(
                 fh,
                 tau=np.asarray(tau, dtype=np.float64),
-                w=np.asarray(w, dtype=np.float64),
+                w=np.asarray(
+                    w,
+                    dtype=np.complex128 if np.iscomplexobj(w) else np.float64,
+                ),
                 err=np.asarray(float(err), dtype=np.float64),
             )
         os.replace(tmp, path)
@@ -261,7 +266,7 @@ jax.tree_util.register_dataclass(
 def _laplace_to_minimax_nodes(
     tau: np.ndarray, alpha: np.ndarray, *, time_axis: str,
 ) -> MinimaxNodes:
-    """Convert a (real τ, real α) Laplace quadrature into complex ``MinimaxNodes``.
+    """Convert a real-node Laplace quadrature into complex ``MinimaxNodes``.
 
     ``time_axis``:
       * ``'real'``      — chi0 Laplace: ``t = τ + 0j``, α cast to complex.
@@ -270,7 +275,8 @@ def _laplace_to_minimax_nodes(
                           ``t = -1j·τ``, α cast to complex.
     """
     tau_j = jnp.asarray(np.asarray(tau, dtype=np.float64), dtype=jnp.float64)
-    alpha_j = jnp.asarray(np.asarray(alpha, dtype=np.float64), dtype=jnp.float64)
+    alpha_j = jnp.asarray(np.asarray(alpha, dtype=np.complex128),
+                          dtype=jnp.complex128)
     if time_axis == 'real':
         t = tau_j.astype(jnp.complex128)
     elif time_axis == 'imag':
@@ -278,7 +284,7 @@ def _laplace_to_minimax_nodes(
     else:
         raise ValueError(
             f"Unknown time_axis={time_axis!r}; expected 'real' or 'imag'.")
-    return MinimaxNodes(t=t, alpha=alpha_j.astype(jnp.complex128))
+    return MinimaxNodes(t=t, alpha=alpha_j)
 
 
 def _crossing_to_minimax_nodes(
@@ -304,7 +310,7 @@ def _crossing_to_minimax_nodes(
 
 @dataclass(frozen=True)
 class LaplaceMinimaxQuadrature:
-    """Quadrature summary for ``1/x`` on ``[x_min, x_max]``."""
+    """Real-node Laplace quadrature, with real or complex weights."""
 
     x_min: float
     x_max: float
@@ -511,6 +517,7 @@ def _solve_noncrossing_imag_scaled_cached(
 ) -> tuple[np.ndarray, np.ndarray, float]:
     payload = {
         "solver": "noncrossing_imag",
+        "solver_revision": 2,
         "logR_key": float(logR_key),
         "omega_hat_key": float(omega_hat_key),
         "target_key": float(target_key),
@@ -529,6 +536,37 @@ def _solve_noncrossing_imag_scaled_cached(
     w = np.asarray(w, dtype=np.float64)
     err = float(err)
     _store_minimax_disk_cache("noncrossing_imag", payload, tau, w, err)
+    return tau, w, err
+
+
+@lru_cache(maxsize=64)
+def _solve_noncrossing_complex_scaled_cached(
+    logR_key: float,
+    omega_hat_key: float,
+    target_key: float,
+    max_nodes: int,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    payload = {
+        "solver": "noncrossing_complex",
+        "solver_revision": 1,
+        "logR_key": float(logR_key),
+        "omega_hat_key": float(omega_hat_key),
+        "target_key": float(target_key),
+        "max_nodes": int(max_nodes),
+    }
+    cached = _load_minimax_disk_cache("noncrossing_complex", payload)
+    if cached is not None:
+        return cached
+    R = float(np.exp(logR_key))
+    omega_hat = float(omega_hat_key)
+    target = float(target_key)
+    tau, w, _n, err = _minimax.noncrossing_complex_grids(
+        R, omega_hat, target, N_start=2, N_max=max_nodes,
+    )
+    tau = np.asarray(tau, dtype=np.float64)
+    w = np.asarray(w, dtype=np.complex128)
+    err = float(err)
+    _store_minimax_disk_cache("noncrossing_complex", payload, tau, w, err)
     return tau, w, err
 
 
@@ -676,6 +714,46 @@ def solve_laplace_minimax_imag_interval(
         tau=np.asarray(tau, dtype=np.float64),
         alpha=np.asarray(alpha, dtype=np.float64),
         max_error=float(err_abs),
+    )
+
+
+def solve_laplace_minimax_complex_interval(
+    x_min: float,
+    x_max: float,
+    omega_p: float,
+    *,
+    target_error: float = 1.0e-6,
+    max_nodes: int = 64,
+) -> LaplaceMinimaxQuadrature:
+    """Fit ``1/(x+i*omega_p)`` with real decay nodes and complex weights.
+
+    This is the noncrossing resolvent building block for off-axis full-frequency
+    sampling. The real and imaginary components are fitted independently, so the
+    returned quadrature can contain up to ``2*max_nodes`` total nodes.
+    ``target_error`` follows the scaled-interval convention used by the other
+    Laplace builders; the physical error is divided by ``x_min``.
+    """
+    x_min = max(float(x_min), _TINY)
+    x_max = max(float(x_max), x_min * (1.0 + 1.0e-9))
+    omega_p = float(omega_p)
+    target_error = max(float(target_error), 1.0e-14)
+    max_nodes = max(4, int(max_nodes))
+
+    R = x_max / x_min
+    omega_hat = omega_p / x_min
+    tau_hat, w_hat, err_hat = _solve_noncrossing_complex_scaled_cached(
+        round(float(np.log(R)), 12),
+        round(omega_hat, 12),
+        round(target_error, 14),
+        max_nodes,
+    )
+
+    return LaplaceMinimaxQuadrature(
+        x_min=x_min,
+        x_max=x_max,
+        tau=np.asarray(tau_hat, dtype=np.float64) / x_min,
+        alpha=np.asarray(w_hat, dtype=np.complex128) / x_min,
+        max_error=float(err_hat) / x_min,
     )
 
 
@@ -927,5 +1005,4 @@ def build_real_quadrature(quad, Omega, minimax_config, *, print_fn=None):
             f"(R'={(Omega-quad.x_min)/(Omega-quad.x_max):.3f}), "
             f"err~{err_combined:.1e}")
     return fused
-
 
