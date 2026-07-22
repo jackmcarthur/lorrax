@@ -8,7 +8,6 @@ ships five targets, all validated on NERSC Perlmutter (1–4 nodes × 4×A100):
 |---|---|---|---|---|
 | `cusolvermp` | cuSOLVERMp (multi-proc multi-GPU, NCCL-backed CAL) | 1 proc per GPU | `common.cusolvermp_eigh_test`, `common.cusolvermp_batched_test`, `tests/test_ffi_linalg_contract.py` | potrf/potrs/getrf+getrs 1e-16–1e-14 on 1×1/2×2/4×1/1×4; syevd square meshes only (rect mesh DEADLOCKS — wrapper rejects) |
 | `cublasmp` | cuBLASMp (batched gemm + fused W-solve) | 1 proc per GPU | `common.cublasmp_gemm_test`, `common.cublasmp_w_solve_test`, contract tests | 1e-16–1e-14 on all meshes.  Comm ABI must match the LOADED cuBLASMp generation (≥0.5.0 = NCCL) — see `scripts/stage_cublasmp_redist.sh` |
-| `cusolvermg` | cuSOLVERMg (single-proc multi-GPU, in-container) | 1 proc × N GPUs | `common.cusolvermg_eigh_test` | F64 @ n∈{128, 2048}, err ≲ 2e-11.  No production consumer (benchmarks only) |
 | `slate` | SLATE (MPI + GPU tile linalg; AMD-portable path) | 1 proc per GPU | `common.slate_cholesky_trsm_test`, `common.slate_batched_test`, contract tests | potrf/trsm/heev ~1e-16/1e-14 on p==q or 1-D meshes; see [`slate/README.md`](slate/README.md) |
 | `phdf5`      | parallel HDF5 via MPI-IO (read + write sharded slabs) | 1 proc per GPU | `common.phdf5_write_test`, `common.phdf5_multi_offset_test` | 0.000e+00 round-trip; 4 / 9 GB/s write / read @ 16 GPUs. See [`phdf5/ARCHITECTURE.md`](phdf5/ARCHITECTURE.md) for the async-design rationale and the non-obvious pitfalls encountered along the way. |
 | `scalapack` | ScaLAPACK from Cray LibSci (HOST platform — JAX CPU backend) | 1 proc per rank | `tests/test_ffi_linalg_contract.py` (`scalapack_*` cells) | pXgetrf+pXgetrs fused per-q LU (`distributed_lu = scalapack`); square + 1-D meshes (square-block requirement); zero extra link deps (libsci already in `liblorrax_ffi_host.so`) |
@@ -64,9 +63,7 @@ ffi/
 │   ├── {__init__,context,eigh}.py     public API + NCCL bootstrap + shard_map
 │   ├── scripts/stage_nvhpc.sh         copy cuSOLVERMp/libcal to /pscratch
 │   └── cpp/{ctx.h,context.cc,eigh_ffi.cc}
-├── cusolvermg/
 │   ├── {__init__,eigh}.py
-│   └── cpp/eigh_mg_ffi.cc
 └── phdf5/
     ├── {__init__,context,write,read}.py    open/close/write/read_sharded_slab
     ├── scripts/{stage_openmpi,stage_cray}.sh
@@ -95,11 +92,6 @@ build against the opt-in Cray MPICH stack, prefix with
 LORRAX_NGPU=4 src/ffi/common/cpp/run_shifter.sh env \
     CUSOLVERMP_FORCE_NCCL=1 XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async \
     python3 -u -m common.cusolvermp_eigh_test --grid 2 2
-
-# cusolvermg — 1 rank × 4 GPUs
-LORRAX_NGPU=4 LORRAX_NTASKS=1 \
-    src/ffi/common/cpp/run_shifter.sh \
-    python3 -u -m common.cusolvermg_eigh_test
 
 # phdf5 round-trip (write + parallel read, exact equality)
 LORRAX_NGPU=4 src/ffi/common/cpp/run_shifter.sh env \

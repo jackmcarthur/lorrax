@@ -1,18 +1,13 @@
-"""Eigh timing benchmark — 1 GPU vs 4 GPUs at n=2048.
+"""Eigh timing benchmark — cusolverMp distributed_eigh at n=2048.
 
-Run in two phases:
+LORRAX is one JAX process per GPU, so the only mode is multi-process
+cusolverMp on a 2x2 grid:
 
-  # phase A: single-process, 1 / 4 GPU via cusolverMg + jnp.linalg.eigh baseline
-  LORRAX_NGPU=4 LORRAX_NTASKS=1 \\
-      src/ffi/common/cpp/run_shifter.sh \\
-      python3 -u -m common.eigh_benchmark --mode single -n 2048 --repeats 5
-
-  # phase B: multi-process, cusolverMp on a 2x2 grid
   LORRAX_NGPU=4 src/ffi/common/cpp/run_shifter.sh env \\
       CUSOLVERMP_FORCE_NCCL=1 \\
       XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \\
       XLA_PYTHON_CLIENT_PREALLOCATE=false \\
-      python3 -u -m common.eigh_benchmark --mode mp -n 2048 --repeats 5
+      python3 -u -m common.eigh_benchmark -n 2048 --repeats 5
 
 Prints per-call wall time (ms) with one warm-up excluded so JIT compile and
 lazy context setup don't show up in the mean.
@@ -69,46 +64,6 @@ def time_call(fn, args, repeats: int, name: str) -> None:
     )
 
 
-def run_single_process(n: int, repeats: int) -> int:
-    """Benchmark jnp.linalg.eigh (1 GPU) and eigh_mg (multi-GPU)."""
-    from ffi.cusolvermg import eigh_mg
-
-    _log(f"\n=== single-process mode, n={n}, repeats={repeats} ===")
-    _log(f"jax.devices() = {jax.devices()}")
-
-    A_host = make_symmetric(n)
-    # Correctness reference (cheap at n=2048)
-    ref = np.sort(np.linalg.eigvalsh(A_host))
-
-    # 1) jnp.linalg.eigh on 1 GPU (device 0 only)
-    A1 = jnp.asarray(A_host)   # lands on devices()[0]
-    jit_eigh = jax.jit(jnp.linalg.eigh)
-    _log("\n--- jnp.linalg.eigh  (1 GPU, device 0) ---")
-    time_call(lambda a: jit_eigh(a), (A1,), repeats, "jnp.eigh-1GPU")
-    evals1, _ = jit_eigh(A1)
-    evals1_np = np.sort(np.asarray(jax.device_get(evals1)))
-    _log(f"  max |eigvals - ref| = {np.max(np.abs(evals1_np - ref)):.2e}")
-
-    # 2) cusolverMg with max_gpus=1 (single-device path through the FFI)
-    _log("\n--- cusolverMg eigh_mg (max_gpus=1) ---")
-    tile = 256
-    time_call(lambda a: eigh_mg(a, tile_size=tile, max_gpus=1),
-              (A1,), repeats, "Mg-1GPU")
-    evals_mg1, _ = eigh_mg(A1, tile_size=tile, max_gpus=1)
-    evals_mg1_np = np.sort(np.asarray(jax.device_get(evals_mg1)))
-    _log(f"  max |eigvals - ref| = {np.max(np.abs(evals_mg1_np - ref)):.2e}")
-
-    # 3) cusolverMg with all GPUs
-    _log(f"\n--- cusolverMg eigh_mg (max_gpus=0, all={jax.device_count()}) ---")
-    time_call(lambda a: eigh_mg(a, tile_size=tile, max_gpus=0),
-              (A1,), repeats, f"Mg-{jax.device_count()}GPU")
-    evals_mgN, _ = eigh_mg(A1, tile_size=tile, max_gpus=0)
-    evals_mgN_np = np.sort(np.asarray(jax.device_get(evals_mgN)))
-    _log(f"  max |eigvals - ref| = {np.max(np.abs(evals_mgN_np - ref)):.2e}")
-
-    return 0
-
-
 def run_multiprocess(n: int, repeats: int) -> int:
     """Benchmark cusolverMp distributed_eigh on a 2x2 grid."""
     # multi-process JAX bootstrap
@@ -155,15 +110,11 @@ def run_multiprocess(n: int, repeats: int) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["single", "mp"], required=True)
     ap.add_argument("-n", type=int, default=2048)
     ap.add_argument("--repeats", type=int, default=5)
     args = ap.parse_args()
 
-    if args.mode == "single":
-        return run_single_process(args.n, args.repeats)
-    else:
-        return run_multiprocess(args.n, args.repeats)
+    return run_multiprocess(args.n, args.repeats)
 
 
 if __name__ == "__main__":

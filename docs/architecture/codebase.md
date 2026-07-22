@@ -60,7 +60,7 @@ src/
 │   ├── timing.py              named sections, aggregate report
 │   ├── minimax.py             Laplace + imag-ω minimax solvers
 │   ├── minimax_assets/        shipped quadrature tables (npz + catalog.json)
-│   ├── slate_* / cusolvermp_eigh_test / cusolvermg_eigh_test
+│   ├── slate_* / cusolvermp_eigh_test
 │   │                          FFI smoke tests / benchmarks (run via lxrun)
 │   └── phdf5_*                phdf5 benchmarks + plumbing tests
 │
@@ -83,7 +83,6 @@ src/
 ├── ffi/                  # XLA FFI bridge to native libraries
 │   ├── common/                ffi_loader (ctypes) + cpp (CMake) → liblorrax_ffi.so
 │   ├── cusolvermp/            distributed eigh (multi-proc multi-GPU, CAL+NCCL)
-│   ├── cusolvermg/            single-proc multi-GPU eigh (cuSOLVERMg)
 │   ├── phdf5/                 parallel HDF5 read/write (MPI-IO)
 │   └── slate/                 SLATE Cholesky / trsm / heev (p×q grid)
 │

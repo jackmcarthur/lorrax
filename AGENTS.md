@@ -37,7 +37,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/common/gpu_utils.py` | Host-side GPU memory detection | Chunk auto-sizing |
 | `src/file_io/slab_io.py` | `SlabIO`: phdf5 writer wrapper for zeta_q / V_qmunu | Big HDF5 writes |
 | `src/file_io/sigma_output.py` | Σ output (eqp.dat, sigma.h5) | Output formats |
-| `src/ffi/` | XLA FFI bridge: `cusolvermp`, `cusolvermg`, `phdf5`, `slate` | Native-library entry points |
+| `src/ffi/` | XLA FFI bridge: `cusolvermp`, `cublasmp`, `phdf5`, `slate` | Native-library entry points |
 | `src/solvers/` | Davidson, Lanczos, Chebyshev, pseudobands | Iterative eigensolvers |
 | `src/centroid/kmeans_cli.py` / `src/centroid/kmeans_isdf.py` | ISDF centroid generation — `kmeans_cli` is the CLI (`python -m centroid.kmeans_cli`); `kmeans_isdf` is the algorithm library, no `__main__` | Centroid count / quality |
 | `src/psp/` | Pseudopotentials, dipole / kin+ion generators | `dipole.h5` or `kin_ion.h5` issues |

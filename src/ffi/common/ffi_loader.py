@@ -11,7 +11,7 @@ its cpu (lapack) vs CUDA (cusolver) kernels, so ``jax.ffi.ffi_call``
 sites resolve the right handler from the lowering platform and never
 mention a platform themselves:
 
-    CUDA  liblorrax_ffi.so       cuSOLVERMp/cuBLASMp/cusolverMg/phdf5/slate
+    CUDA  liblorrax_ffi.so       cuSOLVERMp/cuBLASMp/phdf5/slate
     cpu   liblorrax_ffi_host.so  slate host handlers (Target::HostTask)
 
 Public API
@@ -56,7 +56,6 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cusolvermp_batched_solve_lu": "CusolverMpBatchedSolveLuFfi",
     "lorrax_cublasmp_batched_gemm":       "CublasMpBatchedGemmFfi",
     "lorrax_cublasmp_batched_w_solve":    "CublasMpBatchedWSolveFfi",
-    "lorrax_cusolvermg_eigh_f64":   "EighMgF64",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",

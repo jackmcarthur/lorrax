@@ -283,7 +283,6 @@ LORRAX ships an XLA FFI bridge (`src/ffi/`) that calls into three native librari
 | Subpackage | Library | Process model | Use |
 |---|---|---|---|
 | `cusolvermp` | cuSOLVERMp + CAL/NCCL | 1 proc per GPU | Distributed `eigh` (syevd) |
-| `cusolvermg` | cuSOLVERMg | 1 proc × N GPUs | Single-proc multi-GPU `eigh` |
 | `phdf5` | parallel HDF5 via MPI-IO | 1 proc per GPU | Sharded slab read/write of `zeta_q.h5`, `V_qmunu.h5`, etc. |
 | `slate` | SLATE + libsci | p×q GPU grid | Distributed Cholesky, trsm, heev (evaluation) |
 

@@ -269,30 +269,6 @@ def check_cusolvermp_eigh(mesh, dtype, n=32):
     assert res < 1e-11, f"Q^H eigvec residual {res:.3e}"
 
 
-def check_cusolvermg_eigh(n=32, tile=16):
-    """f64-only, single-process multi-GPU.  Contract: eigenvalues match;
-    Q^T = eigenvectors (documented transpose convention)."""
-    import jax
-    from ffi.cusolvermg import eigh_mg
-    rng = np.random.default_rng(17)
-    A_np = _herm(rng, 1, n, "float64")[0]
-
-    def solve():
-        W, Q = eigh_mg(jax.device_put(A_np), tile_size=tile)
-        return np.asarray(W), np.asarray(Q)
-
-    W1, Q1 = solve()
-    W2, Q2 = solve()
-    assert np.array_equal(W1, W2) and np.array_equal(Q1, Q2), \
-        "eigh_mg rerun not bit-deterministic"
-    ev_err = float(np.max(np.abs(W1 - np.linalg.eigvalsh(A_np))))
-    assert ev_err < 1e-10, f"eigenvalue error {ev_err:.3e}"
-    Qt = Q1.T
-    res = (np.linalg.norm(A_np @ Qt - Qt * W1[None, :])
-           / max(np.linalg.norm(A_np), 1.0))
-    assert res < 1e-11, f"Q^T eigvec residual {res:.3e}"
-
-
 def check_cublasmp_gemm(mesh, dtype, transa="C", transb="N"):
     from ffi.cublasmp import batched_distributed_gemm
     rng = np.random.default_rng(19)
@@ -564,11 +540,6 @@ def test_cusolvermp_solve_lu_general(mesh11):
 @pytest.mark.parametrize("dtype", ["complex128", "float64"])
 def test_cusolvermp_eigh(mesh11, dtype):
     check_cusolvermp_eigh(mesh11, dtype)
-
-
-@needs_ffi
-def test_cusolvermg_eigh():
-    check_cusolvermg_eigh()
 
 
 @needs_ffi
