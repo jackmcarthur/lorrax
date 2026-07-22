@@ -20,8 +20,11 @@
   },
   "sweeps": {
     "error_bounds": [
+      1e-05,
       1e-06,
-      2e-07
+      2e-07,
+      4e-08,
+      1e-08
     ],
     "crossing_A_dim_values": [
       20.0,
@@ -47,6 +50,30 @@
     {
       "family": "crossing",
       "target_kind": "hgl",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_target",
+      "range_param": "A_dim",
+      "range_max": 20.0,
+      "eps_q": 0.001,
+      "node_count": 34,
+      "max_error": 9.390861359370728e-09,
+      "file": "crossing/crossing_hgl_A_20p000000_eps_1p0em08_epsq_1p0em03.npz"
+    },
+    {
+      "family": "crossing",
+      "target_kind": "hgl",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_target",
+      "range_param": "A_dim",
+      "range_max": 20.0,
+      "eps_q": 0.001,
+      "node_count": 30,
+      "max_error": 3.7108593517465316e-08,
+      "file": "crossing/crossing_hgl_A_20p000000_eps_4p0em08_epsq_1p0em03.npz"
+    },
+    {
+      "family": "crossing",
+      "target_kind": "hgl",
       "error_bound": 2e-07,
       "error_metric": "linf_abs_target",
       "range_param": "A_dim",
@@ -67,6 +94,42 @@
       "node_count": 25,
       "max_error": 4.4319801295600314e-07,
       "file": "crossing/crossing_hgl_A_20p000000_eps_1p0em06_epsq_1p0em03.npz"
+    },
+    {
+      "family": "crossing",
+      "target_kind": "hgl",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_target",
+      "range_param": "A_dim",
+      "range_max": 20.0,
+      "eps_q": 0.001,
+      "node_count": 20,
+      "max_error": 5.2850266137813295e-06,
+      "file": "crossing/crossing_hgl_A_20p000000_eps_1p0em05_epsq_1p0em03.npz"
+    },
+    {
+      "family": "crossing",
+      "target_kind": "hgl",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_target",
+      "range_param": "A_dim",
+      "range_max": 40.0,
+      "eps_q": 0.001,
+      "node_count": 68,
+      "max_error": 7.3811247426613935e-09,
+      "file": "crossing/crossing_hgl_A_40p000000_eps_1p0em08_epsq_1p0em03.npz"
+    },
+    {
+      "family": "crossing",
+      "target_kind": "hgl",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_target",
+      "range_param": "A_dim",
+      "range_max": 40.0,
+      "eps_q": 0.001,
+      "node_count": 63,
+      "max_error": 1.7887796993631966e-08,
+      "file": "crossing/crossing_hgl_A_40p000000_eps_4p0em08_epsq_1p0em03.npz"
     },
     {
       "family": "crossing",
@@ -95,6 +158,18 @@
     {
       "family": "crossing",
       "target_kind": "hgl",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_target",
+      "range_param": "A_dim",
+      "range_max": 40.0,
+      "eps_q": 0.001,
+      "node_count": 43,
+      "max_error": 4.911683114977583e-06,
+      "file": "crossing/crossing_hgl_A_40p000000_eps_1p0em05_epsq_1p0em03.npz"
+    },
+    {
+      "family": "crossing",
+      "target_kind": "hgl",
       "error_bound": 1e-06,
       "error_metric": "linf_abs_target",
       "range_param": "A_dim",
@@ -103,6 +178,26 @@
       "node_count": 66,
       "max_error": 9.435262925405752e-07,
       "file": "crossing/crossing_hgl_A_60p000000_eps_1p0em06_epsq_1p0em03.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 10.0,
+      "node_count": 8,
+      "max_error": 4.356681460038203e-09,
+      "file": "noncrossing/noncrossing_R_10p000000_eps_1p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 10.0,
+      "node_count": 8,
+      "max_error": 4.356681460038203e-09,
+      "file": "noncrossing/noncrossing_R_10p000000_eps_4p0em08.npz"
     },
     {
       "family": "noncrossing",
@@ -126,6 +221,36 @@
     },
     {
       "family": "noncrossing",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 10.0,
+      "node_count": 6,
+      "max_error": 1.1459461893847944e-06,
+      "file": "noncrossing/noncrossing_R_10p000000_eps_1p0em05.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "node_count": 10,
+      "max_error": 4.264520403474137e-09,
+      "file": "noncrossing/noncrossing_R_21p544347_eps_1p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "node_count": 9,
+      "max_error": 2.26468052089146e-08,
+      "file": "noncrossing/noncrossing_R_21p544347_eps_4p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
       "error_bound": 2e-07,
       "error_metric": "linf_abs_scaled_1_over_x",
       "range_param": "R",
@@ -143,6 +268,36 @@
       "node_count": 8,
       "max_error": 1.846071053177023e-07,
       "file": "noncrossing/noncrossing_R_21p544347_eps_1p0em06.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "node_count": 7,
+      "max_error": 1.3444117721722604e-06,
+      "file": "noncrossing/noncrossing_R_21p544347_eps_1p0em05.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "node_count": 11,
+      "max_error": 3.6754413575146305e-09,
+      "file": "noncrossing/noncrossing_R_46p415888_eps_1p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "node_count": 10,
+      "max_error": 3.7114978979069235e-08,
+      "file": "noncrossing/noncrossing_R_46p415888_eps_4p0em08.npz"
     },
     {
       "family": "noncrossing",
@@ -166,6 +321,36 @@
     },
     {
       "family": "noncrossing",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "node_count": 7,
+      "max_error": 8.367238104153157e-06,
+      "file": "noncrossing/noncrossing_R_46p415888_eps_1p0em05.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 100.0,
+      "node_count": 12,
+      "max_error": 7.243841859683187e-09,
+      "file": "noncrossing/noncrossing_R_100p000000_eps_1p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 100.0,
+      "node_count": 12,
+      "max_error": 7.243841859683187e-09,
+      "file": "noncrossing/noncrossing_R_100p000000_eps_4p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
       "error_bound": 2e-07,
       "error_metric": "linf_abs_scaled_1_over_x",
       "range_param": "R",
@@ -183,6 +368,36 @@
       "node_count": 10,
       "max_error": 3.199706661849433e-07,
       "file": "noncrossing/noncrossing_R_100p000000_eps_1p0em06.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 100.0,
+      "node_count": 8,
+      "max_error": 6.303484512013013e-06,
+      "file": "noncrossing/noncrossing_R_100p000000_eps_1p0em05.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 215.44346900318823,
+      "node_count": 14,
+      "max_error": 2.7640111310844873e-09,
+      "file": "noncrossing/noncrossing_R_215p443469_eps_1p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 215.44346900318823,
+      "node_count": 13,
+      "max_error": 1.2800328241802106e-08,
+      "file": "noncrossing/noncrossing_R_215p443469_eps_4p0em08.npz"
     },
     {
       "family": "noncrossing",
@@ -206,6 +421,36 @@
     },
     {
       "family": "noncrossing",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 215.44346900318823,
+      "node_count": 9,
+      "max_error": 5.16526256355565e-06,
+      "file": "noncrossing/noncrossing_R_215p443469_eps_1p0em05.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 464.15888336127773,
+      "node_count": 15,
+      "max_error": 3.988594787784905e-09,
+      "file": "noncrossing/noncrossing_R_464p158883_eps_1p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 464.15888336127773,
+      "node_count": 14,
+      "max_error": 1.6155060844624813e-08,
+      "file": "noncrossing/noncrossing_R_464p158883_eps_4p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
       "error_bound": 2e-07,
       "error_metric": "linf_abs_scaled_1_over_x",
       "range_param": "R",
@@ -223,6 +468,36 @@
       "node_count": 12,
       "max_error": 1.8689675703939534e-07,
       "file": "noncrossing/noncrossing_R_464p158883_eps_1p0em06.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 464.15888336127773,
+      "node_count": 10,
+      "max_error": 3.976081456746883e-06,
+      "file": "noncrossing/noncrossing_R_464p158883_eps_1p0em05.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 1000.0,
+      "node_count": 16,
+      "max_error": 5.5973412571574954e-09,
+      "file": "noncrossing/noncrossing_R_1000p000000_eps_1p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 1000.0,
+      "node_count": 15,
+      "max_error": 1.7138546692940793e-08,
+      "file": "noncrossing/noncrossing_R_1000p000000_eps_4p0em08.npz"
     },
     {
       "family": "noncrossing",
@@ -246,6 +521,36 @@
     },
     {
       "family": "noncrossing",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 1000.0,
+      "node_count": 10,
+      "max_error": 8.748383718781838e-06,
+      "file": "noncrossing/noncrossing_R_1000p000000_eps_1p0em05.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 2154.4346900318824,
+      "node_count": 17,
+      "max_error": 6.7563482586407986e-09,
+      "file": "noncrossing/noncrossing_R_2154p434690_eps_1p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 2154.4346900318824,
+      "node_count": 16,
+      "max_error": 1.8401705270676416e-08,
+      "file": "noncrossing/noncrossing_R_2154p434690_eps_4p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
       "error_bound": 2e-07,
       "error_metric": "linf_abs_scaled_1_over_x",
       "range_param": "R",
@@ -263,6 +568,36 @@
       "node_count": 13,
       "max_error": 4.71478217245469e-07,
       "file": "noncrossing/noncrossing_R_2154p434690_eps_1p0em06.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 2154.4346900318824,
+      "node_count": 11,
+      "max_error": 4.277554717324605e-06,
+      "file": "noncrossing/noncrossing_R_2154p434690_eps_1p0em05.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 4641.588833612777,
+      "node_count": 18,
+      "max_error": 7.663168766214312e-09,
+      "file": "noncrossing/noncrossing_R_4641p588834_eps_1p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 4641.588833612777,
+      "node_count": 17,
+      "max_error": 1.7798323925788395e-08,
+      "file": "noncrossing/noncrossing_R_4641p588834_eps_4p0em08.npz"
     },
     {
       "family": "noncrossing",
@@ -286,6 +621,36 @@
     },
     {
       "family": "noncrossing",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 4641.588833612777,
+      "node_count": 11,
+      "max_error": 6.42676684538737e-06,
+      "file": "noncrossing/noncrossing_R_4641p588834_eps_1p0em05.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 10000.0,
+      "node_count": 19,
+      "max_error": 7.1746197871647155e-09,
+      "file": "noncrossing/noncrossing_R_10000p000000_eps_1p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 10000.0,
+      "node_count": 18,
+      "max_error": 1.7460780488143257e-08,
+      "file": "noncrossing/noncrossing_R_10000p000000_eps_4p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
       "error_bound": 2e-07,
       "error_metric": "linf_abs_scaled_1_over_x",
       "range_param": "R",
@@ -303,6 +668,36 @@
       "node_count": 14,
       "max_error": 7.260188864544048e-07,
       "file": "noncrossing/noncrossing_R_10000p000000_eps_1p0em06.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 10000.0,
+      "node_count": 11,
+      "max_error": 8.558130048296576e-06,
+      "file": "noncrossing/noncrossing_R_10000p000000_eps_1p0em05.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 21544.346900318822,
+      "node_count": 20,
+      "max_error": 6.401189023286236e-09,
+      "file": "noncrossing/noncrossing_R_21544p346900_eps_1p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 21544.346900318822,
+      "node_count": 19,
+      "max_error": 1.4393388148015163e-08,
+      "file": "noncrossing/noncrossing_R_21544p346900_eps_4p0em08.npz"
     },
     {
       "family": "noncrossing",
@@ -326,6 +721,36 @@
     },
     {
       "family": "noncrossing",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 21544.346900318822,
+      "node_count": 12,
+      "max_error": 5.682966556119773e-06,
+      "file": "noncrossing/noncrossing_R_21544p346900_eps_1p0em05.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 46415.888336127726,
+      "node_count": 21,
+      "max_error": 6.581022129585081e-09,
+      "file": "noncrossing/noncrossing_R_46415p888336_eps_1p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 46415.888336127726,
+      "node_count": 19,
+      "max_error": 3.501917145056887e-08,
+      "file": "noncrossing/noncrossing_R_46415p888336_eps_4p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
       "error_bound": 2e-07,
       "error_metric": "linf_abs_scaled_1_over_x",
       "range_param": "R",
@@ -346,6 +771,36 @@
     },
     {
       "family": "noncrossing",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 46415.888336127726,
+      "node_count": 12,
+      "max_error": 7.443165199849666e-06,
+      "file": "noncrossing/noncrossing_R_46415p888336_eps_1p0em05.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 100000.0,
+      "node_count": 22,
+      "max_error": 5.546718280008392e-09,
+      "file": "noncrossing/noncrossing_R_100000p000000_eps_1p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 4e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 100000.0,
+      "node_count": 20,
+      "max_error": 2.7313854400468074e-08,
+      "file": "noncrossing/noncrossing_R_100000p000000_eps_4p0em08.npz"
+    },
+    {
+      "family": "noncrossing",
       "error_bound": 2e-07,
       "error_metric": "linf_abs_scaled_1_over_x",
       "range_param": "R",
@@ -363,6 +818,16 @@
       "node_count": 15,
       "max_error": 8.684369397426229e-07,
       "file": "noncrossing/noncrossing_R_100000p000000_eps_1p0em06.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 1e-05,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 100000.0,
+      "node_count": 12,
+      "max_error": 8.566026691303463e-06,
+      "file": "noncrossing/noncrossing_R_100000p000000_eps_1p0em05.npz"
     }
   ]
 }

@@ -36,7 +36,7 @@ itself:
 
 ## Sweep values in this bundle
 
-- Error bounds: 1.0e-06, 2.0e-07
+- Error bounds: 1.0e-05, 1.0e-06, 2.0e-07, 4.0e-08, 1.0e-08
 - Crossing target kind: `hgl`
 - Crossing `eps_q`: 1.000e-03
 - Crossing `A_dim` values: 20, 40
