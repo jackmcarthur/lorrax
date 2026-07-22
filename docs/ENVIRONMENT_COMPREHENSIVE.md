@@ -179,8 +179,8 @@ concisely; see the overlay's source for the GPU vs CPU branches.
 | `cohsex.in` setting | CPU value | Routes to |
 |---|---|---|
 | `use_ffi_io = true` | (unchanged) | `_slab_io_mpi_host.py` (per-rank MPI-IO via mpi4py + h5py-parallel) |
-| `cusolvermp_charge = auto/on` | forced `off` | in-tree `cholesky_2d.sharded_cholesky` |
-| `cusolvermp_lu = auto/on` | forced `off` | per-q `jnp.linalg.solve` |
+| `distributed_cholesky = auto/cusolvermp/slate` | forced `off` | in-tree `cholesky_2d.sharded_cholesky` (the cuSOLVERMp and SLATE FFIs are CUDA-only today) |
+| `distributed_lu = auto/cusolvermp` | forced `off` | per-q `jnp.linalg.solve` |
 | `pair_density_slots = 3` (GPU XLA) | 4 (CPU XLA) | `_default_pair_density_slots()` |
 
 The CPU path uses synchronous writes (no async writer thread) because
@@ -286,7 +286,8 @@ LORRAX ships an XLA FFI bridge (`src/ffi/`) that calls into three native librari
 | `cusolvermp` | cuSOLVERMp + CAL/NCCL | 1 proc per GPU | Distributed `eigh` (syevd) |
 | `cusolvermg` | cuSOLVERMg | 1 proc × N GPUs | Single-proc multi-GPU `eigh` |
 | `phdf5` | parallel HDF5 via MPI-IO | 1 proc per GPU | Sharded slab read/write of `zeta_q.h5`, `V_qmunu.h5`, etc. |
-| `slate` | SLATE + libsci | p×q GPU grid | Distributed Cholesky, trsm, heev (evaluation) |
+| `cublasmp` | cuBLASMp ≥0.5 (NCCL ABI) | 1 proc per GPU | Distributed GEMM + fused W-solve (`screening_solver = cublasmp_ffi`) |
+| `slate` | SLATE + libsci | p×q GPU grid | Distributed Cholesky, trsm, heev — the portable (Frontier/Aurora) backend, selected via `distributed_cholesky = slate` (§5.7) |
 
 Details: [`src/ffi/AGENTS.md`](../src/ffi/AGENTS.md), [`src/ffi/PORTING.md`](../src/ffi/PORTING.md), [`src/ffi/phdf5/ARCHITECTURE.md`](../src/ffi/phdf5/ARCHITECTURE.md).
 
@@ -296,9 +297,14 @@ Pre-staged host-side directories bind-mount to fixed container paths:
 
 | Host path (override var) | Container mount | Contents |
 |---|---|---|
-| `$LORRAX_FFI_NVHPC_DIR` (default `$HOME/software/lorrax_nvhpc`) | `/lorrax_nvhpc` | NVHPC 25.5 subset: `libcusolverMp.so.0`, `libcal` |
+| `$LORRAX_FFI_NVHPC_DIR` (default `$HOME/software/lorrax_nvhpc`) | `/lorrax_nvhpc` | Two stage subdirs (runtime picks via `LORRAX_NVHPC_SUBPATH`): `0.7.2_cuda12.9/` = **production runtime stage** — cuSOLVERMp 0.7.2 + cuBLASMp 0.5.1 (restaged 2026-07-10, see §5.6); `25.5_cuda12.9/` = NVHPC 25.5 subset — full header set (`cusolverMp.h`, `cublasmp.h`, `cal.h`, `nccl.h`) + `libcal`, used at **build** time and as RUNPATH fallback for `libcal.so.0` |
 | `$LORRAX_FFI_PHDF5_DIR` (default `$HOME/software/lorrax_phdf5_cray/stage`) | `/lorrax_phdf5` | Cray HDF5 1.12 (libmpi_gnu_*.so.12) |
 | `$LORRAX_FFI_SLATE_DIR` (default `$HOME/software/lorrax_slate_cray/stage`) | `/lorrax_slate` | Cray libsci + `libmpi_gtl_cuda.so.0` + xpmem + lustreapi |
+
+Not bind-mounted (plain `$HOME` paths, visible in the container via siteFs): the SLATE
+install itself — `$LORRAX_SLATE_INSTALL_DIR` (default `$HOME/software/slate/install`;
+the scripted pinned builds live under `$HOME/software/slate_builds/{gpu,cpu}/install`,
+see §5.6).
 
 Container-side `LD_LIBRARY_PATH` (order matters):
 

@@ -13,8 +13,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 |------|------|-------------|
 | `src/gw/gw_jax.py` | Main GW driver | Any GW debugging |
 | `src/gw/gw_init.py` | Input parsing, chunking strategy, pipeline orchestration | Input file questions, chunk sizing |
-| `src/gw/gw_config.py` | `LorraxConfig` runtime options dataclass | Flag plumbing, memory budget |
-| `src/gw/gw_driver_helpers.py` | Screening/PPM setup helpers | Driver wiring |
+| `src/gw/gw_config.py` | `LorraxConfig` runtime options dataclass; backend axes (`slab_io`, `distributed_cholesky`, `distributed_lu`) | Flag plumbing, memory budget |
 | `src/gw/w_isdf.py` | χ₀ → W screening pipeline (CTSP, Dyson solve) | Screening / epsilon issues |
 | `src/gw/ppm_sigma.py` | GN-PPM dynamic self-energy Σ^c(ω) | Frequency-dependent sigma issues |
 | `src/gw/minimax_screening.py` | PPM extraction, minimax window helpers | PPM parameter issues |
@@ -25,7 +24,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/gw/wavefunction_bundle.py` | `Wavefunctions` bundle + `project` / `project_ri` (Σ_μν → Σ_ij band projection) | Band-basis projection |
 | `src/gw/qsgw_utils.py` | QSGW fixed-point solver, Σ^xc I/O | Self-consistent GW |
 | `src/gw/kin_ion_io.py` | Kinetic + ionic Hamiltonian I/O | `kin_ion.h5` issues |
-| `src/common/isdf_fitting.py` | CCT/ZCT, pair-density kernels, zeta solve | Zeta fitting, pair density |
+| `src/isdf/core.py` | ISDF core: pair density, C_q/Z_q kernels, `factor_c_q` (Cholesky/LU, backend dispatch), `solve_zeta`, `fit_one_rchunk` | Zeta fitting, pair density |
 | `src/common/load_wfns.py` | Wavefunction loading + band-chunked FFT | WFN load path |
 | `src/common/cholesky_2d.py` | 2D-blocked Cholesky for sharded CCT | Cholesky issues |
 | `src/common/fft_helpers.py` | Flat-k FFT helpers | FFT plumbing |
@@ -37,7 +36,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/common/gpu_utils.py` | Host-side GPU memory detection | Chunk auto-sizing |
 | `src/file_io/slab_io.py` | `SlabIO`: phdf5 writer wrapper for zeta_q / V_qmunu | Big HDF5 writes |
 | `src/file_io/sigma_output.py` | Σ output (eqp.dat, sigma.h5) | Output formats |
-| `src/ffi/` | XLA FFI bridge: `cusolvermp`, `cusolvermg`, `phdf5`, `slate` | Native-library entry points |
+| `src/ffi/` | XLA FFI bridge: `cusolvermp`, `cusolvermg`, `cublasmp`, `phdf5`, `slate` (block-cyclic potrf/trsm/heev; input-file selection via `distributed_cholesky = slate`) | Native-library entry points |
 | `src/solvers/` | Davidson, Lanczos, Chebyshev, pseudobands | Iterative eigensolvers |
 | `src/centroid/kmeans_cli.py` / `src/centroid/kmeans_isdf.py` | ISDF centroid generation — `kmeans_cli` is the CLI (`python -m centroid.kmeans_cli`); `kmeans_isdf` is the algorithm library, no `__main__` | Centroid count / quality |
 | `src/psp/` | Pseudopotentials, dipole / kin+ion generators | `dipole.h5` or `kin_ion.h5` issues |
@@ -68,7 +67,7 @@ uv run python -m gw.kin_ion_io -i cohsex.in
 # GW calculation
 uv run python -m gw.gw_jax -i cohsex.in
 
-# Tests (~15s, JAX compilation overhead)
+# Tests (~2 min on CPU; FFI-stack tests skip cleanly without liblorrax_ffi.so)
 uv run python -m pytest -q
 ```
 
@@ -80,6 +79,7 @@ lxalloc                        # 1 node / 4 GPUs / 2 h
 lxpre cohsex.in 640            # all 3 preprocessing steps (single-GPU)
 lxrun python3 -u -m gw.gw_jax -i cohsex.in        # 4-GPU GW
 LORRAX_NGPU=1 lxrun ...                           # single-GPU override
+LORRAX_NGPU=1 lxrun python3 -m pytest -q tests    # full suite (~4 min, incl. FFI contract tests)
 ```
 
 See [`config/README.md`](config/README.md) for the full cluster reference. Docs: [`docs/ENVIRONMENT_COMPREHENSIVE.md`](docs/ENVIRONMENT_COMPREHENSIVE.md).
@@ -153,7 +153,9 @@ the pipeline is organized and where a new feature belongs.
 
 ## Before committing
 
-Run `uv run python -m pytest -q` after long running branches (5+ small commits); it takes 15 seconds.
+Run `uv run python -m pytest -q` after long running branches (5+ small commits); ~2 min on
+CPU (FFI tests skip without the .so), ~4 min for the full suite on one A100
+(`LORRAX_NGPU=1 lxrun python3 -m pytest -q tests`).
 Do not commit `__pycache__/`, `.venv/`, or `uv_cache/`, etc. directories.
 
 ## Environment
