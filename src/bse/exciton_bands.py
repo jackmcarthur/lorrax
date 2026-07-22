@@ -339,6 +339,17 @@ def main(argv=None):
                     help="skip the diagnostic warm re-run of the solve scan "
                          "(reproducibility assert + dispatch-only timing); "
                          "the re-run costs a full second solve pass")
+    ap.add_argument("--extra-q", type=str, default=None,
+                    help="';'-separated extra fractional Q (each 'x,y,z') "
+                         "appended to the path and solved in the SAME scan "
+                         "(one compile, no extra cost per point beyond the "
+                         "scan row).  They are NOT plotted; they are written "
+                         "to the .dat with mode 'extra'.  The intended use is "
+                         "the reference-free SYMMETRY test: pass the "
+                         "point-group images of a few off-grid path Q — "
+                         "symmetry-equivalent Q must give identical E_S, so "
+                         "any disagreement is off-grid interpolation error, "
+                         "and its size localises the leg.")
     ap.add_argument("--out-prefix", type=str, default="exciton_bands")
     ap.add_argument("--w-coarse-grid", type=str, default=None,
                     help="NX,NY,NZ — sample the screened W on this COARSE BZ "
@@ -457,9 +468,21 @@ def main(argv=None):
     kpath_frac, x_path, node_idx, node_labels, _gp = ht.initialize_kpath(
         wfn, params)
     Qpath = np.asarray(kpath_frac, dtype=np.float64)
+    nQ_path = Qpath.shape[0]
+    # --extra-q rows ride the SAME scan (extra xs rows, one compile).  They are
+    # appended to Qpath so every Q-dependent stage — htransform caches, V_Q,
+    # the solve — treats them exactly like path points; only the plot and the
+    # path-distance axis stop at nQ_path.
+    Q_extra = np.zeros((0, 3))
+    if args.extra_q:
+        Q_extra = np.array([[float(v) for v in seg.split(",")]
+                            for seg in args.extra_q.split(";") if seg.strip()],
+                           dtype=np.float64)
+        Qpath = np.concatenate([Qpath, Q_extra], axis=0)
+        log(f"  +{Q_extra.shape[0]} --extra-q point(s) appended to the scan")
     nQ = Qpath.shape[0]
-    log(f"Q path: {nQ} points, nodes at {list(map(int, node_idx))} "
-        f"labels {node_labels}")
+    log(f"Q path: {nQ_path} path points (+{nQ - nQ_path} extra), nodes at "
+        f"{list(map(int, node_idx))} labels {node_labels}")
     tick("htransform_setup", t0)
 
     # ── conduction caches ψ_c(k+Q), ε_c(k+Q) for the whole path ──────────
@@ -738,9 +761,13 @@ def main(argv=None):
             fh.write("# iQ  s_path  Qx  Qy  Qz  mode  E_1..E_neig (eV)\n")
             for iQ in range(nQ):
                 row = " ".join(f"{e*RY2EV:.6f}" for e in evs_path[iQ])
-                fh.write(f"{iQ:4d} {x_path[iQ]:.6f} "
+                # extras have no path distance: reuse the last path x so the
+                # column stays numeric, and flag them in the mode column.
+                sx = x_path[iQ] if iQ < nQ_path else x_path[nQ_path - 1]
+                mode = "interp" if iQ < nQ_path else "extra "
+                fh.write(f"{iQ:4d} {sx:.6f} "
                          f"{Qpath[iQ][0]: .6f} {Qpath[iQ][1]: .6f} "
-                         f"{Qpath[iQ][2]: .6f} interp {row}\n")
+                         f"{Qpath[iQ][2]: .6f} {mode} {row}\n")
             for iQ in refit_idx:
                 row = " ".join(f"{e*RY2EV:.6f}" for e in evs_refit[iQ])
                 fh.write(f"{iQ:4d} {x_path[iQ]:.6f} "
@@ -764,7 +791,7 @@ def main(argv=None):
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(figsize=(6.4, 4.4))
         for b in range(args.n_eig):
-            ax.plot(x_path, evs_path[:, b] * RY2EV, lw=1.2, color="C0",
+            ax.plot(x_path, evs_path[:nQ_path, b] * RY2EV, lw=1.2, color="C0",
                     alpha=0.9, label="interp" if b == 0 else None)
         for iQ in refit_idx:
             ax.scatter(np.full(args.n_eig, x_path[iQ]), evs_refit[iQ] * RY2EV,
