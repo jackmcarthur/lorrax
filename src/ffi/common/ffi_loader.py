@@ -86,9 +86,10 @@ def _locate_so() -> Path:
         if c.is_file():
             return c
     hints = "\n  ".join(str(p) for p in _candidate_paths()) or "(none)"
+    build_script = Path(__file__).resolve().parent / "cpp" / "build.sh"
     raise FileNotFoundError(
         "Could not locate liblorrax_ffi*.so.  Build with:\n"
-        "    bash src/ffi/common/cpp/build.sh\n"
+        f"    bash {build_script}\n"
         "Paths searched:\n  " + hints
     )
 

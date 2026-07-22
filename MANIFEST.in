@@ -1,1 +1,6 @@
 recursive-include src/common/minimax_assets *.json *.md *.npz
+recursive-include src/ffi *.md CMakeLists.txt *.cc *.cu *.h *.sh
+prune src/ffi/common/cpp/build
+recursive-include config *.md *.lua *.sh *.slurm
+recursive-include docs/installation *.md
+include docs/ENVIRONMENT_COMPREHENSIVE.md

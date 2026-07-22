@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "lorrax"
 version = "0.1.0"
@@ -43,12 +47,39 @@ lorrax-centroids = "centroid.kmeans_cli:main"
 [tool.uv]
 package = true
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.package-data]
 common = [
     "minimax_assets/*.json",
     "minimax_assets/*.md",
     "minimax_assets/crossing/*.npz",
     "minimax_assets/noncrossing/*.npz",
+]
+ffi = [
+    "AGENTS.md",
+    "PORTING.md",
+    "TEMPLATE.md",
+    "common/cpp/CMakeLists.txt",
+    "common/cpp/*.cc",
+    "common/cpp/*.h",
+    "common/cpp/*.sh",
+    "cublasmp/cpp/*.cc",
+    "cublasmp/cpp/*.cu",
+    "cublasmp/cpp/*.h",
+    "cusolvermg/cpp/*.cc",
+    "cusolvermp/cpp/*.cc",
+    "cusolvermp/cpp/*.h",
+    "cusolvermp/scripts/*.sh",
+    "phdf5/ARCHITECTURE.md",
+    "phdf5/cpp/*.cc",
+    "phdf5/cpp/*.h",
+    "phdf5/scripts/*.sh",
+    "slate/README.md",
+    "slate/cpp/*.cc",
+    "slate/cpp/*.h",
+    "slate/scripts/*.sh",
 ]
 
 [tool.uv.workspace]

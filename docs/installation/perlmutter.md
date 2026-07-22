@@ -5,6 +5,10 @@ MPICH, and the Shifter container runtime. The site-specific paths, SLURM default
 literal NERSC values (`m2651`, `interactive` QOS, `/opt/udiImage`, …) live here, kept out of
 the generic [Installation](index.md) tracks.
 
+This reference uses the NVIDIA JAX 25.04 image and a CUDA-12.9 native stack. It is
+intentionally distinct from the public package's JAX >=0.9 / CUDA-13 pure-JAX default;
+the Perlmutter native libraries must not be reused in a CUDA-13 process.
+
 !!! note "Authoritative sources"
     This page is a short orientation. The authoritative, maintained references are
     [`config/README.md`](../../config/README.md) (module, `lxalloc`/`lxrun`/`lxpre`,

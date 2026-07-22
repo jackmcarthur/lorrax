@@ -5,13 +5,16 @@ regression fixture — with **no GPU and no native (FFI) build**. It is the one 
 guaranteed to exist and succeed, and the fastest way to confirm LORRAX works on your
 machine.
 
-## 1. Install (pure-JAX, CPU)
+## 1. Install (pure JAX; CUDA 13 package default)
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh    # one-time
 git clone <lorrax-repo-url> && cd lorrax
-uv sync                                            # editable install; puts src/ on sys.path
+uv sync                                            # editable install; jax[cuda13]>=0.9
 ```
+
+The fixture below is CPU-capable. On a host where you want to force the CPU backend, prefix
+the run commands with `JAX_PLATFORMS=cpu`.
 
 ## 2. Run the bundled fixture
 
@@ -49,7 +52,7 @@ On NERSC Perlmutter, `lxpre cohsex.in <N>` runs steps 1–3 in one command; see
 
 ## Where to next
 
-- [Installation](installation/index.md) — GPU (CUDA 12), container, and from-source tracks
+- [Installation](installation/index.md) — CUDA 13 Python, container, and native-source tracks
 - [FFI native libraries](installation/ffi-native-libs.md) — distributed `eigh`, sharded
   HDF5, SLATE
 - [Theory overview](theory/overview.md) and [physics](theory/physics.md)
