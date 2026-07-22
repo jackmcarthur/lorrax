@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from common import minimax as minimax_core
 from gw import minimax_screening as ms
 
 
@@ -192,6 +193,28 @@ def test_solve_laplace_minimax_interval_skips_shipped_lookup_when_disabled(monke
     np.testing.assert_allclose(quad.tau, tau_hat)
     np.testing.assert_allclose(quad.alpha, alpha_hat)
     assert quad.max_error == err_hat
+
+
+def test_crossing_solver_hgl_error_is_dense_and_well_conditioned():
+    """The fast analytic start must retain the certified HGL approximation."""
+    A = 20.0
+    tau, alpha, reported_error = minimax_core.solve_crossing(
+        25,
+        A,
+        minimax_core.G_hgl,
+        minimax_core.tau_max_hgl(1.0e-3),
+        target_error=1.0e-6,
+    )
+
+    u_dense = np.linspace(0.0, A, 20_001)
+    dense_error = np.max(np.abs(
+        minimax_core.G_hgl(u_dense)
+        - np.sin(np.outer(u_dense, tau)) @ alpha
+    ))
+
+    assert reported_error < 1.0e-6
+    assert dense_error < 1.0e-6
+    assert np.sum(np.abs(alpha)) < 1.0
 
 # ===========================================================================
 #  real-axis quadrature vs analytic kernel (was test_real_axis_quadrature.py)

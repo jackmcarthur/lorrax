@@ -597,7 +597,9 @@ def _cr_varpro_lm(tau, u_grid, g, max_iter=120, tol=1e-14, weights=None,
         tau_s = np.maximum(tau_, 1e-10)
         Phi = np.sin(np.outer(u_grid, tau_s)) * W[:, None]
         U, sig, Vt = np.linalg.svd(Phi, full_matrices=False)
-        sig_inv = np.where(sig > 1e-14 * max(sig[0], 1e-30), 1.0 / sig, 0.0)
+        sig_inv = np.zeros_like(sig)
+        np.divide(1.0, sig, out=sig_inv,
+                  where=sig > 1e-14 * max(sig[0], 1e-30))
         w_ = Vt.T @ (sig_inv * (U.T @ g_w))
         r_ = g_w - U @ (U.T @ g_w)
         return w_, r_, np.dot(r_, r_), U
@@ -673,48 +675,6 @@ def _cr_minimax_lp(Phi, g, method='highs-ipm'):
     return w, t_opt
 
 
-def _cr_lp_backward_elim(N, A, G_func, tau_max_val):
-    """LP with backward elimination to select exactly N frequencies."""
-    eta = 3.0
-    tau_upper = tau_max_val * 1.3
-    K = max(30, int(np.ceil(eta * A * tau_upper / np.pi)) + 20)
-    K = min(K, 500)
-
-    M = max(600, 15 * N)
-    u_grid = np.linspace(0, A, M)
-    g = G_func(u_grid)
-
-    tau_candidates = np.linspace(0.01, tau_upper, K)
-    Phi_full = np.sin(np.outer(u_grid, tau_candidates))
-
-    w_full, t_full = _cr_minimax_lp(Phi_full, g)
-    if w_full is None:
-        return None, None, None
-
-    amp = np.abs(w_full)
-    S_size = min(3 * N, K)
-    S_idx = np.argsort(amp)[-S_size:]
-    S_idx = np.sort(S_idx)
-
-    while len(S_idx) > N:
-        Phi_S = Phi_full[:, S_idx]
-        w_S, _ = _cr_minimax_lp(Phi_S, g)
-        if w_S is None:
-            amp_S = np.abs(w_full[S_idx])
-            keep = np.argsort(amp_S)[-N:]
-            S_idx = np.sort(S_idx[keep])
-            break
-        drop = np.argmin(np.abs(w_S))
-        S_idx = np.delete(S_idx, drop)
-
-    Phi_N = Phi_full[:, S_idx]
-    w_N, t_N = _cr_minimax_lp(Phi_N, g)
-    if w_N is None:
-        w_N = np.linalg.lstsq(Phi_N, g, rcond=None)[0]
-
-    return tau_candidates[S_idx], w_N, u_grid
-
-
 def _cr_final_lp_weights(tau, u_eval, g_eval):
     """Final minimax LP for weights with tau fixed."""
     Phi = np.sin(np.outer(u_eval, tau))
@@ -724,11 +684,12 @@ def _cr_final_lp_weights(tau, u_eval, g_eval):
     return np.linalg.lstsq(Phi, g_eval, rcond=None)[0], np.inf
 
 
-def solve_crossing(N, A, G_func, tau_max_val, lawson_iter=5):
+def solve_crossing(N, A, G_func, tau_max_val, lawson_iter=5, *,
+                   target_error=None):
     """Compute N-point minimax quadrature for crossing regularization.
 
     Architecture:
-      1. LP on adaptive candidate grid -> backward elimination to N freqs
+      1. Chebyshev/support initialization
       2. VarPro-LM + Lawson polish to refine continuous frequencies
       3. Final minimax LP for optimal weights at the polished frequencies
 
@@ -753,6 +714,8 @@ def solve_crossing(N, A, G_func, tau_max_val, lawson_iter=5):
         tau, w = _cr_varpro_lm(tau, u_grid, g, tau_hi=tau_hi)
 
         for k in range(lawson_iter):
+            if target_error is not None and _eval_err(tau, w) < float(target_error):
+                break
             Phi = np.sin(np.outer(u_grid, np.maximum(tau, 1e-10)))
             e = g - Phi @ w
             ae = np.abs(e)
@@ -779,16 +742,16 @@ def solve_crossing(N, A, G_func, tau_max_val, lawson_iter=5):
         if err_ < best_err:
             best_tau, best_w, best_err = tau_, w_, err_
 
-    tau_lp, w_lp, _ = _cr_lp_backward_elim(N, A, G_func, tau_max_val)
-    if tau_lp is not None:
-        _update(*_polish(tau_lp))
-
-    tau_support = np.linspace(0.1, tau_max_val * 1.1, N)
-    _update(*_polish(tau_support))
-
     k = np.arange(1, N + 1)
     tau_cheb = tau_max_val * 0.5 * (1 - np.cos(np.pi * k / (N + 1)))
-    _update(*_polish(tau_cheb))
+    tau_support = np.linspace(0.1, tau_max_val * 1.1, N)
+
+    starts = (tau_cheb, tau_support)
+
+    for start in starts:
+        _update(*_polish(start))
+        if target_error is not None and best_err < float(target_error):
+            break
 
     order = np.argsort(best_tau)
     return best_tau[order], best_w[order], best_err
@@ -806,8 +769,8 @@ def crossing_grids(A, eps, G_func, tau_max_func, eps_q=1e-3, N_max=500):
     N_lo = max(2, N_est - 5)
 
     for N in range(N_lo, N_max + 1):
-        tau, w, err = solve_crossing(N, A, G_func, tmx,
-                                     lawson_iter=5)
+        tau, w, err = solve_crossing(
+            N, A, G_func, tmx, lawson_iter=5, target_error=eps)
         if err < eps:
             return tau, w, N, err
 
@@ -885,7 +848,9 @@ def _cr_solve_1overx(N, A_dim, u_min=5.0):
     def _eval(t):
         Phi = np.sin(np.outer(u, np.maximum(t, 1e-10)))
         U, s, Vt = np.linalg.svd(Phi, full_matrices=False)
-        si = np.where(s > 1e-14 * max(s[0], 1e-30), 1 / s, 0)
+        si = np.zeros_like(s)
+        np.divide(1.0, s, out=si,
+                  where=s > 1e-14 * max(s[0], 1e-30))
         w = Vt.T @ (si * (U.T @ g))
         r = g - U @ (U.T @ g)
         return w, r, r @ r, U

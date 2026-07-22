@@ -121,7 +121,12 @@ $$\epsilon(N, R) \approx 0.31 \cdot \exp\!\big[-N\big(\tfrac{3.55}{\ln R} + 0.68
 
 ### 5.2 Crossing Solver
 
-LP backward elimination on a dense candidate grid to select $N$ frequencies, then VarPro-LM + Lawson polish, then final minimax LP for optimal weights.
+Chebyshev-distributed frequencies with a uniform-support fallback initialize the
+continuous nodes. VarPro-LM refines the nodes, Lawson reweighting moves the fit
+toward the maximum norm, and a final dense minimax LP optimizes the weights.
+Each start stops as soon as the requested dense-grid error is certified. The
+former candidate-grid LP/backward-elimination initializer was both much more
+expensive and consistently discarded on the shipped HGL table family.
 
 Empirical error scaling (calibrated on $A = 50, 100, 200$, $R^2 = 0.996$):
 $$\epsilon(N, A) \approx \exp(-0.93 - 14.25 \cdot N/A)$$
