@@ -12,7 +12,6 @@ Do not add a second dispatcher next to this one; add the operation here.
 """
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
@@ -42,8 +41,12 @@ def dispatch_eigh(A, mesh_xy: Mesh, backend: str):
     ndev matrices at once, the FFI path solves one matrix ndev-ways and
     walks the batch serially.  So ``off`` wins by roughly ndev on a long
     batch of tiles that fit, and the FFI backends win when a single tile
-    does not fit on one device at all.  Measured on MoS2 12×12 / 80 Ry,
-    16 × A100-80GB — see
+    does not fit on one device at all.  Measured (``common.eigh_benchmark
+    --mode dispatch``, complex128, 2×2 mesh of A100-80GB, native batch 32)
+    the FFI is 640×/249×/281×/94× slower PER MATRIX at n =
+    512/1024/2048/4096 for cusolvermp and 221×/164×/216× at n =
+    512/1024/2048 for slate — fixed-cost dominated, so ``off`` is the
+    default everywhere.  See
     ``reports/htransform_distributed_eigh_2026-07-21/report.md``.
 
     Parameters
