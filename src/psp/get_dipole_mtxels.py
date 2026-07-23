@@ -23,6 +23,17 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
+
+# Must run before any device is touched: without it every rank of a multi-process
+# launch is its own single-process job, so ``jax.devices()`` below sees only the
+# local device, the k-axis sharding constraint materialises a *full* copy of the
+# G-space wavefunctions on every rank, and each rank OOMs on the same allocation
+# (144 k x 120 bands x 2 spinor x 36x36x135 ~ 97 GB for MoS2 12x12).  No-op when
+# there is a single process, so single-node/Perlmutter behaviour is unchanged.
+init_jax_distributed()
+fallback_to_cpu_if_no_gpu_backend()
+
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps
 from common.wfn_transforms import read_Gvecs_to_devices
