@@ -137,6 +137,17 @@ def _add_static_head(sig_sx, sig_coh, *, static_head_terms, meta, mesh_xy,
         static_head_terms, nk_tot=meta.nk_tot, do_screened=do_screened)
     if not do_screened:
         coh_h = jnp.zeros_like(coh_h)
+    # The q->0 head is a GLOBAL correction and must be bit-identical on every
+    # process before the replicated device_put below — JAX asserts equality of
+    # a replicated value across processes.  On the full-BZ fallback path (e.g.
+    # a centroid set whose orbit closure fails) each rank can compute it with
+    # roundoff-level (~1e-19) divergence, tripping that assert.  Broadcast
+    # rank 0's copy to enforce consistency.  No-op single-process, and a no-op
+    # when the ranks already agree (the IBZ cascade path).
+    if jax.process_count() > 1:
+        from jax.experimental import multihost_utils
+        sx_h = multihost_utils.broadcast_one_to_all(sx_h)
+        coh_h = multihost_utils.broadcast_one_to_all(coh_h)
     rep = NamedSharding(mesh_xy, P(None, None, None))
     return (sig_sx + jax.device_put(sx_h, rep),
             sig_coh + jax.device_put(coh_h, rep))

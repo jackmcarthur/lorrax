@@ -28,12 +28,13 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export JAX_ENABLE_X64=1
 export JAX_PLATFORMS="${JAX_PLATFORMS:-cuda,cpu}"
 
-# Turing (sm_75) + driver 535 + cudaMallocAsync: XLA command-buffer / CUDA-
-# graph capture fails "Failed to add memset node to a CUDA graph
-# (CUDA_ERROR_INVALID_VALUE)" in some kernels (e.g. the ζ-fit r-chunk).
-# Disable command buffers — correctness on this GPU generation; the perf
-# cost is small-op launch overhead only.
-export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_command_buffer="
+# Turing (sm_75) + driver 535 + cudaMallocAsync: XLA CUDA-graph capture of
+# FUSION/WHILE command buffers fails "Failed to add memset node to a CUDA
+# graph (CUDA_ERROR_INVALID_VALUE)" (e.g. the ζ-fit r-chunk).  Keep the
+# library-call graphs (cuBLAS / custom-call — the GEMMs and cuSolverMp) but
+# exclude FUSION/WHILE where the failing memset lives.  Set
+# LORRAX_XLA_CMDBUF="" to disable command buffers entirely.
+export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_command_buffer=${LORRAX_XLA_CMDBUF:-CUBLAS,CUBLASLT,CUSTOM_CALL}"
 
 # NCCL on Frontera rtx (ConnectX-3/mlx4, no NVLink): single-node uses PCIe
 # P2P intra-socket / host-staging cross-socket. These are safe single-node
