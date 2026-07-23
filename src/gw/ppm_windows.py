@@ -177,6 +177,21 @@ def _iter_branches(
 
 def _to_host_np(a, dtype=np.complex128, *, tiled: bool = False):
     """Gather a possibly sharded array to host."""
+    # A globally-sharded (non-fully-addressable) jax.Array can only be gathered
+    # with tiled=True.  With tiled=False process_allgather raises
+    #   ValueError: Gathering global non-fully-addressable arrays only
+    #               supports tiled=True
+    # and the device_get fallback below then raises
+    #   RuntimeError: Fetching value for `jax.Array` that spans non-addressable
+    #                 (non process local) devices is not possible
+    # so BOTH paths died and every multi-host PPM sigma run aborted right after
+    # the first sigma branch finished.  tiled=True returns the reconstructed
+    # *global* array, which is what the callers here want (they add it straight
+    # into a host buffer of global shape).  tiled is left as the caller asked
+    # for process-local / fully-addressable values, so single-process behaviour
+    # is unchanged.
+    if not getattr(a, "is_fully_addressable", True):
+        tiled = True
     try:
         return np.asarray(
             jax.experimental.multihost_utils.process_allgather(a, tiled=tiled),
