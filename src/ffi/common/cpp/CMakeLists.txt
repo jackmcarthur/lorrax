@@ -9,21 +9,52 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ----------------------------------------------------------------------------
+# Optional-target switches.  Both default ON so every existing (Perlmutter /
+# Cray) invocation is byte-identical — this block is a no-op there.  A
+# port that lacks a dependency turns the relevant target OFF from its own
+# build script (see config/frontera/):
+#   -DLORRAX_FFI_HAVE_CAL=OFF     cuSOLVERMp >= 0.7 is NCCL-native and needs
+#                                 no CAL (libcal / cal.h absent from the pip
+#                                 wheels).  OFF drops the cal.h include, the
+#                                 CAL->NCCL shim, the pre-0.7 CAL comm path,
+#                                 and the libcal link; the NCCL comm path
+#                                 (create_context, ensure_cublasmp) passes
+#                                 ncclComm_t directly.
+#   -DLORRAX_FFI_HAVE_PHDF5=OFF   drop the phdf5 subpackage (no parallel HDF5
+#                                 / MPI at build time).  The cusolverMp /
+#                                 cuBLASMp distributed-linalg targets still
+#                                 build; ffi_loader.py skips the absent
+#                                 phdf5 handler symbols.
+option(LORRAX_FFI_HAVE_CAL   "Build the CAL (<=0.6.x cuSOLVERMp) comm path"      ON)
+option(LORRAX_FFI_HAVE_PHDF5 "Build the phdf5 subpackage (needs parallel HDF5)" ON)
+# cuBLASMp fused gemm / W-solve carry the only .cu translation unit
+# (w_solve_kernels.cu), so they need a full nvcc.  OFF builds an eigh-only
+# .so with NO CUDA-language step — the Frontera pip toolchain ships ptxas
+# but not the nvcc driver, and the distributed eigensolver needs neither.
+# libcublasmp is still linked (cuSOLVERMp's own runtime dependency) and
+# ensure_cublasmp (pure host C++) still compiles.
+option(LORRAX_FFI_HAVE_CUBLASMP "Build cuBLASMp fused-kernel FFIs (needs nvcc)" ON)
+
+# ----------------------------------------------------------------------------
 # CUDA language (for .cu kernel translation units compiled by nvcc).  We
 # point CMAKE_CUDA_COMPILER at the container's nvcc so it matches the
 # toolkit whose headers/runtime we already use for the C++ TUs.  A100 =
 # compute_80 / sm_80; the Shifter container on Perlmutter is A100-only.
+# Gated on LORRAX_FFI_HAVE_CUBLASMP: the eigh-only build has no .cu sources
+# and must not require an nvcc.
 # ----------------------------------------------------------------------------
-if(NOT DEFINED CMAKE_CUDA_COMPILER)
-    if(EXISTS "/usr/local/cuda/bin/nvcc")
-        set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
+if(LORRAX_FFI_HAVE_CUBLASMP)
+    if(NOT DEFINED CMAKE_CUDA_COMPILER)
+        if(EXISTS "/usr/local/cuda/bin/nvcc")
+            set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
+        endif()
     endif()
-endif()
-enable_language(CUDA)
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 80)  # A100 on Perlmutter
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 80)  # A100 on Perlmutter
+    endif()
 endif()
 
 # ----------------------------------------------------------------------------
@@ -243,8 +274,11 @@ if(NOT NCCL_LIBRARY)
 endif()
 
 # ----------------------------------------------------------------------------
-#  Parallel HDF5 + MPI — for the ffi.phdf5 subpackage.
+#  Parallel HDF5 + MPI — for the ffi.phdf5 subpackage.  Gated on
+#  LORRAX_FFI_HAVE_PHDF5 so a port without parallel HDF5 / MPI (e.g. an
+#  eigh-only cuSOLVERMp build) can skip the whole probe.
 # ----------------------------------------------------------------------------
+if(LORRAX_FFI_HAVE_PHDF5)
 # Default stage dir (bind-mounted by run_shifter.sh).  Callers can
 # override with -DHDF5_ROOT=... or $HDF5_ROOT / $HDF5_DIR env vars,
 # which CMake's find_package(HDF5) honours natively.
@@ -327,6 +361,7 @@ if(NOT LORRAX_MPI_LIBRARY)
         "libmpi not found in ${LORRAX_MPICH_LIB_DIR}.")
 endif()
 message(STATUS "MPI:  include=${LORRAX_MPI_INCLUDE_DIR} lib=${LORRAX_MPI_LIBRARY}")
+endif()  # LORRAX_FFI_HAVE_PHDF5
 
 # ----------------------------------------------------------------------------
 #  SLATE — for the ffi.slate subpackage.  Found via find_package(slate)
@@ -382,13 +417,21 @@ set(LORRAX_FFI_SOURCES
     ../../cusolvermp/cpp/batched_potrf_ffi.cc
     ../../cusolvermp/cpp/batched_potrs_ffi.cc
     ../../cusolvermp/cpp/batched_solve_lu_ffi.cc
-    ../../cublasmp/cpp/batched_gemm_ffi.cc
-    ../../cublasmp/cpp/batched_w_solve_ffi.cc
-    ../../cublasmp/cpp/w_solve_kernels.cu
-    ../../phdf5/cpp/context.cc
-    ../../phdf5/cpp/write_ffi.cc
-    ../../phdf5/cpp/read_ffi.cc
 )
+if(LORRAX_FFI_HAVE_CUBLASMP)
+    list(APPEND LORRAX_FFI_SOURCES
+        ../../cublasmp/cpp/batched_gemm_ffi.cc
+        ../../cublasmp/cpp/batched_w_solve_ffi.cc
+        ../../cublasmp/cpp/w_solve_kernels.cu
+    )
+endif()
+if(LORRAX_FFI_HAVE_PHDF5)
+    list(APPEND LORRAX_FFI_SOURCES
+        ../../phdf5/cpp/context.cc
+        ../../phdf5/cpp/write_ffi.cc
+        ../../phdf5/cpp/read_ffi.cc
+    )
+endif()
 if(LORRAX_HAVE_SLATE)
     list(APPEND LORRAX_FFI_SOURCES
         ../../slate/cpp/context.cc
@@ -433,17 +476,28 @@ find_package(Threads REQUIRED)
 target_link_libraries(lorrax_ffi PRIVATE
     "${CUSOLVERMP_LIBDIR}/libcusolverMp.so"
     "${CUSOLVERMP_LIBDIR}/libcublasmp.so"
-    "${CUSOLVERMP_LIBDIR}/libcal.so"
     "${NCCL_LIBRARY}"
     "${CUDART_LIBRARY}"
     "${CUSOLVER_LIBRARY}"
-    ${HDF5_LIBRARIES}
-    "${LORRAX_MPI_LIBRARY}"
     Threads::Threads
 )
+# CAL is only linked for the <=0.6.x comm path; NCCL-native cuSOLVERMp
+# (>=0.7, the pip wheels) ships no libcal.
+if(LORRAX_FFI_HAVE_CAL)
+    target_link_libraries(lorrax_ffi PRIVATE "${CUSOLVERMP_LIBDIR}/libcal.so")
+endif()
+if(LORRAX_FFI_HAVE_PHDF5)
+    target_link_libraries(lorrax_ffi PRIVATE ${HDF5_LIBRARIES} "${LORRAX_MPI_LIBRARY}")
+endif()
 if(LORRAX_HAVE_SLATE)
     target_link_libraries(lorrax_ffi PRIVATE slate)
 endif()
+
+# Propagate the switches to the C++ sources (api.cc, cusolvermp/context.cc).
+target_compile_definitions(lorrax_ffi PRIVATE
+    LORRAX_FFI_HAVE_CAL=$<BOOL:${LORRAX_FFI_HAVE_CAL}>
+    LORRAX_FFI_HAVE_PHDF5=$<BOOL:${LORRAX_FFI_HAVE_PHDF5}>
+)
 
 target_compile_options(lorrax_ffi PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-Wall>

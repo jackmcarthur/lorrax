@@ -14,7 +14,17 @@
 #include <cusolverMp.h>
 
 #include "../../cusolvermp/cpp/ctx.h"
+
+// LORRAX_FFI_HAVE_PHDF5 defaults to 1 (Perlmutter/Cray builds the phdf5
+// subpackage).  A port without parallel HDF5 / MPI builds with
+// -DLORRAX_FFI_HAVE_PHDF5=0 (see config/frontera/), which drops the phdf5
+// lifecycle entry points below; ffi_loader.py skips the absent symbols.
+#ifndef LORRAX_FFI_HAVE_PHDF5
+#define LORRAX_FFI_HAVE_PHDF5 1
+#endif
+#if LORRAX_FFI_HAVE_PHDF5
 #include "../../phdf5/cpp/ctx.h"
+#endif
 
 namespace lrx = lorrax_ffi::cusolvermp;
 
@@ -31,6 +41,7 @@ namespace lorrax_ffi::cusolvermp {
                                 int nelems);
 }
 
+#if LORRAX_FFI_HAVE_PHDF5
 namespace lorrax_ffi::phdf5 {
     // Implemented in phdf5/cpp/context.cc
     PhdfCtx* open_ctx(const std::string& path, int p, int q,
@@ -41,6 +52,7 @@ namespace lorrax_ffi::phdf5 {
     hid_t    open_dataset_ro(PhdfCtx* ctx, const std::string& ds_name);
     void     ensure_mpi_initialized();
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // extern "C" ABI.  All functions set *err_out (size 512) to a message on
@@ -119,6 +131,7 @@ int lrx_version_info(int* cuda_rt, int* cuda_drv, int* nccl_ver) {
 // ---------------------------------------------------------------------------
 //  parallel-HDF5 subpackage lifecycle
 // ---------------------------------------------------------------------------
+#if LORRAX_FFI_HAVE_PHDF5
 
 // Open (or create) a parallel-HDF5 file collectively.
 // mode_flag: 0 = 'w' truncate, 1 = 'a' append-or-create, 2 = 'r' read-only
@@ -200,5 +213,7 @@ int lrx_phdf5_open_dataset_ro(
         return 1;
     }
 }
+
+#endif  // LORRAX_FFI_HAVE_PHDF5
 
 }  // extern "C"

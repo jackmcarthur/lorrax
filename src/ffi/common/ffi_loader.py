@@ -209,7 +209,9 @@ def _declare_cuda_stack(lib: ctypes.CDLL) -> None:
     ]
     lib.lrx_version_info.restype = ctypes.c_int
 
-    # phdf5 lifecycle
+    # phdf5 lifecycle — absent from a -DLORRAX_FFI_HAVE_PHDF5=0 build.
+    if not hasattr(lib, "lrx_phdf5_open"):
+        return
     lib.lrx_phdf5_open.argtypes = [
         ctypes.c_char_p,                     # path
         ctypes.c_int, ctypes.c_int,          # p, q
@@ -246,8 +248,11 @@ def _declare_cuda_stack(lib: ctypes.CDLL) -> None:
 
 def _declare_slate(lib: ctypes.CDLL) -> None:
     """SLATE context lifecycle — exported by BOTH platform libraries
-    (slate/cpp/context.cc is pure MPI and compiled into each)."""
+    (slate/cpp/context.cc is pure MPI and compiled into each).  Absent
+    from a build made without SLATE (e.g. the Frontera eigh-only .so)."""
 
+    if not hasattr(lib, "lrx_slate_context_create"):
+        return
     lib.lrx_slate_context_create.argtypes = [
         ctypes.c_int,           # rank
         ctypes.c_int,           # world_size
@@ -274,6 +279,13 @@ def _declare_slate(lib: ctypes.CDLL) -> None:
 
 def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
     for target_name, cpp_symbol in _PLATFORMS[platform]["targets"].items():
+        # A partial build (e.g. the Frontera eigh-only .so with
+        # -DLORRAX_FFI_HAVE_PHDF5=0 and no SLATE) omits some handler
+        # symbols.  Skip the ones this .so doesn't export instead of
+        # failing the whole load; the corresponding Python wrappers raise
+        # a clear AttributeError only if actually called.
+        if not hasattr(lib, cpp_symbol):
+            continue
         fn = getattr(lib, cpp_symbol)
         try:
             jax.ffi.register_ffi_target(

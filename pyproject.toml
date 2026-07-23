@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "h5py>=3.14.0",
-    "jax[cuda13]>=0.9.0",
+    "jax[cuda12]>=0.9.0",
     "jaxlib>=0.9.0",
     "matplotlib>=3.10.3",
     "numpy>=2.3.1",
@@ -24,10 +24,13 @@ docs = [
     "mkdocstrings>=0.30.1",
     "mkdocstrings-python>=1.18.2",
 ]
-# NOTE: the default GPU stack is CUDA 13 / JAX >=0.9 (see
-# [project.dependencies] `jax[cuda13]`). A CUDA-12 install path on the same
-# JAX 0.9 line (`jax[cuda12]>=0.9.0`) is a plausible future support-matrix
-# row but is not offered here yet, so no `cuda12` extra is defined.
+# NOTE: the default GPU stack here is CUDA 12 / JAX >=0.9 (see
+# [project.dependencies] `jax[cuda12]`). This was switched from `cuda13` to
+# support TACC Frontera, whose RTX 5000 (Turing, sm_75) GPU nodes run NVIDIA
+# driver 535.113.01 (CUDA 12.2) — CUDA 13 needs a >=580 driver. Driver 535
+# runs the full CUDA 12.x userspace via minor-version compatibility, and JAX
+# on CUDA 12 supports sm_52+, so Turing is well within range. To go back to
+# CUDA 13 on a newer-driver machine, flip `jax[cuda12]` -> `jax[cuda13]`.
 
 [project.scripts]
 lorrax-gw = "gw.gw_jax:main"
@@ -75,7 +78,7 @@ dev = [
     "pytest>=8.0.0",
 ]
 jax = [
-    "jax[cuda13]>=0.9.0",
+    "jax[cuda12]>=0.9.0",
     "jaxlib>=0.9.0",
 ]
 build = [

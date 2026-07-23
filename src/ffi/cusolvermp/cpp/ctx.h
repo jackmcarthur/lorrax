@@ -4,12 +4,22 @@
 #include <cstddef>
 #include <cuda_runtime.h>
 #include <nccl.h>
+// LORRAX_FFI_HAVE_CAL defaults to 1 (unset -> Perlmutter/Cray behaviour).
+// The Frontera eigh-only build compiles with -DLORRAX_FFI_HAVE_CAL=0
+// because cuSOLVERMp >= 0.7 (the pip wheels) is NCCL-native and ships no
+// cal.h / libcal.
+#ifndef LORRAX_FFI_HAVE_CAL
+#define LORRAX_FFI_HAVE_CAL 1
+#endif
+#if LORRAX_FFI_HAVE_CAL
 #include <cal.h>
+#endif
 #include <cusolverMp.h>
 #include <cublasmp.h>
 
 namespace lorrax_ffi::cusolvermp {
 
+#if LORRAX_FFI_HAVE_CAL
 // "Shim" struct passed through CAL's user-data slot to our three allgather
 // callbacks.  Lives for the lifetime of the LorraxCusolverMpCtx.
 struct CalNcclShim {
@@ -19,6 +29,7 @@ struct CalNcclShim {
     void*         d_scratch       = nullptr;
     size_t        d_scratch_bytes = 0;
 };
+#endif
 
 struct LorraxCusolverMpCtx {
     // identity
@@ -38,9 +49,13 @@ struct LorraxCusolverMpCtx {
     ncclComm_t          nccl_comm  = nullptr;
     cudaStream_t        stream     = nullptr;
     cusolverMpHandle_t  handle     = nullptr;
+#if LORRAX_FFI_HAVE_CAL
     cal_comm_t          cal_comm   = nullptr;   // our CAL wrapper over NCCL
+#endif
     cusolverMpGrid_t    grid       = nullptr;
+#if LORRAX_FFI_HAVE_CAL
     CalNcclShim         shim{};                 // stable address — CAL holds a ptr
+#endif
 
     // Pooled events for cross-stream joins.  Created once in ctor, destroyed
     // once in dtor.  cudaEventRecord on an already-recorded event just

@@ -12,15 +12,15 @@
 
 #include <cuda_runtime.h>
 #include <nccl.h>
-#include <cal.h>
 #include <cusolverMp.h>
 #include <cublasmp.h>
 
 #include "../../common/cpp/ffi_helpers.h"
-#include "ctx.h"
+#include "ctx.h"   // defines/defaults LORRAX_FFI_HAVE_CAL, includes <cal.h> when set
 
 namespace lorrax_ffi::cusolvermp {
 
+#if LORRAX_FFI_HAVE_CAL
 // ---------------------------------------------------------------------------
 // CAL → NCCL bridge
 // ---------------------------------------------------------------------------
@@ -87,6 +87,7 @@ static calError_t cal_nccl_req_free(void* request) {
     (void)request;  // shim is owned by the Ctx; nothing to free per-request
     return CAL_OK;
 }
+#endif  // LORRAX_FFI_HAVE_CAL
 
 // ----- tiny throwing checks (for setup path; FFI handlers use Error) ------
 static void throw_if_cuda(cudaError_t st, const char* what) {
@@ -254,6 +255,7 @@ int64_t create_context(int rank, int world_size,
         ? CUSOLVERMP_GRID_MAPPING_COL_MAJOR
         : CUSOLVERMP_GRID_MAPPING_ROW_MAJOR;
 
+#if LORRAX_FFI_HAVE_CAL
     if (!use_nccl_comm_path) {
         // 0.6.x: cusolverMpCreateDeviceGrid takes cal_comm_t.  Build a
         // real cal_comm via cal_comm_create, plumbing the three required
@@ -296,6 +298,28 @@ int64_t create_context(int rank, int world_size,
                 /*numColDevices=*/q, layout),
             "cusolverMpCreateDeviceGrid");
     }
+#else
+    // NCCL-native build (LORRAX_FFI_HAVE_CAL=0): cuSOLVERMp headers declare
+    // cusolverMpCreateDeviceGrid's comm parameter as ncclComm_t, so pass
+    // ctx->nccl_comm directly — no CAL, no reinterpret_cast.  The <0.7 CAL
+    // comm path does not exist in this build.
+    if (!use_nccl_comm_path) {
+        std::ostringstream os;
+        os << "cusolverMp " << (mp_version / 1000) << "." << ((mp_version / 100) % 10)
+           << "." << (mp_version % 100) << " uses the pre-0.7 CAL comm path, but this "
+           << "binary was built with LORRAX_FFI_HAVE_CAL=0 (NCCL-native only).  "
+           << "Load cuSOLVERMp >= 0.7, or rebuild with -DLORRAX_FFI_HAVE_CAL=ON "
+           << "and a CAL-providing SDK.";
+        throw std::runtime_error(os.str());
+    }
+    throw_if_cusolver(
+        cusolverMpCreateDeviceGrid(
+            ctx->handle, &ctx->grid,
+            ctx->nccl_comm,
+            /*numRowDevices=*/p,
+            /*numColDevices=*/q, layout),
+        "cusolverMpCreateDeviceGrid");
+#endif  // LORRAX_FFI_HAVE_CAL
 
     // Device buffer for d_info (int) used by every Syevd call.
     throw_if_cuda(cudaMalloc(&ctx->d_info, sizeof(int)), "cudaMalloc(d_info)");
@@ -328,12 +352,14 @@ void destroy_context(int64_t ctx_handle) {
     if (ctx->cublasmp_handle) { cublasMpDestroy(ctx->cublasmp_handle);       ctx->cublasmp_handle = nullptr; }
     if (ctx->grid)     { cusolverMpDestroyGrid(ctx->grid);       ctx->grid = nullptr; }
     if (ctx->handle)   { cusolverMpDestroy(ctx->handle);         ctx->handle = nullptr; }
+#if LORRAX_FFI_HAVE_CAL
     if (ctx->cal_comm) { cal_comm_destroy(ctx->cal_comm);        ctx->cal_comm = nullptr; }
     if (ctx->shim.d_scratch) {
         cudaFree(ctx->shim.d_scratch);
         ctx->shim.d_scratch = nullptr;
         ctx->shim.d_scratch_bytes = 0;
     }
+#endif
     if (ctx->ev_xla_in)  { cudaEventDestroy(ctx->ev_xla_in);     ctx->ev_xla_in = nullptr; }
     if (ctx->ev_ctx_out) { cudaEventDestroy(ctx->ev_ctx_out);    ctx->ev_ctx_out = nullptr; }
     if (ctx->stream)   { cudaStreamDestroy(ctx->stream);         ctx->stream = nullptr; }
@@ -366,6 +392,7 @@ void ensure_cublasmp(LorraxCusolverMpCtx* ctx) {
             blasmp_version / 1000, (blasmp_version / 100) % 10,
             blasmp_version % 100, use_nccl_comm_path ? "NCCL" : "CAL");
     }
+#if LORRAX_FFI_HAVE_CAL
     if (!use_nccl_comm_path && !ctx->cal_comm) {
         std::ostringstream os;
         os << "ensure_cublasmp: loaded cuBLASMp " << blasmp_version
@@ -377,6 +404,17 @@ void ensure_cublasmp(LorraxCusolverMpCtx* ctx) {
            << "use the <= 0.6.x cuSOLVERMp stage.";
         throw std::runtime_error(os.str());
     }
+#else
+    // NCCL-native build: only the cuBLASMp NCCL comm ABI (>= 0.5.0) is
+    // supported — there is no CAL comm to fall back to.
+    if (!use_nccl_comm_path) {
+        std::ostringstream os;
+        os << "ensure_cublasmp: loaded cuBLASMp " << blasmp_version
+           << " uses the pre-0.5 CAL comm ABI, but this binary was built "
+           << "with LORRAX_FFI_HAVE_CAL=0.  Load cuBLASMp >= 0.5.0.";
+        throw std::runtime_error(os.str());
+    }
+#endif
     if (use_nccl_comm_path && !ctx->nccl_comm) {
         std::ostringstream os;
         os << "ensure_cublasmp: loaded cuBLASMp " << blasmp_version
@@ -395,11 +433,17 @@ void ensure_cublasmp(LorraxCusolverMpCtx* ctx) {
         cublasMpGridLayout_t layout = ctx->grid_layout_col_major
             ? CUBLASMP_GRID_LAYOUT_COL_MAJOR
             : CUBLASMP_GRID_LAYOUT_ROW_MAJOR;
+#if LORRAX_FFI_HAVE_CAL
         // cal_comm_t / ncclComm_t are both opaque pointers; cast to the
         // declared header type and pass the correct concrete object.
         cal_comm_t comm_arg = use_nccl_comm_path
             ? reinterpret_cast<cal_comm_t>(ctx->nccl_comm)
             : ctx->cal_comm;
+#else
+        // NCCL-native cuBLASMp headers declare the comm parameter as
+        // ncclComm_t — pass it straight through.
+        ncclComm_t comm_arg = ctx->nccl_comm;
+#endif
         throw_if_cublasmp(
             cublasMpGridCreate(ctx->p, ctx->q, layout,
                                 comm_arg, &ctx->cublasmp_grid),
