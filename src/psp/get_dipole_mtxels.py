@@ -22,6 +22,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.experimental import multihost_utils as _mhu
 
 from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
 
@@ -737,6 +738,16 @@ def main(argv=None):
 	        if args.skip_vnl
 	        else 'dipole_cart[3,x,y] = p_i + i[r_i, V_NL]; ')
 	note += 'deltaE[k,:,:] = E_b - E_b\''
+	# Rank-0 writes.  Every rank holds the same gathered host arrays, so a
+	# multi-process launch previously had all of them open the SAME path with
+	# mode 'w' concurrently -- serial h5py has no cross-process locking, so
+	# that is a genuine corruption hazard (it merely happened not to bite at
+	# 4 ranks).  Barrier afterwards so no rank races ahead of the file
+	# existing on disk.
+	if jax.process_index() != 0:
+		_mhu.sync_global_devices("dipole_write")
+		print(f"\nWrote dipole data to {out_path} (by rank 0)")
+		return 0
 	with h5py.File(str(out_path), 'w') as h5:
 		h5.create_dataset('dipole_cart', data=dipole)
 		h5.create_dataset('deltaE', data=deltaE)
@@ -758,6 +769,8 @@ def main(argv=None):
 				"v_cvkq[a, c, v, k, q] = symmetric (v_R + v_L)/2 of "
 				"<u_{c, k-q}|v^a|u_{v, k}>_cell  (kinetic + VNL); "
 				"kminq_idx[k, q] = canonical k-q index in unfolded_kpts.")
+	if jax.process_count() > 1:
+		_mhu.sync_global_devices("dipole_write")
 	print(f"\nWrote dipole data to {out_path}")
 
 

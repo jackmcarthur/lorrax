@@ -49,8 +49,12 @@ def _scalar_to_host_float(a) -> float:
         # which aborted every multi-host GN-PPM run in fit_gn_ppm_from_wc_pair.
         # Tiled gathering needs >= 1-D, so promote the scalar first; fall back to
         # a plain device_get when the value is already fully addressable.
+        # ``reshape((-1,))[:1]`` rather than ``reshape((1,))``: the latter would
+        # raise for any input with size > 1, whereas the historical tiled=False
+        # path flattened after gathering and took element 0.  Keep that
+        # tolerance so this is a strict bug-fix with no behaviour regression.
         try:
-            gathered = _mh.process_allgather(arr.reshape((1,)), tiled=True)
+            gathered = _mh.process_allgather(arr.reshape((-1,))[:1], tiled=True)
         except Exception:
             gathered = jax.device_get(arr)
         return float(np.asarray(gathered, dtype=np.float64).reshape(-1)[0])
