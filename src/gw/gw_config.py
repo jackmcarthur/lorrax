@@ -1378,14 +1378,27 @@ class LorraxConfig:
                         "the system's parallel HDF5 to get PHDF5_HOST."
                     )
                     _slab_io_choice = SlabIOBackend.H5PY_ALLGATHER
-            if _dist_chol not in ("off", "slate"):
+            if _dist_chol not in ("off", "slate", "auto"):
                 # slate passes through: it has a host-platform FFI
                 # (liblorrax_ffi_host.so, Target::HostTask) and keeps the
                 # explicit-request-fails-loudly semantics on CPU too.
+                #
+                # ``auto`` ALSO passes through now.  It used to be forced to
+                # 'off' here, but 'off' is an *override* that short-circuits
+                # the whole route policy in isdf/core.py straight to
+                # ``sharded_cholesky`` -- and the replicated route it thereby
+                # skips is the ONLY one that carries the charge ζ-solve
+                # rank-truncation cure (charge_zeta_solve='rank_truncate').
+                # That route is replicated dense JAX with no FFI, so it is
+                # perfectly valid on CPU; only the ABOVE-cap cuSOLVERMp branch
+                # is CUDA-only, and isdf/core.py now declines that on a CPU
+                # mesh.  Forcing 'off' here silently produced a
+                # non-rank-conditioned ζ on CPU (ζ far too large, garbage V_q
+                # -> nonsense Σ and an inverted QP gap) with no warning.
                 print_fn(
                     f"  [config] distributed_cholesky={_dist_chol} "
                     "requested but JAX backend is CPU; cuSOLVERMp is "
-                    "CUDA-only and auto never picks SLATE.  Forcing 'off' "
+                    "CUDA-only.  Forcing 'off' "
                     "(in-tree sharded_cholesky).  SLATE's host FFI is "
                     "available via explicit distributed_cholesky = slate."
                 )

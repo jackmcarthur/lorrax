@@ -846,6 +846,18 @@ _REPLICATED_CHOL_MAX_STACK_BYTES = int(
     float(os.environ.get("LORRAX_ZETA_REPLICATE_CAP_GIB", "4")) * 1024**3)
 
 
+def _mesh_is_cpu(mesh_xy) -> bool:
+    """True when the mesh's devices are the CPU backend.
+
+    Used to keep the ``auto`` policy from selecting the CUDA-only
+    cuSOLVERMp factor on a host-only run.
+    """
+    try:
+        return bool(mesh_xy.devices.flat[0].platform == 'cpu')
+    except Exception:
+        return False
+
+
 def _replicate_charge_ok(nq: int | None, n_rmu: int | None) -> bool:
     """True when the charge CCT stack ``(nq, n_μ, n_μ)`` c128 fits under the
     replication cap — the criterion for the mesh-invariant dense Cholesky
@@ -931,6 +943,9 @@ def _resolve_solver_kind_charge(
     # and we refuse rather than downgrade: the 2026-07-21 full-BZ 12×12 fit
     # (13.4 GiB, just over the cap) silently fell back and returned ζ 4.5×
     # too large, rebuilding V_q to relF 16–32 instead of 1.8e-15.
+    # The replicated route is dense JAX with no FFI, so it is valid on every
+    # backend including CPU -- and it is the only route carrying the
+    # rank-truncation cure, so it must stay reachable there.
     if _replicate_charge_ok(nq, n_rmu):
         return ('replicated_rank_truncate'
                 if charge_zeta_solve == 'rank_truncate'
@@ -944,7 +959,11 @@ def _resolve_solver_kind_charge(
             f"Set LORRAX_ZETA_REPLICATE_CAP_GIB={-(-need // 1) + 1:.0f} if the "
             f"device budget allows, or charge_zeta_solve='cholesky' to accept "
             f"the distributed factor (NOT rank-conditioned — verify V_q).")
-    return 'cusolvermp_cholesky' if is_2d else 'sharded_cholesky'
+    # Above the cap: cuSOLVERMp is CUDA-only, so never auto-pick it on a CPU
+    # mesh (that is the one genuinely GPU-bound branch of this policy).
+    if is_2d and not _mesh_is_cpu(mesh_xy):
+        return 'cusolvermp_cholesky'
+    return 'sharded_cholesky'
 
 
 def _require_slate_ffi() -> None:
