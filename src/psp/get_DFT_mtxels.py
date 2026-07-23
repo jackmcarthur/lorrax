@@ -33,17 +33,6 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from functools import partial, lru_cache
 
-from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
-
-# Must run before any device is touched.  main() sizes its mesh from
-# ``jax.process_count() * jax.local_device_count()``; without this every rank of
-# a multi-process launch sees process_count()==1, builds a 1x1 mesh, and the
-# k-axis sharding constraint materialises a *full* copy of the G-space
-# wavefunctions per rank instead of sharding them (~97 GB for MoS2 12x12 at 120
-# bands).  No-op for a single process, so Perlmutter behaviour is unchanged.
-init_jax_distributed()
-fallback_to_cpu_if_no_gpu_backend()
-
 
 # Per-WFN-path cache of full-BZ G-vectors (replaces
 # ``sym.get_gvecs_kfull`` per-k calls in compute_valence_density).  The
