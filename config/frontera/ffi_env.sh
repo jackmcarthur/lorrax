@@ -32,3 +32,31 @@ export JAX_PLATFORMS="${JAX_PLATFORMS:-cuda,cpu}"
 # P2P intra-socket / host-staging cross-socket. These are safe single-node
 # defaults; for multi-node, IB-over-mlx4 may need NCCL_IB_DISABLE=1.
 export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-PHB}"
+
+# --- phdf5 (host Intel-MPI parallel HDF5, hybrid-mounted) -------------------
+# Set LORRAX_FFI_PHDF5=1 before sourcing to run the phdf5-inclusive .so.
+if [ "${LORRAX_FFI_PHDF5:-0}" = "1" ]; then
+    export LORRAX_FFI_SO="${LORRAX_FFI_SO_PHDF5:-$LORRAX_FFI_STAGE/build_phdf5/liblorrax_ffi.so}"
+    HDF5_ROOT_DIR="${LORRAX_HDF5_ROOT:-/home1/apps/intel19/impi19_0/phdf5/1.14.6}"
+    IMPI="${LORRAX_IMPI_ROOT:-/opt/intel/compilers_and_libraries_2020.4.304/linux/mpi/intel64}"
+    export I_MPI_ROOT="${IMPI%/intel64}"   # wrappers/runtime append intel64/
+    # Intel compiler runtime (libimf/libintlc/libsvml — the Intel-built HDF5
+    # and libfabric NEED these).  2020.1 runtime is ABI-compatible with the
+    # 2020.4 MPI.
+    ICC_RT="${LORRAX_ICC_RUNTIME:-/opt/intel/compilers_and_libraries_2020.1.217/linux/compiler/lib/intel64_lin}"
+    # Intel MPI runtime libs (libmpi.so.12 + bundled libfabric) + HDF5.
+    export LD_LIBRARY_PATH="$HDF5_ROOT_DIR/lib:$IMPI/lib/release:$IMPI/lib:$IMPI/libfabric/lib:$ICC_RT:$LD_LIBRARY_PATH"
+    # Bootstrap Intel MPI under srun --mpi=pmi2 via the host slurm PMI2 lib
+    # (pre-copied to $WORK/host_pmi).  MUST override unconditionally: TACC's
+    # login environment sets I_MPI_PMI_LIBRARY=/usr/lib64/libpmi.so, a host
+    # PMI-1 lib that is the wrong protocol for --mpi=pmi2 AND absent inside
+    # the container -> MPIR_pmi_init fails.  Force our staged PMI2 lib.
+    export I_MPI_PMI_LIBRARY="${LORRAX_PMI2_LIB:-$WORK/host_pmi/libpmi2.so.0}"
+    # Single node: shared-memory-only transport skips OFI/libfabric init
+    # entirely (the tcp/mlx4 OFI provider fails "addrinfo() No data
+    # available" in-container).  For multi-node, set LORRAX_MPI_FABRICS=ofi
+    # + FI_PROVIDER and sort out the ConnectX-3 fabric.
+    export I_MPI_FABRICS="${LORRAX_MPI_FABRICS:-shm}"
+    export FI_PROVIDER="${FI_PROVIDER:-tcp}"
+    export HDF5_USE_FILE_LOCKING=FALSE
+fi
