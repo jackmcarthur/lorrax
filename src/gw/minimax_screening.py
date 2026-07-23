@@ -41,8 +41,19 @@ def _scalar_to_host_float(a) -> float:
     """Fetch a scalar JAX value in a multihost-safe way."""
 
     if jax.process_count() > 1:
-        gathered = np.asarray(_mh.process_allgather(jnp.asarray(a), tiled=False), dtype=np.float64)
-        return float(gathered.reshape(-1)[0])
+        arr = jnp.asarray(a)
+        # ``process_allgather`` rejects ``tiled=False`` for globally-sharded
+        # (non-fully-addressable) inputs:
+        #   ValueError: Gathering global non-fully-addressable arrays only
+        #               supports tiled=True
+        # which aborted every multi-host GN-PPM run in fit_gn_ppm_from_wc_pair.
+        # Tiled gathering needs >= 1-D, so promote the scalar first; fall back to
+        # a plain device_get when the value is already fully addressable.
+        try:
+            gathered = _mh.process_allgather(arr.reshape((1,)), tiled=True)
+        except Exception:
+            gathered = jax.device_get(arr)
+        return float(np.asarray(gathered, dtype=np.float64).reshape(-1)[0])
     return float(np.asarray(jax.device_get(a), dtype=np.float64))
 
 
