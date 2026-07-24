@@ -24,6 +24,41 @@ from common import jax_profile
 from .gw_config import read_lorrax_input, read_cohsex_input  # noqa: F401
 
 
+def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print):
+	"""Fail fast when ``tmp/zeta_q.h5`` belongs to a different ISDF basis.
+
+	``tmp_dir`` is hardwired to ``<input_dir>/tmp`` and the ζ file is a fixed
+	``zeta_q.h5`` -- unlike its sibling ``isdf_tensors_{n_rmu}.h5``, it is NOT
+	namespaced by centroid count.  So two runs launched from the same directory
+	with different ``centroids_file`` share one ζ file.  The writer opens it
+	``mode='a'`` and only discovers the clash deep inside the slab write, as
+
+	  ValueError: could not broadcast input array from shape (144,276,8603)
+	                                          into shape (144,1194,8603)
+
+	i.e. *after* the entire multi-hour ζ fit has already been computed and
+	thrown away.  Check the precondition up front instead: it costs one HDF5
+	header read and turns an hour of wasted compute into an actionable message.
+	"""
+	if not os.path.exists(zeta_h5_path):
+		return
+	try:
+		with h5py.File(zeta_h5_path, 'r') as f:
+			dset = f.get('zeta_q')
+			existing = None if dset is None else int(dset.shape[1])
+	except Exception:
+		return		# unreadable/partial file: let the writer deal with it
+	if existing is not None and existing != int(n_rmu):
+		raise ValueError(
+			f"{zeta_h5_path} holds a ζ for n_mu={existing}, but this run has "
+			f"n_mu={n_rmu}.  tmp/ is derived from the input file's directory "
+			f"and zeta_q.h5 is not namespaced by centroid count, so two runs "
+			f"started from the same directory with different centroids_file "
+			f"values collide here.  Give each run its own directory (put its "
+			f"input file there), or move/delete the stale ζ.  Refusing now "
+			f"rather than after the fit.")
+
+
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
              psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print):
 	"""Fit ISDF interpolation vectors ζ and write to HDF5.
@@ -52,6 +87,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	mem_est = chunks.get('memory_estimate', {})
 
 	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
+	_check_zeta_h5_matches_basis(zeta_h5_path, int(meta.n_rmu), print_fn)
 	print_fn(f"\n  Chunked ISDF fitting:")
 	print_fn(f"    Band chunks: {chunks['band_chunk']}")
 	print_fn(f"    R chunks:    {chunks['chunk_r']} (contiguous r-space)")
