@@ -246,6 +246,72 @@ class _AllgatherBackend:
         vshape = _normalize_valid_shape(
             op="read_slab", name=name, valid_shape=valid_shape,
             slab_shape=out_shape, offset=off, global_shape=None)
+        # ---- SHARDED fast path ------------------------------------------
+        # When the caller asks for a sharded result, read ONLY this
+        # process's shard.  The whole-slab path below allocates the FULL
+        # global tensor as host numpy TWICE on EVERY rank (``read_host`` +
+        # the zero-padded ``host``) — for the V_q batched ζ read
+        # (``gw/v_q_g_flat.py::_make_read_all_ibz``, one call for all
+        # n_q) that is
+        #     n_q · μ_pad · ngkmax · 16  ×2
+        # = 11.8 GB/rank at MoS2 12×12 full-BZ (n_q=144, μ_pad=320,
+        # ngkmax=8603), i.e. 23.6 GB/node at 2 ranks/node, against a
+        # ~79 MB/rank sharded read.  That is the allocation that grew the
+        # node from 22 to 53 GB in one 30 s sample and aborted all 80 ranks
+        # entering V_q in job 7874242 (the ``raw_buffer.h:149 Check failed:
+        # buffer_.IsConcrete()`` LOG(FATAL), rc=134).  Each process already
+        # owns its own 'r' handle, so it can read its own hyperslab
+        # directly — same bytes, same values, 1/P the host memory.
+        #
+        # The result is byte-identical to the whole-slab path: every shard
+        # takes exactly the elements the target sharding assigns it, and
+        # positions past ``vshape`` stay zero (the μ-pad contract).
+        if (not as_numpy) and mesh is not None and partition_spec is not None:
+            from jax.sharding import NamedSharding
+            sharding = NamedSharding(mesh, partition_spec)
+            try:
+                idx_map = sharding.addressable_devices_indices_map(
+                    tuple(out_shape))
+            except Exception:
+                idx_map = None
+            if idx_map:
+                ndim = len(out_shape)
+                arrays = []
+                for dev, ix in idx_map.items():
+                    los, his = [], []
+                    for ax in range(ndim):
+                        sl = ix[ax] if ix is not None else slice(None)
+                        lo = 0 if sl.start is None else int(sl.start)
+                        hi = int(out_shape[ax]) if sl.stop is None \
+                            else int(sl.stop)
+                        los.append(lo)
+                        his.append(hi)
+                    local_shape = tuple(h - l for l, h in zip(los, his))
+                    # Intersect this shard with the VALID (on-disk) region;
+                    # everything outside stays zero.
+                    r_lo = [min(l, int(v)) for l, v in zip(los, vshape)]
+                    r_hi = [min(h, int(v)) for h, v in zip(his, vshape)]
+                    local = np.zeros(local_shape,
+                                     dtype=dtype or dset.dtype)
+                    if all(b > a for a, b in zip(r_lo, r_hi)):
+                        disk = tuple(slice(off[ax] + r_lo[ax],
+                                           off[ax] + r_hi[ax])
+                                     for ax in range(ndim))
+                        dst = tuple(slice(r_lo[ax] - los[ax],
+                                          r_hi[ax] - los[ax])
+                                    for ax in range(ndim))
+                        local[dst] = dset[disk]
+                    arrays.append(jax.device_put(local, dev))
+                out = jax.make_array_from_single_device_arrays(
+                    tuple(out_shape), sharding, arrays)
+                # Complete the transfer while the source numpy is still
+                # referenced: XLA:CPU can adopt a large host buffer
+                # zero-copy, and letting it fall out of scope with the
+                # definition event still pending is the other way to reach
+                # the IsConcrete() CHECK.
+                jax.block_until_ready(out)
+                return out
+
         slicer = tuple(slice(o, o + s) for o, s in zip(off, vshape))
         read_host = np.asarray(dset[slicer], dtype=dtype) if dtype \
                     else np.asarray(dset[slicer])
@@ -260,8 +326,12 @@ class _AllgatherBackend:
         if mesh is not None:
             from jax.sharding import NamedSharding, PartitionSpec as P
             spec = partition_spec if partition_spec is not None else P()
-            return jax.device_put(host, NamedSharding(mesh, spec))
-        return jnp.asarray(host)
+            out = jax.device_put(host, NamedSharding(mesh, spec))
+        else:
+            out = jnp.asarray(host)
+        # See the note above — keep ``host`` alive until the transfer lands.
+        jax.block_until_ready(out)
+        return out
 
     # ------------------------------------------------------------------
     def close(self) -> None:

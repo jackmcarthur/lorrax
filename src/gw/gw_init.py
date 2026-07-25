@@ -601,6 +601,7 @@ def prepare_isdf_and_wavefunctions(
 			# band_chunk / chunk_r / q_chunk / gflat_chunk_size, the rank
 			# floor P_min, and the binding-stage report.
 			from gw.gflat_memory_model import plan_gflat_chunks
+			from gw.gw_config import SlabIOBackend
 			mem = cfg.memory
 			nb_total = ((band_slices.b3 - band_slices.b0)
 			            + (band_slices.b4 - band_slices.b1))
@@ -622,6 +623,13 @@ def prepare_isdf_and_wavefunctions(
 				                     if mem.band_chunk_size > 0 else None),
 				gflat_chunk_size_override=(int(mem.gflat_chunk_size)
 				                           if mem.gflat_chunk_size > 0 else None),
+				# Stage F (restart-tensor write) is UNSHARDED on the
+				# allgather backend — ``_slab_io_allgather._to_host``
+				# process_allgathers the whole (n_q, μ, μ) tensor onto every
+				# rank.  The parallel-HDF5 backends write per-rank hyperslabs
+				# and cost the sharded amount instead.
+				slab_io_replicates=(
+					cfg.backend.slab_io == SlabIOBackend.H5PY_ALLGATHER),
 			)
 			if jax.process_index() == 0:
 				print0("")

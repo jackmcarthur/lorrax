@@ -248,6 +248,7 @@ def plan_gflat_chunks(
     use_ibz_T: bool = False,
     n_q_ibz: int | None = None,
     pair_density_slots: int | None = None,
+    slab_io_replicates: bool = True,
 ) -> GFlatChunkPlan:
     """Pick ``(band_chunk, r_chunk, q_chunk, gflat_chunk_size)`` so the
     per-rank HWM lands under ``util·budget``.  Reports the rank floor
@@ -376,12 +377,27 @@ def plan_gflat_chunks(
            + _c128(mu, ngkmax, shard=p_x)               # ζ resharded on 'x'
            + _c128(mu, ngkmax, shard=p_y))              # ζ resharded on 'y'
 
+    # Stage F — the restart-tensor WRITE (isdf_tensors_<n_rmu>.h5).
+    # On the H5PY_ALLGATHER SlabIO backend (the CPU default whenever the venv
+    # lacks mpi4py + h5py-parallel, which is the case on Frontera today)
+    # ``_slab_io_allgather._to_host`` process_allgathers the WHOLE tensor onto
+    # EVERY rank and then copies it to host numpy — so V_qmunu / W0_qmunu land
+    # UNSHARDED, twice.  Nothing in stages A-E models an I/O-seam replication,
+    # which is why the planner reported a 6.70 GB HWM for a run that died past
+    # ζ-fit.  Scales as μ², so it is the next wall after Stage C:
+    #   μ=276  -> 0.47 GB    μ=2412 -> 27 GB    μ=10k  -> 460 GB.
+    # ``slab_io_replicates=False`` (PHDF5_FFI / PHDF5_HOST: each rank writes
+    # its own hyperslab) drops it to the sharded cost.
+    _v_tensor = _c128(n_q_ibz, mu, mu, shard=1 if slab_io_replicates else p_xy)
+    F_t = 2.0 * _v_tensor if slab_io_replicates else _v_tensor
+
     peaks = {
         "A_centroid_load": persistent_total + A_t,
         "B_cct_chol":      persistent_total + B_t,
         "C_fit_one_rchunk": persistent_total + C_t,
         "D_accumulate":    persistent_total + D_t,
         "E_v_q":           E_base + E_t,
+        "F_tensor_write":  E_base + F_t,
     }
     bottleneck = max(peaks, key=peaks.get)
     hwm = peaks[bottleneck]
