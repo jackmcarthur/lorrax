@@ -22,6 +22,18 @@ import argparse
 import time
 
 import h5py
+
+# Canonical JAX GPU/CPU bootstrap (see runtime.__init__, bse.bse_jax):
+# set_default_env() (JAX_ENABLE_X64 + JAX_PLATFORMS='cuda,cpu') MUST run BEFORE
+# `import jax`; init_jax_distributed() sets up the SLURM one-proc-per-GPU device
+# set; fallback_to_cpu_if_no_gpu_backend() downgrades to CPU when no GPU backend
+# is present.  All idempotent / no-ops in single-process runs.
+from runtime import set_default_env
+set_default_env()
+from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
+init_jax_distributed()
+fallback_to_cpu_if_no_gpu_backend()
+
 import jax
 import jax.experimental.multihost_utils as mhu
 import jax.numpy as jnp

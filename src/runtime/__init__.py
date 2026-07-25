@@ -211,20 +211,65 @@ def nccl_warmup(mesh_xy) -> None:
         _ = jax.jit(jnp.sum)(x).block_until_ready()
 
 
-def fallback_to_cpu_if_no_gpu_backend() -> None:
-    """If ``jax.devices()`` throws 'Unknown backend: gpu', retry on CPU.
+def _gpu_is_present() -> bool:
+    """True if an NVIDIA GPU is actually visible to this process.
 
-    Happens in sandbox / test contexts without a CUDA runtime.  We
-    clear JAX_PLATFORM_NAME and force JAX_PLATFORMS=cpu, then let the
-    caller's next ``jax.devices()`` succeed.  Real failures
-    (initialisation errors, driver issues, etc.) are re-raised.
+    Used to decide whether a JAX GPU-backend init failure is a benign
+    "no GPU here, run on CPU" (login/CPU node) or a genuine GPU-init
+    failure that must NOT be masked (GPU node with a driver/library
+    problem).  Signals, cheapest first:
+
+      * ``CUDA_VISIBLE_DEVICES=""`` → explicitly masked, no GPU.
+      * any ``/dev/nvidia[0-9]*`` device node (or ``/dev/nvidiactl``) →
+        a GPU is physically present on this node.
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd is not None and cvd.strip() == "":
+        return False
+    import glob
+    return bool(glob.glob("/dev/nvidia[0-9]*")) or os.path.exists("/dev/nvidiactl")
+
+
+def fallback_to_cpu_if_no_gpu_backend() -> None:
+    """If ``jax.devices()`` fails because no GPU backend came up, retry on CPU.
+
+    Two failure strings count as "no GPU backend":
+
+      * ``Unknown backend: 'gpu'``            — JAX_PLATFORMS unset / 'gpu'
+        with no CUDA runtime (sandbox / test contexts).
+      * ``Unable to initialize backend 'cuda'`` (and the 'gpu'/'rocm'
+        variants) — what JAX raises when ``JAX_PLATFORMS='cuda,cpu'`` (the
+        value ``set_default_env()`` sets) is tried on a CPU node.
+
+    We downgrade to CPU ONLY when no GPU is actually present
+    (:func:`_gpu_is_present`): on a real GPU node a cuda-init failure is a
+    genuine error and is re-raised rather than silently masked by a
+    catastrophically-slow CPU run.  On downgrade we clear JAX_PLATFORM_NAME,
+    force JAX_PLATFORMS=cpu, and drop any cached (failed) backend so the
+    caller's next ``jax.devices()`` re-initialises cleanly on CPU.
     """
     import jax
+    caught = None
     try:
         jax.devices()
+        return
     except RuntimeError as exc:
-        if "Unknown backend: 'gpu'" in str(exc):
-            os.environ.pop("JAX_PLATFORM_NAME", None)
-            os.environ["JAX_PLATFORMS"] = "cpu"
-        else:
-            raise
+        caught = exc            # bind to a name the except block won't delete
+        msg = str(exc)
+    no_gpu_backend = (
+        "Unknown backend: 'gpu'" in msg
+        or "Unable to initialize backend 'cuda'" in msg
+        or "Unable to initialize backend 'gpu'" in msg
+        or "Unable to initialize backend 'rocm'" in msg)
+    if not (no_gpu_backend and not _gpu_is_present()):
+        # Genuine failure (real GPU-init error on a GPU node, or a
+        # non-backend RuntimeError): re-raise the ORIGINAL exception.  A
+        # bare ``raise`` here would throw "No active exception to re-raise"
+        # since the except block has exited.
+        raise caught
+    os.environ.pop("JAX_PLATFORM_NAME", None)
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    try:                       # drop the half-initialised cuda backend cache
+        jax.clear_backends()
+    except Exception:
+        pass

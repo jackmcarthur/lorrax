@@ -1096,7 +1096,12 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> st
                 f"meshes.")
         return 'scalapack_lu'
 
-    return 'cusolvermp_lu' if is_2d else 'lu'
+    # auto: cuSolverMp on true 2D GPU meshes.  cuSOLVERMp is CUDA-only, so
+    # never auto-pick it on a CPU mesh (mirrors the charge resolver's guard) —
+    # fall back to the CPU-safe in-tree per-q solve.
+    if is_2d and not _mesh_is_cpu(mesh_xy):
+        return 'cusolvermp_lu'
+    return 'lu'
 
 
 def _resolve_solver_kind(

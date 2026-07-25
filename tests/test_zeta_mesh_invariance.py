@@ -221,7 +221,12 @@ def _worker_cap() -> int:
         print(json.dumps({"skip": f"only {len(devs)} devices"}))
         return 0
     mesh = Mesh(np.asarray(devs[:4]).reshape(2, 2), ('x', 'y'))
-    res = {"cap_gib": core._REPLICATED_CHOL_MAX_STACK_BYTES / 1024 ** 3}
+    # Above the cap the auto CHOLESKY route resolves to cuSolverMp only on a
+    # true-2D GPU mesh; on a CPU mesh (this worker forces JAX_PLATFORMS=cpu)
+    # cuSolverMp is CUDA-only, so it must fall back to the in-tree sharded
+    # Cholesky.  Report the platform so the parent asserts the right kind.
+    res = {"cap_gib": core._REPLICATED_CHOL_MAX_STACK_BYTES / 1024 ** 3,
+           "mesh_is_cpu": bool(core._mesh_is_cpu(mesh))}
     for tag, nq in (("ibz74", 74), ("fullbz144", 144)):
         for solve in ("rank_truncate", "cholesky"):
             try:
@@ -432,12 +437,19 @@ def test_rank_truncate_refuses_above_the_replication_cap():
     assert default["cap_gib"] == pytest.approx(4.0), \
         f"default replication cap changed: {default['cap_gib']} GiB"
     # Below the cap nothing changes; above it rank_truncate refuses while the
-    # cholesky alternative still resolves to the distributed factor.
+    # cholesky alternative still resolves to the distributed factor.  That
+    # factor is backend-dependent: cuSolverMp on a true-2D GPU mesh, but the
+    # CPU-safe in-tree sharded Cholesky on a CPU mesh (cuSolverMp is CUDA-only).
+    expected_cholesky = ("sharded_cholesky" if default["mesh_is_cpu"]
+                         else "cusolvermp_cholesky")
     for tag in ("ibz74", "fullbz144"):
         assert default[f"{tag}_rank_truncate"].startswith("RAISE:"), (
             f"{tag} above the 4 GiB cap silently downgraded to "
             f"{default[f'{tag}_rank_truncate']!r} instead of raising")
-        assert default[f"{tag}_cholesky"] == "cusolvermp_cholesky"
+        assert default[f"{tag}_cholesky"] == expected_cholesky, (
+            f"{tag} above-cap cholesky resolved to "
+            f"{default[f'{tag}_cholesky']!r}, expected {expected_cholesky!r} "
+            f"(mesh_is_cpu={default['mesh_is_cpu']})")
 
     raised = _run_worker("worker_cap",
                          env_extra={"LORRAX_ZETA_REPLICATE_CAP_GIB": "8"})
