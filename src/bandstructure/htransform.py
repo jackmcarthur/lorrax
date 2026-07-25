@@ -217,9 +217,18 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # (one chunk, no cross terms to lose) and surfaced when the chunk was
     # sized to the ψ box instead.
     n_rtot = meta.fft_grid[0] * meta.fft_grid[1] * meta.fft_grid[2]
+    # Align band_chunk to the mesh band-shard count (p_band = mesh.size): the
+    # loader pads nb to round_up(band_chunk, p_band) regardless, so e.g. 7 real
+    # bands on a 16-way mesh still COSTS 16 -- and pushes 9 zero-pad bands
+    # through every local FFT and the UH@psi GEMM (~2.3x waste) while doubling
+    # the iteration count (and the per-chunk XLA retrace storm).  Rounding up to
+    # a p_band multiple is free (same padded memory) and both removes the waste
+    # and halves the iterations/compiles.  Pure chunking change -> identical G.
+    _p_band = max(1, int(mesh_xy.size))
+    _bc = ((band_chunk_size + _p_band - 1) // _p_band) * _p_band
     band_chunk_ranges = [
-        (b_start + i * band_chunk_size, min(b_start + (i + 1) * band_chunk_size, b_end))
-        for i in range((nb + band_chunk_size - 1) // band_chunk_size)
+        (b_start + i * _bc, min(b_start + (i + 1) * _bc, b_end))
+        for i in range((nb + _bc - 1) // _bc)
     ]
     # r-chunk holds one Q block (rank, nspinor·r_len) plus the ψ tile
     # (nk, band_chunk, nspinor, r_len); size it so both stay inside the budget.
@@ -563,8 +572,12 @@ def load_wfns_and_enk_for_sigma(wfn, sym, nval: int, ncond: int, nband: int):
     return nsigmarange, jnp.asarray(enk_sigma).transpose(1, 0)
 
 
-def setup_wfn_and_sym(wfn_file: str):
-    wfn = WFNReader(wfn_file)
+def setup_wfn_and_sym(wfn_file: str, mesh_xy: Mesh | None = None):
+    # Pass the device mesh so the loader can pick a sharded read backend
+    # (phdf5 FFI on GPU / phdf5_host union read on multi-process CPU),
+    # band-sharding ψ instead of replicating the whole WFN on every rank.
+    # Single-process / no-mesh transparently stays eager.
+    wfn = WFNReader(wfn_file, mesh=mesh_xy)
     sym = symmetry_maps.SymMaps(wfn)
     return wfn, sym
 
@@ -720,8 +733,11 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     def _resolve(path: str) -> str:
         return path if os.path.isabs(path) else os.path.join(input_dir, path)
 
+    # Build the mesh up front so the loader is mesh-aware (sharded read).
+    if mesh_xy is None:
+        mesh_xy = _build_mesh_xy()
     wfn_file = _resolve(params["wfn_file"])
-    wfn, sym = setup_wfn_and_sym(wfn_file)
+    wfn, sym = setup_wfn_and_sym(wfn_file, mesh_xy=mesh_xy)
     centroid_path = _resolve(params.get("centroids_file", "centroids_frac.txt"))
     _, centroid_indices, n_rmu = _shared_load_centroids(centroid_path, tuple(int(x) for x in wfn.fft_grid))
 
@@ -744,8 +760,6 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             except Exception as exc:
                 log_fn(f"EQP override skipped for {os.path.basename(eqp_path)}: {exc}")
 
-    if mesh_xy is None:
-        mesh_xy = _build_mesh_xy()
     band_range = (int(nsigmarange[0]), int(nsigmarange[1]))
     with mesh_xy:
         out = streaming_galerkin_solve(

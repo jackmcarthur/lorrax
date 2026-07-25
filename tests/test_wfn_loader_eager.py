@@ -220,6 +220,53 @@ def test_auto_backend_resolves_to_eager_on_single_process(synth_wfn_path):
 
 
 # ===========================================================================
+#  phdf5_host (CPU host union read + shared on-device unfold) vs eager
+#  bit-equality.  The host read + union + vectorised unfold + G-flat
+#  layout all execute here on a 1x1 CPU mesh (single addressable shard);
+#  the only untested piece is the multi-rank band split, which is the
+#  §5b ``_eager_build_process_local`` idiom (proven separately).
+# ===========================================================================
+def _mesh_1x1():
+    import jax
+    from jax.sharding import Mesh
+    devs = np.asarray(jax.devices()[:1]).reshape(1, 1)
+    return Mesh(devs, ("x", "y"))
+
+
+@pytest.mark.parametrize("bands", [(0, 6), (2, 5)])
+def test_phdf5_host_matches_eager_ibz(synth_wfn_path, bands):
+    """Raw IBZ read parity: phdf5_host host union read == eager h5py read.
+
+    Restricted to ``k='ibz'``.  The tiny synth WFN builds a *degenerate*
+    ``SymMaps`` whose ``sym_mats_k`` is length ``ntran`` rather than the
+    ``2·ntran`` real WFNs carry, which trips an ``unfold_psi`` edge case
+    (``n_sym_spatial = len//2 = 0`` ⇒ every row read as TRS).  So
+    ``full_bz`` unfold parity is covered by the real-symmetry WFNsmall
+    htransform regression, not this fixture.
+    """
+    from jax.sharding import PartitionSpec as P
+    mesh = _mesh_1x1()
+    # ``load(sharding=...)`` takes a PartitionSpec; the loader wraps it in
+    # a NamedSharding against its own mesh.
+    shard = P(None, ("x", "y"), None, None)
+    with WfnLoader(synth_wfn_path, mesh=mesh, backend="eager") as le:
+        ref = np.asarray(le.load(bands=bands, k="ibz", sharding=shard))
+    with WfnLoader(synth_wfn_path, mesh=mesh, backend="phdf5_host") as lh:
+        assert lh.backend == "phdf5_host"
+        got = np.asarray(lh.load(bands=bands, k="ibz", sharding=shard))
+    assert got.shape == ref.shape
+    # Same numpy read + identical layout ⇒ bit-identical.
+    np.testing.assert_allclose(got, ref, rtol=0, atol=0)
+
+
+def test_env_forces_backend(synth_wfn_path, monkeypatch):
+    monkeypatch.setenv("LORRAX_WFN_BACKEND", "phdf5_host")
+    mesh = _mesh_1x1()
+    with WfnLoader(synth_wfn_path, mesh=mesh, backend="auto") as loader:
+        assert loader.backend == "phdf5_host"
+
+
+# ===========================================================================
 #  phdf5 per-rank band clamp (merged from test_wfn_loader_phdf5_clamp.py)
 #  Regression for the 16-GPU CrI3 H5Dread crash: world doesn't divide bands.
 # ===========================================================================

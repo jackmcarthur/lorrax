@@ -118,6 +118,9 @@ def _build_phdf5_clamped_counts(
     return counts.reshape(int(world) * int(n_reads), 4)
 
 
+_PHDF5_HOST_ANNOUNCED = False
+
+
 class WfnLoader:
     # ------------------------------------------------------------------
     # Lifecycle
@@ -127,7 +130,7 @@ class WfnLoader:
         path: str | Path,
         *,
         mesh: Mesh | None = None,
-        backend: Literal["auto", "eager", "phdf5"] = "auto",
+        backend: Literal["auto", "eager", "phdf5", "phdf5_host"] = "auto",
     ) -> None:
         self._path = str(path)
         self._filename = self._path  # legacy WFNReader compat
@@ -135,11 +138,11 @@ class WfnLoader:
 
         if backend == "auto":
             backend = self._auto_pick_backend()
-        if backend not in ("eager", "phdf5"):
+        if backend not in ("eager", "phdf5", "phdf5_host"):
             raise ValueError(f"unknown backend {backend!r}")
-        if backend == "phdf5" and mesh is None:
+        if backend in ("phdf5", "phdf5_host") and mesh is None:
             raise ValueError(
-                "WfnLoader: backend='phdf5' requires a Mesh; pass mesh=...")
+                f"WfnLoader: backend={backend!r} requires a Mesh; pass mesh=...")
         self.backend = backend
 
         self._file = h5.File(self._path, "r")
@@ -182,7 +185,8 @@ class WfnLoader:
         # tightest).  ``_gvecs_raw`` (ngktot,3) + ``_kpt_starts`` are cheap
         # index metadata both backends use — keep those eager.
         self._coeffs_ds = (
-            self._file["wfns/coeffs"] if self.backend == "eager" else None)
+            self._file["wfns/coeffs"]
+            if self.backend in ("eager", "phdf5_host") else None)
         self._gvecs_raw = self._file["wfns/gvecs"][:]     # (ngktot, 3) int
         # kpt_starts = cumulative (exclusive prefix) sum of ngk.
         self._kpt_starts = kpt_starts(self.ngk)
@@ -240,17 +244,37 @@ class WfnLoader:
         """Pick the lightest backend that works.
 
         Rules:
+          * ``LORRAX_WFN_BACKEND`` env set → honour it verbatim (escape
+            hatch for A/B testing / forcing eager).
           * Mesh missing → eager (single-device / laptop / pytest).
-          * Single-process JAX → eager (no benefit from collective FFI).
-          * Multi-process JAX + mesh provided + CUDA FFI .so loadable →
-            phdf5.  The probe must pin the CUDA library: the phdf5 FFI
-            lives only there, and a bare get_lib() on a CPU backend would
-            "succeed" by loading the slate-only host library and then
-            crash at the first open_file.
-          * Anything else → eager.
+          * Single-process JAX → eager (no benefit from a collective /
+            union read).
+          * Multi-process JAX + mesh + CUDA FFI .so loadable → phdf5
+            (collective MPI-IO read on GPU).  The probe must pin the CUDA
+            library: the phdf5 FFI lives only there, and a bare get_lib()
+            on a CPU backend would "succeed" by loading the slate-only
+            host library and then crash at the first open_file.
+          * Multi-process JAX + mesh, no CUDA → phdf5_host (host h5py
+            union read + the SAME on-device vectorised unfold kernel as
+            phdf5).  This replaces the eager per-k/per-chunk numpy unfold
+            — which re-lowers XLA on every band chunk (the ~2200-compile
+            storm) — with one shape-cached shard_map that compiles once.
+            Mathematically identical to eager (both single-source the
+            symmetry algebra through ``unfold_psi``'s primitives).
         """
+        import os
+        # A mesh-less loader can only run eager — there is no device mesh
+        # to express a sharded read against.  This dominates the env
+        # override: forcing a sharded backend onto a metadata-only,
+        # mesh-less loader (htransform builds one before its mesh exists)
+        # must not raise.
         if self._mesh is None:
             return "eager"
+        forced = os.environ.get("LORRAX_WFN_BACKEND", "").strip().lower()
+        if forced == "eager":
+            return "eager"
+        if forced in ("phdf5", "phdf5_host"):
+            return forced           # mesh present (checked above) → viable
         try:
             if int(jax.process_count()) <= 1:
                 return "eager"
@@ -262,7 +286,9 @@ class WfnLoader:
             from ffi.phdf5 import open_file as _of  # noqa: F401
             return "phdf5"
         except Exception:
-            return "eager"
+            pass
+        # Multi-process CPU: the zero-build host union-read path.
+        return "phdf5_host"
 
     # ------------------------------------------------------------------
     # k-set resolution
@@ -537,7 +563,11 @@ class WfnLoader:
         if self._phdf5_static_dev is not None:
             return self._phdf5_static_dev
 
-        from ffi.phdf5 import open_file
+        # ``open_file`` is the CUDA FFI entry point; import it lazily and
+        # only when the FFI backend actually needs a collective context
+        # (``phdf5_host`` reuses the plain h5py handle instead).
+        if self.backend == "phdf5":
+            from ffi.phdf5 import open_file
 
         sym = self._ensure_sym()
         nk_full = int(sym.nk_tot)
@@ -582,8 +612,10 @@ class WfnLoader:
             if ph is not None:
                 phase[nk, :ngk_k] = ph
 
-        # Open the phdf5 collective context lazily.
-        if self._phdf5_ctx is None:
+        # Open the phdf5 collective context lazily.  Only the FFI backend
+        # needs it; ``phdf5_host`` reuses the plain h5py handle and must
+        # not touch the CUDA FFI (which would fail to load on a CPU node).
+        if self.backend == "phdf5" and self._phdf5_ctx is None:
             self._phdf5_ctx = open_file(self._path, mesh=self._mesh, mode="r")
 
         # Device-stage the static tables once.  Sharding choice mirrors
@@ -706,14 +738,13 @@ class WfnLoader:
                 f"_phdf5_build: b_lo={b_lo_logical} >= mnband={mnband_file}; "
                 "entire band window past file extent")
 
-        rep1 = NamedSharding(self._mesh, P(None))
         rep2 = NamedSharding(self._mesh, P(None, None))
         counts_sharding = NamedSharding(self._mesh, P(("x", "y"), None))
         # Numpy → replicated/sharded device_put; bare numpy skips the
         # single-device staging that triggers an all-reduce broadcast.
+        # (``position_in_reads`` is staged inside _phdf5_unfold_and_shard.)
         offsets_dev = jax.device_put(offsets, rep2)
         counts_dev = jax.device_put(counts_global, counts_sharding)
-        position_in_reads_dev = jax.device_put(position_in_reads, rep1)
 
         reader = read_kchunk_union_sharded(
             ctx, "wfns/coeffs",
@@ -731,10 +762,30 @@ class WfnLoader:
         # (bands_per_rank, ns, n_reads, ngkmax, 2) f64 sharded
         # P(('x','y'), None, None, None, None).
 
-        # On-device unfold + transpose to WfnLoader's G-flat layout.
+        return self._phdf5_unfold_and_shard(
+            cnk_at_ibz, k_idxs=k_idxs, unfold=unfold, n_reads=n_reads,
+            n_k=n_k, bands_per_rank=bands_per_rank, ns=ns, ngkmax=ngkmax,
+            position_in_reads=position_in_reads, out_sharding=out_sharding)
+
+    def _phdf5_unfold_and_shard(
+        self, cnk_at_ibz, *, k_idxs, unfold, n_reads, n_k, bands_per_rank,
+        ns, ngkmax, position_in_reads, out_sharding,
+    ) -> jax.Array:
+        """Shared tail of both phdf5 read paths: on-device symmetry unfold
+        (+ transpose to WfnLoader's G-flat layout) of the union buffer
+        ``cnk_at_ibz`` ``(bands_per_rank, ns, n_reads, ngkmax, 2)`` sharded
+        ``P(('x','y'), None, None, None, None)``.
+
+        Single-sourced so the FFI (``_phdf5_build``) and host
+        (``_phdf5_host_build``) reads cannot drift in the unfold step.
+        """
+        static = self._ensure_phdf5_static()
         unfold_jit = _phdf5_unfold_kernel(
             self._mesh, n_reads=n_reads, n_k=n_k, bands_per_rank=bands_per_rank,
             nspinor=ns, ngkmax=ngkmax, unfold=unfold)
+        rep1 = NamedSharding(self._mesh, P(None))
+        position_in_reads_dev = jax.device_put(
+            np.asarray(position_in_reads, dtype=np.int32), rep1)
 
         if unfold:
             U_k = jnp.take(static["U_per_full"],
@@ -751,6 +802,121 @@ class WfnLoader:
         # psi shape after the kernel: (n_k, nb_padded, ns, ngkmax) c128
         # with band-axis sharding propagated from the read.
         return jax.lax.with_sharding_constraint(psi, out_sharding)
+
+    def _phdf5_host_build(
+        self,
+        *,
+        b_lo: int,
+        b_hi: int,
+        k_idxs: np.ndarray,
+        unfold: bool,
+        nb_padded: int,
+        out_sharding: NamedSharding,
+    ) -> jax.Array:
+        """(CPU) Host h5py union read + on-device unfold → G-flat ψ.
+
+        Zero-FFI twin of :meth:`_phdf5_build`.  Produces the *same*
+        ``cnk_at_ibz`` union buffer — per-rank
+        ``(bands_per_rank, ns, n_reads, ngkmax, 2)`` f64 sharded
+        ``P(('x','y'), None, None, None, None)`` — but each rank reads its
+        own contiguous band block with the plain h5py handle (independent
+        read-only POSIX hyperslabs of a *disjoint* band block; no MPI-IO,
+        no CUDA), then feeds the identical
+        :meth:`_phdf5_unfold_and_shard` kernel.
+
+        The unfold shard_map is ``lru_cache``d on its shape signature, so
+        it compiles **once** across the whole band sweep — this is the
+        fix for the eager path's per-k/per-chunk numpy-unfold compile
+        storm.  Output: ``(n_k, nb_padded, nspinor, ngkmax)`` c128.
+        """
+        from ._slab_io_mpi_host import _local_shard_and_global_offset
+
+        static = self._ensure_phdf5_static()
+        p_x = int(self._mesh.shape["x"])
+        p_y = int(self._mesh.shape["y"])
+        world = p_x * p_y
+        ns = int(self.nspinor)
+        ngkmax = int(self.ngkmax)
+        nb = int(nb_padded)
+        if nb % world:
+            raise ValueError(
+                f"_phdf5_host_build: nb_padded={nb} not divisible by "
+                f"world={world}; loader bug — _default_sharding should pad.")
+        bands_per_rank = nb // world
+        mnband_file = int(self.nbands)
+        b_lo = int(b_lo)
+        b_hi = int(b_hi)
+
+        # One-time banner so run logs unambiguously show the host union
+        # read is active (rules out a silent fallback to eager).
+        global _PHDF5_HOST_ANNOUNCED
+        if not _PHDF5_HOST_ANNOUNCED:
+            _PHDF5_HOST_ANNOUNCED = True
+            try:
+                if int(jax.process_index()) == 0:
+                    print(f"[WfnLoader] backend=phdf5_host active "
+                          f"(world={world}, bands_per_rank={bands_per_rank}, "
+                          f"ngkmax={ngkmax})", flush=True)
+            except Exception:
+                pass
+
+        # --- k-plan (identical bookkeeping to _phdf5_build) ---
+        if unfold:
+            ibz_per_full = np.asarray(static["ibz_per_full"])
+            ibz_per_k = ibz_per_full[np.asarray(k_idxs, dtype=np.int32)]
+        else:
+            ibz_per_k = np.asarray(k_idxs, dtype=np.int32)
+        ibz_unique_sorted = np.unique(ibz_per_k).astype(np.int32)
+        n_reads = int(ibz_unique_sorted.size)
+        position_in_reads = np.searchsorted(
+            ibz_unique_sorted, ibz_per_k).astype(np.int32)
+        n_k = int(len(k_idxs))
+
+        # --- learn THIS rank's band block via the §5b sharded-zero proto ---
+        # (cached factory → compiles once, no per-chunk lambda re-lower).
+        read_spec = NamedSharding(
+            self._mesh, P(("x", "y"), None, None, None, None))
+        global_read_shape = (nb, ns, n_reads, ngkmax, 2)
+        proto = _sharded_zero_proto_fn(
+            global_read_shape, jnp.float64, read_spec)()
+        local_zero, offset = _local_shard_and_global_offset(proto)
+        local_shape = tuple(int(x) for x in local_zero.shape)
+        del proto, local_zero
+        # Only the band axis (0) may be sharded; the rest must be replicated
+        # so a stray non-band spec fails loud rather than silently wrong.
+        if tuple(int(o) for o in offset[1:]) != (0, 0, 0, 0) or \
+                local_shape != (bands_per_rank, ns, n_reads, ngkmax, 2):
+            raise ValueError(
+                "_phdf5_host_build expects band-axis-only sharding "
+                f"P(('x','y'),None,None,None,None); got offset={offset} "
+                f"local_shape={local_shape} for global {global_read_shape}.")
+        band_off = int(offset[0])   # 0..nb, in padded band coords
+
+        # --- host union read: fill this rank's (bpr, ns, n_reads, ngk, 2) ---
+        local = np.zeros(
+            (bands_per_rank, ns, n_reads, ngkmax, 2), dtype=np.float64)
+        # File band rows for this rank's block, clamped so pad bands (past
+        # the logical window b_hi) and past-EOF bands (past mnband) stay
+        # zero — matching the eager backend's zero-fill contract.
+        fb_lo = b_lo + band_off
+        fb_hi = min(fb_lo + bands_per_rank, b_hi, mnband_file)
+        n_real = max(0, fb_hi - fb_lo)
+        if n_real > 0:
+            for r, ibz in enumerate(ibz_unique_sorted):
+                start = int(self._kpt_starts[int(ibz)])
+                ngk = int(self.ngk[int(ibz)])
+                # (n_real, ns, ngk, 2) read-only hyperslab.
+                raw = self._coeffs_ds[fb_lo:fb_hi, :, start:start + ngk, :]
+                local[:n_real, :, r, :ngk, :] = raw
+
+        local_arr = jax.device_put(local, jax.local_devices()[0])
+        cnk_at_ibz = jax.make_array_from_single_device_arrays(
+            global_read_shape, read_spec, [local_arr])
+
+        return self._phdf5_unfold_and_shard(
+            cnk_at_ibz, k_idxs=k_idxs, unfold=unfold, n_reads=n_reads,
+            n_k=n_k, bands_per_rank=bands_per_rank, ns=ns, ngkmax=ngkmax,
+            position_in_reads=position_in_reads, out_sharding=out_sharding)
 
     # ------------------------------------------------------------------
     def load(
@@ -823,6 +989,21 @@ class WfnLoader:
                 # same string set.
                 pass  # NamedSharding doesn't care about exact dim sizes
             psi = self._phdf5_build(
+                b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
+                nb_padded=nb_padded, out_sharding=named_sharding)
+            if bispinor:
+                psi = self._apply_bispinor_lift(
+                    psi, k=k, k_idxs=k_idxs, unfold=unfold,
+                    sharding=named_sharding)
+            return psi
+
+        if self.backend == "phdf5_host" and named_sharding is not None:
+            # Host union read + shared on-device unfold.  The output is
+            # inherently band-sharded (the unfold's out_specs is
+            # P(None,('x','y'),None,None)); a replicated request
+            # (named_sharding is None, rare test path) falls through to
+            # the eager builders below instead.
+            psi = self._phdf5_host_build(
                 b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
                 nb_padded=nb_padded, out_sharding=named_sharding)
             if bispinor:
@@ -1113,6 +1294,25 @@ def _bispinor_lift_kernel(
     bvec : (3, 3)            float64
     """
     return _get_bispinor_lift_jit(sharding)(psi_2, gvecs, kvecs, bvec)
+
+
+# ---------------------------------------------------------------------------
+# Sharded-zero proto factory (module-level so the JIT cache survives
+# across ``load()`` calls; used by the host union read to learn which
+# band block THIS rank owns without re-lowering a fresh lambda per call)
+# ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=None)
+def _sharded_zero_proto_fn(global_shape: tuple, dtype, sharding):
+    """A cached jitted ``() -> zeros(global_shape) @ sharding``.
+
+    Keyed by (shape, dtype, sharding) so it compiles exactly once per
+    signature.  Each device materialises only its own zero shard — no
+    full host/device allocation — and JAX's ``.addressable_shards`` then
+    reports the local slab's global offset, which is how the host read
+    discovers its band block for ``make_array_from_single_device_arrays``.
+    """
+    return jax.jit(lambda: jnp.zeros(global_shape, dtype=dtype),
+                   out_shardings=sharding)
 
 
 # ---------------------------------------------------------------------------
