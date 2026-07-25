@@ -136,11 +136,36 @@ def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
     return _c128(bc, ns, n_rtot, shard=p_xy) * _FFT_CUFFT_FACTOR
 
 
-def _stage_C_slope(*, nk, ns, nq, mu, slots, p_xy) -> float:
+#: Concurrent copies of the band-all_gathered FULL-r ψ(r) slab that XLA
+#: keeps live inside ``z_q_from_psi_sm``'s scan body.  ONE is unavoidable
+#: (the ``lax.all_gather`` output); the historical second came from the
+#: ``jnp.take`` band-compaction, now elided at trace time whenever the
+#: permutation is the identity (``isdf/core.py`` ``_y_compact_identity``).
+#: Kept at 2 because the elision is config-dependent (a short final band
+#: chunk re-enables the take) and an under-estimate here is a hard OOM.
+_GATHERED_PSI_SLOTS = 2
+
+
+def _stage_C_slope(*, nk, ns, nq, mu, slots, p_xy, band_chunk) -> float:
     """Per-``cr`` bytes of the Stage-C transient (the binder): the
-    ``slots`` concurrent pair-density accumulators + the Z_q output."""
+    ``slots`` concurrent pair-density accumulators, the Z_q output, and the
+    band-all_gathered ψ(r) slab.
+
+    THE ψ(r) SLAB HAS NO ``/P``.  ``z_q_from_psi_sm`` computes each rank's
+    1/P band block over the FULL r-chunk, then ``lax.all_gather``s the band
+    axis over ('x','y') so every rank holds ``(nk, band_chunk, ns, cr)``
+    before it slices its own r_loc (isdf/core.py — the "r-slab strategy"
+    comment: the r-slice MUST follow the gather for band/r coherence).
+    That object is replicated in bands AND full in r, so it is the only
+    Stage-C term that does not shrink with the mesh — and at MoS2 12×12
+    (nk=144, band_chunk=160, ns=2, cr=n_rtot=174960) it is 129 GB/rank per
+    copy, i.e. 9.4× everything else in this slope combined.  Omitting it is
+    what let the planner choose r_chunk = n_rtot and ask XLA for a single
+    271 GB allocation (job 7874236 RESOURCE_EXHAUSTED)."""
     return (slots * _c128(nk, ns, ns, mu, shard=p_xy)   # pair carry
-            + _c128(nq, mu, shard=p_xy))                # Z_q / zeta_out
+            + _c128(nq, mu, shard=p_xy)                 # Z_q / zeta_out
+            # band-gathered FULL-r ψ(r) slab — UNSHARDED (see above)
+            + _GATHERED_PSI_SLOTS * _c128(nk, band_chunk, ns))
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +322,10 @@ def plan_gflat_chunks(
                                mesh_xy=mesh_xy, p_xy=p_xy)
 
     # ---- Phase 2: dial chunk_r against Stage C's slope ------------------
-    C_slope = _stage_C_slope(nk=nk, ns=ns, nq=nq, mu=mu, slots=slots, p_xy=p_xy)
+    # ``band_chunk`` is resolved above — Stage C's ψ(r) slab is sized by it
+    # (the gathered band axis), so the two knobs are coupled.
+    C_slope = _stage_C_slope(nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
+                             p_xy=p_xy, band_chunk=band_chunk)
     headroom_C = max(target - persistent_total, 0.0)
     r_lo = min(mu, n_rtot)                      # performance floor (§3)
     if r_chunk_override and r_chunk_override > 0:

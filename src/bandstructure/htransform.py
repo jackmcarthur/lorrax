@@ -884,28 +884,43 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
 
     R_grid = jnp.asarray(build_R_grid_np(kgrid))
 
-    # ── Kpath-batch processing — Regime A ────────────────────────────────
-    # Replicate fH_R upfront (~240 MB at our scale), so each batch's compute
-    # is fully local and the only collective in the kpath section is the
-    # one-shot upfront all-gather. Per-batch eigvalsh runs ndev-parallel via
-    # batch-axis sharding. Production-scale Regime B (distributed eigh per
-    # batch element) is the same code with a different out_sharding + FFI
-    # swap and no upfront fH_R replication.
-    fH_R_rep = jax.device_put(fH_R, rep)
+    # ── Kpath-batch processing ───────────────────────────────────────────
+    # fH_R stays SHARDED P(None, 'x', 'y'): the (rank, rank) face is split
+    # across the mesh, the lattice-R axis is not.  The q-Fourier sum contracts
+    # ONLY over R, so every device builds its own (i, j) tile with NO
+    # communication; the single collective is the reshard onto the q axis just
+    # before the eigvalsh, after which each device owns whole (rank, rank)
+    # matrices for its own q-rows and the eigvalsh runs ndev-parallel.
+    #
+    # It used to be ``fH_R_rep = jax.device_put(fH_R, rep)``.  That is
+    # nk · rank² · 16 B on EVERY device (MoS2 12×12: ~51 GB/rank at rank 4716,
+    # and it is the term that breaks a 90 GB rank envelope at n_μ ≈ 3.1k) and,
+    # because the source is sharded, JAX routes it through ``x._value`` — a
+    # host gather of the same size per process.  Identical de-replication to
+    # ``bandstructure/bse_setup.py::_fourier`` (see its lines 166-178 / 247-259
+    # for the measured OOM this removes); the arithmetic is unchanged.
 
     # Sharding specs for batched (bs, rank, rank) → (bs, rank) eigvalsh.
     batch_mat_shard = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
     batch_eig_shard = NamedSharding(mesh_xy, P(('x', 'y'), None))
+    face_ij_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
     @partial(jax.jit, out_shardings=batch_eig_shard)
-    def _kpath_batch(batch_k, fH_R_rep, S_chol):
-        # batch_k: (bs, 3) replicated; fH_R_rep: (nk, rank, rank) replicated;
-        # S_chol: (rank, rank) replicated. All inputs replicated → einsum
-        # is local, only the final reshard for eigvalsh is collective.
+    def _kpath_batch(batch_k, fH_R, S_chol):
+        # batch_k: (bs, 3) replicated; fH_R: (nk, rank, rank) at P(None,'x','y');
+        # S_chol: (rank, rank) replicated.  The einsum contracts over the
+        # (replicated) R axis only → local on each (i, j) tile.
         phase = jnp.exp(-2j * jnp.pi * (batch_k @ R_grid.T))           # (bs, nk)
-        mat = 0.5 * jnp.einsum('bk,kij->bij', phase, fH_R_rep)         # (bs, rank, rank)
-        mat = mat + jnp.swapaxes(mat, 1, 2).conj()
+        mat = 0.5 * jnp.einsum('bk,kij->bij', phase, fH_R)             # (bs, rank, rank)
+        # Pin the contraction OUTPUT to the (i, j) layout: left free, XLA
+        # materialises the whole (bs, rank, rank) batch on every device before
+        # the reshard below (bs·rank²·16 = 11.4 GiB/device at bs=32/rank 4716).
+        mat = jax.lax.with_sharding_constraint(mat, face_ij_shard)
+        # Reshard (i,j)→q FIRST, then hermitize: on the q-sharded layout each
+        # device owns whole matrices, so the transpose is local.  The other
+        # order costs a second all-to-all for ``swapaxes``.
         mat = jax.lax.with_sharding_constraint(mat, batch_mat_shard)
+        mat = mat + jnp.swapaxes(mat, 1, 2).conj()
 
         def _solve_one(m):
             y = jsp_linalg.solve_triangular(S_chol, m, lower=True)
@@ -914,16 +929,20 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
 
         return jax.vmap(_solve_one)(mat)
 
-    # Round-trip diagnostic at Γ — single-batch via einsum (replicated input).
+    # Round-trip diagnostic at Γ — single q, kept (i, j)-sharded (never whole
+    # on any device: rank²·16/ndev instead of rank²·16).
     q0 = jnp.zeros((1, 3), dtype=jnp.float64)
+    face_one_shard = NamedSharding(mesh_xy, P('x', 'y'))
 
     @jax.jit
-    def _gamma_rt(fH_R_rep):
+    def _gamma_rt(fH_R):
         phase0 = jnp.exp(-2j * jnp.pi * (q0 @ R_grid.T))
-        m = 0.5 * jnp.einsum('bk,kij->bij', phase0, fH_R_rep)
-        return (m + jnp.swapaxes(m, 1, 2).conj())[0]
+        m = 0.5 * jnp.einsum('bk,kij->bij', phase0, fH_R)
+        m = jax.lax.with_sharding_constraint(m, face_ij_shard)
+        m = (m + jnp.swapaxes(m, 1, 2).conj())[0]
+        return jax.lax.with_sharding_constraint(m, face_one_shard)
 
-    fH_gamma_rt = _gamma_rt(fH_R_rep)
+    fH_gamma_rt = _gamma_rt(fH_R)
     diffs = jnp.max(jnp.abs(fH_k - fH_gamma_rt), axis=(1, 2))
     rt_err = float(jnp.min(diffs))
     log_fn(f"FFT Γ round-trip max error: {rt_err:.3e}")
@@ -950,7 +969,7 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         nq_padded = wrapped_k.shape[0]
         lambda_q_list = []
         for i in range(0, nq_padded, batch_size):
-            batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R_rep, S_chol)
+            batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R, S_chol)
             lambda_q_list.append(batch_eigs)
             jax.block_until_ready(batch_eigs)
 

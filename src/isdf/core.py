@@ -518,6 +518,25 @@ def z_q_from_psi_sm(
 			_p = np.arange(bpd_max_global)
 			_y_compact_idx_np[_bc] = np.where(
 				_p < _nb_tot, (_p // _bpd) * bpd_max + (_p % _bpd), _bpd)
+		# STATIC identity check.  When EVERY bc's compaction is the
+		# identity permutation the ``jnp.take`` in the scan body is
+		# mathematically a no-op -- but XLA cannot prove that from a
+		# traced index array, so it materialises a SECOND copy of the
+		# band-gathered FULL-r psi(r) slab:
+		#     nk * bpd_max_global * ns * n_zchunk * 16 bytes
+		# with NO mesh division on either axis (129 GB/rank at MoS2
+		# 12x12, 160-band window, r_chunk = n_rtot = 174960 -- half of
+		# the 271 GB single allocation that OOM'd job 7874236).
+		# Eliding it is BIT-EXACT (take with an identity index is the
+		# identity) and halves the Stage-C arena.  An all-pad bc leaves
+		# its row at zeros (not identity) and correctly disables it.
+		_y_compact_identity = bool(
+			n_bc > 0
+			and np.array_equal(
+				_y_compact_idx_np,
+				np.broadcast_to(
+					np.arange(bpd_max_global, dtype=np.int32),
+					(n_bc, bpd_max_global))))
 		# Per-bc tables.  Built as np arrays here (NOT jnp.asarray) so
 		# they enter the shard_map body via numpy → jnp lift inside the
 		# Manual-mode body.  Closure-captured Auto-sharded jax.Arrays
@@ -612,7 +631,8 @@ def z_q_from_psi_sm(
 			b_hi_global_arr = jnp.asarray(_b_hi_global_np)
 			psi_l_X_bc_offset = jnp.asarray(_psi_l_X_bc_offset_np)
 			psi_r_X_bc_offset = jnp.asarray(_psi_r_X_bc_offset_np)
-			y_compact_idx = jnp.asarray(_y_compact_idx_np)
+			if not _y_compact_identity:
+				y_compact_idx = jnp.asarray(_y_compact_idx_np)
 
 			# Pre-pad psi_l_X_ / psi_r_X_ at the front with front_pad_*
 			# zero bands so the per-bc offset is always non-negative
@@ -693,8 +713,14 @@ def z_q_from_psi_sm(
 				#      global-band axis so the g_axis mask + psi_*_X slice align
 				#      with the gathered Y band axis.  No-op when
 				#      bpd_per_bc == bpd_max (full chunk / P=1).
-				psi_Y_bc_full_r = jnp.take(
-					psi_Y_bc_full_r, y_compact_idx[bc_idx], axis=1)
+				#      ELIDED when the permutation is the identity for every
+				#      bc (``_y_compact_identity``): XLA cannot fold a
+				#      traced-index take, so it would allocate a SECOND full
+				#      band-gathered FULL-r slab (nk * bpd_max_global * ns *
+				#      n_zchunk * 16, unsharded on both axes).
+				if not _y_compact_identity:
+					psi_Y_bc_full_r = jnp.take(
+						psi_Y_bc_full_r, y_compact_idx[bc_idx], axis=1)
 				# (3b) Slice the r-axis to THIS y-rank's r_loc slab.
 				#      MUST happen AFTER gather so the band axis +
 				#      r axis are coherent (each gathered band's r
@@ -907,6 +933,40 @@ def _replicate_charge_ok(nq: int | None, n_rmu: int | None) -> bool:
     return int(nq) * int(n_rmu) ** 2 * 16 <= _REPLICATED_CHOL_MAX_STACK_BYTES
 
 
+def _replicate_rank_truncate_ok(nq: int | None, n_rmu: int | None) -> bool:
+    """True when the rank-truncating charge factor can run replicated.
+
+    DIFFERENT CRITERION from :func:`_replicate_charge_ok`, deliberately.
+    That one gates the *Cholesky* route on the whole ``(nq, μ, μ)`` stack,
+    which is the right question there.  It is the WRONG question for
+    ``rank_truncate``: :func:`factor_c_q_replicated_batched` already splits
+    the q axis at its own ``_REPLICATED_FACTOR_MAX_BATCH_BYTES`` bound, so
+    the replicated transient is ONE q-batch (≤ that bound, plus the eigh's
+    own workspace) and is FLAT IN nq — it does not grow with the stack.
+    Testing the stack made the resolver refuse fits that comfortably fit,
+    e.g. MoS2 12×12 full-BZ (nq=144, μ=2412 → 13.4 GiB stack, but only
+    ~4 GiB replicated at a time), and refusing means losing the §6a
+    rank-truncation physics cure rather than losing memory.
+
+    This can only make the production-default ``rank_truncate`` route
+    REACHABLE where it previously raised; it never changes a route that
+    resolves today, and it does not touch the ``cholesky`` branch at all.
+
+    NOTE (the real μ ceiling on this route): memory is not what breaks
+    here.  The factor is a dense ``eigh`` per q run REDUNDANTLY on every
+    rank — O(nq·μ³) with no P-scaling at all (~5.5 h at μ=4k, ~86 h at
+    μ=10k on 28 cores).  Past ~4k centroids the route needs a genuinely
+    distributed eigh (SLATE/ScaLAPACK via ``ffi.linalg``; cuSOLVERMp is
+    out on a rectangular mesh), not a bigger cap.
+    """
+    if nq is None or n_rmu is None:
+        return False
+    n = int(n_rmu)
+    batch = _replicated_factor_q_chunk(int(nq), n)
+    return batch * n * n * 16 <= max(_REPLICATED_CHOL_MAX_STACK_BYTES,
+                                     _REPLICATED_FACTOR_MAX_BATCH_BYTES)
+
+
 def _resolve_channel_ladder(
     mesh_xy: Mesh,
     override: str,
@@ -1027,6 +1087,13 @@ def _resolve_solver_kind_charge(
             return ('replicated_rank_truncate'
                     if charge_zeta_solve == 'rank_truncate'
                     else 'replicated_cholesky')
+        # Above the (whole-stack) Cholesky cap, rank_truncate gets its own,
+        # correct criterion: the replicated transient is ONE q-batch, not the
+        # stack (see _replicate_rank_truncate_ok).  Strictly widening — this
+        # branch is only reached where the code raised before.
+        if (charge_zeta_solve == 'rank_truncate'
+                and _replicate_rank_truncate_ok(nq, n_rmu)):
+            return 'replicated_rank_truncate'
         if charge_zeta_solve == 'rank_truncate':
             need = (int(nq) * int(n_rmu) ** 2 * 16 / 1024**3
                     if nq and n_rmu else 0.0)
@@ -1187,6 +1254,8 @@ def _factor_c_q_replicated(
     if key not in _replicated_chol_cache:
         _re = ridge_extra
         _rc = rcond
+        _rank_log = (mode == 'rank_truncate' and _os.environ.get(
+            "LORRAX_ZETA_RANK_LOG", "1") not in ("0", "", "false"))
         @partial(jax.jit, out_shardings=out_sh)
         def _fn(C):
             def _ridged_chol(C_log):
@@ -1216,6 +1285,22 @@ def _factor_c_q_replicated(
                 # Double-``where`` keeps rsqrt off the dropped (tiny/≤0) modes.
                 inv_sqrt = jnp.where(
                     keep, jax.lax.rsqrt(jnp.where(keep, lam, 1.0)), 0.0)
+                # OBSERVABILITY: the retained-mode count IS the conditioning
+                # signal for this route — it is what tells you whether n_μ has
+                # over-completed the pair-density rank (κ blow-up) and by how
+                # much.  It lives inside the jit, so print it from there.
+                # ``n_keep`` per q + the spectral span λ_max/λ_min(kept).
+                # Silence with LORRAX_ZETA_RANK_LOG=0.
+                if _rank_log:
+                    lam_keep_min = jnp.min(
+                        jnp.where(keep, lam, jnp.inf), axis=-1)
+                    jax.debug.print(
+                        "[zeta rank_truncate] n_log={n} rcond={rc:.1e} "
+                        "n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn}",
+                        n=n_log, rc=_rc,
+                        k=jnp.sum(keep, axis=-1),
+                        mx=lam_max[..., 0], mn=lam_keep_min,
+                        ordered=False)
                 return V * inv_sqrt[..., None, :].astype(V.dtype)
 
             factor_fn = (_rank_trunc_factor if mode == 'rank_truncate'
