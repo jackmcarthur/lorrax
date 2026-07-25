@@ -831,11 +831,12 @@ class WfnLoader:
                     sharding=named_sharding)
             return psi
 
-        psi_np = self._eager_build(
-            b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
-            nb_padded=nb_padded)
-
         if bispinor:
+            # Bispinor lift path (rarer): full build.  Process-local bispinor
+            # is future work (the lift appends per-band small components).
+            psi_np = self._eager_build(
+                b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
+                nb_padded=nb_padded)
             psi_j = jnp.asarray(psi_np)
             psi_j = self._apply_bispinor_lift(
                 psi_j, k=k, k_idxs=k_idxs, unfold=unfold, sharding=None)
@@ -843,9 +844,86 @@ class WfnLoader:
                 return psi_j
             return jax.device_put(psi_j, named_sharding)
 
+        if named_sharding is not None and int(jax.process_count()) > 1:
+            # (§5b) Build ONLY this process's band shard and assemble via the
+            # slab-io process-local idiom -- no rank materialises the full
+            # (n_k, nb_padded, ns, ngkmax) host array, which grows with
+            # world_size and OOMs past ~16 nodes.  Byte-identical to the full
+            # build + device_put below.
+            return self._eager_build_process_local(
+                b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
+                nb_padded=nb_padded, named_sharding=named_sharding)
+
+        # Single-process / replicated: the full host build is fine (no OOM).
+        psi_np = self._eager_build(
+            b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
+            nb_padded=nb_padded)
         if named_sharding is None:
             return jnp.asarray(psi_np)
         return jax.device_put(psi_np, named_sharding)
+
+    def _eager_build_process_local(
+        self,
+        *,
+        b_lo: int,
+        b_hi: int,
+        k_idxs: np.ndarray,
+        unfold: bool,
+        nb_padded: int,
+        named_sharding: NamedSharding,
+    ) -> jax.Array:
+        """(§5b) Process-local eager load: each rank builds only its band shard.
+
+        Reuses the slab-io helpers verbatim -- ``_local_shard_and_global_offset``
+        to learn THIS rank's band block from a cheap sharded zero proto, and
+        ``jax.make_array_from_single_device_arrays`` to assemble -- so no rank
+        allocates the full (n_k, nb_padded, ns, ngkmax) host array.  The only
+        WFN-specific part is the symmetry unfold, which stays in ``_eager_build``.
+
+        Assumes the BAND axis (1) is the only sharded axis (the centroid-load
+        spec ``P(None, ('x','y'), None, None)``); asserts the rest are
+        replicated so a different spec fails loud rather than silently wrong.
+        """
+        from ._slab_io_mpi_host import _local_shard_and_global_offset
+        ns = int(self.nspinor)
+        ngkmax = int(self.ngkmax)
+        n_k = int(len(k_idxs))
+        nb_logical = int(b_hi) - int(b_lo)
+        global_shape = (n_k, int(nb_padded), ns, ngkmax)
+
+        # Cheap directly-sharded zero proto (each device makes its own zero
+        # shard -- no full host/device allocation), then ask JAX which slab
+        # this rank owns.  Same trick as ``_slab_io_mpi_host.read_slab``.
+        proto = jax.jit(
+            lambda: jnp.zeros(global_shape, dtype=jnp.complex128),
+            out_shardings=named_sharding)()
+        local_zero, offset = _local_shard_and_global_offset(proto)
+        local_shape = tuple(int(x) for x in local_zero.shape)
+        del proto, local_zero
+        if (offset[0], offset[2], offset[3]) != (0, 0, 0) or \
+                local_shape[0] != n_k or local_shape[2] != ns or \
+                local_shape[3] != ngkmax:
+            raise ValueError(
+                "process-local eager load supports only band-axis sharding "
+                f"(P(None, band, None, None)); got offset={offset} "
+                f"local_shape={local_shape} for global {global_shape}.")
+        local_nb = local_shape[1]
+        band_off = int(offset[1])
+
+        # Real bands in this rank's block map to its FRONT [0:n_real); the rest
+        # (pad bands, or blocks entirely past nb_logical) stay zero.
+        real_hi = min(band_off + local_nb, nb_logical)
+        n_real = max(0, real_hi - band_off)
+        if n_real > 0:
+            local_np = self._eager_build(
+                b_lo=int(b_lo) + band_off, b_hi=int(b_lo) + band_off + n_real,
+                k_idxs=k_idxs, unfold=unfold, nb_padded=local_nb)
+        else:
+            local_np = np.zeros(local_shape, dtype=np.complex128)
+
+        local_arr = jax.device_put(local_np, jax.local_devices()[0])
+        return jax.make_array_from_single_device_arrays(
+            global_shape, named_sharding, [local_arr])
 
     # ------------------------------------------------------------------
     # Iterator: band chunks
