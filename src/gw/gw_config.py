@@ -306,6 +306,18 @@ _DEFAULTS = {
     # cusolvermp_lu with values auto|on|off (on → cusolvermp).
     "distributed_cholesky": "auto",
     "distributed_lu":       "auto",
+    #   eigh_backend = auto | off | cusolvermp | slate
+    #       Hermitian eigensolver for the BSE/htransform distributed-eigh
+    #       sites (bse_setup fH_q, vq_interp coarse C_q tiles).  auto|off =
+    #       the q-BATCHED native jnp.linalg.eigh (the measured default at
+    #       every production tile size); cusolvermp|slate spread ONE tile
+    #       over the whole mesh via the distributed-linalg FFI — the wide-
+    #       band-window regime where a single matrix no longer fits on one
+    #       device (square mesh + one process per device required; all
+    #       guards fire at resolve time — see ffi/linalg + docs/dev/
+    #       linalg_ffi.md).  The --eigh-backend CLI flag of htransform /
+    #       exciton_bands OVERRIDES this key.
+    "eigh_backend":         "auto",
     # Charge ζ-fit OPT-IN Tikhonov ridge ε (added ON TOP of the fixed
     # 1e-14·|tr| non-singularity floor, as a fraction of the mean CCT
     # diagonal tr(C)/n): C_q ← C_q + [1e-14·|tr| + ε·|tr|/n]·I before the
@@ -483,6 +495,9 @@ _NORMALIZE_STR = {
     "isdf_memory_mode",
     "ppm_invalid_mode",
     "ppm_model",
+    # distributed-linalg backend axes (consumed both via LorraxConfig and
+    # directly from the params dict by htransform / exciton_bands).
+    "eigh_backend",
 }
 
 
@@ -851,6 +866,7 @@ class BackendConfig:
     screening_solver: ScreeningSolver
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
     distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
+    eigh_backend: str          # "auto" | "off" | "cusolvermp" | "slate"
     zeta_ridge: float          # charge-CCT Tikhonov ridge ε (rel. to tr/n)
     charge_zeta_solve: str     # "rank_truncate" | "cholesky"
     zeta_rcond: float          # rank-truncation cutoff (·λ_max)
@@ -864,7 +880,9 @@ class BackendConfig:
             f"screening_solver={self.screening_solver.value}, "
             f"distributed_cholesky={self.distributed_cholesky}, "
             f"distributed_lu={self.distributed_lu}, "
-            f"charge_zeta_solve={self.charge_zeta_solve}"
+            + (f"eigh_backend={self.eigh_backend}, "
+               if self.eigh_backend != "auto" else "")
+            + f"charge_zeta_solve={self.charge_zeta_solve}"
             + (f"(rcond={self.zeta_rcond:g})"
                if self.charge_zeta_solve == 'rank_truncate' else '')
             + (f", zeta_ridge={self.zeta_ridge:g}"
@@ -1341,6 +1359,14 @@ class LorraxConfig:
                 f"distributed_lu={_dist_lu!r} invalid; expected auto / off "
                 f"/ cusolvermp / scalapack (a SLATE getrf wrapper does not "
                 f"exist yet; scalapack is the host/CPU-backend option).")
+        _eigh_backend = str(_g("eigh_backend")).strip().lower()
+        if _eigh_backend not in ("auto", "off", "cusolvermp", "slate"):
+            raise ValueError(
+                f"eigh_backend={_eigh_backend!r} invalid; expected "
+                f"auto / off / cusolvermp / slate.")
+        # No CPU rewriting for eigh_backend: an explicit FFI request keeps
+        # the fails-loudly semantics — ffi.linalg.resolve_backend rejects
+        # cusolvermp on a CPU mesh (and a slate-less build) at resolve time.
         _charge_zeta_solve = str(_g("charge_zeta_solve")).strip().lower()
         if _charge_zeta_solve not in ("rank_truncate", "cholesky"):
             raise ValueError(
@@ -1435,6 +1461,7 @@ class LorraxConfig:
             screening_solver=_LEGACY_ISDF_MEMORY_MODE[isdf_memory_mode],
             distributed_cholesky=_dist_chol,
             distributed_lu=_dist_lu,
+            eigh_backend=_eigh_backend,
             zeta_ridge=float(_g("zeta_ridge")),
             charge_zeta_solve=_charge_zeta_solve,
             zeta_rcond=float(_g("zeta_rcond")),

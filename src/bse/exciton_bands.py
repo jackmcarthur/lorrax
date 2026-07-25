@@ -324,9 +324,11 @@ def main(argv=None):
                          "4-13%% near-Γ/zone-boundary head error, "
                          "arbitrary_q_bse.md §16.4).  Overrides the cohsex.in "
                          "``head_minibz_average`` key; default (unset) uses it.")
-    ap.add_argument("--eigh-backend", default="auto",
+    ap.add_argument("--eigh-backend", default=None,
                     choices=("auto", "off", "cusolvermp", "slate"),
-                    help="Hermitian eigensolver for BOTH distributed-eigh "
+                    help="OVERRIDES the input-file ``eigh_backend`` key "
+                         "(default: use the key, which defaults to auto).  "
+                         "Hermitian eigensolver for BOTH distributed-eigh "
                          "sites: the coarse exchange tiles C_q (vq_interp) and "
                          "the htransform fH_q (bse_setup).  auto|off = the "
                          "q-BATCHED native path (every device solves its own "
@@ -395,6 +397,11 @@ def main(argv=None):
     from bandstructure.bse_setup import compute_wfns_fi
 
     params = read_lorrax_input(args.input)
+    # Input file is the source of truth; the CLI flag is an override.
+    # (Both distributed-eigh sites below — compute_wfns_fi and
+    # build_vq_evaluator — read this resolved value.)
+    if args.eigh_backend is None:
+        args.eigh_backend = str(params.get("eigh_backend", "auto"))
     if not params.get("kpoints_crystal_b"):
         raise ValueError(f"{args.input} has no K_POINTS crystal_b block — "
                          "the exciton Q path comes from it (same format as "

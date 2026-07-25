@@ -127,7 +127,7 @@ count. Reaching for n_μ=2412 here buys nothing and costs a memory fight.
 ## Memory
 
 The eigh is **not** the constraint, despite appearances. Routing it through the
-distributed FFI (`ffi.common.dispatch.dispatch_eigh`, cuSOLVERMp/SLATE) is
+distributed FFI (`ffi.linalg.dispatch_eigh`, cuSOLVERMp/SLATE) is
 numerically exact (6.19e-11 meV vs native at rank 4452) but **does not change
 the high-water mark** — 15.677713664 GB/device, identical to the byte for both
 backends, because the peak is reached before the eigh runs. It also costs

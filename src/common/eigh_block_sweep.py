@@ -45,7 +45,8 @@ def main() -> int:
         os.environ[_DIST_SENTINEL] = "1"
 
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-    from ffi.cusolvermp import distributed_eigh
+    from ffi.linalg import backend_module
+    distributed_eigh = backend_module("cusolvermp").distributed_eigh
 
     world = jax.process_count()
     p = int(np.sqrt(world))

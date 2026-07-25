@@ -77,7 +77,8 @@ def run_multiprocess(n: int, repeats: int) -> int:
         os.environ[_DIST_SENTINEL] = "1"
 
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-    from ffi.cusolvermp import distributed_eigh
+    from ffi.linalg import backend_module
+    distributed_eigh = backend_module("cusolvermp").distributed_eigh
 
     world = jax.process_count()
     _log(f"\n=== multi-process mode, n={n}, repeats={repeats}, world={world} ===")
@@ -111,7 +112,7 @@ def run_multiprocess(n: int, repeats: int) -> int:
 def run_dispatch(sizes, repeats: int, batch: int, backend: str) -> int:
     """The dispatch question: q-BATCHED native vs ONE distributed tile.
 
-    This is the measurement ``ffi.common.dispatch.dispatch_eigh`` cites for
+    This is the measurement ``ffi.linalg.dispatch_eigh`` cites for
     choosing a backend, and the one ``bandstructure.bse_setup`` faces per q.
     Both arms decompose the SAME kind of matrix — Hermitian complex128,
     ``(n, n)`` — and are reported as **ms per matrix**, the only comparable
@@ -128,7 +129,7 @@ def run_dispatch(sizes, repeats: int, batch: int, backend: str) -> int:
     One JAX process per GPU (the LORRAX process model), square mesh.
     """
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-    from ffi.common.dispatch import dispatch_eigh
+    from ffi.linalg import dispatch_eigh
 
     world = jax.process_count()
     p = int(round(np.sqrt(world)))

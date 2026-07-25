@@ -1069,18 +1069,23 @@ def main(argv=None):
     parser.add_argument("--a-band", type=int, default=None,
                         help="Band index (0-based) whose bandwidth sets 'a'. "
                              "E.g. nval+ncond_keep-1. Default: top band.")
-    parser.add_argument("--eigh-backend", default="auto",
+    parser.add_argument("--eigh-backend", default=None,
                         choices=("auto", "off", "cusolvermp", "slate"),
                         help="Eigensolver for the fH_q eigendecomposition of "
                              "the get_centroids_fi handoff.  auto|off = the "
                              "q-batched native path; cusolvermp|slate spread "
                              "ONE (rank, rank) tile over the mesh via the "
-                             "distributed-linalg FFI (wide band windows).")
+                             "distributed-linalg FFI (wide band windows).  "
+                             "OVERRIDES the input-file ``eigh_backend`` key "
+                             "(default: use the key, which defaults to auto).")
     args = parser.parse_args(argv)
     log = _make_logger(args.verbose)
 
     from gw.gw_init import read_cohsex_input
     params = read_cohsex_input(args.input)
+    # Input file is the source of truth; the CLI flag is an override.
+    eigh_backend = (args.eigh_backend if args.eigh_backend is not None
+                    else str(params.get("eigh_backend", "auto")))
     
     # Override WFN file if provided via CLI
     if args.wfn_file is not None:
@@ -1108,7 +1113,7 @@ def main(argv=None):
                 kgrid_fi=params["kgrid_fi"],
                 band_window_fi=(b_min, b_max),
                 mesh_xy=mesh_xy, a_band_index=args.a_band,
-                eigh_backend=args.eigh_backend, log_fn=log,
+                eigh_backend=eigh_backend, log_fn=log,
             )
         log(f"BSE setup: psi_rmu_Y={wfns_fi.psi_rmu_Y.shape} "
             f"P{wfns_fi.psi_rmu_Y.sharding.spec}, "

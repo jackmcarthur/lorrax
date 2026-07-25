@@ -85,7 +85,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from ffi.common.dispatch import dispatch_eigh
+from ffi.linalg import NATIVE, dispatch_eigh, resolve_backend
 
 # pipeline constants (§13.5 production shape; reference values verbatim)
 ALPHA = 0.30          # Gaussian split width, 1/bohr; broad optimum ~1.5-2x dq
@@ -579,7 +579,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     which keeps the whole stage at ≤2 XLA compiles instead of one per
     distinct sphere size (15 at MoS2 12×12; the ``_clean_split`` census
     finding).  ``eigh_backend='auto'`` resolves to the batched native path —
-    see ``ffi.common.dispatch.dispatch_eigh`` for when the FFI backends win;
+    see ``ffi.linalg.dispatch_eigh`` for when the FFI backends win;
     they are honored per-q if explicitly requested.  n_μ is used at its
     LOGICAL extent here; the jitted evaluator pads on output.
 
@@ -601,6 +601,10 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     nq, n_mu = zx["nq"], zx["n_mu"]
     ngkmax = zx["ngkmax"]
     ndev = int(mesh_xy.devices.size)
+    # Resolve-time backend resolution: platform / compiled-capability /
+    # coverage / geometry guards all fire here, before the q loop (see
+    # ffi.linalg.resolve).  auto|off resolve to the q-batched native path.
+    eigh_resolved = resolve_backend("eigh", eigh_backend, mesh_xy)
     q_chunk = int(min(q_chunk, nq,
                       max(ndev, ndev * (5e9 // (n_mu * ngkmax * 16 * ndev)))))
     assert np.max(np.abs(zx["qfr"][:, 2])) < 1e-12, "slab pipeline needs q_z=0"
@@ -678,14 +682,14 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
 
     for q0 in range(0, nq, q_chunk):
         sl = slice(q0, min(q0 + q_chunk, nq))
-        if eigh_backend in ("auto", "off"):
+        if eigh_resolved == NATIVE:
             lam, R = _eigh_batch(C_herm(sl))
         else:
             # explicit distributed-FFI request: per-q eigh, then the same
             # batched post-eigh pipeline (single source for the math).
             pairs = [dispatch_eigh(jax.device_put(C_herm(slice(q, q + 1))[0],
                                                   grid_xy),
-                                   mesh_xy, eigh_backend)
+                                   mesh_xy, eigh_resolved)
                      for q in range(sl.start, sl.stop)]
             lam = jnp.stack([p[0] for p in pairs])
             R = jnp.stack([p[1] for p in pairs])

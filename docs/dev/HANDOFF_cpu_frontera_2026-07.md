@@ -118,6 +118,11 @@ Measured, not assumed (see `SPEEDUP_SCORECARD.md`):
    by `verify.py`; the multiprocess-worker pytest is slow under shared-alloc
    contention).
 
+The distributed-linalg stack (dispatch, backends, config keys, guards) is now
+unified behind the `ffi.linalg` facade — see `docs/dev/linalg_ffi.md` for the
+architecture, the per-backend constraints, and the sharp edges (square-mesh
+deadlock, the `distributed_cholesky=off` physics warning, replication cap).
+
 ## How this branch was built (for the next agent)
 Parallel work used **git worktrees** under `/work2/.../frontera/wt-{A,BC,D,E}`
 (one branch each off `a7b332b`), a **shared 40-node dev holder** + the

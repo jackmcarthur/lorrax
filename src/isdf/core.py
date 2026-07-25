@@ -38,6 +38,10 @@ from common.fft_helpers import (
     compute_block_size_for_2d_cholesky,
 )
 from common.wfn_transforms import to_rchunk_inner
+# Distributed-linalg facade: mesh probing, guard resolution, and the ONE
+# import seam for the FFI backend packages (cusolvermp / slate / scalapack).
+from ffi.linalg import backend_module, mesh_is_cpu as _mesh_is_cpu, \
+    resolve_backend as _resolve_linalg_backend
 
 
 # ============================================================================
@@ -884,16 +888,8 @@ _REPLICATED_CHOL_MAX_STACK_BYTES = int(
     float(os.environ.get("LORRAX_ZETA_REPLICATE_CAP_GIB", "4")) * 1024**3)
 
 
-def _mesh_is_cpu(mesh_xy) -> bool:
-    """True when the mesh's devices are the CPU backend.
-
-    Used to keep the ``auto`` policy from selecting the CUDA-only
-    cuSOLVERMp factor on a host-only run.
-    """
-    try:
-        return bool(mesh_xy.devices.flat[0].platform == 'cpu')
-    except Exception:
-        return False
+# ``_mesh_is_cpu`` (historical name, still exported for tests) is the
+# facade's ``ffi.linalg.mesh_is_cpu`` — imported at the top of the module.
 
 
 def _replicate_charge_ok(nq: int | None, n_rmu: int | None) -> bool:
@@ -1006,12 +1002,12 @@ def _resolve_solver_kind_charge(
                        cuSolverMp nor slate is auto-picked below the cap).
     """
     def _slate(px: int, py: int) -> str:
-        _require_slate_ffi()
-        if px == 1 and py > 1:
-            raise ValueError(
-                f"distributed_cholesky=slate: 1×{py} meshes hit a SLATE "
-                f"stride assert (guarded; see ffi/slate README).  Use a "
-                f"{py}×1 or square mesh, or a different backend.")
+        # Facade guard ladder (ffi.linalg.resolve): platform, compiled-
+        # capability probe (a slate-less build fails HERE, at resolve time,
+        # naming what IS available), process coverage, and the SLATE 1×q
+        # stride-assert geometry guard.  This layer only maps the approved
+        # backend to its charge-channel route string.
+        _resolve_linalg_backend('cholesky', 'slate', mesh_xy)
         return 'slate_cholesky'
 
     # auto → default policy.  Fit-size stacks factor with the mesh-invariant
@@ -1051,46 +1047,6 @@ def _resolve_solver_kind_charge(
         auto_pre=_auto_pre)
 
 
-def _require_slate_ffi() -> None:
-    """Raise with an actionable message unless the SLATE FFI is loadable.
-
-    SLATE is an OPTIONAL dependency: nothing imports it unless the input
-    file explicitly selects ``distributed_cholesky = slate``.
-    """
-    try:
-        from ffi.common.ffi_loader import get_lib
-        get_lib()
-        from ffi.slate import distributed_cholesky  # noqa: F401
-    except Exception as exc:
-        raise RuntimeError(
-            "distributed_cholesky=slate requested but the SLATE FFI is "
-            f"unavailable ({exc}).  Build it with "
-            "src/ffi/slate/scripts/build_perlmutter.sh + "
-            "src/ffi/common/cpp/build.sh (CUDA) or "
-            "src/ffi/common/cpp/host/build_host.sh (CPU backend), or use "
-            "distributed_cholesky = auto|off|cusolvermp."
-        ) from exc
-
-
-def _require_scalapack_ffi() -> None:
-    """Raise with an actionable message unless the ScaLAPACK host FFI is
-    loadable.  Host-only optional dependency (Cray LibSci via
-    liblorrax_ffi_host.so): nothing imports it unless the input file
-    explicitly selects ``distributed_lu = scalapack``.
-    """
-    try:
-        from ffi.common.ffi_loader import get_lib
-        get_lib("cpu")
-        from ffi.scalapack import batched_distributed_solve_lu  # noqa: F401
-    except Exception as exc:
-        raise RuntimeError(
-            "distributed_lu=scalapack requested but the ScaLAPACK host FFI "
-            f"is unavailable ({exc}).  Build it with "
-            "src/ffi/common/cpp/host/build_host.sh (host-only backend — on "
-            "GPU meshes use distributed_lu = auto|off|cusolvermp)."
-        ) from exc
-
-
 def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> str:
     """Pick the transverse-channel ζ-fit solver: cuSolverMp distributed
     getrf+getrs vs the in-tree per-q ``jnp.linalg.solve`` + ridge.
@@ -1118,21 +1074,11 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> st
       (No ``slate`` value: a SLATE getrf wrapper does not exist yet.)
     """
     def _scalapack(px: int, py: int) -> str:
-        plat = mesh_xy.devices.flat[0].platform
-        if plat != 'cpu':
-            # Defense-in-depth for direct callers — gw_config already
-            # rejects scalapack on non-CPU backends at parse time.
-            raise ValueError(
-                f"distributed_lu=scalapack is host-only (Cray LibSci) but "
-                f"the mesh devices are {plat!r}; use distributed_lu = "
-                f"auto|off|cusolvermp on GPU meshes.")
-        _require_scalapack_ffi()
-        if px > 1 and py > 1 and px != py:
-            raise ValueError(
-                f"distributed_lu=scalapack: mesh {px}x{py} unsupported — "
-                f"pXgetrf needs square descriptor blocks, which the "
-                f"one-tile-per-rank layout only gives on square or 1-D "
-                f"meshes.")
+        # Facade guard ladder (ffi.linalg.resolve): host-only platform
+        # (defense-in-depth — gw_config already rejects scalapack on
+        # non-CPU backends at parse time), compiled-capability probe,
+        # process coverage, and the square-or-1-D descriptor geometry.
+        _resolve_linalg_backend('solve_lu', 'scalapack', mesh_xy)
         return 'scalapack_lu'
 
     # auto: cuSolverMp on true 2D GPU meshes; the shared ladder's CPU-mesh
@@ -1456,8 +1402,8 @@ def factor_c_q(
         # Distributed potrf on C_q at P(None,'x','y'); returns the raw
         # lower-triangular factor.  Downstream solve_zeta rebuilds the
         # CusolverMpBatchedLowerL handle and dispatches to potrs.
-        from ffi.cusolvermp import batched_distributed_cholesky
-        L_handle = batched_distributed_cholesky(C_q, mesh=mesh_xy)
+        L_handle = backend_module('cusolvermp').batched_distributed_cholesky(
+            C_q, mesh=mesh_xy)
         return L_handle.raw
 
     if solver_kind == 'slate_cholesky':
@@ -1475,7 +1421,7 @@ def factor_c_q(
         # n_rmu here is the PADDED extent (divisible by px·py, hence by
         # each axis individually), so SLATE's divisibility contract
         # always holds.
-        from ffi.slate import distributed_cholesky as _slate_potrf
+        _slate_potrf = backend_module('slate').distributed_cholesky
         L_rows = [
             _slate_potrf(C_q[iq], mesh=mesh_xy).to_jax_lower()
             for iq in range(nq)
@@ -1690,7 +1636,9 @@ def solve_zeta(
         # None) so the downstream G-flat accumulator receives ζ
         # μ-flat-sharded (the FFT layout it actually wants — see
         # accumulate_rchunk_to_gflat / common.wfn_transforms).
-        from ffi.cusolvermp import batched_distributed_potrs, CusolverMpBatchedLowerL
+        _mp = backend_module('cusolvermp')
+        batched_distributed_potrs = _mp.batched_distributed_potrs
+        CusolverMpBatchedLowerL = _mp.CusolverMpBatchedLowerL
         Px = int(mesh_xy.shape['x'])
         Py = int(mesh_xy.shape['y'])
         # potrs requires Z's last dim divisible by Py (see pad_last_axis_to).
@@ -1718,10 +1666,9 @@ def solve_zeta(
         # column padding pattern as the cholesky branch.  The two
         # backends share this branch verbatim — identical call contract;
         # scalapack is the host/CPU-backend twin (Cray LibSci).
-        if solver_kind == 'scalapack_lu':
-            from ffi.scalapack import batched_distributed_solve_lu
-        else:
-            from ffi.cusolvermp import batched_distributed_solve_lu
+        batched_distributed_solve_lu = backend_module(
+            'scalapack' if solver_kind == 'scalapack_lu' else 'cusolvermp'
+        ).batched_distributed_solve_lu
         Px = int(mesh_xy.shape['x'])
         Py = int(mesh_xy.shape['y'])
         # getrs descB requires NRHS % Py == 0 (see pad_last_axis_to).

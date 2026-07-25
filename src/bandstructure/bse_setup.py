@@ -32,7 +32,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from ffi.common.dispatch import dispatch_eigh, EIGH_BACKENDS
+from ffi.linalg import NATIVE, dispatch_eigh, resolve_backend
 
 from .htransform import build_fH_R, build_R_grid_np, newton_inv
 
@@ -116,7 +116,7 @@ def compute_wfns_fi(
                    ``cusolvermp|slate`` route ONE (rank, rank) tile at a time
                    through the distributed-linalg FFI.  See the eigh comment
                    in the batch loop below for which regime is which, and
-                   ``ffi.common.dispatch.dispatch_eigh`` for the backends.
+                   ``ffi.linalg.dispatch_eigh`` for the backends.
         log_fn:    optional logger.
 
     Returns:
@@ -197,10 +197,20 @@ def compute_wfns_fi(
     # identical to the SP driver's sort-then-keep, but returning eigenVECTORS
     # too.  The guard bands above b_max stay in fH (they shape the
     # interpolation) but are not returned, so every returned band is interior.
-    if eigh_backend not in EIGH_BACKENDS:
-        raise ValueError(f"eigh_backend must be one of {EIGH_BACKENDS}, "
-                         f"got {eigh_backend!r}")
-    native = eigh_backend in ("auto", "off")
+    # Resolve-time backend resolution: every guard (vocabulary, platform,
+    # compiled-capability, process coverage, SQUARE mesh — cusolverMpSyevd
+    # DEADLOCKS on rectangular blocks — and rank divisibility) fires HERE,
+    # before any q is solved.  See ffi.linalg.resolve for the guard order.
+    try:
+        eigh_resolved = resolve_backend("eigh", eigh_backend, mesh_xy, n=rank)
+    except ValueError as exc:
+        if "divisible" in str(exc):
+            raise ValueError(
+                f"{exc}  ``streaming_galerkin_solve`` mesh-aligns the "
+                f"retained SVD rank to lcm(px, py); a ctilde built on a "
+                f"different mesh has to be refit on this one.") from None
+        raise
+    native = eigh_resolved == NATIVE
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
 
     # The two stages either side of the eigh are plain traceable functions,
@@ -281,18 +291,8 @@ def compute_wfns_fi(
     # wide for the batched path runnable at all, at the cost of nq sequential
     # distributed solves.  Native stays the default.
     if not native:
-        if px != py:
-            raise ValueError(
-                f"eigh_backend={eigh_backend!r} needs a SQUARE mesh (both FFI "
-                f"eigh wrappers reject p != q — cusolverMpSyevd DEADLOCKS on "
-                f"rectangular blocks); got {px}x{py}.")
-        if rank % px or rank % py:
-            raise ValueError(
-                f"eigh_backend={eigh_backend!r} needs rank ({rank}) divisible "
-                f"by both mesh axes ({px}, {py}).  ``streaming_galerkin_solve`` "
-                f"mesh-aligns the retained SVD rank to lcm(px, py); a ctilde "
-                f"built on a different mesh has to be refit on this one.")
-        log(f"  fH_q eigh: {eigh_backend} FFI, ONE (rank {rank})² tile "
+        # Mesh/geometry guards already passed in resolve_backend above.
+        log(f"  fH_q eigh: {eigh_resolved} FFI, ONE (rank {rank})² tile "
             f"distributed over the {px}x{py} mesh, {nq} q serially")
 
     lam_chunks, psi_chunks, c_chunks = [], [], []
@@ -311,7 +311,7 @@ def compute_wfns_fi(
         t_eigh = time.time()
         for i in range(nq):        # no batch padding: one q, one solve
             lam_q, U_q = dispatch_eigh(_fH_q_one(q_pad[i], fH_R),
-                                       mesh_xy, eigh_backend)
+                                       mesh_xy, eigh_resolved)
             _emit(*_project_one(lam_q, U_q, B_rep, b_min, b_max))
             # nq SERIAL distributed solves is a long, silent stretch — log the
             # rate so a stall is distinguishable from slow progress.

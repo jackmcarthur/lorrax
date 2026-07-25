@@ -153,7 +153,7 @@ not a constraint to work around. Single-process multi-GPU is not a supported
 geometry — the cuSOLVERMg backend built on it has been deleted. Single-*device*
 runs are unrelated and must keep working: gates must not require 16 GPUs.
 
-**One eigh dispatcher.** `ffi.common.dispatch.dispatch_eigh` is the single
+**One eigh dispatcher.** `ffi.linalg.dispatch_eigh` is the single
 backend switch (`auto|off|cusolvermp|slate`) for both `vq_interp`'s coarse
 `C_q` and `bandstructure/bse_setup`'s per-q `fH_q`. `vq_interp._eigh_backend`
 was deleted; do not reintroduce a parallel dispatcher. Native batched is the

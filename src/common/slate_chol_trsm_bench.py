@@ -49,7 +49,9 @@ _init()
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import multihost_utils
-from ffi.slate import distributed_cholesky, distributed_trsm
+from ffi.linalg import backend_module
+_slate = backend_module("slate")
+distributed_cholesky, distributed_trsm = _slate.distributed_cholesky, _slate.distributed_trsm
 
 
 def _log(s):
