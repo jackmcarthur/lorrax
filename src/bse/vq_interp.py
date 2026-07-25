@@ -387,7 +387,15 @@ def build_cq(zx, mesh_xy: Mesh, q_chunk=48):
         sl = slice(q0, min(q0 + q_chunk, nq))
         P_R = _pr_acc(P_R, jax.device_put(jnp.asarray(zx["psi"][sl]), rep),
                       jax.device_put(jnp.asarray(EqR_np[sl]), rep))
-    return _to_host(_cq_final(P_R, jax.device_put(jnp.asarray(EqR_np), rep)))
+    # Return C_q as a MESH-SHARDED device array on the (μ, ν) FACE
+    # (``face3`` = ``P(None, 'x', 'y')`` — q replicated, μ over 'x', ν over 'y'),
+    # the SAME (μ, ν) tiling every other matrix in this module lives on.  The
+    # former ``_to_host`` process_allgather materialised the full
+    # (nq, n_μ, n_μ) c128 stack on EVERY process (13.4 GB/proc at nq=144,
+    # n_μ=2412); the sharded form holds only nq·(n_μ/px)·(n_μ/py)·16 B per
+    # device.  Consumers (``prepare_coarse``, ``run_gates``) reshard/gather on
+    # DEVICE per chunk — no per-proc host gather.
+    return _cq_final(P_R, jax.device_put(jnp.asarray(EqR_np), rep))
 
 
 def kq_index(zx, ki, qi):
@@ -470,8 +478,12 @@ def run_gates(zx, C_q):
         sl = slice(k0, min(k0 + 16, zx["nk"]))
         G = _xhx_acc(G, jnp.asarray(zx["psi"][kqs[sl]]),
                      jnp.asarray(zx["psi"][sl]))
+    # C_q is now a device array sharded on the (μ, ν) face; gather ONLY the
+    # q=0 slice for this diagnostic (n_μ²·16 B, replicated) — the full stack is
+    # never brought to host.
+    C_q0 = _to_host(C_q[0]) if isinstance(C_q, jax.Array) else C_q[0]
     log("XHX_vs_Cq_torus_q0",
-        relF(np.asarray(jax.device_get(G)), C_q[0]), 1e-8)
+        relF(np.asarray(jax.device_get(G)), C_q0), 1e-8)
     for q in range(2):
         v, n = v_sphere(zx, q)
         vs, _ = v_sphere(zx, q, kind="slab_sr", alpha=0.63)
@@ -654,22 +666,25 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     Fch = np.empty((nq, n_mu, nG), dtype=np.complex128)
 
     def C_herm(sl):
-        """Hermitised C_q, PER CHUNK.  A whole-array copy is another
-        nq·n_μ²·16 B on every process — 13.4 GB at the converged reference,
-        which four ranks per node cannot afford beside C_q itself."""
+        """Hermitised C_q, PER CHUNK.  ``C_q`` is a device array sharded on the
+        (μ, ν) face (``build_cq`` no longer host-gathers); slicing the q axis
+        (replicated) and hermitising stay ON DEVICE — no per-proc host copy of
+        the 13.4 GB stack.  ``_eigh_batch``'s ``with_sharding_constraint`` then
+        reshards each chunk from the (μ, ν) face to the q-batched ``qb3`` layout.
+        (numpy ``C_q`` still works — ``jnp`` ops promote it — preserving the old
+        host path for callers/tests that pass a replicated array.)"""
         c = C_q[sl]
-        return 0.5 * (c + np.conj(np.swapaxes(c, -2, -1)))
+        return 0.5 * (c + jnp.conj(jnp.swapaxes(c, -2, -1)))
 
     for q0 in range(0, nq, q_chunk):
         sl = slice(q0, min(q0 + q_chunk, nq))
         if eigh_backend in ("auto", "off"):
-            lam, R = _eigh_batch(jax.device_put(jnp.asarray(C_herm(sl)), qb3))
+            lam, R = _eigh_batch(C_herm(sl))
         else:
             # explicit distributed-FFI request: per-q eigh, then the same
             # batched post-eigh pipeline (single source for the math).
-            pairs = [dispatch_eigh(jax.device_put(
-                                       jnp.asarray(C_herm(slice(q, q + 1))[0]),
-                                       grid_xy),
+            pairs = [dispatch_eigh(jax.device_put(C_herm(slice(q, q + 1))[0],
+                                                  grid_xy),
                                    mesh_xy, eigh_backend)
                      for q in range(sl.start, sl.stop)]
             lam = jnp.stack([p[0] for p in pairs])
@@ -801,7 +816,7 @@ def pack_coeffs(des, coeffs):
 
 def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
                     qmc_reps=10, n_coarse=250_000, seed_offset=0, kgrid=None):
-    """Host-side mini-BZ CELL AVERAGE of the LR-slab head at target Q.
+    """RANK-PARALLEL mini-BZ CELL AVERAGE of the LR-slab head at target Q.
 
     Returns ``(gstar, head_val)``:
 
@@ -816,8 +831,30 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     LR channel is averaged; the SR body already carries ``v_SR(Q+G*)`` once
     (arbitrary_q_bse.md §16 no-double-count).  The winding ``e^{-i2θ}`` is
     untouched — it rides the phase-factored ζ̃ model in ``eval_vq``; this
-    scalar supplies the magnitude only.  Single-sources
-    :func:`gw.coulomb.base.minibz_average`.
+    scalar supplies the magnitude only.
+
+    ONE source of truth for the PHYSICS: the bare LR-slab kernel is
+    :func:`gw.coulomb.base._minibz_kernel_bare` (the same
+    ``8π·f2d·e^{−K²/4α²}/|K|²`` GW's Coulomb head uses), the mini-BZ affine
+    wrap is :func:`gw.vcoul.wrap_points_to_voronoi` + the same
+    ``randlims`` map as :func:`gw.coulomb.base.minibz_voronoi_batches`, and
+    the inscribed-sphere / adaptive-``n_q`` rule matches
+    :func:`gw.coulomb.base.minibz_average` (``minibzaverage.f90:63-75``).
+
+    RANK-PARALLELISM (this routine used to run the FULL serial host Sobol QMC
+    redundantly on every process): the estimator is the mean of the bare
+    kernel over ``qmc_reps`` replicate batches, each keeping its first
+    ``n_q`` mini-BZ δq draws — equivalently a single mean over the
+    ``reps·n_q`` kept samples, since ``n_q`` is the same for every rep.  Each
+    kept sample carries a GLOBAL slot index whose randomness comes ONLY from
+    that index, via ``jax.random.fold_in(PRNGKey(seed), gidx)`` (the sharded
+    sobol/threefry idiom: per-sample keys folded off one root key, no
+    per-rank reseeding).  Ranks own disjoint contiguous slabs of the
+    kept-slot range and evaluate only their slab; the per-rank partial sums
+    are all-reduced across processes (``process_allgather`` + sum).  Because
+    the sample for a given global slot is identical no matter which rank
+    draws it, the result is DETERMINISTIC and rank-count invariant (bit-equal
+    up to float summation reorder ~1e-13), just ``1/nranks`` the work.
 
     ``kgrid`` overrides ``zx['kgrid']`` for the mini-BZ CELL SIZE — the
     ``bse_k_grid`` coarse→fine init passes the FINE k-grid here so the q=0
@@ -825,8 +862,9 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     (the head magnitude scales with the mini-BZ cell area).  Default None uses
     the stored coarse grid (the exciton_bands Q-path convention, unchanged).
     """
-    from gw.coulomb.base import (minibz_voronoi_batches, minibz_average,
+    from gw.coulomb.base import (_minibz_kernel_bare,
                                  minibz_inscribed_sphere_r2)
+    from gw.vcoul import wrap_points_to_voronoi
     if alpha is None:
         alpha = float(prep["alpha"])
     GS = np.asarray(prep["GS"], dtype=np.float64)          # (3, nG)
@@ -839,16 +877,66 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     K2 = np.sum(K * K, axis=0)
     gstar = int(np.argmin(K2))
     shift_cart = K[:, gstar]                               # cartesian Q+G*
-    dq = minibz_voronoi_batches(
-        bvec, kgrid, nsamples=nsamples, method="sobol",
-        qmc_reps=qmc_reps, nmax=3, is_2d=True, seed_offset=seed_offset)
+    len_shift2 = float(shift_cart @ shift_cart)
     q0sph2 = minibz_inscribed_sphere_r2(bvec, kgrid, is_2d=True)
-    head_bare = minibz_average(
-        shift_cart, dq, kind="slab_lr", celvol=celvol,
-        n_kpts=int(np.prod(kgrid)), q0sph2=q0sph2, alpha=alpha,
-        zc=float(np.pi / bvec[2, 2]), analytic_sphere=False,
-        adaptive=True, n_coarse=n_coarse)
-    return gstar, float(head_bare) / celvol
+
+    # BGW adaptive per-batch sample count (minibzaverage.f90:63-75); the 2D
+    # slab head always takes this (non-analytic-sphere) branch.
+    if len_shift2 > 1e-12:
+        n_q = int(round(n_coarse * 4.0 * q0sph2 / len_shift2))
+        n_q = max(1, min(n_q, int(nsamples)))
+    else:
+        n_q = int(nsamples)
+
+    rank = int(jax.process_index())
+    nranks = int(jax.process_count())
+    n_kept = int(qmc_reps) * n_q
+    lo = rank * n_kept // nranks                            # disjoint, union
+    hi = (rank + 1) * n_kept // nranks                      # = [0, n_kept)
+
+    if hi > lo:
+        base_key = jax.random.PRNGKey(int(seed_offset))
+        slots = jnp.arange(lo, hi, dtype=jnp.uint32)
+        rep = slots // np.uint32(n_q)                       # replicate batch
+        loc = slots % np.uint32(n_q)                        # in-batch draw
+        gidx = rep * np.uint32(int(nsamples)) + loc         # global draw index
+
+        @jax.jit
+        def _draw(gidx):
+            def one(i):
+                return jax.random.uniform(jax.random.fold_in(base_key, i),
+                                          (3,), dtype=jnp.float64)
+            return jax.vmap(one)(gidx)
+
+        U = np.asarray(_draw(gidx), dtype=np.float64)       # (local, 3) ∈ [0,1)
+        # δq mapping — VERBATIM minibz_voronoi_batches geometry (single source
+        # for the wrap + mini-BZ affine map), nmax=3 = BGW ncell.
+        randcart = (bvec.T @ U.T).T
+        wrapped = np.asarray(wrap_points_to_voronoi(
+            jnp.asarray(randcart), jnp.asarray(bvec), nmax=3),
+            dtype=np.float64)
+        randlims = bvec.T @ (np.diag(1.0 / np.asarray(kgrid, np.float64))
+                             @ np.linalg.inv(bvec.T))
+        dq = (randlims @ wrapped.T).T
+        dq[:, 2] = 0.0                                       # 2D slab: qz = 0
+        v, _ = _minibz_kernel_bare(shift_cart, dq, kind="slab_lr",
+                                   alpha=alpha, zc=float(np.pi / bvec[2, 2]))
+        local_sum = float(np.sum(v))
+        local_cnt = float(v.shape[0])
+    else:
+        local_sum = local_cnt = 0.0
+
+    if nranks > 1:
+        from jax.experimental import multihost_utils
+        g = np.asarray(multihost_utils.process_allgather(
+            np.asarray([local_sum, local_cnt], dtype=np.float64),
+            tiled=False))
+        tot_sum = float(g[:, 0].sum())
+        tot_cnt = float(g[:, 1].sum())
+    else:
+        tot_sum, tot_cnt = local_sum, local_cnt
+    head_bare = tot_sum / tot_cnt                            # mean over kept
+    return gstar, head_bare / celvol
 
 
 def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None,

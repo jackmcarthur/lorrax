@@ -567,10 +567,10 @@ def main(argv=None):
         bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
     # Everything the htransform produced is now copied into the conduction
     # stacks and nothing below reads it again.  Drop it before the V_Q model
-    # build: ``vq_interp.build_cq`` process_allgathers C_q to host, which is
-    # ONE (n_stencil, n_μ, n_μ) c128 allocation — 16.8 GB at n_μ = 2412 — and
-    # it OOMs if the htransform's leftovers are still resident.  ``bundle``
-    # alone is ψ at every (Q, k) in both shardings.
+    # build: ``vq_interp.build_cq`` now returns C_q as a (μ, ν)-face SHARDED
+    # device array (no per-proc host gather), but the coarse ζ / P_R
+    # intermediates it builds still want the htransform leftovers gone.
+    # ``bundle`` alone is ψ at every (Q, k) in both shardings.
     del bundle, ctilde, B_at_mu, enk_sigma
     tick("htransform_psi_cQ", t0)
 
