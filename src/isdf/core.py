@@ -487,6 +487,33 @@ def z_q_from_psi_sm(
 		bpd_max = int(_psi_G_store._bpd_max)
 		bpd_max_global = bpd_max * P_total          # padded global bc band count
 		n_bc = len(bcr)
+		# Static per-bc Y-compaction gather table (device-invariance fix):
+		# all_gather(tiled) over ('x','y') stacks P per-rank blocks of
+		# `bpd_max` slots along the gathered band axis; rank r's block holds
+		# this bc's global bands in its FIRST `bpd_per_bc` slots + zero pad.
+		# The g_axis mask and the contiguous psi_*_X slice both assume a
+		# CONTIGUOUS global band axis, so reorder the gathered slots to place
+		# this bc's real bands contiguously at the front (out pos p -> src
+		# slot).  Identity whenever bpd_per_bc == bpd_max (every full chunk
+		# AND every chunk at P=1) -> no-op / byte-identical there.
+		_y_compact_idx_np = np.zeros((n_bc, bpd_max_global), dtype=np.int32)
+		for _bc in range(n_bc):
+			_bpd = int(_psi_G_store._bpd_per_bc[_bc])
+			if _bpd <= 0:
+				continue  # all-pad bc: every slot masked downstream
+			_nb_tot = _bpd * P_total  # == b_hi-b_lo (sharded load is P-divisible)
+			# Precondition guard (device-invariance audit): each band-chunk
+			# width MUST be world_size-divisible, else floor-div silently drops
+			# bands and the populate tile assignment shape-mismatches at P>1.
+			assert _nb_tot == (bcr[_bc][1] - bcr[_bc][0]) and _bpd <= bpd_max, (
+				f"z_q band chunk {_bc} width {bcr[_bc][1]-bcr[_bc][0]} is not a "
+				f"multiple of world_size {P_total} (bpd_per_bc={_bpd}); set "
+				f"band_chunk_size to a multiple of world_size")
+			# out pos p -> src slot (strided real bands compacted to front);
+			# tail (p >= _nb_tot) -> slot _bpd, a guaranteed-zero pad slot.
+			_p = np.arange(bpd_max_global)
+			_y_compact_idx_np[_bc] = np.where(
+				_p < _nb_tot, (_p // _bpd) * bpd_max + (_p % _bpd), _bpd)
 		# Per-bc tables.  Built as np arrays here (NOT jnp.asarray) so
 		# they enter the shard_map body via numpy → jnp lift inside the
 		# Manual-mode body.  Closure-captured Auto-sharded jax.Arrays
@@ -581,6 +608,7 @@ def z_q_from_psi_sm(
 			b_hi_global_arr = jnp.asarray(_b_hi_global_np)
 			psi_l_X_bc_offset = jnp.asarray(_psi_l_X_bc_offset_np)
 			psi_r_X_bc_offset = jnp.asarray(_psi_r_X_bc_offset_np)
+			y_compact_idx = jnp.asarray(_y_compact_idx_np)
 
 			# Pre-pad psi_l_X_ / psi_r_X_ at the front with front_pad_*
 			# zero bands so the per-bc offset is always non-negative
@@ -653,6 +681,16 @@ def z_q_from_psi_sm(
 				psi_Y_bc_full_r = jax.lax.all_gather(
 					psi_Y_bc_local_full_r, axis_name=('x', 'y'),
 					axis=1, tiled=True)
+				# Guard: the gathered band axis must be the full contiguous width
+				# (P blocks x bpd_max).  A wrong strided/contiguous read surfaces
+				# HERE as a loud shape mismatch, not silent P-dependent corruption.
+				assert psi_Y_bc_full_r.shape[1] == bpd_max_global
+				# (3a) Compact strided per-rank band blocks to a CONTIGUOUS
+				#      global-band axis so the g_axis mask + psi_*_X slice align
+				#      with the gathered Y band axis.  No-op when
+				#      bpd_per_bc == bpd_max (full chunk / P=1).
+				psi_Y_bc_full_r = jnp.take(
+					psi_Y_bc_full_r, y_compact_idx[bc_idx], axis=1)
 				# (3b) Slice the r-axis to THIS y-rank's r_loc slab.
 				#      MUST happen AFTER gather so the band axis +
 				#      r axis are coherent (each gathered band's r

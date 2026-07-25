@@ -233,7 +233,128 @@ def _worker_cap() -> int:
     return 0
 
 
-def _run_worker(tag: str, timeout: int = 600, env_extra: dict | None = None):
+def _worker_zq_band_invariance() -> int:
+    """Child process: run the REAL ``z_q_from_psi_sm`` across CPU host-device
+    meshes that FORCE a short remainder band chunk (``bpd_per_bc < bpd_max`` at
+    P>1) and report the worst cross-mesh frob-rel of Z_q.
+
+    This closes the coverage gap that let the band ``all_gather`` stride bug
+    through: the bit-identity test runs z_q only on a 1x1 mesh, and the
+    factor/solve mesh-invariance test never runs the band-gather at all.  For
+    the band axis only ``P = px*py`` matters (the gather flattens ('x','y')
+    row-major), so we sweep P = 1,2,3,4,6 including a non-square 2x3.  Dims are
+    chosen so every swept mesh divides cleanly (n_rmu=12, n_zchunk=12) and both
+    band-chunk widths (24, 12) are divisible by every swept P -> the
+    P-divisibility precondition holds AND bpd_per_bc is non-uniform (a real
+    remainder chunk) at every P>1."""
+    import json
+    import numpy as np
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from isdf.core import z_q_from_psi_sm
+
+    devs = jax.devices()
+    NEED = 6
+    if len(devs) < NEED:
+        print(json.dumps({"skip": f"only {len(devs)} devices (<{NEED})"}))
+        return 0
+
+    rng = np.random.default_rng(0xB0BAFE77)
+    kgrid = (2, 2, 1); nk = 4
+    ns = 2; fft_grid = (4, 4, 4); n_rtot = 4 * 4 * 4
+    ngkmax = n_rtot // 2 + 1
+    n_rmu = 12; n_zchunk = 12; nb_total = 36
+    band_chunk_ranges = ((0, 24), (24, 36))          # widths 24, 12 -> remainder
+    band_range = (0, nb_total)
+
+    g_index = np.full((nk, *fft_grid), ngkmax, dtype=np.int32)
+    for k in range(nk):
+        for idx, cell in enumerate(sorted(rng.choice(n_rtot, ngkmax, replace=False))):
+            g_index[k, cell // 16, (cell // 4) % 4, cell % 4] = idx
+    psi_G = (rng.standard_normal((nk, nb_total, ns, ngkmax))
+             + 1j * rng.standard_normal((nk, nb_total, ns, ngkmax))).astype(np.complex128)
+    kvecs = rng.uniform(-0.5, 0.5, size=(nk, 3)).astype(np.float64)
+    psi_l_X = (rng.standard_normal((nk, n_rmu, nb_total, ns))
+               + 1j * rng.standard_normal((nk, n_rmu, nb_total, ns))).astype(np.complex128)
+    psi_r_X = (rng.standard_normal((nk, n_rmu, nb_total, ns))
+               + 1j * rng.standard_normal((nk, n_rmu, nb_total, ns))).astype(np.complex128)
+
+    class _MeshStore:
+        """Multi-device mock PsiGStore: shards bands over P=px*py devices in
+        row-major ('x','y') order, each rank's tile padded to bpd_max -- the
+        exact layout the real store + band all_gather assume."""
+        def __init__(self, mesh):
+            P_tot = mesh.size
+            self._py = mesh.shape['y']
+            self.band_chunk_ranges = band_chunk_ranges
+            offs = [0]
+            for lo, hi in band_chunk_ranges:
+                offs.append(offs[-1] + (hi - lo))
+            self._offs = offs
+            self._bpd_per_bc = tuple((hi - lo) // P_tot for lo, hi in band_chunk_ranges)
+            self._bpd_max = max(self._bpd_per_bc)
+            self._per_rank_shape = (nk, nb_total, ns, ngkmax)
+            class _M:
+                pass
+            self.meta = _M()
+            self.meta.fft_grid = fft_grid
+            self._g = jax.device_put(
+                jnp.asarray(g_index), NamedSharding(mesh, P(None, None, None, None)))
+            self._k = jax.device_put(
+                jnp.asarray(kvecs), NamedSharding(mesh, P(None, None)))
+
+        def _slice_local_tile_bc(self, x_idx, y_idx, bc_idx):
+            r = int(x_idx) * self._py + int(y_idx)
+            bc = int(bc_idx)
+            b_lo = self._offs[bc]
+            bpd = self._bpd_per_bc[bc]
+            out = np.zeros((nk, self._bpd_max, ns, ngkmax), dtype=np.complex128)
+            out[:, :bpd, :, :] = psi_G[:, b_lo + r * bpd: b_lo + (r + 1) * bpd, :, :]
+            return out
+
+        @property
+        def g_index(self):
+            return self._g
+
+        @property
+        def kvecs_frac(self):
+            return self._k
+
+    def _run(mesh):
+        store = _MeshStore(mesh)
+        rep = NamedSharding(mesh, P())
+        Z = z_q_from_psi_sm(
+            jax.device_put(jnp.asarray(psi_l_X), rep),
+            jax.device_put(jnp.asarray(psi_r_X), rep),
+            store,
+            band_chunk_ranges=band_chunk_ranges,
+            band_range_left=band_range, band_range_right=band_range,
+            r_start_dyn=0, r_chunk_size=n_zchunk,
+            gamma_L=None, gamma_R=None, kgrid=kgrid, mesh_xy=mesh)
+        return np.asarray(jax.device_get(Z))
+
+    meshes = {"1x1": (1, 1), "1x2": (1, 2), "1x3": (1, 3),
+              "2x2": (2, 2), "2x3": (2, 3)}
+    ref = None
+    worst = 0.0
+    bpd = {}
+    for tag, (px, py) in meshes.items():
+        mesh = Mesh(np.asarray(devs[: px * py]).reshape(px, py), ('x', 'y'))
+        Z = _run(mesh)
+        bpd[tag] = [(hi - lo) // (px * py) for lo, hi in band_chunk_ranges]
+        if ref is None:
+            ref = Z
+        else:
+            worst = max(worst, float(np.linalg.norm(Z - ref)
+                                     / max(np.linalg.norm(ref), 1e-300)))
+    print(json.dumps({"worst_zq": worst, "bpd_per_bc": bpd}))
+    return 0
+
+
+def _run_worker(tag: str, timeout: int = 600, env_extra: dict | None = None,
+                ndev: int | None = None):
     env = dict(os.environ)
     env["JAX_PLATFORMS"] = "cpu"
     env["JAX_ENABLE_X64"] = "1"
@@ -241,7 +362,7 @@ def _run_worker(tag: str, timeout: int = 600, env_extra: dict | None = None):
         env.update(env_extra)
     # Append so any pre-existing XLA_FLAGS survive.
     env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "")
-                        + f" --xla_force_host_platform_device_count={_NDEV}").strip()
+                        + f" --xla_force_host_platform_device_count={ndev or _NDEV}").strip()
     res = subprocess.run(
         [sys.executable, os.path.abspath(__file__), tag],
         env=env, capture_output=True, text=True, timeout=timeout)
@@ -336,6 +457,21 @@ def test_rank_truncate_refuses_above_the_replication_cap():
         f"{full['fullbz144_rank_truncate']!r}"
 
 
+def test_zq_band_gather_is_mesh_invariant():
+    """The REAL ``z_q_from_psi_sm`` gives a mesh-invariant Z_q even when a short
+    remainder band chunk forces ``bpd_per_bc < bpd_max`` at P>1 -- the
+    device-count bug fixed in ``isdf/core.py`` (band all_gather stride vs the
+    contiguous g_axis mask / psi_*_X slice).  Sweeps P = 1,2,3,4,6 (incl. a
+    non-square 2x3) on the CPU host-device pool."""
+    out = _run_worker("worker_zq_band", ndev=6)
+    if "skip" in out:
+        pytest.skip(f"z_q band-invariance gate: {out['skip']}")
+    assert out["worst_zq"] <= 1e-9, (
+        f"z_q_from_psi_sm drifts across meshes (remainder-chunk band-gather "
+        f"regression): worst frob-rel {out['worst_zq']:.3e} > 1e-9 "
+        f"(bpd_per_bc per mesh: {out['bpd_per_bc']})")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "worker_cap":
         sys.exit(_worker_cap())
@@ -343,4 +479,6 @@ if __name__ == "__main__":
         sys.exit(_worker())
     if len(sys.argv) > 1 and sys.argv[1] == "worker_rt":
         sys.exit(_worker_rank_truncate())
+    if len(sys.argv) > 1 and sys.argv[1] == "worker_zq_band":
+        sys.exit(_worker_zq_band_invariance())
     sys.exit(test_zeta_fit_charge_factor_solve_is_mesh_invariant() or 0)

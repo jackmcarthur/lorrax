@@ -117,9 +117,31 @@ def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
         return (_one_channel(jnp.real(sigma_k_local)),
                 _one_channel(jnp.imag(sigma_k_local)))
 
-    return shard_map(_local, mesh=mesh_xy,
-                     in_specs=in_specs, out_specs=out_specs,
-                     check_rep=False)
+    _sm = shard_map(_local, mesh=mesh_xy,
+                    in_specs=in_specs, out_specs=out_specs,
+                    check_rep=False)
+
+    # Guard the divisibility this kernel requires (see docstring): the two
+    # psum_scatters split m over p_x and n over p_y, so an indivisible sigma
+    # band window would otherwise crash cryptically deep inside psum_scatter
+    # (or, with a future non-tiled variant, misalign silently).  Convert that
+    # into a clear, actionable failure that names the fix.  No behaviour change
+    # for valid (divisible) inputs — identity passthrough.  meta.py rounds
+    # b_id_4 to world_size but NOT the sigma band window (b3-b0), so this is a
+    # real, reachable precondition, not a tautology.
+    p_x, p_y = mesh_xy.shape['x'], mesh_xy.shape['y']
+
+    def _project_ri_reduce_scatter(psi_xr, sigma_k, psi_yn):
+        m, n = psi_xr.shape[1], psi_yn.shape[3]
+        assert m % p_x == 0 and n % p_y == 0, (
+            f"sigma reduce-scatter needs the band window divisible by the "
+            f"mesh: m={m} must be a multiple of p_x={p_x} and n={n} of "
+            f"p_y={p_y}. Pad the sigma band window (b3-b0) up to a multiple "
+            f"of p_x*p_y at the caller (meta.py rounds b_id_4 but NOT the "
+            f"sigma window).")
+        return _sm(psi_xr, sigma_k, psi_yn)
+
+    return _project_ri_reduce_scatter
 
 
 def _get_sigma_kij_kernel(
