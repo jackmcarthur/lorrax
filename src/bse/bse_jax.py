@@ -7,16 +7,10 @@ import sys
 # Ensure x64 + jax.distributed bootstrap before any jax-collective code
 # (the ring matvec uses lax.psum/ppermute on the 2D mesh, which is silent-
 # wrong if processes don't agree on a shared distributed runtime).
-# ``set_default_env()`` (JAX_ENABLE_X64 + JAX_PLATFORMS='cuda,cpu' via
-# setdefault) MUST precede ``import jax``; ``fallback_to_cpu_if_no_gpu_backend``
-# rescues the legacy ``JAX_PLATFORM_NAME=gpu`` launch env on a CPU-only node
-# (otherwise the first jax.devices() dies with "Unknown backend: 'gpu'").
-# Mirrors the exciton_bands.py bootstrap.
-from runtime import set_default_env
-set_default_env()
-from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
-init_jax_distributed()
-fallback_to_cpu_if_no_gpu_backend()
+# Single-sourced in runtime.bootstrap() (env defaults + jax.distributed
+# init + CPU fallback); MUST run before this module's own `import jax`.
+from runtime import bootstrap
+bootstrap()
 
 import jax
 import jax.numpy as jnp

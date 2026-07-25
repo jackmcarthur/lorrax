@@ -14,12 +14,18 @@ phdf5 plumbing tests, ...) needs the same three things:
 
 This module owns all three.  Each driver should do::
 
-    from runtime import set_default_env
-    set_default_env()   # BEFORE ``import jax``
+    from runtime import bootstrap
+    bootstrap()          # BEFORE the driver's own ``import jax``
     import jax
-    from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
-    init_jax_distributed()
-    fallback_to_cpu_if_no_gpu_backend()
+
+:func:`bootstrap` bundles the canonical three-call header
+(``set_default_env`` → ``init_jax_distributed`` →
+``fallback_to_cpu_if_no_gpu_backend``).  It is importable without pulling
+in jax (this module only imports jax lazily, inside functions), and it
+sets the env vars before anything imports jax — so as long as the CLI
+calls it above its own ``import jax``, the before-import contract holds.
+Drivers with a non-standard header (e.g. no CPU fallback) can still call
+the three pieces individually.
 
 Previously five different modules had their own copies of this logic,
 drifting apart over time (gw.gw_jax had the SLURM-coordinator fallback;
@@ -38,10 +44,29 @@ import subprocess
 _DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
 
 __all__ = [
+    "bootstrap",
     "set_default_env",
     "init_jax_distributed",
     "fallback_to_cpu_if_no_gpu_backend",
 ]
+
+
+def bootstrap(*, platform: str = "gpu") -> None:
+    """Canonical CLI bootstrap: env defaults + distributed init + CPU fallback.
+
+    One call replaces the three-call header every LORRAX CLI used to
+    carry.  MUST run before the caller's own ``import jax``:
+    :func:`set_default_env` only works if jax has not been imported yet
+    (jax reads its env at import time).  The jax imports *inside*
+    :func:`init_jax_distributed` / :func:`fallback_to_cpu_if_no_gpu_backend`
+    happen after the env is set, so they are safe.
+
+    Idempotent (each piece guards itself); no-op-ish in single-process
+    runs.  ``platform`` forwards to :func:`set_default_env`.
+    """
+    set_default_env(platform=platform)
+    init_jax_distributed()
+    fallback_to_cpu_if_no_gpu_backend()
 
 
 def set_default_env(*, platform: str = "gpu") -> None:

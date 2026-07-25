@@ -911,6 +911,56 @@ def _replicate_charge_ok(nq: int | None, n_rmu: int | None) -> bool:
     return int(nq) * int(n_rmu) ** 2 * 16 <= _REPLICATED_CHOL_MAX_STACK_BYTES
 
 
+def _resolve_channel_ladder(
+    mesh_xy: Mesh,
+    override: str,
+    *,
+    kind_fallback: str,
+    kind_cusolvermp: str,
+    explicit: dict | None = None,
+    auto_pre=None,
+) -> str:
+    """The mesh/CPU/backend decision ladder SHARED by the per-channel
+    ζ-fit solver resolvers (:func:`_resolve_solver_kind_charge`,
+    :func:`_resolve_solver_kind_transverse`) — written once so the two
+    channels cannot drift.
+
+    Ladder (identical for both channels):
+
+      * ``override='off'``                 → ``kind_fallback``.
+      * ``override='on'|'cusolvermp'``     → ``kind_cusolvermp`` on true 2D
+        meshes (px≥2 AND py≥2), else ``kind_fallback``.
+      * ``override`` in ``explicit``       → that handler decides (called
+        with ``(px, py)``; owns its own FFI-availability / mesh-geometry
+        checks and may raise).  Channel-specific: 'slate' for charge,
+        'scalapack' for transverse.
+      * auto (or unrecognised): ``auto_pre()`` first when given (the charge
+        channel's replication-cap branch; returns a kind, raises, or
+        returns ``None`` to fall through), then ``kind_cusolvermp`` on true
+        2D non-CPU meshes (cuSOLVERMp is CUDA-only — never auto-picked on
+        a CPU mesh), else ``kind_fallback``.
+    """
+    px = int(mesh_xy.shape['x'])
+    py = int(mesh_xy.shape['y'])
+    is_2d = (px >= 2 and py >= 2)
+
+    if override == 'off':
+        return kind_fallback
+    if override in ('on', 'cusolvermp'):
+        return kind_cusolvermp if is_2d else kind_fallback
+    handler = (explicit or {}).get(override)
+    if handler is not None:
+        return handler(px, py)
+    # auto (or unrecognised) → default policy.
+    if auto_pre is not None:
+        kind = auto_pre()
+        if kind is not None:
+            return kind
+    if is_2d and not _mesh_is_cpu(mesh_xy):
+        return kind_cusolvermp
+    return kind_fallback
+
+
 def _resolve_solver_kind_charge(
     mesh_xy: Mesh, override: str = "auto",
     n_rmu: int | None = None, nq: int | None = None,
@@ -955,15 +1005,7 @@ def _resolve_solver_kind_charge(
                        cuSolverMp on true 2D / sharded otherwise (neither
                        cuSolverMp nor slate is auto-picked below the cap).
     """
-    px = int(mesh_xy.shape['x'])
-    py = int(mesh_xy.shape['y'])
-    is_2d = (px >= 2 and py >= 2)
-
-    if override == 'off':
-        return 'sharded_cholesky'
-    if override in ('on', 'cusolvermp'):
-        return 'cusolvermp_cholesky' if is_2d else 'sharded_cholesky'
-    if override == 'slate':
+    def _slate(px: int, py: int) -> str:
         _require_slate_ffi()
         if px == 1 and py > 1:
             raise ValueError(
@@ -972,36 +1014,41 @@ def _resolve_solver_kind_charge(
                 f"{py}×1 or square mesh, or a different backend.")
         return 'slate_cholesky'
 
-    # auto (or unrecognised) → default policy.  Fit-size stacks factor with
-    # the mesh-invariant replicated dense factor; larger stacks keep the
-    # distributed / sharded policy.  ``charge_zeta_solve == 'rank_truncate'``
-    # (the production default) selects the rank-revealing eigh pseudo-inverse
-    # on the replicated route — the only route it applies to (a full eigh
-    # cannot be block-cyclic).  Above the cap we therefore CANNOT honour it,
-    # and we refuse rather than downgrade: the 2026-07-21 full-BZ 12×12 fit
-    # (13.4 GiB, just over the cap) silently fell back and returned ζ 4.5×
-    # too large, rebuilding V_q to relF 16–32 instead of 1.8e-15.
-    # The replicated route is dense JAX with no FFI, so it is valid on every
-    # backend including CPU -- and it is the only route carrying the
+    # auto → default policy.  Fit-size stacks factor with the mesh-invariant
+    # replicated dense factor; larger stacks keep the distributed / sharded
+    # policy (fall through to the shared ladder).  ``charge_zeta_solve ==
+    # 'rank_truncate'`` (the production default) selects the rank-revealing
+    # eigh pseudo-inverse on the replicated route — the only route it applies
+    # to (a full eigh cannot be block-cyclic).  Above the cap we therefore
+    # CANNOT honour it, and we refuse rather than downgrade: the 2026-07-21
+    # full-BZ 12×12 fit (13.4 GiB, just over the cap) silently fell back and
+    # returned ζ 4.5× too large, rebuilding V_q to relF 16–32 instead of
+    # 1.8e-15.  The replicated route is dense JAX with no FFI, so it is valid
+    # on every backend including CPU -- and it is the only route carrying the
     # rank-truncation cure, so it must stay reachable there.
-    if _replicate_charge_ok(nq, n_rmu):
-        return ('replicated_rank_truncate'
-                if charge_zeta_solve == 'rank_truncate'
-                else 'replicated_cholesky')
-    if charge_zeta_solve == 'rank_truncate':
-        need = int(nq) * int(n_rmu) ** 2 * 16 / 1024**3 if nq and n_rmu else 0.0
-        raise ValueError(
-            f"charge_zeta_solve='rank_truncate' needs the replicated route, "
-            f"but the CCT stack (nq={nq}, n_mu={n_rmu}) is {need:.2f} GiB > "
-            f"the {_REPLICATED_CHOL_MAX_STACK_BYTES / 1024**3:.2f} GiB cap.  "
-            f"Set LORRAX_ZETA_REPLICATE_CAP_GIB={-(-need // 1) + 1:.0f} if the "
-            f"device budget allows, or charge_zeta_solve='cholesky' to accept "
-            f"the distributed factor (NOT rank-conditioned — verify V_q).")
-    # Above the cap: cuSOLVERMp is CUDA-only, so never auto-pick it on a CPU
-    # mesh (that is the one genuinely GPU-bound branch of this policy).
-    if is_2d and not _mesh_is_cpu(mesh_xy):
-        return 'cusolvermp_cholesky'
-    return 'sharded_cholesky'
+    def _auto_pre() -> str | None:
+        if _replicate_charge_ok(nq, n_rmu):
+            return ('replicated_rank_truncate'
+                    if charge_zeta_solve == 'rank_truncate'
+                    else 'replicated_cholesky')
+        if charge_zeta_solve == 'rank_truncate':
+            need = (int(nq) * int(n_rmu) ** 2 * 16 / 1024**3
+                    if nq and n_rmu else 0.0)
+            raise ValueError(
+                f"charge_zeta_solve='rank_truncate' needs the replicated route, "
+                f"but the CCT stack (nq={nq}, n_mu={n_rmu}) is {need:.2f} GiB > "
+                f"the {_REPLICATED_CHOL_MAX_STACK_BYTES / 1024**3:.2f} GiB cap.  "
+                f"Set LORRAX_ZETA_REPLICATE_CAP_GIB={-(-need // 1) + 1:.0f} if the "
+                f"device budget allows, or charge_zeta_solve='cholesky' to accept "
+                f"the distributed factor (NOT rank-conditioned — verify V_q).")
+        return None
+
+    return _resolve_channel_ladder(
+        mesh_xy, override,
+        kind_fallback='sharded_cholesky',
+        kind_cusolvermp='cusolvermp_cholesky',
+        explicit={'slate': _slate},
+        auto_pre=_auto_pre)
 
 
 def _require_slate_ffi() -> None:
@@ -1070,15 +1117,7 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> st
       ``auto`` (default) → cuSolverMp on true 2D, legacy otherwise.
       (No ``slate`` value: a SLATE getrf wrapper does not exist yet.)
     """
-    px = int(mesh_xy.shape['x'])
-    py = int(mesh_xy.shape['y'])
-    is_2d = (px >= 2 and py >= 2)
-
-    if override == 'off':
-        return 'lu'
-    if override in ('on', 'cusolvermp'):
-        return 'cusolvermp_lu' if is_2d else 'lu'
-    if override == 'scalapack':
+    def _scalapack(px: int, py: int) -> str:
         plat = mesh_xy.devices.flat[0].platform
         if plat != 'cpu':
             # Defense-in-depth for direct callers — gw_config already
@@ -1096,12 +1135,13 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> st
                 f"meshes.")
         return 'scalapack_lu'
 
-    # auto: cuSolverMp on true 2D GPU meshes.  cuSOLVERMp is CUDA-only, so
-    # never auto-pick it on a CPU mesh (mirrors the charge resolver's guard) —
-    # fall back to the CPU-safe in-tree per-q solve.
-    if is_2d and not _mesh_is_cpu(mesh_xy):
-        return 'cusolvermp_lu'
-    return 'lu'
+    # auto: cuSolverMp on true 2D GPU meshes; the shared ladder's CPU-mesh
+    # guard falls back to the CPU-safe in-tree per-q solve.
+    return _resolve_channel_ladder(
+        mesh_xy, override,
+        kind_fallback='lu',
+        kind_cusolvermp='cusolvermp_lu',
+        explicit={'scalapack': _scalapack})
 
 
 def _resolve_solver_kind(

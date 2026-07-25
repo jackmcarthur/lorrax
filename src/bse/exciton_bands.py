@@ -76,16 +76,13 @@ from functools import partial
 
 import numpy as np
 
-# LORRAX distributed bootstrap — SINGLE-SOURCED in ``runtime/`` (the same three
-# calls gw.gw_jax / psp.run_nscf use; runtime.__init__ owns the SLURM-aware
-# ``jax.distributed.initialize`` pattern).  ``set_default_env()`` must run
-# BEFORE ``import jax`` (JAX reads its env at import); ``init_jax_distributed()``
-# must run BEFORE any ``jax.devices()`` / mesh creation so a multi-node srun
-# (one process per GPU, CUDA_VISIBLE_DEVICES=$SLURM_LOCALID) yields the full
-# global device set.  Both are idempotent and no-ops in single-process runs
-# (sentinel guard + proc_count<=1), so the 1-GPU path is byte-unchanged.
-from runtime import set_default_env
-set_default_env()
+# LORRAX distributed bootstrap — SINGLE-SOURCED in runtime.bootstrap()
+# (env defaults + SLURM-aware ``jax.distributed.initialize`` + CPU
+# fallback; idempotent, no-ops in single-process runs).  Must run BEFORE
+# this module's own ``import jax`` and any ``jax.devices()`` / mesh
+# creation so a multi-node srun yields the full global device set.
+from runtime import bootstrap
+bootstrap()
 
 import jax
 import jax.numpy as jnp
@@ -93,10 +90,6 @@ from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 jax.config.update("jax_enable_x64", True)
-
-from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
-init_jax_distributed()
-fallback_to_cpu_if_no_gpu_backend()
 
 from solvers.lanczos import block_lanczos_eig_jit
 from common.fft_helpers import make_sharded_ifftn_3d
