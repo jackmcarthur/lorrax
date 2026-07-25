@@ -69,7 +69,12 @@ _CUDA_TARGET_SYMBOLS = {
 
 # Host variants of the slate targets (src/ffi/slate/cpp/host_ffi.cc) —
 # same target names as the CUDA table, registered under platform="cpu" —
-# plus the host-only ScaLAPACK targets (src/ffi/scalapack/, Cray LibSci).
+# plus the host-only ScaLAPACK targets (src/ffi/scalapack/, Cray LibSci),
+# plus the phdf5 read handlers (src/ffi/phdf5/cpp/read_ffi.cc compiled with
+# -DLORRAX_FFI_NO_CUDA).  The phdf5 target STRINGS are identical to the CUDA
+# table so the ffi.phdf5.read ffi_call sites resolve by lowering platform;
+# only the C++ SYMBOL names differ (PhdfRead*HostFfi vs PhdfRead*Ffi) so the
+# two platform .so's can co-exist under RTLD_GLOBAL.
 _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_eigh":              "SlateEighHostFfi",
     "lorrax_slate_potrf":             "SlatePotrfHostFfi",
@@ -77,6 +82,9 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_batched_potrf":     "SlateBatchedPotrfHostFfi",
     "lorrax_slate_batched_trsm":      "SlateBatchedTrsmHostFfi",
     "lorrax_scalapack_batched_solve_lu": "ScalapackBatchedSolveLuHostFfi",
+    "lorrax_phdf5_read":              "PhdfReadHostFfi",
+    "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkHostFfi",
+    "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionHostFfi",
 }
 
 # Per-platform library spec: .so filename, env-var override, in-tree build
@@ -166,6 +174,11 @@ def _set_argtypes(lib: ctypes.CDLL, platform: str) -> None:
     """Declare argtypes/restype for the lrx_* entry points ``lib`` exports."""
     if platform == "CUDA":
         _declare_cuda_stack(lib)
+    # phdf5 lifecycle (CUDA-free) + slate lifecycle (pure MPI) are exported by
+    # WHICHEVER platform library was built with them — the phdf5 host read
+    # path drives lrx_phdf5_* through liblorrax_ffi_host.so.  Both declare
+    # under hasattr guards so a partial build is fine.
+    _declare_phdf5(lib)
     _declare_slate(lib)
 
 
@@ -209,7 +222,14 @@ def _declare_cuda_stack(lib: ctypes.CDLL) -> None:
     ]
     lib.lrx_version_info.restype = ctypes.c_int
 
-    # phdf5 lifecycle — absent from a -DLORRAX_FFI_HAVE_PHDF5=0 build.
+
+def _declare_phdf5(lib: ctypes.CDLL) -> None:
+    """parallel-HDF5 lifecycle — exported by whichever platform library was
+    built with the phdf5 subpackage (the CUDA-free wrappers in
+    phdf5/cpp/api.cc compile into BOTH liblorrax_ffi.so and, for the host
+    read path, liblorrax_ffi_host.so).  Absent from a
+    -DLORRAX_FFI_HAVE_PHDF5=0 build; declared under a hasattr guard so
+    loading such a .so doesn't fail."""
     if not hasattr(lib, "lrx_phdf5_open"):
         return
     lib.lrx_phdf5_open.argtypes = [
@@ -379,13 +399,19 @@ def version_info() -> dict:
 
 
 # ---- phdf5 ----------------------------------------------------------------
+# ``platform`` selects the library that owns the collective context: "CUDA"
+# for the GPU MPI-IO path, "cpu" for the host read path (liblorrax_ffi_host.so
+# built with the phdf5 subpackage).  ``None`` follows the JAX default backend,
+# so the WFN loader's phdf5 backend works on both GPU and CPU nodes without a
+# platform argument.  A PhdfCtx handle is a plain int64 address, so the
+# lifecycle calls just need to reach the .so that created it.
 def phdf5_open(path: str, p: int, q: int, rank: int, world_size: int,
-               mode_flag: int) -> int:
+               mode_flag: int, platform: Optional[str] = None) -> int:
     """Collective open/create of a parallel-HDF5 file.
 
     mode_flag: 0 = truncate ('w'), 1 = append-or-create ('a'), 2 = read-only ('r').
     """
-    lib = get_lib("CUDA")
+    lib = get_lib(platform)
     ctx_out = ctypes.c_int64(0)
     err = ctypes.create_string_buffer(_ERR_CAP)
     rc = lib.lrx_phdf5_open(
@@ -398,16 +424,16 @@ def phdf5_open(path: str, p: int, q: int, rank: int, world_size: int,
     return int(ctx_out.value)
 
 
-def phdf5_close(ctx_handle: int) -> None:
-    get_lib("CUDA").lrx_phdf5_close(int(ctx_handle))
+def phdf5_close(ctx_handle: int, platform: Optional[str] = None) -> None:
+    get_lib(platform).lrx_phdf5_close(int(ctx_handle))
 
 
-def phdf5_init_mpi() -> None:
+def phdf5_init_mpi(platform: Optional[str] = None) -> None:
     """Eagerly init MPI_THREAD_MULTIPLE so the first ``open_file`` in the
     hot path doesn't pay the ~400 ms MPI_Init_thread cost.  Collective
     across all ranks; idempotent after first call.
     """
-    get_lib("CUDA").lrx_phdf5_init_mpi()
+    get_lib(platform).lrx_phdf5_init_mpi()
 
 
 # Mapping from numpy/jax dtype to the integer tag matching xla::ffi::DataType.
@@ -422,7 +448,8 @@ _DTYPE_TAG = {
 
 
 def phdf5_ensure_dataset(ctx_handle: int, ds_name: str,
-                         shape, dtype_name: str) -> int:
+                         shape, dtype_name: str,
+                         platform: Optional[str] = None) -> int:
     """Collective create/open of an N-D HDF5 dataset.  Returns hid_t as int64.
 
     ``shape`` is any sequence of non-negative ints (tuple, list, numpy array).
@@ -432,7 +459,7 @@ def phdf5_ensure_dataset(ctx_handle: int, ds_name: str,
     shape = tuple(int(s) for s in shape)
     if not shape:
         raise ValueError("phdf5_ensure_dataset: shape must be non-empty")
-    lib = get_lib("CUDA")
+    lib = get_lib(platform)
     ShapeArr = ctypes.c_int64 * len(shape)
     shape_buf = ShapeArr(*shape)
     ds_id_out = ctypes.c_int64(0)
@@ -449,9 +476,10 @@ def phdf5_ensure_dataset(ctx_handle: int, ds_name: str,
     return int(ds_id_out.value)
 
 
-def phdf5_open_dataset_ro(ctx_handle: int, ds_name: str) -> int:
+def phdf5_open_dataset_ro(ctx_handle: int, ds_name: str,
+                          platform: Optional[str] = None) -> int:
     """Collective H5Dopen of an existing dataset.  Returns hid_t as int64."""
-    lib = get_lib("CUDA")
+    lib = get_lib(platform)
     ds_id_out = ctypes.c_int64(0)
     err = ctypes.create_string_buffer(_ERR_CAP)
     rc = lib.lrx_phdf5_open_dataset_ro(

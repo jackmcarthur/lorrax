@@ -15,16 +15,12 @@
 
 #include "../../cusolvermp/cpp/ctx.h"
 
-// LORRAX_FFI_HAVE_PHDF5 defaults to 1 (Perlmutter/Cray builds the phdf5
-// subpackage).  A port without parallel HDF5 / MPI builds with
-// -DLORRAX_FFI_HAVE_PHDF5=0 (see config/frontera/), which drops the phdf5
-// lifecycle entry points below; ffi_loader.py skips the absent symbols.
-#ifndef LORRAX_FFI_HAVE_PHDF5
-#define LORRAX_FFI_HAVE_PHDF5 1
-#endif
-#if LORRAX_FFI_HAVE_PHDF5
-#include "../../phdf5/cpp/ctx.h"
-#endif
+// The parallel-HDF5 lifecycle extern-C wrappers (lrx_phdf5_*) now live in
+// the CUDA-free phdf5/cpp/api.cc so the SAME TU compiles into both the CUDA
+// library and the host library.  A build with -DLORRAX_FFI_HAVE_PHDF5=ON
+// adds phdf5/cpp/api.cc to the source list (see common/cpp/CMakeLists.txt);
+// a build without it simply omits that TU and ffi_loader.py skips the
+// absent phdf5 symbols.
 
 namespace lrx = lorrax_ffi::cusolvermp;
 
@@ -40,19 +36,6 @@ namespace lorrax_ffi::cusolvermp {
                                 uintptr_t device_ptr,
                                 int nelems);
 }
-
-#if LORRAX_FFI_HAVE_PHDF5
-namespace lorrax_ffi::phdf5 {
-    // Implemented in phdf5/cpp/context.cc
-    PhdfCtx* open_ctx(const std::string& path, int p, int q,
-                      int rank, int world_size, int mode_flag);
-    void     close_ctx(PhdfCtx* ctx);
-    hid_t    ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
-                            const int64_t* shape, int ndim, int dtype_tag);
-    hid_t    open_dataset_ro(PhdfCtx* ctx, const std::string& ds_name);
-    void     ensure_mpi_initialized();
-}
-#endif
 
 // ---------------------------------------------------------------------------
 // extern "C" ABI.  All functions set *err_out (size 512) to a message on
@@ -128,92 +111,8 @@ int lrx_version_info(int* cuda_rt, int* cuda_drv, int* nccl_ver) {
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-//  parallel-HDF5 subpackage lifecycle
-// ---------------------------------------------------------------------------
-#if LORRAX_FFI_HAVE_PHDF5
-
-// Open (or create) a parallel-HDF5 file collectively.
-// mode_flag: 0 = 'w' truncate, 1 = 'a' append-or-create, 2 = 'r' read-only
-// Returns 0 on success; sets err_out and returns 1 on failure.
-int lrx_phdf5_open(
-    const char* path,
-    int p, int q, int rank, int world_size,
-    int mode_flag,
-    int64_t* ctx_out,
-    char* err_out, int err_cap)
-{
-    try {
-        auto* ctx = lorrax_ffi::phdf5::open_ctx(
-            std::string(path), p, q, rank, world_size, mode_flag);
-        *ctx_out = reinterpret_cast<int64_t>(ctx);
-        return 0;
-    } catch (const std::exception& e) {
-        if (err_out && err_cap > 0) {
-            snprintf(err_out, err_cap, "%s", e.what());
-        }
-        return 1;
-    }
-}
-
-void lrx_phdf5_close(int64_t ctx_handle) {
-    lorrax_ffi::phdf5::close_ctx(
-        reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle));
-}
-
-// Eager MPI init.  Safe to call multiple times.  Use at program
-// startup to move the ~400 ms MPI_Init_thread(THREAD_MULTIPLE) cost
-// off the first-open critical path.
-void lrx_phdf5_init_mpi(void) {
-    lorrax_ffi::phdf5::ensure_mpi_initialized();
-}
-
-// Collective H5Dcreate/H5Dopen.  All ranks must call concurrently.
-// shape[ndim] is the N-D dataset shape; ndim >= 1.  dtype_tag: 1=F32
-// 2=F64 3=S32 4=S64 5=C64 6=C128 (matches xla::ffi::DataType).
-// Returns 0 on success and writes the hid_t to *ds_id_out; sets err_out
-// and returns 1 on failure.
-int lrx_phdf5_ensure_dataset(
-    int64_t ctx_handle,
-    const char* ds_name,
-    const int64_t* shape, int ndim,
-    int dtype_tag,
-    int64_t* ds_id_out,
-    char* err_out, int err_cap)
-{
-    try {
-        hid_t ds = lorrax_ffi::phdf5::ensure_dataset(
-            reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
-            std::string(ds_name), shape, ndim, dtype_tag);
-        *ds_id_out = (int64_t)ds;
-        return 0;
-    } catch (const std::exception& e) {
-        if (err_out && err_cap > 0) snprintf(err_out, err_cap, "%s", e.what());
-        return 1;
-    }
-}
-
-// Collective H5Dopen (read-only semantics; no create).  All ranks must
-// call concurrently.  Returns 0 on success and writes the hid_t to
-// *ds_id_out; sets err_out and returns 1 on failure.
-int lrx_phdf5_open_dataset_ro(
-    int64_t ctx_handle,
-    const char* ds_name,
-    int64_t* ds_id_out,
-    char* err_out, int err_cap)
-{
-    try {
-        hid_t ds = lorrax_ffi::phdf5::open_dataset_ro(
-            reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
-            std::string(ds_name));
-        *ds_id_out = (int64_t)ds;
-        return 0;
-    } catch (const std::exception& e) {
-        if (err_out && err_cap > 0) snprintf(err_out, err_cap, "%s", e.what());
-        return 1;
-    }
-}
-
-#endif  // LORRAX_FFI_HAVE_PHDF5
+// The parallel-HDF5 lifecycle wrappers (lrx_phdf5_open/close/init_mpi/
+// ensure_dataset/open_dataset_ro) live in phdf5/cpp/api.cc (CUDA-free,
+// shared with the host library).
 
 }  // extern "C"
