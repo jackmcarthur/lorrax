@@ -289,13 +289,28 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     for bc_range, psi_bc_Y in iter_psi_rchunk_bandwise(
             wfn, sym, meta, mesh_xy, band_range, 0, n_rtot, bispinor,
             band_chunk_size=band_chunk_size,
-            band_chunk_ranges=band_chunk_ranges):
+            band_chunk_ranges=band_chunk_ranges,
+            band_pad_to=_bc):
         bc = bc_range[1] - bc_range[0]
         bc_lo = bc_range[0] - b_start
         bc_hi = bc_range[1] - b_start
-        UH_bc = UH_kb[:, :, bc_lo:bc_hi].reshape(rank, nk * bc)
+        # ``iter_psi_rchunk_bandwise(band_pad_to=_bc)`` zero-pads every
+        # chunk's band axis to the SINGLE width ``w`` (= _bc for full
+        # chunks; the remainder chunk is padded up to it too), so
+        # ``to_rchunk`` and ``_accum`` compile ONCE for the whole sweep
+        # instead of recompiling per distinct remainder width.  The
+        # contraction operand UH_bc has to match that width: the real
+        # bands occupy columns [0, bc); the trailing (w - bc) columns
+        # multiply psi's zero pad-bands, so zero-filling them keeps Q
+        # bit-identical.  (This also removes a latent shape mismatch when
+        # the loader's own p_band round-up already made w > bc.)
+        w = int(psi_bc_Y.shape[1])
+        UH_bc_kb = UH_kb[:, :, bc_lo:bc_hi]              # (rank, nk, bc)
+        if w > bc:
+            UH_bc_kb = jnp.pad(UH_bc_kb, ((0, 0), (0, 0), (0, w - bc)))
+        UH_bc = UH_bc_kb.reshape(rank, nk * w)
 
-        accum = _make_accum_kernel(rank, bc, nspinor, mesh_xy,
+        accum = _make_accum_kernel(rank, w, nspinor, mesh_xy,
                                    sharding_y, grid_xy)
         Q = accum(UH_bc, inv_s, psi_bc_Y, Q)
         chunk_count += 1

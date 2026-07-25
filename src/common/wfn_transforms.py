@@ -1574,6 +1574,7 @@ def iter_psi_rchunk_bandwise(
     band_chunk_size: int = 16,
     k_chunk_size: int = 0,
     band_chunk_ranges: list[tuple[int, int]] | None = None,
+    band_pad_to: int | None = None,
 ):
     """Generator: yield ``(bc_range, psi_bc_Y)`` one band chunk at a time.
 
@@ -1590,6 +1591,16 @@ def iter_psi_rchunk_bandwise(
     yielded chunk lies fully inside one (or both) of those ranges and
     no out-of-range einsums ever dispatch.  When None, contiguous
     chunks of ``band_chunk_size`` are built from ``band_range``.
+
+    ``band_pad_to`` zero-pads every yielded chunk's band axis up to a
+    single uniform width (the full chunk width) BEFORE ``to_rchunk``,
+    so the ``to_rchunk`` shard_map — keyed on ``psi.shape`` — sees ONE
+    band-dim across the whole sweep and compiles exactly ONCE instead
+    of once-per-distinct-remainder-width.  The pad rows are physically
+    zero, so a caller that accumulates a band-contraction (the Galerkin
+    ``UH_bc @ psi`` fold) must slice/zero-pad its contraction operand to
+    the same width — the extra bands then contribute exactly zero.
+    ``None`` disables the pad (legacy per-chunk-shape behaviour).
 
     Uses :class:`file_io.wfn_loader.WfnLoader` + ``to_rchunk``.  ``sym``
     is unused (loader builds its own SymMaps).
@@ -1639,6 +1650,21 @@ def iter_psi_rchunk_bandwise(
             psi_G_flat = loader.load(
                 bands=bc_range, k="full_bz",
                 sharding=sharding_load, bispinor=bispinor)
+            # Uniform-band-pad: zero-fill the band axis to ``band_pad_to``
+            # so ``to_rchunk`` sees ONE shape across every chunk (compiles
+            # once; the trailing zero bands survive the FFT + r-slice as
+            # zeros and are dropped by the caller's zero-padded UH slice).
+            if (band_pad_to is not None
+                    and int(psi_G_flat.shape[1]) < int(band_pad_to)):
+                _pad = int(band_pad_to) - int(psi_G_flat.shape[1])
+                psi_G_flat = jnp.concatenate(
+                    [psi_G_flat,
+                     jnp.zeros((psi_G_flat.shape[0], _pad,
+                                psi_G_flat.shape[2], psi_G_flat.shape[3]),
+                               dtype=psi_G_flat.dtype)],
+                    axis=1)
+                psi_G_flat = jax.lax.with_sharding_constraint(
+                    psi_G_flat, NamedSharding(mesh_xy, sharding_load))
             psi_bc_Y = to_rchunk(
                 psi_G_flat, g_index_full, meta.fft_grid,
                 int(r_start), n_rchunk, mesh=mesh_xy, norm="ortho",
