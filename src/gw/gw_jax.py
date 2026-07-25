@@ -30,8 +30,8 @@ the q→0 Coulomb head is a scalar channel threaded through every stage,
 not a stage; W is evaluated at exactly the two frequencies {0, iω_p} a
 one-pole model is determined by.  See ``docs/theory/physics.md``.
 """
-from runtime import set_default_env
-set_default_env()  # BEFORE `import jax` — JAX reads env at import time.
+from runtime import bootstrap
+bootstrap()  # env + jax.distributed + CPU fallback — BEFORE `import jax`.
 
 import argparse
 import gc
@@ -42,10 +42,6 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 jax.config.update("jax_enable_x64", True)
-
-from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
-init_jax_distributed()
-fallback_to_cpu_if_no_gpu_backend()
 
 from file_io import (
     WFNReader,

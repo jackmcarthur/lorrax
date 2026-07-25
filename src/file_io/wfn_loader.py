@@ -284,25 +284,18 @@ class WfnLoader:
                 return "eager"
         except Exception:
             return "eager"
-        # GPU: collective MPI-IO read on the CUDA FFI library.
+        # GPU first, then CPU: the SAME collective MPI-IO read path, served
+        # by whichever platform's FFI library exports the kchunk-union read
+        # handler.  ``ffi_loader.has_phdf5_read`` owns the per-platform
+        # symbol probe (adding a new FFI target platform touches only
+        # ffi_loader._PLATFORMS, not this ladder).  The h5py twin below is
+        # only for when no phdf5-capable .so exists on either platform.
         try:
-            from ffi.common.ffi_loader import get_lib
-            get_lib("CUDA")
-            from ffi.phdf5 import open_file as _of  # noqa: F401
-            return "phdf5"
-        except Exception:
-            pass
-        # CPU: the SAME FFI read path via the host library, IF it was built
-        # with the phdf5 read handlers (liblorrax_ffi_host.so exposing
-        # PhdfReadKchunkUnionHostFfi).  This is the single-read-path design —
-        # the h5py twin below is only for when no such .so exists.
-        try:
-            from ffi.common.ffi_loader import get_lib, _HOST_TARGET_SYMBOLS
-            _hostlib = get_lib("cpu")
-            _sym = _HOST_TARGET_SYMBOLS.get("lorrax_phdf5_read_kchunk_union")
-            if _sym is not None and hasattr(_hostlib, _sym):
-                from ffi.phdf5 import open_file as _of  # noqa: F401
-                return "phdf5"
+            from ffi.common.ffi_loader import has_phdf5_read
+            for _plat in ("CUDA", "cpu"):
+                if has_phdf5_read(_plat):
+                    from ffi.phdf5 import open_file as _of  # noqa: F401
+                    return "phdf5"
         except Exception:
             pass
         # No phdf5-capable FFI library on either platform: fall back to the
@@ -564,8 +557,86 @@ class WfnLoader:
         return named, int(p_band)
 
     # ------------------------------------------------------------------
-    # The main load
+    # Shared sharded-read scaffolding (used by the phdf5 paths AND the
+    # §5b process-local eager path — single-sourced so the "learn my
+    # band block / assemble sharded" idiom is written exactly once)
     # ------------------------------------------------------------------
+    def _kplan(
+        self, k_idxs: np.ndarray, unfold: bool,
+    ) -> tuple[np.ndarray, int, np.ndarray, int]:
+        """Union-read bookkeeping shared by both phdf5 read paths.
+
+        Maps the requested k-set to the ascending-sorted union of IBZ
+        source k-points (each read from disk exactly once) and each
+        request's position in that union — the axis along which the
+        union read concatenates its output.
+
+        Returns ``(ibz_unique_sorted, n_reads, position_in_reads, n_k)``.
+        """
+        if unfold:
+            static = self._ensure_phdf5_static()
+            ibz_per_full = np.asarray(static["ibz_per_full"])
+            ibz_per_k = ibz_per_full[np.asarray(k_idxs, dtype=np.int32)]
+        else:
+            # k_idxs are already IBZ indices.
+            ibz_per_k = np.asarray(k_idxs, dtype=np.int32)
+        ibz_unique_sorted = np.unique(ibz_per_k).astype(np.int32)
+        n_reads = int(ibz_unique_sorted.size)
+        # ``position_in_reads[j]`` = where ibz_per_k[j] sits in the
+        # ascending-sorted union.
+        position_in_reads = np.searchsorted(
+            ibz_unique_sorted, ibz_per_k).astype(np.int32)
+        return ibz_unique_sorted, n_reads, position_in_reads, int(len(k_idxs))
+
+    def _assemble_process_local(
+        self,
+        *,
+        global_shape: tuple[int, ...],
+        sharding: NamedSharding,
+        dtype,
+        sharded_axis: int,
+        fill_local,
+    ) -> jax.Array:
+        """Learn THIS rank's block of a band-sharded global array and
+        assemble it from a per-rank host build — the shared scaffold of
+        :meth:`_eager_build_process_local` and :meth:`_phdf5_host_build`.
+
+        Steps (the slab-io process-local idiom, written once):
+
+          1. Materialise a cheap sharded zero proto via the lru-cached
+             :func:`_sharded_zero_proto_fn` (each device makes only its
+             own zero shard; compiles ONCE per (shape, dtype, sharding)
+             signature — no per-call lambda re-lowering).
+          2. ``_local_shard_and_global_offset`` reports the local slab's
+             shape + global offset.
+          3. Validate that ONLY ``sharded_axis`` is sharded — a stray
+             non-band spec fails loud rather than silently wrong.
+          4. ``fill_local(axis_offset, local_shape) -> np.ndarray``
+             builds the rank's host block (caller owns zero-fill of pad
+             rows / past-EOF rows).
+          5. ``jax.make_array_from_single_device_arrays`` assembles the
+             global array — no rank materialises the full host slab.
+        """
+        from ._slab_io_mpi_host import _local_shard_and_global_offset
+        global_shape = tuple(int(s) for s in global_shape)
+        proto = _sharded_zero_proto_fn(global_shape, dtype, sharding)()
+        local_zero, offset = _local_shard_and_global_offset(proto)
+        local_shape = tuple(int(x) for x in local_zero.shape)
+        del proto, local_zero
+        if any(
+            ax != sharded_axis
+            and (int(offset[ax]) != 0 or local_shape[ax] != global_shape[ax])
+            for ax in range(len(global_shape))
+        ):
+            raise ValueError(
+                f"process-local load supports only axis-{sharded_axis} "
+                f"(band) sharding; got offset={tuple(int(o) for o in offset)} "
+                f"local_shape={local_shape} for global {global_shape}.")
+        local_np = fill_local(int(offset[sharded_axis]), local_shape)
+        local_arr = jax.device_put(local_np, jax.local_devices()[0])
+        return jax.make_array_from_single_device_arrays(
+            global_shape, sharding, [local_arr])
+
     # ------------------------------------------------------------------
     # phdf5 backend — collective FFI read + on-device unfold
     # ------------------------------------------------------------------
@@ -676,7 +747,7 @@ class WfnLoader:
         """
         from ffi.phdf5.read import read_kchunk_union_sharded
 
-        static = self._ensure_phdf5_static()
+        self._ensure_phdf5_static()   # side effect: opens the phdf5 ctx
         ctx = self._phdf5_ctx
         assert ctx is not None
         p_x = int(self._mesh.shape["x"])
@@ -694,23 +765,9 @@ class WfnLoader:
         b_lo_logical = int(b_lo)
         b_hi_logical = int(b_hi)
 
-        # Determine the union of IBZ k-points to read, and the position
-        # of each requested k in that union.
-        if unfold:
-            ibz_per_full = np.asarray(static["ibz_per_full"])
-            ibz_per_k = ibz_per_full[np.asarray(k_idxs, dtype=np.int32)]
-        else:
-            # k_idxs are already IBZ indices.
-            ibz_per_k = np.asarray(k_idxs, dtype=np.int32)
-
-        ibz_unique_sorted = np.unique(ibz_per_k).astype(np.int32)
-        n_reads = int(ibz_unique_sorted.size)
-        # ``position_in_reads[j]`` = where ibz_per_k[j] sits in the
-        # ascending-sorted union (the dim along which read_kchunk_union
-        # returns its concatenated output).
-        position_in_reads = np.searchsorted(
-            ibz_unique_sorted, ibz_per_k).astype(np.int32)
-        n_k = int(len(k_idxs))
+        # Union-read k-plan (shared with the host twin via _kplan).
+        ibz_unique_sorted, n_reads, position_in_reads, n_k = self._kplan(
+            k_idxs, unfold)
 
         # Hyperslab offsets/counts for the union read.
         # Dataset layout: (mnband, nspinor, ngktot, 2) f64; kchunk_axis=2.
@@ -852,12 +909,7 @@ class WfnLoader:
         fix for the eager path's per-k/per-chunk numpy-unfold compile
         storm.  Output: ``(n_k, nb_padded, nspinor, ngkmax)`` c128.
         """
-        from ._slab_io_mpi_host import _local_shard_and_global_offset
-
-        static = self._ensure_phdf5_static()
-        p_x = int(self._mesh.shape["x"])
-        p_y = int(self._mesh.shape["y"])
-        world = p_x * p_y
+        world = int(self._mesh.shape["x"]) * int(self._mesh.shape["y"])
         ns = int(self.nspinor)
         ngkmax = int(self.ngkmax)
         nb = int(nb_padded)
@@ -883,58 +935,37 @@ class WfnLoader:
             except Exception:
                 pass
 
-        # --- k-plan (identical bookkeeping to _phdf5_build) ---
-        if unfold:
-            ibz_per_full = np.asarray(static["ibz_per_full"])
-            ibz_per_k = ibz_per_full[np.asarray(k_idxs, dtype=np.int32)]
-        else:
-            ibz_per_k = np.asarray(k_idxs, dtype=np.int32)
-        ibz_unique_sorted = np.unique(ibz_per_k).astype(np.int32)
-        n_reads = int(ibz_unique_sorted.size)
-        position_in_reads = np.searchsorted(
-            ibz_unique_sorted, ibz_per_k).astype(np.int32)
-        n_k = int(len(k_idxs))
+        # Union-read k-plan (identical bookkeeping to _phdf5_build).
+        ibz_unique_sorted, n_reads, position_in_reads, n_k = self._kplan(
+            k_idxs, unfold)
 
-        # --- learn THIS rank's band block via the §5b sharded-zero proto ---
-        # (cached factory → compiles once, no per-chunk lambda re-lower).
-        read_spec = NamedSharding(
-            self._mesh, P(("x", "y"), None, None, None, None))
-        global_read_shape = (nb, ns, n_reads, ngkmax, 2)
-        proto = _sharded_zero_proto_fn(
-            global_read_shape, jnp.float64, read_spec)()
-        local_zero, offset = _local_shard_and_global_offset(proto)
-        local_shape = tuple(int(x) for x in local_zero.shape)
-        del proto, local_zero
-        # Only the band axis (0) may be sharded; the rest must be replicated
-        # so a stray non-band spec fails loud rather than silently wrong.
-        if tuple(int(o) for o in offset[1:]) != (0, 0, 0, 0) or \
-                local_shape != (bands_per_rank, ns, n_reads, ngkmax, 2):
-            raise ValueError(
-                "_phdf5_host_build expects band-axis-only sharding "
-                f"P(('x','y'),None,None,None,None); got offset={offset} "
-                f"local_shape={local_shape} for global {global_read_shape}.")
-        band_off = int(offset[0])   # 0..nb, in padded band coords
+        def _fill(band_off: int, local_shape: tuple[int, ...]) -> np.ndarray:
+            # Host union read: fill this rank's (bpr, ns, n_reads, ngk, 2).
+            local = np.zeros(local_shape, dtype=np.float64)
+            # File band rows for this rank's block, clamped so pad bands
+            # (past the logical window b_hi) and past-EOF bands (past
+            # mnband) stay zero — matching the eager zero-fill contract.
+            fb_lo = b_lo + band_off
+            fb_hi = min(fb_lo + local_shape[0], b_hi, mnband_file)
+            n_real = max(0, fb_hi - fb_lo)
+            if n_real > 0:
+                for r, ibz in enumerate(ibz_unique_sorted):
+                    start = int(self._kpt_starts[int(ibz)])
+                    ngk = int(self.ngk[int(ibz)])
+                    # (n_real, ns, ngk, 2) read-only hyperslab.
+                    raw = self._coeffs_ds[fb_lo:fb_hi, :, start:start + ngk, :]
+                    local[:n_real, :, r, :ngk, :] = raw
+            return local
 
-        # --- host union read: fill this rank's (bpr, ns, n_reads, ngk, 2) ---
-        local = np.zeros(
-            (bands_per_rank, ns, n_reads, ngkmax, 2), dtype=np.float64)
-        # File band rows for this rank's block, clamped so pad bands (past
-        # the logical window b_hi) and past-EOF bands (past mnband) stay
-        # zero — matching the eager backend's zero-fill contract.
-        fb_lo = b_lo + band_off
-        fb_hi = min(fb_lo + bands_per_rank, b_hi, mnband_file)
-        n_real = max(0, fb_hi - fb_lo)
-        if n_real > 0:
-            for r, ibz in enumerate(ibz_unique_sorted):
-                start = int(self._kpt_starts[int(ibz)])
-                ngk = int(self.ngk[int(ibz)])
-                # (n_real, ns, ngk, 2) read-only hyperslab.
-                raw = self._coeffs_ds[fb_lo:fb_hi, :, start:start + ngk, :]
-                local[:n_real, :, r, :ngk, :] = raw
-
-        local_arr = jax.device_put(local, jax.local_devices()[0])
-        cnk_at_ibz = jax.make_array_from_single_device_arrays(
-            global_read_shape, read_spec, [local_arr])
+        # Learn THIS rank's band block + assemble via the shared §5b
+        # process-local scaffold (cached proto → compiles once).
+        cnk_at_ibz = self._assemble_process_local(
+            global_shape=(nb, ns, n_reads, ngkmax, 2),
+            sharding=NamedSharding(
+                self._mesh, P(("x", "y"), None, None, None, None)),
+            dtype=jnp.float64,
+            sharded_axis=0,
+            fill_local=_fill)
 
         return self._phdf5_unfold_and_shard(
             cnk_at_ibz, k_idxs=k_idxs, unfold=unfold, n_reads=n_reads,
@@ -1078,9 +1109,9 @@ class WfnLoader:
     ) -> jax.Array:
         """(§5b) Process-local eager load: each rank builds only its band shard.
 
-        Reuses the slab-io helpers verbatim -- ``_local_shard_and_global_offset``
-        to learn THIS rank's band block from a cheap sharded zero proto, and
-        ``jax.make_array_from_single_device_arrays`` to assemble -- so no rank
+        Runs on the shared :meth:`_assemble_process_local` scaffold (cached
+        sharded-zero proto → ``_local_shard_and_global_offset`` → per-rank
+        host build → ``jax.make_array_from_single_device_arrays``) so no rank
         allocates the full (n_k, nb_padded, ns, ngkmax) host array.  The only
         WFN-specific part is the symmetry unfold, which stays in ``_eager_build``.
 
@@ -1088,46 +1119,30 @@ class WfnLoader:
         spec ``P(None, ('x','y'), None, None)``); asserts the rest are
         replicated so a different spec fails loud rather than silently wrong.
         """
-        from ._slab_io_mpi_host import _local_shard_and_global_offset
         ns = int(self.nspinor)
         ngkmax = int(self.ngkmax)
         n_k = int(len(k_idxs))
         nb_logical = int(b_hi) - int(b_lo)
-        global_shape = (n_k, int(nb_padded), ns, ngkmax)
 
-        # Cheap directly-sharded zero proto (each device makes its own zero
-        # shard -- no full host/device allocation), then ask JAX which slab
-        # this rank owns.  Same trick as ``_slab_io_mpi_host.read_slab``.
-        proto = jax.jit(
-            lambda: jnp.zeros(global_shape, dtype=jnp.complex128),
-            out_shardings=named_sharding)()
-        local_zero, offset = _local_shard_and_global_offset(proto)
-        local_shape = tuple(int(x) for x in local_zero.shape)
-        del proto, local_zero
-        if (offset[0], offset[2], offset[3]) != (0, 0, 0) or \
-                local_shape[0] != n_k or local_shape[2] != ns or \
-                local_shape[3] != ngkmax:
-            raise ValueError(
-                "process-local eager load supports only band-axis sharding "
-                f"(P(None, band, None, None)); got offset={offset} "
-                f"local_shape={local_shape} for global {global_shape}.")
-        local_nb = local_shape[1]
-        band_off = int(offset[1])
+        def _fill(band_off: int, local_shape: tuple[int, ...]) -> np.ndarray:
+            # Real bands in this rank's block map to its FRONT [0:n_real);
+            # the rest (pad bands, or blocks past nb_logical) stay zero.
+            local_nb = local_shape[1]
+            real_hi = min(band_off + local_nb, nb_logical)
+            n_real = max(0, real_hi - band_off)
+            if n_real > 0:
+                return self._eager_build(
+                    b_lo=int(b_lo) + band_off,
+                    b_hi=int(b_lo) + band_off + n_real,
+                    k_idxs=k_idxs, unfold=unfold, nb_padded=local_nb)
+            return np.zeros(local_shape, dtype=np.complex128)
 
-        # Real bands in this rank's block map to its FRONT [0:n_real); the rest
-        # (pad bands, or blocks entirely past nb_logical) stay zero.
-        real_hi = min(band_off + local_nb, nb_logical)
-        n_real = max(0, real_hi - band_off)
-        if n_real > 0:
-            local_np = self._eager_build(
-                b_lo=int(b_lo) + band_off, b_hi=int(b_lo) + band_off + n_real,
-                k_idxs=k_idxs, unfold=unfold, nb_padded=local_nb)
-        else:
-            local_np = np.zeros(local_shape, dtype=np.complex128)
-
-        local_arr = jax.device_put(local_np, jax.local_devices()[0])
-        return jax.make_array_from_single_device_arrays(
-            global_shape, named_sharding, [local_arr])
+        return self._assemble_process_local(
+            global_shape=(n_k, int(nb_padded), ns, ngkmax),
+            sharding=named_sharding,
+            dtype=jnp.complex128,
+            sharded_axis=1,
+            fill_local=_fill)
 
     # ------------------------------------------------------------------
     # Iterator: band chunks

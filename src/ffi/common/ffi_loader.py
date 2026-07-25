@@ -42,7 +42,7 @@ from typing import Dict, Optional
 import jax
 import jax.ffi
 
-__all__ = ["get_lib"]
+__all__ = ["get_lib", "has_target", "has_phdf5_read"]
 
 _LIBS: Dict[str, ctypes.CDLL] = {}
 
@@ -316,6 +316,38 @@ def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
         except Exception as exc:
             if "already registered" not in str(exc).lower():
                 raise
+
+
+def has_target(target_name: str, platform: str) -> bool:
+    """True when ``platform``'s FFI library is loadable AND exports the C++
+    handler for XLA target ``target_name`` (per that platform's symbol
+    table).  Never raises: returns False when the library is absent, fails
+    to load, or was built without the handler (partial builds legitimately
+    omit symbols — see :func:`_register_ffi_targets`).
+
+    This is THE capability probe for backend auto-pick logic (e.g.
+    ``WfnLoader._auto_pick_backend``).  Callers must not reach into the
+    private ``_CUDA_TARGET_SYMBOLS`` / ``_HOST_TARGET_SYMBOLS`` tables:
+    the target-name → C++-symbol mapping is per-platform and owned here,
+    so adding a new FFI target platform only touches ``_PLATFORMS``.
+    """
+    spec = _PLATFORMS.get(platform)
+    if spec is None:
+        return False
+    sym = spec["targets"].get(target_name)
+    if sym is None:
+        return False
+    try:
+        return hasattr(get_lib(platform), sym)
+    except Exception:
+        return False
+
+
+def has_phdf5_read(platform: str) -> bool:
+    """True when ``platform``'s FFI library can serve the collective
+    kchunk-union WFN read — the probe ``WfnLoader._auto_pick_backend``
+    uses to pick the ``phdf5`` backend on that platform."""
+    return has_target("lorrax_phdf5_read_kchunk_union", platform)
 
 
 def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
