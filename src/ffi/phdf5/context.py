@@ -33,6 +33,19 @@ def validate_mesh_2d(mesh: Mesh) -> tuple[int, int]:
     return int(mesh.shape["x"]), int(mesh.shape["y"])
 
 
+def _platform_for_mesh(mesh: Mesh) -> str:
+    """Which FFI library owns the collective context for ``mesh`` — "CUDA"
+    for a GPU mesh, "cpu" for a CPU mesh.  The phdf5 read handlers are
+    registered under both platform strings (same jax.ffi target names), and
+    the collective open/dataset lifecycle must go through the matching .so.
+    """
+    try:
+        plat = mesh.devices.flat[0].platform
+    except Exception:
+        plat = ""
+    return "CUDA" if plat in ("gpu", "cuda") else "cpu"
+
+
 _MODE_FLAGS = {"w": 0, "a": 1, "r": 2}
 
 
@@ -59,7 +72,8 @@ def open_file(path: str, *, mesh: Mesh, mode: str = "w") -> int:
     """
     if mode not in _MODE_FLAGS:
         raise ValueError(f"mode must be w/a/r; got {mode!r}")
-    ffi_loader.get_lib("CUDA")
+    platform = _platform_for_mesh(mesh)
+    ffi_loader.get_lib(platform)
     p, q = validate_mesh_2d(mesh)
     if p * q != jax.process_count():
         raise ValueError(
@@ -71,7 +85,7 @@ def open_file(path: str, *, mesh: Mesh, mode: str = "w") -> int:
         ctx = ffi_loader.phdf5_open(
             path, p, q,
             int(jax.process_index()), int(jax.process_count()),
-            _MODE_FLAGS[mode],
+            _MODE_FLAGS[mode], platform=platform,
         )
         _FILE_CTXS[path] = ctx
         return ctx
@@ -81,7 +95,10 @@ def close_file(path_or_handle) -> None:
     """Collective close.  Accepts either a path (the original open_file
     argument) or the int handle returned from open_file."""
     global _FILE_CTXS
-    ffi_loader.get_lib("CUDA")
+    # Route to the process's own platform library (CUDA on a GPU node, cpu on
+    # a CPU node) — get_lib(None) follows the JAX default backend.  Hardcoding
+    # "CUDA" would fail to load on a CPU node where only the host lib exists.
+    ffi_loader.get_lib()
     with _LOCK:
         if isinstance(path_or_handle, str):
             ctx = _FILE_CTXS.pop(path_or_handle, None)
@@ -98,7 +115,7 @@ def _atexit_close_all() -> None:
     """Close any files still open at process exit — catches forgotten
     close_file calls.  Runs on every process."""
     try:
-        ffi_loader.get_lib("CUDA")
+        ffi_loader.get_lib()
     except Exception:
         return
     with _LOCK:

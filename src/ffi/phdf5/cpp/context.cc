@@ -12,7 +12,9 @@
 #include <string>
 #include <vector>
 
+#ifndef LORRAX_FFI_NO_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <mpi.h>
 #include <hdf5.h>
 
@@ -28,6 +30,7 @@ static void throw_if(hid_t id, const char* what) {
         throw std::runtime_error(os.str());
     }
 }
+#ifndef LORRAX_FFI_NO_CUDA
 static void throw_if_cuda(cudaError_t st, const char* what) {
     if (st != cudaSuccess) {
         std::ostringstream os;
@@ -35,6 +38,7 @@ static void throw_if_cuda(cudaError_t st, const char* what) {
         throw std::runtime_error(os.str());
     }
 }
+#endif
 
 // One-shot MPI init.  cuSOLVERMp doesn't use MPI, so if the caller
 // only ever touches cuSOLVERMp there's no MPI_Init surprise.  Either
@@ -70,21 +74,41 @@ static long env_long(const char* name, long default_value) {
     return parsed;
 }
 
+// Grow the staging buffer to >= need_bytes.  The read core H5Dreads into
+// this buffer identically on both platforms; only the allocator differs —
+// cudaMallocHost (page-locked, for fast async H2D) on the CUDA build vs a
+// plain aligned host malloc on the host build, where the staging tail is a
+// std::memcpy and page-locking would be pointless.
 bool ensure_pinned(PhdfCtx* ctx, size_t need_bytes) {
     if (ctx->pinned_capacity >= need_bytes) return true;
     if (ctx->pinned_buf) {
+#ifdef LORRAX_FFI_NO_CUDA
+        std::free(ctx->pinned_buf);
+#else
         cudaFreeHost(ctx->pinned_buf);
+#endif
         ctx->pinned_buf = nullptr;
         ctx->pinned_capacity = 0;
     }
     // Round up to a multiple of 2 MiB to reduce re-allocation churn
     // across writes of slightly varying sizes.
     size_t rounded = ((need_bytes + (2 << 20) - 1) / (2 << 20)) * (2 << 20);
+#ifdef LORRAX_FFI_NO_CUDA
+    // 64-byte aligned so the H5Dread lands on a cache-line boundary
+    // (rounded is a 2-MiB multiple, so it satisfies aligned_alloc's
+    // size-multiple-of-alignment requirement).
+    ctx->pinned_buf = std::aligned_alloc(64, rounded);
+    if (ctx->pinned_buf == nullptr) {
+        ctx->pinned_capacity = 0;
+        return false;
+    }
+#else
     if (cudaMallocHost(&ctx->pinned_buf, rounded) != cudaSuccess) {
         ctx->pinned_buf = nullptr;
         ctx->pinned_capacity = 0;
         return false;
     }
+#endif
     ctx->pinned_capacity = rounded;
     return true;
 }
@@ -297,6 +321,7 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     throw_if(ctx->dxpl_indep, "H5Pcreate(DATASET_XFER indep)");
     H5Pset_dxpl_mpio(ctx->dxpl_indep, H5FD_MPIO_INDEPENDENT);
 
+#ifndef LORRAX_FFI_NO_CUDA
     // --- private CUDA stream for D2H staging ---
     // Record the current device so the writer_thread can bind to the
     // same one; GPU pointers allocated under the main thread's JAX
@@ -312,15 +337,22 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
                   "cudaEventCreate(phdf5 d2h_event)");
     throw_if_cuda(cudaEventCreateWithFlags(&ctx->h2d_event, cudaEventDisableTiming),
                   "cudaEventCreate(phdf5 h2d_event)");
+#endif
 
     // --- start dedicated writer thread (FIFO task queue) ---
-    // The worker thread must attach to the CUDA primary context before
-    // any task runs — write tasks don't call CUDA themselves but read
-    // tasks do (cudaMemcpyAsync H2D after the H5Dread).  Without this
-    // the runtime returns cudaErrorMemoryAllocation on the first CUDA
-    // call from this thread.
+    // One thread per ctx drains ``task_queue`` in FIFO order so every
+    // rank enters the H5Dwrite/H5Dread MPI-IO collectives in the same
+    // program order (the collective correctness requirement).  On the
+    // CUDA build the worker must attach to the CUDA primary context
+    // before any task runs — read tasks call cudaMemcpyAsync H2D after
+    // the H5Dread; without cudaSetDevice the runtime returns
+    // cudaErrorMemoryAllocation on the first CUDA call from this thread.
+    // On the host build there is no device to bind and the staging tail
+    // is a plain memcpy.
     ctx->writer_thread = std::thread([ctx]() {
+#ifndef LORRAX_FFI_NO_CUDA
         cudaSetDevice(ctx->cuda_device);
+#endif
         for (;;) {
             std::function<void()> task;
             {
@@ -452,13 +484,19 @@ void close_ctx(PhdfCtx* ctx) {
     if (ctx->fcpl_id    >= 0) H5Pclose(ctx->fcpl_id);
 
     if (ctx->pinned_buf) {
+#ifdef LORRAX_FFI_NO_CUDA
+        std::free(ctx->pinned_buf);
+#else
         cudaFreeHost(ctx->pinned_buf);
+#endif
         ctx->pinned_buf = nullptr;
         ctx->pinned_capacity = 0;
     }
+#ifndef LORRAX_FFI_NO_CUDA
     if (ctx->d2h_event) cudaEventDestroy(ctx->d2h_event);
     if (ctx->h2d_event) cudaEventDestroy(ctx->h2d_event);
     if (ctx->stream)    cudaStreamDestroy(ctx->stream);
+#endif
 
     if (ctx->owns_comm && ctx->comm != MPI_COMM_NULL) {
         MPI_Comm_free(&ctx->comm);

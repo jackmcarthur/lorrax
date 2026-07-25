@@ -427,6 +427,7 @@ if(LORRAX_FFI_HAVE_CUBLASMP)
 endif()
 if(LORRAX_FFI_HAVE_PHDF5)
     list(APPEND LORRAX_FFI_SOURCES
+        ../../phdf5/cpp/api.cc
         ../../phdf5/cpp/context.cc
         ../../phdf5/cpp/write_ffi.cc
         ../../phdf5/cpp/read_ffi.cc

@@ -250,17 +250,21 @@ class WfnLoader:
           * Single-process JAX → eager (no benefit from a collective /
             union read).
           * Multi-process JAX + mesh + CUDA FFI .so loadable → phdf5
-            (collective MPI-IO read on GPU).  The probe must pin the CUDA
-            library: the phdf5 FFI lives only there, and a bare get_lib()
-            on a CPU backend would "succeed" by loading the slate-only
-            host library and then crash at the first open_file.
-          * Multi-process JAX + mesh, no CUDA → phdf5_host (host h5py
-            union read + the SAME on-device vectorised unfold kernel as
-            phdf5).  This replaces the eager per-k/per-chunk numpy unfold
-            — which re-lowers XLA on every band chunk (the ~2200-compile
-            storm) — with one shape-cached shard_map that compiles once.
-            Mathematically identical to eager (both single-source the
-            symmetry algebra through ``unfold_psi``'s primitives).
+            (collective MPI-IO read on GPU).  The probe pins the CUDA
+            library explicitly.
+          * Multi-process JAX + mesh + host FFI .so exposes the phdf5 read
+            handlers → phdf5 (collective MPI-IO read on CPU).  Same single
+            read path — the phdf5 C++ read core is shared and only its
+            device-staging tail switches (cudaMemcpyAsync H2D vs a host
+            memcpy); the ffi_call resolves to the host handler by lowering
+            platform and open_file routes the collective lifecycle to the
+            host lib (liblorrax_ffi_host.so built with the phdf5 subpackage).
+          * Multi-process JAX + mesh, no phdf5-capable FFI .so at all →
+            phdf5_host (the zero-FFI h5py union-read FALLBACK).  It feeds
+            the SAME on-device vectorised unfold kernel as the FFI path, so
+            it stays a drop-in for the collective read when the host FFI
+            library is unavailable — but it is now a fallback, not the
+            default CPU path.
         """
         import os
         # A mesh-less loader can only run eager — there is no device mesh
@@ -280,6 +284,7 @@ class WfnLoader:
                 return "eager"
         except Exception:
             return "eager"
+        # GPU: collective MPI-IO read on the CUDA FFI library.
         try:
             from ffi.common.ffi_loader import get_lib
             get_lib("CUDA")
@@ -287,7 +292,21 @@ class WfnLoader:
             return "phdf5"
         except Exception:
             pass
-        # Multi-process CPU: the zero-build host union-read path.
+        # CPU: the SAME FFI read path via the host library, IF it was built
+        # with the phdf5 read handlers (liblorrax_ffi_host.so exposing
+        # PhdfReadKchunkUnionHostFfi).  This is the single-read-path design —
+        # the h5py twin below is only for when no such .so exists.
+        try:
+            from ffi.common.ffi_loader import get_lib, _HOST_TARGET_SYMBOLS
+            _hostlib = get_lib("cpu")
+            _sym = _HOST_TARGET_SYMBOLS.get("lorrax_phdf5_read_kchunk_union")
+            if _sym is not None and hasattr(_hostlib, _sym):
+                from ffi.phdf5 import open_file as _of  # noqa: F401
+                return "phdf5"
+        except Exception:
+            pass
+        # No phdf5-capable FFI library on either platform: fall back to the
+        # zero-FFI h5py union read (shares the on-device unfold kernel).
         return "phdf5_host"
 
     # ------------------------------------------------------------------
@@ -815,7 +834,11 @@ class WfnLoader:
     ) -> jax.Array:
         """(CPU) Host h5py union read + on-device unfold → G-flat ψ.
 
-        Zero-FFI twin of :meth:`_phdf5_build`.  Produces the *same*
+        No-FFI FALLBACK for :meth:`_phdf5_build`, selected by
+        ``_auto_pick_backend`` only when no phdf5-capable FFI library is
+        loadable on either platform (the host lib built with the phdf5 read
+        handlers is preferred — it shares the collective MPI-IO read core).
+        Produces the *same*
         ``cnk_at_ibz`` union buffer — per-rank
         ``(bands_per_rank, ns, n_reads, ngkmax, 2)`` f64 sharded
         ``P(('x','y'), None, None, None, None)`` — but each rank reads its

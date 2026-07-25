@@ -85,9 +85,17 @@ def _insert_at(seq: Sequence, axis: int, value) -> tuple:
     return tuple(items)
 
 
-def _register_and_open_dataset(fh: int, ds_name: str) -> int:
-    get_lib()
-    return ffi_loader.phdf5_open_dataset_ro(fh, ds_name)
+def _register_and_open_dataset(fh: int, ds_name: str,
+                               mesh: Mesh | None = None) -> int:
+    # Drive the collective H5Dopen through the SAME platform library that
+    # owns the context (CUDA on a GPU mesh, cpu on a CPU mesh) — so a
+    # dual-platform process (JAX_PLATFORMS=cuda,cpu) with a CPU mesh doesn't
+    # route the lifecycle call to the CUDA lib's HDF5/MPI state.  The read
+    # ffi_call itself still resolves by lowering platform automatically.
+    from .context import _platform_for_mesh
+    platform = _platform_for_mesh(mesh) if mesh is not None else None
+    get_lib(platform)
+    return ffi_loader.phdf5_open_dataset_ro(fh, ds_name, platform=platform)
 
 
 # =============================================================================
@@ -207,7 +215,7 @@ def read_sharded_slab(
         raise ValueError(
             f"global shape ({n_rows},{n_cols}) must divide mesh ({p},{q})")
 
-    ds_id = _register_and_open_dataset(fh, ds_name)
+    ds_id = _register_and_open_dataset(fh, ds_name, mesh)
     local_shape = (n_rows // p, n_cols // q)
     out_struct = jax.ShapeDtypeStruct(local_shape, jnp.dtype(dtype))
     offset_zero = jnp.zeros((2,), dtype=jnp.int64)
@@ -283,7 +291,7 @@ def read_kchunk_sharded(
 
     axis_count_per_dim, axis_flat = _encode_sharding_axes(
         mesh, file_partition_spec, ndim_file)
-    ds_id = _register_and_open_dataset(fh, ds_name)
+    ds_id = _register_and_open_dataset(fh, ds_name, mesh)
 
     out_local_shape = (n_kchunk,) + tuple(int(s) for s in per_rank_file_shape)
     out_struct = jax.ShapeDtypeStruct(out_local_shape, jnp.dtype(dtype))
@@ -410,7 +418,7 @@ def _read_kchunk_union_sharded_cached(
 
     axis_count_per_dim, axis_flat = _encode_sharding_axes(
         mesh, file_partition_spec, ndim_file)
-    ds_id = _register_and_open_dataset(fh, ds_name)
+    ds_id = _register_and_open_dataset(fh, ds_name, mesh)
 
     out_local_shape = _insert_at(
         [int(s) for s in per_rank_file_shape], kchunk_axis, n_kchunk)

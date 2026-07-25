@@ -28,7 +28,21 @@
 #include <string>
 #include <vector>
 
+// LORRAX_FFI_NO_CUDA (host build): the collective MPI-IO read core below —
+// hyperslab selection + H5Dread into ctx->pinned_buf — is byte-identical on
+// both platforms.  Only three things switch on the flag:
+//   1. the handler's leading PlatformStream<cudaStream_t> ctx (absent on the
+//      CPU platform, which hands the handler host buffers directly),
+//   2. the small offset/count buffer copy (cudaMemcpy D2H vs a plain read of
+//      the already-host-resident XLA buffer), and
+//   3. the device-staging tail (cudaMemcpyAsync H2D + event vs std::memcpy
+//      into the host-resident XLA output buffer).
+// The host handlers register under DISTINCT symbol names (PhdfRead*HostFfi)
+// so the two platform .so's can co-exist in one process under RTLD_GLOBAL —
+// the same split slate/scalapack use.
+#ifndef LORRAX_FFI_NO_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <hdf5.h>
 
 #include "xla/ffi/api/ffi.h"
@@ -37,9 +51,64 @@
 #include "ctx.h"
 #include "phdf5_interface.h"
 
+// Leading dispatch/Impl parameter for the XLA platform stream.  The CUDA
+// handlers bind ``.Ctx<PlatformStream<cudaStream_t>>()`` and thread the
+// stream through to the H2D staging; the host handlers take no stream.
+#ifdef LORRAX_FFI_NO_CUDA
+#define LRX_STREAM_PARAM
+#define LRX_STREAM_ARG
+#else
+#define LRX_STREAM_PARAM cudaStream_t xla_stream,
+#define LRX_STREAM_ARG   xla_stream,
+#endif
+
 namespace lorrax_ffi::phdf5 {
 
 namespace ffi = ::xla::ffi;
+
+// Stage ``bytes`` from ctx->pinned_buf (where H5Dread landed) into the XLA
+// output buffer ``d_dst``.  CUDA: async H2D on ctx->stream, recorded on the
+// pooled h2d_event, with xla_stream made to wait so downstream ops defer
+// until the copy completes.  Host: d_dst is host memory, so a plain memcpy
+// (the writer thread has already serialized this task, so no event needed).
+#ifdef LORRAX_FFI_NO_CUDA
+static inline ffi::Error stage_pinned_to_output(
+    PhdfCtx* ctx, void* d_dst, size_t bytes)
+{
+    std::memcpy(d_dst, ctx->pinned_buf, bytes);
+    return ffi::Error::Success();
+}
+#else
+static inline ffi::Error stage_pinned_to_output(
+    cudaStream_t xla_stream, PhdfCtx* ctx, void* d_dst, size_t bytes)
+{
+    LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_dst, ctx->pinned_buf, bytes,
+                                      cudaMemcpyHostToDevice, ctx->stream));
+    LORRAX_CUDA_CHECK(cudaEventRecord(ctx->h2d_event, ctx->stream));
+    LORRAX_CUDA_CHECK(cudaStreamWaitEvent(xla_stream, ctx->h2d_event, 0));
+    return ffi::Error::Success();
+}
+#endif
+
+// Copy a small (N x int64) index buffer out of an FFI input into host
+// ``dst``.  Host: the buffer is already host-resident.  CUDA: D2H copy.
+// Returns false on failure and fills ``err`` (CUDA path only).
+static inline bool copy_index_to_host(
+    void* dst, const void* src, size_t nbytes, std::string* err)
+{
+#ifdef LORRAX_FFI_NO_CUDA
+    std::memcpy(dst, src, nbytes);
+    (void)err;
+    return true;
+#else
+    cudaError_t ce = cudaMemcpy(dst, src, nbytes, cudaMemcpyDeviceToHost);
+    if (ce != cudaSuccess) {
+        if (err) *err = cudaGetErrorString(ce);
+        return false;
+    }
+    return true;
+#endif
+}
 
 static std::vector<int64_t> unravel_rank(
     int64_t rank, ffi::Span<const int64_t> mesh_shape)
@@ -55,7 +124,7 @@ static std::vector<int64_t> unravel_rank(
 
 template <typename T>
 static ffi::Error ReadImpl(
-    cudaStream_t xla_stream,
+    LRX_STREAM_PARAM
     PhdfCtx* ctx,
     T* d_dst,
     const std::vector<hsize_t>& offset,
@@ -70,7 +139,7 @@ static ffi::Error ReadImpl(
 
     if (!ensure_pinned(ctx, bytes)) {
         std::ostringstream os;
-        os << "phdf5 read: cudaMallocHost(" << bytes << ") failed";
+        os << "phdf5 read: staging-buffer alloc of " << bytes << " bytes failed";
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
     }
     std::memset(ctx->pinned_buf, 0, bytes);
@@ -133,28 +202,19 @@ static ffi::Error ReadImpl(
                           "phdf5 read: H5Dread failed");
     }
 
-    // Async H2D to the XLA-allocated output buffer.  No cross-stream-
-    // wait for xla_stream state: XLA's FFI contract guarantees the
-    // output buffer is available for writing at handler entry.
-    LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_dst, ctx->pinned_buf, bytes,
-                                      cudaMemcpyHostToDevice, ctx->stream));
-
-    // Record completion on the pooled ctx event and make xla_stream
-    // wait for it.  Downstream ops on xla_stream will defer until the
-    // H2D is done.  No cudaEventSynchronize here: we don't need to
-    // block the handler thread — xla_stream's own dependency handles
-    // correctness.  No cudaEventDestroy: the event is owned by ctx.
-    LORRAX_CUDA_CHECK(cudaEventRecord(ctx->h2d_event, ctx->stream));
-    LORRAX_CUDA_CHECK(cudaStreamWaitEvent(xla_stream, ctx->h2d_event, 0));
-
-    return ffi::Error::Success();
+    // Device-staging tail (the ONLY hardware-specific step): CUDA async H2D
+    // to the XLA output buffer + pooled-event fence so xla_stream defers
+    // until the copy completes; host = plain memcpy into the host-resident
+    // output.  XLA's FFI contract guarantees the output buffer is available
+    // for writing at handler entry, so no cross-stream wait is needed.
+    return stage_pinned_to_output(LRX_STREAM_ARG ctx, d_dst, bytes);
 }
 
 // Padding contract: A_out dimensions are the equal-block physical
 // output shape. valid_shape is the logical file prefix to read; ranks
 // outside it get zeros, and edge ranks read clipped hyperslabs.
 static ffi::Error ReadDispatch(
-    cudaStream_t stream,
+    LRX_STREAM_PARAM
     ffi::Buffer<ffi::DataType::S64> offset_buf,   // shape (ndim,)
     ffi::Buffer<ffi::DataType::S64> valid_shape_buf, // shape (ndim,)
     ffi::Result<ffi::AnyBuffer> A_out,
@@ -185,26 +245,21 @@ static ffi::Error ReadDispatch(
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
 
-    // D2H-copy the small offset buffer (N × 8 bytes).
+    // Bring the small offset + valid_shape buffers (N × 8 bytes each) into
+    // host memory (D2H on CUDA; already host-resident on the host build).
     std::vector<int64_t> offset_host(N);
-    cudaError_t ce_off = cudaMemcpy(offset_host.data(), offset_buf.untyped_data(),
-                                    N * sizeof(int64_t), cudaMemcpyDeviceToHost);
-    if (ce_off != cudaSuccess) {
-        std::ostringstream os;
-        os << "phdf5 read: cudaMemcpy(offset) failed: "
-           << cudaGetErrorString(ce_off);
-        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+    std::string cperr;
+    if (!copy_index_to_host(offset_host.data(), offset_buf.untyped_data(),
+                            N * sizeof(int64_t), &cperr)) {
+        return ffi::Error(ffi::ErrorCode::kInternal,
+                          "phdf5 read: copy(offset) failed: " + cperr);
     }
     std::vector<int64_t> valid_shape_host(N);
-    cudaError_t ce_valid = cudaMemcpy(valid_shape_host.data(),
-                                      valid_shape_buf.untyped_data(),
-                                      N * sizeof(int64_t),
-                                      cudaMemcpyDeviceToHost);
-    if (ce_valid != cudaSuccess) {
-        std::ostringstream os;
-        os << "phdf5 read: cudaMemcpy(valid_shape) failed: "
-           << cudaGetErrorString(ce_valid);
-        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+    if (!copy_index_to_host(valid_shape_host.data(),
+                            valid_shape_buf.untyped_data(),
+                            N * sizeof(int64_t), &cperr)) {
+        return ffi::Error(ffi::ErrorCode::kInternal,
+                          "phdf5 read: copy(valid_shape) failed: " + cperr);
     }
 
     std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
@@ -249,27 +304,27 @@ static ffi::Error ReadDispatch(
     const auto dtype = A_out->element_type();
     switch (dtype) {
         case ffi::DataType::F32:
-            return ReadImpl<float>(stream, ctx,
+            return ReadImpl<float>(LRX_STREAM_ARG ctx,
                 static_cast<float*>(A_out->untyped_data()),
                 offset, file_count, mem_dims, (hid_t)ds_id);
         case ffi::DataType::F64:
-            return ReadImpl<double>(stream, ctx,
+            return ReadImpl<double>(LRX_STREAM_ARG ctx,
                 static_cast<double*>(A_out->untyped_data()),
                 offset, file_count, mem_dims, (hid_t)ds_id);
         case ffi::DataType::S32:
-            return ReadImpl<int32_t>(stream, ctx,
+            return ReadImpl<int32_t>(LRX_STREAM_ARG ctx,
                 static_cast<int32_t*>(A_out->untyped_data()),
                 offset, file_count, mem_dims, (hid_t)ds_id);
         case ffi::DataType::S64:
-            return ReadImpl<int64_t>(stream, ctx,
+            return ReadImpl<int64_t>(LRX_STREAM_ARG ctx,
                 static_cast<int64_t*>(A_out->untyped_data()),
                 offset, file_count, mem_dims, (hid_t)ds_id);
         case ffi::DataType::C64:
-            return ReadImpl<std::complex<float>>(stream, ctx,
+            return ReadImpl<std::complex<float>>(LRX_STREAM_ARG ctx,
                 static_cast<std::complex<float>*>(A_out->untyped_data()),
                 offset, file_count, mem_dims, (hid_t)ds_id);
         case ffi::DataType::C128:
-            return ReadImpl<std::complex<double>>(stream, ctx,
+            return ReadImpl<std::complex<double>>(LRX_STREAM_ARG ctx,
                 static_cast<std::complex<double>*>(A_out->untyped_data()),
                 offset, file_count, mem_dims, (hid_t)ds_id);
         default: {
@@ -311,7 +366,7 @@ static ffi::Error ReadDispatch(
 
 template <typename T>
 static ffi::Error ReadKchunkImpl(
-    cudaStream_t xla_stream,
+    LRX_STREAM_PARAM
     PhdfCtx* ctx,
     T* d_dst,
     const std::vector<std::vector<hsize_t>>& offsets,  // (n_kchunk, N_file)
@@ -335,7 +390,7 @@ static ffi::Error ReadKchunkImpl(
 
     if (!ensure_pinned(ctx, bytes)) {
         std::ostringstream os;
-        os << "phdf5 read_kchunk: cudaMallocHost(" << bytes << ") failed";
+        os << "phdf5 read_kchunk: staging-buffer alloc of " << bytes << " bytes failed";
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
     }
     auto t_pin = now();
@@ -391,10 +446,8 @@ static ffi::Error ReadKchunkImpl(
     H5Sclose(filespace);
     auto t_reads = now();
 
-    LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_dst, ctx->pinned_buf, bytes,
-                                      cudaMemcpyHostToDevice, ctx->stream));
-    LORRAX_CUDA_CHECK(cudaEventRecord(ctx->h2d_event, ctx->stream));
-    LORRAX_CUDA_CHECK(cudaStreamWaitEvent(xla_stream, ctx->h2d_event, 0));
+    FFI_RETURN_IF_ERROR(
+        stage_pinned_to_output(LRX_STREAM_ARG ctx, d_dst, bytes));
     auto t_h2d = now();
 
     if (do_time && ctx->rank == 0) {
@@ -411,7 +464,7 @@ static ffi::Error ReadKchunkImpl(
 }
 
 static ffi::Error ReadKchunkDispatch(
-    cudaStream_t stream,
+    LRX_STREAM_PARAM
     ffi::Buffer<ffi::DataType::S64> offset_buf,   // shape (n_kchunk, N_file)
     ffi::Result<ffi::AnyBuffer> A_out,             // shape (n_kchunk, per-rank file dims...)
     int64_t ctx_handle,
@@ -459,16 +512,15 @@ static ffi::Error ReadKchunkDispatch(
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
 
-    // D2H-copy the small offset buffer (n_kchunk × N_file × 8 bytes).
+    // Bring the small offset buffer (n_kchunk × N_file × 8 bytes) to host.
     std::vector<int64_t> offset_host((size_t)n_kchunk * N_file);
-    cudaError_t ce_off = cudaMemcpy(
-        offset_host.data(), offset_buf.untyped_data(),
-        offset_host.size() * sizeof(int64_t), cudaMemcpyDeviceToHost);
-    if (ce_off != cudaSuccess) {
-        std::ostringstream os;
-        os << "phdf5 read_kchunk: cudaMemcpy(offset) failed: "
-           << cudaGetErrorString(ce_off);
-        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+    {
+        std::string cperr;
+        if (!copy_index_to_host(offset_host.data(), offset_buf.untyped_data(),
+                                offset_host.size() * sizeof(int64_t), &cperr)) {
+            return ffi::Error(ffi::ErrorCode::kInternal,
+                              "phdf5 read_kchunk: copy(offset) failed: " + cperr);
+        }
     }
 
     // Derive per-rank coord and per-dim rank_coord (same encoding as
@@ -527,27 +579,27 @@ static ffi::Error ReadKchunkDispatch(
     const auto dtype = A_out->element_type();
     switch (dtype) {
         case ffi::DataType::F32:
-            return ReadKchunkImpl<float>(stream, ctx,
+            return ReadKchunkImpl<float>(LRX_STREAM_ARG ctx,
                 static_cast<float*>(A_out->untyped_data()),
                 offsets, count, (hid_t)ds_id);
         case ffi::DataType::F64:
-            return ReadKchunkImpl<double>(stream, ctx,
+            return ReadKchunkImpl<double>(LRX_STREAM_ARG ctx,
                 static_cast<double*>(A_out->untyped_data()),
                 offsets, count, (hid_t)ds_id);
         case ffi::DataType::S32:
-            return ReadKchunkImpl<int32_t>(stream, ctx,
+            return ReadKchunkImpl<int32_t>(LRX_STREAM_ARG ctx,
                 static_cast<int32_t*>(A_out->untyped_data()),
                 offsets, count, (hid_t)ds_id);
         case ffi::DataType::S64:
-            return ReadKchunkImpl<int64_t>(stream, ctx,
+            return ReadKchunkImpl<int64_t>(LRX_STREAM_ARG ctx,
                 static_cast<int64_t*>(A_out->untyped_data()),
                 offsets, count, (hid_t)ds_id);
         case ffi::DataType::C64:
-            return ReadKchunkImpl<std::complex<float>>(stream, ctx,
+            return ReadKchunkImpl<std::complex<float>>(LRX_STREAM_ARG ctx,
                 static_cast<std::complex<float>*>(A_out->untyped_data()),
                 offsets, count, (hid_t)ds_id);
         case ffi::DataType::C128:
-            return ReadKchunkImpl<std::complex<double>>(stream, ctx,
+            return ReadKchunkImpl<std::complex<double>>(LRX_STREAM_ARG ctx,
                 static_cast<std::complex<double>*>(A_out->untyped_data()),
                 offsets, count, (hid_t)ds_id);
         default: {
@@ -625,8 +677,13 @@ static void async_read_kchunk_union_worker(
     auto t0 = now();
 
     // Block until the previous task's async H2D has finished reading
-    // from ``pinned_buf`` — guards the pinned-buffer reuse.
+    // from ``pinned_buf`` — guards the pinned-buffer reuse.  On the host
+    // build the staging tail is a synchronous std::memcpy that fully
+    // drains before the worker picks up the next FIFO task, so the buffer
+    // is already free and there is nothing to wait on.
+#ifndef LORRAX_FFI_NO_CUDA
     cudaEventSynchronize(ctx->h2d_event);
+#endif
     auto t_prev_h2d_done = now();
 
     size_t per_k_elts = 1;
@@ -636,7 +693,7 @@ static void async_read_kchunk_union_worker(
 
     if (!ensure_pinned(ctx, bytes)) {
         std::ostringstream os;
-        os << "phdf5 read_kchunk_union: cudaMallocHost(" << bytes << ") failed";
+        os << "phdf5 read_kchunk_union: staging-buffer alloc of " << bytes << " bytes failed";
         promise.SetError(ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str()));
         return;
     }
@@ -740,6 +797,11 @@ static void async_read_kchunk_union_worker(
     // ctx->writer_thread and pipeline on its FIFO queue — the next
     // task's cudaEventSynchronize(h2d_event) at start is a no-op (the
     // event is already in its recorded-complete state by then).
+#ifdef LORRAX_FFI_NO_CUDA
+    // Host: d_dst is host memory; the memcpy completes synchronously so
+    // ``d_dst`` is fully populated before the Promise fires below.
+    std::memcpy(d_dst, ctx->pinned_buf, bytes);
+#else
     cudaError_t ce = cudaMemcpyAsync(
         d_dst, ctx->pinned_buf, bytes, cudaMemcpyHostToDevice, ctx->stream);
     if (ce != cudaSuccess) {
@@ -750,6 +812,7 @@ static void async_read_kchunk_union_worker(
     }
     cudaEventRecord(ctx->h2d_event, ctx->stream);
     cudaEventSynchronize(ctx->h2d_event);
+#endif
     auto t_h2d = now();
 
     if (do_time && ctx->rank == 0) {
@@ -771,7 +834,7 @@ static void async_read_kchunk_union_worker(
 }
 
 static ffi::Future ReadKchunkUnionDispatch(
-    cudaStream_t stream,
+    LRX_STREAM_PARAM
     ffi::Buffer<ffi::DataType::S64> offset_buf,   // (n_kchunk, N_file)
     ffi::Buffer<ffi::DataType::S64> count_buf,    // (n_kchunk, N_file)
     ffi::Result<ffi::AnyBuffer> A_out,
@@ -825,23 +888,22 @@ static ffi::Future ReadKchunkUnionDispatch(
             "phdf5 read_kchunk_union: offset_buf / count_buf shape mismatch"));
     }
 
-    // D2H both small buffers.
+    // Bring both small index buffers to host (D2H on CUDA; already host-
+    // resident on the host build).
     std::vector<int64_t> off_host((size_t)n_kchunk * N_file);
     std::vector<int64_t> cnt_host((size_t)n_kchunk * N_file);
-    cudaError_t ce;
-    ce = cudaMemcpy(off_host.data(), offset_buf.untyped_data(),
-                    off_host.size() * sizeof(int64_t), cudaMemcpyDeviceToHost);
-    if (ce != cudaSuccess) {
-        return fail(ffi::Error(ffi::ErrorCode::kInternal,
-            std::string("phdf5 read_kchunk_union: D2H offset: ") +
-            cudaGetErrorString(ce)));
-    }
-    ce = cudaMemcpy(cnt_host.data(), count_buf.untyped_data(),
-                    cnt_host.size() * sizeof(int64_t), cudaMemcpyDeviceToHost);
-    if (ce != cudaSuccess) {
-        return fail(ffi::Error(ffi::ErrorCode::kInternal,
-            std::string("phdf5 read_kchunk_union: D2H count: ") +
-            cudaGetErrorString(ce)));
+    {
+        std::string cperr;
+        if (!copy_index_to_host(off_host.data(), offset_buf.untyped_data(),
+                                off_host.size() * sizeof(int64_t), &cperr)) {
+            return fail(ffi::Error(ffi::ErrorCode::kInternal,
+                "phdf5 read_kchunk_union: copy(offset): " + cperr));
+        }
+        if (!copy_index_to_host(cnt_host.data(), count_buf.untyped_data(),
+                                cnt_host.size() * sizeof(int64_t), &cperr)) {
+            return fail(ffi::Error(ffi::ErrorCode::kInternal,
+                "phdf5 read_kchunk_union: copy(count): " + cperr));
+        }
     }
 
     // Per-rank coord shift on sharded dims (same encoding as single-
@@ -948,7 +1010,9 @@ static ffi::Future ReadKchunkUnionDispatch(
             std::move(per_rank_max), kax,
             std::move(promise));
     };
-    (void)stream;  // unused: task owns its own synchronization via h2d_event
+#ifndef LORRAX_FFI_NO_CUDA
+    (void)xla_stream;  // unused: task owns its own synchronization via h2d_event
+#endif
     {
         std::lock_guard<std::mutex> lk(ctx->queue_mu);
         ctx->task_queue.emplace_back(std::move(task));
@@ -959,10 +1023,28 @@ static ffi::Future ReadKchunkUnionDispatch(
 
 }  // namespace lorrax_ffi::phdf5
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    PhdfReadFfi, lorrax_ffi::phdf5::ReadDispatch,
-    xla::ffi::Ffi::Bind()
+// Handler registration.  The three handlers share one dispatch body each
+// (compiled from the SAME functions above); the platform split is only in
+// the binding: the CUDA build names them Phdf*Ffi and prepends
+// ``.Ctx<PlatformStream<cudaStream_t>>()``; the host build names them
+// Phdf*HostFfi and omits the stream ctx (XLA's CPU runtime hands the
+// handler host buffers on the calling thread).  ffi_loader.py registers the
+// CUDA names under platform="CUDA" and the Host names under platform="cpu",
+// both against the same jax.ffi target strings, so the ffi_call sites stay
+// platform-agnostic — the split jaxlib uses for cpu-lapack vs cuda-cusolver.
+#ifdef LORRAX_FFI_NO_CUDA
+#  define LRX_PHDF_HANDLER(name) name##HostFfi
+#  define LRX_PHDF_STREAM_CTX
+#else
+#  define LRX_PHDF_HANDLER(name) name##Ffi
+#  define LRX_PHDF_STREAM_CTX \
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+#endif
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    LRX_PHDF_HANDLER(PhdfRead), lorrax_ffi::phdf5::ReadDispatch,
+    xla::ffi::Ffi::Bind()
+        LRX_PHDF_STREAM_CTX
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()
         .Ret<xla::ffi::AnyBuffer>()
@@ -973,9 +1055,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<xla::ffi::Span<const int64_t>>("axis_flat"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    PhdfReadKchunkFfi, lorrax_ffi::phdf5::ReadKchunkDispatch,
+    LRX_PHDF_HANDLER(PhdfReadKchunk), lorrax_ffi::phdf5::ReadKchunkDispatch,
     xla::ffi::Ffi::Bind()
-        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        LRX_PHDF_STREAM_CTX
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_buf (n_kchunk, N_file)
         .Ret<xla::ffi::AnyBuffer>()
         .Attr<int64_t>("ctx_handle")
@@ -986,9 +1068,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("n_kchunk"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    PhdfReadKchunkUnionFfi, lorrax_ffi::phdf5::ReadKchunkUnionDispatch,
+    LRX_PHDF_HANDLER(PhdfReadKchunkUnion),
+    lorrax_ffi::phdf5::ReadKchunkUnionDispatch,
     xla::ffi::Ffi::Bind()
-        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        LRX_PHDF_STREAM_CTX
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_buf (n_kchunk, N_file)
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // count_buf  (n_kchunk, N_file)
         .Ret<xla::ffi::AnyBuffer>()

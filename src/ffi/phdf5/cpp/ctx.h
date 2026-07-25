@@ -16,7 +16,16 @@
 #include <thread>
 #include <unordered_map>
 
+// LORRAX_FFI_NO_CUDA is defined by the host-platform build (see
+// common/cpp/host/CMakeLists.txt).  The collective MPI-IO read core in
+// read_ffi.cc / context.cc is hardware-agnostic; only the device-staging
+// tail (H2D vs a plain host memcpy) and the staging-buffer allocator
+// (cudaMallocHost vs aligned host malloc) switch on this flag.  The CUDA
+// build leaves it undefined and compiles the stream/event/pinned members
+// below; the host build drops them.
+#ifndef LORRAX_FFI_NO_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <mpi.h>
 #include <hdf5.h>
 
@@ -44,13 +53,18 @@ struct PhdfCtx {
     std::unordered_map<std::string, hid_t> open_datasets;
     std::mutex                             datasets_mu;
 
-    // Staging — private CUDA stream for D2H copies.  The pinned host
-    // buffers are allocated per-call (see write_ffi.cc) so consecutive
-    // async dispatches don't race on a shared buffer; fields below
-    // survive as a no-op fallback for any future sync code path.
-    cudaStream_t stream              = nullptr;
+    // Staging — a single host buffer H5Dread lands into before the
+    // device-staging tail.  On the CUDA build it is cudaMallocHost-pinned
+    // and copied H2D on ``stream`` with completion signalled via
+    // ``h2d_event``; on the host build it is a plain aligned malloc and the
+    // tail is a std::memcpy into the (host-resident) XLA output buffer.
+    // The buffer + capacity fields are shared by both; the CUDA-only
+    // stream/event/device fields below are compiled out on the host build.
     void*        pinned_buf          = nullptr;
     size_t       pinned_capacity     = 0;
+#ifndef LORRAX_FFI_NO_CUDA
+    // private CUDA stream for D2H/H2D copies.
+    cudaStream_t stream              = nullptr;
     int          cuda_device         = -1;         // CUDA device id the main thread was on at open_ctx time; the writer_thread binds here before running any CUDA API (otherwise GPU pointers from main thread's context aren't recognised → cudaErrorMemoryAllocation on cudaMemcpyAsync).
     // Reused I/O-completion events.  Created in open_ctx, destroyed
     // in close_ctx.  Per-call cudaEventCreate/Destroy blocks for
@@ -63,6 +77,7 @@ struct PhdfCtx {
     // the Python worker / writer thread.
     cudaEvent_t  d2h_event           = nullptr;
     cudaEvent_t  h2d_event           = nullptr;
+#endif
 
     // ─── Async-write worker ─────────────────────────────────────────
     // Single dedicated thread drains ``task_queue`` in FIFO order.
