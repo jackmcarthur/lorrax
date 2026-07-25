@@ -73,7 +73,6 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
     if hit is not None:
         return hit
 
-    blk_xy_sh = NamedSharding(mesh_xy, P(('x', 'y'), None))
     blk_x_sh = NamedSharding(mesh_xy, P('x', None))
     blk_y_sh = NamedSharding(mesh_xy, P('y', None))
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
@@ -90,13 +89,16 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
         # drop the q axis.  In the same_zeta case ``zeta_R_q is
         # zeta_L_q`` (caller-aliased); we still take separate views
         # so the two reshardings below are explicit.
-        zeta_L_3d = jax.lax.with_sharding_constraint(zeta_L_q, blk_xy_sh)
-        if same_zeta:
-            zeta_R_3d = zeta_L_3d
-        else:
-            zeta_R_3d = jax.lax.with_sharding_constraint(zeta_R_q, blk_xy_sh)
-        zeta_L = jax.lax.with_sharding_constraint(zeta_L_3d[0], blk_x_sh)
-        zeta_R = jax.lax.with_sharding_constraint(zeta_R_3d[0], blk_y_sh)
+        # Drop the size-1 q axis FIRST, then reshard the real (μ, G) tensor to
+        # μ-on-x (L) / μ-on-y (R).  The previous code staged through
+        # P(('x','y'), None) — sharding the size-1 q axis over all 4 devices —
+        # which XLA cannot reshard to the μ-sharded layout, so it fell back to a
+        # full replicate-then-repartition ("[SPMD] Involuntary full
+        # rematerialization" on the V_q g-flat tensor).  Indexing [0] first
+        # keeps the reshard on the μ axis (a clean all-to-all / all-gather).
+        zeta_L = jax.lax.with_sharding_constraint(zeta_L_q[0], blk_x_sh)
+        zeta_R_src = zeta_L_q if same_zeta else zeta_R_q
+        zeta_R = jax.lax.with_sharding_constraint(zeta_R_src[0], blk_y_sh)
         v_q = jax.lax.with_sharding_constraint(v_q, v_sh)
 
         V_q = jnp.zeros((n_rmu_L, n_rmu_R), dtype=zeta_L.dtype)
