@@ -76,9 +76,15 @@ def _build_mesh(p: int, q: int) -> Mesh:
 
 def _replicate_to_host(arr) -> np.ndarray:
     """Gather a sharded jax.Array onto rank 0 as a numpy array."""
-    gathered = multihost_utils.process_allgather(arr, tiled=False)
+    # tiled=True is REQUIRED for global (non-fully-addressable) arrays in a
+    # multi-process run: it reassembles the global value (same shape).  With
+    # a single process it degenerates to the identity, so this is safe for
+    # the 1-proc multi-device case too.  (tiled=False raises
+    # "Gathering global non-fully-addressable arrays only supports tiled=True".)
+    gathered = multihost_utils.process_allgather(arr, tiled=True)
     h = np.asarray(gathered)
-    # process_allgather adds a leading process axis when tiled=False.
+    # Guard: a fully-replicated input can still come back with a leading
+    # process axis on some paths; strip it down to the logical rank.
     while h.ndim > arr.ndim:
         h = h[0]
     return h
