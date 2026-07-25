@@ -29,6 +29,7 @@ from common import symmetry_maps
 from common import Meta
 from common.wfn_transforms import (
     get_enk_bandrange, load_centroids_band_chunked, iter_psi_rchunk_bandwise,
+    load_psi_gflat_padded,
 )
 from isdf import factor_c_q
 from common.fft_helpers import make_flat_k_ifftn
@@ -132,11 +133,33 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                f"{(nb + band_chunk_size - 1)//band_chunk_size} chunks; G is "
                f"accumulated r-outer / band-inner so the split stays exact)")
 
-    # ── 1. Load ψ at centroids (band-sharded internally on 'y') ──
+    # ── 1. Load ψ(G-flat) ONCE for the whole band window ──
+    # One capped+padded load (band-sharded over ('x','y')) serves BOTH the
+    # centroid sampling below AND the r-streaming Galerkin sweep in step 3
+    # — previously each streamed band chunk re-issued its own
+    # ``loader.load`` (h5py read + symmetry unfold per chunk), so ψ was
+    # read from file twice per run (once for centroids, once chunk-by-chunk
+    # for the stream).  G-flat is small (~6-11% of the FFT box, same
+    # tensor ``load_centroids_band_chunked`` already held), so keeping it
+    # resident through the Q loop trades a few GB global for a single
+    # file read + single unfold.  Numerics: per-chunk consumption is a
+    # device SLICE of the same values — bit-identical.
     t0 = time.time()
+    psi_G_win = load_psi_gflat_padded(
+        wfn, band_range, mesh_xy=mesh_xy, bispinor=bispinor)
+    if psi_G_win is None:
+        raise ValueError(
+            f"streaming_galerkin_solve: band window {band_range} lies "
+            f"entirely past the file's band extent ({int(wfn.nbands)})")
+    log_fn(f"  ψ(G-flat) window load: {time.time()-t0:.2f}s "
+           f"(shape {tuple(psi_G_win.shape)}, shared by centroid sample + "
+           f"r-stream)")
+
+    # ── 1b. ψ at centroids (band-sharded internally on 'y') ──
     psi_rmu_Y, _ = load_centroids_band_chunked(
         wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
         band_range=band_range, band_chunk_size=band_chunk_size,
+        psi_G_flat=psi_G_win,
     )
     # psi_rmu_Y: (nk, nb, ns, n_μ), sharded P(None, None, None, 'y')
     log_fn(f"  load_centroids_band_chunked: {time.time()-t0:.2f}s")
@@ -295,7 +318,8 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             wfn, sym, meta, mesh_xy, band_range, 0, n_rtot, bispinor,
             band_chunk_size=band_chunk_size,
             band_chunk_ranges=band_chunk_ranges,
-            band_pad_to=_bc):
+            band_pad_to=_bc,
+            psi_G_flat=psi_G_win):
         bc = bc_range[1] - bc_range[0]
         bc_lo = bc_range[0] - b_start
         bc_hi = bc_range[1] - b_start
@@ -319,6 +343,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                                    sharding_y, grid_xy)
         Q = accum(UH_bc, inv_s, psi_bc_Y, Q)
         chunk_count += 1
+    del psi_G_win  # window served its last consumer; free before Q Qᴴ
     G = _fold_G(Q, G)
     del Q
     jax.block_until_ready(G)

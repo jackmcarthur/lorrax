@@ -200,71 +200,35 @@ class PsiGStore:
         # compute here.  Keep the synchronous path until either scale
         # grows (CrI3) or the broader async-reader story comes back.
         from common import timing
+        from common.wfn_transforms import load_psi_gflat_padded
         sharding_spec = P(None, ('x', 'y'), None, None)
-        file_nbands = int(self.loader.nbands)
         for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
             bc_start, bc_end = int(bc_range[0]), int(bc_range[1])
-            # Past-mnband zero-pad — same contract as
-            # ``load_centroids_band_chunked`` (commit 2129fad).  When
-            # ``world_size`` rounds ``b_id_4`` past the file's
-            # ``mnband`` (CrI3 6×6 30Ry SOC: mnband=86, world_size=16
-            # ⇒ b_id_4=96), the final bc range can exceed
-            # ``loader.nbands``.  ``WfnLoader.load`` rejects
-            # ``b_hi > nbands`` at ``file_io/wfn_loader.py:678``; cap
-            # the loader call and zero-pad the band axis up to
-            # ``bc_end - bc_start`` afterward, reapplying the
-            # ``(None, ('x', 'y'), None, None)`` sharding.  Pad rows
-            # are physically zero — the
-            # ``_zero_user_band_pad_in_shard`` post-step below would
-            # zero them anyway since their global band index
-            # ``>= user_band_stop``, so the contract for downstream
-            # consumers is identical to the pre-fix path whenever
-            # ``bc_end <= loader.nbands`` (this branch never fires).
-            bc_end_in_file = min(bc_end, file_nbands)
-            nb_total = bc_end - bc_start
             b_lo = self._bc_band_offsets[bc_idx]
             b_hi = self._bc_band_offsets[bc_idx + 1]
-            # When the entire bc range starts at/past ``file_nbands`` the
-            # cap above collapses the load to an empty range
-            # ``(file_nbands, file_nbands)`` that ``WfnLoader.load``
-            # rejects.  This whole bc has only band-pad rows that the
-            # post-load ``_zero_user_band_pad_in_shard`` step would zero
-            # out anyway, AND the per-rank host-tile slice for these
-            # rows is empty (``bpd_per_bc[bc] == 0`` since
-            # ``nb_total < p`` for the all-pad tail bcs), so we can skip
-            # the load entirely.  The host_tile entries already pre-zero
-            # via ``np.empty`` of the bc-band span ``b_hi - b_lo == 0``
-            # — no write needed.
-            if bc_start >= bc_end_in_file:
-                # Fill this bc's per-rank tile span with zeros directly
-                # (no FFI call needed — the eager and phdf5 backends
-                # would both produce zero rows for an entirely-past-EOF
-                # band window, modulo the WfnLoader.load bounds check
-                # at file_io/wfn_loader.py:678).
+            # Past-mnband zero-pad — the cap-at-file-nbands + zero-pad +
+            # reshard dance is single-sourced in
+            # :func:`common.wfn_transforms.load_psi_gflat_padded` (same
+            # contract as ``load_centroids_band_chunked``, commit
+            # 2129fad).  ``None`` return = the entire bc range starts
+            # at/past ``loader.nbands``: only band-pad rows the
+            # ``_zero_user_band_pad_in_shard`` post-step would zero out
+            # anyway, AND the per-rank host-tile slice for these rows is
+            # empty (``bpd_per_bc[bc] == 0`` since ``nb_total < p`` for
+            # the all-pad tail bcs), so skip the load entirely and
+            # zero-fill the tile span directly.
+            with timing.section("psi_G_store.populate.loader_load"):
+                psi_G_bc = load_psi_gflat_padded(
+                    self.loader, (bc_start, bc_end), mesh_xy=self.mesh,
+                    bispinor=self.bispinor, k="full_bz",
+                    sharding=sharding_spec)
+                if psi_G_bc is not None:
+                    jax.block_until_ready(psi_G_bc)
+            if psi_G_bc is None:
                 if b_hi - b_lo > 0:
                     for (x, y) in self._coords.values():
                         self._host_tiles[(x, y)][:, b_lo:b_hi, :, :] = 0
                 continue
-            with timing.section("psi_G_store.populate.loader_load"):
-                psi_G_bc = self.loader.load(
-                    bands=(bc_start, bc_end_in_file), k="full_bz",
-                    sharding=sharding_spec,
-                    bispinor=self.bispinor,
-                )
-                jax.block_until_ready(psi_G_bc)
-            nb_loaded = int(psi_G_bc.shape[1])
-            if nb_loaded < nb_total:
-                pad_bands = nb_total - nb_loaded
-                psi_G_bc = jnp.concatenate(
-                    [psi_G_bc,
-                     jnp.zeros(
-                         (psi_G_bc.shape[0], pad_bands,
-                          psi_G_bc.shape[2], psi_G_bc.shape[3]),
-                         dtype=psi_G_bc.dtype)],
-                    axis=1)
-                psi_G_bc = jax.lax.with_sharding_constraint(
-                    psi_G_bc, NamedSharding(self.mesh, sharding_spec))
-                jax.block_until_ready(psi_G_bc)
             with timing.section("psi_G_store.populate.shard_to_host"):
                 for shard in psi_G_bc.addressable_shards:
                     x, y = self._coords[id(shard.device)]

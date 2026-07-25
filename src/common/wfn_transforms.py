@@ -68,6 +68,7 @@ __all__ = [
     "read_Gvecs_to_devices",
     "iter_psi_rchunk_bandwise",
     "load_centroids_band_chunked",
+    "load_psi_gflat_padded",
 ]
 
 
@@ -1560,6 +1561,91 @@ def read_Gvecs_to_devices(
     return psi_box, nb_logical
 
 
+# Default band-sharded G-flat spec shared by every ψ(G-flat) load site.
+_GFLAT_LOAD_SPEC = P(None, ('x', 'y'), None, None)
+
+
+def load_psi_gflat_padded(
+    loader,
+    bands: tuple[int, int],
+    *,
+    mesh_xy: Mesh,
+    bispinor: bool,
+    pad_to: int | None = None,
+    k="full_bz",
+    sharding: P = _GFLAT_LOAD_SPEC,
+) -> "jax.Array | None":
+    """One capped + zero-padded ψ(G-flat) load — THE shared load dance.
+
+    Single source for the load → cap-at-file-nbands → zero-pad-band-axis
+    → reapply-sharding sequence that was previously triplicated (with
+    drift) across ``psi_G_store._populate_from_loader``,
+    ``load_centroids_band_chunked`` and ``iter_psi_rchunk_bandwise``.
+
+    Past-mnband contract (``common/meta.py:100-117``): ``b_id_4 =
+    round_up(b_id_4_user, world_size)`` may exceed the file's ``mnband``
+    (CrI3 6×6 30Ry SOC: mnband=86, world_size=16 ⇒ b_id_4=96).
+    ``WfnLoader.load`` rejects ``b_hi > nbands``; this helper caps the
+    loader call at ``loader.nbands`` and zero-pads the band axis back up
+    to ``max(pad_to, b_hi - b_lo)``, preserving ``sharding``.  Pad rows
+    are physically zero — the same contract every call site already
+    promised downstream.
+
+    Returns ``None`` when the ENTIRE requested window starts at/past the
+    file's band extent (an all-pad chunk) — the caller decides whether
+    that is a zero-fill (psi_G_store tiles) or an error (a user window
+    past EOF on a primary load).
+    """
+    b_lo, b_hi = int(bands[0]), int(bands[1])
+    nb_total = b_hi - b_lo
+    target = max(nb_total, int(pad_to)) if pad_to is not None else nb_total
+    file_nbands = int(loader.nbands)
+    b_hi_in_file = min(b_hi, file_nbands)
+    if b_lo >= b_hi_in_file:
+        return None
+    psi = loader.load(
+        bands=(b_lo, b_hi_in_file), k=k, sharding=sharding,
+        bispinor=bool(bispinor))
+    nb_loaded = int(psi.shape[1])
+    if nb_loaded < target:
+        psi = jnp.concatenate(
+            [psi,
+             jnp.zeros((psi.shape[0], target - nb_loaded,
+                        psi.shape[2], psi.shape[3]), dtype=psi.dtype)],
+            axis=1)
+        psi = jax.lax.with_sharding_constraint(
+            psi, NamedSharding(mesh_xy, sharding))
+    return psi
+
+
+def _slice_bands_gflat(psi_full: jax.Array, lo: int, width: int,
+                       mesh: Mesh) -> jax.Array:
+    """Band-window slice ``psi_full[:, lo:lo+width]`` of a device-resident
+    ψ(G-flat) window, re-sharded to the standard band-sharded spec.
+
+    One cached jit per (shape, width) — ``lo`` is a traced scalar, so the
+    whole band-chunk sweep dispatches ONE compiled slicer.  Caller must
+    guarantee ``lo + width <= psi_full.shape[1]`` (``dynamic_slice``
+    would silently clamp-and-shift otherwise).
+    """
+    if lo + width > int(psi_full.shape[1]):
+        raise ValueError(
+            f"_slice_bands_gflat: [{lo}, {lo + width}) out of "
+            f"[0, {int(psi_full.shape[1])})")
+    key = (psi_full.shape, int(width), _sharding_key(psi_full), id(mesh))
+
+    def build():
+        out_shard = NamedSharding(mesh, _GFLAT_LOAD_SPEC)
+
+        @partial(jax.jit, out_shardings=out_shard)
+        def fn(psi_, lo_):
+            return jax.lax.dynamic_slice_in_dim(psi_, lo_, width, axis=1)
+        return fn
+
+    fn = _cached_jit('slice_bands_gflat', key, build)
+    return fn(psi_full, jnp.int32(lo))
+
+
 # ============================================================================
 # R-CHUNK EXTRACTION: Contiguous r-space chunking via flattened r-index
 # ============================================================================
@@ -1575,6 +1661,7 @@ def iter_psi_rchunk_bandwise(
     k_chunk_size: int = 0,
     band_chunk_ranges: list[tuple[int, int]] | None = None,
     band_pad_to: int | None = None,
+    psi_G_flat: jax.Array | None = None,
 ):
     """Generator: yield ``(bc_range, psi_bc_Y)`` one band chunk at a time.
 
@@ -1601,6 +1688,18 @@ def iter_psi_rchunk_bandwise(
     ``UH_bc @ psi`` fold) must slice/zero-pad its contraction operand to
     the same width — the extra bands then contribute exactly zero.
     ``None`` disables the pad (legacy per-chunk-shape behaviour).
+
+    ``psi_G_flat`` — optional device-resident ψ(G-flat) window covering
+    ``band_range`` (band-sharded ``P(None, ('x','y'), None, None)``, as
+    returned by :func:`load_psi_gflat_padded`).  When given, each band
+    chunk is a device SLICE of it instead of a fresh ``loader.load`` —
+    ONE file read (+ symmetry unfold) serves the whole sweep, and a
+    caller that already holds the window (htransform loads the same
+    window for centroid sampling) pays zero extra I/O.  Slice columns
+    beyond the chunk's real bands hold the window's own pad rows
+    (finite; zero or real file bands) — same contract as the loader's
+    internal band round-up, so consumers must keep masking ``[bc, w)``.
+    Full-BZ path only (``k_chunk_size`` must stay 0).
 
     Uses :class:`file_io.wfn_loader.WfnLoader` + ``to_rchunk``.  ``sym``
     is unused (loader builds its own SymMaps).
@@ -1635,7 +1734,7 @@ def iter_psi_rchunk_bandwise(
             _zeros_Y_cache[shape] = fn
         return fn()
 
-    sharding_load = P(None, ('x', 'y'), None, None)
+    sharding_load = _GFLAT_LOAD_SPEC
 
     loader = wfn  # reuse top-level WfnLoader
     g_index_full = loader.box_index(k="full_bz")
@@ -1645,32 +1744,74 @@ def iter_psi_rchunk_bandwise(
         np.asarray(sym_loader.kvecs_asints, dtype=np.float64)
         / kgrid_arr[None, :])
 
-    for bc_range in band_chunk_ranges:
-        if nk_batch >= nk_tot:
-            psi_G_flat = loader.load(
-                bands=bc_range, k="full_bz",
-                sharding=sharding_load, bispinor=bispinor)
-            # Uniform-band-pad: zero-fill the band axis to ``band_pad_to``
-            # so ``to_rchunk`` sees ONE shape across every chunk (compiles
-            # once; the trailing zero bands survive the FFT + r-slice as
-            # zeros and are dropped by the caller's zero-padded UH slice).
-            if (band_pad_to is not None
-                    and int(psi_G_flat.shape[1]) < int(band_pad_to)):
-                _pad = int(band_pad_to) - int(psi_G_flat.shape[1])
-                psi_G_flat = jnp.concatenate(
-                    [psi_G_flat,
-                     jnp.zeros((psi_G_flat.shape[0], _pad,
-                                psi_G_flat.shape[2], psi_G_flat.shape[3]),
-                               dtype=psi_G_flat.dtype)],
-                    axis=1)
-                psi_G_flat = jax.lax.with_sharding_constraint(
-                    psi_G_flat, NamedSharding(mesh_xy, sharding_load))
+    # ── Window-reuse fast path: slice per-bc from a resident G-flat ──
+    if psi_G_flat is not None:
+        if 0 < nk_batch < nk_tot:
+            raise ValueError(
+                "iter_psi_rchunk_bandwise: psi_G_flat reuse requires the "
+                "full-BZ path (k_chunk_size=0)")
+        # Widths per chunk (band_pad_to overrides so to_rchunk compiles
+        # once); pad the window ONCE up to the max slice extent so the
+        # dynamic-slice never clamps (clamp would shift the window and
+        # leak earlier bands into pad columns).
+        # ``max`` guards a chunk wider than band_pad_to (never truncate
+        # real bands) — same semantics as the pad-only-if-smaller load
+        # path.
+        widths = [
+            (max(int(band_pad_to), b1 - b0) if band_pad_to is not None
+             else (b1 - b0))
+            for (b0, b1) in band_chunk_ranges]
+        need = max(
+            (b0 - b_start) + w
+            for (b0, _b1), w in zip(band_chunk_ranges, widths))
+        nb_avail = int(psi_G_flat.shape[1])
+        if need > nb_avail:
+            def _build_pad():
+                out_shard = NamedSharding(mesh_xy, sharding_load)
+
+                @partial(jax.jit, out_shardings=out_shard)
+                def fn(psi_):
+                    return jnp.pad(
+                        psi_, ((0, 0), (0, need - nb_avail), (0, 0), (0, 0)))
+                return fn
+            psi_G_flat = _cached_jit(
+                'pad_bands_gflat',
+                (psi_G_flat.shape, need, _sharding_key(psi_G_flat),
+                 id(mesh_xy)),
+                _build_pad)(psi_G_flat)
+        for bc_range, w in zip(band_chunk_ranges, widths):
+            psi_bc = _slice_bands_gflat(
+                psi_G_flat, int(bc_range[0]) - b_start, w, mesh_xy)
             psi_bc_Y = to_rchunk(
-                psi_G_flat, g_index_full, meta.fft_grid,
+                psi_bc, g_index_full, meta.fft_grid,
                 int(r_start), n_rchunk, mesh=mesh_xy, norm="ortho",
                 kvecs_frac=jnp.asarray(kvecs_frac_full))
             psi_bc_Y = jax.lax.with_sharding_constraint(psi_bc_Y, out_Y)
-            del psi_G_flat
+            del psi_bc
+            yield bc_range, psi_bc_Y
+        return
+
+    for bc_range in band_chunk_ranges:
+        if nk_batch >= nk_tot:
+            # Shared capped-load + uniform-band-pad dance (zero-fill the
+            # band axis to ``band_pad_to`` so ``to_rchunk`` sees ONE
+            # shape across every chunk; trailing zero bands survive the
+            # FFT + r-slice as zeros and are dropped by the caller's
+            # zero-padded UH slice).
+            psi_G_bc = load_psi_gflat_padded(
+                loader, bc_range, mesh_xy=mesh_xy, bispinor=bispinor,
+                pad_to=band_pad_to, k="full_bz", sharding=sharding_load)
+            if psi_G_bc is None:
+                raise ValueError(
+                    f"iter_psi_rchunk_bandwise: band chunk {bc_range} lies "
+                    f"entirely past the file's band extent "
+                    f"({int(loader.nbands)})")
+            psi_bc_Y = to_rchunk(
+                psi_G_bc, g_index_full, meta.fft_grid,
+                int(r_start), n_rchunk, mesh=mesh_xy, norm="ortho",
+                kvecs_frac=jnp.asarray(kvecs_frac_full))
+            psi_bc_Y = jax.lax.with_sharding_constraint(psi_bc_Y, out_Y)
+            del psi_G_bc
             yield bc_range, psi_bc_Y
         else:
             nb_chunk = bc_range[1] - bc_range[0]
@@ -1714,6 +1855,7 @@ def load_centroids_band_chunked(
     k_chunk_size: int | None = None,
     *,
     use_phdf5: bool = False,
+    psi_G_flat: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """
     Load centroid-sampled wavefunctions using band AND k-point chunking.
@@ -1858,25 +2000,20 @@ def load_centroids_band_chunked(
     # preserving the (None, ('x','y'), None, None) sharding.  The pad
     # rows are physically zero — same contract the user-band-pad zero
     # block below applies to the (b_id_4_user, b_id_4) slots.
-    file_nbands = int(loader.nbands)
-    b_end_in_file = min(b_end, file_nbands)
-    with timing.section("load_centroids.loader_load"):
-        psi_G_flat = loader.load(
-            bands=(b_start, b_end_in_file), k="full_bz",
-            sharding=sharding_load, bispinor=bispinor)
-        jax.block_until_ready(psi_G_flat)
-    nb_loaded = int(psi_G_flat.shape[1])
-    if nb_loaded < nb_total:
-        pad_bands = nb_total - nb_loaded
-        psi_G_flat = jnp.concatenate(
-            [psi_G_flat,
-             jnp.zeros(
-                 (psi_G_flat.shape[0], pad_bands,
-                  psi_G_flat.shape[2], psi_G_flat.shape[3]),
-                 dtype=psi_G_flat.dtype)],
-            axis=1)
-        psi_G_flat = jax.lax.with_sharding_constraint(
-            psi_G_flat, NamedSharding(mesh_xy, sharding_load))
+    # ``psi_G_flat`` may arrive pre-loaded from the caller (htransform
+    # loads ONE window that serves both this centroid sample and the
+    # r-streaming sweep); otherwise pull it via the shared helper.
+    if psi_G_flat is None:
+        with timing.section("load_centroids.loader_load"):
+            psi_G_flat = load_psi_gflat_padded(
+                loader, (b_start, b_end), mesh_xy=mesh_xy,
+                bispinor=bispinor, k="full_bz", sharding=sharding_load)
+            if psi_G_flat is None:
+                raise ValueError(
+                    f"load_centroids_band_chunked: band window "
+                    f"({b_start}, {b_end}) lies entirely past the file's "
+                    f"band extent ({int(loader.nbands)})")
+            jax.block_until_ready(psi_G_flat)
     nb_padded = int(psi_G_flat.shape[1])
 
     # One shard_map + scan: full (nk, nb_padded) extent, centroid

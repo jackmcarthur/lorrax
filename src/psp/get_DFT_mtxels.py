@@ -34,10 +34,14 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from functools import partial, lru_cache
 
 
-# Per-WFN-path cache of full-BZ G-vectors (replaces
-# ``sym.get_gvecs_kfull`` per-k calls in compute_valence_density).  The
-# loader's eager backend slurps ``wfns/coeffs`` once per path; cheap
-# vs. building SymMaps per call.
+# Full-BZ G-vectors for compute_valence_density (replaces
+# ``sym.get_gvecs_kfull`` per-k calls).  ``wfn`` is a
+# ``file_io.wfn_loader.WfnLoader`` everywhere in this repo, and the
+# loader already memoises ``gvecs()`` / ``ngk_valid()`` internally — use
+# it directly.  The per-path fallback loader (kept for any legacy
+# WFNReader-shaped handle) opens a SECOND file handle and re-reads the
+# ``(ngktot, 3)`` gvecs table, which duplicates hundreds of MB of host
+# RAM per rank at CrI3-class ngktot — avoid it when possible.
 @lru_cache(maxsize=4)
 def _wfn_loader_for_path(path: str):
     from file_io.wfn_loader import WfnLoader
@@ -45,10 +49,14 @@ def _wfn_loader_for_path(path: str):
 
 
 def _gvecs_full_cache(wfn):
+    if hasattr(wfn, "gvecs"):
+        return wfn.gvecs(k="full_bz")
     return _wfn_loader_for_path(wfn._filename).gvecs(k="full_bz")
 
 
 def _ngk_full_cache(wfn):
+    if hasattr(wfn, "ngk_valid"):
+        return wfn.ngk_valid(k="full_bz")
     return _wfn_loader_for_path(wfn._filename).ngk_valid(k="full_bz")
 # Support both `python -m psp.get_DFT_mtxels` and direct script execution
 try:
