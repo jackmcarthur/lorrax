@@ -102,6 +102,8 @@ class GWResults:
     sigma_omega_h5_path: str | None = None
     tensors_filename: str | None = None
     kin_ion_has_hartree: bool = False
+    #: 'stored' | 'folded' | 'isdf' | 'gspace' — see file_io.kin_ion.
+    hartree_source: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +454,7 @@ def _warn_on_unphysical_h0(
     kin_ion_diag_ev: np.ndarray,
     hartree_diag_ev: np.ndarray,
     kin_ion_has_hartree: bool = False,
+    hartree_source: str | None = None,
     print_fn=print,
 ) -> np.ndarray:
     """Flag a corrupted mean-field H₀ before it reaches eqp{0,1}.dat.
@@ -494,8 +497,16 @@ def _warn_on_unphysical_h0(
             | (implied_vxc_ev > _VXC_IMPLIED_MAX_EV)
         )
     )
-    _src = ("kin_ion[exact V_H folded in]" if kin_ion_has_hartree
-            else "kin_ion + V_H[ISDF]")
+    _exact = bool(kin_ion_has_hartree) or (
+        hartree_source in ("stored", "gspace", "folded"))
+    _src = {
+        "folded": "kin_ion[exact V_H folded in]",
+        "stored": "kin_ion + V_H[exact, stored]",
+        "gspace": "kin_ion + V_H[exact, on-the-fly]",
+        "isdf":   "kin_ion + V_H[ISDF]",
+    }.get(hartree_source,
+          "kin_ion[exact V_H folded in]" if kin_ion_has_hartree
+          else "kin_ion + V_H[ISDF]")
     print_fn(
         f"  H0 check: implied Vxc = E_DFT - ({_src}) in "
         f"[{lo:.3f}, {hi:.3f}] eV over {implied_vxc_ev.size} (k,n)"
@@ -504,7 +515,7 @@ def _warn_on_unphysical_h0(
         return implied_vxc_ev
     k_bad, n_band_bad = np.unravel_index(
         int(np.argmax(np.abs(implied_vxc_ev))), implied_vxc_ev.shape)
-    if kin_ion_has_hartree:
+    if _exact:
         _diagnosis = (
             "H0 is fully exact here (T + V_ion + V_NL + V_H, all plane-wave / "
             "FFT-grid), so this is NOT an ISDF convergence problem and raising "
@@ -663,13 +674,16 @@ def write_results(
         np.real(np.diagonal(results.kin_ion_ry[irr_idx], axis1=1, axis2=2)) * r2e
     )
     # ── H₀'s Hartree term: exactly one source, never two ──────────────────
-    # ``kin_ion_has_hartree`` ⇒ ⟨mk|V_H|nk⟩ was evaluated exactly on the
-    # FFT grid at kin_ion generation time and is already inside
-    # ``kin_ion_diag_ev``.  Adding ``sig_h`` on top would double count a
-    # ~500 eV term.  ``sigma_dispatch`` already zeroed ``sig_h`` for every
-    # consumer; skipping explicitly here keeps the writer's contract
-    # readable on its own and makes the two paths independent.
-    if results.kin_ion_has_hartree:
+    # Only the LEGACY ``folded`` file has ⟨mk|V_H|nk⟩ already inside
+    # ``kin_ion_diag_ev``; adding ``sig_h`` on top of that would double
+    # count ~500 eV.  For every other source ``sig_h`` *is* the run's V_H
+    # (the ISDF quadrature, or the exact matrix that ``sigma_dispatch``
+    # substituted for it), so it is read normally — which is why the VH
+    # column of sigma_diag.dat is meaningful again under the stored-array
+    # format instead of reading 0.000 by design.  ``sigma_dispatch``
+    # already applied the rule; restating it here keeps the writer's
+    # contract readable on its own and makes the two paths independent.
+    if results.kin_ion_has_hartree or results.hartree_source == "folded":
         hartree_diag_ev = np.zeros_like(kin_ion_diag_ev)
     else:
         hartree_diag_ev = np.real(
@@ -680,6 +694,7 @@ def write_results(
         kin_ion_diag_ev=kin_ion_diag_ev,
         hartree_diag_ev=hartree_diag_ev,
         kin_ion_has_hartree=results.kin_ion_has_hartree,
+        hartree_source=results.hartree_source,
         print_fn=print_fn,
     )
     # Σ_c at E_DFT diagonal: in PPM mode this is the interpolated value

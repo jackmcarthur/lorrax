@@ -41,8 +41,13 @@ from .sigma_output import (
 )
 from .qp_wfn import write_qp_rotations_h5
 from .kin_ion import (
+    HARTREE_DATASET,
+    HARTREE_SOURCES,
     load_kin_ion_submatrix,
+    load_hartree_submatrix,
     kin_ion_has_hartree,
+    kin_ion_hartree_source,
+    resolve_hartree_source,
     read_kin_ion_provenance,
     validate_kin_ion_against_run,
 )

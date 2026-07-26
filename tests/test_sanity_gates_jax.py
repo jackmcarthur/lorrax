@@ -325,17 +325,25 @@ def test_implied_vxc_window_is_sourced_from_gw_output():
 
 
 # ---------------------------------------------------------------------------
-# 3c. make_eqp_bgw honours the has_hartree no-double-count contract
+# 3c. make_eqp_bgw honours the V_H-source contract (folded / stored)
 # ---------------------------------------------------------------------------
 
-def _make_eqp_cli_inputs(d, *, has_hartree, nk=2, nb=4, nb_file=6,
+def _make_eqp_cli_inputs(d, *, has_hartree=False, stored=False,
+                         nk=2, nb=4, nb_file=6,
                          n_omega=5, kin_ion_ev=-300.0, v_h_ev=280.0,
-                         e_dft_ev=-40.0, sigma_x_ev=-20.0):
+                         e_dft_ev=-40.0, sigma_x_ev=-20.0,
+                         stored_v_h_ev=None):
     """Build a minimal run dir for ``make_eqp_bgw``.
 
-    ``kin_ion`` is written as if V_H were folded in when
-    ``has_hartree`` is set, so the two modes describe the SAME physical
-    system and must therefore produce the same eqp0.
+    Three shapes of the same physical system, which must therefore all
+    produce the same eqp0:
+      * legacy      — pristine kin_ion, no attrs; V_H from sigma_mnk
+      * has_hartree — V_H folded INTO kin_ion's values (pre-v_hartree)
+      * stored      — pristine kin_ion + a separate ``v_hartree`` array
+
+    ``stored_v_h_ev`` overrides the value written into the stored array
+    (default: the same ``v_h_ev`` sigma_mnk carries), which is how the
+    substitution can be told apart from the suppression.
 
     The constants are chosen so the implied V_xc lands INSIDE the
     physical window (E_DFT − (kin_ion + V_H) ≈ −18…−12 eV).  That is not
@@ -357,6 +365,12 @@ def _make_eqp_cli_inputs(d, *, has_hartree, nk=2, nb=4, nb_file=6,
         ds = f.create_dataset("kin_ion", data=kin / RYD_TO_EV)
         if has_hartree:
             ds.attrs["has_hartree"] = True
+        if stored:
+            vh_stored = np.zeros((nk, nb_file, nb_file), dtype=np.complex128)
+            for b in range(nb_file):
+                vh_stored[:, b, b] = (
+                    v_h_ev if stored_v_h_ev is None else stored_v_h_ev)
+            f.create_dataset("v_hartree", data=vh_stored / RYD_TO_EV)
 
     with h5py.File(os.path.join(d, "qp_wfn_rotations.h5"), "w") as f:
         f.create_dataset("band_range", data=np.array([band_start, band_stop]))
@@ -426,6 +440,122 @@ def test_make_eqp_bgw_suppresses_hartree_when_folded():
         f"  max|diff| = {np.max(np.abs(legacy - folded)):.6f} eV")
 
 
+def test_make_eqp_bgw_stored_array_matches_the_folded_route():
+    """**THE migration gate.**  Stored ``v_hartree`` ≡ the fold-in it replaces.
+
+    Same physics, three encodings — legacy (V_H only in sigma_mnk),
+    folded (V_H inside kin_ion's values, the format N gated), and stored
+    (pristine kin_ion + its own ``v_hartree`` array).  eqp0 must be
+    identical, or the new file format silently changes answers.
+    """
+    from gw.eqp_bgw import make_eqp_bgw
+    with tempfile.TemporaryDirectory() as d_fold, \
+         tempfile.TemporaryDirectory() as d_store:
+        _make_eqp_cli_inputs(d_fold, has_hartree=True)
+        _make_eqp_cli_inputs(d_store, stored=True)
+        make_eqp_bgw(d_fold)
+        make_eqp_bgw(d_store)
+        folded = _read_eqp_qp_column(os.path.join(d_fold, "eqp0.dat"))
+        stored = _read_eqp_qp_column(os.path.join(d_store, "eqp0.dat"))
+    assert stored.size and stored.size == folded.size
+    assert np.allclose(folded, stored, atol=1e-9), (
+        f"stored-v_hartree route disagrees with the fold-in it replaces:\n"
+        f"  folded {folded[:4]}\n  stored {stored[:4]}\n"
+        f"  max|diff| = {np.max(np.abs(folded - stored)):.6f} eV")
+
+
+def test_make_eqp_bgw_stored_array_is_substituted_not_ignored():
+    """The stored array must REPLACE sigma_mnk's ISDF column, not be a no-op.
+
+    Pin the size of the substitution: a stored V_H that differs from the
+    ISDF one by 30 eV must move eqp0 by exactly that.  Without this, a
+    silently-ignored ``v_hartree`` would still pass the equality gate
+    above (both files carry the same number there).
+    """
+    from gw.eqp_bgw import make_eqp_bgw
+    with tempfile.TemporaryDirectory() as d_a, \
+         tempfile.TemporaryDirectory() as d_b:
+        _make_eqp_cli_inputs(d_a, stored=True)
+        _make_eqp_cli_inputs(d_b, stored=True, stored_v_h_ev=310.0)
+        make_eqp_bgw(d_a)
+        make_eqp_bgw(d_b)
+        a = _read_eqp_qp_column(os.path.join(d_a, "eqp0.dat"))
+        b = _read_eqp_qp_column(os.path.join(d_b, "eqp0.dat"))
+    shift = float(np.mean(b - a))
+    assert abs(shift - 30.0) < 1e-6, (
+        f"expected the stored V_H (+30 eV) to move eqp0 by 30 eV; "
+        f"got {shift:.6f} eV — the array is being ignored")
+
+
+def test_kin_ion_hartree_source_resolution():
+    """The precedence ladder and the refusals, on real files."""
+    from file_io.kin_ion import (
+        kin_ion_hartree_source, resolve_hartree_source)
+    with tempfile.TemporaryDirectory() as d_leg, \
+         tempfile.TemporaryDirectory() as d_fold, \
+         tempfile.TemporaryDirectory() as d_store:
+        _make_eqp_cli_inputs(d_leg)
+        _make_eqp_cli_inputs(d_fold, has_hartree=True)
+        _make_eqp_cli_inputs(d_store, stored=True)
+        p_leg = os.path.join(d_leg, "kin_ion.h5")
+        p_fold = os.path.join(d_fold, "kin_ion.h5")
+        p_store = os.path.join(d_store, "kin_ion.h5")
+
+        assert kin_ion_hartree_source(p_leg) == "none"
+        assert kin_ion_hartree_source(p_fold) == "folded"
+        assert kin_ion_hartree_source(p_store) == "stored"
+
+        # auto: stored wins, then folded, then isdf.
+        assert resolve_hartree_source(p_store, "auto", print_fn=_Log()) == "stored"
+        assert resolve_hartree_source(p_fold, "auto", print_fn=_Log()) == "folded"
+        assert resolve_hartree_source(p_leg, "auto", print_fn=_Log()) == "isdf"
+
+        # Explicit requests are honoured on a pristine file...
+        assert resolve_hartree_source(p_store, "isdf", print_fn=_Log()) == "isdf"
+        assert resolve_hartree_source(p_leg, "gspace", print_fn=_Log()) == "gspace"
+
+        # ...but a folded file may not be combined with another source:
+        # its values already contain V_H, so anything else double counts.
+        for req in ("isdf", "gspace"):
+            try:
+                resolve_hartree_source(p_fold, req, print_fn=_Log())
+            except ValueError as exc:
+                assert "double count" in str(exc)
+            else:
+                raise AssertionError(
+                    f"hartree_source={req} on a folded file must raise")
+
+        # stored requested but absent must name the fix, not fall back.
+        try:
+            resolve_hartree_source(p_leg, "stored", print_fn=_Log())
+        except ValueError as exc:
+            assert "v_hartree" in str(exc)
+        else:
+            raise AssertionError("hartree_source=stored on a legacy file must raise")
+
+        # An unknown value never silently becomes 'auto'.
+        try:
+            resolve_hartree_source(p_leg, "exact", print_fn=_Log())
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("an unknown hartree_source must raise")
+
+
+def test_kin_ion_has_hartree_is_false_for_the_stored_format():
+    """Back-compat in the safe direction.
+
+    ``kin_ion_has_hartree`` means "V_H is inside the kin_ion VALUES".  A
+    new-format file has pristine values, so it must answer False — that
+    is exactly what lets an OLD reader treat it as an ionic-only file and
+    correctly add its own ISDF V_H instead of double counting.
+    """
+    from file_io.kin_ion import kin_ion_has_hartree
+    with tempfile.TemporaryDirectory() as d:
+        _make_eqp_cli_inputs(d, stored=True)
+        assert kin_ion_has_hartree(os.path.join(d, "kin_ion.h5")) is False
+
+
 def test_make_eqp_bgw_double_count_would_be_caught():
     """Pin the size of the bug: not suppressing V_H shifts eqp0 by ~V_H."""
     from gw import eqp_bgw
@@ -443,6 +573,75 @@ def test_make_eqp_bgw_double_count_would_be_caught():
     assert abs(shift - 280.0) < 1e-6, (
         f"expected the un-suppressed run to be high by the V_H column "
         f"(280 eV); got {shift:.3f} eV")
+
+
+# ---------------------------------------------------------------------------
+# 3d. kin_ion_io's V_H defaults — computed, stored separately, never folded
+# ---------------------------------------------------------------------------
+
+def test_kin_ion_io_writes_the_stored_hartree_array_by_default():
+    """V_H is computed by default and STORED SEPARATELY, never folded.
+
+    Three defaults are pinned here because each silently changes what
+    every downstream consumer sees:
+      * ``hartree`` on  — the file carries ``v_hartree``, so a run gets
+        the exact V_H without a second generator pass;
+      * ``fold_hartree`` off — ``kin_ion`` stays pristine, which is what
+        keeps one file usable by both the exact and the ISDF route and
+        keeps ``kin_ion_has_hartree`` False for old readers;
+      * ``--no-hartree`` still available for an ionic-only file.
+    """
+    from gw.kin_ion_io import build_argparser
+    p = build_argparser()
+    a = p.parse_args(["-i", "x.in"])
+    assert a.hartree is True, "V_H must be computed by default"
+    assert a.fold_hartree is False, (
+        "kin_ion must stay pristine by default — V_H goes in its own array")
+    assert p.parse_args(["-i", "x.in", "--no-hartree"]).hartree is False
+    assert p.parse_args(["-i", "x.in", "--fold-hartree"]).fold_hartree is True
+    # Symmetric pair: last flag wins, in both orders.
+    assert p.parse_args(["-i", "x.in", "--hartree", "--no-hartree"]).hartree is False
+    assert p.parse_args(["-i", "x.in", "--no-hartree", "--hartree"]).hartree is True
+
+
+def test_kin_ion_io_refuses_a_multiprocess_launch():
+    """``srun -n P`` on this generator must fail loudly, not race.
+
+    Every array in the CLI is built on device 0 through a 1×1 mesh and
+    the output is a plain numpy array written by whoever finishes; P
+    ranks would redo identical work and overwrite one another's
+    ``kin_ion.h5``, with rc=0.  The guard reads the same env ladder
+    ``runtime._resolve_num_processes`` does, and fires before any file
+    is opened (hence the nonexistent input path below).
+    """
+    from gw import kin_ion_io
+    prev = os.environ.get("SLURM_NTASKS")
+    prev_pc = os.environ.get("JAX_PROCESS_COUNT")
+    os.environ.pop("JAX_PROCESS_COUNT", None)
+    os.environ["SLURM_NTASKS"] = "4"
+    try:
+        msg = None
+        try:
+            kin_ion_io.main(["-i", "/nonexistent/deck.in"])
+        except SystemExit as exc:
+            msg = str(exc)
+        assert msg and "single-process" in msg, (
+            f"expected a single-process refusal, got: {msg!r}")
+        # The documented override still lets a caller through.
+        os.environ["LORRAX_KIN_ION_ALLOW_MULTIPROC"] = "1"
+        try:
+            kin_ion_io.main(["-i", "/nonexistent/deck.in"])
+        except SystemExit as exc:
+            assert "single-process" not in str(exc)
+        except Exception:
+            pass          # any downstream failure means the guard let go
+    finally:
+        os.environ.pop("LORRAX_KIN_ION_ALLOW_MULTIPROC", None)
+        for k, v in (("SLURM_NTASKS", prev), ("JAX_PROCESS_COUNT", prev_pc)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 # ---------------------------------------------------------------------------

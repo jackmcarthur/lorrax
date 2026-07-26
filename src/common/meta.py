@@ -53,6 +53,18 @@ class Meta:
             self.b_id_4,
         )
         self.band_edges = (b0, b1, b2, b3, b4)
+        # ── WARNING — ``band_ranges.sigma`` IS NOT THE Σ WINDOW ──────────
+        # Nothing in src/ or tests/ reads ``band_ranges`` (verified by
+        # grep); the authoritative Σ slice is
+        # ``gw.wavefunction_bundle.BandSlices.sigma = slice(0, b3-b0)``,
+        # i.e. **[b0, b3) — every occupied band included**, which is what
+        # ``cohsex_sigma.build_Gij`` and the Hartree/SX kernels index.
+        # The ``(b1, b3)`` below is a *different*, unused convention.
+        # Reading it as "the bands ρ is built from" produces the false
+        # conclusion that a deck with ``nval < nelec`` drops occupied
+        # bands out of the ISDF density (it does not) — that misreading
+        # cost workstream N a wrong root-cause attribution.  Do not
+        # reintroduce it as a source of truth; prefer ``BandSlices``.
         self.band_ranges = SimpleNamespace(
             valence=(b1, b2),
             conduction=(b2, b3),

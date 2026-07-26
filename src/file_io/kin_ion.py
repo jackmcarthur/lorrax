@@ -1,33 +1,55 @@
-"""Kinetic + ionic Hamiltonian I/O.
+"""Kinetic + ionic Hamiltonian I/O, and the mean-field V_H it may carry.
 
-The kin_ion matrix elements correspond to H_DFT − V_xc, i.e. kinetic +
-ionic (local + nonlocal) contributions, with V_xc removed.
+``kin_ion`` holds ⟨mk|T + V_loc + V_NL|nk⟩ — **pristine ionic mean field,
+never V_H** in files written by the current ``gw.kin_ion_io``.
 
-**Two modes, distinguished by the ``has_hartree`` attribute:**
+H₀ = kin_ion + V_H is a ~500 eV catastrophic cancellation, so *where*
+⟨mk|V_H|nk⟩ comes from is a first-class, explicitly-resolved decision.
+Three sources, in ``auto`` precedence order:
 
-``has_hartree=True`` (what ``gw.kin_ion_io`` writes by default)
-    The dataset already contains ⟨mk|V_H|nk⟩, evaluated exactly on the
-    FFT grid at generation time.  The GW driver MUST NOT add its own
-    ISDF ``sig_h`` on top — see ``gw.sigma_dispatch``, which zeroes it,
-    and ``gw.gw_output.write_results``, which skips it.  H₀ is then
-    independent of the ISDF centroid count.
+``stored``  — the file carries a separate ``v_hartree`` dataset
+    ``(nk, nb, nb)`` complex128, Ry, the exact FFT-grid matrix evaluated
+    at generation time (this is what ``gw.kin_ion_io`` writes by
+    default).  The **full matrix**, not just the diagonal, so a QSGW
+    band rotation can transform it.  ``kin_ion`` itself stays pristine.
+``isdf``    — ⟨mk|V_H|nk⟩ from the ISDF ``V_q[0]`` tile
+    (``gw.cohsex_sigma``'s Hartree kernel).  Fully P-distributed and
+    recomputable in-loop; centroid-count dependent.
+``gspace``  — built on the fly by the driver through the same exact
+    FFT-grid route (``gw.kin_ion_io.compute_hartree_matrix``).
 
-``has_hartree`` absent or False (legacy files)
-    Kinetic + ionic only; the GW run adds the ISDF ``sig_h``.  H₀ then
-    depends on the centroid basis through a ~500 eV cancellation, which
-    ``_warn_on_unphysical_h0`` exists to catch.
+Plus one **legacy** state that only ever appears on disk, never as a
+request:
 
-Reading the attribute is the ONLY supported way to tell the two apart —
-never infer it from magnitudes.
+``folded``  — ``has_hartree=True`` and NO ``v_hartree`` dataset: V_H was
+    added *into* the ``kin_ion`` values (the pre-``v_hartree`` format).
+    The driver must then add no V_H of its own.  Read-only support.
+
+**Back-compatibility is safe in the dangerous direction.**  A file in
+the new format has pristine ``kin_ion`` and no ``has_hartree`` attribute,
+so an *old* reader treats it as a legacy ionic-only file and adds its own
+ISDF V_H — which is correct, not a double count.  Only the reverse
+(a ``folded`` file read as pristine) would double count, and
+``_warn_on_unphysical_h0`` fires hard on that.
+
+Reading the attributes / dataset presence is the ONLY supported way to
+tell these apart — never infer from magnitudes.
 """
 import os
 
 import h5py
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from .slab_io import SlabIO
+
+#: Name of the separate exact-V_H dataset inside ``kin_ion.h5``.
+HARTREE_DATASET = "v_hartree"
+
+#: Legal values of the ``hartree_source`` input key.
+HARTREE_SOURCES = ("auto", "stored", "isdf", "gspace")
 
 
 def read_kin_ion_provenance(h5_path: str) -> dict:
@@ -45,21 +67,144 @@ def read_kin_ion_provenance(h5_path: str) -> dict:
 		ds = h5["kin_ion"]
 		out = {k: v for k, v in ds.attrs.items()}
 		out["_shape"] = tuple(int(s) for s in ds.shape)
+		out["_has_v_hartree"] = HARTREE_DATASET in h5
+		if out["_has_v_hartree"]:
+			out["_hartree_shape"] = tuple(
+				int(s) for s in h5[HARTREE_DATASET].shape)
+			# The array's OWN attrs win.  ``kin_ion`` also stamps
+			# ``hartree_truncation_2d`` (False whenever V_H is not folded
+			# into its values), so a ``setdefault`` here would mask the
+			# stored array's real Coulomb convention behind that False and
+			# make the load-time report say "truncation_2d=False" for a
+			# correctly 2D-truncated V_H.
+			for k, v in h5[HARTREE_DATASET].attrs.items():
+				out[f"hartree_{k}"] = v
 	return out
 
 
 def kin_ion_has_hartree(h5_path: str) -> bool:
-	"""True iff ``kin_ion.h5`` already contains the mean-field V_H.
+	"""True iff V_H is **folded into the ``kin_ion`` values themselves**.
 
-	The contract flag for the no-double-counting rule.  Legacy files
-	written before the exact-V_H fold-in carry no attribute at all and
-	therefore answer False, preserving their original semantics.
+	The legacy (pre-``v_hartree``) contract flag for the
+	no-double-counting rule.  It is deliberately NOT true for the current
+	format, where V_H lives in its own dataset and ``kin_ion`` is
+	pristine — see :func:`kin_ion_hartree_source`, which is what new code
+	should call.  Legacy files written before the fold-in carry no
+	attribute at all and answer False, preserving their semantics.
 	"""
 	try:
 		attrs = read_kin_ion_provenance(h5_path)
 	except (FileNotFoundError, KeyError):
 		return False
+	if attrs.get("_has_v_hartree"):
+		return False           # separate array ⇒ kin_ion values are pristine
 	return bool(attrs.get("has_hartree", False))
+
+
+def kin_ion_hartree_source(h5_path: str) -> str:
+	"""What the FILE offers: ``'stored'`` | ``'folded'`` | ``'none'``.
+
+	Pure inspection — no policy.  :func:`resolve_hartree_source` applies
+	the request and the precedence.
+	"""
+	try:
+		attrs = read_kin_ion_provenance(h5_path)
+	except (FileNotFoundError, KeyError):
+		return "none"
+	if attrs.get("_has_v_hartree"):
+		return "stored"
+	if bool(attrs.get("has_hartree", False)):
+		return "folded"
+	return "none"
+
+
+def resolve_hartree_source(h5_path: str, requested: str = "auto",
+                           *, print_fn=print) -> str:
+	"""Decide where ⟨mk|V_H|nk⟩ comes from.  Returns the resolved source.
+
+	``auto`` precedence: **stored** array → legacy **folded** values →
+	**isdf**.  An explicit request is honoured, except that it may not
+	silently contradict a folded file: a ``folded`` ``kin_ion.h5`` has V_H
+	inside its values and *any* other source would double count, so that
+	combination raises rather than producing a plausible wrong number.
+
+	Returns one of ``'stored' | 'folded' | 'isdf' | 'gspace'``.  Only
+	``'folded'`` means "add nothing"; the other three all supply a V_H
+	that the driver adds to a pristine ``kin_ion``.
+	"""
+	requested = str(requested or "auto").strip().lower()
+	if requested not in HARTREE_SOURCES:
+		raise ValueError(
+			f"hartree_source={requested!r} is not one of {HARTREE_SOURCES}")
+	available = kin_ion_hartree_source(h5_path)
+
+	if available == "folded":
+		if requested in ("auto", "stored"):
+			return "folded"
+		raise ValueError(
+			f"hartree_source={requested!r} was requested but "
+			f"{os.path.basename(h5_path)} is a LEGACY folded file: V_H is "
+			"already inside its kin_ion values, so adding a second source "
+			"would double count ~500 eV.  Regenerate kin_ion.h5 (the current "
+			"writer stores V_H as a separate 'v_hartree' array and leaves "
+			"kin_ion pristine), or drop the override.")
+
+	if requested == "auto":
+		return "stored" if available == "stored" else "isdf"
+	if requested == "stored":
+		if available != "stored":
+			raise ValueError(
+				f"hartree_source=stored but {os.path.basename(h5_path)} has no "
+				f"'{HARTREE_DATASET}' dataset.  Regenerate it with "
+				"`python -m gw.kin_ion_io` (which stores V_H by default), or "
+				"use hartree_source=isdf / gspace.")
+		return "stored"
+	return requested                      # 'isdf' or 'gspace'
+
+
+def load_hartree_submatrix(
+	h5_path: str,
+	band_start: int,
+	band_stop: int,
+	*,
+	mesh: Mesh | None = None,
+	backend=None,
+) -> jax.Array:
+	"""Read the stored exact ⟨mk|V_H|nk⟩ sub-window, replicated (Ry).
+
+	Same shape/sharding contract as :func:`load_kin_ion_submatrix` — the
+	two are added together to form H₀, so they must come back in the same
+	layout.  Raises if the dataset is absent; call
+	:func:`resolve_hartree_source` first.
+	"""
+	if band_stop <= band_start:
+		raise ValueError(f"Invalid band slice [{band_start}, {band_stop})")
+	if not os.path.exists(h5_path):
+		raise FileNotFoundError(f"kin_ion file not found: {h5_path}")
+	with h5py.File(h5_path, "r") as h5:
+		if HARTREE_DATASET not in h5:
+			raise KeyError(
+				f"Dataset '{HARTREE_DATASET}' missing from {h5_path}")
+		nk, nb_total, nb_total2 = h5[HARTREE_DATASET].shape
+	if nb_total != nb_total2:
+		raise ValueError(
+			f"{HARTREE_DATASET} must be square in band axes; "
+			f"got {(nk, nb_total, nb_total2)}")
+	if band_stop > nb_total:
+		raise ValueError(
+			f"Requested bands require {band_stop} states but "
+			f"{HARTREE_DATASET} only has {nb_total}.  Regenerate kin_ion.h5 "
+			f"with at least -n {band_stop}.")
+	nb = band_stop - band_start
+	with SlabIO(h5_path, mode="r", mesh=mesh, backend=backend) as io:
+		return io.read_slab(
+			HARTREE_DATASET,
+			shape=(nk, nb, nb),
+			offset=(0, band_start, band_start),
+			dtype=jnp.complex128,
+			mesh=mesh,
+			partition_spec=P(None, None, None),
+		)
 
 
 def validate_kin_ion_against_run(
@@ -99,17 +244,29 @@ def validate_kin_ion_against_run(
 			f"kin_ion.h5 has {int(attrs['_shape'][1])} bands but the run's sigma "
 			f"window needs {int(band_stop)}."
 		)
-	has_h = bool(attrs.get("has_hartree", False))
-	if has_h:
+	if attrs.get("_has_v_hartree"):
+		hs = attrs.get("_hartree_shape", ("?", "?", "?"))
+		if band_stop is not None and int(hs[1]) < int(band_stop):
+			raise ValueError(
+				f"kin_ion.h5 stores V_H for {int(hs[1])} bands but the run's "
+				f"sigma window needs {int(band_stop)}.  The two arrays must "
+				"cover the same window — regenerate with a larger -n.")
 		print_fn(
-			"  kin_ion: has_hartree=True — exact FFT-grid V_H is already folded "
-			f"in (truncation_2d={bool(attrs.get('hartree_truncation_2d', False))}); "
-			"the ISDF sig_h will NOT be added."
+			f"  kin_ion: pristine T+V_loc+V_NL, plus a stored exact V_H array "
+			f"{tuple(hs)} (truncation_2d="
+			f"{bool(attrs.get('hartree_truncation_2d', False))})."
+		)
+	elif bool(attrs.get("has_hartree", False)):
+		print_fn(
+			"  kin_ion: LEGACY folded file — exact FFT-grid V_H is inside the "
+			f"kin_ion values (truncation_2d="
+			f"{bool(attrs.get('hartree_truncation_2d', False))}); no V_H will "
+			"be added on top."
 		)
 	else:
 		print_fn(
-			"  kin_ion: legacy mode (no has_hartree attr) — V_H comes from the "
-			"ISDF centroid quadrature, so H0 depends on the centroid count."
+			"  kin_ion: ionic only (no stored V_H) — V_H comes from the ISDF "
+			"centroid quadrature, so H0 depends on the centroid count."
 		)
 	return attrs
 

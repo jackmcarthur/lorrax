@@ -342,6 +342,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         sym=inputs.sym, wfn=inputs.wfn,
         band_slices=inputs.band_slices,
         input_dir=inputs.input_dir,
+        # The stored/gspace V_H lives in the DFT basis; this is the U that
+        # takes it into the basis ``wfns_qp`` is expressed in.
+        hartree_basis_rotation=U_qp,
         write_sigma_omega_h5=False,
         print_fn=inputs.print_fn,
     )

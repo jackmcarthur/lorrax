@@ -577,16 +577,40 @@ def make_eqp_bgw(
 	# infer it from magnitudes (``file_io.kin_ion`` module docstring).
 	# Imported lazily (as ``gw.sigma_dispatch`` does) so this module stays
 	# importable without pulling in the jax-dependent file_io stack.
-	from file_io.kin_ion import kin_ion_has_hartree
-	if kin_ion_has_hartree(kin_ion_path):
+	from file_io.kin_ion import kin_ion_hartree_source, HARTREE_DATASET
+	_src = kin_ion_hartree_source(kin_ion_path)
+	if _src == "folded":
 		print(
-			f"  kin_ion: has_hartree=True — exact FFT-grid V_H is already "
-			f"folded into {os.path.basename(kin_ion_path)}; suppressing "
+			f"  kin_ion: LEGACY folded file — exact FFT-grid V_H is already "
+			f"inside {os.path.basename(kin_ion_path)}'s values; suppressing "
 			f"sigma_mnk.h5's ISDF Hartree column "
 			f"(mean |V_H| = {float(np.mean(np.abs(np.real(hartree_diag)))):.3f} eV) "
 			f"to avoid double counting."
 		)
 		hartree_diag = np.zeros_like(hartree_diag)
+	elif _src == "stored":
+		# The file carries the exact V_H as its own array, and kin_ion is
+		# pristine — so we do not suppress, we SUBSTITUTE.  Using the
+		# stored matrix instead of sigma_mnk's ISDF column is the whole
+		# point of re-deriving eqp from a regenerated kin_ion.h5: Σ_xc
+		# does not depend on V_H, so the only thing that should change is
+		# which V_H H0 was built with.
+		with h5py.File(kin_ion_path, "r") as kf:
+			vh_full = np.asarray(kf[HARTREE_DATASET])
+		if vh_full.shape[1] < band_stop:
+			raise ValueError(
+				f"{HARTREE_DATASET} covers {vh_full.shape[1]} bands but the "
+				f"sigma window needs {band_stop}.")
+		vh_irr = vh_full[kirr_to_kfull, band_start:band_stop,
+		                 band_start:band_stop]
+		vh_exact = np.real(np.diagonal(vh_irr, axis1=1, axis2=2)) * RYD_TO_EV
+		print(
+			f"  kin_ion: pristine, with a stored exact V_H array — using it "
+			f"instead of sigma_mnk.h5's ISDF Hartree column "
+			f"(mean |V_H| {float(np.mean(np.abs(np.real(hartree_diag)))):.3f} "
+			f"→ {float(np.mean(np.abs(vh_exact))):.3f} eV)."
+		)
+		hartree_diag = vh_exact
 
 	# Mean-field gate — this CLI is the unguarded path.  Unlike the live
 	# driver (where ``gw_output.write_results`` runs the same check just
