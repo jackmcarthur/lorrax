@@ -402,10 +402,14 @@ def z_q_from_psi_sm(
 	  2. :func:`common.wfn_transforms.to_rchunk_inner` does the local
 	     IFFT + per-rank r-slab (``r0_local = r_start + axis_index('y')
 	     * r_loc``).
-	  3. ``lax.all_gather(axis_name=('x','y'), axis=1, tiled=True)``
+	  3. ``lax.all_to_all('y', split_axis=r, concat_axis=band,
+	     tiled=True)`` then ``lax.all_gather('x', axis=1, tiled=True)``
 	     aligns the band axis with ``psi_l_X`` / ``psi_r_X``'s
-	     band-replicated layout.  IFFT-FIRST; gather-first would blow
-	     the FFT box to ~80 GB / rank.
+	     band-replicated layout WHILE scattering r onto 'y', so the
+	     gathered slab is ``r_loc`` deep, not ``n_zchunk`` (p_y× less
+	     memory; see the step-(3) comment for why this is the exact
+	     movement and why band order is unchanged).  IFFT-FIRST;
+	     gather-first would blow the FFT box to ~80 GB / rank.
 	  4. L/R per-bc band masks (mask approach — ``jnp.where`` on a
 	     rank-local axis).
 	  5. Two einsums into rank-5 carries ``(P_l_acc, P_r_acc)``.
@@ -661,16 +665,18 @@ def z_q_from_psi_sm(
 
 			# r-slab strategy: each y-rank ultimately owns ``r_loc``
 			# positions of the r-chunk (out_spec=P(None, 'x', 'y') on
-			# n_zchunk).  We CANNOT slice the r-axis per-rank BEFORE
-			# the all_gather over bands — that would mix r-slabs from
-			# different y-ranks at the same gathered band position
-			# (r-incoherence at the einsum).  Instead: per rank
-			# compute the FULL r-chunk in psi_Y_local, gather bands,
-			# THEN slice the r-axis to this y-rank's per-rank slab.
-			# Per-rank cost of full-r psi_Y_local is bigger by p_y vs
-			# the r_loc version, but XLA's scan-internal allocator
-			# aliases the per-iter slab across iters → single slot.
-			r0_y_offset = y_idx * jnp.int32(r_loc)
+			# n_zchunk).  A plain per-rank r-slice BEFORE the band gather
+			# would mix r-slabs from different y-ranks at the same gathered
+			# band position (r-incoherence at the einsum) — which is why
+			# this used to gather bands at FULL r and slice afterwards.
+			# It no longer does: step (3) below performs the band-gather and
+			# the r-scatter as ONE all-to-all + all_gather, which is exactly
+			# the required permutation and never materialises the
+			# full-bands × full-r slab.  ``psi_Y_local`` (this rank's OWN
+			# bands over full r) is still built per iter — unavoidable, since
+			# other y-ranks need other r-blocks of those same bands — but it
+			# is only ``bpd_max`` bands wide and XLA's scan-internal
+			# allocator aliases it across iters → single slot.
 
 			P_l_init = jnp.zeros(
 				(nk, ns, r_loc, mu_loc, ns), dtype=jnp.complex128)
@@ -698,13 +704,41 @@ def z_q_from_psi_sm(
 					psi_G_bc_local, g_index_dev, fft_grid_t,
 					r_start_, n_zchunk,
 					kvecs_frac=kvecs_frac_dev, norm="ortho")
-				# (3) all_gather across both mesh axes along the band
-				#     axis.  IFFT-FIRST per §2.9 (gather-first → 80 GB
-				#     FFT box, infeasible).  Output: (nk, P·bpd_max,
-				#     ns, n_zchunk) on every rank.
+				# (3) Band-gather AND r-scatter in one shot.
+				#
+				#     The old code did all_gather(('x','y')) over bands at the
+				#     FULL r-chunk and only THEN sliced r — so every rank held
+				#     nk · bpd_max_global · ns · n_zchunk · 16 bytes with NO mesh
+				#     division on either axis (129 GB/rank at MoS2 12x12,
+				#     band_chunk=160, cr=174960).  That single object is wall #0:
+				#     it is what forced r_chunk down to <=81 chunks and capped the
+				#     machine at n_mu ~ 4000 independently of everything else.
+				#
+				#     The r-slice CANNOT simply move before the gather (that mixes
+				#     r-slabs from different y-ranks at the same gathered band --
+				#     the r-incoherence the old comment warns about).  But the
+				#     movement we actually want IS an all-to-all: rank (x,y) owns
+				#     its own bands over ALL r and needs ALL bands over r-block y.
+				#     Express it exactly:
+				#       (3a) all_to_all on 'y'  — split r into p_y blocks, concat
+				#            onto bands: (x,y) ships its y'-th r-block to (x,y')
+				#            and receives every (x,y'')'s bands at r-block y.
+				#       (3b) all_gather on 'x'  — the remaining band blocks, now
+				#            already restricted to r-block y.
+				#     Same NCCL/Gloo byte volume, pure data movement (BIT-EXACT),
+				#     and the peak drops by p_y: 129 -> 12.9 GB/rank at run1 scale.
+				#
+				#     BAND ORDER IS PRESERVED, which is load-bearing (g_axis mask,
+				#     y_compact_idx and the psi_*_X slice all assume it).  all_to_all
+				#     concatenates sources in 'y' order, then all_gather concatenates
+				#     in 'x' order, so block (x,y) lands at offset (x·p_y + y)·bpd_max
+				#     — exactly where all_gather(('x','y'), tiled=True) put it (that
+				#     flattens row-major with 'x' slowest).
+				psi_Y_col = jax.lax.all_to_all(
+					psi_Y_bc_local_full_r, 'y',
+					split_axis=3, concat_axis=1, tiled=True)
 				psi_Y_bc_full_r = jax.lax.all_gather(
-					psi_Y_bc_local_full_r, axis_name=('x', 'y'),
-					axis=1, tiled=True)
+					psi_Y_col, axis_name='x', axis=1, tiled=True)
 				# Guard: the gathered band axis must be the full contiguous width
 				# (P blocks x bpd_max).  A wrong strided/contiguous read surfaces
 				# HERE as a loud shape mismatch, not silent P-dependent corruption.
@@ -721,13 +755,10 @@ def z_q_from_psi_sm(
 				if not _y_compact_identity:
 					psi_Y_bc_full_r = jnp.take(
 						psi_Y_bc_full_r, y_compact_idx[bc_idx], axis=1)
-				# (3b) Slice the r-axis to THIS y-rank's r_loc slab.
-				#      MUST happen AFTER gather so the band axis +
-				#      r axis are coherent (each gathered band's r
-				#      values come from the SAME source rank's full
-				#      r-chunk computation).
-				psi_Y_bc = jax.lax.dynamic_slice_in_dim(
-					psi_Y_bc_full_r, r0_y_offset, r_loc, axis=3)
+				# (3c) The r-slice is GONE: step (3a) already delivered this
+				#      y-rank's r-block, coherently with the gathered band axis.
+				assert psi_Y_bc_full_r.shape[3] == r_loc
+				psi_Y_bc = psi_Y_bc_full_r
 				# (4) L/R global-index masks (mask approach per §2.5).
 				#     bc_valid handles short final bc (pad rows = zero).
 				g_axis = (b_lo_global_arr[bc_idx]
