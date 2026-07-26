@@ -124,10 +124,117 @@ from psp.pseudos import (                              # noqa: F401
 )
 
 
+def spin_degeneracy_factor(wfn) -> float:
+    """Electrons per occupied band for this WFN's spin treatment.
+
+    ``WfnLoader.nelec`` is ``max(ifmax)`` — the number of occupied
+    *bands*, not electrons.  A spin-restricted scalar calculation
+    (``nspin == 1``, ``nspinor == 1``) puts **two** electrons in each of
+    those bands; a non-collinear/spinor calculation (``nspinor == 2``,
+    the LORRAX default for the MoS₂ decks) puts one, and so does each
+    channel of a collinear spin-polarised run (``nspin == 2``).
+
+    Getting this wrong scales ρ — and therefore ⟨V_H⟩, a ~500 eV
+    quantity — by a factor of two, so it is derived here once and
+    checked against ``∫ρ d³r`` by :func:`build_hartree_potential`.
+    """
+    nspin = int(getattr(wfn, "nspin", 1) or 1)
+    nspinor = int(getattr(wfn, "nspinor", 1) or 1)
+    if nspin == 1 and nspinor == 1:
+        return 2.0
+    return 1.0
+
+
+def valence_density_from_kpoint(
+    psi_k_box: jnp.ndarray,
+    *,
+    nocc: int,
+    weight: float,
+    cell_volume: float,
+    spin_degeneracy: float = 1.0,
+) -> jnp.ndarray:
+    """One k-point's contribution to ρ_v(r), on the ψ FFT box grid.
+
+    ``psi_k_box`` is ``(nb, nspinor, nx, ny, nz)`` G-space coefficients
+    in the FFT box (the ``load_kpoint_fftbox`` / ``to_box`` layout).
+    Returns ``w_k · f_spin · Σ_{n<nocc, s} |ψ_{nks}(r)|²`` with the same
+    ``√(N_grid/Ω)`` normalisation :func:`compute_local_V_k` assumes, so
+    ``ΔV · Σ_r ρ = f_spin · w_k · nocc``.
+
+    Single source of truth for the density quadrature: both the
+    all-k-resident :func:`compute_valence_density` and the chunked
+    per-k CLI (``gw.kin_ion_io``) go through this.
+    """
+    nx, ny, nz = psi_k_box.shape[-3:]
+    ngrid = int(nx) * int(ny) * int(nz)
+    scale = jnp.sqrt(jnp.asarray(ngrid, dtype=jnp.float64)
+                     / jnp.asarray(cell_volume, dtype=jnp.float64))
+    psi_occ = psi_k_box[: int(nocc)]
+    psi_r = jnp.fft.ifftn(psi_occ, axes=(-3, -2, -1), norm='ortho') * scale
+    return (float(weight) * float(spin_degeneracy)) * jnp.sum(
+        jnp.real(jnp.conj(psi_r) * psi_r), axis=(0, 1))
+
+
+def build_hartree_potential(
+    rho_r: jnp.ndarray,
+    wfn,
+    *,
+    truncation_2d: bool,
+    expected_electrons: float | None = None,
+    charge_tol: float = 1.0e-3,
+    print_fn=print,
+) -> jnp.ndarray:
+    """ρ(r) → V_H(r) (Ry) with a hard charge-normalisation check.
+
+    ``truncation_2d`` MUST match the Coulomb convention the rest of the
+    run uses (``sys_dim == 2`` ⇒ Ismail-Beigi slab cutoff, which is also
+    what QE's ``assume_isolated='2D'`` applies to its Hartree, local
+    pseudopotential and Ewald terms).  Mixing conventions between
+    ``kin_ion``'s V_loc and V_H puts a large *systematic* error straight
+    into H₀, where it cannot be told apart from a basis-convergence
+    problem.
+
+    The ``∫ρ d³r`` check is the cheap guard against a silent factor-2
+    (spin degeneracy) or grid-normalisation slip: both would rescale a
+    ~500 eV term.
+    """
+    volume = float(wfn.cell_volume)
+    ngrid = int(np.prod(rho_r.shape))
+    charge = float(jnp.sum(rho_r)) * volume / ngrid
+    if expected_electrons is not None:
+        rel = abs(charge - expected_electrons) / max(1.0, abs(expected_electrons))
+        print_fn(
+            f"    rho normalisation: ∫ρ d³r = {charge:.6f} e "
+            f"(expected {expected_electrons:.6f}, rel err {rel:.2e})"
+        )
+        if rel > charge_tol:
+            raise ValueError(
+                f"Valence density normalisation is off: ∫ρ d³r = {charge:.6f} "
+                f"but {expected_electrons:.6f} electrons were expected "
+                f"(rel err {rel:.2e} > {charge_tol:.1e}).  V_H is a ~500 eV "
+                "term in H0 — refusing to fold in a mis-normalised density."
+            )
+    else:
+        print_fn(f"    rho normalisation: ∫ρ d³r = {charge:.6f} e")
+    print_fn(
+        f"    Hartree Coulomb: {'2D slab-truncated (Ismail-Beigi)' if truncation_2d else '3D periodic'}"
+    )
+    V_H_r = compute_hartree_potential_real(
+        rho_r,
+        jnp.asarray(wfn.bdot, dtype=jnp.float64),
+        bvec=jnp.asarray(wfn.bvec, dtype=jnp.float64),
+        blat=float(wfn.blat),
+        truncation_2d=bool(truncation_2d),
+    )
+    hartree_energy = 0.5 * float(jnp.sum(rho_r * V_H_r)) * volume / ngrid
+    print_fn(f"    Hartree energy (½∫ρV_H) = {hartree_energy:.6f} Ry")
+    return V_H_r
+
+
 def compute_valence_density(wfn_k, sym, wfn):
     """
     Compute valence charge density rho_v(r) from occupied valence wavefunctions.
-        
+
     Returns:
         Valence charge density rho_v(r) on an ecutrho-based FFT grid if available
     """
@@ -144,7 +251,11 @@ def compute_valence_density(wfn_k, sym, wfn):
     volume = jnp.asarray(wfn.cell_volume, dtype=jnp.float64)
     ngrid_pad = nx_pad * ny_pad * nz_pad
     scale_pad = jnp.sqrt(ngrid_pad / volume)
-    
+    # Electrons per occupied band (2 only for spin-restricted scalar runs;
+    # 1 for the nspinor=2 decks LORRAX actually runs).  ``wfn.nelec`` is a
+    # BAND count (max(ifmax)), so this factor is what turns it into charge.
+    f_spin = spin_degeneracy_factor(wfn)
+
     # Get k-point weights - if looping over full mesh (sym.nk_tot), use 1/nk_tot
     # If looping over irreducible mesh with wfn.kweights, use those weights
     use_kweights = hasattr(wfn, 'kweights') and nk_local == len(wfn.kweights)
@@ -160,10 +271,10 @@ def compute_valence_density(wfn_k, sym, wfn):
         wk = float(kweights[ik])  # k-point weight
 
         if same_grid:
-            psi_occ = wfn_k[ik, :nocc]  # (nocc, nspinor, nx, ny, nz)
-            psi_r = jnp.fft.ifftn(psi_occ, axes=(-3, -2, -1), norm='ortho') * scale_pad
-            rho_val_local += wk * jnp.sum(
-                jnp.real(jnp.conj(psi_r) * psi_r), axis=(0, 1)
+            # Single-sourced with the chunked per-k CLI path.
+            rho_val_local += valence_density_from_kpoint(
+                wfn_k[ik], nocc=nocc, weight=wk,
+                cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin,
             )
         else:
             # gvecs_k = sym.get_gvecs_kfull(wfn, ik)  # legacy
@@ -186,7 +297,8 @@ def compute_valence_density(wfn_k, sym, wfn):
 
                 psi_G_padded_batch = jax.vmap(scatter_one, in_axes=0, out_axes=0)(C_occ)
                 psi_r_batch = jnp.fft.ifftn(psi_G_padded_batch, axes=(-3, -2, -1), norm='ortho') * scale_pad
-                rho_val_local += wk * jnp.sum(jnp.real(psi_r_batch.conj() * psi_r_batch), axis=0)
+                rho_val_local += (wk * f_spin) * jnp.sum(
+                    jnp.real(psi_r_batch.conj() * psi_r_batch), axis=0)
     
     # With proper k-point weights included above, no division needed
     # (weights sum to 1 for irreducible mesh, or 1/nk_tot each for full mesh)
@@ -664,15 +776,28 @@ def get_kin_ion(
             )
         print("  Computing valence density and Hartree potential for kin+ion...")
         with timing.section("psp.get_DFT_mtxels.get_kin_ion.hartree") as timer_hartree:
+            # ρ must land on the SAME grid as the ψ FFT box, since
+            # ``compute_local_V_k`` forms ψ(r)·V_H(r) pointwise.  A
+            # ``wfn.grid_rho`` set to the 2× grid (as get_DFT_mtxels.main
+            # does) would silently broadcast-fail or, worse, mis-scale.
+            _grid_rho = getattr(wfn, 'grid_rho', None)
+            _box = tuple(int(x) for x in wfn_k_sharded.shape[-3:])
+            if _grid_rho is not None and tuple(int(x) for x in _grid_rho) != _box:
+                raise ValueError(
+                    f"get_kin_ion(include_hartree=True): wfn.grid_rho={tuple(_grid_rho)} "
+                    f"but the ψ FFT box is {_box}.  V_H must be evaluated on the "
+                    "ψ box grid — clear grid_rho or set it to the ψ FFT grid."
+                )
             rho_valence = compute_valence_density(wfn_k_sharded, sym, wfn)
-            bdot_j = jnp.asarray(wfn.bdot, dtype=jnp.float64)
-            bvec_j = jnp.asarray(wfn.bvec, dtype=jnp.float64)
-            V_H_r = compute_hartree_potential_real(
-                rho_valence,
-                bdot_j,
-                bvec=bvec_j,
-                blat=float(wfn.blat),
-                truncation_2d=False,  # Set to True for 2D slab truncation matching ISDF
+            # Coulomb convention is inherited from the deck's sys_dim —
+            # NOT hardwired.  It must agree with the V_loc truncation
+            # above and with the DFT run that produced E_DFT / vxc.dat
+            # (QE ``assume_isolated='2D'`` ⇒ truncated Hartree as well).
+            V_H_r = build_hartree_potential(
+                rho_valence, wfn,
+                truncation_2d=ctx.truncation_2d,
+                expected_electrons=(
+                    spin_degeneracy_factor(wfn) * float(wfn.nelec)),
             )
 
     # Allocate output and compute per-k

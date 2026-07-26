@@ -354,6 +354,20 @@ def main(argv=None):
 	# collapsed into a replicated Σ_xc^QSGW by ``build_qsgw_sigma_xc``
 	# below.  This lets the rest of post-processing (eigh, scissor,
 	# eqp output) operate on replicated arrays without resharding seams.
+	# Provenance gate BEFORE the read: kin_ion.h5 fixes the Coulomb
+	# truncation convention and the band window for the whole mean-field
+	# side of H₀, and ``has_hartree`` decides whether the ISDF ``sig_h``
+	# is added on top.  A silent disagreement here lands as tens of eV in
+	# a ~500 eV cancellation, so it is checked loudly, once.
+	from file_io import validate_kin_ion_against_run
+	kin_ion_attrs = validate_kin_ion_against_run(
+		config.paths.kin_ion_file,
+		sys_dim=config.sys_dim,
+		nk=meta.nk_tot,
+		band_stop=band_slices.b3,
+		print_fn=print0,
+	)
+	kin_ion_has_hartree = bool(kin_ion_attrs.get("has_hartree", False))
 	kin_ion = load_kin_ion_submatrix(
 		config.paths.kin_ion_file, band_slices.b0, band_slices.b3,
 		mesh=mesh_xy, backend=config.backend.slab_io,
@@ -483,6 +497,7 @@ def main(argv=None):
 		efermi_ev=efermi_dft_ev,
 		sigma_omega_h5_path=sigma_omega_h5_path,
 		tensors_filename=tensors_filename,
+		kin_ion_has_hartree=kin_ion_has_hartree,
 	)
 	if meta.rank == 0:
 		# Optional Σ-decomposition debug table (no-op unless

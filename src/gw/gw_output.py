@@ -48,7 +48,13 @@ class GWResults:
     E_dft_ry : np.ndarray, (nk, nb)
         DFT reference eigenvalues (Rydberg).
     kin_ion_ry : np.ndarray, (nk, nb, nb)
-        H₀ = T + V_ion matrix (Rydberg).
+        H₀ = T + V_ion (+ V_H when ``kin_ion_has_hartree``) matrix (Ry).
+    kin_ion_has_hartree : bool
+        True when ``kin_ion.h5`` carried ``has_hartree=True``, i.e. the
+        exact FFT-grid mean-field V_H is already inside ``kin_ion_ry``.
+        The writer then adds NO Hartree term of its own; ``sig_h`` is
+        already zeroed upstream in ``sigma_dispatch``, and this flag
+        makes the writer's contract explicit rather than implicit.
     band_start, band_stop : int
         0-based band window [band_start, band_stop).
     use_ppm : bool
@@ -95,6 +101,7 @@ class GWResults:
     efermi_ev: float | None = None
     sigma_omega_h5_path: str | None = None
     tensors_filename: str | None = None
+    kin_ion_has_hartree: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +451,7 @@ def _warn_on_unphysical_h0(
     e_dft_ev: np.ndarray,
     kin_ion_diag_ev: np.ndarray,
     hartree_diag_ev: np.ndarray,
+    kin_ion_has_hartree: bool = False,
     print_fn=print,
 ) -> np.ndarray:
     """Flag a corrupted mean-field H₀ before it reaches eqp{0,1}.dat.
@@ -465,6 +473,13 @@ def _warn_on_unphysical_h0(
     ``E_DFT = ⟨T+V_ion+V_NL⟩ + ⟨V_H⟩ + ⟨V_xc⟩`` is exact, so a converged
     run must reproduce a physical ``V_xc`` band-by-band.  Returns the
     implied ``V_xc`` (nk, nb) in eV so callers can log it.
+
+    The identity is mode-agnostic on purpose: when ``kin_ion_has_hartree``
+    the V_H term already lives inside ``kin_ion_diag_ev`` and
+    ``hartree_diag_ev`` is zero, so the same sum and the same window
+    still apply.  Only the diagnosis printed on failure differs — an
+    exact-V_H run that trips this gate is NOT an ISDF convergence
+    problem, and saying so would send the reader down the wrong path.
     """
     implied_vxc_ev = np.asarray(e_dft_ev, dtype=np.float64) - (
         np.asarray(kin_ion_diag_ev, dtype=np.float64)
@@ -479,26 +494,42 @@ def _warn_on_unphysical_h0(
             | (implied_vxc_ev > _VXC_IMPLIED_MAX_EV)
         )
     )
+    _src = ("kin_ion[exact V_H folded in]" if kin_ion_has_hartree
+            else "kin_ion + V_H[ISDF]")
     print_fn(
-        f"  H0 check: implied Vxc = E_DFT - (kin_ion + V_H) in "
+        f"  H0 check: implied Vxc = E_DFT - ({_src}) in "
         f"[{lo:.3f}, {hi:.3f}] eV over {implied_vxc_ev.size} (k,n)"
     )
     if n_bad == 0:
         return implied_vxc_ev
     k_bad, n_band_bad = np.unravel_index(
         int(np.argmax(np.abs(implied_vxc_ev))), implied_vxc_ev.shape)
+    if kin_ion_has_hartree:
+        _diagnosis = (
+            "H0 is fully exact here (T + V_ion + V_NL + V_H, all plane-wave / "
+            "FFT-grid), so this is NOT an ISDF convergence problem and raising "
+            "the centroid count will not help.  Look instead at whether "
+            "kin_ion.h5 was generated from THIS run's input file: a Coulomb "
+            "truncation mismatch (sys_dim), a wrong occupied-band count in the "
+            "density, or a WFN/deck mismatch are the ways this branch fails."
+        )
+    else:
+        _diagnosis = (
+            "Most likely cause: the ISDF centroid basis is too small to resolve "
+            "<nk|V_H|nk> (V_H is a centroid quadrature; kin_ion is exact), so "
+            "the ~500 eV cancellation in H0 does not close.  The durable fix is "
+            "to regenerate kin_ion.h5 with the exact V_H folded in "
+            "(gw.kin_ion_io, default); the stopgap is more centroids."
+        )
     print_fn(
-        "  *** WARNING: H0 = kin_ion + V_H is UNPHYSICAL — "
+        f"  *** WARNING: H0 = {_src} is UNPHYSICAL — "
         f"{n_bad} of {implied_vxc_ev.size} (k,n) have an implied Vxc outside "
         f"[{_VXC_IMPLIED_MIN_EV:.0f}, {_VXC_IMPLIED_MAX_EV:.0f}] eV "
         f"(worst: k={int(k_bad)} n={int(n_band_bad)}, "
         f"Vxc={float(implied_vxc_ev[k_bad, n_band_bad]):.3f} eV).  "
         "eqp0/eqp1/eqp_g0w0 are NOT trustworthy.  Sigma may still be fine — "
-        "the mean-field side is what failed.  Most likely cause: the ISDF "
-        "centroid basis is too small to resolve <nk|V_H|nk> (V_H is a "
-        "centroid quadrature; kin_ion is exact), so the ~500 eV "
-        "cancellation in H0 does not close.  Raise the centroid count and "
-        "re-check, or cross-check H0 against pw2bgw's kih.dat. ***"
+        f"the mean-field side is what failed.  {_diagnosis}  "
+        "Cross-check H0 against pw2bgw's kih.dat. ***"
     )
     return implied_vxc_ev
 
@@ -575,6 +606,13 @@ def write_results(
     # per (k, n).  Column labels switch on mode: COHSEX prints
     # sigSX/sigCOH/sigTOT/VH; PPM prints sigX/sigC/sigXC/VH (same array
     # slots, relabelled).  The driver passes the right arrays for each mode.
+    #
+    # NOTE on the VH column when ``kin_ion_has_hartree``: it reads 0.000
+    # by design.  V_H is no longer a self-energy channel there — it was
+    # folded into kin_ion at generation time — so the ISDF quadrature is
+    # suppressed upstream and this column truthfully reports "no Hartree
+    # added here".  The mean-field V_H is not separately recoverable from
+    # ``kin_ion.h5``; regenerate with ``--no-hartree`` if you need it split.
     if results.use_ppm:
         sx_arr = results.sig_x
         diag_ry = results.sigma_c_diag_at_dft_ry
@@ -624,12 +662,24 @@ def write_results(
     kin_ion_diag_ev = (
         np.real(np.diagonal(results.kin_ion_ry[irr_idx], axis1=1, axis2=2)) * r2e
     )
-    hartree_diag_ev = np.real(np.diagonal(sig_h_out[irr_idx], axis1=1, axis2=2))
+    # ── H₀'s Hartree term: exactly one source, never two ──────────────────
+    # ``kin_ion_has_hartree`` ⇒ ⟨mk|V_H|nk⟩ was evaluated exactly on the
+    # FFT grid at kin_ion generation time and is already inside
+    # ``kin_ion_diag_ev``.  Adding ``sig_h`` on top would double count a
+    # ~500 eV term.  ``sigma_dispatch`` already zeroed ``sig_h`` for every
+    # consumer; skipping explicitly here keeps the writer's contract
+    # readable on its own and makes the two paths independent.
+    if results.kin_ion_has_hartree:
+        hartree_diag_ev = np.zeros_like(kin_ion_diag_ev)
+    else:
+        hartree_diag_ev = np.real(
+            np.diagonal(sig_h_out[irr_idx], axis1=1, axis2=2))
     sigma_x_diag_ev = np.real(np.diagonal(sig_x_out[irr_idx], axis1=1, axis2=2))
     _warn_on_unphysical_h0(
         e_dft_ev=e_dft_ev_irr,
         kin_ion_diag_ev=kin_ion_diag_ev,
         hartree_diag_ev=hartree_diag_ev,
+        kin_ion_has_hartree=results.kin_ion_has_hartree,
         print_fn=print_fn,
     )
     # Σ_c at E_DFT diagonal: in PPM mode this is the interpolated value
@@ -683,6 +733,9 @@ def write_results(
         not results.self_consistent
         and results.sigma_xc_at_dft_ev is not None
     ):
+        # ``sig_h`` is identically zero in exact-V_H mode (suppressed in
+        # ``sigma_dispatch``), so this sum is the same H₀ the eqp writer
+        # used in both modes.
         h0_diag = (
             np.real(
                 np.diagonal(results.kin_ion_ry + results.sig_h, axis1=1, axis2=2)

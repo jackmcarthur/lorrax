@@ -195,6 +195,22 @@ def compute_sigma_xc(
         )
     sig_h = cohsex["sig_h"]
     sig_x = cohsex["sig_x"]
+
+    # ── The no-double-counting seam (single point of truth) ───────────────
+    # When ``kin_ion.h5`` was generated with the exact FFT-grid V_H folded
+    # in (``has_hartree=True``), the mean-field Hartree term is already
+    # inside H₀.  Zero it HERE — the one place ``sig_h`` enters
+    # ``SigmaResult`` — so every downstream consumer (the eigh operand
+    # ``sigma_total = Σ_xc + V_H``, the fixed-point h₀, the SC iteration
+    # map, eqp{0,1}.dat, sigma_diag.dat's VH column) is consistent by
+    # construction rather than by each remembering to subtract.
+    # The ISDF quadrature above still runs (it is cheap and its cost is
+    # dwarfed by Σ); only its *use* is suppressed.
+    from file_io import kin_ion_has_hartree
+    if kin_ion_has_hartree(config.paths.kin_ion_file):
+        print_fn("  V_H: taken from kin_ion.h5 (exact, FFT-grid); ISDF sig_h "
+                 "suppressed to avoid double counting.")
+        sig_h = jnp.zeros_like(sig_h)
     sig_sx = cohsex["sig_sx"]                    # zero placeholders for V-only path
     sig_coh = cohsex["sig_coh"]
 
