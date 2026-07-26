@@ -604,15 +604,19 @@ def test_kin_ion_io_writes_the_stored_hartree_array_by_default():
     assert p.parse_args(["-i", "x.in", "--no-hartree", "--hartree"]).hartree is True
 
 
-def test_kin_ion_io_refuses_a_multiprocess_launch():
-    """``srun -n P`` on this generator must fail loudly, not race.
+def test_kin_ion_io_catches_a_BROKEN_multiprocess_launch():
+    """The generator now distributes — but a *failed* distributed init
+    still has to fail loudly.
 
-    Every array in the CLI is built on device 0 through a 1×1 mesh and
-    the output is a plain numpy array written by whoever finishes; P
-    ranks would redo identical work and overwrite one another's
-    ``kin_ion.h5``, with rc=0.  The guard reads the same env ladder
-    ``runtime._resolve_num_processes`` does, and fires before any file
-    is opened (hence the nonexistent input path below).
+    The old guard refused ``srun -n P`` outright.  Since the CLI is
+    k-partitioned with a coordinated rank-0 write, ``-n P`` is the
+    supported way to run it.  What remains fatal is the launcher
+    advertising P tasks while ``jax.distributed`` joined a world of 1:
+    then there is no world to partition over, every task computes the
+    whole thing and every task believes it is rank 0 — the original
+    clobber with none of the safety.  This test drives exactly that
+    state (SLURM_NTASKS=4 in a single-process test process) and fires
+    before any file is opened (hence the nonexistent input path).
     """
     from gw import kin_ion_io
     prev = os.environ.get("SLURM_NTASKS")
@@ -625,23 +629,185 @@ def test_kin_ion_io_refuses_a_multiprocess_launch():
             kin_ion_io.main(["-i", "/nonexistent/deck.in"])
         except SystemExit as exc:
             msg = str(exc)
-        assert msg and "single-process" in msg, (
-            f"expected a single-process refusal, got: {msg!r}")
-        # The documented override still lets a caller through.
-        os.environ["LORRAX_KIN_ION_ALLOW_MULTIPROC"] = "1"
-        try:
-            kin_ion_io.main(["-i", "/nonexistent/deck.in"])
-        except SystemExit as exc:
-            assert "single-process" not in str(exc)
-        except Exception:
-            pass          # any downstream failure means the guard let go
+        assert msg and "joined a world of" in msg, (
+            f"expected a broken-launch refusal, got: {msg!r}")
     finally:
-        os.environ.pop("LORRAX_KIN_ION_ALLOW_MULTIPROC", None)
         for k, v in (("SLURM_NTASKS", prev), ("JAX_PROCESS_COUNT", prev_pc)):
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+# ---------------------------------------------------------------------------
+# 3b. The exact-V_H distribution layer (workstream X)
+# ---------------------------------------------------------------------------
+
+def test_rho_work_items_cover_every_band_exactly_once():
+    """The ρ partition must be a partition — no band counted twice, none
+    dropped.  A duplicated (k, band) silently inflates a ~500 eV term."""
+    from gw.kin_ion_io import rho_work_items
+    for nk, nocc, world in ((9, 26, 1), (9, 26, 4), (9, 26, 16), (9, 26, 64),
+                            (144, 26, 1), (144, 26, 16), (144, 26, 80),
+                            (144, 26, 144), (144, 26, 512), (4, 3, 64)):
+        items = rho_work_items(nk, nocc, world)
+        seen = {}
+        for ik, lo, hi in items:
+            for b in range(lo, hi):
+                key = (ik, b)
+                assert key not in seen, f"duplicate {key} at P={world}"
+                seen[key] = True
+        assert len(seen) == nk * nocc, (
+            f"P={world}: covered {len(seen)} of {nk * nocc} (k, band) pairs")
+
+
+def test_rho_work_items_are_the_serial_sweep_when_P_le_nk():
+    """THE BIT-PARITY PRECONDITION.
+
+    At ``world <= nk`` the sweep must be exactly the serial one — one
+    item per k, in k order, with the whole occupied manifold — because
+    that is what makes the P=1 result bit-for-bit the pre-distribution
+    result rather than merely equal to 1e-16.
+    """
+    from gw.kin_ion_io import rho_work_items
+    for world in (1, 2, 9, 144):
+        nk, nocc = 144, 26
+        if world > nk:
+            continue
+        assert rho_work_items(nk, nocc, world) == [
+            (ik, 0, nocc) for ik in range(nk)], f"P={world} reordered the sweep"
+
+
+def test_rho_work_items_balance_within_one_item():
+    """Round-robin, not contiguous blocks: nk=9 at P=4 must be 3/2/2/2,
+    not 3/3/3/0 (which idles a quarter of the machine)."""
+    from gw.kin_ion_io import rho_work_items
+    items = rho_work_items(9, 26, 4)
+    counts = [len(items[r::4]) for r in range(4)]
+    assert max(counts) - min(counts) <= 1, counts
+    assert sum(counts) == len(items)
+
+
+def test_valence_density_nocc_none_matches_the_sliced_form():
+    """``nocc=None`` is a slicing convention, not a second quadrature."""
+    from psp.get_DFT_mtxels import valence_density_from_kpoint
+    rng = np.random.default_rng(0)
+    box = (rng.standard_normal((5, 2, 4, 4, 6))
+           + 1j * rng.standard_normal((5, 2, 4, 4, 6)))
+    box = jnp.asarray(box, dtype=jnp.complex128)
+    a = valence_density_from_kpoint(box, nocc=5, weight=0.25,
+                                    cell_volume=13.0, spin_degeneracy=2.0)
+    b = valence_density_from_kpoint(box, nocc=None, weight=0.25,
+                                    cell_volume=13.0, spin_degeneracy=2.0)
+    assert float(jnp.abs(a - b).max()) == 0.0
+    # and the sub-window spelling equals summing the whole one
+    c = valence_density_from_kpoint(box[:2], nocc=None, weight=0.25,
+                                    cell_volume=13.0, spin_degeneracy=2.0)
+    d = valence_density_from_kpoint(box[2:], nocc=None, weight=0.25,
+                                    cell_volume=13.0, spin_degeneracy=2.0)
+    assert float(jnp.abs(a - (c + d)).max()) < 1e-13 * float(jnp.abs(a).max())
+
+
+def test_collective_helpers_are_the_identity_at_P1():
+    """P=1 must not go anywhere near a collective — that is what makes
+    the single-node CLI bit-identical to its pre-distribution self."""
+    import jax as _jax
+    from gw.kin_ion_io import (_psum_replicate, _gather_indexed_blocks,
+                               replicate_to_mesh, resolve_mesh)
+    if int(_jax.process_count()) != 1:
+        return
+    rng = np.random.default_rng(1)
+    rho = rng.standard_normal((3, 4, 5))
+    out = _psum_replicate(rho, resolve_mesh())
+    assert np.array_equal(out, rho)
+
+    vals = rng.standard_normal((3, 2, 2)) + 0j
+    idx = np.array([2, 0, -1], dtype=np.int32)      # one padding slot
+    g = _gather_indexed_blocks(vals, idx, 3)
+    assert np.array_equal(g[2], vals[0]) and np.array_equal(g[0], vals[1])
+    assert np.array_equal(g[1], np.zeros((2, 2), dtype=g.dtype))
+
+    r = replicate_to_mesh(rho, resolve_mesh())
+    assert np.allclose(np.asarray(r), rho)
+
+
+def test_hartree_mesh_resolution_is_square_and_covers_every_device():
+    from gw.kin_ion_io import resolve_mesh
+    m = resolve_mesh()
+    assert tuple(m.axis_names) == ('x', 'y')
+    assert int(m.devices.size) == int(jax.device_count())
+
+
+_FIXTURE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "tests", "regression", "cohsex_debug")
+
+
+def test_rotated_density_load_reduces_to_the_plain_load_at_U_identity():
+    """The QSGW density seam must be a no-op at U = 1.
+
+    ``build_valence_density_distributed(psi_rotation=U)`` is what lets a
+    density-updating SC loop rebuild ρ from the CURRENT orbitals.  With
+    U the identity it must reproduce the DFT-orbital load exactly, or
+    the seam is quietly changing the one-shot answer too.
+    """
+    wfn_path = os.path.join(_FIXTURE, "WFNsmall.h5")
+    if not os.path.exists(wfn_path):
+        return
+    from file_io import WfnLoader
+    from common import symmetry_maps, Meta
+    from common.wfn_transforms import load_kpoint_fftbox_local
+    from gw.kin_ion_io import _load_rotated_occ_fftbox
+    wfn = WfnLoader(wfn_path)
+    sym = symmetry_maps.SymMaps(wfn)
+    meta = Meta.from_system(wfn, sym, 4, 4, 8, 0, False)
+    nmix = 8
+    plain = load_kpoint_fftbox_local(wfn, meta, 0, nmix)
+    U = np.eye(nmix, dtype=np.complex128)
+    rot = _load_rotated_occ_fftbox(wfn, meta, 0, U)
+    assert plain.shape == rot.shape, (plain.shape, rot.shape)
+    assert float(jnp.abs(plain - rot).max()) == 0.0
+    # a pure band SWAP must permute, not change, the density
+    from psp.get_DFT_mtxels import valence_density_from_kpoint
+    Us = np.eye(nmix, dtype=np.complex128)[:, [1, 0] + list(range(2, nmix))]
+    swapped = _load_rotated_occ_fftbox(wfn, meta, 0, Us)
+    kw = dict(nocc=None, weight=1.0, cell_volume=float(wfn.cell_volume),
+              spin_degeneracy=1.0)
+    r0 = valence_density_from_kpoint(plain, **kw)
+    r1 = valence_density_from_kpoint(swapped, **kw)
+    assert float(jnp.abs(r0 - r1).max()) < 1e-10 * float(jnp.abs(r0).max())
+    wfn.close()
+
+
+def test_process_local_load_matches_the_legacy_wrapper():
+    """``load_kpoint_fftbox`` must keep its values while gaining a
+    process-local backend — every existing single-process caller
+    (orbital_magnetization, scf_potential, run_sternheimer, …) depends
+    on it."""
+    wfn_path = os.path.join(_FIXTURE, "WFNsmall.h5")
+    if not os.path.exists(wfn_path):
+        return
+    from file_io import WfnLoader
+    from common import symmetry_maps, Meta
+    from common.wfn_transforms import (load_kpoint_fftbox,
+                                       load_kpoint_fftbox_local)
+    wfn = WfnLoader(wfn_path)
+    sym = symmetry_maps.SymMaps(wfn)
+    meta = Meta.from_system(wfn, sym, 4, 4, 8, 0, False)
+    a = load_kpoint_fftbox(wfn, sym, meta, 1, 6)
+    b = load_kpoint_fftbox_local(wfn, meta, 1, 6)
+    assert float(jnp.abs(a - b).max()) == 0.0
+    # the band sub-window is a plain slice of the full window
+    c = load_kpoint_fftbox_local(wfn, meta, 1, 6, b_lo=2)
+    assert float(jnp.abs(a[2:6] - c).max()) == 0.0
+    wfn.close()
+
+
+def test_hartree_cache_can_be_invalidated_for_a_density_updating_loop():
+    from gw import sigma_dispatch
+    sigma_dispatch._hartree_cache[("sentinel",)] = ("isdf", None)
+    sigma_dispatch.invalidate_hartree_cache()
+    assert sigma_dispatch._hartree_cache == {}
 
 
 # ---------------------------------------------------------------------------

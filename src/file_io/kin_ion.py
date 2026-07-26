@@ -16,7 +16,11 @@ Three sources, in ``auto`` precedence order:
     (``gw.cohsex_sigma``'s Hartree kernel).  Fully P-distributed and
     recomputable in-loop; centroid-count dependent.
 ``gspace``  — built on the fly by the driver through the same exact
-    FFT-grid route (``gw.kin_ion_io.compute_hartree_matrix``).
+    FFT-grid route (``gw.kin_ion_io.compute_hartree_matrix``), on the
+    run's own device mesh.  Since scorecard §X that route is
+    distributed (ρ: one psum; Poisson: replicated; matrix elements:
+    k-partitioned + one gather), so ``gspace`` is now the in-loop /
+    QSGW-capable spelling of the exact V_H and not just an offline one.
 
 Plus one **legacy** state that only ever appears on disk, never as a
 request:

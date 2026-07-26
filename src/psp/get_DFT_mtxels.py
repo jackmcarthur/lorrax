@@ -86,13 +86,25 @@ import h5py
 import psp.vnl_ops as vnl_ops
 
 import common.timing as timing
-# Lightweight device report (CPU-only by default)
-try:
-    devs = jax.devices()
-    plat = devs[0].platform if devs else 'none'
-    print(f"JAX: {len(devs)} {plat} devices")
-except Exception:
-    pass
+
+
+def report_devices(print_fn=print) -> None:
+    """Lightweight device banner — call it, do not trigger it on import.
+
+    This used to run at module IMPORT time.  ``jax.devices()`` brings up
+    the XLA backend, and ``jax.distributed.initialize()`` refuses to run
+    after that ("must be called before any JAX calls that might
+    initialise the XLA backend"), so merely importing this module made
+    every downstream CLI single-process **whatever its own header did**.
+    That is what pinned ``gw.kin_ion_io`` to one rank; a diagnostic
+    print is not worth a backend init, so it moved into a function.
+    """
+    try:
+        devs = jax.devices()
+        plat = devs[0].platform if devs else 'none'
+        print_fn(f"JAX: {len(devs)} {plat} devices")
+    except Exception:
+        pass
 
 # Import ISDF modules
  
@@ -148,7 +160,7 @@ def spin_degeneracy_factor(wfn) -> float:
 def valence_density_from_kpoint(
     psi_k_box: jnp.ndarray,
     *,
-    nocc: int,
+    nocc: int | None,
     weight: float,
     cell_volume: float,
     spin_degeneracy: float = 1.0,
@@ -161,15 +173,26 @@ def valence_density_from_kpoint(
     ``√(N_grid/Ω)`` normalisation :func:`compute_local_V_k` assumes, so
     ``ΔV · Σ_r ρ = f_spin · w_k · nocc``.
 
-    Single source of truth for the density quadrature: both the
-    all-k-resident :func:`compute_valence_density` and the chunked
-    per-k CLI (``gw.kin_ion_io``) go through this.
+    ``nocc=None`` means "every band in ``psi_k_box`` is occupied and
+    contributes" — the contract the **band-chunked** distributed sweep
+    needs, where a rank has been handed the band sub-window
+    ``[b_lo, b_hi)`` of the occupied manifold and there is no
+    band-0-based cut to apply.  ``nocc=n`` keeps the legacy
+    "first n rows of a full-window box" behaviour.  Both spellings
+    produce identical arithmetic for the same set of bands; this is a
+    slicing convention, not a second quadrature.
+
+    Single source of truth for the density quadrature: the
+    all-k-resident :func:`compute_valence_density`, the chunked per-k
+    CLI and the k/band-partitioned distributed sweep
+    (``gw.kin_ion_io.build_valence_density_distributed``) all go
+    through this one function.
     """
     nx, ny, nz = psi_k_box.shape[-3:]
     ngrid = int(nx) * int(ny) * int(nz)
     scale = jnp.sqrt(jnp.asarray(ngrid, dtype=jnp.float64)
                      / jnp.asarray(cell_volume, dtype=jnp.float64))
-    psi_occ = psi_k_box[: int(nocc)]
+    psi_occ = psi_k_box if nocc is None else psi_k_box[: int(nocc)]
     psi_r = jnp.fft.ifftn(psi_occ, axes=(-3, -2, -1), norm='ortho') * scale
     return (float(weight) * float(spin_degeneracy)) * jnp.sum(
         jnp.real(jnp.conj(psi_r) * psi_r), axis=(0, 1))

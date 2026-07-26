@@ -65,6 +65,8 @@ __all__ = [
     # WfnLoader as their first ``wfn`` argument.
     "get_enk_bandrange",
     "load_kpoint_fftbox",
+    "load_kpoint_fftbox_local",
+    "process_local_mesh",
     "read_Gvecs_to_devices",
     "iter_psi_rchunk_bandwise",
     "load_centroids_band_chunked",
@@ -1414,32 +1416,87 @@ def apply_bloch_phase_on_slice(
 # ===========================================================================
 
 
+_PROCESS_LOCAL_MESH: "Mesh | None" = None
+
+
+def process_local_mesh() -> Mesh:
+    """THE 1×1 ``('x','y')`` mesh over **this process's own** device.
+
+    Every rank gets a different mesh object holding a different device
+    (``jax.local_devices()[0]``), which is exactly the point: a jit
+    whose operands live on this mesh compiles and runs process-locally,
+    with no collective and no cross-rank agreement on shapes.  It is the
+    mesh half of the :meth:`file_io.wfn_loader.WfnLoader.load_process_local`
+    contract.
+
+    Cached module-wide so the shape-keyed jit caches in this module
+    (``to_box`` and friends key on the output ``NamedSharding``, which
+    embeds the mesh) hit instead of re-lowering per call.
+
+    NOTE the difference from ``jax.devices()[:1]``, which this helper
+    replaces at its call sites: ``jax.devices()`` is the GLOBAL device
+    list, so ``jax.devices()[0]`` is process 0's device on every rank —
+    a mesh no rank but 0 can compute on.
+    """
+    global _PROCESS_LOCAL_MESH
+    if _PROCESS_LOCAL_MESH is None:
+        _PROCESS_LOCAL_MESH = Mesh(
+            np.asarray(jax.local_devices()[:1]).reshape(1, 1),
+            axis_names=('x', 'y'))
+    return _PROCESS_LOCAL_MESH
+
+
+def load_kpoint_fftbox_local(wfn, meta, k_idx, nb, *, b_lo: int = 0,
+                             bispinor: bool = False):
+    """One k-point's ψ in the FFT box, **process-local**.
+
+    Returns ``(nb - b_lo, nspinor, nx, ny, nz)`` c128 on
+    ``jax.local_devices()[0]`` — see
+    :meth:`file_io.wfn_loader.WfnLoader.load_process_local` for the
+    single-device contract and why the k-parallel kernels need it.
+
+    ``b_lo`` selects a band sub-window ``[b_lo, nb)``; the default
+    ``b_lo=0`` reproduces the legacy "first ``nb`` bands" behaviour.
+    Band sub-windows are what lets the ρ sweep in ``gw.kin_ion_io``
+    add band-parallelism on top of k-parallelism when the rank count
+    exceeds ``nk``.
+
+    Memory: ``(nb - b_lo) · nspinor · nx·ny·nz · 16 B`` — 0.55 GiB for
+    the MoS₂ 12×12 at 120 bands, which is why the callers stream k
+    (and, past P > nk, band chunks) rather than materialising all of it.
+    """
+    loader = wfn  # reuse top-level WfnLoader; do NOT re-open (would re-slurp coeffs)
+    psi = loader.load_process_local(
+        bands=(int(b_lo), int(nb)), k=[int(k_idx)], bispinor=bool(bispinor))
+    ns_have = int(psi.shape[2])
+    if int(meta.nspinor) > ns_have:
+        psi = jnp.pad(psi, ((0, 0), (0, 0), (0, int(meta.nspinor) - ns_have),
+                            (0, 0)))
+    psi_box = to_box(psi, loader.box_index(k=[int(k_idx)]),
+                     tuple(int(s) for s in meta.fft_grid),
+                     mesh=process_local_mesh())
+    return psi_box[0]                                # strip the singleton k-axis
+
+
 def load_kpoint_fftbox(wfn, sym, meta, k_idx, nb):
     """Load a single k-point's wavefunction into the FFT box on GPU.
 
     Returns jax array of shape (nb, nspinor, nx, ny, nz), ~0.55 GiB for 12x12.
 
-    Uses :class:`file_io.wfn_loader.WfnLoader` + ``to_box``.  ``sym`` is
-    unused (the loader's full-BZ unfold is internal to ``load(k=[k_idx])``);
-    kept in the signature for caller-API back-compat.
+    Thin back-compat wrapper over :func:`load_kpoint_fftbox_local`;
+    ``sym`` is unused (the loader's full-BZ unfold is internal to
+    ``load_process_local(k=[k_idx])``) and kept for caller-API
+    compatibility.
+
+    Values are unchanged for every existing (single-process) caller: at
+    ``P=1`` ``jax.local_devices()[0] is jax.devices()[0]`` and the
+    mesh-less loader's ``load(..., sharding=None)`` took the same
+    ``_eager_build`` path ``load_process_local`` takes.  At ``P>1`` the
+    old body was silently wrong (it boxed a band-SHARDED ψ against a
+    1×1 mesh pinned to process 0's device); the delegation fixes that.
     """
     del sym
-
-    loader = wfn  # reuse top-level WfnLoader; do NOT re-open (would re-slurp coeffs)
-    psi = loader.load(bands=(0, int(nb)), k=[int(k_idx)],
-                      sharding=None)               # (1, nb, nspinor_wfn, ngkmax)
-    if int(meta.nspinor) > int(loader.nspinor):
-        ns_pad = int(meta.nspinor) - int(loader.nspinor)
-        psi = jnp.pad(psi, ((0, 0), (0, 0), (0, ns_pad), (0, 0)))
-    # Single-rank legacy helper: build the 1×1 trivial mesh inline so
-    # ``to_box`` runs through the same mesh-required code path as the
-    # multi-rank callers.
-    _mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
-                  axis_names=('x', 'y'))
-    psi_box = to_box(psi, loader.box_index(k=[int(k_idx)]),
-                      tuple(int(s) for s in meta.fft_grid),
-                      mesh=_mesh)
-    return psi_box[0]                                # strip the singleton k-axis
+    return load_kpoint_fftbox_local(wfn, meta, k_idx, nb)
 
 
 def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):

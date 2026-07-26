@@ -92,8 +92,29 @@ class SigmaResult:
 #: exact V_H does not change with the band basis (it is a fixed operator in
 #: the DFT basis, and ``rotate_wavefunctions`` handles the basis change on
 #: H₀ as a whole), so re-reading — or worse, re-running the ``gspace``
-#: build, which is minutes — every iteration would be pure waste.
+#: build, every iteration would be pure waste.
+#:
+#: WHAT THE CACHE ASSUMES, AND WHEN IT MUST BE DROPPED.  The statement
+#: above is exactly true for QSGW **at fixed density** — the only kind the
+#: driver runs today: the SC loop rotates the band basis, it does not
+#: rebuild ρ.  A density-updating QSGW breaks the assumption, because then
+#: V_H is a function of the current occupied orbitals and *does* change
+#: every iteration.  The kernel is ready for that
+#: (``compute_hartree_matrix(..., psi_rotation=U[:, :, :nocc])`` builds ρ
+#: from the rotated ψ) and the cost is affordable — see the QSGW readiness
+#: note in the scorecard — but such a loop MUST call
+#: :func:`invalidate_hartree_cache` at the top of each iteration, or it
+#: will silently keep iteration 0's Hartree potential for ever.
 _hartree_cache: dict = {}
+
+
+def invalidate_hartree_cache() -> None:
+    """Drop the memoised V_H so the next call rebuilds it.
+
+    Required by any self-consistency loop that updates the DENSITY (not
+    just the band basis) — see the note on :data:`_hartree_cache`.
+    """
+    _hartree_cache.clear()
 
 
 def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
@@ -127,16 +148,25 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
             raise ValueError(
                 "hartree_source=gspace needs the WFN loader and SymMaps.")
         print_fn("  V_H: rebuilding the exact FFT-grid matrix on the fly "
-                 "(hartree_source=gspace) — this is a SERIAL, single-process "
-                 "build; prefer a stored 'v_hartree' array for production.")
+                 "(hartree_source=gspace) — DISTRIBUTED over the run's own "
+                 "mesh (ρ: one psum; Poisson: replicated; ⟨mk|V_H|nk⟩: "
+                 "k-partitioned + one gather).")
         # Lazy: pulls in the psp stack, which the ISDF path does not need.
-        from gw.kin_ion_io import compute_hartree_matrix
+        from gw.kin_ion_io import compute_hartree_matrix, replicate_to_mesh
         v_h_np = compute_hartree_matrix(
             wfn, sym, meta,
             truncation_2d=(int(config.sys_dim) == 2),
-            nb=int(band_slices.b3), print_fn=print_fn)
-        v_h = jnp.asarray(v_h_np[:, band_slices.b0:band_slices.b3,
-                                 band_slices.b0:band_slices.b3])
+            nb=int(band_slices.b3), mesh=mesh_xy, print_fn=print_fn)
+        # ``compute_hartree_matrix`` hands every rank the same host array;
+        # publish it as a genuinely REPLICATED global array so it composes
+        # with the (global) ``sig_h`` it replaces.  ``jnp.asarray`` here
+        # would have produced a single-device array — fine at P=1, an
+        # operand-sharding mismatch at P>1.
+        v_h = replicate_to_mesh(
+            np.ascontiguousarray(
+                v_h_np[:, band_slices.b0:band_slices.b3,
+                       band_slices.b0:band_slices.b3]),
+            mesh_xy)
     elif source == "folded":
         print_fn("  V_H: LEGACY folded kin_ion.h5 — V_H is inside its values; "
                  "the ISDF sig_h is suppressed to avoid double counting.")

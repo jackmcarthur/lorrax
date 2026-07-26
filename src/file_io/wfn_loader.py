@@ -1159,6 +1159,76 @@ class WfnLoader:
             return jnp.asarray(psi_np)
         return jax.device_put(psi_np, named_sharding)
 
+    def load_process_local(
+        self,
+        *,
+        bands: tuple[int, int],
+        k: KSpec = "full_bz",
+        bispinor: bool = False,
+    ) -> jax.Array:
+        """ψ(G) for THIS PROCESS ALONE — a **single-device** ``jax.Array``.
+
+        Layout contract
+        ---------------
+        Returns ``(n_k, nb, nspinor_out, ngkmax)`` c128 committed to
+        ``jax.local_devices()[0]``.  ``nb = bands[1] - bands[0]``
+        exactly: **no mesh-divisibility band padding**, because nothing
+        about this array is global.
+
+        How it differs from :meth:`load` — and why that matters
+        -------------------------------------------------------
+        :meth:`load` always returns a *global* array: every rank must
+        request the SAME ``(bands, k)`` window and each ends up owning a
+        band shard of one logical object.  That is the right primitive
+        for the GW pipeline, and the wrong one for any kernel whose
+        parallelism is over k, because rank *r* asking for ``k=[7]``
+        while rank *s* asks for ``k=[9]`` builds a global array whose
+        shards are pieces of different physical objects.
+
+        This method is the other primitive: the array it returns is
+        addressable by this process only, so each rank may load a
+        DIFFERENT ``(bands, k)`` window and run ordinary ``jax.jit``
+        computations on it with no collective, no barrier and no
+        cross-rank shape agreement.  Combining the per-rank results is
+        then an explicit, auditable step (one ``psum`` / one
+        ``process_allgather``) rather than something XLA's SPMD
+        partitioner infers.
+
+        Used by the exact-V_H kernel (``gw.kin_ion_io``), whose ρ sweep
+        and ⟨mk|V_H|nk⟩ sweep are both partitioned over k.
+
+        Identical values to ``load(..., sharding=None)`` on a mesh-less
+        loader — same ``_eager_build``, same symmetry unfold — so a P=1
+        run is bit-for-bit what the serial path produced.
+        """
+        if bispinor and int(self.nspinor) != 2:
+            raise ValueError(
+                f"load_process_local(bispinor=True) requires a 2-spinor WFN; "
+                f"file has nspinor={int(self.nspinor)}.")
+        b_lo, b_hi = int(bands[0]), int(bands[1])
+        if b_hi <= b_lo:
+            raise ValueError(f"empty band range: {bands}")
+        if b_lo < 0 or b_hi > int(self.nbands):
+            raise ValueError(
+                f"band range {bands} out of [0, {self.nbands})")
+
+        k_idxs, unfold = self._resolve_k(k)
+        # The phdf5 backends never open the coeffs dataset (they read it
+        # collectively through the FFI), but the host build below needs
+        # the handle.  Opening it lazily costs one h5py lookup and keeps
+        # this method usable from a driver whose loader is phdf5-backed.
+        if self._coeffs_ds is None:
+            self._coeffs_ds = self._file["wfns/coeffs"]
+
+        psi_np = self._eager_build(
+            b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
+            nb_padded=b_hi - b_lo)
+        psi = jax.device_put(psi_np, jax.local_devices()[0])
+        if bispinor:
+            psi = self._apply_bispinor_lift(
+                psi, k=k, k_idxs=k_idxs, unfold=unfold, sharding=None)
+        return psi
+
     def _eager_build_process_local(
         self,
         *,
