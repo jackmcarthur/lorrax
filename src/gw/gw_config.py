@@ -1197,8 +1197,12 @@ class LorraxConfig:
             try:
                 zct_stage_cap_gb = min(
                     memory_per_device_gb, max(0.0, float(zct_cap_env)))
-            except Exception:
-                pass
+            except ValueError:
+                # Swallowing this left the user believing a cap was in
+                # force when it was not -- an OOM later, with no clue.
+                print(f"  *** LORRAX SANITY: ISDF_ZCT_STAGE_CAP_GB="
+                      f"{zct_cap_env!r} is not a number; the stage cap is "
+                      f"NOT set. ***", flush=True)
         if (zct_stage_cap_gb is None and zct_frac_env
                 and jax.default_backend() in ("gpu", "cuda")):
             from common.gpu_utils import get_device_memory_info
@@ -1207,8 +1211,10 @@ class LorraxConfig:
                 try:
                     frac = max(0.10, min(0.95, float(zct_frac_env)))
                     zct_stage_cap_gb = min(memory_per_device_gb, frac * total_gb)
-                except Exception:
-                    pass
+                except ValueError:
+                    print(f"  *** LORRAX SANITY: ISDF_ZCT_STAGE_CAP_FRAC="
+                          f"{zct_frac_env!r} is not a number; the stage cap "
+                          f"is NOT set. ***", flush=True)
 
         def _g(key):
             return params.get(key, _DEFAULTS.get(key))

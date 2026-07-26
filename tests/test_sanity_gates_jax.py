@@ -1,0 +1,336 @@
+"""Sanity-gate tests that need jax and/or h5py.
+
+**READY TO RUN — NOT YET EXECUTED.**  The login-node ``python3`` has
+neither jax nor a working h5py (``libhdf5.so.103`` missing), so this file
+was written and left runnable rather than run.  Execute it inside the
+container, e.g.::
+
+    /scratch2/08271/jackmc/lorrax_setup/alloc_run.sh 1 1 \
+        /work2/08271/jackmc/frontera/wt-F/src \
+        /work2/08271/jackmc/frontera/wt-F \
+        python -u tests/test_sanity_gates_jax.py
+
+or under pytest with the venv on PATH.  It needs **one** process and no
+GPU; total runtime is seconds.  The pure-python half of the coverage
+(``tests/test_sanity_gates.py``) already passes on the login node — this
+file adds only the on-device reduction path and the HDF5 provenance
+guards.
+
+Covered here
+------------
+1. ``common.sanity`` reductions against real ``jax.Array`` inputs,
+   including a *sharded* array (the production case — the reduction must
+   produce one replicated scalar, not a per-shard value).
+2. ``file_io.zeta_loader.ZetaLoader``'s ``zeta_is_done`` refusal — the
+   guard that turns a ζ from a job that died mid-write from "silently
+   reusable" into an error.
+3. ``gw.gw_init._check_zeta_h5_matches_basis`` on a G-flat file — the
+   case the old guard missed entirely because it probed ``zeta_q``
+   while the production writer creates ``zeta_q_G``.
+"""
+import os
+import sys
+import tempfile
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("JAX_ENABLE_X64", "1")
+
+import h5py                                          # noqa: E402
+import jax                                           # noqa: E402
+import jax.numpy as jnp                              # noqa: E402
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
+
+from common import sanity                            # noqa: E402
+
+
+class _Log:
+    def __init__(self):
+        self.lines = []
+
+    def __call__(self, *a, **k):
+        self.lines.append(" ".join(str(x) for x in a))
+
+    @property
+    def text(self):
+        return "\n".join(self.lines)
+
+    @property
+    def failures(self):
+        return [ln for ln in self.lines if "LORRAX SANITY FAILURE" in ln]
+
+
+def _mesh(nx=1, ny=1):
+    devs = np.array(jax.devices()[: nx * ny]).reshape(nx, ny)
+    return Mesh(devs, ("x", "y"))
+
+
+# ---------------------------------------------------------------------------
+# 1. Device-side reductions
+# ---------------------------------------------------------------------------
+
+def test_device_check_finite_clean():
+    a = jnp.arange(64, dtype=jnp.complex128).reshape(8, 8)
+    log = _Log()
+    assert sanity.check_finite("V_q", a, print_fn=log) is True
+    assert log.failures == []
+
+
+def test_device_check_finite_catches_nan():
+    a = jnp.ones((8, 8), dtype=jnp.complex128)
+    a = a.at[3, 4].set(jnp.nan)
+    a = a.at[5, 1].set(jnp.inf)
+    log = _Log()
+    assert sanity.check_finite("W", a, print_fn=log) is False
+    assert "2 non-finite entries of 64" in log.failures[0], log.text
+
+
+def test_device_check_finite_complex_imag_nan():
+    """``inf`` / ``nan`` hiding in the imaginary part must be caught."""
+    a = jnp.ones((4, 4), dtype=jnp.complex128) + 1j * jnp.zeros((4, 4))
+    a = a.at[1, 1].set(1.0 + 1j * jnp.nan)
+    log = _Log()
+    assert sanity.check_finite("Sigma", a, print_fn=log) is False
+
+
+def test_device_check_finite_on_sharded_array():
+    """The reduction must be global, not per-shard.
+
+    A sharded (nq, mu, mu) V_q is the real input here; a reduction that
+    silently operated on the local shard would miss a NaN living on
+    another device — which is precisely the multi-rank failure mode these
+    gates exist for.
+    """
+    n_dev = len(jax.devices())
+    if n_dev < 2:
+        print("  SKIP test_device_check_finite_on_sharded_array "
+              "(needs >=2 devices; set XLA_FLAGS="
+              "--xla_force_host_platform_device_count=4)")
+        return
+    mesh = _mesh(1, min(4, n_dev))
+    sh = NamedSharding(mesh, P(None, "y"))
+    host = np.ones((4, mesh.shape["y"] * 3), dtype=np.complex128)
+    host[0, -1] = np.nan                    # lands on the LAST shard only
+    a = jax.device_put(jnp.asarray(host), sh)
+    log = _Log()
+    assert sanity.check_finite("V_q(sharded)", a, print_fn=log) is False
+    assert "1 non-finite" in log.failures[0], log.text
+
+
+def test_device_check_hermitian():
+    rng = np.random.default_rng(1)
+    m = rng.normal(size=(8, 8)) + 1j * rng.normal(size=(8, 8))
+    herm = jnp.asarray(0.5 * (m + m.conj().T))
+    assert sanity.check_hermitian("V_q[0]", herm, print_fn=_Log()) is True
+    broken = herm.at[2, 5].add(0.7)
+    log = _Log()
+    assert sanity.check_hermitian("V_q[0]", broken, print_fn=log) is False
+    assert "is NOT Hermitian" in log.failures[0]
+
+
+def test_device_gate_cost_is_one_fetch():
+    """Sanity: the reduction returns scalars, not the array (cheapness gate)."""
+    big = jnp.ones((256, 256), dtype=jnp.complex128)
+    n_bad, n_nan, max_abs, size = sanity._finite_stats(big)
+    assert (n_bad, n_nan, size) == (0, 0, 256 * 256)
+    assert abs(max_abs - 1.0) < 1e-12
+
+
+def test_off_switch_skips_device_work():
+    prev = os.environ.get("LORRAX_SANITY")
+    os.environ["LORRAX_SANITY"] = "0"
+    try:
+        log = _Log()
+        bad = jnp.full((4, 4), jnp.nan, dtype=jnp.complex128)
+        assert sanity.check_finite("V", bad, print_fn=log) is True
+        assert log.lines == []
+    finally:
+        if prev is None:
+            os.environ.pop("LORRAX_SANITY", None)
+        else:
+            os.environ["LORRAX_SANITY"] = prev
+
+
+# ---------------------------------------------------------------------------
+# 2/3. HDF5 provenance guards on zeta_q.h5
+# ---------------------------------------------------------------------------
+
+def _make_zeta_h5(path, *, n_rmu, n_q=2, ngkmax=7, done=True,
+                  fft_grid=(8, 8, 8), layout="G_flat"):
+    """Minimal zeta_q.h5 carrying just what the guards read."""
+    from file_io.isdf_header import IsdfHeader, write_isdf_header
+
+    idx = np.stack(np.meshgrid(
+        np.arange(n_rmu) % fft_grid[0],
+        np.zeros(1, dtype=int), np.zeros(1, dtype=int),
+        indexing="ij"), axis=-1).reshape(n_rmu, 3).astype(np.int32)
+    gvec = np.zeros((n_q, 3, ngkmax), dtype=np.int32)
+    ngk = np.full((n_q,), ngkmax, dtype=np.int32)
+    hdr = IsdfHeader.build(
+        r_mu_fft_idx=idx, fft_grid=fft_grid, density="scalar",
+        vertex_mu_L=0, zeta_is_done=done, zeta_layout=layout,
+        gvec_components=gvec, ngk_per_q=ngk, zeta_cutoff_ry=10.0)
+    with h5py.File(path, "w") as f:
+        if layout == "G_flat":
+            f.create_dataset("zeta_q_G",
+                             data=np.zeros((n_q, n_rmu, ngkmax),
+                                           dtype=np.complex128))
+        else:
+            f.create_dataset("zeta_q",
+                             data=np.zeros((n_q, 64, n_rmu),
+                                           dtype=np.complex128))
+    write_isdf_header(path, hdr, mode="a")
+    return path
+
+
+def test_zeta_basis_guard_sees_gflat_dataset():
+    """The regression this fixes: the old guard probed the wrong dataset.
+
+    A stale 276-centroid ζ in the run directory of a 606-centroid run has
+    always been supposed to raise here.  Before the fix it did not, for
+    every G-flat (i.e. every production) file.
+    """
+    from gw.gw_init import _check_zeta_h5_matches_basis
+    with tempfile.TemporaryDirectory() as d:
+        p = _make_zeta_h5(os.path.join(d, "zeta_q.h5"), n_rmu=276)
+        # Matching basis ⇒ silent.
+        _check_zeta_h5_matches_basis(p, 276, print_fn=_Log(),
+                                     fft_grid=(8, 8, 8))
+        # Mismatched basis ⇒ must raise.
+        try:
+            _check_zeta_h5_matches_basis(p, 606, print_fn=_Log(),
+                                         fft_grid=(8, 8, 8))
+        except ValueError as exc:
+            assert "n_mu=276" in str(exc)
+        else:
+            raise AssertionError(
+                "stale-basis zeta_q.h5 was accepted (the pre-fix bug)")
+
+
+def test_zeta_basis_guard_catches_wrong_fft_grid():
+    from gw.gw_init import _check_zeta_h5_matches_basis
+    with tempfile.TemporaryDirectory() as d:
+        p = _make_zeta_h5(os.path.join(d, "zeta_q.h5"), n_rmu=16,
+                          fft_grid=(8, 8, 8))
+        try:
+            _check_zeta_h5_matches_basis(p, 16, print_fn=_Log(),
+                                         fft_grid=(4, 4, 4))
+        except ValueError as exc:
+            assert "different FFT grid" in str(exc)
+        else:
+            raise AssertionError("wrong-grid zeta_q.h5 was accepted")
+
+
+def test_zeta_basis_guard_warns_on_incomplete():
+    from gw.gw_init import _check_zeta_h5_matches_basis
+    log = _Log()
+    with tempfile.TemporaryDirectory() as d:
+        p = _make_zeta_h5(os.path.join(d, "zeta_q.h5"), n_rmu=16, done=False)
+        _check_zeta_h5_matches_basis(p, 16, print_fn=log, fft_grid=(8, 8, 8))
+    assert "zeta_is_done=False" in log.text, log.text
+
+
+def test_zeta_loader_refuses_incomplete_file():
+    """A ζ from a crashed fit must not open for reading."""
+    from file_io.zeta_loader import ZetaLoader
+    with tempfile.TemporaryDirectory() as d:
+        p = _make_zeta_h5(os.path.join(d, "zeta_q.h5"), n_rmu=16, done=False)
+        try:
+            ZetaLoader(p, mesh=_mesh()).close()
+        except ValueError as exc:
+            assert "zeta_is_done=False" in str(exc)
+        else:
+            raise AssertionError(
+                "ZetaLoader opened a ζ whose fit never finished")
+
+
+def test_zeta_loader_override_env():
+    from file_io.zeta_loader import ZetaLoader
+    prev = os.environ.get("LORRAX_ALLOW_PARTIAL_ZETA")
+    os.environ["LORRAX_ALLOW_PARTIAL_ZETA"] = "1"
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = _make_zeta_h5(os.path.join(d, "zeta_q.h5"), n_rmu=16,
+                              done=False)
+            ZetaLoader(p, mesh=_mesh()).close()      # must NOT raise
+    finally:
+        if prev is None:
+            os.environ.pop("LORRAX_ALLOW_PARTIAL_ZETA", None)
+        else:
+            os.environ["LORRAX_ALLOW_PARTIAL_ZETA"] = prev
+
+
+def test_zeta_loader_accepts_complete_file():
+    from file_io.zeta_loader import ZetaLoader
+    with tempfile.TemporaryDirectory() as d:
+        p = _make_zeta_h5(os.path.join(d, "zeta_q.h5"), n_rmu=16, done=True)
+        with ZetaLoader(p, mesh=_mesh()) as z:
+            assert int(z.n_rmu) == 16
+            assert z.zeta_layout == "G_flat"
+
+
+# ---------------------------------------------------------------------------
+# 4. Collective barrier + fail-fast hook
+# ---------------------------------------------------------------------------
+
+def test_barrier_single_process_is_noop():
+    from common.collectives import barrier, process_count
+    assert process_count() == jax.process_count()
+    if jax.process_count() <= 1:
+        assert barrier("unit_test", print_fn=_Log()) is False
+    else:
+        assert barrier("unit_test", print_fn=_Log()) is True
+
+
+def test_failfast_hook_not_installed_single_process():
+    """The hook must stay OFF in single-process runs (normal tracebacks)."""
+    import runtime
+    before = sys.excepthook
+    runtime.install_failfast_excepthook()
+    if int(os.environ.get("SLURM_NTASKS", "1")) <= 1:
+        assert sys.excepthook is before
+
+
+def test_failfast_hook_respects_optout():
+    import runtime
+    prev_n = os.environ.get("SLURM_NTASKS")
+    prev_f = os.environ.get("LORRAX_FAILFAST")
+    os.environ["SLURM_NTASKS"] = "4"
+    os.environ["LORRAX_FAILFAST"] = "0"
+    before = sys.excepthook
+    try:
+        runtime.install_failfast_excepthook()
+        assert sys.excepthook is before
+    finally:
+        for k, v in (("SLURM_NTASKS", prev_n), ("LORRAX_FAILFAST", prev_f)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# ---------------------------------------------------------------------------
+
+def _main():
+    tests = [(n, o) for n, o in sorted(globals().items())
+             if n.startswith("test_") and callable(o)]
+    failed = []
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"  PASS  {name}", flush=True)
+        except Exception as exc:               # noqa: BLE001 - test runner
+            import traceback
+            failed.append(name)
+            print(f"  FAIL  {name}: {type(exc).__name__}: {exc}", flush=True)
+            traceback.print_exc()
+    print(f"\n{len(tests) - len(failed)} passed, {len(failed)} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

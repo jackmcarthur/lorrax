@@ -10,6 +10,8 @@ import jax.numpy as jnp
 import h5py
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from common.collectives import barrier
+
 
 def _mu_logical_shape(shape, mu_axes, n_rmu_logical):
     """On-disk (logical) shape for a μ-padded in-memory array: clip the
@@ -133,11 +135,7 @@ def write_restart_state_to_h5(
     if w0_touched and jax.process_index() == 0:
         with h5py.File(filename, "a") as f:
             f["W0_qmunu"].attrs["W0_ready"] = w0_ready
-    try:
-        from jax.experimental import multihost_utils as _mh
-        _mh.sync_global_devices("restart_W0_ready_flag")
-    except Exception:
-        pass
+    barrier("restart_W0_ready_flag")
 
 
 def write_w0_qmunu_to_h5(
@@ -162,11 +160,7 @@ def write_w0_qmunu_to_h5(
     if jax.process_index() == 0:
         with h5py.File(filename, "a") as f:
             f["W0_qmunu"].attrs["W0_ready"] = True
-    try:
-        from jax.experimental import multihost_utils as _mh
-        _mh.sync_global_devices("restart_W0_ready_flag")
-    except Exception:
-        pass
+    barrier("restart_W0_ready_flag")
 
 
 def write_head_scalars_to_h5(
@@ -191,11 +185,7 @@ def write_head_scalars_to_h5(
     Rank-0-only write (these are tiny; no MPI-IO needed).
     """
     if jax.process_index() != 0:
-        try:
-            from jax.experimental import multihost_utils as _mh
-            _mh.sync_global_devices("restart_head_scalars")
-        except Exception:
-            pass
+        barrier("restart_head_scalars")
         return
     with h5py.File(filename, "a") as f:
         if vhead is not None:
@@ -209,11 +199,7 @@ def write_head_scalars_to_h5(
             ds = f.create_dataset("whead", data=arr)
             if omega_grid is not None:
                 ds.attrs["omega_grid"] = np.asarray(omega_grid, dtype=np.float64).reshape(-1)
-    try:
-        from jax.experimental import multihost_utils as _mh
-        _mh.sync_global_devices("restart_head_scalars")
-    except Exception:
-        pass
+    barrier("restart_head_scalars")
 
 
 def assert_restart_window_matches(filename, band_slices=None,

@@ -345,6 +345,23 @@ def main(argv=None):
 		print0(f"  Bare Σ_X diagonal (eV), k=0: "
 		       + "  ".join(f"{sig_x_diag[0, i]:.4f}" for i in range(min(8, sig_x_diag.shape[1]))))
 
+		# ── Σ stage gate ─────────────────────────────────────────────
+		# Σ_x[n,n] = −Σ_{m∈occ} ⟨nm|V|mn⟩ is a negative-definite
+		# quadratic form in a positive-semidefinite kernel: every
+		# diagonal entry is strictly negative in a correct run, whatever
+		# the system.  A positive one is a sign / conjugation /
+		# band-index slip, not a convergence issue.  The magnitude
+		# bracket is deliberately loose (bare exchange runs −40…−5 eV
+		# for the production decks) — it exists to catch a units or
+		# basis-normalisation slip, not to police physics.
+		from common import sanity
+		sanity.check_finite("Σ_x", sigma_result.sigma_x_kij_ry, print_fn=print0)
+		sanity.check_finite("V_H", sigma_result.v_h_kij_ry, print_fn=print0)
+		sanity.check_sign("Σ_x diagonal (eV)", sig_x_diag,
+		                  expect="negative", print_fn=print0)
+		sanity.check_in_range("Σ_x diagonal (eV)", sig_x_diag,
+		                      -200.0, 0.0, unit="eV", print_fn=print0)
+
 	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
 	#
 	# Sharding: kin_ion + all four static-COHSEX components (Σ_SX, Σ_COH,
@@ -429,8 +446,18 @@ def main(argv=None):
 			mesh_xy=mesh_xy)
 
 	# ---- Single H-build + diagonalization on replicated arrays ----
+	# Gate the two inputs to the QP diagonalization *before* eigh: LAPACK
+	# on a NaN-bearing matrix returns without complaining, and the garbage
+	# then propagates into eqp0/eqp1/WFN_qp.h5 with rc=0.  ``kin_ion`` also
+	# comes off disk (kin_ion.h5), so this doubles as the content check on
+	# that interface.
+	from common import sanity
+	sanity.check_finite("kin_ion (from kin_ion.h5)", kin_ion, print_fn=print0)
+	sanity.check_finite("Σ_total (Σ_xc + V_H)", sigma_total, print_fn=print0)
+
 	H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
 	E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
+	sanity.check_finite("E_qp (eigh of H_QP)", E_full, print_fn=print0)
 
 	# ---- One-shot WFN_qp.h5 dump (drop-in BSE / restart input).  SC
 	# already wrote its own WFN_qp.h5 above via dump_qp_wfn_artifacts

@@ -50,6 +50,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import barrier
+
 
 
 # 7 (μ_L, ν_L) tiles for which the unified kernel runs:
@@ -408,11 +410,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 [list(t) for t in sorted(ZERO_TILES)])
             f.attrs["hermitian_pairs"] = json.dumps(
                 [[list(k), list(v)] for k, v in HERMITIAN_PAIRS.items()])
-    try:
-        from jax.experimental import multihost_utils as _mh
-        _mh.sync_global_devices("v_q_bispinor_g_flat_tile_layout_meta")
-    except Exception:
-        pass
+    barrier("v_q_bispinor_g_flat_tile_layout_meta")
     return output_h5_path
 
 

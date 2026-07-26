@@ -24,7 +24,8 @@ from common import jax_profile
 from .gw_config import read_lorrax_input, read_cohsex_input  # noqa: F401
 
 
-def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print):
+def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print,
+                                 *, fft_grid=None):
 	"""Fail fast when ``tmp/zeta_q.h5`` belongs to a different ISDF basis.
 
 	``tmp_dir`` is hardwired to ``<input_dir>/tmp`` and the ζ file is a fixed
@@ -39,15 +40,48 @@ def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print):
 	i.e. *after* the entire multi-hour ζ fit has already been computed and
 	thrown away.  Check the precondition up front instead: it costs one HDF5
 	header read and turns an hour of wasted compute into an actionable message.
+
+	Three invariants, all off one header read:
+
+	1. **μ extent.**  Historically this probed ``f['zeta_q']`` only — the
+	   *legacy r-space* dataset name.  Every production run since the G-flat
+	   migration writes ``zeta_q_G`` instead, so ``f.get('zeta_q')`` returned
+	   ``None`` and the guard silently passed on exactly the files it was
+	   written to protect.  Both names are probed now.
+	2. **``zeta_is_done``.**  The writer stamps this ``False`` up front and
+	   flips it via ``mark_zeta_done`` only after the last chunk lands.  It
+	   was written but never read by anybody, so a ζ from a job that died
+	   mid-write (the campaign produced several) was indistinguishable on
+	   disk from a complete one.
+	3. **Centroid grid.**  Two centroid sets of the *same* size on different
+	   FFT grids pass (1) and produce silently wrong pair densities.
 	"""
 	if not os.path.exists(zeta_h5_path):
 		return
+	existing = None
+	zeta_done = None
+	header_grid = None
 	try:
 		with h5py.File(zeta_h5_path, 'r') as f:
-			dset = f.get('zeta_q')
-			existing = None if dset is None else int(dset.shape[1])
-	except Exception:
-		return		# unreadable/partial file: let the writer deal with it
+			# G-flat (production): (n_q, n_rmu, ngkmax).
+			# r-space (legacy):    (n_q, n_rtot, n_rmu).
+			for _name, _mu_axis in (('zeta_q_G', 1), ('zeta_q', 2)):
+				dset = f.get(_name)
+				if dset is not None and dset.ndim == 3:
+					existing = int(dset.shape[_mu_axis])
+					break
+			hdr = f.get('isdf_header')
+			if hdr is not None:
+				if 'zeta_is_done' in hdr:
+					zeta_done = bool(np.asarray(hdr['zeta_is_done'])[()])
+				cent = hdr.get('centroids/r_mu_fft_idx')
+				if cent is not None:
+					header_grid = np.asarray(cent, dtype=np.int64)
+	except Exception as exc:
+		# Unreadable/partial file: say so, then let the writer deal with it.
+		print_fn(f"  [zeta guard] could not read {zeta_h5_path} "
+		         f"({type(exc).__name__}: {exc}); continuing.")
+		return
 	if existing is not None and existing != int(n_rmu):
 		raise ValueError(
 			f"{zeta_h5_path} holds a ζ for n_mu={existing}, but this run has "
@@ -57,6 +91,29 @@ def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print):
 			f"values collide here.  Give each run its own directory (put its "
 			f"input file there), or move/delete the stale ζ.  Refusing now "
 			f"rather than after the fit.")
+	if zeta_done is False:
+		print_fn(
+			f"  *** LORRAX SANITY: {zeta_h5_path} has zeta_is_done=False — "
+			f"it was left behind by a ζ-fit that did NOT finish writing.  "
+			f"This run will overwrite it, which is fine; but if you meant to "
+			f"REUSE it, do not: its trailing q-blocks are undefined. ***")
+	if header_grid is not None and header_grid.shape[0] != int(n_rmu):
+		raise ValueError(
+			f"{zeta_h5_path} isdf_header lists {header_grid.shape[0]} "
+			f"centroids but this run has n_mu={n_rmu} — the header and the ζ "
+			f"dataset in that file disagree, so it is corrupt.  Delete it.")
+	if (header_grid is not None and fft_grid is not None
+			and header_grid.size):
+		fg = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+		# Centroid FFT indices are bounded by the grid they were kmeans'd
+		# on; an index at or beyond this run's grid proves a different grid.
+		if bool(np.any(header_grid.max(axis=0) >= fg)):
+			raise ValueError(
+				f"{zeta_h5_path} was built on a different FFT grid: its "
+				f"centroid indices reach {tuple(header_grid.max(axis=0))} "
+				f"but this run's grid is {tuple(int(v) for v in fg)}.  The "
+				f"pair densities would be sampled at the wrong points.  "
+				f"Delete the stale ζ or use a separate run directory.")
 
 
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
@@ -87,7 +144,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	mem_est = chunks.get('memory_estimate', {})
 
 	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
-	_check_zeta_h5_matches_basis(zeta_h5_path, int(meta.n_rmu), print_fn)
+	_check_zeta_h5_matches_basis(zeta_h5_path, int(meta.n_rmu), print_fn,
+	                             fft_grid=meta.fft_grid)
 	print_fn(f"\n  Chunked ISDF fitting:")
 	print_fn(f"    Band chunks: {chunks['band_chunk']}")
 	print_fn(f"    R chunks:    {chunks['chunk_r']} (contiguous r-space)")
@@ -546,7 +604,23 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	print_fn(f"\n  V_q computed:")
 	print_fn(f"    Shape: {V_qmunu.shape}")
 	# V_q_raw is now flat-q (nq, μ, μ); q=0 slab is V_q_raw[0].
-	print_fn(f"    V_q=0 trace: {jnp.trace(V_q_raw[0]).real:.4f}")
+	_vq0_trace = float(jnp.trace(V_q_raw[0]).real)
+	print_fn(f"    V_q=0 trace: {_vq0_trace:.4f}")
+
+	# ── V_q stage gate ────────────────────────────────────────────────
+	# Three one-sweep invariants on the tensor every later stage (χ₀, W,
+	# Σ_x, Σ_c, the BSE kernel) is built from.  Historically this seam
+	# produced a 27 % shift in ``tr V_{q=0}`` between two runs whose V_q
+	# is band-window-independent and therefore *must* have been identical
+	# — a discrepancy that was only noticed days later, by hand, from log
+	# archaeology.  V is a positive-definite Gram matrix in the ISDF
+	# basis, so its q=0 trace is positive by construction and its tiles
+	# are Hermitian by construction; both are cheap to state.
+	from common import sanity
+	sanity.check_finite("V_q", V_qmunu, print_fn=print_fn)
+	sanity.check_positive("V_q[q=0] trace", _vq0_trace, print_fn=print_fn)
+	sanity.check_hermitian("V_q[q=0]", V_q_raw[0], print_fn=print_fn)
+	sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
 	return V_qmunu, G0
 
 
@@ -760,6 +834,21 @@ def prepare_isdf_and_wavefunctions(
 				n_rmu_logical=int(meta.n_rmu))
 			V_qmunu = rs.V_qmunu
 			print0("  Loaded restart tensors from H5.")
+			# Restart is the seam where "rc=0 but garbage" was born (job
+			# 7874375: a changed band window silently reused tensors built
+			# under the old one).  The band-window attrs guard inside
+			# ``load_restart_state_from_h5`` covers provenance; these
+			# gates cover the *content* — a truncated/partially-written
+			# restart file from a crashed run reads back as zeros or NaN
+			# and would otherwise flow straight into Σ.
+			from common import sanity
+			sanity.check_finite("restart V_q", V_qmunu, print_fn=print0)
+			sanity.check_positive(
+				"restart V_q[q=0] trace",
+				float(jnp.trace(V_qmunu[0]).real), print_fn=print0)
+			sanity.check_finite("restart ψ (psi_full_y)", rs.psi_rmu_Y,
+			                    print_fn=print0)
+			sanity.check_finite("restart E_nk", rs.enk_full, print_fn=print0)
 			wfns = build_wavefunction_bundle(
 				wfn, sym, meta, band_slices, mesh_xy,
 				psi_rmu_Y=rs.psi_rmu_Y, psi_rmuT_X=rs.psi_rmuT_X,

@@ -48,6 +48,7 @@ __all__ = [
     "set_default_env",
     "init_jax_distributed",
     "fallback_to_cpu_if_no_gpu_backend",
+    "install_failfast_excepthook",
 ]
 
 
@@ -67,6 +68,81 @@ def bootstrap(*, platform: str = "gpu") -> None:
     set_default_env(platform=platform)
     init_jax_distributed()
     fallback_to_cpu_if_no_gpu_backend()
+    install_failfast_excepthook()
+
+
+def install_failfast_excepthook() -> None:
+    """Make an uncaught per-rank exception kill the *job*, not just the rank.
+
+    The exit-code problem this solves
+    ---------------------------------
+    In a ``jax.distributed`` run the ranks are peers in a collective
+    program.  When one rank raises, CPython unwinds it normally: module
+    ``atexit`` handlers run, the NCCL/gloo backend tries to tear down, and
+    the interpreter may block indefinitely inside a communicator whose
+    peers are still sitting in a collective the dead rank will now never
+    join.  Meanwhile the surviving ranks are blocked in that collective.
+    The step ends when srun's timeout or the scheduler reaps it — and the
+    campaign's logs repeatedly show that ending as **rc=0 at the sbatch
+    level**, with a partial or absent set of outputs and no error anywhere
+    near the top of the log.
+
+    The fix is to make the *first* rank to fail exit non-zero,
+    immediately, without unwinding:
+
+    * print a rank-tagged banner (so ``tail`` on any log finds it),
+    * flush stdout/stderr explicitly (``os._exit`` does not),
+    * ``os._exit(1)`` — skipping atexit handlers and backend teardown,
+      which is exactly what would otherwise hang.
+
+    srun then sees a non-zero task exit, kills the remaining tasks in the
+    step, and the job's exit code is non-zero.  A failure that used to
+    look like success now looks like a failure.
+
+    No-op in single-process runs (normal traceback + rc 1 already works,
+    and ``os._exit`` would suppress useful teardown).  Opt out with
+    ``LORRAX_FAILFAST=0``.
+    """
+    if os.environ.get("LORRAX_FAILFAST", "1").strip().lower() in (
+            "0", "off", "false", "no"):
+        return
+    if _resolve_proc_count() <= 1:
+        return
+
+    import sys
+
+    if getattr(sys, "_lorrax_failfast_installed", False):
+        return
+
+    previous = sys.excepthook
+
+    def _failfast(exc_type, exc_value, exc_tb):
+        # SystemExit never reaches sys.excepthook, so an intentional
+        # ``raise SystemExit(0)`` (e.g. LORRAX_EXIT_AFTER_ZETA) is
+        # unaffected by this hook.
+        rank = _resolve_proc_id()
+        n = _resolve_proc_count()
+        try:
+            previous(exc_type, exc_value, exc_tb)
+        except Exception:
+            import traceback
+            traceback.print_exception(exc_type, exc_value, exc_tb)
+        try:
+            sys.stderr.write(
+                f"\n*** LORRAX FAIL-FAST: rank {rank}/{n} died with "
+                f"{exc_type.__name__}: {exc_value}\n"
+                f"*** Exiting rc=1 WITHOUT teardown so this failure reaches "
+                f"the job's exit code.  Peer ranks are blocked in a "
+                f"collective this rank will never join; srun will now kill "
+                f"the step.  (Disable with LORRAX_FAILFAST=0.)\n\n")
+            sys.stderr.flush()
+            sys.stdout.flush()
+        except Exception:
+            pass
+        os._exit(1)
+
+    sys.excepthook = _failfast
+    sys._lorrax_failfast_installed = True
 
 
 def set_default_env(*, platform: str = "gpu") -> None:

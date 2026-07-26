@@ -109,6 +109,19 @@ def write_bgw_eqp(
 	if e_qp.shape != (nk, nb):
 		raise ValueError(f"e_qp shape {e_qp.shape} does not match e_dft {(nk, nb)}")
 
+	# ── Writer gate (pre-write) ──────────────────────────────────────
+	# The NaN-producing distributed back-solve of 2026-07 reached disk
+	# with rc=0 and was caught only because somebody afterwards counted
+	# the floats in eqp0.dat: ``%15.9f`` renders a NaN as the token
+	# ``nan``, so the *count of parseable floats* drops while the line
+	# count does not.  That check is made structural here — the writer
+	# refuses to pretend a NaN-bearing array is a result, and re-reads
+	# what it wrote to confirm the file it produced parses to exactly the
+	# expected number of finite floats.
+	from common import sanity
+	sanity.check_finite(f"{os.path.basename(path)} E_DFT column", e_dft)
+	sanity.check_finite(f"{os.path.basename(path)} E_QP column", e_qp)
+
 	abs_path = os.path.abspath(path)
 	if os.path.dirname(abs_path):
 		os.makedirs(os.path.dirname(abs_path), exist_ok=True)
@@ -129,7 +142,81 @@ def write_bgw_eqp(
 						f"{ispin:8d}{iband:8d}"
 						f"{float(e_dft[ik, ib]):15.9f}{float(e_qp[ik, ib]):15.9f}\n"
 					)
+	verify_eqp_file(abs_path, nk=nk, nb=nb, nspin=nspin)
 	return abs_path
+
+
+def verify_eqp_file(
+	path: str, *, nk: int, nb: int, nspin: int = 1,
+	print_fn=print,
+) -> bool:
+	"""Re-read a written ``eqp*.dat`` and assert its structural float count.
+
+	The invariant: after the ``#`` provenance line the file holds ``nk``
+	k-point headers (3 floats + 1 int) and ``nk·nspin·nb`` body rows
+	(2 ints + 2 floats).  So a healthy file parses to exactly
+
+	    n_float = nk·3 + nk·nspin·nb·2
+
+	*finite* floats.  ``float("nan")`` parses fine, so the count alone is
+	not enough — non-finite tokens are counted separately and reported.
+	This is the check that caught the NaN-producing back-solve after the
+	fact; running it inside the writer turns "somebody noticed later" into
+	"the run said so at the time".
+
+	Returns True when the file is structurally sound.  Cost is one pass
+	over a few-thousand-line text file, i.e. nothing.
+	"""
+	from common import sanity
+
+	if not sanity.sanity_enabled():
+		return True
+	expect_rows = int(nk) * int(nspin) * int(nb)
+	expect_floats = int(nk) * 3 + expect_rows * 2
+	n_float = 0
+	n_nonfinite = 0
+	n_header = 0
+	n_body = 0
+	with open(path, "r") as fh:
+		for line in fh:
+			if line.startswith("#") or not line.strip():
+				continue
+			tok = line.split()
+			# Header rows are (3f13.9, i8) — the first token is a float and
+			# carries a '.'.  Body rows are (2i8, 2f15.9) — the first two
+			# tokens are bare integers.  Discriminating on content rather
+			# than column width keeps this correct if either format ever
+			# widens a field.
+			if len(tok) == 4 and "." in tok[0]:
+				n_header += 1
+				vals = tok[:3]
+			elif len(tok) == 4:
+				n_body += 1
+				vals = tok[2:]
+			else:
+				n_nonfinite += len(tok)   # malformed → count as suspect
+				continue
+			for v in vals:
+				try:
+					x = float(v)
+				except ValueError:
+					n_nonfinite += 1
+					continue
+				if np.isfinite(x):
+					n_float += 1
+				else:
+					n_nonfinite += 1
+	base = os.path.basename(path)
+	ok = sanity.check_count(
+		f"{base} finite-float count", n_float, expect_floats,
+		print_fn=print_fn,
+		detail=(f"{n_header}/{nk} k-headers, {n_body}/{expect_rows} band rows, "
+		        f"{n_nonfinite} non-finite/unparseable tokens.  A NaN or Inf "
+		        f"in the QP column renders as a token %15.9f cannot round-trip "
+		        f"— the file looks complete but its numbers are not."))
+	ok = sanity.check_count(f"{base} band rows", n_body, expect_rows,
+	                        print_fn=print_fn) and ok
+	return ok
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +289,21 @@ def compute_eqp_diag(
 	delta_at_dft = (
 		kin_ion_diag_ev + hartree_diag_ev + sigma_xc_at_dft - e_dft_ev
 	).real
+
+	# ── QP-shift bracket ─────────────────────────────────────────────
+	# Δ = eqp0 − E_DFT is the *entire* GW correction.  Physically it is a
+	# few eV: BGW/LORRAX MoS₂ gaps move by ~1–3 eV, and no pseudopotential
+	# G0W0 calculation produces a tens-of-eV shift.  The 2026-07 runs
+	# emitted a QP gap of −136 eV through every "successful" stage; the
+	# number that was wrong is exactly this one, and it is available here,
+	# in the one function both the live writer and the post-hoc CLI share.
+	# ±50 eV is deliberately far outside anything defensible, so a fire
+	# here always means H₀ or Σ is broken — most often the kin_ion + V_H
+	# cancellation (see gw_output._warn_on_unphysical_h0, which diagnoses
+	# the mean-field side of the same failure).
+	from common import sanity
+	sanity.check_in_range(
+		"QP shift Δ = eqp0 − E_DFT", delta_at_dft, -50.0, 50.0, unit="eV")
 
 	eqp0 = e_dft_ev + delta_at_dft
 	if z_factor is None:

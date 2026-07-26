@@ -280,13 +280,17 @@ def compute_screening(
     )
     from .w_isdf import compute_chi0, solve_w
 
+    from common import sanity
+
     W_by_role: dict[str, jax.Array] = {}
     for req in requests:
         if req.role == "static":
-            W_by_role[req.role] = compute_static_w(
+            W_static = compute_static_w(
                 wfns, V_q, quad, e_ref=e_ref,
                 sym=sym, centroid_indices=centroid_indices,
                 config=config, meta=meta, mesh_xy=mesh_xy)
+            _gate_w(W_static, req, print_fn=print_fn)
+            W_by_role[req.role] = W_static
             continue
         # Pick imag or real axis by which component of ω is non-zero.
         on_imag = abs(req.omega_ry.imag) > 0.0
@@ -312,9 +316,37 @@ def compute_screening(
             solver=config.backend.screening_solver)
         del chi0
         W.block_until_ready()
+        _gate_w(W, req, print_fn=print_fn)
         W_by_role[req.role] = W
 
     return W_by_role
+
+
+def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print) -> None:
+    """Stage gate on one solved W — the Dyson solve is the fragile seam.
+
+    ``W = (1 − Vχ₀)⁻¹V`` is the only place in the GW flow where a matrix
+    *inverse* of a near-singular object is taken at production scale, and
+    it is where the distributed back-solve work lives.  A flat-mesh column
+    sharding bug in exactly this solve produced NaN with ``rc=0`` and was
+    caught only downstream by counting floats in ``eqp0.dat``.  One
+    finiteness reduction plus one hermiticity residual here names the
+    stage instead.
+
+    ``W`` is Hermitian for the two frequencies LORRAX evaluates (ω = 0 and
+    ω = iω_p, both on axes where χ₀ is Hermitian); the real-axis HL probe
+    is *not* Hermitian in general, so hermiticity is only asserted on the
+    imaginary/zero-frequency branch.
+    """
+    from common import sanity
+
+    label = f"W[{req.role}]"
+    sanity.check_finite(label, W, print_fn=print_fn)
+    if abs(complex(req.omega_ry).real) == 0.0:
+        # ω on the imaginary axis (including ω=0): W is Hermitian.
+        # rtol is generous — this catches structural mixing, not roundoff.
+        sanity.check_hermitian(f"{label}[q=0]", W[0], rtol=1e-6,
+                               print_fn=print_fn)
 
 
 __all__ = [

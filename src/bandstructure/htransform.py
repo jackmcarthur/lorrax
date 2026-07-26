@@ -1111,8 +1111,36 @@ def main(argv=None):
         params["wfn_file"] = args.wfn_file
         log(f"Using WFN file from CLI: {args.wfn_file}")
 
+    from common import sanity
+
     wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma = initialize_wfns(
         args.input, params, log, args.eqp_file)
+    # ── Galerkin-input gate ───────────────────────────────────────────
+    # S is the ISDF overlap Gram matrix (Hermitian positive-definite by
+    # construction) and ``enk_sigma`` is the band energies the whole
+    # interpolation is anchored to — including, when ``--eqp-file`` is
+    # given, energies read from a GW run that may itself have produced
+    # garbage.  A −136 eV QP energy fed into htransform yields a
+    # bandstructure.dat that is numerically finite, plots fine, and is
+    # wrong.  Bracket it here, where the file name is still in scope.
+    sanity.check_finite("htransform S (ISDF overlap)", S, print_fn=log)
+    sanity.check_finite("htransform ctilde", ctilde, print_fn=log)
+    sanity.check_finite("htransform E_nk (Ry)", enk_sigma, print_fn=log)
+    # Bandwidth, not absolute energy: the zero of a pseudopotential
+    # eigenvalue is convention-dependent, but the *spread* of a Σ-window
+    # band set is not — 20 Ry (272 eV) is far wider than any real
+    # semicore-to-conduction window and so only fires on gross
+    # corruption.  A subtler check (comparing --eqp-file energies against
+    # the DFT ones they replace) is proposed but not implemented here;
+    # see the workstream-O report.
+    _enk = np.asarray(jax.device_get(enk_sigma), dtype=np.float64)
+    if _enk.size:
+        _spread = float(_enk.max() - _enk.min())
+        log(f"  E_nk spread: {_spread:.4f} Ry over {_enk.size} states")
+        sanity.check_in_range(
+            "htransform E_nk bandwidth (Ry)", np.array([_spread]),
+            0.0, 20.0, unit="Ry", print_fn=log)
+
     kpath_data = initialize_kpath(wfn, params)
     with mesh_xy:
         result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
@@ -1143,6 +1171,13 @@ def main(argv=None):
     if args.plot:
         plot_bands(result)
 
+    # ── Writer gate ───────────────────────────────────────────────────
+    # bandstructure.dat is the file downstream tooling and the regression
+    # gate diff against ground truth; a NaN row silently changes the file
+    # length rather than the exit code.
+    sanity.check_finite("bandstructure.dat energies",
+                        result['energies_sorted'], print_fn=log)
+
     output_dir = os.path.dirname(os.path.abspath(args.input))
     write_bands_to_file(
         os.path.join(output_dir, 'bandstructure.dat'),
@@ -1159,4 +1194,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

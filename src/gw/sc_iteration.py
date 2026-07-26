@@ -67,6 +67,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import barrier
 from common.units import RYD_TO_EV
 from .band_partition import BandPartition, apply_band_partition
 from .scissor import fit_scissor
@@ -929,11 +930,7 @@ def dump_qp_wfn_artifacts(
             kpoints_crys=np.asarray(wfn.kpoints, dtype=np.float64),
             nkx=int(kgrid[0]), nky=int(kgrid[1]), nkz=int(kgrid[2]),
         )
-    try:
-        from jax.experimental import multihost_utils as _mh
-        _mh.sync_global_devices("qp_wfn_h5_write")
-    except Exception:
-        pass
+    barrier("qp_wfn_h5_write")
     print_fn(f"  QP WFN:       {qp_wfn_path}")
     print_fn(f"  QP rotations: {qp_rot_path}")
     print_fn(f"  Final E_F (midgap, eV): {efermi_ry * RYD_TO_EV:.6f}")
