@@ -484,6 +484,50 @@ def test_zq_band_gather_is_mesh_invariant():
         f"(bpd_per_bc per mesh: {out['bpd_per_bc']})")
 
 
+def test_zeta_gather_tier_ladder_is_pinned():
+    """``distributed_zeta_solve`` route-pin — the GATHER granularity of the
+    ζ back-solve, orthogonal to ``charge_zeta_solve``'s factorization choice.
+
+    Load-bearing invariant: ``auto`` at fixture scale must resolve to
+    ``replicated``, i.e. the pre-feature path, so the default GW answer is
+    bit-identical.  ``auto`` only switches to ``per_q`` once the replicated
+    ``(nq, μ, μ)`` gather crosses ``LORRAX_ZETA_GATHER_CAP_GIB`` (4 GiB) —
+    a memory decision, never a physics one (both tiers run the same per-q
+    kernel).  ``distributed`` must REFUSE loudly rather than silently do
+    something else; that is the same fails-loudly contract the replication
+    cap test above pins for ``rank_truncate``.
+    """
+    import isdf.core as core
+
+    assert core._ZETA_GATHER_MAX_BYTES == 4 * 1024 ** 3, \
+        f"default gather cap changed: {core._ZETA_GATHER_MAX_BYTES}"
+
+    # Fixture scale (cohsex_debug: nq=9, μ_pad=64 → 0.6 MB) — must stay
+    # on today's path.
+    assert core._resolve_zeta_gather("auto", n_rmu=64, nq=9) == "replicated"
+    # MoS2 12×12 / 606c (nq=144, μ_pad=640 → 0.94 GB) — still replicated.
+    assert core._resolve_zeta_gather("auto", n_rmu=640, nq=144) == "replicated"
+    # MoS2 12×12 / 1998c (nq=144, μ_pad=2016 → 9.36 GB) — over the cap.
+    assert core._resolve_zeta_gather("auto", n_rmu=2016, nq=144) == "per_q"
+    # No size info → conservative, keep today's path.
+    assert core._resolve_zeta_gather("auto") == "replicated"
+
+    # Explicit overrides win in both directions.
+    assert core._resolve_zeta_gather(
+        "replicated", n_rmu=2016, nq=144) == "replicated"
+    assert core._resolve_zeta_gather("per_q", n_rmu=64, nq=9) == "per_q"
+
+    # 'distributed' is designed but not built: refuse, and name what is
+    # missing so the message is actionable.
+    with pytest.raises(ValueError) as exc:
+        core._resolve_zeta_gather("distributed", n_rmu=2016, nq=144)
+    msg = str(exc.value)
+    assert "not implemented" in msg
+    assert "pzheevd" in msg and "column" in msg
+    with pytest.raises(ValueError):
+        core._resolve_zeta_gather("nonsense")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "worker_cap":
         sys.exit(_worker_cap())

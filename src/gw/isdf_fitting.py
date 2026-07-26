@@ -16,9 +16,11 @@ from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
 
 from isdf.core import (
     c_q_from_psi_sm,
+    host_rss_gb as _host_rss_gb,
     factor_c_q,
     fit_one_rchunk,
     _resolve_solver_kind,
+    _resolve_zeta_gather,
     _band_norms_slice,
 )
 
@@ -30,6 +32,7 @@ from isdf.core import (
 # NCCL collective buffers, and other XLA-arena-external allocations.
 _NVSMI_PEAK_MB = 0
 _NVSMI_LAST_MB = 0
+
 
 def mem_probe(label, *, only_rank0=True):
     """``LORRAX_MEM_DEBUG=1`` runtime probe of process-wide HBM at named sites.
@@ -143,6 +146,7 @@ def fit_zeta_to_h5(
     distributed_lu: str = "auto",
     zeta_ridge: float = 0.0,
     charge_zeta_solve: str = "cholesky",
+    distributed_zeta_solve: str = "auto",
     zeta_rcond: float = 1e-8,
     gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
@@ -430,6 +434,12 @@ def fit_zeta_to_h5(
             distributed_lu=distributed_lu,
             n_rmu=int(n_rmu), nq=int(C_q_flat.shape[0]),
             charge_zeta_solve=charge_zeta_solve)
+        # Back-solve gather tier (input key ``distributed_zeta_solve``).
+        # Sized on the PADDED mu extent — that is what actually crosses
+        # the all-gather inside the back-solve.
+        _resolved_zeta_gather = _resolve_zeta_gather(
+            distributed_zeta_solve,
+            n_rmu=int(n_rmu_padded), nq=int(C_q_flat.shape[0]))
         if int(vertex_mu_L) == 0:
             _how = ("rank-truncated pinv"
                     if _resolved_solver_kind == 'replicated_rank_truncate'
@@ -439,6 +449,12 @@ def fit_zeta_to_h5(
         else:
             print(f"  Pass through C_q  [γ̃^{vertex_mu_L} indefinite — "
                   f"path={_resolved_solver_kind}]")
+        _gather_gb = (int(C_q_flat.shape[0]) * int(n_rmu_padded) ** 2
+                      * 16 / 1e9)
+        print(f"  Zeta back-solve gather: tier={_resolved_zeta_gather} "
+              f"(distributed_zeta_solve={distributed_zeta_solve})  "
+              f"replicated (nq,μ,μ) gather would be {_gather_gb:.2f} GB/rank; "
+              f"per-q tile {int(n_rmu_padded) ** 2 * 16 / 1e9:.3f} GB")
         L_q = factor_c_q(
             C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
             n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
@@ -845,6 +861,20 @@ def fit_zeta_to_h5(
         jax.block_until_ready(L_q)
     mem_probe("pre_rchunk_loop")
 
+    # glibc heap trim hook (see the comment at the call site in the loop
+    # below).  DEFAULT ON — one ``malloc_trim(0)`` per r-chunk costs a few
+    # ms and is the second half of the workstream-T ramp cure (the first
+    # half is ``runtime.tune_glibc_malloc``, applied before ``import jax``).
+    # ``LORRAX_MALLOC_TRIM=0`` disables; ``malloc_trim`` is glibc-only, so
+    # a missing symbol just disables the hook.
+    _trim_fn = None
+    if os.environ.get("LORRAX_MALLOC_TRIM", "1") not in ("0", "off", "false"):
+        try:
+            import ctypes
+            _trim_fn = ctypes.CDLL("libc.so.6").malloc_trim
+        except Exception:
+            _trim_fn = None
+
     with timing.section("zeta_fit.chunk_loop"):
         for chunk_idx in range(num_chunks):
             r_start = chunk_idx * chunk_r
@@ -856,6 +886,7 @@ def fit_zeta_to_h5(
             psi_G_store.begin_rchunk(r_start, r_end)
 
             _dbg_rchunk = bool(os.environ.get("LORRAX_RCHUNK_DEBUG"))
+            _rss0 = _host_rss_gb() if _dbg_rchunk else 0.0
             _mem_probe(f"rchunk_start chunk={chunk_idx}")
             t0 = time.perf_counter()
             try:
@@ -882,6 +913,7 @@ def fit_zeta_to_h5(
                         solver_kind=_resolved_solver_kind,
                         q_irr_full_idx=q_irr_full_idx,   # Phase B: gather inside the kernel
                         cct_trace_per_q=cct_trace_per_q,
+                        zeta_gather=_resolved_zeta_gather,
                     )
                     zeta_chunk.block_until_ready()
             finally:
@@ -891,6 +923,7 @@ def fit_zeta_to_h5(
                 psi_G_store.end_rchunk()
             _t_fit = time.perf_counter() - t0
             t_fit_total += _t_fit
+            _rss1 = _host_rss_gb() if _dbg_rchunk else 0.0
             _mem_probe(f"after_fit_one_rchunk chunk={chunk_idx}")
 
             # 6e. IBZ-slice → allgather (or FFI) → HDF5 write.
@@ -920,11 +953,44 @@ def fit_zeta_to_h5(
             _t_write = time.perf_counter() - t0
             t_write_total += _t_write
             _mem_probe(f"after_accumulate chunk={chunk_idx}")
+            _rss2 = _host_rss_gb() if _dbg_rchunk else 0.0
+            # Return glibc's free-but-still-mapped heap to the OS at the
+            # end of each r-chunk.  Together with
+            # ``runtime.tune_glibc_malloc`` this is the cure for the
+            # workstream-T per-r-chunk anonymous-memory ramp: XLA:CPU's
+            # transients are ordinary malloc/free, and the memory glibc
+            # keeps in its per-thread arenas after ``free`` is what
+            # ratchets RSS up chunk after chunk while
+            # ``jax.live_arrays()`` stays flat.  MEASURED at MoS2 12x12 /
+            # 606c / P=80 / 81 r-chunks: +0.35 GB/rank/chunk -> 0.00.
+            _trimmed = _rss2
+            if _trim_fn is not None:
+                try:
+                    _trim_fn(0)
+                    _trimmed = _host_rss_gb()
+                except Exception:
+                    pass
             if _dbg_rchunk and jax.process_index() == 0:
+                # ``rss`` is the leak observable: on CPU the XLA arena is
+                # invisible to ``memory_stats()``, so per-chunk anonymous
+                # growth only shows up here.  ``live`` is the JAX-side
+                # array total — rss growing while live stays flat means
+                # the accumulation is NOT a retained jax.Array.
+                _live_gb = 0.0
+                try:
+                    for _a in jax.live_arrays():
+                        _live_gb += (int(np.prod(_a.shape))
+                                     * _a.dtype.itemsize) / 1e9
+                except Exception:
+                    _live_gb = -1.0
                 print(f"[rchunk_dbg] chunk={chunk_idx+1}/{num_chunks} "
                       f"r=[{r_start},{r_end}) fit={_t_fit*1000:.0f}ms "
                       f"write={_t_write*1000:.0f}ms "
-                      f"total={(_t_fit+_t_write)*1000:.0f}ms", flush=True)
+                      f"total={(_t_fit+_t_write)*1000:.0f}ms "
+                      f"rss={_rss2:.3f}GB live={_live_gb:.3f}GB "
+                      f"d_fit={_rss1 - _rss0:+.3f} "
+                      f"d_acc={_rss2 - _rss1:+.3f} "
+                      f"rss_trim={_trimmed:.3f}GB", flush=True)
             r_progress.step()
             # LORRAX_MAX_RCHUNKS=N: stop the r-chunk loop after N chunks
             # for profiling/sweeping.  Clean python exit avoids the
