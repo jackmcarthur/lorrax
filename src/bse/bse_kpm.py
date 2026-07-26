@@ -328,7 +328,7 @@ def run_kpm_dos(
 def main(argv: list[str] | None = None) -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="KPM density of states for BSE")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="KPM density of states for BSE")
     parser.add_argument("-i", "--input", required=True, help="COHSEX input file")
     parser.add_argument("--n-val", type=int, default=4)
     parser.add_argument("--n-cond", type=int, default=4)

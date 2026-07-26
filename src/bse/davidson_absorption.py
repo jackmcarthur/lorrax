@@ -61,7 +61,7 @@ def _gather_to_host(arr):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p = argparse.ArgumentParser(allow_abbrev=False, description=__doc__.split("\n\n")[0])
     p.add_argument("-i", "--input", required=True)
     p.add_argument("--n-val", type=int, required=True,
                    help="Kramers pairs (SOC) or SP bands (non-SOC). For Si SOC 8x8: --n-val 4")

@@ -45,7 +45,7 @@ def run_symmetry_test(wfn_path: str, tol: float = 1e-6) -> int:
 
 def main() -> None:
     """CLI entrypoint."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(allow_abbrev=False, description=__doc__)
     parser.add_argument("wfn", help="Path to WFN.h5")
     parser.add_argument(
         "--tol",

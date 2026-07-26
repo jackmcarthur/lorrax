@@ -590,7 +590,7 @@ def make_eqp_bgw(
 # ---------------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
-	p = argparse.ArgumentParser(
+	p = argparse.ArgumentParser(allow_abbrev=False,
 		prog="python -m gw.eqp_bgw",
 		description="Reproduce BGW eqp0.dat / eqp1.dat from a LORRAX gw_jax run.",
 	)

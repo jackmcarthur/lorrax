@@ -437,7 +437,7 @@ def compute_finite_q_mtxels(
 # --------------------------
 
 def main(argv=None):
-	parser = argparse.ArgumentParser(description="Dipole/velocity matrix elements <mk|v|nk>")
+	parser = argparse.ArgumentParser(allow_abbrev=False, description="Dipole/velocity matrix elements <mk|v|nk>")
 	parser.add_argument(
 		"-i",
 		"--input",

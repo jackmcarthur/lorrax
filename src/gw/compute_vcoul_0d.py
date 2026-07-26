@@ -191,7 +191,7 @@ def main():
     sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent.parent))
     from file_io import WfnLoader as WFNReader
 
-    parser = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(allow_abbrev=False,
         description="Compute cell-box-truncated Coulomb potential and compare with BGW vcoul"
     )
     parser.add_argument("--wfn", default="WFN.h5", help="WFN HDF5 file")

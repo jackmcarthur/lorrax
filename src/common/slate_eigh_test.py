@@ -89,7 +89,7 @@ def make_hermitian(n: int, seed: int, dtype, mesh: Mesh,
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("-n", type=int, default=256)
     ap.add_argument("--dtype", choices=["f64", "c128"], default="c128")
     ap.add_argument("--seed", type=int, default=0)

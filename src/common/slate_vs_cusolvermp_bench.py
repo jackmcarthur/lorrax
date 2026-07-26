@@ -72,7 +72,7 @@ def build_hermitian(n: int, dtype, seed: int, mesh) -> jax.Array:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--backend", choices=["cusolvermp", "slate"], required=True)
     ap.add_argument("-n", type=int, default=2048)
     ap.add_argument("--dtype", choices=["f64", "c128"], default="c128")

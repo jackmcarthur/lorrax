@@ -192,13 +192,16 @@ class PsiGStore:
                 self._host_tiles[(x, y)] = np.empty(
                     self._per_rank_shape, dtype=np.complex128)
 
-        # NOTE: an AsyncWfnReader (file_io/wfn_loader.py) is available
-        # and was tried here to pipeline ``loader.load(bc+1)`` against
-        # bc[i]'s shard_to_host copy.  At MoS2 3×3 scale, xprof shows
-        # H2D/compute overlap_frac = 0.000 even with depth-2 prefetch
-        # — XLA's stream scheduler doesn't pipeline our H2D against
-        # compute here.  Keep the synchronous path until either scale
-        # grows (CrI3) or the broader async-reader story comes back.
+        # NOTE: this read is deliberately SYNCHRONOUS.  A prefetching
+        # AsyncWfnReader (a worker thread issuing ``loader.load(bc+1)``
+        # against bc[i]'s shard_to_host copy) was implemented and
+        # measured here: at MoS2 3×3 scale xprof shows H2D/compute
+        # overlap_frac = 0.000 even with depth-2 prefetch — XLA's stream
+        # scheduler does not pipeline our H2D against compute.  The class
+        # was deleted 2026-07-25 as production-dead code (it had no
+        # callers).  If the async-reader story comes back at larger scale
+        # (CrI3), rebuild it on ``common.async_io.AsyncDispatcher``, which
+        # is still here and drives the SlabIO write side.
         from common import timing
         from common.wfn_transforms import load_psi_gflat_padded
         sharding_spec = P(None, ('x', 'y'), None, None)

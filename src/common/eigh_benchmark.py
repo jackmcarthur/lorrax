@@ -175,7 +175,7 @@ def _median_ms(fn, repeats: int) -> float:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--mode", choices=["mp", "dispatch"], default="mp")
     ap.add_argument("-n", type=int, default=2048)
     ap.add_argument("--sizes", default="512,1024,2048,4096",

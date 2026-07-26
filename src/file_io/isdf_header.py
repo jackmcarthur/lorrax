@@ -37,6 +37,13 @@ What lives in ``isdf_header``
   and ``zeta_cutoff_ry``.  These mirror the WFN.h5 ``wfns``
   group layout with the ragged G-axis replaced by a fixed
   ``ngkmax``-padded axis.
+- ``fit_provenance`` (scalar str, optional): JSON description of the
+  INPUTS the fit consumed — band windows, cutoffs, solver knobs, source
+  WFN identity.  Written by :func:`stamp_fit_provenance` AFTER
+  :func:`mark_zeta_done`.  ``zeta_is_done`` says "this file is
+  complete"; ``fit_provenance`` says "…and here is what it is complete
+  FOR".  Both are required for ``gw.gw_init`` to reuse a ζ instead of
+  refitting; a legacy file missing either is refit.
 """
 
 from __future__ import annotations
@@ -93,6 +100,17 @@ class IsdfHeader:
                                  # to verify or rebuild the sphere can do so
                                  # without trusting the components table.
 
+    fit_provenance: str | None = None
+                                 # JSON blob describing the INPUTS this ζ was
+                                 # fit from (band windows, cutoffs, solver
+                                 # knobs, source WFN identity, ...).  Written
+                                 # by :func:`stamp_fit_provenance` after
+                                 # ``mark_zeta_done``; consumed by
+                                 # ``gw.gw_init``'s ζ-reuse check, which
+                                 # refits unless this matches the current run
+                                 # EXACTLY.  ``None`` on legacy files => no
+                                 # reuse (refit), which is the safe direction.
+
     @property
     def n_rmu(self) -> int:
         return int(self.r_mu_fft_idx.shape[0])
@@ -116,6 +134,7 @@ class IsdfHeader:
         gvec_components: np.ndarray | None = None,
         ngk_per_q: np.ndarray | None = None,
         zeta_cutoff_ry: float | None = None,
+        fit_provenance: str | None = None,
     ) -> 'IsdfHeader':
         """Build a header from centroid FFT-grid indices.
 
@@ -175,6 +194,8 @@ class IsdfHeader:
             gvec_components=gv,
             ngk_per_q=nk,
             zeta_cutoff_ry=cutoff,
+            fit_provenance=(None if fit_provenance is None
+                            else str(fit_provenance)),
         )
 
 
@@ -205,6 +226,7 @@ def bind_isdf_attrs(obj: object, isdf: IsdfHeader) -> None:
     obj.gvec_components = isdf.gvec_components
     obj.ngk_per_q = isdf.ngk_per_q
     obj.zeta_cutoff_ry = isdf.zeta_cutoff_ry
+    obj.fit_provenance = isdf.fit_provenance
     obj.ngkmax_zeta = isdf.ngkmax   # WFN.h5-style padded G-axis size
 
 
@@ -229,6 +251,8 @@ def _read_group(f: h5.File) -> IsdfHeader:
           if 'ngk' in g else None)
     cutoff = (float(g['zeta_cutoff_ry'][()])
               if 'zeta_cutoff_ry' in g else None)
+    prov = (_decode_str(g['fit_provenance'][()])
+            if 'fit_provenance' in g else None)
     return IsdfHeader(
         density=_decode_str(g['density'][()]),
         vertex_mu_L=int(g['vertex_mu_L'][()]),
@@ -239,6 +263,7 @@ def _read_group(f: h5.File) -> IsdfHeader:
         gvec_components=gv,
         ngk_per_q=nk,
         zeta_cutoff_ry=cutoff,
+        fit_provenance=prov,
     )
 
 
@@ -296,6 +321,9 @@ def write_isdf_header(
             g.create_dataset(
                 'zeta_cutoff_ry',
                 data=np.float64(header.zeta_cutoff_ry))
+        if header.fit_provenance is not None:
+            g.create_dataset('fit_provenance',
+                             data=np.bytes_(header.fit_provenance))
 
 
 def mark_zeta_done(path: str | Path) -> None:
@@ -317,6 +345,28 @@ def mark_zeta_done(path: str | Path) -> None:
             g.create_dataset('zeta_is_done', data=np.bool_(True))
 
 
+def stamp_fit_provenance(path: str | Path, provenance: str) -> None:
+    """Write ``isdf_header/fit_provenance`` (idempotent, overwrite in place).
+
+    Called by the ζ driver AFTER :func:`mark_zeta_done`, so a run killed
+    between the two leaves a complete-but-unstamped file — which the reuse
+    check treats as "cannot verify" and refits.  That ordering is
+    deliberate: every failure mode falls back to recomputing, never to
+    reusing an unverified ζ.
+
+    ``provenance`` is a JSON string; see ``gw.gw_init._zeta_fit_provenance``
+    for the schema and ``_zeta_reuse_ok`` for the comparison.
+    """
+    with h5.File(str(path), 'a') as f:
+        if _GROUP not in f:
+            raise ValueError(
+                f"stamp_fit_provenance: {path} has no '{_GROUP}' group")
+        g = f[_GROUP]
+        if 'fit_provenance' in g:
+            del g['fit_provenance']
+        g.create_dataset('fit_provenance', data=np.bytes_(str(provenance)))
+
+
 __all__ = [
     'IsdfHeader',
     'read_isdf_header',
@@ -324,4 +374,5 @@ __all__ = [
     'bind_isdf_attrs',
     'write_isdf_header',
     'mark_zeta_done',
+    'stamp_fit_provenance',
 ]

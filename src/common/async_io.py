@@ -2,9 +2,11 @@
 
 Generalises the ``_dispatch_loop`` pattern from
 :mod:`file_io._slab_io_ffi` so the same threading discipline can drive
-async writes (H5Dwrite tasks queued by ``SlabIO``) and async reads
-(:class:`AsyncWfnReader` issuing ``WfnLoader.load`` on a worker thread
-while the main thread runs on-device compute).
+any single-resource async work.  Its one production consumer today is
+the SlabIO write side (H5Dwrite tasks queued by ``SlabIO``).  A read-side
+consumer (``AsyncWfnReader``, prefetching ``WfnLoader.load``) also
+existed but was deleted 2026-07-25: measured H2D/compute overlap was
+0.000 and it had no callers (see ``common/psi_G_store.py``).
 
 Why a single-worker thread and not a pool
 -----------------------------------------

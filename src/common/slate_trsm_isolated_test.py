@@ -50,7 +50,7 @@ def _log(s):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("-n", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()

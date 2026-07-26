@@ -158,7 +158,7 @@ def test_lanczos(data, n_eig=5, max_iter=50, use_jit_lanczos=True):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Test BSE matvec with COHSEX restart data")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="Test BSE matvec with COHSEX restart data")
     parser.add_argument('-i', '--input', required=True, help="COHSEX input file (used for directory context)")
     parser.add_argument('--n-val', type=int, default=4, help="Number of valence bands")
     parser.add_argument('--n-cond', type=int, default=4, help="Number of conduction bands")

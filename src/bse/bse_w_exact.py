@@ -512,7 +512,7 @@ def run_w_omega_chain_compare(
 def main(argv=None) -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(allow_abbrev=False,
         description="Exact W_c(omega) via the non-TDA RPA density resolvent")
     parser.add_argument("-i", "--input", required=True, help="COHSEX input file")
     parser.add_argument("--compare-w0", action="store_true",

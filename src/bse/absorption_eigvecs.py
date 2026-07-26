@@ -88,7 +88,7 @@ def compute_jdos(d_alpha, de_cv, omegas_Ry, V_cell, eta_Ry, n_spin, n_spinor, n_
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(
+    p = argparse.ArgumentParser(allow_abbrev=False,
         description="BSE absorption from BGW-format eigenvectors.h5 + dipole.h5",
     )
     p.add_argument("--eigenvectors", default="eigenvectors.h5",

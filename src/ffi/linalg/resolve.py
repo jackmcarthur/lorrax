@@ -8,19 +8,23 @@ error.  Every guard lives here, applied in one fixed order:
     1. vocabulary   — is the name a backend of this op at all?
     2. platform     — does the backend run on this mesh's device kind?
                       (cusolvermp is CUDA-only; scalapack is host-only)
-    3. capability   — is the backend's FFI handler actually compiled into
-                      the loaded library?  (``ffi_loader.has_target`` —
-                      partial builds legitimately omit handlers, and a
-                      missing one must fail HERE, not minutes later at
-                      the first distributed call)
+    3. capability   — is the backend's FFI handler actually usable?
+                      (``ffi_loader.probe_target``, which separates "the
+                      library would not load" from "the library has no
+                      such handler" — partial builds legitimately omit
+                      handlers, and either way it must fail HERE, not
+                      minutes later at the first distributed call, with
+                      the reason that names the actual fix)
     4. coverage     — the FFI backends run ONE JAX process per device
                       (their MPI/NCCL context is per-process); a mesh
                       with more devices than processes cannot drive them
     5. geometry     — square-mesh where required (cusolverMpSyevd
                       DEADLOCKS inside a collective on rectangular
-                      blocks instead of returning an error), the SLATE
-                      1×q stride-assert guard, ScaLAPACK's square-block
-                      descriptor requirement
+                      blocks instead of returning an error), SLATE's
+                      square-or-N×1 tile rule + the 1×q stride-assert
+                      guard (both mirroring
+                      ``ffi/slate/context.validate_tile_layout``),
+                      ScaLAPACK's square-block descriptor requirement
     6. divisibility — ``n`` divisible by both mesh axes (only checked
                       when the caller passes ``n``)
 
@@ -99,10 +103,9 @@ _SPEC = {
     ("solve_lu", "scalapack"):  ("lorrax_scalapack_batched_solve_lu",  ("cpu",)),
 }
 
-_BUILD_HINTS = {
-    "CUDA": "src/ffi/common/cpp/build.sh (liblorrax_ffi.so)",
-    "cpu":  "src/ffi/common/cpp/host/build_host.sh (liblorrax_ffi_host.so)",
-}
+# (The per-platform build command used to be duplicated here.  It now
+# lives ONLY in ffi_loader._PLATFORMS[...]["build_hint"], which
+# probe_target quotes — one copy, next to the paths it refers to.)
 
 
 def mesh_platform(mesh_xy: Mesh) -> str:
@@ -156,6 +159,17 @@ def _check_geometry(op: str, backend: str, px: int, py: int) -> None:
                 f"(cusolverMpSyevd DEADLOCKS on rectangular blocks; SLATE "
                 f"heev rejects them); got {px}x{py}.")
     elif backend == "slate":
+        # These two rules MIRROR ``ffi/slate/context.validate_tile_layout``
+        # (the call-time guard) exactly, in the same order.  Keep them in
+        # sync: a rule enforced only at call time turns a returned 'slate'
+        # into a broken promise (bug L-1, 2026-07-25: cholesky+slate on a
+        # 2x4 mesh resolved, then raised on the very next call).
+        if px > 1 and py > 1 and px != py:
+            raise ValueError(
+                f"{op} backend 'slate': mesh {px}x{py} unsupported — with "
+                f"both axes > 1 the square SLATE tile size cannot give one "
+                f"tile per rank on both axes unless px == py.  Use a square "
+                f"or Nx1 mesh, or a different backend.")
         if px == 1 and py > 1:
             raise ValueError(
                 f"{op} backend 'slate': 1x{py} meshes hit a SLATE stride "
@@ -248,13 +262,22 @@ def resolve_backend(op: str, requested: str, mesh_xy: Mesh,
             f"{', '.join(_available(op, mesh_xy))}.")
 
     # 3. compiled capability
-    if not ffi_loader.has_target(target, platform):
+    #
+    # ``probe_target`` (not ``has_target``) because the REASON matters to
+    # whoever reads this: "the .so would not dlopen" and "the .so has no
+    # such handler" have completely different fixes, and reporting the
+    # first as the second sends people to rebuild a library that is fine.
+    # That happened: wk_P G4 (2026-07-25) refused slate cholesky on a
+    # legal 8x1 mesh with "not compiled into the cpu FFI library" while
+    # `nm -D` showed SlatePotrfHostFfi present — the real cause was an
+    # incomplete LD_LIBRARY_PATH for the lib's DT_NEEDED.
+    usable, why = ffi_loader.probe_target(target, platform)
+    if not usable:
         raise RuntimeError(
             f"{op} backend {requested!r} requested but its FFI handler "
-            f"({target}) is not compiled into the {platform} FFI library.  "
+            f"({target}) is not usable: {why}  "
             f"Available {op} backends on this mesh: "
-            f"{', '.join(_available(op, mesh_xy))}.  "
-            f"To enable it, rebuild with {_BUILD_HINTS[platform]}.")
+            f"{', '.join(_available(op, mesh_xy))}.")
 
     # 4. process coverage (one JAX process per device)
     ndev = int(mesh_xy.devices.size)

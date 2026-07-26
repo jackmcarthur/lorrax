@@ -111,7 +111,7 @@ def compute_eps2_from_files(paths, *, eta_eV, n_max=None,
 
 
 def _main():
-    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p = argparse.ArgumentParser(allow_abbrev=False, description=__doc__.split("\n\n")[0])
     p.add_argument("--files", nargs="+", required=True,
                    help="One or more BGW-format eigenvalues.dat paths")
     p.add_argument("--eta-eV", type=float, default=0.05,

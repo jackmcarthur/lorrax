@@ -150,7 +150,7 @@ def _compute_static_head(head_resolver, meta, do_screened, print0):
 
 
 def main(argv=None):
-	argp = argparse.ArgumentParser(
+	argp = argparse.ArgumentParser(allow_abbrev=False,
 		description="LORRAX GW driver — COHSEX / GN-PPM / HL-PPM self-energy, "
 		            "one-shot or self-consistent (see gw_config.ComputeMode / QPSolver)")
 	argp.add_argument(

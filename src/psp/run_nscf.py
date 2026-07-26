@@ -20,8 +20,15 @@ Usage:
 """
 from __future__ import annotations
 
-from runtime import set_default_env
-set_default_env()  # BEFORE `import jax`
+# Canonical JAX GPU/CPU bootstrap — single-sourced in runtime.bootstrap()
+# (env defaults + jax.distributed init + CPU fallback; all idempotent).
+# MUST run BEFORE this module's own `import jax`.  NOTE: this used to be
+# set_default_env() + init_jax_distributed() only; bootstrap() adds
+# fallback_to_cpu_if_no_gpu_backend(), so on a node with no usable GPU
+# backend this CLI now falls back to CPU instead of dying at the first
+# jax call.
+from runtime import bootstrap
+bootstrap()
 
 import argparse
 import os
@@ -30,9 +37,6 @@ import time
 import numpy as np
 import jax
 import jax.numpy as jnp
-
-from runtime import init_jax_distributed
-init_jax_distributed()
 
 from file_io import CrystalData, WFNWriter
 from psp.pseudos import load_pseudopotentials
@@ -437,7 +441,7 @@ def run_nscf(
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="LORRAX NSCF: Davidson + Pseudobands → WFN.h5")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="LORRAX NSCF: Davidson + Pseudobands → WFN.h5")
     parser.add_argument("-i", "--input", default=None, help="Input file (nscf.in)")
     parser.add_argument("--save", default=None, help="QE .save directory")
     parser.add_argument("--pseudo_dir", default=None)

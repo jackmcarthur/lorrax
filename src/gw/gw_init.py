@@ -116,6 +116,152 @@ def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print,
 				f"Delete the stale ζ or use a separate run directory.")
 
 
+#: Bump when the provenance schema changes meaning (forces a refit of
+#: every ζ stamped by an older LORRAX, rather than a false match).
+_ZETA_PROVENANCE_SCHEMA = 1
+
+
+def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
+                         zeta_cutoff, zeta_vcoul_cutoff, write_ibz_only,
+                         band_norms):
+	"""Canonical JSON description of everything the ζ fit consumed.
+
+	Every entry is an input that CHANGES ζ numerically.  Deliberately
+	EXCLUDED: anything device-count dependent (``n_rmu_padded``, the chunk
+	plan, the mesh shape) — ζ is device-count invariant by design (the
+	2026-07 z_q invariance work), so a P=4 ζ is reusable at P=80 and
+	including P would defeat the whole feature.
+
+	Also excluded: the centroid table itself.  It is already on disk in
+	full (``isdf_header/centroids/r_mu_fft_idx``) and is compared
+	element-wise by :func:`_zeta_reuse_ok` — a hash here would only add a
+	second, weaker check.
+
+	``wfn_bytes`` identifies the source WFN.h5 without reading it.  mtime
+	is deliberately NOT included: copying/restoring a WFN.h5 changes mtime
+	without changing content, and a spurious multi-hour refit is a worse
+	outcome than the (contrived) same-path-same-size-different-content
+	case.
+
+	``zeta_rcond`` / ``zeta_ridge`` record the EFFECTIVE values, i.e. after
+	``LORRAX_ZETA_RCOND`` / ``LORRAX_ZETA_RIDGE`` are applied exactly as
+	``isdf/core._replicated_chol`` applies them.  Recording the cfg values
+	instead would be a correctness hole: a rerun that drops the env
+	override would match the provenance and silently reuse a ζ fit at a
+	different conditioning cutoff.
+
+	``write_ibz_only`` is the REQUESTED value.  ``fit_zeta_to_h5`` may
+	flip it off when the orbit-closure check fails — but that check is a
+	deterministic function of (centroids, symmetry), both of which are
+	pinned by other entries here, so the effective value is pinned too.
+	"""
+	import json
+	# ``wfn._filename`` is the same source path fit_zeta_to_h5 copies
+	# mf_header from — the authoritative identity of the ζ's input WFN.
+	wfn_path = getattr(wfn, '_filename', None) or ''
+	try:
+		wfn_bytes = int(os.path.getsize(wfn_path)) if wfn_path else -1
+	except OSError:
+		wfn_bytes = -1
+	bn = None
+	if band_norms is not None:
+		arr = np.asarray(band_norms, dtype=np.float64)
+		bn = [int(arr.size), float(arr.sum()), float(arr.max()) if arr.size else 0.0]
+	prov = {
+		'schema':               _ZETA_PROVENANCE_SCHEMA,
+		'n_rmu':                int(meta.n_rmu),
+		'band_range_left':      [int(band_range_left[0]), int(band_range_left[1])],
+		'band_range_right':     [int(band_range_right[0]), int(band_range_right[1])],
+		'bispinor':             bool(cfg.bispinor),
+		'gspace_mode':          str(cfg.gspace_mode),
+		'zeta_cutoff_ry':       round(float(zeta_cutoff), 9),
+		'bare_coulomb_cutoff':  round(float(zeta_vcoul_cutoff), 9),
+		# EFFECTIVE (env-overridden) values — mirrors isdf/core:1278-1279.
+		'zeta_ridge':           os.environ.get(
+			"LORRAX_ZETA_RIDGE", repr(cfg.backend.zeta_ridge)),
+		'zeta_rcond':           os.environ.get(
+			"LORRAX_ZETA_RCOND", repr(cfg.backend.zeta_rcond)),
+		'charge_zeta_solve':    str(cfg.backend.charge_zeta_solve),
+		'gamma_contract_mode':  str(cfg.backend.gamma_contract_mode),
+		'write_ibz_only':       bool(write_ibz_only),
+		'vertex_mu_L':          0,
+		'band_norms':           bn,
+		'fft_grid':             [int(x) for x in np.asarray(meta.fft_grid).reshape(3)],
+		'ecutwfc':              round(float(wfn.ecutwfc), 9),
+		'ecutrho':              round(float(wfn.ecutrho), 9),
+		'wfn_file':             os.path.abspath(wfn_path) if wfn_path else '',
+		'wfn_bytes':            wfn_bytes,
+	}
+	return json.dumps(prov, sort_keys=True)
+
+
+def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
+                   print_fn=print):
+	"""Can we skip the ζ fit and reuse ``zeta_h5_path`` as-is?
+
+	Returns ``True`` only when EVERY one of these holds:
+
+	  1. ``LORRAX_FORCE_REFIT`` is not set to a truthy value;
+	  2. the file exists and its ``isdf_header`` is readable;
+	  3. ``zeta_is_done`` is True (the writer flipped it after the last
+	     H5Dwrite drained — a crashed fit leaves it False);
+	  4. ``fit_provenance`` is present AND byte-identical to this run's;
+	  5. the on-disk centroid table equals this run's centroid indices.
+
+	Anything unexpected — missing attr, unreadable file, legacy header —
+	returns False, i.e. REFIT.  Every failure mode costs compute; none
+	costs correctness.  That asymmetry is the whole design: this cache
+	sits in front of a multi-hour step whose silent misuse produced a
+	−135 eV QP gap once already (job 7874375, the restart-window bug).
+	"""
+	if os.environ.get('LORRAX_FORCE_REFIT', '') not in ('', '0', 'false', 'False'):
+		print_fn("    [zeta reuse] LORRAX_FORCE_REFIT set — refitting.")
+		return False
+	if not os.path.exists(zeta_h5_path):
+		return False
+	try:
+		from file_io.isdf_header import read_isdf_header
+		hdr = read_isdf_header(zeta_h5_path)
+	except Exception as exc:
+		print_fn(f"    [zeta reuse] {zeta_h5_path}: unreadable isdf_header "
+		         f"({exc}) — refitting.")
+		return False
+	if not bool(hdr.zeta_is_done):
+		print_fn(f"    [zeta reuse] {zeta_h5_path} is INCOMPLETE "
+		         f"(zeta_is_done=False, i.e. a previous fit died mid-write) "
+		         f"— refitting.")
+		return False
+	if hdr.fit_provenance is None:
+		print_fn(f"    [zeta reuse] {zeta_h5_path} carries no fit_provenance "
+		         f"(written by an older LORRAX) — cannot verify what it was "
+		         f"fit for, so refitting.")
+		return False
+	if str(hdr.fit_provenance) != str(provenance_json):
+		import json
+		try:
+			old = json.loads(hdr.fit_provenance)
+			new = json.loads(provenance_json)
+			diff = sorted(k for k in set(old) | set(new)
+			              if old.get(k) != new.get(k))
+			detail = "; ".join(
+				f"{k}: on-disk={old.get(k)!r} now={new.get(k)!r}" for k in diff)
+		except Exception:
+			detail = "(provenance unparseable)"
+		print_fn(f"    [zeta reuse] {zeta_h5_path} was fit under DIFFERENT "
+		         f"inputs — refitting.  Changed: {detail}")
+		return False
+	try:
+		want = np.asarray(centroid_fft_idx, dtype=np.int32)
+		got = np.asarray(hdr.r_mu_fft_idx, dtype=np.int32)
+	except Exception:
+		return False
+	if want.shape != got.shape or not np.array_equal(want, got):
+		print_fn(f"    [zeta reuse] {zeta_h5_path} holds a DIFFERENT centroid "
+		         f"set ({got.shape} vs {want.shape}) — refitting.")
+		return False
+	return True
+
+
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
              psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print):
 	"""Fit ISDF interpolation vectors ζ and write to HDF5.
@@ -202,6 +348,32 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		f"    cutoffs: zeta = {_zeta_cutoff:.1f} Ry, "
 		f"bare-Coulomb = {_zeta_vcoul_cutoff:.1f} Ry  "
 		f"(ecutwfc={float(wfn.ecutwfc):.1f}, ecutrho={_ecutrho:.1f})")
+	# ── ζ REUSE: skip the fit when tmp/zeta_q.h5 is complete AND provably
+	# the same fit.  Before this, a rerun in the same directory always
+	# refit (gw_init only VALIDATED the μ extent), costing 20+ min at
+	# fixture scale and ~22 min at MoS2 12×12/P=80 for a byte-identical
+	# result.  Reuse is charge-channel-only: the bispinor branch below
+	# also produces ``transverse_wfn_data``, which is not on disk, so a
+	# bispinor run always refits.  Override with LORRAX_FORCE_REFIT=1.
+	_provenance = _zeta_fit_provenance(
+		wfn=wfn, meta=meta, cfg=cfg,
+		band_range_left=band_range_left, band_range_right=band_range_right,
+		zeta_cutoff=_zeta_cutoff, zeta_vcoul_cutoff=_zeta_vcoul_cutoff,
+		write_ibz_only=_write_ibz_only_charge, band_norms=_band_norms)
+	_reuse = (not cfg.bispinor) and _zeta_reuse_ok(
+		zeta_h5_path, _provenance, centroid_indices, print_fn=print_fn)
+	if _reuse:
+		print_fn("")
+		print_fn("  " + "=" * 68)
+		print_fn(f"  REUSING the existing ζ at {zeta_h5_path} — FIT SKIPPED.")
+		print_fn( "  isdf_header/zeta_is_done is True, the centroid table")
+		print_fn( "  matches, and fit_provenance is identical to this run's")
+		print_fn( "  inputs (band windows, cutoffs, solver knobs, source WFN).")
+		print_fn( "  Set LORRAX_FORCE_REFIT=1 to refit unconditionally.")
+		print_fn("  " + "=" * 68)
+		print_fn("")
+		return zeta_h5_path, mem_est, None
+
 	with timing.section("gw_jax.zeta_fit_chunked"), jax_profile.trace_section("zeta_fit"):
 		peak_bytes = fit_zeta_to_h5(
 			wfn=wfn, sym=sym, meta=meta,
@@ -225,6 +397,21 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			write_ibz_only=_write_ibz_only_charge,
 			zeta_cutoff_ry=_zeta_cutoff,
 		)
+
+	# Stamp what this ζ was fit FOR, so a later run can reuse it.  AFTER
+	# the fit (and therefore after ``mark_zeta_done`` inside
+	# fit_zeta_to_h5) on purpose: a job killed between the two leaves a
+	# complete-but-unstamped file, which _zeta_reuse_ok refits.  Rank 0
+	# only, then a barrier so no rank races ahead of the write.
+	if jax.process_index() == 0:
+		try:
+			from file_io.isdf_header import stamp_fit_provenance
+			stamp_fit_provenance(zeta_h5_path, _provenance)
+		except Exception as exc:
+			# Non-fatal: the ζ itself is fine, it just won't be reusable.
+			print_fn(f"    [zeta provenance] not stamped ({exc}); this ζ "
+			         f"will be refit on the next run.")
+	jax.experimental.multihost_utils.sync_global_devices("zeta_provenance")
 
 	budget_gb = mem_est.get('budget_gb', cfg.memory.per_device_gb)
 	if peak_bytes > 0:

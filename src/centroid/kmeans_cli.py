@@ -6,9 +6,15 @@ prunes via pivoted Cholesky, and optionally plots.
 """
 from __future__ import annotations
 
-# Must precede any jax import so JAX_ENABLE_X64 etc. take effect.
-from runtime import set_default_env
-set_default_env()
+# Canonical JAX GPU/CPU bootstrap — single-sourced in runtime.bootstrap()
+# (env defaults + jax.distributed init + CPU fallback; all idempotent).
+# MUST precede this module's own `import jax` so JAX_ENABLE_X64 etc. take
+# effect.  NOTE: this used to be set_default_env() + init_jax_distributed()
+# only; bootstrap() adds fallback_to_cpu_if_no_gpu_backend(), so on a node
+# with no usable GPU backend this CLI now falls back to CPU instead of
+# dying at the first jax call.
+from runtime import bootstrap
+bootstrap()
 
 import argparse
 import math
@@ -17,9 +23,6 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
-
-from runtime import init_jax_distributed
-init_jax_distributed()
 
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps, timing
@@ -40,7 +43,7 @@ from .kmeans_isdf import (
 # ─────────────────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = argparse.ArgumentParser(allow_abbrev=False,
         description="Weighted k-means for ISDF sampling points.",
     )
     p.add_argument("N_c", type=int, nargs="?", default=400,
