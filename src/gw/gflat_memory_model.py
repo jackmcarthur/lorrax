@@ -146,26 +146,37 @@ def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
 _GATHERED_PSI_SLOTS = 2
 
 
-def _stage_C_slope(*, nk, ns, nq, mu, slots, p_xy, band_chunk) -> float:
-    """Per-``cr`` bytes of the Stage-C transient (the binder): the
-    ``slots`` concurrent pair-density accumulators, the Z_q output, and the
-    band-all_gathered ψ(r) slab.
+def _stage_C_slope(*, nk, ns, nq, mu, slots, p_xy, band_chunk, p_y) -> float:
+    """Per-``cr`` bytes of the Stage-C transient (the binder): the ``slots``
+    concurrent pair-density accumulators, the Z_q output, and the two psi(r)
+    slabs the band-gather machinery keeps live.
 
-    THE ψ(r) SLAB HAS NO ``/P``.  ``z_q_from_psi_sm`` computes each rank's
-    1/P band block over the FULL r-chunk, then ``lax.all_gather``s the band
-    axis over ('x','y') so every rank holds ``(nk, band_chunk, ns, cr)``
-    before it slices its own r_loc (isdf/core.py — the "r-slab strategy"
-    comment: the r-slice MUST follow the gather for band/r coherence).
-    That object is replicated in bands AND full in r, so it is the only
-    Stage-C term that does not shrink with the mesh — and at MoS2 12×12
-    (nk=144, band_chunk=160, ns=2, cr=n_rtot=174960) it is 129 GB/rank per
-    copy, i.e. 9.4× everything else in this slope combined.  Omitting it is
-    what let the planner choose r_chunk = n_rtot and ask XLA for a single
-    271 GB allocation (job 7874236 RESOURCE_EXHAUSTED)."""
+    THE GATHERED psi(r) SLAB IS SHARDED ON 'y' ONLY -- 1/p_y, not 1/P.
+    ``z_q_from_psi_sm`` computes each rank's 1/P band block over the FULL
+    r-chunk, then does ``all_to_all('y', split r, concat bands)`` +
+    ``all_gather('x', bands)``, so every rank ends up holding
+    ``(nk, band_chunk, ns, cr/p_y)`` -- ALL bands, but only ITS r-block.
+    A second, smaller slab is live alongside it: this rank's OWN
+    ``band_chunk/p_xy`` bands over the FULL r-chunk (the all-to-all source),
+    which is unavoidable because other y-ranks need other r-blocks of exactly
+    those bands.
+
+    HISTORY -- do not regress this.  The gather used to run over ('x','y') at
+    the FULL r-chunk with the r-slice afterwards, giving
+    ``nk*band_chunk*ns*cr*16`` with NO mesh division on either axis: 129
+    GB/rank per copy at MoS2 12x12 (nk=144, band_chunk=160, ns=2,
+    cr=174960), i.e. 9.4x everything else in this slope combined.  Omitting
+    it from the model is what let the planner pick r_chunk = n_rtot and ask
+    XLA for a single 271 GB allocation (job 7874236 RESOURCE_EXHAUSTED); the
+    all-to-all then removed the p_y factor outright (5.2x on this slope at
+    the 8x10 mesh).
+    """
     return (slots * _c128(nk, ns, ns, mu, shard=p_xy)   # pair carry
             + _c128(nq, mu, shard=p_xy)                 # Z_q / zeta_out
-            # band-gathered FULL-r ψ(r) slab — UNSHARDED (see above)
-            + _GATHERED_PSI_SLOTS * _c128(nk, band_chunk, ns))
+            # gathered psi(r): all bands, r-block only  -> /p_y
+            + _GATHERED_PSI_SLOTS * _c128(nk, band_chunk, ns, shard=p_y)
+            # all-to-all source: own bands, full r      -> /p_xy on bands
+            + _c128(nk, max(1, band_chunk // p_xy), ns))
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +337,7 @@ def plan_gflat_chunks(
     # ``band_chunk`` is resolved above — Stage C's ψ(r) slab is sized by it
     # (the gathered band axis), so the two knobs are coupled.
     C_slope = _stage_C_slope(nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
-                             p_xy=p_xy, band_chunk=band_chunk)
+                             p_xy=p_xy, band_chunk=band_chunk, p_y=p_y)
     headroom_C = max(target - persistent_total, 0.0)
     r_lo = min(mu, n_rtot)                      # performance floor (§3)
     if r_chunk_override and r_chunk_override > 0:
