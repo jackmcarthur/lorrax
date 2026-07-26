@@ -388,6 +388,61 @@ def _integrate_tau_windows_for_branch(
     progress.finish()
 
 
+# ---------------------------------------------------------------------------
+# Sigma band-window mesh padding
+# ---------------------------------------------------------------------------
+
+def pad_sigma_window(psi_proj_xr, psi_proj_yn, mesh_xy):
+    """Zero-pad the sigma band window up to a multiple of ``p_x·p_y``.
+
+    ``ppm_tau_kernel._make_project_ri_reduce_scatter`` reduce-scatters m over
+    ``'x'`` and n over ``'y'``, and ``_MemoryTileSink`` holds Sigma_c(w,k,m,n)
+    at ``P(None, None, 'x', 'y')`` — so BOTH need ``m % p_x == 0`` and
+    ``n % p_y == 0``.  ``common/meta.py`` rounds ``b_id_4`` (the FULL window)
+    to ``world_size`` but never the sigma window ``b3-b0``, so an indivisible
+    QP window is reachable and fired on MoS2 12x12 (m=n=70, mesh 8x10).
+
+    Padding is the fix the guard itself prescribes, and it is exact: every
+    output element ``Sigma[k,m,n]`` is an INDEPENDENT contraction
+    ``psi*_m . sigma . psi_n``, so appending bands adds output rows/columns
+    without perturbing any existing one.  The pad rows are exactly zero, so
+    the pad block of Sigma is exactly zero too — and it is stripped by
+    :func:`strip_sigma_window` before Sigma leaves the branch, so nothing
+    downstream (host buffer, eqp write) ever sees the padded extent.
+
+    Mirrors the established zero-pad-band contract used by the wfn loader
+    (``load_psi_gflat_padded``) and htransform (``band_pad_to``).
+
+    Returns ``(xr_padded, yn_padded, nb_real)``; a no-op (identity, same
+    buffers) when the window already divides.
+    """
+    p_x = int(mesh_xy.shape['x'])
+    p_y = int(mesh_xy.shape['y'])
+    nb_real = int(psi_proj_xr.shape[1])
+    div = p_x * p_y
+    nb_pad = -(-nb_real // div) * div        # round up
+    if nb_pad == nb_real:
+        return psi_proj_xr, psi_proj_yn, nb_real
+    extra = nb_pad - nb_real
+    # psi_xr : (nk, m, s, mu_X) at P(None,None,None,'x') -> band axis 1
+    # psi_yn : (nk, s, mu_Y, n) at P(None,None,'y',None) -> band axis 3
+    # Neither band axis is mesh-sharded, so both pads are rank-local.
+    xr_p = jnp.pad(psi_proj_xr, ((0, 0), (0, extra), (0, 0), (0, 0)))
+    yn_p = jnp.pad(psi_proj_yn, ((0, 0), (0, 0), (0, 0), (0, extra)))
+    return xr_p, yn_p, nb_real
+
+
+def strip_sigma_window(sigma_kij, nb_real: int):
+    """Drop the :func:`pad_sigma_window` pad block from a (..., m, n) Sigma.
+
+    The pad rows/cols are exactly zero (bilinear in zero-padded psi); this is
+    the single seam where the padded extent stops.  No-op when unpadded.
+    """
+    if sigma_kij is None or int(sigma_kij.shape[-1]) == int(nb_real):
+        return sigma_kij
+    return sigma_kij[..., :nb_real, :nb_real]
+
+
 def _run_sigma_branch(
     *,
     omega_nonneg_ry: np.ndarray,
@@ -429,7 +484,13 @@ def _run_sigma_branch(
     psi_proj_xr = wfns.xr(s.sigma)
     psi_proj_yn = wfns.yn(s.sigma)
     nk_proj = int(psi_proj_xr.shape[0])
-    nb_proj = int(psi_proj_xr.shape[1])
+    # Mesh-pad the QP band window: the reduce-scatter projector and the
+    # Sigma_c tile sink both need m % p_x == 0 / n % p_y == 0 (see
+    # pad_sigma_window).  ``nb_proj`` stays the REAL window everywhere the
+    # caller can see; only the in-branch machinery runs at ``nb_pad``.
+    psi_proj_xr, psi_proj_yn, nb_proj = pad_sigma_window(
+        psi_proj_xr, psi_proj_yn, mesh_xy)
+    nb_pad = int(psi_proj_xr.shape[1])
 
     if n_omega == 0:
         return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
@@ -464,16 +525,24 @@ def _run_sigma_branch(
         # (m_X, n_Y) sharding — the full (n_ω,n_k,n_b,n_b) buffer never
         # exists on any GPU until the final device assembly at finalize().
         sink: _MemoryTileSink | _H5Sink = _MemoryTileSink(
-            shape=(n_omega, nk_proj, nb_proj, nb_proj),
+            shape=(n_omega, nk_proj, nb_pad, nb_pad),
             sharding=NamedSharding(mesh_xy, P(None, None, 'x', 'y')),
         )
     else:
         # Single-process streamed: assemble each window on host and RMW it to
         # the h5 dataset ω-batched (n_windows RMW, not n_τ).
+        assert nb_pad == nb_proj, (
+            f"streamed sigma sink cannot carry a padded QP window "
+            f"(nb_pad={nb_pad} != nb_proj={nb_proj}); KIJ_STREAM is "
+            f"single-process only, where the mesh is 1x1 and no pad exists.")
         sink = _H5Sink(
             writer=stream_writer,
             omega_global_idx=omega_global_idx,
             omega_batch_size=int(max(1, omega_batch_size)),
+            # KIJ_STREAM is single-process only (ppm_accumulators
+            # _select_accum_mode: n_proc != 1 -> KIJ_HOST), and a 1x1 mesh
+            # cannot pad -- so the real and padded extents coincide here.
+            # Assert it rather than rely on the coincidence.
             full_spatial_shape=(nk_proj, nb_proj, nb_proj),
         )
     accumulator: _SigmaAccumulator = _TauAccumulator(
@@ -491,7 +560,10 @@ def _run_sigma_branch(
     acc_total = accumulator.finalize()
     if acc_total is None:
         return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), windows
-    return acc_total, windows
+    # Strip the mesh pad block (exactly zero) — the ONE seam where the padded
+    # QP window stops.  Everything above this line ran at nb_pad; everything
+    # below (host Sigma buffer, eqp write) sees only the real nb_proj.
+    return strip_sigma_window(acc_total, nb_proj), windows
 
 
 def _compute_invalid_static_sigma(

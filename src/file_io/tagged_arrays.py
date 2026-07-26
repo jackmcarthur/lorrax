@@ -43,6 +43,7 @@ def write_restart_state_to_h5(
     use_ffi_io: bool | None = None,
     mode: str = "w",
     kgrid: tuple[int, int, int] | None = None,
+    band_slices=None,
 ):
     """Write (subset of) canonical restart state via SlabIO.
 
@@ -80,6 +81,20 @@ def write_restart_state_to_h5(
         # leave the attr unset; BSE falls back to reading WFN.
         if kgrid is not None and mode == "w":
             io.write_attr("kgrid", np.asarray(kgrid, dtype=np.int64))
+        # BAND-WINDOW PROVENANCE.  V_qmunu / psi_full_y / enk_full are all
+        # indexed by the band window they were BUILT under; a restart that
+        # changes nval/ncond/nband re-reads them under a different window and
+        # silently misindexes Sigma -- no crash, just wrong physics (job
+        # 7874375: window 70 tensors reused at window 80 gave a QP gap of
+        # -135 eV while every stage reported success).  Stamp the window here
+        # so :func:`assert_restart_window_matches` can refuse that on load.
+        if band_slices is not None and mode == "w":
+            io.write_attr("band_window", np.asarray(
+                [int(band_slices.b0), int(band_slices.b1),
+                 int(band_slices.b2), int(band_slices.b3),
+                 int(band_slices.b4)], dtype=np.int64))
+        if mode == "w":
+            io.write_attr("n_rmu_logical", np.int64(int(n_rmu_logical)))
 
         def _write(name, arr, mu_axes=()):
             if arr is None:
@@ -201,6 +216,50 @@ def write_head_scalars_to_h5(
         pass
 
 
+def assert_restart_window_matches(filename, band_slices=None,
+                                 n_rmu_logical=None) -> None:
+    """Refuse a restart whose tensors were built under a DIFFERENT band
+    window or centroid count.
+
+    ``V_qmunu``, ``psi_full_y`` and ``enk_full`` are all indexed by the band
+    window in force when they were written.  Reusing them under a changed
+    ``nval``/``ncond``/``nband`` misindexes Sigma with no shape error and no
+    crash — job 7874375 reused window-70 tensors at window 80 and produced a
+    QP gap of -135 eV while every stage reported success.  This turns that
+    into a loud, actionable failure naming BOTH windows.
+
+    Files written before this attr existed carry no ``band_window``; those
+    are passed through with no check (back-compat), since refusing them would
+    strand existing restart files.
+    """
+    with h5py.File(filename, "r") as f:
+        stored_w = np.asarray(f["band_window"]).tolist() if "band_window" in f else None
+        stored_mu = (int(np.asarray(f["n_rmu_logical"])[()])
+                     if "n_rmu_logical" in f else None)
+
+    if stored_w is not None and band_slices is not None:
+        want = [int(band_slices.b0), int(band_slices.b1), int(band_slices.b2),
+                int(band_slices.b3), int(band_slices.b4)]
+        if [int(x) for x in stored_w] != want:
+            raise ValueError(
+                f"Restart file {filename} was written under band window "
+                f"(b0,b1,b2,b3,b4)={tuple(int(x) for x in stored_w)} but this "
+                f"run has {tuple(want)}.  V_qmunu / psi_full_y / enk_full are "
+                f"indexed by that window, so reusing them would MISINDEX "
+                f"Sigma silently (no crash, wrong QP energies -- see job "
+                f"7874375).  Either restore the original nval/ncond/nband, or "
+                f"set restart=false to rebuild the tensors for the new window."
+            )
+    if stored_mu is not None and n_rmu_logical is not None:
+        if int(stored_mu) != int(n_rmu_logical):
+            raise ValueError(
+                f"Restart file {filename} was written with n_rmu={stored_mu} "
+                f"but this run has n_rmu={int(n_rmu_logical)}.  The ISDF basis "
+                f"differs, so V_qmunu / psi_full_y are not reusable.  Set "
+                f"restart=false (or point at the matching centroid file)."
+            )
+
+
 def read_restart_state_from_h5(filename):
     """Read canonical restart state from HDF5 (restart format v2)."""
     with h5py.File(filename, "r") as f:
@@ -220,7 +279,8 @@ def read_restart_state_from_h5(filename):
     return V_qmunu, S_qmunu, psi_full_y, enk_full, V0_noG0_munu, G0_mu_nu
 
 
-def load_restart_state_from_h5(filename, mesh_xy, band_slices=None):
+def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
+                              n_rmu_logical=None):
     """Load canonical restart state and reshape wavefunctions into the
     two arrays expected by :func:`gw.wavefunction_bundle.build_wavefunctions`.
 
@@ -237,8 +297,10 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None):
     single y→x all-to-all on the μ axis; this is the only reshard on
     the restart path.
     """
-    del band_slices  # retained for call-site compatibility
     from types import SimpleNamespace
+    # Loud-fail BEFORE any tensor is trusted (see the function's docstring).
+    assert_restart_window_matches(filename, band_slices=band_slices,
+                                  n_rmu_logical=n_rmu_logical)
     V_qmunu, S_qmunu, psi_full_y_raw, enk_full, V0_noG0_munu, G0_mu_nu = read_restart_state_from_h5(filename)
 
     # V_qmunu is now flat-q ``(nq, μ, μ)``.  Earlier formats had leading
