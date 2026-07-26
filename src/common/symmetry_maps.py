@@ -808,6 +808,14 @@ def unfold_psi(
     sym_idx = int(sym_idx)
     # ``sym_mats_k`` always has length ``2 · n_sym_spatial`` — the spatial
     # half is followed by the TRS-augmented rows (-S).
+    if int(np.shape(sym_mats_k)[0]) != 2 * int(np.shape(U_spinor_spatial)[0]):
+        raise ValueError(
+            "unfold_psi: sym_mats_k must be TRS-augmented to length "
+            f"2*n_sym_spatial; got len(sym_mats_k)="
+            f"{int(np.shape(sym_mats_k)[0])} vs len(U_spinor_spatial)="
+            f"{int(np.shape(U_spinor_spatial)[0])}.  A non-augmented table "
+            "silently reclassifies the identity row as time reversal "
+            "(returns iσ_y·conj(ψ) on an un-negated G-list).")
     n_sym_spatial = int(sym_mats_k.shape[0]) // 2
     is_trs = sym_idx >= n_sym_spatial
     s_spatial = sym_idx - n_sym_spatial if is_trs else sym_idx
@@ -871,7 +879,23 @@ class SymMaps:
         if ntran <= 1:
             # Trivial identity-only symmetry path
             self.sym_matrices = np.eye(3, dtype=np.int32)[None, :, :]
-            self.sym_mats_k = self.sym_matrices.transpose(0, 2, 1).copy()
+            # ``sym_mats_k`` MUST be TRS-augmented to length ``2·ntran``
+            # exactly like the general branch below: every consumer
+            # (``unfold_psi``/``trs_augment_U`` derive ``n_sym_spatial =
+            # len(sym_mats_k)//2``, ``zeta_loader``'s q-IBZ TR mapping,
+            # ``compute_vcoul``'s q lookup) assumes the spatial half is
+            # followed by the ``-S`` time-reversal half.  Leaving it at
+            # length 1 made ``n_sym_spatial = 1//2 = 0``, so ``unfold_psi``
+            # classified the *identity* row (sym_idx=0) as a TRS row and
+            # returned ``iσ_y·conj(ψ)`` on an un-negated G-list — i.e. it
+            # silently replaced ψ(r) by ψ*(−r) for EVERY k of any
+            # symmetry-free (``nosym``) WFN.  Norms, ⟨ψ_m|ψ_n⟩, T and
+            # (because ρ is inverted too) V_H all survive that, so it only
+            # shows up in the position-dependent ionic terms: V_NL
+            # collapses and V_loc shifts by O(100 eV).  See scorecard §Q.
+            _sym_mats_k = self.sym_matrices.transpose(0, 2, 1).copy()
+            self.sym_mats_k = np.concatenate(
+                [_sym_mats_k, -_sym_mats_k], axis=0)
             self.translations = np.zeros((1, 3), dtype=np.float64)
 
             # In no-symmetry case, unfolded grid equals irreducible grid

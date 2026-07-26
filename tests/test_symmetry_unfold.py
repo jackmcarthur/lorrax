@@ -689,7 +689,59 @@ def test_unfold_psi_trs_squared_is_identity_on_spinor():
                                 err_msg="T² should equal -I on a spin-1/2 state")
 
 
+def _trivial_sym_wfn(kgrid=(2, 2, 1)):
+    """Minimal WFN stand-in that drives SymMaps' ``ntran <= 1`` branch."""
+    import types
+    kg = np.asarray(kgrid, dtype=np.int32)
+    kx, ky, kz = np.meshgrid(np.arange(kg[0]), np.arange(kg[1]),
+                             np.arange(kg[2]), indexing='ij')
+    kpts = np.stack([kx.ravel(), ky.ravel(), kz.ravel()],
+                    axis=1).astype(float) / kg[None, :].astype(float)
+    return types.SimpleNamespace(
+        ntran=1, kpoints=kpts, nkpts=int(kpts.shape[0]),
+        kgrid=kg, shift=np.zeros(3, dtype=float),
+    )
+
+
+def test_trivial_symmetry_branch_trs_augments_sym_mats_k():
+    """``ntran <= 1`` must still yield a TRS-augmented ``sym_mats_k``.
+
+    Regression guard for workstream Q: when the no-symmetry branch left
+    ``sym_mats_k`` at length 1, ``unfold_psi`` computed
+    ``n_sym_spatial = 1 // 2 = 0`` and therefore classified the IDENTITY
+    row (``sym_idx = 0``) as a time-reversal row — silently returning
+    ``iσ_y·conj(ψ)`` on an un-negated G-list for every k of every
+    ``nosym`` WFN.  Norms, ⟨ψ_m|ψ_n⟩, ⟨T⟩ and (because ρ inverts too)
+    ⟨V_H⟩ are all invariant under that, so the corruption only surfaced
+    in the position-dependent ionic terms (V_NL collapsed, V_loc shifted
+    by O(100 eV)).
+    """
+    sym = SymMaps(_trivial_sym_wfn())
+    smk = np.asarray(sym.sym_mats_k)
+    assert smk.shape == (2, 3, 3), (
+        f"sym_mats_k must be TRS-augmented to 2·ntran rows; got {smk.shape}")
+    np.testing.assert_array_equal(smk[0], np.eye(3, dtype=smk.dtype))
+    np.testing.assert_array_equal(smk[1], -np.eye(3, dtype=smk.dtype))
+    assert smk.shape[0] == 2 * np.asarray(sym.U_spinor).shape[0]
+
+    # ...and the identity row must round-trip ψ untouched.
+    rng = np.random.default_rng(11)
+    cnk = (rng.standard_normal((2, 2, 4)) + 1j * rng.standard_normal((2, 2, 4)))
+    g_kbar = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [-1, 1, 0]],
+                      dtype=np.int32)
+    out = unfold_psi(
+        cnk, sym_idx=int(sym.sym_idx_k[0]), g_kbar=g_kbar,
+        sym_mats_k=sym.sym_mats_k, translations=sym.translations,
+        U_spinor_spatial=sym.U_spinor,
+    )
+    np.testing.assert_allclose(
+        out, cnk, atol=1e-14, rtol=0.0,
+        err_msg="identity sym row must leave ψ unchanged on a nosym WFN")
+
+
 if __name__ == "__main__":
+    test_trivial_symmetry_branch_trs_augments_sym_mats_k()
+    print("test_trivial_symmetry_branch_trs_augments_sym_mats_k OK")
     test_unfold_psi_identity_is_noop()
     print("test_unfold_psi_identity_is_noop OK")
     test_unfold_psi_matches_hand_reference()
