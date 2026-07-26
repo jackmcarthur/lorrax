@@ -276,6 +276,15 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
     psi_coh_yr  = wfns.yr(s.full)
     psi_proj_xr = wfns.xr(s.sigma)
     psi_proj_yn = wfns.yn(s.sigma)
+    # Mesh-pad the QP band window EXACTLY as ``ppm_sigma._run_sigma_branch``
+    # does at runtime.  This is load-bearing twice over: the reduce-scatter
+    # projector asserts m % p_x == 0 / n % p_y == 0 (so an unpadded AOT
+    # lowering fires the guard here, which is where 7874338 died), and the AOT
+    # signature must match the runtime one shape-for-shape or pjit silently
+    # re-traces and the precompile buys nothing.
+    from .ppm_sigma import pad_sigma_window
+    psi_proj_xr, psi_proj_yn, _nb_real = pad_sigma_window(
+        psi_proj_xr, psi_proj_yn, mesh_xy)
 
     # Representative non-ψ inputs — values don't matter for AOT, only
     # the full `(shape, dtype, sharding, committed-ness)` tuple must

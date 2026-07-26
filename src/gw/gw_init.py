@@ -712,6 +712,10 @@ def prepare_isdf_and_wavefunctions(
 				V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
 				init_W0=True, mesh=mesh_xy, backend=cfg.backend.slab_io,
 				mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
+				# Stamp the band window + n_rmu so a later restart
+				# under a CHANGED window fails loudly instead of
+				# silently misindexing Sigma (job 7874375).
+				band_slices=band_slices,
 			)
 
 			with timing.section("gw_jax.wavefunction_setup"):
@@ -752,7 +756,8 @@ def prepare_isdf_and_wavefunctions(
 		from file_io import load_restart_state_from_h5
 		with timing.section("gw_jax.restart_load"):
 			rs = load_restart_state_from_h5(
-				tensors_filename, mesh_xy, band_slices=band_slices)
+				tensors_filename, mesh_xy, band_slices=band_slices,
+				n_rmu_logical=int(meta.n_rmu))
 			V_qmunu = rs.V_qmunu
 			print0("  Loaded restart tensors from H5.")
 			wfns = build_wavefunction_bundle(

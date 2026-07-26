@@ -23,6 +23,7 @@ from .qe_save_reader import CrystalData
 from .wfn_writer import WFNWriter
 from .epsreader import EPSReader
 from .tagged_arrays import (
+    assert_restart_window_matches,
     write_restart_state_to_h5,
     write_w0_qmunu_to_h5,
     write_head_scalars_to_h5,
