@@ -304,7 +304,7 @@ def add_kpoint_mapping_to_rotation_file(rot_file, wfn_file, verbose=True):
 
 
 def main():
-    parser = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(allow_abbrev=False,
         description='Rotate DFT wavefunctions to QP basis using COHSEX rotation matrices.'
     )
     parser.add_argument('wfn_file', help='Input WFN.h5 file')

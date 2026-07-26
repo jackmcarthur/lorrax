@@ -45,8 +45,15 @@ Usage
 """
 from __future__ import annotations
 
-from runtime import set_default_env
-set_default_env()  # BEFORE `import jax`
+# Canonical JAX GPU/CPU bootstrap — single-sourced in runtime.bootstrap()
+# (env defaults + jax.distributed init + CPU fallback; all idempotent).
+# MUST run BEFORE this module's own `import jax`.  NOTE: this used to be
+# set_default_env() + init_jax_distributed() only; bootstrap() adds
+# fallback_to_cpu_if_no_gpu_backend(), so on a node with no usable GPU
+# backend this CLI now falls back to CPU instead of dying at the first
+# jax call.
+from runtime import bootstrap
+bootstrap()
 
 import argparse
 import functools
@@ -58,9 +65,6 @@ import h5py
 import jax
 import jax.numpy as jnp
 import numpy as np
-
-from runtime import init_jax_distributed
-init_jax_distributed()
 
 from common import Meta, symmetry_maps
 from common.wfn_transforms import load_kpoint_fftbox
@@ -1440,7 +1444,7 @@ def run_sternheimer(
 # ═══════════════════════════════════════════════════════════════════════
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(allow_abbrev=False,
         description="Insulating Sternheimer G=0 column driver "
                     "(χ_{G'0}(q, ω=0) via projected MINRES).")
     parser.add_argument("-i", "--input", default=None,

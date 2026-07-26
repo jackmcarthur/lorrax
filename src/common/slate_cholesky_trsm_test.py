@@ -95,7 +95,7 @@ def build_rhs(n, m, dtype, seed, mesh):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("-n", type=int, default=256)
     ap.add_argument("-m", type=int, default=0, help="rhs cols; default n")
     ap.add_argument("--dtype", choices=["f64", "c128"], default="c128")

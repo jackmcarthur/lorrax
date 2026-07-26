@@ -36,7 +36,7 @@ def _log(s):
 def main():
     nq, n = 1, 64
     import argparse
-    _ap = argparse.ArgumentParser()
+    _ap = argparse.ArgumentParser(allow_abbrev=False)
     _ap.add_argument("--nrhs", type=int, default=0, help="0 = n")
     _args, _ = _ap.parse_known_args()
     nrhs = _args.nrhs or n

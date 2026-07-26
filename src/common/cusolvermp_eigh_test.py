@@ -180,7 +180,7 @@ def run_real_test(n: int, mesh: Mesh) -> int:
 
 # ===========================================================================
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("-n", type=int, default=128,
                     help="Matrix size (default 128).")
     ap.add_argument("--grid", nargs=2, type=int, default=None,

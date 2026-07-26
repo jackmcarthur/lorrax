@@ -21,6 +21,7 @@ Suite architecture (2026-07-09 redesign):
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -81,7 +82,88 @@ def copy_fixture(case_dir: Path, run_dir: Path, *, tmp_from: Path = None):
         src_tmp = Path(tmp_from) / "tmp"
         assert src_tmp.is_dir(), f"no restart state to copy: {src_tmp}"
         shutil.copytree(src_tmp, run_dir / "tmp")
+    # copytree preserves modes, and the fixtures themselves are kept
+    # READ-ONLY at rest (see ``protect_fixtures``).  Restore owner-write on
+    # the COPY: Tier-2 variants edit their run dir's input file
+    # (``mutate_input``) and the driver rewrites tmp/ state in place.
+    make_writable(run_dir)
     return run_dir
+
+
+def make_writable(root: Path) -> None:
+    """Give the owner write permission on ``root`` and everything under it."""
+    root = Path(root)
+    os.chmod(root, os.stat(root).st_mode | stat.S_IWUSR)
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            p = Path(dirpath) / name
+            try:
+                os.chmod(p, os.stat(p).st_mode | stat.S_IWUSR)
+            except OSError:
+                pass
+
+
+def protect_fixtures(reg_root: Path = None) -> list:
+    """Make every regression FIXTURE file read-only; return what it changed.
+
+    Why this exists
+    ---------------
+    Gates are staged by copying ``tests/regression/<case>/`` into a scratch
+    run dir.  On 2026-07-25 one sbatch stager used ``ln -sf`` instead of
+    ``cp`` — the driver then wrote its ``sigma_mnk.h5`` output THROUGH the
+    symlink and silently destroyed the checked-in fixture.  Nothing failed;
+    the corruption was noticed by eye.
+
+    Defence in depth, cheapest layer first:
+      1. fixtures are ``a-w`` at rest (this function, called from
+         ``conftest.pytest_sessionstart``) — a write through a stray
+         symlink now fails loudly with EACCES;
+      2. stagers copy, never link (``cp -L`` if the source may be a link);
+      3. run-dir copies get owner-write back (:func:`make_writable`).
+
+    The protected set is exactly the **git-tracked** files under
+    ``tests/regression/`` — not a filename heuristic.  That distinction
+    matters: ``sigma_mnk.h5`` is in ``_FIXTURE_IGNORE`` (the driver writes a
+    file of that name, so it is never copied into a run dir) and is ALSO a
+    checked-in reference artifact.  It is the file the 2026-07-25 incident
+    destroyed. A name-based rule would have skipped precisely the victim.
+
+    Self-healing rather than assertive: it chmods and reports.  A hard
+    failure here would strand a fresh clone whose umask left files writable,
+    which is every clone.  Outside a git checkout it is a no-op.
+    """
+    reg_root = Path(reg_root) if reg_root is not None else REG
+    if not reg_root.is_dir():
+        return []
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(reg_root), "ls-files", "-z", "--full-name", "."],
+            capture_output=True, timeout=60)
+        if out.returncode != 0:
+            return []
+        top = subprocess.run(
+            ["git", "-C", str(reg_root), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if not top:
+        return []
+    changed = []
+    for rel in out.stdout.decode().split("\0"):
+        if not rel:
+            continue
+        path = Path(top) / rel
+        if path.is_symlink() or not path.is_file():
+            continue
+        mode = os.stat(path).st_mode
+        ro = mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+        if ro != mode:
+            try:
+                os.chmod(path, ro)
+                changed.append(str(path))
+            except OSError:
+                pass
+    return changed
 
 
 def run_gw_jax(run_dir, input_name, platform=None, extra_env=None,

@@ -277,7 +277,7 @@ def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data, log=print):
 def main(argv=None):
     import argparse
 
-    ap = argparse.ArgumentParser(
+    ap = argparse.ArgumentParser(allow_abbrev=False,
         description="Exciton bandstructure E_S(Q) along a K_POINTS crystal_b path")
     ap.add_argument("-i", "--input", required=True,
                     help="cohsex.in with a K_POINTS crystal_b Q-path block")

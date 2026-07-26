@@ -242,7 +242,7 @@ def summarize_ms(samples: list[float]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(allow_abbrev=False, description=__doc__)
     parser.add_argument("--mode", choices=["potrf", "potrf_potrs"], default="potrf")
     parser.add_argument("--mesh", default="2x2")
     parser.add_argument("--nq", type=int, default=9)

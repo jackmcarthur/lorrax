@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.22)
+# LANGUAGES CXX ONLY — deliberate, do not add C or Fortran.  Nothing here is
+# Fortran (the ScaLAPACK calls go through MKL's C bindings) and the py312
+# apptainer container this builds in has no gfortran, so enabling Fortran
+# fails the configure outright.  SLATE's OWN CMakeLists declares
+# `LANGUAGES CXX Fortran` while using Fortran nowhere and needs the same
+# one-line patch before it will configure here — see
+# config/frontera/build_ffi_host.sh, step "patch SLATE".
 project(lorrax_ffi_host LANGUAGES CXX)
 
 # liblorrax_ffi_host.so — the host-platform (JAX CPU backend) FFI library.
@@ -14,11 +21,17 @@ project(lorrax_ffi_host LANGUAGES CXX)
 # platform="CUDA") with the same jax.ffi target names — the jaxlib
 # cpu-lapack / cuda-cusolver registration split.
 #
-# Three optional component groups, each CUDA-free:
+# Two optional component groups, each CUDA-free:
 #   LORRAX_FFI_HAVE_PHDF5  (default ON)  parallel-HDF5 read handlers + lifecycle
 #   LORRAX_HOST_HAVE_SLATE (default ON)  SLATE gpu_backend=none host handlers
+#                                        AND the ScaLAPACK solve_lu handler
+#                                        (it reuses slate/cpp/ctx.h) + their
+#                                        ScaLAPACK/BLACS link line.
 # SLATE downgrades to "skipped" if its install isn't found, so a phdf5-only
-# host lib builds on a cluster without a SLATE host install (e.g. Frontera).
+# host lib still builds on a cluster with no SLATE host install.
+#
+# The full 9-target lib (phdf5×3, slate×5, scalapack×1) was first built on
+# Frontera 2026-07-25; recipe in config/frontera/build_ffi_host.sh.
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -149,6 +162,85 @@ if(LORRAX_HOST_HAVE_SLATE)
             ../../../scalapack/cpp/solve_lu_ffi.cc)
         list(APPEND _host_link_libs slate)
         list(APPEND _host_rpaths "${LORRAX_SLATE_HOST_INSTALL_DIR}/lib64" "/lorrax_slate/lib")
+
+        # --------------------------------------------------------------
+        # ScaLAPACK + BLACS — required by scalapack/cpp/solve_lu_ffi.cc
+        # (pXgetrf / pXgetrs / blacs_gridinit / descinit / numroc).
+        #
+        # The SLATE package does NOT supply them: SLATE is configured with
+        # -DSCALAPACK_LIBRARIES="" (its optional scalapack_api layer is
+        # not built), so `slate` brings in BLAS/LAPACK only.  Workstream L
+        # (2026-07-25) had to hand-inject the link line via
+        # -DCMAKE_SHARED_LINKER_FLAGS on every configure — that gap is
+        # closed here.
+        #
+        # Resolution order:
+        #   1. -DLORRAX_SCALAPACK_LIBRARIES="<link line>" — vendor-agnostic
+        #      escape hatch (Cray LibSci, netlib, AOCL, ...).  A CMake list
+        #      or a space-separated string; raw `-l`/`-L` flags are fine.
+        #   2. MKL, probed under -DLORRAX_MKL_ROOT / $MKLROOT.  This is the
+        #      Frontera path (MKL 2020.1 at
+        #      /opt/intel/compilers_and_libraries_2020.1.217/linux/mkl).
+        #   3. nothing found -> loud WARNING; the .so still links (the
+        #      symbols stay undefined) but the first scalapack call dies.
+        #
+        # `-Wl,--no-as-needed` is mandatory: MKL's layered libraries are
+        # reached transitively and ld10+ drops them from DT_NEEDED
+        # otherwise, producing a .so that dlopens and then fails to
+        # resolve pzgetrf at call time.
+        # --------------------------------------------------------------
+        if(NOT DEFINED LORRAX_SCALAPACK_LIBRARIES AND DEFINED ENV{LORRAX_SCALAPACK_LIBRARIES})
+            set(LORRAX_SCALAPACK_LIBRARIES "$ENV{LORRAX_SCALAPACK_LIBRARIES}" CACHE STRING
+                "Full ScaLAPACK+BLACS link line (overrides the MKL probe)")
+        endif()
+        if(LORRAX_SCALAPACK_LIBRARIES)
+            separate_arguments(_scalapack_link UNIX_COMMAND
+                              "${LORRAX_SCALAPACK_LIBRARIES}")
+            message(STATUS "ScaLAPACK: explicit -> ${LORRAX_SCALAPACK_LIBRARIES}")
+        else()
+            if(NOT DEFINED LORRAX_MKL_ROOT AND DEFINED ENV{LORRAX_MKL_ROOT})
+                set(LORRAX_MKL_ROOT "$ENV{LORRAX_MKL_ROOT}" CACHE PATH "MKL install prefix")
+            endif()
+            if(NOT LORRAX_MKL_ROOT AND DEFINED ENV{MKLROOT})
+                set(LORRAX_MKL_ROOT "$ENV{MKLROOT}" CACHE PATH "MKL install prefix")
+            endif()
+            # BLACS flavour MUST match the MPI actually linked above
+            # (Intel MPI on Frontera); a mismatch links fine and then
+            # hangs/aborts inside blacs_gridinit.
+            set(LORRAX_MKL_BLACS "mkl_blacs_intelmpi_lp64" CACHE STRING
+                "MKL BLACS library, must match the MPI (…_intelmpi_lp64 | …_openmpi_lp64)")
+            set(LORRAX_MKL_THREAD_LIB "mkl_gnu_thread" CACHE STRING
+                "MKL threading layer (mkl_gnu_thread for g++, mkl_sequential to disable)")
+            find_library(LORRAX_MKL_SCALAPACK_LIBRARY NAMES mkl_scalapack_lp64
+                HINTS "${LORRAX_MKL_ROOT}/lib/intel64_lin"
+                      "${LORRAX_MKL_ROOT}/lib/intel64"
+                      "${LORRAX_MKL_ROOT}/lib")
+            if(LORRAX_MKL_SCALAPACK_LIBRARY)
+                get_filename_component(_mkl_libdir
+                                       "${LORRAX_MKL_SCALAPACK_LIBRARY}" DIRECTORY)
+                set(_scalapack_link
+                    "-L${_mkl_libdir}" "-Wl,--no-as-needed"
+                    "-lmkl_scalapack_lp64" "-l${LORRAX_MKL_BLACS}"
+                    "-lmkl_intel_lp64" "-l${LORRAX_MKL_THREAD_LIB}" "-lmkl_core")
+                if(LORRAX_MKL_THREAD_LIB STREQUAL "mkl_gnu_thread")
+                    list(APPEND _scalapack_link "-lgomp")
+                endif()
+                list(APPEND _scalapack_link "-lpthread" "-lm" "-ldl")
+                list(APPEND _host_rpaths "${_mkl_libdir}")
+                message(STATUS "ScaLAPACK: MKL at ${_mkl_libdir} "
+                               "(blacs=${LORRAX_MKL_BLACS}, thread=${LORRAX_MKL_THREAD_LIB})")
+            else()
+                set(_scalapack_link "")
+                message(WARNING
+                    "ScaLAPACK/BLACS not found — building "
+                    "scalapack/cpp/solve_lu_ffi.cc with UNDEFINED pXgetrf/BLACS "
+                    "symbols.  ffi_loader.has_target('lorrax_scalapack_batched_solve_lu') "
+                    "will report the handler present and the first call will die.  "
+                    "Set -DLORRAX_MKL_ROOT (or \$MKLROOT), or pass a full "
+                    "-DLORRAX_SCALAPACK_LIBRARIES link line.")
+            endif()
+        endif()
+        list(APPEND _host_link_libs ${_scalapack_link})
     else()
         message(STATUS
             "SLATE (host): not found at ${LORRAX_SLATE_HOST_INSTALL_DIR} — "

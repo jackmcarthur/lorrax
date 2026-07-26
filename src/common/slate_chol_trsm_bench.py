@@ -99,7 +99,7 @@ def _parse_mesh(s: str) -> tuple[int, int]:
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--mesh", type=str, required=True,
                     help="grid as PxQ, e.g. 2x2, 1x4, 4x1")
     ap.add_argument("-n", type=int, default=1024)

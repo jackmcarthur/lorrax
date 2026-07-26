@@ -240,7 +240,7 @@ def main():
     import argparse
     from pathlib import Path
 
-    parser = argparse.ArgumentParser(description="CROP acceleration method benchmark")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="CROP acceleration method benchmark")
     parser.add_argument("--show", action="store_true", help="Show plots interactively")
     parser.add_argument(
         "--outdir",

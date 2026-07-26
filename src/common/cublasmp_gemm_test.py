@@ -41,7 +41,7 @@ def _log(s):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--nbatch", type=int, default=2)
     ap.add_argument("-m", type=int, default=64)
     ap.add_argument("-n", type=int, default=64)

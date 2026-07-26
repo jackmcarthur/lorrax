@@ -12,6 +12,50 @@
 #   (default $LORRAX_FFI_STAGE_WTA/build_host; point LORRAX_FFI_HOST_SO there
 #    at runtime).  A UNIQUE stage dir so it never clobbers the shared
 #    $WORK/lorrax_ffi CUDA .so.
+#
+# ----------------------------------------------------------------------------
+# SLATE + ScaLAPACK (the distributed-linalg half of the lib) — OPT-IN
+# ----------------------------------------------------------------------------
+# By default this script builds the phdf5-only lib (3 targets), which needs no
+# external numerical library.  Set LORRAX_SLATE_HOST_INSTALL_DIR to a
+# gpu_backend=none SLATE install and you get all 9 host targets (phdf5×3,
+# slate×5, scalapack×1):
+#
+#   LORRAX_SLATE_HOST_INSTALL_DIR=$WORK/slate_builds/cpu/install \
+#     config/frontera/build_ffi_host.sh --fresh
+#
+# Building that SLATE install is a SEPARATE, one-time step; SLATE is external
+# source, so its two Frontera deviations cannot live in this repo's CMake and
+# are recorded here instead (workstream L, 2026-07-25; the working script is
+# /scratch2/08271/jackmc/lorrax_setup/wk_L/build_slate_host.sh):
+#
+#   1. PATCH SLATE: "LANGUAGES CXX Fortran" -> "LANGUAGES CXX".
+#      SLATE declares Fortran but uses it NOWHERE (only in the commented-out
+#      scalapack_api); the py312 container has no gfortran, so the configure
+#      dies before compiling anything.  One line, applied to the SLATE source
+#      tree before configuring:
+#
+#        sed -i 's/    LANGUAGES CXX Fortran/    LANGUAGES CXX/' \
+#            "$SLATE_SRC/CMakeLists.txt"
+#
+#   2. CONFIGURE SLATE with MKL, not libsci (the Perlmutter recipe's default):
+#        -Dgpu_backend=none -Dblas=mkl -Dblas_int=int -Dblas_threaded=true
+#        -Dbuild_tests=no -DSCALAPACK_LIBRARIES=""
+#        -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_LIBDIR=lib64
+#      (SCALAPACK_LIBRARIES="" is why THIS lib must link ScaLAPACK itself —
+#       see the ScaLAPACK block in src/ffi/common/cpp/host/CMakeLists.txt.)
+#
+#   3. BUILD ON NODE-LOCAL /tmp.  /work2 is Lustre; under a concurrent
+#      40-node job even `python -c pass` from the venv stalls minutes in
+#      ptlrpc_set_wait.  Stage the SLATE source + cmake/ninja ELF binaries to
+#      /tmp (one sequential tar read, ~2-min build) and pass
+#      -DLORRAX_XLA_FFI_INCLUDE_DIR explicitly so cmake never imports jax.
+#
+# Runtime for the SLATE/ScaLAPACK targets needs LD_LIBRARY_PATH ⊇ MKL libdir
+# + the Intel compiler runtime (libimf/libsvml/libirng/libintlc) + SLATE's
+# lib64.  KNOWN BUG L-2: SLATE host `heev` SIGSEGVs deterministically (even
+# 1×1, n=64) — use eigh_backend=auto (native).  potrf/trsm/ScaLAPACK getrf
+# are clean.  See docs/dev/linalg_ffi.md "Sharp edges".
 # ============================================================================
 set -euo pipefail
 
@@ -20,6 +64,11 @@ set -euo pipefail
 : "${LORRAX_FFI_STAGE_WTA:=$WORK/lorrax_ffi_wtA}"
 : "${LORRAX_HDF5_ROOT:=/home1/apps/intel19/impi19_0/phdf5/1.14.6}"
 : "${LORRAX_IMPI_ROOT:=/opt/intel/compilers_and_libraries_2020.4.304/linux/mpi/intel64}"
+# MKL supplies ScaLAPACK + BLACS (and SLATE's BLAS/LAPACK).  2020.1 is the
+# newest on Frontera that ships libmkl_scalapack_lp64.so; 2019.5 also works.
+: "${LORRAX_MKL_ROOT:=/opt/intel/compilers_and_libraries_2020.1.217/linux/mkl}"
+# Empty => phdf5-only lib (the historical default).
+: "${LORRAX_SLATE_HOST_INSTALL_DIR:=}"
 
 PY="$LORRAX_VENV/bin/python"
 CMAKE="$LORRAX_VENV/bin/cmake"
@@ -52,7 +101,6 @@ ARGS=(
     -DCMAKE_CXX_COMPILER=g++
     -DPython3_EXECUTABLE="$PY"            # jax.ffi.include_dir() probe uses this
     -DLORRAX_FFI_HAVE_PHDF5=ON
-    -DLORRAX_HOST_HAVE_SLATE=OFF          # no SLATE host install on Frontera
     -DHDF5_ROOT="$LORRAX_HDF5_ROOT"
     -DHDF5_PREFER_PARALLEL=ON
     -DLORRAX_MPI_INCLUDE_DIR="$LORRAX_IMPI_ROOT/include"
@@ -60,6 +108,31 @@ ARGS=(
     -DCMAKE_MODULE_PATH="$LORRAX_ROOT/config/frontera/cmake"
     -DLORRAX_IMPI_ROOT="$LORRAX_IMPI_ROOT"
 )
+
+# SLATE + ScaLAPACK group (see the header).  The ScaLAPACK/BLACS link line is
+# now resolved by the CMakeLists from LORRAX_MKL_ROOT — no more hand-injected
+# -DCMAKE_SHARED_LINKER_FLAGS.
+if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
+    [ -d "$LORRAX_SLATE_HOST_INSTALL_DIR/lib64/cmake/slate" ] || {
+        echo "[build_host] LORRAX_SLATE_HOST_INSTALL_DIR set but no" >&2
+        echo "             $LORRAX_SLATE_HOST_INSTALL_DIR/lib64/cmake/slate" >&2
+        exit 2; }
+    [ -f "$LORRAX_MKL_ROOT/lib/intel64_lin/libmkl_scalapack_lp64.so" ] || {
+        echo "[build_host] no libmkl_scalapack_lp64.so under $LORRAX_MKL_ROOT" >&2
+        echo "             set LORRAX_MKL_ROOT (or LORRAX_SCALAPACK_LIBRARIES)" >&2
+        exit 2; }
+    ARGS+=(
+        -DLORRAX_HOST_HAVE_SLATE=ON
+        -DLORRAX_SLATE_HOST_INSTALL_DIR="$LORRAX_SLATE_HOST_INSTALL_DIR"
+        -DLORRAX_MKL_ROOT="$LORRAX_MKL_ROOT"
+    )
+    echo "[build_host] SLATE group ON  ($LORRAX_SLATE_HOST_INSTALL_DIR)"
+    echo "[build_host] ScaLAPACK/BLACS from MKL at $LORRAX_MKL_ROOT"
+else
+    ARGS+=(-DLORRAX_HOST_HAVE_SLATE=OFF)
+    echo "[build_host] SLATE group OFF (phdf5-only lib);"
+    echo "[build_host]   set LORRAX_SLATE_HOST_INSTALL_DIR to enable it."
+fi
 
 if [ "${1:-}" == "--fresh" ]; then rm -rf "$BUILD"; fi
 mkdir -p "$BUILD"
@@ -77,4 +150,28 @@ if readelf -d "$SO" | grep NEEDED | grep -qiE 'cuda|nccl|nvshmem|cusolver|cublas
     echo "[build_host] FAILED: host lib links a CUDA-stack library." >&2
     exit 1
 fi
-echo "[build_host] CUDA-free OK.  done."
+echo "[build_host] CUDA-free OK."
+
+# Exported handler symbols must match ffi_loader._HOST_TARGET_SYMBOLS, or
+# has_target() lies and the facade's capability guard passes wrongly.
+WANT="PhdfReadHostFfi PhdfReadKchunkHostFfi PhdfReadKchunkUnionHostFfi"
+if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
+    WANT="$WANT SlateEighHostFfi SlatePotrfHostFfi SlateTrsmHostFfi \
+SlateBatchedPotrfHostFfi SlateBatchedTrsmHostFfi ScalapackBatchedSolveLuHostFfi \
+lrx_slate_init_mpi lrx_slate_context_create"
+fi
+echo "[build_host] --- exported handlers ---"
+MISS=0
+for s in $WANT; do
+    if nm -D "$SO" | grep -qE " (T|B|D) $s\$"; then echo "  OK      $s"
+    else echo "  MISSING $s"; MISS=1; fi
+done
+[ "$MISS" -eq 0 ] || { echo "[build_host] FAILED: missing handlers." >&2; exit 1; }
+if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
+    echo "[build_host] --- ScaLAPACK/BLACS in DT_NEEDED ---"
+    readelf -d "$SO" | grep -E 'scalapack|blacs' \
+        || { echo "[build_host] FAILED: no ScaLAPACK/BLACS DT_NEEDED — the" >&2
+             echo "             -Wl,--no-as-needed link line did not take." >&2
+             exit 1; }
+fi
+echo "[build_host] done."

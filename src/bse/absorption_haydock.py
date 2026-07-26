@@ -302,7 +302,7 @@ def run_haydock(
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(
+    p = argparse.ArgumentParser(allow_abbrev=False,
         description="Haydock-route BSE absorption (continued fraction; no eigenvectors)",
     )
     p.add_argument("-i", "--input", required=True,

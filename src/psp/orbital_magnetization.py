@@ -416,7 +416,7 @@ def hf_group_velocity_check(Vp, Vnl, eps_grid, kcrys_grid, B, kgrid, nbands_show
 
 # ----------------------------------------------------------------------
 def main(argv=None):
-    p = argparse.ArgumentParser(
+    p = argparse.ArgumentParser(allow_abbrev=False,
         description="Per-cell orbital magnetic moment (modern theory, dH/dk).")
     p.add_argument("--wfn", required=True, help="WFN.h5 (BGW format, nspinor=2)")
     p.add_argument("--nbnd", type=int, default=None,

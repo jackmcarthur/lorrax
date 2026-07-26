@@ -549,7 +549,7 @@ def write_pseudopoles_h5(
 def main(argv: list[str] | None = None) -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="FEAST pseudopole construction with biased seeds")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="FEAST pseudopole construction with biased seeds")
     parser.add_argument("-i", "--input", required=True, help="COHSEX input file")
     parser.add_argument("--n-val", type=int, default=4)
     parser.add_argument("--n-cond", type=int, default=4)

@@ -1079,7 +1079,7 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Hamiltonian interpolation driver")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="Hamiltonian interpolation driver")
     parser.add_argument("-i", "--input", default="cohsex_test.in", help="Input file")
     parser.add_argument("-wfn", "--wfn-file", default=None, help="Override WFN file (e.g. WFN_qp.h5)")
     parser.add_argument("--plot", action="store_true", help="Show interpolated band plot")
@@ -1099,6 +1099,20 @@ def main(argv=None):
                              "(default: use the key, which defaults to auto).")
     args = parser.parse_args(argv)
     log = _make_logger(args.verbose)
+
+    # JAX persistent compile cache — the same call/pattern as gw_jax's
+    # _warm_start (and run_nscf / run_sternheimer / kmeans_cli).  This CLI
+    # was the one driver that never enabled it, so every htransform run paid
+    # a cold XLA compile of the Galerkin/G-accum kernels.  Opt out (and the
+    # ONLY supported setting at P > 1 on Frontera, where a shared cache
+    # deadlocks the compile barrier) with ISDF_JAX_CACHE_DIR="" — that env
+    # value is honoured inside ensure_jax_compile_cache, so nothing here
+    # needs to test for it.  Failures are logged and swallowed.
+    try:
+        from common.jax_compile_cache import ensure_jax_compile_cache
+        ensure_jax_compile_cache()
+    except Exception as exc:
+        print(f"  [jax compile cache] skipped: {exc}", flush=True)
 
     from gw.gw_init import read_cohsex_input
     params = read_cohsex_input(args.input)

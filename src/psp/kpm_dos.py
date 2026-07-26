@@ -322,7 +322,7 @@ def _plot_dos(E_grid, rho, n_moments, n_random, nk, path):
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="KPM density of states for H_DFT")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="KPM density of states for H_DFT")
     parser.add_argument("--save", required=True, help="QE .save directory")
     parser.add_argument("--pseudo_dir", default=None)
     parser.add_argument("--nk", type=int, nargs=3, default=[4, 4, 4])

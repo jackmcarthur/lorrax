@@ -187,7 +187,7 @@ def _cosine_similarity_density(
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="BSE Block Davidson smoke + comparison")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="BSE Block Davidson smoke + comparison")
     parser.add_argument("-i", "--input", required=True,
                         help="cohsex.in (used to find isdf_tensors_*.h5 + WFN.h5)")
     parser.add_argument("--n-val", type=int, default=8)

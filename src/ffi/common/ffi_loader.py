@@ -42,9 +42,11 @@ from typing import Dict, Optional
 import jax
 import jax.ffi
 
-__all__ = ["get_lib", "has_target", "has_phdf5_read"]
+__all__ = ["get_lib", "has_target", "probe_target", "has_phdf5_read"]
 
 _LIBS: Dict[str, ctypes.CDLL] = {}
+#: platform -> the .so path actually dlopen'd (for diagnostics).
+_LIB_PATHS: Dict[str, str] = {}
 
 # Symbols the XLA FFI side exports (plain C via XLA_FFI_DEFINE_HANDLER_SYMBOL),
 # per platform.  One handler per routine covers all supported dtypes —
@@ -318,29 +320,83 @@ def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
                 raise
 
 
-def has_target(target_name: str, platform: str) -> bool:
-    """True when ``platform``'s FFI library is loadable AND exports the C++
-    handler for XLA target ``target_name`` (per that platform's symbol
-    table).  Never raises: returns False when the library is absent, fails
-    to load, or was built without the handler (partial builds legitimately
-    omit symbols — see :func:`_register_ffi_targets`).
+def probe_target(target_name: str, platform: str) -> tuple[bool, str]:
+    """``(usable, reason)`` for XLA target ``target_name`` on ``platform``.
 
-    This is THE capability probe for backend auto-pick logic (e.g.
-    ``WfnLoader._auto_pick_backend``).  Callers must not reach into the
-    private ``_CUDA_TARGET_SYMBOLS`` / ``_HOST_TARGET_SYMBOLS`` tables:
-    the target-name → C++-symbol mapping is per-platform and owned here,
-    so adding a new FFI target platform only touches ``_PLATFORMS``.
+    The reason DISTINGUISHES the three ways a target can be unusable,
+    because they have three different fixes:
+
+    ``unknown target``
+        Not a target of this platform's library at all — a typo or a
+        wrong-platform request.
+    ``library could not be loaded``
+        The ``.so`` is missing, or ``dlopen`` failed (an unresolved
+        ``DT_NEEDED``, a glibc/GLIBCXX mismatch, a wrong
+        ``LD_LIBRARY_PATH``).  **The handler may well be compiled;
+        nothing about the build is wrong.**
+    ``loaded but does not export <symbol>``
+        The genuine partial-build case — this, and ONLY this, is a
+        "rebuild the library" problem.
+
+    Why the distinction is worth a function: conflating the middle case
+    with the last one produces an error that tells you to rebuild a
+    library that is perfectly fine, while the actual cause (one missing
+    entry in ``LD_LIBRARY_PATH``) goes unmentioned.  On Frontera the
+    unified host lib needs MKL **and** the Intel compiler runtime
+    (``libimf``/``libsvml``/``libintlc``/``libirng``) **and** the phdf5
+    ``libhdf5.so.310`` **and** ``libfabric`` — only some of which are in
+    its RUNPATH.  Getting that wrong silently downgraded an N×1 mesh to
+    ``native`` with a "not compiled" diagnosis (found by wk_P G4,
+    2026-07-25).
+
+    Never raises.
     """
     spec = _PLATFORMS.get(platform)
     if spec is None:
-        return False
+        return False, (f"unknown FFI platform {platform!r} "
+                       f"(known: {sorted(_PLATFORMS)})")
     sym = spec["targets"].get(target_name)
     if sym is None:
-        return False
+        return False, (f"unknown target: {target_name!r} is not a target of "
+                       f"the {platform} FFI library (known: "
+                       f"{', '.join(sorted(spec['targets']))})")
     try:
-        return hasattr(get_lib(platform), sym)
-    except Exception:
-        return False
+        lib = get_lib(platform)
+    except Exception as exc:
+        return False, (
+            f"the {platform} FFI library could not be loaded: "
+            f"{type(exc).__name__}: {exc}  "
+            f"NOTE: this says nothing about whether {target_name} is "
+            f"compiled — fix the library path/dependencies first "
+            f"(LORRAX_FFI_SO / LORRAX_FFI_HOST_SO select the .so; "
+            f"LD_LIBRARY_PATH must cover its DT_NEEDED — on Frontera that "
+            f"means MKL + the Intel compiler runtime + parallel HDF5 + "
+            f"libfabric + SLATE's lib64; `ldd <so>` lists what is missing).")
+    if not hasattr(lib, sym):
+        return False, (
+            f"loaded {_loaded_path(platform)} but it does not export {sym} — "
+            f"this library was built WITHOUT the {target_name} handler.  "
+            f"Rebuild with {spec['build_hint']}.")
+    return True, "available"
+
+
+def has_target(target_name: str, platform: str) -> bool:
+    """True when ``platform``'s FFI library is loadable AND exports the C++
+    handler for XLA target ``target_name`` (per that platform's symbol
+    table).  Never raises.
+
+    This is THE capability probe for backend auto-pick logic (e.g.
+    ``WfnLoader._auto_pick_backend``), where a bool is all a fallback
+    decision needs.  Anything that REPORTS a refusal to a human should
+    use :func:`probe_target` instead and quote its reason — a bare False
+    cannot distinguish "not built" from "LD_LIBRARY_PATH is wrong".
+
+    Callers must not reach into the private ``_CUDA_TARGET_SYMBOLS`` /
+    ``_HOST_TARGET_SYMBOLS`` tables: the target-name → C++-symbol mapping
+    is per-platform and owned here, so adding a new FFI target platform
+    only touches ``_PLATFORMS``.
+    """
+    return probe_target(target_name, platform)[0]
 
 
 def has_phdf5_read(platform: str) -> bool:
@@ -370,7 +426,13 @@ def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
     _set_argtypes(lib, platform)
     _register_ffi_targets(lib, platform)
     _LIBS[platform] = lib
+    _LIB_PATHS[platform] = str(path)
     return lib
+
+
+def _loaded_path(platform: str) -> str:
+    """The .so path dlopen'd for ``platform`` (for error messages)."""
+    return _LIB_PATHS.get(platform, f"<{platform} library>")
 
 
 # ---------------------------------------------------------------------------

@@ -241,7 +241,7 @@ def get_sigma_per_window(h5_path: str) -> dict[str, np.ndarray]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Sweep p_keep from saved pseudopole intermediates")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="Sweep p_keep from saved pseudopole intermediates")
     parser.add_argument("--poles", required=True, help="H5 file with intermediates")
     parser.add_argument("--ref", required=True, help="Reference Wc H5 file")
     parser.add_argument("--omega-ev", type=float, default=0.0)

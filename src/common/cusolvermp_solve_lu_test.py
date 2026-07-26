@@ -95,7 +95,7 @@ def _parse_mesh(s):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--nbatch", type=int, default=8)
     ap.add_argument("-n", type=int, default=128)
     ap.add_argument("--nrhs", type=int, default=0, help="rhs cols; default n")

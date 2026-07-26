@@ -75,6 +75,23 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parent))
 import harness  # noqa: E402
 
 
+def pytest_sessionstart(session):
+    """Make the checked-in regression fixtures read-only before anything runs.
+
+    A gate stager that symlinks (rather than copies) a fixture into its run
+    dir lets the driver write its OUTPUT through the link and destroy the
+    fixture — which happened to
+    ``tests/regression/cohsex_debug/sigma_mnk.h5`` on 2026-07-25, silently.
+    ``a-w`` turns that into an immediate EACCES.  ``harness.copy_fixture``
+    restores owner-write on the run-dir COPY, so nothing legitimate breaks.
+    """
+    changed = harness.protect_fixtures()
+    if changed:
+        tw = session.config.get_terminal_writer()
+        tw.line(f"[fixtures] made {len(changed)} regression fixture file(s) "
+                f"read-only (see harness.protect_fixtures)")
+
+
 def _run_session_case(tmp_path_factory, case_name, input_name, output_name):
     import pytest as _pytest
     harness.skip_unless_gpu(_pytest)

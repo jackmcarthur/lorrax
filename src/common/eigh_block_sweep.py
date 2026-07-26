@@ -28,7 +28,7 @@ def _log(msg: str) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("-n", type=int, required=True)
     ap.add_argument("--blocks", type=int, nargs="+", required=True,
                     help="Block sizes to sweep.")

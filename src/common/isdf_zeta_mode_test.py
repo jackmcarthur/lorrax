@@ -115,7 +115,7 @@ def _run_mode(mode, A, B, mesh):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--nq", type=int, default=8)
     ap.add_argument("-n", type=int, default=128)
     ap.add_argument("--mrhs", type=int, default=0, help="rhs cols; default n")

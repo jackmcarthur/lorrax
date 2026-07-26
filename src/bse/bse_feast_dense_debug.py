@@ -134,7 +134,7 @@ def feast_filter_with_iteration(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Dense FEAST sanity check")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="Dense FEAST sanity check")
     parser.add_argument("--n", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-ritz", type=int, default=4)

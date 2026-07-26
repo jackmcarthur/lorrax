@@ -49,7 +49,7 @@ import psp.vnl_ops as vnl_ops
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Validate H eigenvalues vs QE")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="Validate H eigenvalues vs QE")
     parser.add_argument("--save", required=True, help="QE .save directory")
     parser.add_argument("--pseudo_dir", required=True, help="Directory with .upf files")
     parser.add_argument("--wfn", required=True, help="WFN.h5 from pw2bgw")

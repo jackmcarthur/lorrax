@@ -1157,7 +1157,7 @@ def _parse_window_arg(values: list[str], default: Tuple[float, float]) -> Tuple[
 def main(argv: list[str] | None = None) -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="FEAST setup for sharded BSE")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="FEAST setup for sharded BSE")
     parser.add_argument("-i", "--input", required=True, help="COHSEX input file")
     parser.add_argument("--n-val", type=int, default=4)
     parser.add_argument("--n-cond", type=int, default=4)

@@ -106,7 +106,7 @@ def _check(name: str, eager: np.ndarray, phdf5: np.ndarray, atol: float = 0.0) -
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--wfn", required=True)
     ap.add_argument("--mesh", required=True, help="PxQ")
     ap.add_argument("--bands", default="0,4", help="b_lo,b_hi")

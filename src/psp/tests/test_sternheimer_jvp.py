@@ -318,7 +318,7 @@ def test_finite_q_jvp(fx, use_schur=False):
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--wfn", default="WFN.h5")
     ap.add_argument("--pseudo_dir", default=".")
     ap.add_argument("--truncation-2d", action="store_true", default=True)

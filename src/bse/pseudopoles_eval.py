@@ -126,7 +126,7 @@ def _parse_cols(col_str: str | None, n_mu: int) -> np.ndarray:
 
 
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description="Evaluate Wc(omega) columns from a pseudopoles file.")
+    ap = argparse.ArgumentParser(allow_abbrev=False, description="Evaluate Wc(omega) columns from a pseudopoles file.")
     ap.add_argument("--poles", required=True, help="Input H5 from bse_pseudopoles.py")
     ap.add_argument("--out", default="Wc_from_pseudopoles.h5", help="Output H5 in bse_w_exact-compatible format")
     ap.add_argument("--omega-ev", type=float, default=0.0)
