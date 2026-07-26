@@ -40,7 +40,12 @@ from .sigma_output import (
     copy_sigma_kij_h5_to_omega_h5,
 )
 from .qp_wfn import write_qp_rotations_h5
-from .kin_ion import load_kin_ion_submatrix
+from .kin_ion import (
+    load_kin_ion_submatrix,
+    kin_ion_has_hartree,
+    read_kin_ion_provenance,
+    validate_kin_ion_against_run,
+)
 from .centroids import load_centroids
 from .paths import resolve_input_paths
 from .read_bgw_vcoul import read_bgw_vcoul, fill_v_grid_for_q, BGWVcoulTable
