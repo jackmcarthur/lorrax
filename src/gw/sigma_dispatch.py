@@ -19,6 +19,7 @@ This module owns *no compute* of its own — every kernel lives under
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Callable
 
@@ -83,6 +84,71 @@ class SigmaResult:
 
 
 # ---------------------------------------------------------------------------
+# H₀'s Hartree term: resolve the source once, cache the array
+# ---------------------------------------------------------------------------
+
+#: (kin_ion path, b0, b3, resolved source) → (source, V_H (nk,nb,nb) Ry | None).
+#: The QSGW loop calls ``compute_sigma_xc`` once per SC iteration and the
+#: exact V_H does not change with the band basis (it is a fixed operator in
+#: the DFT basis, and ``rotate_wavefunctions`` handles the basis change on
+#: H₀ as a whole), so re-reading — or worse, re-running the ``gspace``
+#: build, which is minutes — every iteration would be pure waste.
+_hartree_cache: dict = {}
+
+
+def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
+                             wfn=None, sym=None, print_fn=print):
+    """``(source, V_H_kij_ry | None)`` for this run's ``hartree_source``.
+
+    ``source`` is one of ``'stored' | 'folded' | 'isdf' | 'gspace'``.
+    The array is returned only for ``stored`` / ``gspace``; ``folded``
+    means "V_H is inside kin_ion's values, add nothing", and ``isdf``
+    means "keep the ISDF quadrature".
+    """
+    from file_io.kin_ion import resolve_hartree_source, load_hartree_submatrix
+
+    path = config.paths.kin_ion_file
+    requested = getattr(config, "hartree_source", "auto")
+    source = resolve_hartree_source(path, requested, print_fn=print_fn)
+    key = (os.path.abspath(path), int(band_slices.b0), int(band_slices.b3),
+           source, id(mesh_xy))
+    if key in _hartree_cache:
+        return _hartree_cache[key]
+
+    v_h = None
+    if source == "stored":
+        v_h = load_hartree_submatrix(
+            path, band_slices.b0, band_slices.b3,
+            mesh=mesh_xy, backend=config.backend.slab_io)
+        print_fn("  V_H: exact FFT-grid matrix read from kin_ion.h5's "
+                 "'v_hartree' dataset; the ISDF quadrature is not used.")
+    elif source == "gspace":
+        if wfn is None or sym is None:
+            raise ValueError(
+                "hartree_source=gspace needs the WFN loader and SymMaps.")
+        print_fn("  V_H: rebuilding the exact FFT-grid matrix on the fly "
+                 "(hartree_source=gspace) — this is a SERIAL, single-process "
+                 "build; prefer a stored 'v_hartree' array for production.")
+        # Lazy: pulls in the psp stack, which the ISDF path does not need.
+        from gw.kin_ion_io import compute_hartree_matrix
+        v_h_np = compute_hartree_matrix(
+            wfn, sym, meta,
+            truncation_2d=(int(config.sys_dim) == 2),
+            nb=int(band_slices.b3), print_fn=print_fn)
+        v_h = jnp.asarray(v_h_np[:, band_slices.b0:band_slices.b3,
+                                 band_slices.b0:band_slices.b3])
+    elif source == "folded":
+        print_fn("  V_H: LEGACY folded kin_ion.h5 — V_H is inside its values; "
+                 "the ISDF sig_h is suppressed to avoid double counting.")
+    else:
+        print_fn("  V_H: ISDF V_q[0] quadrature (hartree_source=isdf); H0 "
+                 "therefore depends on the centroid count.")
+
+    _hartree_cache[key] = (source, v_h)
+    return source, v_h
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -108,6 +174,7 @@ def compute_sigma_xc(
     wfns_transverse=None,
     bispinor_v_q_path: str | None = None,
     write_sigma_omega_h5: bool = True,
+    hartree_basis_rotation: jax.Array | None = None,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -196,21 +263,36 @@ def compute_sigma_xc(
     sig_h = cohsex["sig_h"]
     sig_x = cohsex["sig_x"]
 
-    # ── The no-double-counting seam (single point of truth) ───────────────
-    # When ``kin_ion.h5`` was generated with the exact FFT-grid V_H folded
-    # in (``has_hartree=True``), the mean-field Hartree term is already
-    # inside H₀.  Zero it HERE — the one place ``sig_h`` enters
-    # ``SigmaResult`` — so every downstream consumer (the eigh operand
-    # ``sigma_total = Σ_xc + V_H``, the fixed-point h₀, the SC iteration
-    # map, eqp{0,1}.dat, sigma_diag.dat's VH column) is consistent by
-    # construction rather than by each remembering to subtract.
-    # The ISDF quadrature above still runs (it is cheap and its cost is
-    # dwarfed by Σ); only its *use* is suppressed.
-    from file_io import kin_ion_has_hartree
-    if kin_ion_has_hartree(config.paths.kin_ion_file):
-        print_fn("  V_H: taken from kin_ion.h5 (exact, FFT-grid); ISDF sig_h "
-                 "suppressed to avoid double counting.")
+    # ── The V_H-source seam (single point of truth) ──────────────────────
+    # ``sig_h`` above is the ISDF V_q[0] quadrature.  This is the ONE
+    # place it enters ``SigmaResult``, so resolving the source here makes
+    # every downstream consumer consistent by construction rather than by
+    # each remembering the rule: the eigh operand ``sigma_total =
+    # Σ_xc + V_H``, the fixed-point h₀, the SC iteration map, eqp{0,1}.dat
+    # and sigma_diag.dat's VH column all read what this decides.
+    #   stored/gspace → replace it with the exact FFT-grid matrix
+    #   folded        → zero it (V_H is inside kin_ion's values already)
+    #   isdf          → keep it
+    # The ISDF quadrature runs regardless; it is cheap next to Σ, and
+    # running it unconditionally keeps the graph shape source-independent.
+    source, v_h_ext = resolve_external_hartree(
+        config, meta, band_slices, mesh_xy, wfn=wfn, sym=sym, print_fn=print_fn)
+    if source == "folded":
         sig_h = jnp.zeros_like(sig_h)
+    elif v_h_ext is not None:
+        v_h_ext = jnp.asarray(v_h_ext, dtype=sig_h.dtype)
+        if hartree_basis_rotation is not None:
+            # QSGW: ``wfns`` is in the CURRENT QP basis, so every Σ channel
+            # this function returns is too, and ``sc_iteration`` rotates the
+            # lot back with ``O_DFT = U·O_QP·U†``.  The stored/gspace V_H is
+            # a fixed operator in the DFT basis, so it must be rotated INTO
+            # the QP basis first (``O_QP = U†·O_DFT·U``) — substituting it
+            # raw would make the rotate-back return ``U·V_H·U†`` and put a
+            # basis error into a ~500 eV term with no other symptom.
+            U = jnp.asarray(hartree_basis_rotation, dtype=sig_h.dtype)
+            v_h_ext = jnp.einsum('kpm,kpq,kqn->kmn',
+                                 jnp.conj(U), v_h_ext, U, optimize=True)
+        sig_h = v_h_ext
     sig_sx = cohsex["sig_sx"]                    # zero placeholders for V-only path
     sig_coh = cohsex["sig_coh"]
 

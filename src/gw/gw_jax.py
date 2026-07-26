@@ -384,7 +384,16 @@ def main(argv=None):
 		band_stop=band_slices.b3,
 		print_fn=print0,
 	)
-	kin_ion_has_hartree = bool(kin_ion_attrs.get("has_hartree", False))
+	# Which V_H source this run will use, resolved once and printed.  Only
+	# the LEGACY ``folded`` case means "V_H is inside kin_ion's values";
+	# ``stored``/``gspace`` supply it as a separate matrix that the Σ seam
+	# substitutes for the ISDF quadrature, and ``isdf`` keeps the latter.
+	from file_io.kin_ion import resolve_hartree_source
+	hartree_source = resolve_hartree_source(
+		config.paths.kin_ion_file, config.hartree_source, print_fn=print0)
+	print0(f"  hartree_source: requested={config.hartree_source} "
+	       f"→ resolved={hartree_source}")
+	kin_ion_has_hartree = (hartree_source == "folded")
 	kin_ion = load_kin_ion_submatrix(
 		config.paths.kin_ion_file, band_slices.b0, band_slices.b3,
 		mesh=mesh_xy, backend=config.backend.slab_io,
@@ -525,6 +534,7 @@ def main(argv=None):
 		sigma_omega_h5_path=sigma_omega_h5_path,
 		tensors_filename=tensors_filename,
 		kin_ion_has_hartree=kin_ion_has_hartree,
+		hartree_source=hartree_source,
 	)
 	if meta.rank == 0:
 		# Optional Σ-decomposition debug table (no-op unless

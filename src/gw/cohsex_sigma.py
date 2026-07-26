@@ -37,6 +37,17 @@ from .wavefunction_bundle import G_FFT7D_SPEC, V_FFT5D_SPEC
 def build_Gij(meta, mesh_xy: Mesh) -> jax.Array:
     """Occupation projector G_ij = diag(1,...,1,0,...,0) for sigma bands.
 
+    **Band coverage — the Hartree density is complete regardless of
+    ``nval``.**  The Σ slice this multiplies is
+    ``BandSlices.sigma = slice(0, b3 - b0)``, i.e. global bands
+    ``[b0, b3) = [0, nelec + ncond)``, so the ``nocc = min(nelec,
+    nb_sigma) = nelec`` rows set to 1 below are global bands
+    ``[0, nelec)`` — *every* occupied band, including deep semicore, for
+    any ``nval``.  ``Meta.band_ranges.sigma`` is a different (unused)
+    ``(b1, b3)`` convention; reading the projector against *that* window
+    suggests a deck with ``nval < nelec`` silently drops occupied bands
+    out of ρ.  It does not.  See the warning in ``common/meta.py``.
+
     ─ NOTE TO FUTURE EDITORS — THE numpy USAGE BELOW IS INTENTIONAL ─
     (nk, nb_sigma, nb_sigma) is a tiny host-side matrix (<1 MiB in
     every realistic case).  The all-``jnp`` version fired 8 standalone
@@ -45,6 +56,19 @@ def build_Gij(meta, mesh_xy: Mesh) -> jax.Array:
     numpy; the ``device_put`` at the end places it on the mesh.
     DO NOT "fix" back to ``jnp``.
     """
+    # The coverage claim above, enforced rather than merely asserted in
+    # prose: if the Σ window were ever narrower than the occupied
+    # manifold, ``min`` would silently drop occupied bands out of ρ and
+    # V_H would come out systematically small with no other symptom.
+    # ``nb_sigma = nelec + ncond`` makes this unreachable for ncond >= 0;
+    # the guard exists so a future band-window change cannot reintroduce
+    # it quietly.
+    if int(meta.nb_sigma) < int(meta.nelec):
+        raise ValueError(
+            f"build_Gij: sigma window has {int(meta.nb_sigma)} bands but the "
+            f"system has {int(meta.nelec)} occupied bands.  The Hartree "
+            f"density would be missing {int(meta.nelec) - int(meta.nb_sigma)} "
+            "occupied bands, which no centroid count can repair.")
     nocc = min(meta.nelec, meta.nb_sigma)
     Gij = np.zeros((meta.nk_tot, meta.nb_sigma, meta.nb_sigma), dtype=np.complex128)
     Gij[:, :nocc, :nocc] = np.eye(nocc, dtype=np.complex128)

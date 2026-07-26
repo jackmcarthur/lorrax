@@ -1,22 +1,47 @@
 #!/usr/bin/env python3
 """kin+ion computation: T + V_loc + V_NL (+ V_H) for all k → kin_ion.h5.
 
-**Default output is ``H_DFT − V_xc``**: kinetic + ionic (local and
-nonlocal) *and* the mean-field Hartree potential, all evaluated exactly
-on the plane-wave/FFT grid.  The file is stamped ``has_hartree=True`` and
-the GW driver then skips its own ``sig_h`` so nothing is double counted
-(see :func:`file_io.kin_ion.kin_ion_has_hartree`).
+**By default this writes TWO datasets** and never mixes them:
 
-Why V_H belongs here and not in the ISDF Σ stage
-------------------------------------------------
+``kin_ion``   (nk, nb, nb) — ``T + V_loc + V_NL``, **pristine**.
+``v_hartree`` (nk, nb, nb) — the exact FFT-grid ⟨mk|V_H|nk⟩, Ry.
+
+Keeping them apart is what makes one file serve every consumer: the same
+``kin_ion.h5`` feeds a run that wants the exact V_H (``hartree_source=
+stored``) and one that wants the ISDF quadrature (``isdf``), the VH
+column of ``sigma_diag.dat`` stops reading 0.000 by construction, and a
+QSGW band rotation gets the **full matrix** rather than a diagonal it
+cannot transform.  At 12×12 / 80 bands the extra array is ~15 MB.
+
+``--no-hartree`` skips V_H entirely (ionic-only file, ISDF route
+mandatory).  ``--fold-hartree`` reproduces the legacy pre-``v_hartree``
+format that added V_H *into* ``kin_ion`` and stamped ``has_hartree=True``;
+it exists only to regenerate old artifacts bit-for-bit.
+
+Which V_H source to use — read this before trusting an eqp number
+-----------------------------------------------------------------
 ``H₀ = ⟨T+V_ion+V_NL⟩ + ⟨V_H⟩`` is a catastrophic cancellation: for MoS₂
-the two terms are −502 eV and +461 eV and their sum is −42 eV.  The
-first was always exact (plane waves); the second used to be an ISDF
-centroid quadrature, so a few-percent basis error landed on H₀ as tens
-of eV and wrecked every QP energy while every stage still reported
-success.  Evaluating ⟨mk|V_H|nk⟩ here — the same ``compute_local_V_k``
-route V_loc already takes — closes that cancellation analytically inside
-one routine and makes eqp0 **independent of the centroid count**.
+the two terms are −502 eV and +461 eV and their sum is −42 eV, so V_H's
+*relative* accuracy is H₀'s accuracy in absolute eV.
+
+* **stored / gspace (exact FFT-grid).**  ⟨mk|V_H|nk⟩ through the same
+  ``compute_local_V_k`` route V_loc takes: analytically exact and
+  centroid-count independent.  Pinned to QE's ``kih.dat`` at rms
+  1e-4 eV.  Built here by a serial, single-process, k-sequential
+  density accumulation — that, not accuracy, is its limitation.
+* **isdf (V_q[0] tile).**  Costs nothing extra, inherits the GW run's
+  full P-way distribution, recomputable in-loop for QSGW.  Measured vs
+  the exact route (MoS₂, scorecard §S.5): ~1 % on the occupied manifold
+  at 6 centroids per ζ-fit band, 0.11–0.20 % from 9 c/band upward —
+  where it **plateaus** (2.5× more centroids, and a 1e-12 rank cutoff
+  instead of 1e-8, each buy <5 % relative).
+
+The plateau is why the exact sources exist.  A 0.5 % V_H error is 2 eV
+of H₀, and the VBM and CBM errors do not cancel: on the MoS₂ 12×12 at
+606 centroids the ISDF route is 0.54 % rms over the occupied manifold
+and that is +1.91 eV on the VBM and −2.25 eV on the CBM at K — **4.15 eV
+on the band gap**.  50 meV QP energies need V_H to ~1e-4 relative, two
+orders past the plateau.
 
 Every physical convention is inherited from the run's own input deck
 (``sys_dim`` → Coulomb truncation, ``nval``/``ncond``/``nband`` → band
@@ -57,6 +82,7 @@ from psp.get_DFT_mtxels import (
     valence_density_from_kpoint,
 )
 from psp.operator_checks import validate_operator_inputs
+from file_io.kin_ion import HARTREE_DATASET
 import psp.vnl_ops as vnl_ops
 
 
@@ -131,7 +157,60 @@ def build_valence_density_chunked(wfn, sym, meta, nocc: int, print_fn=print):
     return rho
 
 
-def main(argv=None):
+def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
+                           nb: int, print_fn=print):
+    """The exact FFT-grid ⟨mk|V_H|nk⟩ for all k — **(nk, nb, nb) Ry**.
+
+    SINGLE SOURCE for the two exact-V_H consumers: this CLI (which
+    stores the result as ``kin_ion.h5``'s ``v_hartree`` dataset) and the
+    driver's ``hartree_source=gspace`` route, which rebuilds it in
+    memory.  Both must produce the same numbers or the ``stored`` and
+    ``gspace`` sources would disagree, so there is exactly one
+    implementation.
+
+    Needs no pseudopotentials: ρ comes from ψ, V_H from the Poisson
+    solve, and the matrix element from the same ``compute_local_V_k``
+    route V_loc takes.  ``truncation_2d`` MUST be the run's own
+    convention (deck ``sys_dim``); mixing it with V_loc's is a large
+    systematic error inside a ~500 eV cancellation.
+
+    Returns the FULL matrix, not the diagonal: a QSGW band rotation
+    needs ⟨m|V_H|n⟩ off-diagonals to transform H₀ into the QP basis.
+    """
+    nocc = int(wfn.nelec)
+    if nocc > nb:
+        raise ValueError(
+            f"V_H needs the {nocc} occupied bands but only {nb} were requested")
+    print_fn(f"\nBuilding valence density from {nocc} occupied bands...")
+    rho_r = build_valence_density_chunked(wfn, sym, meta, nocc,
+                                          print_fn=print_fn)
+    V_H_r = build_hartree_potential(
+        rho_r, wfn,
+        truncation_2d=bool(truncation_2d),
+        expected_electrons=spin_degeneracy_factor(wfn) * float(nocc),
+        print_fn=print_fn,
+    )
+    V_H_r = jnp.asarray(V_H_r, dtype=jnp.float64)
+    del rho_r
+
+    v_h_all = np.zeros((sym.nk_tot, nb, nb), dtype=np.complex128)
+    for ik in range(sym.nk_tot):
+        if ik % 32 == 0:
+            print_fn(f"    V_H matrix: k={ik + 1}/{sym.nk_tot}...")
+        wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)
+        Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
+        v_h_all[ik] = np.asarray(compute_local_V_k(
+            wfn_k, Gk_crys, V_H_r, wfn.cell_volume, g_mask=None))
+        del wfn_k
+    return v_h_all
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    """The CLI's argument parser.
+
+    Split out of :func:`main` so the V_H defaults are pinnable by a unit
+    test without running the generator.
+    """
     argp = argparse.ArgumentParser(description="Chunked kin+ion computation")
     argp.add_argument("-i", "--input", required=True, help="cohsex / GW input file")
     argp.add_argument("-o", "--output", default=None, help="output HDF5 (default: kin_ion.h5)")
@@ -142,14 +221,50 @@ def main(argv=None):
     argp.add_argument("--pseudo_dir", default=None,
                       help="directory containing *.upf files (default: input file dir)")
     argp.add_argument("--hartree", dest="hartree", action="store_true", default=True,
-                      help="fold the exact mean-field V_H into kin_ion (DEFAULT)")
+                      help="DEFAULT: also compute the exact FFT-grid ⟨mk|V_H|nk⟩ and "
+                           "store it as the SEPARATE 'v_hartree' array (kin_ion "
+                           "itself stays pristine T+V_loc+V_NL)")
     argp.add_argument("--no-hartree", dest="hartree", action="store_false",
-                      help="legacy mode: T+V_loc+V_NL only; the GW run then adds "
-                           "its own ISDF V_H (centroid-count dependent H0)")
-    args = argp.parse_args(argv)
+                      help="skip V_H entirely: the file carries T+V_loc+V_NL only and "
+                           "the GW run must supply V_H from the ISDF V_q[0] tile")
+    argp.add_argument("--fold-hartree", dest="fold_hartree", action="store_true",
+                      default=False,
+                      help="LEGACY/compat: add V_H INTO the kin_ion values and stamp "
+                           "has_hartree=True (the pre-'v_hartree' format).  Only for "
+                           "reproducing old artifacts — the stored-array default is "
+                           "strictly better (kin_ion stays reusable, QSGW gets the "
+                           "full matrix, and the VH column stops reading 0.000).")
+    return argp
+
+
+def main(argv=None):
+    args = build_argparser().parse_args(argv)
 
     timing.reset()
     print("== kin_ion_io ==")
+
+    # ---- this generator is SINGLE-PROCESS; say so instead of racing ----
+    # Every array below is built on device 0 through a 1x1 mesh
+    # (``load_kpoint_fftbox`` passes ``sharding=None``), the k loop is a
+    # host-side Python loop, and the output accumulator is a plain numpy
+    # array written by whoever gets there.  Launched under ``srun -n P``
+    # that is P processes doing identical work and then overwriting one
+    # another's ``kin_ion.h5`` — a silently truncated or interleaved file
+    # with rc=0.  Refuse loudly rather than produce it.  (Distributing it
+    # is a real and worthwhile change — see the strong-scaling audit in
+    # the scorecard — but it is not what this guard is for.)
+    _nproc = int(os.environ.get(
+        "JAX_PROCESS_COUNT",
+        os.environ.get("JAX_NUM_PROCESSES",
+                       os.environ.get("SLURM_NTASKS", "1"))))
+    if _nproc > 1 and not os.environ.get("LORRAX_KIN_ION_ALLOW_MULTIPROC"):
+        raise SystemExit(
+            f"gw.kin_ion_io is a single-process generator but the launcher "
+            f"advertises {_nproc} processes (SLURM_NTASKS / "
+            f"JAX_PROCESS_COUNT).  Every rank would redo the whole "
+            f"calculation and overwrite the same output file.  Run it with "
+            f"one task (`srun -n 1` / `#SBATCH -n 1`).")
+
     input_dir = os.path.dirname(os.path.abspath(args.input))
 
     # ---- parse input: the deck is the single source of truth ----
@@ -290,25 +405,17 @@ def main(argv=None):
     # SAME Coulomb convention as V_loc above (``ctx.truncation_2d``, i.e.
     # the deck's sys_dim) — which is also QE's, since the DFT run that
     # produced E_DFT/vxc.dat used ``assume_isolated='2D'`` for a slab.
-    V_H_r = None
+    v_h_all = None
     if args.hartree:
-        nocc = int(wfn.nelec)
-        if nocc > nb_eff:
-            raise SystemExit(
-                f"--hartree needs the {nocc} occupied bands but only "
-                f"{nb_eff} were requested")
-        print(f"\nBuilding valence density from {nocc} occupied bands...")
         with timing.section("build_V_H"):
-            rho_r = build_valence_density_chunked(wfn, sym, meta, nocc)
-            V_H_r = build_hartree_potential(
-                rho_r, wfn,
-                truncation_2d=ctx.truncation_2d,
-                expected_electrons=spin_degeneracy_factor(wfn) * float(nocc),
-            )
-            V_H_r = jnp.asarray(V_H_r, dtype=jnp.float64)
-            del rho_r
+            v_h_all = compute_hartree_matrix(
+                wfn, sym, meta, truncation_2d=ctx.truncation_2d, nb=nb_eff)
 
     # ---- compute kin+ion per k-point ----
+    # ``kin_ion`` stays PRISTINE (T + V_loc + V_NL) unless --fold-hartree
+    # is given: V_H rides along as its own dataset so the same file can
+    # feed a run that wants the exact V_H and one that wants the ISDF
+    # quadrature, and so a QSGW rotation has the full ⟨m|V_H|n⟩ matrix.
     out_path = args.output or os.path.join(input_dir, "kin_ion.h5")
     kin_ion_all = np.zeros((sym.nk_tot, nb_eff, nb_eff), dtype=np.complex128)
 
@@ -322,15 +429,18 @@ def main(argv=None):
             kvec = sym.unfolded_kpts[ik]
             Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
 
-            H_k = get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn,
-                                V_H_r=V_H_r)
+            H_k = get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn)
             kin_ion_all[ik] = np.asarray(H_k)
             del wfn_k
+
+    folded = bool(args.fold_hartree and v_h_all is not None)
+    if folded:
+        kin_ion_all = kin_ion_all + v_h_all
 
     # ---- write output ----
     print(f"\nWriting to {out_path}...")
     desc = ("T + V_loc + V_NL + V_H matrix elements (H_DFT - V_xc)"
-            if args.hartree else "T + V_loc + V_NL matrix elements")
+            if folded else "T + V_loc + V_NL matrix elements")
     with timing.section("write_h5"):
         with h5py.File(out_path, "w") as f:
             ds = f.create_dataset("kin_ion", data=kin_ion_all, dtype=np.complex128)
@@ -341,11 +451,14 @@ def main(argv=None):
             ds.attrs["truncation_2d"] = ctx.truncation_2d
             ds.attrs["pseudopotentials"] = str(list(pseudos.keys()))
             # ---- provenance: everything a consumer must agree with ----
-            # ``has_hartree`` is the contract flag: when True the GW
-            # driver MUST NOT add its own ``sig_h`` (double counting).
-            ds.attrs["has_hartree"] = bool(args.hartree)
+            # ``has_hartree`` means the LEGACY fold-in: V_H is inside the
+            # kin_ion VALUES and no consumer may add another.  It stays
+            # False for the stored-array default, which is what makes the
+            # new format safe for old readers (they see pristine kin_ion
+            # and correctly supply their own ISDF V_H).
+            ds.attrs["has_hartree"] = folded
             ds.attrs["hartree_truncation_2d"] = bool(
-                ctx.truncation_2d) if args.hartree else False
+                ctx.truncation_2d) if folded else False
             ds.attrs["input_file"] = os.path.basename(args.input)
             ds.attrs["wfn_file"] = os.path.basename(wfn_path)
             ds.attrs["nval"] = nval
@@ -355,13 +468,28 @@ def main(argv=None):
             ds.attrs["bispinor"] = bool(bispinor)
             ds.attrs["nspinor"] = int(wfn.nspinor)
             ds.attrs["fft_grid"] = np.asarray(meta.fft_grid, dtype=np.int32)
+            if v_h_all is not None and not folded:
+                vh = f.create_dataset(HARTREE_DATASET, data=v_h_all,
+                                      dtype=np.complex128)
+                vh.attrs["description"] = (
+                    "<mk|V_H|nk> (Ry), exact FFT-grid mean-field Hartree; "
+                    "NOT included in the 'kin_ion' dataset")
+                vh.attrs["truncation_2d"] = bool(ctx.truncation_2d)
+                vh.attrs["nocc"] = int(wfn.nelec)
+                vh.attrs["fft_grid"] = np.asarray(meta.fft_grid, dtype=np.int32)
 
-    print(f"Wrote {os.path.basename(out_path)}: shape {kin_ion_all.shape}, "
-          f"sys_dim={sys_dim}, has_hartree={bool(args.hartree)}")
-    if args.hartree:
+    _src = ("FOLDED into kin_ion (legacy)" if folded else
+            (f"stored as '{HARTREE_DATASET}'" if v_h_all is not None
+             else "absent (ISDF route required)"))
+    print(f"Wrote {os.path.basename(out_path)}: kin_ion {kin_ion_all.shape}, "
+          f"sys_dim={sys_dim}, V_H {_src}")
+    if v_h_all is not None:
         d0 = np.real(np.diagonal(kin_ion_all[0])) * 13.605693122994
-        print("  H0 diag (eV), k=0, first 8 bands: "
+        v0 = np.real(np.diagonal(v_h_all[0])) * 13.605693122994
+        print("  kin_ion diag (eV), k=0, first 8: "
               + "  ".join(f"{v:.4f}" for v in d0[:8]))
+        print("  V_H     diag (eV), k=0, first 8: "
+              + "  ".join(f"{v:.4f}" for v in v0[:8]))
     timing.report(title="--- Timing (seconds) ---")
     return 0
 

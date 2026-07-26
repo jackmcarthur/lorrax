@@ -203,6 +203,18 @@ _DEFAULTS = {
     # Empty string == "not set" (cfg.centroids_file_current is None then).
     "centroids_file_current": "",
     "kin_ion_file": "kin_ion.h5",
+    # Where H0's mean-field Hartree term comes from.  H0 = kin_ion + V_H is
+    # a ~500 eV cancellation, so this is an explicit, validated choice
+    # rather than something inferred from what happens to be on disk.
+    #   auto   — stored 'v_hartree' array in kin_ion.h5 if present, else
+    #            the legacy folded file if that is what it is, else isdf
+    #   stored — require the exact array in kin_ion.h5 (raises if absent)
+    #   isdf   — the ISDF V_q[0] tile (cohsex_sigma's Hartree kernel);
+    #            distributed and in-loop capable, centroid-count dependent
+    #   gspace — rebuild the exact FFT-grid matrix on the fly this run
+    # See file_io/kin_ion.py's module docstring for the full contract and
+    # the scorecard's S.5 table for the accuracy each buys.
+    "hartree_source": "auto",
     # Three human-readable text outputs (always written):
     #   sigma_diag.dat — LORRAX-native per-(k,n) Σ-decomposition dump.
     #   eqp0.dat       — BGW-format zeroth-order QP energies.
@@ -940,6 +952,8 @@ class LorraxConfig:
     ncond: int
     nband: int
     sys_dim: int
+    #: auto | stored | isdf | gspace — see HARTREE_SOURCES.
+    hartree_source: str
 
     # --- Core mode flags (top-level; hot path) ---
     restart: bool
@@ -1473,6 +1487,16 @@ class LorraxConfig:
             zeta_rcond=float(_g("zeta_rcond")),
             gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
         )
+        # Validate the V_H source at PARSE time, not at the read that
+        # would otherwise fail 20 minutes into a 40-node run.
+        from file_io.kin_ion import HARTREE_SOURCES
+        _hartree_source = str(_g("hartree_source") or "auto").strip().lower()
+        if _hartree_source not in HARTREE_SOURCES:
+            raise ValueError(
+                f"hartree_source={_hartree_source!r} is not one of "
+                f"{HARTREE_SOURCES}.  H0 = kin_ion + V_H is a ~500 eV "
+                "cancellation; this key is not guessed.")
+
         debug = DebugConfig(
             sigma_freq_debug_output=bool(_g("sigma_freq_debug_output")),
             sigma_freq_debug_file=str(_g("sigma_freq_debug_file")),
@@ -1491,6 +1515,7 @@ class LorraxConfig:
             ncond=int(_g("ncond")),
             nband=int(_g("nband")),
             sys_dim=int(_g("sys_dim")),
+            hartree_source=_hartree_source,
             restart=bool(_g("restart")),
             compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
             qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
