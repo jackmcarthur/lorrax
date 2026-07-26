@@ -39,6 +39,10 @@ sys.path.insert(0, os.path.join(
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_ENABLE_X64", "1")
+# Four emulated host devices so the sharded-reduction test exercises a real
+# multi-device global array (the production case) instead of skipping.
+os.environ.setdefault("XLA_FLAGS",
+                      "--xla_force_host_platform_device_count=4")
 
 import h5py                                          # noqa: E402
 import jax                                           # noqa: E402
@@ -159,10 +163,34 @@ def test_off_switch_skips_device_work():
 # 2/3. HDF5 provenance guards on zeta_q.h5
 # ---------------------------------------------------------------------------
 
+_FIXTURE_WFN = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "regression", "cohsex_debug", "WFNsmall.h5")
+
+
+def _fixture_fft_grid():
+    """FFT grid of the regression WFN, so both headers agree."""
+    with h5py.File(_FIXTURE_WFN, "r") as f:
+        return tuple(int(v) for v in f["mf_header/gspace/FFTgrid"][:])
+
+
 def _make_zeta_h5(path, *, n_rmu, n_q=2, ngkmax=7, done=True,
-                  fft_grid=(8, 8, 8), layout="G_flat"):
-    """Minimal zeta_q.h5 carrying just what the guards read."""
+                  fft_grid=None, layout="G_flat", with_mf_header=True):
+    """Minimal zeta_q.h5 carrying just what the guards read.
+
+    ``ZetaLoader`` reads BOTH headers at open (``mf_header`` for the
+    crystal/k-grid surface, ``isdf_header`` for the centroid surface), so
+    a fixture with only the latter fails in the reader before reaching
+    any gate.  The mf_header is copied verbatim from the read-only
+    regression WFN using the same ``copy_mf_header`` helper the
+    production ζ writer uses — the source is opened read-only and never
+    modified.
+    """
     from file_io.isdf_header import IsdfHeader, write_isdf_header
+    from file_io.mf_header import copy_mf_header
+
+    if fft_grid is None:
+        fft_grid = _fixture_fft_grid()
 
     idx = np.stack(np.meshgrid(
         np.arange(n_rmu) % fft_grid[0],
@@ -184,6 +212,8 @@ def _make_zeta_h5(path, *, n_rmu, n_q=2, ngkmax=7, done=True,
                              data=np.zeros((n_q, 64, n_rmu),
                                            dtype=np.complex128))
     write_isdf_header(path, hdr, mode="a")
+    if with_mf_header:
+        copy_mf_header(_FIXTURE_WFN, path, dst_mode="a")
     return path
 
 
@@ -196,14 +226,14 @@ def test_zeta_basis_guard_sees_gflat_dataset():
     """
     from gw.gw_init import _check_zeta_h5_matches_basis
     with tempfile.TemporaryDirectory() as d:
+        grid = _fixture_fft_grid()
         p = _make_zeta_h5(os.path.join(d, "zeta_q.h5"), n_rmu=276)
         # Matching basis ⇒ silent.
-        _check_zeta_h5_matches_basis(p, 276, print_fn=_Log(),
-                                     fft_grid=(8, 8, 8))
+        _check_zeta_h5_matches_basis(p, 276, print_fn=_Log(), fft_grid=grid)
         # Mismatched basis ⇒ must raise.
         try:
             _check_zeta_h5_matches_basis(p, 606, print_fn=_Log(),
-                                         fft_grid=(8, 8, 8))
+                                         fft_grid=grid)
         except ValueError as exc:
             assert "n_mu=276" in str(exc)
         else:
@@ -214,8 +244,9 @@ def test_zeta_basis_guard_sees_gflat_dataset():
 def test_zeta_basis_guard_catches_wrong_fft_grid():
     from gw.gw_init import _check_zeta_h5_matches_basis
     with tempfile.TemporaryDirectory() as d:
-        p = _make_zeta_h5(os.path.join(d, "zeta_q.h5"), n_rmu=16,
-                          fft_grid=(8, 8, 8))
+        # File built on the fixture's (large) grid; the run claims a
+        # much smaller one, so the stored centroid indices fall outside it.
+        p = _make_zeta_h5(os.path.join(d, "zeta_q.h5"), n_rmu=16)
         try:
             _check_zeta_h5_matches_basis(p, 16, print_fn=_Log(),
                                          fft_grid=(4, 4, 4))
@@ -230,7 +261,8 @@ def test_zeta_basis_guard_warns_on_incomplete():
     log = _Log()
     with tempfile.TemporaryDirectory() as d:
         p = _make_zeta_h5(os.path.join(d, "zeta_q.h5"), n_rmu=16, done=False)
-        _check_zeta_h5_matches_basis(p, 16, print_fn=log, fft_grid=(8, 8, 8))
+        _check_zeta_h5_matches_basis(p, 16, print_fn=log,
+                                     fft_grid=_fixture_fft_grid())
     assert "zeta_is_done=False" in log.text, log.text
 
 
@@ -274,6 +306,25 @@ def test_zeta_loader_accepts_complete_file():
 
 
 # ---------------------------------------------------------------------------
+# 3b. The eqp mean-field window is single-sourced from gw_output
+# ---------------------------------------------------------------------------
+
+def test_implied_vxc_window_is_sourced_from_gw_output():
+    """With the driver importable, the writer must adopt ITS window.
+
+    The pure-python suite can only check the fallback literals (it runs
+    without jax, so ``gw.gw_output`` is unimportable there).  Here the real
+    module is available, so this pins the actual single-sourcing: if N's
+    work retunes the physical V_xc window, the writer-side gate follows
+    automatically instead of silently drifting.
+    """
+    from gw import eqp_bgw, gw_output
+    lo, hi = eqp_bgw._implied_vxc_window_ev()
+    assert lo == float(gw_output._VXC_IMPLIED_MIN_EV), (lo, hi)
+    assert hi == float(gw_output._VXC_IMPLIED_MAX_EV), (lo, hi)
+
+
+# ---------------------------------------------------------------------------
 # 4. Collective barrier + fail-fast hook
 # ---------------------------------------------------------------------------
 
@@ -287,12 +338,35 @@ def test_barrier_single_process_is_noop():
 
 
 def test_failfast_hook_not_installed_single_process():
-    """The hook must stay OFF in single-process runs (normal tracebacks)."""
+    """The hook must stay OFF in single-process runs (normal tracebacks).
+
+    ``SLURM_NTASKS`` is inherited from the batch script even when this
+    suite runs on one rank, so the single-process condition is forced
+    here rather than read from the ambient environment — otherwise the
+    assertion silently no-ops under sbatch and tests nothing.  The
+    install sentinel is cleared too, since an earlier test in the same
+    interpreter may have set it.
+    """
     import runtime
-    before = sys.excepthook
-    runtime.install_failfast_excepthook()
-    if int(os.environ.get("SLURM_NTASKS", "1")) <= 1:
-        assert sys.excepthook is before
+    prev_n = os.environ.get("SLURM_NTASKS")
+    prev_hook = sys.excepthook
+    had_sentinel = getattr(sys, "_lorrax_failfast_installed", False)
+    os.environ["SLURM_NTASKS"] = "1"
+    if had_sentinel:
+        del sys._lorrax_failfast_installed
+    try:
+        runtime.install_failfast_excepthook()
+        assert sys.excepthook is prev_hook, (
+            "fail-fast hook installed in a single-process run; it would "
+            "replace normal tracebacks with os._exit(1) for no reason")
+    finally:
+        sys.excepthook = prev_hook
+        if had_sentinel:
+            sys._lorrax_failfast_installed = True
+        if prev_n is None:
+            os.environ.pop("SLURM_NTASKS", None)
+        else:
+            os.environ["SLURM_NTASKS"] = prev_n
 
 
 def test_failfast_hook_respects_optout():
@@ -302,10 +376,17 @@ def test_failfast_hook_respects_optout():
     os.environ["SLURM_NTASKS"] = "4"
     os.environ["LORRAX_FAILFAST"] = "0"
     before = sys.excepthook
+    had_sentinel = getattr(sys, "_lorrax_failfast_installed", False)
+    if had_sentinel:
+        del sys._lorrax_failfast_installed
     try:
         runtime.install_failfast_excepthook()
-        assert sys.excepthook is before
+        assert sys.excepthook is before, (
+            "LORRAX_FAILFAST=0 did not suppress hook installation")
     finally:
+        sys.excepthook = before
+        if had_sentinel:
+            sys._lorrax_failfast_installed = True
         for k, v in (("SLURM_NTASKS", prev_n), ("LORRAX_FAILFAST", prev_f)):
             if v is None:
                 os.environ.pop(k, None)

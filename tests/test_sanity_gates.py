@@ -357,6 +357,106 @@ def test_eqp_writer_gate_fires_on_nan_input():
 
 
 # ---------------------------------------------------------------------------
+# The eqp mean-field gate — REGRESSION for the miscalibrated first version
+# ---------------------------------------------------------------------------
+
+def _capture(fn):
+    """Run ``fn`` capturing stdout (the gate's default print_fn)."""
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        out = fn()
+    return out, buf.getvalue()
+
+
+def test_eqp_gate_silent_on_large_but_legitimate_qp_shift():
+    """A deep semicore state has |eqp0 - E_DFT| >> 50 eV and is CORRECT.
+
+    This is the exact false positive the first version of this gate
+    produced: it bracketed the raw QP shift at +/-50 eV and fired on 72 of
+    120 states of the cohsex_debug fixture -- a run that reproduced its
+    reference eqp to 1e-6 eV in the same job.  Delta = Sigma_xc - V_xc, and
+    for semicore bands both terms are of order 100 eV, so the shift is
+    legitimately huge while the mean-field identity stays perfectly
+    physical.  The gate must key on the identity, not the shift.
+    """
+    nk, nb = 2, 3
+    e_dft = np.array([[-59.16, -33.86, -3.08]] * nk)
+    v_h = np.array([[254.64, 337.41, 161.70]] * nk)
+    implied_vxc = np.full((nk, nb), -18.0)          # healthy
+    kin_ion = e_dft - v_h - implied_vxc
+    sigma_x = np.array([[-103.0, -88.0, -21.0]] * nk)   # bare exchange
+    sigma_c = np.zeros((nk, nb))
+
+    def run():
+        eqp_bgw._warn_on_unphysical_implied_vxc(
+            e_dft_ev=e_dft, kin_ion_diag_ev=kin_ion, hartree_diag_ev=v_h)
+        return eqp_bgw.compute_eqp_diag(
+            kin_ion_diag_ev=kin_ion, hartree_diag_ev=v_h,
+            sigma_x_diag_ev=sigma_x, sigma_c_at_dft_diag_ev=sigma_c,
+            e_dft_ev=e_dft)
+    (eqp0, _), out = _with_level("1", lambda: _capture(run))
+
+    shift = eqp0 - e_dft
+    assert np.max(np.abs(shift)) > 50.0, (
+        "test is not exercising the large-shift regime")
+    assert "LORRAX SANITY FAILURE" not in out, (
+        f"gate fired on a healthy run with a legitimately large QP shift:\n{out}")
+
+
+def test_eqp_gate_fires_on_broken_mean_field():
+    """A broken kin_ion + V_H cancellation must still be caught."""
+    nk, nb = 2, 3
+    e_dft = np.array([[-59.16, -33.86, -3.08]] * nk)
+    v_h = np.array([[254.64, 337.41, 161.70]] * nk)
+    # 46 eV of ISDF error in V_H -> implied Vxc leaves the physical window,
+    # which is the 2026-07 production signature.
+    kin_ion = e_dft - v_h - np.full((nk, nb), -18.0) + 60.0
+    sigma_x = np.array([[-103.0, -88.0, -21.0]] * nk)
+
+    def run():
+        eqp_bgw._warn_on_unphysical_implied_vxc(
+            e_dft_ev=e_dft, kin_ion_diag_ev=kin_ion, hartree_diag_ev=v_h)
+    _, out = _with_level("1", lambda: _capture(run))
+    assert "LORRAX SANITY FAILURE" in out, out
+    assert "implied Vxc" in out, out
+
+
+def test_compute_eqp_diag_does_not_duplicate_the_mean_field_gate():
+    """The shared math function must stay silent about H0.
+
+    On the live driver path ``gw_output.write_results`` already runs
+    ``_warn_on_unphysical_h0`` on these same arrays immediately before
+    calling the writer.  Putting the check in ``compute_eqp_diag`` too
+    made a single broken H0 report itself twice, in two different
+    wordings — verified against the cohsex_debug fixture, where both
+    fired on the identical 86 of 120 states.  The gate belongs to
+    ``make_eqp_bgw`` (the post-hoc CLI, which has no other guard).
+    """
+    nk, nb = 2, 3
+    e_dft = np.array([[-59.16, -33.86, -3.08]] * nk)
+    v_h = np.array([[254.64, 337.41, 161.70]] * nk)
+    kin_ion = e_dft - v_h - np.full((nk, nb), -18.0) + 60.0   # broken H0
+
+    def run():
+        return eqp_bgw.compute_eqp_diag(
+            kin_ion_diag_ev=kin_ion, hartree_diag_ev=v_h,
+            sigma_x_diag_ev=np.zeros((nk, nb)),
+            sigma_c_at_dft_diag_ev=np.zeros((nk, nb)),
+            e_dft_ev=e_dft)
+    _, out = _with_level("1", lambda: _capture(run))
+    assert "LORRAX SANITY FAILURE" not in out, (
+        f"compute_eqp_diag duplicated the driver-side H0 guard:\n{out}")
+
+
+def test_eqp_gate_window_matches_gw_output():
+    """The writer-side window must not drift from the driver-side guard."""
+    lo, hi = eqp_bgw._implied_vxc_window_ev()
+    assert (lo, hi) == (-50.0, 2.0), (lo, hi)
+
+
+# ---------------------------------------------------------------------------
 # common.collectives.barrier — single-process semantics
 # ---------------------------------------------------------------------------
 

@@ -260,6 +260,64 @@ def compute_z_factor_from_omega_grid(
 	return sigma_c_at_dft, z_factor
 
 
+def _implied_vxc_window_ev() -> tuple[float, float]:
+	"""The physical window for ``V_xc = E_DFT − (kin_ion + V_H)``, in eV.
+
+	Single-sources the bounds from ``gw.gw_output`` when that module
+	exposes them, so the writer-side gate and the driver-side
+	``_warn_on_unphysical_h0`` can never drift apart.  The literals below
+	are the same numbers, kept as a fallback so this module stays
+	importable on its own (the post-hoc ``python -m gw.eqp_bgw`` CLI does
+	not otherwise need the driver).
+	"""
+	try:
+		from . import gw_output as _gwo
+		return (float(getattr(_gwo, "_VXC_IMPLIED_MIN_EV", -50.0)),
+		        float(getattr(_gwo, "_VXC_IMPLIED_MAX_EV", 2.0)))
+	except ImportError:
+		return (-50.0, 2.0)
+
+
+def _warn_on_unphysical_implied_vxc(
+	*, e_dft_ev, kin_ion_diag_ev, hartree_diag_ev,
+) -> None:
+	"""Gate the mean-field side of eqp{0,1} on the DFT eigenvalue identity.
+
+	``E_DFT = ⟨T+V_ion+V_NL⟩ + ⟨V_H⟩ + ⟨V_xc⟩`` is exact, so a correct run
+	must reproduce a physical ``V_xc = E_DFT − (kin_ion + V_H)``
+	band-by-band.  That is the invariant this checks.
+
+	Why not check the QP shift itself.  The first version of this gate
+	bracketed ``Δ = eqp0 − E_DFT`` at ±50 eV, reasoning that GW moves
+	states by a few eV.  That is **wrong for deep states**: Δ = Σ_xc −
+	V_xc, and semicore bands carry bare-exchange Σ_x of order −100 eV
+	against an equally large V_xc, so a perfectly healthy run legitimately
+	shows |Δ| ≫ 50 eV.  It fired on 72 of 120 states of the cohsex_debug
+	fixture — a run that simultaneously reproduced its reference eqp to
+	1e-6 eV.  The implied-V_xc form has no such sensitivity: the large,
+	legitimate Σ_xc cancels out of it entirely, because Σ never enters.
+
+	This is deliberately the same invariant, and the same window, as
+	``gw_output._warn_on_unphysical_h0``.  That one guards the live driver
+	path; this one additionally covers the post-hoc ``make_eqp_bgw`` CLI,
+	which rebuilds eqp{0,1} from ``kin_ion.h5`` + ``sigma_mnk.h5`` on disk
+	— exactly the stale-artifact scenario — and had no guard at all.  It
+	is warn-only and prints nothing on a healthy run, so it adds no noise
+	where the driver already reports.
+	"""
+	from common import sanity
+
+	if not sanity.sanity_enabled():
+		return
+	implied_vxc = (np.asarray(e_dft_ev, dtype=np.float64)
+	               - (np.asarray(kin_ion_diag_ev, dtype=np.float64)
+	                  + np.real(np.asarray(hartree_diag_ev))))
+	lo, hi = _implied_vxc_window_ev()
+	sanity.check_in_range(
+		"implied Vxc = E_DFT − (kin_ion + V_H)", implied_vxc, lo, hi,
+		unit="eV")
+
+
 def compute_eqp_diag(
 	*,
 	kin_ion_diag_ev: np.ndarray,        # (nk, nb)
@@ -290,21 +348,13 @@ def compute_eqp_diag(
 		kin_ion_diag_ev + hartree_diag_ev + sigma_xc_at_dft - e_dft_ev
 	).real
 
-	# ── QP-shift bracket ─────────────────────────────────────────────
-	# Δ = eqp0 − E_DFT is the *entire* GW correction.  Physically it is a
-	# few eV: BGW/LORRAX MoS₂ gaps move by ~1–3 eV, and no pseudopotential
-	# G0W0 calculation produces a tens-of-eV shift.  The 2026-07 runs
-	# emitted a QP gap of −136 eV through every "successful" stage; the
-	# number that was wrong is exactly this one, and it is available here,
-	# in the one function both the live writer and the post-hoc CLI share.
-	# ±50 eV is deliberately far outside anything defensible, so a fire
-	# here always means H₀ or Σ is broken — most often the kin_ion + V_H
-	# cancellation (see gw_output._warn_on_unphysical_h0, which diagnoses
-	# the mean-field side of the same failure).
-	from common import sanity
-	sanity.check_in_range(
-		"QP shift Δ = eqp0 − E_DFT", delta_at_dft, -50.0, 50.0, unit="eV")
-
+	# NOTE: the mean-field (implied-V_xc) gate deliberately does NOT live
+	# here.  ``compute_eqp_diag`` is shared by the live driver path, and
+	# there ``gw_output.write_results`` already runs
+	# ``_warn_on_unphysical_h0`` on these very arrays immediately before
+	# calling the writer — checking again would emit two identical
+	# complaints about one problem.  The gate is attached to
+	# :func:`make_eqp_bgw` instead, which is the path that has no guard.
 	eqp0 = e_dft_ev + delta_at_dft
 	if z_factor is None:
 		eqp1 = eqp0  # Z=1 trivially
@@ -501,6 +551,17 @@ def make_eqp_bgw(
 	sigma_x_diag = np.diagonal(sigma_x_irr, axis1=1, axis2=2)
 	hartree_diag = np.diagonal(hartree_irr, axis1=1, axis2=2)
 	sigma_c_omega_diag = np.diagonal(sigma_c_irr, axis1=2, axis2=3)  # (n_omega, nk, nb)
+
+	# Mean-field gate — this CLI is the unguarded path.  Unlike the live
+	# driver (where ``gw_output.write_results`` runs the same check just
+	# before writing), ``make_eqp_bgw`` rebuilds eqp{0,1} from whatever
+	# ``kin_ion.h5`` / ``sigma_mnk.h5`` happen to be sitting in
+	# ``run_dir`` — the stale-artifact scenario, with no guard at all.
+	_warn_on_unphysical_implied_vxc(
+		e_dft_ev=e_dft_ev,
+		kin_ion_diag_ev=kin_ion_diag_ev,
+		hartree_diag_ev=np.real(hartree_diag),
+	)
 
 	sigma_c_at_dft, z_factor = compute_z_factor_from_omega_grid(
 		sigma_c_omega_diag_ev=sigma_c_omega_diag,
