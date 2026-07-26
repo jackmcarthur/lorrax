@@ -210,6 +210,63 @@ class WfnLoader:
         # always returns the same ``jax.Array``.
         self._gvecs_dev_cache: dict[tuple, "jax.Array"] = {}
 
+        # ------------------------------------------------------------------
+        # Load-time symmetry MEASUREMENT (default ON).
+        #
+        # A WFN file states which spatial operations it *claims* and how
+        # its k-mesh was reduced, but never states whether time-reversal
+        # symmetry holds for the system.  Inferring that from flags
+        # (``ntran``, "is this a nosym deck") is what produced the
+        # ψ(r) → ψ*(−r) corruption of scorecard §Q, and several bugs
+        # before it.  Instead we build the spin-resolved charge density
+        # from the RAW IBZ wavefunctions and measure it: ``trs_holds``
+        # below is a MEASURED property of these coefficients, and
+        # ``SymMaps`` consults it before it will select any
+        # time-reversal row (see ``_sym_wfn_stub``).
+        #
+        # WHAT IS AND IS NOT ESTABLISHED BY ``self.trs_holds`` — read this
+        # before relying on it, and see the derivations it points at:
+        #   * MEASURED: whether the occupied manifold is time-reversal
+        #     invariant, via ``m_{−k}(r) = −m_k(r)`` summed over the ± k
+        #     pairs present in the file.  That identity involves NO
+        #     symmetry operation, NO fractional translation τ, NO umklapp
+        #     vector and NO ``U_spinor`` — so it is an INDEPENDENT check
+        #     on the unfold, not a restatement of it.  Derivation (T1)-(T5)
+        #     in ``common/density_symmetry_check.py``.
+        #   * ALSO MEASURED: that each claimed ``{S|τ}`` really leaves ρ
+        #     invariant.  Because ρ is a spinor TRACE, ``U_spinor`` and the
+        #     τ-phase cancel out of it, so this arm validates ``mtrx`` and
+        #     ``tnp`` only.
+        #   * NOT MEASURED: ``U_spinor`` and the τ-phase used by
+        #     ``unfold_psi`` (they cancel in ρ, see above), and TRS for
+        #     ``nspin == 2`` decks (this reader has no spin axis — coeffs
+        #     axis 1 is the spinor axis everywhere, so the two collinear
+        #     channels are not addressable and the check says so).
+        # The verdict reaches ``SymMaps`` through ``_sym_wfn_stub`` below;
+        # ``SymMaps`` is the ONLY consumer, and it is also the only place
+        # that can turn a time-reversal row into a conjugated ψ, so
+        # gating there covers every backend (eager / phdf5 / phdf5_host).
+        #
+        # Runs last in ``__init__`` because it needs ``nelec``,
+        # ``kweights``, ``box_index`` and the open file handle.  Cost is
+        # occupied-bands-only on a ±-closed k-subsample — order a second
+        # at fixture scale, ~5 s at 12x12 scale (measured, scorecard §U)
+        # — cached per (file, mtime, size) for the process.
+        # ``LORRAX_TRS_CHECK=0`` opts out; ``=strict`` raises instead of
+        # warning.
+        self.density_symmetry = None
+        self.trs_holds = True
+        self._run_density_symmetry_check()
+
+    def _run_density_symmetry_check(self) -> None:
+        """Measure TRS + the spatial symmetry table from ψ (see above)."""
+        from common.density_symmetry_check import cached_density_symmetry_check
+        report = cached_density_symmetry_check(self)
+        if report is None:
+            return
+        self.density_symmetry = report
+        self.trs_holds = bool(report.trs_holds)
+
     # ------------------------------------------------------------------
     def close(self) -> None:
         f = getattr(self, "_file", None)
@@ -330,6 +387,11 @@ class WfnLoader:
                 "ij,kj->ki",
                 np.linalg.inv(self.avec).T, self.atom_positions),
             fft_grid=self.fft_grid,
+            # MEASURED (not inferred) time-reversal verdict — see
+            # ``_run_density_symmetry_check``.  ``SymMaps`` refuses to
+            # select time-reversal rows when this is False, whatever the
+            # ``ntran``/k-weight flags imply.
+            trs_holds=bool(getattr(self, "trs_holds", True)),
         )
 
     def _resolve_k(self, k: KSpec) -> tuple[np.ndarray, bool]:

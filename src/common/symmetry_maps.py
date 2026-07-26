@@ -766,6 +766,42 @@ def unfold_psi(
         Equivalently: ψ_full = iσ_y · conj(spatial-form), per the per-element
         derivation in ``reports/trs_sym_audit_2026-05-14/pr3_design.md``.
 
+        WHY THE G-LIST IS NEGATED, AND WHY THAT IS HALF OF THE RULE.
+        Θ = iσ_y K is ANTIUNITARY. Acting on ψ_nk(r) = Σ_G c(G) e^{i(k+G)·r}:
+
+            (Θψ_nk)(r) = iσ_y ψ*_nk(r) = Σ_G [iσ_y c*(G)] e^{−i(k+G)·r}
+                       = Σ_{G'} [iσ_y c*(−G')] e^{i(−k+G')·r}   (G' = −G)
+
+            ⇒  c_{Θ,−k}(G') = iσ_y · conj( c(−G') ).                    (★)
+
+        (★) has TWO halves: the spinor factor ``iσ_y·conj`` (applied HERE)
+        and the negation of the G list (applied by the CALLER, because
+        ``sym_mats_k[sym_idx] = −S`` for a TRS row, so
+        ``WfnLoader.gvecs(k='full_bz')`` emits ``−S·G_kbar − kg0``).
+        Applying one half without the other replaces ψ(r) by ψ*(−r) —
+        norm-, orthogonality- and ⟨T⟩-preserving, hence invisible to every
+        cheap check, and wrong by O(100 eV) in V_loc/V_NL. That is exactly
+        the scorecard §Q bug, and it is why the length guard below is a
+        hard raise rather than a warning: the ONLY thing that keeps the two
+        halves in step is ``len(sym_mats_k) == 2·len(U_spinor_spatial)``.
+
+        NON-SYMMORPHIC τ UNDER TRS. ``tau_phase_row`` is fed ``S_full``
+        (= −S on a TRS row), so ``exp(−i (−S·G)·τ) = exp(+i (S·G)·τ)`` —
+        the conjugate of the spatial phase — which is what (★) demands
+        since the whole spatial expression is conjugated. There is no
+        separate τ for TRS rows and none is needed; ``translations`` is
+        indexed by ``s_spatial``. Verified end-to-end on the genuinely
+        non-symmorphic ``si_cohsex_debug`` deck (tnp = π ⇒ τ_frac = 1/2).
+
+        INDEPENDENT MEASUREMENT. Whether TRS holds AT ALL for a given file
+        is no longer inferred from ``ntran``/k-weights: it is measured from
+        the wavefunctions by ``common.density_symmetry_check`` (identity
+        (★★★) there: m_{−k}(r) = −m_k(r)), and a False verdict removes the
+        TRS rows from ``SymMaps``'s search set so this branch is never
+        reached. That measurement deliberately uses NO symmetry operation,
+        NO τ and NO U_spinor, so it is an independent check on this code
+        rather than a restatement of it.
+
         Implementation note: ``sym_mats_k[sym_idx]`` already encodes the
         ±S sign (TRS rows are ``-S``). Computing
         ``rotated = sym_mats_k[sym_idx] @ G_kbar`` and then
@@ -851,7 +887,7 @@ def unfold_psi(
 
 
 class SymMaps:
-    def __init__(self, wfn):
+    def __init__(self, wfn, *, allow_trs=None):
         """
         Initialize symmetry mappings for a given WFN file.
         class variables:
@@ -870,7 +906,31 @@ class SymMaps:
         
         Args:
             wfn: WFNReader instance
+            allow_trs: whether time-reversal rows of ``sym_mats_k`` may be
+                SELECTED when mapping the full BZ onto the IBZ.  ``None``
+                (default) takes the value from ``wfn.trs_holds`` — the
+                MEASURED verdict that ``WfnLoader`` obtains by building
+                the spin-resolved density from the raw IBZ wavefunctions
+                (``common.density_symmetry_check``) — falling back to
+                ``True`` (the historical, permissive behaviour) for
+                wfn-shaped objects that carry no verdict.
+
+                When False, ``sym_mats_k`` keeps its ``2·ntran`` length
+                (``unfold_psi`` hard-requires that shape — §Q) but the
+                k-mapping searches only the SPATIAL half, so
+                ``sym_idx_k`` / ``sym_idx_q`` can never name a
+                time-reversal row and no ψ is ever conjugated.  A
+                magnetic system whose file nevertheless claims a
+                TRS-reduced mesh therefore fails loudly instead of
+                silently returning iσ_y·conj(ψ).
         """
+        # Measured-TRS gate.  ``allow_trs=None`` → consult the wfn object;
+        # objects with no verdict (legacy WFNReader, hand-built stubs) get
+        # the permissive default so this is a pure no-op for them.
+        if allow_trs is None:
+            allow_trs = getattr(wfn, 'trs_holds', None)
+        self.trs_allowed = True if allow_trs is None else bool(allow_trs)
+
         # get symmetry matrices from wfn file
         try:
             ntran = int(getattr(wfn, 'ntran', 1))
@@ -896,6 +956,12 @@ class SymMaps:
             _sym_mats_k = self.sym_matrices.transpose(0, 2, 1).copy()
             self.sym_mats_k = np.concatenate(
                 [_sym_mats_k, -_sym_mats_k], axis=0)
+            # Rows this instance is ALLOWED to select (see ``trs_allowed``).
+            # In this branch ``sym_idx_k`` is identically zero anyway, so
+            # the restriction is documentation of intent; it is still set
+            # so every code path can read one attribute.
+            self._sym_mats_k_search = (
+                self.sym_mats_k if self.trs_allowed else _sym_mats_k)
             self.translations = np.zeros((1, 3), dtype=np.float64)
 
             # In no-symmetry case, unfolded grid equals irreducible grid
@@ -991,9 +1057,60 @@ class SymMaps:
         
         # Add time-reversal symmetry (k → -k) combined with each spatial symmetry
         # This is needed because QE uses time-reversal to reduce k-points, but doesn't
-        # store it as one of the ntran symmetries
+        # store it as one of the ntran symmetries.
+        #
+        # AUDIT MAP — the four places TRS lives in LORRAX, and what each
+        # one is responsible for.  Read them together; every historical
+        # bug here came from changing one without the others.
+        #   1. THIS LINE builds the table: rows [0, ntran) are the spatial
+        #      ops S (acting on k as ``sym_mats_k[s] @ k``), rows
+        #      [ntran, 2·ntran) are ``−S`` = "time reversal ∘ S".  The
+        #      TRS half is a k-space sign flip ONLY; it carries no τ of
+        #      its own and no separate spinor matrix.
+        #   2. ``self._sym_mats_k_search`` (just below) decides which rows
+        #      may be SELECTED.  This is the gate: with TRS disallowed the
+        #      table keeps its 2·ntran length (``unfold_psi`` requires that
+        #      shape) but ``sym_idx_k``/``sym_idx_q`` can never exceed
+        #      ntran, so no ψ is ever conjugated.
+        #   3. ``unfold_psi`` applies the antiunitary itself — spinor
+        #      factor ``iσ_y·conj(U_spinor[s])`` and the conjugated τ
+        #      phase.  Its docstring carries the (★) derivation showing
+        #      that the OTHER half of Θ, the negation of the G list, is
+        #      supplied by ``sym_mats_k[sym_idx] = −S`` flowing into
+        #      ``WfnLoader.gvecs(k='full_bz')``.  Half of Θ without the
+        #      other half = ψ(r) → ψ*(−r) = scorecard §Q.
+        #   4. ``common.density_symmetry_check`` MEASURES whether TRS is
+        #      a symmetry of these particular wavefunctions at all, from
+        #      the magnetization density, using none of 1–3.  Its verdict
+        #      arrives here as ``wfn.trs_holds`` and drives (2).
+        # ``centroid.orbit_syms.compute_centroid_sym_perm(extend_trs=True)``
+        # is the real-space counterpart: TRS leaves r fixed, so its rows
+        # duplicate the spatial rows rather than negating anything.
         time_reversal_syms = -self.sym_mats_k  # S @ k -> -S @ k
         self.sym_mats_k = np.concatenate([self.sym_mats_k, time_reversal_syms], axis=0)
+
+        # ...but only SELECT from the TRS half when time reversal has been
+        # established for these wavefunctions.  The table itself always
+        # keeps its ``2·ntran`` length — ``unfold_psi`` derives
+        # ``n_sym_spatial = len(sym_mats_k)//2`` and hard-raises on any
+        # other shape (§Q) — so the gate lives in the SEARCH set used by
+        # ``create_kpoint_symmetry_map`` / ``find_symmetry_ops_simple`` /
+        # ``find_irreducible_bz_points``.  With TRS disallowed those can
+        # only ever return ``sym_idx < ntran``, i.e. no ψ is conjugated
+        # anywhere in the pipeline.
+        self._sym_mats_k_search = (
+            self.sym_mats_k if self.trs_allowed
+            else self.sym_mats_k[:wfn.ntran])
+        if not self.trs_allowed:
+            import warnings as _warnings
+            _warnings.warn(
+                "SymMaps: the measured charge density says TIME-REVERSAL "
+                "SYMMETRY IS BROKEN for this WFN, so the time-reversal rows "
+                "of sym_mats_k will not be used to map the full BZ. If this "
+                "file's IBZ was reduced using time reversal the mapping "
+                "below will fail loudly — which is the correct outcome: a "
+                "TRS-reduced mesh for a magnetic system is not physical.",
+                RuntimeWarning)
 
         # get the list of full zone k-points and the map from k_full to k_irr
         self.kpoint_map, self.unfolded_kpts = self.create_kpoint_symmetry_map(wfn)
@@ -1106,7 +1223,7 @@ class SymMaps:
         # ``sym_mats_k`` (which already includes time-reversal). Note that
         # `is_trs[i_full] = sym_idx_q[i_full] >= ntran` is implicit; not stored.
         irr_idx_q, sym_idx_q, q_irr_kgrid_int = find_irreducible_bz_points(
-            self.kvecs_asints, self.sym_mats_k, irr_kgrid_int=None,
+            self.kvecs_asints, self._sym_mats_k_search, irr_kgrid_int=None,
         )
         self.irr_idx_q = irr_idx_q
         self.sym_idx_q = sym_idx_q
@@ -1173,7 +1290,10 @@ class SymMaps:
         
         for kfull_idx in range(len(full_kpoints)):
             k_found = False
-            for sym_idx, sym_mat in enumerate(self.sym_mats_k):
+            # ``_sym_mats_k_search`` is ``sym_mats_k`` unless the measured
+            # density says TRS is broken, in which case it is the spatial
+            # half only (see ``__init__``/``trs_allowed``).
+            for sym_idx, sym_mat in enumerate(self._sym_mats_k_search):
                 # Apply symmetry operation to k-point
                 k_transformed = self._wrap_to_bz(sym_mat @ full_kpoints[kfull_idx])
                 
@@ -1199,7 +1319,9 @@ class SymMaps:
         if unmatched_kpts:
             import warnings
             warnings.warn(f"WFN symmetry data incomplete: {len(unmatched_kpts)} k-points could not be "
-                         f"mapped via stored symmetries (ntran={len(self.sym_mats_k)}). "
+                         f"mapped via stored symmetries "
+                         f"(ntran={len(self._sym_mats_k_search)}"
+                         f"{'' if self.trs_allowed else ', TIME REVERSAL DISALLOWED by the measured density'}). "
                          f"Using identity fallback. First unmatched: {unmatched_kpts[0][1]}")
         
         return kpoint_map, full_kpoints
@@ -1209,11 +1331,15 @@ class SymMaps:
         irk_to_k_map = np.zeros(full_kpts.shape[0], dtype=np.int32)
         irk_sym_map = np.zeros(full_kpts.shape[0], dtype=np.int32)
         ntran = len(self.sym_matrices)
-        # all symmetries applied to the irr k-points: shape (nkbar, nsym, 3)
-        Skbar = np.einsum('ijk,lk->lij', self.sym_mats_k, wfn.kpoints)
+        # all symmetries applied to the irr k-points: shape (nkbar, nsym, 3).
+        # Searches ``_sym_mats_k_search`` — the full TRS-augmented table
+        # unless the measured density says TRS is broken, in which case
+        # only the spatial half is eligible.
+        Skbar = np.einsum('ijk,lk->lij', self._sym_mats_k_search, wfn.kpoints)
         Skbar = self._wrap_to_bz(Skbar)
 
         # find the symmetry operations that map the irr k-points to the full k-points
+        matched = np.zeros(full_kpts.shape[0], dtype=bool)
         for ikfull, kfull in enumerate(full_kpts):
             for ikbar in range(wfn.nkpts):
                 # Compare each component within tolerance
@@ -1222,6 +1348,22 @@ class SymMaps:
                 if len(matches) > 0:
                     irk_to_k_map[ikfull] = ikbar
                     irk_sym_map[ikfull] = matches[0]
+                    matched[ikfull] = True
+
+        if not self.trs_allowed and not np.all(matched):
+            n_bad = int(np.count_nonzero(~matched))
+            raise ValueError(
+                f"SymMaps: {n_bad} of {full_kpts.shape[0]} full-BZ k-points "
+                f"cannot be reached from the IBZ using the SPATIAL symmetry "
+                f"operations alone, and the measured charge density says "
+                f"time-reversal symmetry is BROKEN for these wavefunctions "
+                f"(magnetization density above tolerance), so the "
+                f"time-reversal rows must not be used. This WFN's k-mesh was "
+                f"reduced with an assumption its own wavefunctions "
+                f"contradict; regenerate it with `noinv=.true.` (or fix the "
+                f"magnetic ground state). Set LORRAX_TRS_CHECK=0 to restore "
+                f"the old flags-only behaviour at your own risk."
+            )
 
         # Note: TRS-augmented sym indices (irk_sym_map >= ntran) are now
         # handled correctly by ``unfold_psi`` (PR3, 2026-05-14). The

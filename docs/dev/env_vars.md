@@ -45,6 +45,10 @@ These change the numbers a run produces.
 | `ISDF_CHUNK_TARGET_UTILIZATION` | `0.0` (auto) | Overrides the planner's memory-utilization target; clamped to [0.85, 1.0] (`gw_config.py:1185`). |
 | `ISDF_ZCT_STAGE_CAP_GB` | unset | Absolute cap (GB) on the ζ-contraction stage transient (`gw_config.py:1194`). |
 | `ISDF_ZCT_STAGE_CAP_FRAC` | unset | Same cap as a fraction of the per-device budget (`gw_config.py:1195`). |
+| `LORRAX_TRS_CHECK` | `1` (ON) | Load-time MEASUREMENT of the WFN's symmetries against the density built from its own occupied ψ (`common/density_symmetry_check.py:trs_check_mode`, called from `file_io/wfn_loader.py` `_run_density_symmetry_check`). `0` disables it and restores the pre-2026-07 flags-only behaviour; `strict` raises instead of warning. The measured `trs_holds` verdict GATES `SymMaps`'s time-reversal augmentation — with the check off, a magnetic deck can again be silently time-reversed (scorecard §Q class of bug). Not a physics knob in the input-key sense: it selects whether a *diagnostic* runs, and its default is on. |
+| `LORRAX_TRS_TOL` | `1e-6` | Relative tolerance on `‖Σ_pair w·m‖∞ / ‖ρ‖∞` for the TRS verdict (`density_symmetry_check.py:TOL_TRS`). Measured residuals on every LORRAX fixture are ≤ 1e-12; real magnetization is O(1e-2…1). |
+| `LORRAX_TRS_SPATIAL_TOL` | `1e-4` | Relative tolerance on `‖ρ(Sr+τ) − ρ(r)‖∞ / ‖ρ‖∞` per claimed symmetry op (`density_symmetry_check.py:TOL_SPATIAL`). A wrong op mismatches by O(0.1…1). |
+| `LORRAX_TRS_MAX_K` | `32` | Cap on the k-points sampled by the check; `0` = all. The sample is ±-closed, so it is a *sufficiency* choice, not an approximation: every ± pair is an independent exact identity under TRS. |
 
 ## 2. Runtime — I/O, backends, placement
 
