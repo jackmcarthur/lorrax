@@ -436,37 +436,33 @@ def test_rank_truncate_refuses_above_the_replication_cap():
         pytest.skip(f"cap gate: {default['skip']}")
     assert default["cap_gib"] == pytest.approx(4.0), \
         f"default replication cap changed: {default['cap_gib']} GiB"
-    # Below the cap nothing changes; above it rank_truncate refuses while the
-    # cholesky alternative still resolves to the distributed factor.  That
-    # factor is backend-dependent: cuSolverMp on a true-2D GPU mesh, but the
-    # CPU-safe in-tree sharded Cholesky on a CPU mesh (cuSolverMp is CUDA-only).
+    # CONTRACT UPDATE (J.1): the cap gates ONE q-BATCH, not the whole stack —
+    # factor_c_q_replicated_batched bounds the true per-rank transient at the
+    # cap regardless of nq, so both historical stacks (ibz74 6.42 GiB,
+    # fullbz144 12.48 GiB TOTAL) now legitimately resolve to the replicated
+    # rank-truncate route under the DEFAULT cap.  The protective intent is
+    # unchanged: the route must be rank_truncate (never a silent downgrade to
+    # a plain-Cholesky factor — the 2026-07-21 physics destroyer); the
+    # explicit-cholesky alternative still resolves to the distributed factor.
     expected_cholesky = ("sharded_cholesky" if default["mesh_is_cpu"]
                          else "cusolvermp_cholesky")
     for tag in ("ibz74", "fullbz144"):
-        assert default[f"{tag}_rank_truncate"].startswith("RAISE:"), (
-            f"{tag} above the 4 GiB cap silently downgraded to "
-            f"{default[f'{tag}_rank_truncate']!r} instead of raising")
+        assert default[f"{tag}_rank_truncate"] == "replicated_rank_truncate", (
+            f"{tag} must resolve to replicated_rank_truncate under the "
+            f"per-BATCH cap contract (J.1), got "
+            f"{default[f'{tag}_rank_truncate']!r}")
         assert default[f"{tag}_cholesky"] == expected_cholesky, (
-            f"{tag} above-cap cholesky resolved to "
-            f"{default[f'{tag}_cholesky']!r}, expected {expected_cholesky!r} "
+            f"{tag} cholesky resolved to {default[f'{tag}_cholesky']!r}, "
+            f"expected {expected_cholesky!r} "
             f"(mesh_is_cpu={default['mesh_is_cpu']})")
 
+    # The env knob still parses and overrides (it now sets the batch bound).
     raised = _run_worker("worker_cap",
                          env_extra={"LORRAX_ZETA_REPLICATE_CAP_GIB": "8"})
     assert raised["cap_gib"] == pytest.approx(8.0), \
         "LORRAX_ZETA_REPLICATE_CAP_GIB did not raise the cap"
-    assert raised["ibz74_rank_truncate"] == "replicated_rank_truncate", \
-        f"nq=74 (6.42 GiB) must pass under an 8 GiB cap, got " \
-        f"{raised['ibz74_rank_truncate']!r}"
-    assert raised["fullbz144_rank_truncate"].startswith("RAISE:"), \
-        "nq=144 (12.48 GiB) must still refuse under an 8 GiB cap"
-
-    full = _run_worker("worker_cap",
-                       env_extra={"LORRAX_ZETA_REPLICATE_CAP_GIB": "16"})
-    assert full["ibz74_rank_truncate"] == "replicated_rank_truncate"
-    assert full["fullbz144_rank_truncate"] == "replicated_rank_truncate", \
-        f"nq=144 must pass under a 16 GiB cap, got " \
-        f"{full['fullbz144_rank_truncate']!r}"
+    for tag in ("ibz74", "fullbz144"):
+        assert raised[f"{tag}_rank_truncate"] == "replicated_rank_truncate"
 
 
 def test_zq_band_gather_is_mesh_invariant():
