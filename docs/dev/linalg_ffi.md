@@ -130,8 +130,9 @@ failed guard, the mesh, and the available alternatives.
 |---|---|---|---|---|---|
 | `native` | all | any | any | nothing (pure JAX) | eigh: `jnp.linalg.eigh`, q-batched (every device solves its own shard of the batch). cholesky: replicated dense factor (mesh-invariant) or in-tree `sharded_cholesky` shard_map kernel. solve_lu: per-q `jnp.linalg.solve` + ridge. |
 | `cusolvermp` | eigh, cholesky, solve_lu | CUDA only | eigh: **square** (deadlock otherwise); cholesky/lu: true-2D (px,py ≥ 2), else falls back to native | `liblorrax_ffi.so` + NCCL | Block-cyclic; the factor is grid-dependent (see replication cap). eigh returns a RAW buffer whose conj-transpose is the eigenvector matrix — `dispatch_eigh` normalizes this. |
-| `slate` | eigh, cholesky | CUDA or host | **square or N×1** (`px,py > 1` needs `px == py`); never 1×q (stride assert) | SLATE in the FFI build | The portability path (Frontier/Aurora). Returns TRUE column eigenvectors. Host `heev` is **broken** — see "Sharp edges". |
-| `scalapack` | solve_lu | host only | square or 1-D | `liblorrax_ffi_host.so` linked against MKL ScaLAPACK+BLACS (Cray LibSci elsewhere) | The host twin of cusolvermp's LU; explicit request only, never auto-picked. |
+| `slate` | eigh (CUDA only), cholesky | CUDA or host | **square or N×1** (`px,py > 1` needs `px == py`); never 1×q (stride assert) | SLATE in the FFI build | The portability path (Frontier/Aurora). Returns TRUE column eigenvectors. Host `heev` is **broken and now REFUSED at resolve time** — see "Sharp edges". |
+| `scalapack` | eigh, solve_lu | host only | square or 1-D | `liblorrax_ffi_host.so` linked against MKL ScaLAPACK+BLACS (Cray LibSci elsewhere) | eigh = `pzheevd`/`pdsyevd`, **the permanent CPU distributed eigh** (what `distributed` resolves to there); solve_lu = `pXgetrf`+`pXgetrs`. Returns TRUE column eigenvectors. Both are explicit-request only — neither is ever auto-picked. |
+| `distributed` (alias) | eigh | any | that of the backend it names | — | Not a library: "spread ONE tile over the mesh with this platform's distributed eigh". Resolves to `scalapack` on cpu (**permanently**) and `cusolvermp` on CUDA, then runs the full guard ladder. This is the name the ζ-fit's `distributed_zeta_solve = distributed` tier uses. |
 
 **When does an FFI backend actually win?** It depends on the *regime* —
 and the two measured regimes point in opposite directions.
@@ -158,7 +159,7 @@ one matrix ndev-ways and walks the batch serially. Hence `auto` →
 | `solve_lu` n=400, nrhs=200 | scalapack | **0.256 s** | 1.563 s | **6.1×** |
 | `solve_lu` n=400, nrhs=200 (in the μ=3000 downfold chain) | scalapack | **0.240 s** | 2.766 s | **11.5×** |
 | `cholesky` n=400 (in the μ=3000 chain) | slate | 0.116 s | 0.071 s | 0.6× |
-| `eigh` n=1200 / 3000 | — (blocked, L-2) | — | 0.93 s / 10.2–11.4 s | — |
+| `eigh` n=1200 / 3000 | — (slate blocked, L-2) | — | 0.93 s / 10.2–11.4 s | — |
 
 The FFI advantage is a **multi-node effect**: it grows with rank spread,
 because native gathers the tile onto every process while the FFI keeps
@@ -174,10 +175,43 @@ it distributed. On 1 node × 16 ranks (pure shm MPI) the same cholesky is
 * ⇒ **hoist `resolve_backend` and the first call out of any loop**, and
   don't route matrices whose native solve is already < ~0.25 s.
 
-**Bottom line:** `cholesky` (slate) and `solve_lu` (scalapack) at
-n = 400–1200, and the sharded `SᴴWS` GEMM chain at μ_big = 1200/3000,
-are production-ready on Frontera CPU. Distributed `eigh` is not
-(bug L-2).
+*Distributed eigh on a Frontera CPU mesh: ScaLAPACK `pzheevd`*
+(workstream V, 2026-07-26; c128 Hermitian PD, `P(None,'x','y')`, medians
+over 3 reps, `FI_PROVIDER=tcp` so the inter-node numbers are pessimistic):
+
+| mesh (nodes) | n | ‖AZ−ZΛ‖/‖A‖ | ‖ZᴴZ−I‖ | max\|Δλ\|/λ_max | ‖C⁺−C⁺_native‖/‖C⁺‖ | t/matrix |
+|---|---|---|---|---|---|---|
+| 1×1 (1) | 64 | 1.1e-15 | 1.3e-14 | 7.2e-16 | 2.3e-15 | 0.009 s |
+| 1×1 (1) | 512 | 1.3e-15 | 6.5e-14 | 1.8e-15 | 4.8e-15 | 0.28 s |
+| 2×2 (2) | 64 | 1.2e-15 | 1.5e-14 | 1.1e-15 | 2.6e-15 | 0.012 s |
+| 2×2 (2) | 512 | 2.1e-15 | 1.1e-13 | 2.5e-15 | 6.4e-15 | 0.54 s |
+| 2×2 (2) | 2048 | 4.0e-15 | 4.0e-13 | 5.3e-15 | 1.2e-14 | 2.33 s |
+| 4×4 (8) | 2016 | timing only | | | | 1.99 s |
+| 4×4 (8) | 2448 | timing only | | | | 2.89 s |
+
+Against the REPLICATED `jnp.linalg.eigh` it replaces (measured at 2×2,
+P-independent by construction): 0.076 s at n=512, 1.44 s at n=2048. So
+**`pzheevd` does not win on wall time at these sizes** — 7× slower at
+n=512/4 ranks, roughly parity at n≈2000 on 16 ranks. It wins on the two
+things wall time does not show: the `(nq, μ, μ)` factor is never
+replicated (65 MB/rank vs 9.36 GB/rank at MoS2 12×12), and the cost
+divides by P where the native path is flat. Route a tile here when it
+does not fit replicated, or when P is large — not to make a small eigh
+faster.
+
+Reruns are bit-deterministic on a fixed grid. First call is 8–29 s (BLACS
+grid + XLA compile), amortized from rep 1 — hoist it out of loops. The
+4×4 rows are latency only (the harness's replicated reference path kept
+hitting Gloo `DEADLINE_EXCEEDED` under cluster contention); correctness at
+that shape is covered by the P=16 fixture gate. Note the **gauge-invariant**
+column: `C⁺ = Z diag(1/λ) Zᴴ` — the quantity the ζ-fit consumes — agrees
+with the native eigh to 1e-14 even though the eigenVECTORS do not (and
+must not be compared across meshes).
+
+**Bottom line:** `cholesky` (slate), `solve_lu` (scalapack) and now
+`eigh` (scalapack `pzheevd`) are production-ready on Frontera CPU, as is
+the sharded `SᴴWS` GEMM chain at μ_big = 1200/3000. SLATE's host `heev`
+is not (bug L-2) and is refused.
 
 ## The config surface
 
@@ -188,6 +222,43 @@ Input-file keys are the source of truth; CLI flags override them.
 | `distributed_cholesky` | `auto \| off \| cusolvermp \| slate` | GW ζ-fit charge channel (`isdf/core`) |
 | `distributed_lu` | `auto \| off \| cusolvermp \| scalapack` | GW ζ-fit transverse channels (`isdf/core`) |
 | `eigh_backend` | `auto \| off \| cusolvermp \| slate` | BSE/htransform eigh sites (`bse_setup`, `vq_interp`) via `htransform` / `exciton_bands` |
+| `distributed_zeta_solve` | `auto \| replicated \| per_q \| distributed` | GW ζ-fit back-solve tier (`isdf/core`) |
+
+`ffi.linalg.resolve_backend('eigh', …)` additionally accepts `distributed`
+(and `scalapack`) beyond the `eigh_backend` key's vocabulary; the ζ-fit tier
+is the caller that uses them.
+
+### `distributed_zeta_solve` — the ζ back-solve tier
+
+| value | factor | back-solve | O(μ²)-per-q object ever replicated? |
+|---|---|---|---|
+| `replicated` | dense `eigh` per q, **redundantly on every rank** | gather the whole `(nq, μ, μ)` factor, then matmul | yes — `nq·μ²·16` B/rank, on EVERY r-chunk |
+| `per_q` | same | gather ONE `(μ, μ)` tile at a time | yes, but one tile (`μ²·16` B peak) |
+| `distributed` | ScaLAPACK `pzheevd` over the whole mesh, truncation on the replicated spectrum, `C⁺` kept 2D-sharded | stacked GEMM `C⁺ @ Z` with BOTH operands `P(None,'x','y')` | **no** |
+| `auto` (default) | — | `replicated` under `LORRAX_ZETA_GATHER_CAP_GIB` (4 GiB), `per_q` above | — |
+
+`distributed` is the only tier whose **factorisation** cost scales with P:
+the other two run one dense `eigh` per q on every rank, O(nq·μ³) with no
+P-scaling at all (~5.5 h at μ=4k, ~86 h at μ=10k on 28 cores — the wall
+that caps the centroid ladder at ~4k). It is EXPLICIT opt-in because a
+block-cyclic eigh picks a different (equally valid) eigenvector gauge, so
+ζ agrees with the other tiers to ~κ·ε rather than bit-exactly. It requires
+the charge channel, `charge_zeta_solve = 'rank_truncate'`, and a mesh the
+ScaLAPACK eigh accepts (host, one process per device, **square or 1-D**,
+μ_pad divisible by both axes) — all checked at resolve time.
+
+Layout contract of the `distributed` tier (nothing here is ever
+replicated):
+
+```
+C_q, C⁺   (nq, μ, μ)  P(None,'x','y')   rows on 'x', cols on 'y'
+V         (nq, μ, μ)  P(None,'x','y')   eigenvectors as COLUMNS
+λ         (nq, μ)     replicated        ascending, identical per rank
+Z, ζ      (nq, μ, r)  P(None,'x','y')   μ on 'x', r on 'y'
+```
+
+Z staying on `'x'/'y'` (instead of columns-on-the-FLAT-mesh) is what makes
+it work — see "Sharp edges".
 
 * `--eigh-backend` (htransform, exciton_bands CLIs) **overrides** the
   `eigh_backend` key; unset, the key (default `auto`) applies.
@@ -308,7 +379,19 @@ What can run here?
   guards reject cleanly at resolve time (no hang), but the FFI is simply
   not in play. If FFI cholesky/LU matters for a run, choose **8×8 (64
   ranks)** or **10×10 (100 ranks)** and keep `n` divisible by both axes.
-* **SLATE host `heev` SIGSEGVs (bug L-2, open).** `lorrax_slate_eigh` →
+* **The flat-mesh column-sharding trap (scorecard J.9).** A block-sharded
+  `(μ,μ)` operator can only be applied by ranks that share a column block
+  cooperating on the μ contraction. ζ's `Z` is built at
+  `P(None,'x','y')` but the replicated/per_q back-solve reshards it to
+  `P(None, None, ('x','y'))` — columns over the **flat** mesh — after
+  which ranks sharing a `y` index hold UNRELATED column blocks. A 2-D
+  SUMMA on that layout `psum`s partial products built from different
+  columns: NaNs, `rc=0`, no crash (the gate caught them only as
+  float-count deficits in eqp). The `distributed` tier's answer is not to
+  fix the SUMMA but to **never do the reshard**: it consumes Z in the
+  layout `z_q_from_psi_sm` builds it in. If you add another sharded-operator
+  path, check `Z.sharding.spec` first.
+* **SLATE host `heev` SIGSEGVs (bug L-2, open → now REFUSED).** `lorrax_slate_eigh` →
   `slate::heev(…, Target::HostTask)` segfaults rank 0 deterministically
   at *every* configuration tried: n = 64/512/1200, mesh 1×1/2×2/4×4,
   intra- and inter-node, `compute_evecs` True and False, SLATE built
@@ -319,8 +402,40 @@ What can run here?
   Prime suspect: SLATE 2025.05's host `heev` against MKL's LAPACK 3.8
   (the upstream validation was Cray LibSci). On the **same** library and
   context, `potrf`, `trsm` and ScaLAPACK `getrf/getrs` are all clean
-  (potrf n=512 residual 1.47e-16). **Use `eigh_backend = auto`
-  (native).** Repro: `wk_L/diag.py --px 1 --py 1 --ops mpi,ctx,potrf512,eigh512`.
+  (potrf n=512 residual 1.47e-16). Since the handler IS compiled and the
+  capability probe passes, nothing else would catch it and
+  `resolve_backend` would hand back a name whose first call kills the job
+  with no Python traceback — so **`('eigh','slate')` on a CPU mesh is now
+  a resolve-time refusal** naming ScaLAPACK as the replacement. Use
+  `distributed` (= `scalapack`) for a distributed CPU eigh, or
+  `auto`/`off` for the native one. Repro:
+  `wk_L/diag.py --px 1 --py 1 --ops mpi,ctx,potrf512,eigh512`.
+* **`pXheevd` can return `INFO = 0` with correct eigenvalues and a
+  silently garbage `Z`.** The eigenvector back-transform
+  (`pXunmtr`/`pXormtr`) is a *separate* workspace requirement that
+  `pXheevd`'s published `LWORK` formula does not always cover — nor does
+  MKL's query. Measured on this stack: real symmetric n=32, 1×1 grid,
+  PDSYEVD asks 2305 doubles, PDORMTR needs 3232 ⇒ `INFO = 0`,
+  `max|Δλ| = 7e-15`, `‖ZᴴZ−I‖ = 6e-15`, and `‖AZ−ZΛ‖/‖A‖ = 1.40`. The only
+  symptom is one `PDORMTR parameter number 16 had an illegal value` line
+  on stderr. `eigh_ffi.cc` now floors `LWORK` with
+  `max((NB(NB−1))/2, (NP0+MQ0)·NB) + NB² + 8N`. **Corollary for anyone
+  adding an eigensolver: an eigenvalue-only test does not test an
+  eigensolver.** Always assert `A @ Z == Z diag(W)`.
+* **MKL's `pzheevd` workspace query is MANDATORY, not advisory.** MKL
+  returns an `LWORK` far above the netlib `LWMIN` on multi-rank grids
+  (measured 368× at N=20000 on a 2×2 grid) and **rejects the netlib
+  minimum with `INFO = -16`**. `eigh_ffi.cc` therefore treats a failed
+  query as fatal and uses `max(query, reference formula)`. The workspace
+  is `malloc`'d inside the handler, so it is invisible to the JAX memory
+  planner — `LORRAX_SCALAPACK_EIGH_LOG=1` prints it per call (measured
+  11 MB WORK + 6 MB RWORK at n=2016 on a 4×4 grid; it grows as the grid
+  shrinks). Also: netlib and MKL both implement `JOBZ='V'` ONLY for
+  `pzheevd` (`'N'` returns `INFO=-1`), and `IA=JA=1` with `MB_A == NB_A`
+  is enforced (`INFO = -706` / `-4` otherwise). `pzheevr` (MRRR) is the
+  documented fallback: it supports `JOBZ='N'` and eigenvalue subsets and
+  needs ~n²/p instead of ~3n²/p workspace, at slightly worse
+  orthogonality on clustered spectra.
 * **`scalapack.batched_distributed_solve_lu` DONATES both A and B.**
   Rebuild them if you need to compute a residual afterwards.
 * **Fabric: use `FI_PROVIDER=mlx`, not `tcp`, on Frontera.** Frontera CLX

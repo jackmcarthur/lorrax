@@ -1,13 +1,17 @@
 """Backend resolution for the distributed dense-linalg facade.
 
 This module is the ONE place where a requested backend name
-(``auto | off | cusolvermp | slate | scalapack``, per op) is turned into
-a concrete, *guaranteed-callable* backend — or a clear resolve-time
-error.  Every guard lives here, applied in one fixed order:
+(``auto | off | distributed | cusolvermp | slate | scalapack``, per op) is
+turned into a concrete, *guaranteed-callable* backend — or a clear
+resolve-time error.  Every guard lives here, applied in one fixed order:
 
     1. vocabulary   — is the name a backend of this op at all?
+                      (``distributed`` is resolved to the platform's
+                      default distributed library FIRST, then runs the
+                      whole ladder as if it had been named explicitly)
     2. platform     — does the backend run on this mesh's device kind?
                       (cusolvermp is CUDA-only; scalapack is host-only)
+    2b. known-broken— slate eigh on a CPU mesh (bug L-2: SIGSEGV)
     3. capability   — is the backend's FFI handler actually usable?
                       (``ffi_loader.probe_target``, which separates "the
                       library would not load" from "the library has no
@@ -74,11 +78,26 @@ OPS = ("eigh", "cholesky", "solve_lu")
 NATIVE = "native"
 
 #: Per-op user vocabulary (requested names).  ``auto``/``off`` resolve
-#: to ``native``; the rest name distributed FFI libraries.
+#: to ``native``; the rest name distributed FFI libraries.  ``distributed``
+#: (eigh only) is the PLATFORM-DEFAULT distributed backend — see
+#: :data:`_DISTRIBUTED_DEFAULT`.
 BACKEND_CHOICES = {
-    "eigh":     ("auto", "off", "cusolvermp", "slate"),
+    "eigh":     ("auto", "off", "distributed", "cusolvermp", "slate",
+                 "scalapack"),
     "cholesky": ("auto", "off", "cusolvermp", "slate"),
     "solve_lu": ("auto", "off", "cusolvermp", "scalapack"),
+}
+
+#: ``distributed`` → the platform's permanent default distributed backend.
+#: On **cpu** that is ScaLAPACK ``pzheevd``, FOREVER: SLATE's host ``heev``
+#: SIGSEGVs deterministically down to a 1×1 mesh (bug L-2, scorecard L §4)
+#: while ScaLAPACK's routines on the same library and MPI context are
+#: clean, so there is no configuration in which slate is the right CPU
+#: eigh.  On CUDA it is cuSOLVERMp, the only library there with a
+#: distributed syevd.
+_DISTRIBUTED_DEFAULT = {
+    ("eigh", "cpu"):  "scalapack",
+    ("eigh", "CUDA"): "cusolvermp",
 }
 EIGH_BACKENDS = BACKEND_CHOICES["eigh"]
 CHOLESKY_BACKENDS = BACKEND_CHOICES["cholesky"]
@@ -97,6 +116,7 @@ _NATIVE_IMPL = {
 _SPEC = {
     ("eigh", "cusolvermp"):     ("lorrax_cusolvermp_eigh",             ("CUDA",)),
     ("eigh", "slate"):          ("lorrax_slate_eigh",                  ("CUDA", "cpu")),
+    ("eigh", "scalapack"):      ("lorrax_scalapack_eigh",              ("cpu",)),
     ("cholesky", "cusolvermp"): ("lorrax_cusolvermp_batched_potrf",    ("CUDA",)),
     ("cholesky", "slate"):      ("lorrax_slate_potrf",                 ("CUDA", "cpu")),
     ("solve_lu", "cusolvermp"): ("lorrax_cusolvermp_batched_solve_lu", ("CUDA",)),
@@ -148,11 +168,14 @@ def _process_count() -> int:
 def _check_geometry(op: str, backend: str, px: int, py: int) -> None:
     """Guard 5 — mesh-geometry constraints, per (op, backend).  Raises
     ValueError with the reason; silent-pass otherwise."""
-    if op == "eigh":
-        # Both FFI eigh wrappers reject p != q; for cusolvermp this is a
-        # DEADLOCK guard (cusolverMpSyevd hangs in a collective on
+    if op == "eigh" and backend in ("cusolvermp", "slate"):
+        # These two FFI eigh wrappers reject p != q; for cusolvermp this is
+        # a DEADLOCK guard (cusolverMpSyevd hangs in a collective on
         # rectangular one-tile-per-rank blocks — observed 4x1/1x4,
         # 2026-07-10), for SLATE heev a hard library requirement.
+        # ScaLAPACK pXheevd is NOT in this class: like pXgetrf it only
+        # needs square descriptor BLOCKS, so square-or-1-D is enough (its
+        # rule is the ``scalapack`` branch below).
         if px != py:
             raise ValueError(
                 f"eigh backend {backend!r} needs a SQUARE mesh "
@@ -176,12 +199,16 @@ def _check_geometry(op: str, backend: str, px: int, py: int) -> None:
                 f"assert (guarded; see src/ffi/slate/README.md).  Use a "
                 f"{py}x1 or square mesh, or a different backend.")
     elif backend == "scalapack":
+        # Mirrors ffi.scalapack.eigh.validate_eigh_mesh / solve_lu's own
+        # check — keep them in sync (bug L-1: a rule enforced only at call
+        # time turns a returned backend name into a broken promise).
         if px > 1 and py > 1 and px != py:
+            _routine = "pXheevd" if op == "eigh" else "pXgetrf"
             raise ValueError(
                 f"{op} backend 'scalapack': mesh {px}x{py} unsupported — "
-                f"pXgetrf needs square descriptor blocks, which the "
-                f"one-tile-per-rank layout only gives on square or 1-D "
-                f"meshes.")
+                f"{_routine} needs square descriptor blocks (MB == NB), "
+                f"which the one-tile-per-rank layout only gives on square "
+                f"or 1-D meshes.")
 
 
 def resolve_backend(op: str, requested: str, mesh_xy: Mesh,
@@ -219,9 +246,15 @@ def resolve_backend(op: str, requested: str, mesh_xy: Mesh,
     * ``eigh``: always ``native``.  The q-batched jnp path solves ndev
       matrices concurrently; the FFI path solves one matrix ndev-ways and
       walks the batch serially, measured 100–600x slower per fit-size
-      matrix (``common.eigh_benchmark --mode dispatch``).  The FFI
-      backends are an explicit opt-in for single tiles too large for one
-      device.
+      matrix (``common.eigh_benchmark --mode dispatch``).  ``auto`` means
+      "the fastest eigh for this call", and for a batch of tiles that fit
+      on one device that is still the native one — the htransform /
+      vq_interp consumers depend on it and are gated bit-exact.
+      **``distributed`` is the name for "spread ONE tile over the mesh"**,
+      and its CPU default is permanently ScaLAPACK ``pzheevd``
+      (:data:`_DISTRIBUTED_DEFAULT`).  That is the backend the ζ-fit's
+      ``distributed_zeta_solve = distributed`` tier uses, and the only way
+      out of the replicated factor's O(nq·μ³)-with-no-P-scaling wall.
     * ``cholesky`` / ``solve_lu``: ``cusolvermp`` on a true-2D
       (px>=2 and py>=2) CUDA mesh when its handler is compiled, else
       ``native``.  Never an FFI backend on a CPU mesh.  (The GW ζ-fit
@@ -240,6 +273,18 @@ def resolve_backend(op: str, requested: str, mesh_xy: Mesh,
         return NATIVE
 
     px, py = _mesh_shape(mesh_xy)
+    if requested == "distributed":
+        # "Spread ONE tile over the whole mesh, with whatever library this
+        # platform's distributed eigh is."  Explicit — every guard below
+        # applies and a failure raises rather than downgrading, because a
+        # silent downgrade to the replicated path is exactly the O(nq·μ³)
+        # no-P-scaling wall this name exists to escape.
+        requested = _DISTRIBUTED_DEFAULT.get((op, mesh_platform(mesh_xy)))
+        if requested is None:
+            raise ValueError(
+                f"{op} backend 'distributed' has no default backend on "
+                f"platform {mesh_platform(mesh_xy)!r} "
+                f"(defined for: {sorted(_DISTRIBUTED_DEFAULT)}).")
     if requested == "auto":
         if op == "eigh" or mesh_is_cpu(mesh_xy):
             return NATIVE
@@ -260,6 +305,22 @@ def resolve_backend(op: str, requested: str, mesh_xy: Mesh,
             f"mesh devices are {platform!r}.  "
             f"Available {op} backends on this mesh: "
             f"{', '.join(_available(op, mesh_xy))}.")
+
+    # 2b. KNOWN-BROKEN combination (bug L-2, scorecard L §4).  SLATE's host
+    # ``heev`` SIGSEGVs deterministically — n = 64/512/1200, meshes 1x1 /
+    # 2x2 / 4x4, intra- and inter-node, compute_evecs both ways, SLATE built
+    # both threaded and sequential.  It reproduces on ONE rank, so it is
+    # neither MPI nor the layout contract.  The handler IS compiled and the
+    # capability probe passes, so nothing below would catch it and
+    # ``resolve_backend`` would hand back a name whose first call kills the
+    # job with no Python traceback.  Refuse here, and name the replacement.
+    if op == "eigh" and requested == "slate" and platform == "cpu":
+        raise RuntimeError(
+            "eigh backend 'slate' is REJECTED on CPU meshes: SLATE's host "
+            "heev SIGSEGVs deterministically (bug L-2, reproduced on a 1x1 "
+            "mesh at n=64 — not an MPI or layout problem).  Use "
+            "'distributed' (= ScaLAPACK pzheevd, the permanent CPU default) "
+            "or 'off'/'auto' for the replicated jnp.linalg.eigh.")
 
     # 3. compiled capability
     #

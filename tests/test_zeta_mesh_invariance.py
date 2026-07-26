@@ -489,9 +489,10 @@ def test_zeta_gather_tier_ladder_is_pinned():
     bit-identical.  ``auto`` only switches to ``per_q`` once the replicated
     ``(nq, μ, μ)`` gather crosses ``LORRAX_ZETA_GATHER_CAP_GIB`` (4 GiB) —
     a memory decision, never a physics one (both tiers run the same per-q
-    kernel).  ``distributed`` must REFUSE loudly rather than silently do
-    something else; that is the same fails-loudly contract the replication
-    cap test above pins for ``rank_truncate``.
+    kernel).  ``distributed`` (workstream V) is a real tier now, but it
+    must stay EXPLICIT-only and refuse loudly on the combinations it cannot
+    serve — the same fails-loudly contract the replication cap test above
+    pins for ``rank_truncate``.
     """
     import isdf.core as core
 
@@ -513,13 +514,33 @@ def test_zeta_gather_tier_ladder_is_pinned():
         "replicated", n_rmu=2016, nq=144) == "replicated"
     assert core._resolve_zeta_gather("per_q", n_rmu=64, nq=9) == "per_q"
 
-    # 'distributed' is designed but not built: refuse, and name what is
-    # missing so the message is actionable.
+    # 'distributed' is EXPLICIT-only: ``auto`` may never pick it, at any
+    # size, because it changes the arithmetic (block-cyclic eigh gauge).
+    for mu, nq_ in ((64, 9), (2016, 144), (10000, 144)):
+        assert core._resolve_zeta_gather(
+            "auto", n_rmu=mu, nq=nq_) != "distributed"
+
+    # It needs the rank-truncation cure: a plain distributed inverse would
+    # destroy the charge-channel physics, so it refuses rather than offers.
     with pytest.raises(ValueError) as exc:
-        core._resolve_zeta_gather("distributed", n_rmu=2016, nq=144)
-    msg = str(exc.value)
-    assert "not implemented" in msg
-    assert "pzheevd" in msg and "column" in msg
+        core._resolve_zeta_gather("distributed", n_rmu=2016, nq=144,
+                                  mesh_xy=object(),
+                                  charge_zeta_solve="cholesky")
+    assert "rank_truncate" in str(exc.value)
+
+    # ...and it needs a mesh to resolve its eigh backend on.
+    with pytest.raises(ValueError) as exc:
+        core._resolve_zeta_gather("distributed", n_rmu=2016, nq=144,
+                                  charge_zeta_solve="rank_truncate")
+    assert "mesh" in str(exc.value)
+
+    # Transverse channels resolve to per_q instead of raising: ONE key
+    # drives both channels, and the transverse CCT is indefinite (its
+    # distributed route is distributed_lu=scalapack, a different key).
+    assert core._resolve_zeta_gather(
+        "distributed", n_rmu=2016, nq=144, vertex_mu_L=1,
+        charge_zeta_solve="rank_truncate") == "per_q"
+
     with pytest.raises(ValueError):
         core._resolve_zeta_gather("nonsense")
 

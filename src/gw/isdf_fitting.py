@@ -434,15 +434,37 @@ def fit_zeta_to_h5(
             distributed_lu=distributed_lu,
             n_rmu=int(n_rmu), nq=int(C_q_flat.shape[0]),
             charge_zeta_solve=charge_zeta_solve)
-        # Back-solve gather tier (input key ``distributed_zeta_solve``).
-        # Sized on the PADDED mu extent — that is what actually crosses
-        # the all-gather inside the back-solve.
+        # Back-solve tier (input key ``distributed_zeta_solve``).  Sized on
+        # the PADDED mu extent — that is what actually crosses the
+        # all-gather inside the back-solve, and what the ScaLAPACK
+        # descriptors are built on for the ``distributed`` tier.
         _resolved_zeta_gather = _resolve_zeta_gather(
             distributed_zeta_solve,
-            n_rmu=int(n_rmu_padded), nq=int(C_q_flat.shape[0]))
+            n_rmu=int(n_rmu_padded), nq=int(C_q_flat.shape[0]),
+            mesh_xy=mesh_xy, vertex_mu_L=int(vertex_mu_L),
+            charge_zeta_solve=charge_zeta_solve)
+        if _resolved_zeta_gather == 'distributed':
+            # The tier IS a charge-channel route: it replaces the whole
+            # factor+back-solve pair, not just the gather granularity of
+            # the replicated one.  Overriding here (and NOT inside
+            # _resolve_solver_kind_charge) keeps the two knobs
+            # single-purpose: `distributed_cholesky` picks the factor
+            # LIBRARY, `distributed_zeta_solve` picks whether the factor is
+            # ever replicated.  Refuses rather than downgrades if the user
+            # also pinned an incompatible factor route.
+            if _resolved_solver_kind not in ('replicated_rank_truncate',):
+                raise ValueError(
+                    f"distributed_zeta_solve='distributed' resolves the "
+                    f"charge factor itself, but distributed_cholesky "
+                    f"resolved to {_resolved_solver_kind!r}.  Leave "
+                    f"distributed_cholesky at 'auto' (which gives "
+                    f"replicated_rank_truncate) for this tier.")
+            _resolved_solver_kind = 'distributed_rank_truncate'
         if int(vertex_mu_L) == 0:
             _how = ("rank-truncated pinv"
                     if _resolved_solver_kind == 'replicated_rank_truncate'
+                    else "distributed rank-truncated pinv (2D-sharded C+)"
+                    if _resolved_solver_kind == 'distributed_rank_truncate'
                     else "chol(C_q)")
             print(f"  Computing L_q = {_how}  [PSD, charge channel, "
                   f"path={_resolved_solver_kind}]")
@@ -451,10 +473,11 @@ def fit_zeta_to_h5(
                   f"path={_resolved_solver_kind}]")
         _gather_gb = (int(C_q_flat.shape[0]) * int(n_rmu_padded) ** 2
                       * 16 / 1e9)
-        print(f"  Zeta back-solve gather: tier={_resolved_zeta_gather} "
+        print(f"  Zeta back-solve tier: {_resolved_zeta_gather} "
               f"(distributed_zeta_solve={distributed_zeta_solve})  "
               f"replicated (nq,μ,μ) gather would be {_gather_gb:.2f} GB/rank; "
-              f"per-q tile {int(n_rmu_padded) ** 2 * 16 / 1e9:.3f} GB")
+              f"per-q tile {int(n_rmu_padded) ** 2 * 16 / 1e9:.3f} GB; "
+              f"distributed tier gathers NO (μ,μ) object")
         L_q = factor_c_q(
             C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
             n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
