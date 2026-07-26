@@ -342,6 +342,24 @@ _DEFAULTS = {
     # historical replicated/cuSolverMp Cholesky path (bit-identical to the
     # pre-feature behavior; the selectable alternative).
     "charge_zeta_solve":    "rank_truncate",   # rank_truncate | cholesky
+    # ζ BACK-SOLVE GATHER TIER — how much of the replicated (nq, μ, μ)
+    # factor crosses the all-gather inside the per-r-chunk back-solve.
+    # Orthogonal to charge_zeta_solve (which picks the FACTORIZATION) and
+    # numerically free: every tier runs the same per-q arithmetic.
+    #   replicated  = today's path: gather the whole (q_batch, μ, μ) stack
+    #                 onto every rank, nq·μ²·16 B, re-gathered per r-chunk
+    #                 (18.9 GB/rank at MoS2 12×12 / μ=1998).
+    #   per_q       = gather ONE (μ, μ) tile at a time, loop q
+    #                 (65 MB at μ=2016, 1.6 GB at μ=10k).
+    #   distributed = block-sharded factor.  NOT IMPLEMENTED — rejected at
+    #                 resolve time with the two missing pieces named
+    #                 (ScaLAPACK pzheevd handler + the ζ column re-layout;
+    #                 scorecard J.9).
+    #   auto (DEFAULT) = replicated while the gather fits under
+    #                 LORRAX_ZETA_GATHER_CAP_GIB (4 GiB), per_q above it.
+    #                 Fixture-scale stacks stay on replicated, so the
+    #                 default path is bit-identical to the pre-feature one.
+    "distributed_zeta_solve": "auto",  # auto | replicated | per_q | distributed
     # Rank-truncation cutoff (relative to λ_max, per q).  DEFAULT 1e-8 —
     # the LOW end of the over-complete recovery plateau.  An over-complete
     # basis needs it: at MoS2 4×4/1204c, 1e-10 only partially recovers (MAE
@@ -869,6 +887,7 @@ class BackendConfig:
     eigh_backend: str          # "auto" | "off" | "cusolvermp" | "slate"
     zeta_ridge: float          # charge-CCT Tikhonov ridge ε (rel. to tr/n)
     charge_zeta_solve: str     # "rank_truncate" | "cholesky"
+    distributed_zeta_solve: str  # "auto"|"replicated"|"per_q"|"distributed"
     zeta_rcond: float          # rank-truncation cutoff (·λ_max)
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
 
@@ -887,6 +906,8 @@ class BackendConfig:
                if self.charge_zeta_solve == 'rank_truncate' else '')
             + (f", zeta_ridge={self.zeta_ridge:g}"
                if self.zeta_ridge else '')
+            + (f", distributed_zeta_solve={self.distributed_zeta_solve}"
+               if self.distributed_zeta_solve != 'auto' else '')
             + f", gamma_contract={self.gamma_contract_mode}"
         )
 
@@ -1378,6 +1399,12 @@ class LorraxConfig:
             raise ValueError(
                 f"charge_zeta_solve={_charge_zeta_solve!r} invalid; expected "
                 f"rank_truncate / cholesky.")
+        _dist_zeta_solve = str(_g("distributed_zeta_solve")).strip().lower()
+        if _dist_zeta_solve not in (
+                "auto", "replicated", "per_q", "distributed"):
+            raise ValueError(
+                f"distributed_zeta_solve={_dist_zeta_solve!r} invalid; "
+                f"expected auto / replicated / per_q / distributed.")
         try:
             import jax as _jax
             _is_cpu_backend = _jax.default_backend() == "cpu"
@@ -1470,6 +1497,7 @@ class LorraxConfig:
             eigh_backend=_eigh_backend,
             zeta_ridge=float(_g("zeta_ridge")),
             charge_zeta_solve=_charge_zeta_solve,
+            distributed_zeta_solve=_dist_zeta_solve,
             zeta_rcond=float(_g("zeta_rcond")),
             gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
         )

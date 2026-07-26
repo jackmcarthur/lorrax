@@ -44,6 +44,25 @@ from ffi.linalg import backend_module, mesh_is_cpu as _mesh_is_cpu, \
     resolve_backend as _resolve_linalg_backend
 
 
+def host_rss_gb() -> float:
+    """This process's resident set size in GB, from ``/proc/self/status``.
+
+    The CPU backend returns ``None`` from ``device.memory_stats()``, so
+    on a CPU mesh the ONLY faithful per-rank memory observable is the
+    kernel's own RSS accounting.  Cheap (one small read, no JAX calls) —
+    safe to sample inside the r-chunk loop.  Returns -1.0 where
+    ``/proc`` is unavailable.
+    """
+    try:
+        with open("/proc/self/status", "r") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    return -1.0
+
+
 # ============================================================================
 # Open-spin pair density: P_k,ab(μ, ν) = Σ_n ψ*_{n,k,a}(μ) ψ_{n,k,b}(ν)
 # ============================================================================
@@ -1218,6 +1237,71 @@ def _resolve_solver_kind(
         charge_zeta_solve=charge_zeta_solve)
 
 
+# Budget for the ζ back-solve's replicated-factor ALL-GATHER, i.e. the
+# transient that ``_solve_all_at_once`` / ``_solve_batch_and_update`` put on
+# every rank when they pull the (q_batch, μ, μ) factor to P(None,None,None).
+# Deliberately SEPARATE from ``_REPLICATED_CHOL_MAX_STACK_BYTES``: that one
+# gates whether the FACTORIZATION may be replicated (a physics-route
+# decision, and production raises it to 16 GiB to keep rank_truncate
+# reachable), this one gates only the gather GRANULARITY inside the
+# back-solve, which is numerically free either way.
+_ZETA_GATHER_MAX_BYTES = int(
+    float(os.environ.get("LORRAX_ZETA_GATHER_CAP_GIB", "4")) * 1024 ** 3)
+
+
+def _resolve_zeta_gather(
+    override: str = "auto",
+    n_rmu: int | None = None,
+    nq: int | None = None,
+) -> str:
+    """Resolve the ζ back-solve GATHER TIER — the input key
+    ``distributed_zeta_solve``.
+
+    Returns ``'replicated'`` or ``'per_q'``; raises for ``'distributed'``.
+
+    * ``replicated`` — today's path: the back-solve all-gathers the whole
+      ``(q_batch, μ, μ)`` factor onto every rank, ``nq·μ²·16`` B per rank
+      (18.9 GB at MoS2 12×12 / μ=1998 counting the logical-extent copies,
+      and it is re-gathered on EVERY r-chunk).
+    * ``per_q`` — gather ONE ``(μ, μ)`` tile at a time and loop q inside
+      the r-chunk.  ``μ²·16`` B (65 MB at μ=2016, 1.6 GB at μ=10k).  Same
+      kernel, same per-q arithmetic; only the live gathered extent shrinks.
+    * ``distributed`` — REJECTED at resolve time (see the message): the
+      block-sharded factor needs a distributed eigh and a ζ column
+      re-layout that do not exist yet.
+    * ``auto`` (default) — ``replicated`` while the gather fits under
+      :data:`_ZETA_GATHER_MAX_BYTES`, ``per_q`` above it.  At fixture scale
+      (nq=9, μ_pad=64 ⇒ 0.6 MB) that is ``replicated``, i.e. bit-identical
+      to the pre-feature path; at MoS2 12×12 / μ=2016 (9.4 GB) it is
+      ``per_q``.
+    """
+    tier = str(override or "auto").strip().lower()
+    if tier == "distributed":
+        raise ValueError(
+            "distributed_zeta_solve='distributed' is not implemented. "
+            "Two pieces are missing, both designed but not built: "
+            "(1) a distributed Hermitian eigensolver for the charge factor "
+            "(ScaLAPACK pzheevd via ffi.linalg — SLATE's host heev SIGSEGVs, "
+            "workstream L bug L-2); and (2) the ζ column re-layout — a "
+            "block-sharded (μ,μ) factor requires the ranks that share a "
+            "column block to cooperate on the μ contraction, so Z/ζ must "
+            "move from columns-on-('x','y') to columns-on-'y', which "
+            "changes _reshard_zeta_r_XY_to_mu_XY (scorecard J.9). "
+            "Use 'per_q' (same physics, one (mu,mu) tile gathered at a "
+            "time) or 'replicated'.")
+    if tier in ("replicated", "per_q"):
+        return tier
+    if tier != "auto":
+        raise ValueError(
+            f"distributed_zeta_solve={override!r} invalid; expected "
+            f"auto / replicated / per_q / distributed.")
+    if nq is None or n_rmu is None:
+        return "replicated"
+    return ("replicated"
+            if int(nq) * int(n_rmu) ** 2 * 16 <= _ZETA_GATHER_MAX_BYTES
+            else "per_q")
+
+
 _replicated_chol_cache = {}  # replicated dense Cholesky kernel (keyed by shape)
 
 
@@ -1644,6 +1728,7 @@ def solve_zeta(
     solver_kind: str = 'auto',
     cct_trace_per_q: jax.Array | None = None,
     n_rmu_logical: int | None = None,
+    zeta_gather: str = "replicated",
 ) -> jax.Array:
     """
     Solve for zeta_q given pre-computed system matrix from
@@ -1837,6 +1922,10 @@ def solve_zeta(
     needs_padding = n_zchunk_padded != n_zchunk
 
     z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+    # Staging layout for the Z reshard (see ``_reshard_z``): parks 'x' on
+    # the leading nq axis so each with_sharding_constraint moves exactly
+    # one mesh axis.
+    intermediate_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
     L_rep_shard = NamedSharding(mesh_xy, P(None, None))
     L_batch_rep_shard = NamedSharding(mesh_xy, P(None, None, None))  # (B_q, n_rmu, n_rmu)
     q_batch = min(q_chunk_size, nq)
@@ -1866,6 +1955,18 @@ def solve_zeta(
     # inverse does not exist, so the tri-solve would be wrong).
     use_rank_trunc = (solver_kind == 'replicated_rank_truncate')
 
+    # ``zeta_gather`` selects the GATHER GRANULARITY of the replicated
+    # factor, not the factorization — see :func:`_resolve_zeta_gather`.
+    #   'replicated' : one all-gather of the whole (q_batch, μ, μ) stack
+    #                  (today's path, and what ``_solve_all_at_once``
+    #                  does at q_batch = nq).
+    #   'per_q'      : one all-gather of a SINGLE (1, μ, μ) tile at a
+    #                  time, looped over q.  Same kernel
+    #                  (``_sharded_cho_solve_batch`` at batch 1), same
+    #                  arithmetic per q — only the live gathered extent
+    #                  changes, from ``nq·μ²·16`` to ``μ²·16``.
+    per_q_gather = (str(zeta_gather).strip().lower() == "per_q")
+
     # Cache key for solve function (includes q_chunk_size and padded size).
     # ``use_lu`` / ``use_rank_trunc`` partition the cache so the three
     # back-solve compiles don't collide on the same key.  ``n_log`` is
@@ -1873,7 +1974,7 @@ def solve_zeta(
     # cache too.
     cache_key = ('solve_from_L', id(mesh_xy), nq, n_rmu, n_log,
                  n_zchunk_padded, q_chunk_size, bool(use_lu),
-                 bool(use_rank_trunc))
+                 bool(use_rank_trunc), bool(per_q_gather))
 
     def _ridge_indef_solve(L: jax.Array, Z: jax.Array) -> jax.Array:
         """Solve (L + ε·tr(L)/n · I) · ζ = Z via pivoted LU at the
@@ -1963,11 +2064,59 @@ def solve_zeta(
             L_full_rep = jax.lax.with_sharding_constraint(L_q_sharded, L_batch_rep_shard)
             return _sharded_cho_solve_batch(L_full_rep, Z_col)
 
+        @partial(jax.jit, donate_argnums=(2,))
+        def _solve_one_q_and_update(L_q_sharded, Z_col, zeta_acc, q):
+            """PER-Q tier: gather ONE ``(μ, μ)`` factor tile, solve that q,
+            scatter into ``zeta_acc``.
+
+            The only difference from ``_solve_all_at_once`` is the extent
+            that crosses the ``with_sharding_constraint`` all-gather:
+            ``μ²·16`` instead of ``nq·μ²·16`` (64 MB vs 9.4 GB at
+            μ_pad = 2016, nq = 144).  The solve itself is the SAME
+            ``_sharded_cho_solve_batch`` kernel at batch 1, so each q sees
+            exactly the arithmetic it saw inside the batched call.
+
+            Both slices are taken INSIDE the jit off a traced ``q`` so the
+            shapes are identical for every q — one trace, one compile, one
+            executable for the whole loop — and ``Z_col`` is never sliced
+            eagerly (an eager slice would materialise ``nq`` extra
+            ``(1, μ, r/P)`` device arrays per r-chunk).  ``donate_argnums``
+            chains ``zeta_acc`` through the loop the same way
+            ``_solve_batch_and_update`` does.
+            """
+            L_one = jax.lax.dynamic_slice_in_dim(L_q_sharded, q, 1, axis=0)
+            L_one_rep = jax.lax.with_sharding_constraint(
+                L_one, L_batch_rep_shard)
+            Z_one = jax.lax.dynamic_slice_in_dim(Z_col, q, 1, axis=0)
+            out = _sharded_cho_solve_batch(L_one_rep, Z_one)
+            return jax.lax.dynamic_update_slice_in_dim(
+                zeta_acc, out, q, axis=0)
+
+        # Z reshard P(None,'x','y') → P(None,None,('x','y')), staged
+        # through P('x',None,'y') so each step moves ONE mesh axis (see
+        # the call site below for the Involuntary-Remat measurement that
+        # forced the two-step form).
+        #
+        # MUST live in the cache with the other kernels.  It used to be
+        # defined at the call site, i.e. a FRESH ``jax.jit`` object per
+        # r-chunk — and a fresh wrapper is a fresh key for JAX's
+        # trace/lower/compile caches (they key on the wrapped function's
+        # identity), so every r-chunk retraced, relowered and
+        # RECOMPILED this reshard.  At production scale that is the one
+        # XLA compilation inside the r-chunk loop, and it is on the
+        # r_chunk-sized tensor.
+        @partial(jax.jit, donate_argnums=(0,))
+        def _reshard_z(z):
+            z = jax.lax.with_sharding_constraint(z, intermediate_shard)
+            return jax.lax.with_sharding_constraint(z, z_col_shard)
+
         _solve_cache[cache_key] = SimpleNamespace(
             solve_batch_and_update=_solve_batch_and_update,
             solve_all_at_once=_solve_all_at_once,
             sharded_cho_solve=_sharded_cho_solve,
             sharded_cho_solve_batch=_sharded_cho_solve_batch,
+            solve_one_q_and_update=_solve_one_q_and_update,
+            reshard_z=_reshard_z,
         )
 
     helpers = _solve_cache[cache_key]
@@ -2009,17 +2158,32 @@ def solve_zeta(
         # w_isdf._get_w_solve_fn (V/χ reshard).  See lorrax_B commit
         # c0307a0 for the original Si 4×4×4 result (HLO peak
         # 68.94 → 29.94 GB on the same kernel compile).
-        intermediate_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
-        @partial(jax.jit, donate_argnums=(0,))
-        def _reshard_z(z):
-            z = jax.lax.with_sharding_constraint(z, intermediate_shard)
-            return jax.lax.with_sharding_constraint(z, _target_sharding)
-        Z_col = _reshard_z(Z_q)
+        # The kernel itself is built ONCE per cache_key (above) — building
+        # it here made every r-chunk recompile it.
+        Z_col = helpers.reshard_z(Z_q)
         # No-op when called inside an outer jit (tracer has no
         # block_until_ready and the outer jit syncs at its boundary).
         if not isinstance(Z_col, jax.core.Tracer):
             Z_col.block_until_ready()
         del Z_q
+
+    # PER-Q tier: one (μ, μ) gather at a time.  Sits BEFORE the
+    # ``q_batch >= nq`` fast path because it deliberately overrides the
+    # planner's q_chunk (which is a compute-batching choice, not a memory
+    # one) — the whole point of this tier is that the gathered extent is
+    # independent of both nq and q_chunk_size.
+    if per_q_gather:
+        zeta = jnp.zeros_like(Z_col)
+        # Python loop, not lax.scan/fori: a scan over a q-sharded carry
+        # makes SPMD replicate the accumulator (documented at the
+        # q-batch loop below).  Same reason, same shape of fix.
+        for q in range(nq):
+            zeta = helpers.solve_one_q_and_update(L_q, Z_col, zeta, q)
+        del Z_col
+        zeta = _reshard_zeta_r_XY_to_mu_XY(zeta, mesh_xy)
+        if needs_padding:
+            return zeta[:, :, :n_zchunk]
+        return zeta
 
     # Fast path: solve all q-points at once
     if q_batch >= nq:
@@ -2094,6 +2258,7 @@ def _make_fit_one_rchunk_kernel(
     is_charge: bool = True,
     solver_kind: str = 'auto',
     q_irr_full_idx: np.ndarray | None = None,
+    zeta_gather: str = 'replicated',
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
     over every piece of static structure + a :class:`PsiGStore` that
@@ -2196,7 +2361,8 @@ def _make_fit_one_rchunk_kernel(
             L_q, Z_q_for_solve, mesh_xy, q_chunk_size,
             solver_kind=solver_kind,
             cct_trace_per_q=cct_trace_per_q,
-            n_rmu_logical=int(meta.n_rmu))
+            n_rmu_logical=int(meta.n_rmu),
+            zeta_gather=zeta_gather)
 
     @jax.jit
     def _kernel(
@@ -2248,6 +2414,7 @@ def fit_one_rchunk(
     solver_kind: str = 'auto',
     q_irr_full_idx: np.ndarray | None = None,
     cct_trace_per_q: jax.Array | None = None,
+    zeta_gather: str = 'replicated',
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -2278,6 +2445,7 @@ def fit_one_rchunk(
         id(psi_G_store),
         bool(is_charge),
         str(solver_kind),
+        str(zeta_gather),
         (None if q_irr_full_idx is None
          else (int(q_irr_full_idx.shape[0]),
                hash(np.asarray(q_irr_full_idx,
@@ -2298,6 +2466,7 @@ def fit_one_rchunk(
             is_charge=bool(is_charge),
             solver_kind=str(solver_kind),
             q_irr_full_idx=q_irr_full_idx,
+            zeta_gather=str(zeta_gather),
         )
         _fit_one_rchunk_cache[cache_key] = fn
     # cct_trace_per_q is None for the charge channel (Cholesky path
@@ -2314,6 +2483,10 @@ def fit_one_rchunk(
     # at each phase boundary is the cost of separating them — a few
     # microseconds on small kernels, dominated by the per-phase work.
     _dbg = bool(os.environ.get("LORRAX_RCHUNK_DEBUG"))
+    # Per-phase host-RSS deltas: on CPU the XLA arena is invisible to
+    # ``memory_stats()``, so attributing the per-r-chunk anonymous ramp
+    # to z_q_build vs solve needs the kernel's own accounting.
+    _r0 = host_rss_gb() if _dbg else 0.0
     _t_z0 = time.perf_counter() if _dbg else 0.0
     with timing.section("zeta_fit.chunk.z_q_build"):
         Z_q = fn.z_q_phase(
@@ -2322,14 +2495,18 @@ def fit_one_rchunk(
             gamma_perm, gamma_phase)
         Z_q.block_until_ready()
     _t_z = (time.perf_counter() - _t_z0) if _dbg else 0.0
+    _r1 = host_rss_gb() if _dbg else 0.0
     _t_s0 = time.perf_counter() if _dbg else 0.0
     with timing.section("zeta_fit.chunk.solve"):
         zeta = fn.solve_phase(Z_q, L_q, cct_trace_per_q)
         zeta.block_until_ready()
     _t_s = (time.perf_counter() - _t_s0) if _dbg else 0.0
     if _dbg and jax.process_index() == 0:
+        _r2 = host_rss_gb()
         print(f"[rchunk_dbg]   z_q_build={_t_z*1000:.0f}ms "
-              f"solve={_t_s*1000:.0f}ms", flush=True)
+              f"solve={_t_s*1000:.0f}ms "
+              f"d_zq={_r1 - _r0:+.3f}GB d_solve={_r2 - _r1:+.3f}GB",
+              flush=True)
     return zeta
 
 

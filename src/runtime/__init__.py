@@ -161,6 +161,59 @@ def set_default_env(*, platform: str = "gpu") -> None:
         os.environ["JAX_PLATFORMS"] = "cpu"
     else:
         raise ValueError(f"platform must be 'gpu' or 'cpu', got {platform!r}")
+    tune_glibc_malloc()
+
+
+# glibc mallopt parameter numbers (malloc.h).
+_M_TRIM_THRESHOLD = -1
+_M_MMAP_THRESHOLD = -3
+
+
+def tune_glibc_malloc() -> bool:
+    """Pin glibc's mmap/trim thresholds so freed XLA:CPU transients go back
+    to the OS.  Returns True when the tuning was applied.
+
+    WHY (workstream T, measured on Frontera).  XLA:CPU allocates and frees
+    every intermediate through plain ``malloc``/``free``.  glibc's mmap
+    threshold is DYNAMIC: the first time an mmap'd block is freed, glibc
+    raises the threshold to that block's size (capped at 32 MB) and sets
+    ``trim_threshold = 2 x mmap_threshold``.  From then on every allocation
+    below 32 MB is served from the sbrk heap / per-thread arenas, and heap
+    memory is returned to the OS only when the *top* of the heap happens to
+    be free.  With 28 XLA worker threads churning multi-MB contraction
+    scratch that condition is essentially never met, so RSS ratchets up
+    monotonically for as long as the process keeps doing work — anonymous
+    memory, page cache flat.
+
+    In the ISDF zeta fit that showed up as a per-r-chunk ramp proportional to
+    the back-solve FLOP count: +0.35 GB/rank/r-chunk at MoS2 12x12 / 606
+    centroids / P=80, and +6.6 GB/rank/r-chunk at 1998 centroids / P=144,
+    which is what killed jobs 7874803 / 7875070 / 7875071 with
+    ``std::bad_alloc`` mid-loop while the planner's static estimate was
+    comfortable.  ``jax.live_arrays()`` stayed EXACTLY constant throughout —
+    nothing was retained on the JAX side.
+
+    Pinning ``M_MMAP_THRESHOLD`` also DISABLES the dynamic adjustment, so
+    every allocation at or above the threshold is mmap'd and ``munmap``'d on
+    free — returned to the OS immediately, no fragmentation.  Measured cost:
+    within noise (~4% on the r-chunk wall at 40 nodes), and steady-state RSS
+    dropped 2.3 -> 1.7 GB/rank as a bonus.
+
+    Knobs: ``LORRAX_MALLOC_TUNE=0`` disables; ``LORRAX_MALLOC_MMAP_MB`` /
+    ``LORRAX_MALLOC_TRIM_MB`` override the thresholds (MB).
+    """
+    if os.environ.get("LORRAX_MALLOC_TUNE", "1") in ("0", "off", "false"):
+        return False
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        mmap_mb = int(os.environ.get("LORRAX_MALLOC_MMAP_MB", "1"))
+        trim_mb = int(os.environ.get("LORRAX_MALLOC_TRIM_MB", "128"))
+        ok = libc.mallopt(_M_MMAP_THRESHOLD, mmap_mb * 1024 * 1024)
+        ok &= libc.mallopt(_M_TRIM_THRESHOLD, trim_mb * 1024 * 1024)
+        return bool(ok)
+    except Exception:
+        return False
 
 
 def _resolve_proc_count() -> int:
