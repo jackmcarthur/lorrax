@@ -427,6 +427,83 @@ def write_freq_debug(
 
 
 # ---------------------------------------------------------------------------
+# H₀ sanity gate  (mean-field side of eqp0/eqp1/eqp_g0w0)
+# ---------------------------------------------------------------------------
+
+# ⟨nk|V_xc|nk⟩ for LDA/PBE pseudo-systems lives in a narrow, strictly
+# negative band (measured: −25 … −5 eV for MoS₂ across the semicore,
+# valence and low-conduction manifolds; QE ``vxc.dat``).  Anything outside
+# this generous window means H₀ = ⟨T+V_ion+V_NL⟩ + ⟨V_H⟩ has lost its
+# cancellation, NOT that the exchange-correlation physics changed.
+_VXC_IMPLIED_MIN_EV = -50.0
+_VXC_IMPLIED_MAX_EV = 2.0
+
+
+def _warn_on_unphysical_h0(
+    *,
+    e_dft_ev: np.ndarray,
+    kin_ion_diag_ev: np.ndarray,
+    hartree_diag_ev: np.ndarray,
+    print_fn=print,
+) -> np.ndarray:
+    """Flag a corrupted mean-field H₀ before it reaches eqp{0,1}.dat.
+
+    ``H₀ = kin_ion + V_H`` is a *catastrophic cancellation*: for a
+    pseudopotential system with semicore states both terms run to several
+    hundred eV of opposite sign and their sum is only tens of eV (MoS₂:
+    ⟨T+V_ion+V_NL⟩ = −502 eV, ⟨V_H⟩ = +461 eV, H₀ = −42 eV).  ``kin_ion``
+    comes from an exact plane-wave evaluation (``gw.kin_ion_io``) while
+    ``V_H`` is an ISDF centroid quadrature (``cohsex_sigma``'s ``hartree``
+    kernel), so *any* relative error in the ISDF pair-product
+    representation lands on H₀ multiplied by ~500 eV.  A 10 % ISDF error
+    — which an under-resolved centroid set will happily produce while
+    every stage still reports "successful" — is a 50 eV error in every QP
+    energy.
+
+    The cheap, assumption-free detector is the implied exchange-correlation
+    potential ``V_xc = E_DFT − H₀``: the DFT eigenvalue identity
+    ``E_DFT = ⟨T+V_ion+V_NL⟩ + ⟨V_H⟩ + ⟨V_xc⟩`` is exact, so a converged
+    run must reproduce a physical ``V_xc`` band-by-band.  Returns the
+    implied ``V_xc`` (nk, nb) in eV so callers can log it.
+    """
+    implied_vxc_ev = np.asarray(e_dft_ev, dtype=np.float64) - (
+        np.asarray(kin_ion_diag_ev, dtype=np.float64)
+        + np.asarray(hartree_diag_ev, dtype=np.float64)
+    )
+    if implied_vxc_ev.size == 0:
+        return implied_vxc_ev
+    lo, hi = float(implied_vxc_ev.min()), float(implied_vxc_ev.max())
+    n_bad = int(
+        np.count_nonzero(
+            (implied_vxc_ev < _VXC_IMPLIED_MIN_EV)
+            | (implied_vxc_ev > _VXC_IMPLIED_MAX_EV)
+        )
+    )
+    print_fn(
+        f"  H0 check: implied Vxc = E_DFT - (kin_ion + V_H) in "
+        f"[{lo:.3f}, {hi:.3f}] eV over {implied_vxc_ev.size} (k,n)"
+    )
+    if n_bad == 0:
+        return implied_vxc_ev
+    k_bad, n_band_bad = np.unravel_index(
+        int(np.argmax(np.abs(implied_vxc_ev))), implied_vxc_ev.shape)
+    print_fn(
+        "  *** WARNING: H0 = kin_ion + V_H is UNPHYSICAL — "
+        f"{n_bad} of {implied_vxc_ev.size} (k,n) have an implied Vxc outside "
+        f"[{_VXC_IMPLIED_MIN_EV:.0f}, {_VXC_IMPLIED_MAX_EV:.0f}] eV "
+        f"(worst: k={int(k_bad)} n={int(n_band_bad)}, "
+        f"Vxc={float(implied_vxc_ev[k_bad, n_band_bad]):.3f} eV).  "
+        "eqp0/eqp1/eqp_g0w0 are NOT trustworthy.  Sigma may still be fine — "
+        "the mean-field side is what failed.  Most likely cause: the ISDF "
+        "centroid basis is too small to resolve <nk|V_H|nk> (V_H is a "
+        "centroid quadrature; kin_ion is exact), so the ~500 eV "
+        "cancellation in H0 does not close.  Raise the centroid count and "
+        "re-check, or cross-check H0 against pw2bgw's kih.dat. ***"
+    )
+    return implied_vxc_ev
+
+
+# ---------------------------------------------------------------------------
 # Result writer  (QE ``punch('all')`` pattern)
 # ---------------------------------------------------------------------------
 
@@ -549,6 +626,12 @@ def write_results(
     )
     hartree_diag_ev = np.real(np.diagonal(sig_h_out[irr_idx], axis1=1, axis2=2))
     sigma_x_diag_ev = np.real(np.diagonal(sig_x_out[irr_idx], axis1=1, axis2=2))
+    _warn_on_unphysical_h0(
+        e_dft_ev=e_dft_ev_irr,
+        kin_ion_diag_ev=kin_ion_diag_ev,
+        hartree_diag_ev=hartree_diag_ev,
+        print_fn=print_fn,
+    )
     # Σ_c at E_DFT diagonal: in PPM mode this is the interpolated value
     # the driver already computed; in static modes it is the static Σ_COH
     # diagonal (post-degen-averaging if enabled).
