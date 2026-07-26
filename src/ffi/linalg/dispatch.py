@@ -34,8 +34,12 @@ def dispatch_eigh(A, mesh_xy: Mesh, backend: str):
     ``cusolvermp`` → cuSOLVERMp FFI, ONE ``(n, n)`` tile spread over the
                      whole mesh.  Square 2-D mesh, ``n`` divisible by both
                      axis sizes.
-    ``slate``      → SLATE FFI, same one-tile-per-call geometry; portable
-                     backend (also has CPU-platform handlers).
+    ``slate``      → SLATE FFI, same one-tile-per-call geometry.  CUDA
+                     only in practice: the CPU handler SIGSEGVs and is
+                     refused at resolve time (bug L-2).
+    ``scalapack``  → ScaLAPACK ``pzheevd`` FFI, host-only, square or 1-D
+                     mesh.  The permanent CPU distributed backend; also
+                     what ``distributed`` resolves to there.
 
     Both FFI backends run one JAX process per GPU — which is how LORRAX
     runs, so it is not a restriction, it is the architecture.  What DOES
@@ -87,5 +91,6 @@ def dispatch_eigh(A, mesh_xy: Mesh, backend: str):
     if resolved == "cusolvermp":
         lam, Qraw = backend_module("cusolvermp").distributed_eigh(A, mesh=mesh_xy)
         return lam, jnp.conj(Qraw).T       # raw buffer → column eigenvectors
-    lam, Q = backend_module("slate").distributed_eigh(A, mesh=mesh_xy)
-    return lam, Q                          # already true columns
+    # slate and scalapack both return TRUE column eigenvectors.
+    lam, Q = backend_module(resolved).distributed_eigh(A, mesh=mesh_xy)
+    return lam, Q

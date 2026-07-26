@@ -24,14 +24,15 @@ project(lorrax_ffi_host LANGUAGES CXX)
 # Two optional component groups, each CUDA-free:
 #   LORRAX_FFI_HAVE_PHDF5  (default ON)  parallel-HDF5 read handlers + lifecycle
 #   LORRAX_HOST_HAVE_SLATE (default ON)  SLATE gpu_backend=none host handlers
-#                                        AND the ScaLAPACK solve_lu handler
-#                                        (it reuses slate/cpp/ctx.h) + their
-#                                        ScaLAPACK/BLACS link line.
+#                                        AND the ScaLAPACK solve_lu + eigh
+#                                        handlers (they reuse slate/cpp/ctx.h)
+#                                        + their ScaLAPACK/BLACS link line.
 # SLATE downgrades to "skipped" if its install isn't found, so a phdf5-only
 # host lib still builds on a cluster with no SLATE host install.
 #
-# The full 9-target lib (phdf5×3, slate×5, scalapack×1) was first built on
-# Frontera 2026-07-25; recipe in config/frontera/build_ffi_host.sh.
+# The full 10-target lib (phdf5×3, slate×5, scalapack×2) is built by
+# config/frontera/build_ffi_host.sh (9 targets first built 2026-07-25;
+# scalapack eigh added 2026-07-26, workstream V).
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -159,13 +160,15 @@ if(LORRAX_HOST_HAVE_SLATE)
         list(APPEND LORRAX_FFI_HOST_SOURCES
             ../../../slate/cpp/context.cc
             ../../../slate/cpp/host_ffi.cc
-            ../../../scalapack/cpp/solve_lu_ffi.cc)
+            ../../../scalapack/cpp/solve_lu_ffi.cc
+            ../../../scalapack/cpp/eigh_ffi.cc)
         list(APPEND _host_link_libs slate)
         list(APPEND _host_rpaths "${LORRAX_SLATE_HOST_INSTALL_DIR}/lib64" "/lorrax_slate/lib")
 
         # --------------------------------------------------------------
-        # ScaLAPACK + BLACS — required by scalapack/cpp/solve_lu_ffi.cc
-        # (pXgetrf / pXgetrs / blacs_gridinit / descinit / numroc).
+        # ScaLAPACK + BLACS — required by scalapack/cpp/*_ffi.cc
+        # (pXgetrf / pXgetrs / pXheevd / blacs_gridinit / descinit / numroc;
+        # prototypes in scalapack/cpp/blacs_grid.h).
         #
         # The SLATE package does NOT supply them: SLATE is configured with
         # -DSCALAPACK_LIBRARIES="" (its optional scalapack_api layer is

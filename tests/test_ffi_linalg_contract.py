@@ -630,7 +630,50 @@ def test_slate_batched_cholesky_trsm_cpu(mesh_cpu11):
 @needs_host_ffi
 @pytest.mark.parametrize("dtype", ["complex128", "float64"])
 def test_slate_eigh_true_eigenvectors_cpu(mesh_cpu11, dtype):
-    check_slate_eigh(mesh_cpu11, dtype)
+    # BUG L-2: SLATE's host `heev` SIGSEGVs deterministically (1x1 mesh,
+    # n=64, single rank — not MPI, not the layout contract).  A SIGSEGV is
+    # not a test failure: it takes the pytest process down mid-run, so
+    # every cell after this one in the file was silently never executed.
+    # Skip until upstream is fixed; the CPU distributed eigh contract is
+    # covered by ``test_scalapack_eigh_true_eigenvectors_cpu`` below, and
+    # the resolver refuses this combination
+    # (``test_compute_wfns_fi_slate_refused_on_cpu``).
+    pytest.skip("slate host heev SIGSEGVs — bug L-2, see docs/dev/linalg_ffi.md")
+
+
+def check_scalapack_eigh(mesh, dtype, n=32):
+    """ScaLAPACK ``pzheevd``/``pdsyevd`` through ffi.scalapack — the same
+    STRICT contract ``check_slate_eigh`` states (and SLATE's host handler
+    cannot meet): W matches numpy, Z's COLUMNS are true eigenvectors
+    (``A @ Z == Z @ diag(W)`` — a wrong layout/transpose passes the
+    eigenvalue check and fails this), Z unitary, rerun bit-deterministic
+    on a fixed grid."""
+    from ffi.scalapack import distributed_eigh
+    rng = np.random.default_rng(37)
+    A_np = _herm(rng, 1, n, dtype)[0]
+
+    def solve():
+        A = _put(A_np, mesh, ("x", "y"))
+        W, Z = distributed_eigh(A, mesh=mesh)
+        return _gather(W)[:n], _gather(Z)
+
+    W1, Z1 = solve()
+    W2, Z2 = solve()
+    assert np.array_equal(W1, W2) and np.array_equal(Z1, Z2), \
+        "scalapack eigh rerun not bit-deterministic"
+    ev_err = float(np.max(np.abs(W1 - np.linalg.eigvalsh(A_np))))
+    assert ev_err < 1e-10, f"eigenvalue error {ev_err:.3e}"
+    nrmA = max(np.linalg.norm(A_np), 1.0)
+    res = np.linalg.norm(A_np @ Z1 - Z1 * W1[None, :]) / nrmA
+    orth = np.linalg.norm(np.conj(Z1.T) @ Z1 - np.eye(n))
+    assert res < 1e-11 and orth < 1e-11, \
+        f"eigvec residual {res:.3e}, orthonormality {orth:.3e}"
+
+
+@needs_host_ffi
+@pytest.mark.parametrize("dtype", ["complex128", "float64"])
+def test_scalapack_eigh_true_eigenvectors_cpu(mesh_cpu11, dtype):
+    check_scalapack_eigh(mesh_cpu11, dtype)
 
 
 @needs_host_ffi
@@ -915,10 +958,33 @@ def test_compute_wfns_fi_slate_matches_native(mesh11):
 
 
 @needs_host_ffi
-def test_compute_wfns_fi_slate_matches_native_cpu(mesh_cpu11):
-    # Host platform: the same wiring a CPU-backend run takes.  This is the
+def test_compute_wfns_fi_slate_refused_on_cpu(mesh_cpu11):
+    """Host platform: ``eigh_backend='slate'`` must be REFUSED, not run.
+
+    Bug L-2 — SLATE's host ``heev`` SIGSEGVs deterministically, down to a
+    1x1 mesh at n=64.  This cell used to call it and take the whole pytest
+    process down with it (no traceback, no summary, every later test in the
+    file unrun).  The handler IS compiled, so no capability probe catches
+    it; ``resolve_backend`` therefore refuses the combination outright.
+    """
+    import jax.numpy as jnp
+    from bandstructure.bse_setup import compute_wfns_fi
+
+    ct, enk, B, kgrid = _synthetic_htransform()
+    with mesh_cpu11, pytest.raises(RuntimeError, match="REJECTED on CPU"):
+        compute_wfns_fi(ctilde=jnp.asarray(ct), B_at_mu=jnp.asarray(B),
+                        enk_sigma=jnp.asarray(enk), kgrid_co=kgrid,
+                        band_window_fi=(1, 3), mesh_xy=mesh_cpu11,
+                        kgrid_fi=(4, 4, 1), batch_size=8,
+                        eigh_backend="slate")
+
+
+@needs_host_ffi
+def test_compute_wfns_fi_scalapack_matches_native_cpu(mesh_cpu11):
+    # Host platform: the same wiring a CPU-backend run takes, on the
+    # backend that actually works there (ScaLAPACK pzheevd).  This is the
     # cell that runs on a machine with no GPU at all.
-    check_compute_wfns_fi_backend(mesh_cpu11, "slate")
+    check_compute_wfns_fi_backend(mesh_cpu11, "scalapack")
 
 
 def test_compute_wfns_fi_rejects_bad_backend():
@@ -930,7 +996,9 @@ def test_compute_wfns_fi_rejects_bad_backend():
     from bandstructure.bse_setup import compute_wfns_fi
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
     ct, enk, B, kgrid = _synthetic_htransform()
-    with pytest.raises(ValueError, match="eigh_backend"):
+    # (The message names the OP, not the config key: resolve.py is
+    # op-generic and must not hard-code per-consumer key names.)
+    with pytest.raises(ValueError, match="backend must be one of"):
         compute_wfns_fi(ctilde=jnp.asarray(ct), B_at_mu=jnp.asarray(B),
                         enk_sigma=jnp.asarray(enk), kgrid_co=kgrid,
                         band_window_fi=(1, 3), mesh_xy=mesh,

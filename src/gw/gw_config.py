@@ -354,23 +354,34 @@ _DEFAULTS = {
     # historical replicated/cuSolverMp Cholesky path (bit-identical to the
     # pre-feature behavior; the selectable alternative).
     "charge_zeta_solve":    "rank_truncate",   # rank_truncate | cholesky
-    # ζ BACK-SOLVE GATHER TIER — how much of the replicated (nq, μ, μ)
-    # factor crosses the all-gather inside the per-r-chunk back-solve.
-    # Orthogonal to charge_zeta_solve (which picks the FACTORIZATION) and
-    # numerically free: every tier runs the same per-q arithmetic.
+    # ζ BACK-SOLVE TIER — how much of the (nq, μ, μ) charge factor is ever
+    # replicated.  The first three tiers below are numerically free (same
+    # per-q arithmetic, only the gathered extent differs); `distributed`
+    # replaces the factorization as well and is the only one that scales.
     #   replicated  = today's path: gather the whole (q_batch, μ, μ) stack
     #                 onto every rank, nq·μ²·16 B, re-gathered per r-chunk
     #                 (18.9 GB/rank at MoS2 12×12 / μ=1998).
     #   per_q       = gather ONE (μ, μ) tile at a time, loop q
     #                 (65 MB at μ=2016, 1.6 GB at μ=10k).
-    #   distributed = block-sharded factor.  NOT IMPLEMENTED — rejected at
-    #                 resolve time with the two missing pieces named
-    #                 (ScaLAPACK pzheevd handler + the ζ column re-layout;
-    #                 scorecard J.9).
+    #   distributed = NOTHING O(μ²) is replicated.  Distributed eigh
+    #                 (ScaLAPACK pzheevd), truncation on the replicated
+    #                 spectrum, 2D-sharded C⁺, and a stacked GEMM C⁺@Z with
+    #                 both operands 2D-sharded.  The ONLY tier whose
+    #                 FACTORIZATION divides by P — the other two run one
+    #                 dense eigh per q redundantly on every rank, O(nq·μ³)
+    #                 with no P-scaling (~86 h at μ=10k).  EXPLICIT opt-in:
+    #                 a block-cyclic eigh picks a different (equally valid)
+    #                 gauge, so ζ matches the other tiers to ~κ·ε, not
+    #                 bit-exactly.  Needs charge_zeta_solve='rank_truncate'
+    #                 and a SQUARE or 1-D mesh (pXheevd descriptor rule);
+    #                 refuses at resolve time otherwise.  On the transverse
+    #                 channels it resolves to per_q (indefinite CCT — its
+    #                 distributed route is distributed_lu=scalapack).
     #   auto (DEFAULT) = replicated while the gather fits under
     #                 LORRAX_ZETA_GATHER_CAP_GIB (4 GiB), per_q above it.
-    #                 Fixture-scale stacks stay on replicated, so the
-    #                 default path is bit-identical to the pre-feature one.
+    #                 Never `distributed`.  Fixture-scale stacks stay on
+    #                 replicated, so the default path is bit-identical to
+    #                 the pre-feature one.
     "distributed_zeta_solve": "auto",  # auto | replicated | per_q | distributed
     # Rank-truncation cutoff (relative to λ_max, per q).  DEFAULT 1e-8 —
     # the LOW end of the over-complete recovery plateau.  An over-complete

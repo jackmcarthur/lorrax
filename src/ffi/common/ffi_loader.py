@@ -71,7 +71,7 @@ _CUDA_TARGET_SYMBOLS = {
 
 # Host variants of the slate targets (src/ffi/slate/cpp/host_ffi.cc) —
 # same target names as the CUDA table, registered under platform="cpu" —
-# plus the host-only ScaLAPACK targets (src/ffi/scalapack/, Cray LibSci),
+# plus the host-only ScaLAPACK targets (src/ffi/scalapack/, MKL/LibSci),
 # plus the phdf5 read handlers (src/ffi/phdf5/cpp/read_ffi.cc compiled with
 # -DLORRAX_FFI_NO_CUDA).  The phdf5 target STRINGS are identical to the CUDA
 # table so the ffi.phdf5.read ffi_call sites resolve by lowering platform;
@@ -84,6 +84,7 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_batched_potrf":     "SlateBatchedPotrfHostFfi",
     "lorrax_slate_batched_trsm":      "SlateBatchedTrsmHostFfi",
     "lorrax_scalapack_batched_solve_lu": "ScalapackBatchedSolveLuHostFfi",
+    "lorrax_scalapack_eigh":          "ScalapackEighHostFfi",
     "lorrax_phdf5_read":              "PhdfReadHostFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkHostFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionHostFfi",

@@ -11,9 +11,9 @@
 // Grid: reuses the slate SlateCtx (pure MPI, ctx.h).  Its comm is
 // rank-remapped so that BLACS "C" (column-major) grid order puts comm
 // rank (mx + my*Px) at grid coords (mx, my) = the JAX mesh coords — the
-// same pairing the slate handlers rely on for GridOrder::Col.  The BLACS
-// context is created collectively on first use per SlateCtx and cached
-// for process lifetime (BLACS grids are freed at exit).
+// same pairing the slate handlers rely on for GridOrder::Col.  The grid
+// and the Fortran-ABI prototypes live in ``blacs_grid.h``, shared with
+// the other ScaLAPACK handlers.
 //
 // Layout contract (same family as the slate host handlers):
 //   A : (Nq, N, N)     P(None,'x','y'), inner dims pre-transposed by the
@@ -28,7 +28,6 @@
 #include <complex>
 #include <cstdint>
 #include <cstring>
-#include <map>
 #include <mutex>
 #include <sstream>
 #include <vector>
@@ -37,38 +36,7 @@
 
 #include "xla/ffi/api/ffi.h"
 
-#include "../../slate/cpp/ctx.h"
-
-// ---------------------------------------------------------------------------
-//  Cray LibSci ScaLAPACK / BLACS prototypes (Fortran ABI + C-BLACS).
-//  32-bit integer interface (libsci default).
-// ---------------------------------------------------------------------------
-extern "C" {
-int  Csys2blacs_handle(MPI_Comm comm);
-void Cblacs_gridinit(int* ictxt, const char* order, int nprow, int npcol);
-void Cblacs_gridinfo(int ictxt, int* nprow, int* npcol, int* myrow, int* mycol);
-
-int numroc_(const int* n, const int* nb, const int* iproc,
-            const int* isrcproc, const int* nprocs);
-void descinit_(int* desc, const int* m, const int* n, const int* mb,
-               const int* nb, const int* irsrc, const int* icsrc,
-               const int* ictxt, const int* lld, int* info);
-
-void pdgetrf_(const int* m, const int* n, double* a, const int* ia,
-              const int* ja, const int* desca, int* ipiv, int* info);
-void pdgetrs_(const char* trans, const int* n, const int* nrhs,
-              const double* a, const int* ia, const int* ja,
-              const int* desca, const int* ipiv, double* b, const int* ib,
-              const int* jb, const int* descb, int* info);
-
-void pzgetrf_(const int* m, const int* n, std::complex<double>* a,
-              const int* ia, const int* ja, const int* desca, int* ipiv,
-              int* info);
-void pzgetrs_(const char* trans, const int* n, const int* nrhs,
-              const std::complex<double>* a, const int* ia, const int* ja,
-              const int* desca, const int* ipiv, std::complex<double>* b,
-              const int* ib, const int* jb, const int* descb, int* info);
-}
+#include "blacs_grid.h"
 
 namespace lorrax_ffi::scalapack_solve_lu {
 
@@ -106,23 +74,6 @@ template <> struct Getrs<std::complex<double>> {
     { pzgetrs_(tr, n, nrhs, a, ia, ja, desca, ipiv, b, ib, jb, descb, info); }
 };
 
-// BLACS context per SlateCtx, created collectively on first use.  The
-// map is tiny (one entry per mesh shape) and lives for the process.
-static int blacs_ctxt_for(SlateCtx* ctx) {
-    static std::mutex mu;
-    static std::map<int64_t, int> cache;
-    const int64_t key = reinterpret_cast<int64_t>(ctx);
-    std::lock_guard<std::mutex> lock(mu);
-    auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
-    int ictxt = Csys2blacs_handle(ctx->comm);
-    // "C": comm rank r → grid (r % p, r / p).  With the SlateCtx remap
-    // (context.cc) this lands JAX shard (mx, my) at grid (mx, my).
-    Cblacs_gridinit(&ictxt, "C", ctx->p, ctx->q);
-    cache[key] = ictxt;
-    return ictxt;
-}
-
 template <typename T>
 static ffi::Error SolveLuImpl(
     int64_t nq, int64_t n, int64_t nrhs,
@@ -133,7 +84,7 @@ static ffi::Error SolveLuImpl(
 {
     const int p = ctx->p;
     const int q = ctx->q;
-    const int ictxt = blacs_ctxt_for(ctx);
+    const int ictxt = lorrax_ffi::scalapack::blacs_ctxt_for(ctx);
 
     int nprow = 0, npcol = 0, myrow = 0, mycol = 0;
     Cblacs_gridinfo(ictxt, &nprow, &npcol, &myrow, &mycol);

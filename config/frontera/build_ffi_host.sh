@@ -18,8 +18,8 @@
 # ----------------------------------------------------------------------------
 # By default this script builds the phdf5-only lib (3 targets), which needs no
 # external numerical library.  Set LORRAX_SLATE_HOST_INSTALL_DIR to a
-# gpu_backend=none SLATE install and you get all 9 host targets (phdf5×3,
-# slate×5, scalapack×1):
+# gpu_backend=none SLATE install and you get all 10 host targets (phdf5×3,
+# slate×5, scalapack×2):
 #
 #   LORRAX_SLATE_HOST_INSTALL_DIR=$WORK/slate_builds/cpu/install \
 #     config/frontera/build_ffi_host.sh --fresh
@@ -54,8 +54,9 @@
 # Runtime for the SLATE/ScaLAPACK targets needs LD_LIBRARY_PATH ⊇ MKL libdir
 # + the Intel compiler runtime (libimf/libsvml/libirng/libintlc) + SLATE's
 # lib64.  KNOWN BUG L-2: SLATE host `heev` SIGSEGVs deterministically (even
-# 1×1, n=64) — use eigh_backend=auto (native).  potrf/trsm/ScaLAPACK getrf
-# are clean.  See docs/dev/linalg_ffi.md "Sharp edges".
+# 1×1, n=64) and is REJECTED at resolve time on CPU meshes.  The distributed
+# CPU eigh is ScaLAPACK `pzheevd` (ScalapackEighHostFfi, workstream V);
+# potrf/trsm/ScaLAPACK getrf are clean.  See docs/dev/linalg_ffi.md.
 # ============================================================================
 set -euo pipefail
 
@@ -158,12 +159,18 @@ WANT="PhdfReadHostFfi PhdfReadKchunkHostFfi PhdfReadKchunkUnionHostFfi"
 if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
     WANT="$WANT SlateEighHostFfi SlatePotrfHostFfi SlateTrsmHostFfi \
 SlateBatchedPotrfHostFfi SlateBatchedTrsmHostFfi ScalapackBatchedSolveLuHostFfi \
-lrx_slate_init_mpi lrx_slate_context_create"
+ScalapackEighHostFfi lrx_slate_init_mpi lrx_slate_context_create"
 fi
 echo "[build_host] --- exported handlers ---"
+# Read the dynamic symbol table ONCE.  `nm -D "$SO" | grep -q ...` inside a
+# `set -o pipefail` script reports MISSING for every symbol grep matches
+# EARLY: grep -q exits at the first hit, nm dies of SIGPIPE, and pipefail
+# propagates nm's 141.  (It only "worked" for the symbols that happen to sit
+# at the end of the table.)
+DYNSYMS="$(nm -D "$SO")"
 MISS=0
 for s in $WANT; do
-    if nm -D "$SO" | grep -qE " (T|B|D) $s\$"; then echo "  OK      $s"
+    if grep -qE " (T|B|D) $s\$" <<< "$DYNSYMS"; then echo "  OK      $s"
     else echo "  MISSING $s"; MISS=1; fi
 done
 [ "$MISS" -eq 0 ] || { echo "[build_host] FAILED: missing handlers." >&2; exit 1; }
