@@ -31,7 +31,12 @@ the on-shell Σ:
 Inputs (per LORRAX gw_jax run directory)
 ----------------------------------------
 - ``WFN.h5``                 — IBZ wedge k-points + DFT energies in Ry
-- ``kin_ion.h5``             — K+I matrix elements in Ry (nk_full, nb, nb)
+- ``kin_ion.h5``             — K+I matrix elements in Ry (nk_full, nb, nb).
+                               When stamped ``has_hartree=True`` it ALSO
+                               contains the exact FFT-grid ⟨V_H⟩, and this
+                               CLI then suppresses ``sigma_mnk.h5``'s ISDF
+                               Hartree column rather than adding it twice
+                               (same contract as ``gw.sigma_dispatch``).
 - ``sigma_mnk.h5``           — Σ_x, Σ_c(ω), V_H matrix elements in eV; ω in eV
                                relative to the DFT mid-gap Fermi level
 - ``qp_wfn_rotations.h5``    — band_range + kirr_to_kfull mapping
@@ -551,6 +556,37 @@ def make_eqp_bgw(
 	sigma_x_diag = np.diagonal(sigma_x_irr, axis1=1, axis2=2)
 	hartree_diag = np.diagonal(hartree_irr, axis1=1, axis2=2)
 	sigma_c_omega_diag = np.diagonal(sigma_c_irr, axis1=2, axis2=3)  # (n_omega, nk, nb)
+
+	# ── The no-double-counting seam, CLI side ─────────────────────────
+	# Mirror of ``gw.sigma_dispatch``'s seam, which zeroes the ISDF
+	# ``sig_h`` when ``kin_ion.h5`` already carries the exact FFT-grid
+	# V_H.  That seam covers the live driver only; this CLI rebuilds
+	# eqp{0,1} straight from files and predated the ``has_hartree``
+	# contract entirely, so it kept adding ``sigma_mnk.h5``'s Hartree
+	# column on top of an already-folded kin_ion.
+	#
+	# The mixed case is the *normal* one here, not an edge case: a
+	# ``sigma_mnk.h5`` written by an older run carries a non-zero ISDF
+	# V_H, and pointing this CLI at a regenerated folded ``kin_ion.h5``
+	# is exactly how one re-derives QP energies without re-running Σ
+	# (Σ_xc does not depend on V_H, so the rebuild is legitimate).
+	# Double-counting ~500 eV of Hartree put the c606 sweep's QP gap at
+	# −453 eV with rc=0 (job 7874840).
+	#
+	# Reading the attribute is the only supported discriminator — never
+	# infer it from magnitudes (``file_io.kin_ion`` module docstring).
+	# Imported lazily (as ``gw.sigma_dispatch`` does) so this module stays
+	# importable without pulling in the jax-dependent file_io stack.
+	from file_io.kin_ion import kin_ion_has_hartree
+	if kin_ion_has_hartree(kin_ion_path):
+		print(
+			f"  kin_ion: has_hartree=True — exact FFT-grid V_H is already "
+			f"folded into {os.path.basename(kin_ion_path)}; suppressing "
+			f"sigma_mnk.h5's ISDF Hartree column "
+			f"(mean |V_H| = {float(np.mean(np.abs(np.real(hartree_diag)))):.3f} eV) "
+			f"to avoid double counting."
+		)
+		hartree_diag = np.zeros_like(hartree_diag)
 
 	# Mean-field gate — this CLI is the unguarded path.  Unlike the live
 	# driver (where ``gw_output.write_results`` runs the same check just

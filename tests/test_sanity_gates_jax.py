@@ -325,6 +325,127 @@ def test_implied_vxc_window_is_sourced_from_gw_output():
 
 
 # ---------------------------------------------------------------------------
+# 3c. make_eqp_bgw honours the has_hartree no-double-count contract
+# ---------------------------------------------------------------------------
+
+def _make_eqp_cli_inputs(d, *, has_hartree, nk=2, nb=4, nb_file=6,
+                         n_omega=5, kin_ion_ev=-300.0, v_h_ev=280.0,
+                         e_dft_ev=-40.0, sigma_x_ev=-20.0):
+    """Build a minimal run dir for ``make_eqp_bgw``.
+
+    ``kin_ion`` is written as if V_H were folded in when
+    ``has_hartree`` is set, so the two modes describe the SAME physical
+    system and must therefore produce the same eqp0.
+
+    The constants are chosen so the implied V_xc lands INSIDE the
+    physical window (E_DFT − (kin_ion + V_H) ≈ −18…−12 eV).  That is not
+    cosmetic: a test fixture that trips the very guard under test trains
+    the reader to ignore the guard's output, which is the exact failure
+    mode this whole workstream exists to prevent.  The one place a firing
+    is expected is
+    ``test_make_eqp_bgw_double_count_would_be_caught``, where it is the
+    assertion's whole point.
+    """
+    from common.units import RYD_TO_EV
+    band_start, band_stop = 1, 1 + nb
+
+    kin_diag_ev = kin_ion_ev + (v_h_ev if has_hartree else 0.0)
+    kin = np.zeros((nk, nb_file, nb_file))
+    for b in range(nb_file):
+        kin[:, b, b] = kin_diag_ev
+    with h5py.File(os.path.join(d, "kin_ion.h5"), "w") as f:
+        ds = f.create_dataset("kin_ion", data=kin / RYD_TO_EV)
+        if has_hartree:
+            ds.attrs["has_hartree"] = True
+
+    with h5py.File(os.path.join(d, "qp_wfn_rotations.h5"), "w") as f:
+        f.create_dataset("band_range", data=np.array([band_start, band_stop]))
+        f.create_dataset("kirr_to_kfull", data=np.arange(nk))
+
+    # WFN: nb_file bands, VBM inside the window so the E_F check passes.
+    en = np.zeros((1, nk, nb_file))
+    for b in range(nb_file):
+        en[0, :, b] = (e_dft_ev + 2.0 * b) / RYD_TO_EV
+    with h5py.File(os.path.join(d, "WFN.h5"), "w") as f:
+        g = f.create_group("mf_header/kpoints")
+        g.create_dataset("rk", data=np.zeros((nk, 3)))
+        g.create_dataset("nspin", data=np.int32(1))
+        g.create_dataset("el", data=en)
+        g.create_dataset("ifmax", data=np.full((1, nk), band_start + 2))
+
+    # sigma_mnk: the ISDF Hartree column is ALWAYS non-zero on disk --
+    # that is the mixed case this contract exists for.
+    sx = np.zeros((nk, nb_file, nb_file), dtype=np.complex128)
+    vh = np.zeros((nk, nb_file, nb_file), dtype=np.complex128)
+    for b in range(nb_file):
+        sx[:, b, b] = sigma_x_ev
+        vh[:, b, b] = v_h_ev
+    sc = np.zeros((n_omega, nk, nb_file, nb_file), dtype=np.complex128)
+    with h5py.File(os.path.join(d, "sigma_mnk.h5"), "w") as f:
+        f.create_dataset("omega_ev", data=np.linspace(-10.0, 10.0, n_omega))
+        f.create_dataset("sigma_sx_kij_ev", data=sx)
+        f.create_dataset("hartree_kij_ev", data=vh)
+        f.create_dataset("sigma_c_kij_ev", data=sc)
+    return d
+
+
+def _read_eqp_qp_column(path):
+    vals = []
+    for line in open(path):
+        if line.startswith("#") or not line.strip():
+            continue
+        t = line.split()
+        if len(t) == 4 and "." not in t[0]:
+            vals.append(float(t[3]))
+    return np.array(vals)
+
+
+def test_make_eqp_bgw_suppresses_hartree_when_folded():
+    """A folded kin_ion must NOT get sigma_mnk's ISDF V_H added on top.
+
+    Production job 7874840 hit exactly this: Q's regenerated
+    ``kin_ion.h5`` (has_hartree=True) symlinked into a c606 run dir whose
+    ``sigma_mnk.h5`` predated the contract.  ~500 eV of Hartree was
+    counted twice, the rebuilt QP gap came out at -453 eV, and the CLI
+    exited 0.  Both modes below describe the same physical system, so
+    their eqp0 columns must agree.
+    """
+    from gw.eqp_bgw import make_eqp_bgw
+    with tempfile.TemporaryDirectory() as d_leg, \
+         tempfile.TemporaryDirectory() as d_new:
+        _make_eqp_cli_inputs(d_leg, has_hartree=False)
+        _make_eqp_cli_inputs(d_new, has_hartree=True)
+        make_eqp_bgw(d_leg)
+        make_eqp_bgw(d_new)
+        legacy = _read_eqp_qp_column(os.path.join(d_leg, "eqp0.dat"))
+        folded = _read_eqp_qp_column(os.path.join(d_new, "eqp0.dat"))
+    assert legacy.size and legacy.size == folded.size
+    assert np.allclose(legacy, folded, atol=1e-9), (
+        f"folded-kin_ion path disagrees with legacy on identical physics:\n"
+        f"  legacy {legacy[:4]}\n  folded {folded[:4]}\n"
+        f"  max|diff| = {np.max(np.abs(legacy - folded)):.6f} eV")
+
+
+def test_make_eqp_bgw_double_count_would_be_caught():
+    """Pin the size of the bug: not suppressing V_H shifts eqp0 by ~V_H."""
+    from gw import eqp_bgw
+    with tempfile.TemporaryDirectory() as d:
+        _make_eqp_cli_inputs(d, has_hartree=True)
+        eqp_bgw.make_eqp_bgw(d)
+        good = _read_eqp_qp_column(os.path.join(d, "eqp0.dat"))
+        # Simulate the pre-fix behaviour by stripping the contract flag.
+        with h5py.File(os.path.join(d, "kin_ion.h5"), "a") as f:
+            del f["kin_ion"].attrs["has_hartree"]
+        eqp_bgw.make_eqp_bgw(d, eqp0_out="eqp0_bad.dat",
+                             eqp1_out="eqp1_bad.dat")
+        bad = _read_eqp_qp_column(os.path.join(d, "eqp0_bad.dat"))
+    shift = float(np.mean(bad - good))
+    assert abs(shift - 280.0) < 1e-6, (
+        f"expected the un-suppressed run to be high by the V_H column "
+        f"(280 eV); got {shift:.3f} eV")
+
+
+# ---------------------------------------------------------------------------
 # 4. Collective barrier + fail-fast hook
 # ---------------------------------------------------------------------------
 
