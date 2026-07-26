@@ -1288,14 +1288,43 @@ def apply_eqp_and_reslice_bands(
 
 
 def _find_restart_file(input_file: str) -> str:
+    """Locate ``isdf_tensors_<n_rmu>.h5`` — loudly when the choice is ambiguous.
+
+    ``isdf_tensors_*.h5`` is namespaced by centroid count, so a run
+    directory that has been used for a μ-sweep holds several.  This
+    returned the first *lexicographically* sorted match, which is not the
+    newest and not necessarily the one the GW run that produced this
+    BSE's inputs wrote: ``isdf_tensors_1194.h5`` sorts before
+    ``isdf_tensors_276.h5``.  Picking the wrong one is silent — the BSE
+    kernel is built from a different ISDF basis than Σ was, every stage
+    reports success, and the exciton spectrum is quietly wrong.  The
+    ambiguity is now named in the log, and the *newest* file wins (the
+    one the most recent GW run wrote), which is the intent everywhere
+    this is called from.
+    """
     input_dir = os.path.dirname(os.path.abspath(input_file))
     candidates = []
     candidates.extend(sorted(glob.glob(os.path.join(input_dir, "tmp", "isdf_tensors_*.h5"))))
     candidates.extend(sorted(glob.glob(os.path.join(input_dir, "isdf_tensors_*.h5"))))
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    raise FileNotFoundError(f"Could not find canonical restart file isdf_tensors_*.h5 in {input_dir}")
+    candidates = [p for p in candidates if os.path.exists(p)]
+    if not candidates:
+        raise FileNotFoundError(f"Could not find canonical restart file isdf_tensors_*.h5 in {input_dir}")
+    if len(candidates) > 1:
+        # Newest wins; say so, and list what was passed over.
+        chosen = max(candidates, key=os.path.getmtime)
+        others = ", ".join(os.path.basename(p) for p in candidates
+                           if p != chosen)
+        print(
+            f"  *** LORRAX SANITY: {len(candidates)} restart tensor files "
+            f"match isdf_tensors_*.h5 in {input_dir} — they hold DIFFERENT "
+            f"ISDF bases (different centroid counts).  Using the newest, "
+            f"{os.path.basename(chosen)}; ignoring: {others}.  If that is "
+            f"not the basis this BSE's eqp/Σ inputs were built with, the "
+            f"exciton spectrum will be wrong with no other symptom — pass "
+            f"the file explicitly or clean the run directory. ***",
+            flush=True)
+        return chosen
+    return candidates[0]
 
 
 def _load_ring_subset(

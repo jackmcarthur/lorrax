@@ -424,14 +424,15 @@ if __name__ == "__main__":
             kpm_argv += ["--emin-ev", str(args.kpm_emin_ev)]
         if args.kpm_emax_ev is not None:
             kpm_argv += ["--emax-ev", str(args.kpm_emax_ev)]
-        bse_kpm.main(kpm_argv)
-        raise SystemExit(0)
+        # Propagate the sub-driver's exit code instead of hardcoding 0:
+        # delegating used to launder any failure it reported into rc 0.
+        raise SystemExit(bse_kpm.main(kpm_argv) or 0)
 
     if not args.lanczos:
         from . import bse_feast
 
         use_rpa = args.rpa or not args.bse
-        bse_feast.main(
+        _feast_rc = bse_feast.main(
             [
                 "-i",
                 args.input,
@@ -492,7 +493,8 @@ if __name__ == "__main__":
                 ),
             ]
         )
-        raise SystemExit(0)
+        # Propagate the sub-driver's exit code (see the kpm branch above).
+        raise SystemExit(_feast_rc or 0)
 
     # Non-TDA (full BSE) now flows through the same preview via the
     # ``solve_bse_sharded(tda=False)`` dispatch -> ``bse_nontda`` (structure-

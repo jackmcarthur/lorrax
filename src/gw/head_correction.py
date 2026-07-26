@@ -102,6 +102,66 @@ def resolve_head_override(params, omega) -> HeadSample | None:
     )
 
 
+def _check_dipole_coverage(
+    dipole_path, *, nb_file, nk_file, nk_run, nb_run, nelec, print_fn,
+):
+    """Loud coverage check on ``dipole.h5`` at the point of use.
+
+    ``dipole.h5`` is generated once by ``psp.get_dipole_mtxels`` at
+    whatever ``nbands`` the generating run happened to use, and it is
+    *not* namespaced by that count.  The head ``S(ω)`` built from it sums
+    over ``arange(nelec, nb_file)`` conduction states — so a file written
+    at 120 bands feeding a run whose Σ window spans 160 silently
+    truncates the transition space in ``wcoul0``, and therefore in every
+    q→0 Σ_SX / Σ_COH correction.  That exact mismatch shipped in the
+    2026-07 production runs and was found by hand, not by the code.
+
+    The file stamps ``nbands`` / ``nk`` as HDF5 attrs; nothing read them.
+    This warns rather than raises: a short dipole file is a *convergence*
+    defect, not a corrupt one, and refusing would break every existing
+    run directory.  It is loud enough to see.
+    """
+    from common import sanity
+
+    if not sanity.sanity_enabled():
+        return
+    attrs_nb, attrs_nk = None, None
+    try:
+        import h5py
+        with h5py.File(dipole_path, "r") as h5:
+            if "nbands" in h5.attrs:
+                attrs_nb = int(np.asarray(h5.attrs["nbands"]))
+            if "nk" in h5.attrs:
+                attrs_nk = int(np.asarray(h5.attrs["nk"]))
+    except (OSError, KeyError, ValueError) as exc:
+        print_fn(f"  [dipole guard] could not read attrs from {dipole_path} "
+                 f"({type(exc).__name__}: {exc})")
+    if attrs_nk is not None and attrs_nk != int(nk_run):
+        sanity.warn(
+            f"{dipole_path} was generated on nk={attrs_nk} but this run has "
+            f"nk_tot={int(nk_run)}.  The head S(ω) would be assembled from a "
+            f"different k-sampling than Σ — refusing to trust it is the only "
+            f"safe reading of this file.",
+            print_fn=print_fn)
+    n_cond_file = max(0, int(nb_file) - int(nelec))
+    print_fn(
+        f"  dipole.h5 coverage: {int(nb_file)} bands on disk "
+        f"({int(nelec)} occ + {n_cond_file} cond)"
+        + (f", run Σ window = {int(nb_run)} bands" if nb_run else ""))
+    if nb_run and int(nb_file) < int(nb_run):
+        sanity.warn(
+            f"{dipole_path} carries only {int(nb_file)} bands but this run's "
+            f"Σ window spans {int(nb_run)}.  The q→0 head S(ω) sums "
+            f"conduction states arange({int(nelec)}, {int(nb_file)}) — "
+            f"{n_cond_file} of them — so wcoul0, and every Σ_SX/Σ_COH head "
+            f"correction built from it, is converged to a SMALLER transition "
+            f"space than Σ itself.  This does not crash and does not change "
+            f"the exit code; it makes the head systematically wrong.  "
+            f"Regenerate dipole.h5 with nbands >= {int(nb_run)} "
+            f"(psp.get_dipole_mtxels) to close it.",
+            print_fn=print_fn)
+
+
 def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> HeadSample:
     """Resolve a q=0 head sample using overrides and configured source order."""
 
@@ -160,6 +220,10 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
         nk_tot = int(sym.nk_tot)
         nb = int(dipole_cart.shape[2])
         nelec = int(wfn.nelec)
+        _check_dipole_coverage(
+            dipole_path, nb_file=nb, nk_file=int(dipole_cart.shape[1]),
+            nk_run=nk_tot, nb_run=int(getattr(meta, "nb_sigma", 0) or 0),
+            nelec=nelec, print_fn=print_fn)
         occ = np.zeros((nk_tot, nb), dtype=float)
         occ[:, :max(0, min(nelec, nb))] = 1.0
         f_nk = jnp.asarray(occ, dtype=jnp.float64)

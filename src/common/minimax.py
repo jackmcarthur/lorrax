@@ -349,8 +349,18 @@ def _nc_remez_at_R(N, R, s_init, max_outer=6):
     try:
         s2, _ = _nc_solve_at_R(N, R, s, lawson_iter=0)
         s = np.sort(s2)
-    except Exception:
-        pass
+    except (np.linalg.LinAlgError, ValueError, FloatingPointError) as exc:
+        # Falling back to the unrefined initial nodes is a legitimate
+        # recovery, but it silently DEGRADES the tau quadrature that every
+        # chi0 build in the run is evaluated on -- and the resulting error
+        # shows up as a physics discrepancy, never as a failure.  Say so.
+        import warnings
+        warnings.warn(
+            f"minimax: node refinement at N={N}, R={R:.3e} failed "
+            f"({type(exc).__name__}: {exc}); continuing from the unrefined "
+            f"initial nodes.  The tau-quadrature error below is the number "
+            f"to check.",
+            RuntimeWarning, stacklevel=2)
 
     w = _nc_ls_weights(x, s)
     e = _nc_err_curve(x, s, w)

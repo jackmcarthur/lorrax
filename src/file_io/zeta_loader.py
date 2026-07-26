@@ -35,6 +35,7 @@ auto-route).  Use as a context manager or call :meth:`close`.
 """
 from __future__ import annotations
 
+import os
 from functools import partial
 from pathlib import Path
 from typing import Literal, Sequence
@@ -109,6 +110,46 @@ class ZetaLoader:
         self.n_q_full = int(np.prod(self.kgrid))
         self.q_layout: Literal["ibz", "full_bz"] = (
             "full_bz" if self.n_q_on_disk == self.n_q_full else "ibz")
+
+        # ── Read-side provenance gate ────────────────────────────────
+        # ``zeta_is_done`` is the writer's completeness flag: stamped
+        # False before the first chunk, flipped True by ``mark_zeta_done``
+        # only after the last one drains.  Until now NOTHING read it, so a
+        # ζ left behind by a job that died mid-write (this happened
+        # repeatedly during the 2026-07 campaign — SIGABRT at V_q entry,
+        # RESOURCE_EXHAUSTED in Stage C) was indistinguishable from a
+        # complete one and its undefined trailing q-blocks flowed straight
+        # into V_q → W → Σ with rc=0.  Refuse at open instead.
+        _allow_partial = bool(int(
+            os.environ.get("LORRAX_ALLOW_PARTIAL_ZETA", "0") or "0"))
+        if mode == "r" and not bool(self.zeta_is_done) and not _allow_partial:
+            raise ValueError(
+                f"{self._path} has isdf_header/zeta_is_done=False: the ζ fit "
+                f"that wrote it did not finish, so its trailing q-blocks are "
+                f"undefined.  Reading it would produce a physically "
+                f"meaningless V_q / W / Σ without any error.  Delete the file "
+                f"and re-run the fit (restart=false), or point at a complete "
+                f"ζ.  Set LORRAX_ALLOW_PARTIAL_ZETA=1 to override for "
+                f"debugging.")
+        # Header-vs-dataset agreement.  The two are written by different
+        # calls (``write_isdf_header`` then the SlabIO append); a crash
+        # between them, or a stale header surviving a rewrite, leaves a
+        # file whose centroid table describes a different basis than its
+        # ζ block.  In G-flat layout μ is the on-disk axis 1 (padded to
+        # the mesh), so the header count is a floor, not an equality.
+        _n_rmu_header = int(self.n_rmu)
+        if self.zeta_layout == 'G_flat':
+            if self.n_rmu_disk < _n_rmu_header:
+                raise ValueError(
+                    f"{self._path} is inconsistent: isdf_header lists "
+                    f"{_n_rmu_header} centroids but zeta_q_G has only "
+                    f"{self.n_rmu_disk} μ rows.  The header and the ζ block "
+                    f"were written by different runs — the file is corrupt.")
+        elif self.n_rmu_disk != _n_rmu_header:
+            raise ValueError(
+                f"{self._path} is inconsistent: isdf_header lists "
+                f"{_n_rmu_header} centroids but zeta_q has {self.n_rmu_disk}. "
+                f"The header and the ζ block were written by different runs.")
 
         # SlabIO handle (held open for the loader's lifetime so the
         # phdf5 FFI ctx is reused across reads).

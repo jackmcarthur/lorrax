@@ -109,6 +109,19 @@ def write_bgw_eqp(
 	if e_qp.shape != (nk, nb):
 		raise ValueError(f"e_qp shape {e_qp.shape} does not match e_dft {(nk, nb)}")
 
+	# ── Writer gate (pre-write) ──────────────────────────────────────
+	# The NaN-producing distributed back-solve of 2026-07 reached disk
+	# with rc=0 and was caught only because somebody afterwards counted
+	# the floats in eqp0.dat: ``%15.9f`` renders a NaN as the token
+	# ``nan``, so the *count of parseable floats* drops while the line
+	# count does not.  That check is made structural here — the writer
+	# refuses to pretend a NaN-bearing array is a result, and re-reads
+	# what it wrote to confirm the file it produced parses to exactly the
+	# expected number of finite floats.
+	from common import sanity
+	sanity.check_finite(f"{os.path.basename(path)} E_DFT column", e_dft)
+	sanity.check_finite(f"{os.path.basename(path)} E_QP column", e_qp)
+
 	abs_path = os.path.abspath(path)
 	if os.path.dirname(abs_path):
 		os.makedirs(os.path.dirname(abs_path), exist_ok=True)
@@ -129,7 +142,81 @@ def write_bgw_eqp(
 						f"{ispin:8d}{iband:8d}"
 						f"{float(e_dft[ik, ib]):15.9f}{float(e_qp[ik, ib]):15.9f}\n"
 					)
+	verify_eqp_file(abs_path, nk=nk, nb=nb, nspin=nspin)
 	return abs_path
+
+
+def verify_eqp_file(
+	path: str, *, nk: int, nb: int, nspin: int = 1,
+	print_fn=print,
+) -> bool:
+	"""Re-read a written ``eqp*.dat`` and assert its structural float count.
+
+	The invariant: after the ``#`` provenance line the file holds ``nk``
+	k-point headers (3 floats + 1 int) and ``nk·nspin·nb`` body rows
+	(2 ints + 2 floats).  So a healthy file parses to exactly
+
+	    n_float = nk·3 + nk·nspin·nb·2
+
+	*finite* floats.  ``float("nan")`` parses fine, so the count alone is
+	not enough — non-finite tokens are counted separately and reported.
+	This is the check that caught the NaN-producing back-solve after the
+	fact; running it inside the writer turns "somebody noticed later" into
+	"the run said so at the time".
+
+	Returns True when the file is structurally sound.  Cost is one pass
+	over a few-thousand-line text file, i.e. nothing.
+	"""
+	from common import sanity
+
+	if not sanity.sanity_enabled():
+		return True
+	expect_rows = int(nk) * int(nspin) * int(nb)
+	expect_floats = int(nk) * 3 + expect_rows * 2
+	n_float = 0
+	n_nonfinite = 0
+	n_header = 0
+	n_body = 0
+	with open(path, "r") as fh:
+		for line in fh:
+			if line.startswith("#") or not line.strip():
+				continue
+			tok = line.split()
+			# Header rows are (3f13.9, i8) — the first token is a float and
+			# carries a '.'.  Body rows are (2i8, 2f15.9) — the first two
+			# tokens are bare integers.  Discriminating on content rather
+			# than column width keeps this correct if either format ever
+			# widens a field.
+			if len(tok) == 4 and "." in tok[0]:
+				n_header += 1
+				vals = tok[:3]
+			elif len(tok) == 4:
+				n_body += 1
+				vals = tok[2:]
+			else:
+				n_nonfinite += len(tok)   # malformed → count as suspect
+				continue
+			for v in vals:
+				try:
+					x = float(v)
+				except ValueError:
+					n_nonfinite += 1
+					continue
+				if np.isfinite(x):
+					n_float += 1
+				else:
+					n_nonfinite += 1
+	base = os.path.basename(path)
+	ok = sanity.check_count(
+		f"{base} finite-float count", n_float, expect_floats,
+		print_fn=print_fn,
+		detail=(f"{n_header}/{nk} k-headers, {n_body}/{expect_rows} band rows, "
+		        f"{n_nonfinite} non-finite/unparseable tokens.  A NaN or Inf "
+		        f"in the QP column renders as a token %15.9f cannot round-trip "
+		        f"— the file looks complete but its numbers are not."))
+	ok = sanity.check_count(f"{base} band rows", n_body, expect_rows,
+	                        print_fn=print_fn) and ok
+	return ok
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +260,64 @@ def compute_z_factor_from_omega_grid(
 	return sigma_c_at_dft, z_factor
 
 
+def _implied_vxc_window_ev() -> tuple[float, float]:
+	"""The physical window for ``V_xc = E_DFT − (kin_ion + V_H)``, in eV.
+
+	Single-sources the bounds from ``gw.gw_output`` when that module
+	exposes them, so the writer-side gate and the driver-side
+	``_warn_on_unphysical_h0`` can never drift apart.  The literals below
+	are the same numbers, kept as a fallback so this module stays
+	importable on its own (the post-hoc ``python -m gw.eqp_bgw`` CLI does
+	not otherwise need the driver).
+	"""
+	try:
+		from . import gw_output as _gwo
+		return (float(getattr(_gwo, "_VXC_IMPLIED_MIN_EV", -50.0)),
+		        float(getattr(_gwo, "_VXC_IMPLIED_MAX_EV", 2.0)))
+	except ImportError:
+		return (-50.0, 2.0)
+
+
+def _warn_on_unphysical_implied_vxc(
+	*, e_dft_ev, kin_ion_diag_ev, hartree_diag_ev,
+) -> None:
+	"""Gate the mean-field side of eqp{0,1} on the DFT eigenvalue identity.
+
+	``E_DFT = ⟨T+V_ion+V_NL⟩ + ⟨V_H⟩ + ⟨V_xc⟩`` is exact, so a correct run
+	must reproduce a physical ``V_xc = E_DFT − (kin_ion + V_H)``
+	band-by-band.  That is the invariant this checks.
+
+	Why not check the QP shift itself.  The first version of this gate
+	bracketed ``Δ = eqp0 − E_DFT`` at ±50 eV, reasoning that GW moves
+	states by a few eV.  That is **wrong for deep states**: Δ = Σ_xc −
+	V_xc, and semicore bands carry bare-exchange Σ_x of order −100 eV
+	against an equally large V_xc, so a perfectly healthy run legitimately
+	shows |Δ| ≫ 50 eV.  It fired on 72 of 120 states of the cohsex_debug
+	fixture — a run that simultaneously reproduced its reference eqp to
+	1e-6 eV.  The implied-V_xc form has no such sensitivity: the large,
+	legitimate Σ_xc cancels out of it entirely, because Σ never enters.
+
+	This is deliberately the same invariant, and the same window, as
+	``gw_output._warn_on_unphysical_h0``.  That one guards the live driver
+	path; this one additionally covers the post-hoc ``make_eqp_bgw`` CLI,
+	which rebuilds eqp{0,1} from ``kin_ion.h5`` + ``sigma_mnk.h5`` on disk
+	— exactly the stale-artifact scenario — and had no guard at all.  It
+	is warn-only and prints nothing on a healthy run, so it adds no noise
+	where the driver already reports.
+	"""
+	from common import sanity
+
+	if not sanity.sanity_enabled():
+		return
+	implied_vxc = (np.asarray(e_dft_ev, dtype=np.float64)
+	               - (np.asarray(kin_ion_diag_ev, dtype=np.float64)
+	                  + np.real(np.asarray(hartree_diag_ev))))
+	lo, hi = _implied_vxc_window_ev()
+	sanity.check_in_range(
+		"implied Vxc = E_DFT − (kin_ion + V_H)", implied_vxc, lo, hi,
+		unit="eV")
+
+
 def compute_eqp_diag(
 	*,
 	kin_ion_diag_ev: np.ndarray,        # (nk, nb)
@@ -203,6 +348,13 @@ def compute_eqp_diag(
 		kin_ion_diag_ev + hartree_diag_ev + sigma_xc_at_dft - e_dft_ev
 	).real
 
+	# NOTE: the mean-field (implied-V_xc) gate deliberately does NOT live
+	# here.  ``compute_eqp_diag`` is shared by the live driver path, and
+	# there ``gw_output.write_results`` already runs
+	# ``_warn_on_unphysical_h0`` on these very arrays immediately before
+	# calling the writer — checking again would emit two identical
+	# complaints about one problem.  The gate is attached to
+	# :func:`make_eqp_bgw` instead, which is the path that has no guard.
 	eqp0 = e_dft_ev + delta_at_dft
 	if z_factor is None:
 		eqp1 = eqp0  # Z=1 trivially
@@ -399,6 +551,17 @@ def make_eqp_bgw(
 	sigma_x_diag = np.diagonal(sigma_x_irr, axis1=1, axis2=2)
 	hartree_diag = np.diagonal(hartree_irr, axis1=1, axis2=2)
 	sigma_c_omega_diag = np.diagonal(sigma_c_irr, axis1=2, axis2=3)  # (n_omega, nk, nb)
+
+	# Mean-field gate — this CLI is the unguarded path.  Unlike the live
+	# driver (where ``gw_output.write_results`` runs the same check just
+	# before writing), ``make_eqp_bgw`` rebuilds eqp{0,1} from whatever
+	# ``kin_ion.h5`` / ``sigma_mnk.h5`` happen to be sitting in
+	# ``run_dir`` — the stale-artifact scenario, with no guard at all.
+	_warn_on_unphysical_implied_vxc(
+		e_dft_ev=e_dft_ev,
+		kin_ion_diag_ev=kin_ion_diag_ev,
+		hartree_diag_ev=np.real(hartree_diag),
+	)
 
 	sigma_c_at_dft, z_factor = compute_z_factor_from_omega_grid(
 		sigma_c_omega_diag_ev=sigma_c_omega_diag,

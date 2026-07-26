@@ -38,10 +38,9 @@ def main() -> int:
     _DIST_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
     if not os.environ.get(_DIST_SENTINEL):
         if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
-            try:
-                jax.distributed.initialize()
-            except Exception:
-                pass
+            # Do NOT swallow: a failed distributed init in a >1-task run
+            # leaves this rank running a different program than its peers.
+            jax.distributed.initialize()
         os.environ[_DIST_SENTINEL] = "1"
 
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -63,6 +62,7 @@ def main() -> int:
     _log(f"n={args.n}  grid={p}x{q}  repeats={args.repeats}")
     _log(f"{'block':>6}  {'warmup':>9}  {'mean':>8}  {'std':>6}  {'min':>8}  "
          f"{'max|evals-ref|':>14}")
+    n_failed = 0
     for block in args.blocks:
         if args.n % (block * p) != 0 or args.n % (block * q) != 0:
             _log(f"  block={block:<4}   skip: n%block*{p}!=0")
@@ -92,9 +92,18 @@ def main() -> int:
             _log(f"{block:>6}  {warmup_ms:>8.0f}  {s.mean():>7.0f}  "
                  f"{s.std():>5.0f}  {s.min():>7.0f}  {err:>14.2e}")
         except Exception as e:
+            # Swallow-and-continue is right for a *sweep* (one block size
+            # failing must not hide the others), but the sweep's exit code
+            # must still report it: previously every block could error and
+            # the process still exited 0, so a CI invocation of this script
+            # could never fail.
+            n_failed += 1
             _log(f"  block={block:<4}   ERROR: {type(e).__name__}: "
                  f"{str(e)[:120]}")
 
+    if n_failed:
+        _log(f"FAILED: {n_failed} of {len(args.blocks)} block sizes errored")
+        return 1
     return 0
 
 
