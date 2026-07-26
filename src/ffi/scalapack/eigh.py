@@ -148,7 +148,7 @@ def distributed_eigh(A: jax.Array, *, mesh: Mesh) -> Tuple[jax.Array, jax.Array]
 
     ``A`` is ``(N, N)`` at ``P('x','y')``; returns ``(W, Z)`` with ``W``
     ``(N,)`` replicated and ``Z`` ``(N, N)`` at ``P('x','y')``.  This is the
-    shape the ``ffi.linalg.dispatch_eigh`` facade calls (one tile spread
+    shape ``ffi.linalg.LinalgPlan.__call__`` uses (one tile spread
     over the mesh); the batched entry point is what the ζ-fit uses.
     """
     if A.ndim != 2:

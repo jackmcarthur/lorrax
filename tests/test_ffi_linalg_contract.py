@@ -874,6 +874,88 @@ def test_resolver_never_auto_picks_slate():
 
 
 # ---------------------------------------------------------------------------
+# ffi.linalg.plan — the call-site interface.  These cells PIN the promise
+# that a plan resolves EXACTLY like resolve_backend: the plan exists to
+# move resharding and batching off the call sites, not to change routes.
+# ---------------------------------------------------------------------------
+
+def test_plan_resolution_is_identical_to_resolve_backend():
+    """Every (op, requested) resolves the same through both spellings —
+    including the ones that RAISE, with the same exception type."""
+    from ffi import linalg
+    mesh = _mesh_cpu_1x1()
+    for op in linalg.OPS:
+        for requested in linalg.BACKEND_CHOICES[op]:
+            try:
+                expected = linalg.resolve_backend(op, requested, mesh)
+            except (ValueError, RuntimeError) as exc:
+                with pytest.raises(type(exc)):
+                    linalg.plan(op, mesh, backend=requested)
+                continue
+            p = linalg.plan(op, mesh, backend=requested)
+            assert p.backend == expected, (op, requested)
+            assert p.is_native == (expected == linalg.NATIVE)
+            assert p.op == op and p.requested == requested
+
+
+def test_plan_native_contract():
+    """A native plan advertises no sharding contract, runs eigh itself,
+    and REFUSES the two ops whose native route lives in isdf/core."""
+    import jax.numpy as jnp
+    from ffi import linalg
+    mesh = _mesh_cpu_1x1()
+
+    p = linalg.plan("eigh", mesh, backend="auto")
+    assert p.is_native and p.in_sharding is None
+    rng = np.random.default_rng(0)
+    A = _herm(rng, 1, 8, "complex128")[0]
+    lam, R = p(jnp.asarray(A))
+    assert np.max(np.abs(np.asarray(A) @ np.asarray(R)
+                         - np.asarray(R) * np.asarray(lam)[None, :])) < 1e-10
+    # batched() on a native plan is jnp.linalg.eigh's own batching.
+    lam_b, R_b = p.batched(jnp.asarray(_herm(rng, 3, 8, "complex128")))
+    assert lam_b.shape == (3, 8) and R_b.shape == (3, 8, 8)
+
+    for op in ("cholesky", "solve_lu"):
+        q = linalg.plan(op, mesh, backend="auto")
+        assert q.is_native
+        with pytest.raises(NotImplementedError, match="isdf/core"):
+            q(jnp.asarray(A))
+
+
+def test_plan_describe_and_module_are_honest():
+    from ffi import linalg
+    mesh = _mesh_cpu_1x1()
+    p = linalg.plan("eigh", mesh, backend="off")
+    assert "native" in p.describe() and "any layout" in p.describe()
+    with pytest.raises(ValueError, match="no FFI backend module"):
+        _ = p.module
+
+
+@needs_host_ffi
+def test_plan_batched_matches_the_backend_call_cpu():
+    """``plan.batched`` on the CPU distributed eigh == the raw wrapper.
+
+    Pins the migration of ``isdf/core._factor_c_q_distributed_rank_truncate``
+    (which now says ``backend='distributed'`` and ``plan.batched``) against
+    what it used to call directly.  ScaLAPACK returns TRUE column
+    eigenvectors, so the plan's normaliser is the identity here — and that
+    is exactly what must stay true.
+    """
+    import jax.numpy as jnp
+    from ffi import linalg
+    mesh = _mesh_cpu_1x1()
+    rng = np.random.default_rng(11)
+    A = jnp.asarray(_hpd(rng, 2, 16, "complex128"))
+    assert linalg.plan("eigh", mesh, backend="distributed").backend == "scalapack"
+    W_ref, Z_ref = linalg.backend_module("scalapack").batched_distributed_eigh(
+        A, mesh=mesh)
+    W, Z = linalg.plan("eigh", mesh, backend="distributed", n=16).batched(A)
+    assert np.array_equal(np.asarray(W), np.asarray(W_ref))
+    assert np.array_equal(np.asarray(Z), np.asarray(Z_ref))
+
+
+# ---------------------------------------------------------------------------
 # eigh_backend = cusolvermp | slate — the htransform fH_q wiring
 # (bandstructure.bse_setup.compute_wfns_fi; ffi.common.dispatch.dispatch_eigh)
 # ---------------------------------------------------------------------------

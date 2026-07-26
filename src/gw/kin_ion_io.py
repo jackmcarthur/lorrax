@@ -282,6 +282,14 @@ def _psum_kernel(ndim: int, mesh: Mesh):
     recompile the reduction each time, and per-rank compiles are the
     documented dominant startup cost of this code base.
     """
+    # ``id(mesh)`` is safe as a key here (and everywhere else in the tree
+    # that uses it — isdf/core's five kernel caches do the same): the
+    # CACHED VALUE closes over ``mesh`` through the shard_map, so the Mesh
+    # object cannot be collected while its entry lives and its id cannot be
+    # recycled underneath us.  The failure mode is therefore a redundant
+    # compile on a second, equal Mesh object — never a stale hit.  Use
+    # ``ffi.slate.batched._mesh_key`` instead wherever the cached value
+    # does NOT retain the mesh.
     key = (int(ndim), id(mesh))
     fn = _PSUM_KERNELS.get(key)
     if fn is None:
@@ -584,6 +592,19 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     del rho_np
 
     # ---- 3. ⟨mk|V_H|nk⟩: k-partitioned, no reduction, one gather ------
+    #
+    # COMPILE NOTE (workstream Z audit, measured with JAX_LOG_COMPILES on
+    # the cohsex fixture): ``generate_gvectors_k`` returns ``Gk_crys`` at
+    # the k-point's OWN ``ngk``, which differs between k, so
+    # ``_compute_local_V_k_jit`` compiles once per DISTINCT ngk — 3 on the
+    # fixture (IBZ ngk 749/754/754/780), and bounded above by the IBZ
+    # k-count, not by nk.  ``compute_local_V_k`` carries a ``g_mask`` hook
+    # that would collapse this to ONE compile by padding to ngkmax, and it
+    # is deliberately NOT used here: the pad columns contribute exact
+    # zeros but they CHANGE THE SUMMATION ORDER of the ⟨m|V|n⟩ reduction,
+    # and this matrix element sits inside the ~500 eV H₀ cancellation this
+    # module exists to get right.  A few extra compiles of a small kernel
+    # is the correct trade; revisit only with a bit-exactness gate.
     ks_local = list(range(rank, nk, world))
     blk = max(1, -(-nk // world))
     v_local = np.zeros((blk, nb, nb), dtype=np.complex128)

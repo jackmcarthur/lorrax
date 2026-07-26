@@ -32,7 +32,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from ffi.linalg import NATIVE, dispatch_eigh, resolve_backend
+from ffi.linalg import plan as linalg_plan
 
 from .htransform import build_fH_R, build_R_grid_np, newton_inv
 
@@ -116,7 +116,7 @@ def compute_wfns_fi(
                    ``cusolvermp|slate`` route ONE (rank, rank) tile at a time
                    through the distributed-linalg FFI.  See the eigh comment
                    in the batch loop below for which regime is which, and
-                   ``ffi.linalg.dispatch_eigh`` for the backends.
+                   ``ffi.linalg.LinalgPlan`` for the backends.
         log_fn:    optional logger.
 
     Returns:
@@ -202,7 +202,7 @@ def compute_wfns_fi(
     # DEADLOCKS on rectangular blocks — and rank divisibility) fires HERE,
     # before any q is solved.  See ffi.linalg.resolve for the guard order.
     try:
-        eigh_resolved = resolve_backend("eigh", eigh_backend, mesh_xy, n=rank)
+        eigh_plan = linalg_plan("eigh", mesh_xy, backend=eigh_backend, n=rank)
     except ValueError as exc:
         if "divisible" in str(exc):
             raise ValueError(
@@ -210,7 +210,7 @@ def compute_wfns_fi(
                 f"retained SVD rank to lcm(px, py); a ctilde built on a "
                 f"different mesh has to be refit on this one.") from None
         raise
-    native = eigh_resolved == NATIVE
+    native = eigh_plan.is_native
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
 
     # The two stages either side of the eigh are plain traceable functions,
@@ -272,7 +272,7 @@ def compute_wfns_fi(
     @partial(jax.jit, static_argnames=('b_min', 'b_max'))
     def _q_batch(q_batch, fH_R, B, b_min, b_max):
         """Native: Fourier sum → batched eigh → projection, ONE fused jit."""
-        lam, U = dispatch_eigh(_fourier(q_batch, fH_R, True), mesh_xy, "off")
+        lam, U = jnp.linalg.eigh(_fourier(q_batch, fH_R, True))
         return _project(lam, U, B, b_min, b_max)
 
     @jax.jit
@@ -291,9 +291,8 @@ def compute_wfns_fi(
     # wide for the batched path runnable at all, at the cost of nq sequential
     # distributed solves.  Native stays the default.
     if not native:
-        # Mesh/geometry guards already passed in resolve_backend above.
-        log(f"  fH_q eigh: {eigh_resolved} FFI, ONE (rank {rank})² tile "
-            f"distributed over the {px}x{py} mesh, {nq} q serially")
+        # Mesh/geometry guards already passed when the plan was built.
+        log(f"  fH_q eigh: {eigh_plan.describe()}, {nq} q serially")
 
     lam_chunks, psi_chunks, c_chunks = [], [], []
 
@@ -310,8 +309,7 @@ def compute_wfns_fi(
     else:
         t_eigh = time.time()
         for i in range(nq):        # no batch padding: one q, one solve
-            lam_q, U_q = dispatch_eigh(_fH_q_one(q_pad[i], fH_R),
-                                       mesh_xy, eigh_resolved)
+            lam_q, U_q = eigh_plan(_fH_q_one(q_pad[i], fH_R))
             _emit(*_project_one(lam_q, U_q, B_rep, b_min, b_max))
             # nq SERIAL distributed solves is a long, silent stretch — log the
             # rate so a stall is distinguishable from slow progress.

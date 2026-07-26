@@ -41,7 +41,7 @@ from common.wfn_transforms import to_rchunk_inner
 # Distributed-linalg facade: mesh probing, guard resolution, and the ONE
 # import seam for the FFI backend packages (cusolvermp / slate / scalapack).
 from ffi.linalg import backend_module, mesh_is_cpu as _mesh_is_cpu, \
-    resolve_backend as _resolve_linalg_backend
+    plan as linalg_plan, resolve_backend as _resolve_linalg_backend
 
 
 def host_rss_gb() -> float:
@@ -1597,8 +1597,19 @@ def _factor_c_q_distributed_rank_truncate(
     rank_log = os.environ.get(
         "LORRAX_ZETA_RANK_LOG", "1") not in ("0", "", "false")
 
-    W, V = backend_module('scalapack').batched_distributed_eigh(
-        C_q, mesh=mesh_xy)
+    # ONE resolved plan, then one call.  ``'distributed'`` (not a hard-coded
+    # 'scalapack') is deliberate and is the SAME name ``_resolve_zeta_gather``
+    # approved: the platform default (ScaLAPACK on cpu, cuSOLVERMp on CUDA,
+    # ``resolve._DISTRIBUTED_DEFAULT``) is then chosen in ONE place instead of
+    # two that can disagree — naming scalapack here made a CUDA mesh pass the
+    # tier's resolve guard and then hit ffi.scalapack's host-only check at
+    # call time.  ``plan.batched`` uses ScaLAPACK's real batched entry point
+    # (one descriptor + one workspace for the whole (nq, μ, μ) stack) and
+    # falls back to a per-q loop for a backend that has none, so this call
+    # site does not encode which is which.
+    eigh_plan = linalg_plan('eigh', mesh_xy, backend='distributed',
+                            n=int(n_pad))
+    W, V = eigh_plan.batched(C_q)
 
     key = ('dist_rank_trunc', id(mesh_xy), int(nq), int(n_pad), n_log,
            float(rcond), bool(rank_log))
@@ -1702,6 +1713,16 @@ def _distributed_pinv_apply(
     per_q_bytes = (n_pad * (n_pad // px) + n_pad * (n_zcols // py)) * 16
     qb = _distributed_q_batch(nq, per_q_bytes)
 
+    # NOTE on the eager ``C_pinv[q0:q1]`` / ``Z_q[q0:q1]`` slices below:
+    # the sibling per_q tier (``_solve_one_q_and_update``) slices INSIDE
+    # its jit off a traced q, which gives one compiled shape for the whole
+    # loop.  Here the slices are eager, so a non-dividing ``nq`` gives a
+    # second compiled shape for the remainder block — bounded at two, and
+    # deliberate: the q-batch is chosen from a BYTE budget, so making the
+    # block shape uniform would mean padding nq and factoring q-blocks
+    # that do not exist.  Two compiles + two transient slices per r-chunk
+    # against ~nq of each on the traced-q form; at MoS2 12x12 (nq=144,
+    # qb=116) that is 2 blocks per r-chunk.
     key = ('dist_pinv_apply', id(mesh_xy), int(nq), int(n_pad), n_log,
            n_zcols, int(qb))
     if key not in _dist_solve_cache:
@@ -1980,6 +2001,43 @@ def _reshard_zeta_mu_X_r_Y_to_mu_XY(zeta: jax.Array, mesh_xy: Mesh) -> jax.Array
         zeta, NamedSharding(mesh_xy, P(None, ('x', 'y'), None)))
 
 
+def _distributed_backsolve(Z_q: jax.Array, mesh_xy: Mesh, run) -> jax.Array:
+    """RHS pad → distributed back-solve → output reshard → trim.
+
+    THE shared frame for every ζ back-solve that keeps the factor
+    distributed — cuSolverMp ``potrs``, the cuSolverMp/ScaLAPACK
+    ``getrf``+``getrs`` pair, and the ``distributed`` tier's ``C⁺Z``
+    GEMM.  Those three differ ONLY in ``run``; the three things around
+    it are identical and used to be written out three times:
+
+    1. **NRHS padding.**  Every block-cyclic descriptor (and the GEMM's
+       ``'y'``-sharded column block) needs the last axis divisible by
+       ``Py``.  ``pad_last_axis_to`` appends zero columns, which give
+       exactly zero solution columns, so this is free of arithmetic
+       consequences.
+    2. **The output reshard.**  All three land ζ at ``P(None,'x','y')``
+       = ``(q_, μ_X, r_Y)``; the downstream G-flat accumulator wants
+       ``(q_, μ_XY, r_)`` so its FFT runs sharding-preserving.  That is
+       ONE all-to-all on ``'y'`` (:func:`_reshard_zeta_mu_X_r_Y_to_mu_XY`)
+       — half of what the replicated/per_q tiers pay, because their
+       shard_map back-solve lands ζ column-sharded over the flat mesh.
+    3. **The trim** back to the caller's logical column count.
+
+    Keeping them here is not only de-duplication: FFI-adjacent
+    resharding is where this code base has lost the most time (J.9's
+    silent NaNs from a Z re-layout, T.4's per-r-chunk recompile of one),
+    so there is exactly one copy to keep right.
+
+    ``run`` takes the PADDED Z and returns ζ at ``P(None,'x','y')``.
+    """
+    Py = int(mesh_xy.shape['y'])
+    Z_pad, n_cols = pad_last_axis_to(Z_q, Py)
+    zeta_out = _reshard_zeta_mu_X_r_Y_to_mu_XY(run(Z_pad), mesh_xy)
+    if int(Z_pad.shape[-1]) != n_cols:
+        return zeta_out[:, :, :n_cols]
+    return zeta_out
+
+
 def _reshard_zeta_r_XY_to_mu_XY(zeta: jax.Array, mesh_xy: Mesh) -> jax.Array:
     """Reshard (q_, μ_, r_XY) → (q_, μ_XY, r_) for the shard_map branch.
 
@@ -2124,47 +2182,25 @@ def solve_zeta(
         # P(None,'x','y') — no factor gather, and no Z re-layout (Z is
         # consumed in the layout z_q_from_psi_sm builds it in, which is
         # exactly what scorecard J.9's flat-mesh column sharding made
-        # impossible).  The GEMM's last dim must divide Py.
-        Py = int(mesh_xy.shape['y'])
-        Z_q, n_zchunk_logical = pad_last_axis_to(Z_q, Py)
-        needs_trim = int(Z_q.shape[-1]) != n_zchunk_logical
-        zeta_xy = _distributed_pinv_apply(L_q, Z_q, mesh_xy, n_log)
-        # (q_, μ_X, r_Y) -> (q_, μ_XY, r_): ONE all-to-all on 'y'.  The
-        # other tiers pay this plus a second leg, because their back-solve
-        # lands ζ at P(None, None, ('x','y')).
-        zeta_out = _reshard_zeta_mu_X_r_Y_to_mu_XY(zeta_xy, mesh_xy)
-        if needs_trim:
-            return zeta_out[:, :, :n_zchunk_logical]
-        return zeta_out
+        # impossible).
+        return _distributed_backsolve(
+            Z_q, mesh_xy,
+            lambda Z: _distributed_pinv_apply(L_q, Z, mesh_xy, n_log))
 
     if solver_kind == 'cusolvermp_cholesky':
         # Distributed potrs: Z stays at P(None,'x','y'), no input reshard
-        # and no all-gather of L.  Output reshards to P(None, ('x','y'),
-        # None) so the downstream G-flat accumulator receives ζ
-        # μ-flat-sharded (the FFT layout it actually wants — see
-        # accumulate_rchunk_to_gflat / common.wfn_transforms).
+        # and no all-gather of L.
         _mp = backend_module('cusolvermp')
-        batched_distributed_potrs = _mp.batched_distributed_potrs
-        CusolverMpBatchedLowerL = _mp.CusolverMpBatchedLowerL
         Px = int(mesh_xy.shape['x'])
         Py = int(mesh_xy.shape['y'])
-        # potrs requires Z's last dim divisible by Py (see pad_last_axis_to).
-        Z_q, n_zchunk = pad_last_axis_to(Z_q, Py)
-        needs_padding = int(Z_q.shape[-1]) != n_zchunk
         # Re-attach handle metadata (the raw array carries no shape/grid info).
-        L_handle = CusolverMpBatchedLowerL(
+        L_handle = _mp.CusolverMpBatchedLowerL(
             raw=L_q, mesh=mesh_xy, n=int(n_rmu),
             mb=int(n_rmu) // Px, nb=int(n_rmu) // Py, nbatch=int(nq),
         )
-        zeta_xy = batched_distributed_potrs(L_handle, Z_q, mesh=mesh_xy)
-        # Natural potrs output sharding: P(None, 'x', 'y') = (q_, μ_X, r_Y).
-        # Target: P(None, ('x','y'), None) = (q_, μ_XY, r_).
-        # Single mesh axis 'y' moves from r-axis to μ-axis (joining 'x'
-        # there) — one all-to-all on 'y' between data axes 1 and 2.
-        zeta_out = _reshard_zeta_mu_X_r_Y_to_mu_XY(zeta_xy, mesh_xy)
-        if needs_padding:
-            return zeta_out[:, :, :n_zchunk]
-        return zeta_out
+        return _distributed_backsolve(
+            Z_q, mesh_xy,
+            lambda Z: _mp.batched_distributed_potrs(L_handle, Z, mesh=mesh_xy))
 
     if solver_kind in ('cusolvermp_lu', 'scalapack_lu'):
         # Distributed getrf+getrs for the transverse channels.  L_q here
@@ -2176,11 +2212,6 @@ def solve_zeta(
         batched_distributed_solve_lu = backend_module(
             'scalapack' if solver_kind == 'scalapack_lu' else 'cusolvermp'
         ).batched_distributed_solve_lu
-        Px = int(mesh_xy.shape['x'])
-        Py = int(mesh_xy.shape['y'])
-        # getrs descB requires NRHS % Py == 0 (see pad_last_axis_to).
-        Z_q, n_zchunk = pad_last_axis_to(Z_q, Py)
-        needs_padding = int(Z_q.shape[-1]) != n_zchunk
 
         def _dist_ridged_lu(L_log, Z_log):
             # The μ-slice to the LOGICAL extent (via solve_at_logical;
@@ -2212,15 +2243,16 @@ def solve_zeta(
             return batched_distributed_solve_lu(
                 L_log + ridge * eye_n, Z_log, mesh=mesh_xy)
 
-        zeta_xy = solve_at_logical(_dist_ridged_lu, n_log, (L_q,), Z_q)
-        if mu_pad:
-            zeta_xy = jax.lax.with_sharding_constraint(
-                zeta_xy, NamedSharding(mesh_xy, P(None, 'x', 'y')))
-        # Reshard rationale identical to the cholesky branch above.
-        zeta_out = _reshard_zeta_mu_X_r_Y_to_mu_XY(zeta_xy, mesh_xy)
-        if needs_padding:
-            return zeta_out[:, :, :n_zchunk]
-        return zeta_out
+        def _run_lu(Z):
+            zeta_xy = solve_at_logical(_dist_ridged_lu, n_log, (L_q,), Z)
+            if mu_pad:
+                # solve_at_logical's zero-refill re-embeds at the padded
+                # extent; pin the layout back before the output reshard.
+                zeta_xy = jax.lax.with_sharding_constraint(
+                    zeta_xy, NamedSharding(mesh_xy, P(None, 'x', 'y')))
+            return zeta_xy
+
+        return _distributed_backsolve(Z_q, mesh_xy, _run_lu)
 
     # Compute padding needed for even sharding across all devices
     total_devices = mesh_xy.devices.size

@@ -85,7 +85,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from ffi.linalg import NATIVE, dispatch_eigh, resolve_backend
+from ffi.linalg import plan as linalg_plan
 
 # pipeline constants (§13.5 production shape; reference values verbatim)
 ALPHA = 0.30          # Gaussian split width, 1/bohr; broad optimum ~1.5-2x dq
@@ -579,7 +579,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     which keeps the whole stage at ≤2 XLA compiles instead of one per
     distinct sphere size (15 at MoS2 12×12; the ``_clean_split`` census
     finding).  ``eigh_backend='auto'`` resolves to the batched native path —
-    see ``ffi.linalg.dispatch_eigh`` for when the FFI backends win;
+    see ``ffi.linalg.LinalgPlan`` for when the FFI backends win;
     they are honored per-q if explicitly requested.  n_μ is used at its
     LOGICAL extent here; the jitted evaluator pads on output.
 
@@ -601,17 +601,19 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     nq, n_mu = zx["nq"], zx["n_mu"]
     ngkmax = zx["ngkmax"]
     ndev = int(mesh_xy.devices.size)
-    # Resolve-time backend resolution: platform / compiled-capability /
-    # coverage / geometry guards all fire here, before the q loop (see
-    # ffi.linalg.resolve).  auto|off resolve to the q-batched native path.
-    eigh_resolved = resolve_backend("eigh", eigh_backend, mesh_xy)
+    # ONE resolved plan for the whole q loop: platform / compiled-capability
+    # / coverage / geometry guards all fire here, before any q is touched
+    # (see ffi.linalg.resolve), and the plan then carries the backend, the
+    # operand-sharding contract and the batch behaviour to the call site
+    # below.  auto|off resolve to the q-batched native path.  Hoisted, not
+    # per-chunk: resolution dlopens, and the first FFI call builds a BLACS /
+    # cuSOLVERMp context (scorecard L §5).
+    eigh_plan = linalg_plan("eigh", mesh_xy, backend=eigh_backend)
     q_chunk = int(min(q_chunk, nq,
                       max(ndev, ndev * (5e9 // (n_mu * ngkmax * 16 * ndev)))))
     assert np.max(np.abs(zx["qfr"][:, 2])) < 1e-12, "slab pipeline needs q_z=0"
     GS = lr_gset(zx, alpha)
     nG = GS.shape[1]
-    grid_xy = NamedSharding(mesh_xy, P("x", "y"))
-    qb1 = NamedSharding(mesh_xy, P(("x", "y")))
     qb2 = NamedSharding(mesh_xy, P(("x", "y"), None))
     qb3 = NamedSharding(mesh_xy, P(("x", "y"), None, None))
 
@@ -682,17 +684,17 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
 
     for q0 in range(0, nq, q_chunk):
         sl = slice(q0, min(q0 + q_chunk, nq))
-        if eigh_resolved == NATIVE:
+        if eigh_plan.is_native:
             lam, R = _eigh_batch(C_herm(sl))
         else:
-            # explicit distributed-FFI request: per-q eigh, then the same
-            # batched post-eigh pipeline (single source for the math).
-            pairs = [dispatch_eigh(jax.device_put(C_herm(slice(q, q + 1))[0],
-                                                  grid_xy),
-                                   mesh_xy, eigh_resolved)
-                     for q in range(sl.start, sl.stop)]
-            lam = jnp.stack([p[0] for p in pairs])
-            R = jnp.stack([p[1] for p in pairs])
+            # Explicit distributed-FFI request.  ``plan.batched`` is the
+            # per-q loop + stack this used to spell out, plus the operand
+            # reshard to the FFI's P(None,'x','y') contract — one call, and
+            # the only thing that changes if a backend ever grows a real
+            # batched eigh is which branch inside the plan runs.  The same
+            # batched post-eigh pipeline follows either way (single source
+            # for the math).
+            lam, R = eigh_plan.batched(C_herm(sl))
         S_b, V_b, F_b = _clean_split(
             lam, R,
             jax.device_put(jnp.asarray(zx["ZG"][sl]), qb3),

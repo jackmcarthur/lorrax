@@ -44,16 +44,27 @@ input file (cohsex.in)         CLI flags            env
         "native" | "cusolvermp" | "slate" | "scalapack"
                      │
                      ▼
-   ffi.linalg.dispatch_eigh(A, mesh, resolved)        ← call-time routing
+   ffi.linalg.plan(op, mesh, backend=…, n=…) -> LinalgPlan
+        plan.is_native            ← "you own this route"
+        plan(A)                   ← ONE tile, resharded inside
+        plan.batched(A)           ← a stack, uniform across backends
+        plan.describe()           ← one line for the run banner
+                     │
+                     ▼
    ffi.linalg.backend_module(name).<distributed op>   ← the ONE import seam
 ```
 
-Three layers, one module each in `src/ffi/linalg/`:
+Four layers, one module each in `src/ffi/linalg/`:
 
 * **`resolve.py`** — vocabulary, guard ladder, `resolve_backend`,
   `list_backends`, `backend_module`, `mesh_is_cpu`/`mesh_platform`.
-* **`dispatch.py`** — `dispatch_eigh` (per-op call-time dispatch and
-  output-convention normalization).
+* **`plan.py`** — `plan()` → `LinalgPlan`: **the call-site interface**.
+  Resolves once and carries the answer together with the layout
+  contract, the operand reshard, the batch behaviour and the per-backend
+  output conventions.  See "The plan API" below.
+* **`dispatch.py`** — `dispatch_eigh`, the older single-call entry point,
+  now a thin shim over a plan.  Kept for back-compat; new code takes a
+  plan.
 * **backends** — `ffi/cusolvermp/` (CUDA), `ffi/slate/` (CUDA + host),
   `ffi/scalapack/` (host), each a thin `shard_map`+`jax.ffi` wrapper
   over one C++ handler in `liblorrax_ffi.so` / `liblorrax_ffi_host.so`;
@@ -276,27 +287,83 @@ cannot work (with a printed notice), but deliberately does NOT rewrite
 `auto` (see "Sharp edges") and does not touch `eigh_backend` — an
 explicit FFI eigh request keeps fails-loudly semantics at resolve time.
 
+## The plan API
+
+`linalg.plan(op, mesh, backend=…, n=…)` returns a **`LinalgPlan`**: the
+resolution, plus everything a call site used to re-derive around it.
+
+| attribute / method | what it is |
+|---|---|
+| `.backend` | the resolved name (`native` / `cusolvermp` / `slate` / `scalapack`) |
+| `.is_native` | `True` ⇒ **the caller owns this route** (see below) |
+| `.in_sharding` / `.batch_in_sharding` | the operand contract: `P('x','y')` for one tile, `P(None,'x','y')` for a stack; `None` on a native plan |
+| `.module` | the backend package, via `backend_module` |
+| `plan(A, …)` | run on ONE tile; operands moved to `.in_sharding` first |
+| `plan.batched(A, …)` | run on a stack — the backend's own batched entry point if it has one, otherwise a loop + `jnp.stack` |
+| `.describe()` | one line for a run banner |
+
+Why it exists: every FFI-linalg call site had grown the same five lines
+around the one that mattered — `resolve_backend(...)`, compare against
+`NATIVE`, build a `NamedSharding(mesh, P('x','y'))`, `device_put` /
+`with_sharding_constraint` the operand into it, then loop the batch axis
+and `jnp.stack` because that particular backend has no batched entry
+point.  Five copies is five places for **FFI-adjacent resharding** to
+drift, and that is where this code base has lost the most time (J.9's
+silent NaNs from a Z re-layout, T.4's per-r-chunk recompile of one, V.4's
+deleted `_reshard_z`).  `ensure_sharding` — traced ⇒
+`with_sharding_constraint`, already-there ⇒ untouched, otherwise
+`device_put` — is now the single copy.
+
+**The plan does not change resolution.**  `plan()` calls
+`resolve_backend` with the caller's arguments and stores the answer;
+route strings, `auto` policy and every guard are byte-identical to
+calling the resolver directly, and the pinned route tests cover both
+spellings.
+
+**`is_native` means the caller owns it.**  `native` is a real backend
+whose fast paths are *batched, and fused into the caller's jit* — and
+for cholesky / solve_lu it is not one call at all but the channel-policy
+route in `isdf/core` (replicated dense factor / 2-D blocked `shard_map` /
+per-q ridged solve).  So `plan(...)` runs the native path only for
+`eigh`, where it genuinely is one call, and raises for the other two
+naming what owns them rather than pretending.
+
+**Hoist the plan out of loops.**  Resolution `dlopen`s (cached
+afterwards) and the first FFI call builds a BLACS / cuSOLVERMp context
+and compiles an XLA module — 1.4–2.7 s measured, scorecard L §5.
+
 ## Code examples
 
 Resolve + call for eigh on a 2×2 mesh (the `bse_setup` pattern):
 
 ```python
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh
 from ffi import linalg
 
 mesh = Mesh(devices.reshape(2, 2), ('x', 'y'))          # one process/device
 
 # Resolve ONCE, before the q loop; every guard fires here.
-resolved = linalg.resolve_backend("eigh", requested, mesh, n=n)
+eigh_plan = linalg.plan("eigh", mesh, backend=requested, n=n)
+log(eigh_plan.describe())
 
-if resolved == linalg.NATIVE:
-    lam, R = jnp.linalg.eigh(A_qbatch)                  # q-sharded batch
+if eigh_plan.is_native:
+    lam, R = jnp.linalg.eigh(A_qbatch)      # q-sharded batch, fused in caller
 else:
-    A = jax.device_put(A_one, NamedSharding(mesh, P('x', 'y')))
-    lam, R = linalg.dispatch_eigh(A, mesh, resolved)    # ONE distributed tile
-# Either way: A @ R == R @ diag(lam) (dispatch normalizes conventions).
+    lam, R = eigh_plan(A_one)               # ONE distributed tile
+# Either way: A @ R == R @ diag(lam) (the plan normalizes conventions).
 ```
+
+A stack, without caring whether the backend is batched (the
+`vq_interp.prepare_coarse` and ζ-tier pattern):
+
+```python
+lam, R = eigh_plan.batched(C_chunk)         # (nb, n, n) -> (nb, n), (nb, n, n)
+```
+
+ScaLAPACK factors the whole stack in one FFI call (one descriptor, one
+workspace); cuSOLVERMp and SLATE have no batched eigh, so the plan loops
+and stacks.  The call site does not encode which is which.
 
 Cholesky through the ζ-fit policy layer (route strings) and the facade
 import seam:
@@ -335,12 +402,26 @@ What can run here?
    `BACKEND_CHOICES`, one `(op, backend) → (target, platforms)` row in
    `_SPEC`, any geometry rule in `_check_geometry`, and a branch in
    `backend_module`.
-4. Route the call in `ffi/linalg/dispatch.py` (for eigh) or the
-   consumer's route-string branch (`isdf/core.py` for the ζ-fit ops),
-   normalizing the output convention in the dispatcher, not at call
-   sites.
+4. Add ONE row to `ffi/linalg/plan.py`'s `_IMPL`: the single-tile entry
+   point, the stacked one (either may be `None` — the plan fills the
+   missing side in), and an output normaliser if the library's
+   convention differs.  Every migrated call site picks the backend up
+   from that row; do NOT normalize conventions at call sites.
 5. Extend the config vocabulary (`gw_config.py` validation + the key
    comment) and this page's table.
+
+### Call sites: migrated, and not
+
+| call site | state |
+|---|---|
+| `bandstructure/bse_setup.compute_wfns_fi` (fH_q) | **plan** — one plan for the whole q loop |
+| `bse/vq_interp.prepare_coarse` (coarse C_q) | **plan** — `plan.batched` replaced the hand-rolled per-q loop + `jnp.stack` |
+| `isdf/core._factor_c_q_distributed_rank_truncate` (ζ `distributed` tier) | **plan** — `backend='distributed'`, so the platform default is chosen in ONE place (it used to hard-code `scalapack` while the tier's own guard approved `distributed`, which on a CUDA mesh approved cuSOLVERMp and then called the host-only backend) |
+| `common/eigh_benchmark` | **plan** — and the plan is now hoisted out of the timing loop |
+| `isdf/core.solve_zeta` cusolvermp-potrs / getrf+getrs branches | route strings + a cuSOLVERMp *handle* whose block-cyclic geometry `solve_zeta` rebuilds; the surrounding pad → solve → reshard → trim frame is de-duplicated into `_distributed_backsolve`, the backend call itself is left on `backend_module`. Migrate together with the ζ route strings, never separately — they are pinned. |
+| `isdf/core.factor_c_q` cusolvermp / slate cholesky branches | same: pinned route strings, and the two backends return different objects (handle vs `to_jax_lower()` L). `_IMPL` records the asymmetry; the branches can move once a route-pin test covers the handle path. |
+| `gw/w_isdf` cuBLASMp fused W-solve | **not a selectable op** — one fused gemm+potrf+trsm kernel, no native twin to dispatch against. Out of scope by design. |
+| `common/slate_*_test.py`, `slate_vs_cusolvermp_bench`, `eigh_block_sweep`, `cusolvermp_*_test.py` | deliberately NOT migrated: they exercise backend *internals* (raw buffer layouts, `block_size`, `compute_evecs`) that the plan normalizes away. Testing through the abstraction would stop them testing the thing. |
 
 ## Sharp edges (read before touching defaults)
 

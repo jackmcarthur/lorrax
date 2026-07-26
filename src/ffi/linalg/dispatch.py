@@ -17,7 +17,8 @@ from __future__ import annotations
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
-from .resolve import EIGH_BACKENDS, NATIVE, backend_module, resolve_backend
+from .plan import plan as _plan
+from .resolve import EIGH_BACKENDS, NATIVE
 
 __all__ = ["dispatch_eigh", "EIGH_BACKENDS"]
 
@@ -80,17 +81,15 @@ def dispatch_eigh(A, mesh_xy: Mesh, backend: str):
     """
     if backend in ("auto", "off", NATIVE):
         return jnp.linalg.eigh(A)
-    resolved = resolve_backend("eigh", backend, mesh_xy)
-    if resolved == NATIVE:                 # (unreachable today: eigh has no
+    p = _plan("eigh", mesh_xy, backend=backend)
+    if p.is_native:                        # (unreachable today: eigh has no
         return jnp.linalg.eigh(A)          # silent FFI→native fallback)
     if A.ndim != 2:
         raise ValueError(
             f"eigh backend {backend!r} takes ONE (n, n) matrix — got shape "
             f"{A.shape}.  The FFI backends distribute a single tile over the "
             f"mesh; batch by looping the caller, not by a leading axis.")
-    if resolved == "cusolvermp":
-        lam, Qraw = backend_module("cusolvermp").distributed_eigh(A, mesh=mesh_xy)
-        return lam, jnp.conj(Qraw).T       # raw buffer → column eigenvectors
-    # slate and scalapack both return TRUE column eigenvectors.
-    lam, Q = backend_module(resolved).distributed_eigh(A, mesh=mesh_xy)
-    return lam, Q
+    # ``LinalgPlan`` owns the operand reshard and the per-backend
+    # eigenvector-layout normalisation (cuSOLVERMp's raw buffer is the
+    # conjugate transpose of the column form; slate/scalapack are columns).
+    return p(A)

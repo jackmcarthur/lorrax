@@ -77,8 +77,7 @@ def run_multiprocess(n: int, repeats: int) -> int:
         os.environ[_DIST_SENTINEL] = "1"
 
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-    from ffi.linalg import backend_module
-    distributed_eigh = backend_module("cusolvermp").distributed_eigh
+    from ffi.linalg import plan as linalg_plan
 
     world = jax.process_count()
     _log(f"\n=== multi-process mode, n={n}, repeats={repeats}, world={world} ===")
@@ -97,12 +96,13 @@ def run_multiprocess(n: int, repeats: int) -> int:
     A = jax.device_put(jnp.asarray(A_host),
                        NamedSharding(mesh, P("x", "y")))
 
-    _log(f"\n--- cusolverMp distributed_eigh ({p}x{q} grid) ---")
-    time_call(lambda a: distributed_eigh(a, mesh=mesh),
-              (A,), repeats, f"Mp-{world}proc")
+    # Resolved once, outside the timing loop (scorecard L §6).
+    eigh_plan = linalg_plan("eigh", mesh, backend="cusolvermp", n=n)
+    _log(f"\n--- {eigh_plan.describe()} ({p}x{q} grid) ---")
+    time_call(lambda a: eigh_plan(a), (A,), repeats, f"Mp-{world}proc")
 
     # correctness
-    evals, _ = distributed_eigh(A, mesh=mesh)
+    evals, _ = eigh_plan(A)
     from jax.experimental import multihost_utils
     evals_np = np.sort(np.asarray(multihost_utils.process_allgather(evals, tiled=False)))
     _log(f"  max |eigvals - ref| = {np.max(np.abs(evals_np - ref)):.2e}")
@@ -112,7 +112,7 @@ def run_multiprocess(n: int, repeats: int) -> int:
 def run_dispatch(sizes, repeats: int, batch: int, backend: str) -> int:
     """The dispatch question: q-BATCHED native vs ONE distributed tile.
 
-    This is the measurement ``ffi.linalg.dispatch_eigh`` cites for
+    This is the measurement ``ffi.linalg.LinalgPlan`` cites for
     choosing a backend, and the one ``bandstructure.bse_setup`` faces per q.
     Both arms decompose the SAME kind of matrix — Hermitian complex128,
     ``(n, n)`` — and are reported as **ms per matrix**, the only comparable
@@ -123,13 +123,19 @@ def run_dispatch(sizes, repeats: int, batch: int, backend: str) -> int:
               ``batch/ndev`` WHOLE matrices concurrently.  Costs
               ``batch/ndev · n²·16`` bytes per device, so it stops fitting
               first.
-      ffi     ``dispatch_eigh`` on ONE ``(n, n)`` sharded ``P('x','y')``:
-              the whole mesh works on one matrix, ``n²·16/ndev`` per device.
+      ffi     a resolved ``ffi.linalg`` PLAN on ONE ``(n, n)`` sharded
+              ``P('x','y')``: the whole mesh works on one matrix,
+              ``n²·16/ndev`` per device.
+
+    The plan is built ONCE, outside the timing loop — resolution probes
+    the FFI library and the first call builds a BLACS / cuSOLVERMp
+    context and compiles an XLA module (1.4–2.7 s, scorecard L §5), and
+    neither belongs in a per-call median.
 
     One JAX process per GPU (the LORRAX process model), square mesh.
     """
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-    from ffi.linalg import dispatch_eigh
+    from ffi.linalg import plan as linalg_plan
 
     world = jax.process_count()
     p = int(round(np.sqrt(world)))
@@ -157,7 +163,8 @@ def run_dispatch(sizes, repeats: int, batch: int, backend: str) -> int:
         t_nat = _median_ms(lambda: f_nat(A_b), repeats) / batch
 
         A_1 = jax.device_put(jnp.asarray(A_np), NamedSharding(mesh, P("x", "y")))
-        t_ffi = _median_ms(lambda: dispatch_eigh(A_1, mesh, backend), repeats)
+        eigh_plan = linalg_plan("eigh", mesh, backend=backend, n=n)
+        t_ffi = _median_ms(lambda: eigh_plan(A_1), repeats)
 
         _log(f"{n:>7} {t_nat:>15.1f} {t_ffi:>13.1f} {t_ffi / t_nat:>11.2f}")
     return 0
