@@ -13,6 +13,7 @@ The whole model is two things summed:
     L_q          nq·μ²·16 / P            (÷P, μ²  — the rank floor)
     gflat_acc    nq·μ·ngkmax·16 / P      (÷P)
     4·ψ_copies   nk·μ·nb·ns·16, 2 on 'x' + 2 on 'y'  (÷√P — single-axis)
+    loader_tbl   nk·n_rtot·4 + nk·ngkmax·16          (REPLICATED, no ÷P)
 
 **stage transients** — each stage adds ONE transient on top; they do not
 co-exist, so the HWM takes a ``max``, not a sum:
@@ -96,19 +97,34 @@ def _factor_mesh(pp: int) -> tuple[int, int]:
 # The consequential array inventory (§1)
 # ---------------------------------------------------------------------------
 
-def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax,
+def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
                       p_x, p_y) -> dict:
     """The un-chunkable floor resident across the whole r-chunk loop.
 
     ``L_q`` and ``gflat_acc`` are ÷P (μ²/μ-family); the four ψ centroid
     copies are single-axis ÷√P (2 on 'x', 2 on 'y') — the corrected
-    centroid term (design §5 bug #4: NOT ÷p_xy)."""
+    centroid term (design §5 bug #4: NOT ÷p_xy).
+
+    ``loader_tables`` is the WFN loader's REPLICATED per-k metadata,
+    staged once by ``WfnLoader.box_index_dev`` / ``_ensure_phdf5_static``
+    and retained for the loader's lifetime: the sparse-G→FFT-box index
+    ``(nk, nx, ny, nz) int32`` and the τ-phase row ``(nk, ngkmax) c128``.
+    Small (121 MB at MoS2 12×12) but **P-INDEPENDENT** — adding nodes
+    never shrinks it, so it belongs in the floor rather than nowhere.
+    It is modelled here because these two arrays used to cost ``P ×``
+    their size as a *transient* on top (JAX's hidden ``device_put`` →
+    ``assert_equal`` all-gather, 7.7 GB/rank at P=64, 17.4 GB projected
+    at P=144); that is what made this planner read 0.48× of the measured
+    node peak at 606c/P=64.  Cured in ``common.collectives.
+    device_put_process_local``; keep the residency term so the floor
+    stays honest."""
     P_ = p_x * p_y
     psi_one = _c128(nk, ns, mu, nb)
     return {
         "L_q":         _c128(nq, mu, mu, shard=P_),
         "gflat_acc":   _c128(nq_disk, mu, ngkmax, shard=P_),
         "psi_copies":  2 * psi_one / p_x + 2 * psi_one / p_y,
+        "loader_tables": 4.0 * nk * n_rtot + _C128 * nk * ngkmax,
     }
 
 
@@ -294,16 +310,24 @@ def plan_gflat_chunks(
     budget = budget_gb * 1e9
     target = budget * target_utilization
 
-    sys = dict(nk=nk, ns=ns, nq=nq, nq_disk=nq_disk, mu=mu, nb=nb, ngkmax=ngkmax)
+    sys = dict(nk=nk, ns=ns, nq=nq, nq_disk=nq_disk, mu=mu, nb=nb,
+               ngkmax=ngkmax, n_rtot=n_rtot)
 
     # ---- Phase 1: the rank floor (un-chunkable ÷P / ÷√P family) ---------
     def _floor_at(pp: int) -> float:
         px, py = _factor_mesh(pp)
         return sum(_persistent_bytes(p_x=px, p_y=py, **sys).values())
 
+    # ``loader_tables`` is P-INDEPENDENT, so if it alone busts the budget no
+    # rank count fixes it — say so at once instead of stepping the search a
+    # million times (each step factorises the mesh).
+    _p_independent = _persistent_bytes(p_x=1, p_y=1, **sys)["loader_tables"]
     p_min = 1
-    while p_min < 1 << 20 and _floor_at(p_min) > target:
-        p_min += 1
+    if _p_independent > target:
+        p_min = 1 << 20
+    else:
+        while p_min < 1 << 20 and _floor_at(p_min) > target:
+            p_min += 1
 
     persistent = _persistent_bytes(p_x=p_x, p_y=p_y, **sys)
     persistent_total = sum(persistent.values())
@@ -392,15 +416,34 @@ def plan_gflat_chunks(
     # On the H5PY_ALLGATHER SlabIO backend (the CPU default whenever the venv
     # lacks mpi4py + h5py-parallel, which is the case on Frontera today)
     # ``_slab_io_allgather._to_host`` process_allgathers the WHOLE tensor onto
-    # EVERY rank and then copies it to host numpy — so V_qmunu / W0_qmunu land
-    # UNSHARDED, twice.  Nothing in stages A-E models an I/O-seam replication,
-    # which is why the planner reported a 6.70 GB HWM for a run that died past
-    # ζ-fit.  Scales as μ², so it is the next wall after Stage C:
-    #   μ=276  -> 0.47 GB    μ=2412 -> 27 GB    μ=10k  -> 460 GB.
+    # EVERY rank and then copies it to host numpy — so each written tensor
+    # lands UNSHARDED, twice (the gathered device buffer AND the host numpy
+    # copy).  Nothing in stages A-E models an I/O-seam replication, which is
+    # why the planner reported a 6.70 GB HWM for a run that died past ζ-fit.
     # ``slab_io_replicates=False`` (PHDF5_FFI / PHDF5_HOST: each rank writes
     # its own hyperslab) drops it to the sharded cost.
+    #
+    # TWO different tensors go through this seam and the model must take the
+    # LARGER, not just the ``(μ, μ)`` one:
+    #   V_qmunu / W0_qmunu    (n_q_ibz, μ, μ)        — μ² family
+    #   the G-flat ζ tensor   (n_q_disk, μ, ngkmax)  — μ·ngkmax family
+    # Whenever ngkmax > μ (true at every centroid count below ~ngkmax) the
+    # G-flat write is the binder and the old μ²-only term UNDER-predicted it.
+    # MEASURED (wk_Y probe, 1998 centroids / μ_pad=2048 / ngkmax=8603 / P=64,
+    # run dir ``runs/d_1998_P64_rep``): the largest collective in the whole
+    # run is one all-gather of
+    #     nq·μ_pad·ngkmax·16 = 144·2048·8603·16 = 40,594,046,976 B
+    # to the byte, on top of 60.7 GB already live — while this term reported
+    # 2·144·2048²·16 = 19.33 GB, i.e. 2.10× too small, and the planner named
+    # the right binder at the wrong size.  The corrected term, both copies,
+    # at nq=144 / ngkmax=8603 (MoS2 12x12):
+    #   μ_pad=288 -> 11.42 GB   640 -> 25.37 GB   2048 -> 81.19 GB
+    # each of which is 2x a collective the probe has actually SEEN in a dump.
     _v_tensor = _c128(n_q_ibz, mu, mu, shard=1 if slab_io_replicates else p_xy)
-    F_t = 2.0 * _v_tensor if slab_io_replicates else _v_tensor
+    _gflat_tensor = _c128(nq_disk, mu, ngkmax,
+                          shard=1 if slab_io_replicates else p_xy)
+    _f_tensor = max(_v_tensor, _gflat_tensor)
+    F_t = 2.0 * _f_tensor if slab_io_replicates else _f_tensor
 
     peaks = {
         "A_centroid_load": persistent_total + A_t,

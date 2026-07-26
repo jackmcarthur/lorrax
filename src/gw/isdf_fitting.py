@@ -12,6 +12,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common import Meta
 from common import timing
 from common import jax_profile
+from common.collectives import (
+    device_put_process_local as _device_put_process_local,
+)
 from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
 
 from isdf.core import (
@@ -473,10 +476,14 @@ def fit_zeta_to_h5(
                   f"path={_resolved_solver_kind}]")
         _gather_gb = (int(C_q_flat.shape[0]) * int(n_rmu_padded) ** 2
                       * 16 / 1e9)
+        # per-q tile: the two structural all_gathers inside ``_per_q_block``
+        # move μ²/p_y (row block) + μ² (full tile) — measured, not nominal.
+        _p_y = int(mesh_xy.shape['y'])
+        _tile_gb = (int(n_rmu_padded) ** 2 * 16 * (1.0 + 1.0 / _p_y)) / 1e9
         print(f"  Zeta back-solve tier: {_resolved_zeta_gather} "
               f"(distributed_zeta_solve={distributed_zeta_solve})  "
               f"replicated (nq,μ,μ) gather would be {_gather_gb:.2f} GB/rank; "
-              f"per-q tile {int(n_rmu_padded) ** 2 * 16 / 1e9:.3f} GB; "
+              f"per-q tile {_tile_gb:.3f} GB (×nq executions/r-chunk); "
               f"distributed tier gathers NO (μ,μ) object")
         L_q = factor_c_q(
             C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
@@ -868,9 +875,11 @@ def fit_zeta_to_h5(
               f"(n_q={n_q_disk} × n_mu_local={_n_mu_local}); "
               f"chunk_size={_cs} → "
               f"per-iter FFT box {_cs * n_rtot * 16 / 1e9:.2f} GB/rank")
-    # Numpy → replicated: avoid the ``jnp.asarray`` wrap that would
-    # single-device-stage and turn device_put into an all-reduce.
-    _q_irr_frac_dev = jax.device_put(
+    # Numpy → replicated, process-locally: ``jax.device_put(numpy, <a
+    # multi-process NamedSharding>)`` fires JAX's hidden
+    # ``multihost_utils.assert_equal`` all-gather (see
+    # ``common.collectives.device_put_process_local``).
+    _q_irr_frac_dev = _device_put_process_local(
         np.asarray(q_irr_frac, dtype=np.float64),
         NamedSharding(mesh_xy, P(None, None)))
 
@@ -1047,7 +1056,7 @@ def fit_zeta_to_h5(
         # mask them here.  Logical slots ``[..., :ngk[q]]`` carry the
         # real coeffs and are untouched.
         if _gflat_ngk_per_q is not None:
-            _ngk_dev = jax.device_put(
+            _ngk_dev = _device_put_process_local(
                 np.asarray(_gflat_ngk_per_q, dtype=np.int32),
                 NamedSharding(mesh_xy, P(None)))
             _g_axis = jnp.arange(int(gflat_acc.shape[-1]),

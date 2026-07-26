@@ -262,7 +262,12 @@ class PsiGStore:
             sym = self.loader._ensure_sym()
             kvecs_frac = np.asarray(
                 sym.kvecs_asints, dtype=np.float64) / kgrid[None, :]
-            self._kvecs_frac_dev = jax.device_put(
+            # Process-local placement — see
+            # ``common.collectives.device_put_process_local``: on a
+            # multi-process mesh ``jax.device_put(numpy, sharding)``
+            # fires JAX's hidden ``assert_equal`` all-gather.
+            from common.collectives import device_put_process_local
+            self._kvecs_frac_dev = device_put_process_local(
                 kvecs_frac,
                 NamedSharding(self.mesh, P(None, None)))
 

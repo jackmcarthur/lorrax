@@ -297,7 +297,14 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     def _fold_G(Q, G_in):
         return G_in + (Q @ Q.conj().T)                       # (rank, rank) P('x','y')
 
-    G = jax.device_put(jnp.zeros((rank, rank), dtype=jnp.complex128), grid_xy)
+    # Allocate G sharded directly.  ``jax.device_put(jnp.zeros(...), sharding)``
+    # on a multi-process mesh hands JAX an UNCOMMITTED fully-addressable array,
+    # which takes ``_device_put_sharding_impl``'s ``multihost_utils.assert_equal``
+    # branch — a real ``process_allgather`` of ``P · rank² · 16`` B (178 MB/rank
+    # per process at rank 4716, so 11 GB/rank at P=64) to assert that a block of
+    # zeros is the same everywhere.  Same fix, same reason, as ``Q`` below.
+    G = jax.jit(lambda: jnp.zeros((rank, rank), dtype=jnp.complex128),
+                out_shardings=grid_xy)()
 
     t2 = time.time()
     chunk_count = 0

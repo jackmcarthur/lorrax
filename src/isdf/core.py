@@ -1268,8 +1268,14 @@ def _resolve_zeta_gather(
       (18.9 GB at MoS2 12×12 / μ=1998 counting the logical-extent copies,
       and it is re-gathered on EVERY r-chunk).
     * ``per_q`` — gather ONE ``(μ, μ)`` tile at a time and loop q inside
-      the r-chunk.  ``μ²·16`` B (65 MB at μ=2016, 1.6 GB at μ=10k).  Same
-      kernel, same per-q arithmetic; only the live gathered extent shrinks.
+      the r-chunk.  ``μ²·(1 + 1/p_y)·16`` B (75 MB at μ_pad=2048 on an 8×8
+      mesh, 1.8 GB at μ=10k).  Same per-q arithmetic as the batched
+      kernel; only the live gathered extent shrinks.  The slice is taken
+      INSIDE a ``shard_map`` (``_per_q_block``) — written as a
+      ``with_sharding_constraint`` on a traced-``q`` slice it read the
+      same way but COMPILED to the full ``(nq, μ, μ)`` gather plus a
+      dynamic_slice, which is worse than ``replicated`` and cost 12–40×
+      the back-solve wall (scorecard Y.2; do not regress it).
     * ``distributed`` — the factor is NEVER gathered.  ``C_q`` is
       eigendecomposed distributed (ScaLAPACK ``pzheevd``), truncated on the
       replicated spectrum, and the truncated pseudo-inverse ``C⁺`` is kept
@@ -2266,6 +2272,9 @@ def solve_zeta(
     intermediate_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
     L_rep_shard = NamedSharding(mesh_xy, P(None, None))
     L_batch_rep_shard = NamedSharding(mesh_xy, P(None, None, None))  # (B_q, n_rmu, n_rmu)
+    # The layout ``L_q`` actually ARRIVES in (2-D over the mesh face); the
+    # per_q tier consumes it directly instead of asking for a replica.
+    L_batch_xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     q_batch = min(q_chunk_size, nq)
     nq_padded = round_up(nq, q_batch)
 
@@ -2299,10 +2308,13 @@ def solve_zeta(
     #                  (today's path, and what ``_solve_all_at_once``
     #                  does at q_batch = nq).
     #   'per_q'      : one all-gather of a SINGLE (1, μ, μ) tile at a
-    #                  time, looped over q.  Same kernel
-    #                  (``_sharded_cho_solve_batch`` at batch 1), same
-    #                  arithmetic per q — only the live gathered extent
-    #                  changes, from ``nq·μ²·16`` to ``μ²·16``.
+    #                  time, looped over q.  Same arithmetic per q as the
+    #                  batched kernel — only the live gathered extent
+    #                  changes, from ``nq·μ²·16`` to ``μ²·(1+1/Py)·16``.
+    #                  The gather is written INSIDE a shard_map so the
+    #                  partitioner cannot hoist it back to the full stack;
+    #                  see ``_per_q_block`` for the measurement that forced
+    #                  that form (scorecard Y.2).
     per_q_gather = (str(zeta_gather).strip().lower() == "per_q")
 
     # Cache key for solve function (includes q_chunk_size and padded size).
@@ -2402,33 +2414,80 @@ def solve_zeta(
             L_full_rep = jax.lax.with_sharding_constraint(L_q_sharded, L_batch_rep_shard)
             return _sharded_cho_solve_batch(L_full_rep, Z_col)
 
+        # PER-Q tier.  The q-selection happens INSIDE a shard_map, where
+        # the gather is a `lax.all_gather` on an already-sliced tile — so
+        # the per-q extent is a STRUCTURAL property of the program, not a
+        # request the partitioner is free to reorder.
+        #
+        # HISTORY — do not regress this (scorecard Y.2, measured on the
+        # production deck).  The first implementation sliced a traced ``q``
+        # out of the sharded stack and then asked for the tile replicated::
+        #
+        #     L_one = lax.dynamic_slice_in_dim(L_q_sharded, q, 1, axis=0)
+        #     L_one_rep = lax.with_sharding_constraint(L_one, replicated)
+        #
+        # which reads as "gather one (μ,μ) tile".  XLA:CPU's SPMD
+        # partitioner does NOT sink a q-axis ``dynamic_slice`` through the
+        # μ-axis ``all-gather`` even though the two commute: it emitted the
+        # WHOLE ``(nq, μ_pad, μ_pad)`` gather and applied the slice
+        # afterwards.  Measured at 1998 centroids / μ_pad = 2048 / P = 64,
+        # the buffer assignment charged ``jit(_solve_one_q_and_update)``
+        # ``nq·μ_pad·(μ_pad + μ_pad/P_x)·16`` = 10.87 GB — i.e. the tier's
+        # own gather was LARGER than the ``replicated`` gather it exists to
+        # avoid (9.66 GB), and because the module runs once per q it moved
+        # 144× that per r-chunk.  That is the whole of the 12–40× wall-clock
+        # penalty Y.1 measured, and it is why T.5's "9.36 GB → 0.065 GB"
+        # headline was wrong.
+        #
+        # Inside a shard_map there is nothing left to hoist: the local
+        # slice is a local slice of the rank's OWN ``(nq, μ/Px, μ/Py)``
+        # block, and the two ``all_gather``s that follow it are written on
+        # a single-q operand.  Gathered bytes per execution are exactly
+        # ``μ_pad·(μ_pad/Py)·16 + μ_pad²·16`` — 75 MB at μ_pad = 2048,
+        # independent of nq.
+        @partial(shard_map, mesh=mesh_xy,
+                 in_specs=(P(None, 'x', 'y'),            # L_q  (nq, μ, μ)
+                           P(None, None, ('x', 'y')),    # Z_col
+                           P(None, None, ('x', 'y')),    # zeta_acc
+                           P()),                         # q (replicated scalar)
+                 out_specs=P(None, None, ('x', 'y')),
+                 check_rep=False)
+        def _per_q_block(L_loc, Z_loc, zeta_loc, q):
+            # L_loc: (nq, μ/Px, μ/Py) — this rank's 2-D block of the stack.
+            L_one = jax.lax.dynamic_slice_in_dim(L_loc, q, 1, axis=0)
+            # Rebuild EXACTLY the replicated (1, μ, μ) tile the batched
+            # kernel would have seen: 'x' owns axis 1, 'y' owns axis 2, so
+            # the tiled all_gathers concatenate in mesh-index order.
+            L_row = jax.lax.all_gather(L_one, 'x', axis=1, tiled=True)
+            L_tile = jax.lax.all_gather(L_row, 'y', axis=2, tiled=True)
+            Z_one = jax.lax.dynamic_slice_in_dim(Z_loc, q, 1, axis=0)
+            # Same three back-solve bodies as ``_sharded_cho_solve_batch``
+            # at batch 1 — identical shapes, identical operand values,
+            # therefore bit-identical arithmetic.
+            if use_rank_trunc:
+                out = jax.vmap(_pinv_matmul_logical)(L_tile, Z_one)
+            elif use_lu:
+                out = jax.vmap(_ridge_indef_solve)(L_tile, Z_one)
+            else:
+                out = jax.vmap(_tri_solve_logical)(L_tile, Z_one)
+            return jax.lax.dynamic_update_slice_in_dim(
+                zeta_loc, out, q, axis=0)
+
         @partial(jax.jit, donate_argnums=(2,))
         def _solve_one_q_and_update(L_q_sharded, Z_col, zeta_acc, q):
             """PER-Q tier: gather ONE ``(μ, μ)`` factor tile, solve that q,
             scatter into ``zeta_acc``.
 
-            The only difference from ``_solve_all_at_once`` is the extent
-            that crosses the ``with_sharding_constraint`` all-gather:
-            ``μ²·16`` instead of ``nq·μ²·16`` (64 MB vs 9.4 GB at
-            μ_pad = 2016, nq = 144).  The solve itself is the SAME
-            ``_sharded_cho_solve_batch`` kernel at batch 1, so each q sees
-            exactly the arithmetic it saw inside the batched call.
-
-            Both slices are taken INSIDE the jit off a traced ``q`` so the
-            shapes are identical for every q — one trace, one compile, one
-            executable for the whole loop — and ``Z_col`` is never sliced
-            eagerly (an eager slice would materialise ``nq`` extra
+            ``q`` is a traced argument, so every iteration shares one
+            trace, one compile and one executable, and ``Z_col`` is never
+            sliced eagerly (an eager slice would materialise ``nq`` extra
             ``(1, μ, r/P)`` device arrays per r-chunk).  ``donate_argnums``
             chains ``zeta_acc`` through the loop the same way
             ``_solve_batch_and_update`` does.
             """
-            L_one = jax.lax.dynamic_slice_in_dim(L_q_sharded, q, 1, axis=0)
-            L_one_rep = jax.lax.with_sharding_constraint(
-                L_one, L_batch_rep_shard)
-            Z_one = jax.lax.dynamic_slice_in_dim(Z_col, q, 1, axis=0)
-            out = _sharded_cho_solve_batch(L_one_rep, Z_one)
-            return jax.lax.dynamic_update_slice_in_dim(
-                zeta_acc, out, q, axis=0)
+            L_xy = jax.lax.with_sharding_constraint(
+                L_q_sharded, L_batch_xy_shard)
+            return _per_q_block(L_xy, Z_col, zeta_acc, jnp.asarray(q))
 
         # Z reshard P(None,'x','y') → P(None,None,('x','y')), staged
         # through P('x',None,'y') so each step moves ONE mesh axis (see

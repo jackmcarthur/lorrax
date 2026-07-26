@@ -59,6 +59,8 @@ import numpy as np
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import device_put_process_local
+
 from .mf_header import bind_mf_attrs, kpt_starts, read_mf_header_from_file
 
 
@@ -572,12 +574,17 @@ class WfnLoader:
             sharding = NamedSharding(mesh, P(None, None, None, None))
         elif isinstance(sharding, P):
             sharding = NamedSharding(mesh, sharding)
-        # Pass numpy directly to ``device_put`` — the per-process-local
-        # placement path avoids the all-reduce that ``jnp.asarray`` ->
-        # device_put(replicated) would otherwise trigger (same comment
-        # as in ``psi_G_store._populate_from_loader``).
+        # Process-local placement (``common.collectives``): every rank
+        # builds the SAME index table from the same file, so each may
+        # simply declare its own shard.  ``jax.device_put(numpy,
+        # multi_process_named_sharding)`` would instead fire JAX's silent
+        # ``multihost_utils.assert_equal`` → ``process_allgather``, which
+        # for THIS table is ``P·nk·n_rtot·4`` B on every rank: 6.45 GB at
+        # P=64, 14.5 GB projected at P=144 (scorecard Y.3, the larger of
+        # the two "P-LINEAR loader allgathers").  It was the single
+        # biggest collective in a ζ-fit at 276 centroids.
         g_idx_np = self.box_index(k=k)
-        dev = jax.device_put(g_idx_np, sharding)
+        dev = device_put_process_local(g_idx_np, sharding)
         self._gvecs_dev_cache[cache_key] = dev
         return dev
 
@@ -777,16 +784,22 @@ class WfnLoader:
         rep1 = NamedSharding(self._mesh, P(None))
         rep2 = NamedSharding(self._mesh, P(None, None))
         rep3 = NamedSharding(self._mesh, P(None, None, None))
-        # Pass numpy directly to ``device_put``; ``jnp.asarray`` wrapped
-        # in this position used to single-device-stage the host array
-        # first, forcing device_put → replicated to fire an all-reduce
-        # broadcast.  See psi_G_store: same fix.
+        # Process-local placement, NOT ``jax.device_put(numpy, sharding)``.
+        # On a multi-process mesh the latter fires JAX's silent
+        # ``multihost_utils.assert_equal`` → ``process_allgather(tiled=True)``
+        # per table (see ``common.collectives.device_put_process_local``).
+        # ``phase`` is the second of scorecard Y.3's two P-LINEAR loader
+        # allgathers: ``P·nk·ngkmax·16`` = 1.27 GB/rank at P=64, 2.85 GB
+        # projected at P=144.  Every rank computes these tables from the
+        # same file with the same code, so they are bit-identical by
+        # construction and the assertion buys nothing.
         self._phdf5_static_dev = {
-            "ibz_per_full": jax.device_put(ibz_per_full, rep1),
-            "sym_idx_per_full": jax.device_put(sym_idx_per_full, rep1),
-            "tr_mask_per_full": jax.device_put(tr_mask, rep1),
-            "U_per_full": jax.device_put(U_per, rep3),
-            "phase_per_full": jax.device_put(phase, rep2),
+            "ibz_per_full": device_put_process_local(ibz_per_full, rep1),
+            "sym_idx_per_full": device_put_process_local(
+                sym_idx_per_full, rep1),
+            "tr_mask_per_full": device_put_process_local(tr_mask, rep1),
+            "U_per_full": device_put_process_local(U_per, rep3),
+            "phase_per_full": device_put_process_local(phase, rep2),
             "n_tran": n_tran,
             "nk_full": nk_full,
         }
@@ -878,11 +891,16 @@ class WfnLoader:
 
         rep2 = NamedSharding(self._mesh, P(None, None))
         counts_sharding = NamedSharding(self._mesh, P(("x", "y"), None))
-        # Numpy → replicated/sharded device_put; bare numpy skips the
-        # single-device staging that triggers an all-reduce broadcast.
+        # Process-local placement for both tables.  ``counts_global`` is
+        # the (world·n_reads, 4) table sharded ('x','y') on the leading
+        # axis, so this is literally the per-rank hyperslab: each rank
+        # keeps only its own ``(n_reads, 4)`` rows and never sends them.
+        # Via ``jax.device_put`` the hidden ``assert_equal`` gather on
+        # this one is O(P²) — ``P·(world·n_reads)·4·8`` B, 18.9 MB at
+        # P=64 but 95.5 MB at P=144.
         # (``position_in_reads`` is staged inside _phdf5_unfold_and_shard.)
-        offsets_dev = jax.device_put(offsets, rep2)
-        counts_dev = jax.device_put(counts_global, counts_sharding)
+        offsets_dev = device_put_process_local(offsets, rep2)
+        counts_dev = device_put_process_local(counts_global, counts_sharding)
 
         reader = read_kchunk_union_sharded(
             ctx, "wfns/coeffs",
@@ -922,7 +940,7 @@ class WfnLoader:
             self._mesh, n_reads=n_reads, n_k=n_k, bands_per_rank=bands_per_rank,
             nspinor=ns, ngkmax=ngkmax, unfold=unfold)
         rep1 = NamedSharding(self._mesh, P(None))
-        position_in_reads_dev = jax.device_put(
+        position_in_reads_dev = device_put_process_local(
             np.asarray(position_in_reads, dtype=np.int32), rep1)
 
         if unfold:
@@ -1139,7 +1157,12 @@ class WfnLoader:
                 psi_j, k=k, k_idxs=k_idxs, unfold=unfold, sharding=None)
             if named_sharding is None:
                 return psi_j
-            return jax.device_put(psi_j, named_sharding)
+            # Process-local shard-out.  ``jax.device_put`` of an
+            # UNCOMMITTED array onto a multi-process sharding takes the
+            # same hidden ``assert_equal`` branch as the numpy case — and
+            # here the operand is the whole ψ window, so the assertion
+            # would gather ``P × nk·nb·ns·ngkmax·16``.
+            return device_put_process_local(psi_j, named_sharding)
 
         if named_sharding is not None and int(jax.process_count()) > 1:
             # (§5b) Build ONLY this process's band shard and assemble via the

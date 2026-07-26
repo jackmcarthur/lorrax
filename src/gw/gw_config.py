@@ -361,8 +361,15 @@ _DEFAULTS = {
     #   replicated  = today's path: gather the whole (q_batch, μ, μ) stack
     #                 onto every rank, nq·μ²·16 B, re-gathered per r-chunk
     #                 (18.9 GB/rank at MoS2 12×12 / μ=1998).
-    #   per_q       = gather ONE (μ, μ) tile at a time, loop q
-    #                 (65 MB at μ=2016, 1.6 GB at μ=10k).
+    #   per_q       = gather ONE (μ, μ) tile at a time, loop q — the slice
+    #                 is taken inside a shard_map so the partitioner cannot
+    #                 turn it back into the full-stack gather (it did until
+    #                 workstream AA; scorecard Y.2).  μ²·(1+1/p_y)·16 per
+    #                 execution and nq executions per r-chunk, so its TOTAL
+    #                 per-r-chunk traffic is ≈ the replicated tier's while
+    #                 its LIVE gather is nq× smaller: use it when memory,
+    #                 not bandwidth, is the binder and the mesh is not
+    #                 square enough for `distributed`.
     #   distributed = NOTHING O(μ²) is replicated.  Distributed eigh
     #                 (ScaLAPACK pzheevd), truncation on the replicated
     #                 spectrum, 2D-sharded C⁺, and a stacked GEMM C⁺@Z with
