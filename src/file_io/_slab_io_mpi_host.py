@@ -18,6 +18,31 @@ thread because:
    would let us mirror the FFI's threaded design, but the perf win
    isn't worth the added complexity at this scale.
 
+MPI-collectives coexistence (scorecard AS, 2026-07-27) — synchronous
+writes are NOT sufficient once JAX's own CPU collectives ride MPI:
+
+* With ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` the jaxlib wheel's
+  MPItrampoline runtime drives the SAME ``libmpi`` as this module,
+  from XLA's collectives thread — so this module's "main thread only"
+  discipline no longer serializes anything.  That concurrency is only
+  defined at ``MPI_THREAD_MULTIPLE``, and XLA requests FUNNELED:
+  measured at P=16 x 8 nodes, ~29% of runs segfault/hang at the
+  ζ-write/V_q boundary (two threads concurrently inside
+  ``MPID_Progress_wait``; provider-independent — AS.4b).
+* The certified stack (AS.4c): ``MPITRAMPOLINE_LIB`` must point at the
+  THREAD_MULTIPLE-patched MPIwrapper build
+  (``wk_AS/mpiw_thr_install/lib64/libmpiwrapper.so`` — it upgrades
+  every init request to MULTIPLE, never downgrades), plus
+  ``LORRAX_MPI_FINALIZE_FIX=skip_atexit`` via the overlay
+  ``sitecustomize`` (jax registers an atexit ``collectives.Finalize``
+  AND the C++ destructor finalizes → double-finalize rc=1 without it).
+  These are harness-level machine facts, not LORRAX policy: LORRAX
+  reads neither variable (see docs/dev/env_vars.md §6).
+* Under the certified default (gloo collectives) none of this applies:
+  mpi4py's import here is the first MPI init and requests MULTIPLE.
+  The C++ FFI twin guards the same hazard at open time
+  (``ffi/phdf5/cpp/context.cc`` MPI_Query_thread warning).
+
 What we DO match from :class:`_FfiBackend`:
 
 * Same Lustre prestripe on rank 0 before any rank opens the file.
@@ -112,15 +137,21 @@ def _mpi_io_hints(MPI):
     if sc > 0:
         info.Set("striping_factor", str(sc))
         info.Set("striping_unit", str(_stripe_size_bytes()))
-    # romio_cb_write / romio_ds_write / cb_nodes are left at ROMIO's
-    # automatic policy unless asked for.  MEASURED (wk_AI, P=16, the
-    # production tile): forcing ``romio_cb_write=enable`` on top of
-    # collective + stripe32 was 1826 MB/s vs 2066 MB/s for ROMIO's own
-    # choice, i.e. the explicit hint the C++ writer carries buys nothing
-    # here and may cost a little.  Knobs kept, defaults not opinionated.
+    # romio_cb_write / romio_ds_write / cb_nodes / cb_buffer_size are
+    # left at ROMIO's automatic policy unless asked for.  MEASURED
+    # (wk_AI, P=16, the production tile): forcing
+    # ``romio_cb_write=enable`` on top of collective + stripe32 was
+    # 1826 MB/s vs 2066 MB/s for ROMIO's own choice, i.e. the explicit
+    # hint buys nothing here and may cost a little.  Knobs kept,
+    # defaults not opinionated.  Since workstream AW the C++ writer
+    # (``ffi/phdf5/cpp/context.cc``) follows the SAME policy — its old
+    # Perlmutter-era forced defaults (cb_write=enable, ds_write=disable,
+    # cb_buffer_size=64M, cb_nodes=world_size) are gone, so an unset env
+    # means "ROMIO decides" in every writer and a set one reaches both.
     for key, env in (("romio_cb_write", "LORRAX_PHDF5_CB_WRITE"),
                      ("romio_ds_write", "LORRAX_PHDF5_DS_WRITE"),
-                     ("cb_nodes", "LORRAX_PHDF5_CB_NODES")):
+                     ("cb_nodes", "LORRAX_PHDF5_CB_NODES"),
+                     ("cb_buffer_size", "LORRAX_PHDF5_CB_BUFFER_SIZE")):
         val = os.environ.get(env, "")
         if val:
             info.Set(key, val)

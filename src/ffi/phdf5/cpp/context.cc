@@ -1,8 +1,23 @@
 // context.cc — open/close for the parallel-HDF5 FFI.
 //
 // open_file: collective MPI_Init_thread + H5Fcreate/H5Fopen with cached
-// property lists.  Tuning via env vars (LORRAX_PHDF5_INDEPENDENT,
-// LORRAX_PHDF5_ALIGN_MB, LORRAX_PHDF5_NO_COLL_META).
+// property lists.
+//
+// Env tunables (all optional; docs/dev/env_vars.md is the registry):
+//   LORRAX_PHDF5_COLLECTIVE_WRITES (1)  collective vs independent writes
+//   LORRAX_PHDF5_DEDUP_REPLICAS   (1)   one canonical writer per replica
+//   LORRAX_PHDF5_INDEPENDENT      (0)   force independent READS
+//   LORRAX_PHDF5_COLL_META        (0)   collective metadata ops
+//   LORRAX_PHDF5_ALIGN_MB         (4)   H5Pset_alignment threshold/length
+//   LORRAX_PHDF5_STRIPE_COUNT     (16)  Lustre striping_factor hint
+//   LORRAX_PHDF5_STRIPE_SIZE_FS   (4M)  Lustre striping_unit hint (lfs form;
+//                                       legacy byte-valued
+//                                       LORRAX_PHDF5_STRIPE_SIZE honoured)
+//   LORRAX_PHDF5_CB_WRITE / _DS_WRITE / _CB_NODES / _CB_BUFFER_SIZE /
+//   _CB_PER_NODE                (unset) ROMIO pass-throughs; unset = ROMIO
+//                                       automatic policy (measured best on
+//                                       Frontera — scorecard AI/AW)
+//   LORRAX_PHDF5_DUMP_HINTS       (0)   print the hints ROMIO retained
 
 #include <cstdio>
 #include <cstdlib>
@@ -141,6 +156,40 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
 {
     ensure_mpi_initialized();
 
+    // GUARD (scorecard AS.4b): this ctx runs a dedicated writer thread
+    // whose H5Dwrite drives MPI-IO collectives concurrently with any
+    // main-thread / XLA-thread MPI traffic.  That concurrency is only
+    // DEFINED at MPI_THREAD_MULTIPLE.  When *we* init MPI we request
+    // MULTIPLE (ensure_mpi_initialized) — but when someone else got
+    // there first (jax's MPI CPU collectives via MPItrampoline request
+    // FUNNELED; an unpatched MPIwrapper grants it), the granted level is
+    // whatever they asked for, and the measured consequence at P=16 x 8
+    // nodes was a ~29% provider-independent segfault/hang rate at the
+    // zeta-write/V_q boundary — two threads of one rank concurrently
+    // inside MPID_Progress_wait.  The certified fix is the
+    // THREAD_MULTIPLE-patched MPIwrapper (wk_AS mpiw_thr_install /
+    // MPITRAMPOLINE_LIB); this guard exists so the hazardous
+    // configuration announces itself up front instead of dying minutes
+    // later with a backtrace that names neither cause nor fix.
+    {
+        int provided = 0;
+        MPI_Query_thread(&provided);
+        if (provided < MPI_THREAD_MULTIPLE && rank == 0) {
+            std::fprintf(stderr,
+                "[phdf5] WARNING: MPI granted thread level %d < "
+                "MPI_THREAD_MULTIPLE (%d) and MPI was initialized before "
+                "this library (jax cpu_collectives_implementation=mpi with "
+                "an unpatched MPIwrapper?).  The phdf5 writer thread's "
+                "collective MPI-IO is UNDEFINED at this level — measured "
+                "~29%% multi-node crash rate (scorecard AS.4b).  Fix: use "
+                "the MPI_THREAD_MULTIPLE-patched MPIwrapper as "
+                "MPITRAMPOLINE_LIB (wk_AS mpiw_thr_install), or run the "
+                "gloo collectives default.\n",
+                provided, MPI_THREAD_MULTIPLE);
+            std::fflush(stderr);
+        }
+    }
+
     auto* ctx = new PhdfCtx{};
     ctx->path = path;
     ctx->p = p;
@@ -195,57 +244,85 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     ctx->comm = MPI_COMM_WORLD;
     ctx->owns_comm = false;
 
-    // --- MPI_Info hints for ROMIO/MPI-IO.  Per the NERSC I/O guide,
-    // collective buffering ("two-phase I/O") aggregates rank-local writes
-    // into stripe-sized transfers.  With the stock ROMIO defaults on
-    // Perlmutter we measured ~0.85 GB/s at 16 ranks; with the defaults
-    // set below we measured 4.4 GB/s into an unstriped dir (5.2x) and
-    // the gap would widen with more ranks.  All hints are overridable
-    // via env for A/B testing.
+    // --- MPI_Info hints for ROMIO/MPI-IO.  POLICY (aligned with the
+    // Python writer `_slab_io_mpi_host._mpi_io_hints`, 2026-07-27
+    // workstream AW): the STRIPE hints are set by default — they are the
+    // measured lever (scorecard AI: collective+stripe 74 → 2066 MB/s on
+    // the production tile; and `lfs` does not exist inside the apptainer
+    // image, so these hints are the ONLY way the layout gets set on
+    // Frontera).  Everything else — romio_cb_write / romio_ds_write /
+    // cb_buffer_size / cb_nodes — is left at ROMIO's automatic policy
+    // unless the env asks: under H5FD_MPIO_COLLECTIVE ROMIO already
+    // runs two-phase aggregation, and FORCING romio_cb_write=enable on
+    // top of it measured *slower* than ROMIO's own choice (wk_AI, P=16
+    // production tile: 1826 vs 2066 MB/s).  The old defaults here
+    // (cb_write=enable, ds_write=disable, cb_buffer_size=64 MiB,
+    // cb_nodes=world_size) were a Perlmutter/OpenMPI-era tuning
+    // (0.85 → 4.4 GB/s on THAT stack); they are preserved as env
+    // escape hatches, not defaults, so unset-env now means the same
+    // thing in every writer: ROMIO decides.
     MPI_Info info = MPI_INFO_NULL;
     MPI_Info_create(&info);
     auto info_set = [&](const char* key, const char* val) {
         MPI_Info_set(info, const_cast<char*>(key), const_cast<char*>(val));
     };
+    // Pass-through knobs (set only when the env is non-empty).
     const char* cb_write = std::getenv("LORRAX_PHDF5_CB_WRITE");
-    info_set("romio_cb_write", cb_write && *cb_write ? cb_write : "enable");
+    if (cb_write && *cb_write) info_set("romio_cb_write", cb_write);
     const char* ds_write = std::getenv("LORRAX_PHDF5_DS_WRITE");
-    info_set("romio_ds_write", ds_write && *ds_write ? ds_write : "disable");
-    // cb_buffer_size: per-aggregator collective buffer.  ROMIO default
-    // (4 MiB) is too small for multi-GB writes; 64 MiB is the knee of
-    // the empirical bandwidth curve at 16 ranks.
+    if (ds_write && *ds_write) info_set("romio_ds_write", ds_write);
     const char* cb_buf = std::getenv("LORRAX_PHDF5_CB_BUFFER_SIZE");
-    info_set("cb_buffer_size", cb_buf && *cb_buf ? cb_buf : "67108864");
-    // Aggregator count.  OpenMPI/ROMIO honours `cb_nodes` and needs it
-    // at ~world_size to hit peak bandwidth (4.4 GB/s vs 0.85 with the
-    // default heuristic on Perlmutter).  Cray MPICH ignores this hint
-    // and picks its own aggregator layout internally, so setting it
-    // does no harm on that stack.  LORRAX_PHDF5_CB_NODES overrides
-    // explicitly; LORRAX_PHDF5_CB_PER_NODE is the Cray-form override
-    // (becomes cb_config_list="*:N").
+    if (cb_buf && *cb_buf) info_set("cb_buffer_size", cb_buf);
     const char* cb_nodes = std::getenv("LORRAX_PHDF5_CB_NODES");
-    if (cb_nodes && *cb_nodes) {
-        info_set("cb_nodes", cb_nodes);
-    } else {
-        char buf[16];
-        std::snprintf(buf, sizeof(buf), "%d", world_size);
-        info_set("cb_nodes", buf);
-    }
+    if (cb_nodes && *cb_nodes) info_set("cb_nodes", cb_nodes);
     const char* cb_per_node = std::getenv("LORRAX_PHDF5_CB_PER_NODE");
     if (cb_per_node && *cb_per_node) {
         std::string v = std::string("*:") + cb_per_node;
         info_set("cb_config_list", v.c_str());
     }
     // striping_factor / striping_unit: MPI-IO's way to request a Lustre
-    // stripe layout when it creates the file.  Default 16 x 4 MiB was the
-    // bandwidth peak in our sweep for a 4 GB sharded-write (16 ranks,
-    // 268 MB per shard).  For larger or smaller writes tune via env.
-    // These hints are no-ops if the containing directory already has
-    // a fixed stripe layout (lfs setstripe).
+    // stripe layout when it creates the file (ROMIO applies it through
+    // llapi — works inside the container with no `lfs` binary on PATH).
+    // Default 16 x 4 MiB (scorecard AI: +57% on top of collective; the
+    // request is clamped to what Lustre grants — the banner prints the
+    // request, `lfs getstripe` prints the truth).  No-ops if the file
+    // inode already exists — which is why the Python prestripe path
+    // unlinks on mode='w'.
+    //
+    // Env naming: LORRAX_PHDF5_STRIPE_SIZE_FS is THE documented knob
+    // (env_vars.md), spelled like `lfs setstripe -S` ("4M"); it is read
+    // by the three Python sites and, since workstream AW, here too —
+    // previously this file read only the undocumented byte-valued
+    // LORRAX_PHDF5_STRIPE_SIZE, so the documented knob silently did not
+    // reach the C++ writer.  The legacy byte spelling still works as a
+    // fallback.
     const char* stripe_count = std::getenv("LORRAX_PHDF5_STRIPE_COUNT");
     info_set("striping_factor", stripe_count && *stripe_count ? stripe_count : "16");
-    const char* stripe_size  = std::getenv("LORRAX_PHDF5_STRIPE_SIZE");
-    info_set("striping_unit",  stripe_size  && *stripe_size  ? stripe_size  : "4194304");
+    long stripe_bytes = 4L << 20;
+    if (const char* fs = std::getenv("LORRAX_PHDF5_STRIPE_SIZE_FS");
+        fs && *fs) {
+        char* end = nullptr;
+        double v = std::strtod(fs, &end);
+        long mult = 1;
+        if (end && *end) {
+            switch (*end) {
+                case 'k': case 'K': mult = 1L << 10; break;
+                case 'm': case 'M': mult = 1L << 20; break;
+                case 'g': case 'G': mult = 1L << 30; break;
+                default: mult = 0; break;  // unparseable -> keep default
+            }
+        }
+        if (end != fs && mult > 0) stripe_bytes = (long)(v * (double)mult);
+    } else if (const char* b = std::getenv("LORRAX_PHDF5_STRIPE_SIZE");
+               b && *b) {
+        long parsed = std::strtol(b, nullptr, 10);
+        if (parsed > 0) stripe_bytes = parsed;
+    }
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%ld", stripe_bytes);
+        info_set("striping_unit", buf);
+    }
 
     // --- fapl: MPI-IO + (optional) collective metadata + alignment ---
     ctx->fapl_id = H5Pcreate(H5P_FILE_ACCESS);
