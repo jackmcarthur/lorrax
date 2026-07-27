@@ -11,6 +11,8 @@ Knobs:
 
   ``ISDF_JAX_CACHE_DIR=/some/path``   — override cache location.
   ``ISDF_JAX_CACHE_DIR=""``            — opt out entirely.
+  ``LORRAX_JAX_CACHE_MULTIPROCESS=1``  — re-arm the cache at P > 1 (see
+                                         the deadlock note below).  OFF.
 
 Default location is ``~/.cache/isdf_jax_compilation``.
 
@@ -20,6 +22,53 @@ saves ~3-4 s of XLA compile on warm re-runs (measured 2026-04-19).
 The env-var naming is legacy — historically this was for ISDF
 kernels only, now it caches the whole run.  Left as-is for backward
 compat with existing user shell aliases and run scripts.
+
+WHY THE CACHE IS OFF AT ``jax.process_count() > 1`` (scorecard AG)
+=================================================================
+This is the ``load_centroid_wfns`` hang that blocked every multi-process
+GPU run on Frontera's ``rtx`` queue.  The mechanism, root-caused from
+a live C-level stack (workstream AG, job 7876375):
+
+* JAX writes persistent-cache entries **from process 0 only** — not a
+  LORRAX choice, it is unconditional in
+  ``jax/_src/compiler.py::_cache_write``::
+
+      # Only write cache entries from the first process. Otherwise we
+      # create problems with contention for writes on some filesystems
+      if distributed.global_state.process_id != 0:
+        return
+
+* This module used to partition the cache **per rank**
+  (``{base}/np{P}/rank{i}/``) so each rank only ever saw its own
+  entries.  Combined with the above that is a permanent asymmetry:
+  ``rank0/`` accumulates entries run after run (measured: 882) while
+  ``rank1..P-1/`` stay **empty forever**.
+
+* On the next run process 0 therefore HITS the cache and skips
+  compilation, while every peer MISSES and compiles.  On XLA:GPU
+  compilation is not a local act: ``xla::gpu::AutotunerPass`` shards the
+  autotuning across processes and exchanges the results through the JAX
+  coordination service (``xla::Autotuner::Autotune(HloModule*, ...,
+  MultiProcessKeyValueStore&)`` → ``BlockingKeyValueGet``).  A process
+  that skipped compilation never publishes its share, so the peers block
+  in ``CoordinationServiceAgent::GetKeyValue`` **forever**.
+
+The observable is a silent hang with one rank spinning at ~70-100 % CPU
+(process 0, already downstream and waiting in a collective), the rest
+parked at ~2 % CPU, and every GPU at 0 % utilisation.  It cost three
+GPU jobs and a workstream to find, which is exactly why the refusal
+below is LOUD.
+
+XLA:CPU has no such autotuner, but the campaign's CPU launchers all
+export ``ISDF_JAX_CACHE_DIR=""`` by hand anyway; this guard makes that
+out-of-band convention an in-tree property so a launcher that forgets
+it (``config/frontera/ffi_env.sh`` did) cannot resurrect the hang.
+
+Making the cache genuinely safe at P > 1 needs process-0-writes to be
+readable by every rank *and* the resulting hit/miss pattern to be
+identical on every rank — a single shared dir does not achieve the
+second (JAX's cache key hashes the per-rank device assignment, so the
+peers still miss).  Until that is solved, P > 1 runs pay the compile.
 """
 from __future__ import annotations
 
@@ -28,6 +77,11 @@ import warnings
 from pathlib import Path
 
 _COMPILATION_CACHE_READY = False
+
+
+def _truthy(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() not in (
+        "", "0", "false", "no", "off")
 
 
 def ensure_jax_compile_cache() -> None:
@@ -43,17 +97,26 @@ def ensure_jax_compile_cache() -> None:
     skips truly trivial compiles (const, simple reshape, etc.), so
     "cache everything" is already reasonably targeted.
 
-    Partitioning: cache entries are nested under
-    ``{base}/np{N_proc}/rank{N}/`` so each rank reads/writes its
-    own dir.  JAX's cache key hashes in the per-rank device
-    assignment, which means rank 1 would previously try to load
-    rank 0's entries, find a device-index mismatch, and emit a
+    **Single-process runs only, by default.**  At
+    ``jax.process_count() > 1`` this function REFUSES to arm the cache
+    and says so on process 0 — see the module docstring for the
+    autotuner deadlock that refusal prevents (scorecard AG).
+    ``LORRAX_JAX_CACHE_MULTIPROCESS=1`` re-arms it for whoever fixes
+    the underlying asymmetry.
+
+    Partitioning (single-process path, and the P>1 path if re-armed):
+    cache entries are nested under ``{base}/np{N_proc}/rank{N}/`` so
+    each rank reads/writes its own dir.  JAX's cache key hashes in the
+    per-rank device assignment, which means rank 1 would otherwise try
+    to load rank 0's entries, find a device-index mismatch, and emit a
     ``"Device assignment does not have any local devices"`` warning
-    per primitive per JIT on every warm run.  With per-rank dirs
-    each rank only ever sees its own entries, so the mismatch
-    never arises.  Shared-cache sharing across ranks was a marginal
-    optimisation (rank writes, another rank reads) and in practice
-    the per-rank caches converge within one warm run.
+    per primitive per JIT on every warm run.
+    NOTE the sting in the tail, and why per-rank dirs are not a fix at
+    P > 1: JAX writes cache entries from **process 0 only**, so the
+    peers' dirs never fill and the "per-rank caches converge within one
+    warm run" claim this docstring used to make is **false** — measured
+    ``np4/rank0`` = 882 entries, ``np4/rank{1,2,3}`` = 0, three days
+    after those dirs were created.
 
     Also silences the legacy warning via a targeted
     ``warnings.filterwarnings`` as defense-in-depth for cases where
@@ -94,6 +157,28 @@ def ensure_jax_compile_cache() -> None:
     except Exception:
         n_proc = 1
         proc_idx = 0
+
+    # ---- the P > 1 refusal (see the module docstring for the mechanism) ----
+    if n_proc > 1 and not _truthy("LORRAX_JAX_CACHE_MULTIPROCESS"):
+        if proc_idx == 0:
+            print(
+                f"  [compile-cache] REFUSED at {n_proc} processes: the JAX "
+                f"persistent compile cache is written by process 0 ONLY "
+                f"(jax/_src/compiler.py::_cache_write), so on a multi-process "
+                f"run the ranks' hit/miss patterns diverge — process 0 skips "
+                f"compilation while its peers block forever in "
+                f"xla::gpu::AutotunerPass' cross-process key-value exchange "
+                f"(CoordinationServiceAgent::GetKeyValue).  That is the "
+                f"silent `load_centroid_wfns` hang of scorecard AG.\n"
+                f"  [compile-cache] this run compiles from scratch on every "
+                f"rank, which is CORRECT and ~1 min slower.  Set "
+                f"ISDF_JAX_CACHE_DIR=\"\" to silence this line, or "
+                f"LORRAX_JAX_CACHE_MULTIPROCESS=1 to re-arm the cache and "
+                f"accept the hang (would have used {cache_dir}).",
+                flush=True)
+        _COMPILATION_CACHE_READY = True
+        return
+
     cache_path = (Path(cache_dir).expanduser()
                   / f"np{n_proc}" / f"rank{proc_idx}")
     try:

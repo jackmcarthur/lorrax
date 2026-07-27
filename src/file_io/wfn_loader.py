@@ -140,6 +140,12 @@ class WfnLoader:
 
         if backend == "auto":
             backend = self._auto_pick_backend()
+            # The auto-pick is invisible otherwise, and it is a REAL fork
+            # in behaviour (collective MPI-IO FFI read vs h5py union read
+            # vs per-rank eager) selected by whether an FFI .so happens to
+            # be on LD_LIBRARY_PATH.  Two GPU campaigns differed only in
+            # this and nothing in either log said so (scorecard AG).
+            self._announce_backend(backend)
         if backend not in ("eager", "phdf5", "phdf5_host"):
             raise ValueError(f"unknown backend {backend!r}")
         if backend in ("phdf5", "phdf5_host") and mesh is None:
@@ -299,6 +305,35 @@ class WfnLoader:
     # ------------------------------------------------------------------
     # Backend selection
     # ------------------------------------------------------------------
+    _BACKEND_ANNOUNCED: set = set()
+
+    def _announce_backend(self, backend: str) -> None:
+        """Print the auto-picked read backend once per (backend, world).
+
+        Rank-0 only, once per distinct decision — so a driver that opens
+        several loaders does not spam, but a run whose read path changed
+        because an ``.so`` appeared on ``LD_LIBRARY_PATH`` says so.
+        """
+        try:
+            world = int(jax.process_count())
+            if int(jax.process_index()) != 0:
+                return
+        except Exception:
+            world = 1
+        key = (backend, world)
+        if key in WfnLoader._BACKEND_ANNOUNCED:
+            return
+        WfnLoader._BACKEND_ANNOUNCED.add(key)
+        why = {
+            "eager": "single-process or mesh-less: host h5py read per rank",
+            "phdf5": "collective MPI-IO read through the phdf5 FFI .so",
+            "phdf5_host": "h5py union read + the shared on-device unfold "
+                          "(no phdf5-capable FFI .so found)",
+        }.get(backend, "")
+        print(f"  [WfnLoader] read backend = {backend} "
+              f"(auto, {world} process{'es' if world != 1 else ''}) — {why}",
+              flush=True)
+
     def _auto_pick_backend(self) -> str:
         """Pick the lightest backend that works.
 
