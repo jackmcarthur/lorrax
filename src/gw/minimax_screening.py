@@ -9,7 +9,7 @@ This module is intentionally scoped to the static path first:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 import hashlib
 import importlib.resources as importlib_resources
 import json
@@ -405,16 +405,58 @@ def fit_gn_ppm_from_wc_pair(
         whatever sharding is already attached to the inputs.
     """
 
-    Wc0 = jnp.asarray(Wc0_qmunu, dtype=jnp.complex128)
-    Wc_probe = jnp.asarray(Wc_probe_qmunu, dtype=jnp.complex128)
-    z_probe = jnp.asarray(probe_omega, dtype=jnp.complex128)
-
-    n_mu = int(Wc0.shape[-1])
+    n_mu = int(jnp.asarray(Wc0_qmunu).shape[-1])
     n_log = int(n_mu_logical)
     if not (0 < n_log <= n_mu):
         raise ValueError(
             f"fit_gn_ppm_from_wc_pair: n_mu_logical={n_log} outside "
             f"(0, {n_mu}] for input extent {n_mu}.")
+
+    omega_vals, B_vals, good, fulfilled = _gn_ppm_fit_kernel(
+        Wc0_qmunu, Wc_probe_qmunu,
+        jnp.asarray(probe_omega, dtype=jnp.complex128),
+        jnp.asarray(fallback_omega, dtype=jnp.float64),
+        n_log,
+    )
+    # The ONLY host sync in the fit, and it is deliberately outside the
+    # kernel: ``_scalar_to_host_float`` gathers, which cannot happen
+    # under ``jit``.
+    return omega_vals, B_vals, good, 1.0 - _scalar_to_host_float(fulfilled)
+
+
+@partial(jax.jit, static_argnums=(4,))
+def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
+    """The GN-PPM fit as ONE XLA module.  Elementwise; layout-preserving.
+
+    Why jitted (scorecard J.3 / AD).  Run eagerly this chain materialises
+    ~15 concurrent ``(nq, μ, μ)`` complex128 temporaries — ``denom``,
+    ``safe``, ``ratio``, ``omega_sq``, its real part, four boolean masks,
+    two ``where`` results, ``B_vals`` and the two reduction operands —
+    each a separate device allocation with **zero buffer reuse**, on top
+    of a resident ``V_q`` and the W pair that feed it.  At MoS₂ 12×12,
+    μ_pad = 2048 that is 15 × 4.8 GB of arena the ISDF memory model does
+    not know about (it stops at Stage E).  Under one jit XLA fuses the
+    whole chain into a handful of loops and reuses buffers; J estimated
+    ~3 live slots.
+
+    Bit-exactness: every operation here is elementwise, so fusion cannot
+    reassociate anything.  The two reductions count booleans, i.e. exact
+    integers in float64.  The fitted ``Ω``/``B`` are deterministic and
+    are gated bit-identical before/after.
+
+    ``n_log`` is STATIC (the mask is a shape-dependent constant, and the
+    logical extent is a host-side property of the run), so this compiles
+    once per (shape, logical extent) — the same key the eager path would
+    have retraced on anyway.  Module-level, so no in-body-jit recompile
+    hazard (scorecard Z.1 class (a)).
+
+    Returns ``(omega_vals, B_vals, good, fulfilled_fraction)``; the
+    caller turns the last one into ``1 - fraction`` on the host.
+    """
+    Wc0 = jnp.asarray(Wc0_qmunu, dtype=jnp.complex128)
+    Wc_probe = jnp.asarray(Wc_probe_qmunu, dtype=jnp.complex128)
+    n_mu = int(Wc0.shape[-1])
+
     mu_log = jnp.arange(n_mu) < n_log
     mode_mask = mu_log[:, None] & mu_log[None, :]   # (μ, ν) logical selector
 
@@ -430,18 +472,15 @@ def fit_gn_ppm_from_wc_pair(
         & mode_mask
     )
 
-    fallback = jnp.asarray(fallback_omega, dtype=jnp.float64)
     # Pad modes born DEAD: Ω = 0 (hence B = -Wc0·Ω/2 = 0) outside the
-    # logical block — see ``n_mu_logical`` above.
+    # logical block — see ``n_mu_logical`` in the wrapper.
     omega_vals = jnp.where(
         mode_mask, jnp.where(good, jnp.sqrt(omega_sq_re), fallback), 0.0)
     B_vals = -0.5 * Wc0 * omega_vals.astype(jnp.complex128)
     m = jnp.broadcast_to(mode_mask, good.shape)
     n_modes = jnp.sum(m.astype(jnp.float64))
     n_good = jnp.sum(good.astype(jnp.float64))
-    unfulfilled_fraction = 1.0 - _scalar_to_host_float(
-        n_good / jnp.maximum(n_modes, 1.0))
-    return omega_vals, B_vals, good, unfulfilled_fraction
+    return omega_vals, B_vals, good, n_good / jnp.maximum(n_modes, 1.0)
 
 
 @lru_cache(maxsize=64)

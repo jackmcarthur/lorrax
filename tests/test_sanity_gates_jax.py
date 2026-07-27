@@ -556,6 +556,98 @@ def test_kin_ion_has_hartree_is_false_for_the_stored_format():
         assert kin_ion_has_hartree(os.path.join(d, "kin_ion.h5")) is False
 
 
+def _eqp_body_bytes(path):
+    """The file minus its ``#`` provenance line (which carries a timestamp)."""
+    with open(path) as fh:
+        return "".join(l for l in fh if not l.startswith("#")).encode()
+
+
+def _assemble_from_run_dir_via_in_memory(d, out0, out1):
+    """Load the CLI's artifacts by hand and go through the LIVE entry point.
+
+    Deliberately does NOT reuse ``make_eqp_bgw``'s loader: the point is to
+    reach ``write_eqp_bgw_in_memory`` — what ``gw_output.write_results``
+    calls — with the same numbers the CLI reads, and prove the two entry
+    points cannot produce different files.
+    """
+    from common.units import RYD_TO_EV
+    from gw.eqp_bgw import write_eqp_bgw_in_memory
+    from file_io.kin_ion import kin_ion_hartree_source, HARTREE_DATASET
+
+    with h5py.File(os.path.join(d, "WFN.h5"), "r") as w:
+        kpts = np.asarray(w["mf_header/kpoints/rk"])
+        en = np.asarray(w["mf_header/kpoints/el"])
+        ifmax = np.asarray(w["mf_header/kpoints/ifmax"])
+    with h5py.File(os.path.join(d, "qp_wfn_rotations.h5"), "r") as q:
+        b0, b1 = (int(x) for x in np.asarray(q["band_range"]))
+        kmap = np.asarray(q["kirr_to_kfull"], dtype=np.int64)
+    e_dft = en[0, :, b0:b1] * RYD_TO_EV
+    nocc = int(np.max(ifmax[0])) - 1 - b0
+    efermi = 0.5 * (float(np.max(e_dft[:, : nocc + 1]))
+                    + float(np.min(e_dft[:, nocc + 1:])))
+    kip = os.path.join(d, "kin_ion.h5")
+    with h5py.File(kip, "r") as k:
+        kin = np.asarray(k["kin_ion"])[kmap, b0:b1, b0:b1]
+    kin_diag = np.real(np.diagonal(kin, axis1=1, axis2=2)) * RYD_TO_EV
+    with h5py.File(os.path.join(d, "sigma_mnk.h5"), "r") as s:
+        om = np.asarray(s["omega_ev"], dtype=np.float64)
+        sx = np.asarray(s["sigma_sx_kij_ev"])[kmap][:, b0:b1, b0:b1]
+        vh = np.asarray(s["hartree_kij_ev"])[kmap][:, b0:b1, b0:b1]
+        sc = np.asarray(s["sigma_c_kij_ev"])[:, kmap][:, :, b0:b1, b0:b1]
+    src = kin_ion_hartree_source(kip)
+    vh_exact = None
+    if src == "stored":
+        with h5py.File(kip, "r") as k:
+            vhf = np.asarray(k[HARTREE_DATASET])[kmap, b0:b1, b0:b1]
+        vh_exact = np.real(np.diagonal(vhf, axis1=1, axis2=2)) * RYD_TO_EV
+    return write_eqp_bgw_in_memory(
+        eqp0_path=os.path.join(d, out0), eqp1_path=os.path.join(d, out1),
+        kpoints_irr_frac=kpts, band_offset=b0, e_dft_ev=e_dft,
+        kin_ion_diag_ev=kin_diag,
+        hartree_diag_ev=np.real(np.diagonal(vh, axis1=1, axis2=2)),
+        sigma_x_diag_ev=np.real(np.diagonal(sx, axis1=1, axis2=2)),
+        sigma_c_at_dft_diag_ev=None,
+        sigma_c_omega_diag_ev=np.diagonal(sc, axis1=2, axis2=3),
+        omega_rel_ev=om, e_dft_rel_ev=e_dft - efermi,
+        nspin=1, hartree_source=src, exact_hartree_diag_ev=vh_exact,
+    )
+
+
+def test_both_eqp_entry_points_are_byte_identical():
+    """**THE unification gate (AD).**  One assembly, one formatter.
+
+    ``gw_output.write_results`` (live driver) and ``make_eqp_bgw``
+    (post-hoc CLI) now differ only in how the arrays are obtained: both
+    end in ``assemble_eqp`` → ``EqpAssembly.write``.  Fed the same
+    artifacts they must therefore emit eqp0.dat / eqp1.dat that are
+    byte-identical past the provenance line — including the V_H seam,
+    which is the piece that used to be written out twice and drifted
+    (job 7874840, QP gap −453 eV at rc=0).
+
+    Run on all three file shapes, because the seam takes a different
+    branch in each: legacy (as-given), folded (suppressed), stored
+    (substituted).
+    """
+    from gw.eqp_bgw import make_eqp_bgw
+    for label, kw in (("legacy", {}),
+                      ("folded", dict(has_hartree=True)),
+                      ("stored", dict(stored=True, stored_v_h_ev=310.0))):
+        with tempfile.TemporaryDirectory() as d:
+            _make_eqp_cli_inputs(d, **kw)
+            make_eqp_bgw(d)                       # -> eqp0.dat / eqp1.dat
+            _assemble_from_run_dir_via_in_memory(
+                d, "eqp0_mem.dat", "eqp1_mem.dat")
+            for a, b in (("eqp0.dat", "eqp0_mem.dat"),
+                         ("eqp1.dat", "eqp1_mem.dat")):
+                ba = _eqp_body_bytes(os.path.join(d, a))
+                bb = _eqp_body_bytes(os.path.join(d, b))
+                assert ba == bb, (
+                    f"[{label}] {a} from the CLI differs from {b} from the "
+                    f"live in-memory entry point — the two paths have "
+                    f"independent semantics again.\n"
+                    f"  CLI  : {ba[:200]!r}\n  live : {bb[:200]!r}")
+
+
 def test_make_eqp_bgw_double_count_would_be_caught():
     """Pin the size of the bug: not suppressing V_H shifts eqp0 by ~V_H."""
     from gw import eqp_bgw

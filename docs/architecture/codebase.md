@@ -155,9 +155,12 @@ class Meta:
     nb_sigma = b_id_3 - b_id_0
     kgrid = (nkx, nky, nkz)
     band_edges = (b0, b1, b2, b3, b4)
-    band_ranges.valence / conduction / sigma / full / occupied /
-        val_plus_sigma / cond_plus_sigma   # SimpleNamespace of (lo, hi)
 ```
+
+`Meta` carries the band EDGES only.  Band *windows* come from
+`gw.wavefunction_bundle.BandSlices` — the single source of truth.  (A
+duplicate `Meta.band_ranges` namespace existed until AD; it was dead code
+with a conflicting `sigma` convention and is gone.)
 
 Constructed via `Meta.from_system(wfn, sym, nval, ncond, nband, n_rmu, bispinor)` in the driver.
 

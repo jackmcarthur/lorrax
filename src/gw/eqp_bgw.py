@@ -57,6 +57,29 @@ Everything past the comment line is byte-identical to BGW's own
 transparently skips leading ``#`` lines; for downstream BGW binaries
 (BSE/Inteqp) that don't, strip the comment with ``tail -n +2``.
 
+Design — one assembly, one formatter, two ways in
+-------------------------------------------------
+There are two legitimate ways to want eqp{0,1}: during a live gw_jax run
+(the arrays are already in memory) and afterwards from a run directory
+(the "rebuild QP energies from artifacts without re-running Σ" workflow,
+which proved essential this campaign).  They differ ONLY in how the
+arrays are obtained::
+
+        load artifacts              in-memory arrays
+              |                            |
+    make_eqp_bgw                     gw_output.write_results
+              \\                          /
+               +---- assemble_eqp() ----+     V_H seam, mean-field gate,
+                        |                     Z-factor, Newton update
+               EqpAssembly.write()            the BGW formatter
+
+Everything physical happens in :func:`assemble_eqp` — in particular the
+V_H seam (:func:`resolve_hartree_diag_ev`), which used to be written out
+once here and once in ``gw_output`` and drifted (production job 7874840:
+double-counted Hartree, QP gap −453 eV, rc=0).  :func:`make_eqp_bgw` has
+no independent semantics left; it cannot produce a different answer from
+the driver, only the same answer from different inputs.
+
 CLI
 ---
     python -m gw.eqp_bgw <run_dir>
@@ -66,6 +89,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import h5py
@@ -303,12 +327,15 @@ def _warn_on_unphysical_implied_vxc(
 	legitimate Σ_xc cancels out of it entirely, because Σ never enters.
 
 	This is deliberately the same invariant, and the same window, as
-	``gw_output._warn_on_unphysical_h0``.  That one guards the live driver
-	path; this one additionally covers the post-hoc ``make_eqp_bgw`` CLI,
-	which rebuilds eqp{0,1} from ``kin_ion.h5`` + ``sigma_mnk.h5`` on disk
-	— exactly the stale-artifact scenario — and had no guard at all.  It
-	is warn-only and prints nothing on a healthy run, so it adds no noise
-	where the driver already reports.
+	``gw_output._warn_on_unphysical_h0``.
+
+	**Status:** since AD, :func:`assemble_eqp` runs the source-aware
+	``_warn_on_unphysical_h0`` for BOTH entry points, so this function is
+	no longer on the live path.  It is retained as (a) the fallback the
+	assembly uses when ``gw.gw_output`` is not importable (no jax on the
+	host — the post-hoc CLI's own environment) and (b) the ``common.sanity``
+	spelling of the same bracket, which the pure-python gate suite calls
+	directly.  Warn-only; prints nothing on a healthy run.
 	"""
 	from common import sanity
 
@@ -354,18 +381,263 @@ def compute_eqp_diag(
 	).real
 
 	# NOTE: the mean-field (implied-V_xc) gate deliberately does NOT live
-	# here.  ``compute_eqp_diag`` is shared by the live driver path, and
-	# there ``gw_output.write_results`` already runs
-	# ``_warn_on_unphysical_h0`` on these very arrays immediately before
-	# calling the writer — checking again would emit two identical
-	# complaints about one problem.  The gate is attached to
-	# :func:`make_eqp_bgw` instead, which is the path that has no guard.
+	# here.  ``compute_eqp_diag`` is the pure math kernel, shared by every
+	# path including callers that legitimately want no output at all
+	# (``gw_output.write_freq_debug``), and a gate here reported one
+	# broken H₀ twice in two wordings.  It lives one level up, in
+	# :func:`assemble_eqp`, which BOTH entry points go through — so it
+	# still fires exactly once on the live driver and on the post-hoc
+	# CLI.  Pinned by
+	# ``tests/test_sanity_gates.py::test_compute_eqp_diag_does_not_duplicate_the_mean_field_gate``.
 	eqp0 = e_dft_ev + delta_at_dft
 	if z_factor is None:
 		eqp1 = eqp0  # Z=1 trivially
 	else:
 		eqp1 = e_dft_ev + z_factor * delta_at_dft
 	return eqp0, eqp1
+
+
+# ---------------------------------------------------------------------------
+# THE V_H seam — which Hartree term enters H₀, decided in exactly one place
+# ---------------------------------------------------------------------------
+
+def resolve_hartree_diag_ev(
+	*,
+	hartree_diag_ev: np.ndarray,
+	hartree_source: str | None = None,
+	kin_ion_has_hartree: bool = False,
+	exact_hartree_diag_ev: np.ndarray | None = None,
+	print_fn=print,
+) -> tuple[np.ndarray, str]:
+	"""Decide the ⟨mk|V_H|mk⟩ term of H₀.  **The only copy of this rule.**
+
+	H₀ = kin_ion + V_H is a ~500 eV catastrophic cancellation, so counting
+	the Hartree term twice — or zero times — is the single most damaging
+	mistake either eqp entry point can make (production job 7874840:
+	QP gap −453 eV at rc=0).  The three-way rule, from
+	``file_io.kin_ion``'s source ladder:
+
+	``folded``   (legacy ``has_hartree=True`` with no ``v_hartree``
+	             dataset) — V_H is already inside the ``kin_ion`` values.
+	             **Suppress**: the Hartree term is zero here.
+	``stored``   — ``kin_ion`` is pristine and the file carries the exact
+	             FFT-grid V_H in its own array.  **Substitute** it for
+	             whatever Σ-side (ISDF quadrature) column the caller
+	             brought, when the caller supplies it.
+	other        (``isdf`` / ``gspace`` / ``none`` / unknown) —
+	             ``hartree_diag_ev`` *is* the run's V_H.  **Use as given.**
+
+	``exact_hartree_diag_ev`` is the substitution operand and is optional
+	on purpose.  On the live driver path ``gw.sigma_dispatch`` has already
+	substituted the exact matrix into ``sig_h`` at the one point V_H
+	enters ``SigmaResult``, so the caller passes ``None`` and this
+	function is a no-op for ``stored``.  On the post-hoc CLI path nothing
+	upstream did that, so ``make_eqp_bgw`` reads ``kin_ion.h5``'s
+	``v_hartree`` and passes it here.  Either way the decision is made
+	once, by this function.
+
+	Reading the file attribute is the only supported discriminator —
+	never infer the state from magnitudes (``file_io.kin_ion`` docstring).
+
+	Returns ``(hartree_diag_ev_used, rule)`` where ``rule`` is one of
+	``'suppressed'`` / ``'substituted'`` / ``'as-given'``.
+	"""
+	h = np.real(np.asarray(hartree_diag_ev, dtype=np.float64))
+	if bool(kin_ion_has_hartree) or hartree_source == "folded":
+		print_fn(
+			"  V_H seam: kin_ion carries the exact FFT-grid V_H in its own "
+			"values (legacy folded file) — suppressing the Sigma-side "
+			f"Hartree column (mean |V_H| = {float(np.mean(np.abs(h))):.3f} eV) "
+			"to avoid double counting.")
+		return np.zeros_like(h), "suppressed"
+	if hartree_source == "stored" and exact_hartree_diag_ev is not None:
+		vh = np.real(np.asarray(exact_hartree_diag_ev, dtype=np.float64))
+		if vh.shape != h.shape:
+			raise ValueError(
+				f"exact V_H diagonal shape {vh.shape} does not match the "
+				f"Sigma-side Hartree column {h.shape}")
+		print_fn(
+			"  V_H seam: kin_ion is pristine and carries a stored exact V_H "
+			"array — substituting it for the Sigma-side ISDF column "
+			f"(mean |V_H| {float(np.mean(np.abs(h))):.3f} → "
+			f"{float(np.mean(np.abs(vh))):.3f} eV).")
+		return vh, "substituted"
+	return h, "as-given"
+
+
+# ---------------------------------------------------------------------------
+# THE assembly — H₀ + Σ → eqp0/eqp1.  Both entry points go through this.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class EqpAssembly:
+	"""Everything the BGW eqp{0,1} formatter needs, and nothing else.
+
+	Produced by :func:`assemble_eqp` — the *only* place the V_H seam, the
+	mean-field gate, the Z-factor and the Newton update are applied — and
+	consumed by :meth:`write`, which is the *only* BGW formatter.  The
+	live driver (``gw.gw_output.write_results``) and the post-hoc CLI
+	(:func:`make_eqp_bgw`) differ solely in how they obtain the input
+	arrays; from this object onward the two paths are the same code.
+	"""
+
+	kpoints_irr_frac: np.ndarray
+	band_offset: int
+	e_dft_ev: np.ndarray
+	eqp0_ev: np.ndarray
+	eqp1_ev: np.ndarray
+	kin_ion_diag_ev: np.ndarray
+	hartree_diag_ev: np.ndarray          # post-seam: the V_H actually used
+	sigma_x_diag_ev: np.ndarray
+	sigma_c_at_dft_diag_ev: np.ndarray
+	z_factor: np.ndarray | None
+	hartree_rule: str                    # 'suppressed' | 'substituted' | 'as-given'
+	implied_vxc_ev: np.ndarray | None
+	nspin: int = 1
+
+	def write(self, *, eqp0_path: str, eqp1_path: str) -> tuple[str, str]:
+		"""Emit the exact-BGW-format eqp0.dat / eqp1.dat pair."""
+		return write_eqp_bgw_pair(
+			eqp0_path=eqp0_path, eqp1_path=eqp1_path,
+			kpoints_irr_frac=self.kpoints_irr_frac,
+			e_dft_ev=self.e_dft_ev,
+			eqp0_ev=self.eqp0_ev, eqp1_ev=self.eqp1_ev,
+			band_offset=self.band_offset, nspin=self.nspin,
+		)
+
+
+def assemble_eqp(
+	*,
+	kpoints_irr_frac: np.ndarray,
+	band_offset: int,
+	e_dft_ev: np.ndarray,                                  # (nk, nb)
+	kin_ion_diag_ev: np.ndarray,                           # (nk, nb)
+	hartree_diag_ev: np.ndarray,                           # (nk, nb) pre-seam
+	sigma_x_diag_ev: np.ndarray,                           # (nk, nb)
+	sigma_c_at_dft_diag_ev: np.ndarray | None = None,      # (nk, nb)
+	# Optional: full ω-grid for the Z-factor (PPM modes only).
+	# If None ⇒ Z=1 ⇒ eqp1 == eqp0 (BGW behaviour in static modes).
+	sigma_c_omega_diag_ev: np.ndarray | None = None,       # (n_omega, nk, nb)
+	omega_rel_ev: np.ndarray | None = None,                # (n_omega,)
+	e_dft_rel_ev: np.ndarray | None = None,                # (nk, nb)
+	dE_ev: float = 0.5,
+	nspin: int = 1,
+	# The V_H seam (see resolve_hartree_diag_ev)
+	hartree_source: str | None = None,
+	kin_ion_has_hartree: bool = False,
+	exact_hartree_diag_ev: np.ndarray | None = None,
+	mean_field_gate: bool = True,
+	print_fn=print,
+) -> EqpAssembly:
+	"""Assemble BGW QP energies from H₀ and Σ.  **One implementation.**
+
+	Order of operations, and each step happens exactly once:
+
+	1. the V_H seam (:func:`resolve_hartree_diag_ev`);
+	2. the mean-field gate on the *resolved* H₀
+	   (``gw.gw_output._warn_on_unphysical_h0`` — the source-aware
+	   implied-V_xc check; warn-only, never raises);
+	3. Σ_c at E_DFT and the central-difference Z-factor, when an ω-grid
+	   is supplied (:func:`compute_z_factor_from_omega_grid`);
+	4. the Newton update (:func:`compute_eqp_diag`).
+
+	The gate lives HERE rather than in ``compute_eqp_diag`` (which must
+	stay a silent pure function — pinned by
+	``tests/test_sanity_gates.py::test_compute_eqp_diag_does_not_duplicate_the_mean_field_gate``)
+	and no longer at the two call sites, so a single broken H₀ reports
+	itself exactly once, in one wording, on both entry points.
+	"""
+	hartree_used, rule = resolve_hartree_diag_ev(
+		hartree_diag_ev=hartree_diag_ev,
+		hartree_source=hartree_source,
+		kin_ion_has_hartree=kin_ion_has_hartree,
+		exact_hartree_diag_ev=exact_hartree_diag_ev,
+		print_fn=print_fn,
+	)
+
+	implied_vxc = None
+	if mean_field_gate:
+		implied_vxc = _warn_on_unphysical_h0(
+			e_dft_ev=e_dft_ev,
+			kin_ion_diag_ev=kin_ion_diag_ev,
+			hartree_diag_ev=hartree_used,
+			kin_ion_has_hartree=kin_ion_has_hartree,
+			hartree_source=hartree_source,
+			print_fn=print_fn,
+		)
+		# No second check here on purpose.  ``_warn_on_unphysical_h0``
+		# emits its failure through ``common.sanity.warn``, so the
+		# ``*** LORRAX SANITY FAILURE`` grep token and the strict-mode
+		# raise both come from that ONE call — for the live driver and
+		# for the post-hoc CLI alike.  O's policy kept, its duplicate
+		# wording dropped.
+
+	if sigma_c_omega_diag_ev is None:
+		# Static mode: no ω-grid, Z = 1 trivially.
+		if sigma_c_at_dft_diag_ev is None:
+			raise ValueError(
+				"assemble_eqp needs either sigma_c_at_dft_diag_ev (static "
+				"modes) or sigma_c_omega_diag_ev + omega_rel_ev + "
+				"e_dft_rel_ev (dynamic modes)")
+		z_factor = None
+		sigma_c_at_dft = sigma_c_at_dft_diag_ev
+	else:
+		if omega_rel_ev is None or e_dft_rel_ev is None:
+			raise ValueError(
+				"sigma_c_omega_diag_ev requires omega_rel_ev and e_dft_rel_ev")
+		# Re-derive σ_c at E_DFT from the full ω-grid for self-consistency
+		# with the Z-factor central difference.
+		sigma_c_at_dft, z_factor = compute_z_factor_from_omega_grid(
+			sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
+			omega_rel_ev=omega_rel_ev,
+			e_dft_rel_ev=e_dft_rel_ev,
+			dE_ev=dE_ev,
+		)
+
+	eqp0_ev, eqp1_ev = compute_eqp_diag(
+		kin_ion_diag_ev=kin_ion_diag_ev,
+		hartree_diag_ev=hartree_used,
+		sigma_x_diag_ev=sigma_x_diag_ev,
+		sigma_c_at_dft_diag_ev=sigma_c_at_dft,
+		e_dft_ev=e_dft_ev,
+		z_factor=z_factor,
+	)
+	return EqpAssembly(
+		kpoints_irr_frac=np.asarray(kpoints_irr_frac, dtype=np.float64),
+		band_offset=int(band_offset),
+		e_dft_ev=np.asarray(e_dft_ev, dtype=np.float64),
+		eqp0_ev=eqp0_ev, eqp1_ev=eqp1_ev,
+		kin_ion_diag_ev=kin_ion_diag_ev,
+		hartree_diag_ev=hartree_used,
+		sigma_x_diag_ev=sigma_x_diag_ev,
+		sigma_c_at_dft_diag_ev=sigma_c_at_dft,
+		z_factor=z_factor,
+		hartree_rule=rule,
+		implied_vxc_ev=implied_vxc,
+		nspin=int(nspin),
+	)
+
+
+def _warn_on_unphysical_h0(**kwargs):
+	"""The source-aware mean-field gate, single-sourced from the driver.
+
+	Lives in ``gw.gw_output`` (with its window constants) because that is
+	where the diagnosis text belongs; imported lazily here so this module
+	stays importable on its own for the post-hoc CLI, exactly as
+	:func:`_implied_vxc_window_ev` does.  If the driver is not importable
+	(no jax on the host) the assembly falls back to the local
+	warn-only bracket rather than skipping the check.
+	"""
+	try:
+		from . import gw_output as _gwo
+	except ImportError:
+		_warn_on_unphysical_implied_vxc(
+			e_dft_ev=kwargs["e_dft_ev"],
+			kin_ion_diag_ev=kwargs["kin_ion_diag_ev"],
+			hartree_diag_ev=kwargs["hartree_diag_ev"],
+		)
+		return None
+	return _gwo._warn_on_unphysical_h0(**kwargs)
 
 
 def write_eqp_bgw_pair(
@@ -415,47 +687,42 @@ def write_eqp_bgw_in_memory(
 	e_dft_rel_ev: np.ndarray | None = None,                # (nk, nb), required if dynamic
 	dE_ev: float = 0.5,
 	nspin: int = 1,
+	hartree_source: str | None = None,
+	kin_ion_has_hartree: bool = False,
+	exact_hartree_diag_ev: np.ndarray | None = None,
+	print_fn=print,
 ) -> tuple[str, str]:
 	"""Compute and write BGW-format ``eqp0.dat`` / ``eqp1.dat`` from in-memory arrays.
 
 	Parallel of :func:`make_eqp_bgw` (the post-hoc CLI orchestrator) for the
 	live gw_jax write path: the caller already has ``Σ_x``, ``V_H``,
 	``kin_ion``, ``E_DFT`` in memory, so reloading them from disk would be
-	wasteful.  Both entry points now share :func:`compute_eqp_diag`,
-	:func:`compute_z_factor_from_omega_grid`, and :func:`write_eqp_bgw_pair`
-	— there is one source of truth for the eqp{0,1} math and BGW formatter.
-	"""
-	if sigma_c_omega_diag_ev is None:
-		# Static mode: no ω-grid, Z = 1 trivially.
-		z_factor = None
-	else:
-		if omega_rel_ev is None or e_dft_rel_ev is None:
-			raise ValueError(
-				"sigma_c_omega_diag_ev requires omega_rel_ev and e_dft_rel_ev"
-			)
-		# Re-derive σ_c at E_DFT from the full ω-grid for self-consistency
-		# with the Z-factor central difference.
-		sigma_c_at_dft_diag_ev, z_factor = compute_z_factor_from_omega_grid(
-			sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
-			omega_rel_ev=omega_rel_ev,
-			e_dft_rel_ev=e_dft_rel_ev,
-			dE_ev=dE_ev,
-		)
+	wasteful.  **Both entry points are now the same two calls** —
+	:func:`assemble_eqp` then :meth:`EqpAssembly.write` — so the V_H seam,
+	the mean-field gate, the Z-factor and the formatter each exist once.
 
-	eqp0_ev, eqp1_ev = compute_eqp_diag(
+	``hartree_diag_ev`` is handed in PRE-seam (i.e. whatever the Σ side
+	produced); the seam decides whether it is suppressed, substituted or
+	used as given.
+	"""
+	return assemble_eqp(
+		kpoints_irr_frac=kpoints_irr_frac,
+		band_offset=band_offset,
+		e_dft_ev=e_dft_ev,
 		kin_ion_diag_ev=kin_ion_diag_ev,
 		hartree_diag_ev=hartree_diag_ev,
 		sigma_x_diag_ev=sigma_x_diag_ev,
 		sigma_c_at_dft_diag_ev=sigma_c_at_dft_diag_ev,
-		e_dft_ev=e_dft_ev,
-		z_factor=z_factor,
-	)
-	return write_eqp_bgw_pair(
-		eqp0_path=eqp0_path, eqp1_path=eqp1_path,
-		kpoints_irr_frac=kpoints_irr_frac,
-		e_dft_ev=e_dft_ev, eqp0_ev=eqp0_ev, eqp1_ev=eqp1_ev,
-		band_offset=band_offset, nspin=nspin,
-	)
+		sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
+		omega_rel_ev=omega_rel_ev,
+		e_dft_rel_ev=e_dft_rel_ev,
+		dE_ev=dE_ev,
+		nspin=nspin,
+		hartree_source=hartree_source,
+		kin_ion_has_hartree=kin_ion_has_hartree,
+		exact_hartree_diag_ev=exact_hartree_diag_ev,
+		print_fn=print_fn,
+	).write(eqp0_path=eqp0_path, eqp1_path=eqp1_path)
 
 
 # ---------------------------------------------------------------------------
@@ -557,19 +824,18 @@ def make_eqp_bgw(
 	hartree_diag = np.diagonal(hartree_irr, axis1=1, axis2=2)
 	sigma_c_omega_diag = np.diagonal(sigma_c_irr, axis1=2, axis2=3)  # (n_omega, nk, nb)
 
-	# ── The no-double-counting seam, CLI side ─────────────────────────
-	# Mirror of ``gw.sigma_dispatch``'s seam, which zeroes the ISDF
-	# ``sig_h`` when ``kin_ion.h5`` already carries the exact FFT-grid
-	# V_H.  That seam covers the live driver only; this CLI rebuilds
-	# eqp{0,1} straight from files and predated the ``has_hartree``
-	# contract entirely, so it kept adding ``sigma_mnk.h5``'s Hartree
-	# column on top of an already-folded kin_ion.
+	# ── The V_H seam's ONE extra input on this path ───────────────────
+	# ``gw.sigma_dispatch`` applies the source rule at the single point
+	# V_H enters ``SigmaResult`` — but that covers the live driver only.
+	# This CLI rebuilds eqp{0,1} straight from files, so it has to look
+	# the source up itself and hand the seam its operand.  Everything
+	# after that is :func:`assemble_eqp`, byte-for-byte the live path.
 	#
 	# The mixed case is the *normal* one here, not an edge case: a
 	# ``sigma_mnk.h5`` written by an older run carries a non-zero ISDF
-	# V_H, and pointing this CLI at a regenerated folded ``kin_ion.h5``
-	# is exactly how one re-derives QP energies without re-running Σ
-	# (Σ_xc does not depend on V_H, so the rebuild is legitimate).
+	# V_H, and pointing this CLI at a regenerated ``kin_ion.h5`` is
+	# exactly how one re-derives QP energies without re-running Σ (Σ_xc
+	# does not depend on V_H, so the rebuild is legitimate).
 	# Double-counting ~500 eV of Hartree put the c606 sweep's QP gap at
 	# −453 eV with rc=0 (job 7874840).
 	#
@@ -579,22 +845,8 @@ def make_eqp_bgw(
 	# importable without pulling in the jax-dependent file_io stack.
 	from file_io.kin_ion import kin_ion_hartree_source, HARTREE_DATASET
 	_src = kin_ion_hartree_source(kin_ion_path)
-	if _src == "folded":
-		print(
-			f"  kin_ion: LEGACY folded file — exact FFT-grid V_H is already "
-			f"inside {os.path.basename(kin_ion_path)}'s values; suppressing "
-			f"sigma_mnk.h5's ISDF Hartree column "
-			f"(mean |V_H| = {float(np.mean(np.abs(np.real(hartree_diag)))):.3f} eV) "
-			f"to avoid double counting."
-		)
-		hartree_diag = np.zeros_like(hartree_diag)
-	elif _src == "stored":
-		# The file carries the exact V_H as its own array, and kin_ion is
-		# pristine — so we do not suppress, we SUBSTITUTE.  Using the
-		# stored matrix instead of sigma_mnk's ISDF column is the whole
-		# point of re-deriving eqp from a regenerated kin_ion.h5: Σ_xc
-		# does not depend on V_H, so the only thing that should change is
-		# which V_H H0 was built with.
+	vh_exact = None
+	if _src == "stored":
 		with h5py.File(kin_ion_path, "r") as kf:
 			vh_full = np.asarray(kf[HARTREE_DATASET])
 		if vh_full.shape[1] < band_stop:
@@ -604,45 +856,26 @@ def make_eqp_bgw(
 		vh_irr = vh_full[kirr_to_kfull, band_start:band_stop,
 		                 band_start:band_stop]
 		vh_exact = np.real(np.diagonal(vh_irr, axis1=1, axis2=2)) * RYD_TO_EV
-		print(
-			f"  kin_ion: pristine, with a stored exact V_H array — using it "
-			f"instead of sigma_mnk.h5's ISDF Hartree column "
-			f"(mean |V_H| {float(np.mean(np.abs(np.real(hartree_diag)))):.3f} "
-			f"→ {float(np.mean(np.abs(vh_exact))):.3f} eV)."
-		)
-		hartree_diag = vh_exact
 
-	# Mean-field gate — this CLI is the unguarded path.  Unlike the live
-	# driver (where ``gw_output.write_results`` runs the same check just
-	# before writing), ``make_eqp_bgw`` rebuilds eqp{0,1} from whatever
-	# ``kin_ion.h5`` / ``sigma_mnk.h5`` happen to be sitting in
-	# ``run_dir`` — the stale-artifact scenario, with no guard at all.
-	_warn_on_unphysical_implied_vxc(
+	# From here on: zero independent semantics.  Same assembly (seam +
+	# mean-field gate + Z-factor + Newton update), same formatter, as
+	# ``gw_output.write_results``.  This CLI's whole remaining job is
+	# "load artifacts, then call these two".
+	return assemble_eqp(
+		kpoints_irr_frac=kpoints_irr,
+		band_offset=band_start,
 		e_dft_ev=e_dft_ev,
 		kin_ion_diag_ev=kin_ion_diag_ev,
 		hartree_diag_ev=np.real(hartree_diag),
-	)
-
-	sigma_c_at_dft, z_factor = compute_z_factor_from_omega_grid(
+		sigma_x_diag_ev=np.real(sigma_x_diag),
 		sigma_c_omega_diag_ev=sigma_c_omega_diag,
 		omega_rel_ev=omega_rel_ev,
 		e_dft_rel_ev=e_dft_rel_ev,
 		dE_ev=finite_difference_spacing_ev,
-	)
-	eqp0_ev, eqp1_ev = compute_eqp_diag(
-		kin_ion_diag_ev=kin_ion_diag_ev,
-		hartree_diag_ev=np.real(hartree_diag),
-		sigma_x_diag_ev=np.real(sigma_x_diag),
-		sigma_c_at_dft_diag_ev=sigma_c_at_dft,
-		e_dft_ev=e_dft_ev,
-		z_factor=z_factor,
-	)
-	return write_eqp_bgw_pair(
-		eqp0_path=eqp0_path, eqp1_path=eqp1_path,
-		kpoints_irr_frac=kpoints_irr,
-		e_dft_ev=e_dft_ev, eqp0_ev=eqp0_ev, eqp1_ev=eqp1_ev,
-		band_offset=band_start, nspin=1,
-	)
+		nspin=1,
+		hartree_source=_src,
+		exact_hartree_diag_ev=vh_exact,
+	).write(eqp0_path=eqp0_path, eqp1_path=eqp1_path)
 
 
 # ---------------------------------------------------------------------------
