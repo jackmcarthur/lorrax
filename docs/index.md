@@ -15,7 +15,8 @@ or GN-PPM (Godby–Needs Generalized Plasmon Pole) frequency dependence.
 
 The fastest way to confirm LORRAX works on your machine — runs a complete static-COHSEX
 calculation end-to-end on a fresh clone with **no GPU and no native (FFI) build**
-(the bundled fixture sets `use_ffi_io = false` and ships its own wavefunction):
+(the bundled fixture sets `use_ffi_io = false` — the deprecated spelling of
+`slab_io = h5py_allgather`, the serial writer — and ships its own wavefunction):
 
 ```bash
 uv sync

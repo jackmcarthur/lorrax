@@ -123,11 +123,22 @@ def _setup_runtime(config, mesh_xy, *, print_fn=print) -> None:
 	elif config.backend.slab_io is SlabIOBackend.PHDF5_HOST:
 		# mpi4py initialises MPI on first import; do it here so the
 		# ~400 ms MPI_Init cost is amortised before the first SlabIO
-		# open (same rationale as the FFI's phdf5_init_mpi).
+		# open (same rationale as the FFI's phdf5_init_mpi).  When
+		# slab_io=auto routed here, the router already proved MPI
+		# inits; an explicit slab_io=phdf5_host can still hit a PMI
+		# mismatch, so say what the failure means — the SlabIO open
+		# will then fail loudly with the same cause.
 		try:
 			from mpi4py import MPI  # noqa: F401
-		except Exception as exc:
-			print_fn(f"  [phdf5_host mpi4py init] skipped: {exc}")
+		except BaseException as exc:
+			print_fn(
+				f"  [phdf5_host mpi4py init] FAILED: {exc}\n"
+				"    An MPI_Init failure here (classic signature: "
+				"'MPI_Init_thread() failed ... error code: 16') usually "
+				"means a PMI mismatch between the launcher and the MPI "
+				"library.  On SLURM launch with `srun --mpi=pmi2`; some "
+				"MPI builds also need I_MPI_PMI_LIBRARY (or the site "
+				"equivalent) pointing at the system libpmi2.")
 
 	try:
 		from common.jax_compile_cache import ensure_jax_compile_cache

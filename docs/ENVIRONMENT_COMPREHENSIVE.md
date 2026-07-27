@@ -177,7 +177,7 @@ concisely; see the overlay's source for the GPU vs CPU branches.
 
 | `cohsex.in` setting | CPU value | Routes to |
 |---|---|---|
-| `use_ffi_io = true` | (unchanged) | `_slab_io_mpi_host.py` (per-rank MPI-IO via mpi4py + h5py-parallel) |
+| `slab_io = auto` (default; `use_ffi_io` is deprecated) | (unchanged) | capability router: `_slab_io_ffi.py` when the host lib exports the write handler, else `_slab_io_mpi_host.py` (per-rank MPI-IO via mpi4py + h5py-parallel), else allgather |
 | `cusolvermp_charge = auto/on` | forced `off` | in-tree `cholesky_2d.sharded_cholesky` |
 | `cusolvermp_lu = auto/on` | forced `off` | per-q `jnp.linalg.solve` |
 | `pair_density_slots = 3` (GPU XLA) | 4 (CPU XLA) | `_default_pair_density_slots()` |

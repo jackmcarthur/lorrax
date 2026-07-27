@@ -690,7 +690,9 @@ def main(argv=None):
             f"JAX_PROCESS_COUNT) but jax.distributed joined a world of "
             f"{world}.  Every task would redo the whole calculation and "
             f"overwrite the same output file.  Fix the distributed launch "
-            f"(coordinator address / GLOO_SOCKET_IFNAME) or run `-n 1`.")
+            f"(JAX_COORDINATOR_ADDRESS reachable from every task; note "
+            f"GLOO_SOCKET_IFNAME is inert in shipped jax — "
+            f"LORRAX_GLOO_IFNAME is the transport knob) or run `-n 1`.")
 
     input_dir = os.path.dirname(os.path.abspath(args.input))
 

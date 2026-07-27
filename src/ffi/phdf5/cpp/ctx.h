@@ -95,15 +95,25 @@ struct PhdfCtx {
     bool                              shutdown_flag = false;
 
     // Tuning flags, read from env at open time.  Default: collective
-    // reads (OpenMPI-ROMIO's two-phase I/O is optimal) + independent
-    // writes (avoids Cray MPICH's ad_cray_write_coll.c:669 OOM at
-    // >~1 GB/rank, neutral on OpenMPI at our measured sizes).  Metadata
-    // defaults to non-collective so file-level ops (H5Dcreate/extend)
-    // also bypass the Cray collective driver — and per ARCHITECTURE.md
-    // non-collective meta is ~100 ms faster on OpenMPI small writes too.
+    // reads AND collective writes (two-phase aggregation; the strided
+    // 2-D tile pattern of the production writes is ~3 orders faster
+    // collective — scorecard AI — and the default now matches the
+    // Python phdf5_host writer so LORRAX_PHDF5_COLLECTIVE_WRITES=0
+    // means "independent" in every writer.  Historical Cray-MPICH
+    // caution: ad_cray_write_coll.c:669 OOM at >~1 GB/rank on that
+    // stack — use the env override there).  Metadata defaults to
+    // non-collective so file-level ops (H5Dcreate/extend) bypass the
+    // collective driver — per ARCHITECTURE.md non-collective meta is
+    // ~100 ms faster on OpenMPI small writes too.  dedup_replicas
+    // drops all-but-one writer of a replica group's identical
+    // hyperslab (mesh axes not consumed by the array's sharding):
+    // required for correctness under collective writes (overlapping
+    // selections are undefined) and pure waste-removal under
+    // independent writes.  LORRAX_PHDF5_DEDUP_REPLICAS=0 disables.
     bool   use_collective_read  = true;
-    bool   use_collective_write = false;
+    bool   use_collective_write = true;
     bool   coll_metadata        = false;
+    bool   dedup_replicas       = true;
     size_t align_threshold   = 1 << 20;          // 1 MiB
     size_t align_length      = 1 << 20;
 };

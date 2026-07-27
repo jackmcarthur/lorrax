@@ -385,6 +385,33 @@ static ffi::Future WriteDispatch(
     }
 
     std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
+
+    // Replica dedup: a mesh axis that shards NO dim of this array is a
+    // replica axis — every rank along it holds the same shard and would
+    // compute the same hyperslab.  Under collective MPI-IO overlapping
+    // selections are undefined behaviour (identical bytes or not);
+    // under independent MPI-IO they are redundant writes.  One
+    // canonical writer per replica group: the rank with coord 0 on
+    // every unconsumed mesh axis.  Everyone else drops to a null
+    // selection (they still ENTER the collective H5Dwrite below —
+    // collective transfer requires every rank at the call).  Purely
+    // rank-local: no communication, unlike the Python host backend's
+    // allgather-keyed dedup, because coord + axis_flat determine the
+    // duplicate set exactly.  Same env knob as the host backend:
+    // LORRAX_PHDF5_DEDUP_REPLICAS=0 disables.
+    bool replica_dup = false;
+    if (ctx->dedup_replicas) {
+        std::vector<char> axis_used(mesh_shape.size(), 0);
+        for (size_t i = 0; i < axis_flat.size(); ++i) {
+            int64_t ax = axis_flat[i];
+            if (ax >= 0 && (size_t)ax < axis_used.size())
+                axis_used[(size_t)ax] = 1;
+        }
+        for (size_t ax = 0; ax < axis_used.size(); ++ax) {
+            if (!axis_used[ax] && coord[ax] != 0) { replica_dup = true; break; }
+        }
+    }
+
     std::vector<hsize_t> offset(N), file_count(N), mem_dims(N);
     size_t flat_idx = 0;
     for (size_t d = 0; d < N; ++d) {
@@ -423,6 +450,12 @@ static ffi::Future WriteDispatch(
         }
         offset[d] += (hsize_t)local_start;
         flat_idx += (size_t)na;
+    }
+    if (replica_dup) {
+        // Not the canonical writer of this replica group: write nothing,
+        // but keep the (possibly collective) H5Dwrite rendezvous via the
+        // async body's empty-selection path (H5Sselect_none).
+        for (size_t d = 0; d < N; ++d) file_count[d] = 0;
     }
 
     // Element size + HDF5 native type per dtype (we don't dispatch by
