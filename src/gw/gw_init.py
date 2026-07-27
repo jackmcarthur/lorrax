@@ -176,11 +176,21 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'gspace_mode':          str(cfg.gspace_mode),
 		'zeta_cutoff_ry':       round(float(zeta_cutoff), 9),
 		'bare_coulomb_cutoff':  round(float(zeta_vcoul_cutoff), 9),
-		# EFFECTIVE (env-overridden) values — mirrors isdf/core:1278-1279.
-		'zeta_ridge':           os.environ.get(
-			"LORRAX_ZETA_RIDGE", repr(cfg.backend.zeta_ridge)),
-		'zeta_rcond':           os.environ.get(
-			"LORRAX_ZETA_RCOND", repr(cfg.backend.zeta_rcond)),
+		# EFFECTIVE (env-overridden) values — mirrors
+		# isdf/core._deprecated_env_float exactly: the env forms are
+		# DEPRECATED (scorecard AV) but still win when non-empty, so the
+		# provenance must keep recording what the fit actually used.  An
+		# empty env var counts as unset (as in core); the recorded string
+		# is byte-identical to the historical format in every case that
+		# ever produced a reusable ζ.
+		'zeta_ridge':           (
+			os.environ.get("LORRAX_ZETA_RIDGE")
+			if (os.environ.get("LORRAX_ZETA_RIDGE") or "").strip()
+			else repr(cfg.backend.zeta_ridge)),
+		'zeta_rcond':           (
+			os.environ.get("LORRAX_ZETA_RCOND")
+			if (os.environ.get("LORRAX_ZETA_RCOND") or "").strip()
+			else repr(cfg.backend.zeta_rcond)),
 		'charge_zeta_solve':    str(cfg.backend.charge_zeta_solve),
 		'gamma_contract_mode':  str(cfg.backend.gamma_contract_mode),
 		'write_ibz_only':       bool(write_ibz_only),
