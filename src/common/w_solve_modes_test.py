@@ -138,10 +138,10 @@ def main():
                     dyson_solver="distributed")
     jax.block_until_ready(W_dst)
 
-    V_full = np.asarray(multihost_utils.process_allgather(V_q))
-    C_full = np.asarray(multihost_utils.process_allgather(chi0_q))
-    Wl = np.asarray(multihost_utils.process_allgather(W_loc))
-    Wd = np.asarray(multihost_utils.process_allgather(W_dst))
+    V_full = np.asarray(multihost_utils.process_allgather(V_q, tiled=True))
+    C_full = np.asarray(multihost_utils.process_allgather(chi0_q, tiled=True))
+    Wl = np.asarray(multihost_utils.process_allgather(W_loc, tiled=True))
+    Wd = np.asarray(multihost_utils.process_allgather(W_dst, tiled=True))
 
     if jax.process_index() != 0:
         return 0
