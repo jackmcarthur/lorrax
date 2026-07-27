@@ -79,13 +79,18 @@ NATIVE = "native"
 
 #: Per-op user vocabulary (requested names).  ``auto``/``off`` resolve
 #: to ``native``; the rest name distributed FFI libraries.  ``distributed``
-#: (eigh only) is the PLATFORM-DEFAULT distributed backend — see
-#: :data:`_DISTRIBUTED_DEFAULT`.
+#: is the PLATFORM-DEFAULT distributed backend — see
+#: :data:`_DISTRIBUTED_DEFAULT`.  It is available for ``eigh`` and, since
+#: AD (the sharded W solve), for ``solve_lu``: both ops have exactly one
+#: right distributed library per platform, so naming the library at the
+#: call site is redundant and drifts (scorecard Z.2 was precisely that
+#: drift).  ``cholesky`` deliberately does NOT: its CPU story is the
+#: channel-policy ladder in ``isdf/core``, not one library.
 BACKEND_CHOICES = {
     "eigh":     ("auto", "off", "distributed", "cusolvermp", "slate",
                  "scalapack"),
     "cholesky": ("auto", "off", "cusolvermp", "slate"),
-    "solve_lu": ("auto", "off", "cusolvermp", "scalapack"),
+    "solve_lu": ("auto", "off", "distributed", "cusolvermp", "scalapack"),
 }
 
 #: ``distributed`` → the platform's permanent default distributed backend.
@@ -98,6 +103,11 @@ BACKEND_CHOICES = {
 _DISTRIBUTED_DEFAULT = {
     ("eigh", "cpu"):  "scalapack",
     ("eigh", "CUDA"): "cusolvermp",
+    # solve_lu: the same one-library-per-platform rule.  ScaLAPACK's
+    # pXgetrf/pXgetrs on the host lib, cuSOLVERMp's batched getrf/getrs
+    # on CUDA — the two backends _IMPL already lists for this op.
+    ("solve_lu", "cpu"):  "scalapack",
+    ("solve_lu", "CUDA"): "cusolvermp",
 }
 EIGH_BACKENDS = BACKEND_CHOICES["eigh"]
 CHOLESKY_BACKENDS = BACKEND_CHOICES["cholesky"]

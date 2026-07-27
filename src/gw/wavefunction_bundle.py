@@ -32,6 +32,11 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 class BandSlices:
     """Precomputed local slices from the five canonical band edges.
 
+    **THE single source of truth for band windows.**  ``Meta`` supplies
+    the five edges (``meta.band_edges``) and nothing else; the duplicate
+    ``Meta.band_ranges`` namespace that used to shadow this — with a
+    *different* and unused ``sigma`` convention — was deleted (AD).
+
     Band edges (global indices):
         b0  lowest band in the calculation
         b1  start of mixed valence/conduction sigma region

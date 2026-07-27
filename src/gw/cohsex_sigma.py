@@ -43,10 +43,10 @@ def build_Gij(meta, mesh_xy: Mesh) -> jax.Array:
     ``[b0, b3) = [0, nelec + ncond)``, so the ``nocc = min(nelec,
     nb_sigma) = nelec`` rows set to 1 below are global bands
     ``[0, nelec)`` — *every* occupied band, including deep semicore, for
-    any ``nval``.  ``Meta.band_ranges.sigma`` is a different (unused)
-    ``(b1, b3)`` convention; reading the projector against *that* window
-    suggests a deck with ``nval < nelec`` silently drops occupied bands
-    out of ρ.  It does not.  See the warning in ``common/meta.py``.
+    any ``nval``.  (A second, unused ``Meta.band_ranges.sigma = (b1, b3)``
+    convention used to exist and suggested — falsely — that a deck with
+    ``nval < nelec`` drops occupied bands out of ρ.  It is deleted;
+    ``BandSlices`` is the only band-window source.)
 
     ─ NOTE TO FUTURE EDITORS — THE numpy USAGE BELOW IS INTENTIONAL ─
     (nk, nb_sigma, nb_sigma) is a tiny host-side matrix (<1 MiB in

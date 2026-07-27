@@ -16,7 +16,7 @@ not fit on any single device":
 |---|---|---|
 | `eigh` | BSE/htransform: fH_q band interpolation (`bandstructure/bse_setup.py`), coarse exchange tiles C_q (`bse/vq_interp.py`) | (rank, rank), rank ≈ nspinor·n_μ (10²–10⁴) |
 | `cholesky` | GW ζ-fit, charge channel (`isdf/core.py`) | (nq, n_μ, n_μ) batched HPD |
-| `solve_lu` | GW ζ-fit, transverse channels (`isdf/core.py`) | (nq, n_μ, n_μ) batched Hermitian-indefinite |
+| `solve_lu` | GW ζ-fit, transverse channels (`isdf/core.py`); the W Dyson solve (`gw/w_isdf.py`, `w_dyson_solver = distributed`) | (nq, n_μ, n_μ) batched Hermitian-indefinite |
 
 XLA gives you excellent *batched per-device* factorizations but no
 distributed single-tile ones. Vendor/HPC libraries (cuSOLVERMp, SLATE,
@@ -420,6 +420,7 @@ What can run here?
 | `common/eigh_benchmark` | **plan** — and the plan is now hoisted out of the timing loop |
 | `isdf/core.solve_zeta` cusolvermp-potrs / getrf+getrs branches | route strings + a cuSOLVERMp *handle* whose block-cyclic geometry `solve_zeta` rebuilds; the surrounding pad → solve → reshard → trim frame is de-duplicated into `_distributed_backsolve`, the backend call itself is left on `backend_module`. Migrate together with the ζ route strings, never separately — they are pinned. |
 | `isdf/core.factor_c_q` cusolvermp / slate cholesky branches | same: pinned route strings, and the two backends return different objects (handle vs `to_jax_lower()` L). `_IMPL` records the asymmetry; the branches can move once a route-pin test covers the handle path. |
+| `gw/w_isdf._get_w_solve_fn_plan` (the W Dyson solve) | **plan** — `plan('solve_lu', mesh, backend='distributed').batched(A, V)` with `A = (1 − pref·V·χ₀)`, reached by the input key `w_dyson_solver = distributed`.  The μ axes never leave `P(None,'x','y')`, so W_q(μ_X, ν_Y) is solved where it already lives — no q-parallel gather of (μ, μ) tiles. `distributed` became legal vocabulary for `solve_lu` with this migration (scalapack on cpu, cusolvermp on CUDA — the two backends `_IMPL` already listed).  A resolve-time refusal is caught in `_resolve_w_solve_fn`, printed with the resolver's own message, and falls back to the per-q LU. |
 | `gw/w_isdf` cuBLASMp fused W-solve | **not a selectable op** — one fused gemm+potrf+trsm kernel, no native twin to dispatch against. Out of scope by design. |
 | `common/slate_*_test.py`, `slate_vs_cusolvermp_bench`, `eigh_block_sweep`, `cusolvermp_*_test.py` | deliberately NOT migrated: they exercise backend *internals* (raw buffer layouts, `block_size`, `compute_evecs`) that the plan normalizes away. Testing through the abstraction would stop them testing the thing. |
 

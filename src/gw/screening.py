@@ -204,10 +204,13 @@ def compute_static_w(
                 chi0_q_solve = chi0_q
             with timing.section("W.compile"):
                 precompile_solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
-                                   solver=config.backend.screening_solver)
+                                   solver=config.backend.screening_solver,
+                                   dyson_solver=config.backend.w_dyson_solver)
             with timing.section("W.exec"):
-                W_q_solve = solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
-                              solver=config.backend.screening_solver)
+                W_q_solve = solve_w(
+                    V_q_solve, chi0_q_solve, meta, mesh_xy,
+                    solver=config.backend.screening_solver,
+                    dyson_solver=config.backend.w_dyson_solver)
                 # χ₀ is donated inside solve_w — the reference is
                 # now invalid.  Do NOT touch ``chi0_q_solve`` after this.
                 del chi0_q_solve
@@ -313,7 +316,8 @@ def compute_screening(
         chi0.block_until_ready()
         W = solve_w(
             V_q, chi0, meta, mesh_xy,
-            solver=config.backend.screening_solver)
+            solver=config.backend.screening_solver,
+            dyson_solver=config.backend.w_dyson_solver)
         del chi0
         W.block_until_ready()
         _gate_w(W, req, print_fn=print_fn)

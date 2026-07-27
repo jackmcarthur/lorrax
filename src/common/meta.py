@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from types import SimpleNamespace
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -53,35 +52,16 @@ class Meta:
             self.b_id_4,
         )
         self.band_edges = (b0, b1, b2, b3, b4)
-        # ── WARNING — ``band_ranges.sigma`` IS NOT THE Σ WINDOW ──────────
-        # Nothing in src/ or tests/ reads ``band_ranges`` (verified by
-        # grep); the authoritative Σ slice is
-        # ``gw.wavefunction_bundle.BandSlices.sigma = slice(0, b3-b0)``,
-        # i.e. **[b0, b3) — every occupied band included**, which is what
-        # ``cohsex_sigma.build_Gij`` and the Hartree/SX kernels index.
-        # The ``(b1, b3)`` below is a *different*, unused convention.
-        # Reading it as "the bands ρ is built from" produces the false
-        # conclusion that a deck with ``nval < nelec`` drops occupied
-        # bands out of the ISDF density (it does not) — that misreading
-        # cost workstream N a wrong root-cause attribution.  Do not
-        # reintroduce it as a source of truth; prefer ``BandSlices``.
-        self.band_ranges = SimpleNamespace(
-            valence=(b1, b2),
-            conduction=(b2, b3),
-            sigma=(b1, b3),
-            full=(b0, b4),
-            occupied=(b0, b2),
-            val_plus_sigma=(b0, b3),
-            cond_plus_sigma=(b1, b4),
-        )
-
-    def band_range(self, name: str) -> tuple[int, int]:
-        if not hasattr(self, "band_ranges"):
-            raise AttributeError("Meta.band_ranges not initialised")
-        try:
-            return getattr(self.band_ranges, name)
-        except AttributeError as exc:
-            raise KeyError(f"Unknown band window '{name}'") from exc
+        # ── There is deliberately NO ``band_ranges`` here ────────────────
+        # A ``Meta.band_ranges`` SimpleNamespace (+ a ``band_range(name)``
+        # accessor) used to live at this point.  Nothing in src/ or tests/
+        # ever read it, and its ``sigma=(b1, b3)`` entry CONTRADICTED the
+        # real Σ window — reading it as "the bands ρ is built from" cost
+        # workstream N a wrong root-cause attribution.  Deleted (AD).
+        # The single source of truth for band windows is
+        # ``gw.wavefunction_bundle.BandSlices`` (built from
+        # ``meta.band_edges`` in ``gw_jax.py``).  Do not reintroduce a
+        # second one here.
 
     @classmethod
     def from_system(

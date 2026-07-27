@@ -419,6 +419,13 @@ _DEFAULTS = {
     "band_chunk_size": 16,
     "r_chunk_size": 0,
     # ISDF
+    # Which dense solve runs the W Dyson equation A·W = V, A = (1 - Vχ₀).
+    #   auto / lu    per-q pivoted LU inside the q-parallel shard_map (default)
+    #   lstsq        rank-deficient fallback (SVD min-norm); NOT bit-identical
+    #   distributed  2-D sharded solve through the ffi.linalg PLAN seam
+    #                (ScaLAPACK/cuSOLVERMp); falls back to lu when the mesh
+    #                offers no distributed solve_lu.
+    "w_dyson_solver": "auto",
     "isdf_memory_mode": "auto",   # auto | high_mem | low_mem
                                    # high_mem (default): 2D-blocked JAX Cholesky +
                                    #   replicate-L vmap trsm.  Fast for small n_rmu.
@@ -541,6 +548,7 @@ _NORMALIZE_STR = {
     "wcoul0_source", "screening_method", "minimax_energy_reference",
     "sigma_omega_accumulation", "fermi_reference",
     "isdf_memory_mode",
+    "w_dyson_solver",
     "ppm_invalid_mode",
     "ppm_model",
     # distributed-linalg backend axes (consumed both via LorraxConfig and
@@ -912,6 +920,7 @@ class BackendConfig:
     slab_io: SlabIOBackend
     gspace_io: GspaceIO
     screening_solver: ScreeningSolver
+    w_dyson_solver: str  # "auto"|"lu"|"lstsq"|"distributed" (W Dyson dense solve)
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
     distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
     eigh_backend: str          # "auto" | "off" | "cusolvermp" | "slate"
@@ -927,7 +936,9 @@ class BackendConfig:
             f"backend: slab_io={self.slab_io.value}, "
             f"gspace_io={self.gspace_io.value}, "
             f"screening_solver={self.screening_solver.value}, "
-            f"distributed_cholesky={self.distributed_cholesky}, "
+            + (f"w_dyson_solver={self.w_dyson_solver}, "
+               if self.w_dyson_solver != "auto" else "")
+            + f"distributed_cholesky={self.distributed_cholesky}, "
             f"distributed_lu={self.distributed_lu}, "
             + (f"eigh_backend={self.eigh_backend}, "
                if self.eigh_backend != "auto" else "")
@@ -1431,6 +1442,11 @@ class LorraxConfig:
             raise ValueError(
                 f"charge_zeta_solve={_charge_zeta_solve!r} invalid; expected "
                 f"rank_truncate / cholesky.")
+        _w_dyson_solver = str(_g("w_dyson_solver")).strip().lower()
+        if _w_dyson_solver not in ("auto", "lu", "lstsq", "distributed"):
+            raise ValueError(
+                f"w_dyson_solver={_w_dyson_solver!r} invalid; expected "
+                f"auto / lu / lstsq / distributed.")
         _dist_zeta_solve = str(_g("distributed_zeta_solve")).strip().lower()
         if _dist_zeta_solve not in (
                 "auto", "replicated", "per_q", "distributed"):
@@ -1524,6 +1540,7 @@ class LorraxConfig:
             slab_io=_slab_io_choice,
             gspace_io=GspaceIO(str(_g("gspace_mode")).strip().lower()),
             screening_solver=_LEGACY_ISDF_MEMORY_MODE[isdf_memory_mode],
+            w_dyson_solver=_w_dyson_solver,
             distributed_cholesky=_dist_chol,
             distributed_lu=_dist_lu,
             eigh_backend=_eigh_backend,

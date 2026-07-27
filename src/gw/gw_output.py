@@ -483,6 +483,11 @@ def _warn_on_unphysical_h0(
     still apply.  Only the diagnosis printed on failure differs — an
     exact-V_H run that trips this gate is NOT an ISDF convergence
     problem, and saying so would send the reader down the wrong path.
+
+    **Called from exactly one place:** ``eqp_bgw.assemble_eqp``, on the
+    arrays the V_H seam just resolved.  Both eqp entry points (this
+    module's ``write_results`` and the post-hoc ``make_eqp_bgw`` CLI) go
+    through that assembly, so this gate now covers both and fires once.
     """
     implied_vxc_ev = np.asarray(e_dft_ev, dtype=np.float64) - (
         np.asarray(kin_ion_diag_ev, dtype=np.float64)
@@ -532,15 +537,24 @@ def _warn_on_unphysical_h0(
             "to regenerate kin_ion.h5 with the exact V_H folded in "
             "(gw.kin_ion_io, default); the stopgap is more centroids."
         )
-    print_fn(
-        f"  *** WARNING: H0 = {_src} is UNPHYSICAL — "
+    # Emitted through ``common.sanity.warn`` so this failure carries the
+    # ``*** LORRAX SANITY FAILURE`` grep token every other gate in the
+    # tree uses, and so ``LORRAX_SANITY=strict`` stops the run here
+    # rather than writing an untrustworthy eqp.  Before AD the token was
+    # attached to the post-hoc CLI's own copy of this check; folding the
+    # two gates into one (``eqp_bgw.assemble_eqp``) would otherwise have
+    # dropped it from the CLI and never given it to the live driver.
+    from common import sanity
+    sanity.warn(
+        f"H0 = {_src} is UNPHYSICAL — "
         f"{n_bad} of {implied_vxc_ev.size} (k,n) have an implied Vxc outside "
         f"[{_VXC_IMPLIED_MIN_EV:.0f}, {_VXC_IMPLIED_MAX_EV:.0f}] eV "
         f"(worst: k={int(k_bad)} n={int(n_band_bad)}, "
         f"Vxc={float(implied_vxc_ev[k_bad, n_band_bad]):.3f} eV).  "
         "eqp0/eqp1/eqp_g0w0 are NOT trustworthy.  Sigma may still be fine — "
         f"the mean-field side is what failed.  {_diagnosis}  "
-        "Cross-check H0 against pw2bgw's kih.dat. ***"
+        "Cross-check H0 against pw2bgw's kih.dat.",
+        print_fn=print_fn,
     )
     return implied_vxc_ev
 
@@ -608,7 +622,7 @@ def write_results(
         write_eqp_g0w0,
         write_qp_rotations_h5,
     )
-    from .eqp_bgw import write_eqp_bgw_in_memory
+    from .eqp_bgw import assemble_eqp
 
     r2e = RYD_TO_EV
 
@@ -673,30 +687,20 @@ def write_results(
     kin_ion_diag_ev = (
         np.real(np.diagonal(results.kin_ion_ry[irr_idx], axis1=1, axis2=2)) * r2e
     )
-    # ── H₀'s Hartree term: exactly one source, never two ──────────────────
-    # Only the LEGACY ``folded`` file has ⟨mk|V_H|nk⟩ already inside
-    # ``kin_ion_diag_ev``; adding ``sig_h`` on top of that would double
-    # count ~500 eV.  For every other source ``sig_h`` *is* the run's V_H
-    # (the ISDF quadrature, or the exact matrix that ``sigma_dispatch``
-    # substituted for it), so it is read normally — which is why the VH
-    # column of sigma_diag.dat is meaningful again under the stored-array
-    # format instead of reading 0.000 by design.  ``sigma_dispatch``
-    # already applied the rule; restating it here keeps the writer's
-    # contract readable on its own and makes the two paths independent.
-    if results.kin_ion_has_hartree or results.hartree_source == "folded":
-        hartree_diag_ev = np.zeros_like(kin_ion_diag_ev)
-    else:
-        hartree_diag_ev = np.real(
-            np.diagonal(sig_h_out[irr_idx], axis1=1, axis2=2))
+    # ── H₀'s Hartree term ─────────────────────────────────────────────────
+    # Handed to the assembly PRE-seam: ``eqp_bgw.resolve_hartree_diag_ev``
+    # is the one place that decides whether this column is suppressed
+    # (legacy folded kin_ion), substituted (a stored exact V_H the caller
+    # supplies) or used as given (ISDF quadrature, or the exact matrix
+    # ``sigma_dispatch`` already substituted into ``sig_h``).  The rule
+    # used to be restated here AND in ``eqp_bgw.make_eqp_bgw``; it is now
+    # written once, so the live driver and the post-hoc CLI cannot drift.
+    # The mean-field (implied-V_xc) gate moved with it — ``assemble_eqp``
+    # runs ``_warn_on_unphysical_h0`` on the resolved arrays, so a broken
+    # H₀ still reports itself exactly once, with the same wording.
+    hartree_diag_ev = np.real(
+        np.diagonal(sig_h_out[irr_idx], axis1=1, axis2=2))
     sigma_x_diag_ev = np.real(np.diagonal(sig_x_out[irr_idx], axis1=1, axis2=2))
-    _warn_on_unphysical_h0(
-        e_dft_ev=e_dft_ev_irr,
-        kin_ion_diag_ev=kin_ion_diag_ev,
-        hartree_diag_ev=hartree_diag_ev,
-        kin_ion_has_hartree=results.kin_ion_has_hartree,
-        hartree_source=results.hartree_source,
-        print_fn=print_fn,
-    )
     # Σ_c at E_DFT diagonal: in PPM mode this is the interpolated value
     # the driver already computed; in static modes it is the static Σ_COH
     # diagonal (post-degen-averaging if enabled).
@@ -727,8 +731,7 @@ def write_results(
             )
         e_dft_rel_ev_irr = e_dft_ev_irr - float(results.efermi_ev)
 
-    write_eqp_bgw_in_memory(
-        eqp0_path=eqp0_file, eqp1_path=eqp1_file,
+    assemble_eqp(
         kpoints_irr_frac=np.asarray(kpoints_irr_frac, dtype=np.float64),
         band_offset=results.band_start,
         e_dft_ev=e_dft_ev_irr,
@@ -741,7 +744,10 @@ def write_results(
         e_dft_rel_ev=e_dft_rel_ev_irr,
         dE_ev=eqp_dE_ev,
         nspin=1,
-    )
+        hartree_source=results.hartree_source,
+        kin_ion_has_hartree=results.kin_ion_has_hartree,
+        print_fn=print_fn,
+    ).write(eqp0_path=eqp0_file, eqp1_path=eqp1_file)
 
     # ── eqp_g0w0.dat (PPM non-SC only) — explicit Re/Im of H₀+Σ_xc(E_DFT) ──
     if (
