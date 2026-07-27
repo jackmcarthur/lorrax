@@ -393,7 +393,7 @@ def _integrate_tau_windows_for_branch(
 # ---------------------------------------------------------------------------
 
 def pad_sigma_window(psi_proj_xr, psi_proj_yn, mesh_xy):
-    """Zero-pad the sigma band window up to a multiple of ``p_x·p_y``.
+    """Zero-pad the sigma band window: m to a multiple of ``p_x``, n of ``p_y``.
 
     ``ppm_tau_kernel._make_project_ri_reduce_scatter`` reduce-scatters m over
     ``'x'`` and n over ``'y'``, and ``_MemoryTileSink`` holds Sigma_c(w,k,m,n)
@@ -413,22 +413,45 @@ def pad_sigma_window(psi_proj_xr, psi_proj_yn, mesh_xy):
     Mirrors the established zero-pad-band contract used by the wfn loader
     (``load_psi_gflat_padded``) and htransform (``band_pad_to``).
 
+    **The two axes are padded INDEPENDENTLY, and that is the whole point.**
+    The precondition is ``m % p_x == 0`` AND ``n % p_y == 0`` — two separate
+    one-axis constraints, because ``m`` is reduce-scattered over ``'x'``
+    only and ``n`` over ``'y'`` only.  Rounding *both* up to a multiple of
+    the PRODUCT ``p_x·p_y`` (what this used to do) satisfies them, but pays
+    for it in the largest object the Σ branch carries: Σ_c(ω, k, m, n) and
+    every per-τ tile that feeds it scale as ``m_pad · n_pad``.  On MoS₂
+    12×12 at P=80 (8×10, window 70) that is 80×80 = 6400 where 72×70 = 5040
+    suffices — **1.27× of the Σ_c tile, the host accumulate and the D2H
+    copy, for nothing** — and on a square mesh it is far worse: at P=64
+    (8×8) the product rule demands 128×128 = 16384 against 72×72 = 5184,
+    i.e. **3.16×**.  Since Y.4 recommends square meshes for two independent
+    reasons, the product rule was on a collision course with the mesh shape
+    the campaign is moving to.
+
+    Exactness is unchanged by the split: every output element
+    ``Sigma[k,m,n]`` is an independent contraction, so the pad extent on
+    one axis cannot perturb any element of the other, and the pad block is
+    exactly zero either way.
+
     Returns ``(xr_padded, yn_padded, nb_real)``; a no-op (identity, same
-    buffers) when the window already divides.
+    buffers) on whichever axis already divides.  The caller reads the two
+    padded extents back off the returned arrays' shapes — they are no
+    longer equal in general.
     """
     p_x = int(mesh_xy.shape['x'])
     p_y = int(mesh_xy.shape['y'])
     nb_real = int(psi_proj_xr.shape[1])
-    div = p_x * p_y
-    nb_pad = -(-nb_real // div) * div        # round up
-    if nb_pad == nb_real:
-        return psi_proj_xr, psi_proj_yn, nb_real
-    extra = nb_pad - nb_real
+    m_pad = -(-nb_real // p_x) * p_x          # round up to p_x  (reduce-scatter 'x')
+    n_pad = -(-nb_real // p_y) * p_y          # round up to p_y  (reduce-scatter 'y')
     # psi_xr : (nk, m, s, mu_X) at P(None,None,None,'x') -> band axis 1
     # psi_yn : (nk, s, mu_Y, n) at P(None,None,'y',None) -> band axis 3
     # Neither band axis is mesh-sharded, so both pads are rank-local.
-    xr_p = jnp.pad(psi_proj_xr, ((0, 0), (0, extra), (0, 0), (0, 0)))
-    yn_p = jnp.pad(psi_proj_yn, ((0, 0), (0, 0), (0, 0), (0, extra)))
+    xr_p = (psi_proj_xr if m_pad == nb_real else
+            jnp.pad(psi_proj_xr,
+                    ((0, 0), (0, m_pad - nb_real), (0, 0), (0, 0))))
+    yn_p = (psi_proj_yn if n_pad == nb_real else
+            jnp.pad(psi_proj_yn,
+                    ((0, 0), (0, 0), (0, 0), (0, n_pad - nb_real))))
     return xr_p, yn_p, nb_real
 
 
@@ -437,8 +460,16 @@ def strip_sigma_window(sigma_kij, nb_real: int):
 
     The pad rows/cols are exactly zero (bilinear in zero-padded psi); this is
     the single seam where the padded extent stops.  No-op when unpadded.
+
+    BOTH trailing extents are tested: since ``pad_sigma_window`` pads m and n
+    independently, one axis can be at the real extent while the other is
+    padded (mesh 8×10, window 70 → m=72, n=70).  Testing only the last axis
+    would have returned an m-padded Σ untouched.
     """
-    if sigma_kij is None or int(sigma_kij.shape[-1]) == int(nb_real):
+    if sigma_kij is None:
+        return sigma_kij
+    if (int(sigma_kij.shape[-2]) == int(nb_real)
+            and int(sigma_kij.shape[-1]) == int(nb_real)):
         return sigma_kij
     return sigma_kij[..., :nb_real, :nb_real]
 
@@ -490,7 +521,9 @@ def _run_sigma_branch(
     # caller can see; only the in-branch machinery runs at ``nb_pad``.
     psi_proj_xr, psi_proj_yn, nb_proj = pad_sigma_window(
         psi_proj_xr, psi_proj_yn, mesh_xy)
-    nb_pad = int(psi_proj_xr.shape[1])
+    # m and n are padded to DIFFERENT extents in general (m→p_x, n→p_y).
+    m_pad = int(psi_proj_xr.shape[1])
+    n_pad = int(psi_proj_yn.shape[3])
 
     if n_omega == 0:
         return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
@@ -525,16 +558,17 @@ def _run_sigma_branch(
         # (m_X, n_Y) sharding — the full (n_ω,n_k,n_b,n_b) buffer never
         # exists on any GPU until the final device assembly at finalize().
         sink: _MemoryTileSink | _H5Sink = _MemoryTileSink(
-            shape=(n_omega, nk_proj, nb_pad, nb_pad),
+            shape=(n_omega, nk_proj, m_pad, n_pad),
             sharding=NamedSharding(mesh_xy, P(None, None, 'x', 'y')),
         )
     else:
         # Single-process streamed: assemble each window on host and RMW it to
         # the h5 dataset ω-batched (n_windows RMW, not n_τ).
-        assert nb_pad == nb_proj, (
+        assert m_pad == nb_proj and n_pad == nb_proj, (
             f"streamed sigma sink cannot carry a padded QP window "
-            f"(nb_pad={nb_pad} != nb_proj={nb_proj}); KIJ_STREAM is "
-            f"single-process only, where the mesh is 1x1 and no pad exists.")
+            f"(m_pad={m_pad}, n_pad={n_pad}, nb_proj={nb_proj}); KIJ_STREAM "
+            f"is single-process only, where the mesh is 1x1 and no pad "
+            f"exists.")
         sink = _H5Sink(
             writer=stream_writer,
             omega_global_idx=omega_global_idx,
