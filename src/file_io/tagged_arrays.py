@@ -4,6 +4,8 @@ This module reads/writes HDF5 restart files in the v2 format used by gw_jax.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -432,8 +434,24 @@ def save_restart_state_per_proc(
     mesh_xy,
     V0_noG0_munu=None,
 ):
-    """Save local per-process shards for canonical restart state."""
+    """Save local per-process shards for canonical restart state.
+
+    OFF by default (``LORRAX_PER_PROC_RESTART=1`` enables).  No reader of
+    these ``*.rank*.h5`` files exists in-tree — restart goes through the
+    canonical ``isdf_tensors_*.h5`` via ``load_restart_state_from_h5`` —
+    and the write is not cheap: the process-dependent slices below gather
+    the full ``(nq, μ, μ)`` V and ψ per rank (4 m 43 s and 72 GB at MoS₂
+    12×12/c2406/P=144, measured job 7876530), immediately after the
+    canonical collective write of the same data finished in 2.2 s.
+    """
     del meta
+    if os.environ.get("LORRAX_PER_PROC_RESTART", "0").strip().lower() not in (
+            "1", "true", "yes", "on"):
+        if jax.process_index() == 0:
+            print("  [restart_write] per-proc shard dump skipped "
+                  "(no in-tree reader; LORRAX_PER_PROC_RESTART=1 to enable)",
+                  flush=True)
+        return
     cx, cy = _mesh_coords_for_local_process(mesh_xy)
     rank = jax.process_index()
     fname = f"{prefix}.rank{rank}.x{cx}.y{cy}.h5"
