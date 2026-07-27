@@ -67,7 +67,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.collectives import barrier
+from common.collectives import barrier, device_put_process_local
 from common.units import RYD_TO_EV
 from .band_partition import BandPartition, apply_band_partition
 from .scissor import fit_scissor
@@ -171,8 +171,13 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     H0 = (enk_dft_ry[:, :, None] * np.eye(nb_active)[None, :, :]).astype(
         np.complex128)
     rep = NamedSharding(inputs.mesh_xy, P(None, None, None))
+    # Process-local replication (plain ``jax.device_put`` of host numpy
+    # onto a multi-process sharding fires JAX's hidden ``assert_equal``
+    # all-gather, P × nk × nb² × 16 B — scorecard AA.1).  ``H0`` is a
+    # pure function of the DFT energies, identical on every rank;
+    # ``LORRAX_CHECK_REPLICA=1`` re-arms the assertion.
     return SCState(
-        H_qp_dft=jax.device_put(H0, rep),
+        H_qp_dft=device_put_process_local(H0, rep),
         iteration=0,
     )
 
@@ -296,10 +301,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             efermi_ry = 0.5 * (vbm + cbm)
             rep2 = NamedSharding(inputs.mesh_xy, P(None, None))
             rep3 = NamedSharding(inputs.mesh_xy, P(None, None, None))
-            E_qp_ry = jax.device_put(E_np, rep2)
-            U_qp = jax.device_put(
+            # Process-local replication — see the H_qp_dft note above
+            # (same hidden assert_equal; same rank-invariance argument).
+            E_qp_ry = device_put_process_local(E_np, rep2)
+            U_qp = device_put_process_local(
                 np.broadcast_to(
-                    np.eye(nb, dtype=np.complex128), H_np.shape).copy(),
+                    np.eye(nb, dtype=np.complex128), H_np.shape),
                 rep3)
     if E_qp_ry is None:
         E_qp_ry, U_qp, efermi_ry = _diagonalize_and_get_efermi(

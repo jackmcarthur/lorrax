@@ -88,7 +88,14 @@ def ensure_sharding(x, sharding: NamedSharding):
     if (getattr(have, "spec", None) == sharding.spec
             and getattr(have, "mesh", None) == sharding.mesh):
         return x
-    return jax.device_put(x, sharding)
+    # Process-local for host/uncommitted operands (a global jax.Array is
+    # handed straight to ``device_put`` inside the helper — a genuine
+    # reshard).  Plain ``device_put`` of host numpy onto a multi-process
+    # sharding fires JAX's hidden ``assert_equal`` all-gather at
+    # P × x.nbytes (scorecard AA.1) — for an (n, n) c128 FFI operand,
+    # exactly the class of silent cost this helper exists to prevent.
+    from common.collectives import device_put_process_local
+    return device_put_process_local(x, sharding)
 
 
 def _eigh_columns(backend: str, lam, Q):

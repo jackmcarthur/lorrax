@@ -90,6 +90,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from common.collectives import device_put_process_local
+
 jax.config.update("jax_enable_x64", True)
 
 
@@ -181,8 +183,12 @@ def _seed_block(cols, data: dict, gen, sh):
     G = np.zeros((p, n_rmu), dtype=np.float64)
     for b, nu0 in enumerate(cols):
         G[b, int(nu0)] = 1.0
-    r = jax.device_put(
-        jnp.broadcast_to(jnp.asarray(G)[:, :, None], (p, n_rmu, nk)), sh.S)
+    # Process-local (scorecard AA.1): the probe block is identical on every
+    # rank; the host ``np.broadcast_to`` view lets each rank materialise
+    # only its own shard, and skips plain ``device_put``'s hidden
+    # P-linear assert_equal all-gather.  LORRAX_CHECK_REPLICA=1 re-arms it.
+    r = device_put_process_local(
+        np.broadcast_to(G[:, :, None], (p, n_rmu, nk)), sh.S)
     f = jax.lax.with_sharding_constraint(
         gen(r, data["psi_c_X"], data["psi_v_X"], data["V_q0"]), sh.X)
     return f  # (p, c, v, k)

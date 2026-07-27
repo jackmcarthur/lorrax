@@ -57,7 +57,10 @@ def main() -> int:
     X = rng.standard_normal((args.n, args.n))
     A_host = (X + X.T + np.eye(args.n) * (2.0 * args.n)).astype(np.float64)
     ref = np.sort(np.linalg.eigvalsh(A_host))
-    A = jax.device_put(jnp.asarray(A_host), NamedSharding(mesh, P("x", "y")))
+    # Process-local (AA.1): plain device_put of the host operand would pay
+    # a P × n² × 8 B assert_equal all-gather and distort the benchmark.
+    from common.collectives import device_put_process_local
+    A = device_put_process_local(A_host, NamedSharding(mesh, P("x", "y")))
 
     _log(f"n={args.n}  grid={p}x{q}  repeats={args.repeats}")
     _log(f"{'block':>6}  {'warmup':>9}  {'mean':>8}  {'std':>6}  {'min':>8}  "

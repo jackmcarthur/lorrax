@@ -99,13 +99,19 @@ def average_sigma_components(
 
     Returns the six inputs, averaged, in the same order.
     """
-    import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import device_put_process_local
 
     rep = NamedSharding(mesh_xy, P(None, None, None))
 
+    # Process-local replication, NOT plain ``jax.device_put``: the latter
+    # fires JAX's hidden ``assert_equal`` all-gather on a multi-process
+    # mesh — P × nk × nb² × 16 B per matrix, six matrices (scorecard
+    # AA.1).  Each averaged matrix is a deterministic host function of
+    # the (replicated) Σ components, identical on every rank;
+    # ``LORRAX_CHECK_REPLICA=1`` re-arms the assertion.
     def _dav(M):
-        return jax.device_put(apply_to_matrix_diagonals(
+        return device_put_process_local(apply_to_matrix_diagonals(
             np.asarray(M), energies_kn_ry, tol_ry), rep)
 
     sigma_total = _dav(sigma_total)

@@ -2012,6 +2012,7 @@ def load_centroids_band_chunked(
     out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
     out_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
     stage_Y_4d = NamedSharding(mesh_xy, P(None, 'y', None, None))
+    stage_X_4d = NamedSharding(mesh_xy, P(None, 'x', None, None))
 
     # Same divisor + test-only extra pad as Meta.n_rmu_padded — the ψ
     # centroid extent loaded here must equal the meta extent the ζ-fit
@@ -2087,22 +2088,60 @@ def load_centroids_band_chunked(
     del psi_G_flat
 
     # Single global reshard {None, XY, None, None} → {None, None, None, Y}
-    # plus a conjugate-transpose into the rmuT_X layout.  Two-step
-    # reshard via ``stage_Y_4d`` for the same SPMD reason as the
-    # legacy per-chunk path: a single all-to-all on the band axis
-    # before the second all-to-all onto the n_rmu axis.
+    # plus a conjugate-transpose into the rmuT_X layout.  TWO INDEPENDENT
+    # staged chains from the band-sharded input, one per output:
+    #
+    #   psi_rmu :  b:('x','y') → b:'y'  → μ:'y'   (out_Y)
+    #   psi_rmuT:  b:('x','y') → b:'x'  → transpose → μ:'x'  (out_X)
+    #
+    # Each chain is one same-axis band→μ all-to-all after a partial
+    # gather over the OTHER axis — both transitions XLA's partitioner
+    # handles natively.  The previous form derived psi_rmuT from the
+    # FINISHED out_Y tensor, which asked for a μ:'y' → μ:'x' reshard on
+    # the transposed tensor; that is the x-major↔y-major device-order
+    # move XLA cannot lower (upstream b/433785288) and it compiled into
+    # a compiler-flagged "[SPMD] Involuntary full rematerialization" —
+    # an all-gather of the ENTIRE (nk, μ_pad, nb, ns) ψ_rμ on every rank
+    # (1.475 GB/rank at 1998c/nb160/P=80; grows ∝ μ·nb — scorecard K.2,
+    # K.1 #7).  The split chains move full/Px + full/Py per rank instead
+    # of full/Py + full.  Values are untouched (pad/transpose/conj are
+    # elementwise/layout ops): bit-identical outputs, different wires.
+    # ORDERING MATTERS: each chain applies its stage constraint BEFORE the
+    # μ-pad.  Padding first (the original form) gives the pad output ONE
+    # sharding that both chains then consume — the partitioner assigns it
+    # the first chain's b:'y' layout and the second chain's b:'x' demand
+    # becomes exactly the y-major↔x-major device-order move again
+    # (measured: at 8×10 the hoisted pad re-created the involuntary remat
+    # on per-shard c128[144,16,2,640] — wk_AO/gw80 first attempt).  With
+    # the constraint first, the two pads are distinct instructions on
+    # distinctly-sharded operands and each chain stays on its own axis.
     @jax.jit
     def _reshard_all(psi_rmu_band):
-        if n_rmu_padded > n_rmu:
-            psi_rmu_band = jnp.pad(
-                psi_rmu_band,
-                ((0, 0), (0, 0), (0, 0), (0, n_rmu_padded - n_rmu)),
-            )
+        pad_cfg = ((0, 0), (0, 0), (0, 0), (0, n_rmu_padded - n_rmu))
         psi_rmu = jax.lax.with_sharding_constraint(psi_rmu_band, stage_Y_4d)
+        if n_rmu_padded > n_rmu:
+            psi_rmu = jnp.pad(psi_rmu, pad_cfg)
         psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, out_Y)
-        psi_rmuT = jnp.conj(psi_rmu.transpose(0, 3, 1, 2))
+        psi_T = jax.lax.with_sharding_constraint(psi_rmu_band, stage_X_4d)
+        if n_rmu_padded > n_rmu:
+            psi_T = jnp.pad(psi_T, pad_cfg)
+        psi_rmuT = jnp.conj(psi_T.transpose(0, 3, 1, 2))
         psi_rmuT = jax.lax.with_sharding_constraint(psi_rmuT, out_X)
         return psi_rmu, psi_rmuT
+
+    # Attribution barrier: on the PHDF5_HOST / process-local loader routes
+    # NOTHING above this line synchronizes the processes (independent
+    # h5py reads, local FFTs), so the first collective inside
+    # ``_reshard_all`` absorbs ALL process skew accumulated since launch
+    # (cold-start import/startup skew).  Measured: the identical
+    # 606c/P=80 cell pair in job 7876541 recorded reshard = 92.6 s on
+    # the allocation's first (cold) srun vs 0.55 s on the third run on
+    # the SAME nodes with the same 433 compiles — the 92 s was never
+    # data movement.  This named barrier charges the skew to its own
+    # row so ``load_centroids.reshard`` reports the collective itself.
+    with timing.section("load_centroids.pre_reshard_sync"):
+        from common.collectives import barrier as _sync_barrier
+        _sync_barrier("load_centroids_pre_reshard")
 
     with timing.section("load_centroids.reshard"):
         psi_rmu_all, psi_rmuT_all = _reshard_all(psi_rmu_band)

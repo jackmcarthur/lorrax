@@ -325,8 +325,13 @@ class _AllgatherBackend:
 
         if mesh is not None:
             from jax.sharding import NamedSharding, PartitionSpec as P
+            from common.collectives import device_put_process_local
             spec = partition_spec if partition_spec is not None else P()
-            out = jax.device_put(host, NamedSharding(mesh, spec))
+            # Process-local placement: every rank read the same slab from
+            # the same file, so plain ``device_put``'s hidden
+            # ``assert_equal`` all-gather (P × slab bytes, scorecard AA.1)
+            # would verify a tautology.  LORRAX_CHECK_REPLICA=1 re-arms it.
+            out = device_put_process_local(host, NamedSharding(mesh, spec))
         else:
             out = jnp.asarray(host)
         # See the note above — keep ``host`` alive until the transfer lands.

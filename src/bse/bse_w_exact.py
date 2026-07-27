@@ -66,6 +66,7 @@ from .bse_ring_comm import (
     make_bse_shardings,
 )
 from .bse_serial import compute_pair_amplitude
+from common.collectives import device_put_process_local
 import common.timing as timing
 
 jax.config.update("jax_enable_x64", True)
@@ -174,12 +175,17 @@ def build_finite_q_data(data, q, mesh_xy):
     dq["V_q0"] = data["V_q_full"][:, :, qx, qy, qz]
     # Roll on host (see _roll_k_axis_host) so a different q needs no new compile;
     # device_put uploads the rolled array straight into the target sharding.
-    psi_c_q = jnp.asarray(_roll_k_axis_host(
-        np.asarray(jax.device_get(data["psi_c_X"])), (qx, qy, qz), nkx, nky, nkz))
-    dq["psi_c_X"] = jax.device_put(psi_c_q, sh.psi_x)
-    dq["psi_c_Y"] = jax.device_put(psi_c_q, sh.psi_y)
-    dq["eps_c"] = jax.device_put(jnp.asarray(_roll_k_axis_host(
-        np.asarray(jax.device_get(data["eps_c"])), (qx, qy, qz), nkx, nky, nkz)), sh.eps)
+    # Process-local placement of the rolled HOST arrays (identical on
+    # every rank: same source tensor, same q).  Plain ``device_put`` of
+    # host data onto a multi-process sharding fires JAX's hidden
+    # ``assert_equal`` all-gather — P × nbytes per call, three calls per
+    # finite-q point (scorecard AA.1).  LORRAX_CHECK_REPLICA=1 re-arms it.
+    psi_c_q = _roll_k_axis_host(
+        np.asarray(jax.device_get(data["psi_c_X"])), (qx, qy, qz), nkx, nky, nkz)
+    dq["psi_c_X"] = device_put_process_local(psi_c_q, sh.psi_x)
+    dq["psi_c_Y"] = device_put_process_local(psi_c_q, sh.psi_y)
+    dq["eps_c"] = device_put_process_local(_roll_k_axis_host(
+        np.asarray(jax.device_get(data["eps_c"])), (qx, qy, qz), nkx, nky, nkz), sh.eps)
     # M_X/M_Y are hoisted V-term pair amplitudes (audit P3) and are pure functions
     # of psi_c — the finite-q roll shifted psi_c, so recompute them from the ROLLED
     # conduction states.  The q=0 M's shallow-copied from `data` would be stale and
@@ -326,8 +332,14 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
 
     # --- Stage 1: SEED (zeta -> pair), batched over the whole probe block. ---
-    G = jnp.asarray(G_zeta, dtype=jnp.float64)
-    r = jax.device_put(jnp.broadcast_to(G[:, :, None], (n_probe, n_rmu, nk)), sh.S)
+    # Process-local (scorecard AA.1): the probe block is identical on every
+    # rank; ``np.broadcast_to`` keeps the host operand a zero-copy view, so
+    # each rank materialises only its own shard — where plain ``device_put``
+    # of the materialised broadcast paid a P × n_probe·n_rmu·nk·8 B
+    # assert_equal all-gather.  LORRAX_CHECK_REPLICA=1 re-arms the check.
+    G = np.asarray(G_zeta, dtype=np.float64)
+    r = device_put_process_local(
+        np.broadcast_to(G[:, :, None], (n_probe, n_rmu, nk)), sh.S)
     f = jax.lax.with_sharding_constraint(
         gen(r, data["psi_c_X"], data["psi_v_X"], data["V_q0"]), sh.X)
     rhs = jax.lax.with_sharding_constraint(

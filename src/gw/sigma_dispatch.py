@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from .gw_config import ComputeMode
 
@@ -411,8 +412,12 @@ def compute_sigma_xc(
         config.omega_grid_ev, dtype=np.float64)
     efermi_ry = float(wfn.efermi)
     e_qp_rel_ev = np.asarray(e_qp_ev, dtype=np.float64) - efermi_ry * RYD_TO_EV
-    sig_x_rep = jax.device_put(jnp.asarray(sig_x),
-        NamedSharding(mesh_xy, P(None, None, None)))
+    # Process-local replication (plain ``device_put`` of a host/uncommitted
+    # array onto a multi-process sharding fires JAX's hidden ``assert_equal``
+    # all-gather — scorecard AA.1).  ``sig_x`` is replicated post-Σ output,
+    # identical on every rank; ``LORRAX_CHECK_REPLICA=1`` re-arms the check.
+    sig_x_rep = device_put_process_local(
+        sig_x, NamedSharding(mesh_xy, P(None, None, None)))
     sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
         ppm_outputs.sigma_c_omega, sig_x_rep,
         omega_grid_ev, e_qp_rel_ev, mesh_xy,

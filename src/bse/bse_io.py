@@ -896,10 +896,15 @@ def load_bse_data_from_restart_sharded(
                 G0_pad = np.zeros((n_rmu_pad,), dtype=np.complex128)
                 G0_pad[:G0_full.size] = G0_full
                 G0_full = G0_pad
-            g0_X = jax.device_put(G0_full,
-                                  NamedSharding(mesh_xy, P("x")))
-            g0_Y = jax.device_put(G0_full,
-                                  NamedSharding(mesh_xy, P("y")))
+            # Process-local (AA.1): G0_full is host numpy read identically
+            # on every rank; plain device_put would fire the hidden
+            # assert_equal all-gather (twice).  LORRAX_CHECK_REPLICA=1
+            # re-arms it.
+            from common.collectives import device_put_process_local
+            g0_X = device_put_process_local(G0_full,
+                                            NamedSharding(mesh_xy, P("x")))
+            g0_Y = device_put_process_local(G0_full,
+                                            NamedSharding(mesh_xy, P("y")))
             vhead_restart = (complex(f["vhead"][()])
                              if "vhead" in f else None)
             whead_restart = (jnp.asarray(f["whead"][:], dtype=jnp.complex128)

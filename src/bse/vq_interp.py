@@ -85,6 +85,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import device_put_process_local
 from ffi.linalg import plan as linalg_plan
 
 # pipeline constants (§13.5 production shape; reference values verbatim)
@@ -383,10 +384,15 @@ def build_cq(zx, mesh_xy: Mesh, q_chunk=48):
     P_R = jax.jit(lambda: jnp.zeros((nR, ns, n_mu, n_mu, ns),
                                     dtype=jnp.complex128),
                   out_shardings=face5)()
+    # Process-local placement of the host chunks (scorecard AA.1): every
+    # rank reads the same file / computes the same phases, so plain
+    # ``device_put``'s hidden assert_equal all-gather (P × chunk bytes,
+    # once per q-chunk) verifies a tautology.  LORRAX_CHECK_REPLICA=1
+    # re-arms the assertion.
     for q0 in range(0, nq, q_chunk):
         sl = slice(q0, min(q0 + q_chunk, nq))
-        P_R = _pr_acc(P_R, jax.device_put(jnp.asarray(zx["psi"][sl]), rep),
-                      jax.device_put(jnp.asarray(EqR_np[sl]), rep))
+        P_R = _pr_acc(P_R, device_put_process_local(zx["psi"][sl], rep),
+                      device_put_process_local(EqR_np[sl], rep))
     # Return C_q as a MESH-SHARDED device array on the (μ, ν) FACE
     # (``face3`` = ``P(None, 'x', 'y')`` — q replicated, μ over 'x', ν over 'y'),
     # the SAME (μ, ν) tiling every other matrix in this module lives on.  The
@@ -395,7 +401,7 @@ def build_cq(zx, mesh_xy: Mesh, q_chunk=48):
     # n_μ=2412); the sharded form holds only nq·(n_μ/px)·(n_μ/py)·16 B per
     # device.  Consumers (``prepare_coarse``, ``run_gates``) reshard/gather on
     # DEVICE per chunk — no per-proc host gather.
-    return _cq_final(P_R, jax.device_put(jnp.asarray(EqR_np), rep))
+    return _cq_final(P_R, device_put_process_local(EqR_np, rep))
 
 
 def kq_index(zx, ki, qi):
@@ -695,13 +701,17 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
             # batched post-eigh pipeline follows either way (single source
             # for the math).
             lam, R = eigh_plan.batched(C_herm(sl))
+        # Process-local placement of the host chunks (scorecard AA.1) —
+        # same file / same host tables on every rank, so plain
+        # ``device_put``'s hidden assert_equal all-gather (5 × per chunk)
+        # verifies a tautology.  LORRAX_CHECK_REPLICA=1 re-arms it.
         S_b, V_b, F_b = _clean_split(
             lam, R,
-            jax.device_put(jnp.asarray(zx["ZG"][sl]), qb3),
-            jax.device_put(jnp.asarray(v_ref_all[sl]), qb2),
-            jax.device_put(jnp.asarray(v_lr_all[sl]), qb2),
-            jax.device_put(jnp.asarray(idx_all[sl]), qb2),
-            jax.device_put(jnp.asarray(zx["qfr"][sl]), qb2))
+            device_put_process_local(zx["ZG"][sl], qb3),
+            device_put_process_local(v_ref_all[sl], qb2),
+            device_put_process_local(v_lr_all[sl], qb2),
+            device_put_process_local(idx_all[sl], qb2),
+            device_put_process_local(zx["qfr"][sl], qb2))
         # process_allgather (not device_get): S_b/V_b/F_b are q-sharded qb3
         # across the whole mesh, so on a multi-node run their shards span other
         # processes and device_get would raise (non-addressable).
@@ -716,7 +726,10 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
           f"channels zero-filled; sphere-tail bound {tail:.1e}"
           f"{'' if keep_host_mirrors else '; host mirrors dropped'}")
     stencil_sh = NamedSharding(mesh_xy, P(None, "x", "y"))
-    V_SRc_dev = (jax.device_put(V_SRc_np, stencil_sh) if keep_host_mirrors
+    # Host-mirror branch: process-local placement (AA.1; the mirror was
+    # assembled identically on every rank from _to_host'd chunks).
+    V_SRc_dev = (device_put_process_local(V_SRc_np, stencil_sh)
+                 if keep_host_mirrors
                  else jax.jit(lambda *c: jnp.concatenate(c, axis=0),
                               out_shardings=stencil_sh)(*V_dev_chunks))
     del V_dev_chunks

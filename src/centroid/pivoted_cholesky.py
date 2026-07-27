@@ -50,6 +50,7 @@ from functools import partial
 
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps, timing
+from common.collectives import device_put_process_local
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -415,7 +416,13 @@ def prune_candidates_by_pivoted_cholesky(
         if orbit_id is None:
             piv, L, rank, d_final, d_taken, trR_over_trG = select_step(G)
         else:
-            orbit_id_jax = jax.device_put(
+            # Process-local placement, NOT plain ``jax.device_put``: the
+            # latter fires JAX's hidden ``assert_equal`` all-gather
+            # (P × M × 4 bytes) on a multi-process mesh (scorecard AA.1).
+            # ``orbit_id`` is a pure function of the candidate list +
+            # symmetry ops, identical on every rank by construction;
+            # ``LORRAX_CHECK_REPLICA=1`` restores the assertion.
+            orbit_id_jax = device_put_process_local(
                 np.asarray(orbit_id, dtype=np.int32),
                 NamedSharding(mesh, PartitionSpec(select_axis)),
             )
