@@ -548,12 +548,19 @@ What can run here?
   orthogonality on clustered spectra.
 * **`scalapack.batched_distributed_solve_lu` DONATES both A and B.**
   Rebuild them if you need to compute a residual afterwards.
-* **Fabric: use `FI_PROVIDER=mlx`, not `tcp`, on Frontera.** Frontera CLX
-  is ConnectX-6 and TACC's own `impi` modulefile sets `FI_PROVIDER=mlx`
-  plus UCX tunings. `FI_PROVIDER=tcp` (IPoIB) is an rtx/mlx4 workaround
-  that was carried over by mistake; every inter-node FFI number measured
-  under it is **pessimistic**. TACC also documents `ibrun`, not
-  `srun --mpi=pmi2`, as the supported container-MPI launcher.
+* **Fabric: leave `FI_PROVIDER` UNSET on Frontera CLX** (do not pin `mlx`
+  explicitly — you get it by unsetting; `fi_info` falsely reports −61 for
+  `mlx` even where it works, so trust only `I_MPI_DEBUG=4`'s
+  "libfabric provider:" banner). Measured (scorecard AP.3/AP.4, reproduced
+  in-container by AS.2): unset ⇒ `mlx` at 1.07 µs / 11.4 GB/s; the old
+  `FI_PROVIDER=tcp` (IPoIB) pin is 10.9 µs / 2.15 GB/s and was an
+  rtx/mlx4 workaround carried over by mistake — every inter-node FFI
+  number measured under it is **pessimistic** (pzheevd n=2448 P=144:
+  12 s/q → 0.5–0.9 s/q after the fix). Never request `verbs` at P≥144
+  with the one-block layout (68 s/q pathology). The harness dial is
+  `LORRAX_MPI_PROVIDER` (`auto`|`tcp`|explicit). TACC also documents
+  `ibrun`, not `srun --mpi=pmi2`, as the supported container-MPI
+  launcher.
 
 ## Verification
 

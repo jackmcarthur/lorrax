@@ -343,6 +343,21 @@ def pin_gloo_interface() -> None:
         if rank0:
             print(f"[runtime] {msg}", flush=True)
 
+    # Non-Gloo CPU collectives (JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi):
+    # the wrapped factory below would forward untouched anyway (it builds
+    # Gloo collectives only when the impl config equals "gloo"), but
+    # announcing "Gloo collectives pinned to ib0" for an MPI-collectives
+    # run misleads — say what actually happens and skip (wk_AS gate e).
+    # LORRAX sets the implementation via this env var only, so reading it
+    # here (before jax is imported) is authoritative for our launches.
+    _impl = os.environ.get(
+        "JAX_CPU_COLLECTIVES_IMPLEMENTATION", "gloo").strip().lower()
+    if _impl and _impl != "gloo":
+        _say(f"Gloo interface pin: no-op (CPU collectives implementation "
+             f"is {_impl!r}, not gloo; its transport is Intel MPI's — see "
+             "FI_PROVIDER/LORRAX_MPI_PROVIDER).")
+        return
+
     override = os.environ.get("LORRAX_GLOO_IFNAME")
     if override is not None and override.strip().lower() in (
             "off", "none", "0", ""):
