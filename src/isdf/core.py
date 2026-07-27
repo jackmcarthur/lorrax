@@ -1249,6 +1249,45 @@ _ZETA_GATHER_MAX_BYTES = int(
     float(os.environ.get("LORRAX_ZETA_GATHER_CAP_GIB", "4")) * 1024 ** 3)
 
 
+# ---------------------------------------------------------------------------
+# DEPRECATED env overrides of input-file keys (scorecard AV; pattern #8).
+#
+# ``zeta_rcond`` / ``zeta_ridge`` are THE conditioning knobs of the μ ladder
+# — physics policy, not machine capability — so their home is the input file,
+# where they are parsed, validated, echoed into the run log and captured by
+# ζ-fit provenance.  The env forms predate the keys and used to win SILENTLY
+# (the env read had the key's value as its *fallback*), which is exactly the
+# env-coupled-behavior failure class: a sweep run whose central parameter is
+# not in its own input file.  No live harness depends on the env forms
+# (audited 2026-07-27: the one historical user is the completed one-off
+# run_B_c1998_rcond10/run72.sbatch).  They keep working this release, but
+# the override is announced LOUDLY, once per process per variable.
+_env_override_warned: set = set()
+
+
+def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
+    """Input key is the source of truth; a non-empty env var still overrides,
+    but prints a deprecation notice on rank 0 (once per process).
+
+    Empty/unset env → the key's value, exactly.  This also removes the old
+    crash on ``LORRAX_ZETA_RCOND=""`` (``float('')``).
+    """
+    raw = os.environ.get(env_name)
+    if raw is None or raw.strip() == "":
+        return float(key_value)
+    val = float(raw)
+    if env_name not in _env_override_warned:
+        _env_override_warned.add(env_name)
+        if jax.process_index() == 0:
+            print(f"  *** DEPRECATED env override: {env_name}={raw} overrides "
+                  f"input key {key_name}={key_value!r}.  The input file is "
+                  f"the record — put '{key_name} = {raw}' in the deck "
+                  f"instead.  The env form still wins this release, but it "
+                  f"is loud on purpose (env grants capability; it must not "
+                  f"silently select policy).", flush=True)
+    return val
+
+
 def _resolve_zeta_gather(
     override: str = "auto",
     n_rmu: int | None = None,
@@ -1412,8 +1451,11 @@ def _factor_c_q_replicated(
     import os as _os
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
-    ridge_extra = float(_os.environ.get("LORRAX_ZETA_RIDGE", str(zeta_ridge)))
-    rcond = float(_os.environ.get("LORRAX_ZETA_RCOND", str(zeta_rcond)))
+    # DEPRECATED env forms — the input keys are the record (scorecard AV).
+    ridge_extra = _deprecated_env_float(
+        "LORRAX_ZETA_RIDGE", "zeta_ridge", zeta_ridge)
+    rcond = _deprecated_env_float(
+        "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
     mode = str(charge_zeta_solve)
     out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     rep_sh = NamedSharding(mesh_xy, P())
@@ -1700,7 +1742,9 @@ def _factor_c_q_distributed_rank_truncate(
     """
     nq, n_pad, _ = C_q.shape
     n_log = int(n_rmu_logical)
-    rcond = float(os.environ.get("LORRAX_ZETA_RCOND", str(zeta_rcond)))
+    # DEPRECATED env form — the input key is the record (scorecard AV).
+    rcond = _deprecated_env_float(
+        "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
     rank_log = os.environ.get(
         "LORRAX_ZETA_RANK_LOG", "1") not in ("0", "", "false")
 
