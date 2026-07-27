@@ -316,21 +316,35 @@ class _MpiHostBackend:
         # block into it via make_array_from_single_device_arrays.
         sharding = NamedSharding(mesh, partition_spec)
 
-        # Probe shard layout by constructing a same-shape zero array,
-        # pulling addressable_shards[0].index for THIS rank, then
-        # reading exactly that hyperslab from the file.  This is the
-        # cheap way to ask JAX "what slab does this rank own?" without
-        # re-implementing the partition spec arithmetic.
-        proto = jax.device_put(
-            jnp.zeros(tuple(read_shape), dtype=jnp.dtype(dtype)),
-            sharding,
-        )
-        shard = proto.addressable_shards[0]
-        local_shape = tuple(shard.data.shape)
+        # Ask the sharding directly which hyperslab THIS rank owns.
+        # `addressable_devices_indices_map` is PURE METADATA — it
+        # allocates nothing and communicates nothing — and it is the same
+        # idiom `common.collectives.device_put_process_local` uses.
+        #
+        # It replaces a probe that built a zero array of the WHOLE GLOBAL
+        # SHAPE and `device_put` it onto `sharding` just to read
+        # `.addressable_shards[0].index`.  That did two bad things at
+        # once: it materialised the full tensor on every rank, AND
+        # `device_put(numpy, <multi-process NamedSharding>)` trips JAX's
+        # hidden `multihost_utils.assert_equal` (scorecard AA.1), i.e. a
+        # `process_allgather` of P x the global array.  MEASURED: job
+        # 7876346 died here in `compute_V_q` at MoS2 12x12 / c2406 with
+        #   nq*mu_pad*ngkmax*16 = 144*2448*8603*16 = 48.52 GB/rank
+        #   x P=144                                = 6.99 TB
+        # reported verbatim as `RESOURCE_EXHAUSTED: Out of memory
+        # allocating 6987250335744 bytes`.  That run was the first ever to
+        # reach `compute_V_q` at this size, which is why a read path in
+        # production since wk_AB had never shown it: the cost is
+        # O(P x global tensor) and only bites once the tensor is large.
+        idx_map = sharding.addressable_devices_indices_map(tuple(read_shape))
+        index = idx_map[jax.local_devices()[0]]
         # Same None-handling as _local_shard_and_global_offset: replicated
-        # axes have slice(None, None).
+        # axes come back as slice(None, None).
+        local_shape = tuple(
+            int(s.stop - s.start) if s.start is not None else int(full)
+            for s, full in zip(index, read_shape))
         shard_offset = tuple(int(s.start) if s.start is not None else 0
-                             for s in shard.index)
+                             for s in index)
 
         # Read the local hyperslab.  Clip to valid_shape: anything in the
         # padded tail is zero-filled by JAX's array assembly.

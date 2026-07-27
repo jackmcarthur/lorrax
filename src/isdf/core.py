@@ -1559,6 +1559,107 @@ def _distributed_q_batch(nq: int, per_q_bytes: int) -> int:
     return max(1, min(int(nq), _ZETA_GATHER_MAX_BYTES // max(1, per_q_bytes)))
 
 
+# --------------------------------------------------------------------------
+# COLLECTIVE PAYLOAD CHUNKING  (scorecard AF)
+#
+# A memory budget is NOT a transport budget.  ``_ZETA_GATHER_MAX_BYTES``
+# (4 GiB) bounds how much gathered data may be LIVE; it says nothing about
+# how many bytes ONE `all_gather` / `psum_scatter` instruction hands to the
+# interconnect in a single shot.  Those are different quantities, and only
+# the second one is what a fabric actually has to survive.
+#
+# THIS IS TRANSPORT-AGNOSTIC, AND DELIBERATELY SO.  Nothing below is
+# specific to a backend, a fabric or a machine: the tier still issues plain
+# ``lax.all_gather`` / ``lax.psum_scatter``, just in bounded per-instruction
+# payloads.  The identical code path runs unchanged on NCCL/CUDA, on any
+# other XLA backend, and on any interconnect -- there is no transport probe,
+# no per-fabric branch and no environment sniffing anywhere load-bearing.
+# Bounded collectives are simply the robust regime everywhere; large
+# single-shot ones are the fragile regime everywhere, and differ only in HOW
+# they degrade (a slow tail, a retry storm, or an outright transport error).
+# The default below is a transport-agnostic bound, NOT a tuning constant for
+# any one cluster.
+#
+# It was CALIBRATED against the loudest available failure, which is the only
+# reason a specific machine appears here at all.  MEASURED (scorecard AC.2,
+# job 7876062, 72 nodes x 2 ranks, 12x12 mesh, nq=144, mu_pad=2448): the C+
+# formation below issued ONE all_gather of 144*2448*204*16 = 1.15 GB and ONE
+# psum_scatter of the same order, and the job died inside that instruction
+# with MaxRSS 10.69 GB against an 85 GB budget -- i.e. every memory cap was
+# satisfied and it still died.  The counter-evidence that FIXES the bound
+# rather than merely lowering it: the sibling `per_q` tier ran HEALTHY on the
+# identical 144 ranks (job 7876086) while issuing collectives of 0.104 GB.
+# So ~100 MB per instruction is a measured-good payload and ~1.15 GB a
+# measured-fatal one; the default sits just above the measured-good point.
+#
+# The chunking is done as a HOST-LEVEL loop over q-blocks -- one XLA
+# execution per block -- rather than a loop inside one jit.  That is
+# deliberate: XLA carries collective-combiner passes that merge adjacent
+# same-axis collectives back into one instruction, so a loop inside the jit
+# is a chunked-in-Python / fused-in-HLO non-fix.  Separate executions cannot
+# be combined by construction, and the HLO dump gate proves the bound.
+_DEFAULT_COLLECTIVE_CHUNK_MB = 128.0
+
+
+def _collective_chunk_bytes() -> int:
+    """Upper bound on ONE emitted collective's payload, in bytes.
+
+    ``LORRAX_COLLECTIVE_CHUNK_MB`` (default 128 MB, see the note above).
+    ``0`` or a negative value disables chunking entirely and restores the
+    pre-AF single-shot behaviour — kept only so the failure can be
+    reproduced on demand.
+    """
+    try:
+        mb = float(os.environ.get("LORRAX_COLLECTIVE_CHUNK_MB",
+                                  _DEFAULT_COLLECTIVE_CHUNK_MB))
+    except ValueError:
+        mb = _DEFAULT_COLLECTIVE_CHUNK_MB
+    if mb <= 0:
+        return 1 << 62                      # "no bound" — reproduction only
+    return max(1, int(mb * (1 << 20)))
+
+
+def _chunk_q(nq: int, per_q_collective_bytes: int) -> int:
+    """Largest q-block whose LARGEST single collective fits the budget.
+
+    ``per_q_collective_bytes`` must be the size of the BIGGEST collective
+    the block emits per q — not the sum over collectives and not the live
+    footprint.  The bound is per-instruction because that is what the
+    transport sees.
+    """
+    return max(1, min(int(nq),
+                      _collective_chunk_bytes()
+                      // max(1, int(per_q_collective_bytes))))
+
+
+_chunk_logged: set = set()
+
+
+def _chunk_log(where: str, nq: int, qb: int, per_q_bytes: int) -> None:
+    """One line per call site naming the emitted per-collective payload.
+
+    On by default (``LORRAX_COLLECTIVE_CHUNK_LOG=0`` silences it): a tier
+    that silently stopped chunking would otherwise be invisible until it
+    took a 72-node job down again.  Deduplicated on the tuple, because the
+    back-solve site is re-entered once per r-chunk (9–81 times).
+    """
+    if os.environ.get("LORRAX_COLLECTIVE_CHUNK_LOG", "1") in ("0", "", "false"):
+        return
+    if jax.process_index() != 0:
+        return
+    sig = (where, int(nq), int(qb), int(per_q_bytes))
+    if sig in _chunk_logged:
+        return
+    _chunk_logged.add(sig)
+    nblk = (int(nq) + int(qb) - 1) // max(1, int(qb))
+    print(f"  [collective chunk] {where}: nq={nq} q_block={qb} "
+          f"({nblk} executions) max collective/exec = "
+          f"{qb * per_q_bytes / 1e6:.1f} MB "
+          f"(cap {_collective_chunk_bytes() / 1e6:.1f} MB, "
+          f"unchunked would be {nq * per_q_bytes / 1e9:.3f} GB)",
+          flush=True)
+
+
 def _factor_c_q_distributed_rank_truncate(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
     zeta_rcond: float = 1e-8,
@@ -1617,8 +1718,18 @@ def _factor_c_q_distributed_rank_truncate(
                             n=int(n_pad))
     W, V = eigh_plan.batched(C_q)
 
+    px = int(mesh_xy.shape['x'])
+    py = int(mesh_xy.shape['y'])
+    # The two collectives `_pinv_local` emits, per q:
+    #   all_gather('x')   (μ/Px, μ/Py) -> (μ, μ/Py)   = μ²/Py · 16 B
+    #   psum_scatter('y') (μ/Px, μ)    -> (μ/Px, μ/Py) = μ²/Px · 16 B
+    # The BIGGER of the two sets the q-block (see `_chunk_q`).
+    per_q_coll = max(n_pad * (n_pad // py), (n_pad // px) * n_pad) * 16
+    qb = _chunk_q(nq, per_q_coll)
+    _chunk_log('C+ formation (pinv)', nq, qb, per_q_coll)
+
     key = ('dist_rank_trunc', id(mesh_xy), int(nq), int(n_pad), n_log,
-           float(rcond), bool(rank_log))
+           float(rcond), bool(rank_log), int(qb))
     if key not in _dist_factor_cache:
         out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
@@ -1646,8 +1757,8 @@ def _factor_c_q_distributed_rank_truncate(
             return jax.lax.psum_scatter(
                 partial_ij, 'y', scatter_dimension=2, tiled=True)
 
-        @partial(jax.jit, out_shardings=out_sh)
-        def _fn(lam, Vv):
+        @jax.jit
+        def _masks(lam):
             # λ_max must be the LOGICAL block's, not the padded matrix's,
             # or the cut moves with the device count.  The padded matrix is
             # exactly block-diagonal [C_log 0; 0 I], so its spectrum is
@@ -1671,10 +1782,30 @@ def _factor_c_q_distributed_rank_truncate(
                     "n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn}",
                     n=n_pad, rc=rcond, k=jnp.sum(keep, axis=-1),
                     mx=lam_max[..., 0], mn=lam_keep_min, ordered=False)
-            return _pinv_local(Vv, inv)
+            return inv
 
-        _dist_factor_cache[key] = _fn
-    return _dist_factor_cache[key](W, V)
+        @partial(jax.jit, out_shardings=out_sh, donate_argnums=(2,))
+        def _block(V_blk, inv_blk, acc, q0):
+            return jax.lax.dynamic_update_slice(
+                acc, _pinv_local(V_blk, inv_blk), (q0, 0, 0))
+
+        # Zeros in the OUTPUT layout.  `V` already carries it, so this is a
+        # local fill on every rank — no collective, no host round-trip.
+        _zeros = jax.jit(jnp.zeros_like, out_shardings=out_sh)
+
+        _dist_factor_cache[key] = (_masks, _block, _zeros)
+
+    _masks, _block, _zeros = _dist_factor_cache[key]
+    inv = _masks(W)
+    C_pinv = _zeros(V)
+    # Host-level q-block loop: ONE XLA execution per block, so the emitted
+    # all_gather / psum_scatter payloads are bounded by construction and
+    # cannot be re-combined by a compiler pass (see the AF note above).
+    # At most two compiled shapes (full blocks + the remainder).
+    for q0 in range(0, nq, qb):
+        q1 = min(q0 + qb, nq)
+        C_pinv = _block(V[q0:q1], inv[q0:q1], C_pinv, q0)
+    return C_pinv
 
 
 def _distributed_pinv_apply(
@@ -1717,7 +1848,19 @@ def _distributed_pinv_apply(
     n_log = int(n_rmu_logical)
 
     per_q_bytes = (n_pad * (n_pad // px) + n_pad * (n_zcols // py)) * 16
-    qb = _distributed_q_batch(nq, per_q_bytes)
+    # TWO bounds, and they answer different questions (scorecard AF):
+    #   `_distributed_q_batch`  — how much gathered data may be LIVE
+    #                             (LORRAX_ZETA_GATHER_CAP_GIB, 4 GiB).
+    #   `_chunk_q`              — how many bytes ONE collective instruction
+    #                             may hand to the transport in a single shot
+    #                             (LORRAX_COLLECTIVE_CHUNK_MB, 128 MB).
+    # The GEMM emits two gathers per q: C⁺'s row block over 'y'
+    # (μ·μ/Px·16) and Z's column block over 'x' (μ·r/Py·16).  The second is
+    # the larger at production r_chunk and is what sets the block.
+    per_q_coll = max(n_pad * (n_pad // px), n_pad * (n_zcols // py)) * 16
+    qb = min(_distributed_q_batch(nq, per_q_bytes),
+             _chunk_q(nq, per_q_coll))
+    _chunk_log('C+ back-solve (GEMM)', nq, qb, per_q_coll)
 
     # NOTE on the eager ``C_pinv[q0:q1]`` / ``Z_q[q0:q1]`` slices below:
     # the sibling per_q tier (``_solve_one_q_and_update``) slices INSIDE

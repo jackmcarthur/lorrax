@@ -271,6 +271,34 @@ Z, ζ      (nq, μ, r)  P(None,'x','y')   μ on 'x', r on 'y'
 Z staying on `'x'/'y'` (instead of columns-on-the-FLAT-mesh) is what makes
 it work — see "Sharp edges".
 
+**Collective payload bound (`LORRAX_COLLECTIVE_CHUNK_MB`, default 128 MB) —
+transport-agnostic.**
+A memory cap is not a transport cap. `LORRAX_ZETA_GATHER_CAP_GIB` bounds how
+much gathered data may be *live*; this bounds how many bytes ONE
+`all_gather`/`psum_scatter` instruction hands to the interconnect in a single
+shot. Both ζ-tier `shard_map`s (forming `C⁺`, and applying it) are driven by
+a **host-level loop over q-blocks** — one XLA execution per block, so the
+emitted collective cannot be re-combined by a compiler pass — with the block
+sized from the *largest single* collective per q.
+
+This is a property of the emitted program, not of any backend: the tier still
+issues plain `lax` collectives, and the identical code path runs unchanged on
+NCCL/CUDA and on any other XLA backend. There is no transport detection and
+no per-fabric branch. Bounded collectives are the robust regime on every
+fabric; oversized single-shot ones are the fragile regime on every fabric and
+differ only in how they degrade. **Treat 128 MB as a portable default, not a
+cluster tuning.**
+
+At MoS2 12×12/c2406 the bound gives `q_block = 16` for the C⁺ formation
+(127.8 MB/execution against 1.151 GB unchunked) and `q_block = 3` for the
+back-solve GEMM (114.2 MB against 5.482 GB). It was calibrated against the
+loudest available failure: job 7876062 died at P=144 inside the unchunked
+1.15 GB collective with MaxRSS at 12 % of budget, while the healthy `per_q`
+control on the same 144 ranks was issuing 104 MB collectives. Setting the
+knob to `0` restores the single-shot behaviour (for reproducing that failure
+only); below the cap it is a no-op, so at fixture scale the emitted HLO is
+unchanged. `LORRAX_COLLECTIVE_CHUNK_LOG=0` silences the per-site line.
+
 * `--eigh-backend` (htransform, exciton_bands CLIs) **overrides** the
   `eigh_backend` key; unset, the key (default `auto`) applies.
 * Legacy keys `cusolvermp_charge` / `cusolvermp_lu` (`auto|on|off`) are
