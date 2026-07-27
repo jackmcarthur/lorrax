@@ -149,18 +149,30 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     ctx->world_size = world_size;
 
     // Env-driven tuning.  Defaults (see ctx.h): reads collective, writes
-    // independent, metadata non-collective.  Env overrides:
-    //   LORRAX_PHDF5_INDEPENDENT=1    → also force reads independent
-    //   LORRAX_PHDF5_COLLECTIVE_WRITES=1 → force writes back to collective
-    //                                    (OpenMPI-only; crashes on Cray at large
-    //                                    writes)
-    //   LORRAX_PHDF5_COLL_META=1      → re-enable collective metadata ops
+    // COLLECTIVE (default flipped 2026-07-27 to match the Python
+    // phdf5_host writer, so LORRAX_PHDF5_COLLECTIVE_WRITES means the
+    // same thing in every writer; measured on the production tile
+    // geometry: strided 2-D tiles of a contiguous dataset are ~3 orders
+    // faster under two-phase collective aggregation — scorecard AI),
+    // metadata non-collective.  Env overrides:
+    //   LORRAX_PHDF5_INDEPENDENT=1       → also force reads independent
+    //   LORRAX_PHDF5_COLLECTIVE_WRITES=0 → back to independent writes
+    //                                     (historical Cray-MPICH caution:
+    //                                     ad_cray_write_coll.c OOM at
+    //                                     >~1 GB/rank on that stack)
+    //   LORRAX_PHDF5_COLL_META=1         → re-enable collective metadata
+    //   LORRAX_PHDF5_DEDUP_REPLICAS=0    → let every rank of a replica
+    //                                     group write its identical copy
+    //                                     (overlapping selections are
+    //                                     undefined under collective
+    //                                     MPI-IO — only for debugging)
     const bool force_indep_read    = env_long("LORRAX_PHDF5_INDEPENDENT", 0) != 0;
-    const bool force_coll_write    = env_long("LORRAX_PHDF5_COLLECTIVE_WRITES", 0) != 0;
+    const bool coll_write          = env_long("LORRAX_PHDF5_COLLECTIVE_WRITES", 1) != 0;
     const bool force_coll_metadata = env_long("LORRAX_PHDF5_COLL_META", 0) != 0;
     ctx->use_collective_read  = !force_indep_read;
-    ctx->use_collective_write = force_coll_write;
+    ctx->use_collective_write = coll_write;
     ctx->coll_metadata        = force_coll_metadata;
+    ctx->dedup_replicas       = env_long("LORRAX_PHDF5_DEDUP_REPLICAS", 1) != 0;
     // Alignment default matches the new striping_unit default (4 MiB) so
     // H5 objects start on Lustre stripe boundaries.
     long align_mb        = env_long("LORRAX_PHDF5_ALIGN_MB", 4);
