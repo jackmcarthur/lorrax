@@ -1,10 +1,51 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import OrderedDict
 from functools import wraps
 from typing import Any, Callable
+
+# ---------------------------------------------------------------------------
+# STAGE CADENCE (scorecard AI; the observability gap AC.2 / AC.3c / AF.4c
+# each hit independently).
+#
+# ``timing.section`` accumulates into a tree that is printed ONCE, at the
+# end of the run.  Every stage in this codebase is therefore silent while
+# it runs, and three separate 30 min-to-3 h stages (the ``pzheevd`` eigh,
+# the restart-tensor write, the screening solve) have now been
+# indistinguishable from a hang while alive — a job that prints nothing
+# cannot be triaged, only waited out or killed.
+#
+# ``LORRAX_TIMING_TRACE=1`` makes every section announce its entry and
+# exit with a wall-clock timestamp on rank 0.  That is a milestone
+# cadence for the WHOLE code, including stages that are one monolithic
+# jit call and so cannot carry a ``LoopProgress``.  Print-only; the
+# accumulated tree and the final report are byte-identical either way.
+# ``LORRAX_TIMING_TRACE_DEPTH`` caps nesting depth (default 3).
+# ---------------------------------------------------------------------------
+_TRACE = os.environ.get("LORRAX_TIMING_TRACE", "0").strip().lower() in (
+    "1", "true", "yes", "on")
+_TRACE_DEPTH = int(os.environ.get("LORRAX_TIMING_TRACE_DEPTH", "3"))
+_TRACE_RANK0: bool | None = None
+
+
+def _trace_enabled(depth: int) -> bool:
+    global _TRACE_RANK0
+    if not _TRACE or depth > _TRACE_DEPTH:
+        return False
+    if _TRACE_RANK0 is None:
+        try:
+            import jax
+            _TRACE_RANK0 = jax.process_index() == 0
+        except Exception:                                    # noqa: BLE001
+            _TRACE_RANK0 = True
+    return _TRACE_RANK0
+
+
+def _trace(msg: str) -> None:
+    print(f"[stage {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 class TimingNode:
@@ -43,6 +84,8 @@ class TimingSection:
 
 	def __enter__(self) -> "TimingSection":
 		self.stack.append(self)
+		if _trace_enabled(len(self.stack)):
+			_trace("  " * (len(self.stack) - 1) + f"-> {self.node.name}")
 		self.start = time.perf_counter()
 		self.child_elapsed = 0.0
 		self._watchers = []
@@ -57,6 +100,10 @@ class TimingSection:
 		exclusive = inclusive - self.child_elapsed
 		with self.collector._lock:
 			self.node.record(inclusive, max(0.0, exclusive))
+		if _trace_enabled(len(self.stack)):
+			_trace("  " * (len(self.stack) - 1)
+			       + f"<- {self.node.name}  {inclusive:.1f} s"
+			       + ("  [EXC]" if exc_type is not None else ""))
 		self.stack.pop()
 		if self.stack:
 			self.stack[-1].child_elapsed += inclusive

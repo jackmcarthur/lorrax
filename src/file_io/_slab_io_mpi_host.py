@@ -61,6 +61,71 @@ from ._slab_io_ffi import (
     _rank0,
 )
 
+_TRUE = ("1", "true", "yes", "on")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    return v.strip().lower() in _TRUE
+
+
+def _stripe_size_bytes() -> int:
+    """Lustre stripe size in bytes.
+
+    ``LORRAX_PHDF5_STRIPE_SIZE_FS`` is the ``lfs setstripe -S`` spelling
+    ("4M"); MPI-IO's ``striping_unit`` hint wants bytes, so accept both
+    and normalise here.
+    """
+    raw = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE_FS", "4M").strip()
+    mult = 1
+    if raw and raw[-1] in "kKmMgG":
+        mult = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[raw[-1].lower()]
+        raw = raw[:-1]
+    try:
+        return int(float(raw) * mult)
+    except ValueError:
+        return 4 << 20
+
+
+def _mpi_io_hints(MPI):
+    """The ``MPI_Info`` handed to ``H5Pset_fapl_mpio``.
+
+    **This is the striping lever that actually works on Frontera.**
+    :func:`_lustre_prestripe` shells out to ``lfs``, which does NOT
+    EXIST inside the apptainer container every production run uses, so
+    it has always been a silent no-op on this machine — MEASURED: both
+    files job 7876423 wrote (``zeta_q.h5``, ``isdf_tensors_2406.h5``)
+    came back ``lmm_stripe_count: 1``, i.e. 13.3 GB of ``V_qmunu``
+    funnelled through a SINGLE OST.  ROMIO sets the layout through
+    ``llapi`` at file-create time instead, so the hints below reach
+    Lustre from inside the container with no binary on PATH.
+
+    Same keys, same defaults as the C++ writer's
+    ``ffi/phdf5/cpp/context.cc`` (which has always set them) — the h5py
+    backend set NONE, which is the single biggest divergence between
+    the two "equivalent" writers.
+    """
+    info = MPI.Info.Create()
+    sc = int(os.environ.get("LORRAX_PHDF5_STRIPE_COUNT", "16"))
+    if sc > 0:
+        info.Set("striping_factor", str(sc))
+        info.Set("striping_unit", str(_stripe_size_bytes()))
+    # romio_cb_write / romio_ds_write / cb_nodes are left at ROMIO's
+    # automatic policy unless asked for.  MEASURED (wk_AI, P=16, the
+    # production tile): forcing ``romio_cb_write=enable`` on top of
+    # collective + stripe32 was 1826 MB/s vs 2066 MB/s for ROMIO's own
+    # choice, i.e. the explicit hint the C++ writer carries buys nothing
+    # here and may cost a little.  Knobs kept, defaults not opinionated.
+    for key, env in (("romio_cb_write", "LORRAX_PHDF5_CB_WRITE"),
+                     ("romio_ds_write", "LORRAX_PHDF5_DS_WRITE"),
+                     ("cb_nodes", "LORRAX_PHDF5_CB_NODES")):
+        val = os.environ.get(env, "")
+        if val:
+            info.Set(key, val)
+    return info
+
 
 def _local_shard_and_global_offset(
     A: jax.Array,
@@ -168,6 +233,19 @@ class _MpiHostBackend:
         # 'w'; 'a'/'r' inherit the existing inode's stripe layout.
         # Barrier after so all ranks see the inode before H5Fopen.
         if mode == "w" and _rank0():
+            # UNLINK, don't just truncate.  A Lustre stripe layout is a
+            # property of the INODE and is fixed at create time: both
+            # ``lfs setstripe`` and MPI-IO's ``striping_factor`` hint are
+            # no-ops against an existing file, and ``H5Fcreate(TRUNC)``
+            # reuses the inode.  So a rerun in a run dir that already
+            # holds a 1-stripe ``isdf_tensors_*.h5`` would silently keep
+            # 1 stripe for ever.  ``mode='w'`` means "replace", so
+            # replacing the inode is also the honest reading.
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
             stripe_count = int(os.environ.get("LORRAX_PHDF5_STRIPE_COUNT", "16"))
             stripe_size = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE_FS", "4M")
             _lustre_prestripe(path, stripe_count=stripe_count,
@@ -176,7 +254,54 @@ class _MpiHostBackend:
             _barrier("slab_io_mpi_host_prestripe")
 
         h5_mode = {"w": "w", "a": "a", "r": "r"}[mode]
-        self._fh = h5py.File(path, h5_mode, driver="mpio", comm=self._comm)
+        self._info = _mpi_io_hints(MPI)
+        self._fh = h5py.File(path, h5_mode, driver="mpio",
+                             comm=self._comm, info=self._info)
+
+        # Collective (two-phase) MPI-IO for the bulk writes.  DEFAULT ON,
+        # and this is the fix for scorecard AF.4c's 1.7 MB/s.  Rationale,
+        # measured (wk_AI microbench, the production tile geometry):
+        #
+        #   ``V_qmunu`` is (nq, mu, mu) sharded P(None,'x','y'), i.e. a
+        #   2-D TILE of a CONTIGUOUS dataset.  A rank's tile is not one
+        #   contiguous file region — its innermost run is only
+        #   ``(mu/Py)*16`` = 3.2 kB, and there are ``nq*(mu/Px)`` = 28 800
+        #   of them per rank.  Under INDEPENDENT MPI-IO HDF5 issues one
+        #   ``MPI_File_write_at`` per run, so 144 ranks hammer Lustre with
+        #   4.1 M tiny strided writes.
+        #
+        #   ``zeta_q_G`` is (nq, mu, ngkmax) sharded on mu only AND
+        #   created with ``chunks=(1, mu, ngkmax)``, so a rank's tile is
+        #   one contiguous 2.3 MB region per chunk.  Same transport, same
+        #   job, ~3 orders faster — the defect was never the transport.
+        #
+        # H5FD_MPIO_COLLECTIVE makes ROMIO aggregate the strided tiles in
+        # its two-phase exchange and emit a few large contiguous writes
+        # per aggregator instead.  ``LORRAX_PHDF5_COLLECTIVE_WRITES=0``
+        # restores the pre-AI behaviour exactly.
+        self._collective = _env_flag("LORRAX_PHDF5_COLLECTIVE_WRITES", True)
+        # Collective transfer mode requires EVERY rank to enter every
+        # H5Dwrite, so ranks with nothing to write need a null selection
+        # rather than an early return.  Build the dxpl once.
+        self._dxpl_coll = None
+        if self._collective:
+            from h5py import h5fd, h5p
+            dxpl = h5p.create(h5p.DATASET_XFER)
+            dxpl.set_dxpl_mpio(h5fd.MPIO_COLLECTIVE)
+            self._dxpl_coll = dxpl
+        # Drop redundant writes of replicated axes.  A replicated axis
+        # gives every rank in that mesh row the SAME hyperslab and the
+        # SAME bytes; under independent MPI-IO that was merely wasteful,
+        # under collective MPI-IO overlapping selections are also
+        # undefined behaviour.  One canonical writer per distinct
+        # hyperslab fixes both (and cuts psi_full_y's traffic by Px).
+        self._dedup = _env_flag("LORRAX_PHDF5_DEDUP_REPLICAS", True)
+        if _rank0() and _env_flag("LORRAX_PHDF5_LOG", True):
+            print(f"  [SlabIO.phdf5_host] {os.path.basename(path)} mode={mode} "
+                  f"collective_write={self._collective} dedup_replicas="
+                  f"{self._dedup} stripe_count="
+                  f"{os.environ.get('LORRAX_PHDF5_STRIPE_COUNT', '16')} "
+                  f"stripe_unit={_stripe_size_bytes()} B", flush=True)
 
         # write_attr accumulates small (rank-0-only) writes that we
         # defer to close() so they don't interleave with collective
@@ -264,16 +389,61 @@ class _MpiHostBackend:
 
         local, shard_offset = _local_shard_and_global_offset(A)
         clipped = _clip_shard_to_valid(local, shard_offset, off, vshape)
-        if clipped is None:
-            # This rank's shard is entirely in the padded tail.  Under
-            # independent MPI-IO no participation required from this
-            # rank for this dataset; collective ops elsewhere still
-            # need all-rank entry, which the caller ensures.
-            return
-        arr, ds_offset = clipped
         dset = self._fh[name]
-        slc = tuple(slice(o, o + s) for o, s in zip(ds_offset, arr.shape))
-        dset[slc] = arr
+        if clipped is None:
+            # This rank's shard is entirely in the padded tail: nothing
+            # of its own to write.  Under INDEPENDENT MPI-IO it could
+            # simply return; under COLLECTIVE it must still enter the
+            # H5Dwrite, with a null selection.
+            arr, ds_offset = None, None
+        else:
+            arr, ds_offset = clipped
+
+        if self._dedup:
+            # One canonical writer per distinct (offset, shape).  Ranks
+            # that are duplicates of a lower rank drop to a null
+            # selection.  The allgather is a few hundred bytes.
+            key = (None if arr is None
+                   else (tuple(int(o) for o in ds_offset),
+                         tuple(int(s) for s in arr.shape)))
+            keys = self._comm.allgather(key)
+            me = self._comm.Get_rank()
+            if key is not None and keys.index(key) != me:
+                arr, ds_offset = None, None
+
+        self._write_hyperslab(dset, ds_offset, arr)
+
+    # ------------------------------------------------------------------
+    def _write_hyperslab(self, dset, ds_offset, arr) -> None:
+        """One ``H5Dwrite`` of ``arr`` at ``ds_offset`` (or a null
+        selection when ``arr is None``), in the configured transfer mode.
+
+        Uses the low-level h5py API rather than ``dset[slc] = arr`` for
+        two reasons: a *null* selection has no high-level spelling, and
+        the collective dxpl has to be the same object on every rank.
+        """
+        from h5py import h5s
+
+        if arr is None:
+            if not self._collective:
+                return                      # independent: just skip
+            fspace = dset.id.get_space()
+            fspace.select_none()
+            mspace = h5s.create_simple((1,))
+            mspace.select_none()
+            buf = np.zeros((1,), dtype=dset.dtype)
+            dset.id.write(mspace, fspace, buf, dxpl=self._dxpl_coll)
+            return
+
+        # Clipping an inner axis makes ``local[...]`` a strided VIEW;
+        # H5Dwrite wants a contiguous buffer.  No-op when nothing clipped.
+        arr = np.ascontiguousarray(arr)
+        fspace = dset.id.get_space()
+        fspace.select_hyperslab(tuple(int(o) for o in ds_offset),
+                                tuple(int(s) for s in arr.shape))
+        mspace = h5s.create_simple(arr.shape)
+        dset.id.write(mspace, fspace, arr,
+                      dxpl=self._dxpl_coll if self._collective else None)
 
     # ------------------------------------------------------------------
     def read_slab(
