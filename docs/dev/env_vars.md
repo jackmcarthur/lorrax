@@ -56,6 +56,7 @@ Machine and library facts. Legitimately env vars.
 
 | var | default | effect |
 |---|---|---|
+| `LORRAX_GLOO_IFNAME` | unset (→ auto-detect) | Which NIC carries JAX's **Gloo CPU collectives** (`runtime/__init__.py:pin_gloo_interface`, called from `bootstrap()`). Unset: auto-detect the first UP `ib*`/`hsn*` interface with an IPv4 and re-register the CPU backend factory so `make_gloo_tcp_collectives` gets `interface=` — on Frontera that is `ib0` (InfiniBand); jax's default binds the NIC that routes to the coordinator, which is the **1 GbE management NIC `em1`** (measured 3.3× whole-pipeline on the 4×4 deck, bit-identical outputs — scorecard AK.10/AL). A name forces that interface (skipped loudly if it is not UP with an IPv4); `off`/`none`/`0` disables the pin. Machine capability, not policy — but the decision is **always announced on rank 0**, and every failure path degrades to stock jax transport with a printed reason rather than crashing. No-op for single-process runs and for `JAX_PLATFORMS != cpu` (GPU collectives are NCCL's business). |
 | `LORRAX_FFI_SO` | in-tree `src/ffi/common/cpp/build/liblorrax_ffi.so` | Path to the **CUDA** FFI library (`ffi/common/ffi_loader.py:96`). |
 | `LORRAX_FFI_HOST_SO` | in-tree `src/ffi/common/cpp/host/build/liblorrax_ffi_host.so` | Path to the **host** FFI library (`ffi_loader.py:103`). Point this at `$WORK/lorrax_ffi_unified/build_host/…` for the SLATE+ScaLAPACK build. |
 | `LORRAX_WFN_BACKEND` | `""` (→ config/auto) | Forces the WFN read backend: `eager` \| `phdf5` \| `phdf5_host` (`file_io/wfn_loader.py:277`). |
@@ -170,6 +171,7 @@ vars — the earlier grep-based counts were misleading.
 | `OMP_NUM_THREADS` | `setdefault "32"` in `psp/orbital_magnetization.py` only. NOTE: on Frontera the XLA:CPU threadpool does **not** obey OMP — `taskset` pinning is the real mechanism (FRONTERA_ADVICE §10). |
 | `MPLBACKEND` | `setdefault "Agg"` for headless plotting. |
 | `FI_PROVIDER` | not read by LORRAX, but **set it to `mlx`** on Frontera (ConnectX-6). `tcp` is an rtx/mlx4 workaround that makes every inter-node latency pessimistic. |
+| `GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME` | `GLOO_SOCKET_IFNAME` is **INERT with jax** — the string appears nowhere in the shipped jax/jaxlib (scorecard AF.5/AK.4); every job script that exports it is exporting a no-op. The working dial is `LORRAX_GLOO_IFNAME` above (§2). `NCCL_SOCKET_IFNAME` *is* read by NCCL and still matters on GPU runs. |
 
 ---
 

@@ -46,6 +46,7 @@ _DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
 __all__ = [
     "bootstrap",
     "set_default_env",
+    "pin_gloo_interface",
     "init_jax_distributed",
     "fallback_to_cpu_if_no_gpu_backend",
     "install_failfast_excepthook",
@@ -61,11 +62,16 @@ def bootstrap(*, platform: str = "gpu") -> None:
     (jax reads its env at import time).  The jax imports *inside*
     :func:`init_jax_distributed` / :func:`fallback_to_cpu_if_no_gpu_backend`
     happen after the env is set, so they are safe.
+    :func:`pin_gloo_interface` must run after :func:`set_default_env`
+    (it reads the resolved ``JAX_PLATFORMS``) and before anything touches
+    ``jax.devices()`` (a backend factory cannot be replaced once the
+    backend is initialized) — this slot satisfies both.
 
     Idempotent (each piece guards itself); no-op-ish in single-process
     runs.  ``platform`` forwards to :func:`set_default_env`.
     """
     set_default_env(platform=platform)
+    pin_gloo_interface()
     init_jax_distributed()
     fallback_to_cpu_if_no_gpu_backend()
     install_failfast_excepthook()
@@ -214,6 +220,196 @@ def tune_glibc_malloc() -> bool:
         return bool(ok)
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Gloo transport interface pin (workstreams AK/AL, 2026-07)
+# ---------------------------------------------------------------------------
+
+_GLOO_PIN_SENTINEL = "_LORRAX_GLOO_PIN_DONE"
+
+# High-speed-fabric name patterns, in preference order: InfiniBand (Frontera
+# ib0), then Cray Slingshot (Perlmutter hsn0).  Machine capability, not
+# policy: the pin binds the SAME collectives to a different NIC.
+_FABRIC_PREFIXES = ("ib", "hsn")
+
+# SIOCGIFADDR — Linux ioctl for an interface's IPv4 (struct ifreq).
+_SIOCGIFADDR = 0x8915
+
+
+def _iface_ipv4(name: str):
+    """IPv4 address assigned to interface ``name``, or None (Linux only)."""
+    import fcntl
+    import socket
+    import struct
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        packed = fcntl.ioctl(
+            s.fileno(), _SIOCGIFADDR,
+            struct.pack("256s", name.encode()[:15]))
+        return socket.inet_ntoa(packed[20:24])
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def _iface_is_up(name: str) -> bool:
+    """True unless the kernel reports the interface administratively down."""
+    try:
+        with open(f"/sys/class/net/{name}/operstate") as f:
+            return f.read().strip() != "down"
+    except OSError:
+        return False
+
+
+def _detect_fabric_iface():
+    """(name, ipv4) of the preferred UP high-speed fabric NIC, else None.
+
+    Preference: ``ib*`` before ``hsn*`` (numeric order within a prefix);
+    a candidate must be UP and carry an assigned IPv4 — an interface Gloo
+    could not actually bind is not a candidate.
+    """
+    try:
+        names = sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        return None
+    for prefix in _FABRIC_PREFIXES:
+        for name in names:
+            if not (name.startswith(prefix)
+                    and name[len(prefix):len(prefix) + 1].isdigit()):
+                continue
+            if not _iface_is_up(name):
+                continue
+            addr = _iface_ipv4(name)
+            if addr:
+                return name, addr
+    return None
+
+
+def pin_gloo_interface() -> None:
+    """Bind JAX's Gloo CPU collectives to the high-speed fabric NIC.
+
+    THE PROBLEM (measured, scorecard AK.4/AK.10).  ``jax.distributed`` CPU
+    runs use Gloo TCP collectives, and jax 0.9.1 constructs them with no
+    ``interface=`` argument (``jax/_src/xla_bridge.py::make_cpu_client``
+    calls ``make_gloo_tcp_collectives(distributed_client=...)`` only).
+    Gloo then binds the NIC that routes to the coordinator's hostname —
+    on Frontera the 1 GbE management NIC ``em1`` (129.114.x.x, MTU 1500),
+    not InfiniBand ``ib0`` (192.168.x.x).  ``GLOO_SOCKET_IFNAME`` appears
+    nowhere in the shipped jax/jaxlib and is inert.  Measured on the 4x4
+    785c deck at P=16 (job 7876536): pinning ``interface=ib0`` is 3.3x on
+    the whole pipeline (zeta back-solve 13.7x, sigma.exec 3.5x) with
+    eqp0/eqp1/sigma_diag/eqp_g0w0 byte-identical and every compile-only
+    stage row at ratio 1.00 — only communication moves.
+
+    THE MECHANISM.  ``xla_bridge.register_backend_factory("cpu", ...)``
+    overwrites the stock factory and refuses only once the backend is
+    already initialized, so re-registering before anything touches
+    ``jax.devices()`` installs a wrapper that builds the Gloo collectives
+    with ``interface=`` set and forwards everything else to the stock
+    ``make_cpu_client``.
+
+    SCOPE — this is a transport (machine-capability) choice, never physics:
+      * single-process runs: silent no-op (no collectives exist);
+      * GPU-platform runs (``JAX_PLATFORMS`` not exactly ``cpu``): silent
+        no-op (multi-process GPU uses NCCL, whose NIC selection is NCCL's);
+      * no ``ib*``/``hsn*`` interface with an IPv4 found: announced no-op,
+        stock jax behaviour;
+      * jax internals moved / registration refused / bad interface at
+        collectives-construction time: LOUD warning, stock behaviour —
+        degrade, never crash and never hang.  (A pinned interface with no
+        route to a peer fails at the first collective with Gloo's 30 s
+        connect timeout — an exception the failfast hook turns into a job
+        exit, not a hang; ``LORRAX_GLOO_IFNAME=off`` is the escape hatch.)
+
+    Override: ``LORRAX_GLOO_IFNAME=<name>`` forces the interface,
+    ``off``/``none``/``0`` disables the pin.  Either way the decision is
+    announced on rank 0 — an env var that silently changed the wire under
+    every collective would violate quality-pattern #8.
+    """
+    if os.environ.get(_GLOO_PIN_SENTINEL):
+        return
+    os.environ[_GLOO_PIN_SENTINEL] = "1"
+
+    if _resolve_proc_count() <= 1:
+        return                          # no cross-process collectives at all
+    if os.environ.get("JAX_PLATFORMS", "").strip().lower() != "cpu":
+        return                          # GPU path: collectives are NCCL's
+
+    rank0 = _resolve_proc_id() == 0
+
+    def _say(msg: str) -> None:
+        if rank0:
+            print(f"[runtime] {msg}", flush=True)
+
+    override = os.environ.get("LORRAX_GLOO_IFNAME")
+    if override is not None and override.strip().lower() in (
+            "off", "none", "0", ""):
+        _say("Gloo interface pin DISABLED by LORRAX_GLOO_IFNAME="
+             f"{override!r}: jax default transport (binds the NIC that "
+             "routes to the coordinator — the 1 GbE management NIC on "
+             "Frontera).")
+        return
+
+    if override is not None:
+        iface = override.strip()
+        addr = _iface_ipv4(iface)
+        if addr is None or not _iface_is_up(iface):
+            _say(f"WARNING: LORRAX_GLOO_IFNAME={iface!r} is not an UP "
+                 "interface with an IPv4 on this node — Gloo interface pin "
+                 "SKIPPED, stock jax transport (likely the 1 GbE management "
+                 "NIC).")
+            return
+        why = "LORRAX_GLOO_IFNAME override"
+    else:
+        found = _detect_fabric_iface()
+        if found is None:
+            _say("Gloo interface: jax default (no UP ib*/hsn* interface "
+                 "with an IPv4 found on this node).")
+            return
+        iface, addr = found
+        why = "auto-detected high-speed fabric"
+
+    try:
+        from jax._src import config as _jax_config
+        from jax._src import distributed as _jax_dist
+        from jax._src import xla_bridge as _xb
+        from jax._src.lib import xla_client as _xc
+
+        _stock_make_cpu_client = _xb.make_cpu_client
+        _make_gloo = _xc._xla.make_gloo_tcp_collectives   # AttributeError if moved
+
+        def _pinned_cpu_client(collectives=None):
+            if (collectives is None
+                    and _jax_dist.global_state.client is not None
+                    and _jax_config.cpu_collectives_implementation.value
+                        == "gloo"):
+                try:
+                    collectives = _make_gloo(
+                        distributed_client=_jax_dist.global_state.client,
+                        interface=iface,
+                    )
+                except Exception as exc:
+                    _say(f"WARNING: could not build Gloo collectives on "
+                         f"{iface!r} ({type(exc).__name__}: {exc}); falling "
+                         "back to the stock transport.")
+                    collectives = None
+            return _stock_make_cpu_client(collectives)
+
+        _xb.register_backend_factory(
+            "cpu", _pinned_cpu_client, priority=0, fail_quietly=False)
+    except Exception as exc:
+        _say(f"WARNING: Gloo interface pin unavailable "
+             f"({type(exc).__name__}: {exc}) — jax internals moved or the "
+             "backend is already initialized; stock jax transport (on "
+             "Frontera that is the 1 GbE management NIC). Update "
+             "runtime.pin_gloo_interface for this jax version.")
+        return
+
+    _say(f"Gloo collectives pinned to {iface} ({addr}; {why}). The jax "
+         "default binds the coordinator-route NIC — em1, 1 GbE, on "
+         "Frontera compute nodes. Override/disable: LORRAX_GLOO_IFNAME.")
 
 
 def _resolve_proc_count() -> int:
