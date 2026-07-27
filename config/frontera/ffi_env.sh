@@ -28,16 +28,19 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export JAX_ENABLE_X64=1
 export JAX_PLATFORMS="${JAX_PLATFORMS:-cuda,cpu}"
 
-# NOTE (scorecard AG): this file deliberately does NOT set
-# ISDF_JAX_CACHE_DIR.  The JAX persistent compile cache must be off on
-# multi-process runs — process 0 alone writes it, so its peers diverge and
-# block forever in XLA:GPU's cross-process autotuner key-value exchange
-# (the silent `load_centroid_wfns` hang).  That is now enforced IN-TREE and
-# process-count-aware by common/jax_compile_cache.py, which refuses the
-# cache at jax.process_count() > 1 and prints why, so single-process GPU
-# runs sourcing this file keep their warm-compile win.  Do not "fix" this
-# by exporting ISDF_JAX_CACHE_DIR="" here — that would also disable the
-# cache at P == 1, where it is safe and useful.
+# NOTE (scorecard AG, then AH): this file deliberately does NOT set
+# ISDF_JAX_CACHE_DIR, and that is now the *right* default rather than a
+# workaround.  History: the JAX persistent compile cache used to hang every
+# multi-process GPU run — process 0 alone writes entries, the old per-rank
+# cache layout therefore kept the peers' dirs empty forever, process 0 hit
+# and skipped compilation, and its peers blocked forever in XLA:GPU's
+# cross-process autotuner key-value exchange (the silent
+# `load_centroid_wfns` hang).  common/jax_compile_cache.py used to refuse
+# the cache at jax.process_count() > 1 for that reason; it now REPAIRS it
+# (process-invariant cache key + a coordination-service agreement on the
+# usable entry set + atomic writes), so multi-process runs sourcing this
+# file get the warm-compile win too.  Do not "fix" anything by exporting
+# ISDF_JAX_CACHE_DIR="" here — that throws the win away at every P.
 
 # Turing (sm_75) + driver 535 + cudaMallocAsync: XLA CUDA-graph capture of
 # FUSION/WHILE command buffers fails "Failed to add memset node to a CUDA

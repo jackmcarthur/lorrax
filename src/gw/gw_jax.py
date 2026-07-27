@@ -102,8 +102,10 @@ def _setup_runtime(config, mesh_xy, *, print_fn=print) -> None:
 	  collective ``H5Fcreate`` (in ``zeta_fit_chunked``) doesn't pay
 	  the ~400 ms MPI_Init cost on the critical path; failures are
 	  logged and swallowed.
-	- **JAX persistent compile cache**: enable XDG-style on-disk cache
-	  so warm-cache cold starts skip ~3 s of XLA compile.  Opt out via
+	- **JAX persistent compile cache**: enable the XDG-style on-disk
+	  cache so a warm run skips XLA compilation entirely — safe at
+	  every process count since scorecard AH (measured at P=8 on the
+	  fixture: 373 compiles/rank cold, 5 warm).  Opt out via
 	  ``ISDF_JAX_CACHE_DIR=""``.
 	"""
 	from runtime import nccl_warmup

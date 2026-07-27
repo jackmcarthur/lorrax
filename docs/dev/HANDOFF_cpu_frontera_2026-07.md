@@ -110,11 +110,22 @@ Measured, not assumed (see `SPEEDUP_SCORECARD.md`):
   rejected, native eigh err 1.3e-15, 9 CLIs import clean on CPU).
 
 ## Open items (ranked by leverage)
-1. **The compile-cache deadlock** — the highest-value remaining storm work.
-   Enabling a shared `jax_compilation_cache_dir` would cut ~138/rank × 16 down
-   toward 138 total, but the P>1 cache deadlock (per-rank cache diverges on
-   hit/miss → cross-process compile barrier hangs; see FRONTERA_ADVICE §4)
-   forces `ISDF_JAX_CACHE_DIR=""`. Fixing that unlocks the real 158s win.
+1. ~~**The compile-cache deadlock**~~ **DONE — workstreams AG (root cause) +
+   AH (repair), 2026-07-27.** The deadlock was the *per-rank* cache layout, not
+   a shared one: JAX writes entries from process 0 only, so the peers' dirs
+   stayed empty forever, process 0 hit and skipped compilation, and XLA:GPU's
+   collective autotune exchange blocked the peers for good.
+   `common/jax_compile_cache.py` now makes the cache key process-invariant,
+   shares ONE dir per world size, agrees on the usable entry set over the
+   coordination-service KV store, writes atomically, and degrades loudly
+   instead of hanging. `ISDF_JAX_CACHE_DIR=""` is no longer needed.
+   **But the "158 s win" this item promised does not exist**: measured at 606
+   centroids / P=16, the ~174 modules/rank cost ~5 s of XLA compilation per
+   rank, and every rank compiles concurrently — so a perfect cache removes ~1 %
+   of a 431 s CPU run. The storm is a large COUNT of cheap compiles; its cost
+   is jaxpr tracing + lowering + eager dispatch, which the persistent cache is
+   consulted *after* and cannot remove. The cache is a 3.6x win on GPU, where
+   autotuning makes compilation cost 38.6 s/rank. See scorecard AH.
 2. **Rebuild & deploy the host FFI lib** so CPU uses the collective read
    (currently falls back to the h5py twin).
 3. ~~**Port `write_ffi.cc`** to the host lib if CPU writes are ever needed.~~
