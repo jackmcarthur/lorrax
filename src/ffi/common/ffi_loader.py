@@ -12,7 +12,8 @@ sites resolve the right handler from the lowering platform and never
 mention a platform themselves:
 
     CUDA  liblorrax_ffi.so       cuSOLVERMp/cuBLASMp/phdf5/slate
-    cpu   liblorrax_ffi_host.so  slate host handlers (Target::HostTask)
+    cpu   liblorrax_ffi_host.so  phdf5 read+write / slate (Target::HostTask)
+                                 / ScaLAPACK
 
 Public API
 ----------
@@ -42,7 +43,8 @@ from typing import Dict, Optional
 import jax
 import jax.ffi
 
-__all__ = ["get_lib", "has_target", "probe_target", "has_phdf5_read"]
+__all__ = ["get_lib", "has_target", "probe_target", "has_phdf5_read",
+           "has_phdf5_write"]
 
 _LIBS: Dict[str, ctypes.CDLL] = {}
 #: platform -> the .so path actually dlopen'd (for diagnostics).
@@ -72,11 +74,17 @@ _CUDA_TARGET_SYMBOLS = {
 # Host variants of the slate targets (src/ffi/slate/cpp/host_ffi.cc) —
 # same target names as the CUDA table, registered under platform="cpu" —
 # plus the host-only ScaLAPACK targets (src/ffi/scalapack/, MKL/LibSci),
-# plus the phdf5 read handlers (src/ffi/phdf5/cpp/read_ffi.cc compiled with
-# -DLORRAX_FFI_NO_CUDA).  The phdf5 target STRINGS are identical to the CUDA
-# table so the ffi.phdf5.read ffi_call sites resolve by lowering platform;
-# only the C++ SYMBOL names differ (PhdfRead*HostFfi vs PhdfRead*Ffi) so the
-# two platform .so's can co-exist under RTLD_GLOBAL.
+# plus the phdf5 read AND write handlers (src/ffi/phdf5/cpp/{read,write}_ffi.cc
+# compiled with -DLORRAX_FFI_NO_CUDA).  The phdf5 target STRINGS are identical
+# to the CUDA table so the ffi.phdf5.{read,write} ffi_call sites resolve by
+# lowering platform; only the C++ SYMBOL names differ (Phdf*HostFfi vs
+# Phdf*Ffi) so the two platform .so's can co-exist under RTLD_GLOBAL.
+#
+# ``lorrax_phdf5_write`` is what makes ``SlabIOBackend.PHDF5_FFI`` reachable on
+# the CPU backend (workstream AE) — a host lib built before that port exports
+# the three read symbols only, and ``has_phdf5_write('cpu')`` is False, which
+# is exactly how the gw_config router demotes gracefully to PHDF5_HOST /
+# H5PY_ALLGATHER instead of dying at the first ζ write.
 _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_eigh":              "SlateEighHostFfi",
     "lorrax_slate_potrf":             "SlatePotrfHostFfi",
@@ -88,6 +96,7 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_phdf5_read":              "PhdfReadHostFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkHostFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionHostFfi",
+    "lorrax_phdf5_write":             "PhdfWriteHostFfi",
 }
 
 # Per-platform library spec: .so filename, env-var override, in-tree build
@@ -405,6 +414,17 @@ def has_phdf5_read(platform: str) -> bool:
     kchunk-union WFN read — the probe ``WfnLoader._auto_pick_backend``
     uses to pick the ``phdf5`` backend on that platform."""
     return has_target("lorrax_phdf5_read_kchunk_union", platform)
+
+
+def has_phdf5_write(platform: str) -> bool:
+    """True when ``platform``'s FFI library can serve the collective
+    sharded-slab WRITE — the probe ``gw.gw_config`` uses to route
+    ``slab_io=auto`` to :attr:`SlabIOBackend.PHDF5_FFI`.
+
+    False on a host lib built before workstream AE (read-only), which is
+    why the router demotes rather than failing at the first ζ write; use
+    :func:`probe_target` when reporting the reason to a human."""
+    return has_target("lorrax_phdf5_write", platform)
 
 
 def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:

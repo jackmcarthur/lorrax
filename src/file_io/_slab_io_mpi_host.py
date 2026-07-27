@@ -32,9 +32,15 @@ is the cudaMemcpy D2H — on JAX's CPU backend the "device" memory IS
 host memory, so the local shard is already in numpy-addressable RAM
 and we hand the pointer straight to h5py.
 
-Selected by :class:`gw.gw_config.SlabIOBackend.PHDF5_HOST`.  The
-``gw_config`` auto-router maps ``use_ffi_io=true`` on the CPU backend
-to this module; on the GPU backend the FFI path is preferred.
+Selected by :class:`gw.gw_config.SlabIOBackend.PHDF5_HOST`.  This is now
+the SECOND CPU tier, not the first: since workstream AE the phdf5 write
+core also compiles into the CUDA-free host FFI lib, and
+``gw_config._route_cpu_slab_io`` prefers ``PHDF5_FFI`` whenever that lib
+exports ``PhdfWriteHostFfi`` — because the FFI path needs no extra Python
+environment, whereas this module needs ``mpi4py`` + an ``HDF5_MPI=ON``
+h5py (the ``lorrax_env_mpi_overlay`` prefix, workstream AB).  Kept as the
+fallback for a deployed host lib without the write handler, and as the
+A/B control for the writer.
 """
 from __future__ import annotations
 

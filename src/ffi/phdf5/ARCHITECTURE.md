@@ -12,18 +12,38 @@ earlier in the investigation). Section 2.6 below refers to the first
 `MPI_Init_thread` cost; the number scales similarly on both stacks.
 Stack-specific tuning is in [`PORTING.md`](../PORTING.md).
 
-**CPU sibling**: this FFI is CUDA-only at the C++ level (cudaMemcpyAsync
-D2H, cudaEvent sync — ~97 CUDA call sites across `write_ffi.cc` +
-`read_ffi.cc`).  The host-side equivalent for JAX's CPU backend lives
-at `src/file_io/_slab_io_mpi_host.py` — same per-rank parallel MPI-IO
-write semantics via mpi4py + h5py(parallel), minus the cudaMemcpy
-(CPU XLA "device" memory IS host memory).  Both backends produce
-byte-identical output; the `SlabIO` interface is the same.  Selection
-is automatic from `LorraxConfig.from_input_file` based on
-`jax.default_backend()`.  The CPU path is synchronous (no Python
-worker thread) because there's no D2H to overlap and Cray MPICH's
-default `MPI_THREAD_SINGLE` deadlocks on cross-thread MPI-IO at
-`H5Fclose`; see `_slab_io_mpi_host.py` module docstring.
+**CPU: this FFI is NOT CUDA-only any more.**  It was, until workstreams
+A (read, 2026-07-25) and AE (write, 2026-07-26) made every phdf5 TU
+compile into BOTH platform libraries from the same source under one
+flag, `LORRAX_FFI_NO_CUDA`:
+
+    liblorrax_ffi.so       CUDA   PhdfRead*Ffi     / PhdfWriteFfi
+    liblorrax_ffi_host.so  cpu    PhdfRead*HostFfi / PhdfWriteHostFfi
+
+The collective MPI-IO core — hyperslab arithmetic, `valid_shape`
+clipping, the FIFO writer thread, `H5Dread`/`H5Dwrite` — is byte-identical
+on both.  Only three seams switch, and they all live in
+`cpp/platform_seam.h`: (1) the handler binding (host handlers take no
+`PlatformStream` Ctx and get distinct symbol names so both `.so`s can be
+`RTLD_GLOBAL`-loaded in one process), (2) the small index buffers
+(`cudaMemcpy` D2H vs a plain host read), (3) the payload staging — and on
+the host build the write side of (3) is *nothing at all*: XLA's CPU
+buffer already IS host memory, so `H5Dwrite` reads the local shard in
+place, with no pinned allocation, no copy and no event.
+
+`src/file_io/_slab_io_mpi_host.py` (mpi4py + h5py-parallel) remains as the
+**second** CPU tier, for a deployed host lib built before the write port;
+it needs an extra Python environment that the FFI does not.  All three
+writers produce byte-identical output.  Selection is automatic in
+`LorraxConfig.from_input_file` → `_route_cpu_slab_io`, which
+capability-probes the lib rather than guessing from the platform.
+
+The mpi4py path is synchronous (no Python worker thread) because there's
+no D2H to overlap and Cray MPICH's default `MPI_THREAD_SINGLE` deadlocks
+on cross-thread MPI-IO at `H5Fclose`; see its module docstring.  The FFI
+path keeps its writer thread on both platforms — one thread per ctx is
+what guarantees every rank enters the MPI-IO collectives in the same
+order.
 
 ------------------------------------------------------------------------
 

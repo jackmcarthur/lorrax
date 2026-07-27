@@ -13,16 +13,20 @@ project(lorrax_ffi_host LANGUAGES CXX)
 # Deliberately separate from ../CMakeLists.txt (the CUDA build): that build
 # hard-requires cuSOLVERMp / NCCL / the CUDA language and runs inside the
 # Shifter/apptainer container; this one is CUDA-free BY CONSTRUCTION.  It
-# compiles the SAME phdf5 collective MPI-IO core (context.cc + read_ffi.cc)
-# as the CUDA lib, with -DLORRAX_FFI_NO_CUDA so the device-staging tail is a
-# std::memcpy into the host-resident XLA output buffer instead of a
-# cudaMemcpyAsync H2D (see phdf5/cpp/read_ffi.cc).  ffi_loader.py registers
+# compiles the SAME phdf5 collective MPI-IO core (context.cc + read_ffi.cc +
+# write_ffi.cc) as the CUDA lib, with -DLORRAX_FFI_NO_CUDA so the
+# device-staging seams collapse: the read tail becomes a std::memcpy into the
+# host-resident XLA output buffer instead of a cudaMemcpyAsync H2D, and the
+# write path hands H5Dwrite the XLA input buffer directly instead of staging
+# it D2H through a pinned buffer (see phdf5/cpp/platform_seam.h).
+# ffi_loader.py registers
 # this library's handlers under platform="cpu" (the CUDA library's under
 # platform="CUDA") with the same jax.ffi target names — the jaxlib
 # cpu-lapack / cuda-cusolver registration split.
 #
 # Two optional component groups, each CUDA-free:
-#   LORRAX_FFI_HAVE_PHDF5  (default ON)  parallel-HDF5 read handlers + lifecycle
+#   LORRAX_FFI_HAVE_PHDF5  (default ON)  parallel-HDF5 read + write handlers
+#                                        + lifecycle
 #   LORRAX_HOST_HAVE_SLATE (default ON)  SLATE gpu_backend=none host handlers
 #                                        AND the ScaLAPACK solve_lu + eigh
 #                                        handlers (they reuse slate/cpp/ctx.h)
@@ -30,15 +34,17 @@ project(lorrax_ffi_host LANGUAGES CXX)
 # SLATE downgrades to "skipped" if its install isn't found, so a phdf5-only
 # host lib still builds on a cluster with no SLATE host install.
 #
-# The full 10-target lib (phdf5×3, slate×5, scalapack×2) is built by
+# The full 11-target lib (phdf5×4, slate×5, scalapack×2) is built by
 # config/frontera/build_ffi_host.sh (9 targets first built 2026-07-25;
-# scalapack eigh added 2026-07-26, workstream V).
+# scalapack eigh added 2026-07-26, workstream V; the phdf5 WRITE handler
+# added 2026-07-26, workstream AE — it is what makes the mpi4py +
+# h5py-parallel overlay unnecessary on CPU).
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-option(LORRAX_FFI_HAVE_PHDF5  "Build the phdf5 host read handlers (needs parallel HDF5)" ON)
+option(LORRAX_FFI_HAVE_PHDF5  "Build the phdf5 host read+write handlers (needs parallel HDF5)" ON)
 option(LORRAX_HOST_HAVE_SLATE "Build the SLATE host handlers (needs a gpu_backend=none SLATE install)" ON)
 
 # ----------------------------------------------------------------------------
@@ -122,6 +128,7 @@ if(LORRAX_FFI_HAVE_PHDF5)
         ../../../phdf5/cpp/api.cc
         ../../../phdf5/cpp/context.cc
         ../../../phdf5/cpp/read_ffi.cc
+        ../../../phdf5/cpp/write_ffi.cc
     )
     list(APPEND _host_link_libs ${HDF5_LIBRARIES} "${LORRAX_MPI_LIBRARY}")
     get_filename_component(_hdf5_libdir "${HDF5_C_LIBRARY_hdf5}" DIRECTORY)

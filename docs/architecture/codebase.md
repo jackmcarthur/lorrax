@@ -198,11 +198,11 @@ Reads `eps0mat.h5` / `epsmat.h5`. Used only by the `epshead` head source (`head_
 
 Sharded HDF5 writer with three backends (selected by `SlabIOBackend` enum; the legacy `use_ffi_io: bool` setting maps to PHDF5_FFI/H5PY_ALLGATHER for back-compat):
 
-- `PHDF5_FFI` → `_slab_io_ffi.py` (parallel HDF5 via the phdf5 FFI; CUDA-only at the C++ level). Each rank writes its own hyperslab via independent MPI-IO collective writes. GPU backend default.
-- `PHDF5_HOST` → `_slab_io_mpi_host.py` (parallel HDF5 via mpi4py + h5py(parallel)). Same per-rank parallel-write semantics as PHDF5_FFI, minus the cudaMemcpy D2H. CPU backend default when the venv has mpi4py + h5py-parallel; spiritually identical to the FFI path.
-- `H5PY_ALLGATHER` → `_slab_io_allgather.py` (all-gather to rank 0 then serial h5py). Last-resort fallback for systems without parallel HDF5; slow at scale.
+- `PHDF5_FFI` → `_slab_io_ffi.py` (parallel HDF5 via the phdf5 FFI). Each rank writes its own hyperslab via independent MPI-IO collective writes. Default on BOTH backends: the C++ core compiles into the CUDA lib and, under `LORRAX_FFI_NO_CUDA`, into the CUDA-free host lib, where the D2H staging collapses to an in-place read of the XLA host buffer (workstream AE).
+- `PHDF5_HOST` → `_slab_io_mpi_host.py` (parallel HDF5 via mpi4py + h5py(parallel)). Same per-rank parallel-write semantics, driven from Python. Second CPU tier — for a host lib built without the write handler; needs the mpi4py overlay that the FFI path does not.
+- `H5PY_ALLGATHER` → `_slab_io_allgather.py` (all-gather to rank 0 then serial h5py). Last-resort fallback for systems without parallel HDF5; slow at scale, and the gather is the dominant collective in a large run.
 
-The `LorraxConfig.from_input_file` builder auto-routes `use_ffi_io=true` to the right backend per `jax.default_backend()`: PHDF5_FFI on GPU, PHDF5_HOST on CPU (falls back to H5PY_ALLGATHER if mpi4py / h5py-parallel are missing — emits a one-line config log).
+The `LorraxConfig.from_input_file` builder auto-routes `use_ffi_io=true`: PHDF5_FFI on GPU; on CPU `_route_cpu_slab_io` probes `ffi_loader.probe_target('lorrax_phdf5_write', 'cpu')` and picks PHDF5_FFI → PHDF5_HOST → H5PY_ALLGATHER, logging one line naming the tier and, on a demotion, the probe's reason.
 
 Used for `zeta_q.h5` and `V_qmunu.h5` (big files), and for `sigma_mnk.h5` via `write_sigma_omega_h5`.
 

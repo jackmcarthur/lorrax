@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
 # build_ffi_host.sh — build liblorrax_ffi_host.so (the CUDA-free host-platform
-# FFI library) on Frontera, WITH the phdf5 read handlers.  RUN INSIDE the
+# FFI library) on Frontera, WITH the phdf5 read AND write handlers.  RUN
+# INSIDE the
 # python:3.12 apptainer container (glibc 2.28+), same host Intel-MPI parallel
 # HDF5 the CUDA build_ffi.sh uses for its phdf5 path — minus every
 # CUDA/NCCL/cuSOLVERMp dependency.
@@ -16,10 +17,10 @@
 # ----------------------------------------------------------------------------
 # SLATE + ScaLAPACK (the distributed-linalg half of the lib) — OPT-IN
 # ----------------------------------------------------------------------------
-# By default this script builds the phdf5-only lib (3 targets), which needs no
-# external numerical library.  Set LORRAX_SLATE_HOST_INSTALL_DIR to a
-# gpu_backend=none SLATE install and you get all 10 host targets (phdf5×3,
-# slate×5, scalapack×2):
+# By default this script builds the phdf5-only lib (4 targets: 3 read + 1
+# write), which needs no external numerical library.  Set
+# LORRAX_SLATE_HOST_INSTALL_DIR to a gpu_backend=none SLATE install and you
+# get all 11 host targets (phdf5×4, slate×5, scalapack×2):
 #
 #   LORRAX_SLATE_HOST_INSTALL_DIR=$WORK/slate_builds/cpu/install \
 #     config/frontera/build_ffi_host.sh --fresh
@@ -155,7 +156,8 @@ echo "[build_host] CUDA-free OK."
 
 # Exported handler symbols must match ffi_loader._HOST_TARGET_SYMBOLS, or
 # has_target() lies and the facade's capability guard passes wrongly.
-WANT="PhdfReadHostFfi PhdfReadKchunkHostFfi PhdfReadKchunkUnionHostFfi"
+WANT="PhdfReadHostFfi PhdfReadKchunkHostFfi PhdfReadKchunkUnionHostFfi \
+PhdfWriteHostFfi"
 if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
     WANT="$WANT SlateEighHostFfi SlatePotrfHostFfi SlateTrsmHostFfi \
 SlateBatchedPotrfHostFfi SlateBatchedTrsmHostFfi ScalapackBatchedSolveLuHostFfi \

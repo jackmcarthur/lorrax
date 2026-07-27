@@ -40,6 +40,8 @@
 // The host handlers register under DISTINCT symbol names (PhdfRead*HostFfi)
 // so the two platform .so's can co-exist in one process under RTLD_GLOBAL —
 // the same split slate/scalapack use.
+// Seams 1 (handler binding) and 2 (index copy-in) live in platform_seam.h,
+// shared verbatim with write_ffi.cc; seam 3 (the staging tail) is below.
 #ifndef LORRAX_FFI_NO_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -50,17 +52,7 @@
 #include "../../common/cpp/ffi_helpers.h"
 #include "ctx.h"
 #include "phdf5_interface.h"
-
-// Leading dispatch/Impl parameter for the XLA platform stream.  The CUDA
-// handlers bind ``.Ctx<PlatformStream<cudaStream_t>>()`` and thread the
-// stream through to the H2D staging; the host handlers take no stream.
-#ifdef LORRAX_FFI_NO_CUDA
-#define LRX_STREAM_PARAM
-#define LRX_STREAM_ARG
-#else
-#define LRX_STREAM_PARAM cudaStream_t xla_stream,
-#define LRX_STREAM_ARG   xla_stream,
-#endif
+#include "platform_seam.h"
 
 namespace lorrax_ffi::phdf5 {
 
@@ -90,25 +82,8 @@ static inline ffi::Error stage_pinned_to_output(
 }
 #endif
 
-// Copy a small (N x int64) index buffer out of an FFI input into host
-// ``dst``.  Host: the buffer is already host-resident.  CUDA: D2H copy.
-// Returns false on failure and fills ``err`` (CUDA path only).
-static inline bool copy_index_to_host(
-    void* dst, const void* src, size_t nbytes, std::string* err)
-{
-#ifdef LORRAX_FFI_NO_CUDA
-    std::memcpy(dst, src, nbytes);
-    (void)err;
-    return true;
-#else
-    cudaError_t ce = cudaMemcpy(dst, src, nbytes, cudaMemcpyDeviceToHost);
-    if (ce != cudaSuccess) {
-        if (err) *err = cudaGetErrorString(ce);
-        return false;
-    }
-    return true;
-#endif
-}
+// ``copy_index_to_host`` (seam 2) is in platform_seam.h — shared with
+// write_ffi.cc so the two TUs cannot drift.
 
 static std::vector<int64_t> unravel_rank(
     int64_t rank, ffi::Span<const int64_t> mesh_shape)
@@ -1032,14 +1007,8 @@ static ffi::Future ReadKchunkUnionDispatch(
 // CUDA names under platform="CUDA" and the Host names under platform="cpu",
 // both against the same jax.ffi target strings, so the ffi_call sites stay
 // platform-agnostic — the split jaxlib uses for cpu-lapack vs cuda-cusolver.
-#ifdef LORRAX_FFI_NO_CUDA
-#  define LRX_PHDF_HANDLER(name) name##HostFfi
-#  define LRX_PHDF_STREAM_CTX
-#else
-#  define LRX_PHDF_HANDLER(name) name##Ffi
-#  define LRX_PHDF_STREAM_CTX \
-        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
-#endif
+// ``LRX_PHDF_HANDLER`` / ``LRX_PHDF_STREAM_CTX`` are defined in
+// platform_seam.h (seam 1), shared with write_ffi.cc.
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     LRX_PHDF_HANDLER(PhdfRead), lorrax_ffi::phdf5::ReadDispatch,
