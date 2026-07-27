@@ -115,12 +115,30 @@ class LoopProgress:
     def __exit__(self, *exc):
         self.finish()
 
-    def step(self):
-        """Call after each iteration completes."""
+    def start(self):
+        """Begin timing (and print the banner) BEFORE the first iteration.
+
+        ``step()`` starts the clock lazily, which is the right default for a
+        loop whose first iteration is cheap: the banner then carries a
+        meaningful timestamp.  It is the WRONG default when the point of the
+        cadence is that the stage must not be silent *while* it runs — a lazy
+        banner appears only once the first (possibly hour-long) iteration has
+        already finished, i.e. exactly when it is no longer needed.  Callers
+        in that situation call ``start()`` first.
+
+        Idempotent, and a no-op for every existing caller (``step()``'s lazy
+        branch is unchanged and simply finds the clock already running).
+        """
         if self._start is None:
             self._start = time.time()
             if self.enabled:
                 self.print_fn(f"Started {self.title} at {_fmt_time(self._start)}.")
+        return self
+
+    def step(self):
+        """Call after each iteration completes."""
+        if self._start is None:
+            self.start()
         self._current += 1
         if self.enabled and self._current <= self.num_steps and self._mask[self._current]:
             elapsed = time.time() - self._start

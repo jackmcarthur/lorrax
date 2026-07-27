@@ -279,10 +279,19 @@ def main(argv=None):
 	# Persist W0_qmunu + q=0 head scalars to the ISDF restart file for
 	# downstream consumers (BSE, future Σ-builders); no-op unless screened
 	# and the restart file exists.
-	persist_w0_and_head(
-		W_by_role.get("static", V_q),
-		tensors_filename=tensors_filename, head_resolver=head_resolver,
-		config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
+	# TIMED, and it was not.  This call gathers the whole (nq, μ, μ) W0
+	# onto one rank on the ``h5py_allgather`` backend and writes it — the
+	# stage AF.4c measured at ~1.7 MB/s aggregate and 2 h 55 m of total
+	# silence at c2406 — yet it sat between two timed stages with no
+	# section of its own, so it appeared in the run's wall clock and in
+	# NO row of the stage table.  Naming it is the precondition for
+	# anyone attributing that wall time (the write path itself is
+	# workstream AE/AF's; this is the instrument, not the fix).
+	with timing.section("gw_jax.persist_w0"):
+		persist_w0_and_head(
+			W_by_role.get("static", V_q),
+			tensors_filename=tensors_filename, head_resolver=head_resolver,
+			config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
 
 	# q→0 head correction.  The bare-X head is the same physical quantity in
 	# both COHSEX and PPM modes; gating this on ``not use_ppm_sigma`` was

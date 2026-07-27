@@ -31,6 +31,8 @@ looks them up by string, so no enum/registry retrofit is needed.
 from __future__ import annotations
 
 import os
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable
 
@@ -41,6 +43,71 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common import jax_profile
 import common.timing as timing
 from .gw_config import ComputeMode
+
+
+# ---------------------------------------------------------------------------
+# Stage cadence — the screening stage is no longer allowed to be silent
+# ---------------------------------------------------------------------------
+
+class _ScreeningCadence:
+    """Timestamped enter/exit lines per screening phase + a LoopProgress bar.
+
+    **Why this exists.**  Everything between the end of the ζ-fit and the
+    first ``Started sigma[...]`` line used to print NOTHING: the χ₀ build,
+    the Dyson solve and — for the dynamic modes — the *entire* probe-ω W
+    (a second full χ₀ + a second full-BZ Dyson solve) ran with no output
+    at all.  ``timing.section`` records them, but its report is only
+    emitted at the END of the run, so a run that is still inside the stage
+    shows the operator exactly what a hang shows: nothing.  This campaign
+    has now paid for that three times — AC.2's 30-minute silent
+    ``pzheevd``, AF.4c's 2 h 55 m silent restart write, and the 2.5 h of
+    silence at c2406 that motivated this workstream — and the discriminator
+    AC.3c prescribes ("progressing = a cadence exists") cannot be applied
+    to a stage that has no milestone to emit.
+
+    Each phase therefore prints a line **before** it starts (so the last
+    line on screen names what the run is currently inside) and one after
+    it finishes (with its wall time).  ``LoopProgress`` supplies the
+    familiar bar/ETA cadence over the W evaluations themselves, in the
+    same format as the ζ chunk loop and the Σ τ sweep.
+
+    Print-only: no array is touched, no sharding constraint is added, and
+    every phase body is unchanged.  Rank-gated through ``LoopProgress``'s
+    own ``jax.process_index() == 0`` default.
+    """
+
+    def __init__(self, n_requests: int, print_fn: Callable = print):
+        from common.progress import LoopProgress
+        self._print = print_fn
+        self._enabled = (jax.process_index() == 0)
+        self._bar = LoopProgress(
+            max(1, int(n_requests)), print_fn,
+            title="screening (chi0 -> W)", item_name="W role").start()
+        self._role = ""
+
+    def role(self, label: str) -> None:
+        """Name the W evaluation the following phases belong to."""
+        self._role = label
+
+    @contextmanager
+    def phase(self, label: str, detail: str = ""):
+        """One named phase: announce, run, report the wall time."""
+        tag = f"W[{self._role}] {label}" if self._role else label
+        suffix = f"  ({detail})" if detail else ""
+        if self._enabled:
+            self._print(f"  [ {time.strftime('%H:%M:%S')} ] screening: "
+                        f"{tag} ...{suffix}")
+        t0 = time.time()
+        yield
+        if self._enabled:
+            self._print(f"  [ {time.strftime('%H:%M:%S')} ] screening: "
+                        f"{tag} done in {time.time() - t0:.1f} s")
+
+    def role_done(self) -> None:
+        self._bar.step()
+
+    def finish(self) -> None:
+        self._bar.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +183,7 @@ def compute_static_w(
     config,
     meta,
     mesh_xy,
+    cadence: "_ScreeningCadence | None" = None,
 ) -> jax.Array:
     """W(ω=0) = (1 − Vχ₀)⁻¹V on the full BZ, solved on the IBZ wedge.
 
@@ -167,6 +235,11 @@ def compute_static_w(
     else:
         use_ibz_w = False
 
+    cad = cadence if cadence is not None else _ScreeningCadence(1, lambda *a, **k: None)
+    nq_solve = (int(np.asarray(sym.q_irr_full_idx).shape[0]) if use_ibz_w
+                else int(meta.nk_tot))
+    _mu = int(meta.n_rmu)
+
     with timing.section("gw_jax.chi0_W"):
         with jax_profile.trace_section("chi0_W"):
             # Split compile vs exec for χ₀ and W.  Each section's
@@ -180,10 +253,14 @@ def compute_static_w(
             # buffer.  Do NOT use ``_chi_sec.watch(...)`` here — it
             # keeps a bound ``block_until_ready`` method alive on the
             # section object past W-solve, which blocks donation.
-            with timing.section("chi.compile"):
+            with cad.phase("chi0 compile"), timing.section("chi.compile"):
                 precompile_chi0(wfns, quad, meta, mesh_xy,
                                 energy_reference=e_ref)
-            with timing.section("chi.exec"):
+            with cad.phase(
+                    "chi0 build",
+                    f"{len(np.asarray(quad.tau))} tau nodes, "
+                    f"{int(meta.nk_tot)} q, mu={_mu}"), \
+                 timing.section("chi.exec"):
                 chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
                                       energy_reference=e_ref)
                 chi0_q.block_until_ready()
@@ -192,7 +269,9 @@ def compute_static_w(
             if use_ibz_w:
                 from common.symmetry_maps import slice_q_full_to_ibz
                 _nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-                with timing.section("W.slice_to_ibz"):
+                with cad.phase("IBZ slice",
+                               f"{int(meta.nk_tot)} q -> {nq_solve} q"), \
+                     timing.section("W.slice_to_ibz"):
                     V_q_solve = slice_q_full_to_ibz(
                         V_q, sym.q_irr_full_idx, out_sharding=_nat)
                     chi0_q_solve = slice_q_full_to_ibz(
@@ -202,11 +281,14 @@ def compute_static_w(
             else:
                 V_q_solve = V_q
                 chi0_q_solve = chi0_q
-            with timing.section("W.compile"):
+            with cad.phase("Dyson compile"), timing.section("W.compile"):
                 precompile_solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
                                    solver=config.backend.screening_solver,
                                    dyson_solver=config.backend.w_dyson_solver)
-            with timing.section("W.exec"):
+            with cad.phase("Dyson solve",
+                           f"{nq_solve} q, mu={_mu}, "
+                           f"{'IBZ wedge' if use_ibz_w else 'full BZ'}"), \
+                 timing.section("W.exec"):
                 W_q_solve = solve_w(
                     V_q_solve, chi0_q_solve, meta, mesh_xy,
                     solver=config.backend.screening_solver,
@@ -220,7 +302,9 @@ def compute_static_w(
             # iterate over the full BZ in the k-q sums.
             if use_ibz_w:
                 from common.symmetry_maps import unfold_v_q
-                with timing.section("W.unfold_to_full_bz"):
+                with cad.phase("IBZ -> full-BZ unfold",
+                               f"{nq_solve} q -> {int(meta.nk_tot)} q"), \
+                     timing.section("W.unfold_to_full_bz"):
                     n_sym_spatial = int(
                         np.asarray(sym_perm).shape[0]) // 2
                     W_q = unfold_v_q(
@@ -286,14 +370,22 @@ def compute_screening(
     from common import sanity
 
     W_by_role: dict[str, jax.Array] = {}
+    # One cadence for the whole stage: every phase of every requested W
+    # announces itself before it runs and reports its wall time after.
+    # See ``_ScreeningCadence`` for why this is not optional.
+    cad = _ScreeningCadence(len(requests), print_fn)
     for req in requests:
+        cad.role(req.role)
         if req.role == "static":
             W_static = compute_static_w(
                 wfns, V_q, quad, e_ref=e_ref,
                 sym=sym, centroid_indices=centroid_indices,
-                config=config, meta=meta, mesh_xy=mesh_xy)
-            _gate_w(W_static, req, print_fn=print_fn)
+                config=config, meta=meta, mesh_xy=mesh_xy,
+                cadence=cad)
+            with cad.phase("finiteness + hermiticity gate"):
+                _gate_w(W_static, req, print_fn=print_fn)
             W_by_role[req.role] = W_static
+            cad.role_done()
             continue
         # Pick imag or real axis by which component of ω is non-zero.
         on_imag = abs(req.omega_ry.imag) > 0.0
@@ -311,18 +403,57 @@ def compute_screening(
                 quad, abs(req.omega_ry.real),
                 config.minimax_config, print_fn=print_fn)
 
-        chi0 = compute_chi0(
-            wfns, quad_used, meta, mesh_xy, energy_reference=e_ref)
-        chi0.block_until_ready()
-        W = solve_w(
-            V_q, chi0, meta, mesh_xy,
-            solver=config.backend.screening_solver,
-            dyson_solver=config.backend.w_dyson_solver)
-        del chi0
-        W.block_until_ready()
-        _gate_w(W, req, print_fn=print_fn)
+        # The probe-ω W was, until now, the single largest UNMEASURED and
+        # UNANNOUNCED block of work in the run: a second full χ₀ build and
+        # a second Dyson solve, on the FULL BZ (not the IBZ wedge the
+        # static role uses — see the docstring's frozen-golden note), with
+        # neither a ``timing.section`` nor a print.  It was therefore
+        # invisible in the end-of-run stage table AND invisible while it
+        # ran.  Both halves are fixed here; the section names mirror the
+        # static role's so the two are directly comparable in the report.
+        # The probe quadrature has a DIFFERENT node count from the static
+        # one, and the probe solve runs at the full-BZ q extent rather than
+        # the IBZ wedge's — so neither kernel is a cache hit on the static
+        # role's compiled module, and without these AOT calls the probe's
+        # compile time would be charged to its exec row.  Mirrors the static
+        # path's chi.compile → chi.exec → W.compile → W.exec ordering exactly
+        # so the two roles are directly comparable in the stage table.
+        from .w_isdf import precompile_chi0, precompile_solve_w
+        with timing.section("gw_jax.chi0_W_probe"):
+            with jax_profile.trace_section("chi0_W_probe"):
+                with cad.phase("chi0 compile"), timing.section("chi.compile"):
+                    precompile_chi0(wfns, quad_used, meta, mesh_xy,
+                                    energy_reference=e_ref)
+                with cad.phase(
+                        "chi0 build",
+                        f"{len(np.asarray(quad_used.tau))} tau nodes, "
+                        f"{int(meta.nk_tot)} q, mu={int(meta.n_rmu)}"), \
+                     timing.section("chi.exec"):
+                    chi0 = compute_chi0(
+                        wfns, quad_used, meta, mesh_xy, energy_reference=e_ref)
+                    chi0.block_until_ready()
+                with cad.phase("Dyson compile"), timing.section("W.compile"):
+                    precompile_solve_w(
+                        V_q, chi0, meta, mesh_xy,
+                        solver=config.backend.screening_solver,
+                        dyson_solver=config.backend.w_dyson_solver)
+                with cad.phase(
+                        "Dyson solve",
+                        f"{int(meta.nk_tot)} q, mu={int(meta.n_rmu)}, "
+                        f"full BZ"), \
+                     timing.section("W.exec"):
+                    W = solve_w(
+                        V_q, chi0, meta, mesh_xy,
+                        solver=config.backend.screening_solver,
+                        dyson_solver=config.backend.w_dyson_solver)
+                    del chi0
+                    W.block_until_ready()
+        with cad.phase("finiteness + hermiticity gate"):
+            _gate_w(W, req, print_fn=print_fn)
         W_by_role[req.role] = W
+        cad.role_done()
 
+    cad.finish()
     return W_by_role
 
 
