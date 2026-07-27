@@ -545,6 +545,60 @@ def test_zeta_gather_tier_ladder_is_pinned():
         core._resolve_zeta_gather("nonsense")
 
 
+def test_distributed_tier_collective_payload_is_bounded(monkeypatch):
+    """The COLLECTIVE PAYLOAD bound of the `distributed` tier (scorecard AF).
+
+    A memory cap is not a transport cap.  ``LORRAX_ZETA_GATHER_CAP_GIB``
+    bounds how much gathered data may be LIVE; this bounds how many bytes
+    ONE ``all_gather`` / ``psum_scatter`` instruction hands to the
+    transport in a single shot.  Job 7876062 died at P=144 on a 1.15 GB
+    single-shot Gloo AllGather in the C⁺ formation with MaxRSS at 12 % of
+    budget — i.e. the memory cap was satisfied and the job still died.
+
+    Pinned here because the failure mode is invisible below P≈64: at
+    fixture scale the cap does not bite and the tier runs exactly as it
+    did before this workstream.
+    """
+    import isdf.core as core
+
+    monkeypatch.delenv("LORRAX_COLLECTIVE_CHUNK_MB", raising=False)
+
+    assert core._DEFAULT_COLLECTIVE_CHUNK_MB == 128.0
+    assert core._collective_chunk_bytes() == 128 * 1024 ** 2
+
+    # THE production point (MoS2 12×12, c2406): nq=144, μ_pad=2448, 12×12
+    # mesh.  The C⁺ formation's two collectives are μ²/Py and μ²/Px per q,
+    # both 2448·204·16 = 7.99 MB; unchunked that is 1.15 GB in one shot.
+    per_q = 2448 * 204 * 16
+    qb = core._chunk_q(144, per_q)
+    assert qb == 16, qb
+    assert qb * per_q <= core._collective_chunk_bytes()
+    assert 144 * per_q > 1e9, "the unchunked payload is the one that died"
+
+    # The back-solve's larger leg: Z's column block, μ·r_chunk/Py per q.
+    per_q_z = 2448 * (11664 // 12) * 16
+    qb_z = core._chunk_q(144, per_q_z)
+    assert qb_z == 3, qb_z
+    assert qb_z * per_q_z <= core._collective_chunk_bytes()
+
+    # Fixture scale: the cap must NOT bite, so P≤16 behaviour (and every
+    # existing gate) is the pre-AF code path exactly.
+    assert core._chunk_q(9, 64 * 32 * 16) == 9
+
+    # One q is the floor — a single q's collective is irreducible by
+    # q-blocking, and the tier must not deadlock trying to go below it.
+    assert core._chunk_q(144, 1 << 30) == 1
+
+    # Tunable, and disable-able for reproducing the failure on purpose.
+    monkeypatch.setenv("LORRAX_COLLECTIVE_CHUNK_MB", "64")
+    assert core._collective_chunk_bytes() == 64 * 1024 ** 2
+    assert core._chunk_q(144, per_q) == 8
+    monkeypatch.setenv("LORRAX_COLLECTIVE_CHUNK_MB", "0")
+    assert core._chunk_q(144, per_q) == 144      # unbounded == pre-AF
+    monkeypatch.setenv("LORRAX_COLLECTIVE_CHUNK_MB", "not-a-number")
+    assert core._collective_chunk_bytes() == 128 * 1024 ** 2
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "worker_cap":
         sys.exit(_worker_cap())

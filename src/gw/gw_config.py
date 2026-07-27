@@ -459,6 +459,11 @@ _DEFAULTS = {
     #                 Never `distributed`.  Fixture-scale stacks stay on
     #                 replicated, so the default path is bit-identical to
     #                 the pre-feature one.
+    # A SEPARATE env bound governs the `distributed` tier's TRANSPORT, not
+    # its memory: LORRAX_COLLECTIVE_CHUNK_MB (128 MB) caps ONE emitted
+    # collective's payload.  The 4 GiB gather cap was satisfied when job
+    # 7876062 died at P=144 inside a single 1.15 GB Gloo AllGather; see
+    # isdf/core.py's "COLLECTIVE PAYLOAD CHUNKING" note and scorecard AF.
     "distributed_zeta_solve": "auto",  # auto | replicated | per_q | distributed
     # Rank-truncation cutoff (relative to λ_max, per q).  DEFAULT 1e-8 —
     # the LOW end of the over-complete recovery plateau.  An over-complete
