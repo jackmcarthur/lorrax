@@ -291,7 +291,11 @@ if(LORRAX_FFI_HAVE_PHDF5)
 endif()
 
 find_package(Threads REQUIRED)
-target_link_libraries(lorrax_ffi_host PRIVATE ${_host_link_libs} Threads::Threads)
+# ${CMAKE_DL_LIBS}: blacs_grid.h resolves MKL_Set_Num_Threads_Local via
+# dlsym(RTLD_DEFAULT) so the MKL-thread pin needs no MKL link dependency
+# (and is a clean no-op on a non-MKL ScaLAPACK).
+target_link_libraries(lorrax_ffi_host PRIVATE ${_host_link_libs}
+                      Threads::Threads ${CMAKE_DL_LIBS})
 
 target_compile_options(lorrax_ffi_host PRIVATE -Wall -Wextra
     -Wno-unused-parameter -Wno-unused-variable)

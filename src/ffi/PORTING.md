@@ -149,21 +149,29 @@ Env vars read at `open_file` time:
 
 | Var                              | Default      | Effect |
 |----------------------------------|--------------|--------|
-| `LORRAX_PHDF5_CB_WRITE`          | `enable`     | ROMIO collective buffering on writes. |
-| `LORRAX_PHDF5_CB_BUFFER_SIZE`    | `67108864`   | Per-aggregator CB buffer size (bytes). |
-| `LORRAX_PHDF5_CB_NODES`          | `world_size` | ROMIO aggregator count. |
+| `LORRAX_PHDF5_CB_WRITE`          | _unset_ (ROMIO auto) | Forwarded to `romio_cb_write` when set. |
+| `LORRAX_PHDF5_DS_WRITE`          | _unset_ (ROMIO auto) | Forwarded to `romio_ds_write` when set. |
+| `LORRAX_PHDF5_CB_BUFFER_SIZE`    | _unset_ (ROMIO auto) | Per-aggregator CB buffer size (bytes) when set. |
+| `LORRAX_PHDF5_CB_NODES`          | _unset_ (ROMIO auto) | ROMIO aggregator count when set. |
 | `LORRAX_PHDF5_CB_PER_NODE`       | _unset_      | Cray MPICH: aggregators/node (`cb_config_list=*:N`). |
 | `LORRAX_PHDF5_STRIPE_COUNT`      | `16`         | Lustre `striping_factor` hint. |
-| `LORRAX_PHDF5_STRIPE_SIZE`       | `4194304`    | Lustre `striping_unit` (bytes). |
+| `LORRAX_PHDF5_STRIPE_SIZE_FS`    | `4M`         | Lustre `striping_unit` hint (`lfs -S` spelling; legacy byte-valued `LORRAX_PHDF5_STRIPE_SIZE` also honoured). |
 | `LORRAX_PHDF5_ALIGN_MB`          | `4`          | `H5Pset_alignment` threshold (MiB). |
-| `LORRAX_PHDF5_INDEPENDENT`       | `0`          | 1 → also force **reads** to independent (writes already are). |
-| `LORRAX_PHDF5_COLLECTIVE_WRITES` | `0`          | 1 → re-enable collective writes. **Do not** on Cray. |
+| `LORRAX_PHDF5_INDEPENDENT`       | `0`          | 1 → force **reads** to independent. |
+| `LORRAX_PHDF5_COLLECTIVE_WRITES` | `1`          | 0 → independent writes (pre-AI behaviour; the historical Cray `ad_cray_write_coll.c` OOM caution lives in context.cc). |
+| `LORRAX_PHDF5_DEDUP_REPLICAS`    | `1`          | 0 → every replica rank writes its identical copy (UB under collective; debug only). |
 | `LORRAX_PHDF5_COLL_META`         | `0`          | 1 → re-enable collective metadata ops. |
 
-Rule of thumb: bump `STRIPE_COUNT` to 32-64 for writes > 10 GB; drop
-`CB_BUFFER_SIZE` to 8 MiB for writes < 100 MB. If the enclosing
-directory has an explicit `lfs setstripe` layout, the `striping_*`
-hints are no-ops (directory wins).
+The ROMIO `cb_*`/`ds_*` rows were FORCED defaults (`enable`/`disable`/
+64 MiB/`world_size`) until 2026-07-27 — a Perlmutter/OpenMPI-era tuning.
+On Frontera/Intel-MPI forcing `romio_cb_write=enable` measured *slower*
+than ROMIO's automatic policy under collective transfers (scorecard AI),
+so all four are now pure pass-throughs, matching the Python
+`_slab_io_mpi_host` writer.  Rule of thumb: bump `STRIPE_COUNT` to 32-64
+for writes > 10 GB. If the enclosing directory has an explicit
+`lfs setstripe` layout, the `striping_*` hints are no-ops (directory
+wins), and an EXISTING file keeps its inode's layout (mode='w' unlinks
+for exactly this reason).
 
 Baked-in DCPL: `H5D_FILL_TIME_NEVER` + `H5D_ALLOC_TIME_EARLY` +
 `H5F_LIBVER_LATEST`.

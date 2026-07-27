@@ -548,6 +548,29 @@ What can run here?
   orthogonality on clustered spectra.
 * **`scalapack.batched_distributed_solve_lu` DONATES both A and B.**
   Rebuild them if you need to compute a residual afterwards.
+* **MKL threading is a scale-dependent cliff inside the ScaLAPACK
+  handlers — the handlers now pin their own team.**  The harness-wide
+  `MKL_NUM_THREADS=28` (right for the local `zheevd_` route and BLAS at
+  large tiles) is catastrophic for `pzheevd`/`pzgetrf` at the production
+  grid, where g≈204 panels mean thousands of tiny BLAS calls interleaved
+  with latency-bound BLACS collectives and the threading layer's
+  fork/join + spin-wait starves MPI progress.  Measured (wk_ENV AW,
+  pz_bench/pzlu_bench = the exact handler geometry, n=2448, mlx):
+  12×12 pzheevd **11.28 s/q @ 14 thr vs 0.463 s/q @ 4 thr (24×)**,
+  17.0 s/q @ 28 oversubscribed; 8×8 at the production 2 ranks/node × 28
+  placement is monotone — 38.4 / 27.4 / 12.7 / 5.0 s/q @ 28/14/4/1 thr;
+  pzgetrf+pzgetrs 12×12: 1.51 s @ 6 thr vs 0.37 @ 4 / 0.25 @ 1.  At 4×4
+  (P=16, g=612) every thread count is flat — which is why this was
+  invisible on the small deck.  `eigh_ffi.cc`/`solve_lu_ffi.cc` now cap
+  the calling thread's MKL team via `mkl_set_num_threads_local`
+  (default min(current, 4); `LORRAX_SCALAPACK_MKL_THREADS` overrides,
+  `off` restores the old behaviour; dlsym-resolved, no-op on non-MKL
+  ScaLAPACK).  Scope conditions: measured at n=2448, P=16–144, in a
+  co-tenant-free holder window; the n=5040 confirmation cells landed in
+  sibling-workstream co-tenancy (6× intra-cell rep swing) and are
+  INCONCLUSIVE — rerun on quiet nodes before extrapolating the cap to
+  n ≳ 5000, and re-verify if plan-B NB redistribution lands (blocking
+  changes the panel size this pathology rides on).
 * **Fabric: leave `FI_PROVIDER` UNSET on Frontera CLX** (do not pin `mlx`
   explicitly — you get it by unsetting; `fi_info` falsely reports −61 for
   `mlx` even where it works, so trust only `I_MPI_DEBUG=4`'s

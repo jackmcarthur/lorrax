@@ -287,6 +287,16 @@ static ffi::Error EighDispatch(
     std::lock_guard<std::mutex> lock(
         lorrax_ffi::slate::host_collective_mutex());
 
+    // Pin the MKL team for the pXheevd calls.  At the production grid
+    // (12x12, g=204) the harness-wide MKL_NUM_THREADS=28 is CATASTROPHIC
+    // for this solver: 11.28 s/q at 14 threads vs 0.463 s/q at 4 (24x,
+    // measured — see blacs_grid.h).  LORRAX_SCALAPACK_MKL_THREADS
+    // overrides; default = min(current, 4).  Thread-local, restored on
+    // scope exit — the global setting (right for the local zheevd_
+    // plan-A route) is untouched.
+    lorrax_ffi::scalapack::MklThreadScope mkl_scope(
+        lorrax_ffi::scalapack::scalapack_mkl_threads());
+
     const auto dtype = A.element_type();
     if (Z_out->element_type() != dtype) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,

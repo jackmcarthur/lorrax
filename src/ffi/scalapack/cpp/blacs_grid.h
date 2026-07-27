@@ -29,9 +29,13 @@
 
 #include <complex>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 
+#include <dlfcn.h>
 #include <mpi.h>
 
 #include "../../slate/cpp/ctx.h"
@@ -103,5 +107,93 @@ inline int blacs_ctxt_for(lorrax_ffi::slate::SlateCtx* ctx) {
     cache[key] = ictxt;
     return ictxt;
 }
+
+// ---------------------------------------------------------------------------
+//  MKL thread pinning around ScaLAPACK calls (workstream AW, 2026-07-27).
+//
+//  THE MEASUREMENT (wk_ENV aw_mkl_matrix, pz_bench = the exact eigh_ffi.cc
+//  geometry, n=2448, provider mlx):
+//
+//    grid 12x12 g=204 (P=144, the production shape):
+//        MKL threads 14 -> 11.28 s/q      MKL threads 4 -> 0.463 s/q (24x)
+//        MKL threads  1 ->  0.585 s/q     (threads 28, oversub: see logs)
+//    grid 4x4 g=612 (P=16): FLAT — 0.87..0.94 s/q across 1/4/14/28.
+//
+//  At scale the block-cyclic panels are small (g=204), each pXheevd step
+//  is hundreds of tiny BLAS calls interleaved with latency-bound BLACS
+//  collectives, and MKL's threading layer (fork/join + spin-wait between
+//  kernels) starves MPI progress — the more threads, the worse.  A small
+//  team (~4) keeps the panel GEMMs parallel without the spin-wait tax.
+//
+//  Mechanism: mkl_set_num_threads_local on the CALLING thread only, via
+//  dlsym(RTLD_DEFAULT) so this header adds no MKL link dependency and the
+//  pin degrades to a no-op on a non-MKL ScaLAPACK (LibSci).  The global
+//  MKL_NUM_THREADS (28 in production — right for the LOCAL zheevd_ plan-A
+//  route and for XLA-adjacent BLAS) is untouched; the previous local
+//  value is restored when the scope closes.
+//
+//  Env: LORRAX_SCALAPACK_MKL_THREADS
+//        unset / "auto" -> min(mkl_get_max_threads(), 4)   [measured best]
+//        "0" / "off"    -> leave MKL threading alone (pre-AW behaviour)
+//        <N>            -> pin exactly N inside the handlers
+// ---------------------------------------------------------------------------
+using mkl_set_local_fn = int (*)(int);
+using mkl_get_max_fn   = int (*)();
+
+inline mkl_set_local_fn mkl_set_num_threads_local_ptr() {
+    static mkl_set_local_fn fn = reinterpret_cast<mkl_set_local_fn>(
+        dlsym(RTLD_DEFAULT, "MKL_Set_Num_Threads_Local"));
+    return fn;
+}
+
+inline mkl_get_max_fn mkl_get_max_threads_ptr() {
+    static mkl_get_max_fn fn = reinterpret_cast<mkl_get_max_fn>(
+        dlsym(RTLD_DEFAULT, "MKL_Get_Max_Threads"));
+    return fn;
+}
+
+// Threads to pin inside ScaLAPACK handlers; 0 = leave MKL alone.
+inline int scalapack_mkl_threads() {
+    static int resolved = [] {
+        const char* v = std::getenv("LORRAX_SCALAPACK_MKL_THREADS");
+        const bool is_auto =
+            (!v || !*v || std::strcmp(v, "auto") == 0);
+        if (!is_auto) {
+            if (std::strcmp(v, "off") == 0) return 0;
+            const int parsed = std::atoi(v);
+            return parsed > 0 ? parsed : 0;
+        }
+        auto get_max = mkl_get_max_threads_ptr();
+        if (get_max == nullptr) return 0;      // not MKL — no pin
+        const int cur = get_max();
+        return cur > 4 ? 4 : 0;               // cap only if it would shrink
+    }();
+    return resolved;
+}
+
+// RAII: pin the calling thread's MKL team for the duration of a handler
+// body; restore the previous thread-local setting on exit.  No-op when
+// the pin is disabled or MKL is absent.
+class MklThreadScope {
+  public:
+    explicit MklThreadScope(int nthreads) {
+        if (nthreads <= 0) return;
+        auto set_local = mkl_set_num_threads_local_ptr();
+        if (set_local == nullptr) return;
+        prev_ = set_local(nthreads);
+        active_ = true;
+    }
+    ~MklThreadScope() {
+        if (active_) {
+            mkl_set_num_threads_local_ptr()(prev_);
+        }
+    }
+    MklThreadScope(const MklThreadScope&) = delete;
+    MklThreadScope& operator=(const MklThreadScope&) = delete;
+
+  private:
+    bool active_ = false;
+    int  prev_ = 0;   // 0 = "follow the global setting" per MKL docs
+};
 
 }  // namespace lorrax_ffi::scalapack

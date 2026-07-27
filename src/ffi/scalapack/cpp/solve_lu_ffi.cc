@@ -184,6 +184,10 @@ static ffi::Error SolveLuDispatch(
     // see host_collective_mutex() in slate/cpp/ctx.h.
     std::lock_guard<std::mutex> lock(
         lorrax_ffi::slate::host_collective_mutex());
+    // MKL team pin, same rationale + knob as the eigh handler
+    // (LORRAX_SCALAPACK_MKL_THREADS; measured matrix in blacs_grid.h).
+    lorrax_ffi::scalapack::MklThreadScope mkl_scope(
+        lorrax_ffi::scalapack::scalapack_mkl_threads());
     const auto dtype = A.element_type();
     if (B.element_type() != dtype || X_out->element_type() != dtype) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,

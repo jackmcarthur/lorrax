@@ -30,6 +30,42 @@ LORRAX_FFI_SO
     Absolute path to ``liblorrax_ffi.so`` (CUDA).  Takes precedence.
 LORRAX_FFI_HOST_SO
     Absolute path to ``liblorrax_ffi_host.so`` (cpu).  Takes precedence.
+
+Dynamic-linking environment (audited 2026-07-27, workstream AW)
+---------------------------------------------------------------
+The dlopen here resolves the library's ``DT_NEEDED`` through its
+RUNPATH plus ``LD_LIBRARY_PATH``.  On Frontera the unified host lib's
+RUNPATH covers Intel MPI ``lib/release``, SLATE's ``lib64`` and MKL —
+what ``LD_LIBRARY_PATH`` MUST add is only what has no RUNPATH
+coverage: the parallel-HDF5 ``lib`` (``libhdf5.so.310``), Intel MPI's
+``libfabric/lib``, and (for the overlay h5py, not for this .so) the
+Intel compiler runtime.  Two ordering facts, so nobody re-derives
+them:
+
+* **"SLATE first" is convention, not requirement.**  The SLATE dir
+  holds only ``libslate``/``libblaspp``/``liblapackpp`` (no libmpi, no
+  libhdf5, no MKL), so its position can shadow nothing; libslate's own
+  RUNPATH resolves its transitive blaspp/lapackpp.  Ordering among the
+  LORRAX entries is not load-bearing — PRESENCE is (a missing entry is
+  the ``probe_target`` "library could not be loaded" case).
+* The one measured ordering hazard is host-lib STAGING into the
+  container: a bare ``/hostlibs`` (host ``/usr/lib64``) *prepended* to
+  ``LD_LIBRARY_PATH`` shadows the container glibc and kills every
+  binary — staged RDMA userspace must be APPENDED (scorecard AP.2 /
+  AS.1; the working pattern is wk_AS ``as_inner.sh``).
+
+MPI coexistence (scorecard AS): this library's handlers MPI_Init the
+process libmpi with ``MPI_THREAD_MULTIPLE`` if nothing else got there
+first.  Under ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` jax's
+MPItrampoline runtime inits FIRST (requesting only FUNNELED), so that
+stack must run the THREAD_MULTIPLE-patched MPIwrapper as
+``MPITRAMPOLINE_LIB`` (+ ``LORRAX_MPI_FINALIZE_FIX=skip_atexit`` in
+the overlay sitecustomize) or the FFI's concurrent MPI threads race —
+measured ~29% multi-node failure rate (AS.4b).  LORRAX deliberately
+does NOT default ``MPITRAMPOLINE_LIB`` itself: it is a harness-level
+machine fact (a build artifact path), the unpatched build is a
+measured hazard, and ``phdf5/cpp/context.cc`` announces the hazardous
+level at open time.
 """
 
 from __future__ import annotations

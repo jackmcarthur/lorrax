@@ -307,19 +307,23 @@ Environment variables, loosely in order of how often you'd touch them:
 | var | default | effect |
 |---|---|---|
 | `ISDF_JAX_CACHE_DIR` | `~/.cache/isdf_jax_compilation` | persistent compile-cache path; set to `""` to disable. Safe and ON at every process count since scorecard AH — see `common/jax_compile_cache.py` and `docs/dev/env_vars.md` for the `LORRAX_JAX_CACHE_*` knobs |
-| `LORRAX_PHDF5_INDEPENDENT` | `0` | if `1`, also force **reads** to independent (writes are already independent by default) — rarely helpful on OpenMPI; neutral on Cray |
-| `LORRAX_PHDF5_COLLECTIVE_WRITES` | `0` | if `1`, force writes back to collective — **do not set on Cray MPICH** (triggers `ad_cray_write_coll.c:669` OOM at ≥ 1 GB/rank); on OpenMPI the default independent write path matches collective within noise |
+| `LORRAX_PHDF5_INDEPENDENT` | `0` | if `1`, force **reads** to independent — rarely helpful on OpenMPI; neutral on Cray |
+| `LORRAX_PHDF5_COLLECTIVE_WRITES` | `1` | if `0`, back to independent writes (pre-AI behaviour; the strided-tile pathology is 3 orders slower — scorecard AI).  The Cray MPICH `ad_cray_write_coll.c:669` OOM caution (≥ 1 GB/rank) predates this default and is recorded in context.cc |
+| `LORRAX_PHDF5_DEDUP_REPLICAS` | `1` | if `0`, replica ranks all write their identical copy — UB under collective MPI-IO, debugging only |
 | `LORRAX_PHDF5_COLL_META` | `0` | if `1`, re-enable collective metadata ops — default is non-collective (faster everywhere: +100 ms on OpenMPI small writes, required on Cray for n ≥ 16384 C128 writes) |
 | `LORRAX_PHDF5_ALIGN_MB` | `4` | H5Pset_alignment threshold/stride in MiB; `0` disables |
 | `LORRAX_PHDF5_STRIPE_COUNT` | `16` | Lustre stripe count hint via MPI_Info |
-| `LORRAX_PHDF5_STRIPE_SIZE` | `4194304` | stripe size (bytes) via MPI_Info |
-| `LORRAX_PHDF5_CB_NODES` | `world_size` | ROMIO aggregator count |
-| `LORRAX_PHDF5_CB_BUFFER_SIZE` | `67108864` (64 MiB) | ROMIO collective buffer per aggregator |
-| `LORRAX_PHDF5_CB_WRITE` | `enable` | ROMIO collective buffering on writes |
-| `LORRAX_PHDF5_DS_WRITE` | `disable` | ROMIO "data sieving" on writes |
+| `LORRAX_PHDF5_STRIPE_SIZE_FS` | `4M` | stripe size hint (`lfs -S` spelling, shared with the Python writers; legacy byte-valued `LORRAX_PHDF5_STRIPE_SIZE` honoured) |
+| `LORRAX_PHDF5_CB_NODES` | _unset_ (ROMIO auto) | ROMIO aggregator count when set |
+| `LORRAX_PHDF5_CB_BUFFER_SIZE` | _unset_ (ROMIO auto) | ROMIO collective buffer per aggregator when set |
+| `LORRAX_PHDF5_CB_WRITE` | _unset_ (ROMIO auto) | `romio_cb_write` when set |
+| `LORRAX_PHDF5_DS_WRITE` | _unset_ (ROMIO auto) | `romio_ds_write` when set |
 
 At MoS2 3×3 / 4 GPU we tried the full MPI-IO tuning sweep: all flat
-within ±200 ms. At larger scale these will matter more.
+within ±200 ms.  On Frontera at production scale the levers that DO
+matter are collective transfers + the stripe hints (scorecard AI:
+74 → 2066 MB/s); the forced ROMIO cb/ds defaults measured slightly
+*negative* there and became pass-throughs (workstream AW, 2026-07-27).
 
 ------------------------------------------------------------------------
 
