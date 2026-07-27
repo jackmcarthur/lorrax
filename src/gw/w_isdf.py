@@ -2,6 +2,22 @@
 
 All inter-function arrays use flat k/q indices: chi(nq, μ, μ), V(nq, μ, μ), W(nq, μ, μ).
 The 3D k-grid only appears inside FFT helpers.
+
+W Dyson solve — exactly TWO plans (input key ``w_dyson_solver``):
+
+``local`` (default)
+    q-parallel shard_map: q's scattered ``P(('x','y'),None,None)``, one
+    dense pivoted LU per q on the owning rank, W constrained back out to
+    ``P(None,'x','y')`` through a staged relayout.  Fast at moderate P;
+    every rank must hold whole (μ, μ) tiles for its q's.
+``distributed``
+    2-D-sharded backsolve: A_q = 1 − V_q·χ_q formed by stacked block
+    GEMMs with every operand at ``P(None,'x','y')``, factored and solved
+    through the ``ffi.linalg`` plan facade (ScaLAPACK ``pzgetrf`` /
+    ``pzgetrs`` on CPU meshes, cuSOLVERMp on CUDA).  No rank ever
+    materialises a full (μ, μ) tile — the memory ceiling that matters at
+    thousands of low-memory processes.  W lands natively in
+    ``P(None,'x','y')`` (no relayout).
 """
 import os
 from functools import partial
@@ -28,8 +44,6 @@ from .minimax_screening import MinimaxNodes
 
 _chi_minimax_kernel_cache: dict = {}
 _w_solve_cache: dict = {}
-#: Reasons the `distributed` W-solve route declined, already announced.
-_W_FALLBACK_ANNOUNCED: set = set()
 
 
 # ============================================================================
@@ -191,35 +205,21 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
 
 
 # ============================================================================
-# W solve with two-stage resharding (following load_wfns pattern)
+# W solve — plan 1 of 2: LOCAL (q-parallel per-q dense LU)
 # ============================================================================
 
-#: Inner dense solves of the Dyson system A·W = V, A = (1 − Vχ₀).
-#:
-#: ``lu``    — pivoted LU (``lu_factor``/``lu_solve``).  THE default, and
-#:            the right one: A is SQUARE and generically well conditioned
-#:            (it is I minus a term whose spectral radius is < 1 wherever
-#:            the RPA screening is physical — an eigenvalue of Vχ₀
-#:            reaching 1 is a plasmon instability, not a numerical one).
-#:            One factorisation, one triangular pair of solves.
-#: ``lstsq`` — the RANK-DEFICIENT FALLBACK.  ``jnp.linalg.lstsq`` solves
-#:            min‖A·W − V‖ via SVD with an rcond cutoff, so it still
-#:            returns the minimum-norm answer when A is singular to
-#:            working precision (an over-complete centroid basis at large
-#:            μ can push V toward rank deficiency, which is the same
-#:            conditioning failure ``zeta_rcond`` guards on the ζ side).
-#:            It costs an SVD instead of an LU — several× the flops — and
-#:            it is NOT bit-identical to the LU route, so it is opt-in and
-#:            its eqp delta must be quoted whenever it is used.
-_DYSON_INNER = ("lu", "lstsq")
-
-
-def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int,
-                    n_rmu_logical: int | None = None,
-                    inner: str = "lu"):
+def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
+                          n_rmu_logical: int | None = None):
     """W = (I - V χ)⁻¹ V via q-parallel shard_map.  All arrays flat-q: (nq, μ, μ).
 
-    ``inner`` selects the dense per-q solve — see :data:`_DYSON_INNER`.
+    The LOCAL plan: q's are scattered over all devices
+    (``P(('x','y'),None,None)``) and each rank runs one dense pivoted LU
+    (``lu_factor``/``lu_solve``) per owned q.  LU is the right inner
+    solve: A is SQUARE and generically well conditioned (it is I minus a
+    term whose spectral radius is < 1 wherever the RPA screening is
+    physical — an eigenvalue of Vχ₀ reaching 1 is a plasmon instability,
+    not a numerical one).  One factorisation, one triangular pair of
+    solves.
 
     ``n_rmu_logical``: when smaller than ``n_rmu`` (μ-padded inputs),
     the per-q pivoted LU is μ-SLICED to the logical extent and the W
@@ -235,24 +235,12 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int,
     n_log = int(n_rmu_logical) if n_rmu_logical is not None else int(n_rmu)
     if n_log > int(n_rmu):
         raise ValueError(
-            f"_get_w_solve_fn: n_rmu_logical={n_log} exceeds extent {n_rmu}")
-    if inner not in _DYSON_INNER:
-        raise ValueError(
-            f"_get_w_solve_fn: inner={inner!r} invalid; "
-            f"expected one of {list(_DYSON_INNER)}")
+            f"_get_w_solve_fn_local: n_rmu_logical={n_log} exceeds extent {n_rmu}")
     mu_pad = int(n_rmu) - n_log
 
-    cache_key = (id(mesh_xy), nq, n_rmu, n_log, inner)
+    cache_key = ("local", id(mesh_xy), nq, n_rmu, n_log)
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
-    if inner != "lu":
-        # Announce any non-default Dyson solve exactly once per built
-        # kernel.  Without this a mis-plumbed key would silently run the
-        # default and the "route X agrees with the default" gate would
-        # be vacuously true — the class of result this campaign has
-        # been burned by (scorecard Y.2's per_q docstring).
-        print(f"  [W solve] Dyson inner solve = {inner} "
-              f"(logical mu extent {n_log} of {n_rmu})")
 
     q_shard = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
     # ── W COMES OUT 2-D SHARDED: W_q(μ_X, ν_Y) ────────────────────────
@@ -269,8 +257,8 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int,
     # ``head_wing_schur`` which literally undid the replication by hand.
     # The ONLY q-index anywhere is ``screening.py``'s ``W[0]``
     # hermiticity gate, which is a two-reduction check on one tile.
-    # The cuBLASMp fused solver has always returned P(None,'x','y'), so
-    # the whole downstream chain is already proven on this layout.
+    # The distributed plan has always returned P(None,'x','y'), so the
+    # whole downstream chain is already proven on this layout.
     #
     # Collective-wise the final constraint changes from an ALL-GATHER
     # (every rank ends holding nq·μ²·16 B) to an ALL-TO-ALL (nq·μ²·16/P
@@ -316,19 +304,12 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int,
             nq_dev = V_local.shape[0]
 
             def _dyson_log(V_log, chi_log):
-                # Solve at the LOGICAL μ extent (see _get_w_solve_fn
+                # Solve at the LOGICAL μ extent (see _get_w_solve_fn_local
                 # docstring; slice/zero-refill via solve_at_logical).
                 # V/χ pad rows are exact zeros, so the sliced system IS
                 # the logical Dyson system; the W pad block is exactly
                 # zero (A_pad = I, RHS_pad = 0).
                 A = jnp.eye(n_log, dtype=V_log.dtype) - V_log @ chi_log
-                if inner == "lstsq":
-                    # Rank-deficient fallback — see _DYSON_INNER.  rcond
-                    # is left at lstsq's default (machine-eps · max(M,N)),
-                    # the same convention ``zeta_rcond`` documents on the
-                    # ζ side; a singular A then yields the minimum-norm W
-                    # instead of an LU that quietly returns garbage.
-                    return jnp.linalg.lstsq(A, V_log)[0]
                 lu, piv = jsp_linalg.lu_factor(A)
                 return jsp_linalg.lu_solve((lu, piv), V_log)
 
@@ -368,189 +349,251 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int,
     return _solve_w
 
 
-def _get_w_solve_fn_plan(mesh_xy: Mesh, nq: int, n_rmu: int,
-                         n_rmu_logical: int, backend: str = "auto"):
-    """W = solve(A, V), A = (1 − pref·V·χ₀), through the linalg PLAN seam.
+# ============================================================================
+# W solve — plan 2 of 2: DISTRIBUTED (2-D-sharded stacked-GEMM backsolve)
+# ============================================================================
 
-    The 2-D-sharded route the owner asked for, spelled the way the rest
-    of the tree spells distributed linear algebra (scorecard Z.5): one
-    resolved :class:`ffi.linalg.plan.LinalgPlan`, then one
-    ``plan.batched(A, V)``.  **The μ axes never leave ``P(None,'x','y')``**
-    — no q-parallel all-gather/all-scatter of (μ, μ) blocks at all, which
-    is the whole difference from the JAX-native path above: there each
-    rank must own whole (μ, μ) tiles to run a dense LU, here the
-    ScaLAPACK / cuSOLVERMp descriptor consumes the block-cyclic tiles
-    where they already live.
+def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
+                                n_rmu_logical: int):
+    """W = solve(A, V), A = (1 − pref·V·χ₀), everything 2-D sharded.
 
-    Padding contract, and why it is exact.  A is built at the LOGICAL μ
-    extent (as the native path does — forming ``V @ χ`` at the padded
-    extent regroups the reduction per pad extent and wobbles W at 1e-8
-    rel., which GN-PPM amplifies to eV near a pole), then A is padded
-    with an IDENTITY block and V with ZEROS so the FFI's divisibility
-    rule (n % max(Px,Py) == 0) is satisfied.  The padded system is block
-    diagonal ``[[A_log, 0], [0, I]]`` with RHS ``[[V_log], [0]]``, so its
-    solution is exactly ``[[W_log], [0]]`` and partial pivoting cannot
-    mix the blocks (every pad column is a unit vector, every pad row is
-    zero in the logical columns).
+    The DISTRIBUTED plan — the scale-out route for thousands of
+    low-memory processes, in the same architectural family as the
+    ζ-fit's distributed rank-truncate tier
+    (:func:`isdf.core._factor_c_q_distributed_rank_truncate`):
 
-    ``backend`` is passed straight to :func:`ffi.linalg.plan.plan`, so
-    ``auto`` resolves to NATIVE on a CPU mesh and the caller falls back
-    to :func:`_get_w_solve_fn` — resolution policy is not duplicated
-    here.  Returns ``None`` when the plan is native, so the caller can
-    take that branch.
+    1. **A build** — per q-block, ``A = I − V·(pref·χ)`` as a 2-D block
+       GEMM inside ``shard_map``: rank (x, y) all-gathers V's row block
+       along 'y' (full k for its i rows, μ·μ/Px per rank) and χ's column
+       block along 'x' (full k for its j columns, μ·μ/Py per rank),
+       multiplies locally, and subtracts from its identity tile.  The
+       gathers are STRUCTURAL — inside shard_map the partitioner cannot
+       hoist them into a full-stack gather (the per_q-tier lesson,
+       quality pattern #4).  The q loop is chunked HOST-side so one
+       collective instruction never exceeds ``LORRAX_COLLECTIVE_CHUNK_MB``
+       (the AF transport bound; separate XLA executions cannot be
+       re-combined by a compiler pass).
+    2. **Factor + backsolve** — ONE resolved
+       :class:`ffi.linalg.plan.LinalgPlan` for ``solve_lu`` with
+       ``backend='distributed'`` (ScaLAPACK ``pzgetrf``/``pzgetrs`` on a
+       CPU mesh, cuSOLVERMp on CUDA — ``resolve._DISTRIBUTED_DEFAULT``),
+       consuming the block-cyclic tiles where they already live.
+
+    **No rank ever materialises a full (μ, μ) tile**: inputs, A, the LU
+    factors and W all stay ``P(None,'x','y')`` (per-rank blocks of
+    μ/Px × μ/Py; the largest per-rank transient is the μ·μ/min(Px,Py)
+    gathered GEMM operand).  W lands natively in ``P(None,'x','y')`` —
+    no relayout, unlike the local plan.
+
+    Padding contract, and why it is exact: V and χ pad rows/cols are
+    exact zeros (the bilinear-in-zero-padded-ψ contract), so at the
+    PADDED extent ``A = [[A_log, 0], [0, I]]`` and ``RHS = [[V_log], [0]]``
+    hold EXACTLY — the identity-embedded block-diagonal system whose
+    solution is ``[[W_log], [0]]``; partial pivoting cannot mix the
+    blocks (every pad column is a unit vector, every pad row is zero in
+    the logical columns).  W's pad rows/cols are masked to exact zeros
+    after the solve (same contract as ``solve_at_logical``'s
+    zero-refill on the local plan).  Unlike the local plan the LOGICAL
+    block is formed/factored at the padded extent, so W here carries the
+    ≤1e-8-rel pad-extent regrouping wobble — which is subsumed by the
+    block-cyclic factorisation's own non-bit-identity; this plan's
+    numerical contract is the Dyson residual (``LORRAX_W_RESIDUAL_CHECK``),
+    not bit-identity with the local plan.
+
+    Geometry/capability failures (host lib absent, non-square mesh,
+    n not divisible, process coverage) RAISE at resolve time with the
+    resolver's own message — an explicitly requested distributed solve
+    never silently downgrades to the local plan (quality pattern #6/#8).
     """
-    from ffi.linalg.plan import plan as linalg_plan
-
-    n_log = int(n_rmu_logical)
-    p = linalg_plan("solve_lu", mesh_xy, backend=backend, n=int(n_rmu))
-    if p.is_native:
-        return None
-
-    cache_key = ("plan_solve_lu", id(mesh_xy), nq, n_rmu, n_log, p.backend)
-    if cache_key in _w_solve_cache:
-        return _w_solve_cache[cache_key]
-
-    nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     n_ext = int(n_rmu)
+    n_log = int(n_rmu_logical)
+    if n_log > n_ext:
+        raise ValueError(
+            f"_get_w_solve_fn_distributed: n_rmu_logical={n_log} exceeds "
+            f"extent {n_ext}")
 
-    @partial(jax.jit, out_shardings=(nat, nat))
-    def _build_system(V_q, chi0_q, pref):
-        """(V, χ₀) → (A, B) at the padded extent, both P(None,'x','y').
-
-        A and B are ALWAYS freshly built buffers, never aliases of the
-        caller's V — ``scalapack.batched_distributed_solve_lu`` DONATES
-        both of its operands (docs/dev/linalg_ffi.md "Sharp edges"), and
-        V is still needed afterwards by Σ_SX / Σ_COH / Σ_X and by the
-        PPM fit's ``Wc = W − V``.
-        """
-        V_q = jax.lax.with_sharding_constraint(V_q, nat)
-        chi0_q = jax.lax.with_sharding_constraint(chi0_q, nat)
-        V_log = V_q[:, :n_log, :n_log]
-        chi_log = (pref * chi0_q)[:, :n_log, :n_log]
-        A_log = (jnp.eye(n_log, dtype=V_log.dtype)[None, :, :]
-                 - V_log @ chi_log)
-        nq_local = V_q.shape[0]
-        eye = jnp.broadcast_to(
-            jnp.eye(n_ext, dtype=V_log.dtype)[None, :, :],
-            (nq_local, n_ext, n_ext))
-        A = eye.at[:, :n_log, :n_log].set(A_log)
-        B = jnp.zeros_like(V_q).at[:, :n_log, :n_log].set(V_log)
-        return A, B
-
-    def _solve_w_plan(V_q, chi0_q, pref):
-        A, B = _build_system(V_q, chi0_q, pref)
-        # plan.batched owns the operand layout (batch_in_sharding is
-        # exactly ``nat``) and the per-backend output convention.
-        return p.batched(A, B)
-
-    _w_solve_cache[cache_key] = _solve_w_plan
-    return _solve_w_plan
-
-
-def _get_w_solve_fn_low_mem(mesh_xy: Mesh, nq: int, n_rmu: int, dtype):
-    """Low-mem W-solve: fused cuBLASMp + cuSOLVERMp FFI.
-
-    One distributed FFI call runs the entire symmetric Cholesky Dyson
-    solve inside the device:
-        v = X X†                 (cusolverMp potrf)
-        H = I − X† (pref·χ) X    (2 cublasMp gemms + identity kernel)
-        L_H = chol(H)            (cusolverMp potrf)
-        W = X H⁻¹ X†             (2 cublasMp trsms + 1 cublasMp gemm)
-
-    No JAX-level intermediates, no opportunity for XLA to reshard or
-    rematerialize — all matmuls are distributed-native in-device.
-    """
-    from ffi.cublasmp import batched_fused_w_solve
-    from jax.sharding import NamedSharding
-
-    cache_key = ("low_mem_fused", id(mesh_xy), nq, n_rmu, dtype)
+    cache_key = ("distributed", id(mesh_xy), nq, n_ext, n_log)
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
-    nat = NamedSharding(mesh_xy, P(None, "x", "y"))
+    from jax.experimental.shard_map import shard_map
+    from ffi.linalg.plan import plan as linalg_plan
+    # House chunking pattern — single source (scorecard AF): one emitted
+    # collective's payload is bounded by LORRAX_COLLECTIVE_CHUNK_MB.
+    from isdf.core import _chunk_q, _chunk_log
 
-    def _solve_w_low(V_q, chi0_q, pref):
-        # The fused FFI reads pref as a compile-time complex scalar attr,
-        # so pref must be a Python scalar here (not a jnp array).
-        # chi0_q now comes out of compute_chi0 in P(None, 'x', 'y')
-        # (same as V_q) — no reshard needed at the hand-off.
-        V_q    = jax.lax.with_sharding_constraint(V_q, nat)
-        chi0_q = jax.lax.with_sharding_constraint(chi0_q, nat)
-        return batched_fused_w_solve(V_q, chi0_q, pref, mesh=mesh_xy)
+    # Every guard fires HERE (vocabulary, platform, capability, process
+    # coverage, mesh geometry, divisibility) — resolve.py's ladder, with
+    # its own messages.  ``distributed`` maps to the platform default
+    # (ScaLAPACK on cpu, cuSOLVERMp on CUDA) in ONE place.
+    p = linalg_plan("solve_lu", mesh_xy, backend="distributed", n=n_ext)
+    if p.is_native:
+        # Only reachable through resolve's documented legacy semantics
+        # (cusolvermp on a 1-D CUDA mesh degenerates to native).  An
+        # explicit request must not silently run a different plan.
+        px_, py_ = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+        raise RuntimeError(
+            f"w_dyson_solver=distributed: no distributed solve_lu on this "
+            f"mesh ({px_}x{py_}; the resolver degenerated to the native "
+            f"backend).  Use w_dyson_solver=local here, or a mesh the "
+            f"distributed backend supports.")
 
-    _w_solve_cache[cache_key] = _solve_w_low
-    return _solve_w_low
+    px = int(mesh_xy.shape['x'])
+    py = int(mesh_xy.shape['y'])
+    nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+
+    if jax.process_index() == 0:
+        print(f"  [W solve] w_dyson_solver=distributed -> {p.describe()}",
+              flush=True)
+
+    # The two collectives ``_a_local`` emits, per q (2-D block GEMM):
+    #   all_gather('y')  V   (μ/Px, μ/Py) -> (μ/Px, μ)  = μ²/Px · 16 B
+    #   all_gather('x')  χ   (μ/Px, μ/Py) -> (μ, μ/Py)  = μ²/Py · 16 B
+    # The BIGGER of the two sets the q-block (see ``_chunk_q``).
+    per_q_coll = max(n_ext * (n_ext // px), n_ext * (n_ext // py)) * 16
+
+    @partial(shard_map, mesh=mesh_xy,
+             in_specs=(P(None, 'x', 'y'), P(None, 'x', 'y')),
+             out_specs=P(None, 'x', 'y'), check_rep=False)
+    def _a_local(V_loc, chi_loc):
+        # A[q,i,j] = δ_ij − Σ_k V[q,i,k]·χs[q,k,j] on my (i on 'x',
+        # j on 'y') tile.  Classic 2-D block GEMM pairing — same shape
+        # of communication as ``isdf.core._distributed_pinv_apply``.
+        V_row = jax.lax.all_gather(V_loc, 'y', axis=2, tiled=True)
+        chi_col = jax.lax.all_gather(chi_loc, 'x', axis=1, tiled=True)
+        prod = jnp.einsum('qik,qkj->qij', V_row, chi_col)
+        i0 = jax.lax.axis_index('x') * (n_ext // px)
+        j0 = jax.lax.axis_index('y') * (n_ext // py)
+        eye_tile = jnp.equal(
+            i0 + jnp.arange(n_ext // px)[:, None],
+            j0 + jnp.arange(n_ext // py)[None, :]).astype(V_loc.dtype)
+        return eye_tile[None, :, :] - prod
+
+    @partial(jax.jit, donate_argnums=(2,), out_shardings=nat)
+    def _a_chunk(V_blk, chi_blk, A_acc, q0):
+        return jax.lax.dynamic_update_slice(
+            A_acc, _a_local(V_blk, chi_blk), (q0, 0, 0))
+
+    # χ is donated here (module contract: the caller releases χ₀ after
+    # solve_w — see screening.py's ``del chi0_q_solve``).
+    _scale = jax.jit(lambda c, pref: pref * c,
+                     donate_argnums=(0,), out_shardings=nat)
+    _zeros_like = jax.jit(jnp.zeros_like, out_shardings=nat)
+    # RHS must be a FRESH buffer, never an alias of the caller's V —
+    # the FFI backsolve DONATES both operands (docs/dev/linalg_ffi.md
+    # "Sharp edges") and V is still needed by Σ_SX/Σ_COH/Σ_X and the
+    # PPM fit's Wc = W − V.
+    _copy = jax.jit(jnp.copy, out_shardings=nat)
+
+    if n_log < n_ext:
+        @partial(shard_map, mesh=mesh_xy,
+                 in_specs=P(None, 'x', 'y'), out_specs=P(None, 'x', 'y'),
+                 check_rep=False)
+        def _mask_pads_local(W_loc):
+            # W pad rows/cols → exact zeros (they are already exact by
+            # the block-diagonal argument above; the mask makes the
+            # contract structural, mirroring the ζ tier's pad-row mask).
+            i0 = jax.lax.axis_index('x') * (n_ext // px)
+            j0 = jax.lax.axis_index('y') * (n_ext // py)
+            ri = (i0 + jnp.arange(n_ext // px)) < n_log
+            cj = (j0 + jnp.arange(n_ext // py)) < n_log
+            return jnp.where(ri[None, :, None] & cj[None, None, :], W_loc, 0)
+        _mask_pads = jax.jit(_mask_pads_local, donate_argnums=(0,))
+    else:
+        _mask_pads = None
+
+    def _solve_w_dist(V_flat: jax.Array, chi_flat: jax.Array,
+                      pref: jax.Array) -> jax.Array:
+        """V_flat, chi_flat: (nq, μ, μ) at P(None,'x','y').  Returns W
+        (nq, μ, μ) at P(None,'x','y').  chi_flat's buffer is consumed."""
+        nq_local = int(V_flat.shape[0])
+        qb = _chunk_q(nq_local, per_q_coll)
+        _chunk_log('W Dyson A-build (GEMM)', nq_local, qb, per_q_coll)
+        chi_scaled = _scale(chi_flat, pref)
+        A = _zeros_like(V_flat)
+        # Host-level q-block loop: ONE XLA execution per block, so the
+        # emitted all_gather payloads are bounded by construction and
+        # cannot be re-combined by a compiler pass (AF note in
+        # isdf/core).  At most two compiled shapes (full + remainder).
+        for q0 in range(0, nq_local, qb):
+            q1 = min(q0 + qb, nq_local)
+            A = _a_chunk(V_flat[q0:q1], chi_scaled[q0:q1], A, q0)
+        B = _copy(V_flat)
+        # ONE plan call for the whole stack: one descriptor, one
+        # workspace; A and B are donated into the FFI.
+        W = p.batched(A, B)
+        if _mask_pads is not None:
+            W = _mask_pads(W)
+        if os.environ.get("LORRAX_W_RESIDUAL_CHECK", "0") not in (
+                "0", "", "false"):
+            _w_residual_report(V_flat, chi_scaled, W, n_ext)
+        return W
+
+    _w_solve_cache[cache_key] = _solve_w_dist
+    return _solve_w_dist
+
+
+def _w_residual_report(V_flat, chi_scaled, W, n_ext, n_check: int = 4):
+    """Direct Dyson residual ‖(1−Vχ)W − V‖/‖V‖ on the first few q.
+
+    THE strict numerical contract of the distributed plan (a
+    block-cyclic LU is not bit-comparable to the local per-q LU; the
+    residual is what certifies the solve — quality pattern #6, "test
+    what executes").  Diagnostic-only, opt-in via
+    ``LORRAX_W_RESIDUAL_CHECK=1``; never on in the traced production
+    path, so the collective-table gate is taken with it OFF.
+    """
+    ns = min(int(V_flat.shape[0]), int(n_check))
+
+    @jax.jit
+    def _res(V_s, chi_s, W_s):
+        A_s = jnp.eye(n_ext, dtype=V_s.dtype)[None, :, :] - V_s @ chi_s
+        num = jnp.linalg.norm((A_s @ W_s - V_s).reshape(ns, -1), axis=1)
+        den = jnp.linalg.norm(V_s.reshape(ns, -1), axis=1)
+        return num / den
+
+    r = np.asarray(jax.device_get(_res(V_flat[:ns], chi_scaled[:ns], W[:ns])))
+    if jax.process_index() == 0:
+        vals = "  ".join(f"q{iq}={v:.3e}" for iq, v in enumerate(r))
+        print(f"  [W solve] Dyson residual |(1-Vchi)W - V|/|V| ({ns} q): "
+              f"{vals}  max={r.max():.3e}", flush=True)
 
 
 def _w_solve_pref_scalar(meta) -> float:
     """The 2/(√N_k · n_spin · n_spinor) prefactor in front of χ₀ in the
-    Dyson solve.  Same value for both backends; pulled out so the
-    dispatch helper below isn't the only place it's computed."""
+    Dyson solve.  Same value for both plans; pulled out so the dispatch
+    helper below isn't the only place it's computed."""
     nq = int(meta.nk_tot)
     nspin = max(1, int(getattr(meta, 'nspin', 1)))
     nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
     return 2.0 / (float(max(1, nq)) ** 0.5 * float(nspin) * float(nspinor))
 
 
-def _normalize_screening_solver(solver_or_mode):
-    """Accept either a :class:`ScreeningSolver` or the legacy string
-    (``"high_mem"``/``"low_mem"``/``"auto"``) and return the enum.
+def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None):
+    """Return ``(solve_fn, pref)`` for the requested W plan.
 
-    Kept narrow so the only place legacy strings cross over is here.
+    Single source of truth for the two-plan dispatch.  Both ``solve_w``
+    and ``precompile_solve_w`` go through this helper — the dispatch
+    logic exists in one place.
+
+    ``dyson_solver`` (input key ``w_dyson_solver``) selects the plan:
+
+    ``local`` (default; ``auto`` is an alias)
+        per-q pivoted LU inside the q-parallel shard_map —
+        :func:`_get_w_solve_fn_local`.
+    ``distributed``
+        the 2-D-sharded stacked-GEMM backsolve through the linalg plan
+        facade — :func:`_get_w_solve_fn_distributed`.  Refuses loudly at
+        resolve time when the mesh/build cannot run it; never silently
+        downgrades.
+
+    W comes out ``P(None,'x','y')`` on BOTH — that is the module's
+    output contract, not a per-plan detail.
     """
-    from .gw_config import ScreeningSolver, _LEGACY_ISDF_MEMORY_MODE
-    if isinstance(solver_or_mode, ScreeningSolver):
-        return solver_or_mode
-    s = (solver_or_mode or "auto").strip().lower()
-    if s in _LEGACY_ISDF_MEMORY_MODE:
-        return _LEGACY_ISDF_MEMORY_MODE[s]
-    raise ValueError(
-        f"solver={solver_or_mode!r} invalid; pass a ScreeningSolver enum "
-        f"or one of {sorted(_LEGACY_ISDF_MEMORY_MODE)}."
-    )
-
-
-def _resolve_w_solve_fn(meta, mesh_xy, *, solver, dtype, n_rmu,
-                        dyson_solver=None):
-    """Return ``(solve_fn, pref)`` for the requested screening solver.
-
-    Single source of truth for the JAX-native vs cuBLASMp-FFI fork, and
-    (since AD) for the Dyson-solve seam underneath the native fork.
-    Both ``solve_w`` and ``precompile_solve_w`` go through this helper —
-    the dispatch logic exists in one place.
-
-    ``dyson_solver`` (input key ``w_dyson_solver``) selects HOW the
-    square system A·W = V, A = (1 − Vχ₀), is solved:
-
-    ``auto`` / ``lu``  per-q pivoted LU inside the q-parallel shard_map
-                       (today's production route, unchanged).
-    ``lstsq``          the rank-deficient fallback, same shard_map, SVD
-                       inner solve — see :data:`_DYSON_INNER`.
-    ``distributed``    the 2-D-sharded route through the linalg PLAN
-                       (:func:`_get_w_solve_fn_plan`); ``auto``-resolves
-                       to native on a CPU mesh without the host FFI, in
-                       which case this falls back to ``lu`` and says so.
-
-    W comes out ``P(None,'x','y')`` on ALL of them — that is now the
-    module's output contract, not a per-route detail.
-    """
-    from .gw_config import ScreeningSolver
-    solver = _normalize_screening_solver(solver)
+    from .gw_config import normalize_w_dyson_solver
+    dyson = normalize_w_dyson_solver(dyson_solver)
     nq = int(meta.nk_tot)
     pref_scalar = _w_solve_pref_scalar(meta)
-    dyson = (dyson_solver or "auto").strip().lower()
-    if dyson not in ("auto", "lu", "lstsq", "distributed"):
-        raise ValueError(
-            f"w_dyson_solver={dyson_solver!r} invalid; expected one of "
-            f"auto|lu|lstsq|distributed")
-
-    if solver is ScreeningSolver.CUBLASMP_FFI:
-        # Fused FFI consumes pref as a Python complex scalar (compile-time attr).
-        # NOTE: the distributed FFI solve runs at the PADDED extent (its
-        # block-cyclic layout needs mesh divisibility) — it retains the
-        # ≤1e-8-rel pad-extent sensitivity the JAX_NATIVE path removes.
-        solve_fn = _get_w_solve_fn_low_mem(mesh_xy, nq, n_rmu, dtype)
-        return solve_fn, complex(pref_scalar)
 
     # ``meta.n_rmu`` is a HARD read: a soft getattr fallback here
     # silently restored the padded-extent LU for any meta-like object
@@ -559,78 +602,40 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, solver, dtype, n_rmu,
     n_log = int(meta.n_rmu)
 
     if dyson == "distributed":
-        # The 2-D-sharded plan route.  Resolution lives in
-        # ffi.linalg.resolve, not here.  Two ways it can decline, and
-        # both end in the per-q LU with the reason PRINTED — a silent
-        # downgrade is the failure mode this tree keeps paying for:
-        #   * it resolves NATIVE (no distributed solve_lu on this mesh)
-        #   * it RAISES from a guard (host lib absent, non-square mesh,
-        #     n not divisible, one-process-per-device violated).  The
-        #     resolver's message names the failed guard; we forward it
-        #     verbatim rather than re-deriving the diagnosis.
-        plan_fn = None
-        try:
-            plan_fn = _get_w_solve_fn_plan(
-                mesh_xy, nq, n_rmu, n_log, backend="distributed")
-            _why = ("resolved to the native backend (no distributed "
-                    "solve_lu on this mesh)")
-        except (ValueError, RuntimeError, ImportError, OSError) as exc:
-            _why = f"refused at resolve time: {exc}"
-        if plan_fn is not None:
-            return plan_fn, jnp.asarray(pref_scalar, dtype=jnp.complex128)
-        # ``precompile_solve_w`` resolves the same thing just before
-        # ``solve_w`` does, so say it once per reason, not twice per
-        # W solve per SC iteration.
-        if _why not in _W_FALLBACK_ANNOUNCED:
-            _W_FALLBACK_ANNOUNCED.add(_why)
-            print(f"  [W solve] w_dyson_solver=distributed {_why} — "
-                  f"falling back to the per-q LU.")
-        dyson = "lu"
-
-    # JAX_NATIVE (q-parallel reshard + per-rank LU/lstsq via shard_map).
-    # The inner solve runs at the LOGICAL μ extent; W pad rows/cols are
-    # zero-filled — see _get_w_solve_fn.
-    solve_fn = _get_w_solve_fn(
-        mesh_xy, nq, n_rmu, n_rmu_logical=n_log,
-        inner=("lstsq" if dyson == "lstsq" else "lu"))
+        solve_fn = _get_w_solve_fn_distributed(mesh_xy, nq, n_rmu, n_log)
+    else:
+        solve_fn = _get_w_solve_fn_local(
+            mesh_xy, nq, n_rmu, n_rmu_logical=n_log)
     return solve_fn, jnp.asarray(pref_scalar, dtype=jnp.complex128)
 
 
-def solve_w(V_q, chi0_q, meta, mesh_xy, *, solver=None, memory_mode=None,
-            dyson_solver=None):
+def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None):
     """W(q) = (I − V χ₀)⁻¹ V  via a Dyson solve.  **W comes out sharded.**
 
     All arrays flat-q: V(nq, μ, μ), χ₀(nq, μ, μ) → W(nq, μ, μ).
 
     **Output contract:** ``W`` is ``P(None, 'x', 'y')`` — 2-D sharded
-    W_q(μ_X, ν_Y) — on every route, and stays that way into its
+    W_q(μ_X, ν_Y) — on both plans, and stays that way into its
     consumers (Σ_SX/Σ_COH's 5-D FFT spec, the PPM fit, the IBZ unfold,
-    the restart writer).  It used to be fully replicated on the
-    JAX-native route; see the ``nat_3d`` note in ``_get_w_solve_fn``.
+    the restart writer).
 
-    Pass either ``solver`` (a :class:`ScreeningSolver` enum) or the
-    legacy ``memory_mode`` string ("high_mem" / "low_mem" / "auto").
-    Legacy callers that still hand in the string keep working —
-    ``_normalize_screening_solver`` does the coercion in one place.
+    ``dyson_solver`` (input key ``w_dyson_solver``) picks one of the
+    TWO plans — see :func:`_resolve_w_solve_fn`:
 
-    Solver semantics:
+    - ``local`` (default): q-parallel reshard + per-q dense LU via
+      shard_map.  Legal on any mesh; each rank holds whole (μ, μ)
+      tiles for its q's.
+    - ``distributed``: 2-D-sharded stacked-GEMM backsolve through the
+      ffi.linalg plan facade (ScaLAPACK on CPU, cuSOLVERMp on CUDA).
+      No rank ever materialises a full (μ, μ) tile — the P→∞ memory
+      ceiling.  Slower than ``local`` at moderate P; that is priced and
+      accepted (the point is the per-rank memory ceiling, not speed).
 
-    - :attr:`ScreeningSolver.JAX_NATIVE` (default): q-parallel reshard
-      + per-rank dense solve via shard_map.  Legal on any mesh, one
-      all-gather + one all-scatter of (μ, μ) blocks.
-    - :attr:`ScreeningSolver.CUBLASMP_FFI`: fused symmetric Cholesky
-      W = X H⁻¹ X†; no reshard to q-parallel, but matmuls can reshard
-      internally (JAX-planned).  Requires χ such that I − X†χX is PD.
-
-    ``dyson_solver`` (``auto|lu|lstsq|distributed``) picks the dense
-    solve underneath JAX_NATIVE — see :func:`_resolve_w_solve_fn`.
+    ``chi0_q``'s buffer is CONSUMED (donated) on both plans — the
+    caller must drop its reference after this call.
     """
-    chosen = solver if solver is not None else memory_mode
     solve_fn, pref = _resolve_w_solve_fn(
-        meta, mesh_xy,
-        solver=chosen, dtype=V_q.dtype, n_rmu=chi0_q.shape[1],
-        dyson_solver=dyson_solver,
-    )
+        meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver)
     with jax_profile.annotation("W_solve"):
         return solve_fn(V_q, chi0_q, pref)
 
@@ -725,44 +730,20 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
     ).compile()
 
 
-def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, solver=None,
-                       memory_mode=None, dyson_solver=None):
+def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None):
     """AOT lower+compile of the W-solve jit.  See ``precompile_chi0``.
 
     Goes through the same ``_resolve_w_solve_fn`` dispatch as
-    :func:`solve_w` so both paths agree on which jit to compile.  The
-    cuBLASMp FFI path uses a slightly different ``.lower(V_q, chi0_q)``
-    signature (pref is folded into the compile-time attribute set, not
-    a runtime arg) so the precompile is a thin per-solver branch here.
+    :func:`solve_w` so both paths agree on which jit to compile.
     """
-    from .gw_config import ScreeningSolver
     ensure_jax_compile_cache()
-    chosen = solver if solver is not None else memory_mode
-    solver_enum = _normalize_screening_solver(chosen)
-    nq = int(meta.nk_tot)
-    n_rmu = chi0_q.shape[1]
-
-    if solver_enum is ScreeningSolver.CUBLASMP_FFI:
-        # Also primes the cuBLASMp context handle via get_or_init_context.
-        from ffi.cublasmp import batched_fused_w_solve_jit
-        pref_scalar = _w_solve_pref_scalar(meta)
-        jit_fn = batched_fused_w_solve_jit(
-            dtype=V_q.dtype, nq=nq, n=n_rmu,
-            pref=complex(pref_scalar), mesh=mesh_xy,
-        )
-        jit_fn.lower(V_q, chi0_q).compile()
-        return
-
     solve_fn, pref = _resolve_w_solve_fn(
-        meta, mesh_xy,
-        solver=ScreeningSolver.JAX_NATIVE, dtype=V_q.dtype, n_rmu=n_rmu,
-        dyson_solver=dyson_solver,
-    )
-    # The PLAN route (``w_dyson_solver = distributed``) is a plain
-    # function around an FFI call, not a jit, so there is nothing to
-    # lower here — the first real call builds the BLACS descriptor and
-    # compiles its own module (scorecard L §5, amortised from call 2).
+        meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver)
+    # The DISTRIBUTED plan is a plain function around chunked jits + one
+    # FFI call, not a single jit, so there is nothing to lower here —
+    # the first real call builds the BLACS descriptor and compiles its
+    # own modules (scorecard L §5, amortised from call 2; the ζ tier
+    # behaves the same way).
     if not hasattr(solve_fn, "lower"):
         return
     solve_fn.lower(V_q, chi0_q, pref).compile()
-

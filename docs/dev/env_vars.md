@@ -87,6 +87,7 @@ None of these change results.
 | var | default | effect |
 |---|---|---|
 | `LORRAX_ZETA_RANK_LOG` | `1` (on) | Per-q `n_keep / λ_max / λ_min(kept)` telemetry from the rank truncation (`isdf/core.py:1288`). **The conditioning signal of the μ ladder** — leave it on. `0`/`""`/`false` disables. |
+| `LORRAX_W_RESIDUAL_CHECK` | `0` | Prints the direct Dyson residual `‖(1−Vχ)W − V‖/‖V‖` on the first few q after a `w_dyson_solver = distributed` W solve (`gw/w_isdf.py`). The strict numerical contract of the distributed plan (block-cyclic LU is not bit-comparable to the local per-q LU). Adds one diagnostic jit — leave OFF when taking collective-table probes. |
 | `LORRAX_MEM_DEBUG` | unset | Memory high-water printing (4 sites: `gw_init.py:870`, `isdf_fitting.py:52,843,918`). |
 | `LORRAX_RCHUNK_DEBUG` | unset | Per-r-chunk shape/timing (`isdf_fitting.py:858`, `isdf/core.py:2316`). |
 | `LORRAX_EXIT_AFTER_ZETA` | unset | Exit right after the ζ fit — the MaxRSS discriminator for the "unmodelled Stage F" audit (`gw_init.py:849`). |

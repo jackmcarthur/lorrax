@@ -26,7 +26,7 @@ no all-gather.
 
 * ``extract_V_body_sharded`` — V_body = V_q − v_head · g0_x* ⊗ g0_y
 * ``solve_W_body0_sharded`` — W_body0 = (I − V_body·χ_body)⁻¹·V_body
-  (delegates to existing ``w_isdf._get_w_solve_fn``).
+  (delegates to existing ``w_isdf._get_w_solve_fn_local``).
 * ``schur_reductions_sharded`` — assemble (χ_head_eff, A_wing, A_wing').
 * ``assemble_W_sharded`` — W = W_body0 + (g0_x* + A_wing_x) · W_head ·
   (g0_y + A_wing'_y).
@@ -45,7 +45,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 # ---------------------------------------------------------------------------
 # Sharding specs.  Match the production V_FFT5D_SPEC convention but
 # expressed in flat-q form (nq, μ, μ) so this module composes with
-# ``w_isdf._get_w_solve_fn`` which already takes flat-q V/χ.
+# ``w_isdf._get_w_solve_fn_local`` which already takes flat-q V/χ.
 # ---------------------------------------------------------------------------
 
 V_FLATQ_SPEC = P(None, 'x', 'y')      # (nq, μ_X, μ_Y) — same as W_q in flat-q form
@@ -54,13 +54,13 @@ G0_Y_SPEC    = P(None, 'y')           # (nq, μ_Y) — replicated on x
 SCALAR_Q_SPEC = P(None,)              # (nq,) — replicated
 
 # Intermediate sharding for the V_FLATQ_SPEC ↔ q-shard reshard.
-# Same trick as ``w_isdf._get_w_solve_fn``: routing through
+# Same trick as ``w_isdf._get_w_solve_fn_local``: routing through
 # ``P('x', None, 'y')`` lets SPMD plan the reshard as two single-axis
 # all_to_alls (one on x for the q axis, one on y for the μ axis)
 # instead of falling into "Involuntary full rematerialization" when
 # asked to un-shard or re-shard both x and y simultaneously.  The
 # helper below applies this stage at the entry of any function that
-# consumes W_body0 (output of ``_get_w_solve_fn``) and re-imposes
+# consumes W_body0 (output of ``_get_w_solve_fn_local``) and re-imposes
 # V_FLATQ_SPEC for the kernel body.
 _RESHARD_MID_SPEC = P('x', None, 'y')
 
@@ -71,7 +71,7 @@ def _reshard_W_to_flatq(W_q: jax.Array, mesh_xy: Mesh) -> jax.Array:
     ``with_sharding_constraint`` to ``P('x', None, 'y')`` first parks
     one axis at a time, then a second constraint to ``V_FLATQ_SPEC``
     moves the other.  Without the intermediate, XLA hits "Involuntary
-    full rematerialization" when the producer (``_get_w_solve_fn``)
+    full rematerialization" when the producer (``_get_w_solve_fn_local``)
     leaves W q-sharded across the combined ('x','y') axis tuple.
     """
     W_q = jax.lax.with_sharding_constraint(
@@ -109,7 +109,7 @@ def extract_V_body_sharded(
 # ---------------------------------------------------------------------------
 # Step 2: body solve W_body0 = (I − V_body·χ_body)⁻¹ · V_body
 # ---------------------------------------------------------------------------
-# Delegates to the existing ``w_isdf._get_w_solve_fn`` — this already
+# Delegates to the existing ``w_isdf._get_w_solve_fn_local`` — this already
 # uses q-parallel shard_map for the LU and reshards back to V_FLATQ_SPEC,
 # so we just hand off.  We keep a thin wrapper so callers see a uniform
 # API alongside the rank-1 helpers.
@@ -127,13 +127,13 @@ def solve_W_body0_sharded(
     (``gw_jax`` passes ``2.0+0j`` for the spinor factor in static COHSEX);
     the test passes ``1.0+0j`` for synthetic data.
     """
-    from ..w_isdf import _get_w_solve_fn
+    from ..w_isdf import _get_w_solve_fn_local
     nq = int(V_body_q.shape[0])
     n_mu = int(V_body_q.shape[1])
-    solve_w = _get_w_solve_fn(mesh_xy, nq, n_mu)
+    solve_w = _get_w_solve_fn_local(mesh_xy, nq, n_mu)
     pref_arr = jnp.asarray(pref, dtype=jnp.complex128)
     W = solve_w(V_body_q, chi_body_q, pref_arr)
-    # ``_get_w_solve_fn`` ends with ``with_sharding_constraint(W, rep_3d)``
+    # ``_get_w_solve_fn_local`` ends with ``with_sharding_constraint(W, rep_3d)``
     # which XLA may or may not honour — when it doesn't, downstream
     # consumers asking for V_FLATQ_SPEC hit "Involuntary full
     # rematerialization" on the implicit reshard.  Force the output to

@@ -195,10 +195,10 @@ def batched_distributed_potrs(
     answers (quiet, no error) when ``NRHS ≤ N`` on a 2D process grid
     (Px>1 AND Py>1).  ``NRHS ≥ N + Py`` works correctly to machine
     precision.  Callers whose natural ``NRHS`` is small relative to N
-    must pad with zero columns and slice the result.  See
-    ``w_isdf.solve_w_low_mem`` for a concrete workaround.  The zeta-fit
+    must pad with zero columns and slice the result.  The zeta-fit
     chunked path escapes the bug because its ``NRHS = n_rchunk`` is
-    typically ≫ N.
+    typically ≫ N.  (Not an issue on 0.7+, which the W distributed
+    plan's ``solve_lu`` route requires anyway.)
     """
     Px, Py = _validate_mesh(mesh)
     if mesh.axis_names != L.mesh.axis_names:
@@ -332,10 +332,11 @@ def batched_distributed_solve_lu(
     at N up to 512.  cuSOLVERMp 0.6.0 returned garbage on Px>1 AND Py>1
     (info=0 but wrong X); 0.7+ fixes it.
 
-    Used by the ζ-fit transverse channels (indefinite CCT^μ) and by
-    ``w_isdf.solve_w_low_mem`` for the general (non-Hermitian)
-    ``I - V χ`` system.  Pivot vectors are allocated per call inside
-    the FFI and never surfaced to Python.
+    Used by the ζ-fit transverse channels (indefinite CCT^μ) and — via
+    the ``ffi.linalg`` plan facade on CUDA meshes — by the W Dyson
+    ``w_dyson_solver = distributed`` plan for the general
+    (non-Hermitian) ``I - V χ`` system.  Pivot vectors are allocated
+    per call inside the FFI and never surfaced to Python.
 
     Input sharding: both ``A`` and ``B`` in ``P(None, 'x', 'y')``.
     Output has the same shape and sharding as ``B``.  ``A`` is donated —
