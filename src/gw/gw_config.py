@@ -144,19 +144,64 @@ class SlabIOBackend(str, enum.Enum):
     H5PY_ALLGATHER = "h5py_allgather"
 
 
+def _probe_phdf5_host_tier() -> tuple[bool, str]:
+    """``(usable, reason)`` for the ``PHDF5_HOST`` (mpi4py + h5py-parallel)
+    tier, testing exactly what a ``_MpiHostBackend`` will execute.
+
+    ``import mpi4py`` alone proves nothing: the package import succeeds
+    on a broken PMI stack and the run then dies at the first SlabIO open
+    with ``MPI_Init_thread() failed [error code: 16]`` (a PMI flavour
+    mismatch between the launcher and the MPI library).  So the probe
+    does the real thing — ``from mpi4py import MPI`` — which runs
+    ``MPI_Init_thread``.  The init cost is not wasted: the selected
+    backend needed it anyway (same rationale as ``phdf5_init_mpi`` in
+    ``gw_jax.configure_run``).
+
+    Never raises: an init failure is a *probe* result, not a run killer
+    — the router demotes and says why.  An explicit
+    ``slab_io=phdf5_host`` request bypasses this probe and keeps
+    fails-loudly semantics at the first SlabIO open.
+    """
+    try:
+        from mpi4py import MPI  # noqa: F401 — runs MPI_Init_thread
+    except BaseException as exc:  # MPI init failures can be raw SystemExit
+        return False, (
+            f"mpi4py MPI init failed ({type(exc).__name__}: {exc}).  "
+            "This usually means a PMI mismatch between the launcher and "
+            "the MPI library (classic signature: 'MPI_Init_thread() "
+            "failed ... error code: 16').  On SLURM launch with "
+            "`srun --mpi=pmi2`; some MPI builds also need "
+            "I_MPI_PMI_LIBRARY (or the site equivalent) pointing at the "
+            "system's libpmi2 — ask your site docs for the path.")
+    try:
+        import h5py
+        if not bool(h5py.get_config().mpi):
+            return False, ("h5py is built without MPI support "
+                           "(h5py.get_config().mpi is False) — an "
+                           "HDF5_MPI=ON h5py build is required")
+    except Exception as exc:
+        return False, f"h5py import failed ({type(exc).__name__}: {exc})"
+    return True, "available"
+
+
 def _route_cpu_slab_io(print_fn) -> "SlabIOBackend":
     """Pick the ``slab_io=auto`` backend on the JAX **CPU** backend.
 
-    Three tiers, best first — each one loud about why it was or was not
-    taken, because "which writer ran" is the single most consequential
-    thing about a large run's memory profile:
+    Runs UNCONDITIONALLY for ``slab_io=auto`` — routing depends on no
+    other input key (the legacy ``use_ffi_io`` boolean is honored only
+    as an explicit override, see ``from_input_file``).  Three tiers,
+    best first — each one loud about why it was or was not taken,
+    because "which writer ran" is the single most consequential thing
+    about a large run's memory profile:
 
     1. ``PHDF5_FFI`` — the host FFI lib exports the collective write
        handler.  Zero extra Python environment; the ζ tile never leaves
        the rank that owns it.
     2. ``PHDF5_HOST`` — no write handler in the lib, but the interpreter
-       has ``mpi4py`` + an ``HDF5_MPI=ON`` h5py (the AB overlay).  Same
-       MPI-IO semantics, extra env.
+       has ``mpi4py`` + an ``HDF5_MPI=ON`` h5py (the AB overlay) and
+       MPI actually initializes (the probe runs ``MPI_Init_thread``, so
+       a PMI-mismatched harness demotes here instead of dying later).
+       Same MPI-IO semantics, extra env.
     3. ``H5PY_ALLGATHER`` — neither; rank-0 serial write behind a full
        ``process_allgather`` of the tensor.
 
@@ -175,21 +220,16 @@ def _route_cpu_slab_io(print_fn) -> "SlabIOBackend":
         reason = f"{type(exc).__name__}: {exc}"
     if _ffi_write_ok:
         print_fn(
-            "  [config] use_ffi_io=true on CPU backend; host FFI exports "
+            "  [config] slab_io=auto on CPU backend: host FFI exports "
             "the collective phdf5 write handler.  Routing SlabIO through "
             "PHDF5_FFI (bare-MPI C++ collective MPI-IO, no mpi4py needed)."
         )
         return SlabIOBackend.PHDF5_FFI
 
-    try:
-        import mpi4py  # noqa: F401
-        import h5py
-        _have_parallel_h5 = bool(h5py.get_config().mpi)
-    except Exception:
-        _have_parallel_h5 = False
-    if _have_parallel_h5:
+    _host_ok, _host_reason = _probe_phdf5_host_tier()
+    if _host_ok:
         print_fn(
-            "  [config] use_ffi_io=true on CPU backend; the host FFI write "
+            "  [config] slab_io=auto on CPU backend: the host FFI write "
             f"handler is unavailable ({reason}).  Routing SlabIO through "
             "PHDF5_HOST (mpi4py + h5py-parallel) — same per-rank "
             "collective MPI-IO write semantics."
@@ -197,12 +237,91 @@ def _route_cpu_slab_io(print_fn) -> "SlabIOBackend":
         return SlabIOBackend.PHDF5_HOST
 
     print_fn(
-        "  [config] use_ffi_io=true on CPU backend but neither writer is "
-        f"available (host FFI: {reason}; venv lacks mpi4py / "
-        "h5py-parallel); falling back to H5PY_ALLGATHER (rank-0 serial "
-        "write behind a full all-gather — slow, and the all-gather is the "
-        "memory wall at scale).  Rebuild the host lib with "
-        "config/frontera/build_ffi_host.sh to get PHDF5_FFI."
+        "  [config] slab_io=auto on CPU backend but neither parallel "
+        f"writer is available (host FFI: {reason}; PHDF5_HOST tier: "
+        f"{_host_reason}).  Falling back to H5PY_ALLGATHER (rank-0 "
+        "serial write behind a full all-gather — slow, and the "
+        "all-gather is the memory wall at scale).  Building the host "
+        "FFI lib with the write handler enables PHDF5_FFI (see e.g. "
+        "config/frontera/build_ffi_host.sh for a worked example)."
+    )
+    return SlabIOBackend.H5PY_ALLGATHER
+
+
+def _route_gpu_slab_io(print_fn) -> "SlabIOBackend":
+    """Pick the ``slab_io=auto`` backend on a non-CPU (GPU) JAX backend.
+
+    Same capability-probed, never-env-guessed contract as the CPU
+    router.  Tiers:
+
+    1. ``PHDF5_FFI`` — the CUDA FFI lib exports the collective write
+       handler, and the run is single-node.  Cross-node GPU FFI is
+       demoted: the FFI's internal MPI bring-up is a known failure on
+       multi-node GPU stacks (Intel-MPI/OFI, campaign ledger 2026-07)
+       and ``slab_io=auto`` must degrade with an announcement, not die.
+       An explicit ``slab_io=phdf5_ffi`` still fails loudly instead.
+    2. ``PHDF5_HOST`` — mpi4py + h5py-parallel present, MPI inits, AND
+       exactly one addressable device per process (the backend's
+       one-shard-per-process contract; a single process driving N GPUs
+       would fail at write time, so the probe declines it up front).
+    3. ``H5PY_ALLGATHER`` — always works: gather via JAX collectives,
+       rank-0 serial h5py write of host arrays.
+    """
+    import jax as _jax
+
+    # Multi-node detection: capability fact, not policy.  SLURM exports
+    # the node count; other launchers without the variable are treated
+    # as single-node (the probe below still guards the library itself).
+    _nnodes = 1
+    for _k in ("SLURM_JOB_NUM_NODES", "SLURM_NNODES"):
+        try:
+            _nnodes = max(_nnodes, int(os.environ.get(_k, "1")))
+        except ValueError:
+            pass
+
+    reason = "ffi.common.ffi_loader import failed"
+    _ffi_write_ok = False
+    if _nnodes > 1:
+        reason = (f"multi-node GPU run detected ({_nnodes} nodes): the "
+                  "CUDA FFI's MPI bring-up is a known cross-node failure "
+                  "on GPU stacks; auto declines it (explicit "
+                  "slab_io=phdf5_ffi overrides and fails loudly)")
+    else:
+        try:
+            from ffi.common.ffi_loader import probe_target
+            _ffi_write_ok, reason = probe_target("lorrax_phdf5_write", "CUDA")
+        except Exception as exc:                  # pragma: no cover
+            reason = f"{type(exc).__name__}: {exc}"
+    if _ffi_write_ok:
+        print_fn(
+            "  [config] slab_io=auto on GPU backend: CUDA FFI exports "
+            "the collective phdf5 write handler (single-node).  Routing "
+            "SlabIO through PHDF5_FFI."
+        )
+        return SlabIOBackend.PHDF5_FFI
+
+    _host_ok, _host_reason = _probe_phdf5_host_tier()
+    if _host_ok and _jax.local_device_count() != 1:
+        _host_ok = False
+        _host_reason = (
+            f"{_jax.local_device_count()} addressable devices in this "
+            "process; the PHDF5_HOST backend requires exactly one "
+            "shard per process (one GPU per process)")
+    if _host_ok:
+        print_fn(
+            "  [config] slab_io=auto on GPU backend: CUDA FFI write "
+            f"handler unavailable ({reason}).  Routing SlabIO through "
+            "PHDF5_HOST (mpi4py + h5py-parallel, per-rank collective "
+            "MPI-IO of the device shard via host staging)."
+        )
+        return SlabIOBackend.PHDF5_HOST
+
+    print_fn(
+        "  [config] slab_io=auto on GPU backend: no parallel writer "
+        f"available (CUDA FFI: {reason}; PHDF5_HOST tier: "
+        f"{_host_reason}).  Falling back to H5PY_ALLGATHER (rank-0 "
+        "serial write behind a full gather — always works, slow at "
+        "scale)."
     )
     return SlabIOBackend.H5PY_ALLGATHER
 
@@ -336,17 +455,19 @@ _DEFAULTS = {
     # ``degen_avg_tol_ry`` matches BGW's ``TOL_Degeneracy = 1e-6 Ry``.
     "no_degen_averaging": False,
     "degen_avg_tol_ry": 1.0e-6,
-    # I/O backend: True routes big sigma/zeta writes through the
-    # parallel-HDF5 FFI (collective MPI-IO, ~5× faster than the
-    # rank-0 h5py path once Lustre striping is applied — see
-    # ``_slab_io_ffi._lustre_prestripe``).  False keeps the historical
-    # ``process_allgather`` + rank-0 ``h5py`` path as a fallback for
-    # non-Lustre filesystems or systems without the FFI ``.so`` built.
-    "use_ffi_io": True,
-    # Explicit SlabIO backend override: "auto" (default — route by
-    # use_ffi_io + platform, see from_input_file) | "phdf5_ffi" |
-    # "phdf5_host" | "h5py_allgather".  Every enum value is reachable
-    # from the input file; auto keeps the legacy use_ffi_io semantics.
+    # DEPRECATED (2026-07-27) tri-state boolean, superseded by
+    # ``slab_io``.  None (default) = unset: ``slab_io=auto`` routes by
+    # capability alone.  Explicit ``false`` forces the historical
+    # ``process_allgather`` + rank-0 ``h5py`` writer (same as
+    # ``slab_io = h5py_allgather``).  Explicit ``true`` is redundant —
+    # the router already prefers the parallel writers.
+    "use_ffi_io": None,
+    # SlabIO backend: "auto" (default — the capability-probed router for
+    # the active JAX platform, see ``_route_cpu_slab_io`` /
+    # ``_route_gpu_slab_io``) | "phdf5_ffi" | "phdf5_host" |
+    # "h5py_allgather".  Every enum value is reachable from the input
+    # file; an explicit value is honoured verbatim and fails loudly if
+    # unavailable.
     "slab_io": "auto",
     # ψ(G) source for the ISDF r-chunk loop.  Both modes keep ψ(G) on
     # the HOST in per-rank band-sharded layout and pull one band-chunk
@@ -631,6 +752,11 @@ _NORMALIZE_STR = {
     "eigh_backend",
 }
 
+# Tri-state booleans: _DEFAULTS value is None (= unset), an explicit
+# input-file value parses as bool.  The parse loop needs the set because
+# ``default is None`` otherwise means "nullable float".
+_NULLABLE_BOOL = frozenset({"use_ffi_io"})
+
 
 # ---------------------------------------------------------------------------
 #  Input file parser
@@ -746,12 +872,28 @@ def read_lorrax_input(filename: str) -> dict:
                     DeprecationWarning, stacklevel=2,
                 )
 
+        if section.get("use_ffi_io", fallback=None) is not None:
+            import warnings
+            warnings.warn(
+                "Input key 'use_ffi_io' is deprecated; the slab_io=auto "
+                "router picks the best available writer unconditionally.  "
+                "'use_ffi_io = false' is honored as 'slab_io = "
+                "h5py_allgather'; 'use_ffi_io = true' is a no-op.  Set "
+                "'slab_io' explicitly if you need a specific writer.",
+                DeprecationWarning, stacklevel=2,
+            )
+
         # Build params from _DEFAULTS, overriding with parsed values
         params = {}
         for key, default in _DEFAULTS.items():
             raw = section.get(key, fallback=None)
             if raw is None:
                 params[key] = default
+            elif key in _NULLABLE_BOOL:
+                # Tri-state boolean (default None = unset); an explicit
+                # value parses as bool.  Currently only the deprecated
+                # ``use_ffi_io``.
+                params[key] = section.getboolean(key)
             elif isinstance(default, bool):
                 params[key] = section.getboolean(key)
             elif isinstance(default, int):
@@ -1456,22 +1598,34 @@ class LorraxConfig:
             gflat_chunk_size=int(_g("gflat_chunk_size")),
             vq_g_chunk_size=int(_g("vq_g_chunk_size")),
         )
-        # Auto-route GPU FFIs off on the CPU backend.  cuSOLVERMp /
-        # cuBLASMp are GPU-only.  The phdf5 FFI is NOT: both its read and
-        # its write core compile CUDA-free into liblorrax_ffi_host.so
-        # (``LORRAX_FFI_NO_CUDA``; see ``ffi/phdf5/cpp/platform_seam.h``),
-        # so on CPU it is preferred whenever the deployed lib exports the
-        # handler.  On the CPU backend:
+        # SlabIO routing + auto-route GPU FFIs off on the CPU backend.
+        # cuSOLVERMp / cuBLASMp are GPU-only.  The phdf5 FFI is NOT: both
+        # its read and its write core compile CUDA-free into
+        # liblorrax_ffi_host.so (``LORRAX_FFI_NO_CUDA``; see
+        # ``ffi/phdf5/cpp/platform_seam.h``), so on CPU it is preferred
+        # whenever the deployed lib exports the handler.
         #
-        #   * ``use_ffi_io=true`` → ``_route_cpu_slab_io``: PHDF5_FFI (host
-        #     lib exports the write handler) → PHDF5_HOST (mpi4py +
-        #     h5py-parallel) → H5PY_ALLGATHER.  Capability-probed, never
-        #     env-presence-guessed, and loud about which tier it took.
-        #   * ``cusolvermp_charge`` / ``cusolvermp_lu`` → ``"off"`` (in-tree
-        #     ``cholesky_2d`` and per-q ``jnp.linalg.solve`` paths).
+        #   * ``slab_io=auto`` (the default) ALWAYS runs the capability-
+        #     probed router for the active JAX backend — CPU:
+        #     ``_route_cpu_slab_io`` (PHDF5_FFI → PHDF5_HOST →
+        #     H5PY_ALLGATHER); GPU: ``_route_gpu_slab_io`` (PHDF5_FFI if
+        #     the CUDA probe passes and single-node, else the safest
+        #     working fallback).  Capability-probed, never
+        #     env-presence-guessed, loud about which tier it took, and
+        #     gated on NO other input key (an "auto" silently inert
+        #     behind a second key is quality-pattern #8; see
+        #     docs/dev/QUALITY_PATTERNS.md).
+        #   * ``use_ffi_io`` is a deprecated boolean override:
+        #     ``false`` forces H5PY_ALLGATHER (the pre-FFI writer),
+        #     ``true`` is the routed default anyway (no-op), unset means
+        #     "route".  Superseded by ``slab_io=<backend>``.
+        #   * on CPU, ``cusolvermp_charge`` / ``cusolvermp_lu`` → ``"off"``
+        #     (in-tree ``cholesky_2d`` and per-q ``jnp.linalg.solve``).
         #
         # User-facing: same ``cohsex.in`` works on both backends.
-        _use_ffi_io_in = bool(_g("use_ffi_io"))
+        _use_ffi_io_in = _g("use_ffi_io")   # None (unset) | True | False
+        if _use_ffi_io_in is not None:
+            _use_ffi_io_in = bool(_use_ffi_io_in)
         _slab_io_in = str(_g("slab_io")).strip().lower()
         if _slab_io_in not in ("auto", "phdf5_ffi", "phdf5_host", "h5py_allgather"):
             raise ValueError(
@@ -1535,14 +1689,45 @@ class LorraxConfig:
             _is_cpu_backend = _jax.default_backend() == "cpu"
         except Exception:
             _is_cpu_backend = False
-        _slab_io_choice = (SlabIOBackend.PHDF5_FFI if _use_ffi_io_in
-                           else SlabIOBackend.H5PY_ALLGATHER)
+        # --- SlabIO backend resolution.  Precedence:
+        #   1. explicit ``slab_io=<backend>`` — honoured verbatim (a wrong
+        #      choice fails loudly at SlabIO open, which beats silently
+        #      running a different backend than the input file says).
+        #      The capability probes are skipped: a deck that already
+        #      named its writer should not pay a host-lib dlopen.
+        #   2. ``use_ffi_io=false`` (deprecated) — forces H5PY_ALLGATHER.
+        #   3. ``slab_io=auto`` (default) — the platform router, always.
+        if _slab_io_in != "auto":
+            if _use_ffi_io_in is not None:
+                print_fn(
+                    f"  [config] use_ffi_io={str(_use_ffi_io_in).lower()} "
+                    f"is ignored: slab_io={_slab_io_in} is explicit and "
+                    "takes precedence (use_ffi_io is deprecated).")
+            _slab_io_choice = SlabIOBackend(_slab_io_in)
+        elif _use_ffi_io_in is False:
+            import warnings
+            warnings.warn(
+                "Input key 'use_ffi_io' is deprecated; 'use_ffi_io = "
+                "false' is honored as 'slab_io = h5py_allgather' (the "
+                "pre-FFI rank-0 writer).  Set 'slab_io = h5py_allgather' "
+                "explicitly instead.",
+                DeprecationWarning, stacklevel=2)
+            print_fn(
+                "  [config] use_ffi_io=false (deprecated): forcing SlabIO "
+                "through H5PY_ALLGATHER (rank-0 serial write).  This "
+                "overrides the slab_io=auto router; prefer "
+                "slab_io = h5py_allgather.")
+            _slab_io_choice = SlabIOBackend.H5PY_ALLGATHER
+        else:
+            if _use_ffi_io_in is True:
+                print_fn(
+                    "  [config] use_ffi_io=true is deprecated and "
+                    "redundant: slab_io=auto already routes to the best "
+                    "available parallel writer.  Remove the key.")
+            _slab_io_choice = (_route_cpu_slab_io(print_fn)
+                               if _is_cpu_backend
+                               else _route_gpu_slab_io(print_fn))
         if _is_cpu_backend:
-            # Only for slab_io=auto: an explicit backend is honoured verbatim
-            # below, and the tier-1 probe dlopen's the host FFI library, which
-            # a deck that already named its writer should not pay for.
-            if _use_ffi_io_in and _slab_io_in == "auto":
-                _slab_io_choice = _route_cpu_slab_io(print_fn)
             if _dist_chol not in ("off", "slate", "auto"):
                 # slate passes through: it has a host-platform FFI
                 # (liblorrax_ffi_host.so, Target::HostTask) and keeps the
@@ -1588,12 +1773,6 @@ class LorraxConfig:
                 "distributed_lu=scalapack is host-only (Cray LibSci) but "
                 "the JAX backend is not CPU; use distributed_lu = "
                 "auto|off|cusolvermp on GPU runs.")
-        if _slab_io_in != "auto":
-            # Explicit backend: no platform second-guessing — a wrong
-            # choice fails loudly at SlabIO open (e.g. phdf5_ffi on CPU),
-            # which beats silently running a different backend than the
-            # input file says.
-            _slab_io_choice = SlabIOBackend(_slab_io_in)
         backend = BackendConfig(
             slab_io=_slab_io_choice,
             gspace_io=GspaceIO(str(_g("gspace_mode")).strip().lower()),
