@@ -52,8 +52,12 @@ without changing any physics. Every change below is verified **bit-exact**
 **To enable the CPU FFI read** (optional; the twin works without it): build the
 host lib with `config/frontera/build_ffi_host.sh --fresh` inside the py312
 apptainer container (stages into `$WORK/lorrax_ffi_host` or a dir of your
-choice), then point `LORRAX_FFI_SO` at it. The host lib is **read-only**
-(`write_ffi.cc` not ported — CPU only needs reads).
+choice), then point `LORRAX_FFI_HOST_SO` at it.
+
+~~The host lib is **read-only**~~ — **no longer true as of workstream AE
+(2026-07-26)**: `write_ffi.cc` compiles into the host lib from the same TU
+under the same `LORRAX_FFI_NO_CUDA` flag, so the host lib does collective
+MPI-IO **writes** too (`PhdfWriteHostFfi`). See open item 3 below.
 
 ### 2. htransform compile storm — anatomy & fix
 Measured, not assumed (see `SPEEDUP_SCORECARD.md`):
@@ -113,7 +117,22 @@ Measured, not assumed (see `SPEEDUP_SCORECARD.md`):
    forces `ISDF_JAX_CACHE_DIR=""`. Fixing that unlocks the real 158s win.
 2. **Rebuild & deploy the host FFI lib** so CPU uses the collective read
    (currently falls back to the h5py twin).
-3. **Port `write_ffi.cc`** to the host lib if CPU writes are ever needed.
+3. ~~**Port `write_ffi.cc`** to the host lib if CPU writes are ever needed.~~
+   **DONE — workstream AE, 2026-07-26.** `write_ffi.cc` now compiles into both
+   libs from one TU; the three seams (handler binding, index copy-in, payload
+   staging) live in `ffi/phdf5/cpp/platform_seam.h` and are shared verbatim
+   with `read_ffi.cc`. On the host platform the D2H staging **disappears**:
+   the XLA buffer is host memory, so `H5Dwrite` reads the local ζ shard in
+   place — no pinned buffer, no copy, no event. `gw_config._route_cpu_slab_io`
+   capability-probes `lorrax_phdf5_write` and routes `slab_io=auto` on CPU
+   **PHDF5_FFI → PHDF5_HOST(mpi4py) → H5PY_ALLGATHER**, demoting gracefully on
+   a host lib built before the port. This makes the mpi4py + h5py-parallel
+   overlay (workstream AB) **optional**: the same writer semantics now need
+   only the `.so`. Library: `$WORK/lorrax_ffi_unified/build_host_W` (11
+   targets = V's 10 + `PhdfWriteHostFfi`). Gates: P=4 fixture eqp
+   max|Δ| = 1.0e-6 eV and `zeta_q.h5` + `isdf_tensors_*.h5` **bit-identical**
+   to the allgather writer, with `mpi4py` provably absent from the
+   interpreter.
 4. Full `tests/test_zeta_mesh_invariance.py` green-run on CPU (logic confirmed
    by `verify.py`; the multiprocess-worker pytest is slow under shared-alloc
    contention).

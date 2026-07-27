@@ -4,6 +4,15 @@ Opt-in path (``use_ffi_io=True``).  Imported lazily by
 :mod:`file_io.slab_io` so the default allgather path works without
 ``liblorrax_ffi.so`` being built.
 
+PLATFORM-AGNOSTIC.  Nothing in this module is CUDA-specific: the
+``jax.ffi.ffi_call`` sites name only the target string, and
+``ffi_loader`` registers ``liblorrax_ffi.so``'s handlers under
+platform="CUDA" and ``liblorrax_ffi_host.so``'s under platform="cpu"
+against those same strings.  So this backend drives the GPU collective
+write and (since workstream AE) the host one — on CPU the C++ side
+skips the D2H staging entirely and H5Dwrite reads the XLA buffer in
+place.  ``gw_config._route_cpu_slab_io`` capability-probes for it.
+
 Every operation derives per-rank hyperslab offsets from the sharding
 spec of the JAX array being written (or a caller-provided one for
 reads) plus a global-origin ``offset`` argument.  The C++ handler

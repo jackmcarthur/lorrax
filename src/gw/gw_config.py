@@ -120,21 +120,91 @@ class SlabIOBackend(str, enum.Enum):
     """How big sigma/zeta/restart HDF5 files are written.
 
     - ``PHDF5_FFI`` — every rank writes its hyperslab via the parallel-HDF5
-      FFI (collective MPI-IO).  GPU backend default.  ~5× faster than the
-      rank-0 path once Lustre striping is applied.  C++ side requires
-      CUDA (cudaMemcpyAsync D2H, cudaEvent sync); GPU-only.
-    - ``PHDF5_HOST`` — host-side equivalent of ``PHDF5_FFI``: each rank
-      writes its own hyperslab via parallel HDF5 driven by mpi4py +
-      h5py(parallel).  Spiritually identical to the FFI path minus the
-      cudaMemcpy.  CPU backend default when the venv has mpi4py +
-      h5py-parallel installed.
+      FFI (collective MPI-IO).  Default on BOTH backends now: the C++ core
+      (``ffi/phdf5/cpp/write_ffi.cc``) compiles into the CUDA lib and, since
+      workstream AE, into the CUDA-free host lib under ``LORRAX_FFI_NO_CUDA``
+      — where the D2H staging collapses to "H5Dwrite reads the XLA buffer in
+      place".  ~5× faster than the rank-0 path once Lustre striping is
+      applied.  Needs the host lib to export ``PhdfWriteHostFfi``
+      (``ffi_loader.has_phdf5_write('cpu')``); the auto-router probes.
+    - ``PHDF5_HOST`` — host-side equivalent driven by mpi4py +
+      h5py(parallel) instead of the FFI.  Same per-rank collective MPI-IO
+      write semantics.  Now the SECOND tier on CPU: it needs an extra
+      environment (the ``lorrax_env_mpi_overlay`` two-package overlay,
+      workstream AB) that the FFI path does not, so it is kept only as the
+      fallback for a host lib without the write handler.
     - ``H5PY_ALLGATHER`` — gather to rank 0 and write via serial h5py.
       Last-resort fallback for systems without either parallel HDF5 or
-      the FFI.  Slow at scale (rank-0 disk bandwidth bottleneck).
+      the FFI.  Slow at scale (rank-0 disk bandwidth bottleneck), and the
+      gather itself is the single biggest collective in a large run
+      (12.05 GB at 606 centroids / P=16 — scorecard AB.2).
     """
     PHDF5_FFI = "phdf5_ffi"
     PHDF5_HOST = "phdf5_host"
     H5PY_ALLGATHER = "h5py_allgather"
+
+
+def _route_cpu_slab_io(print_fn) -> "SlabIOBackend":
+    """Pick the ``slab_io=auto`` backend on the JAX **CPU** backend.
+
+    Three tiers, best first — each one loud about why it was or was not
+    taken, because "which writer ran" is the single most consequential
+    thing about a large run's memory profile:
+
+    1. ``PHDF5_FFI`` — the host FFI lib exports the collective write
+       handler.  Zero extra Python environment; the ζ tile never leaves
+       the rank that owns it.
+    2. ``PHDF5_HOST`` — no write handler in the lib, but the interpreter
+       has ``mpi4py`` + an ``HDF5_MPI=ON`` h5py (the AB overlay).  Same
+       MPI-IO semantics, extra env.
+    3. ``H5PY_ALLGATHER`` — neither; rank-0 serial write behind a full
+       ``process_allgather`` of the tensor.
+
+    The tier-1 probe is :func:`ffi_loader.probe_target`, not a bare
+    ``has_target``: its three-state reason distinguishes "lib not built
+    with the handler" (rebuild) from "lib could not be dlopen'd"
+    (``LD_LIBRARY_PATH``) — a distinction that cost workstream P a day.
+    Never raises: any probe failure demotes to the next tier.
+    """
+    reason = "ffi.common.ffi_loader import failed"
+    try:
+        from ffi.common.ffi_loader import probe_target
+        _ffi_write_ok, reason = probe_target("lorrax_phdf5_write", "cpu")
+    except Exception as exc:                      # pragma: no cover
+        _ffi_write_ok = False
+        reason = f"{type(exc).__name__}: {exc}"
+    if _ffi_write_ok:
+        print_fn(
+            "  [config] use_ffi_io=true on CPU backend; host FFI exports "
+            "the collective phdf5 write handler.  Routing SlabIO through "
+            "PHDF5_FFI (bare-MPI C++ collective MPI-IO, no mpi4py needed)."
+        )
+        return SlabIOBackend.PHDF5_FFI
+
+    try:
+        import mpi4py  # noqa: F401
+        import h5py
+        _have_parallel_h5 = bool(h5py.get_config().mpi)
+    except Exception:
+        _have_parallel_h5 = False
+    if _have_parallel_h5:
+        print_fn(
+            "  [config] use_ffi_io=true on CPU backend; the host FFI write "
+            f"handler is unavailable ({reason}).  Routing SlabIO through "
+            "PHDF5_HOST (mpi4py + h5py-parallel) — same per-rank "
+            "collective MPI-IO write semantics."
+        )
+        return SlabIOBackend.PHDF5_HOST
+
+    print_fn(
+        "  [config] use_ffi_io=true on CPU backend but neither writer is "
+        f"available (host FFI: {reason}; venv lacks mpi4py / "
+        "h5py-parallel); falling back to H5PY_ALLGATHER (rank-0 serial "
+        "write behind a full all-gather — slow, and the all-gather is the "
+        "memory wall at scale).  Rebuild the host lib with "
+        "config/frontera/build_ffi_host.sh to get PHDF5_FFI."
+    )
+    return SlabIOBackend.H5PY_ALLGATHER
 
 
 class GspaceIO(str, enum.Enum):
@@ -1381,15 +1451,17 @@ class LorraxConfig:
             gflat_chunk_size=int(_g("gflat_chunk_size")),
             vq_g_chunk_size=int(_g("vq_g_chunk_size")),
         )
-        # Auto-route GPU FFIs off on the CPU backend.  The phdf5 FFI is
-        # CUDA-only at the C++ level (cudaMemcpyAsync D2H, cudaEvent sync
-        # — see ``src/ffi/phdf5/cpp/write_ffi.cc``).  cuSOLVERMp / cuBLASMp
-        # are similarly GPU-only.  On the CPU backend:
+        # Auto-route GPU FFIs off on the CPU backend.  cuSOLVERMp /
+        # cuBLASMp are GPU-only.  The phdf5 FFI is NOT: both its read and
+        # its write core compile CUDA-free into liblorrax_ffi_host.so
+        # (``LORRAX_FFI_NO_CUDA``; see ``ffi/phdf5/cpp/platform_seam.h``),
+        # so on CPU it is preferred whenever the deployed lib exports the
+        # handler.  On the CPU backend:
         #
-        #   * ``use_ffi_io=true`` → ``SlabIOBackend.PHDF5_HOST`` (parallel
-        #     HDF5 via mpi4py + h5py-parallel — same per-rank collective
-        #     MPI-IO write as the FFI, no cudaMemcpy needed); falls back
-        #     to ``H5PY_ALLGATHER`` if the venv lacks mpi4py / h5py-parallel.
+        #   * ``use_ffi_io=true`` → ``_route_cpu_slab_io``: PHDF5_FFI (host
+        #     lib exports the write handler) → PHDF5_HOST (mpi4py +
+        #     h5py-parallel) → H5PY_ALLGATHER.  Capability-probed, never
+        #     env-presence-guessed, and loud about which tier it took.
         #   * ``cusolvermp_charge`` / ``cusolvermp_lu`` → ``"off"`` (in-tree
         #     ``cholesky_2d`` and per-q ``jnp.linalg.solve`` paths).
         #
@@ -1461,30 +1533,11 @@ class LorraxConfig:
         _slab_io_choice = (SlabIOBackend.PHDF5_FFI if _use_ffi_io_in
                            else SlabIOBackend.H5PY_ALLGATHER)
         if _is_cpu_backend:
-            if _use_ffi_io_in:
-                try:
-                    import mpi4py  # noqa: F401
-                    import h5py
-                    _have_parallel_h5 = bool(h5py.get_config().mpi)
-                except Exception:
-                    _have_parallel_h5 = False
-                if _have_parallel_h5:
-                    print_fn(
-                        "  [config] use_ffi_io=true on CPU backend; "
-                        "phdf5 FFI is CUDA-only.  Routing SlabIO through "
-                        "PHDF5_HOST (mpi4py + h5py-parallel) — same "
-                        "per-rank collective MPI-IO write semantics."
-                    )
-                    _slab_io_choice = SlabIOBackend.PHDF5_HOST
-                else:
-                    print_fn(
-                        "  [config] use_ffi_io=true on CPU backend but "
-                        "venv lacks mpi4py / h5py-parallel; falling back "
-                        "to H5PY_ALLGATHER (rank-0 serial write — slow "
-                        "at scale).  Build h5py with HDF5_MPI=ON against "
-                        "the system's parallel HDF5 to get PHDF5_HOST."
-                    )
-                    _slab_io_choice = SlabIOBackend.H5PY_ALLGATHER
+            # Only for slab_io=auto: an explicit backend is honoured verbatim
+            # below, and the tier-1 probe dlopen's the host FFI library, which
+            # a deck that already named its writer should not pay for.
+            if _use_ffi_io_in and _slab_io_in == "auto":
+                _slab_io_choice = _route_cpu_slab_io(print_fn)
             if _dist_chol not in ("off", "slate", "auto"):
                 # slate passes through: it has a host-platform FFI
                 # (liblorrax_ffi_host.so, Target::HostTask) and keeps the

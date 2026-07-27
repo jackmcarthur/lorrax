@@ -13,12 +13,14 @@ Two backends, selected by ``backend: SlabIOBackend``:
 - :attr:`SlabIOBackend.PHDF5_FFI` — :mod:`file_io._slab_io_ffi`.
   Collective MPI-IO via ``ffi.phdf5``; each rank writes its own
   hyperslab directly.  Lazy import; only loads the FFI when selected.
-  CUDA-only at the C++ level (cudaMemcpyAsync D2H); GPU backend.
+  Works on BOTH backends: the C++ core compiles into the CUDA lib and
+  into the CUDA-free host lib (``LORRAX_FFI_NO_CUDA`` — the D2H staging
+  becomes an in-place read of the XLA host buffer).  Preferred on CPU
+  whenever the deployed host lib exports ``PhdfWriteHostFfi``.
 - :attr:`SlabIOBackend.PHDF5_HOST` — :mod:`file_io._slab_io_mpi_host`.
-  Host-side equivalent of PHDF5_FFI: each rank writes its own hyperslab
-  via parallel HDF5 driven by mpi4py + h5py(parallel).  Spiritually
-  identical to the FFI path minus the cudaMemcpy.  CPU backend default
-  when the venv has mpi4py + h5py-parallel.
+  Same per-rank collective MPI-IO, driven from Python by mpi4py +
+  h5py(parallel) instead of the FFI.  Fallback tier on CPU for a host
+  lib built without the write handler; needs the mpi4py overlay.
 
 The legacy ``use_ffi_io: bool`` kwarg is still accepted on every entry
 point and silently coerced via :func:`_normalize_slab_backend` — pass

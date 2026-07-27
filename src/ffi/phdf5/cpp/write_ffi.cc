@@ -72,6 +72,32 @@
 // interaction — destroying an event with outstanding xla_stream
 // dependencies appears to wait on that stream to drain.  The fix
 // here — one event per ctx — is clean and correct.
+//
+// ─── LORRAX_FFI_NO_CUDA: the same TU builds the host lib ──────────────
+// This file compiles UNCHANGED into liblorrax_ffi_host.so (the CUDA-free
+// host-platform library) under -DLORRAX_FFI_NO_CUDA, exactly as
+// read_ffi.cc does.  The collective MPI-IO write core — per-rank
+// hyperslab derivation, valid_shape clipping, empty selection, the FIFO
+// writer thread, H5Dwrite — is byte-identical on both platforms.  The
+// three seams are:
+//   1. handler binding: ``PhdfWriteHostFfi`` with no PlatformStream Ctx
+//      (platform_seam.h),
+//   2. index copy-in: the (ndim × int64) offset / valid_shape buffers are
+//      a plain host read instead of cudaMemcpy D2H (platform_seam.h),
+//   3. payload staging: the CUDA path cudaMemcpyAsync's the local shard
+//      D2H into the ctx's pinned buffer and has the writer thread wait on
+//      ``ctx->d2h_event``; on the host platform the XLA buffer IS host
+//      memory, so H5Dwrite reads the shard IN PLACE — no staging copy, no
+//      pinned allocation, no event.  That elision is the point: at MoS2
+//      12×12 / 606 centroids the sharded ζ tile is 0.75 GB per rank, and
+//      the allgather writer it replaces cost 12.05 GB of collective plus
+//      a second host copy (scorecard AB.3).
+// Lifetime of the in-place source pointer: ``_slab_io_ffi.write_slab``
+// dispatches through a Python worker that holds a reference to ``A`` and
+// blocks on the returned token, and XLA does not donate the input, so A's
+// buffer stays live until the Future this handler returns is resolved —
+// i.e. until H5Dwrite has finished reading it.  This is the same
+// contract the CUDA path relies on for its cudaMemcpyAsync source.
 
 #include <chrono>
 #include <complex>
@@ -85,7 +111,9 @@
 #include <utility>
 #include <vector>
 
+#ifndef LORRAX_FFI_NO_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <hdf5.h>
 
 #include "xla/ffi/api/ffi.h"
@@ -93,6 +121,7 @@
 #include "../../common/cpp/ffi_helpers.h"
 #include "ctx.h"
 #include "phdf5_interface.h"
+#include "platform_seam.h"
 
 namespace lorrax_ffi::phdf5 {
 
@@ -141,9 +170,13 @@ static std::string h5_object_name(hid_t id)
     return name;
 }
 
-// Run H5Dwrite on the ctx writer thread.  If ``wait_for_d2h`` is
-// true, first cudaEventSynchronize on the ctx's reusable d2h_event
-// so the pinned host buffer is valid.  We deliberately DO NOT
+// Run H5Dwrite on the ctx writer thread.  ``src_buf`` is the ctx's
+// pinned staging buffer on the CUDA build and the XLA input buffer
+// itself on the host build (seam 3).  If ``wait_for_d2h`` is
+// true (CUDA only), first cudaEventSynchronize on the ctx's reusable
+// d2h_event so the pinned host buffer is valid; on the host build
+// there is no copy in flight and the flag is always false.
+// We deliberately DO NOT
 // destroy the event here: cudaEventDestroy on a recently-recorded
 // event (per-call) blocks 700-800 ms on 3 of 4 ranks when xla_stream
 // has a main-thread backlog (measured 2026-04-18, cause: likely
@@ -157,13 +190,17 @@ static void async_worker(
     std::vector<hsize_t> offset,
     std::vector<hsize_t> file_count,
     std::vector<hsize_t> mem_dims,
-    void* pinned_buf,
+    void* src_buf,
     bool wait_for_d2h,
     ffi::Promise promise)
 {
+#ifndef LORRAX_FFI_NO_CUDA
     if (wait_for_d2h) {
         cudaEventSynchronize(ctx->d2h_event);
     }
+#else
+    (void)wait_for_d2h;   // no D2H copy on the host build (seam 3)
+#endif
     const int rank = (int)offset.size();
     hid_t filespace = H5Dget_space(ds_id);
     if (filespace < 0) {
@@ -263,7 +300,7 @@ static void async_worker(
 
     hid_t dxpl = ctx->use_collective_write ? ctx->dxpl_coll : ctx->dxpl_indep;
     herr_t st = H5Dwrite(ds_id, native_type, memspace, filespace, dxpl,
-                         pinned_buf);
+                         src_buf);
     if (st < 0 && debug) H5Eprint2(H5E_DEFAULT, stderr);
 
     H5Sclose(memspace);
@@ -290,7 +327,7 @@ static void async_worker(
 // buffer makes the trace signature shape-only (ndim), so shard_map
 // closures compile ONCE per (ds_id, ndim, dtype, sharding).
 static ffi::Future WriteDispatch(
-    cudaStream_t xla_stream,
+    LRX_STREAM_PARAM
     ffi::AnyBuffer A,
     ffi::Buffer<ffi::DataType::S64> offset_buf,   // shape (ndim,)
     ffi::Buffer<ffi::DataType::S64> valid_shape_buf, // shape (ndim,)
@@ -329,27 +366,22 @@ static ffi::Future WriteDispatch(
         return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str()));
     }
 
-    // D2H-copy the small offset buffer (N × 8 bytes = 24-40 bytes
-    // typically).  Blocking cudaMemcpy; microseconds.
+    // Seam 2 — fetch the small index buffers (N × 8 bytes = 24-40 bytes
+    // typically).  CUDA: blocking cudaMemcpy D2H, microseconds.  Host:
+    // the XLA buffer is already host-resident, so a plain memcpy.
+    std::string idx_err;
     std::vector<int64_t> offset_host(N);
-    cudaError_t ce_off = cudaMemcpy(offset_host.data(), offset_buf.untyped_data(),
-                                    N * sizeof(int64_t), cudaMemcpyDeviceToHost);
-    if (ce_off != cudaSuccess) {
-        std::ostringstream os;
-        os << "phdf5 write: cudaMemcpy(offset) failed: "
-           << cudaGetErrorString(ce_off);
-        return fail(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
+    if (!copy_index_to_host(offset_host.data(), offset_buf.untyped_data(),
+                            N * sizeof(int64_t), &idx_err)) {
+        return fail(ffi::Error(ffi::ErrorCode::kInternal,
+                    "phdf5 write: index copy(offset) failed: " + idx_err));
     }
     std::vector<int64_t> valid_shape_host(N);
-    cudaError_t ce_valid = cudaMemcpy(valid_shape_host.data(),
-                                      valid_shape_buf.untyped_data(),
-                                      N * sizeof(int64_t),
-                                      cudaMemcpyDeviceToHost);
-    if (ce_valid != cudaSuccess) {
-        std::ostringstream os;
-        os << "phdf5 write: cudaMemcpy(valid_shape) failed: "
-           << cudaGetErrorString(ce_valid);
-        return fail(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
+    if (!copy_index_to_host(valid_shape_host.data(),
+                            valid_shape_buf.untyped_data(),
+                            N * sizeof(int64_t), &idx_err)) {
+        return fail(ffi::Error(ffi::ErrorCode::kInternal,
+                    "phdf5 write: index copy(valid_shape) failed: " + idx_err));
     }
 
     std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
@@ -441,6 +473,17 @@ static ffi::Future WriteDispatch(
     for (auto c : mem_dims) n_local_elts *= (size_t)c;
     const size_t bytes = n_local_elts * elt_bytes;
 
+    // ---- Seam 3: get the local shard to a host pointer H5Dwrite can read.
+#ifdef LORRAX_FFI_NO_CUDA
+    // Host platform: the XLA buffer already IS host memory.  H5Dwrite reads
+    // it IN PLACE — no staging allocation, no copy, nothing to wait on.
+    // (Staging here would cost a second full copy of the per-rank ζ shard
+    // — 0.75 GB/rank at 606 centroids / P=16 — for zero benefit.)  The
+    // pointer stays valid until the Future resolves; see the header note.
+    void* src_buf = A.untyped_data();
+    const bool wait_for_d2h = false;
+    (void)bytes;
+#else
     // Reuse ``ctx->pinned_buf``, growing on demand.  Safe because the
     // Python worker thread serializes write_slab calls: the prior
     // H5Dwrite has already completed (buffer released) by the time
@@ -451,7 +494,8 @@ static ffi::Future WriteDispatch(
         os << "phdf5 write: ensure_pinned(" << bytes << ") failed";
         return fail(ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str()));
     }
-    void* pinned_buf = ctx->pinned_buf;
+    void* src_buf = ctx->pinned_buf;
+    const bool wait_for_d2h = true;
 
     // D2H: cudaMemcpyAsync on ctx's private stream, then record the
     // ctx's REUSABLE d2h_event so the writer thread can sync on it.
@@ -470,7 +514,7 @@ static ffi::Future WriteDispatch(
     // Python worker serialises writes so by the time the next
     // handler runs, the previous H5Dwrite has already consumed
     // pinned_buf.
-    cudaError_t ce = cudaMemcpyAsync(pinned_buf, A.untyped_data(), bytes,
+    cudaError_t ce = cudaMemcpyAsync(src_buf, A.untyped_data(), bytes,
                                      cudaMemcpyDeviceToHost, ctx->stream);
     if (ce != cudaSuccess) {
         std::ostringstream os;
@@ -479,6 +523,7 @@ static ffi::Future WriteDispatch(
         return fail(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
     }
     cudaEventRecord(ctx->d2h_event, ctx->stream);
+#endif  // LORRAX_FFI_NO_CUDA
 
     // Standard Promise/Future handshake: construct promise, construct
     // future from it (one-shot), then move promise into the task
@@ -490,13 +535,13 @@ static ffi::Future WriteDispatch(
                  offset = std::move(offset),
                  file_count = std::move(file_count),
                  mem_dims = std::move(mem_dims),
-                 pinned_buf,
+                 src_buf, wait_for_d2h,
                  promise = std::move(promise)]() mutable
     {
         async_worker(ctx, dset, native_type,
                      std::move(offset), std::move(file_count),
                      std::move(mem_dims),
-                     pinned_buf, /*wait_for_d2h=*/true,
+                     src_buf, wait_for_d2h,
                      std::move(promise));
     };
 
@@ -513,10 +558,15 @@ static ffi::Future WriteDispatch(
 }  // namespace lorrax_ffi::phdf5
 
 // ---- FFI binding ---------------------------------------------------------
+// One dispatch body (above), two bindings: the CUDA build emits
+// ``PhdfWriteFfi`` with the platform stream as a leading Ctx; the host build
+// emits ``PhdfWriteHostFfi`` with none (XLA's CPU runtime calls the handler
+// with host buffers on the calling thread).  Both register under the SAME
+// jax.ffi target string ``lorrax_phdf5_write`` — see platform_seam.h.
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    PhdfWriteFfi, lorrax_ffi::phdf5::WriteDispatch,
+    LRX_PHDF_HANDLER(PhdfWrite), lorrax_ffi::phdf5::WriteDispatch,
     xla::ffi::Ffi::Bind()
-        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        LRX_PHDF_STREAM_CTX
         .Arg<xla::ffi::AnyBuffer>()
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_base
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // valid_shape
