@@ -11,7 +11,7 @@ along the same axes the input file's section comments already use:
     config.sigma_grid  — ω-grid for Σ_c(ω) output
     config.sc          — self-consistency loop knobs (qp_solver = self_consistent)
     config.memory      — chunk sizing
-    config.backend     — FFI/IO backend selection (slab_io / gspace_io / screening_solver)
+    config.backend     — FFI/IO backend selection (slab_io / gspace_io / w_dyson_solver)
     config.debug       — debug-only flags & file paths
     config.bse         — BSE interpolation setup (htransform-driven)
     config.paths       — output filenames
@@ -344,30 +344,54 @@ class GspaceIO(str, enum.Enum):
     FILE_REREAD = "file_reread"
 
 
-class ScreeningSolver(str, enum.Enum):
-    """Which solver runs the W = (1 - V·χ₀)⁻¹·V Dyson equation.
+#: The two W Dyson plans (``gw/w_isdf.py``) — the ONLY legal resolved
+#: values of the ``w_dyson_solver`` input key.
+_W_DYSON_PLANS = ("local", "distributed")
 
-    - ``JAX_NATIVE`` — q-parallel reshard + ``jax.scipy.linalg.lu_factor``
-      / ``lu_solve`` per q.  Default; uses one all-gather + all-scatter.
-    - ``CUBLASMP_FFI`` — fused symmetric Cholesky W = X·H⁻¹·X† via
-      cuBLASMp + cuSOLVERMp FFI.  No JAX-level intermediates between
-      the matmuls; needed when ``nq · n_rmu²`` exceeds VRAM.
+
+def normalize_w_dyson_solver(value) -> str:
+    """Normalise a ``w_dyson_solver`` spelling to one of the TWO plans.
+
+    Single source of the vocabulary — the parser and
+    ``w_isdf._resolve_w_solve_fn`` both call this, so a spelling cannot
+    mean different things at parse time and solve time.
+
+    - ``local`` / ``auto`` / None → ``"local"`` (the q-parallel per-q
+      dense LU; ``auto`` is a permanent back-compat alias).
+    - ``distributed`` → ``"distributed"`` (the 2-D-sharded stacked-GEMM
+      backsolve through the ffi.linalg plan facade).
+    - ``lu`` → ``"local"`` with a DeprecationWarning (it was the same
+      route under its old name).
+    - ``lstsq`` → ``ValueError``: the SVD min-norm inner solve was
+      REMOVED in the two-plan cleanup (2026-07-27) — old decks fail
+      informatively instead of silently rerouting.
     """
-    JAX_NATIVE = "jax_native"
-    CUBLASMP_FFI = "cublasmp_ffi"
-
-
-# Legacy ``isdf_memory_mode`` strings → ``ScreeningSolver`` enum.  Used
-# by both the input-file parser and the back-compat property aliases.
-_LEGACY_ISDF_MEMORY_MODE = {
-    "auto":     ScreeningSolver.JAX_NATIVE,    # back-compat default
-    "high_mem": ScreeningSolver.JAX_NATIVE,
-    "low_mem":  ScreeningSolver.CUBLASMP_FFI,
-}
-_SCREENING_SOLVER_TO_LEGACY = {
-    ScreeningSolver.JAX_NATIVE:   "high_mem",
-    ScreeningSolver.CUBLASMP_FFI: "low_mem",
-}
+    s = ("auto" if value is None else str(value)).strip().lower()
+    if s == "lu":
+        import warnings
+        warnings.warn(
+            "w_dyson_solver = lu is deprecated: the per-q pivoted LU is "
+            "now spelled 'local' (and is the default).  Update the deck "
+            "to w_dyson_solver = local.",
+            DeprecationWarning, stacklevel=2)
+        s = "local"
+    if s == "lstsq":
+        raise ValueError(
+            "w_dyson_solver = lstsq was REMOVED (two-plan W cleanup, "
+            "2026-07-27).  The two plans are 'local' (per-q pivoted LU, "
+            "default) and 'distributed' (2-D-sharded ScaLAPACK/cuSOLVERMp "
+            "backsolve).  lstsq existed as a rank-deficiency fallback; a "
+            "rank-deficient A = 1 - V·chi0 means the centroid basis has "
+            "over-completed the pair-density rank — reduce n_mu (fewer "
+            "centroids) or raise zeta_rcond instead of masking it with a "
+            "min-norm solve.")
+    if s == "auto":
+        return "local"
+    if s not in _W_DYSON_PLANS:
+        raise ValueError(
+            f"w_dyson_solver={value!r} invalid; expected "
+            f"local (default; auto is an alias) or distributed.")
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -615,20 +639,17 @@ _DEFAULTS = {
     "band_chunk_size": 16,
     "r_chunk_size": 0,
     # ISDF
-    # Which dense solve runs the W Dyson equation A·W = V, A = (1 - Vχ₀).
-    #   auto / lu    per-q pivoted LU inside the q-parallel shard_map (default)
-    #   lstsq        rank-deficient fallback (SVD min-norm); NOT bit-identical
-    #   distributed  2-D sharded solve through the ffi.linalg PLAN seam
-    #                (ScaLAPACK/cuSOLVERMp); falls back to lu when the mesh
-    #                offers no distributed solve_lu.
+    # Which of the TWO W Dyson plans solves A·W = V, A = (1 - Vχ₀):
+    #   local (default; auto is an alias)
+    #                per-q pivoted LU inside the q-parallel shard_map.
+    #   distributed  2-D-sharded stacked-GEMM backsolve through the
+    #                ffi.linalg plan facade (ScaLAPACK on CPU meshes,
+    #                cuSOLVERMp on CUDA); no rank ever materialises a
+    #                full (μ, μ) tile.  Refuses loudly at resolve time
+    #                on an unsupported mesh/build — never silently
+    #                downgrades to local.
+    # (lu → local with a DeprecationWarning; lstsq was removed.)
     "w_dyson_solver": "auto",
-    "isdf_memory_mode": "auto",   # auto | high_mem | low_mem
-                                   # high_mem (default): 2D-blocked JAX Cholesky +
-                                   #   replicate-L vmap trsm.  Fast for small n_rmu.
-                                   # low_mem: batched cuSOLVERMp potrf + potrs on
-                                   #   per-X-row sub-comm (L stays distributed).
-                                   #   Needed when nq * n_rmu^2 exceeds VRAM.
-                                   # auto → high_mem for back-compat.
     "mc_average_vcoul_body": True,
     # Per-Q mini-BZ Coulomb head cell-averaging (BGW minibzaverage_3d/2d).
     # False (default) = current behavior, BIT-IDENTICAL: the q→0 head is the
@@ -743,7 +764,6 @@ _NORMALIZE_STR = {
     "sc_accelerator",
     "wcoul0_source", "screening_method", "minimax_energy_reference",
     "sigma_omega_accumulation", "fermi_reference",
-    "isdf_memory_mode",
     "w_dyson_solver",
     "ppm_invalid_mode",
     "ppm_model",
@@ -882,6 +902,29 @@ def read_lorrax_input(filename: str) -> dict:
                 "'slab_io' explicitly if you need a specific writer.",
                 DeprecationWarning, stacklevel=2,
             )
+
+        # isdf_memory_mode: REMOVED key (two-plan W cleanup 2026-07-27).
+        # auto/high_mem selected the route that is now w_dyson_solver=local
+        # (the default) — deprecation-warn and ignore.  low_mem selected
+        # the fused cuBLASMp W solve, which was DELETED (superseded by
+        # w_dyson_solver = distributed, which binds cusolvermp on CUDA
+        # meshes through the ffi.linalg plan facade) — fail informatively
+        # so old decks do not silently reroute.
+        _imm = section.get("isdf_memory_mode", fallback=None)
+        if _imm is not None:
+            _imm_s = str(_imm).strip().lower()
+            if _imm_s == "low_mem":
+                raise ValueError(
+                    "isdf_memory_mode = low_mem was REMOVED: the fused "
+                    "cuBLASMp W solve is gone (two-plan W cleanup).  Use "
+                    "w_dyson_solver = distributed for the 2-D-sharded "
+                    "backsolve (ScaLAPACK on CPU, cuSOLVERMp on CUDA).")
+            import warnings
+            warnings.warn(
+                f"Input key 'isdf_memory_mode' (= {_imm_s!r}) is "
+                f"deprecated and ignored: the W Dyson solve is selected "
+                f"by w_dyson_solver = local|distributed.",
+                DeprecationWarning, stacklevel=2)
 
         # Build params from _DEFAULTS, overriding with parsed values
         params = {}
@@ -1126,7 +1169,7 @@ class MemoryConfig:
 
 @dataclass(frozen=True)
 class BackendConfig:
-    """Three-axis backend selection: I/O + ψ(G) lifecycle + screening solver.
+    """Three-axis backend selection: I/O + ψ(G) lifecycle + W Dyson plan.
 
     All three knobs were previously orthogonal-sounding boolean/string
     flags in different namespaces (``use_ffi_io`` / ``gspace_mode`` /
@@ -1136,8 +1179,7 @@ class BackendConfig:
     """
     slab_io: SlabIOBackend
     gspace_io: GspaceIO
-    screening_solver: ScreeningSolver
-    w_dyson_solver: str  # "auto"|"lu"|"lstsq"|"distributed" (W Dyson dense solve)
+    w_dyson_solver: str  # "local" | "distributed" (normalized; W Dyson plan)
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
     distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
     eigh_backend: str          # "auto" | "off" | "cusolvermp" | "slate"
@@ -1152,9 +1194,8 @@ class BackendConfig:
         return (
             f"backend: slab_io={self.slab_io.value}, "
             f"gspace_io={self.gspace_io.value}, "
-            f"screening_solver={self.screening_solver.value}, "
             + (f"w_dyson_solver={self.w_dyson_solver}, "
-               if self.w_dyson_solver != "auto" else "")
+               if self.w_dyson_solver != "local" else "")
             + f"distributed_cholesky={self.distributed_cholesky}, "
             f"distributed_lu={self.distributed_lu}, "
             + (f"eigh_backend={self.eigh_backend}, "
@@ -1416,11 +1457,6 @@ class LorraxConfig:
         """Legacy ``gspace_mode: str`` view of ``backend.gspace_io``."""
         return self.backend.gspace_io.value
 
-    @property
-    def isdf_memory_mode(self) -> str:
-        """Legacy ``isdf_memory_mode`` view of ``backend.screening_solver``."""
-        return _SCREENING_SOLVER_TO_LEGACY[self.backend.screening_solver]
-
     # ------------------------------------------------------------------
     #  Factory
     # ------------------------------------------------------------------
@@ -1438,15 +1474,6 @@ class LorraxConfig:
         params = read_lorrax_input(filename)
         input_dir = os.path.dirname(os.path.abspath(filename))
         resolve_input_paths(params, input_dir)
-
-        # --- Validate isdf_memory_mode (legacy string → ScreeningSolver) ---
-        isdf_memory_mode = str(
-            params.get("isdf_memory_mode", "auto")).strip().lower()
-        if isdf_memory_mode not in _LEGACY_ISDF_MEMORY_MODE:
-            raise ValueError(
-                f"isdf_memory_mode={isdf_memory_mode!r} invalid; "
-                f"expected one of {sorted(_LEGACY_ISDF_MEMORY_MODE)}"
-            )
 
         # --- Memory auto-detection ---
         memory_per_device_gb = float(params.get("memory_per_device_gb", 0.0))
@@ -1673,11 +1700,9 @@ class LorraxConfig:
             raise ValueError(
                 f"charge_zeta_solve={_charge_zeta_solve!r} invalid; expected "
                 f"rank_truncate / cholesky.")
-        _w_dyson_solver = str(_g("w_dyson_solver")).strip().lower()
-        if _w_dyson_solver not in ("auto", "lu", "lstsq", "distributed"):
-            raise ValueError(
-                f"w_dyson_solver={_w_dyson_solver!r} invalid; expected "
-                f"auto / lu / lstsq / distributed.")
+        # Normalised to one of the TWO plans at PARSE time (fails loudly
+        # here on removed spellings, not 20 minutes into the run).
+        _w_dyson_solver = normalize_w_dyson_solver(_g("w_dyson_solver"))
         _dist_zeta_solve = str(_g("distributed_zeta_solve")).strip().lower()
         if _dist_zeta_solve not in (
                 "auto", "replicated", "per_q", "distributed"):
@@ -1776,7 +1801,6 @@ class LorraxConfig:
         backend = BackendConfig(
             slab_io=_slab_io_choice,
             gspace_io=GspaceIO(str(_g("gspace_mode")).strip().lower()),
-            screening_solver=_LEGACY_ISDF_MEMORY_MODE[isdf_memory_mode],
             w_dyson_solver=_w_dyson_solver,
             distributed_cholesky=_dist_chol,
             distributed_lu=_dist_lu,

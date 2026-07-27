@@ -2695,7 +2695,7 @@ def solve_zeta(
         # P('x', None, 'y') parks 'x' on the leading nq axis so each
         # with_sharding_constraint moves only one mesh axis — two pure
         # all-to-alls, no all-gather inflation.  Same pattern as
-        # w_isdf._get_w_solve_fn (V/χ reshard).  See lorrax_B commit
+        # w_isdf._get_w_solve_fn_local (V/χ reshard).  See lorrax_B commit
         # c0307a0 for the original Si 4×4×4 result (HLO peak
         # 68.94 → 29.94 GB on the same kernel compile).
         # The kernel itself is built ONCE per cache_key (above) — building
