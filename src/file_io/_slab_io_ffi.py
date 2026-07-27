@@ -49,6 +49,9 @@ def _barrier(tag: str) -> None:
         pass
 
 
+_PRESTRIPE_WARNED = False
+
+
 def _lustre_prestripe(path: str, stripe_count: int = 16,
                       stripe_size: str = "4M") -> None:
     """Pre-create ``path`` with an explicit Lustre stripe layout.
@@ -70,8 +73,25 @@ def _lustre_prestripe(path: str, stripe_count: int = 16,
 
     Best-effort: if ``lfs`` isn't on PATH or striping fails (e.g.,
     non-Lustre filesystem), this is a no-op.
+
+    **It IS a no-op on Frontera.**  Every production run executes inside
+    the apptainer image, which does not ship ``lfs`` (nor libraries for
+    it), so ``shutil.which`` returns None and this function has never
+    once set a stripe here — MEASURED on job 7876423's output:
+    ``zeta_q.h5`` and ``isdf_tensors_2406.h5`` both came back
+    ``lmm_stripe_count: 1``.  The no-op used to be silent, which is why
+    it survived; it now says so once.  The layout is instead requested
+    through MPI-IO's ``striping_factor``/``striping_unit`` hints, which
+    ROMIO applies via ``llapi`` with no binary on PATH
+    (``_slab_io_mpi_host._mpi_io_hints``; ``ffi/phdf5/cpp/context.cc``).
     """
     if shutil.which("lfs") is None:
+        global _PRESTRIPE_WARNED
+        if not _PRESTRIPE_WARNED and _rank0():
+            _PRESTRIPE_WARNED = True
+            print("  [SlabIO] `lfs` not on PATH (container): lfs prestripe "
+                  "SKIPPED; Lustre layout comes from the MPI-IO "
+                  "striping_factor/striping_unit hints instead.", flush=True)
         return
     try:
         # Remove any existing file so lfs can set the stripe.  Safe for

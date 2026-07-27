@@ -98,12 +98,38 @@ def write_restart_state_to_h5(
         if mode == "w":
             io.write_attr("n_rmu_logical", np.int64(int(n_rmu_logical)))
 
+        # PER-DATASET LIVENESS (scorecard AF.4c).  This function writes
+        # tens of GB at production scale -- ~40 GB at MoS2 12x12/c2406 --
+        # and used to print NOTHING while doing it.  Job 7876423 spent
+        # 2 h 55 m in here and was killed by the wall clock with no way to
+        # tell "slow" from "wedged": AC.3c's discriminator ("a cadence
+        # exists" vs "no first milestone") cannot be applied to a stage
+        # that has no milestone to emit, and file size is the trap AC.3b
+        # documents (parallel HDF5 pre-allocates at create time, so the
+        # file reaches full size before any data lands).  One line per
+        # dataset with its own elapsed time is the cheapest thing that
+        # makes this stage diagnosable while it is still alive.
+        # ON by default for exactly that reason; LORRAX_RESTART_WRITE_LOG=0
+        # silences it.
+        import os as _os
+        import time as _time
+        _wlog = _os.environ.get(
+            "LORRAX_RESTART_WRITE_LOG", "1") not in ("0", "", "false")
+        _rank0 = jax.process_index() == 0
+
         def _write(name, arr, mu_axes=()):
             if arr is None:
                 return
             shape = _mu_logical_shape(arr.shape, mu_axes, n_rmu_logical)
+            _t0 = _time.time()
             io.create_dataset(name, shape=shape, dtype=arr.dtype)
             io.write_slab(name, arr, global_shape=shape, valid_shape=shape)
+            if _wlog and _rank0:
+                _nb = int(np.prod(shape)) * int(np.dtype(arr.dtype).itemsize)
+                _dt = _time.time() - _t0
+                print(f"  [restart_write] {name} {tuple(int(v) for v in shape)}"
+                      f" {_nb / 1e9:.2f} GB in {_dt:.1f} s"
+                      f" ({_nb / 1e6 / max(_dt, 1e-9):.0f} MB/s)", flush=True)
 
         _write("V_qmunu",      V_qmunu,      mu_axes=(-2, -1))
         _write("S_qmunu",      S_qmunu,      mu_axes=(-2, -1))
@@ -127,7 +153,18 @@ def write_restart_state_to_h5(
                 raise ValueError("init_W0=True requires V_qmunu to size the placeholder")
             v_shape = _mu_logical_shape(V_qmunu.shape, (-2, -1), n_rmu_logical)
             v_dtype = V_qmunu.dtype
+            _t0 = _time.time()
             io.create_dataset("W0_qmunu", shape=v_shape, dtype=v_dtype)
+            if _wlog and _rank0:
+                # Allocation ONLY -- no data is written here.  Naming that
+                # explicitly matters: under parallel HDF5 this call makes the
+                # file jump by the full tensor size, which reads exactly like
+                # progress and is not (AC.3b).
+                _nb = int(np.prod(v_shape)) * int(np.dtype(v_dtype).itemsize)
+                print(f"  [restart_write] W0_qmunu placeholder ALLOCATED "
+                      f"{tuple(int(v) for v in v_shape)} {_nb / 1e9:.2f} GB "
+                      f"in {_time.time() - _t0:.1f} s (no data written)",
+                      flush=True)
 
     # bse_io.py reads W0_ready as an HDF5 attr on the W0_qmunu dataset.
     # Set it rank-0-only after SlabIO has released the file, to stay
@@ -149,12 +186,27 @@ def write_w0_qmunu_to_h5(
     """
     from .slab_io import SlabIO
 
+    import os as _os
+    import time as _time
     shape = _mu_logical_shape(W0_qmunu.shape, (-2, -1), n_rmu_logical)
     with SlabIO(filename, mode="a", mesh=mesh,
                 backend=backend, use_ffi_io=use_ffi_io) as io:
+        _t0 = _time.time()
         io.create_dataset("W0_qmunu", shape=shape, dtype=W0_qmunu.dtype)
         io.write_slab("W0_qmunu", W0_qmunu, global_shape=shape,
                       valid_shape=shape)
+        # Same instrument as ``write_restart_state_to_h5`` (AF.4c).  This
+        # is the SECOND (nq, mu, mu) tensor the run writes -- another
+        # 13.34 GB at c2406 -- and it had no telemetry at all, so a repeat
+        # of the writer pathology would have been invisible here even
+        # after AF instrumented its sibling.
+        if (_os.environ.get("LORRAX_RESTART_WRITE_LOG", "1")
+                not in ("0", "", "false") and jax.process_index() == 0):
+            _nb = int(np.prod(shape)) * int(np.dtype(W0_qmunu.dtype).itemsize)
+            _dt = _time.time() - _t0
+            print(f"  [restart_write] W0_qmunu {tuple(int(v) for v in shape)}"
+                  f" {_nb / 1e9:.2f} GB in {_dt:.1f} s"
+                  f" ({_nb / 1e6 / max(_dt, 1e-9):.0f} MB/s)", flush=True)
 
     # W0_ready flag is a per-dataset attr read by bse_io.py.
     if jax.process_index() == 0:
