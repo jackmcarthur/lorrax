@@ -1110,11 +1110,12 @@ def main(argv=None):
     # JAX persistent compile cache — the same call/pattern as gw_jax's
     # _warm_start (and run_nscf / run_sternheimer / kmeans_cli).  This CLI
     # was the one driver that never enabled it, so every htransform run paid
-    # a cold XLA compile of the Galerkin/G-accum kernels.  Opt out (and the
-    # ONLY supported setting at P > 1 on Frontera, where a shared cache
-    # deadlocks the compile barrier) with ISDF_JAX_CACHE_DIR="" — that env
-    # value is honoured inside ensure_jax_compile_cache, so nothing here
-    # needs to test for it.  Failures are logged and swallowed.
+    # a cold XLA compile of the Galerkin/G-accum kernels.  It is now safe and
+    # effective at EVERY process count (scorecard AH) — measured at P=8 on the
+    # fixture, a warm run compiles 0 of 152 modules per rank instead of 152.
+    # Opt out with ISDF_JAX_CACHE_DIR="" — that env value is honoured inside
+    # ensure_jax_compile_cache, so nothing here needs to test for it.
+    # Failures are logged and swallowed.
     try:
         from common.jax_compile_cache import ensure_jax_compile_cache
         ensure_jax_compile_cache()

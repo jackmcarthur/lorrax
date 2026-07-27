@@ -268,7 +268,10 @@ only inside `w_isdf` / `ppm_sigma`, so `zeta_fit_chunked` and
 `jax.config.update('jax_compilation_cache_dir', …)` API, activated
 from each driver's `main()` before any jit. Cache dir partitioned
 by `np{n_proc}` so a 1-GPU debug run doesn't collide with 4-GPU
-prod. Opt-out via `ISDF_JAX_CACHE_DIR=""`.
+prod — but WITHIN a world size every rank shares one directory, and a
+coordination-service agreement keeps the ranks' hit/miss patterns
+identical (scorecard AG/AH; a divergent pattern deadlocks XLA:GPU's
+collective autotune exchange). Opt-out via `ISDF_JAX_CACHE_DIR=""`.
 
 Warm-run savings:
 - `gw.gw_jax`: 24.4 s → 20.0 s (−4.3 s)
@@ -303,7 +306,7 @@ Environment variables, loosely in order of how often you'd touch them:
 
 | var | default | effect |
 |---|---|---|
-| `ISDF_JAX_CACHE_DIR` | `~/.cache/isdf_jax_compilation` | persistent compile-cache path; set to `""` to disable |
+| `ISDF_JAX_CACHE_DIR` | `~/.cache/isdf_jax_compilation` | persistent compile-cache path; set to `""` to disable. Safe and ON at every process count since scorecard AH — see `common/jax_compile_cache.py` and `docs/dev/env_vars.md` for the `LORRAX_JAX_CACHE_*` knobs |
 | `LORRAX_PHDF5_INDEPENDENT` | `0` | if `1`, also force **reads** to independent (writes are already independent by default) — rarely helpful on OpenMPI; neutral on Cray |
 | `LORRAX_PHDF5_COLLECTIVE_WRITES` | `0` | if `1`, force writes back to collective — **do not set on Cray MPICH** (triggers `ad_cray_write_coll.c:669` OOM at ≥ 1 GB/rank); on OpenMPI the default independent write path matches collective within noise |
 | `LORRAX_PHDF5_COLL_META` | `0` | if `1`, re-enable collective metadata ops — default is non-collective (faster everywhere: +100 ms on OpenMPI small writes, required on Cray for n ≥ 16384 C128 writes) |
