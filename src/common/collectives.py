@@ -193,8 +193,14 @@ def device_put_process_local(host_array, sharding, *, check: bool | None = None)
         return jax.device_put(arr, sharding)
 
     if check is None:
-        check = os.environ.get("LORRAX_CHECK_REPLICA", "0").strip() not in (
-            "", "0", "false", "False")
+        # Same falsy vocabulary as every other LORRAX knob ("", 0, false,
+        # no, off — case-insensitive).  The old parse recognised only
+        # ""/"0"/"false"/"False", so LORRAX_CHECK_REPLICA=off (or NO, OFF,
+        # False in another case) silently ENABLED the debug all-gather —
+        # a P-linear hidden collective (7.8 GB/rank at P=64, scorecard Y.5)
+        # turned on by a string that reads as "disabled" (workstream AT).
+        check = os.environ.get("LORRAX_CHECK_REPLICA", "0").strip().lower() \
+            not in ("", "0", "false", "no", "off")
     if check:
         # Opt-in debug path — this IS the P-linear all-gather.
         return jax.device_put(arr, sharding)
