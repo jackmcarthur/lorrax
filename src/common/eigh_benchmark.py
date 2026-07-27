@@ -93,8 +93,11 @@ def run_multiprocess(n: int, repeats: int) -> int:
     A_host = make_symmetric(n)
     ref = np.sort(np.linalg.eigvalsh(A_host))
 
-    A = jax.device_put(jnp.asarray(A_host),
-                       NamedSharding(mesh, P("x", "y")))
+    # Process-local (AA.1): plain device_put of the host operand would pay
+    # a P × n² × 8 B assert_equal all-gather and distort the benchmark.
+    from common.collectives import device_put_process_local
+    A = device_put_process_local(A_host,
+                                 NamedSharding(mesh, P("x", "y")))
 
     # Resolved once, outside the timing loop (scorecard L §6).
     eigh_plan = linalg_plan("eigh", mesh, backend="cusolvermp", n=n)
@@ -157,12 +160,16 @@ def run_dispatch(sizes, repeats: int, batch: int, backend: str) -> int:
         z = (rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n)))
         A_np = (0.5 * (z + np.conj(z.T)) + n * np.eye(n)).astype(np.complex128)
 
-        A_b = jax.device_put(jnp.broadcast_to(jnp.asarray(A_np), (batch, n, n)),
-                             NamedSharding(mesh, P(("x", "y"), None, None)))
+        # Process-local (AA.1) — see above; the np.broadcast_to view also
+        # keeps each rank's host materialisation to its own shard.
+        from common.collectives import device_put_process_local
+        A_b = device_put_process_local(
+            np.broadcast_to(A_np, (batch, n, n)),
+            NamedSharding(mesh, P(("x", "y"), None, None)))
         f_nat = jax.jit(jnp.linalg.eigh)
         t_nat = _median_ms(lambda: f_nat(A_b), repeats) / batch
 
-        A_1 = jax.device_put(jnp.asarray(A_np), NamedSharding(mesh, P("x", "y")))
+        A_1 = device_put_process_local(A_np, NamedSharding(mesh, P("x", "y")))
         eigh_plan = linalg_plan("eigh", mesh, backend=backend, n=n)
         t_ffi = _median_ms(lambda: eigh_plan(A_1), repeats)
 

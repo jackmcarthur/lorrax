@@ -395,7 +395,13 @@ def _compute_V_q_g_flat_one_tile(
     g0_acc = jax.jit(lambda: jnp.zeros(
         (n_q_ibz, n_rmu_L_padded), dtype=jnp.complex128),
         out_shardings=g0_sh)()
-    v_q_dev = jax.device_put(
+    # Process-local placement, NOT plain ``jax.device_put``: the latter
+    # fires JAX's hidden ``assert_equal`` all-gather on a multi-process
+    # mesh — P × nq × ngkmax × 8 B of pure assertion traffic (scorecard
+    # AA.1).  ``v_q_table`` is a pure function of the q-grid + cutoff,
+    # identical on every rank; ``LORRAX_CHECK_REPLICA=1`` re-arms the check.
+    from common.collectives import device_put_process_local
+    v_q_dev = device_put_process_local(
         v_q_table, NamedSharding(mesh_xy, P(None, None)))
 
     kernel = _make_per_q_kernel(

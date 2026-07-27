@@ -679,7 +679,11 @@ def main(argv=None):
             V_np = vq_interp.refit_vq(zx, rst, q_tile, mesh_xy)
             V_pad = np.zeros((n_rmu_pad, n_rmu_pad), dtype=np.complex128)
             V_pad[:n_rmu, :n_rmu] = 0.5 * (V_np + V_np.conj().T)
-            V_rows.append(jax.device_put(jnp.asarray(V_pad), grid_xy))
+            # Process-local (AA.1): V_pad is host numpy, identical on every
+            # rank; plain device_put would fire the hidden assert_equal
+            # all-gather.  LORRAX_CHECK_REPLICA=1 re-arms it.
+            from common.collectives import device_put_process_local
+            V_rows.append(device_put_process_local(V_pad, grid_xy))
     n_solve = nQ + len(refit_idx)
     V_stack = jax.device_put(jnp.stack(V_rows),
                              NamedSharding(mesh_xy, P(None, "x", "y")))

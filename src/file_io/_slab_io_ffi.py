@@ -34,6 +34,8 @@ from jax.experimental.shard_map import shard_map
 from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import device_put_process_local
+
 
 def _rank0() -> bool:
     return jax.process_index() == 0
@@ -170,7 +172,12 @@ def _replicated_i64_vector(values: Sequence[int], mesh: Mesh) -> jax.Array:
     permuted in the real CrI3 driver.  Replicating the control buffer is
     both the intended semantics and the safest JIT cache key.
     """
-    return jax.device_put(
+    # Process-local placement: plain ``jax.device_put`` of host numpy onto
+    # a multi-process sharding runs JAX's hidden ``assert_equal``
+    # all-gather (scorecard AA.1) — a per-call blocking collective on a
+    # control buffer that is identical on every rank by construction.
+    # ``LORRAX_CHECK_REPLICA=1`` re-arms the assertion.
+    return device_put_process_local(
         np.asarray(tuple(int(v) for v in values), dtype=np.int64),
         NamedSharding(mesh, P()),
     )
@@ -558,8 +565,16 @@ class _FfiBackend:
         if not isinstance(A, jax.Array):
             A = jnp.asarray(A)
         # Ensure placement: if not sharded on our mesh, put as replicated.
+        # Process-local (see _replicated_i64_vector): a host/uncommitted
+        # operand here would otherwise pay the hidden assert_equal
+        # all-gather at P × A.nbytes — on a WRITE-path tensor, the
+        # single biggest assertion payload in the codebase (AA.1 class).
+        # A replicated write requires rank-identical A anyway (the
+        # collective writer dedups replicas); LORRAX_CHECK_REPLICA=1
+        # re-arms the assertion.
         if not isinstance(A.sharding, NamedSharding) or A.sharding.mesh is not self.mesh:
-            A = jax.device_put(A, _replicated_sharding(self.mesh, A.ndim))
+            A = device_put_process_local(
+                A, _replicated_sharding(self.mesh, A.ndim))
 
         axis_count_per_dim, axis_flat = _sharding_to_axis_info(
             A.sharding, A.ndim)

@@ -29,6 +29,7 @@ from jax.sharding import Mesh, PartitionSpec, NamedSharding
 from jax.experimental.shard_map import shard_map
 
 from common import timing
+from common.collectives import device_put_process_local
 
 config.update("jax_enable_x64", True)
 
@@ -857,9 +858,17 @@ def weighted_kmeans_jax(
             centroids = positions[idx]
         centroids.block_until_ready()
 
-    # Set the sharding of the lloyd inputs in one pass.
+    # Set the sharding of the lloyd inputs in one pass.  NOT plain
+    # ``jax.device_put``: on a multi-process mesh that silently runs
+    # ``multihost_utils.assert_equal`` — a P-linear all-gather of the
+    # operand (scorecard AA.1) — and ``positions``/``rho_flat`` are the
+    # full FFT grid, the largest host arrays this driver touches.  Every
+    # input is a pure function of the WFN density + the seed, identical
+    # on every rank by construction; ``LORRAX_CHECK_REPLICA=1`` restores
+    # the assertion for a debugging run.
     def shard(x, *axes):
-        return jax.device_put(x, NamedSharding(mesh, PartitionSpec(*axes)))
+        return device_put_process_local(
+            x, NamedSharding(mesh, PartitionSpec(*axes)))
     positions = shard(positions, mesh_axis, None)
     rho_flat = shard(rho_flat, mesh_axis)
     metric_tensor = shard(metric_tensor)
