@@ -199,13 +199,13 @@ Reads `eps0mat.h5` / `epsmat.h5`. Used only by the `epshead` head source (`head_
 
 ### 2.7 `SlabIO` — `src/file_io/slab_io.py`
 
-Sharded HDF5 writer with three backends (selected by `SlabIOBackend` enum; the legacy `use_ffi_io: bool` setting maps to PHDF5_FFI/H5PY_ALLGATHER for back-compat):
+Sharded HDF5 writer with three backends (selected by `SlabIOBackend` enum; the deprecated `use_ffi_io: bool` kwarg/input-key is still coerced for back-compat):
 
-- `PHDF5_FFI` → `_slab_io_ffi.py` (parallel HDF5 via the phdf5 FFI). Each rank writes its own hyperslab via independent MPI-IO collective writes. Default on BOTH backends: the C++ core compiles into the CUDA lib and, under `LORRAX_FFI_NO_CUDA`, into the CUDA-free host lib, where the D2H staging collapses to an in-place read of the XLA host buffer (workstream AE).
+- `PHDF5_FFI` → `_slab_io_ffi.py` (parallel HDF5 via the phdf5 FFI). Each rank writes its own hyperslab; collective MPI-IO writes are the default (`LORRAX_PHDF5_COLLECTIVE_WRITES=0` reverts to independent — same knob, same default as the Python host writer since 2026-07-27), with rank-local replica dedup (`LORRAX_PHDF5_DEDUP_REPLICAS=0` disables). Available on BOTH backends: the C++ core compiles into the CUDA lib and, under `LORRAX_FFI_NO_CUDA`, into the CUDA-free host lib, where the D2H staging collapses to an in-place read of the XLA host buffer (workstream AE).
 - `PHDF5_HOST` → `_slab_io_mpi_host.py` (parallel HDF5 via mpi4py + h5py(parallel)). Same per-rank parallel-write semantics, driven from Python. Second CPU tier — for a host lib built without the write handler; needs the mpi4py overlay that the FFI path does not.
 - `H5PY_ALLGATHER` → `_slab_io_allgather.py` (all-gather to rank 0 then serial h5py). Last-resort fallback for systems without parallel HDF5; slow at scale, and the gather is the dominant collective in a large run.
 
-The `LorraxConfig.from_input_file` builder auto-routes `use_ffi_io=true`: PHDF5_FFI on GPU; on CPU `_route_cpu_slab_io` probes `ffi_loader.probe_target('lorrax_phdf5_write', 'cpu')` and picks PHDF5_FFI → PHDF5_HOST → H5PY_ALLGATHER, logging one line naming the tier and, on a demotion, the probe's reason.
+The `LorraxConfig.from_input_file` builder routes `slab_io = auto` (the default) UNCONDITIONALLY through a capability-probed router — no other input key gates it. On CPU, `_route_cpu_slab_io` probes `ffi_loader.probe_target('lorrax_phdf5_write', 'cpu')` and picks PHDF5_FFI → PHDF5_HOST (the tier-2 probe really runs `MPI_Init_thread`, so a PMI-mismatched harness demotes instead of dying) → H5PY_ALLGATHER. On GPU, `_route_gpu_slab_io` picks PHDF5_FFI when the CUDA lib exports the write handler and the run is single-node (cross-node GPU FFI is a known MPI bring-up failure — auto demotes with an announcement), else PHDF5_HOST/H5PY_ALLGATHER. Every decision is logged with the tier and, on a demotion, the probe's reason. The deprecated `use_ffi_io` input key: `false` forces H5PY_ALLGATHER (warned), `true` is a no-op, and it is ignored when `slab_io` is explicit.
 
 Used for `zeta_q.h5` and `V_qmunu.h5` (big files), and for `sigma_mnk.h5` via `write_sigma_omega_h5`.
 
@@ -298,7 +298,8 @@ WFN.h5 + WFNq.h5 + centroids_frac.h5 + (eps0mat.h5, dipole.h5 optional)
     │  WFNReader, SymMaps, load_centroids
     │  Meta.from_system, BandSlices.from_band_edges
     │  mesh_xy = _build_mesh()
-    │  if use_ffi_io: phdf5_init_mpi() (eager MPI_THREAD_MULTIPLE init)
+    │  if slab_io is PHDF5_FFI: phdf5_init_mpi() (eager MPI_THREAD_MULTIPLE init;
+    │                            PHDF5_HOST warms mpi4py the same way)
     │  ensure_jax_compile_cache()
     ▼
 ┌──────────────────────────────────────────────────────────────────────┐
