@@ -24,6 +24,14 @@ from typing import Any, Callable
 # jit call and so cannot carry a ``LoopProgress``.  Print-only; the
 # accumulated tree and the final report are byte-identical either way.
 # ``LORRAX_TIMING_TRACE_DEPTH`` caps nesting depth (default 3).
+#
+# Sections that must ALWAYS announce (env-independent stage cadence —
+# e.g. the screening phases, whose silence was paid for three times:
+# AC.2's 30-minute silent pzheevd, AF.4c's 2 h 55 m silent restart
+# write, the 2.5 h silent c2406 screening stage) pass
+# ``announce=True`` (optionally with a human ``label``) to
+# ``timing.section``.  Same formatting path, same rank-0 gate, no
+# depth cap — ONE cadence mechanism, not two.
 # ---------------------------------------------------------------------------
 _TRACE = os.environ.get("LORRAX_TIMING_TRACE", "0").strip().lower() in (
     "1", "true", "yes", "on")
@@ -31,10 +39,8 @@ _TRACE_DEPTH = int(os.environ.get("LORRAX_TIMING_TRACE_DEPTH", "3"))
 _TRACE_RANK0: bool | None = None
 
 
-def _trace_enabled(depth: int) -> bool:
+def _rank0() -> bool:
     global _TRACE_RANK0
-    if not _TRACE or depth > _TRACE_DEPTH:
-        return False
     if _TRACE_RANK0 is None:
         try:
             import jax
@@ -42,6 +48,12 @@ def _trace_enabled(depth: int) -> bool:
         except Exception:                                    # noqa: BLE001
             _TRACE_RANK0 = True
     return _TRACE_RANK0
+
+
+def _trace_enabled(depth: int) -> bool:
+    if not _TRACE or depth > _TRACE_DEPTH:
+        return False
+    return _rank0()
 
 
 def _trace(msg: str) -> None:
@@ -72,20 +84,36 @@ class TimingNode:
 
 
 class TimingSection:
-	__slots__ = ("collector", "node", "stack", "start", "child_elapsed", "_watchers")
+	__slots__ = ("collector", "node", "stack", "start", "child_elapsed",
+	             "_watchers", "announce", "label")
 
-	def __init__(self, collector: "TimingCollector", node: TimingNode, stack: list["TimingSection"]):
+	def __init__(self, collector: "TimingCollector", node: TimingNode,
+	             stack: list["TimingSection"], *, announce: bool = False,
+	             label: str | None = None):
 		self.collector = collector
 		self.node = node
 		self.stack = stack
 		self.start = 0.0
 		self.child_elapsed = 0.0
 		self._watchers: list[Callable[[], Any]] = []
+		# ``announce=True``: enter/exit lines are printed regardless of
+		# LORRAX_TIMING_TRACE (rank-0 only), through the SAME _trace
+		# formatter.  ``label`` replaces the node name in those lines
+		# (the tree/report always keeps the node name).
+		self.announce = announce
+		self.label = label
+
+	def _display_name(self) -> str:
+		return self.label if self.label else self.node.name
+
+	def _cadence_on(self) -> bool:
+		return (_trace_enabled(len(self.stack))
+		        or (self.announce and _rank0()))
 
 	def __enter__(self) -> "TimingSection":
 		self.stack.append(self)
-		if _trace_enabled(len(self.stack)):
-			_trace("  " * (len(self.stack) - 1) + f"-> {self.node.name}")
+		if self._cadence_on():
+			_trace("  " * (len(self.stack) - 1) + f"-> {self._display_name()}")
 		self.start = time.perf_counter()
 		self.child_elapsed = 0.0
 		self._watchers = []
@@ -100,9 +128,9 @@ class TimingSection:
 		exclusive = inclusive - self.child_elapsed
 		with self.collector._lock:
 			self.node.record(inclusive, max(0.0, exclusive))
-		if _trace_enabled(len(self.stack)):
+		if self._cadence_on():
 			_trace("  " * (len(self.stack) - 1)
-			       + f"<- {self.node.name}  {inclusive:.1f} s"
+			       + f"<- {self._display_name()}  {inclusive:.1f} s"
 			       + ("  [EXC]" if exc_type is not None else ""))
 		self.stack.pop()
 		if self.stack:
@@ -153,11 +181,12 @@ class TimingCollector:
 			setattr(self._local, "stack", stack)
 		return stack
 
-	def section(self, name: str) -> TimingSection:
+	def section(self, name: str, *, announce: bool = False,
+	            label: str | None = None) -> TimingSection:
 		stack = self._stack()
 		parent = stack[-1].node if stack else self._root
 		node = parent.child(name)
-		return TimingSection(self, node, stack)
+		return TimingSection(self, node, stack, announce=announce, label=label)
 
 	def timed(self, name: str | None = None, *, watch: bool = False) -> Callable:
 		def decorator(func: Callable) -> Callable:
@@ -237,8 +266,9 @@ def reset() -> None:
 	_GLOBAL_COLLECTOR.reset()
 
 
-def section(name: str) -> TimingSection:
-	return _GLOBAL_COLLECTOR.section(name)
+def section(name: str, *, announce: bool = False,
+            label: str | None = None) -> TimingSection:
+	return _GLOBAL_COLLECTOR.section(name, announce=announce, label=label)
 
 
 def timed(name: str | None = None, *, watch: bool = False) -> Callable:
