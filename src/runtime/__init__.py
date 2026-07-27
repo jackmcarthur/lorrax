@@ -312,8 +312,16 @@ def pin_gloo_interface() -> None:
 
     SCOPE — this is a transport (machine-capability) choice, never physics:
       * single-process runs: silent no-op (no collectives exist);
-      * GPU-platform runs (``JAX_PLATFORMS`` not exactly ``cpu``): silent
-        no-op (multi-process GPU uses NCCL, whose NIC selection is NCCL's);
+      * GPU-platform runs (``JAX_PLATFORMS`` not exactly ``cpu``): no-op
+        ONLY when a GPU is physically present (NCCL owns those
+        collectives).  On a GPU-less node a multi-platform list containing
+        ``cpu`` lands on the CPU backend anyway, so the pin engages —
+        measured (AT repin2 probe): the cuda plugin fails at DISCOVERY
+        time, not at backend init, so ``jax.devices()`` never raises and
+        waiting for the CPU fallback would be too late.  The fallback
+        (:func:`fallback_to_cpu_if_no_gpu_backend`) additionally re-runs
+        the pin on its raise-then-downgrade path, so a GPU-less node
+        cannot silently land its collectives on the management NIC;
       * no ``ib*``/``hsn*`` interface with an IPv4 found: announced no-op,
         stock jax behaviour;
       * jax internals moved / registration refused / bad interface at
@@ -334,8 +342,23 @@ def pin_gloo_interface() -> None:
 
     if _resolve_proc_count() <= 1:
         return                          # no cross-process collectives at all
-    if os.environ.get("JAX_PLATFORMS", "").strip().lower() != "cpu":
-        return                          # GPU path: collectives are NCCL's
+    plat = os.environ.get("JAX_PLATFORMS", "").strip().lower()
+    if plat != "cpu":
+        # A multi-platform value ("cuda,cpu" — the bootstrap(platform="gpu")
+        # default) on a node with NO physical GPU still lands on the CPU
+        # backend, and jax then builds its CPU Gloo collectives exactly as
+        # in a pure-cpu run — on the coordinator-route NIC.  MEASURED (AT
+        # repin2 probe, 2026-07-27): on Frontera CPU nodes the cuda plugin
+        # fails at DISCOVERY time (logged, never raised), jax.devices()
+        # succeeds on cpu without the RuntimeError the CPU fallback catches,
+        # so the fallback's re-pin never fires and a forgot-the-export
+        # launch silently rode em1.  Pin whenever "cpu" is in the platform
+        # list and no GPU is physically present; a node with a real GPU
+        # keeps the unchanged behaviour (NCCL owns GPU collectives, and the
+        # CPU backend there is not the collectives carrier).
+        cpu_in_list = "cpu" in [p.strip() for p in plat.split(",")]
+        if not (cpu_in_list and not _gpu_is_present()):
+            return                      # GPU path: collectives are NCCL's
 
     rank0 = _resolve_proc_id() == 0
 
@@ -422,8 +445,11 @@ def pin_gloo_interface() -> None:
              "runtime.pin_gloo_interface for this jax version.")
         return
 
-    _say(f"Gloo collectives pinned to {iface} ({addr}; {why}). The jax "
-         "default binds the coordinator-route NIC — em1, 1 GbE, on "
+    plat_note = "" if plat == "cpu" else (
+        f" [JAX_PLATFORMS={plat!r} with no GPU present: this run lands on "
+        f"the CPU backend]")
+    _say(f"Gloo collectives pinned to {iface} ({addr}; {why}).{plat_note} "
+         "The jax default binds the coordinator-route NIC — em1, 1 GbE, on "
          "Frontera compute nodes. Override/disable: LORRAX_GLOO_IFNAME.")
 
 
@@ -612,6 +638,19 @@ def fallback_to_cpu_if_no_gpu_backend() -> None:
     catastrophically-slow CPU run.  On downgrade we clear JAX_PLATFORM_NAME,
     force JAX_PLATFORMS=cpu, and drop any cached (failed) backend so the
     caller's next ``jax.devices()`` re-initialises cleanly on CPU.
+
+    The downgrade also RE-RUNS :func:`pin_gloo_interface` (workstream AT).
+    At bootstrap time the pin engages only for ``JAX_PLATFORMS=cpu`` or for
+    a platform list containing ``cpu`` on a GPU-less node; a value WITHOUT
+    ``cpu`` (``"gpu"``, ``"cuda"``) that raises here and downgrades would
+    otherwise continue with stock Gloo transport on the coordinator-route
+    NIC (em1, 1 GbE on Frontera: the 3.3x whole-pipeline penalty of
+    scorecard AK.10/AL), with nothing printed.  An environmental accident
+    must not silently change the wire under every collective
+    (quality-pattern #8).  After the downgrade the platform IS cpu and the
+    backend cache was just cleared, so factory re-registration is possible
+    again; every failure path inside the pin still degrades loudly to the
+    stock transport.
     """
     import jax
     caught = None
@@ -638,3 +677,8 @@ def fallback_to_cpu_if_no_gpu_backend() -> None:
         jax.clear_backends()
     except Exception:
         pass
+    # Re-arm the Gloo fabric pin now that the platform is CPU (see docstring).
+    # pin_gloo_interface self-guards (P<=1 / non-gloo impl / LORRAX_GLOO_IFNAME
+    # =off all keep it a no-op) and never raises past a printed warning.
+    os.environ.pop(_GLOO_PIN_SENTINEL, None)
+    pin_gloo_interface()

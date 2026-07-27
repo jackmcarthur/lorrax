@@ -816,7 +816,23 @@ def ensure_jax_compile_cache() -> None:
         base_cache = os.environ.get(
             "XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
         cache_dir = os.path.join(base_cache, "isdf_jax_compilation")
+    else:
+        # A whitespace-only value is the ""-opt-out, not a real path.
+        cache_dir = cache_dir.strip()
     if not cache_dir:  # explicit opt-out via ISDF_JAX_CACHE_DIR=""
+        # Announce the opt-out (workstream AT).  This used to be silent, and
+        # the production harnesses kept exporting ISDF_JAX_CACHE_DIR="" for a
+        # reason that STOPPED being true when the AH agreement layer landed
+        # ("the shared cache deadlocks at P>1" — it no longer can, by
+        # construction).  An env var that silently disables a measured win is
+        # exactly the env-coupled-behavior class (quality-pattern #8): say it
+        # once, on rank 0, so a stale harness line is visible in every log.
+        if proc_idx == 0:
+            _say(f"persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" "
+                 f"opt-out): every rank compiles every module, every run. "
+                 f"Safe at any P since the AH agreement layer; to enable, "
+                 f"point ISDF_JAX_CACHE_DIR at $SCRATCH (small files — "
+                 f"/home1 would eat its inode quota).")
         return
 
     # ---- back-compat escape hatch: the scorecard-AG refusal --------------
