@@ -36,6 +36,8 @@ def write_restart_state_to_h5(
     n_rmu_logical: int,
     V_qmunu=None,
     psi_full_y=None,
+    psi_full_y_transverse=None,
+    n_rmu_transverse_logical: int | None = None,
     enk_full=None,
     S_qmunu=None,
     V0_noG0_munu=None,
@@ -71,6 +73,14 @@ def write_restart_state_to_h5(
     False so downstream readers (bse_io) know to treat it as a
     placeholder.  Passing ``W0_qmunu`` directly flips ``W0_ready`` to
     True.
+
+    ``psi_full_y_transverse`` (bispinor only) is the σ^B-side ψ sampled
+    at the TRANSVERSE centroid set — the per-channel second ψ dataset
+    the bispinor restart round-trip needs.  Its μ axis is clipped by
+    ``n_rmu_transverse_logical`` (the transverse centroid count, which
+    differs from the charge ``n_rmu_logical``); the same attr is stamped
+    so ``load_restart_state_from_h5`` can re-pad and the restart guard
+    can compare it against the run's ``centroids_file_current``.
     """
     from .slab_io import SlabIO
 
@@ -139,6 +149,32 @@ def write_restart_state_to_h5(
         _write("G0_mu_nu",     G0_mu_nu,     mu_axes=(-1,))
         _write("psi_full_y",   psi_full_y,   mu_axes=(-1,))
         _write("enk_full",     enk_full)
+
+        # Bispinor per-channel ψ: μ axis clipped to the TRANSVERSE
+        # logical extent (its own centroid count, not n_rmu_logical).
+        if psi_full_y_transverse is not None:
+            if n_rmu_transverse_logical is None:
+                raise ValueError(
+                    "write_restart_state_to_h5: psi_full_y_transverse "
+                    "requires n_rmu_transverse_logical (the transverse "
+                    "centroid count) to clip its μ axis on disk.")
+            n_T = int(n_rmu_transverse_logical)
+            shape_T = _mu_logical_shape(
+                psi_full_y_transverse.shape, (-1,), n_T)
+            _t0 = _time.time()
+            io.create_dataset("psi_full_y_transverse", shape=shape_T,
+                              dtype=psi_full_y_transverse.dtype)
+            io.write_slab("psi_full_y_transverse", psi_full_y_transverse,
+                          global_shape=shape_T, valid_shape=shape_T)
+            io.write_attr("n_rmu_transverse_logical", np.int64(n_T))
+            if _wlog and _rank0:
+                _nb = (int(np.prod(shape_T))
+                       * int(np.dtype(psi_full_y_transverse.dtype).itemsize))
+                _dt = _time.time() - _t0
+                print(f"  [restart_write] psi_full_y_transverse "
+                      f"{tuple(int(v) for v in shape_T)}"
+                      f" {_nb / 1e9:.2f} GB in {_dt:.1f} s"
+                      f" ({_nb / 1e6 / max(_dt, 1e-9):.0f} MB/s)", flush=True)
 
         # W0_qmunu: either write the real data or pre-allocate an
         # all-zeros placeholder.
@@ -315,8 +351,15 @@ def read_restart_state_from_h5(filename):
         G0_mu_nu = jnp.asarray(f["G0_mu_nu"][:]) if "G0_mu_nu" in f else None
         psi_full_y = jnp.asarray(f["psi_full_y"][:])
         enk_full = jnp.asarray(f["enk_full"][:]) if "enk_full" in f else None
+        # Bispinor per-channel ψ (transverse centroid set) — optional;
+        # absent in scalar restarts and in bispinor restarts written
+        # before 2026-07-27.
+        psi_full_y_transverse = (
+            jnp.asarray(f["psi_full_y_transverse"][:])
+            if "psi_full_y_transverse" in f else None)
 
-    return V_qmunu, S_qmunu, psi_full_y, enk_full, V0_noG0_munu, G0_mu_nu
+    return (V_qmunu, S_qmunu, psi_full_y, enk_full, V0_noG0_munu, G0_mu_nu,
+            psi_full_y_transverse)
 
 
 def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
@@ -341,7 +384,8 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
     # Loud-fail BEFORE any tensor is trusted (see the function's docstring).
     assert_restart_window_matches(filename, band_slices=band_slices,
                                   n_rmu_logical=n_rmu_logical)
-    V_qmunu, S_qmunu, psi_full_y_raw, enk_full, V0_noG0_munu, G0_mu_nu = read_restart_state_from_h5(filename)
+    (V_qmunu, S_qmunu, psi_full_y_raw, enk_full, V0_noG0_munu, G0_mu_nu,
+     psi_full_y_T_raw) = read_restart_state_from_h5(filename)
 
     # V_qmunu is now flat-q ``(nq, μ, μ)``.  Earlier formats had leading
     # ``(1, npol, npol)`` axes (and even earlier, the ``(nkx, nky, nkz)``
@@ -408,10 +452,33 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
     if enk_full is not None:
         enk_full = jax.lax.with_sharding_constraint(enk_full, replicated_2)
 
+    # Bispinor transverse ψ (optional): same re-pad + two-copy derivation
+    # as the charge ψ, at the TRANSVERSE μ extent (its own centroid
+    # count, its own pad).
+    psi_rmu_Y_T = psi_rmuT_X_T = None
+    n_rmu_T_disk = None
+    if psi_full_y_T_raw is not None:
+        n_rmu_T_disk = int(psi_full_y_T_raw.shape[-1])
+        mu_pad_T = (padded_mu_extent(n_rmu_T_disk, int(jax.device_count()))
+                    - n_rmu_T_disk)
+        if mu_pad_T > 0:
+            psi_full_y_T_raw = jnp.pad(
+                psi_full_y_T_raw,
+                [(0, 0)] * (psi_full_y_T_raw.ndim - 1) + [(0, mu_pad_T)])
+        psi_rmu_Y_T = jax.lax.with_sharding_constraint(
+            psi_full_y_T_raw, y3_psi_Y)
+        psi_rmuT_X_T = jax.lax.with_sharding_constraint(
+            jnp.conj(psi_rmu_Y_T).transpose(0, 3, 1, 2),
+            x1_psi_X,
+        )
+
     return SimpleNamespace(
         V_qmunu=V_qmunu, S_qmunu=S_qmunu, V0_noG0_munu=V0_noG0_munu,
         G0_mu_nu=G0_mu_nu, enk_full=enk_full,
         psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
+        psi_rmu_Y_transverse=psi_rmu_Y_T,
+        psi_rmuT_X_transverse=psi_rmuT_X_T,
+        n_rmu_transverse_disk=n_rmu_T_disk,
     )
 
 

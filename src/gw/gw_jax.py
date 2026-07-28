@@ -263,10 +263,27 @@ def main(argv=None):
 	# samples ψ at the transverse-centroid Wfns bundle (None when
 	# bispinor=False or centroids_file_current is unset).
 	wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
+	# LOUD guard (quality pattern #7): the Σ kernels' Σ^B fold-in is a
+	# structural no-op when ``wfns_transverse``/``bispinor_v_q_path`` is
+	# None — a bispinor run reaching Σ without them would exit rc=0 with
+	# Σ^B silently dropped.  Both producer paths (fit + restart) raise
+	# with specifics before this point; this is the last-line invariant.
+	if config.bispinor and wfns_transverse is None:
+		raise RuntimeError(
+			"bispinor = true but no transverse-centroid Wfns bundle was "
+			"produced (Σ^B would be silently dropped).  Check "
+			"centroids_file_current and, on restart, that the restart "
+			"file carries psi_full_y_transverse.")
 	bispinor_v_q_path = (
 		os.path.join(tmp_dir, 'v_q_bispinor.h5')
 		if wfns_transverse is not None else None
 	)
+	if bispinor_v_q_path is not None and not os.path.exists(bispinor_v_q_path):
+		raise RuntimeError(
+			f"bispinor: {bispinor_v_q_path} is missing.  The V^{{i,j}} "
+			f"tile file is written by the non-restart pipeline "
+			f"(compute_V_q); on restart it must still be present in "
+			f"tmp/.  Rerun with restart = false to regenerate it.")
 
 	# ---- Screening: χ₀ → W = (1 − Vχ)⁻¹ V at every ω the Σ scheme needs ----
 	# X_ONLY requests no screening at all.

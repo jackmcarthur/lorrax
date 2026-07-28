@@ -125,3 +125,82 @@ def test_restart_mu_pad_roundtrip(tmp_path, monkeypatch):
     np.testing.assert_array_equal(
         np.asarray(rs_log.V_qmunu), V[:, :N_LOG, :N_LOG])
     np.testing.assert_array_equal(np.asarray(rs_log.G0_mu_nu), G0[:N_LOG])
+    # Scalar restart: no transverse channel on disk → None fields.
+    assert rs_log.psi_rmu_Y_transverse is None
+    assert rs_log.psi_rmuT_X_transverse is None
+    assert rs_log.n_rmu_transverse_disk is None
+
+
+def test_restart_transverse_psi_roundtrip(tmp_path, monkeypatch):
+    """Bispinor per-channel ψ round-trip: the TRANSVERSE dataset has its
+    own (smaller) logical μ extent, its own disk clip, and its own
+    re-pad on read — independent of the charge ``n_rmu_logical``."""
+    import h5py
+    from file_io import (
+        load_restart_state_from_h5,
+        write_restart_state_to_h5,
+    )
+
+    N_LOG_T = 5          # transverse centroid count (≠ N_LOG, non-dividing)
+    NS_T = 4             # bispinor-lifted spinor components
+
+    mesh = _mesh_1x1()
+    rng = np.random.default_rng(20260727)
+    V, G0, psi, enk, _ = _padded_state(rng)
+
+    def _c(*shape):
+        return (rng.standard_normal(shape)
+                + 1j * rng.standard_normal(shape)).astype(np.complex128)
+
+    psi_T = _c(NK, NB, NS_T, N_LOG_T + MU_PAD)
+    psi_T[..., N_LOG_T:] = 0.0
+
+    path = str(tmp_path / "isdf_tensors_bispinor_test.h5")
+    monkeypatch.delenv("LORRAX_EXTRA_MU_PAD", raising=False)
+    write_restart_state_to_h5(
+        path, n_rmu_logical=N_LOG,
+        V_qmunu=jnp.asarray(V), G0_mu_nu=jnp.asarray(G0),
+        enk_full=jnp.asarray(enk),
+        mesh=mesh, mode="w", kgrid=(NQ, 1, 1),
+    )
+    # The gw_init call pattern: charge ψ + transverse ψ in one append.
+    write_restart_state_to_h5(
+        path, n_rmu_logical=N_LOG,
+        psi_full_y=jnp.asarray(psi),
+        psi_full_y_transverse=jnp.asarray(psi_T),
+        n_rmu_transverse_logical=N_LOG_T,
+        mesh=mesh, mode="a",
+    )
+
+    # Disk contract: transverse μ extent is its OWN logical count.
+    with h5py.File(path, "r") as f:
+        assert f["psi_full_y"].shape == (NK, NB, NS, N_LOG)
+        assert f["psi_full_y_transverse"].shape == (NK, NB, NS_T, N_LOG_T)
+        np.testing.assert_array_equal(
+            f["psi_full_y_transverse"][:], psi_T[..., :N_LOG_T])
+        assert int(np.asarray(f["n_rmu_transverse_logical"])[()]) == N_LOG_T
+
+    # Forced pad on read: transverse ψ re-pads at its own extent.
+    monkeypatch.setenv("LORRAX_EXTRA_MU_PAD", str(MU_PAD))
+    rs = load_restart_state_from_h5(path, mesh)
+    assert rs.n_rmu_transverse_disk == N_LOG_T
+    np.testing.assert_array_equal(
+        np.asarray(rs.psi_rmu_Y_transverse), psi_T)
+    np.testing.assert_array_equal(
+        np.asarray(rs.psi_rmuT_X_transverse),
+        np.conj(psi_T).transpose(0, 3, 1, 2))
+
+    # No pad: logical extent untouched.
+    monkeypatch.delenv("LORRAX_EXTRA_MU_PAD", raising=False)
+    rs_log = load_restart_state_from_h5(path, mesh)
+    assert rs_log.psi_rmu_Y_transverse.shape == (NK, NB, NS_T, N_LOG_T)
+    np.testing.assert_array_equal(
+        np.asarray(rs_log.psi_rmu_Y_transverse), psi_T[..., :N_LOG_T])
+
+    # Contract guard: the transverse dataset REQUIRES its logical count.
+    with pytest.raises(ValueError, match="n_rmu_transverse_logical"):
+        write_restart_state_to_h5(
+            path, n_rmu_logical=N_LOG,
+            psi_full_y_transverse=jnp.asarray(psi_T),
+            mesh=mesh, mode="a",
+        )
