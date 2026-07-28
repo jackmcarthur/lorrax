@@ -416,7 +416,15 @@ def main(argv=None):
 	# is added on top.  A silent disagreement here lands as tens of eV in
 	# a ~500 eV cancellation, so it is checked loudly, once.
 	from file_io import validate_kin_ion_against_run
-	kin_ion_attrs = validate_kin_ion_against_run(
+	# Called for its gate side effect only: it RAISES on any provenance
+	# disagreement and prints the file's V_H storage summary.  The returned
+	# attrs dict is deliberately not bound — the V_H routing this run
+	# actually uses is re-resolved from the file by resolve_hartree_source
+	# below, and it is THAT resolution (hartree_source /
+	# kin_ion_has_hartree) which flows into the GWResults output
+	# provenance (release audit 2026-07-28: the previous ``kin_ion_attrs``
+	# binding was dead).
+	validate_kin_ion_against_run(
 		config.paths.kin_ion_file,
 		sys_dim=config.sys_dim,
 		nk=meta.nk_tot,

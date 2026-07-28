@@ -424,15 +424,24 @@ if __name__ == "__main__":
             kpm_argv += ["--emin-ev", str(args.kpm_emin_ev)]
         if args.kpm_emax_ev is not None:
             kpm_argv += ["--emax-ev", str(args.kpm_emax_ev)]
-        # Propagate the sub-driver's exit code instead of hardcoding 0:
-        # delegating used to launder any failure it reported into rc 0.
-        raise SystemExit(bse_kpm.main(kpm_argv) or 0)
+        # rc propagation is STRUCTURAL here: ``bse_kpm.main`` is ``-> None``
+        # and never returns a status code — argparse errors raise
+        # SystemExit(2) and any runtime failure raises out of ``main()``
+        # (nothing in it catches-and-returns), so a non-zero exit rides the
+        # exception past this line.  Reaching the line below means success.
+        # (A previous comment claimed ``main() or 0`` propagated a returned
+        # rc; with a None-returning delegate that expression was always 0 —
+        # release audit 2026-07-28.)
+        bse_kpm.main(kpm_argv)
+        raise SystemExit(0)
 
     if not args.lanczos:
         from . import bse_feast
 
         use_rpa = args.rpa or not args.bse
-        _feast_rc = bse_feast.main(
+        # rc propagation is structural, exactly as in the kpm branch above:
+        # ``bse_feast.main`` is ``-> None`` and signals failure by raising.
+        bse_feast.main(
             [
                 "-i",
                 args.input,
@@ -493,8 +502,7 @@ if __name__ == "__main__":
                 ),
             ]
         )
-        # Propagate the sub-driver's exit code (see the kpm branch above).
-        raise SystemExit(_feast_rc or 0)
+        raise SystemExit(0)
 
     # Non-TDA (full BSE) now flows through the same preview via the
     # ``solve_bse_sharded(tda=False)`` dispatch -> ``bse_nontda`` (structure-

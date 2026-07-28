@@ -160,6 +160,39 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int], nk_tot: int
 # Static head addition — q→0 band-diagonal head correction for COHSEX.
 # ---------------------------------------------------------------------------
 
+def _replicate_head(head_kij, mesh_xy: Mesh):
+    """Replicate a q→0 head matrix (nk, nb_sigma, nb_sigma) on the mesh.
+
+    Shared by all four head placement sites (SX/COH in
+    :func:`_add_static_head`; bare-X in :func:`compute_cohsex_sigma` and
+    :func:`compute_v_h_sigma_x`).  Two concerns, in order:
+
+    1. The q→0 head is a GLOBAL correction and must be bit-identical on
+       every process.  On the full-BZ fallback path (e.g. a centroid set
+       whose orbit closure fails) each rank can compute it with
+       roundoff-level (~1e-19) divergence, so rank 0's copy is broadcast
+       first.  No-op single-process, and a value no-op when the ranks
+       already agree (the IBZ cascade path).
+    2. Placement uses ``device_put_process_local``, NOT a bare
+       ``jax.device_put``: on a multi-process replicated sharding the
+       latter silently runs multihost ``assert_equal`` — a P-linear
+       all-gather of the (nk, nb_sigma, nb_sigma) complex128 operand
+       (scorecard AA.1/Y.5).  Post-broadcast bit-identity is exactly
+       device_put_process_local's documented precondition;
+       LORRAX_CHECK_REPLICA=1 restores the assertion.  (AO-sweep
+       stragglers: the bare-X sites had neither the broadcast nor the
+       process-local placement, and _add_static_head paid the assert
+       all-gather on top of its broadcast — consolidated here, release
+       audit 2026-07-28.)
+    """
+    if jax.process_count() > 1:
+        from jax.experimental import multihost_utils
+        head_kij = multihost_utils.broadcast_one_to_all(head_kij)
+    from common.collectives import device_put_process_local
+    return device_put_process_local(
+        head_kij, NamedSharding(mesh_xy, P(None, None, None)))
+
+
 def _add_static_head(sig_sx, sig_coh, *, static_head_terms, meta, mesh_xy,
                      do_screened: bool):
     """Add the q→0 head correction to SX/COH (no-op if terms is None)."""
@@ -169,20 +202,8 @@ def _add_static_head(sig_sx, sig_coh, *, static_head_terms, meta, mesh_xy,
         static_head_terms, nk_tot=meta.nk_tot, do_screened=do_screened)
     if not do_screened:
         coh_h = jnp.zeros_like(coh_h)
-    # The q->0 head is a GLOBAL correction and must be bit-identical on every
-    # process before the replicated device_put below — JAX asserts equality of
-    # a replicated value across processes.  On the full-BZ fallback path (e.g.
-    # a centroid set whose orbit closure fails) each rank can compute it with
-    # roundoff-level (~1e-19) divergence, tripping that assert.  Broadcast
-    # rank 0's copy to enforce consistency.  No-op single-process, and a no-op
-    # when the ranks already agree (the IBZ cascade path).
-    if jax.process_count() > 1:
-        from jax.experimental import multihost_utils
-        sx_h = multihost_utils.broadcast_one_to_all(sx_h)
-        coh_h = multihost_utils.broadcast_one_to_all(coh_h)
-    rep = NamedSharding(mesh_xy, P(None, None, None))
-    return (sig_sx + jax.device_put(sx_h, rep),
-            sig_coh + jax.device_put(coh_h, rep))
+    return (sig_sx + _replicate_head(sx_h, mesh_xy),
+            sig_coh + _replicate_head(coh_h, mesh_xy))
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +293,10 @@ def compute_cohsex_sigma(
         if static_head_terms is not None:
             x_head, _ = static_head_terms_to_kij(
                 static_head_terms, nk_tot=meta.nk_tot, do_screened=False)
-            sig_x = sig_x + jax.device_put(x_head, rep)
+            # Broadcast + process-local replication — same per-rank
+            # roundoff-divergence risk and hidden-assert cost as the SX/COH
+            # heads; see _replicate_head.
+            sig_x = sig_x + _replicate_head(x_head, mesh_xy)
         sig_x = jax.lax.with_sharding_constraint(sig_x, rep)
         sig_x.block_until_ready()
 
@@ -351,7 +375,10 @@ def compute_v_h_sigma_x(
     if static_head_terms is not None:
         x_head, _ = static_head_terms_to_kij(
             static_head_terms, nk_tot=meta.nk_tot, do_screened=False)
-        sig_x = sig_x + jax.device_put(x_head, rep)
+        # Broadcast + process-local replication — same per-rank roundoff-
+        # divergence risk and hidden-assert cost as the SX/COH heads; see
+        # _replicate_head.  This is the X_ONLY/PPM production entry.
+        sig_x = sig_x + _replicate_head(x_head, mesh_xy)
         sig_x = jax.lax.with_sharding_constraint(sig_x, rep)
         sig_x.block_until_ready()
 

@@ -43,6 +43,20 @@ import subprocess
 
 _DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
 
+# Canonical LORRAX boolean grammar for env knobs — ONE token set, case- and
+# whitespace-insensitive, shared by every knob in this module.  Before the
+# consolidation (release audit 2026-07-28) LORRAX_MALLOC_TUNE,
+# LORRAX_FAILFAST and the LORRAX_GLOO_IFNAME disable check each parsed a
+# different subset, so e.g. LORRAX_MALLOC_TUNE=OFF (or "False", "no", " 0 ")
+# silently left the tuning ENABLED — the falsy-parse bug class this
+# workstream had already fixed once for LORRAX_CHECK_REPLICA.
+_FALSY_TOKENS = ("", "0", "false", "no", "off")
+
+
+def _env_falsy(name: str, default: str = "1") -> bool:
+    """True when env knob ``name`` parses as falsy ('', 0, false, no, off)."""
+    return os.environ.get(name, default).strip().lower() in _FALSY_TOKENS
+
 __all__ = [
     "bootstrap",
     "set_default_env",
@@ -109,8 +123,7 @@ def install_failfast_excepthook() -> None:
     and ``os._exit`` would suppress useful teardown).  Opt out with
     ``LORRAX_FAILFAST=0``.
     """
-    if os.environ.get("LORRAX_FAILFAST", "1").strip().lower() in (
-            "0", "off", "false", "no"):
+    if _env_falsy("LORRAX_FAILFAST"):
         return
     if _resolve_proc_count() <= 1:
         return
@@ -177,7 +190,11 @@ _M_MMAP_THRESHOLD = -3
 
 def tune_glibc_malloc() -> bool:
     """Pin glibc's mmap/trim thresholds so freed XLA:CPU transients go back
-    to the OS.  Returns True when the tuning was applied.
+    to the OS.  Returns True when the tuning was applied; every path that
+    leaves it unapplied (opt-out, missing libc/mallopt, mallopt rejecting
+    the value) announces itself on rank 0 — this tuning is a load-bearing
+    OOM mitigation, and a guard that matters must say when it is not in
+    force (QUALITY_PATTERNS #5/#7).
 
     WHY (workstream T, measured on Frontera).  XLA:CPU allocates and frees
     every intermediate through plain ``malloc``/``free``.  glibc's mmap
@@ -208,8 +225,14 @@ def tune_glibc_malloc() -> bool:
     Knobs: ``LORRAX_MALLOC_TUNE=0`` disables; ``LORRAX_MALLOC_MMAP_MB`` /
     ``LORRAX_MALLOC_TRIM_MB`` override the thresholds (MB).
     """
-    if os.environ.get("LORRAX_MALLOC_TUNE", "1") in ("0", "off", "false"):
+    if _env_falsy("LORRAX_MALLOC_TUNE"):
+        if _resolve_proc_id() == 0:
+            print("[runtime] glibc malloc tuning DISABLED by "
+                  "LORRAX_MALLOC_TUNE: long XLA:CPU runs regain the "
+                  "per-r-chunk RSS ramp this tuning removes (workstream T).",
+                  flush=True)
         return False
+    reason = None
     try:
         import ctypes
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -217,9 +240,24 @@ def tune_glibc_malloc() -> bool:
         trim_mb = int(os.environ.get("LORRAX_MALLOC_TRIM_MB", "128"))
         ok = libc.mallopt(_M_MMAP_THRESHOLD, mmap_mb * 1024 * 1024)
         ok &= libc.mallopt(_M_TRIM_THRESHOLD, trim_mb * 1024 * 1024)
-        return bool(ok)
-    except Exception:
+        if not ok:
+            reason = "mallopt() returned 0 (threshold value rejected)"
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+    if reason is not None:
+        # This is the load-bearing mitigation for the +GB/rank/r-chunk RSS
+        # ramp that killed jobs 7874803/7875070/7875071 with std::bad_alloc
+        # (workstream T).  It used to fail silently here — a run whose OOM
+        # guard never armed left zero log evidence (release audit
+        # 2026-07-28).  Rank 0 speaks: glibc/mallopt behaviour is uniform
+        # across the ranks of one homogeneous job.
+        if _resolve_proc_id() == 0:
+            print(f"[runtime] WARNING: glibc malloc tuning NOT applied "
+                  f"({reason}); expect the RSS ramp on long CPU runs that "
+                  f"OOM-killed jobs 7874803/7875070/7875071 — see "
+                  f"workstream T.", flush=True)
         return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +265,10 @@ def tune_glibc_malloc() -> bool:
 # ---------------------------------------------------------------------------
 
 _GLOO_PIN_SENTINEL = "_LORRAX_GLOO_PIN_DONE"
+
+# LORRAX_GLOO_IFNAME values that mean "do not pin" — the canonical falsy
+# grammar plus the historical "none" spelling.
+_GLOO_DISABLE_TOKENS = _FALSY_TOKENS + ("none",)
 
 # High-speed-fabric name patterns, in preference order: InfiniBand (Frontera
 # ib0), then Cray Slingshot (Perlmutter hsn0).  Machine capability, not
@@ -322,8 +364,8 @@ def pin_gloo_interface() -> None:
         (:func:`fallback_to_cpu_if_no_gpu_backend`) additionally re-runs
         the pin on its raise-then-downgrade path, so a GPU-less node
         cannot silently land its collectives on the management NIC;
-      * no ``ib*``/``hsn*`` interface with an IPv4 found: announced no-op,
-        stock jax behaviour;
+      * no ``ib*``/``hsn*`` interface with an IPv4 found: rank-tagged
+        warning from every affected rank, stock jax behaviour;
       * jax internals moved / registration refused / bad interface at
         collectives-construction time: LOUD warning, stock behaviour —
         degrade, never crash and never hang.  (A pinned interface with no
@@ -331,14 +373,25 @@ def pin_gloo_interface() -> None:
         connect timeout — an exception the failfast hook turns into a job
         exit, not a hang; ``LORRAX_GLOO_IFNAME=off`` is the escape hatch.)
 
-    Override: ``LORRAX_GLOO_IFNAME=<name>`` forces the interface,
-    ``off``/``none``/``0`` disables the pin.  Either way the decision is
-    announced on rank 0 — an env var that silently changed the wire under
-    every collective would violate quality-pattern #8.
+    Override: ``LORRAX_GLOO_IFNAME=<name>`` forces the interface;
+    ``off``/``none``/``0``/``false``/``no``/empty disables the pin.  Every
+    decision is announced — an env var that silently changed the wire under
+    every collective would violate quality-pattern #8.  Success banners and
+    env-driven no-ops print once from rank 0; demotions and failures print
+    from the AFFECTED rank, rank-tagged, on stderr, because NIC state is
+    per-node and a rank-0-only gate would hide a rank-asymmetric fallback
+    to the management NIC (standing doctrine #3).
     """
-    if os.environ.get(_GLOO_PIN_SENTINEL):
+    # PID-keyed idempotency: a plain env sentinel is INHERITED by child
+    # processes (subprocess with env=os.environ.copy() — the tests/harness.py
+    # launch pattern), so a child LORRAX CLI spawned from a bootstrapped
+    # parent would silently skip its own pin and ride the management NIC —
+    # the exact regression the pin exists to prevent.  Keying the value on
+    # the setter's PID keeps within-process idempotency while making an
+    # inherited sentinel ignorable (release audit 2026-07-28).
+    if os.environ.get(_GLOO_PIN_SENTINEL) == str(os.getpid()):
         return
-    os.environ[_GLOO_PIN_SENTINEL] = "1"
+    os.environ[_GLOO_PIN_SENTINEL] = str(os.getpid())
 
     if _resolve_proc_count() <= 1:
         return                          # no cross-process collectives at all
@@ -358,13 +411,42 @@ def pin_gloo_interface() -> None:
         # CPU backend there is not the collectives carrier).
         cpu_in_list = "cpu" in [p.strip() for p in plat.split(",")]
         if not (cpu_in_list and not _gpu_is_present()):
-            return                      # GPU path: collectives are NCCL's
+            # GPU path: collectives are NCCL's.  An explicit
+            # LORRAX_GLOO_IFNAME override cannot be honored here — an
+            # explicit request that is not honored must be acknowledged
+            # with the reason, not silently no-op'd (standing doctrine #3;
+            # release audit 2026-07-28).
+            override = os.environ.get("LORRAX_GLOO_IFNAME")
+            if (override is not None
+                    and override.strip().lower() not in _GLOO_DISABLE_TOKENS
+                    and _resolve_proc_id() == 0):
+                print(f"[runtime] LORRAX_GLOO_IFNAME={override.strip()!r} "
+                      f"IGNORED: GPU run (JAX_PLATFORMS={plat!r}, GPU "
+                      "present), so NCCL owns the collectives and the Gloo "
+                      "interface pin is out of scope.  The override applies "
+                      "only to CPU-collectives runs.", flush=True)
+            return
 
-    rank0 = _resolve_proc_id() == 0
+    rank = _resolve_proc_id()
+    rank0 = rank == 0
 
-    def _say(msg: str) -> None:
+    def _announce(msg: str) -> None:
+        # Success banners and env-driven no-op decisions, uniform across the
+        # job by construction: one line from rank 0 is enough.
         if rank0:
             print(f"[runtime] {msg}", flush=True)
+
+    def _warn(msg: str) -> None:
+        # Demotions and failures.  NIC state is per-NODE and jax-internals
+        # failures are per-process, so the AFFECTED rank speaks, rank-tagged,
+        # on stderr.  The previous rank-0-only gate here meant a rank whose
+        # ib0 was down silently fell back to the em1 management NIC while its
+        # peers pinned ib0 — a rank-asymmetric transport demotion with
+        # nothing printed anywhere (release audit 2026-07-28; standing
+        # doctrine #3: 'auto' may demote but must announce, from the rank it
+        # happens on).
+        import sys
+        print(f"[runtime] rank {rank}: {msg}", file=sys.stderr, flush=True)
 
     # Non-Gloo CPU collectives (JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi):
     # the wrapped factory below would forward untouched anyway (it builds
@@ -376,35 +458,38 @@ def pin_gloo_interface() -> None:
     _impl = os.environ.get(
         "JAX_CPU_COLLECTIVES_IMPLEMENTATION", "gloo").strip().lower()
     if _impl and _impl != "gloo":
-        _say(f"Gloo interface pin: no-op (CPU collectives implementation "
-             f"is {_impl!r}, not gloo; its transport is Intel MPI's — see "
-             "FI_PROVIDER/LORRAX_MPI_PROVIDER).")
+        _announce(f"Gloo interface pin: no-op (CPU collectives "
+                  f"implementation is {_impl!r}, not gloo; its transport is "
+                  "Intel MPI's — see FI_PROVIDER/LORRAX_MPI_PROVIDER).")
         return
 
     override = os.environ.get("LORRAX_GLOO_IFNAME")
-    if override is not None and override.strip().lower() in (
-            "off", "none", "0", ""):
-        _say("Gloo interface pin DISABLED by LORRAX_GLOO_IFNAME="
-             f"{override!r}: jax default transport (binds the NIC that "
-             "routes to the coordinator — the 1 GbE management NIC on "
-             "Frontera).")
+    if override is not None and (
+            override.strip().lower() in _GLOO_DISABLE_TOKENS):
+        _announce("Gloo interface pin DISABLED by LORRAX_GLOO_IFNAME="
+                  f"{override!r}: jax default transport (binds the NIC that "
+                  "routes to the coordinator — the 1 GbE management NIC on "
+                  "Frontera).")
         return
 
     if override is not None:
         iface = override.strip()
         addr = _iface_ipv4(iface)
         if addr is None or not _iface_is_up(iface):
-            _say(f"WARNING: LORRAX_GLOO_IFNAME={iface!r} is not an UP "
-                 "interface with an IPv4 on this node — Gloo interface pin "
-                 "SKIPPED, stock jax transport (likely the 1 GbE management "
-                 "NIC).")
+            _warn(f"WARNING: LORRAX_GLOO_IFNAME={iface!r} is not an UP "
+                  "interface with an IPv4 on this node — Gloo interface pin "
+                  "SKIPPED on this rank, stock jax transport (likely the "
+                  "1 GbE management NIC).")
             return
         why = "LORRAX_GLOO_IFNAME override"
     else:
         found = _detect_fabric_iface()
         if found is None:
-            _say("Gloo interface: jax default (no UP ib*/hsn* interface "
-                 "with an IPv4 found on this node).")
+            # Per-node condition (a peer's node may well have an UP fabric
+            # NIC), so this demotion is announced by every affected rank.
+            _warn("Gloo interface: DEMOTED to the jax default transport — "
+                  "no UP ib*/hsn* interface with an IPv4 found on this "
+                  "node (the default binds the coordinator-route NIC).")
             return
         iface, addr = found
         why = "auto-detected high-speed fabric"
@@ -429,28 +514,32 @@ def pin_gloo_interface() -> None:
                         interface=iface,
                     )
                 except Exception as exc:
-                    _say(f"WARNING: could not build Gloo collectives on "
-                         f"{iface!r} ({type(exc).__name__}: {exc}); falling "
-                         "back to the stock transport.")
+                    # Per-rank failure: THIS rank falls back while its peers
+                    # may pin — must be visible from the affected rank.
+                    _warn(f"WARNING: could not build Gloo collectives on "
+                          f"{iface!r} ({type(exc).__name__}: {exc}); this "
+                          "rank falls back to the stock transport (the "
+                          "coordinator-route NIC).")
                     collectives = None
             return _stock_make_cpu_client(collectives)
 
         _xb.register_backend_factory(
             "cpu", _pinned_cpu_client, priority=0, fail_quietly=False)
     except Exception as exc:
-        _say(f"WARNING: Gloo interface pin unavailable "
-             f"({type(exc).__name__}: {exc}) — jax internals moved or the "
-             "backend is already initialized; stock jax transport (on "
-             "Frontera that is the 1 GbE management NIC). Update "
-             "runtime.pin_gloo_interface for this jax version.")
+        _warn(f"WARNING: Gloo interface pin unavailable on this rank "
+              f"({type(exc).__name__}: {exc}) — jax internals moved or the "
+              "backend is already initialized; stock jax transport (on "
+              "Frontera that is the 1 GbE management NIC). Update "
+              "runtime.pin_gloo_interface for this jax version.")
         return
 
     plat_note = "" if plat == "cpu" else (
         f" [JAX_PLATFORMS={plat!r} with no GPU present: this run lands on "
         f"the CPU backend]")
-    _say(f"Gloo collectives pinned to {iface} ({addr}; {why}).{plat_note} "
-         "The jax default binds the coordinator-route NIC — em1, 1 GbE, on "
-         "Frontera compute nodes. Override/disable: LORRAX_GLOO_IFNAME.")
+    _announce(f"Gloo collectives pinned to {iface} ({addr}; {why})."
+              f"{plat_note} The jax default binds the coordinator-route NIC "
+              "— em1, 1 GbE, on Frontera compute nodes. Override/disable: "
+              "LORRAX_GLOO_IFNAME.")
 
 
 def _resolve_proc_count() -> int:

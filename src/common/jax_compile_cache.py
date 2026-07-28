@@ -41,17 +41,21 @@ Knobs (all optional):
                                           ``LORRAX_JAX_CACHE_PREFETCH_THREADS``
                                           workers (16).
 
-Default location is ``~/.cache/isdf_jax_compilation``; entries live in
-``{base}/np{N_proc}/`` — ONE directory shared by every rank of a world
-size (the old ``rank{i}/`` partitioning is gone; see below).
+Default location (``ISDF_JAX_CACHE_DIR`` unset) is
+``$SCRATCH/lorrax_jax_cache`` when ``$SCRATCH`` is set, else
+``$XDG_CACHE_HOME``/``~/.cache`` + ``/isdf_jax_compilation`` — the resolved
+default is announced once at init.  Entries live in ``{base}/np{N_proc}/``
+— ONE directory shared by every rank of a world size (the old ``rank{i}/``
+partitioning is gone; see below).
 
-**On Frontera, point ``ISDF_JAX_CACHE_DIR`` at ``$SCRATCH``.**  One entry is
-one small file, and a populated world size is several hundred of them (301 for
-the gw fixture at P=8, 886 measured for a big deck), so the default under
-``/home1`` eats inodes on the filesystem whose *inode* quota locks you out of
-the machine (ADVICE section 2).  Correctness does not depend on this — the
-directory only has to be visible to every rank, which ``$SCRATCH`` and
-``$WORK`` both are and ``/tmp`` is NOT.
+**Why ``$SCRATCH`` comes first.**  One entry is one small file, and a
+populated world size is several hundred of them (301 for the gw fixture at
+P=8, 886 measured for a big deck), so a default under ``/home1`` eats inodes
+on the filesystem whose *inode* quota locks you out of the machine (ADVICE
+section 2).  The cache is enabled by default, so the safe location has to be
+the code's default rather than shell-alias advice.  Correctness does not
+depend on this — the directory only has to be visible to every rank, which
+``$SCRATCH`` and ``$WORK`` both are and ``/tmp`` is NOT.
 
 The ``ISDF_*`` env-var naming is legacy — historically this was for ISDF
 kernels only, now it caches the whole run.  Left as-is for backward
@@ -783,15 +787,6 @@ def ensure_jax_compile_cache() -> None:
         return
     _COMPILATION_CACHE_READY = True
 
-    # Legacy shared caches (pre-AH) can still be on disk with entries whose
-    # device binding does not match; JAX warns once per primitive per jit.
-    # Non-fatal (JAX recompiles) but noisy.
-    warnings.filterwarnings(
-        "ignore",
-        message=r"Error reading persistent compilation cache entry .*",
-        category=UserWarning,
-    )
-
     try:
         import jax as _jax
         n_proc = _jax.process_count()
@@ -801,6 +796,22 @@ def ensure_jax_compile_cache() -> None:
         proc_idx = 0
     _STATE.n_proc = n_proc
     _STATE.proc_idx = proc_idx
+
+    # Legacy shared caches (pre-AH) can still be on disk with entries whose
+    # device binding does not match; JAX warns once per primitive per jit.
+    # Non-fatal (JAX recompiles) but noisy.  Suppressed ONLY at P > 1, where
+    # any agreed entry that fails to load is already reported loudly by
+    # ``_fatal``.  At P == 1 no agreement layer is installed, so this
+    # warning is the only observable that distinguishes "cache warm" from
+    # "cache rotting" (torn pre-AH write, scratch bit rot) — a blanket
+    # filter made healthy and corrupt caches log identically there
+    # (QUALITY_PATTERNS #7 addendum; release audit 2026-07-28).
+    if n_proc > 1:
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Error reading persistent compilation cache entry .*",
+            category=UserWarning,
+        )
 
     # The compile counter goes in on EVERY path, including cache-off, so that
     # "compiles with the cache" and "compiles without it" are the same
@@ -812,10 +823,27 @@ def ensure_jax_compile_cache() -> None:
         pass
 
     cache_dir = os.environ.get("ISDF_JAX_CACHE_DIR")
+    default_note = None
     if cache_dir is None:
-        base_cache = os.environ.get(
-            "XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
-        cache_dir = os.path.join(base_cache, "isdf_jax_compilation")
+        # Default chain (announced once, rank 0, below): $SCRATCH first.
+        # A populated world size is several hundred small files (886
+        # measured for a big deck), and this module's own docstring has
+        # always said the default under /home1 eats the inode quota that
+        # locks a user out of the machine.  With the cache now enabled by
+        # default at all P, the safe location must be the CODE's default,
+        # not a docstring plea (release audit 2026-07-28).
+        scratch = os.environ.get("SCRATCH", "").strip()
+        if scratch:
+            cache_dir = os.path.join(scratch, "lorrax_jax_cache")
+            default_note = "$SCRATCH default"
+        else:
+            base_cache = os.environ.get(
+                "XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+            cache_dir = os.path.join(base_cache, "isdf_jax_compilation")
+            default_note = ("no $SCRATCH in the environment — falling back "
+                            "under the home filesystem; several hundred "
+                            "small files per world size, WATCH THE INODE "
+                            "QUOTA or set ISDF_JAX_CACHE_DIR")
     else:
         # A whitespace-only value is the ""-opt-out, not a real path.
         cache_dir = cache_dir.strip()
@@ -831,9 +859,15 @@ def ensure_jax_compile_cache() -> None:
             _say(f"persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" "
                  f"opt-out): every rank compiles every module, every run. "
                  f"Safe at any P since the AH agreement layer; to enable, "
-                 f"point ISDF_JAX_CACHE_DIR at $SCRATCH (small files — "
-                 f"/home1 would eat its inode quota).")
+                 f"unset ISDF_JAX_CACHE_DIR (the default resolves under "
+                 f"$SCRATCH) or point it at any rank-visible directory.")
         return
+
+    if default_note is not None and proc_idx == 0:
+        # Announce the resolved default exactly once — a location the user
+        # never chose must be visible in the log (quality-pattern #8).
+        _say(f"cache dir (default): {cache_dir} ({default_note}; override "
+             f"with ISDF_JAX_CACHE_DIR, \"\" opts out).")
 
     # ---- back-compat escape hatch: the scorecard-AG refusal --------------
     if n_proc > 1 and not _truthy("LORRAX_JAX_CACHE_MULTIPROCESS", "1"):

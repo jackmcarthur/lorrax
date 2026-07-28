@@ -313,12 +313,22 @@ def build_qsgw_sigma_xc(
     w_lo = 1.0 - w_hi
 
     rep_2d = NamedSharding(mesh_xy, P(None, None))
-    # Numpy → replicated; ``jnp.asarray`` wrap would force a
-    # single-device staging that turns device_put into an all-reduce.
-    idx_lo_j = jax.device_put(idx_lo.astype(np.int32), rep_2d)
-    idx_hi_j = jax.device_put(idx_hi.astype(np.int32), rep_2d)
-    w_lo_j   = jax.device_put(w_lo.astype(np.complex128), rep_2d)
-    w_hi_j   = jax.device_put(w_hi.astype(np.complex128), rep_2d)
+    # Numpy → replicated, placed PROCESS-LOCALLY: a bare ``jax.device_put``
+    # of host numpy onto a multi-process replicated sharding silently runs
+    # multihost ``assert_equal`` — four hidden P-linear all-gathers of
+    # (nk, nb) tables on every fixed_point solve (AO-sweep straggler class,
+    # scorecard AA.1/Y.5; converted 2026-07-28).  The idx/w tables are pure
+    # deterministic functions (np.searchsorted/clip) of the replicated E and
+    # ω inputs — bit-identical on every rank by construction, which is
+    # device_put_process_local's documented precondition;
+    # LORRAX_CHECK_REPLICA=1 restores the assertion.  (``jnp.asarray`` wrap
+    # would be worse still — a single-device staging that turns device_put
+    # into an all-reduce.)
+    from common.collectives import device_put_process_local
+    idx_lo_j = device_put_process_local(idx_lo.astype(np.int32), rep_2d)
+    idx_hi_j = device_put_process_local(idx_hi.astype(np.int32), rep_2d)
+    w_lo_j   = device_put_process_local(w_lo.astype(np.complex128), rep_2d)
+    w_hi_j   = device_put_process_local(w_hi.astype(np.complex128), rep_2d)
 
     sigma_xc_qsgw = _qsgw_build_kernel(mesh_xy)(
         sigma_c_omega_ry, sigma_x_kij_ry,
