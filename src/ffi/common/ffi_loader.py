@@ -129,6 +129,10 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_batched_trsm":      "SlateBatchedTrsmHostFfi",
     "lorrax_scalapack_batched_solve_lu": "ScalapackBatchedSolveLuHostFfi",
     "lorrax_scalapack_eigh":          "ScalapackEighHostFfi",
+    # MKL FFT (DFTI API) flat-k batched-FFT handlers (mklfft/cpp) — the
+    # LORRAX_FFT_FFI backend of common.fft_helpers (FFT-FFI prototype).
+    "lorrax_mklfft_flat_k":           "MklFftFlatKHostFfi",
+    "lorrax_mklfft_gw_conv":          "MklFftGwConvHostFfi",
     "lorrax_phdf5_read":              "PhdfReadHostFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkHostFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionHostFfi",

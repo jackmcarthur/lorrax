@@ -239,6 +239,41 @@ if(LORRAX_HOST_HAVE_SLATE)
                 list(APPEND _host_rpaths "${_mkl_libdir}")
                 message(STATUS "ScaLAPACK: MKL at ${_mkl_libdir} "
                                "(blacs=${LORRAX_MKL_BLACS}, thread=${LORRAX_MKL_THREAD_LIB})")
+
+                # ------------------------------------------------------
+                # MKL FFT (DFTI API) flat-k batched-FFT host handlers
+                # (mklfft/cpp/fft_flat_k_ffi.cc; FFT-FFI prototype
+                # 2026-07-28).  O(N log N) FFT at any k-count via MKL's
+                # DFTI descriptor API — NOT a DFT-as-matmul.  Rides the
+                # MKL link line already resolved above (DFTI lives in
+                # mkl_intel_lp64/mkl_core/threading — zero new link
+                # deps); needs only mkl_dfti.h.  The one TU is compiled
+                # -fopenmp for its chunk-loop threading (gomp is already
+                # on the link line via mkl_gnu_thread).
+                # ------------------------------------------------------
+                get_filename_component(_mkl_incdir
+                                       "${_mkl_libdir}/../../include" ABSOLUTE)
+                if(EXISTS "${_mkl_incdir}/mkl_dfti.h")
+                    list(APPEND LORRAX_FFI_HOST_SOURCES
+                        ../../../mklfft/cpp/fft_flat_k_ffi.cc)
+                    set(LORRAX_MKLFFT_INCLUDE_DIR "${_mkl_incdir}")
+                    # The TU's own OpenMP pragmas need gomp even if the MKL
+                    # threading layer is switched to mkl_sequential.
+                    if(NOT LORRAX_MKL_THREAD_LIB STREQUAL "mkl_gnu_thread")
+                        list(APPEND _scalapack_link "-lgomp")
+                    endif()
+                    set_source_files_properties(
+                        ../../../mklfft/cpp/fft_flat_k_ffi.cc
+                        PROPERTIES COMPILE_OPTIONS "-fopenmp")
+                    message(STATUS
+                        "mklfft: MKL FFT (DFTI API) flat-k handlers ON "
+                        "(headers at ${_mkl_incdir})")
+                else()
+                    message(STATUS
+                        "mklfft: ${_mkl_incdir}/mkl_dfti.h not found — "
+                        "flat-k FFT handlers skipped (LORRAX_FFT_FFI will "
+                        "refuse at runtime).")
+                endif()
             else()
                 set(_scalapack_link "")
                 message(WARNING
@@ -284,6 +319,10 @@ target_include_directories(lorrax_ffi_host PRIVATE
     "${LORRAX_XLA_FFI_INCLUDE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../.."
 )
+if(LORRAX_MKLFFT_INCLUDE_DIR)
+    target_include_directories(lorrax_ffi_host PRIVATE
+        "${LORRAX_MKLFFT_INCLUDE_DIR}")
+endif()
 if(LORRAX_FFI_HAVE_PHDF5)
     target_include_directories(lorrax_ffi_host PRIVATE
         "${HDF5_INCLUDE_DIRS}"

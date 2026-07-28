@@ -63,6 +63,21 @@ def _stage_timing_enabled() -> bool:
         "1", "true", "yes", "on")
 
 
+def _fft_ffi_fused_enabled() -> bool:
+    """``LORRAX_FFT_FFI_FUSED=1`` routes the τ kernel's IFFT·(G·W)·FFT step
+    through ONE fused MKL FFT (DFTI API) host-FFI entry point
+    (``common.fft_helpers.make_flat_k_gw_conv``) so the R-space G tile never
+    materializes.  O(N log N) FFTs via MKL's DFTI descriptor API reading the
+    dot-layout tile directly (NOT a DFT-as-matmul) — see the backend block
+    in fft_helpers.  Independent of ``LORRAX_FFT_FFI`` (which switches the
+    decomposed helpers); default OFF, production path untouched.  Read at
+    kernel-factory time and part of the kernel cache keys.  Announce/refuse
+    semantics live in the fft_helpers factory (raises if the host .so lacks
+    the handler)."""
+    return os.environ.get("LORRAX_FFT_FFI_FUSED", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _project_ri_local(psi_xr_local, sigma_k_local, psi_yn_local):
     """Rank-local body of the ψ* σ ψ reduce-scatter projection.
 
@@ -263,21 +278,37 @@ def _get_sigma_kij_kernel(
 
     kgrid = tuple(int(x) for x in kgrid)
     nk_tot = kgrid[0] * kgrid[1] * kgrid[2]
+    from common.fft_helpers import (
+        fft_ffi_enabled, make_flat_k_fftn, make_flat_k_gw_conv,
+        make_flat_k_ifftn)
     # The stage-timing flag is part of the cache key: the two variants are
     # different callables (fused jit vs staged dispatcher) and must not
     # shadow each other across a flag flip inside one process (tests).
-    pipeline_key = (id(mesh_xy), kgrid, _stage_timing_enabled())
+    # Likewise the two FFT-FFI flags (read at factory time by fft_helpers /
+    # _fft_ffi_fused_enabled): a flip mid-process must rebuild the kernel.
+    pipeline_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
+                    fft_ffi_enabled(), _fft_ffi_fused_enabled())
     if pipeline_key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[pipeline_key]
 
-    from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
     from .wavefunction_bundle import G_FFT7D_SPEC as _G_spec, V_FFT5D_SPEC as _V_spec
 
     ensure_jax_compile_cache()
-    _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _G_spec, norm='ortho')
-    _G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, _G_spec, norm='ortho')
-    _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
     inv_sqrt_nk = -1.0 / np.sqrt(float(nk_tot))
+    use_fused_ffi = _fft_ffi_fused_enabled()
+    if use_fused_ffi:
+        # ONE fused MKL FFT (DFTI API) host-FFI call per rank per τ:
+        # sigma_k = fftn(ifftn(G_k)·ifftn(W_q)[:,None,:,None,:]·inv_sqrt_nk)
+        # with the R-space G tile chunked away inside the handler.  The
+        # decomposed helpers below are deliberately NOT built on this route
+        # (their announce/probe belongs to LORRAX_FFT_FFI).
+        _gw_conv = make_flat_k_gw_conv(
+            mesh_xy, kgrid, _G_spec, _V_spec,
+            norm='ortho', mult=inv_sqrt_nk)
+    else:
+        _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _G_spec, norm='ortho')
+        _G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, _G_spec, norm='ortho')
+        _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
 
     from .greens_function_kernel import build_G_tau
 
@@ -294,7 +325,13 @@ def _get_sigma_kij_kernel(
         ``W_q`` is **donated**: it's built fresh each τ by ``_build_W_t_q``
         and only consumed here, so XLA can reuse its buffer for the
         ``V_R = _V_ifftn(W_q)`` output instead of allocating a separate
-        intermediate.
+        intermediate.  DONATION-AUDIT NOTE (2026-07-28): in PRODUCTION this
+        jit is traced INTO the outer ``_tau_kernel`` jit, where inner-jit
+        donation is inert (donation acts only at top-level dispatch — same
+        house fact as the ζ r-chunk jits, SPEEDUP_SCORECARD.md audit row
+        (d)); there W_t_q is a module-internal temp and buffer reuse is
+        XLA's liveness analysis + the FFI in-place aliases.  The annotation
+        is kept for any future top-level dispatch of this kernel.
 
         G(t) = build_G_tau(psi, E_A, 1j·t_node, e_ref=E_ref_A, mask=mask_A),
         i.e. the unified ISDF-basis G builder with pure-imaginary t
@@ -305,9 +342,12 @@ def _get_sigma_kij_kernel(
             psi_coh_xn, psi_coh_yr, E_A, 1j * t_node,
             e_ref=E_ref_A, mask=mask_A,
         )
-        G_R = _G_ifftn(G_k)
-        V_R = _V_ifftn(W_q)[:, None, :, None, :]  # (nk,1,μ,1,μ) broadcast to G shape
-        sigma_k = _G_fftn(G_R * V_R * inv_sqrt_nk)
+        if use_fused_ffi:
+            sigma_k = _gw_conv(G_k, W_q)
+        else:
+            G_R = _G_ifftn(G_k)
+            V_R = _V_ifftn(W_q)[:, None, :, None, :]  # (nk,1,μ,1,μ) broadcast to G shape
+            sigma_k = _G_fftn(G_R * V_R * inv_sqrt_nk)
         return _project_ri_rs(psi_proj_xr, sigma_k, psi_proj_yn)
 
     if not _stage_timing_enabled():
@@ -327,22 +367,40 @@ def _get_sigma_kij_kernel(
     #     split of dot vs collective wait comes from a profiler trace
     #     (jax_profile.trace_section wraps the first window per branch in
     #     ppm_sigma), not from restructuring the kernel.
-    #   * W_q is NOT donated here (the fused kernel donates it into the
-    #     _V_ifftn temp); one extra (nq, μ_X, μ_Y)/rank buffer while the
-    #     knob is on — diagnostic-only cost.
+    #   * DONATION AUDIT (2026-07-28, owner directive with the FFT-FFI
+    #     prototype): each stage jit now donates every operand that is DEAD
+    #     after its call — G_k → G_ifft, W_q → V_ifft, (G_R, V_R) →
+    #     mult_fft, sigma_k → project.  Verified against this dispatcher:
+    #     none of those is referenced again after its consuming stage (the
+    #     ``sec.watch`` block-until-ready runs in the PRODUCING stage's
+    #     section, before the donation), and the ψ/E/mask operands are
+    #     loop-invariant across τ so they are never donated.  This closes
+    #     the staged path's previously-documented "W_q NOT donated here"
+    #     gap and drops the big dead tiles (399 MB G_k / G_R, 100 MB W_q /
+    #     V_R at nb=128/P=64) from the staged peak.  Donation is data
+    #     movement only — stage rows measure the same ops.
     #   * Stage boundaries force materialization of G_k / G_R / V_R that
     #     the fused module may keep in fft-native layout, so staged wall
     #     ≠ fused wall; the rows are for RATIO attribution.
+    #   * LORRAX_FFT_FFI_FUSED=1: the three FFT-adjacent rows collapse into
+    #     ONE row ``sigma.tau.GW_conv_ffi`` (the fused MKL FFT (DFTI API)
+    #     handler does IFFT·multiply·FFT in one call) — A/B against the
+    #     sum G_ifft + V_ifft + GW_mult_fft of the reference table.
     # Scale-neutral: per-τ host overhead is O(#stages), independent of
     # n_atoms / N_μ / nk / P and identical on CPU and GPU backends.
     # ------------------------------------------------------------------
     _G_build_j = jax.jit(
         lambda xn, yr, E_A, mask_A, E_ref_A, t_node: build_G_tau(
             xn, yr, E_A, 1j * t_node, e_ref=E_ref_A, mask=mask_A))
-    _G_ifft_j = jax.jit(_G_ifftn)
-    _V_ifft_j = jax.jit(lambda W_q: _V_ifftn(W_q)[:, None, :, None, :])
-    _mult_fft_j = jax.jit(lambda G_R, V_R: _G_fftn(G_R * V_R * inv_sqrt_nk))
-    _project_j = jax.jit(_project_ri_rs)
+    if use_fused_ffi:
+        _conv_j = jax.jit(_gw_conv, donate_argnums=(0, 1))
+    else:
+        _G_ifft_j = jax.jit(_G_ifftn, donate_argnums=(0,))
+        _V_ifft_j = jax.jit(lambda W_q: _V_ifftn(W_q)[:, None, :, None, :],
+                            donate_argnums=(0,))
+        _mult_fft_j = jax.jit(lambda G_R, V_R: _G_fftn(G_R * V_R * inv_sqrt_nk),
+                              donate_argnums=(0, 1))
+    _project_j = jax.jit(_project_ri_rs, donate_argnums=(1,))
 
     def _sigma_kij_kernel_staged(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
@@ -352,15 +410,20 @@ def _get_sigma_kij_kernel(
             G_k = _G_build_j(psi_coh_xn, psi_coh_yr, E_A, mask_A,
                              E_ref_A, t_node)
             sec.watch(G_k)
-        with timing.section("sigma.tau.G_ifft") as sec:
-            G_R = _G_ifft_j(G_k)
-            sec.watch(G_R)
-        with timing.section("sigma.tau.V_ifft") as sec:
-            V_R = _V_ifft_j(W_q)
-            sec.watch(V_R)
-        with timing.section("sigma.tau.GW_mult_fft") as sec:
-            sigma_k = _mult_fft_j(G_R, V_R)
-            sec.watch(sigma_k)
+        if use_fused_ffi:
+            with timing.section("sigma.tau.GW_conv_ffi") as sec:
+                sigma_k = _conv_j(G_k, W_q)
+                sec.watch(sigma_k)
+        else:
+            with timing.section("sigma.tau.G_ifft") as sec:
+                G_R = _G_ifft_j(G_k)
+                sec.watch(G_R)
+            with timing.section("sigma.tau.V_ifft") as sec:
+                V_R = _V_ifft_j(W_q)
+                sec.watch(V_R)
+            with timing.section("sigma.tau.GW_mult_fft") as sec:
+                sigma_k = _mult_fft_j(G_R, V_R)
+                sec.watch(sigma_k)
         with timing.section("sigma.tau.project_rs") as sec:
             out = _project_j(psi_proj_xr, sigma_k, psi_proj_yn)
             sec.watch(out)
@@ -378,7 +441,9 @@ def _get_sigma_tau_kernel(
     """Return a cached tau-node sigma builder with jittable local FFTs."""
 
     kgrid = tuple(int(x) for x in kgrid)
-    cache_key = (id(mesh_xy), kgrid, _stage_timing_enabled())
+    from common.fft_helpers import fft_ffi_enabled
+    cache_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
+                 fft_ffi_enabled(), _fft_ffi_fused_enabled())
     if cache_key in _sigma_tau_kernel_cache:
         return _sigma_tau_kernel_cache[cache_key]
 

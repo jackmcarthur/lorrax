@@ -161,7 +161,8 @@ PhdfWriteHostFfi"
 if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
     WANT="$WANT SlateEighHostFfi SlatePotrfHostFfi SlateTrsmHostFfi \
 SlateBatchedPotrfHostFfi SlateBatchedTrsmHostFfi ScalapackBatchedSolveLuHostFfi \
-ScalapackEighHostFfi lrx_slate_init_mpi lrx_slate_context_create"
+ScalapackEighHostFfi lrx_slate_init_mpi lrx_slate_context_create \
+MklFftFlatKHostFfi MklFftGwConvHostFfi"
 fi
 echo "[build_host] --- exported handlers ---"
 # Read the dynamic symbol table ONCE.  `nm -D "$SO" | grep -q ...` inside a
