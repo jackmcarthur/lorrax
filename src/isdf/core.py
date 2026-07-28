@@ -154,8 +154,14 @@ def gram_q0_from_pair(
 	gamma_R: tuple[jax.Array, jax.Array] | None = None,
 	*,
 	mesh_xy: Mesh,
+	symmetrize: bool = True,
 ) -> jax.Array:
 	"""q=0 valence-conduction pair-product Gram from open-spin pair densities.
+
+	``symmetrize=False`` skips the final Hermitian symmetrization (which
+	requires a SQUARE G) — used by the column-blocked Gram build in
+	:mod:`centroid.pivoted_cholesky`, which assembles rectangular column
+	blocks and applies the identical 0.5·(G+G^H) once on the full matrix.
 
 	Mathematically (q=0 special case of the CCT-over-k structure):
 
@@ -189,7 +195,7 @@ def gram_q0_from_pair(
 	lhs_id = gamma_L is None
 	rhs_id = gamma_R is None
 	cache_key = ('gram_q0_from_pair', id(mesh_xy), nk, ns1, ns2, n_rmu,
-	             lhs_id, rhs_id)
+	             lhs_id, rhs_id, symmetrize)
 
 	if cache_key not in _isdf_pipeline_cache:
 		in_spin = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
@@ -199,6 +205,7 @@ def gram_q0_from_pair(
 
 		_lhs_id = lhs_id
 		_rhs_id = rhs_id
+		_symmetrize = symmetrize
 
 		@partial(jax.jit,
 		         in_shardings=(in_spin, in_spin, kw_rep, rep, rep, rep, rep),
@@ -216,8 +223,10 @@ def gram_q0_from_pair(
 			)
 			G = jnp.sum(kw[:, None, None] * prod, axis=0)
 			# Symmetrize: q=0 Gram is Hermitian by construction; fp roundoff
-			# can break it.  Cheap fix.
-			G = 0.5 * (G + jnp.conj(G.T))
+			# can break it.  Cheap fix.  (Skipped for rectangular column
+			# blocks — the blocked caller symmetrizes the assembled square.)
+			if _symmetrize:
+				G = 0.5 * (G + jnp.conj(G.T))
 			return G
 
 		_isdf_pipeline_cache[cache_key] = _gram_q0
