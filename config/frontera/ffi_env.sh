@@ -76,9 +76,38 @@ if [ "${LORRAX_FFI_PHDF5:-0}" = "1" ]; then
     export I_MPI_PMI_LIBRARY="${LORRAX_PMI2_LIB:-$WORK/host_pmi/libpmi2.so.0}"
     # Single node: shared-memory-only transport skips OFI/libfabric init
     # entirely (the tcp/mlx4 OFI provider fails "addrinfo() No data
-    # available" in-container).  For multi-node, set LORRAX_MPI_FABRICS=ofi
-    # + FI_PROVIDER and sort out the ConnectX-3 fabric.
+    # available" in-container on rtx/ConnectX-3).  For multi-node, set
+    # LORRAX_MPI_FABRICS=shm:ofi and pick the provider below.
     export I_MPI_FABRICS="${LORRAX_MPI_FABRICS:-shm}"
-    export FI_PROVIDER="${FI_PROVIDER:-tcp}"
+    # Provider .so resolution — REQUIRED in-container (AU measured: with it
+    # unset, PMPI_Init aborts "addrinfo() failed ... No data available":
+    # libfabric finds no providers.  mpivars.sh, which normally sets it, is
+    # not sourced in-container).
+    export FI_PROVIDER_PATH="$IMPI/libfabric/lib/prov"
+    # ---- libfabric provider (scorecard AP root cause, AS.5 spec) ----------
+    # The old `FI_PROVIDER="${FI_PROVIDER:-tcp}"` seed here was an rtx/mlx4
+    # bring-up workaround that leaked to CLX production: on Frontera CLX HDR
+    # leave FI_PROVIDER UNSET and Intel MPI auto-selects the native `mlx`
+    # (UCX) provider — 1.07 us / 11.4 GB/s vs tcp's 10.9 us / 2.15 GB/s;
+    # pzheevd n=2448 P=144 12 s/q -> 0.5-0.9 s/q.  NOTE the seed also never
+    # did what it claimed: TACC's default impi module exports FI_PROVIDER=mlx
+    # in every login/compute shell, so the `:-tcp` fallback usually saw an
+    # inherited value — the case-block below unsets/sets it deterministically.
+    #   LORRAX_MPI_PROVIDER=auto  (default) unset -> IMPI picks mlx on CLX
+    #   LORRAX_MPI_PROVIDER=tcp   the rtx/mlx4 escape hatch (IPoIB via ib0)
+    #   LORRAX_MPI_PROVIDER=<x>   force-request provider <x>
+    #                             (never `verbs` at P>=144 one-block: AP.4)
+    # In-container, mlx additionally needs the staged host RDMA/UCX userspace
+    # (AS.1 hostlibs pattern) and NO --bind under /dev.  Without it, auto
+    # degrades to tcp — announced by the I_MPI_DEBUG banner.
+    case "${LORRAX_MPI_PROVIDER:-auto}" in
+      auto) unset FI_PROVIDER FI_TCP_IFACE 2>/dev/null ;;
+      tcp)  IB_IF=$(ip -o -4 addr show 2>/dev/null | awk '/ib/{print $2; exit}')
+            export FI_PROVIDER=tcp FI_TCP_IFACE=${IB_IF:-ib0} ;;
+      *)    export FI_PROVIDER="$LORRAX_MPI_PROVIDER" ;;
+    esac
+    # Provider banner ("libfabric provider: ...") is mandatory telemetry —
+    # fi_info reports -61 for mlx even where it works; trust only the banner.
+    export I_MPI_DEBUG="${I_MPI_DEBUG:-4}"
     export HDF5_USE_FILE_LOCKING=FALSE
 fi
