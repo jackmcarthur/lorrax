@@ -106,6 +106,26 @@ if [ "${LORRAX_FFI_PHDF5:-0}" = "1" ]; then
             export FI_PROVIDER=tcp FI_TCP_IFACE=${IB_IF:-ib0} ;;
       *)    export FI_PROVIDER="$LORRAX_MPI_PROVIDER" ;;
     esac
+    # ---- UCX tunings for the mlx provider (AU A/B, audit fix/zq 2026-07-28)
+    # TACC's default impi module exports these into every login/compute
+    # shell, so EVERY AP/AS mlx number (1.07 us / 11.4 GB/s pingpong,
+    # pzheevd 0.5-0.9 s/q) was measured UNDER them.  AU measured that
+    # stripping them leaves 8 B latency unchanged but DOUBLES the 1 MiB
+    # 32-rank Allreduce (419 -> 799 us) — load-bearing for large-message
+    # collectives.  Setdefault the six certified-harness values
+    # (mos2_4x4_test/gw800_merged.sbatch) so a stripped launch environment
+    # (cron, clean ssh) does not silently lose 2x; inherited values always
+    # win.  Skipped under the tcp escape hatch: rtx/mlx4 has no dc_x
+    # transport, and UCX is not in the tcp path anyway.  Do not add other
+    # UCX knobs (env_vars.md section 5).
+    if [ "${LORRAX_MPI_PROVIDER:-auto}" != "tcp" ]; then
+      export UCX_TLS=${UCX_TLS:-knem,dc_x,rc}
+      export UCX_RC_MLX5_RETRY_COUNT=${UCX_RC_MLX5_RETRY_COUNT:-40}
+      export UCX_RC_MLX5_TIMEOUT=${UCX_RC_MLX5_TIMEOUT:-1200000.00us}
+      export UCX_DC_MLX5_RETRY_COUNT=${UCX_DC_MLX5_RETRY_COUNT:-40}
+      export UCX_DC_MLX5_TIMEOUT=${UCX_DC_MLX5_TIMEOUT:-1200000.00us}
+      export UCX_UD_MLX5_TIMEOUT=${UCX_UD_MLX5_TIMEOUT:-600000000.00us}
+    fi
     # Provider banner ("libfabric provider: ...") is mandatory telemetry —
     # fi_info reports -61 for mlx even where it works; trust only the banner.
     export I_MPI_DEBUG="${I_MPI_DEBUG:-4}"

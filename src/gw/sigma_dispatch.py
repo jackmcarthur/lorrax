@@ -88,7 +88,9 @@ class SigmaResult:
 # H₀'s Hartree term: resolve the source once, cache the array
 # ---------------------------------------------------------------------------
 
-#: (kin_ion path, b0, b3, resolved source) → (source, V_H (nk,nb,nb) Ry | None).
+#: (kin_ion path, b0, b3, resolved source, mesh identity) →
+#: (source, V_H (nk,nb,nb) Ry | None).  Mesh identity is the STABLE
+#: shape/axis/device-id tuple from :func:`_mesh_cache_key`, not ``id()``.
 #: The QSGW loop calls ``compute_sigma_xc`` once per SC iteration and the
 #: exact V_H does not change with the band basis (it is a fixed operator in
 #: the DFT basis, and ``rotate_wavefunctions`` handles the basis change on
@@ -107,6 +109,22 @@ class SigmaResult:
 #: :func:`invalidate_hartree_cache` at the top of each iteration, or it
 #: will silently keep iteration 0's Hartree potential for ever.
 _hartree_cache: dict = {}
+
+
+def _mesh_cache_key(mesh_xy) -> tuple:
+    """STABLE identity of a Mesh for cache keying: axis names + extents
+    plus the flat device-id tuple.
+
+    The previous key component was ``id(mesh_xy)``, which a new Mesh can
+    REUSE after the old one is garbage-collected — a false hit would then
+    hand back V_H arrays sharded on a dead mesh.  Conversely, two JAX
+    ``Mesh`` objects over the same devices/axes compare equal and their
+    ``NamedSharding``s compose, so a hit across equivalent Mesh OBJECTS
+    (which ``id()`` needlessly missed) is correct.  (audit fix/zq
+    2026-07-28)
+    """
+    return (tuple(mesh_xy.shape.items()),
+            tuple(int(d.id) for d in mesh_xy.devices.flat))
 
 
 def invalidate_hartree_cache() -> None:
@@ -133,7 +151,7 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
     requested = getattr(config, "hartree_source", "auto")
     source = resolve_hartree_source(path, requested, print_fn=print_fn)
     key = (os.path.abspath(path), int(band_slices.b0), int(band_slices.b3),
-           source, id(mesh_xy))
+           source, _mesh_cache_key(mesh_xy))
     if key in _hartree_cache:
         return _hartree_cache[key]
 

@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include <cctype>
 #include <complex>
 #include <cstdint>
 #include <cstdio>
@@ -132,10 +133,21 @@ inline int blacs_ctxt_for(lorrax_ffi::slate::SlateCtx* ctx) {
 //  route and for XLA-adjacent BLAS) is untouched; the previous local
 //  value is restored when the scope closes.
 //
-//  Env: LORRAX_SCALAPACK_MKL_THREADS
-//        unset / "auto" -> min(mkl_get_max_threads(), 4)   [measured best]
-//        "0" / "off"    -> leave MKL threading alone (pre-AW behaviour)
-//        <N>            -> pin exactly N inside the handlers
+//  Env: LORRAX_SCALAPACK_MKL_THREADS (values case-insensitive)
+//        unset / "" / "auto" -> min(mkl_get_max_threads(), 4) [measured best]
+//        "0" / "off"         -> leave MKL threading alone (pre-AW behaviour)
+//        <positive integer>  -> pin exactly N inside the handlers
+//        anything else       -> ONE loud stderr line naming the value and
+//                               this grammar, then the "auto" policy.
+//        Rationale (audit fix/zq 2026-07-28): a typo ("Auto", "on", "4x",
+//        a negative number) used to fall through atoi() to 0 == "off",
+//        i.e. silently inherit the global MKL_NUM_THREADS (28 in
+//        production) — the measured-24x-slower configuration this knob
+//        exists to prevent, with a mysteriously slow eigh as the only
+//        symptom.  Doctrine 3/pattern #8: a malformed explicit request
+//        must not silently select the known-bad policy; falling back to
+//        AUTO is the safe direction and the announcement makes it
+//        diagnosable.
 // ---------------------------------------------------------------------------
 using mkl_set_local_fn = int (*)(int);
 using mkl_get_max_fn   = int (*)();
@@ -152,21 +164,50 @@ inline mkl_get_max_fn mkl_get_max_threads_ptr() {
     return fn;
 }
 
+// Case-insensitive string equality (ASCII; env-value vocabulary only).
+inline bool str_ieq(const char* a, const char* b) {
+    for (;; ++a, ++b) {
+        const int ca = std::tolower(static_cast<unsigned char>(*a));
+        const int cb = std::tolower(static_cast<unsigned char>(*b));
+        if (ca != cb) return false;
+        if (ca == 0) return true;
+    }
+}
+
 // Threads to pin inside ScaLAPACK handlers; 0 = leave MKL alone.
 inline int scalapack_mkl_threads() {
     static int resolved = [] {
+        const auto auto_policy = [] {
+            auto get_max = mkl_get_max_threads_ptr();
+            if (get_max == nullptr) return 0;  // not MKL — no pin
+            const int cur = get_max();
+            return cur > 4 ? 4 : 0;            // cap only if it would shrink
+        };
         const char* v = std::getenv("LORRAX_SCALAPACK_MKL_THREADS");
-        const bool is_auto =
-            (!v || !*v || std::strcmp(v, "auto") == 0);
-        if (!is_auto) {
-            if (std::strcmp(v, "off") == 0) return 0;
-            const int parsed = std::atoi(v);
-            return parsed > 0 ? parsed : 0;
+        if (!v || !*v || str_ieq(v, "auto")) return auto_policy();
+        if (str_ieq(v, "off")) return 0;
+        // Strict full-string integer parse: atoi() previously mapped any
+        // typo to 0 == "off" (the measured-24x-slower policy) and
+        // silently accepted trailing junk ("4x" -> 4).
+        char* end = nullptr;
+        const long parsed = std::strtol(v, &end, 10);
+        if (end != v && *end == '\0' && parsed >= 0 && parsed <= 4096) {
+            return static_cast<int>(parsed);   // "0" == "off" (documented)
         }
-        auto get_max = mkl_get_max_threads_ptr();
-        if (get_max == nullptr) return 0;      // not MKL — no pin
-        const int cur = get_max();
-        return cur > 4 ? 4 : 0;               // cap only if it would shrink
+        // Unrecognized value: announce loudly ONCE (this init runs once
+        // per process) and take the safe direction — AUTO, never "off"
+        // (see the grammar note above; audit fix/zq 2026-07-28).
+        std::fprintf(
+            stderr,
+            "*** LORRAX_SCALAPACK_MKL_THREADS='%s' is not a recognized "
+            "value (accepted, case-insensitive: 'auto', 'off', '0', or a "
+            "positive integer <= 4096).  Falling back to 'auto' (cap the "
+            "handler-local MKL team at 4) — NOT to 'off', which would "
+            "silently inherit the global MKL_NUM_THREADS (measured 24x "
+            "slower pzheevd at the 12x12 production grid, workstream AW). "
+            "***\n",
+            v);
+        return auto_policy();
     }();
     return resolved;
 }

@@ -14,7 +14,9 @@ previous behaviour):
 * `src/ffi/common/ffi_loader.py` — skips FFI handler / lifecycle symbols a
   partial build doesn't export.
 
-Kept on the `frontera-ffi` branch so `main` stays pristine.
+Originally staged on the `frontera-ffi` branch; long since merged — the
+Frontera FFI stack (CUDA + host SLATE/ScaLAPACK + phdf5) is mainline and
+production-certified (2026-07 campaign, scorecard AM-AU).
 
 ## Why Frontera is different
 
@@ -53,11 +55,31 @@ Build flags: `-DLORRAX_FFI_HAVE_CAL=OFF -DLORRAX_FFI_HAVE_PHDF5=OFF`,
 `-DCMAKE_CUDA_ARCHITECTURES=75`, CUDA toolkit assembled from the venv's pip
 `nvidia-*-cu12` packages (see `stage_ffi_deps.sh`).
 
-## Deferred
+## Built since (formerly "Deferred" — updated 2026-07-28)
 
-* **phdf5** — sharded slab I/O. Frontera has `module load phdf5`; build with
-  `-DLORRAX_FFI_HAVE_PHDF5=ON` + the host MPI hybrid-mounted into the
-  container (TACC pattern: launch via `ibrun apptainer`, `FI_PROVIDER=tcp` on
-  rtx due to the ConnectX-3/mlx4 fabric).
-* **SLATE**, **cuBLASMp fused kernels beyond the linked lib**, **multi-node**
-  (NCCL-over-IB on mlx4 likely falls back to TCP — benchmark first).
+* **phdf5** — sharded slab I/O is BUILT and is a production write path
+  (`slab_io` router: `PHDF5_FFI` → `phdf5_host` → allgather).
+  `build_ffi_host.sh` (this dir) builds it with
+  `-DLORRAX_FFI_HAVE_PHDF5=ON` against the host Intel MPI hybrid-mounted
+  into the container; `ffi_env.sh` stages the runtime (PMI2 lib,
+  `FI_PROVIDER_PATH`, the `LORRAX_MPI_PROVIDER` dial, UCX setdefaults).
+* **SLATE / ScaLAPACK** — built by `build_ffi_host.sh` into
+  `liblorrax_ffi_host.so`; ScaLAPACK `pzheevd`
+  (`ScalapackEighHostFfi`) is the permanent CPU distributed eigh behind
+  the `ffi/linalg` facade.
+* Still open: cuBLASMp fused kernels beyond the linked lib (consumer-less
+  package, owner-ledgered for deletion pending one rtx gate), and
+  cross-node **GPU** phdf5 bring-up on the rtx mlx4 fabric
+  (HANDOFF_2026-07-28 open ledger).
+
+## Transport — do NOT seed `FI_PROVIDER` (post-AU doctrine)
+
+On Frontera CLX leave `FI_PROVIDER` **unset** (`LORRAX_MPI_PROVIDER=auto`,
+the `ffi_env.sh` default): Intel MPI then auto-selects the native `mlx`
+(UCX/RDMA) provider — measured 1.07 µs / 11.4 GB/s vs the old
+`FI_PROVIDER=tcp` seed's 10.9 µs / 2.15 GB/s, which was the root cause of
+the 30-minute pzheevd era (n=2448 P=144: ~12 s/q under tcp vs
+0.5–0.9 s/q under mlx; scorecard AP, seed deleted by AU).
+`LORRAX_MPI_PROVIDER=tcp` remains ONLY as the rtx/mlx4 (ConnectX-3)
+escape hatch.  Trust the `I_MPI_DEBUG≥4` `libfabric provider:` banner,
+never `fi_info` (it false-negatives on mlx).

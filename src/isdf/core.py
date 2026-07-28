@@ -532,10 +532,15 @@ def z_q_from_psi_sm(
 			# Precondition guard (device-invariance audit): each band-chunk
 			# width MUST be world_size-divisible, else floor-div silently drops
 			# bands and the populate tile assignment shape-mismatches at P>1.
-			assert _nb_tot == (bcr[_bc][1] - bcr[_bc][0]) and _bpd <= bpd_max, (
-				f"z_q band chunk {_bc} width {bcr[_bc][1]-bcr[_bc][0]} is not a "
-				f"multiple of world_size {P_total} (bpd_per_bc={_bpd}); set "
-				f"band_chunk_size to a multiple of world_size")
+			# ValueError, not assert: the fix is a user input key
+			# (band_chunk_size), and an assert vanishes under `python -O`,
+			# re-arming exactly the silent band-dropping this guards
+			# (audit fix/zq 2026-07-28).
+			if _nb_tot != (bcr[_bc][1] - bcr[_bc][0]) or _bpd > bpd_max:
+				raise ValueError(
+					f"z_q band chunk {_bc} width {bcr[_bc][1]-bcr[_bc][0]} is not a "
+					f"multiple of world_size {P_total} (bpd_per_bc={_bpd}); set "
+					f"band_chunk_size to a multiple of world_size")
 			# out pos p -> src slot (strided real bands compacted to front);
 			# tail (p >= _nb_tot) -> slot _bpd, a guaranteed-zero pad slot.
 			_p = np.arange(bpd_max_global)
@@ -1034,12 +1039,17 @@ def _resolve_channel_ladder(
     Ladder (identical for both channels):
 
       * ``override='off'``                 → ``kind_fallback``.
-      * ``override='on'|'cusolvermp'``     → ``kind_cusolvermp`` on true 2D
-        meshes (px≥2 AND py≥2), else ``kind_fallback``.
       * ``override`` in ``explicit``       → that handler decides (called
         with ``(px, py)``; owns its own FFI-availability / mesh-geometry
-        checks and may raise).  Channel-specific: 'slate' for charge,
-        'scalapack' for transverse.
+        checks and may raise).  Both channels route EXPLICIT
+        ``'cusolvermp'`` (legacy alias ``'on'``) through the ffi.linalg
+        facade — platform, compiled-capability, process-coverage and
+        true-2D geometry guards — exactly like 'slate'/'scalapack'.  The
+        old inline shortcut (``kind_cusolvermp if is_2d else
+        kind_fallback``) silently demoted an explicit request on a 1-D
+        mesh AND skipped every capability probe, so resolve could promise
+        a handler the mesh/build couldn't run (doctrine 3 / quality
+        pattern #6; audit fix/zq 2026-07-28).
       * auto (or unrecognised): ``auto_pre()`` first when given (the charge
         channel's replication-cap branch; returns a kind, raises, or
         returns ``None`` to fall through), then ``kind_cusolvermp`` on true
@@ -1052,8 +1062,6 @@ def _resolve_channel_ladder(
 
     if override == 'off':
         return kind_fallback
-    if override in ('on', 'cusolvermp'):
-        return kind_cusolvermp if is_2d else kind_fallback
     handler = (explicit or {}).get(override)
     if handler is not None:
         return handler(px, py)
@@ -1099,8 +1107,12 @@ def _resolve_solver_kind_charge(
 
     Override via cohsex.in ``distributed_cholesky``:
       ``off``        → force the in-tree sharded Cholesky.
-      ``cusolvermp`` → force cuSolverMp (still falls back on 1D meshes;
-                       legacy alias ``on``).
+      ``cusolvermp`` → force cuSolverMp (legacy alias ``on``).  EXPLICIT
+                       choice via the ffi.linalg facade: refuses at
+                       resolve time on a non-CUDA mesh, a build without
+                       the compiled handler, or a 1-D mesh (block-cyclic
+                       layout degenerates) — never a silent fallback
+                       (doctrine 3; audit fix/zq 2026-07-28).
       ``slate``      → SLATE ``potrf`` — the portable (Frontier/Aurora)
                        backend.  EXPLICIT choice: fails loudly if the
                        FFI/library is absent or the mesh geometry is the
@@ -1119,6 +1131,15 @@ def _resolve_solver_kind_charge(
         # backend to its charge-channel route string.
         _resolve_linalg_backend('cholesky', 'slate', mesh_xy)
         return 'slate_cholesky'
+
+    def _cusolvermp(px: int, py: int) -> str:
+        # EXPLICIT cusolvermp runs the same facade guard ladder as
+        # 'slate': CUDA platform, compiled handler, process coverage,
+        # true-2D geometry (a 1-D mesh REFUSES at resolve time instead
+        # of silently returning the sharded fallback).  (audit fix/zq
+        # 2026-07-28; doctrine 3 / quality pattern #6)
+        _resolve_linalg_backend('cholesky', 'cusolvermp', mesh_xy)
+        return 'cusolvermp_cholesky'
 
     # auto → default policy.  Fit-size stacks factor with the mesh-invariant
     # replicated dense factor; larger stacks keep the distributed / sharded
@@ -1160,7 +1181,8 @@ def _resolve_solver_kind_charge(
         mesh_xy, override,
         kind_fallback='sharded_cholesky',
         kind_cusolvermp='cusolvermp_cholesky',
-        explicit={'slate': _slate},
+        explicit={'slate': _slate,
+                  'cusolvermp': _cusolvermp, 'on': _cusolvermp},
         auto_pre=_auto_pre)
 
 
@@ -1181,8 +1203,12 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
 
     Override via cohsex.in ``distributed_lu``:
       ``off``        → force per-q ``jnp.linalg.solve``.
-      ``cusolvermp`` → force cuSolverMp (still falls back on 1D meshes;
-                       legacy alias ``on``).
+      ``cusolvermp`` → force cuSolverMp (legacy alias ``on``).  EXPLICIT
+                       choice via the ffi.linalg facade: refuses at
+                       resolve time on a non-CUDA mesh, a build without
+                       the compiled handler, or a 1-D mesh — never a
+                       silent fallback (doctrine 3; audit fix/zq
+                       2026-07-28).
       ``scalapack``  → ScaLAPACK ``pXgetrf``+``pXgetrs`` from Cray LibSci
                        — the host/CPU-backend backend (liblorrax_ffi_host).
                        EXPLICIT choice, never auto-picked; fails loudly if
@@ -1219,13 +1245,23 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
         _resolve_linalg_backend('solve_lu', 'scalapack', mesh_xy)
         return 'scalapack_lu'
 
+    def _cusolvermp(px: int, py: int) -> str:
+        # EXPLICIT cusolvermp runs the same facade guard ladder as
+        # 'scalapack': CUDA platform, compiled handler, process coverage,
+        # true-2D geometry (a 1-D mesh REFUSES at resolve time instead of
+        # silently returning the per-q fallback).  (audit fix/zq
+        # 2026-07-28; doctrine 3 / quality pattern #6)
+        _resolve_linalg_backend('solve_lu', 'cusolvermp', mesh_xy)
+        return 'cusolvermp_lu'
+
     # auto: cuSolverMp on true 2D GPU meshes; the shared ladder's CPU-mesh
     # guard falls back to the CPU-safe in-tree per-q solve.
     kind = _resolve_channel_ladder(
         mesh_xy, override,
         kind_fallback='lu',
         kind_cusolvermp='cusolvermp_lu',
-        explicit={'scalapack': _scalapack})
+        explicit={'scalapack': _scalapack,
+                  'cusolvermp': _cusolvermp, 'on': _cusolvermp})
 
     if kind in ('cusolvermp_lu', 'scalapack_lu') and n_rmu_logical is not None:
         px = int(mesh_xy.shape['x'])
@@ -1316,6 +1352,54 @@ _ZETA_GATHER_MAX_BYTES = int(
 _env_override_warned: set = set()
 
 
+def _env_override_raw(env_name: str) -> str | None:
+    """THE non-empty-env-wins rule of the deprecated env twins, in ONE
+    place: the raw env string when it is set and non-blank (that value
+    wins this release), else ``None`` (the input key is used).  Shared by
+    the factor sites (:func:`_deprecated_env_float`) and the ζ-provenance
+    record (:func:`deprecated_env_record` ←
+    ``gw.gw_init._zeta_fit_provenance``) so the two can never drift
+    (quality pattern #3; audit fix/zq 2026-07-28)."""
+    raw = os.environ.get(env_name)
+    if raw is None or raw.strip() == "":
+        return None
+    return raw
+
+
+def deprecated_env_record(env_name: str, key_value) -> str:
+    """The string ζ-fit provenance records for a deprecated env-twin knob:
+    the raw env string when the env form wins (the exact rule the factor
+    sites apply, via :func:`_env_override_raw`), else ``repr(key_value)``.
+    Byte-identical to the historical inline format in every case that
+    ever produced a reusable ζ, so existing provenance stamps keep
+    matching.  (audit fix/zq 2026-07-28)"""
+    raw = _env_override_raw(env_name)
+    return raw if raw is not None else repr(key_value)
+
+
+_ENV_TRUE = ("1", "true", "yes", "on")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Canonical boolean env parse for this module's telemetry/debug gates
+    (also used by ``gw.gw_init``).
+
+    Unset or exactly-empty → ``default``; otherwise strip + lowercase and
+    test membership in ``("1", "true", "yes", "on")`` — everything else
+    (``0``/``false``/``no``/``off``, any case) is False.  Same grammar as
+    ``file_io/_slab_io_mpi_host._env_flag`` and the C++ writers'
+    ``env_flag`` (``ffi/phdf5/cpp/context.cc``).  Consolidates the
+    hand-rolled ``not in ("0", "", "false")`` parses this branch grew,
+    under which ``LORRAX_ZETA_RANK_LOG=False`` or ``=off`` left a
+    default-on log enabled — the falsy-parse class workstream AT already
+    fixed for LORRAX_CHECK_REPLICA.  (audit fix/zq 2026-07-28)
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in _ENV_TRUE
+
+
 def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
     """Input key is the source of truth; a non-empty env var still overrides,
     but prints a deprecation notice on rank 0 (once per process).
@@ -1323,8 +1407,8 @@ def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
     Empty/unset env → the key's value, exactly.  This also removes the old
     crash on ``LORRAX_ZETA_RCOND=""`` (``float('')``).
     """
-    raw = os.environ.get(env_name)
-    if raw is None or raw.strip() == "":
+    raw = _env_override_raw(env_name)
+    if raw is None:
         return float(key_value)
     val = float(raw)
     if env_name not in _env_override_warned:
@@ -1490,7 +1574,10 @@ def _factor_c_q_replicated(
       over-complete for the pair-density rank).  ``rank_truncate`` (the
       default) is the PRINCIPLED cure that supersedes it — drop the near-null
       directions instead of shifting them — so the ridge stays 0 there.
-      ``LORRAX_ZETA_RIDGE`` overrides ε for tuning.
+      Tune ε via the ``zeta_ridge`` input key in the deck; the
+      ``LORRAX_ZETA_RIDGE`` env form is a DEPRECATED twin (scorecard AV:
+      still wins when set non-empty, but loudly — see
+      :func:`_deprecated_env_float`) slated for removal.
 
     Factorise at the LOGICAL extent and re-embed identity in the pad block
     (√1 = 1 for L; B's pad block is likewise identity and is sliced away in
@@ -1515,8 +1602,8 @@ def _factor_c_q_replicated(
     if key not in _replicated_chol_cache:
         _re = ridge_extra
         _rc = rcond
-        _rank_log = (mode == 'rank_truncate' and _os.environ.get(
-            "LORRAX_ZETA_RANK_LOG", "1") not in ("0", "", "false"))
+        _rank_log = (mode == 'rank_truncate'
+                     and _env_bool("LORRAX_ZETA_RANK_LOG", True))
         @partial(jax.jit, out_shardings=out_sh)
         def _fn(C):
             def _ridged_chol(C_log):
@@ -1736,7 +1823,7 @@ def _chunk_log(where: str, nq: int, qb: int, per_q_bytes: int) -> None:
     took a 72-node job down again.  Deduplicated on the tuple, because the
     back-solve site is re-entered once per r-chunk (9–81 times).
     """
-    if os.environ.get("LORRAX_COLLECTIVE_CHUNK_LOG", "1") in ("0", "", "false"):
+    if not _env_bool("LORRAX_COLLECTIVE_CHUNK_LOG", True):
         return
     if jax.process_index() != 0:
         return
@@ -1796,8 +1883,7 @@ def _factor_c_q_distributed_rank_truncate(
     # DEPRECATED env form — the input key is the record (scorecard AV).
     rcond = _deprecated_env_float(
         "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
-    rank_log = os.environ.get(
-        "LORRAX_ZETA_RANK_LOG", "1") not in ("0", "", "false")
+    rank_log = _env_bool("LORRAX_ZETA_RANK_LOG", True)
 
     # ONE resolved plan, then one call.  ``'distributed'`` (not a hard-coded
     # 'scalapack') is deliberate and is the SAME name ``_resolve_zeta_gather``
@@ -2080,7 +2166,10 @@ def factor_c_q(
         zeta_rcond: rank-truncation cutoff for the
             ``'replicated_rank_truncate'`` charge factor (drop
             eigenvalues < ``zeta_rcond·λ_max``).  Ignored by the Cholesky
-            paths.  ``LORRAX_ZETA_RCOND`` overrides it for tuning.
+            paths.  Tune via the ``zeta_rcond`` input key in the deck;
+            the ``LORRAX_ZETA_RCOND`` env form is a DEPRECATED twin
+            (scorecard AV: still wins when set non-empty, but loudly)
+            slated for removal.
 
     Returns:
         L_q: ``(nq, n_rmu, n_rmu)`` at PADDED extent, sharded

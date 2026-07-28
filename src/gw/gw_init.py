@@ -17,6 +17,11 @@ import h5py
 
 import common.timing as timing
 from common import jax_profile
+# Named-barrier helper: annotates failures with the barrier name and
+# no-ops at P=1; also avoids relying on ``jax.experimental.multihost_utils``
+# being attribute-reachable off a bare ``import jax`` (an import-order
+# accident).  (audit fix/zq 2026-07-28)
+from common.collectives import barrier
 
 
 
@@ -156,6 +161,7 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	pinned by other entries here, so the effective value is pinned too.
 	"""
 	import json
+	from isdf.core import deprecated_env_record as _dep_env_record
 	# ``wfn._filename`` is the same source path fit_zeta_to_h5 copies
 	# mf_header from — the authoritative identity of the ζ's input WFN.
 	wfn_path = getattr(wfn, '_filename', None) or ''
@@ -176,21 +182,19 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'gspace_mode':          str(cfg.gspace_mode),
 		'zeta_cutoff_ry':       round(float(zeta_cutoff), 9),
 		'bare_coulomb_cutoff':  round(float(zeta_vcoul_cutoff), 9),
-		# EFFECTIVE (env-overridden) values — mirrors
-		# isdf/core._deprecated_env_float exactly: the env forms are
-		# DEPRECATED (scorecard AV) but still win when non-empty, so the
-		# provenance must keep recording what the fit actually used.  An
-		# empty env var counts as unset (as in core); the recorded string
-		# is byte-identical to the historical format in every case that
+		# EFFECTIVE (env-overridden) values, recorded via the SAME
+		# non-empty-env-wins rule the factor sites apply
+		# (isdf/core.deprecated_env_record → _env_override_raw — ONE
+		# implementation, no inline mirror to drift; audit fix/zq
+		# 2026-07-28): the env forms are DEPRECATED (scorecard AV) but
+		# still win when non-empty, so the provenance must keep recording
+		# what the fit actually used.  The recorded string is
+		# byte-identical to the historical format in every case that
 		# ever produced a reusable ζ.
-		'zeta_ridge':           (
-			os.environ.get("LORRAX_ZETA_RIDGE")
-			if (os.environ.get("LORRAX_ZETA_RIDGE") or "").strip()
-			else repr(cfg.backend.zeta_ridge)),
-		'zeta_rcond':           (
-			os.environ.get("LORRAX_ZETA_RCOND")
-			if (os.environ.get("LORRAX_ZETA_RCOND") or "").strip()
-			else repr(cfg.backend.zeta_rcond)),
+		'zeta_ridge':           _dep_env_record(
+			"LORRAX_ZETA_RIDGE", cfg.backend.zeta_ridge),
+		'zeta_rcond':           _dep_env_record(
+			"LORRAX_ZETA_RCOND", cfg.backend.zeta_rcond),
 		'charge_zeta_solve':    str(cfg.backend.charge_zeta_solve),
 		'gamma_contract_mode':  str(cfg.backend.gamma_contract_mode),
 		'write_ibz_only':       bool(write_ibz_only),
@@ -224,7 +228,13 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 	sits in front of a multi-hour step whose silent misuse produced a
 	−135 eV QP gap once already (job 7874375, the restart-window bug).
 	"""
-	if os.environ.get('LORRAX_FORCE_REFIT', '') not in ('', '0', 'false', 'False'):
+	# Canonical boolean grammar (isdf/core._env_bool — same set as
+	# _slab_io_mpi_host._env_flag): under the old hand-rolled
+	# ``not in ('', '0', 'false', 'False')`` parse, ``=off``/``=no``
+	# counted as truthy and forced a multi-hour refit (audit fix/zq
+	# 2026-07-28).
+	from isdf.core import _env_bool
+	if _env_bool('LORRAX_FORCE_REFIT', False):
 		print_fn("    [zeta reuse] LORRAX_FORCE_REFIT set — refitting.")
 		return False
 	if not os.path.exists(zeta_h5_path):
@@ -270,6 +280,26 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		         f"set ({got.shape} vs {want.shape}) — refitting.")
 		return False
 	return True
+
+
+def _centroid_table_md5(centroid_fft_idx) -> str:
+	"""Canonical content hash of a centroid fft-index table: int64,
+	C-order bytes → md5 hexdigest.
+
+	Stamped on the restart tensors file at write and verified at restart
+	load, so a restart proves the σ quadrature BASIS — not just its size —
+	matches this run's centroid file(s).  A regenerated centroid file with
+	the SAME count but different points (kmeans reruns plausibly produce
+	this) used to pass the count-only guard and evaluate Σ with ψ sampled
+	at the wrong r_μ — silently wrong physics (pattern #10).  The sibling
+	ζ-reuse cache compares its centroid table element-wise
+	(:func:`_zeta_reuse_ok`); this is the same check compressed to an HDF5
+	attr.  (audit fix/zq 2026-07-28)
+	"""
+	import hashlib
+	arr = np.ascontiguousarray(
+		np.asarray(jax.device_get(centroid_fft_idx), dtype=np.int64))
+	return hashlib.md5(arr.tobytes()).hexdigest()
 
 
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
@@ -358,6 +388,37 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		f"    cutoffs: zeta = {_zeta_cutoff:.1f} Ry, "
 		f"bare-Coulomb = {_zeta_vcoul_cutoff:.1f} Ry  "
 		f"(ecutwfc={float(wfn.ecutwfc):.1f}, ecutrho={_ecutrho:.1f})")
+	# ── Bispinor PRE-FLIGHT (audit fix/zq 2026-07-28): resolve the
+	# transverse distributed-LU contract BEFORE any compute.  The
+	# divisibility refusal (isdf/core._resolve_solver_kind_transverse)
+	# used to fire only inside the transverse fit_zeta_to_h5 calls below,
+	# which run AFTER the charge fit completes — and a bispinor run always
+	# refits the charge channel (ζ reuse is charge-only), so an explicit
+	# distributed_lu whose transverse centroid count does not divide the
+	# mesh burned the multi-hour charge fit before the inevitable
+	# ValueError.  Every input needed to refuse — mesh shape,
+	# distributed_lu, the transverse centroid count — is known right here
+	# (one text-file read), so a doomed run refuses in seconds; the same
+	# call announces an ``auto`` demotion up front (rank 0).  The
+	# per-channel resolution inside fit_zeta_to_h5 later re-resolves
+	# identically (defense in depth).
+	if cfg.bispinor:
+		# Requirement check hoisted with the pre-flight (it used to sit
+		# after the charge fit, same late-refusal shape).
+		if not getattr(cfg.paths, 'centroids_file_current', None):
+			raise ValueError(
+				"Bispinor calculation requires centroids_file_current in cohsex.in "
+				"(set to the path of a current-density kmeans output, e.g. "
+				"centroids_frac_NNN_current.txt from "
+				"`centroid.kmeans_cli --density-mode current ...`)."
+			)
+		from file_io.centroids import load_centroids as _load_cent_pf
+		from isdf.core import _resolve_solver_kind_transverse
+		_, _, _n_rmu_T_pf = _load_cent_pf(
+			cfg.paths.centroids_file_current, meta.fft_grid)
+		_resolve_solver_kind_transverse(
+			mesh_xy, cfg.backend.distributed_lu,
+			n_rmu_logical=int(_n_rmu_T_pf))
 	# ── ζ REUSE: skip the fit when tmp/zeta_q.h5 is complete AND provably
 	# the same fit.  Before this, a rerun in the same directory always
 	# refit (gw_init only VALIDATED the μ extent), costing 20+ min at
@@ -422,7 +483,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			# Non-fatal: the ζ itself is fine, it just won't be reusable.
 			print_fn(f"    [zeta provenance] not stamped ({exc}); this ζ "
 			         f"will be refit on the next run.")
-	jax.experimental.multihost_utils.sync_global_devices("zeta_provenance")
+	barrier("zeta_provenance")
 
 	budget_gb = mem_est.get('budget_gb', cfg.memory.per_device_gb)
 	if peak_bytes > 0:
@@ -450,14 +511,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# otherwise downstream V_q silently falls back to scalar V_q and then
 	# crashes on a full-BZ vs IBZ shape mismatch (ζ_T written by bispinor
 	# mode is full-BZ; scalar V_q expects IBZ-only).  See the 2026-05-14
-	# CrI3 30 Ry test-bed KNOWN_SANDBOX_ERRORS entry.
-	if cfg.bispinor and not getattr(cfg.paths, 'centroids_file_current', None):
-		raise ValueError(
-			"Bispinor calculation requires centroids_file_current in cohsex.in "
-			"(set to the path of a current-density kmeans output, e.g. "
-			"centroids_frac_NNN_current.txt from "
-			"`centroid.kmeans_cli --density-mode current ...`)."
-		)
+	# CrI3 30 Ry test-bed KNOWN_SANDBOX_ERRORS entry.  The
+	# missing-centroids_file_current refusal itself now lives in the
+	# bispinor PRE-FLIGHT above (before the charge fit), so this branch
+	# gate is only reachable with the path present.
 	if cfg.bispinor and getattr(cfg.paths, 'centroids_file_current', None):
 		import dataclasses
 		from common.wfn_transforms import load_centroids_band_chunked
@@ -584,7 +641,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 	if jax.process_index() == 0:
 		os.sync()
-	jax.experimental.multihost_utils.sync_global_devices("zeta_flush")
+	barrier("zeta_flush")
 
 	bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
 
@@ -787,7 +844,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			# entries exact zeros).
 			_g0_np = np.asarray(G0_gathered)[..., :int(meta.n_rmu)]
 			f.create_dataset('g0_mu', data=_g0_np)
-	jax.experimental.multihost_utils.sync_global_devices("g0_write")
+	barrier("g0_write")
 
 	# Scalar V_qmunu is just (nq, μ, μ).  The (1, npol, npol) leading
 	# axes of the legacy 8-D layout were never used in scalar mode and
@@ -1031,6 +1088,26 @@ def prepare_isdf_and_wavefunctions(
 					int(transverse_wfn_data['meta'].n_rmu)
 					if transverse_wfn_data is not None else None),
 			)
+			# Stamp the centroid tables' CONTENT hashes so a restart can
+			# verify the quadrature points, not just their counts (see
+			# ``_centroid_table_md5``; audit fix/zq 2026-07-28).  Rank 0
+			# only, after the collective writer released the file; a
+			# failed stamp is non-fatal — the restart-side guard then
+			# warns about the missing attr instead of verifying.
+			if jax.process_index() == 0:
+				try:
+					with h5py.File(tensors_filename, 'a') as _f:
+						_f.attrs['centroids_charge_md5'] = (
+							_centroid_table_md5(centroid_indices))
+						if transverse_wfn_data is not None:
+							_f.attrs['centroids_transverse_md5'] = (
+								_centroid_table_md5(
+									transverse_wfn_data['centroid_indices']))
+				except Exception as exc:
+					print0(f"    [restart stamp] centroid content hashes "
+					       f"not stamped ({exc}); a restart will warn "
+					       f"instead of verifying the centroid tables.")
+			barrier("restart_centroid_stamp")
 		save_restart_state_per_proc(
 			os.path.join(tmp_dir, "isdf_tensors"),
 			V_qmunu, None, wfns.psi_yr, wfns.enk, meta, mesh_xy)
@@ -1059,6 +1136,43 @@ def prepare_isdf_and_wavefunctions(
 			sanity.check_finite("restart ψ (psi_full_y)", rs.psi_rmu_Y,
 			                    print_fn=print0)
 			sanity.check_finite("restart E_nk", rs.enk_full, print_fn=print0)
+			# Centroid-table CONTENT guard (pattern #10; audit fix/zq
+			# 2026-07-28).  The band-window/n_rmu attrs pin the SHAPES of
+			# the restart tensors; these md5 stamps (written by the
+			# non-restart path above) pin the quadrature POINTS.  Old
+			# restart files predating the stamp get a LOUD warning naming
+			# the gap, not a refusal.
+			_stamped = {}
+			try:
+				with h5py.File(tensors_filename, 'r') as _f:
+					for _a in ('centroids_charge_md5',
+					           'centroids_transverse_md5'):
+						if _a in _f.attrs:
+							_stamped[_a] = str(_f.attrs[_a])
+			except Exception as exc:
+				print0(f"  [restart guard] could not read centroid hash "
+				       f"attrs from {tensors_filename} "
+				       f"({type(exc).__name__}: {exc}).")
+			_have_c = _stamped.get('centroids_charge_md5')
+			if _have_c is None:
+				print0(
+					f"  *** LORRAX SANITY: {tensors_filename} carries no "
+					f"'centroids_charge_md5' attr — it predates the "
+					f"centroid-content stamp (2026-07-28), so the charge "
+					f"centroid TABLE cannot be verified against this "
+					f"run's centroids_file; only counts and band windows "
+					f"are checked.  If the centroid file may have been "
+					f"regenerated since these tensors were written, rerun "
+					f"with restart = false. ***")
+			elif _have_c != _centroid_table_md5(centroid_indices):
+				raise ValueError(
+					f"restart: {tensors_filename} was written for a "
+					f"DIFFERENT charge centroid table (md5 {_have_c} on "
+					f"disk vs {_centroid_table_md5(centroid_indices)} "
+					f"from this run's centroids_file).  Same count, "
+					f"different points ⇒ ψ/V_q sampled at the wrong r_μ "
+					f"(silently wrong physics).  Set restart = false, or "
+					f"restore the original centroid file.")
 			wfns = build_wavefunction_bundle(
 				wfn, sym, meta, band_slices, mesh_xy,
 				psi_rmu_Y=rs.psi_rmu_Y, psi_rmuT_X=rs.psi_rmuT_X,
@@ -1081,16 +1195,17 @@ def prepare_isdf_and_wavefunctions(
 						f"with restart = false to rebuild the tensors "
 						f"(the ζ fits and v_q_bispinor.h5 will be "
 						f"regenerated).")
-				# Provenance: the on-disk transverse μ count must match
-				# the run's centroids_file_current (pattern #10 — the
-				# artifact outlives the config that made it).
+				# Provenance: the on-disk transverse centroid COUNT and
+				# CONTENT (md5 stamp) must match the run's
+				# centroids_file_current (pattern #10 — the artifact
+				# outlives the config that made it).
 				if not getattr(cfg.paths, 'centroids_file_current', None):
 					raise ValueError(
 						"bispinor restart requires centroids_file_current "
 						"in the input file (same requirement as the "
 						"non-restart bispinor path).")
 				from file_io.centroids import load_centroids as _load_cent
-				_, _, _n_rmu_curr_now = _load_cent(
+				_, _cent_T_idx_now, _n_rmu_curr_now = _load_cent(
 					cfg.paths.centroids_file_current, meta.fft_grid)
 				if int(_n_rmu_curr_now) != int(rs.n_rmu_transverse_disk):
 					raise ValueError(
@@ -1102,6 +1217,33 @@ def prepare_isdf_and_wavefunctions(
 						f"{int(_n_rmu_curr_now)}.  The σ^B quadrature "
 						f"basis differs; set restart = false (or restore "
 						f"the original transverse centroid file).")
+				# Content check — same count does NOT mean same points
+				# (audit fix/zq 2026-07-28; ``_stamped`` read above).
+				_have_t = _stamped.get('centroids_transverse_md5')
+				if _have_t is None:
+					print0(
+						f"  *** LORRAX SANITY: {tensors_filename} carries "
+						f"no 'centroids_transverse_md5' attr — it "
+						f"predates the centroid-content stamp "
+						f"(2026-07-28), so the transverse centroid TABLE "
+						f"cannot be verified; only its count "
+						f"({int(rs.n_rmu_transverse_disk)}) was checked.  "
+						f"A regenerated centroids_file_current with the "
+						f"same count would be consumed SILENTLY (Σ^B at "
+						f"the wrong r_μ).  If in doubt, rerun with "
+						f"restart = false. ***")
+				elif _have_t != _centroid_table_md5(_cent_T_idx_now):
+					raise ValueError(
+						f"bispinor restart: {tensors_filename} was "
+						f"written for a DIFFERENT transverse centroid "
+						f"table (md5 {_have_t} on disk vs "
+						f"{_centroid_table_md5(_cent_T_idx_now)} from "
+						f"centroids_file_current).  Same count "
+						f"({int(_n_rmu_curr_now)}), different points ⇒ "
+						f"Σ^B evaluated with ψ sampled at the wrong r_μ "
+						f"(silently wrong physics).  Set restart = false, "
+						f"or restore the original transverse centroid "
+						f"file.")
 				sanity.check_finite(
 					"restart transverse ψ (psi_full_y_transverse)",
 					rs.psi_rmu_Y_transverse, print_fn=print0)
