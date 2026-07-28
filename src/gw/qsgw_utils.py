@@ -142,10 +142,153 @@ def solve_diagonal_sigma_fixed_point(
 # Σ diagonal extraction from sharded Σ_c(ω, k, m_X, n_Y)
 # ---------------------------------------------------------------------------
 
+def is_band_sharded_sigma_omega(a) -> bool:
+    """True iff ``a`` is a 4-D jax.Array actually partitioned on its (m, n)
+    band axes (the ``sigma_omega_layout=sharded`` tile cube).
+
+    Layout is read off the array itself — the single source of truth
+    (QUALITY_PATTERNS #3) — so consumers cannot disagree with the producer
+    about which path a given tensor took.  A replicated / single-device /
+    numpy Σ_c returns False and takes the historical code paths untouched.
+    """
+    sharding = getattr(a, "sharding", None)
+    spec = getattr(sharding, "spec", None)
+    if spec is None or getattr(a, "ndim", 0) != 4:
+        return False
+    spec = tuple(spec) + (None,) * (4 - len(tuple(spec)))
+    return spec[2] is not None or spec[3] is not None
+
+
 # Kernel cache: one jit'd extractor per mesh.  Module-scope (NOT a
 # closure inside the caller) so SC iterations hit the pjit cache instead
 # of retracing+recompiling a fresh function object every call.
 _EXTRACT_DIAG_KERNEL_CACHE: dict[int, object] = {}
+
+# Sharded-layout siblings (one per mesh): the diagonal-only extractor and
+# the band-diagonal adder used by the ``sigma_omega_layout=sharded`` path.
+_EXTRACT_DIAG_SHARDED_KERNEL_CACHE: dict[int, object] = {}
+_ADD_BAND_DIAG_KERNEL_CACHE: dict[int, object] = {}
+
+
+def _extract_diag_sharded_kernel(mesh_xy: Mesh):
+    """Diagonal of a P(None,None,'x','y')-sharded Σ_c WITHOUT materializing
+    the full cube on any device.
+
+    Structural (inside shard_map, where the partitioner cannot hoist a
+    gather — QUALITY_PATTERNS #4): each shard extracts the global-diagonal
+    elements it owns (the (m, n) intersection with the diagonal), everything
+    else contributes exact zeros, and ONE psum over both mesh axes
+    replicates the (nω, nk, nb) diagonal — n_ω·nk·nb·16 B (5.4 MB at
+    nb=512, nb² → nb vs the full-cube gather).  Every diagonal element is
+    owned by exactly one shard, so the psum adds a value to exact zeros —
+    movement-only up to IEEE ``x + 0.0`` (bit-exact for every x ≠ -0.0).
+
+    Requires a SQUARE global band extent with both axes divisible by their
+    mesh axis (m/p_x, n/p_y integral) — guaranteed by the sharded layout's
+    resolve-time divisibility refusal (no mesh pad reaches this path).
+    """
+    key = id(mesh_xy)
+    fn = _EXTRACT_DIAG_SHARDED_KERNEL_CACHE.get(key)
+    if fn is None:
+        from functools import partial
+        from jax.experimental.shard_map import shard_map
+
+        p_x = int(mesh_xy.shape['x'])
+
+        @jax.jit
+        @partial(shard_map, mesh=mesh_xy,
+                 in_specs=P(None, None, 'x', 'y'),
+                 out_specs=P(None, None, None),
+                 check_rep=False)
+        def _diag_sharded(tile):
+            ix = jax.lax.axis_index('x')
+            iy = jax.lax.axis_index('y')
+            mb = tile.shape[2]
+            nbl = tile.shape[3]
+            nb = mb * p_x                       # square global extent
+            i = jnp.arange(nb)
+            a = i - ix * mb
+            b = i - iy * nbl
+            own = (a >= 0) & (a < mb) & (b >= 0) & (b < nbl)
+            a_c = jnp.clip(a, 0, mb - 1)
+            b_c = jnp.clip(b, 0, nbl - 1)
+            vals = tile[:, :, a_c, b_c]         # (nω, nk, nb) local gather
+            vals = jnp.where(own[None, None, :], vals,
+                             jnp.zeros((), dtype=tile.dtype))
+            return jax.lax.psum(vals, axis_name=('x', 'y'))
+
+        fn = _diag_sharded
+        _EXTRACT_DIAG_SHARDED_KERNEL_CACHE[key] = fn
+    return fn
+
+
+def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
+    """``Σ += diag(d)`` on a P(None,None,'x','y')-sharded Σ_c — rank-local.
+
+    The analytic q→0 head is band-diagonal; on the sharded layout it is
+    injected straight into each rank's tile (zero communication, and the
+    dense (nω, nk, nb, nb) head tensor is never materialized anywhere).
+    Element-for-element this performs the same IEEE add the replicated
+    path's dense ``Σ + head`` performs on the diagonal; off-diagonal
+    elements are left untouched (the dense path adds exact 0.0 there).
+
+    ``diag_w_kn`` is host numpy (nω, nk, nb), bit-identical on every rank
+    by construction (pure function of replicated inputs) — placed with
+    ``device_put_process_local`` per the AA.1 rule.
+    """
+    from common.collectives import device_put_process_local
+
+    mesh_xy = sigma_w_kij.sharding.mesh
+    key = id(mesh_xy)
+    fn = _ADD_BAND_DIAG_KERNEL_CACHE.get(key)
+    if fn is None:
+        from functools import partial
+        from jax.experimental.shard_map import shard_map
+
+        @jax.jit
+        @partial(shard_map, mesh=mesh_xy,
+                 in_specs=(P(None, None, 'x', 'y'), P(None, None, None)),
+                 out_specs=P(None, None, 'x', 'y'),
+                 check_rep=False)
+        def _add_diag(tile, diag):
+            ix = jax.lax.axis_index('x')
+            iy = jax.lax.axis_index('y')
+            mb = tile.shape[2]
+            nbl = tile.shape[3]
+            nb = diag.shape[2]
+            i = jnp.arange(nb)
+            a = i - ix * mb
+            b = i - iy * nbl
+            own = (a >= 0) & (a < mb) & (b >= 0) & (b < nbl)
+            a_c = jnp.clip(a, 0, mb - 1)
+            b_c = jnp.clip(b, 0, nbl - 1)
+            contrib = jnp.where(own[None, None, :], diag,
+                                jnp.zeros((), dtype=diag.dtype))
+            # Non-owned i map to clipped duplicate (a, b) slots with exact-0
+            # contributions — scatter-add of zeros, value- and bit-neutral.
+            return tile.at[:, :, a_c, b_c].add(contrib)
+
+        fn = _add_diag
+        _ADD_BAND_DIAG_KERNEL_CACHE[key] = fn
+
+    diag_rep = device_put_process_local(
+        np.ascontiguousarray(np.asarray(diag_w_kn, dtype=np.complex128)),
+        NamedSharding(mesh_xy, P(None, None, None)))
+    return fn(sigma_w_kij, diag_rep)
+
+
+def gather_sigma_omega_replicated_host(sigma_w_kij: jax.Array) -> np.ndarray:
+    """Explicit escape hatch: reconstruct the FULL Σ_c(ω,k,m,n) on every
+    rank's host from the sharded layout (the memo's ``.replicated()`` seam).
+
+    This is exactly the replication the sharded layout exists to avoid —
+    n_ω·nk·nb²·16 B per rank — so no in-tree consumer calls it; it is the
+    promise-contract fallback for tooling / future consumers not yet ported
+    (pattern #6: the fallback is explicit, never silent).
+    """
+    import jax.experimental.multihost_utils as mhu
+    return np.asarray(
+        mhu.process_allgather(sigma_w_kij, tiled=True), dtype=np.complex128)
 
 
 def _extract_diag_kernel(mesh_xy: Mesh):
@@ -182,9 +325,17 @@ def extract_sigma_diag_replicated(
 
     Memory note: the materialised tensor is ``nω · nk · nb² · 16 B``
     per device (≈ 270 MB for MoS2 4×4×1, 80 bands, 41 ω-points).  Fits
-    comfortably in the 28 GB device budget; a shard_map specialisation
-    for the very-large-system case is left for follow-up.
+    comfortably in the 28 GB device budget.
+
+    Sharded layout (``sigma_omega_layout=sharded``): when the input is
+    genuinely band-partitioned (read off ``sigma_w_kij.sharding`` — the
+    array itself is the source of truth), the shard_map specialisation
+    extracts ONLY the diagonal and psums it (nω·nk·nb·16 B moved instead
+    of the full cube).  The replicated input keeps the historical kernel
+    bit-for-bit untouched.
     """
+    if is_band_sharded_sigma_omega(sigma_w_kij):
+        return _extract_diag_sharded_kernel(mesh_xy)(sigma_w_kij)
     return _extract_diag_kernel(mesh_xy)(sigma_w_kij)
 
 

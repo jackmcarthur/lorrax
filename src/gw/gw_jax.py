@@ -224,6 +224,38 @@ def main(argv=None):
 	meta.bispinor = config.bispinor
 	band_slices = BandSlices.from_band_edges(*meta.band_edges)
 
+	# ---- sigma_omega_layout=sharded: resolve-time geometry/backend gate ----
+	# The config-level axis checks (self_consistent, kij_stream) already ran
+	# in ``config.qp_solver``; the two conditions below need the mesh and the
+	# σ window, known only here.  Refusing NOW costs seconds; refusing at the
+	# Σ stage would waste the whole ζ fit (pattern #6: the resolve-time check
+	# must test what will execute).  The Σ driver re-checks divisibility at
+	# its own seam as the last-line guard.
+	if mode.is_dynamic and config.ppm.omega_layout == "sharded":
+		from .gw_config import SlabIOBackend
+		_p_x = int(mesh_xy.devices.shape[0])
+		_p_y = int(mesh_xy.devices.shape[1])
+		_nbs = int(meta.nb_sigma)
+		if _nbs % _p_x != 0 or _nbs % _p_y != 0:
+			raise ValueError(
+				f"sigma_omega_layout=sharded (round 1) requires the σ band "
+				f"window (nval+ncond={_nbs}) to divide the mesh on both axes "
+				f"({_p_x}x{_p_y}): the mesh-pad block cannot ride the sharded "
+				f"consumer path yet.  Use a divisible window or "
+				f"sigma_omega_layout=replicated.")
+		if (jax.process_count() > 1
+				and config.backend.slab_io is SlabIOBackend.H5PY_ALLGATHER):
+			raise ValueError(
+				"sigma_omega_layout=sharded with slab_io=h5py_allgather at "
+				"P>1 would re-introduce the full Σ_c(ω) cube gather inside "
+				"the sigma_mnk.h5 writer — the exact collective this layout "
+				"removes.  Use slab_io=auto (routes to a per-rank parallel "
+				"PHDF5 writer) or phdf5_ffi/phdf5_host.")
+		print0(
+			f"  sigma_omega_layout = sharded: Σ_c(ω,k,m,n) stays "
+			f"(m_X, n_Y)-tiled on the {_p_x}x{_p_y} mesh end-to-end "
+			f"(consumers read tiles; no full-cube replication).")
+
 	# DFT eigenvalues on the Σ band window (Ry) — one fetch, reused by the
 	# Σ_X diagnostic, the SC initial state, degeneracy averaging, and the
 	# results writer.
