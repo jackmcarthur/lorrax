@@ -164,7 +164,11 @@ def _probe_phdf5_host_tier() -> tuple[bool, str]:
     """
     try:
         from mpi4py import MPI  # noqa: F401 — runs MPI_Init_thread
-    except BaseException as exc:  # MPI init failures can be raw SystemExit
+    except (Exception, SystemExit) as exc:
+        # MPI init failures can be raw SystemExit — but NOT BaseException:
+        # that also swallowed KeyboardInterrupt, turning a Ctrl-C during
+        # config parse into a silent tier demotion with a misleading "PMI
+        # mismatch" diagnostic (audit fix/zq 2026-07-28).
         return False, (
             f"mpi4py MPI init failed ({type(exc).__name__}: {exc}).  "
             "This usually means a PMI mismatch between the launcher and "
@@ -892,16 +896,11 @@ def read_lorrax_input(filename: str) -> dict:
                     DeprecationWarning, stacklevel=2,
                 )
 
-        if section.get("use_ffi_io", fallback=None) is not None:
-            import warnings
-            warnings.warn(
-                "Input key 'use_ffi_io' is deprecated; the slab_io=auto "
-                "router picks the best available writer unconditionally.  "
-                "'use_ffi_io = false' is honored as 'slab_io = "
-                "h5py_allgather'; 'use_ffi_io = true' is a no-op.  Set "
-                "'slab_io' explicitly if you need a specific writer.",
-                DeprecationWarning, stacklevel=2,
-            )
+        # 'use_ffi_io' deprecation warns ONCE, at the resolution site in
+        # ``from_input_file`` (which distinguishes the true/false/overridden
+        # cases).  A second generic warning here made one deck emit two
+        # overlapping DeprecationWarnings for one key (audit fix/zq
+        # 2026-07-28).
 
         # isdf_memory_mode: REMOVED key (two-plan W cleanup 2026-07-27).
         # auto/high_mem selected the route that is now w_dyson_solver=local
@@ -1646,8 +1645,11 @@ class LorraxConfig:
         #     ``false`` forces H5PY_ALLGATHER (the pre-FFI writer),
         #     ``true`` is the routed default anyway (no-op), unset means
         #     "route".  Superseded by ``slab_io=<backend>``.
-        #   * on CPU, ``cusolvermp_charge`` / ``cusolvermp_lu`` → ``"off"``
-        #     (in-tree ``cholesky_2d`` and per-q ``jnp.linalg.solve``).
+        #   * on CPU, explicit ``cusolvermp`` (incl. via the legacy
+        #     ``cusolvermp_charge``/``cusolvermp_lu = on`` aliases) is
+        #     REFUSED at parse time (CUDA-only backend; doctrine 3);
+        #     ``distributed_lu = auto`` demotes to ``"off"`` (in-tree
+        #     per-q ``jnp.linalg.solve``) with an announcement.
         #
         # User-facing: same ``cohsex.in`` works on both backends.
         _use_ffi_io_in = _g("use_ffi_io")   # None (unset) | True | False
@@ -1722,8 +1724,19 @@ class LorraxConfig:
         #      named its writer should not pay a host-lib dlopen.
         #   2. ``use_ffi_io=false`` (deprecated) — forces H5PY_ALLGATHER.
         #   3. ``slab_io=auto`` (default) — the platform router, always.
+        # 'use_ffi_io' deprecation warns exactly ONCE per deck, here —
+        # each deck hits exactly one of the three branches below, and the
+        # warning text names what actually happened to the key (audit
+        # fix/zq 2026-07-28: read_lorrax_input used to emit a second,
+        # differently-worded warning for mere presence of the key).
         if _slab_io_in != "auto":
             if _use_ffi_io_in is not None:
+                import warnings
+                warnings.warn(
+                    f"Input key 'use_ffi_io' is deprecated and IGNORED "
+                    f"here: slab_io={_slab_io_in} is explicit and takes "
+                    f"precedence.  Remove use_ffi_io from the deck.",
+                    DeprecationWarning, stacklevel=2)
                 print_fn(
                     f"  [config] use_ffi_io={str(_use_ffi_io_in).lower()} "
                     f"is ignored: slab_io={_slab_io_in} is explicit and "
@@ -1745,6 +1758,13 @@ class LorraxConfig:
             _slab_io_choice = SlabIOBackend.H5PY_ALLGATHER
         else:
             if _use_ffi_io_in is True:
+                import warnings
+                warnings.warn(
+                    "Input key 'use_ffi_io' is deprecated; 'use_ffi_io = "
+                    "true' is a no-op — the slab_io=auto router already "
+                    "picks the best available parallel writer.  Remove "
+                    "the key.",
+                    DeprecationWarning, stacklevel=2)
                 print_fn(
                     "  [config] use_ffi_io=true is deprecated and "
                     "redundant: slab_io=auto already routes to the best "
@@ -1753,41 +1773,55 @@ class LorraxConfig:
                                if _is_cpu_backend
                                else _route_gpu_slab_io(print_fn))
         if _is_cpu_backend:
-            if _dist_chol not in ("off", "slate", "auto"):
-                # slate passes through: it has a host-platform FFI
-                # (liblorrax_ffi_host.so, Target::HostTask) and keeps the
-                # explicit-request-fails-loudly semantics on CPU too.
-                #
-                # ``auto`` ALSO passes through now.  It used to be forced to
-                # 'off' here, but 'off' is an *override* that short-circuits
-                # the whole route policy in isdf/core.py straight to
-                # ``sharded_cholesky`` -- and the replicated route it thereby
-                # skips is the ONLY one that carries the charge ζ-solve
-                # rank-truncation cure (charge_zeta_solve='rank_truncate').
-                # That route is replicated dense JAX with no FFI, so it is
-                # perfectly valid on CPU; only the ABOVE-cap cuSOLVERMp branch
-                # is CUDA-only, and isdf/core.py now declines that on a CPU
-                # mesh.  Forcing 'off' here silently produced a
-                # non-rank-conditioned ζ on CPU (ζ far too large, garbage V_q
-                # -> nonsense Σ and an inverted QP gap) with no warning.
+            # Doctrine 3 (audit fix/zq 2026-07-28): an EXPLICIT
+            # ``cusolvermp`` on a CPU JAX backend REFUSES at parse time —
+            # matching the scalapack-on-GPU refusal below and
+            # eigh_backend's fails-loudly contract — instead of being
+            # rewritten to 'off' (which silently ran a different solver
+            # than the input file names).  Only 'auto' may demote, with an
+            # announcement.
+            #
+            # slate / scalapack pass through: host-platform FFIs
+            # (liblorrax_ffi_host.so) with explicit-request-fails-loudly
+            # semantics at their own resolve/call sites.
+            #
+            # ``distributed_cholesky = auto`` ALSO passes through.  It
+            # used to be forced to 'off' here, but 'off' is an *override*
+            # that short-circuits the whole route policy in isdf/core.py
+            # straight to ``sharded_cholesky`` -- and the replicated route
+            # it thereby skips is the ONLY one that carries the charge
+            # ζ-solve rank-truncation cure
+            # (charge_zeta_solve='rank_truncate').  That route is
+            # replicated dense JAX with no FFI, so it is perfectly valid
+            # on CPU; only the ABOVE-cap cuSOLVERMp branch is CUDA-only,
+            # and isdf/core.py declines that on a CPU mesh.  Forcing 'off'
+            # here silently produced a non-rank-conditioned ζ on CPU
+            # (garbage V_q -> inverted QP gap) with no warning.
+            if _dist_chol == "cusolvermp":
+                raise ValueError(
+                    "distributed_cholesky = cusolvermp is CUDA-only but "
+                    "the JAX backend is CPU; use distributed_cholesky = "
+                    "auto|off|slate on CPU runs (auto keeps the replicated "
+                    "rank-truncation route; slate is the host FFI).")
+            if _dist_lu == "cusolvermp":
+                raise ValueError(
+                    "distributed_lu = cusolvermp is CUDA-only but the JAX "
+                    "backend is CPU; use distributed_lu = "
+                    "auto|off|scalapack on CPU runs (scalapack is the "
+                    "ScaLAPACK host FFI).")
+            if _dist_lu == "auto":
+                # 'auto' demote, announced: auto never picks an FFI LU on
+                # a CPU backend (cuSOLVERMp is CUDA-only and auto never
+                # selects ScaLAPACK), so 'off' (in-tree per-q
+                # jnp.linalg.solve) is the same route auto would resolve
+                # to — made explicit here, and said out loud.
                 print_fn(
-                    f"  [config] distributed_cholesky={_dist_chol} "
-                    "requested but JAX backend is CPU; cuSOLVERMp is "
-                    "CUDA-only.  Forcing 'off' "
-                    "(in-tree sharded_cholesky).  SLATE's host FFI is "
-                    "available via explicit distributed_cholesky = slate."
-                )
-                _dist_chol = "off"
-            if _dist_lu not in ("off", "scalapack"):
-                # scalapack passes through: it is the host-platform LU
-                # backend and keeps explicit-request-fails-loudly
-                # semantics on CPU too.
-                print_fn(
-                    f"  [config] distributed_lu={_dist_lu} requested "
-                    "but JAX backend is CPU; cuSOLVERMp is CUDA-only and "
-                    "auto never picks ScaLAPACK.  Forcing 'off' (in-tree "
-                    "per-q jnp.linalg.solve).  The ScaLAPACK host FFI is "
-                    "available via explicit distributed_lu = scalapack."
+                    "  [config] distributed_lu=auto on CPU backend: auto "
+                    "never picks an FFI LU here (cuSOLVERMp is CUDA-only; "
+                    "ScaLAPACK is explicit-only).  Demoting to 'off' "
+                    "(in-tree per-q jnp.linalg.solve).  The ScaLAPACK "
+                    "host FFI is available via explicit "
+                    "distributed_lu = scalapack."
                 )
                 _dist_lu = "off"
         elif _dist_lu == "scalapack":

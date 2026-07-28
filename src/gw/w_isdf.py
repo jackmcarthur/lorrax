@@ -279,8 +279,9 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
     q_spec = P(('x', 'y'), None, None)
 
     # ``chi_flat`` is donated (position 1): the caller releases χ₀ right
-    # after this call (see ``gw_jax.main`` — the ``del chi0_q`` inside the
-    # ``W.exec`` timing block).  ``V_flat`` is NOT donated — V is reused
+    # after this call (module contract, same as the distributed plan —
+    # the ``del chi0_q_solve`` inside ``screening.py``'s ``W.exec``
+    # timing block).  ``V_flat`` is NOT donated — V is reused
     # by COHSEX Σ_SX, Σ_COH, Σ_X and the PPM fit's Wc = W - V step.
     @partial(jax.jit, donate_argnums=(1,))
     def _solve_w(V_flat: jax.Array, chi_flat: jax.Array, pref: jax.Array) -> jax.Array:
@@ -400,10 +401,11 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     numerical contract is the Dyson residual (``LORRAX_W_RESIDUAL_CHECK``),
     not bit-identity with the local plan.
 
-    Geometry/capability failures (host lib absent, non-square mesh,
-    n not divisible, process coverage) RAISE at resolve time with the
-    resolver's own message — an explicitly requested distributed solve
-    never silently downgrades to the local plan (quality pattern #6/#8).
+    Geometry/capability failures (host lib absent, non-square or 1-D
+    mesh, n not divisible, process coverage) RAISE at resolve time with
+    the resolver's own message — an explicitly requested distributed
+    solve never silently downgrades to the local plan (quality pattern
+    #6/#8).
     """
     n_ext = int(n_rmu)
     n_log = int(n_rmu_logical)
@@ -420,23 +422,25 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     from ffi.linalg.plan import plan as linalg_plan
     # House chunking pattern — single source (scorecard AF): one emitted
     # collective's payload is bounded by LORRAX_COLLECTIVE_CHUNK_MB.
+    # TODO(release): promote _chunk_q/_chunk_log to a public home (e.g.
+    # common/collectives.chunk_q/chunk_log) and import them publicly from
+    # both isdf/core and here — gw physics code should not reach into
+    # another package's underscore-private namespace, and _chunk_log's
+    # module-global dedup set is cross-package shared mutable state with
+    # no public contract (audit fix/zq 2026-07-28, _idx 29; needs an
+    # isdf/core edit, outside this fix's file set).
     from isdf.core import _chunk_q, _chunk_log
 
     # Every guard fires HERE (vocabulary, platform, capability, process
-    # coverage, mesh geometry, divisibility) — resolve.py's ladder, with
-    # its own messages.  ``distributed`` maps to the platform default
-    # (ScaLAPACK on cpu, cuSOLVERMp on CUDA) in ONE place.
+    # coverage, mesh geometry — including the 1-D-mesh cusolvermp refusal
+    # — and divisibility) — resolve.py's ladder, with its own messages.
+    # ``distributed`` maps to the platform default (ScaLAPACK on cpu,
+    # cuSOLVERMp on CUDA) in ONE place.  No compensating ``p.is_native``
+    # re-check is needed: an explicit request that cannot be honored
+    # raises at resolve time (the former silent 1-D-mesh degenerate-to-
+    # native was removed; audit fix/zq 2026-07-28), so a returned plan is
+    # always the distributed backend it names.
     p = linalg_plan("solve_lu", mesh_xy, backend="distributed", n=n_ext)
-    if p.is_native:
-        # Only reachable through resolve's documented legacy semantics
-        # (cusolvermp on a 1-D CUDA mesh degenerates to native).  An
-        # explicit request must not silently run a different plan.
-        px_, py_ = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
-        raise RuntimeError(
-            f"w_dyson_solver=distributed: no distributed solve_lu on this "
-            f"mesh ({px_}x{py_}; the resolver degenerated to the native "
-            f"backend).  Use w_dyson_solver=local here, or a mesh the "
-            f"distributed backend supports.")
 
     px = int(mesh_xy.shape['x'])
     py = int(mesh_xy.shape['y'])
@@ -524,8 +528,14 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
         W = p.batched(A, B)
         if _mask_pads is not None:
             W = _mask_pads(W)
-        if os.environ.get("LORRAX_W_RESIDUAL_CHECK", "0") not in (
-                "0", "", "false"):
+        # House falsy vocabulary — same parse (and same rationale comment)
+        # as common/collectives.py's LORRAX_CHECK_REPLICA fix (workstream
+        # AT): the narrow "0"/""/"false" tuple this replaced meant
+        # LORRAX_W_RESIDUAL_CHECK=off/no/False silently ENABLED the
+        # diagnostic — which must be OFF when taking collective-table
+        # probes (docs/dev/env_vars.md).  (audit fix/zq 2026-07-28)
+        if os.environ.get("LORRAX_W_RESIDUAL_CHECK", "0").strip().lower() \
+                not in ("", "0", "false", "no", "off"):
             _w_residual_report(V_flat, chi_scaled, W, n_ext)
         return W
 

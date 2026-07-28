@@ -13,17 +13,25 @@ from __future__ import annotations
 
 import atexit
 import threading
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import jax
 from jax.sharding import Mesh
 
 from ..common import ffi_loader
 
-__all__ = ["open_file", "close_file", "validate_mesh_2d"]
+__all__ = ["open_file", "close_file", "platform_for_handle",
+           "validate_mesh_2d"]
 
 _LOCK = threading.Lock()
-_FILE_CTXS: Dict[str, int] = {}              # path -> int64 ctx handle
+# path -> (int64 ctx handle, owning platform "CUDA"|"cpu").  The platform
+# is recorded at open and used for EVERY lifecycle call on the handle: a
+# PhdfCtx* allocated by one platform's .so (its heap, its HDF5/MPI state)
+# must never be handed to the other library — the dual-platform
+# (JAX_PLATFORMS=cuda,cpu) hazard the mesh routing exists for.  Routing
+# only the open by mesh platform while close/ensure_dataset followed the
+# JAX default backend was exactly that bug (audit fix/zq 2026-07-28).
+_FILE_CTXS: Dict[str, Tuple[int, str]] = {}
 
 
 def validate_mesh_2d(mesh: Mesh) -> tuple[int, int]:
@@ -81,47 +89,68 @@ def open_file(path: str, *, mesh: Mesh, mode: str = "w") -> int:
 
     with _LOCK:
         if path in _FILE_CTXS:
-            return _FILE_CTXS[path]
+            return _FILE_CTXS[path][0]
         ctx = ffi_loader.phdf5_open(
             path, p, q,
             int(jax.process_index()), int(jax.process_count()),
             _MODE_FLAGS[mode], platform=platform,
         )
-        _FILE_CTXS[path] = ctx
+        _FILE_CTXS[path] = (ctx, platform)
         return ctx
+
+
+def platform_for_handle(ctx_handle: int) -> Optional[str]:
+    """The platform ("CUDA"/"cpu") whose library allocated ``ctx_handle``,
+    or None for an unknown handle.  Every lifecycle call on a handle
+    (``phdf5_close`` / ``phdf5_ensure_dataset`` / ``phdf5_open_dataset_ro``)
+    must go through the owning platform's .so — this is the lookup the
+    write-side lifecycle sites use to route theirs."""
+    with _LOCK:
+        for _ctx, _plat in _FILE_CTXS.values():
+            if _ctx == int(ctx_handle):
+                return _plat
+    return None
 
 
 def close_file(path_or_handle) -> None:
     """Collective close.  Accepts either a path (the original open_file
-    argument) or the int handle returned from open_file."""
+    argument) or the int handle returned from open_file.
+
+    Routed to the platform library that OPENED the handle (recorded in
+    ``_FILE_CTXS`` at open) — not the JAX default backend, which in a
+    dual-platform process could be the other library and would then free
+    a foreign PhdfCtx* against foreign HDF5/MPI state.  An unknown handle
+    (not opened through this module) falls back to the default-backend
+    library, the pre-existing best guess."""
     global _FILE_CTXS
-    # Route to the process's own platform library (CUDA on a GPU node, cpu on
-    # a CPU node) — get_lib(None) follows the JAX default backend.  Hardcoding
-    # "CUDA" would fail to load on a CPU node where only the host lib exists.
-    ffi_loader.get_lib()
     with _LOCK:
+        platform = None
         if isinstance(path_or_handle, str):
-            ctx = _FILE_CTXS.pop(path_or_handle, None)
+            entry = _FILE_CTXS.pop(path_or_handle, None)
+            ctx = entry[0] if entry is not None else None
+            platform = entry[1] if entry is not None else None
         else:
             ctx = int(path_or_handle)
-            # Drop any path entries pointing at this ctx.
-            for k in [k for k, v in _FILE_CTXS.items() if v == ctx]:
+            # Drop any path entries pointing at this ctx, keeping its
+            # recorded platform.
+            for k in [k for k, v in _FILE_CTXS.items() if v[0] == ctx]:
+                platform = _FILE_CTXS[k][1]
                 _FILE_CTXS.pop(k, None)
         if ctx is not None and ctx != 0:
-            ffi_loader.phdf5_close(int(ctx))
+            # platform=None (unknown handle) follows the JAX default
+            # backend inside ffi_loader — hardcoding "CUDA" would fail on
+            # a CPU node where only the host lib exists.
+            ffi_loader.phdf5_close(int(ctx), platform=platform)
 
 
 def _atexit_close_all() -> None:
     """Close any files still open at process exit — catches forgotten
-    close_file calls.  Runs on every process."""
-    try:
-        ffi_loader.get_lib()
-    except Exception:
-        return
+    close_file calls.  Runs on every process.  Each handle closes through
+    its own recorded platform library."""
     with _LOCK:
-        for path, ctx in list(_FILE_CTXS.items()):
+        for path, (ctx, platform) in list(_FILE_CTXS.items()):
             try:
-                ffi_loader.phdf5_close(int(ctx))
+                ffi_loader.phdf5_close(int(ctx), platform=platform)
             except Exception:
                 pass
         _FILE_CTXS.clear()

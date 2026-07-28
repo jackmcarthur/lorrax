@@ -1,12 +1,13 @@
 """Call-time dispatch for the distributed dense-linalg facade.
 
-One function per operation, shared by every consumer, so the backend
-names and the per-backend output conventions are defined exactly once.
-Consumers today:
-
-  * ``bse.vq_interp.prepare_coarse``      — the coarse C_q tiles (n_μ²)
-  * ``bandstructure.bse_setup.compute_wfns_fi`` — the htransform fH_q
-    (rank², rank ≈ nspinor·n_μ)
+One function per operation, so the backend names and the per-backend
+output conventions are defined exactly once.  ``dispatch_eigh`` is a
+retained back-compat entry point (external scripts via the
+``ffi.common.dispatch`` shim): the former in-tree consumers —
+``bse.vq_interp.prepare_coarse`` and
+``bandstructure.bse_setup.compute_wfns_fi`` — both migrated to the plan
+facade (``linalg_plan("eigh", ...)``) and no in-tree caller remains; the
+only in-repo coverage is ``tests/test_ffi_linalg_contract.py``.
 
 Do not add a second dispatcher next to this one; add the operation here.
 Backend *resolution* (guards, capability probing, auto policy) lives in
@@ -82,8 +83,11 @@ def dispatch_eigh(A, mesh_xy: Mesh, backend: str):
     if backend in ("auto", "off", NATIVE):
         return jnp.linalg.eigh(A)
     p = _plan("eigh", mesh_xy, backend=backend)
-    if p.is_native:                        # (unreachable today: eigh has no
-        return jnp.linalg.eigh(A)          # silent FFI→native fallback)
+    if p.is_native:                        # (unreachable: resolve has NO
+        return jnp.linalg.eigh(A)          # silent FFI→native fallback for
+                                           # any op — explicit requests
+                                           # refuse at resolve time, and
+                                           # auto/off returned above)
     if A.ndim != 2:
         raise ValueError(
             f"eigh backend {backend!r} takes ONE (n, n) matrix — got shape "

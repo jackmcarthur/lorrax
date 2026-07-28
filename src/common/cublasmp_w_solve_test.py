@@ -1,6 +1,15 @@
 """Correctness test for the fused cuBLASMp + cuSOLVERMp W-solve.
 
 Compares against numpy's direct solve of (I - V chi) W = V.
+
+DEPRECATED / OWNER-LEDGER ITEM (handoff 2026-07-28 open ledger): the
+``ffi/cublasmp`` fused-W package this gates is CONSUMER-LESS in-tree —
+its w_isdf consumer (``_get_w_solve_fn_low_mem``) was deleted in the
+two-plan W cleanup (2026-07-27), superseded by
+``w_dyson_solver = distributed`` (2-D-sharded backsolve through the
+ffi.linalg plan facade; cuSOLVERMp on CUDA meshes).  The package + this
+gate script are scheduled for the owner's deletion pass once the one rtx
+gate runs; do not add new consumers.
 """
 from __future__ import annotations
 import os, sys, argparse, time

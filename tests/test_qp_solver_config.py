@@ -165,9 +165,28 @@ def test_sc_bad_accelerator_rejected(tmp_path):
 # ---------------------------------------------------------------------------
 # Distributed-linalg axes: distributed_cholesky / distributed_lu
 # (portable backend names; legacy cusolvermp_charge/cusolvermp_lu aliases)
+#
+# The parse outcome is JAX-backend-dependent (explicit cusolvermp REFUSES
+# on a CPU backend — doctrine 3, audit fix/zq 2026-07-28; 'auto' LU
+# demotes there with an announcement), so each cell PINS the backend via
+# monkeypatch instead of inheriting whatever the test box runs, and the
+# slab_io routers are stubbed so no capability probe / MPI init runs at
+# parse time.
 # ---------------------------------------------------------------------------
 
-def test_distributed_linalg_defaults(tmp_path):
+def _pin_backend(monkeypatch, backend_name: str):
+    import jax
+    import gw.gw_config as gw_config
+    from gw.gw_config import SlabIOBackend
+    monkeypatch.setattr(jax, "default_backend", lambda: backend_name)
+    monkeypatch.setattr(gw_config, "_route_cpu_slab_io",
+                        lambda print_fn: SlabIOBackend.H5PY_ALLGATHER)
+    monkeypatch.setattr(gw_config, "_route_gpu_slab_io",
+                        lambda print_fn: SlabIOBackend.H5PY_ALLGATHER)
+
+
+def test_distributed_linalg_defaults(tmp_path, monkeypatch):
+    _pin_backend(monkeypatch, "gpu")
     cfg = _config(tmp_path)
     assert cfg.backend.distributed_cholesky == "auto"
     assert cfg.backend.distributed_lu == "auto"
@@ -184,7 +203,10 @@ def test_distributed_lu_slate_rejected(tmp_path):
         _config(tmp_path, "distributed_lu = slate\n")
 
 
-def test_legacy_cusolvermp_aliases_warn_and_map(tmp_path):
+def test_legacy_cusolvermp_aliases_warn_and_map(tmp_path, monkeypatch):
+    # Non-CPU backend: the mapped 'cusolvermp' survives to the stored
+    # config (on CPU the same deck now refuses — see the CPU cells below).
+    _pin_backend(monkeypatch, "gpu")
     with pytest.warns(DeprecationWarning, match="cusolvermp_charge"):
         cfg = _config(tmp_path, "cusolvermp_charge = on\n")
     assert cfg.backend.distributed_cholesky == "cusolvermp"
@@ -193,7 +215,8 @@ def test_legacy_cusolvermp_aliases_warn_and_map(tmp_path):
     assert cfg.backend.distributed_lu == "off"
 
 
-def test_explicit_new_key_beats_legacy_alias(tmp_path):
+def test_explicit_new_key_beats_legacy_alias(tmp_path, monkeypatch):
+    _pin_backend(monkeypatch, "gpu")
     with pytest.warns(DeprecationWarning):
         cfg = _config(
             tmp_path,
@@ -204,3 +227,38 @@ def test_explicit_new_key_beats_legacy_alias(tmp_path):
 def test_distributed_cholesky_invalid_value_raises(tmp_path):
     with pytest.raises(ValueError, match="distributed_cholesky"):
         _config(tmp_path, "distributed_cholesky = scalapack\n")
+
+
+@pytest.mark.parametrize("key", ["distributed_cholesky", "distributed_lu"])
+def test_explicit_cusolvermp_on_cpu_refuses(tmp_path, monkeypatch, key):
+    # Doctrine 3: an explicit CUDA-only backend on a CPU JAX backend
+    # REFUSES at parse time — it is not rewritten to 'off' (which silently
+    # ran a different solver than the input file names).  Substring
+    # contract, not exact text.
+    _pin_backend(monkeypatch, "cpu")
+    with pytest.raises(ValueError, match="CUDA-only"):
+        _config(tmp_path, f"{key} = cusolvermp\n")
+
+
+def test_legacy_alias_cusolvermp_on_cpu_refuses(tmp_path, monkeypatch):
+    # The legacy 'on' spelling maps to cusolvermp and must hit the SAME
+    # refusal on CPU — the alias is not a loophole.
+    _pin_backend(monkeypatch, "cpu")
+    with pytest.warns(DeprecationWarning, match="cusolvermp_charge"):
+        with pytest.raises(ValueError, match="CUDA-only"):
+            _config(tmp_path, "cusolvermp_charge = on\n")
+
+
+def test_auto_on_cpu_chol_passes_lu_demotes_announced(tmp_path, monkeypatch):
+    # 'auto' MAY demote, announced: distributed_cholesky=auto passes
+    # through (it carries the replicated rank-truncation route on CPU);
+    # distributed_lu=auto demotes to 'off' and says so.
+    _pin_backend(monkeypatch, "cpu")
+    lines: list[str] = []
+    path = tmp_path / "cohsex_auto_cpu.in"
+    path.write_text(BASE_INPUT)
+    cfg = LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    assert cfg.backend.distributed_cholesky == "auto"
+    assert cfg.backend.distributed_lu == "off"
+    assert any("distributed_lu=auto" in l and "off" in l for l in lines)

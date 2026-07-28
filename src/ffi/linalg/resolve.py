@@ -221,6 +221,38 @@ def _check_geometry(op: str, backend: str, px: int, py: int) -> None:
                 f"or 1-D meshes.")
 
 
+#: (op, px, py) triples whose auto→native geometry demote has already been
+#: announced this process — resolve_backend runs per plan() call and the
+#: announcement is per-decision, not per-call.
+_AUTO_GEOMETRY_DEMOTE_ANNOUNCED: set[tuple[str, int, int]] = set()
+
+
+def _announce_auto_geometry_demote(op: str, px: int, py: int) -> None:
+    """Rank-0, once-per-(op, geometry) announcement that ``auto`` demoted a
+    compiled cusolvermp to native because the mesh is 1-D (doctrine 3:
+    'auto' may demote but must announce).  Mesh geometry cannot differ per
+    rank, so rank 0 speaks for all."""
+    key = (op, int(px), int(py))
+    if key in _AUTO_GEOMETRY_DEMOTE_ANNOUNCED:
+        return
+    _AUTO_GEOMETRY_DEMOTE_ANNOUNCED.add(key)
+    if _process_index() == 0:
+        print(
+            f"  [linalg.resolve] {op} backend 'auto': cusolvermp is "
+            f"compiled but the {px}x{py} mesh is 1-D (block-cyclic 2-D "
+            f"layout needs px >= 2 and py >= 2) — demoting to native.  "
+            f"An explicit 'cusolvermp' request on this mesh refuses "
+            f"instead.", flush=True)
+
+
+def _process_index() -> int:
+    import jax
+    try:
+        return int(jax.process_index())
+    except Exception:
+        return 0
+
+
 def resolve_backend(op: str, requested: str, mesh_xy: Mesh,
                     *, n: int | None = None) -> str:
     """Resolve a requested backend name for ``op`` on ``mesh_xy``.
@@ -267,9 +299,13 @@ def resolve_backend(op: str, requested: str, mesh_xy: Mesh,
       out of the replicated factor's O(nq·μ³)-with-no-P-scaling wall.
     * ``cholesky`` / ``solve_lu``: ``cusolvermp`` on a true-2D
       (px>=2 and py>=2) CUDA mesh when its handler is compiled, else
-      ``native``.  Never an FFI backend on a CPU mesh.  (The GW ζ-fit
-      layer adds the replication-cap / rank-truncation refinement on
-      top — see ``isdf/core._resolve_solver_kind_charge``.)
+      ``native`` (announced on rank 0 when the demote is geometry-driven,
+      i.e. the handler IS compiled but the mesh is 1-D).  Never an FFI
+      backend on a CPU mesh.  An EXPLICIT ``cusolvermp`` (or
+      ``distributed`` resolving to it) on a 1-D mesh refuses at guard 5
+      instead of demoting.  (The GW ζ-fit layer adds the replication-cap
+      / rank-truncation refinement on top — see
+      ``isdf/core._resolve_solver_kind_charge``.)
     """
     if op not in BACKEND_CHOICES:
         raise ValueError(f"unknown linalg op {op!r} (known: {'|'.join(OPS)})")
@@ -283,6 +319,7 @@ def resolve_backend(op: str, requested: str, mesh_xy: Mesh,
         return NATIVE
 
     px, py = _mesh_shape(mesh_xy)
+    requested_spelling = requested   # keep the user's spelling for messages
     if requested == "distributed":
         # "Spread ONE tile over the whole mesh, with whatever library this
         # platform's distributed eigh is."  Explicit — every guard below
@@ -301,6 +338,14 @@ def resolve_backend(op: str, requested: str, mesh_xy: Mesh,
         target, _ = _SPEC[(op, "cusolvermp")]
         if px >= 2 and py >= 2 and ffi_loader.has_target(target, "CUDA"):
             return "cusolvermp"
+        # Doctrine 3: 'auto' MAY demote, but must announce.  The only
+        # demote here that is not the documented default policy ("native
+        # unless a compiled cusolvermp on a true-2D CUDA mesh") is the
+        # geometry one: handler compiled, mesh 1-D.  Mesh geometry is
+        # identical on every rank, so a rank-0 line suffices; deduped so
+        # repeated plan() calls do not spam.  (audit fix/zq 2026-07-28)
+        if ffi_loader.has_target(target, "CUDA") and not (px >= 2 and py >= 2):
+            _announce_auto_geometry_demote(op, px, py)
         return NATIVE
 
     # ── explicit FFI backend: run the full guard ladder ──────────────
@@ -363,11 +408,25 @@ def resolve_backend(op: str, requested: str, mesh_xy: Mesh,
 
     # 5. geometry
     if requested == "cusolvermp" and op in ("cholesky", "solve_lu"):
-        # Documented legacy semantics of the ζ-fit ladder: explicit
-        # cusolvermp still falls back to native on a 1-D mesh (the
-        # block-cyclic 2-D layout degenerates there).
+        # cuSOLVERMp's block-cyclic 2-D layout degenerates on a 1-D mesh.
+        # This used to ``return NATIVE`` silently ("legacy semantics of
+        # the ζ-fit ladder") — a doctrine-3 violation that forced the one
+        # strict consumer (gw/w_isdf._get_w_solve_fn_distributed) to
+        # re-check ``p.is_native`` after planning.  The ζ-fit ladder does
+        # its OWN explicit 1-D fallback upstream (isdf/core
+        # ``kind_cusolvermp if is_2d else kind_fallback``) and never
+        # reaches this guard, so nothing in-tree depended on the silent
+        # demote.  Explicit requests now refuse HERE; 'auto' demotes with
+        # an announcement above.  (audit fix/zq 2026-07-28)
         if not (px >= 2 and py >= 2):
-            return NATIVE
+            _via = ("" if requested_spelling == "cusolvermp"
+                    else f" (requested as {requested_spelling!r})")
+            raise ValueError(
+                f"{op} backend 'cusolvermp'{_via} needs a true-2D mesh "
+                f"(px >= 2 and py >= 2): its block-cyclic 2-D layout "
+                f"degenerates on the {px}x{py} mesh.  Use a true-2D mesh, "
+                f"or 'auto' (demotes to native with an announcement), or "
+                f"'off' for the native path.")
     _check_geometry(op, requested, px, py)
 
     # 6. divisibility

@@ -3,7 +3,9 @@
 // open_file: collective MPI_Init_thread + H5Fcreate/H5Fopen with cached
 // property lists.
 //
-// Env tunables (all optional; docs/dev/env_vars.md is the registry):
+// Env tunables (all optional; docs/dev/env_vars.md is the registry).
+// Boolean knobs accept the shared writer grammar — see env_flag below
+// (mirrors Python's file_io/_slab_io_mpi_host._env_flag exactly):
 //   LORRAX_PHDF5_COLLECTIVE_WRITES (1)  collective vs independent writes
 //   LORRAX_PHDF5_DEDUP_REPLICAS   (1)   one canonical writer per replica
 //   LORRAX_PHDF5_INDEPENDENT      (0)   force independent READS
@@ -19,6 +21,7 @@
 //                                       Frontera — scorecard AI/AW)
 //   LORRAX_PHDF5_DUMP_HINTS       (0)   print the hints ROMIO retained
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -87,6 +90,30 @@ static long env_long(const char* name, long default_value) {
     long parsed = std::strtol(v, &end, 10);
     if (end == v) return default_value;
     return parsed;
+}
+
+// Pull a BOOLEAN tunable from env.  Grammar is defined in ONE place —
+// Python's ``file_io/_slab_io_mpi_host._env_flag`` — and mirrored here
+// exactly (keep the two in sync):
+//   unset or empty                                  -> default
+//   strip + lowercase in {"1", "true", "yes", "on"} -> true
+//   anything else ("0", "false", "no", "off", ...)  -> false
+// Boolean knobs used to go through env_long, whose strtol grammar
+// silently kept the DEFAULT on word spellings — so e.g.
+// LORRAX_PHDF5_COLLECTIVE_WRITES=false left the FFI writer collective
+// while the Python phdf5_host writer went independent: the two writers
+// diverged on the same environment (audit fix/zq 2026-07-28).
+static bool env_flag(const char* name, bool default_value) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return default_value;
+    std::string s(v);
+    // strip (all-whitespace strips to "" -> false, matching Python, where
+    // only unset / exactly-empty return the default)
+    const auto b = s.find_first_not_of(" \t\r\n");
+    const auto e = s.find_last_not_of(" \t\r\n");
+    s = (b == std::string::npos) ? std::string() : s.substr(b, e - b + 1);
+    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+    return s == "1" || s == "true" || s == "yes" || s == "on";
 }
 
 // Grow the staging buffer to >= need_bytes.  The read core H5Dreads into
@@ -215,13 +242,16 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     //                                     (overlapping selections are
     //                                     undefined under collective
     //                                     MPI-IO — only for debugging)
-    const bool force_indep_read    = env_long("LORRAX_PHDF5_INDEPENDENT", 0) != 0;
-    const bool coll_write          = env_long("LORRAX_PHDF5_COLLECTIVE_WRITES", 1) != 0;
-    const bool force_coll_metadata = env_long("LORRAX_PHDF5_COLL_META", 0) != 0;
+    // Boolean knobs parse through env_flag — the SAME grammar as the
+    // Python writers' _env_flag (see env_flag above), so a given
+    // environment means the same thing in every writer.
+    const bool force_indep_read    = env_flag("LORRAX_PHDF5_INDEPENDENT", false);
+    const bool coll_write          = env_flag("LORRAX_PHDF5_COLLECTIVE_WRITES", true);
+    const bool force_coll_metadata = env_flag("LORRAX_PHDF5_COLL_META", false);
     ctx->use_collective_read  = !force_indep_read;
     ctx->use_collective_write = coll_write;
     ctx->coll_metadata        = force_coll_metadata;
-    ctx->dedup_replicas       = env_long("LORRAX_PHDF5_DEDUP_REPLICAS", 1) != 0;
+    ctx->dedup_replicas       = env_flag("LORRAX_PHDF5_DEDUP_REPLICAS", true);
     // Alignment default matches the new striping_unit default (4 MiB) so
     // H5 objects start on Lustre stripe boundaries.
     long align_mb        = env_long("LORRAX_PHDF5_ALIGN_MB", 4);
@@ -286,8 +316,9 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     // Default 16 x 4 MiB (scorecard AI: +57% on top of collective; the
     // request is clamped to what Lustre grants — the banner prints the
     // request, `lfs getstripe` prints the truth).  No-ops if the file
-    // inode already exists — which is why the Python prestripe path
-    // unlinks on mode='w'.
+    // inode already exists — which is why, on mode='w', rank 0 unlinks
+    // the target before open in both Python backends, so the collective
+    // create here sees a fresh inode and the striping hints apply.
     //
     // Env naming: LORRAX_PHDF5_STRIPE_SIZE_FS is THE documented knob
     // (env_vars.md), spelled like `lfs setstripe -S` ("4M"); it is read
@@ -373,7 +404,7 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     //     doesn't clutter normal output; indispensable when tuning
     //     Lustre/ROMIO performance because ROMIO silently ignores hints
     //     it doesn't understand or that the filesystem overrides.
-    if (ctx->rank == 0 && env_long("LORRAX_PHDF5_DUMP_HINTS", 0) != 0) {
+    if (ctx->rank == 0 && env_flag("LORRAX_PHDF5_DUMP_HINTS", false)) {
         void* vfd_handle = nullptr;
         if (H5Fget_vfd_handle(ctx->file_id, ctx->fapl_id, &vfd_handle) >= 0
             && vfd_handle != nullptr) {

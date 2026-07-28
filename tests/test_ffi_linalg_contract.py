@@ -932,6 +932,76 @@ def test_plan_describe_and_module_are_honest():
         _ = p.module
 
 
+# ---------------------------------------------------------------------------
+# resolve guard 5 — the 1-D-mesh cusolvermp geometry contract (doctrine 3).
+# Pure resolve-level cells: the mesh/capability facts are mocked, so these
+# run on any dev box with no GPU and no .so.  They pin the CONTRACT
+# (refusal for explicit requests, announced demote for 'auto') by
+# substring, not exact text.  The old behavior — explicit cusolvermp
+# silently returning NATIVE on a 1-D mesh — forced a compensating
+# ``p.is_native`` re-raise in gw/w_isdf; both were removed together
+# (audit fix/zq 2026-07-28).
+# ---------------------------------------------------------------------------
+
+class _FakeCudaMesh:
+    """Shape/platform stand-in: resolve_backend reads only
+    ``mesh.shape['x'/'y']``, ``mesh.devices.flat[0].platform`` and
+    ``mesh.devices.size``."""
+
+    def __init__(self, px, py):
+        from types import SimpleNamespace
+        self.shape = {"x": px, "y": py}
+        self.devices = SimpleNamespace(
+            flat=[SimpleNamespace(platform="gpu")], size=px * py)
+
+
+def _mock_cuda_capabilities(monkeypatch, nproc):
+    from ffi.linalg import resolve as R
+    from ffi.common import ffi_loader as FL
+    monkeypatch.setattr(FL, "probe_target", lambda t, p: (True, "ok"))
+    monkeypatch.setattr(FL, "has_target", lambda t, p: True)
+    monkeypatch.setattr(R, "_process_count", lambda: nproc)
+    return R
+
+
+@pytest.mark.parametrize("op", ["cholesky", "solve_lu"])
+def test_resolve_explicit_cusolvermp_refuses_on_1d_mesh(monkeypatch, op):
+    R = _mock_cuda_capabilities(monkeypatch, nproc=4)
+    with pytest.raises(ValueError, match="true-2D"):
+        R.resolve_backend(op, "cusolvermp", _FakeCudaMesh(1, 4))
+    with pytest.raises(ValueError, match="1x4"):
+        R.resolve_backend(op, "cusolvermp", _FakeCudaMesh(1, 4))
+
+
+def test_resolve_distributed_spelling_refuses_and_names_itself(monkeypatch):
+    # 'distributed' maps to cusolvermp on CUDA and must refuse the same
+    # way — naming the user's original spelling, so the message points at
+    # the key the deck actually set (w_dyson_solver=distributed).
+    R = _mock_cuda_capabilities(monkeypatch, nproc=4)
+    with pytest.raises(ValueError, match="distributed"):
+        R.resolve_backend("solve_lu", "distributed", _FakeCudaMesh(4, 1))
+
+
+def test_resolve_explicit_cusolvermp_2d_mesh_is_a_promise(monkeypatch):
+    R = _mock_cuda_capabilities(monkeypatch, nproc=4)
+    assert R.resolve_backend(
+        "cholesky", "cusolvermp", _FakeCudaMesh(2, 2)) == "cusolvermp"
+    assert R.resolve_backend(
+        "solve_lu", "distributed", _FakeCudaMesh(2, 2)) == "cusolvermp"
+
+
+def test_resolve_auto_1d_mesh_demotes_with_announcement(monkeypatch, capsys):
+    R = _mock_cuda_capabilities(monkeypatch, nproc=4)
+    R._AUTO_GEOMETRY_DEMOTE_ANNOUNCED.clear()
+    mesh = _FakeCudaMesh(1, 4)
+    assert R.resolve_backend("solve_lu", "auto", mesh) == R.NATIVE
+    out = capsys.readouterr().out
+    assert "auto" in out and "native" in out and "1x4" in out
+    # Deduped: a second resolve of the same decision stays quiet.
+    assert R.resolve_backend("solve_lu", "auto", mesh) == R.NATIVE
+    assert "native" not in capsys.readouterr().out
+
+
 @needs_host_ffi
 def test_plan_batched_matches_the_backend_call_cpu():
     """``plan.batched`` on the CPU distributed eigh == the raw wrapper.

@@ -29,14 +29,6 @@ from .minimax_config import MinimaxConfig
 _TINY = 1.0e-12
 
 
-def _to_host_np(a, dtype=np.complex128):
-    """Gather a (possibly sharded) JAX array to host as a NumPy array."""
-    try:
-        return np.asarray(_mh.process_allgather(a, tiled=True), dtype=dtype)
-    except Exception:
-        return np.asarray(jax.device_get(a), dtype=dtype)
-
-
 def _scalar_to_host_float(a) -> float:
     """Fetch a scalar JAX value in a multihost-safe way."""
 
@@ -47,15 +39,21 @@ def _scalar_to_host_float(a) -> float:
         #   ValueError: Gathering global non-fully-addressable arrays only
         #               supports tiled=True
         # which aborted every multi-host GN-PPM run in fit_gn_ppm_from_wc_pair.
-        # Tiled gathering needs >= 1-D, so promote the scalar first; fall back to
-        # a plain device_get when the value is already fully addressable.
-        # ``reshape((-1,))[:1]`` rather than ``reshape((1,))``: the latter would
-        # raise for any input with size > 1, whereas the historical tiled=False
-        # path flattened after gathering and took element 0.  Keep that
-        # tolerance so this is a strict bug-fix with no behaviour regression.
-        try:
+        # Dispatch is CONDITION-TESTED (same explicit ``is_fully_addressable``
+        # branch as ``ppm_windows._to_host_np``), not exception-swallowed: a
+        # try/except around the collective converted ANY allgather failure
+        # (Gloo/NCCL error, partial-rank abort) into a silent device_get
+        # fallback that could return on some ranks while others raised —
+        # a rank-desync hazard masking real collective failures (audit
+        # fix/zq 2026-07-28).
+        # Tiled gathering needs >= 1-D, so promote the scalar first.
+        # ``reshape((-1,))[:1]`` rather than ``reshape((1,))``: the latter
+        # would raise for any input with size > 1, whereas the historical
+        # tiled=False path flattened after gathering and took element 0.
+        # Keep that tolerance so this stays a strict bug-fix.
+        if not getattr(arr, "is_fully_addressable", True):
             gathered = _mh.process_allgather(arr.reshape((-1,))[:1], tiled=True)
-        except Exception:
+        else:
             gathered = jax.device_get(arr)
         return float(np.asarray(gathered, dtype=np.float64).reshape(-1)[0])
     return float(np.asarray(jax.device_get(a), dtype=np.float64))

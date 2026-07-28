@@ -81,8 +81,11 @@ def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
         (c) collective-flush SlabIO variant (stage many τ on GPU, one
             parallel-HDF5 write at window close).
 
-    Requires m % p_x == 0 and n % p_y == 0.  Padding at the caller is the
-    cleanest place to handle non-divisibility (TODO when we hit that).
+    Requires m % p_x == 0 and n % p_y == 0.  Callers satisfy this via
+    ``ppm_sigma.pad_sigma_window`` (independent per-axis zero-pads:
+    m → multiple of p_x, n → multiple of p_y; the exactly-zero pad block
+    is dropped by ``ppm_sigma.strip_sigma_window`` before Σ leaves the
+    branch).
     """
     from jax.experimental.shard_map import shard_map
 
@@ -133,12 +136,18 @@ def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
 
     def _project_ri_reduce_scatter(psi_xr, sigma_k, psi_yn):
         m, n = psi_xr.shape[1], psi_yn.shape[3]
+        # Message names the ACTUAL fix (pad_sigma_window's independent
+        # per-axis pads), not the old p_x*p_y product rule that
+        # pad_sigma_window's docstring denounces as up-to-3.16x waste
+        # (audit fix/zq 2026-07-28).
         assert m % p_x == 0 and n % p_y == 0, (
             f"sigma reduce-scatter needs the band window divisible by the "
             f"mesh: m={m} must be a multiple of p_x={p_x} and n={n} of "
-            f"p_y={p_y}. Pad the sigma band window (b3-b0) up to a multiple "
-            f"of p_x*p_y at the caller (meta.py rounds b_id_4 but NOT the "
-            f"sigma window).")
+            f"p_y={p_y}.  Pad m and n INDEPENDENTLY (m -> p_x, n -> p_y) "
+            f"via gw.ppm_sigma.pad_sigma_window at the caller — both "
+            f"existing call sites do; do NOT round to a multiple of "
+            f"p_x*p_y (meta.py rounds b_id_4 but NOT the sigma window "
+            f"b3-b0, so a new unpadded caller is a real hazard).")
         return _sm(psi_xr, sigma_k, psi_yn)
 
     return _project_ri_reduce_scatter

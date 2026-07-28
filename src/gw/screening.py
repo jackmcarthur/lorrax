@@ -125,6 +125,11 @@ def screening_requests_for(
 # Static W with the IBZ fast path
 # ---------------------------------------------------------------------------
 
+# Per-process dedup for the LORRAX_FORCE_FULL_BZ announcement: one tagged
+# line per process per run, not one per role / SC iteration.
+_FORCE_FULL_BZ_ANNOUNCED = False
+
+
 def compute_static_w(
     wfns,
     V_q: jax.Array,
@@ -137,8 +142,18 @@ def compute_static_w(
     meta,
     mesh_xy,
     role: str = "static",
+    force_full_bz: bool = False,
+    section: str = "chi0_W",
 ) -> jax.Array:
-    """W(ω=0) = (1 − Vχ₀)⁻¹V on the full BZ, solved on the IBZ wedge.
+    """W = (1 − Vχ₀)⁻¹V on the full BZ, solved on the IBZ wedge when legal.
+
+    One cadence for EVERY W role: AOT compile split (chi.compile /
+    chi.exec / W.compile / W.exec), ``block_until_ready`` discipline, and
+    the χ₀ donation contract are defined here exactly once.  The static
+    role runs the IBZ cascade; the probe roles call this same function
+    with ``force_full_bz=True`` (see :func:`compute_screening`'s
+    frozen-golden note), so the stage rows stay directly comparable and a
+    cadence/donation change cannot fork between the two paths.
 
     IBZ cascade for the Dyson solve: V_q and χ₀_q are sliced to IBZ rows
     before :func:`gw.w_isdf.solve_w` so the per-q Cholesky/LU factor runs
@@ -146,9 +161,10 @@ def compute_static_w(
     back to the full BZ via the SAME helper V_q uses (same physics — W is
     bilinear in centroids and rotates by centroid double-permute + L-phase
     + TRS conj under sym).  Explicit-full-BZ debug bypass
-    (``LORRAX_FORCE_FULL_BZ=1``) matches the V_q gate; IBZ activation
-    otherwise depends only on orbit-closure of the centroid set (checked
-    downstream in ``_resolve_ibz_q_list``).
+    (``LORRAX_FORCE_FULL_BZ=1``) matches the V_q gate and is ANNOUNCED
+    when it flips this decision; IBZ activation otherwise depends only on
+    orbit-closure of the centroid set (checked downstream in
+    ``_resolve_ibz_q_list``).
 
     Parameters
     ----------
@@ -157,19 +173,28 @@ def compute_static_w(
     V_q : (nq, μ, μ) jax.Array
         Bare Coulomb in flat-q ISDF basis, ``P(None, 'x', 'y')``.
     quad, e_ref
-        Static minimax quadrature from ``minimax_screening.build_static_quadrature``.
+        Minimax quadrature (static, or a single-frequency probe quad from
+        ``build_imag_quadrature`` / ``build_real_quadrature``) + energy
+        reference from ``minimax_screening.build_static_quadrature``.
     sym, centroid_indices
-        Symmetry tables + ISDF centroid set for the IBZ resolve.
+        Symmetry tables + ISDF centroid set for the IBZ resolve (unused
+        when the full-BZ route is taken).
     config, meta, mesh_xy
         Standard driver scaffolding.
     role
-        Label used in the announced cadence lines (``W[<role>] ...``);
-        the timing-tree node names are role-independent.
+        Label used in the announced cadence lines (``W[<role>] ...``).
+    force_full_bz
+        Skip the IBZ cascade unconditionally (the probe roles' deliberate
+        frozen-golden route).  Independent of the ``LORRAX_FORCE_FULL_BZ``
+        debug env bypass, which additionally forces the static role.
+    section
+        Timing/trace node name — ``chi0_W`` (static) or ``chi0_W_probe``,
+        so the two roles keep separate rows in the end-of-run stage table.
 
     Returns
     -------
     W_q : (nq_full, μ, μ) jax.Array
-        Static screened Coulomb on the full BZ, ``P(None, 'x', 'y')``.
+        Screened Coulomb on the full BZ, ``P(None, 'x', 'y')``.
     """
     from .w_isdf import (
         compute_chi0,
@@ -178,8 +203,30 @@ def compute_static_w(
         solve_w,
     )
 
-    use_ibz_w_requested = not bool(
+    # LORRAX_FORCE_FULL_BZ is a numerics-affecting debug bypass: it
+    # reroutes the W Dyson solve (and the V_q / gw_init IBZ writes, which
+    # read the same flag) from the IBZ wedge to the full BZ — a route with
+    # a documented ~0.1 meV path-dependence in the downstream PPM fit
+    # (see compute_screening's docstring).  Doctrine 5: env may grant
+    # capability but must not SILENTLY select policy — so engaging it
+    # announces loudly at this decision site.  Env state can differ per
+    # rank, so the affected process speaks, tagged with its rank id
+    # (audit fix/zq 2026-07-28; previously this read was fully silent —
+    # verbose=False below suppresses even the IBZ resolve's own print).
+    _env_force_full_bz = bool(
         int(os.environ.get('LORRAX_FORCE_FULL_BZ', '0')))
+    if _env_force_full_bz and not force_full_bz:
+        global _FORCE_FULL_BZ_ANNOUNCED
+        if not _FORCE_FULL_BZ_ANNOUNCED:
+            _FORCE_FULL_BZ_ANNOUNCED = True
+            print(
+                f"  [screening rank {jax.process_index()}] "
+                f"LORRAX_FORCE_FULL_BZ=1: BYPASSING the IBZ wedge — the "
+                f"static-W Dyson solve (and the V_q/gw_init IBZ writes) "
+                f"run on the FULL BZ.  Numerics scope: ~0.1 meV "
+                f"PPM-fit path-dependence vs the IBZ route; debug only.",
+                flush=True)
+    use_ibz_w_requested = not (force_full_bz or _env_force_full_bz)
     if use_ibz_w_requested and getattr(sym, 'q_irr_full_idx', None) is not None:
         from .v_q_g_flat import _resolve_ibz_q_list
         (_, q_irr_frac, full_to_irr_idx, full_to_irr_sym,
@@ -196,11 +243,13 @@ def compute_static_w(
     _mu = int(meta.n_rmu)
     _w = f"W[{role}]"
 
-    with timing.section("gw_jax.chi0_W"):
-        with jax_profile.trace_section("chi0_W"):
+    with timing.section(f"gw_jax.{section}"):
+        with jax_profile.trace_section(section):
             # Split compile vs exec for χ₀ and W.  Each section's
             # wall time is read off the end-of-run timing report
-            # under ``gw_jax.chi0_W.{chi,W}.{compile,exec}``.  The
+            # under ``gw_jax.<section>.{chi,W}.{compile,exec}``
+            # (section = chi0_W for the static role, chi0_W_probe for
+            # the probe roles).  The
             # explicit ``block_until_ready`` inside the exec sections
             # is load-bearing: it (a) pins chi.exec / W.exec wall time
             # to the actual dispatched compute (not just the host
@@ -323,17 +372,22 @@ def compute_screening(
         build_imag_quadrature,
         build_real_quadrature,
     )
-    from .w_isdf import compute_chi0, solve_w
 
-    from common import sanity
     from common.progress import LoopProgress
 
     W_by_role: dict[str, jax.Array] = {}
+    # X_ONLY declares no screening requests — return before any cadence
+    # print.  A Started/Finished "screening (chi0 -> W)" pair around zero
+    # work is an observable that does not discriminate (QUALITY_PATTERNS
+    # addendum); the old ``max(1, len(requests))`` clamp printed exactly
+    # that.  (audit fix/zq 2026-07-28)
+    if not requests:
+        return W_by_role
     # Bar/ETA cadence over the W roles; every phase inside announces
     # itself via ``timing.section(..., announce=True)`` (see the stage
     # cadence note at the top of this module).
     bar = LoopProgress(
-        max(1, len(requests)), print_fn,
+        len(requests), print_fn,
         title="screening (chi0 -> W)", item_name="W role").start()
     for req in requests:
         _w = f"W[{req.role}]"
@@ -365,50 +419,23 @@ def compute_screening(
                 quad, abs(req.omega_ry.real),
                 config.minimax_config, print_fn=print_fn)
 
-        # The probe-ω W was, until now, the single largest UNMEASURED and
-        # UNANNOUNCED block of work in the run: a second full χ₀ build and
-        # a second Dyson solve, on the FULL BZ (not the IBZ wedge the
-        # static role uses — see the docstring's frozen-golden note), with
-        # neither a ``timing.section`` nor a print.  It was therefore
-        # invisible in the end-of-run stage table AND invisible while it
-        # ran.  Both halves are fixed here; the section names mirror the
-        # static role's so the two are directly comparable in the report.
-        # The probe quadrature has a DIFFERENT node count from the static
-        # one, and the probe solve runs at the full-BZ q extent rather than
-        # the IBZ wedge's — so neither kernel is a cache hit on the static
-        # role's compiled module, and without these AOT calls the probe's
-        # compile time would be charged to its exec row.  Mirrors the static
-        # path's chi.compile → chi.exec → W.compile → W.exec ordering exactly
-        # so the two roles are directly comparable in the stage table.
-        from .w_isdf import precompile_chi0, precompile_solve_w
-        with timing.section("gw_jax.chi0_W_probe"):
-            with jax_profile.trace_section("chi0_W_probe"):
-                with timing.section("chi.compile", announce=True,
-                                    label=f"{_w} chi0 compile"):
-                    precompile_chi0(wfns, quad_used, meta, mesh_xy,
-                                    energy_reference=e_ref)
-                with timing.section(
-                        "chi.exec", announce=True,
-                        label=f"{_w} chi0 build "
-                              f"({len(np.asarray(quad_used.tau))} tau nodes, "
-                              f"{int(meta.nk_tot)} q, mu={int(meta.n_rmu)})"):
-                    chi0 = compute_chi0(
-                        wfns, quad_used, meta, mesh_xy, energy_reference=e_ref)
-                    chi0.block_until_ready()
-                with timing.section("W.compile", announce=True,
-                                    label=f"{_w} Dyson compile"):
-                    precompile_solve_w(
-                        V_q, chi0, meta, mesh_xy,
-                        dyson_solver=config.backend.w_dyson_solver)
-                with timing.section(
-                        "W.exec", announce=True,
-                        label=f"{_w} Dyson solve ({int(meta.nk_tot)} q, "
-                              f"mu={int(meta.n_rmu)}, full BZ)"):
-                    W = solve_w(
-                        V_q, chi0, meta, mesh_xy,
-                        dyson_solver=config.backend.w_dyson_solver)
-                    del chi0
-                    W.block_until_ready()
+        # The probe-ω W runs through the SAME cadence function as the
+        # static role (compute_static_w: chi.compile → chi.exec →
+        # W.compile → W.exec, with the AOT split, block_until_ready
+        # discipline and χ₀ donation defined once), on the FULL BZ
+        # (force_full_bz=True — not the IBZ wedge; see the docstring's
+        # frozen-golden note) and under its own ``chi0_W_probe`` timing
+        # node so the two roles stay separate-but-comparable rows in the
+        # stage table.  This replaces a statement-for-statement copy of
+        # the static body that had already forced one coordinated
+        # two-site edit (the w_dyson_solver rename) — data-movement-only
+        # consolidation; acceptance criterion is the 785c bit-gate
+        # (run_800c md5 baseline).  (audit fix/zq 2026-07-28)
+        W = compute_static_w(
+            wfns, V_q, quad_used, e_ref=e_ref,
+            sym=sym, centroid_indices=centroid_indices,
+            config=config, meta=meta, mesh_xy=mesh_xy,
+            role=req.role, force_full_bz=True, section="chi0_W_probe")
         with timing.section("W.gate", announce=True,
                             label=f"{_w} finiteness + hermiticity gate"):
             _gate_w(W, req, print_fn=print_fn)

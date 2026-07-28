@@ -133,12 +133,11 @@ def solve_W_body0_sharded(
     solve_w = _get_w_solve_fn_local(mesh_xy, nq, n_mu)
     pref_arr = jnp.asarray(pref, dtype=jnp.complex128)
     W = solve_w(V_body_q, chi_body_q, pref_arr)
-    # ``_get_w_solve_fn_local`` ends with ``with_sharding_constraint(W, rep_3d)``
-    # which XLA may or may not honour — when it doesn't, downstream
-    # consumers asking for V_FLATQ_SPEC hit "Involuntary full
-    # rematerialization" on the implicit reshard.  Force the output to
-    # V_FLATQ_SPEC HERE via the two-stage reshard, so that consumers
-    # (schur_reductions_sharded, assemble_W_sharded) see a
+    # Current contract: ``_get_w_solve_fn_local`` lands W 2-D sharded at
+    # ``P(None,'x','y')`` (the former replicated ``rep_3d`` output was
+    # removed — scorecard J.2 #3).  The two-stage reshard here moves that
+    # to V_FLATQ_SPEC without an involuntary full rematerialization, so
+    # consumers (schur_reductions_sharded, assemble_W_sharded) see a
     # cleanly-sharded input and don't need any reshard themselves.
     return _reshard_W_to_flatq(W, mesh_xy)
 

@@ -420,7 +420,8 @@ def solve_W_body0(V_body: np.ndarray, chi_body: np.ndarray) -> np.ndarray:
     """Return  W^0_body = (1 − V_body · χ_body)^{-1} V_body  for one q, ω.
 
     PoC version: a single dense solve.  Production reuses
-    ``gw.w_isdf.solve_w`` (sharded, low/high-mem variants).
+    ``gw.w_isdf.solve_w`` (two plans: ``w_dyson_solver = local |
+    distributed``).
     """
     n_mu = V_body.shape[0]
     eye = np.eye(n_mu, dtype=np.complex128)
