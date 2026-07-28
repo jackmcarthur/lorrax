@@ -256,16 +256,30 @@ def _herm_stats(a):
     import jax
     import jax.numpy as jnp
 
-    fn = _HERM_STATS_CACHE.get("fn")
+    # Keyed by sharding as well as shape: the sharding constraint below is
+    # closed over, so a differently-sharded tile needs its own compile.
+    sharding = getattr(a, "sharding", None)
+    key = ("fn", a.shape, str(a.dtype), sharding)
+    fn = _HERM_STATS_CACHE.get(key)
     if fn is None:
         @jax.jit
         def fn(m):
             herm = jnp.conj(jnp.swapaxes(m, -1, -2))
+            if sharding is not None:
+                # Load-bearing, not cosmetic: without this constraint the
+                # SPMD partitioner is free to resolve the (P(x,y), P(y,x))
+                # operand conflict of the subtract by ALL-GATHERING BOTH
+                # (μ, μ) operands to replicated — it did exactly that even
+                # under one jit (AQ 4962c/P=64 cold table 2026-07-28,
+                # modules jit_fn 0536/0698: 2 × 398.72 MB per gate call).
+                # Pinning herm to m's sharding forces a tile-local
+                # transpose reshard (O(μ²/P) per rank) instead.
+                herm = jax.lax.with_sharding_constraint(herm, sharding)
             return jnp.stack([
                 jnp.max(jnp.abs(m - herm)).astype(jnp.float64),
                 jnp.max(jnp.abs(m)).astype(jnp.float64),
             ])
-        _HERM_STATS_CACHE["fn"] = fn
+        _HERM_STATS_CACHE[key] = fn
     return fn(a)
 
 

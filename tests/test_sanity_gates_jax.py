@@ -993,3 +993,48 @@ def _main():
 
 if __name__ == "__main__":
     raise SystemExit(_main())
+
+
+def test_check_hermitian_sharded_no_full_gather():
+    """The hermiticity gate must never materialise a replicated (n, n) tile.
+
+    Regression for the AQ 4962c/P=64 collective-table finding (2026-07-28):
+    the eager transpose+subtract — and its first, naively-jitted fix — let
+    the SPMD partitioner resolve the P(x,y)/P(y,x) operand conflict by
+    ALL-GATHERING BOTH full (μ, μ) operands onto every rank (2 × 398.72 MB
+    at μ=4962, modules jit_subtract 0730/0973 then jit_fn 0536/0698).  The
+    fix pins the transposed operand to the input sharding
+    (``with_sharding_constraint``), forcing a tile-local reshard.  This
+    test compiles the fused stats kernel on a 2×2-sharded tile and asserts
+    the optimized HLO carries no all-gather with the full (n, n) extent —
+    the same predicate wk_AN/colltable.py applies to production dumps.
+    """
+    if len(jax.devices()) < 4:
+        import pytest
+        pytest.skip("needs 4 (emulated) devices")
+    mesh = _mesh(2, 2)
+    n = 64
+    sh = NamedSharding(mesh, P("x", "y"))
+    rng = np.random.default_rng(7)
+    m = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+    herm = jnp.asarray(m + m.conj().T)          # Hermitian by construction
+    a = jax.device_put(herm, sh)
+
+    # Numeric contract: Hermitian input → ~0 relative residual; a broken
+    # tile (one element flipped) must be caught.
+    assert sanity.check_hermitian("gate[test]", a, rtol=1e-10)
+    bad = herm.at[3, 5].set(herm[3, 5] + 17.0)
+    log = _Log()
+    assert not sanity.check_hermitian(
+        "gate[test-bad]", jax.device_put(bad, sh), rtol=1e-10, print_fn=log)
+
+    # Collective contract: no full-(n, n) all-gather in the compiled HLO.
+    fn = sanity._HERM_STATS_CACHE[("fn", a.shape, str(a.dtype), a.sharding)]
+    txt = fn.lower(a).compile().as_text()
+    offenders = [
+        ln for ln in txt.splitlines()
+        if "all-gather" in ln and f"[{n},{n}]" in ln.replace(" ", "")
+    ]
+    assert not offenders, (
+        "hermiticity gate re-grew a full-tile all-gather:\n"
+        + "\n".join(offenders))
