@@ -72,7 +72,15 @@ def build_Gij(meta, mesh_xy: Mesh) -> jax.Array:
     nocc = min(meta.nelec, meta.nb_sigma)
     Gij = np.zeros((meta.nk_tot, meta.nb_sigma, meta.nb_sigma), dtype=np.complex128)
     Gij[:, :nocc, :nocc] = np.eye(nocc, dtype=np.complex128)
-    return jax.device_put(Gij, NamedSharding(mesh_xy, P(None, None, None)))
+    # Process-local placement, NOT plain ``jax.device_put``: on a
+    # multi-process mesh the latter silently runs multihost
+    # ``assert_equal`` — a P-linear all-gather of the operand (scorecard
+    # AA.1).  Gij is a pure function of (nk, nb_sigma, nelec) —
+    # bit-identical on every rank by construction (np.eye block, no
+    # roundoff).  LORRAX_CHECK_REPLICA=1 restores the assertion.
+    from common.collectives import device_put_process_local
+    return device_put_process_local(
+        Gij, NamedSharding(mesh_xy, P(None, None, None)))
 
 
 # ---------------------------------------------------------------------------
