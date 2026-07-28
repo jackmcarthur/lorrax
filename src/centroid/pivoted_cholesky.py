@@ -39,6 +39,8 @@ been folded" convention.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -972,6 +974,64 @@ def build_gram_q0_via_loadwfns(
             psi_l_rmu_Y = psi_l_rmu_Y / norms_l_j[None, :, None, None]
             psi_l_rmuT_X = psi_l_rmuT_X / norms_l_j[None, None, :, None]
         psi_l_rmu_Y.block_until_ready()
+
+    # ---- Single-device column-blocked path (size-ladder wall fix) ----
+    # The full open-spin pair tensors are (nk, ns, ns, M, M): 98 GB EACH at
+    # M~9.8k (c7000 kmeans killed a 192 GB node — 2026-07-28 job 7878309).
+    # Per-element contraction order is unchanged by blocking the OUTPUT
+    # columns, so G is numerically the same map; only materialization moves.
+    # Multi-device meshes keep the original path untouched (the 'y'-sharded
+    # column axis must not be sliced locally).
+    n_dev_total = mesh_xy.devices.size
+    col_block = 0
+    if n_dev_total == 1:
+        env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
+        if env_cb:
+            col_block = max(256, int(env_cb))
+        else:
+            nk_, _, ns_, M_ = psi_l_rmu_Y.shape
+            bytes_per_col = 2 * nk_ * ns_ * ns_ * M_ * 16
+            budget_bytes = float(meta.memory_per_device_gb) * 1e9 * 0.25
+            col_block = max(256, int(budget_bytes // max(bytes_per_col, 1)))
+        if col_block >= psi_l_rmu_Y.shape[3]:
+            col_block = 0  # one full block == the original computation
+
+    if col_block:
+        M_cols = psi_l_rmu_Y.shape[3]
+        if verbose:
+            print(f"[pivoted_cholesky] column-blocked Gram: M={M_cols}, "
+                  f"col_block={col_block} "
+                  f"({-(-M_cols // col_block)} blocks; single-device path)")
+        with timing.section("right.load"):
+            psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
+                wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
+                band_chunk_size=band_chunk_size, use_phdf5=use_phdf5,
+            )
+            if norms_r_j is not None:
+                psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
+                psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
+            psi_r_rmu_Y.block_until_ready()
+        with timing.section("q0_sum"):
+            g_blocks = []
+            for c0 in range(0, M_cols, col_block):
+                c1 = min(c0 + col_block, M_cols)
+                P_l_b = pair_density(
+                    psi_l_rmuT_X, psi_l_rmu_Y[..., c0:c1], mesh_xy)
+                P_r_b = pair_density(
+                    psi_r_rmuT_X, psi_r_rmu_Y[..., c0:c1], mesh_xy)
+                G_b = gram_q0_from_pair(P_l_b, P_r_b, kw, mesh_xy=mesh_xy,
+                                        symmetrize=False)
+                G_b.block_until_ready()
+                g_blocks.append(G_b)
+                del P_l_b, P_r_b
+            G = jnp.concatenate(g_blocks, axis=1)
+            # Same Hermitian symmetrization the unblocked kernel applies,
+            # once, on the assembled square matrix.
+            G = 0.5 * (G + jnp.conj(G.T))
+            G.block_until_ready()
+        del psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X
+        return G
+
     with timing.section("left.pair"):
         P_l_k = pair_density(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
         P_l_k.block_until_ready()
