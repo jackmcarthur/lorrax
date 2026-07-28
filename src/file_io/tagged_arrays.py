@@ -5,6 +5,7 @@ This module reads/writes HDF5 restart files in the v2 format used by gw_jax.
 from __future__ import annotations
 
 import os
+import time
 
 import numpy as np
 import jax
@@ -28,6 +29,40 @@ def _mu_logical_shape(shape, mu_axes, n_rmu_logical):
     for ax in mu_axes:
         out[ax] = min(out[ax], int(n_rmu_logical))
     return tuple(out)
+
+
+def _restart_write_log_on() -> bool:
+    """Gate for the per-dataset liveness telemetry (scorecard AF.4c).
+
+    ON by default, rank 0 only: this module writes tens of GB at
+    production scale (~40 GB at MoS2 12x12/c2406) and used to print
+    NOTHING while doing it — job 7876423 spent 2 h 55 m in here and was
+    wall-clock-killed with no way to tell "slow" from "wedged".  File
+    size is the trap AC.3b documents (parallel HDF5 pre-allocates at
+    create time, so the file reaches full size before any data lands);
+    one line per dataset with its own elapsed time is the cheapest
+    thing that makes this stage diagnosable while alive.
+    ``LORRAX_RESTART_WRITE_LOG=0`` silences it.
+    """
+    return (os.environ.get("LORRAX_RESTART_WRITE_LOG", "1")
+            not in ("0", "", "false")
+            and jax.process_index() == 0)
+
+
+def _log_restart_write(name, shape, dtype, dt) -> None:
+    """One ``[restart_write]`` line for a completed dataset write.
+
+    Single implementation on purpose: the AF.4c line format is
+    load-bearing for log diagnosis, and this module used to carry four
+    hand-synced copies of it (audit 2026-07-28; QUALITY_PATTERNS #3).
+    Gated by :func:`_restart_write_log_on`.
+    """
+    if not _restart_write_log_on():
+        return
+    nb = int(np.prod(shape)) * int(np.dtype(dtype).itemsize)
+    print(f"  [restart_write] {name} {tuple(int(v) for v in shape)}"
+          f" {nb / 1e9:.2f} GB in {dt:.1f} s"
+          f" ({nb / 1e6 / max(dt, 1e-9):.0f} MB/s)", flush=True)
 
 
 def write_restart_state_to_h5(
@@ -78,9 +113,12 @@ def write_restart_state_to_h5(
     at the TRANSVERSE centroid set — the per-channel second ψ dataset
     the bispinor restart round-trip needs.  Its μ axis is clipped by
     ``n_rmu_transverse_logical`` (the transverse centroid count, which
-    differs from the charge ``n_rmu_logical``); the same attr is stamped
-    so ``load_restart_state_from_h5`` can re-pad and the restart guard
-    can compare it against the run's ``centroids_file_current``.
+    differs from the charge ``n_rmu_logical``).  The count is also
+    stamped as the ``n_rmu_transverse_logical`` dataset:
+    ``read_restart_state_from_h5`` cross-checks it against the stored
+    dataset's μ extent at load (torn/hand-edited-file guard); the
+    loader itself re-pads from the dataset shape
+    (``load_restart_state_from_h5`` → ``n_rmu_transverse_disk``).
     """
     from .slab_io import SlabIO
 
@@ -110,38 +148,26 @@ def write_restart_state_to_h5(
         if mode == "w":
             io.write_attr("n_rmu_logical", np.int64(int(n_rmu_logical)))
 
-        # PER-DATASET LIVENESS (scorecard AF.4c).  This function writes
-        # tens of GB at production scale -- ~40 GB at MoS2 12x12/c2406 --
-        # and used to print NOTHING while doing it.  Job 7876423 spent
-        # 2 h 55 m in here and was killed by the wall clock with no way to
-        # tell "slow" from "wedged": AC.3c's discriminator ("a cadence
-        # exists" vs "no first milestone") cannot be applied to a stage
-        # that has no milestone to emit, and file size is the trap AC.3b
-        # documents (parallel HDF5 pre-allocates at create time, so the
-        # file reaches full size before any data lands).  One line per
-        # dataset with its own elapsed time is the cheapest thing that
-        # makes this stage diagnosable while it is still alive.
-        # ON by default for exactly that reason; LORRAX_RESTART_WRITE_LOG=0
-        # silences it.
-        import os as _os
-        import time as _time
-        _wlog = _os.environ.get(
-            "LORRAX_RESTART_WRITE_LOG", "1") not in ("0", "", "false")
-        _rank0 = jax.process_index() == 0
+        # PER-DATASET LIVENESS (scorecard AF.4c): every completed write
+        # below emits one [restart_write] line — rationale and the
+        # LORRAX_RESTART_WRITE_LOG gate live at
+        # :func:`_restart_write_log_on` / :func:`_log_restart_write`.
 
-        def _write(name, arr, mu_axes=()):
+        def _write(name, arr, mu_axes=(), n_logical=None):
+            """create+write one dataset, μ axes clipped to ``n_logical``
+            (default: the charge ``n_rmu_logical``), with the AF.4c
+            telemetry line.  Single write path for every dataset in
+            this file, including the transverse ψ and the real W0
+            (audit 2026-07-28 — the transverse block used to be an
+            inline copy of this helper)."""
             if arr is None:
                 return
-            shape = _mu_logical_shape(arr.shape, mu_axes, n_rmu_logical)
-            _t0 = _time.time()
+            n_log = n_rmu_logical if n_logical is None else n_logical
+            shape = _mu_logical_shape(arr.shape, mu_axes, n_log)
+            _t0 = time.time()
             io.create_dataset(name, shape=shape, dtype=arr.dtype)
             io.write_slab(name, arr, global_shape=shape, valid_shape=shape)
-            if _wlog and _rank0:
-                _nb = int(np.prod(shape)) * int(np.dtype(arr.dtype).itemsize)
-                _dt = _time.time() - _t0
-                print(f"  [restart_write] {name} {tuple(int(v) for v in shape)}"
-                      f" {_nb / 1e9:.2f} GB in {_dt:.1f} s"
-                      f" ({_nb / 1e6 / max(_dt, 1e-9):.0f} MB/s)", flush=True)
+            _log_restart_write(name, shape, arr.dtype, time.time() - _t0)
 
         _write("V_qmunu",      V_qmunu,      mu_axes=(-2, -1))
         _write("S_qmunu",      S_qmunu,      mu_axes=(-2, -1))
@@ -159,49 +185,37 @@ def write_restart_state_to_h5(
                     "requires n_rmu_transverse_logical (the transverse "
                     "centroid count) to clip its μ axis on disk.")
             n_T = int(n_rmu_transverse_logical)
-            shape_T = _mu_logical_shape(
-                psi_full_y_transverse.shape, (-1,), n_T)
-            _t0 = _time.time()
-            io.create_dataset("psi_full_y_transverse", shape=shape_T,
-                              dtype=psi_full_y_transverse.dtype)
-            io.write_slab("psi_full_y_transverse", psi_full_y_transverse,
-                          global_shape=shape_T, valid_shape=shape_T)
+            _write("psi_full_y_transverse", psi_full_y_transverse,
+                   mu_axes=(-1,), n_logical=n_T)
+            # Stamped for the load-time extent cross-check in
+            # read_restart_state_from_h5.
             io.write_attr("n_rmu_transverse_logical", np.int64(n_T))
-            if _wlog and _rank0:
-                _nb = (int(np.prod(shape_T))
-                       * int(np.dtype(psi_full_y_transverse.dtype).itemsize))
-                _dt = _time.time() - _t0
-                print(f"  [restart_write] psi_full_y_transverse "
-                      f"{tuple(int(v) for v in shape_T)}"
-                      f" {_nb / 1e9:.2f} GB in {_dt:.1f} s"
-                      f" ({_nb / 1e6 / max(_dt, 1e-9):.0f} MB/s)", flush=True)
 
         # W0_qmunu: either write the real data or pre-allocate an
         # all-zeros placeholder.
         w0_touched = W0_qmunu is not None or init_W0
         w0_ready = False
         if W0_qmunu is not None:
-            shape = _mu_logical_shape(W0_qmunu.shape, (-2, -1), n_rmu_logical)
-            io.create_dataset("W0_qmunu", shape=shape, dtype=W0_qmunu.dtype)
-            io.write_slab("W0_qmunu", W0_qmunu, global_shape=shape,
-                          valid_shape=shape)
+            _write("W0_qmunu", W0_qmunu, mu_axes=(-2, -1))
             w0_ready = True
         elif init_W0:
             if V_qmunu is None:
                 raise ValueError("init_W0=True requires V_qmunu to size the placeholder")
             v_shape = _mu_logical_shape(V_qmunu.shape, (-2, -1), n_rmu_logical)
             v_dtype = V_qmunu.dtype
-            _t0 = _time.time()
+            _t0 = time.time()
             io.create_dataset("W0_qmunu", shape=v_shape, dtype=v_dtype)
-            if _wlog and _rank0:
-                # Allocation ONLY -- no data is written here.  Naming that
-                # explicitly matters: under parallel HDF5 this call makes the
-                # file jump by the full tensor size, which reads exactly like
+            if _restart_write_log_on():
+                # Allocation ONLY -- no data is written here, so this
+                # deliberately does NOT use the _log_restart_write
+                # completed-write format.  Naming that explicitly
+                # matters: under parallel HDF5 this call makes the file
+                # jump by the full tensor size, which reads exactly like
                 # progress and is not (AC.3b).
                 _nb = int(np.prod(v_shape)) * int(np.dtype(v_dtype).itemsize)
                 print(f"  [restart_write] W0_qmunu placeholder ALLOCATED "
                       f"{tuple(int(v) for v in v_shape)} {_nb / 1e9:.2f} GB "
-                      f"in {_time.time() - _t0:.1f} s (no data written)",
+                      f"in {time.time() - _t0:.1f} s (no data written)",
                       flush=True)
 
     # bse_io.py reads W0_ready as an HDF5 attr on the W0_qmunu dataset.
@@ -224,12 +238,10 @@ def write_w0_qmunu_to_h5(
     """
     from .slab_io import SlabIO
 
-    import os as _os
-    import time as _time
     shape = _mu_logical_shape(W0_qmunu.shape, (-2, -1), n_rmu_logical)
     with SlabIO(filename, mode="a", mesh=mesh,
                 backend=backend, use_ffi_io=use_ffi_io) as io:
-        _t0 = _time.time()
+        _t0 = time.time()
         io.create_dataset("W0_qmunu", shape=shape, dtype=W0_qmunu.dtype)
         io.write_slab("W0_qmunu", W0_qmunu, global_shape=shape,
                       valid_shape=shape)
@@ -238,13 +250,8 @@ def write_w0_qmunu_to_h5(
         # 13.34 GB at c2406 -- and it had no telemetry at all, so a repeat
         # of the writer pathology would have been invisible here even
         # after AF instrumented its sibling.
-        if (_os.environ.get("LORRAX_RESTART_WRITE_LOG", "1")
-                not in ("0", "", "false") and jax.process_index() == 0):
-            _nb = int(np.prod(shape)) * int(np.dtype(W0_qmunu.dtype).itemsize)
-            _dt = _time.time() - _t0
-            print(f"  [restart_write] W0_qmunu {tuple(int(v) for v in shape)}"
-                  f" {_nb / 1e9:.2f} GB in {_dt:.1f} s"
-                  f" ({_nb / 1e6 / max(_dt, 1e-9):.0f} MB/s)", flush=True)
+        _log_restart_write("W0_qmunu", shape, W0_qmunu.dtype,
+                           time.time() - _t0)
 
     # W0_ready flag is a per-dataset attr read by bse_io.py.
     if jax.process_index() == 0:
@@ -357,6 +364,24 @@ def read_restart_state_from_h5(filename):
         psi_full_y_transverse = (
             jnp.asarray(f["psi_full_y_transverse"][:])
             if "psi_full_y_transverse" in f else None)
+        # Integrity cross-check of the stamped transverse extent against
+        # the dataset it describes (audit 2026-07-28: the stamp used to
+        # be write-only shadow metadata, QUALITY_PATTERNS #3 — the
+        # loader derives the extent from the dataset shape, so a
+        # mismatch means a torn or hand-edited file and must refuse
+        # loudly rather than feed downstream re-padding, #7).
+        if (psi_full_y_transverse is not None
+                and "n_rmu_transverse_logical" in f):
+            stored_T = int(np.asarray(f["n_rmu_transverse_logical"])[()])
+            disk_T = int(psi_full_y_transverse.shape[-1])
+            if stored_T != disk_T:
+                raise ValueError(
+                    f"Restart file {filename}: stamped "
+                    f"n_rmu_transverse_logical={stored_T} does not match "
+                    f"the psi_full_y_transverse μ extent on disk "
+                    f"({disk_T}).  The file is internally inconsistent "
+                    f"(torn write or hand-edited) — regenerate the "
+                    f"restart tensors (restart=false).")
 
     return (V_qmunu, S_qmunu, psi_full_y, enk_full, V0_noG0_munu, G0_mu_nu,
             psi_full_y_transverse)

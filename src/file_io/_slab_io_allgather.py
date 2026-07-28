@@ -1,18 +1,21 @@
-"""Default SlabIO backend: process_allgather + rank-0 h5py.
+"""Last-resort SlabIO backend: process_allgather + rank-0 h5py.
 
-Canonical CPU SlabIO path.  ``gw_config.LorraxConfig.from_input_file``
-auto-routes ``use_ffi_io=true`` on the JAX CPU backend through this
-module (since the phdf5 FFI is CUDA-only at the C++ level — see
-``src/ffi/phdf5/cpp/write_ffi.cc``).  No CUDA dependency; works in any
-container with h5py + jax installed.
+Tier 3 of the ``slab_io = auto`` capability router
+(``gw_config._route_cpu_slab_io`` / ``_route_gpu_slab_io``:
+PHDF5_FFI → PHDF5_HOST → H5PY_ALLGATHER) — selected only when neither
+parallel-HDF5 writer is available, or forced explicitly via
+``slab_io = h5py_allgather`` / the deprecated ``use_ffi_io = false``
+override.  (``use_ffi_io = true`` is a deprecated no-op: the phdf5 FFI
+is routed by capability, and it has not been CUDA-only since
+workstream AE's host port.)  No CUDA or mpi4py dependency; works in
+any container with h5py + jax installed.
 
 Pattern: every rank gathers the global array via
 ``jax.experimental.multihost_utils.process_allgather(A, tiled=True)``,
-then rank-0 writes the hyperslab via serial h5py.  Slower than the FFI's
-collective MPI-IO at production scale (rank-0 disk bandwidth bottleneck,
-plus full-array gather memory) but byte-identical output.  The FFI
-backend lives in ``_slab_io_ffi.py`` and is selected on the GPU backend
-when ``use_ffi_io=true``.
+then rank-0 writes the hyperslab via serial h5py.  Slower than the
+parallel writers (``_slab_io_ffi.py`` / ``_slab_io_mpi_host.py``) at
+production scale — rank-0 disk bandwidth bottleneck, plus full-array
+gather memory — but byte-identical output.
 """
 from __future__ import annotations
 
@@ -30,6 +33,7 @@ from ._slab_io_ffi import (
     _normalize_slab_request,
     _normalize_valid_shape,
     _rank0,
+    _shard_read_plan,
 )
 
 
@@ -269,37 +273,43 @@ class _AllgatherBackend:
         if (not as_numpy) and mesh is not None and partition_spec is not None:
             from jax.sharding import NamedSharding
             sharding = NamedSharding(mesh, partition_spec)
-            try:
-                idx_map = sharding.addressable_devices_indices_map(
-                    tuple(out_shape))
-            except Exception:
-                idx_map = None
-            if idx_map:
-                ndim = len(out_shape)
+            # PURE METADATA call — allocates and communicates nothing
+            # (same unguarded idiom as
+            # ``common.collectives.device_put_process_local``).  A
+            # failure here is a real sharding/mesh bug and must raise AT
+            # THE CAUSE: a bare ``except Exception`` used to demote
+            # every rank silently to the whole-slab path below (2× the
+            # full global tensor per rank — the 11.8 GB/rank allocation
+            # that OOM-killed all 80 ranks of job 7874242), resurfacing
+            # minutes later as an unattributable node OOM (audit
+            # 2026-07-28; doctrine 3).
+            idx_map = sharding.addressable_devices_indices_map(
+                tuple(out_shape))
+            if not idx_map:
+                # No addressable device of this process is in the target
+                # mesh, so the sharded fast path cannot assemble a
+                # result here.  'auto' demotion must ANNOUNCE, on the
+                # affected rank (doctrine 3).
+                print(f"  [SlabIO.allgather rank={jax.process_index()}] "
+                      f"read_slab({name!r}): no addressable devices in "
+                      f"the target mesh — demoting to the whole-slab "
+                      f"read (2 full host copies of shape "
+                      f"{tuple(int(s) for s in out_shape)} on this "
+                      f"rank).", flush=True)
+            else:
                 arrays = []
                 for dev, ix in idx_map.items():
-                    los, his = [], []
-                    for ax in range(ndim):
-                        sl = ix[ax] if ix is not None else slice(None)
-                        lo = 0 if sl.start is None else int(sl.start)
-                        hi = int(out_shape[ax]) if sl.stop is None \
-                            else int(sl.stop)
-                        los.append(lo)
-                        his.append(hi)
-                    local_shape = tuple(h - l for l, h in zip(los, his))
-                    # Intersect this shard with the VALID (on-disk) region;
-                    # everything outside stays zero.
-                    r_lo = [min(l, int(v)) for l, v in zip(los, vshape)]
-                    r_hi = [min(h, int(v)) for h, v in zip(his, vshape)]
+                    # Shared index→(block, valid-clipped hyperslab)
+                    # arithmetic — single source of truth with
+                    # ``_slab_io_mpi_host.read_slab`` (audit 2026-07-28,
+                    # QUALITY_PATTERNS #3).
+                    local_shape, dst, disk = _shard_read_plan(
+                        ix, out_shape, off, vshape)
+                    # Everything outside the VALID (on-disk) region
+                    # stays zero.
                     local = np.zeros(local_shape,
                                      dtype=dtype or dset.dtype)
-                    if all(b > a for a, b in zip(r_lo, r_hi)):
-                        disk = tuple(slice(off[ax] + r_lo[ax],
-                                           off[ax] + r_hi[ax])
-                                     for ax in range(ndim))
-                        dst = tuple(slice(r_lo[ax] - los[ax],
-                                          r_hi[ax] - los[ax])
-                                    for ax in range(ndim))
+                    if dst is not None:
                         local[dst] = dset[disk]
                     arrays.append(jax.device_put(local, dev))
                 out = jax.make_array_from_single_device_arrays(

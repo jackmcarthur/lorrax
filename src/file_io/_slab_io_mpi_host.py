@@ -45,7 +45,13 @@ writes are NOT sufficient once JAX's own CPU collectives ride MPI:
 
 What we DO match from :class:`_FfiBackend`:
 
-* Same Lustre prestripe on rank 0 before any rank opens the file.
+* Same ``mode='w'`` inode replace + rank-0 prestripe before any rank
+  opens the file (the shared ``_replace_inode_for_write`` +
+  ``_lustre_prestripe``; the layout that actually sticks comes from
+  the MPI-IO striping hints — see :func:`_mpi_io_hints`).
+* Same collective-write default (``LORRAX_PHDF5_COLLECTIVE_WRITES``,
+  on) with replica dedup (``LORRAX_PHDF5_DEDUP_REPLICAS``, on) — see
+  ``__init__`` for the wk_AI measurements.
 * Same per-rank hyperslab arithmetic derived from JAX's
   ``Array.addressable_shards[i].index`` (a tuple of ``slice`` per dim
   giving the global slab of each local shard).
@@ -84,6 +90,9 @@ from ._slab_io_ffi import (
     _normalize_slab_request,
     _normalize_valid_shape,
     _rank0,
+    _replace_inode_for_write,
+    _shard_read_plan,
+    _stripe_count,
 )
 
 _TRUE = ("1", "true", "yes", "on")
@@ -101,17 +110,27 @@ def _stripe_size_bytes() -> int:
 
     ``LORRAX_PHDF5_STRIPE_SIZE_FS`` is the ``lfs setstripe -S`` spelling
     ("4M"); MPI-IO's ``striping_unit`` hint wants bytes, so accept both
-    and normalise here.
+    and normalise here.  Malformed input REFUSES with the grammar: it
+    used to be silently replaced by the 4 MiB default, so an explicit
+    ``=4MiB`` A/B experiment quietly measured the default configuration
+    (doctrine 3; audit 2026-07-28 — the sibling
+    ``LORRAX_PHDF5_STRIPE_COUNT`` refuses the same way, see
+    ``_slab_io_ffi._stripe_count``).
     """
     raw = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE_FS", "4M").strip()
     mult = 1
+    base = raw
     if raw and raw[-1] in "kKmMgG":
         mult = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[raw[-1].lower()]
-        raw = raw[:-1]
+        base = raw[:-1]
     try:
-        return int(float(raw) * mult)
+        return int(float(base) * mult)
     except ValueError:
-        return 4 << 20
+        raise ValueError(
+            f"LORRAX_PHDF5_STRIPE_SIZE_FS={raw!r} is not a valid stripe "
+            f"size: expected '<number>[k|M|G]' in the `lfs setstripe -S` "
+            f"single-letter-suffix grammar (e.g. '4M', '512k'; "
+            f"'MiB'/'MB' spellings are not accepted).") from None
 
 
 def _mpi_io_hints(MPI):
@@ -133,7 +152,7 @@ def _mpi_io_hints(MPI):
     the two "equivalent" writers.
     """
     info = MPI.Info.Create()
-    sc = int(os.environ.get("LORRAX_PHDF5_STRIPE_COUNT", "16"))
+    sc = _stripe_count()
     if sc > 0:
         info.Set("striping_factor", str(sc))
         info.Set("striping_unit", str(_stripe_size_bytes()))
@@ -259,29 +278,25 @@ class _MpiHostBackend:
         self.mesh = mesh
         self.mode = mode
 
-        # Pre-stripe the file on rank 0 so Lustre's per-stripe layout
-        # actually matches the MPI-IO hints we'll use below.  Only on
-        # 'w'; 'a'/'r' inherit the existing inode's stripe layout.
-        # Barrier after so all ranks see the inode before H5Fopen.
-        if mode == "w" and _rank0():
-            # UNLINK, don't just truncate.  A Lustre stripe layout is a
-            # property of the INODE and is fixed at create time: both
-            # ``lfs setstripe`` and MPI-IO's ``striping_factor`` hint are
-            # no-ops against an existing file, and ``H5Fcreate(TRUNC)``
-            # reuses the inode.  So a rerun in a run dir that already
-            # holds a 1-stripe ``isdf_tensors_*.h5`` would silently keep
-            # 1 stripe for ever.  ``mode='w'`` means "replace", so
-            # replacing the inode is also the honest reading.
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except OSError:
-                pass
-            stripe_count = int(os.environ.get("LORRAX_PHDF5_STRIPE_COUNT", "16"))
-            stripe_size = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE_FS", "4M")
-            _lustre_prestripe(path, stripe_count=stripe_count,
-                              stripe_size=stripe_size)
+        # mode='w' must REPLACE the inode (rank-0 unlink + barrier,
+        # shared with _FfiBackend — see _replace_inode_for_write for the
+        # full rationale): a Lustre stripe layout is a property of the
+        # INODE, fixed at create time; ``lfs setstripe``, the
+        # ``striping_factor`` hint and ``H5Fcreate(TRUNC)`` are all
+        # no-ops against an existing file, so a rerun over a 1-stripe
+        # ``isdf_tensors_*.h5`` would silently keep 1 stripe for ever.
+        # The helper uses lexists (dangling symlinks too) and RAISES on
+        # a failed unlink instead of the old silent ``except OSError:
+        # pass`` (audit 2026-07-28).  'a'/'r' inherit the existing
+        # inode's layout by design.  Barrier after the rank-0 prestripe
+        # so all ranks see the inode state before H5Fopen.
         if mode == "w":
+            _replace_inode_for_write(path)
+            if _rank0():
+                _lustre_prestripe(
+                    path, stripe_count=_stripe_count(),
+                    stripe_size=os.environ.get(
+                        "LORRAX_PHDF5_STRIPE_SIZE_FS", "4M"))
             _barrier("slab_io_mpi_host_prestripe")
 
         h5_mode = {"w": "w", "a": "a", "r": "r"}[mode]
@@ -330,8 +345,7 @@ class _MpiHostBackend:
         if _rank0() and _env_flag("LORRAX_PHDF5_LOG", True):
             print(f"  [SlabIO.phdf5_host] {os.path.basename(path)} mode={mode} "
                   f"collective_write={self._collective} dedup_replicas="
-                  f"{self._dedup} stripe_count="
-                  f"{os.environ.get('LORRAX_PHDF5_STRIPE_COUNT', '16')} "
+                  f"{self._dedup} stripe_count={_stripe_count()} "
                   f"stripe_unit={_stripe_size_bytes()} B", flush=True)
 
         # write_attr accumulates small (rank-0-only) writes that we
@@ -396,10 +410,20 @@ class _MpiHostBackend:
         clipped block at ``(slab_offset + shard_offset_within_slab)``
         in the dataset.
 
-        Independent MPI-IO writes — no rank-rank collective synchro
-        at write time.  Equivalent to the FFI backend's default
-        (``LORRAX_PHDF5_INDEPENDENT=1`` rationale, see
-        ``ffi/phdf5/cpp/ctx.h``).
+        COLLECTIVE transfer mode by default (``H5FD_MPIO_COLLECTIVE``;
+        wk_AI measurements at the ``self._collective`` comment in
+        ``__init__`` — the fix for AF.4c's 1.7 MB/s strided-tile
+        writes).  That makes this call rank-synchronous: EVERY rank
+        must enter it for every dataset — ranks with nothing to write
+        participate with a null selection, and an early return would
+        deadlock the two-phase exchange.  Additionally, with
+        ``LORRAX_PHDF5_DEDUP_REPLICAS`` (default on) each call runs a
+        small blocking ``comm.allgather`` to elect one canonical
+        writer per distinct hyperslab.
+        ``LORRAX_PHDF5_COLLECTIVE_WRITES=0`` restores independent
+        MPI-IO writes (the pre-AI behaviour).  Note
+        ``LORRAX_PHDF5_INDEPENDENT`` is unrelated: it controls FFI
+        READS only (``force_indep_read``, ``ffi/phdf5/cpp/context.cc``).
         """
         if not isinstance(A, jax.Array):
             A = jnp.asarray(A)
@@ -545,34 +569,18 @@ class _MpiHostBackend:
         # O(P x global tensor) and only bites once the tensor is large.
         idx_map = sharding.addressable_devices_indices_map(tuple(read_shape))
         index = idx_map[jax.local_devices()[0]]
-        # Same None-handling as _local_shard_and_global_offset: replicated
-        # axes come back as slice(None, None).
-        local_shape = tuple(
-            int(s.stop - s.start) if s.start is not None else int(full)
-            for s, full in zip(index, read_shape))
-        shard_offset = tuple(int(s.start) if s.start is not None else 0
-                             for s in index)
-
-        # Read the local hyperslab.  Clip to valid_shape: anything in the
-        # padded tail is zero-filled by JAX's array assembly.
-        clipped = _clip_shard_to_valid(
-            np.zeros(local_shape, dtype=np.dtype(dtype)),  # shape carrier
-            shard_offset, off, vshape,
-        )
+        # Shared index→(local block, valid-clipped hyperslab) arithmetic
+        # — single source of truth with the allgather backend's sharded
+        # fast path (``_slab_io_ffi._shard_read_plan``; audit
+        # 2026-07-28, QUALITY_PATTERNS #3).
+        local_shape, dst, disk = _shard_read_plan(
+            index, read_shape, off, vshape)
         host_local = np.zeros(local_shape, dtype=np.dtype(dtype))
-        if clipped is not None:
-            _, ds_offset = clipped
-            keep_shape = tuple(min(ls, ve - so)
-                               for ls, ve, so in zip(local_shape, vshape,
-                                                     shard_offset))
-            slc = tuple(slice(o, o + s)
-                        for o, s in zip(ds_offset, keep_shape))
-            # Read into the prefix of host_local; the padded tail stays
-            # zeroed out.  h5py.dataset[slc] returns a freshly-allocated
-            # ndarray; we copy into host_local's prefix.
-            read_block = self._fh[name][slc]
-            sel = tuple(slice(0, s) for s in keep_shape)
-            host_local[sel] = read_block
+        if dst is not None:
+            # Read the valid part into the block prefix; the padded
+            # tail stays zeroed.  h5py returns a fresh ndarray; we copy
+            # into host_local in place.
+            host_local[dst] = self._fh[name][disk]
 
         # Assemble per-process locals back into a globally-sharded array.
         device = jax.local_devices()[0]

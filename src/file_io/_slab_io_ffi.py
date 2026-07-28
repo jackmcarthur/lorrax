@@ -1,8 +1,12 @@
 """FFI SlabIO backend — collective MPI-IO via ``ffi.phdf5``.
 
-Opt-in path (``use_ffi_io=True``).  Imported lazily by
-:mod:`file_io.slab_io` so the default allgather path works without
-``liblorrax_ffi.so`` being built.
+FIRST tier of the ``slab_io = auto`` capability router on BOTH JAX
+backends (``gw_config._route_cpu_slab_io`` / ``_route_gpu_slab_io``:
+PHDF5_FFI → PHDF5_HOST → H5PY_ALLGATHER), also selectable explicitly
+via ``slab_io = phdf5_ffi``.  The legacy ``use_ffi_io`` boolean no
+longer routes here: ``true`` is a deprecated no-op, ``false`` forces
+the allgather backend.  Imported lazily by :mod:`file_io.slab_io` so
+the fallback tiers work without ``liblorrax_ffi*.so`` being built.
 
 PLATFORM-AGNOSTIC.  Nothing in this module is CUDA-specific: the
 ``jax.ffi.ffi_call`` sites name only the target string, and
@@ -51,6 +55,124 @@ def _barrier(tag: str) -> None:
         pass
 
 
+def _stripe_count() -> int:
+    """``LORRAX_PHDF5_STRIPE_COUNT`` (Lustre ``striping_factor``), default 16.
+
+    Unset/empty → default; anything else must be a plain int.  Shared by
+    both PHDF5 writers.  A typo here used to crash with a bare
+    ``ValueError`` while the sibling ``LORRAX_PHDF5_STRIPE_SIZE_FS`` was
+    silently replaced by ITS default — two neighbouring knobs, opposite
+    failure modes (audit 2026-07-28).  Both now refuse loudly, naming
+    the variable and the accepted grammar (doctrine 3).
+    """
+    raw = os.environ.get("LORRAX_PHDF5_STRIPE_COUNT", "").strip()
+    if not raw:
+        return 16
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"LORRAX_PHDF5_STRIPE_COUNT={raw!r} is not a valid stripe "
+            f"count: expected a plain integer (e.g. 16; <=0 disables "
+            f"the striping hints).") from None
+
+
+def _replace_inode_for_write(path: str) -> None:
+    """Rank-0 unlink + barrier so ``mode='w'`` REPLACES the file's inode.
+
+    Called by BOTH PHDF5 writers (:class:`_FfiBackend` and
+    ``_slab_io_mpi_host._MpiHostBackend``) before any rank opens the
+    file, UNCONDITIONALLY of ``lfs`` availability.  Rationale: a Lustre
+    stripe layout is a property of the INODE, fixed at create time —
+    ``lfs setstripe``, MPI-IO's ``striping_factor`` hint and
+    ``H5Fcreate(H5F_ACC_TRUNC)`` are all no-ops against an existing
+    inode, so a rerun over an existing 1-stripe file keeps 1 stripe
+    forever (measured: job 7876423 funnelled 13.3 GB of ``V_qmunu``
+    through a single OST).  The only unlink used to live inside
+    :func:`_lustre_prestripe` AFTER its lfs-missing early return, i.e.
+    it never ran in the production apptainer image (audit 2026-07-28).
+
+    ``os.path.lexists`` (not ``exists``) so a dangling symlink is also
+    replaced; a live symlink is announced before removal because the
+    new file lands at ``path`` itself, not at the link's old target.
+    A failed unlink RAISES rather than falling through: proceeding
+    would H5F_ACC_TRUNC the old inode and silently inherit its stripe
+    layout — ``mode='w'`` is a replace contract.
+    """
+    if _rank0() and os.path.lexists(path):
+        if os.path.islink(path):
+            try:
+                target = os.readlink(path)
+            except OSError:
+                target = "<unreadable>"
+            print(f"  [SlabIO] mode='w': {path} is a symlink -> "
+                  f"{target!r}; removing the LINK — the new file is "
+                  f"created at {path}, not at the old target.",
+                  flush=True)
+        try:
+            os.remove(path)
+        except OSError as e:
+            raise OSError(
+                f"SlabIO mode='w': could not replace existing file "
+                f"{path!r}: {e}.  Refusing to open with H5F_ACC_TRUNC "
+                f"instead — truncation reuses the inode, so the file "
+                f"would silently keep its existing Lustre stripe layout "
+                f"and ignore the striping_factor/striping_unit hints "
+                f"(the 1-stripe single-OST defect, job 7876423).  "
+                f"Delete the file or fix its permissions, then rerun."
+            ) from e
+    _barrier("slab_io_replace_inode")
+
+
+def _shard_read_plan(
+    index: Sequence[slice],
+    out_shape: Sequence[int],
+    offset: Sequence[int],
+    valid_shape: Sequence[int],
+) -> tuple[tuple[int, ...],
+           tuple[slice, ...] | None,
+           tuple[slice, ...] | None]:
+    """Map one entry of ``Sharding.addressable_devices_indices_map`` to
+    a per-device hyperslab read plan.
+
+    Returns ``(local_shape, dst, disk)``:
+
+    * ``local_shape`` — the device-local block shape (replicated axes
+      come back from JAX as ``slice(None, None)`` and span the full
+      ``out_shape`` axis);
+    * ``dst`` — slices INTO the local block for the part overlapping
+      the valid (on-disk) region ``[0, valid_shape)`` of the slab, or
+      ``None`` when the block lies wholly in the padded tail (leave
+      the zero-filled block untouched);
+    * ``disk`` — the matching dataset slices, shifted by the caller's
+      global ``offset``.
+
+    Single source of truth for the index→(offset, shape) + valid-clip
+    arithmetic that was previously copy-pasted per backend
+    (``_slab_io_allgather`` sharded fast path and
+    ``_slab_io_mpi_host.read_slab`` — audit 2026-07-28,
+    QUALITY_PATTERNS #3).  ``common.collectives.
+    device_put_process_local`` keeps its own offsets-only two-liner.
+    """
+    ndim = len(out_shape)
+    los: list[int] = []
+    his: list[int] = []
+    for ax in range(ndim):
+        sl = index[ax]
+        los.append(0 if sl.start is None else int(sl.start))
+        his.append(int(out_shape[ax]) if sl.stop is None else int(sl.stop))
+    local_shape = tuple(h - l for l, h in zip(los, his))
+    r_lo = [min(l, int(v)) for l, v in zip(los, valid_shape)]
+    r_hi = [min(h, int(v)) for h, v in zip(his, valid_shape)]
+    if not all(b > a for a, b in zip(r_lo, r_hi)):
+        return local_shape, None, None
+    disk = tuple(slice(int(offset[ax]) + r_lo[ax],
+                       int(offset[ax]) + r_hi[ax]) for ax in range(ndim))
+    dst = tuple(slice(r_lo[ax] - los[ax], r_hi[ax] - los[ax])
+                for ax in range(ndim))
+    return local_shape, dst, disk
+
+
 _PRESTRIPE_WARNED = False
 
 
@@ -86,6 +208,13 @@ def _lustre_prestripe(path: str, stripe_count: int = 16,
     through MPI-IO's ``striping_factor``/``striping_unit`` hints, which
     ROMIO applies via ``llapi`` with no binary on PATH
     (``_slab_io_mpi_host._mpi_io_hints``; ``ffi/phdf5/cpp/context.cc``).
+
+    The ``mode='w'`` inode replace no longer depends on this function:
+    :func:`_replace_inode_for_write` unlinks unconditionally before
+    either PHDF5 writer opens (audit 2026-07-28 — the ``os.remove``
+    below sat behind the lfs early-return above and never ran in the
+    container), so on the lfs-available path the remove below merely
+    re-runs harmlessly against an already-removed file.
     """
     if shutil.which("lfs") is None:
         global _PRESTRIPE_WARNED
@@ -392,21 +521,25 @@ class _FfiBackend:
         self.path = path
         self.mesh = mesh
         self.mode = mode
-        # Pre-stripe the file on rank 0 so Lustre's per-stripe layout
-        # actually matches the MPI_Info hints the FFI passes to ROMIO.
-        # Only for 'w' mode — existing files in 'a'/'r' already have
-        # their layout and we'd lose it by unlinking.  Barrier after
-        # so all ranks see the new inode before H5Fcreate.
-        if mode == "w" and jax.process_index() == 0:
-            stripe_count = int(os.environ.get("LORRAX_PHDF5_STRIPE_COUNT", "16"))
-            stripe_size = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE_FS", "4M")
-            _lustre_prestripe(path, stripe_count=stripe_count,
-                              stripe_size=stripe_size)
+        # mode='w' must REPLACE the inode (rank-0 unlink + barrier,
+        # shared with _MpiHostBackend — see _replace_inode_for_write):
+        # Lustre layout is fixed at inode create, so H5Fcreate(TRUNC)
+        # over an old file silently keeps its stripe count and the
+        # MPI_Info striping hints no-op.  Unconditional of `lfs`: the
+        # old unlink sat behind _lustre_prestripe's lfs-missing early
+        # return and never ran in the production container (audit
+        # 2026-07-28, job 7876423 1-stripe evidence).  'a'/'r' keep the
+        # existing inode and its layout by design.  Barrier after the
+        # rank-0 prestripe so all ranks see the inode state before
+        # H5Fcreate.
         if mode == "w":
-            try:
-                multihost_utils.sync_global_devices("slab_io_ffi_prestripe")
-            except Exception:
-                pass
+            _replace_inode_for_write(path)
+            if _rank0():
+                _lustre_prestripe(
+                    path, stripe_count=_stripe_count(),
+                    stripe_size=os.environ.get(
+                        "LORRAX_PHDF5_STRIPE_SIZE_FS", "4M"))
+            _barrier("slab_io_ffi_prestripe")
         self.fh: int = self._open_file(path, mesh=mesh, mode=mode)
         self._ds_ids: dict[str, int] = {}
         # write_attr needs plain h5py (the FFI doesn't expose a

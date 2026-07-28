@@ -33,25 +33,95 @@ from typing import Any, Callable
 # ``timing.section``.  Same formatting path, same rank-0 gate, no
 # depth cap — ONE cadence mechanism, not two.
 # ---------------------------------------------------------------------------
-_TRACE = os.environ.get("LORRAX_TIMING_TRACE", "0").strip().lower() in (
-    "1", "true", "yes", "on")
-_TRACE_DEPTH = int(os.environ.get("LORRAX_TIMING_TRACE_DEPTH", "3"))
+# Both knobs are read at USE time, not import time: common.timing is
+# imported by essentially every LORRAX CLI, and an import-time ``int()``
+# of a malformed LORRAX_TIMING_TRACE_DEPTH killed every rank before
+# main() even ran, even with tracing disabled — an observability knob
+# must never take down the run it observes (QUALITY_PATTERNS #8; audit
+# 2026-07-28).  Use-time reads also match the rest of LORRAX's env
+# flags (cf. ``_slab_io_mpi_host._env_flag``): tests/drivers that set
+# the env after import see the new value.
+_TRACE_TRUE = ("1", "true", "yes", "on")
 _TRACE_RANK0: bool | None = None
 
 
+def _trace_flag() -> bool:
+    return (os.environ.get("LORRAX_TIMING_TRACE", "0").strip().lower()
+            in _TRACE_TRUE)
+
+
+def _trace_depth() -> int:
+    """``LORRAX_TIMING_TRACE_DEPTH`` (nesting-depth cap, default 3).
+
+    Unset/empty → default (the module falsy-parse convention, matching
+    :func:`_trace_flag`); anything else must be a plain int.  Malformed
+    input refuses with the variable name (doctrine 3) — and only once
+    tracing is actually on, since :func:`_trace_enabled` short-circuits
+    on the flag first.
+    """
+    raw = os.environ.get("LORRAX_TIMING_TRACE_DEPTH", "").strip()
+    if not raw:
+        return 3
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"LORRAX_TIMING_TRACE_DEPTH={raw!r} is not a valid trace "
+            f"depth: expected a plain integer nesting cap (default 3)."
+        ) from None
+
+
 def _rank0() -> bool:
+    """Rank-0 gate for cadence prints.
+
+    Memoizes ONLY once ``jax.distributed`` is initialised.  Pre-init,
+    ``jax.process_index()`` reports 0 on EVERY process — the previous
+    first-call-wins cache could latch True on all ranks for the whole
+    run (P duplicate cadence lines) if any announced section ran before
+    ``jax.distributed.initialize`` — and calling it would also force
+    XLA backend init as a side effect of a print path (the
+    QUALITY_PATTERNS #8 init-order hazard).  We therefore consult only
+    ``jax._src.distributed.global_state`` (pure state, no backend
+    init): pre-init and no-jax callers get an UNCACHED True, and the
+    first post-init call resolves and caches the real rank (audit
+    2026-07-28).
+    """
     global _TRACE_RANK0
-    if _TRACE_RANK0 is None:
+    if _TRACE_RANK0 is not None:
+        return _TRACE_RANK0
+    try:
+        from jax._src import distributed as _jax_distributed
+    except ImportError:
+        # No jax in this interpreter (standalone tooling): single
+        # process, rank 0 by definition.
+        _TRACE_RANK0 = True
+        return True
+    state = getattr(_jax_distributed, "global_state", None)
+    if state is None:
+        # Compat fallback: jax internals moved ``global_state`` (not the
+        # case for the pinned jax>=0.9).  Fall back to the process
+        # index, cached — the pre-fix behaviour, better than printing on
+        # every rank forever.
         try:
             import jax
             _TRACE_RANK0 = jax.process_index() == 0
-        except Exception:                                    # noqa: BLE001
+        except (ImportError, RuntimeError):
             _TRACE_RANK0 = True
+        return _TRACE_RANK0
+    pid = getattr(state, "process_id", None)
+    if getattr(state, "client", None) is None or pid is None:
+        # Distributed runtime not (yet) initialised: either a
+        # single-process run (never initialises; True is correct on
+        # every call) or a multi-process run before
+        # ``jax.distributed.initialize`` (identity unknowable yet — do
+        # NOT cache, so post-init calls resolve correctly).
+        return True
+    _TRACE_RANK0 = int(pid) == 0
     return _TRACE_RANK0
 
 
 def _trace_enabled(depth: int) -> bool:
-    if not _TRACE or depth > _TRACE_DEPTH:
+    if not _trace_flag() or depth > _trace_depth():
         return False
     return _rank0()
 
