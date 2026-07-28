@@ -239,6 +239,14 @@ class _TauAccumulator(_SigmaAccumulator):
     def finalize(self) -> jax.Array | None:
         return self._sink.result()
 
+    def finalize_host_tiles(self):
+        """Branch tail WITHOUT the device round trip — see
+        :meth:`_MemoryTileSink.host_tiles`.  Only meaningful behind a
+        memory-tile sink (the streamed _H5Sink has already written its
+        windows to disk and has nothing to hand back); calling it on a
+        sink without ``host_tiles`` is a caller bug and raises."""
+        return self._sink.host_tiles()
+
 
 class _WindowSink:
     """Protocol for what a finished window's per-shard tiles become."""
@@ -248,6 +256,12 @@ class _WindowSink:
 
 class _MemoryTileSink(_WindowSink):
     """Σ_c(ω, k, m, n) held as per-rank numpy tiles — never GPU HBM.
+
+    The Σ driver's per-branch tail reads :meth:`host_tiles` (host numpy in,
+    host numpy out — the single-gather-at-stage-end path); :meth:`result`
+    is the original per-branch device-assembly variant, kept as the
+    _WindowSink protocol's generic answer and for any future caller that
+    genuinely wants a device Σ.
 
     Each window's per-shard tiles are added into a running per-shard total.  At
     :meth:`result`, each shard tile is placed back on the device that owned it
@@ -264,13 +278,69 @@ class _MemoryTileSink(_WindowSink):
         self._sharding = sharding
         self._total_shards: list[np.ndarray] | None = None
         self._devices: list | None = None
+        # 3-D σ^τ shard indices (nk, m, n) captured with the first window —
+        # needed by host_tiles() to place each tile in the 4-D global Σ.
+        self._index: list[tuple] | None = None
 
     def consume_window(self, win_shards, shard_index, shard_devices) -> None:
         if self._total_shards is None:
             self._total_shards = [np.zeros_like(w) for w in win_shards]
             self._devices = list(shard_devices)
+            self._index = [tuple(ix) for ix in shard_index]
         for d, w in enumerate(win_shards):
             self._total_shards[d] += w
+
+    def host_tiles(self):
+        """Per-shard host tiles, their 4-D global indices, and owning devices.
+
+        The no-round-trip branch tail — scorecard AK.9's second named lever
+        ("``_to_host_np(sigma_kij, tiled=False)`` is a P-INDEPENDENT gather
+        — once per Σ branch, n_ω_branch·nk·nb²·16 bytes onto EVERY rank,
+        ≈237 MB/branch at 606c/b160, growing as nb²").  The old tail:
+        :meth:`result` re-uploads the per-rank host tiles (device_put),
+        assembles a global sharded array, and the driver then
+        process_allgather's the full (n_ω, nk, nb, nb) slab back to every
+        rank's host — once PER BRANCH, i.e. 4 device round trips + 4
+        64-process allgathers per Σ stage.  This accessor instead hands the
+        already-correct host tiles straight to the driver, which sums
+        branches in numpy at their global ω indices and pays ONE
+        device-assembly + gather at the end of the stage
+        (``ppm_sigma.compute_sigma_c_ppm_omega_grid``).  Pure data plumbing:
+        the tile VALUES are byte-identical to what result() would have
+        gathered; only the movement schedule changes.
+
+        Measured domain (claim-decay rule): at AQ 4962c/P=64 nb=128 (job
+        7878038, 2026-07-28) the new rows read sigma.finalize 0.000 s ×4 +
+        sigma.host_gather 0.244 s — but the OLD per-branch gathers there
+        cost only ~1-4 s total (the baseline's Finished→Started seams were
+        already 0-1 s; the analysts' "4-5 s/branch tail" was the async-D2H
+        deque drain inside the branch, which this fix deliberately does NOT
+        touch).  The win at small nb is small; the lever's value is the
+        nb²-growth term AK.9 names.
+
+        Scale/design-envelope note: the object moved is the QP-band-window
+        Σ tile — (n_ω, nk, nb_σ/p_x, nb_σ/p_y) per rank — which is
+        independent of N_μ and SHRINKS with P, so the fix stays valid as
+        n_atoms → hundreds, N_μ → tens of thousands, P → thousands, on CPU
+        and GPU backends alike; going from 4 full-slab replications to 1 is
+        a flat 4× cut in the stage-tail collective volume at every scale.
+
+        Empty branch (no window contributed): returns zero tiles with the
+        indices/devices the sharding prescribes — same semantics as
+        result()'s zero path.
+        """
+        if self._total_shards is None:
+            devices = list(self._sharding.addressable_devices)
+            dmap = self._sharding.devices_indices_map(self._shape)
+            local_shape = self._sharding.shard_shape(self._shape)
+            tiles = [np.zeros(local_shape, dtype=np.complex128)
+                     for _ in devices]
+            index4 = [tuple(dmap[d]) for d in devices]
+            return tiles, index4, devices
+        # _index holds the 3-D σ^τ indices (nk, m, n); the sink's global
+        # shape carries the leading ω axis → prepend the full slice.
+        index4 = [(slice(None),) + tuple(ix) for ix in self._index]
+        return self._total_shards, index4, self._devices
 
     def result(self) -> jax.Array:
         if self._total_shards is None:

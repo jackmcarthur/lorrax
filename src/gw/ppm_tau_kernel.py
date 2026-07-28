@@ -19,6 +19,7 @@ first per-τ dispatch pays a full compile inside execution.
 
 from __future__ import annotations
 
+import os
 from functools import partial
 from typing import Callable
 
@@ -27,11 +28,111 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
+from common import timing
 from common.jax_compile_cache import ensure_jax_compile_cache
 
 
 _sigma_tau_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 _sigma_kij_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
+
+
+def _stage_timing_enabled() -> bool:
+    """``LORRAX_SIGMA_TAU_TIMING=1`` selects the stage-split instrumented τ kernel.
+
+    Diagnostic knob (2026-07-28; evidence: AQ 4962c/P=64 HLO module_0912 —
+    'sigma.exec 272.040' is a single opaque row, 176 τ dispatches at a uniform
+    ~1.51 s that no existing timing row decomposes).  When ON, the per-τ body
+    is dispatched as its cached stage jits (W-phase build / G build / flat-k
+    IFFTs / G·W multiply + forward FFT / ψ-projection + reduce-scatter), each
+    wrapped in a blocking ``timing.section`` sub-row, so ONE run splits the
+    per-τ wall into those stages.  When OFF (default) the production fused
+    ``_tau_kernel`` jit is returned unchanged — the flag is read once at
+    kernel-factory time and is part of the kernel cache key, so the disabled
+    path pays zero per-τ overhead.
+
+    Read at USE time, truthy-parsed like common.timing's trace flags.  This is
+    an observability knob, not policy: the staged variant evaluates the exact
+    same jnp op sequence (same primitives, same order, no algebraic rewrites),
+    only in separate XLA modules with per-stage blocking — numerics identical;
+    walltime is NOT comparable to the fused path (cross-stage fusion and the
+    async-D2H overlap of ppm_accumulators are deliberately serialized).
+    Scale-neutral: overhead is O(1) host work per τ stage, independent of
+    n_atoms / N_μ / nk / P / backend.
+    """
+    return os.environ.get("LORRAX_SIGMA_TAU_TIMING", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _project_ri_local(psi_xr_local, sigma_k_local, psi_yn_local):
+    """Rank-local body of the ψ* σ ψ reduce-scatter projection.
+
+    ONE source for the projection tail, called from inside the standalone
+    projector's shard_map (``_make_project_ri_reduce_scatter``).  Kept at
+    module level so any future kernel variant shares the byte-identical
+    body (the 2026-07-28 monolithic-fusion experiment did exactly that; see
+    wk_REL/sigma_perf_results.md — refuted at nb=128, patch preserved).
+    Local shapes:
+
+        psi_xr_local  (nk, m, s, μ_X_loc)
+        sigma_k_local (nk, s, μ_X_loc, s', μ_Y_loc)
+        psi_yn_local  (nk, s', μ_Y_loc, n)
+        → (re, im) each (nk, m/p_x, n/p_y)
+
+    Re/im CHANNELS stay separate end-to-end (OWNER_HOLD 2026-07-28: the
+    channel decomposition is mathematically substantive — each channel's
+    einsum/cast sequence below must stay per-channel).  Two approved
+    movement-only levers are applied on top:
+
+    * AK.9 stacking (scorecard, 2026-07-28): both channels' psum_scatter
+      payloads ride ONE collective per mesh axis, stacked on a fresh
+      leading axis — 4 → 2 messages/τ at identical bytes.  Bit-exact by
+      construction: reduce-scatter sums ELEMENTWISE over the same replica
+      groups in the same rank order ("a rank-wise elementwise sum cannot
+      care that two independent arrays were concatenated" — AK.9);
+      stack/index are pure data movement.  AK.9's precondition (transport
+      question settled) is met on this run family — the certified AS.7
+      mpi/mlx cell.
+    * Axis-order swap (owner-approved 2026-07-28): μ_Y contracted FIRST so
+      the LARGE stacked partial reduce-scatters over 'y' (consecutive-rank
+      groups: node-local pairs at 2 ranks/node) and only the small final
+      block rides the stride-p_x all-inter-node 'x' groups (evidence: HLO
+      module_0912 replica_groups {0,8,...,56} for 'x' vs {0..7} for 'y';
+      payloads 2×40.9 MB vs 2×0.52 MB pre-swap).  Per-channel contraction
+      order becomes ψ*·(σ·ψ) — same math/flops, value-level identical,
+      gated by the 1e-12 parity suite (not claimed bit-exact).
+
+    Scale-neutral: both levers are flat in n_atoms / N_μ / nk / nb / P and
+    backend; no new N_μ²-sized object is created.
+    """
+    def _right(sigma_real_or_imag):
+        # 'ksxty' × 'ktyn' -> 'ksxn'  (contracts s', local μ_Y)
+        return jnp.einsum(
+            'ksxty,ktyn->ksxn',
+            sigma_real_or_imag, psi_yn_local, optimize=True)
+
+    right_re = _right(jnp.real(sigma_k_local))
+    right_im = _right(jnp.imag(sigma_k_local))
+    # ONE psum_scatter(y) for both channels; n is axis 4 of the stack:
+    # (2, nk, s, μ_X_loc, n) → (2, nk, s, μ_X_loc, n/p_y)
+    right_rs = jax.lax.psum_scatter(
+        jnp.stack([right_re, right_im], axis=0), 'y',
+        scatter_dimension=4, tiled=True)
+
+    def _left(right_rs_ch):
+        # 'kmsx' × 'ksxn' -> 'kmn'  (contracts s, local μ_X)
+        return jnp.einsum(
+            'kmsx,ksxn->kmn',
+            jnp.conj(psi_xr_local), right_rs_ch, optimize=True)
+
+    result_re = _left(right_rs[0])
+    result_im = _left(right_rs[1])
+    # ONE psum_scatter(x) for both channels; m is axis 2 of the stack:
+    # (2, nk, m, n/p_y) → (2, nk, m/p_x, n/p_y)
+    out = jax.lax.psum_scatter(
+        jnp.stack([result_re, result_im], axis=0), 'x',
+        scatter_dimension=2, tiled=True)
+    return (out[0].astype(jnp.complex128),
+            out[1].astype(jnp.complex128))
 
 
 def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
@@ -57,11 +158,29 @@ def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
     is_fully_addressable in multi-process mode).
 
     Comms inside:  the two implicit psums of the original einsum
-        psum(x)       over the μ_X contraction axis
-        psum(y)       over the μ_Y contraction axis
+        psum(y)       over the μ_Y contraction axis   (FIRST — large payload)
+        psum(x)       over the μ_X contraction axis   (second — small payload)
     become:
-        psum_scatter(x, scatter_dim=m)   — reduces μ_X AND scatters m on x
         psum_scatter(y, scatter_dim=n)   — reduces μ_Y AND scatters n on y
+        psum_scatter(x, scatter_dim=m)   — reduces μ_X AND scatters m on x
+    with two packaging/locality levers on top of the original design:
+      * AK.9 stacking (scorecard, 2026-07-28): BOTH re/im channels ride each
+        collective in one stacked payload — 2 collectives per τ instead of 4
+        at identical bytes, bit-exact (elementwise rank-sum is indifferent
+        to concatenation).
+      * axis-order swap (owner-approved 2026-07-28, movement-only): the
+        μ_Y-side contraction runs FIRST so the LARGE partial (the m-full
+        (nk, s, μ_X_loc, n) block) reduce-scatters over the 'y' axis, whose
+        consecutive-rank replica groups have node-local pairs at 2
+        ranks/node, while the stride-p_x 'x' groups (zero SHM locality on
+        the AQ layout — HLO module_0912 groups {0,8,16,...}) now carry only
+        the small (nk, m, n/p_y) block.  Per-channel contraction order
+        becomes ψ*·(σ·ψ) instead of (ψ*·σ)·ψ — same math and flops,
+        value-level (not bit-level) identical; gated by the 1e-12 output
+        parity suite.  Scale-neutral: locality preference and message
+        count are flat in n_atoms / N_μ / nk / nb / P and backend.
+    The channel MATH stays per-channel — see the OWNER_HOLD note in
+    ``_project_ri_local``.
 
     Same NCCL byte volume as the original pair of psums (on-ring LL128), but
     the output is sharded (m_X, n_Y) so every downstream coeff·σ multiply
@@ -97,30 +216,7 @@ def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
     # 2-tuple output: re part, im part.  Each (nk, m_X, n_Y) sharded.
     out_specs = (P(None, 'x', 'y'), P(None, 'x', 'y'))
 
-    def _local(psi_xr_local, sigma_k_local, psi_yn_local):
-        # Per-channel reduce-scatter: do re and im independently so the
-        # output is a tuple of two (nk, m/p_x, n/p_y) arrays rather than a
-        # stacked (2, nk, m, n) that callers would have to slice.
-        def _one_channel(sigma_real_or_imag):
-            # 'kmsx' × 'ksxty' -> 'kmty'  (contracts s, local μ_X)
-            left_partial = jnp.einsum(
-                'kmsx,ksxty->kmty',
-                jnp.conj(psi_xr_local), sigma_real_or_imag, optimize=True)
-            # psum_scatter(x, scatter_dim=m=1) → (nk, m/p_x, s', μ/p_y)
-            left_rs = jax.lax.psum_scatter(
-                left_partial, 'x', scatter_dimension=1, tiled=True)
-            # 'kmty' × 'ktyn' -> 'kmn'  (contracts s', local μ_Y)
-            result_partial = jnp.einsum(
-                'kmty,ktyn->kmn', left_rs, psi_yn_local, optimize=True)
-            # psum_scatter(y, scatter_dim=n=2) → (nk, m/p_x, n/p_y)
-            return jax.lax.psum_scatter(
-                result_partial, 'y', scatter_dimension=2, tiled=True,
-            ).astype(jnp.complex128)
-
-        return (_one_channel(jnp.real(sigma_k_local)),
-                _one_channel(jnp.imag(sigma_k_local)))
-
-    _sm = shard_map(_local, mesh=mesh_xy,
+    _sm = shard_map(_project_ri_local, mesh=mesh_xy,
                     in_specs=in_specs, out_specs=out_specs,
                     check_rep=False)
 
@@ -167,7 +263,10 @@ def _get_sigma_kij_kernel(
 
     kgrid = tuple(int(x) for x in kgrid)
     nk_tot = kgrid[0] * kgrid[1] * kgrid[2]
-    pipeline_key = (id(mesh_xy), kgrid)
+    # The stage-timing flag is part of the cache key: the two variants are
+    # different callables (fused jit vs staged dispatcher) and must not
+    # shadow each other across a flag flip inside one process (tests).
+    pipeline_key = (id(mesh_xy), kgrid, _stage_timing_enabled())
     if pipeline_key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[pipeline_key]
 
@@ -211,8 +310,64 @@ def _get_sigma_kij_kernel(
         sigma_k = _G_fftn(G_R * V_R * inv_sqrt_nk)
         return _project_ri_rs(psi_proj_xr, sigma_k, psi_proj_yn)
 
-    _sigma_kij_kernel_cache[pipeline_key] = _sigma_kij_kernel
-    return _sigma_kij_kernel
+    if not _stage_timing_enabled():
+        _sigma_kij_kernel_cache[pipeline_key] = _sigma_kij_kernel
+        return _sigma_kij_kernel
+
+    # ------------------------------------------------------------------
+    # Stage-split instrumented variant (LORRAX_SIGMA_TAU_TIMING=1 only).
+    #
+    # Same op sequence as ``_sigma_kij_kernel`` above, dispatched as five
+    # cached stage jits so blocking ``timing.section`` sub-rows attribute
+    # the per-τ wall (evidence: AQ 4962c/P=64 HLO module_0912, 2026-07-28
+    # — the 1.51 s/τ was indivisible).  Notes:
+    #   * ``sigma.tau.project_rs`` covers the ψ-projection dots AND their
+    #     two psum_scatters together — they live inside one shard_map and
+    #     the re/im channel decomposition there is OWNER-HELD; a per-op
+    #     split of dot vs collective wait comes from a profiler trace
+    #     (jax_profile.trace_section wraps the first window per branch in
+    #     ppm_sigma), not from restructuring the kernel.
+    #   * W_q is NOT donated here (the fused kernel donates it into the
+    #     _V_ifftn temp); one extra (nq, μ_X, μ_Y)/rank buffer while the
+    #     knob is on — diagnostic-only cost.
+    #   * Stage boundaries force materialization of G_k / G_R / V_R that
+    #     the fused module may keep in fft-native layout, so staged wall
+    #     ≠ fused wall; the rows are for RATIO attribution.
+    # Scale-neutral: per-τ host overhead is O(#stages), independent of
+    # n_atoms / N_μ / nk / P and identical on CPU and GPU backends.
+    # ------------------------------------------------------------------
+    _G_build_j = jax.jit(
+        lambda xn, yr, E_A, mask_A, E_ref_A, t_node: build_G_tau(
+            xn, yr, E_A, 1j * t_node, e_ref=E_ref_A, mask=mask_A))
+    _G_ifft_j = jax.jit(_G_ifftn)
+    _V_ifft_j = jax.jit(lambda W_q: _V_ifftn(W_q)[:, None, :, None, :])
+    _mult_fft_j = jax.jit(lambda G_R, V_R: _G_fftn(G_R * V_R * inv_sqrt_nk))
+    _project_j = jax.jit(_project_ri_rs)
+
+    def _sigma_kij_kernel_staged(
+        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+        E_A, mask_A, E_ref_A, t_node, W_q,
+    ):
+        with timing.section("sigma.tau.G_build") as sec:
+            G_k = _G_build_j(psi_coh_xn, psi_coh_yr, E_A, mask_A,
+                             E_ref_A, t_node)
+            sec.watch(G_k)
+        with timing.section("sigma.tau.G_ifft") as sec:
+            G_R = _G_ifft_j(G_k)
+            sec.watch(G_R)
+        with timing.section("sigma.tau.V_ifft") as sec:
+            V_R = _V_ifft_j(W_q)
+            sec.watch(V_R)
+        with timing.section("sigma.tau.GW_mult_fft") as sec:
+            sigma_k = _mult_fft_j(G_R, V_R)
+            sec.watch(sigma_k)
+        with timing.section("sigma.tau.project_rs") as sec:
+            out = _project_j(psi_proj_xr, sigma_k, psi_proj_yn)
+            sec.watch(out)
+        return out
+
+    _sigma_kij_kernel_cache[pipeline_key] = _sigma_kij_kernel_staged
+    return _sigma_kij_kernel_staged
 
 
 def _get_sigma_tau_kernel(
@@ -223,7 +378,7 @@ def _get_sigma_tau_kernel(
     """Return a cached tau-node sigma builder with jittable local FFTs."""
 
     kgrid = tuple(int(x) for x in kgrid)
-    cache_key = (id(mesh_xy), kgrid)
+    cache_key = (id(mesh_xy), kgrid, _stage_timing_enabled())
     if cache_key in _sigma_tau_kernel_cache:
         return _sigma_tau_kernel_cache[cache_key]
 
@@ -256,6 +411,31 @@ def _get_sigma_tau_kernel(
             psi_proj_xr, psi_proj_yn,
             E_A, mask_A, E_ref_A, t_node, W_t_q,
         )
+
+    if _stage_timing_enabled():
+        # Stage-split diagnostic dispatcher (see _stage_timing_enabled):
+        # _build_W_t_q is already its own jit, so calling it from Python
+        # gives the 'sigma.tau.w_phase' row for free; sigma_kij_kernel is
+        # the staged variant from _get_sigma_kij_kernel (same cache-key
+        # flag) and emits the remaining stage rows.  Numerics: identical
+        # op sequence to the fused _tau_kernel above.
+        def _tau_kernel_staged(
+            psi_coh_xn, psi_coh_yr,
+            psi_proj_xr, psi_proj_yn,
+            E_A, mask_A, B_q, Omega_q, mask_B,
+            E_ref_A, E_ref_B, t_node,
+        ):
+            with timing.section("sigma.tau.w_phase") as sec:
+                W_t_q = _build_W_t_q(B_q, Omega_q, mask_B, E_ref_B, t_node)
+                sec.watch(W_t_q)
+            return sigma_kij_kernel(
+                psi_coh_xn, psi_coh_yr,
+                psi_proj_xr, psi_proj_yn,
+                E_A, mask_A, E_ref_A, t_node, W_t_q,
+            )
+
+        _sigma_tau_kernel_cache[cache_key] = _tau_kernel_staged
+        return _tau_kernel_staged
 
     _sigma_tau_kernel_cache[cache_key] = _tau_kernel
     return _tau_kernel
@@ -315,8 +495,25 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
     E_ref_B = jnp.asarray(0.0, dtype=jnp.float64)
     t_node  = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128)
 
-    tau_kernel.lower(
-        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-        E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B,
-        E_ref_A, E_ref_B, t_node,
-    ).compile()
+    if hasattr(tau_kernel, "lower"):
+        tau_kernel.lower(
+            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+            E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B,
+            E_ref_A, E_ref_B, t_node,
+        ).compile()
+    else:
+        # Stage-split diagnostic dispatcher (LORRAX_SIGMA_TAU_TIMING=1): a
+        # plain Python callable over five stage jits, so there is no single
+        # ``.lower()``.  Prewarm by EXECUTING it once at the real
+        # shapes/shardings — signature match with the runtime path is then
+        # guaranteed by construction (the precompile-signature drift this
+        # AOT helper exists to prevent), at the cost of ~one τ-node of
+        # execution inside sigma.compile.  All ranks reach this call
+        # synchronously (module contract), so the psum_scatters inside are
+        # collective-safe.  Output is discarded.
+        out = tau_kernel(
+            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+            E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B,
+            E_ref_A, E_ref_B, t_node,
+        )
+        jax.block_until_ready(out)

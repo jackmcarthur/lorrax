@@ -45,6 +45,7 @@ This driver retains the physics prologue (PPM fit + physics-state prep) plus the
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, NamedTuple
 import os
@@ -55,7 +56,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 import h5py
 
-from common import jax_profile
+from common import jax_profile, timing
 from common.units import RYD_TO_EV
 from .gw_config import PPMConfig
 from .minimax_config import MinimaxConfig
@@ -103,6 +104,26 @@ class SigmaOmegaResult:
     omega_ev: np.ndarray
     sigma_c_kij: jax.Array | None      # (n_omega, nk, nb, nb) or None if streamed
     sigma_kij_h5_path: str | None = None
+
+
+class _SigmaBranchTiles(NamedTuple):
+    """One branch's Σ_c as per-rank HOST tiles — the single-gather tail seam.
+
+    Produced by ``_run_sigma_branch`` on the memory-tile (KIJ_HOST) path in
+    place of the old device-assembled, branch-stripped jax.Array (comms fix,
+    2026-07-28; evidence: AQ 4962c/P=64 gw.log branch tails — 4× device
+    re-upload + 4× 64-process allgather of the full Σ slab, ~17-18 s of the
+    Σ stage).  ``tiles[d]`` is (n_ω_branch, nk, m_pad/p_x, n_pad/p_y) numpy
+    at global 4-D index ``tile_index[d]``; the driver sums branches at their
+    global ω indices and gathers ONCE at stage end.  The mesh pad block is
+    still attached (stripped once, after the gather).
+    """
+    tiles: list                      # list[np.ndarray], one per addressable shard
+    tile_index: list                 # list[tuple[slice, ...]] 4-D global indices
+    devices: list                    # owning jax devices, aligned with tiles
+    spatial_padded: tuple            # (nk_proj, m_pad, n_pad) global padded extents
+    sharding: NamedSharding          # P(None, None, 'x', 'y') over the 4-D global
+    nb_real: int                     # real QP window extent (pre-pad), for strip
 
 
 # ---------------------------------------------------------------------------
@@ -317,11 +338,32 @@ def minimax_tau_integrate_sigma(
         # σ^τ is returned as a (re, im) tuple so the crossing window's HGL
         # quadrature (which keeps only Im[coeff·σ]) doesn't carry a complex
         # σ^τ through the FFT stack — would double HBM + collective traffic.
-        sigma_re, sigma_im = build_sigma_tau(
-            jnp.asarray(t_c, dtype=jnp.complex128))
+        #
+        # Per-τ timing sub-rows (instrumentation, 2026-07-28; evidence: AQ
+        # 4962c/P=64 — 'sigma.exec 272.040' hid 176 uniform 1.51 s τ
+        # dispatches with no finer attribution):
+        #   sigma.tau.dispatch    the τ-kernel call.  Fused path: async
+        #                         submit, ~0 host time.  With
+        #                         LORRAX_SIGMA_TAU_TIMING=1 the staged
+        #                         kernel emits blocking per-stage children
+        #                         (w_phase / G_build / G_ifft / V_ifft /
+        #                         GW_mult_fft / project_rs) under this row.
+        #   sigma.tau.host_accum  add_tau: async-D2H drain of τ_{i-lag} +
+        #                         the numpy ω-projection.  On the fused
+        #                         path this row also absorbs the wait for
+        #                         device compute (the deque's lag), so it
+        #                         UPPER-bounds host-side work.
+        # Overhead when nothing is enabled: two timing.section enter/exits
+        # per τ (~µs) — scale-neutral (independent of n_atoms, N_μ, nk, P,
+        # backend); the design-envelope τ counts (hundreds) keep this in
+        # the sub-ms range per stage.
+        with timing.section("sigma.tau.dispatch"):
+            sigma_re, sigma_im = build_sigma_tau(
+                jnp.asarray(t_c, dtype=jnp.complex128))
         if progress is not None:
             progress.step()
-        add_tau(sigma_re, sigma_im, t_c, alpha_eff_c)
+        with timing.section("sigma.tau.host_accum"):
+            add_tau(sigma_re, sigma_im, t_c, alpha_eff_c)
 
 
 def _integrate_tau_windows_for_branch(
@@ -355,9 +397,26 @@ def _integrate_tau_windows_for_branch(
         total_tau_nodes, print_fn, title=f"sigma[{branch_label}]",
         item_name="tau node", max_updates=10)
 
+    # One profiler SESSION per branch, first window only, active only when
+    # ISDF_JAX_PROFILE_DIR is set (jax_profile.trace_section no-ops
+    # otherwise — zero overhead in production).  The annotation/
+    # step_annotation hooks below were already wired but inert without a
+    # session; this is the missing session starter the AQ analysis called
+    # out (2026-07-28): a perfetto trace of one window per branch is what
+    # separates dot self-time from reduce-scatter wait inside the single
+    # jit__tau_kernel module, which no timing.section row can.  First
+    # window only, to bound trace size at any n_τ (scale-neutral).
+    def _trace_tag(label: str) -> str:
+        return "".join(c if (c.isascii() and c.isalnum()) else "_"
+                       for c in label)
+
     with jax_profile.annotation(f"sigma_branch[{branch_label}]"):
         for win_idx, win in enumerate(windows):
-            with jax_profile.step_annotation(
+            trace_ctx = (
+                jax_profile.trace_section(
+                    "sigma_tau_" + _trace_tag(branch_label))
+                if win_idx == 0 else nullcontext())
+            with trace_ctx, jax_profile.step_annotation(
                 "sigma_window", step_num=win_idx,
                 detail=f"{branch_label}:{win.name}:n{win.n_tau}",
             ):
@@ -499,12 +558,19 @@ def _run_sigma_branch(
     omega_batch_size: int = 4,
     stream_writer: Callable[[np.ndarray, jax.Array], None] | None = None,
     use_shipped_minimax_tables: bool = True,
-) -> tuple[jax.Array, list[_SigmaWindow]]:
+) -> tuple['_SigmaBranchTiles | None', list[_SigmaWindow]]:
     """Orchestrator for one branch (cond or val × pos or neg ω half).
 
     Reads as a physics outline:
         windows = _build_windows_for_branch(...)          # host
         acc     = _integrate_tau_windows_for_branch(...)  # device
+
+    Returns (memory-tile path) a :class:`_SigmaBranchTiles` of per-rank
+    HOST tiles still carrying the mesh pad — the driver sums branches on
+    host and performs the single end-of-stage gather + strip (comms fix
+    2026-07-28, see _SigmaBranchTiles).  Streamed path and empty branches
+    return ``None`` (the h5 RMWs, when streaming, already happened at the
+    window boundaries).
     """
     omega_nonneg_ry = np.asarray(omega_nonneg_ry, dtype=np.float64)
     n_omega = int(omega_nonneg_ry.shape[0])
@@ -526,7 +592,7 @@ def _run_sigma_branch(
     n_pad = int(psi_proj_yn.shape[3])
 
     if n_omega == 0:
-        return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
+        return None, []
 
     windows = _build_windows_for_branch(
         omega_nonneg_ry=omega_nonneg_ry,
@@ -541,7 +607,7 @@ def _run_sigma_branch(
         log_tag=log_tag, print_fn=print_fn,
     )
     if not windows:
-        return jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
+        return None, []
 
     omega_vec = jnp.asarray(omega_nonneg_ry, dtype=jnp.float64)
     tau_kernel = _get_sigma_tau_kernel(
@@ -591,13 +657,29 @@ def _run_sigma_branch(
         log_tag=log_tag, print_fn=print_fn,
     )
 
-    acc_total = accumulator.finalize()
-    if acc_total is None:
-        return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), windows
-    # Strip the mesh pad block (exactly zero) — the ONE seam where the padded
-    # QP window stops.  Everything above this line ran at nb_pad; everything
-    # below (host Sigma buffer, eqp write) sees only the real nb_proj.
-    return strip_sigma_window(acc_total, nb_proj), windows
+    # Branch tail.  'sigma.finalize' is the timing row the AQ analysis asked
+    # for (2026-07-28): the old tail hid a 4-5 s dead span per branch inside
+    # the branch elapsed (deque drain + device re-upload + full-slab
+    # process_allgather).  On the memory-tile path the tail is now just the
+    # host-tile handoff — the row exists to PROVE it stays near zero.
+    if stream_writer is not None:
+        with timing.section("sigma.finalize"):
+            accumulator.finalize()   # _H5Sink: windows already RMW-written; returns None
+        return None, windows
+    with timing.section("sigma.finalize"):
+        tiles, tile_index, tile_devices = accumulator.finalize_host_tiles()
+    # The mesh pad block stays attached here; the driver strips it ONCE
+    # after the single end-of-stage gather (pad rows are exactly zero, so
+    # summing padded branch tiles then stripping equals stripping each
+    # branch — see pad_sigma_window/strip_sigma_window).
+    return _SigmaBranchTiles(
+        tiles=tiles,
+        tile_index=tile_index,
+        devices=tile_devices,
+        spatial_padded=(nk_proj, m_pad, n_pad),
+        sharding=NamedSharding(mesh_xy, P(None, None, 'x', 'y')),
+        nb_real=nb_proj,
+    ), windows
 
 
 def _compute_invalid_static_sigma(
@@ -911,30 +993,92 @@ def compute_sigma_c_ppm_omega_grid(
             cond_mask=cond_mask, val_mask=val_mask,
         )
 
-        # Run each branch and fold its Σc directly into the host tensor at its
-        # global ω indices.  cond and val of a given ω-half share those indices,
-        # so the second branch's `+=` sums cond+val there — same values, same
-        # traversal order (cond before val, per-branch device reduction then
-        # host add) as the old per-ω-half dict, minus the tuple-of-ints key.
+        # Run each branch and fold its Σc tiles into per-rank HOST tile
+        # accumulators at the branch's global ω indices.  cond and val of a
+        # given ω-half share those indices, so the second branch's `+=` sums
+        # cond+val there — same values, same traversal order (cond before
+        # val), same pairwise-add order per element as the old per-branch
+        # allgather + host fold, so the result is bit-identical.
+        #
+        # Comms fix — scorecard AK.9's second named lever, the P-independent
+        # per-branch `_to_host_np(sigma_kij, tiled=False)` full-slab gather
+        # onto EVERY rank (≈237 MB/branch at 606c/b160, grows as nb²).
+        # (2026-07-28; evidence: AQ 4962c/P=64 run run_AQ_c4962_p64_mpi;
+        # measured at that shape by job 7878038: finalize+gather now
+        # 0.24 s total vs ~1-4 s before — small at nb=128; the target is
+        # the nb² growth term.)  Σ_c already lives as per-rank host numpy tiles in
+        # exactly the (m_X, n_Y) sharding the reduce-scatter projector
+        # emitted; the old tail re-uploaded them to device and
+        # process_allgather'd the FULL (n_ω_branch, nk, nb, nb) slab to all
+        # ranks once PER BRANCH.  Now the tiles stay on host across
+        # branches and ONE gather runs at the end of the stage
+        # ('sigma.host_gather' below).  Design-envelope scaling: the moved
+        # object is the QP-band-window slab (n_ω · nk · nb_σ² · 16 B),
+        # independent of N_μ; per-rank tiles shrink as 1/P, and the 4→1
+        # replication cut is flat in n_atoms / nk / N_μ / P on CPU and GPU
+        # backends — nothing here is tuned to the rehearsal shape.
         # Streaming writes straight to the h5 via the branch's _H5Sink; both
-        # cond and val RMW-add into the same dataset, so no host fold is needed.
+        # cond and val RMW-add into the same dataset, so no host fold is
+        # needed (branch returns None there).
+        tile_acc = None     # per-shard host accumulators, full ω extent
+        tile_meta = None    # first branch's _SigmaBranchTiles (layout metadata)
         for br in branches:
-            sigma_kij, _ = _run_sigma_branch(
+            branch_tiles, _ = _run_sigma_branch(
                 omega_nonneg_ry=br.omega_abs, omega_global_idx=br.omega_idx,
                 E_A=br.E_A, base_mask_A=br.base_mask_A,
                 space=br.space, neg_omega_half=br.neg_omega_half,
                 log_tag=br.tag,
                 **common_branch_kwargs,
             )
-            if not streaming:
-                # the reduce-scatter project (_make_project_ri_reduce_scatter)
-                # returns Σ sharded (m_X, n_Y), so the host copy needs a
-                # cross-process gather rather than jax.device_get; _to_host_np
-                # falls back to device_get for single-process / replicated.
-                idx = np.asarray(br.omega_idx, dtype=np.int64)
-                sigma_kij_host[idx] = (
-                    sigma_kij_host[idx]
-                    + _to_host_np(sigma_kij, dtype=np.complex128, tiled=False))
+            if streaming or branch_tiles is None:
+                continue
+            idx = np.asarray(br.omega_idx, dtype=np.int64)
+            if tile_acc is None:
+                tile_meta = branch_tiles
+                tile_acc = [
+                    np.zeros((n_omega,) + t.shape[1:], dtype=np.complex128)
+                    for t in branch_tiles.tiles]
+            else:
+                # All branches run the same ψ window on the same mesh, so
+                # their tile layouts must agree — a mismatch here is a bug,
+                # not a configuration (QUALITY_PATTERNS #7: guard it).
+                assert (branch_tiles.tile_index == tile_meta.tile_index
+                        and branch_tiles.spatial_padded == tile_meta.spatial_padded), (
+                    f"sigma branch tile layout drifted across branches: "
+                    f"{branch_tiles.spatial_padded} vs {tile_meta.spatial_padded}")
+            for d, t in enumerate(branch_tiles.tiles):
+                tile_acc[d][idx] += t
+
+        # Single end-of-stage gather: assemble the global padded Σ_c from the
+        # per-rank host tiles and reconstruct it on every rank's host — ONCE,
+        # replacing the old 4 per-branch device round trips + allgathers.
+        # (Every rank needs the full tensor: downstream head injection /
+        # diag(Σ_c) interpolation / sigma_mnk write all read the replicated
+        # host copy, and the final jnp.asarray(sigma_kij_host) must agree
+        # across processes.)
+        if not streaming and tile_acc is not None:
+            assert tile_meta.nb_real == nb_proj
+            with timing.section("sigma.host_gather"):
+                padded_shape = (n_omega,) + tuple(
+                    int(s) for s in tile_meta.spatial_padded)
+                if int(jax.process_count()) == 1:
+                    # Every shard is addressable (single process, any device
+                    # count — no shard-0 assumption, Bug C): pure host
+                    # assembly, no device hop at all.
+                    full_pad = np.zeros(padded_shape, dtype=np.complex128)
+                    for t, ix in zip(tile_acc, tile_meta.tile_index):
+                        full_pad[ix] = t
+                else:
+                    arrays = [jax.device_put(t, d)
+                              for t, d in zip(tile_acc, tile_meta.devices)]
+                    gathered = jax.make_array_from_single_device_arrays(
+                        padded_shape, tile_meta.sharding, arrays)
+                    full_pad = _to_host_np(
+                        gathered, dtype=np.complex128, tiled=True)
+                # Strip the mesh pad block (exactly zero) — the ONE seam
+                # where the padded QP window stops; everything below (host
+                # Σ buffer, eqp write) sees only the real nb_proj extent.
+                sigma_kij_host += strip_sigma_window(full_pad, nb_proj)
 
         # static_limit: fold the ω-independent invalid-pole static-COHSEX
         # term into Σ_c at every ω (host add / streamed ω-batched h5 RMW —
