@@ -241,6 +241,34 @@ def check_finite(
     return ok
 
 
+_HERM_STATS_CACHE: dict = {}
+
+
+def _herm_stats(a):
+    """``[max|A−Aᴴ|, max|A|]`` of a ``(..., μ, μ)`` tile — ONE compiled module.
+
+    The jitted callable is cached at module level so repeated gate calls
+    reuse the compiled module (``jax.jit`` caches on function identity +
+    avals; a fresh ``jit`` per call would recompile at every gate).  See
+    the sharding note inside :func:`check_hermitian` for why fusing these
+    ops is load-bearing, not a style choice.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    fn = _HERM_STATS_CACHE.get("fn")
+    if fn is None:
+        @jax.jit
+        def fn(m):
+            herm = jnp.conj(jnp.swapaxes(m, -1, -2))
+            return jnp.stack([
+                jnp.max(jnp.abs(m - herm)).astype(jnp.float64),
+                jnp.max(jnp.abs(m)).astype(jnp.float64),
+            ])
+        _HERM_STATS_CACHE["fn"] = fn
+    return fn(a)
+
+
 def check_hermitian(
     name: str,
     matrix: Any,
@@ -265,17 +293,23 @@ def check_hermitian(
         return True
     if _is_jax(matrix):
         import jax
-        import jax.numpy as jnp
 
         a = matrix
         if a.ndim < 2 or a.shape[-1] != a.shape[-2]:
             return True
-        herm = jnp.conj(jnp.swapaxes(a, -1, -2))
-        stats = jnp.stack([
-            jnp.max(jnp.abs(a - herm)).astype(jnp.float64),
-            jnp.max(jnp.abs(a)).astype(jnp.float64),
-        ])
-        dev, scale = (float(v) for v in np.asarray(jax.device_get(stats)))
+        # The transpose+subtract+reductions MUST live in ONE compiled
+        # module.  Executed eagerly, each op is its own XLA module: the
+        # transposed operand materialises with the mesh-transposed
+        # sharding, and the eager binary subtract resolves the sharding
+        # conflict by ALL-GATHERING BOTH (μ, μ) operands onto every rank
+        # — 2 × 399 MB c128[4992,4992] gathers per gate call, seen in the
+        # AQ 4962c/P=64 collective table 2026-07-28 (modules
+        # jit_subtract 0730/0973).  Fused under one jit, GSPMD reshards
+        # the transpose tile-locally (O(μ²/P) per rank) and the output is
+        # two scalars, keeping this the "one reduction" the docstring
+        # promises.  Re-verify from the HLO dump if this function changes.
+        dev, scale = (
+            float(v) for v in np.asarray(jax.device_get(_herm_stats(a))))
     else:
         a = np.asarray(matrix)
         if a.ndim < 2 or a.shape[-1] != a.shape[-2]:
