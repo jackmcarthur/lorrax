@@ -1013,12 +1013,23 @@ def prepare_isdf_and_wavefunctions(
 					       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
 					       f"transverse centroids")
 
-			# Append ψ to the now-open restart file.
+			# Append ψ to the now-open restart file.  Bispinor: also the
+			# σ^B-side transverse-centroid ψ (per-channel second dataset),
+			# clipped to ITS logical extent — this is what makes a
+			# bispinor restart round-trip (the loader re-pads and
+			# ``prepare_isdf_and_wavefunctions`` rebuilds the second
+			# bundle from it; without it Σ^B would be silently dropped).
 			write_restart_state_to_h5(
 				tensors_filename,
 				n_rmu_logical=int(meta.n_rmu),
 				psi_full_y=wfns.psi_yr, mesh=mesh_xy,
 				backend=cfg.backend.slab_io, mode="a",
+				psi_full_y_transverse=(
+					wfns_transverse.psi_yr
+					if wfns_transverse is not None else None),
+				n_rmu_transverse_logical=(
+					int(transverse_wfn_data['meta'].n_rmu)
+					if transverse_wfn_data is not None else None),
 			)
 		save_restart_state_per_proc(
 			os.path.join(tmp_dir, "isdf_tensors"),
@@ -1052,11 +1063,56 @@ def prepare_isdf_and_wavefunctions(
 				wfn, sym, meta, band_slices, mesh_xy,
 				psi_rmu_Y=rs.psi_rmu_Y, psi_rmuT_X=rs.psi_rmuT_X,
 				enk_full=rs.enk_full, print_fn=print0)
-			# Restart path doesn't yet round-trip the transverse
-			# Wfns through the restart file; bispinor restart will
-			# need a second psi_full_y dataset (per-channel).  Mark
-			# as not-yet-supported so consumers fail loud.
+			# Bispinor restart: the transverse-centroid ψ round-trips
+			# through the per-channel ``psi_full_y_transverse`` dataset
+			# (written 2026-07-27+).  Anything missing or mismatched is
+			# a LOUD refusal — before this, ``wfns_transverse=None``
+			# flowed into the Σ kernels whose Σ^B fold-in is a silent
+			# no-op on None (rc=0, wrong physics: Σ^B dropped).
 			wfns_transverse = None
+			if cfg.bispinor:
+				if getattr(rs, 'psi_rmu_Y_transverse', None) is None:
+					raise ValueError(
+						f"bispinor restart: {tensors_filename} has no "
+						f"'psi_full_y_transverse' dataset.  It was written "
+						f"either by a scalar run or by a LORRAX predating "
+						f"the bispinor restart round-trip (2026-07-27).  "
+						f"Σ^B needs ψ at the transverse centroids; rerun "
+						f"with restart = false to rebuild the tensors "
+						f"(the ζ fits and v_q_bispinor.h5 will be "
+						f"regenerated).")
+				# Provenance: the on-disk transverse μ count must match
+				# the run's centroids_file_current (pattern #10 — the
+				# artifact outlives the config that made it).
+				if not getattr(cfg.paths, 'centroids_file_current', None):
+					raise ValueError(
+						"bispinor restart requires centroids_file_current "
+						"in the input file (same requirement as the "
+						"non-restart bispinor path).")
+				from file_io.centroids import load_centroids as _load_cent
+				_, _, _n_rmu_curr_now = _load_cent(
+					cfg.paths.centroids_file_current, meta.fft_grid)
+				if int(_n_rmu_curr_now) != int(rs.n_rmu_transverse_disk):
+					raise ValueError(
+						f"bispinor restart: {tensors_filename} stores the "
+						f"transverse ψ for n_rmu_T="
+						f"{int(rs.n_rmu_transverse_disk)} centroids, but "
+						f"centroids_file_current "
+						f"({cfg.paths.centroids_file_current}) now has "
+						f"{int(_n_rmu_curr_now)}.  The σ^B quadrature "
+						f"basis differs; set restart = false (or restore "
+						f"the original transverse centroid file).")
+				sanity.check_finite(
+					"restart transverse ψ (psi_full_y_transverse)",
+					rs.psi_rmu_Y_transverse, print_fn=print0)
+				wfns_transverse = build_wavefunction_bundle(
+					wfn, sym, meta, band_slices, mesh_xy,
+					psi_rmu_Y=rs.psi_rmu_Y_transverse,
+					psi_rmuT_X=rs.psi_rmuT_X_transverse,
+					enk_full=rs.enk_full, print_fn=print0)
+				print0(f"  [bispinor] σ^B-side Wfns rebuilt from restart "
+				       f"(n_rmu_T={int(rs.n_rmu_transverse_disk)} "
+				       f"transverse centroids)")
 
 	return SimpleNamespace(
 		V_qmunu=V_qmunu,
