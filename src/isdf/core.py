@@ -1164,7 +1164,8 @@ def _resolve_solver_kind_charge(
         auto_pre=_auto_pre)
 
 
-def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> str:
+def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
+                                    n_rmu_logical: int | None = None) -> str:
     """Pick the transverse-channel ζ-fit solver: cuSolverMp distributed
     getrf+getrs vs the in-tree per-q ``jnp.linalg.solve`` + ridge.
 
@@ -1189,6 +1190,26 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> st
                        1-D mesh (pXgetrf needs square blocks).
       ``auto`` (default) → cuSolverMp on true 2D, legacy otherwise.
       (No ``slate`` value: a SLATE getrf wrapper does not exist yet.)
+
+    ``n_rmu_logical`` (the LOGICAL transverse centroid count) activates
+    the resolve-time divisibility contract for the two DISTRIBUTED
+    backends: the indefinite solve must run at the logical μ extent
+    (ROOT_CAUSE.md 2026-07-08 — pad-shape LU roundoff is amplified O(1)
+    in the near-null transverse modes), and the block-cyclic descriptors
+    need ``n_log % px == n_log % py == 0``.  When they don't divide:
+
+      * EXPLICIT request (``cusolvermp``/``on``/``scalapack``) → raise
+        HERE, at resolve time, naming the fix — the promise contract
+        (quality pattern #6/#8; the same treatment the charge W solve
+        got in the two-plan cleanup).  Before 2026-07-27 this demoted to
+        the per-q replicated LU via a ``warnings.warn`` deep inside
+        ``solve_zeta`` — the ledgered "silent replicated-LU fallback".
+      * ``auto`` resolution → announce the demotion (rank-0 print) and
+        return the per-q ``'lu'`` route.
+
+    Callers that don't know ``n_rmu_logical`` (pass ``None``) keep the
+    pure mesh/backend ladder; ``solve_zeta`` retains an announced
+    call-time demotion as defense in depth for those.
     """
     def _scalapack(px: int, py: int) -> str:
         # Facade guard ladder (ffi.linalg.resolve): host-only platform
@@ -1200,11 +1221,40 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> st
 
     # auto: cuSolverMp on true 2D GPU meshes; the shared ladder's CPU-mesh
     # guard falls back to the CPU-safe in-tree per-q solve.
-    return _resolve_channel_ladder(
+    kind = _resolve_channel_ladder(
         mesh_xy, override,
         kind_fallback='lu',
         kind_cusolvermp='cusolvermp_lu',
         explicit={'scalapack': _scalapack})
+
+    if kind in ('cusolvermp_lu', 'scalapack_lu') and n_rmu_logical is not None:
+        px = int(mesh_xy.shape['x'])
+        py = int(mesh_xy.shape['y'])
+        n_log = int(n_rmu_logical)
+        if (n_log % px) or (n_log % py):
+            if override in ('on', 'cusolvermp', 'scalapack'):
+                raise ValueError(
+                    f"distributed_lu={override!r} was explicitly requested, "
+                    f"but the transverse centroid count n_rmu_T={n_log} is "
+                    f"not divisible by the {px}x{py} mesh axes.  The "
+                    f"indefinite transverse solve must run at the LOGICAL "
+                    f"extent (pad-extent LU roundoff is amplified O(1) in "
+                    f"the near-null transverse modes) and the block-cyclic "
+                    f"descriptors need n % px == n % py == 0.  Either pick "
+                    f"a transverse centroid count divisible by both mesh "
+                    f"axes, change the process mesh, or set "
+                    f"distributed_lu = off (per-q replicated "
+                    f"jnp.linalg.solve, valid at any extent).")
+            if jax.process_index() == 0:
+                print(
+                    f"  [solver resolve] transverse LU: auto resolved to "
+                    f"{kind} but n_rmu_T={n_log} does not divide the "
+                    f"{px}x{py} mesh axes (block-cyclic descriptor rule); "
+                    f"demoting to the per-q replicated LU "
+                    f"(distributed_lu-equivalent 'off') so the solve runs "
+                    f"at the logical extent.", flush=True)
+            return 'lu'
+    return kind
 
 
 def _resolve_solver_kind(
@@ -1231,7 +1281,8 @@ def _resolve_solver_kind(
     if solver_kind != 'auto':
         return solver_kind
     if int(vertex_mu_L) != 0:
-        return _resolve_solver_kind_transverse(mesh_xy, distributed_lu)
+        return _resolve_solver_kind_transverse(
+            mesh_xy, distributed_lu, n_rmu_logical=n_rmu)
     return _resolve_solver_kind_charge(
         mesh_xy, distributed_cholesky, n_rmu=n_rmu, nq=nq,
         charge_zeta_solve=charge_zeta_solve)
@@ -2361,12 +2412,21 @@ def solve_zeta(
             # ``n_rmu_logical`` above), but the distributed block-cyclic
             # descriptors need n % Px == n % Py == 0.  Fall back to the
             # per-q replicated LU, which runs at any logical extent.
-            import warnings
-            warnings.warn(
-                f"solve_zeta: n_rmu_logical={n_log} not divisible by the "
-                f"{Px_}x{Py_} mesh axes; transverse LU falls back from "
-                f"the distributed backend to the per-q jnp.linalg.solve "
-                f"path so the solve can run at the logical extent.")
+            # Defense in depth ONLY: the config path refuses (explicit
+            # request) or announces (auto) this at RESOLVE time inside
+            # ``_resolve_solver_kind_transverse``; reaching this branch
+            # means a caller passed an explicit distributed kind without
+            # the divisibility precondition.  Announce via print, not
+            # warnings.warn — warnings dedupe/capture made the original
+            # demotion effectively silent in production logs (the
+            # ledgered "silent replicated-LU fallback").
+            if jax.process_index() == 0:
+                print(
+                    f"  [solve_zeta] n_rmu_logical={n_log} not divisible "
+                    f"by the {Px_}x{Py_} mesh axes; transverse LU falls "
+                    f"back from {solver_kind} to the per-q "
+                    f"jnp.linalg.solve path so the solve can run at the "
+                    f"logical extent.", flush=True)
             solver_kind = 'lu'
 
     if solver_kind == 'distributed_rank_truncate':
