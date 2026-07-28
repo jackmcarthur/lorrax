@@ -101,7 +101,16 @@ def _project_tau_onto_omega_np(
                          = coeff_re·σ_im + coeff_im·σ_re (real, up-cast to c128).
     """
     omega_kernel = np.exp(1j * omega_sign * omega_vec * t_node)
-    coeff = alpha_eff * omega_kernel
+    # ``pref`` is folded into the (n_ω,)-sized coeff instead of multiplying
+    # the full (n_ω, nk, i, j) contrib afterwards — removes one full-size
+    # array pass + temporary per τ.  Value-identical, NOT bitwise (the
+    # per-element product associates (pref·c)·σ instead of pref·(c·σ));
+    # gated by the 1e-12 output parity suite at nb=128 AND nb=256
+    # (host_accum follow-up, 2026-07-28).  The final ``.astype`` copy is
+    # likewise dropped: both branches already produce complex128
+    # (``np.asarray`` with a matching dtype is a no-copy view) — that one
+    # is bit-exact.
+    coeff = (pref * alpha_eff) * omega_kernel
     coeff_re = np.real(coeff).reshape(-1, 1, 1, 1)
     coeff_im = np.imag(coeff).reshape(-1, 1, 1, 1)
     if project_code == 0:           # full Laplace window
@@ -111,7 +120,7 @@ def _project_tau_onto_omega_np(
         contrib = coeff_re * sigma_im[None, ...] + coeff_im * sigma_re[None, ...]
     else:
         raise ValueError(f"Unknown project_code {project_code}")
-    return (pref * contrib).astype(np.complex128)
+    return np.asarray(contrib, dtype=np.complex128)
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +222,7 @@ class _TauAccumulator(_SigmaAccumulator):
             self._drain_one()
 
     def _drain_one(self) -> None:
+        from common import timing
         handles, t_c, alpha_eff_c = self._pending.popleft()
         if self._win_shards is None:
             self._win_shards = [None] * len(handles)
@@ -220,13 +230,28 @@ class _TauAccumulator(_SigmaAccumulator):
             # ``np.asarray`` of an addressable shard waits on the D2H we kicked
             # off earlier — by now the transfer has had ``lag`` iterations of
             # GPU work to overlap with.
-            proj = _project_tau_onto_omega_np(
-                np.asarray(hr), np.asarray(hi), self._omega_vec_np,
-                t_c, alpha_eff_c, self._omega_sign_f, self._pref_f, self._project_code,
-            )
-            if self._win_shards[d] is None:
-                self._win_shards[d] = np.zeros_like(proj)
-            self._win_shards[d] += proj
+            #
+            # The two rows below make the parent 'sigma.tau.host_accum' row
+            # DISCRIMINATE (QUALITY_PATTERNS addendum): 'd2h_wait' blocks on
+            # τ_{i-lag}'s device COMPUTE + transfer, so on a device-bound τ
+            # loop it absorbs the kernel time (it read 72.7 s of an 87 s
+            # sigma.exec at run_L1_b256 nb=256 — that is the DEVICE wall
+            # surfacing here, not host work); 'omega_project' is the pure
+            # numpy ω-kernel + accumulate (0.71 s/176 τ at nb=128, job
+            # 7878038 pass b).  A future "host_accum exploded" reading must
+            # cite the omega_project row, not the parent (2026-07-28).
+            with timing.section("sigma.tau.d2h_wait"):
+                sr = np.asarray(hr)
+                si = np.asarray(hi)
+            with timing.section("sigma.tau.omega_project"):
+                proj = _project_tau_onto_omega_np(
+                    sr, si, self._omega_vec_np,
+                    t_c, alpha_eff_c, self._omega_sign_f, self._pref_f,
+                    self._project_code,
+                )
+                if self._win_shards[d] is None:
+                    self._win_shards[d] = np.zeros_like(proj)
+                self._win_shards[d] += proj
 
     def end_window(self) -> None:
         while self._pending:
