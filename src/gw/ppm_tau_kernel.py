@@ -78,25 +78,72 @@ def _fft_ffi_fused_enabled() -> bool:
         "1", "true", "yes", "on")
 
 
-def _project_ri_local(psi_xr_local, sigma_k_local, psi_yn_local):
-    """Rank-local body of the ψ* σ ψ reduce-scatter projection.
+def _laplace_merge_enabled() -> bool:
+    """``LORRAX_SIGMA_LAPLACE_MERGE=1`` merges the Laplace-family projection
+    channels (owner ruling 2026-07-28, conditional approval — OWNER_DECISIONS
+    ruling on item 1): Laplace windows (``project="full"``) dispatch a τ
+    kernel whose projection tail is ONE complex chain X = ψ†σψ
+    (``_project_x_local``) and whose host ω-consumer reads X directly;
+    crossing windows (``project="imag"``) keep the two-channel kernel
+    unchanged.  Legality is bilinearity + consumer analysis, NOT a symmetry
+    assumption — see ``_project_x_local`` and manual §7.5.
 
-    ONE source for the projection tail, called from inside the standalone
-    projector's shard_map (``_make_project_ri_reduce_scatter``).  Kept at
-    module level so any future kernel variant shares the byte-identical
-    body (the 2026-07-28 monolithic-fusion experiment did exactly that; see
-    wk_REL/sigma_perf_results.md — refuted at nb=128, patch preserved).
-    Local shapes:
+    Default OFF: the production path is byte-untouched.  Read at
+    kernel-selection time in ``ppm_sigma`` and in ``precompile_sigma``; the
+    merged and two-channel kernels carry separate cache keys (``merged_x``)
+    because BOTH coexist within one merged-plan run (crossing windows still
+    need the two-channel kernel).  The driver announces the active plan
+    once per Σ stage (env grants the capability loudly; outputs are
+    value-identical, gated at 1e-12 — complex-GEMM association differs, so
+    bit-exactness is not claimed).  Scale-neutral: no new N_μ²-sized object
+    on any rank; per-τ collective payload and D2H volume HALVE on Laplace
+    windows.
+    """
+    return os.environ.get("LORRAX_SIGMA_LAPLACE_MERGE", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _project_ri_local(psi_xr_local, sigma_k_local, psi_yn_local):
+    """Rank-local body of the TWO-CHANNEL ψ* σ ψ reduce-scatter projection.
+
+    ONE source for the two-channel projection tail, called from inside the
+    standalone projector's shard_map (``_make_project_ri_reduce_scatter``).
+    Kept at module level so any future kernel variant shares the
+    byte-identical body (the 2026-07-28 monolithic-fusion experiment did
+    exactly that; see wk_REL/sigma_perf_results.md — refuted at nb=128,
+    patch preserved).  Local shapes:
 
         psi_xr_local  (nk, m, s, μ_X_loc)
         sigma_k_local (nk, s, μ_X_loc, s', μ_Y_loc)
         psi_yn_local  (nk, s', μ_Y_loc, n)
         → (re, im) each (nk, m/p_x, n/p_y)
 
-    Re/im CHANNELS stay separate end-to-end (OWNER_HOLD 2026-07-28: the
-    channel decomposition is mathematically substantive — each channel's
-    einsum/cast sequence below must stay per-channel).  Two approved
-    movement-only levers are applied on top:
+    CHANNEL STRUCTURE (owner ruling 2026-07-28; derivation:
+    wk_REL/DERIVATION_channel_hermiticity.md, manual §7.5).  σ^τ is split
+    elementwise into σ_R = Re σ^τ, σ_I = Im σ^τ *before* projection, and
+    each real channel rides its own GEMM chain:
+
+        S_R = ψ† σ_R ψ,     S_I = ψ† σ_I ψ      (each complex (nk, m, n)).
+
+    This two-channel body is REQUIRED for crossing (HGL core) windows,
+    whose host consumer (``_project_tau_onto_omega_np``, project_code=1)
+    weights S_R and S_I with two INDEPENDENT real ω-vectors
+    (Re(c)·S_I + Im(c)·S_R): both channels are genuinely consumed, and no
+    per-slice symmetry exists to reconstruct them — the crossing phases
+    enter σ^τ symmetrically (not antisymmetrically) under (μ,ν)→(ν,μ), so
+    σ^τ is neither Hermitian nor complex-symmetric per slice; the only
+    surviving relation, σ^τ† = σ^{−τ}, pairs different quadrature
+    abscissae on a one-sided grid and buys nothing.  Nor can (S_R, S_I) be
+    recovered from the single complex X = ψ†σψ at fixed k: X carries 2n²
+    real dof against the 4n² needed, and the Toeplitz (Hermitian/
+    anti-Hermitian) split of X fails structurally — for Laplace windows
+    both S_R and i·S_I are Hermitian, so it returns (X, 0), not
+    (S_R, i·S_I).  Laplace windows (project="full") do NOT need the split:
+    their consumer forms only c·(S_R + i·S_I) = c·X, and under
+    ``LORRAX_SIGMA_LAPLACE_MERGE=1`` they dispatch the merged single-chain
+    body ``_project_x_local`` instead.
+
+    Two approved movement-only levers are applied on top:
 
     * AK.9 stacking (scorecard, 2026-07-28): both channels' psum_scatter
       payloads ride ONE collective per mesh axis, stacked on a fresh
@@ -150,7 +197,60 @@ def _project_ri_local(psi_xr_local, sigma_k_local, psi_yn_local):
             out[1].astype(jnp.complex128))
 
 
-def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
+def _project_x_local(psi_xr_local, sigma_k_local, psi_yn_local):
+    """Rank-local body of the MERGED single-chain projection X = ψ† σ ψ.
+
+    Laplace-family (``project="full"``) windows only, behind
+    ``LORRAX_SIGMA_LAPLACE_MERGE=1``.  The merge is licensed by BILINEARITY
+    alone: the projection is linear in σ, so
+
+        X ≡ ψ† σ ψ = ψ† (σ_R + i·σ_I) ψ = S_R + i·S_I,
+
+    and the Laplace host consumer (``_project_tau_onto_omega_np``,
+    project_code=0) forms exactly c·(S_R + i·S_I) = c·X and nothing else —
+    the channel split is informationally redundant there.  ONE complex GEMM
+    chain therefore replaces the two real-channel chains of
+    ``_project_ri_local``: half the projection GEMM work, HALF the
+    reduce-scatter payload per mesh axis (one c128 tile vs the stacked
+    re/im pair — both channels of the stacked pair are complex, since
+    real-σ × complex-ψ GEMMs emit complex tiles), and half the per-τ D2H
+    bytes.  No symmetry assumption enters: the identity survives HL-probe
+    fits, deck gauge, and any hermiticity defect ε_H of B_q.  Crossing
+    windows must NOT dispatch this body — their consumer needs (S_R, S_I)
+    separately and X under-determines them (see ``_project_ri_local``).
+    Derivation: wk_REL/DERIVATION_channel_hermiticity.md §3 (verdicts 1-6),
+    manual §7.5.
+
+    Local shapes:
+
+        psi_xr_local  (nk, m, s, μ_X_loc)
+        sigma_k_local (nk, s, μ_X_loc, s', μ_Y_loc)
+        psi_yn_local  (nk, s', μ_Y_loc, n)
+        → X (nk, m/p_x, n/p_y) complex128
+
+    Contraction order matches the two-channel body (μ_Y first, the
+    owner-approved axis-order swap): the LARGE partial reduce-scatters over
+    the node-local consecutive-rank 'y' groups, the small final block over
+    the stride-p_x 'x' groups.  Value-level identical to recombining the
+    two-channel outputs (complex-GEMM association differs — not bit-exact);
+    gated by the P=4 production-kernel S_R + i·S_I = X check at 1e-12 and
+    the nb=128/nb=256 A/B parity suite.
+    """
+    # 'ksxty' × 'ktyn' -> 'ksxn'  (contracts s', local μ_Y) — one complex GEMM
+    right = jnp.einsum('ksxty,ktyn->ksxn',
+                       sigma_k_local, psi_yn_local, optimize=True)
+    # ONE psum_scatter(y): (nk, s, μ_X_loc, n) → (nk, s, μ_X_loc, n/p_y)
+    right_rs = jax.lax.psum_scatter(right, 'y', scatter_dimension=3, tiled=True)
+    # 'kmsx' × 'ksxn' -> 'kmn'  (contracts s, local μ_X) — one complex GEMM
+    result = jnp.einsum('kmsx,ksxn->kmn',
+                        jnp.conj(psi_xr_local), right_rs, optimize=True)
+    # ONE psum_scatter(x): (nk, m, n/p_y) → (nk, m/p_x, n/p_y)
+    return jax.lax.psum_scatter(result, 'x', scatter_dimension=1, tiled=True)
+
+
+def _make_project_ri_reduce_scatter(
+    mesh_xy: Mesh, *, merged_x: bool = False,
+) -> Callable[..., jax.Array]:
     """Build a shard_map'd ψ* σ ψ that reduce-scatters the output.
 
     Drop-in replacement for ``wavefunction_bundle.project_ri`` at the tail of
@@ -194,8 +294,16 @@ def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
         value-level (not bit-level) identical; gated by the 1e-12 output
         parity suite.  Scale-neutral: locality preference and message
         count are flat in n_atoms / N_μ / nk / nb / P and backend.
-    The channel MATH stays per-channel — see the OWNER_HOLD note in
-    ``_project_ri_local``.
+    Channel plans (owner ruling 2026-07-28): ``merged_x=False`` (default)
+    builds the two-channel (S_R, S_I) projector above — REQUIRED for
+    crossing windows, whose consumer weights the channels independently and
+    cannot recover them from X (see ``_project_ri_local``).
+    ``merged_x=True`` builds the single-complex-chain variant
+    X = ψ†σψ = S_R + i·S_I (``_project_x_local``) for Laplace
+    (project="full") windows, whose consumer forms only c·X — legality is
+    bilinearity, not symmetry.  Its output is ONE (nk, m_X, n_Y) complex
+    array at P(None, 'x', 'y'), and each mesh axis carries ONE psum_scatter
+    at HALF the stacked-pair payload.
 
     Same NCCL byte volume as the original pair of psums (on-ring LL128), but
     the output is sharded (m_X, n_Y) so every downstream coeff·σ multiply
@@ -228,12 +336,18 @@ def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
         P(None, None, 'x', None, 'y'),     # sigma_k : (nk, s, μ_X, s', μ_Y)
         P(None, None, 'y', None),          # psi_yn  : (nk, s', μ_Y, n)
     )
-    # 2-tuple output: re part, im part.  Each (nk, m_X, n_Y) sharded.
-    out_specs = (P(None, 'x', 'y'), P(None, 'x', 'y'))
-
-    _sm = shard_map(_project_ri_local, mesh=mesh_xy,
-                    in_specs=in_specs, out_specs=out_specs,
-                    check_rep=False)
+    if merged_x:
+        # Merged Laplace plan: ONE complex X, (nk, m_X, n_Y) sharded.
+        out_specs = P(None, 'x', 'y')
+        _sm = shard_map(_project_x_local, mesh=mesh_xy,
+                        in_specs=in_specs, out_specs=out_specs,
+                        check_rep=False)
+    else:
+        # 2-tuple output: re part, im part.  Each (nk, m_X, n_Y) sharded.
+        out_specs = (P(None, 'x', 'y'), P(None, 'x', 'y'))
+        _sm = shard_map(_project_ri_local, mesh=mesh_xy,
+                        in_specs=in_specs, out_specs=out_specs,
+                        check_rep=False)
 
     # Guard the divisibility this kernel requires (see docstring): the two
     # psum_scatters split m over p_x and n over p_y, so an indivisible sigma
@@ -268,12 +382,17 @@ def _get_sigma_kij_kernel(
     *,
     mesh_xy: Mesh,
     kgrid: tuple[int, int, int],
+    merged_x: bool = False,
 ) -> Callable[..., jax.Array]:
     """Return a jit-compatible sigma-kij kernel with device-local FFTs.
 
     The tail project (ψ* σ ψ → Σ_mn) uses the reduce-scatter variant
     (_make_project_ri_reduce_scatter) so the emitted σ^τ is sharded
-    (m_X, n_Y) without any downstream reshuffle.
+    (m_X, n_Y) without any downstream reshuffle.  ``merged_x`` selects the
+    projection plan (owner ruling 2026-07-28): False = two-channel
+    (S_R, S_I) output for crossing windows and the default (merge-off)
+    path; True = the merged Laplace plan emitting the single complex
+    X = ψ†σψ (see ``_project_x_local``).
     """
 
     kgrid = tuple(int(x) for x in kgrid)
@@ -286,8 +405,12 @@ def _get_sigma_kij_kernel(
     # shadow each other across a flag flip inside one process (tests).
     # Likewise the two FFT-FFI flags (read at factory time by fft_helpers /
     # _fft_ffi_fused_enabled): a flip mid-process must rebuild the kernel.
+    # ``merged_x`` keys the projection plan: on a merged-plan run BOTH
+    # kernels live in the cache simultaneously (Laplace windows dispatch the
+    # merged one, crossing windows the two-channel one).
     pipeline_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
-                    fft_ffi_enabled(), _fft_ffi_fused_enabled())
+                    fft_ffi_enabled(), _fft_ffi_fused_enabled(),
+                    bool(merged_x))
     if pipeline_key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[pipeline_key]
 
@@ -312,7 +435,7 @@ def _get_sigma_kij_kernel(
 
     from .greens_function_kernel import build_G_tau
 
-    _project_ri_rs = _make_project_ri_reduce_scatter(mesh_xy)
+    _project_ri_rs = _make_project_ri_reduce_scatter(mesh_xy, merged_x=merged_x)
 
     @partial(jax.jit, donate_argnums=(8,))
     def _sigma_kij_kernel(
@@ -320,6 +443,9 @@ def _get_sigma_kij_kernel(
         E_A, mask_A, E_ref_A, t_node, W_q,
     ):
         """Σ_kij = project_rs[ FFT[ G(R) · W(R) / √Nk ] ].  All flat-k.
+
+        Output: the (S_R, S_I) tuple (two-channel plan) or the single
+        complex X = ψ†σψ (merged Laplace plan, ``merged_x=True``).
 
         W_q is (nq, μ, μ) flat-q — same layout as all other flat-k arrays.
         ``W_q`` is **donated**: it's built fresh each τ by ``_build_W_t_q``
@@ -362,11 +488,13 @@ def _get_sigma_kij_kernel(
     # the per-τ wall (evidence: AQ 4962c/P=64 HLO module_0912, 2026-07-28
     # — the 1.51 s/τ was indivisible).  Notes:
     #   * ``sigma.tau.project_rs`` covers the ψ-projection dots AND their
-    #     two psum_scatters together — they live inside one shard_map and
-    #     the re/im channel decomposition there is OWNER-HELD; a per-op
-    #     split of dot vs collective wait comes from a profiler trace
-    #     (jax_profile.trace_section wraps the first window per branch in
-    #     ppm_sigma), not from restructuring the kernel.
+    #     psum_scatters together — they live inside one shard_map (the
+    #     two-channel body, or the merged single-chain body when
+    #     ``merged_x``; the crossing family keeps two channels per the
+    #     owner ruling 2026-07-28); a per-op split of dot vs collective
+    #     wait comes from a profiler trace (jax_profile.trace_section
+    #     wraps the first window per branch in ppm_sigma), not from
+    #     restructuring the kernel.
     #   * DONATION AUDIT (2026-07-28, owner directive with the FFT-FFI
     #     prototype): each stage jit now donates every operand that is DEAD
     #     after its call — G_k → G_ifft, W_q → V_ifft, (G_R, V_R) →
@@ -437,19 +565,30 @@ def _get_sigma_tau_kernel(
     *,
     mesh_xy: Mesh,
     kgrid: tuple[int, int, int],
+    merged_x: bool = False,
 ) -> Callable[..., jax.Array]:
-    """Return a cached tau-node sigma builder with jittable local FFTs."""
+    """Return a cached tau-node sigma builder with jittable local FFTs.
+
+    ``merged_x=False`` (default): the two-channel kernel returning
+    (S_R, S_I) — the only kernel crossing windows may use, and the whole
+    story when LORRAX_SIGMA_LAPLACE_MERGE is off.  ``merged_x=True``: the
+    merged Laplace-plan kernel returning the single complex X = ψ†σψ
+    (see ``_project_x_local``); dispatched by ``ppm_sigma`` for
+    project="full" windows only.
+    """
 
     kgrid = tuple(int(x) for x in kgrid)
     from common.fft_helpers import fft_ffi_enabled
     cache_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
-                 fft_ffi_enabled(), _fft_ffi_fused_enabled())
+                 fft_ffi_enabled(), _fft_ffi_fused_enabled(),
+                 bool(merged_x))
     if cache_key in _sigma_tau_kernel_cache:
         return _sigma_tau_kernel_cache[cache_key]
 
     ensure_jax_compile_cache()
     q_mu_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    sigma_kij_kernel = _get_sigma_kij_kernel(mesh_xy=mesh_xy, kgrid=kgrid)
+    sigma_kij_kernel = _get_sigma_kij_kernel(mesh_xy=mesh_xy, kgrid=kgrid,
+                                             merged_x=merged_x)
 
     @jax.jit
     def _build_W_t_q(B_q, Omega_q, mask_B, E_ref_B, t_node):
@@ -519,11 +658,20 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
     The kernel is shape-invariant across the four ω-sign × cond/val
     branches (ψ / E_A / mask_A / B_q / Ω_q / mask_B / scalars all have
     fixed shape+dtype+sharding; only values change per window) — so
-    one AOT compile covers every branch.
+    one AOT compile covers every branch.  On a merged-plan run
+    (LORRAX_SIGMA_LAPLACE_MERGE=1) there are two kernels — the merged
+    Laplace X kernel and the two-channel crossing kernel — and both are
+    compiled here.
     """
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    tau_kernel = _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid)
+    tau_kernels = [_get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid)]
+    if _laplace_merge_enabled():
+        # Merged-plan run: BOTH kernels dispatch at runtime (Laplace windows
+        # the merged X kernel, crossing windows the two-channel one) — AOT
+        # both so neither pays a first-dispatch compile inside sigma.exec.
+        tau_kernels.append(_get_sigma_tau_kernel(
+            mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True))
 
     s = wfns.slices
     psi_coh_xn  = wfns.xn(s.full)
@@ -560,25 +708,26 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
     E_ref_B = jnp.asarray(0.0, dtype=jnp.float64)
     t_node  = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128)
 
-    if hasattr(tau_kernel, "lower"):
-        tau_kernel.lower(
-            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B,
-            E_ref_A, E_ref_B, t_node,
-        ).compile()
-    else:
-        # Stage-split diagnostic dispatcher (LORRAX_SIGMA_TAU_TIMING=1): a
-        # plain Python callable over five stage jits, so there is no single
-        # ``.lower()``.  Prewarm by EXECUTING it once at the real
-        # shapes/shardings — signature match with the runtime path is then
-        # guaranteed by construction (the precompile-signature drift this
-        # AOT helper exists to prevent), at the cost of ~one τ-node of
-        # execution inside sigma.compile.  All ranks reach this call
-        # synchronously (module contract), so the psum_scatters inside are
-        # collective-safe.  Output is discarded.
-        out = tau_kernel(
-            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B,
-            E_ref_A, E_ref_B, t_node,
-        )
-        jax.block_until_ready(out)
+    for tau_kernel in tau_kernels:
+        if hasattr(tau_kernel, "lower"):
+            tau_kernel.lower(
+                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B,
+                E_ref_A, E_ref_B, t_node,
+            ).compile()
+        else:
+            # Stage-split diagnostic dispatcher (LORRAX_SIGMA_TAU_TIMING=1): a
+            # plain Python callable over five stage jits, so there is no single
+            # ``.lower()``.  Prewarm by EXECUTING it once at the real
+            # shapes/shardings — signature match with the runtime path is then
+            # guaranteed by construction (the precompile-signature drift this
+            # AOT helper exists to prevent), at the cost of ~one τ-node of
+            # execution inside sigma.compile.  All ranks reach this call
+            # synchronously (module contract), so the psum_scatters inside are
+            # collective-safe.  Output is discarded.
+            out = tau_kernel(
+                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B,
+                E_ref_A, E_ref_B, t_node,
+            )
+            jax.block_until_ready(out)

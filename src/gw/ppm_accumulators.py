@@ -79,7 +79,7 @@ def _select_accum_mode(
 
 
 def _project_tau_onto_omega_np(
-    sigma_re: np.ndarray, sigma_im: np.ndarray, omega_vec: np.ndarray,
+    sigma_re: np.ndarray, sigma_im: np.ndarray | None, omega_vec: np.ndarray,
     t_node: complex, alpha_eff: complex, omega_sign: float, pref: float,
     project_code: int,
 ) -> np.ndarray:
@@ -91,14 +91,30 @@ def _project_tau_onto_omega_np(
 
         contrib[ω, k, i, j] = pref · α_eff · exp(i·sign·ω·t) · P(σ_re, σ_im)
 
-    where σ^τ is carried as a real/imag pair because the crossing window's HGL
-    quadrature needs only Im[coeff·σ^τ] — carrying complex σ^τ through the FFT
-    pipeline would double memory for no benefit.  The window's ``project_code``:
+    The window's ``project_code`` names the consumer:
 
         code=0 ("full")  Laplace window (single/stripe/slab) — keep the full
-                         complex product (coeff_re + i·coeff_im)·(σ_re + i·σ_im).
+                         complex product coeff·(σ_re + i·σ_im), i.e.
+                         coeff·(S_R + i·S_I) = coeff·X with X = ψ†σψ.  Only
+                         the recombined complex object is ever consumed here,
+                         which is what licenses the merged single-chain plan.
         code=1 ("imag")  Crossing window — keep only Im[coeff·σ]
-                         = coeff_re·σ_im + coeff_im·σ_re (real, up-cast to c128).
+                         = coeff_re·σ_im + coeff_im·σ_re (real, up-cast to
+                         c128): S_R and S_I are weighted by two INDEPENDENT
+                         real ω-vectors, so both channels must arrive
+                         separately (they cannot be recovered from X — see
+                         ppm_tau_kernel._project_ri_local).
+
+    Channel carriers: on the two-channel plan σ^τ arrives as the real/imag
+    pair ``(sigma_re, sigma_im)`` — the crossing consumer needs the split,
+    and carrying complex σ^τ through the FFT pipeline would double memory
+    for no benefit.  On the merged Laplace plan
+    (LORRAX_SIGMA_LAPLACE_MERGE=1) the kernel ships X = S_R + i·S_I as ONE
+    complex tile: ``sigma_im is None`` and ``sigma_re`` carries X.  That
+    form is only defined for code=0 (bilinearity: ψ†σψ = ψ†σ_Rψ + i·ψ†σ_Iψ,
+    so coeff·X equals the recombined two-channel product to GEMM-association
+    roundoff; gated at 1e-12).  A merged tile reaching code=1 is a dispatch
+    bug and raises.
     """
     omega_kernel = np.exp(1j * omega_sign * omega_vec * t_node)
     # ``pref`` is folded into the (n_ω,)-sized coeff instead of multiplying
@@ -111,6 +127,16 @@ def _project_tau_onto_omega_np(
     # (``np.asarray`` with a matching dtype is a no-copy view) — that one
     # is bit-exact.
     coeff = (pref * alpha_eff) * omega_kernel
+    if sigma_im is None:
+        # Merged Laplace plan: sigma_re IS the complex X = S_R + i·S_I.
+        if project_code != 0:
+            raise ValueError(
+                "merged single-chain σ (X = ψ†σψ) reached a crossing "
+                "consumer (project_code=1) — the crossing window needs the "
+                "(S_R, S_I) pair and must dispatch the two-channel kernel "
+                "(ppm_sigma window dispatch bug).")
+        contrib = coeff.reshape(-1, 1, 1, 1) * sigma_re[None, ...]
+        return np.asarray(contrib, dtype=np.complex128)
     coeff_re = np.real(coeff).reshape(-1, 1, 1, 1)
     coeff_im = np.imag(coeff).reshape(-1, 1, 1, 1)
     if project_code == 0:           # full Laplace window
@@ -154,6 +180,11 @@ class _SigmaAccumulator:
     physics fixes (including the −1 that the −ω half contributes), so there is
     no separate scale argument.  ``t_c`` / ``α_eff_c`` are Python/host complex
     scalars computed once in :func:`minimax_tau_integrate_sigma`.
+
+    On the merged Laplace plan (LORRAX_SIGMA_LAPLACE_MERGE=1, project="full"
+    windows) ``add_tau`` receives ``(X, None, t_c, α_eff_c)`` — the single
+    complex X = ψ†σψ = S_R + i·S_I in the ``sigma_re`` slot; crossing windows
+    always deliver the (σ_re, σ_im) pair.
     """
     def begin_window(self, window: '_SigmaWindow') -> None: ...
     def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_eff_c: complex) -> None: ...
@@ -207,16 +238,25 @@ class _TauAccumulator(_SigmaAccumulator):
         # Grab EVERY local shard handle and start the D2H copies now — do NOT
         # materialize to numpy yet.  ``copy_to_host_async`` returns the same
         # shard object with the transfer kicked off in the background.
+        # ``sigma_im is None`` = merged Laplace plan: ``sigma_re`` carries the
+        # single complex X = S_R + i·S_I, and the per-τ D2H volume HALVES
+        # (one c128 tile per shard instead of the re/im pair).
         shards_re = sigma_re.addressable_shards
-        shards_im = sigma_im.addressable_shards
+        shards_im = (sigma_im.addressable_shards
+                     if sigma_im is not None else None)
         if self._shard_index is None:
             self._shard_index = [s.index for s in shards_re]
             self._shard_devices = [s.device for s in shards_re]
         handles = []
-        for sr, si in zip(shards_re, shards_im):
-            sr.data.copy_to_host_async()
-            si.data.copy_to_host_async()
-            handles.append((sr.data, si.data))
+        if shards_im is None:
+            for sr in shards_re:
+                sr.data.copy_to_host_async()
+                handles.append((sr.data, None))
+        else:
+            for sr, si in zip(shards_re, shards_im):
+                sr.data.copy_to_host_async()
+                si.data.copy_to_host_async()
+                handles.append((sr.data, si.data))
         self._pending.append((handles, t_c, alpha_eff_c))
         if len(self._pending) > self._lag:
             self._drain_one()
@@ -242,7 +282,7 @@ class _TauAccumulator(_SigmaAccumulator):
             # cite the omega_project row, not the parent (2026-07-28).
             with timing.section("sigma.tau.d2h_wait"):
                 sr = np.asarray(hr)
-                si = np.asarray(hi)
+                si = None if hi is None else np.asarray(hi)
             with timing.section("sigma.tau.omega_project"):
                 proj = _project_tau_onto_omega_np(
                     sr, si, self._omega_vec_np,
