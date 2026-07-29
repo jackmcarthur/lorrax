@@ -89,7 +89,8 @@ dgemm vs 1263 GF/s MKL, memo Sec. 4.4/4.5; the bare Eigen dot saturates
 1.6–1.9× below vendor BLAS at full threads — jobs 7879008/7879010).
 The dial routes ONLY that right contraction through the vendor-BLAS GEMM
 host FFI handler (``lorrax_mklblas_gemm_batch``, src/ffi/mklblas/cpp —
-dgemm/zgemm dispatch on buffer dtype, batched ``cblas_?gemm_batch`` entry
+{d,s,z,c}gemm dispatch on buffer dtype (all four BLAS
+precisions), batched ``cblas_?gemm_batch`` entry
 when the BLAS has it, plain cblas GEMM loop otherwise; works in principle
 with Intel MKL or Cray LibSci, tested with Intel only so far;
 vendor-internal threading under the workstream-AW MklThreadScope
@@ -101,8 +102,10 @@ detection, not policy): unset / ``auto`` turns the FFI body ON when the
 platform is CPU AND the handler resolves in the host .so — announced once
 on rank 0 — and quietly keeps the native lowering everywhere the dial
 cannot apply (non-CPU platform: cuBLAS native is optimal, silent BY
-DESIGN; ``extra="minor"``; non-f64/c128 dtypes such as the BSE fp32-GMRES
-path).  ``LORRAX_BANDS_GEMM_FFI=0`` disables.  An EXPLICIT ``=1`` keeps
+DESIGN; ``extra="minor"``, which is structural — the contracted axis is
+not GEMM-reachable there).  Since 2026-07-29 the handler serves ALL FOUR
+BLAS precisions (f64/f32/c128/c64), so the BSE fp32-GMRES complex64 path
+rides it too and is no longer a capability boundary.  ``LORRAX_BANDS_GEMM_FFI=0`` disables.  An EXPLICIT ``=1`` keeps
 the announce-or-REFUSE semantics: it REFUSES on a non-CPU mesh, refuses
 when the host .so lacks the handler (quoting the probe reason), refuses
 ``extra="minor"`` and refuses unsupported dtypes — explicit requests are
@@ -339,7 +342,8 @@ def _require_bands_gemm_ffi(mesh: Mesh) -> None:
 def _gemm_batch_ffi(a3, b3):
     """C[i] = A[i] @ B[i % BB] for A (BA, M, K), B (BB, K, N), BA % BB == 0.
 
-    Row-major NN batched GEMM through the host handler; dtype (f64/c128)
+    Row-major NN batched GEMM through the host handler; dtype
+    (f64/f32/c128/c64)
     is dispatched inside the .so from the buffer element type.  The
     broadcast rule (B cycling with period BB) is what lets one handler
     serve both the plain per-k batch (BA == BB == nk) and the
@@ -491,20 +495,28 @@ def contract_bands_block_reshard(
     # row-major flattening of adjacent axes) — free at the XLA level.
 
     def _ffi_dtypes_ok(o_l, psi_l):
-        """The GEMM handler is f64/c128-only BY CONSTRUCTION (it dispatches
-        on the buffer dtype).  Explicit mode: REFUSE with the fix named
-        (the fft_helpers TypeError pattern — never a silent downgrade);
-        AUTO: quietly keep the XLA lowering for this call — a documented
-        capability boundary, e.g. the BSE fp32-GMRES path's complex64
-        operands."""
+        """The GEMM handler serves ALL FOUR BLAS precisions since the
+        2026-07-29 owner order — f64/f32/c128/c64, dispatched on the
+        buffer dtype onto cblas_{d,s,z,c}gemm[_batch].  The BSE fp32-GMRES
+        (complex64) path therefore RIDES the handler now; it used to be a
+        capability boundary (auto fell back, explicit ``=1`` refused).
+
+        What remains excluded is only a genuinely unserveable dtype (f16,
+        bf16, c256, or a mismatched pair that the de-promotion policy
+        should have split upstream).  Explicit mode still REFUSES those
+        with the fix named; AUTO still quietly keeps the XLA lowering."""
         ok = (o_l.dtype == psi_l.dtype
-              and o_l.dtype in (jnp.float64, jnp.complex128))
+              and o_l.dtype in (jnp.float64, jnp.float32,
+                                jnp.complex128, jnp.complex64))
         if ok or ffi_mode != "on":
             return ok
         raise TypeError(
             f"LORRAX_BANDS_GEMM_FFI: the vendor-BLAS GEMM host handler "
-            f"supports f64/c128 only, got O {o_l.dtype} × ψ {psi_l.dtype} "
-            f"(e.g. an fp32 BSE GMRES solve).  Unset LORRAX_BANDS_GEMM_FFI "
+            f"serves f64/f32/c128/c64, got O {o_l.dtype} × ψ "
+            f"{psi_l.dtype}.  A MISMATCHED pair means the de-promotion "
+            f"policy did not split a mixed real/complex contraction "
+            f"upstream (a bug — report it); a half/extended precision "
+            f"operand is genuinely unserved.  Unset LORRAX_BANDS_GEMM_FFI "
             f"for this path — the XLA lowering accepts it, and explicit "
             f"requests are never silently downgraded.")
 

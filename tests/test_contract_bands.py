@@ -273,7 +273,8 @@ def test_refusals():
 # ---------------------------------------------------------------------------
 # AUTO default (owner order 2026-07-29): ON iff CPU platform + handler in
 # the host .so; explicit 0 disables; auto quietly keeps the XLA plan where
-# the dial cannot apply (extra="minor", non-f64/c128 dtypes).
+# the dial cannot apply (extra="minor"; the dtype boundary is GONE since
+# the handler serves all four BLAS precisions — c64 now rides it).
 # ---------------------------------------------------------------------------
 
 def test_auto_default():
@@ -313,15 +314,17 @@ def test_auto_default():
             txt = _compile_text(proj_m, dev)
             assert len(_CC_RE.findall(txt)) == 0, (
                 "[auto minor] must fall back to the XLA plan, not refuse")
-            # ... and non-f64/c128 dtypes (fp32 BSE class) fall back too.
+            # ... while complex64 now RIDES the handler (owner order
+            # 2026-07-29 added f32/c64 to the TU — it used to fall back).
             proj_c = contract_bands_block_reshard(mesh, channels="none")
             (psi_l, o, psi_r), dev = _operands(mesh)
             dev64 = tuple(jnp.asarray(d, dtype=jnp.complex64) for d in dev)
             txt = jax.jit(proj_c).lower(*dev64).compile().as_text()
-            assert len(_CC_RE.findall(txt)) == 0, (
-                "[auto c64] complex64 operands must keep the XLA lowering")
-            print("  [auto] AUTO-ON engages; minor + c64 fall back to XLA",
-                  flush=True)
+            assert len(_CC_RE.findall(txt)) == 1, (
+                "[auto c64] complex64 must now use the cgemm custom-call "
+                "(the dtype boundary was removed)")
+            print("  [auto] AUTO-ON engages; minor falls back, c64 rides "
+                  "the handler", flush=True)
         else:
             proj = contract_bands_block_reshard(mesh, extra="leading")
             (psi_l, o, psi_r), dev = _operands(mesh, extra="leading")
@@ -348,6 +351,88 @@ def _ffi_available():
         return ok, reason
     except Exception as exc:                       # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Single precision (owner order 2026-07-29): the handler serves all four
+# BLAS precisions, so c64 (the BSE fp32-GMRES class) and f32 must both use
+# the custom-call AND agree with the reference.
+#
+# TOLERANCE JUSTIFICATION.  Unit roundoff for binary32 is u = 2^-24 =
+# 5.96e-8.  The worst-case relative error of a length-K dot product is
+# ~K*u; here the contracted length is K = NS*MU = 32, so K*u = 1.9e-6.  We
+# compare TWO f32 evaluations with different summation orders (the vendor
+# GEMM vs the XLA/Eigen dot), each carrying that bound, so the difference
+# can reach ~2*K*u = 3.8e-6.  TOL32 = 1e-5 is therefore the smallest round
+# number strictly ABOVE the worst case.  A 1e-6 tolerance would sit BELOW
+# the theoretical bound and be flaky by construction — the measured error
+# is printed so the real margin is visible rather than assumed.
+# ---------------------------------------------------------------------------
+
+TOL32 = 1e-5
+
+
+def test_single_precision_ffi():
+    ok, reason = _ffi_available()
+    if not ok:
+        print(f"  [f32] SKIP (handler unavailable: {reason})", flush=True)
+        return
+    mesh = _mesh()
+    (psi_l, o, psi_r), dev = _operands(mesh)
+    exact = _ref(psi_l, o, psi_r)          # float64/complex128 reference
+
+    def _run(dtype, gemm):
+        os.environ["LORRAX_BANDS_GEMM_FFI"] = gemm
+        try:
+            proj = contract_bands_block_reshard(mesh, channels="none")
+            dsm = tuple(jnp.asarray(d, dtype=dtype) for d in dev)
+            out = jax.jit(proj)(*dsm)
+            txt = jax.jit(proj).lower(*dsm).compile().as_text()
+            return np.asarray(out), len(_CC_RE.findall(txt))
+        finally:
+            os.environ["LORRAX_BANDS_GEMM_FFI"] = "0"
+
+    # --- complex64: the BSE fp32-GMRES class -------------------------
+    on_c, ncc_on = _run(jnp.complex64, "1")
+    off_c, ncc_off = _run(jnp.complex64, "0")
+    assert ncc_on == 1, f"[f32 c64] expected 1 cgemm custom-call, got {ncc_on}"
+    assert ncc_off == 0, f"[f32 c64] dial=0 must not emit one, got {ncc_off}"
+    d_hh = _relerr(on_c, off_c)            # handler vs XLA, both f32
+    d_he = _relerr(on_c, exact)            # handler vs exact
+    assert d_hh <= TOL32, f"[f32 c64] handler-vs-XLA {d_hh:.3e} > {TOL32}"
+    assert d_he <= TOL32, f"[f32 c64] handler-vs-exact {d_he:.3e} > {TOL32}"
+
+    # --- float32: all-real operands take the sgemm path --------------
+    # NB: _operands(real_o=True) realifies only O — ψ stays complex.  The
+    # f32 GEMM path needs ALL THREE real, and the reference must be taken
+    # from the SAME real operands.  (First version compared a real-operand
+    # run against a complex-ψ reference and "failed" at 6.8e-1: a test
+    # bug, not a handler bug.  Kept as a comment so it is not reintroduced.)
+    (cpsi_l, co, cpsi_r), rdev = _operands(mesh, real_o=True)
+    rl = np.real(cpsi_l).copy()
+    ro = np.real(co).copy()
+    rr = np.real(cpsi_r).copy()
+    r_exact = np.real(_ref(rl, ro, rr))
+    rdev32 = tuple(jax.device_put(jnp.asarray(v, dtype=jnp.float32),
+                                  d.sharding)
+                   for v, d in zip((rl, ro, rr), rdev))
+    os.environ["LORRAX_BANDS_GEMM_FFI"] = "1"
+    try:
+        proj = contract_bands_block_reshard(mesh, channels="none")
+        out32 = np.asarray(jax.jit(proj)(*rdev32))
+        txt = jax.jit(proj).lower(*rdev32).compile().as_text()
+        ncc32 = len(_CC_RE.findall(txt))
+    finally:
+        os.environ["LORRAX_BANDS_GEMM_FFI"] = "0"
+    assert ncc32 == 1, f"[f32 f32] expected 1 sgemm custom-call, got {ncc32}"
+    d32 = _relerr(out32, r_exact)
+    assert d32 <= TOL32, f"[f32 f32] handler-vs-exact {d32:.3e} > {TOL32}"
+
+    print(f"  [f32] c64 handler-vs-XLA {d_hh:.2e}, handler-vs-exact "
+          f"{d_he:.2e}; f32 handler-vs-exact {d32:.2e}  (tol {TOL32:g} = "
+          f"2*K*u with K={NS*MU}, u=2^-24)", flush=True)
+    print("  [f32] all four precisions served — c64/f32 custom-calls fire",
+          flush=True)
 
 
 def test_ffi_gemm_plan():

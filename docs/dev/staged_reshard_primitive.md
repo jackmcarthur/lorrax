@@ -77,7 +77,7 @@ in the message — the broken-promise pattern, QUALITY_PATTERNS §6):
    which axis disagrees).
 5. Under an EXPLICIT `LORRAX_BANDS_GEMM_FFI=1`: non-CPU mesh;
    missing/unloadable handler (quotes the `probe_target` reason);
-   `extra="minor"`; non-f64/c128 operand dtypes (§3.4).  The AUTO default
+   `extra="minor"`; an operand dtype outside f64/f32/c128/c64 (§3.4).  The AUTO default
    (unset/`auto`, 2026-07-29) never refuses — it quietly keeps the native
    lowering wherever the dial cannot apply.
 
@@ -207,8 +207,10 @@ policy, doctrine #8):** unset/`auto` turns the FFI body ON when the
 platform is CPU AND the handler resolves in the host .so, announced once
 on rank 0; on CUDA the auto is OFF **silently by design** (XLA:GPU's dot
 lowering already dispatches cuBLAS — optimal); auto also quietly keeps
-the XLA plan for `extra="minor"` and for non-f64/c128 dtypes (the BSE
-fp32-GMRES class).  `LORRAX_BANDS_GEMM_FFI=0` disables.
+the XLA plan for `extra="minor"` (structural).  **All four BLAS
+precisions are served since 2026-07-29** — f64/f32/c128/c64 onto
+`cblas_{d,s,z,c}gemm[_batch]` — so the BSE fp32-GMRES complex64 class
+rides the handler rather than falling back.  `LORRAX_BANDS_GEMM_FFI=0` disables.
 
 Rules for an EXPLICIT `=1` (env grants capability loudly; never a silent
 downgrade — QUALITY_PATTERNS §8):
@@ -219,8 +221,9 @@ downgrade — QUALITY_PATTERNS §8):
   (XLA:GPU's dot lowering already dispatches cuBLAS, which is optimal);
 * REFUSE `extra="minor"` (the contracted axis is not reachable by a
   strided batched GEMM without a full-tile transpose copy);
-* REFUSE non-f64/c128 dtypes (the handler dispatches on the buffer
-  dtype; the message names the fix);
+* REFUSE a dtype outside f64/f32/c128/c64 (half/extended precision, or
+  a mismatched pair the de-promotion policy should have split upstream —
+  the message distinguishes the two and names the fix);
 * read at FACTORY time → consumers key their kernel caches on it
   (`bands_gemm_ffi_enabled()` resolves auto, `bands_gemm_ffi_mode()`
   exposes the raw grammar).
