@@ -78,31 +78,6 @@ def _fft_ffi_fused_enabled() -> bool:
         "1", "true", "yes", "on")
 
 
-def _laplace_merge_enabled() -> bool:
-    """``LORRAX_SIGMA_LAPLACE_MERGE=1`` merges the Laplace-family projection
-    channels (owner ruling 2026-07-28, conditional approval — OWNER_DECISIONS
-    ruling on item 1): Laplace windows (``project="full"``) dispatch a τ
-    kernel whose projection tail is ONE complex chain X = ψ†σψ
-    (``_project_x_local``) and whose host ω-consumer reads X directly;
-    crossing windows (``project="imag"``) keep the two-channel kernel
-    unchanged.  Legality is bilinearity + consumer analysis, NOT a symmetry
-    assumption — see ``_project_x_local`` and manual §7.5.
-
-    Default OFF: the production path is byte-untouched.  Read at
-    kernel-selection time in ``ppm_sigma`` and in ``precompile_sigma``; the
-    merged and two-channel kernels carry separate cache keys (``merged_x``)
-    because BOTH coexist within one merged-plan run (crossing windows still
-    need the two-channel kernel).  The driver announces the active plan
-    once per Σ stage (env grants the capability loudly; outputs are
-    value-identical, gated at 1e-12 — complex-GEMM association differs, so
-    bit-exactness is not claimed).  Scale-neutral: no new N_μ²-sized object
-    on any rank; per-τ collective payload and D2H volume HALVE on Laplace
-    windows.
-    """
-    return os.environ.get("LORRAX_SIGMA_LAPLACE_MERGE", "0").strip().lower() in (
-        "1", "true", "yes", "on")
-
-
 def _project_ri_local(psi_xr_local, sigma_k_local, psi_yn_local):
     """Rank-local body of the TWO-CHANNEL ψ* σ ψ reduce-scatter projection.
 
@@ -139,9 +114,10 @@ def _project_ri_local(psi_xr_local, sigma_k_local, psi_yn_local):
     anti-Hermitian) split of X fails structurally — for Laplace windows
     both S_R and i·S_I are Hermitian, so it returns (X, 0), not
     (S_R, i·S_I).  Laplace windows (project="full") do NOT need the split:
-    their consumer forms only c·(S_R + i·S_I) = c·X, and under
-    ``LORRAX_SIGMA_LAPLACE_MERGE=1`` they dispatch the merged single-chain
-    body ``_project_x_local`` instead.
+    their consumer forms only c·(S_R + i·S_I) = c·X, and they ALWAYS
+    dispatch the merged single-chain body ``_project_x_local`` instead
+    (the default and only Laplace path — owner order 2026-07-28; the
+    original conditional approval was the same day's ruling).
 
     Three approved movement-only levers are applied on top:
 
@@ -243,9 +219,10 @@ def _project_ri_local(psi_xr_local, sigma_k_local, psi_yn_local):
 def _project_x_local(psi_xr_local, sigma_k_local, psi_yn_local):
     """Rank-local body of the MERGED single-chain projection X = ψ† σ ψ.
 
-    Laplace-family (``project="full"``) windows only, behind
-    ``LORRAX_SIGMA_LAPLACE_MERGE=1``.  The merge is licensed by BILINEARITY
-    alone: the projection is linear in σ, so
+    Laplace-family (``project="full"``) windows only — this is their
+    DEFAULT and only projection path (owner order 2026-07-28; the opt-in
+    env gate of the original conditional approval is gone).  The merge is
+    licensed by BILINEARITY alone: the projection is linear in σ, so
 
         X ≡ ψ† σ ψ = ψ† (σ_R + i·σ_I) ψ = S_R + i·S_I,
 
@@ -366,16 +343,18 @@ def _make_project_ri_reduce_scatter(
         records the refutation).  Collectives, payload dtypes/shapes,
         and the channel algebra are untouched; value-level identical,
         1e-12 parity-gated.
-    Channel plans (owner ruling 2026-07-28): ``merged_x=False`` (default)
-    builds the two-channel (S_R, S_I) projector above — REQUIRED for
-    crossing windows, whose consumer weights the channels independently and
-    cannot recover them from X (see ``_project_ri_local``).
-    ``merged_x=True`` builds the single-complex-chain variant
-    X = ψ†σψ = S_R + i·S_I (``_project_x_local``) for Laplace
-    (project="full") windows, whose consumer forms only c·X — legality is
-    bilinearity, not symmetry.  Its output is ONE (nk, m_X, n_Y) complex
-    array at P(None, 'x', 'y'), and each mesh axis carries ONE psum_scatter
-    at HALF the stacked-pair payload.
+    Channel plans (owner ruling 2026-07-28; merge made the DEFAULT by owner
+    order the same day): ``merged_x=False`` builds the two-channel
+    (S_R, S_I) projector above — the crossing-window path, REQUIRED there
+    because that consumer weights the channels independently and cannot
+    recover them from X (see ``_project_ri_local``).  ``merged_x=True``
+    builds the single-complex-chain variant X = ψ†σψ = S_R + i·S_I
+    (``_project_x_local``) — the path EVERY Laplace (project="full") window
+    dispatches, whose consumer forms only c·X — legality is bilinearity,
+    not symmetry.  Its output is ONE (nk, m_X, n_Y) complex array at
+    P(None, 'x', 'y'), and each mesh axis carries ONE psum_scatter at HALF
+    the stacked-pair payload.  Both plans coexist in every Σ run; there is
+    no env flag selecting between them.
 
     Same NCCL byte volume as the original pair of psums (on-ring LL128), but
     the output is sharded (m_X, n_Y) so every downstream coeff·σ multiply
@@ -461,10 +440,11 @@ def _get_sigma_kij_kernel(
     The tail project (ψ* σ ψ → Σ_mn) uses the reduce-scatter variant
     (_make_project_ri_reduce_scatter) so the emitted σ^τ is sharded
     (m_X, n_Y) without any downstream reshuffle.  ``merged_x`` selects the
-    projection plan (owner ruling 2026-07-28): False = two-channel
-    (S_R, S_I) output for crossing windows and the default (merge-off)
-    path; True = the merged Laplace plan emitting the single complex
-    X = ψ†σψ (see ``_project_x_local``).
+    projection plan (owner ruling 2026-07-28, default semantics since the
+    same-day owner order): False = two-channel (S_R, S_I) output — the
+    crossing-window path; True = the Laplace plan emitting the single
+    complex X = ψ†σψ (see ``_project_x_local``).  Both are built in every
+    Σ run.
     """
 
     kgrid = tuple(int(x) for x in kgrid)
@@ -477,9 +457,9 @@ def _get_sigma_kij_kernel(
     # shadow each other across a flag flip inside one process (tests).
     # Likewise the two FFT-FFI flags (read at factory time by fft_helpers /
     # _fft_ffi_fused_enabled): a flip mid-process must rebuild the kernel.
-    # ``merged_x`` keys the projection plan: on a merged-plan run BOTH
-    # kernels live in the cache simultaneously (Laplace windows dispatch the
-    # merged one, crossing windows the two-channel one).
+    # ``merged_x`` keys the projection plan: BOTH kernels live in the cache
+    # simultaneously in every Σ run (Laplace windows dispatch the merged
+    # one, crossing windows the two-channel one).
     pipeline_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
                     fft_ffi_enabled(), _fft_ffi_fused_enabled(),
                     bool(merged_x))
@@ -642,11 +622,11 @@ def _get_sigma_tau_kernel(
     """Return a cached tau-node sigma builder with jittable local FFTs.
 
     ``merged_x=False`` (default): the two-channel kernel returning
-    (S_R, S_I) — the only kernel crossing windows may use, and the whole
-    story when LORRAX_SIGMA_LAPLACE_MERGE is off.  ``merged_x=True``: the
-    merged Laplace-plan kernel returning the single complex X = ψ†σψ
-    (see ``_project_x_local``); dispatched by ``ppm_sigma`` for
-    project="full" windows only.
+    (S_R, S_I) — the only kernel crossing windows may use.
+    ``merged_x=True``: the merged Laplace-plan kernel returning the single
+    complex X = ψ†σψ (see ``_project_x_local``); dispatched by
+    ``ppm_sigma`` for EVERY project="full" window (the default and only
+    Laplace path — owner order 2026-07-28).
     """
 
     kgrid = tuple(int(x) for x in kgrid)
@@ -730,20 +710,19 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
     The kernel is shape-invariant across the four ω-sign × cond/val
     branches (ψ / E_A / mask_A / B_q / Ω_q / mask_B / scalars all have
     fixed shape+dtype+sharding; only values change per window) — so
-    one AOT compile covers every branch.  On a merged-plan run
-    (LORRAX_SIGMA_LAPLACE_MERGE=1) there are two kernels — the merged
-    Laplace X kernel and the two-channel crossing kernel — and both are
-    compiled here.
+    one AOT compile covers every branch.  Every Σ run carries two kernels
+    — the merged Laplace X kernel and the two-channel crossing kernel —
+    and both are compiled here.
     """
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    tau_kernels = [_get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid)]
-    if _laplace_merge_enabled():
-        # Merged-plan run: BOTH kernels dispatch at runtime (Laplace windows
-        # the merged X kernel, crossing windows the two-channel one) — AOT
-        # both so neither pays a first-dispatch compile inside sigma.exec.
-        tau_kernels.append(_get_sigma_tau_kernel(
-            mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True))
+    # BOTH kernels dispatch at runtime (Laplace windows the merged X kernel,
+    # crossing windows the two-channel one) — AOT both so neither pays a
+    # first-dispatch compile inside sigma.exec.
+    tau_kernels = [
+        _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid),
+        _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True),
+    ]
 
     s = wfns.slices
     psi_coh_xn  = wfns.xn(s.full)
