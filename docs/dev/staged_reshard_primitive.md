@@ -413,6 +413,19 @@ by no one yet, NOT wired — is `wk_REL/contract_bands_notes.md` §6:
   aliases being dtype-agnostic is load-bearing: BSE's fp32-GMRES FFTs
   are complex64 and the flat-k FFI handlers are c128-only on cpu *and*
   CUDA, so routing them at the flat-k layer would have to refuse them.
+* **Layout warning for whoever wires §6.1 route (a)** (measured
+  2026-07-29, jobs 7879363/7879370; HLO dumps in
+  `wk_REL/fftlayout_hlo/`).  BSE's conv FFTs are minor-most and XLA:CPU
+  gives them **zero** transposes/copies — 0 bytes moved at all six real
+  call sites, sharded and unsharded.  A k-major operand is a different
+  story: the same 24.92 MB tile through the same `fft` moves **124.60 MB
+  in transpose+copy (5.0×)**, and the fft's operand is a fusion literally
+  named `%transpose_copy_fusion`.  Consequence: relabelling BSE to
+  k-leading is only correct *together with* `LORRAX_FFT_FFI` (whose
+  handler reads k-major via stride descriptors).  The XLA-path variant of
+  that relabel — §6.1 route (b) — is **refuted**: it buys the layout cost
+  with none of the relief.  Do not stage route (a) as "layout first,
+  backend later".
 * `vq_interp.make_eval_vq`: honestly NOT a contract_bands instance
   (outer-product class — the contracted axis is replicated, the sharded
   axes are outputs).  Needs a structural sibling, not this primitive.
