@@ -81,6 +81,28 @@ def write_eigenvectors_stream(
     kpts_fortran = kpts.T.copy()
     exciton_Q_shifts = np.zeros((1, 3), dtype=np.float64)
 
+    # ── ONE writer ────────────────────────────────────────────────────────
+    # Every rank used to reach the ``h5py.File(output_file, "w")`` below on the
+    # same shared path.  MEASURED at P=64 / N_mu=10015 (job 7879470, leg
+    # m24x64): the solve finishes and prints its eigenvalues, then the ranks
+    # race each other truncating one file and the step exits rc=1 with
+    #     OSError: Unable to synchronously create file (file signature not found)
+    #     OSError: ... (truncated file: eof = 96, ..., stored_eof = 2048)
+    # leaving an eigenvectors.h5 written by whichever rank won.  That is
+    # QUALITY_PATTERNS #7 ("P ranks overwrote one output file") in production.
+    # ``solve_bse_sharded`` pins ``out_shardings=(rep_eig, rep_eig, rep_eig)``
+    # with ``rep_eig = NamedSharding(mesh, P())``, so eigenvalues/eigenvectors
+    # are REPLICATED and rank 0's file is byte-for-byte the file any rank
+    # would have written.
+    # The ``jax.device_get`` calls stay UNGATED on both branches on purpose:
+    # ``eigenvectors[i]`` slices a GLOBAL array, which dispatches an XLA
+    # computation every process must enter — a rank-0-only body would hang the
+    # multi-process client rather than fix anything.
+    if jax.process_index() != 0:
+        for i in range(n_write):
+            jax.device_get(eigenvectors[i])
+        return
+
     with h5py.File(output_file, "w") as f:
         f.create_group("mf_header")
         f.create_group("eps_header")
