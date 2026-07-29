@@ -286,3 +286,16 @@ Re-run the audit with:
 python3 tools/env_audit.py src        # AST walk; flags "MULTIPLE DEFAULTS"
 grep -rn 'getenv(' src/ffi            # the C++ side, which the tool can't see
 ```
+
+## AS.7 upgrade scope (added 2026-07-29)
+
+**GW-ONLY — `mpi` BREAKS BSE (wk_REL, 2026-07-29).** Any kernel whose
+collectives sit inside a `lax.scan`/`while_loop` inside a `shard_map` inside a
+single jit can have XLA:CPU issue them from an intra-op pool thread, and jax's
+MPI backend binds its communicator to the MPI-initialising thread: the BSE TDA
+Lanczos dies on every rank with `MPI: Communicator requested from a thread that
+is not the one MPI was initialized from` (job 7879458, P=4, 785c; raised at
+`bse/bse_jax.py:179` inside `solve_bse_sharded._full_run`; VmHWM 0.60 GiB, not
+memory). GW is unaffected (top-level collectives, main thread; job 7879295 rc=0
+at P=64/mu=10015). Use the gloo/ib0 default for BSE — verified rc=0 at P=4 (job
+7879463) and P=64/mu=10015 (job 7879470).
