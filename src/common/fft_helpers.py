@@ -368,15 +368,25 @@ def make_sharded_fftn_3d(
 
 
 # ============================================================================
-# MKL FFT (DFTI API) host-FFI backend for the flat-k helpers — GATED, OFF by
-# default (LORRAX_FFT_FFI; the fused τ entry additionally behind
-# LORRAX_FFT_FFI_FUSED read in gw/ppm_tau_kernel).  PROTOTYPE, 2026-07-28.
+# FFI backend for the flat-k helpers — GATED, OFF by default
+# (LORRAX_FFT_FFI; the fused τ entry additionally behind
+# LORRAX_FFT_FFI_FUSED read in gw/ppm_tau_kernel).  PROTOTYPE 2026-07-28;
+# CUDA mirror 2026-07-29 — the flag is PLATFORM-UNIFORM.
 #
-# WHAT: the flat-k batched 3-D FFTs dispatched to liblorrax_ffi_host.so's
-# MKL FFT handlers (src/ffi/mklfft/cpp/fft_flat_k_ffi.cc) — a genuine
-# O(N log N) fast Fourier transform at any k-count, driven through MKL's
-# DFTI *descriptor API*.  It is NOT a DFT-as-matmul (owner-vetoed): "DFTI"
-# names Intel's descriptor interface to its FFT engine, nothing else.
+# WHAT: the flat-k batched 3-D FFTs dispatched to the platform FFI library:
+#   cpu   liblorrax_ffi_host.so  MKL FFT via the DFTI *descriptor API*
+#                                (src/ffi/mklfft/cpp/fft_flat_k_ffi.cc) — a
+#                                genuine O(N log N) FFT at any k-count; NOT
+#                                a DFT-as-matmul (owner-vetoed): "DFTI" names
+#                                Intel's descriptor interface, nothing else.
+#   CUDA  liblorrax_ffi.so      cuFFT with the ADVANCED DATA LAYOUT
+#                                (src/ffi/cufft/cpp/fft_flat_k_cuda_ffi.cc):
+#                                cufftPlanMany64 inembed/istride=T/idist=1 —
+#                                the exact stride-descriptor analog; a plain
+#                                CUDA kernel (NVRTC-compiled; not a cuFFT
+#                                callback) fuses the G·W multiply + norms.
+# Both libraries register the SAME target names (ffi_loader per-platform
+# tables), so the ffi_call sites below stay platform-agnostic.
 #
 # WHY: XLA:CPU's fft custom-call requires the transformed axes minor-most,
 # so every dot(k-major flat) <-> fft(k-minor 3-D) boundary in the Σ τ
@@ -397,8 +407,9 @@ def make_sharded_fftn_3d(
 # bit-identical) — gated by the unit gate + the 1e-12 Σ parity suite.
 #
 # Refusal doctrine (pattern #8): the flag is an explicit request — if the
-# host library lacks the handler, or the mesh is not CPU, this REFUSES
-# loudly with the probe reason instead of silently running the XLA path.
+# mesh platform's library lacks the handler, or the platform has no backend
+# at all (neither cpu nor CUDA), this REFUSES loudly with the probe reason
+# instead of silently running the XLA path.
 # In-place: operand 0 is aliased to the result (input_output_aliases), so
 # when the buffer is dead XLA lets the handler transform it in place —
 # the terminal form of donation (zero extra big tiles).
@@ -410,10 +421,12 @@ _fft_ffi_announced: set = set()
 
 
 def fft_ffi_enabled() -> bool:
-    """LORRAX_FFT_FFI=1 routes flat-k FFTs to the MKL FFT (DFTI API) host
-    handler.  Read at helper-FACTORY time (kernel caches must key on it —
-    see ppm_tau_kernel).  Unrecognized values announce once and take the
-    safe direction: OFF (the default XLA path untouched)."""
+    """LORRAX_FFT_FFI=1 routes flat-k FFTs to the platform FFI handler
+    (MKL FFT/DFTI on cpu meshes, cuFFT strided on CUDA meshes — same
+    target names, resolved per lowering platform).  Read at helper-FACTORY
+    time (kernel caches must key on it — see ppm_tau_kernel).  Unrecognized
+    values announce once and take the safe direction: OFF (the default XLA
+    path untouched)."""
     v = os.environ.get("LORRAX_FFT_FFI", "0").strip().lower()
     if v in ("", "0", "off", "false", "no"):
         return False
@@ -427,32 +440,66 @@ def fft_ffi_enabled() -> bool:
     return False
 
 
-def _require_fft_ffi(mesh: Mesh, target: str) -> None:
-    """Announce-or-refuse for the explicitly requested FFI backend."""
+def _fft_ffi_platform(mesh: Mesh) -> str:
+    """FFI platform string for ``mesh``'s devices ("cpu" or "CUDA").
+
+    Platform dispatch (2026-07-29): the CUDA library exports the SAME target
+    names (cufft/cpp/fft_flat_k_cuda_ffi.cc — cufftPlanMany64 advanced
+    layout, the exact stride-descriptor analog of the MKL DFTI handlers), so
+    LORRAX_FFT_FFI is platform-uniform on cpu and CUDA meshes.  Anything
+    else still refuses loudly — explicit requests are never silently
+    downgraded."""
     plat = mesh.devices.flat[0].platform
-    if plat != "cpu":
-        raise RuntimeError(
-            f"LORRAX_FFT_FFI requested the MKL FFT (DFTI API) host backend, "
-            f"but the mesh devices are {plat!r} — this backend is host-only. "
-            f"Unset LORRAX_FFT_FFI on non-CPU meshes (explicit requests are "
-            f"never silently downgraded).")
+    if plat == "cpu":
+        return "cpu"
+    if plat in ("gpu", "cuda"):
+        return "CUDA"
+    raise RuntimeError(
+        f"LORRAX_FFT_FFI requested the FFI flat-k FFT backend, but the mesh "
+        f"devices are {plat!r} — backends exist for cpu (MKL FFT via the "
+        f"DFTI API) and CUDA (cuFFT strided) only.  Unset LORRAX_FFT_FFI on "
+        f"this mesh (explicit requests are never silently downgraded).")
+
+
+_FFT_FFI_BACKEND_LABEL = {
+    "cpu": "MKL FFT (DFTI API) host",
+    "CUDA": "cuFFT strided CUDA",
+}
+
+
+def _require_fft_ffi(mesh: Mesh, target: str) -> None:
+    """Announce-or-refuse for the explicitly requested FFI backend.
+
+    Refuses (with the probe reason) ONLY if the mesh platform has no
+    backend, or the platform's library lacks the target — never silently
+    runs the XLA path (pattern #8)."""
+    plat = _fft_ffi_platform(mesh)
     from ffi.common import ffi_loader
-    ok, reason = ffi_loader.probe_target(target, "cpu")
+    ok, reason = ffi_loader.probe_target(target, plat)
     if not ok:
         raise RuntimeError(
-            f"LORRAX_FFT_FFI requested the MKL FFT (DFTI API) host backend, "
-            f"but FFI target {target!r} is unusable: {reason}")
-    if target not in _fft_ffi_announced:
-        _fft_ffi_announced.add(target)
+            f"LORRAX_FFT_FFI requested the {_FFT_FFI_BACKEND_LABEL[plat]} "
+            f"backend, but FFI target {target!r} is unusable on platform "
+            f"{plat!r}: {reason}")
+    key = (target, plat)
+    if key not in _fft_ffi_announced:
+        _fft_ffi_announced.add(key)
         try:
             first = jax.process_index() == 0
         except Exception:
             first = True
         if first:
-            print(f"[fft_ffi] flat-k 3-D FFTs -> MKL FFT (DFTI API) host FFI "
-                  f"handler ({target}): O(N log N) FFT reading the dot-layout "
-                  f"tile in place via stride descriptors — no XLA layout "
-                  f"transposes.", flush=True)
+            if plat == "cpu":
+                print(f"[fft_ffi] flat-k 3-D FFTs -> MKL FFT (DFTI API) host "
+                      f"FFI handler ({target}): O(N log N) FFT reading the "
+                      f"dot-layout tile in place via stride descriptors — no "
+                      f"XLA layout transposes.", flush=True)
+            else:
+                print(f"[fft_ffi] flat-k 3-D FFTs -> cuFFT strided CUDA FFI "
+                      f"handler ({target}): cufftPlanMany64 advanced layout "
+                      f"(istride=T, idist=1 — the stride-descriptor analog) "
+                      f"reading the dot-layout tile in place; jnp.fft norm "
+                      f"scales applied by a fused device kernel.", flush=True)
 
 
 def _ffi_fft_scale(kind: str, norm: str | None, nk: int) -> float:
@@ -490,9 +537,10 @@ def _make_flat_k_fft_ffi(
     out_spec: P | None,
 ) -> Callable:
     """FFI-backed flat-k FFT: ``(nk, *trail) -> (nk, *trail)``, same contract
-    as :func:`make_flat_k_fft` — one batched MKL FFT (DFTI API) per rank
-    over the local shard, k-major layout end to end (never reshaped to the
-    3-D k-minor form, which is the whole point)."""
+    as :func:`make_flat_k_fft` — one batched strided FFT per rank over the
+    local shard (MKL DFTI on cpu, cuFFT advanced layout on CUDA), k-major
+    layout end to end (never reshaped to the 3-D k-minor form, which is the
+    whole point)."""
     if kind not in ('ifftn', 'fftn'):
         raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
     if out_spec is not None and tuple(out_spec) != tuple(spec):
@@ -549,7 +597,8 @@ def make_flat_k_gw_conv(
     norm: str | None = 'ortho',
     mult: float = 1.0,
 ) -> Callable:
-    """FUSED flat-k convolution — the second MKL FFT (DFTI API) entry point.
+    """FUSED flat-k convolution — the second FFI entry point (MKL DFTI on
+    cpu, cuFFT + fused multiply kernel on CUDA).
 
     Returns ``fn(G_flat, W_flat) -> sigma_flat`` computing, value-identically
     to the decomposed helper sequence (~1e-15 rel; gated, not bit-exact):
@@ -616,11 +665,11 @@ def make_flat_k_gw_conv(
 # pin with `with_sharding_constraint`, run a jittable device-local 3D FFT
 # over the leading (0, 1, 2) k-axes, reshape back to (nk, *trail).
 #
-# Backend gate: with LORRAX_FFT_FFI=1 the factory returns the MKL FFT
-# (DFTI API) host-FFI variant instead (see the block above) — same
-# ``(nk, *trail) -> (nk, *trail)`` contract, no 3-D reshape, no layout
-# anchoring.  Default (flag off): the XLA path below, byte-for-byte
-# untouched.
+# Backend gate: with LORRAX_FFT_FFI=1 the factory returns the platform FFI
+# variant instead (MKL DFTI on cpu, cuFFT strided on CUDA — see the block
+# above) — same ``(nk, *trail) -> (nk, *trail)`` contract, no 3-D reshape,
+# no layout anchoring.  Default (flag off): the XLA path below,
+# byte-for-byte untouched.
 # ============================================================================
 
 
@@ -645,9 +694,10 @@ def make_flat_k_fft(
     follows ``jnp.fft.*`` ('ortho', 'forward', 'backward' / None).
     """
     if fft_ffi_enabled():
-        # Gated backend (announce-or-refuse inside): MKL FFT (DFTI API)
-        # host handler, k-major end to end.  Factory-time env read — kernel
-        # caches key on fft_ffi_enabled() (see ppm_tau_kernel).
+        # Gated backend (announce-or-refuse inside): the platform FFI
+        # handler (MKL DFTI on cpu, cuFFT strided on CUDA), k-major end to
+        # end.  Factory-time env read — kernel caches key on
+        # fft_ffi_enabled() (see ppm_tau_kernel).
         return _make_flat_k_fft_ffi(mesh, kgrid, spec, kind=kind,
                                     norm=norm, out_spec=out_spec)
     nkx, nky, nkz = (int(v) for v in kgrid)

@@ -11,9 +11,9 @@ its cpu (lapack) vs CUDA (cusolver) kernels, so ``jax.ffi.ffi_call``
 sites resolve the right handler from the lowering platform and never
 mention a platform themselves:
 
-    CUDA  liblorrax_ffi.so       cuSOLVERMp/cuBLASMp/phdf5/slate
+    CUDA  liblorrax_ffi.so       cuSOLVERMp/cuBLASMp/phdf5/slate/cuFFT flat-k
     cpu   liblorrax_ffi_host.so  phdf5 read+write / slate (Target::HostTask)
-                                 / ScaLAPACK
+                                 / ScaLAPACK / MKL-DFTI flat-k / MKL GEMM
 
 Public API
 ----------
@@ -96,6 +96,14 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cusolvermp_batched_solve_lu": "CusolverMpBatchedSolveLuFfi",
     "lorrax_cublasmp_batched_gemm":       "CublasMpBatchedGemmFfi",
     "lorrax_cublasmp_batched_w_solve":    "CublasMpBatchedWSolveFfi",
+    # cuFFT strided flat-k batched-FFT handlers (cufft/cpp) — the CUDA
+    # platform mirror of the mklfft host handlers below.  The target STRINGS
+    # deliberately keep the host table's "mklfft" names (they were coined by
+    # the CPU prototype): common.fft_helpers issues ONE platform-agnostic
+    # ffi_call per site and the lowering platform resolves the handler —
+    # exactly the phdf5 same-target/different-symbol split.
+    "lorrax_mklfft_flat_k":         "CufftFlatKCudaFfi",
+    "lorrax_mklfft_gw_conv":        "CufftGwConvCudaFfi",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",

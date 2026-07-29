@@ -60,7 +60,7 @@ done
 # Merge headers from every nvidia package that ships include/.  cp -rsf makes
 # a symlink mirror and merges into existing subdirs (e.g. crt/).  Force each
 # so re-runs and cross-package overlaps don't abort.
-for pkg in cuda_runtime cuda_nvcc cuda_cccl cuda_cupti nvtx cublas cusolver cusparse nccl nvjitlink; do
+for pkg in cuda_runtime cuda_nvcc cuda_cccl cuda_cupti nvtx cublas cusolver cusparse cufft cuda_nvrtc nccl nvjitlink; do
     inc="$NV/$pkg/include"
     [ -d "$inc" ] && cp -rsf "$inc"/. "$CUDA_ROOT/include/" 2>/dev/null || true
 done
@@ -68,7 +68,7 @@ done
 # Merge all shared libs into lib64 (symlinks preserve versioned SONAMEs),
 # and add a bare libX.so -> libX.so.N alias so CMake's find_library(cudart,
 # cusolver, ...) resolves (the wheels ship only versioned .so.N).
-for pkg in cuda_runtime cuda_nvrtc cublas cusolver cusparse nccl nvjitlink; do
+for pkg in cuda_runtime cuda_nvrtc cublas cusolver cusparse cufft nccl nvjitlink; do
     libd="$NV/$pkg/lib"
     [ -d "$libd" ] || continue
     for so in "$libd"/*.so*; do
@@ -93,6 +93,9 @@ echo "[stage] === sanity ==="
 echo "  cuda_runtime.h: $([ -e "$CUDA_ROOT/include/cuda_runtime.h" ] && echo yes || echo MISSING)"
 echo "  libcudart.so:   $([ -e "$CUDA_ROOT/lib64/libcudart.so" ] && echo yes || echo MISSING)"
 echo "  nccl.h:      $([ -e "$CUDA_ROOT/include/nccl.h" ] && echo yes || echo MISSING)"
+echo "  cufft.h:     $([ -e "$CUDA_ROOT/include/cufft.h" ] && echo yes || echo MISSING)"
+echo "  nvrtc.h:     $([ -e "$CUDA_ROOT/include/nvrtc.h" ] && echo yes || echo MISSING)"
+echo "  libcufft.so: $([ -e "$CUDA_ROOT/lib64/libcufft.so" ] && echo yes || echo MISSING)"
 echo "  libcudart:   $(ls "$CUDA_ROOT"/lib64/libcudart.so* 2>/dev/null | head -1 || echo MISSING)"
 echo "  cusolverMp.h:$([ -e "$STAGE/include/cusolverMp.h" ] && echo yes || echo MISSING)"
 echo "  libcusolverMp.so: $([ -e "$STAGE/lib/libcusolverMp.so" ] && echo yes || echo MISSING)"

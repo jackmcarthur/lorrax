@@ -34,6 +34,14 @@ option(LORRAX_FFI_HAVE_PHDF5 "Build the phdf5 subpackage (needs parallel HDF5)" 
 # libcublasmp is still linked (cuSOLVERMp's own runtime dependency) and
 # ensure_cublasmp (pure host C++) still compiles.
 option(LORRAX_FFI_HAVE_CUBLASMP "Build cuBLASMp fused-kernel FFIs (needs nvcc)" ON)
+# cuFFT strided flat-k FFT handlers (cufft/cpp/fft_flat_k_cuda_ffi.cc) — the
+# CUDA platform mirror of the mklfft host handlers (FFT-FFI, 2026-07-29).
+# Plain C++ TU compiled by the host compiler against the CUDA headers (its
+# two device kernels are NVRTC-compiled at runtime), so it needs NO nvcc —
+# it builds in the Frontera pip toolchain where LORRAX_FFI_HAVE_CUBLASMP is
+# OFF.  Auto-downgrades to a loud skip if cufft.h / libcufft / nvrtc are
+# absent (LORRAX_FFT_FFI on CUDA then refuses at runtime via probe_target).
+option(LORRAX_FFI_HAVE_CUFFT "Build the cuFFT strided flat-k FFT handlers" ON)
 
 # ----------------------------------------------------------------------------
 # CUDA language (for .cu kernel translation units compiled by nvcc).  We
@@ -274,6 +282,46 @@ if(NOT NCCL_LIBRARY)
 endif()
 
 # ----------------------------------------------------------------------------
+#  cuFFT + NVRTC — for the LORRAX_FFI_HAVE_CUFFT flat-k handlers.  All four
+#  pieces ship in the container toolkit (/usr/local/cuda) AND in the pip
+#  nvidia-cufft-cu12 / nvidia-cuda-nvrtc-cu12 wheels staged into the Frontera
+#  cuda_root by config/frontera/stage_ffi_deps.sh.
+# ----------------------------------------------------------------------------
+set(LORRAX_CUFFT_ON 0)
+if(LORRAX_FFI_HAVE_CUFFT)
+    find_library(CUFFT_LIBRARY cufft
+        PATHS "${CUDA_TOOLKIT_ROOT}/lib64"
+              "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
+        NO_DEFAULT_PATH)
+    find_library(NVRTC_LIBRARY nvrtc
+        PATHS "${CUDA_TOOLKIT_ROOT}/lib64"
+              "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
+        NO_DEFAULT_PATH)
+    find_path(CUFFT_INCLUDE_DIR cufft.h
+        PATHS "${CUDA_TOOLKIT_ROOT}/include"
+              "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/include"
+        NO_DEFAULT_PATH)
+    find_path(NVRTC_INCLUDE_DIR nvrtc.h
+        PATHS "${CUDA_TOOLKIT_ROOT}/include"
+              "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/include"
+        NO_DEFAULT_PATH)
+    if(CUFFT_LIBRARY AND NVRTC_LIBRARY AND CUFFT_INCLUDE_DIR AND NVRTC_INCLUDE_DIR)
+        set(LORRAX_CUFFT_ON 1)
+        message(STATUS "cufft: strided flat-k FFT handlers ON "
+                       "(${CUFFT_LIBRARY}; nvrtc=${NVRTC_LIBRARY})")
+    else()
+        message(WARNING
+            "cufft: cufft.h/libcufft/nvrtc.h/libnvrtc not all found under "
+            "${CUDA_TOOLKIT_ROOT} (cufft.h=${CUFFT_INCLUDE_DIR} "
+            "lib=${CUFFT_LIBRARY} nvrtc.h=${NVRTC_INCLUDE_DIR} "
+            "libnvrtc=${NVRTC_LIBRARY}) — the flat-k FFT handlers are "
+            "SKIPPED and LORRAX_FFT_FFI on CUDA meshes will refuse at "
+            "runtime.  On Frontera re-run config/frontera/stage_ffi_deps.sh "
+            "(it merges the nvidia-cufft/nvrtc wheels into cuda_root).")
+    endif()
+endif()
+
+# ----------------------------------------------------------------------------
 #  Parallel HDF5 + MPI — for the ffi.phdf5 subpackage.  Gated on
 #  LORRAX_FFI_HAVE_PHDF5 so a port without parallel HDF5 / MPI (e.g. an
 #  eigh-only cuSOLVERMp build) can skip the whole probe.
@@ -425,6 +473,11 @@ if(LORRAX_FFI_HAVE_CUBLASMP)
         ../../cublasmp/cpp/w_solve_kernels.cu
     )
 endif()
+if(LORRAX_CUFFT_ON)
+    list(APPEND LORRAX_FFI_SOURCES
+        ../../cufft/cpp/fft_flat_k_cuda_ffi.cc
+    )
+endif()
 if(LORRAX_FFI_HAVE_PHDF5)
     list(APPEND LORRAX_FFI_SOURCES
         ../../phdf5/cpp/api.cc
@@ -486,6 +539,15 @@ target_link_libraries(lorrax_ffi PRIVATE
 # (>=0.7, the pip wheels) ships no libcal.
 if(LORRAX_FFI_HAVE_CAL)
     target_link_libraries(lorrax_ffi PRIVATE "${CUSOLVERMP_LIBDIR}/libcal.so")
+endif()
+if(LORRAX_CUFFT_ON)
+    # ${CMAKE_DL_LIBS}: the cufft TU resolves the driver API (cuModule*/
+    # cuLaunchKernel) via dlsym — no link-time libcuda (absent on
+    # build/login nodes); NVRTC compiles its two device kernels at runtime.
+    target_link_libraries(lorrax_ffi PRIVATE
+        "${CUFFT_LIBRARY}" "${NVRTC_LIBRARY}" ${CMAKE_DL_LIBS})
+    target_include_directories(lorrax_ffi PRIVATE
+        "${CUFFT_INCLUDE_DIR}" "${NVRTC_INCLUDE_DIR}")
 endif()
 if(LORRAX_FFI_HAVE_PHDF5)
     target_link_libraries(lorrax_ffi PRIVATE ${HDF5_LIBRARIES} "${LORRAX_MPI_LIBRARY}")
