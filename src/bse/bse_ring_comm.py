@@ -17,7 +17,10 @@ except ImportError:  # pragma: no cover - older JAX
     _shard_map_fn = _shard_map_mod.shard_map
 
 import common.timing as timing
+from common.contract_bands import contract_bands_block_reshard
 from common.fft_helpers import (
+    local_fftn3,
+    local_ifftn3,
     make_sharded_fftn_3d,
     make_sharded_ifftn_3d,
 )
@@ -342,6 +345,29 @@ def build_bse_ring_matvec(
     _T_local_fftn = make_sharded_fftn_3d(
         mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
 
+    # ψ†Uψ decode = contract_bands_block_reshard, extra="leading" (owner
+    # order 2026-07-29; adoption map wk_REL/contract_bands_notes.md §6.2 —
+    # the CLEAN drop-in site: the b-stacked U already exists, so the stack
+    # axis is free).  Replaces the partitioner-chosen collectives of the
+    # historical einsum pair ("kctM,bMNtsk->bcNsk" then "kvsN,bcNsk->bcvk",
+    # c-replicated intermediate, LARGE payload on the strided 'x' groups —
+    # the exact inversion the primitive's §3.2 policy refuses) with the
+    # structural stacked psum_scatter chain: large partial over the
+    # node-local 'y' groups, small final over 'x', all b trials on ONE
+    # collective per mesh axis (AK.9), impl=mpi warm-up inherited from the
+    # factory.  Value-level identical (contraction reassociation — gate at
+    # 1e-12, not bit-exact).  The transposes below are rank-local
+    # (sharded axes preserved: M stays on 'x', N on 'y', c on 'x', v on
+    # 'y'); the U transpose to the primitive's k-leading layout is priced
+    # by the parity/perf gate, and composes with the future flat-k conv
+    # layout (map §6.1 route (a)) which emits k-leading natively.
+    _w_decode = contract_bands_block_reshard(
+        mesh_xy, extra="leading",
+        divisibility_hint=(
+            "BSE callers: n_cond_pad / n_val_pad already pad c to p_x and "
+            "v to p_y (bse_io loader); an indivisible window here means an "
+            "unpadded/hand-built operand."))
+
     def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
         nspinor = psi_c_X.shape[2]
         nb_trial = T.shape[0]
@@ -355,8 +381,13 @@ def build_bse_ring_matvec(
         U_q = _T_local_fftn(U_R)
         U = U_q.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nk)
 
-        A = jnp.einsum("kctM,bMNtsk->bcNsk", jnp.conj(psi_c_X), U)
-        WX = jnp.einsum("kvsN,bcNsk->bcvk", psi_v_Y, A)
+        # (b, M, N, t, s, k) -> (b, k, t, M, s, N): the primitive's
+        # canonical O layout (extra="leading"); ψ_v (k, v, s, N) ->
+        # (k, s, N, v) = ψ_right.  conj(ψ_c) is applied inside.
+        O_b = jnp.transpose(U, (0, 5, 3, 1, 4, 2))
+        psi_v_snv = jnp.transpose(psi_v_Y, (0, 2, 3, 1))
+        out = _w_decode(psi_c_X, O_b, psi_v_snv)     # (b, nk, c_X, v_Y)
+        WX = jnp.transpose(out, (0, 2, 3, 1))        # (b, c_X, v_Y, nk)
         return WX / sqrt_nk
 
     apply_W_from_T = jax.jit(
@@ -576,6 +607,29 @@ def build_bse_ring_matvec_full(
     _T_local_fftn = make_sharded_fftn_3d(
         mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
 
+    # ψ†Uψ decode = contract_bands_block_reshard, extra="leading" (owner
+    # order 2026-07-29; adoption map wk_REL/contract_bands_notes.md §6.2 —
+    # the CLEAN drop-in site: the b-stacked U already exists, so the stack
+    # axis is free).  Replaces the partitioner-chosen collectives of the
+    # historical einsum pair ("kctM,bMNtsk->bcNsk" then "kvsN,bcNsk->bcvk",
+    # c-replicated intermediate, LARGE payload on the strided 'x' groups —
+    # the exact inversion the primitive's §3.2 policy refuses) with the
+    # structural stacked psum_scatter chain: large partial over the
+    # node-local 'y' groups, small final over 'x', all b trials on ONE
+    # collective per mesh axis (AK.9), impl=mpi warm-up inherited from the
+    # factory.  Value-level identical (contraction reassociation — gate at
+    # 1e-12, not bit-exact).  The transposes below are rank-local
+    # (sharded axes preserved: M stays on 'x', N on 'y', c on 'x', v on
+    # 'y'); the U transpose to the primitive's k-leading layout is priced
+    # by the parity/perf gate, and composes with the future flat-k conv
+    # layout (map §6.1 route (a)) which emits k-leading natively.
+    _w_decode = contract_bands_block_reshard(
+        mesh_xy, extra="leading",
+        divisibility_hint=(
+            "BSE callers: n_cond_pad / n_val_pad already pad c to p_x and "
+            "v to p_y (bse_io loader); an indivisible window here means an "
+            "unpadded/hand-built operand."))
+
     def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
         nspinor = psi_c_X.shape[2]
         nb_trial = T.shape[0]
@@ -589,8 +643,13 @@ def build_bse_ring_matvec_full(
         U_q = _T_local_fftn(U_R)
         U = U_q.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nk)
 
-        A = jnp.einsum("kctM,bMNtsk->bcNsk", jnp.conj(psi_c_X), U)
-        WX = jnp.einsum("kvsN,bcNsk->bcvk", psi_v_Y, A)
+        # (b, M, N, t, s, k) -> (b, k, t, M, s, N): the primitive's
+        # canonical O layout (extra="leading"); ψ_v (k, v, s, N) ->
+        # (k, s, N, v) = ψ_right.  conj(ψ_c) is applied inside.
+        O_b = jnp.transpose(U, (0, 5, 3, 1, 4, 2))
+        psi_v_snv = jnp.transpose(psi_v_Y, (0, 2, 3, 1))
+        out = _w_decode(psi_c_X, O_b, psi_v_snv)     # (b, nk, c_X, v_Y)
+        WX = jnp.transpose(out, (0, 2, 3, 1))        # (b, c_X, v_Y, nk)
         return WX / sqrt_nk
 
     apply_W_from_T = jax.jit(
@@ -990,7 +1049,7 @@ def ring_matvec_smoke_test(px: int = 2, py: int = 2) -> None:
         X = jax.lax.with_sharding_constraint(X, sh.X)
 
         matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
-        W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
+        W_R = local_ifftn3(W_q, axes=(2, 3, 4), norm="ortho")
         M_X = compute_pair_amplitude(psi_c_X, psi_v_X)
         M_Y = compute_pair_amplitude(psi_c_Y, psi_v_Y)
         HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
@@ -1052,7 +1111,7 @@ def ring_matvec_correctness_check(
         W_q = jax.lax.with_sharding_constraint(W_q, sh.W)
         V_q0 = jax.lax.with_sharding_constraint(V_q0, sh.V)
         X = jax.lax.with_sharding_constraint(X, sh.X)
-        W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
+        W_R = local_ifftn3(W_q, axes=(2, 3, 4), norm="ortho")
 
         matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
         M_X = compute_pair_amplitude(psi_c_X, psi_v_X)
@@ -1075,10 +1134,10 @@ def ring_matvec_correctness_check(
         R = jnp.einsum("kvsN,bcvk->bcksN", jnp.conj(psi_v), X)
         T = jnp.einsum("kctM,bcksN->bMNtsk", psi_c, R)
         T_k = T.reshape(X.shape[0], n_rmu_pad, n_rmu_pad, psi_c.shape[2], psi_c.shape[2], nkx, nky, nkz)
-        T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm="ortho")
-        W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
+        T_R = local_ifftn3(T_k, axes=(5, 6, 7), norm="ortho")
+        W_R = local_ifftn3(W_q, axes=(2, 3, 4), norm="ortho")
         U_R = W_R[None, :, :, None, None, :, :, :] * T_R
-        U_q = jnp.fft.fftn(U_R, axes=(5, 6, 7), norm="ortho")
+        U_q = local_fftn3(U_R, axes=(5, 6, 7), norm="ortho")
         U = U_q.reshape(X.shape[0], n_rmu_pad, n_rmu_pad, psi_c.shape[2], psi_c.shape[2], nk)
         A = jnp.einsum("kctM,bMNtsk->bcNsk", jnp.conj(psi_c), U)
         W_ref = jnp.einsum("kvsN,bcNsk->bcvk", psi_v, A) / sqrt_nk
@@ -1086,7 +1145,7 @@ def ring_matvec_correctness_check(
         comp_matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
         with mesh:
             D_ring = apply_D(X, eps_c, eps_v)
-            W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
+            W_R = local_ifftn3(W_q, axes=(2, 3, 4), norm="ortho")
             V_ring = comp_matvec(
                 X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R * 0.0, V_q0,
                 M_X, M_Y

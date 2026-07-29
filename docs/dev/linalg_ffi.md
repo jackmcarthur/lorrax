@@ -145,6 +145,19 @@ failed guard, the mesh, and the available alternatives.
 | `scalapack` | eigh, solve_lu | host only | square or 1-D | `liblorrax_ffi_host.so` linked against MKL ScaLAPACK+BLACS (Cray LibSci elsewhere) | eigh = `pzheevd`/`pdsyevd`, **the permanent CPU distributed eigh** (what `distributed` resolves to there); solve_lu = `pXgetrf`+`pXgetrs`. Returns TRUE column eigenvectors. Both are explicit-request only — neither is ever auto-picked. |
 | `distributed` (alias) | eigh | any | that of the backend it names | — | Not a library: "spread ONE tile over the mesh with this platform's distributed eigh". Resolves to `scalapack` on cpu (**permanently**) and `cusolvermp` on CUDA, then runs the full guard ladder. This is the name the ζ-fit's `distributed_zeta_solve = distributed` tier uses. |
 
+> **Same-.so neighbours (not linalg backends):** `liblorrax_ffi_host.so`
+> also carries the flat-k MKL FFT (DFTI API) handlers
+> (`common.fft_helpers`, `LORRAX_FFT_FFI` — Intel-specific by
+> construction) and the `contract_bands` GEMM handler
+> (`lorrax_mklblas_gemm_batch`, `LORRAX_BANDS_GEMM_FFI`, auto default on
+> CPU).  The GEMM handler is vendor-portable: it builds against any
+> standard CBLAS on the resolved linalg link line and prefers the
+> batched `cblas_?gemm_batch` entry when the BLAS has it (CMake
+> `check_symbol_exists` probe), falling back to a plain
+> `cblas_{d,z}gemm` loop otherwise — **works in principle with Intel MKL
+> or Cray LibSci (batched entry when available, plain-GEMM loop
+> otherwise); tested with Intel only so far.**
+
 **When does an FFI backend actually win?** It depends on the *regime* —
 and the two measured regimes point in opposite directions.
 

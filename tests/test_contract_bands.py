@@ -53,7 +53,8 @@ import jax.numpy as jnp                              # noqa: E402
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
 from common.contract_bands import (                  # noqa: E402
-    contract_bands_block_reshard, bands_gemm_ffi_enabled)
+    contract_bands_block_reshard, bands_gemm_ffi_enabled,
+    bands_gemm_ffi_mode)
 
 
 NK, NS, MU, MN, E = 4, 2, 16, 8, 3
@@ -267,6 +268,72 @@ def test_refusals():
         raise AssertionError("split_reim real-O refusal did not fire")
     except TypeError as exc:
         assert "complex" in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# AUTO default (owner order 2026-07-29): ON iff CPU platform + handler in
+# the host .so; explicit 0 disables; auto quietly keeps the XLA plan where
+# the dial cannot apply (extra="minor", non-f64/c128 dtypes).
+# ---------------------------------------------------------------------------
+
+def test_auto_default():
+    ok, reason = _ffi_available()
+    prev = os.environ.pop("LORRAX_BANDS_GEMM_FFI", None)
+    try:
+        assert bands_gemm_ffi_mode() == "auto"
+        auto_on = bands_gemm_ffi_enabled()
+        assert auto_on == ok, (
+            f"auto verdict {auto_on} != handler availability {ok} "
+            f"({reason})")
+        os.environ["LORRAX_BANDS_GEMM_FFI"] = "auto"
+        assert bands_gemm_ffi_enabled() == ok
+        os.environ["LORRAX_BANDS_GEMM_FFI"] = "0"
+        assert bands_gemm_ffi_mode() == "off"
+        assert not bands_gemm_ffi_enabled(), "explicit =0 must disable auto"
+        del os.environ["LORRAX_BANDS_GEMM_FFI"]
+
+        mesh = _mesh()
+        if ok:
+            # auto-ON: the leading plan carries the GEMM custom-call ...
+            proj = contract_bands_block_reshard(mesh, extra="leading")
+            (psi_l, o, psi_r), dev = _operands(mesh, extra="leading")
+            out = jax.jit(proj)(*dev)
+            err = _relerr(out, _ref(psi_l, o, psi_r, extra="leading"))
+            assert err <= TOL, f"[auto leading] parity {err:.3e} > 1e-14"
+            txt = _compile_text(proj, dev)
+            assert len(_CC_RE.findall(txt)) == 1, (
+                "[auto leading] expected the FFI custom-call under auto-ON")
+            # ... while extra="minor" quietly keeps the XLA plan (the
+            # explicit-mode refusal must NOT fire under auto) ...
+            proj_m = contract_bands_block_reshard(mesh, extra="minor")
+            (psi_l, o, psi_r), dev = _operands(mesh, extra="minor")
+            out = jax.jit(proj_m)(*dev)
+            err = _relerr(out, _ref(psi_l, o, psi_r, extra="minor"))
+            assert err <= TOL, f"[auto minor] parity {err:.3e} > 1e-14"
+            txt = _compile_text(proj_m, dev)
+            assert len(_CC_RE.findall(txt)) == 0, (
+                "[auto minor] must fall back to the XLA plan, not refuse")
+            # ... and non-f64/c128 dtypes (fp32 BSE class) fall back too.
+            proj_c = contract_bands_block_reshard(mesh, channels="none")
+            (psi_l, o, psi_r), dev = _operands(mesh)
+            dev64 = tuple(jnp.asarray(d, dtype=jnp.complex64) for d in dev)
+            txt = jax.jit(proj_c).lower(*dev64).compile().as_text()
+            assert len(_CC_RE.findall(txt)) == 0, (
+                "[auto c64] complex64 operands must keep the XLA lowering")
+            print("  [auto] AUTO-ON engages; minor + c64 fall back to XLA",
+                  flush=True)
+        else:
+            proj = contract_bands_block_reshard(mesh, extra="leading")
+            (psi_l, o, psi_r), dev = _operands(mesh, extra="leading")
+            txt = _compile_text(proj, dev)
+            assert len(_CC_RE.findall(txt)) == 0
+            print(f"  [auto] handler unavailable -> auto-OFF ({reason})",
+                  flush=True)
+    finally:
+        if prev is None:
+            os.environ.pop("LORRAX_BANDS_GEMM_FFI", None)
+        else:
+            os.environ["LORRAX_BANDS_GEMM_FFI"] = prev
 
 
 # ---------------------------------------------------------------------------

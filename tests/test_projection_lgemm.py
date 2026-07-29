@@ -54,6 +54,12 @@ sys.path.insert(0, os.path.join(
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_ENABLE_X64", "1")
+# This file pins the DEFAULT XLA GEMM lowering of the projector (dot
+# classes, converts).  Since 2026-07-29 LORRAX_BANDS_GEMM_FFI defaults to
+# AUTO (ON when the host .so's GEMM handler resolves), which would replace
+# the pinned dots with mklblas custom-calls — pin the dial OFF here; the
+# FFI plan has its own pins in tests/test_contract_bands.py.
+os.environ.setdefault("LORRAX_BANDS_GEMM_FFI", "0")
 # Four emulated host devices: the projector's shard_map/psum_scatter path
 # is identical to production; multi-process collectives are covered by the
 # restart-gated P=64 A/B (wk_REL/lgemm_ab.sbatch).

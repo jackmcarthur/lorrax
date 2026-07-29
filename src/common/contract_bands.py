@@ -80,26 +80,37 @@ Encoded policies (each measured; evidence cited inline)
    INDEPENDENTLY per axis — never to the p_x·p_y product, which wastes
    up to 3.16× tile; audit fix/zq 2026-07-28).
 
-Gated CPU GEMM body (LORRAX_BANDS_GEMM_FFI)
--------------------------------------------
+Gated CPU GEMM body (LORRAX_BANDS_GEMM_FFI; AUTO default 2026-07-29)
+--------------------------------------------------------------------
 The large right contraction is the measured wall of this pattern — 71% of
 the Σ project_rs row, running 4.3–7.3× below the node's BLAS roofline
 through XLA:CPU's Eigen dots (295 GF/s promoted zgemm / ~172 GF/s split
-dgemm vs 1263 GF/s MKL, memo Sec. 4.4/4.5).  ``LORRAX_BANDS_GEMM_FFI=1``
-routes ONLY that right contraction through the MKL batched-GEMM host FFI
-handler (``lorrax_mklblas_gemm_batch``, src/ffi/mklblas/cpp — dgemm/zgemm
-dispatch on buffer dtype, MKL-internal threading under the workstream-AW
-MklThreadScope pattern).  Everything else — channel algebra, collectives,
-the small left dots (1.6e-3 of the right's flops, measured) — is
-untouched.  House rules applied: env grants capability loudly (announce
-once) and an explicit request is never silently downgraded — the flag
-REFUSES on a non-CPU mesh (the CUDA lowering already hits cuBLAS, which
-is optimal there; this dial is CPU-only) and refuses when the host .so
-lacks the handler, quoting the probe reason.  ``input_output_aliases``:
-deliberately NONE — a GEMM output (B, M, N) never matches an operand
-buffer shape, so no alias is legal (contrast the in-place FFT handlers).
-Read at FACTORY time: kernel caches must key on
-:func:`bands_gemm_ffi_enabled` (ppm_tau_kernel does).
+dgemm vs 1263 GF/s MKL, memo Sec. 4.4/4.5; the bare Eigen dot saturates
+1.6–1.9× below vendor BLAS at full threads — jobs 7879008/7879010).
+The dial routes ONLY that right contraction through the vendor-BLAS GEMM
+host FFI handler (``lorrax_mklblas_gemm_batch``, src/ffi/mklblas/cpp —
+dgemm/zgemm dispatch on buffer dtype, batched ``cblas_?gemm_batch`` entry
+when the BLAS has it, plain cblas GEMM loop otherwise; works in principle
+with Intel MKL or Cray LibSci, tested with Intel only so far;
+vendor-internal threading under the workstream-AW MklThreadScope
+pattern).  Everything else — channel algebra, collectives, the small left
+dots (1.6e-3 of the right's flops, measured) — is untouched.
+
+Default is AUTO (owner order 2026-07-29, doctrine #8: capability
+detection, not policy): unset / ``auto`` turns the FFI body ON when the
+platform is CPU AND the handler resolves in the host .so — announced once
+on rank 0 — and quietly keeps the native lowering everywhere the dial
+cannot apply (non-CPU platform: cuBLAS native is optimal, silent BY
+DESIGN; ``extra="minor"``; non-f64/c128 dtypes such as the BSE fp32-GMRES
+path).  ``LORRAX_BANDS_GEMM_FFI=0`` disables.  An EXPLICIT ``=1`` keeps
+the announce-or-REFUSE semantics: it REFUSES on a non-CPU mesh, refuses
+when the host .so lacks the handler (quoting the probe reason), refuses
+``extra="minor"`` and refuses unsupported dtypes — explicit requests are
+never silently downgraded.  ``input_output_aliases``: deliberately NONE —
+a GEMM output (B, M, N) never matches an operand buffer shape, so no
+alias is legal (contrast the in-place FFT handlers).  Read at FACTORY
+time: kernel caches must key on :func:`bands_gemm_ffi_enabled`
+(ppm_tau_kernel does).
 
 Canonical operand layout (global shapes → mesh specs)
 -----------------------------------------------------
@@ -140,6 +151,7 @@ from jax.sharding import Mesh, PartitionSpec as P
 __all__ = [
     "contract_bands_block_reshard",
     "bands_gemm_ffi_enabled",
+    "bands_gemm_ffi_mode",
     "ensure_grouped_collectives_ready",
 ]
 
@@ -195,30 +207,105 @@ def ensure_grouped_collectives_ready(*, print_fn=print) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Gated MKL batched-GEMM FFI body (CPU only)
+# Gated vendor-BLAS GEMM FFI body (CPU only; AUTO default since 2026-07-29)
 # ---------------------------------------------------------------------------
 
 _BANDS_GEMM_TARGET = "lorrax_mklblas_gemm_batch"
 _bands_gemm_announced: set = set()
+_bands_gemm_auto_verdict: bool | None = None  # memoized capability probe
 
 
-def bands_gemm_ffi_enabled() -> bool:
-    """``LORRAX_BANDS_GEMM_FFI=1`` routes the primitive's LARGE right
-    contraction through the MKL batched-GEMM host FFI handler.  Read at
-    FACTORY time — kernel caches must key on this (ppm_tau_kernel's
-    pipeline/cache keys do).  Unrecognized values announce once and take
-    the safe direction: OFF (default XLA lowering untouched)."""
-    v = os.environ.get("LORRAX_BANDS_GEMM_FFI", "0").strip().lower()
-    if v in ("", "0", "off", "false", "no"):
-        return False
-    if v in ("1", "on", "true", "yes"):
+def _rank0() -> bool:
+    try:
+        return jax.process_index() == 0
+    except Exception:                                     # noqa: BLE001
         return True
+
+
+def bands_gemm_ffi_mode() -> str:
+    """The LORRAX_BANDS_GEMM_FFI grammar: ``"on"`` | ``"off"`` | ``"auto"``.
+
+    ``auto`` (the DEFAULT since the 2026-07-29 owner order — unset or
+    ``auto``) is capability detection, not policy (env-vars doctrine #8):
+    it turns the FFI GEMM body ON only where it is known-optimal and
+    available (CPU platform + handler in the host .so) and quietly leaves
+    the native lowering everywhere else.  Explicit ``1`` keeps the
+    announce-or-REFUSE semantics; explicit ``0`` disables.  Unrecognized
+    values announce once and take the conservative direction: ``off``."""
+    v = os.environ.get("LORRAX_BANDS_GEMM_FFI", "").strip().lower()
+    if v in ("", "auto"):
+        return "auto"
+    if v in ("0", "off", "false", "no"):
+        return "off"
+    if v in ("1", "on", "true", "yes"):
+        return "on"
     if "grammar" not in _bands_gemm_announced:
         _bands_gemm_announced.add("grammar")
         print(f"*** LORRAX_BANDS_GEMM_FFI={v!r} is not a recognized value "
-              f"(accepted: 0/off/false/no, 1/on/true/yes).  Treating as OFF "
-              f"(default XLA GEMM lowering). ***", flush=True)
-    return False
+              f"(accepted: auto/unset, 0/off/false/no, 1/on/true/yes).  "
+              f"Treating as OFF (default XLA GEMM lowering). ***", flush=True)
+    return "off"
+
+
+def _bands_gemm_auto_enabled() -> bool:
+    """The AUTO resolution (owner order 2026-07-29): ON iff the platform
+    is CPU AND the GEMM handler resolves in the host .so.  Decision
+    announced ONCE on rank 0 either way (the router prints its decision);
+    on a non-CPU platform auto is OFF silently BY DESIGN — XLA:GPU's dot
+    lowering already dispatches cuBLAS, which is optimal there.
+
+    Platform is read from ``JAX_PLATFORMS`` (``ffi_loader.platform_from_env``
+    — never initializes the JAX backend, so cache-key calls before
+    ``jax.distributed.initialize`` stay safe).  The production CPU harnesses
+    export ``JAX_PLATFORMS=cpu``, and ``runtime.bootstrap()``'s GPU-less
+    downgrade (``fallback_to_cpu_if_no_gpu_backend``) FORCES it to ``cpu``,
+    so those runs resolve correctly.  The read is lexical though: an unset
+    variable resolves CUDA-first, and so does a run that reaches a CPU mesh
+    while ``JAX_PLATFORMS`` still reads ``cuda,cpu`` (``set_default_env``'s
+    gpu default, if jax resolved cpu without raising).  Both give auto-OFF
+    — the safe direction: the XLA lowering, no error, just no speedup.
+    Fix either by exporting ``JAX_PLATFORMS=cpu`` or ``=1`` explicitly.
+    """
+    global _bands_gemm_auto_verdict
+    if _bands_gemm_auto_verdict is not None:
+        return _bands_gemm_auto_verdict
+    from ffi.common import ffi_loader
+    if ffi_loader.platform_from_env(default="CUDA") != "cpu":
+        # Non-CPU platform: silently-by-design OFF (cuBLAS native optimal).
+        _bands_gemm_auto_verdict = False
+        return False
+    ok, reason = ffi_loader.probe_target(_BANDS_GEMM_TARGET, "cpu")
+    _bands_gemm_auto_verdict = bool(ok)
+    if "auto" not in _bands_gemm_announced:
+        _bands_gemm_announced.add("auto")
+        if _rank0():
+            if ok:
+                print(f"[bands_gemm] AUTO-ON: CPU platform and FFI target "
+                      f"{_BANDS_GEMM_TARGET!r} resolves in the host .so -> "
+                      f"contract_bands right-GEMMs at vendor-BLAS rate "
+                      f"(1.6-1.9x over the XLA:CPU Eigen dots at full "
+                      f"threads, jobs 7879008/7879010).  "
+                      f"LORRAX_BANDS_GEMM_FFI=0 disables.", flush=True)
+            else:
+                print(f"[bands_gemm] auto: FFI target {_BANDS_GEMM_TARGET!r} "
+                      f"unavailable -> default XLA GEMM lowering "
+                      f"({reason})", flush=True)
+    return _bands_gemm_auto_verdict
+
+
+def bands_gemm_ffi_enabled() -> bool:
+    """True when the primitive's LARGE right contraction routes through the
+    vendor-BLAS GEMM host FFI handler.  DEFAULT is AUTO (2026-07-29 owner
+    order): ON when the platform is CPU and the handler resolves in the
+    host .so (announced once), OFF otherwise — see
+    :func:`bands_gemm_ffi_mode`.  Read at FACTORY time — kernel caches
+    must key on this (ppm_tau_kernel's pipeline/cache keys do)."""
+    mode = bands_gemm_ffi_mode()
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    return _bands_gemm_auto_enabled()
 
 
 def _require_bands_gemm_ffi(mesh: Mesh) -> None:
@@ -241,12 +328,8 @@ def _require_bands_gemm_ffi(mesh: Mesh) -> None:
             f"{reason}")
     if _BANDS_GEMM_TARGET not in _bands_gemm_announced:
         _bands_gemm_announced.add(_BANDS_GEMM_TARGET)
-        try:
-            first = jax.process_index() == 0
-        except Exception:
-            first = True
-        if first:
-            print(f"[bands_gemm] contract_bands right-GEMMs -> MKL batched "
+        if _rank0():
+            print(f"[bands_gemm] contract_bands right-GEMMs -> vendor-BLAS "
                   f"GEMM host FFI handler ({_BANDS_GEMM_TARGET}): "
                   f"dgemm/zgemm at BLAS rate (memo Sec. 4.4 exit (b)); "
                   f"collectives, channel algebra and left dots untouched.",
@@ -373,8 +456,10 @@ def contract_bands_block_reshard(
             f"Sec. 6.1 finding #1).  Build the mesh with {ax_y!r} minor, or "
             f"pass axes=(major, minor) matching your mesh.")
 
+    ffi_mode = bands_gemm_ffi_mode()
     use_ffi = bands_gemm_ffi_enabled()
-    if use_ffi:
+    if use_ffi and ffi_mode == "on":
+        # Explicit request: announce-or-REFUSE, never silently downgraded.
         _require_bands_gemm_ffi(mesh_xy)
         if extra == "minor":
             raise RuntimeError(
@@ -385,6 +470,17 @@ def contract_bands_block_reshard(
                 "Use extra='leading' with the FFI dial, or unset "
                 "LORRAX_BANDS_GEMM_FFI for the minor order (explicit "
                 "requests are never silently downgraded).")
+    elif use_ffi:
+        # AUTO (the default): capability detection, not policy — quietly
+        # keep the native lowering where the dial cannot apply.  Non-CPU
+        # mesh: silent OFF by design (XLA:GPU's dot lowering already hits
+        # cuBLAS — optimal); extra='minor': the contracted axis is not
+        # GEMM-reachable (see the explicit-mode refusal above), so the
+        # minor order keeps the XLA plan.  The probe + AUTO-ON announce
+        # already ran inside bands_gemm_ffi_enabled().
+        plat = mesh_xy.devices.flat[0].platform
+        if plat != "cpu" or extra == "minor":
+            use_ffi = False
 
     p_x = mesh_xy.shape[ax_x]
     p_y = mesh_xy.shape[ax_y]
@@ -394,9 +490,27 @@ def contract_bands_block_reshard(
     # Reshapes around the FFI call are index-preserving (contiguous
     # row-major flattening of adjacent axes) — free at the XLA level.
 
+    def _ffi_dtypes_ok(o_l, psi_l):
+        """The GEMM handler is f64/c128-only BY CONSTRUCTION (it dispatches
+        on the buffer dtype).  Explicit mode: REFUSE with the fix named
+        (the fft_helpers TypeError pattern — never a silent downgrade);
+        AUTO: quietly keep the XLA lowering for this call — a documented
+        capability boundary, e.g. the BSE fp32-GMRES path's complex64
+        operands."""
+        ok = (o_l.dtype == psi_l.dtype
+              and o_l.dtype in (jnp.float64, jnp.complex128))
+        if ok or ffi_mode != "on":
+            return ok
+        raise TypeError(
+            f"LORRAX_BANDS_GEMM_FFI: the vendor-BLAS GEMM host handler "
+            f"supports f64/c128 only, got O {o_l.dtype} × ψ {psi_l.dtype} "
+            f"(e.g. an fp32 BSE GMRES solve).  Unset LORRAX_BANDS_GEMM_FFI "
+            f"for this path — the XLA lowering accepts it, and explicit "
+            f"requests are never silently downgraded.")
+
     def _right_none(o_l, psi_l):
         # (k, s, x, t, y) × (k, t, y, n) -> (k, s, x, n)
-        if not use_ffi:
+        if not use_ffi or not _ffi_dtypes_ok(o_l, psi_l):
             return jnp.einsum('ksxty,ktyn->ksxn', o_l, psi_l, optimize=True)
         k, s, x, t, y = o_l.shape
         n = psi_l.shape[3]
@@ -407,7 +521,7 @@ def contract_bands_block_reshard(
     def _right_leading(o_l, psi_l):
         # (e, k, s, x, t, y) × (k, t, y, n) -> (e, k, s, x, n); the k-only
         # ψ batch is broadcast over e by the handler's BA % BB rule.
-        if not use_ffi:
+        if not use_ffi or not _ffi_dtypes_ok(o_l, psi_l):
             return jnp.einsum('eksxty,ktyn->eksxn', o_l, psi_l,
                               optimize=True)
         e, k, s, x, t, y = o_l.shape

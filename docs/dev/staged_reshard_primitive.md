@@ -75,8 +75,11 @@ in the message — the broken-promise pattern, QUALITY_PATTERNS §6):
 3. `channels="split_reim"` with `extra != "none"`, or with a real `O`.
 4. Operand-extent mismatches vs `O` (rank and per-axis, message names
    which axis disagrees).
-5. Under `LORRAX_BANDS_GEMM_FFI=1`: non-CPU mesh; missing/unloadable
-   handler (quotes the `probe_target` reason); `extra="minor"` (§3.4).
+5. Under an EXPLICIT `LORRAX_BANDS_GEMM_FFI=1`: non-CPU mesh;
+   missing/unloadable handler (quotes the `probe_target` reason);
+   `extra="minor"`; non-f64/c128 operand dtypes (§3.4).  The AUTO default
+   (unset/`auto`, 2026-07-29) never refuses — it quietly keeps the native
+   lowering wherever the dial cannot apply.
 
 Callable contract: the returned `project` is a `shard_map`'d function —
 jit it or trace it into a larger kernel.  The FACTORY must be invoked
@@ -172,25 +175,43 @@ rank≥2 `convert(f64[...])→c128` anywhere, (b) dot dtype/shape classes,
 `tests/test_contract_bands.py` and `tests/test_projection_lgemm.py` are
 the reference implementations of the pattern.
 
-### 3.4 The gated FFI MKL GEMM body (`LORRAX_BANDS_GEMM_FFI`)
+### 3.4 The gated FFI vendor-BLAS GEMM body (`LORRAX_BANDS_GEMM_FFI`; AUTO default)
 
 Even de-promoted, XLA:CPU's Eigen dots run well below the node's BLAS
 rate (thread-pool probe, job 7879008: scaling with the client pool is
 near-linear — NOT a pool-wiring defect; the bare dot saturates 1.6–1.9×
 below MKL at 28 threads, and the in-module production rate is a further
-~2× below the bare dot).  `LORRAX_BANDS_GEMM_FFI=1` therefore routes
-ONLY the large right contraction through the MKL batched-GEMM host
-handler `lorrax_mklblas_gemm_batch`
-(`src/ffi/mklblas/cpp/gemm_batch_ffi.cc`): row-major NN
-`C[i] = A[i] @ B[i % BB]` — the B-cycling broadcast is what serves both
-the plain per-k batch and the extra-stacked batch with the k-only ψ —
-dgemm/zgemm dispatched on buffer dtype, MKL-internal threading under the
-workstream-AW `MklThreadScope` pin (`LORRAX_MKLBLAS_THREADS`
-auto|off|N, strict grammar).  Collectives, channel algebra and the small
-left dots (measured 1.6e-3 of the right's flops) are untouched.
+~2× below the bare dot).  The dial therefore routes ONLY the large right
+contraction through the vendor-BLAS GEMM host handler
+`lorrax_mklblas_gemm_batch` (`src/ffi/mklblas/cpp/gemm_batch_ffi.cc`):
+row-major NN `C[i] = A[i] @ B[i % BB]` — the B-cycling broadcast is what
+serves both the plain per-k batch and the extra-stacked batch with the
+k-only ψ — dgemm/zgemm dispatched on buffer dtype, vendor-internal
+threading under the workstream-AW `MklThreadScope` pin
+(`LORRAX_MKLBLAS_THREADS` auto|off|N, strict grammar; dlsym'd — a no-op
+on a non-MKL BLAS).  Collectives, channel algebra and the small left
+dots (measured 1.6e-3 of the right's flops) are untouched.
 
-Rules encoded (env grants capability loudly; never a silent downgrade —
-QUALITY_PATTERNS §8):
+**Vendor portability (2026-07-29):** `cblas_?gemm_batch` is an MKL
+extension of CBLAS.  The build probes for it with CMake
+`check_symbol_exists` against the resolved BLAS headers + link line
+(`src/ffi/common/cpp/host/CMakeLists.txt`, mklblas block): present → the
+batched entry (preferred); absent → a portable loop of plain
+`cblas_{d,z}gemm` calls (standard CBLAS — each GEMM threaded internally
+by the vendor).  The handler therefore **works in principle with Intel
+MKL or Cray LibSci (batched entry when available, plain-GEMM loop
+otherwise); tested with Intel only so far.**
+
+**Default is AUTO (owner order 2026-07-29 — capability detection, not
+policy, doctrine #8):** unset/`auto` turns the FFI body ON when the
+platform is CPU AND the handler resolves in the host .so, announced once
+on rank 0; on CUDA the auto is OFF **silently by design** (XLA:GPU's dot
+lowering already dispatches cuBLAS — optimal); auto also quietly keeps
+the XLA plan for `extra="minor"` and for non-f64/c128 dtypes (the BSE
+fp32-GMRES class).  `LORRAX_BANDS_GEMM_FFI=0` disables.
+
+Rules for an EXPLICIT `=1` (env grants capability loudly; never a silent
+downgrade — QUALITY_PATTERNS §8):
 
 * announce once on rank 0; REFUSE with the probe reason if the host .so
   lacks the handler;
@@ -198,7 +219,11 @@ QUALITY_PATTERNS §8):
   (XLA:GPU's dot lowering already dispatches cuBLAS, which is optimal);
 * REFUSE `extra="minor"` (the contracted axis is not reachable by a
   strided batched GEMM without a full-tile transpose copy);
-* read at FACTORY time → consumers key their kernel caches on it.
+* REFUSE non-f64/c128 dtypes (the handler dispatches on the buffer
+  dtype; the message names the fix);
+* read at FACTORY time → consumers key their kernel caches on it
+  (`bands_gemm_ffi_enabled()` resolves auto, `bands_gemm_ffi_mode()`
+  exposes the raw grammar).
 
 Measured (job 7879010, P=64, cache-cold, coll=mpi): nb=128 staged
 project_rs 29.407→19.622 s (−33%), prod sigma.exec 58.313→49.224;
@@ -206,6 +231,56 @@ nb=256 composed 20.565→14.162 / 35.234→29.979.  Parity exact-0 .dat,
 h5 ≤2.5e-14 eV, reduce-scatter payloads byte-equal off-vs-on.  Build:
 `config/frontera/build_ffi_host.sh` (the TU rides the existing MKL link
 line; see the mklblas block in `src/ffi/common/cpp/host/CMakeLists.txt`).
+
+**Configure-time probe caveat (2026-07-29, cost a gate cycle):** the
+`check_symbol_exists` probe links a try_compile EXECUTABLE, where `ld`
+defaults to `--no-allow-shlib-undefined` and demands the *whole*
+shared-library closure resolve — which the real target (a `.so`) never
+has to.  On Frontera that produced a FALSE NEGATIVE twice (jobs
+7879278/7879281 both compiled the slow plain-GEMM loop against an MKL
+that *has* the batched entry): first from BLACS's open `MPI_*`
+references, then — after adding `libmpi` to close them — from `libmpi`'s
+own `fi_*@FABRIC_*` references (libfabric is on `LD_LIBRARY_PATH` at run
+time, not on the link search path).  The probe therefore sets
+`CMAKE_REQUIRED_LINK_OPTIONS=-Wl,--allow-shlib-undefined`, which
+tolerates undefined symbols *inside the dependency libraries* while
+still hard-failing on an undefined reference from the probe's own
+object — exactly the question being asked.  **If you port this to a
+non-GNU linker and the flag is rejected, the probe simply fails and the
+portable plain-GEMM loop is compiled: slower, never wrong.**  Read the
+configure log line (`mklblas: GEMM host handler ON — batched entry …`
+vs `… — plain cblas_?gemm loop …`) rather than assuming.
+
+**Platform reach of this module (CPU/GPU sweep, 2026-07-29).**  The
+primitive itself is backend-neutral and *supported on both platforms*:
+the `shard_map` bodies are `jnp.einsum` + `jax.lax.psum_scatter` +
+`jax.lax.complex` only, so a CUDA mesh lowers the same staged chain
+through NCCL reduce-scatter.  The three platform-conditional pieces, and
+what each does on GPU:
+
+* **the FFI GEMM body** — never lowered on GPU.  `lorrax_mklblas_gemm_batch`
+  is registered in `ffi_loader`'s **host table only**, so even a forced
+  probe on CUDA reports *unknown target*; auto resolves OFF from
+  `JAX_PLATFORMS` before any probe, the factory re-checks
+  `mesh.devices.flat[0].platform`, and an explicit `=1` refuses.  A GPU
+  user never sees this dial engage and never needs to unset it — the
+  native `dot` → cuBLAS lowering is what runs, by design.
+* **`ensure_grouped_collectives_ready()`** — a no-op on GPU: it returns
+  early unless `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`, a CPU-backend
+  variable (§3.5).  GPU meshes have no equivalent ordering contract here.
+* **the mesh-minor-axis refusal** (§3.2) — *stays* on GPU and is stated
+  in device-order terms, not CPU terms: only the LAST mesh axis has
+  consecutive-rank replica groups on the standard process-ordered device
+  layout, so that is where the large partial must reduce-scatter.  On a
+  multi-node GPU mesh built row-major from `jax.devices()` the minor axis
+  is likewise the intra-node one, so the same `axes=(major, minor)` rule
+  applies; a hand-permuted GPU device mesh will hit the refusal and must
+  pass `axes` matching its own layout.
+
+The one GPU gap to be honest about: **no GPU execution of this primitive
+has been run.**  Everything above is a code + platform-table reading, not
+a measurement — the campaign's meshes are all CPU.  Nothing GPU-specific
+is *claimed* to be fast, only to resolve sanely.
 
 ### 3.5 The impl=mpi world-collective-first warm-up contract
 
@@ -314,10 +389,30 @@ by no one yet, NOT wired — is `wk_REL/contract_bands_notes.md` §6:
   compose.  Trial-stacking the collectives (4b→4) needs a two-phase
   primitive variant (stage-1 GEMM inside the scan, stacked collectives
   after) — an API decision that belongs to the owner, flagged there.
-* `bse_ring_comm._apply_W_from_T` (TDA and non-TDA): clean
-  `extra="leading"` drop-in — those paths already materialize the
-  b-stacked T, so the stack axis is free, and adoption converts
-  partitioner-chosen collectives into the structural chain.
+* `bse_ring_comm._apply_W_from_T` (TDA and non-TDA): **ADOPTED
+  2026-07-29** (owner order) — clean `extra="leading"` drop-in: those
+  paths already materialize the b-stacked T, so the stack axis is free,
+  and the adoption converts the partitioner-chosen collectives of the
+  historical einsum pair into the structural stacked psum_scatter chain
+  (large payload on the node-local 'y' groups, one collective per mesh
+  axis for all b trials).  Rank-local transposes bridge the conv layout
+  (`(b,M,N,t,s,k)` → the primitive's k-leading O) and ψ_v; they compose
+  with the future flat-k conv layout of the 6.1 route (a).  Value-level
+  identical (1e-12 gate class).  The fp32-GMRES path's complex64
+  operands ride the primitive's XLA lowering (the FFI dial's dtype
+  boundary — auto quietly falls back, explicit `=1` refuses).  Both
+  builders lower unchanged on a CUDA mesh (the body is `einsum` +
+  `psum_scatter`; the GEMM dial is CPU-only and simply stays off there).
+* **Not** part of that adoption, and easy to over-read: the same
+  2026-07-29 sweep routed BSE's remaining raw `jnp.fft` calls through
+  `fft_helpers.local_ifftn3`/`local_fftn3`.  Those are **aliases of
+  `jnp.fft`** — call-site hygiene ("one source for the local FFT"), NOT
+  a backend switch.  `LORRAX_FFT_FFI` only reaches `make_flat_k_*` sites
+  and BSE has none, so BSE is unaffected by that flag (and by the cuFFT
+  mirror) on **both** platforms until a real flat-k adoption lands.  The
+  aliases being dtype-agnostic is load-bearing: BSE's fp32-GMRES FFTs
+  are complex64 and the flat-k FFI handlers are c128-only on cpu *and*
+  CUDA, so routing them at the flat-k layer would have to refuse them.
 * `vq_interp.make_eval_vq`: honestly NOT a contract_bands instance
   (outer-product class — the contracted axis is replicated, the sharded
   axes are outputs).  Needs a structural sibling, not this primitive.

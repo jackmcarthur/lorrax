@@ -33,6 +33,7 @@ from solvers.chebyshev import (
 from .bse_ring_comm import build_bse_ring_matvec, build_bse_ring_matvec_full, make_bse_shardings
 from .bse_feast import estimate_spectral_bounds_sharded, _create_mesh_xy, _build_gmres_data_fp32
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
+from common.fft_helpers import local_ifftn3
 import common.timing as timing
 
 jax.config.update("jax_enable_x64", True)
@@ -155,7 +156,7 @@ def run_kpm_dos(
         }
     )
     if include_W:
-        data_fp32["W_R"] = jnp.fft.ifftn(data_fp32["W_q"], axes=(2, 3, 4), norm="ortho")
+        data_fp32["W_R"] = local_ifftn3(data_fp32["W_q"], axes=(2, 3, 4), norm="ortho")
     else:
         data_fp32["W_R"] = data_fp32["W_q"]
 

@@ -33,6 +33,7 @@ from .bse_ring_comm import (
     make_bse_shardings,
 )
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
+from common.fft_helpers import local_ifftn3
 import common.timing as timing
 
 jax.config.update("jax_enable_x64", True)
@@ -177,7 +178,7 @@ def _feast_filter(
     if gmres_fp32:
         data_gmres = _build_gmres_data_fp32(data)
         if "W_q" in data_gmres:
-            data_gmres["W_R"] = jnp.fft.ifftn(data_gmres["W_q"], axes=(2, 3, 4), norm="ortho")
+            data_gmres["W_R"] = local_ifftn3(data_gmres["W_q"], axes=(2, 3, 4), norm="ortho")
         diag_h_gmres = _cast_with_sharding(diag_h, jnp.float32)
         runner_dtype = jnp.complex64
 
@@ -248,7 +249,7 @@ def run_pseudopoles(
         )
 
     if include_W:
-        data["W_R"] = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
+        data["W_R"] = local_ifftn3(data["W_q"], axes=(2, 3, 4), norm="ortho")
     else:
         data["W_R"] = data["W_q"]
 

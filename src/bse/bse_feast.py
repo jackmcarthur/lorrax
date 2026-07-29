@@ -31,6 +31,7 @@ from .bse_ring_comm import build_bse_ring_matvec, build_bse_ring_matvec_full, ma
 from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_preconditioner import energy_diff_cv_k
 import common.timing as timing
+from common.fft_helpers import local_ifftn3
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
 
 jax.config.update("jax_enable_x64", True)
@@ -81,7 +82,9 @@ def ensure_W_R(data: dict, include_W: bool) -> dict:
     must call this before invoking a matvec.  Mutates and returns ``data``.
     """
     if include_W:
-        data["W_R"] = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
+        # fft_helpers is THE single FFT entry point (owner rule) — raw
+        # jnp.fft is not called from BSE (2026-07-29 sweep).
+        data["W_R"] = local_ifftn3(data["W_q"], axes=(2, 3, 4), norm="ortho")
     else:
         data["W_R"] = data["W_q"]
     return data

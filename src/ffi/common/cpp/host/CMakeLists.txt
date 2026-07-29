@@ -275,37 +275,6 @@ if(LORRAX_HOST_HAVE_SLATE)
                         "refuse at runtime).")
                 endif()
 
-                # ------------------------------------------------------
-                # MKL batched-GEMM host handler (mklblas/cpp/
-                # gemm_batch_ffi.cc; contract_bands FFI GEMM body,
-                # 2026-07-28 — RESHARD_OVERHEAD_MEMO Sec. 4.4 exit (b)).
-                # cblas_{d,z}gemm_batch ride the SAME MKL link line as
-                # ScaLAPACK/DFTI above (mkl_intel_lp64/threading/core —
-                # zero new link deps); needs only mkl_cblas.h.  Compiled
-                # -fopenmp for omp_get_max_threads() in its thread-cap
-                # policy (gomp already linked via mkl_gnu_thread).
-                # ------------------------------------------------------
-                if(EXISTS "${_mkl_incdir}/mkl_cblas.h")
-                    list(APPEND LORRAX_FFI_HOST_SOURCES
-                        ../../../mklblas/cpp/gemm_batch_ffi.cc)
-                    if(NOT LORRAX_MKLFFT_INCLUDE_DIR)
-                        set(LORRAX_MKLFFT_INCLUDE_DIR "${_mkl_incdir}")
-                    endif()
-                    if(NOT LORRAX_MKL_THREAD_LIB STREQUAL "mkl_gnu_thread")
-                        list(APPEND _scalapack_link "-lgomp")
-                    endif()
-                    set_source_files_properties(
-                        ../../../mklblas/cpp/gemm_batch_ffi.cc
-                        PROPERTIES COMPILE_OPTIONS "-fopenmp")
-                    message(STATUS
-                        "mklblas: MKL batched-GEMM host handler ON "
-                        "(headers at ${_mkl_incdir})")
-                else()
-                    message(STATUS
-                        "mklblas: ${_mkl_incdir}/mkl_cblas.h not found — "
-                        "batched-GEMM handler skipped (LORRAX_BANDS_GEMM_FFI "
-                        "will refuse at runtime).")
-                endif()
             else()
                 set(_scalapack_link "")
                 message(WARNING
@@ -316,6 +285,102 @@ if(LORRAX_HOST_HAVE_SLATE)
                     "Set -DLORRAX_MKL_ROOT (or \$MKLROOT), or pass a full "
                     "-DLORRAX_SCALAPACK_LIBRARIES link line.")
             endif()
+        endif()
+
+        # --------------------------------------------------------------
+        # Vendor-BLAS GEMM host handler (mklblas/cpp/gemm_batch_ffi.cc;
+        # contract_bands FFI GEMM body, 2026-07-28 —
+        # RESHARD_OVERHEAD_MEMO Sec. 4.4 exit (b)).  VENDOR-PORTABLE
+        # since 2026-07-29 (owner order): it builds against ANY standard
+        # CBLAS on the resolved linalg link line — Intel MKL via
+        # mkl_cblas.h (the Frontera path; zero new link deps) OR Cray
+        # LibSci / OpenBLAS / BLIS via cblas.h (the explicit
+        # -DLORRAX_SCALAPACK_LIBRARIES route).  cblas_?gemm_batch is an
+        # MKL EXTENSION (OpenBLAS ships it too) and is resolved AT
+        # RUNTIME BY dlsym inside the TU — present -> the batched entry;
+        # absent -> the TU's portable plain cblas_{d,z}gemm loop; the
+        # live entry is announced on first use.  There is deliberately
+        # NO build-time feature probe (see the note further down).  Works
+        # in principle with Intel MKL or Cray LibSci; TESTED WITH INTEL
+        # ONLY so far.  Compiled -fopenmp for omp_get_max_threads() in
+        # its thread-cap policy.
+        #
+        # NOTE (order coupling, deliberate but worth knowing): _mkl_incdir
+        # is set only by the MKL branch of the ScaLAPACK resolution above.
+        # On the explicit -DLORRAX_SCALAPACK_LIBRARIES route it is unset,
+        # so the header falls through to find_path(cblas.h).  That is the
+        # intended behaviour, but it does mean the GEMM handler's header
+        # choice is downstream of how ScaLAPACK resolved.  Both outcomes
+        # build a working handler, so the coupling cannot produce a
+        # silently-degraded binary — only a different #include.
+        # --------------------------------------------------------------
+        set(_gemm_cblas_header "")
+        set(_gemm_cblas_incdir "")
+        if(_mkl_incdir AND EXISTS "${_mkl_incdir}/mkl_cblas.h")
+            set(_gemm_cblas_header "mkl_cblas.h")
+            set(_gemm_cblas_incdir "${_mkl_incdir}")
+        else()
+            find_path(LORRAX_CBLAS_INCLUDE_DIR cblas.h
+                HINTS "$ENV{CRAY_LIBSCI_PREFIX_DIR}/include"
+                      "$ENV{LORRAX_CBLAS_DIR}/include"
+                      "$ENV{LORRAX_CBLAS_DIR}")
+            if(LORRAX_CBLAS_INCLUDE_DIR)
+                set(_gemm_cblas_header "cblas.h")
+                set(_gemm_cblas_incdir "${LORRAX_CBLAS_INCLUDE_DIR}")
+            endif()
+        endif()
+        if(_gemm_cblas_header)
+            # NO FEATURE PROBE HERE — deliberate (owner order 2026-07-29).
+            # Whether this BLAS has the cblas_?gemm_batch extension is
+            # decided AT RUNTIME by dlsym inside the TU, the same way the
+            # MKL thread pin resolves MKL_Set_Num_Threads_Local
+            # (scalapack/cpp/blacs_grid.h).  One binary serves Intel MKL
+            # and Cray LibSci; the live entry is announced on first use.
+            #
+            # Why the probe was removed rather than fixed: a link-based
+            # check_symbol_exists answers "no" for ENVIRONMENTAL reasons,
+            # and its "no" silently selects the ~1.6-1.9x slower plain
+            # loop.  It did exactly that on Frontera twice, for two
+            # different link-closure reasons (jobs 7879278/7879281 — a
+            # try_compile EXECUTABLE must close the whole shared-library
+            # graph, so BLACS's open MPI_* refs failed it, and then
+            # libmpi's own fi_*@FABRIC_* refs failed it again).  A
+            # build-time question whose wrong answer is invisible and
+            # costly does not belong in the build.  Runtime dlsym asks it
+            # in the process that makes the call, with no CMake state set
+            # and unset around a probe and nothing order-dependent.
+            #
+            # What remains below is a plain EXISTS test choosing which
+            # CBLAS header to include.  That is not a probe in the same
+            # sense: its failure mode is "GEMM handler not built at all",
+            # announced right here and refused loudly at runtime — never
+            # "built, but silently slow".
+            list(APPEND LORRAX_FFI_HOST_SOURCES
+                ../../../mklblas/cpp/gemm_batch_ffi.cc)
+            set(LORRAX_MKLBLAS_INCLUDE_DIR "${_gemm_cblas_incdir}")
+            set(_gemm_defs "")
+            if(_gemm_cblas_header STREQUAL "mkl_cblas.h")
+                list(APPEND _gemm_defs "LORRAX_MKLBLAS_MKL_HEADER=1")
+            endif()
+            message(STATUS
+                "mklblas: GEMM host handler ON (${_gemm_cblas_header} at "
+                "${_gemm_cblas_incdir}); batched-vs-plain entry is chosen "
+                "at RUNTIME by dlsym and announced on first use — no "
+                "build-time feature probe by design")
+            set_source_files_properties(
+                ../../../mklblas/cpp/gemm_batch_ffi.cc
+                PROPERTIES COMPILE_OPTIONS "-fopenmp"
+                           COMPILE_DEFINITIONS "${_gemm_defs}")
+            # gomp for the TU's omp_get_max_threads(); harmless duplicate
+            # when the MKL branch already appended it via mkl_gnu_thread.
+            list(APPEND _scalapack_link "-lgomp")
+        else()
+            message(STATUS
+                "mklblas: no CBLAS header found (mkl_cblas.h under the "
+                "MKL prefix, or cblas.h — set LORRAX_CBLAS_DIR / "
+                "CRAY_LIBSCI_PREFIX_DIR) — GEMM handler skipped "
+                "(LORRAX_BANDS_GEMM_FFI=1 will refuse at runtime; the "
+                "auto default stays on the XLA lowering).")
         endif()
         list(APPEND _host_link_libs ${_scalapack_link})
     else()
@@ -354,6 +419,12 @@ target_include_directories(lorrax_ffi_host PRIVATE
 if(LORRAX_MKLFFT_INCLUDE_DIR)
     target_include_directories(lorrax_ffi_host PRIVATE
         "${LORRAX_MKLFFT_INCLUDE_DIR}")
+endif()
+if(LORRAX_MKLBLAS_INCLUDE_DIR)
+    # CBLAS headers for the GEMM handler (same dir as mklfft under MKL;
+    # the LibSci/OpenBLAS cblas.h dir on non-MKL builds).
+    target_include_directories(lorrax_ffi_host PRIVATE
+        "${LORRAX_MKLBLAS_INCLUDE_DIR}")
 endif()
 if(LORRAX_FFI_HAVE_PHDF5)
     target_include_directories(lorrax_ffi_host PRIVATE

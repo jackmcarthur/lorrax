@@ -13,6 +13,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from runtime.padding import padded_mu_extent
+from common.fft_helpers import local_fftn3, local_ifftn3
 
 from .bse_serial import compute_pair_amplitude
 
@@ -710,9 +711,9 @@ def _interpolate_bse_data_to_grid(
 
     # ── W direct: coarse W_q → ifft(R) → zero-pad R → fine → fft back ─────
     W_sh = NamedSharding(mesh_xy, P("x", "y", None, None, None))
-    W_R_coarse = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
+    W_R_coarse = local_ifftn3(data["W_q"], axes=(2, 3, 4), norm="ortho")
     W_R_fine = pad_W_R_to_grid(W_R_coarse, fine_grid)
-    W_q_fine = jnp.fft.fftn(W_R_fine, axes=(2, 3, 4), norm="ortho")
+    W_q_fine = local_fftn3(W_R_fine, axes=(2, 3, 4), norm="ortho")
     W_q_fine = jax.device_put(W_q_fine, W_sh)
     log_fn(f"[bse_k_grid] W zero-padded in R "
            f"{coarse_grid[0]}x{coarse_grid[1]}x{coarse_grid[2]}→"

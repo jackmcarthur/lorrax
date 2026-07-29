@@ -1,7 +1,43 @@
-// gemm_batch_ffi.cc — MKL batched-GEMM host handler, HOST platform (JAX CPU
-// backend).  The gated CPU GEMM body of the contract_bands_block_reshard
-// primitive (src/common/contract_bands.py, LORRAX_BANDS_GEMM_FFI) —
-// wk_REL/RESHARD_OVERHEAD_MEMO.md Sec. 4.4 exit (b) / Sec. 7 lever 1.
+// gemm_batch_ffi.cc — vendor-BLAS batched-GEMM host handler, HOST platform
+// (JAX CPU backend).  The gated CPU GEMM body of the
+// contract_bands_block_reshard primitive (src/common/contract_bands.py,
+// LORRAX_BANDS_GEMM_FFI) — wk_REL/RESHARD_OVERHEAD_MEMO.md Sec. 4.4 exit
+// (b) / Sec. 7 lever 1.
+//
+// VENDOR PORTABILITY (2026-07-29, owner order): cblas_?gemm_batch is an
+// MKL EXTENSION of CBLAS (OpenBLAS ships it too; Cray LibSci does not).
+// The choice is made AT RUNTIME BY dlsym — there is NO build-time feature
+// probe and no HAVE_BATCH macro:
+//   cblas_{d,z}gemm_batch resolve  -> ONE batched call per invocation;
+//   either one missing              -> portable fallback: a loop of plain
+//                                     cblas_{d,z}gemm calls (standard
+//                                     CBLAS — MKL / LibSci / OpenBLAS /
+//                                     BLIS all serve those), each GEMM
+//                                     threaded internally by the vendor.
+// ONE BINARY SERVES EITHER VENDOR.  Rationale (owner order 2026-07-29,
+// after the probe cost a gate cycle): a link-based CMake
+// check_symbol_exists silently downgraded THIS handler to the slow loop
+// on an MKL that has the batched entry, twice, for two different
+// link-closure reasons (jobs 7879278/7879281 — see
+// wk_REL/gemm_portability_bse_notes.md).  A build-time probe that can
+// answer "no" for environmental reasons is a footgun: the failure is
+// invisible and costs 1.6-1.9x.  dlsym asks the question in the process
+// that will actually make the call, using the SAME house idiom as the
+// MKL thread pin below (blacs_grid.h's MklThreadScope) — zero link
+// dependency, no CMake state set/unset around a probe, nothing to get
+// out of order.  The prototypes are declared HERE as function-pointer
+// typedefs, so the TU never needs a header that declares the batched
+// entry (plain <cblas.h> on LibSci/OpenBLAS is enough).
+//   LORRAX_MKLBLAS_MKL_HEADER  defined -> compile against <mkl_cblas.h>
+//                              (MKL builds); undefined -> <cblas.h>.
+//                              A plain EXISTS test in CMake, not a
+//                              probe: its failure mode is "handler not
+//                              built at all" (loud), never "built slow".
+// WHICH ENTRY IS LIVE IS ANNOUNCED ON FIRST USE, UNCONDITIONALLY (see
+// announce_entry_once below) — a silent downgrade is impossible by
+// construction, which is the whole point of the redesign.
+// Works in principle with Intel MKL or Cray LibSci; TESTED WITH INTEL
+// ONLY so far (Frontera MKL 2020.1, batched entry — jobs 7879008/7879010).
 //
 // WHY IT EXISTS: the primitive's large right contraction is the measured
 // Σ project_rs wall — XLA:CPU runs it through Eigen at 295 GF/s (promoted
@@ -17,8 +53,8 @@
 //   MklBlasGemmBatchHostFfi (target lorrax_mklblas_gemm_batch)
 //       A (BA, M, K), B (BB, K, N)  ->  C (BA, M, N),  BA % BB == 0,
 //       C[i] = A[i] @ B[i % BB]     (row-major, NoTrans/NoTrans),
-//       dtype f64 (cblas_dgemm_batch) or c128 (cblas_zgemm_batch), both
-//       operands the SAME dtype (the primitive's de-promotion policy
+//       dtype f64 (cblas_dgemm[_batch]) or c128 (cblas_zgemm[_batch]),
+//       both operands the SAME dtype (the primitive's de-promotion policy
 //       guarantees no mixed real/complex GEMM ever reaches this point).
 //   The B-cycling broadcast rule serves both the plain per-k batch
 //   (BA == BB == nk) and the extra-stacked batch (BA == E·nk vs the
@@ -28,7 +64,8 @@
 // (BA, M, K)/(BB, K, N) operand buffer, so no input_output_aliases are
 // declared (contrast the in-place mklfft handlers, where shapes match).
 //
-// Threading: ONE cblas_*gemm_batch call per invocation; MKL parallelizes
+// Threading: ONE cblas_*gemm_batch call per invocation (or the plain-GEMM
+// loop, one internally-threaded GEMM per slot); MKL parallelizes
 // internally.  The calling (XLA host-callback) thread pins MKL to
 // LORRAX_MKLBLAS_THREADS (auto = ambient omp_get_max_threads(), i.e. the
 // harness's OMP_NUM_THREADS under taskset; strict grammar per the AW audit
@@ -50,6 +87,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -57,7 +95,11 @@
 #include <dlfcn.h>
 #include <omp.h>
 
+#if defined(LORRAX_MKLBLAS_MKL_HEADER)
 #include <mkl_cblas.h>
+#else
+#include <cblas.h>              // standard CBLAS (LibSci / OpenBLAS / BLIS)
+#endif
 
 #include "xla/ffi/api/ffi.h"
 
@@ -65,6 +107,113 @@ namespace lorrax_ffi::mklblas {
 
 namespace ffi = ::xla::ffi;
 using C128 = std::complex<double>;
+
+// LP64 CBLAS integer.  MKL_INT under <mkl_cblas.h>; plain int for the
+// standard CBLAS headers (LibSci/OpenBLAS/BLIS lp64 — the only builds
+// LORRAX links; no ILP64 variant is configured anywhere in this repo).
+#if defined(LORRAX_MKLBLAS_MKL_HEADER)
+using blas_int = MKL_INT;
+#else
+using blas_int = int;
+#endif
+
+// ---------------------------------------------------------------------------
+//  Runtime symbol resolution (the house idiom: blacs_grid.h's MklThreadScope,
+//  cufft/cpp's driver-API entries, mklfft/cpp's pin — all dlsym).
+//
+//  RTLD_DEFAULT searches the process's global symbol scope.  That is the
+//  right handle here because ffi_loader.get_lib() dlopens this .so with
+//  ctypes.CDLL(..., mode=RTLD_GLOBAL) (ffi_loader.py:514), which publishes
+//  the library AND its DT_NEEDED closure — libmkl_intel_lp64 among them —
+//  into that scope.  RTLD_NEXT is tried as a second chance for the case
+//  where this object was loaded into a local scope instead; if BOTH miss,
+//  we take the plain-GEMM loop AND SAY SO (announce_entry_once).  There is
+//  deliberately no third mechanism: an unresolved symbol here is a correct,
+//  announced capability answer, not an error to work around.
+// ---------------------------------------------------------------------------
+static void* resolve_sym(const char* name) {
+    void* p = dlsym(RTLD_DEFAULT, name);
+#ifdef RTLD_NEXT
+    if (p == nullptr) p = dlsym(RTLD_NEXT, name);
+#endif
+    return p;
+}
+
+// Batched-GEMM entry points, declared HERE as function-pointer typedefs so
+// no header needs to declare them (that is what frees the TU from
+// mkl_cblas.h).  The CBLAS enum parameters are typed `int`: every CBLAS
+// spells its enums differently (CBLAS_LAYOUT / CBLAS_ORDER) but they are
+// plain C enums with small values, i.e. int-sized and int-passed on every
+// ABI this project builds for.  The integer parameters use blas_int, which
+// IS the vendor's index type by the same rule as the plain entries below.
+using dgemm_batch_fn = void (*)(int, const int*, const int*,
+                                const blas_int*, const blas_int*,
+                                const blas_int*, const double*,
+                                const double**, const blas_int*,
+                                const double**, const blas_int*,
+                                const double*, double**, const blas_int*,
+                                blas_int, const blas_int*);
+using zgemm_batch_fn = void (*)(int, const int*, const int*,
+                                const blas_int*, const blas_int*,
+                                const blas_int*, const void*,
+                                const void**, const blas_int*,
+                                const void**, const blas_int*,
+                                const void*, void**, const blas_int*,
+                                blas_int, const blas_int*);
+
+struct BatchedEntries {
+    dgemm_batch_fn d = nullptr;
+    zgemm_batch_fn z = nullptr;
+    // BOTH or NEITHER: a BLAS that served only one would make the handler's
+    // behaviour dtype-dependent for no benefit, and no real BLAS does that.
+    bool ok() const { return d != nullptr && z != nullptr; }
+};
+
+static const BatchedEntries& batched_entries() {
+    static const BatchedEntries e = [] {
+        BatchedEntries b;
+        b.d = reinterpret_cast<dgemm_batch_fn>(
+            resolve_sym("cblas_dgemm_batch"));
+        b.z = reinterpret_cast<zgemm_batch_fn>(
+            resolve_sym("cblas_zgemm_batch"));
+        return b;
+    }();
+    return e;
+}
+
+// Announce on rank 0 (or when the launcher is unknown — tests, single
+// process).  Reading the launcher's rank env is enough: this TU is
+// comms-free by design and must not link MPI.
+static bool announce_here() {
+    for (const char* v : {"SLURM_PROCID", "PMI_RANK", "OMPI_COMM_WORLD_RANK"}) {
+        const char* s = std::getenv(v);
+        if (s != nullptr && *s != '\0') return std::strcmp(s, "0") == 0;
+    }
+    return true;
+}
+
+// UNCONDITIONAL (not behind LORRAX_MKLBLAS_LOG): which entry is live must
+// always be visible in the log, so a silent downgrade cannot happen.  Once
+// per process, at first use.
+static void announce_entry_once() {
+    static std::atomic<bool> once{false};
+    if (once.exchange(true)) return;
+    if (!announce_here()) return;
+    const BatchedEntries& e = batched_entries();
+    if (e.ok()) {
+        std::fprintf(stderr,
+                     "[mklblas] GEMM entry: cblas_?gemm_batch (batched) — "
+                     "resolved by dlsym at first use.\n");
+    } else {
+        std::fprintf(stderr,
+                     "[mklblas] GEMM entry: plain cblas_?gemm loop — this "
+                     "BLAS does not export cblas_%sgemm_batch (dlsym), so "
+                     "the portable per-slot loop is used.  Correct, ~1.6-1.9x "
+                     "below the batched entry on MKL.\n",
+                     e.d == nullptr ? "d" : "z");
+    }
+    std::fflush(stderr);
+}
 
 // ---------------------------------------------------------------------------
 //  MKL thread pinning (workstream-AW pattern; dlsym so no extra link dep and
@@ -74,7 +223,7 @@ using mkl_set_local_fn = int (*)(int);
 
 static mkl_set_local_fn mkl_set_num_threads_local_ptr() {
     static mkl_set_local_fn fn = reinterpret_cast<mkl_set_local_fn>(
-        dlsym(RTLD_DEFAULT, "MKL_Set_Num_Threads_Local"));
+        resolve_sym("MKL_Set_Num_Threads_Local"));
     return fn;
 }
 
@@ -174,27 +323,41 @@ static ffi::Error GemmBatchDispatch(
     if (ba == 0 || m == 0 || n == 0) return ffi::Error::Success();
 
     const int nthr = team_threads();
+    // Capability answer + announcement BEFORE any work, so the log records
+    // which entry ran even if the GEMM below aborts.
+    announce_entry_once();
+    const BatchedEntries& batched = batched_entries();
+    const bool use_batched = batched.ok();
+
     if (log_enabled()) {
         static std::atomic<bool> once{false};
         if (!once.exchange(true)) {
+            const char* entry = use_batched
+                ? "cblas_?gemm_batch (batched entry)"
+                : "cblas_?gemm loop (no batched entry in this BLAS)";
             std::fprintf(stderr,
                          "[mklblas] gemm_batch first call: dtype=%s BA=%ld "
-                         "BB=%ld M=%ld N=%ld K=%ld threads=%d\n",
+                         "BB=%ld M=%ld N=%ld K=%ld threads=%d via %s\n",
                          dt == ffi::DataType::F64 ? "f64" : "c128",
-                         (long)ba, (long)bb, (long)m, (long)n, (long)k, nthr);
+                         (long)ba, (long)bb, (long)m, (long)n, (long)k,
+                         nthr, entry);
         }
     }
 
+    const blas_int gm = (blas_int)m, gn = (blas_int)n, gk = (blas_int)k;
+    const blas_int lda = gk, ldb = gn, ldc = gn;
+
+    MklLocalPin pin(nthr);  // the vendor BLAS threads each call internally
+                            // (dlsym'd MKL pin; a no-op on non-MKL BLAS,
+                            // where OMP_NUM_THREADS et al. govern)
+    if (use_batched) {
     // One group; per-batch pointer arrays express the B-cycling broadcast
     // (a constant-stride API cannot: A's batch walks e·nk while B's walks
     // k only).  Pointer-array setup is O(BA) — noise next to the GEMMs.
-    const CBLAS_TRANSPOSE trans = CblasNoTrans;
-    const MKL_INT gm = (MKL_INT)m, gn = (MKL_INT)n, gk = (MKL_INT)k;
-    const MKL_INT lda = gk, ldb = gn, ldc = gn;
-    const MKL_INT group_count = 1;
-    const MKL_INT group_size = (MKL_INT)ba;
-
-    MklLocalPin pin(nthr);  // MKL threads the batch internally
+    const int layout = (int)CblasRowMajor;
+    const int trans = (int)CblasNoTrans;
+    const blas_int group_count = 1;
+    const blas_int group_size = (blas_int)ba;
     if (dt == ffi::DataType::F64) {
         const double* a = static_cast<const double*>(A.untyped_data());
         const double* b = static_cast<const double*>(B.untyped_data());
@@ -207,9 +370,9 @@ static ffi::Error GemmBatchDispatch(
             cp[i] = c + i * m * n;
         }
         const double alpha = 1.0, beta = 0.0;
-        cblas_dgemm_batch(CblasRowMajor, &trans, &trans, &gm, &gn, &gk,
-                          &alpha, ap.data(), &lda, bp.data(), &ldb,
-                          &beta, cp.data(), &ldc, group_count, &group_size);
+        batched.d(layout, &trans, &trans, &gm, &gn, &gk,
+                  &alpha, ap.data(), &lda, bp.data(), &ldb,
+                  &beta, cp.data(), &ldc, group_count, &group_size);
     } else {
         const C128* a = static_cast<const C128*>(A.untyped_data());
         const C128* b = static_cast<const C128*>(B.untyped_data());
@@ -222,9 +385,38 @@ static ffi::Error GemmBatchDispatch(
             cp[i] = c + i * m * n;
         }
         const C128 alpha(1.0, 0.0), beta(0.0, 0.0);
-        cblas_zgemm_batch(CblasRowMajor, &trans, &trans, &gm, &gn, &gk,
-                          &alpha, ap.data(), &lda, bp.data(), &ldb,
-                          &beta, cp.data(), &ldc, group_count, &group_size);
+        batched.z(layout, &trans, &trans, &gm, &gn, &gk,
+                  &alpha, ap.data(), &lda, bp.data(), &ldb,
+                  &beta, cp.data(), &ldc, group_count, &group_size);
+    }
+    } else {
+    // Portable fallback: plain standard-CBLAS GEMMs, one per batch slot,
+    // same B-cycling broadcast rule.  Each GEMM is threaded internally by
+    // the vendor BLAS; the loop itself is sequential BY DESIGN (the
+    // batches are large-M×K tiles — an outer OpenMP loop would fight the
+    // BLAS's own team for the same cores).
+    if (dt == ffi::DataType::F64) {
+        const double* a = static_cast<const double*>(A.untyped_data());
+        const double* b = static_cast<const double*>(B.untyped_data());
+        double* c = static_cast<double*>(C->untyped_data());
+        for (int64_t i = 0; i < ba; ++i) {
+            cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        gm, gn, gk, 1.0, a + i * m * k, lda,
+                        b + (i % bb) * k * n, ldb,
+                        0.0, c + i * m * n, ldc);
+        }
+    } else {
+        const C128* a = static_cast<const C128*>(A.untyped_data());
+        const C128* b = static_cast<const C128*>(B.untyped_data());
+        C128* c = static_cast<C128*>(C->untyped_data());
+        const C128 alpha(1.0, 0.0), beta(0.0, 0.0);
+        for (int64_t i = 0; i < ba; ++i) {
+            cblas_zgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        gm, gn, gk, &alpha, a + i * m * k, lda,
+                        b + (i % bb) * k * n, ldb,
+                        &beta, c + i * m * n, ldc);
+        }
+    }
     }
     return ffi::Error::Success();
 }

@@ -6,6 +6,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
+from common.fft_helpers import local_fftn3, local_ifftn3
 from .bse_preconditioner import energy_diff_cv_k
 
 
@@ -58,11 +59,13 @@ def apply_bse_hamiltonian_single_device(
 
     R = jnp.einsum("kvsN,bcvk->bcksN", jnp.conj(psi_v), X)
     T = jnp.einsum("kctM,bcksN->bMNtsk", psi_c, R)
+    # FFTs through the fft_helpers local kernels ("ONE source for the
+    # local FFT") — single-device reference, values byte-identical.
     T_k = T.reshape(X.shape[0], n_rmu, n_rmu, nspinor, nspinor, nkx, nky, nkz)
-    T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm="ortho")
-    W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
+    T_R = local_ifftn3(T_k, axes=(5, 6, 7), norm="ortho")
+    W_R = local_ifftn3(W_q, axes=(2, 3, 4), norm="ortho")
     U_R = W_R[None, :, :, None, None, :, :, :] * T_R
-    U_q = jnp.fft.fftn(U_R, axes=(5, 6, 7), norm="ortho")
+    U_q = local_fftn3(U_R, axes=(5, 6, 7), norm="ortho")
     U = U_q.reshape(X.shape[0], n_rmu, n_rmu, nspinor, nspinor, nk)
     A = jnp.einsum("kctM,bMNtsk->bcNsk", jnp.conj(psi_c), U)
     W_term = jnp.einsum("kvsN,bcNsk->bcvk", psi_v, A) / sqrt_nk

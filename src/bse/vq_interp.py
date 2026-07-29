@@ -86,6 +86,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
+from common.fft_helpers import local_fftn3
 from ffi.linalg import plan as linalg_plan
 
 # pipeline constants (§13.5 production shape; reference values verbatim)
@@ -1486,7 +1487,7 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
     # relative to the phase-free FFT — omitting it decorates V by that
     # (μ,ν) phase (measured: 54% tile / 11% B error on the on-grid null).
     zeta_box = zeta.reshape(n_mu, zx["nx"], zx["ny"], zx["nz"])
-    ztG_box = jnp.fft.fftn(zeta_box, axes=(1, 2, 3), norm="backward") \
+    ztG_box = local_fftn3(zeta_box, axes=(1, 2, 3), norm="backward") \
         .reshape(n_mu, zx["n_rtot"])
     GS = _sphere_millers(zx, qw)
     fi = flat_idx(zx, GS)
