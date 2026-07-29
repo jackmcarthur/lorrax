@@ -143,7 +143,7 @@ def _project_ri_local(psi_xr_local, sigma_k_local, psi_yn_local):
     ``LORRAX_SIGMA_LAPLACE_MERGE=1`` they dispatch the merged single-chain
     body ``_project_x_local`` instead.
 
-    Two approved movement-only levers are applied on top:
+    Three approved movement-only levers are applied on top:
 
     * AK.9 stacking (scorecard, 2026-07-28): both channels' psum_scatter
       payloads ride ONE collective per mesh axis, stacked on a fresh
@@ -162,15 +162,58 @@ def _project_ri_local(psi_xr_local, sigma_k_local, psi_yn_local):
       payloads 2×40.9 MB vs 2×0.52 MB pre-swap).  Per-channel contraction
       order becomes ψ*·(σ·ψ) — same math/flops, value-level identical,
       gated by the 1e-12 parity suite (not claimed bit-exact).
+    * L-GEMM f64-split relowering (2026-07-28;
+      wk_REL/RESHARD_OVERHEAD_MEMO.md Sec. 4.4 exit (a) / Sec. 7 lever 1):
+      each channel's f64 × c128 right-einsum is expressed as TWO f64
+      dgemms against Re ψ / Im ψ plus one ``lax.complex`` recombine,
+      instead of one mixed-dtype einsum.  Mechanism fixed (HLO-proven,
+      reshard-ubench dump module_0009.jit__project_ri_reduce_scatter):
+      XLA promotes a mixed f64/c128 dot by CONVERTING the f64 channel
+      operand to c128 (a ~400 MB materialization per channel at
+      nb=128/P=64) and issues Eigen zgemm at 2× the mathematically
+      required flops — measured 295 GF/s vs 1263 GF/s for the same
+      contraction through BLAS.  The relowering changes ONLY the
+      representation of the complex ψ operand: the owner-held channel
+      algebra (independent σ_R / σ_I chains) is untouched, the
+      collectives are byte-identical (same stacked c128 payloads, same
+      2 psum_scatters/τ, same replica groups), and the small left dots
+      stay genuinely complex.  Value-level identical (the dgemm pair
+      sums the same products in a different order than the promoted
+      zgemm), NOT bit-exact — 1e-12 parity-gated.  Envelope: the flop
+      halving and the promotion-copy removal are shape-independent
+      (any n_atoms / N_μ / nb / nk / P); mixed-dtype dots promote on
+      GPU as well, so the relowering is neutral-or-better on both
+      backends (measured on XLA:CPU only).  MEASURED (job 7878942,
+      nb=128/μ=4962/P=64): project_rs 43.2 → 38.7 s FFI-fused staged
+      (−10.5%), sigma.exec 71.906 → 66.470 FFI-fused prod / 272.0 →
+      262.6 XLA prod; h5 tensors ≤2.2e-14 eV vs baseline.  Honest gap:
+      Eigen's f64 batched dot runs ~172 GF/s at these shapes (per-flop
+      BELOW its zgemm's 295), so the memo's BLAS-rate 19.8 s projection
+      needs the FFI MKL GEMM handler (memo Sec. 4.4 exit (b)) — named,
+      not done.  The MERGED body ``_project_x_local`` is deliberately
+      NOT f64-split — no promotion exists there and the split measured
+      as a regression (see its docstring).
 
-    Scale-neutral: both levers are flat in n_atoms / N_μ / nk / nb / P and
+    Scale-neutral: all levers are flat in n_atoms / N_μ / nk / nb / P and
     backend; no new N_μ²-sized object is created.
     """
+    # L-GEMM f64-split relowering (see docstring): decompose the complex ψ
+    # operand ONCE into its f64 parts; each real channel then rides two
+    # f64 dgemms.  No mixed-dtype einsum survives, so XLA has nothing to
+    # promote.  ψ_yn is (nk, s', μ_Y_loc, n) — small next to σ, and the
+    # extracts are shared by both channels (CSE'd within the module).
+    psi_yn_re = jnp.real(psi_yn_local)
+    psi_yn_im = jnp.imag(psi_yn_local)
+
     def _right(sigma_real_or_imag):
-        # 'ksxty' × 'ktyn' -> 'ksxn'  (contracts s', local μ_Y)
-        return jnp.einsum(
-            'ksxty,ktyn->ksxn',
-            sigma_real_or_imag, psi_yn_local, optimize=True)
+        # 'ksxty' × 'ktyn' -> 'ksxn'  (contracts s', local μ_Y) as TWO
+        # f64 dgemms (σ_ch·Re ψ, σ_ch·Im ψ) + complex recombine — the
+        # same contraction, real arithmetic only.
+        re = jnp.einsum('ksxty,ktyn->ksxn',
+                        sigma_real_or_imag, psi_yn_re, optimize=True)
+        im = jnp.einsum('ksxty,ktyn->ksxn',
+                        sigma_real_or_imag, psi_yn_im, optimize=True)
+        return jax.lax.complex(re, im)
 
     right_re = _right(jnp.real(sigma_k_local))
     right_im = _right(jnp.imag(sigma_k_local))
@@ -235,8 +278,26 @@ def _project_x_local(psi_xr_local, sigma_k_local, psi_yn_local):
     two-channel outputs (complex-GEMM association differs — not bit-exact);
     gated by the P=4 production-kernel S_R + i·S_I = X check at 1e-12 and
     the nb=128/nb=256 A/B parity suite.
+
+    L-GEMM f64-split NOT applied here — tried and REFUTED by measurement
+    (2026-07-28, job 7878942; patch preserved at
+    wk_REL/lgemm_full_2026-07-28.patch).  The two-channel body's L-GEMM
+    relowering fixes an f64→c128 PROMOTION — a pathology this body does
+    not have: its right contraction is genuinely complex × complex at
+    the mathematically minimal flop count already.  Lowering it as four
+    f64 dgemms (σψ = (σ_R ψ_re − σ_I ψ_im) + i(σ_R ψ_im + σ_I ψ_re))
+    kept 1e-12 parity but REGRESSED the composed nb=256 stack
+    (project_rs 24.6→25.5 s staged, sigma.exec 35.6→39.7 s prod vs
+    run_CHMERGE_l1mf): Eigen's f64 batched dot measured ~172 GF/s at
+    these shapes — BELOW its own zgemm's 295 GF/s per flop — so 4 dgemms
+    at the same flops lose ~60 ms/τ on Laplace windows.  The lever that
+    reaches BLAS rate (~1263 GF/s measured) for this body is the FFI MKL
+    GEMM handler (memo Sec. 4.4 exit (b)) — named, not done.  Measured
+    domain: MoS2 4×4, nb=256/μ=2475 (+ model at nb=128), XLA:CPU/Eigen,
+    P=64.
     """
     # 'ksxty' × 'ktyn' -> 'ksxn'  (contracts s', local μ_Y) — one complex GEMM
+    # (deliberately NOT f64-split; see the refutation note in the docstring).
     right = jnp.einsum('ksxty,ktyn->ksxn',
                        sigma_k_local, psi_yn_local, optimize=True)
     # ONE psum_scatter(y): (nk, s, μ_X_loc, n) → (nk, s, μ_X_loc, n/p_y)
@@ -294,6 +355,17 @@ def _make_project_ri_reduce_scatter(
         value-level (not bit-level) identical; gated by the 1e-12 output
         parity suite.  Scale-neutral: locality preference and message
         count are flat in n_atoms / N_μ / nk / nb / P and backend.
+      * L-GEMM f64-split relowering (2026-07-28, movement-only; details
+        + evidence in the body docstrings): the TWO-CHANNEL body's large
+        right-einsums are expressed as pure-f64 dgemms + a complex
+        recombine so XLA never promotes an f64 channel operand to c128
+        (no ~400 MB convert copies, no Eigen zgemm at 2× flops);
+        measured project_rs 43.2 → 38.7 s at nb=128 (job 7878942).  The
+        merged body keeps its single complex chain — no promotion exists
+        there and the split measured as a regression (its docstring
+        records the refutation).  Collectives, payload dtypes/shapes,
+        and the channel algebra are untouched; value-level identical,
+        1e-12 parity-gated.
     Channel plans (owner ruling 2026-07-28): ``merged_x=False`` (default)
     builds the two-channel (S_R, S_I) projector above — REQUIRED for
     crossing windows, whose consumer weights the channels independently and
