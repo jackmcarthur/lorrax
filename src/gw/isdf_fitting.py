@@ -431,21 +431,26 @@ def fit_zeta_to_h5(
         # cascade fires) and the logical centroid count so the charge
         # resolver can pick the mesh-invariant replicated dense Cholesky for
         # fit-size stacks (see _resolve_solver_kind_charge).
-        _resolved_solver_kind = _resolve_solver_kind(
-            mesh_xy, int(vertex_mu_L), solver_kind,
-            distributed_cholesky=distributed_cholesky,
-            distributed_lu=distributed_lu,
-            n_rmu=int(n_rmu), nq=int(C_q_flat.shape[0]),
-            charge_zeta_solve=charge_zeta_solve)
-        # Back-solve tier (input key ``distributed_zeta_solve``).  Sized on
-        # the PADDED mu extent — that is what actually crosses the
-        # all-gather inside the back-solve, and what the ScaLAPACK
-        # descriptors are built on for the ``distributed`` tier.
+        # ORDER MATTERS (capacity fix 2026-07-29, ladder notes R15.1).
+        # The back-solve tier is resolved FIRST because when it is
+        # ``distributed`` it REPLACES the charge factor wholesale a few lines
+        # below, and the replicated factor's capacity check must therefore not
+        # be enforced.  Enforcing it was capping mu at
+        # sqrt(4 GiB / 16 B) = 16,384 on the size of a buffer the distributed
+        # route never allocates.  ``_resolve_zeta_gather`` does not depend on
+        # the factor kind, so the reorder is free.
         _resolved_zeta_gather = _resolve_zeta_gather(
             distributed_zeta_solve,
             n_rmu=int(n_rmu_padded), nq=int(C_q_flat.shape[0]),
             mesh_xy=mesh_xy, vertex_mu_L=int(vertex_mu_L),
             charge_zeta_solve=charge_zeta_solve)
+        _resolved_solver_kind = _resolve_solver_kind(
+            mesh_xy, int(vertex_mu_L), solver_kind,
+            distributed_cholesky=distributed_cholesky,
+            distributed_lu=distributed_lu,
+            n_rmu=int(n_rmu), nq=int(C_q_flat.shape[0]),
+            charge_zeta_solve=charge_zeta_solve,
+            replicated_factor_used=(_resolved_zeta_gather != 'distributed'))
         if _resolved_zeta_gather == 'distributed':
             # The tier IS a charge-channel route: it replaces the whole
             # factor+back-solve pair, not just the gather granularity of

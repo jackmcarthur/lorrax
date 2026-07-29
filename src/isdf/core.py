@@ -1088,6 +1088,7 @@ def _resolve_solver_kind_charge(
     mesh_xy: Mesh, override: str = "auto",
     n_rmu: int | None = None, nq: int | None = None,
     charge_zeta_solve: str = "cholesky",
+    replicated_factor_used: bool = True,
 ) -> str:
     """Pick the charge-channel ζ-fit solver: fully-replicated dense
     Cholesky (mesh-invariant, the default for fit-size tiles) vs the
@@ -1173,6 +1174,19 @@ def _resolve_solver_kind_charge(
         # branch is only reached where the code raised before.
         if (charge_zeta_solve == 'rank_truncate'
                 and _replicate_rank_truncate_ok(nq, n_rmu)):
+            return 'replicated_rank_truncate'
+        if charge_zeta_solve == 'rank_truncate' and not replicated_factor_used:
+            # CAPACITY FIX (size campaign 2026-07-29, ladder notes R15.1).
+            # ``distributed_zeta_solve='distributed'`` REPLACES this factor
+            # wholesale with ``_factor_c_q_distributed_rank_truncate``, whose
+            # layout contract never replicates an O(mu^2) object at all
+            # (C_q/C+/V all P(None,'x','y'); only lambda (nq,mu) is
+            # replicated).  The caller overrides ``_resolved_solver_kind`` to
+            # 'distributed_rank_truncate' on the very next statement.  So
+            # enforcing the REPLICATED capacity here refuses a run on the
+            # size of a buffer that is never allocated -- it was capping mu at
+            # sqrt(4 GiB / 16 B) = 16,384 for a route that does not use the
+            # buffer.  Return the nominal kind and let the caller override.
             return 'replicated_rank_truncate'
         if charge_zeta_solve == 'rank_truncate':
             need = (int(nq) * int(n_rmu) ** 2 * 16 / 1024**3
@@ -1309,6 +1323,7 @@ def _resolve_solver_kind(
     n_rmu: int | None = None,
     nq: int | None = None,
     charge_zeta_solve: str = "cholesky",
+    replicated_factor_used: bool = True,
 ) -> str:
     """Single source of truth for the ``auto`` resolution.  Transverse
     channels (γ̃^i, μ_L≠0) take ``_resolve_solver_kind_transverse``;
@@ -1330,7 +1345,8 @@ def _resolve_solver_kind(
             mesh_xy, distributed_lu, n_rmu_logical=n_rmu)
     return _resolve_solver_kind_charge(
         mesh_xy, distributed_cholesky, n_rmu=n_rmu, nq=nq,
-        charge_zeta_solve=charge_zeta_solve)
+        charge_zeta_solve=charge_zeta_solve,
+        replicated_factor_used=replicated_factor_used)
 
 
 # Budget for the ζ back-solve's replicated-factor ALL-GATHER, i.e. the
