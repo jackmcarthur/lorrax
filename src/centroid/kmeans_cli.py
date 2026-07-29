@@ -193,12 +193,18 @@ def _build_mesh(args, n_points: int) -> tuple[Mesh, tuple[str, ...]]:
     (which uses ``load_centroids_band_chunked`` and friends) only has one
     codepath to worry about.
     """
+    from common.wfn_transforms import process_local_mesh
+
     devices = jax.devices()
     n_dev = len(devices)
     multi_host = jax.process_count() > 1
 
+    # Single-device fallbacks use THIS PROCESS's device, never
+    # ``jax.devices()[0]`` (the global list's first entry = process 0's device
+    # on every rank, a mesh no other rank can compute on).  At P=1 the two are
+    # the same object, so single-process behaviour is byte-identical.
     if args.no_shard or n_dev < 2:
-        return Mesh(np.asarray(devices[:1]).reshape(1, 1), ("x", "y")), ("x", "y")
+        return process_local_mesh(), ("x", "y")
 
     # Most-square 2-D factorisation (same recipe as ``gw_jax._build_mesh``).
     nx = max(k for k in range(1, int(math.isqrt(n_dev)) + 1) if n_dev % k == 0)
@@ -213,7 +219,7 @@ def _build_mesh(args, n_points: int) -> tuple[Mesh, tuple[str, ...]]:
         print(f"P/{n_shards} = {per_shard} < {_P_PER_SHARD_MIN} points per "
               "shard; falling back to single-device. Pass --force-shard to "
               "override.")
-        return Mesh(np.asarray(devices[:1]).reshape(1, 1), ("x", "y")), ("x", "y")
+        return process_local_mesh(), ("x", "y")
 
     if multi_host and per_shard < _P_PER_SHARD_MIN:
         print(f"P/{n_shards} = {per_shard} < {_P_PER_SHARD_MIN}; sharding "

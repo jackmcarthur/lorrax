@@ -99,7 +99,7 @@ def gather_wfn_at_candidates(
     """
     del sym  # reserved; see docstring
     from file_io.wfn_loader import WfnLoader
-    from common.wfn_transforms import to_rmu
+    from common.wfn_transforms import to_rmu, process_local_mesh
 
     # Reduce ``cand_idx`` mod fft_grid to match the convention to_rmu
     # expects (FFT-grid indices in ``[0, fft_grid[a])``).
@@ -114,12 +114,17 @@ def gather_wfn_at_candidates(
     # ``norm='ortho'`` matches the legacy convention (1/√N on both
     # directions); pivoted-Cholesky selection is scale-invariant
     # but we preserve byte-for-byte numerics anyway.
+    # PROCESS-LOCAL: ψ at the candidate points is a pure function of the WFN
+    # and the (rank-identical) candidate list, so each rank builds its own
+    # copy.  The old body paired a GLOBAL band-sharded ``loader.load`` with a
+    # 1x1 mesh over ``jax.devices()[:1]`` — the global list, i.e. process 0's
+    # device on every rank.  Same defect, same SIGSEGV class as
+    # ``centroid/charge_density.py``'s two sites; see
+    # ``common.wfn_transforms.process_local_mesh``.
     with WfnLoader(wfn._filename) as loader:
-        psi = loader.load(bands=(band_start, band_end), k="ibz")
-        mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
-                     axis_names=('x', 'y'))
+        psi = loader.load_process_local(bands=(band_start, band_end), k="ibz")
         return to_rmu(psi, loader.box_index(k="ibz"), loader.fft_grid,
-                      cand_mod, mesh=mesh, norm="ortho")
+                      cand_mod, mesh=process_local_mesh(), norm="ortho")
 
 
 # ═══════════════════════════════════════════════════════════════════════
