@@ -574,8 +574,350 @@ def cell_scale(mesh, args) -> int:
     return rc
 
 
+def _rank_checksum(mesh, A, mu_axis, axes=("x", "y")):
+    """Per-rank ‖shard‖² of a (n_q, μ_S, μ_L) array sharded on ``mu_axis``.
+
+    Returns a length-P vector, one entry per rank, so a mismatch can be
+    localized to the rank (hence the mesh position, hence the replica
+    group) whose shard changed — which is what turns "the answer is
+    wrong" into "collective X on group Y delivered corrupt data".
+    """
+    ax_x, ax_y = axes
+
+    def _body(a):
+        return jnp.asarray([jnp.sum(jnp.abs(a) ** 2).real])
+
+    v = jax.jit(shard_map(
+        _body, mesh=mesh, in_specs=(P(None, None, mu_axis),),
+        out_specs=P((ax_x, ax_y)), check_rep=False))(A)
+    # The (P,) result is itself sharded one-entry-per-rank, so a bare
+    # np.asarray raises "spans non-addressable devices" (it did, job
+    # 7879519, and took the localization dump down with it).
+    return np.asarray(multihost_utils.process_allgather(v, tiled=True))
+
+
+def cell_provoke(mesh, args) -> int:
+    """Repeat the EXACT P=4 configuration N times and report an incidence rate.
+
+    Job 7879491 returned a non-Hermitian W_S at P=4 (Im Σ = 6.25e+02 where
+    the algebra forces 0); job 7879499 re-ran the identical configuration
+    and was clean.  A single sighting is not actionable — a RATE is.  This
+    cell holds every operand fixed, recomputes both overlap plans N times
+    in one process, and compares each rep against its own rep-0 result and
+    against the other plan.  Every operand here is deterministic, so ANY
+    nonzero difference between reps is corruption, not arithmetic: the
+    comparison threshold is EXACT ZERO, not a tolerance.
+
+    On a mismatch it dumps per-rank ‖shard‖² for both plans and both reps,
+    which localizes the corruption to a rank / replica group.
+    """
+    n_q, mu_l, mu_s, n_g = args.nq, args.mu_l, args.mu_s, args.ng
+    p_x, p_y = int(mesh.shape["x"]), int(mesh.shape["y"])
+    world = p_x * p_y
+    _log(f"=== cell provoke: P={world} ({p_x}x{p_y}) n_q={n_q} μ_L={mu_l} "
+         f"μ_S={mu_s} n_G={n_g} reps={args.reps} ===")
+    _log(f"  comparison threshold is EXACT 0 — the operands are identical "
+         f"every rep, so any bit difference is transport corruption.")
+
+    zL = _make_zeta(mesh, n_q, mu_l, n_g, 0)
+    zS = _make_zeta(mesh, n_q, mu_s, n_g, 1)
+    zL_xy = _make_zeta_2d(mesh, n_q, mu_l, n_g, 0, mu_axis="x", g_axis="y")
+    zS_y = _make_zeta_2d(mesh, n_q, mu_s, n_g, 1, mu_axis=None, g_axis="y")
+    zL_yx = _make_zeta_2d(mesh, n_q, mu_l, n_g, 0, mu_axis="y", g_axis="x")
+    zS_x = _make_zeta_2d(mesh, n_q, mu_s, n_g, 1, mu_axis=None, g_axis="x")
+    jax.block_until_ready((zL, zS, zL_xy, zS_y, zL_yx, zS_x))
+
+    ovl1 = jax.jit(zeta_overlap_block_reshard(mesh))
+    ovl_x = jax.jit(zeta_overlap_single_axis(mesh, mu_axis="x", g_axis="y"))
+    ovl_y = jax.jit(zeta_overlap_single_axis(mesh, mu_axis="y", g_axis="x"))
+
+    def _absmax(a, b):
+        f = jax.jit(lambda u, v: jnp.max(jnp.abs(u - v)),
+                    out_shardings=NamedSharding(mesh, P()))
+        return float(np.asarray(f(a, b).addressable_data(0)))
+
+    ref = {}
+    bad, n_checked, xp = [], 0, []
+    for rep in range(args.reps):
+        barrier(f"zp.provoke{rep}")
+        t0 = time.perf_counter()
+        A_x, A_y = ovl1(zS, zL)
+        B_x = ovl_x(zS_y, zL_xy)
+        B_y = ovl_y(zS_x, zL_yx)
+        jax.block_until_ready((A_x, A_y, B_x, B_y))
+        dt = time.perf_counter() - t0
+        cur = {"1p.O_x": A_x, "1p.O_y": A_y, "2p.O_x": B_x, "2p.O_y": B_y}
+        # Cross-plan EVERY rep: the two plans compute the same matrix by
+        # structurally different collectives, so a large cross-plan gap
+        # says WHICH plan is wrong on THIS rep (fp reassociation alone is
+        # ~7e-14 here).  Job 7879519 proc0 rep0 showed O_x 7.2e-14 and
+        # O_y 1.6e+02 — the one-pass O_y chain, and only that chain.
+        cx, cy = _absmax(A_x, B_x), _absmax(A_y, B_y)
+        xp.append((rep, cx, cy))
+        if cy > 1e-9 or cx > 1e-9:
+            _log(f"  *** rep {rep}: CROSS-PLAN gap O_x {cx:.6e} "
+                 f"O_y {cy:.6e} (fp noise is ~7e-14) ***")
+        if rep == 0:
+            ref = dict(cur)
+            _log(f"  rep 0: cross-plan |1p-2p| O_x {cx:.3e} O_y {cy:.3e} "
+                 f"({dt:.2f} s)")
+            continue
+        d = {k: _absmax(cur[k], ref[k]) for k in cur}
+        n_checked += 1
+        worst = max(d.values())
+        if worst != 0.0:
+            bad.append((rep, dict(d)))
+            _log(f"  *** rep {rep}: NONZERO drift vs rep 0 — "
+                 + "  ".join(f"{k} {v:.6e}" for k, v in d.items()) + " ***")
+            for k, ax in (("1p.O_x", "x"), ("1p.O_y", "y"),
+                          ("2p.O_x", "x"), ("2p.O_y", "y")):
+                if d[k] == 0.0:
+                    continue
+                try:
+                    c0 = _rank_checksum(mesh, ref[k], ax)
+                    c1 = _rank_checksum(mesh, cur[k], ax)
+                except Exception as exc:              # noqa: BLE001
+                    _log(f"      {k}: rank-checksum dump failed "
+                         f"({type(exc).__name__}: {exc}) — incidence "
+                         f"measurement continues")
+                    continue
+                diff = np.nonzero(c1 - c0)[0]
+                _log(f"      {k}: ranks with changed ‖shard‖² = "
+                     f"{diff.tolist()}  (of {world})")
+                for r in diff.tolist():
+                    _log(f"        rank {r} (x={r // p_y}, y={r % p_y}): "
+                         f"{c0[r]:.15e} -> {c1[r]:.15e}")
+        elif rep % 5 == 0:
+            _log(f"  rep {rep}: clean ({dt:.2f} s)")
+
+    nx = sum(1 for _, cx, _ in xp if cx > 1e-9)
+    ny = sum(1 for _, _, cy in xp if cy > 1e-9)
+    _log(f"  CROSS-PLAN P={world}: O_x wrong in {nx}/{len(xp)} reps, "
+         f"O_y wrong in {ny}/{len(xp)} reps "
+         f"(1-pass vs the structurally independent 2-pass)")
+    rate = len(bad) / max(n_checked, 1)
+    _log(f"  INCIDENCE P={world}: {len(bad)}/{n_checked} reps drifted "
+         f"({100 * rate:.1f}%)")
+    _log(f"  {'PASS' if not bad else 'FAIL'} [provoke] "
+         f"(PASS = bit-identical across all reps)")
+    return 0 if (not bad and nx == 0 and ny == 0) else 1
+
+
+def _load_real_zeta(loader, n_q, n_mu, n_g_pad, mesh, spec):
+    """Read a real ζ slab and deliver it at ``spec`` with G zero-padded.
+
+    ``read_zeta_G_slab`` returns ``(q, μ, ngkmax)`` at ``P(None,('x','y'),
+    None)`` — the V_q driver's layout.  The overlap wants G sharded (or μ
+    and G sharded), so there is exactly one reshard here; that is the
+    interface cost §7.2 of the notes flagged, now paid rather than
+    described.  ``sphere_idx=None`` consumes the raw per-q sphere (the
+    loader refuses to narrow a per-q sphere with a shared index); the two
+    files having the SAME per-q sphere is what
+    ``assert_zeta_bases_compatible`` verifies.
+
+    G is zero-padded ngkmax → n_g_pad so the mesh divides it.  A zero G
+    column contributes zero to every overlap and every Gram entry, so the
+    pad is inert — the same argument the μ pad rests on.
+    """
+    # The loader shards μ FLAT over the whole mesh (P(None,('x','y'),None)),
+    # so the READ needs μ divisible by P = p_x·p_y — a stricter condition
+    # than the overlap's (μ divisible by p_x and by p_y separately), and
+    # one that 2406 % 4 = 2 and 606 % 4 = 2 both violate (job 7879524).
+    # ``valid_mu`` is the loader's own answer: read a P-divisible μ window
+    # zero-filled past the logical extent, then slice the pad off before
+    # the reshard, so no zero ζ row ever reaches the Gram.
+    n_mu, n_q = int(n_mu), int(n_q)
+    p_tot = int(mesh.size)
+    mu_read = n_mu + (-n_mu) % p_tot
+    z = loader.read_zeta_G_slab(
+        q_offset=0, q_count=n_q, mu_offset=0, mu_count=mu_read,
+        qvec_batch_frac=jnp.zeros((n_q, 3)), sphere_idx=None,
+        mesh=mesh, valid_mu=n_mu)
+    n_g = int(z.shape[-1])
+    pad = int(n_g_pad) - n_g
+    if pad < 0:
+        raise ValueError(f"n_g_pad={n_g_pad} < ngkmax={n_g}")
+    return jax.jit(
+        lambda a: jax.lax.with_sharding_constraint(
+            jnp.pad(a[:, :n_mu, :], ((0, 0), (0, 0), (0, pad))),
+            NamedSharding(mesh, spec)))(z)
+
+
+def cell_real(mesh, args) -> int:
+    """The whole chain on REAL ISDF ζ from two production fits.
+
+    Owner follow-up #1.  ζ_L and ζ_S are read from two real
+    ``zeta_q.h5`` files on the SAME deck, grid, q set and per-q G-sphere,
+    so the overlap, the Gram, the metric and the conditioning are all
+    real physics data.  W_L remains an analytic Hermitian matrix **in the
+    real large basis** — no real W exists on disk (V_q/W are in-memory
+    in this pipeline) — and that is stated rather than blurred.
+    """
+    from file_io.zeta_loader import ZetaLoader
+    from common.zeta_projection import assert_zeta_bases_compatible
+
+    p_x, p_y = int(mesh.shape["x"]), int(mesh.shape["y"])
+    _log(f"--- cell real: ζ_S={args.zeta_small}")
+    _log(f"               ζ_L={args.zeta_large}")
+    with ZetaLoader(args.zeta_small, mesh=mesh) as ldS, \
+            ZetaLoader(args.zeta_large, mesh=mesh) as ldL:
+        geom = assert_zeta_bases_compatible(ldS, ldL, print_fn=_log)
+        mu_s, mu_l = geom["mu_S"], geom["mu_L"]
+        n_q = min(int(args.nq), geom["n_q_on_disk"])
+        ngk = geom["ngkmax"]
+        n_g = ngk + (-ngk) % (p_x * p_y)
+        for name, n in (("mu_S", mu_s), ("mu_L", mu_l)):
+            if n % p_x or n % p_y:
+                _log(f"  REFUSE: {name}={n} is not divisible by p_x={p_x} "
+                     f"and p_y={p_y}.  The READ pad is handled (valid_mu), "
+                     f"but padding μ_S into the GRAM would make G_S "
+                     f"singular; pick a mesh whose axes divide {mu_s} and "
+                     f"{mu_l} (gcd here is 6, so 1/2/3/6 per axis).")
+                return 2
+        _log(f"  using n_q={n_q} of {geom['n_q_on_disk']}, "
+             f"ngkmax {ngk} -> n_G {n_g} (zero pad, inert), "
+             f"ratio μ_L/μ_S = {mu_l / mu_s:.2f}")
+        _log(f"  global: ζ_L {n_q * mu_l * n_g * 16 / 1e9:.2f} GB, "
+             f"ζ_S {n_q * mu_s * n_g * 16 / 1e9:.2f} GB, "
+             f"W_L {n_q * mu_l * mu_l * 16 / 1e9:.2f} GB")
+
+        t0 = time.perf_counter()
+        zeta_L = _load_real_zeta(ldL, n_q, mu_l, n_g, mesh,
+                                 P(None, None, ("x", "y")))
+        zeta_S = _load_real_zeta(ldS, n_q, mu_s, n_g, mesh,
+                                 P(None, None, ("x", "y")))
+        jax.block_until_ready((zeta_L, zeta_S))
+        _log(f"  [read+reshard] {time.perf_counter() - t0:.2f} s")
+
+    f_host, g_host = _w_seeds(n_q, mu_l)
+    W_L = _make_W_L(mesh, f_host, g_host)
+
+    # --- the independent dense numpy reference FIRST, from the REAL ζ.
+    # cond(G_S) on a real ISDF basis is the number the synthetic study
+    # cannot supply, and it is also the thing most likely to make the
+    # device Cholesky refuse — so it is computed and reported BEFORE any
+    # device path can raise.
+    zS = np.asarray(multihost_utils.process_allgather(zeta_S, tiled=True))
+    zL = np.asarray(multihost_utils.process_allgather(zeta_L, tiled=True))
+    W_full = np.asarray(multihost_utils.process_allgather(W_L, tiled=True))
+    # BLAS-routed batched matmul, NOT np.einsum: numpy's einsum runs its
+    # own C loop for this pattern (~1 GF/s), and O_ref alone is 4e11 flops
+    # at these real sizes — job 7879528 was still grinding on it after two
+    # minutes.  ``a @ swapaxes(b)`` dispatches zgemm.
+    def _gram2(a, b):
+        return np.conj(a) @ np.swapaxes(b, -1, -2)
+
+    O_ref = _gram2(zS, zL)
+    G_ref = _gram2(zS, zS)
+    conds = [float(np.linalg.cond(G_ref[q])) for q in range(n_q)]
+    cond = float(np.max(conds))
+    ev = np.linalg.eigvalsh(G_ref[0])
+    _log(f"  cond(G_S) per q: min {min(conds):.3e} max {cond:.3e}; "
+         f"G_S[q=0] eigenvalues span {ev.min():.6e} .. {ev.max():.6e}")
+    # The reference MUST apply the same truncation as the device path.
+    # Comparing a rank-truncated solve against np.linalg.solve on a matrix
+    # with cond 5.7e18 is meaningless — job 7879536 reported 9.996e-01 and
+    # that was the REFERENCE being wrong, not the kernel.
+    if args.mode == "ls_trunc":
+        wv, Vv = np.linalg.eigh(G_ref)
+        keepv = wv > args.rcond * wv.max(axis=-1, keepdims=True)
+        wiv = np.where(keepv, 1.0 / np.where(keepv, wv, 1.0), 0.0)
+        T_ref = ((Vv * wiv[:, None, :])
+                 @ np.conj(np.swapaxes(Vv, -1, -2))) @ O_ref
+        _log(f"  numpy reference uses the SAME rcond={args.rcond:g} "
+             f"truncation (retained {int(keepv[0].sum())}/{mu_s} at q=0)")
+    else:
+        T_ref = np.linalg.solve(G_ref, O_ref)
+
+    lsmode = args.mode if args.mode != "raw" else "ls"
+    rc_kw = {"rcond": args.rcond} if lsmode == "ls_trunc" else {}
+    out = {}
+    for mode in (lsmode, "raw"):
+        kw = rc_kw if mode == lsmode else {}
+        try:
+            psi_l, psi_r, _ = build_zeta_transfer(
+                zeta_S, zeta_L, mesh, mode=mode, print_fn=_log,
+                announce=(mode == "raw"), **kw)
+        except ValueError as exc:                      # noqa: BLE001
+            _log(f"  mode={mode}: build_zeta_transfer REFUSED — {exc}")
+            _log(f"  (numpy cond(G_S)={cond:.3e}; a real ISDF small basis "
+                 f"whose sphere-metric Gram is near-singular needs the "
+                 f"rank-truncated route the FIT already has "
+                 f"(charge_zeta_solve=rank_truncate), not a Cholesky.)")
+            return 3
+        W_S = jax.jit(project_w_between_zeta_bases(mesh))(W_L, psi_l, psi_r)
+        out["ls" if mode == lsmode else "raw"] = np.asarray(
+            multihost_utils.process_allgather(W_S, tiled=True))
+        del psi_l, psi_r, W_S
+    W_ref = T_ref @ W_full @ np.conj(np.swapaxes(T_ref, -1, -2))
+    e_dense = _rel(out["ls"], W_ref)
+    e_herm = _rel(out["ls"], np.conj(np.swapaxes(out["ls"], -1, -2)))
+
+    # --- representability round-trip on the REAL ζ_L.
+    # The small basis here is conj(A)·ζ_L for a random A: the point is
+    # that ζ_L is REAL, so the transfer, the Gram and the metric are all
+    # built from production ζ, while the field is representable in the
+    # small span BY CONSTRUCTION and the LS transfer must reproduce W_S0
+    # exactly.  Using the true LS image of the real ζ_S would need G_L^-1
+    # (μ_L², host-only) — deliberately not done: it is both expensive and
+    # exactly the O(μ_L²) object this module exists to avoid.
+    rng = np.random.default_rng(3)
+    A = ((rng.standard_normal((n_q, mu_s, mu_l))
+          + 1j * rng.standard_normal((n_q, mu_s, mu_l)))
+         / np.sqrt(2.0 * mu_l))
+    W0 = (rng.standard_normal((n_q, mu_s, mu_s))
+          + 1j * rng.standard_normal((n_q, mu_s, mu_s)))
+    W0 = 0.5 * (W0 + np.conj(np.swapaxes(W0, -1, -2)))
+    W_emb = (np.swapaxes(A, -1, -2) @ W0 @ np.conj(A))
+    W_emb_d = _put(W_emb, NamedSharding(mesh, P(None, "x", "y")))
+    zS_rep = _put(np.conj(A) @ zL,
+                  NamedSharding(mesh, P(None, None, ("x", "y"))))
+    rt = {}
+    for mode in (lsmode, "raw"):
+        kw = rc_kw if mode == lsmode else {}
+        pl, pr, _ = build_zeta_transfer(zS_rep, zeta_L, mesh, mode=mode,
+                                        print_fn=_log, announce=False, **kw)
+        got = np.asarray(multihost_utils.process_allgather(
+            jax.jit(project_w_between_zeta_bases(mesh))(W_emb_d, pl, pr),
+            tiled=True))
+        rt["ls" if mode == lsmode else "raw"] = _rel(got, W0)
+
+    ratio = (float(np.max(np.abs(out["raw"])))
+             / max(float(np.max(np.abs(out["ls"]))), 1e-300))
+    _log(f"  REAL μ_L={mu_l} μ_S={mu_s} n_q={n_q} transfer={lsmode}"
+         + (f" rcond={args.rcond:g}" if rc_kw else ""))
+    _log(f"    cond(G_S) max over q        = {cond:.4e}")
+    _log(f"    W_S vs dense numpy ref      = {e_dense:.3e}  (gate {args.tol:.0e})")
+    _log(f"    W_S hermiticity             = {e_herm:.3e}  (gate {args.tol:.0e})")
+    _log(f"    round-trip  mode=ls         = {rt['ls']:.3e}  (gate {args.tol:.0e})")
+    _log(f"    round-trip  mode=raw        = {rt['raw']:.3e}  (must be >> 1e-3)")
+    _log(f"    max|W_S raw| / max|W_S ls|  = {ratio:.4e}")
+    # The representability round-trip is a GATE on synthetic ζ and a
+    # DIAGNOSTIC on real ζ: its exactness argument needs the LARGE basis
+    # well conditioned, and a real μ_L=2406 ISDF Gram is strongly
+    # rank-deficient, so round-off in the degenerate directions is
+    # amplified without bound.  Reported with the reason, not gated.
+    _log("    (round-trip is a DIAGNOSTIC here, not a gate: the real LARGE "
+         "basis is itself rank-deficient, so 'exactly representable' is "
+         "not numerically meaningful.  On synthetic ζ, cond~20, the same "
+         "quantity is 1.5e-15.)")
+    ok = (e_dense < args.tol and e_herm < args.tol and rt["raw"] > 1e-3)
+
+    _log(f"    {'PASS' if ok else 'FAIL'} [real]")
+    rc = 0 if ok else 1
+
+    del zeta_L, zeta_S, zS_rep
+    if args.with_selection:
+        sa = argparse.Namespace(**vars(args))
+        sa.mu_l, sa.mu_s, sa.nq = mu_l, mu_s, n_q
+        rc = cell_selection(mesh, sa) or rc
+    return rc
+
+
 _CELLS = {"dense": cell_dense, "selection": cell_selection,
-          "roundtrip": cell_roundtrip, "scale": cell_scale}
+          "roundtrip": cell_roundtrip, "scale": cell_scale,
+          "provoke": cell_provoke,
+          "real": cell_real}
 
 
 def main() -> int:
@@ -587,9 +929,14 @@ def main() -> int:
     ap.add_argument("--mu-s", type=int, default=48)
     ap.add_argument("--ng", type=int, default=256)
     ap.add_argument("--reps", type=int, default=10)
-    ap.add_argument("--mode", default="ls", choices=("ls", "raw"))
+    ap.add_argument("--mode", default="ls",
+                    choices=("ls", "ls_trunc", "raw"))
+    ap.add_argument("--rcond", type=float, default=0.0,
+                    help="relative eigenvalue threshold for mode=ls_trunc")
     ap.add_argument("--tol", type=float, default=1e-12)
     ap.add_argument("--with-selection", action="store_true")
+    ap.add_argument("--zeta-small", default=None, help="small-basis zeta_q.h5")
+    ap.add_argument("--zeta-large", default=None, help="large-basis zeta_q.h5")
     ap.add_argument("--mu-s-chunk", type=int, default=0,
                     help="force the overlap's mu_S chunk size (0 = auto). "
                          "The gate sizes auto-resolve to ONE chunk, so the "

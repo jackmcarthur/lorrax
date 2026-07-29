@@ -137,6 +137,8 @@ from __future__ import annotations
 import os
 from typing import Callable
 
+import numpy as np
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -148,6 +150,7 @@ from common.contract_bands import (
 
 __all__ = [
     "ensure_world_clique_ready",
+    "assert_zeta_bases_compatible",
     "zeta_overlap_block_reshard",
     "zeta_overlap_single_axis",
     "zeta_gram_single_axis",
@@ -288,6 +291,129 @@ def _require_div(n: int, px: int, py: int, what: str, axes) -> None:
     if n % px or n % py:
         raise ValueError(_MU_DIV_MSG.format(
             what=what, n=n, px=px, py=py, ax_x=axes[0], ax_y=axes[1]))
+
+
+# ---------------------------------------------------------------------------
+# Two-ζ-file compatibility: the per-q sphere must be THE SAME sphere
+# ---------------------------------------------------------------------------
+
+def assert_zeta_bases_compatible(loader_S, loader_L, *, print_fn=print) -> dict:
+    """Refuse two ζ files whose G axes are not the same G's, in the same order.
+
+    The overlap (†) is ``Σ_G conj(ζ̃^S(G)) ζ̃^L(G)`` — a sum over a shared
+    index.  On the G-flat format that index is a **per-q WFN.h5-style
+    sphere** whose positions vary with q
+    (``isdf_header/gvec_components``, shape ``(n_q, 3, ngkmax)``;
+    ``file_io.zeta_loader`` says so explicitly and refuses to narrow it
+    with a single shared ``sphere_idx``).  Two files can therefore agree
+    on ``ngkmax``, ``ngk``, ``FFTgrid`` and ``n_q`` and STILL be summing
+    different G's at the same array position — in which case the overlap
+    is silently meaningless.
+
+    This is not hypothetical.  Measured on the MoS2 12×12 80 Ry decks:
+    the μ=2406, μ=606 and two of the μ=276 ζ files share
+    ``gvec_components`` bit-for-bit, while a third μ=276 file
+    (``mos2_80ry_12x12/tmp/zeta_q.h5``) has identical ngkmax=8603,
+    identical ngk, identical FFTgrid=(36,36,135) and identical n_q=144
+    but a DIFFERENT ``gvec_components``.  Nothing in the shapes would
+    have caught it.
+
+    Checks, in order (each refusal names the fix): ζ layout, completeness
+    flag, FFT grid, n_q on disk and q layout, ngkmax, per-q ngk, and
+    finally ``gvec_components`` byte-for-byte.
+
+    Returns a dict of the agreed geometry for the caller's log.
+    """
+    import numpy as np
+
+    def _fail(what, a, b, fix):
+        raise ValueError(
+            f"zeta_projection: the two ζ files disagree on {what} — "
+            f"small={a!r} vs large={b!r}.  {fix}")
+
+    for lo, tag in ((loader_S, "small"), (loader_L, "large")):
+        if getattr(lo, "zeta_layout", None) != "G_flat":
+            raise ValueError(
+                f"zeta_projection: the {tag} ζ file is layout "
+                f"{getattr(lo, 'zeta_layout', None)!r}; the overlap consumes "
+                f"the G-flat format (the r-space layout would need an FFT "
+                f"per read).  Refit with the G-flat writer.")
+        if not bool(getattr(lo, "zeta_is_done", True)):
+            raise ValueError(
+                f"zeta_projection: the {tag} ζ file's zeta_is_done flag is "
+                f"FALSE — it was left behind by a job that died mid-write "
+                f"and its trailing chunks are undefined.  Re-run the fit; "
+                f"do NOT project from it.")
+
+    a, b = np.asarray(loader_S.fft_grid), np.asarray(loader_L.fft_grid)
+    if not np.array_equal(a, b):
+        _fail("FFTgrid", a.tolist(), b.tolist(),
+              "The two bases must be fitted on the same real-space grid; "
+              "refit one of them on the other's grid.")
+    if int(loader_S.n_q_on_disk) != int(loader_L.n_q_on_disk):
+        _fail("n_q on disk", int(loader_S.n_q_on_disk),
+              int(loader_L.n_q_on_disk),
+              "The overlap is per-q and indexes both files with the same q; "
+              "an IBZ-only file cannot be paired with a full-BZ one without "
+              "unfolding first.")
+    if loader_S.q_layout != loader_L.q_layout:
+        _fail("q layout", loader_S.q_layout, loader_L.q_layout,
+              "Unfold the IBZ file (or fold the full-BZ one) before "
+              "projecting.")
+    if int(loader_S.n_G_sph_disk) != int(loader_L.n_G_sph_disk):
+        _fail("ngkmax", int(loader_S.n_G_sph_disk),
+              int(loader_L.n_G_sph_disk),
+              "Different sphere sizes mean different cutoffs; refit at a "
+              "common zeta_cutoff_ry.")
+
+    ngk_s = getattr(loader_S, "ngk_per_q", None)
+    ngk_l = getattr(loader_L, "ngk_per_q", None)
+    if ngk_s is not None and ngk_l is not None:
+        if not np.array_equal(np.asarray(ngk_s), np.asarray(ngk_l)):
+            _fail("per-q ngk", "…", "…",
+                  "The per-q logical sphere sizes differ; the two fits did "
+                  "not see the same q-sphere.")
+
+    gv_s = getattr(loader_S, "gvec_components", None)
+    gv_l = getattr(loader_L, "gvec_components", None)
+    if gv_s is None or gv_l is None:
+        raise ValueError(
+            "zeta_projection: a G-flat ζ file is missing "
+            "isdf_header/gvec_components, so the per-q sphere it was "
+            "written against cannot be verified.  Refusing rather than "
+            "assuming the two files index the same G's — see this "
+            "function's docstring for the measured counterexample.")
+    gv_s = np.asarray(gv_s, dtype=np.int32)
+    gv_l = np.asarray(gv_l, dtype=np.int32)
+    if gv_s.shape != gv_l.shape or not np.array_equal(gv_s, gv_l):
+        n_bad = (int(np.count_nonzero(np.any(gv_s != gv_l, axis=(1, 2))))
+                 if gv_s.shape == gv_l.shape else -1)
+        raise ValueError(
+            f"zeta_projection: the two ζ files carry DIFFERENT per-q "
+            f"G-spheres (isdf_header/gvec_components differs"
+            + (f" at {n_bad} of {gv_s.shape[0]} q's" if n_bad >= 0
+               else f"; shapes {gv_s.shape} vs {gv_l.shape}")
+            + ").  Every other header field can match — ngkmax, ngk, "
+            "FFTgrid, n_q all did in the case that motivated this check — "
+            "and the overlap would still be summing conj(ζ^S) at one G "
+            "against ζ^L at a different G, position by position, giving a "
+            "plausible-looking but meaningless transfer.  Fix: use two ζ "
+            "files written by the same sphere convention (fits on the same "
+            "deck normally are), or scatter both onto a shared sphere via "
+            "gvec_components first — that scatter is NOT implemented here "
+            "or in file_io.zeta_loader.")
+
+    geom = {"n_q_on_disk": int(loader_L.n_q_on_disk),
+            "ngkmax": int(loader_L.n_G_sph_disk),
+            "fft_grid": tuple(int(x) for x in np.asarray(loader_L.fft_grid)),
+            "mu_S": int(loader_S.n_rmu), "mu_L": int(loader_L.n_rmu),
+            "q_layout": loader_L.q_layout}
+    print_fn(f"[zeta_projection] ζ pair verified compatible: "
+             f"μ_S={geom['mu_S']} μ_L={geom['mu_L']} n_q={geom['n_q_on_disk']} "
+             f"({geom['q_layout']}) ngkmax={geom['ngkmax']} "
+             f"FFT={geom['fft_grid']}; gvec_components identical "
+             f"byte-for-byte.")
+    return geom
 
 
 # ---------------------------------------------------------------------------
@@ -578,53 +704,116 @@ def zeta_gram_replicated(
 # ---------------------------------------------------------------------------
 
 def least_squares_transfer(
-    gram_S, O_sharded, mesh_xy: Mesh, mu_axis: str,
+    gram_S, O_sharded, mesh_xy: Mesh, mu_axis: str, *,
+    rcond: float | None = None, print_fn=print,
 ) -> jax.Array:
-    """``T = G_S^{-1} · O`` for one sharding of ``O``.
+    """``T = G_S^{-1} O`` (Cholesky) or ``T = G_S^+ O`` (rank-truncated).
 
-    ``G_S`` is Hermitian positive definite whenever the small ζ set is
-    linearly independent, so the solve is a Cholesky back-substitution.
-    It is done INSIDE a shard_map with ``G_S`` replicated and ``O``'s μ_L
-    axis sharded, which makes the solve rank-local by construction — the
-    partitioner is never asked to plan a collective for it.
+    ``rcond=None`` — Cholesky back-substitution, valid when the small ζ
+    set is linearly independent on the G-sphere.  Done INSIDE a shard_map
+    with ``G_S`` replicated and ``O``'s μ_L axis sharded, so the solve is
+    rank-local by construction and the partitioner is never asked to plan
+    a collective for it.  **Refuses** (does not ridge, does not pinv)
+    when the Cholesky fails, and names ``rcond`` as the fix.
 
-    Refuses (does not ridge, does not pinv) when the Cholesky fails: a
-    non-PD small-basis Gram means duplicated / linearly dependent
-    centroids in the SMALL set, and silently regularizing it would hide
-    a basis bug behind a plausible-looking W_S.
+    ``rcond=<float>`` — Hermitian eigendecomposition of ``G_S``, keeping
+    the eigenvalues above ``rcond · λ_max`` per q and zeroing the rest:
+    the Moore–Penrose pseudo-inverse truncated at a stated rank.  The
+    retained rank is ANNOUNCED per q, because it is physics: it is the
+    number of small-basis ζ's that are actually independent on the
+    sphere, and if it is far below μ_S the small basis is not the size
+    the caller thinks it is.
+
+    **Why the truncated route is not optional on real data.**  Measured
+    on the production MoS2 12×12 80 Ry ζ (job 7879532): the 606-centroid
+    basis has ``cond(G_S) = 5.7e18`` with eigenvalues spanning
+    ``-4.5e-05 … 6.9e+11`` — numerically singular, the negative end being
+    round-off on a positive-semidefinite matrix.  A real ISDF basis is
+    strongly linearly dependent on its own sphere; the ISDF FIT already
+    fights exactly this with ``charge_zeta_solve=rank_truncate`` and the
+    RCOND dials.  The synthetic study could never have shown it
+    (cond ≈ 20 there), which is why it had to be run on real ζ.
+
+    ``T`` is exact on the retained subspace, so the representability
+    property of (‡) survives truncation with "representable" read as
+    "representable in the retained span".
     """
     from jax.experimental.shard_map import shard_map
 
-    chol = jnp.linalg.cholesky(gram_S)          # (n_q, μ_S, μ_S), replicated
-    bad = jnp.isnan(jnp.real(jnp.diagonal(chol, axis1=-2, axis2=-1))).any()
-    if bool(jax.device_get(bad)):
-        diag = jnp.real(jnp.diagonal(gram_S, axis1=-2, axis2=-1))
-        raise ValueError(
-            f"zeta_projection: the SMALL-basis Gram G_S = <ζ^S|ζ^S> is not "
-            f"positive definite (Cholesky produced NaN).  That means the "
-            f"small ζ set is linearly dependent on the G-sphere — typically "
-            f"duplicated centroids, a small basis larger than the sphere "
-            f"rank, or a ζ file whose trailing μ rows are the zero pad "
-            f"(strip the pad, or pass mu_S = the LOGICAL centroid count).  "
-            f"Gram diagonal min/max = "
-            f"{float(jnp.min(diag)):.3e}/{float(jnp.max(diag)):.3e}.  No "
-            f"ridge is applied and no pseudo-inverse is substituted: a "
-            f"silent regularization here would be indistinguishable from a "
-            f"correct projection downstream.")
+    if rcond is None:
+        chol = jnp.linalg.cholesky(gram_S)
+        bad = jnp.isnan(
+            jnp.real(jnp.diagonal(chol, axis1=-2, axis2=-1))).any()
+        if bool(jax.device_get(bad)):
+            diag = jnp.real(jnp.diagonal(gram_S, axis1=-2, axis2=-1))
+            raise ValueError(
+                f"zeta_projection: the SMALL-basis Gram G_S = <ζ^S|ζ^S> is "
+                f"not positive definite (Cholesky produced NaN) — the small "
+                f"ζ set is linearly dependent on the G-sphere.  For a REAL "
+                f"ISDF basis this is the NORMAL case, not a bug: measured "
+                f"cond(G_S)=5.7e18 on the production 606-centroid MoS2 "
+                f"12×12 basis (job 7879532).  FIX: pass rcond (e.g. "
+                f"rcond=1e-10, mode='ls_trunc' at the build_zeta_transfer "
+                f"level) to use the rank-truncated pseudo-inverse — the "
+                f"same route the ISDF fit itself takes "
+                f"(charge_zeta_solve=rank_truncate).  Other causes worth "
+                f"excluding first: duplicated centroids, or a ζ file whose "
+                f"trailing μ rows are the zero pad (pass the LOGICAL "
+                f"centroid count).  Gram diagonal min/max = "
+                f"{float(jnp.min(diag)):.3e}/{float(jnp.max(diag)):.3e}.  "
+                f"No ridge is applied and no pseudo-inverse is substituted "
+                f"silently: that would be indistinguishable from a correct "
+                f"projection downstream.")
 
-    def _body(L_loc, O_loc):
-        # L_loc replicated (n_q, μ_S, μ_S); O_loc (n_q, μ_S, μ_L_local).
-        y = jax.lax.linalg.triangular_solve(
-            L_loc, O_loc, left_side=True, lower=True,
-            transpose_a=False, conjugate_a=False)
-        return jax.lax.linalg.triangular_solve(
-            L_loc, y, left_side=True, lower=True,
-            transpose_a=True, conjugate_a=True)
+        def _body(L_loc, O_loc):
+            y = jax.lax.linalg.triangular_solve(
+                L_loc, O_loc, left_side=True, lower=True,
+                transpose_a=False, conjugate_a=False)
+            return jax.lax.linalg.triangular_solve(
+                L_loc, y, left_side=True, lower=True,
+                transpose_a=True, conjugate_a=True)
+
+        return shard_map(
+            _body, mesh=mesh_xy,
+            in_specs=(P(None, None, None), P(None, None, mu_axis)),
+            out_specs=P(None, None, mu_axis), check_rep=False)(chol, O_sharded)
+
+    if not (0.0 < float(rcond) < 1.0):
+        raise ValueError(
+            f"rcond must be in (0, 1) — it is a RELATIVE threshold on "
+            f"λ/λ_max, got {rcond!r}.")
+    w, V = jnp.linalg.eigh(gram_S)              # ascending, replicated
+    lam_max = jnp.max(w, axis=-1, keepdims=True)
+    keep = w > (float(rcond) * lam_max)
+    ranks = np.asarray(jax.device_get(jnp.sum(keep, axis=-1)))
+    n_mu_s = int(gram_S.shape[-1])
+    if jax.process_index() == 0:
+        print_fn(
+            f"[zeta_projection] rank-truncated transfer at rcond={rcond:g}: "
+            f"retained rank per q min/median/max = {ranks.min()}/"
+            f"{int(np.median(ranks))}/{ranks.max()} of μ_S={n_mu_s} "
+            f"({100.0 * ranks.mean() / n_mu_s:.1f}% of the nominal basis). "
+            f"The discarded directions are ζ's that are linearly dependent "
+            f"on the rest ON THE SPHERE — W_S is the projection onto the "
+            f"retained span, and a rank far below μ_S means the small "
+            f"basis is smaller than it looks.")
+    if int(ranks.min()) == 0:
+        raise ValueError(
+            f"zeta_projection: rcond={rcond:g} retained ZERO directions at "
+            f"some q — the threshold is above λ_max.  Lower rcond.")
+    w_inv = jnp.where(keep, 1.0 / jnp.where(keep, w, 1.0), 0.0)
+
+    def _body(V_loc, wi_loc, O_loc):
+        # T = V diag(w_inv) V^H O, all rank-local (V, w_inv replicated)
+        y = jnp.einsum('qkm,qkn->qmn', jnp.conj(V_loc), O_loc, optimize=True)
+        y = y * wi_loc[:, :, None].astype(y.dtype)
+        return jnp.einsum('qmk,qkn->qmn', V_loc, y, optimize=True)
 
     return shard_map(
         _body, mesh=mesh_xy,
-        in_specs=(P(None, None, None), P(None, None, mu_axis)),
-        out_specs=P(None, None, mu_axis), check_rep=False)(chol, O_sharded)
+        in_specs=(P(None, None, None), P(None, None),
+                  P(None, None, mu_axis)),
+        out_specs=P(None, None, mu_axis), check_rep=False)(V, w_inv, O_sharded)
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +847,7 @@ def build_zeta_transfer(
     zeta_S, zeta_L, mesh_xy: Mesh, *,
     axes: tuple[str, str] = ("x", "y"),
     mode: str = "ls",
+    rcond: float | None = None,
     mu_s_chunk: int | None = None,
     print_fn=print,
     announce: bool = True,
@@ -675,10 +865,23 @@ def build_zeta_transfer(
     Returns ``(psi_left, psi_right, info)`` where ``info`` carries the
     Gram bytes and the transfer's global shape for the caller's log.
     """
-    if mode not in ("ls", "raw"):
+    if mode not in ("ls", "ls_trunc", "raw"):
         raise ValueError(
-            f"zeta_projection mode must be 'ls' (least-squares transfer, "
-            f"G_S^-1·O) or 'raw' (bare overlap congruence), got {mode!r}")
+            f"zeta_projection mode must be 'ls' (least-squares transfer via "
+            f"Cholesky), 'ls_trunc' (rank-truncated pseudo-inverse — "
+            f"REQUIRED on real ISDF bases, whose Gram is numerically "
+            f"singular; pass rcond) or 'raw' (bare overlap congruence), "
+            f"got {mode!r}")
+    if mode == "ls_trunc" and rcond is None:
+        raise ValueError(
+            "mode='ls_trunc' needs an explicit rcond (relative eigenvalue "
+            "threshold, e.g. 1e-10).  It is not defaulted: the retained "
+            "rank is a physics choice and must be stated by the caller, "
+            "the same way the ISDF fit states its RCOND.")
+    if mode == "ls" and rcond is not None:
+        raise ValueError(
+            "rcond is only meaningful with mode='ls_trunc'; mode='ls' is "
+            "the exact Cholesky solve.")
     ax_x, ax_y = axes
     p_x, p_y = _check_mesh(mesh_xy, axes)
     n_q, mu_s, n_g = (int(d) for d in zeta_S.shape)
@@ -711,8 +914,10 @@ def build_zeta_transfer(
                 f"on μ_L, {n_q * mu_s * mu_l * 16 / 1e6 / p_x:.1f} MB/rank "
                 f"on '{ax_x}' + {n_q * mu_s * mu_l * 16 / 1e6 / p_y:.1f} "
                 f"MB/rank on '{ax_y}'.")
-        T_x = least_squares_transfer(G_S, O_x, mesh_xy, ax_x)
-        T_y = least_squares_transfer(G_S, O_y, mesh_xy, ax_y)
+        T_x = least_squares_transfer(G_S, O_x, mesh_xy, ax_x,
+                                     rcond=rcond, print_fn=print_fn)
+        T_y = least_squares_transfer(G_S, O_y, mesh_xy, ax_y,
+                                     rcond=rcond, print_fn=lambda *a: None)
 
     psi_left, psi_right = jax.jit(
         lambda a, b: transfer_operands_from_dense(a, b, mesh_xy, axes)
