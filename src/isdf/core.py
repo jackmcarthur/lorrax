@@ -1848,6 +1848,49 @@ def _chunk_log(where: str, nq: int, qb: int, per_q_bytes: int) -> None:
     took a 72-node job down again.  Deduplicated on the tuple, because the
     back-solve site is re-entered once per r-chunk (9–81 times).
     """
+    # --- LOUD FLOOR (size campaign 2026-07-29, owner-approved) -------------
+    # `_chunk_q` splits the q axis ONLY.  Once ONE q's collective exceeds the
+    # budget its `max(1, ...)` floor returns q_block=1 and there is no
+    # granularity left: the advertised bound is then simply ABANDONED and the
+    # emitted payload grows as mu^2 unchecked.  That is a silent downgrade of a
+    # bound this module advertises, which the project's rules forbid.
+    #
+    # Trigger arithmetic differs PER CALL SITE — do not quote one threshold:
+    #   C+ formation (pinv):     per-q ~ mu^2 * 16 / Px
+    #        -> breaches 128 MiB above mu ~ sqrt(budget*Px/16) = 8,192 (Px=8)
+    #   C+ back-solve (GEMM):    per-q ~ (mu^2/Px + mu*r_chunk/Py) * 16,
+    #        i.e. dominated by the mu*r_chunk term, LINEAR in mu
+    #        -> breaches 128 MiB above mu ~ budget*Py/(16*r_chunk) = 1,456
+    #           at r_chunk = 46,080, Py = 8.
+    # MEASURED, and it corrected the first version of this comment: at the
+    # campaign's SMALLEST deck (mu=2475) the pinv site sits at 12.5 MB/q
+    # (fine, q_block=10) while the back-solve site already emits 230.0 MB/q
+    # (1.7x over).  So the back-solve bound has been violated by essentially
+    # EVERY run this project has ever made, not merely by mu > 8,192.
+    # Larger measured back-solve payloads: 926 MB at mu=10015, 1386 MB at
+    # 15007, 1773 MB at 24933 -- up to 13.2x the cap.
+    # NOTE: no failure has ever been attributed to the violation; this is an
+    # honesty fix, not a wall.  Deliberately announced BEFORE the
+    # LORRAX_COLLECTIVE_CHUNK_LOG check — a routine-logging knob must not be
+    # able to silence a bound violation — and with its own dedup key.
+    _budget = _collective_chunk_bytes()
+    if int(qb) <= 1 and int(per_q_bytes) > _budget and jax.process_index() == 0:
+        _wsig = ("__floor__", where, int(per_q_bytes))
+        if _wsig not in _chunk_logged:
+            _chunk_logged.add(_wsig)
+            print(f"  [collective chunk] WARNING {where}: cannot honour the "
+                  f"payload bound — one q alone emits "
+                  f"{per_q_bytes / 1e6:.1f} MB against a "
+                  f"{_budget / 1e6:.1f} MB budget "
+                  f"({per_q_bytes / max(1.0, _budget):.1f}x). q is the only "
+                  f"split axis, so q_block is already 1 and the bound is "
+                  f"ABANDONED, not enforced. The per-q payload grows with mu "
+                  f"at this site (pinv ~ mu^2/Px; back-solve ~ mu*r_chunk/Py, "
+                  f"so the back-solve bound is already unhonourable at the "
+                  f"smallest production mu). No failure has been attributed to "
+                  f"this; raise LORRAX_COLLECTIVE_CHUNK_MB to silence it "
+                  f"honestly, or accept the larger payload.",
+                  flush=True)
     if not _env_bool("LORRAX_COLLECTIVE_CHUNK_LOG", True):
         return
     if jax.process_index() != 0:
