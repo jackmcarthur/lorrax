@@ -410,17 +410,86 @@ def fit_gn_ppm_from_wc_pair(
             f"fit_gn_ppm_from_wc_pair: n_mu_logical={n_log} outside "
             f"(0, {n_mu}] for input extent {n_mu}.")
 
-    omega_vals, B_vals, good, fulfilled = _gn_ppm_fit_kernel(
-        Wc0_qmunu, Wc_probe_qmunu,
-        jnp.asarray(probe_omega, dtype=jnp.complex128),
-        jnp.asarray(fallback_omega, dtype=jnp.float64),
-        n_log,
-    )
+    _z = jnp.asarray(probe_omega, dtype=jnp.complex128)
+    _fb = jnp.asarray(fallback_omega, dtype=jnp.float64)
+    _W0 = jnp.asarray(Wc0_qmunu)
+
+    # --- q-CHUNKED EVALUATION (movement-only; see the note above the kernel).
+    # Leading axis is the q family; the trailing two are (mu, nu).  One q-slice
+    # of the LOCAL (already-sharded) tile is what sizes the arena.
+    _nq = int(_W0.shape[0])
+    _per_q = 1
+    for _d in _W0.shape[1:]:
+        _per_q *= int(_d)
+    _per_q *= _W0.dtype.itemsize
+    _qb = _gn_ppm_fit_q_block(_nq, _per_q)
+
+    if _qb >= _nq:
+        # Whole thing fits: the historical single-shot call, untouched.
+        omega_vals, B_vals, good, n_good, n_modes = _gn_ppm_fit_kernel(
+            Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log)
+    else:
+        _om, _bv, _gd = [], [], []
+        n_good = jnp.asarray(0.0, dtype=jnp.float64)
+        n_modes = jnp.asarray(0.0, dtype=jnp.float64)
+        for _q0 in range(0, _nq, _qb):
+            _q1 = min(_q0 + _qb, _nq)
+            _o, _b, _g, _ng, _nm = _gn_ppm_fit_kernel(
+                Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1], _z, _fb, n_log)
+            _om.append(_o); _bv.append(_b); _gd.append(_g)
+            # Exact integer counts -> summation order is irrelevant.
+            n_good = n_good + _ng
+            n_modes = n_modes + _nm
+        omega_vals = jnp.concatenate(_om, axis=0)
+        B_vals = jnp.concatenate(_bv, axis=0)
+        good = jnp.concatenate(_gd, axis=0)
+        del _om, _bv, _gd
+
+    fulfilled = n_good / jnp.maximum(n_modes, 1.0)
     # The ONLY host sync in the fit, and it is deliberately outside the
     # kernel: ``_scalar_to_host_float`` gathers, which cannot happen
     # under ``jit``.
     return omega_vals, B_vals, good, 1.0 - _scalar_to_host_float(fulfilled)
 
+
+# ---------------------------------------------------------------------------
+# GN-PPM fit q-chunking (size campaign 2026-07-29, ladder notes R32/R33)
+#
+# MEASURED DEFECT.  The docstring below predicts "~3 live slots" once jitted.
+# At MoS2 4x4 / mu_pad = 24,960 / P = 64 the real number is THIRTY-TWO: the
+# rank-0 HLO of the run that OOMed (job 7879469,
+# module_0914.jit__gn_ppm_fit_kernel) reports
+#     allocation 35: size 74.27GiB, preallocated-temp
+# against parameters/outputs of only 8.27 GiB total, all correctly sharded
+# c128[16,3120,3120] tiles (3120 = mu_pad/p_x).  74.27 GiB is EXACTLY
+# 32.0 x one tile.  XLA:CPU fused only 6 of ~111 full-tile instructions, so
+# the chain materialises dozens of temporaries instead of reusing a handful.
+# That arena is what killed mu=24,933 at P=64, twice, with the identical
+# 79,744,204,800-byte allocation.
+#
+# THE FIX IS MOVEMENT-ONLY.  Every operation in the kernel is elementwise in
+# the leading (q) axis and the two reductions are exact integer counts, so
+# evaluating q in blocks changes evaluation ORDER and PLACEMENT only.  The
+# arena falls as 1/n_blocks while the (already-sharded) inputs and outputs stay
+# resident.  Nothing about the arithmetic, the guards, or the fitted values
+# changes -- and the guards are deliberately NOT touched (see R33 note: a
+# finiteness/branch guard that costs scratch is an owner question, not
+# something to quietly restructure).
+_GN_PPM_FIT_ARENA_BUDGET_BYTES = int(
+    float(os.environ.get("LORRAX_PPM_FIT_ARENA_GIB", "8")) * 1024 ** 3)
+#: Measured live-temporary multiple of one (q-block, mu, nu) tile.
+_GN_PPM_FIT_LIVE_TILES = 32
+
+
+def _gn_ppm_fit_q_block(nq: int, tile_bytes_per_q: int) -> int:
+    """Largest q-block whose temp arena fits the budget.  Floor 1, cap nq.
+
+    ``tile_bytes_per_q`` is ONE q-slice of the local (already-sharded) tile.
+    Returns ``nq`` (the historical single-shot path, bit-identical) whenever
+    the whole thing already fits.
+    """
+    per_q = max(1, int(tile_bytes_per_q) * _GN_PPM_FIT_LIVE_TILES)
+    return max(1, min(int(nq), _GN_PPM_FIT_ARENA_BUDGET_BYTES // per_q))
 
 @partial(jax.jit, static_argnums=(4,))
 def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
@@ -460,7 +529,19 @@ def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
 
     denom = Wc0 - Wc_probe
     safe = jnp.abs(denom) > 1.0e-14
-    ratio = jnp.where(safe, Wc_probe / denom, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+    # INTERMEDIATE REDUCTION 1 (2026-07-29, owner directive; ladder notes R34).
+    # The old form was ``ratio = where(safe, Wc_probe/denom, 0)`` — a full-tile
+    # c128 SELECT (2.32 GiB at mu_pad=24960/P=64) purely as defensive masking.
+    # It is REDUNDANT, provably: ``safe`` remains ANDed into ``good`` below, and
+    # the ONLY consumer of ``ratio`` is omega_sq -> omega_sq_re -> sqrt, whose
+    # value is discarded by ``where(good, ...)`` on exactly the lanes where
+    # ``safe`` is false.  Case check on a lane with safe == False:
+    #   old: ratio=0 -> omega_sq_re=0 -> isfinite(0)=T, (0>0)=F -> good=F
+    #   new: ratio=inf/nan -> omega_sq_re=inf/nan -> isfinite=F     -> good=F
+    # both give good=False, and omega_vals/B_vals then take the SAME branch.
+    # Guard SEMANTICS are unchanged: ``safe`` still gates ``good``.  Only the
+    # materialisation of a masked copy is removed.
+    ratio = Wc_probe / denom
     omega_sq = -(z_probe * z_probe) * ratio
     omega_sq_re = jnp.real(omega_sq)
     good = (
@@ -472,13 +553,29 @@ def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
 
     # Pad modes born DEAD: Ω = 0 (hence B = -Wc0·Ω/2 = 0) outside the
     # logical block — see ``n_mu_logical`` in the wrapper.
-    omega_vals = jnp.where(
-        mode_mask, jnp.where(good, jnp.sqrt(omega_sq_re), fallback), 0.0)
+    #
+    # INTERMEDIATE REDUCTION 2: the old form was a NESTED pair of full-tile
+    # selects, ``where(mode_mask, where(good, sqrt, fallback), 0.0)``.  Because
+    # ``good`` already contains ``& mode_mask``, the outer select can be folded
+    # into the inner one's FALSE operand, and that operand then depends only on
+    # ``mode_mask`` — a (mu, nu) 2-D array with NO q axis.  Equivalence, all
+    # three reachable cases:
+    #   good=T (=> mode_mask=T): old sqrt        ; new sqrt                 ✓
+    #   good=F, mode_mask=T    : old fallback    ; new where(T,fallback,0)  ✓
+    #   good=F, mode_mask=F    : old 0.0         ; new where(F,fallback,0)  ✓
+    # Saves one full-tile f64 select (1.16 GiB) and one full-tile broadcast;
+    # the surviving fallback operand is nq times smaller.
+    _fallback_or_dead = jnp.where(mode_mask, fallback, 0.0)   # (mu, nu), 2-D
+    omega_vals = jnp.where(good, jnp.sqrt(omega_sq_re), _fallback_or_dead)
     B_vals = -0.5 * Wc0 * omega_vals.astype(jnp.complex128)
     m = jnp.broadcast_to(mode_mask, good.shape)
     n_modes = jnp.sum(m.astype(jnp.float64))
     n_good = jnp.sum(good.astype(jnp.float64))
-    return omega_vals, B_vals, good, n_good / jnp.maximum(n_modes, 1.0)
+    # RAW COUNTS, not the ratio (q-chunking 2026-07-29).  Both are sums of
+    # booleans, i.e. EXACT integers in float64 (max here ~1e10 << 2^53), so
+    # summing them across q-blocks is associativity-safe and the wrapper's
+    # single division reproduces the one-shot value BIT-EXACTLY.
+    return omega_vals, B_vals, good, n_good, n_modes
 
 
 @lru_cache(maxsize=64)
