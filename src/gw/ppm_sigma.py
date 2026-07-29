@@ -73,7 +73,7 @@ from .ppm_windows import (
     _CROSSING_A_MAX,
     crossing_regularization_floor,
 )
-from .ppm_tau_kernel import _get_sigma_tau_kernel, _laplace_merge_enabled
+from .ppm_tau_kernel import _get_sigma_tau_kernel
 from .ppm_accumulators import (
     _AccumMode,
     _select_accum_mode,
@@ -336,10 +336,11 @@ def minimax_tau_integrate_sigma(
         Callable ``t_j -> (σ_re, σ_im)`` that bundles G(τ)·W(τ), the
         FFT round-trip and ψ-projection for one τ scalar.  Closes over
         the window-pinned args (psi, masks, E_ref_A/B, B_q, Ω_q) so
-        the signature here reads parallel to chi0's builders.  On the
-        merged Laplace plan the tuple is ``(X, None)`` with
-        X = ψ†σψ = S_R + i·S_I from the single-chain kernel; the
-        accumulator consumes X directly.
+        the signature here reads parallel to chi0's builders.  For
+        Laplace windows the tuple is ``(X, None)`` with
+        X = ψ†σψ = S_R + i·S_I from the single-chain kernel (the default
+        and only Laplace channel plan); the accumulator consumes X
+        directly.  Crossing windows deliver the (σ_re, σ_im) pair.
     add_tau
         Callable invoked per τ with ``(σ_re, σ_im, t_c, α_eff_c)``.
         ``t_c`` and ``α_eff_c`` are Python complex scalars (already on
@@ -361,12 +362,12 @@ def minimax_tau_integrate_sigma(
     for i in range(int(nodes.t.shape[0])):
         t_c = complex(t_host[i])
         alpha_eff_c = complex(alpha_eff_host[i])
-        # Two-channel windows return σ^τ as a (re, im) tuple: the crossing
+        # Crossing windows return σ^τ as a (re, im) tuple: the crossing
         # window's HGL quadrature consumes Im[coeff·σ] = Re(c)·S_I +
         # Im(c)·S_R with independent real ω-weights, so both channels must
-        # ship.  Merged-plan Laplace windows return (X, None) — one complex
-        # tile, half the projection GEMMs / collective payload / D2H bytes;
-        # legal because their consumer forms only c·X (bilinearity).
+        # ship.  Laplace windows return (X, None) — one complex tile, half
+        # the projection GEMMs / collective payload / D2H bytes; legal
+        # because their consumer forms only c·X (bilinearity).
         #
         # Per-τ timing sub-rows (instrumentation, 2026-07-28; evidence: AQ
         # 4962c/P=64 — 'sigma.exec 272.040' hid 176 uniform 1.51 s τ
@@ -408,9 +409,9 @@ def _integrate_tau_windows_for_branch(
     psi_proj_xr: jax.Array,
     psi_proj_yn: jax.Array,
     tau_kernel: Callable[..., jax.Array],
+    tau_kernel_x: Callable[..., jax.Array],
     log_tag: str,
     print_fn,
-    tau_kernel_x: Callable[..., jax.Array] | None = None,
 ) -> None:
     """Walk windows; for each, dispatch ``minimax_tau_integrate_sigma``
     with closures that bind this window's (psi, masks, E_ref, kernel) and
@@ -419,15 +420,16 @@ def _integrate_tau_windows_for_branch(
     accumulator's sink, not this loop's.  See
     _TauAccumulator + _MemoryTileSink / _H5Sink.
 
-    Channel-plan dispatch (owner ruling 2026-07-28): when ``tau_kernel_x``
-    is provided (LORRAX_SIGMA_LAPLACE_MERGE=1), Laplace windows
-    (project="full", project_code=0) run the merged single-complex-chain
-    kernel — X = ψ†σψ, consumed directly by the accumulator as
-    ``(X, None)`` — because their ω-consumer forms only c·(S_R+i·S_I) = c·X
-    (bilinearity; ppm_tau_kernel._project_x_local).  Crossing windows
-    (project="imag") ALWAYS dispatch ``tau_kernel``, the two-channel
-    kernel, unchanged: their consumer weights S_R and S_I independently and
-    X under-determines the pair.
+    Channel-plan dispatch (owner ruling 2026-07-28; made the default and
+    only path by owner order the same day): Laplace windows
+    (project="full", project_code=0) ALWAYS run ``tau_kernel_x``, the
+    merged single-complex-chain kernel — X = ψ†σψ, consumed directly by
+    the accumulator as ``(X, None)`` — because their ω-consumer forms only
+    c·(S_R+i·S_I) = c·X (bilinearity; channel-plan doc in
+    ppm_tau_kernel._make_project_ri_reduce_scatter).
+    Crossing windows (project="imag") ALWAYS dispatch ``tau_kernel``, the
+    two-channel kernel, unchanged: their consumer weights S_R and S_I
+    independently and X under-determines the pair.
     """
     from common.progress import LoopProgress
 
@@ -466,9 +468,9 @@ def _integrate_tau_windows_for_branch(
                 E_ref_A_j   = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
                 E_ref_B_j   = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
 
-                # Merged plan: Laplace windows only (see docstring).
-                use_merged_x = (tau_kernel_x is not None
-                                and win.project_code == 0)
+                # Laplace windows dispatch the merged X kernel; crossing
+                # windows the two-channel kernel (see docstring).
+                use_merged_x = win.project_code == 0
                 kern = tau_kernel_x if use_merged_x else tau_kernel
 
                 def build_sigma_tau(t_j):
@@ -663,17 +665,14 @@ def _run_sigma_branch(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
     )
-    # Merged Laplace plan (LORRAX_SIGMA_LAPLACE_MERGE=1): sibling kernel for
-    # project="full" windows; crossing windows keep tau_kernel unchanged.
-    # Default OFF → tau_kernel_x is None and this branch is byte-identical
-    # to the two-channel path.
-    tau_kernel_x = None
-    if _laplace_merge_enabled():
-        tau_kernel_x = _get_sigma_tau_kernel(
-            mesh_xy=mesh_xy,
-            kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
-            merged_x=True,
-        )
+    # Merged Laplace-plan sibling kernel (the default and only path for
+    # project="full" windows — owner order 2026-07-28); crossing windows
+    # keep tau_kernel, the two-channel kernel, unchanged.
+    tau_kernel_x = _get_sigma_tau_kernel(
+        mesh_xy=mesh_xy,
+        kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
+        merged_x=True,
+    )
 
     # One async-D2H accumulator; the sink decides where a finished window goes.
     # Both sinks consume the SAME per-shard host tiles produced by the single
@@ -938,16 +937,6 @@ def compute_sigma_c_ppm_omega_grid(
         f"Nω={omega_req.size}, Δω={omega_step_ev:.3f} eV, "
         f"ξ={float(regularization_width_ry) * RYD_TO_EV:.3f} eV"
     )
-    # Channel plan announce (doctrine: an env-granted capability flips
-    # behavior loudly, never silently).  Default OFF prints nothing and the
-    # two-channel path is byte-untouched.
-    if _laplace_merge_enabled():
-        print_fn(
-            "  Σc channel plan: LAPLACE MERGE (LORRAX_SIGMA_LAPLACE_MERGE=1)"
-            " — project=full windows run ONE complex projection chain"
-            " X = ψ†σψ (consumer identity c·(S_R + i·S_I) = c·X, by"
-            " bilinearity); crossing windows keep the two-channel kernel."
-            "  Value-identical at the 1e-12 parity gate, not bit-exact.")
     if n_invalid:
         print_fn(
             f"  GN invalid modes: {n_invalid}/{n_total_modes} "

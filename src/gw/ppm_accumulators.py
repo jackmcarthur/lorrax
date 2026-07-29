@@ -94,27 +94,31 @@ def _project_tau_onto_omega_np(
     The window's ``project_code`` names the consumer:
 
         code=0 ("full")  Laplace window (single/stripe/slab) — keep the full
-                         complex product coeff·(σ_re + i·σ_im), i.e.
-                         coeff·(S_R + i·S_I) = coeff·X with X = ψ†σψ.  Only
-                         the recombined complex object is ever consumed here,
-                         which is what licenses the merged single-chain plan.
+                         complex product coeff·X with X = ψ†σψ = S_R + i·S_I.
+                         Only that recombined complex object is ever consumed
+                         here, which is what licenses the merged single-chain
+                         plan (the default and only Laplace path — owner
+                         order 2026-07-28).
         code=1 ("imag")  Crossing window — keep only Im[coeff·σ]
                          = coeff_re·σ_im + coeff_im·σ_re (real, up-cast to
                          c128): S_R and S_I are weighted by two INDEPENDENT
                          real ω-vectors, so both channels must arrive
-                         separately (they cannot be recovered from X — see
-                         ppm_tau_kernel._project_ri_local).
+                         separately (they cannot be recovered from X — see the
+                         channel-plan doc in
+                         ppm_tau_kernel._make_project_ri_reduce_scatter).
 
-    Channel carriers: on the two-channel plan σ^τ arrives as the real/imag
-    pair ``(sigma_re, sigma_im)`` — the crossing consumer needs the split,
-    and carrying complex σ^τ through the FFT pipeline would double memory
-    for no benefit.  On the merged Laplace plan
-    (LORRAX_SIGMA_LAPLACE_MERGE=1) the kernel ships X = S_R + i·S_I as ONE
-    complex tile: ``sigma_im is None`` and ``sigma_re`` carries X.  That
-    form is only defined for code=0 (bilinearity: ψ†σψ = ψ†σ_Rψ + i·ψ†σ_Iψ,
-    so coeff·X equals the recombined two-channel product to GEMM-association
-    roundoff; gated at 1e-12).  A merged tile reaching code=1 is a dispatch
-    bug and raises.
+    Channel carriers mirror the codes one-to-one.  Laplace (code=0): the
+    merged kernel ships X = S_R + i·S_I as ONE complex tile —
+    ``sigma_im is None`` and ``sigma_re`` carries X (bilinearity:
+    ψ†σψ = ψ†σ_Rψ + i·ψ†σ_Iψ, so coeff·X equals the recombined two-channel
+    product to GEMM-association roundoff; gated at 1e-12).  Crossing
+    (code=1): σ^τ arrives as the real/imag pair ``(sigma_re, sigma_im)`` —
+    that consumer needs the split, and carrying complex σ^τ through the FFT
+    pipeline would double memory for no benefit.  Any cross-pairing is a
+    dispatch bug and raises: a merged tile at code=1 (the load-bearing
+    guard — the crossing math CANNOT be recovered from X), and a
+    two-channel pair at code=0 (its recombine branch died when the merge
+    became the default).
     """
     omega_kernel = np.exp(1j * omega_sign * omega_vec * t_node)
     # ``pref`` is folded into the (n_ω,)-sized coeff instead of multiplying
@@ -128,7 +132,7 @@ def _project_tau_onto_omega_np(
     # is bit-exact.
     coeff = (pref * alpha_eff) * omega_kernel
     if sigma_im is None:
-        # Merged Laplace plan: sigma_re IS the complex X = S_R + i·S_I.
+        # Laplace plan: sigma_re IS the complex X = S_R + i·S_I.
         if project_code != 0:
             raise ValueError(
                 "merged single-chain σ (X = ψ†σψ) reached a crossing "
@@ -137,15 +141,21 @@ def _project_tau_onto_omega_np(
                 "(ppm_sigma window dispatch bug).")
         contrib = coeff.reshape(-1, 1, 1, 1) * sigma_re[None, ...]
         return np.asarray(contrib, dtype=np.complex128)
+    # Two-channel (S_R, S_I) pair: crossing windows only.  The Laplace
+    # recombine branch (pair at code=0) died when the merge became the
+    # default (owner order 2026-07-28) — reaching it is a dispatch bug.
+    if project_code == 0:
+        raise ValueError(
+            "two-channel (sigma_re, sigma_im) pair reached a Laplace "
+            "consumer (project_code=0) — Laplace windows always dispatch "
+            "the merged single-chain kernel and ship X = ψ†σψ as (X, None) "
+            "(ppm_sigma window dispatch bug).")
+    if project_code != 1:
+        raise ValueError(f"Unknown project_code {project_code}")
     coeff_re = np.real(coeff).reshape(-1, 1, 1, 1)
     coeff_im = np.imag(coeff).reshape(-1, 1, 1, 1)
-    if project_code == 0:           # full Laplace window
-        sigma_full = sigma_re[None, ...] + 1j * sigma_im[None, ...]
-        contrib = (coeff_re + 1j * coeff_im) * sigma_full
-    elif project_code == 1:         # crossing window — keep Im[coeff·σ]
-        contrib = coeff_re * sigma_im[None, ...] + coeff_im * sigma_re[None, ...]
-    else:
-        raise ValueError(f"Unknown project_code {project_code}")
+    # Crossing window — keep Im[coeff·σ]
+    contrib = coeff_re * sigma_im[None, ...] + coeff_im * sigma_re[None, ...]
     return np.asarray(contrib, dtype=np.complex128)
 
 
@@ -181,10 +191,10 @@ class _SigmaAccumulator:
     no separate scale argument.  ``t_c`` / ``α_eff_c`` are Python/host complex
     scalars computed once in :func:`minimax_tau_integrate_sigma`.
 
-    On the merged Laplace plan (LORRAX_SIGMA_LAPLACE_MERGE=1, project="full"
-    windows) ``add_tau`` receives ``(X, None, t_c, α_eff_c)`` — the single
-    complex X = ψ†σψ = S_R + i·S_I in the ``sigma_re`` slot; crossing windows
-    always deliver the (σ_re, σ_im) pair.
+    For Laplace (project="full") windows ``add_tau`` receives
+    ``(X, None, t_c, α_eff_c)`` — the single complex X = ψ†σψ = S_R + i·S_I
+    in the ``sigma_re`` slot (the default and only Laplace channel plan);
+    crossing windows always deliver the (σ_re, σ_im) pair.
     """
     def begin_window(self, window: '_SigmaWindow') -> None: ...
     def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_eff_c: complex) -> None: ...
@@ -238,7 +248,7 @@ class _TauAccumulator(_SigmaAccumulator):
         # Grab EVERY local shard handle and start the D2H copies now — do NOT
         # materialize to numpy yet.  ``copy_to_host_async`` returns the same
         # shard object with the transfer kicked off in the background.
-        # ``sigma_im is None`` = merged Laplace plan: ``sigma_re`` carries the
+        # ``sigma_im is None`` = Laplace window: ``sigma_re`` carries the
         # single complex X = S_R + i·S_I, and the per-τ D2H volume HALVES
         # (one c128 tile per shard instead of the re/im pair).
         shards_re = sigma_re.addressable_shards

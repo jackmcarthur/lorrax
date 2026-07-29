@@ -133,6 +133,9 @@ _HOST_TARGET_SYMBOLS = {
     # LORRAX_FFT_FFI backend of common.fft_helpers (FFT-FFI prototype).
     "lorrax_mklfft_flat_k":           "MklFftFlatKHostFfi",
     "lorrax_mklfft_gw_conv":          "MklFftGwConvHostFfi",
+    # MKL batched-GEMM handler (mklblas/cpp) — the LORRAX_BANDS_GEMM_FFI
+    # body of common.contract_bands (contract_bands_block_reshard).
+    "lorrax_mklblas_gemm_batch":      "MklBlasGemmBatchHostFfi",
     "lorrax_phdf5_read":              "PhdfReadHostFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkHostFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionHostFfi",

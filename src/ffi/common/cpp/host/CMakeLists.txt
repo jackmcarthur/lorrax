@@ -274,6 +274,38 @@ if(LORRAX_HOST_HAVE_SLATE)
                         "flat-k FFT handlers skipped (LORRAX_FFT_FFI will "
                         "refuse at runtime).")
                 endif()
+
+                # ------------------------------------------------------
+                # MKL batched-GEMM host handler (mklblas/cpp/
+                # gemm_batch_ffi.cc; contract_bands FFI GEMM body,
+                # 2026-07-28 — RESHARD_OVERHEAD_MEMO Sec. 4.4 exit (b)).
+                # cblas_{d,z}gemm_batch ride the SAME MKL link line as
+                # ScaLAPACK/DFTI above (mkl_intel_lp64/threading/core —
+                # zero new link deps); needs only mkl_cblas.h.  Compiled
+                # -fopenmp for omp_get_max_threads() in its thread-cap
+                # policy (gomp already linked via mkl_gnu_thread).
+                # ------------------------------------------------------
+                if(EXISTS "${_mkl_incdir}/mkl_cblas.h")
+                    list(APPEND LORRAX_FFI_HOST_SOURCES
+                        ../../../mklblas/cpp/gemm_batch_ffi.cc)
+                    if(NOT LORRAX_MKLFFT_INCLUDE_DIR)
+                        set(LORRAX_MKLFFT_INCLUDE_DIR "${_mkl_incdir}")
+                    endif()
+                    if(NOT LORRAX_MKL_THREAD_LIB STREQUAL "mkl_gnu_thread")
+                        list(APPEND _scalapack_link "-lgomp")
+                    endif()
+                    set_source_files_properties(
+                        ../../../mklblas/cpp/gemm_batch_ffi.cc
+                        PROPERTIES COMPILE_OPTIONS "-fopenmp")
+                    message(STATUS
+                        "mklblas: MKL batched-GEMM host handler ON "
+                        "(headers at ${_mkl_incdir})")
+                else()
+                    message(STATUS
+                        "mklblas: ${_mkl_incdir}/mkl_cblas.h not found — "
+                        "batched-GEMM handler skipped (LORRAX_BANDS_GEMM_FFI "
+                        "will refuse at runtime).")
+                endif()
             else()
                 set(_scalapack_link "")
                 message(WARNING
