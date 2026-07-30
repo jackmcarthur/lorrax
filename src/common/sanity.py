@@ -71,6 +71,7 @@ __all__ = [
     "warn",
     "check_finite",
     "check_hermitian",
+    "report_hermitian_residual",
     "check_positive",
     "check_in_range",
     "check_sign",
@@ -283,6 +284,59 @@ def _herm_stats(a):
     return fn(a)
 
 
+def report_hermitian_residual(
+    name: str,
+    dev: float,
+    scale: float,
+    *,
+    print_fn: Callable[..., Any] = print,
+    rtol: float = 1e-8,
+    verbose: bool = False,
+    detail: str = "",
+    always: bool = False,
+) -> bool:
+    """Verdict + message for a Hermiticity residual already reduced to scalars.
+
+    ``dev = max|A − Aᴴ|``, ``scale = max|A|``.  This is the half of
+    :func:`check_hermitian` that never touches the array, split out so that a
+    check whose reduction MUST happen inside a traced region reaches the same
+    verdict, through the same tolerance, with the same wording as the
+    construction-site gates.  One implementation of "is this Hermitian and what
+    do I tell the human", not two — see ``solvers/lanczos.py``, which reduces
+    ``α − αᴴ`` inside the Lanczos ``fori_loop`` (it cannot ``device_get`` there)
+    and hands the two scalars back out through a debug callback.
+
+    ``always=True`` evaluates and reports **regardless of ``LORRAX_SANITY``**.
+    The off-switch documented at the top of this module is a *cost* escape
+    hatch; a caller whose residual was already computed by the algorithm it is
+    checking has no cost to escape, and an invariant that a stray environment
+    variable can silence is not an invariant.  ``strict`` still raises.
+    """
+    if not (always or sanity_enabled()):
+        return True
+    dev = float(dev)
+    scale = float(scale)
+    suffix = f"  {detail}" if detail else ""
+    if not np.isfinite(dev) or not np.isfinite(scale):
+        warn(f"{name} hermiticity residual is not finite "
+             f"(max|A-Aᴴ|={dev}, max|A|={scale}).{suffix}", print_fn=print_fn)
+        return False
+    rel = dev / scale if scale > 0.0 else dev
+    if verbose:
+        print_fn(f"  sanity[{name}]: hermiticity residual = {rel:.3e} "
+                 f"(abs {dev:.3e}, scale {scale:.3e})")
+    if rel > float(rtol):
+        warn(
+            f"{name} is NOT Hermitian: max|A-Aᴴ|/max|A| = {rel:.3e} > "
+            f"{float(rtol):.1e} (abs {dev:.3e} on scale {scale:.3e}).  "
+            f"A Hermitian-by-construction tile losing hermiticity means an "
+            f"index/shard mixing bug, not a numerical one.{suffix}",
+            print_fn=print_fn,
+        )
+        return False
+    return True
+
+
 def check_hermitian(
     name: str,
     matrix: Any,
@@ -330,24 +384,8 @@ def check_hermitian(
             return True
         dev = float(np.max(np.abs(a - np.conj(np.swapaxes(a, -1, -2)))))
         scale = float(np.max(np.abs(a)))
-    if not np.isfinite(dev) or not np.isfinite(scale):
-        warn(f"{name} hermiticity residual is not finite "
-             f"(max|A-Aᴴ|={dev}, max|A|={scale}).", print_fn=print_fn)
-        return False
-    rel = dev / scale if scale > 0.0 else dev
-    if verbose:
-        print_fn(f"  sanity[{name}]: hermiticity residual = {rel:.3e} "
-                 f"(abs {dev:.3e}, scale {scale:.3e})")
-    if rel > float(rtol):
-        warn(
-            f"{name} is NOT Hermitian: max|A-Aᴴ|/max|A| = {rel:.3e} > "
-            f"{float(rtol):.1e} (abs {dev:.3e} on scale {scale:.3e}).  "
-            f"A Hermitian-by-construction tile losing hermiticity means an "
-            f"index/shard mixing bug, not a numerical one.",
-            print_fn=print_fn,
-        )
-        return False
-    return True
+    return report_hermitian_residual(
+        name, dev, scale, print_fn=print_fn, rtol=rtol, verbose=verbose)
 
 
 def check_positive(

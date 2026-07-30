@@ -5,10 +5,19 @@ Finds the lowest n_eig eigenvalues of a Hermitian operator H given only
 a callable matvec.  No physics knowledge — works for any Hermitian
 eigenproblem.
 
-Three variants:
-  - simple_lanczos_eig:  Python-loop, full reorthogonalization
-  - lanczos_eig_jit:     lax.fori_loop, partial reorthogonalization (JIT-able)
-  - block_lanczos_eig:   Block Lanczos for shaped state vectors
+Five variants:
+  - simple_lanczos_eig:              Python-loop, full reorthogonalization
+  - lanczos_eig_jit:                 lax.fori_loop, partial reorth (JIT-able)
+  - block_lanczos_eig:               Block Lanczos, Python loop, shaped vectors
+  - block_lanczos_eig_jit:           Block Lanczos in lax.fori_loop
+  - block_lanczos_eig_jit_converged: as above, Ritz-stability exit
+
+Every one of them carries the **α-Hermiticity invariant** — see the section
+below ``import numpy as np``.  ``⟨q, Hq⟩`` is real for a Hermitian H, so the
+imaginary part of ``α`` (which the recurrence computes and used to discard) is
+a free detector for "the matvec did not return H·q".  It is always on because
+it is free; it is the only invariant in this codebase that sits on COLLECTIVE
+OUTPUT rather than on a construction tile.
 
 Usage
 -----
@@ -23,6 +32,196 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 import numpy as np
+
+
+# ===========================================================================
+# The Hermitian-form invariant the recurrence already computes
+# ===========================================================================
+#
+# WHY THIS IS HERE
+# ----------------
+# Every Lanczos variant below forms
+#
+#     α_j = ⟨q_j, H q_j⟩            (scalar variants)
+#     α_j = Q_jᴴ H Q_j              (block variants, (bs, bs))
+#
+# and then throws away the part of it that is a free integrity check.  The
+# scalar variants took ``.real`` and discarded ``Im α``; the block variants
+# built T and symmetrised it with ``(T + Tᴴ)/2`` (see ``_build_block_tridiag``),
+# which discards ``α − αᴴ``.  For a Hermitian H both discarded quantities are
+# ZERO in exact arithmetic — a Hermitian form has a real value, a Hermitian
+# Gram block is Hermitian — for ANY q, converged or not, at every iteration.
+#
+# That makes ``Im α`` a detector for "the matvec did not return H·q".  It is
+# blind to nothing that matters and it costs nothing, because the complex dot
+# product that produces it is already on the critical path.
+#
+# The concrete motivation (2026-07-29): ``jax.lax.psum_scatter`` under
+# ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=gloo`` silently returns wrong data in
+# ~5 % of executions, always in output segment 0, with a plausible magnitude
+# and a zero exit code (``wk_REL/UPSTREAM_gloo_psum_scatter_corruption.md``).
+# The BSE matvec issues two of them per iteration
+# (``bse/bse_stack_matvec.py:126,129``).  A corrupted segment makes the
+# returned vector not equal to H·q, which breaks the Hermitian form by the
+# size of the error.  The archaeology found that ``check_hermitian`` runs at
+# five sites in this codebase and NONE of them is downstream of a
+# reduce-scatter — every invariant sat on construction tiles.  This is the one
+# that sits on collective OUTPUT, and it is the reason a whole campaign of
+# 1913 job logs contains no detection of a bug that was firing all along.
+#
+# THE QUANTITY, AND WHY IT IS check_hermitian's
+# ---------------------------------------------
+# The tridiagonal T built from these α's is Hermitian by construction, so
+# ``(T − Tᴴ)_jj = α_j − conj(α_j) = 2i·Im α_j``.  Reporting
+#
+#     rel = max_j |Im α_j| / max_j |α_j|
+#
+# is therefore literally ``max|A − Aᴴ| / max|A|`` (up to the factor 2)
+# restricted to T's diagonal — the SAME residual, scaled against the tile's own
+# scale, that ``common.sanity.check_hermitian`` computes.  Both paths report
+# through ``sanity.report_hermitian_residual`` so there is one verdict, one
+# tolerance and one message, not two.  Normalising by ``max_j |α_j|`` rather
+# than by the per-iteration ``|α_j|`` is deliberate and is check_hermitian's own
+# convention: a single α passing near zero (a Krylov direction nearly orthogonal
+# to Hq) must not manufacture a false positive.
+#
+# THE TOLERANCE — DERIVED, NOT TUNED
+# ----------------------------------
+# With ``‖q‖₂ = 1`` and u = 2⁻⁵³ = 1.11e-16 the unit roundoff of float64, the
+# computed ``Im α`` has exactly two sources, and both scale with a CONTRACTION
+# LENGTH times u:
+#
+#   (1) the dot product itself.  α = Σᵢ conj(qᵢ) zᵢ over n terms; the standard
+#       bound is |fl(Σ) − Σ| ≤ γ_n Σ|qᵢ zᵢ| ≤ γ_n‖q‖‖z‖ = γ_n‖z‖ with
+#       γ_n = nu/(1−nu) ≈ n·u (pairwise summation, which XLA/BLAS actually use,
+#       reduces this to O(log n · u) — we keep the pessimistic n·u).
+#
+#   (2) the matvec.  z = fl(Hq) = Hq + δz with ‖δz‖ ≲ c_H·u·‖H‖, where c_H is
+#       the effective accumulation depth of the matvec.  ⟨q, δz⟩ has no reason
+#       to be real, so it lands in Im α at ≲ c_H·u·‖H‖.  For the BSE matvec the
+#       deep chains are the two reduce-scatter contractions over μ and ν
+#       (length N_mu each) plus the k-FFT (nk log nk) and the c/v einsums, so
+#       c_H ≈ 2·N_mu + nk·log₂nk + n_c + n_v = O(N_mu).
+#
+# Adding them and dividing by scale = max_j|α_j| = θ‖H‖ (θ = O(1) once the
+# Krylov space has sampled the spectrum; θ ≥ 0.1 is generous for BSE, whose H
+# is gapped and positive):
+#
+#     rel ≲ (n + c_H)·u / θ
+#
+# At the LARGEST production BSE shape on this stack (N_mu = 10015, n = n_c·n_v·nk
+# ≈ 4·10³):  (4·10³ + 2·10⁴)·1.11e-16 / 0.1 ≈ 2.7e-11.
+#
+# ``ALPHA_HERM_RTOL = 1e-9`` therefore sits ~40× above the worst-case round-off
+# budget of the largest shape we run (and ~10⁶× above what a small deck
+# actually measures), while the corruption it exists to catch is a RELATIVE
+# perturbation of order 1e-2…1e-1 of the matvec output — 7 to 8 orders of
+# magnitude above the threshold.  There is no tuning freedom in that gap: any
+# tolerance in [1e-11, 1e-4] gives the same verdict on every case we have.  It
+# is not chosen to make a test pass; it is the round-off bound rounded up.
+#
+# COST — why this is always-on and not behind LORRAX_SANITY
+# ---------------------------------------------------------
+# Scalar variants: ``jnp.vdot`` already produces a complex scalar, so ``.imag``
+# is the half of it that was being discarded — at worst two extra length-n
+# multiply-accumulate passes, against a matvec that is orders of magnitude more
+# expensive, and against the reorthogonalisation's own n_reorth dot products
+# in the same loop body.  Block variants: α_j is already fully materialised
+# (the recurrence subtracts ``Q_j @ α_j``), so the residual is bs² = O(10) flops
+# on a tile that is already in registers.  Neither adds a collective, a device
+# sync, or a full-tile pass.  Per the owner's rule, a free invariant is
+# always-on: it reports through ``report_hermitian_residual(..., always=True)``,
+# which bypasses the ``LORRAX_SANITY`` *cost* escape hatch while still honouring
+# ``strict``.
+#
+# The residual leaves the traced region through ONE ``jax.debug.callback`` per
+# solve (unordered, three float64 scalars).  It cannot be a return value: these
+# solvers run inside ``bse_lanczos._full_run``'s outer jit with fixed
+# ``out_shardings``, and you cannot raise from inside a ``fori_loop``.
+
+ALPHA_HERM_RTOL = 1e-9
+
+_ALPHA_FORMS = {
+    "vec": ("<q,Hq>",
+            "alpha_j = <q_j, H q_j> is REAL for any Hermitian H and any q_j, "
+            "so a nonzero imaginary part"),
+    "block": ("Q^H H Q",
+              "alpha_j = Q_j^H H Q_j is HERMITIAN for any Hermitian H and any "
+              "Q_j, so a nonzero antihermitian part"),
+}
+
+_ALPHA_CAUSE = (
+    " means the matvec did not return H*q -- the "
+    "operator, not the algorithm, is wrong.  Known cause on this stack: a "
+    "silent reduce-scatter corruption (jax.lax.psum_scatter under "
+    "JAX_CPU_COLLECTIVES_IMPLEMENTATION=gloo returns wrong data in ~5% of "
+    "executions, always output segment 0; see "
+    "wk_REL/UPSTREAM_gloo_psum_scatter_corruption.md).  Re-run under "
+    "JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi (clean in 584/584) before "
+    "believing any eigenvalue from this solve.  Other candidates: a "
+    "non-Hermitian W/V tile fed to the matvec, or a mis-transposed shard."
+)
+
+
+def _report_alpha_herm(name: str, form: str, dev, scale, worst) -> bool:
+    """Host-side half of the α-Hermiticity gate (called from a debug callback).
+
+    ``dev = max_j|Im α_j|`` (or ``max_j max|α_j − α_jᴴ|`` for the block
+    variants), ``scale = max_j|α_j|``, ``worst`` = the iteration index where
+    ``dev`` was attained, which is what a human needs to know next.
+    """
+    from common import sanity
+
+    dev = float(np.asarray(dev))
+    scale = float(np.asarray(scale))
+    worst = int(np.asarray(worst))
+    rel = dev / scale if scale > 0.0 else dev
+    label, why = _ALPHA_FORMS[form]
+    ok = sanity.report_hermitian_residual(
+        f"{name} alpha (Hermitian form {label})", dev, scale,
+        rtol=ALPHA_HERM_RTOL, always=True,
+        detail=f"Worst iteration: j={worst}.  {why}{_ALPHA_CAUSE}",
+    )
+    if ok:
+        try:
+            first = jax.process_index() == 0
+        except Exception:
+            first = True
+        if first:
+            print(f"  lanczos[{name}]: alpha non-Hermitian part / "
+                  f"max|alpha| = {rel:.3e} "
+                  f"(tol {ALPHA_HERM_RTOL:.0e}, worst j={worst})  OK",
+                  flush=True)
+    return ok
+
+
+def _emit_alpha_herm(name: str, alpha_im, alpha_re,
+                     form: str = "vec") -> None:
+    """Reduce the per-iteration α residual to 3 scalars and ship them out.
+
+    ``alpha_im`` : (n_iter,) real — |Im α_j| (scalar variants) or
+    ``max|α_j − α_jᴴ|`` (block variants).  ``alpha_re`` : (n_iter,) real —
+    |α_j| (or ``max|α_j|``).  Traced-safe: pure reductions plus one unordered
+    ``jax.debug.callback``, no collectives, no device sync.
+    """
+    dev = jnp.max(alpha_im)
+    scale = jnp.max(alpha_re)
+    worst = jnp.argmax(alpha_im)
+    jax.debug.callback(
+        lambda d, s, w: _report_alpha_herm(name, form, d, s, w),
+        dev, scale, worst)
+
+
+def _block_alpha_stats(alpha_all):
+    """Per-block ``(max|α − αᴴ|, max|α|)`` for a stack of (bs, bs) α blocks.
+
+    Exactly ``check_hermitian``'s two numbers, evaluated per iteration on a
+    tile that is already resident.  O(n_iter · bs²) — free.
+    """
+    herm = jnp.conj(jnp.swapaxes(alpha_all, -1, -2))
+    dev = jnp.max(jnp.abs(alpha_all - herm), axis=(-2, -1))
+    scale = jnp.max(jnp.abs(alpha_all), axis=(-2, -1))
+    return dev, scale
 
 
 def block_lanczos_eig(
@@ -111,6 +310,15 @@ def block_lanczos_eig(
         Q_blocks.append(Q_next_flat)
         Q_current = Q_next_flat.reshape(block_size, *shape)
 
+    # α-Hermiticity gate.  ``alpha_j = Q_jᴴ H Q_j`` is a Hermitian Gram block
+    # for any Q_j; the (T + Tᴴ)/2 below would silently absorb any violation.
+    # This path is eager, so ``check_hermitian`` applies verbatim to the tiny
+    # (n_blocks, bs, bs) stack — no callback needed.
+    from common import sanity
+    sanity.check_hermitian(
+        "block_lanczos_eig alpha (Hermitian form Q^H H Q)",
+        jnp.stack(alpha_blocks), rtol=ALPHA_HERM_RTOL)
+
     n_blocks = len(alpha_blocks)
     T_size = n_blocks * block_size
     T = jnp.zeros((T_size, T_size), dtype=jnp.complex128)
@@ -179,10 +387,14 @@ def simple_lanczos_eig(
     Q = Q.at[:, 0].set(q)
     alpha = jnp.zeros((max_iter,), dtype=jnp.float64)
     beta = jnp.zeros((max_iter,), dtype=jnp.float64)
+    # |Im α_j| — the half of the Hermitian form this loop used to discard.
+    alpha_im = jnp.zeros((max_iter,), dtype=jnp.float64)
 
     for j in range(max_iter):
         z = matvec(q)
-        alpha = alpha.at[j].set(jnp.vdot(q, z).real)
+        alpha_c = jnp.vdot(q, z)           # ONE dot; both halves are used.
+        alpha = alpha.at[j].set(alpha_c.real)
+        alpha_im = alpha_im.at[j].set(jnp.abs(alpha_c.imag))
 
         if j > 0:
             z = z - beta[j - 1] * Q[:, j - 1]
@@ -199,6 +411,9 @@ def simple_lanczos_eig(
 
         q = z / beta[j]
         Q = Q.at[:, j + 1].set(q)
+
+    _emit_alpha_herm("simple_lanczos_eig",
+                     alpha_im[:max_iter], jnp.abs(alpha[:max_iter]))
 
     T = jnp.diag(alpha[:max_iter])
     if max_iter > 1:
@@ -259,13 +474,20 @@ def lanczos_eig_jit(
     Q = Q.at[:, 0].set(q0)
     alpha = jnp.zeros((max_iter,), dtype=jnp.float64)
     beta = jnp.zeros((max_iter,), dtype=jnp.float64)
+    # |Im α_j| — carried alongside α, checked once after the loop.  Two extra
+    # float64 slots of carry; see the module header for the cost argument.
+    alpha_im = jnp.zeros((max_iter,), dtype=jnp.float64)
 
     def lanczos_step(j, carry):
-        Q, alpha, beta, q_prev = carry
+        Q, alpha, beta, alpha_im, q_prev = carry
         z = matvec(q_prev)
 
-        alpha_j = jnp.vdot(q_prev, z).real
+        # ONE complex dot product.  ``.real`` drives the recurrence; ``.imag``
+        # is the Hermitian-form residual that used to be discarded here.
+        alpha_c = jnp.vdot(q_prev, z)
+        alpha_j = alpha_c.real
         alpha = alpha.at[j].set(alpha_j)
+        alpha_im = alpha_im.at[j].set(jnp.abs(alpha_c.imag))
 
         z = z - alpha_j * q_prev
         q_prev_prev = Q[:, jnp.maximum(j - 1, 0)]
@@ -287,10 +509,13 @@ def lanczos_eig_jit(
         q_next = z / jnp.maximum(beta_j, 1e-15)
         Q = Q.at[:, j + 1].set(q_next)
 
-        return (Q, alpha, beta, q_next)
+        return (Q, alpha, beta, alpha_im, q_next)
 
-    init_carry = (Q, alpha, beta, q0)
-    Q, alpha, beta, _ = lax.fori_loop(0, max_iter, lanczos_step, init_carry)
+    init_carry = (Q, alpha, beta, alpha_im, q0)
+    Q, alpha, beta, alpha_im, _ = lax.fori_loop(
+        0, max_iter, lanczos_step, init_carry)
+
+    _emit_alpha_herm("lanczos_eig_jit", alpha_im, jnp.abs(alpha))
 
     T = jnp.diag(alpha)
     off_diag = beta[:-1]
@@ -443,6 +668,10 @@ def block_lanczos_eig_jit(
     Q_all, alpha_all, beta_all = lax.fori_loop(
         0, int(max_iter), body, (Q_all, alpha_all, beta_all))
 
+    # α-Hermiticity gate, BEFORE _build_block_tridiag's (T + Tᴴ)/2 absorbs it.
+    _emit_alpha_herm("block_lanczos_eig_jit", *_block_alpha_stats(alpha_all),
+                     form="block")
+
     # Block-tridiagonal T built inside-jit (no Python loop unroll).
     T = _build_block_tridiag(alpha_all, beta_all, int(max_iter), bs)
 
@@ -586,6 +815,12 @@ def block_lanczos_eig_jit_converged(
 
     init = (jnp.int32(0), Q_all, alpha_all, beta_all, last_evals, converged)
     j_final, Q_all, alpha_all, beta_all, _, _ = lax.while_loop(cond, body, init)
+
+    # α-Hermiticity gate, BEFORE _build_block_tridiag's (T + Tᴴ)/2 absorbs it.
+    # Blocks past ``j_final`` were never written and are exactly zero, so they
+    # contribute 0 to both the deviation and the scale — no mask needed.
+    _emit_alpha_herm("block_lanczos_eig_jit_converged",
+                     *_block_alpha_stats(alpha_all), form="block")
 
     # Final eigh — mask inactive blocks the same way as the convergence
     # check, otherwise the zero eigvals from unfilled iters dominate
