@@ -206,15 +206,39 @@ def warmup_davidson_jit(
     sharding : jax.sharding.Sharding, optional
         If given, dummy buffers are placed under this sharding so the
         compile cache key matches the production shardings.
+
+    Notes
+    -----
+    Placement uses ``common.collectives.device_put_process_local``, NOT a
+    bare ``jax.device_put``.  ``jnp.zeros(...)`` is an **uncommitted**
+    ``jax.Array``, and ``jax/_src/dispatch.py::_device_put_sharding_impl``
+    takes the ``multihost_utils.assert_equal`` branch for an uncommitted
+    operand whenever the target sharding is not fully addressable — a real
+    ``process_allgather`` that materialises ``P × V.nbytes`` on **every**
+    rank (AA.1 / AO.1).  The BSE caller
+    (``bse.bse_lanczos``, ``solver_kind='davidson'``) passes
+    ``NamedSharding(mesh_xy, P(None, 'x', 'y', None))`` — a multi-process
+    sharding — and calls this once per subspace size in
+    ``{n_eig, 2·n_eig, …, m_max}``, so the antipattern fires four times on
+    the full trial-vector block before a single matvec runs.
+    The precondition ``device_put_process_local`` documents holds
+    trivially: the operand is all-zeros, hence bit-identical on every rank.
+    The host seed is a **zero-copy** ``np.broadcast_to`` view (the same
+    trick AO.1 used for ``bse_w_exact``'s probe seed), so no rank ever
+    materialises the global buffer on the host either — the helper's
+    ``np.ascontiguousarray(arr[idx])`` realises only this rank's shard.
     """
     if m_max is None:
         m_max = 4 * n_eig
     for m in range(n_eig, m_max + n_eig, n_eig):
         m_eff = min(m, m_max)
         shape = (m_eff,) + tuple(trailing_shape)
-        V = jnp.zeros(shape, dtype=dtype)
-        if sharding is not None:
-            V = jax.device_put(V, sharding)
+        if sharding is None:
+            V = jnp.zeros(shape, dtype=dtype)
+        else:
+            from common.collectives import device_put_process_local
+            V = device_put_process_local(
+                np.broadcast_to(np.zeros((), dtype=dtype), shape), sharding)
         HV = V
         _ritz_and_residuals(V, HV, n_eig)
 

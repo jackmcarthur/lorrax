@@ -519,10 +519,22 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
     #   * mask_A, scalars: at runtime go through ``jnp.asarray(numpy_val)``
     #     which stays uncommitted — leave as plain jnp to match.
     #   * mask_B inherits Ω_q's sharding, same as ``_materialize_window_mask_B``.
+    #
+    # Placement uses ``device_put_process_local``, NOT a bare
+    # ``jax.device_put`` (AA.1 / AO.1): ``jnp.zeros(...)`` is an
+    # UNCOMMITTED ``jax.Array``, and ``_device_put_sharding_impl`` takes
+    # the ``multihost_utils.assert_equal`` (= ``process_allgather``)
+    # branch for an uncommitted operand onto a sharding that is not fully
+    # addressable.  ``rep_2d`` is multi-process, so the bare call was a
+    # real P-linear collective inside the AOT precompile.  The helper
+    # produces the SAME committed ``NamedSharding(P(None, None))`` array,
+    # which is the only property this dummy has to have.  The replication
+    # precondition holds trivially (all-zeros).
     nb_full = int(psi_coh_xn.shape[-1])
     rep_2d  = NamedSharding(mesh_xy, P(None, None))
-    E_A     = jax.device_put(
-        jnp.zeros((int(meta.nk_tot), nb_full), dtype=jnp.float64), rep_2d)
+    from common.collectives import device_put_process_local
+    E_A     = device_put_process_local(
+        np.zeros((int(meta.nk_tot), nb_full), dtype=np.float64), rep_2d)
     mask_A  = jnp.ones((int(meta.nk_tot), nb_full), dtype=bool)
     mask_B  = jnp.ones_like(ppm.Omega_q, dtype=bool)
     E_ref_A = jnp.asarray(0.0, dtype=jnp.float64)
