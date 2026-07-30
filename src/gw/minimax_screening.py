@@ -455,17 +455,22 @@ def fit_gn_ppm_from_wc_pair(
 # ---------------------------------------------------------------------------
 # GN-PPM fit q-chunking (size campaign 2026-07-29, ladder notes R32/R33)
 #
-# MEASURED DEFECT.  The docstring below predicts "~3 live slots" once jitted.
-# At MoS2 4x4 / mu_pad = 24,960 / P = 64 the real number is THIRTY-TWO: the
-# rank-0 HLO of the run that OOMed (job 7879469,
-# module_0914.jit__gn_ppm_fit_kernel) reports
+# MEASURED DEFECT.  At MoS2 4x4 / mu_pad = 24,960 / P = 64 the rank-0 HLO of
+# the run that OOMed (job 7879469, module_0914.jit__gn_ppm_fit_kernel) reports
 #     allocation 35: size 74.27GiB, preallocated-temp
 # against parameters/outputs of only 8.27 GiB total, all correctly sharded
-# c128[16,3120,3120] tiles (3120 = mu_pad/p_x).  74.27 GiB is EXACTLY
-# 32.0 x one tile.  XLA:CPU fused only 6 of ~111 full-tile instructions, so
-# the chain materialises dozens of temporaries instead of reusing a handful.
-# That arena is what killed mu=24,933 at P=64, twice, with the identical
-# 79,744,204,800-byte allocation.
+# c128[16,3120,3120] tiles (3120 = mu_pad/p_x).
+#
+# > CLAIM-DECAY (R37, 2026-07-29).  The original reading of that line -- "32
+# > live temporaries because XLA fused only 6 of ~111 full-tile instructions"
+# > -- is WRONG, and so is the conclusion that the guard chain does not fuse.
+# > XLA:CPU fuses the chain completely: at the reference shape the entry
+# > computation contains SEVEN full-tile instructions (2 parameters + 5 kLoop
+# > fusions) and ZERO unfused full-tile elementwise ops; the "111" counted
+# > instructions INSIDE %fused_computation bodies, which never materialise.
+# > The 74.27 GiB was ONE buffer -- the replicated global mode-count mask, see
+# > the n_modes note in the kernel -- and it is now gone.  The "32.0x one tile"
+# > multiple was the mesh identity p_x^2/2, not a temporary count.
 #
 # THE FIX IS MOVEMENT-ONLY.  Every operation in the kernel is elementwise in
 # the leading (q) axis and the two reductions are exact integer counts, so
@@ -477,7 +482,14 @@ def fit_gn_ppm_from_wc_pair(
 # something to quietly restructure).
 _GN_PPM_FIT_ARENA_BUDGET_BYTES = int(
     float(os.environ.get("LORRAX_PPM_FIT_ARENA_GIB", "8")) * 1024 ** 3)
-#: Measured live-temporary multiple of one (q-block, mu, nu) tile.
+#: Live-footprint multiple of one (q-block, mu, nu) c128 tile.
+#: DELIBERATELY CONSERVATIVE.  Once the replicated mode-count mask is gone
+#: (R37) the measured multiple is ~4 (params + outputs + a half-tile temp), so
+#: 32 over-estimates by ~8x and therefore over-chunks.  Campaign doctrine (R5,
+#: R30.3) is that a sizer which reads HIGH is safe and one that reads LOW is
+#: not, so the value is left high on purpose; lowering it is a measured,
+#: separately-gated change, not a comment edit.  It does not affect the
+#: reference deck, which takes the single-shot path either way.
 _GN_PPM_FIT_LIVE_TILES = 32
 
 
@@ -568,8 +580,45 @@ def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
     _fallback_or_dead = jnp.where(mode_mask, fallback, 0.0)   # (mu, nu), 2-D
     omega_vals = jnp.where(good, jnp.sqrt(omega_sq_re), _fallback_or_dead)
     B_vals = -0.5 * Wc0 * omega_vals.astype(jnp.complex128)
-    m = jnp.broadcast_to(mode_mask, good.shape)
-    n_modes = jnp.sum(m.astype(jnp.float64))
+    # ---------------------------------------------------------------------
+    # THE ARENA (size campaign 2026-07-29, ladder notes R37).  ``n_modes`` used
+    # to be computed as
+    #     n_modes = jnp.sum(jnp.broadcast_to(mode_mask, good.shape)
+    #                       .astype(jnp.float64))
+    # and THAT SINGLE LINE was the whole 74.27 GiB allocation that killed
+    # mu = 24,933 at P = 64.  ``mode_mask`` is built from ``jnp.arange(n_mu)``,
+    # which carries NO sharding, so GSPMD kept this branch REPLICATED: every
+    # rank materialised the FULL GLOBAL ``f64[nq, mu_pad, mu_pad]`` mask just to
+    # add up its ones.  Read straight out of the failing run's own HLO:
+    #     %fused_computation () -> f64[2,2496,2496]      <- global, not sharded
+    #     allocation 33: size 95.06MiB, preallocated-temp
+    #         95.06MiB; 3 values; f64[2,2496,2496], f64[2,312,312], f64[]
+    # 2*2496*2496*8 = 99,680,256 B = 95.06 MiB  == the entire "arena", and at
+    # production 16*24960*24960*8 = 79,744,204,800 B == the exact OOM byte
+    # count.  The famous "32.0x one tile" multiple was never 32 temporaries: it
+    # is the identity (mu_pad/mu_local)^2 * (8/16) = p_x^2/2 = 64/2, i.e. a
+    # property of the 8x8 MESH, which is why it read exactly 32.0 at two very
+    # different problem sizes (both were P=64).
+    #
+    # The value is a CONSTANT.  ``mode_mask`` has exactly ``n_log**2`` true
+    # entries by construction (an outer AND of ``arange(n_mu) < n_log`` with
+    # itself), broadcast over the leading axes, so the sum is exactly
+    # ``prod(lead) * n_log**2`` -- a non-negative integer.  Summing 0.0/1.0 in
+    # float64 is EXACT while every partial sum stays below 2**53 (production is
+    # ~1e10), and the answer is that same integer, so emitting the integer
+    # directly is BIT-IDENTICAL, not merely mathematically equal.  Guards are
+    # untouched: ``mode_mask`` still gates ``good`` and still zeroes pad modes.
+    _n_lead = 1
+    for _d in good.shape[:-2]:
+        _n_lead *= int(_d)
+    _n_modes_exact = _n_lead * n_log * n_log
+    if _n_modes_exact < (1 << 53):
+        n_modes = jnp.asarray(float(_n_modes_exact), dtype=jnp.float64)
+    else:
+        # Unreachable on any hardware this runs on (needs mu ~ 2.4e7); kept so
+        # the float64 exactness argument above is never silently violated.
+        n_modes = jnp.sum(
+            jnp.broadcast_to(mode_mask, good.shape).astype(jnp.float64))
     n_good = jnp.sum(good.astype(jnp.float64))
     # RAW COUNTS, not the ratio (q-chunking 2026-07-29).  Both are sums of
     # booleans, i.e. EXACT integers in float64 (max here ~1e10 << 2^53), so
