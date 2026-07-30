@@ -59,7 +59,11 @@ def mem_probe(label, *, only_rank0=True):
         return
     if only_rank0 and jax.process_index() != 0:
         return
-    dev = jax.devices()[0]
+    # local_devices(), not devices(): jax.devices() is the GLOBAL list, so
+    # jax.devices()[0] is process 0's device on every rank.  ``only_rank0``
+    # is a DEFAULT, not a guarantee — callers pass only_rank0=False to get a
+    # per-rank sample, and that sample must describe the rank's own pool.
+    dev = jax.local_devices()[0]
     stats = dev.memory_stats() if hasattr(dev, "memory_stats") else {}
     if stats is None:
         stats = {}

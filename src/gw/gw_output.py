@@ -140,7 +140,10 @@ def print_banner(
 
     try:
         import jax
-        _stats = jax.devices()[0].memory_stats()
+        # local_devices(), not devices(): jax.devices() is the GLOBAL list, so
+        # jax.devices()[0] is process 0's device on every rank and the banner
+        # would report another process's pool (or throw) at every P > 1.
+        _stats = jax.local_devices()[0].memory_stats()
         if _stats:
             _bl = _stats.get("bytes_limit", 0) / 1e9
             _bu = _stats.get("bytes_in_use", 0) / 1e9

@@ -34,12 +34,22 @@ def get_gpu_memory_nvidia_smi() -> float | None:
 
 
 def _get_jax_gpu_memory_bytes() -> tuple[float | None, float | None, float | None]:
-    """Return (bytes_limit, bytes_in_use, bytes_available) for the first JAX GPU device."""
+    """Return (bytes_limit, bytes_in_use, bytes_available) for **this process's** JAX device.
+
+    ``jax.local_devices()``, NOT ``jax.devices()``: the latter is the GLOBAL
+    device list, so ``jax.devices()[0]`` is process 0's device on every rank
+    (the hazard ``common.wfn_transforms.process_local_mesh`` names).  A
+    non-addressable device's ``memory_stats()`` does not describe this rank's
+    pool, and this function feeds MEMORY BUDGETS — every rank but 0 would have
+    been sizing its chunks against another process's allocator.  At ``P == 1``
+    the two lists are the same object, so single-process behaviour is
+    unchanged.
+    """
     try:
         import jax
         import jax.numpy as jnp
         _ = jnp.zeros(1).block_until_ready()
-        devices = jax.devices()
+        devices = jax.local_devices()
         if not devices or not hasattr(devices[0], 'memory_stats'):
             return None, None, None
         stats = devices[0].memory_stats()
