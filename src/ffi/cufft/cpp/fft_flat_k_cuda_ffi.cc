@@ -131,15 +131,50 @@ namespace ffi = ::xla::ffi;
 using C128 = std::complex<double>;
 
 // Opt-in debug logging.  Presence-tested as before, but now rank-scoped:
-// rank 0 by default, every rank with LORRAX_CUFFT_LOG=all.  Before the
-// 2026-07-30 audit there was no rank guard at all here (mklblas had
+// rank 0 by default, every rank with =all.  ONE spelling per FFI target
+// family across platforms (audit P1.11): LORRAX_FFT_FFI_LOG is the shared
+// knob; LORRAX_CUFFT_LOG / LORRAX_MKLFFT_LOG are deprecated aliases honored
+// on BOTH platforms (announced once) — before this fix the log knob under
+// the SAME target name was spelled differently per platform, so a deck
+// moved between platforms silently lost its logging.  Before the 2026-07-30
+// audit there was additionally no rank guard at all here (mklblas had
 // announce_here(), this file and mklfft had nothing), so at P=1000+ each of
 // the five sites below was multiplied by the process count.  Rank detection
 // reads the launcher env, not MPI_Comm_rank: this TU is comms-free by design
 // and must not link MPI.  See common/cpp/mkl_thread_pin.h.
 static bool log_enabled() {
-    static const bool on = mklpin::log_here("LORRAX_CUFFT_LOG");
+    static const bool on = [] {
+        static std::atomic<bool> alias_warned{false};
+        return mklpin::log_value_here(mklpin::knob_value(
+            "LORRAX_FFT_FFI_LOG",
+            {"LORRAX_CUFFT_LOG", "LORRAX_MKLFFT_LOG"}, alias_warned));
+    }();
     return on;
+}
+
+// Host-only tuning knobs that are INERT on this platform (audit P1.11).
+// LORRAX_FFT_FFI_THREADS / LORRAX_FFT_FFI_CHUNK (and their deprecated
+// spellings) tune the MKL DFTI handler's OpenMP chunk loop; the cuFFT
+// backend has no chunk loop, so under the announce-or-refuse doctrine a
+// set-but-unread knob must SAY it is inert rather than vanish.  Announced
+// once per process, rank-scoped, at the first handler call.
+static void announce_inert_host_knobs() {
+    static std::atomic<bool> done{false};
+    if (done.exchange(true)) return;
+    if (!mklpin::announce_here()) return;
+    for (const char* name :
+         {"LORRAX_FFT_FFI_THREADS", "LORRAX_MKLFFT_THREADS",
+          "LORRAX_FFT_FFI_CHUNK", "LORRAX_MKLFFT_CHUNK"}) {
+        if (std::getenv(name) != nullptr) {
+            std::fprintf(stderr,
+                         "[cufft_flat_k] %s is set but tunes the HOST (MKL "
+                         "DFTI) flat-k handler's OpenMP chunk loop only; the "
+                         "cuFFT backend has no chunk loop and the knob is "
+                         "INERT on this platform (announced, not silently "
+                         "dropped).\n",
+                         name);
+        }
+    }
 }
 
 static const char* cufft_err_name(cufftResult r) {
@@ -193,34 +228,55 @@ static ffi::Error fail(const char* where, const std::string& detail) {
 struct DriverApi {
     CUresult (*ModuleLoadData)(CUmodule*, const void*) = nullptr;
     CUresult (*ModuleGetFunction)(CUfunction*, CUmodule, const char*) = nullptr;
+    CUresult (*ModuleUnload)(CUmodule) = nullptr;
     CUresult (*LaunchKernel)(CUfunction, unsigned, unsigned, unsigned,
                              unsigned, unsigned, unsigned, unsigned,
                              CUstream, void**, void**) = nullptr;
     CUresult (*CtxGetCurrent)(CUcontext*) = nullptr;
     CUresult (*GetErrorString)(CUresult, const char**) = nullptr;
     bool ok = false;
+    std::string err;   // WHY resolution failed (dlerror text), for the
+                       // first-use refusal — was swallowed pre-P1.9.
 };
 
 static const DriverApi& driver_api() {
     static DriverApi api = [] {
         DriverApi a;
         void* h = RTLD_DEFAULT;
+        dlerror();  // clear any stale error state
         if (dlsym(h, "cuLaunchKernel") == nullptr) {
             h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
-            if (h == nullptr) return a;  // ok=false; reported at first use
+            if (h == nullptr) {
+                const char* e = dlerror();
+                a.err = std::string("dlopen(libcuda.so.1): ") +
+                        (e ? e : "(dlerror returned no detail)");
+                return a;  // ok=false; err reported at first use
+            }
         }
+        auto need = [&](const char* name) -> void* {
+            dlerror();
+            void* p = dlsym(h, name);
+            if (p == nullptr && a.err.empty()) {
+                const char* e = dlerror();
+                a.err = std::string("dlsym(") + name + "): " +
+                        (e ? e : "symbol not found (no dlerror detail)");
+            }
+            return p;
+        };
         a.ModuleLoadData = reinterpret_cast<decltype(a.ModuleLoadData)>(
-            dlsym(h, "cuModuleLoadData"));
+            need("cuModuleLoadData"));
         a.ModuleGetFunction = reinterpret_cast<decltype(a.ModuleGetFunction)>(
-            dlsym(h, "cuModuleGetFunction"));
+            need("cuModuleGetFunction"));
+        a.ModuleUnload = reinterpret_cast<decltype(a.ModuleUnload)>(
+            need("cuModuleUnload"));
         a.LaunchKernel = reinterpret_cast<decltype(a.LaunchKernel)>(
-            dlsym(h, "cuLaunchKernel"));
+            need("cuLaunchKernel"));
         a.CtxGetCurrent = reinterpret_cast<decltype(a.CtxGetCurrent)>(
-            dlsym(h, "cuCtxGetCurrent"));
+            need("cuCtxGetCurrent"));
         a.GetErrorString = reinterpret_cast<decltype(a.GetErrorString)>(
-            dlsym(h, "cuGetErrorString"));
-        a.ok = a.ModuleLoadData && a.ModuleGetFunction && a.LaunchKernel &&
-               a.CtxGetCurrent && a.GetErrorString;
+            need("cuGetErrorString"));
+        a.ok = a.ModuleLoadData && a.ModuleGetFunction && a.ModuleUnload &&
+               a.LaunchKernel && a.CtxGetCurrent && a.GetErrorString;
         return a;
     }();
     return api;
@@ -290,12 +346,21 @@ struct KernelPack {
 // cudaFree(0) fallback covers a first-call-without-context path.
 static ffi::Error get_kernels(KernelPack** out) {
     static std::map<CUcontext, KernelPack> cache;
+    // Negative cache (audit P1.9): an NVRTC/module failure is deterministic
+    // for a given process+context, and this function is called per FFI
+    // dispatch — without the cache a persistent failure re-ran the whole
+    // NVRTC compile on EVERY call before failing again.  First failure is
+    // recorded; later calls refuse immediately with the recorded reason.
+    static std::map<CUcontext, std::string> fail_cache;
     const DriverApi& api = driver_api();
     if (!api.ok) {
         return fail("driver-api resolve",
-                    "the CUDA driver entry points this handler needs are "
-                    "not available in libcuda.so.1 (is a CUDA driver "
-                    "present on this node?)");
+                    std::string("the CUDA driver entry points this handler "
+                                "needs could not be resolved — ") +
+                        (api.err.empty()
+                             ? "no detail recorded (is a CUDA driver present "
+                               "on this node?)"
+                             : api.err));
     }
     CUcontext ctx = nullptr;
     api.CtxGetCurrent(&ctx);
@@ -311,6 +376,18 @@ static ffi::Error get_kernels(KernelPack** out) {
         *out = &it->second;
         return ffi::Error::Success();
     }
+    auto fit = fail_cache.find(ctx);
+    if (fit != fail_cache.end()) {
+        return fail("kernel build (cached failure, NVRTC not re-run)",
+                    fit->second);
+    }
+    // Every failure from here on is deterministic — record it before
+    // returning so the next call refuses without re-compiling.
+    auto fail_sticky = [&](const char* where,
+                           const std::string& detail) -> ffi::Error {
+        fail_cache.emplace(ctx, std::string(where) + " — " + detail);
+        return fail(where, detail);
+    };
 
     int dev = 0, cc_major = 0, cc_minor = 0;
     LRX_CUDA_CHECK(cudaGetDevice(&dev), "cudaGetDevice");
@@ -326,7 +403,7 @@ static ffi::Error get_kernels(KernelPack** out) {
                                         "lrx_fft_flat_k_kernels.cu",
                                         0, nullptr, nullptr);
     if (nr != NVRTC_SUCCESS) {
-        return fail("nvrtcCreateProgram", nvrtcGetErrorString(nr));
+        return fail_sticky("nvrtcCreateProgram", nvrtcGetErrorString(nr));
     }
     char arch[64];
     std::snprintf(arch, sizeof(arch), "--gpu-architecture=sm_%d%d",
@@ -342,8 +419,8 @@ static ffi::Error get_kernels(KernelPack** out) {
             nvrtcGetProgramLog(prog, &log[0]);
         }
         nvrtcDestroyProgram(&prog);
-        return fail("nvrtcCompileProgram",
-                    std::string(nvrtcGetErrorString(nr)) + " — " + log);
+        return fail_sticky("nvrtcCompileProgram",
+                           std::string(nvrtcGetErrorString(nr)) + " — " + log);
     }
     // Prefer a native cubin (no driver PTX-JIT: the node driver may predate
     // this toolkit's PTX ISA); fall back to PTX if cubin is unavailable.
@@ -362,13 +439,13 @@ static ffi::Error get_kernels(KernelPack** out) {
     }
     nvrtcDestroyProgram(&prog);
     if (nr != NVRTC_SUCCESS || image.empty()) {
-        return fail("nvrtc get cubin/ptx", nvrtcGetErrorString(nr));
+        return fail_sticky("nvrtc get cubin/ptx", nvrtcGetErrorString(nr));
     }
 
     CUmodule mod = nullptr;
     CUresult cr = api.ModuleLoadData(&mod, image.data());
     if (cr != CUDA_SUCCESS) {
-        return fail("cuModuleLoadData", cu_err(cr));
+        return fail_sticky("cuModuleLoadData", cu_err(cr));
     }
     KernelPack pack;
     cr = api.ModuleGetFunction(&pack.scale_fn, mod, "lrx_scale_c128");
@@ -376,7 +453,11 @@ static ffi::Error get_kernels(KernelPack** out) {
         cr = api.ModuleGetFunction(&pack.mult_fn, mod, "lrx_gw_mult_c128");
     }
     if (cr != CUDA_SUCCESS) {
-        return fail("cuModuleGetFunction", cu_err(cr));
+        // Unload before failing (P1.9): the module is unreachable after
+        // this return — without the unload it leaked device memory on
+        // every (pre-negative-cache, per-call) retry.
+        api.ModuleUnload(mod);
+        return fail_sticky("cuModuleGetFunction", cu_err(cr));
     }
     if (log_enabled()) {
         std::fprintf(stderr,
@@ -517,6 +598,7 @@ static ffi::Error FlatKDispatch(
     ffi::AnyBuffer X, ffi::Result<ffi::AnyBuffer> Y,
     int64_t nkx, int64_t nky, int64_t nkz, int64_t forward, double scale)
 {
+    announce_inert_host_knobs();
     if (X.element_type() != ffi::DataType::C128 ||
         Y->element_type() != ffi::DataType::C128) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -589,6 +671,7 @@ static ffi::Error GwConvDispatch(
     ffi::AnyBuffer G, ffi::AnyBuffer W, ffi::Result<ffi::AnyBuffer> S,
     int64_t nkx, int64_t nky, int64_t nkz, double scale_i, double scale_f)
 {
+    announce_inert_host_knobs();
     if (G.element_type() != ffi::DataType::C128 ||
         W.element_type() != ffi::DataType::C128 ||
         S->element_type() != ffi::DataType::C128) {
