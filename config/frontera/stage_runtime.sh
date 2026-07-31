@@ -80,6 +80,26 @@ else
       rm -rf "$_ls_dir.part"
     fi
   fi
+  # Evict stale bundle extracts (keep the newest 2 by mtime — the one just
+  # staged plus one predecessor for any still-running job on this node).
+  # Each extract is ~800 MB on a 144-224 GB shared /tmp SSD, and every
+  # bundle rebuild changes the size-mtime key, so without this the old
+  # trees accumulate until the node's SSD fills.  Done while still holding
+  # the lock, so no rank races the extractor.  .lock is a file and .part
+  # dirs are transient; both are excluded by the dirs-only listing + the
+  # newest-2 window.
+  # The CURRENT key is never evicted, whatever its mtime (an old extract of
+  # the current bundle can be older than two extracts of a newer bundle a
+  # sibling job staged — evicting the tree this very run is about to use
+  # would be self-sabotage).
+  _ls_stale=$(cd "$_ls_root" 2>/dev/null && ls -1td -- */ 2>/dev/null | tail -n +3)
+  for _ls_old in $_ls_stale; do
+    _ls_old=${_ls_old%/}
+    case "$_ls_old" in .|..|""|"$_ls_key") continue ;; esac
+    _lorrax_stage_say "evicting stale extract $_ls_root/$_ls_old"
+    rm -rf "${_ls_root:?}/$_ls_old"
+  done
+  unset _ls_stale _ls_old
   flock -u 9 2>/dev/null || true
   exec 9>&- 2>/dev/null
 

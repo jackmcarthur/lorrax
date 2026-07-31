@@ -15,7 +15,10 @@
 # ============================================================================
 set -euo pipefail
 
-: "${LORRAX_ROOT:=$HOME/software/lorrax}"
+# No default: the old $HOME/software/lorrax guess pointed at a stale checkout
+# on this machine and a silently-wrong source tree is worse than a refusal
+# (same :?-contract as build_mpiwrapper.sh / build_ffi_host.sh).
+: "${LORRAX_ROOT:?set LORRAX_ROOT to the worktree/repo root (contains config/frontera and src/ffi)}"
 : "${LORRAX_VENV:=$WORK/lorrax_env/.venv}"
 : "${LORRAX_FFI_STAGE:=$WORK/lorrax_ffi}"
 : "${LORRAX_FFI_PHDF5:=0}"
