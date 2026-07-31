@@ -226,21 +226,18 @@ def _get_sigma_kij_kernel(
     kgrid = tuple(int(x) for x in kgrid)
     nk_tot = kgrid[0] * kgrid[1] * kgrid[2]
     from common.fft_helpers import (
-        fft_ffi_enabled, make_flat_k_fftn, make_flat_k_gw_conv,
-        make_flat_k_ifftn)
+        make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
     # The stage-timing flag is part of the cache key: the two variants are
     # different callables (fused jit vs staged dispatcher) and must not
     # shadow each other across a flag flip inside one process (tests).
-    # Likewise the two FFT-FFI flags (read at factory time by fft_helpers /
-    # _fft_ffi_fused_enabled) and the contract_bands GEMM-FFI flag (read at
-    # factory time by the primitive): a flip mid-process must rebuild the
-    # kernel.  ``merged_x`` keys the projection plan: BOTH kernels live in
-    # the cache simultaneously in every Σ run (Laplace windows dispatch the
-    # merged one, crossing windows the two-channel one).
-    from common.contract_bands import bands_gemm_ffi_enabled
+    # Likewise every factory-time FFI dial (FFT, fused FFT, contract_bands
+    # GEMM — one owner: ffi.ffi_dial_key()): a flip mid-process must rebuild
+    # the kernel.  ``merged_x`` keys the projection plan: BOTH kernels live
+    # in the cache simultaneously in every Σ run (Laplace windows dispatch
+    # the merged one, crossing windows the two-channel one).
+    from ffi import ffi_dial_key
     pipeline_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
-                    fft_ffi_enabled(), _fft_ffi_fused_enabled(),
-                    bands_gemm_ffi_enabled(), bool(merged_x))
+                    ffi_dial_key(), bool(merged_x))
     if pipeline_key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[pipeline_key]
 
@@ -409,11 +406,11 @@ def _get_sigma_tau_kernel(
     """
 
     kgrid = tuple(int(x) for x in kgrid)
-    from common.fft_helpers import fft_ffi_enabled
-    from common.contract_bands import bands_gemm_ffi_enabled
+    # ffi.ffi_dial_key(): the ONE owner of the factory-time FFI dial tuple —
+    # must match _get_sigma_kij_kernel's pipeline_key components exactly.
+    from ffi import ffi_dial_key
     cache_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
-                 fft_ffi_enabled(), _fft_ffi_fused_enabled(),
-                 bands_gemm_ffi_enabled(), bool(merged_x))
+                 ffi_dial_key(), bool(merged_x))
     if cache_key in _sigma_tau_kernel_cache:
         return _sigma_tau_kernel_cache[cache_key]
 

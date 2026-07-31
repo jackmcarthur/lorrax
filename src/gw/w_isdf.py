@@ -56,7 +56,12 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
 
     nkx, nky, nkz = kgrid
     nk = nkx * nky * nkz
-    cache_key = (id(mesh_xy), kgrid)
+    # ffi_dial_key(): the make_flat_k_fftn factories below read
+    # LORRAX_FFT_FFI at FACTORY time, so the dials must be part of this
+    # cache key or a mid-process flag flip serves the stale backend
+    # (flat-k FFT service contract, docs/dev/flat_k_fft_service.md).
+    from ffi import ffi_dial_key
+    cache_key = (id(mesh_xy), kgrid, ffi_dial_key())
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 

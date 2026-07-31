@@ -2,3 +2,36 @@
 
 See `AGENTS.md` for the directory layout and how to add a new target.
 """
+
+
+def ffi_dial_key() -> tuple:
+    """The ONE cache-key component capturing every factory-time FFI dial.
+
+    ``make_flat_k_*`` / ``make_flat_k_gw_conv`` / the ``contract_bands``
+    primitive all read their backend dial (``LORRAX_FFT_FFI``,
+    ``LORRAX_FFT_FFI_FUSED``, ``LORRAX_BANDS_GEMM_FFI``) at FACTORY time, so
+    a kernel cache that omits the dials serves a stale backend after a
+    mid-process flag flip (tests flip them; the service contract —
+    ``docs/dev/flat_k_fft_service.md`` — says the dial MUST be in every
+    consumer cache key).  This helper is the single owner of "which dials
+    were live when this factory ran"; consumers fold the returned tuple into
+    their cache keys instead of each re-listing the dials (and drifting when
+    a dial is added):
+
+        ``gw.ppm_tau_kernel``   (pipeline_key + tau cache_key)
+        ``gw.cohsex_sigma._make_cohsex_kernels``
+        ``gw.w_isdf._get_chi_minimax_kernel``
+
+    All three reads are tier-1 lexical (no JAX backend init) and O(1) —
+    safe in any cache-lookup path at any P.
+    """
+    from ffi.mklblas import bands_gemm_ffi_enabled
+    from ffi.mklfft import fft_ffi_enabled, fused_fft_ffi_enabled
+    return (
+        ("fft_ffi", fft_ffi_enabled()),
+        ("fft_ffi_fused", fused_fft_ffi_enabled()),
+        ("bands_gemm_ffi", bands_gemm_ffi_enabled()),
+    )
+
+
+__all__ = ["ffi_dial_key"]

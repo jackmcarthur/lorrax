@@ -95,12 +95,18 @@ _cohsex_kernel_cache: dict[tuple[object, ...], tuple] = {}
 def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int], nk_tot: int):
     """Cached factory: returns (sigma_sx, sigma_coh, hartree) jit'd kernels.
 
-    Keyed on (id(mesh_xy), kgrid) — same shape the chi0 / ppm_sigma
-    kernel caches use.  ``nk_tot`` = prod(kgrid) and is redundant for
-    cache-lookup purposes; it stays as a positional arg because the
-    Hartree kernel closes over it as a compile-time constant.
+    Keyed on (id(mesh_xy), kgrid, ffi_dial_key()) — same shape the chi0 /
+    ppm_sigma kernel caches use.  The ``ffi_dial_key()`` component is
+    load-bearing: the ``make_flat_k_*`` factories below read
+    ``LORRAX_FFT_FFI`` at FACTORY time, so without the dials in the key a
+    mid-process flag flip would serve a kernel built for the stale backend
+    (the flat-k FFT service contract, ``docs/dev/flat_k_fft_service.md``).
+    ``nk_tot`` = prod(kgrid) and is redundant for cache-lookup purposes; it
+    stays as a positional arg because the Hartree kernel closes over it as
+    a compile-time constant.
     """
-    cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid))
+    from ffi import ffi_dial_key
+    cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key())
     if cache_key in _cohsex_kernel_cache:
         return _cohsex_kernel_cache[cache_key]
 
