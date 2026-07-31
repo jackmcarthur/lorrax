@@ -26,7 +26,7 @@ Authoritative source: [`pyproject.toml`](../pyproject.toml). No docker images, n
 | Package | Version | Purpose |
 |---|---|---|
 | **Python** | ≥3.12 | Language runtime |
-| **jax[cuda13]** | ≥0.9 | Array ops, autodiff, GPU acceleration (CUDA-13 wheels bundle the runtime) |
+| **jax[cuda12]** | ≥0.9 | Array ops, autodiff, GPU acceleration (CUDA-12 wheels bundle the runtime; pyproject pins `jax[cuda12]` — see the cuda13→cuda12 note at pyproject.toml:28) |
 | **jaxlib** | ≥0.9 | JAX backend |
 | **numpy** | ≥2.3.1 | Arrays, host-side I/O |
 | **scipy** | ≥1.16.0 | Linear algebra, FFTs (host) |
@@ -42,7 +42,7 @@ Declared under `[dependency-groups]` in `pyproject.toml`:
 | Group | Contents | When |
 |---|---|---|
 | `dev` | flake8, pytest | Everywhere |
-| `jax` | Explicit `jax[cuda13]` + jaxlib pin | If uv resolves without extras |
+| `jax` | Explicit `jax[cuda12]` + jaxlib pin | If uv resolves without extras |
 | `build` | cmake, ninja, nanobind, scikit-build-core | Building the FFI C++ shared object `liblorrax_ffi.so` (§5) |
 | `profile` | tensorboard, tensorboard-plugin-profile, xprof | JAX/XProf traces |
 
@@ -502,7 +502,7 @@ RuntimeError: No GPU/TPU found, falling back to CPU.
 1. `nvidia-smi` — are GPUs visible at all?
 2. `python -c "import jax; print(jax.default_backend())"` — should print `gpu`
 3. `echo $CUDA_VISIBLE_DEVICES` — inside Shifter this is set by `select_gpu.sh` to `$SLURM_LOCALID`
-4. `pip list | grep jax` — jaxlib must be the CUDA build (`jax[cuda13]`)
+4. `pip list | grep jax` — jaxlib must be the CUDA build (`jax[cuda12]`)
 
 ### 8.2 Out-of-memory
 

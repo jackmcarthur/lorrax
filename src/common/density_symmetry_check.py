@@ -230,7 +230,9 @@ Environment
 ``LORRAX_TRS_TOL``        relative tolerance for ‖m‖∞/‖ρ‖∞ (default 1e-6).
 ``LORRAX_TRS_SPATIAL_TOL`` relative tolerance for the ρ(Sr+τ) residual
                           (default 1e-4).
-``LORRAX_TRS_MAX_K``      max k-points sampled (default 32; 0 = all).
+``LORRAX_TRS_MAX_K``      max k-points sampled (default 12 =
+                          ``MAX_K_DEFAULT``, the measured sufficiency
+                          choice — scorecard §U k-ladder; 0 = all).
 """
 
 from __future__ import annotations
