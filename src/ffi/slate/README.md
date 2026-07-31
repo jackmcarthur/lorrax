@@ -264,7 +264,7 @@ library and registration table — see `src/ffi/scalapack/`.
 
 Dual-lib caveat (GPU nodes): both SLATE builds install `libslate.so.2`,
 so when the CUDA FFI library loads first its `libslate` satisfies the
-host library's DT_NEEDED too — the in-process `*_cpu` tests on a GPU
+host library's own dependencies too — the in-process `*_cpu` tests on a GPU
 node exercise the host HANDLERS (`fromScaLAPACK` + `Target::HostTask`)
 against the cuda-built SLATE running host-side.  That is a supported
 SLATE configuration, and the `gpu_backend=none` binary itself is

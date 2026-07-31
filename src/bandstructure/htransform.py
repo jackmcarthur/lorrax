@@ -22,21 +22,43 @@ from functools import partial
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps
 from common import Meta
+from common import rank_criterion
+from runtime.padding import round_up
 from common.wfn_transforms import (
     get_enk_bandrange, load_centroids_band_chunked, iter_psi_rchunk_bandwise,
     load_psi_gflat_padded,
 )
 from isdf import factor_c_q
 from common.fft_helpers import make_flat_k_ifftn
+# Q's r axis is split over the ('x','y') PRODUCT and its extent is an FFT-box
+# size, so it divides that product only by luck.  Raw, that is a refusal, not a
+# degradation — see the fitted ``sharding_y`` in streaming_galerkin_solve.
+from common.sharding_fit import fit_sharding as _fit
+from common.sharding_fit import padded_extent as _pad_to
 
 
 def _build_mesh_xy() -> Mesh:
-    """Most-square 2D ('x','y') mesh — matches gw_jax._build_mesh idiom."""
-    total = jax.process_count() * jax.local_device_count()
-    gx = int(np.sqrt(total))
-    while gx > 1 and total % gx != 0:
-        gx -= 1
-    return Mesh(np.asarray(jax.devices()).reshape(gx, total // gx), ('x', 'y'))
+    """Most-square 2D ('x','y') mesh — from the service, not hand-rolled.
+
+    This was seven lines re-typing ``collectives.resolve_mesh``'s body, and
+    it was one of the five mesh dialects the 2026-07-30 API-linkage audit
+    catalogued: it sized the grid from ``process_count() * local_device_count()``
+    while ``gw.kin_ion_io`` used ``jax.device_count()`` and
+    ``common.eigh_block_sweep`` used ``process_count()`` alone.  Those agree
+    only because Frontera runs one device per process.
+
+    The one behavioural difference is a gain: ``resolve_mesh`` puts the
+    result through ``_require_addressable``, so a mesh this process cannot
+    compute on is refused BY NAME here rather than surfacing as a bare
+    ``StopIteration`` inside a jit several layers down.
+
+    NOT ``prepare_mesh``: that also warms the ``impl=mpi`` communicator
+    cliques, which is an extra collective on a path that does not have one
+    today.  Whether this driver should warm is the open warm-up-contract
+    question (numbered request), not a change to smuggle in with a rename.
+    """
+    from common.collectives import resolve_mesh
+    return resolve_mesh(axis_names=('x', 'y'))
 
 
 _accum_G_cache: dict = {}
@@ -180,40 +202,142 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     U, s, Vh = _svd_replicated(A)
     del A
     s_host = np.asarray(s)
-    rank_raw = int((s_host > s_host.max() * rtol).sum())
-    # Mesh-align the retained rank.  G, its Cholesky factor, ctilde and fH all
-    # live on a (rank, rank) face sharded P('x', 'y'), so ``rank`` has to divide
-    # BOTH mesh axes.  Whenever the ψ-at-centroids matrix is genuinely
-    # rank-deficient — nk·nb at or above the ISDF column count, which is exactly
-    # the regime the band-window capacity rule is about — ``rank_raw`` is an
-    # arbitrary integer and the first ``device_put`` onto that face raises
-    #   "global size of its dimension 0 should be divisible by 4 ... equal to 4570".
-    # Round DOWN to the aligned rank: the dropped directions are the ones
-    # sitting at the rtol threshold (σ/σ_max ~ 1e-8), i.e. numerically the same
-    # decision ``rtol`` already makes, one notch tighter.
+
+    # ── The truncation criterion ──────────────────────────────────────────
+    # ``rank_phys`` is the ONLY place the retained subspace is decided, and
+    # the decision is a cap on how much the pseudo-inverse below (``inv_s``
+    # = 1/σ) may amplify round-off: keep σ > σ_max/κ_cap with κ_cap = 1/rtol.
+    # It is NOT a search for a gap — these are ISDF/Galerkin overlap spectra
+    # and they are smooth by construction, with no knee to find.  See
+    # ``common/rank_criterion`` for the criterion, for the three standard
+    # alternatives (discrepancy principle / L-curve / GCV) and the measured
+    # reason each is refuted here, and for the §R19 table in which retaining
+    # 41 % MORE rank moved a QP gap from 3.13 eV to −5049 eV.
+    rank_phys = rank_criterion.select_rank(s_host, rtol)
+
+    # ── Mesh alignment: PAD, never round the rank down ────────────────────
+    # G, its Cholesky factor, ctilde, B and fH all live on a (rank, rank)
+    # face sharded P('x','y'), so the carried extent has to divide BOTH mesh
+    # axes; an unaligned extent makes the first ``device_put`` onto that face
+    # raise "global size of its dimension 0 should be divisible by 4 …".
+    #
+    # This used to round the retained rank DOWN to a multiple of
+    # lcm(px, py) — at P=64 on an 8×8 mesh, up to 7 physically-selected
+    # directions discarded FOR A DEVICE-GRID REASON, which makes the answer a
+    # function of the machine it ran on.  The rationale ("the dropped ones
+    # sit at the rtol threshold, the same decision rtol already makes") does
+    # not survive contact with the measured spectrum.
+    #
+    # MEASURED, job 7883150 (MoS2 4×4, n_μ=785, nval=26/ncond=16, rtol 1e-8):
+    # the SVD is (672, 1570), rank 672 = FULL row rank, and the retained block
+    # runs σ_max = 9.857614e-01 down to σ_min = 2.22115e-05, i.e.
+    #     σ_min/σ_max = 2.2532e-05,
+    # which is FOUR AND A HALF DECADES ABOVE the cut at σ_max·rtol.  κ_eff =
+    # 4.44e4 against a cap of 1e8.  The directions a round-down removes are
+    # therefore not threshold noise at all — they are ordinary members of a
+    # smooth spectrum, comfortably inside the retained block.
+    #
+    # DO NOT re-derive that ratio from an older log line.  Until 2026-07-31
+    # this function printed
+    #     f"σ_min/{rtol:.0e}={float(s_host[rank-1]):.3e}"
+    # whose LABEL says the value is divided by rtol and whose ARGUMENT is the
+    # raw σ.  Reading its "σ_min/1e-08=2.221e-05" as σ_min/σ_max ≈ 2e-13
+    # understates the true ratio by eight decades, and that misreading was
+    # carried into a campaign brief as evidence that this deck sits "exactly
+    # at the interpolation capacity limit".  It does not: the capacity limit
+    # on this deck is at nb ≈ 98 (nk·nb = 1568 vs nspinor·n_μ = 1570), where
+    # the same sweep measures rank 1562 < 1568, ctilde orthogonality 6.31e-04
+    # and an on-grid energy error of 0.242 meV.  The rank report below prints
+    # both ends of the retained block with correct labels; use it.
+    #
+    # The fix is to pad the face instead.  The α-basis is EXTENDED by
+    # ``n_pad`` exactly-null directions:
+    #   coeffs[:, rank_phys:] = 0,  inv_s[rank_phys:] = 0,  UH[rank_phys:] = 0
+    # ⇒ Q's pad rows are exactly zero ⇒ G's pad rows/cols are exactly zero.
+    # An identity block is placed on the pad diagonal of G so the Cholesky is
+    # non-singular; for a block-diagonal SPD matrix ``potrf`` returns exactly
+    # blockdiag(chol(G_phys), I) — every off-diagonal update is an exact 0/1
+    # division — so ctilde, B and W_proj all acquire exactly-zero pad
+    # columns/rows and every downstream contraction over α is bit-unchanged.
+    # fH = Σ_n f(ε_n) c_n c_nᴴ likewise gains an exactly-zero block, i.e.
+    # ``n_pad`` extra exact-zero eigenvalues on top of the (rank − nb) exact
+    # zeros it already carries; band selection is ascending-index and the
+    # f-transform makes f(ε) ≤ 0, so the extra zeros sort ABOVE every selected
+    # band and no selection moves.
+    #
+    # ``LORRAX_EXTRA_RANK_PAD`` adds further null directions on top of the
+    # mesh round-up.  It is the pad-extent-invariance knob for this axis (the
+    # same role ``LORRAX_EXTRA_MU_PAD`` plays for μ): any result that moves
+    # under it depends on the pad extent and is a defect.  Never set it in
+    # production.
     align = math.lcm(int(mesh_xy.shape['x']), int(mesh_xy.shape['y']))
-    rank = max(align, (rank_raw // align) * align)
-    rank = min(rank, int(s_host.size))
-    U = U[:, :rank]
-    s = s[:rank]
-    Vh = Vh[:rank, :]                        # (rank, ns·n_μ), keep for centroid recovery
-    log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}): rank={rank}"
-           + (f" (rtol rank {rank_raw} → mesh-aligned to {align})"
-              if rank != rank_raw else "")
-           + f", σ_max={float(s_host[0]):.3e}, "
-           f"σ_min/{rtol:.0e}={float(s_host[rank-1]):.3e} "
-           f"({time.time()-t1:.2f}s)")
-    if rank_raw < nk * nb:
+    rank = round_up(rank_phys, align)
+    _extra = int(os.environ.get("LORRAX_EXTRA_RANK_PAD", "0") or 0)
+    if _extra < 0:
+        raise ValueError(
+            f"LORRAX_EXTRA_RANK_PAD must be >= 0; got {_extra}")
+    if _extra:
+        rank = round_up(rank + _extra, align)
+    n_pad = rank - rank_phys
+
+    # Slice to the criterion's rank and null-extend to the carried extent in
+    # ONE jit with an explicit replicated out_sharding: done op-by-op,
+    # ``jnp.pad`` on a multi-process mesh would leave these operands with an
+    # inferred sharding instead of the ``rep`` the SVD produced.
+    @partial(jax.jit, static_argnames=('r_phys', 'n_pad'),
+             out_shardings=(rep, rep, rep, rep))
+    def _trim_and_pad(U, s, Vh, r_phys, n_pad):
+        U = U[:, :r_phys]
+        s = s[:r_phys]
+        Vh = Vh[:r_phys, :]
+        coeffs = U * s[None, :]              # (nk·nb, r_phys)
+        inv_s = (1.0 / s)[:, None]           # (r_phys, 1)
+        UH = U.conj().T                      # (r_phys, nk·nb)
+        if n_pad:
+            coeffs = jnp.pad(coeffs, ((0, 0), (0, n_pad)))
+            inv_s = jnp.pad(inv_s, ((0, n_pad), (0, 0)))
+            UH = jnp.pad(UH, ((0, n_pad), (0, 0)))
+            Vh = jnp.pad(Vh, ((0, n_pad), (0, 0)))
+        return coeffs, inv_s, UH, Vh
+
+    # ── Truncation diagnostic — printed on EVERY run ──────────────────────
+    # retained rank, σ range of the retained block, σ range discarded, and
+    # how much of the discard was the physics criterion (all of it, now) vs
+    # the mesh alignment (must be zero).  ``violations()`` is the assertion:
+    # it refuses a run whose achieved amplification exceeds the cap, whose
+    # retained set depends on the device grid, or whose σ_max is zero/NaN
+    # (the documented `nband`-is-an-absolute-index trap, in which the SVD of
+    # an all-zero ψ window returns rank 0 and everything downstream is
+    # meaningless).
+    _trunc = rank_criterion.rank_report(
+        s_host, rtol, label=f"htransform ψ@centroids SVD ({nk*nb}, "
+                            f"{nspinor*n_mu})",
+        quantity="singular values", rank_used=rank,
+        n_rows=nk * nb, n_cols=nspinor * n_mu)
+    log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}): rank={rank_phys}"
+           + (f" (+{n_pad} null pad → carried extent {rank}, "
+              f"mesh-aligned to {align})" if n_pad else "")
+           + f" ({time.time()-t1:.2f}s)")
+    log_fn(_trunc.describe())
+    _bad = _trunc.violations()
+    if _bad:
+        raise ValueError(
+            "streaming_galerkin_solve: the ψ-at-centroids truncation is not "
+            "self-consistent — " + "  ".join(_bad))
+    if rank_phys < nk * nb:
         log_fn(f"  [warn] ψ-at-centroids is RANK-DEFICIENT: {nk*nb} states vs "
-               f"numerical rank {rank_raw} (nspinor·n_μ = {nspinor*n_mu}).  The "
+               f"numerical rank {rank_phys} (nspinor·n_μ = {nspinor*n_mu}).  The "
                f"Galerkin basis cannot span the band window — fH energy "
                f"recovery will degrade.  Capacity rule: nk·nb < rank(ψ_μ) "
-               f"≤ nspinor·n_μ, i.e. nb < {rank_raw/nk:.2f} here.")
+               f"≤ nspinor·n_μ, i.e. nb < {rank_phys/nk:.2f} here.  (The pad "
+               f"directions are exactly null and add NO capacity — the "
+               f"capacity bound is on rank_phys, never on the carried "
+               f"extent.)")
 
-    coeffs = U * s[None, :]                  # (nk·nb, rank), replicated
-    inv_s = (1.0 / s)[:, None]               # (rank, 1), replicated
-    UH = U.conj().T                          # (rank, nk·nb), replicated
-    del U
+    # Null-extend to the carried extent.  The zeros here are what make every
+    # pad row of Q — hence of G, ctilde, B and W_proj — exactly zero.
+    coeffs, inv_s, UH, Vh = _trim_and_pad(U, s, Vh, rank_phys, n_pad)
+    del U, s
 
     # ── 3. G = Q Q^H with Q = inv_s · U^H ψ, streamed r-OUTER / band-INNER ──
     #
@@ -290,7 +414,42 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # BOTH mesh axes, not just 'y'.  At MoS2 12x12 / n_μ=2412 / rank 4700 that
     # is 26.3 GB global: 6.6 GB/device on 'y' alone (times two for the
     # in+out pair the loop needs) versus 1.6 GB/device over ('x','y').
-    sharding_y = NamedSharding(mesh_xy, P(None, ('x', 'y')))
+    #
+    # FITTED, not raw.  Splitting one array axis over the ('x','y') PRODUCT
+    # requires that product to divide the extent, and the extent here is
+    # ``nspinor · n_rtot`` — an FFT-box size, a datum, not something anyone
+    # rounded.  Raw, this line does not degrade at an awkward device count, it
+    # REFUSES: job 7882966 legs d16/d49/d64 all rc=1 with the same
+    # ``IndivisibleError`` on the cohsex fixture's 27000 = 2³·3³·5³, on the
+    # pre- AND post-rank-padding sources alike, which is what confines that
+    # gate to divisors of gcd(27000, 32) = 8.  It is the same class
+    # ``common/sharding_fit`` exists for, and this was the one member of the
+    # class not routed through it.
+    #
+    # The fitter keeps the LARGEST sub-product that divides rather than
+    # replicating outright, which is what makes it usable here: 27000 is
+    # indivisible by 64 but divisible by 8, so an 8x8 mesh keeps 8-way instead
+    # of refusing, and a 4x4 mesh keeps 4-way.  Only when NO sub-product
+    # divides (7x7: 27000 % 7 != 0) does Q go replicated, and then the
+    # announcement prints the per-device GiB — which for this array is the
+    # 26.3 GB figure above, i.e. a stop sign, correctly.
+    #
+    # NOT the cause of the P=64 htransform wall, and the two must not be
+    # conflated: on the MoS2 4x4 deck this extent is nspinor·n_rtot =
+    # 2·46080 = 92160, which divides 16 AND 64, so this line never fired
+    # there — that wall was the q-batch in bse_setup (see its ``bs`` block).
+    # Same class, different member, different failure mode: this one raises,
+    # that one silently replicated 32x.
+    #
+    # DURABLE FIX, as everywhere else in this class: pad rather than fit.  The
+    # r axis is a FREE index of the Q[α, x] contraction, so zero columns add
+    # zero columns to Q and G = Q Qᴴ sums over them — exactly-zero terms in a
+    # sum.  That is left undone here deliberately: it needs
+    # ``iter_psi_rchunk_bandwise`` to emit a padded r extent, which is a
+    # loader contract change, and it would re-block the G reduction (harmless
+    # but not free to gate).  ``sharding_fit.padded_extent`` is the call.
+    sharding_y = _fit(mesh_xy, P(None, ('x', 'y')),
+                      (rank, nspinor * n_rtot), "htransform.Q(r-axis)")
     grid_xy_G = grid_xy
 
     @partial(jax.jit, donate_argnums=(0, 1), out_shardings=grid_xy_G)
@@ -303,8 +462,25 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # branch — a real ``process_allgather`` of ``P · rank² · 16`` B (178 MB/rank
     # per process at rank 4716, so 11 GB/rank at P=64) to assert that a block of
     # zeros is the same everywhere.  Same fix, same reason, as ``Q`` below.
-    G = jax.jit(lambda: jnp.zeros((rank, rank), dtype=jnp.complex128),
-                out_shardings=grid_xy)()
+    #
+    # PAD BLOCK.  ``inv_s`` is zero on the pad rows, so Q's pad rows — and
+    # therefore Q Qᴴ's pad rows and columns — are EXACTLY zero and G would be
+    # singular there.  Seed the pad diagonal with 1 so G is block-diagonal
+    # ``[[G_phys, 0], [0, I]]``.  ``potrf`` on that returns exactly
+    # ``blockdiag(chol(G_phys), I)``: for j ≥ rank_phys every A[j,k<j] is an
+    # exact 0 and L[j,k] = 0/L[k,k] = 0, so L[j,j] = sqrt(1 − 0) = 1.  The
+    # physical block is therefore factored bit-identically to the unpadded
+    # run, and ctilde/B/W_proj acquire exactly-zero pad columns/rows.
+    # ``n_pad == 0`` keeps the historical zeros allocation untouched.
+    def _alloc_G():
+        Z = jnp.zeros((rank, rank), dtype=jnp.complex128)
+        if n_pad:
+            d = jnp.concatenate([jnp.zeros(rank - n_pad, dtype=jnp.float64),
+                                 jnp.ones(n_pad, dtype=jnp.float64)])
+            Z = Z + jnp.diag(d).astype(jnp.complex128)
+        return Z
+
+    G = jax.jit(_alloc_G, out_shardings=grid_xy)()
 
     t2 = time.time()
     chunk_count = 0
@@ -404,7 +580,32 @@ def solve_q0_galerkin(
     rtol: float = 1e-8,
     log_fn=None,
 ):
-    """Solve psi_mu @ Q = psi_r using a Galerkin projection (spin folded into μ)."""
+    """Solve psi_mu @ Q = psi_r using a Galerkin projection (spin folded into μ).
+
+    DEAD CODE as of 2026-07-30 — a repo-wide search finds no caller, no test
+    and no driver that reaches this function; ``streaming_galerkin_solve`` is
+    what the four live consumers use.  It is annotated rather than deleted
+    because deletion is an owner call, but DO NOT resurrect it without fixing
+    two things first, neither of which is covered by any gate:
+
+    1.  ``G + 1e-11 * I`` below is an ABSOLUTE ridge.  Every other ridge in
+        LORRAX is relative to the operator's own scale — ``factor_c_q`` uses
+        ``1e-14·|trace|``, ``h_transform``'s S-Cholesky uses
+        ``1e-10·mean(diag)``, ``zeta_ridge`` uses ``ε·|tr|/n`` — because an
+        absolute constant is meaningless once the units or the system size
+        change.  On a small-trace G it dominates; on a large-trace G it does
+        nothing.
+    2.  It truncates twice and inconsistently: once with the mask
+        ``s > s.max()*rtol`` and again inside ``lstsq(rcond=rtol)``, which
+        applies its own relative cut to the ALREADY-truncated ``coeffs``.
+        The composite amplification cap is therefore not ``1/rtol`` and is
+        not stated anywhere.  ``common/rank_criterion`` is the one place the
+        cap should be expressed.
+
+    ``streaming_galerkin_solve`` has neither problem: one truncation, one
+    stated cap, and a Cholesky on a G whose only regularisation is the exact
+    identity block on the null pad.
+    """
     psi_mu = jnp.asarray(psi_mu, dtype=jnp.complex128)
     psi_r = jnp.asarray(psi_r, dtype=psi_mu.dtype)
     if psi_mu.shape[:-1] != psi_r.shape[:-1]:
@@ -591,6 +792,81 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
         fH_R = local_ifftn(fH_k)
         return fH_k, fH_R
+
+    # ── THE ON-GRID RECOVERY GATE ─────────────────────────────────────────
+    # fH_k = Σ_n f(ε_n,k) c_n,k c_n,kᴴ has eigenvalues EXACTLY {f(ε_n,k)} (plus
+    # rank−nb exact zeros) if and only if the rows of ctilde[k] are
+    # orthonormal.  When they are not, the eigenvalues are no longer f(ε_n)
+    # and ``newton_inv`` returns wrong ENERGIES on the coarse grid — silently,
+    # with a Hermitian positive-semidefinite fH, a successful Cholesky
+    # upstream and a plot that looks fine.
+    #
+    # WHY HERE.  This is the one function BOTH consumers pass through — the
+    # ``bandstructure.htransform`` CLI and ``bandstructure.bse_setup.
+    # compute_wfns_fi`` (hence ``bse.exciton_bands``).  Gating here covers the
+    # exciton path without reaching into it.
+    #
+    # WHY ALL k.  ``streaming_galerkin_solve`` prints ``ctilde[0]`` only, and
+    # k=0 is Γ, the most symmetric point in the zone.  Cheap to fix: this is
+    # nk·nb²·rank, four orders below the nk·rank³ of an eigendecomposition.
+    #
+    # THE THRESHOLD IS MEASURED, not chosen.  Jobs 7883150 / 7883160, MoS2 4×4
+    # / n_μ=785 / rtol 1e-8, walking ncond across the capacity limit
+    # (nk·nb → nspinor·n_μ = 1570).  ``ortho`` is this number; ``on-grid'' is
+    # the order-matched max|Δε| over the whole band window against the stored
+    # eigenvalues:
+    #
+    #   ncond  nk·nb  rank   ortho      on-grid max   on-grid over BSE cond
+    #     70    1536  1536   1.87e-14   3.2e-05 meV        8.8e-11 meV
+    #     71    1552  1551   2.97e-04   2.955   meV        0.201   meV   ←
+    #     72    1568  1562   6.31e-04   6.939   meV        0.242   meV
+    #     74    1600  1570   3.11e-03   23.60   meV        0.860   meV
+    #     78    1632  1570   9.35e-03   88.92   meV        3.142   meV
+    #
+    # Losing ONE direction of 1552 (rank 1551) is what crosses the owner's
+    # 0.1 meV requirement.  Over that range on-grid max|Δε| ≈ 9.0e3 · ortho
+    # (7.6e3 … 1.1e4), so a cap of 1e-6 holds the on-grid energy error under
+    # ~0.01 meV with a decade of margin, while every healthy configuration
+    # measured — every window from nb=30 to nb=96 — sits at 1.9e-14, EIGHT
+    # decades below the cap.  There is no false-positive room here.
+    #
+    # AND IT IS NOT A CONDITIONING PROBLEM, so do not reach for ``rtol``.
+    # Same job, ncond=72, tightening the amplification cap makes it WORSE
+    # because it discards more of a basis that already cannot span:
+    #     rtol 1e-8 → rank 1562, ortho 6.31e-04, on-grid  6.9 meV
+    #     rtol 1e-6 → rank 1494, ortho 1.04e-02, on-grid 80.3 meV
+    #     rtol 1e-4 → rank 1086, ortho 2.61e-02, on-grid 219.3 meV
+    # The lever is n_μ (or a narrower window), never the truncation tolerance.
+    #
+    # ``LORRAX_FH_ORTHO_TOL`` overrides; 0 disables. Never disable to make a
+    # run finish — the failure it catches is a wrong number, not a crash.
+    rep_ = NamedSharding(mesh_xy, P())
+
+    @partial(jax.jit, out_shardings=rep_)
+    def _ortho_all_k(c):
+        nb_ = c.shape[1]
+        G = jnp.einsum('kim,kjm->kij', c, jnp.conj(c), optimize=True)
+        return jnp.max(jnp.abs(G - jnp.eye(nb_, dtype=G.dtype)[None]))
+
+    _ortho = float(_ortho_all_k(ctilde))
+    _tol = float(os.environ.get("LORRAX_FH_ORTHO_TOL", "1e-6") or 0.0)
+    log_fn(f"  [gate] ctilde orthonormality over ALL {int(ctilde.shape[0])} k: "
+           f"max|C Cᴴ − I| = {_ortho:.3e}  (cap {_tol:.1e}; measured "
+           f"conversion: on-grid max|Δε| ≈ 9.0e3 × this, so this run's "
+           f"on-grid energy error is ≈ {9.0e3 * _ortho:.2e} meV)")
+    if _tol > 0.0 and _ortho > _tol:
+        raise ValueError(
+            f"build_fH_R: the Galerkin coefficients are NOT orthonormal — "
+            f"max|C Cᴴ − I| = {_ortho:.3e} over all k, above the {_tol:.1e} "
+            f"cap.  fH's eigenvalues are then not f(ε_n) and the recovered "
+            f"ENERGIES are wrong on the coarse grid by roughly "
+            f"{9.0e3 * _ortho:.2e} meV, silently.  Cause, in order of "
+            f"likelihood: (1) ψ-at-centroids cannot span the band window — "
+            f"check the rank line from streaming_galerkin_solve for "
+            f"rank < nk·nb, and fix it with MORE CENTROIDS or a NARROWER "
+            f"window, never with rtol; (2) the G accumulation summed Q Qᴴ "
+            f"per band chunk instead of summing into Q first.  Override with "
+            f"LORRAX_FH_ORTHO_TOL only to reproduce a known-bad run.")
 
     fH_k, fH_R = _build(ctilde, f_eps.T)
     return fH_k, fH_R, (a_f, n_f, shift), f_eps
@@ -967,7 +1243,21 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         wrapped_k = (kpath_frac + 0.5) % 1.0 - 0.5
         # Pad nq to a multiple of batch_size — every batch has the same
         # shape, _kpath_batch compiles ONCE.
-        batch_size = 32
+        #
+        # And pad batch_size itself to a multiple of ndev.  ``batch_mat_shard``
+        # / ``batch_eig_shard`` above are RAW ``P(('x','y'), …)`` NamedShardings
+        # with no fitter, so a width that does not divide px*py does not
+        # degrade here — it raises ``IndivisibleError`` inside the jit.  A
+        # fixed 32 therefore restricts this driver to device counts dividing
+        # 32; at P=64 it cannot run at all.  Third member of the same class as
+        # the fitted ``sharding_y`` above and the ``bs`` block in
+        # ``bandstructure.bse_setup`` (whose 32-wide q-batch, which DOES have a
+        # fitter, replicated instead of refusing and cost 866.5 s vs 105.7 s —
+        # jobs 7882533 / 7882569).  Padding is the right lever for all three:
+        # the extra q are zero rows already appended here and already dropped
+        # by the ``[:nq]`` slice in ``_post_kpath``, so this changes how many
+        # q are evaluated and where, never a value.
+        batch_size = _pad_to(mesh_xy, ('x', 'y'), 32)
         nq = wrapped_k.shape[0]
         n_pad = (-nq) % batch_size
         if n_pad:

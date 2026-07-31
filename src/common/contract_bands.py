@@ -59,20 +59,23 @@ Encoded policies (each measured; evidence cited inline)
    measurement (Eigen dgemm ~172 GF/s is per-flop BELOW its zgemm's
    295 at these shapes; job 7878942, refutation recorded in
    ``gw.ppm_tau_kernel._project_x_local``'s history).
-4. **The impl=mpi world-collective-first warm-up contract**
-   (memo Sec. 4.2, jobs 7878862/7878883): under
-   ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` the XLA CPU mpi-collectives
-   runtime creates GROUPED cliques lazily and its
-   ``MPI_Is_thread_main`` check passes ONLY after a WORLD-clique
-   collective has first-touched the runtime; a standalone consumer whose
-   FIRST collective is a grouped psum_scatter dies deterministically with
-   ``UNKNOWN: MPI: Communicator requested from a thread ...``.
-   Async-dispatch off does NOT avoid it — the contract is ORDER, not
-   asynchrony.  Production runs satisfy it accidentally (early sync
-   barriers); tests, microbenches and future BSE drivers do not.  The
-   factory therefore calls :func:`ensure_grouped_collectives_ready`
-   before returning — every consumer of this primitive inherits the
-   warm-up instead of rediscovering the failure.
+4. **The impl=mpi mesh-clique warm-up** (corrected 2026-07-29).  Under
+   ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` jaxlib refuses to CREATE a
+   communicator from any thread but the MPI-initialising one
+   (``MPI_Is_thread_main`` in
+   ``xla::cpu::MpiCollectives::CreateCommunicators``), and XLA:CPU's
+   parallel ``ThunkExecutor`` issues collective thunks from intra-op pool
+   workers — so a clique whose FIRST use is inside a real jitted program
+   dies on every rank.  The factory therefore calls
+   :func:`common.collectives.warm_mesh_cliques` before returning, which
+   creates each clique once from the main thread; XLA then serves every
+   later acquisition from its process-global clique cache.
+
+   This SUPERSEDES the earlier ``ensure_grouped_collectives_ready``, which
+   warmed the WORLD clique only.  The controls (job 7881053) show world-only
+   FAILS, as do x-only and x+y-without-world; only x+y+world passes.  The
+   old "world-collective-first contract" was right that warm-up matters and
+   wrong about which device sets to warm — the caching is **per-clique**.
 5. **Divisibility guard with an actionable refusal**: the two
    psum_scatters split m over p_x and n over p_y; an indivisible window
    would crash cryptically deep inside psum_scatter.  The wrapper
@@ -88,32 +91,31 @@ through XLA:CPU's Eigen dots (295 GF/s promoted zgemm / ~172 GF/s split
 dgemm vs 1263 GF/s MKL, memo Sec. 4.4/4.5; the bare Eigen dot saturates
 1.6–1.9× below vendor BLAS at full threads — jobs 7879008/7879010).
 The dial routes ONLY that right contraction through the vendor-BLAS GEMM
-host FFI handler (``lorrax_mklblas_gemm_batch``, src/ffi/mklblas/cpp —
-{d,s,z,c}gemm dispatch on buffer dtype (all four BLAS
-precisions), batched ``cblas_?gemm_batch`` entry
-when the BLAS has it, plain cblas GEMM loop otherwise; works in principle
-with Intel MKL or Cray LibSci, tested with Intel only so far;
-vendor-internal threading under the workstream-AW MklThreadScope
-pattern).  Everything else — channel algebra, collectives, the small left
-dots (1.6e-3 of the right's flops, measured) — is untouched.
+host FFI handler; everything else — channel algebra, collectives, the
+small left dots (1.6e-3 of the right's flops, measured) — is untouched.
 
-Default is AUTO (owner order 2026-07-29, doctrine #8: capability
-detection, not policy): unset / ``auto`` turns the FFI body ON when the
-platform is CPU AND the handler resolves in the host .so — announced once
-on rank 0 — and quietly keeps the native lowering everywhere the dial
-cannot apply (non-CPU platform: cuBLAS native is optimal, silent BY
-DESIGN; ``extra="minor"``, which is structural — the contracted axis is
-not GEMM-reachable there).  Since 2026-07-29 the handler serves ALL FOUR
-BLAS precisions (f64/f32/c128/c64), so the BSE fp32-GMRES complex64 path
-rides it too and is no longer a capability boundary.  ``LORRAX_BANDS_GEMM_FFI=0`` disables.  An EXPLICIT ``=1`` keeps
-the announce-or-REFUSE semantics: it REFUSES on a non-CPU mesh, refuses
-when the host .so lacks the handler (quoting the probe reason), refuses
-``extra="minor"`` and refuses unsupported dtypes — explicit requests are
-never silently downgraded.  ``input_output_aliases``: deliberately NONE —
-a GEMM output (B, M, N) never matches an operand buffer shape, so no
-alias is legal (contrast the in-place FFT handlers).  Read at FACTORY
-time: kernel caches must key on :func:`bands_gemm_ffi_enabled`
-(ppm_tau_kernel does).
+The dial ITSELF is a microservice: ``ffi.mklblas`` owns its grammar,
+platform resolution, capability probe, announcements, refusals and the
+``ffi_call`` (handler ``lorrax_mklblas_gemm_batch``,
+src/ffi/mklblas/cpp).  ``docs/dev/vendor_gemm_service.md`` is its
+contract, ``docs/dev/ffi_gate_contract.md`` the gate doctrine it
+implements.  Default is AUTO (owner order 2026-07-29, doctrine #8:
+capability detection, not policy) — ON when the platform is CPU AND the
+handler resolves in the host .so, announced once, and quietly native
+everywhere it cannot apply.
+
+What belongs to THIS module, and is enforced here, is only what a GEMM
+service cannot know: WHICH contraction is routed, and that
+``extra="minor"`` is excluded — a fact about this primitive's operand
+layout, not about BLAS (the contracted axis is not reachable by a strided
+batched GEMM without a full-tile transpose copy, which would cost what
+the handler saves).  Under AUTO the minor order quietly keeps the XLA
+plan; under an explicit ``=1`` it REFUSES, like every other unhonorable
+explicit request.  ``input_output_aliases``: deliberately NONE — a GEMM
+output (B, M, N) never matches an operand buffer shape, so no alias is
+legal (contrast the in-place FFT handlers).  Read at FACTORY time:
+kernel caches must key on :func:`bands_gemm_ffi_enabled` (ppm_tau_kernel
+does).
 
 Canonical operand layout (global shapes → mesh specs)
 -----------------------------------------------------
@@ -144,225 +146,56 @@ backend-neutral; the FFI dial is CPU-only and refused elsewhere).
 
 from __future__ import annotations
 
-import os
 from typing import Callable
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P
 
+from common.collectives import warm_mesh_cliques
+
 __all__ = [
     "contract_bands_block_reshard",
     "bands_gemm_ffi_enabled",
     "bands_gemm_ffi_mode",
-    "ensure_grouped_collectives_ready",
 ]
 
 
 # ---------------------------------------------------------------------------
-# impl=mpi world-collective-first warm-up (policy 4)
+# Gated vendor-BLAS GEMM FFI body — the SERVICE lives in ``ffi.mklblas``
 # ---------------------------------------------------------------------------
-
-_world_warmed = False
-
-
-def ensure_grouped_collectives_ready(*, print_fn=print) -> bool:
-    """Satisfy the XLA mpi-collectives world-collective-first init contract.
-
-    Under ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` a GROUPED clique
-    (any psum_scatter over a mesh sub-axis) can only be created after a
-    WORLD-clique collective has first-touched the collectives runtime —
-    otherwise every rank whose first collective is grouped dies with
-    ``UNKNOWN: MPI: Communicator requested from a thread that is not the
-    one MPI was initialized from``  (memo Sec. 4.2; resolved empirically
-    by the 7878883 probe: world-psum-first fixes it, async-dispatch-off
-    does not).  This helper issues one world-spanning barrier collective
-    (``common.collectives.barrier`` — a psum over ALL global devices)
-    exactly once per process, only when the mpi implementation is active
-    in a multi-process run.  Idempotent and cheap when already warm
-    (~60 ms measured); a no-op on gloo / single-process / non-CPU stacks.
-
-    MUST be called synchronously on every rank (it is a collective).  The
-    :func:`contract_bands_block_reshard` factory calls it, and factories
-    are invoked synchronously on all ranks by construction (kernel-build
-    time); standalone consumers (microbenches, drivers) may call it
-    directly before their first grouped collective.
-
-    Returns True when a warm-up collective was actually executed.
-    """
-    global _world_warmed
-    if _world_warmed:
-        return False
-    impl = os.environ.get(
-        "JAX_CPU_COLLECTIVES_IMPLEMENTATION", "").strip().lower()
-    if impl != "mpi":
-        return False
-    from common.collectives import barrier, process_count
-    if process_count() <= 1:
-        return False
-    # A real world-clique collective through the active runtime.  Marking
-    # the flag BEFORE the barrier would skip the warm-up forever if the
-    # barrier itself raised; barrier() is fatal-on-failure by design, so
-    # ordering after is safe and re-entry cannot happen on a dead rank.
-    barrier("contract_bands.world_collective_warmup", print_fn=print_fn)
-    _world_warmed = True
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Gated vendor-BLAS GEMM FFI body (CPU only; AUTO default since 2026-07-29)
-# ---------------------------------------------------------------------------
-
-_BANDS_GEMM_TARGET = "lorrax_mklblas_gemm_batch"
-_bands_gemm_announced: set = set()
-_bands_gemm_auto_verdict: bool | None = None  # memoized capability probe
-
-
-def _rank0() -> bool:
-    try:
-        return jax.process_index() == 0
-    except Exception:                                     # noqa: BLE001
-        return True
+# The dial's grammar, platform resolution, capability probe, announcements
+# and refusals are the microservice's (``src/ffi/mklblas/gemm.py``, on the
+# shared ``ffi.common.gate.Gate``); its ``ffi_call`` is there too, per
+# ``src/ffi/AGENTS.md:149-150``.  This module keeps only the two things that
+# are genuinely ITS policy and cannot live in a GEMM service: WHICH
+# contraction is routed (the large right one, never the left dots), and the
+# ``extra="minor"`` structural exclusion, which is a fact about this
+# primitive's operand layout rather than about BLAS.  Contract:
+# ``docs/dev/vendor_gemm_service.md``; gate doctrine:
+# ``docs/dev/ffi_gate_contract.md``.
+from ffi.mklblas import (                                    # noqa: E402
+    GATE as _BANDS_GEMM_GATE,
+    gemm_batch as _gemm_batch_ffi,
+    require_bands_gemm_ffi as _require_bands_gemm_ffi,
+)
 
 
 def bands_gemm_ffi_mode() -> str:
-    """The LORRAX_BANDS_GEMM_FFI grammar: ``"on"`` | ``"off"`` | ``"auto"``.
-
-    ``auto`` (the DEFAULT since the 2026-07-29 owner order — unset or
-    ``auto``) is capability detection, not policy (env-vars doctrine #8):
-    it turns the FFI GEMM body ON only where it is known-optimal and
-    available (CPU platform + handler in the host .so) and quietly leaves
-    the native lowering everywhere else.  Explicit ``1`` keeps the
-    announce-or-REFUSE semantics; explicit ``0`` disables.  Unrecognized
-    values announce once and take the conservative direction: ``off``."""
-    v = os.environ.get("LORRAX_BANDS_GEMM_FFI", "").strip().lower()
-    if v in ("", "auto"):
-        return "auto"
-    if v in ("0", "off", "false", "no"):
-        return "off"
-    if v in ("1", "on", "true", "yes"):
-        return "on"
-    if "grammar" not in _bands_gemm_announced:
-        _bands_gemm_announced.add("grammar")
-        print(f"*** LORRAX_BANDS_GEMM_FFI={v!r} is not a recognized value "
-              f"(accepted: auto/unset, 0/off/false/no, 1/on/true/yes).  "
-              f"Treating as OFF (default XLA GEMM lowering). ***", flush=True)
-    return "off"
-
-
-def _bands_gemm_auto_enabled() -> bool:
-    """The AUTO resolution (owner order 2026-07-29): ON iff the platform
-    is CPU AND the GEMM handler resolves in the host .so.  Decision
-    announced ONCE on rank 0 either way (the router prints its decision);
-    on a non-CPU platform auto is OFF silently BY DESIGN — XLA:GPU's dot
-    lowering already dispatches cuBLAS, which is optimal there.
-
-    Platform is read from ``JAX_PLATFORMS`` (``ffi_loader.platform_from_env``
-    — never initializes the JAX backend, so cache-key calls before
-    ``jax.distributed.initialize`` stay safe).  The production CPU harnesses
-    export ``JAX_PLATFORMS=cpu``, and ``runtime.bootstrap()``'s GPU-less
-    downgrade (``fallback_to_cpu_if_no_gpu_backend``) FORCES it to ``cpu``,
-    so those runs resolve correctly.  The read is lexical though: an unset
-    variable resolves CUDA-first, and so does a run that reaches a CPU mesh
-    while ``JAX_PLATFORMS`` still reads ``cuda,cpu`` (``set_default_env``'s
-    gpu default, if jax resolved cpu without raising).  Both give auto-OFF
-    — the safe direction: the XLA lowering, no error, just no speedup.
-    Fix either by exporting ``JAX_PLATFORMS=cpu`` or ``=1`` explicitly.
-    """
-    global _bands_gemm_auto_verdict
-    if _bands_gemm_auto_verdict is not None:
-        return _bands_gemm_auto_verdict
-    from ffi.common import ffi_loader
-    if ffi_loader.platform_from_env(default="CUDA") != "cpu":
-        # Non-CPU platform: silently-by-design OFF (cuBLAS native optimal).
-        _bands_gemm_auto_verdict = False
-        return False
-    ok, reason = ffi_loader.probe_target(_BANDS_GEMM_TARGET, "cpu")
-    _bands_gemm_auto_verdict = bool(ok)
-    if "auto" not in _bands_gemm_announced:
-        _bands_gemm_announced.add("auto")
-        if _rank0():
-            if ok:
-                print(f"[bands_gemm] AUTO-ON: CPU platform and FFI target "
-                      f"{_BANDS_GEMM_TARGET!r} resolves in the host .so -> "
-                      f"contract_bands right-GEMMs at vendor-BLAS rate "
-                      f"(1.6-1.9x over the XLA:CPU Eigen dots at full "
-                      f"threads, jobs 7879008/7879010).  "
-                      f"LORRAX_BANDS_GEMM_FFI=0 disables.", flush=True)
-            else:
-                print(f"[bands_gemm] auto: FFI target {_BANDS_GEMM_TARGET!r} "
-                      f"unavailable -> default XLA GEMM lowering "
-                      f"({reason})", flush=True)
-    return _bands_gemm_auto_verdict
+    """The LORRAX_BANDS_GEMM_FFI grammar: ``"on"`` | ``"off"`` | ``"auto"``
+    (delegates to :data:`ffi.mklblas.GATE`)."""
+    return _BANDS_GEMM_GATE.mode()
 
 
 def bands_gemm_ffi_enabled() -> bool:
     """True when the primitive's LARGE right contraction routes through the
     vendor-BLAS GEMM host FFI handler.  DEFAULT is AUTO (2026-07-29 owner
     order): ON when the platform is CPU and the handler resolves in the
-    host .so (announced once), OFF otherwise — see
-    :func:`bands_gemm_ffi_mode`.  Read at FACTORY time — kernel caches
-    must key on this (ppm_tau_kernel's pipeline/cache keys do)."""
-    mode = bands_gemm_ffi_mode()
-    if mode == "off":
-        return False
-    if mode == "on":
-        return True
-    return _bands_gemm_auto_enabled()
-
-
-def _require_bands_gemm_ffi(mesh: Mesh) -> None:
-    """Announce-or-refuse for the explicitly requested FFI GEMM body."""
-    plat = mesh.devices.flat[0].platform
-    if plat != "cpu":
-        raise RuntimeError(
-            f"LORRAX_BANDS_GEMM_FFI requested the MKL batched-GEMM host "
-            f"backend, but the mesh devices are {plat!r}.  This dial is "
-            f"CPU-only BY DESIGN: the native XLA dot lowering on CUDA "
-            f"already dispatches cuBLAS (optimal there) and is deliberately "
-            f"untouched.  Unset LORRAX_BANDS_GEMM_FFI on non-CPU meshes — "
-            f"explicit requests are never silently downgraded.")
-    from ffi.common import ffi_loader
-    ok, reason = ffi_loader.probe_target(_BANDS_GEMM_TARGET, "cpu")
-    if not ok:
-        raise RuntimeError(
-            f"LORRAX_BANDS_GEMM_FFI requested the MKL batched-GEMM host "
-            f"backend, but FFI target {_BANDS_GEMM_TARGET!r} is unusable: "
-            f"{reason}")
-    if _BANDS_GEMM_TARGET not in _bands_gemm_announced:
-        _bands_gemm_announced.add(_BANDS_GEMM_TARGET)
-        if _rank0():
-            print(f"[bands_gemm] contract_bands right-GEMMs -> vendor-BLAS "
-                  f"GEMM host FFI handler ({_BANDS_GEMM_TARGET}): "
-                  f"dgemm/zgemm at BLAS rate (memo Sec. 4.4 exit (b)); "
-                  f"collectives, channel algebra and left dots untouched.",
-                  flush=True)
-
-
-def _gemm_batch_ffi(a3, b3):
-    """C[i] = A[i] @ B[i % BB] for A (BA, M, K), B (BB, K, N), BA % BB == 0.
-
-    Row-major NN batched GEMM through the host handler; dtype
-    (f64/f32/c128/c64)
-    is dispatched inside the .so from the buffer element type.  The
-    broadcast rule (B cycling with period BB) is what lets one handler
-    serve both the plain per-k batch (BA == BB == nk) and the
-    extra-stacked batch (BA == E·nk against the k-only ψ, extra axis
-    OUTERMOST).  No input_output_aliases — a (BA, M, N) GEMM output can
-    never legally alias a (BA, M, K)/(BB, K, N) operand buffer.
-    """
-    ba, m, k = (int(d) for d in a3.shape)
-    bb, k2, n = (int(d) for d in b3.shape)
-    if k != k2 or (bb and ba % bb):
-        raise ValueError(
-            f"bands_gemm: incompatible batch shapes A{tuple(a3.shape)} vs "
-            f"B{tuple(b3.shape)} (need A.K == B.K and BA % BB == 0).")
-    if a3.dtype != b3.dtype:
-        raise TypeError(
-            f"bands_gemm: mixed operand dtypes {a3.dtype} vs {b3.dtype} — "
-            f"the de-promotion policy should have split them upstream.")
-    out_t = jax.ShapeDtypeStruct((ba, m, n), a3.dtype)
-    return jax.ffi.ffi_call(_BANDS_GEMM_TARGET, out_t)(a3, b3)
+    host .so (announced once), OFF otherwise.  Read at FACTORY time —
+    kernel caches must key on this (ppm_tau_kernel's pipeline/cache keys
+    do), which is why the auto resolution is lexical and never initializes
+    the JAX backend (gate contract, tier 1)."""
+    return _BANDS_GEMM_GATE.enabled()
 
 
 # ---------------------------------------------------------------------------
@@ -476,14 +309,17 @@ def contract_bands_block_reshard(
                 "requests are never silently downgraded).")
     elif use_ffi:
         # AUTO (the default): capability detection, not policy — quietly
-        # keep the native lowering where the dial cannot apply.  Non-CPU
-        # mesh: silent OFF by design (XLA:GPU's dot lowering already hits
-        # cuBLAS — optimal); extra='minor': the contracted axis is not
-        # GEMM-reachable (see the explicit-mode refusal above), so the
-        # minor order keeps the XLA plan.  The probe + AUTO-ON announce
-        # already ran inside bands_gemm_ffi_enabled().
-        plat = mesh_xy.devices.flat[0].platform
-        if plat != "cpu" or extra == "minor":
+        # keep the native lowering where the dial cannot apply.  The gate
+        # owns the mesh-platform half (non-CPU mesh: OFF, silent BY DESIGN
+        # and with the reason recorded in the gate's
+        # ``silent_platform_demote`` field — XLA:GPU's dot lowering already
+        # hits cuBLAS, which is optimal); THIS module owns extra='minor',
+        # which is a fact about the primitive's operand layout, not about
+        # BLAS: the contracted axis is not GEMM-reachable there (see the
+        # explicit-mode refusal above), so the minor order keeps the XLA
+        # plan.  The probe + AUTO-ON announce already ran inside
+        # bands_gemm_ffi_enabled().
+        if _BANDS_GEMM_GATE.resolve(mesh_xy) is None or extra == "minor":
             use_ffi = False
 
     p_x = mesh_xy.shape[ax_x]
@@ -700,7 +536,9 @@ def contract_bands_block_reshard(
         _check_shapes(psi_left, o, psi_right)
         return _sm(psi_left, o, psi_right)
 
-    # Policy 4: every consumer inherits the warm-up (no-op off-mpi).
-    ensure_grouped_collectives_ready()
+    # Policy 4: create this mesh's MPI cliques on the MAIN thread now, so the
+    # pool-worker collectives inside the returned kernel hit XLA's clique
+    # cache instead of its MPI_Is_thread_main guard.  No-op off impl=mpi.
+    warm_mesh_cliques(mesh_xy)
 
     return _project

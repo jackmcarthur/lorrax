@@ -322,7 +322,31 @@ def _pad_axis_to_multiple(x: jax.Array, axis: int, multiple: int) -> tuple[jax.A
     return jnp.pad(x, pad_width, mode="constant"), size + pad
 
 
-def _get_local_mesh_coords(mesh_xy: Mesh) -> tuple[list[tuple[int, int]], int, int]:
+def _get_local_mesh_coords(
+    mesh_xy: Mesh, *, origin: str = "bse_io._get_local_mesh_coords",
+) -> tuple[list[tuple[int, int]], int, int]:
+    """This process's (x, y) coords in ``mesh_xy``, plus the grid shape.
+
+    Refuses up front (``collectives._require_addressable``) a mesh on which
+    THIS process owns no device.  Every shard-aware reader below funnels
+    through here and then hands its process-local block to
+    ``jax.make_array_from_process_local_data``, which on a zero-addressable
+    mesh runs ``next(iter(addressable_shards.values()))``
+    (``jax/_src/array.py:1017``) over an empty map and raises a BARE
+    ``StopIteration('')`` — no message, no rank, no mention of a mesh.  At
+    P=2 that lands as "rank 0 succeeded, rank 1 died with an empty
+    exception", which is what makes it undiagnosable (job 7882420).
+
+    The readers are called with the run's full 2-D mesh today, so every
+    rank IS addressable and this is hardening rather than a live bug.  It
+    is placed HERE, not at the three ``make_array_from_process_local_data``
+    call sites, because the very next line — ``np.argwhere(...)[0]`` over a
+    device this mesh does not contain — would raise an equally anonymous
+    ``IndexError`` first, before the guard could speak.
+    """
+    from common.collectives import _require_addressable
+
+    _require_addressable(mesh_xy, origin=origin)
     devices_2d = np.asarray(mesh_xy.devices)
     grid_x, grid_y = devices_2d.shape
     local_devices = list(jax.local_devices())
@@ -357,7 +381,8 @@ def _read_psi_mu_sharded(
     dtype: np.dtype = np.complex128,
     trim: bool = True,
 ) -> jax.Array:
-    local_coords, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
+    local_coords, grid_x, grid_y = _get_local_mesh_coords(
+        mesh_xy, origin="bse_io._read_psi_mu_sharded")
     local_x, local_y = _get_local_axis_coords(local_coords)
     _assert_local_block(local_coords, local_x, local_y)
 
@@ -460,7 +485,8 @@ def _read_vq0_sharded(
     trim: bool = True,
     kgrid: Optional[tuple[int, int, int]] = None,
 ) -> jax.Array:
-    local_coords, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
+    local_coords, grid_x, grid_y = _get_local_mesh_coords(
+        mesh_xy, origin="bse_io._read_vq0_sharded")
     local_x, local_y = _get_local_axis_coords(local_coords)
     _assert_local_block(local_coords, local_x, local_y)
     n_rmu, n_rnu, _nkx, _nky, _nkz, read_slab = _resolve_munu_reader(dset, kgrid=kgrid)
@@ -508,7 +534,8 @@ def _read_wq_sharded(
     trim: bool = True,
     kgrid: Optional[tuple[int, int, int]] = None,
 ) -> jax.Array:
-    local_coords, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
+    local_coords, grid_x, grid_y = _get_local_mesh_coords(
+        mesh_xy, origin="bse_io._read_wq_sharded")
     local_x, local_y = _get_local_axis_coords(local_coords)
     _assert_local_block(local_coords, local_x, local_y)
     # Layout shim (8-D / 6-D / 3-D-flat-q) is single-sourced in
@@ -852,7 +879,8 @@ def load_bse_data_from_restart_sharded(
         eps_v = jnp.asarray(enk_full[:, val_indices])
         eps_c = jnp.asarray(enk_full[:, cond_indices])
 
-        _, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
+        _, grid_x, grid_y = _get_local_mesh_coords(
+            mesh_xy, origin="bse_io.load_bse_data_from_restart_sharded")
         # Disk stores the LOGICAL μ extent; re-pad to the ONE in-memory
         # convention (mesh-product round-up, runtime.padding).
         n_rmu_pad = padded_mu_extent(n_rmu, grid_x * grid_y)

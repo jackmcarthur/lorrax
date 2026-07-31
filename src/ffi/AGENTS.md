@@ -10,7 +10,32 @@ ships five targets, all validated on NERSC Perlmutter (1–4 nodes × 4×A100):
 | `cublasmp` | cuBLASMp (batched gemm + fused W-solve) | 1 proc per GPU | `common.cublasmp_gemm_test`, `common.cublasmp_w_solve_test`, contract tests | 1e-16–1e-14 on all meshes.  Comm ABI must match the LOADED cuBLASMp generation (≥0.5.0 = NCCL) — see `scripts/stage_cublasmp_redist.sh` |
 | `slate` | SLATE (MPI + GPU tile linalg; AMD-portable path) | 1 proc per GPU | `common.slate_cholesky_trsm_test`, `common.slate_batched_test`, contract tests | potrf/trsm/heev ~1e-16/1e-14 on p==q or 1-D meshes; see [`slate/README.md`](slate/README.md) |
 | `phdf5`      | parallel HDF5 via MPI-IO (read + write sharded slabs) | 1 proc per GPU | `common.phdf5_write_test`, `common.phdf5_multi_offset_test` | 0.000e+00 round-trip; 4 / 9 GB/s write / read @ 16 GPUs. See [`phdf5/ARCHITECTURE.md`](phdf5/ARCHITECTURE.md) for the async-design rationale and the non-obvious pitfalls encountered along the way. |
-| `scalapack` | ScaLAPACK from Cray LibSci (HOST platform — JAX CPU backend) | 1 proc per rank | `tests/test_ffi_linalg_contract.py` (`scalapack_*` cells) | pXgetrf+pXgetrs fused per-q LU (`distributed_lu = scalapack`); square + 1-D meshes (square-block requirement); zero extra link deps (libsci already in `liblorrax_ffi_host.so`) |
+| `scalapack` | the **ScaLAPACK API** (HOST platform — JAX CPU backend), supplied by whichever implementation the host lib was linked against: Cray LibSci on Perlmutter, Intel MKL on Frontera | 1 proc per rank | `tests/test_ffi_linalg_contract.py` (`scalapack_*` cells) | pXgetrf+pXgetrs fused per-q LU (`distributed_lu = scalapack`) + pXheevd eigh; square + 1-D meshes (square-block requirement); zero extra link deps (the provider is already in `liblorrax_ffi_host.so`) |
+
+> **Which of these families are vendor-swappable and which are not** —
+> with the API each one actually calls, and the evidence — is
+> [PORTING.md §0](PORTING.md). Short version: ScaLAPACK, CBLAS and HDF5
+> are published APIs with several implementations, so porting them is a
+> link line; SLATE, cuSOLVERMp, cuBLASMp, cuFFT and MKL's DFTI have one
+> implementation each. `mklblas`/`mklfft` are historical names, not
+> vendor assertions.
+>
+> **SLATE can answer to ScaLAPACK names — that is the portability route,
+> and it is one permutation away from working.** SLATE's optional
+> `libslate_scalapack_api` re-defines 6 of LORRAX's 11 ScaLAPACK names
+> (measured: every compute routine, none of the grid/descriptor tools,
+> which every platform's own ScaLAPACK supplies anyway) and forwards them
+> to `slate::`, whose CPU/CUDA/ROCm backend is fixed by the *build*. So
+> `pzheevd_` can be one symbol over three platforms. Two things stand in
+> the way today, both measured: the shims hard-code `MPI_COMM_WORLD`, so
+> under the mesh device order LORRAX ships they are **wrong by ~15 % on any
+> 2-D mesh** (a Fortran-order mesh swaps which provider is right — the fix
+> is LORRAX-side, no upstream patch); and the target defaults to
+> `HostTask`, so a GPU build silently runs on the CPU.
+> `scalapack/cpp/blacs_grid.h` detects the interposition and refuses by
+> default — `ffi_loader` keys only on LORRAX's own handler symbols and
+> cannot see it. Full measurement, the fix and its cost:
+> [PORTING.md §0b](PORTING.md); what each user's machine gets: §0c.
 
 Multi-process targets share the same bootstrap pattern (KV-store broadcast
 of a unique handle → `cal_comm_create` / `H5Fcreate`) — the scaffold for

@@ -96,14 +96,51 @@ Set **before `import jax`**. `gw_jax.py` hard-defaults the two X64 / platform va
 | `JAX_ENABLE_X64` | `1` | 64-bit precision (required for GW) |
 | `JAX_PLATFORMS` | `cuda,cpu` | Prefer CUDA, fall back to CPU |
 | `XLA_PYTHON_CLIENT_PREALLOCATE` | `false` | Don't pre-grab a fixed XLA pool |
-| `XLA_PYTHON_CLIENT_ALLOCATOR` | `platform` | Use CUDA async mempool (shared with NCCL / cuSOLVERMp / SLATE) |
-| `TF_GPU_ALLOCATOR` | `cuda_malloc_async` | CUDA 12 async allocator (no pipeline stalls) |
+| `XLA_PYTHON_CLIENT_ALLOCATOR` | `cuda_async` | cudaMallocAsync mempool (shared with NCCL / cuSOLVERMp / SLATE).  **Not** `platform` — see §3.2 |
 | `JAX_COMPILATION_CACHE_DIR` | `$SCRATCH/.jax_cache` | Persistent XLA PTX cache across processes |
 | `HDF5_USE_FILE_LOCKING` | `FALSE` | Lustre HDF5 compatibility |
 
-### 3.2 Why the platform allocator, not `MEM_FRACTION=0.95`
+### 3.2 The three allocators, and why not `MEM_FRACTION=0.95`
 
-Pre-allocating 95 % of A100 VRAM into XLA's BFC pool leaves NCCL only ~2 GB for staging, and cuSOLVERMp's `syevd` surfaces this as `NCCL error 1 unhandled cuda error` → `cusolverMpSyevd: status=7`. Using `XLA_PYTHON_CLIENT_ALLOCATOR=platform` (cudaMallocAsync) lets XLA and NCCL (and CAL / SLATE) share one pool. If you need a hard cap, use `MEM_FRACTION` only with `XLA_PYTHON_CLIENT_ALLOCATOR=default` (BFC) — the platform allocator ignores it.
+`XLA_PYTHON_CLIENT_ALLOCATOR` selects between **three distinct allocators** in
+the CUDA plugin.  This section used to call `platform` "cudaMallocAsync"; it is
+not, and the difference decides whether every memory report in the codebase
+works:
+
+| value | what it actually is | plugin log line | `memory_stats()` |
+|---|---|---|---|
+| unset / `default` / `bfc` | XLA's BFC pool | `Using BFC allocator.` | fully populated |
+| `platform` | plain `cudaMalloc` | `Using platform allocator.` | `bytes_limit=0`, `peak_bytes_in_use=0` |
+| `cuda_async` | `cudaMallocAsync` (separate `CudaAsyncAllocator`) | — | keeps `peak_bytes_in_use` |
+
+Measured on 8× Quadro RTX 5000 across 2 nodes, jobs 7882442 / 7882447 / 7882468,
+every cell run twice with rep 2 in reverse order: `cuda_async` is the best of the
+three (0.19 GB overhead, 9.20 GB largest creatable cuFFT plan) **and** keeps
+`peak_bytes_in_use`.  `platform` has good headroom but blinds `gw_init`'s
+high-water report, `gw_output`'s XLA-pool banner and `runtime/aot_memory`, all of
+which read `memory_stats()`.
+
+`TF_GPU_ALLOCATOR` is a **TensorFlow** variable and is **inert for JAX**: a cell
+setting only `TF_GPU_ALLOCATOR=cuda_malloc_async` was byte-identical to the unset
+cell on every metric, including an 11.805 GB BFC pool the real `cuda_async`
+allocator never has (job 7882442).  It has been removed from the tables above
+rather than corrected.  Do not add it back.
+
+Why not `MEM_FRACTION=0.95`: pre-allocating 95 % of A100 VRAM into XLA's BFC pool
+leaves NCCL only ~2 GB for staging, and cuSOLVERMp's `syevd` surfaces this as
+`NCCL error 1 unhandled cuda error` → `cusolverMpSyevd: status=7`.  Using
+`XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async` lets XLA and NCCL (and CAL / SLATE)
+share one pool.  If you need a hard cap, `MEM_FRACTION` is honoured only by BFC
+(`default`/`bfc`); the other two ignore it.
+
+`runtime.set_default_env()` deliberately leaves `XLA_PYTHON_CLIENT_ALLOCATOR`
+**unset** (= BFC) and pins only `XLA_PYTHON_CLIENT_PREALLOCATE=false`.  On sm_75
+(Frontera `rtx`) `cuda_async` additionally needs the command-buffer restriction
+that `config/frontera/ffi_env.sh` sets alongside it; promote it globally only
+together with that mitigation.  An unrecognised value is refused up front by
+`runtime._check_allocator_env()` — left to jaxlib it surfaces as
+`Backend 'cuda' is not in the list of known backends`, which reads as missing
+hardware.
 
 ### 3.3 Device selection
 
@@ -439,8 +476,7 @@ module load cuda/12.3 python/3.12
 source $LORRAX_ROOT/.venv/bin/activate
 export JAX_ENABLE_X64=1 JAX_PLATFORMS=cuda,cpu
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export XLA_PYTHON_CLIENT_ALLOCATOR=platform
-export TF_GPU_ALLOCATOR=cuda_malloc_async
+export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async   # NOT `platform` — see §3.2
 python -m gw.gw_jax -i cohsex.in
 ```
 
@@ -476,7 +512,7 @@ Symptom: eigh FFI fails with `cusolverMpSyevd: status=7` and an NCCL error 1.
 
 Cause: XLA BFC preallocated the GPU pool, leaving NCCL no staging memory.
 
-Fix: confirm `XLA_PYTHON_CLIENT_PREALLOCATE=false` and `XLA_PYTHON_CLIENT_ALLOCATOR=platform` are set (the module sets them; a user-level `XLA_PYTHON_CLIENT_MEM_FRACTION` export can override and break things).
+Fix: confirm `XLA_PYTHON_CLIENT_PREALLOCATE=false` and `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async` are set (`platform` also frees the pool, but zeroes `memory_stats()` — see §3.2) (the module sets them; a user-level `XLA_PYTHON_CLIENT_MEM_FRACTION` export can override and break things).
 
 ### 8.4 `LORRAX_MPI_TYPE=pmix` hangs
 

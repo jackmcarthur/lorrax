@@ -162,6 +162,66 @@ def _check_dipole_coverage(
             print_fn=print_fn)
 
 
+def _dipole_window_from_params(params, wfn) -> tuple[int, int, int]:
+    """``(nval, ncond, nband)`` the way ``psp.get_dipole_mtxels`` derives it.
+
+    Mirrors the writer's own derivation (``get_dipole_mtxels.main``:
+    ``nval``/``ncond`` default 5, ``nband`` defaults to
+    ``max(wfn.nbands, nelec + ncond)`` and honours an explicit ``nband``),
+    because the provenance stamp records exactly those three numbers and
+    the check is only meaningful if the reader reconstructs them the same
+    way.  Kept as a named helper so the mirroring is visible and greppable
+    rather than inlined into the head path.
+    """
+    nval = int(params.get("nval", 5))
+    ncond = int(params.get("ncond", 5))
+    try:
+        nband_param = params.get("nband", None)
+        if nband_param is None:
+            nband = max(int(wfn.nbands), int(wfn.nelec) + ncond)
+        else:
+            nband = int(nband_param)
+    except Exception:
+        nband = max(int(wfn.nbands), int(wfn.nelec) + ncond)
+    return nval, ncond, nband
+
+
+def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
+    """Was ``dipole.h5`` built from THIS DFT solution and THIS band window?
+
+    The coverage check above answers "is the file big enough"; this answers
+    "is it the right file at all".  They are different failures and neither
+    implies the other: a dipole.h5 regenerated from a *different* WFN has
+    exactly the right shape, so every shape-based check passes and nothing
+    downstream notices that the q→0 head S(ω) — and therefore every
+    Σ_SX/Σ_COH head correction — is built from stale velocity matrix
+    elements.
+
+    ``psp.get_dipole_mtxels`` has stamped ``prov_*`` attrs (WFN sha256 plus
+    the band window) since the guard landed, and shipped
+    ``check_dipole_provenance`` to read them back.  Nothing called it; the
+    writer and the checker both existed and the consumer did neither.
+
+    Reports through ``common.sanity`` — loud by default, a refusal under
+    ``LORRAX_SANITY=strict`` — and is gated on ``sanity_enabled()`` like
+    its sibling.  An UNSTAMPED file (written before the guard) reports as
+    unverifiable and does not fail the run.
+    """
+    from common import sanity
+
+    if not sanity.sanity_enabled():
+        return
+    nval, ncond, nband = _dipole_window_from_params(params, wfn)
+    try:
+        from psp.get_dipole_mtxels import check_dipole_provenance
+    except Exception as exc:            # psp stack unavailable (h5py-less env)
+        print_fn(f"  [dipole provenance] check unavailable "
+                 f"({type(exc).__name__}: {exc})")
+        return
+    check_dipole_provenance(dipole_path, wfn=wfn, nval=nval, ncond=ncond,
+                            nband=nband, print_fn=print_fn)
+
+
 def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> HeadSample:
     """Resolve a q=0 head sample using overrides and configured source order."""
 
@@ -224,6 +284,8 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
             dipole_path, nb_file=nb, nk_file=int(dipole_cart.shape[1]),
             nk_run=nk_tot, nb_run=int(getattr(meta, "nb_sigma", 0) or 0),
             nelec=nelec, print_fn=print_fn)
+        _check_dipole_provenance(dipole_path, params=params, wfn=wfn,
+                                 print_fn=print_fn)
         occ = np.zeros((nk_tot, nb), dtype=float)
         occ[:, :max(0, min(nelec, nb))] = 1.0
         f_nk = jnp.asarray(occ, dtype=jnp.float64)

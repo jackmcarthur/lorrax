@@ -42,6 +42,230 @@ from common.units import RYD_TO_EV
 
 
 # ---------------------------------------------------------------------------
+#  Environment grammar — ONE boolean vocabulary for the GW init/config layer
+# ---------------------------------------------------------------------------
+#
+# WHY THIS IS HERE AND NOT IMPORTED.  The tree already carries the same
+# recognised token set in four places:
+#
+#   * ``ffi/common/gate.py::MODE_SPELLINGS`` — three-valued (auto/off/on).
+#     Its ``auto`` is load-bearing (a gate may DEMOTE and say so), so it is
+#     deliberately NOT folded into a two-valued test; only its on/off halves
+#     are the same vocabulary as ours.
+#   * ``runtime.__init__._FALSY_TOKENS`` — the falsy set plus ``""``.
+#   * ``isdf/core.py::_env_bool`` and ``file_io/_slab_io_mpi_host.py::_env_flag``
+#     — the two-valued helpers, identical to each other, and to the C++
+#     ``env_flag`` in ``ffi/phdf5/cpp/context.cc``.
+#
+# ``gw.gw_config`` must stay importable WITHOUT jax (the login-node config
+# tests, and ``gw_output``'s banner, both rely on that), while
+# ``isdf.core`` imports jax at module scope — so this layer cannot import
+# the helper it agrees with.  The duplication is therefore deliberate and
+# is pinned by ``tests/test_env_grammar.py::test_defect3_vocabulary_has_not_drifted``,
+# which reads the other four copies (two of them straight out of the source
+# text, without importing jax) and fails on any drift.
+#
+# SEMANTICS, matching ``isdf.core._env_bool`` exactly:
+#   unset or blank      -> the caller's default
+#   a truthy spelling   -> True        (case- and whitespace-insensitive)
+#   a falsy spelling    -> False
+#   anything else       -> False, AND announced once (see ``env_bool``)
+#
+# The announcement is the only behavioural difference from
+# ``isdf.core._env_bool``.  Resolving an unrecognised token to something
+# other than False would split the grammar for ``LORRAX_RCHUNK_DEBUG``,
+# which both modules read; adding telemetry does not.
+
+_ENV_TRUE = ("1", "on", "true", "yes")
+_ENV_FALSE = ("0", "off", "false", "no")
+
+#: (name, raw value) pairs already announced, so a knob read once per
+#: r-chunk cannot spam a multi-hour log.
+_ENV_ANNOUNCED: set = set()
+
+
+def reset_env_announce_state() -> None:
+    """Forget which grammar errors have been announced (tests only)."""
+    _ENV_ANNOUNCED.clear()
+
+
+def env_bool(name: str, default: bool, *, print_fn=print) -> bool:
+    """Canonical boolean env parse for the GW init/config layer.
+
+    Parameters
+    ----------
+    name : str
+        Environment variable, e.g. ``"LORRAX_MEM_DEBUG"``.
+    default : bool
+        Value when the variable is unset or blank.  This is the knob's
+        DOCUMENTED default, not a guess — ``docs/dev/env_vars.md`` is the
+        table it has to agree with.
+
+    Notes
+    -----
+    The three bugs this replaces, all in the four files this layer owns:
+
+    * ``if os.environ.get("LORRAX_EXIT_AFTER_ZETA"):`` — a bare presence
+      test, so ``=0`` ended a production run with ``SystemExit(0)``;
+    * ``not in ("0", "off", "false")`` — case-SENSITIVE, so
+      ``LORRAX_MALLOC_TRIM=OFF`` left the trim hook on while the
+      documented sibling ``LORRAX_MALLOC_TUNE=OFF`` correctly turned off;
+    * ``bool(os.environ.get(...))`` — same presence-test class.
+
+    An unrecognised token resolves False (see the module comment) but is
+    ANNOUNCED, once per (name, value), with the project's grep-able
+    ``*** LORRAX SANITY`` marker.  Silently resolving a typo in either
+    direction is the failure mode this whole helper exists to remove.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    tok = raw.strip().lower()
+    if tok in _ENV_TRUE:
+        return True
+    if tok in _ENV_FALSE:
+        return False
+    key = (name, raw)
+    if key not in _ENV_ANNOUNCED:
+        _ENV_ANNOUNCED.add(key)
+        print_fn(
+            f"  *** LORRAX SANITY: {name}={raw!r} is not a recognised "
+            f"boolean.  Accepted: {'/'.join(_ENV_TRUE)} (on), "
+            f"{'/'.join(_ENV_FALSE)} (off), unset/blank (default="
+            f"{'on' if default else 'off'}).  Treating it as OFF. ***")
+    return False
+
+
+def env_float(name: str, default: float, *, print_fn=print) -> float:
+    """Canonical numeric env parse: unset/blank → default, bad → ANNOUNCE.
+
+    The same defect class as :func:`env_bool`, one type along.  A
+    ``try: float(...) except: default`` leaves the user believing a knob is
+    in force when it is not — the exact failure this file's
+    ``ISDF_ZCT_STAGE_CAP_GB`` handler already carries a comment about
+    ("an OOM later, with no clue"), and which its sibling
+    ``ISDF_CHUNK_TARGET_UTILIZATION`` was still committing.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        key = (name, raw)
+        if key not in _ENV_ANNOUNCED:
+            _ENV_ANNOUNCED.add(key)
+            print_fn(f"  *** LORRAX SANITY: {name}={raw!r} is not a number; "
+                     f"falling back to {default}.  The knob is NOT in "
+                     f"force. ***")
+        return default
+
+
+def resolve_zct_stage_cap(cap_raw, frac_raw, *, per_device_gb: float,
+                          total_gb: float, print_fn=print):
+    """Resolve the ζCᵀ stage cap in GB, or ``None`` when no cap applies.
+
+    Pure — the caller supplies ``total_gb`` (the physical card, ``0.0``
+    when there is no device to take a fraction of, i.e. the CPU backend).
+
+    Every path that ends in "no cap" says why.  The CPU path used to be
+    silent: the fraction branch sat behind
+    ``jax.default_backend() in ("gpu", "cuda")``, so a user who exported
+    ``ISDF_ZCT_STAGE_CAP_FRAC`` on a CPU run got no cap, no clamp and no
+    message — indistinguishable from the knob working.
+    """
+    if cap_raw and str(cap_raw).strip():
+        try:
+            return min(float(per_device_gb),
+                       max(0.0, float(cap_raw)))
+        except ValueError:
+            # Deliberately does NOT fall through to the _FRAC branch: an
+            # explicit absolute cap that cannot be parsed is a user error,
+            # and quietly substituting a different knob's answer for it
+            # would hide the typo behind a plausible number.
+            print_fn(f"  *** LORRAX SANITY: ISDF_ZCT_STAGE_CAP_GB="
+                     f"{cap_raw!r} is not a number; NO stage cap is in "
+                     f"force (ISDF_ZCT_STAGE_CAP_FRAC is not consulted as "
+                     f"a fallback for a malformed explicit cap). ***")
+            return None
+    if not (frac_raw and str(frac_raw).strip()):
+        return None
+    if float(total_gb) <= 0:
+        print_fn(f"  *** LORRAX SANITY: ISDF_ZCT_STAGE_CAP_FRAC="
+                 f"{frac_raw!r} is a fraction of the DEVICE's physical "
+                 f"memory, and this backend reports none (total_gb=0) — "
+                 f"so NO stage cap is in force.  Use "
+                 f"ISDF_ZCT_STAGE_CAP_GB for an absolute cap. ***")
+        return None
+    try:
+        frac = max(0.10, min(0.95, float(frac_raw)))
+    except ValueError:
+        print_fn(f"  *** LORRAX SANITY: ISDF_ZCT_STAGE_CAP_FRAC="
+                 f"{frac_raw!r} is not a number; the stage cap is "
+                 f"NOT set. ***")
+        return None
+    return min(float(per_device_gb), frac * float(total_gb))
+
+
+# ---------------------------------------------------------------------------
+#  ζ-truncating env knobs
+# ---------------------------------------------------------------------------
+#: Env knobs that make the ζ fit stop EARLY and still write a file.
+#:
+#: ``LORRAX_MAX_RCHUNKS=N`` breaks the r-chunk loop after N chunks
+#: (``gw/isdf_fitting.py``), and the writer downstream of the loop still
+#: calls ``mark_zeta_done`` — so the truncated ζ is stamped complete.  If
+#: ``gw_init`` then stamps ``fit_provenance`` on it, ``_zeta_reuse_ok``
+#: will REUSE that ζ in a later production run from the same directory,
+#: because provenance records the *configuration*, which is identical.
+#: The result is silently wrong physics from a profiling knob.
+ZETA_TRUNCATING_ENV_KNOBS = ("LORRAX_MAX_RCHUNKS",)
+
+
+def active_zeta_truncating_knobs() -> list[tuple[str, str]]:
+    """``[(name, raw), ...]`` for every truncating knob currently in force.
+
+    Blank counts as unset (the r-chunk loop's own guard is
+    ``if _max_rchunks and ...``, so ``""`` does not truncate).
+    """
+    out = []
+    for name in ZETA_TRUNCATING_ENV_KNOBS:
+        raw = os.environ.get(name)
+        if raw is not None and raw.strip():
+            out.append((name, raw))
+    return out
+
+
+# ---------------------------------------------------------------------------
+#  XLA GPU memory environment — RE-EXPORTED, not defined here
+# ---------------------------------------------------------------------------
+#
+# These four names used to be defined in this file, ~280 lines of them, and
+# ``runtime.collect_startup_facts`` imported them from here — an L3 module
+# reaching up into the GW driver package for something that knows nothing
+# about GW.  They now live in :mod:`runtime.xla_memory`, next to
+# ``runtime.set_default_env``, which is the code that decides which of these
+# variables LORRAX ships.  See that module's docstring for the four traps it
+# encodes and the measurements behind them (jobs 7882443 / 7882447).
+#
+# The re-export is not a compatibility shim to be swept away: ``gw_init``
+# captions the ζ-fit peak and ``gw_output`` prints the startup banner from
+# these, and reading them as ``gw_config.<name>`` is how those call sites and
+# ``tests/test_env_grammar.py`` are written.  Keeping the alias here costs one
+# import and keeps the deck-level vocabulary in one place.
+#
+# ``runtime`` imports jax only inside function bodies, so this import does NOT
+# cost gw_config its jax-free property (the login-node config tests and
+# ``gw_output``'s banner both depend on that).
+from runtime.xla_memory import (       # noqa: F401
+    XlaGpuMemoryEnv,
+    XlaPoolReading,
+    classify_xla_pool,
+    resolve_xla_gpu_memory_env,
+)
+
+
+# ---------------------------------------------------------------------------
 #  Enums
 # ---------------------------------------------------------------------------
 
@@ -211,7 +435,7 @@ def _route_cpu_slab_io(print_fn) -> "SlabIOBackend":
 
     The tier-1 probe is :func:`ffi_loader.probe_target`, not a bare
     ``has_target``: its three-state reason distinguishes "lib not built
-    with the handler" (rebuild) from "lib could not be dlopen'd"
+    with the handler" (rebuild) from "lib could not be loaded"
     (``LD_LIBRARY_PATH``) — a distinction that cost workstream P a day.
     Never raises: any probe failure demotes to the next tier.
     """
@@ -276,12 +500,23 @@ def _route_gpu_slab_io(print_fn) -> "SlabIOBackend":
     # Multi-node detection: capability fact, not policy.  SLURM exports
     # the node count; other launchers without the variable are treated
     # as single-node (the probe below still guards the library itself).
+    # A malformed value used to be swallowed, leaving _nnodes=1 — i.e. a
+    # multi-node run silently routed to the CUDA phdf5 FFI, the one path
+    # documented below as a known cross-node failure.  Say so instead: the
+    # detection still degrades to single-node (that is the safe direction
+    # for a capability probe), but not in silence.
     _nnodes = 1
     for _k in ("SLURM_JOB_NUM_NODES", "SLURM_NNODES"):
+        _raw = os.environ.get(_k)
+        if _raw is None or not _raw.strip():
+            continue
         try:
-            _nnodes = max(_nnodes, int(os.environ.get(_k, "1")))
+            _nnodes = max(_nnodes, int(_raw))
         except ValueError:
-            pass
+            print_fn(f"  *** LORRAX SANITY: {_k}={_raw!r} is not an integer; "
+                     f"multi-node detection falls back to 1 node, which "
+                     f"routes slab_io=auto to the CUDA phdf5 FFI.  On a real "
+                     f"multi-node GPU run set slab_io explicitly. ***")
 
     reason = "ffi.common.ffi_loader import failed"
     _ffi_write_ok = False
@@ -396,6 +631,77 @@ def normalize_w_dyson_solver(value) -> str:
             f"w_dyson_solver={value!r} invalid; expected "
             f"local (default; auto is an alias) or distributed.")
     return s
+
+
+def eigh_backend_choices() -> tuple:
+    """The legal ``eigh_backend`` spellings — the RESOLVER's own list.
+
+    Read from :data:`ffi.linalg.resolve.BACKEND_CHOICES` so the parser and
+    the thing that actually dispatches cannot drift.  They HAD drifted:
+    this parser accepted only ``auto|off|cusolvermp|slate`` while the
+    resolver had grown ``distributed`` (the portable "spread ONE tile over
+    the mesh" spelling, and the ONLY eigh backend that exists on a host
+    mesh, where it means ScaLAPACK ``pzheevd``) and ``scalapack``.  The
+    effect was that the low-memory eigh could not be requested at all
+    through a GW input file on CPU — the very platform it is needed on.
+
+    Falls back to the literal tuple if ``ffi`` cannot be imported (a
+    parser must not need the FFI package to read a deck); the fallback is
+    pinned equal to the resolver's list by
+    ``tests/test_bse_setup_qchunk.py``.
+    """
+    try:
+        from ffi.linalg.resolve import BACKEND_CHOICES
+        return tuple(BACKEND_CHOICES["eigh"])
+    except Exception:
+        return ("auto", "off", "distributed", "cusolvermp", "slate",
+                "scalapack")
+
+
+def resolve_eigh_backend(params) -> str:
+    """``(eigh_backend, use_low_mem_eigh)`` → ONE backend string.
+
+    THE single place the two spellings of one axis are combined, so a
+    driver that reads the raw params dict (``bandstructure.htransform``,
+    ``bse.exciton_bands``) gets the same answer as ``LorraxConfig``.
+
+    * ``use_low_mem_eigh`` unset/false → ``eigh_backend`` verbatim.
+    * true + ``auto`` → ``"distributed"`` (the platform's distributed
+      library; ScaLAPACK on a host mesh, cuSOLVERMp on CUDA).
+    * true + an explicit library name → that name (it already IS the
+      distributed path).
+    * true + ``off`` → ``ValueError``.  ``off`` pins the q-batched native
+      eigh, which needs a WHOLE ``(rank, rank)`` matrix per device — the
+      one thing the flag says is unaffordable.  Refusing at parse time is
+      the doctrine: an explicit request that cannot be honoured never
+      silently becomes its opposite.
+
+    Vocabulary is checked here too, so an unknown spelling fails at parse
+    time rather than at the first eigh.
+    """
+    raw = params.get("eigh_backend", "auto") if hasattr(params, "get") else "auto"
+    backend = str("auto" if raw is None else raw).strip().lower()
+    choices = eigh_backend_choices()
+    if backend not in choices:
+        raise ValueError(
+            f"eigh_backend={backend!r} invalid; expected "
+            f"{' / '.join(choices)}.")
+    low_mem = bool(params.get("use_low_mem_eigh", False)
+                   if hasattr(params, "get") else False)
+    if not low_mem:
+        return backend
+    if backend in ("auto", "native"):
+        return "distributed"
+    if backend == "off":
+        raise ValueError(
+            "use_low_mem_eigh = true with eigh_backend = off is a "
+            "contradiction: 'off' pins the q-batched NATIVE eigh, which is "
+            "the path that needs one whole (rank, rank) matrix per device — "
+            "exactly what the low-memory flag says will not fit.  Either "
+            "drop use_low_mem_eigh, or set eigh_backend = auto (resolves to "
+            "'distributed') or name a library "
+            "(distributed|cusolvermp|slate|scalapack).")
+    return backend
 
 
 # ---------------------------------------------------------------------------
@@ -537,18 +843,33 @@ _DEFAULTS = {
     # cusolvermp_lu with values auto|on|off (on → cusolvermp).
     "distributed_cholesky": "auto",
     "distributed_lu":       "auto",
-    #   eigh_backend = auto | off | cusolvermp | slate
+    #   eigh_backend = auto | off | distributed | cusolvermp | slate
+    #                | scalapack
     #       Hermitian eigensolver for the BSE/htransform distributed-eigh
     #       sites (bse_setup fH_q, vq_interp coarse C_q tiles).  auto|off =
     #       the q-BATCHED native jnp.linalg.eigh (the measured default at
-    #       every production tile size); cusolvermp|slate spread ONE tile
-    #       over the whole mesh via the distributed-linalg FFI — the wide-
-    #       band-window regime where a single matrix no longer fits on one
-    #       device (square mesh + one process per device required; all
-    #       guards fire at resolve time — see ffi/linalg + docs/dev/
-    #       linalg_ffi.md).  The --eigh-backend CLI flag of htransform /
-    #       exciton_bands OVERRIDES this key.
+    #       every production tile size); the rest spread ONE tile over the
+    #       whole mesh via the distributed-linalg FFI — the wide-band-window
+    #       regime where a single matrix no longer fits on one device (square
+    #       mesh + one process per device required; all guards fire at
+    #       resolve time — see ffi/linalg + docs/dev/linalg_ffi.md).
+    #       ``distributed`` = the PLATFORM's distributed library (ScaLAPACK
+    #       pzheevd on a host mesh, cuSOLVERMp on CUDA) and is the spelling
+    #       that ports; the vocabulary is ffi.linalg.resolve's own, checked
+    #       against it at parse time so the two can never drift.  The
+    #       --eigh-backend CLI flag of htransform / exciton_bands OVERRIDES
+    #       this key.
     "eigh_backend":         "auto",
+    #   use_low_mem_eigh = true | false   (default false)
+    #       The SAME axis named by INTENT instead of by library: "one whole
+    #       (rank, rank) matrix does not fit on a rank, keep it spread over
+    #       the mu x nu face".  true + eigh_backend=auto  =>  'distributed'.
+    #       true + an explicit library name keeps that name.  true +
+    #       eigh_backend=off is a CONTRADICTION and is refused at parse time,
+    #       as is a true that cannot be honoured on this mesh — never a
+    #       silent fall back to the whole-matrix path the flag exists to
+    #       avoid.  See bandstructure.bse_setup.compute_wfns_fi.
+    "use_low_mem_eigh":     False,
     # Charge ζ-fit OPT-IN Tikhonov ridge ε (added ON TOP of the fixed
     # 1e-14·|tr| non-singularity floor, as a fraction of the mean CCT
     # diagonal tr(C)/n): C_q ← C_q + [1e-14·|tr| + ε·|tr|/n]·I before the
@@ -772,6 +1093,19 @@ _DEFAULTS = {
     "wfn_fi_min": 0,             # Sub-window of htransform band axis (0-based).
     "wfn_fi_max": 0,             # Exclusive upper end. wfn_fi_max==0 → use full window.
     "kgrid_fi": "",              # "nx ny nz" or "nx,ny,nz". Empty → no fine grid.
+    # Fine-grid q CHUNK: how many q-points of the fine set have their
+    # f(H(q)) built and decomposed at once.  0 (DEFAULT) = N_q_co, the
+    # COARSE k-point count prod(kgrid_co) — not a bare constant.  fH_R is
+    # (nk_co, rank, rank) face-sharded, so one chunk of N_q_co q-points is
+    # byte-for-byte the same per-rank residency as fH_R itself: a deck that
+    # could build fH_R at all can afford exactly one such chunk, and the
+    # fine-grid pass then completes for ANY N_q_fi.  Raise it to trade
+    # memory for fewer collectives, lower it on a memory-tight rank.  It is
+    # a FLOOR: rounded up to a multiple of the device count so the q axis
+    # stays shardable (bse_setup pads with sharding_fit.padded_extent).
+    # Ignored by the distributed-eigh path, whose chunk is 1 by
+    # construction.  See bandstructure.bse_setup.compute_wfns_fi.
+    "wfn_fi_q_chunk": 0,
 }
 
 # Keys whose string values should be lowercased and stripped
@@ -1212,7 +1546,10 @@ class BackendConfig:
     w_dyson_solver: str  # "local" | "distributed" (normalized; W Dyson plan)
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
     distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
-    eigh_backend: str          # "auto" | "off" | "cusolvermp" | "slate"
+    eigh_backend: str          # resolved: auto|off|distributed|cusolvermp|
+                               #           slate|scalapack (use_low_mem_eigh
+                               #           already folded in)
+    use_low_mem_eigh: bool     # what the deck ASKED for, kept for the banner
     zeta_ridge: float          # charge-CCT Tikhonov ridge ε (rel. to tr/n)
     charge_zeta_solve: str     # "rank_truncate" | "cholesky"
     distributed_zeta_solve: str  # "auto"|"replicated"|"per_q"|"distributed"
@@ -1228,8 +1565,9 @@ class BackendConfig:
                if self.w_dyson_solver != "local" else "")
             + f"distributed_cholesky={self.distributed_cholesky}, "
             f"distributed_lu={self.distributed_lu}, "
-            + (f"eigh_backend={self.eigh_backend}, "
-               if self.eigh_backend != "auto" else "")
+            + (f"eigh_backend={self.eigh_backend}"
+               + (" (use_low_mem_eigh)" if self.use_low_mem_eigh else "")
+               + ", " if self.eigh_backend != "auto" else "")
             + f"charge_zeta_solve={self.charge_zeta_solve}"
             + (f"(rcond={self.zeta_rcond:g})"
                if self.charge_zeta_solve == 'rank_truncate' else '')
@@ -1260,6 +1598,7 @@ class BSEConfig:
     wfn_fi_min: int
     wfn_fi_max: int
     kgrid_fi: str
+    wfn_fi_q_chunk: int   # 0 = N_q_co (prod(kgrid_co)); see compute_wfns_fi
 
 
 @dataclass(frozen=True)
@@ -1530,41 +1869,32 @@ class LorraxConfig:
         # 0.0 (default) = auto: the planner uses its ns²-aware default
         # (higher for scalar, lower for bispinor's 4× pair density).  A
         # positive env value overrides it, clamped to [0.85, 1.0].
-        try:
-            chunk_utilization = float(
-                os.environ.get("ISDF_CHUNK_TARGET_UTILIZATION", "0.0"))
-        except Exception:
-            chunk_utilization = 0.0
+        # ``env_float`` announces a non-numeric value instead of swallowing
+        # it — the bare ``except Exception`` here left the user believing a
+        # utilization was in force when it was not.
+        chunk_utilization = env_float("ISDF_CHUNK_TARGET_UTILIZATION", 0.0,
+                                      print_fn=print_fn)
         if chunk_utilization > 0:
             chunk_utilization = max(0.85, min(1.0, chunk_utilization))
 
         # --- ZCT stage cap from env ---
+        # ``total_gb`` is the PHYSICAL card; 0.0 when the backend has no
+        # device memory (CPU).  Passing it in keeps the decision — and
+        # every "no cap, and here is why" announcement — in one pure,
+        # testable place instead of behind a backend guard that used to
+        # skip the fraction branch in silence.
         import jax
-        zct_stage_cap_gb = None
-        zct_cap_env = os.environ.get("ISDF_ZCT_STAGE_CAP_GB")
-        zct_frac_env = os.environ.get("ISDF_ZCT_STAGE_CAP_FRAC")
-        if zct_cap_env:
-            try:
-                zct_stage_cap_gb = min(
-                    memory_per_device_gb, max(0.0, float(zct_cap_env)))
-            except ValueError:
-                # Swallowing this left the user believing a cap was in
-                # force when it was not -- an OOM later, with no clue.
-                print(f"  *** LORRAX SANITY: ISDF_ZCT_STAGE_CAP_GB="
-                      f"{zct_cap_env!r} is not a number; the stage cap is "
-                      f"NOT set. ***", flush=True)
-        if (zct_stage_cap_gb is None and zct_frac_env
-                and jax.default_backend() in ("gpu", "cuda")):
+        _zct_total_gb = 0.0
+        if jax.default_backend() in ("gpu", "cuda"):
             from common.gpu_utils import get_device_memory_info
-            total_gb = float(get_device_memory_info().get("total_gb", 0.0))
-            if total_gb > 0:
-                try:
-                    frac = max(0.10, min(0.95, float(zct_frac_env)))
-                    zct_stage_cap_gb = min(memory_per_device_gb, frac * total_gb)
-                except ValueError:
-                    print(f"  *** LORRAX SANITY: ISDF_ZCT_STAGE_CAP_FRAC="
-                          f"{zct_frac_env!r} is not a number; the stage cap "
-                          f"is NOT set. ***", flush=True)
+            _zct_total_gb = float(
+                get_device_memory_info().get("total_gb", 0.0))
+        zct_stage_cap_gb = resolve_zct_stage_cap(
+            os.environ.get("ISDF_ZCT_STAGE_CAP_GB"),
+            os.environ.get("ISDF_ZCT_STAGE_CAP_FRAC"),
+            per_device_gb=memory_per_device_gb,
+            total_gb=_zct_total_gb,
+            print_fn=print_fn)
 
         def _g(key):
             return params.get(key, _DEFAULTS.get(key))
@@ -1733,11 +2063,15 @@ class LorraxConfig:
                 f"distributed_lu={_dist_lu!r} invalid; expected auto / off "
                 f"/ cusolvermp / scalapack (a SLATE getrf wrapper does not "
                 f"exist yet; scalapack is the host/CPU-backend option).")
-        _eigh_backend = str(_g("eigh_backend")).strip().lower()
-        if _eigh_backend not in ("auto", "off", "cusolvermp", "slate"):
-            raise ValueError(
-                f"eigh_backend={_eigh_backend!r} invalid; expected "
-                f"auto / off / cusolvermp / slate.")
+        # eigh_backend + use_low_mem_eigh are ONE axis; ``resolve_eigh_backend``
+        # is the single place they combine (the raw-params drivers call the
+        # same function).  It also owns the vocabulary check, read from
+        # ffi.linalg.resolve so parser and dispatcher cannot drift.
+        _use_low_mem_eigh = bool(_g("use_low_mem_eigh"))
+        _eigh_backend = resolve_eigh_backend({
+            "eigh_backend": _g("eigh_backend"),
+            "use_low_mem_eigh": _use_low_mem_eigh,
+        })
         # No CPU rewriting for eigh_backend: an explicit FFI request keeps
         # the fails-loudly semantics — ffi.linalg.resolve_backend rejects
         # cusolvermp on a CPU mesh (and a slate-less build) at resolve time.
@@ -1883,6 +2217,7 @@ class LorraxConfig:
             distributed_cholesky=_dist_chol,
             distributed_lu=_dist_lu,
             eigh_backend=_eigh_backend,
+            use_low_mem_eigh=_use_low_mem_eigh,
             zeta_ridge=float(_g("zeta_ridge")),
             charge_zeta_solve=_charge_zeta_solve,
             distributed_zeta_solve=_dist_zeta_solve,
@@ -1909,7 +2244,12 @@ class LorraxConfig:
             wfn_fi_min=int(_g("wfn_fi_min")),
             wfn_fi_max=int(_g("wfn_fi_max")),
             kgrid_fi=str(_g("kgrid_fi") or ""),
+            wfn_fi_q_chunk=int(_g("wfn_fi_q_chunk")),
         )
+        if bse.wfn_fi_q_chunk < 0:
+            raise ValueError(
+                f"wfn_fi_q_chunk={bse.wfn_fi_q_chunk} invalid; expected >= 1, "
+                f"or 0 for the default (= N_q_co, the coarse k-point count).")
 
         return cls(
             # Top-level: system + mode flags

@@ -2,6 +2,21 @@
 
 Module organization, key classes, data flow, and file formats. Read this when working on implementation tasks. For physics/theory see [`PHYSICS_COMPREHENSIVE.md`](../theory/physics.md); for environment setup see [`ENVIRONMENT_COMPREHENSIVE.md`](../ENVIRONMENT_COMPREHENSIVE.md).
 
+> **Read [`layers.md`](layers.md) first if you are about to add or move a
+> module.** This page says *where things are*; that one says **what a module is
+> allowed to know about**, and it is enforced.
+>
+> Three levels — **L1 physics** (bands, q-points, ζ, Σ, decks), **L2 numerical
+> routines** (matrices, quadrature, convergence — nothing physical), **L3
+> substrate** (devices, meshes, processes, native libraries, files — nothing
+> mathematical). **Imports run downhill only.** `tests/test_layering.py` fails
+> when they do not: it is pure AST, needs neither jax nor an importable `src`,
+> and runs on a login node in under ten seconds.
+>
+> The one-line version: a driver should read as physics. If `gw_jax.py` has to
+> say `Mesh`, `shard_map` or `os.environ`, the thing it is saying belongs in
+> the substrate.
+
 ---
 
 ## Table of Contents

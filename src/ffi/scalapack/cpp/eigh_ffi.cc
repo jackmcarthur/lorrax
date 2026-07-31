@@ -308,6 +308,22 @@ static ffi::Error EighDispatch(
             "scalapack.eigh: W output must be float64 (real eigenvalues)");
     }
 
+    // PROVENANCE.  Refuse if the pXheevd this process will actually call is
+    // SLATE's overlay rather than the linked ScaLAPACK: that body is
+    // slate::heev, i.e. bug L-2 — the deterministic SIGSEGV this backend
+    // exists to avoid, and the one failure mode that leaves no traceback.
+    // See the block in blacs_grid.h for the measured symbol table and the
+    // LORRAX_SCALAPACK_ALLOW_SLATE_API waiver.
+    {
+        const char* evd = (dtype == ffi::DataType::F64) ? "pdsyevd_"
+                                                        : "pzheevd_";
+        const std::string refusal =
+            lorrax_ffi::scalapack::scalapack_slate_api_refusal("eigh", evd);
+        if (!refusal.empty()) {
+            return ffi::Error(ffi::ErrorCode::kUnimplemented, refusal);
+        }
+    }
+
     switch (dtype) {
         case ffi::DataType::F64:
             return EighImpl<double>(

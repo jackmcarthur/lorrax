@@ -92,8 +92,8 @@ handlers call it directly).
 
    > `probe_target` returns `(usable, reason)` and separates three cases
    > that have three different fixes: **unknown target** (typo / wrong
-   > platform), **the library would not load** (missing `.so`, unresolved
-   > `DT_NEEDED`, glibc/GLIBCXX mismatch, wrong `LD_LIBRARY_PATH` — the
+   > platform), **the library would not load** (missing `.so`, a library it
+   > needs not found, glibc/GLIBCXX mismatch, wrong `LD_LIBRARY_PATH` — the
    > handler may be perfectly well compiled), and **loaded but does not
    > export the symbol** (the genuine partial build — the only one that
    > means "rebuild"). `has_target` is the bool version, for auto-pick
@@ -105,8 +105,9 @@ handlers call it directly).
    > the cpu FFI library", while `nm -D` showed `SlatePotrfHostFfi`
    > present and workstream L had run that exact handler at 0.111 s. The
    > real cause was an incomplete `LD_LIBRARY_PATH`; the old message sent
-   > you to rebuild a library that was fine. **The unified host lib's
-   > RUNPATH covers MKL, SLATE's `lib64` and Intel MPI's `lib/release`,
+   > you to rebuild a library that was fine. **The unified host lib's own
+   > built-in search path covers MKL, SLATE's `lib64` and Intel MPI's
+   > `lib/release`,
    > but NOT `libhdf5.so.310`, `libfabric`, or the Intel compiler runtime
    > (`libimf`/`libsvml`/`libintlc`/`libirng`) — those must be on
    > `LD_LIBRARY_PATH`.** Check with `ldd <so> | grep 'not found'`.
@@ -522,8 +523,31 @@ What can run here?
   single rank, single process**, so it is not MPI, not the comm remap,
   not the LORRAX layout contract; ruled out: `MPI_Query_thread` = 3
   (MULTIPLE), `ldd -r` clean, MKL 2020.1 exports the full 2-stage set.
-  Prime suspect: SLATE 2025.05's host `heev` against MKL's LAPACK 3.8
-  (the upstream validation was Cray LibSci). On the **same** library and
+  ~~Prime suspect: SLATE 2025.05's host `heev` against MKL's LAPACK 3.8
+  (the upstream validation was Cray LibSci).~~
+  > **REFUTED 2026-07-31 (job 7883880).** `slate::heev` is not the fault.
+  > Reached through SLATE's own ScaLAPACK-compatibility shim
+  > (`scalapack_heevd.cc` → `slate::heev`, `LD_PRELOAD`ed over LORRAX's
+  > ScaLAPACK handler) on a **1×1 CPU mesh**, the very same `libslate.so.2`
+  > and MKL returned **CORRECT** at n = 32 / 64 / 128 / 512
+  > (`max|Δλ|` 1.24e-14 → 5.76e-13, `‖AZ−ZΛ‖/‖A‖` ≤ 3.2e-15,
+  > `‖ZᴴZ−I‖` ≤ 8.0e-14) — while in the **same job, same mesh, same sizes**,
+  > `ffi.slate`'s own host handler died with **SIGSEGV (rc 139) at n=32 and
+  > n=64**. Same library, same MKL, same process image, opposite outcomes ⇒
+  > the fault is in **`slate/cpp/host_ffi.cc`'s call path**, not upstream.
+  > Enumerable differences at that call site: LORRAX builds `Z` as
+  > SLATE-managed tiles and copies out via `tileGetForReading`, whereas the
+  > shim wraps the caller's buffer with `Matrix::fromScaLAPACK`; LORRAX uses
+  > the no-`grid_order` `HermitianMatrix::fromScaLAPACK` overload; and
+  > LORRAX passes only `{Target, HostTask}` where the shim also passes
+  > `MaxPanelThreads` and `InnerBlocking` (`MethodEig::DC` is ruled out —
+  > `src/heev.cc:92` shows DC is already SLATE's default).
+  > Reproducer, with the direct handler as its built-in red twin:
+  > `wk_REL/harness/slalias_l2.sbatch`. **The resolve-time refusal below
+  > stays** until someone fixes and gates the handler — this note changes
+  > where to look, not what is currently safe to run.
+
+  On the **same** library and
   context, `potrf`, `trsm` and ScaLAPACK `getrf/getrs` are all clean
   (potrf n=512 residual 1.47e-16). Since the handler IS compiled and the
   capability probe passes, nothing else would catch it and
@@ -559,6 +583,42 @@ What can run here?
   documented fallback: it supports `JOBZ='N'` and eigenvalue subsets and
   needs ~n²/p instead of ~3n²/p workspace, at slightly worse
   orthogonality on clustered spectra.
+* **SLATE's ScaLAPACK overlay can hijack the `scalapack` backend
+  invisibly, and is now REFUSED (2026-07-31).** SLATE ships an optional
+  `libslate_scalapack_api.so` that re-defines the ScaLAPACK entry points
+  and forwards them to `slate::`; its README documents `LD_PRELOAD`
+  interception. Measured against LORRAX's eleven names, it **DEFINES 6**
+  (`pzheevd_` `pdsyevd_` `pzgetrf_` `pdgetrf_` `pzgetrs_` `pdgetrs_` —
+  i.e. every operation this backend performs) and supplies **none** of
+  the five grid/descriptor names (it *calls* `numroc_` and
+  `Cblacs_gridinfo` itself). So one `LD_PRELOAD` replaces every solve
+  while `resolve_backend('eigh','scalapack')` still returns `scalapack`
+  and still promises a callable backend — `ffi_loader` keys only on
+  LORRAX's own handler symbols and cannot see it (measured:
+  `has_target('lorrax_scalapack_eigh')` still answers `True` with the
+  overlay live). **And it works on 1×1** — both ops, machine precision, n up
+  to 512 — which is the hazard, not a reassurance, because 1×1 is the one
+  geometry that cannot expose the defect. On a **2×2 mesh** (job 7883978,
+  n=64) the overlay returns `‖AZ−ZΛ‖/‖A‖ = 1.52e-01` and `‖ZᴴZ−I‖ = 6.98`
+  for eigh and `1.55e-01` for LU, where MKL is correct to 1e-15 on the same
+  mesh. **The whole defect is one permutation**: the shims hard-code
+  `MPI_COMM_WORLD` and want shard `(mx,my)` on rank `mx+my*p`, LORRAX puts
+  it on `mx*q+my`. Flip the mesh's device order to Fortran and the two swap
+  places exactly — overlay correct to 1.4e-15, MKL wrong by the same 1.52e-01
+  to four digits. So the fix is LORRAX-side and needs no patched dependency,
+  but it is a *swap*: the two providers cannot share a mesh until
+  `blacs_ctxt_for` derives its permutation from the mesh's actual device
+  order instead of assuming C. Separately, every shim hard-wires `info = 0`
+  ("todo: extract the real info") — the ζ-fit's LU ridge covers the singular
+  case, nothing covers a non-converged eigh — and `slate::heev` requires a
+  square process grid (`heev.cc:102`) and `GridOrder::Col` (asserted in five
+  places), while `getrf`/`getrs`/`potrf`/`trsm` carry no such constraint.
+  `scalapack/cpp/blacs_grid.h` resolves the provider of the routine it is
+  about to call (`dlsym` + `dladdr`) and refuses by default, naming all of
+  it. Reproducer: `wk_REL/harness/slalias_mesh.sbatch`.
+  `LORRAX_SCALAPACK_ALLOW_SLATE_API=1` downgrades to one loud line.
+  Full measurement + the build script for the red twin:
+  [`src/ffi/PORTING.md` §0b](../../src/ffi/PORTING.md).
 * **`scalapack.batched_distributed_solve_lu` DONATES both A and B.**
   Rebuild them if you need to compute a residual afterwards.
 * **MKL threading is a scale-dependent cliff inside the ScaLAPACK

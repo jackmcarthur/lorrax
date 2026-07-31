@@ -8,8 +8,10 @@ for the ``distributed_lu`` axis.  Identical call contract:
     B : (Nq, N, NRHS)  P(None, 'x', 'y')
     X : same shape/sharding as B
 
-ScaLAPACK comes from Cray LibSci, which ``liblorrax_ffi_host.so`` already
-links for SLATE's BLAS — no extra dependency.  The BLACS grid is built on
+ScaLAPACK comes from whichever implementation of the ScaLAPACK API the
+host library was linked against — MKL on Frontera, Cray LibSci on
+Perlmutter, and the source is identical either way (see
+``ffi.scalapack``).  No extra dependency.  The BLACS grid is built on
 the slate context's rank-remapped MPI comm ("C" grid order lands JAX shard
 (mx, my) at grid (mx, my)); the wrapper reuses ``ffi.slate.context`` for
 mesh validation, registration, and the per-(p, q) ctx cache.

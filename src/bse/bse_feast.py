@@ -27,7 +27,8 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from solvers.quadrature import feast_ellipse_quadrature as _feast_ellipse_quadrature_generic
-from .bse_ring_comm import build_bse_ring_matvec, build_bse_ring_matvec_full, make_bse_shardings
+from .bse_ring_comm import (build_bse_ring_matvec, build_bse_ring_matvec_full,
+                            create_mesh_xy, make_bse_shardings)
 from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_preconditioner import energy_diff_cv_k
 import common.timing as timing
@@ -773,12 +774,12 @@ def run_feast_ritz(
     return results
 
 def _create_mesh_xy(px: int, py: int) -> Mesh:
-    devices = jax.devices()
-    n_devices = len(devices)
-    if px * py > n_devices:
-        raise ValueError(f"Requested px*py={px*py} devices, but only {n_devices} available")
-    mesh_devices = np.array(devices[: px * py]).reshape(px, py)
-    return Mesh(mesh_devices, axis_names=("x", "y"))
+    """Alias of the ONE BSE mesh factory (``bse_ring_comm.create_mesh_xy``).
+
+    Was a local un-warmed copy; ``bse_kpm`` imports this name.  See the
+    docstring on ``create_mesh_xy`` for why the duplication was a defect.
+    """
+    return create_mesh_xy(px, py)
 
 
 def estimate_spectral_bounds_sharded(

@@ -41,21 +41,25 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 def _gather_to_host(arr) -> np.ndarray:
     """Bring a (possibly multi-process) jax.Array to host as numpy.
 
-    Mirrors ``file_io._slab_io_allgather._to_host`` — for sharded JAX
-    arrays uses ``process_allgather(tiled=False)`` (returns
-    ``(world, *shape)``; collapse to ``[0]`` for replicated data).
+    Delegates to :func:`common.collectives.gather_to_host`.
+
+    WHAT THIS USED TO BE, AND WHY IT WAS WRONG.  It branched on
+    ``process_count() == 1`` and then called ``process_allgather(tiled=False)``,
+    which stacks each process's copy to ``(world, *shape)`` and needed a
+    ``host.ndim == len(shape)+1`` heuristic to squeeze row 0 back off.  That
+    round trip is correct only for a REPLICATED array; on a
+    process-SPANNING one ``tiled=False`` raises outright
+    ("Gathering global non-fully-addressable arrays only supports
+    tiled=True").  Its own caller feeds it exactly that: ``init_bse_subspace``
+    passes the loader's k-sharded ``eps_c``/``eps_v``.  The correct predicate
+    is ``is_fully_addressable``, not the process count — a single process can
+    still hold the whole array, and 16 processes can still each hold a shard
+    of one.  The service has that branch and the reasoning behind it.
     """
     if isinstance(arr, np.ndarray):
         return arr
-    if jax.process_count() == 1:
-        return np.asarray(jax.device_get(arr))
-    from jax.experimental import multihost_utils
-    gathered = multihost_utils.process_allgather(arr, tiled=False)
-    host = np.asarray(jax.device_get(gathered))
-    expected = tuple(int(d) for d in arr.shape)
-    if host.ndim == len(expected) + 1 and host.shape[1:] == expected:
-        host = host[0]
-    return host
+    from common.collectives import gather_to_host
+    return gather_to_host(arr)
 
 
 def init_bse_subspace(

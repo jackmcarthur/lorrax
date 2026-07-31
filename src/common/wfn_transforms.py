@@ -1416,34 +1416,24 @@ def apply_bloch_phase_on_slice(
 # ===========================================================================
 
 
-_PROCESS_LOCAL_MESH: "Mesh | None" = None
-
-
-def process_local_mesh() -> Mesh:
-    """THE 1×1 ``('x','y')`` mesh over **this process's own** device.
-
-    Every rank gets a different mesh object holding a different device
-    (``jax.local_devices()[0]``), which is exactly the point: a jit
-    whose operands live on this mesh compiles and runs process-locally,
-    with no collective and no cross-rank agreement on shapes.  It is the
-    mesh half of the :meth:`file_io.wfn_loader.WfnLoader.load_process_local`
-    contract.
-
-    Cached module-wide so the shape-keyed jit caches in this module
-    (``to_box`` and friends key on the output ``NamedSharding``, which
-    embeds the mesh) hit instead of re-lowering per call.
-
-    NOTE the difference from ``jax.devices()[:1]``, which this helper
-    replaces at its call sites: ``jax.devices()`` is the GLOBAL device
-    list, so ``jax.devices()[0]`` is process 0's device on every rank —
-    a mesh no rank but 0 can compute on.
-    """
-    global _PROCESS_LOCAL_MESH
-    if _PROCESS_LOCAL_MESH is None:
-        _PROCESS_LOCAL_MESH = Mesh(
-            np.asarray(jax.local_devices()[:1]).reshape(1, 1),
-            axis_names=('x', 'y'))
-    return _PROCESS_LOCAL_MESH
+# THE 1×1 ('x','y') mesh over this process's own device — an ALIAS, not a
+# definition.  This module used to own it, and ``common.collectives`` (the
+# cross-process service) imported it from here, which is a device-layer
+# module reaching up into a ψ-transform kernel for its own topology.  The
+# owner moved on 2026-07-31; the function object is unchanged, so the
+# identity contract that makes this work is unchanged too.
+#
+# THAT IDENTITY IS LOAD-BEARING.  The shape-keyed jit caches in this module
+# (``to_box`` and friends) key on the output ``NamedSharding``, which embeds
+# the mesh OBJECT.  Two equal-but-distinct 1×1 ``Mesh``es double every one of
+# them.  So this MUST stay an alias — re-implementing it here, however
+# faithfully, is the bug.  ``tests/test_layering.py`` pins the direction and
+# ``tests/test_collectives_distribution.py`` pins the identity.
+#
+# It is the mesh half of the ``WfnLoader.load_process_local`` contract; see
+# ``common.collectives.single_device_mesh`` for the ``jax.devices()[:1]``
+# hazard it replaces.
+from common.collectives import single_device_mesh as process_local_mesh
 
 
 def load_kpoint_fftbox_local(wfn, meta, k_idx, nb, *, b_lo: int = 0,

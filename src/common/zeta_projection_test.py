@@ -68,18 +68,18 @@ def _init():
     if os.environ.get(_DIST):
         return
     if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
-        # Gloo transport: pin the high-speed fabric BEFORE the backend is
-        # created (a backend factory cannot be replaced afterwards).  A
-        # no-op when JAX_CPU_COLLECTIVES_IMPLEMENTATION != gloo.  This
-        # driver runs on gloo BY MEASUREMENT: job 7879485 shows the mpi
-        # collectives cannot create a grouped clique for a standalone
-        # driver under any warm-up, while gloo/ib0 passes the same chain.
+        # State the resolved CPU collectives implementation.  This driver
+        # runs under impl=mpi like everything else; the earlier claim that
+        # it "runs on gloo BY MEASUREMENT" rested on job 7879485, whose
+        # grouped-clique failures were jaxlib's MPI_Is_thread_main guard,
+        # not a property of this driver — LORRAX_MPI_FORCE_THREAD_MAIN
+        # answers it (docs/dev/mpi_collectives.md).
         try:
             import runtime as _rt
-            _rt.pin_gloo_interface()
+            _rt.announce_cpu_collectives()
         except Exception as _exc:                              # noqa: BLE001
-            print(f"[zeta_projection_test] pin_gloo_interface skipped: "
-                  f"{type(_exc).__name__}: {_exc}", flush=True)
+            print(f"[zeta_projection_test] announce_cpu_collectives "
+                  f"skipped: {type(_exc).__name__}: {_exc}", flush=True)
         cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
         one_gpu = cvd and "," not in cvd
         init_kwargs = {"local_device_ids": [0]} if one_gpu else {}
@@ -94,7 +94,6 @@ from jax.experimental import multihost_utils                       # noqa: E402
 from jax.experimental.shard_map import shard_map                   # noqa: E402
 
 from common.zeta_projection import (                                # noqa: E402
-    ensure_world_clique_ready,
     build_zeta_transfer,
     project_w_between_zeta_bases,
     transfer_operands_from_dense,
@@ -104,8 +103,8 @@ from common.zeta_projection import (                                # noqa: E402
     zeta_gram_replicated,
     least_squares_transfer,
 )
-from common.contract_bands import (                                 # noqa: E402
-    ensure_grouped_collectives_ready, bands_gemm_ffi_enabled)
+from common.contract_bands import bands_gemm_ffi_enabled           # noqa: E402
+from common.collectives import warm_mesh_cliques                   # noqa: E402
 from common.collectives import (                                    # noqa: E402
     barrier, device_put_process_local as _put)
 
@@ -952,12 +951,11 @@ def main() -> int:
     mesh = _mesh_from(args.mesh)
     _log(f"### zeta_projection_test cell={args.cell} mesh={args.mesh} "
          f"world={jax.process_count()} devices={len(jax.devices())} ###")
-    # impl=mpi: the WORLD clique must be created by a real device collective
-    # on THIS mesh before any grouped psum_scatter (job 7879482 — the
-    # primitive's sync_global_devices-based helper is not sufficient).
-    if ensure_world_clique_ready(mesh, print_fn=_log):
-        _log("  [mpi] world-clique warm-up collective executed")
-    ensure_grouped_collectives_ready(print_fn=_log)
+    # impl=mpi: create this mesh's MPI cliques on the MAIN thread before any
+    # jitted grouped collective.  Per-clique caching means the world clique
+    # alone is NOT enough (job 7881053) — warm_mesh_cliques does x, y and
+    # world.  No-op off impl=mpi.
+    warm_mesh_cliques(mesh, print_fn=_log)
     rc = _CELLS[args.cell](mesh, args)
     _log(f"### cell={args.cell} rc={rc} ###")
     return rc

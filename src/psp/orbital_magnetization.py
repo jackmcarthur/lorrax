@@ -54,8 +54,8 @@ if str(_SRC) not in sys.path:
 
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps, Meta
-from common.load_wfns import load_kpoint_fftbox
-from psp.dft_operators import (generate_gvectors_k, gather_psi_G_from_crys,
+from common.wfn_transforms import load_kpoint_fftbox
+from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
                                momentum_matrix_k)
 from psp.get_dipole_mtxels import compute_p_operator_k, compute_vnl_velocity_cart
 from psp.pseudos import load_pseudopotentials, print_atomic_structure
@@ -68,7 +68,7 @@ MU_B_PREFACTOR = 0.5  # |m_e/hbar^2| in Ry-a0^2 units (magnitude; sign handled b
 # ----------------------------------------------------------------------
 #  Per-k velocity assembly  (dH/dk = kinetic 2(k+G) + nonlocal dV_NL/dk)
 # ----------------------------------------------------------------------
-def velocity_at_k(wfn, sym, meta, vnl_setup, ik, nb):
+def velocity_at_k(wfn, sym, meta, vnl_setup, ik, nb, gvectors=None):
     """Return (v_kin, v_nl, eps, sz) for full-BZ k-index ``ik``.
 
     v_kin, v_nl : (3, nb, nb) complex128, the kinetic 2(k+G) and nonlocal
@@ -77,24 +77,31 @@ def velocity_at_k(wfn, sym, meta, vnl_setup, ik, nb):
                   sign can be validated by Hellmann-Feynman before summing.
     eps         : (nb,) DFT eigenvalues at this k (Ry).
     sz          : (nb,) <sigma_z> = sum_G(|c_up|^2 - |c_dn|^2) per band.
+    gvectors    : PaddedGVectors, optional — the fixed-shape G table, built
+                  once for the whole k sweep.  Pad columns are made inert by
+                  the mask that travels with it; they hold G=(0,0,0), which
+                  aliases Γ, so dropping the mask would double-count ψ(Γ)
+                  in every one of the three quantities below.
     """
     wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)            # (nb, ns, nx,ny,nz)
-    Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
+    tab = padded_gvectors(wfn, k="full_bz") if gvectors is None else gvectors
+    Gk_crys, g_mask = tab.at(ik)
     kpoint = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)  # crystal coords
 
     v_kin = np.asarray(compute_p_operator_k(
         wfn_k, Gk_crys, kpoint,
-        getattr(wfn, "bdot", None), wfn.bvec, wfn.blat))         # (3, nb, nb)
+        getattr(wfn, "bdot", None), wfn.bvec, wfn.blat,
+        g_mask=g_mask))                                           # (3, nb, nb)
     if vnl_setup is None:                                         # --skip-vnl diagnostic
         v_nl = np.zeros_like(v_kin)
     else:
         v_nl = np.asarray(compute_vnl_velocity_cart(
-            wfn_k, Gk_crys, kpoint, vnl_setup))                   # (3, nb, nb)
+            wfn_k, Gk_crys, kpoint, vnl_setup, g_mask=g_mask))    # (3, nb, nb)
 
     k_red = int(sym.irr_idx_k[ik])
     eps = np.asarray(wfn.energies[0, k_red, :nb], dtype=np.float64)
 
-    psi_G = np.asarray(gather_psi_G_from_crys(wfn_k, Gk_crys))    # (nb, ns, nG)
+    psi_G = np.asarray(gather_psi_G_from_crys(wfn_k, Gk_crys, g_mask))  # (nb, ns, nG)
     sz = (np.abs(psi_G[:, 0]) ** 2 - np.abs(psi_G[:, 1]) ** 2).sum(axis=1).real
     del wfn_k, psi_G
     return v_kin, v_nl, eps, sz
@@ -199,8 +206,10 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
           f"Pmat@[1,0,0]={np.round(Pmat @ np.array([1.0,0,0]),4).tolist()}")
 
     psi_ibz = wfn.load(bands=(0, nbnd), k="ibz", sharding=None)  # (nrk,nb,ns,ngkmax)
-    gvecs_ibz = np.asarray(wfn.gvecs(k="ibz"))            # (nrk,ngkmax,3) raw sphere
-    ngk_v = np.asarray(wfn.ngk_valid(k="ibz"))           # (nrk,) valid G count
+    # ψ is ALREADY at ngkmax here, so slicing the G table back to each k's
+    # ngk (which this loop used to do) only served to make the operand
+    # shapes ragged again.  Keep the loader's width and carry its mask.
+    gtab = padded_gvectors(wfn, k="ibz")
 
     cA = np.zeros(3, dtype=np.complex128); cB = np.zeros(3, dtype=np.complex128)
     PA_band = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
@@ -208,9 +217,11 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
     S_sum = 0.0
     E = np.zeros((nrk, nbnd), dtype=np.float64)
     for i in range(nrk):
-        ng = int(ngk_v[i])
-        G_int = jnp.asarray(gvecs_ibz[i, :ng], dtype=jnp.int32)
-        psi_G = jnp.asarray(np.asarray(psi_ibz[i])[:, :, :ng])   # (nb,ns,ng)
+        G_pad, g_mask = gtab.at(i)
+        G_int = jnp.asarray(G_pad, dtype=jnp.int32)              # (ngkmax,3)
+        # Mask ψ, not Z: every contraction below closes against conj(ψ_G).
+        psi_G = (jnp.asarray(np.asarray(psi_ibz[i]))
+                 * jnp.asarray(g_mask)[None, None, :])           # (nb,ns,ngkmax)
         k_crys = jnp.asarray(np.asarray(wfn.kpoints[i]), dtype=jnp.float64)
         eps = np.asarray(wfn.energies[0, i, :nbnd], dtype=np.float64)
         E[i] = eps
@@ -218,7 +229,7 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
         if sign != 0:
             kdata = vnl_ops.build_vnl_kdata_from_kvec(
                 np.asarray(wfn.kpoints[i], dtype=float),
-                np.asarray(gvecs_ibz[i, :ng], dtype=int), vnl_setup, compute_dZ=True)
+                np.asarray(G_pad, dtype=int), vnl_setup, compute_dZ=True)
             nsE = kdata.E_super.shape[0]
             psi_phys = psi_G[:, :nsE, :] if psi_G.shape[1] > nsE else psi_G
             v = v + sign * np.asarray(vnl_ops.vnl_velocity_matrix(
@@ -558,8 +569,10 @@ def main(argv=None):
         SZ = np.zeros((nk, nbnd), dtype=np.float64)
         Kc = np.zeros((nk, 3), dtype=np.float64)
         print(f"[orbmag] assembling velocity matrices over {nk} full-BZ k-points...")
+        gtab = padded_gvectors(wfn, k="full_bz")     # one fixed-shape table
         for ik in range(nk):
-            vk, vnlk, eps, sz = velocity_at_k(wfn, sym, meta, vnl_setup, ik, nbnd)
+            vk, vnlk, eps, sz = velocity_at_k(wfn, sym, meta, vnl_setup, ik, nbnd,
+                                              gvectors=gtab)
             Vp[ik], Vnl[ik], E[ik], SZ[ik] = vk, vnlk, eps, sz
             Kc[ik] = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
             if (ik + 1) % 6 == 0 or ik == nk - 1:

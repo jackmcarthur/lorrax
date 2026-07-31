@@ -63,6 +63,7 @@ from .bse_ring_comm import (
     build_bse_ring_matvec_full,
     build_realspace_random_transition_generator,
     build_density_snapshot_operator,
+    create_mesh_xy,
     make_bse_shardings,
 )
 from .bse_serial import compute_pair_amplitude
@@ -79,10 +80,15 @@ _BLOCK_GMRES_CACHE: dict[tuple, tuple] = {}
 
 
 def _create_mesh_xy(px: int, py: int) -> Mesh:
-    devices = jax.devices()
-    if px * py > len(devices):
-        raise ValueError(f"Requested px*py={px*py} devices, only {len(devices)} available")
-    return Mesh(np.array(devices[: px * py]).reshape(px, py), axis_names=("x", "y"))
+    """Alias of the ONE BSE mesh factory (``bse_ring_comm.create_mesh_xy``).
+
+    This used to be a local copy that built the Mesh and returned it WITHOUT
+    warming the MPI cliques, so every driver reaching it — ``bse_w_exact``,
+    ``exciton_bands`` (which imports this name) — died at P>1 under
+    ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi``.  Kept as a name so the
+    existing importers do not move; the body is delegation only.
+    """
+    return create_mesh_xy(px, py)
 
 
 def _build_rpa_resolvent(mesh_xy: Mesh, data: dict):

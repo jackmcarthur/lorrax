@@ -102,6 +102,14 @@ def relF(a, b):
     return float(np.linalg.norm(a - b) / np.linalg.norm(b))
 
 
+# Sharding that is legal for THIS deck's extents.  n_mu is a k-means output
+# and nq is the BZ q-count; neither is rounded to the mesh here (bse_io rounds
+# its own copy), so both refuse to shard on most decks.  See
+# common/sharding_fit.py for the measured evidence and the durable fix.
+from common.sharding_fit import fit_sharding as _ns              # noqa: E402
+from common.sharding_fit import legal_spec as _legal_spec        # noqa: E402
+
+
 # ===========================================================================
 # coarse-data loading (reference load_fixture, with paths as arguments)
 # ===========================================================================
@@ -170,6 +178,57 @@ def load_zeta_coarse(restart_file: str, zeta_file: str) -> dict:
             f"but the k-grid has nk={zx['nk']} (IBZ cascade active).  "
             f"Regenerate the fit with full-BZ zeta, or wait for the IBZ-zeta "
             f"unfold (deferred; must route through the one SymMaps sym-action).")
+    # ── q LABELS FOR A FULL-BZ ζ WRITTEN FROM A SYMMETRY-REDUCED WFN ──────
+    # ``mf_header`` is copied verbatim from the WFN, so ``kpoints/rk`` holds
+    # the WFN's k-list — the IBZ when the mean-field run used symmetry.  The ζ
+    # writer, under ``LORRAX_FORCE_FULL_BZ=1``, writes the FULL BZ:
+    # ``_bgw_wrap_q(sym.kvecs_asints) / kgrid`` (gw/isdf_fitting.py, the
+    # ``q_irr_frac is None`` branch).  On the MoS2 4x4 deck that is 16 ζ tiles
+    # against a 10-row ``rk``, and ``qraw[:nq]`` silently returned 10 rows —
+    # surfacing three lines later as the misleading "duplicate k labels in rk
+    # list" (job 7882499 cell exb64s).  Reconstruct the writer's own list.
+    #
+    # THIS IS NOT TAKEN ON TRUST.  ``run_gates`` rebuilds V from ζ at EVERY q
+    # and compares it against the stored ``V_qmunu[q]`` at 5e-6
+    # (``makeVq_vs_disk_Vqmunu_allq_max``).  A permuted or mis-wrapped q list
+    # cannot pass that: each q's ζ would be checked against a different q's
+    # stored tile.  Do not run this path with ``LORRAX_SKIP_VQ_GATES=1`` until
+    # it has passed once on a given deck.
+    if qraw.shape[0] < zx["nq"]:
+        _kg = np.asarray(zx["kgrid"], dtype=np.float64)
+        _idx = np.stack(np.meshgrid(np.arange(_kg[0]), np.arange(_kg[1]),
+                                    np.arange(_kg[2]), indexing="ij"),
+                        axis=-1).reshape(-1, 3).astype(np.float64)
+        _wrapped = np.where(_idx > _kg[None, :] / 2.0, _idx - _kg[None, :], _idx)
+        qfull = _wrapped / _kg[None, :]
+        # Necessary condition: every k the mean-field header DOES carry must
+        # appear in the reconstruction (catches a transposed grid or the wrong
+        # wrap convention, both of which would otherwise reach run_gates as a
+        # confusing numerical failure).
+        _have = {tuple(np.rint(v * _kg).astype(int) % _kg.astype(int))
+                 for v in qfull}
+        _missing = [tuple(np.rint(v * _kg).astype(int) % _kg.astype(int))
+                    for v in qraw if tuple(np.rint(v * _kg).astype(int)
+                                           % _kg.astype(int)) not in _have]
+        if _missing:
+            raise ValueError(
+                f"reconstructed full-BZ q list does not contain "
+                f"{len(_missing)} of the {qraw.shape[0]} mf_header k-points "
+                f"(e.g. {_missing[0]}); the on-disk q ordering is not the "
+                f"C-order wrapped {tuple(int(v) for v in zx['kgrid'])} grid "
+                f"this reconstruction assumes.")
+        try:
+            _first = jax.process_index() == 0
+        except Exception:
+            _first = True
+        if _first:
+            print(f"  [vq_interp] zeta_q.h5 holds {zx['nq']} full-BZ q but "
+                  f"mf_header/kpoints/rk has only {qraw.shape[0]} (the WFN is "
+                  f"symmetry-reduced).  q labels reconstructed as the BGW-"
+                  f"wrapped C-order {tuple(int(v) for v in zx['kgrid'])} grid; "
+                  f"run_gates' per-q makeVq-vs-disk check verifies it.",
+                  flush=True)
+        qraw = qfull
     zx["qfr_raw"] = qraw[: zx["nq"]]
     zx["qfr"] = zx["qfr_raw"] - np.round(zx["qfr_raw"])  # BGW-wrapped, pre half-fix
     kg = zx["kgrid"]
@@ -363,20 +422,28 @@ def build_cq(zx, mesh_xy: Mesh, q_chunk=48):
     nR = len(Rw)
     EqR_np = np.exp(2j * np.pi * (zx["qfr"] @ Rw.T))
     rep = NamedSharding(mesh_xy, P())
-    face5 = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
-    face3 = NamedSharding(mesh_xy, P(None, "x", "y"))
+    # (μ, ν) face.  n_mu is the raw k-means centroid count, so the face is
+    # legal only when it divides the mesh axis; _ns degrades (loudly) when it
+    # does not.  Pk carries the k-chunk on the leading axis, P_R the R index —
+    # different leading extents, same face, so both are fitted separately.
+    face5 = _ns(mesh_xy, P(None, None, "x", "y", None),
+                (nR, ns, n_mu, n_mu, ns), "build_cq.P_R")
+    face5_k = _ns(mesh_xy, P(None, None, "x", "y", None),
+                  (q_chunk, ns, n_mu, n_mu, ns), "build_cq.Pk")
+    face3_R = _ns(mesh_xy, P(None, "x", "y"), (nR, n_mu, n_mu), "build_cq.C_R")
+    face3 = _ns(mesh_xy, P(None, "x", "y"), (nq, n_mu, n_mu), "build_cq.C_q")
 
     @partial(jax.jit, donate_argnums=(0,), out_shardings=face5)
     def _pr_acc(P_R, psi_c, EqR_c):
         psiX = jnp.conj(psi_c).transpose(0, 3, 1, 2)
         Pk = jax.lax.with_sharding_constraint(
-            jnp.einsum("kmna,knbr->karmb", psiX, psi_c), face5)
+            jnp.einsum("kmna,knbr->karmb", psiX, psi_c), face5_k)
         return P_R + jnp.einsum("kR,kavmb->Ravmb", EqR_c, Pk)
 
     @partial(jax.jit, out_shardings=face3)
     def _cq_final(P_R, EqR):
         C_R = jax.lax.with_sharding_constraint(
-            jnp.einsum("ravmb,ravmb->rvm", jnp.conj(P_R), P_R), face3)
+            jnp.einsum("ravmb,ravmb->rvm", jnp.conj(P_R), P_R), face3_R)
         return jnp.einsum("qr,rvm->qmv", jnp.conj(EqR) / nq, C_R)
 
     # Allocate the accumulator ALREADY SHARDED.  ``device_put(jnp.zeros(...))``
@@ -553,11 +620,13 @@ def _to_host(x):
     replicated array) must instead use ``device_get`` — ``process_allgather(
     tiled=True)`` would DUPLICATE its leading axis by the process count.  Branch
     on ``is_fully_addressable`` (a global property, so the collective stays in
-    lockstep); this keeps the 1-GPU path a plain device_get."""
-    if getattr(x, "is_fully_addressable", True):
-        return np.asarray(jax.device_get(x))
-    from jax.experimental import multihost_utils
-    return np.asarray(multihost_utils.process_allgather(x, tiled=True))
+    lockstep); this keeps the 1-GPU path a plain device_get.
+
+    That branch now lives ONCE, in :func:`common.collectives.gather_to_host`;
+    this is delegation, and the reasoning above is kept here because the
+    ζ-clean chunk loop is where it is load-bearing."""
+    from common.collectives import gather_to_host
+    return gather_to_host(x)
 
 
 def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
@@ -621,8 +690,20 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     assert np.max(np.abs(zx["qfr"][:, 2])) < 1e-12, "slab pipeline needs q_z=0"
     GS = lr_gset(zx, alpha)
     nG = GS.shape[1]
-    qb2 = NamedSharding(mesh_xy, P(("x", "y"), None))
-    qb3 = NamedSharding(mesh_xy, P(("x", "y"), None, None))
+    # q-batched layout: every device owns whole matrices for its own q.  That
+    # needs nq_chunk % ndev == 0, which a deck with fewer BZ q-points than
+    # devices can never satisfy (4x4x1 => nq=16, at P=64 there is nothing to
+    # split).  _ns degrades to replicated, loudly, in exactly that regime; when
+    # the chunk does divide, the spec is returned unchanged and no HLO moves.
+    # The RAGGED TAIL is fitted separately: nq % q_chunk can leave a short last
+    # chunk that is illegal even when the full ones are legal.
+    def _qb(nb_lead):
+        return (_ns(mesh_xy, P(("x", "y"), None), (nb_lead, n_mu),
+                    "prepare_coarse.qb2"),
+                _ns(mesh_xy, P(("x", "y"), None, None), (nb_lead, n_mu, ngkmax),
+                    "prepare_coarse.qb3"))
+
+    qb2, qb3 = _qb(q_chunk)
 
     # ── host geometry/kernel prep (cheap per-q numpy vector math) ────────
     # v rows zero-padded to ngkmax (``v_sphere_padded``): pad channels
@@ -643,14 +724,29 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     rmu = jnp.asarray(zx["rmu_frac"])                    # (n_μ, 3) trace const
     GS_f = jnp.asarray(GS.T.astype(np.float64))          # (nG, 3) trace const
 
-    @partial(jax.jit, out_shardings=(qb2, qb3))
-    def _eigh_batch(C):
-        C = jax.lax.with_sharding_constraint(C, qb3)
-        lam, R = jnp.linalg.eigh(C)
-        return lam, R
+    # The two batch kernels are built PER DISTINCT CHUNK LENGTH (at most two:
+    # the full q_chunk and the ragged tail), because their shardings depend on
+    # whether that length divides the device count.  Cached, so the compile
+    # count is unchanged when nq % q_chunk == 0 — the common case.
+    _KERNELS: dict = {}
 
-    @partial(jax.jit, out_shardings=(qb3, qb3, qb3))
-    def _clean_split(lam, R, ZGq, v_ref, v_lr, idx, qfr_b):
+    def _kernels(nb_lead):
+        if nb_lead in _KERNELS:
+            return _KERNELS[nb_lead]
+        qb2_b, qb3_b = _qb(nb_lead)
+        _KERNELS[nb_lead] = (_make_eigh_batch(qb2_b, qb3_b),
+                             _make_clean_split(qb3_b))
+        return _KERNELS[nb_lead]
+
+    def _make_eigh_batch(qb2, qb3):
+        @partial(jax.jit, out_shardings=(qb2, qb3))
+        def _eigh_batch(C):
+            C = jax.lax.with_sharding_constraint(C, qb3)
+            lam, R = jnp.linalg.eigh(C)
+            return lam, R
+        return _eigh_batch
+
+    def _clean_split_body(lam, R, ZGq, v_ref, v_lr, idx, qfr_b):
         # S_q = R g_ε(Λ) R^H  (analytic Tikhonov filter of C_q; §12.3)
         g = lam ** 2 / (lam ** 2
                         + (eps_tik * lam.max(axis=1, keepdims=True)) ** 2)
@@ -670,6 +766,9 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
         qG = qfr_b[:, None, :] + GS_f[None, :, :]        # (b, nG, 3)
         ph = jnp.exp(2j * jnp.pi * jnp.einsum("mi,bgi->bmg", rmu, qG))
         return S, V_SRc, ph * ztg
+
+    def _make_clean_split(qb3):
+        return jax.jit(_clean_split_body, out_shardings=(qb3, qb3, qb3))
 
     S_np = (np.empty((nq, n_mu, n_mu), dtype=np.complex128)
             if keep_host_mirrors else None)
@@ -691,6 +790,9 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
 
     for q0 in range(0, nq, q_chunk):
         sl = slice(q0, min(q0 + q_chunk, nq))
+        nb_lead = sl.stop - sl.start
+        (_eigh_batch, _clean_split) = _kernels(nb_lead)
+        qb2, qb3 = _qb(nb_lead)
         if eigh_plan.is_native:
             lam, R = _eigh_batch(C_herm(sl))
         else:
@@ -726,7 +828,8 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     print(f"  [prep] gset({alpha}) = {nG} G; {n_out} out-of-sphere (q,G) "
           f"channels zero-filled; sphere-tail bound {tail:.1e}"
           f"{'' if keep_host_mirrors else '; host mirrors dropped'}")
-    stencil_sh = NamedSharding(mesh_xy, P(None, "x", "y"))
+    stencil_sh = _ns(mesh_xy, P(None, "x", "y"), (nq, n_mu, n_mu),
+                     "prepare_coarse.V_SRc")
     # Host-mirror branch: process-local placement (AA.1; the mirror was
     # assembled identically on every rank from _to_host'd chunks).
     V_SRc_dev = (device_put_process_local(V_SRc_np, stencil_sh)
@@ -1012,9 +1115,15 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None,
     specs = [(g, tuple(des["specs"][g]),
               jnp.asarray(prep["gz_cols"][g], dtype=jnp.int32))
              for g in des["specs"]]
-    grid_xy = NamedSharding(mesh_xy, P("x", "y"))
-    row_x = NamedSharding(mesh_xy, P("x", None))
-    row_y = NamedSharding(mesh_xy, P("y", None))
+    # Two different (μ, ν) extents live in this body: the LOGICAL n_mu on the
+    # intermediates and the loader's PADDED n_out on the returned tile.  n_out
+    # is padded_mu_extent(n_mu, px*py) so it always divides; n_mu is the raw
+    # k-means count and usually does not.  Fit them separately — using one
+    # sharding for both is what made the intermediates illegal.
+    grid_mu = _ns(mesh_xy, P("x", "y"), (n_mu, n_mu), "eval_vq.V_SR(n_mu)")
+    grid_out = _ns(mesh_xy, P("x", "y"), (n_out, n_out), "eval_vq.out(n_out)")
+    row_x = _ns(mesh_xy, P("x", None), (n_mu, nG), "eval_vq.A_x")
+    row_y = _ns(mesh_xy, P("y", None), (n_mu, nG), "eval_vq.A_y")
 
     def _phi(Kpar, spec):
         s = 1.0 / (2.0 * alpha)
@@ -1027,7 +1136,7 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None,
         f0 = jnp.exp(-2j * jnp.pi * (Qfrac @ R7.T))          # (nR,)
         w = f0 @ pinvF                                        # (n_train,)
         V_SR = jnp.tensordot(w, V_SRc_stack, axes=(0, 0))     # (n_μ, n_μ) xy
-        V_SR = jax.lax.with_sharding_constraint(V_SR, grid_xy)
+        V_SR = jax.lax.with_sharding_constraint(V_SR, grid_mu)
         # ── LR model rebuild at K = Q+G (closed form, never interpolated) ──
         K = bvec.T @ (Qfrac[:, None] + GS)                    # (3, nG)
         M = jnp.zeros((n_mu, GS.shape[1]), dtype=jnp.complex128)
@@ -1052,17 +1161,18 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None,
         A_x = jax.lax.with_sharding_constraint(A, row_x)
         A_y = jax.lax.with_sharding_constraint(A, row_y)
         V = V_SR + jnp.conj(A_x) @ A_y.T
+        V = jax.lax.with_sharding_constraint(V, grid_mu)
         if n_out > n_mu:
             V = jnp.pad(V, ((0, n_out - n_mu), (0, n_out - n_mu)))
-        return jax.lax.with_sharding_constraint(V, grid_xy)
+        return jax.lax.with_sharding_constraint(V, grid_out)
 
     if head_minibz_average:
-        @partial(jax.jit, out_shardings=grid_xy)
+        @partial(jax.jit, out_shardings=grid_out)
         def eval_vq(Qfrac, V_SRc_stack, pinvF, coeffs_tuple, head_val, gstar):
             return _body(Qfrac, V_SRc_stack, pinvF, coeffs_tuple,
                          head_val, gstar)
     else:
-        @partial(jax.jit, out_shardings=grid_xy)
+        @partial(jax.jit, out_shardings=grid_out)
         def eval_vq(Qfrac, V_SRc_stack, pinvF, coeffs_tuple):
             return _body(Qfrac, V_SRc_stack, pinvF, coeffs_tuple,
                          jnp.asarray(0.0, dtype=jnp.float64),

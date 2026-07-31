@@ -30,17 +30,28 @@ the q→0 Coulomb head is a scalar channel threaded through every stage,
 not a stage; W is evaluated at exactly the two frequencies {0, iω_p} a
 one-pole model is determined by.  See ``docs/theory/physics.md``.
 """
-from runtime import bootstrap
-bootstrap()  # env + jax.distributed + CPU fallback — BEFORE `import jax`.
+from runtime import initialize_communicator_stack
+
+#: THE startup call.  One line brings up everything below the physics: the
+#: JAX env defaults, the fail-fast excepthook, the CPU-collectives
+#: announcement, the CPU-only GPU-plugin skip, ``jax.distributed``, the
+#: GPU-or-CPU resolution, the device mesh with every MPI/NCCL communicator it
+#: needs already created, the persistent compile cache, and the rank-0 block
+#: stating everything it resolved.  It MUST stay above this module's own
+#: ``import jax``: the env defaults only bind before jax reads them.
+#:
+#: Idempotent, so the ``python -m gw.gw_jax`` -> ``gw_init`` -> ``gw.gw_jax``
+#: re-import path gets the same stack rather than a second mesh.
+RUNTIME = initialize_communicator_stack()
 
 import argparse
 import gc
 import os
+import time
 
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
 jax.config.update("jax_enable_x64", True)
 
 from file_io import (
@@ -79,40 +90,24 @@ from .gw_output import (
 )
 
 
-def _build_mesh():
-	"""Construct 2D device mesh with most-square factorization."""
-	total = jax.process_count() * jax.local_device_count()
-	gx = int(np.sqrt(total))
-	while gx > 1 and total % gx != 0:
-		gx -= 1
-	return Mesh(np.array(jax.devices()).reshape(gx, total // gx), ['x', 'y'])
-
-
 def _setup_runtime(config, mesh_xy, *, print_fn=print) -> None:
-	"""Pre-init NCCL + phdf5 MPI + JAX persistent compile cache.
+	"""Pre-init phdf5's MPI, the one startup step that needs the config.
 
-	All three are best-effort startup optimizations whose absence is not
-	fatal:
+	**phdf5 ``MPI_Init_thread``**: when the slab-IO backend is the phdf5
+	FFI, eagerly enter ``MPI_THREAD_MULTIPLE`` so the first collective
+	``H5Fcreate`` (in ``zeta_fit_chunked``) doesn't pay the ~400 ms
+	MPI_Init cost on the critical path; failures are logged and swallowed.
 
-	- **NCCL warmup**: pre-allocates communicators for full-mesh and
-	  per-axis psums so the first real collective (sigma's all-reduce-
-	  start) doesn't eat a timed section.  No-op in single-process.
-	- **phdf5 ``MPI_Init_thread``**: when the slab-IO backend is the
-	  phdf5 FFI, eagerly enter ``MPI_THREAD_MULTIPLE`` so the first
-	  collective ``H5Fcreate`` (in ``zeta_fit_chunked``) doesn't pay
-	  the ~400 ms MPI_Init cost on the critical path; failures are
-	  logged and swallowed.
-	- **JAX persistent compile cache**: enable the XDG-style on-disk
-	  cache so a warm run skips XLA compilation entirely — safe at
-	  every process count since scorecard AH (measured at P=8 on the
-	  fixture: 373 compiles/rank cold, 5 warm).  Opt out via
-	  ``ISDF_JAX_CACHE_DIR=""``.
+	This is what is LEFT of the old driver-local runtime setup.  Everything
+	else it used to do — the JAX persistent compile cache in particular —
+	moved into ``runtime.initialize_communicator_stack`` at the top of this
+	module, because none of it depended on the parsed config and every
+	driver needed the same thing in the same order.  This step stays here
+	because it is the only one that does: it branches on
+	``config.backend.slab_io``, which does not exist until the input file
+	has been read.
 	"""
-	from runtime import nccl_warmup
 	from .gw_config import SlabIOBackend
-
-	with timing.section("nccl_warmup"):
-		nccl_warmup(mesh_xy)
 
 	if config.backend.slab_io is SlabIOBackend.PHDF5_FFI:
 		try:
@@ -139,12 +134,6 @@ def _setup_runtime(config, mesh_xy, *, print_fn=print) -> None:
 				"library.  On SLURM launch with `srun --mpi=pmi2`; some "
 				"MPI builds also need I_MPI_PMI_LIBRARY (or the site "
 				"equivalent) pointing at the system libpmi2.")
-
-	try:
-		from common.jax_compile_cache import ensure_jax_compile_cache
-		ensure_jax_compile_cache()
-	except Exception as exc:
-		print_fn(f"  [jax compile cache] skipped: {exc}")
 
 
 def _compute_static_head(head_resolver, meta, do_screened, print0):
@@ -174,6 +163,30 @@ def main(argv=None):
 	)
 	args = argp.parse_args(argv)
 
+	# ---- Stage timing: ONE table, and it sums to the wall -------------------
+	# ``timing.reset()`` used to sit just above the ISDF call, which threw
+	# away everything the prologue had already recorded.  Resetting HERE,
+	# before any stage runs, is what lets the prologue appear at all.
+	# ``_t_main`` is the wall this table is closed against
+	# (``report(wall=...)``), so the printed rows plus ``(untimed)`` always
+	# add up to the run — a reader can tell a complete accounting from a
+	# partial one without doing arithmetic.
+	#
+	# The startup stack now runs ABOVE this reset (it runs above ``main()``),
+	# so its own ``collective_warmup`` section is wiped here.  That is fine
+	# and deliberate: ``initialize_communicator_stack`` measured every phase
+	# itself and handed the numbers back in ``RUNTIME.facts['elapsed']``, and
+	# the epilogue re-records them as a DECOMPOSITION of the pre-main span
+	# rather than as extra rows.
+	_t_main = time.perf_counter()
+	# Work done BEFORE main(): the module body's
+	# ``initialize_communicator_stack()`` (env, jax.distributed, backend
+	# init, mesh + clique warm-up) and every import under it.  Measured 75.0 s
+	# to first output on a cold node vs 2.1 s warm — the largest single row in
+	# a small run, and previously in no row at all.
+	_pre_main = timing.process_elapsed_s()
+	timing.reset()
+
 	# Rank-gated print used as ``print_fn=`` throughout the driver.  We do
 	# NOT clobber ``builtins.print`` — that historically affected every
 	# imported library, including ones that legitimately want to write
@@ -193,8 +206,27 @@ def main(argv=None):
 	mode = config.compute_mode       # the self-energy ansatz
 	do_screened = mode is not ComputeMode.X_ONLY
 
-	# ---- Runtime initialization: device mesh, NCCL/MPI/compile-cache ----
-	mesh_xy = _build_mesh()
+	# ---- The runtime is already up ----------------------------------------
+	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
+	# of this module, above ``import jax``, because the JAX env defaults only
+	# bind before jax reads them.  ``RUNTIME.mesh`` is THE run's most-square
+	# ('x','y') mesh with every communicator it will need ALREADY created —
+	# the warm-up is not optional and not the physics' job:
+	#   * a mesh this process owns no device on is refused there, naming the
+	#     caller, instead of surfacing a bare StopIteration deeper down;
+	#   * ``warm_mesh_cliques`` (CPU/MPI) ran as well as ``nccl_warmup``
+	#     (GPU/NCCL).  This driver used to call only the latter, so under
+	#     ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` its MPI cliques were
+	#     created incidentally, by whichever physics kernel happened to fire
+	#     the first collective (``common/zeta_projection.py``,
+	#     ``common/contract_bands.py`` each warm their own mesh).  That works
+	#     only while those early programs stay small enough for XLA's
+	#     SEQUENTIAL thunk executor; the parallel executor lands on the
+	#     ``MPI_Is_thread_main`` refusal that killed the BSE TDA Lanczos
+	#     (32 refusals at P=16, gate 7881216).
+	# Do NOT call prepare_mesh() again here: a second Mesh object is a second
+	# set of communicators and a second copy of every shape-keyed jit cache.
+	mesh_xy = RUNTIME.mesh
 	_setup_runtime(config, mesh_xy, print_fn=print0)
 	print_banner(
 		backend=jax.default_backend(),
@@ -274,21 +306,34 @@ def main(argv=None):
 	bgw_v_grid_fn = build_bgw_v_grid_fn(
 		config, wfn=wfn, sym=sym, input_dir=input_dir, print_fn=print0)
 
+	# Everything from ``main()`` entry to here is the driver PROLOGUE:
+	# config parse, the config-dependent phdf5 MPI pre-init, WFN + symmetry +
+	# centroid reads, the head resolver.  (The mesh, its collective warm-up
+	# and the compile cache are NOT here any more — they happen above
+	# ``main()`` in ``initialize_communicator_stack`` and are reported as
+	# their own rows.)  It is
+	# executed exactly once and, on a cold node, it is the largest single row
+	# in this table (75.0 s to first output, job 7881949) — so it is named.
+	# ``timing.record`` rather than a ``with`` block deliberately: the block
+	# above is another workstream's and must not be re-indented for a timer.
+	timing.record("gw_jax.startup", time.perf_counter() - _t_main)
+
 	# ISDF fitting or restart loading
-	timing.reset()
-	isdf = prepare_isdf_and_wavefunctions(
-		cfg=config,
-		wfn=wfn,
-		sym=sym,
-		meta=meta,
-		centroid_indices=centroid_indices,
-		band_slices=band_slices,
-		mesh_xy=mesh_xy,
-		tmp_dir=tmp_dir,
-		tensors_filename=tensors_filename,
-		print0=print0,
-		bgw_v_grid_fn=bgw_v_grid_fn,
-	)
+	with timing.section("gw_jax.isdf", announce=True,
+	                    label="ISDF basis + wavefunctions"):
+		isdf = prepare_isdf_and_wavefunctions(
+			cfg=config,
+			wfn=wfn,
+			sym=sym,
+			meta=meta,
+			centroid_indices=centroid_indices,
+			band_slices=band_slices,
+			mesh_xy=mesh_xy,
+			tmp_dir=tmp_dir,
+			tensors_filename=tensors_filename,
+			print0=print0,
+			bgw_v_grid_fn=bgw_v_grid_fn,
+		)
 	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle
 	# Bispinor: σ^B reads V^{i,j} tiles from v_q_bispinor.h5 and
@@ -324,17 +369,25 @@ def main(argv=None):
 	if do_screened:
 		# The minimax τ-axis, solved on G's actual spectral range — shared
 		# by every χ₀ build this run (static + probe W here, SC re-solves).
-		quad, e_ref = build_static_quadrature(
-			wfns, config.minimax_config, print_fn=print0)
+		# TIMED because it is the classic mis-attribution on this path: the
+		# crossing-minimax solve costs ~95 s cold with no cache and no
+		# shipped table (XPROF_TRACE_GUIDE §"Known LORRAX cost centers"),
+		# and with no row of its own that 95 s reads as "GW startup".
+		with timing.section("gw_jax.minimax_quadrature", announce=True,
+		                    label="minimax tau-axis"):
+			quad, e_ref = build_static_quadrature(
+				wfns, config.minimax_config, print_fn=print0)
 	# SC solves its own W's inside the iteration map; the static W is
 	# still solved once here to seed the W0 restart flush.
 	requests = screening_requests_for(mode, config)
 	if qp_solver is QPSolver.SELF_CONSISTENT:
 		requests = [r for r in requests if r.role == "static"]
-	W_by_role = compute_screening(
-		wfns, V_q, requests, quad=quad, e_ref=e_ref,
-		sym=sym, centroid_indices=centroid_indices,
-		config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
+	with timing.section("gw_jax.screening", announce=True,
+	                    label="screening (chi0 -> W)"):
+		W_by_role = compute_screening(
+			wfns, V_q, requests, quad=quad, e_ref=e_ref,
+			sym=sym, centroid_indices=centroid_indices,
+			config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
 
 	# Persist W0_qmunu + q=0 head scalars to the ISDF restart file for
 	# downstream consumers (BSE, future Σ-builders); no-op unless screened
@@ -362,8 +415,9 @@ def main(argv=None):
 	# correlation), so only the X-head survives — which is the piece needed.
 	static_head_terms = None
 	if config.do_G0:
-		static_head_terms = _compute_static_head(
-			head_resolver, meta, do_screened, print0)
+		with timing.section("gw_jax.static_head"):
+			static_head_terms = _compute_static_head(
+				head_resolver, meta, do_screened, print0)
 
 	# ---- Σ_xc + V_H: ONE dispatch for every mode ----
 	# The same ``compute_sigma_xc`` call the SC iteration map makes each
@@ -456,6 +510,10 @@ def main(argv=None):
 	# kin_ion_has_hartree) which flows into the GWResults output
 	# provenance (release audit 2026-07-28: the previous ``kin_ion_attrs``
 	# binding was dead).
+	# TIMED as one row: the gate, the source resolution and the slab read are
+	# a single logical stage ("get H₀ off disk") and the read is a distributed
+	# H5 slab load whose cost is a file-system property, not a physics one.
+	_t_kin = time.perf_counter()
 	validate_kin_ion_against_run(
 		config.paths.kin_ion_file,
 		sys_dim=config.sys_dim,
@@ -477,6 +535,7 @@ def main(argv=None):
 		config.paths.kin_ion_file, band_slices.b0, band_slices.b3,
 		mesh=mesh_xy, backend=config.backend.slab_io,
 	)
+	timing.record("gw_jax.kin_ion_load", time.perf_counter() - _t_kin)
 
 	# ---- update_H[Σ; qp_solver] — all branches yield ``sigma_total``
 	# (Σ_xc + V_H, Ry, DFT basis, replicated) whose eigh gives E_qp/U_qp.
@@ -487,15 +546,19 @@ def main(argv=None):
 		# basis and its sigma_omega_h5_path points at the converged
 		# single-write sigma_mnk.h5.  See ``sc_iteration.run_sc_driver``.
 		from .sc_iteration import run_sc_driver
-		sigma_result, sigma_total, _ = run_sc_driver(
-			wfns, V_q, kin_ion,
-			quad=quad, e_ref=e_ref,
-			static_head_terms=static_head_terms,
-			head_resolver=head_resolver,
-			config=config, meta=meta, mesh_xy=mesh_xy,
-			sym=sym, wfn=wfn, centroid_indices=centroid_indices,
-			band_slices=band_slices, input_dir=input_dir,
-			enk_dft=enk_dft, print_fn=print0)
+		# Executed once; it is the whole SC loop, so it is the run's biggest
+		# row when it fires and must not hide inside ``(untimed)``.
+		with timing.section("gw_jax.sc_driver", announce=True,
+		                    label="self-consistent QSGW driver"):
+			sigma_result, sigma_total, _ = run_sc_driver(
+				wfns, V_q, kin_ion,
+				quad=quad, e_ref=e_ref,
+				static_head_terms=static_head_terms,
+				head_resolver=head_resolver,
+				config=config, meta=meta, mesh_xy=mesh_xy,
+				sym=sym, wfn=wfn, centroid_indices=centroid_indices,
+				band_slices=band_slices, input_dir=input_dir,
+				enk_dft=enk_dft, print_fn=print0)
 	else:
 		# One-shot: ``one_shot_dft`` = Σ_xc was already QSGW-built at
 		# E_DFT inside compute_sigma_xc (pass-through; also covers static
@@ -503,9 +566,10 @@ def main(argv=None):
 		# on-shell solve + scissor + QSGW rebuild at the solved energies.
 		# eqp0.dat/eqp1.dat are at-DFT in every case (written downstream
 		# from ``sigma_c_at_dft_ev`` / the ω-grid diag, not from here).
-		sigma_total = solve_qp(
-			qp_solver, sigma_result, kin_ion,
-			config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
+		with timing.section("gw_jax.solve_qp"):
+			sigma_total = solve_qp(
+				qp_solver, sigma_result, kin_ion,
+				config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
 
 	# ---- Post-Σ seam: bare locals from the (DFT-basis) SigmaResult ----
 	# One extraction for SC and one-shot alike; PPM-only fields are None
@@ -557,9 +621,16 @@ def main(argv=None):
 	sanity.check_finite("kin_ion (from kin_ion.h5)", kin_ion, print_fn=print0)
 	sanity.check_finite("Σ_total (Σ_xc + V_H)", sigma_total, print_fn=print0)
 
-	H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
-	E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
+	# TIMED: nk independent (nb_sigma, nb_sigma) Hermitian eigensolves.  It is
+	# one statement and normally seconds, but it is O(nk·nb³) and it is the
+	# only dense LAPACK call on the post-Σ path, so it is the row that tells
+	# you when the band window (not the physics) became the cost.
+	with timing.section("gw_jax.qp_eigh") as _sec_eigh:
+		H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
+		E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
+		_sec_eigh.watch(E_full, U_full)
 	sanity.check_finite("E_qp (eigh of H_QP)", E_full, print_fn=print0)
+	_t_out = time.perf_counter()
 
 	# ---- One-shot WFN_qp.h5 dump (drop-in BSE / restart input).  SC
 	# already wrote its own WFN_qp.h5 above via dump_qp_wfn_artifacts
@@ -641,8 +712,27 @@ def main(argv=None):
 			kirr_to_kfull=np.array(sym.kirr_fullids, dtype=np.int32),
 			print_fn=print0,
 		)
+	timing.record("gw_jax.output", time.perf_counter() - _t_out)
+	if _pre_main is not None:
+		# DECOMPOSE the pre-main span; do not add rows to it.  The entry
+		# point timed its own phases (it happened before ``timing.reset()``,
+		# so its own ``collective_warmup`` section was wiped), and the
+		# remainder of ``_pre_main`` is the import storm — 75.0 s cold vs
+		# 2.1 s warm, job 7881949.  Recording the phases AND the whole span
+		# would double-count and break the table's "rows + (untimed) ==
+		# wall" property, which is the only thing that lets a reader tell a
+		# complete accounting from a partial one.
+		_phases = RUNTIME.facts.get("elapsed", {})
+		for _phase, _secs in sorted(_phases.items()):
+			if _phase != "total":
+				timing.record(f"gw_jax.runtime_stack.{_phase}", _secs)
+		timing.record("gw_jax.imports",
+		              max(_pre_main - _phases.get("total", 0.0), 0.0))
 	if meta.rank == 0:
-		timing.report(print_fn=print0, title="--- Timing ---")
+		# ``wall=`` closes the table: printed rows + ``(untimed)`` == the
+		# whole PROCESS when /proc gave us the pre-main span, else main().
+		_wall = time.perf_counter() - _t_main + (_pre_main or 0.0)
+		timing.report(print_fn=print0, title="--- Timing ---", wall=_wall)
 
 	return 0
 

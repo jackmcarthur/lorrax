@@ -30,6 +30,7 @@ from .bse_ring_comm import (
     build_density_snapshot_operator,
     build_density_drive_operators,
     build_density_readout_operator_full,
+    create_mesh_xy,
     make_bse_shardings,
 )
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
@@ -204,12 +205,11 @@ def _feast_filter(
 
 
 def _create_mesh_xy(px: int, py: int) -> Mesh:
-    devices = jax.devices()
-    n_devices = len(devices)
-    if px * py > n_devices:
-        raise ValueError(f"Requested px*py={px*py} devices, but only {n_devices} available")
-    mesh_devices = np.array(devices[: px * py]).reshape(px, py)
-    return Mesh(mesh_devices, axis_names=("x", "y"))
+    """Alias of the ONE BSE mesh factory (``bse_ring_comm.create_mesh_xy``).
+
+    Was a local un-warmed copy.  See ``create_mesh_xy`` for why.
+    """
+    return create_mesh_xy(px, py)
 
 
 def run_pseudopoles(

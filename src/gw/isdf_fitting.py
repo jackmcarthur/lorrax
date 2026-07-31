@@ -17,6 +17,12 @@ from common.collectives import (
 )
 from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
 
+# Canonical boolean env grammar for this layer (same recognised token set
+# as isdf.core._env_bool / file_io._slab_io_mpi_host._env_flag, plus an
+# announcement for anything outside it).  See gw/gw_config.py's module
+# comment and tests/test_env_grammar.py for the drift gate.
+from .gw_config import active_zeta_truncating_knobs, env_bool
+
 from isdf.core import (
     c_q_from_psi_sm,
     host_rss_gb as _host_rss_gb,
@@ -55,7 +61,7 @@ def mem_probe(label, *, only_rank0=True):
     sample — the *canonical* OOM-relevance metric since
     ``device.memory_stats()`` returns ``None`` on this stack.
     """
-    if not os.environ.get("LORRAX_MEM_DEBUG"):
+    if not env_bool("LORRAX_MEM_DEBUG", False):
         return
     if only_rank0 and jax.process_index() != 0:
         return
@@ -892,7 +898,7 @@ def fit_zeta_to_h5(
     # should match: centroids (ψ_l/ψ_r in both Y and X transposes), L_q
     # (Cholesky factor at IBZ for charge / pass-through CCT for
     # transverse), and the freshly-zeroed gflat_acc.  Round-1 addition.
-    if os.environ.get("LORRAX_MEM_DEBUG"):
+    if env_bool("LORRAX_MEM_DEBUG", False):
         jax.block_until_ready(gflat_acc)
         jax.block_until_ready(L_q)
     mem_probe("pre_rchunk_loop")
@@ -903,8 +909,15 @@ def fit_zeta_to_h5(
     # half is ``runtime.tune_glibc_malloc``, applied before ``import jax``).
     # ``LORRAX_MALLOC_TRIM=0`` disables; ``malloc_trim`` is glibc-only, so
     # a missing symbol just disables the hook.
+    #
+    # The parse used to be a case-SENSITIVE ``not in ("0", "off", "false")``,
+    # which missed ``""``, ``"no"`` and every uppercase spelling — so
+    # ``LORRAX_MALLOC_TRIM=OFF`` left the hook ON while its documented
+    # sibling ``LORRAX_MALLOC_TUNE=OFF`` (runtime._env_falsy) correctly
+    # turned OFF.  The two knobs are advertised together in
+    # docs/dev/env_vars.md:116-117 and now answer identically.
     _trim_fn = None
-    if os.environ.get("LORRAX_MALLOC_TRIM", "1") not in ("0", "off", "false"):
+    if env_bool("LORRAX_MALLOC_TRIM", True):
         try:
             import ctypes
             _trim_fn = ctypes.CDLL("libc.so.6").malloc_trim
@@ -921,7 +934,7 @@ def fit_zeta_to_h5(
             # for this r-chunk.  host_cache mode: no-op.
             psi_G_store.begin_rchunk(r_start, r_end)
 
-            _dbg_rchunk = bool(os.environ.get("LORRAX_RCHUNK_DEBUG"))
+            _dbg_rchunk = env_bool("LORRAX_RCHUNK_DEBUG", False)
             _rss0 = _host_rss_gb() if _dbg_rchunk else 0.0
             _mem_probe(f"rchunk_start chunk={chunk_idx}")
             t0 = time.perf_counter()
@@ -984,7 +997,7 @@ def fit_zeta_to_h5(
                     mesh=mesh_xy,
                 )
                 del zeta_chunk
-                if os.environ.get("LORRAX_MEM_DEBUG"):
+                if env_bool("LORRAX_MEM_DEBUG", False):
                     jax.block_until_ready(gflat_acc)
             _t_write = time.perf_counter() - t0
             t_write_total += _t_write
@@ -1032,8 +1045,34 @@ def fit_zeta_to_h5(
             # for profiling/sweeping.  Clean python exit avoids the
             # SLURM step-zombie issue you get from killing the python
             # mid-run.  Off when unset.
+            #
+            # STRICT PARSE.  The old ``if _max_rchunks and ... >= int(...)``
+            # took any non-empty string as a request: ``=0`` — the natural
+            # spelling of "no limit" — is a truthy STRING whose int is 0, so
+            # ``(chunk_idx+1) >= 0`` fired on the very first chunk and
+            # truncated the fit to one r-chunk.  A non-numeric value raised a
+            # bare ``invalid literal for int()`` from inside the loop.  Both
+            # produce a PARTIAL ζ that the writer still marks complete, so
+            # they must refuse up front instead.
             _max_rchunks = os.environ.get("LORRAX_MAX_RCHUNKS")
-            if _max_rchunks and (chunk_idx + 1) >= int(_max_rchunks):
+            _max_rchunks = _max_rchunks.strip() if _max_rchunks else ""
+            if _max_rchunks:
+                try:
+                    _max_n = int(_max_rchunks)
+                except ValueError:
+                    raise ValueError(
+                        f"LORRAX_MAX_RCHUNKS={_max_rchunks!r} is not an "
+                        f"integer.  It truncates the ζ fit after N r-chunks "
+                        f"(profiling only); unset it to fit every chunk."
+                    ) from None
+                if _max_n < 1:
+                    raise ValueError(
+                        f"LORRAX_MAX_RCHUNKS={_max_rchunks!r} must be >= 1.  "
+                        f"To disable the truncation, UNSET the variable — "
+                        f"'0' used to be accepted and truncated the fit to a "
+                        f"single r-chunk, silently."
+                    )
+            if _max_rchunks and (chunk_idx + 1) >= _max_n:
                 if jax.process_index() == 0:
                     print(f"[rchunk_dbg] LORRAX_MAX_RCHUNKS={_max_rchunks} "
                           f"reached after chunk {chunk_idx+1}; "
@@ -1094,7 +1133,30 @@ def fit_zeta_to_h5(
     # has drained to disk.  Restart paths key off this flag to decide
     # whether the on-disk ζ is trustable; flipping it here (after the
     # global sync above) guarantees every rank's writes are durable.
-    if jax.process_index() == 0:
+    #
+    # NOT when a truncating knob was in force.  ``LORRAX_MAX_RCHUNKS=N``
+    # breaks the r-chunk loop above after N chunks, so the tensor written
+    # a few lines up is a PARTIAL ζ — and this stamp is the file's own
+    # claim about itself.  ``gw_init`` already refuses to add
+    # ``fit_provenance`` in that case, which blocks REUSE; this stops the
+    # file lying in the first place.  The two guards are deliberately
+    # independent: provenance is about "may a later run reuse this", and
+    # ``zeta_is_done`` is about "did the writer finish", which it did not.
+    # Both read the one list in ``gw_config.ZETA_TRUNCATING_ENV_KNOBS``.
+    _trunc = active_zeta_truncating_knobs()
+    if _trunc and jax.process_index() == 0:
+        _names = ", ".join(f"{k}={v}" for k, v in _trunc)
+        print("")
+        print("  " + "!" * 68)
+        print(f"  *** LORRAX SANITY: {_names} truncated this ζ fit "
+              f"(fewer than {num_chunks} r-chunks). ***")
+        print(f"  {output_file} holds a PARTIAL ζ and is NOT being marked")
+        print( "  complete (isdf_header/zeta_is_done stays False), so no")
+        print( "  restart or reuse path will trust it.  Profiling only —")
+        print( "  delete this file before any production run from this")
+        print( "  directory.")
+        print("  " + "!" * 68, flush=True)
+    elif jax.process_index() == 0:
         from file_io.isdf_header import mark_zeta_done
         mark_zeta_done(output_file)
 

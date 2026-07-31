@@ -58,6 +58,68 @@
 # 1×1, n=64) and is REJECTED at resolve time on CPU meshes.  The distributed
 # CPU eigh is ScaLAPACK `pzheevd` (ScalapackEighHostFfi, workstream V);
 # potrf/trsm/ScaLAPACK getrf are clean.  See docs/dev/linalg_ffi.md.
+#
+# ----------------------------------------------------------------------------
+# WHICH LIBRARY SUPPLIES WHAT, AND HOW ITS ABSENCE ANNOUNCES ITSELF
+# ----------------------------------------------------------------------------
+# Four numerical libraries can end up inside liblorrax_ffi_host.so.  THREE OF
+# THE FOUR ARE INTERCHANGEABLE WITH ANOTHER VENDOR'S, because LORRAX calls a
+# published API, not a product:
+#
+#   what is linked here           API LORRAX calls        swap it for
+#   ---------------------------   ---------------------   --------------------
+#   libmkl_scalapack_lp64 +       ScaLAPACK + C-BLACS     Cray LibSci
+#   libmkl_blacs_intelmpi_lp64    (11 Fortran-ABI names,  (libsci_*_mpi_*),
+#   (+ the mkl_intel/thread/core  hand-declared in        netlib, AOCL, or
+#   layers they need)             scalapack/cpp/          SLATE's own
+#                                 blacs_grid.h)           libslate_scalapack_api
+#   libmkl_intel_lp64 (CBLAS)     cblas_dgemm/zgemm       OpenBLAS, BLIS,
+#                                 (+ an OPTIONAL batched  LibSci, ATLAS
+#                                 extension asked for at
+#                                 runtime, never here)
+#   libmkl_intel_lp64 (DFTI)      DftiCreateDescriptor/   NOTHING — DFTI is
+#                                 SetValue/Compute*       Intel-only.  This is
+#                                                         the one host family
+#                                                         with a single-vendor
+#                                                         API.
+#   libslate + blaspp/lapackpp    slate:: C++ templates   NOTHING — a template
+#                                                         library has no ABI a
+#                                                         second vendor could
+#                                                         implement.
+#
+# To use a different ScaLAPACK, pass the whole link line and skip the MKL
+# probe entirely — no source change, nothing else to configure:
+#
+#   LORRAX_SCALAPACK_LIBRARIES="-L/opt/cray/pe/libsci/.../lib -lsci_gnu_mpi_mp -lsci_gnu_mp" \
+#     config/frontera/build_ffi_host.sh --fresh
+#
+# The three groups are independent: no SLATE install still gives you the
+# ScaLAPACK, GEMM and FFT handlers, and no ScaLAPACK still gives you SLATE's.
+# Each group prints one configure line saying what it resolved or why it was
+# skipped — READ THE CONFIGURE LOG FIRST.  If you no longer have it, the
+# runtime symptoms map back like this:
+#
+#   cannot resolve pzheevd_/pdsyevd_/pzgetrf_/pdgetrf_/pzgetrs_/pdgetrs_/
+#   numroc_/descinit_/Csys2blacs_handle/Cblacs_gridinit/Cblacs_gridinfo
+#       -> no ScaLAPACK+BLACS was linked.  Set LORRAX_MKL_ROOT, or pass
+#       LORRAX_SCALAPACK_LIBRARIES.  Those ELEVEN names are the ENTIRE
+#       ScaLAPACK surface LORRAX uses — measured as the complete
+#       undefined-symbol set of the two handler objects outside libc.
+#   cannot resolve cblas_dgemm/cblas_zgemm  -> a CBLAS header was found but
+#       its library was not on the link line.  (cblas_?gemm_batch will never
+#       appear here; it is looked up at runtime and its absence just selects
+#       the plain-GEMM loop.)
+#   cannot resolve Dfti*  -> the MKL runtime is missing from LD_LIBRARY_PATH.
+#   cannot resolve a mangled _ZN5slate...  -> libslate.so is missing from
+#       LD_LIBRARY_PATH.
+#   a collective hangs or aborts inside blacs_gridinit, no message  -> the
+#       BLACS flavour does not match the MPI.  MKL ships one BLACS per MPI
+#       (mkl_blacs_intelmpi_lp64 vs mkl_blacs_openmpi_lp64); the wrong one
+#       links perfectly and only fails at the first grid call.
+#
+# The authoritative version of this map, with the CMake variable names, is the
+# "HOST NUMERICAL LIBRARIES" block at the top of the resolution section in
+# src/ffi/common/cpp/host/CMakeLists.txt.
 # ============================================================================
 set -euo pipefail
 
@@ -119,17 +181,39 @@ if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
         echo "[build_host] LORRAX_SLATE_HOST_INSTALL_DIR set but no" >&2
         echo "             $LORRAX_SLATE_HOST_INSTALL_DIR/lib64/cmake/slate" >&2
         exit 2; }
-    [ -f "$LORRAX_MKL_ROOT/lib/intel64_lin/libmkl_scalapack_lp64.so" ] || {
-        echo "[build_host] no libmkl_scalapack_lp64.so under $LORRAX_MKL_ROOT" >&2
-        echo "             set LORRAX_MKL_ROOT (or LORRAX_SCALAPACK_LIBRARIES)" >&2
-        exit 2; }
+    # ScaLAPACK provider.  An explicit LORRAX_SCALAPACK_LIBRARIES link line
+    # is the vendor-neutral route (Cray LibSci, netlib, AOCL, SLATE's
+    # scalapack_api) and takes precedence — do NOT insist on MKL then.
+    if [ -n "${LORRAX_SCALAPACK_LIBRARIES:-}" ]; then
+        ARGS+=(-DLORRAX_SCALAPACK_LIBRARIES="$LORRAX_SCALAPACK_LIBRARIES")
+        echo "[build_host] ScaLAPACK from the explicit link line:"
+        echo "[build_host]   $LORRAX_SCALAPACK_LIBRARIES"
+        # MKL headers are still worth passing when present: they are what
+        # supplies the DFTI (FFT) and CBLAS (GEMM) handlers, which are
+        # independent of who provides ScaLAPACK.
+        if [ -f "$LORRAX_MKL_ROOT/include/mkl_dfti.h" ]; then
+            ARGS+=(-DLORRAX_MKL_ROOT="$LORRAX_MKL_ROOT")
+            echo "[build_host]   (MKL at $LORRAX_MKL_ROOT still used for the FFT/GEMM headers)"
+        else
+            echo "[build_host]   (no MKL headers — the DFTI FFT handlers will be skipped;"
+            echo "[build_host]    set LORRAX_CBLAS_DIR for the GEMM handler's cblas.h)"
+        fi
+    else
+        [ -f "$LORRAX_MKL_ROOT/lib/intel64_lin/libmkl_scalapack_lp64.so" ] || {
+            echo "[build_host] no libmkl_scalapack_lp64.so under $LORRAX_MKL_ROOT" >&2
+            echo "             ScaLAPACK is an API with several implementations —" >&2
+            echo "             either set LORRAX_MKL_ROOT to an MKL prefix, or set" >&2
+            echo "             LORRAX_SCALAPACK_LIBRARIES to a whole link line for" >&2
+            echo "             any other one (Cray LibSci, netlib, AOCL)." >&2
+            exit 2; }
+        ARGS+=(-DLORRAX_MKL_ROOT="$LORRAX_MKL_ROOT")
+        echo "[build_host] ScaLAPACK/BLACS from MKL at $LORRAX_MKL_ROOT"
+    fi
     ARGS+=(
         -DLORRAX_HOST_HAVE_SLATE=ON
         -DLORRAX_SLATE_HOST_INSTALL_DIR="$LORRAX_SLATE_HOST_INSTALL_DIR"
-        -DLORRAX_MKL_ROOT="$LORRAX_MKL_ROOT"
     )
     echo "[build_host] SLATE group ON  ($LORRAX_SLATE_HOST_INSTALL_DIR)"
-    echo "[build_host] ScaLAPACK/BLACS from MKL at $LORRAX_MKL_ROOT"
 else
     ARGS+=(-DLORRAX_HOST_HAVE_SLATE=OFF)
     echo "[build_host] SLATE group OFF (phdf5-only lib);"
@@ -147,7 +231,8 @@ echo "[build_host] compiling..."
 SO="$BUILD/liblorrax_ffi_host.so"
 [ -f "$SO" ] || { echo "[build_host] FAILED: no $SO" >&2; exit 1; }
 echo "[build_host] --- artifact: $SO ---"; ls -lh "$SO"
-echo "[build_host] --- DT_NEEDED ---"; readelf -d "$SO" | grep NEEDED || true
+echo "[build_host] --- libraries this .so will load at run time ---"
+readelf -d "$SO" | grep NEEDED || true
 if readelf -d "$SO" | grep NEEDED | grep -qiE 'cuda|nccl|nvshmem|cusolver|cublas'; then
     echo "[build_host] FAILED: host lib links a CUDA-stack library." >&2
     exit 1
@@ -156,12 +241,24 @@ echo "[build_host] CUDA-free OK."
 
 # Exported handler symbols must match ffi_loader._HOST_TARGET_SYMBOLS, or
 # has_target() lies and the facade's capability guard passes wrongly.
+#
+# Grouped exactly as the CMakeLists groups them, so a partial build is
+# checked for what it actually claimed to build and nothing else.  The
+# ScaLAPACK group carries the two GEMM/FFT handlers because they ride its
+# link line, not because they call ScaLAPACK.
 WANT="PhdfReadHostFfi PhdfReadKchunkHostFfi PhdfReadKchunkUnionHostFfi \
 PhdfWriteHostFfi"
 if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
+    # SLATE group.
     WANT="$WANT SlateEighHostFfi SlatePotrfHostFfi SlateTrsmHostFfi \
-SlateBatchedPotrfHostFfi SlateBatchedTrsmHostFfi ScalapackBatchedSolveLuHostFfi \
-ScalapackEighHostFfi lrx_slate_init_mpi lrx_slate_context_create \
+SlateBatchedPotrfHostFfi SlateBatchedTrsmHostFfi \
+lrx_slate_init_mpi lrx_slate_context_create"
+    # ScaLAPACK group (+ the handlers that share its link line).  Requested
+    # here whenever this script was given an MKL root or an explicit link
+    # line; the two are independent of the SLATE group in the CMakeLists,
+    # and this list will need splitting the day a caller enables one
+    # without the other.
+    WANT="$WANT ScalapackBatchedSolveLuHostFfi ScalapackEighHostFfi \
 MklFftFlatKHostFfi MklFftGwConvHostFfi"
 fi
 echo "[build_host] --- exported handlers ---"
@@ -178,9 +275,15 @@ for s in $WANT; do
 done
 [ "$MISS" -eq 0 ] || { echo "[build_host] FAILED: missing handlers." >&2; exit 1; }
 if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
-    echo "[build_host] --- ScaLAPACK/BLACS in DT_NEEDED ---"
-    readelf -d "$SO" | grep -E 'scalapack|blacs' \
-        || { echo "[build_host] FAILED: no ScaLAPACK/BLACS DT_NEEDED — the" >&2
+    # The ScaLAPACK provider must be recorded as a run-time dependency of the
+    # .so itself.  If it is not, the link succeeded but `-Wl,--no-as-needed`
+    # did not take, and the .so will load cleanly and then fail to find
+    # pzheevd_ at the first distributed solve.  Matches MKL's
+    # libmkl_scalapack/libmkl_blacs_* and Cray LibSci's libsci_*_mpi_*.
+    echo "[build_host] --- ScaLAPACK provider recorded as a dependency ---"
+    readelf -d "$SO" | grep -E 'scalapack|blacs|libsci' \
+        || { echo "[build_host] FAILED: no ScaLAPACK/BLACS library is recorded" >&2
+             echo "             as a dependency of the .so — the" >&2
              echo "             -Wl,--no-as-needed link line did not take." >&2
              exit 1; }
 fi

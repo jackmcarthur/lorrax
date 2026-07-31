@@ -23,17 +23,77 @@
 
 namespace lorrax_ffi::slate {
 
+// GUARD (2026-07-30 FFI divergence audit; the phdf5 twin is
+// phdf5/cpp/context.cc:201-219).  SLATE's stated requirement at the top of
+// this file — "MPI_Init_thread with MPI_THREAD_MULTIPLE (SLATE's internal
+// OMP+MPI pattern is not safe below that)" — was REQUESTED here and never
+// VERIFIED: `provided` was captured and discarded, and MPI_Query_thread
+// appeared nowhere in slate/cpp/.  Requesting MULTIPLE proves nothing,
+// because the request is a no-op whenever someone else initialised MPI
+// first: jax's MPI CPU collectives via MPItrampoline request FUNNELED, and
+// an unpatched MPIwrapper grants exactly that.  The measured consequence of
+// running concurrent MPI progress below MULTIPLE on this stack was a ~29%
+// provider-independent segfault/hang rate at P=16 x 8 nodes (3 segfaults +
+// 1 hang in 14 runs; scorecard AS.4b).  The certified fix is the
+// THREAD_MULTIPLE-patched MPIwrapper.  This guard makes the hazardous
+// configuration announce itself up front instead of dying minutes later
+// with a backtrace that names neither cause nor fix.
+//
+// Placement matters: the query runs on BOTH paths — after we initialise AND
+// after an early return because someone else already did.  The
+// already-initialised path is the hazardous one, so a guard that only ran
+// when we called MPI_Init_thread ourselves would be void by construction.
+//
+// NOT extracted into a shared header with the phdf5 twin, deliberately.
+// There are two call sites, and this project's own threshold (TEMPLATE.md
+// :194-195) is "extract when a THIRD library would copy it a third time".
+// The hazard sentences are also genuinely different — phdf5's is a
+// dedicated writer thread driving collective MPI-IO, SLATE's is its
+// internal OpenMP+MPI task engine — so a shared helper would carry a
+// parameterised message and save nothing but the four-line query.  The
+// mechanical part that WAS worth sharing (the MKL pin, three copies) is now
+// common/cpp/mkl_thread_pin.h.  If a third MPI FFI family appears, extract
+// then, and take the "query after ensuring init" placement with it.
+static void warn_if_thread_level_insufficient() {
+    static std::atomic<bool> warned{false};
+    int provided = 0;
+    MPI_Query_thread(&provided);
+    if (provided >= MPI_THREAD_MULTIPLE) return;
+    int rank = -1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (rank != 0) return;
+    if (warned.exchange(true)) return;
+    std::fprintf(stderr,
+        "[slate] WARNING: MPI granted thread level %d < MPI_THREAD_MULTIPLE "
+        "(%d) and MPI was initialized before this library (jax "
+        "cpu_collectives_implementation=mpi with an unpatched MPIwrapper?).  "
+        "SLATE's internal OpenMP+MPI task engine is UNDEFINED at this level "
+        "— the same concurrent-MPI-progress hazard measured at a ~29%% "
+        "multi-node crash rate for the phdf5 writer thread (scorecard "
+        "AS.4b).  Fix: point MPITRAMPOLINE_LIB at the MPIwrapper built by "
+        "config/frontera/build_mpiwrapper.sh, which upgrades every init to "
+        "MPI_THREAD_MULTIPLE (docs/dev/mpi_collectives.md).\n",
+        provided, MPI_THREAD_MULTIPLE);
+    std::fflush(stderr);
+}
+
 static void ensure_mpi_initialized() {
     int inited = 0;
     MPI_Initialized(&inited);
-    if (inited) return;
-    int provided = 0;
-    MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &provided);
-    // Important: MPICH needs srun --mpi=cray_shasta (not pmi2 / pmix)
-    // inside the shifter gpu,mpich module to actually bootstrap a
-    // multi-rank MPI_COMM_WORLD.  run_shifter.sh sets this default.  If
-    // MPI_COMM_WORLD is singleton here on a world_size > 1 allocation,
-    // check LORRAX_MPI_TYPE and/or the srun --mpi= flag.
+    if (!inited) {
+        int provided = 0;
+        MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &provided);
+        // Important: MPICH needs srun --mpi=cray_shasta (not pmi2 / pmix)
+        // inside the shifter gpu,mpich module to actually bootstrap a
+        // multi-rank MPI_COMM_WORLD.  run_shifter.sh sets this default.  If
+        // MPI_COMM_WORLD is singleton here on a world_size > 1 allocation,
+        // check LORRAX_MPI_TYPE and/or the srun --mpi= flag.
+        //
+        // `provided` is NOT inspected here on purpose: MPI_Query_thread
+        // below answers the same question on both paths, and reading it
+        // only here is precisely the bug this guard fixes.
+    }
+    warn_if_thread_level_insufficient();
 }
 
 }  // namespace lorrax_ffi::slate

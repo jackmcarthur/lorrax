@@ -98,17 +98,15 @@ def _load_wfn_k_fftbox_ibz(wfn: WFNReader, n_val: int) -> jnp.ndarray:
     pass a ``WfnLoader`` directly so this transient construction goes
     away.
     """
-    import jax
-    from jax.sharding import Mesh
     from file_io.wfn_loader import WfnLoader
     from common.wfn_transforms import to_box
 
+    from common.collectives import single_device_mesh
+
     with WfnLoader(wfn._filename) as loader:
         psi = loader.load(bands=(0, n_val), k="ibz")
-        mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
-                     axis_names=('x', 'y'))
         return to_box(psi, loader.box_index(k="ibz"), loader.fft_grid,
-                       mesh=mesh)
+                      mesh=single_device_mesh())
 
 
 def rho_from_wfn_ibz(
@@ -222,9 +220,10 @@ def rho_from_band_range(
     (Nx, Ny, Nz) float64 real-space weight on the WFN FFT grid.
     """
     import jax
-    from jax.sharding import Mesh
     from file_io.wfn_loader import WfnLoader
     from common.wfn_transforms import to_rbox
+
+    from common.collectives import single_device_mesh
 
     b_lo, b_hi = int(band_range[0]), int(band_range[1])
     if b_hi <= b_lo:
@@ -242,7 +241,7 @@ def rho_from_band_range(
         g_index = loader.box_index(k="ibz")
         n_k = int(g_index.shape[0])
         kw = np.asarray(wfn.kweights, dtype=np.float64)[:n_k]
-        mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+        mesh = single_device_mesh()
         # r-space buffer is (n_k, nb, nspinor, Nr) complex128 → size the
         # band chunk against the budget (≥1 band, ≤ the whole range).
         per_band = n_k * nspinor * n_r * 16

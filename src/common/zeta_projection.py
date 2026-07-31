@@ -134,7 +134,6 @@ Refusals (all raise BEFORE any collective, with the fix named)
 """
 from __future__ import annotations
 
-import os
 from typing import Callable
 
 import numpy as np
@@ -143,13 +142,10 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.contract_bands import (
-    contract_bands_block_reshard,
-    ensure_grouped_collectives_ready,
-)
+from common.collectives import warm_mesh_cliques
+from common.contract_bands import contract_bands_block_reshard
 
 __all__ = [
-    "ensure_world_clique_ready",
     "assert_zeta_bases_compatible",
     "zeta_overlap_block_reshard",
     "zeta_overlap_single_axis",
@@ -160,100 +156,6 @@ __all__ = [
     "project_w_between_zeta_bases",
     "transfer_operands_from_dense",
 ]
-
-
-# ---------------------------------------------------------------------------
-# impl=mpi world-clique warm-up — stronger than the primitive's helper
-# ---------------------------------------------------------------------------
-
-_world_clique_warmed = False
-
-
-def ensure_world_clique_ready(mesh_xy: Mesh, *,
-                              axes: tuple[str, str] = ("x", "y"),
-                              print_fn=print) -> bool:
-    """Warm the impl=mpi WORLD clique — and ANNOUNCE that it is not enough.
-
-    Background.  ``common.contract_bands.ensure_grouped_collectives_ready``
-    encodes the memo's world-collective-first contract (RESHARD_OVERHEAD_MEMO
-    Sec. 4.2, job 7878883): under
-    ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` a GROUPED clique can only be
-    created after a WORLD-clique collective has first-touched the runtime.
-    It implements that with ``common.collectives.barrier`` →
-    ``multihost_utils.sync_global_devices``.
-
-    **Measured (job 7879485, P=4, 5 variants, one fresh process each): under
-    impl=mpi NO warm-up makes a standalone driver's grouped psum_scatter
-    work.**  ``none``, ``sync_global_devices``, a ``lax.psum`` over both
-    mesh axes on the caller's own mesh, a world all-gather on the caller's
-    own mesh, and psum+sgd together ALL die with
-
-        UNKNOWN: MPI: Communicator requested from a thread that is not the
-        one MPI was initialized from.
-
-    (jaxlib's ``MpiCollectives::CreateCommunicators`` gates on
-    ``MPI_Is_thread_main``; XLA:CPU executes the collective from its thread
-    pool.)  The same probe run shows **gloo with the ib0 pin passing the
-    identical chain with no warm-up at all** — consistent with
-    RESHARD_OVERHEAD_MEMO Sec. 4.3, which measured this exact staged
-    reduce-scatter chain on gloo/ib0 at P=64 (job 7878883 step 1c, rc=0).
-    Production GW *does* run grouped collectives under impl=mpi (job
-    7879010, 8/8 passes rc=0), so the contract is satisfiable — but by
-    something in the full gw_jax process that a standalone driver does not
-    reproduce, and that was not chased down here.
-
-    This helper therefore (a) still issues the world-clique collective the
-    memo's probe used — cheap, harmless, and the right thing if the
-    upstream contract is ever the whole story again — and (b) ANNOUNCES the
-    known-bad configuration on rank 0 rather than letting the caller
-    discover it as an ``UNKNOWN`` error mid-run.  It is NOT a refusal:
-    production runs this configuration successfully, so refusing would
-    break a working path.
-
-    A no-op off impl=mpi and in single-process runs.  MUST be called
-    synchronously on every rank (it is a collective).  The factories below
-    call it, so consumers inherit it.
-
-    Returns True when a warm-up collective was actually executed.
-    """
-    global _world_clique_warmed
-    if _world_clique_warmed:
-        return False
-    impl = os.environ.get(
-        "JAX_CPU_COLLECTIVES_IMPLEMENTATION", "").strip().lower()
-    if impl != "mpi":
-        return False
-    from common.collectives import process_count, device_put_process_local
-    if process_count() <= 1:
-        return False
-    from jax.experimental.shard_map import shard_map
-    import numpy as np
-
-    if jax.process_index() == 0:
-        print_fn(
-            "*** zeta_projection: JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi in a "
-            "standalone driver.  The grouped psum_scatter this module issues "
-            "is MEASURED to fail here with 'MPI: Communicator requested from "
-            "a thread that is not the one MPI was initialized from' under "
-            "EVERY known warm-up (job 7879485: none / sync_global_devices / "
-            "world psum / world all-gather / both).  Use "
-            "JAX_CPU_COLLECTIVES_IMPLEMENTATION=gloo with the ib0 pin "
-            "(runtime.pin_gloo_interface) — measured green for this exact "
-            "chain in the same probe and at P=64 in job 7878883.  Warming "
-            "the world clique anyway and continuing. ***")
-    ax = tuple(axes)
-    one = device_put_process_local(
-        np.ones(1, dtype=np.float64), NamedSharding(mesh_xy, P(None)))
-    fn = jax.jit(shard_map(
-        lambda a: jax.lax.psum(a, ax), mesh=mesh_xy,
-        in_specs=(P(None),), out_specs=P(None), check_rep=False))
-    total = float(jax.device_get(fn(one))[0])
-    _world_clique_warmed = True
-    if total != float(mesh_xy.size) and jax.process_index() == 0:
-        print_fn(f"*** zeta_projection world-clique warm-up returned {total} "
-                 f"but the mesh has {mesh_xy.size} devices — the all-reduce "
-                 f"did not span the mesh. ***")
-    return True
 
 
 _MU_DIV_MSG = (
@@ -517,8 +419,7 @@ def zeta_overlap_block_reshard(
             out_specs=(P(None, None, ax_x), P(None, None, ax_y)),
             check_rep=False)(zeta_S, zeta_L)
 
-    ensure_world_clique_ready(mesh_xy, axes=axes)
-    ensure_grouped_collectives_ready()
+    warm_mesh_cliques(mesh_xy)
     return _overlap
 
 
@@ -607,8 +508,7 @@ def zeta_overlap_single_axis(
             in_specs=(P(None, None, g_axis), P(None, mu_axis, g_axis)),
             out_specs=P(None, None, mu_axis), check_rep=False)(zeta_S, zeta_L)
 
-    ensure_world_clique_ready(mesh_xy)
-    ensure_grouped_collectives_ready()
+    warm_mesh_cliques(mesh_xy)
     return _overlap
 
 
@@ -644,8 +544,7 @@ def zeta_gram_single_axis(mesh_xy: Mesh, *, g_axis: str) -> Callable:
             _body, mesh=mesh_xy, in_specs=(P(None, None, g_axis),),
             out_specs=out_spec, check_rep=False)(zeta_S)
 
-    ensure_world_clique_ready(mesh_xy)
-    ensure_grouped_collectives_ready()
+    warm_mesh_cliques(mesh_xy)
     return _gram
 
 
@@ -694,8 +593,7 @@ def zeta_gram_replicated(
             in_specs=(P(None, None, (ax_x, ax_y)),),
             out_specs=P(None, None, None), check_rep=False)(zeta_S)
 
-    ensure_world_clique_ready(mesh_xy, axes=axes)
-    ensure_grouped_collectives_ready()
+    warm_mesh_cliques(mesh_xy)
     return _gram
 
 
@@ -785,8 +683,34 @@ def least_squares_transfer(
     w, V = jnp.linalg.eigh(gram_S)              # ascending, replicated
     lam_max = jnp.max(w, axis=-1, keepdims=True)
     keep = w > (float(rcond) * lam_max)
-    ranks = np.asarray(jax.device_get(jnp.sum(keep, axis=-1)))
+    # THE CRITERION: ``keep`` is a CAP on how much G_S⁺ may amplify round-off
+    # (κ_eff = λ_max/λ_min(kept) ≤ 1/rcond), NOT a search for a gap — these
+    # ζ-overlap spectra are smooth and have none.  ``common/rank_criterion``
+    # carries the derivation and the measurements that refute the standard
+    # alternatives (discrepancy principle / L-curve / GCV) for this code.
+    #
+    # Diagnostic, on every run and in ONE device_get: retained rank, the
+    # retained block's λ range (hence κ_eff), the discarded λ range, and the
+    # margin — the fractional rank inflation from loosening rcond by 1e-4.
+    # §R19 measured +41 % of retained rank costing 5000 eV, so a large margin
+    # says the basis is over-complete and rcond must not be loosened here.
+    _stats = jax.device_get((
+        jnp.sum(keep, axis=-1),                                  # ranks
+        lam_max[..., 0],                                         # λ_max
+        jnp.min(jnp.where(keep, w, jnp.inf), axis=-1),           # λ_min kept
+        jnp.max(jnp.where(keep, -jnp.inf, w), axis=-1),          # λ top dropped
+        jnp.min(w, axis=-1),                                     # λ_min
+        jnp.sum(w > (float(rcond) * 1e-4 * lam_max), axis=-1),   # loose rank
+    ))
+    ranks = np.asarray(_stats[0])
+    lmax_h, lminkeep_h, ldrop_h, lmin_h, ranks_loose = (
+        np.asarray(x) for x in _stats[1:])
     n_mu_s = int(gram_S.shape[-1])
+    # Computed on EVERY process (gram_S is replicated, so the verdict is the
+    # same everywhere) — a refusal raised only on rank 0 would hang the rest.
+    with np.errstate(divide='ignore', invalid='ignore'):
+        kappa = lmax_h / lminkeep_h
+        margin = (ranks_loose - ranks) / np.maximum(ranks, 1)
     if jax.process_index() == 0:
         print_fn(
             f"[zeta_projection] rank-truncated transfer at rcond={rcond:g}: "
@@ -797,6 +721,21 @@ def least_squares_transfer(
             f"on the rest ON THE SPHERE — W_S is the projection onto the "
             f"retained span, and a rank far below μ_S means the small "
             f"basis is smaller than it looks.")
+        print_fn(
+            f"[zeta_projection]   retained λ {np.max(lmax_h):.6e} .. "
+            f"{np.min(lminkeep_h):.6e} -> kappa_eff max {np.nanmax(kappa):.3e} "
+            f"(cap 1/rcond = {1.0/float(rcond):.3e}); discarded λ "
+            f"{np.min(lmin_h):.6e} .. {np.max(ldrop_h):.6e}; grid alignment "
+            f"discarded 0 (this route never rounds the rank to the mesh); "
+            f"margin (rcond x 1e-4) max +{100.0*np.max(margin):.1f}% "
+            f"— R19 anchor: +41% cost 5000 eV.")
+    if np.nanmax(kappa) > (1.0 / float(rcond)) * (1.0 + 1e-9):
+        raise ValueError(
+            f"zeta_projection: achieved amplification "
+            f"{np.nanmax(kappa):.3e} exceeds the cap "
+            f"{1.0/float(rcond):.3e} the rcond={rcond:g} truncation was "
+            f"supposed to enforce — the retained set is not the one the "
+            f"criterion selected.")
     if int(ranks.min()) == 0:
         raise ValueError(
             f"zeta_projection: rcond={rcond:g} retained ZERO directions at "
@@ -963,7 +902,7 @@ def project_w_between_zeta_bases(
     """
     ax_x, ax_y = axes
     _check_mesh(mesh_xy, axes)
-    ensure_world_clique_ready(mesh_xy, axes=axes)
+    warm_mesh_cliques(mesh_xy)
     inner = contract_bands_block_reshard(
         mesh_xy, channels="none", extra="none", axes=axes,
         divisibility_hint=(

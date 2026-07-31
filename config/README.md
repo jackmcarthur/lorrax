@@ -63,15 +63,45 @@ sbatch $LORRAX_ROOT/config/perlmutter/run_gw.slurm
 |---|---|---|
 | `HDF5_USE_FILE_LOCKING` | `FALSE` | Lustre filesystem HDF5 compatibility |
 | `XLA_PYTHON_CLIENT_PREALLOCATE` | `false` | Don't pre-grab a fixed XLA pool; let NCCL/cuSOLVERMp share VRAM |
-| `XLA_PYTHON_CLIENT_ALLOCATOR` | `platform` | Use the CUDA async mempool (shared with NCCL) instead of XLA's BFC |
-| `TF_GPU_ALLOCATOR` | `cuda_malloc_async` | CUDA 12 async allocator (no pipeline stalls) |
+| `XLA_PYTHON_CLIENT_ALLOCATOR` | `cuda_async` | cudaMallocAsync mempool (shared with NCCL) instead of XLA's BFC — **not** `platform`, see below |
 | `JAX_COMPILATION_CACHE_DIR` | `$SCRATCH/.jax_cache` | Persistent XLA PTX cache across JAX processes |
+
+> **`platform` is NOT cudaMallocAsync.**  The three values name three
+> different allocators in the CUDA plugin, and this table used to conflate
+> two of them:
+>
+> | value | what it actually is | `memory_stats()` |
+> |---|---|---|
+> | unset / `default` / `bfc` | XLA's BFC pool ("Using BFC allocator.") | fully populated |
+> | `platform` | plain `cudaMalloc` ("Using platform allocator.") | `bytes_limit=0`, `peak_bytes_in_use=0` |
+> | `cuda_async` | `cudaMallocAsync` (a separate `CudaAsyncAllocator`) | keeps `peak_bytes_in_use` |
+>
+> Measured on 8× Quadro RTX 5000 across 2 nodes, jobs 7882442/7882447/7882468
+> (each cell run twice, rep 2 in reverse order).  `cuda_async` was the best
+> of the three — 0.19 GB overhead, 9.20 GB largest creatable cuFFT plan.
+> `platform` gives good headroom but blinds every memory report in the
+> codebase, because `gw_init`'s high-water report, `gw_output`'s XLA-pool
+> banner and `runtime/aot_memory` all read `memory_stats()`.
+>
+> **`TF_GPU_ALLOCATOR` is a TensorFlow variable and is inert for JAX.**  A
+> cell setting only `TF_GPU_ALLOCATOR=cuda_malloc_async` was byte-identical
+> to the unset cell on every metric — including an 11.805 GB BFC pool that
+> the real `cuda_async` allocator never has (job 7882442).  It was removed
+> from this table rather than corrected; do not add it back.
+>
+> On sm_75 (Frontera `rtx`) `cuda_async` additionally needs the
+> command-buffer restriction in `config/frontera/ffi_env.sh` — that file is
+> the one place that sets both together.  `runtime.set_default_env()`
+> therefore leaves `XLA_PYTHON_CLIENT_ALLOCATOR` unset (= BFC) and only
+> pins `XLA_PYTHON_CLIENT_PREALLOCATE=false`, which is a correctness knob
+> here: LORRAX's FFI handlers allocate OUTSIDE the XLA allocator.
 
 > **Why not `MEM_FRACTION=0.95`?**  We tried it.  Pre-allocating 95 % of A100
 > VRAM into XLA's BFC pool leaves NCCL only ~2 GB for its staging buffers,
 > and cuSOLVERMp's `syevd` surfaces that as `NCCL error 1 unhandled cuda
-> error` → `cusolverMpSyevd: status=7`.  Switching to the platform allocator
-> (cudaMallocAsync) lets XLA and NCCL share one pool.
+> error` → `cusolverMpSyevd: status=7`.  Switching to the cudaMallocAsync
+> allocator (`XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async`) lets XLA and NCCL
+> share one pool.  `MEM_FRACTION` is honoured only by BFC.
 
 **Shell functions:**
 

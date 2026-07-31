@@ -106,7 +106,7 @@ if [[ ! -f "${SO_FILE}" ]]; then
 fi
 
 echo
-echo "[build_host] --- CUDA-free proof (readelf NEEDED) ---"
+echo "[build_host] --- CUDA-free proof: libraries this .so loads at run time ---"
 readelf -d "${SO_FILE}" | grep NEEDED
 if readelf -d "${SO_FILE}" | grep NEEDED | grep -qiE 'cuda|nccl|nvshmem|cal\.so'; then
     echo "[build_host] FAILED: ${SO_FILE} links a CUDA-stack library — the" >&2

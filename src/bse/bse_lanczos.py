@@ -240,6 +240,10 @@ def solve_bse_sharded(
         return eigenvalues, eigenvectors, jnp.int32(max_iter)
 
     rep_eig = NamedSharding(mesh_xy, P())  # eigenvalues / eigenvectors come back replicated.
+    # ``krep``: the Krylov basis sharding, or None to leave it to GSPMD (the
+    # shipped behaviour).  Resolved ONCE here, not per matvec call.
+    from .bse_stack_matvec import matvec_opts as _mv_opts
+    krylov_rep = rep_eig if "krep" in _mv_opts() else None
 
     # End-to-end jit with explicit in/out shardings + donate the bulky
     # buffers we won't need post-Lanczos.
@@ -291,13 +295,26 @@ def solve_bse_sharded(
             # vectors at once → ``block_size``-larger GEMMs (better GPU
             # occupancy) and ``block_size``-fewer host dispatches.
             def matvec_block(V_block):
+                # ``krep`` (LORRAX_BSE_MATVEC_OPT): pin the FLAT Krylov axis to
+                # replicated.  Unconstrained it inherits ``sh.X``'s tiling
+                # through the reshape, which puts every reorthogonalisation dot
+                # product, the QR and the Ritz eigh on a sharded axis and turns
+                # each into a collective.  Costs one replicated
+                # (max_iter+1, n_flat, bs) basis per rank — right for a small
+                # pair space, wrong for a large one; see the dial docs.
+                if krylov_rep is not None:
+                    V_block = jax.lax.with_sharding_constraint(V_block,
+                                                               krylov_rep)
                 X = V_block.reshape(shape)
                 X = jax.lax.with_sharding_constraint(X, sh.X)
                 HX = matvec_ring(
                     X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                     eps_c, eps_v, W_R, V_q0, M_X, M_Y,
                 )
-                return HX.reshape(bs, -1)
+                HX = HX.reshape(bs, -1)
+                if krylov_rep is not None:
+                    HX = jax.lax.with_sharding_constraint(HX, krylov_rep)
+                return HX
             if rtol > 0.0:
                 # Convergence-driven: ``lax.while_loop`` exits when the
                 # n_eig lowest Ritz values stabilise within ``rtol``.

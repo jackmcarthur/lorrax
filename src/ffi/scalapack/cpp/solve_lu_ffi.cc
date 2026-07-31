@@ -193,6 +193,23 @@ static ffi::Error SolveLuDispatch(
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "scalapack.solve_lu: A, B, X must share dtype");
     }
+    // PROVENANCE — same guard as the eigh handler.  The LU shims are not
+    // bug L-2, but they carry the other two defects (hard-coded
+    // MPI_COMM_WORLD vs this ctx's rank-remapped comm, and info hard-wired
+    // to 0), so an unannounced substitution is still a silent-wrong-answer
+    // route.  Checked on getrf AND getrs: the two live in different SLATE
+    // translation units and a partial interposition is possible.
+    // See blacs_grid.h for the measured symbol table and the waiver.
+    for (const char* nm : {(dtype == ffi::DataType::F64) ? "pdgetrf_"
+                                                        : "pzgetrf_",
+                           (dtype == ffi::DataType::F64) ? "pdgetrs_"
+                                                        : "pzgetrs_"}) {
+        const std::string refusal =
+            lorrax_ffi::scalapack::scalapack_slate_api_refusal("solve_lu", nm);
+        if (!refusal.empty()) {
+            return ffi::Error(ffi::ErrorCode::kUnimplemented, refusal);
+        }
+    }
     // A's buffer is donated — getrf factors in place (cast away const,
     // same convention as the cusolvermp twin).
     switch (dtype) {

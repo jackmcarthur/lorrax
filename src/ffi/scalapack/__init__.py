@@ -1,9 +1,20 @@
 """ScaLAPACK FFI — host-platform distributed linear algebra.
 
 The portable CPU-backend twin of ``ffi.cusolvermp``.  Handlers live in
-``liblorrax_ffi_host.so`` (see ``src/ffi/common/cpp/host/``); ScaLAPACK +
-BLACS come from the vendor BLAS the host library already links (MKL on
-Frontera, Cray LibSci on Perlmutter), so neither op adds a dependency.
+``liblorrax_ffi_host.so`` (see ``src/ffi/common/cpp/host/``).
+
+**ScaLAPACK is a published API, not a product.**  These two ops call the
+eight-symbol ScaLAPACK + C-BLACS Fortran ABI hand-declared in
+``src/ffi/scalapack/cpp/blacs_grid.h``, and that ABI is implemented by
+Intel MKL (Frontera), Cray LibSci (Perlmutter), netlib, AMD AOCL, and
+SLATE's own ``scalapack_api`` layer.  Which one is linked is decided
+entirely in ``src/ffi/common/cpp/host/CMakeLists.txt``
+(``LORRAX_SCALAPACK_LIBRARIES`` overrides the MKL probe with any link
+line at all) and **nothing in this package can observe it** — the
+capability check keys only on LORRAX's own handler symbols.  So do not
+write a vendor name into this family's code or docstrings as if it were
+a fact about the build.  Whichever it is, the host library already links
+it for the other host handlers, so neither op adds a dependency.
 
 Two ops:
 

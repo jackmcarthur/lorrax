@@ -30,7 +30,6 @@ sharding ``P(None, 'x', 'y')`` matches.
 """
 from __future__ import annotations
 
-import os
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -38,6 +37,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+from .gw_config import env_bool
 
 if TYPE_CHECKING:
     from file_io.zeta_loader import ZetaLoader
@@ -172,7 +173,13 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
     # DEBUG: set LORRAX_FORCE_FULL_BZ=1 to bypass the IBZ cascade and
     # compute V_q at all full-BZ q's directly.  Useful for isolating
     # whether residuals come from unfold_v_q vs the rest of the pipeline.
-    _force_full_bz = bool(int(os.environ.get('LORRAX_FORCE_FULL_BZ', '0')))
+    #
+    # ONE grammar for this knob, shared with the four other sites that read
+    # it (``gw/gw_init.py`` x3, ``gw/screening.py``).  The old
+    # ``bool(int(os.environ.get(...)))`` took decimal digits only, so
+    # ``=true``/``=on``/``=yes`` raised a bare ``invalid literal for int()``
+    # from deep inside the V_q cascade rather than doing what they say.
+    _force_full_bz = env_bool('LORRAX_FORCE_FULL_BZ', False)
     if sym is not None and centroid_indices is not None and not _force_full_bz:
         from centroid.orbit_syms import compute_centroid_sym_perm
         n_tran = int(np.asarray(sym.sym_matrices).shape[0])

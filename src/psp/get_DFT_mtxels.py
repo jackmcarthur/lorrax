@@ -23,14 +23,26 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 # Respect user/project overrides; otherwise prefer GPU-capable platforms
 if "JAX_PLATFORMS" not in os.environ and "JAX_PLATFORM_NAME" not in os.environ:
     os.environ["JAX_PLATFORMS"] = "cuda,cpu"
+# Canonical value, single-sourced in runtime.set_default_env() — kept here
+# only because this module is also a standalone CLI that does not call
+# bootstrap().  See that function for the measurement (jobs 7882442/7882447).
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
-os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
+# REMOVED, both measured on 8 GPUs (job 7882442) rather than argued:
+#   XLA_PYTHON_CLIENT_ALLOCATOR=platform — `platform` is plain cudaMalloc, NOT
+#     cudaMallocAsync as the old comment here and three docs claimed.  Under it
+#     memory_stats() reports bytes_limit=0 and peak_bytes_in_use=0, so it
+#     silently zeroes gw_init's GPU high-water report and gw_output's XLA-pool
+#     banner.  Leaving it unset selects BFC, which keeps those readings.
+#   TF_GPU_ALLOCATOR=cuda_malloc_async — a TensorFlow variable, inert for JAX.
+#     A cell setting only this was identical to the unset cell on every metric,
+#     including an 11.805 GB BFC pool that cuda_async never has.
+# NOTE these two also only ever took effect when this module was imported
+# BEFORE the first jax.devices(); under gw/kin_ion_io.py they ran after it and
+# changed nothing but the strings in os.environ.
 
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from functools import partial, lru_cache
 
 
@@ -81,6 +93,7 @@ from psp.radial.build_projectors_qe import (
     build_local_ionic_potential_on_G_total,
 )
 from psp.dft_operators import vnl_matrix_from_kdata
+from common.collectives import prepare_mesh, shard_over_k
 from dataclasses import dataclass
 import h5py
 import psp.vnl_ops as vnl_ops
@@ -387,7 +400,8 @@ def compute_hartree_potential_real(
 
 # ── Re-exports from dft_operators (canonical location) ──
 from psp.dft_operators import poisson_potential_from_rhoG  # noqa: F401
-from psp.dft_operators import generate_gvectors_k          # noqa: F401
+from psp.dft_operators import padded_gvectors              # noqa: F401
+from psp.dft_operators import generate_gvectors_k          # noqa: F401  (D10 reference)
 
 
 def compute_kinetic_k(wfn_k, Gk_crys, kpoint_crys, bdot, g_mask: jax.Array | None = None):
@@ -486,36 +500,47 @@ def _compute_local_V_k_jit(
     V_loc = jnp.einsum('bsg,nsg->bn', jnp.conj(psi_coeffs), vpsi, optimize=True)
     return V_loc * jnp.sqrt(1.0 / volume)
 
-    # Legacy implementation removed in favor of unified vnl_ops / dft_operators path.
-    raise NotImplementedError("compute_V_NL_k legacy path removed; use vnl_ops.build_vnl_kdata_from_kvec plus dft_operators.vnl_matrix_from_kdata.")
-
 
 @timing.timed("psp.get_DFT_mtxels.get_H_matrix_elements", watch=True)
-def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valrange):
+def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
+                          n_valrange, sys_dim: int = 3):
     """
     Compute nonlocal pseudopotential matrix elements <mk|V_NL|nk> for all k-points.
-    
-    This implementation distributes k-points across the XY processor grid and 
+
+    This implementation distributes k-points across the XY processor grid and
     computes V_NL elements for each k-point independently.
-    
+
     Args:
         wfn: WFNReader object
-        sym: SymMaps object  
+        sym: SymMaps object
         pseudos: Dictionary of loaded pseudopotentials
         global_psi_G: Global sharded wavefunction coefficients in G-space
         meta: System metadata
         mesh_xy: JAX device mesh for sharding
         n_valrange: Band range for all valence bands [0, nelec]
-        
+        sys_dim: system dimensionality (0/2/3) from the DECK.  Both the
+            Hartree and the local ionic potential take their Coulomb
+            convention from it — ``truncation_2d = (sys_dim == 2)``, the
+            Ismail-Beigi slab cutoff, which is also what QE's
+            ``assume_isolated='2D'`` applies.  This used to be hardwired
+            ``True`` at both call sites, so a 3D bulk deck silently got a
+            slab-truncated Hartree AND a slab-truncated V_loc.
+
     Returns:
         Array of nonlocal potential matrix elements, shape (nk, nb, nb)
     """
+    from psp.operator_checks import validate_operator_inputs
+    ctx = validate_operator_inputs(
+        pseudos=pseudos, wfn=wfn, sys_dim=sys_dim,
+        caller="get_H_matrix_elements",
+    )
     print("\nComputing DFT Hamiltonian (Ry units)...")
-    
+    print(f"  Coulomb truncation: "
+          f"{'2D slab' if ctx.truncation_2d else '3D bulk'} (sys_dim={sys_dim})")
+
     # 1. Reshard wavefunctions to distribute k-points over XY grid
-    k_xy_shard = NamedSharding(mesh_xy, P(('x','y'), None, None, None, None, None))
     print("  Resharding wavefunctions to device mesh")
-    wfn_k_sharded = jax.lax.with_sharding_constraint(global_psi_G, k_xy_shard)
+    wfn_k_sharded = shard_over_k(global_psi_G, mesh_xy)
     
     # 2. Prepare atomic structure data (replicated on all devices)
     atom_positions = jnp.asarray(wfn.atom_crys, dtype=jnp.float64)  # Crystal coordinates
@@ -550,35 +575,12 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
         for ap in assignments
     ]
 
-    # Precompute G and K scaffolding for all k-points
-    print("  Precomputing G and K scaffolding for all k-points...")
-    Gk_crys_all: list[jnp.ndarray] = []
-    for i in range(sym.nk_tot):
-        Gk_crys_i, _ = generate_gvectors_k(i, sym, wfn, meta)
-        Gk_crys_all.append(jnp.asarray(Gk_crys_i, dtype=jnp.int32))
-    print("  Done precomputing G scaffolding.")
-
-    # Build fixed-size G pads for the local terms and a unified VNL setup once.
-    nG_list: list[int] = []
-    for Gk_crys_i in Gk_crys_all:
-        nG_list.append(int(Gk_crys_i.shape[0]))
-    nG_max = max(nG_list) if nG_list else 0
-    Gk_crys_pad: list[jnp.ndarray] = []
-    G_mask: list[jnp.ndarray] = []
-    for i in range(sym.nk_tot):
-        Gcur = jnp.asarray(Gk_crys_all[i], dtype=jnp.int32)
-        nG = int(Gcur.shape[0])
-        if nG < nG_max:
-            pad = nG_max - nG
-            Gpad = jnp.pad(Gcur, ((0, pad), (0, 0)))
-            mask = jnp.concatenate(
-                [jnp.ones((nG,), dtype=jnp.float64), jnp.zeros((pad,), dtype=jnp.float64)]
-            )
-        else:
-            Gpad = Gcur
-            mask = jnp.ones((nG_max,), dtype=jnp.float64)
-        Gk_crys_pad.append(Gpad)
-        G_mask.append(mask)
+    # G scaffolding: the loader's OWN fixed-shape (nk, ngkmax, 3) table
+    # plus its pad mask.  This replaces a per-k `generate_gvectors_k`
+    # sweep that sliced the same table back to each k's ngk and then
+    # re-padded it by hand to the max — three passes to arrive where the
+    # loader already was (owner decision D10).
+    gtab = padded_gvectors(wfn, k="full_bz")
     vnl_setup = vnl_ops.build_vnl_setup(
         wfn,
         sym,
@@ -594,7 +596,9 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
     rho_valence = compute_valence_density(wfn_k_sharded, sym, wfn)
     print(f"    Valence density grid: {rho_valence.shape}")
     # Precompute Hartree potential V_H(r) on the rho grid using reciprocal metric bdot
-    # Use 2D truncation by default for slab systems (matches ISDF/BerkeleyGW)
+    # Coulomb convention comes from the deck's sys_dim (ctx.truncation_2d),
+    # the SAME flag V_loc uses below.  Mixing the two puts a large
+    # systematic error straight into H0's ~500 eV cancellation.
     bdot_j = jnp.asarray(wfn.bdot, dtype=jnp.float64)
     bvec_j = jnp.asarray(wfn.bvec, dtype=jnp.float64)
     V_H_r = compute_hartree_potential_real(
@@ -602,7 +606,7 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
         bdot_j,
         bvec=bvec_j,
         blat=float(wfn.blat),
-        truncation_2d=True,  # Match QE's assume_isolated='2D' behavior
+        truncation_2d=ctx.truncation_2d,   # deck sys_dim, NOT hardwired
     )
     deltaV = float(wfn.cell_volume) / float(np.prod(V_H_r.shape))
     print(f"    Hartree potential grid: {V_H_r.shape}")
@@ -625,7 +629,7 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
         cell_volume=float(wfn.cell_volume),
         bvec=np.asarray(wfn.bvec, dtype=float),
         blat=float(wfn.blat),
-        truncation_2d=True,  # Match QE's assume_isolated='2D' behavior
+        truncation_2d=ctx.truncation_2d,   # deck sys_dim, NOT hardwired
     )
     V_loc_r = jnp.asarray(V_loc_r, dtype=jnp.float64)
 
@@ -636,19 +640,21 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
     for i in range(1):
         wfn_k = wfn_k_sharded[i]  # (nb, nspinor, nx, ny, nz)
         kpoint = kpoints[i]
-        Gk_crys = Gk_crys_pad[i]
+        Gk_crys, g_mask = gtab.at(i)
 
-        T_k = compute_kinetic_k(
-            wfn_k, Gk_crys, kpoint, bdot_j
-        )
-        V_ion_k = compute_local_V_k(wfn_k, Gk_crys, V_loc_r, wfn.cell_volume, G_mask[i])
-        V_H_k = compute_local_V_k(wfn_k, Gk_crys, V_H_r, wfn.cell_volume, G_mask[i])
+        # Every term takes the SAME (padded) G-list and the SAME mask.
+        # Before D10 the local terms were padded and V_NL was not, so the
+        # four contributions to H(k=0) were summed over two different
+        # G-layouts inside a ~500 eV cancellation.
+        T_k = compute_kinetic_k(wfn_k, Gk_crys, kpoint, bdot_j, g_mask)
+        V_ion_k = compute_local_V_k(wfn_k, Gk_crys, V_loc_r, wfn.cell_volume, g_mask)
+        V_H_k = compute_local_V_k(wfn_k, Gk_crys, V_H_r, wfn.cell_volume, g_mask)
         kdata = vnl_ops.build_vnl_kdata_from_kvec(
             np.asarray(kpoint, dtype=float),
-            np.asarray(Gk_crys_all[i], dtype=int),
+            np.asarray(Gk_crys, dtype=int),
             vnl_setup,
         )
-        V_NL_k = vnl_matrix_from_kdata(wfn_k, Gk_crys_all[i], kdata)
+        V_NL_k = vnl_matrix_from_kdata(wfn_k, Gk_crys, kdata, mask=g_mask)
 
         # Temporary debug prints: first 4x4 blocks (2 decimals, scientific)
         # (per-matrix debug prints removed)
@@ -672,197 +678,36 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
     
     return H_sharded, rho_valence, first_k_components
     
-@timing.timed("psp.get_DFT_mtxels.get_kin_ion", watch=True)
-def get_kin_ion(
-    global_psi_G,
-    wfn,
-    sym,
-    pseudos,
-    meta,
-    mesh_xy,
-    assignments=None,
-    species_payload=None,
-    include_hartree: bool = False,
-    nb_limit: int | None = None,
-    sys_dim: int = 3,
-):
-    """Return kinetic + ionic (+ optional Hartree) matrices for all k-points: shape (nk, nb, nb).
-
-    When `include_hartree` is True the valence Hartree potential V_H is
-    constructed from the occupied states and added to the returned matrices.
-
-    Parameters
-    ----------
-    sys_dim : int
-        System dimensionality (0, 2, or 3).  Controls Coulomb truncation
-        for V_loc: ``truncation_2d=True`` only when ``sys_dim == 2``.
-    """
-    from psp.operator_checks import validate_operator_inputs
-    ctx = validate_operator_inputs(
-        pseudos=pseudos, wfn=wfn, sys_dim=sys_dim, caller="get_kin_ion",
-    )
-    # Reshard to ensure k is sharded across mesh as in main flow
-    k_xy_shard = NamedSharding(mesh_xy, P(('x','y'), None, None, None, None, None))
-    wfn_k_sharded = jax.lax.with_sharding_constraint(global_psi_G, k_xy_shard)
-
-    # Structure setup
-    with timing.section("psp.get_DFT_mtxels.get_kin_ion.structure_setup") as timer_struct:
-        atom_positions = jnp.asarray(wfn.atom_crys, dtype=jnp.float64)
-        atom_types = jnp.asarray(wfn.atom_types, dtype=jnp.int32)
-        if assignments is None:
-            assignments = build_atom_pp_assignments(atom_positions, atom_types, pseudos)
-        if species_payload is None:
-            tmp: dict[int, dict[str, object]] = {}
-            for ap in assignments:
-                pseudo = ap.pseudo
-                if pseudo is None:
-                    continue
-                key = id(pseudo)
-                entry = tmp.setdefault(key, {"pseudo": pseudo, "positions": []})
-                entry["positions"].append(np.asarray(ap.position, dtype=float))
-            species_payload = [
-                (
-                    e["pseudo"],
-                    np.asarray(e["positions"], dtype=float) if e["positions"] else np.zeros((0, 3), dtype=float),
-                )
-                for e in tmp.values()
-            ]
-        timer_struct.watch(assignments, species_payload)
-
-    # Precompute G scaffolding once; unified VNL setup reconstructs per-k K on device.
-    with timing.section("psp.get_DFT_mtxels.get_kin_ion.k_scaffolding") as timer_kprep:
-        Gk_crys_all: list[jnp.ndarray] = []
-        for i in range(sym.nk_tot):
-            Gk_crys_i, _ = generate_gvectors_k(i, sym, wfn, meta)
-            Gk_crys_all.append(jnp.asarray(Gk_crys_i, dtype=jnp.int32))
-        timer_kprep.watch(Gk_crys_all)
-
-    # Build fixed-size G pads for local terms, and one shared VNL setup.
-    nG_list = []
-    for Gk_crys_i in Gk_crys_all:
-        nG_list.append(int(Gk_crys_i.shape[0]))
-
-    nG_max = max(nG_list) if nG_list else 0
-    Gk_crys_pad: list[jnp.ndarray] = []
-    G_mask: list[jnp.ndarray] = []
-    for i in range(sym.nk_tot):
-        Gcur = jnp.asarray(Gk_crys_all[i], dtype=jnp.int32)
-        nG = int(Gcur.shape[0])
-        if nG < nG_max:
-            pad = nG_max - nG
-            Gpad = jnp.pad(Gcur, ((0, pad), (0, 0)))
-            mask = jnp.concatenate([jnp.ones((nG,), dtype=jnp.float64), jnp.zeros((pad,), dtype=jnp.float64)])
-        else:
-            Gpad = Gcur
-            mask = jnp.ones((nG_max,), dtype=jnp.float64)
-        Gk_crys_pad.append(Gpad)
-        G_mask.append(mask)
-
-    # Build unified VNL setup once for all k.
-    with timing.section("psp.get_DFT_mtxels.get_kin_ion.plan_build"):
-        vnl_setup = vnl_ops.build_vnl_setup(
-            wfn,
-            sym,
-            meta,
-            pseudos,
-            nspinor=int(wfn.nspinor),
-        )
-
-    # Build V_loc on 2x grid once
-    with timing.section("psp.get_DFT_mtxels.get_kin_ion.build_V_loc") as timer_vloc:
-        V_loc_r = build_local_ionic_potential_on_G_total(
-            assignments=[
-                {"pseudo": ap.pseudo, "position": np.asarray(ap.position, dtype=float)} for ap in assignments
-            ],
-            species_groups=[
-                (
-                    sp[0],
-                    (np.asarray(sp[1], dtype=float) if np.asarray(sp[1]).size > 0 else np.zeros((0, 3), dtype=float)),
-                )
-                for sp in species_payload
-            ],
-            fft_grid=tuple(int(x) for x in meta.fft_grid),
-            bdot=np.asarray(wfn.bdot, dtype=float),
-            cell_volume=float(wfn.cell_volume),
-            bvec=np.asarray(wfn.bvec, dtype=float),
-            blat=float(wfn.blat),
-            truncation_2d=ctx.truncation_2d,
-        )
-        V_loc_r = jnp.asarray(V_loc_r, dtype=jnp.float64)
-        # Avoid forcing device sync here; leave compute lazy
-
-    V_H_r = None
-    if include_hartree:
-        if int(wfn.nelec) > wfn_k_sharded.shape[1]:
-            raise ValueError(
-                f"include_hartree=True requires at least nelec={wfn.nelec} bands (got {wfn_k_sharded.shape[1]})"
-            )
-        print("  Computing valence density and Hartree potential for kin+ion...")
-        with timing.section("psp.get_DFT_mtxels.get_kin_ion.hartree") as timer_hartree:
-            # ρ must land on the SAME grid as the ψ FFT box, since
-            # ``compute_local_V_k`` forms ψ(r)·V_H(r) pointwise.  A
-            # ``wfn.grid_rho`` set to the 2× grid (as get_DFT_mtxels.main
-            # does) would silently broadcast-fail or, worse, mis-scale.
-            _grid_rho = getattr(wfn, 'grid_rho', None)
-            _box = tuple(int(x) for x in wfn_k_sharded.shape[-3:])
-            if _grid_rho is not None and tuple(int(x) for x in _grid_rho) != _box:
-                raise ValueError(
-                    f"get_kin_ion(include_hartree=True): wfn.grid_rho={tuple(_grid_rho)} "
-                    f"but the ψ FFT box is {_box}.  V_H must be evaluated on the "
-                    "ψ box grid — clear grid_rho or set it to the ψ FFT grid."
-                )
-            rho_valence = compute_valence_density(wfn_k_sharded, sym, wfn)
-            # Coulomb convention is inherited from the deck's sys_dim —
-            # NOT hardwired.  It must agree with the V_loc truncation
-            # above and with the DFT run that produced E_DFT / vxc.dat
-            # (QE ``assume_isolated='2D'`` ⇒ truncated Hartree as well).
-            V_H_r = build_hartree_potential(
-                rho_valence, wfn,
-                truncation_2d=ctx.truncation_2d,
-                expected_electrons=(
-                    spin_degeneracy_factor(wfn) * float(wfn.nelec)),
-            )
-
-    # Allocate output and compute per-k
-    nk, nb_total = wfn_k_sharded.shape[0], wfn_k_sharded.shape[1]
-    nb = int(nb_total)
-    if nb_limit is not None:
-        nb = max(1, min(nb, int(nb_limit)))
-    kin_ion = np.zeros((nk, nb, nb), dtype=np.complex128)
-    bdot_j = jnp.asarray(wfn.bdot, dtype=jnp.float64)
-    for i in range(sym.nk_tot):
-        with timing.section("psp.get_DFT_mtxels.get_kin_ion.k_loop") as timer_kloop:
-            wfn_k = wfn_k_sharded[i, :nb]
-            kpoint = jnp.asarray(sym.unfolded_kpts[i], dtype=jnp.float64)
-            Gk_crys = Gk_crys_pad[i]
-            with timing.section("psp.get_DFT_mtxels.get_kin_ion.compute_T"):
-                T_k = compute_kinetic_k(wfn_k, Gk_crys, kpoint, bdot_j, G_mask[i])
-            with timing.section("psp.get_DFT_mtxels.get_kin_ion.compute_V_loc"):
-                V_ion_k = compute_local_V_k(wfn_k, Gk_crys, V_loc_r, wfn.cell_volume, G_mask[i])
-            with timing.section("psp.get_DFT_mtxels.get_kin_ion.compute_V_NL"):
-                kdata = vnl_ops.build_vnl_kdata_from_kvec(
-                    np.asarray(kpoint, dtype=float),
-                    np.asarray(Gk_crys_all[i], dtype=int),
-                    vnl_setup,
-                )
-                V_NL_k = vnl_matrix_from_kdata(wfn_k, Gk_crys_all[i], kdata)
-            total_k = T_k + V_ion_k + V_NL_k
-            if include_hartree:
-                with timing.section("psp.get_DFT_mtxels.get_kin_ion.compute_V_H"):
-                    V_H_k = compute_local_V_k(wfn_k, Gk_crys, V_H_r, wfn.cell_volume, G_mask[i])
-                total_k = total_k + V_H_k
-            kin_ion[i] = np.asarray(total_k)
-            timer_kloop.watch(kin_ion[i])
-
-    return kin_ion
-
-
-def write_kin_ion_h5(kin_ion: np.ndarray, out_path: str = 'kin_ion.h5') -> None:
-    """Write kin+ion array (nk, nb, nb) to an HDF5 file with dataset 'kin_ion'."""
-    with h5py.File(out_path, 'w') as h5:
-        dset = h5.create_dataset('kin_ion', data=kin_ion)
-        dset.attrs['description'] = 'Kinetic + ionic (local + nonlocal) matrix elements, shape (nk, nb, nb)'
-
+# ---------------------------------------------------------------------------
+# REMOVED 2026-07-30 (owner decision D10 workstream): ``get_kin_ion`` and
+# ``write_kin_ion_h5``.
+#
+# They computed T + V_loc + V_NL (+ optional V_H) for all k and wrote
+# ``kin_ion.h5`` — the same physics, the same dataset name and the same
+# output PATH as ``gw.kin_ion_io``, which is the route the GW pipeline
+# actually reads and which is pinned to pw2bgw's ``kih.dat`` at
+# rms 6.19e-5 eV / max 2.39e-4 eV (job 7882058).  Three reasons the
+# duplicate had to go rather than be kept as a reference:
+#
+# 1. WRONG COULOMB CONVENTION FROM THIS MODULE'S OWN CLI.  ``get_kin_ion``
+#    defaulted to ``sys_dim=3``; ``main()`` called it without one.  So on
+#    any slab deck it built V_loc 3D-periodic while ``get_H_matrix_elements``
+#    100 lines earlier hardwired ``truncation_2d=True`` — and then wrote the
+#    result to ``<input_dir>/kin_ion.h5``, silently clobbering the correct
+#    file with a wrong-convention, V_H-free one.  Inside H0's ~500 eV
+#    cancellation that is not a small error.
+# 2. IT DID NOT DISTRIBUTE.  Every rank held a replicated
+#    ``np.zeros((nk, nb, nb))`` (1.0 GiB at nb=2048) and pulled each k out
+#    of a k-SHARDED global array one at a time — a gather per k.
+#    ``gw.kin_ion_io`` partitions the k loop and gathers once.
+# 3. Its one genuinely useful idea — building ``Gk_crys_pad`` + ``G_mask``
+#    and passing the mask so every k presents one shape — is now the
+#    ``psp.dft_operators.PaddedGVectors`` route, used by ``gw.kin_ion_io``
+#    and gated at 1e-12 by tests/test_kin_ion_padded_gvectors.py.
+#
+# ``get_H_matrix_elements`` below is KEPT: its k=0 per-term decomposition
+# (K / V_ion / V_H / V_NL written to k0_diag.txt) has no replacement.
+# ---------------------------------------------------------------------------
 
 
 
@@ -899,8 +744,13 @@ def main(argv=None):
     ncond = params["ncond"] 
     nband = params["nband"]
     bispinor = params["bispinor"]
-    
-    print(f"Parameters: nval={nval}, ncond={ncond}, nband={nband}, bispinor={bispinor}")
+    # The deck owns the Coulomb convention.  Absent sys_dim, 3 (bulk) is
+    # the same default gw.kin_ion_io uses, so the two CLIs cannot disagree
+    # by accident on the same deck.
+    sys_dim = int(params.get("sys_dim") if params.get("sys_dim") is not None else 3)
+
+    print(f"Parameters: nval={nval}, ncond={ncond}, nband={nband}, "
+          f"bispinor={bispinor}, sys_dim={sys_dim}")
     
     # Load wavefunction file
     print(f"\nLoading wavefunction file: {os.path.basename(params['wfn_file'])}")
@@ -939,15 +789,9 @@ def main(argv=None):
           f"({'input' if _ecutrho_in is not None else 'default=WFN ecutwfc'}); "
           f"rho grid = {wfn.grid_rho}")
     
-    # Set up JAX device mesh
-    total_devices = jax.process_count() * jax.local_device_count()
-    grid_x = int(np.sqrt(total_devices))
-    while total_devices % grid_x != 0:
-        grid_x -= 1
-    grid_y = total_devices // grid_x
-    devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
-    mesh_xy = Mesh(devices_2d, ['x', 'y'])
-    print(f"JAX device mesh: {grid_x}x{grid_y} = {total_devices} devices")
+    mesh_xy = prepare_mesh(print_fn=print)
+    print(f"JAX device mesh: {'x'.join(str(int(n)) for n in mesh_xy.devices.shape)}"
+          f" = {int(mesh_xy.devices.size)} devices")
     
     # Load G-vectors and wavefunction coefficients
     print("\nLoading wavefunction coefficients to devices...")
@@ -967,7 +811,9 @@ def main(argv=None):
     
     # Compute DFT Hamiltonian matrix elements
     print(f"\nComputing DFT Hamiltonian matrix elements...")
-    H_DFT, rho_valence, k0 = get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valrange)
+    H_DFT, rho_valence, k0 = get_H_matrix_elements(
+        wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valrange,
+        sys_dim=sys_dim)
     print(f"  Hamiltonian matrix elements shape: {H_DFT.shape}")
     
     print(f"  Total electrons in system: {wfn.nelec}")
@@ -1064,14 +910,13 @@ def main(argv=None):
     print("\nDFT Hamiltonian calculation completed successfully!")
     print("="*60)
 
-    # Optionally write kin_ion for this run
-    try:
-        kin_ion = get_kin_ion(global_psi_G, wfn, sym, pseudos, meta, mesh_xy)
-        out_h5 = os.path.join(input_dir, 'kin_ion.h5')
-        write_kin_ion_h5(kin_ion, out_h5)
-        print(f"Wrote kin+ion matrices to {out_h5}")
-    except Exception as e:
-        print(f"Warning: failed to write kin_ion.h5 ({e})")
+    # NO kin_ion.h5 IS WRITTEN HERE any more.  This CLI is the per-term
+    # H(k=0) DIAGNOSTIC; the generator is ``python -m gw.kin_ion_io``, which
+    # inherits the deck's sys_dim, distributes the k loop and stores V_H as
+    # its own dataset.  Writing both from here is what let a 3D-truncated
+    # file overwrite a 2D-truncated one — see the removal note above.
+    print("kin_ion.h5 is NOT written by this diagnostic; "
+          "use `python -m gw.kin_ion_io -i <deck> -o kin_ion.h5`.")
 
     timing.report(title="--- Timing (seconds) ---")
 

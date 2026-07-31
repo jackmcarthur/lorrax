@@ -12,6 +12,15 @@ Public API (Hamiltonian construction + application):
   apply_H_k            — fused JIT H|ψ⟩, psi_box donated; 2 ms on A100 for Si
   build_matrix_k       — full ⟨m|H|n⟩ matrix
 
+Public API (G-vector layout):
+  padded_gvectors       — the loader's FIXED-shape (nk, ngkmax, 3) table
+                          + pad mask, as a PaddedGVectors.  THE ROUTE
+                          every operator in this package takes.
+  generate_gvectors_k_padded — per-k twin of the above
+  generate_gvectors_k   — one k's RAGGED (ngk[ik], 3) G-list.  Retained
+                          as the D10 comparison reference (and for
+                          misc/ scripts); no production consumer left.
+
 Public API (per-component builders):
   build_T_diag          — |k+G|² + G-indices from SymMaps
   build_T_diag_from_kvec — same from explicit k-vector + ecutwfc (no SymMaps)
@@ -133,29 +142,142 @@ def poisson_potential_from_rhoG(
     return jnp.real(jnp.fft.ifftn(V_G, norm='ortho'))
 
 
-def generate_gvectors_k(kpoint_idx, sym, wfn, meta):
-    """G-vectors for one k-point via SymMaps (GW path).
+def _as_loader(wfn):
+    """The ``WfnLoader`` behind ``wfn`` — never a second file handle if
+    one can be avoided.
 
-    Returns (Gk_crys, kpoint_crys): (nG, 3) int and (3,) float.
+    Re-opening the file costs a fresh ``(ngktot, 3)`` G-table on the
+    host (hundreds of MB at CrI3-class ``ngktot``), so the legacy
+    ``WFNReader`` fallback exists only for tests that still hold the old
+    reader object.
+    """
+    from file_io.wfn_loader import WfnLoader as _WFNLoader
+    if isinstance(wfn, _WFNLoader):
+        return wfn
+    return _WFNLoader(wfn._filename)
+
+
+def generate_gvectors_k(kpoint_idx, sym, wfn, meta):
+    """G-vectors for one k-point via SymMaps (GW path) — **ragged**.
+
+    LEGACY / REFERENCE.  Every operator in ``psp`` and ``gw.kin_ion_io``
+    now takes :func:`padded_gvectors`; this is kept because owner
+    decision D10 gates the padded route *against* it, so the comparison
+    needs both routes to stay callable from one process.
+
+    Returns (Gk_crys, kpoint_crys): (ngk[ik], 3) int and (3,) float.
 
     Post-P5 migration: ``sym.get_gvecs_kfull`` moved into ``WfnLoader``;
     re-fetch the full-BZ G-table from the loader and slice the single
     requested k.  ``WfnLoader`` caches the table so this is cheap on
     repeated calls.
+
+    The slice back to ``ngk[ik]`` is what makes every consumer's per-k
+    kernel recompile once per DISTINCT ``ngk`` and blocks ``lax.scan``
+    over k.  Consumers that can carry a mask should use
+    :func:`padded_gvectors` instead — the loader's table is *already*
+    the padded one, so the fixed-shape route is strictly less work.
     """
     kpoint_crys = jnp.asarray(sym.unfolded_kpts[kpoint_idx], dtype=jnp.float64)
-    from file_io.wfn_loader import WfnLoader as _WFNLoader
-    if isinstance(wfn, _WFNLoader):
-        loader = wfn
-    else:
-        # Legacy WFNReader fallback (kept for tests that still hold the
-        # old reader object).  Rebuild a loader against the same file.
-        loader = _WFNLoader(wfn._filename)
+    loader = _as_loader(wfn)
     gvecs_full = loader.gvecs(k="full_bz")           # (n_full, ngkmax, 3) int32
     ngk_full = loader.ngk_valid(k="full_bz")         # (n_full,) int32
     nk = int(kpoint_idx)
     Gk_crys = jnp.asarray(gvecs_full[nk, : int(ngk_full[nk])], dtype=jnp.int32)
     return Gk_crys, kpoint_crys
+
+
+@dataclass(frozen=True)
+class PaddedGVectors:
+    """Every k's G-list at ONE fixed shape ``(n_k, ngkmax, 3)`` + its mask.
+
+    This is the *native* layout of ``WfnLoader.gvecs()``: the loader
+    stores the G table zero-padded to the file's ``ngkmax`` and reports
+    the logical extent separately through ``ngk_valid()``.
+    :func:`generate_gvectors_k` throws that away by slicing back to
+    ``ngk[ik]``; this class hands it over intact, plus the 1/0 mask that
+    makes the pad columns inert.
+
+    Why the fixed shape is worth carrying a mask for
+    ------------------------------------------------
+    ``ngk`` differs between k, so a ragged G-list gives every per-k
+    kernel a different operand shape.  That costs one JIT lowering per
+    DISTINCT ``ngk`` (bounded by the IBZ k-count), it forces one device
+    dispatch — and therefore one blocking readback — per k, and it makes
+    ``lax.scan`` over the k loop illegal outright, since scan requires
+    the carried shapes to be uniform.
+
+    Pad-column contract
+    -------------------
+    Pad rows hold the G-vector ``(0, 0, 0)``, which is a *valid* FFT-box
+    index that aliases the physical Γ component — so a consumer that
+    forgets the mask silently double-counts ψ(G=0), it does not crash.
+    Every consumer must therefore multiply one factor of each contraction
+    over G by :attr:`mask`.  The kernels that take a ``g_mask`` argument
+    (``psp.get_DFT_mtxels.compute_kinetic_k`` /
+    ``compute_local_V_k``, ``dft_operators.gather_psi_G``) already do
+    exactly that.
+
+    On the arithmetic: appending exact zeros does not change a sum
+    (``x + 0.0 == x`` in IEEE-754).  What a shape change does move is
+    XLA's choice of reduction BLOCKING, so the ragged route already had a
+    per-``ngk``-dependent association and this one makes the association
+    UNIFORM across k.  Neither is "the" reference; agreement between them
+    is what is checked (owner decision D10, gate 1e-12).
+    """
+
+    gvecs: np.ndarray        # (n_k, ngkmax, 3) int32, zero-padded
+    mask: np.ndarray         # (n_k, ngkmax) float64, 1 valid / 0 pad
+    ngk: np.ndarray          # (n_k,) int32 — logical extent per k
+
+    @property
+    def ngkmax(self) -> int:
+        return int(self.gvecs.shape[1])
+
+    @property
+    def n_k(self) -> int:
+        return int(self.gvecs.shape[0])
+
+    def at(self, ik: int) -> tuple[np.ndarray, np.ndarray]:
+        """``(G_pad, mask)`` for one k — host arrays, no device traffic."""
+        j = int(ik)
+        return self.gvecs[j], self.mask[j]
+
+
+def padded_gvectors(wfn, *, k="full_bz") -> PaddedGVectors:
+    """The loader's fixed-shape ``(n_k, ngkmax, 3)`` G table + pad mask.
+
+    Costs nothing beyond what the ψ loader already builds: ``gvecs()``
+    and ``ngk_valid()`` are memoised on the loader, and
+    ``WfnLoader.box_index`` (which every FFT-box load calls) has already
+    materialised the same table.  The only new array is the ``(n_k,
+    ngkmax)`` f64 mask — 0.25 MB at MoS₂ 4×4, 23 MB at a 144-k /
+    20000-G deck.
+
+    ``k`` is any ``WfnLoader`` k-spec (``"full_bz"``, ``"ibz"``, or an
+    explicit index list), so a rank can build the table for exactly the
+    k it owns.
+    """
+    loader = _as_loader(wfn)
+    gvecs = np.asarray(loader.gvecs(k=k), dtype=np.int32)
+    ngk = np.asarray(loader.ngk_valid(k=k), dtype=np.int32)
+    cols = np.arange(int(gvecs.shape[1]), dtype=np.int32)[None, :]
+    mask = (cols < ngk[:, None]).astype(np.float64)
+    return PaddedGVectors(gvecs=gvecs, mask=mask, ngk=ngk)
+
+
+def generate_gvectors_k_padded(kpoint_idx, sym, wfn, meta):
+    """Per-k twin of :func:`generate_gvectors_k`, fixed-shape.
+
+    Returns ``(Gk_pad, g_mask, kpoint_crys)`` with ``Gk_pad`` at
+    ``(ngkmax, 3)`` and ``g_mask`` at ``(ngkmax,)``.  Prefer
+    :func:`padded_gvectors` when sweeping more than one k — it builds the
+    mask once for the whole table instead of once per call.
+    """
+    kpoint_crys = jnp.asarray(sym.unfolded_kpts[kpoint_idx], dtype=jnp.float64)
+    tab = padded_gvectors(wfn, k="full_bz")
+    G_pad, g_mask = tab.at(kpoint_idx)
+    return jnp.asarray(G_pad, dtype=jnp.int32), g_mask, kpoint_crys
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -220,16 +342,34 @@ def build_T_diag(
     wfn,
     sym,
     meta,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    *,
+    gvectors: PaddedGVectors | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, np.ndarray]:
     """Kinetic diagonal |k+G|² and G-vector FFT-box indices (SymMaps path).
 
-    Returns (T_diag, Gx, Gy, Gz) where T_diag is (nG,) float64 in Ry
-    and Gx, Gy, Gz are (nG,) int32 FFT-box indices.
+    Returns ``(T_diag, Gx, Gy, Gz, g_mask)``, all at the loader's FIXED
+    ``ngkmax``: ``T_diag`` is ``(ngkmax,)`` float64 in Ry, ``Gx/Gy/Gz``
+    are ``(ngkmax,)`` int32 FFT-box indices and ``g_mask`` is
+    ``(ngkmax,)`` float64, 1 on the ``ngk[k]`` physical rows and 0 on the
+    pad.
+
+    Pad rows carry ``G = (0,0,0)``, so ``T_diag`` there is ``|k|²`` — a
+    finite, physically-meaningless value that :func:`setup_H_k` replaces
+    with its ``1e10`` preconditioner sentinel.  The mask is what makes
+    the pad inert; it is returned rather than left implicit because
+    ``(0,0,0)`` is a VALID box index that aliases Γ, so a consumer that
+    drops it double-counts ψ(G=0) instead of crashing.
+
+    Pass ``gvectors`` to reuse one :class:`PaddedGVectors` table across a
+    k sweep instead of rebuilding it per k.
     """
     kvec = np.asarray(sym.unfolded_kpts[k_idx], dtype=float)
 
-    Gk_crys, _ = generate_gvectors_k(k_idx, sym, wfn, meta)
-    return _T_diag_from_G(np.asarray(Gk_crys, dtype=int), kvec, wfn.bdot)
+    tab = padded_gvectors(wfn, k="full_bz") if gvectors is None else gvectors
+    G_pad, g_mask = tab.at(k_idx)
+    T_diag, Gx, Gy, Gz = _T_diag_from_G(
+        np.asarray(G_pad, dtype=int), kvec, wfn.bdot)
+    return T_diag, Gx, Gy, Gz, g_mask
 
 
 def build_T_diag_from_kvec(
@@ -355,11 +495,14 @@ def build_vnl_kdata(
     sym,
     meta,
     nspinor: int | None = None,
+    gvectors: PaddedGVectors | None = None,
 ):
     """Dense VNL projectors (Z, E) for one k-point via vnl_ops.
 
     Returns (vnl_Z, vnl_E) where:
-      vnl_Z : (total_R, nG) — all channels × atoms × betas concatenated
+      vnl_Z : (total_R, ngkmax) — all channels × atoms × betas concatenated,
+              already zero on the pad columns (see
+              ``vnl_ops.build_vnl_kdata``), so no caller-side mask is needed
       vnl_E : (nspinor, nspinor, total_R, total_R) — block-diagonal D matrix
     """
     import psp.vnl_ops as vnl_ops
@@ -367,7 +510,8 @@ def build_vnl_kdata(
     if nspinor is None:
         nspinor = int(meta.nspinor)
 
-    kdata = vnl_ops.build_vnl_kdata(k_idx, vnl_setup, wfn, sym, meta)
+    kdata = vnl_ops.build_vnl_kdata(k_idx, vnl_setup, wfn, sym, meta,
+                                     gvectors=gvectors)
     return kdata.Z, kdata.E_super
 
 
@@ -483,6 +627,7 @@ def setup_H_k(
     meta,
     V_loc_r: jax.Array | None = None,
     ngkmax: int | None = None,
+    gvectors: PaddedGVectors | None = None,
 ) -> HamiltonianK:
     """Assemble all per-k Hamiltonian data (SymMaps path).
 
@@ -494,23 +639,36 @@ def setup_H_k(
     wfn, sym, meta : standard LORRAX objects
     V_loc_r : (nx, ny, nz) — ionic local potential alone, for h_diag.
         If None, h_diag falls back to T_diag only.
-    ngkmax : int, optional — pad all arrays to this size for uniform JIT.
-        Compute once via ``compute_ngkmax`` and pass to every k-point.
+    ngkmax : int, optional — pad beyond the loader's own ``ngkmax``.
+        The G table is ALREADY fixed-shape at the file's ``ngkmax``, so
+        this is only needed when a caller wants a still larger uniform
+        size; a smaller value is refused rather than silently truncating
+        a k's physical G-sphere.
+    gvectors : PaddedGVectors, optional — reuse one table across a sweep.
     """
-    T_diag, Gx, Gy, Gz = build_T_diag(k_idx, wfn, sym, meta)
-    nG_actual = int(Gx.shape[0])
+    T_diag, Gx, Gy, Gz, g_mask = build_T_diag(
+        k_idx, wfn, sym, meta, gvectors=gvectors)
+    nG_actual = int(np.count_nonzero(g_mask))
+    nG_pad = int(g_mask.shape[0])
 
-    # Pad G-vectors BEFORE building VNL so _table_interp sees uniform shapes
-    if ngkmax is not None and ngkmax > nG_actual:
-        pad = ngkmax - nG_actual
-        T_diag = jnp.pad(T_diag, (0, pad), constant_values=1e10)
+    if ngkmax is not None and int(ngkmax) < nG_pad:
+        raise ValueError(
+            f"setup_H_k: ngkmax={int(ngkmax)} is smaller than the loader's "
+            f"own padded width {nG_pad}; truncating would drop physical "
+            f"G-vectors at the k with the largest ngk.")
+    if ngkmax is not None and int(ngkmax) > nG_pad:
+        pad = int(ngkmax) - nG_pad
+        T_diag = jnp.pad(T_diag, (0, pad), constant_values=0.0)
         Gx = jnp.pad(Gx, (0, pad), constant_values=0)
         Gy = jnp.pad(Gy, (0, pad), constant_values=0)
         Gz = jnp.pad(Gz, (0, pad), constant_values=0)
-        mask = jnp.concatenate([jnp.ones(nG_actual, dtype=jnp.bool_),
-                                jnp.zeros(pad, dtype=jnp.bool_)])
-    else:
-        mask = jnp.ones(nG_actual, dtype=jnp.bool_)
+        g_mask = np.concatenate([g_mask, np.zeros(pad, dtype=g_mask.dtype)])
+
+    mask = jnp.asarray(g_mask, dtype=jnp.bool_)
+    # Pad rows hold G=(0,0,0), i.e. T = |k|² there.  Restore the 1e10
+    # preconditioner sentinel the padded path has always published, so
+    # anything reading ``HamiltonianK.T_diag`` sees the same thing.
+    T_diag = jnp.where(mask, T_diag, jnp.asarray(1e10, dtype=T_diag.dtype))
 
     # Build VNL at padded size — one JIT trace for all k-points
     Gk_int = np.stack([np.asarray(Gx), np.asarray(Gy), np.asarray(Gz)], axis=-1)
@@ -1108,15 +1266,20 @@ def compute_dipole_all(wfn, sym, meta, vnl_plan, B, nb=None):
     deltaE = np.zeros((nk, nb, nb), dtype=np.float64)
     energies = np.asarray(wfn.energies)
 
+    # One fixed-shape G table for the whole sweep.  Masking ψ_G alone is
+    # sufficient here: every contraction downstream — the kinetic
+    # 2(k+G)·ψ in ``momentum_matrix_k`` and both halves of
+    # ``vnl_velocity_from_dZ`` — closes against ``conj(psi_G)``, so a
+    # zero at a pad column kills that column's contribution even though
+    # Z/dZ are finite there.
+    gtab = padded_gvectors(wfn, k="full_bz")
+
     for ik in range(nk):
         with timing.section(f"dipole_k{ik}"):
             wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)
-            Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
-            psi_G = wfn_k[:, :,
-                          np.asarray(Gk_crys)[:, 0],
-                          np.asarray(Gk_crys)[:, 1],
-                          np.asarray(Gk_crys)[:, 2]]
-            G_int = jnp.asarray(np.asarray(Gk_crys, dtype=int), dtype=jnp.int32)
+            G_pad, g_mask = gtab.at(ik)
+            psi_G = gather_psi_G_from_crys(wfn_k, G_pad, g_mask)
+            G_int = jnp.asarray(G_pad, dtype=jnp.int32)
             k_j = jnp.asarray(sym.unfolded_kpts[ik], dtype=jnp.float64)
 
             Z_dZ_E = build_Z_and_dZ(k_j, G_int, B_j, channels)

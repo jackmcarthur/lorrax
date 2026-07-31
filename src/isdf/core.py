@@ -1648,15 +1648,46 @@ def _factor_c_q_replicated(
                 # much.  It lives inside the jit, so print it from there.
                 # ``n_keep`` per q + the spectral span λ_max/λ_min(kept).
                 # Silence with LORRAX_ZETA_RANK_LOG=0.
+                #
+                # THE CRITERION, stated: ``keep`` above is NOT a search for a
+                # gap in λ — a real ISDF charge spectrum is smooth and has
+                # none.  It is a CAP on how much C⁺ may amplify round-off:
+                # κ_eff = λ_max/λ_min(kept) ≤ 1/zeta_rcond by construction.
+                # ``common/rank_criterion`` carries the derivation, the three
+                # standard alternatives (discrepancy principle / L-curve /
+                # GCV) and the measurement that refutes each of them here.
+                #
+                # The three extra fields below are the ones a run needs in
+                # order to be auditable without a sweep:
+                #   kappa/q     achieved amplification — the invariant
+                #   ldrop_hi/q  the LARGEST discarded λ, i.e. the top of the
+                #               discarded band (paired with lam_min_kept it
+                #               gives the whole cut, and shows there is no
+                #               plateau at the cut — there never is)
+                #   margin/q    fractional rank inflation from loosening
+                #               rcond by 1e-4.  §R19 measured +41 % of rank
+                #               costing 5000 eV, so a LARGE margin means the
+                #               basis is over-complete and rcond must NOT be
+                #               loosened on this run.
                 if _rank_log:
                     lam_keep_min = jnp.min(
                         jnp.where(keep, lam, jnp.inf), axis=-1)
+                    n_keep = jnp.sum(keep, axis=-1)
+                    lam_drop_hi = jnp.max(
+                        jnp.where(keep, -jnp.inf, lam), axis=-1)
+                    n_loose = jnp.sum(lam > (_rc * 1e-4 * lam_max), axis=-1)
+                    margin = (n_loose - n_keep) / jnp.maximum(n_keep, 1)
                     jax.debug.print(
                         "[zeta rank_truncate] n_log={n} rcond={rc:.1e} "
-                        "n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn}",
+                        "n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn} "
+                        "kappa/q={kp} ldrop_hi/q={dh} lam_min/q={lo} "
+                        "margin/q={mg}",
                         n=n_log, rc=_rc,
-                        k=jnp.sum(keep, axis=-1),
+                        k=n_keep,
                         mx=lam_max[..., 0], mn=lam_keep_min,
+                        kp=lam_max[..., 0] / lam_keep_min,
+                        dh=lam_drop_hi, lo=jnp.min(lam, axis=-1),
+                        mg=margin,
                         ordered=False)
                 return V * inv_sqrt[..., None, :].astype(V.dtype)
 
@@ -1965,13 +1996,30 @@ def _factor_c_q_distributed_rank_truncate(
             if rank_log:
                 # Same conditioning signal the replicated route prints —
                 # n_keep/q is what tells you n_μ has over-completed the
-                # pair-density rank.  Silence with LORRAX_ZETA_RANK_LOG=0.
+                # pair-density rank — plus the same three audit fields (see
+                # the replicated route's note and ``common/rank_criterion``):
+                # the achieved amplification κ_eff = λ_max/λ_min(kept), which
+                # the cut exists to bound at 1/rcond; the top of the discarded
+                # band; and the margin to the §R19 cliff.
+                # CAVEAT specific to this route: ``lam`` is the spectrum of
+                # the PADDED matrix [C_log 0; 0 I], so the (n_pad − n_log)
+                # eigenvalues exactly equal to 1 are pad, not physics.  They
+                # are dropped whenever rcond·λ_max > 1 (always, at production
+                # λ_max ~ 1e11 and rcond 1e-8), so n_keep is clean — but
+                # ldrop_hi can be the pad value 1.0 rather than a physical λ.
                 lam_keep_min = jnp.min(jnp.where(keep, lam, jnp.inf), axis=-1)
+                n_keep = jnp.sum(keep, axis=-1)
+                n_loose = jnp.sum(lam > (rcond * 1e-4 * lam_max), axis=-1)
                 jax.debug.print(
                     "[zeta rank_truncate/distributed] n_pad={n} rcond={rc:.1e} "
-                    "n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn}",
-                    n=n_pad, rc=rcond, k=jnp.sum(keep, axis=-1),
-                    mx=lam_max[..., 0], mn=lam_keep_min, ordered=False)
+                    "n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn} "
+                    "kappa/q={kp} ldrop_hi/q={dh} margin/q={mg}",
+                    n=n_pad, rc=rcond, k=n_keep,
+                    mx=lam_max[..., 0], mn=lam_keep_min,
+                    kp=lam_max[..., 0] / lam_keep_min,
+                    dh=jnp.max(jnp.where(keep, -jnp.inf, lam), axis=-1),
+                    mg=(n_loose - n_keep) / jnp.maximum(n_keep, 1),
+                    ordered=False)
             return inv
 
         @partial(jax.jit, out_shardings=out_sh, donate_argnums=(2,))
@@ -3224,7 +3272,10 @@ def fit_one_rchunk(
     # ``timing.section`` for per-r-chunk breakdown.  ``block_until_ready``
     # at each phase boundary is the cost of separating them — a few
     # microseconds on small kernels, dominated by the per-phase work.
-    _dbg = bool(os.environ.get("LORRAX_RCHUNK_DEBUG"))
+    # Same knob, same grammar as gw/isdf_fitting.py:937.  This was a bare
+    # presence test, so ``LORRAX_RCHUNK_DEBUG=0`` turned the debug path ON
+    # here and OFF there — one knob, two answers, in the same r-chunk loop.
+    _dbg = _env_bool("LORRAX_RCHUNK_DEBUG", False)
     # Per-phase host-RSS deltas: on CPU the XLA arena is invisible to
     # ``memory_stats()``, so attributing the per-r-chunk anonymous ramp
     # to z_q_build vs solve needs the kernel's own accounting.

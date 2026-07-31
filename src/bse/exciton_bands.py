@@ -109,6 +109,9 @@ def _gather_host(x):
     """Gather a ``jax.Array`` to a full host numpy array, identical on every
     process, whether it is REPLICATED or PROCESS-SPANNING.
 
+    ONE line of delegation to :func:`common.collectives.gather_to_host`, and
+    the reasoning stays HERE because this driver is where it was learned:
+
     ``jax.device_get`` raises on an array whose shards live on OTHER processes
     (the diagnostic gate's Q-shifted ψ_c is μ-sharded ``P(...,'x')``, so on a
     16-process / 4-node run no single process holds it all) — those need
@@ -117,15 +120,30 @@ def _gather_host(x):
     FULLY-ADDRESSABLE array (replicated, or single-process) must NOT go through
     ``process_allgather(tiled=True)`` — that concatenates each process's full
     copy and DUPLICATES the leading axis (e.g. eps_c (144,·) → (16·144,·)).  So
-    branch on ``is_fully_addressable``: ``device_get`` when the whole array is
-    local, ``process_allgather`` only when shards are remote.  The branch is a
-    global property (identical on every process), so the collective stays in
-    lockstep.  On one process everything is fully addressable ⇒ plain device_get.
+    the service branches on ``is_fully_addressable``: ``device_get`` when the
+    whole array is local, ``process_allgather`` only when shards are remote.
+    The branch is a global property (identical on every process), so the
+    collective stays in lockstep.  On one process everything is fully
+    addressable ⇒ plain device_get.
+
+    WHAT THIS DRIVER ACTUALLY FEEDS IT, NOW.  Only ``evs_dev`` — the
+    block-Lanczos Ritz values, ``P()``-sharded.  The driver's own log line
+    records that such an array reports ``fully_addressable=False`` at P=64
+    (job 7882507), so it takes the service's ``is_fully_replicated`` arm: a
+    LOCAL buffer read, no collective.  The one caller that used to hand this
+    function a μ-sharded, genuinely process-spanning array — the on-grid
+    diagnostic gate — no longer does; it contracts μ on device instead (see
+    :func:`_gate_stats_on_device` for the three warm-up attempts that failed
+    to make that gather work under impl=mpi).  So this driver now issues no
+    cross-process host gather at all.
+
+    The branch still matters and is still gated in
+    ``tests/test_bse_gather_and_mesh.py``, because at 64 ranks the wrong arm
+    silently returns an array 64× too long on the leading axis, and because
+    the service is shared.
     """
-    if getattr(x, "is_fully_addressable", True):
-        return np.asarray(jax.device_get(x))
-    from jax.experimental import multihost_utils
-    return np.asarray(multihost_utils.process_allgather(x, tiled=True))
+    from common.collectives import gather_to_host
+    return gather_to_host(x)
 
 
 # ===========================================================================
@@ -150,6 +168,16 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
     n_flat = nc_pad * nv_pad * nk
+    # ``krep`` (LORRAX_BSE_MATVEC_OPT): pin the FLAT Krylov vectors to
+    # replicated.  Without a constraint the (block, n_flat) axis inherits the
+    # tiling of ``sh.X`` through the reshape, so the Lanczos algebra — every
+    # reorthogonalisation dot product, the QR, the Ritz eigh — runs on a
+    # sharded 1024-long axis and each of those becomes a collective.  With it,
+    # exactly one all-gather per matvec and the rest is local.  See the dial's
+    # documentation in bse_stack_matvec for the residency it costs and why
+    # that makes it wrong at large pair dimension.
+    from .bse_stack_matvec import matvec_opts as _mv_opts
+    krylov_rep = (NamedSharding(mesh_xy, P()) if "krep" in _mv_opts() else None)
     if n_reorth is None:
         # FULL reorthogonalisation by default: exciton windows are small
         # (n_flat = nc·nv·nk ~ 10²-10⁴), the Krylov space often saturates
@@ -173,11 +201,16 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                 compute_pair_amplitude(psi_c_Y, psi_v_Y), sh.psi_y)
 
             def matvec_block(Vb):
+                if krylov_rep is not None:
+                    Vb = lax.with_sharding_constraint(Vb, krylov_rep)
                 X = Vb.reshape(block_size, nc_pad, nv_pad, nk)
                 X = lax.with_sharding_constraint(X, sh.X)
                 HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                             eps_c, eps_v, W_R, V, M_X, M_Y)
-                return HX.reshape(block_size, -1)
+                HX = HX.reshape(block_size, -1)
+                if krylov_rep is not None:
+                    HX = lax.with_sharding_constraint(HX, krylov_rep)
+                return HX
 
             evs, _ = block_lanczos_eig_jit(
                 matvec_block, n_flat, n_eig=n_eig, block_size=block_size,
@@ -223,33 +256,135 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
     return _stacks(bundle.psi_rmu_Y, bundle.enk_full)
 
 
-def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data, log=print):
+def _gate_stats_on_device(eps_ht, eps_st, psi_ht, psi_st, nc, mesh_xy):
+    """Both gate numbers computed ON DEVICE; only replicated results read back.
+
+    Returns ``(max|Δε_c|, Gram(nk, nc, nc))`` as REPLICATED arrays, read with
+    ``addressable_data(0)`` — a purely local buffer read that issues no
+    collective at all.
+
+    WHY NOT ``gather_to_host``.  Three separate attempts to make a host gather
+    work here failed on hardware at P=16 under
+    ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi``, always in the same frame and
+    always with "Communicator requested from a thread that is not the one MPI
+    was initialized from": the mesh-clique warm-up did not cover it (job
+    7882523), a ``process_allgather`` warm-up on a host operand did not (job
+    7882531), and a path-exact warm-up on a genuinely sharded operand did not
+    either (job 7882555/7882561).  ``multihost_utils.process_allgather``
+    identity-jits to ``P()``, and at this point in the program that jit
+    acquires a communicator from an intra-op pool worker; the warm-up
+    mechanism that fixes ``shard_map(psum)`` cliques does not fix it.
+
+    So stop trying to gather.  The μ contraction rides a mesh-AXIS psum, which
+    IS warmed and works; everything else here is already replicated, so the
+    host side needs no collective whatsoever.  This is also strictly cheaper:
+    the old code pulled ``nk·nc·ns·n_μ`` complex numbers to every process
+    inside a diagnostic, on the one axis the whole BSE is sharded over.
+
+    Pad slots are exact zeros on both ψ legs, so the padded μ extent is
+    carried through rather than sliced — slicing a sharded axis would be a
+    reshard, and adding zeros changes neither a norm nor an inner product.
+    """
+    rep = NamedSharding(mesh_xy, P())
+
+    @partial(jax.jit, out_shardings=(rep, rep, rep))
+    def _f(e_ht, e_st, A, B):
+        # ORDER.  htransform returns eigenvalues ASCENDING (they come out of an
+        # eigensolve); the stored restart holds them in DFT-BAND-INDEX order.
+        # QP corrections reorder bands, so those two orders differ BY
+        # CONSTRUCTION, not by error.  Differencing them index-by-index — which
+        # is what this gate did — measures the permutation, not the
+        # interpolation.
+        #
+        # Measured on run_EXB_c785 (2026-07-31): the index-wise number is
+        # 80.694 meV and is reproducible from ``eqp1.dat`` ALONE, with no
+        # htransform, no Galerkin basis and no interpolation in the arithmetic:
+        #   max_k max_{b in [26,34)} |sort(EQP)[b] - EQP[b]| = 80.6935 meV
+        #   at k=(0.25,-0.5,0), band 30, where the QP shifts push band 30 above
+        #   31 and 32.
+        # The order-matched number on the same run is 6.5e-11 meV.  The 80.694
+        # was read as this path's accuracy limit for a whole campaign.  The
+        # Perlmutter campaign hit the identical trap at a fixed 57.902 meV.
+        #
+        # ``d`` is therefore the SET comparison — did htransform recover the
+        # same conduction manifold — which is the question this gate asks.
+        # ``d_idx`` is kept and reported alongside so the permutation stays
+        # VISIBLE rather than silently folded into the accuracy number: a large
+        # d_idx with a tiny d is band reordering and is expected; a large d is
+        # the interpolation basis failing.
+        d = jnp.max(jnp.abs(jnp.sort(e_ht[:, :nc], axis=-1)
+                            - jnp.sort(e_st[:, :nc], axis=-1)))
+        d_idx = jnp.max(jnp.abs(e_ht[:, :nc] - e_st[:, :nc]))
+        A = A[:, :nc]
+        B = B[:, :nc]
+        nA = jnp.sqrt(jnp.sum(jnp.abs(A) ** 2, axis=(2, 3)))[:, :, None, None]
+        nB = jnp.sqrt(jnp.sum(jnp.abs(B) ** 2, axis=(2, 3)))[:, :, None, None]
+        G = jnp.einsum("kasm,kbsm->kab", jnp.conj(A / nA), B / nB)
+        return d, d_idx, G
+
+    return _f(eps_ht, eps_st, psi_ht, psi_st)
+
+
+def _local(x):
+    """This process's own buffer of a REPLICATED device array — no collective.
+
+    ``addressable_data(0)`` is a local read.  For a ``P()``-sharded array
+    every process holds the whole thing, so this IS the full array; unlike
+    ``gather_to_host`` it cannot issue (or refuse) a communicator request.
+    """
+    return np.asarray(jax.device_get(x.addressable_data(0))
+                      if hasattr(x, "addressable_data") else x)
+
+
+def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data,
+                              mesh_xy, log=print):
     """On-grid consistency gate at a Γ path point: htransform conduction
     ε vs the stored restart ε (max |Δ|), and the gauge-free per-k subspace
     overlap min singular value of ⟨ψ_ht|ψ_stored⟩ (bands × bands, spin+μ
     contracted).  Values printed; hard-fails only on gross breakage (>0.5
     overlap loss / >0.1 Ry ε drift) — htransform accuracy is
-    centroid-count-governed and reported, not silently trusted."""
-    eps_st = _gather_host(data["eps_c"])                  # (nk, nc_pad)
-    psi_st = _gather_host(data["psi_c_X"])                # (nk, nc_pad, ns, μ_pad)
+    centroid-count-governed and reported, not silently trusted.
+
+    ψ IS NOT GATHERED.  This used to pull both the htransform and the stored
+    μ-sharded ψ to host on every process and do the contraction in numpy.
+    Two things were wrong with that.  (1) Scaling: it is an ``O(N_μ)``
+    all-gather per process inside a DIAGNOSTIC, on the one axis the whole BSE
+    is sharded over.  (2) It did not work: at P=16 under
+    ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` the gather refuses with
+    "Communicator requested from a thread that is not the one MPI was
+    initialized from" — reproduced 6/6 and 4/4 cells in jobs 7882523 and
+    7882531, in this exact frame, and NOT cured by either of two
+    ``process_allgather`` warm-up attempts.  Contracting μ on device (where
+    the psum rides an already-warmed mesh-axis clique) removes the operand
+    that could not be gathered instead of trying harder to gather it, and
+    leaves a ``nk·nc²`` object that every process holds.
+
+    ε goes the same way: it is folded into the same jit and returned as a
+    replicated scalar, so the host side of this gate issues NO collective at
+    all — see ``_gate_stats_on_device`` for the three warm-up attempts that
+    did not make a host gather work here.
+    """
     nc = int(data["n_cond"])
-    nmu = int(data["n_rmu"])
-    eps_ht = np.asarray(eps_cQ_gamma)[:, :nc]
-    d_eps = float(np.max(np.abs(eps_ht - eps_st[:, :nc])))
-    psi_ht = np.asarray(psi_cQ_gamma)[:, :nc, :, :nmu]
+    d_dev, d_idx_dev, G_dev = _gate_stats_on_device(
+        eps_cQ_gamma, data["eps_c"], psi_cQ_gamma, data["psi_c_X"],
+        nc, mesh_xy)
+    d_eps = float(_local(d_dev))
+    d_eps_idx = float(_local(d_idx_dev))
+    G = _local(G_dev)
     smin = 1.0
-    for k in range(psi_st.shape[0]):
-        A = psi_ht[k].reshape(nc, -1)
-        B = psi_st[k, :nc, :, :nmu].reshape(nc, -1)
-        # normalize rows (htransform ψ normalized in the α metric, stored ψ
-        # in the full-r metric — only the SPAN is gauge-free at centroids)
-        A = A / np.linalg.norm(A, axis=1, keepdims=True)
-        B = B / np.linalg.norm(B, axis=1, keepdims=True)
-        s = np.linalg.svd(A.conj() @ B.T, compute_uv=False)
-        smin = min(smin, float(s.min()))
+    for k in range(G.shape[0]):
+        sv = np.linalg.svd(G[k], compute_uv=False)
+        smin = min(smin, float(sv.min()))
     d_meV = d_eps * RY2EV * 1e3
-    log(f"  [gate] htransform@Γ vs stored: max|Δε_c| = {d_meV:.3f} meV, "
+    d_meV_idx = d_eps_idx * RY2EV * 1e3
+    log(f"  [gate] htransform@Γ vs stored: max|Δε_c| = {d_meV:.6f} meV "
+        f"(order-matched; this is the accuracy number), "
         f"conduction-subspace overlap min-sval = {smin:.4f}")
+    log(f"  [gate] band-index-wise |Δε_c| = {d_meV_idx:.3f} meV — this is "
+        f"NOT an accuracy figure.  htransform returns energies ascending and "
+        f"the restart stores them in DFT-band order, so QP band reordering "
+        f"alone produces a large value here.  Compare the order-matched "
+        f"number above.")
     # The min-sval (subspace overlap) does NOT see energy corruption: an
     # over-packed interp window keeps the ψ_c SPAN (min-sval healthy) while the
     # recovered conduction ENERGIES drift by ~eV (640c/nband=80: min-sval 0.86
@@ -365,11 +500,37 @@ def main(argv=None):
                          "keeps the native fine W byte-identical.")
     args = ap.parse_args(argv)
 
+    # ---- Stage timing -----------------------------------------------------
+    # DELIBERATELY a driver-local two-column table (``name  seconds``) and NOT
+    # ``common.timing.report``: eight live campaign harnesses parse this table
+    # with ``grep htransform_psi_cQ | awk '{print $2}'``, and the collector's
+    # table puts COUNT in column 2.  Switching formats would leave every one of
+    # them reading a small integer as a wall time and reporting it as green —
+    # the void-instrument failure mode this campaign has already paid for nine
+    # times.  What IS fixed here is completeness: every phase between
+    # ``t_wall`` and the report now has a row, and the table closes with an
+    # explicit ``(untimed)`` residual so it always sums to TOTAL.  A reader can
+    # therefore tell "this accounting is complete" from "43% of the wall is
+    # somewhere else" without doing arithmetic — which is exactly what went
+    # wrong when job 7882533's 4633 s read as two phases and ~2000 s of
+    # mystery (the mystery was ``solve_scan_cold``, a fully-executed pass that
+    # WAS in the table; the reader summed the wrong two rows).
     t_wall = time.time()
     timers: dict[str, float] = {}
 
     def tick(name, t0):
         timers[name] = timers.get(name, 0.0) + (time.time() - t0)
+
+    # Work done BEFORE main(): this module's ``bootstrap()`` and every import
+    # under it.  75.0 s to first output on a cold Frontera node vs 2.1 s warm
+    # (job 7881949), and previously outside the table's clock entirely, so the
+    # printed TOTAL could be a minute short of the job's own wall.
+    from common.timing import process_elapsed_s as _proc_elapsed
+    _pre_main = _proc_elapsed()
+    if _pre_main is not None:
+        timers["imports_and_runtime"] = _pre_main
+        t_wall -= _pre_main
+    t_prologue = time.time()
 
     # Rank-0 I/O guard.  In a multi-node run (one process per GPU) the file
     # writes (.dat / .png) and progress prints must run on process 0 ONLY —
@@ -406,6 +567,13 @@ def main(argv=None):
         raise ValueError(f"{args.input} has no K_POINTS crystal_b block — "
                          "the exciton Q path comes from it (same format as "
                          "the htransform bandstructure driver)")
+
+    # Everything above — bootstrap, jax.distributed, mesh creation and its
+    # MPI clique warm-up, the input parse — is the driver prologue.  Named
+    # rather than left in the residual: at P=16 ``jax.distributed`` init alone
+    # measured 43.8 s, and on a cold node the software stack boots off Lustre
+    # for 75 s (job 7881949).  Neither is physics and neither had a row.
+    tick("prologue", t_prologue)
 
     # ── load the Q-independent BSE data (production loader) ──────────────
     t0 = time.time()
@@ -578,9 +746,16 @@ def main(argv=None):
     iGamma = [i for i in range(nQ)
               if np.linalg.norm(Qpath[i] - np.round(Qpath[i])) < 1e-9]
     if iGamma:
+        # ψ stays ON DEVICE (μ-sharded): the gate contracts μ there and only
+        # the (nk, nc, nc) Gram comes to host.  ε is replicated, so it is
+        # gathered cheaply inside the gate.  See gate_htransform_vs_stored.
+        # TIMED because it is a DIAGNOSTIC on the critical path: it runs one
+        # host ``svd`` per k.  A diagnostic is allowed to cost something; it
+        # is not allowed to cost something invisibly.
+        t0 = time.time()
         gate_htransform_vs_stored(
-            _gather_host(psi_cQ_X[iGamma[0]]),
-            _gather_host(eps_cQ[iGamma[0]]), data, log=log)
+            psi_cQ_X[iGamma[0]], eps_cQ[iGamma[0]], data, mesh_xy, log=log)
+        tick("gamma_gate", t0)
 
     # ── V_Q tiles ─ ONE shared arbitrary-Q model build.  The bse_k_grid
     #    coarse→fine general init (bse_io) calls the SAME
@@ -725,6 +900,7 @@ def main(argv=None):
     solver = build_path_solver(
         mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_eig=args.n_eig,
         block_size=args.block_size, max_iter=args.max_iter)
+    tick("w_r_and_build", t0)
     t_c0 = time.time()
     evs_dev = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                      data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R)
@@ -739,8 +915,10 @@ def main(argv=None):
     tick("solve_scan_cold", t_c0)
     if not args.skip_rerun_check:
         # warm re-run: census-clean per-Q cost + reproducibility assert.
-        # Pure diagnostic — 42% of a 40-pt 12×12 production wall (183 s);
-        # skip it with --skip-rerun-check once a configuration is trusted.
+        # Pure diagnostic — it re-executes the ENTIRE Q scan a second time.
+        # Measured share of the wall when it is on (P=64, 91 Q, job 7882533):
+        # 1767.17 s of a 4633.36 s run = 38.1%, the single largest row in the
+        # table.  ``--skip-rerun-check`` removes exactly that and nothing else.
         t_w0 = time.time()
         evs2 = _gather_host(
             solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
@@ -751,15 +929,27 @@ def main(argv=None):
             "scan re-run not reproducible"
         log(f"solve_path: cold {t_first:.2f}s (incl. ONE compile), warm "
             f"{t_warm:.2f}s = {t_warm/n_solve*1e3:.1f} ms/Q over {n_solve} Q")
+        log(f"  [diagnostic cost] the warm re-run is a REPRODUCIBILITY CHECK, "
+            f"not physics: it re-solves all {n_solve} Q and is "
+            f"{100.0*t_warm/max(time.time()-t_wall, 1e-9):.0f}% of the wall so "
+            f"far.  Pass --skip-rerun-check once this configuration is trusted.")
     else:
         log(f"solve_path: cold {t_first:.2f}s (incl. ONE compile) over "
             f"{n_solve} Q; warm re-run check SKIPPED")
+    t0 = time.time()
     mem = solver.lower(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                        data["psi_v_X"], data["psi_v_Y"], data["eps_v"],
                        W_R).compile().memory_analysis()
     log(f"solve_path memory_analysis: temp={mem.temp_size_in_bytes/2**20:.1f} MiB "
         f"args={mem.argument_size_in_bytes/2**20:.1f} MiB "
         f"out={mem.output_size_in_bytes/2**20:.1f} MiB")
+    # TIMED: this is an AOT ``lower().compile()`` of the SAME program that was
+    # just executed, for a memory report.  Whether it hits XLA's in-process
+    # executable cache or recompiles from scratch is an XLA implementation
+    # detail, and the difference is the whole compile (~157 s at P=64, 91 Q).
+    # A diagnostic that can silently cost a compile gets its own row.
+    tick("mem_analysis", t0)
+    t_out0 = time.time()
 
     evs_path = evs_all[:nQ]
     evs_refit = {iQ: evs_all[nQ + j] for j, iQ in enumerate(refit_idx)}
@@ -831,10 +1021,32 @@ def main(argv=None):
         fig.savefig(png, dpi=180)
         print(f"Wrote {png}")
 
+        timers["outputs"] = time.time() - t_out0
+        total = time.time() - t_wall
+        untimed = total - sum(timers.values())
         print("\n--- timings (s) ---")
         for k, v in timers.items():
-            print(f"  {k:<22s} {v:9.2f}")
-        print(f"  {'TOTAL':<22s} {time.time()-t_wall:9.2f}")
+            print(f"  {k:<22s} {v:9.2f}   {100.0*v/max(total,1e-9):5.1f}%")
+        # The residual, ALWAYS printed.  A small number here is the table's own
+        # evidence that it is complete; a large one names the gap instead of
+        # leaving a reader to discover it by subtraction.
+        print(f"  {'(untimed)':<22s} {untimed:9.2f}   "
+              f"{100.0*untimed/max(total,1e-9):5.1f}%")
+        print(f"  {'TOTAL':<22s} {total:9.2f}   100.0%")
+
+    # LEAVE TOGETHER.  Everything above this line inside ``if _rank0`` — the
+    # .dat write, the interp-vs-refit table, matplotlib — is rank-0 only and
+    # takes seconds.  Without this barrier ranks 1..P-1 return from main(),
+    # exit, and tear their MPI process down while rank 0 is still in
+    # matplotlib; MPI aborts the surviving rank and the job exits 134 (SIGABRT)
+    # AFTER having written a completely correct .dat and .png.  Measured: job
+    # 7882507 cell exb64s, rc=134 with exb_smoke_p64.dat/.png both present and
+    # correct.  That is worse than a plain failure, because a harness cannot
+    # tell it from one — every multi-rank exciton_bands run scored FAIL on a
+    # successful calculation.  ``barrier`` is a no-op at process_count()<=1 and
+    # is not on any solver path: one sync, once, after all the physics.
+    from common.collectives import barrier
+    barrier("exciton_bands.outputs_written")
     return 0
 
 

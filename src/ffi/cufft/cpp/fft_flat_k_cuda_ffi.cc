@@ -7,7 +7,26 @@
 // WHY IT EXISTS: same anchor as the host handler — XLA's fft custom-call
 // requires the transformed axes minor-most, while the Σ τ-kernel holds its
 // tiles in flat-k "dot layout" (k-major: (nk, s, μ_X, s', μ_Y)), so XLA
-// transposes the tile before/after EVERY fft.  cuFFT's ADVANCED DATA LAYOUT
+// MATERIALIZES THE WHOLE TILE IN A DIFFERENT LAYOUT before AND after every
+// fft.  Say "layout materialisation", not "transpose": XLA does not emit a
+// `transpose` opcode for this.  It emits a kLoop `fusion` whose body holds
+// the transpose+copy, e.g. (after_optimizations HLO of the flat-k ifft,
+// wk_REL/results/hlo/fftlayout_hlo/F_flatk_control.hlo.txt):
+//
+//   %transpose_copy_fusion = c128[1,312,1,312,4,4,1] fusion(%g.1),
+//       kind=kLoop, calls=%fused_computation.1,
+//       metadata={op_name="jit(flatk_ifft)/transpose"}
+//   %fft.0 = ... fft(%transpose_copy_fusion), fft_type=IFFT
+//   ROOT %bitcast_copy_fusion = c128[16,1,312,1,312] fusion(%fft.0), ...
+//
+// The cost is real and is the entire reason this handler exists — the tile
+// is written out twice — but it is invisible to any census that keys on
+// `opcode in (transpose, copy)`.  On the GPU census (job log
+// wk_REL/results/logs/audit_gpu_hlo.log, jax 0.9.1, CudaDevice) the four
+// flat-k cases report `transpose ops: 0  copy ops: 0  fusion ops: 1` and the
+// minor-most control reports `fusion ops: 0` — same verdict line, opposite
+// structure.  If you are re-measuring this, count fusions.  cuFFT's
+// ADVANCED DATA LAYOUT
 // (cufftPlanMany64 inembed/onembed/istride/idist) is the exact analog of the
 // MKL DFTI stride descriptors: element address for FFT index (x, y, z) of
 // batch b is  b·idist + ((x·inembed[1] + y)·inembed[2] + z)·istride,  so with
@@ -97,6 +116,8 @@
 
 #include <dlfcn.h>
 
+#include "../../common/cpp/mkl_thread_pin.h"   // rank-scoped log gate only
+
 #include <cuda.h>            // driver-API types only; entry points via dlsym
 #include <cuda_runtime.h>
 #include <cufft.h>
@@ -109,8 +130,15 @@ namespace lorrax_ffi::cufft_flat_k {
 namespace ffi = ::xla::ffi;
 using C128 = std::complex<double>;
 
+// Opt-in debug logging.  Presence-tested as before, but now rank-scoped:
+// rank 0 by default, every rank with LORRAX_CUFFT_LOG=all.  Before the
+// 2026-07-30 audit there was no rank guard at all here (mklblas had
+// announce_here(), this file and mklfft had nothing), so at P=1000+ each of
+// the five sites below was multiplied by the process count.  Rank detection
+// reads the launcher env, not MPI_Comm_rank: this TU is comms-free by design
+// and must not link MPI.  See common/cpp/mkl_thread_pin.h.
 static bool log_enabled() {
-    static const bool on = (std::getenv("LORRAX_CUFFT_LOG") != nullptr);
+    static const bool on = mklpin::log_here("LORRAX_CUFFT_LOG");
     return on;
 }
 
@@ -265,8 +293,9 @@ static ffi::Error get_kernels(KernelPack** out) {
     const DriverApi& api = driver_api();
     if (!api.ok) {
         return fail("driver-api resolve",
-                    "libcuda.so.1 entry points not resolvable via dlsym "
-                    "(is a CUDA driver present on this node?)");
+                    "the CUDA driver entry points this handler needs are "
+                    "not available in libcuda.so.1 (is a CUDA driver "
+                    "present on this node?)");
     }
     CUcontext ctx = nullptr;
     api.CtxGetCurrent(&ctx);

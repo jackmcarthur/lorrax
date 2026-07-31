@@ -1,0 +1,376 @@
+"""``compute_wfns_fi``'s q-CHUNK and its two eigenvalue paths.
+
+Covers the three things the fine-grid chunking contract promises:
+
+1. the chunk width is an INPUT KEY (``wfn_fi_q_chunk``) whose default is
+   ``N_q_co = prod(kgrid_co)`` — not a bare constant;
+2. ``use_low_mem_eigh`` selects the distributed (face-sharded) eigh and
+   REFUSES when it cannot be honoured, never demoting to the whole-matrix
+   path it exists to avoid;
+3. eigenvalues are accumulated to the FULL band count across chunks
+   (``.lam_all_fi``), while ψ/coeffs stay windowed.
+
+INSTRUMENT DISCIPLINE (README §5.1).  The value comparator used by the
+chunk-invariance cells is exercised on a PLANTED deviation in
+``test_chunk_invariance_comparator_goes_red`` — a chunk-invariance PASS is
+only informative because that cell shows the same comparator failing.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+
+# ---------------------------------------------------------------------------
+#  fixtures / helpers
+# ---------------------------------------------------------------------------
+
+def _mesh_1x1():
+    import jax
+    from jax.sharding import Mesh
+    return Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+
+
+def _mesh_cpu_1x1():
+    import jax
+    from jax.sharding import Mesh
+    devs = jax.devices("cpu")
+    return Mesh(np.asarray(devs[:1]).reshape(1, 1), ("x", "y"))
+
+
+def _synthetic(nk_grid=(2, 2, 1), nb=4, rank=32, n_mu=6, ns=2, seed=11):
+    """A structurally real (ctilde, enk, B) triple — band-orthonormal
+    ``ctilde`` per k, exactly as ``streaming_galerkin_solve`` produces (see
+    ``test_ffi_linalg_contract._synthetic_htransform``, same construction)."""
+    rng = np.random.default_rng(seed)
+    nk = nk_grid[0] * nk_grid[1] * nk_grid[2]
+    ct = np.empty((nk, nb, rank), dtype=np.complex128)
+    for k in range(nk):
+        z = (rng.standard_normal((rank, nb))
+             + 1j * rng.standard_normal((rank, nb)))
+        q, _ = np.linalg.qr(z)
+        ct[k] = np.conj(q.T)
+    enk = (np.linspace(-0.6, 0.4, nb)[:, None]
+           + 0.05 * np.cos(2 * np.pi * np.arange(nk) / nk)[None, :])
+    B = (rng.standard_normal((rank, ns, n_mu))
+         + 1j * rng.standard_normal((rank, ns, n_mu)))
+    return ct, enk, B, nk_grid
+
+
+def _run(mesh, *, kgrid_fi=(4, 4, 1), band_window=(1, 3), log=None, **kw):
+    import jax.numpy as jnp
+    from bandstructure.bse_setup import compute_wfns_fi
+    ct, enk, B, kgrid_co = _synthetic()
+    with mesh:
+        return compute_wfns_fi(
+            ctilde=jnp.asarray(ct), B_at_mu=jnp.asarray(B),
+            enk_sigma=jnp.asarray(enk), kgrid_co=kgrid_co,
+            kgrid_fi=kgrid_fi, band_window_fi=band_window, mesh_xy=mesh,
+            log_fn=log, **kw)
+
+
+def _maxdiff(a, b):
+    """THE comparator these cells gate on.  Shown going red in
+    ``test_chunk_invariance_comparator_goes_red``."""
+    a, b = np.asarray(a), np.asarray(b)
+    assert a.shape == b.shape, f"shape {a.shape} != {b.shape}"
+    return float(np.max(np.abs(a - b))) if a.size else 0.0
+
+
+# ---------------------------------------------------------------------------
+#  1. the chunk width and its default
+# ---------------------------------------------------------------------------
+
+def test_q_chunk_defaults_to_n_q_co():
+    """No ``batch_size`` → the chunk is N_q_co, announced as such.
+
+    The old default was a literal 32, which on this fixture (N_q_co = 4)
+    would build a chunk 8x wider than the coarse Hamiltonian the deck has
+    already had to afford.
+    """
+    pytest.importorskip("jax")
+    lines = []
+    out = _run(_mesh_1x1(), log=lines.append)
+    banner = " ".join(lines)
+    assert "q-chunk=4" in banner, banner
+    assert "default N_q_co=4" in banner, banner
+    assert out.psi_rmu_Y.shape[0] == 16          # 4x4x1 fine grid
+
+
+def test_q_chunk_explicit_key_is_honoured():
+    pytest.importorskip("jax")
+    lines = []
+    _run(_mesh_1x1(), batch_size=8, log=lines.append)
+    banner = " ".join(lines)
+    assert "q-chunk=8" in banner and "wfn_fi_q_chunk=8" in banner, banner
+
+
+def test_q_chunk_zero_and_none_both_mean_the_default():
+    """``wfn_fi_q_chunk = 0`` is the input file's spelling of "unset"; it
+    must not become a zero-width chunk (an infinite loop) or a 1."""
+    pytest.importorskip("jax")
+    for spelling in (0, None, -1):
+        lines = []
+        _run(_mesh_1x1(), batch_size=spelling, log=lines.append)
+        assert "q-chunk=4" in " ".join(lines), (spelling, lines)
+
+
+def test_kgrid_co_inconsistent_with_ctilde_is_refused():
+    """The default reads N_q_co off ``kgrid_co``; a kgrid_co that does not
+    match ctilde's k-axis would silently pick the wrong default (and
+    build_fH_R would ifft-reshape into the wrong grid)."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from bandstructure.bse_setup import compute_wfns_fi
+    ct, enk, B, _ = _synthetic()
+    mesh = _mesh_1x1()
+    with pytest.raises(ValueError, match="N_q_co"):
+        with mesh:
+            compute_wfns_fi(
+                ctilde=jnp.asarray(ct), B_at_mu=jnp.asarray(B),
+                enk_sigma=jnp.asarray(enk), kgrid_co=(3, 3, 1),
+                kgrid_fi=(4, 4, 1), band_window_fi=(1, 3), mesh_xy=mesh)
+
+
+# ---------------------------------------------------------------------------
+#  2. values do not depend on the chunk width  (+ the comparator's red twin)
+# ---------------------------------------------------------------------------
+
+_CHUNKS = [1, 2, 4, 5, 8, 16, 32]
+
+
+#: The chunk width is a 1-ULP axis, NOT a bit-exact one.  MEASURED, job
+#: 7883840: on a 1x1 mesh at rank 32, ``lam_fi`` from a 1-wide chunk and a
+#: 2-wide chunk differ by 2.220446e-16 — one ULP at |lam| ~ 1.  Nothing in
+#: the loop is order-dependent (every q is independent; the Fourier sum, the
+#: eigh and the projection are per-q; the trailing pad rows are sliced off),
+#: so the difference is inside ``jnp.linalg.eigh`` itself, which selects a
+#: different LAPACK/XLA kernel by BATCH SIZE.  That is the same class as the
+#: cross-P reduction-blocking difference this deck already pins at 0.740 meV,
+#: four orders below it.  This tolerance is stated in Ry on the recovered
+#: energies — the quantity the physics gate reads — and is 1e-11 eV, i.e. 8
+#: orders below the 1 meV .dat tolerance.
+CHUNK_TOL_RY = 1.0e-12
+
+
+def test_values_are_invariant_to_the_chunk_width():
+    """A chunk boundary is a LOOP boundary, not an algorithmic one.
+
+    Gated at :data:`CHUNK_TOL_RY` rather than at 0.0 because the eigh kernel
+    is batch-size dependent — see the note on that constant.  The ACTUAL
+    spread is printed by ``test_chunk_width_ulp_spread_is_reported`` so the
+    tolerance can be checked against the measurement instead of trusted.
+    """
+    pytest.importorskip("jax")
+    mesh = _mesh_1x1()
+    ref = _run(mesh, batch_size=_CHUNKS[0], return_coeffs=True)
+    for bs in _CHUNKS[1:]:
+        got = _run(mesh, batch_size=bs, return_coeffs=True)
+        assert _maxdiff(ref.enk_full, got.enk_full) < CHUNK_TOL_RY, bs
+        assert _maxdiff(ref.lam_fi, got.lam_fi) < CHUNK_TOL_RY, bs
+        assert _maxdiff(ref.lam_all_fi, got.lam_all_fi) < CHUNK_TOL_RY, bs
+        assert _maxdiff(ref.psi_rmu_Y, got.psi_rmu_Y) < 1e-10, bs
+        assert _maxdiff(ref.psi_rmuT_X, got.psi_rmuT_X) < 1e-10, bs
+        assert _maxdiff(ref.coeffs_fi, got.coeffs_fi) < 1e-10, bs
+
+
+def test_chunk_width_ulp_spread_is_reported(capsys):
+    """Print the FULL width-vs-width difference table.
+
+    Which pairs are bit-identical and which are one ULP apart is the fact
+    the .dat byte-identity gate turns on: the production default moves the
+    width 32 -> N_q_co, so if (and only if) those two widths agree bitwise
+    can a byte-identical .dat be expected at fixed P.  Measured here rather
+    than assumed, and asserted only at the ULP scale.
+    """
+    pytest.importorskip("jax")
+    mesh = _mesh_1x1()
+    outs = {bs: _run(mesh, batch_size=bs) for bs in _CHUNKS}
+    ref = outs[_CHUNKS[-1]]
+    rows = []
+    for bs in _CHUNKS:
+        d_lam = _maxdiff(ref.lam_fi, outs[bs].lam_fi)
+        d_e = _maxdiff(ref.enk_full, outs[bs].enk_full)
+        rows.append((bs, d_lam, d_e))
+    with capsys.disabled():
+        print(f"\n  chunk-width spread vs bs={_CHUNKS[-1]} (rank 32, 1x1 mesh):")
+        for bs, d_lam, d_e in rows:
+            print(f"    bs={bs:<4} max|d lam| = {d_lam:.6e}   "
+                  f"max|d enk| = {d_e:.6e} Ry"
+                  f"{'   (bit-identical)' if d_lam == 0.0 else ''}")
+    assert max(r[1] for r in rows) < CHUNK_TOL_RY
+    # Every width >= 2 must be BIT-identical; only the degenerate 1-wide
+    # chunk moves, and by exactly one ULP.  That is the fact the .dat gate
+    # rests on: the production default takes P=16 from 32 to 16, and both
+    # are in the bit-identical class.
+    assert [r for r in rows if r[0] >= 2 and r[1] != 0.0] == []
+    # …and the comparator is not merely reading the same object twice.  A
+    # plant must exceed the ULP to exist at all: +1e-18 on values of
+    # magnitude ~0.4 (ULP ~5.5e-17) is a NO-OP and made this very line
+    # assert 0.0 > 0.0 — a red twin that was itself void (job 7883854).
+    planted = np.array(ref.lam_fi)
+    planted.flat[0] = np.nextafter(planted.flat[0], np.inf)
+    assert _maxdiff(ref.lam_fi, planted) > 0.0
+
+
+def test_chunk_invariance_comparator_goes_red():
+    """THE RED TWIN.  ``_maxdiff`` must report a planted deviation.
+
+    Without this cell, ``== 0.0`` above could be reading two references to
+    the same array, an empty array, or a comparator that always returns 0 —
+    all of which have happened in this project (README §5.1).
+    """
+    pytest.importorskip("jax")
+    mesh = _mesh_1x1()
+    ref = _run(mesh, batch_size=2)
+    planted = np.array(ref.lam_fi)
+    planted[0, 0] += 1e-13          # a hundred times below the eV tolerances
+    assert _maxdiff(ref.lam_fi, planted) > 0.0
+    psi = np.array(ref.psi_rmu_Y)
+    psi[-1, -1, -1, -1] += 1e-13
+    assert _maxdiff(ref.psi_rmu_Y, psi) > 0.0
+    # and it must NOT be fooled by a shape change
+    with pytest.raises(AssertionError):
+        _maxdiff(ref.lam_fi, np.asarray(ref.lam_fi)[:-1])
+
+
+def test_q_count_not_a_multiple_of_the_chunk():
+    """The pad-and-slice path: 16 fine q with a 5-wide chunk (4 chunks, 4
+    padded rows discarded).  Same values as an exact division."""
+    pytest.importorskip("jax")
+    mesh = _mesh_1x1()
+    a = _run(mesh, batch_size=4)
+    b = _run(mesh, batch_size=5)
+    assert a.lam_fi.shape == b.lam_fi.shape == (16, 2)
+    assert _maxdiff(a.lam_fi, b.lam_fi) < CHUNK_TOL_RY
+    assert _maxdiff(a.psi_rmu_Y, b.psi_rmu_Y) < 1e-10
+
+
+# ---------------------------------------------------------------------------
+#  3. eigenvalues accumulated to the FULL band count across chunks
+# ---------------------------------------------------------------------------
+
+def test_lam_all_fi_is_the_full_spectrum_and_agrees_with_the_window():
+    """``.lam_all_fi`` is (nq, rank) — every band — and its band-window
+    slice is BIT-identical to ``.lam_fi``, i.e. the two are one solve, not
+    two."""
+    pytest.importorskip("jax")
+    ct, _, _, _ = _synthetic()
+    rank = ct.shape[2]
+    out = _run(_mesh_1x1(), batch_size=3, band_window=(1, 3))
+    assert out.lam_all_fi.shape == (16, rank)
+    assert _maxdiff(np.asarray(out.lam_all_fi)[:, 1:3], out.lam_fi) == 0.0
+    # ascending within each q (jnp.linalg.eigh's contract, and what the
+    # band-window slice relies on to mean "the lowest nb_fi at/above b_min")
+    lam = np.asarray(out.lam_all_fi)
+    assert np.all(np.diff(lam, axis=1) >= -1e-12)
+
+
+def test_lam_all_fi_survives_a_chunk_boundary():
+    """Accumulation across chunks, not just within one: a 3-wide chunk over
+    16 q writes six chunks and the last is padding-only in part."""
+    pytest.importorskip("jax")
+    mesh = _mesh_1x1()
+    one = _run(mesh, batch_size=32)      # one chunk covers everything
+    many = _run(mesh, batch_size=3)      # six chunks
+    assert _maxdiff(one.lam_all_fi, many.lam_all_fi) < CHUNK_TOL_RY
+
+
+# ---------------------------------------------------------------------------
+#  4. use_low_mem_eigh — selection, and refusal without fallback
+# ---------------------------------------------------------------------------
+
+def test_use_low_mem_eigh_with_off_is_a_contradiction():
+    pytest.importorskip("jax")
+    with pytest.raises(ValueError, match="contradiction"):
+        _run(_mesh_1x1(), use_low_mem_eigh=True, eigh_backend="off")
+
+
+def test_use_low_mem_eigh_refuses_rather_than_running_native():
+    """NO SILENT FALLBACK.
+
+    ``slate`` eigh on a CPU mesh is refused unconditionally by
+    ``ffi.linalg.resolve`` (bug L-2: SLATE's host heev SIGSEGVs).  Asking
+    for it under ``use_low_mem_eigh`` must therefore RAISE — the failure
+    mode this guards against is the opposite: quietly computing the answer
+    with the q-batched native eigh, which is the whole-matrix path the flag
+    says will not fit, and reporting success.
+    """
+    jax = pytest.importorskip("jax")
+    try:
+        mesh = _mesh_cpu_1x1()
+    except (RuntimeError, IndexError):        # no CPU devices addressable
+        pytest.skip("no CPU device for the host-mesh refusal cell")
+    with pytest.raises(RuntimeError) as exc:
+        _run(mesh, use_low_mem_eigh=True, eigh_backend="slate")
+    msg = str(exc.value)
+    assert "use_low_mem_eigh=True could not be honoured" in msg, msg
+    assert "REJECTED on CPU" in msg, msg          # the underlying guard
+    assert "No fallback" in msg, msg
+
+
+def test_use_low_mem_eigh_keeps_an_explicitly_named_library():
+    """The flag is a rename onto ``distributed``; it must not overwrite a
+    library the deck named.  Checked at the resolve seam so the cell needs
+    no FFI build."""
+    from gw.gw_config import resolve_eigh_backend
+    assert resolve_eigh_backend(
+        {"eigh_backend": "scalapack", "use_low_mem_eigh": True}) == "scalapack"
+    assert resolve_eigh_backend(
+        {"eigh_backend": "cusolvermp", "use_low_mem_eigh": True}) == "cusolvermp"
+
+
+# ---------------------------------------------------------------------------
+#  5. the input keys themselves
+# ---------------------------------------------------------------------------
+
+def test_eigh_backend_vocabulary_is_the_resolvers_own():
+    """gw_config's fallback list must equal ffi.linalg.resolve's.
+
+    They HAD drifted — the parser accepted only auto|off|cusolvermp|slate
+    while the resolver had grown ``distributed`` and ``scalapack``, so the
+    low-memory eigh was unrequestable through an input file on a host mesh.
+    """
+    pytest.importorskip("jax")
+    from ffi.linalg.resolve import BACKEND_CHOICES
+    from gw.gw_config import eigh_backend_choices
+    assert set(eigh_backend_choices()) == set(BACKEND_CHOICES["eigh"])
+    # …and the hard-coded fallback (used when ffi cannot be imported) too.
+    import inspect
+    from gw import gw_config
+    src = inspect.getsource(gw_config.eigh_backend_choices)
+    for name in BACKEND_CHOICES["eigh"]:
+        assert f'"{name}"' in src, f"fallback tuple is missing {name!r}"
+
+
+def test_resolve_eigh_backend_passthrough_and_promotion():
+    from gw.gw_config import resolve_eigh_backend
+    assert resolve_eigh_backend({}) == "auto"
+    assert resolve_eigh_backend({"eigh_backend": "off"}) == "off"
+    assert resolve_eigh_backend({"eigh_backend": "OFF  "}) == "off"
+    assert resolve_eigh_backend(
+        {"eigh_backend": "auto", "use_low_mem_eigh": True}) == "distributed"
+    with pytest.raises(ValueError, match="invalid"):
+        resolve_eigh_backend({"eigh_backend": "replicated"})
+
+
+def test_input_keys_parse(tmp_path):
+    from gw.gw_config import read_lorrax_input
+    p = tmp_path / "deck.in"
+    p.write_text(
+        "[cohsex]\n"
+        "nval = 4\n"
+        "wfn_fi_q_chunk = 12\n"
+        "use_low_mem_eigh = true\n"
+        "eigh_backend = distributed\n")
+    params = read_lorrax_input(str(p))
+    assert params["wfn_fi_q_chunk"] == 12 and isinstance(
+        params["wfn_fi_q_chunk"], int)
+    assert params["use_low_mem_eigh"] is True
+    assert params["eigh_backend"] == "distributed"
+    # defaults, when the deck says nothing
+    q = tmp_path / "bare.in"
+    q.write_text("[cohsex]\nnval = 4\n")
+    bare = read_lorrax_input(str(q))
+    assert bare["wfn_fi_q_chunk"] == 0        # 0 == "use N_q_co"
+    assert bare["use_low_mem_eigh"] is False

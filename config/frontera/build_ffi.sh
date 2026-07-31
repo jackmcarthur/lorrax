@@ -91,5 +91,6 @@ echo "[build] compiling..."
 SO="$BUILD/liblorrax_ffi.so"
 [ -f "$SO" ] || { echo "[build] FAILED: no $SO" >&2; exit 1; }
 echo "[build] --- artifact: $SO ---"; ls -lh "$SO"
-echo "[build] --- DT_NEEDED ---"; readelf -d "$SO" | grep NEEDED
+echo "[build] --- libraries this .so will load at run time ---"
+readelf -d "$SO" | grep NEEDED
 echo "[build] done."

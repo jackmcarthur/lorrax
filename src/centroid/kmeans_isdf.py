@@ -8,14 +8,15 @@ primitive FCC. See ``build_min_image_offsets``.
 
 Public surface:
 
-* ``weighted_kmeans_jax`` — driver. Requires a mesh; the entire Lloyd
-  loop runs as one ``lax.while_loop`` inside ``shard_map``.
+* ``weighted_kmeans_jax`` — driver. The entire Lloyd loop runs to
+  convergence on device, with the real-space grid distributed.
 * ``kmeans_pp_init`` — k-means++ seed via Gumbel-max on log-weights.
-* ``kmeans_update_step`` — one Lloyd iteration (single-device).
-* ``make_sharded_kmeans_update`` — same, sharded.
 * ``build_min_image_offsets`` — startup-time table of relevant images.
 * ``snap_centroids_to_grid``, ``ensure_unique_centroids`` — host-side
   helpers used by the CLI.
+
+Device placement, mesh construction and the one collective this
+algorithm needs live in :mod:`centroid.distribution`, not here.
 """
 from __future__ import annotations
 
@@ -24,14 +25,10 @@ from functools import partial
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax import lax, config
-from jax.sharding import Mesh, PartitionSpec, NamedSharding
-from jax.experimental.shard_map import shard_map
+from jax import lax
 
 from common import timing
-from common.collectives import device_put_process_local
-
-config.update("jax_enable_x64", True)
+from . import distribution as dist
 
 
 BOHR_TO_ANG = 0.529177210544
@@ -439,250 +436,112 @@ def _orbit_finalize_update(reps, sum_wd, sum_w, metric, offsets, Rinv, tau):
     return canon, movement_sq
 
 
-@partial(jax.jit, static_argnames=['n_c', 'c_block'])
-def kmeans_update_step(
-    positions_frac: jnp.ndarray,
-    centroids_frac: jnp.ndarray,
-    rho_flat: jnp.ndarray,
-    metric_tensor: jnp.ndarray,
-    n_c: int,
-    c_block: int = _DEFAULT_C_BLOCK,
-    offsets: jnp.ndarray | None = None,
-) -> tuple:
-    """One Lloyd iteration on a single device."""
-    if offsets is None:
-        offsets = jnp.zeros((1, 3), dtype=jnp.int32)
-    labels = assign_labels_chunked(
-        positions_frac, centroids_frac, metric_tensor, n_c,
-        c_block=c_block, offsets=offsets,
-    )
-    sum_wd, sum_w = _local_update_accumulators(
-        positions_frac, centroids_frac, rho_flat, labels, n_c,
-        metric_tensor, offsets,
-    )
-    new_cent, movement_sq = _finalize_update(
-        centroids_frac, sum_wd, sum_w, metric_tensor, offsets,
-    )
-    return new_cent, movement_sq, labels
-
-
 # ─────────────────────────────────────────────────────────────────────────
-# Sharded Lloyd update (one step) — kept for direct tests / reuse
+# One Lloyd iteration, on this rank's slice of the grid
 # ─────────────────────────────────────────────────────────────────────────
 
-def _kmeans_step_shardmap_body(positions, centroids, rho, metric, offsets,
-                               n_c, c_block, axis_name):
-    """One Lloyd step inside a shard_map: P-sharded, two ``psum``s."""
+def _lloyd_step(positions, centroids, rho, metric, offsets,
+                n_c, c_block, grid_axis):
+    """Assign → accumulate → move, with the grid distributed.
+
+    Nearest-centroid assignment is embarrassingly parallel over grid
+    points; the weighted-mean update needs each centroid's total over ALL
+    points, which is the two sums over the grid below."""
     labels = assign_labels_chunked(
         positions, centroids, metric, n_c, c_block=c_block, offsets=offsets,
     )
-    local_wsum, local_w = _local_update_accumulators(
+    local_wd, local_w = _local_update_accumulators(
         positions, centroids, rho, labels, n_c, metric, offsets,
     )
-    sum_wd = lax.psum(local_wsum, axis_name=axis_name)
-    sum_w = lax.psum(local_w, axis_name=axis_name)
-    new_cent, movement_sq = _finalize_update(
-        centroids, sum_wd, sum_w, metric, offsets,
+    return _finalize_update(
+        centroids,
+        dist.sum_over_grid(local_wd, grid_axis),
+        dist.sum_over_grid(local_w, grid_axis),
+        metric, offsets,
     )
-    return new_cent, movement_sq, labels
 
 
-def _orbit_step_shardmap_body(positions, reps, rho, metric, offsets,
-                              R, Rinv, tau, n_rep, c_block, axis_name):
-    """One sym-aware Lloyd step inside a shard_map. Same psum pattern as the
-    non-orbit body — the orbit-folding happens locally on each shard before
-    the per-rep accumulators are reduced across shards."""
+def _orbit_lloyd_step(positions, reps, rho, metric, offsets,
+                      R, Rinv, tau, n_rep, c_block, grid_axis):
+    """Sym-aware Lloyd step. Same two sums over the grid — the orbit
+    fold-back is local to each rank's points, before the per-rep
+    accumulators are reduced."""
     labels, _, tie_mask = assign_labels_orbit_chunked(
         positions, reps, metric, n_rep, c_block=c_block,
         offsets=offsets, Rinv=Rinv, tau=tau,
     )
-    local_wsum, local_w = _orbit_local_update_accumulators(
+    local_wd, local_w = _orbit_local_update_accumulators(
         positions, reps, rho, labels, tie_mask,
         n_rep, metric, offsets, R, Rinv, tau,
     )
-    sum_wd = lax.psum(local_wsum, axis_name=axis_name)
-    sum_w = lax.psum(local_w, axis_name=axis_name)
-    new_reps, movement_sq = _orbit_finalize_update(
-        reps, sum_wd, sum_w, metric, offsets, Rinv, tau,
+    return _orbit_finalize_update(
+        reps,
+        dist.sum_over_grid(local_wd, grid_axis),
+        dist.sum_over_grid(local_w, grid_axis),
+        metric, offsets, Rinv, tau,
     )
-    return new_reps, movement_sq, labels
-
-
-def make_sharded_kmeans_update(
-    mesh: Mesh,
-    n_c: int,
-    c_block: int = _DEFAULT_C_BLOCK,
-    mesh_axis: str | tuple[str, ...] = 'x',
-    offsets: np.ndarray | None = None,
-):
-    """Build a jitted single-step sharded ``kmeans_update_step`` over ``mesh``.
-
-    P sharded on ``mesh_axis``; centroids replicated; one ``psum`` each on
-    the (C, 3) and (C,) accumulators per step.
-    """
-    axis_names = (mesh_axis,) if isinstance(mesh_axis, str) else tuple(mesh_axis)
-    for ax in axis_names:
-        if ax not in mesh.axis_names:
-            raise ValueError(
-                f"mesh_axis {mesh_axis!r}: axis '{ax}' not in mesh "
-                f"{mesh.axis_names}"
-            )
-    if offsets is None:
-        offsets = np.zeros((1, 3), dtype=np.int32)
-    offsets = jnp.asarray(offsets, dtype=jnp.int32)
-
-    in_specs = (
-        PartitionSpec(mesh_axis, None),
-        PartitionSpec(None, None),
-        PartitionSpec(mesh_axis),
-        PartitionSpec(None, None),
-    )
-    out_specs = (
-        PartitionSpec(None, None),
-        PartitionSpec(None),
-        PartitionSpec(mesh_axis),
-    )
-
-    @jax.jit
-    def step(positions, centroids, rho, metric):
-        return shard_map(
-            lambda p, c, r, g: _kmeans_step_shardmap_body(
-                p, c, r, g, offsets, n_c, c_block, mesh_axis,
-            ),
-            mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False,
-        )(positions, centroids, rho, metric)
-    return step
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Sharded full Lloyd loop — lax.while_loop, on-device until convergence
+# Full Lloyd loop — iterates to convergence on device
 # ─────────────────────────────────────────────────────────────────────────
 
-def make_sharded_lloyd_loop(
-    mesh: Mesh,
+def make_lloyd_loop(
+    mesh,
     n_c: int,
     max_steps: int,
     tolerance: float,
     offsets,
+    *,
+    R=None, Rinv=None, tau=None,
     c_block: int = _DEFAULT_C_BLOCK,
     mesh_axis: str | tuple[str, ...] = 'x',
 ):
-    """Build a jitted Lloyd loop running until movement² < tol² or max_steps.
+    """Lloyd iteration to ``max(movement) < tolerance`` or ``max_steps``.
 
-    The entire loop lives in one ``lax.while_loop`` inside one
-    ``shard_map`` — no host syncs per iteration. ``tolerance`` and
-    ``offsets`` are captured as closure constants so the call site
-    doesn't need to materialise them. Returns
+    ``(R, Rinv, tau)`` select the **orbit-aware** step, in which centroids
+    are orbit representatives and every point's contribution is folded
+    back to the rep frame through the minimising symmetry image; without
+    them each centroid is a literal point.
+
+    The whole loop is one ``lax.while_loop`` that never returns to the
+    host, so convergence costs zero syncs per iteration.  Returns
     ``(final_centroids, steps_taken, max_movement_sq)``.
     """
-    axis_names = (mesh_axis,) if isinstance(mesh_axis, str) else tuple(mesh_axis)
-    for ax in axis_names:
-        if ax not in mesh.axis_names:
-            raise ValueError(
-                f"mesh_axis {mesh_axis!r}: axis '{ax}' not in mesh "
-                f"{mesh.axis_names}"
-            )
     offsets = jnp.asarray(offsets, dtype=jnp.int32)
     tol_sq = jnp.float64(tolerance) ** 2
+    orbit_aware = R is not None
+    if orbit_aware:
+        R = jnp.asarray(R, dtype=jnp.int32)
+        Rinv = jnp.asarray(Rinv, dtype=jnp.int32)
+        tau = jnp.asarray(tau, dtype=jnp.float64)
 
-    in_specs = (
-        PartitionSpec(mesh_axis, None),    # positions
-        PartitionSpec(None, None),         # centroids
-        PartitionSpec(mesh_axis),          # rho
-        PartitionSpec(None, None),         # metric
-    )
-    out_specs = (
-        PartitionSpec(None, None),         # centroids
-        PartitionSpec(),                   # steps
-        PartitionSpec(),                   # max movement²
-    )
+    def iterate(positions, centroids, rho, metric):
+        def not_converged(state):
+            _, step, max_mv_sq = state
+            return (step < max_steps) & (max_mv_sq >= tol_sq)
 
-    @jax.jit
-    def lloyd(positions, centroids, rho, metric):
-        def local(positions, centroids, rho, metric):
-            def cond(state):
-                _, step, max_mv_sq = state
-                return (step < max_steps) & (max_mv_sq >= tol_sq)
-
-            def body(state):
-                c, step, _ = state
-                new_c, movement_sq, _ = _kmeans_step_shardmap_body(
-                    positions, c, rho, metric, offsets, n_c, c_block, mesh_axis,
+        def step_once(state):
+            c, step, _ = state
+            if orbit_aware:
+                new_c, movement_sq = _orbit_lloyd_step(
+                    positions, c, rho, metric, offsets,
+                    R, Rinv, tau, n_c, c_block, mesh_axis,
                 )
-                return new_c, step + 1, jnp.max(movement_sq)
-
-            init = (centroids, jnp.int32(0), jnp.float64(jnp.inf))
-            return lax.while_loop(cond, body, init)
-
-        return shard_map(
-            local, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
-            check_rep=False,
-        )(positions, centroids, rho, metric)
-    return lloyd
-
-
-def make_sharded_orbit_lloyd_loop(
-    mesh: Mesh,
-    n_rep: int,
-    max_steps: int,
-    tolerance: float,
-    offsets,
-    R, Rinv, tau,
-    c_block: int = _DEFAULT_C_BLOCK,
-    mesh_axis: str | tuple[str, ...] = 'x',
-):
-    """Sym-aware sibling of ``make_sharded_lloyd_loop``. Identical sharding
-    pattern (P sharded on ``mesh_axis``, reps + sym data replicated, two
-    ``psum``s per step on the per-rep accumulators); the body uses the
-    orbit assignment + fold-back accumulator + canonical finalize."""
-    axis_names = (mesh_axis,) if isinstance(mesh_axis, str) else tuple(mesh_axis)
-    for ax in axis_names:
-        if ax not in mesh.axis_names:
-            raise ValueError(
-                f"mesh_axis {mesh_axis!r}: axis '{ax}' not in mesh "
-                f"{mesh.axis_names}"
-            )
-    offsets = jnp.asarray(offsets, dtype=jnp.int32)
-    R = jnp.asarray(R, dtype=jnp.int32)
-    Rinv = jnp.asarray(Rinv, dtype=jnp.int32)
-    tau = jnp.asarray(tau, dtype=jnp.float64)
-    tol_sq = jnp.float64(tolerance) ** 2
-
-    in_specs = (
-        PartitionSpec(mesh_axis, None),    # positions
-        PartitionSpec(None, None),         # reps
-        PartitionSpec(mesh_axis),          # rho
-        PartitionSpec(None, None),         # metric
-    )
-    out_specs = (
-        PartitionSpec(None, None),         # reps
-        PartitionSpec(),                   # steps
-        PartitionSpec(),                   # max movement²
-    )
-
-    @jax.jit
-    def lloyd(positions, reps, rho, metric):
-        def local(positions, reps, rho, metric):
-            def cond(state):
-                _, step, max_mv_sq = state
-                return (step < max_steps) & (max_mv_sq >= tol_sq)
-
-            def body(state):
-                r, step, _ = state
-                new_r, movement_sq, _ = _orbit_step_shardmap_body(
-                    positions, r, rho, metric, offsets,
-                    R, Rinv, tau, n_rep, c_block, mesh_axis,
+            else:
+                new_c, movement_sq = _lloyd_step(
+                    positions, c, rho, metric, offsets,
+                    n_c, c_block, mesh_axis,
                 )
-                return new_r, step + 1, jnp.max(movement_sq)
+            return new_c, step + 1, jnp.max(movement_sq)
 
-            init = (reps, jnp.int32(0), jnp.float64(jnp.inf))
-            return lax.while_loop(cond, body, init)
+        return lax.while_loop(
+            not_converged, step_once,
+            (centroids, jnp.int32(0), jnp.float64(jnp.inf)),
+        )
 
-        return shard_map(
-            local, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
-            check_rep=False,
-        )(positions, reps, rho, metric)
-    return lloyd
+    return dist.grid_parallel_loop(
+        mesh, iterate, grid_axis=mesh_axis, who="make_lloyd_loop")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -790,31 +649,35 @@ def _pick_c_block(n_c: int, preferred: int = _DEFAULT_C_BLOCK) -> int:
 
 
 def weighted_kmeans_jax(
-    avec: jnp.ndarray,
-    rho_jax: jnp.ndarray,
+    avec,
+    rho,
     N_c: int = 10,
     max_steps: int = 200,
     tolerance: float = 5e-3,
     seed: int = 0,
     *,
-    mesh: Mesh,
+    mesh,
     mesh_axis: str | tuple[str, ...] = 'x',
     init_method: str = 'kpp',
-    R: jnp.ndarray | None = None,
-    Rinv: jnp.ndarray | None = None,
-    tau: jnp.ndarray | None = None,
+    R=None,
+    Rinv=None,
+    tau=None,
 ):
-    """Density-weighted PBC k-means.
+    """Density-weighted PBC k-means over the real-space FFT grid.
 
-    The whole Lloyd loop is one jit'd ``lax.while_loop`` inside a
-    ``shard_map``. Mesh is required (single-device callers pass a
-    1-element mesh).
+    Seed the centroids (k-means++ on ρ, or an i.i.d. ρ-weighted draw),
+    then Lloyd-iterate to convergence: assign every grid point to its
+    nearest centroid under the min-image lattice metric, move each
+    centroid to the ρ-weighted mean of its cell, repeat.
+
+    ``avec`` is the (3, 3) real-space lattice (rows are lattice vectors)
+    and ``rho`` the (Nx, Ny, Nz) weight; both may be numpy.
 
     When ``(R, Rinv, tau)`` are supplied, runs the **orbit-aware** path:
-    centroids become orbit *representatives* and Lloyd updates fold
-    each point's contribution back to the rep frame through the
-    minimising symmetry image. Pass the table from
-    ``orbit_syms.build_real_space_syms(wfn, sym)``.
+    centroids become orbit *representatives* and each point's
+    contribution is folded back to the rep frame through the minimising
+    symmetry image, so the final set is closed under the point group.
+    Pass the table from ``orbit_syms.build_real_space_syms(wfn, sym)``.
 
     Returns:
         labels  : (P,) cluster assignment for each grid point.
@@ -828,24 +691,25 @@ def weighted_kmeans_jax(
     if orbit_aware and (Rinv is None or tau is None):
         raise ValueError("orbit mode requires all of (R, Rinv, tau)")
 
+    avec = jnp.asarray(avec, dtype=jnp.float64)
     metric_tensor = avec @ avec.T
-    offsets = build_min_image_offsets(metric_tensor)
+    offsets = jnp.asarray(build_min_image_offsets(metric_tensor))
     print(f"PBC min-image offsets: {offsets.shape[0]} (1 ⇒ orthorhombic); "
           f"orbit mode: {'on (n_sym=' + str(int(R.shape[0])) + ')' if orbit_aware else 'off'}")
 
-    Nx, Ny, Nz = rho_jax.shape
+    Nx, Ny, Nz = rho.shape
     fx, fy, fz = (jnp.linspace(0, 1, n, endpoint=False, dtype=jnp.float64)
                   for n in (Nx, Ny, Nz))
     positions = jnp.stack(jnp.meshgrid(fx, fy, fz, indexing="ij"),
                           axis=-1).reshape(-1, 3)
-    rho_flat = rho_jax.reshape(-1)
+    rho_flat = jnp.asarray(rho, dtype=jnp.float64).reshape(-1)
     print(f"Grid: {Nx}×{Ny}×{Nz} = {positions.shape[0]} points; N_c = {N_c}")
 
     with timing.section("init"):
         if init_method == 'kpp':
             centroids = kmeans_pp_init(
                 positions, rho_flat, metric_tensor, N_c,
-                jax.random.PRNGKey(seed), offsets=jnp.asarray(offsets),
+                jax.random.PRNGKey(seed), offsets=offsets,
                 Rinv=Rinv if orbit_aware else None,
                 tau=tau if orbit_aware else None,
             )
@@ -858,37 +722,18 @@ def weighted_kmeans_jax(
             centroids = positions[idx]
         centroids.block_until_ready()
 
-    # Set the sharding of the lloyd inputs in one pass.  NOT plain
-    # ``jax.device_put``: on a multi-process mesh that silently runs
-    # ``multihost_utils.assert_equal`` — a P-linear all-gather of the
-    # operand (scorecard AA.1) — and ``positions``/``rho_flat`` are the
-    # full FFT grid, the largest host arrays this driver touches.  Every
-    # input is a pure function of the WFN density + the seed, identical
-    # on every rank by construction; ``LORRAX_CHECK_REPLICA=1`` restores
-    # the assertion for a debugging run.
-    def shard(x, *axes):
-        return device_put_process_local(
-            x, NamedSharding(mesh, PartitionSpec(*axes)))
-    positions = shard(positions, mesh_axis, None)
-    rho_flat = shard(rho_flat, mesh_axis)
-    metric_tensor = shard(metric_tensor)
-    centroids = shard(centroids)
+    # The grid is the distributed axis: each rank owns a slice of the
+    # points and the whole centroid list.
+    positions = dist.place(positions, mesh, mesh_axis, None)
+    rho_flat = dist.place(rho_flat, mesh, mesh_axis)
+    metric_tensor = dist.place(metric_tensor, mesh)
+    centroids = dist.place(centroids, mesh)
 
-    if orbit_aware:
-        lloyd = make_sharded_orbit_lloyd_loop(
-            mesh, N_c, max_steps, tolerance, offsets, R, Rinv, tau,
-            c_block=_pick_c_block(N_c), mesh_axis=mesh_axis,
-        )
-    else:
-        lloyd = make_sharded_lloyd_loop(
-            mesh, N_c, max_steps, tolerance, offsets,
-            c_block=_pick_c_block(N_c), mesh_axis=mesh_axis,
-        )
-    # Lloyd is one jit'd while_loop on each first call: compile then run.
-    # Splitting the first compile from steady-state exec (same idiom as
-    # chi.compile / chi.exec in gw_jax) is moot here because only one
-    # call happens per process, but block_until_ready still pins the
-    # wall to GPU work.
+    lloyd = make_lloyd_loop(
+        mesh, N_c, max_steps, tolerance, offsets,
+        R=R, Rinv=Rinv, tau=tau,
+        c_block=_pick_c_block(N_c), mesh_axis=mesh_axis,
+    )
     with timing.section("lloyd"):
         centroids, steps, max_mv_sq = lloyd(
             positions, centroids, rho_flat, metric_tensor,
@@ -902,13 +747,13 @@ def weighted_kmeans_jax(
         if orbit_aware:
             labels, _, _ = assign_labels_orbit_chunked(
                 positions, centroids, metric_tensor, N_c,
-                c_block=_pick_c_block(N_c), offsets=jnp.asarray(offsets),
+                c_block=_pick_c_block(N_c), offsets=offsets,
                 Rinv=Rinv, tau=tau,
             )
         else:
             labels = assign_labels_chunked(
                 positions, centroids, metric_tensor, N_c,
-                c_block=_pick_c_block(N_c), offsets=jnp.asarray(offsets),
+                c_block=_pick_c_block(N_c), offsets=offsets,
             )
         labels.block_until_ready()
     return labels, centroids, steps, float(max_mv_sq)

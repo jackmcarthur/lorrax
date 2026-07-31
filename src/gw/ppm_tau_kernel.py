@@ -76,10 +76,20 @@ def _fft_ffi_fused_enabled() -> bool:
     in fft_helpers.  Independent of ``LORRAX_FFT_FFI`` (which switches the
     decomposed helpers); default OFF, production path untouched.  Read at
     kernel-factory time and part of the kernel cache keys.  Announce/refuse
-    semantics live in the fft_helpers factory (raises if the host .so lacks
-    the handler)."""
-    return os.environ.get("LORRAX_FFT_FFI_FUSED", "0").strip().lower() in (
-        "1", "true", "yes", "on")
+    semantics live in the FFT service factory (raises if the platform's .so
+    lacks the handler).
+
+    THE FLAG IS NOT READ HERE (2026-07-30).  It used to be — a consumer
+    parsing ``in ("1","true","yes","on")`` with no grammar check and no
+    announcement, so ``=yes`` worked, ``=Y`` silently did nothing, and
+    neither said anything.  That violated the FFT service's own stated rule
+    ("these helpers stay THE single FFT entry point — the backend switch
+    happens here and nowhere else", ``fft_helpers.py:306-307``).  The gate
+    now lives with the handler it gates (``ffi.mklfft.FUSED_GATE``, on the
+    shared ``ffi.common.gate.Gate``), with the same strict grammar as the
+    other two dials; every spelling that worked before still works."""
+    from ffi.mklfft import fused_fft_ffi_enabled
+    return fused_fft_ffi_enabled()
 
 
 def _make_project_ri_reduce_scatter(

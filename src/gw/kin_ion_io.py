@@ -58,44 +58,35 @@ Usage:
 """
 
 import os
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 
 # ---- join the distributed world BEFORE anything touches XLA ------------
 # ``jax.distributed.initialize()`` refuses to run once the XLA backend is
 # up, and the import graph below (``psp.*``) reaches jax.  ``runtime``
-# itself imports no jax, and every piece here is idempotent through an env
-# sentinel — which is what makes this safe under ``gw.sigma_dispatch``'s
-# LAZY import of this module from inside an already-bootstrapped driver:
-# there the calls are all no-ops.
-from runtime import (init_jax_distributed,                    # noqa: E402
-                     fallback_to_cpu_if_no_gpu_backend,
-                     install_failfast_excepthook)
-init_jax_distributed()
-fallback_to_cpu_if_no_gpu_backend()
-install_failfast_excepthook()
+# itself imports no jax, and every piece of ``bootstrap()`` is idempotent
+# through an env sentinel — which is what makes this safe under
+# ``gw.sigma_dispatch``'s LAZY import of this module from inside an
+# already-bootstrapped driver: there the calls are all no-ops.
+from runtime import bootstrap                                 # noqa: E402
+bootstrap()          # env defaults + jax.distributed + CPU fallback + failfast
 
-import argparse
-from functools import partial
+import argparse                                               # noqa: E402
 
 import numpy as np
-import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from jax.experimental.shard_map import shard_map
 import h5py
 
-from file_io import WfnLoader as WFNReader
 from common import symmetry_maps, Meta
+from common.collectives import (barrier, device_count, gather_k_blocks,
+                                local_share, prepare_mesh, process_rank_world,
+                                psum_replicate, resolve_mesh)
 from common.wfn_transforms import load_kpoint_fftbox_local
 import common.timing as timing
-
-from psp.pseudos import load_pseudopotentials, build_atom_pp_assignments
-from psp.dft_operators import generate_gvectors_k, vnl_matrix_from_kdata
-from psp.radial.build_projectors_qe import build_local_ionic_potential_on_G_total
+from file_io import WfnLoader as WFNReader
+from file_io.kin_ion import HARTREE_DATASET
 from gw.gw_config import read_lorrax_input as read_cohsex_input
+from psp.pseudos import load_pseudopotentials, build_atom_pp_assignments
+from psp.dft_operators import padded_gvectors, vnl_matrix_from_kdata
+from psp.radial.build_projectors_qe import build_local_ionic_potential_on_G_total
 from psp.get_DFT_mtxels import (
     compute_kinetic_k,
     compute_local_V_k,
@@ -104,7 +95,6 @@ from psp.get_DFT_mtxels import (
     valence_density_from_kpoint,
 )
 from psp.operator_checks import validate_operator_inputs
-from file_io.kin_ion import HARTREE_DATASET
 import psp.vnl_ops as vnl_ops
 
 
@@ -119,17 +109,36 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
     Parameters
     ----------
     wfn_k : (nb, nspinor, nx, ny, nz) — wavefunctions in FFT box
-    Gk_crys : (nG, 3) int — G-vector indices for this k
+    Gk_crys : (nG, 3) int — G-vector indices for this k.  May be the
+        k's own ``ngk`` rows or the ``ngkmax``-padded table, in which
+        case ``g_mask`` is REQUIRED (pad rows hold ``(0,0,0)``, a valid
+        box index that aliases Γ, so an absent mask double-counts ψ(G=0)
+        rather than crashing).
     kvec : (3,) float — k-point in crystal coords
     V_loc_r : (nx, ny, nz) — local ionic potential on FFT grid
     vnl_setup : VNLSetup from vnl_ops.build_vnl_setup (or None to skip V_NL)
     wfn : WFNReader (for bdot, bvec, blat, cell_volume)
-    g_mask : (nG,) float or None — mask for padded G-vectors
+    g_mask : (nG,) float or None — 1 on physical G, 0 on pad columns.
     V_H_r : (nx, ny, nz) or None — mean-field Hartree potential on the
         SAME FFT grid as ``V_loc_r``.  Folded in through the identical
         local-potential route, so H₀'s ~500 eV cancellation closes inside
         one exact routine instead of across two numerical schemes.
     """
+    Gk_np = np.asarray(Gk_crys, dtype=int)
+    if g_mask is None and int(np.count_nonzero(~Gk_np.any(axis=1))) > 1:
+        # A physical G-sphere contains (0,0,0) at most ONCE, and
+        # ``WfnLoader.gvecs()`` pads with exactly that row — so more than
+        # one all-zero row means a padded list arrived without its mask.
+        # Refuse instead of returning a plausible number: the pad rows are
+        # a VALID FFT-box index, so the unmasked answer is silently wrong
+        # by (ngkmax - ngk) extra copies of the Γ component, inside a
+        # ~500 eV cancellation.  Cheap: one host reduction over (nG, 3)
+        # int per k.
+        raise ValueError(
+            f"get_kin_ion_k: Gk_crys has "
+            f"{int(np.count_nonzero(~Gk_np.any(axis=1)))} all-zero rows, so "
+            f"it is ngkmax-padded, but g_mask is None.  Pass the mask from "
+            f"psp.dft_operators.padded_gvectors(...).at(ik).")
     bdot_np = np.asarray(wfn.bdot, dtype=float)
     T_k = compute_kinetic_k(wfn_k, Gk_crys, kvec, bdot_np, g_mask=g_mask)
     V_loc_k = compute_local_V_k(
@@ -138,12 +147,15 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
 
     V_NL_k = 0.0
     if vnl_setup is not None:
+        # Z is built ON THE SAME (padded) G-list, which is the contract
+        # ``_build_vnl_kdata_core`` documents: Z at a pad row is finite
+        # (it is evaluated at K = kvec) and the caller must mask before
+        # contracting.  Masking ψ_G is sufficient and is what
+        # ``vnl_matrix_from_kdata(mask=…)`` does — every contraction in
+        # ``vnl_ops.vnl_matrix`` runs through ψ_G at least once.
         kdata = vnl_ops.build_vnl_kdata_from_kvec(
-            np.asarray(kvec, dtype=float),
-            np.asarray(Gk_crys, dtype=int),
-            vnl_setup,
-        )
-        V_NL_k = vnl_matrix_from_kdata(wfn_k, Gk_crys, kdata)
+            np.asarray(kvec, dtype=float), Gk_np, vnl_setup)
+        V_NL_k = vnl_matrix_from_kdata(wfn_k, Gk_crys, kdata, mask=g_mask)
 
     H_k = T_k + V_loc_k + V_NL_k
     if V_H_r is not None:
@@ -154,13 +166,16 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
 
 
 # ===========================================================================
-# THE DISTRIBUTION LAYER
+# THE EXACT V_H, distributed
 # ===========================================================================
-# Everything in this section exists so that ONE implementation of the exact
-# V_H serves all three consumers — the ``kin_ion.h5`` generator CLI below,
-# the driver's ``hartree_source=gspace`` route, and the QSGW loop that will
-# rebuild V_H from an updated ρ every SC iteration.  It is mesh-aware from
-# 1×1 (single-node CLI) up to a production mesh.
+# Everything below exists so that ONE implementation of the exact V_H serves
+# all three consumers — the ``kin_ion.h5`` generator CLI, the driver's
+# ``hartree_source=gspace`` route, and the QSGW loop that will rebuild V_H
+# from an updated ρ every SC iteration.  It is mesh-aware from 1×1
+# (single-node CLI) up to a production mesh.
+#
+# The plumbing itself — mesh, work partition, psum, gather, the pipelined
+# per-k sweep — is ``common.collectives``; nothing here reaches under it.
 #
 # COMMUNICATION CONTRACT (this is the whole design, in four lines):
 #
@@ -184,191 +199,6 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
 # dominant sweep (matrix elements, 1.05e12 of the 1.2e12 flops at 12×12)
 # needs.  Band chunking is layered on top of the ρ sweep only when P > nk,
 # which is the only regime where k alone stops filling the machine.
-#
-# Why the work assignment is round-robin (``range(rank, n, world)``) rather
-# than contiguous blocks: nk need not divide P (the cohsex fixture has
-# nk=9), and contiguous blocking would idle whole ranks — nk=9 at P=4 gives
-# 3/3/3/0 contiguous but 3/2/2/2 round-robin.  The gather carries each
-# item's index with it, so the assignment is free to be any permutation.
-
-
-def _process_rank_world() -> tuple[int, int]:
-    """``(rank, world)`` for the work partition — PROCESS granularity.
-
-    The unit of parallelism here is the process (one full CPU socket on
-    Frontera, one device), not the device, because the per-rank sweeps
-    below run on process-local single-device arrays.  A build with more
-    than one addressable device per process would break that identity;
-    the collective helpers assert it rather than silently mis-assemble.
-    """
-    return int(jax.process_index()), int(jax.process_count())
-
-
-def resolve_mesh(mesh: Mesh | None = None) -> Mesh:
-    """The ``('x','y')`` mesh the collectives run on.
-
-    Callers that already have the run's mesh (the GW driver) pass it, so
-    no second mesh — and no second communicator — is created.  The CLI
-    has none and gets the same most-square factorisation
-    :func:`gw.gw_jax._build_mesh` uses, degenerating to 1×1 on a single
-    device so every code path below is identical at P=1.
-    """
-    if mesh is not None:
-        return mesh
-    total = int(jax.device_count())
-    gx = int(np.sqrt(total))
-    while gx > 1 and total % gx != 0:
-        gx -= 1
-    return Mesh(np.asarray(jax.devices()).reshape(gx, total // gx),
-                axis_names=('x', 'y'))
-
-
-def _psum_replicate(local_np: np.ndarray, mesh: Mesh) -> np.ndarray:
-    """Per-rank partial → the summed whole, on every rank.  ONE psum.
-
-    ``local_np`` is this rank's partial (any shape); the return is the
-    element-wise sum over ranks, as a host array identical on all of
-    them.  Cost is exactly one all-reduce of ``local_np.nbytes``.
-
-    Mechanism: the per-rank partials are declared as the shards of a
-    ``(world, *shape)`` global array via
-    ``make_array_from_single_device_arrays`` (a metadata operation — no
-    data moves), then a ``shard_map`` body whose only op is
-    ``lax.psum`` reduces them.  Spelling it as an explicit psum instead
-    of ``jnp.sum(axis=0)`` keeps the optimized HLO to a single
-    ``all-reduce`` with no reduce-scatter/all-gather pair, which is what
-    the communication audit checks.
-
-    P=1 short-circuits to the identity: no mesh, no collective, and
-    therefore bit-identical to the serial accumulation.
-
-    Reading the ``vh_rho_psum`` timer: it is measured on rank 0 and a
-    collective cannot complete before the LAST rank arrives, so the
-    number is (rank-0 idle waiting for the slowest peer) + (the actual
-    1.4 MB reduce, microseconds).  It is a load-imbalance meter, not a
-    bandwidth meter — do not read a large value as "the network is
-    slow".
-    """
-    rank, world = _process_rank_world()
-    if world <= 1:
-        return np.asarray(local_np)
-    if int(jax.local_device_count()) != 1:
-        raise RuntimeError(
-            f"the exact-V_H distribution layer assumes one addressable "
-            f"device per process; this process has "
-            f"{int(jax.local_device_count())}.")
-    if int(mesh.devices.size) != world:
-        raise RuntimeError(
-            f"mesh has {int(mesh.devices.size)} devices but there are "
-            f"{world} processes; they must match for the ρ psum.")
-
-    shape = tuple(int(s) for s in np.shape(local_np))
-    in_spec = P(('x', 'y'), *((None,) * len(shape)))
-    sharding = NamedSharding(mesh, in_spec)
-    local_dev = jax.device_put(np.asarray(local_np)[None], jax.local_devices()[0])
-    g = jax.make_array_from_single_device_arrays(
-        (world,) + shape, sharding, [local_dev])
-    return np.asarray(_psum_kernel(len(shape), mesh)(g))
-
-
-_PSUM_KERNELS: dict = {}
-
-
-def _psum_kernel(ndim: int, mesh: Mesh):
-    """Cached ``jit(shard_map(psum))`` — one compile per (rank, mesh).
-
-    Built once and memoised because the QSGW loop calls the V_H kernel
-    every SC iteration; a fresh closure per call would retrace and
-    recompile the reduction each time, and per-rank compiles are the
-    documented dominant startup cost of this code base.
-    """
-    # ``id(mesh)`` is safe as a key here (and everywhere else in the tree
-    # that uses it — isdf/core's five kernel caches do the same): the
-    # CACHED VALUE closes over ``mesh`` through the shard_map, so the Mesh
-    # object cannot be collected while its entry lives and its id cannot be
-    # recycled underneath us.  The failure mode is therefore a redundant
-    # compile on a second, equal Mesh object — never a stale hit.  Use
-    # ``ffi.slate.batched._mesh_key`` instead wherever the cached value
-    # does NOT retain the mesh.
-    key = (int(ndim), id(mesh))
-    fn = _PSUM_KERNELS.get(key)
-    if fn is None:
-        rest = (None,) * int(ndim)
-        in_spec = P(('x', 'y'), *rest)
-
-        @partial(shard_map, mesh=mesh, in_specs=(in_spec,),
-                 out_specs=P(*rest), check_rep=False)
-        def _body(x):
-            return jax.lax.psum(x[0], ('x', 'y'))
-
-        fn = jax.jit(_body)
-        _PSUM_KERNELS[key] = fn
-    return fn
-
-
-def replicate_to_mesh(host_array: np.ndarray, mesh: Mesh) -> jax.Array:
-    """A host array every rank already holds → a REPLICATED global array.
-
-    No communication: each rank simply declares its identical copy as
-    the replica living on its own device.  Use this on anything produced
-    by :func:`_psum_replicate` / :func:`_gather_indexed_blocks` before
-    mixing it with the driver's global arrays — ``jnp.asarray`` would
-    make a *single-device* array instead, which is indistinguishable
-    from the right thing at P=1 and an operand-sharding error at P>1.
-
-    Correctness precondition: the caller must guarantee the input is
-    bit-identical on every rank.  Both producers above satisfy that by
-    construction (a psum and an all-gather are rank-invariant).
-    """
-    if int(jax.process_count()) <= 1:
-        return jnp.asarray(host_array)
-    shape = tuple(int(s) for s in host_array.shape)
-    sharding = NamedSharding(mesh, P(*([None] * len(shape))))
-    local = jax.device_put(np.asarray(host_array), jax.local_devices()[0])
-    return jax.make_array_from_single_device_arrays(shape, sharding, [local])
-
-
-def _gather_indexed_blocks(local_vals: np.ndarray, local_idx: np.ndarray,
-                           n_total: int) -> np.ndarray:
-    """Per-rank ``(blk, …)`` blocks + their global indices → the whole array.
-
-    Each rank passes the values it computed and, alongside them, the
-    global slot each one belongs in (``-1`` marks a padding slot on
-    ranks that drew fewer items).  Carrying the index in the payload is
-    what frees the work assignment from having to be contiguous — see
-    the round-robin note at the top of this section — and removes any
-    dependence on the process ordering of the gather.
-
-    ONE all-gather of ``world · blk · prod(item_shape)`` elements.  For
-    ⟨mk|V_H|nk⟩ that is nk·nb²·16 B ≈ 15 MB at 80 bands / 33 MB at 120
-    bands (MoS₂ 12×12) — deliberately accepted rather than engineered
-    away: it is 3 % of one matrix-element sweep's flops-equivalent time,
-    it happens once per invocation, and it hands every rank the object
-    both consumers want (a file write on rank 0; a replicated operand
-    for ``sigma_dispatch``).
-    """
-    rank, world = _process_rank_world()
-    item_shape = tuple(int(s) for s in local_vals.shape[1:])
-    out = np.zeros((int(n_total),) + item_shape, dtype=local_vals.dtype)
-    if world <= 1:
-        for j, ik in enumerate(np.asarray(local_idx)):
-            if int(ik) >= 0:
-                out[int(ik)] = local_vals[j]
-        return out
-
-    from jax.experimental import multihost_utils as _mh
-    dev = jax.local_devices()[0]
-    vals_g = np.asarray(_mh.process_allgather(
-        jax.device_put(np.asarray(local_vals), dev), tiled=False))
-    idx_g = np.asarray(_mh.process_allgather(
-        jax.device_put(np.asarray(local_idx, dtype=np.int32), dev),
-        tiled=False))
-    for r in range(idx_g.shape[0]):
-        for j in range(idx_g.shape[1]):
-            ik = int(idx_g[r, j])
-            if ik >= 0:
-                out[ik] = vals_g[r, j]
-    return out
 
 
 def rho_work_items(nk: int, nocc: int, world: int) -> list[tuple[int, int, int]]:
@@ -405,7 +235,8 @@ def _load_rotated_occ_fftbox(wfn, meta, ik: int, U_k):
     ``nmix·nocc·ns·N_r`` (a 20× saving at MoS₂ 12×12), and the box is
     only ever materialised at ``nocc`` bands rather than ``nmix``.
     """
-    from common.wfn_transforms import to_box, process_local_mesh
+    from common.collectives import single_device_mesh
+    from common.wfn_transforms import to_box
     nmix = int(np.shape(U_k)[0])
     psi_g = wfn.load_process_local(bands=(0, nmix), k=[int(ik)])
     ns_have = int(psi_g.shape[2])
@@ -416,13 +247,13 @@ def _load_rotated_occ_fftbox(wfn, meta, ik: int, U_k):
     psi_g = jnp.einsum('mn,kmsg->knsg', U, psi_g, optimize=True)
     box = to_box(psi_g, wfn.box_index(k=[int(ik)]),
                  tuple(int(s) for s in meta.fft_grid),
-                 mesh=process_local_mesh())
+                 mesh=single_device_mesh())
     return box[0]
 
 
 def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
                                       nk: int | None = None,
-                                      mesh: Mesh | None = None,
+                                      mesh=None,
                                       psi_rotation=None,
                                       print_fn=print) -> np.ndarray:
     """ρ_v(r) on the ψ FFT box grid — k/band-partitioned, ONE psum.
@@ -474,13 +305,13 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
     Returns the summed ρ(r) as a host array identical on every rank.
     """
     mesh = resolve_mesh(mesh)
-    rank, world = _process_rank_world()
+    _, world = process_rank_world()
     nk = int(sym.nk_tot if nk is None else nk)
     nx, ny, nz = (int(s) for s in meta.fft_grid)
     rotated = psi_rotation is not None
     items = (rho_work_items(nk, int(nocc), 1) if rotated
              else rho_work_items(nk, int(nocc), world))
-    mine = items[rank::world]
+    mine = local_share(items)
     f_spin = spin_degeneracy_factor(wfn)
     wk = 1.0 / float(nk)
     print_fn(f"    rho sweep: {len(items)} (k, band-chunk) items over "
@@ -502,11 +333,11 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
         )
         del psi_k
     with timing.section("vh_rho_psum"):
-        return _psum_replicate(np.asarray(rho_local), mesh)
+        return psum_replicate(np.asarray(rho_local), mesh)
 
 
 def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
-                           nb: int, mesh: Mesh | None = None,
+                           nb: int, mesh=None,
                            psi_rotation=None,
                            print_fn=print):
     """The exact FFT-grid ⟨mk|V_H|nk⟩ for all k — **(nk, nb, nb) Ry**.
@@ -538,7 +369,7 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     ⟨m|V_H|n⟩ off-diagonals to transform H₀ into the QP basis.
     """
     mesh = resolve_mesh(mesh)
-    rank, world = _process_rank_world()
+    _, world = process_rank_world()
     nocc = int(wfn.nelec)
     nk = int(sym.nk_tot)
     if nocc > nb:
@@ -557,7 +388,7 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     # it here also means a QSGW loop pays it once, on iteration 0.
     if world > 1:
         with timing.section("vh_collective_bootstrap"):
-            _psum_replicate(
+            psum_replicate(
                 np.zeros(tuple(int(s) for s in meta.fft_grid),
                          dtype=np.float64), mesh)
 
@@ -593,34 +424,34 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
 
     # ---- 3. ⟨mk|V_H|nk⟩: k-partitioned, no reduction, one gather ------
     #
-    # COMPILE NOTE (workstream Z audit, measured with JAX_LOG_COMPILES on
-    # the cohsex fixture): ``generate_gvectors_k`` returns ``Gk_crys`` at
-    # the k-point's OWN ``ngk``, which differs between k, so
-    # ``_compute_local_V_k_jit`` compiles once per DISTINCT ngk — 3 on the
-    # fixture (IBZ ngk 749/754/754/780), and bounded above by the IBZ
-    # k-count, not by nk.  ``compute_local_V_k`` carries a ``g_mask`` hook
-    # that would collapse this to ONE compile by padding to ngkmax, and it
-    # is deliberately NOT used here: the pad columns contribute exact
-    # zeros but they CHANGE THE SUMMATION ORDER of the ⟨m|V|n⟩ reduction,
-    # and this matrix element sits inside the ~500 eV H₀ cancellation this
-    # module exists to get right.  A few extra compiles of a small kernel
-    # is the correct trade; revisit only with a bit-exactness gate.
-    ks_local = list(range(rank, nk, world))
-    blk = max(1, -(-nk // world))
-    v_local = np.zeros((blk, nb, nb), dtype=np.complex128)
-    k_local = np.full((blk,), -1, dtype=np.int32)
-    for j, ik in enumerate(ks_local):
-        if j % 32 == 0:
-            print_fn(f"    V_H matrix: local k {j + 1}/{len(ks_local)} "
-                     f"(global k={ik + 1}/{nk})...")
+    # Fixed-shape G (owner decision D10, 2026-07-30).  ``padded_gvectors``
+    # hands over the loader's OWN ``(nk, ngkmax, 3)`` table instead of
+    # slicing it back to each k's ``ngk``, so every k presents identical
+    # operand shapes: ``_compute_local_V_k_jit`` lowers ONCE instead of
+    # once per distinct ngk, and the loop becomes a sequence of dispatches
+    # of the same executable that ``collectives.sweep_local_k`` can
+    # pipeline behind a single readback.  The pad columns are made inert by
+    # ``g_mask`` — see ``PaddedGVectors`` for why the mask is mandatory
+    # rather than merely tidy (pad rows are ``(0,0,0)``, i.e. Γ).
+    #
+    # This supersedes the pre-D10 COMPILE NOTE, whose stated objection was
+    # that pad columns "change the summation order" of a matrix element
+    # inside H₀'s ~500 eV cancellation.  Appending exact zeros does not
+    # change a sum; what a shape change moves is XLA's reduction
+    # BLOCKING, which means the ragged route was itself carrying a
+    # per-ngk-dependent association and this route makes it uniform.
+    # Neither is a reference, so the two are compared on the merits at
+    # 1e-12 (tests/test_kin_ion_padded_gvectors.py).
+    gtab = padded_gvectors(wfn, k="full_bz")
+
+    def _vh_block(ik):
         wfn_k = load_kpoint_fftbox_local(wfn, meta, ik, nb)
-        Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
-        v_local[j] = np.asarray(compute_local_V_k(
-            wfn_k, Gk_crys, V_H_r, wfn.cell_volume, g_mask=None))
-        k_local[j] = ik
-        del wfn_k
-    with timing.section("vh_matrix_gather"):
-        return _gather_indexed_blocks(v_local, k_local, nk)
+        G_pad, g_mask = gtab.at(ik)
+        return compute_local_V_k(
+            wfn_k, G_pad, V_H_r, wfn.cell_volume, g_mask=g_mask)
+
+    return gather_k_blocks(nk, _vh_block, item_shape=(nb, nb),
+                           label="vh_matrix", print_fn=print_fn)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -661,16 +492,26 @@ def main(argv=None):
     timing.reset()
 
     # (the distributed init happens at module import — see the header)
-    rank, world = _process_rank_world()
+    rank, world = process_rank_world()
     print0 = print if rank == 0 else (lambda *a, **k: None)
     print0(f"== kin_ion_io ==  (P={world} process"
-           f"{'es' if world != 1 else ''}, {jax.device_count()} devices)")
+           f"{'es' if world != 1 else ''}, {device_count()} devices)")
+
+    # Persistent compile cache — same call, same position (after the
+    # distributed init, before any jit) as gw.gw_jax:145.  Without it this
+    # CLI re-lowers every kernel on every invocation, which at nb=256 is
+    # most of the wall: 40 s of recorded sections inside a 124 s run.  The
+    # per-k kernels here recompile once per DISTINCT ngk (see the COMPILE
+    # NOTE in compute_hartree_matrix), so the miss count is the IBZ k-count,
+    # not one.
+    from common.jax_compile_cache import ensure_jax_compile_cache
+    ensure_jax_compile_cache()
 
     # ---- the multi-rank contract: DISTRIBUTE, then write once -----------
     # This used to refuse ``srun -n P`` outright, because every rank redid
     # the whole calculation on device 0 and then overwrote the same
     # ``kin_ion.h5`` at rc=0.  Both halves of that are now fixed: the k
-    # loops below are partitioned over ranks (see THE DISTRIBUTION LAYER),
+    # loops below are partitioned over ranks (``collectives.gather_k_blocks``),
     # and the write is coordinated — rank 0 alone opens the file, after a
     # gather that has already given it every k.
     #
@@ -690,9 +531,8 @@ def main(argv=None):
             f"JAX_PROCESS_COUNT) but jax.distributed joined a world of "
             f"{world}.  Every task would redo the whole calculation and "
             f"overwrite the same output file.  Fix the distributed launch "
-            f"(JAX_COORDINATOR_ADDRESS reachable from every task; note "
-            f"GLOO_SOCKET_IFNAME is inert in shipped jax — "
-            f"LORRAX_GLOO_IFNAME is the transport knob) or run `-n 1`.")
+            f"(JAX_COORDINATOR_ADDRESS must be reachable from every "
+            f"task) or run `-n 1`.")
 
     input_dir = os.path.dirname(os.path.abspath(args.input))
 
@@ -760,7 +600,6 @@ def main(argv=None):
           f"nspin/nspinor: {int(getattr(wfn, 'nspin', 1))}/{int(wfn.nspinor)}")
     print0(f"nval={nval} ncond={ncond} nelec(bands)={int(wfn.nelec)}")
     print0(f"Hartree folded in: {args.hartree}")
-    print0(f"Devices: {jax.device_count()}")
 
     # ---- load pseudopotentials ----
     pseudo_dir = args.pseudo_dir or input_dir
@@ -834,18 +673,13 @@ def main(argv=None):
     # SAME Coulomb convention as V_loc above (``ctx.truncation_2d``, i.e.
     # the deck's sys_dim) — which is also QE's, since the DFT run that
     # produced E_DFT/vxc.dat used ``assume_isolated='2D'`` for a slab.
-    mesh_xy = resolve_mesh()
-    # Pay the communicator-bootstrap cost once, up front, instead of
-    # inside the ρ psum.  Measured on Frontera/Gloo at P=4: the FIRST
-    # collective of a run costs ~12 s of topology exchange and the
-    # second costs microseconds, so without this the 1.4 MB all-reduce
-    # looks like 70 % of the kernel and the strong-scaling numbers are
-    # measuring Gloo's handshake.  Same rationale (and same helper) as
-    # ``gw.gw_jax._setup_runtime``.
-    if world > 1:
-        from runtime import nccl_warmup
-        with timing.section("collective_warmup"):
-            nccl_warmup(mesh_xy)
+    # ``prepare_mesh`` also pays the communicator-bootstrap cost once, up
+    # front, instead of inside the ρ psum.  Measured on Frontera/Gloo at
+    # P=4: the FIRST collective of a run costs ~12 s of topology exchange
+    # and the second costs microseconds, so without it the 1.4 MB
+    # all-reduce looks like 70 % of the kernel and the strong-scaling
+    # numbers are measuring the transport's handshake.
+    mesh_xy = prepare_mesh(print_fn=print0)
     v_h_all = None
     if args.hartree:
         with timing.section("build_V_H"):
@@ -867,30 +701,22 @@ def main(argv=None):
     # all three consumers call; the price is one extra ψ read per k, which
     # is itself now P-way parallel.)
     out_path = args.output or os.path.join(input_dir, "kin_ion.h5")
-    ks_local = list(range(rank, sym.nk_tot, world))
-    blk = max(1, -(-int(sym.nk_tot) // world))
-    kin_local = np.zeros((blk, nb_eff, nb_eff), dtype=np.complex128)
-    kidx_local = np.full((blk,), -1, dtype=np.int32)
+    gtab = padded_gvectors(wfn, k="full_bz")
 
-    print0(f"\nProcessing {sym.nk_tot} k-points over P={world} ranks "
-           f"({len(ks_local)} on rank 0)...")
-    for j, ik in enumerate(ks_local):
-        if j % 16 == 0:
-            print0(f"  local k={j + 1}/{len(ks_local)} (global {ik + 1}/{sym.nk_tot})...")
+    def _kin_ion_block(ik):
+        wfn_k = load_kpoint_fftbox_local(wfn, meta, ik, nb_eff)
+        G_pad, g_mask = gtab.at(ik)
+        return get_kin_ion_k(wfn_k, G_pad, sym.unfolded_kpts[ik],
+                             V_loc_r, vnl_setup, wfn, g_mask=g_mask)
 
-        with timing.section("kin_ion_k"):
-            wfn_k = load_kpoint_fftbox_local(wfn, meta, ik, nb_eff)
-            kvec = sym.unfolded_kpts[ik]
-            Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
-
-            H_k = get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn)
-            kin_local[j] = np.asarray(H_k)
-            kidx_local[j] = ik
-            del wfn_k
-
-    with timing.section("kin_ion_gather"):
-        kin_ion_all = _gather_indexed_blocks(kin_local, kidx_local, sym.nk_tot)
-    del kin_local
+    # ``gather_k_blocks`` records ONE ``kin_ion_k`` section around the WHOLE
+    # sweep, count 1 — not one per k.  The per-k timer this replaces only
+    # worked because ``np.asarray(H_k)`` synchronised inside it; with the
+    # readback deferred a per-k section would time the dispatch and
+    # attribute the compute to whoever happened to block next.
+    kin_ion_all = gather_k_blocks(sym.nk_tot, _kin_ion_block,
+                                  item_shape=(nb_eff, nb_eff),
+                                  label="kin_ion", print_fn=print0)
 
     folded = bool(args.fold_hartree and v_h_all is not None)
     if folded:
@@ -944,9 +770,7 @@ def main(argv=None):
                     vh.attrs["nocc"] = int(wfn.nelec)
                     vh.attrs["fft_grid"] = np.asarray(meta.fft_grid, dtype=np.int32)
 
-    if world > 1:
-        from jax.experimental import multihost_utils as _mh
-        _mh.sync_global_devices("kin_ion_written")
+    barrier("kin_ion_written")
 
     _src = ("FOLDED into kin_ion (legacy)" if folded else
             (f"stored as '{HARTREE_DATASET}'" if v_h_all is not None
@@ -963,6 +787,22 @@ def main(argv=None):
     if rank == 0:
         timing.report(title="--- Timing (seconds) ---")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Forwarding shims — NOT used by anything in this file.
+# ---------------------------------------------------------------------------
+# These four names used to be defined here; they are generic k-partition
+# plumbing and now live in ``common.collectives``.  Two call sites still
+# import them from this module (``gw.sigma_dispatch``,
+# ``tests/test_sanity_gates_jax.py``), which are outside this workstream's
+# file ownership — see requests R3/R4.  Delete this block once both move.
+from common.collectives import (                       # noqa: E402,F401
+    gather_indexed_blocks as _gather_indexed_blocks,
+    psum_replicate as _psum_replicate,
+    replicate_to_mesh,
+    sweep_local_k,
+)
 
 
 if __name__ == "__main__":

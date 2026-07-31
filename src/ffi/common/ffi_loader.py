@@ -31,13 +31,15 @@ LORRAX_FFI_SO
 LORRAX_FFI_HOST_SO
     Absolute path to ``liblorrax_ffi_host.so`` (cpu).  Takes precedence.
 
-Dynamic-linking environment (audited 2026-07-27, workstream AW)
----------------------------------------------------------------
-The dlopen here resolves the library's ``DT_NEEDED`` through its
-RUNPATH plus ``LD_LIBRARY_PATH``.  On Frontera the unified host lib's
-RUNPATH covers Intel MPI ``lib/release``, SLATE's ``lib64`` and MKL —
-what ``LD_LIBRARY_PATH`` MUST add is only what has no RUNPATH
-coverage: the parallel-HDF5 ``lib`` (``libhdf5.so.310``), Intel MPI's
+Where the library's own dependencies come from (audited 2026-07-27, AW)
+----------------------------------------------------------------------
+Loading the FFI library also loads everything it needs, searched first
+in the directory list baked into the library at link time (its *built-in
+search path*, set by ``config/frontera/build_ffi_host.sh``) and then in
+``LD_LIBRARY_PATH``.  On Frontera the unified host lib's built-in path
+already covers Intel MPI ``lib/release``, SLATE's ``lib64`` and MKL —
+what ``LD_LIBRARY_PATH`` MUST add is only what it does not cover: the
+parallel-HDF5 ``lib`` (``libhdf5.so.310``), Intel MPI's
 ``libfabric/lib``, and (for the overlay h5py, not for this .so) the
 Intel compiler runtime.  Two ordering facts, so nobody re-derives
 them:
@@ -45,7 +47,7 @@ them:
 * **"SLATE first" is convention, not requirement.**  The SLATE dir
   holds only ``libslate``/``libblaspp``/``liblapackpp`` (no libmpi, no
   libhdf5, no MKL), so its position can shadow nothing; libslate's own
-  RUNPATH resolves its transitive blaspp/lapackpp.  Ordering among the
+  built-in search path finds its blaspp/lapackpp.  Ordering among the
   LORRAX entries is not load-bearing — PRESENCE is (a missing entry is
   the ``probe_target`` "library could not be loaded" case).
 * The one measured ordering hazard is host-lib STAGING into the
@@ -83,7 +85,7 @@ __all__ = ["get_lib", "has_target", "probe_target", "has_phdf5_read",
            "has_phdf5_write"]
 
 _LIBS: Dict[str, ctypes.CDLL] = {}
-#: platform -> the .so path actually dlopen'd (for diagnostics).
+#: platform -> the .so path actually loaded (for diagnostics).
 _LIB_PATHS: Dict[str, str] = {}
 
 # Symbols the XLA FFI side exports (plain C via XLA_FFI_DEFINE_HANDLER_SYMBOL),
@@ -391,10 +393,10 @@ def probe_target(target_name: str, platform: str) -> tuple[bool, str]:
         Not a target of this platform's library at all — a typo or a
         wrong-platform request.
     ``library could not be loaded``
-        The ``.so`` is missing, or ``dlopen`` failed (an unresolved
-        ``DT_NEEDED``, a glibc/GLIBCXX mismatch, a wrong
-        ``LD_LIBRARY_PATH``).  **The handler may well be compiled;
-        nothing about the build is wrong.**
+        The ``.so`` is missing, or loading it failed: one of the
+        libraries it in turn needs could not be found, a glibc/GLIBCXX
+        mismatch, a wrong ``LD_LIBRARY_PATH``.  **The handler may well
+        be compiled; nothing about the build is wrong.**
     ``loaded but does not export <symbol>``
         The genuine partial-build case — this, and ONLY this, is a
         "rebuild the library" problem.
@@ -405,8 +407,9 @@ def probe_target(target_name: str, platform: str) -> tuple[bool, str]:
     entry in ``LD_LIBRARY_PATH``) goes unmentioned.  On Frontera the
     unified host lib needs MKL **and** the Intel compiler runtime
     (``libimf``/``libsvml``/``libintlc``/``libirng``) **and** the phdf5
-    ``libhdf5.so.310`` **and** ``libfabric`` — only some of which are in
-    its RUNPATH.  Getting that wrong silently downgraded an N×1 mesh to
+    ``libhdf5.so.310`` **and** ``libfabric`` — only some of which are
+    covered by the library's built-in search path.  Getting that wrong
+    silently downgraded an N×1 mesh to
     ``native`` with a "not compiled" diagnosis (found by wk_P G4,
     2026-07-25).
 
@@ -430,9 +433,10 @@ def probe_target(target_name: str, platform: str) -> tuple[bool, str]:
             f"NOTE: this says nothing about whether {target_name} is "
             f"compiled — fix the library path/dependencies first "
             f"(LORRAX_FFI_SO / LORRAX_FFI_HOST_SO select the .so; "
-            f"LD_LIBRARY_PATH must cover its DT_NEEDED — on Frontera that "
-            f"means MKL + the Intel compiler runtime + parallel HDF5 + "
-            f"libfabric + SLATE's lib64; `ldd <so>` lists what is missing).")
+            f"LD_LIBRARY_PATH must cover every library that .so needs — "
+            f"on Frontera that is the vendor BLAS/ScaLAPACK (MKL) + the "
+            f"Intel compiler runtime + parallel HDF5 + libfabric + "
+            f"SLATE's lib64; run `ldd <so>` to see which are missing).")
     if not hasattr(lib, sym):
         return False, (
             f"loaded {_loaded_path(platform)} but it does not export {sym} — "
@@ -520,7 +524,7 @@ def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
 
 
 def _loaded_path(platform: str) -> str:
-    """The .so path dlopen'd for ``platform`` (for error messages)."""
+    """The .so path loaded for ``platform`` (for error messages)."""
     return _LIB_PATHS.get(platform, f"<{platform} library>")
 
 

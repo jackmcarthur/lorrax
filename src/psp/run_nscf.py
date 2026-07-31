@@ -38,6 +38,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from common.collectives import all_gather_processes, barrier
 from file_io import CrystalData, WFNWriter
 from psp.pseudos import load_pseudopotentials
 from psp.h_dft import setup_H_k_from_kvec, make_apply_H
@@ -248,21 +249,26 @@ def run_nscf(
                 print(f"  [rank {rank}] k={ik:3d}/{nk}: "
                       f"{time.perf_counter()-tk:.3f}s  evals[0]={evals[0]:.6f} Ry")
 
-        # Gather evals + evecs across processes. Each ik has one owner (sum
-        # reduction over the zero-initialised buffers gives the right answer).
-        if n_proc > 1:
-            from jax.experimental import multihost_utils as _mh
-            eigenvalues = np.asarray(
-                _mh.process_allgather(jnp.asarray(eigenvalues), tiled=False)
-            ).reshape(n_proc, nk, nbnd).sum(axis=0)
-            local_coeffs = np.asarray(
-                _mh.process_allgather(jnp.asarray(local_coeffs), tiled=False)
-            ).reshape(n_proc, nk, nbnd, nspinor, ngkmax).sum(axis=0)
-            if do_pseudobands:
-                all_evecs = np.asarray(
-                    _mh.process_allgather(jnp.asarray(all_evecs), tiled=False)
-                ).reshape(n_proc, nk, nbnd, nspinor, ngkmax).sum(axis=0)
-            _mh.sync_global_devices("run_nscf_kloop_done")
+        # Gather evals + evecs across processes.  Each ik has exactly one
+        # owner and every other rank left that slot zero, so the cross-rank
+        # reduction is a plain sum.
+        #
+        # ``all_gather_processes`` + ``.sum(0)`` is BIT-IDENTICAL to what this
+        # loop did by hand, which is why it is what landed: this workstream
+        # cannot gate ``run_nscf`` at P>1.  It is also P-LINEAR in memory —
+        # the gather materialises ``(P, nk, nbnd, nspinor, ngkmax)`` on every
+        # rank, 26 MB x P at the MoS2 4x4 / 128-band deck.  The right call is
+        # ``collectives.psum_replicate(buf, mesh)``, one all-reduce and no
+        # P-fold transient; it needs a mesh and one addressable device per
+        # process, and a P>1 gate to switch on.  See request R3.
+        def _owner_sum(buf):
+            return all_gather_processes(buf, tiled=False).sum(axis=0)
+
+        eigenvalues = _owner_sum(eigenvalues)
+        local_coeffs = _owner_sum(local_coeffs)
+        if do_pseudobands:
+            all_evecs = _owner_sum(all_evecs)
+        barrier("run_nscf_kloop_done")
 
         # Only rank 0 writes the WFN.h5 file; H5 is not parallel-writable here.
         if rank == 0:
@@ -273,9 +279,7 @@ def run_nscf(
                 writer.write_k(ik, eigenvalues[ik],
                                local_coeffs[ik, :, :, :ng_k])
             writer.close()
-        if n_proc > 1:
-            from jax.experimental import multihost_utils as _mh
-            _mh.sync_global_devices("run_nscf_wfn_written")
+        barrier("run_nscf_wfn_written")
 
         if verbose and rank == 0:
             dt = time.perf_counter() - t_dav

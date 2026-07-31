@@ -21,6 +21,7 @@
 //                                       Frontera — scorecard AI/AW)
 //   LORRAX_PHDF5_DUMP_HINTS       (0)   print the hints ROMIO retained
 
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -64,22 +65,72 @@ static void throw_if_cuda(cudaError_t st, const char* what) {
 // caller triggers it eagerly via the exported ``lrx_phdf5_init_mpi``
 // (takes ~400 ms on first call; calling it during program startup
 // before the hot path saves that time on the critical path).
+// GUARD (scorecard AS.4b; twin in slate/cpp/context.cc).  This ctx runs a
+// dedicated writer thread whose H5Dwrite drives MPI-IO collectives
+// concurrently with any main-thread / XLA-thread MPI traffic.  That
+// concurrency is only DEFINED at MPI_THREAD_MULTIPLE.  When *we* init MPI we
+// request MULTIPLE — but when someone else got there first (jax's MPI CPU
+// collectives via MPItrampoline request FUNNELED; an unpatched MPIwrapper
+// grants it), the granted level is whatever they asked for, and the measured
+// consequence at P=16 x 8 nodes was a ~29% provider-independent segfault/hang
+// rate at the zeta-write/V_q boundary — two threads of one rank concurrently
+// inside MPID_Progress_wait.  The certified fix is the THREAD_MULTIPLE-
+// patched MPIwrapper; this guard exists so the hazardous configuration
+// announces itself up front instead of dying minutes later with a backtrace
+// that names neither cause nor fix.
+//
+// MOVED HERE from inside open_ctx (2026-07-30 FFI divergence audit).  It ran
+// only on the first open_file, so the documented eager-init entry point
+// `lrx_phdf5_init_mpi` (api.cc:74) — whose entire purpose is to init MPI
+// early, at startup, off the critical path — took the hazardous decision and
+// said nothing.  Sitting in ensure_mpi_initialized it now covers every way
+// this library can reach MPI, and it queries on BOTH paths: after we
+// initialise AND after an early return because someone else already did.
+// The already-initialised path is the hazardous one, so a guard that only
+// ran when we called MPI_Init_thread ourselves would be void by
+// construction.  Rank now comes from MPI_Comm_rank rather than open_ctx's
+// argument, which is what let it live at the lower level.
+static void warn_if_thread_level_insufficient() {
+    static std::atomic<bool> warned{false};
+    int provided = 0;
+    MPI_Query_thread(&provided);
+    if (provided >= MPI_THREAD_MULTIPLE) return;
+    int rank = -1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (rank != 0) return;
+    if (warned.exchange(true)) return;
+    std::fprintf(stderr,
+        "[phdf5] WARNING: MPI granted thread level %d < "
+        "MPI_THREAD_MULTIPLE (%d) and MPI was initialized before "
+        "this library (jax cpu_collectives_implementation=mpi with "
+        "an unpatched MPIwrapper?).  The phdf5 writer thread's "
+        "collective MPI-IO is UNDEFINED at this level — measured "
+        "~29%% multi-node crash rate (scorecard AS.4b).  Fix: "
+        "point MPITRAMPOLINE_LIB at the MPIwrapper built by "
+        "config/frontera/build_mpiwrapper.sh, which upgrades every "
+        "init to MPI_THREAD_MULTIPLE (docs/dev/mpi_collectives.md).\n",
+        provided, MPI_THREAD_MULTIPLE);
+    std::fflush(stderr);
+}
+
 void ensure_mpi_initialized() {
     int inited = 0;
     MPI_Initialized(&inited);
-    if (inited) return;
-    int provided = 0;
-    // MPI_THREAD_MULTIPLE is required: the dedicated writer thread
-    // (ctx->writer_thread, started in open_ctx) calls H5Dwrite which
-    // internally drives MPI-IO collectives concurrently with any
-    // main-thread MPI calls.  We accept whatever level we get and
-    // assume MULTIPLE (required for the parallel-HDF5 build + OpenMPI
-    // stack on Perlmutter); running on a weaker-threaded MPI would
-    // silently corrupt MPI state.
-    MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &provided);
-    // Do NOT register MPI_Finalize via atexit — HDF5 calls MPI at its
-    // own destructors; ordering is fragile.  Our close_file path calls
-    // MPI_Finalize explicitly when the last file closes (via a ref count).
+    if (!inited) {
+        int provided = 0;
+        // MPI_THREAD_MULTIPLE is required: the dedicated writer thread
+        // (ctx->writer_thread, started in open_ctx) calls H5Dwrite which
+        // internally drives MPI-IO collectives concurrently with any
+        // main-thread MPI calls.  `provided` is NOT inspected here on
+        // purpose — MPI_Query_thread below answers the same question on
+        // both paths, and reading it only here would miss the hazardous
+        // case entirely (someone else initialised first).
+        MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &provided);
+        // Do NOT register MPI_Finalize via atexit — HDF5 calls MPI at its
+        // own destructors; ordering is fragile.  Our close_file path calls
+        // MPI_Finalize explicitly when the last file closes (via a ref count).
+    }
+    warn_if_thread_level_insufficient();
 }
 
 // Pull an integer tunable from env, falling back to default.
@@ -181,41 +232,10 @@ static hid_t h5_open_or_create(const std::string& path, int mode_flag, hid_t fap
 PhdfCtx* open_ctx(const std::string& path, int p, int q,
                   int rank, int world_size, int mode_flag)
 {
+    // Covers the thread-level guard too — it lives in
+    // ensure_mpi_initialized now (see the note there), so the eager
+    // lrx_phdf5_init_mpi path gets it as well.
     ensure_mpi_initialized();
-
-    // GUARD (scorecard AS.4b): this ctx runs a dedicated writer thread
-    // whose H5Dwrite drives MPI-IO collectives concurrently with any
-    // main-thread / XLA-thread MPI traffic.  That concurrency is only
-    // DEFINED at MPI_THREAD_MULTIPLE.  When *we* init MPI we request
-    // MULTIPLE (ensure_mpi_initialized) — but when someone else got
-    // there first (jax's MPI CPU collectives via MPItrampoline request
-    // FUNNELED; an unpatched MPIwrapper grants it), the granted level is
-    // whatever they asked for, and the measured consequence at P=16 x 8
-    // nodes was a ~29% provider-independent segfault/hang rate at the
-    // zeta-write/V_q boundary — two threads of one rank concurrently
-    // inside MPID_Progress_wait.  The certified fix is the
-    // THREAD_MULTIPLE-patched MPIwrapper (wk_AS mpiw_thr_install /
-    // MPITRAMPOLINE_LIB); this guard exists so the hazardous
-    // configuration announces itself up front instead of dying minutes
-    // later with a backtrace that names neither cause nor fix.
-    {
-        int provided = 0;
-        MPI_Query_thread(&provided);
-        if (provided < MPI_THREAD_MULTIPLE && rank == 0) {
-            std::fprintf(stderr,
-                "[phdf5] WARNING: MPI granted thread level %d < "
-                "MPI_THREAD_MULTIPLE (%d) and MPI was initialized before "
-                "this library (jax cpu_collectives_implementation=mpi with "
-                "an unpatched MPIwrapper?).  The phdf5 writer thread's "
-                "collective MPI-IO is UNDEFINED at this level — measured "
-                "~29%% multi-node crash rate (scorecard AS.4b).  Fix: use "
-                "the MPI_THREAD_MULTIPLE-patched MPIwrapper as "
-                "MPITRAMPOLINE_LIB (wk_AS mpiw_thr_install), or run the "
-                "gloo collectives default.\n",
-                provided, MPI_THREAD_MULTIPLE);
-            std::fflush(stderr);
-        }
-    }
 
     auto* ctx = new PhdfCtx{};
     ctx->path = path;

@@ -115,14 +115,13 @@ def _has_gpu() -> bool:
 def _cufft_probe_available() -> bool:
     """Return True iff the libcufft workspace query works in this env.
 
-    The Shifter container ships JAX 0.5.3, whose GPU build does not expose
-    ``libcufft.so`` in ``/proc/self/maps`` after CUDA init, so
-    ``_query_one_plan_workspace_bytes`` raises ``CufftQueryError``.  The
-    three GPU tests below all depend on that probe; skip them precisely when
-    it is unavailable.  Once the env matches pyproject (JAX ~0.9 with a
-    dynamically linked cuFFT) the probe succeeds and the tests RUN again —
-    so a real regression is still caught.  Only ``CufftQueryError`` is
-    swallowed here; any other failure propagates.
+    The query needs a jaxlib whose cuFFT is a *separate* shared object, so it
+    shows up in ``/proc/self/maps`` after CUDA init.  That holds for the
+    pyproject env (JAX 0.9.1 + ``nvidia-cufft-cu12``, which ships
+    ``libcufft.so.11``); it did NOT hold for the older Shifter container's
+    JAX 0.5.3.  Skip precisely when the probe is unavailable, so a real
+    regression is still caught wherever it is available.  Only
+    ``CufftQueryError`` is swallowed here; any other failure propagates.
     """
     if not _has_gpu():
         return False
@@ -140,10 +139,33 @@ def _cufft_probe_available() -> bool:
 
 
 _CUFFT_SKIP_REASON = (
-    "libcufft workspace query unavailable: GPU absent, or the container's "
-    "cuFFT is not in /proc/self/maps (Shifter JAX 0.5.3); needs the "
-    "JAX~0.9 env per pyproject. Container-env mismatch, not a regression."
+    "libcufft workspace query unavailable: GPU absent, or this jaxlib's cuFFT "
+    "is not a separate .so in /proc/self/maps. Env mismatch, not a regression."
 )
+
+
+@pytest.mark.skipif(not _has_gpu(), reason="needs a CUDA backend")
+def test_xla_gpu_still_emits_a_parseable_fft_op():
+    """XLA:GPU must keep emitting an ``fft`` HLO op that our regex can read.
+
+    This is the guard on the one way the cuFFT term can go to zero without
+    anybody noticing: if XLA:GPU ever rewrites ``fft`` into a custom-call the
+    way XLA:CPU does for Ducc, ``parse_fft_specs_from_hlo`` returns an empty
+    list, ``cufft_scratch`` becomes 0, and ``cufft_measured`` stays True
+    because nothing failed.  Then the planner is back to under-predicting
+    silently.  ``query_fft_peak_bytes`` announces that case at runtime; this
+    test turns it into a failure in CI.
+    """
+    from src.runtime.aot_memory import parse_fft_specs_from_hlo
+
+    compiled = jax.jit(lambda x: jnp.fft.fftn(x, axes=(1, 2, 3))).lower(
+        jax.ShapeDtypeStruct((4, 8, 8, 8), jnp.complex128)).compile()
+    specs = parse_fft_specs_from_hlo(compiled.as_text())
+    assert specs, (
+        "XLA:GPU's optimized HLO for jnp.fft.fftn contains no parseable fft "
+        "op.  Every cuFFT scratch prediction is now silently 0 — update "
+        "_FFT_OP_RE in src/runtime/aot_memory.py.")
+    assert specs[0].rank == 3 and specs[0].transform_shape == (8, 8, 8)
 
 
 @pytest.mark.skipif(not _cufft_probe_available(), reason=_CUFFT_SKIP_REASON)
@@ -181,6 +203,10 @@ def test_predicted_peak_matches_runtime_3d_fft():
     assert breakdown.cufft_scratch > 0, (
         "cuFFT plan workspace should be positive for a 75×75×200 batched "
         "3-D FFT — query path is not reaching libcufft."
+    )
+    assert breakdown.cufft_measured is True, (
+        "cufft_measured must be True when the query actually ran; a False "
+        "here means the 0-scratch demotion path was taken."
     )
 
     # Run for real and read peak_bytes_in_use.

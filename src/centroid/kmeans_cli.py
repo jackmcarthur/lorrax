@@ -1,14 +1,22 @@
 """CLI driver for the weighted k-means ISDF point selector.
 
-Run as ``python3 -m centroid.kmeans_cli N_C [opts]``. Builds the device
-mesh, calls ``weighted_kmeans_jax``, snaps to the FFT grid, optionally
-prunes via pivoted Cholesky, and optionally plots.
+Run as ``python3 -m centroid.kmeans_cli N_C [opts]``.
+
+The physics, in the order it happens: pick the density that decides WHERE
+the ISDF quadrature gets points; run a density-weighted k-means over the
+real-space FFT grid, optionally in orbit representatives so the answer is
+closed under the crystal point group; snap to the grid and unfold; then
+prune the over-sampled candidate pool down to N_c by pivoted Cholesky on
+the pair-density Gram, which keeps the points that span the band window
+Σ actually consumes.
+
+Device meshes, sharding and placement live in :mod:`centroid.distribution`.
 """
 from __future__ import annotations
 
 # Canonical JAX GPU/CPU bootstrap — single-sourced in runtime.bootstrap()
 # (env defaults + jax.distributed init + CPU fallback; all idempotent).
-# MUST precede this module's own `import jax` so JAX_ENABLE_X64 etc. take
+# MUST precede any import that pulls in jax, so JAX_ENABLE_X64 etc. take
 # effect.  NOTE: this used to be set_default_env() + init_jax_distributed()
 # only; bootstrap() adds fallback_to_cpu_if_no_gpu_backend(), so on a node
 # with no usable GPU backend this CLI now falls back to CPU instead of
@@ -17,16 +25,14 @@ from runtime import bootstrap
 bootstrap()
 
 import argparse
-import math
 
 import numpy as np
-import jax
-import jax.numpy as jnp
-from jax.sharding import Mesh
 
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps, timing
+from common.collectives import process_rank
 
+from . import distribution as dist
 from .charge_density import get_charge_density
 from .kmeans_isdf import (
     BOHR_TO_ANG,
@@ -163,20 +169,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Mesh selection (factor n_dev as 2-D when possible).
+# The σ window — one resolver, two consumers
 # ─────────────────────────────────────────────────────────────────────────
-
-_P_PER_SHARD_MIN = 100_000
-"""NCCL-latency floor: shard only when each device sees ≥ this many points
-(measured on Si 4×4×4: P=110k / 4 GPUs gave a slower run than single-device
-because allreduce dominated the 1 ms local compute)."""
-
 
 def _resolve_sigma_window(args, wfn) -> tuple[int, int]:
     """``(n_val, n_cond)`` of the σ window — the bands the ISDF must span.
 
     Single source of truth for both consumers: the pivoted-Cholesky prune
     band ranges and the ``band_range`` k-means weight.
+
+    KEEP THESE TWO EXPLICIT.  ``n_cond`` defaulting to ``n_val`` gave every
+    centroid set built before 2026-07-29 a prune window of (0, n_val) ×
+    (0, 2·n_val) while Σ_c consumed the full band square: at nb=1024 the
+    selection came back rank-deficient by 30 % (897 orbits requested, 630
+    achieved, Gram diagonals at 7.6e-17) and the QP gap went NEGATIVE.
+    Dose-response is monotone in the window: (0,52) → eqp0 0.3645,
+    (0,256) → 3.1350, (0,1024) → 3.7227.  ``wk_REL/centroid_rank_gate.sh``
+    reads this run's log and FAILS on the shortfall — do not reword the
+    "target N orbits", "prune window:" or "After pruning ... rank=N" lines
+    below without updating it.
     """
     n_val = (int(args.prune_n_val) if args.prune_n_val is not None
              else int(wfn.nelec))
@@ -186,42 +197,157 @@ def _resolve_sigma_window(args, wfn) -> tuple[int, int]:
     return n_val, n_cond
 
 
-def _build_mesh(args, n_points: int) -> tuple[Mesh, tuple[str, ...]]:
-    """Pick a 2-D device mesh ('x', 'y'), matching gw_jax's ISDF mesh.
+# ─────────────────────────────────────────────────────────────────────────
+# Stages
+# ─────────────────────────────────────────────────────────────────────────
 
-    Single-device collapses to a 1×1 2-D mesh so the downstream pipeline
-    (which uses ``load_centroids_band_chunked`` and friends) only has one
-    codepath to worry about.
+def _resolve_symmetry(args, wfn, sym, charge_density):
+    """The point group the centroid set will be closed under.
+
+    Gate on the group RECOVERED FROM THE DENSITY, not on ``wfn.ntran``: a
+    reduced WFN understates the crystal symmetry (non-collinear SOC stores
+    only {E, σ_h}; a nosym run stores {E}), and orbit closure taken from
+    the stored group leaves ⟨nk|V_H|nk⟩ C3-broken across the k-star.
+
+    Returns ``(R, Rinv, tau, n_sym, orbit_aware)``.
     """
-    devices = jax.devices()
-    n_dev = len(devices)
-    multi_host = jax.process_count() > 1
+    if args.no_orbit:
+        return None, None, None, 1, False
+    from .orbit_syms import build_real_space_syms
+    R, Rinv, tau = build_real_space_syms(
+        wfn, sym, charge_density=charge_density)
+    n_sym = int(R.shape[0])
+    if args.orbit or n_sym > 1:
+        return R, Rinv, tau, n_sym, True
+    return None, None, None, 1, False
 
-    if args.no_shard or n_dev < 2:
-        return Mesh(np.asarray(devices[:1]).reshape(1, 1), ("x", "y")), ("x", "y")
 
-    # Most-square 2-D factorisation (same recipe as ``gw_jax._build_mesh``).
-    nx = max(k for k in range(1, int(math.isqrt(n_dev)) + 1) if n_dev % k == 0)
-    ny = n_dev // nx
-    n_shards = nx * ny
-    per_shard = n_points // n_shards
+def _resolve_weight(args, wfn, charge_density, Rinv, tau):
+    """WHICH density weights the k-means — i.e. where the quadrature gets
+    points at all.  Returns ``(weight, label)``.
 
-    # Never fall back to single-device when running multi-host: the other
-    # ranks would sit on collectives against a mesh they aren't in and
-    # the JAX distributed shutdown barrier would hang for minutes.
-    if per_shard < _P_PER_SHARD_MIN and not args.force_shard and not multi_host:
-        print(f"P/{n_shards} = {per_shard} < {_P_PER_SHARD_MIN} points per "
-              "shard; falling back to single-device. Pass --force-shard to "
-              "override.")
-        return Mesh(np.asarray(devices[:1]).reshape(1, 1), ("x", "y")), ("x", "y")
+    WHY ``band_range`` EXISTS: the occupied-only ρ(r) is entirely inside
+    the slab, so a ρ-weighted k-means places ZERO centroids in the vacuum
+    and the vacuum-localized far-conduction states have no quadrature
+    support — ⟨nk|V_H|nk⟩ (a pure centroid sum) then comes back sign-wrong
+    (+140 eV vs −140 eV on MoS2) and the whole error lands on
+    Vxc = E_dft − kin_ion − V_H.
+    """
+    if args.centroid_weight != "band_range":
+        return charge_density, (
+            "scalar charge density ρ(r)" if args.density_mode == "scalar"
+            else "Gordon-decomposed Pauli current "
+                 "Σ_{n,k,i}(j^Gordon_{n,k,i}(r))²")
 
-    if multi_host and per_shard < _P_PER_SHARD_MIN:
-        print(f"P/{n_shards} = {per_shard} < {_P_PER_SHARD_MIN}; sharding "
-              "anyway (multi-host: single-device fallback would deadlock).")
+    if args.density_mode != "scalar":
+        raise ValueError(
+            "--centroid-weight band_range applies to the scalar (charge) "
+            "channel; --density-mode current already weights by its own "
+            "occupied-state current.")
+    if args.weight_bands is not None:
+        b_lo, b_hi = (int(v) for v in args.weight_bands.split(":"))
+    else:
+        n_val, n_cond = _resolve_sigma_window(args, wfn)
+        b_lo, b_hi = 0, n_val + n_cond
 
-    dev_grid = np.asarray(devices).reshape(nx, ny)
-    print(f"Sharded mesh: ('x'={nx}, 'y'={ny}) over {n_dev} devices")
-    return Mesh(dev_grid, ("x", "y")), ("x", "y")
+    # τ=0 is required for the plain-index grid symmetrization; the
+    # recovered density point group is symmorphic by construction, a WFN
+    # group may not be.
+    ops = (np.asarray(Rinv) if Rinv is not None
+           and np.allclose(np.asarray(tau), 0.0, atol=1e-8) else None)
+    print(f"k-means weight: band_range Σ_{{n∈[{b_lo},{b_hi})}} Σ_k w_k|ψ_nk|²"
+          f"{'' if ops is None else f' (symmetrized, {len(ops)} ops)'}")
+    from .charge_density import rho_from_band_range
+    return (rho_from_band_range(wfn, (b_lo, b_hi), sym_ops=ops),
+            f"band-range density Σ_{{n∈[{b_lo},{b_hi})}} Σ_k w_k|ψ_nk(r)|²")
+
+
+def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
+                     Rinv, tau, n_sym, M_cand):
+    """Fractional centroids → unique FFT-grid points.
+
+    Returns ``(indices, fractional, n_unique, orbit_id)``.
+    """
+    if orbit_aware:
+        # Snap reps to the FFT grid FIRST. Lloyd produces off-grid fp64 reps,
+        # and their fp64 sym images would round inconsistently — two
+        # mathematically sym-related reps could land on different grid
+        # cells. Snap-then-unfold guarantees on-grid orbit closure (because
+        # R is integer and τ × fft_grid is integer for grid-commensurate τ).
+        _, reps_snapped, _ = snap_centroids_to_grid(
+            centroids_frac, fft_grid, deduplicate=False)
+        # Unfold with Rinv = inv(mtrx): the BGW r-action is r' = Rinv·r + τ,
+        # matching compute_centroid_sym_perm and validate_atomic_symmetries.
+        # A no-op vs forward S on symmorphic systems (CrI3, MoS2); critical
+        # for Si Fd-3m.
+        from .orbit_syms import unfold_orbit_unique_with_id
+        unfolded, orbit_id = unfold_orbit_unique_with_id(
+            reps_snapped, np.asarray(Rinv), np.asarray(tau))
+        print(f"\nUnfolded {centroids_frac.shape[0]} reps → "
+              f"{unfolded.shape[0]} distinct centroids (n_sym={n_sym})")
+        indices, snapped, _ = snap_centroids_to_grid(
+            unfolded, fft_grid, deduplicate=False)
+        return indices, snapped, indices.shape[0], orbit_id
+
+    print(f"\nSnapping {M_cand} centroids to FFT grid {fft_grid}...")
+    indices, snapped, n_dups = snap_centroids_to_grid(
+        centroids_frac, fft_grid, deduplicate=True)
+    if n_dups == 0:
+        print(f"✓ All {indices.shape[0]} centroids on unique grid points.")
+        return indices, snapped, indices.shape[0], None
+
+    print(f"⚠ {n_dups} duplicates; redistributing to nearby grid points...")
+    snapped = ensure_unique_centroids(centroids_frac, fft_grid, rho=weight)
+    indices = (np.round(snapped * np.asarray(fft_grid))
+               .astype(np.int64) % np.asarray(fft_grid))
+    return indices, snapped, snapped.shape[0], None
+
+
+def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
+    """Pivoted-Cholesky prune of the over-sampled candidate pool to N_c.
+
+    Greedy pivoting on the pair-density Gram keeps the candidates that add
+    the most independent interpolation directions over the σ band window;
+    the achieved rank is the number it actually certified.  Returns
+    ``(indices, fractional, n_unique)``.
+    """
+    from .pivoted_cholesky import prune_candidates_by_pivoted_cholesky
+
+    # Orbit mode targets ORBITS, not points: the final centroid count is
+    # Σ orbit_size over the picked orbits (≈ N_c by construction).
+    n_orbits = len(np.unique(orbit_id)) if orbit_id is not None else n_unique
+    n_orbit_keep = (max(1, int(np.ceil(N_c * n_orbits / n_unique)))
+                    if orbit_id is not None else N_c)
+    print(f"\nPivoted-Cholesky prune: {n_unique} → {N_c}"
+          f"{f' (target {n_orbit_keep} orbits)' if orbit_id is not None else ''}")
+
+    n_val, n_cond = _resolve_sigma_window(args, wfn)     # one resolver
+    max_band = n_val + n_cond
+    kwargs: dict = dict(
+        wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=n_orbit_keep, mesh=mesh,
+        orbit_id=orbit_id, use_phdf5=args.use_phdf5,
+    )
+    if args.prune_window == "v_x_vc":
+        kwargs["band_range_left"] = (0, n_val)
+        kwargs["band_range_right"] = (0, max_band)
+        print(f"  prune window: v×(v+c)  left=(0,{n_val}) "
+              f"right=(0,{max_band})  [covers |ψ_v|² + v×c]")
+    elif args.prune_window == "vc_x_vc":
+        kwargs["band_range_left"] = (0, max_band)
+        kwargs["band_range_right"] = (0, max_band)
+        print(f"  prune window: (v+c)×(v+c)  left=right=(0,{max_band})"
+              f"  [full σ-window square Gram, covers |ψ_c|² too]")
+    else:
+        kwargs["n_val"] = n_val
+        kwargs["n_cond"] = n_cond
+        print(f"  prune window: v×c  left=(0,{n_val}) "
+              f"right=({n_val},{max_band})  [legacy]")
+
+    with timing.section("prune"):
+        keep_idx, rank, *_ = prune_candidates_by_pivoted_cholesky(**kwargs)
+    indices = np.asarray(keep_idx, dtype=np.int64)
+    print(f"After pruning: {indices.shape[0]} centroids (rank={rank})")
+    return indices, indices.shape[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -237,9 +363,7 @@ def main():
     except Exception as e:
         print(f"  [jax compile cache] skipped: {e}", flush=True)
 
-    print(f"✓ JAX initialized: {len(jax.devices())} device(s) "
-          f"(local: {len(jax.local_devices())}, "
-          f"proc {jax.process_index()}/{jax.process_count()})")
+    print(f"✓ JAX initialized: {dist.device_summary()}")
 
     timing.reset()
 
@@ -290,77 +414,31 @@ def main():
     avec_ang = np.asarray(wfn.avec) * float(wfn.alat) * BOHR_TO_ANG
     print(f"Charge density shape: {charge_density.shape}")
     print(f"Lattice lengths: {np.linalg.norm(avec_ang, axis=1)} Å")
-    avec_jax = jnp.asarray(avec_ang, dtype=jnp.float64)
 
-    n_points = int(np.prod(fft_grid))
-    mesh, mesh_axis = _build_mesh(args, n_points)
+    mesh = dist.build_mesh(int(np.prod(fft_grid)),
+                           shard=not args.no_shard,
+                           force_shard=args.force_shard)
+    mesh_axis = dist.MESH_AXES
 
-    # Decide orbit vs non-orbit.  Unless --no-orbit, build the closure sym
-    # group with charge-density point-group recovery, then enable orbit mode
-    # when it has more than the identity.  Gating on the *recovered* group
-    # (not raw ``wfn.ntran``) makes orbit closure the default for any WFN
-    # whose density carries point-group symmetry — including reduced WFNs
-    # (non-collinear SOC stores only {E, σ_h}; a nosym run stores {E}) whose
-    # stored ntran understates the crystal symmetry and would otherwise leave
-    # ⟨nk|V_H|nk⟩ C3-broken across the k-star.
-    R = Rinv = tau = None
-    n_sym = 1
-    orbit_aware = False
-    if not args.no_orbit:
-        from .orbit_syms import build_real_space_syms
-        R, Rinv, tau = build_real_space_syms(
-            wfn, sym, charge_density=charge_density)
-        n_sym = int(R.shape[0])
-        orbit_aware = args.orbit or n_sym > 1
-    if not orbit_aware:
-        R = Rinv = tau = None
-        n_sym = 1
+    R, Rinv, tau, n_sym, orbit_aware = _resolve_symmetry(
+        args, wfn, sym, charge_density)
 
-    # ── k-means weight ───────────────────────────────────────────────────
-    # WHY band_range EXISTS: occupied-only ρ(r) is entirely inside the slab,
-    # so the weighted k-means places ZERO centroids in the vacuum and the
-    # vacuum-localized far-conduction states have no quadrature support —
-    # ⟨nk|V_H|nk⟩ (a pure centroid sum) is then sign-wrong and the whole
-    # error lands on Vxc = E_dft − kin_ion − V_H.
     with timing.section("setup.weight"):
         if args.centroid_weight is None:      # scalar defaults to band_range
             args.centroid_weight = ("band_range" if args.density_mode == "scalar"
                                     else "charge_density")
-        if args.centroid_weight == "band_range":
-            if args.density_mode != "scalar":
-                raise ValueError(
-                    "--centroid-weight band_range applies to the scalar "
-                    "(charge) channel; --density-mode current already "
-                    "weights by its own occupied-state current.")
-            if args.weight_bands is not None:
-                b_lo, b_hi = (int(v) for v in args.weight_bands.split(":"))
-            else:
-                _nv, _nc = _resolve_sigma_window(args, wfn)
-                b_lo, b_hi = 0, _nv + _nc
-            # τ=0 is required for the plain-index grid symmetrization; the
-            # recovered density point group is symmorphic by construction,
-            # a WFN group may not be.
-            _ops = (np.asarray(Rinv) if Rinv is not None
-                    and np.allclose(np.asarray(tau), 0.0, atol=1e-8) else None)
-            print(f"k-means weight: band_range Σ_{{n∈[{b_lo},{b_hi})}} "
-                  f"Σ_k w_k|ψ_nk|²"
-                  f"{'' if _ops is None else f' (symmetrized, {len(_ops)} ops)'}")
-            from .charge_density import rho_from_band_range
-            weight = rho_from_band_range(wfn, (b_lo, b_hi), sym_ops=_ops)
-            weight_label = (f"band-range density Σ_{{n∈[{b_lo},{b_hi})}} "
-                            f"Σ_k w_k|ψ_nk(r)|²")
-        else:
-            weight = charge_density
-            weight_label = ("scalar charge density ρ(r)"
-                            if args.density_mode == "scalar" else
-                            "Gordon-decomposed Pauli current "
-                            "Σ_{n,k,i}(j^Gordon_{n,k,i}(r))²")
+        weight, weight_label = _resolve_weight(
+            args, wfn, charge_density, Rinv, tau)
 
-    rho_jax = jnp.asarray(weight, dtype=jnp.float64)
+    # w^α re-weighting.  Per Gersho the asymptotic centroid number density
+    # goes as w^(3α/5), so α > 1 pulls points into high-density regions.
+    # Only the k-means sees the power; ``weight`` itself stays as measured,
+    # because it is also what breaks ties when snapped centroids collide.
+    kmeans_weight = weight
     if args.rho_power != 1.0:
-        # Clip to non-negative before power (QE iFFT can leave tiny < 0
-        # noise) and tell the user we're using a non-default exponent.
-        rho_jax = jnp.maximum(rho_jax, 0.0) ** float(args.rho_power)
+        # Clip to non-negative first — QE's iFFT can leave tiny < 0 noise.
+        kmeans_weight = np.maximum(
+            np.asarray(weight, dtype=np.float64), 0.0) ** float(args.rho_power)
         print(f"k-means weight: (weight)^{args.rho_power:g} "
               f"(asymptotic centroid density ∝ w^{0.6*args.rho_power:.3f})")
 
@@ -386,99 +464,24 @@ def main():
         kmeans_target = M_cand
 
     with timing.section("kmeans"):
-        _, centroids_jax, _, _ = weighted_kmeans_jax(
-            avec_jax, rho_jax, N_c=kmeans_target, seed=args.seed,
+        _, centroids, _, _ = weighted_kmeans_jax(
+            avec_ang, kmeans_weight, N_c=kmeans_target, seed=args.seed,
             mesh=mesh, mesh_axis=mesh_axis,
             init_method=init_method,
             R=R, Rinv=Rinv, tau=tau,
         )
-        centroids_jax.block_until_ready()
-    centroids_frac = np.asarray(centroids_jax)
+    centroids_frac = np.asarray(centroids)
 
-    orbit_id_arr = None
     with timing.section("snap_unfold"):
-        if orbit_aware:
-            # Snap reps to the FFT grid FIRST. Lloyd produces off-grid fp64 reps,
-            # and their fp64 sym images would round inconsistently — two
-            # mathematically sym-related reps could land on different grid
-            # cells. Snap-then-unfold guarantees on-grid orbit closure (because
-            # R is integer and τ × fft_grid is integer for grid-commensurate τ).
-            _, reps_snapped, _ = snap_centroids_to_grid(
-                centroids_frac, fft_grid, deduplicate=False,
-            )
-            from .orbit_syms import unfold_orbit_unique_with_id
-            # Pass Rinv = inv(mtrx).  BGW r-action is r' = Rinv·r + τ;
-            # this matches the direction used by compute_centroid_sym_perm
-            # and validate_atomic_symmetries.  No-op vs forward S on
-            # symmorphic systems (CrI3, MoS2); critical for Si Fd-3m.
-            unfolded, orbit_id_arr = unfold_orbit_unique_with_id(
-                reps_snapped, np.asarray(Rinv), np.asarray(tau),
-            )
-            print(f"\nUnfolded {centroids_frac.shape[0]} reps → "
-                  f"{unfolded.shape[0]} distinct centroids (n_sym={n_sym})")
-            centroid_indices, centroids_snapped, _ = snap_centroids_to_grid(
-                unfolded, fft_grid, deduplicate=False,
-            )
-            n_unique = centroid_indices.shape[0]
-        else:
-            print(f"\nSnapping {M_cand} centroids to FFT grid {fft_grid}...")
-            centroid_indices, centroids_snapped, n_dups = snap_centroids_to_grid(
-                centroids_frac, fft_grid, deduplicate=True
-            )
-            n_unique = centroid_indices.shape[0]
-            if n_dups > 0:
-                print(f"⚠ {n_dups} duplicates; redistributing to nearby grid points...")
-                centroids_snapped = ensure_unique_centroids(
-                    centroids_frac, fft_grid, rho=weight,
-                )
-                n_unique = centroids_snapped.shape[0]
-                centroid_indices = (np.round(centroids_snapped * np.asarray(fft_grid))
-                                    .astype(np.int64) % np.asarray(fft_grid))
-            else:
-                print(f"✓ All {n_unique} centroids on unique grid points.")
+        centroid_indices, centroids_snapped, n_unique, orbit_id_arr = \
+            _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
+                             Rinv, tau, n_sym, M_cand)
 
     if oversample > 1.0 and n_unique > N_c:
-        from .pivoted_cholesky import prune_candidates_by_pivoted_cholesky
-        # Orbit mode: target ORBITS not points; final centroid count is
-        # Σ orbit_size of picked orbits (≈ N_c by construction).
-        n_orbits = (len(np.unique(orbit_id_arr))
-                    if orbit_id_arr is not None else n_unique)
-        n_orbit_keep = (max(1, int(np.ceil(N_c * n_orbits / n_unique)))
-                        if orbit_id_arr is not None else N_c)
-        print(f"\nPivoted-Cholesky prune: {n_unique} → {N_c}"
-              f"{f' (target {n_orbit_keep} orbits)' if orbit_id_arr is not None else ''}")
-        # Same σ window the band_range weight uses (one resolver).
-        _n_val_eff, _n_cond_eff = _resolve_sigma_window(args, wfn)
-        _max_band = _n_val_eff + _n_cond_eff
-        _prune_kwargs: dict = dict(
-            wfn=wfn, sym=sym, cand_idx=centroid_indices,
-            n_keep=n_orbit_keep, mesh=mesh,
-            orbit_id=orbit_id_arr,
-            use_phdf5=args.use_phdf5,
-        )
-        if args.prune_window == "v_x_vc":
-            _prune_kwargs["band_range_left"] = (0, _n_val_eff)
-            _prune_kwargs["band_range_right"] = (0, _max_band)
-            print(f"  prune window: v×(v+c)  left=(0,{_n_val_eff}) "
-                  f"right=(0,{_max_band})  [covers |ψ_v|² + v×c]")
-        elif args.prune_window == "vc_x_vc":
-            _prune_kwargs["band_range_left"] = (0, _max_band)
-            _prune_kwargs["band_range_right"] = (0, _max_band)
-            print(f"  prune window: (v+c)×(v+c)  left=right=(0,{_max_band})"
-                  f"  [full σ-window square Gram, covers |ψ_c|² too]")
-        else:
-            _prune_kwargs["n_val"] = _n_val_eff
-            _prune_kwargs["n_cond"] = _n_cond_eff
-            print(f"  prune window: v×c  left=(0,{_n_val_eff}) "
-                  f"right=({_n_val_eff},{_max_band})  [legacy]")
-        with timing.section("prune"):
-            keep_idx, rank, *_ = prune_candidates_by_pivoted_cholesky(
-                **_prune_kwargs,
-            )
-        centroid_indices = np.asarray(keep_idx, dtype=np.int64)
+        centroid_indices, n_unique = _prune(
+            args, wfn, sym, mesh, centroid_indices, orbit_id_arr,
+            n_unique, N_c)
         centroids_snapped = centroid_indices.astype(float) / np.asarray(fft_grid)
-        n_unique = centroid_indices.shape[0]
-        print(f"After pruning: {n_unique} centroids (rank={rank})")
 
     # Default suffix follows --density-mode unless the user overrode it.
     out_suffix = (args.out_suffix
@@ -499,7 +502,7 @@ def main():
     )
     print(f"Saved centroids to {out_file}")
 
-    if jax.process_index() == 0:
+    if process_rank() == 0:
         timing.report(title="--- kmeans_cli timing (s) ---")
 
     if args.plot:

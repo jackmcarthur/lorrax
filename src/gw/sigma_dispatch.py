@@ -171,7 +171,13 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
                  "mesh (ρ: one psum; Poisson: replicated; ⟨mk|V_H|nk⟩: "
                  "k-partitioned + one gather).")
         # Lazy: pulls in the psp stack, which the ISDF path does not need.
-        from gw.kin_ion_io import compute_hartree_matrix, replicate_to_mesh
+        # ``replicate_to_mesh`` is generic k-partition plumbing and comes
+        # from the SERVICE; only ``compute_hartree_matrix`` (real physics,
+        # and the reason for the lazy import) comes from the driver.  Both
+        # used to be imported from ``kin_ion_io``, which made a library
+        # module depend on a CLI for a collective helper.
+        from common.collectives import replicate_to_mesh
+        from gw.kin_ion_io import compute_hartree_matrix
         v_h_np = compute_hartree_matrix(
             wfn, sym, meta,
             truncation_2d=(int(config.sys_dim) == 2),

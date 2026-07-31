@@ -55,6 +55,67 @@ Build flags: `-DLORRAX_FFI_HAVE_CAL=OFF -DLORRAX_FFI_HAVE_PHDF5=OFF`,
 `-DCMAKE_CUDA_ARCHITECTURES=75`, CUDA toolkit assembled from the venv's pip
 `nvidia-*-cu12` packages (see `stage_ffi_deps.sh`).
 
+## Multi-process CPU runs: collectives on MPI
+
+LORRAX's CPU collectives run on MPI, not on jax's default gloo — gloo's
+`reduce-scatter` silently corrupts ~5% of executions here, and mpi is also
+1.4-8.2x faster on the collective-bound stages. That needs an MPIwrapper we
+build:
+
+```bash
+export LORRAX_ROOT=$PWD
+config/frontera/build_mpiwrapper.sh --fresh    # LOGIN NODE (needs gfortran)
+
+# then, in the job's container env:
+export JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi
+export MPITRAMPOLINE_LIB=$WORK/lorrax_mpiwrapper/install/lib64/libmpiwrapper.so
+export LORRAX_MPI_FORCE_THREAD_MAIN=1
+export LORRAX_MPI_FINALIZE_FIX=skip_atexit
+PYTHONPATH=$WORK/lorrax_env_mpi_overlay/site:$PYTHONPATH
+```
+
+All four are load-bearing; omitting the last one makes every successful run
+exit rc=1. Full rationale and the rest of the env block:
+**`docs/dev/mpi_collectives.md`**.
+
+## Cold start: the node-local run-time bundle
+
+A first run on a fresh node reads the 5.6 GB venv off Lustre through the
+container, one mmap page fault at a time. Measured on fresh Frontera compute
+nodes (job 7882055), `gw.kin_ion_io` needed **44–88 s** to resolve its import
+graph — of which **34–73 s was `jax.devices()` alone**, dlopening a CUDA stack
+a CPU run cannot use. Two changes take that to **4.6 s**:
+
+1. `runtime.skip_gpu_plugin_discovery()` — in-tree, automatic, no packaging
+   change. 88 s → 11 s on its own.
+2. the bundle below — 11 s → 4.6 s.
+
+```bash
+# ONCE per venv/source revision, inside the SIF (byte-compiling needs the
+# container's python 3.12).  Writes $SCRATCH/lorrax_bundle/lorrax_cpu_bundle.tar
+apptainer exec --bind /home1,/work2,/scratch1,/scratch2 $LORRAX_SIF \
+    config/frontera/build_cpu_runtime_bundle.sh
+
+# in the job's CONTAINER-SIDE runner, before python:
+export LORRAX_BUNDLE=$SCRATCH/lorrax_bundle/lorrax_cpu_bundle.tar
+. $LORRAX_ROOT/config/frontera/stage_runtime.sh    # SOURCE it, don't exec it
+export PYTHONPATH=$LORRAX_OVERLAY_DIR:$LORRAX_SRC_DIR
+$LORRAX_PY -u -m gw.kin_ion_io ...
+```
+
+The bundle is venv + MPI overlay + `src/` minus what a CPU run cannot use
+(`nvidia/*`, `jax_plugins/`, `jax_cuda12_plugin/`, and the
+`jax_cuda12_pjrt-*.dist-info` that advertises the plugin entry point),
+byte-compiled: 5.6 GB → 769 MB, striped 12-wide so a whole job can read it at
+once. `stage_runtime.sh` unrolls it onto `/tmp` — a real 144 GB local XFS SSD
+on CLX, writable inside apptainer — once per node under `flock`, in 1.5–2.2 s.
+`LORRAX_STAGE=0` disables it; a missing bundle falls back to the Lustre venv
+and **says so on rank 0**.
+
+Nothing here is a patched dependency: every file is a byte-for-byte copy of
+what uv installed, and the GPU venv is untouched. Full measurement and the
+falsified instruments: **`docs/dev/cold_start.md`**.
+
 ## Built since (formerly "Deferred" — updated 2026-07-28)
 
 * **phdf5** — sharded slab I/O is BUILT and is a production write path

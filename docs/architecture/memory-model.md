@@ -136,9 +136,13 @@ first term).
 The 4× model is exact for large shards (>0.3 GB).  For small shards a
 fixed overhead of ~0.03–0.1 GB adds ~10–15% above the 4× prediction.
 This overhead comes from the cuFFT plan cache, the phase array
-broadcast, and JIT compilation metadata.  The G-flat planner uses a
-`fft_box_factor = 4.0` constant; the AOT model confirms the same
-`β = 4` for the relevant primitive.
+broadcast, and JIT compilation metadata.
+
+`fft_box_factor = 4.0` counts **box copies** and is the G-flat planner's
+*fallback only* (`_FFT_CUFFT_FACTOR`, used when there is no real `Mesh` to
+compile against, and announced when used). It does not model the cuFFT plan
+workspace at all — that is a separate term, measured rather than assumed; see
+"cuFFT plan scratch (live measurement)" below.
 
 ### Band chunk constraint
 
@@ -185,7 +189,7 @@ where each term is per-rank, c128 (CrI3 6×6 80 Ry, 4×4 mesh, n_rmu=376):
 | Term | Shape | Bytes |
 |---|---|---|
 | `M_P_carry` (×2: L, R) | `(n_k, n_s², n_rmu/p_x, n_zchunk/p_y)` | 3.71 GiB each, both live to γ̃ contract |
-| `M_FFT_box` (scan-aliased) | `(n_k, bpd_max_local, n_s, n_r)` + 4× cuFFT scratch | ~5 GiB, 1 slot across all bc iters |
+| `M_FFT_box` (scan-aliased) | `4 ×` `(n_k, bpd_max_local, n_s, n_r)` box copies, **plus** the cuFFT plan workspace (a separate term — see "cuFFT plan scratch") | ~5 GiB, 1 slot across all bc iters |
 | `M_all_gather_slab` (scan-aliased) | `(n_k, P·bpd_max_local, n_s, n_zchunk)` | ~1.36 GiB pre-r-slice, ~340 MB post-r-slice |
 | `M_psi_G_iter` (io_callback) | `(n_k, bpd_max, n_s, ngkmax)` per bc | ~80 MB |
 | `persistent_base` | centroids (L+R) + `L_q` | varies |
@@ -582,7 +586,10 @@ To size a fresh system at a target `memory_per_device_gb` (cohsex.in):
    `get_device_memory_gb` returns `0.9 · bytes_available`; choose
    `28.0` for a 40 GB A100, `56.0`–`72.0` for an 80 GB hbm80g A100,
    `6.0` for an 8 GB local GPU.  `chunk_target_utilization: 0.97`
-   (heuristic; G-flat planner uses 0.80 internally).
+   (heuristic).  The G-flat planner's own default is `ns²`-aware
+   (`_default_util`): 0.90 scalar, 0.85 spinor `ns=2`, 0.78 bispinor
+   `ns=4` — larger `ns²` means a bigger single contiguous Stage-C arena,
+   which needs more headroom against BFC fragmentation.
 2. **Pick the mesh** `p_x × p_y = total_GPUs`.  Square-ish meshes
    (e.g. 4×4 on 16 GPUs) minimise both Peak A and Peak C since they
    sit on `p_xy`-sharded buffers.  If `n_rmu_padded % p_xy ≠ 0` the
@@ -611,7 +618,18 @@ To size a fresh system at a target `memory_per_device_gb` (cohsex.in):
 7. **Compare HWM to runtime peak.**  `γ = runtime_peak / planner_HWM`
    should land in `[0.7, 1.0]`.  `γ > 1.0` means under-estimate — count
    binding-peak slots in the HLO memory-usage-report and update
-   `pair_density_slots_*` or `fft_box_factor`.
+   `pair_density_slots_*`.  Do **not** reach for `fft_box_factor` first:
+   since 2026-07-30 it is only the fallback bound, and a run on a real mesh
+   does not use it (the FFT box is compiled and measured, cuFFT plan
+   workspace included).  Check the log for a `[memory-model]` announcement —
+   if one is there, the term really did fall back and the reason is printed.
+
+   **KNOWN OPEN (2026-07-30):** the ladder campaign measured `γ > 1` —
+   the planner under-predicting true peak by **1.5–14 %** — independently of
+   the FFT term.  A GB-vs-GiB unit error had masked this and the earlier
+   "model needs no fixes" verdict was withdrawn.  The FFT-box half of that
+   gap is now measured rather than assumed; the remainder is **not
+   diagnosed**.  Treat `HWM` as an estimate, not a bound, until it is.
 8. **Escape hatches**, in order:
    - `LORRAX_FORCE_FULL_BZ=1` — disables the IBZ cascade (debugging).
    - `use_phdf5_gspace: true` — per-rchunk parallel HDF5 reads,
@@ -682,14 +700,173 @@ heuristic remains the authoritative chooser for `q_chunk` / `q_gather`
 
 ## cuFFT plan scratch (live measurement)
 
-The closed-form G-Flat model above does not see the cuFFT plan *workspace* XLA
-requests at runtime — it is invisible to `jax.live_arrays()` / `memory_analysis()`.
-That single real number is measured live by `src/runtime/aot_memory.py`
-(`aot_kernel_peak_bytes`, a `cufftGetSize*` query over the compiled HLO) and added
-to the V_q tile chooser's estimate. There is no offline fit / DOE / preset
-framework: the former `src/gw/aot_memory_model/` package was removed 2026-07-02
-(it was dead-by-clobber — `plan_gflat_chunks` always overwrote its chunk picks;
-see `reports/memplanner_cleanup_2026-07-02/PLAN.md`).
+The closed-form shape algebra above cannot see the cuFFT plan *workspace*. It is
+not merely "hard to see": the plan workspace is **not in XLA's buffer assignment
+at all** — jaxlib's `FftThunk` takes it from a runtime scratch allocator at
+execution time — so `compiled.memory_analysis()` and `jax.live_arrays()` both
+report a number that excludes it. Any peak built from `memory_analysis()` alone
+is a systematic *low bound* for a kernel containing an FFT.
+
+**The one honest path (as of 2026-07-30):**
+
+```
+gw/gflat_memory_model.py::_fft_box_bytes          # Stage A/D FFT-box term
+  -> common/fft_helpers.py::query_fft_peak_bytes  # compile the production FFT
+     -> runtime/aot_memory.py::aot_kernel_peak_bytes
+          compiled.memory_analysis()      -> compiled_peak
+          parse fft ops from as_text()    -> FftSpec per op
+          cufftMakePlanMany on jaxlib's own libcufft -> cufft_scratch
+        total = compiled_peak + cufft_scratch
+```
+
+`query_fft_peak_bytes` compiles **the same helper production runs**
+(`make_sharded_fftn_3d`: a `shard_map`'d device-local rank-3 `jnp.fft.fftn`,
+one cuFFT plan per rank). Before 2026-07-30 it compiled the per-axis
+`custom_partitioning` form instead — three rank-1 plans that no production path
+ever builds — and read only `memory_analysis()`, while its own docstring
+promised the result "includes cuFFT scratch". Both defects are fixed; the
+per-axis form has been deleted rather than left as a modelling-only path.
+
+Size of the term this recovers, from `scripts/profiling/aot_cufft_sanity.py`
+(CrI3 6x6x1 80 Ry V_q box `(75, 75, 200)` c128, 16-GPU 4x4 mesh, 80 GB cards):
+
+| q_chunk | `compiled_peak` | observed |
+|---|---|---|
+| 8 | 40.84 GB | ran fine |
+| 12 | 61.22 GB | ran fine |
+| 13 | **66.32 GB** | **cuFFT plan creation FAILED** — so the true peak crossed 80 GB, i.e. >13.7 GB of it was invisible to `memory_analysis()` |
+| 18 | 91.0 GB | OOM at runtime |
+
+**Direct measurement of the gap** (job 7882062, Quadro RTX 5000, jax 0.9.1,
+`(16, 75, 75, 200)` c128 — the CrI3 V_q transform shape at a batch that fits a
+16 GB card):
+
+| quantity | value |
+|---|---|
+| `memory_analysis()` only — the pre-fix number | 0.576 GB |
+| `cufft_scratch` (queried, `cufft_measured=True`) | 0.288 GB |
+| `aot_kernel_peak_bytes(...).total` | **0.864 GB** |
+| runtime `device.memory_stats()['peak_bytes_in_use']` after executing | **0.864 GB** |
+
+The pre-fix number was **50 % low**; the new total matched the runtime peak to
+**0.0 %**. The same job showed the query discriminates rather than returning a
+constant: at `(75, 75, 200)` (mixed radix, 75 = 3·5², 200 = 2³·5²) the scratch
+is exactly 1× the data, while `(60, 60, 200)`, `(64, 64, 64)` and
+`(32, 32, 32)` all report **0** — which independently corroborates the MoS2
+observation in `aot_cufft_sanity.py` that "cuFFT scratch is essentially zero on
+MoS2". The cliff is shape-dependent, which is exactly why a constant factor
+cannot stand in for the query.
+
+**Where the cuFFT term is 0 and that is correct:** XLA:CPU has no cuFFT plans,
+so the scratch term there is an exact zero and `cufft_measured` stays `True`.
+That decision is made from the **platform**, not the HLO — measured on jax
+0.9.1 (job 7882062), XLA:CPU keeps the `fft` op in `compiled.as_text()` exactly
+as XLA:GPU does, so "the HLO has an fft op" does *not* imply cuFFT. (An earlier
+draft of this fix inferred it from the HLO and made every CPU run print a bogus
+low-bound warning.) If a compiled FFT shows **no** fft op at all, that is
+parser blindness and is announced on either platform.
+
+XLA:CPU's own Ducc/pocketfft scratch is a different and much smaller quantity;
+this path does not model it and does not claim to.
+
+**Fallbacks announce.** Every path that returns a weaker number than the one
+advertised prints once, from the rank it happened on, via
+`runtime.aot_memory.announce_once`: probe compile failure (→ 3×data analytic
+bound), no real `Mesh` (→ the analytic `fft_box_factor = 4.0` box-copy bound),
+libcufft unavailable (→ `cufft_scratch = 0` with `cufft_measured = False`).
+
+There is no offline fit / DOE / preset framework: the former
+`src/gw/aot_memory_model/` package was removed 2026-07-02 (dead-by-clobber —
+`plan_gflat_chunks` always overwrote its chunk picks; see
+`reports/memplanner_cleanup_2026-07-02/PLAN.md`).
+
+### NOT modelled: the LORRAX FFI handler arenas (`LORRAX_FFT_FFI=1`)
+
+A third invisible allocation exists and this planner does **not** account for
+it. With the flat-k FFT service enabled, the handlers in
+`src/ffi/mklfft/cpp` (MKL DFTI descriptors) and `src/ffi/cufft/cpp` (cuFFT
+plans + the NVRTC-compiled fused multiply) hold their own workspace *outside
+both* XLA's buffer assignment and the `cufftMakePlanMany` query above — the
+query sizes the plan XLA's own FFT thunk would build, not a plan the FFI
+library builds for itself. The FFI workstream reports **~100 MB/rank**.
+
+That figure is theirs, not measured here, so it is recorded rather than
+folded into a term: adding an unverified constant to the model is how the
+`fft_box_factor` story started. Two things make it tolerable for now — it is
+a per-process constant rather than a shape-dependent term that grows with the
+chunk knobs, and `_default_util` already withholds 10–22 % of the budget
+(0.90 / 0.85 / 0.78 by `ns`), which is 0.8–1.8 GB on an 8 GB card and far
+more on production cards. It is still an unmodelled term and should be closed
+by an arena-size query on the FFI side, not by a constant here.
+
+## Measured corrections behind the G-flat terms
+
+Three terms in `gw/gflat_memory_model.py` exist because a run died without
+them. The code carries a one-line pointer to this section; the measurements
+live here so the planner source stays short. **Do not remove these terms
+without re-measuring** — each was added after a specific job failed.
+
+### 1. `loader_tables` — a P-independent floor (`_persistent_bytes`)
+
+The WFN loader stages two REPLICATED per-k arrays once and keeps them for its
+lifetime: the sparse-G→FFT-box index `(nk, nx, ny, nz) int32` (staged by
+`WfnLoader.box_index_dev`) and the τ-phase row `(nk, ngkmax) c128`
+(`_ensure_phdf5_static`). Small — 121 MB at MoS2 12×12 — but **P-independent**:
+adding nodes never shrinks it, so it belongs in the floor rather than nowhere.
+
+It is modelled at all because these two arrays used to cost `P ×` their size as
+a *transient* on top: JAX's hidden `device_put` → `assert_equal` all-gather,
+7.7 GB/rank at P=64 and 17.4 GB projected at P=144. That is what made the
+planner read **0.48× of the measured node peak** at 606 centroids / P=64. The
+transient was cured in `common.collectives.device_put_process_local`; the
+residency term stays so the floor remains honest.
+
+### 2. Stage C's gathered ψ(r) slab — two mesh divisions (`_stage_C_slope`)
+
+`z_q_from_psi_sm` computes each rank's 1/P band block over the FULL r-chunk,
+then `all_to_all('y', split r, concat bands)` + `all_gather('x', bands)`. Each
+rank therefore holds `(nk, band_chunk, ns, cr/p_y)` — all bands, only its
+r-block — plus a smaller slab of its own `band_chunk/p_xy` bands over the full
+r-chunk (the all-to-all source, unavoidable: other y-ranks need other r-blocks
+of exactly those bands).
+
+Before that, the gather ran over `('x','y')` at the full r-chunk with the
+r-slice applied *afterwards*, giving `nk·band_chunk·ns·cr·16` with **no mesh
+division on either axis**: 129 GB/rank per copy at MoS2 12×12 (nk=144,
+band_chunk=160, ns=2, cr=174960) — 9.4× everything else in this slope combined.
+Omitting it from the model is what let the planner pick `r_chunk = n_rtot` and
+ask XLA for a single 271 GB allocation (**job 7874236**, RESOURCE_EXHAUSTED).
+The all-to-all then removed the `p_y` factor outright: 5.2× on this slope at the
+8×10 mesh.
+
+### 3. Stage F — the restart-tensor write takes the LARGER of two tensors
+
+On the `H5PY_ALLGATHER` SlabIO backend (the CPU default whenever the venv lacks
+mpi4py + h5py-parallel, which is the case on Frontera today)
+`_slab_io_allgather._to_host` process_allgathers the WHOLE tensor onto EVERY
+rank and then copies it to host numpy — each written tensor lands UNSHARDED,
+**twice** (gathered device buffer + host numpy copy). Nothing in stages A–E
+models an I/O-seam replication, which is why the planner once reported a
+6.70 GB HWM for a run that died past ζ-fit. `slab_io_replicates=False`
+(`PHDF5_FFI` / `PHDF5_HOST`, per-rank hyperslabs) drops it to the sharded cost.
+
+TWO tensors cross this seam and the model must take the larger:
+
+| tensor | shape | family |
+|---|---|---|
+| `V_qmunu` / `W0_qmunu` | `(n_q_ibz, μ, μ)` | μ² |
+| the G-flat ζ tensor | `(n_q_disk, μ, ngkmax)` | μ·ngkmax |
+
+Whenever `ngkmax > μ` (true at every centroid count below ~ngkmax) the G-flat
+write is the binder, and the old μ²-only term under-predicted it. MEASURED
+(wk_Y probe, 1998 centroids / μ_pad=2048 / ngkmax=8603 / P=64, run dir
+`runs/d_1998_P64_rep`): the largest collective in the whole run is one
+all-gather of `nq·μ_pad·ngkmax·16 = 144·2048·8603·16 = 40,594,046,976 B`, to
+the byte, on top of 60.7 GB already live — while the term reported
+`2·144·2048²·16 = 19.33 GB`, i.e. **2.10× too small**. The planner named the
+right binder at the wrong size. Corrected term, both copies, at nq=144 /
+ngkmax=8603 (MoS2 12×12): μ_pad=288 → 11.42 GB, 640 → 25.37 GB,
+2048 → 81.19 GB — each 2× a collective the probe has actually seen in a dump.
 
 ## Predicted-vs-realized faithfulness (Round-7 audit, 2026-05-17)
 

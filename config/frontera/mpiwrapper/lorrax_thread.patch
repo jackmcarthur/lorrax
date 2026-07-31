@@ -1,0 +1,81 @@
+--- a/src/mpiwrapper.cxx
++++ b/src/mpiwrapper.cxx
+@@ -129,11 +129,78 @@
+ 
+ // Wrap most constants and functions automatically
+ 
++// wk_AS (LORRAX Frontera): upgrade EVERY init request to
++// MPI_THREAD_MULTIPLE.  The jaxlib XLA MpiCollectives requests only
++// FUNNELED; with mpi4py/h5py collective MPI-IO running on the python
++// main thread while XLA's collectives run on an executor thread, a
++// FUNNELED grant is undefined behavior — measured on Frontera as an
++// intermittent (~30%) segfault/hang in the MPI progress engine at
++// P=16 x 8 nodes (SPEEDUP_SCORECARD.md section AS.4b).  Upgrading the
++// grant to MULTIPLE makes Intel MPI's global lock serialize the two
++// threads.  Requests are upgraded, never downgraded.
++static int lorrax_upgraded_init_thread(int *argc, char ***argv, int required,
++                                       int *provided) {
++  (void)required;
++  return PMPI_Init_thread(argc, argv, MPI_THREAD_MULTIPLE, provided);
++}
++static int lorrax_upgraded_init(int *argc, char ***argv) {
++  int provided;
++  return PMPI_Init_thread(argc, argv, MPI_THREAD_MULTIPLE, &provided);
++}
++#define MPI_Init_thread(argc, argv, required, provided) \
++  lorrax_upgraded_init_thread(argc, argv, required, provided)
++#define MPI_Init(argc, argv) lorrax_upgraded_init(argc, argv)
++
++// wk_REL (LORRAX Frontera, 2026-07-29): OPT-IN override of
++// MPI_Is_thread_main.
++//
++// jaxlib 0.9.1 xla::cpu::MpiCollectives::CreateCommunicators() opens with
++//     int flag; MPI_Is_thread_main(&flag);
++//     if (!flag) return absl::UnknownError(
++//         "MPI: Communicator requested from a thread that is not the one "
++//         "MPI was initialized from. ...");
++// and only then constructs MpiCommunicator(color, key), i.e.
++//     MPI_Comm_split(MPI_COMM_WORLD, color, key, &comm).
++// The guard is on communicator CREATION only (once per clique key); the
++// collectives themselves (AllReduce/ReduceScatter/AllGather/...) carry no
++// such check.  XLA:CPU executes the collective thunk from a pool worker, so
++// any clique whose FIRST use is inside a jitted program is refused.  The
++// thread LEVEL is irrelevant to this test: MPI_Is_thread_main is false on a
++// non-initialising thread even under MPI_THREAD_MULTIPLE.
++//
++// Setting LORRAX_MPI_FORCE_THREAD_MAIN=1 makes the wrapper report
++// "yes, thread-main" to every caller, which removes XLA's refusal and lets
++// MPI_Comm_split run on the executor thread.  That is legal MPI *only*
++// because this same wrapper already upgrades every init to
++// MPI_THREAD_MULTIPLE above, and because XLA creates cliques in a
++// deterministic order that is identical on every rank.  Default OFF.
++static int lorrax_force_thread_main_enabled() {
++  static int cached = -1;
++  if (cached < 0) {
++    const char *v = getenv("LORRAX_MPI_FORCE_THREAD_MAIN");
++    cached = (v && *v && *v != '0' && *v != 'n' && *v != 'N' &&
++              *v != 'f' && *v != 'F') ? 1 : 0;
++  }
++  return cached;
++}
++static int lorrax_is_thread_main(int *flag) {
++  if (lorrax_force_thread_main_enabled()) {
++    if (flag)
++      *flag = 1;
++    return MPI_SUCCESS;
++  }
++  return PMPI_Is_thread_main(flag);
++}
++#define MPI_Is_thread_main(flag) lorrax_is_thread_main(flag)
++
+ extern "C" {
+ #include "mpiabi_defn_constants_c.h"
+ #include "mpiabi_defn_functions_c.h"
+ #include "mpiabi_defn_functions_fortran.h"
+ }
++#undef MPI_Init_thread
++#undef MPI_Init
++#undef MPI_Is_thread_main
+ 
+ // Handle the remaining functions manually
+ 

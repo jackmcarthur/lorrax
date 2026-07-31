@@ -47,8 +47,8 @@ conda install -c conda-forge 'hdf5=*=mpi_openmpi_*' openmpi
 spack install hdf5+mpi
 ```
 
-Build the FFI against it directly with `-DHDF5_ROOT=<prefix>` — no staging / SONAME
-shimming needed off-container.
+Build the FFI against it directly with `-DHDF5_ROOT=<prefix>` — no staging and no
+library-name shimming needed off-container.
 
 **Cray:** load `cray-hdf5-parallel` and stage it with
 `src/ffi/phdf5/scripts/stage_cray.sh`. The OpenMPI stage script
@@ -98,8 +98,8 @@ cmake --build build -j
 For an OpenMPI / non-Cray build, `build.sh` accepts `LORRAX_FFI_ALLOW_DEFAULT_MPI=1` so it
 does not hard-require the Cray-MPICH env vars; set `LORRAX_PHDF5_MPI_STACK=openmpi`
 accordingly (this variable is consumed by the build pipeline — run_shifter.sh / CMake — not
-by `build.sh` itself). The build-time and runtime MPI stacks **must match** — a mismatch surfaces as
-a runtime SONAME error / segfault, not a clean message.
+by `build.sh` itself). The build-time and runtime MPI stacks **must match** — a mismatch surfaces as a
+segfault or a "cannot open shared object file" at start-up, not a clean message.
 
 ## See also
 

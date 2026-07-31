@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 # Ensure x64 + jax.distributed bootstrap before any jax-collective code
 # (the ring matvec uses lax.psum/ppermute on the 2D mesh, which is silent-
@@ -14,6 +15,8 @@ bootstrap()
 
 import jax
 import jax.numpy as jnp
+
+import common.timing as timing
 
 from .bse_ring_comm import (
     build_bse_ring_matvec,
@@ -117,6 +120,23 @@ def _preview_lanczos(
     solver_kind: str = "lanczos",
     tda: bool = True,
 ) -> None:
+    # ---- Stage timing --------------------------------------------------
+    # This driver printed NO timing table at all, which is why the release
+    # regression table's "BSE 377 s" was a single opaque number that could
+    # not be compared with GW's (whose table has a dozen rows) — and why it
+    # was read as "BSE is slow" when the two rows were taken on different
+    # decks (b1024/N_mu=10015 vs b256/N_mu=2475).  Three top-level rows,
+    # each executed exactly once, plus the ``(untimed)`` closer.
+    _t_main = time.perf_counter()
+    _pre_main = timing.process_elapsed_s()
+    timing.reset()
+    if _pre_main is not None:
+        # Imports + the runtime bootstrap + ``jax.distributed`` — the cold
+        # start (75.0 s cold vs 2.1 s warm, job 7881949).  It happens before
+        # this function and so is invisible to any timer inside it.  Recorded
+        # FIRST so it appears first: the table's row order is insertion order,
+        # and a startup row printed last reads as an epilogue.
+        timing.record("bse.imports_and_runtime", _pre_main)
     restart_file = _find_restart_file(input_file)
     n_devices = jax.device_count()
     # Non-TDA has no 1-device (``solve_bse``) path — it runs through the sharded
@@ -133,22 +153,24 @@ def _preview_lanczos(
         # auto-detects valence by ``mean_enk < fermi_energy``; user-given
         # n_occ replaces that detection identically to _load_ring_subset.
         # We pass fermi_energy=0.0 (default) and rely on enk_full's reference.
-        data = load_bse_data_from_restart_sharded(
-            restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
-            input_file=input_file, n_occ=n_occ,
-        )
-        # T-encoding strategy plumbed via the data dict (see solve_bse_sharded).
-        data["matvec_kind"] = matvec_kind
-        grid_x, grid_y = mesh_xy.devices.shape
-        # EQP override on enk_full (BGW eqp1.dat semantics).
-        if eqp_file is not None:
-            # Re-slice the band window on the eqp-corrected energies. Uses the
-            # loader-CLAMPED band counts (data['n_val']/data['n_cond']), not the
-            # raw CLI n_val/n_cond, so an over-request can't slice out of bounds.
-            from .bse_io import apply_eqp_and_reslice_bands
-            data["eps_v"], data["eps_c"], _ = apply_eqp_and_reslice_bands(
-                restart_file, eqp_file, input_file,
-                int(data["n_val"]), int(data["n_cond"]), n_occ, grid_x, grid_y)
+        with timing.section("bse.load", announce=True,
+                            label="restart load (psi, W_q, V_q0)"):
+            data = load_bse_data_from_restart_sharded(
+                restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
+                input_file=input_file, n_occ=n_occ,
+            )
+            # T-encoding strategy plumbed via the data dict (see solve_bse_sharded).
+            data["matvec_kind"] = matvec_kind
+            grid_x, grid_y = mesh_xy.devices.shape
+            # EQP override on enk_full (BGW eqp1.dat semantics).
+            if eqp_file is not None:
+                # Re-slice the band window on the eqp-corrected energies. Uses the
+                # loader-CLAMPED band counts (data['n_val']/data['n_cond']), not the
+                # raw CLI n_val/n_cond, so an over-request can't slice out of bounds.
+                from .bse_io import apply_eqp_and_reslice_bands
+                data["eps_v"], data["eps_c"], _ = apply_eqp_and_reslice_bands(
+                    restart_file, eqp_file, input_file,
+                    int(data["n_val"]), int(data["n_cond"]), n_occ, grid_x, grid_y)
         nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]
         nk = nkx * nky * nkz
         nc_pad = int(data["n_cond_pad"])
@@ -170,28 +192,37 @@ def _preview_lanczos(
             print(f"Lanczos [{mode}]: ≤ {block_max_iter} iterations")
         # Resolve full-reorth sentinel (-1) to the actual Krylov depth.
         n_reorth_eff = block_max_iter if n_reorth < 0 else n_reorth
-        eigenvalues, eigenvectors, n_iter_done = solve_bse_sharded(
-            data, mesh_xy, n_eig=n_eig, max_iter=block_max_iter,
-            include_W=include_W, block_size=block_size,
-            rtol=rtol, check_every=check_every, n_reorth=n_reorth_eff,
-            solver_kind=solver_kind, tda=tda,
-        )
+        # ONE row for the eigensolve — compile + every Krylov iteration.  It
+        # is the number worth comparing across decks, and the only honest way
+        # to say "the BSE solve cost X" (the matvec itself runs
+        # block_max_iter x block_size times and must NOT be timed per call).
+        with timing.section("bse.eigensolve", announce=True,
+                            label=f"{solver_kind} eigensolve") as _sec:
+            eigenvalues, eigenvectors, n_iter_done = solve_bse_sharded(
+                data, mesh_xy, n_eig=n_eig, max_iter=block_max_iter,
+                include_W=include_W, block_size=block_size,
+                rtol=rtol, check_every=check_every, n_reorth=n_reorth_eff,
+                solver_kind=solver_kind, tda=tda,
+            )
+            _sec.watch(eigenvalues, eigenvectors)
         n_done = int(n_iter_done)
         if rtol > 0:
             tag = "Block Lanczos" if block_size > 1 else "Lanczos"
             print(f"{tag} exited at iter {n_done}/{block_max_iter} "
                   f"(Krylov dim = {n_done * block_size})")
     else:
-        payload = _load_ring_subset(
-            restart_file,
-            n_val,
-            n_cond,
-            1,
-            1,
-            eqp_file=eqp_file,
-            n_occ=n_occ,
-            input_file=input_file,
-        )
+        with timing.section("bse.load", announce=True,
+                            label="restart load (1 device)"):
+            payload = _load_ring_subset(
+                restart_file,
+                n_val,
+                n_cond,
+                1,
+                1,
+                eqp_file=eqp_file,
+                n_occ=n_occ,
+                input_file=input_file,
+            )
         psi_c = payload["psi_c"]
         psi_v = payload["psi_v"]
         eps_c = payload["eps_c"]
@@ -212,28 +243,40 @@ def _preview_lanczos(
             max_lanczos_iter = max(30, min(200, bse_dim // 2))
         print(f"Lanczos: {max_lanczos_iter} iterations")
 
-        eigenvalues, eigenvectors = solve_bse(
-            psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz,
-            n_eig=n_eig, max_iter=max_lanczos_iter, include_W=include_W,
-        )
+        with timing.section("bse.eigensolve", announce=True,
+                            label="lanczos eigensolve (1 device)") as _sec:
+            eigenvalues, eigenvectors = solve_bse(
+                psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz,
+                n_eig=n_eig, max_iter=max_lanczos_iter, include_W=include_W,
+            )
+            _sec.watch(eigenvalues, eigenvectors)
     ryd2ev = 13.6056980659
     print(f"Lowest {n_eig} eigenvalues (Ry): {eigenvalues}")
     print(f"Lowest {n_eig} eigenvalues (eV): {eigenvalues * ryd2ev}")
 
     if write_eigs is not None:
         n_write = n_eig if write_eigs < 0 else min(write_eigs, n_eig)
-        write_eigenvectors_stream(
-            "eigenvectors.h5",
-            eigenvalues,
-            eigenvectors,
-            n_val,
-            n_cond,
-            nkx,
-            nky,
-            nkz,
-            n_write,
-            use_tda=tda,
-        )
+        with timing.section("bse.write_eigenvectors", announce=True):
+            write_eigenvectors_stream(
+                "eigenvectors.h5",
+                eigenvalues,
+                eigenvectors,
+                n_val,
+                n_cond,
+                nkx,
+                nky,
+                nkz,
+                n_write,
+                use_tda=tda,
+            )
+
+    if jax.process_index() == 0:
+        # ``wall=`` closes the table: printed rows + ``(untimed)`` == the whole
+        # PROCESS when /proc gave us the pre-main span, else this function.
+        # ``(untimed)`` is then the mesh creation + clique warm-up and the
+        # small host work between the named stages.
+        timing.report(print_fn=print, title="--- BSE Timing ---",
+                      wall=time.perf_counter() - _t_main + (_pre_main or 0.0))
 
 
 

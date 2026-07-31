@@ -41,8 +41,9 @@ if [[ -z "${LORRAX_FFI_ALLOW_DEFAULT_MPI:-}" ]]; then
         echo "[build]   include='${LORRAX_MPI_INCLUDE_DIR:-<unset>}'" >&2
         echo "[build]   libdir ='${LORRAX_MPICH_LIB_DIR:-<unset>}'"   >&2
         echo "[build] Without these CMake falls back to HPC-X OpenMPI at /opt/hpcx/ompi" >&2
-        echo "[build] and the produced .so will have DT_NEEDED libmpi.so.40 — which is" >&2
-        echo "[build] the wrong SONAME for Cray MPICH and segfaults the runtime path" >&2
+        echo "[build] and the produced .so will ask for libmpi.so.40 at run time —" >&2
+        echo "[build] the wrong MPI library name for Cray MPICH, which segfaults" >&2
+        echo "[build] the runtime path" >&2
         echo "[build] (see KNOWN_SANDBOX_ERRORS.md 2026-05-10)." >&2
         echo "[build] Invoke via src/ffi/common/cpp/run_shifter.sh, which exports both," >&2
         echo "[build] or set LORRAX_FFI_ALLOW_DEFAULT_MPI=1 to bypass this check." >&2

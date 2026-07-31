@@ -30,7 +30,6 @@ looks them up by string, so no enum/registry retrofit is needed.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Callable
 
@@ -40,7 +39,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common import jax_profile
 import common.timing as timing
-from .gw_config import ComputeMode
+from .gw_config import ComputeMode, env_bool
 
 
 # ---------------------------------------------------------------------------
@@ -213,8 +212,16 @@ def compute_static_w(
     # rank, so the affected process speaks, tagged with its rank id
     # (audit fix/zq 2026-07-28; previously this read was fully silent —
     # verbose=False below suppresses even the IBZ resolve's own print).
-    _env_force_full_bz = bool(
-        int(os.environ.get('LORRAX_FORCE_FULL_BZ', '0')))
+    # ONE grammar, shared with the four other readers of this knob
+    # (``gw/gw_init.py`` x3, ``gw/v_q_g_flat.py``).  ``bool(int(...))``
+    # accepted decimal digits only, which for a knob whose whole purpose is
+    # to be typed by hand at a shell prompt meant ``=true``/``=on``/``=yes``
+    # raised ``invalid literal for int()`` from inside the W solve, and
+    # ``=2`` silently meant "on".  ``env_bool`` also ANNOUNCES an
+    # unrecognised token instead of resolving it in either direction
+    # silently, which matters here more than anywhere: this is the one
+    # numerics-affecting reader of the five.
+    _env_force_full_bz = env_bool('LORRAX_FORCE_FULL_BZ', False)
     if _env_force_full_bz and not force_full_bz:
         global _FORCE_FULL_BZ_ANNOUNCED
         if not _FORCE_FULL_BZ_ANNOUNCED:

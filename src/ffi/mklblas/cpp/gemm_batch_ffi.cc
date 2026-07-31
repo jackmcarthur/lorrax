@@ -105,6 +105,7 @@
 #include <cblas.h>              // standard CBLAS (LibSci / OpenBLAS / BLIS)
 #endif
 
+#include "../../common/cpp/mkl_thread_pin.h"
 #include "xla/ffi/api/ffi.h"
 
 namespace lorrax_ffi::mklblas {
@@ -123,26 +124,29 @@ using blas_int = int;
 #endif
 
 // ---------------------------------------------------------------------------
-//  Runtime symbol resolution (the house idiom: blacs_grid.h's MklThreadScope,
-//  cufft/cpp's driver-API entries, mklfft/cpp's pin — all dlsym).
+//  Runtime symbol resolution (the house idiom: cufft/cpp's driver-API
+//  entries, the MKL pins — all dlsym).  The resolver itself now lives in
+//  common/cpp/mkl_thread_pin.h, which is MPI-free and CUDA-free so this
+//  comms-free TU can use it; it was THIS file's two-stage
+//  RTLD_DEFAULT->RTLD_NEXT version that the 2026-07-30 audit promoted to be
+//  the shared one, because it is the strictly more capable of the two forms
+//  that had diverged.  If both stages miss we take the plain-GEMM loop AND
+//  SAY SO (announce_entry_once).
 //
-//  RTLD_DEFAULT searches the process's global symbol scope.  That is the
+//  CORRECTION (2026-07-30): the comment that used to live here said
+//  "RTLD_DEFAULT searches the process's global symbol scope.  That is the
 //  right handle here because ffi_loader.get_lib() dlopens this .so with
-//  ctypes.CDLL(..., mode=RTLD_GLOBAL) (ffi_loader.py:514), which publishes
-//  the library AND its DT_NEEDED closure — libmkl_intel_lp64 among them —
-//  into that scope.  RTLD_NEXT is tried as a second chance for the case
-//  where this object was loaded into a local scope instead; if BOTH miss,
-//  we take the plain-GEMM loop AND SAY SO (announce_entry_once).  There is
-//  deliberately no third mechanism: an unresolved symbol here is a correct,
-//  announced capability answer, not an error to work around.
+//  ctypes.CDLL(..., mode=RTLD_GLOBAL)".  The first sentence is the man
+//  page's wording for a caller in the main executable and is not what glibc
+//  does for a caller inside a dlopen'd library — it searches the CALLER's
+//  link-map scope, which already includes this .so's DT_NEEDED closure.  The
+//  RTLD_GLOBAL load mode is therefore NOT what makes the pin resolve here,
+//  and the difference between this file's resolver and the bare-RTLD_DEFAULT
+//  copies in mklfft/scalapack was never behavioural.  Measured table is in
+//  the mkl_thread_pin.h header; the probe is
+//  tests/test_ffi_thread_pin_resolution.py.
 // ---------------------------------------------------------------------------
-static void* resolve_sym(const char* name) {
-    void* p = dlsym(RTLD_DEFAULT, name);
-#ifdef RTLD_NEXT
-    if (p == nullptr) p = dlsym(RTLD_NEXT, name);
-#endif
-    return p;
-}
+using mklpin::resolve_sym;
 
 // Batched-GEMM entry points, declared HERE as function-pointer typedefs so
 // no header needs to declare them (that is what frees the TU from
@@ -225,14 +229,10 @@ static bool batched_for(ffi::DataType dt) {
 
 // Announce on rank 0 (or when the launcher is unknown — tests, single
 // process).  Reading the launcher's rank env is enough: this TU is
-// comms-free by design and must not link MPI.
-static bool announce_here() {
-    for (const char* v : {"SLURM_PROCID", "PMI_RANK", "OMPI_COMM_WORLD_RANK"}) {
-        const char* s = std::getenv(v);
-        if (s != nullptr && *s != '\0') return std::strcmp(s, "0") == 0;
-    }
-    return true;
-}
+// comms-free by design and must not link MPI.  Moved to
+// common/cpp/mkl_thread_pin.h in the 2026-07-30 audit so mklfft and cufft —
+// which had NO rank guard at all — can share the one implementation.
+using mklpin::announce_here;
 
 // UNCONDITIONAL (not behind LORRAX_MKLBLAS_LOG): which entry is live must
 // always be visible in the log, so a silent downgrade cannot happen.  Once
@@ -257,13 +257,13 @@ static void announce_entry_once(ffi::DataType dt) {
     if (batched_for(dt)) {
         std::fprintf(stderr,
                      "[mklblas] GEMM entry (%s): cblas_%cgemm_batch "
-                     "(batched) — resolved by dlsym at first use.\n",
+                     "(batched) — this BLAS provides the batched entry.\n",
                      nm, letter);
     } else {
         std::fprintf(stderr,
                      "[mklblas] GEMM entry (%s): plain cblas_%cgemm loop — "
-                     "this BLAS does not export cblas_%cgemm_batch (dlsym), "
-                     "so the portable per-slot loop is used.  Correct, "
+                     "this BLAS does not provide cblas_%cgemm_batch, so the "
+                     "portable per-slot loop is used.  Correct, "
                      "~1.6-1.9x below the batched entry on MKL.\n",
                      nm, letter, letter);
     }
@@ -272,44 +272,12 @@ static void announce_entry_once(ffi::DataType dt) {
 
 // ---------------------------------------------------------------------------
 //  MKL thread pinning (workstream-AW pattern; dlsym so no extra link dep and
-//  a no-op on a non-MKL BLAS — same local copy as mklfft/cpp).
+//  a no-op on a non-MKL BLAS).  Mechanism shared via
+//  common/cpp/mkl_thread_pin.h; `MklLocalPin` is the old local name for what
+//  is now mklpin::MklThreadScope, kept so the pin site below reads unchanged.
 // ---------------------------------------------------------------------------
-using mkl_set_local_fn = int (*)(int);
-
-static mkl_set_local_fn mkl_set_num_threads_local_ptr() {
-    static mkl_set_local_fn fn = reinterpret_cast<mkl_set_local_fn>(
-        resolve_sym("MKL_Set_Num_Threads_Local"));
-    return fn;
-}
-
-class MklLocalPin {
-  public:
-    explicit MklLocalPin(int nthreads) {
-        if (nthreads <= 0) return;
-        auto set_local = mkl_set_num_threads_local_ptr();
-        if (set_local == nullptr) return;
-        prev_ = set_local(nthreads);
-        active_ = true;
-    }
-    ~MklLocalPin() {
-        if (active_) mkl_set_num_threads_local_ptr()(prev_);
-    }
-    MklLocalPin(const MklLocalPin&) = delete;
-    MklLocalPin& operator=(const MklLocalPin&) = delete;
-
-  private:
-    bool active_ = false;
-    int prev_ = 0;  // 0 = "follow the global setting" per MKL docs
-};
-
-static bool str_ieq(const char* a, const char* b) {
-    for (;; ++a, ++b) {
-        const int ca = std::tolower(static_cast<unsigned char>(*a));
-        const int cb = std::tolower(static_cast<unsigned char>(*b));
-        if (ca != cb) return false;
-        if (ca == 0) return true;
-    }
-}
+using MklLocalPin = mklpin::MklThreadScope;
+using mklpin::str_ieq;
 
 // MKL team size for the batch call.  Strict full-string grammar (AW audit
 // lesson: a typo must not silently pick a known-bad policy).  "auto"

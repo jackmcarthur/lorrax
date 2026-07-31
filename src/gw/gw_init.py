@@ -28,6 +28,19 @@ from common.collectives import barrier
 # Backward-compatible re-exports
 from .gw_config import read_lorrax_input, read_cohsex_input  # noqa: F401
 
+# Canonical env grammar for this layer.  ``gw_config`` is deliberately
+# jax-free, so importing it here adds nothing to the import graph that
+# ``read_lorrax_input`` above did not already add.  See the module comment
+# in gw_config for why this vocabulary is duplicated rather than imported
+# from ``isdf.core`` (which imports jax) — and for the drift gate that
+# keeps the copies identical.
+from .gw_config import (
+	env_bool,
+	active_zeta_truncating_knobs,
+	classify_xla_pool,
+	resolve_xla_gpu_memory_env,
+)
+
 
 def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print,
                                  *, fft_grid=None):
@@ -348,8 +361,18 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# (checked downstream).  The bispinor V_q orchestrator consumes the
 	# IBZ-only ζ̃_C identically to the 2-comp path; see derivation in
 	# ``reports/bispinor_ibz_2026-05-16/derivation.md``.
-	_write_ibz_only_charge = not bool(int(
-		os.environ.get('LORRAX_FORCE_FULL_BZ', '0')))
+	#
+	# ``env_bool``, not ``bool(int(os.environ.get(...)))``: the latter
+	# accepts only decimal digits, so the natural spellings of this knob —
+	# ``=1`` works but ``=true``/``=on``/``=yes`` raise a bare
+	# ``ValueError: invalid literal for int() with base 10`` from inside
+	# ISDF setup, and ``=2`` silently means "on".  All five sites that read
+	# this variable (three here, ``gw/v_q_g_flat.py``, ``gw/screening.py``)
+	# were converted together — a knob with two grammars is worse than one
+	# with a single wrong grammar, because then the failure depends on
+	# which code path reads it first.
+	_write_ibz_only_charge = not env_bool(
+		'LORRAX_FORCE_FULL_BZ', False, print_fn=print_fn)
 	# Two cutoffs control the bare-Coulomb / ζ-sphere construction:
 	#   * ``bare_coulomb_cutoff_ry`` — V_q's sqrt_v(q+G) mask.
 	#   * ``zeta_cutoff_ry``         — the on-disk per-q ζ sphere
@@ -475,7 +498,37 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# fit_zeta_to_h5) on purpose: a job killed between the two leaves a
 	# complete-but-unstamped file, which _zeta_reuse_ok refits.  Rank 0
 	# only, then a barrier so no rank races ahead of the write.
-	if jax.process_index() == 0:
+	#
+	# EXCEPT when a truncating knob was in force.  ``LORRAX_MAX_RCHUNKS=N``
+	# breaks the r-chunk loop after N chunks (gw/isdf_fitting.py) and the
+	# writer downstream of the loop still calls ``mark_zeta_done``, so the
+	# partial ζ is stamped COMPLETE on disk.  Provenance records the
+	# CONFIGURATION, which a later production run in the same directory
+	# reproduces exactly — so stamping here would make _zeta_reuse_ok
+	# reuse a truncated ζ and produce silently wrong physics from a
+	# profiling knob.  Refusing the stamp breaks that chain outright
+	# (rule 4 of _zeta_reuse_ok: no provenance ⇒ refit).
+	#
+	# The writer now consults the SAME knob list before calling
+	# ``mark_zeta_done``, so a truncated file also carries
+	# ``zeta_is_done=False``.  The two guards stay separate on purpose —
+	# provenance answers "may a later run REUSE this", zeta_is_done answers
+	# "did the writer FINISH" — and either alone stops the reuse.
+	_trunc = active_zeta_truncating_knobs()
+	if _trunc:
+		_names = ", ".join(f"{k}={v}" for k, v in _trunc)
+		print_fn("")
+		print_fn("  " + "!" * 68)
+		print_fn(f"  *** LORRAX SANITY: {_names} truncated this ζ fit. ***")
+		print_fn(f"  {zeta_h5_path} is INCOMPLETE and is NOT being stamped")
+		print_fn( "  with fit_provenance, so no later run can reuse it.  The")
+		print_fn( "  writer also left isdf_header/zeta_is_done False, so no")
+		print_fn( "  restart path will trust it either.  Profiling only —")
+		print_fn( "  delete this file before any production run from this")
+		print_fn( "  directory.")
+		print_fn("  " + "!" * 68)
+		print_fn("")
+	elif jax.process_index() == 0:
 		try:
 			from file_io.isdf_header import stamp_fit_provenance
 			stamp_fit_provenance(zeta_h5_path, _provenance)
@@ -488,16 +541,62 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	budget_gb = mem_est.get('budget_gb', cfg.memory.per_device_gb)
 	if peak_bytes > 0:
 		peak_gb = peak_bytes / 1e9
-		# peak_bytes_in_use only tracks the true peak under the BFC allocator.
-		# cuda_async (XLA_PYTHON_CLIENT_ALLOCATOR=platform — the FFI default)
-		# returns freed transients to its pool, so the reading under-reports;
-		# flag it rather than print a misleadingly-low % as if it were faithful.
-		_async = (os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR") == "platform"
-		          or os.environ.get("TF_GPU_ALLOCATOR") == "cuda_malloc_async")
-		_caveat = ("  [cuda_async under-reports — rerun with "
-		           "XLA_PYTHON_CLIENT_ALLOCATOR=default for the true peak]") if _async else ""
-		print_fn(f"    GPU high-water mark: {peak_gb:.2f} GB / {budget_gb:.2f} GB budget "
-		         f"({100 * peak_gb / budget_gb:.0f}%){_caveat}")
+		# WHERE DID THIS NUMBER COME FROM?  ``fit_zeta_to_h5._track_peak``
+		# prefers ``memory_stats()['peak_bytes_in_use']`` and falls back to
+		# an nvidia-smi whole-GPU sample when that is 0/absent — and the
+		# caller cannot tell which fired.  Under the ``platform`` allocator
+		# the arena reports bytes_limit=0 AND peak_bytes_in_use=0
+		# (measured, job 7882447), so every figure printed there is the
+		# nvidia-smi fallback: the whole card, other processes included.
+		#
+		# Four bugs in the previous three lines, all silent:
+		#   * ``== "platform"`` was case-SENSITIVE while jax lowercases
+		#     (jaxlib/xla_client.py:190), so ``=PLATFORM`` printed bare;
+		#   * it never matched ``cuda_async``, which is what
+		#     ``config/frontera/ffi_env.sh:24`` deploys;
+		#   * it called ``platform`` "cuda_async" — three distinct
+		#     allocators, and ``platform`` is plain cudaMalloc;
+		#   * its ``TF_GPU_ALLOCATOR`` clause was dead (inert for jax).
+		# And its premise — "cuda_async under-reports" — was not
+		# reproduced: peak_bytes_in_use measured IDENTICAL to BFC.
+		#
+		# The environment alone cannot answer this: the allocator is fixed
+		# at backend init, so a variable set later changes the string and
+		# not the client (job 7882443).  Corroborate against the device.
+		_xm = resolve_xla_gpu_memory_env()
+		_backend = jax.default_backend()
+		try:
+			_stats = jax.local_devices()[0].memory_stats()
+		except Exception as _exc:
+			_stats = None
+			print_fn(f"    [mem] memory_stats() unavailable "
+			         f"({type(_exc).__name__}: {_exc}); the peak below is "
+			         f"whatever the ζ-fit tracker could sample.")
+		_pool = classify_xla_pool(_stats, backend=_backend, env=_xm)
+		_caveat = _xm.caveat()
+		if _pool.disagreement:
+			print_fn(f"    *** LORRAX SANITY: {_pool.disagreement} ***")
+		# Label the line by the LIVE backend.  On a CPU-backend run that
+		# lands on a GPU node (JAX_PLATFORMS=cpu with SLURM still exporting
+		# CUDA_VISIBLE_DEVICES) the nvidia-smi fallback reads a GPU this
+		# run never used, so calling it a "GPU high-water mark" would be a
+		# statement about another job.
+		# ``budget_gb`` is 0 when no device memory could be detected (the CPU
+		# backend reaches this line too).  Print "n/a" rather than divide.
+		_pct = (f"{100 * peak_gb / budget_gb:.0f}%" if budget_gb > 0
+		        else "budget unknown")
+		if str(_backend).strip().lower() in ("gpu", "cuda", "rocm"):
+			_src = ("XLA arena" if _pool.peak_source == "arena"
+			        else "nvidia-smi whole-GPU sample")
+			print_fn(f"    GPU high-water mark: {peak_gb:.2f} GB / "
+			         f"{budget_gb:.2f} GB budget ({_pct})  "
+			         f"[source: {_src}]{_caveat}")
+		else:
+			print_fn(f"    ζ-fit high-water mark: {peak_gb:.2f} GB / "
+			         f"{budget_gb:.2f} GB budget ({_pct})  [backend="
+			         f"{_backend}: this figure comes from the device "
+			         f"memory-stats/nvidia-smi tracker and is NOT this "
+			         f"run's host RSS — use LORRAX_MEM_DEBUG=1 for that]")
 
 	# Default: no transverse-channel ψ to surface to the caller.
 	transverse_wfn_data = None
@@ -607,8 +706,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					# checked downstream in ``fit_zeta_to_h5``; failure
 					# is loud per the bispinor IBZ requirement.
 					write_ibz_only=(bool(cfg.bispinor)
-					                and not bool(int(os.environ.get(
-						                'LORRAX_FORCE_FULL_BZ', '0')))),
+					                and not env_bool(
+						                'LORRAX_FORCE_FULL_BZ', False,
+						                print_fn=print_fn)),
 					zeta_cutoff_ry=_zeta_cutoff,
 				)
 		# Surface the transverse-centroid ψ to the caller so it can build
@@ -715,8 +815,8 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# Orbit-closure of the C/T centroid sets is checked inside
 		# ``_resolve_ibz_q_list`` (called per tile by the V_q
 		# orchestrator) and silently falls back to full-BZ on failure.
-		_use_ibz_bispinor = not bool(int(
-			os.environ.get('LORRAX_FORCE_FULL_BZ', '0')))
+		_use_ibz_bispinor = not env_bool(
+			'LORRAX_FORCE_FULL_BZ', False, print_fn=print_fn)
 		if _use_ibz_bispinor:
 			_cents_curr_path = cfg.paths.centroids_file_current
 			_, _cent_T_idx_np, _ = _load_centroids(
@@ -1004,10 +1104,29 @@ def prepare_isdf_and_wavefunctions(
 			# the pipeline right after ζ-fit, before the expensive V_q
 			# stage.  Combine with LORRAX_MAX_RCHUNKS=N + LORRAX_RCHUNK_DEBUG=1
 			# for fast per-r-chunk timing sweeps.
-			if os.environ.get("LORRAX_EXIT_AFTER_ZETA"):
+			#
+			# The parse used to be a bare presence test, so *every* non-empty
+			# value exited — including ``LORRAX_EXIT_AFTER_ZETA=0``.  A debug
+			# knob set to "off" therefore ended a production run with
+			# ``SystemExit(0)``: the worst possible failure shape, because
+			# rc=0 with a truncated output is indistinguishable from
+			# completion to anything downstream.  ``env_bool`` gives ``0``,
+			# ``off``, ``false``, ``no`` (any case) their obvious meaning and
+			# announces anything it does not recognise.
+			if env_bool("LORRAX_EXIT_AFTER_ZETA", False, print_fn=print0):
 				if jax.process_index() == 0:
-					print("[profile] LORRAX_EXIT_AFTER_ZETA set: "
-					      "exiting cleanly after fit_zeta.", flush=True)
+					# Loud and machine-greppable: this exit is rc=0 by
+					# design (runtime's fail-fast excepthook documents
+					# SystemExit(0) as intentional), so the LOG is the only
+					# place a consumer can tell an early exit from a
+					# finished run.
+					print("*** LORRAX EARLY EXIT: LORRAX_EXIT_AFTER_ZETA=1 "
+					      "— stopping after fit_zeta.  V_q, W, and Σ were "
+					      "NOT computed; this run produced no self-energy. "
+					      "***", flush=True)
+					import sys as _sys
+					print("*** LORRAX EARLY EXIT (LORRAX_EXIT_AFTER_ZETA) ***",
+					      file=_sys.stderr, flush=True)
 				raise SystemExit(0)
 			# P4 — pre-V_q.  Whatever's still in HBM after fit_zeta
 			# returns forms the persistent baseline that V_q's transient
@@ -1025,7 +1144,7 @@ def prepare_isdf_and_wavefunctions(
 			# G0) plus anything held over from ζ-fit.  Combined with P4
 			# and the V_q HLO buffer-assignment.txt this lets us model
 			# V_q's contribution to overall HBM peak.  Round-1 addition.
-			if os.environ.get("LORRAX_MEM_DEBUG"):
+			if env_bool("LORRAX_MEM_DEBUG", False, print_fn=print0):
 				jax.block_until_ready(V_qmunu)
 			_mem_probe("post_v_q")
 

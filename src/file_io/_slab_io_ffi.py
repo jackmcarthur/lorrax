@@ -35,24 +35,27 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental.shard_map import shard_map
-from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.collectives import device_put_process_local
+from common.collectives import barrier as _barrier, device_put_process_local
 
 
 def _rank0() -> bool:
     return jax.process_index() == 0
 
 
-def _barrier(tag: str) -> None:
-    """Cross-process barrier; falls back to no-op if JAX hasn't
-    initialised the distributed runtime (single-process or test mode).
-    """
-    try:
-        multihost_utils.sync_global_devices(tag)
-    except Exception:
-        pass
+# ``_barrier`` is ``common.collectives.barrier``.  It used to be a local
+# copy whose whole body was ``try: sync_global_devices(tag); except
+# Exception: pass`` — seven lines below an import of the very module that
+# owns the correct one.  The swallow is the defect: every use of it here
+# guards a WRITE ordering (the inode replacement before the Lustre
+# prestripe hints, the prestripe before the collective open, the rank-0
+# deferred-attr write before close), so a barrier that silently did
+# nothing would let a rank read a file whose stripe layout or metadata
+# the writer has not finished changing — a data defect that reports rc=0.
+# ``collectives.barrier`` instead returns False for the legitimate
+# single-process no-op and RAISES (after naming the barrier) when a real
+# multi-process barrier fails.
 
 
 def _stripe_count() -> int:
@@ -909,8 +912,8 @@ class _FfiBackend:
                         if not isinstance(host, np.ndarray):
                             host = np.asarray(jax.device_get(host))
                         h5.create_dataset(name, data=host)
-            try:
-                multihost_utils.sync_global_devices("slab_io_ffi_close_attrs")
-            except Exception:
-                pass
+            # Same barrier, same reason as the write-ordering ones above:
+            # rank 0 has just rewritten datasets in this file with serial
+            # h5py, and no other rank may reopen it until that is durable.
+            _barrier("slab_io_ffi_close_attrs")
             self._deferred_attrs = []

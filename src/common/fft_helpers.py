@@ -1,37 +1,32 @@
 import math
-import os
 from typing import Callable
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-from jax.experimental.custom_partitioning import custom_partitioning
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
 
 # =============================================================================
-# FFT workspace query (for memory-model sizing)
+# FFT peak-memory query (for memory-model sizing)
 # =============================================================================
-# The memory model in ``gflat_memory_model.plan_gflat_chunks`` (and the
-# V_q chooser in ``compute_vcoul._choose_v_q_chunks``) needs the per-rank peak
-# HBM an ``N``-D batched FFT will allocate.  Nominal ``N_copies × data_size``
-# fudge factors under-predict badly for mixed-radix boxes (24 = 2³·3, 10 = 2·5)
-# at small batch sizes — cuFFT's planner picks different algorithms there with
-# non-linear workspace growth.
+# ``gflat_memory_model._fft_box_bytes`` needs the per-rank peak HBM a batched
+# 3-D FFT will actually take.  Nominal ``N_copies × data_size`` fudge factors
+# under-predict badly for mixed-radix boxes (24 = 2³·3, 10 = 2·5) at small
+# batch sizes — cuFFT picks different algorithms there, with non-linear
+# workspace growth.
 #
-# Rather than query cuFFT via ctypes (fragile across shifter / conda / bare-
-# metal JAX builds and may not match XLA's actual plan choice), we AOT-compile
-# the exact ``jnp.fft.fftn`` XLA would emit, read its ``memory_analysis()``,
-# and cache the result — pure JAX, works wherever JAX works.
+# The measurement has TWO halves and needs both.  ``compiled.memory_analysis()``
+# gives XLA's buffer-assignment peak; the cuFFT *plan workspace* is not in
+# buffer assignment at all (jaxlib's FftThunk takes it from a runtime scratch
+# allocator), so memory_analysis alone is a systematic low bound.  This
+# function compiles the FFT and hands the executable to
+# ``runtime.aot_memory.aot_kernel_peak_bytes``, which adds the cuFFT term by
+# querying ``cufftMakePlanMany`` on jaxlib's own libcufft.  That module owns
+# the cuFFT half; this function owns "which FFT, at which shape/sharding".
 #
-# This function is called statically at chooser time (never in a hot loop), so
-# the ~1-2 s per-shape compile cost is amortised across the full run.  Two
-# canonical uses in the pipeline:
-#   * Wavefunction-box FFT:   shape = fft_grid (nx, ny, nz), batched by
-#                             nk × bpd × ns (in-loop ψ_G → ψ_r).
-#   * k-grid FFT (ZCT / CCT): shape = kgrid (nkx, nky, nkz), batched by
-#                             μ × cr or μ × μ.
+# Called statically at chooser time (never in a hot loop), so the ~1-2 s
+# per-shape compile is amortised over the run and cached per unique shape.
 
 _fft_workspace_cache: dict = {}
 
@@ -43,18 +38,31 @@ def query_fft_peak_bytes(
     sharding: NamedSharding,
     dtype=jnp.complex128,
 ) -> int:
-    """AOT-compile a ``jnp.fft.fftn`` over the given input/sharding and
-    return the XLA-measured total peak bytes PER RANK.
+    """Per-rank peak HBM bytes of the production 3-D FFT at this shape.
 
-    "Peak" here is ``temp + argument + output − alias`` from
-    ``compiled.memory_analysis()`` — the full per-rank HBM footprint of
-    a standalone FFT jit (input buffer + output buffer + cuFFT scratch,
-    minus donated-alias savings).  Subtract what you already count in
-    other stage terms if you only want the "extra" workspace.
+    Compiles the SAME helper production uses — :func:`make_sharded_fftn_3d`,
+    a ``shard_map``'d device-local ``jnp.fft.fftn`` — at ``input_shape`` /
+    ``sharding``, then returns
+    ``runtime.aot_memory.aot_kernel_peak_bytes(...).total``:
+
+        ``temp + argument + output − alias``  (XLA buffer assignment)
+      + ``cufftMakePlanMany`` workspace       (invisible to the above)
+
+    i.e. the full per-rank footprint of a standalone FFT jit.  Subtract what
+    you already count in other stage terms if you only want the *extra*
+    workspace.
+
+    Every path that returns something weaker than that announces itself once
+    per process (``runtime.aot_memory.announce_once``): a failed compile
+    demotes to a 3×data analytic bound, and a CUDA mesh whose HLO contains no
+    parseable fft op — which would silently zero the cuFFT term — is reported
+    rather than believed.
 
     Caches by ``(input_shape, fft_axes, sharding.spec, dtype_str,
     mesh_shape)``, so each unique FFT shape compiles once per process.
     """
+    from runtime.aot_memory import aot_kernel_peak_bytes, announce_once
+
     mesh = sharding.mesh
     key = (tuple(input_shape), tuple(fft_axes),
            str(sharding.spec), jnp.dtype(dtype).str,
@@ -66,46 +74,70 @@ def query_fft_peak_bytes(
 
     spec = jax.ShapeDtypeStruct(
         tuple(int(s) for s in input_shape), dtype, sharding=sharding)
-
-    # Use make_jittable_local_fftn_3d — matches the real kernel's FFT
-    # partitioning.  Plain jnp.fft.fftn on a sharded tensor forces XLA
-    # to reason about the FFT at HLO level; since it can't see that
-    # sharded axes aren't FFT axes, it inserts a gather for the output
-    # and a ~2× replicated temp buffer, inflating reported peak by ~8×
-    # for small-FFT-axis + large-batch shapes.  The custom_partitioning
-    # wrapper hides the FFT in an opaque primitive so XLA sees only
-    # the local per-device FFT — matching production memory usage.
-    local_fftn = make_jittable_local_fftn_3d(
-        mesh, sharding.spec, sharding.spec,
-        axes=tuple(fft_axes), norm=None,
-    )
+    # THE SAME FACTORY PRODUCTION USES.  Every real FFT box in the pipeline
+    # (wfn_transforms._local_box_fft, zeta_loader._do_disk_to_G, the flat-k
+    # helpers below) goes through make_sharded_*fftn_3d: one shard_map'd
+    # rank-3 ``jnp.fft.fftn`` per rank over its local shard, which XLA:GPU
+    # lowers to ONE cuFFT rank-3 plan.  Modelling the per-axis
+    # ``make_jittable_local_fftn_3d`` form instead (as this function did
+    # before) sizes three rank-1 plans that no production path ever builds.
+    local_fftn = make_sharded_fftn_3d(
+        mesh, sharding.spec, sharding.spec, axes=tuple(fft_axes), norm=None)
     jit_fft = jax.jit(local_fftn, out_shardings=sharding)
 
+    platform = mesh.devices.flat[0].platform
+    on_gpu = platform in ("gpu", "cuda")
     try:
-        compiled = jit_fft.lower(spec).compile(
-            compiler_options={"xla_gpu_memory_limit_slop_factor": 10000})
-    except Exception:
-        # If AOT compile fails (unusual — happens e.g. when called before
-        # JAX has a backend), fall back to an over-conservative estimate:
-        # 3× data size.  Logged so the caller notices.
+        lowered = jit_fft.lower(spec)
+        # The slop factor keeps a deliberately oversized probe box from
+        # failing compilation on XLA:GPU's memory limit; it is a GPU-only
+        # debug option, so CPU meshes compile plain.
+        compiled = lowered.compile(
+            compiler_options={"xla_gpu_memory_limit_slop_factor": 10000}
+        ) if on_gpu else lowered.compile()
+        # Declare the mesh's platform: XLA:CPU also keeps an ``fft`` op in
+        # its optimized HLO (measured, jax 0.9.1), so the microservice cannot
+        # infer from the HLO alone whether a zero cuFFT term is a fact or a
+        # missing measurement.
+        peak = aot_kernel_peak_bytes(compiled, platform=platform)
+    except Exception as exc:
+        # Unusual (e.g. called before JAX has a backend, or a shape the mesh
+        # cannot shard).  Demote to an over-conservative 3×data bound — and
+        # SAY SO, from this rank.  The pre-2026-07-30 code claimed in a
+        # comment that this was "logged so the caller notices" while making
+        # no log call at all.
         elem = jnp.dtype(dtype).itemsize
         total_elems = 1
         for s in input_shape:
             total_elems *= int(s)
-        # Divide by total device count for per-rank estimate (approximate
-        # — assumes input is sharded across all devices).
         n_devs = 1
         for a in mesh.axis_names:
             n_devs *= int(mesh.shape[a])
         fallback = 3 * total_elems * elem // max(1, n_devs)
+        announce_once(
+            f"fft-peak-compile-failed:{key}",
+            f"FFT peak query could NOT compile {tuple(input_shape)} "
+            f"{jnp.dtype(dtype).name} on spec {sharding.spec} "
+            f"({type(exc).__name__}: {exc}).  Falling back to a 3×data "
+            f"analytic bound ({fallback/1e9:.2f} GB/rank) that does NOT "
+            f"include cuFFT plan workspace")
         _fft_workspace_cache[key] = fallback
         return fallback
 
-    m = compiled.memory_analysis()
-    total = (int(m.temp_size_in_bytes)
-             + int(m.argument_size_in_bytes)
-             + int(m.output_size_in_bytes)
-             - int(m.alias_size_in_bytes))
+    if not peak.fft_specs:
+        # We just compiled an FFT, so its op must be in the HLO — on BOTH
+        # platforms (measured, jax 0.9.1: XLA:CPU keeps the fft op too).  If
+        # it is not, the parser has gone blind and on a CUDA mesh that means
+        # the cuFFT term is 0 by omission rather than by measurement — the
+        # exact under-prediction this path exists to remove.
+        announce_once(
+            f"fft-peak-no-hlo-fft:{key}",
+            f"FFT peak query compiled {tuple(input_shape)} on a {platform!r} "
+            f"mesh but the optimized HLO exposes NO fft op.  On a CUDA mesh "
+            f"that silently zeroes the cuFFT plan-workspace term — XLA has "
+            f"probably changed how it emits FFTs; see "
+            f"runtime.aot_memory._FFT_OP_RE")
+    total = int(peak.total)
     _fft_workspace_cache[key] = total
     return total
 
@@ -164,144 +196,16 @@ def compute_block_size_for_2d_cholesky(n_rmu: int, Pr: int, Pc: int) -> tuple[in
 # ============================================================================
 # shard_map based FFT - runs FFT independently on each device's local data
 # See: https://docs.jax.dev/en/latest/notebooks/shard_map.html
+#
+# ONE local-FFT form, deliberately.  A second, per-axis
+# ``custom_partitioning`` form (``make_jittable_local_{i,}fftn_3d``, three
+# chained rank-1 FFTs) lived here until 2026-07-30 with no production caller:
+# its only user was ``query_fft_peak_bytes``, i.e. the memory model was
+# sizing three rank-1 cuFFT plans that nothing in the pipeline ever builds.
+# Recover it from git history if a per-axis form is ever wanted again; do not
+# reintroduce it as a modelling-only path.
 # ============================================================================
 
-
-def _normalize_local_fft_axes(rank: int, axes: tuple[int, ...]) -> tuple[int, ...]:
-    normalized = tuple(ax if ax >= 0 else rank + ax for ax in axes)
-    if len(set(normalized)) != len(normalized):
-        raise ValueError(f"FFT axes must be unique, got {axes}.")
-    if any(ax < 0 or ax >= rank for ax in normalized):
-        raise ValueError(f"FFT axes {axes} out of bounds for rank-{rank} array.")
-    return normalized
-
-
-def _validate_local_fft_specs(in_spec: P, out_spec: P, axes: tuple[int, ...]) -> tuple[int, ...]:
-    in_axes = tuple(in_spec)
-    out_axes = tuple(out_spec)
-    if len(in_axes) != len(out_axes):
-        raise ValueError(
-            f"Input/output PartitionSpecs must have the same rank, got {in_spec} and {out_spec}."
-        )
-    fft_axes = _normalize_local_fft_axes(len(in_axes), axes)
-    for ax in fft_axes:
-        if in_axes[ax] is not None or out_axes[ax] is not None:
-            raise ValueError(
-                "Jittable local FFT helpers require every transformed axis to be replicated. "
-                f"Axis {ax} is sharded in in_spec={in_spec}, out_spec={out_spec}."
-            )
-    return fft_axes
-
-
-def _make_jittable_local_fft(
-    mesh: Mesh,
-    in_spec: P,
-    out_spec: P,
-    *,
-    fft_kind: str,
-    norm: str | None,
-    axes: tuple[int, ...],
-):
-    """Return a jit-compatible FFT that preserves sharding on replicated FFT axes."""
-
-    del mesh  # The active mesh is supplied to the partition callback during tracing.
-    fft_axes = _validate_local_fft_specs(in_spec, out_spec, axes)
-    if fft_kind not in ("ifftn", "fftn"):
-        raise ValueError(f"Unsupported fft_kind={fft_kind!r}")
-
-    def _make_axis_wrapper(axis: int):
-        def fft_impl(x):
-            n_axis = x.shape[axis]
-            if fft_kind == "ifftn":
-                raw = jnp.conj(jnp.fft.fft(jnp.conj(x), axis=axis))
-                if norm in (None, "backward"):
-                    return raw / float(n_axis)
-                if norm == "ortho":
-                    return raw / jnp.sqrt(float(n_axis))
-                if norm == "forward":
-                    return raw
-            else:
-                raw = jnp.fft.fft(x, axis=axis)
-                if norm in (None, "backward"):
-                    return raw
-                if norm == "ortho":
-                    return raw / jnp.sqrt(float(n_axis))
-                if norm == "forward":
-                    return raw / float(n_axis)
-            raise ValueError(f"Unsupported FFT norm={norm!r}")
-
-        @custom_partitioning
-        def _local_fft_axis(x):
-            return fft_impl(x)
-
-        def _partition(mesh_arg: Mesh, arg_shapes, result_shape):
-            del arg_shapes, result_shape
-            return (
-                mesh_arg,
-                fft_impl,
-                NamedSharding(mesh_arg, out_spec),
-                (NamedSharding(mesh_arg, in_spec),),
-            )
-
-        def _infer(mesh_arg: Mesh, arg_shapes, result_shape):
-            del arg_shapes, result_shape
-            return NamedSharding(mesh_arg, out_spec)
-
-        _local_fft_axis.def_partition(
-            infer_sharding_from_operands=_infer,
-            partition=_partition,
-            sharding_rule="...i -> ...i",
-        )
-        return _local_fft_axis
-
-    axis_wrappers = [_make_axis_wrapper(axis) for axis in fft_axes]
-
-    def _local_fft(x):
-        for fft_axis in axis_wrappers:
-            x = fft_axis(x)
-        return x
-
-    return _local_fft
-
-
-def make_jittable_local_ifftn_3d(
-    mesh: Mesh,
-    in_spec: P,
-    out_spec: P,
-    *,
-    norm: str | None = None,
-    axes: tuple[int, int, int] = (-3, -2, -1),
-):
-    """Create a jit-compatible local IFFT over replicated FFT axes."""
-
-    return _make_jittable_local_fft(
-        mesh,
-        in_spec,
-        out_spec,
-        fft_kind="ifftn",
-        norm=norm,
-        axes=axes,
-    )
-
-
-def make_jittable_local_fftn_3d(
-    mesh: Mesh,
-    in_spec: P,
-    out_spec: P,
-    *,
-    norm: str | None = None,
-    axes: tuple[int, int, int] = (-3, -2, -1),
-):
-    """Create a jit-compatible local FFT over replicated FFT axes."""
-
-    return _make_jittable_local_fft(
-        mesh,
-        in_spec,
-        out_spec,
-        fft_kind="fftn",
-        norm=norm,
-        axes=axes,
-    )
 
 def local_ifftn3(x_local, *, axes: tuple[int, ...] = (-3, -2, -1), norm: str | None = None):
     """Device-local N-D IFFT — the inner kernel of :func:`make_sharded_ifftn_3d`.
@@ -369,223 +273,32 @@ def make_sharded_fftn_3d(
 
 # ============================================================================
 # FFI backend for the flat-k helpers — GATED, OFF by default
-# (LORRAX_FFT_FFI; the fused τ entry additionally behind
-# LORRAX_FFT_FFI_FUSED read in gw/ppm_tau_kernel).  PROTOTYPE 2026-07-28;
-# CUDA mirror 2026-07-29 — the flag is PLATFORM-UNIFORM.
+# ============================================================================
+# The service itself lives in ``src/ffi/mklfft`` (Python) + ``src/ffi/mklfft/
+# cpp`` and ``src/ffi/cufft/cpp`` (handlers).  THIS file used to carry a
+# second, drifting copy of the gate and both bodies; as of 2026-07-30 it
+# delegates, so there is ONE implementation and one env read.
 #
-# WHAT: the flat-k batched 3-D FFTs dispatched to the platform FFI library:
-#   cpu   liblorrax_ffi_host.so  MKL FFT via the DFTI *descriptor API*
-#                                (src/ffi/mklfft/cpp/fft_flat_k_ffi.cc) — a
-#                                genuine O(N log N) FFT at any k-count; NOT
-#                                a DFT-as-matmul (owner-vetoed): "DFTI" names
-#                                Intel's descriptor interface, nothing else.
-#   CUDA  liblorrax_ffi.so      cuFFT with the ADVANCED DATA LAYOUT
-#                                (src/ffi/cufft/cpp/fft_flat_k_cuda_ffi.cc):
-#                                cufftPlanMany64 inembed/istride=T/idist=1 —
-#                                the exact stride-descriptor analog; a plain
-#                                CUDA kernel (NVRTC-compiled; not a cuFFT
-#                                callback) fuses the G·W multiply + norms.
-# Both libraries register the SAME target names (ffi_loader per-platform
-# tables), so the ffi_call sites below stay platform-agnostic.
+# What the service is: the flat-k batched 3-D FFTs dispatched to the platform
+# FFI library — MKL FFT via the DFTI descriptor API on cpu meshes, cuFFT with
+# the advanced data layout (cufftPlanMany64) on CUDA meshes.  Both libraries
+# register the SAME target names, so the call sites are platform-agnostic.
+# WHY: XLA's fft custom-call wants the transformed axes minor-most, so every
+# dot(k-major) <-> fft(k-minor) boundary in the Σ τ kernel pays a full
+# transpose of the ~398 MB/rank μ² tile (60-65% of sigma.exec at nb=128/P=64).
+# Stride descriptors read the dot-layout tile where it lies, so the transposes
+# disappear instead of moving.  Contract: ``docs/dev/flat_k_fft_service.md``.
 #
-# WHY: XLA:CPU's fft custom-call requires the transformed axes minor-most,
-# so every dot(k-major flat) <-> fft(k-minor 3-D) boundary in the Σ τ
-# kernel pays a full transpose copy of the ~398 MB/rank μ² tile — measured
-# 60-65% of sigma.exec at nb=128/P=64 and CLOSED as structural for any
-# XLA-side arrangement (wk_REL/sigma_perf_results.md).  MKL FFT (DFTI API)
-# has no such layout requirement: stride descriptors read the dot-layout
-# tile exactly where it lies, so the helper boundary stops anchoring
-# layouts and the transposes disappear instead of moving.
-#
-# Contract: these helpers stay THE single FFT entry point (owner rule) —
-# the backend switch happens here and nowhere else.  The flag applies to
-# every make_flat_k_* call site whose contract the handler supports (the
-# 3-D-form spec replicated on the k axes, complex128, no post-FFT
-# reshard); norm conventions are computed HERE to match jnp.fft exactly
-# and shipped to the handler as a plain scale.  The FFI result is
-# value-identical to jnp.fft at ~1e-15 relative (different FFT engine, not
-# bit-identical) — gated by the unit gate + the 1e-12 Σ parity suite.
-#
-# Refusal doctrine (pattern #8): the flag is an explicit request — if the
-# mesh platform's library lacks the handler, or the platform has no backend
-# at all (neither cpu nor CUDA), this REFUSES loudly with the probe reason
-# instead of silently running the XLA path.
-# In-place: operand 0 is aliased to the result (input_output_aliases), so
-# when the buffer is dead XLA lets the handler transform it in place —
-# the terminal form of donation (zero extra big tiles).
+# What stays here: the OWNER RULE that these helpers are the single FFT entry
+# point.  ``make_flat_k_fft`` below is still the only door; it just asks
+# ``ffi.mklfft`` for the backend instead of implementing it twice.
 # ============================================================================
 
-_FFT_FFI_TARGET = "lorrax_mklfft_flat_k"
-_FFT_FFI_CONV_TARGET = "lorrax_mklfft_gw_conv"
-_fft_ffi_announced: set = set()
-
-
-def fft_ffi_enabled() -> bool:
-    """LORRAX_FFT_FFI=1 routes flat-k FFTs to the platform FFI handler
-    (MKL FFT/DFTI on cpu meshes, cuFFT strided on CUDA meshes — same
-    target names, resolved per lowering platform).  Read at helper-FACTORY
-    time (kernel caches must key on it — see ppm_tau_kernel).  Unrecognized
-    values announce once and take the safe direction: OFF (the default XLA
-    path untouched)."""
-    v = os.environ.get("LORRAX_FFT_FFI", "0").strip().lower()
-    if v in ("", "0", "off", "false", "no"):
-        return False
-    if v in ("1", "on", "true", "yes"):
-        return True
-    if "grammar" not in _fft_ffi_announced:
-        _fft_ffi_announced.add("grammar")
-        print(f"*** LORRAX_FFT_FFI={v!r} is not a recognized value "
-              f"(accepted: 0/off/false/no, 1/on/true/yes).  Treating as OFF "
-              f"(default XLA FFT path). ***", flush=True)
-    return False
-
-
-def _fft_ffi_platform(mesh: Mesh) -> str:
-    """FFI platform string for ``mesh``'s devices ("cpu" or "CUDA").
-
-    Platform dispatch (2026-07-29): the CUDA library exports the SAME target
-    names (cufft/cpp/fft_flat_k_cuda_ffi.cc — cufftPlanMany64 advanced
-    layout, the exact stride-descriptor analog of the MKL DFTI handlers), so
-    LORRAX_FFT_FFI is platform-uniform on cpu and CUDA meshes.  Anything
-    else still refuses loudly — explicit requests are never silently
-    downgraded."""
-    plat = mesh.devices.flat[0].platform
-    if plat == "cpu":
-        return "cpu"
-    if plat in ("gpu", "cuda"):
-        return "CUDA"
-    raise RuntimeError(
-        f"LORRAX_FFT_FFI requested the FFI flat-k FFT backend, but the mesh "
-        f"devices are {plat!r} — backends exist for cpu (MKL FFT via the "
-        f"DFTI API) and CUDA (cuFFT strided) only.  Unset LORRAX_FFT_FFI on "
-        f"this mesh (explicit requests are never silently downgraded).")
-
-
-_FFT_FFI_BACKEND_LABEL = {
-    "cpu": "MKL FFT (DFTI API) host",
-    "CUDA": "cuFFT strided CUDA",
-}
-
-
-def _require_fft_ffi(mesh: Mesh, target: str) -> None:
-    """Announce-or-refuse for the explicitly requested FFI backend.
-
-    Refuses (with the probe reason) ONLY if the mesh platform has no
-    backend, or the platform's library lacks the target — never silently
-    runs the XLA path (pattern #8)."""
-    plat = _fft_ffi_platform(mesh)
-    from ffi.common import ffi_loader
-    ok, reason = ffi_loader.probe_target(target, plat)
-    if not ok:
-        raise RuntimeError(
-            f"LORRAX_FFT_FFI requested the {_FFT_FFI_BACKEND_LABEL[plat]} "
-            f"backend, but FFI target {target!r} is unusable on platform "
-            f"{plat!r}: {reason}")
-    key = (target, plat)
-    if key not in _fft_ffi_announced:
-        _fft_ffi_announced.add(key)
-        try:
-            first = jax.process_index() == 0
-        except Exception:
-            first = True
-        if first:
-            if plat == "cpu":
-                print(f"[fft_ffi] flat-k 3-D FFTs -> MKL FFT (DFTI API) host "
-                      f"FFI handler ({target}): O(N log N) FFT reading the "
-                      f"dot-layout tile in place via stride descriptors — no "
-                      f"XLA layout transposes.", flush=True)
-            else:
-                print(f"[fft_ffi] flat-k 3-D FFTs -> cuFFT strided CUDA FFI "
-                      f"handler ({target}): cufftPlanMany64 advanced layout "
-                      f"(istride=T, idist=1 — the stride-descriptor analog) "
-                      f"reading the dot-layout tile in place; jnp.fft norm "
-                      f"scales applied by a fused device kernel.", flush=True)
-
-
-def _ffi_fft_scale(kind: str, norm: str | None, nk: int) -> float:
-    """Total scale matching jnp.fft's norm conventions exactly:
-    ifftn: backward/None -> 1/N, ortho -> 1/sqrt(N), forward -> 1;
-    fftn : backward/None -> 1,  ortho -> 1/sqrt(N), forward -> 1/N."""
-    if norm == 'ortho':
-        return 1.0 / math.sqrt(float(nk))
-    if norm in (None, 'backward'):
-        return 1.0 / float(nk) if kind == 'ifftn' else 1.0
-    if norm == 'forward':
-        return 1.0 if kind == 'ifftn' else 1.0 / float(nk)
-    raise ValueError(f"Unsupported FFT norm={norm!r}")
-
-
-def _validate_ffi_flat_spec(spec: P, what: str) -> P:
-    """FFT axes (leading three of the 3-D form) must be replicated; return
-    the equivalent flat-form spec (nk axis replicated + original trail)."""
-    axes = tuple(spec)
-    if len(axes) < 3 or any(ax is not None for ax in axes[:3]):
-        raise ValueError(
-            f"FFI flat-k backend needs the three k axes of {what} replicated "
-            f"(spec {spec}); sharded FFT axes are unsupported (same contract "
-            f"as the XLA-path helpers).")
-    return P(None, *axes[3:])
-
-
-def _make_flat_k_fft_ffi(
-    mesh: Mesh,
-    kgrid: tuple[int, int, int],
-    spec: P,
-    *,
-    kind: str,
-    norm: str | None,
-    out_spec: P | None,
-) -> Callable:
-    """FFI-backed flat-k FFT: ``(nk, *trail) -> (nk, *trail)``, same contract
-    as :func:`make_flat_k_fft` — one batched strided FFT per rank over the
-    local shard (MKL DFTI on cpu, cuFFT advanced layout on CUDA), k-major
-    layout end to end (never reshaped to the 3-D k-minor form, which is the
-    whole point)."""
-    if kind not in ('ifftn', 'fftn'):
-        raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
-    if out_spec is not None and tuple(out_spec) != tuple(spec):
-        raise ValueError(
-            "FFI flat-k backend does not implement a post-FFT reshard "
-            f"(out_spec {out_spec} != spec {spec}); unset LORRAX_FFT_FFI for "
-            "this call path or drop out_spec.")
-    _require_fft_ffi(mesh, _FFT_FFI_TARGET)
-    nkx, nky, nkz = (int(v) for v in kgrid)
-    nk = nkx * nky * nkz
-    flat_spec = _validate_ffi_flat_spec(spec, "the input")
-    scale = _ffi_fft_scale(kind, norm, nk)
-    attrs = dict(nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz),
-                 forward=np.int64(0 if kind == 'ifftn' else 1),
-                 scale=np.float64(scale))
-
-    def _local(x_local):
-        out_t = jax.ShapeDtypeStruct(x_local.shape, x_local.dtype)
-        return jax.ffi.ffi_call(
-            _FFT_FFI_TARGET, out_t,
-            input_output_aliases={0: 0},  # in-place when the operand is dead
-        )(x_local, **attrs)
-
-    _sm = shard_map(_local, mesh=mesh,
-                    in_specs=(flat_spec,), out_specs=flat_spec,
-                    check_rep=False)
-
-    def _flat_k_fft_ffi(x_flat):
-        if x_flat.dtype != jnp.complex128:
-            raise TypeError(
-                f"FFI flat-k backend supports complex128 only, got "
-                f"{x_flat.dtype} (the XLA path would accept it — unset "
-                f"LORRAX_FFT_FFI for this call path).")
-        if x_flat.ndim != len(tuple(flat_spec)):
-            raise ValueError(
-                f"flat-k input rank {x_flat.ndim} does not match the "
-                f"3-D-form spec {spec} (expect rank {len(tuple(flat_spec))} "
-                f"flat).")
-        if int(x_flat.shape[0]) != nk:
-            raise ValueError(
-                f"flat-k input leading extent {x_flat.shape[0]} != "
-                f"nkx*nky*nkz = {nk}.")
-        return _sm(x_flat)
-
-    return _flat_k_fft_ffi
+from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
+    fft_ffi_enabled,
+    make_gw_conv_ffi as _make_gw_conv_ffi,
+    make_flat_k_fft_ffi as _make_flat_k_fft_ffi,
+)
 
 
 def make_flat_k_gw_conv(
@@ -597,63 +310,18 @@ def make_flat_k_gw_conv(
     norm: str | None = 'ortho',
     mult: float = 1.0,
 ) -> Callable:
-    """FUSED flat-k convolution — the second FFI entry point (MKL DFTI on
-    cpu, cuFFT + fused multiply kernel on CUDA).
-
-    Returns ``fn(G_flat, W_flat) -> sigma_flat`` computing, value-identically
-    to the decomposed helper sequence (~1e-15 rel; gated, not bit-exact):
+    """FUSED flat-k convolution ``fn(G_flat, W_flat) -> sigma_flat``:
 
         sigma = fftn( ifftn(G) * ifftn(W)[:, None, :, None, :] * mult )
 
-    with all three transforms + the broadcast multiply inside ONE host FFI
-    call per rank, chunked so the R-space G tile never materializes (the
-    Σ τ kernel's big intermediate).  ``G_flat`` is ``(nk, a, mx, b, my)``,
-    ``W_flat`` is ``(nk, mx, my)``; ``mult`` (e.g. Σ's -1/√N_k) is folded
-    into the forward-transform scale.  Shapes/strides come from the runtime
-    shards — nothing deck-specific.  Sigma-family layout contract only; the
-    plain helpers remain the entry point for everything else.
+    with all three transforms + the broadcast multiply in ONE FFI call per
+    rank, so the R-space G tile never materializes.  Sigma-family layout
+    contract only; the plain helpers remain the entry point for everything
+    else.  Implementation: :func:`ffi.mklfft.make_gw_conv_ffi`.
     """
-    _require_fft_ffi(mesh, _FFT_FFI_CONV_TARGET)
-    nkx, nky, nkz = (int(v) for v in kgrid)
-    nk = nkx * nky * nkz
-    g_flat = _validate_ffi_flat_spec(g_spec, "G")
-    v_flat = _validate_ffi_flat_spec(v_spec, "W")
-    attrs = dict(nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz),
-                 scale_i=np.float64(_ffi_fft_scale('ifftn', norm, nk)),
-                 scale_f=np.float64(_ffi_fft_scale('fftn', norm, nk)
-                                    * float(mult)))
+    return _make_gw_conv_ffi(mesh, kgrid, g_spec, v_spec,
+                             norm=norm, mult=mult)
 
-    def _local(g_local, w_local):
-        if g_local.ndim != 5 or w_local.ndim != 3:
-            raise ValueError(
-                f"gw_conv expects local G (nk, a, mx, b, my) and W "
-                f"(nk, mx, my); got {g_local.shape} / {w_local.shape}.")
-        if (g_local.shape[0] != w_local.shape[0]
-                or g_local.shape[2] != w_local.shape[1]
-                or g_local.shape[4] != w_local.shape[2]):
-            raise ValueError(
-                f"gw_conv G/W shard shapes disagree: {g_local.shape} vs "
-                f"{w_local.shape} (need G[0]==W[0], G[2]==W[1], G[4]==W[2]).")
-        out_t = jax.ShapeDtypeStruct(g_local.shape, g_local.dtype)
-        return jax.ffi.ffi_call(
-            _FFT_FFI_CONV_TARGET, out_t,
-            input_output_aliases={0: 0},  # sigma_k in G_k's buffer when dead
-        )(g_local, w_local, **attrs)
-
-    _sm = shard_map(_local, mesh=mesh,
-                    in_specs=(g_flat, v_flat), out_specs=g_flat,
-                    check_rep=False)
-
-    def _gw_conv(G_flat, W_flat):
-        if G_flat.dtype != jnp.complex128 or W_flat.dtype != jnp.complex128:
-            raise TypeError("gw_conv supports complex128 only.")
-        if int(G_flat.shape[0]) != nk or int(W_flat.shape[0]) != nk:
-            raise ValueError(
-                f"gw_conv leading extents {G_flat.shape[0]}/{W_flat.shape[0]} "
-                f"!= nkx*nky*nkz = {nk}.")
-        return _sm(G_flat, W_flat)
-
-    return _gw_conv
 
 
 # ============================================================================

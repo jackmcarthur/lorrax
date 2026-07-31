@@ -9,21 +9,25 @@ numpy to ~1e-10.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+# Env defaults + jax.distributed + CPU fallback, BEFORE `import jax`.
+from runtime import bootstrap                                 # noqa: E402
+bootstrap()
 
-import numpy as np
+import numpy as np                                            # noqa: E402
 import jax
 import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
+from common.collectives import (all_gather_processes,          # noqa: E402
+                                device_put_process_local,
+                                process_rank, resolve_mesh)
+
 
 def _log(msg: str) -> None:
-    if jax.process_index() == 0:
+    if process_rank() == 0:
         print(msg, flush=True)
 
 
@@ -35,23 +39,16 @@ def main() -> int:
     ap.add_argument("--repeats", type=int, default=3)
     args = ap.parse_args()
 
-    _DIST_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
-    if not os.environ.get(_DIST_SENTINEL):
-        if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
-            # Do NOT swallow: a failed distributed init in a >1-task run
-            # leaves this rank running a different program than its peers.
-            jax.distributed.initialize()
-        os.environ[_DIST_SENTINEL] = "1"
-
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from jax.sharding import NamedSharding, PartitionSpec as P
     from ffi.linalg import backend_module
     distributed_eigh = backend_module("cusolvermp").distributed_eigh
 
-    world = jax.process_count()
-    p = int(np.sqrt(world))
-    q = world // p
-    devices = np.asarray(jax.devices()).reshape(p, q)
-    mesh = Mesh(devices, ("x", "y"))
+    # ``resolve_mesh`` factorises the device count most-squarely and refuses
+    # a mesh this process owns no device in.  The int(sqrt(world)) grid it
+    # replaces silently produced a reshape error for any non-rectangular
+    # world (P=7 -> 2x3).
+    mesh = resolve_mesh()
+    p, q = (int(s) for s in mesh.devices.shape)
 
     rng = np.random.default_rng(17)
     X = rng.standard_normal((args.n, args.n))
@@ -59,7 +56,6 @@ def main() -> int:
     ref = np.sort(np.linalg.eigvalsh(A_host))
     # Process-local (AA.1): plain device_put of the host operand would pay
     # a P × n² × 8 B assert_equal all-gather and distort the benchmark.
-    from common.collectives import device_put_process_local
     A = device_put_process_local(A_host, NamedSharding(mesh, P("x", "y")))
 
     _log(f"n={args.n}  grid={p}x{q}  repeats={args.repeats}")
@@ -86,9 +82,7 @@ def main() -> int:
                 samples.append((time.perf_counter() - t0) * 1000)
 
             evals, _ = distributed_eigh(A, mesh=mesh, block_size=block)
-            from jax.experimental import multihost_utils
-            evals_np = np.sort(np.asarray(
-                multihost_utils.process_allgather(evals, tiled=False)))
+            evals_np = np.sort(all_gather_processes(evals))
             err = float(np.max(np.abs(evals_np - ref)))
 
             s = np.asarray(samples)

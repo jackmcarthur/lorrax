@@ -380,13 +380,13 @@ def resolve_backend(op: str, requested: str, mesh_xy: Mesh,
     # 3. compiled capability
     #
     # ``probe_target`` (not ``has_target``) because the REASON matters to
-    # whoever reads this: "the .so would not dlopen" and "the .so has no
+    # whoever reads this: "the .so would not load" and "the .so has no
     # such handler" have completely different fixes, and reporting the
     # first as the second sends people to rebuild a library that is fine.
     # That happened: wk_P G4 (2026-07-25) refused slate cholesky on a
     # legal 8x1 mesh with "not compiled into the cpu FFI library" while
     # `nm -D` showed SlatePotrfHostFfi present — the real cause was an
-    # incomplete LD_LIBRARY_PATH for the lib's DT_NEEDED.
+    # incomplete LD_LIBRARY_PATH for the libraries that lib needs.
     usable, why = ffi_loader.probe_target(target, platform)
     if not usable:
         raise RuntimeError(

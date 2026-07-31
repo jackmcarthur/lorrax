@@ -4,9 +4,10 @@ The **permanent CPU backend for distributed Hermitian eigendecomposition**
 (``ffi.linalg.resolve_backend('eigh', 'distributed', <cpu mesh>)``).  SLATE's
 host ``heev`` SIGSEGVs deterministically on this stack — bug L-2, reproduced
 down to a 1×1 mesh, single rank — while ScaLAPACK's routines on the SAME
-library and MPI context are clean; ScaLAPACK also comes from MKL, which
-``liblorrax_ffi_host.so`` already links for ``solve_lu``, so this costs no
-new dependency.
+library and MPI context are clean.  ScaLAPACK comes from whichever
+implementation of the ScaLAPACK API the host library was linked against
+(see ``ffi.scalapack``); ``liblorrax_ffi_host.so`` already links it for
+``solve_lu``, so this costs no new dependency.
 
 Layout contract
 ---------------

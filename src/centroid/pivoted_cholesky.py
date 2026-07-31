@@ -18,10 +18,11 @@ Architectural map to ``gw/isdf_fitting.py``:
     gram_q0_from_pair                 ←→  q=0 cross-product (no k→q FFT)
     (nothing)                         ←→  pivoted_cholesky_select  (new)
 
-This module is deliberately single-device for the first cut per the md's
-guidance ("Do not start with distributed pivoting"). The ``build_gram_q0``
-step is a k-serial ``lax.fori_loop``; the select step is a single
-``lax.fori_loop`` with static ``k_keep``. Both jit cleanly.
+The Gram is built row-sharded over the ``('x','y')`` mesh and the select
+step runs on it in place: per iteration it costs one ``pmax`` for the
+pivot value, one for the tie-break, and one ``psum`` of the (k_keep,)
+pivot row — O(k_keep) comm, everything else local.  Column ``p`` needs no
+collective at all, which is why the Gram is ROW-sharded.
 
 Shapes (following the md):
 
@@ -54,142 +55,17 @@ from file_io import WfnLoader as WFNReader
 from common import symmetry_maps, timing
 from common.collectives import device_put_process_local
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Step 1 — gather wavefunctions at candidate points
-# ═══════════════════════════════════════════════════════════════════════
-
-
-def gather_wfn_at_candidates(
-    wfn: WFNReader,
-    sym: symmetry_maps.SymMaps,
-    cand_idx: np.ndarray,
-    band_start: int,
-    band_end: int,
-) -> jnp.ndarray:
-    """Evaluate ψ_{n,k}(r̃_a) at M candidate FFT-grid points for bands in a slice.
-
-    Uses IBZ wavefunctions (no full-BZ unfold). The implementation is:
-
-      1. For each irreducible k-point:
-         a. Read raw coefficients ``c_n,k(G)`` for the requested band slice.
-         b. Scatter onto the QE FFT grid (n_x, n_y, n_z).
-         c. iFFT to real space.
-         d. Gather at the M candidate indices.
-      2. Stack along k and return.
-
-    Spinor components are preserved: output shape is
-    ``(nkpts, nb, nspinor, M)``. The caller typically flattens the spinor
-    axis into the band axis for Gram assembly.
-
-    Args:
-        wfn: open WFNReader.
-        sym: matching SymMaps (currently unused — raw IBZ coefficients
-            suffice because |ψ|² and cross products don't care about the
-            fractional-translation phase that SymMaps applies — but kept in
-            the signature for future use).
-        cand_idx: (M, 3) int FFT-grid indices, already reduced mod fft_grid.
-        band_start, band_end: half-open band range [band_start, band_end).
-
-    Returns:
-        psi_cand: (nkpts, band_end - band_start, nspinor, M) complex128
-            ψ_{n,k}(r̃_a), one slab per IBZ k-point. Kept in complex128 so
-            the downstream Gram + pivoted-Cholesky select operate in fp64
-            throughout (matches the gw_jax data path's precision).
-    """
-    del sym  # reserved; see docstring
-    from file_io.wfn_loader import WfnLoader
-    from common.wfn_transforms import to_rmu
-
-    # Reduce ``cand_idx`` mod fft_grid to match the convention to_rmu
-    # expects (FFT-grid indices in ``[0, fft_grid[a])``).
-    nx, ny, nz = (int(x) for x in wfn.fft_grid)
-    cand_mod = np.stack([
-        np.asarray(cand_idx[:, 0], dtype=np.int64) % nx,
-        np.asarray(cand_idx[:, 1], dtype=np.int64) % ny,
-        np.asarray(cand_idx[:, 2], dtype=np.int64) % nz,
-    ], axis=-1).astype(np.int32)
-
-    # WfnLoader (eager) + to_rmu: IBZ raw → IFFT → gather at candidates.
-    # ``norm='ortho'`` matches the legacy convention (1/√N on both
-    # directions); pivoted-Cholesky selection is scale-invariant
-    # but we preserve byte-for-byte numerics anyway.
-    with WfnLoader(wfn._filename) as loader:
-        psi = loader.load(bands=(band_start, band_end), k="ibz")
-        mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
-                     axis_names=('x', 'y'))
-        return to_rmu(psi, loader.box_index(k="ibz"), loader.fft_grid,
-                      cand_mod, mesh=mesh, norm="ortho")
+from . import distribution as dist
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Step 2 — Gram matrix G^{(0)}_{ab}
+# Reference — single-device greedy pivoted Cholesky
 # ═══════════════════════════════════════════════════════════════════════
-
-
-def _fold_spin_into_band(psi: jnp.ndarray) -> jnp.ndarray:
-    """(nk, nb, nspinor, M) → (nk, nb * nspinor, M). Pure reshape."""
-    nk, nb, ns, M = psi.shape
-    return psi.reshape(nk, nb * ns, M)
-
-
-@partial(jax.jit, static_argnames=('enforce_hermitian',))
-def build_candidate_gram_q0(
-    phi_val_cand: jnp.ndarray,
-    psi_cond_cand: jnp.ndarray,
-    k_weights: jnp.ndarray | None = None,
-    enforce_hermitian: bool = True,
-) -> jnp.ndarray:
-    """Build the (M, M) Hermitian PSD candidate Gram for q = 0.
-
-        G_{ab} = Σ_k w_k · [Σ_v  φ_{v,k}(r̃_a)  φ*_{v,k}(r̃_b)]
-                        · [Σ_c  ψ*_{c,k}(r̃_a) ψ_{c,k}(r̃_b)]
-
-    (pivoted_cholesky.md §1, §4.2)
-
-    The k-loop is a ``lax.fori_loop`` so the whole thing fits in a single
-    jit; memory peak is (M, M) complex plus two (nv|nc, M) slabs per step.
-
-    Args:
-        phi_val_cand:  (nk, nv_eff, M) complex — spinor folded into band.
-        psi_cond_cand: (nk, nc_eff, M) complex — same.
-        k_weights: optional (nk,) real. If None, all k-points get weight 1.
-        enforce_hermitian: if True, symmetrize ``(G + G^H) / 2`` at exit.
-
-    Returns:
-        G: (M, M) complex.
-    """
-    nk, nv, M = phi_val_cand.shape
-    _, nc, M2 = psi_cond_cand.shape
-    del nv, nc  # for pyflakes
-    if k_weights is None:
-        k_weights = jnp.ones((nk,), dtype=phi_val_cand.real.dtype)
-
-    def body_fun(k, G):
-        phi_k = phi_val_cand[k]   # (nv, M)
-        psi_k = psi_cond_cand[k]  # (nc, M)
-
-        # Valence projector: P_v[a,b] = Σ_v φ_{v}(a) φ*_{v}(b)
-        # In matrix form: P_v = φ.T @ conj(φ)  with φ: (nv, M) → (M, M)
-        P_v = phi_k.T @ jnp.conj(phi_k)
-
-        # Conduction projector: P̃_c[a,b] = Σ_c ψ*_{c}(a) ψ_{c}(b)
-        #                   = conj(ψ).T @ ψ                    (M, M)
-        P_c_tilde = jnp.conj(psi_k).T @ psi_k
-
-        return G + k_weights[k] * (P_v * P_c_tilde)
-
-    G = jnp.zeros((M, M2), dtype=phi_val_cand.dtype)
-    G = lax.fori_loop(0, nk, body_fun, G)
-
-    if enforce_hermitian:
-        G = 0.5 * (G + jnp.conj(G.T))
-    return G
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Step 3 — jitted exact greedy pivoted Cholesky
-# ═══════════════════════════════════════════════════════════════════════
+#
+# The production path is ``make_sharded_pivoted_cholesky_select`` below;
+# this is the same greedy recurrence written without any collective, and
+# it is what ``tests/test_centroid_distribution.py`` gates the sharded
+# kernel against.  Keep the two in step.
 
 
 @partial(jax.jit, static_argnames=('k_keep',))
@@ -355,19 +231,15 @@ def prune_candidates_by_pivoted_cholesky(
                 f"grid directly instead."
             )
 
-    if not ('x' in mesh.axis_names and 'y' in mesh.axis_names):
-        raise ValueError(
-            f"prune_candidates_by_pivoted_cholesky requires a 2-D mesh "
-            f"with axes ('x', 'y'); got {mesh.axis_names}. Build the mesh "
-            f"the same way gw_jax does (single-device → 1×1)."
-        )
+    select_axis = dist.require_axes(mesh, dist.MESH_AXES,
+                                    "prune_candidates_by_pivoted_cholesky")
 
     # The sharded select kernel requires M to be divisible by the product
     # of the mesh axis sizes (each shard owns M/n_dev rows). Orbit-unfold
     # counts can land on awkward M (special-position orbits don't all have
     # size n_sym), so check up-front and give a hint instead of letting
     # ``make_sharded_pivoted_cholesky_select`` fail with a cryptic message.
-    n_dev = int(mesh.shape['x']) * int(mesh.shape['y'])
+    n_dev = dist.n_shards(mesh, select_axis)
     if M % n_dev != 0:
         raise ValueError(
             f"M={M} (number of candidates) must be divisible by the "
@@ -397,10 +269,9 @@ def prune_candidates_by_pivoted_cholesky(
         )
         # Reshard ('x','y') → row-sharded for the column-major pivot scan.
         G = jax.lax.with_sharding_constraint(
-            G, NamedSharding(mesh, PartitionSpec(('x', 'y'), None)),
+            G, NamedSharding(mesh, PartitionSpec(select_axis, None)),
         )
         G.block_until_ready()
-    select_axis = ('x', 'y')
 
     if verbose:
         diag = jnp.real(jnp.diag(G))
@@ -459,136 +330,12 @@ def prune_candidates_by_pivoted_cholesky(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Multi-device — WIP: sharded Gram build
-# ═══════════════════════════════════════════════════════════════════════
-#
-# For large candidate pools (M ≳ 10⁴) the (M, M) complex Gram matrix no
-# longer fits on a single A100 (M = 16384 ⇒ 2.1 GiB in complex64). The
-# natural first step toward distributed pruning is to row-shard G on a
-# 1-D mesh 'x' so each device stores a (M / n_dev, M) slab. The per-k
-# matmul structure makes this trivial: each row-slab is produced by a
-# local matmul between the full (nk, nv, M) wavefunction replica and the
-# M_slab slice of column vectors — no cross-device communication during
-# the build.
-#
-# The sharded pivoted-Cholesky SELECT path is not in this commit — it
-# needs a small `psum`/`pmax` pattern per iteration (broadcast the pivot
-# row L[p, :] from its owning shard, and a global max-index reduction
-# over the residual diagonal). Coming in a follow-up. For now, callers
-# who want the sharded Gram can row-gather it back via
-# ``jax.device_put`` before calling the single-device
-# ``pivoted_cholesky_select`` — only useful when the Gram fits on one
-# device but the build fits better distributed.
-
-
-def make_sharded_gram_q0(
-    mesh: Mesh,
-    M: int,
-    *,
-    enforce_hermitian: bool = True,
-):
-    """Build a jitted Gram-assembly closure over ``mesh`` ('x',).
-
-    The returned function signature matches ``build_candidate_gram_q0``:
-    it takes replicated (nk, nv, M) and (nk, nc, M) wavefunction tensors
-    and a replicated (nk,) weight vector, and returns a row-sharded
-    (M, M) complex Gram matrix with ``NamedSharding(mesh, P('x', None))``.
-
-    The row shard is the natural output of ``φ_local.T @ conj(φ)`` when
-    the left factor is sliced to M_slab columns: each device computes
-    its own (M_slab, M) slab of both projectors, element-wise-multiplies,
-    and accumulates over k.
-
-    Args:
-        mesh: 1-axis device mesh named 'x'. ``M`` must be divisible by
-            ``mesh.shape['x']``.
-        M: candidate count. Static.
-        enforce_hermitian: if True, do a ``(G + G^H)/2`` symmetrization at
-            the end. This is an *all-pairs* operation over the sharded
-            axis — it requires an all-gather of G across the mesh and
-            therefore breaks the sharding; the caller can defer this
-            step until after the select if they want to avoid the gather.
-
-    Returns:
-        A callable ``(phi, psi, kw) -> G_row_sharded``.
-    """
-    if 'x' not in mesh.axis_names:
-        raise ValueError(f"mesh must have an 'x' axis, got {mesh.axis_names}")
-    n_dev = mesh.shape['x']
-    if M % n_dev != 0:
-        raise ValueError(f"M={M} must be divisible by mesh 'x' size {n_dev}")
-    M_slab = M // n_dev
-
-    rep = PartitionSpec()
-    row_shard = PartitionSpec('x', None)
-
-    in_specs = (rep, rep, rep)           # phi, psi, kw — all replicated
-    out_specs = row_shard                # G row-sharded
-
-    @partial(jax.jit, static_argnames=())
-    def step(phi, psi, kw):
-        def body_local(phi_full, psi_full, kw_full):
-            # Pick out this shard's columns of the left factors. The
-            # right factor stays the full M so the output has shape
-            # (M_slab, M).
-            my_idx = lax.axis_index('x')   # legacy 1-D 'x'-only path
-            a_start = my_idx * M_slab
-            phi_a_block = lax.dynamic_slice_in_dim(
-                phi_full, a_start, M_slab, axis=2
-            )   # (nk, nv, M_slab)
-            psi_a_block = lax.dynamic_slice_in_dim(
-                psi_full, a_start, M_slab, axis=2
-            )   # (nk, nc, M_slab)
-
-            nk = phi_full.shape[0]
-
-            def k_body(k, G_slab):
-                phi_k = phi_full[k]        # (nv, M)
-                psi_k = psi_full[k]        # (nc, M)
-                phi_k_block = phi_a_block[k]   # (nv, M_slab)
-                psi_k_block = psi_a_block[k]   # (nc, M_slab)
-
-                # P_v_slab[a, b] = Σ_v φ(a) φ*(b), a in local slab, b full.
-                P_v_slab = phi_k_block.T @ jnp.conj(phi_k)           # (M_slab, M)
-                # P̃_c_slab[a, b] = Σ_c ψ*(a) ψ(b)
-                P_c_slab = jnp.conj(psi_k_block).T @ psi_k           # (M_slab, M)
-                return G_slab + kw_full[k] * (P_v_slab * P_c_slab)
-
-            G_slab = jnp.zeros((M_slab, M), dtype=phi_full.dtype)
-            G_slab = lax.fori_loop(0, nk, k_body, G_slab)
-            return G_slab
-
-        G_sharded = shard_map(
-            body_local, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
-            check_rep=False,
-        )(phi, psi, kw)
-
-        if enforce_hermitian:
-            # Hermitian symmetrization requires full G on one device. For
-            # now we pay the all-gather — acceptable while G still fits
-            # post-gather on one device. For truly out-of-core G this
-            # step should be deferred to the caller (and the select step
-            # can tolerate small non-Hermiticity via its own clamp).
-            G_full = jax.lax.with_sharding_constraint(
-                G_sharded, NamedSharding(mesh, PartitionSpec()),
-            )
-            G_full = 0.5 * (G_full + jnp.conj(G_full.T))
-            # Re-shard back so the caller sees the same layout.
-            G_sharded = jax.lax.with_sharding_constraint(
-                G_full, NamedSharding(mesh, row_shard),
-            )
-        return G_sharded
-
-    return step
-
-
-# ═══════════════════════════════════════════════════════════════════════
 # Multi-device — sharded pivoted-Cholesky select
 # ═══════════════════════════════════════════════════════════════════════
-# Companion to ``make_sharded_gram_q0``. Consumes a row-sharded
-# G ∈ ℂ^(M×M) on a 1-D mesh 'x' (sharded on axis 0) and runs the same
-# greedy pivoted-Cholesky select as the single-device version. Sharded
-# along M: each device owns (M_slab, M) of G and (M_slab, k_keep) of L.
+# Consumes the row-sharded G ∈ ℂ^(M×M) that ``build_gram_q0_via_loadwfns``
+# produces and runs the same greedy select as ``pivoted_cholesky_select``.
+# Sharded along M: each device owns (M_slab, M) of G and (M_slab, k_keep)
+# of L.
 #
 # Collectives per iteration (one per Lloyd-like step):
 #
@@ -619,16 +366,8 @@ def make_sharded_pivoted_cholesky_select(
     ``pivoted_cholesky_select``: ``(piv, L, rank, d_final, d_taken,
     trR_over_trG)`` with shardings (replicated, row-sharded, replicated,
     row-sharded-1d, replicated, replicated)."""
-    axis_names = (mesh_axis,) if isinstance(mesh_axis, str) else tuple(mesh_axis)
-    for ax in axis_names:
-        if ax not in mesh.axis_names:
-            raise ValueError(
-                f"mesh_axis {mesh_axis!r} references '{ax}' not in "
-                f"mesh axes {mesh.axis_names}"
-            )
-    n_dev = 1
-    for a in axis_names:
-        n_dev *= mesh.shape[a]
+    dist.require_axes(mesh, mesh_axis, "make_sharded_pivoted_cholesky_select")
+    n_dev = dist.n_shards(mesh, mesh_axis)
     if M % n_dev != 0:
         raise ValueError(f"M={M} must be divisible by product of mesh axes "
                          f"{mesh_axis} (= {n_dev})")
@@ -985,9 +724,27 @@ def build_gram_q0_via_loadwfns(
     n_dev_total = mesh_xy.devices.size
     col_block = 0
     if n_dev_total == 1:
+        # LORRAX_GRAM_COL_BLOCK: explicit column-block width; a falsy token
+        # means "no override", i.e. the auto budget below.  This USED to be a bare
+        # presence test — ``=0`` and ``=off`` are the two spellings a user
+        # reaches for to DISABLE a knob, and they did the opposite or
+        # crashed: "0" is a non-empty string, so it took the override
+        # branch and ``max(256, 0)`` turned "off" into the SMALLEST legal
+        # block (maximum blocking), while "off" died in ``int()`` mid-run
+        # after the left window had already been loaded.  Same falsy
+        # vocabulary as ``runtime._env_falsy`` and every other LORRAX knob.
         env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
+        if env_cb.lower() in ("", "0", "false", "no", "off"):
+            env_cb = ""
         if env_cb:
-            col_block = max(256, int(env_cb))
+            try:
+                col_block = max(256, int(env_cb))
+            except ValueError:
+                raise ValueError(
+                    f"LORRAX_GRAM_COL_BLOCK={env_cb!r} is neither a positive "
+                    f"integer column width nor a falsy token "
+                    f"('', 0, false, no, off)."
+                ) from None
         else:
             nk_, _, ns_, M_ = psi_l_rmu_Y.shape
             bytes_per_col = 2 * nk_ * ns_ * ns_ * M_ * 16

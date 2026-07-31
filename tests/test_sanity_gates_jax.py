@@ -804,8 +804,11 @@ def test_collective_helpers_are_the_identity_at_P1():
     """P=1 must not go anywhere near a collective — that is what makes
     the single-node CLI bit-identical to its pre-distribution self."""
     import jax as _jax
-    from gw.kin_ion_io import (_psum_replicate, _gather_indexed_blocks,
-                               replicate_to_mesh, resolve_mesh)
+    # From the SERVICE, not from the kin_ion driver: these are generic
+    # k-partition plumbing and the driver only ever re-exported them.
+    from common.collectives import (psum_replicate as _psum_replicate,
+                                    gather_indexed_blocks as _gather_indexed_blocks,
+                                    replicate_to_mesh, resolve_mesh)
     if int(_jax.process_count()) != 1:
         return
     rng = np.random.default_rng(1)
@@ -824,7 +827,7 @@ def test_collective_helpers_are_the_identity_at_P1():
 
 
 def test_hartree_mesh_resolution_is_square_and_covers_every_device():
-    from gw.kin_ion_io import resolve_mesh
+    from common.collectives import resolve_mesh
     m = resolve_mesh()
     assert tuple(m.axis_names) == ('x', 'y')
     assert int(m.devices.size) == int(jax.device_count())

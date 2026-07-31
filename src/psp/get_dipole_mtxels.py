@@ -21,27 +21,27 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from jax.experimental import multihost_utils as _mhu
 
 from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
 
-# Must run before any device is touched: without it every rank of a multi-process
-# launch is its own single-process job, so ``jax.devices()`` below sees only the
-# local device, the k-axis sharding constraint materialises a *full* copy of the
-# G-space wavefunctions on every rank, and each rank OOMs on the same allocation
-# (144 k x 120 bands x 2 spinor x 36x36x135 ~ 97 GB for MoS2 12x12).  No-op when
-# there is a single process, so single-node/Perlmutter behaviour is unchanged.
+# Must run before any device is touched.  Without it every rank of a
+# multi-process launch is its own single-process job: ``jax.process_count()``
+# reads 1 everywhere, so ``collectives.local_share`` hands EVERY rank the whole
+# k list and the closing ``gather_indexed_blocks`` never runs — P ranks each do
+# the whole sweep and write the same file.  No-op when there is a single
+# process, so single-node/Perlmutter behaviour is unchanged.
 init_jax_distributed()
 fallback_to_cpu_if_no_gpu_backend()
 
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps
-from common.wfn_transforms import read_Gvecs_to_devices
+from common.collectives import barrier, gather_k_blocks, prepare_mesh
+from common.wfn_transforms import load_kpoint_fftbox_local
 from common import Meta
 from gw.gw_config import read_lorrax_input as read_cohsex_input
 from psp.pseudos import load_pseudopotentials, print_atomic_structure
-from psp.dft_operators import generate_gvectors_k, gather_psi_G_from_crys, momentum_matrix_k
+from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
+                               momentum_matrix_k)
 import psp.vnl_ops as vnl_ops
 import h5py
 # --------------------------
@@ -49,13 +49,19 @@ import h5py
 # --------------------------
 
 
-def compute_p_operator_k(wfn_k: jax.Array, Gk_crys: np.ndarray, kpoint_crys: np.ndarray, bdot: np.ndarray, bvec: np.ndarray, blat: float) -> jax.Array:
+def compute_p_operator_k(wfn_k: jax.Array, Gk_crys: np.ndarray, kpoint_crys: np.ndarray, bdot: np.ndarray, bvec: np.ndarray, blat: float, *, g_mask=None) -> jax.Array:
 	"""Compute p-operator matrix elements per Cartesian component.
 
 	Returns array of shape (3, nb, nb) for components x,y,z.
 	p_i = sum_G (k+G)_cart[i] c*_mk(G) c_nk(G)
+
+	``g_mask`` is 1 on the k's physical G and 0 on the ngkmax pad.  It
+	is applied to ψ_G, which is enough: the sum above closes against
+	conj(ψ) so a zeroed column contributes nothing.  Omitting it on a
+	padded G-list does NOT crash — pad rows hold (0,0,0), which aliases
+	Γ — it silently adds (ngkmax − ngk) extra copies of the Γ term.
 	"""
-	C_bsg = gather_psi_G_from_crys(wfn_k, Gk_crys)
+	C_bsg = gather_psi_G_from_crys(wfn_k, Gk_crys, g_mask)
 	k_crys = jnp.asarray(kpoint_crys, dtype=jnp.float64)
 	G_int = jnp.asarray(Gk_crys, dtype=jnp.int32)
 	B = jnp.asarray(bvec, dtype=jnp.float64) * float(blat)
@@ -67,6 +73,8 @@ def compute_vnl_matrix_from_setup(
 	Gk_crys: np.ndarray,
 	kpoint_crys: np.ndarray,
 	vnl_setup,
+	*,
+	g_mask=None,
 ) -> jax.Array:
 	"""Return <m|V_NL(k)|n> using the unified JAX VNL setup."""
 	kdata = vnl_ops.build_vnl_kdata_from_kvec(
@@ -75,7 +83,10 @@ def compute_vnl_matrix_from_setup(
 		vnl_setup,
 		compute_dZ=False,
 	)
-	psi_G = gather_psi_G_from_crys(wfn_k, Gk_crys)
+	# Z is finite on the pad columns (it is evaluated at K = kvec there),
+	# so the mask has to reach ψ — every contraction in ``vnl_matrix``
+	# runs through ψ_G at least once.
+	psi_G = gather_psi_G_from_crys(wfn_k, Gk_crys, g_mask)
 	# Slice to physical spinor components for bispinor wavefunctions
 	nspinor_E = kdata.E_super.shape[0]
 	if psi_G.shape[1] > nspinor_E:
@@ -88,6 +99,8 @@ def compute_vnl_velocity_cart(
 	Gk_crys: np.ndarray,
 	kpoint_crys: np.ndarray,
 	vnl_setup,
+	*,
+	g_mask=None,
 ) -> jax.Array:
 	"""Return dV_NL/dK_cart using the unified JAX VNL path."""
 	kdata = vnl_ops.build_vnl_kdata_from_kvec(
@@ -96,7 +109,7 @@ def compute_vnl_velocity_cart(
 		vnl_setup,
 		compute_dZ=True,
 	)
-	psi_G = gather_psi_G_from_crys(wfn_k, Gk_crys)
+	psi_G = gather_psi_G_from_crys(wfn_k, Gk_crys, g_mask)
 	# Slice to physical spinor components for bispinor wavefunctions
 	nspinor_E = kdata.E_super.shape[0]
 	if psi_G.shape[1] > nspinor_E:
@@ -117,7 +130,8 @@ def compute_block_direct_cnk(*args, **kwargs):
 # --------------------------
 
 def _build_g_lookup(Gk_int_kmq: np.ndarray, Gk_int_k: np.ndarray,
-                     G_wrap: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+                     G_wrap: np.ndarray, *,
+                     ngk_kmq: int, ngk_k: int) -> tuple[np.ndarray, np.ndarray]:
     """Per-(k, q) integer lookup that translates between the G-spheres of
     ``k`` and ``canonical(k − q)`` under umklapp.
 
@@ -127,17 +141,35 @@ def _build_g_lookup(Gk_int_kmq: np.ndarray, Gk_int_k: np.ndarray,
     coefficient there is zero anyway, so the contribution to the
     overlap is zero).
 
+    Both G-lists are the loader's fixed ``(ngkmax, 3)`` tables, so the
+    PHYSICAL extents ``ngk_kmq`` / ``ngk_k`` are passed explicitly and the
+    pad rows take no part:
+
+    * the bra-side dictionary is built over the first ``ngk_kmq`` rows —
+      the pad rows are all ``(0,0,0)``, so including them would rebind
+      the Γ key to the LAST pad index and every ket G that maps to Γ
+      would then read a zero coefficient;
+    * the ket-side loop runs over the first ``ngk_k`` rows and the rest
+      of the mask is False — a pad row would otherwise look up
+      ``(0,0,0) + G_wrap``, which is frequently a real member of the bra
+      sphere, and contribute a spurious ψ(Γ) term.
+
+    The Python dictionary work is therefore unchanged from the ragged
+    route; only the returned arrays are widened to ``ngkmax``.
+
     Returns
     -------
-    map_arr : (nG_k,) int32  — μ_kmq index per μ_k (0 placeholder where
-              not found; use ``mask`` to gate).
-    mask    : (nG_k,) bool   — True where the lookup succeeded.
+    map_arr : (ngkmax,) int32  — μ_kmq index per μ_k (0 placeholder where
+              not found or padded; use ``mask`` to gate).
+    mask    : (ngkmax,) bool   — True where the lookup succeeded.
     """
-    target = Gk_int_k + G_wrap[None, :]                                 # (nG_k, 3)
-    g_dict = {tuple(int(x) for x in g): i for i, g in enumerate(Gk_int_kmq)}
-    nG_k = target.shape[0]
-    map_arr = np.empty(nG_k, dtype=np.int32)
-    mask = np.empty(nG_k, dtype=bool)
+    ngkmax = int(Gk_int_k.shape[0])
+    ngk_k = int(ngk_k)
+    target = Gk_int_k[:ngk_k] + G_wrap[None, :]                         # (ngk_k, 3)
+    g_dict = {tuple(int(x) for x in g): i
+              for i, g in enumerate(Gk_int_kmq[:int(ngk_kmq)])}
+    map_arr = np.zeros(ngkmax, dtype=np.int32)
+    mask = np.zeros(ngkmax, dtype=bool)
     for i, t in enumerate(target):
         idx = g_dict.get((int(t[0]), int(t[1]), int(t[2])), -1)
         mask[i] = idx >= 0
@@ -285,8 +317,10 @@ def _cell_overlaps_at_q_Gbox(
 
 
 def compute_finite_q_mtxels(
-    wfn, sym, meta, vnl_setup, wfn_k_sharded, Gk_crys_all,
+    wfn, sym, meta, vnl_setup, gtab,
     *,
+    nb: int,
+    bispinor: bool,
     iq_list: list[int],
     nv_block: int,
     nc_block: int,
@@ -302,8 +336,12 @@ def compute_finite_q_mtxels(
       kminq_idx[nk, nq] int32 — canonical k-q lookup.
 
     Plumbing:
-      • G-sphere throughout (no FFT box).  Wfns are taken from
-        ``wfn_k_sharded`` (already loaded in the q=0 dipole pass).
+      • G-sphere throughout.  Each k's FFT box is loaded, gathered to
+        that k's G-sphere and DROPPED before the next k
+        (:func:`common.wfn_transforms.load_kpoint_fftbox_local`), so the
+        box residency is one k's worth, not ``n_k``'s.  What survives the
+        loop is the four G-sphere lists below, which are ~4 % of the box
+        per k (``ngkmax`` vs ``nx·ny·nz``: 1964 vs 46080 on MoS₂ 4×4).
       • Kinetic apply via ``apply_kinetic_velocity_to_ket``.
       • VNL apply via ``vnl_ops.apply_vnl_velocity_to_ket`` with k-side
         Z(k) projectors for v_R and bra-side Z(k_can_kmq) projectors
@@ -329,7 +367,7 @@ def compute_finite_q_mtxels(
     n_occ = int(wfn.nelec)
     v_lo = max(0, n_occ - int(nv_block))
     c_lo = n_occ
-    c_hi = min(n_occ + int(nc_block), int(wfn_k_sharded.shape[1]))
+    c_hi = min(n_occ + int(nc_block), int(nb))
     nv_eff = n_occ - v_lo
     nc_eff = c_hi - c_lo
 
@@ -344,21 +382,36 @@ def compute_finite_q_mtxels(
         print(f"  finite-q: applying v_kin + V_NL  to {nv_eff} valence + "
               f"{nc_eff} conduction × {nk_full} k-points (G-sphere)")
 
-    # Per-k (kdata, vket_v, vket_c) — different shapes per k (G-sphere
-    # length varies) so we keep a Python list rather than vmap'ing.
-    vket_v_per_k = []     # (3, nv, ns, nG_k)  each
-    vket_c_per_k = []     # (3, nc, ns, nG_k)  each
-    psi_v_per_k  = []     # (nv, ns, nG_k)
-    psi_c_per_k  = []     # (nc, ns, nG_k)
+    # Per-k (kdata, vket_v, vket_c).  Every k now presents the SAME
+    # (ngkmax) G-axis, so these lists hold uniformly-shaped arrays and
+    # each kernel below lowers once for the whole sweep.
+    #
+    # THESE FOUR LISTS ARE THE REMAINING n_k-SCALING RESIDENCY of the
+    # finite-q path, and they are NOT removable by streaming: the (k, q)
+    # loop below pairs ket k with bra canonical(k−q), so an arbitrary
+    # pair of k must be live at once.  Cost is
+    # ``n_k · 4 · (nv+nc) · ns · ngkmax · 16`` B — 514 MB on MoS₂ 4×4 at
+    # nval=26/ncond=102, against the 3.0 GB of FFT box the old route held
+    # for the same sweep.  Sharding them needs a k-partition of the (k, q)
+    # loop plus one gather of the G-sphere blocks; it is not done here.
+    vket_v_per_k = []     # (3, nv, ns, ngkmax)  each
+    vket_c_per_k = []     # (3, nc, ns, ngkmax)  each
+    psi_v_per_k  = []     # (nv, ns, ngkmax)
+    psi_c_per_k  = []     # (nc, ns, ngkmax)
     for ik in range(nk_full):
         kvec = jnp.asarray(kpts_full[ik], dtype=jnp.float64)
-        Gk_int = Gk_crys_all[ik]                                       # (nG_k, 3) int
-        # Slice psi → G-sphere shape (nb, ns, nG_k).  ``wfn_k_sharded`` is
-        # (nk, nb, ns, nG_k); the gather already happened upstream via
-        # ``read_Gvecs_to_devices``.
-        psi_k = wfn_k_sharded[ik]                                      # (nb, ns, nG_k)
+        G_pad, g_mask = gtab.at(ik)
+        Gk_int = jnp.asarray(G_pad, dtype=jnp.int32)                   # (ngkmax, 3)
+        # ONE k's FFT box, process-local: (nb, ns, nx, ny, nz).  The
+        # previous route indexed a resident (nk, nb, ns, nx, ny, nz)
+        # array, i.e. it held EVERY k's box for the whole call.
+        psi_k = load_kpoint_fftbox_local(wfn, meta, ik, int(nb),
+                                         bispinor=bool(bispinor))
         # Gather FFT-box layout → G-sphere coeffs at this k's integer G-list.
-        psi_k_G = gather_psi_G_from_crys(psi_k, Gk_int)               # (nb, ns, nG_k)
+        # The mask zeroes the pad columns, which is what makes the finite,
+        # K=kvec values of Z/dZ on those columns inert downstream.
+        psi_k_G = gather_psi_G_from_crys(psi_k, Gk_int, g_mask)        # (nb, ns, ngkmax)
+        del psi_k                       # the box dies here, not at loop end
         psi_v = psi_k_G[v_lo:n_occ]
         psi_c = psi_k_G[c_lo:c_hi]
         psi_v_per_k.append(psi_v)
@@ -411,9 +464,11 @@ def compute_finite_q_mtxels(
             kvec_kmq_np = kpts_full[ikmq]
             G_wrap_np = np.round((kvec_k_np - qvec) - kvec_kmq_np).astype(np.int32)
 
-            Gk_int_k   = np.asarray(Gk_crys_all[ik],   dtype=np.int32)
-            Gk_int_can = np.asarray(Gk_crys_all[ikmq], dtype=np.int32)
-            map_arr, mask = _build_g_lookup(Gk_int_can, Gk_int_k, G_wrap_np)
+            Gk_int_k   = np.asarray(gtab.gvecs[ik],   dtype=np.int32)
+            Gk_int_can = np.asarray(gtab.gvecs[ikmq], dtype=np.int32)
+            map_arr, mask = _build_g_lookup(
+                Gk_int_can, Gk_int_k, G_wrap_np,
+                ngk_kmq=int(gtab.ngk[ikmq]), ngk_k=int(gtab.ngk[ik]))
             map_arr_j = jnp.asarray(map_arr, dtype=jnp.int32)
             mask_j    = jnp.asarray(mask)
 
@@ -431,6 +486,122 @@ def compute_finite_q_mtxels(
                   f"|rho|_∞={max_rho:.3e}  |v|_∞={max_v:.3e}")
 
     return rho_cvkq, v_cvkq, kminq_idx_kq, n_occ, v_lo, c_hi
+
+# --------------------------
+# Provenance: which WFN and which band window produced this dipole.h5
+# --------------------------
+#
+# ``dipole.h5`` is generated ONCE, out of band, and then read by every
+# later GW run in the directory.  Its contents depend on (a) the WFN's
+# eigenstates and (b) the deck's band window — and nothing on disk
+# recorded either, so regenerating WFN.h5 (new nbnd, new NSCF, new
+# k-grid) and leaving the old dipole.h5 in place produces a file of the
+# right SHAPE with the wrong CONTENTS.  ``gw.head_correction`` already
+# checks the band COUNT and ``nk``; neither catches that case.
+#
+# The fingerprint is over the eigenvalue table and the k-list, i.e. the
+# two things that change whenever the underlying DFT solution changes,
+# and it is cheap because ``WfnLoader`` has both in memory already.
+
+_PROV_ATTRS = ("prov_wfn_sha256", "prov_nval", "prov_ncond", "prov_nband",
+               "prov_nb_written", "prov_bispinor", "prov_skip_vnl",
+               "prov_vnl_mode", "prov_wfn_file")
+
+
+def wfn_fingerprint(wfn) -> str:
+    """SHA-256 over the DFT solution ``dipole.h5`` is a function of.
+
+    Covers the eigenvalues, the k-list and the electron/spinor counts.
+    Deliberately NOT the coefficients: they are hundreds of GB, and any
+    change to them that matters also moves an eigenvalue.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    for arr in (np.ascontiguousarray(np.asarray(wfn.energies, dtype=np.float64)),
+                np.ascontiguousarray(np.asarray(wfn.kpoints, dtype=np.float64))):
+        h.update(str(arr.shape).encode())
+        h.update(arr.tobytes())
+    h.update(str((int(wfn.nelec), int(wfn.nspinor), int(wfn.nbands))).encode())
+    return h.hexdigest()
+
+
+def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
+                             nb_written, bispinor, skip_vnl, vnl_mode) -> None:
+    """Record what this ``dipole.h5`` was built from."""
+    h5.attrs["prov_wfn_sha256"] = wfn_fingerprint(wfn)
+    h5.attrs["prov_wfn_file"] = str(wfn_path)
+    h5.attrs["prov_nval"] = int(nval)
+    h5.attrs["prov_ncond"] = int(ncond)
+    h5.attrs["prov_nband"] = int(nband)
+    h5.attrs["prov_nb_written"] = int(nb_written)
+    h5.attrs["prov_bispinor"] = bool(bispinor)
+    h5.attrs["prov_skip_vnl"] = bool(skip_vnl)
+    h5.attrs["prov_vnl_mode"] = str(vnl_mode)
+
+
+def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
+                             print_fn=print) -> bool:
+    """Does ``path`` match the WFN and band window of the CURRENT run?
+
+    Returns True only when a stamp exists AND agrees.  Disagreement goes
+    through ``common.sanity.warn`` (the same channel
+    ``gw.head_correction`` uses for its coverage check) so a strict run
+    turns it into a refusal and a permissive one still prints loudly.
+    A MISSING stamp is reported as such and returns False — an
+    unstamped file predates this guard and cannot be vouched for.
+    """
+    from common import sanity
+
+    try:
+        with h5py.File(str(path), "r") as h5:
+            attrs = {k: h5.attrs[k] for k in _PROV_ATTRS if k in h5.attrs}
+    except OSError as exc:
+        print_fn(f"  [dipole provenance] cannot open {path} "
+                 f"({type(exc).__name__}: {exc})")
+        return False
+
+    if "prov_wfn_sha256" not in attrs:
+        print_fn(f"  [dipole provenance] {path} carries no provenance stamp "
+                 f"(written before the guard existed).  Regenerate with "
+                 f"`python -m psp.get_dipole_mtxels` to make it checkable.")
+        return False
+
+    want = {"prov_wfn_sha256": wfn_fingerprint(wfn),
+            "prov_nval": int(nval), "prov_ncond": int(ncond),
+            "prov_nband": int(nband)}
+    bad = [(k, attrs[k], v) for k, v in want.items()
+           if k in attrs and _prov_ne(attrs[k], v)]
+    if bad:
+        detail = "; ".join(f"{k}: file={_prov_show(got)} run={_prov_show(exp)}"
+                           for k, got, exp in bad)
+        sanity.warn(
+            f"{path} was generated from a DIFFERENT DFT solution or band "
+            f"window than this run ({detail}).  dipole.h5 has the right "
+            f"shape either way, so nothing downstream will notice: the q→0 "
+            f"head S(ω), and every Σ_SX/Σ_COH correction built from it, "
+            f"would be assembled from stale velocity matrix elements.  "
+            f"Regenerate it with `python -m psp.get_dipole_mtxels -i <deck>`.",
+            print_fn=print_fn)
+        return False
+
+    print_fn(f"  dipole.h5 provenance OK (WFN {want['prov_wfn_sha256'][:12]}…, "
+             f"window nval={int(nval)} ncond={int(ncond)} nband={int(nband)})")
+    return True
+
+
+def _prov_ne(got, expected) -> bool:
+    if isinstance(expected, str):
+        got = got.decode() if isinstance(got, bytes) else str(got)
+        return got != expected
+    return int(np.asarray(got)) != int(expected)
+
+
+def _prov_show(v) -> str:
+    if isinstance(v, bytes):
+        v = v.decode()
+    return (v[:12] + "…") if isinstance(v, str) and len(v) > 13 else str(v)
+
 
 # --------------------------
 # Main driver
@@ -542,16 +713,14 @@ def main(argv=None):
 	print("\nCreating system metadata...")
 	meta = Meta.from_system(wfn, sym, nval, ncond, nband, 0, bispinor)
 
-	# JAX mesh (simple 1D default; minimal sharding for demo)
-	devices = np.array(jax.devices()).reshape(1, -1)
-	mesh_xy = Mesh(devices, ['x', 'y'])
+	# Warm every communicator the closing gather will use, once, from the
+	# main thread (mandatory under impl=mpi).  The mesh itself is not needed
+	# below: nothing in this driver holds a globally-sharded array any more.
+	prepare_mesh()
 
-	print("\nLoading wavefunction coefficients to devices...")
-	# Ensure we load enough conduction bands for debug/output comparisons
+	# Ensure we load enough conduction bands for debug/output comparisons.
+	# ψ is NOT loaded here — see the k sweep below.
 	nband_eff = min(int(wfn.nbands), max(int(wfn.nelec) + int(ncond), int(nband)))
-	brange = (0, nband_eff)
-	global_psi_G, nb_actual = read_Gvecs_to_devices(wfn, sym, brange, meta, bispinor, mesh_xy)
-	print(f"  Loaded {nb_actual} bands in G-space, shape: {global_psi_G.shape}")
 
 	print("\nScanning for pseudopotential files...")
 	pseudos = load_pseudopotentials(str(input_path.parent))
@@ -567,11 +736,10 @@ def main(argv=None):
 	# Structure summary (reuse DFT helper)
 	print_atomic_structure(wfn, pseudos)
 
-	# Precompute G scaffolding for all k-points
-	Gk_crys_all: list[jnp.ndarray] = []
-	for i in range(sym.nk_tot):
-		Gk_crys_i, _ = generate_gvectors_k(i, sym, wfn, meta)
-		Gk_crys_all.append(jnp.asarray(Gk_crys_i, dtype=jnp.int32))
+	# G scaffolding: the loader's own fixed-shape (nk, ngkmax, 3) table
+	# plus its pad mask (owner decision D10).  Every per-k kernel below
+	# therefore sees ONE operand shape for the whole sweep.
+	gtab = padded_gvectors(wfn, k="full_bz")
 
 	# Build unified VNL setup once; radial tables and custom JAX JVPs stay centralized here.
 	vnl_setup = vnl_ops.build_vnl_setup(
@@ -582,19 +750,95 @@ def main(argv=None):
 		nspinor=int(wfn.nspinor),
 	)
 
-	# Reshard wavefunctions over mesh
-	k_xy_shard = NamedSharding(mesh_xy, P(('x','y'), None, None, None, None, None))
-	wfn_k_sharded = jax.lax.with_sharding_constraint(global_psi_G, k_xy_shard)
+	nk = int(sym.nk_tot)
+	nb = int(nband_eff)
 
-	nk = sym.nk_tot
-	nb = int(wfn_k_sharded.shape[1])
-	dipole = np.zeros((3, nk, nb, nb), dtype=np.complex128)
+	# ── ΔE: pure host arithmetic on the band energy table ───────────────
+	# No ψ, no device, nk·nb²·8 B (2 MB at MoS₂ 4×4 / 128 bands), so it is
+	# built for every k on every rank instead of riding the k partition and
+	# paying a second gather.  Arithmetic is verbatim what the fused loop
+	# did, which is why the pinned ``deltaE`` parity is EXACTLY 0.
+	energies = np.asarray(wfn.energies)
 	deltaE = np.zeros((nk, nb, nb), dtype=np.float64)
-
 	for i in range(nk):
-		wfn_k = wfn_k_sharded[i]
+		try:
+			k_red = int(sym.irr_idx_k[i])
+		except Exception:
+			k_red = int(i)
+		if energies.ndim >= 3:
+			e_b = np.asarray(energies[0, k_red, :nb], dtype=float)
+		else:
+			e_b = np.asarray(energies[:nb], dtype=float)
+		deltaE[i] = e_b[:, None] - e_b[None, :]
+
+	def _print_debug_blocks(i, p_cart, vNL_cart):
+		"""The --debug 4x6 tables for one k.  Forces a readback; debug only."""
+		# Choose up to 6 valence (highest) and up to 4 conduction (lowest) bands
+		nelec = int(wfn.nelec)
+		v_count = min(6, max(0, nelec))
+		c_count = min(4, max(0, nb - nelec))
+		if v_count == 0 or c_count == 0:
+			print("[DEBUG] Skipping 4x6 debug blocks: insufficient v/c bands (v_count=", v_count, ", c_count=", c_count, ")")
+			return
+		v_idx = np.arange(nelec - 1, nelec - v_count - 1, -1, dtype=int)  # descending
+		c_idx = np.arange(nelec, nelec + c_count, dtype=int)              # ascending
+		p_x = np.asarray(p_cart[0])
+		full_x = np.asarray(p_cart[0] + vNL_cart[0])
+		if args.divide_energy:
+			with np.errstate(divide='ignore', invalid='ignore'):
+				dE = deltaE[i]
+				p_x = np.where(np.abs(dE) < 1e-12, 0.0, p_x / dE)
+				full_x = np.where(np.abs(dE) < 1e-12, 0.0, full_x / dE)
+		mom_block = p_x[np.ix_(c_idx, v_idx)]
+		full_block = full_x[np.ix_(c_idx, v_idx)]
+		print("\n[DEBUG] 4x6 x-direction momentum block (real):")
+		for r in range(mom_block.shape[0]):
+			print(' '.join(f"{np.real(mom_block[r, c]):.5f}" for c in range(mom_block.shape[1])))
+		print("[DEBUG] 4x6 x-direction momentum block (imag):")
+		for r in range(mom_block.shape[0]):
+			print(' '.join(f"{np.imag(mom_block[r, c]):.5f}" for c in range(mom_block.shape[1])))
+		print("[DEBUG] 4x6 x-direction (p + vNL) block (real):")
+		for r in range(full_block.shape[0]):
+			print(' '.join(f"{np.real(full_block[r, c]):.5f}" for c in range(full_block.shape[1])))
+		print("[DEBUG] 4x6 x-direction (p + vNL) block (imag):")
+		for r in range(full_block.shape[0]):
+			print(' '.join(f"{np.imag(full_block[r, c]):.5f}" for c in range(full_block.shape[1])))
+
+		# 2x3 grid of 2x2 Frobenius norms from the 4x6 (p+vNL) block, matching parse_vmtxel.py
+		if full_block.shape[0] >= 4 and full_block.shape[1] >= 6:
+			B00 = full_block[0:2, 0:2]
+			B01 = full_block[0:2, 2:4]
+			B02 = full_block[0:2, 4:6]
+			B10 = full_block[2:4, 0:2]
+			B11 = full_block[2:4, 2:4]
+			B12 = full_block[2:4, 4:6]
+			fn00 = float(np.linalg.norm(B00, ord='fro'))
+			fn01 = float(np.linalg.norm(B01, ord='fro'))
+			fn02 = float(np.linalg.norm(B02, ord='fro'))
+			fn10 = float(np.linalg.norm(B10, ord='fro'))
+			fn11 = float(np.linalg.norm(B11, ord='fro'))
+			fn12 = float(np.linalg.norm(B12, ord='fro'))
+			print("[DEBUG] 2x3 grid of 2x2 Frobenius norms (|p+vNL|, x-direction):")
+			print(f"  {fn00:.6f} {fn01:.6f} {fn02:.6f}")
+			print(f"  {fn10:.6f} {fn11:.6f} {fn12:.6f}")
+
+	def _dipole_block(i):
+		"""⟨mk|v|nk⟩ = p + i[r, V_NL] for ONE k — ``(3, nb, nb)`` on device.
+
+		THE MEMORY CONTRACT.  ψ enters through
+		``load_kpoint_fftbox_local``, which reads and boxes exactly this
+		k: ``nb·nspinor·nx·ny·nz·16`` B, 189 MB on MoS₂ 4×4 at 128 bands.
+		It is dropped when the block returns.  The route this replaces
+		indexed a RESIDENT ``(nk, nb, ns, nx, ny, nz)`` array — every k's
+		box alive for the whole sweep, 3.0 GB on the same deck, and a
+		second 3.0 GB while the k-major reshard of it was in flight.
+		Nothing about that residency shrank with P: the loop ran all
+		``nk`` on every rank.
+		"""
+		wfn_k = load_kpoint_fftbox_local(wfn, meta, i, nb,
+		                                 bispinor=bispinor)
 		kpoint = jnp.asarray(sym.unfolded_kpts[i], dtype=jnp.float64)
-		Gk_crys = Gk_crys_all[i]
+		Gk_crys, g_mask = gtab.at(i)
 		# Momentum per component
 		p_cart = compute_p_operator_k(
 			wfn_k,
@@ -603,6 +847,7 @@ def main(argv=None):
 			jnp.asarray(wfn.bdot, dtype=jnp.float64),
 			jnp.asarray(wfn.bvec, dtype=jnp.float64),
 			float(wfn.blat),
+			g_mask=g_mask,
 		)  # (3, nb, nb)
 		# Nonlocal velocity components via commutator i[r_i, V_NL]
 		if args.skip_vnl:
@@ -612,7 +857,10 @@ def main(argv=None):
 			B = (np.asarray(wfn.bvec, dtype=float)) * float(wfn.blat)
 			Binv = np.linalg.inv(B)
 			vNL_cart = np.zeros((3, nb, nb), dtype=np.complex128)
-			K_cart_this = (np.asarray(Gk_crys, dtype=float) + np.asarray(kpoint, dtype=float)[None, :]) @ B
+			# Physical rows only: the pad rows are G=(0,0,0), so including
+			# them would drag the median |K| toward |k| and shrink the FD step.
+			G_phys = np.asarray(Gk_crys, dtype=float)[np.asarray(g_mask) > 0.0]
+			K_cart_this = (G_phys + np.asarray(kpoint, dtype=float)[None, :]) @ B
 			K_med = float(np.median(np.linalg.norm(K_cart_this, axis=1))) if K_cart_this.size else 1.0
 			h_base = max(float(args.vnl_h), float(args.vnl_h_rel) * max(K_med, 1.0))
 			h1 = h_base
@@ -623,8 +871,8 @@ def main(argv=None):
 				d1c = d1 @ Binv
 				kp1 = np.asarray(kpoint, dtype=float) + d1c
 				km1 = np.asarray(kpoint, dtype=float) - d1c
-				Vp1 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, kp1, vnl_setup)
-				Vm1 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, km1, vnl_setup)
+				Vp1 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, kp1, vnl_setup, g_mask=g_mask)
+				Vm1 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, km1, vnl_setup, g_mask=g_mask)
 				D1 = - (Vp1 - Vm1) / (2.0 * h1)
 				if args.vnl_num_scheme == "richardson":
 					# D2 at h2
@@ -632,85 +880,35 @@ def main(argv=None):
 					d2c = d2 @ Binv
 					kp2 = np.asarray(kpoint, dtype=float) + d2c
 					km2 = np.asarray(kpoint, dtype=float) - d2c
-					Vp2 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, kp2, vnl_setup)
-					Vm2 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, km2, vnl_setup)
+					Vp2 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, kp2, vnl_setup, g_mask=g_mask)
+					Vm2 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, km2, vnl_setup, g_mask=g_mask)
 					D2 = - (Vp2 - Vm2) / (2.0 * h2)
 					vNL_cart[ic] = (4.0 * D2 - D1) / 3.0
 				else:
 					vNL_cart[ic] = D1
 		else:
-			vNL_cart = compute_vnl_velocity_cart(wfn_k, Gk_crys, kpoint, vnl_setup)
+			vNL_cart = compute_vnl_velocity_cart(wfn_k, Gk_crys, kpoint, vnl_setup, g_mask=g_mask)
 
 		# Sign convention note (Liu-2024 Eq. 17 / BGW k·p):
 		# Our internal assembly returns v^NL = -(∂_q + ∂_{q'}) V_NL, while BGW’s
 		# reported ⟨v⟩ uses the opposite sign convention. Flip here so users don’t
 		# need --vnl-scale=-1.0 when comparing to BGW outputs.
 		vNL_cart = -vNL_cart
-		dipole[:, i] = np.asarray(p_cart + vNL_cart)
-
-		# ΔE matrix for this k from band energies
-		try:
-			k_red = int(sym.irr_idx_k[i])
-		except Exception:
-			k_red = int(i)
-		energies = np.asarray(wfn.energies)
-		if energies.ndim >= 3:
-			e_b = np.asarray(energies[0, k_red, :nb], dtype=float)
-		else:
-			e_b = np.asarray(energies[:nb], dtype=float)
-		deltaE[i] = e_b[:, None] - e_b[None, :]
 
 		# Optional debug: print 4x6 x-direction blocks for selected k index
 		if args.debug and int(i) == int(args.debug_kindex):
-			# Choose up to 6 valence (highest) and up to 4 conduction (lowest) bands
-			nelec = int(wfn.nelec)
-			v_count = min(6, max(0, nelec))
-			c_count = min(4, max(0, nb - nelec))
-			if v_count == 0 or c_count == 0:
-				print("[DEBUG] Skipping 4x6 debug blocks: insufficient v/c bands (v_count=", v_count, ", c_count=", c_count, ")")
-				continue
-			v_idx = np.arange(nelec - 1, nelec - v_count - 1, -1, dtype=int)  # descending
-			c_idx = np.arange(nelec, nelec + c_count, dtype=int)              # ascending
-			p_x = np.asarray(p_cart[0])
-			full_x = np.asarray(p_cart[0] + vNL_cart[0])
-			if args.divide_energy:
-				with np.errstate(divide='ignore', invalid='ignore'):
-					dE = deltaE[i]
-					p_x = np.where(np.abs(dE) < 1e-12, 0.0, p_x / dE)
-					full_x = np.where(np.abs(dE) < 1e-12, 0.0, full_x / dE)
-			mom_block = p_x[np.ix_(c_idx, v_idx)]
-			full_block = full_x[np.ix_(c_idx, v_idx)]
-			print("\n[DEBUG] 4x6 x-direction momentum block (real):")
-			for r in range(mom_block.shape[0]):
-				print(' '.join(f"{np.real(mom_block[r, c]):.5f}" for c in range(mom_block.shape[1])))
-			print("[DEBUG] 4x6 x-direction momentum block (imag):")
-			for r in range(mom_block.shape[0]):
-				print(' '.join(f"{np.imag(mom_block[r, c]):.5f}" for c in range(mom_block.shape[1])))
-			print("[DEBUG] 4x6 x-direction (p + vNL) block (real):")
-			for r in range(full_block.shape[0]):
-				print(' '.join(f"{np.real(full_block[r, c]):.5f}" for c in range(full_block.shape[1])))
-			print("[DEBUG] 4x6 x-direction (p + vNL) block (imag):")
-			for r in range(full_block.shape[0]):
-				print(' '.join(f"{np.imag(full_block[r, c]):.5f}" for c in range(full_block.shape[1])))
+			_print_debug_blocks(i, p_cart, vNL_cart)
 
-			# 2x3 grid of 2x2 Frobenius norms from the 4x6 (p+vNL) block, matching parse_vmtxel.py
-			if full_block.shape[0] >= 4 and full_block.shape[1] >= 6:
-				B00 = full_block[0:2, 0:2]
-				B01 = full_block[0:2, 2:4]
-				B02 = full_block[0:2, 4:6]
-				B10 = full_block[2:4, 0:2]
-				B11 = full_block[2:4, 2:4]
-				B12 = full_block[2:4, 4:6]
-				fn00 = float(np.linalg.norm(B00, ord='fro'))
-				fn01 = float(np.linalg.norm(B01, ord='fro'))
-				fn02 = float(np.linalg.norm(B02, ord='fro'))
-				fn10 = float(np.linalg.norm(B10, ord='fro'))
-				fn11 = float(np.linalg.norm(B11, ord='fro'))
-				fn12 = float(np.linalg.norm(B12, ord='fro'))
-				print("[DEBUG] 2x3 grid of 2x2 Frobenius norms (|p+vNL|, x-direction):")
-				print(f"  {fn00:.6f} {fn01:.6f} {fn02:.6f}")
-				print(f"  {fn10:.6f} {fn11:.6f} {fn12:.6f}")
+		return p_cart + vNL_cart
 
+	# One k per dispatch, round-robin over the processes, ONE host readback
+	# per rank and ONE indexed gather at the end — the same contract
+	# ``gw.kin_ion_io``'s ⟨mk|V_H|nk⟩ sweep runs on.  Returns
+	# ``(nk, 3, nb, nb)`` identical on every rank.
+	dip_k_major = gather_k_blocks(nk, _dipole_block, item_shape=(3, nb, nb),
+	                              label="dipole")
+	dipole = np.ascontiguousarray(np.moveaxis(dip_k_major, 0, 1))
+	del dip_k_major
 
 	# Optional: finite-q matrix elements for the SOS chi head/wing/S/w pipeline.
 	rho_cvkq = v_cvkq = kminq_idx_kq = None
@@ -719,7 +917,9 @@ def main(argv=None):
 		print("\nComputing finite-q matrix elements (SOS pipeline)...")
 		iq_list = args.iq_list if args.iq_list is not None else list(range(int(sym.nk_tot)))
 		rho_cvkq, v_cvkq, kminq_idx_kq, n_occ_eff, v_lo, c_hi = compute_finite_q_mtxels(
-			wfn, sym, meta, vnl_setup, wfn_k_sharded, Gk_crys_all,
+			wfn, sym, meta, vnl_setup, gtab,
+			nb=nb,
+			bispinor=bispinor,
 			iq_list=iq_list,
 			nv_block=int(nval),
 			nc_block=int(ncond),
@@ -745,7 +945,7 @@ def main(argv=None):
 	# 4 ranks).  Barrier afterwards so no rank races ahead of the file
 	# existing on disk.
 	if jax.process_index() != 0:
-		_mhu.sync_global_devices("dipole_write")
+		barrier("dipole_write")
 		print(f"\nWrote dipole data to {out_path} (by rank 0)")
 		return 0
 	with h5py.File(str(out_path), 'w') as h5:
@@ -755,6 +955,10 @@ def main(argv=None):
 		h5.attrs['nk'] = int(sym.nk_tot)
 		h5.attrs['skip_vnl'] = bool(args.skip_vnl)
 		h5.attrs['note'] = note
+		stamp_dipole_provenance(
+			h5, wfn=wfn, wfn_path=str(wfn_path), nval=nval, ncond=ncond,
+			nband=nband, nb_written=nb, bispinor=bispinor,
+			skip_vnl=bool(args.skip_vnl), vnl_mode=str(args.vnl_mode))
 		if rho_cvkq is not None:
 			fq = h5.create_group('finite_q')
 			fq.create_dataset('rho_cvkq', data=rho_cvkq)         # (nc, nv, nk, nq)
@@ -769,8 +973,7 @@ def main(argv=None):
 				"v_cvkq[a, c, v, k, q] = symmetric (v_R + v_L)/2 of "
 				"<u_{c, k-q}|v^a|u_{v, k}>_cell  (kinetic + VNL); "
 				"kminq_idx[k, q] = canonical k-q index in unfolded_kpts.")
-	if jax.process_count() > 1:
-		_mhu.sync_global_devices("dipole_write")
+	barrier("dipole_write")
 	print(f"\nWrote dipole data to {out_path}")
 
 

@@ -17,6 +17,7 @@ Suite architecture (2026-07-09 redesign):
   head scalars back into the restart file (``persist_w0_and_head``).
 * **Tier 3** — unit tests for what the gates cannot see.
 """
+from __future__ import annotations
 
 import os
 import re

@@ -81,6 +81,7 @@
 
 #include <mkl_dfti.h>
 
+#include "../../common/cpp/mkl_thread_pin.h"
 #include "xla/ffi/api/ffi.h"
 
 namespace lorrax_ffi::mklfft {
@@ -89,46 +90,20 @@ namespace ffi = ::xla::ffi;
 using C128 = std::complex<double>;
 
 // ---------------------------------------------------------------------------
-//  MKL thread pinning (workstream-AW pattern, local CUDA-/MPI-free copy of
-//  scalapack/cpp/blacs_grid.h's MklThreadScope: dlsym so no MKL link-time
-//  dependency is added here and the pin is a no-op on a non-MKL BLAS).
+//  MKL thread pinning (workstream-AW pattern).  The mechanism lives in
+//  common/cpp/mkl_thread_pin.h — an MPI-free, CUDA-free header, which is why
+//  it is not scalapack/cpp/blacs_grid.h (that one includes <mpi.h> at :40 and
+//  this TU must stay comms-free).
+//
+//  This file previously held its own copy that resolved the pin with a bare
+//  `dlsym(RTLD_DEFAULT, ...)` while the mklblas copy used RTLD_DEFAULT then
+//  RTLD_NEXT.  Under a local-scope dlopen the GEMM handler pinned MKL and
+//  this one silently did not (2026-07-30 divergence audit).  There is now one
+//  resolver; `MklLocalPin` is the old local name for what is now
+//  `mklpin::MklThreadScope`, kept so the two pin sites below read unchanged.
 // ---------------------------------------------------------------------------
-using mkl_set_local_fn = int (*)(int);
-
-static mkl_set_local_fn mkl_set_num_threads_local_ptr() {
-    static mkl_set_local_fn fn = reinterpret_cast<mkl_set_local_fn>(
-        dlsym(RTLD_DEFAULT, "MKL_Set_Num_Threads_Local"));
-    return fn;
-}
-
-class MklLocalPin {
-  public:
-    explicit MklLocalPin(int nthreads) {
-        if (nthreads <= 0) return;
-        auto set_local = mkl_set_num_threads_local_ptr();
-        if (set_local == nullptr) return;
-        prev_ = set_local(nthreads);
-        active_ = true;
-    }
-    ~MklLocalPin() {
-        if (active_) mkl_set_num_threads_local_ptr()(prev_);
-    }
-    MklLocalPin(const MklLocalPin&) = delete;
-    MklLocalPin& operator=(const MklLocalPin&) = delete;
-
-  private:
-    bool active_ = false;
-    int prev_ = 0;  // 0 = "follow the global setting" per MKL docs
-};
-
-static bool str_ieq(const char* a, const char* b) {
-    for (;; ++a, ++b) {
-        const int ca = std::tolower(static_cast<unsigned char>(*a));
-        const int cb = std::tolower(static_cast<unsigned char>(*b));
-        if (ca != cb) return false;
-        if (ca == 0) return true;
-    }
-}
+using MklLocalPin = mklpin::MklThreadScope;
+using mklpin::str_ieq;
 
 // OpenMP team size for the chunk loop.  Strict full-string grammar (the
 // blacs_grid.h AW-audit lesson: a typo must not silently pick a known-bad
@@ -187,8 +162,14 @@ static int64_t chunk_elems(int64_t nk) {
     return std::max<int64_t>(c, 64);
 }
 
+// Opt-in debug logging.  Presence-tested as before, but now rank-scoped:
+// rank 0 by default, every rank with LORRAX_MKLFFT_LOG=all.  See the
+// log_here() note in common/cpp/mkl_thread_pin.h for why the default
+// flipped — at P=1000 the all-ranks default multiplied a 5-line answer by
+// the process count, and (at the commit site below) by the OpenMP team size
+// on top of that.
 static bool log_enabled() {
-    static const bool on = (std::getenv("LORRAX_MKLFFT_LOG") != nullptr);
+    static const bool on = mklpin::log_here("LORRAX_MKLFFT_LOG");
     return on;
 }
 
@@ -252,13 +233,32 @@ static MKL_LONG get_descriptor(const DescKey& k, DFTI_DESCRIPTOR_HANDLE* out) {
         if (h) DftiFreeDescriptor(&h);
         return st;
     }
+    // ONE line per distinct geometry per PROCESS.  The descriptor cache
+    // above is `thread_local`, so this site is reached once per (thread,
+    // key): before the 2026-07-30 audit the log was multiplied by the
+    // OpenMP team size (28/rank in production) and then again by the
+    // process count.  The diagnostic question this line answers — "which
+    // descriptor geometries did this process build?" — is a per-process
+    // property, so a process-wide seen-set preserves the whole answer and
+    // drops the multiplier.  The thread number is kept and now names the
+    // thread that FIRST committed the geometry.
     if (log_enabled()) {
-        std::fprintf(stderr,
-                     "[mklfft] commit dims=(%ld,%ld,%ld) t_in=%ld t_out=%ld "
-                     "n=%ld sf=%.3e sb=%.3e inplace=%d (thread %d)\n",
-                     (long)k.d0, (long)k.d1, (long)k.d2, (long)k.t_in,
-                     (long)k.t_out, (long)k.n, k.sf, k.sb, k.inplace,
-                     omp_get_thread_num());
+        static std::mutex seen_mu;
+        static std::map<DescKey, char> seen;
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> g(seen_mu);
+            first = seen.emplace(k, '\0').second;
+        }
+        if (first) {
+            std::fprintf(stderr,
+                         "[mklfft] commit dims=(%ld,%ld,%ld) t_in=%ld "
+                         "t_out=%ld n=%ld sf=%.3e sb=%.3e inplace=%d "
+                         "(first committed by thread %d)\n",
+                         (long)k.d0, (long)k.d1, (long)k.d2, (long)k.t_in,
+                         (long)k.t_out, (long)k.n, k.sf, k.sb, k.inplace,
+                         omp_get_thread_num());
+        }
     }
     cache.emplace(k, h);
     *out = h;

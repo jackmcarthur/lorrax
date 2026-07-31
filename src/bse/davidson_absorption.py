@@ -30,7 +30,6 @@ from runtime import bootstrap
 bootstrap()
 
 import jax
-import jax.experimental.multihost_utils as mhu
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -48,16 +47,16 @@ from common.fft_helpers import make_sharded_ifftn_3d
 
 
 def _gather_to_host(arr):
+    """ONE gather (:func:`common.collectives.gather_to_host`).
+
+    Was a ``process_allgather(tiled=False)`` + squeeze-row-0 copy branching on
+    ``process_count()``; that raises on a process-spanning array, which is
+    what ``eigvecs`` (nc, nv, nk under the BSE mesh sharding) is at P>1.
+    """
     if isinstance(arr, np.ndarray):
         return arr
-    if jax.process_count() == 1:
-        return np.asarray(jax.device_get(arr))
-    g = mhu.process_allgather(arr, tiled=False)
-    h = np.asarray(jax.device_get(g))
-    expected = tuple(int(d) for d in arr.shape)
-    if h.ndim == len(expected) + 1 and h.shape[1:] == expected:
-        h = h[0]
-    return h
+    from common.collectives import gather_to_host
+    return gather_to_host(arr)
 
 
 def main(argv=None):

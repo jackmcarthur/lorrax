@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - older JAX
     _shard_map_fn = _shard_map_mod.shard_map
 
 import common.timing as timing
+from common.collectives import prepare_mesh
 from common.contract_bands import contract_bands_block_reshard
 from common.fft_helpers import (
     local_fftn3,
@@ -31,8 +32,113 @@ from .bse_serial import apply_D, apply_bse_hamiltonian_single_device, compute_pa
 jax.config.update("jax_enable_x64", True)
 
 
+def create_mesh_xy(px: int, py: int, devices: Optional[list] = None) -> Mesh:
+    """THE ('x','y') BSE device mesh, warmed — for a driver that names px/py.
+
+    Every BSE entry point must get its mesh from here or from
+    :func:`create_mesh_2d` (which is this function with the most-square
+    factorisation chosen for it).  There is exactly one mesh factory in
+    ``src/bse/`` and this is it.
+
+    WHY THIS FUNCTION EXISTS AT ALL.  Four byte-identical
+    ``_create_mesh_xy(px, py)`` bodies used to live in ``bse_w_exact``,
+    ``bse_feast``, ``bse_pseudopoles`` (and, by import, ``bse_kpm``), none of
+    which warmed anything, while only ``create_mesh_2d`` did.  So five BSE
+    drivers — ``exciton_bands``, ``bse_w_exact``, ``bse_feast``, ``bse_kpm``,
+    ``bse_pseudopoles`` — silently ran WITHOUT the clique warm-up that
+    ``bse_jax`` depends on, and each one dies at P>1 under
+    ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` the moment a collective is
+    first issued from inside a jitted program (see
+    :func:`common.collectives.warm_mesh_cliques`: 32 refusals at P=16, gate
+    7881216).  A duplicated constructor is how a load-bearing side effect goes
+    missing without anybody deleting a line.
+
+    THE WARM-UP IS SETUP-TIME AND SIZE-INDEPENDENT.  ``prepare_mesh`` fires
+    three 1-element ``psum``s (one per mesh axis + one over all axes) plus,
+    on GPU, ``runtime.nccl_warmup``'s three tiny reductions.  ``O(log P)``
+    latency, once per process, independent of ``N_mu`` / ``N_k·N_q`` / the
+    trial-block width; it emits no HLO into any solver kernel, so the BSE
+    communication pattern and every intermediate's sharding are untouched.
+    That is what makes it admissible under the standing BSE rule.
+
+    Collective: every rank must reach this together.  Do not make the call
+    rank-conditional.
+    """
+    if devices is None:
+        devices = jax.devices()
+    px, py = int(px), int(py)
+    if px * py > len(devices):
+        raise ValueError(
+            f"Requested px*py={px*py} devices, only {len(devices)} available")
+    mesh = Mesh(np.array(devices[: px * py]).reshape(px, py),
+                axis_names=("x", "y"))
+    # resolve_mesh (pass-through here) + warm_mesh_cliques + nccl_warmup.
+    mesh = prepare_mesh(mesh)
+    _warm_process_allgather(mesh)
+    return mesh
+
+
+def _warm_process_allgather(mesh: Mesh) -> None:
+    """Create the ``multihost_utils.process_allgather`` clique on this thread.
+
+    ``warm_mesh_cliques`` warms the cliques of OUR mesh: one per axis plus the
+    world set, all created by ``shard_map(psum)`` over a ``('x','y')`` Mesh.
+    ``jax.experimental.multihost_utils.process_allgather`` does not use that
+    mesh — it builds its OWN one-dimensional ``Mesh(jax.devices(), 'processes')``
+    and issues an all-gather on it.  That is a different collective on a
+    differently-shaped mesh, and the x/y/world warm-up does not cover it.
+
+    MEASURED, not reasoned: with the mesh warm-up in place and no allgather
+    warm-up, every cell of job 7882523 (P=16) died at
+    ``exciton_bands.py`` line 592 -> ``_gather_host`` ->
+    ``common/collectives.py`` ``process_allgather`` with
+    "MPI: Communicator requested from a thread that is not the one MPI was
+    initialized from" — 4 of 4 cells, same frame every time.  The gather in
+    question is the driver's on-grid diagnostic gate on the mu-sharded
+    Q-shifted psi_c, which is genuinely process-spanning, so it MUST take the
+    allgather arm; it cannot be avoided by branching differently.
+
+    THE WARM-UP MUST TRAVEL THE REAL PATH.  A first attempt handed
+    ``process_allgather`` a HOST numpy array; job 7882531 then failed in
+    exactly the same frame as before (4 of 4 cells), because a host operand
+    never creates the device clique the real call needs.  So the warm-up now
+    builds a genuinely mesh-SHARDED (hence, at P>1, non-fully-addressable)
+    array and pushes it through ``gather_to_host`` — the same function, the
+    same arm, the same trailing ``np.asarray`` that materialises the result.
+    A warm-up that does not reproduce the failing call is not a warm-up; that
+    is the same lesson as a negative control that withholds the wrong thing.
+
+    COST.  One all-gather of ``P`` float64 — 512 B at P=64 — once per process
+    at driver setup.  ``O(log P)`` latency, independent of ``N_mu``,
+    ``N_k*N_q`` and the trial-block width, and it emits no HLO into any solver
+    kernel.  Same admissibility argument as ``warm_mesh_cliques``.
+
+    No-op at ``process_count() <= 1``.  Best-effort: a failure here is not
+    itself fatal (the real call will raise with a better frame), but it is
+    announced.
+    """
+    if jax.process_count() <= 1:
+        return
+    try:
+        from common.collectives import gather_to_host
+        n = int(mesh.devices.size)
+        probe = jax.device_put(
+            jnp.zeros(n, dtype=jnp.float64),
+            NamedSharding(mesh, P(tuple(mesh.axis_names))))
+        out = gather_to_host(probe)
+        assert out.shape == (n,), out.shape
+    except Exception as exc:                      # noqa: BLE001
+        if jax.process_index() == 0:
+            print(f"  [collectives] process_allgather warm-up failed "
+                  f"({type(exc).__name__}: {exc}); a later gather may refuse "
+                  f"under JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi", flush=True)
+
+
 def create_mesh_2d(devices: Optional[list] = None) -> Mesh:
-    """Create a 2D device mesh for BSE sharding."""
+    """Create a 2D device mesh for BSE sharding (most-square factorisation).
+
+    Thin wrapper over :func:`create_mesh_xy` — same warm-up, same contract.
+    """
     if devices is None:
         devices = jax.devices()
 
@@ -42,8 +148,7 @@ def create_mesh_2d(devices: Optional[list] = None) -> Mesh:
         px -= 1
     py = n_devices // px
 
-    device_array = np.array(devices).reshape(px, py)
-    return Mesh(device_array, axis_names=("x", "y"))
+    return create_mesh_xy(px, py, devices)
 
 
 def make_bse_shardings(mesh_xy: Mesh) -> SimpleNamespace:
@@ -1023,7 +1128,10 @@ def ring_matvec_smoke_test(px: int = 2, py: int = 2) -> None:
             f"Need {px*py} devices, found {len(devices)}. "
             "Set XLA_FLAGS=--xla_force_host_platform_device_count=... before running."
         )
-    mesh = Mesh(np.array(devices[:px * py]).reshape(px, py), axis_names=("x", "y"))
+    # ONE mesh factory (create_mesh_xy): these two smoke drivers used to
+    # build their own, so they were the last un-warmed constructors left
+    # in src/bse/ after the four _create_mesh_xy copies were folded in.
+    mesh = create_mesh_xy(px, py, devices)
     sh = make_bse_shardings(mesh)
 
     nkx, nky, nkz = 2, 2, 1
@@ -1081,7 +1189,10 @@ def ring_matvec_correctness_check(
             f"Need {px*py} devices, found {len(devices)}. "
             "Set XLA_FLAGS=--xla_force_host_platform_device_count=... before running."
         )
-    mesh = Mesh(np.array(devices[:px * py]).reshape(px, py), axis_names=("x", "y"))
+    # ONE mesh factory (create_mesh_xy): these two smoke drivers used to
+    # build their own, so they were the last un-warmed constructors left
+    # in src/bse/ after the four _create_mesh_xy copies were folded in.
+    mesh = create_mesh_xy(px, py, devices)
     sh = make_bse_shardings(mesh)
 
     payload = _load_ring_subset(restart_file, n_val, n_cond, px, py,

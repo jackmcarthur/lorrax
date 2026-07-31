@@ -134,25 +134,114 @@ def print_banner(
     )
     print_fn(f"  Device type: {device_kind}")
 
-    _preallocate = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "unset")
-    _mem_frac = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", "unset")
-    print_fn(f"  XLA preallocate: {_preallocate}  mem_fraction: {_mem_frac}")
+    # ---- XLA GPU pool env -------------------------------------------------
+    # These four variables are read ONLY by the CUDA PJRT plugin's option
+    # builder (jaxlib ``generate_pjrt_gpu_plugin_options``); no CPU code
+    # path consults any of them.  The old banner echoed the RAW strings
+    # unconditionally, which stated a GPU fact on a CPU run and, worse,
+    # printed "XLA preallocate: FALSE" for a value jax resolves as TRUE
+    # (its test is case-sensitive) and "mem_fraction: unset" for a run
+    # using the current variable name.  Report the RESOLVED values, and
+    # qualify them by the live backend.
+    from .gw_config import classify_xla_pool, resolve_xla_gpu_memory_env
+    _xm = resolve_xla_gpu_memory_env()
+    _is_gpu = str(backend).strip().lower() in ("gpu", "cuda", "rocm")
+    if _is_gpu:
+        _alloc = _xm.allocator
+        if _xm.allocator_raw is not None and _xm.allocator_raw != _alloc:
+            _alloc += f" (from {_xm.allocator_raw!r})"
+        _frac = (f"{_xm.mem_fraction} [{_xm.mem_fraction_var}]"
+                 if _xm.mem_fraction else "unset")
+        print_fn(
+            f"  XLA allocator: {_alloc}  preallocate: "
+            f"{'on' if _xm.preallocate else 'off'}  mem_fraction: {_frac}")
+        if not _xm.allocator_is_valid:
+            print_fn(
+                f"  *** LORRAX SANITY: XLA_PYTHON_CLIENT_ALLOCATOR="
+                f"{_xm.allocator_raw!r} is not one of default/platform/bfc/"
+                f"cuda_async — jax raises on this at backend init. ***")
+        if _xm.preallocate_looks_like_a_typo:
+            print_fn(
+                f"  *** LORRAX SANITY: XLA_PYTHON_CLIENT_PREALLOCATE="
+                f"{_xm.preallocate_raw!r} reads as 'off' but jax's test is "
+                f"case-sensitive (only 'false'/'False'/'0' disable), so "
+                f"preallocation is ON. ***")
+        if _xm.mem_fraction_conflict:
+            print_fn(
+                "  *** LORRAX SANITY: XLA_CLIENT_MEM_FRACTION and the "
+                "deprecated XLA_PYTHON_CLIENT_MEM_FRACTION are BOTH set — "
+                "jax raises on this at backend init. ***")
+        elif _xm.mem_fraction_deprecated:
+            print_fn(
+                "  [note] XLA_PYTHON_CLIENT_MEM_FRACTION is deprecated in "
+                "jax 0.9; the current name is XLA_CLIENT_MEM_FRACTION.")
+        if _xm.peak_note:
+            print_fn(f"  [note] {_xm.peak_note}")
+        if _xm.tf_gpu_allocator_raw:
+            print_fn(
+                f"  [note] TF_GPU_ALLOCATOR={_xm.tf_gpu_allocator_raw!r} is "
+                f"set but INERT for jax (a TensorFlow variable); it does not "
+                f"select an allocator here.")
+    else:
+        _gpu_knobs = {n: os.environ.get(n) for n in (
+            "XLA_PYTHON_CLIENT_ALLOCATOR",
+            "XLA_PYTHON_CLIENT_PREALLOCATE",
+            "XLA_CLIENT_MEM_FRACTION",
+            "XLA_PYTHON_CLIENT_MEM_FRACTION")}
+        _set = [n for n, v in _gpu_knobs.items() if v]
+        _tail = (f" (set but ignored: {', '.join(_set)})" if _set else "")
+        print_fn(
+            f"  XLA GPU pool knobs: not applicable on the {backend} "
+            f"backend{_tail}")
 
+    # ---- the CLIENT ------------------------------------------------------
+    # Everything above is what the ENVIRONMENT says.  os.environ is a false
+    # witness for allocator state — the allocator is fixed at backend init,
+    # and bootstrap() reaches backend init via jax.devices() inside
+    # fallback_to_cpu_if_no_gpu_backend(), so any variable set afterwards
+    # changes a string and not the client (measured, job 7882443:
+    # identical os.environ, bytes_limit 11.805 GB vs 0.000 GB).  Read the
+    # device and say so when the two disagree.
     try:
         import jax
         # local_devices(), not devices(): jax.devices() is the GLOBAL list, so
         # jax.devices()[0] is process 0's device on every rank and the banner
         # would report another process's pool (or throw) at every P > 1.
         _stats = jax.local_devices()[0].memory_stats()
-        if _stats:
-            _bl = _stats.get("bytes_limit", 0) / 1e9
-            _bu = _stats.get("bytes_in_use", 0) / 1e9
-            print_fn(
-                f"  XLA pool: limit={_bl:.2f} GB, in_use={_bu:.2f} GB,"
-                f" avail={_bl - _bu:.2f} GB"
-            )
-    except Exception:
-        pass
+        _pool = classify_xla_pool(_stats, backend=backend, env=_xm)
+        if _pool.accounting_present:
+            _bl = (_stats or {}).get("bytes_limit", 0) / 1e9
+            _bu = (_stats or {}).get("bytes_in_use", 0) / 1e9
+            _pk = (_stats or {}).get("peak_bytes_in_use", 0) / 1e9
+            if _bl > 0:
+                print_fn(
+                    f"  XLA pool: limit={_bl:.2f} GB, in_use={_bu:.2f} GB,"
+                    f" avail={_bl - _bu:.2f} GB, peak={_pk:.2f} GB"
+                )
+            else:
+                # MEASURED (job 7882478): cuda_async populates in_use and
+                # peak_bytes_in_use but reports bytes_limit=0.  The old
+                # ``avail = limit - in_use`` then printed a NEGATIVE
+                # available pool — a number that cannot exist.
+                print_fn(
+                    f"  XLA pool: in_use={_bu:.2f} GB, peak={_pk:.2f} GB"
+                    f"  (this allocator reports no bytes_limit, so there is"
+                    f" no 'available' figure)"
+                )
+        else:
+            # ``None``/``{}``/all-zero is the documented answer on backends
+            # with no arena accounting (the CPU client, and the ``platform``
+            # allocator).  Say so — a missing line with no reason reads as
+            # "nothing to report", which is a different claim.
+            print_fn("  XLA pool: the client reports no arena accounting "
+                     "(bytes_limit=0) — no pool figures available")
+        if _pool.disagreement:
+            print_fn(f"  *** LORRAX SANITY: {_pool.disagreement} ***")
+    except Exception as exc:
+        # Previously ``except Exception: pass``.  A swallowed failure here
+        # deleted the pool line from the banner with no trace, so an
+        # operator could not tell "no pool" from "the probe broke".
+        print_fn(f"  XLA pool: unavailable ({type(exc).__name__}: {exc})")
 
     print_fn("=" * 72)
     print_fn("")

@@ -37,9 +37,14 @@ transverse channels are *exactly parallel* with μ_T ≤ μ_C, so they are
 never the binder.  The model carries the spinor factor ``ns² = nspinor²``
 in the pair density and does not size the transverse channels separately.
 
-What the model QUERIES rather than guesses (§6): the cuFFT plan scratch
-(``query_fft_peak_bytes`` on the unsharded 6-D FFT shape) and the backend
-pair-density ``slots`` count (3 GPU / 4 CPU, an XLA BufferAssignment fact).
+Everything above is closed-form shape algebra.  TWO terms are MEASURED (§6):
+the Stage-A/D FFT box (``_fft_box_bytes`` compiles the production FFT helper
+at the real shape/mesh and reads XLA's buffer peak *plus* the cuFFT plan
+workspace, via ``common.fft_helpers.query_fft_peak_bytes`` ->
+``runtime.aot_memory.aot_kernel_peak_bytes``) and the pair-density ``slots``
+count (3 GPU / 4 CPU, an XLA BufferAssignment fact).  Where a measurement is
+unavailable the model demotes to an analytic bound and ANNOUNCES it from the
+rank it happened on — an un-measured term here is a silent OOM later.
 """
 from __future__ import annotations
 
@@ -49,6 +54,11 @@ from typing import Optional
 
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+# The planner's ONE printing path: every fallback below announces its demotion
+# through this, once per process, tagged with the rank it happened on.  (Safe
+# at import time — ``runtime.aot_memory`` pulls in no JAX at module scope.)
+from runtime.aot_memory import announce_once as _announce
 
 
 _C128 = 16  # bytes per complex128
@@ -69,13 +79,20 @@ def _pair_density_slots() -> int:
     try:
         import jax
         return 4 if jax.default_backend() == "cpu" else 3
-    except Exception:
+    except Exception as exc:
+        _announce("pair-density-slots-default",
+                  f"jax.default_backend() unreadable ({type(exc).__name__}: "
+                  f"{exc}); assuming 3 pair-density slots (GPU).  CPU really "
+                  f"has 4, so Stage C would be one (nk, ns², μ, cr) arena low")
         return 3
 
 
-# cuFFT out-of-place plan holds ~2 box-sized scratch slots on top of the
-# in/out boxes.  Used only for the analytic fallback when the FFT box
-# cannot be XLA-queried (no real mesh); production queries XLA exactly.
+# Analytic FALLBACK factor for the FFT box, used only when it cannot be
+# compiled and queried.  A cuFFT out-of-place plan holds ~2 box-sized scratch
+# slots on top of the in/out boxes; measured 4.00x at Si 24³/nk=64 and
+# 48³/nk=1, 4.25-4.55x on small shards (memory-model.md "FFT peak memory").
+# It counts BOX COPIES and does not model the cuFFT plan workspace at all,
+# which is why every path reaching it announces itself.
 _FFT_CUFFT_FACTOR = 4.0
 
 # ``gflat_chunk_size`` cap: past cs ~ 1000 cuFFT switches plan algorithm and
@@ -105,19 +122,11 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
     copies are single-axis ÷√P (2 on 'x', 2 on 'y') — the corrected
     centroid term (design §5 bug #4: NOT ÷p_xy).
 
-    ``loader_tables`` is the WFN loader's REPLICATED per-k metadata,
-    staged once by ``WfnLoader.box_index_dev`` / ``_ensure_phdf5_static``
-    and retained for the loader's lifetime: the sparse-G→FFT-box index
-    ``(nk, nx, ny, nz) int32`` and the τ-phase row ``(nk, ngkmax) c128``.
-    Small (121 MB at MoS2 12×12) but **P-INDEPENDENT** — adding nodes
-    never shrinks it, so it belongs in the floor rather than nowhere.
-    It is modelled here because these two arrays used to cost ``P ×``
-    their size as a *transient* on top (JAX's hidden ``device_put`` →
-    ``assert_equal`` all-gather, 7.7 GB/rank at P=64, 17.4 GB projected
-    at P=144); that is what made this planner read 0.48× of the measured
-    node peak at 606c/P=64.  Cured in ``common.collectives.
-    device_put_process_local``; keep the residency term so the floor
-    stays honest."""
+    ``loader_tables`` is the WFN loader's REPLICATED per-k metadata (the
+    sparse-G→FFT-box index + the τ-phase row), retained for the loader's
+    lifetime and **P-INDEPENDENT** — adding nodes never shrinks it, so it
+    belongs in the floor.  Measured history: memory-model.md §"Measured
+    corrections behind the G-flat terms" #1."""
     P_ = p_x * p_y
     psi_one = _c128(nk, ns, mu, nb)
     return {
@@ -131,9 +140,13 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
 def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
     """Per-rank bytes of the centroid-load FFT box (Stage A / D).
 
-    Queries XLA exactly for the cuFFT plan scratch when a real ``Mesh`` is
-    available (design §6 — the static factor under-predicted Si-10³ by
-    19 GiB); analytic ``(bc/p_xy)·ns·n_rtot·16·factor`` otherwise."""
+    MEASURED whenever a real ``Mesh`` is available: compiles the production
+    FFT helper at this shape/sharding and reads XLA's buffer peak PLUS the
+    cuFFT plan workspace, which is not in buffer assignment.  Both halves
+    matter — the analytic factor alone under-predicted Si-10³ by 19 GiB
+    (design §6), and the cuFFT half is >13.7 GB/rank at the CrI3 V_q box.
+    Otherwise: the analytic ``(bc/p_xy)·ns·n_rtot·16·4.0`` box-copy bound,
+    which does NOT see the plan workspace — and announces that."""
     nx, ny, nz = (int(v) for v in fft_grid)
     n_rtot = nx * ny * nz
     if isinstance(mesh_xy, Mesh):
@@ -146,9 +159,15 @@ def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
                     mesh_xy, P(None, ('x', 'y'), None, None, None, None)),
                 dtype=jnp.complex128,
             ))
-        except Exception:
-            pass
+        except Exception as exc:
+            why = f"the probe failed to compile ({type(exc).__name__}: {exc})"
+    else:
+        why = f"mesh_xy is a {type(mesh_xy).__name__}, not a jax Mesh"
     # Analytic fallback (bands sharded over all P; ns + FFT axes replicated).
+    _announce(f"fft-box-unmeasured:{why}",
+              f"Stage A/D FFT-box term is the analytic {_FFT_CUFFT_FACTOR}x "
+              f"box-copy bound because {why}.  It does NOT include cuFFT plan "
+              f"workspace, so this planner will UNDER-predict FFT-box stages")
     return _c128(bc, ns, n_rtot, shard=p_xy) * _FFT_CUFFT_FACTOR
 
 
@@ -177,15 +196,9 @@ def _stage_C_slope(*, nk, ns, nq, mu, slots, p_xy, band_chunk, p_y) -> float:
     which is unavoidable because other y-ranks need other r-blocks of exactly
     those bands.
 
-    HISTORY -- do not regress this.  The gather used to run over ('x','y') at
-    the FULL r-chunk with the r-slice afterwards, giving
-    ``nk*band_chunk*ns*cr*16`` with NO mesh division on either axis: 129
-    GB/rank per copy at MoS2 12x12 (nk=144, band_chunk=160, ns=2,
-    cr=174960), i.e. 9.4x everything else in this slope combined.  Omitting
-    it from the model is what let the planner pick r_chunk = n_rtot and ask
-    XLA for a single 271 GB allocation (job 7874236 RESOURCE_EXHAUSTED); the
-    all-to-all then removed the p_y factor outright (5.2x on this slope at
-    the 8x10 mesh).
+    DO NOT REGRESS the two mesh divisions here; what an un-divided gather
+    cost is memory-model.md §"Measured corrections behind the G-flat
+    terms" #2 (job 7874236, a single 271 GB allocation).
     """
     return (slots * _c128(nk, ns, ns, mu, shard=p_xy)   # pair carry
             + _c128(nq, mu, shard=p_xy)                 # Z_q / zeta_out
@@ -272,7 +285,6 @@ def plan_gflat_chunks(
     r_chunk_override: int | None = None,
     band_chunk_override: int | None = None,
     gflat_chunk_size_override: int | None = None,
-    use_ibz_T: bool = False,
     n_q_ibz: int | None = None,
     pair_density_slots: int | None = None,
     slab_io_replicates: bool = True,
@@ -412,33 +424,15 @@ def plan_gflat_chunks(
            + _c128(mu, ngkmax, shard=p_x)               # ζ resharded on 'x'
            + _c128(mu, ngkmax, shard=p_y))              # ζ resharded on 'y'
 
-    # Stage F — the restart-tensor WRITE (isdf_tensors_<n_rmu>.h5).
-    # On the H5PY_ALLGATHER SlabIO backend (the CPU default whenever the venv
-    # lacks mpi4py + h5py-parallel, which is the case on Frontera today)
-    # ``_slab_io_allgather._to_host`` process_allgathers the WHOLE tensor onto
-    # EVERY rank and then copies it to host numpy — so each written tensor
-    # lands UNSHARDED, twice (the gathered device buffer AND the host numpy
-    # copy).  Nothing in stages A-E models an I/O-seam replication, which is
-    # why the planner reported a 6.70 GB HWM for a run that died past ζ-fit.
-    # ``slab_io_replicates=False`` (PHDF5_FFI / PHDF5_HOST: each rank writes
-    # its own hyperslab) drops it to the sharded cost.
-    #
-    # TWO different tensors go through this seam and the model must take the
-    # LARGER, not just the ``(μ, μ)`` one:
-    #   V_qmunu / W0_qmunu    (n_q_ibz, μ, μ)        — μ² family
-    #   the G-flat ζ tensor   (n_q_disk, μ, ngkmax)  — μ·ngkmax family
-    # Whenever ngkmax > μ (true at every centroid count below ~ngkmax) the
-    # G-flat write is the binder and the old μ²-only term UNDER-predicted it.
-    # MEASURED (wk_Y probe, 1998 centroids / μ_pad=2048 / ngkmax=8603 / P=64,
-    # run dir ``runs/d_1998_P64_rep``): the largest collective in the whole
-    # run is one all-gather of
-    #     nq·μ_pad·ngkmax·16 = 144·2048·8603·16 = 40,594,046,976 B
-    # to the byte, on top of 60.7 GB already live — while this term reported
-    # 2·144·2048²·16 = 19.33 GB, i.e. 2.10× too small, and the planner named
-    # the right binder at the wrong size.  The corrected term, both copies,
-    # at nq=144 / ngkmax=8603 (MoS2 12x12):
-    #   μ_pad=288 -> 11.42 GB   640 -> 25.37 GB   2048 -> 81.19 GB
-    # each of which is 2x a collective the probe has actually SEEN in a dump.
+    # Stage F — the restart-tensor WRITE (isdf_tensors_<n_rmu>.h5).  On the
+    # H5PY_ALLGATHER SlabIO backend each written tensor lands UNSHARDED and
+    # TWICE (gathered device buffer + host numpy copy); the PHDF5 backends
+    # write per-rank hyperslabs and cost the sharded amount
+    # (``slab_io_replicates=False``).  TWO tensors cross this seam and the
+    # binder is the LARGER: V/W0 ``(n_q_ibz, μ, μ)`` and the G-flat ζ
+    # ``(n_q_disk, μ, ngkmax)`` — whenever ngkmax > μ the ζ write wins.
+    # Measured: memory-model.md §"Measured corrections behind the G-flat
+    # terms" #3 (a 40,594,046,976 B all-gather, matched to the byte).
     _v_tensor = _c128(n_q_ibz, mu, mu, shard=1 if slab_io_replicates else p_xy)
     _gflat_tensor = _c128(nq_disk, mu, ngkmax,
                           shard=1 if slab_io_replicates else p_xy)

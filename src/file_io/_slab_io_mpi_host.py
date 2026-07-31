@@ -29,19 +29,18 @@ writes are NOT sufficient once JAX's own CPU collectives ride MPI:
   measured at P=16 x 8 nodes, ~29% of runs segfault/hang at the
   ζ-write/V_q boundary (two threads concurrently inside
   ``MPID_Progress_wait``; provider-independent — AS.4b).
-* The certified stack (AS.4c): ``MPITRAMPOLINE_LIB`` must point at the
-  THREAD_MULTIPLE-patched MPIwrapper build
-  (``wk_AS/mpiw_thr_install/lib64/libmpiwrapper.so`` — it upgrades
-  every init request to MULTIPLE, never downgrades), plus
+* The production stack: ``MPITRAMPOLINE_LIB`` must point at the
+  MPIwrapper built by ``config/frontera/build_mpiwrapper.sh`` — it
+  upgrades every init request to MULTIPLE and never downgrades — plus
   ``LORRAX_MPI_FINALIZE_FIX=skip_atexit`` via the overlay
   ``sitecustomize`` (jax registers an atexit ``collectives.Finalize``
   AND the C++ destructor finalizes → double-finalize rc=1 without it).
   These are harness-level machine facts, not LORRAX policy: LORRAX
-  reads neither variable (see docs/dev/env_vars.md §6).
-* Under the certified default (gloo collectives) none of this applies:
-  mpi4py's import here is the first MPI init and requests MULTIPLE.
-  The C++ FFI twin guards the same hazard at open time
-  (``ffi/phdf5/cpp/context.cc`` MPI_Query_thread warning).
+  reads neither variable (see docs/dev/env_vars.md and
+  docs/dev/mpi_collectives.md).
+* The C++ FFI twin guards the same hazard at open time
+  (``ffi/phdf5/cpp/context.cc`` MPI_Query_thread warning), which is what
+  fires if the wrapper is missing from the path.
 
 What we DO match from :class:`_FfiBackend`:
 

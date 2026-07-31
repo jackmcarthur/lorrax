@@ -67,6 +67,7 @@ nav:
       - Symmetry: theory/symmetry.md
       - HL-GPP derivation: theory/hl-gpp-derivation.md
   - Architecture:
+      - Layers: architecture/layers.md
       - Codebase: architecture/codebase.md
       - Memory model: architecture/memory-model.md
       - Multi-host: architecture/multihost.md

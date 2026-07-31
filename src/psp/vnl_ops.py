@@ -83,6 +83,12 @@ class VNLKData:
     total_R: int
     # Optional: Cartesian k-derivatives for velocity
     dZ: jax.Array | None            # (3, total_R, nG) or None
+    # 1 on the k's physical G, 0 on the ngkmax pad — None when the G-list
+    # was the k's own ragged sphere.  Set by ``build_vnl_kdata`` (the
+    # SymMaps path), which ALSO zeroes Z/dZ on the pad columns, so this
+    # field documents the layout rather than being a required argument to
+    # anything: a kdata from that route is already inert on the pad.
+    g_mask: np.ndarray | None = None   # (nG,) float64 or None
 
 
 # ---------------------------------------------------------------------------
@@ -120,13 +126,19 @@ def build_vnl_setup(
         if hasattr(wfn, "ecutwfc"):
             q_max = float(np.sqrt(float(wfn.ecutwfc)))
         else:
-            from psp.dft_operators import generate_gvectors_k
+            from psp.dft_operators import padded_gvectors
+            tab = padded_gvectors(wfn, k="full_bz")
             q_max = 0.0
             for ik in range(sym.nk_tot):
-                Gk, _ = generate_gvectors_k(ik, sym, wfn, meta)
+                G_pad, g_mask = tab.at(ik)
                 kvec = np.asarray(sym.unfolded_kpts[ik], dtype=float)
-                K_cart = (np.asarray(Gk, dtype=float) + kvec[None, :]) @ B
-                qk = np.sqrt(np.sum(K_cart ** 2, axis=1))
+                K_cart = (G_pad.astype(float) + kvec[None, :]) @ B
+                # Pad rows are G=(0,0,0), i.e. |k| — small, but not
+                # provably below the physical maximum, so zero them
+                # rather than argue about it.  q_max only ever grows the
+                # radial table, so an over-estimate is harmless while an
+                # under-estimate silently clips the form factors.
+                qk = np.sqrt(np.sum(K_cart ** 2, axis=1)) * g_mask
                 if qk.size:
                     q_max = max(q_max, float(np.max(qk)))
     q_max *= 1.01
@@ -309,14 +321,42 @@ def build_vnl_kdata(
     wfn, sym, meta,
     *,
     compute_dZ: bool = False,
+    gvectors=None,
 ) -> VNLKData:
-    """Build dense Z [and dZ] for one k-point (SymMaps path)."""
-    from psp.dft_operators import generate_gvectors_k
+    """Build dense Z [and dZ] for one k-point (SymMaps path).
 
-    Gk_crys, _ = generate_gvectors_k(k_idx, sym, wfn, meta)
+    The G-list is the loader's FIXED ``(ngkmax, 3)`` table, so
+    ``_assemble_Z_jit`` — whose compile cache is keyed on ``nG`` — lowers
+    ONCE for the whole k sweep instead of once per distinct ``ngk``.
+
+    Z and dZ are returned already ZEROED on the pad columns, and the mask
+    that did it is carried on :attr:`VNLKData.g_mask`.  That is what makes
+    this route safe to drop into a caller that does not mask ψ: every
+    contraction in ``vnl_matrix`` / ``apply_vnl`` / ``vnl_velocity_matrix``
+    passes through Z or dZ at least once, so a zero there is enough.
+    (Left unmasked, the pad columns would be finite — the core evaluates
+    Z at K = kvec on those rows — and would contract against ψ(Γ), which
+    the pad rows alias.)
+
+    Pass ``gvectors`` (a :class:`psp.dft_operators.PaddedGVectors`) to
+    reuse one table across a sweep.
+    """
+    from psp.dft_operators import padded_gvectors
+
+    tab = padded_gvectors(wfn, k="full_bz") if gvectors is None else gvectors
+    G_pad, g_mask = tab.at(k_idx)
     kvec = np.asarray(sym.unfolded_kpts[k_idx], dtype=float)
-    return _build_vnl_kdata_core(kvec, np.asarray(Gk_crys, dtype=int),
+    kdata = _build_vnl_kdata_core(kvec, np.asarray(G_pad, dtype=int),
                                   setup, compute_dZ=compute_dZ)
+    mask_j = jnp.asarray(g_mask, dtype=kdata.Z.real.dtype)
+    return VNLKData(
+        Z=kdata.Z * mask_j[None, :],
+        E_super=kdata.E_super,
+        nG=kdata.nG,
+        total_R=kdata.total_R,
+        dZ=None if kdata.dZ is None else kdata.dZ * mask_j[None, None, :],
+        g_mask=g_mask,
+    )
 
 
 def build_vnl_kdata_from_kvec(

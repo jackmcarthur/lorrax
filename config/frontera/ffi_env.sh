@@ -21,6 +21,32 @@ export LD_LIBRARY_PATH="$LORRAX_FFI_STAGE/stage/lib:${_NV_LIBS}${LD_LIBRARY_PATH
 # use the CUDA async mempool so JAX and the solver share VRAM (avoids the
 # NCCL-starved-of-VRAM -> cusolverMpSyevd status=7 failure).
 export CUSOLVERMP_FORCE_NCCL=1
+# ---------------------------------------------------------------------------
+# WHY THIS FILE MAY SET A DIFFERENT ALLOCATOR THAN runtime.set_default_env()
+#
+# PREALLOCATE=false is NOT a difference -- it is the same canonical value the
+# runtime now sets for every driver, restated here because this file is also
+# sourced by bare FFI tests that never enter Python's bootstrap.
+#
+# ALLOCATOR=cuda_async IS a deliberate deployment-only override, and this is
+# the one file entitled to make it.  Measured on 8x Quadro RTX 5000 across 2
+# nodes (job 7882447, 6 GiB of live XLA arrays on a 15.74 GB card):
+#
+#     allocator            XLA overhead   largest cuFFT plan still creatable
+#     default (BFC)+false   2.13 GB        7.16 GB
+#     cuda_async    +false  0.19 GB        9.20 GB
+#
+# so cuda_async is worth ~2 GB per card to the out-of-XLA cuFFT arena, and
+# unlike `platform` it still reports peak_bytes_in_use.  It is not the
+# in-code default only because on Turing (sm_75) cudaMallocAsync REQUIRES the
+# command-buffer restriction set further down this same file (see the
+# XLA_FLAGS block below) -- and this file is the only place that sets both
+# halves together.  A run that sources this script gets the matched pair; a
+# run that does not gets the runtime's safe BFC default.
+#
+# Do NOT move cuda_async into runtime.set_default_env() without moving that
+# XLA_FLAGS mitigation with it.  `export` here (not setdefault) is correct:
+# it must beat the runtime's setdefault, which is written to yield.
 export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 

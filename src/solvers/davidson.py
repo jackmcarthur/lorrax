@@ -45,23 +45,21 @@ import numpy as np
 def _to_host(arr) -> np.ndarray:
     """Bring a (possibly multi-process) jax.Array to host as numpy.
 
-    Multi-process JAX refuses ``np.asarray`` on arrays whose shards live
-    on non-local devices, even when the array is logically replicated.
-    Mirror the pattern used by ``file_io._slab_io_allgather._to_host``:
-    ``process_allgather(tiled=False)`` returns ``(world, *A.shape)`` —
-    take row 0 (all rows identical for replicated data).
+    Delegates to :func:`common.collectives.gather_to_host`.
+
+    The docstring this replaces said it mirrored
+    ``file_io._slab_io_allgather._to_host`` — but that one uses
+    ``tiled=True`` and this one used ``tiled=False``, so it mirrored the
+    reference incorrectly, and the same mis-citation appears in two other
+    copies of the same body.  ``tiled=False`` raises on an array whose shards
+    live on other processes; ``process_count()`` does not answer that
+    question, ``is_fully_addressable`` does.  One implementation, in the
+    service, with the branch and the reason for it in one place.
     """
     if isinstance(arr, np.ndarray):
         return arr
-    if jax.process_count() == 1:
-        return np.asarray(jax.device_get(arr))
-    from jax.experimental import multihost_utils
-    gathered = multihost_utils.process_allgather(arr, tiled=False)
-    host = np.asarray(jax.device_get(gathered))
-    expected = tuple(int(d) for d in arr.shape)
-    if host.ndim == len(expected) + 1 and host.shape[1:] == expected:
-        host = host[0]
-    return host
+    from common.collectives import gather_to_host
+    return gather_to_host(arr)
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -19,7 +19,6 @@ this module encodes), `wk_REL/lgemm_notes.md` (the de-promotion lever),
 from common.contract_bands import (
     contract_bands_block_reshard,      # THE factory
     bands_gemm_ffi_enabled,            # LORRAX_BANDS_GEMM_FFI (factory-time read)
-    ensure_grouped_collectives_ready,  # impl=mpi world-first warm-up (§3.5)
 )
 
 project = contract_bands_block_reshard(
@@ -175,6 +174,29 @@ rank≥2 `convert(f64[...])→c128` anywhere, (b) dot dtype/shape classes,
 `tests/test_contract_bands.py` and `tests/test_projection_lgemm.py` are
 the reference implementations of the pattern.
 
+**This policy has direct GPU evidence, which this document did not know it
+had** (found by the 2026-07-30 FFI-microservice assessment; the census was
+run for the FFT work and its Part 4 was never read back into here).
+`wk_REL/audit_gpu_hlo.log:140-179`, real GPU, job 7879378 / 1× Quadro RTX
+5000 sm_75, compiled-HLO census of the right contraction at production
+shape — all three forms dispatch `__cublas$gemm`:
+
+| form | census line | XLA temp bytes | fusion ops |
+|---|---|---|---|
+| c128 × c128 (baseline) | `:143-153` | **4.2 MB** | 0 |
+| **REAL f64 O × complex ψ** | `:156-166` | **402.9 MB** | **1** |
+| f64 × f64 split (the de-promoted form) | `:169-179` | **4.2 MB** | 0 |
+
+So the promotion materialization the memo priced on CPU (~400 MB per
+channel) is present on GPU too, at the same magnitude, and the f64 split
+removes it — a ~96× temp-memory difference on the mixed case.  Note what
+the census does NOT say: it counts `opcode == transpose|copy` and reports
+zero for all three rows, so its "NO LARGE LAYOUT TRANSPOSE" verdict line
+is wrong by construction here — the 402.9 MB is produced by a *fusion*.
+Read the temp-bytes column, not the verdict line.  This is a lowering
+observation, not a walltime measurement: **no GPU timing of this primitive
+exists** (§3.4 "platform reach").
+
 ### 3.4 The gated FFI vendor-BLAS GEMM body (`LORRAX_BANDS_GEMM_FFI`; AUTO default)
 
 Even de-promoted, XLA:CPU's Eigen dots run well below the node's BLAS
@@ -193,14 +215,16 @@ on a non-MKL BLAS).  Collectives, channel algebra and the small left
 dots (measured 1.6e-3 of the right's flops) are untouched.
 
 **Vendor portability (2026-07-29):** `cblas_?gemm_batch` is an MKL
-extension of CBLAS.  The build probes for it with CMake
-`check_symbol_exists` against the resolved BLAS headers + link line
-(`src/ffi/common/cpp/host/CMakeLists.txt`, mklblas block): present → the
-batched entry (preferred); absent → a portable loop of plain
-`cblas_{d,z}gemm` calls (standard CBLAS — each GEMM threaded internally
-by the vendor).  The handler therefore **works in principle with Intel
-MKL or Cray LibSci (batched entry when available, plain-GEMM loop
-otherwise); tested with Intel only so far.**
+extension of CBLAS (OpenBLAS ships it too; Cray LibSci does not).  The
+choice is made **at RUNTIME by `dlsym`, per precision** — there is no
+build-time feature probe and no `HAVE_BATCH` macro
+(`src/ffi/mklblas/cpp/gemm_batch_ffi.cc:7-40`, `:188-202`): each of
+`cblas_{s,d,c,z}gemm_batch` that resolves gets one batched call per
+invocation, and each that does not falls back for THAT precision to a loop
+of plain `cblas_?gemm` calls (standard CBLAS, threaded internally by the
+vendor).  One binary serves either vendor.  The handler therefore **works
+in principle with Intel MKL or Cray LibSci; tested with Intel only so far.**
+Details live in `docs/dev/vendor_gemm_service.md` §5.
 
 **Default is AUTO (owner order 2026-07-29 — capability detection, not
 policy, doctrine #8):** unset/`auto` turns the FFI body ON when the
@@ -235,24 +259,38 @@ h5 ≤2.5e-14 eV, reduce-scatter payloads byte-equal off-vs-on.  Build:
 `config/frontera/build_ffi_host.sh` (the TU rides the existing MKL link
 line; see the mklblas block in `src/ffi/common/cpp/host/CMakeLists.txt`).
 
-**Configure-time probe caveat (2026-07-29, cost a gate cycle):** the
-`check_symbol_exists` probe links a try_compile EXECUTABLE, where `ld`
-defaults to `--no-allow-shlib-undefined` and demands the *whole*
-shared-library closure resolve — which the real target (a `.so`) never
-has to.  On Frontera that produced a FALSE NEGATIVE twice (jobs
-7879278/7879281 both compiled the slow plain-GEMM loop against an MKL
-that *has* the batched entry): first from BLACS's open `MPI_*`
-references, then — after adding `libmpi` to close them — from `libmpi`'s
-own `fi_*@FABRIC_*` references (libfabric is on `LD_LIBRARY_PATH` at run
-time, not on the link search path).  The probe therefore sets
-`CMAKE_REQUIRED_LINK_OPTIONS=-Wl,--allow-shlib-undefined`, which
-tolerates undefined symbols *inside the dependency libraries* while
-still hard-failing on an undefined reference from the probe's own
-object — exactly the question being asked.  **If you port this to a
-non-GNU linker and the flag is rejected, the probe simply fails and the
-portable plain-GEMM loop is compiled: slower, never wrong.**  Read the
-configure log line (`mklblas: GEMM host handler ON — batched entry …`
-vs `… — plain cblas_?gemm loop …`) rather than assuming.
+**Why there is no configure-time probe (2026-07-29 owner order; the probe
+existed, cost a gate cycle, and was DELETED).**  A `check_symbol_exists`
+probe links a try_compile EXECUTABLE, where `ld` defaults to
+`--no-allow-shlib-undefined` and demands the *whole* shared-library
+closure resolve — which the real target (a `.so`) never has to.  On
+Frontera that produced a FALSE NEGATIVE twice (jobs 7879278/7879281 both
+compiled the slow plain-GEMM loop against an MKL that *has* the batched
+entry): first from BLACS's open `MPI_*` references, then — after adding
+`libmpi` to close them — from `libmpi`'s own `fi_*@FABRIC_*` references
+(libfabric is on `LD_LIBRARY_PATH` at run time, not on the link search
+path).  The general defect: a build-time question whose wrong answer is
+invisible and costs 1.6–1.9× does not belong in the build.
+
+The probe is gone.  `src/ffi/common/cpp/host/CMakeLists.txt:333-345`
+now says so in place (*"NO FEATURE PROBE HERE — deliberate (owner order
+2026-07-29)"*), and what remains there is a plain header-EXISTS test whose
+failure mode is "handler not built at all" (loud) rather than "built, but
+silently slow".  **The configure log line this section used to tell you to
+read no longer exists.**  The current one is `CMakeLists.txt:366-370`:
+
+```
+mklblas: GEMM host handler ON (mkl_cblas.h at …); batched-vs-plain entry
+is chosen at RUNTIME by dlsym and announced on first use — no build-time
+feature probe by design
+```
+
+To learn which entry is actually live, read the **runtime** announcement
+instead: `gemm_batch_ffi.cc`'s `announce_entry_once` prints one
+unconditional line per precision at that precision's first use (e.g.
+`[mklblas] gemm_batch first call: dtype=c128 … via cblas_?gemm_batch
+(batched entry)`), which is what makes a silent downgrade impossible by
+construction.  It is not behind `LORRAX_MKLBLAS_LOG` on purpose.
 
 **Platform reach of this module (CPU/GPU sweep, 2026-07-29).**  The
 primitive itself is backend-neutral and *supported on both platforms*:
@@ -268,9 +306,6 @@ what each does on GPU:
   `mesh.devices.flat[0].platform`, and an explicit `=1` refuses.  A GPU
   user never sees this dial engage and never needs to unset it — the
   native `dot` → cuBLAS lowering is what runs, by design.
-* **`ensure_grouped_collectives_ready()`** — a no-op on GPU: it returns
-  early unless `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`, a CPU-backend
-  variable (§3.5).  GPU meshes have no equivalent ordering contract here.
 * **the mesh-minor-axis refusal** (§3.2) — *stays* on GPU and is stated
   in device-order terms, not CPU terms: only the LAST mesh axis has
   consecutive-rank replica groups on the standard process-ordered device
@@ -280,32 +315,97 @@ what each does on GPU:
   applies; a hand-permuted GPU device mesh will hit the refusal and must
   pass `axes` matching its own layout.
 
-The one GPU gap to be honest about: **no GPU execution of this primitive
-has been run.**  Everything above is a code + platform-table reading, not
-a measurement — the campaign's meshes are all CPU.  Nothing GPU-specific
-is *claimed* to be fast, only to resolve sanely.
+The GPU gap, stated precisely (amended 2026-07-30 — the earlier flat "no
+GPU execution of this primitive has been run" was too strong in one
+direction and not strong enough in another):
 
-### 3.5 The impl=mpi world-collective-first warm-up contract
+| claim | status |
+|---|---|
+| the f64-split de-promotion (§3.3) matters on GPU | **MEASURED on real GPU** — 402.9 MB vs 4.2 MB XLA temp, `wk_REL/audit_gpu_hlo.log:156-179`, job 7879378 |
+| the staged psum_scatter chain lowers on a CUDA mesh | code + platform-table reading only |
+| any GPU **walltime** of this primitive | **none.** No timing, no A/B, no production driver run |
+| the primitive on a **multi-device** GPU mesh | **unmeasured** — every GPU log in this campaign is `[CudaDevice(id=0)]`, so the NCCL reduce-scatter path has never executed |
+| the FFI GEMM dial on GPU | not applicable and never will be (host symbol table only) |
 
-Under `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`, XLA creates grouped
-cliques lazily and its `MPI_Is_thread_main` check passes only after a
-WORLD-clique collective has first-touched the runtime; a process whose
-FIRST collective is a grouped psum_scatter dies deterministically with
-`UNKNOWN: MPI: Communicator requested from a thread ...`.  This is an
-ORDER contract, not an async one — `JAX_CPU_ENABLE_ASYNC_DISPATCH=false`
-does NOT avoid it.  Evidence: job 7878862 step 1 (52/64 ranks dead at
-the first grouped collective), 7878883 probe (world-psum-first fixes it;
-async-off does not) — memo Sec. 4.2.  Production never sees it only
-because early sync barriers happen to be world collectives.
+Nothing GPU-specific is *claimed* to be fast.  The one thing now claimed
+beyond "resolves sanely" is the de-promotion lowering, and it carries its
+census lines.
 
-The factory calls `ensure_grouped_collectives_ready()` — one
-world-spanning `common.collectives.barrier` collective, once per
-process, only under impl=mpi multi-process (~60 ms warm, ~2 s cold) — so
-every consumer (tests, benches, future BSE drivers) inherits the
-contract instead of rediscovering the failure.  Standalone code that
-issues grouped collectives WITHOUT this primitive should call the helper
-directly.  The L3 FFI direct-MPI tier deletes the contract entirely
-(explicit communicator lifecycle) and slots behind this same interface.
+### 3.5 impl=mpi and grouped cliques (the withdrawn "warm-up contract")
+
+Earlier revisions of this document described a *world-collective-first
+ordering contract*: under `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`, XLA
+supposedly created grouped cliques lazily and its `MPI_Is_thread_main`
+check passed only after a WORLD-clique collective had first-touched the
+runtime, so the factory issued a world barrier
+(`ensure_grouped_collectives_ready()`) before returning.
+
+**That model is withdrawn. It was falsified twice over:**
+
+* A bare subgroup `psum` with **no warm-up of any kind** passes.
+* None of five warm-up variants (none / `sync_global_devices` / world
+  `psum` on the caller's own mesh / world all-gather on the caller's own
+  mesh / both) changes the outcome in either direction (job 7879485).
+
+So ordering was never the mechanism, and the world barrier was doing
+nothing except costing a collective. The helper has been deleted.
+
+**What the gate actually is.** jaxlib's
+`xla::cpu::MpiCollectives::CreateCommunicators()` calls
+`MPI_Is_thread_main()` and refuses with `absl::UnknownError("MPI:
+Communicator requested from a thread that is not the one MPI was
+initialized from...")` when it is false — then, and only then, does it
+`MPI_Comm_split`. Three consequences, all confirmed by disassembling that
+function in `jaxlib/libjax_common.so`:
+
+* it fires on communicator **creation** only, once per clique key; the
+  collectives themselves carry no such check;
+* it is **not** a thread-LEVEL test — `MPI_Is_thread_main` is false on any
+  non-initialising thread even under `MPI_THREAD_MULTIPLE`, so no
+  `MPI_THREAD_*` setting helps;
+* the discriminator is which XLA:CPU execution path the program takes.
+  `ThunkExecutor::ExecuteSequential` runs thunks inline on the caller
+  (main) thread, so small graphs pass; the parallel
+  `ThunkExecutor::Execute<ReadyQueue>` path dispatches to intra-op pool
+  workers, so real graphs fail. That, not "standalone vs production", is
+  why a probe could pass where a full driver failed.
+
+**The fix is a main-thread clique warm-up, in `common.collectives`.**
+
+> SUPERSEDED 2026-07-31.  This section previously read *"The fix is in the
+> MPIwrapper, not in this primitive … `LORRAX_MPI_FORCE_THREAD_MAIN=1` …
+> Consumers of this primitive need no warm-up call."*  That is now wrong in
+> both halves, and it was wrong about the code in this repo at the time it
+> was read: `common/contract_bands.py:542` **does** call
+> `warm_mesh_cliques`, and `docs/dev/env_vars.md:250` marks
+> `LORRAX_MPI_FORCE_THREAD_MAIN` **SUPERSEDED — leave it UNSET**.
+
+`common.collectives.warm_mesh_cliques(mesh)` creates every mesh-axis
+communicator **and** the world communicator on the calling (main) thread,
+inside a jit small enough that XLA takes `ThunkExecutor::ExecuteSequential`
+and runs the thunk inline on the caller.  `AcquireCommunicator` caches on
+the participating-device set alone, so every later acquisition — including
+from an intra-op pool worker inside a large jit — is a cache hit and the
+`MPI_Is_thread_main` guard is never re-evaluated.
+
+Why this and not the wrapper: the override requires a patched MPI shim
+every user must build, and it is strictly less safe — it lets XLA call
+`MPI_Comm_split`, which is collective over `MPI_COMM_WORLD`, from arbitrary
+pool workers.  Warming from one thread in a program-defined order removes
+that exposure.
+
+**It is load-bearing and per-clique.** Job 7881053: warming the world
+clique alone fails, `x` alone fails, `x+y` without the world fails — only
+`x + y + world` passes.  Job 7881216 at P=16: the shipping path is clean
+while the withheld-warm-up control refuses **32 times**.  Cost is three
+1-element psums, `O(log P)` once per process, independent of
+`N_mu`/`N_k`/`N_q`, and absent from every downstream kernel's HLO.
+
+Consumers should call `common.collectives.prepare_mesh()`
+(`resolve_mesh` + `warm_mesh_cliques` + `nccl_warmup`) rather than
+constructing a `Mesh` directly.  The L3 FFI direct-MPI tier (explicit
+communicator lifecycle) is unaffected either way and slots behind the same
+interface.
 
 ### 3.6 Divisibility guards / resolve-time refusals
 
@@ -438,98 +538,53 @@ direct-MPI collective tier that slots behind this interface): keep the
 §2 doctrine and the §3.2/§3.5 contracts, write the §3.3-style HLO pins
 first, and record your numbers with their domain next to these.
 
-**AMENDMENT (2026-07-29): the helper is measured INSUFFICIENT for a
-standalone consumer.**
+**AMENDMENT (2026-07-29, superseding two earlier amendments): the warm-up
+helper is GONE, and the transport question is settled in favour of mpi.**
 
-`ensure_grouped_collectives_ready()` implements the world-collective-first
-contract by calling `common.collectives.barrier`, i.e.
-`multihost_utils.sync_global_devices`. In the installed jaxlib that
-lowers to a `jit(_identity_fn)` all-gather over an internally
-constructed `('processes','local_devices')` mesh — a different device
-assignment from the caller's. **It does not make a standalone driver's
-grouped `psum_scatter` work.**
-
-Measured (job **7879485**; `wk_REL/zproj_mpiprobe.{py,sbatch}`; P=4,
-2 nodes, one FRESH PROCESS per variant, the grouped chain being
-byte-for-byte the one `common.zeta_projection` issues, at tiny shapes
-so neither size nor memory is in play):
+The first amendment recorded that `ensure_grouped_collectives_ready()` was
+measured *insufficient* for a standalone consumer (job **7879485**, P=4, one
+fresh process per variant, the grouped chain byte-for-byte the one
+`common.zeta_projection` issues):
 
 | variant | transport | warm-up before the first grouped collective | verdict |
 |---|---|---|---|
-| `mpi_none` | mpi | none | **FAIL** |
-| `mpi_sgd` | mpi | `sync_global_devices` — what the helper does today | **FAIL** |
-| `mpi_psum` | mpi | `lax.psum` over BOTH mesh axes inside `shard_map`, on the caller's own mesh | **FAIL** |
-| `mpi_ag` | mpi | world all-gather on the caller's own mesh | **FAIL** |
-| `mpi_both` | mpi | psum + sgd | **FAIL** |
-| `gloo_none` | gloo (ib0 pin) | none | **PASS** |
-| `gloo_sgd` | gloo (ib0 pin) | `sync_global_devices` | **PASS** |
+| `mpi_none` | mpi | none | FAIL |
+| `mpi_sgd` | mpi | `sync_global_devices` — what the helper did | FAIL |
+| `mpi_psum` | mpi | `lax.psum` over BOTH mesh axes, caller's own mesh | FAIL |
+| `mpi_ag` | mpi | world all-gather on the caller's own mesh | FAIL |
+| `mpi_both` | mpi | psum + sgd | FAIL |
+| `gloo_none` | gloo (ib0 pin) | none | PASS |
+| `gloo_sgd` | gloo (ib0 pin) | `sync_global_devices` | PASS |
 
-All five mpi variants die with the §3.5 error
-(`MPI: Communicator requested from a thread that is not the one MPI was
-initialized from`). Note that `mpi_psum` is the collective the 7878883
-probe itself used, issued on the caller's mesh — so the discrepancy is
-not "the helper picked the wrong collective".
+That table is still correct as data. Its *interpretation* was not. The five
+mpi FAILs are not "the warm-up is insufficient" — they are jaxlib's
+`MPI_Is_thread_main` guard, which no warm-up can satisfy (§3.5). The helper
+was therefore not "necessary but not sufficient"; it was never necessary. It
+has been deleted, and the factory no longer issues a collective of its own.
 
-**This does not contradict production.** `gw.gw_jax` runs grouped
-collectives under impl=mpi at P=64 successfully (job 7879010, 8/8
-passes rc=0). The contract is therefore satisfiable — by something in
-the full driver process that a standalone module does not reproduce.
-**What that something is has not been identified.** Until it is, the
-honest statement of the contract is:
+**The transport question is no longer open either.** The earlier text here
+said "do NOT read this as 'standalone consumers should use gloo' — the two
+transports have disjoint known-bad regions and neither is a safe default".
+The gloo side of that has since been characterised and it is much worse than
+"a known-bad region":
 
-* **impl=mpi is verified only for the full `gw_jax` process.** A
-  standalone consumer — a test, a microbench, a BSE driver, anything
-  that builds its own mesh and calls the primitive directly — must not
-  assume the warm-up helper covers it, and must gate rather than trust.
-* **The helper is retained** (it is cheap and correct as far as it
-  goes) but its docstring should stop promising sufficiency.
+* gloo's `psum_scatter` **silently returns wrong data in ~5% of executions**
+  — plausible magnitude, no warning, rc=0, always output segment 0. It
+  reproduces with no LORRAX imports at all. The single P=4 sighting this
+  document flagged (job 7879491, a non-Hermitian `W_S`) was the first
+  symptom of exactly that.
+* mpi is clean in **504/504** executions of the identical program, with a
+  gloo positive control corrupting 4 of 4 process lifetimes in the same
+  allocations, and a negative control proving the grouped MPI communicators
+  really are on the critical path.
+* mpi is also faster on this fabric by 1.4-8.2× on the collective-bound
+  stages, and gloo in this jaxlib has no non-TCP transport to close the gap.
 
-**Do NOT read this as "standalone consumers should use gloo."** The two
-transports have *disjoint* known-bad regions and neither is a safe
-default:
-
-* gloo/ib0 was found dying reproducibly at P=64 under the distributed
-  tiers (2 reps, warm and cold), which is part of why the campaign's
-  certified stack moved to impl=mpi;
-* gloo/ib0 nevertheless carries this staged reduce-scatter chain
-  cleanly — memo §4.3 at P=64 (job 7878883 step 1c, rc=0, full suite),
-  and `common.zeta_projection`'s own sweep at P = 4/16/64/144 (jobs
-  7879499/7879504), where the projected result is bit-identical across
-  a 36× range of P;
-* but a **silent, non-reproducible wrong answer** was observed once on
-  gloo at P=4 (job 7879491: a non-Hermitian `W_S` with `Im Σ = 6.25e+02`
-  where the algebra forces exactly 0; the identical configuration re-ran
-  clean in job 7879499). Incidence measured over 100 further executions
-  in job **7879519** — see `wk_REL/zeta_projection_notes.md` §6.
-
-The operational rule this implies, and which the primitive's consumers
-should follow: **choose the transport per context, and carry a cheap
-invariant that the collectives cannot fake.** For a congruence
-`ψ† O ψ` with Hermitian `O` that invariant is free — the result is
-Hermitian for *any* ψ, so a Hermiticity check tests only the machinery.
-`common.zeta_projection` runs exactly that at every production-scale
-point, plus a parity check against a structurally different collective
-pattern, and both are one jitted reduction each with no gather.
-
----
-
-## Companion one-line change
-
-`src/common/contract_bands.py`, `ensure_grouped_collectives_ready`
-docstring — the sentence
-
-"...so every consumer (tests, benches, future BSE drivers) inherits the
-contract instead of rediscovering the failure."
-
-should become
-
-"...so every consumer inherits the *world-clique* warm-up. **This is
-necessary but measured NOT sufficient for a standalone consumer** (job
-7879485: five warm-up variants, all fail; see
-`docs/dev/staged_reshard_primitive.md` §3.5 amendment). Production
-`gw_jax` does run grouped collectives under impl=mpi successfully, so
-the gap is specific to the standalone path and is unexplained."
-
-I have deliberately NOT edited `contract_bands.py` or the primitive doc
-myself: `contract_bands` is the shared GW/BSE entry point and the ladder
-workstream is live against it.
+So the operational rule is simpler than the one this section used to give:
+**run impl=mpi** (`docs/dev/mpi_collectives.md`), and keep the cheap invariant
+anyway. For a congruence `ψ† O ψ` with Hermitian `O` that invariant is free —
+the result is Hermitian for *any* ψ, so a Hermiticity check tests only the
+machinery, and it is the only thing that would have caught the gloo
+corruption. `common.zeta_projection` runs exactly that at every
+production-scale point, plus a parity check against a structurally different
+collective pattern; both are one jitted reduction each with no gather.

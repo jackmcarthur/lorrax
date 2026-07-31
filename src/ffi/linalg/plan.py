@@ -309,7 +309,7 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
     resolution is identical to calling it directly and the same
     ``ValueError`` / ``RuntimeError`` messages come out.
 
-    Hoist the plan out of loops.  Resolution touches ``dlopen`` and
+    Hoist the plan out of loops.  Resolution loads the FFI library and calls
     ``jax.process_count``; the first FFI call additionally builds a BLACS
     / cuSOLVERMp context and compiles an XLA module (1.4–2.7 s measured,
     scorecard L §5), and both are per-plan, amortised from call 2.
