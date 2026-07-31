@@ -76,7 +76,9 @@
 
 #pragma once
 
+#include <atomic>             // once-flags for the deprecated-alias announce
 #include <cctype>
+#include <cstdio>             // the announce fprintf in knob_value
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>   // announce_here's range-for over a braced list;
@@ -202,11 +204,80 @@ inline bool announce_here() {
 // answer into 5000 interleaved lines.  "all" is kept because a genuinely
 // per-rank question (a rank whose shard is ragged) does exist, and answering
 // it must remain possible.
-inline bool log_here(const char* env_name) {
-    const char* v = std::getenv(env_name);
+inline bool log_value_here(const char* v) {
     if (v == nullptr) return false;
     if (str_ieq(v, "all") || std::strcmp(v, "*") == 0) return true;
     return announce_here();
+}
+
+inline bool log_here(const char* env_name) {
+    return log_value_here(std::getenv(env_name));
+}
+
+// ---------------------------------------------------------------------------
+//  Shared thread-knob GRAMMAR (2026-07-31 audit fix P1.13/AW follow-up).
+//  The auto/off/integer full-string parse existed THREE times —
+//  fft_flat_k_ffi.cc:114-134, gemm_batch_ffi.cc:286-306,
+//  blacs_grid.h:476-511 — each with its own strtol block.  Only the PARSE is
+//  unified here; each family keeps its own POLICY (what "auto" resolves to,
+//  what "off" means, the fallback announcement) per the header-note doctrine
+//  above ("Unifying those would fuse three different answers to three
+//  different questions").
+// ---------------------------------------------------------------------------
+struct ThreadKnob {
+    enum Kind {
+        kAuto,   // unset, empty, or "auto" (case-insensitive)
+        kOff,    // "off" (case-insensitive)
+        kInt,    // a full-string integer inside [min_v, max_v] -> `value`
+        kBad,    // anything else — the caller announces its own fallback
+    };
+    Kind kind = kAuto;
+    int value = 0;   // meaningful for kInt only
+};
+
+inline ThreadKnob parse_thread_knob(const char* v, long min_v, long max_v) {
+    ThreadKnob r;
+    if (v == nullptr || *v == '\0' || str_ieq(v, "auto")) return r;  // kAuto
+    if (str_ieq(v, "off")) { r.kind = ThreadKnob::kOff; return r; }
+    char* end = nullptr;
+    const long parsed = std::strtol(v, &end, 10);
+    if (end != v && *end == '\0' && parsed >= min_v && parsed <= max_v) {
+        r.kind = ThreadKnob::kInt;
+        r.value = static_cast<int>(parsed);
+        return r;
+    }
+    r.kind = ThreadKnob::kBad;
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+//  Shared-spelling env knob with deprecated per-family aliases (P1.11).
+//  The flat-k FFT service registers ONE jax.ffi target family on two
+//  platforms, but its C++ knobs were spelled per backend (LORRAX_MKLFFT_LOG
+//  host vs LORRAX_CUFFT_LOG CUDA) so a deck moved between platforms silently
+//  lost its knobs.  Consumers now read the SHARED spelling first and each
+//  legacy spelling second; using a legacy spelling still works but announces
+//  the preferred name once per process (rank-scoped).  `alias_warned` lives
+//  at the call site so the once-flag is per knob, not per header.
+// ---------------------------------------------------------------------------
+inline const char* knob_value(const char* shared_env,
+                              std::initializer_list<const char*> legacy_envs,
+                              std::atomic<bool>& alias_warned) {
+    const char* v = std::getenv(shared_env);
+    if (v != nullptr) return v;
+    for (const char* legacy : legacy_envs) {
+        const char* l = std::getenv(legacy);
+        if (l == nullptr) continue;
+        if (!alias_warned.exchange(true) && announce_here()) {
+            std::fprintf(stderr,
+                         "[lorrax-ffi] %s is a DEPRECATED spelling of %s "
+                         "(one knob per FFI target family, every platform); "
+                         "it is honored this run — please rename it.\n",
+                         legacy, shared_env);
+        }
+        return l;
+    }
+    return nullptr;
 }
 
 }  // namespace lorrax_ffi::mklpin

@@ -39,11 +39,17 @@
 //       into the forward scale by the Python wrapper.
 //
 // In-place: the Python wrappers alias operand 0 to the result
-// (input_output_aliases={0:0}).  When XLA grants the alias the transform
-// runs DFTI_INPLACE in the operand buffer — the terminal form of buffer
-// donation (zero extra tiles); when XLA must keep the operand alive it
-// passes distinct buffers and the handler runs DFTI_NOT_INPLACE.  Both
-// paths are exercised by the unit gate.
+// (input_output_aliases={0:0}), so when the operand is dead XLA passes the
+// SAME buffer as input and output — the terminal form of buffer donation
+// (zero extra big tiles).  The DFTI descriptors themselves are ALWAYS
+// committed DFTI_NOT_INPLACE: every chunk is transformed strided-input ->
+// per-thread compact buffer and then scatter-copied out, and under the
+// granted alias each chunk's k-lines are fully read into the compact buffer
+// before the scatter-copy rewrites exactly those locations (see
+// run_flat_batch).  There is deliberately NO DFTI_INPLACE code path — an
+// earlier draft carried one as a dead, never-selected descriptor axis, and
+// the 2026-07-31 audit (P1.8) removed it rather than keep an untested
+// branch documented as tested.
 //
 // Threading: the handler parallelizes its CHUNK loop with OpenMP (this TU
 // is compiled -fopenmp; the .so already links gomp via mkl_gnu_thread) and
@@ -51,10 +57,11 @@
 // pattern from scalapack/cpp/blacs_grid.h (workstream AW), locally
 // duplicated below WITHOUT the mpi.h/slate deps so this TU stays
 // comms-free; fold into a shared header if the prototype graduates.
-// Team size: LORRAX_MKLFFT_THREADS (auto/off/N, strict grammar per the AW
-// audit fix) — parsed per call (cheap vs the >=10 ms transforms) so the
-// unit gate can sweep it in-process; the measured cap policy is recorded
-// in wk_REL/ffi_fft_proto_notes.md.
+// Team size: LORRAX_FFT_FFI_THREADS (auto/off/N, strict grammar per the AW
+// audit fix; LORRAX_MKLFFT_THREADS is a deprecated alias that announces) —
+// parsed per call (cheap vs the >=10 ms transforms) so the unit gate can
+// sweep it in-process; the measured cap policy is recorded in
+// wk_REL/ffi_fft_proto_notes.md.
 //
 // Envelope-honesty: every extent and stride is taken from the runtime
 // buffer dimensions / attributes; nothing is specialized to a deck.  The
@@ -105,32 +112,42 @@ using C128 = std::complex<double>;
 using MklLocalPin = mklpin::MklThreadScope;
 using mklpin::str_ieq;
 
-// OpenMP team size for the chunk loop.  Strict full-string grammar (the
-// blacs_grid.h AW-audit lesson: a typo must not silently pick a known-bad
-// policy).  "auto" (default) = the ambient omp_get_max_threads() — the
-// production harness exports OMP_NUM_THREADS per rank; whether a smaller
-// cap wins (the owner's 6-way-cap question) is a measurement recorded in
-// the proto notes, and the unit gate sweeps this knob per call.
+// OpenMP team size for the chunk loop.  Strict full-string grammar via the
+// shared parser (mklpin::parse_thread_knob — the blacs_grid.h AW-audit
+// lesson: a typo must not silently pick a known-bad policy; the parse used
+// to exist three times and drifted, 2026-07-31 audit).  "auto" (default) =
+// the ambient omp_get_max_threads() — the production harness exports
+// OMP_NUM_THREADS per rank; whether a smaller cap wins (the owner's
+// 6-way-cap question) is a measurement recorded in the proto notes, and the
+// unit gate sweeps this knob per call.
 static int team_threads() {
     const int maxt = std::max(1, omp_get_max_threads());
-    const char* v = std::getenv("LORRAX_MKLFFT_THREADS");
-    if (!v || !*v || str_ieq(v, "auto")) return maxt;
-    if (str_ieq(v, "off")) return 1;
-    char* end = nullptr;
-    const long parsed = std::strtol(v, &end, 10);
-    if (end != v && *end == '\0' && parsed >= 1 && parsed <= 4096) {
-        return static_cast<int>(parsed);
+    static std::atomic<bool> alias_warned{false};
+    const char* v = mklpin::knob_value(
+        "LORRAX_FFT_FFI_THREADS", {"LORRAX_MKLFFT_THREADS"}, alias_warned);
+    const mklpin::ThreadKnob k = mklpin::parse_thread_knob(v, 1, 4096);
+    switch (k.kind) {
+        case mklpin::ThreadKnob::kOff: return 1;
+        case mklpin::ThreadKnob::kInt: return k.value;
+        case mklpin::ThreadKnob::kBad: {
+            static std::atomic<bool> warned{false};
+            // Rank-scoped (announce_here): pre-audit this printed on every
+            // rank — P lines for one misspelling (P1.13).
+            if (!warned.exchange(true) && mklpin::announce_here()) {
+                std::fprintf(
+                    stderr,
+                    "*** LORRAX_FFT_FFI_THREADS='%s' is not a recognized "
+                    "value (accepted, case-insensitive: 'auto', 'off', or a "
+                    "positive integer <= 4096).  Falling back to 'auto' "
+                    "(%d threads). ***\n",
+                    v, maxt);
+            }
+            return maxt;
+        }
+        case mklpin::ThreadKnob::kAuto:
+        default:
+            return maxt;
     }
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true)) {
-        std::fprintf(
-            stderr,
-            "*** LORRAX_MKLFFT_THREADS='%s' is not a recognized value "
-            "(accepted, case-insensitive: 'auto', 'off', or a positive "
-            "integer <= 4096).  Falling back to 'auto' (%d threads). ***\n",
-            v, maxt);
-    }
-    return maxt;
 }
 
 // Trail elements per chunk.  Default: size the per-thread compact buffer
@@ -138,11 +155,13 @@ static int team_threads() {
 // 1 MiB L2 — the dimension-by-dimension radix passes of the small 3-D FFT
 // then run in cache and the big tile is streamed ONCE per direction
 // (measured: the strided→strided form, whose radix passes all stream the
-// full tile, ran 2.8× slower single-thread).  LORRAX_MKLFFT_CHUNK
-// overrides for experiments; the unit gate sweeps it and exercises ragged
-// chunks explicitly.
+// full tile, ran 2.8× slower single-thread).  LORRAX_FFT_FFI_CHUNK
+// (deprecated alias LORRAX_MKLFFT_CHUNK) overrides for experiments; the
+// unit gate sweeps it and exercises ragged chunks explicitly.
 static int64_t chunk_elems(int64_t nk) {
-    const char* v = std::getenv("LORRAX_MKLFFT_CHUNK");
+    static std::atomic<bool> alias_warned{false};
+    const char* v = mklpin::knob_value(
+        "LORRAX_FFT_FFI_CHUNK", {"LORRAX_MKLFFT_CHUNK"}, alias_warned);
     if (v && *v) {
         char* end = nullptr;
         const long long parsed = std::strtoll(v, &end, 10);
@@ -151,9 +170,10 @@ static int64_t chunk_elems(int64_t nk) {
             return static_cast<int64_t>(parsed);
         }
         static std::atomic<bool> warned{false};
-        if (!warned.exchange(true)) {
+        // Rank-scoped announce (P1.13) — was an every-rank print.
+        if (!warned.exchange(true) && mklpin::announce_here()) {
             std::fprintf(stderr,
-                         "*** LORRAX_MKLFFT_CHUNK='%s' unrecognized — using "
+                         "*** LORRAX_FFT_FFI_CHUNK='%s' unrecognized — using "
                          "the auto policy. ***\n",
                          v);
         }
@@ -163,13 +183,20 @@ static int64_t chunk_elems(int64_t nk) {
 }
 
 // Opt-in debug logging.  Presence-tested as before, but now rank-scoped:
-// rank 0 by default, every rank with LORRAX_MKLFFT_LOG=all.  See the
-// log_here() note in common/cpp/mkl_thread_pin.h for why the default
-// flipped — at P=1000 the all-ranks default multiplied a 5-line answer by
-// the process count, and (at the commit site below) by the OpenMP team size
-// on top of that.
+// rank 0 by default, every rank with =all.  ONE spelling per FFI target
+// family across platforms (P1.11): LORRAX_FFT_FFI_LOG is the shared knob;
+// LORRAX_MKLFFT_LOG / LORRAX_CUFFT_LOG are deprecated aliases honored on
+// BOTH platforms (announced once).  See the log_here() note in
+// common/cpp/mkl_thread_pin.h for why the default flipped — at P=1000 the
+// all-ranks default multiplied a 5-line answer by the process count, and
+// (at the commit site below) by the OpenMP team size on top of that.
 static bool log_enabled() {
-    static const bool on = mklpin::log_here("LORRAX_MKLFFT_LOG");
+    static const bool on = [] {
+        static std::atomic<bool> alias_warned{false};
+        return mklpin::log_value_here(mklpin::knob_value(
+            "LORRAX_FFT_FFI_LOG",
+            {"LORRAX_MKLFFT_LOG", "LORRAX_CUFFT_LOG"}, alias_warned));
+    }();
     return on;
 }
 
@@ -179,17 +206,19 @@ static bool log_enabled() {
 //  A handful of keys per process: (dims, in/out trail strides, transforms
 //  per call, scales, placement).  Handles live for the process.
 // ---------------------------------------------------------------------------
+// Every descriptor is DFTI_NOT_INPLACE by construction (compact-chunk
+// staging; see run_flat_batch) — there is no placement axis here.  A dead
+// `inplace` field claiming a live, unit-gated DFTI_INPLACE path was deleted
+// by the 2026-07-31 audit (P1.8): it was 0 at every construction site.
 struct DescKey {
     MKL_LONG d0, d1, d2;
     MKL_LONG t_in, t_out;  // trail-stride multiplier (elements) in/out
     MKL_LONG n;            // transforms per compute call
     double sf, sb;         // forward / backward scale
-    int inplace;
 
     bool operator<(const DescKey& o) const {
-        return std::tie(d0, d1, d2, t_in, t_out, n, sf, sb, inplace) <
-               std::tie(o.d0, o.d1, o.d2, o.t_in, o.t_out, o.n, o.sf, o.sb,
-                        o.inplace);
+        return std::tie(d0, d1, d2, t_in, t_out, n, sf, sb) <
+               std::tie(o.d0, o.d1, o.d2, o.t_in, o.t_out, o.n, o.sf, o.sb);
     }
 };
 
@@ -215,15 +244,12 @@ static MKL_LONG get_descriptor(const DescKey& k, DFTI_DESCRIPTOR_HANDLE* out) {
     if (!dfti_ok(st)) return st;
     MKL_LONG istr[4] = {0, k.d1 * k.d2 * k.t_in, k.d2 * k.t_in, k.t_in};
     MKL_LONG ostr[4] = {0, k.d1 * k.d2 * k.t_out, k.d2 * k.t_out, k.t_out};
-    st = DftiSetValue(h, DFTI_PLACEMENT,
-                      k.inplace ? DFTI_INPLACE : DFTI_NOT_INPLACE);
+    st = DftiSetValue(h, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
     if (dfti_ok(st)) st = DftiSetValue(h, DFTI_INPUT_STRIDES, istr);
-    if (dfti_ok(st) && !k.inplace)
-        st = DftiSetValue(h, DFTI_OUTPUT_STRIDES, ostr);
+    if (dfti_ok(st)) st = DftiSetValue(h, DFTI_OUTPUT_STRIDES, ostr);
     if (dfti_ok(st)) st = DftiSetValue(h, DFTI_NUMBER_OF_TRANSFORMS, k.n);
     if (dfti_ok(st)) st = DftiSetValue(h, DFTI_INPUT_DISTANCE, (MKL_LONG)1);
-    if (dfti_ok(st) && !k.inplace)
-        st = DftiSetValue(h, DFTI_OUTPUT_DISTANCE, (MKL_LONG)1);
+    if (dfti_ok(st)) st = DftiSetValue(h, DFTI_OUTPUT_DISTANCE, (MKL_LONG)1);
     if (dfti_ok(st)) st = DftiSetValue(h, DFTI_FORWARD_SCALE, k.sf);
     if (dfti_ok(st)) st = DftiSetValue(h, DFTI_BACKWARD_SCALE, k.sb);
     // One MKL thread per handle: the chunk loop is the parallel dimension.
@@ -253,10 +279,10 @@ static MKL_LONG get_descriptor(const DescKey& k, DFTI_DESCRIPTOR_HANDLE* out) {
         if (first) {
             std::fprintf(stderr,
                          "[mklfft] commit dims=(%ld,%ld,%ld) t_in=%ld "
-                         "t_out=%ld n=%ld sf=%.3e sb=%.3e inplace=%d "
+                         "t_out=%ld n=%ld sf=%.3e sb=%.3e "
                          "(first committed by thread %d)\n",
                          (long)k.d0, (long)k.d1, (long)k.d2, (long)k.t_in,
-                         (long)k.t_out, (long)k.n, k.sf, k.sb, k.inplace,
+                         (long)k.t_out, (long)k.n, k.sf, k.sb,
                          omp_get_thread_num());
         }
     }
@@ -265,16 +291,14 @@ static MKL_LONG get_descriptor(const DescKey& k, DFTI_DESCRIPTOR_HANDLE* out) {
     return 0;
 }
 
-static MKL_LONG compute(DFTI_DESCRIPTOR_HANDLE h, bool forward, bool inplace,
+static MKL_LONG compute(DFTI_DESCRIPTOR_HANDLE h, bool forward,
                         const C128* in, C128* out) {
-    // DFTI_NOT_INPLACE never writes the input buffer, so the const_cast is
-    // safe for the XLA (read-only) operand; DFTI_INPLACE is only selected
-    // when XLA granted the output alias (in == out).
+    // Every descriptor is DFTI_NOT_INPLACE, which never writes the input
+    // buffer, so the const_cast is safe for the XLA (read-only) operand.
+    // The XLA-granted alias (in == out at the HANDLER level) is handled by
+    // the chunk engine's read-before-scatter ordering, never by DFTI
+    // placement (P1.8).
     void* pin = const_cast<void*>(static_cast<const void*>(in));
-    if (inplace) {
-        return forward ? DftiComputeForward(h, static_cast<void*>(out))
-                       : DftiComputeBackward(h, static_cast<void*>(out));
-    }
     return forward ? DftiComputeForward(h, pin, static_cast<void*>(out))
                    : DftiComputeBackward(h, pin, static_cast<void*>(out));
 }
@@ -315,9 +339,8 @@ struct ErrSink {
 // scatter-copy rewrites exactly those locations.
 static ffi::Error run_flat_batch(
     MKL_LONG d0, MKL_LONG d1, MKL_LONG d2, int64_t T, bool forward,
-    double scale, bool inplace, const C128* in, C128* out)
+    double scale, const C128* in, C128* out)
 {
-    (void)inplace;  // handled by construction (see above)
     const int64_t nk = (int64_t)d0 * d1 * d2;
     const int64_t C = std::min<int64_t>(chunk_elems(nk), T);
     const int64_t n_chunks = (T + C - 1) / C;
@@ -341,11 +364,11 @@ static ffi::Error run_flat_batch(
             const int64_t t0 = ci * C;
             const MKL_LONG c = static_cast<MKL_LONG>(
                 std::min<int64_t>(C, T - t0));
-            DescKey key{d0, d1, d2, (MKL_LONG)T, c, c, sf, sb, 0};
+            DescKey key{d0, d1, d2, (MKL_LONG)T, c, c, sf, sb};
             DFTI_DESCRIPTOR_HANDLE h = nullptr;
             MKL_LONG st = get_descriptor(key, &h);
             if (!dfti_ok(st)) { err.record(st, "descriptor"); continue; }
-            st = compute(h, forward, /*inplace=*/false, in + t0, buf);
+            st = compute(h, forward, in + t0, buf);
             if (!dfti_ok(st)) { err.record(st, "compute"); continue; }
             for (int64_t k = 0; k < nk; ++k) {
                 std::memcpy(out + k * T + t0, buf + k * c,
@@ -405,7 +428,7 @@ static ffi::Error FlatKDispatch(
         }
     }
     return run_flat_batch((MKL_LONG)nkx, (MKL_LONG)nky, (MKL_LONG)nkz, T,
-                          forward != 0, scale, inplace, in, out);
+                          forward != 0, scale, in, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -473,7 +496,7 @@ static ffi::Error GwConvDispatch(
     C128* vr = ar.buf.data();
     {
         ffi::Error e = run_flat_batch(d0, d1, d2, Tv, /*forward=*/false,
-                                      scale_i, /*inplace=*/false, w_in, vr);
+                                      scale_i, w_in, vr);
         if (!e.success()) return e;
     }
 
@@ -517,12 +540,11 @@ static ffi::Error GwConvDispatch(
                 std::min<int64_t>(C, Tg - t0));
 
             // (a) backward: strided G chunk -> compact buffer (scale_i).
-            DescKey kb{d0, d1, d2, (MKL_LONG)Tg, c, c, 1.0, scale_i, 0};
+            DescKey kb{d0, d1, d2, (MKL_LONG)Tg, c, c, 1.0, scale_i};
             DFTI_DESCRIPTOR_HANDLE hb = nullptr;
             MKL_LONG st = get_descriptor(kb, &hb);
             if (!dfti_ok(st)) { err.record(st, "conv bwd descriptor"); continue; }
-            st = compute(hb, /*forward=*/false, /*inplace=*/false,
-                         g_in + t0, buf);
+            st = compute(hb, /*forward=*/false, g_in + t0, buf);
             if (!dfti_ok(st)) { err.record(st, "conv bwd compute"); continue; }
 
             // (b) multiply by V_R with the (a, b) broadcast: trail index
@@ -554,12 +576,11 @@ static ffi::Error GwConvDispatch(
             // (c) forward: compact buffer -> strided S chunk (scale_f, with
             //     the caller's multiplier folded in).  Under the G->S alias
             //     this rewrites exactly the trail range read in (a) — safe.
-            DescKey kf{d0, d1, d2, c, (MKL_LONG)Tg, c, scale_f, 1.0, 0};
+            DescKey kf{d0, d1, d2, c, (MKL_LONG)Tg, c, scale_f, 1.0};
             DFTI_DESCRIPTOR_HANDLE hf = nullptr;
             st = get_descriptor(kf, &hf);
             if (!dfti_ok(st)) { err.record(st, "conv fwd descriptor"); continue; }
-            st = compute(hf, /*forward=*/true, /*inplace=*/false,
-                         buf, s_out + t0);
+            st = compute(hf, /*forward=*/true, buf, s_out + t0);
             if (!dfti_ok(st)) { err.record(st, "conv fwd compute"); continue; }
         }
     }

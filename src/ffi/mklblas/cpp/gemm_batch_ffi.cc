@@ -92,6 +92,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -279,30 +280,39 @@ static void announce_entry_once(ffi::DataType dt) {
 using MklLocalPin = mklpin::MklThreadScope;
 using mklpin::str_ieq;
 
-// MKL team size for the batch call.  Strict full-string grammar (AW audit
-// lesson: a typo must not silently pick a known-bad policy).  "auto"
-// (default) = ambient omp_get_max_threads() — the production harness
-// exports OMP_NUM_THREADS=28 per rank under taskset.
+// MKL team size for the batch call.  Strict full-string grammar via the
+// shared parser (mklpin::parse_thread_knob; the parse used to exist three
+// times — here, fft_flat_k_ffi.cc, blacs_grid.h — and had drifted; only the
+// PARSE is shared, the "auto" POLICY stays this family's: ambient
+// omp_get_max_threads() — the production harness exports OMP_NUM_THREADS=28
+// per rank under taskset.  AW audit lesson: a typo must not silently pick a
+// known-bad policy.
 static int team_threads() {
     const int maxt = std::max(1, omp_get_max_threads());
     const char* v = std::getenv("LORRAX_MKLBLAS_THREADS");
-    if (!v || !*v || str_ieq(v, "auto")) return maxt;
-    if (str_ieq(v, "off")) return 1;
-    char* end = nullptr;
-    const long parsed = std::strtol(v, &end, 10);
-    if (end != v && *end == '\0' && parsed >= 1 && parsed <= 4096) {
-        return static_cast<int>(parsed);
+    const mklpin::ThreadKnob k = mklpin::parse_thread_knob(v, 1, 4096);
+    switch (k.kind) {
+        case mklpin::ThreadKnob::kOff: return 1;
+        case mklpin::ThreadKnob::kInt: return k.value;
+        case mklpin::ThreadKnob::kBad: {
+            static std::atomic<bool> warned{false};
+            // Rank-scoped (announce_here): pre-audit this printed on every
+            // rank — P lines for one misspelling (P1.13).
+            if (!warned.exchange(true) && announce_here()) {
+                std::fprintf(
+                    stderr,
+                    "*** LORRAX_MKLBLAS_THREADS='%s' is not a recognized "
+                    "value (accepted, case-insensitive: 'auto', 'off', or a "
+                    "positive integer <= 4096).  Falling back to 'auto' "
+                    "(%d threads). ***\n",
+                    v, maxt);
+            }
+            return maxt;
+        }
+        case mklpin::ThreadKnob::kAuto:
+        default:
+            return maxt;
     }
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true)) {
-        std::fprintf(
-            stderr,
-            "*** LORRAX_MKLBLAS_THREADS='%s' is not a recognized value "
-            "(accepted, case-insensitive: 'auto', 'off', or a positive "
-            "integer <= 4096).  Falling back to 'auto' (%d threads). ***\n",
-            v, maxt);
-    }
-    return maxt;
 }
 
 static bool log_enabled() {
@@ -346,6 +356,30 @@ static ffi::Error GemmBatchDispatch(
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
     if (ba == 0 || m == 0 || n == 0) return ffi::Error::Success();
+
+    // blas_int narrowing refusal (P1.10): under LP64 (the only configured
+    // ABI here) blas_int is 32-bit, and the casts below would silently
+    // truncate a >2^31-1 extent into a wrong-answer GEMM.  Refuse, naming
+    // the offending extent.  (i*m*k pointer arithmetic stays int64 and is
+    // unaffected; only the extents handed to CBLAS must fit.)
+    {
+        constexpr int64_t blas_max =
+            static_cast<int64_t>(std::numeric_limits<blas_int>::max());
+        const struct { const char* name; int64_t v; } extents[] = {
+            {"BA", ba}, {"M", m}, {"N", n}, {"K", k}};
+        for (const auto& e : extents) {
+            if (e.v > blas_max) {
+                std::ostringstream os;
+                os << "mklblas.gemm_batch: extent " << e.name << "=" << e.v
+                   << " exceeds this build's BLAS integer (LP64 blas_int max "
+                   << blas_max << ") — the CBLAS call would silently "
+                   << "truncate it.  Shard the batch/band window smaller, or "
+                   << "unset LORRAX_BANDS_GEMM_FFI for this call path (the "
+                   << "XLA lowering has no 32-bit extent limit).";
+                return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+            }
+        }
+    }
 
     const int nthr = team_threads();
     // Capability answer + announcement BEFORE any work, so the log records

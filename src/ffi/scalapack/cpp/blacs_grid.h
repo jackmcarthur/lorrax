@@ -481,30 +481,38 @@ inline int scalapack_mkl_threads() {
             const int cur = get_max();
             return cur > 4 ? 4 : 0;            // cap only if it would shrink
         };
+        // Strict full-string grammar via the SHARED parser
+        // (mklpin::parse_thread_knob — the parse used to exist three times,
+        // here + mklblas + mklfft, and had drifted; 2026-07-31 audit).
+        // Only the parse is shared: atoi() previously mapped any typo to
+        // 0 == "off" (the measured-24x-slower policy) and silently accepted
+        // trailing junk ("4x" -> 4).  min 0: "0" == "off" (documented).
         const char* v = std::getenv("LORRAX_SCALAPACK_MKL_THREADS");
-        if (!v || !*v || str_ieq(v, "auto")) return auto_policy();
-        if (str_ieq(v, "off")) return 0;
-        // Strict full-string integer parse: atoi() previously mapped any
-        // typo to 0 == "off" (the measured-24x-slower policy) and
-        // silently accepted trailing junk ("4x" -> 4).
-        char* end = nullptr;
-        const long parsed = std::strtol(v, &end, 10);
-        if (end != v && *end == '\0' && parsed >= 0 && parsed <= 4096) {
-            return static_cast<int>(parsed);   // "0" == "off" (documented)
+        const mklpin::ThreadKnob k = mklpin::parse_thread_knob(v, 0, 4096);
+        switch (k.kind) {
+            case mklpin::ThreadKnob::kOff: return 0;
+            case mklpin::ThreadKnob::kInt: return k.value;
+            case mklpin::ThreadKnob::kBad: break;   // announce below
+            case mklpin::ThreadKnob::kAuto:
+            default: return auto_policy();
         }
         // Unrecognized value: announce loudly ONCE (this init runs once
-        // per process) and take the safe direction — AUTO, never "off"
-        // (see the grammar note above; audit fix/zq 2026-07-28).
-        std::fprintf(
-            stderr,
-            "*** LORRAX_SCALAPACK_MKL_THREADS='%s' is not a recognized "
-            "value (accepted, case-insensitive: 'auto', 'off', '0', or a "
-            "positive integer <= 4096).  Falling back to 'auto' (cap the "
-            "handler-local MKL team at 4) — NOT to 'off', which would "
-            "silently inherit the global MKL_NUM_THREADS (measured 24x "
-            "slower pzheevd at the 12x12 production grid, workstream AW). "
-            "***\n",
-            v);
+        // per process; rank-scoped since the 2026-07-31 announce-hygiene
+        // pass — one line per JOB, not per rank) and take the safe
+        // direction — AUTO, never "off" (see the grammar note above;
+        // audit fix/zq 2026-07-28).
+        if (mklpin::announce_here()) {
+            std::fprintf(
+                stderr,
+                "*** LORRAX_SCALAPACK_MKL_THREADS='%s' is not a recognized "
+                "value (accepted, case-insensitive: 'auto', 'off', '0', or a "
+                "positive integer <= 4096).  Falling back to 'auto' (cap the "
+                "handler-local MKL team at 4) — NOT to 'off', which would "
+                "silently inherit the global MKL_NUM_THREADS (measured 24x "
+                "slower pzheevd at the 12x12 production grid, workstream AW). "
+                "***\n",
+                v);
+        }
         return auto_policy();
     }();
     return resolved;

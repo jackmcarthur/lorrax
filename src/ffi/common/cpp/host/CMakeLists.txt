@@ -376,24 +376,67 @@ endif()
 #  handler not built at all", announced right here and refused loudly at
 #  runtime — never "built, but silently slow".
 # ----------------------------------------------------------------------------
+#  HEADER *AND* LIBRARY (audit P1.7, 2026-07-31).  The gate used to key on
+#  find_path(cblas.h) alone, but gemm_batch_ffi.cc's plain-loop fallback
+#  calls cblas_dgemm/cblas_zgemm as LINK-TIME symbols (only the *_batch
+#  entries are dlsym'd): on a non-MKL site with a header-only CBLAS prefix
+#  the .so built with undefined symbols and died at the FIRST GEMM call
+#  instead of refusing at build/configure time.  On the MKL path the link
+#  line already carries libmkl_intel_lp64 (which defines cblas_?gemm); on
+#  the cblas.h path a real library must be found — or an explicit
+#  -DLORRAX_SCALAPACK_LIBRARIES link line may supply it (Cray LibSci defines
+#  CBLAS inside libsci) — otherwise the handler is skipped, announced.  The
+#  -Wl,--no-undefined at the link step below is the backstop that makes any
+#  remaining gap a BUILD failure, never a first-call crash.
 set(_gemm_cblas_header "")
 set(_gemm_cblas_incdir "")
+set(_gemm_cblas_lib    "")
 if(_mkl_incdir AND EXISTS "${_mkl_incdir}/mkl_cblas.h")
     set(_gemm_cblas_header "mkl_cblas.h")
     set(_gemm_cblas_incdir "${_mkl_incdir}")
+    # cblas_?gemm live in libmkl_intel_lp64, already on _host_math_link.
+    set(_mklblas_on 1)
 else()
     find_path(LORRAX_CBLAS_INCLUDE_DIR cblas.h
         HINTS "$ENV{CRAY_LIBSCI_PREFIX_DIR}/include"
               "$ENV{LORRAX_CBLAS_DIR}/include"
               "$ENV{LORRAX_CBLAS_DIR}")
     if(LORRAX_CBLAS_INCLUDE_DIR)
-        set(_gemm_cblas_header "cblas.h")
-        set(_gemm_cblas_incdir "${LORRAX_CBLAS_INCLUDE_DIR}")
+        find_library(LORRAX_CBLAS_LIBRARY
+            NAMES cblas openblas blis sci_gnu sci_cray
+            HINTS "$ENV{CRAY_LIBSCI_PREFIX_DIR}/lib"
+                  "$ENV{LORRAX_CBLAS_DIR}/lib64"
+                  "$ENV{LORRAX_CBLAS_DIR}/lib"
+                  "$ENV{LORRAX_CBLAS_DIR}")
+        if(LORRAX_CBLAS_LIBRARY)
+            set(_gemm_cblas_header "cblas.h")
+            set(_gemm_cblas_incdir "${LORRAX_CBLAS_INCLUDE_DIR}")
+            set(_gemm_cblas_lib    "${LORRAX_CBLAS_LIBRARY}")
+            set(_mklblas_on 1)
+        elseif(LORRAX_SCALAPACK_LIBRARIES)
+            # LibSci-style: the explicit ScaLAPACK link line is trusted to
+            # define cblas_?gemm (libsci does); -Wl,--no-undefined verifies.
+            set(_gemm_cblas_header "cblas.h")
+            set(_gemm_cblas_incdir "${LORRAX_CBLAS_INCLUDE_DIR}")
+            set(_mklblas_on 1)
+            message(STATUS
+                "mklblas: cblas.h at ${LORRAX_CBLAS_INCLUDE_DIR}; no "
+                "standalone CBLAS library found — relying on the explicit "
+                "LORRAX_SCALAPACK_LIBRARIES link line to define "
+                "cblas_?gemm (the -Wl,--no-undefined link will fail loudly "
+                "if it does not).")
+        else()
+            message(STATUS
+                "mklblas: cblas.h found at ${LORRAX_CBLAS_INCLUDE_DIR} but "
+                "NO CBLAS library (searched cblas/openblas/blis/sci_* under "
+                "CRAY_LIBSCI_PREFIX_DIR / LORRAX_CBLAS_DIR) — GEMM handler "
+                "skipped rather than built with undefined cblas_?gemm "
+                "(LORRAX_BANDS_GEMM_FFI=1 will refuse at runtime; the auto "
+                "default stays on the XLA lowering).")
+        endif()
     endif()
 endif()
-if(_gemm_cblas_header)
-    set(_mklblas_on 1)
-else()
+if(NOT _mklblas_on AND NOT _gemm_cblas_header)
     message(STATUS
         "mklblas: no CBLAS header found (mkl_cblas.h under the "
         "MKL prefix, or cblas.h — set LORRAX_CBLAS_DIR / "
@@ -530,6 +573,13 @@ if(_mklblas_on)
         ../../../mklblas/cpp/gemm_batch_ffi.cc
         PROPERTIES COMPILE_OPTIONS "-fopenmp"
                    COMPILE_DEFINITIONS "${_gemm_defs}")
+    # The CBLAS library resolved above (cblas.h path only; the MKL path's
+    # cblas_?gemm ride libmkl_intel_lp64, already on the math link line).
+    if(_gemm_cblas_lib)
+        list(APPEND _host_math_link "${_gemm_cblas_lib}")
+        get_filename_component(_gemm_cblas_libdir "${_gemm_cblas_lib}" DIRECTORY)
+        list(APPEND _host_math_rpaths "${_gemm_cblas_libdir}")
+    endif()
     # gomp for the TU's omp_get_max_threads(); harmless duplicate when the
     # MKL branch already appended it via mkl_gnu_thread.
     list(APPEND _host_math_link "-lgomp")
@@ -599,6 +649,15 @@ target_link_libraries(lorrax_ffi_host PRIVATE ${_host_link_libs}
 
 target_compile_options(lorrax_ffi_host PRIVATE -Wall -Wextra
     -Wno-unused-parameter -Wno-unused-variable)
+
+# Announce-or-refuse at LINK time (audit P1.7): every link-time symbol the
+# handlers reference must resolve when the .so is built — an undefined
+# cblas_?gemm (or anything else) fails HERE, loudly, instead of building a
+# library that loads cleanly and dies at the first call.  Runtime-optional
+# entries (cblas_?gemm_batch, MKL_Set_Num_Threads_Local, the CUDA driver
+# API) are dlsym'd and deliberately NOT link references, so this flag does
+# not constrain them.
+target_link_options(lorrax_ffi_host PRIVATE "-Wl,--no-undefined")
 
 message(STATUS "lorrax_ffi_host will build sources:")
 foreach(_s ${LORRAX_FFI_HOST_SOURCES})
