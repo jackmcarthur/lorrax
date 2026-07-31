@@ -97,14 +97,30 @@ def _load_wfn_k_fftbox_ibz(wfn: WFNReader, n_val: int) -> jnp.ndarray:
     :func:`common.wfn_transforms.to_box`.  P5 will switch the caller to
     pass a ``WfnLoader`` directly so this transient construction goes
     away.
+
+    PROCESS-LOCAL by construction.  ρ here is a pure function of the WFN,
+    identical on every rank, so it is computed redundantly per rank rather
+    than as a global object — the same contract
+    :func:`common.wfn_transforms.load_kpoint_fftbox_local` uses.  The
+    previous body paired a GLOBAL band-sharded ``loader.load`` with a 1x1
+    mesh built from ``jax.devices()[:1]``; ``jax.devices()`` is the global
+    device list, so that mesh is process 0's device **on every rank**, and
+    every rank but 0 SIGSEGVs the moment the boxed FFT executes on it.
+    Measured at N_mu=10015: rc=139 at P=4 AND at P=64, faulting in
+    ``psp/get_DFT_mtxels.py:196``'s ``jnp.fft.ifftn`` (wk_REL jobs 7879470 /
+    7879492 / 7879495, all frames identical).  Rank 0 sailed through, which
+    is why the logs showed exactly one rank's worth of progress banners.
     """
     from file_io.wfn_loader import WfnLoader
     from common.wfn_transforms import to_box
 
+    # single_device_mesh IS the process-local mesh: wfn_transforms.
+    # process_local_mesh is an alias for this exact object (one per
+    # process, owned by common.collectives).  Import it from its owner.
     from common.collectives import single_device_mesh
 
     with WfnLoader(wfn._filename) as loader:
-        psi = loader.load(bands=(0, n_val), k="ibz")
+        psi = loader.load_process_local(bands=(0, n_val), k="ibz")
         return to_box(psi, loader.box_index(k="ibz"), loader.fft_grid,
                       mesh=single_device_mesh())
 
@@ -241,6 +257,11 @@ def rho_from_band_range(
         g_index = loader.box_index(k="ibz")
         n_k = int(g_index.shape[0])
         kw = np.asarray(wfn.kweights, dtype=np.float64)[:n_k]
+        # PROCESS-LOCAL, same reasoning (and same measured SIGSEGV) as
+        # ``_load_wfn_k_fftbox_ibz`` above: this weight is a pure function of
+        # the WFN and must not be built as a global band-sharded object on a
+        # mesh pinned to ``jax.devices()[0]``.  single_device_mesh() IS the
+        # process-local mesh (process_local_mesh is its alias).
         mesh = single_device_mesh()
         # r-space buffer is (n_k, nb, nspinor, Nr) complex128 → size the
         # band chunk against the budget (≥1 band, ≤ the whole range).
@@ -256,8 +277,11 @@ def rho_from_band_range(
                   f"chunk={nb_chunk} bands")
         for lo in range(b_lo, b_hi, nb_chunk):
             hi = min(lo + nb_chunk, b_hi)
-            psi = loader.load(bands=(lo, hi), k="ibz")
+            psi = loader.load_process_local(bands=(lo, hi), k="ibz")
             psi_r = to_rbox(psi, g_index, fft_grid, mesh=mesh, norm="ortho")
+            # ``load_process_local`` returns exactly ``hi - lo`` bands (no
+            # mesh-divisibility padding — nothing about it is global), so this
+            # slice is a no-op there and still drops ``load``'s pad rows at P=1.
             psi_r = psi_r[:, :hi - lo] * scale     # drop band-axis pad rows
             w = w + jnp.sum(
                 (psi_r.real ** 2 + psi_r.imag ** 2) * kw_j, axis=(0, 1, 2))

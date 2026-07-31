@@ -188,6 +188,25 @@ def solve_bse_sharded(
     else:
         _W_local_ifftn = None
 
+    # ── W_R = ifft_q(W_q) at a REAL top-level dispatch boundary, W_q DONATED ──
+    # This used to run INSIDE ``_full_run`` (and inside the Davidson block).
+    # There it can never free W_q: W_q is a jit PARAMETER, so its buffer is
+    # owned by the caller for the whole call and XLA has no same-shape OUTPUT
+    # to alias it to — the in-code note at the old ``_full_run`` decorator
+    # records exactly that ("donation was always declined").  The result was
+    # BOTH W_q and W_R resident for the entire Lanczos: 2 x (μ_pad/p_x) x
+    # (ν_pad/p_y) x nk x 16 bytes per rank (2 x 404 MB at μ=10015 / P=64;
+    # ∝ μ²/P, so 2 x 4.1 GB at μ=32k).  Hoisting the transform into its own
+    # donated jit lets XLA alias W_R onto W_q's buffer and lets the caller
+    # drop the Python reference, so only ONE copy survives into the solve.
+    # Value-identical: same helper, same axes, same norm, same operand.
+    if include_W:
+        _W_ifft_donated = jax.jit(_W_local_ifftn, donate_argnums=(0,))
+        W_R = _W_ifft_donated(data["W_q"])
+        data["W_q"] = None          # release the caller-side reference
+    else:
+        W_R = data["W_q"]
+
     # ── Davidson path: doesn't fit inside a single jit wrap (Python-side
     # iteration + on-the-fly Ritz solve), so build matvec + W_R outside and
     # delegate to the shape-agnostic ``solvers.davidson.davidson``.  Returns
@@ -200,9 +219,9 @@ def solve_bse_sharded(
         psi_c_X = data["psi_c_X"]; psi_c_Y = data["psi_c_Y"]
         psi_v_X = data["psi_v_X"]; psi_v_Y = data["psi_v_Y"]
         eps_c   = data["eps_c"];   eps_v   = data["eps_v"]
-        V_q0    = data["V_q0"];    W_q     = data["W_q"]
+        V_q0    = data["V_q0"]
         M_X     = data["M_X"];     M_Y     = data["M_Y"]  # hoisted V-term pair-amps (P3)
-        W_R = _W_local_ifftn(W_q) if include_W else W_q
+        # W_R already built above (donated top-level ifft).
 
         def apply_H(V):    # V: (m, nc_pad, nv_pad, nk) sharded P(None,"x","y",None)
             V = jax.lax.with_sharding_constraint(V, sh.X)
@@ -254,15 +273,13 @@ def solve_bse_sharded(
             sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y,
         ),
         out_shardings=(rep_eig, rep_eig, rep_eig),
-        # NB: W_q (arg 6) is NOT donated — W_R = ifft(W_q) is a fresh buffer with no
-        # aliasable same-shape output, so the donation was always declined (cosmetic,
-        # no copy) and only emitted a "donated buffers not usable" warning (audit P5).
+        # NB: arg 6 is now W_R (already ifft'd, DONATED at its own top-level
+        # boundary above) rather than W_q.  Donating it HERE is still declined
+        # — there is no aliasable same-shape output of a Lanczos solve — which
+        # is the original audit-P5 observation; the fix was to move the
+        # transform out, not to donate the eigensolve's inputs.
     )
-    def _full_run(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_q, V_q0, M_X, M_Y):
-        if include_W:
-            W_R = _W_local_ifftn(W_q)
-        else:
-            W_R = W_q
+    def _full_run(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y):
         if bs == 1:
             # Single-vector matvec — accept (n_flat,) and reshape to (1, c, v, k).
             def matvec(v_flat):
@@ -335,7 +352,7 @@ def solve_bse_sharded(
         data["psi_c_X"], data["psi_c_Y"],
         data["psi_v_X"], data["psi_v_Y"],
         data["eps_c"], data["eps_v"],
-        data["W_q"], data["V_q0"],
+        W_R, data["V_q0"],
         data["M_X"], data["M_Y"],
     )
     eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)

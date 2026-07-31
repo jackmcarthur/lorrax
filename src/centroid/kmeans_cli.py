@@ -573,12 +573,21 @@ def main():
         f"intended channels: "
         f"{'γ̃^0 (charge) ISDF' if args.density_mode == 'scalar' else 'γ̃^{1,2,3} (current) ISDF'}"
     )
-    np.savetxt(
-        out_file, centroids_snapped,
-        header=header,
-        fmt="%.6f", delimiter=" ", comments="# ",
-    )
-    print(f"Saved centroids to {out_file}")
+    # ONE writer.  Every rank used to reach this savetxt on the same shared
+    # path.  It survived P=16 only because all ranks write identical bytes —
+    # which is precisely the latent form of the bug that DID bite at P=64 in
+    # ``bse_io.write_eigenvectors_stream`` (64 concurrent h5py creators,
+    # rc=1 plus a structurally valid file; wk_REL S4.8).  ``centroids_snapped``
+    # is a pure function of the WFN + seed + candidate list and is identical on
+    # every rank, so rank 0's file is the file any rank would have written.
+    # No collective below this point, so gating cannot deadlock.
+    if jax.process_index() == 0:
+        np.savetxt(
+            out_file, centroids_snapped,
+            header=header,
+            fmt="%.6f", delimiter=" ", comments="# ",
+        )
+        print(f"Saved centroids to {out_file}")
 
     if process_rank() == 0:
         timing.report(title="--- kmeans_cli timing (s) ---")

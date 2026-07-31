@@ -239,16 +239,29 @@ def prune_candidates_by_pivoted_cholesky(
     # counts can land on awkward M (special-position orbits don't all have
     # size n_sym), so check up-front and give a hint instead of letting
     # ``make_sharded_pivoted_cholesky_select`` fail with a cryptic message.
+    # ── M need not divide the mesh: ZERO-PAD + ACTIVE-MASK ──────────────────
+    # The select kernel is a shard_map and needs M % n_dev == 0.  M is an
+    # ORBIT-UNFOLD count (special-position orbits are not all of size n_sym),
+    # so it is not controllable from the CLI: at the rung-5 point
+    # M = 13872 = 2^4*3*17^2, which divides 1,2,4,8,16 but NOT 32 or 64 — the
+    # old refusal here is exactly what blocked P=64 centroid generation
+    # (measured, job 7879533).
+    # Instead of refusing, pad G to M_pad with ZERO rows and columns and start
+    # those rows INACTIVE.  A zero row/col contributes nothing to trG, nothing
+    # to d0max, and nothing to the Schur update, and an inactive row can never
+    # be picked, so every reported quantity (trG, trR/trG, d_taken, rank, piv)
+    # is identical to the unpadded problem.  This is the same zero-pad + mask
+    # contract ``runtime.padding.padded_mu_extent`` applies to mu everywhere
+    # else in LORRAX.
     n_dev = dist.n_shards(mesh, select_axis)
-    if M % n_dev != 0:
-        raise ValueError(
-            f"M={M} (number of candidates) must be divisible by the "
-            f"product of mesh axes 'x' and 'y' (= {n_dev}). The sharded "
-            f"pivoted-Cholesky select kernel splits M evenly across "
-            f"shards. Either drop the last {M % n_dev} candidate(s) before "
-            f"calling this function, run on a mesh size that divides M, "
-            f"or pass ``--no-shard`` to use a single-device 1×1 mesh."
-        )
+    # NOTE the pad already exists: ``build_gram_q0_via_loadwfns`` builds through
+    # ``Meta.from_system(n_rmu=M)``, whose ``n_rmu_padded =
+    # padded_mu_extent(M, world_size) = round_up(M, n_dev)`` (common/meta.py
+    # :117), and ψ pad rows are zero, so G comes back (M_pad, M_pad) with the
+    # trailing rows/cols EXACTLY ZERO.  The select never knew that, so it
+    # refused instead.  M_pad is read off G below rather than recomputed here —
+    # recomputing it was a real bug (job 7879553: I padded a second time on top
+    # of the builder's pad and produced 13904, which 64 does not divide).
 
     if verbose:
         window_tag = (f"left={band_range_left}, right={band_range_right}, "
@@ -272,11 +285,27 @@ def prune_candidates_by_pivoted_cholesky(
             G, NamedSharding(mesh, PartitionSpec(select_axis, None)),
         )
         G.block_until_ready()
+    # M_pad is whatever the builder produced (round_up(M, n_dev)); the trailing
+    # n_pad rows/cols are zero-padding, NOT candidates.
+    M_pad = int(G.shape[0])
+    n_pad = M_pad - M
+    if M_pad % n_dev != 0:
+        raise ValueError(
+            f"Gram came back with M_pad={M_pad}, which the mesh product "
+            f"{n_dev} does not divide (logical M={M}). The sharded select "
+            f"needs an even row split; expected round_up(M, {n_dev})="
+            f"{-(-M // n_dev) * n_dev}.")
 
     if verbose:
-        diag = jnp.real(jnp.diag(G))
-        print(f"[pivoted_cholesky] G built, shape={G.shape}, "
+        # Report the LOGICAL diagonal (pads are zero and would drag the min to
+        # 0.0, changing a diagnostic the gates compare across P).
+        diag = jnp.real(jnp.diag(G))[:M]
+        print(f"[pivoted_cholesky] G built, shape=({M}, {M}), "
               f"diag range [{float(diag.min()):.3e}, {float(diag.max()):.3e}]")
+        if n_pad:
+            print(f"[pivoted_cholesky] zero-pad for the sharded select: "
+                  f"M {M} -> {M_pad} (+{n_pad} inactive rows) so M_pad % "
+                  f"{n_dev} == 0; pads carry d=0 and start INACTIVE")
 
     # Run select on the row-sharded Gram. Orbit-aware mode passes orbit_id
     # row-sharded the same way as G; the body marks the whole orbit
@@ -284,10 +313,21 @@ def prune_candidates_by_pivoted_cholesky(
     # via psum-with-mask, same idiom as the L[p, :] broadcast).
     with timing.section("prune.select"):
         select_step = make_sharded_pivoted_cholesky_select(
-            mesh, M, n_keep, mesh_axis=select_axis,
+            mesh, M_pad, n_keep, mesh_axis=select_axis,
         )
+        # Pad mask: real candidates active, pads inactive.  None when n_pad==0
+        # so the P=1 / already-divisible paths take the byte-identical old
+        # code path (no extra operand, no extra shard_map input).
+        active_init = None
+        if n_pad:
+            _act = np.ones((M_pad,), dtype=bool)
+            _act[M:] = False
+            active_init = device_put_process_local(
+                _act, NamedSharding(mesh, PartitionSpec(select_axis)),
+            )
         if orbit_id is None:
-            piv, L, rank, d_final, d_taken, trR_over_trG = select_step(G)
+            piv, L, rank, d_final, d_taken, trR_over_trG = select_step(
+                G, None, active_init)
         else:
             # Process-local placement, NOT plain ``jax.device_put``: the
             # latter fires JAX's hidden ``assert_equal`` all-gather
@@ -295,11 +335,18 @@ def prune_candidates_by_pivoted_cholesky(
             # ``orbit_id`` is a pure function of the candidate list +
             # symmetry ops, identical on every rank by construction;
             # ``LORRAX_CHECK_REPLICA=1`` restores the assertion.
+            _oid = np.asarray(orbit_id, dtype=np.int32)
+            if n_pad:
+                # Pads get an orbit id no real candidate can hold, so the
+                # orbit-kill mask (orbit_id == orbit_id_of_pivot) can never
+                # reach them — belt and braces on top of the active mask.
+                _oid = np.concatenate(
+                    [_oid, np.full((n_pad,), -1, dtype=np.int32)])
             orbit_id_jax = device_put_process_local(
-                np.asarray(orbit_id, dtype=np.int32),
-                NamedSharding(mesh, PartitionSpec(select_axis)),
+                _oid, NamedSharding(mesh, PartitionSpec(select_axis)),
             )
-            piv, L, rank, d_final, d_taken, trR_over_trG = select_step(G, orbit_id_jax)
+            piv, L, rank, d_final, d_taken, trR_over_trG = select_step(
+                G, orbit_id_jax, active_init)
         piv.block_until_ready()
     del L
 
@@ -314,6 +361,17 @@ def prune_candidates_by_pivoted_cholesky(
               f"last={float(trR_over_trG[n_keep]):.3e}")
 
     piv_np = np.asarray(piv)
+    if n_pad:
+        # HARD GUARD, not a comment: if the active mask ever failed, a pad
+        # index would silently index past the candidate list (or wrap) and the
+        # centroid set would be quietly wrong — the rc=0-with-garbage class.
+        bad = piv_np[(piv_np >= M) | (piv_np < 0)]
+        if bad.size:
+            raise RuntimeError(
+                f"pivoted-Cholesky picked {bad.size} PAD row(s) {bad[:8]} "
+                f"(valid candidate range is [0,{M}); M_pad={M_pad}). The "
+                f"active-mask that makes pad rows unpickable did not hold — "
+                f"refusing to emit a centroid set built from padding.")
     if orbit_id is None:
         keep_idx = np.asarray(cand_idx)[piv_np]
     else:
@@ -325,7 +383,9 @@ def prune_candidates_by_pivoted_cholesky(
         if verbose:
             print(f"[pivoted_cholesky] orbit-aware: {len(piv_np)} orbits picked "
                   f"→ {len(keep_idx)} unfolded centroids (orbit-closed)")
-    d_final_np = np.asarray(_mh.process_allgather(d_final, tiled=True))
+    d_final_np = np.asarray(_mh.process_allgather(d_final, tiled=True))[:M]
+    if n_pad:
+        G = G[:M, :M]        # hand back the LOGICAL Gram, not the padded one
     return keep_idx, int(rank), G, d_final_np, np.asarray(d_taken), np.asarray(trR_over_trG)
 
 
@@ -377,15 +437,18 @@ def make_sharded_pivoted_cholesky_select(
     row_shard_1d = PartitionSpec(mesh_axis)
     rep = PartitionSpec()
 
-    # Two input layouts: G alone (no orbit) or (G, orbit_id) with orbit_id
-    # row-sharded the same way as G's row dim.
+    # Input layouts: G alone, or with ``orbit_id`` and/or ``active_init``, each
+    # row-sharded the same way as G's row dim.  ``active_init`` is the
+    # zero-pad mask (see ``prune_candidates_by_pivoted_cholesky``): rows marked
+    # False are never eligible to be picked, which is what lets the caller pad
+    # M up to a multiple of the mesh size instead of being refused.
     in_specs_no_orbit = (row_shard,)
     in_specs_orbit    = (row_shard, row_shard_1d)
     out_specs = (rep, row_shard, rep, row_shard_1d, rep, rep)
 
     @jax.jit
-    def step(G, orbit_id=None):
-        def body_local(G_slab, orbit_id_slab=None):
+    def step(G, orbit_id=None, active_init=None):
+        def body_local(G_slab, orbit_id_slab=None, active_slab=None):
             real_dtype = G_slab.real.dtype
             eps = jnp.finfo(real_dtype).eps
             minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
@@ -400,11 +463,20 @@ def make_sharded_pivoted_cholesky_select(
             trG = lax.psum(jnp.sum(local_diag), axis_name=mesh_axis)
             col_ids_k = jnp.arange(k_keep)
 
+            # Pad rows enter with d = 0 (their G row/col is exactly zero), so
+            # they contribute nothing to trG, to d0max, or to the Schur update.
+            # Starting them INACTIVE is what makes them unpickable: relying on
+            # the tie-break (pads sit at the highest global indices and the
+            # pivot rule takes the LOWEST index among ties) would work today but
+            # is an accident, not a contract.
+            active0 = (jnp.ones((M_slab,), dtype=bool) if active_slab is None
+                       else active_slab.astype(bool))
+
             init = (
                 local_diag,                                              # d_slab
                 jnp.zeros((M_slab, k_keep), dtype=G_slab.dtype),         # L_slab
                 -jnp.ones((k_keep,), dtype=jnp.int32),                   # piv
-                jnp.ones((M_slab,), dtype=bool),                         # active
+                active0,                                                 # active
                 jnp.zeros((k_keep,), dtype=real_dtype),                  # d_taken
                 jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(1.0),
             )
@@ -481,18 +553,29 @@ def make_sharded_pivoted_cholesky_select(
             d_taken = jnp.where(jnp.arange(k_keep) < rank, d_taken, 0.0)
             return piv_out, L_out, rank, d_final, d_taken, trR_over_trG
 
-        if orbit_id is None:
-            return shard_map(
-                lambda g: body_local(g, None), mesh=mesh,
-                in_specs=in_specs_no_orbit, out_specs=out_specs,
-                check_rep=False,
-            )(G)
-        else:
-            return shard_map(
-                body_local, mesh=mesh,
-                in_specs=in_specs_orbit, out_specs=out_specs,
-                check_rep=False,
-            )(G, orbit_id)
+        specs = [row_shard]
+        args = [G]
+        if orbit_id is not None:
+            specs.append(row_shard_1d); args.append(orbit_id)
+        if active_init is not None:
+            specs.append(row_shard_1d); args.append(active_init)
+        has_orbit = orbit_id is not None
+        has_active = active_init is not None
+
+        def _entry(*a):
+            g = a[0]
+            i = 1
+            oid = a[i] if has_orbit else None
+            if has_orbit:
+                i += 1
+            act = a[i] if has_active else None
+            return body_local(g, oid, act)
+
+        return shard_map(
+            _entry, mesh=mesh,
+            in_specs=tuple(specs), out_specs=out_specs,
+            check_rep=False,
+        )(*args)
 
     return step
 
