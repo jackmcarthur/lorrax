@@ -570,6 +570,161 @@ def test_the_env_scan_separates_reads_from_writes():
 
 
 # ===========================================================================
+# 3b.  RULE 2b — a budgeted L1 LIBRARY's env reads are pinned + resolver-scoped
+# ===========================================================================
+#
+# layers.md's acceptance test for a driver says "no ``os.environ``", and L2
+# is covered by rule 2 above — but the L1 *libraries* (htransform,
+# bse_setup) had no ratchet at all, and grew three env reads in one wave
+# (P1.4), one of them a MODULE-SCOPE ``float(os.environ.get(...))`` whose
+# malformed export crashed ``import bandstructure.htransform`` itself.
+#
+# THE TABLE IS A RATCHET, same rules as _DRIVER_PLUMBING_BUDGET: what each
+# file reads TODAY, by name.  A new env read fails; removing one without
+# editing the table fails; and every read must live inside a module-level
+# ``resolve*`` function (the named-resolver pattern: blank→default,
+# announce-or-refuse, callable from the entry layer so a driver can pass
+# the value DOWN instead) — module scope is the import-time-crash class and
+# is banned outright.
+
+_L1_LIBRARY_ENV_READS = {
+    # resolve_galerkin_chunk_bytes / resolve_extra_rank_pad /
+    # resolve_fh_ortho_tol — one resolver each, refuse-on-garbage; the
+    # kwarg/entry layer can override by passing values down.
+    "bandstructure.htransform": {
+        "LORRAX_GALERKIN_CHUNK_GIB",
+        "LORRAX_EXTRA_RANK_PAD",
+        "LORRAX_FH_ORTHO_TOL",
+    },
+    # resolve_reshard_route — explicit kwarg wins, env is the A/B path the
+    # production exciton_bands driver cannot plumb an argument to (file
+    # ownership); unknown tokens announce, never silently.
+    "bandstructure.bse_setup": {
+        "LORRAX_FACE_TO_BATCH_ROUTE",
+    },
+}
+
+
+#: Grammar helpers that read the environment on the caller's behalf — an
+#: ``env_float("LORRAX_X", ...)`` call is an env read exactly as much as
+#: ``os.environ.get`` is, and the P1.3 funnelling of raw reads through
+#: these is precisely what blinded the raw-read-only audit (the
+#: false-clean sweep tools/env_audit.py documents).
+_ENV_HELPER_NAMES = {"env_bool", "env_float"}
+
+
+def _helper_env_reads(tree):
+    """``[(node, key, line)]`` for grammar-helper calls with a literal key."""
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else (
+                fn.attr if isinstance(fn, ast.Attribute) else None)
+            if name in _ENV_HELPER_NAMES and node.args:
+                out.append((node, _literal(node.args[0]), node.lineno))
+    return out
+
+
+def scan_l1_env_reads(source: str):
+    """Every env read in an L1 library, raw OR helper-mediated.
+
+    ``[(key, line)]`` — the union rule 2b's pinned sets are compared
+    against.
+    """
+    tree = ast.parse(source)
+    out = [(k, ln) for kind, k, ln in scan_env(source) if kind == "read"]
+    out.extend((k, ln) for _, k, ln in _helper_env_reads(tree))
+    return sorted(out, key=lambda h: h[1])
+
+
+def scan_env_reads_outside_resolvers(source: str):
+    """Env READS (raw or helper-mediated) not inside a ``resolve*`` function.
+
+    ``[(key, line)]``.  Reads inside any function whose name starts with
+    ``resolve`` (public or ``_resolve``-private) are the sanctioned
+    pattern; everything else — module scope included — is reported.
+    py3.7-safe: membership is computed by walking each resolver's SUBTREE
+    (no ``end_lineno`` on that interpreter).
+    """
+    tree = ast.parse(source)
+    sanctioned = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and \
+                node.name.lstrip("_").startswith("resolve"):
+            for sub in ast.walk(node):
+                sanctioned.add(id(sub))
+    out = []
+    for node in ast.walk(tree):
+        if id(node) in sanctioned:
+            continue
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            attr, val = node.func.attr, node.func.value
+            if attr in ("get", "getenv") and (
+                    "environ" in ast.dump(val)
+                    or (isinstance(val, ast.Name) and val.id == "os")):
+                key = _literal(node.args[0]) if node.args else "<none>"
+                out.append((key, node.lineno))
+        elif isinstance(node, ast.Subscript) and \
+                "environ" in ast.dump(node.value):
+            out.append((_literal(node.slice), node.lineno))
+    for node, key, line in _helper_env_reads(tree):
+        if id(node) not in sanctioned:
+            out.append((key, line))
+    return sorted(out, key=lambda h: h[1])
+
+
+@pytest.mark.parametrize("mod", sorted(_L1_LIBRARY_ENV_READS))
+def test_l1_library_env_reads_are_pinned(sources, mod):
+    """Exact-set ratchet, both directions."""
+    assert mod in sources, f"{mod} is budgeted here but no longer exists"
+    live = {k for k, _ in scan_l1_env_reads(sources[mod])}
+    pinned = _L1_LIBRARY_ENV_READS[mod]
+    new = sorted(live - pinned)
+    assert not new, (
+        f"{mod} grew env reads {new}.  An L1 library dial is a PARAMETER; "
+        f"read it in the entry layer and pass it down, or add a resolve* "
+        f"function AND this table entry in the same commit (layers.md "
+        f"acceptance test).")
+    gone = sorted(pinned - live)
+    assert not gone, (
+        f"{mod} no longer reads {gone} — lower the table here and keep the "
+        f"win.")
+
+
+@pytest.mark.parametrize("mod", sorted(_L1_LIBRARY_ENV_READS))
+def test_l1_library_env_reads_live_in_resolvers(sources, mod):
+    """No module-scope read (import-time crash class), no scattered reads."""
+    stray = scan_env_reads_outside_resolvers(sources[mod])
+    assert not stray, (
+        f"{mod} reads the environment outside a resolve* function at "
+        f"{stray}.  A module-scope parse crashes the IMPORT on a malformed "
+        f"export (the LORRAX_GALERKIN_CHUNK_GIB defect, P1.4); move the "
+        f"read into a named resolver with refuse-on-garbage.")
+
+
+def test_the_resolver_scan_can_fail():
+    """RED TWIN for rule 2b — module scope, in-function, and subscript."""
+    bad_module_scope = "import os\nX = float(os.environ.get('A', '6'))\n"
+    assert scan_env_reads_outside_resolvers(bad_module_scope) == [("A", 2)]
+    bad_fn = "import os\ndef work():\n    return os.getenv('B')\n"
+    assert scan_env_reads_outside_resolvers(bad_fn) == [("B", 3)]
+    bad_sub = "import os\ndef work():\n    return os.environ['C']\n"
+    assert scan_env_reads_outside_resolvers(bad_sub) == [("C", 3)]
+    bad_helper = ("def work():\n"
+                  "    return env_float('E', 1e-6, refuse=True)\n")
+    assert scan_env_reads_outside_resolvers(bad_helper) == [("E", 2)], (
+        "a helper-mediated read outside a resolver must be reported — the "
+        "helper funnel is how the raw-read audit went blind")
+    ok = ("import os\ndef resolve_thing():\n"
+          "    a = os.environ.get('D', '1')\n"
+          "    return a, env_bool('D2', False)\n")
+    assert scan_env_reads_outside_resolvers(ok) == [], (
+        "the scan flags the sanctioned resolver pattern; the gate would be "
+        "turned off")
+
+
+# ===========================================================================
 # 4.  RULE 3 — imports run downhill
 # ===========================================================================
 #

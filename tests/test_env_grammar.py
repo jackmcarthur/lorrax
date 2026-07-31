@@ -292,6 +292,13 @@ OWNED_FILES = (
     "gw/gw_config.py",
     "gw/gw_output.py",
     "gw/isdf_fitting.py",
+    # P1.3 (2026-07-31): isdf/core.py's local ``_env_bool`` was retired —
+    # the module imports ``gw_config.env_bool`` now — which moved its four
+    # boolean knobs under this scan.  Scanning the file is what stops the
+    # divergent-parser class from recurring silently: a fifth grammar
+    # would have to appear IN one of these files to escape notice, and the
+    # scan below flags any raw boolean env read in them.
+    "isdf/core.py",
 )
 
 #: Boolean knobs whose ONLY readers live in the owned files, so their
@@ -307,6 +314,14 @@ OWNED_BOOL_KNOBS = (
     # tests/test_crossfile_requests.py::
     # test_no_module_anywhere_reads_force_full_bz_by_hand.
     "LORRAX_FORCE_FULL_BZ",
+    # P1.3: the isdf/core.py knobs, owned since that file joined
+    # OWNED_FILES (its readers all route through gw_config.env_bool now).
+    "LORRAX_ZETA_RANK_LOG",
+    "LORRAX_COLLECTIVE_CHUNK_LOG",
+    # Read once, in gw_init's ζ-reuse gate — previously through a lazy
+    # ``from isdf.core import _env_bool`` (the last consumer of that
+    # helper); collapsed onto the module-scope env_bool import.
+    "LORRAX_FORCE_REFIT",
 )
 
 #: Boolean knobs that are ALSO read outside the owned files.  Converting
@@ -315,10 +330,12 @@ OWNED_BOOL_KNOBS = (
 #: single wrong grammar.  Filed as cross-file requests; exempted here so
 #: this gate stays green on a correct tree.
 CROSS_FILE_BOOL_KNOBS = {
-    # gw/isdf_fitting.py:937 uses env_bool; isdf/core.py:3275 is a bare
-    # `bool(os.environ.get(...))` presence test, so `=0` turns one OFF and
-    # the other ON.  isdf/core.py belongs to another workstream.
-    "LORRAX_RCHUNK_DEBUG": "isdf/core.py:3275 still presence-tests it",
+    # EMPTY since P1.3: LORRAX_RCHUNK_DEBUG's second reader (isdf/core.py,
+    # historically a bare presence test under which ``=0`` meant ON) now
+    # reads through gw_config.env_bool like gw/isdf_fitting.py, and
+    # isdf/core.py itself is in OWNED_FILES.  The dict stays so the next
+    # genuinely cross-file knob has somewhere to be filed WITH its request
+    # number instead of silently exempted.
 }
 
 
@@ -487,26 +504,61 @@ def test_blank_is_unset_in_every_vocabulary_including_runtime():
 def test_defect3_vocabulary_has_not_drifted():
     """DEFECT 3 — one recognised token set, checked against every live copy.
 
-    Four named vocabularies exist in the tree and must stay set-equal:
+    Three named vocabularies remain in the tree and must stay set-equal:
       * ``ffi/common/gate.py::MODE_SPELLINGS``  (three-valued; ``auto`` is
         load-bearing there and is deliberately NOT merged into the
         two-valued helpers — only the on/off halves are compared);
       * ``runtime.__init__._FALSY_TOKENS``     (the falsy set exactly — the
         ``""`` it used to carry was the blank-token divergence, now fixed);
-      * ``isdf/core.py::_ENV_TRUE``            (read from source: imports jax);
-      * ``file_io/_slab_io_mpi_host.py::_TRUE`` (same).
+      * ``file_io/_slab_io_mpi_host.py::_TRUE`` (read from source: imports
+        jax at package scope).
+
+    ``isdf/core.py::_ENV_TRUE`` — the fourth copy this test used to pin —
+    was RETIRED by P1.3: the module imports ``gw_config.env_bool``
+    instead.  The companion check below asserts the copy stays dead.
     """
     assert set(gw_config._ENV_TRUE) == set(gate.MODE_SPELLINGS["on"])
     assert set(gw_config._ENV_FALSE) == set(gate.MODE_SPELLINGS["off"])
     assert set(_runtime._FALSY_TOKENS) == set(gw_config._ENV_FALSE)
     assert set(gw_config._ENV_TRUE) == set(
-        _literal_tuple_from_source("isdf/core.py", "_ENV_TRUE")), (
-        "gw.gw_config and isdf.core disagree on the truthy token set; "
-        "LORRAX_RCHUNK_DEBUG is read by both")
-    assert set(gw_config._ENV_TRUE) == set(
         _literal_tuple_from_source("file_io/_slab_io_mpi_host.py", "_TRUE"))
     # ``auto`` must stay out of the two-valued sets.
     assert "auto" not in set(gw_config._ENV_TRUE) | set(gw_config._ENV_FALSE)
+
+
+def test_isdf_core_grammar_copy_stays_dead():
+    """P1.3 ratchet: isdf/core.py must IMPORT the grammar, not re-grow it.
+
+    The failure this pins: someone re-adds a local ``_env_bool``/
+    ``_ENV_TRUE`` to isdf/core.py "to avoid the import", and the tree is
+    back to two parsers whose drift is invisible until a knob splits.
+    Parsed, not imported (isdf.core imports jax at module scope).
+    """
+    src = _read("isdf/core.py")
+    tree = ast.parse(src, "isdf/core.py")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            assert node.name != "_env_bool", (
+                "isdf/core.py re-defines _env_bool at line %d; import "
+                "gw_config.env_bool instead (P1.3)" % node.lineno)
+    for node in tree.body:
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        for t in targets:
+            assert not (isinstance(t, ast.Name) and t.id == "_ENV_TRUE"), (
+                "isdf/core.py re-defines _ENV_TRUE; the vocabulary lives "
+                "in gw_config (P1.3)")
+    # and the import is really there, spelled from gw.gw_config
+    has_import = any(
+        isinstance(n, ast.ImportFrom) and n.module == "gw.gw_config"
+        and any(a.name == "env_bool" for a in n.names)
+        for n in ast.walk(tree))
+    assert has_import, (
+        "isdf/core.py no longer imports env_bool from gw.gw_config — its "
+        "boolean knobs have no grammar")
 
 
 # ---------------------------------------------------------------------------

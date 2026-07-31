@@ -1436,27 +1436,19 @@ def deprecated_env_record(env_name: str, key_value) -> str:
     return raw if raw is not None else repr(key_value)
 
 
-_ENV_TRUE = ("1", "true", "yes", "on")
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    """Canonical boolean env parse for this module's telemetry/debug gates
-    (also used by ``gw.gw_init``).
-
-    Unset or exactly-empty → ``default``; otherwise strip + lowercase and
-    test membership in ``("1", "true", "yes", "on")`` — everything else
-    (``0``/``false``/``no``/``off``, any case) is False.  Same grammar as
-    ``file_io/_slab_io_mpi_host._env_flag`` and the C++ writers'
-    ``env_flag`` (``ffi/phdf5/cpp/context.cc``).  Consolidates the
-    hand-rolled ``not in ("0", "", "false")`` parses this branch grew,
-    under which ``LORRAX_ZETA_RANK_LOG=False`` or ``=off`` left a
-    default-on log enabled — the falsy-parse class workstream AT already
-    fixed for LORRAX_CHECK_REPLICA.  (audit fix/zq 2026-07-28)
-    """
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    return raw.strip().lower() in _ENV_TRUE
+# Canonical boolean env grammar — ONE parser, imported, not copied.
+#
+# This module used to carry its own ``_env_bool`` (same token set, no
+# telemetry): a typo'd value (``LORRAX_ZETA_RANK_LOG=ture``) resolved
+# silently to False, which for a default-ON knob silently turned the μ
+# ladder's conditioning signal OFF.  ``gw.gw_config.env_bool`` has the
+# identical vocabulary plus the once-per-(name,value) ``*** LORRAX
+# SANITY`` announcement on unrecognised tokens.  The import direction is
+# L1→L1 and safe: ``gw/__init__`` pulls only ``gw_config``, which is
+# deliberately jax-free and imports nothing from ``isdf``.
+# (P1.3 grammar unification, 2026-07-31; the drift gate is
+# ``tests/test_env_grammar.py``, which scans this file as an OWNED file.)
+from gw.gw_config import env_bool
 
 
 def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
@@ -1662,7 +1654,7 @@ def _factor_c_q_replicated(
         _re = ridge_extra
         _rc = rcond
         _rank_log = (mode == 'rank_truncate'
-                     and _env_bool("LORRAX_ZETA_RANK_LOG", True))
+                     and env_bool("LORRAX_ZETA_RANK_LOG", True))
         @partial(jax.jit, out_shardings=out_sh)
         def _fn(C):
             def _ridged_chol(C_log):
@@ -1956,7 +1948,7 @@ def _chunk_log(where: str, nq: int, qb: int, per_q_bytes: int) -> None:
                   f"this; raise LORRAX_COLLECTIVE_CHUNK_MB to silence it "
                   f"honestly, or accept the larger payload.",
                   flush=True)
-    if not _env_bool("LORRAX_COLLECTIVE_CHUNK_LOG", True):
+    if not env_bool("LORRAX_COLLECTIVE_CHUNK_LOG", True):
         return
     if jax.process_index() != 0:
         return
@@ -2016,7 +2008,7 @@ def _factor_c_q_distributed_rank_truncate(
     # DEPRECATED env form — the input key is the record (scorecard AV).
     rcond = _deprecated_env_float(
         "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
-    rank_log = _env_bool("LORRAX_ZETA_RANK_LOG", True)
+    rank_log = env_bool("LORRAX_ZETA_RANK_LOG", True)
 
     # ONE resolved plan, then one call.  ``'distributed'`` (not a hard-coded
     # 'scalapack') is deliberate and is the SAME name ``_resolve_zeta_gather``
@@ -3368,7 +3360,7 @@ def fit_one_rchunk(
     # Same knob, same grammar as gw/isdf_fitting.py:937.  This was a bare
     # presence test, so ``LORRAX_RCHUNK_DEBUG=0`` turned the debug path ON
     # here and OFF there — one knob, two answers, in the same r-chunk loop.
-    _dbg = _env_bool("LORRAX_RCHUNK_DEBUG", False)
+    _dbg = env_bool("LORRAX_RCHUNK_DEBUG", False)
     # Per-phase host-RSS deltas: on CPU the XLA arena is invisible to
     # ``memory_stats()``, so attributing the per-r-chunk anonymous ramp
     # to z_q_build vs solve needs the kernel's own accounting.

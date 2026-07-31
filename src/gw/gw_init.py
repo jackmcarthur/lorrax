@@ -241,13 +241,14 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 	sits in front of a multi-hour step whose silent misuse produced a
 	−135 eV QP gap once already (job 7874375, the restart-window bug).
 	"""
-	# Canonical boolean grammar (isdf/core._env_bool — same set as
-	# _slab_io_mpi_host._env_flag): under the old hand-rolled
+	# Canonical boolean grammar (gw_config.env_bool, imported at module
+	# scope with the rest of this layer's env helpers — this site used to
+	# lazily import isdf.core._env_bool, the ONE other parser, which P1.3
+	# retired): under the old hand-rolled
 	# ``not in ('', '0', 'false', 'False')`` parse, ``=off``/``=no``
 	# counted as truthy and forced a multi-hour refit (audit fix/zq
 	# 2026-07-28).
-	from isdf.core import _env_bool
-	if _env_bool('LORRAX_FORCE_REFIT', False):
+	if env_bool('LORRAX_FORCE_REFIT', False):
 		print_fn("    [zeta reuse] LORRAX_FORCE_REFIT set — refitting.")
 		return False
 	if not os.path.exists(zeta_h5_path):

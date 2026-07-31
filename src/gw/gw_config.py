@@ -45,36 +45,39 @@ from common.units import RYD_TO_EV
 #  Environment grammar — ONE boolean vocabulary for the GW init/config layer
 # ---------------------------------------------------------------------------
 #
-# WHY THIS IS HERE AND NOT IMPORTED.  The tree already carries the same
-# recognised token set in four places:
+# THIS IS THE CANONICAL COPY.  The tree still carries the same recognised
+# token set in three other places, each with a reason:
 #
 #   * ``ffi/common/gate.py::MODE_SPELLINGS`` — three-valued (auto/off/on).
 #     Its ``auto`` is load-bearing (a gate may DEMOTE and say so), so it is
 #     deliberately NOT folded into a two-valued test; only its on/off halves
 #     are the same vocabulary as ours.
-#   * ``runtime.__init__._FALSY_TOKENS`` — the falsy set plus ``""``.
-#   * ``isdf/core.py::_env_bool`` and ``file_io/_slab_io_mpi_host.py::_env_flag``
-#     — the two-valued helpers, identical to each other, and to the C++
-#     ``env_flag`` in ``ffi/phdf5/cpp/context.cc``.
+#   * ``runtime.__init__._FALSY_TOKENS`` — the sanctioned two-valued
+#     falsy-test resolver (the two-resolver doctrine,
+#     docs/architecture/layers.md): ``runtime`` must resolve knobs BEFORE
+#     jax/config imports are safe, so it keeps its own tiny parser.
+#   * ``file_io/_slab_io_mpi_host.py::_env_flag`` — mirrors the C++
+#     writer's ``env_flag`` (``ffi/phdf5/cpp/context.cc``) so the TWO
+#     phdf5 writers stay one grammar; jax-free file, kept local.
 #
-# ``gw.gw_config`` must stay importable WITHOUT jax (the login-node config
-# tests, and ``gw_output``'s banner, both rely on that), while
-# ``isdf.core`` imports jax at module scope — so this layer cannot import
-# the helper it agrees with.  The duplication is therefore deliberate and
-# is pinned by ``tests/test_env_grammar.py::test_defect3_vocabulary_has_not_drifted``,
-# which reads the other four copies (two of them straight out of the source
-# text, without importing jax) and fails on any drift.
+# ``isdf/core.py``'s ``_env_bool`` — historically the fourth copy — was
+# retired by the P1.3 unification (2026-07-31): ``isdf.core`` now imports
+# :func:`env_bool` from here (L1→L1; ``gw/__init__`` pulls only this
+# jax-free module, so the import adds nothing and cannot cycle).  The
+# remaining copies are pinned set-equal by
+# ``tests/test_env_grammar.py::test_defect3_vocabulary_has_not_drifted``,
+# which reads them straight out of the source text, without importing jax,
+# and fails on any drift.
 #
-# SEMANTICS, matching ``isdf.core._env_bool`` exactly:
+# SEMANTICS:
 #   unset or blank      -> the caller's default
 #   a truthy spelling   -> True        (case- and whitespace-insensitive)
 #   a falsy spelling    -> False
 #   anything else       -> False, AND announced once (see ``env_bool``)
 #
-# The announcement is the only behavioural difference from
-# ``isdf.core._env_bool``.  Resolving an unrecognised token to something
-# other than False would split the grammar for ``LORRAX_RCHUNK_DEBUG``,
-# which both modules read; adding telemetry does not.
+# Resolving an unrecognised token to something other than False would
+# split the grammar between converted and unconverted readers of the same
+# knob; adding telemetry does not.
 
 _ENV_TRUE = ("1", "on", "true", "yes")
 _ENV_FALSE = ("0", "off", "false", "no")
@@ -136,8 +139,10 @@ def env_bool(name: str, default: bool, *, print_fn=print) -> bool:
     return False
 
 
-def env_float(name: str, default: float, *, print_fn=print) -> float:
-    """Canonical numeric env parse: unset/blank → default, bad → ANNOUNCE.
+def env_float(name: str, default: float, *, print_fn=print,
+              refuse: bool = False) -> float:
+    """Canonical numeric env parse: unset/blank → default, bad → ANNOUNCE
+    (or, with ``refuse=True``, RAISE).
 
     The same defect class as :func:`env_bool`, one type along.  A
     ``try: float(...) except: default`` leaves the user believing a knob is
@@ -145,6 +150,12 @@ def env_float(name: str, default: float, *, print_fn=print) -> float:
     ``ISDF_ZCT_STAGE_CAP_GB`` handler already carries a comment about
     ("an OOM later, with no clue"), and which its sibling
     ``ISDF_CHUNK_TARGET_UTILIZATION`` was still committing.
+
+    ``refuse=True`` is for knobs that GATE correctness rather than tune
+    performance (``LORRAX_FH_ORTHO_TOL``): running with the default while
+    the user believes a gate threshold is in force is itself the silent
+    failure, so garbage refuses loudly, naming the variable — the
+    announce-or-refuse doctrine's refuse half.
     """
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -152,6 +163,12 @@ def env_float(name: str, default: float, *, print_fn=print) -> float:
     try:
         return float(raw)
     except ValueError:
+        if refuse:
+            raise ValueError(
+                f"{name}={raw!r} is not a number.  Accepted: a float "
+                f"(e.g. '1e-6'), or unset/blank for the default "
+                f"({default!r}).  Refusing rather than running with a "
+                f"value the caller did not choose.") from None
         key = (name, raw)
         if key not in _ENV_ANNOUNCED:
             _ENV_ANNOUNCED.add(key)

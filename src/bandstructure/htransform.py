@@ -80,8 +80,74 @@ _accum_G_cache: dict = {}
 # band chunks into Q first and only then forms Q Qᴴ; this constant therefore
 # changes memory and the number of ψ re-reads, never the result.
 # Override with LORRAX_GALERKIN_CHUNK_GIB (GiB, float).
-_GALERKIN_CHUNK_MAX_BYTES = int(
-    float(os.environ.get("LORRAX_GALERKIN_CHUNK_GIB", "6")) * 1024 ** 3)
+#
+# Resolved INSIDE the consuming function, not at module scope: the old
+# module-level ``float(os.environ.get(...))`` meant a malformed export
+# crashed ``import bandstructure.htransform`` itself — a bare
+# ``ValueError: could not convert string to float`` from the import
+# storm, naming neither the variable nor the fix (the import-time-crash
+# class, P1 audit).  ``resolve_galerkin_chunk_bytes`` refuses BY NAME,
+# from the call that actually consumes the budget.
+
+
+def resolve_galerkin_chunk_bytes() -> int:
+    """``LORRAX_GALERKIN_CHUNK_GIB`` (GiB, float, default 6) in bytes.
+
+    Blank/unset → the default; garbage REFUSES naming the variable
+    (``gw_config.env_float`` refuse mode); non-positive values refuse too
+    — a zero-byte accumulation budget is never what anyone meant.
+    """
+    from gw.gw_config import env_float
+    gib = env_float("LORRAX_GALERKIN_CHUNK_GIB", 6.0, refuse=True)
+    if gib <= 0.0:
+        raise ValueError(
+            f"LORRAX_GALERKIN_CHUNK_GIB={gib!r} must be > 0 (GiB budget "
+            f"for the Galerkin accumulation chunk; unset/blank = 6).")
+    return int(gib * 1024 ** 3)
+
+
+def resolve_extra_rank_pad() -> int:
+    """``LORRAX_EXTRA_RANK_PAD`` (default 0) — TEST-ONLY pad-invariance knob.
+
+    The one env resolver for the rank axis's extra null directions (see
+    the block comment at the use site); blank/unset → 0, negative or
+    non-integer REFUSES naming the variable.  Never set in production.
+    """
+    raw = os.environ.get("LORRAX_EXTRA_RANK_PAD")
+    if raw is None or not raw.strip():
+        return 0
+    try:
+        extra = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"LORRAX_EXTRA_RANK_PAD={raw!r} is not an integer.  Accepted: "
+            f"a non-negative int, or unset/blank for 0 (no extra pad).") \
+            from None
+    if extra < 0:
+        raise ValueError(
+            f"LORRAX_EXTRA_RANK_PAD must be >= 0; got {extra}")
+    return extra
+
+
+def resolve_fh_ortho_tol(log_fn=None) -> float:
+    """``LORRAX_FH_ORTHO_TOL`` (default 1e-6) — the build_fH_R gate cap.
+
+    Routed through ``gw_config.env_float`` in refuse mode: blank/unset →
+    the default (the old inline ``float(get(...) or 0.0)`` made a BLANK
+    export silently DISABLE the orthonormality gate — the failure it
+    guards is a wrong number, not a crash, so silent-off is the worst
+    possible reading of a typo); garbage REFUSES naming the variable; a
+    NON-DEFAULT value is announced, and ``0`` (gate off) is announced as
+    exactly that.
+    """
+    from gw.gw_config import env_float
+    tol = env_float("LORRAX_FH_ORTHO_TOL", 1e-6, refuse=True)
+    if tol != 1e-6 and log_fn is not None:
+        log_fn(f"  [gate] LORRAX_FH_ORTHO_TOL={tol:.3e} overrides the "
+               f"default 1e-6"
+               + ("  ** THE ORTHONORMALITY GATE IS DISABLED — only ever "
+                  "to reproduce a known-bad run **" if tol == 0.0 else ""))
+    return tol
 
 
 def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
@@ -107,7 +173,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         band_chunk_size: bands per FFT chunk inside the loader.  Treated as a
             CEILING, not a fixed size: it is lowered so one streamed ψ chunk
             ``(nk, bc, nspinor, n_rtot)`` complex128 stays under
-            ``_GALERKIN_CHUNK_MAX_BYTES`` (see below).
+            the ``resolve_galerkin_chunk_bytes()`` budget (see below).
         bispinor: passed through to ``load_centroids_band_chunked``.
         return_full_proj: also return the full-r α-basis projector
             ``W_proj = L⁻¹ diag(1/s) U^H`` (rank, nk·nb), replicated.  For
@@ -136,7 +202,8 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
 
     # Size the band chunk to the ψ box rather than trusting a fixed default.
     bytes_per_band = nk * nspinor * int(meta.n_rtot) * 16
-    bc_cap = max(1, int(_GALERKIN_CHUNK_MAX_BYTES // max(1, bytes_per_band)))
+    bc_cap = max(1, int(resolve_galerkin_chunk_bytes()
+                        // max(1, bytes_per_band)))
     band_chunk_size = max(1, min(int(band_chunk_size), bc_cap, nb))
 
     log_fn(
@@ -272,10 +339,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # production.
     align = math.lcm(int(mesh_xy.shape['x']), int(mesh_xy.shape['y']))
     rank = round_up(rank_phys, align)
-    _extra = int(os.environ.get("LORRAX_EXTRA_RANK_PAD", "0") or 0)
-    if _extra < 0:
-        raise ValueError(
-            f"LORRAX_EXTRA_RANK_PAD must be >= 0; got {_extra}")
+    _extra = resolve_extra_rank_pad()
     if _extra:
         rank = round_up(rank + _extra, align)
     n_pad = rank - rank_phys
@@ -849,7 +913,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         return jnp.max(jnp.abs(G - jnp.eye(nb_, dtype=G.dtype)[None]))
 
     _ortho = float(_ortho_all_k(ctilde))
-    _tol = float(os.environ.get("LORRAX_FH_ORTHO_TOL", "1e-6") or 0.0)
+    _tol = resolve_fh_ortho_tol(log_fn)
     log_fn(f"  [gate] ctilde orthonormality over ALL {int(ctilde.shape[0])} k: "
            f"max|C Cᴴ − I| = {_ortho:.3e}  (cap {_tol:.1e}; measured "
            f"conversion: on-grid max|Δε| ≈ 9.0e3 × this, so this run's "

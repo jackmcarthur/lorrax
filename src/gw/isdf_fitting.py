@@ -18,9 +18,10 @@ from common.collectives import (
 from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
 
 # Canonical boolean env grammar for this layer (same recognised token set
-# as isdf.core._env_bool / file_io._slab_io_mpi_host._env_flag, plus an
-# announcement for anything outside it).  See gw/gw_config.py's module
-# comment and tests/test_env_grammar.py for the drift gate.
+# as file_io._slab_io_mpi_host._env_flag — and since P1.3 the one
+# isdf.core imports too — plus an announcement for anything outside it).
+# See gw/gw_config.py's module comment and tests/test_env_grammar.py for
+# the drift gate.
 from .gw_config import active_zeta_truncating_knobs, env_bool
 
 from isdf.core import (
