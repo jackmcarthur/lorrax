@@ -94,7 +94,7 @@ jax.config.update("jax_enable_x64", True)
 from solvers.lanczos import block_lanczos_eig_jit
 from common.fft_helpers import make_sharded_ifftn_3d
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
-                     decimate_W_q_to_subgrid, pad_W_R_to_grid)
+                     decimate_W_q_to_subgrid, make_w_densifier)
 from .bse_ring_comm import make_bse_shardings
 from .bse_serial import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
@@ -887,14 +887,16 @@ def main(argv=None):
         else:
             # Coarse-W → fine direct term.  Sub-sample the fine W_q onto the
             # coarse BZ sub-grid (same ISDF μ-basis; q=0 head-tile preserved),
-            # ifft to the coarse R-lattice, then ZERO-PAD R back to the fine
-            # grid = exact trig interpolation of W(k) that passes through the
-            # coarse samples.  The convolution then runs on the fine grid with
-            # the fine (nkx,nky,nkz) solver — cheap coarse W, fine excitons.
+            # then the ONE sharded densifier (bse_io.make_w_densifier: shard_map
+            # ifft to the coarse R-lattice + jitted R zero-pad = exact trig
+            # interpolation, (μ,ν) sharding preserved throughout — no eager pad
+            # + device_put re-shard).  The convolution then runs on the fine
+            # grid with the fine (nkx,nky,nkz) solver — cheap coarse W, fine
+            # excitons.
             W_q_coarse = decimate_W_q_to_subgrid(data["W_q"], cg)
-            W_R_coarse = _ifftn(W_q_coarse)
-            W_R = pad_W_R_to_grid(W_R_coarse, (nkx, nky, nkz))
-            W_R = jax.device_put(W_R, sh.W)       # restore μ/ν sharding on the padded R-tensor
+            densify_W = make_w_densifier(mesh_xy, sh.W.spec, (nkx, nky, nkz),
+                                         output="R")
+            W_R = densify_W(W_q_coarse)
             log(f"[coarse-W] W sampled on {cg[0]}x{cg[1]}x{cg[2]} sub-grid of "
                 f"{nkx}x{nky}x{nkz}, zero-padded in R (trig-interp to fine grid)")
     solver = build_path_solver(

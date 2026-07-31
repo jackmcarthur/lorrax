@@ -13,7 +13,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from runtime.padding import padded_mu_extent
-from common.fft_helpers import local_fftn3, local_ifftn3
+from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
 
 from .bse_serial import compute_pair_amplitude
 
@@ -304,6 +304,57 @@ def pad_W_R_to_grid(W_R_coarse: jax.Array,
     n_f_tot = fine_grid[0] * fine_grid[1] * fine_grid[2]
     scale = jnp.sqrt(jnp.asarray(n_f_tot / n_c_tot, dtype=out.real.dtype))
     return out * scale
+
+
+def make_w_densifier(
+    mesh_xy: Mesh,
+    w_spec: P,
+    fine_grid: tuple[int, int, int],
+    *,
+    output: str = "k",
+):
+    """THE coarse→fine W densifier — the ONE sharded implementation.
+
+    Returns a jitted ``fn(W_q_coarse) -> W_fine`` that takes a coarse-grid
+    ``W_q`` of shape ``(μ, ν, ncx, ncy, ncz)`` sharded as ``w_spec`` (the k
+    axes must be replicated in ``w_spec``; only μ/ν may be sharded) and
+    produces the fine-grid W via  ifftn(k→R) → zero-pad R
+    (:func:`pad_W_R_to_grid`, exact trig interpolation) → optionally
+    fftn(R→k):
+
+      * ``output='R'`` → ``W_R_fine`` — what the exciton_bands
+        ``--w-coarse-grid`` path feeds the matvec directly;
+      * ``output='k'`` → ``W_q_fine`` — what the ``bse_k_grid`` bundle
+        densification stores, so each solver's own ``ifftn(W_q)``
+        reproduces the padded ``W_R``.
+
+    SHARDING / SCALING ENVELOPE.  Both FFTs are the shard_map interior
+    kernels (:func:`make_sharded_ifftn_3d` / :func:`make_sharded_fftn_3d`)
+    and the R-axis zero-pad is traced INSIDE one ``jax.jit`` whose
+    ``out_shardings`` pins ``w_spec``, so the (μ,ν) sharding survives end to
+    end: per-rank peak stays at the local ``(μ_loc, ν_loc, nk_fine)`` tile.
+    No step materializes a replicated N_μ²-class array — the eager
+    ``local_ifftn3``/``local_fftn3`` + ``device_put`` form this replaces
+    all-gathered the full tensor per rank (audit P0-4/P2-7) and is what the
+    ``tests/test_fft_shardmap_context.py`` gate now bans.
+    """
+    if output not in ("k", "R"):
+        raise ValueError(f"make_w_densifier: output must be 'k' or 'R', got {output!r}")
+    fine_grid = tuple(int(s) for s in fine_grid)
+    w_sh = NamedSharding(mesh_xy, w_spec)
+    _ifftn = make_sharded_ifftn_3d(mesh_xy, w_spec, w_spec,
+                                   axes=(2, 3, 4), norm="ortho")
+    _fftn = make_sharded_fftn_3d(mesh_xy, w_spec, w_spec,
+                                 axes=(2, 3, 4), norm="ortho")
+
+    @partial(jax.jit, out_shardings=w_sh)
+    def _densify(W_q_coarse):
+        W_R_fine = pad_W_R_to_grid(_ifftn(W_q_coarse), fine_grid)
+        if output == "R":
+            return W_R_fine
+        return _fftn(W_R_fine)
+
+    return _densify
 
 
 def decimate_W_q_to_subgrid(W_q: jax.Array,
@@ -647,7 +698,10 @@ def _interpolate_bse_data_to_grid(
 
     The single coarse→fine densification the ``bse_k_grid`` knob drives, living
     in the GENERAL init so EVERY solver consumes a fine-grid bundle unchanged.
-    Reuses the exact machinery the exciton_bands Q-path uses — no second copy:
+    Each piece goes through the shared builder its exciton_bands sibling uses
+    (until 2026-07-31 the W leg was a SECOND, eager copy — ``local_ifftn3``/
+    ``local_fftn3`` outside any shard_map, all-gathering the (μ,ν)-sharded W
+    per rank; audit P0-4):
 
       * ψ_{v,c}(k) and QP ε_{v,c}(k) on the fine mesh ← ONE htransform fH
         (``bandstructure.htransform.initialize_wfns`` +
@@ -659,11 +713,11 @@ def _interpolate_bse_data_to_grid(
         head (``minibz_head_vlr(..., kgrid=fine_grid)``).  A Q=0 exciton's
         exchange is the single q=0 tile (dense in k,k'); the fine k-grid's
         exchange "q-set" is therefore just q=0.
-      * W direct ← ``pad_W_R_to_grid`` (coarse→fine zero-pad in R = exact trig
-        interpolation), fft'd back to a fine ``W_q`` so each solver's own
-        ``ifftn(W_q)`` reproduces the padded ``W_R``.  This is the mechanism the
-        exciton_bands ``--w-coarse-grid`` flag runs; ``bse_k_grid`` drives it
-        automatically (the banner below is the "W-pad fired" proof).
+      * W direct ← ``make_w_densifier(output='k')`` — the ONE sharded
+        coarse→fine densifier (shard_map FFTs + jitted R zero-pad, (μ,ν)
+        sharding preserved end to end); the exciton_bands ``--w-coarse-grid``
+        flag runs the SAME factory with ``output='R'``.  ``bse_k_grid`` drives
+        it automatically (the banner below is the "W-pad fired" proof).
 
     Band dims (n_val/n_cond and their mesh-pads), n_rmu(_pad), and the q=0 head
     projectors g0 are grid-INVARIANT and carried through untouched; only the k
@@ -758,12 +812,13 @@ def _interpolate_bse_data_to_grid(
     log_fn(f"[bse_k_grid] V_q0 exchange tile via vq_interp eval_vq(Q=0), "
            f"fine mini-BZ head <v_LR>={head_val:.4f} (gstar={gstar})")
 
-    # ── W direct: coarse W_q → ifft(R) → zero-pad R → fine → fft back ─────
-    W_sh = NamedSharding(mesh_xy, P("x", "y", None, None, None))
-    W_R_coarse = local_ifftn3(data["W_q"], axes=(2, 3, 4), norm="ortho")
-    W_R_fine = pad_W_R_to_grid(W_R_coarse, fine_grid)
-    W_q_fine = local_fftn3(W_R_fine, axes=(2, 3, 4), norm="ortho")
-    W_q_fine = jax.device_put(W_q_fine, W_sh)
+    # ── W direct: coarse W_q → ifft(R) → zero-pad R → fine → fft back, all
+    # inside the ONE sharded densifier (shard_map FFTs + jitted pad with
+    # out_shardings) — the (μ,ν) sharding never drops, so per-rank peak is the
+    # local (μ_loc, ν_loc, nk_fine) tile, never a replicated N_μ² array.
+    densify_W = make_w_densifier(
+        mesh_xy, P("x", "y", None, None, None), fine_grid, output="k")
+    W_q_fine = densify_W(data["W_q"])
     log_fn(f"[bse_k_grid] W zero-padded in R "
            f"{coarse_grid[0]}x{coarse_grid[1]}x{coarse_grid[2]}→"
            f"{fine_grid[0]}x{fine_grid[1]}x{fine_grid[2]} "
