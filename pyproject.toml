@@ -61,7 +61,9 @@ members = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-norecursedirs = ["archive"]
+# `bench` holds standalone bench/smoke drivers (moved out of src/ 2026-07-31);
+# they are argv-driven scripts with jax preambles, not pytest suites.
+norecursedirs = ["archive", "bench"]
 # `extra` (tooling / experimental / out-of-repo-fixture suites) is
 # deselected by default; run them with `-m extra` (an explicit -m on the
 # command line overrides this addopts default).

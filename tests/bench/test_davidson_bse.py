@@ -1,4 +1,4 @@
-"""bse/test_davidson_bse.py — Block Davidson on the BSE problem.
+"""tests/bench/test_davidson_bse.py — Block Davidson on the BSE problem.
 
 Loads the same Si 4×4×4, 8×8 BSE setup that ``solve_bse_sharded`` uses,
 runs the refactored shape-agnostic Davidson against it, and compares
@@ -12,7 +12,7 @@ asserts). It prints residual norms per iteration so the
 profiling-stack tooling can pick up the wall-time picture.
 
 Usage (from the cohsex_bse.in run dir, under lxrun):
-    LORRAX_NGPU=4 lxrun python3 -u -m bse.test_davidson_bse \\
+    LORRAX_NGPU=4 lxrun python3 -u tests/bench/test_davidson_bse.py \\
         -i cohsex_bse.in --eqp <bgw_eqp.dat> --n-occ 4 \\
         --n-val 8 --n-cond 8 --n-eig 20 --max-iter 60 \\
         --bgw-h5 /pscratch/.../00_bgw_bse_8x8/eigenvectors.h5
@@ -37,10 +37,10 @@ jax.config.update("jax_enable_x64", True)
 from common.fft_helpers import make_sharded_ifftn_3d
 from solvers.davidson import davidson, warmup_davidson_jit
 
-from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
-from .bse_ring_comm import create_mesh_2d, make_bse_shardings
-from .bse_simple import build_bse_simple_matvec
-from .bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
+from bse.bse_io import _find_restart_file, load_bse_data_from_restart_sharded
+from bse.bse_ring_comm import create_mesh_2d, make_bse_shardings
+from bse.bse_simple import build_bse_simple_matvec
+from bse.bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
 
 
 RYD2EV = 13.6056980659
@@ -74,7 +74,7 @@ def _load_data_and_matvec(
     # than the user-requested n_val / n_cond — otherwise eps_v can be
     # wider than psi_v_X (when n_occ < n_val) and the matvec einsum fails.
     if eqp_file is not None:
-        from .bse_io import apply_eqp_corrections, _pad_axis_to_multiple
+        from bse.bse_io import apply_eqp_corrections, _pad_axis_to_multiple
         n_val_eff = int(data["n_val"])
         n_cond_eff = int(data["n_cond"])
         with h5py.File(restart, "r") as f:

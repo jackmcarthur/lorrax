@@ -15,7 +15,7 @@ Typical Perlmutter usage from this repository:
 ```
 export SLURM_JOBID=<one-node allocation>
 cd /global/homes/j/jackm/scratchperl/lorrax_sandbox/sources/lorrax_D
-LORRAX_NGPU=4 lxrun python3 -u -m ffi.cusolvermp.profile_batched \\
+LORRAX_NGPU=4 lxrun python3 -u tests/bench/profile_batched.py \\
     --mode potrf --nq 9 -n 640 --iters 8 --warmup 2
 ```
 
@@ -26,7 +26,7 @@ export OUT=/path/to/nsys
 LORRAX_NGPU=4 lxrun bash -lc 'nsys profile --trace=cuda,nvtx,osrt \\
     --capture-range=cudaProfilerApi --capture-range-end=stop \\
     --force-overwrite=true -o "$OUT/potrf_rank${SLURM_PROCID}" \\
-    python3 -u -m ffi.cusolvermp.profile_batched \\
+    python3 -u tests/bench/profile_batched.py \\
     --mode potrf --nq 9 -n 640 --iters 8 --warmup 2 --cuda-profiler-api'
 ```
 """

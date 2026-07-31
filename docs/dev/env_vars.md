@@ -258,7 +258,7 @@ observability failures) — cheap keeps, not clutter.
 | `LORRAX_JAX_CACHE_EXPLAIN` | `0` | Turns on `jax_explain_cache_misses` logging. |
 | `LORRAX_JAX_CACHE_FORCE_DIVERGE` / `LORRAX_JAX_CACHE_NO_AGREE` | `0` | Compile-cache TEST HOOKS: positive control / the deadlock reproducer.  Never in production. |
 | `KP2_DEBUG` / `STERN_DEBUG` | unset / `0` | Sternheimer debug (`psp/run_sternheimer.py`, `solvers/sternheimer_solve.py`). |
-| `PF_ARTIFACTS_DIR` / `ISDF_JAX_PROFILE_DIR` | `profile` / unset | Trace output dirs (`common/jax_profile.py`, `bse/test_bse.py`). |
+| `PF_ARTIFACTS_DIR` / `ISDF_JAX_PROFILE_DIR` | `profile` / unset | Trace output dirs (`common/jax_profile.py`, `tests/bench/test_bse.py`). |
 | `ISDF_COHSEX_TEST_PLATFORM` | `auto` | Test harness: force `cpu`/`gpu` for the e2e gates (`tests/harness.py`). |
 
 ## 4. Build-time only
@@ -338,7 +338,7 @@ them inside the running Python does nothing.
 |---|---|
 | `JAX_ENABLE_X64` | `setdefault "1"` at 30 sites; canonical one is `runtime.set_default_env`.  Consistent everywhere. |
 | `JAX_PLATFORMS` | `setdefault "cuda,cpu"`, or hard-set to `"cpu"` by `set_default_env(platform="cpu")`.  `ffi_loader.platform_from_env` READS it (default `""`) to pick the FFI library **without** initializing the JAX backend. |
-| `JAX_PLATFORM_NAME` | jax's DEPRECATED spelling of `JAX_PLATFORMS`.  LORRAX never sets it for a run: `runtime` **pops** it at both CPU-downgrade sites (`runtime/__init__.py:565,967`) so a stale value cannot fight the downgrade; `psp/get_DFT_mtxels.py:24` presence-tests it (either spelling counts as "the caller chose a platform"); the one `setdefault "cpu"` writer is the exempt bench driver `mixing/benchmark_synthetic.py:22`. |
+| `JAX_PLATFORM_NAME` | jax's DEPRECATED spelling of `JAX_PLATFORMS`.  LORRAX never sets it for a run: `runtime` **pops** it at both CPU-downgrade sites (`runtime/__init__.py:565,967`) so a stale value cannot fight the downgrade; `psp/get_DFT_mtxels.py:24` presence-tests it (either spelling counts as "the caller chose a platform"); the one `setdefault "cpu"` writer is the exempt bench driver `tests/bench/benchmark_synthetic.py:22`. |
 | `JAX_PROCESS_COUNT` → `JAX_NUM_PROCESSES` → `SLURM_NTASKS` → `1` | process-count resolution chain, `runtime/__init__.py`. |
 | `JAX_PROCESS_INDEX` → `SLURM_PROCID` → `0` | process-index chain. |
 | `JAX_COORDINATOR_ADDRESS` | overrides the `SLURM_NODELIST`-derived coordinator. |

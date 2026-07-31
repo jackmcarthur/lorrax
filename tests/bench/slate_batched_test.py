@@ -12,7 +12,7 @@ Usage::
     LORRAX_NGPU=4 LORRAX_SELECT_GPU=1 LORRAX_MPI_TYPE=cray_shasta \\
         XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \\
         bash src/ffi/common/cpp/run_shifter.sh \\
-        python3 -u -m common.slate_batched_test \\
+        python3 -u tests/bench/slate_batched_test.py \\
         --nbatch 8 -n 128 --mesh 2x2 --dtype c128
 """
 from __future__ import annotations

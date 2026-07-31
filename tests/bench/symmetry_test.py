@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 
 from file_io import WfnLoader as WFNReader
-from .symmetry_maps import SymMaps
+from common.symmetry_maps import SymMaps
 
 
 def _status_line(label: str, passed: bool, detail: str) -> str:

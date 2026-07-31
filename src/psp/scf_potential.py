@@ -16,7 +16,7 @@ Two public entry points, one helper:
     accumulating Σ_k Σ_{v<n_occ} |ψ_{v,k}(r)|².  No symmetrisation is
     required because the full-BZ sum is already invariant under the
     crystal point group.  Cheaper and more robust than the IBZ +
-    symmetrise approach (which ``psp/archive/charge_density.py`` does;
+    symmetrise approach (which ``tests/bench/charge_density.py`` does;
     ``_symmetrise_density`` there is known broken — see psp/dev_status.md).
 
 Lifted from ``psp/run_nscf._build_potentials`` so both the NSCF driver and
@@ -113,7 +113,7 @@ def build_rho_val_from_wfn(wfn, sym, meta, n_occ: int, *, verbose: bool = True) 
     factor comes from the uniform full-BZ weight (k-weights all 1/N_k once
     symmetry-related k are unfolded).
 
-    Unlike the IBZ path in ``psp/archive/charge_density.build_density_from_ibz``,
+    Unlike the IBZ path in ``tests/bench/charge_density.py::build_density_from_ibz``,
     the full-BZ sum is exactly invariant under the crystal point group without
     an explicit ρ(G) star-averaging pass, so the broken ``_symmetrise_density``
     helper is sidestepped.

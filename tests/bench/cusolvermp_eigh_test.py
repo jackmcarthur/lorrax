@@ -3,11 +3,11 @@
 Usage (Perlmutter, inside an interactive 4-GPU allocation with
 ``module load lorrax``)::
 
-    lxrun python3 -u -m common.cusolvermp_eigh_test
+    lxrun python3 -u tests/bench/cusolvermp_eigh_test.py
 
 or, for a 1-GPU smoke::
 
-    LORRAX_NGPU=1 lxrun python3 -u -m common.cusolvermp_eigh_test --grid 1 1
+    LORRAX_NGPU=1 lxrun python3 -u tests/bench/cusolvermp_eigh_test.py --grid 1 1
 
 What it does
 ------------

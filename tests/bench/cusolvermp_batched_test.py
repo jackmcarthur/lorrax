@@ -9,7 +9,7 @@ via batched_distributed_potrs. Gather, compare per-slice against
 Usage::
 
     lxalloc
-    lxrun python3 -u -m common.cusolvermp_batched_test \\
+    lxrun python3 -u tests/bench/cusolvermp_batched_test.py \\
         --nbatch 8 -n 128 --mrhs 256 --mesh 2x2 --dtype c128
 """
 from __future__ import annotations

@@ -7,7 +7,7 @@ This creates Figure 3a: convergence comparison of Anderson, CROP, and
 CROP-Anderson on a tridiagonal linear system.
 
 Run with:
-    uv run python -m mixing.benchmark_synthetic
+    uv run python tests/bench/benchmark_synthetic.py
     # or
     uv run python src/mixing/benchmark_synthetic.py
 """

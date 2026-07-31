@@ -8,7 +8,7 @@ Usage::
 
     SLURM_JOBID=... LORRAX_NGPU=4 \\
         bash src/ffi/common/cpp/run_shifter.sh \\
-        python3 -u -m common.slate_eigh_test -n 256 --dtype c128
+        python3 -u tests/bench/slate_eigh_test.py -n 256 --dtype c128
 """
 from __future__ import annotations
 

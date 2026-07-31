@@ -166,7 +166,7 @@ Total ~1 MB. These are stable across Cray MPICH minor versions.
   flip the env knob if bench shows surprising results.
 - **Regression in the cuSOLVERMp FFI**: doesn't touch MPI, but sits
   in the same `liblorrax_ffi.so` that we're rebuilding. The
-  `common.cusolvermp_eigh_test` must still pass after migration.
+  `tests/bench/cusolvermp_eigh_test.py` must still pass after migration.
 - **Build-time gcc version mismatch**: host Cray-PE is gnu/12.3, but
   the container's gcc is whatever Ubuntu 22.04 ships
   (probably gcc-11). Shouldn't matter as long as we build inside the

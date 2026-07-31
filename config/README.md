@@ -179,7 +179,7 @@ Single-rank: ~7 s end-to-end. Multi-rank: ~10–15 s. The JAX cold start
 itself is *not* the bottleneck — everything above it is.
 
 - **`lxshell`**: drop into an interactive container shell, then run
-  `python3 -m common.slate_batched_test`, `python3 -m common.cusolvermp_eigh_test`,
+  `python3 tests/bench/slate_batched_test.py`, `python3 tests/bench/cusolvermp_eigh_test.py`,
   etc. back-to-back. Saves the ~5 s shifter bring-up per invocation.
   (Python still cold-starts each call inside the shell — the real 100×
   win is keeping one Python REPL alive.)

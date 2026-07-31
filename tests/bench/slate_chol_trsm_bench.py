@@ -10,7 +10,7 @@ Usage::
     LORRAX_NGPU=4 LORRAX_SELECT_GPU=1 \\
         XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \\
         bash src/ffi/common/cpp/run_shifter.sh \\
-        python3 -u -m common.slate_chol_trsm_bench \\
+        python3 -u tests/bench/slate_chol_trsm_bench.py \\
             --mesh 2x2 -n 1024 --dtype c128 --repeats 3
 """
 from __future__ import annotations

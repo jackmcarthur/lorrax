@@ -14,12 +14,12 @@ Gates (all must pass):
 
 Usage (CPU mesh, e.g. via the shared holder)::
 
-    alloc_run.sh 2 2 <src> <wd> python -u -m common.w_solve_modes_test
+    alloc_run.sh 2 2 <src> <wd> python -u tests/bench/w_solve_modes_test.py
 
 or on GPU::
 
     lxalloc
-    LORRAX_MPI_TYPE=pmix lxrun python3 -u -m common.w_solve_modes_test
+    LORRAX_MPI_TYPE=pmix lxrun python3 -u tests/bench/w_solve_modes_test.py
 """
 from __future__ import annotations
 import os

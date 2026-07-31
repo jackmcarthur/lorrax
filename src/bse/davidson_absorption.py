@@ -6,7 +6,7 @@ specified residual tolerance, not Lanczos finite-Krylov approximation
 that mixes near-degenerate subspaces) plus their per-state dipole
 projections, written as a BGW-format ``eigenvalues_b{1,2,3}.dat``.
 
-Mirrors the matvec/precond/init setup of ``bse.test_davidson_bse``
+Mirrors the matvec/precond/init setup of ``tests/bench/test_davidson_bse.py``
 (known-working: converges Si 8×8 lowest 20 eigvals to ~3 meV vs BGW).
 
 Usage:
@@ -94,7 +94,7 @@ def main(argv=None):
     )
 
     # Apply EQP via the same flow as bse_jax._preview_lanczos /
-    # test_davidson_bse: explicit n_occ-based slice, NOT nearest-energy
+    # tests/bench/test_davidson_bse.py: explicit n_occ-based slice, NOT nearest-energy
     # matching (which silently mis-selects bands after QP shifts).
     if args.eqp is not None:
         from .bse_io import apply_eqp_and_reslice_bands
@@ -112,7 +112,7 @@ def main(argv=None):
         print(f"[davidson_absorption] BSE: {nc_pad}c × {nv_pad}v × {nk}k = "
               f"{nc_pad*nv_pad*nk}, n_eig={args.n_eig}, max_iter={args.max_iter}", flush=True)
 
-    # ── Build matvec exactly like test_davidson_bse ─────────────────────
+    # ── Build matvec exactly like tests/bench/test_davidson_bse.py ─────────────────────
     matvec_simple = build_bse_simple_matvec(mesh_xy, nkx, nky, nkz, include_W=True)
     _W_ifftn = make_sharded_ifftn_3d(
         mesh_xy, sh.W.spec, sh.W.spec, axes=(2, 3, 4), norm="ortho")

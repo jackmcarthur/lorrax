@@ -4,12 +4,12 @@ Runs ONE backend per invocation (each needs different process affinity):
 
     # cuSOLVERMp (default, all GPUs visible per process)
     LORRAX_NGPU=4 bash src/ffi/common/cpp/run_shifter.sh \\
-        python3 -u -m common.slate_vs_cusolvermp_bench \\
+        python3 -u tests/bench/slate_vs_cusolvermp_bench.py \\
         --backend cusolvermp -n 2048 --repeats 5
 
     # SLATE (needs 1-GPU-per-process via LORRAX_SELECT_GPU=1)
     LORRAX_NGPU=4 LORRAX_SELECT_GPU=1 bash src/ffi/common/cpp/run_shifter.sh \\
-        python3 -u -m common.slate_vs_cusolvermp_bench \\
+        python3 -u tests/bench/slate_vs_cusolvermp_bench.py \\
         --backend slate -n 2048 --repeats 5
 
 Warms up once, then reports per-call wall-clock for `repeats` iterations.

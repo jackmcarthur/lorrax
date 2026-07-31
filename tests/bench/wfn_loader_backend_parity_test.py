@@ -11,7 +11,7 @@ Shifter is not currently wired (see KNOWN_SANDBOX_ERRORS.md
 
 Usage::
 
-    lxrun python3 -u -m common.wfn_loader_backend_parity_test \\
+    lxrun python3 -u tests/bench/wfn_loader_backend_parity_test.py \\
         --wfn /pscratch/sd/j/jackm/lorrax_sandbox/runs/MoS2/00_mos2_3x3_cohsex/qe/nscf/WFN.h5 \\
         --mesh 2x2
 """

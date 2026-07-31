@@ -25,7 +25,7 @@ Covers:
 
 Run:
     cd <dir with WFN.h5 + UPFs>
-    lxrun python3 -u -m psp.tests.test_sternheimer_jvp
+    lxrun python3 -u tests/bench/test_sternheimer_jvp.py
 """
 from __future__ import annotations
 

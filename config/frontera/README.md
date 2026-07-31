@@ -47,7 +47,7 @@ $EXEC bash config/frontera/build_ffi.sh --fresh   # build liblorrax_ffi.so
 # 4 ranks x 1 GPU, 2x2 mesh:
 srun -n 4 apptainer exec --nv --bind /home1,/work2,/scratch1,/scratch2 $LORRAX_SIF \
     bash -lc 'source config/frontera/ffi_env.sh; export CUDA_VISIBLE_DEVICES=$SLURM_LOCALID;
-              $LORRAX_VENV/bin/python -m common.cusolvermp_eigh_test --grid 2 2'
+              $LORRAX_VENV/bin/python tests/bench/cusolvermp_eigh_test.py --grid 2 2'
 ```
 `$SCRATCH/lorrax_setup/ffi_build_test.sbatch` wraps all three as one job.
 

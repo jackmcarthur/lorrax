@@ -15,9 +15,10 @@ its directory:
 **Imports run downhill only: L1 → L2 → L3.** Nothing else is allowed, and
 `tests/test_layering.py` fails when it happens.
 
-Today: **141 L1, 18 L2, 56 L3**, plus 26 bench/smoke drivers that live under
-`src/` and are exempt (see [below](#the-26-exempt-bench-drivers)). Four upward
-edges survive, all named in [§5](#5-the-sanctioned-exceptions).
+Today: **140 L1, 18 L2, 56 L3**, and zero exempt bench drivers — the 26 that
+used to live under `src/` moved to `tests/bench/` on 2026-07-31 (see
+[below](#the-26-exempt-bench-drivers)). Four upward edges survive, all named
+in [§5](#5-the-sanctioned-exceptions).
 
 ---
 
@@ -269,20 +270,23 @@ them costs a campaign.
 4. **Do not give `ffi/` a shared C++ handler base.** The cuFFT plan workspace,
    MKL's OpenMP chunking and a scratch-free BLAS call are three measured
    designs that happen to have the same silhouette.
-5. **Do not force the 26 bench drivers under `src/` through `resolve_mesh`.**
+5. **Do not force the bench drivers in `tests/bench/` through `resolve_mesh`.**
    They construct meshes differently on purpose —
-   `ffi/cusolvermp/profile_batched.py` parses `--mesh 2x2` and exits on a
+   `tests/bench/profile_batched.py` parses `--mesh 2x2` and exits on a
    mismatch, which is exactly right for a benchmark whose job is sweeping
-   geometries. Forcing them through the service deletes the sweep. **Move them
-   to `tests/`; leave their mesh construction alone.**
+   geometries. Forcing them through the service deletes the sweep. **Leave
+   their mesh construction alone.**
 
 ### The 26 exempt bench drivers
 
-They are exempt from every rule here and their number is pinned, so the
-exemption cannot widen. Their cost is measured, not hypothetical: their
-copy-pasted jax preamble is **104 of `common/`'s 121** `os.environ`/`os.getenv`
-matches (2026-07-31) — the single largest duplication in the environment sweep.
-The fix is `git mv`, not a new abstraction.
+Moved: all 26 went to `tests/bench/` by `git mv` on 2026-07-31, taking their
+copy-pasted jax preambles — **104 of `common/`'s 121** `os.environ`/`os.getenv`
+matches — out of `src/`. The exemption count in `tests/test_layering.py` is now
+pinned at **zero**: a module under `src/` whose name has a bench shape
+(`test_*`, `*_test`, `*_bench`, `benchmark*`, `profile_*`, `.tests.`,
+`.archive.`) fails the gate. New bench/smoke drivers go in `tests/bench/`,
+which pytest does not collect (`norecursedirs`) — they are argv-driven scripts,
+run as `python3 tests/bench/<name>.py` with `src/` on `PYTHONPATH`.
 
 ---
 

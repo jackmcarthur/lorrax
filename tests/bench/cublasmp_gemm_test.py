@@ -2,7 +2,7 @@
 
 Usage::
     lxalloc
-    LORRAX_MPI_TYPE=pmix lxrun python3 -u -m common.cublasmp_gemm_test
+    LORRAX_MPI_TYPE=pmix lxrun python3 -u tests/bench/cublasmp_gemm_test.py
 """
 from __future__ import annotations
 

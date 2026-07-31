@@ -6,7 +6,7 @@ distributed LU solve used by the W Dyson 'distributed' plan on CUDA meshes.
 Usage::
 
     lxalloc
-    LORRAX_MPI_TYPE=pmix lxrun python3 -u -m common.cusolvermp_solve_lu_test \\
+    LORRAX_MPI_TYPE=pmix lxrun python3 -u tests/bench/cusolvermp_solve_lu_test.py \\
         --nbatch 8 -n 128 --nrhs 128 --mesh 2x2 --dtype c128
 """
 from __future__ import annotations

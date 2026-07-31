@@ -16,7 +16,7 @@ Usage (Perlmutter login node, single GPU):
     /global/homes/j/jackm/scratchperl/.isdf/isdf_venvs/isdf_site" \
     JAX_ENABLE_X64=1 HDF5_USE_FILE_LOCKING=FALSE \
     XLA_PYTHON_CLIENT_PREALLOCATE=false \
-    python3 -u -m psp.tests.test_dft_hamiltonian \
+    python3 -u tests/bench/test_dft_hamiltonian.py \
         --save qe/scf/silicon.save \
         --pseudo_dir qe/scf \
         --wfn qe/nscf/WFN.h5
@@ -41,7 +41,9 @@ from psp.get_DFT_mtxels import (
     build_local_ionic_potential_on_G_total, poisson_potential_from_rhoG,
 )
 from psp.dft_operators import build_G_cart
-from psp.archive.charge_density import build_core_density, compute_grad_rho_sq, build_V_xc
+# charge_density.py sits beside this driver in tests/bench/ (moved out of the
+# deleted src/psp/archive/); as a script, sys.path[0] is this directory.
+from charge_density import build_core_density, compute_grad_rho_sq, build_V_xc
 from psp.dft_operators import (
     build_V_scf, compute_V_H_and_V_xc, setup_H_k, matrix,
 )

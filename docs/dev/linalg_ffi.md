@@ -163,7 +163,7 @@ failed guard, the mesh, and the available alternatives.
 and the two measured regimes point in opposite directions.
 
 *Batched eigh on GPU: native wins by a mile.* Measured
-(`common/eigh_benchmark.py --mode dispatch`, complex128, 2×2 A100-80GB
+(`tests/bench/eigh_benchmark.py --mode dispatch`, complex128, 2×2 A100-80GB
 mesh, native batch 32): the FFI eigh is 640×/249×/281×/94× slower *per
 matrix* at n = 512/1024/2048/4096 (cusolvermp) — fixed-cost dominated.
 The native path solves ndev matrices concurrently; the FFI path solves
@@ -459,12 +459,12 @@ What can run here?
 | `bandstructure/bse_setup.compute_wfns_fi` (fH_q) | **plan** — one plan for the whole q loop |
 | `bse/vq_interp.prepare_coarse` (coarse C_q) | **plan** — `plan.batched` replaced the hand-rolled per-q loop + `jnp.stack` |
 | `isdf/core._factor_c_q_distributed_rank_truncate` (ζ `distributed` tier) | **plan** — `backend='distributed'`, so the platform default is chosen in ONE place (it used to hard-code `scalapack` while the tier's own guard approved `distributed`, which on a CUDA mesh approved cuSOLVERMp and then called the host-only backend) |
-| `common/eigh_benchmark` | **plan** — and the plan is now hoisted out of the timing loop |
+| `tests/bench/eigh_benchmark.py` | **plan** — and the plan is now hoisted out of the timing loop |
 | `isdf/core.solve_zeta` cusolvermp-potrs / getrf+getrs branches | route strings + a cuSOLVERMp *handle* whose block-cyclic geometry `solve_zeta` rebuilds; the surrounding pad → solve → reshard → trim frame is de-duplicated into `_distributed_backsolve`, the backend call itself is left on `backend_module`. Migrate together with the ζ route strings, never separately — they are pinned. |
 | `isdf/core.factor_c_q` cusolvermp / slate cholesky branches | same: pinned route strings, and the two backends return different objects (handle vs `to_jax_lower()` L). `_IMPL` records the asymmetry; the branches can move once a route-pin test covers the handle path. |
 | `gw/w_isdf._get_w_solve_fn_distributed` (the W Dyson solve, plan 2 of 2) | **plan** — `plan('solve_lu', mesh, backend='distributed').batched(A, B)` with `A = (1 − pref·V·χ₀)` formed by a chunked 2-D block GEMM inside `shard_map` (house style: `isdf/core._distributed_pinv_apply`; per-instruction payloads bounded by `LORRAX_COLLECTIVE_CHUNK_MB`), reached by the input key `w_dyson_solver = distributed`.  The μ axes never leave `P(None,'x','y')`, so W_q(μ_X, ν_Y) is solved where it already lives — no rank ever materialises a full (μ, μ) tile. `distributed` is legal vocabulary for `solve_lu` (scalapack on cpu, cusolvermp on CUDA — the two backends `_IMPL` lists).  A resolve-time refusal RAISES with the resolver's own message — an explicitly requested distributed W solve never silently downgrades to the local per-q LU (the only other plan; `w_dyson_solver = local`, the default). |
 | `gw/w_isdf` cuBLASMp fused W-solve | **REMOVED** (two-plan W cleanup, 2026-07-27): the fused gemm+potrf+trsm kernel and its `isdf_memory_mode = low_mem` key are gone, superseded by `w_dyson_solver = distributed` (which binds cusolvermp on CUDA meshes through this facade — no new seams).  The `ffi/cublasmp` wrapper itself still exists for its own tests; it has no production consumer. |
-| `common/slate_*_test.py`, `slate_vs_cusolvermp_bench`, `eigh_block_sweep`, `cusolvermp_*_test.py` | deliberately NOT migrated: they exercise backend *internals* (raw buffer layouts, `block_size`, `compute_evecs`) that the plan normalizes away. Testing through the abstraction would stop them testing the thing. |
+| `tests/bench/slate_*_test.py`, `slate_vs_cusolvermp_bench`, `eigh_block_sweep`, `cusolvermp_*_test.py` | deliberately NOT migrated: they exercise backend *internals* (raw buffer layouts, `block_size`, `compute_evecs`) that the plan normalizes away. Testing through the abstraction would stop them testing the thing. |
 
 ## Sharp edges (read before touching defaults)
 

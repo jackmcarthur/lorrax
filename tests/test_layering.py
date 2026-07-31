@@ -94,18 +94,13 @@ _L2_PACKAGES = ("solvers", "mixing")
 
 
 def _is_standalone_driver(mod: str) -> bool:
-    """True for the bench / smoke-test drivers that live inside ``src/``.
+    """True for a bench / smoke-test driver shape inside ``src/``.
 
-    26 of them, and they are EXEMPT from every rule here — deliberately, and
-    the reason is measured, not aesthetic.  They construct meshes differently
-    ON PURPOSE (``ffi.cusolvermp.profile_batched`` parses ``--mesh 2x2`` and
-    exits on a mismatch, which is correct for a benchmark whose whole job is
-    sweeping geometries), and they carry the standalone jax preamble that the
-    real drivers get from ``runtime.bootstrap``.  Forcing them through the
-    service would delete the sweep.
-
-    They should MOVE to ``tests/``; until they do, they are exempt and their
-    number is pinned by :func:`test_the_src_tree_grows_no_new_bench_drivers`.
+    There are ZERO of them: the 26 exempt drivers moved to ``tests/bench/``
+    (2026-07-31), where the exemption is structural instead of a rule
+    carve-out.  The classifier stays so that
+    :func:`test_the_src_tree_grows_no_new_bench_drivers` can keep the count
+    at 0 — a new driver shape under ``src/`` belongs in ``tests/bench/``.
     """
     last = mod.split(".")[-1]
     return (last.endswith("_test") or last.startswith("test_")
@@ -1008,36 +1003,16 @@ def test_every_module_gets_a_level(sources):
 
 
 def test_the_src_tree_grows_no_new_bench_drivers(sources):
-    """26 bench/smoke drivers live under ``src/`` and are exempt from every
-    rule above.  They belong in ``tests/``; until then this pins the number
-    so the exemption cannot quietly widen.
-
-    Their cost is measured, not hypothetical: their copy-pasted jax preamble
-    is 108 of ``common/``'s 125 environment-read matches, i.e. the single
-    largest duplication in the environment sweep.
+    """The 26 exempt bench/smoke drivers moved to ``tests/bench/``
+    (2026-07-31), taking their copy-pasted jax preambles — 104 of
+    ``common/``'s 121 environment-read matches — with them.  This pins the
+    exemption count at ZERO: a module under ``src/`` whose name has a bench
+    shape would be exempt from every rule above, so none may exist.
     """
     found = sorted(m for m in sources if _is_standalone_driver(m))
-    assert len(found) <= 26, (
-        f"{len(found)} bench/test drivers under src/, was 26: "
-        f"{sorted(set(found) - set(_KNOWN_BENCH_DRIVERS))}.  New ones go in "
-        f"tests/.")
-
-
-_KNOWN_BENCH_DRIVERS = frozenset({
-    "bse.test_bse", "bse.test_davidson_bse",
-    "common.chol_natural_test", "common.cublasmp_gemm_test",
-    "common.cublasmp_w_solve_test", "common.cusolvermp_batched_test",
-    "common.cusolvermp_eigh_test", "common.cusolvermp_solve_lu_test",
-    "common.eigh_benchmark", "common.isdf_zeta_mode_test",
-    "common.potrs_rhs_test", "common.slate_batched_test",
-    "common.slate_chol_trsm_bench", "common.slate_cholesky_trsm_test",
-    "common.slate_eigh_test", "common.slate_trsm_isolated_test",
-    "common.slate_vs_cusolvermp_bench", "common.symmetry_test",
-    "common.w_solve_modes_test", "common.wfn_loader_backend_parity_test",
-    "common.zeta_projection_test", "ffi.cusolvermp.profile_batched",
-    "mixing.benchmark_synthetic", "psp.archive.charge_density",
-    "psp.tests.test_dft_hamiltonian", "psp.tests.test_sternheimer_jvp",
-})
+    assert not found, (
+        f"{len(found)} bench/test driver(s) under src/, must be 0: "
+        f"{found}.  Bench and smoke drivers live in tests/bench/.")
 
 
 def test_the_bench_driver_classifier_can_fail():

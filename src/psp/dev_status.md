@@ -79,7 +79,7 @@ Total:    26.2s
 
 ### Eigenvalue validation (0.0 mRy target)
 
-The canonical test is `psp/tests/test_dft_hamiltonian.py`.  It builds
+The canonical test is `tests/bench/test_dft_hamiltonian.py`.  It builds
 H from a QE .save directory, diagonalizes in the NSCF wavefunction basis,
 and compares eigenvalues at all IBZ k-points.  Self-contained, no stale
 scripts.

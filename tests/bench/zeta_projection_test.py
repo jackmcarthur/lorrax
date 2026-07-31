@@ -39,7 +39,7 @@ Usage::
 
     # 4 emulated devices, one process
     XLA_FLAGS=--xla_force_host_platform_device_count=4 \
-      python -u -m common.zeta_projection_test --cell dense --mesh 2x2
+      python -u tests/bench/zeta_projection_test.py --cell dense --mesh 2x2
 
     # production scaling point
     srun -N32 --ntasks-per-node=2 -n64 ... python -u -m \

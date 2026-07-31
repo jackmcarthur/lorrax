@@ -75,7 +75,7 @@ src/
 │   ├── timing.py              named sections, aggregate report
 │   ├── minimax.py             Laplace + imag-ω minimax solvers
 │   ├── minimax_assets/        shipped quadrature tables (npz + catalog.json)
-│   ├── slate_* / cusolvermp_eigh_test
+│   ├── (bench/smoke drivers → tests/bench/, 2026-07-31)
 │   │                          FFI smoke tests / benchmarks (run via lxrun)
 │   └── phdf5_*                phdf5 benchmarks + plumbing tests
 │
@@ -130,7 +130,7 @@ src/
 │   ├── bse_feast.py, bse_lanczos.py, bse_kpm.py
 │   ├── bse_preconditioner.py, bse_pseudopoles.py
 │   ├── bse_ring_comm.py, bse_serial.py
-│   └── context/, test_bse.py
+│   └── context/  (test_bse.py → tests/bench/)
 │
 ├── bandstructure/        # H-matrix interpolation (experimental)
 │   └── htransform.py
@@ -499,8 +499,8 @@ uv run python -m gw.kin_ion_io -i cohsex.in
 uv run python -m gw.gw_jax -i cohsex.in
 
 # FFI smoke tests (module-load + lxalloc first)
-lxrun python3 -m common.slate_batched_test
-lxrun python3 -m common.cusolvermp_eigh_test
+lxrun python3 tests/bench/slate_batched_test.py
+lxrun python3 tests/bench/cusolvermp_eigh_test.py
 lxrun python3 -m common.phdf5_write_test
 ```
 
@@ -641,8 +641,8 @@ main                                       [gw/gw_jax.py]
 | **Dipole generation** | `psp/get_dipole_mtxels.py : main` |
 | **kin_ion generation** | `gw/kin_ion_io.py : main` |
 | **FFI loader** | `ffi/common/ffi_loader.py : phdf5_init_mpi`, `register_handlers` |
-| **cuSOLVERMp eigh** | `ffi/cusolvermp/eigh.py`, smoke test `common/cusolvermp_eigh_test.py` |
-| **SLATE eigh / Cholesky / trsm** | `ffi/slate/` , tests `common/slate_*_test.py` |
+| **cuSOLVERMp eigh** | `ffi/cusolvermp/eigh.py`, smoke test `tests/bench/cusolvermp_eigh_test.py` |
+| **SLATE eigh / Cholesky / trsm** | `ffi/slate/` , tests `tests/bench/slate_*_test.py` |
 | **phdf5 R/W** | `ffi/phdf5/` , benchmarks `common/phdf5_*.py` |
 
 ---

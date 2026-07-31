@@ -7,7 +7,7 @@ cusolverMp on a 2x2 grid:
       CUSOLVERMP_FORCE_NCCL=1 \\
       XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \\
       XLA_PYTHON_CLIENT_PREALLOCATE=false \\
-      python3 -u -m common.eigh_benchmark -n 2048 --repeats 5
+      python3 -u tests/bench/eigh_benchmark.py -n 2048 --repeats 5
 
 Prints per-call wall time (ms) with one warm-up excluded so JIT compile and
 lazy context setup don't show up in the mean.
