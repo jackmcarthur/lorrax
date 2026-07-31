@@ -25,6 +25,7 @@ from runtime import bootstrap
 bootstrap()
 
 import argparse
+import os
 
 import numpy as np
 
@@ -92,7 +93,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prune-n-val", type=int, default=None,
                    help="Override pivoted-Cholesky n_val (default = wfn.nelec).")
     p.add_argument("--prune-n-cond", type=int, default=None,
-                   help="Override pivoted-Cholesky n_cond (default = n_val).")
+                   help="Override pivoted-Cholesky n_cond (default = the FULL "
+                        "conduction window in the WFN, nbands - n_val, which "
+                        "is a superset of any deck's ncond and therefore "
+                        "always safe). Narrowing this selects the ISDF basis "
+                        "on fewer pair densities than Sigma_c will consume; "
+                        "the rank gate will refuse if that costs independence. "
+                        "Before 2026-07-29 the default was min(n_val, nbands - "
+                        "n_val), which silently clamped the window to n_val.")
     p.add_argument("--prune-window", choices=("v_x_c", "v_x_vc", "vc_x_vc"),
                    default="v_x_vc",
                    help="Pivoted-Cholesky Gram band-window pair. "
@@ -188,12 +196,42 @@ def _resolve_sigma_window(args, wfn) -> tuple[int, int]:
     reads this run's log and FAILS on the shortfall — do not reword the
     "target N orbits", "prune window:" or "After pruning ... rank=N" lines
     below without updating it.
+
+    BUG FIX 2026-07-29 (size campaign, ladder notes R12).  The default was
+
+        n_cond = min(n_val, nb_total - n_val)
+
+    which CLAMPS the conduction extent to ``n_val`` and therefore has nothing
+    to do with the window Σ_c actually consumes.  On the MoS2 4×4 deck
+    (``nelec = 26``) it produced a 26×52 prune window for EVERY centroid set
+    the size campaign built — b256 c2500, b512 c7000, b1024 c10000, b1024
+    c15000 — while the b1024 deck's σ window is ``nval 26 + ncond 998 = 1024``.
+    The ISDF basis was thus selected to resolve a 26×52 pair-density block and
+    then used for a 1024×1024 one.  Measured cost of the clamp at
+    (nb=1024, N=10000, M=13872), same WFN and same candidate pool:
+
+        prune window (0,52)   -> Gram diag min 7.632e-17, rank 630 / 897
+        prune window (0,256)  -> Gram diag min 7.189e-13, rank 897 / 897
+        prune window (0,1024) -> Gram diag min 4.996e-12, rank 897 / 897
+
+    i.e. the old default was **rank-deficient by 30%**: pivoted Cholesky was
+    asked for 897 independent directions and could only certify 630, because
+    the narrow window leaves most candidate centroids at numerically-zero Gram
+    diagonal.  This is treated as a BUG, not a default change — every
+    pre-fix centroid set is affected and should be regarded as selected for a
+    different, much smaller problem than the one it was used on.
+
+    The new default is the FULL conduction window present in the WFN, which is
+    a superset of any deck's ncond and therefore always safe.  Narrowing is
+    still available explicitly via ``--prune-n-cond``.  Cost of the fix is
+    small and was measured, not assumed: the (0,1024) build took 349 s against
+    308 s for (0,52) at nb=1024 — +13% wall, +15 GB peak (81 GB of 186 GB).
     """
     n_val = (int(args.prune_n_val) if args.prune_n_val is not None
              else int(wfn.nelec))
     nb_total = int(wfn.nbands)
     n_cond = (int(args.prune_n_cond) if args.prune_n_cond is not None
-              else min(n_val, nb_total - n_val))
+              else max(0, nb_total - n_val))
     return n_val, n_cond
 
 
@@ -482,6 +520,46 @@ def main():
             args, wfn, sym, mesh, centroid_indices, orbit_id_arr,
             n_unique, N_c)
         centroids_snapped = centroid_indices.astype(float) / np.asarray(fft_grid)
+
+        # --- HARD REFUSAL: the achieved rank must meet the request ----------
+        # (size campaign 2026-07-29, ladder notes R12.4; owner-approved.)
+        # ``rank`` is how many INDEPENDENT interpolation directions pivoted
+        # Cholesky could actually certify.  If it falls short of the number of
+        # orbits requested, the returned set is padded with directions the
+        # Gram says are numerically null — the file still contains the
+        # requested number of points, so nothing downstream notices, and the
+        # ISDF silently under-resolves.  That is exactly what happened on the
+        # b1024 rung: rank 630 against 897 requested, printed in every log for
+        # the whole campaign and read by nobody, while Σ_c produced a QP gap
+        # of 0.36 eV against a true ~3.2-3.6 eV.  Refuse instead.
+        _rank_tol = float(os.environ.get("LORRAX_CENTROID_RANK_TOL", "0.01"))
+        _rank_floor = int(np.ceil((1.0 - _rank_tol) * n_orbit_keep))
+        if int(rank) < _rank_floor:
+            raise SystemExit(
+                f"\nFATAL: pivoted-Cholesky rank deficiency — the candidate "
+                f"pool cannot supply the independence you asked for.\n"
+                f"  requested : {n_orbit_keep} "
+                f"{'orbits' if orbit_id_arr is not None else 'points'}\n"
+                f"  achieved  : {rank}   ({100.0 * rank / max(1, n_orbit_keep):.1f}%"
+                f", floor {_rank_floor} at tol {_rank_tol:g})\n"
+                f"  prune window: left=(0,{_n_val_eff}) right=(0,{_max_band}) "
+                f"[{args.prune_window}]\n"
+                f"The centroids that WOULD have been written are padded with "
+                f"numerically-null directions; an ISDF built on them will\n"
+                f"under-resolve Σ and can be wrong by electron-volts without "
+                f"failing any other gate.  Fix one of:\n"
+                f"  * widen the prune window  — --prune-n-cond <ncond of your "
+                f"deck>  (this is the usual cause; the default is now the\n"
+                f"    full WFN conduction window, so a shortfall here means "
+                f"the window was narrowed explicitly)\n"
+                f"  * use --prune-window vc_x_vc to include c×c pair "
+                f"densities (needed when ncond >> nval)\n"
+                f"  * raise --oversample so the candidate pool is richer, or "
+                f"lower N so you ask for fewer directions\n"
+                f"To override deliberately (NOT recommended for production): "
+                f"LORRAX_CENTROID_RANK_TOL=<fraction>.\n")
+        print(f"  [rank gate] {rank}/{n_orbit_keep} directions certified "
+              f"(floor {_rank_floor}, tol {_rank_tol:g}) — PASS")
 
     # Default suffix follows --density-mode unless the user overrode it.
     out_suffix = (args.out_suffix

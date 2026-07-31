@@ -8,6 +8,7 @@ gamma_matrices, cholesky_2d, fft_helpers, wfn_transforms, psi_G_store) and
 (func-local) ``ffi/`` (cusolvermp).  NO ``gw`` / LorraxConfig / h5 / V_q
 packaging lives here — GW and BSE are consumers.
 """
+import math
 import os
 import time
 from types import SimpleNamespace
@@ -1088,6 +1089,7 @@ def _resolve_solver_kind_charge(
     mesh_xy: Mesh, override: str = "auto",
     n_rmu: int | None = None, nq: int | None = None,
     charge_zeta_solve: str = "cholesky",
+    replicated_factor_used: bool = True,
 ) -> str:
     """Pick the charge-channel ζ-fit solver: fully-replicated dense
     Cholesky (mesh-invariant, the default for fit-size tiles) vs the
@@ -1174,16 +1176,62 @@ def _resolve_solver_kind_charge(
         if (charge_zeta_solve == 'rank_truncate'
                 and _replicate_rank_truncate_ok(nq, n_rmu)):
             return 'replicated_rank_truncate'
+        if charge_zeta_solve == 'rank_truncate' and not replicated_factor_used:
+            # CAPACITY FIX (size campaign 2026-07-29, ladder notes R15.1).
+            # ``distributed_zeta_solve='distributed'`` REPLACES this factor
+            # wholesale with ``_factor_c_q_distributed_rank_truncate``, whose
+            # layout contract never replicates an O(mu^2) object at all
+            # (C_q/C+/V all P(None,'x','y'); only lambda (nq,mu) is
+            # replicated).  The caller overrides ``_resolved_solver_kind`` to
+            # 'distributed_rank_truncate' on the very next statement.  So
+            # enforcing the REPLICATED capacity here refuses a run on the
+            # size of a buffer that is never allocated -- it was capping mu at
+            # sqrt(4 GiB / 16 B) = 16,384 for a route that does not use the
+            # buffer.  Return the nominal kind and let the caller override.
+            return 'replicated_rank_truncate'
         if charge_zeta_solve == 'rank_truncate':
-            need = (int(nq) * int(n_rmu) ** 2 * 16 / 1024**3
+            # REPORT THE QUANTITY THAT ACTUALLY FAILED (DLM campaign
+            # 2026-07-29, jobs 7879700 / 7879689).  Reaching here means BOTH
+            # gates above said no, and they test DIFFERENT things:
+            #   _replicate_charge_ok      whole stack   nq * mu^2 * 16
+            #   _replicate_rank_truncate_ok  one q-batch  batch * mu^2 * 16
+            # The second is the weaker one, so IT is what binds, and the cap
+            # that would clear it is the per-batch figure -- not the stack.
+            # The old message quoted the stack and advised the stack-sized cap
+            # (61 / 94 GiB at the two sizes measured), which over-states the
+            # fix by ~10x: 6 / 10 GiB is what those runs actually needed.
+            stack = (int(nq) * int(n_rmu) ** 2 * 16 / 1024**3
+                     if nq and n_rmu else 0.0)
+            batch = (_replicated_factor_q_chunk(int(nq), int(n_rmu))
+                     if nq and n_rmu else 1)
+            need = (batch * int(n_rmu) ** 2 * 16 / 1024**3
                     if nq and n_rmu else 0.0)
+            # The exact mu ceiling this route carries, from the two 4 GiB caps:
+            # batch collapses to 1 once one (mu, mu) c128 matrix exceeds
+            # _REPLICATED_FACTOR_MAX_BATCH_BYTES, so the criterion reduces to
+            # mu <= sqrt(max(cap, factor_cap) / 16).
+            _cap = max(_REPLICATED_CHOL_MAX_STACK_BYTES,
+                       _REPLICATED_FACTOR_MAX_BATCH_BYTES)
+            mu_max = int(math.isqrt(_cap // 16))
             raise ValueError(
-                f"charge_zeta_solve='rank_truncate' needs the replicated route, "
-                f"but the CCT stack (nq={nq}, n_mu={n_rmu}) is {need:.2f} GiB > "
-                f"the {_REPLICATED_CHOL_MAX_STACK_BYTES / 1024**3:.2f} GiB cap.  "
-                f"Set LORRAX_ZETA_REPLICATE_CAP_GIB={-(-need // 1) + 1:.0f} if the "
-                f"device budget allows, or charge_zeta_solve='cholesky' to accept "
-                f"the distributed factor (NOT rank-conditioned — verify V_q).")
+                f"charge_zeta_solve='rank_truncate' needs the replicated "
+                f"factor, and the binding limit is ONE q-batch, not the "
+                f"stack: batch={batch} x (n_mu={n_rmu})^2 x 16 B = "
+                f"{need:.2f} GiB > the {_cap / 1024**3:.2f} GiB per-batch cap.  "
+                f"(The whole CCT stack, nq={nq}, is {stack:.2f} GiB -- context "
+                f"only; it is NOT what failed.)  On this route the replicated "
+                f"factor is allocated one q-batch at a time, so the ceiling is "
+                f"n_mu <= {mu_max}.  "
+                f"Set LORRAX_ZETA_REPLICATE_CAP_GIB={-(-need // 1) + 1:.0f} to "
+                f"clear it if the device budget allows -- but note the factor "
+                f"is a dense eigh per q run REDUNDANTLY on every rank, "
+                f"O(nq*n_mu^3) with NO P-scaling (measured 4712 s at "
+                f"n_mu=10015 on 64 ranks, so ~20 h at n_mu=24933): raising the "
+                f"cap makes this RESOLVE, not finish.  For large n_mu use "
+                f"distributed_zeta_solve='distributed' instead (ScaLAPACK "
+                f"pzheevd, 236 s at the same size), or "
+                f"charge_zeta_solve='cholesky' to accept the distributed "
+                f"factor (NOT rank-conditioned — verify V_q).")
         return None
 
     return _resolve_channel_ladder(
@@ -1309,6 +1357,7 @@ def _resolve_solver_kind(
     n_rmu: int | None = None,
     nq: int | None = None,
     charge_zeta_solve: str = "cholesky",
+    replicated_factor_used: bool = True,
 ) -> str:
     """Single source of truth for the ``auto`` resolution.  Transverse
     channels (γ̃^i, μ_L≠0) take ``_resolve_solver_kind_transverse``;
@@ -1330,7 +1379,8 @@ def _resolve_solver_kind(
             mesh_xy, distributed_lu, n_rmu_logical=n_rmu)
     return _resolve_solver_kind_charge(
         mesh_xy, distributed_cholesky, n_rmu=n_rmu, nq=nq,
-        charge_zeta_solve=charge_zeta_solve)
+        charge_zeta_solve=charge_zeta_solve,
+        replicated_factor_used=replicated_factor_used)
 
 
 # Budget for the ζ back-solve's replicated-factor ALL-GATHER, i.e. the
@@ -1863,6 +1913,49 @@ def _chunk_log(where: str, nq: int, qb: int, per_q_bytes: int) -> None:
     took a 72-node job down again.  Deduplicated on the tuple, because the
     back-solve site is re-entered once per r-chunk (9–81 times).
     """
+    # --- LOUD FLOOR (size campaign 2026-07-29, owner-approved) -------------
+    # `_chunk_q` splits the q axis ONLY.  Once ONE q's collective exceeds the
+    # budget its `max(1, ...)` floor returns q_block=1 and there is no
+    # granularity left: the advertised bound is then simply ABANDONED and the
+    # emitted payload grows as mu^2 unchecked.  That is a silent downgrade of a
+    # bound this module advertises, which the project's rules forbid.
+    #
+    # Trigger arithmetic differs PER CALL SITE — do not quote one threshold:
+    #   C+ formation (pinv):     per-q ~ mu^2 * 16 / Px
+    #        -> breaches 128 MiB above mu ~ sqrt(budget*Px/16) = 8,192 (Px=8)
+    #   C+ back-solve (GEMM):    per-q ~ (mu^2/Px + mu*r_chunk/Py) * 16,
+    #        i.e. dominated by the mu*r_chunk term, LINEAR in mu
+    #        -> breaches 128 MiB above mu ~ budget*Py/(16*r_chunk) = 1,456
+    #           at r_chunk = 46,080, Py = 8.
+    # MEASURED, and it corrected the first version of this comment: at the
+    # campaign's SMALLEST deck (mu=2475) the pinv site sits at 12.5 MB/q
+    # (fine, q_block=10) while the back-solve site already emits 230.0 MB/q
+    # (1.7x over).  So the back-solve bound has been violated by essentially
+    # EVERY run this project has ever made, not merely by mu > 8,192.
+    # Larger measured back-solve payloads: 926 MB at mu=10015, 1386 MB at
+    # 15007, 1773 MB at 24933 -- up to 13.2x the cap.
+    # NOTE: no failure has ever been attributed to the violation; this is an
+    # honesty fix, not a wall.  Deliberately announced BEFORE the
+    # LORRAX_COLLECTIVE_CHUNK_LOG check — a routine-logging knob must not be
+    # able to silence a bound violation — and with its own dedup key.
+    _budget = _collective_chunk_bytes()
+    if int(qb) <= 1 and int(per_q_bytes) > _budget and jax.process_index() == 0:
+        _wsig = ("__floor__", where, int(per_q_bytes))
+        if _wsig not in _chunk_logged:
+            _chunk_logged.add(_wsig)
+            print(f"  [collective chunk] WARNING {where}: cannot honour the "
+                  f"payload bound — one q alone emits "
+                  f"{per_q_bytes / 1e6:.1f} MB against a "
+                  f"{_budget / 1e6:.1f} MB budget "
+                  f"({per_q_bytes / max(1.0, _budget):.1f}x). q is the only "
+                  f"split axis, so q_block is already 1 and the bound is "
+                  f"ABANDONED, not enforced. The per-q payload grows with mu "
+                  f"at this site (pinv ~ mu^2/Px; back-solve ~ mu*r_chunk/Py, "
+                  f"so the back-solve bound is already unhonourable at the "
+                  f"smallest production mu). No failure has been attributed to "
+                  f"this; raise LORRAX_COLLECTIVE_CHUNK_MB to silence it "
+                  f"honestly, or accept the larger payload.",
+                  flush=True)
     if not _env_bool("LORRAX_COLLECTIVE_CHUNK_LOG", True):
         return
     if jax.process_index() != 0:
