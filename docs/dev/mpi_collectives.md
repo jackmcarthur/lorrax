@@ -222,6 +222,9 @@ build (whole-file equality is not achievable — the build CWD is embedded in
 
 ## Launch recipe
 
+**Executable form: `config/frontera/templates/gw_dev.sbatch`** — the
+certified launch block, vendored; the fragments below are its anatomy.
+
 ```bash
 # --- collectives ----------------------------------------------------------
 export JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi
@@ -231,10 +234,16 @@ export LORRAX_MPI_FINALIZE_FIX=skip_atexit
 # warm_mesh_cliques() replaces it.  Setting it would only mask a missing
 # warm-up call site.
 PYTHONPATH=$WORK/lorrax_env_mpi_overlay/site:$PYTHONPATH   # the sitecustomize
+# The overlay (mpi4py 4.1.2 + parallel h5py 3.16.0 + sitecustomize.py) is
+# now buildable from the repo: config/frontera/build_mpi_overlay.sh.
 
-# --- Intel-MPI provider ---------------------------------------------------
-export LORRAX_MPI_PROVIDER=auto   # auto => FI_PROVIDER unset => mlx
-export I_MPI_DEBUG=4              # provider banner is mandatory telemetry
+# --- Intel-MPI transport --------------------------------------------------
+# The whole block (PMI2 glue, fabrics, provider case-block, UCX
+# setdefaults, I_MPI_DEBUG=4 banner) is config/frontera/mpi_transport_env.sh
+# — source it instead of hand-copying exports.  The PMI2 lib it points at
+# is staged once by config/frontera/stage_host_pmi.sh.
+. $LORRAX_ROOT/config/frontera/mpi_transport_env.sh
+export LORRAX_MPI_PROVIDER=auto   # auto => FI_PROVIDER unset => mlx (default)
 
 # --- container binds ------------------------------------------------------
 # NEVER bind anything under /dev.  RDMA userspace staging:

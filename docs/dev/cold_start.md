@@ -181,6 +181,12 @@ export PYTHONPATH=$LORRAX_OVERLAY_DIR:$LORRAX_SRC_DIR
 $LORRAX_PY -u -m gw.kin_ion_io ...
 ```
 
+The canonical job that wires this together with the transport env and the
+impl=mpi collectives block is `config/frontera/templates/gw_dev.sbatch`.
+`stage_runtime.sh` also evicts stale extracts under its `/tmp` staging root
+(keeps the newest 2 by mtime, never the key in use) — without that, every
+bundle rebuild left another ~800 MB tree on the node SSD.
+
 `build_cpu_runtime_bundle.sh` packs venv + MPI overlay + `src/` into one
 `tar` on `/scratch2`, minus the packages a CPU run cannot use
 (`nvidia/*`, `jax_plugins/`, `jax_cuda12_plugin/`, and the
@@ -447,3 +453,49 @@ are dominated by the large `.so` and are unaffected in any way that matters.
   so ordering drift can be compared against the trend it might be faking.
 * **One deck.** Everything is MoS₂ 4×4, nb=256. The import costs are
   deck-independent by construction; the driver-work numbers in §3.4 are not.
+
+---
+
+## 7. What can — and CANNOT — be cold-started from the repo
+
+As of 2026-07-31 (env audit P0 vendoring wave), a new user with only this
+repo plus the standard TACC environment can build, from tracked recipes in
+`config/frontera/`:
+
+* the GPU FFI `.so` (`stage_ffi_deps.sh` + `build_ffi.sh`) and the host CPU
+  FFI `.so` (`build_ffi_host.sh`, given a SLATE install — see below);
+* the patched MPIwrapper (`build_mpiwrapper.sh`, pinned upstream + in-repo
+  patch, machine-code verification);
+* the mpi4py/parallel-h5py overlay incl. the `sitecustomize` teardown fix
+  (`build_mpi_overlay.sh`, sha256-pinned sources);
+* the staged host PMI2 library (`stage_host_pmi.sh`, provenance + checksum
+  recorded in the script);
+* the CPU runtime bundle + its per-node staging
+  (`build_cpu_runtime_bundle.sh` + `stage_runtime.sh`);
+* a certified multi-node launch (`templates/gw_dev.sbatch`).
+
+### NOT yet vendored — a cold start still depends on artifacts outside the repo
+
+Stating the gaps, not implying completeness:
+
+1. **The container image itself.** Every recipe above runs inside
+   `py312.sif`, which exists only as a built image
+   (`/scratch2/.../lorrax_setup/py312.sif`). There is **no `.def` recipe in
+   the repo**; "python:3.12-bookworm + uv" describes it but does not rebuild
+   it byte-for-byte.
+2. **The venv build procedure.** The shared uv venv
+   (`$WORK/lorrax_env/.venv`, jax 0.9.1 CPU+CUDA-12 wheels et al.) has no
+   in-repo lockfile-to-venv script for Frontera; `pyproject.toml` targets
+   CUDA 13 and is *not* what built it. Reconstructing the exact wheel set
+   relies on the live venv.
+3. **The SLATE host build.** `build_ffi_host.sh` consumes
+   `$WORK/slate_builds/cpu/install`, whose build script is referenced at
+   `/scratch2/.../lorrax_setup/wk_L/build_slate_host.sh` — outside the repo,
+   on a purgeable filesystem.
+4. **The end-to-end MPI-IO smoke.** `build_mpi_overlay.sh` verifies the
+   build in-process; the original 4-rank `srun --mpi=pmi2` collective
+   write/readback smoke (wk_AB `mpiio_smoke.py`) is not vendored, so the
+   overlay's first multi-rank use in a job is still the real gate.
+
+Until 1–3 are vendored, "cold start" here means "cold start of a node that
+already has the /work2 artifacts", not "cold start of a new allocation".

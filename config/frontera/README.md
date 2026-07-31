@@ -65,18 +65,23 @@ build:
 ```bash
 export LORRAX_ROOT=$PWD
 config/frontera/build_mpiwrapper.sh --fresh    # LOGIN NODE (needs gfortran)
+config/frontera/build_mpi_overlay.sh fetch     # LOGIN NODE (network)
+config/frontera/build_mpi_overlay.sh build     # inside the SIF, COMPUTE node
 
 # then, in the job's container env:
 export JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi
 export MPITRAMPOLINE_LIB=$WORK/lorrax_mpiwrapper/install/lib64/libmpiwrapper.so
-export LORRAX_MPI_FORCE_THREAD_MAIN=1
 export LORRAX_MPI_FINALIZE_FIX=skip_atexit
 PYTHONPATH=$WORK/lorrax_env_mpi_overlay/site:$PYTHONPATH
+# LORRAX_MPI_FORCE_THREAD_MAIN: deliberately UNSET — superseded by the
+# in-repo warm_mesh_cliques() (mpi_collectives.md STATUS); setting it would
+# only mask a missing warm-up call site.
 ```
 
-All four are load-bearing; omitting the last one makes every successful run
-exit rc=1. Full rationale and the rest of the env block:
-**`docs/dev/mpi_collectives.md`**.
+All three exports plus the overlay `sitecustomize` are load-bearing; omitting
+`LORRAX_MPI_FINALIZE_FIX` makes every successful run exit rc=1. Full
+rationale and the rest of the env block: **`docs/dev/mpi_collectives.md`**.
+The whole certified block, executable: `templates/gw_dev.sbatch`.
 
 ## Cold start: the node-local run-time bundle
 
@@ -122,8 +127,10 @@ falsified instruments: **`docs/dev/cold_start.md`**.
   (`slab_io` router: `PHDF5_FFI` → `phdf5_host` → allgather).
   `build_ffi_host.sh` (this dir) builds it with
   `-DLORRAX_FFI_HAVE_PHDF5=ON` against the host Intel MPI hybrid-mounted
-  into the container; `ffi_env.sh` stages the runtime (PMI2 lib,
-  `FI_PROVIDER_PATH`, the `LORRAX_MPI_PROVIDER` dial, UCX setdefaults).
+  into the container; `mpi_transport_env.sh` supplies the transport (PMI2
+  lib, `FI_PROVIDER_PATH`, the `LORRAX_MPI_PROVIDER` dial, UCX
+  setdefaults — now unconditional) and `ffi_env.sh` (back-compat shim)
+  adds the phdf5 `.so`/library staging under `LORRAX_FFI_PHDF5=1`.
 * **SLATE / ScaLAPACK** — built by `build_ffi_host.sh` into
   `liblorrax_ffi_host.so`; ScaLAPACK `pzheevd`
   (`ScalapackEighHostFfi`) is the permanent CPU distributed eigh behind
@@ -136,7 +143,7 @@ falsified instruments: **`docs/dev/cold_start.md`**.
 ## Transport — do NOT seed `FI_PROVIDER` (post-AU doctrine)
 
 On Frontera CLX leave `FI_PROVIDER` **unset** (`LORRAX_MPI_PROVIDER=auto`,
-the `ffi_env.sh` default): Intel MPI then auto-selects the native `mlx`
+the `mpi_transport_env.sh` default): Intel MPI then auto-selects the native `mlx`
 (UCX/RDMA) provider — measured 1.07 µs / 11.4 GB/s vs the old
 `FI_PROVIDER=tcp` seed's 10.9 µs / 2.15 GB/s, which was the root cause of
 the 30-minute pzheevd era (n=2448 P=144: ~12 s/q under tcp vs
@@ -144,3 +151,19 @@ the 30-minute pzheevd era (n=2448 P=144: ~12 s/q under tcp vs
 `LORRAX_MPI_PROVIDER=tcp` remains ONLY as the rtx/mlx4 (ConnectX-3)
 escape hatch.  Trust the `I_MPI_DEBUG≥4` `libfabric provider:` banner,
 never `fi_info` (it false-negatives on mlx).
+
+## What is in this directory (2026-07-31 inventory)
+
+| file | role |
+|---|---|
+| `gpu_env.sh` | rtx CUDA env: FFI `.so`, venv nvidia libs, the `cuda_async` + sm_75 `XLA_FLAGS` matched pair |
+| `mpi_transport_env.sh` | Intel-MPI transport hygiene, **unconditional**: PMI2 glue, `I_MPI_FABRICS` (default `shm:ofi`; `LORRAX_MPI_FABRICS=shm` = rtx hatch), `LORRAX_MPI_PROVIDER` case-block, UCX setdefaults, `I_MPI_DEBUG` |
+| `ffi_env.sh` | **deprecated back-compat shim**: sources the two above + the `LORRAX_FFI_PHDF5=1` staging block |
+| `stage_ffi_deps.sh` / `build_ffi.sh` | GPU FFI: pip CUDA root staging + `liblorrax_ffi.so` build (in-container) |
+| `build_ffi_host.sh` | CPU host FFI: phdf5 + SLATE/ScaLAPACK `liblorrax_ffi_host.so` |
+| `build_mpiwrapper.sh` + `mpiwrapper/` | the patched MPIwrapper for `impl=mpi` (login node) |
+| `build_mpi_overlay.sh` + `sitecustomize.py` | the mpi4py 4.1.2 / parallel-h5py 3.16.0 PYTHONPATH overlay, pinned + verified (`fetch` on login, `build` in-container) |
+| `stage_host_pmi.sh` | stages the host SLURM PMI2 lib to `$WORK/host_pmi` (provenance + checksum recorded in the script) |
+| `build_cpu_runtime_bundle.sh` / `stage_runtime.sh` | node-local runtime bundle build / per-node staged unroll (keeps the newest 2 extracts) |
+| `templates/gw_dev.sbatch` | **the canonical multi-node CPU launch** — certified block, all knobs via variables |
+| `cmake/` | the FindMPI shadow stub for the in-container phdf5 build |

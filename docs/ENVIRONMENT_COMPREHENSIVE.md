@@ -136,7 +136,8 @@ share one pool.  If you need a hard cap, `MEM_FRACTION` is honoured only by BFC
 `runtime.set_default_env()` deliberately leaves `XLA_PYTHON_CLIENT_ALLOCATOR`
 **unset** (= BFC) and pins only `XLA_PYTHON_CLIENT_PREALLOCATE=false`.  On sm_75
 (Frontera `rtx`) `cuda_async` additionally needs the command-buffer restriction
-that `config/frontera/ffi_env.sh` sets alongside it; promote it globally only
+that `config/frontera/gpu_env.sh` sets alongside it (formerly in `ffi_env.sh`,
+now a back-compat shim that sources it); promote it globally only
 together with that mitigation.  An unrecognised value is refused up front by
 `runtime._check_allocator_env()` — left to jaxlib it surfaces as
 `Backend 'cuda' is not in the list of known backends`, which reads as missing
@@ -448,6 +449,14 @@ Or via env vars `JAX_COORDINATOR_ADDRESS`, `JAX_NUM_PROCESSES`, `JAX_PROCESS_IND
 ---
 
 ## 7. Generic SLURM clusters
+
+> **TACC Frontera** is a fully worked non-Shifter port and has its own docs:
+> [`config/frontera/README.md`](../config/frontera/README.md) (apptainer, the
+> env-script split `gpu_env.sh` / `mpi_transport_env.sh`, the FFI and
+> MPIwrapper/overlay build recipes) and the canonical batch template
+> [`config/frontera/templates/gw_dev.sbatch`](../config/frontera/templates/gw_dev.sbatch).
+> CPU collectives there run on `impl=mpi` —
+> [`docs/dev/mpi_collectives.md`](dev/mpi_collectives.md).
 
 Port via `config/<cluster>/` (see [`config/README.md`](../config/README.md) §Porting for the full knob list). Headline edits live in `site_config.sh`:
 
