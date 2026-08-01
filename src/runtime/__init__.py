@@ -1805,13 +1805,30 @@ def format_startup_report(f: dict) -> list:
             f"state, so a run printing this line bypassed "
             f"initialize_communicator_stack — see "
             f"docs/environment/overview.md for the library build.")
+    # The dial sentences are PLATFORM-AWARE: an enabled dial whose platform
+    # scope excludes this run's backend is not "routed through the FFI
+    # handler" — it does not exist here, and the gate's own enforce() skips
+    # it silently by declared policy (Gate.silent_platform_demote).  Found
+    # by the P1.2 GPU certification (job 7885151): on a CUDA mesh the block
+    # claimed the LORRAX_BANDS_GEMM_FFI contraction rode the FFI handler
+    # while the actual GEMMs ride XLA:GPU's native cuBLAS lowering.
+    _plat_key = ("CUDA" if f.get("backend") in ("gpu", "cuda")
+                 else f.get("backend"))
     for d in f.get("ffi_dials", ()):
         if d.get("mode") is None:
             add(f"  The {d['env']} dial could not be resolved: {d['detail']}.")
             continue
         raw = d.get("raw")
         how = f"set to {raw!r}" if raw not in (None, "") else "unset"
-        if d["enabled"]:
+        plats = tuple(d.get("platforms") or ())
+        if d["enabled"] and plats and _plat_key not in plats:
+            route = (f"rides the platform's native lowering — the dial "
+                     f"exists on {'/'.join(plats)} only and this run's "
+                     f"backend is {f.get('backend')!r}, where startup "
+                     f"enforcement skips it by the gate's declared platform "
+                     f"policy (the native lowering IS the required path "
+                     f"there)")
+        elif d["enabled"]:
             route = "is routed through the FFI handler (the required layer)"
         elif d.get("off_policy") == "refuse":
             route = ("has NOTHING to run — the native duplicate was "

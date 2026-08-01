@@ -512,6 +512,28 @@ def test_an_on_dial_states_the_required_route():
     assert "routed through the FFI handler (the required layer)" in out
 
 
+def test_an_on_dial_out_of_platform_scope_states_the_native_route():
+    """On a GPU run the LORRAX_BANDS_GEMM_FFI dial does not exist (its
+    handler is in the host symbol table only; XLA:GPU's dot lowering
+    already dispatches cuBLAS) and ``Gate.enforce`` skips it silently by
+    declared policy.  The P1.2 GPU certification (job 7885151) caught the
+    block claiming the contraction was "routed through the FFI handler"
+    on a CUDA mesh — a platform-blind sentence.  The block must state the
+    platform truth instead, while the in-scope dials keep the required
+    wording."""
+    out = _text(_facts(backend="gpu", device_kind="Quadro RTX 5000",
+                       jax_platforms_env="cuda,cpu"))
+    assert ("The LORRAX_BANDS_GEMM_FFI dial is unset and resolved to on, "
+            "so the contract_bands right-GEMM contraction rides the "
+            "platform's native lowering") in out
+    assert "exists on cpu only" in out
+    assert "native lowering IS the required path there" in out
+    # the platform-scoped truth must not leak onto in-scope dials: the FFT
+    # dial exists on CUDA and still states the required route.
+    assert ("so the flat-k 3-D FFT helper path is routed through the FFI "
+            "handler (the required layer)") in out
+
+
 def test_an_off_dial_whose_twin_was_deleted_states_the_refusal():
     """LORRAX_FFT_FFI=0 has nothing to run (the XLA duplicate was deleted);
     the report must say so rather than describe a path that is gone."""
