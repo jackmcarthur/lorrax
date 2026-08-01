@@ -93,6 +93,7 @@ def _env_falsy(name: str, default: str = "1") -> bool:
 
 __all__ = [
     "initialize_communicator_stack",
+    "finalize_process",
     "RuntimeStack",
     "collect_startup_facts",
     "format_startup_report",
@@ -1258,6 +1259,85 @@ def _print_rank0(*a, **k):
     if _resolve_proc_id() == 0:
         k.setdefault("flush", True)
         print(*a, **k)
+
+
+def finalize_process(rc: int = 0):
+    """End the process by EXPLICIT, ORDERED finalization.  Does not return.
+
+    Why this exists (measured, not conjectured).  jax registers an atexit
+    hook (``jax._src.api.clean_up``) that destroys every backend client at
+    interpreter exit.  After a run that cold-compiled its whole program set
+    in-process (~195 XLA:CPU compiles on the fastloop mini-deck), that
+    destructor deadlocks in its thread-pool shutdown: the main thread parks
+    in a futex join and ~53 ``tf_XLAEigen`` pool workers are left spinning
+    on-CPU, indefinitely — 20 minutes measured before the harness timeout
+    (jobs 7884928, 7884989 phases 0a/0b; thread census in the 7884989
+    artifacts).  Every Python-side duty (the driver's timing table, the
+    compile-cache atexit report) completes FIRST; the block is pure C++
+    teardown, unreachable from here, and warm runs (0 in-process compiles)
+    never hit it — 6 clean bare runs across every FFI dial combination
+    (jobs 7884986/7884987).
+
+    So this function performs each remaining teardown duty explicitly, in
+    order, and then ends the process with ``os._exit`` so the interpreter
+    finalization that would run the deadlocking destructor never starts:
+
+    1. ``jax.effects_barrier()`` — drains the runtime tokens that jax's own
+       ``wait_for_tokens`` atexit would have drained.
+    2. ``atexit.unregister(jax._src.api.clean_up)`` — the deadlocking hook.
+    3. ``jax.distributed.shutdown()`` — the piece of ``clean_up`` that must
+       still happen (P>1 coordination service; a no-op at P=1).
+    4. ``atexit._run_exitfuncs()`` — every remaining registered duty runs
+       NOW: the compile-cache report, the ``impl=mpi`` collectives
+       ``Finalize``, h5py cleanup.  Nothing is silently skipped.
+    5. One rank-0 line stating what happened, flush, ``os._exit(rc)``.
+
+    The hard exit is not a workaround bolted on a mystery: the same
+    mechanism (``os._exit`` after ``main()``) is what the fastloop's interim
+    GW_WRAPPER proved green on the certified cold runs (job 7884936) while
+    the bare interpreter exit hung.  Call it from a driver's ``__main__``
+    block with the return code of ``main()``; ``gw.gw_jax`` — the one chain
+    driver measured to hang — is the adopter.
+    """
+    import atexit
+    import sys
+
+    try:
+        import jax
+        try:
+            jax.effects_barrier()
+        except Exception as exc:                          # noqa: BLE001
+            _print_rank0(f"  [finalize] effects_barrier failed "
+                         f"({type(exc).__name__}: {exc}); continuing")
+        try:
+            from jax._src import api as _jax_api
+            atexit.unregister(_jax_api.clean_up)
+        except Exception as exc:                          # noqa: BLE001
+            _print_rank0(f"  [finalize] could not unregister jax clean_up "
+                         f"({type(exc).__name__}: {exc}); the hard exit "
+                         f"below still prevents the interpreter-teardown "
+                         f"path")
+        try:
+            jax.distributed.shutdown()
+        except Exception as exc:                          # noqa: BLE001
+            _print_rank0(f"  [finalize] jax.distributed.shutdown failed "
+                         f"({type(exc).__name__}: {exc}); continuing")
+    except Exception:                                     # jax never imported
+        pass
+    try:
+        atexit._run_exitfuncs()
+    except Exception as exc:                              # noqa: BLE001
+        _print_rank0(f"  [finalize] an atexit hook failed "
+                     f"({type(exc).__name__}: {exc}); continuing")
+    _print_rank0(
+        "[runtime] process finalized explicitly (effects barrier, "
+        "distributed shutdown, atexit hooks) and ending with os._exit: the "
+        "interpreter-teardown destruction of the XLA:CPU client is skipped "
+        "deliberately — it deadlocks in pool shutdown after cold-compile "
+        "storms (jobs 7884928/7884989).")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(int(rc))
 
 
 # ---------------------------------------------------------------------------
