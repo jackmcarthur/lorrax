@@ -191,8 +191,20 @@ def _worker_rt() -> int:
 
 
 def _worker_gauge() -> int:
-    """Child: ridge vs rank_truncate — kept-subspace agreement, and the
-    near-null content only the ridge solution carries."""
+    """Child: ridge vs rank_truncate — kept-subspace agreement on a
+    NULL-FREE RHS, and the near-null amplification only the ridge
+    solution carries on a raw RHS.
+
+    Why two RHS (job 7885329's finding): with a raw RHS the ridge
+    solution's null components are ~1/ridge, and float64 eigenvector
+    orthogonality (~eps) leaks eps/ridge-scale content into ANY
+    kept-subspace projection of z_lu — the comparison measures the
+    leakage (measured 1.3e-3), not the algorithms.  Production Z has
+    structurally suppressed overlap with the TRS-null current modes
+    (why eqp never sees the ridge's null junk — the 1.1e-13 eV
+    dist-vs-local LU parity), so the honest kept-subspace comparison
+    projects the null content out of the RHS first; the raw RHS keeps
+    demonstrating the amplification asymmetry."""
     import numpy as np
     import jax
     import jax.numpy as jnp
@@ -206,6 +218,13 @@ def _worker_gauge() -> int:
     tau = 1e-8
     C, Z, _, spectra = _fixture(rng, nq, n_log, n_pad, n_z, n_z)
 
+    # Null-free RHS for the kept-subspace leg.
+    Zc = Z.copy()
+    for q, (lam, V) in enumerate(spectra):
+        keep = np.abs(lam) > (tau * np.abs(lam).max())
+        Vn = V[:, ~keep]
+        Zc[q, :n_log, :] -= Vn @ (Vn.conj().T @ Z[q, :n_log, :])
+
     mesh = Mesh(np.asarray(devs[:1]).reshape(1, 1), ('x', 'y'))
     in_sh = NamedSharding(mesh, P(None, 'x', 'y'))
     C_dev = jax.device_put(jnp.asarray(C), in_sh)
@@ -215,17 +234,26 @@ def _worker_gauge() -> int:
     # array guard (caught by job 7885328).
     LU, piv = factor_c_q(C_dev, mesh, vertex_mu_L=1, n_rmu_logical=n_log,
                          solver_kind='lu')
-    z_lu = np.asarray(jax.device_get(solve_zeta(
-        LU, jax.device_put(jnp.asarray(Z), in_sh), mesh, nq,
-        vertex_mu_L=1, solver_kind='lu',
-        n_rmu_logical=n_log, lu_piv=piv)))
     Cp, _ = factor_c_q(C_dev, mesh, vertex_mu_L=1, n_rmu_logical=n_log,
                        solver_kind='transverse_rank_truncate',
                        transverse_zeta_rcond=tau)
-    z_rt = np.asarray(jax.device_get(solve_zeta(
-        Cp, jax.device_put(jnp.asarray(Z), in_sh), mesh, nq,
-        vertex_mu_L=1,
-        solver_kind='transverse_rank_truncate', n_rmu_logical=n_log)))
+
+    def _solve_lu(rhs):
+        return np.asarray(jax.device_get(solve_zeta(
+            LU, jax.device_put(jnp.asarray(rhs), in_sh), mesh, nq,
+            vertex_mu_L=1, solver_kind='lu',
+            n_rmu_logical=n_log, lu_piv=piv)))
+
+    def _solve_rt(rhs):
+        return np.asarray(jax.device_get(solve_zeta(
+            Cp, jax.device_put(jnp.asarray(rhs), in_sh), mesh, nq,
+            vertex_mu_L=1,
+            solver_kind='transverse_rank_truncate', n_rmu_logical=n_log)))
+
+    z_lu_c = _solve_lu(Zc)
+    z_rt_c = _solve_rt(Zc)
+    z_lu_raw = _solve_lu(Z)
+    z_rt_raw = _solve_rt(Z)
 
     kept_rel = 0.0
     null_ridge = 0.0
@@ -234,15 +262,15 @@ def _worker_gauge() -> int:
         keep = np.abs(lam) > (tau * np.abs(lam).max())
         Vk = V[:, keep]
         Vn = V[:, ~keep]
-        d = Vk.conj().T @ (z_lu[q, :n_log, :] - z_rt[q, :n_log, :])
+        d = Vk.conj().T @ (z_lu_c[q, :n_log, :] - z_rt_c[q, :n_log, :])
         kept_rel = max(kept_rel,
                        float(np.max(np.abs(d))
                              / np.max(np.abs(Vk.conj().T
-                                             @ z_rt[q, :n_log, :]))))
+                                             @ z_rt_c[q, :n_log, :]))))
         null_ridge = max(null_ridge, float(np.max(np.abs(
-            Vn.conj().T @ z_lu[q, :n_log, :]))))
+            Vn.conj().T @ z_lu_raw[q, :n_log, :]))))
         null_rt = max(null_rt, float(np.max(np.abs(
-            Vn.conj().T @ z_rt[q, :n_log, :]))))
+            Vn.conj().T @ z_rt_raw[q, :n_log, :]))))
     print(json.dumps({
         "kept_rel": kept_rel,          # families agree here (~ridge level)
         "null_ridge": null_ridge,      # 1/ridge-scale amplification
@@ -355,8 +383,10 @@ def test_truncation_drops_the_trs_near_null_pair():
 
 def test_ridge_vs_rank_truncate_agree_on_kept_subspace():
     """Different algorithms, not bit-comparable: kept-subspace agreement
-    at ~ridge level; the near-null amplification exists only on the
-    ridge side (it is what truncation removes)."""
+    at ~ridge level on a null-free RHS (see the worker docstring for why
+    a raw RHS would measure eigenvector-orthogonality leakage instead);
+    the near-null amplification exists only on the ridge side (it is
+    what truncation removes)."""
     out = _run_worker("worker_gauge")
     assert out["kept_rel"] < 1e-6, (
         f"families disagree on the KEPT subspace ({out['kept_rel']:.3e}) "
