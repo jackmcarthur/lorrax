@@ -1,12 +1,15 @@
 """Bispinor V_q^{μ_L, ν_L} orchestrator — thin loop over the unified tile kernel.
 
-The bispinor pair density carries a 4-vector Lorentz index from the
-Pauli decomposition of ψ†_iσ ψ_jσ′:
+Conventions (``common.gamma_matrices``): the stored matrices are
+γ̃^μ ≡ γ^0 γ^μ, so γ̃^0 = I_4 and γ̃^i = α^i on 4-spinors, and every
+channel density is written with ψ† (never ψ̄):
 
-    n_iσ,jσ′(r) = Σ_{μ_L=0..3} ζ_{μ_L,a}(r) ⟨σ| τ^{μ_L} |σ′⟩ C^{a}_{ij}
-    τ^0 = I,  τ^{1,2,3} = (σ_x, σ_y, σ_z)
+    ρ^{μ_L}(r) = ψ† γ̃^{μ_L} ψ ≈ Σ_a ζ_{μ_L,a}(r) ρ^{μ_L}(r_a)
 
-The Coulomb kernel in Lorentz gauge couples the four channels by
+The μ_L = 0 channel is the charge density; the μ_L ∈ {1,2,3} channels
+are CURRENT densities ψ† α^i ψ (not spin densities — α^i couples the
+large and small bispinor components).  We work in Coulomb gauge, where
+the photon propagator couples the four channels by
 
     V^{μ_L,ν_L}_q(μ,ν) = Σ_K  ζ̄_{μ_L,μ}(K) · t^{μ_L,ν_L}(K) · v(K) · ζ_{ν_L,ν}(K)
     t^{0,0}      = 1

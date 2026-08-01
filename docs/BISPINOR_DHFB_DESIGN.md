@@ -1,7 +1,29 @@
 # Bispinor GW — Phase-1 Design (DHF + Bare-Breit)
 
-**Status:** in flight on `agent-B/bispinor-design`
-**Last update:** 2026-05-02
+> **SUPERSEDED IN PART (2026-07-31).** Historical design document; the physics
+> (§§1–4) still describes the implementation, but the code map has moved:
+>
+> - Σ^B assembly lives in `src/gw/sigma_x_bispinor.py` (the planned
+>   `src/gw/breit_sigma.py` was never created); V_q^{μν} tiles in
+>   `src/gw/v_q_bispinor.py`.
+> - Transverse ζ-solve policy (supersedes §4's "Cholesky + 1e-14 ridge for all
+>   four channels"): the transverse CCT^μ is Hermitian but indefinite, solved by
+>   pivoted LU with a 1e-12·|tr|/n ridge (`isdf/core.py:2536` `solve_zeta`);
+>   the charge channel defaults to `charge_zeta_solve = rank_truncate`
+>   (rank-revealing eigh pseudo-inverse, `zeta_rcond` = 1e-8).
+> - File-map rows that no longer exist: `src/common/load_wfns.py`,
+>   `src/common/isdf_fitting.py` (now `src/gw/isdf_fitting.py` +
+>   `src/isdf/core.py`), `src/centroid/centroid_io.py` (the `density:` header
+>   is written/checked by `kmeans_cli` and the GW loaders directly),
+>   `docs/PHYSICS_COMPREHENSIVE.md` /
+>   `docs/CODEBASE_COMPREHENSIVE.md` (see `docs/theory/physics.md` /
+>   `docs/architecture/codebase.md`), and the `runs/MoS2/...` validation dirs
+>   (machine-local, not shipped).
+> - Current usage: manual ch. 8 (bispinor GW) and `docs/drivers.md`
+>   (two-centroid-file convention, `--density-mode current`).
+
+**Status:** historical design record (was: in flight on `agent-B/bispinor-design`)
+**Last update:** 2026-05-02; superseded-in-part header 2026-07-31
 
 ## 1. Scope
 
