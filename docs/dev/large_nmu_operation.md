@@ -105,12 +105,16 @@ plus the launch env of `config/frontera/templates/gw_dev.sbatch`
 These are the objects that do NOT yet divide by P; they bound the regime
 until fixed.  File:line references as of this page's commit.
 
-1. **htransform SVD family** — the last `N_mu²`-class replicated core in
-   the chain: `A = psi@centroids` gathered replicated
-   `(nk·nb, ns·N_mu)` (`bandstructure/htransform.py:262`), dense SVD of A
-   on every rank (`:265`), `Vh` and `B_at_mu` re-replicated (`:356`,
-   `:626`).  Named fix: Gram-eigh of `A Aᴴ` (`nk·nb` square, N_mu-free)
-   via the `ffi.linalg` plan + mu-sharded `Vh`/`B_at_mu`.
+1. ~~htransform SVD family~~ — CLOSED 2026-08-01: the replicated
+   `A = psi@centroids` gather + per-rank dense SVD is now a Gram-eigh of
+   `A Aᴴ` (`nk·nb` square, N_mu-free) through the `ffi.linalg` eigh plan
+   (deck key `eigh_backend`, same family as the fH_q eigh; `auto` = native
+   replicated — the tile is N_mu-free and small — `distributed` = pzheevd),
+   with `Vᴴ` and `B_at_mu` mu-sharded on `'y'` (`B_at_mu` fitted at the
+   true centroid count).  Gauge-class change (eigenvector phases), NOT
+   bit-exact: b300 `bandstructure.dat` parity measured exact-0 at file
+   precision, fastloop both legs exact-0 (jobs 7885090, 7885093).  The
+   remaining htransform mu-bound is item 2's single-axis psi sharding.
 2. **psi-at-centroids single-axis sharding** — `(nk, nb, ns, N_mu)`
    sharded on ONE mesh axis (`common/wfn_transforms.py:1933,2002`), so
    per-rank memory is `~1/sqrt(P)`, in the zeta fit (both transposes),
@@ -122,9 +126,12 @@ until fixed.  File:line references as of this page's commit.
    r-chunk on the default path (see below).
 5. **W Dyson local plan** — `ceil(nq/P)` whole `(mu,mu)` tiles per rank
    unless `w_dyson_solver = distributed`.
-6. **dipole/kin-ion k-gathers** — `(nk, 3, nb, nb)` / `(nk, nb, nb)`
-   replicated before a rank-0 write (`psp/get_dipole_mtxels.py:912`,
-   `gw/kin_ion_io.py:453`); nb²-class, not mu².
+6. **dipole/kin-ion k-gathers** — FIXED: the CLI sweeps now gather
+   `owner_only` (`common/collectives.py::gather_indexed_blocks_to_owner`):
+   the `(nk, 3, nb, nb)` / `(nk, nb, nb)` table exists on rank 0 alone,
+   assembled in `LORRAX_COLLECTIVE_CHUNK_MB`-bounded chunks.  The
+   replicated mode remains the default for operand consumers
+   (`sigma_dispatch`'s gspace V_H route).
 7. **eigenvalue vectors** — `lambda (nq, mu)` replicated in the
    distributed zeta tier (ScaLAPACK's own contract); `Sigma_c(omega,k,m,n)`
    cube replicated under the default `sigma_omega_layout = replicated`.

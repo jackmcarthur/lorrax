@@ -1448,7 +1448,28 @@ def _load_ring_subset(
     n_occ: Optional[int] = None,
     input_file: Optional[str] = None,
 ) -> dict:
-    """Load a single-device BSE subset from canonical gw_jax restart state."""
+    """Load a single-device BSE subset from canonical gw_jax restart state.
+
+    FULL-FILE reader by construction: V_qmunu, W0_qmunu and psi_full_y
+    are materialised whole (that is what its two callers need — the
+    ``_preview_lanczos`` 1-device branch and the ring-matvec correctness
+    check's single-device reference).  A multi-process run must NEVER
+    come through here: every rank would h5py-read the full tensors
+    before any sharding (scorecard BD.4), and the single-device arrays
+    could not represent one logical object across processes anyway.
+    The production preview/ring/FEAST/KPM paths at P>1 already route
+    through :func:`load_bse_data_from_restart_sharded`, whose readers
+    hyperslab only each rank's (μ, ν) tile; this guard turns any future
+    misrouting into a refusal instead of a silent per-rank full read.
+    """
+    import jax as _jax
+    if int(_jax.process_count()) > 1:
+        raise RuntimeError(
+            "_load_ring_subset is the single-device FULL-FILE reader; on "
+            f"{int(_jax.process_count())} processes every rank would read "
+            "the whole V_qmunu/W0_qmunu/psi_full_y. Use "
+            "load_bse_data_from_restart_sharded (sharded hyperslab reads) "
+            "as the P>1 preview/ring paths already do.")
     with h5py.File(restart_file, "r") as f:
         V_qmunu = jnp.asarray(f["V_qmunu"][:])
         if "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):

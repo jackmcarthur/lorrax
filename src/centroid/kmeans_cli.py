@@ -461,6 +461,13 @@ def main():
                            force_shard=args.force_shard)
     mesh_axis = dist.MESH_AXES
 
+    # The loader was necessarily built mesh-less (the mesh is sized from
+    # the FFT grid the file declares), which at P>1 pinned it to the
+    # per-rank eager h5py read (scorecard BD.2).  Late-bind the mesh so
+    # backend=auto can pick the collective phdf5 route for the ψ loads
+    # (prune / rank gate / weight), as htransform already does.
+    wfn.adopt_mesh(mesh)
+
     R, Rinv, tau, n_sym, orbit_aware = _resolve_symmetry(
         args, wfn, sym, charge_density)
 

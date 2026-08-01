@@ -696,8 +696,13 @@ def main(argv=None):
 	if not wfn_path.is_absolute():
 		wfn_path = (input_path.parent / wfn_path).resolve()
 
-	# Open WFN and symmetry
+	# Open WFN and symmetry.  The mesh comes from the module-top
+	# ``initialize_communicator_stack()``; with it, ``backend=auto`` can
+	# pick the collective phdf5 read at P>1 instead of the per-rank eager
+	# h5py read (scorecard BD.2).  The per-k sweep below stays on the
+	# process-local read path either way.
 	wfn = WFNReader(str(wfn_path))
+	wfn.adopt_mesh(RUNTIME.mesh)
 	sym = symmetry_maps.SymMaps(wfn)
 
 	nval = int(params.get("nval", 5))
@@ -906,12 +911,17 @@ def main(argv=None):
 
 	# One k per dispatch, round-robin over the processes, ONE host readback
 	# per rank and ONE indexed gather at the end — the same contract
-	# ``gw.kin_ion_io``'s ⟨mk|V_H|nk⟩ sweep runs on.  Returns
-	# ``(nk, 3, nb, nb)`` identical on every rank.
+	# ``gw.kin_ion_io``'s ⟨mk|V_H|nk⟩ sweep runs on.  ``owner_only``: the
+	# only consumer of the gathered ``(nk, 3, nb, nb)`` table is the
+	# rank-0 h5 write below, so it is assembled on rank 0 alone (None on
+	# the peers) instead of being replicated on every rank (BD.4).
 	with timing.section("dipole_sweep"):
 		dip_k_major = gather_k_blocks(nk, _dipole_block, item_shape=(3, nb, nb),
-		                              label="dipole")
-	dipole = np.ascontiguousarray(np.moveaxis(dip_k_major, 0, 1))
+		                              label="dipole", owner_only=True)
+	if dip_k_major is not None:
+		dipole = np.ascontiguousarray(np.moveaxis(dip_k_major, 0, 1))
+	else:
+		dipole = None                        # non-root: never consumed
 	del dip_k_major
 
 	# Optional: finite-q matrix elements for the SOS chi head/wing/S/w pipeline.

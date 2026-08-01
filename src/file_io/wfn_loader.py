@@ -137,6 +137,7 @@ class WfnLoader:
         self._path = str(path)
         self._filename = self._path  # legacy WFNReader compat
         self._mesh = mesh
+        self._backend_was_auto = (backend == "auto")
 
         if backend == "auto":
             backend = self._auto_pick_backend()
@@ -395,6 +396,46 @@ class WfnLoader:
         # No phdf5-capable FFI library on either platform: fall back to the
         # zero-FFI h5py union read (shares the on-device unfold kernel).
         return "phdf5_host"
+
+    def adopt_mesh(self, mesh) -> str:
+        """Late-bind the device mesh and re-run the auto backend pick.
+
+        For the driver whose mesh cannot exist at construction time:
+        kmeans sizes its mesh from the FFT grid THIS file declares (and
+        from the charge density read against it), so the loader is
+        necessarily built mesh-less and, at P>1, lands on the per-rank
+        eager read even though every ψ load it will do is mesh-wide
+        (scorecard BD.2).  Calling this right after ``dist.build_mesh``
+        gives it the same collective phdf5 route htransform picks.
+
+        Deliberately narrow: only a MULTI-PROCESS run, and only a loader
+        constructed with ``backend="auto"`` that resolved to ``eager``,
+        switches — an explicit ``backend=`` request (A/B forcing) is
+        never overridden, a loader already on a sharded backend keeps
+        its mesh, and a single-process run (however many host devices)
+        keeps the mesh-less replicated-load contract its callers were
+        built against (no band-axis mesh padding appears that was not
+        there before).  The switch is safe mid-life because the phdf5
+        collective context is created lazily on the first ``load`` and
+        the eager state kept so far (the ``coeffs`` dataset HANDLE — no
+        data) remains valid for ``load_process_local``.  Returns the
+        backend now in force.
+        """
+        if mesh is None or self._mesh is not None:
+            return self.backend
+        if not self._backend_was_auto or self.backend != "eager":
+            return self.backend
+        try:
+            if int(jax.process_count()) <= 1:
+                return self.backend
+        except Exception:
+            return self.backend
+        self._mesh = mesh
+        backend = self._auto_pick_backend()
+        if backend != self.backend:
+            self._announce_backend(backend)
+            self.backend = backend
+        return self.backend
 
     # ------------------------------------------------------------------
     # k-set resolution

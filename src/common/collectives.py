@@ -91,6 +91,7 @@ __all__ = [
     "all_gather_processes",
     "gather_to_host",
     "gather_indexed_blocks",
+    "gather_indexed_blocks_to_owner",
     "psum_scatter_checked",
     "report_collective_residual",
     "COLLECTIVE_RTOL",
@@ -756,6 +757,74 @@ def gather_indexed_blocks(local_vals, local_idx, n_total: int):
     return out
 
 
+def _owner_gather_chunk_bytes() -> int:
+    """Per-collective payload cap for :func:`gather_indexed_blocks_to_owner`.
+
+    Reads ``LORRAX_COLLECTIVE_CHUNK_MB`` — the SAME per-instruction
+    transport cap the distributed ζ tier and the W Dyson A-build enforce
+    (``isdf/core._collective_chunk_bytes``; calibration in
+    ``docs/dev/env_vars.md``).  Re-read here rather than imported because
+    ``common`` must not import ``isdf``.  ``0``/negative = unbounded,
+    same escape-hatch semantics as there.
+    """
+    import os
+
+    try:
+        mb = float(os.environ.get("LORRAX_COLLECTIVE_CHUNK_MB", 128.0))
+    except ValueError:
+        mb = 128.0
+    if mb <= 0:
+        return 1 << 62
+    return max(1, int(mb * (1 << 20)))
+
+
+def gather_indexed_blocks_to_owner(local_vals, local_idx, n_total: int):
+    """:func:`gather_indexed_blocks`, assembled on rank 0 ONLY.
+
+    Same collective contract (every rank must call it, with the same
+    ``blk`` and item shape), but the ``(n_total, *item_shape)`` table is
+    materialised only on rank 0; every other rank gets ``None``.  For
+    k-partitioned sweeps whose ONLY consumer is the rank-0 h5 write
+    (dipole / kin-ion), where the replicated table is ``(nk, nb, nb)``-
+    class waste on every peer — 604 MB/rank at 12x12/512b (scorecard
+    BD.4).
+
+    The transport is still ``process_allgather`` (jax exposes no
+    gather-to-root), so total traffic is unchanged; what changes is
+    residency: the allgather is CHUNKED along the block axis so no rank
+    ever holds more than ``LORRAX_COLLECTIVE_CHUNK_MB`` of transient
+    payload, and non-root ranks drop each chunk immediately.  P=1 (and
+    the fastloop shard4 leg, which is single-process) falls through to
+    :func:`gather_indexed_blocks` bit-identically.
+    """
+    import numpy as np
+
+    rank, world = process_rank_world()
+    if world <= 1:
+        return gather_indexed_blocks(local_vals, local_idx, n_total)
+
+    vals = np.asarray(local_vals)
+    blk = int(vals.shape[0])
+    item_shape = tuple(int(s) for s in vals.shape[1:])
+    item_bytes = int(np.prod(item_shape, dtype=np.int64)) * vals.dtype.itemsize
+    step = max(1, _owner_gather_chunk_bytes() // max(1, world * item_bytes))
+
+    idx_g = all_gather_processes(np.asarray(local_idx, dtype=np.int32))
+    out = (np.zeros((int(n_total),) + item_shape, dtype=vals.dtype)
+           if rank == 0 else None)
+    for j0 in range(0, blk, step):
+        j1 = min(blk, j0 + step)
+        vals_g = all_gather_processes(vals[j0:j1])
+        if rank == 0:
+            for r in range(world):
+                for j in range(j0, j1):
+                    ik = int(idx_g[r, j])
+                    if ik >= 0:
+                        out[ik] = vals_g[r, j - j0]
+        del vals_g
+    return out
+
+
 # ---------------------------------------------------------------------------
 # The k-partitioned sweep
 # ---------------------------------------------------------------------------
@@ -883,7 +952,8 @@ def sweep_local_k(ks_local, blk: int, item_shape, per_k, *,
 
 
 def gather_k_blocks(n_k: int, per_k, *, item_shape, label: str,
-                    lookahead: int | None = None, print_fn=print):
+                    lookahead: int | None = None, print_fn=print,
+                    owner_only: bool = False):
     """``per_k(ik)`` for EVERY ``ik`` in ``range(n_k)`` → the whole array.
 
     The entire k-partition contract in one call, and the only one a physics
@@ -894,6 +964,12 @@ def gather_k_blocks(n_k: int, per_k, *, item_shape, label: str,
     (:func:`gather_indexed_blocks`).  No reduction is involved anywhere — a k
     block of ⟨mk|O|nk⟩ is independent of every other, so this is
     embarrassingly parallel with one indexed gather at the end.
+
+    ``owner_only=True`` assembles on rank 0 alone and returns ``None`` on
+    every other rank (:func:`gather_indexed_blocks_to_owner`) — the mode
+    for sweeps whose only consumer is the rank-0 file write.  A caller
+    that needs the table as a replicated operand (the driver's gspace
+    V_H route) must keep the default.
 
     ``per_k`` must return a device array of ``item_shape`` and must not force
     it.  ``label`` names the two timing sections (``{label}_k`` and
@@ -912,6 +988,8 @@ def gather_k_blocks(n_k: int, per_k, *, item_shape, label: str,
                                   item_shape, per_k, lookahead=lookahead,
                                   print_fn=print_fn, label=label)
     with timing.section(f"{label}_gather"):
+        if owner_only:
+            return gather_indexed_blocks_to_owner(vals, idx, n_k)
         return gather_indexed_blocks(vals, idx, n_k)
 
 

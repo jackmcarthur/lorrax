@@ -341,7 +341,8 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
 def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                            nb: int, mesh=None,
                            psi_rotation=None,
-                           print_fn=print):
+                           print_fn=print,
+                           owner_only: bool = False):
     """The exact FFT-grid ⟨mk|V_H|nk⟩ for all k — **(nk, nb, nb) Ry**.
 
     SINGLE SOURCE for every exact-V_H consumer: the CLI in this module
@@ -369,6 +370,11 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     Returns the FULL matrix as a host ``numpy`` array replicated on
     every rank, not the diagonal: a QSGW band rotation needs
     ⟨m|V_H|n⟩ off-diagonals to transform H₀ into the QP basis.
+
+    ``owner_only=True`` (this module's CLI, whose only consumer is the
+    rank-0 h5 write) assembles on rank 0 alone and returns ``None`` on
+    every other rank — see :func:`common.collectives.gather_k_blocks`.
+    Replicated consumers (gspace route, QSGW) keep the default.
     """
     mesh = resolve_mesh(mesh)
     _, world = process_rank_world()
@@ -453,7 +459,8 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
             wfn_k, G_pad, V_H_r, wfn.cell_volume, g_mask=g_mask)
 
     return gather_k_blocks(nk, _vh_block, item_shape=(nb, nb),
-                           label="vh_matrix", print_fn=print_fn)
+                           label="vh_matrix", print_fn=print_fn,
+                           owner_only=owner_only)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -561,8 +568,15 @@ def main(argv=None):
                   else (sys_dim_file if sys_dim_file is not None else 3))
 
     print0(f"Loading WFN: {os.path.basename(wfn_path)}")
+    # The module-top ``initialize_communicator_stack()`` already built and
+    # clique-warmed the run's mesh; handing it to the loader is what lets
+    # ``backend=auto`` pick the collective phdf5 read at P>1 instead of
+    # the per-rank eager h5py read (scorecard BD.2 — htransform already
+    # did this, dipole/kin-ion/kmeans did not).
+    mesh_xy = RUNTIME.mesh
     with timing.section("load_wfn"):
         wfn = WFNReader(wfn_path)
+        wfn.adopt_mesh(mesh_xy)
         sym = symmetry_maps.SymMaps(wfn)
 
     nval = int(params.get("nval", 5))
@@ -677,20 +691,25 @@ def main(argv=None):
     # SAME Coulomb convention as V_loc above (``ctx.truncation_2d``, i.e.
     # the deck's sys_dim) — which is also QE's, since the DFT run that
     # produced E_DFT/vxc.dat used ``assume_isolated='2D'`` for a slab.
-    # ``RUNTIME.mesh`` was built and clique-warmed by the module-top
-    # ``initialize_communicator_stack()``, so the communicator-bootstrap
-    # cost is paid once, up front, instead of inside the ρ psum.  Measured
-    # on Frontera/Gloo at P=4: the FIRST collective of a run costs ~12 s of
-    # topology exchange and the second costs microseconds, so without it
-    # the 1.4 MB all-reduce looks like 70 % of the kernel and the
-    # strong-scaling numbers are measuring the transport's handshake.
-    mesh_xy = RUNTIME.mesh
+    # ``mesh_xy`` was taken from ``RUNTIME.mesh`` above (built and
+    # clique-warmed by the module-top ``initialize_communicator_stack()``),
+    # so the communicator-bootstrap cost is paid once, up front, instead of
+    # inside the ρ psum.  Measured on Frontera/Gloo at P=4: the FIRST
+    # collective of a run costs ~12 s of topology exchange and the second
+    # costs microseconds, so without it the 1.4 MB all-reduce looks like
+    # 70 % of the kernel and the strong-scaling numbers are measuring the
+    # transport's handshake.
+    #
+    # ``owner_only``: this CLI's only V_H consumers are the rank-0 h5
+    # write and the rank-0 diagnostic print, so no peer needs the
+    # replicated (nk, nb, nb) table (BD.4).  The driver's gspace route
+    # (``sigma_dispatch``) keeps the replicated default.
     v_h_all = None
     if args.hartree:
         with timing.section("build_V_H"):
             v_h_all = compute_hartree_matrix(
                 wfn, sym, meta, truncation_2d=ctx.truncation_2d, nb=nb_eff,
-                mesh=mesh_xy, print_fn=print0)
+                mesh=mesh_xy, print_fn=print0, owner_only=True)
 
     # ---- compute kin+ion per k-point (k-partitioned, one gather) --------
     # ``kin_ion`` stays PRISTINE (T + V_loc + V_NL) unless --fold-hartree
@@ -721,18 +740,23 @@ def main(argv=None):
     # attribute the compute to whoever happened to block next.
     kin_ion_all = gather_k_blocks(sym.nk_tot, _kin_ion_block,
                                   item_shape=(nb_eff, nb_eff),
-                                  label="kin_ion", print_fn=print0)
+                                  label="kin_ion", print_fn=print0,
+                                  owner_only=True)
 
-    folded = bool(args.fold_hartree and v_h_all is not None)
-    if folded:
+    # ``owner_only``: from here on ``kin_ion_all``/``v_h_all`` exist on
+    # rank 0 ONLY (None on the peers) — every consumer below is rank-0.
+    # ``folded`` is derived from the args, not from ``v_h_all``, so the
+    # provenance flag stays rank-invariant.
+    folded = bool(args.fold_hartree and args.hartree)
+    if folded and rank == 0:
         kin_ion_all = kin_ion_all + v_h_all
 
     # ---- write output: COORDINATED, rank 0 only -------------------------
-    # Every rank holds the identical gathered arrays, so the file needs
-    # exactly one writer.  This is what the old multi-rank refusal
-    # becomes: not "you may not run multi-rank" but "multi-rank writes
-    # through one rank, after the gather".  The barrier below keeps the
-    # peers alive until the file is closed — an early exit would have
+    # Rank 0 alone holds the gathered arrays (owner_only gather), and the
+    # file needs exactly one writer.  This is what the old multi-rank
+    # refusal becomes: not "you may not run multi-rank" but "multi-rank
+    # writes through one rank, after the gather".  The barrier below keeps
+    # the peers alive until the file is closed — an early exit would have
     # srun tear the step down mid-write.
     print0(f"\nWriting to {out_path}...")
     desc = ("T + V_loc + V_NL + V_H matrix elements (H_DFT - V_xc)"
@@ -777,18 +801,20 @@ def main(argv=None):
 
     barrier("kin_ion_written")
 
+    # Diagnostics read the gathered tables, which only rank 0 holds.
     _src = ("FOLDED into kin_ion (legacy)" if folded else
-            (f"stored as '{HARTREE_DATASET}'" if v_h_all is not None
+            (f"stored as '{HARTREE_DATASET}'" if args.hartree
              else "absent (ISDF route required)"))
-    print0(f"Wrote {os.path.basename(out_path)}: kin_ion {kin_ion_all.shape}, "
-          f"sys_dim={sys_dim}, V_H {_src}")
-    if v_h_all is not None:
-        d0 = np.real(np.diagonal(kin_ion_all[0])) * 13.605693122994
-        v0 = np.real(np.diagonal(v_h_all[0])) * 13.605693122994
-        print0("  kin_ion diag (eV), k=0, first 8: "
-              + "  ".join(f"{v:.4f}" for v in d0[:8]))
-        print0("  V_H     diag (eV), k=0, first 8: "
-              + "  ".join(f"{v:.4f}" for v in v0[:8]))
+    if rank == 0:
+        print0(f"Wrote {os.path.basename(out_path)}: kin_ion "
+               f"{kin_ion_all.shape}, sys_dim={sys_dim}, V_H {_src}")
+        if v_h_all is not None:
+            d0 = np.real(np.diagonal(kin_ion_all[0])) * 13.605693122994
+            v0 = np.real(np.diagonal(v_h_all[0])) * 13.605693122994
+            print0("  kin_ion diag (eV), k=0, first 8: "
+                  + "  ".join(f"{v:.4f}" for v in d0[:8]))
+            print0("  V_H     diag (eV), k=0, first 8: "
+                  + "  ".join(f"{v:.4f}" for v in v0[:8]))
     if rank == 0:
         timing.report(title="--- Timing (seconds) ---",
                       wall=_time.perf_counter() - _t_main)
