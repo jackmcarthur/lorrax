@@ -35,6 +35,7 @@ On NERSC Perlmutter: `module load lorrax` then use `lxrun` / `lxpre`. See [`conf
 
 Detailed physics, code architecture, and environment setup are in `docs/`:
 
+- **[`docs/drivers.md`](docs/drivers.md)** — The seven pipeline drivers in chain order: invocation, keys/flags, outputs, failure modes
 - **[`docs/theory/physics.md`](docs/theory/physics.md)** — ISDF theory, GW equations, ISDF basis (zeta) fitting, JAX sharding
 - **[`docs/architecture/codebase.md`](docs/architecture/codebase.md)** — Module map, data flow, key classes, entry points
 - **[`docs/environment/overview.md`](docs/environment/overview.md)** — The runtime stack, JAX configuration, transports, per-machine pages
