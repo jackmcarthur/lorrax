@@ -6,7 +6,7 @@ Besides these reduced scaling exponents, LORRAX gets its name from: 1.) our real
 
 LORRAX is developed primarily by Jack McArthur (myself) and supervised by Prof. Steven Louie at UC Berkeley, under whom the public BerkeleyGW package has been developed and maintained since 2011. Interoperability with the outputs of the BGW executables `epsilon.x`, `sigma.x`, `kernel.x`, and `absorption.x` is an active area of development. We use heavily and are actively expanding the roles of agentic coding platforms in the development of LORRAX, namely Anthropic's Claude Code and OpenAI's Codex. Both have been collaborators of great importance and are owed significant credit for the current state of LORRAX. We continue to explore applications of SOTA long-horizon schemes for scientific codebases, sandboxes for closed-loop development, and hierarchical tools like MCPs, subagents, and so forth.
 
-The package requires as input the BerkeleyGW format wavefunction file `WFN.h5`. It is currently only compatible with full-spinor wavefunctions, but it can be used with wavefunction k-grids that are reduced by symmetry using BGW's `kgrid.x`. Symmetries are not used in the evaluation of the quasiparticle energies and will not reduce computational cost relative to unfolded k-grids.
+The package requires as input the BerkeleyGW format wavefunction file `WFN.h5`. It is currently only compatible with full-spinor wavefunctions, but it can be used with wavefunction k-grids that are reduced by symmetry using BGW's `kgrid.x`. Crystal symmetries reduce cost through the IBZ cascade: when the centroid set is orbit-closed (`kmeans_cli --orbit`, the default when the crystal has more than one symmetry operation), the ζ-fit factorizes $C_q$ and solves $\zeta_q$ only for $\mathbf q$ in the irreducible zone (`isdf_fitting` `write_ibz_only`), with $V_q$ and $\Sigma_x$ unfolded from it — a ~6–12× reduction of the most expensive stages for a typical hexagonal cell. The pair-density k-sums still run over the full k-lattice. See manual §5.4.
 
 The main drivers are located in `src/`:
 - **ISDF initialization**: `centroid/kmeans_isdf.py` (k-means algorithm) + `centroid/kmeans_cli.py` (CLI entrypoint, `python -m centroid.kmeans_cli`)
@@ -29,7 +29,20 @@ the bundled fixture sets `use_ffi_io = false` and ships its own wavefunction, so
 machine. Everything distributed (sharded HDF5, distributed `eigh`, SLATE) additionally
 requires the native FFI stack — see [`docs/environment/overview.md`](docs/environment/overview.md).
 
+Perlmutter workflow (lxrun/module) — on Frontera this differs; see [`docs/environment/machines/frontera.md`](docs/environment/machines/frontera.md) and the working examples below.
 On NERSC Perlmutter: `module load lorrax` then use `lxrun` / `lxpre`. See [`config/README.md`](config/README.md).
+
+On TACC Frontera (CPU, apptainer + srun), working invocations from the certified scripts (`config/frontera/templates/gw_dev.sbatch`, the mos2_4x4_test sbatch family):
+
+```bash
+# preprocessing, single node / single process (deck_b300.sbatch steps 3-4):
+python3 -u -m centroid.kmeans_cli 3000 --orbit --qe-save ../b300_out/MoS2.save --out-suffix _b300_c3000
+python3 -u -m gw.kin_ion_io -i deck_b300.in -o kin_ion_b300.h5 -n 300 --hartree
+
+# multi-node GW via the certified launch block (gw_ht_b300.sbatch):
+export LORRAX_ROOT=... LORRAX_RUN_DIR=... LORRAX_INPUT=gw.in
+bash $LORRAX_ROOT/config/frontera/templates/gw_dev.sbatch
+```
 
 ## Documentation
 

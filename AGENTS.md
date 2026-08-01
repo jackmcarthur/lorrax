@@ -74,6 +74,8 @@ uv run python -m pytest -q
 
 ### Perlmutter (Shifter via Lmod module)
 
+Perlmutter workflow (lxrun/module) — on Frontera this differs; see `docs/environment/machines/frontera.md` and the working examples below.
+
 ```bash
 module load lorrax_X           # X = A | B | C
 lxalloc                        # 1 node / 4 GPUs / 2 h
@@ -83,6 +85,20 @@ LORRAX_NGPU=1 lxrun ...                           # single-GPU override
 ```
 
 See [`config/README.md`](config/README.md) for the full cluster reference. Docs: [`docs/environment/overview.md`](docs/environment/overview.md).
+
+### Frontera (TACC, CPU: apptainer + srun --mpi=pmi2)
+
+Working invocations from the certified scripts (`config/frontera/templates/gw_dev.sbatch`; mos2_4x4_test sbatch family):
+
+```bash
+# preprocessing, single node / single process (deck_b300.sbatch steps 3-4):
+python3 -u -m centroid.kmeans_cli 3000 --orbit --qe-save ../b300_out/MoS2.save --out-suffix _b300_c3000
+python3 -u -m gw.kin_ion_io -i deck_b300.in -o kin_ion_b300.h5 -n 300 --hartree
+
+# multi-node GW via the certified launch block (gw_ht_b300.sbatch):
+export LORRAX_ROOT=... LORRAX_RUN_DIR=... LORRAX_INPUT=gw.in
+bash $LORRAX_ROOT/config/frontera/templates/gw_dev.sbatch
+```
 
 ## Coding standards
 
@@ -94,9 +110,9 @@ See [`config/README.md`](config/README.md) for the full cluster reference. Docs:
 
 These are the norms that make the codebase legible to humans and one-shottable by models.
 They are enforced by review and the regression gate, not by ceremony. When a convention
-forces a bigger change than the task, flag it — don't silently violate it. See the refactor
-map at `lorrax_sandbox/reports/gw_refactor_map_2026-07-01/` (`MAP.md`, `FEATURES.md`) for how
-the pipeline is organized and where a new feature belongs.
+forces a bigger change than the task, flag it — don't silently violate it. The sandbox
+claims ledger (`lorrax_sandbox/CLAIMS.md`) records what has been verified about the
+pipeline; the old refactor-map reports directory was purged.
 
 ### Structure & style
 - **Procedural on plain arrays, not new API layers.** LORRAX is scientific code read by
@@ -161,5 +177,6 @@ Do not commit `__pycache__/`, `.venv/`, or `uv_cache/`, etc. directories.
 Use `uv` as the package manager. One `.venv/` (gitignored) per machine. No alternative
 envs. Let uv use its global cache — do not create project-local uv cache directories.
 
-On Perlmutter: use Shifter with the NVIDIA JAX container. See
+On Perlmutter: use Shifter with the NVIDIA JAX container (Perlmutter workflow —
+on Frontera this differs; see `docs/environment/machines/frontera.md`). See
 `config/README.md`.
