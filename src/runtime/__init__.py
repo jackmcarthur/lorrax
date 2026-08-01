@@ -14,10 +14,12 @@ The adopters (2026-08-01) are the seven chain drivers — ``gw.gw_jax``,
 ``bandstructure.htransform``, ``bse.bse_jax`` and ``bse.exciton_bands`` —
 each making exactly ONE module-top call, gated per driver by
 ``tests/test_crossfile_requests.py`` (the R1 audit).  The two BSE CLIs that
-take ``--px/--py`` still start on the most-square mesh; a different shape
-goes through :meth:`RuntimeStack.reshape` (or the BSE factory
+take ``--px/--py`` still start on the canonical square mesh; a different
+(square) shape goes through :meth:`RuntimeStack.reshape` (or the BSE factory
 ``bse.bse_ring_comm.create_mesh_xy``, which reuses the startup mesh whenever
-the requested shape matches it).
+the requested shape matches it).  Only square meshes are supported (repo
+``docs/architecture/decisions.md`` 2026-08-01); both paths refuse
+``px != py``.
 
 :func:`initialize_communicator_stack` is that call.  It resolves the JAX
 environment, installs the fail-fast excepthook, states the CPU-collectives
@@ -1083,6 +1085,13 @@ class RuntimeStack:
         say = print_fn if print_fn is not None else _print_rank0
         if (int(px), int(py)) == self.mesh_shape:
             return self.mesh
+        if int(px) != int(py):
+            raise ValueError(
+                f"RuntimeStack.reshape({px}, {py}): only square 2-D meshes "
+                f"are supported (repo docs/architecture/decisions.md, "
+                f"2026-08-01) — rectangular meshes complicate ScaLAPACK "
+                f"grid geometry and the divisibility contracts for no "
+                f"measured benefit.  Pass --px == --py.")
         import jax
         import numpy as np
         from jax.sharding import Mesh

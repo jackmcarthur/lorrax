@@ -224,7 +224,7 @@ def _require_addressable(mesh, *, origin: str):
     return mesh
 
 
-#: The one canonical most-square mesh per axis-name tuple, cached on first
+#: The one canonical SQUARE mesh per axis-name tuple, cached on first
 #: resolution.  Same identity contract as ``_PROCESS_LOCAL_MESH`` below and
 #: for the same reason: shape-keyed jit caches key on the output
 #: ``NamedSharding``, which embeds the mesh OBJECT, so a library that
@@ -235,15 +235,34 @@ _CANONICAL_MESHES: dict = {}
 
 
 def resolve_mesh(mesh=None, *, axis_names=("x", "y")):
-    """THE run's device mesh: pass your own, or get the canonical one.
+    """THE run's device mesh: pass your own, or get the canonical SQUARE one.
 
     Callers that already hold the run's mesh (the GW driver) pass it, so no
     second mesh — and no second communicator — is created.  A CLI has none
-    and gets the most-square factorisation of ``jax.devices()``, degenerating
-    to 1x1 on a single device so every code path is identical at P=1.
+    and gets the s x s mesh over ``jax.devices()`` (s = sqrt of the device
+    count), degenerating to 1x1 on a single device so every code path is
+    identical at P=1.
 
-    The most-square mesh is built ONCE per process per axis-name tuple and
-    cached (``_CANONICAL_MESHES``): ``runtime.initialize_communicator_stack``
+    ONLY SQUARE 2-D MESHES ARE SUPPORTED (owner ruling, repo
+    ``docs/architecture/decisions.md`` 2026-08-01): rectangular meshes
+    complicate ScaLAPACK grid geometry and the divisibility contracts for no
+    measured benefit at our scales.  A device count that is not a perfect
+    square REFUSES here, naming the square counts to request.  The ruling's
+    stated safety net — build s x s and idle the surplus ranks — is
+    deliberately NOT implemented on this stack, because idle ranks cannot be
+    made deadlock-free without deep surgery: (a) under the production
+    transport ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi``, communicator
+    creation is ``MPI_Comm_split`` — collective over ``MPI_COMM_WORLD`` (see
+    :func:`warm_mesh_cliques`) — so a rank outside the mesh that never
+    executes the warm-up jits leaves every in-mesh rank blocked in the split;
+    (b) :func:`psum_replicate` and the k-sweep gathers assume mesh size ==
+    process count; (c) ``multihost_utils`` barriers span the WORLD, so idle
+    ranks would have to replay the entire driver control flow in lockstep
+    while skipping every mesh-touching jit.  A refusal that names the square
+    count is the deadlock-free form of the same rule.
+
+    The mesh is built ONCE per process per axis-name tuple and cached
+    (``_CANONICAL_MESHES``): ``runtime.initialize_communicator_stack``
     resolves it at driver import, and every later no-argument call — a
     library helper resolving "the run's mesh" for itself — gets the same
     object rather than an equal-but-distinct twin that would double every
@@ -253,6 +272,8 @@ def resolve_mesh(mesh=None, *, axis_names=("x", "y")):
     mesh this process cannot compute on is refused here rather than
     manifesting as a bare ``StopIteration`` several layers down.
     """
+    import math
+
     import jax
     import numpy as np
     from jax.sharding import Mesh
@@ -265,12 +286,22 @@ def resolve_mesh(mesh=None, *, axis_names=("x", "y")):
         return _require_addressable(cached, origin="resolve_mesh(canonical)")
     devices = jax.devices()
     total = len(devices)
-    gx = int(np.sqrt(total))
-    while gx > 1 and total % gx != 0:
-        gx -= 1
+    s = math.isqrt(total)
+    if s * s != total:
+        raise RuntimeError(
+            f"resolve_mesh: this run has {total} devices over "
+            f"{process_count()} process(es), and {total} is not a perfect "
+            f"square.  Only square 2-D meshes are supported (repo "
+            f"docs/architecture/decisions.md, 2026-08-01) — request "
+            f"{s * s} processes (a {s}x{s} mesh) or {(s + 1) * (s + 1)} "
+            f"(a {s + 1}x{s + 1} mesh).  Idle-rank truncation to {s}x{s} is "
+            f"not implemented: under JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi, "
+            f"communicator creation is collective over MPI_COMM_WORLD, so "
+            f"the {total - s * s} out-of-mesh rank(s) would deadlock the "
+            f"in-mesh ranks at their first collective (see the resolve_mesh "
+            f"docstring for the full argument).")
     built = _require_addressable(
-        Mesh(np.asarray(devices).reshape(gx, total // gx),
-             axis_names=key),
+        Mesh(np.asarray(devices).reshape(s, s), axis_names=key),
         origin="resolve_mesh")
     _CANONICAL_MESHES[key] = built
     return built

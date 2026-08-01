@@ -209,7 +209,7 @@ def main(argv=None):
 	# ---- The runtime is already up ----------------------------------------
 	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
 	# of this module, above ``import jax``, because the JAX env defaults only
-	# bind before jax reads them.  ``RUNTIME.mesh`` is THE run's most-square
+	# bind before jax reads them.  ``RUNTIME.mesh`` is THE run's square
 	# ('x','y') mesh with every communicator it will need ALREADY created —
 	# the warm-up is not optional and not the physics' job:
 	#   * a mesh this process owns no device on is refused there, naming the

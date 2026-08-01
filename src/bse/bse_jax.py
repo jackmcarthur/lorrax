@@ -9,7 +9,7 @@ import time
 # code: env defaults (x64), jax.distributed (the ring matvec uses
 # lax.psum/ppermute on the 2D mesh, which is silent-wrong if processes
 # don't agree on a shared distributed runtime), CPU fallback, the run's
-# clique-warmed most-square ('x','y') mesh, compile cache, rank-0 report.
+# clique-warmed square ('x','y') mesh, compile cache, rank-0 report.
 # MUST run before this module's own `import jax`.  ``create_mesh_2d()``
 # below returns this same startup mesh (plus the BSE-specific
 # process_allgather warm-up bse_ring_comm documents).

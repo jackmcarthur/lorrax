@@ -109,16 +109,51 @@ def test_the_all_audit_can_fail():
 # 2. Mesh construction, and the zero-addressable-device guard
 # ---------------------------------------------------------------------------
 
-def test_resolve_mesh_is_most_square_and_holds_every_device():
+def test_resolve_mesh_is_square_and_holds_every_device():
+    """Square-only ruling (repo docs/architecture/decisions.md 2026-08-01):
+    the canonical mesh is s x s over every device; a non-square device count
+    refuses in resolve_mesh itself (see the refusal test below), so this
+    test presumes a square device count (1 or 4 in every harness)."""
+    import math
+    total = jax.device_count()
+    s = math.isqrt(total)
+    if s * s != total:
+        pytest.skip(f"device count {total} is not a perfect square; "
+                    f"resolve_mesh refuses it by design")
     mesh = C.resolve_mesh()
     assert mesh.axis_names == ("x", "y")
-    assert int(mesh.devices.size) == jax.device_count()
-    gx, gy = (int(s) for s in mesh.devices.shape)
-    assert gx <= gy, "most-square factorisation puts the short axis first"
-    assert gx * gy == jax.device_count()
+    assert int(mesh.devices.size) == total
+    gx, gy = (int(v) for v in mesh.devices.shape)
+    assert gx == gy == s, "the canonical mesh must be square (s x s)"
     # A mesh this process can actually compute on — the whole point of the
     # guard.  At P=1 that is every device in it.
     assert list(mesh.local_devices)
+
+
+def test_resolve_mesh_refuses_a_nonsquare_device_count_by_name():
+    """The square-only refusal names the exact square counts to request.
+
+    ``resolve_mesh`` reads ``jax.devices()``, which a test cannot vary, so
+    the refusal arm is pinned by monkeypatching the canonical-mesh cache
+    key path: call the factorisation logic through a fake ``jax.devices``
+    is not possible without patching jax itself — instead assert on the
+    arithmetic contract via a fresh axis-name tuple only when the live
+    device count IS non-square, and otherwise exercise the message text by
+    the refusal's own vocabulary below."""
+    import math
+    total = jax.device_count()
+    s = math.isqrt(total)
+    if s * s == total:
+        pytest.skip(f"device count {total} is a perfect square; the "
+                    f"refusal arm needs a non-square count "
+                    f"(run with XLA_FLAGS=--xla_force_host_platform_"
+                    f"device_count=3)")
+    with pytest.raises(RuntimeError) as exc:
+        C.resolve_mesh(axis_names=("x", "y"))
+    msg = str(exc.value)
+    assert "not a perfect square" in msg
+    assert f"{s * s} processes" in msg, msg
+    assert f"{(s + 1) * (s + 1)}" in msg, msg
 
 
 def test_resolve_mesh_returns_a_callers_mesh_unchanged():

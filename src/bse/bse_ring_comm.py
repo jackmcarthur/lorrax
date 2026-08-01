@@ -36,9 +36,11 @@ def create_mesh_xy(px: int, py: int, devices: Optional[list] = None) -> Mesh:
     """THE ('x','y') BSE device mesh, warmed — for a driver that names px/py.
 
     Every BSE entry point must get its mesh from here or from
-    :func:`create_mesh_2d` (which is this function with the most-square
-    factorisation chosen for it).  There is exactly one mesh factory in
-    ``src/bse/`` and this is it.
+    :func:`create_mesh_2d` (which is this function with the square shape
+    chosen for it).  There is exactly one mesh factory in ``src/bse/`` and
+    this is it.  Only SQUARE shapes are accepted (owner ruling, repo
+    ``docs/architecture/decisions.md`` 2026-08-01): a ``px != py`` request
+    refuses rather than building a rectangular mesh.
 
     WHY THIS FUNCTION EXISTS AT ALL.  Four byte-identical
     ``_create_mesh_xy(px, py)`` bodies used to live in ``bse_w_exact``,
@@ -67,12 +69,20 @@ def create_mesh_xy(px: int, py: int, devices: Optional[list] = None) -> Mesh:
     if devices is None:
         devices = jax.devices()
     px, py = int(px), int(py)
+    if px != py:
+        raise ValueError(
+            f"create_mesh_xy: a {px}x{py} mesh was requested, but only "
+            f"square 2-D meshes are supported (repo "
+            f"docs/architecture/decisions.md, 2026-08-01) — rectangular "
+            f"meshes complicate ScaLAPACK grid geometry and the "
+            f"divisibility contracts for no measured benefit.  Request "
+            f"px == py (and a square process count).")
     if px * py > len(devices):
         raise ValueError(
             f"Requested px*py={px*py} devices, only {len(devices)} available")
     # Reuse the run's canonical mesh when the request IS that mesh: since
     # the BSE drivers start with ``runtime.initialize_communicator_stack``
-    # (2026-08-01), the most-square ('x','y') mesh already exists — an
+    # (2026-08-01), the canonical square ('x','y') mesh already exists — an
     # equal-but-distinct copy here would be a second set of communicators
     # and a second copy of every shape-keyed jit cache (the
     # ``collectives.single_device_mesh`` identity contract).  A different
@@ -147,20 +157,30 @@ def _warm_process_allgather(mesh: Mesh) -> None:
 
 
 def create_mesh_2d(devices: Optional[list] = None) -> Mesh:
-    """Create a 2D device mesh for BSE sharding (most-square factorisation).
+    """Create the square 2-D device mesh for BSE sharding.
 
-    Thin wrapper over :func:`create_mesh_xy` — same warm-up, same contract.
+    Thin wrapper over :func:`create_mesh_xy` — same warm-up, same contract,
+    and the same square-only rule as ``common.collectives.resolve_mesh``:
+    a device count that is not a perfect square refuses with the square
+    count to request (the refusal fires in ``resolve_mesh``'s vocabulary
+    via :func:`create_mesh_xy`'s canonical-mesh reuse, or here).
     """
+    import math
+
     if devices is None:
         devices = jax.devices()
 
     n_devices = len(devices)
-    px = int(np.sqrt(n_devices))
-    while n_devices % px != 0:
-        px -= 1
-    py = n_devices // px
+    s = math.isqrt(n_devices)
+    if s * s != n_devices:
+        raise RuntimeError(
+            f"create_mesh_2d: {n_devices} devices is not a perfect square, "
+            f"and only square 2-D meshes are supported (repo "
+            f"docs/architecture/decisions.md, 2026-08-01).  Request "
+            f"{s * s} (a {s}x{s} mesh) or {(s + 1) * (s + 1)} "
+            f"(a {s + 1}x{s + 1} mesh) processes.")
 
-    return create_mesh_xy(px, py, devices)
+    return create_mesh_xy(s, s, devices)
 
 
 def make_bse_shardings(mesh_xy: Mesh) -> SimpleNamespace:

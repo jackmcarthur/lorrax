@@ -86,12 +86,13 @@ def test_a_tuple_entry_replicates_fully_when_NO_sub_product_divides():
     assert tuple(out) == (None, None)
 
 
-def test_partial_retention_prefers_the_larger_sub_product():
-    """On a rectangular mesh two different single axes are available; the
-    fitter must keep the one that splits further."""
-    m = _StubMesh(x=2, y=8)            # product 16
-    out = SF.legal_spec(m, P(("x", "y"), None), (24, 3), "unit.rect")
-    assert tuple(out) == ("y", None), "24 % 8 == 0 and 24 % 2 == 0 — keep 8"
+def test_partial_retention_keeps_one_axis_of_a_square_mesh():
+    """Square-mesh ruling (decisions.md 2026-08-01): both axes have the same
+    extent, so equal-length subsets have equal products and the fitter keeps
+    the earliest order-preserving one that divides — deterministically."""
+    m = _StubMesh(x=8, y=8)            # product 64
+    out = SF.legal_spec(m, P(("x", "y"), None), (24, 3), "unit.sq")
+    assert tuple(out) == ("x", None), "24 % 64 != 0 but 24 % 8 == 0 — keep 8"
 
 
 # ---------------------------------------------------------------------------
@@ -149,10 +150,10 @@ def test_only_the_offending_axis_is_dropped():
 
 
 def test_shard_factor_covers_none_str_and_tuple():
-    m = _StubMesh(x=8, y=4)
+    m = _StubMesh(x=8, y=8)
     assert SF.shard_factor(m, None) == 1
     assert SF.shard_factor(m, "x") == 8
-    assert SF.shard_factor(m, ("x", "y")) == 32
+    assert SF.shard_factor(m, ("x", "y")) == 64
 
 
 def test_the_announcement_fires_once_per_site_not_once_per_call(capsys):

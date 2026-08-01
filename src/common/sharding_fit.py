@@ -133,21 +133,22 @@ def padded_extent(mesh, entry, n: int) -> int:
 def _largest_divisible_subset(mesh, names, dim: int):
     """Longest order-preserving subset of ``names`` whose product divides.
 
-    Ties (equal length) are broken by the LARGER product, then by the
-    earliest-starting subset, so the choice is deterministic and does not
-    depend on dict/set iteration order.  Returns ``()`` when nothing divides.
+    Ties (equal length) are broken by the earliest-starting subset, so the
+    choice is deterministic and does not depend on dict/set iteration order.
+    Under the square-mesh ruling (repo ``docs/architecture/decisions.md``
+    2026-08-01) every mesh axis has the SAME extent, so equal-length subsets
+    have equal products and no larger-product tie-break exists to make — the
+    rectangular-mesh tie-break this function used to carry was deleted with
+    that ruling.  Returns ``()`` when nothing divides.
     """
     for k in range(len(names) - 1, 0, -1):
-        best, best_prod = (), 0
         for sub in combinations(range(len(names)), k):
             picked = tuple(names[i] for i in sub)
             p = 1
             for a in picked:
                 p *= int(mesh.shape[a])
-            if dim % p == 0 and p > best_prod:
-                best, best_prod = picked, p
-        if best:
-            return best
+            if dim % p == 0:
+                return picked
     return ()
 
 

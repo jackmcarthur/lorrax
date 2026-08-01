@@ -78,7 +78,7 @@ import numpy as np
 
 # THE startup call (runtime module docstring): env defaults, SLURM-aware
 # ``jax.distributed.initialize``, CPU fallback, the run's clique-warmed
-# most-square ('x','y') mesh, compile cache, rank-0 report.  Must run
+# square ('x','y') mesh, compile cache, rank-0 report.  Must run
 # BEFORE this module's own ``import jax`` and any ``jax.devices()`` /
 # mesh creation so a multi-node srun yields the full global device set.
 # This driver names ``--px/--py``; ``_create_mesh_xy(px, py)`` in main()

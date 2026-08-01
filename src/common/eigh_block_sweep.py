@@ -43,10 +43,10 @@ def main() -> int:
     from ffi.linalg import backend_module
     distributed_eigh = backend_module("cusolvermp").distributed_eigh
 
-    # ``resolve_mesh`` factorises the device count most-squarely and refuses
-    # a mesh this process owns no device in.  The int(sqrt(world)) grid it
-    # replaces silently produced a reshape error for any non-rectangular
-    # world (P=7 -> 2x3).
+    # ``resolve_mesh`` builds the square s x s mesh (square-only ruling,
+    # repo docs/architecture/decisions.md 2026-08-01; a non-square device
+    # count refuses, naming the square count to request) and refuses a mesh
+    # this process owns no device in.
     mesh = resolve_mesh()
     p, q = (int(s) for s in mesh.devices.shape)
 

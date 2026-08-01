@@ -65,7 +65,7 @@ def build_mesh(n_points: int, *, shard: bool = True,
                force_shard: bool = False, print_fn=print) -> Mesh:
     """The device mesh for a k-means over ``n_points`` real-space points.
 
-    Returns the run's most-square 2-D ``('x','y')`` mesh, or the 1x1
+    Returns the run's square 2-D ``('x','y')`` mesh, or the 1x1
     process-local one when ``shard`` is off, when there is a single device,
     or when the per-device share of the grid is below the latency floor
     (the only decision this function actually makes — construction and the
