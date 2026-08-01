@@ -154,7 +154,8 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              rtol: float = 1e-8, log_fn=None,
                              band_chunk_size: int = 64,
                              bispinor: bool = False,
-                             return_full_proj: bool = False):
+                             return_full_proj: bool = False,
+                             eigh_backend: str = "auto"):
     """Galerkin projection using gw_jax shared loaders.
 
     Single ('x','y') mesh throughout. ψ at centroids comes from
@@ -167,8 +168,14 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         wfn, sym, meta: standard gw_jax handles.
         centroid_indices: (n_μ, 3) FFT-grid coordinates.
         mesh_xy: 2D ``('x','y')`` device mesh.
-        band_range: ``(b_start, b_end)`` — bands included in the SVD basis.
-        rtol: SVD truncation tolerance (relative to s.max()).
+        band_range: ``(b_start, b_end)`` — bands included in the α basis.
+        rtol: σ truncation tolerance (relative to s.max()); σ come from the
+            Gram-eigh of A Aᴴ (see step 2), the same criterion as the old
+            replicated SVD up to sqrt-of-eigenvalue round-off.
+        eigh_backend: ffi.linalg backend for the (nk·nb)² Gram eigh — the
+            same plan family (and deck key) as the fH_q eigh downstream;
+            ``auto`` = native replicated eigh, ``distributed`` = ScaLAPACK
+            pzheevd, one tile over the mesh.
         band_chunk_size: bands per FFT chunk inside the loader.  Treated as a
             CEILING, not a fixed size: it is lowered so one streamed ψ chunk
             ``(nk, bc, nspinor, n_rtot)`` complex128 stays under
@@ -184,7 +191,9 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             (``bse.vq_interp.refit_vq``).
 
     Returns ``(S, ctilde, B_at_mu)`` (legacy contract), plus ``W_proj``
-    appended when ``return_full_proj``.
+    appended when ``return_full_proj``.  ``B_at_mu`` is μ-sharded on 'y'
+    (fitted — replicated only when n_μ divides no mesh axis); ``S``,
+    ``ctilde`` and ``W_proj`` are replicated and N_μ-free.
     """
     import time
     if log_fn is None:
@@ -247,26 +256,70 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # psi_rmu_Y: (nk, nb, ns, n_μ), sharded P(None, None, None, 'y')
     log_fn(f"  load_centroids_band_chunked: {time.time()-t0:.2f}s")
 
-    # ── 2. SVD of A = ψ@centroids reshaped to (nk·nb, ns·n_μ) ──
-    # FFI seam: today gather to replicated, run dense SVD on each device
-    # (small for our sizes); swap for distributed SVD when n_μ scales up.
+    # ── 2. Gram-eigh of A Aᴴ, A = ψ@centroids reshaped to (nk·nb, ns·n_μ) ──
+    # Until 2026-08-01 this step gathered A REPLICATED and ran a dense SVD on
+    # every rank — the last N_μ-scaling replicated core in the chain (A itself
+    # nk·nb·ns·N_μ·16 B/rank plus the gesdd workspace, and Vh/B_at_mu
+    # re-replicated downstream).  A Aᴴ is (nk·nb, nk·nb) — N_μ-FREE — and
+    # eigh(A Aᴴ) gives the same left factor: λ = σ², U = eigenvectors, so
+    # σ = sqrt(λ) and Vᴴ = diag(1/σ) Uᴴ A is formed μ-SHARDED where consumed
+    # (see ``_vh_sharded`` below).  The Gram product contracts (s, μ) locally
+    # on each μ-shard + one (nk·nb)² all-reduce; ψ@centroids is never
+    # replicated and no O(N_μ) object is.
+    #
+    # NUMERICS.  (a) Gauge, not bits: eigenvectors of A Aᴴ match the SVD's U
+    # only up to per-σ phases (rotations inside degenerate σ groups), so
+    # ctilde/B/fH transform covariantly and every physical output (energies,
+    # ψ reconstruction) is invariant analytically, equal to the SVD path to
+    # ~κ·ε in floats — the same "different valid gauge" class as the
+    # distributed ζ tier.  (b) Squaring halves the precision of SMALL σ:
+    # sqrt(λ) resolves σ only down to ~sqrt(ε)·σ_max ≈ 1.5e-8·σ_max, i.e.
+    # exactly the rtol=1e-8 cut.  That is safe HERE because the retained
+    # spectrum is bounded away from the cut (measured job 7883150:
+    # σ_min/σ_max = 2.25e-5, 4.5 decades above it — see the truncation block
+    # below); a deck whose retained block hugged the cut would fail the
+    # ``rank_report`` violations gate, not silently drift.
+    #
+    # The eigh goes through the ffi.linalg plan family: ``eigh_backend`` from
+    # the deck (auto = native batched eigh, replicated — (nk·nb)² is small;
+    # distributed = ScaLAPACK pzheevd, one tile over the mesh, for band
+    # windows where even (nk·nb)² replicated is unaffordable).
     t1 = time.time()
-    # Trim the sharding-pad: load_centroids_band_chunked pads the n_μ axis to a
-    # multiple of the device count, but the TRUE centroid count is
-    # ``n_mu = centroid_indices.shape[0]`` (= the restart's n_rmu).  Without this
-    # trim a centroid count not divisible by the device count (e.g. 1496 on 16
-    # GPU → padded 1504) reshape-crashes here.  No-op when already divisible.
-    A = psi_rmu_Y[..., :n_mu].reshape(nk * nb, nspinor * n_mu)
-    A = jax.device_put(A, rep)
-    del psi_rmu_Y
+    m_states = nk * nb
 
-    @partial(jax.jit, donate_argnums=(0,), out_shardings=(rep, rep, rep))
-    def _svd_replicated(A):
-        result = jnp.linalg.svd(A, full_matrices=False)
-        return result.U, result.S, result.Vh
+    @partial(jax.jit, out_shardings=rep)
+    def _gram(psi):
+        # psi: (nk, nb, ns, μ_pad) at P(None, None, None, 'y').  dot_general
+        # over BOTH (s, μ) axes — no ns·μ reshape ever touches the sharded
+        # axis.  Zero μ-pad columns add exact zeros to the sum.
+        M = jnp.einsum('aism,bjsm->aibj', psi, jnp.conj(psi), optimize=True)
+        M = M.reshape(m_states, m_states)
+        return 0.5 * (M + M.conj().T)
 
-    U, s, Vh = _svd_replicated(A)
-    del A
+    M = _gram(psi_rmu_Y)
+
+    from ffi.linalg import plan as linalg_plan
+    eigh_plan = linalg_plan("eigh", mesh_xy, backend=eigh_backend, n=m_states)
+    if eigh_plan.is_native:
+        @partial(jax.jit, out_shardings=(rep, rep))
+        def _eigh_native(M_):
+            w_, V_ = jnp.linalg.eigh(M_)
+            return w_, V_
+        w, V = _eigh_native(M)
+    else:
+        log_fn("  Gram eigh: " + eigh_plan.describe())
+        w, V = eigh_plan(M)          # λ replicated, V one tile P('x','y')
+        V = jax.device_put(V, rep)   # (nk·nb)² — N_μ-free, small
+    del M
+
+    # eigh is ascending; the SVD contract everywhere below is descending σ.
+    @partial(jax.jit, out_shardings=(rep, rep))
+    def _sv_from_eigs(w, V):
+        s = jnp.sqrt(jnp.clip(w[::-1], 0.0, None))
+        return s, V[:, ::-1]
+
+    s, U = _sv_from_eigs(w, V)
+    del w, V
     s_host = np.asarray(s)
 
     # ── The truncation criterion ──────────────────────────────────────────
@@ -346,13 +399,12 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # Slice to the criterion's rank and null-extend to the carried extent in
     # ONE jit with an explicit replicated out_sharding: done op-by-op,
     # ``jnp.pad`` on a multi-process mesh would leave these operands with an
-    # inferred sharding instead of the ``rep`` the SVD produced.
+    # inferred sharding instead of the ``rep`` the eigh produced.
     @partial(jax.jit, static_argnames=('r_phys', 'n_pad'),
-             out_shardings=(rep, rep, rep, rep))
-    def _trim_and_pad(U, s, Vh, r_phys, n_pad):
+             out_shardings=(rep, rep, rep))
+    def _trim_and_pad(U, s, r_phys, n_pad):
         U = U[:, :r_phys]
         s = s[:r_phys]
-        Vh = Vh[:r_phys, :]
         coeffs = U * s[None, :]              # (nk·nb, r_phys)
         inv_s = (1.0 / s)[:, None]           # (r_phys, 1)
         UH = U.conj().T                      # (r_phys, nk·nb)
@@ -360,8 +412,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             coeffs = jnp.pad(coeffs, ((0, 0), (0, n_pad)))
             inv_s = jnp.pad(inv_s, ((0, n_pad), (0, 0)))
             UH = jnp.pad(UH, ((0, n_pad), (0, 0)))
-            Vh = jnp.pad(Vh, ((0, n_pad), (0, 0)))
-        return coeffs, inv_s, UH, Vh
+        return coeffs, inv_s, UH
 
     # ── Truncation diagnostic — printed on EVERY run ──────────────────────
     # retained rank, σ range of the retained block, σ range discarded, and
@@ -373,11 +424,11 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # an all-zero ψ window returns rank 0 and everything downstream is
     # meaningless).
     _trunc = rank_criterion.rank_report(
-        s_host, rtol, label=f"htransform ψ@centroids SVD ({nk*nb}, "
+        s_host, rtol, label=f"htransform ψ@centroids Gram-eigh σ ({nk*nb}, "
                             f"{nspinor*n_mu})",
         quantity="singular values", rank_used=rank,
         n_rows=nk * nb, n_cols=nspinor * n_mu)
-    log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}): rank={rank_phys}"
+    log_fn(f"  Gram-eigh σ of ({nk*nb}, {nspinor*n_mu}): rank={rank_phys}"
            + (f" (+{n_pad} null pad → carried extent {rank}, "
               f"mesh-aligned to {align})" if n_pad else "")
            + f" ({time.time()-t1:.2f}s)")
@@ -399,8 +450,25 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
 
     # Null-extend to the carried extent.  The zeros here are what make every
     # pad row of Q — hence of G, ctilde, B and W_proj — exactly zero.
-    coeffs, inv_s, UH, Vh = _trim_and_pad(U, s, Vh, rank_phys, n_pad)
+    coeffs, inv_s, UH = _trim_and_pad(U, s, rank_phys, n_pad)
     del U, s
+
+    # Vᴴ = diag(1/σ) Uᴴ A, formed μ-SHARDED on 'y' against the sharded ψ tile
+    # — the replicated SVD Vh this replaces was (rank, ns·N_μ) on every rank.
+    # The contraction runs over (k, n) only, so each device builds its own μ
+    # columns with no communication; the σ-pad rows (inv_s = 0) and the
+    # loader μ-pad columns come out exactly zero.  Kept at the padded μ
+    # extent until ``_b_at_mu`` trims to the true centroid count.
+    vh_shard = NamedSharding(mesh_xy, P(None, None, 'y'))
+
+    @partial(jax.jit, out_shardings=vh_shard)
+    def _vh_sharded(inv_s, UH, psi):
+        UH_kb_ = UH.reshape(rank, nk, nb)
+        Vh = jnp.einsum('akn,knsm->asm', UH_kb_, psi, optimize=True)
+        return inv_s[:, :, None] * Vh        # (rank, ns, μ_pad), μ on 'y'
+
+    Vh_sh = _vh_sharded(inv_s, UH, psi_rmu_Y)
+    del psi_rmu_Y
 
     # ── 3. G = Q Q^H with Q = inv_s · U^H ψ, streamed r-OUTER / band-INNER ──
     #
@@ -610,19 +678,36 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # column index of V^H). This is what downstream Fourier-upscaling +
     # reconstruction needs to recover ψ at any new k at the centroids.
     @jax.jit
-    def _finalize(coeffs, L, Vh):
+    def _finalize(coeffs, L):
         coeffs = coeffs @ L
         ctilde = coeffs.reshape(nk, nb, rank)
         CtC = ctilde[0] @ ctilde[0].conj().T
         ortho_err = jnp.max(jnp.abs(CtC - jnp.eye(nb, dtype=ctilde.dtype)))
-        # B = L⁻¹ V^H, then split (ns·n_μ) → (ns, n_μ).
-        B_flat = jsp_linalg.solve_triangular(L, Vh, lower=True)  # (rank, ns·n_μ)
-        B = B_flat.reshape(rank, nspinor, n_mu)
-        return ctilde, ortho_err, B
+        return ctilde, ortho_err
 
-    ctilde, ortho_err, B_at_mu = _finalize(coeffs, L, Vh)
+    ctilde, ortho_err = _finalize(coeffs, L)
     ctilde = jax.device_put(ctilde, rep)
-    B_at_mu = jax.device_put(B_at_mu, rep)
+
+    # B = L⁻¹ Vᴴ, μ-SHARDED end-to-end (replaces the replicated B_at_mu).
+    # The triangular solve runs along the rank axis and is independent per μ
+    # column, so it stays local on each μ shard; the spinor axis is moved in
+    # front as the (broadcast) batch axis so no reshape ever merges the
+    # replicated ns axis with the sharded μ axis.  The trailing slice trims
+    # the loader μ-pad to the TRUE centroid count; n_μ divides the mesh axis
+    # only by luck, so the output sharding is FITTED (announced replication
+    # fallback, never a refusal).
+    b_shard = _fit(mesh_xy, P(None, None, 'y'), (rank, nspinor, n_mu),
+                   "htransform.B_at_mu(mu-axis)")
+
+    @partial(jax.jit, out_shardings=b_shard)
+    def _b_at_mu(L, Vh):
+        Vt = jnp.moveaxis(Vh, 1, 0)          # (ns, rank, μ_pad)
+        B = jax.vmap(lambda rhs: jsp_linalg.solve_triangular(
+            L, rhs, lower=True))(Vt)
+        return jnp.moveaxis(B, 0, 1)[..., :n_mu]
+
+    B_at_mu = _b_at_mu(L, Vh_sh)
+    del Vh_sh
     # ``jnp.eye`` run EAGERLY is not one module but six —
     # ``iota`` x2 (compiled TWICE: the two operands differ only in
     # dimension), ``add``, ``equal``, ``convert_element_type`` x2 — because
@@ -1194,6 +1279,10 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             wfn, sym, meta, centroid_indices, mesh_xy, band_range,
             rtol=1e-8, log_fn=log_fn, bispinor=bispinor,
             return_full_proj=return_full_proj,
+            # Deck key, same family as the fH_q eigh; the CLI --eigh-backend
+            # override is scoped to compute_wfns_fi and deliberately not
+            # threaded here — the deck is the source of truth for the fit.
+            eigh_backend=str(params.get("eigh_backend", "auto")),
         )
     S, ctilde, B_at_mu = out[:3]
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={band_range[1]-band_range[0]}, rank={ctilde.shape[2]}")
@@ -1212,7 +1301,15 @@ def initialize_kpath(wfn, params):
     k_cart = np.asarray(kpath_frac) @ bvec * blat * (2.0 * np.pi)
     seg_len = np.linalg.norm(np.diff(k_cart, axis=0), axis=1)
     x_path = np.concatenate([[0.0], np.cumsum(seg_len)])
-    gamma_positions = [int(idx) for idx, lbl in zip(node_indices, node_labels) if (lbl or '').strip() == '\\u0393']
+    # Compare against the CANONICAL label ``_clean_label`` emits (the real
+    # 'Γ' character).  Until 2026-08-01 this tested the eight-character
+    # literal ``'\\u0393'``, which no cleaned label ever equals, so
+    # gamma_positions was always empty and the ``argmin(norm)`` fallback in
+    # ``h_transform`` picked index 0 — right only because Γ headed every
+    # path used so far and ties (the zero pad rows) resolve to the first
+    # index (scorecard BE).
+    gamma_positions = [int(idx) for idx, lbl in zip(node_indices, node_labels)
+                       if (lbl or '').strip() == 'Γ']
     return kpath_frac, x_path, node_indices, node_labels, gamma_positions
 
 
@@ -1417,7 +1514,12 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         if 0 <= fermi_band_idx < energies_sorted.shape[1]:
             fermi_energy = float(np.max(energies_sorted[:, fermi_band_idx]))
         if not gamma_positions:
-            gamma_positions = [int(jnp.argmin(jnp.linalg.norm(wrapped_k, axis=1)))]
+            # Label-less path: nearest-to-Γ point, EXCLUDING the batch pad
+            # rows (they are exact zeros and would win the tie on any path
+            # that does not start at Γ).  Host numpy — two values for a log
+            # line and the plot markers, no reason for two eager XLA modules.
+            _k_np = np.asarray(jax.device_get(wrapped_k))[:nq]
+            gamma_positions = [int(np.argmin(np.linalg.norm(_k_np, axis=1)))]
         gamma_exact = np.sort(np.asarray(enk_sigma[:, 0]))[:nb_keep]
         # Shift all reported energies so VBM is at 0
         if energies_on_path is not None:
@@ -1622,13 +1724,18 @@ def main(argv=None):
     sanity.check_finite("bandstructure.dat energies",
                         result['energies_sorted'], print_fn=log)
 
+    # Rank-0 writer gate: at P>1 every process reaches this line with the
+    # same (replicated) energies and used to write the SAME shared-FS file
+    # concurrently — a race that can interleave partial writes.  Same idiom
+    # as the gw_output/gw_init writers.
     output_dir = os.path.dirname(os.path.abspath(args.input))
-    write_bands_to_file(
-        os.path.join(output_dir, 'bandstructure.dat'),
-        result['energies_sorted'],  # Use sorted & truncated to nb_keep, not raw eigenvalues
-        kpath_data[0],
-        kpath_data[1],
-    )
+    if jax.process_index() == 0:
+        write_bands_to_file(
+            os.path.join(output_dir, 'bandstructure.dat'),
+            result['energies_sorted'],  # sorted & truncated to nb_keep, not raw eigenvalues
+            kpath_data[0],
+            kpath_data[1],
+        )
 
     summary = f"HT complete: {result['nb_keep']} bands, nk={result['nk_total']}, fermi={result['fermi_energy']:.6f} Ry"
     if result['path_range'] is not None:
