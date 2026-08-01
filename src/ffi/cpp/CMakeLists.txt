@@ -1161,6 +1161,7 @@ endif()
 if(_scalapack_on)
     list(APPEND LORRAX_FFI_HOST_SOURCES
         scalapack/solve_lu_ffi.cc
+        scalapack/getrf_getrs_ffi.cc
         scalapack/eigh_ffi.cc)
 endif()
 if(_mklfft_on)

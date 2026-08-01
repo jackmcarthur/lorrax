@@ -29,10 +29,14 @@ want square blocks (``MB == NB``), which the one-tile-per-rank layout only
 provides there.
 """
 from .eigh import batched_distributed_eigh, distributed_eigh
-from .solve_lu import batched_distributed_solve_lu
+from .solve_lu import (batched_distributed_getrf,
+                       batched_distributed_getrs,
+                       batched_distributed_solve_lu)
 
 __all__ = [
     "batched_distributed_eigh",
     "distributed_eigh",
     "batched_distributed_solve_lu",
+    "batched_distributed_getrf",
+    "batched_distributed_getrs",
 ]

@@ -130,7 +130,16 @@ _SPEC = {
     ("cholesky", "cusolvermp"): ("lorrax_cusolvermp_batched_potrf",    ("CUDA",)),
     ("cholesky", "slate"):      ("lorrax_slate_potrf",                 ("CUDA", "cpu")),
     ("solve_lu", "cusolvermp"): ("lorrax_cusolvermp_batched_solve_lu", ("CUDA",)),
-    ("solve_lu", "scalapack"):  ("lorrax_scalapack_batched_solve_lu",  ("cpu",)),
+    # The scalapack LU family is THREE handlers since the transverse
+    # factor hoist (2026-08): the fused solve (legacy callers) plus the
+    # split getrf/getrs pair the hoisted ζ factor stage requires.  All
+    # three are probed — an old host .so without the pair refuses at
+    # resolve time (rebuild config/frontera/build_ffi_host.sh) instead of
+    # dying mid-run inside the factor stage.
+    ("solve_lu", "scalapack"):  (("lorrax_scalapack_batched_solve_lu",
+                                  "lorrax_scalapack_batched_getrf",
+                                  "lorrax_scalapack_batched_getrs"),
+                                 ("cpu",)),
 }
 
 # (The per-platform build command used to be duplicated here.  It now
@@ -387,13 +396,17 @@ def resolve_backend(op: str, requested: str, mesh_xy: Mesh,
     # legal 8x1 mesh with "not compiled into the cpu FFI library" while
     # `nm -D` showed SlatePotrfHostFfi present — the real cause was an
     # incomplete LD_LIBRARY_PATH for the libraries that lib needs.
-    usable, why = ffi_loader.probe_target(target, platform)
-    if not usable:
-        raise RuntimeError(
-            f"{op} backend {requested!r} requested but its FFI handler "
-            f"({target}) is not usable: {why}  "
-            f"Available {op} backends on this mesh: "
-            f"{', '.join(_available(op, mesh_xy))}.")
+    # ``target`` may be one name or a tuple of REQUIRED names (the
+    # scalapack LU family: fused solve + split getrf/getrs) — every one
+    # must probe usable, and the refusal names the one that failed.
+    for _t in (target if isinstance(target, tuple) else (target,)):
+        usable, why = ffi_loader.probe_target(_t, platform)
+        if not usable:
+            raise RuntimeError(
+                f"{op} backend {requested!r} requested but its FFI handler "
+                f"({_t}) is not usable: {why}  "
+                f"Available {op} backends on this mesh: "
+                f"{', '.join(_available(op, mesh_xy))}.")
 
     # 4. process coverage (one JAX process per device)
     ndev = int(mesh_xy.devices.size)
@@ -447,7 +460,8 @@ def _available(op: str, mesh_xy: Mesh) -> list[str]:
     for (o, b), (target, platforms) in _SPEC.items():
         if o != op or platform not in platforms:
             continue
-        if ffi_loader.has_target(target, platform):
+        names = target if isinstance(target, tuple) else (target,)
+        if all(ffi_loader.has_target(t, platform) for t in names):
             out.append(b)
     return out
 
