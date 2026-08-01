@@ -687,8 +687,10 @@ def _run_sigma_branch(
     # Branch tail.  'sigma.finalize' is the timing row the AQ analysis asked
     # for (2026-07-28): the old tail hid a 4-5 s dead span per branch inside
     # the branch elapsed (deque drain + device re-upload + full-slab
-    # process_allgather).  On the memory-tile path the tail is now just the
-    # host-tile handoff — the row exists to PROVE it stays near zero.
+    # process_allgather).  On the memory-tile path the tail is the branch's
+    # ONLY pipeline flush (2026-08-01: end_window no longer drains — the
+    # deque persists across windows, so the last ``lag`` τ's of the branch
+    # drain here under this row; everything else overlaps).
     with timing.section("sigma.finalize"):
         tiles, tile_index, tile_devices = accumulator.finalize_host_tiles()
     # The mesh pad block stays attached here; the driver strips it ONCE

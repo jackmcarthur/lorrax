@@ -149,6 +149,29 @@ class _SigmaAccumulator:
     def finalize(self) -> jax.Array | None: ...
 
 
+class _WindowAccum:
+    """Per-window accumulation context carried by the pending deque.
+
+    Holds the window-scoped projector scalars and the running per-shard
+    tiles, so a pending τ entry can be drained AFTER its window closed —
+    the cross-window pipelining that keeps the device queue full at
+    ``end_window`` (the old flush-per-window drain idled the device for
+    ``lag`` kernel walls at every window boundary; measured 5.8 s of the
+    71.2 s sigma.exec at b300/P=16, job 7884656).
+    """
+
+    __slots__ = ('omega_sign_f', 'pref_f', 'project_code',
+                 'win_shards', 'pending_count', 'closed')
+
+    def __init__(self, window: '_SigmaWindow'):
+        self.omega_sign_f = float(window.omega_sign)
+        self.pref_f       = float(window.prefactor)
+        self.project_code = window.project_code
+        self.win_shards: list | None = None
+        self.pending_count = 0
+        self.closed = False
+
+
 class _TauAccumulator(_SigmaAccumulator):
     """Async-D2H deque + the single numpy ω-projector, feeding a sink.
 
@@ -159,8 +182,17 @@ class _TauAccumulator(_SigmaAccumulator):
     code ships to arbitrary device counts, so no shard-0 assumption may survive
     — this was Bug C).  The host reads (and projects/accumulates) each shard's
     σ tile ``lag`` iterations later, so GPU work on τ_{k+lag} overlaps with the
-    numpy accumulate of τ_k.  ``end_window`` drains the queue and hands the
-    per-shard window tiles to the sink.
+    numpy accumulate of τ_k.
+
+    **The deque persists across window boundaries** (2026-08-01): each pending
+    entry carries its window's :class:`_WindowAccum`, so ``end_window`` merely
+    CLOSES the window — the tail τ's drain while the NEXT window's kernels are
+    already dispatched, and the device queue never empties inside a branch.
+    A window's tiles reach the sink when its last entry drains; entries are
+    FIFO, so windows complete in order and the sink sees the exact
+    consume_window sequence (and per-window float-add order) of the old
+    flush-per-window schedule — bit-identical results, different schedule.
+    Only the BRANCH tail (``finalize``/``finalize_host_tiles``) flushes.
 
     The ω-kernel + accumulate runs entirely in numpy on host — no JAX sharding
     machinery, no collectives, no shard_map.  Each shard's contribution is
@@ -174,22 +206,19 @@ class _TauAccumulator(_SigmaAccumulator):
         self._sink = sink
         self._lag = int(lag)
         self._pending: deque = deque()
-        # Per-addressable-shard window accumulators + their layout, discovered
-        # at the first add_tau (constant across τ for a given window shape).
-        self._win_shards: list[np.ndarray | None] | None = None
         self._shard_index: list[tuple] | None = None
         self._shard_devices: list | None = None
-        # Window-scoped scalars cached at begin_window.
-        self._omega_sign_f: float = 0.0
-        self._pref_f: float = 0.0
-        self._project_code: int = 0
+        # Current (open) window context; pending entries hold their own.
+        self._cur: _WindowAccum | None = None
 
     def begin_window(self, window: _SigmaWindow) -> None:
-        self._pending.clear()
-        self._win_shards = None
-        self._omega_sign_f = float(window.omega_sign)
-        self._pref_f       = float(window.prefactor)
-        self._project_code = window.project_code
+        # Pending entries from earlier (closed) windows stay queued — they
+        # drain under THIS window's dispatches.  A begin without a matching
+        # end_window is a driver bug; catch it rather than mis-attribute τ's.
+        if self._cur is not None and not self._cur.closed:
+            raise RuntimeError(
+                "_TauAccumulator.begin_window: previous window never closed")
+        self._cur = _WindowAccum(window)
 
     def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_eff_c: complex) -> None:
         # Grab EVERY local shard handle and start the D2H copies now — do NOT
@@ -214,15 +243,17 @@ class _TauAccumulator(_SigmaAccumulator):
                 sr.data.copy_to_host_async()
                 si.data.copy_to_host_async()
                 handles.append((sr.data, si.data))
-        self._pending.append((handles, t_c, alpha_eff_c))
+        assert self._cur is not None and not self._cur.closed
+        self._cur.pending_count += 1
+        self._pending.append((handles, t_c, alpha_eff_c, self._cur))
         if len(self._pending) > self._lag:
             self._drain_one()
 
     def _drain_one(self) -> None:
         from common import timing
-        handles, t_c, alpha_eff_c = self._pending.popleft()
-        if self._win_shards is None:
-            self._win_shards = [None] * len(handles)
+        handles, t_c, alpha_eff_c, wctx = self._pending.popleft()
+        if wctx.win_shards is None:
+            wctx.win_shards = [None] * len(handles)
         for d, (hr, hi) in enumerate(handles):
             # ``np.asarray`` of an addressable shard waits on the D2H we kicked
             # off earlier — by now the transfer has had ``lag`` iterations of
@@ -243,27 +274,47 @@ class _TauAccumulator(_SigmaAccumulator):
             with timing.section("sigma.tau.omega_project"):
                 proj = _project_tau_onto_omega_np(
                     sr, si, self._omega_vec_np,
-                    t_c, alpha_eff_c, self._omega_sign_f, self._pref_f,
-                    self._project_code,
+                    t_c, alpha_eff_c, wctx.omega_sign_f, wctx.pref_f,
+                    wctx.project_code,
                 )
-                if self._win_shards[d] is None:
-                    self._win_shards[d] = np.zeros_like(proj)
-                self._win_shards[d] += proj
+                if wctx.win_shards[d] is None:
+                    wctx.win_shards[d] = np.zeros_like(proj)
+                wctx.win_shards[d] += proj
+        wctx.pending_count -= 1
+        if wctx.closed and wctx.pending_count == 0:
+            # Last τ of a closed window: hand its tiles to the sink now.
+            # FIFO drains ⇒ windows complete in dispatch order.
+            self._sink.consume_window(
+                wctx.win_shards, self._shard_index, self._shard_devices)
+            wctx.win_shards = None
 
     def end_window(self) -> None:
+        # No flush: close the window and keep the pipeline primed.  The
+        # tail τ's drain under the next window's dispatches; an all-drained
+        # window (short window, or the branch's last add_tau already pushed
+        # everything through) is consumed immediately.
+        assert self._cur is not None
+        self._cur.closed = True
+        if self._cur.pending_count == 0:
+            # Every τ of this window already drained (short window vs lag).
+            # A window always has ≥1 τ, so its tiles exist.
+            assert self._cur.win_shards is not None
+            self._sink.consume_window(
+                self._cur.win_shards, self._shard_index, self._shard_devices)
+            self._cur.win_shards = None
+
+    def _drain_all(self) -> None:
         while self._pending:
             self._drain_one()
-        assert self._win_shards is not None
-        self._sink.consume_window(
-            self._win_shards, self._shard_index, self._shard_devices)
-        self._win_shards = None
 
     def finalize(self) -> jax.Array | None:
+        self._drain_all()
         return self._sink.result()
 
     def finalize_host_tiles(self):
         """Branch tail WITHOUT the device round trip — see
         :meth:`_MemoryTileSink.host_tiles`."""
+        self._drain_all()
         return self._sink.host_tiles()
 
 
