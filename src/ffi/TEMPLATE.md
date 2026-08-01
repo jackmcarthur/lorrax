@@ -8,28 +8,29 @@ their structure.  This doc walks the 10% that changes when porting.
 ## Anatomy of an FFI subpackage
 
 ```
-<lib>/
+src/ffi/<lib>/              python side
 ├── __init__.py            re-exports the public op(s)
 ├── context.py             Python: lazy per-process singleton
-├── eigh.py                Python: shard_map(P('x','y')) wrapper
-└── cpp/
-    ├── ctx.h              per-process state struct
-    ├── context.cc         comm + library handle setup (collective)
-    ├── <lib>_interface.h  per-dtype thin wrappers over the library
-    └── eigh_ffi.cc        Impl<T> / Dispatch / XLA_FFI_DEFINE_HANDLER_SYMBOL
+└── eigh.py                Python: shard_map(P('x','y')) wrapper
+src/ffi/cpp/<lib>/          C++ side (the one C++ tree)
+├── ctx.h                  per-process state struct
+├── context.cc             comm + library handle setup (collective)
+├── <lib>_interface.h      per-dtype thin wrappers over the library
+└── eigh_ffi.cc            Impl<T> / Dispatch / XLA_FFI_DEFINE_HANDLER_SYMBOL
 ```
 
 ## What's shared across subpackages (do not reinvent)
 
-Under `src/ffi/common/`:
+Under `src/ffi/cpp/common/` (C++) and `src/ffi/common/` (python):
 
-- **`cpp/ffi_helpers.h`** — `FFI_RETURN_IF_ERROR`, `LORRAX_CUDA_CHECK`,
+- **`cpp/common/ffi_helpers.h`** — `FFI_RETURN_IF_ERROR`, `LORRAX_CUDA_CHECK`,
   `LORRAX_LIB_CHECK`, `cuda_error`.
-- **`cpp/scalapack_descriptor.h`** — `numroc(...)`,
+- **`cpp/common/scalapack_descriptor.h`** — `numroc(...)`,
   `local_tile_shape(...)`, `one_tile_per_rank(...)`.  ScaLAPACK
   block-cyclic math that cuSOLVERMp and ELPA both need.
-- **`cpp/CMakeLists.txt`** — autodetects NVHPC, builds one .so from
-  all `*_ffi.cc`.  Add your new .cc to `LORRAX_FFI_SOURCES`.
+- **`cpp/CMakeLists.txt`** — THE one build entry point (both platform
+  legs, `-DLORRAX_FFI_PLATFORM=cuda|host`); autodetects NVHPC on the
+  CUDA leg.  Add your new .cc to `LORRAX_FFI_SOURCES`.
 - **`broadcast.py`** — `broadcast_bytes(buf, key=...)`: byte-exact
   broadcast from rank 0 via the JAX distributed KV store.  Works for
   any opaque library handle (ncclUniqueId, MPI_Comm split, PMI).
@@ -78,7 +79,7 @@ etc.).
 
 ### (4) C++ Impl/Dispatch/Ffi
 
-Lift the structure from `cusolvermp/cpp/eigh_ffi.cc`:
+Lift the structure from `cpp/cusolvermp/eigh_ffi.cc`:
 
 ```cpp
 template <typename T>
@@ -158,7 +159,7 @@ uid = broadcast_bytes(uid, key="lorrax_ffi/elpa/handle/v0")
 
 ### (7) Link the library in CMake
 
-In `common/cpp/CMakeLists.txt`, next to `find_library(CUSOLVERMP_...)`:
+In `src/ffi/cpp/CMakeLists.txt` (CUDA leg), next to `find_library(CUSOLVERMP_...)`:
 
 ```cmake
 find_library(ELPA_LIBRARY elpa

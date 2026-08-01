@@ -349,10 +349,10 @@ $LORRAX_SLATE_INSTALL_DIR/lib64 : /lorrax_slate/lib : /lorrax_phdf5/lib :
 ### 5.3 Staging (one-time per cluster)
 
 ```bash
-src/ffi/cusolvermp/scripts/stage_nvhpc.sh   # cuSolverMp + CAL (~100 MB)
-src/ffi/phdf5/scripts/stage_cray.sh         # Cray HDF5 1.12 — canonical default on Perlmutter
-src/ffi/phdf5/scripts/stage_openmpi.sh      # OpenMPI HDF5 — the portable stack for non-Cray clusters
-src/ffi/slate/scripts/stage_cray.sh         # libsci + GTL + xpmem
+src/ffi/cpp/stage/cusolvermp_stage_nvhpc.sh   # cuSolverMp + CAL (~100 MB)
+src/ffi/cpp/stage/phdf5_stage_cray.sh         # Cray HDF5 1.12 — canonical default on Perlmutter
+src/ffi/cpp/stage/phdf5_stage_openmpi.sh      # OpenMPI HDF5 — the portable stack for non-Cray clusters
+src/ffi/cpp/stage/slate_stage_cray.sh         # libsci + GTL + xpmem
 ```
 
 Staging copies are mandatory because Shifter's `udiRoot.conf` on Perlmutter forbids `--volume` sources under `/opt/*` or `$HOME` — only `/pscratch` is bind-mountable. All scripts are idempotent and end with a `readelf -d` sanity check.
@@ -362,10 +362,10 @@ Staging copies are mandatory because Shifter's `udiRoot.conf` on Perlmutter forb
 > **Prereqs.** Before building, (a) the native stacks must be staged (`stage_nvhpc.sh` for cuSolverMp at minimum — see §5.3), and (b) you must hold a GPU allocation (`lxalloc`). `build.sh` fails loudly if `LORRAX_MPI_INCLUDE_DIR` / `LORRAX_MPICH_LIB_DIR` are unset, which `run_shifter.sh` sets for you.
 
 ```bash
-src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh
+src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh
 ```
 
-Output: `src/ffi/common/cpp/build/liblorrax_ffi.so`. CMake logs the resolved HDF5 / MPI paths — eyeball them to confirm the right stack.
+Output: `src/ffi/cpp/build/liblorrax_ffi.so`. CMake logs the resolved HDF5 / MPI paths — eyeball them to confirm the right stack.
 
 To build **outside** Shifter (a non-Cray cluster, native libs obtained independently), drive CMake directly with explicit `-D` overrides instead of `run_shifter.sh` — see [`src/ffi/PORTING.md`](../src/ffi/PORTING.md) and (once available) the Installation → FFI native libraries page.
 

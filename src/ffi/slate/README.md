@@ -10,7 +10,7 @@ MPI + GPU dense linear algebra library from ICL).  Currently exposes:
   historical "eigvec layout artifact" was root-caused 2026-07-10: the
   FFI read stale device tiles without `tileGetForReading` — heev's
   back-transform leaves the valid Z copy on the host — plus a missing
-  local-transpose pair on top.  Fixed in eigh.py / cpp/eigh_ffi.cc.)
+  local-transpose pair on top.  Fixed in eigh.py / ../cpp/slate/eigh_ffi.cc.)
 
 cholesky, trsm and eigh hit machine-precision residuals (~1e-16 /
 ~1e-14) on meshes with `p == q` or `q == 1` (N×1) where
@@ -55,7 +55,7 @@ Three coordinated pieces make SLATE play nicely with JAX-sharded data:
    — pure local op, no inter-rank comm.  The transposed bytes are the
    original block in col-major layout, which SLATE reads correctly.
 
-2. **MPI rank remap** (C++ `cpp/context.cc`).  SLATE's `fromDevices`
+2. **MPI rank remap** (C++ `../cpp/slate/context.cc`).  SLATE's `fromDevices`
    hardcodes `GridOrder::Col` (rank of tile `(i, j)` = `i + j*p`),
    while JAX's C-order mesh reshape puts shard `(mx, my)` on rank
    `mx*q + my`.  These don't agree for `p != 1, q != 1`, so we
@@ -64,8 +64,8 @@ Three coordinated pieces make SLATE play nicely with JAX-sharded data:
    JAX's shard-to-rank assignment.
 
 3. **GPU-aware MPI** (wired up by `config/modulefiles/lorrax/...lua`
-   → `lxrun` / `lxshell`, build-time by `cpp/run_shifter.sh`, both via
-   `cpp/in_container.sh`).  Cray MPICH on Perlmutter does GPU-Direct
+   → `lxrun` / `lxshell`, build-time by `../cpp/run_shifter.sh`, both via
+   `../cpp/in_container.sh`).  Cray MPICH on Perlmutter does GPU-Direct
    RDMA over Slingshot (the closest equivalent to NCCL for any
    MPI-based library) only when `MPICH_GPU_SUPPORT_ENABLED=1` and
    `libmpi_gtl_cuda.so` is loaded.  shifter's `--module=mpich`
@@ -106,7 +106,7 @@ sides, no opaque-handle gymnastics inside the user's mental model.
   rank): the old square-`nb` X on a rectangular RHS aborted every rank
   via an uncatchable `blas::Error` from a SLATE OpenMP task (2×2) or
   silently mis-assembled B (1×4).  Fixed 2026-07-10 in
-  `cpp/{trsm,batched_trsm}_ffi.cc`.
+  `../cpp/slate/{trsm,batched_trsm}_ffi.cc`.
 - Exceptions thrown inside SLATE's OpenMP tasks CANNOT be caught by the
   FFI handler's try/catch — they `std::terminate` all ranks.  Layout
   preconditions must be validated Python-side before invoking the FFI
@@ -123,8 +123,8 @@ be 2-D-sharded; multiple batch elements should be processed in
 parallel across the available GPUs.
 
 **Implemented** — see [`batched.py`](batched.py),
-[`cpp/batched_potrf_ffi.cc`](cpp/batched_potrf_ffi.cc),
-[`cpp/batched_trsm_ffi.cc`](cpp/batched_trsm_ffi.cc).  The sharding
+[`../cpp/slate/batched_potrf_ffi.cc`](../cpp/slate/batched_potrf_ffi.cc),
+[`../cpp/slate/batched_trsm_ffi.cc`](../cpp/slate/batched_trsm_ffi.cc).  The sharding
 contract is `P('x', None, 'y')`: batch across `'x'`, inner matrix
 across `'y'`.  Each X-row of the mesh gets its own MPI sub-comm of
 size `Py` (`MPI_Comm_split` by `x_rank`, via
@@ -154,7 +154,7 @@ of scope; cuSOLVERMp is the answer if you need rectangular meshes.
   for-loop for small-n Hermitian batches; SLATE remains the AMD-GPU
   fallback path (HIP/Frontier).
 - ~~**`heev` eigenvectors.**~~  RESOLVED 2026-07-10 — stale MOSI tile
-  read + missing transpose pair; see `cpp/eigh_ffi.cc`.
+  read + missing transpose pair; see `../cpp/slate/eigh_ffi.cc`.
 - **`gels` / least-squares.**  Useful for the ISDF fitting paths
   (separate ticket).
 
@@ -166,11 +166,11 @@ of scope; cuSOLVERMp is the answer if you need rectangular meshes.
 - `batched.py`  — `batched_distributed_{cholesky,trsm}` + `SlateBatchedLowerL`.
 - `context.py`  — per-(p,q) `MPI_Comm` + `SlateCtx` cache + `validate_mesh`
                   + `get_or_init_subrow_context` for the batched sub-comm.
-- `cpp/ctx.h`           — `SlateCtx` struct.
-- `cpp/context.cc`      — `lrx_slate_{context,subrow_context}_create/destroy/init_mpi`.
+- `../cpp/slate/ctx.h`           — `SlateCtx` struct.
+- `../cpp/slate/context.cc`      — `lrx_slate_{context,subrow_context}_create/destroy/init_mpi`.
 - `cpp/{eigh,potrf,trsm}_ffi.cc` — XLA FFI handlers per op (CUDA).
 - `cpp/batched_{potrf,trsm}_ffi.cc` — batched variants (sub-row comm, CUDA).
-- `cpp/host_ffi.cc` — host-platform variants of all five handlers
+- `../cpp/slate/host_ffi.cc` — host-platform variants of all five handlers
   (JAX CPU backend; compiled only into `liblorrax_ffi_host.so`).
 - `scripts/stage_cray.sh` — populate `$HOME/software/lorrax_slate_cray/stage`
   with libsci + libmpi_gtl_cuda + xpmem + lustreapi (run once per
@@ -182,8 +182,8 @@ of scope; cuSOLVERMp is the answer if you need rectangular meshes.
 ### 1. SLATE itself (host-side, Cray PE — not in the container)
 
 ```
-bash src/ffi/slate/scripts/build_perlmutter.sh gpu    # gpu_backend=cuda
-bash src/ffi/slate/scripts/build_perlmutter.sh cpu    # gpu_backend=none
+bash src/ffi/cpp/stage/slate_build_perlmutter.sh gpu    # gpu_backend=cuda
+bash src/ffi/cpp/stage/slate_build_perlmutter.sh cpu    # gpu_backend=none
 ```
 
 Idempotent; installs under `$HOME/software/slate_builds/{gpu,cpu}/install`
@@ -198,7 +198,7 @@ The script's comments explain every non-obvious flag, especially
 libsci; empty string keeps the tester's reference checks without a bogus
 `-lscalapack`).  If the login node is loaded, run it through the
 allocation: `srun --jobid=$SLURM_JOBID --overlap -N1 -n1 -c 48 bash
-src/ffi/slate/scripts/build_perlmutter.sh gpu`.
+src/ffi/cpp/stage/slate_build_perlmutter.sh gpu`.
 
 **Which build where**: GPU nodes use `gpu/`; CPU nodes use `cpu/`.
 SLATE's execution target is a *runtime* option, and the cuda build does
@@ -210,7 +210,7 @@ into a CPU-node link.
 ### 2. The FFI .so (inside the container)
 
 ```
-bash src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh
+bash src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh
 ```
 
 Login node works when shifter cooperates; otherwise run with
@@ -221,7 +221,7 @@ sessions may be using):
 ```
 export LORRAX_SLATE_INSTALL_DIR=$HOME/software/slate_builds/gpu/install
 export LORRAX_FFI_BUILD_DIR=$HOME/software/slate_builds/ffi_build_gpu
-bash src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh
+bash src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh
 # then at run time:
 export LORRAX_FFI_SO=$LORRAX_FFI_BUILD_DIR/liblorrax_ffi.so   # loader override
 export LORRAX_SLATE_INSTALL_DIR=...                            # LDLIB override
@@ -230,14 +230,14 @@ export LORRAX_SLATE_INSTALL_DIR=...                            # LDLIB override
 ### CPU story — host platform SUPPORTED (2026-07-10)
 
 The slate ops run on the JAX CPU backend through host handler variants
-(`cpp/host_ffi.cc`): `fromScaLAPACK()` on the host buffers (same 2-D
+(`../cpp/slate/host_ffi.cc`): `fromScaLAPACK()` on the host buffers (same 2-D
 block-cyclic layout + GridOrder::Col as `fromDevices`, so the local
 transposes, comm rank-remap, and every mesh/tile validation carry
 unchanged), `Target::HostTask`, plain `memcpy` staging, no stream ctx.
 They compile ONLY into a separate CUDA-free library:
 
 ```
-bash src/ffi/common/cpp/host/build_host.sh     # → host/build/liblorrax_ffi_host.so
+bash src/ffi/cpp/build_host.sh     # → host/build/liblorrax_ffi_host.so
 ```
 
 built host-side (Cray PE, no container) against the `cpu`

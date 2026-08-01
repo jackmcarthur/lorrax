@@ -3,9 +3,9 @@
 Gate for the 2026-07-30 FFI C++ divergence audit.  Three families copied the
 MKL thread-pin block and the copies drifted on the resolver line:
 
-    scalapack/cpp/blacs_grid.h      bare dlsym(RTLD_DEFAULT, ...)
-    mklfft/cpp/fft_flat_k_ffi.cc    bare dlsym(RTLD_DEFAULT, ...)
-    mklblas/cpp/gemm_batch_ffi.cc   dlsym(RTLD_DEFAULT) then dlsym(RTLD_NEXT)
+    cpp/scalapack/blacs_grid.h      bare dlsym(RTLD_DEFAULT, ...)
+    cpp/mklfft/fft_flat_k_ffi.cc    bare dlsym(RTLD_DEFAULT, ...)
+    cpp/mklblas/gemm_batch_ffi.cc   dlsym(RTLD_DEFAULT) then dlsym(RTLD_NEXT)
 
 They really were three independent resolutions, not one shared inline — each
 is a function-local static, invisible to `strings` and visible to `nm -C`:
@@ -26,7 +26,7 @@ glibc's `_dl_sym` resolves RTLD_DEFAULT against the CALLER's link-map scope,
 and for a dlopen'd object that scope includes its own DT_NEEDED closure —
 where libmkl_intel_lp64.so actually lives.  The two resolvers are therefore
 EQUIVALENT for this symbol in every configuration reachable here, and the
-extraction into common/cpp/mkl_thread_pin.h is a maintenance fix, not a
+extraction into cpp/common/mkl_thread_pin.h is a maintenance fix, not a
 correctness fix.
 
 So the tests below assert equivalence, across the full six-way matrix, and
@@ -52,7 +52,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-HEADER = REPO / "src" / "ffi" / "common" / "cpp" / "mkl_thread_pin.h"
+HEADER = REPO / "src" / "ffi" / "cpp" / "common" / "mkl_thread_pin.h"
 
 # A stand-in for libmkl_intel_lp64.so.  Only the symbol NAME matters to
 # dlsym; the body records that it was actually called, so the pin RAII can be
@@ -261,7 +261,7 @@ def test_bare_and_shared_resolvers_agree(built, probe, vendor_scope,
         "The two resolvers DISAGREE on this platform: bare="
         f"{bare} shared={shared} (probe={probe} vendor_scope={vendor_scope} "
         f"probe_scope={probe_scope}).  The equivalence table in "
-        "src/ffi/common/cpp/mkl_thread_pin.h was measured on gcc 8.3.0/glibc "
+        "src/ffi/cpp/common/mkl_thread_pin.h was measured on gcc 8.3.0/glibc "
         "and is now wrong for this toolchain -- re-measure it before "
         "trusting either form."
     )

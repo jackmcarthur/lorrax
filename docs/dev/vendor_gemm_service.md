@@ -4,7 +4,7 @@
 behind it, written to the shape of `staged_reshard_primitive.md` (which
 documents a primitive with physics in it; this documents a mechanism, so it
 is short).  Sources: `src/ffi/mklblas/gemm.py`,
-`src/ffi/mklblas/cpp/gemm_batch_ffi.cc`, `src/ffi/common/gate.py`.
+`src/ffi/cpp/mklblas/gemm_batch_ffi.cc`, `src/ffi/common/gate.py`.
 Measurements: `wk_REL/RESHARD_OVERHEAD_MEMO.md` Sec. 4.4/4.5,
 `wk_REL/contract_bands_notes.md`, `wk_REL/gemm_portability_bse_notes.md`.*
 
@@ -123,7 +123,7 @@ table at all, so the dial does not merely resolve off — it does not exist.
 `cblas_?gemm_batch` is an MKL extension of CBLAS (OpenBLAS has it; Cray
 LibSci does not).  **There is no build-time feature probe and no
 `HAVE_BATCH` macro** (`gemm_batch_ffi.cc:7-40`, `:188-202`;
-`host/CMakeLists.txt:333-345`).  Each of `cblas_{s,d,c,z}gemm_batch` that
+`src/ffi/cpp/CMakeLists.txt` host leg, "RESOLVE 2/4").  Each of `cblas_{s,d,c,z}gemm_batch` that
 `dlsym` resolves gets one batched call per invocation; each that does not
 falls back **for that precision** to a loop of plain `cblas_?gemm` calls
 (standard CBLAS, threaded internally by the vendor, loop sequential by
@@ -172,7 +172,7 @@ call, the same class as the plan-A local eigh that NEEDS the full thread
 count.
 
 The pin is currently the third copy of the same ~60-line block
-(`scalapack/cpp/blacs_grid.h:157-233`, `mklfft/cpp/fft_flat_k_ffi.cc:96-159`,
+(`cpp/scalapack/blacs_grid.h:157-233`, `cpp/mklfft/fft_flat_k_ffi.cc:96-159`,
 here at `:277-338`), kept separate so each TU stays MPI-free
 (`blacs_grid.h:40` includes `<mpi.h>`).  The copies have already DRIFTED:
 this one resolves the pin with `resolve_sym` (`RTLD_DEFAULT` →
@@ -180,7 +180,7 @@ this one resolves the pin with `resolve_sym` (`RTLD_DEFAULT` →
 under a local-scope `dlopen` the GEMM handler still pins MKL and the FFT
 handler silently does not.  `TEMPLATE.md:194-195`'s own threshold ("extract
 when a THIRD library would copy it a third time") is met — the fix is a new
-MPI-free `ffi/common/cpp/mkl_thread_pin.h`, **not** including
+MPI-free `ffi/cpp/common/mkl_thread_pin.h`, **not** including
 `blacs_grid.h`.  Not done in this wave (C++ was out of scope); recorded so
 it is not rediscovered.
 

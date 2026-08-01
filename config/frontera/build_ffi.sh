@@ -29,7 +29,7 @@ PY="$LORRAX_VENV/bin/python"
 CMAKE="$LORRAX_VENV/bin/cmake"
 CUDA_ROOT="$LORRAX_FFI_STAGE/cuda_root"
 STAGE="$LORRAX_FFI_STAGE/stage"
-SRC="$LORRAX_ROOT/src/ffi/common/cpp"
+SRC="$LORRAX_ROOT/src/ffi/cpp"
 
 for p in "$PY" "$CMAKE" "$CUDA_ROOT/include/cuda_runtime.h" "$STAGE/include/cusolverMp.h"; do
     [ -e "$p" ] || { echo "[build] missing prerequisite: $p (run stage_ffi_deps.sh)" >&2; exit 2; }
@@ -39,6 +39,7 @@ export PATH="$CUDA_ROOT/bin:$LORRAX_VENV/bin:$PATH"
 export CUDA_HOME="$CUDA_ROOT"
 
 ARGS=(
+    -DLORRAX_FFI_PLATFORM=cuda
     -DCMAKE_BUILD_TYPE=Release
     -DPython3_EXECUTABLE="$PY"
     -DLORRAX_FFI_HAVE_CAL=OFF

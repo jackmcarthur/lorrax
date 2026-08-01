@@ -391,15 +391,17 @@ src/ffi/phdf5/
 ├── context.py             (Python-side open/close wrappers)
 ├── write.py               (ffi_write_call, write_sharded_slab)
 ├── read.py                (ffi_read_call, read_sharded_slab)
-├── cpp/
-│   ├── ctx.h              (PhdfCtx: fapl/dxpl plists, pooled events, writer_thread, task_queue)
-│   ├── context.cc         (open_ctx, close_ctx, ensure_dataset, ensure_mpi_initialized)
-│   ├── write_ffi.cc       (WriteDispatch — runtime offset, async H5Dwrite task)
-│   ├── read_ffi.cc        (ReadDispatch — runtime offset, sync H5Dread + async H2D)
-│   └── phdf5_interface.h  (HDF5 dtype helpers)
-└── scripts/
-    ├── stage_cray.sh      (copy cray-hdf5-parallel + MPICH-ABI shim to $SCRATCH)
-    └── stage_openmpi.sh   (copy conda-forge HDF5+OpenMPI to $SCRATCH)
+└── (C++ handlers live in src/ffi/cpp/phdf5/ — the one FFI C++ tree,
+     see docs/architecture/ffi_layout.md)
+src/ffi/cpp/phdf5/
+├── ctx.h                  (PhdfCtx: fapl/dxpl plists, pooled events, writer_thread, task_queue)
+├── context.cc             (open_ctx, close_ctx, ensure_dataset, ensure_mpi_initialized)
+├── write_ffi.cc           (WriteDispatch — runtime offset, async H5Dwrite task)
+├── read_ffi.cc            (ReadDispatch — runtime offset, sync H5Dread + async H2D)
+└── phdf5_interface.h      (HDF5 dtype helpers)
+src/ffi/cpp/stage/
+├── phdf5_stage_cray.sh    (copy cray-hdf5-parallel + MPICH-ABI shim to $SCRATCH)
+└── phdf5_stage_openmpi.sh (copy conda-forge HDF5+OpenMPI to $SCRATCH)
 
 src/file_io/_slab_io_ffi.py         (_FfiBackend: Python worker thread, _sm_cache, wraps shard_map+jit)
 src/file_io/slab_io.py              (unified SlabIO front-end: dispatches to FFI or rank-0-allgather)

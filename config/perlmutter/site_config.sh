@@ -82,7 +82,7 @@ LORRAX_MPI_TYPE_DEFAULT="cray_shasta"
 # alongside 0.7.2 for fallback; load with LORRAX_NVHPC_SUBPATH override
 # in a shell.  0.6.0 silently returns wrong answers for getrf/getrs on
 # any Px>1 AND Py>1 mesh — the patched FFI prints a runtime warning
-# (see src/ffi/cusolvermp/cpp/context.cc) but the warning can't fix the
+# (see src/ffi/cpp/cusolvermp/context.cc) but the warning can't fix the
 # bug.  Use 1xN / Nx1 mesh if you must run 0.6.0.
 LORRAX_NVHPC_SUBPATH="0.7.2_cuda12.9/math_libs/12.9/lib64"
 

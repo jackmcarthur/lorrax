@@ -66,7 +66,7 @@ the overlay sitecustomize) or the FFI's concurrent MPI threads race —
 measured ~29% multi-node failure rate (AS.4b).  LORRAX deliberately
 does NOT default ``MPITRAMPOLINE_LIB`` itself: it is a harness-level
 machine fact (a build artifact path), the unpatched build is a
-measured hazard, and ``phdf5/cpp/context.cc`` announces the hazardous
+measured hazard, and ``cpp/phdf5/context.cc`` announces the hazardous
 level at open time.
 """
 
@@ -98,7 +98,7 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cusolvermp_batched_solve_lu": "CusolverMpBatchedSolveLuFfi",
     "lorrax_cublasmp_batched_gemm":       "CublasMpBatchedGemmFfi",
     "lorrax_cublasmp_batched_w_solve":    "CublasMpBatchedWSolveFfi",
-    # cuFFT strided flat-k batched-FFT handlers (cufft/cpp) — the CUDA
+    # cuFFT strided flat-k batched-FFT handlers (cpp/cufft) — the CUDA
     # platform mirror of the mklfft host handlers below.  The target STRINGS
     # deliberately keep the host table's "mklfft" names (they were coined by
     # the CPU prototype): common.fft_helpers issues ONE platform-agnostic
@@ -117,10 +117,10 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_slate_batched_trsm":      "SlateBatchedTrsmFfi",
 }
 
-# Host variants of the slate targets (src/ffi/slate/cpp/host_ffi.cc) —
+# Host variants of the slate targets (src/ffi/cpp/slate/host_ffi.cc) —
 # same target names as the CUDA table, registered under platform="cpu" —
 # plus the host-only ScaLAPACK targets (src/ffi/scalapack/, MKL/LibSci),
-# plus the phdf5 read AND write handlers (src/ffi/phdf5/cpp/{read,write}_ffi.cc
+# plus the phdf5 read AND write handlers (src/ffi/cpp/phdf5/{read,write}_ffi.cc
 # compiled with -DLORRAX_FFI_NO_CUDA).  The phdf5 target STRINGS are identical
 # to the CUDA table so the ffi.phdf5.{read,write} ffi_call sites resolve by
 # lowering platform; only the C++ SYMBOL names differ (Phdf*HostFfi vs
@@ -139,11 +139,11 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_batched_trsm":      "SlateBatchedTrsmHostFfi",
     "lorrax_scalapack_batched_solve_lu": "ScalapackBatchedSolveLuHostFfi",
     "lorrax_scalapack_eigh":          "ScalapackEighHostFfi",
-    # MKL FFT (DFTI API) flat-k batched-FFT handlers (mklfft/cpp) — the
+    # MKL FFT (DFTI API) flat-k batched-FFT handlers (cpp/mklfft) — the
     # LORRAX_FFT_FFI backend of common.fft_helpers (FFT-FFI prototype).
     "lorrax_mklfft_flat_k":           "MklFftFlatKHostFfi",
     "lorrax_mklfft_gw_conv":          "MklFftGwConvHostFfi",
-    # MKL batched-GEMM handler (mklblas/cpp) — the LORRAX_BANDS_GEMM_FFI
+    # MKL batched-GEMM handler (cpp/mklblas) — the LORRAX_BANDS_GEMM_FFI
     # body of common.contract_bands (contract_bands_block_reshard).
     "lorrax_mklblas_gemm_batch":      "MklBlasGemmBatchHostFfi",
     "lorrax_phdf5_read":              "PhdfReadHostFfi",
@@ -153,22 +153,22 @@ _HOST_TARGET_SYMBOLS = {
 }
 
 # Per-platform library spec: .so filename, env-var override, in-tree build
-# dir (relative to this file's cpp/), target table, and the build command
-# for the not-found error.
+# dir (relative to src/ffi/cpp/, the one C++ tree), target table, and the
+# build command for the not-found error.
 _PLATFORMS = {
     "CUDA": dict(
         so_name="liblorrax_ffi.so",
         env="LORRAX_FFI_SO",
         build_subdir="build",
         targets=_CUDA_TARGET_SYMBOLS,
-        build_hint="src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh",
+        build_hint="src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh",
     ),
     "cpu": dict(
         so_name="liblorrax_ffi_host.so",
         env="LORRAX_FFI_HOST_SO",
-        build_subdir="host/build",
+        build_subdir="build_host",
         targets=_HOST_TARGET_SYMBOLS,
-        build_hint="bash src/ffi/common/cpp/host/build_host.sh",
+        build_hint="bash src/ffi/cpp/build_host.sh",
     ),
 }
 
@@ -208,7 +208,7 @@ def _candidate_paths(platform: str) -> list[Path]:
     if env:
         paths.append(Path(env))
     here = Path(__file__).resolve()
-    build_dir = here.parent / "cpp" / spec["build_subdir"]
+    build_dir = here.parent.parent / "cpp" / spec["build_subdir"]
     paths.append(build_dir / spec["so_name"])
     for p in sys.path:
         pp = Path(p)
@@ -291,7 +291,7 @@ def _declare_cuda_stack(lib: ctypes.CDLL) -> None:
 def _declare_phdf5(lib: ctypes.CDLL) -> None:
     """parallel-HDF5 lifecycle — exported by whichever platform library was
     built with the phdf5 subpackage (the CUDA-free wrappers in
-    phdf5/cpp/api.cc compile into BOTH liblorrax_ffi.so and, for the host
+    cpp/phdf5/api.cc compile into BOTH liblorrax_ffi.so and, for the host
     read path, liblorrax_ffi_host.so).  Absent from a
     -DLORRAX_FFI_HAVE_PHDF5=0 build; declared under a hasattr guard so
     loading such a .so doesn't fail."""
@@ -333,7 +333,7 @@ def _declare_phdf5(lib: ctypes.CDLL) -> None:
 
 def _declare_slate(lib: ctypes.CDLL) -> None:
     """SLATE context lifecycle — exported by BOTH platform libraries
-    (slate/cpp/context.cc is pure MPI and compiled into each).  Absent
+    (cpp/slate/context.cc is pure MPI and compiled into each).  Absent
     from a build made without SLATE (e.g. the Frontera eigh-only .so)."""
 
     if not hasattr(lib, "lrx_slate_context_create"):

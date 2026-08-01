@@ -5,11 +5,11 @@ nothing here changes Perlmutter/Cray behaviour. The only edits outside this
 directory are three backward-compatible option guards (all default to the
 previous behaviour):
 
-* `src/ffi/common/cpp/CMakeLists.txt` — `option(LORRAX_FFI_HAVE_CAL ON)`,
+* `src/ffi/cpp/CMakeLists.txt` (CUDA leg) — `option(LORRAX_FFI_HAVE_CAL ON)`,
   `option(LORRAX_FFI_HAVE_PHDF5 ON)`.
-* `src/ffi/cusolvermp/cpp/{ctx.h,context.cc}` — `#if LORRAX_FFI_HAVE_CAL`
+* `src/ffi/cpp/cusolvermp/{ctx.h,context.cc}` — `#if LORRAX_FFI_HAVE_CAL`
   around the CAL comm path (cuSOLVERMp ≥ 0.7 is NCCL-native).
-* `src/ffi/common/cpp/api.cc` — `#if LORRAX_FFI_HAVE_PHDF5` around the phdf5
+* `src/ffi/cpp/common/api.cc` — `#if LORRAX_FFI_HAVE_PHDF5` around the phdf5
   lifecycle entry points.
 * `src/ffi/common/ffi_loader.py` — skips FFI handler / lifecycle symbols a
   partial build doesn't export.

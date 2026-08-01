@@ -218,8 +218,8 @@ setenv("JAX_COMPILATION_CACHE_DIR", jax_cache_dir)
 -- =========================================================================
 
 -- Paths to the helper wrappers (injected into every shell function body).
-local select_gpu_sh   = pathJoin(lorrax_src, "ffi/common/cpp/select_gpu.sh")
-local in_container_sh = pathJoin(lorrax_src, "ffi/common/cpp/in_container.sh")
+local select_gpu_sh   = pathJoin(lorrax_src, "ffi/cpp/select_gpu.sh")
+local in_container_sh = pathJoin(lorrax_src, "ffi/cpp/in_container.sh")
 
 -- -------------------------------------------------------------------------
 -- lxalloc: interactive GPU allocation.

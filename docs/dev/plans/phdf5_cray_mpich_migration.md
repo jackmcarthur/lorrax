@@ -95,7 +95,7 @@ Total ~1 MB. These are stable across Cray MPICH minor versions.
 ### Phase B — launcher + build plumbing
 
 7. Update
-   [`src/ffi/common/cpp/run_shifter.sh`](/global/u2/j/jackm/software/lorrax/src/ffi/common/cpp/run_shifter.sh):
+   [`src/ffi/cpp/run_shifter.sh`](/global/u2/j/jackm/software/lorrax/src/ffi/cpp/run_shifter.sh):
    - Add `--module=mpich` alongside `--module=gpu`.
    - Change `LORRAX_FFI_PHDF5_DIR` default from
      `/pscratch/sd/j/jackm/lorrax_phdf5/stage` to
@@ -106,7 +106,7 @@ Total ~1 MB. These are stable across Cray MPICH minor versions.
    - Bind-mount stays `--volume=$LORRAX_FFI_PHDF5_DIR:/lorrax_phdf5`.
 
 8. Update
-   [`src/ffi/common/cpp/CMakeLists.txt`](/global/u2/j/jackm/software/lorrax/src/ffi/common/cpp/CMakeLists.txt):
+   `src/ffi/cpp/CMakeLists.txt`:
    - `find_package(HDF5 ... COMPONENTS C REQUIRED)` with
      `HDF5_PREFER_PARALLEL=ON`, `HDF5_ROOT=/lorrax_phdf5` should Just
      Work.
@@ -121,7 +121,7 @@ Total ~1 MB. These are stable across Cray MPICH minor versions.
 
 ### Phase C — verification
 
-9. Rebuild: `src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh`
+9. Rebuild: `src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh`
    inside the container, no GPU needed.
 10. Sanity: `ldd build/liblorrax_ffi.so` should show `libhdf5.so.310
     => /lorrax_phdf5/lib/libhdf5.so.310` and `libmpi.so.12 =>

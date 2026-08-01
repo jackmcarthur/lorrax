@@ -1252,7 +1252,7 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
     use cuSolverMp on **true 2D meshes** (px≥2 AND py≥2).  cuSolverMp
     0.7.2 fixes the earlier 2D-grid getrf/getrs correctness bug
     (validated end-to-end on MoS2 3×3 bispinor at 2×2 mesh; see
-    ``src/ffi/cusolvermp/cpp/batched_solve_lu_ffi.cc`` for history).
+    ``src/ffi/cpp/cusolvermp/batched_solve_lu_ffi.cc`` for history).
 
     Tradeoff: small FFI setup overhead at MoS2 scale (n_rmu=656,
     2×2 mesh).  At CrI3 6×6 80 Ry (n_rmu≈1800, 4×4 mesh) the cuSolverMp

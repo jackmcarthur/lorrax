@@ -44,7 +44,7 @@ The three native trees (cuSolverMp, parallel HDF5, SLATE) are staged once under
 container. Then `liblorrax_ffi.so` is built inside Shifter:
 
 ```bash
-src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh
+src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh
 ```
 
 See [`docs/ENVIRONMENT_COMPREHENSIVE.md` §5](../ENVIRONMENT_COMPREHENSIVE.md) for staging

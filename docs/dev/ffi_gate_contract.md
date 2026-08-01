@@ -137,7 +137,7 @@ wrapper body (`ffi/mklfft/flat_k.py`'s `_flat_k_fft_ffi`,
 
 `gate.rank_id()` reads `SLURM_PROCID` → `PMI_RANK` → `OMPI_COMM_WORLD_RANK`,
 the same list in the same order as the C++ `announce_here()`
-(`mklblas/cpp/gemm_batch_ffi.cc:229-235`).  It falls back to
+(`cpp/mklblas/gemm_batch_ffi.cc:229-235`).  It falls back to
 `jax.process_index()` only when none is set (single process, or an unknown
 launcher), where that is both correct and harmless.
 

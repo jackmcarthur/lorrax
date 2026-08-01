@@ -211,7 +211,7 @@ are unaffected.
 
 ## FFI generalisation (what the C++ side needs)
 
-Current [`write_ffi.cc`](/pscratch/sd/j/jackm/lorrax_sandbox/sources/lorrax_C/src/ffi/phdf5/cpp/write_ffi.cc) hardcodes 2-D
+Current [`write_ffi.cc`](/pscratch/sd/j/jackm/lorrax_sandbox/sources/lorrax_C/src/ffi/cpp/phdf5/write_ffi.cc) hardcodes 2-D
 with `(rank/q, rank%q)` offsets.  To support N-D:
 
 - Replace `Attr<int64_t>("n_rows")` + `Attr<int64_t>("n_cols")` with

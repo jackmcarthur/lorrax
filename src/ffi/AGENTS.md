@@ -7,7 +7,7 @@ ships five targets, all validated on NERSC Perlmutter (1–4 nodes × 4×A100):
 | Subpackage | Library | Process model | Smoke test | Status |
 |---|---|---|---|---|
 | `cusolvermp` | cuSOLVERMp (multi-proc multi-GPU, NCCL-backed CAL) | 1 proc per GPU | `common.cusolvermp_eigh_test`, `common.cusolvermp_batched_test`, `tests/test_ffi_linalg_contract.py` | potrf/potrs/getrf+getrs 1e-16–1e-14 on 1×1/2×2/4×1/1×4; syevd square meshes only (rect mesh DEADLOCKS — wrapper rejects) |
-| `cublasmp` | cuBLASMp (batched gemm + fused W-solve) | 1 proc per GPU | `common.cublasmp_gemm_test`, `common.cublasmp_w_solve_test`, contract tests | 1e-16–1e-14 on all meshes.  Comm ABI must match the LOADED cuBLASMp generation (≥0.5.0 = NCCL) — see `scripts/stage_cublasmp_redist.sh` |
+| `cublasmp` | cuBLASMp (batched gemm + fused W-solve) | 1 proc per GPU | `common.cublasmp_gemm_test`, `common.cublasmp_w_solve_test`, contract tests | 1e-16–1e-14 on all meshes.  Comm ABI must match the LOADED cuBLASMp generation (≥0.5.0 = NCCL) — see `cpp/stage/cusolvermp_stage_cublasmp_redist.sh` |
 | `slate` | SLATE (MPI + GPU tile linalg; AMD-portable path) | 1 proc per GPU | `common.slate_cholesky_trsm_test`, `common.slate_batched_test`, contract tests | potrf/trsm/heev ~1e-16/1e-14 on p==q or 1-D meshes; see [`slate/README.md`](slate/README.md) |
 | `phdf5`      | parallel HDF5 via MPI-IO (read + write sharded slabs) | 1 proc per GPU | `common.phdf5_write_test`, `common.phdf5_multi_offset_test` | 0.000e+00 round-trip; 4 / 9 GB/s write / read @ 16 GPUs. See [`phdf5/ARCHITECTURE.md`](phdf5/ARCHITECTURE.md) for the async-design rationale and the non-obvious pitfalls encountered along the way. |
 | `scalapack` | the **ScaLAPACK API** (HOST platform — JAX CPU backend), supplied by whichever implementation the host lib was linked against: Cray LibSci on Perlmutter, Intel MKL on Frontera | 1 proc per rank | `tests/test_ffi_linalg_contract.py` (`scalapack_*` cells) | pXgetrf+pXgetrs fused per-q LU (`distributed_lu = scalapack`) + pXheevd eigh; square + 1-D meshes (square-block requirement); zero extra link deps (the provider is already in `liblorrax_ffi_host.so`) |
@@ -32,7 +32,7 @@ ships five targets, all validated on NERSC Perlmutter (1–4 nodes × 4×A100):
 > 2-D mesh** (a Fortran-order mesh swaps which provider is right — the fix
 > is LORRAX-side, no upstream patch); and the target defaults to
 > `HostTask`, so a GPU build silently runs on the CPU.
-> `scalapack/cpp/blacs_grid.h` detects the interposition and refuses by
+> `cpp/scalapack/blacs_grid.h` detects the interposition and refuses by
 > default — `ffi_loader` keys only on LORRAX's own handler symbols and
 > cannot see it. Full measurement, the fix and its cost:
 > [PORTING.md §0b](PORTING.md); what each user's machine gets: §0c.
@@ -46,12 +46,12 @@ any future distributed solver (ELPA, `H5Dwrite_async`, etc.).
 ```bash
 cd sources/lorrax
 
-src/ffi/cusolvermp/scripts/stage_nvhpc.sh       # ~100 MB → /pscratch, one-time
-src/ffi/phdf5/scripts/stage_openmpi.sh          #  ~40 MB → /pscratch, one-time
+src/ffi/cpp/stage/cusolvermp_stage_nvhpc.sh       # ~100 MB → /pscratch, one-time
+src/ffi/cpp/stage/phdf5_stage_openmpi.sh          #  ~40 MB → /pscratch, one-time
 
 lxalloc                                          # 1 node × 4 GPUs
 export SLURM_JOBID=<from lxalloc output>
-src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh
+src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh
 ```
 
 Staging copies are mandatory because Shifter's `udiRoot.conf` on Perlmutter
@@ -65,47 +65,44 @@ writes) or non-NERSC clusters, see [PORTING.md](PORTING.md).
 ## Layout
 
 ```
-ffi/
+ffi/                       (full design: docs/architecture/ffi_layout.md)
 ├── AGENTS.md            ← you are here
 ├── PORTING.md           per-cluster + MPI stack notes, known issues
 ├── TEMPLATE.md          skeleton for a new target
+├── gate.py  fft.py  gemm.py    facade modules (gate grammar; flat-k FFT
+│                        serving BOTH platforms; vendor-CBLAS batched GEMM)
+├── linalg/              resolve/plan/dispatch facade over the linalg backends
 ├── common/
 │   ├── ffi_loader.py    ctypes-loads the per-platform .so's, registers
 │   │                    handlers (CUDA → liblorrax_ffi.so; cpu →
 │   │                    liblorrax_ffi_host.so; same target names, jaxlib-style)
-│   ├── broadcast.py     JAX-KV-store broadcast helpers
-│   └── cpp/
-│       ├── CMakeLists.txt   single build producing liblorrax_ffi.so
-│       ├── build.sh         invokes cmake + make inside Shifter
-│       ├── run_shifter.sh   Shifter launcher + MPI stack switch
-│       ├── ffi_helpers.h    LORRAX_*_CHECK + FFI_RETURN_IF_ERROR
-│       ├── api.cc           extern "C" ABI for ctypes
-│       └── host/            CUDA-free liblorrax_ffi_host.so (slate host
-│           │                handlers; JAX CPU backend)
-│           ├── CMakeLists.txt
-│           └── build_host.sh    host-side Cray PE build (no container)
-├── cusolvermp/
-│   ├── {__init__,context,eigh}.py     public API + NCCL bootstrap + shard_map
-│   ├── scripts/stage_nvhpc.sh         copy cuSOLVERMp/libcal to /pscratch
-│   └── cpp/{ctx.h,context.cc,eigh_ffi.cc}
-│   ├── {__init__,eigh}.py
-└── phdf5/
-    ├── {__init__,context,write,read}.py    open/close/write/read_sharded_slab
-    ├── scripts/{stage_openmpi,stage_cray}.sh
-    └── cpp/
-        ├── ctx.h                 PhdfCtx (MPI_Comm + cached HDF5 plists + pinned buf)
-        ├── context.cc            MPI_Init_thread + H5F*/H5D* + NERSC MPI-IO hints
-        ├── phdf5_interface.h     dtype → hid_t template trait
-        └── {write,read}_ffi.cc   XLA_FFI_DEFINE_HANDLER_SYMBOL(Phdf{Write,Read}Ffi)
+│   └── broadcast.py     JAX-KV-store broadcast helpers
+├── cusolvermp/ cublasmp/ slate/ scalapack/ phdf5/
+│   │                    pure-python service packages (shard_map wrappers,
+│   │                    context/bootstrap); mklfft/ mklblas/ cufft/ are
+│   │                    re-export shims onto fft.py / gemm.py
+└── cpp/                 THE one C++ tree (both platform legs)
+    ├── CMakeLists.txt   ONE entry point; -DLORRAX_FFI_PLATFORM=cuda|host
+    │                    selects the leg, refuses when unset
+    ├── build.sh         CUDA leg via cmake inside Shifter → cpp/build/
+    ├── build_host.sh    host leg, no container → cpp/build_host/
+    ├── run_shifter.sh   Shifter launcher + MPI stack switch
+    ├── stage/           vendor stage scripts (cusolvermp_stage_nvhpc.sh,
+    │                    phdf5_stage_{openmpi,cray}.sh, slate_*.sh, …)
+    ├── common/          ffi_helpers.h, mkl_thread_pin.h, api.cc (ctypes ABI)
+    ├── cusolvermp/      ctx.h, context.cc, eigh_ffi.cc, batched_*.cc
+    └── phdf5/           ctx.h, context.cc, phdf5_interface.h,
+                         {write,read}_ffi.cc   (+ mklfft/ mklblas/ cufft/
+                         scalapack/ slate/ cublasmp/ same pattern)
 ```
 
 ## Build
 
 ```bash
-src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh
+src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh
 ```
 
-Output: `src/ffi/common/cpp/build/liblorrax_ffi.so`.  CMake prints the
+Output: `src/ffi/cpp/build/liblorrax_ffi.so`.  CMake prints the
 resolved HDF5 + MPI paths so build logs confirm the right stack.  To
 build against the opt-in Cray MPICH stack, prefix with
 `LORRAX_PHDF5_MPI_STACK=mpich`.
@@ -114,18 +111,18 @@ build against the opt-in Cray MPICH stack, prefix with
 
 ```bash
 # cusolvermp — 4 ranks × 4 GPUs
-LORRAX_NGPU=4 src/ffi/common/cpp/run_shifter.sh env \
+LORRAX_NGPU=4 src/ffi/cpp/run_shifter.sh env \
     CUSOLVERMP_FORCE_NCCL=1 XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async \
     python3 -u -m common.cusolvermp_eigh_test --grid 2 2
 
 # phdf5 round-trip (write + parallel read, exact equality)
-LORRAX_NGPU=4 src/ffi/common/cpp/run_shifter.sh env \
+LORRAX_NGPU=4 src/ffi/cpp/run_shifter.sh env \
     XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async HDF5_USE_FILE_LOCKING=FALSE \
     python3 -u -m common.phdf5_write_test
 
 # phdf5 bench @ 16 GPUs / 4 nodes (write or read; pick one)
 LORRAX_NNODES=4 LORRAX_NGPU=4 LORRAX_NTASKS=16 \
-    src/ffi/common/cpp/run_shifter.sh env \
+    src/ffi/cpp/run_shifter.sh env \
     XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async HDF5_USE_FILE_LOCKING=FALSE \
     python3 -u -m common.phdf5_vs_gather_bench -n 16384 --iters 3
 ```
@@ -159,17 +156,18 @@ Each target's bootstrap + handler flow is self-contained in its `cpp/`:
 
 ## Adding a new target
 
-1. `src/ffi/<lib>/cpp/<feature>_ffi.cc`: `XLA_FFI_DEFINE_HANDLER_SYMBOL`.
-   Templates on dtype: follow `phdf5/cpp/write_ffi.cc`.  Stateful
-   context: follow `cusolvermp/cpp/eigh_ffi.cc`.
-2. Append the `.cc` to `LORRAX_FFI_SOURCES` in `common/cpp/CMakeLists.txt`;
+1. `src/ffi/cpp/<lib>/<feature>_ffi.cc`: `XLA_FFI_DEFINE_HANDLER_SYMBOL`.
+   Templates on dtype: follow `cpp/phdf5/write_ffi.cc`.  Stateful
+   context: follow `cpp/cusolvermp/eigh_ffi.cc`.
+2. Append the `.cc` to `LORRAX_FFI_SOURCES` (CUDA leg) and/or
+   `LORRAX_FFI_HOST_SOURCES` (host leg) in `src/ffi/cpp/CMakeLists.txt`;
    add any `-l<lib>` to `target_link_libraries`.
 3. Register the target in `_FFI_TARGET_SYMBOLS` in `common/ffi_loader.py`;
    add ctypes decls for any lifecycle C entry points.
 4. Communicator bootstrap: reuse `cusolvermp/context.py` (NCCL / CAL) or
-   `phdf5/cpp/context.cc`'s `ensure_mpi_initialized` (MPI).
-5. Host-file deps (SDK, module install): `src/ffi/<lib>/scripts/stage_*.sh`
-   following `stage_nvhpc.sh` / `stage_openmpi.sh`.  Extend
+   `cpp/phdf5/context.cc`'s `ensure_mpi_initialized` (MPI).
+5. Host-file deps (SDK, module install): `src/ffi/cpp/stage/<lib>_stage_*.sh`
+   following `cusolvermp_stage_nvhpc.sh` / `phdf5_stage_openmpi.sh`.  Extend
    `run_shifter.sh` to bind-mount the stage to a stable container path.
 6. Python wrapper `src/ffi/<lib>/<feature>.py`: `shard_map` →
    `jax.ffi.ffi_call`.  Re-export from `src/ffi/<lib>/__init__.py`.

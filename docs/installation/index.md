@@ -26,7 +26,7 @@ Only the pure-JAX path works with **zero native libs**. Everything distributed n
     A fresh `git clone` has **no** `liblorrax_ffi.so` (it is a gitignored build artifact).
     The pure-JAX path never touches it (all FFI imports are lazy), but the first time you
     run a distributed / FFI-I/O code path you will hit
-    `FileNotFoundError … Build with: bash src/ffi/common/cpp/build.sh`.
+    `FileNotFoundError … Build with: bash src/ffi/cpp/build.sh`.
     Build the native library per [FFI native libraries](ffi-native-libs.md) before
     using those features.
 

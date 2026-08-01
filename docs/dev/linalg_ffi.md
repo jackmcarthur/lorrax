@@ -534,7 +534,7 @@ What can run here?
   > `‖ZᴴZ−I‖` ≤ 8.0e-14) — while in the **same job, same mesh, same sizes**,
   > `ffi.slate`'s own host handler died with **SIGSEGV (rc 139) at n=32 and
   > n=64**. Same library, same MKL, same process image, opposite outcomes ⇒
-  > the fault is in **`slate/cpp/host_ffi.cc`'s call path**, not upstream.
+  > the fault is in **`cpp/slate/host_ffi.cc`'s call path**, not upstream.
   > Enumerable differences at that call site: LORRAX builds `Z` as
   > SLATE-managed tiles and copies out via `tileGetForReading`, whereas the
   > shim wraps the caller's buffer with `Matrix::fromScaLAPACK`; LORRAX uses
@@ -613,7 +613,7 @@ What can run here?
   case, nothing covers a non-converged eigh — and `slate::heev` requires a
   square process grid (`heev.cc:102`) and `GridOrder::Col` (asserted in five
   places), while `getrf`/`getrs`/`potrf`/`trsm` carry no such constraint.
-  `scalapack/cpp/blacs_grid.h` resolves the provider of the routine it is
+  `cpp/scalapack/blacs_grid.h` resolves the provider of the routine it is
   about to call (`dlsym` + `dladdr`) and refuses by default, naming all of
   it. Reproducer: `wk_REL/harness/slalias_mesh.sbatch`.
   `LORRAX_SCALAPACK_ALLOW_SLATE_API=1` downgrades to one loud line.

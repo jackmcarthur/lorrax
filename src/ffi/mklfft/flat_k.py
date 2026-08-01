@@ -8,11 +8,11 @@ SAME target strings under different C++ symbols
 same-target/different-symbol split):
 
     cpu   liblorrax_ffi_host.so   MKL FFT via the DFTI *descriptor* API
-                                  (``src/ffi/mklfft/cpp/fft_flat_k_ffi.cc``) —
+                                  (``src/ffi/cpp/mklfft/fft_flat_k_ffi.cc``) —
                                   a genuine O(N log N) FFT at any k-count;
                                   NOT a DFT-as-matmul (owner-vetoed).
     CUDA  liblorrax_ffi.so        cuFFT with the ADVANCED DATA LAYOUT
-                                  (``src/ffi/cufft/cpp/fft_flat_k_cuda_ffi.cc``):
+                                  (``src/ffi/cpp/cufft/fft_flat_k_cuda_ffi.cc``):
                                   ``cufftPlanMany64`` inembed/istride=T/idist=1,
                                   the exact stride-descriptor analog; an
                                   NVRTC-compiled kernel fuses the G·W

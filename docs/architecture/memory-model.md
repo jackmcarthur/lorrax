@@ -784,7 +784,7 @@ There is no offline fit / DOE / preset framework: the former
 
 A third invisible allocation exists and this planner does **not** account for
 it. With the flat-k FFT service enabled, the handlers in
-`src/ffi/mklfft/cpp` (MKL DFTI descriptors) and `src/ffi/cufft/cpp` (cuFFT
+`src/ffi/cpp/mklfft` (MKL DFTI descriptors) and `src/ffi/cpp/cufft` (cuFFT
 plans + the NVRTC-compiled fused multiply) hold their own workspace *outside
 both* XLA's buffer assignment and the `cufftMakePlanMany` query above — the
 query sizes the plan XLA's own FFT thunk would build, not a plan the FFI

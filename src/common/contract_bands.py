@@ -97,7 +97,7 @@ small left dots (1.6e-3 of the right's flops, measured) — is untouched.
 The dial ITSELF is a microservice: ``ffi.mklblas`` owns its grammar,
 platform resolution, capability probe, announcements, refusals and the
 ``ffi_call`` (handler ``lorrax_mklblas_gemm_batch``,
-src/ffi/mklblas/cpp).  ``docs/dev/vendor_gemm_service.md`` is its
+src/ffi/cpp/mklblas).  ``docs/dev/vendor_gemm_service.md`` is its
 contract, ``docs/dev/ffi_gate_contract.md`` the gate doctrine it
 implements.  Default is AUTO (owner order 2026-07-29, doctrine #8:
 capability detection, not policy) — ON when the platform is CPU AND the

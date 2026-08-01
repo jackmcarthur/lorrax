@@ -52,7 +52,7 @@ Rank discipline
 ---------------
 :func:`rank_id` reads the LAUNCHER's rank (``SLURM_PROCID`` / ``PMI_RANK`` /
 ``OMPI_COMM_WORLD_RANK``) — the SAME rule, in the same order, as the C++
-side's ``announce_here()`` (``mklblas/cpp/gemm_batch_ffi.cc:229-235``), so
+side's ``announce_here()`` (``cpp/mklblas/gemm_batch_ffi.cc:229-235``), so
 Python and C++ agree on who speaks.  It deliberately does NOT call
 ``jax.process_index()`` first: that goes through ``get_backend()``
 (``jax/_src/xla_bridge.py:1119``) and INITIALIZES the backend, which would

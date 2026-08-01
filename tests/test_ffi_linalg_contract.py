@@ -16,7 +16,7 @@ without the FFI stack.
 
 Host platform: the slate ops also have CPU-backend handlers
 (``liblorrax_ffi_host.so``, registered under platform="cpu" — see
-src/ffi/slate/cpp/host_ffi.cc).  The ``*_cpu`` tests run the SAME check
+src/ffi/cpp/slate/host_ffi.cc).  The ``*_cpu`` tests run the SAME check
 bodies on a 1x1 mesh of CPU devices in this very process (works on GPU
 nodes too: ``jax.ffi.ffi_call`` picks the handler by lowering platform)
 and skip cleanly when the host library is absent.  Multi-rank CPU

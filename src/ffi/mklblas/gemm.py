@@ -1,6 +1,6 @@
 """Vendor-BLAS batched GEMM — the ``LORRAX_BANDS_GEMM_FFI`` service.
 
-The Python half of ``src/ffi/mklblas/cpp/gemm_batch_ffi.cc``: the gate that
+The Python half of ``src/ffi/cpp/mklblas/gemm_batch_ffi.cc``: the gate that
 decides whether the dial is on, and the single ``jax.ffi.ffi_call`` that
 issues the handler.  Per ``src/ffi/AGENTS.md:149-150`` and
 ``TEMPLATE.md:10-20`` this is where an FFI target's Python lives; it used to

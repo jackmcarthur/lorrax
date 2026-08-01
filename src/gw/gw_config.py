@@ -57,7 +57,7 @@ from common.units import RYD_TO_EV
 #     docs/architecture/layers.md): ``runtime`` must resolve knobs BEFORE
 #     jax/config imports are safe, so it keeps its own tiny parser.
 #   * ``file_io/_slab_io_mpi_host.py::_env_flag`` — mirrors the C++
-#     writer's ``env_flag`` (``ffi/phdf5/cpp/context.cc``) so the TWO
+#     writer's ``env_flag`` (``ffi/cpp/phdf5/context.cc``) so the TWO
 #     phdf5 writers stay one grammar; jax-free file, kept local.
 #
 # ``isdf/core.py``'s ``_env_bool`` — historically the fourth copy — was
@@ -362,7 +362,7 @@ class SlabIOBackend(str, enum.Enum):
 
     - ``PHDF5_FFI`` — every rank writes its hyperslab via the parallel-HDF5
       FFI (collective MPI-IO).  Default on BOTH backends now: the C++ core
-      (``ffi/phdf5/cpp/write_ffi.cc``) compiles into the CUDA lib and, since
+      (``ffi/cpp/phdf5/write_ffi.cc``) compiles into the CUDA lib and, since
       workstream AE, into the CUDA-free host lib under ``LORRAX_FFI_NO_CUDA``
       — where the D2H staging collapses to "H5Dwrite reads the XLA buffer in
       place".  ~5× faster than the rank-0 path once Lustre striping is
@@ -2019,7 +2019,7 @@ class LorraxConfig:
         # cuSOLVERMp / cuBLASMp are GPU-only.  The phdf5 FFI is NOT: both
         # its read and its write core compile CUDA-free into
         # liblorrax_ffi_host.so (``LORRAX_FFI_NO_CUDA``; see
-        # ``ffi/phdf5/cpp/platform_seam.h``), so on CPU it is preferred
+        # ``ffi/cpp/phdf5/platform_seam.h``), so on CPU it is preferred
         # whenever the deployed lib exports the handler.
         #
         #   * ``slab_io=auto`` (the default) ALWAYS runs the capability-

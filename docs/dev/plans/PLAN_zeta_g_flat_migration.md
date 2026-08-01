@@ -364,9 +364,9 @@ The R_cart_q for each full-BZ q is just ``R_cart[full_to_irr_sym[q]]``.
 
     srun --jobid=$SLURM_JOBID --overlap --mpi=cray_shasta -N1 -n4 \
          --gres=gpu:4 \
-         /pscratch/sd/j/jackm/lorrax_sandbox/sources/lorrax_D/src/ffi/common/cpp/select_gpu.sh \
+         /pscratch/sd/j/jackm/lorrax_sandbox/sources/lorrax_D/src/ffi/cpp/select_gpu.sh \
          $LORRAX_SHIFTER \
-         /pscratch/sd/j/jackm/lorrax_sandbox/sources/lorrax_D/src/ffi/common/cpp/in_container.sh \
+         /pscratch/sd/j/jackm/lorrax_sandbox/sources/lorrax_D/src/ffi/cpp/in_container.sh \
          python3 -u -m gw.gw_jax -i cohsex_orbit.in
 
 - Bit-identity reference: 5 lines × 9 k-points × ±1 ULP diff vs

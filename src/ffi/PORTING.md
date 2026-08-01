@@ -2,11 +2,11 @@
 
 Covers `ffi.cusolvermp`, `ffi.phdf5`, and `ffi.slate`. All three link
 into one `liblorrax_ffi.so` and share a build system
-(`src/ffi/common/cpp/CMakeLists.txt`).
+(`src/ffi/cpp/CMakeLists.txt`).
 
 The host-platform families (`ffi.scalapack`, `ffi.mklblas`, `ffi.mklfft`
 and the host half of `ffi.phdf5` / `ffi.slate`) link into
-`liblorrax_ffi_host.so` from `src/ffi/common/cpp/host/CMakeLists.txt`,
+`liblorrax_ffi_host.so` from `src/ffi/cpp/CMakeLists.txt`,
 built by `config/frontera/build_ffi_host.sh`. Read §0 next before you
 start hunting for a vendor library.
 
@@ -18,7 +18,7 @@ are tied to one implementation.
 
 | Family | API the LORRAX handler calls | Implementations of that API | Swappable? |
 |---|---|---|---|
-| `scalapack` | ScaLAPACK + C-BLACS Fortran ABI — **exactly eleven symbols**, hand-declared in [`scalapack/cpp/blacs_grid.h`](scalapack/cpp/blacs_grid.h): `pzheevd_`, `pdsyevd_`, `pzgetrf_`, `pdgetrf_`, `pzgetrs_`, `pdgetrs_`, `numroc_`, `descinit_`, `Csys2blacs_handle`, `Cblacs_gridinit`, `Cblacs_gridinfo`.  That list is not a summary: it is the complete non-libc undefined-symbol set of `solve_lu_ffi.cc` + `eigh_ffi.cc`, measured. | Intel MKL (`libmkl_scalapack_lp64` **+** `libmkl_blacs_<mpi>_lp64` — measured 8 + 3 = 11), Cray LibSci (`libsci_*_mpi_*`), netlib ScaLAPACK, AMD AOCL.  **Not SLATE** — see §0b. | **Yes.** Pass `-DLORRAX_SCALAPACK_LIBRARIES="<whole link line>"` and the MKL probe is skipped entirely. No source change. |
+| `scalapack` | ScaLAPACK + C-BLACS Fortran ABI — **exactly eleven symbols**, hand-declared in [`cpp/scalapack/blacs_grid.h`](cpp/scalapack/blacs_grid.h): `pzheevd_`, `pdsyevd_`, `pzgetrf_`, `pdgetrf_`, `pzgetrs_`, `pdgetrs_`, `numroc_`, `descinit_`, `Csys2blacs_handle`, `Cblacs_gridinit`, `Cblacs_gridinfo`.  That list is not a summary: it is the complete non-libc undefined-symbol set of `solve_lu_ffi.cc` + `eigh_ffi.cc`, measured. | Intel MKL (`libmkl_scalapack_lp64` **+** `libmkl_blacs_<mpi>_lp64` — measured 8 + 3 = 11), Cray LibSci (`libsci_*_mpi_*`), netlib ScaLAPACK, AMD AOCL.  **Not SLATE** — see §0b. | **Yes.** Pass `-DLORRAX_SCALAPACK_LIBRARIES="<whole link line>"` and the MKL probe is skipped entirely. No source change. |
 | `mklblas` | CBLAS — `cblas_dgemm` / `cblas_sgemm` / `cblas_zgemm` / `cblas_cgemm`, plus the OPTIONAL `cblas_?gemm_batch` extension | Intel MKL, Cray LibSci, OpenBLAS, BLIS, ATLAS | **Yes.** Point `LORRAX_CBLAS_DIR` (or `CRAY_LIBSCI_PREFIX_DIR`) at a prefix with `cblas.h`. The batched extension is looked up at run time, per precision; a BLAS without it silently takes the portable plain-GEMM loop and says so once. |
 | `phdf5` | HDF5 C API + MPI-IO (`H5Pset_fapl_mpio`, `H5Dwrite`, …) | any parallel HDF5, over any MPI | **Yes.** `-DHDF5_ROOT=<prefix>`; see §"phdf5 stack choice". |
 | `mklfft` | Intel **DFTI** descriptor API (`DftiCreateDescriptor`/`SetValue`/`Compute*`) | **Intel MKL only.** | **No.** DFTI is Intel's. A LibSci-only site simply gets no host FFT handler: `LORRAX_FFT_FFI` refuses at run time and the default XLA lowering stands — a lost optimisation, never a wrong answer. The portable target if this ever needs fixing is the FFTW3 *guru* interface (`fftw_plan_guru_dft`), which takes the arbitrary input/output strides this handler depends on and is implemented by FFTW, cray-fftw, AOCL — and by MKL itself, which exports `fftw_plan_many_dft`/`fftw_execute` from the same library as the `Dfti*` entry points. That is a rewrite of the descriptor construction, not a link-line change, and it is unmeasured. |
@@ -42,14 +42,14 @@ shapes LORRAX actually runs (`p>1, q>1`) it returns answers that are wrong by
 ~15% with no error, because of a fixable mismatch between how LORRAX assigns
 shards to ranks and what the shim assumes. The fix is on LORRAX's side and
 needs no upstream patch. Until it lands, the provenance guard in
-`scalapack/cpp/blacs_grid.h` refuses the overlay by default.
+`cpp/scalapack/blacs_grid.h` refuses the overlay by default.
 
 SLATE ships this compatibility layer as `scalapack_api/` in its source tree,
 built as `libslate_scalapack_api.so`; it re-defines the ScaLAPACK entry
 points and forwards them to `slate::`, and its README documents `LD_PRELOAD`
 interception.
 
-Build it with [`slate/scripts/build_scalapack_api.sh`](slate/scripts/build_scalapack_api.sh)
+Build it with [`cpp/stage/slate_build_scalapack_api.sh`](cpp/stage/slate_build_scalapack_api.sh)
 and `nm -D` the result (SLATE v2025.05.28, measured 2026-07-31 against the
 eleven names above):
 
@@ -153,7 +153,7 @@ because it points somewhere useful.  `slate_pheevd` is a direct call to
 correct at every size above; in the *same job, same mesh, same sizes*,
 `ffi.slate`'s own host handler SIGSEGVed (rc 139) at n=32 and n=64.  Same
 `libslate.so.2`, same MKL, same process image ⇒ **L-2 is in LORRAX's
-`slate/cpp/host_ffi.cc` call path, not in SLATE.**  See
+`cpp/slate/host_ffi.cc` call path, not in SLATE.**  See
 `docs/dev/linalg_ffi.md` and the reproducer
 `wk_REL/harness/slalias_l2.sbatch`.
 
@@ -162,7 +162,7 @@ Because nothing on the Python side can observe an interposition —
 `resolve_backend('eigh','scalapack')` still returns `scalapack`, and
 `has_target('lorrax_scalapack_eigh')` was measured still answering `True`
 with the overlay live — the detection is in C++:
-`scalapack/cpp/blacs_grid.h` resolves the provider of the routine it is
+`cpp/scalapack/blacs_grid.h` resolves the provider of the routine it is
 about to call with `dlsym` + `dladdr` and **refuses** when it is the
 overlay, naming all three defects.  `LORRAX_SCALAPACK_ALLOW_SLATE_API=1`
 downgrades the refusal to one loud line, for deliberately measuring it.
@@ -193,7 +193,7 @@ overrides it if `SLATE_SCALAPACK_TARGET` is set (`devices` / `hosttask` /
 `hostnest` / `hostbatch`).  **A `gpu_backend=cuda` SLATE therefore runs on
 the CPU by default and says nothing.**  Under this project's doctrine that
 is a demotion, and a demotion must announce itself, so
-`scalapack/cpp/blacs_grid.h` prints what the variable resolves to alongside
+`cpp/scalapack/blacs_grid.h` prints what the variable resolves to alongside
 the provider whenever the overlay is live — including the unset case, which
 is the one that looks like success and is not.  If LORRAX ever adopts this
 route for real, it must *set* the target per platform rather than inherit
@@ -275,7 +275,7 @@ The two that are not yet ScaLAPACK-named cost **no new link dependency**:
 `libmkl_scalapack_lp64` already defines `pzpotrf_`, `pdpotrf_`, `pztrsm_`,
 `pdtrsm_` and `pzpotrs_` (measured with `nm -D`), and it is already on this
 library's link line for the eigh/LU handlers.  Writing those two handlers in
-`scalapack/cpp/` — the same shape as `solve_lu_ffi.cc`, reusing the BLACS
+`cpp/scalapack/` — the same shape as `solve_lu_ffi.cc`, reusing the BLACS
 grid and descriptor code already in `blacs_grid.h` — would leave LORRAX
 calling **one API for all four distributed operations**, which is the state
 in which "move to an AMD machine" is a link line plus an env var.
@@ -331,7 +331,7 @@ are its output (job 7883900), not a design intent.
 | Your machine has… | Handlers you get | What you lose | To get it back |
 |---|---|---|---|
 | **SLATE + MKL** (the Frontera production cell) | all 15: phdf5×4, slate×5 (+2 lifecycle), scalapack eigh + fused LU, MKL FFT×2, GEMM | — | — |
-| **MKL, no SLATE** | 10: phdf5×4, scalapack eigh + fused LU, FFT×2, GEMM, and no `slate/cpp/host_ffi.cc` | `ffi.slate` potrf/trsm/batched → `distributed_cholesky = slate` refuses at resolve time | build a `gpu_backend=none` SLATE, point `-DLORRAX_SLATE_HOST_INSTALL_DIR` at the prefix containing `lib64/cmake/slate` |
+| **MKL, no SLATE** | 10: phdf5×4, scalapack eigh + fused LU, FFT×2, GEMM, and no `cpp/slate/host_ffi.cc` | `ffi.slate` potrf/trsm/batched → `distributed_cholesky = slate` refuses at resolve time | build a `gpu_backend=none` SLATE, point `-DLORRAX_SLATE_HOST_INSTALL_DIR` at the prefix containing `lib64/cmake/slate` |
 | **Some other ScaLAPACK** (`-DLORRAX_SCALAPACK_LIBRARIES=…`; LibSci / AOCL / netlib), no MKL headers | 6: phdf5×4, scalapack eigh + fused LU | MKL's DFTI FFT and the CBLAS GEMM handler. `LORRAX_FFT_FFI=1` / `LORRAX_BANDS_GEMM_FFI=1` **refuse at run time**; the default XLA lowering stands, so this is a lost optimisation, never a wrong answer | GEMM: any CBLAS — set `LORRAX_CBLAS_DIR` or `CRAY_LIBSCI_PREFIX_DIR` to a prefix with `cblas.h`. FFT: `-DLORRAX_MKL_ROOT` **in addition to** your ScaLAPACK line — DFTI is Intel-only and has no second vendor |
 | **Neither** | 4: phdf5 only | all distributed linalg + FFT + GEMM | install any ScaLAPACK+BLACS (see §0) — that one dependency restores eigh, LU **and** the FFT/GEMM handlers that ride its link line |
 
@@ -347,7 +347,7 @@ Three things a user should know about that table:
   — `ffi_loader` keys only on LORRAX's own handler symbols.  That is what makes
   the API-level aliasing real, and it is also why an interposed SLATE overlay
   is invisible without the `dlsym`/`dladdr` provenance check in
-  `scalapack/cpp/blacs_grid.h` (§0b).
+  `cpp/scalapack/blacs_grid.h` (§0b).
 
 Two consequences worth internalising before you port:
 
@@ -364,7 +364,7 @@ Two consequences worth internalising before you port:
 The mapping from "unresolved symbol" back to "dependency that was not
 resolved", and the CMake variable that fixes each one, is kept in the
 **"HOST NUMERICAL LIBRARIES"** comment block in
-[`common/cpp/host/CMakeLists.txt`](common/cpp/host/CMakeLists.txt) and
+[`cpp/CMakeLists.txt`](cpp/CMakeLists.txt) and
 restated in the header of `config/frontera/build_ffi_host.sh`. Read the
 configure log first — every group announces what it resolved or why it
 was skipped.
@@ -384,7 +384,7 @@ was skipped.
 MPI is required only for `ffi.phdf5` and `ffi.slate`; `ffi.cusolvermp`
 bootstraps via JAX's KV store + NCCL, no MPI.
 
-## Build system ([`common/cpp/CMakeLists.txt`](common/cpp/CMakeLists.txt))
+## Build system ([`cpp/CMakeLists.txt`](cpp/CMakeLists.txt))
 
 Autodetection probes for each dep, overridable with CMake `-D...` or
 env vars:
@@ -397,21 +397,21 @@ env vars:
 | SLATE        | `/global/homes/<u>/software/slate/install`                   | `-DLORRAX_SLATE_INSTALL_DIR=…` or env                    |
 | NCCL header  | `/usr/include/nccl.h`, then `$NVHPC_ROOT/comm_libs/.../nccl` | `-DNCCL_INCLUDE=…`                                       |
 
-Build: `bash src/ffi/common/cpp/build.sh` (calls CMake + ninja). Rebuild
+Build: `bash src/ffi/cpp/build.sh` (calls CMake + ninja). Rebuild
 from scratch with `--fresh`.
 
 ## Staging vendor deps (one-time per cluster)
 
 Many clusters put system libs under `/opt/...`, which containers can't
 bind-mount freely. We copy the minimal subsets into `$SCRATCH` (or
-equivalent bindable location) via scripts under `src/ffi/*/scripts/`:
+equivalent bindable location) via scripts under `src/ffi/cpp/stage/`:
 
 | Script                             | Produces                                     | Bind-mounted to |
 |------------------------------------|----------------------------------------------|-----------------|
-| [`cusolvermp/scripts/stage_nvhpc.sh`](cusolvermp/scripts/stage_nvhpc.sh) | `libcusolverMp.so.0`, `libcal.so.0`, cuSOLVERMp+NCCL headers (~80 MB) | `/lorrax_nvhpc` |
-| [`phdf5/scripts/stage_cray.sh`](phdf5/scripts/stage_cray.sh)         | Cray HDF5 1.12 + MPICH-ABI shim | `/lorrax_phdf5` |
-| [`phdf5/scripts/stage_openmpi.sh`](phdf5/scripts/stage_openmpi.sh)   | conda-forge HDF5 (OpenMPI)      | `/lorrax_phdf5` |
-| [`slate/scripts/stage_cray.sh`](slate/scripts/stage_cray.sh)         | Cray libsci + `libmpi_gtl_cuda.so.0` + xpmem + lustreapi | `/lorrax_slate` |
+| [`cpp/stage/cusolvermp_stage_nvhpc.sh`](cpp/stage/cusolvermp_stage_nvhpc.sh) | `libcusolverMp.so.0`, `libcal.so.0`, cuSOLVERMp+NCCL headers (~80 MB) | `/lorrax_nvhpc` |
+| [`cpp/stage/phdf5_stage_cray.sh`](cpp/stage/phdf5_stage_cray.sh)         | Cray HDF5 1.12 + MPICH-ABI shim | `/lorrax_phdf5` |
+| [`cpp/stage/phdf5_stage_openmpi.sh`](cpp/stage/phdf5_stage_openmpi.sh)   | conda-forge HDF5 (OpenMPI)      | `/lorrax_phdf5` |
+| [`cpp/stage/slate_stage_cray.sh`](cpp/stage/slate_stage_cray.sh)         | Cray libsci + `libmpi_gtl_cuda.so.0` + xpmem + lustreapi | `/lorrax_slate` |
 
 SLATE itself is built from source; `stage_cray.sh` only copies the
 runtime libs SLATE links against.
@@ -455,24 +455,24 @@ of `CUDA_VISIBLE_DEVICES`.
 ## Checklist for a new cluster
 
 1. **NVHPC SDK**: `module spider nvhpc`. Run
-   [`stage_nvhpc.sh`](cusolvermp/scripts/stage_nvhpc.sh) to copy the
+   [`stage_nvhpc.sh`](cpp/stage/cusolvermp_stage_nvhpc.sh) to copy the
    `libcusolverMp`+`libcal` subset into `$SCRATCH`.
 2. **Parallel HDF5**: pick a stack.
-   - Cray MPICH + cray-hdf5-parallel → [`stage_cray.sh`](phdf5/scripts/stage_cray.sh).
-   - Anything else MPI → [`stage_openmpi.sh`](phdf5/scripts/stage_openmpi.sh)
+   - Cray MPICH + cray-hdf5-parallel → [`stage_cray.sh`](cpp/stage/phdf5_stage_cray.sh).
+   - Anything else MPI → [`stage_openmpi.sh`](cpp/stage/phdf5_stage_openmpi.sh)
      (edit the conda-forge URL to match your MPI).
 3. **SLATE**: clone [icl-utk-edu/slate](https://github.com/icl-utk-edu/slate),
    build against the target MPI + BLAS, install under
    `$HOME/software/slate/install`. Stage Cray runtime libs via
-   [`slate/scripts/stage_cray.sh`](slate/scripts/stage_cray.sh).
+   [`cpp/stage/slate_stage_cray.sh`](cpp/stage/slate_stage_cray.sh).
 4. **Configure and install the module**: copy
    `config/perlmutter/` → `config/<cluster>/`, edit `site_config.sh`
    (especially `LORRAX_SLURM_{ACCOUNT,QOS,CONSTRAINT}`,
    `LORRAX_SHIFTER_MODULES`, `LORRAX_MPI_TYPE_DEFAULT`,
    `LORRAX_NVHPC_SUBPATH`, `LORRAX_MPICH_CONTAINER_DIR`), run
    `bash config/<cluster>/install.sh`.
-5. **Build the .so**: `bash src/ffi/common/cpp/build.sh` (inside shifter
-   via `src/ffi/common/cpp/run_shifter.sh`).
+5. **Build the .so**: `bash src/ffi/cpp/build.sh` (inside shifter
+   via `src/ffi/cpp/run_shifter.sh`).
 6. **Verify**:
    ```bash
    lxalloc

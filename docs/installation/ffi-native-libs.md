@@ -8,7 +8,7 @@ obtain them separately, then build the `.so` against them.
 !!! warning "Fresh clone has no `liblorrax_ffi.so`"
     It is a gitignored build artifact. The pure-JAX path never needs it; the first
     distributed / FFI-I/O call without it fails with
-    `FileNotFoundError … Build with: bash src/ffi/common/cpp/build.sh`.
+    `FileNotFoundError … Build with: bash src/ffi/cpp/build.sh`.
 
 !!! note "TODO"
     These recipes are assembled from the portability and dependency-architecture reviews.
@@ -31,7 +31,7 @@ pip install nvidia-cusolvermp-cu12==0.7.2.888 nvidia-cal-cu12
 ```
 
 **Alternative: NVHPC SDK** (spack `nvhpc`, or the tarball from developer.nvidia.com) → use
-`src/ffi/cusolvermp/scripts/stage_nvhpc.sh` with `NVHPC_ROOT` pointed at the install.
+`src/ffi/cpp/stage/cusolvermp_stage_nvhpc.sh` with `NVHPC_ROOT` pointed at the install.
 
 ## 2. Parallel HDF5
 
@@ -51,8 +51,8 @@ Build the FFI against it directly with `-DHDF5_ROOT=<prefix>` — no staging and
 library-name shimming needed off-container.
 
 **Cray:** load `cray-hdf5-parallel` and stage it with
-`src/ffi/phdf5/scripts/stage_cray.sh`. The OpenMPI stage script
-(`src/ffi/phdf5/scripts/stage_openmpi.sh`) is the portable stack for non-Cray clusters.
+`src/ffi/cpp/stage/phdf5_stage_cray.sh`. The OpenMPI stage script
+(`src/ffi/cpp/stage/phdf5_stage_openmpi.sh`) is the portable stack for non-Cray clusters.
 
 ## 3. SLATE (+ blaspp + lapackpp)
 
@@ -76,13 +76,13 @@ cmake --build build -j && cmake --install build
 
 ## 4. Build `liblorrax_ffi.so` (non-Shifter)
 
-On NERSC the launcher `src/ffi/common/cpp/run_shifter.sh` sets the MPI env vars and runs
+On NERSC the launcher `src/ffi/cpp/run_shifter.sh` sets the MPI env vars and runs
 `build.sh` inside the container (see [Perlmutter](perlmutter.md)). Off-container, drive
 CMake directly with explicit `-D` overrides — the CMake config already supports pointing at
 arbitrary install locations:
 
 ```bash
-cd src/ffi/common/cpp
+cd src/ffi/cpp/common
 cmake -B build -S . \
     -DCUSOLVERMP_INCLUDE_DIR=<cusolvermp-include> \
     -DCUSOLVERMP_LIB_DIR=<cusolvermp-lib> \

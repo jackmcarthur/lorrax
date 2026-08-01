@@ -33,7 +33,7 @@ without changing any physics. Every change below is verified **bit-exact**
   Zero build. Symmetry algebra is single-sourced through `unfold_psi`'s
   primitives (`trs_augment_U`, `tau_phase_row`), so it is *mathematically
   identical* to the eager path — not a parallel reimplementation.
-- **phdf5 FFI shared-core CPU** (`ffi/phdf5/cpp/*`, `ffi/common/*`): the
+- **phdf5 FFI shared-core CPU** (`ffi/cpp/phdf5/*`, `ffi/common/*`): the
   collective MPI-IO read core compiles from the **same** translation units
   into both the CUDA and a new **host** lib; a single `LORRAX_FFI_NO_CUDA`
   flag switches exactly 3 seams (handler binding; index copy-in; the
@@ -131,7 +131,7 @@ Measured, not assumed (see `SPEEDUP_SCORECARD.md`):
 3. ~~**Port `write_ffi.cc`** to the host lib if CPU writes are ever needed.~~
    **DONE — workstream AE, 2026-07-26.** `write_ffi.cc` now compiles into both
    libs from one TU; the three seams (handler binding, index copy-in, payload
-   staging) live in `ffi/phdf5/cpp/platform_seam.h` and are shared verbatim
+   staging) live in `ffi/cpp/phdf5/platform_seam.h` and are shared verbatim
    with `read_ffi.cc`. On the host platform the D2H staging **disappears**:
    the XLA buffer is host memory, so `H5Dwrite` reads the local ζ shard in
    place — no pinned buffer, no copy, no event. `gw_config._route_cpu_slab_io`

@@ -21,7 +21,7 @@ Every operation derives per-rank hyperslab offsets from the sharding
 spec of the JAX array being written (or a caller-provided one for
 reads) plus a global-origin ``offset`` argument.  The C++ handler
 un-ravels the rank id through ``mesh_shape`` and advances along every
-sharded dim.  See ``ffi/phdf5/cpp/write_ffi.cc`` for the C++ side.
+sharded dim.  See ``ffi/cpp/phdf5/write_ffi.cc`` for the C++ side.
 """
 from __future__ import annotations
 
@@ -210,7 +210,7 @@ def _lustre_prestripe(path: str, stripe_count: int = 16,
     it survived; it now says so once.  The layout is instead requested
     through MPI-IO's ``striping_factor``/``striping_unit`` hints, which
     ROMIO applies via ``llapi`` with no binary on PATH
-    (``_slab_io_mpi_host._mpi_io_hints``; ``ffi/phdf5/cpp/context.cc``).
+    (``_slab_io_mpi_host._mpi_io_hints``; ``ffi/cpp/phdf5/context.cc``).
 
     The ``mode='w'`` inode replace no longer depends on this function:
     :func:`_replace_inode_for_write` unlinks unconditionally before

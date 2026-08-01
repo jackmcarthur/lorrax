@@ -277,7 +277,7 @@ loudly when it is missing.
   collectives implementation at all, and it changes nothing but the log.
   The MPI transport itself is Intel MPI's, selected by `FI_PROVIDER` /
   `LORRAX_MPI_PROVIDER` — there is no NIC pin any more.
-* `ffi/phdf5/cpp/context.cc` and `ffi/slate/cpp/context.cc` only call
+* `ffi/cpp/phdf5/context.cc` and `ffi/cpp/slate/context.cc` only call
   `MPI_Init_thread(MULTIPLE)` when nothing initialized MPI first, so they
   coexist with XLA's init by construction. The phdf5 open warns when the
   granted level is below MULTIPLE — that warning firing means the wrapper is

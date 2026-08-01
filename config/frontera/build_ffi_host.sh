@@ -44,7 +44,7 @@
 #        -Dbuild_tests=no -DSCALAPACK_LIBRARIES=""
 #        -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_LIBDIR=lib64
 #      (SCALAPACK_LIBRARIES="" is why THIS lib must link ScaLAPACK itself —
-#       see the ScaLAPACK block in src/ffi/common/cpp/host/CMakeLists.txt.)
+#       see the ScaLAPACK block in src/ffi/cpp/CMakeLists.txt.)
 #
 #   3. BUILD ON NODE-LOCAL /tmp.  /work2 is Lustre; under a concurrent
 #      40-node job even `python -c pass` from the venv stalls minutes in
@@ -71,7 +71,7 @@
 #   libmkl_scalapack_lp64 +       ScaLAPACK + C-BLACS     Cray LibSci
 #   libmkl_blacs_intelmpi_lp64    (11 Fortran-ABI names,  (libsci_*_mpi_*),
 #   (+ the mkl_intel/thread/core  hand-declared in        netlib, AOCL, or
-#   layers they need)             scalapack/cpp/          SLATE's own
+#   layers they need)             cpp/scalapack/          SLATE's own
 #                                 blacs_grid.h)           libslate_scalapack_api
 #   libmkl_intel_lp64 (CBLAS)     cblas_dgemm/zgemm       OpenBLAS, BLIS,
 #                                 (+ an OPTIONAL batched  LibSci, ATLAS
@@ -119,7 +119,7 @@
 #
 # The authoritative version of this map, with the CMake variable names, is the
 # "HOST NUMERICAL LIBRARIES" block at the top of the resolution section in
-# src/ffi/common/cpp/host/CMakeLists.txt.
+# src/ffi/cpp/CMakeLists.txt.
 # ============================================================================
 set -euo pipefail
 
@@ -137,7 +137,7 @@ set -euo pipefail
 PY="$LORRAX_VENV/bin/python"
 CMAKE="$LORRAX_VENV/bin/cmake"
 NINJA="$LORRAX_VENV/bin/ninja"
-SRC="$LORRAX_ROOT/src/ffi/common/cpp/host"
+SRC="$LORRAX_ROOT/src/ffi/cpp"
 BUILD="${LORRAX_FFI_HOST_STAGE:-$LORRAX_FFI_STAGE_WTA/build_host}"
 
 # cmake + ninja live in the venv (pip-installed by stage_ffi_deps.sh); put
@@ -160,6 +160,7 @@ export LIBRARY_PATH="$LORRAX_IMPI_ROOT/libfabric/lib:$LORRAX_IMPI_ROOT/lib/relea
 
 ARGS=(
     -S "$SRC" -B "$BUILD" -G Ninja
+    -DLORRAX_FFI_PLATFORM=host
     -DCMAKE_MAKE_PROGRAM="$NINJA"
     -DCMAKE_BUILD_TYPE=Release
     -DCMAKE_CXX_COMPILER=g++

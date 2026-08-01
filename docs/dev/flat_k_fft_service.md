@@ -3,8 +3,8 @@
 *Mechanism documentation for `LORRAX_FFT_FFI` / `LORRAX_FFT_FFI_FUSED` and
 the two platform handlers behind them, written to the shape of
 `staged_reshard_primitive.md`.  Sources: `src/ffi/mklfft/flat_k.py`,
-`src/ffi/mklfft/cpp/fft_flat_k_ffi.cc`,
-`src/ffi/cufft/cpp/fft_flat_k_cuda_ffi.cc`, `src/ffi/common/gate.py`.
+`src/ffi/cpp/mklfft/fft_flat_k_ffi.cc`,
+`src/ffi/cpp/cufft/fft_flat_k_cuda_ffi.cc`, `src/ffi/common/gate.py`.
 Measurements: `wk_REL/sigma_perf_results.md`, `wk_REL/audit_gpu_fft.log`,
 `wk_REL/cufft_unit.log`, `wk_REL/audit_gpu_hlo.log` (job 7879378).*
 

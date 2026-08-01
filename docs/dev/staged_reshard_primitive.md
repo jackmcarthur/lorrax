@@ -205,7 +205,7 @@ near-linear — NOT a pool-wiring defect; the bare dot saturates 1.6–1.9×
 below MKL at 28 threads, and the in-module production rate is a further
 ~2× below the bare dot).  The dial therefore routes ONLY the large right
 contraction through the vendor-BLAS GEMM host handler
-`lorrax_mklblas_gemm_batch` (`src/ffi/mklblas/cpp/gemm_batch_ffi.cc`):
+`lorrax_mklblas_gemm_batch` (`src/ffi/cpp/mklblas/gemm_batch_ffi.cc`):
 row-major NN `C[i] = A[i] @ B[i % BB]` — the B-cycling broadcast is what
 serves both the plain per-k batch and the extra-stacked batch with the
 k-only ψ — dgemm/zgemm dispatched on buffer dtype, vendor-internal
@@ -218,7 +218,7 @@ dots (measured 1.6e-3 of the right's flops) are untouched.
 extension of CBLAS (OpenBLAS ships it too; Cray LibSci does not).  The
 choice is made **at RUNTIME by `dlsym`, per precision** — there is no
 build-time feature probe and no `HAVE_BATCH` macro
-(`src/ffi/mklblas/cpp/gemm_batch_ffi.cc:7-40`, `:188-202`): each of
+(`src/ffi/cpp/mklblas/gemm_batch_ffi.cc:7-40`, `:188-202`): each of
 `cblas_{s,d,c,z}gemm_batch` that resolves gets one batched call per
 invocation, and each that does not falls back for THAT precision to a loop
 of plain `cblas_?gemm` calls (standard CBLAS, threaded internally by the
@@ -257,7 +257,7 @@ project_rs 29.407→19.622 s (−33%), prod sigma.exec 58.313→49.224;
 nb=256 composed 20.565→14.162 / 35.234→29.979.  Parity exact-0 .dat,
 h5 ≤2.5e-14 eV, reduce-scatter payloads byte-equal off-vs-on.  Build:
 `config/frontera/build_ffi_host.sh` (the TU rides the existing MKL link
-line; see the mklblas block in `src/ffi/common/cpp/host/CMakeLists.txt`).
+line; see the mklblas block in `src/ffi/cpp/CMakeLists.txt`).
 
 **Why there is no configure-time probe (2026-07-29 owner order; the probe
 existed, cost a gate cycle, and was DELETED).**  A `check_symbol_exists`
@@ -272,7 +272,7 @@ entry): first from BLACS's open `MPI_*` references, then — after adding
 path).  The general defect: a build-time question whose wrong answer is
 invisible and costs 1.6–1.9× does not belong in the build.
 
-The probe is gone.  `src/ffi/common/cpp/host/CMakeLists.txt:333-345`
+The probe is gone.  `src/ffi/cpp/CMakeLists.txt:333-345`
 now says so in place (*"NO FEATURE PROBE HERE — deliberate (owner order
 2026-07-29)"*), and what remains there is a plain header-EXISTS test whose
 failure mode is "handler not built at all" (loud) rather than "built, but

@@ -39,7 +39,7 @@ writes are NOT sufficient once JAX's own CPU collectives ride MPI:
   reads neither variable (see docs/dev/env_vars.md and
   docs/dev/mpi_collectives.md).
 * The C++ FFI twin guards the same hazard at open time
-  (``ffi/phdf5/cpp/context.cc`` MPI_Query_thread warning), which is what
+  (``ffi/cpp/phdf5/context.cc`` MPI_Query_thread warning), which is what
   fires if the wrapper is missing from the path.
 
 What we DO match from :class:`_FfiBackend`:
@@ -146,7 +146,7 @@ def _mpi_io_hints(MPI):
     Lustre from inside the container with no binary on PATH.
 
     Same keys, same defaults as the C++ writer's
-    ``ffi/phdf5/cpp/context.cc`` (which has always set them) — the h5py
+    ``ffi/cpp/phdf5/context.cc`` (which has always set them) — the h5py
     backend set NONE, which is the single biggest divergence between
     the two "equivalent" writers.
     """
@@ -162,7 +162,7 @@ def _mpi_io_hints(MPI):
     # 1826 MB/s vs 2066 MB/s for ROMIO's own choice, i.e. the explicit
     # hint buys nothing here and may cost a little.  Knobs kept,
     # defaults not opinionated.  Since workstream AW the C++ writer
-    # (``ffi/phdf5/cpp/context.cc``) follows the SAME policy — its old
+    # (``ffi/cpp/phdf5/context.cc``) follows the SAME policy — its old
     # Perlmutter-era forced defaults (cb_write=enable, ds_write=disable,
     # cb_buffer_size=64M, cb_nodes=world_size) are gone, so an unset env
     # means "ROMIO decides" in every writer and a set one reaches both.
@@ -422,7 +422,7 @@ class _MpiHostBackend:
         ``LORRAX_PHDF5_COLLECTIVE_WRITES=0`` restores independent
         MPI-IO writes (the pre-AI behaviour).  Note
         ``LORRAX_PHDF5_INDEPENDENT`` is unrelated: it controls FFI
-        READS only (``force_indep_read``, ``ffi/phdf5/cpp/context.cc``).
+        READS only (``force_indep_read``, ``ffi/cpp/phdf5/context.cc``).
         """
         if not isinstance(A, jax.Array):
             A = jnp.asarray(A)
