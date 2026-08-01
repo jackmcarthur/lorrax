@@ -115,7 +115,7 @@ report fails `tests/test_runtime_startup_report.py`.
 **not merged** — only the call site (`prepare_mesh`) is shared
 ([layers "What NOT to unify"](layers.md#what-not-to-unify)).
 
-**Deep dive.** `docs/dev/env_vars.md` §0 (the startup report doctrine),
+**Deep dive.** `docs/dev/env_vars.md` §0 (the startup report contract),
 [environment/overview](../environment/overview.md).
 
 ---

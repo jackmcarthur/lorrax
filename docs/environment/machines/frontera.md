@@ -17,7 +17,7 @@ machine reference; that README is the per-script inventory.*
 | Filesystems (measured, job 7882047) | `/work2` streams at 70 MB/s; `/scratch2` at 560 MB/s; node `/tmp` is local XFS |
 | Login-node rules | RLIMIT_NPROC 300 (no process storms, `make -j4` max), no containers/`srun`; `sbatch` submission is allowed |
 | dev queue | max 2 jobs / 40 nodes; `sbatch --parsable` output = last line |
-| MPI | Intel MPI 2020.4 (host, hybrid-mounted into the container); transport doctrine in [transports §3](../transports.md#3-the-intel-mpi-provider-layer-frontera) |
+| MPI | Intel MPI 2020.4 (host, hybrid-mounted into the container); transport policy in [transports §3](../transports.md#3-the-intel-mpi-provider-layer-frontera) |
 
 ## 2. What gets built, and where each build runs
 

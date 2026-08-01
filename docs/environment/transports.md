@@ -44,7 +44,7 @@ When each is used today:
 * **Single-process runs** — no collectives; the implementation is
   irrelevant.
 * **Multi-process CPU** — `impl=mpi`, always. `runtime` warns at startup
-  when a multi-process CPU run has landed on gloo
+  when a multi-process CPU run is using gloo
   (`announce_cpu_collectives`).
 * **GPU** — NCCL via XLA; none of this page's CPU machinery is involved
   (see `runtime.nccl_warmup`).
@@ -75,7 +75,7 @@ alternatives: `docs/dev/mpi_collectives.md`.
 ## 3. The Intel MPI provider layer (Frontera)
 
 Under `impl=mpi` (and for phdf5 MPI-IO and mpi4py) the transport is Intel
-MPI's libfabric provider. Post-AU doctrine, from
+MPI's libfabric provider. The measured provider policy, recorded in
 `config/frontera/README.md`:
 
 * **Leave `FI_PROVIDER` unset** (`LORRAX_MPI_PROVIDER=auto`, the
