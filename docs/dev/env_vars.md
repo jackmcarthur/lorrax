@@ -441,9 +441,21 @@ graphs pass and real ones do not. It is not a thread-LEVEL test: no
 `MPI_THREAD_*` value and no collective warm-up ordering can satisfy it.
 
 **Corrected scope.** `mpi` is therefore **not** GW-only, and BSE does not have
-to stay on gloo. `LORRAX_MPI_FORCE_THREAD_MAIN=1`, with the MPIwrapper from
-`config/frontera/build_mpiwrapper.sh`, answers the guard inside the wrapper;
-the BSE TDA Lanczos that used to die on every rank (job 7879458) then runs
-clean with eigenvalues character-identical to the gloo reference.
+to stay on gloo.
+
+**SUPERSEDED remedy** *(kept as history; the mechanism above is still
+correct).* The remedy this section originally taught —
+`LORRAX_MPI_FORCE_THREAD_MAIN=1` with the MPIwrapper from
+`config/frontera/build_mpiwrapper.sh`, which answered the guard inside the
+wrapper and let the BSE TDA Lanczos that used to die on every rank (job
+7879458) run clean, eigenvalues character-identical to the gloo reference —
+is superseded, consistent with this knob's §5 registry row: leave
+`LORRAX_MPI_FORCE_THREAD_MAIN` UNSET. The current mechanism is the warm-up
+in `common.collectives.warm_mesh_cliques()`, which creates every mesh-axis
+communicator (plus the world one) from the Python main thread at
+mesh-construction time; XLA's clique cache then serves every later
+collective and the `MPI_Is_thread_main` guard is never re-evaluated. The
+knob is retained only as a fallback and as the positive control in the
+gates.
 
 Full rationale, evidence and launch recipe: **`docs/dev/mpi_collectives.md`**.

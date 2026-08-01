@@ -128,8 +128,13 @@ srun --jobid=$SLURM_JOBID -N 1 -n 4 -c 8 --cpu-bind=cores \
 ```
 
 What auto-routes on CPU: `slab_io=auto` → the capability router
-(FFI write handler → `PHDF5_HOST` → allgather); `distributed_cholesky` /
-`distributed_lu` `auto` → `off`; `pair_density_slots` 3 → 4. The CPU
+(FFI write handler → `PHDF5_HOST` → allgather); `distributed_cholesky
+= auto` passes THROUGH (on CPU it carries the replicated
+rank-truncation route — an earlier revision of this page said it
+demotes to `off`, which is exactly the rewrite behind the −161 eV bug
+in [linalg_ffi.md](../../dev/linalg_ffi.md) "Sharp edges");
+`distributed_lu` `auto` → `off`, announced; `pair_density_slots`
+3 → 4. The CPU
 path writes synchronously — the FFI's threaded design deadlocks at
 `H5Fclose` under Cray MPICH's default `MPI_THREAD_SINGLE`
 (`file_io/_slab_io_mpi_host.py` docstring). Note this pre-dates the
