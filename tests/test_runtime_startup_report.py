@@ -472,10 +472,10 @@ def test_the_dial_roster_scanners_can_fail():
     """
     assert _gate_env_of("runtime", "GATE") is None
     assert _gate_env_of("no.such.module", "GATE") is None
-    assert _gate_env_of("ffi.mklblas.gemm", "NOT_A_GATE") is None
+    assert _gate_env_of("ffi.gemm", "NOT_A_GATE") is None
     # ...and it really does resolve the ones that exist.
-    assert _gate_env_of("ffi.mklblas.gemm", "GATE") == "LORRAX_BANDS_GEMM_FFI"
-    assert _gate_env_of("ffi.mklfft.flat_k", "FUSED_GATE") == \
+    assert _gate_env_of("ffi.gemm", "GATE") == "LORRAX_BANDS_GEMM_FFI"
+    assert _gate_env_of("ffi.fft", "FUSED_GATE") == \
         "LORRAX_FFT_FFI_FUSED"
 
 

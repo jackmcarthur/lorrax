@@ -25,8 +25,8 @@ def ffi_dial_key() -> tuple:
     All three reads are tier-1 lexical (no JAX backend init) and O(1) —
     safe in any cache-lookup path at any P.
     """
-    from ffi.mklblas import bands_gemm_ffi_enabled
-    from ffi.mklfft import fft_ffi_enabled, fused_fft_ffi_enabled
+    from ffi.fft import fft_ffi_enabled, fused_fft_ffi_enabled
+    from ffi.gemm import gemm_ffi_enabled as bands_gemm_ffi_enabled
     return (
         ("fft_ffi", fft_ffi_enabled()),
         ("fft_ffi_fused", fused_fft_ffi_enabled()),

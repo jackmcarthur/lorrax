@@ -1,9 +1,9 @@
-# The FFI env-gate contract (`ffi.common.gate.Gate`)
+# The FFI env-gate contract (`ffi.gate.Gate`)
 
 *One resolver for every env-gated, rank-local FFI capability in the tree.
 Written for the agent who adds the fourth dial, and for the reviewer who has
-to believe the third one.  Sources: `src/ffi/common/gate.py`,
-`src/ffi/mklblas/gemm.py`, `src/ffi/mklfft/flat_k.py`.  Consolidation
+to believe the third one.  Sources: `src/ffi/gate.py`,
+`src/ffi/gemm.py`, `src/ffi/fft.py`.  Consolidation
 2026-07-30; the assessment that motivated it is
 `wk_REL/FFI_MICROSERVICE_ASSESSMENT.md`.*
 
@@ -17,7 +17,7 @@ different for a reason (§4).
 ## 1. The contract
 
 ```python
-from ffi.common.gate import Gate
+from ffi.gate import Gate
 
 GATE = Gate(env="LORRAX_FFT_FFI", target="lorrax_mklfft_flat_k",
             platforms=("cpu", "CUDA"), modes=("off", "on"),
@@ -129,7 +129,7 @@ decided; its refusals must not depend on re-reading a flag).
 
 Only platform and handler can be checked at resolve time.  Operand **dtype,
 rank and extent are trace-time facts**, so those refusals live in the
-wrapper body (`ffi/mklfft/flat_k.py`'s `_flat_k_fft_ffi`,
+wrapper body (`ffi/fft.py`'s `_flat_k_fft_ffi`,
 `contract_bands._ffi_dtypes_ok`).  Say so in every service doc; a
 `plan()`-shaped single-phase API would have to lie about when it checked.
 

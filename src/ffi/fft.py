@@ -57,7 +57,7 @@ import numpy as np
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
-from ffi.common.gate import Gate
+from ffi.gate import Gate
 
 __all__ = [
     "FLAT_K_TARGET", "GW_CONV_TARGET", "GATE", "FUSED_GATE",
@@ -296,7 +296,7 @@ def make_gw_conv_ffi(
     plain helpers remain the entry point for everything else.
 
     Refuses through the ``LORRAX_FFT_FFI`` gate's platform/handler guards
-    (mode-independent — see :meth:`ffi.common.gate.Gate.require`): a caller
+    (mode-independent — see :meth:`ffi.gate.Gate.require`): a caller
     that constructs this factory has already decided to use the handler, so
     "which flag is set" is not the question being asked here.
     """

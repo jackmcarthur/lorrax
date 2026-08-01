@@ -86,7 +86,7 @@ def _fft_ffi_fused_enabled() -> bool:
     ("these helpers stay THE single FFT entry point — the backend switch
     happens here and nowhere else", ``fft_helpers.py:306-307``).  The gate
     now lives with the handler it gates (``ffi.mklfft.FUSED_GATE``, on the
-    shared ``ffi.common.gate.Gate``), with the same strict grammar as the
+    shared ``ffi.gate.Gate``), with the same strict grammar as the
     other two dials; every spelling that worked before still works."""
     from ffi.mklfft import fused_fft_ffi_enabled
     return fused_fft_ffi_enabled()

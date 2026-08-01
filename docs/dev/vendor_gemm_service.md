@@ -3,8 +3,8 @@
 *Mechanism documentation for `LORRAX_BANDS_GEMM_FFI` and the host handler
 behind it, written to the shape of `staged_reshard_primitive.md` (which
 documents a primitive with physics in it; this documents a mechanism, so it
-is short).  Sources: `src/ffi/mklblas/gemm.py`,
-`src/ffi/cpp/mklblas/gemm_batch_ffi.cc`, `src/ffi/common/gate.py`.
+is short).  Sources: `src/ffi/gemm.py`,
+`src/ffi/cpp/mklblas/gemm_batch_ffi.cc`, `src/ffi/gate.py`.
 Measurements: `wk_REL/RESHARD_OVERHEAD_MEMO.md` Sec. 4.4/4.5,
 `wk_REL/contract_bands_notes.md`, `wk_REL/gemm_portability_bse_notes.md`.*
 
@@ -97,7 +97,7 @@ load-bearing, not incidental: the verdict is consumed as a KERNEL-CACHE KEY
 `get_lib(None)` — and by the same argument `jax.process_index()`, which
 also goes through `get_backend()` — is forbidden there.  Since 2026-07-30
 the rank-0 test used by the announcement reads the launcher's rank instead
-(`ffi.common.gate.rank_id`), which closes a hole where the announce itself
+(`ffi.gate.rank_id`), which closes a hole where the announce itself
 initialized the backend two lines after a docstring promising it would not.
 
 The lexical read has exactly **two known miss cases**, both resolving in
@@ -153,7 +153,7 @@ precision at that precision's first use, **unconditionally** — not behind
 
 Rank-guarded via `announce_here()` (`gemm_batch_ffi.cc:229-235`), which
 reads `SLURM_PROCID`/`PMI_RANK`/`OMPI_COMM_WORLD_RANK` — the same list, in
-the same order, as `ffi.common.gate.rank_id` on the Python side.
+the same order, as `ffi.gate.rank_id` on the Python side.
 
 ## 5. Threading
 

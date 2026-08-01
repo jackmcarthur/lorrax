@@ -145,7 +145,7 @@ bodies from `ffi.mklfft`.
 timing, progress, gpu_utils, async_io, sanity}.py`.
 
 **Native libraries** — all of `ffi/`: location, probing, gating, dispatch.
-`ffi/common/gate.py` owns four things that used to be four drifting copies —
+`ffi/gate.py` owns four things that used to be four drifting copies —
 grammar, platform, probe, announce-or-refuse.
 
 **Sharded-file transport** — `file_io/{slab_io, _slab_io_ffi,

@@ -82,7 +82,7 @@ _pkg("ffi.common", "ffi/common")
 
 gw_config = _load_isolated("gw.gw_config", "gw/gw_config.py")
 gw_output = _load_isolated("gw.gw_output", "gw/gw_output.py")
-gate = _load_isolated("ffi.common.gate", "ffi/common/gate.py")
+gate = _load_isolated("ffi.gate", "ffi/gate.py")
 import runtime as _runtime            # noqa: E402  (os + subprocess only)
 
 
@@ -471,7 +471,7 @@ def test_blank_is_unset_in_every_vocabulary_including_runtime():
     Replaces the self-retiring gate that PINNED the divergence: while
     ``""`` was in ``runtime._FALSY_TOKENS``, an explicit
     ``export LORRAX_MALLOC_TUNE=`` DISABLED a default-on knob, whereas
-    ``ffi/common/gate.py`` ("unset or whitespace always maps to the gate's
+    ``ffi/gate.py`` ("unset or whitespace always maps to the gate's
     declared default"), ``isdf.core._env_bool``,
     ``file_io._slab_io_mpi_host._env_flag`` and this module's ``env_bool``
     all read blank as unset.
@@ -505,7 +505,7 @@ def test_defect3_vocabulary_has_not_drifted():
     """DEFECT 3 — one recognised token set, checked against every live copy.
 
     Three named vocabularies remain in the tree and must stay set-equal:
-      * ``ffi/common/gate.py::MODE_SPELLINGS``  (three-valued; ``auto`` is
+      * ``ffi/gate.py::MODE_SPELLINGS``  (three-valued; ``auto`` is
         load-bearing there and is deliberately NOT merged into the
         two-valued helpers — only the on/off halves are compared);
       * ``runtime.__init__._FALSY_TOKENS``     (the falsy set exactly — the

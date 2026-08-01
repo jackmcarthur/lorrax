@@ -1,24 +1,16 @@
-"""Flat-k batched 3-D FFT FFI subpackage (cpu MKL DFTI + CUDA cuFFT).
+"""Re-export shim — the flat-k FFT service moved to ``ffi.fft``.
 
-Public API::
-
-    from ffi.mklfft import (
-        fft_ffi_enabled,          # LORRAX_FFT_FFI          (factory-time)
-        fused_fft_ffi_enabled,    # LORRAX_FFT_FFI_FUSED    (factory-time)
-        require_fft_ffi,          # announce-or-REFUSE on a mesh
-        make_flat_k_fft_ffi,      # (nk,*trail) -> (nk,*trail)
-        make_gw_conv_ffi,         # fused ifftn·(G·W)·fftn
-    )
-
-ONE Python module serves BOTH platforms on purpose: the host and CUDA
-libraries register the same target strings under different C++ symbols, so
-the ``ffi_call`` sites never name a platform.  ``src/ffi/cufft/`` therefore
-holds C++ only — see ``ffi/cufft/__init__.py`` for that design note.
-
-Contract: ``docs/dev/flat_k_fft_service.md``.  Gate doctrine:
-``docs/dev/ffi_gate_contract.md``.
+Retained one wave so existing ``ffi.mklfft`` imports keep working
+(docs/architecture/ffi_layout.md §4); new code imports ``ffi.fft``.  The
+vendor name was historical anyway: ONE python module serves BOTH platforms
+(MKL DFTI on cpu, cuFFT on CUDA) under the same jax.ffi target names —
+see ``ffi/fft.py``'s docstring.  C++ handlers: ``src/ffi/cpp/mklfft/`` and
+``src/ffi/cpp/cufft/``.
 """
-from .flat_k import (
+import sys as _sys
+
+from ffi import fft as flat_k  # noqa: F401  (ffi.mklfft.flat_k module alias)
+from ffi.fft import (  # noqa: F401
     FLAT_K_TARGET,
     FUSED_GATE,
     GATE,
@@ -33,6 +25,9 @@ from .flat_k import (
     require_fft_ffi,
     validate_flat_spec,
 )
+
+# `from ffi.mklfft.flat_k import X` must keep working for the shim wave.
+_sys.modules[__name__ + ".flat_k"] = flat_k
 
 __all__ = [
     "FLAT_K_TARGET", "GW_CONV_TARGET", "GATE", "FUSED_GATE",

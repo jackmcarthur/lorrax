@@ -54,7 +54,7 @@ ENV_HELPERS = frozenset({
 })
 
 #: Callables whose ``env=`` keyword names an env var (typed capability
-#: gates: ``ffi/common/gate.py``).
+#: gates: ``ffi/gate.py``).
 ENV_KWARG_CALLS = frozenset({"Gate"})
 
 

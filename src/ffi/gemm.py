@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import jax
 
-from ffi.common.gate import Gate
+from ffi.gate import Gate
 
 __all__ = ["GEMM_TARGET", "GATE", "gemm_ffi_mode", "gemm_ffi_enabled",
            "require_gemm_ffi", "gemm_batch"]
@@ -90,7 +90,7 @@ GATE = Gate(
 
 def gemm_ffi_mode() -> str:
     """``"on"`` | ``"off"`` | ``"auto"`` — the raw ``LORRAX_BANDS_GEMM_FFI``
-    grammar (:meth:`ffi.common.gate.Gate.mode`)."""
+    grammar (:meth:`ffi.gate.Gate.mode`)."""
     return GATE.mode()
 
 

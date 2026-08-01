@@ -60,7 +60,7 @@ _DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
 #
 # BLANK IS NOT FALSE.  ``""`` used to be in this tuple, which made
 # ``export LORRAX_MALLOC_TUNE=`` DISABLE a default-on knob while every other
-# live vocabulary in the tree — ``ffi/common/gate.py`` ("unset or whitespace
+# live vocabulary in the tree — ``ffi/gate.py`` ("unset or whitespace
 # always maps to the gate's declared default"),
 # ``file_io._slab_io_mpi_host._env_flag`` and ``gw.gw_config.env_bool``
 # (which ``isdf.core`` imports since P1.3) —
@@ -1311,8 +1311,8 @@ def _ffi_dial_facts() -> list:
     """
     out = []
     try:
-        from ffi.mklblas.gemm import GATE as _GEMM_GATE
-        from ffi.mklfft.flat_k import GATE as _FFT_GATE, FUSED_GATE
+        from ffi.gemm import GATE as _GEMM_GATE
+        from ffi.fft import GATE as _FFT_GATE, FUSED_GATE
     except Exception as exc:                                  # noqa: BLE001
         return [{"env": "<ffi dials>", "mode": None, "enabled": None,
                  "detail": f"the FFI gate modules could not be imported "

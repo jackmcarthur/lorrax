@@ -12,11 +12,11 @@ registers the SAME XLA target STRINGS as the host MKL-DFTI handlers —
 — so ONE platform-agnostic ``jax.ffi.ffi_call`` per site resolves the right
 handler from the LOWERING platform, exactly the way jaxlib splits its own
 cpu (lapack) vs CUDA (cusolver) kernels and the way ``ffi/phdf5`` does it
-in-tree.  A ``ffi/cufft/flat_k.py`` mirroring ``ffi/mklfft/flat_k.py`` would
+in-tree.  A ``ffi/cufft/flat_k.py`` mirroring ``ffi/fft.py`` would
 duplicate every line of it and force call sites to branch on a platform they
 are not supposed to know about.
 
-**The Python for both platforms lives in** ``ffi.mklfft`` (the target strings
+**The Python for both platforms lives in** ``ffi.fft`` (the target strings
 were coined by the CPU prototype and kept; the name is historical, the
 dispatch is not).  The target names below are re-exported so a reader
 arriving here can confirm the mirror without opening the loader.
@@ -74,6 +74,6 @@ def __getattr__(name: str):
             f"ffi.cufft has no {name!r}: the cuFFT handlers register the "
             f"SAME XLA target strings as the host MKL-DFTI handlers, so ONE "
             f"platform-agnostic wrapper serves both platforms.  Import it "
-            f"from ffi.mklfft instead (`from ffi.mklfft import {name}`) — "
+            f"from ffi.fft instead (`from ffi.fft import {name}`) — "
             f"it lowers to cuFFT on a CUDA mesh.  See ffi/cufft/__init__.py.")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
