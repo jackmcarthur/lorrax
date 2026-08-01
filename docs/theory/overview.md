@@ -55,12 +55,8 @@ For implementation details, see `src/gw/gw_jax.py` and `src/gw/w_isdf.py`.
 
 
 
-### Self consistency
-To do self consistent updates, we need to iterate the V_hartree and Sigma_GW contributions to the self energy until the wavefunctions remain unchanged.
+### Self consistency (updated 2026-07-31)
 
-The DFT hamiltonian is K (kinetic E) + I (ionic local + nonlocal E) + H (hartree E) + Vxc.
-We use gw.kin_ion_io to write the K+I elements to file so we can update V_hartree+Sigma_GW ourselves.
+Self-consistent updates iterate the V_Hartree and Sigma_GW contributions until the quasiparticle Hamiltonian is stationary. The DFT Hamiltonian is K (kinetic) + I (ionic local + nonlocal) + H (Hartree) + Vxc; `gw.kin_ion_io` writes the K+I elements (and, by default, the exact V_H) to file so the run can rebuild V_Hartree + Sigma_GW itself, and `psp.get_dipole_mtxels` supplies the dipole matrix elements for the q→0 head correction to W.
 
-We also use the output of the interpolation-point finding code (kmeans clustering step weighted by the charge density) and the dipole matrix elements from psp.get_dipole_mtxels to calculate the "head correction" to the screened interaction W. Theoretically these should probably all be done on startup of gw.gw_jax but they are all kind of slow (like 10+ seconds each) and we shouldn't do that until they have been profiled and highly optimized with JAX for performance.
-
-The self consistent iterations right now are untested (alpha only, not converging well).
+QSGW (`qp_solver = self_consistent`, `gw_config.QPSolver`) is wired for all compute modes via the mode-agnostic sigma dispatch and verified end-to-end; the loop knobs (`sc_max_iter`, `sc_tol_ev`, rCROP/linear acceleration) are deck keys. See manual §4.5 for the solver family.

@@ -4,6 +4,8 @@
 user — the facade is deliberately small and self-contained enough to
 lift into another SPMD JAX codebase.*
 
+Convention used across the dev docs: `wk_REL/` = `/scratch2/08271/jackmc/lorrax_setup/wk_REL/` (campaign evidence, machine-local, not shipped).
+
 ## The problem
 
 LORRAX runs multi-process SPMD JAX: one process per device, a 2-D

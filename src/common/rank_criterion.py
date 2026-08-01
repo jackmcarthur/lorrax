@@ -37,7 +37,7 @@ WHY THE FAILURE MODE FIXES THE OBJECTIVE
 ----------------------------------------
 The danger is **not** cutting a real direction.  It is **keeping a near-null
 one**, whose pseudo-inverse amplifies noise by ``1/σ``.  Measured on this
-code (wk_REL/docs/ladder_rung1_notes.md §R19, MoS2 4×4, nb=1024, μ≈10k,
+code (docs/dev/notes/ladder_rung1_R19_zeta_rcond.md, MoS2 4×4, nb=1024, μ≈10k,
 ``zeta_rcond`` swept, everything else fixed):
 
     zeta_rcond   retained rank   eqp0        eqp1

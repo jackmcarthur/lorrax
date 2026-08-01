@@ -2,7 +2,7 @@
 
 **Consolidates**: `isdf_context.md`, `isdf_spin_galerkin_derivation.md`, `ZETA_FITTING_ALGORITHM.md`, `cohsex_jax_physics.md`. The detailed ζ + V_q algorithm/sharding doc that previously occupied §11 has been split out to [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md); the symmetry conventions and unfold procedures (IBZ tables, `mtrx`/τ actions, `unfold_psi`, `unfold_v_q`, `compute_centroid_sym_perm`) now live in [`SYMMETRY_COMPREHENSIVE.md`](symmetry.md); the memory model (per-stage formulas, G-flat planner, AOT chooser) is in [`MEMORY_MODEL.md`](../architecture/memory-model.md).
 
-**Status (2026-05-15)**: describes the current implementation in `src/common/isdf_fitting.py` (zeta pipeline), `src/gw/gw_jax.py` (driver), `src/gw/w_isdf.py` (χ₀ + W), `src/gw/ppm_sigma.py` (GN-PPM Σ^c(ω)), `src/gw/head_correction.py` (q→0 head), and `src/gw/greens_function_kernel.py` + `src/gw/wavefunction_bundle.py` (leaf kernels). All physics arrays use the flat-k / flat-q convention (`(nk_tot, …)`); 3-D k-grid layout only appears inside `common/fft_helpers.py`. The detailed ζ + V_q algorithms, sharding map, and IBZ cascade are in [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md); §11 below is now a short pointer with the bispinor / G-flat quick-reference table preserved as an at-a-glance summary.
+**Status (2026-05-15; paths re-pinned 2026-07-31)**: describes the current implementation in `src/gw/isdf_fitting.py` + `src/isdf/core.py` (zeta pipeline), `src/gw/gw_jax.py` (driver), `src/gw/w_isdf.py` (χ₀ + W), `src/gw/ppm_sigma.py` (GN-PPM Σ^c(ω)), `src/gw/head_correction.py` (q→0 head), and `src/gw/greens_function_kernel.py` + `src/gw/wavefunction_bundle.py` (leaf kernels). All physics arrays use the flat-k / flat-q convention (`(nk_tot, …)`); 3-D k-grid layout only appears inside `common/fft_helpers.py`. The detailed ζ + V_q algorithms, sharding map, and IBZ cascade are in [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md); §11 below is now a short pointer with the bispinor / G-flat quick-reference table preserved as an at-a-glance summary.
 
 ---
 
@@ -157,7 +157,7 @@ $$Z_{q,\nu}(\mathbf{r}) = \sum_{\mathbf{R}} e^{i\mathbf{q}\cdot\mathbf{R}} \sum_
 
 **Why FFT convolution?** Direct summation $\sum_{\mathbf{k}, \mathbf{k}'} (\cdots)$ scales as $O(n_k^2)$. Using FFTs to perform the convolution in R-space reduces this to $O(n_k \log n_k)$, making the procedure tractable for large k-grids.
 
-**Implementation**: Compute $P_{\mathbf{k}}$ on k-grid, FFT to R-grid using `make_flat_k_ifftn` from `common/fft_helpers.py` (per-device local FFT on replicated k-axes via `custom_partitioning`), form spin-traced products, FFT back to q-space. See `compute_CCT_from_left_right()` and `compute_ZCT_from_left_right_zchunk()` in `common/isdf_fitting.py`. `norm='forward'` is used for the convolution identity: $C_q = \text{FFT}(\overline{\text{IFFT}(A)} \odot \text{IFFT}(B)) = \sum_{\mathbf k} A^*_k B_{k+q}$.
+**Implementation**: Compute $P_{\mathbf{k}}$ on k-grid, FFT to R-grid using `make_flat_k_ifftn` from `common/fft_helpers.py` (per-device local FFT on replicated k-axes via `custom_partitioning`), form spin-traced products, FFT back to q-space. See `c_q_from_psi_sm()` and `z_q_from_psi_sm()` in `isdf/core.py`. `norm='forward'` is used for the convolution identity: $C_q = \text{FFT}(\overline{\text{IFFT}(A)} \odot \text{IFFT}(B)) = \sum_{\mathbf k} A^*_k B_{k+q}$.
 
 ---
 
@@ -219,7 +219,7 @@ $$C_q(\mu, \nu) = \text{FFT}_{\mathbf{R}}\left[C_{\mathbf{R}}(\mu, \nu)\right]$$
 
 **Sharding**: $C_q(\mu_X, \nu_Y)$ is 2D tiled for blocked Cholesky.
 
-**Implementation**: `compute_CCT_from_left_right()` (spin-traced) in `common/isdf_fitting.py`.  Only the spin-traced path is currently wired to the GW driver; the explicit $P_{ab}$-channel variant lives behind `accumulate_pair_density_spin_traced` for the bispinor four-density work but is not yet exposed via a `cohsex.in` flag.
+**Implementation**: `c_q_from_psi_sm()` (spin-traced) in `isdf/core.py`.  The bispinor four-density channels reuse the same kernel through its `gamma_L`/`gamma_R` (perm, phase) vertex arguments (`bispinor = true` in `cohsex.in`).
 
 ### 4.4 Stage 3: Cholesky Factorization
 
@@ -235,7 +235,7 @@ $$L_q(\mu_X, \nu_Y) = \text{cholesky\_2d\_batched}(C_q)$$
 
 **Sharding**: $L_q(\mu_X, \nu_Y)$ — 2D tiles `P(None, 'x', 'y', None, None)` internally; dense form `P(None, 'x', 'y')` on return.
 
-**Implementation**: `compute_L_q_from_CCT()` in `common/isdf_fitting.py`, which calls `cholesky_2d_batched()` in `common/cholesky_2d.py`. On a 1×1 mesh (single GPU), falls back to dense `jnp.linalg.cholesky` with a small trace-proportional ridge to regularize the rank-deficient pair-density matrix.
+**Implementation**: `factor_c_q()` in `isdf/core.py`, which calls `cholesky_2d_batched()` in `common/cholesky_2d.py`. On a 1×1 mesh (single GPU), falls back to dense `jnp.linalg.cholesky` with a small trace-proportional ridge to regularize the rank-deficient pair-density matrix.
 
 ### 4.5 Stage 4: ZCT and Triangular Solve (Z-Chunked)
 
@@ -257,7 +257,7 @@ $$Z_{\mathbf{R}}(\mu, r) = \sum_{s,s'} (P^{(L)}_{\mathbf{R},s's})^* \cdot P^{(R)
 
 $$Z_q(\mu_X, r_{XY}) = \text{FFT}_{\mathbf{R}}[Z_{\mathbf{R}}]$$
 
-**Step 4c**: Triangular solve. `solve_zeta_from_L_q()` in `common/isdf_fitting.py` loops over q-batches of size `q_chunk_size` (default 1) and, inside a `shard_map` over `('x','y')` with the r-column axis scattered, runs a vmapped Cholesky back-solve:
+**Step 4c**: Triangular solve. `solve_zeta()` in `isdf/core.py` loops over q-batches of size `q_chunk_size` (default 1) and, inside a `shard_map` over `('x','y')` with the r-column axis scattered, runs a vmapped Cholesky back-solve:
 
 ```python
 # shard_map in_specs = (P(None, None, None), P(None, None, ('x','y')))
@@ -277,7 +277,7 @@ L is gathered to replicated inside the shard_map, so each device solves its r-co
 - $Z_q(\mu_X, r_Y)$ built in ZCT: `P(None, 'x', 'y')`; resharded once to `P(None, None, ('x','y'))` for the solve
 - $\zeta_q(\mu, r_{XY})$: `P(None, None, ('x','y'))` — r-column distributed
 
-**Implementation**: `fit_zeta_chunked_to_h5()` in `common/isdf_fitting.py`.
+**Implementation**: `fit_zeta_to_h5()` in `gw/isdf_fitting.py` (stage orchestration) over the `isdf/core.py` kernels.
 
 ### 4.6 Stage 5: Coulomb Matrix Elements
 
@@ -491,7 +491,7 @@ $$\chi^0_{\ell m} = -\frac{2\gamma}{\sqrt{N_k} \, n_{\text{spin}} n_{\text{spino
 
 **Quadrature size**: $N_\tau = \alpha(0.4 - 0.3\ln\epsilon)$ where $\alpha = \sqrt{E_{\text{bw}}/E_{\text{gap}}}$ and $\epsilon$ is target error.
 
-**Implementation**: `compute_chi0_minimax()` in `gw/w_isdf.py`. The cached `_get_chi_minimax_kernel()` (flat-k, compiled once per mesh × kgrid) builds $G^v(\tau)$ and $G^c(\tau)$ via `greens_function_kernel.build_G` with Laplace phases, IFFTs each to R-space using `make_flat_k_ifftn` (see §7.2 below for the swapped μ/ν ↔ 'x'/'y' assignment that keeps the output naturally sharded), contracts `einsum('Rambn,Rbnam->Rmn')`, accumulates `χ_R` over τ nodes in a donated fori-loop, and FFTs back to q. The outer `compute_chi0()` (`gw/w_isdf.py`) pulls the τ nodes and minimax weights from a `LaplaceMinimaxQuadrature` built by `common.minimax` (or loaded from `src/common/minimax_assets/` when `regenerate_minimax_tables = false`).
+**Implementation**: `compute_chi0()` in `gw/w_isdf.py`. The cached `_get_chi_minimax_kernel()` (flat-k, compiled once per mesh × kgrid) builds $G^v(\tau)$ and $G^c(\tau)$ via `greens_function_kernel.build_G` with Laplace phases, IFFTs each to R-space using `make_flat_k_ifftn` (see §7.2 below for the swapped μ/ν ↔ 'x'/'y' assignment that keeps the output naturally sharded), contracts `einsum('Rambn,Rbnam->Rmn')`, accumulates `χ_R` over τ nodes in a donated fori-loop, and FFTs back to q. The outer `compute_chi0()` (`gw/w_isdf.py`) pulls the τ nodes and minimax weights from a `LaplaceMinimaxQuadrature` built by `common.minimax` (or loaded from `src/common/minimax_assets/` when `regenerate_minimax_tables = false`).
 
 **Reference**: Kim, Martyna & Ismail-Beigi, PRB 101, 035139 (2020). Full derivation in `docs/theory/minimax-quadrature.md`. Windowing strategy in `docs/dev/notes/NEW_WINDOW_MINIMAX_GUIDELINES.md`.
 
@@ -637,15 +637,16 @@ $$H_{QP} = (H_{DFT} - V_{xc}) + V_H + \Sigma_{xc}(\omega).$$
 
 The default `G_0 W_0` path (`self_consistent=False`) performs **one-shot** static COHSEX. A separate diagonal-Σ_xc fixed-point (`gw/qsgw_utils.py : solve_diagonal_sigma_fixed_point`) runs post-hoc when `use_ppm_sigma=true` to evaluate $E = \text{diag}(H_0) + \text{Re}\,\Sigma_{xc}(E)$, with a scissor fit (`gw/scissor.py`) extrapolating out-of-ω-grid bands.
 
-**Implementation**: `gw/gw_jax.py : main` — the `if config.self_consistent:` block builds `_sc_step()` and passes it to `rcrop_nojit`; QSGW Σ^xc reconstruction via `build_qsgw_sigma_xc_from_h5` in `gw/qsgw_utils.py`.
+**Implementation**: `gw/gw_jax.py : main` — the `if config.self_consistent:` block builds `_sc_step()` and passes it to `rcrop_nojit`; QSGW Σ^xc reconstruction via `build_qsgw_sigma_xc` in `gw/qsgw_utils.py`.
 
 ### 6.9 GN-PPM dynamic self-energy Σ^c(ω)
 
 Static COHSEX neglects the ω-dependence of $W$. For a full $\Sigma^c(\omega)$ we use the Godby–Needs plasmon-pole model: every $(μ,ν,q)$ matrix element of the correlated screening $W^c = W - V$ is approximated by a single pole,
 
-$$W^c_{q,μν}(\omega) \approx \frac{B_{q,μν}}{\omega^2 - \Omega_{q,μν}^2},$$
+$$W^c_{q,μν}(\omega) \approx \frac{2\,B_{q,μν}\,\Omega_{q,μν}}{\omega^2 - \Omega_{q,μν}^2}
+= B_{q,μν}\left[\frac{1}{\omega-\Omega_{q,μν}} - \frac{1}{\omega+\Omega_{q,μν}}\right],$$
 
-with two parameters $(B, \Omega)$ fitted at each $(μ,ν,q)$ from two known samples — $W^c(0)$ and $W^c(i\omega_p)$ — via `gw/minimax_screening.py : fit_gn_ppm_from_wc_pair`. The driver computes $W(0)$ from the static minimax χ₀, then rebuilds $χ₀(i\omega_p)$ via a second `compute_chi0_minimax` call with an imaginary-frequency quadrature (`build_imag_quadrature`), solves the Dyson equation again for $W(i\omega_p)$, and hands both to `fit_gn_ppm` (`gw/ppm_sigma.py`).
+with two parameters fitted at each $(μ,ν,q)$ from two known samples — $W^c(0)$ and $W^c(z)$, $z = i\omega_p$ — via `gw/minimax_screening.py : fit_gn_ppm_from_wc_pair` (`minimax_screening.py:406-423`): $\Omega^2 = -z^2 W^c(z)/(W^c(0)-W^c(z))$, $B = -\tfrac12 W^c(0)\,\Omega$, valid where $\mathrm{Re}\,\Omega^2 > 0$. (The q→0 head fit uses the other normalization, $B_h/(\omega^2-\Omega_h^2)$ with residue $R_h = B_h/2\Omega_h$.) The driver computes $W(0)$ from the static minimax χ₀, then rebuilds χ₀ at the probe frequency with an imaginary-frequency quadrature (`build_imag_quadrature`), solves the Dyson equation again for $W(i\omega_p)$, and hands both to the fit.
 
 #### 6.9.1 Time-domain integrand
 
@@ -796,7 +797,7 @@ Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` built in `gw_ja
 | `gw/qsgw_utils.py` | Diagonal Σ fixed-point + QSGW Σ^xc |
 | `gw/scissor.py` | Valence/conduction scissor extrapolation |
 | `gw/wavefunction_bundle.py` | `BandSlices`, `Wavefunctions` (4 sharded ψ copies); `project`, `project_ri` band-basis contractions |
-| `common/isdf_fitting.py` | CCT/ZCT kernels, Cholesky, ζ solve, full pipeline |
+| `isdf/core.py` + `gw/isdf_fitting.py` | CCT/ZCT kernels, factorization, ζ solve / stage orchestration |
 | `common/cholesky_2d.py` | 2D blocked Cholesky |
 | `common/fft_helpers.py` | Flat-k ↔ 3-D FFT helpers (custom_partitioning) |
 | `common/meta.py` | `Meta` system dataclass |
