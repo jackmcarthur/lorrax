@@ -53,13 +53,16 @@ def _build_mesh_xy() -> Mesh:
     compute on is refused BY NAME here rather than surfacing as a bare
     ``StopIteration`` inside a jit several layers down.
 
-    NOT ``prepare_mesh``: that also warms the ``impl=mpi`` communicator
-    cliques, which is an extra collective on a path that does not have one
-    today.  Whether this driver should warm is the open warm-up-contract
-    question (numbered request), not a change to smuggle in with a rename.
+    ``prepare_mesh``, not ``resolve_mesh``: the warm-up-contract question is
+    answered by measurement.  Without the clique warm-up this driver's first
+    collective fires from an XLA parallel-executor worker thread and jaxlib
+    refuses communicator creation (MPI_Is_thread_main false) — P=16 job
+    7884867 failed on all 16 ranks at the first ``load_centroids`` collective
+    and needed the LORRAX_MPI_FORCE_THREAD_MAIN fallback; with the warm-up
+    the fallback is unnecessary.
     """
-    from common.collectives import resolve_mesh
-    return resolve_mesh(axis_names=('x', 'y'))
+    from common.collectives import prepare_mesh
+    return prepare_mesh(axis_names=('x', 'y'))
 
 
 _accum_G_cache: dict = {}

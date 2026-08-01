@@ -34,6 +34,7 @@ from jax.experimental.shard_map import shard_map
 from common.collectives import (
     device_put_process_local,
     process_count,
+    prepare_mesh,
     resolve_mesh,
     single_device_mesh,
 )
@@ -91,7 +92,10 @@ def build_mesh(n_points: int, *, shard: bool = True,
             )
         return single_device_mesh()
 
-    mesh = resolve_mesh(axis_names=MESH_AXES)
+    # prepare_mesh, not resolve_mesh: without the clique warm-up the first
+    # Lloyd collective fires from an XLA pool thread and jaxlib refuses
+    # communicator creation at P>1 (job 7884867, 16/16 ranks).
+    mesh = prepare_mesh(axis_names=MESH_AXES)
     nx, ny = (int(mesh.shape[a]) for a in MESH_AXES)
     n_dev = nx * ny
     if n_dev < 2:
