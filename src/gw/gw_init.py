@@ -209,6 +209,21 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'zeta_rcond':           _dep_env_record(
 			"LORRAX_ZETA_RCOND", cfg.backend.zeta_rcond),
 		'charge_zeta_solve':    str(cfg.backend.charge_zeta_solve),
+		# GAUGE tier of the charge-channel factor (zeta audit 2026-08-01):
+		# the `distributed` tier's block-cyclic pzheevd is a different,
+		# equally valid gauge (~kappa*eps vs the whole-tile eigh), so a
+		# zeta fit under one tier must not be silently reused by a rerun
+		# under the other.  `replicated` and `per_q` are back-solve GATHER
+		# granularities over the SAME whole-tile factor (bit-identical),
+		# and `auto` never resolves to `distributed` — so exactly two
+		# gauge classes exist and both collapse here.  The schema is NOT
+		# bumped: `_zeta_reuse_ok` treats a stamp MISSING this key as
+		# legacy replicated-gauge (every pre-2026-08 zeta was), keeping
+		# old run dirs usable.
+		'distributed_zeta_solve': (
+			'distributed'
+			if str(cfg.backend.distributed_zeta_solve).strip().lower()
+			== 'distributed' else 'replicated'),
 		'gamma_contract_mode':  str(cfg.backend.gamma_contract_mode),
 		'write_ibz_only':       bool(write_ibz_only),
 		'vertex_mu_L':          0,
@@ -232,7 +247,11 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 	  2. the file exists and its ``isdf_header`` is readable;
 	  3. ``zeta_is_done`` is True (the writer flipped it after the last
 	     H5Dwrite drained — a crashed fit leaves it False);
-	  4. ``fit_provenance`` is present AND byte-identical to this run's;
+	  4. ``fit_provenance`` is present AND byte-identical to this run's —
+	     with ONE named exception: a legacy stamp lacking the
+	     ``distributed_zeta_solve`` key is treated as a replicated-gauge
+	     fit (announced), so pre-2026-08 run dirs stay reusable by
+	     replicated-tier reruns while a distributed-tier rerun refits;
 	  5. the on-disk centroid table equals this run's centroid indices.
 
 	Anything unexpected — missing attr, unreadable file, legacy header —
@@ -280,10 +299,36 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 			detail = "; ".join(
 				f"{k}: on-disk={old.get(k)!r} now={new.get(k)!r}" for k in diff)
 		except Exception:
+			old = new = None
+			diff = None
 			detail = "(provenance unparseable)"
-		print_fn(f"    [zeta reuse] {zeta_h5_path} was fit under DIFFERENT "
-		         f"inputs — refitting.  Changed: {detail}")
-		return False
+		# Legacy-stamp compatibility (owner-approved, 2026-08-01): stamps
+		# written before the `distributed_zeta_solve` tier key existed are
+		# all replicated-gauge fits (the distributed tier post-dates the
+		# key).  When that key is the ONLY difference and the on-disk
+		# stamp simply lacks it, a replicated-gauge rerun may reuse the
+		# zeta (one-line notice); a distributed-tier rerun must refit —
+		# that IS a tier mismatch, just against an implicit legacy value.
+		# The schema number stays at 1 on purpose: bumping it would force
+		# a refit of every existing on-disk zeta, which this branch exists
+		# to avoid.
+		if (diff == ['distributed_zeta_solve']
+				and 'distributed_zeta_solve' not in old):
+			if str(new.get('distributed_zeta_solve')) == 'replicated':
+				print_fn(f"    [zeta reuse] {zeta_h5_path}: legacy stamp "
+				         f"(no distributed_zeta_solve key) — treating as "
+				         f"replicated tier; reuse allowed.")
+			else:
+				print_fn(
+					f"    [zeta reuse] {zeta_h5_path}: legacy stamp has no "
+					f"distributed_zeta_solve key (= replicated-gauge fit), "
+					f"but this run requests the DISTRIBUTED tier — its "
+					f"block-cyclic eigh is a different gauge, so refitting.")
+				return False
+		else:
+			print_fn(f"    [zeta reuse] {zeta_h5_path} was fit under "
+			         f"DIFFERENT inputs — refitting.  Changed: {detail}")
+			return False
 	try:
 		want = np.asarray(centroid_fft_idx, dtype=np.int32)
 		got = np.asarray(hdr.r_mu_fft_idx, dtype=np.int32)
