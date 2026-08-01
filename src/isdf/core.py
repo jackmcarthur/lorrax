@@ -1836,12 +1836,16 @@ def _factor_c_q_replicated(
     import os as _os
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
+    mode = str(charge_zeta_solve)
     # DEPRECATED env forms — the input keys are the record (scorecard AV).
+    # The env twins are CHARGE-channel keys; the transverse tau
+    # (transverse_zeta_rcond) deliberately has no env twin, so the charge
+    # override must not bleed into the transverse mode.
     ridge_extra = _deprecated_env_float(
         "LORRAX_ZETA_RIDGE", "zeta_ridge", zeta_ridge)
-    rcond = _deprecated_env_float(
-        "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
-    mode = str(charge_zeta_solve)
+    rcond = (float(zeta_rcond) if mode == 'transverse_rank_truncate'
+             else _deprecated_env_float(
+                 "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond))
     out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     rep_sh = NamedSharding(mesh_xy, P())
     key = (id(mesh_xy), int(nq), int(n_rmu), n_log,
@@ -2075,12 +2079,14 @@ def _factor_c_q_replicated_qparallel(
     """
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
-    # DEPRECATED env forms — the input keys are the record (scorecard AV).
+    mode = str(charge_zeta_solve)
+    # DEPRECATED env forms — charge-channel only; the transverse tau has
+    # no env twin (see _factor_c_q_replicated).
     ridge_extra = _deprecated_env_float(
         "LORRAX_ZETA_RIDGE", "zeta_ridge", zeta_ridge)
-    rcond = _deprecated_env_float(
-        "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
-    mode = str(charge_zeta_solve)
+    rcond = (float(zeta_rcond) if mode == 'transverse_rank_truncate'
+             else _deprecated_env_float(
+                 "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond))
     rank_log = (mode in ('rank_truncate', 'transverse_rank_truncate')
                 and env_bool("LORRAX_ZETA_RANK_LOG", True))
     ndev = int(mesh_xy.devices.size)
