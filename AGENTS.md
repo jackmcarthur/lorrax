@@ -14,7 +14,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/gw/gw_jax.py` | Main GW driver | Any GW debugging |
 | `src/gw/gw_init.py` | Input parsing, chunking strategy, pipeline orchestration | Input file questions, chunk sizing |
 | `src/gw/gw_config.py` | `LorraxConfig` runtime options dataclass | Flag plumbing, memory budget |
-| `src/gw/gw_driver_helpers.py` | Screening/PPM setup helpers | Driver wiring |
+| `src/gw/sigma_dispatch.py` | Mode-agnostic Σ dispatch (one call per compute mode) | Driver wiring |
 | `src/gw/w_isdf.py` | χ₀ → W screening pipeline (CTSP, Dyson solve) | Screening / epsilon issues |
 | `src/gw/ppm_sigma.py` | GN-PPM dynamic self-energy Σ^c(ω) | Frequency-dependent sigma issues |
 | `src/gw/minimax_screening.py` | PPM extraction, minimax window helpers | PPM parameter issues |
@@ -25,7 +25,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/gw/wavefunction_bundle.py` | `Wavefunctions` bundle + `project` / `project_ri` (Σ_μν → Σ_ij band projection) | Band-basis projection |
 | `src/gw/qsgw_utils.py` | QSGW fixed-point solver, Σ^xc I/O | Self-consistent GW |
 | `src/gw/kin_ion_io.py` | Kinetic + ionic Hamiltonian I/O | `kin_ion.h5` issues |
-| `src/common/isdf_fitting.py` | CCT/ZCT, pair-density kernels, zeta solve | Zeta fitting, pair density |
+| `src/isdf/core.py` + `src/gw/isdf_fitting.py` | CCT/ZCT, pair-density kernels, zeta solve / stage orchestration | Zeta fitting, pair density |
 | `src/common/wfn_transforms.py` | Wavefunction loading + band-chunked FFT | WFN load path |
 | `src/common/cholesky_2d.py` | 2D-blocked Cholesky for sharded CCT | Cholesky issues |
 | `src/common/fft_helpers.py` | Flat-k FFT helpers | FFT plumbing |

@@ -141,7 +141,7 @@ $$\boxed{Z_{q,\nu}(\mathbf{r}) = \sum_{\mathbf{k}} \sum_{s,s'} P^*_{\mathbf{k}-\
 
 **Key insight**: Even though we fit only the spin-diagonal sum $M^{\uparrow\uparrow} + M^{\downarrow\downarrow}$, the Galerkin error couples **all four spin channels** $P_{ss'}$ including off-diagonal $P_{\uparrow\downarrow}, P_{\downarrow\uparrow}$ due to the $\sum_{m,n} (\cdot)^* (\cdot)$ structure.
 
-**Derivation**: See `docs/isdf_spin_galerkin_derivation.md` for detailed proof that this is the correct CCT formula (not $\sum_{ab} |P_{aa}|^2$ which would be a different fitting target).
+**Derivation**: See `docs/dev/archive/isdf_spin_galerkin_derivation.md` for detailed proof that this is the correct CCT formula (not $\sum_{ab} |P_{aa}|^2$ which would be a different fitting target).
 
 ### 3.3 Lattice Fourier Transform (k-Space Convolution)
 
