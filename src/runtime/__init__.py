@@ -1,14 +1,23 @@
 """THE LORRAX runtime: one startup call, one order, one honest report.
 
-Every core driver — ``gw.gw_jax``, ``bandstructure.htransform``,
-``bse.bse_jax``, ``psp.run_nscf``, ``centroid.kmeans_cli``, … — needs the
-identical thing done in the identical order before any physics runs::
+Every core driver needs the identical thing done in the identical order
+before any physics runs::
 
     from runtime import initialize_communicator_stack
     RUNTIME = initialize_communicator_stack()   # BEFORE ``import jax``
     import jax
     ...
     mesh_xy = RUNTIME.mesh
+
+The adopters (2026-08-01) are the seven chain drivers — ``gw.gw_jax``,
+``centroid.kmeans_cli``, ``psp.get_dipole_mtxels``, ``gw.kin_ion_io``,
+``bandstructure.htransform``, ``bse.bse_jax`` and ``bse.exciton_bands`` —
+each making exactly ONE module-top call, gated per driver by
+``tests/test_crossfile_requests.py`` (the R1 audit).  The two BSE CLIs that
+take ``--px/--py`` still start on the most-square mesh; a different shape
+goes through :meth:`RuntimeStack.reshape` (or the BSE factory
+``bse.bse_ring_comm.create_mesh_xy``, which reuses the startup mesh whenever
+the requested shape matches it).
 
 :func:`initialize_communicator_stack` is that call.  It resolves the JAX
 environment, installs the fail-fast excepthook, states the CPU-collectives

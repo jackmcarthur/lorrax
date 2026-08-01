@@ -14,15 +14,15 @@ Device meshes, sharding and placement live in :mod:`centroid.distribution`.
 """
 from __future__ import annotations
 
-# Canonical JAX GPU/CPU bootstrap — single-sourced in runtime.bootstrap()
-# (env defaults + jax.distributed init + CPU fallback; all idempotent).
-# MUST precede any import that pulls in jax, so JAX_ENABLE_X64 etc. take
-# effect.  NOTE: this used to be set_default_env() + init_jax_distributed()
-# only; bootstrap() adds fallback_to_cpu_if_no_gpu_backend(), so on a node
-# with no usable GPU backend this CLI now falls back to CPU instead of
-# dying at the first jax call.
-from runtime import bootstrap
-bootstrap()
+# THE startup call (runtime module docstring): env defaults, fail-fast
+# hook, jax.distributed, GPU-or-CPU resolution, the run's clique-warmed
+# ('x','y') mesh, compile cache, rank-0 report.  MUST precede any import
+# that pulls in jax, so JAX_ENABLE_X64 etc. take effect.  This driver's
+# mesh POLICY stays in ``centroid.distribution.build_mesh`` (latency
+# floor, --no-shard); when that policy shards, ``resolve_mesh`` hands it
+# back this same startup mesh, not a second one.
+from runtime import initialize_communicator_stack
+RUNTIME = initialize_communicator_stack()
 
 import argparse
 import os

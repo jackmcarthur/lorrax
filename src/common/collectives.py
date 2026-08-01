@@ -223,6 +223,16 @@ def _require_addressable(mesh, *, origin: str):
     return mesh
 
 
+#: The one canonical most-square mesh per axis-name tuple, cached on first
+#: resolution.  Same identity contract as ``_PROCESS_LOCAL_MESH`` below and
+#: for the same reason: shape-keyed jit caches key on the output
+#: ``NamedSharding``, which embeds the mesh OBJECT, so a library that
+#: re-resolves after ``runtime.initialize_communicator_stack`` built the
+#: run's mesh must get THE mesh back, not an equal-but-distinct twin
+#: (``centroid.distribution.build_mesh`` and the BSE factory both re-resolve).
+_CANONICAL_MESHES: dict = {}
+
+
 def resolve_mesh(mesh=None, *, axis_names=("x", "y")):
     """THE run's device mesh: pass your own, or get the canonical one.
 
@@ -230,6 +240,13 @@ def resolve_mesh(mesh=None, *, axis_names=("x", "y")):
     second mesh — and no second communicator — is created.  A CLI has none
     and gets the most-square factorisation of ``jax.devices()``, degenerating
     to 1x1 on a single device so every code path is identical at P=1.
+
+    The most-square mesh is built ONCE per process per axis-name tuple and
+    cached (``_CANONICAL_MESHES``): ``runtime.initialize_communicator_stack``
+    resolves it at driver import, and every later no-argument call — a
+    library helper resolving "the run's mesh" for itself — gets the same
+    object rather than an equal-but-distinct twin that would double every
+    shape-keyed jit cache.
 
     Either way the result is checked with :func:`_require_addressable`, so a
     mesh this process cannot compute on is refused here rather than
@@ -241,15 +258,21 @@ def resolve_mesh(mesh=None, *, axis_names=("x", "y")):
 
     if mesh is not None:
         return _require_addressable(mesh, origin="resolve_mesh(caller's mesh)")
+    key = tuple(axis_names)
+    cached = _CANONICAL_MESHES.get(key)
+    if cached is not None:
+        return _require_addressable(cached, origin="resolve_mesh(canonical)")
     devices = jax.devices()
     total = len(devices)
     gx = int(np.sqrt(total))
     while gx > 1 and total % gx != 0:
         gx -= 1
-    return _require_addressable(
+    built = _require_addressable(
         Mesh(np.asarray(devices).reshape(gx, total // gx),
-             axis_names=tuple(axis_names)),
+             axis_names=key),
         origin="resolve_mesh")
+    _CANONICAL_MESHES[key] = built
+    return built
 
 
 #: The one cached process-local mesh.  A module global, not a

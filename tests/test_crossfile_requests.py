@@ -247,6 +247,55 @@ def test_entry_point_calls_prepare_mesh_in_the_service():
         "initialize_communicator_stack must call prepare_mesh itself")
 
 
+# ---------------------------------------------------------------------------
+# R1 extension (2026-08-01): ALL SEVEN chain drivers own their startup.
+#
+# gw_jax adopted ``initialize_communicator_stack`` on 2026-07-31; the other
+# six drivers still ran ``bootstrap()`` (or, in psp.get_dipole_mtxels, two
+# hand-picked pieces of it) and got their mesh + clique warm-up ad hoc —
+# htransform and the centroid path via interim direct ``prepare_mesh``
+# routing (repo 24e4dc3), kin_ion/dipole via their own calls, the BSE pair
+# via the bse_ring_comm factory alone.  Same audit, same budget for every
+# driver: exactly ONE startup call, ZERO direct prepare_mesh calls, no
+# hand-rolled mesh, no direct warm-up import.  This list is a ratchet —
+# a new chain driver is added here, not exempted.
+# ---------------------------------------------------------------------------
+
+_STARTUP_DRIVERS = (
+    "gw/gw_jax.py",
+    "centroid/kmeans_cli.py",
+    "psp/get_dipole_mtxels.py",
+    "gw/kin_ion_io.py",
+    "bandstructure/htransform.py",
+    "bse/bse_jax.py",
+    "bse/exciton_bands.py",
+)
+
+
+def test_every_chain_driver_owns_its_startup():
+    """Each of the seven chain drivers makes exactly one
+    ``initialize_communicator_stack()`` call and no mesh/warm-up call of
+    its own.  The auditor is ``_audit_driver_warmup`` — already shown able
+    to fail by ``test_auditor_driver_warmup_can_fail`` above, so this test
+    inherits that negative control."""
+    complaints = []
+    for relpath in _STARTUP_DRIVERS:
+        complaints.extend(_audit_driver_warmup(_read(relpath), relpath))
+    assert complaints == [], complaints
+
+
+def test_the_runtime_docstring_names_all_adopters():
+    """The module docstring is where a new reader learns who makes the
+    startup call; a list that stops at gw_jax sends the other six back to
+    ``bootstrap()``.  Module-path spelling (``gw.gw_jax``)."""
+    doc = ast.get_docstring(_tree(_read("runtime/__init__.py"), "runtime"))
+    assert doc is not None
+    for relpath in _STARTUP_DRIVERS:
+        modpath = relpath[:-3].replace("/", ".")
+        assert modpath in doc, (
+            "runtime docstring no longer names adopter %s" % modpath)
+
+
 # ===========================================================================
 # R2 — bse_io must refuse a mesh this process owns no device on
 # ===========================================================================

@@ -41,7 +41,7 @@ from common.collectives import (
 
 # The centroid geometry is fp64 throughout: a fractional coordinate has to
 # resolve 1/N_fft of a lattice vector, and the Lloyd movement tolerance is
-# 5e-3 Angstrom.  ``runtime.bootstrap()`` already exports JAX_ENABLE_X64=1
+# 5e-3 Angstrom.  The drivers' startup call already exports JAX_ENABLE_X64=1
 # for every driver; this covers a bare ``import centroid.<...>`` that did
 # not go through it.
 config.update("jax_enable_x64", True)

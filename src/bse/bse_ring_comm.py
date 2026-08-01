@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover - older JAX
     _shard_map_fn = _shard_map_mod.shard_map
 
 import common.timing as timing
-from common.collectives import prepare_mesh
+from common.collectives import prepare_mesh, resolve_mesh
 from common.contract_bands import contract_bands_block_reshard
 from common.fft_helpers import (
     local_fftn3,
@@ -70,8 +70,20 @@ def create_mesh_xy(px: int, py: int, devices: Optional[list] = None) -> Mesh:
     if px * py > len(devices):
         raise ValueError(
             f"Requested px*py={px*py} devices, only {len(devices)} available")
-    mesh = Mesh(np.array(devices[: px * py]).reshape(px, py),
-                axis_names=("x", "y"))
+    # Reuse the run's canonical mesh when the request IS that mesh: since
+    # the BSE drivers start with ``runtime.initialize_communicator_stack``
+    # (2026-08-01), the most-square ('x','y') mesh already exists — an
+    # equal-but-distinct copy here would be a second set of communicators
+    # and a second copy of every shape-keyed jit cache (the
+    # ``collectives.single_device_mesh`` identity contract).  A different
+    # requested shape is a deliberate second mesh and is built as before.
+    canonical = resolve_mesh(axis_names=("x", "y"))
+    if (tuple(int(n) for n in canonical.devices.shape) == (px, py)
+            and list(canonical.devices.flat) == list(devices[: px * py])):
+        mesh = canonical
+    else:
+        mesh = Mesh(np.array(devices[: px * py]).reshape(px, py),
+                    axis_names=("x", "y"))
     # resolve_mesh (pass-through here) + warm_mesh_cliques + nccl_warmup.
     mesh = prepare_mesh(mesh)
     _warm_process_allgather(mesh)

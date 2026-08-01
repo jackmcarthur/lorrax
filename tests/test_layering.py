@@ -386,8 +386,9 @@ _DRIVER_PLUMBING_BUDGET = {
     # ``jax.sharding`` + ``jax.experimental.shard_map`` at :18-19.  Same
     # shape, larger: htransform is the H-matrix interpolation LIBRARY with a
     # CLI bolted on, and its Galerkin solve is written in ``shard_map``.  Its
-    # hand-rolled ``_build_mesh_xy`` is gone (2026-07-31) — it calls
-    # ``collectives.resolve_mesh`` — so the residue is the kernel half only.
+    # hand-rolled ``_build_mesh_xy`` is gone (2026-07-31; since 2026-08-01 it
+    # hands back the mesh ``initialize_communicator_stack`` built) — so the
+    # residue is the kernel half only.
     "bandstructure.htransform": 2,
     # One ``from jax.sharding import ...`` each.  The four BSE CLIs also
     # default ``--px/--py`` to 1 and slice ``devices[:px*py]``, so on 16

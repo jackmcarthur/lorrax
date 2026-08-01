@@ -76,13 +76,16 @@ from functools import partial
 
 import numpy as np
 
-# LORRAX distributed bootstrap — SINGLE-SOURCED in runtime.bootstrap()
-# (env defaults + SLURM-aware ``jax.distributed.initialize`` + CPU
-# fallback; idempotent, no-ops in single-process runs).  Must run BEFORE
-# this module's own ``import jax`` and any ``jax.devices()`` / mesh
-# creation so a multi-node srun yields the full global device set.
-from runtime import bootstrap
-bootstrap()
+# THE startup call (runtime module docstring): env defaults, SLURM-aware
+# ``jax.distributed.initialize``, CPU fallback, the run's clique-warmed
+# most-square ('x','y') mesh, compile cache, rank-0 report.  Must run
+# BEFORE this module's own ``import jax`` and any ``jax.devices()`` /
+# mesh creation so a multi-node srun yields the full global device set.
+# This driver names ``--px/--py``; ``_create_mesh_xy(px, py)`` in main()
+# reuses the startup mesh when the requested shape matches it and builds
+# (and warms) the requested one when it does not.
+from runtime import initialize_communicator_stack
+RUNTIME = initialize_communicator_stack()
 
 import jax
 import jax.numpy as jnp
@@ -521,7 +524,7 @@ def main(argv=None):
     def tick(name, t0):
         timers[name] = timers.get(name, 0.0) + (time.time() - t0)
 
-    # Work done BEFORE main(): this module's ``bootstrap()`` and every import
+    # Work done BEFORE main(): this module's ``initialize_communicator_stack()`` and every import
     # under it.  75.0 s to first output on a cold Frontera node vs 2.1 s warm
     # (job 7881949), and previously outside the table's clock entirely, so the
     # printed TOTAL could be a minute short of the job's own wall.
@@ -568,7 +571,7 @@ def main(argv=None):
                          "the exciton Q path comes from it (same format as "
                          "the htransform bandstructure driver)")
 
-    # Everything above — bootstrap, jax.distributed, mesh creation and its
+    # Everything above — the startup call, jax.distributed, mesh creation and its
     # MPI clique warm-up, the input parse — is the driver prologue.  Named
     # rather than left in the residual: at P=16 ``jax.distributed`` init alone
     # measured 43.8 s, and on a cold node the software stack boots off Lustre

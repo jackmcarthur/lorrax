@@ -5,13 +5,16 @@ import os
 import sys
 import time
 
-# Ensure x64 + jax.distributed bootstrap before any jax-collective code
-# (the ring matvec uses lax.psum/ppermute on the 2D mesh, which is silent-
-# wrong if processes don't agree on a shared distributed runtime).
-# Single-sourced in runtime.bootstrap() (env defaults + jax.distributed
-# init + CPU fallback); MUST run before this module's own `import jax`.
-from runtime import bootstrap
-bootstrap()
+# THE startup call (runtime module docstring) before any jax-collective
+# code: env defaults (x64), jax.distributed (the ring matvec uses
+# lax.psum/ppermute on the 2D mesh, which is silent-wrong if processes
+# don't agree on a shared distributed runtime), CPU fallback, the run's
+# clique-warmed most-square ('x','y') mesh, compile cache, rank-0 report.
+# MUST run before this module's own `import jax`.  ``create_mesh_2d()``
+# below returns this same startup mesh (plus the BSE-specific
+# process_allgather warm-up bse_ring_comm documents).
+from runtime import initialize_communicator_stack
+RUNTIME = initialize_communicator_stack()
 
 import jax
 import jax.numpy as jnp
@@ -131,7 +134,7 @@ def _preview_lanczos(
     _pre_main = timing.process_elapsed_s()
     timing.reset()
     if _pre_main is not None:
-        # Imports + the runtime bootstrap + ``jax.distributed`` — the cold
+        # Imports + the runtime startup call + ``jax.distributed`` — the cold
         # start (75.0 s cold vs 2.1 s warm, job 7881949).  It happens before
         # this function and so is invisible to any timer inside it.  Recorded
         # FIRST so it appears first: the table's row order is insertion order,

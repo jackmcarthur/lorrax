@@ -4,11 +4,13 @@ import math
 import argparse
 import numpy as np
 
-# Canonical JAX GPU/CPU bootstrap — single-sourced in runtime.bootstrap()
-# (env defaults + jax.distributed init + CPU fallback; all idempotent).
-# MUST run before this module's own `import jax`.
-from runtime import bootstrap
-bootstrap()
+# THE startup call (runtime module docstring): env defaults, fail-fast
+# hook, jax.distributed, CPU fallback, the run's clique-warmed ('x','y')
+# mesh, compile cache, rank-0 report.  MUST run before this module's own
+# `import jax`; idempotent, so importing htransform as a LIBRARY from an
+# already-started driver (bse.exciton_bands does) returns the same stack.
+from runtime import initialize_communicator_stack
+RUNTIME = initialize_communicator_stack()
 
 import jax
 import jax.numpy as jnp
@@ -39,30 +41,23 @@ from common.sharding_fit import padded_extent as _pad_to
 
 
 def _build_mesh_xy() -> Mesh:
-    """Most-square 2D ('x','y') mesh — from the service, not hand-rolled.
+    """The run's ('x','y') mesh — the one the module-top startup call built.
 
-    This was seven lines re-typing ``collectives.resolve_mesh``'s body, and
-    it was one of the five mesh dialects the 2026-07-30 API-linkage audit
-    catalogued: it sized the grid from ``process_count() * local_device_count()``
-    while ``gw.kin_ion_io`` used ``jax.device_count()`` and
-    ``common.eigh_block_sweep`` used ``process_count()`` alone.  Those agree
-    only because Frontera runs one device per process.
-
-    The one behavioural difference is a gain: ``resolve_mesh`` puts the
-    result through ``_require_addressable``, so a mesh this process cannot
-    compute on is refused BY NAME here rather than surfacing as a bare
-    ``StopIteration`` inside a jit several layers down.
-
-    ``prepare_mesh``, not ``resolve_mesh``: the warm-up-contract question is
-    answered by measurement.  Without the clique warm-up this driver's first
-    collective fires from an XLA parallel-executor worker thread and jaxlib
-    refuses communicator creation (MPI_Is_thread_main false) — P=16 job
-    7884867 failed on all 16 ranks at the first ``load_centroids`` collective
-    and needed the LORRAX_MPI_FORCE_THREAD_MAIN fallback; with the warm-up
-    the fallback is unnecessary.
+    History, shortest form: this was seven lines hand-rolling a mesh (one of
+    five dialects, 2026-07-30 audit), then ``resolve_mesh``, then
+    ``prepare_mesh`` once measurement answered the warm-up question — without
+    the clique warm-up this driver's first collective fires from an XLA
+    parallel-executor worker thread and jaxlib refuses communicator creation
+    (MPI_Is_thread_main false; P=16 job 7884867 failed on all 16 ranks at the
+    first ``load_centroids`` collective).  Since 2026-08-01 the mesh and its
+    warm-up come from ``initialize_communicator_stack()`` at the top of this
+    module, so this helper only hands back ``RUNTIME.mesh`` for the library
+    callers (``initialize_wfns`` with ``mesh_xy=None``) that resolve the mesh
+    late.  A second ``prepare_mesh()`` here would be a second Mesh object —
+    a second set of communicators and a second copy of every shape-keyed jit
+    cache.
     """
-    from common.collectives import prepare_mesh
-    return prepare_mesh(axis_names=('x', 'y'))
+    return RUNTIME.mesh
 
 
 _accum_G_cache: dict = {}

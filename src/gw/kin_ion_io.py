@@ -60,14 +60,16 @@ Usage:
 import os
 
 # ---- join the distributed world BEFORE anything touches XLA ------------
-# ``jax.distributed.initialize()`` refuses to run once the XLA backend is
-# up, and the import graph below (``psp.*``) reaches jax.  ``runtime``
-# itself imports no jax, and every piece of ``bootstrap()`` is idempotent
-# through an env sentinel — which is what makes this safe under
+# THE startup call (runtime module docstring): env defaults, fail-fast
+# hook, jax.distributed, CPU fallback, the run's clique-warmed ('x','y')
+# mesh, compile cache, rank-0 report.  ``jax.distributed.initialize()``
+# refuses to run once the XLA backend is up, and the import graph below
+# (``psp.*``) reaches jax; ``runtime`` itself imports no jax, and the call
+# is idempotent — which is what makes this safe under
 # ``gw.sigma_dispatch``'s LAZY import of this module from inside an
-# already-bootstrapped driver: there the calls are all no-ops.
-from runtime import bootstrap                                 # noqa: E402
-bootstrap()          # env defaults + jax.distributed + CPU fallback + failfast
+# already-started driver: there it returns the existing stack.
+from runtime import initialize_communicator_stack             # noqa: E402
+RUNTIME = initialize_communicator_stack()
 
 import argparse                                               # noqa: E402
 
@@ -77,7 +79,7 @@ import h5py
 
 from common import symmetry_maps, Meta
 from common.collectives import (barrier, device_count, gather_k_blocks,
-                                local_share, prepare_mesh, process_rank_world,
+                                local_share, process_rank_world,
                                 psum_replicate, resolve_mesh)
 from common.wfn_transforms import load_kpoint_fftbox_local
 import common.timing as timing
@@ -675,13 +677,14 @@ def main(argv=None):
     # SAME Coulomb convention as V_loc above (``ctx.truncation_2d``, i.e.
     # the deck's sys_dim) — which is also QE's, since the DFT run that
     # produced E_DFT/vxc.dat used ``assume_isolated='2D'`` for a slab.
-    # ``prepare_mesh`` also pays the communicator-bootstrap cost once, up
-    # front, instead of inside the ρ psum.  Measured on Frontera/Gloo at
-    # P=4: the FIRST collective of a run costs ~12 s of topology exchange
-    # and the second costs microseconds, so without it the 1.4 MB
-    # all-reduce looks like 70 % of the kernel and the strong-scaling
-    # numbers are measuring the transport's handshake.
-    mesh_xy = prepare_mesh(print_fn=print0)
+    # ``RUNTIME.mesh`` was built and clique-warmed by the module-top
+    # ``initialize_communicator_stack()``, so the communicator-bootstrap
+    # cost is paid once, up front, instead of inside the ρ psum.  Measured
+    # on Frontera/Gloo at P=4: the FIRST collective of a run costs ~12 s of
+    # topology exchange and the second costs microseconds, so without it
+    # the 1.4 MB all-reduce looks like 70 % of the kernel and the
+    # strong-scaling numbers are measuring the transport's handshake.
+    mesh_xy = RUNTIME.mesh
     v_h_all = None
     if args.hartree:
         with timing.section("build_V_H"):

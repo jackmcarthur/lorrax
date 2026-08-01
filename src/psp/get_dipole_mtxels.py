@@ -17,27 +17,27 @@ import functools
 import time
 from pathlib import Path
 
-os.environ.setdefault("JAX_ENABLE_X64", "1")
+# THE startup call (runtime module docstring), before any device is
+# touched.  Two of its steps used to be called here by name and the rest
+# were skipped.  Without ``jax.distributed`` every rank of a multi-process
+# launch is its own single-process job: ``jax.process_count()`` reads 1
+# everywhere, so ``collectives.local_share`` hands EVERY rank the whole
+# k list and the closing ``gather_indexed_blocks`` never runs — P ranks
+# each do the whole sweep and write the same file.  Without the mesh
+# clique warm-up that gather dies at P>1 under impl=mpi when its
+# communicator is first created from an XLA pool thread (job 7884867
+# class).  The startup call does both, in the right order, above jax.
+from runtime import initialize_communicator_stack
+RUNTIME = initialize_communicator_stack()
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 
-from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
-
-# Must run before any device is touched.  Without it every rank of a
-# multi-process launch is its own single-process job: ``jax.process_count()``
-# reads 1 everywhere, so ``collectives.local_share`` hands EVERY rank the whole
-# k list and the closing ``gather_indexed_blocks`` never runs — P ranks each do
-# the whole sweep and write the same file.  No-op when there is a single
-# process, so single-node/Perlmutter behaviour is unchanged.
-init_jax_distributed()
-fallback_to_cpu_if_no_gpu_backend()
-
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps
 from common import timing
-from common.collectives import barrier, gather_k_blocks, prepare_mesh
+from common.collectives import barrier, gather_k_blocks
 from common.wfn_transforms import load_kpoint_fftbox_local
 from common import Meta
 from gw.gw_config import read_lorrax_input as read_cohsex_input
@@ -716,10 +716,10 @@ def main(argv=None):
 	print("\nCreating system metadata...")
 	meta = Meta.from_system(wfn, sym, nval, ncond, nband, 0, bispinor)
 
-	# Warm every communicator the closing gather will use, once, from the
-	# main thread (mandatory under impl=mpi).  The mesh itself is not needed
+	# Every communicator the closing gather will use was warmed by the
+	# module-top ``initialize_communicator_stack()`` (mandatory under
+	# impl=mpi, from the main thread).  The mesh itself is not needed
 	# below: nothing in this driver holds a globally-sharded array any more.
-	prepare_mesh()
 
 	# Ensure we load enough conduction bands for debug/output comparisons.
 	# ψ is NOT loaded here — see the k sweep below.
