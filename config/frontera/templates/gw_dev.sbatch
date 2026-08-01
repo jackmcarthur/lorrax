@@ -160,6 +160,9 @@ echo "===================== KEY BANNERS ====================="
 grep -aE "libfabric provider|cpu_collectives|collectives|\[stage\]|\[mpi_transport_env\]|SlabIO|restart_write|Backend:|device mesh|TIER resolved|WARN|Error|Traceback|gap|eqp0" \
     "$LORRAX_RUN_DIR/gw_dev.$SLURM_JOB_ID.log" | head -60
 echo "===================== STAGE TABLE ====================="
-sed -n '/Timing summary/,$p' "$LORRAX_RUN_DIR/gw_dev.$SLURM_JOB_ID.log" | head -80
+# gw_jax prints "--- Timing ---" (src/gw/gw_jax.py timing.report title); the
+# old '/Timing summary/' anchor — inherited from the archived harness — never
+# matched, so this capture was silently empty (found 2026-07-31 valsmoke).
+sed -n '/--- Timing ---/,$p' "$LORRAX_RUN_DIR/gw_dev.$SLURM_JOB_ID.log" | head -80
 echo "=== done $(date) ==="
 exit $RC
