@@ -994,6 +994,104 @@ def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None):
     return quad_imag
 
 
+def _lawson_weights_fit(tau, f_x, x, n_iter: int = 60):
+    """Weights-only sup-norm fit of ``f(x) ≈ Σ α_l exp(-τ_l x)``.
+
+    Lawson's algorithm (iteratively reweighted least squares whose weights
+    converge toward the L∞ solution) with column scaling for conditioning.
+    Returns ``(alpha, max_err)`` — the best iterate by measured sup error.
+    Host-side numpy/LAPACK, deterministic for identical inputs — the same
+    per-rank replication contract the minimax solvers themselves rely on.
+    """
+    E = np.exp(-np.outer(x, tau))                  # (n_grid, L)
+    s = np.linalg.norm(E, axis=0)
+    s[s == 0.0] = 1.0
+    Es = E / s
+    w = np.ones(x.shape[0])
+    best_a, best_e = None, np.inf
+    for _ in range(int(n_iter)):
+        sw = np.sqrt(w)
+        a, *_ = np.linalg.lstsq(Es * sw[:, None], f_x * sw, rcond=None)
+        r = Es @ a - f_x
+        err = float(np.max(np.abs(r)))
+        if err < best_e:
+            best_a, best_e = a / s, err
+        w *= np.abs(r) + 1.0e-30
+        w /= w.sum()
+    return np.asarray(best_a, dtype=np.float64), best_e
+
+
+def refit_imag_alpha_augmented(quad, quad_dedicated, omega_p, *,
+                               gate_error: float, n_grid: int = 4096):
+    """Probe-χ₀ node plan for the reuse path (``ppm_probe_chi_reuse=auto``).
+
+    Represent ``x/(x²+ωp²)`` on the STATIC quadrature's τ nodes plus the
+    MINIMAL number of extra nodes, drawn greedily from the dedicated
+    imag-axis quadrature's own node set, such that the measured sup-norm
+    error meets ``gate_error``.  The probe χ₀ then reuses the static
+    sweep's per-node G-build/FFT/contraction tensors on every shared node
+    and only the ``k`` extras cost new compute.
+
+    Weights-only refits are NOT enough on their own: the probe integrand
+    is the Laplace transform of ``cos(ωp t)`` and the 1/x-minimax static
+    grid is far too coarse to resolve that oscillation in the τ tail
+    (measured 2.6e-4 sup error vs the dedicated solver's 1.3e-6 at the
+    b300 window, job 7885097) — hence the augmentation.
+
+    GUARANTEED to terminate acceptably: with ALL dedicated nodes appended,
+    the exact dedicated solution (its α on its nodes, zeros on the static
+    nodes) is in the feasible set and is installed verbatim whenever the
+    fitted candidate is worse.
+
+    Returns ``(tau_full, alpha_static_row, alpha_probe_row, k_extra,
+    max_err)``: the union node vector, the static weights zero-padded onto
+    it (row 0 of the fused sweep — zero-weight extras add exact zeros, so
+    the static accumulation is numerically the static quadrature), the
+    probe weights on it, the number of extra nodes, and the measured
+    sup-norm error of the probe representation.
+    """
+    x_min = float(quad.x_min)
+    x_max = float(quad.x_max)
+    omega_p = float(omega_p)
+    tau_s = np.asarray(quad.tau, dtype=np.float64)
+    tau_d = np.asarray(quad_dedicated.tau, dtype=np.float64)
+    alpha_d = np.asarray(quad_dedicated.alpha, dtype=np.float64)
+
+    x = np.geomspace(x_min, x_max, int(n_grid))
+    f_x = x / (x * x + omega_p * omega_p)
+
+    def _pack(extras_idx, alpha_probe, err):
+        k = len(extras_idx)
+        tau_full = np.concatenate([tau_s, tau_d[extras_idx]])
+        a_static = np.concatenate([
+            np.asarray(quad.alpha, dtype=np.float64), np.zeros(k)])
+        return tau_full, a_static, np.asarray(alpha_probe), int(k), float(err)
+
+    chosen: list = []
+    remaining = list(range(tau_d.shape[0]))
+    a_cur, e_cur = _lawson_weights_fit(tau_s, f_x, x)
+    while e_cur > float(gate_error) and remaining:
+        best = None
+        for c in remaining:
+            tau_try = np.concatenate([tau_s, tau_d[chosen + [c]]])
+            a_try, e_try = _lawson_weights_fit(tau_try, f_x, x)
+            if best is None or e_try < best[1]:
+                best = (c, e_try, a_try)
+        chosen.append(best[0])
+        remaining.remove(best[0])
+        a_cur, e_cur = best[2], best[1]
+
+    if e_cur > float(gate_error):
+        # All extras in and still above gate: install the exact dedicated
+        # embedding (zeros on static nodes, dedicated α on its own nodes)
+        # — same math as the dedicated pass, by construction.
+        chosen = list(range(tau_d.shape[0]))
+        alpha_probe = np.concatenate([np.zeros(tau_s.shape[0]), alpha_d])
+        return _pack(chosen, alpha_probe,
+                     float(quad_dedicated.max_error))
+    return _pack(chosen, a_cur, e_cur)
+
+
 def build_real_quadrature(quad, Omega, minimax_config, *, print_fn=None):
     """Build real-frequency (HL-PPM) χ₀(Ω) quadrature without a new minimax kernel.
 

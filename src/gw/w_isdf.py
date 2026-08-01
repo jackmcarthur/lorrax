@@ -50,18 +50,28 @@ _w_solve_cache: dict = {}
 # χ₀ kernel — minimax quadrature
 # ============================================================================
 
-def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
-    """Build chi0 kernel with device-local FFTs.  Returns flat-q χ₀(nq, μ, μ)."""
+def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
+                            n_out: int = 1):
+    """Build chi0 kernel with device-local FFTs.  Returns flat-q χ₀(nq, μ, μ).
+
+    ``n_out`` (static): number of χ outputs accumulated over the SAME τ
+    sweep.  ``n_out=1`` is the historical kernel, untouched.  ``n_out>=2``
+    (the probe-χ₀ reuse path, ``ppm_probe_chi_reuse=auto``) takes
+    ``nodes.alpha`` of shape ``(n_out, L)`` and returns an ``n_out``-tuple
+    of χ's — the per-τ G-build/FFT/contraction tensors are computed once
+    and each output is its own weighted accumulation.
+    """
     from common.fft_helpers import make_flat_k_fftn
 
     nkx, nky, nkz = kgrid
     nk = nkx * nky * nkz
+    n_out = int(n_out)
     # ffi_dial_key(): the make_flat_k_fftn factories below read
     # LORRAX_FFT_FFI at FACTORY time, so the dials must be part of this
     # cache key or a mid-process flag flip serves the stale backend
     # (flat-k FFT service contract, docs/dev/flat_k_fft_service.md).
     from ffi import ffi_dial_key
-    cache_key = (id(mesh_xy), kgrid, ffi_dial_key())
+    cache_key = (id(mesh_xy), kgrid, ffi_dial_key(), n_out)
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -135,10 +145,64 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
         return jnp.conj(Gv_k), jnp.conj(Gc_k)
 
     # MinimaxNodes pytree (t, alpha) — both replicated across devices.
+    # n_out>=2: alpha is (n_out, L); P() replicates every axis.
     _nodes_shard = MinimaxNodes(
         t=NamedSharding(mesh_xy, _rep1),
-        alpha=NamedSharding(mesh_xy, _rep1),
+        alpha=NamedSharding(mesh_xy, _rep1 if n_out == 1 else P()),
     )
+
+    if n_out >= 2:
+        _chi_R_out = tuple(_chi_R_shard for _ in range(n_out))
+
+        @partial(jax.jit,
+                 in_shardings=(_nodes_shard,
+                                NamedSharding(mesh_xy, _psi_xn_spec),
+                                NamedSharding(mesh_xy, _psi_yr_spec),
+                                NamedSharding(mesh_xy, _psi_yr_spec),
+                                NamedSharding(mesh_xy, _psi_xn_spec),
+                                NamedSharding(mesh_xy, _rep1),
+                                NamedSharding(mesh_xy, _rep1),
+                                NamedSharding(mesh_xy, _rep0),      # vmax
+                                NamedSharding(mesh_xy, _rep0)),     # cmin
+                 out_shardings=_chi_R_out,
+                 static_argnums=())
+        def minimax_tau_integrate_chi_multi(
+            nodes, psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
+            enk_v, enk_c, vmax, cmin,
+        ):
+            """n_out-output sibling of ``minimax_tau_integrate_chi``: ONE τ
+            sweep (identical per-node Gv/Gc + FFTs + contraction), n_out
+            weighted accumulators, one R→q FFT per output.  Bit-parity
+            with the single kernel is NOT contractual (different XLA
+            program); the consumer (probe-χ₀ reuse) is gated on the
+            quadrature-error contract instead."""
+            n_rmu = psi_v_xn.shape[2]
+            zero = jax.lax.with_sharding_constraint(
+                jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128),
+                _chi_R_shard)
+            acc0 = tuple(zero for _ in range(n_out))
+
+            def _body(accs, xs):
+                t_scalar, alpha_col = xs        # alpha_col: (n_out,)
+                tau_real = jnp.real(t_scalar).astype(jnp.float64)
+                Gv_k, Gc_k = _build_Gv_Gc(psi_v_xn, psi_v_yr,
+                                          psi_c_yr, psi_c_xn,
+                                          enk_v, enk_c, tau_real, vmax, cmin)
+                Gv_R = _Gv_fftn(Gv_k)
+                Gc_R = _Gc_fftn(Gc_k)
+                chi_tau = jax.lax.with_sharding_constraint(
+                    jnp.einsum('Rambn,Rambn->Rmn',
+                               Gc_R, jnp.conj(Gv_R), optimize=True),
+                    _chi_R_shard)
+                return tuple(a + alpha_col[i] * chi_tau
+                             for i, a in enumerate(accs)), None
+
+            final_R, _ = jax.lax.scan(
+                _body, acc0, (nodes.t, jnp.transpose(nodes.alpha)))
+            return tuple(_chi_fftn_local(f) for f in final_R)
+
+        _chi_minimax_kernel_cache[cache_key] = minimax_tau_integrate_chi_multi
+        return minimax_tau_integrate_chi_multi
 
     @partial(jax.jit,
              in_shardings=(_nodes_shard,
@@ -704,6 +768,77 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
         jnp.asarray(vmax, dtype=jnp.float64),
         jnp.asarray(cmin, dtype=jnp.float64),
     )
+
+
+def _chi0_multi_kernel_args(wfns, tau, alpha_rows, energy_reference):
+    """Shared host prep for the multi-output χ₀ paths (compute + precompile).
+
+    ``tau``: (L,) node vector (the fused static∪extra union on the probe-
+    reuse path).  ``alpha_rows``: (n_out, L) RAW quadrature weights, one
+    row per output, all on ``tau``.  Row 0 is normally the static weights
+    (zero-padded onto any extra nodes — zero-weight nodes add exact
+    zeros); further rows are probe representations on the same nodes.
+    The χ₀ prefactor ``-2·exp(-τ·E_gap)`` folds into every row exactly as
+    the single-output path folds it into its one α vector.
+    """
+    s = wfns.slices
+    enk_v = wfns.enk[:, s.val]
+    enk_c = wfns.enk[:, s.cond]
+    eref = 0.0 if energy_reference is None else float(energy_reference)
+    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64) - eref
+    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64) - eref
+    vmax = float(np.max(enk_v_host))
+    cmin = float(np.min(enk_c_host))
+    E_gap = cmin - vmax
+    tau = np.asarray(tau, dtype=np.float64)
+    alpha_rows = np.asarray(alpha_rows, dtype=np.float64)
+    if alpha_rows.ndim != 2 or alpha_rows.shape[1] != tau.shape[0]:
+        raise ValueError(
+            f"chi0 multi: alpha_rows shape {alpha_rows.shape} does not "
+            f"match tau nodes ({tau.shape[0]},) — every row must be a "
+            f"weight vector on quad.tau.")
+    alpha_chi = -2.0 * alpha_rows * np.exp(-tau * E_gap)[None, :]
+    nodes = MinimaxNodes(
+        t=jnp.asarray(tau, dtype=jnp.complex128),
+        alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
+    )
+    args = (
+        nodes,
+        wfns.xn(s.val), wfns.yr(s.val),
+        wfns.yr(s.cond), wfns.xn(s.cond),
+        enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
+        enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
+        jnp.asarray(vmax, dtype=jnp.float64),
+        jnp.asarray(cmin, dtype=jnp.float64),
+    )
+    return args, alpha_rows.shape[0]
+
+
+def compute_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
+                       energy_reference=0.0):
+    """χ₀ at several weight vectors over ONE τ sweep — see
+    ``_get_chi_minimax_kernel(n_out>=2)``.  Returns an ``n_out``-tuple of
+    flat-q (nq, μ, μ) arrays, one per row of ``alpha_rows``."""
+    ensure_jax_compile_cache()
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    args, n_out = _chi0_multi_kernel_args(
+        wfns, tau, alpha_rows, energy_reference)
+    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, n_out=n_out)
+    return kernel(*args)
+
+
+def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
+                          energy_reference=None):
+    """AOT lower+compile sibling of :func:`precompile_chi0` for the
+    multi-output kernel."""
+    ensure_jax_compile_cache()
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    if len(np.asarray(tau)) == 0:
+        return
+    args, n_out = _chi0_multi_kernel_args(
+        wfns, tau, alpha_rows, energy_reference)
+    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, n_out=n_out)
+    kernel.lower(*args).compile()
 
 
 def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):

@@ -143,7 +143,9 @@ def compute_static_w(
     role: str = "static",
     force_full_bz: bool = False,
     section: str = "chi0_W",
-) -> jax.Array:
+    fused_probe_chi=None,
+    chi0_override: jax.Array | None = None,
+):
     """W = (1 − Vχ₀)⁻¹V on the full BZ, solved on the IBZ wedge when legal.
 
     One cadence for EVERY W role: AOT compile split (chi.compile /
@@ -189,11 +191,27 @@ def compute_static_w(
     section
         Timing/trace node name — ``chi0_W`` (static) or ``chi0_W_probe``,
         so the two roles keep separate rows in the end-of-run stage table.
+    fused_probe_chi
+        Probe-χ₀ reuse (``ppm_probe_chi_reuse=auto``): a tuple
+        ``(tau_full, alpha_static_row, alpha_probe_row)`` from
+        ``minimax_screening.refit_imag_alpha_augmented``.  The χ build
+        runs the multi-output kernel over ``tau_full`` — ONE τ sweep, two
+        accumulators — and the function returns ``(W_q, chi0_probe_q)``
+        with ``chi0_probe_q`` the full-BZ probe χ₀ (never IBZ-sliced,
+        never donated here).  Row 0 is the static weights zero-padded
+        onto the extra nodes, so the static χ is numerically the static
+        quadrature.
+    chi0_override
+        Skip the χ build entirely and use this precomputed full-BZ χ₀
+        (the probe role consuming the reused χ).  Mutually exclusive with
+        ``fused_probe_chi``.  The override buffer IS donated into the
+        Dyson solve, matching the computed-χ contract.
 
     Returns
     -------
     W_q : (nq_full, μ, μ) jax.Array
         Screened Coulomb on the full BZ, ``P(None, 'x', 'y')``.
+        With ``fused_probe_chi``: ``(W_q, chi0_probe_q)``.
     """
     from .w_isdf import (
         compute_chi0,
@@ -265,18 +283,56 @@ def compute_static_w(
             # buffer.  Do NOT use ``_chi_sec.watch(...)`` here — it
             # keeps a bound ``block_until_ready`` method alive on the
             # section object past W-solve, which blocks donation.
-            with timing.section("chi.compile", announce=True,
-                                label=f"{_w} chi0 compile"):
-                precompile_chi0(wfns, quad, meta, mesh_xy,
-                                energy_reference=e_ref)
-            with timing.section(
-                    "chi.exec", announce=True,
-                    label=f"{_w} chi0 build "
-                          f"({len(np.asarray(quad.tau))} tau nodes, "
-                          f"{int(meta.nk_tot)} q, mu={_mu})"):
-                chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
-                                      energy_reference=e_ref)
-                chi0_q.block_until_ready()
+            if chi0_override is not None and fused_probe_chi is not None:
+                raise ValueError(
+                    "compute_static_w: chi0_override and fused_probe_chi "
+                    "are mutually exclusive.")
+            chi0_extra_q = None
+            if chi0_override is not None:
+                # Probe-χ₀ reuse consumer: the χ was accumulated inside the
+                # static role's τ sweep.  Announced row keeps the stage
+                # table honest about where the probe's χ time went.
+                with timing.section(
+                        "chi.reused", announce=True,
+                        label=f"{_w} chi0 REUSED from the static tau sweep "
+                              f"(ppm_probe_chi_reuse)"):
+                    chi0_q = chi0_override
+            elif fused_probe_chi is not None:
+                from .w_isdf import compute_chi0_multi, precompile_chi0_multi
+                _tau_full, _a_static, _a_probe = fused_probe_chi
+                _alpha_rows = np.stack([
+                    np.asarray(_a_static, dtype=np.float64),
+                    np.asarray(_a_probe, dtype=np.float64)])
+                _n_static = int(np.asarray(quad.tau).shape[0])
+                _n_full = int(np.asarray(_tau_full).shape[0])
+                with timing.section("chi.compile", announce=True,
+                                    label=f"{_w} chi0 compile (dual-output)"):
+                    precompile_chi0_multi(wfns, _tau_full, _alpha_rows, meta,
+                                          mesh_xy, energy_reference=e_ref)
+                with timing.section(
+                        "chi.exec", announce=True,
+                        label=f"{_w} chi0 build "
+                              f"({_n_static}+{_n_full - _n_static} tau "
+                              f"nodes, {int(meta.nk_tot)} q, mu={_mu}, "
+                              f"fused probe accumulator)"):
+                    chi0_q, chi0_extra_q = compute_chi0_multi(
+                        wfns, _tau_full, _alpha_rows, meta, mesh_xy,
+                        energy_reference=e_ref)
+                    chi0_q.block_until_ready()
+                    chi0_extra_q.block_until_ready()
+            else:
+                with timing.section("chi.compile", announce=True,
+                                    label=f"{_w} chi0 compile"):
+                    precompile_chi0(wfns, quad, meta, mesh_xy,
+                                    energy_reference=e_ref)
+                with timing.section(
+                        "chi.exec", announce=True,
+                        label=f"{_w} chi0 build "
+                              f"({len(np.asarray(quad.tau))} tau nodes, "
+                              f"{int(meta.nk_tot)} q, mu={_mu})"):
+                    chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
+                                          energy_reference=e_ref)
+                    chi0_q.block_until_ready()
             # IBZ slice on V_q and χ₀_q.  Both retain the canonical
             # ``P(None, 'x', 'y')`` sharding; the helper locks it in.
             if use_ibz_w:
@@ -333,6 +389,8 @@ def compute_static_w(
                     W_q.block_until_ready()
             else:
                 W_q = W_q_solve
+    if fused_probe_chi is not None:
+        return W_q, chi0_extra_q
     return W_q
 
 
@@ -378,6 +436,7 @@ def compute_screening(
     from .minimax_screening import (
         build_imag_quadrature,
         build_real_quadrature,
+        refit_imag_alpha_augmented,
     )
 
     from common.progress import LoopProgress
@@ -390,6 +449,53 @@ def compute_screening(
     # that.  (audit fix/zq 2026-07-28)
     if not requests:
         return W_by_role
+    # ── Probe-χ₀ reuse planning (``ppm_probe_chi_reuse=auto``) ─────────
+    # GN probes only (single imag-axis request + a static request): plan
+    # the probe χ₀ on the STATIC quadrature's τ nodes plus the minimal
+    # augmentation from the dedicated probe quadrature's node set
+    # (``refit_imag_alpha_augmented`` — weights-only refits alone plateau
+    # ~1e-4 because the probe integrand is the Laplace transform of
+    # cos(ωp·t), which the 1/x static grid cannot resolve in the τ tail;
+    # measured, job 7885097).  The probe χ₀ then accumulates as a second
+    # weighted sum inside ONE fused τ sweep — every shared node's
+    # G-build/FFT/contraction tensors are computed once for both
+    # frequencies, and only the k extras cost new compute (scorecard BC:
+    # the dedicated probe pass duplicated ~40% of the screening stage).
+    # Same quadrature-error contract, different bits — hence
+    # deck-key-gated, default off (gw_config).
+    fused_plan = None
+    chi0_probe_reused = None
+    _reuse_mode = str(getattr(config.ppm, "probe_chi_reuse", "off"))
+    if _reuse_mode == "auto":
+        _imag_probes = [
+            r for r in requests
+            if r.role != "static"
+            and abs(complex(r.omega_ry).imag) > 0.0
+            and abs(complex(r.omega_ry).real) == 0.0]
+        _has_static = any(r.role == "static" for r in requests)
+        if len(_imag_probes) == 1 and _has_static:
+            _wp = abs(complex(_imag_probes[0].omega_ry).imag)
+            _quad_ded = build_imag_quadrature(
+                quad, _wp, config.minimax_config, print_fn=print_fn)
+            _target = float(config.minimax_config.target_error)
+            _gate = max(float(_quad_ded.max_error), _target)
+            _tau_full, _a_static, _a_probe, _k, _err = \
+                refit_imag_alpha_augmented(
+                    quad, _quad_ded, _wp, gate_error=_gate)
+            fused_plan = (_tau_full, _a_static, _a_probe)
+            _n_s = int(np.asarray(quad.tau).shape[0])
+            _n_d = int(np.asarray(_quad_ded.tau).shape[0])
+            print_fn(
+                f"  probe chi0 reuse (ppm_probe_chi_reuse=auto): fused "
+                f"sweep = {_n_s} static + {_k} extra nodes (dedicated "
+                f"pass would cost {_n_d}); probe representation err "
+                f"{_err:.1e} vs dedicated {_quad_ded.max_error:.1e} "
+                f"(gate {_gate:.1e}).")
+        elif len(requests) > 1:
+            print_fn(
+                "  probe chi0 reuse (ppm_probe_chi_reuse=auto): no single "
+                "imag-axis probe request (HL/real-axis probes always take "
+                "the dedicated path) — reuse inactive.")
     # Bar/ETA cadence over the W roles; every phase inside announces
     # itself via ``timing.section(..., announce=True)`` (see the stage
     # cadence note at the top of this module).
@@ -399,11 +505,18 @@ def compute_screening(
     for req in requests:
         _w = f"W[{req.role}]"
         if req.role == "static":
-            W_static = compute_static_w(
-                wfns, V_q, quad, e_ref=e_ref,
-                sym=sym, centroid_indices=centroid_indices,
-                config=config, meta=meta, mesh_xy=mesh_xy,
-                role=req.role)
+            if fused_plan is not None:
+                W_static, chi0_probe_reused = compute_static_w(
+                    wfns, V_q, quad, e_ref=e_ref,
+                    sym=sym, centroid_indices=centroid_indices,
+                    config=config, meta=meta, mesh_xy=mesh_xy,
+                    role=req.role, fused_probe_chi=fused_plan)
+            else:
+                W_static = compute_static_w(
+                    wfns, V_q, quad, e_ref=e_ref,
+                    sym=sym, centroid_indices=centroid_indices,
+                    config=config, meta=meta, mesh_xy=mesh_xy,
+                    role=req.role)
             with timing.section("W.gate", announce=True,
                                 label=f"{_w} finiteness + hermiticity gate"):
                 _gate_w(W_static, req, print_fn=print_fn)
@@ -417,6 +530,25 @@ def compute_screening(
             raise ValueError(
                 f"compute_screening: complex-axis ω={req.omega_ry!r} "
                 f"not supported — ω must be pure real or pure imag.")
+        if on_imag and chi0_probe_reused is not None:
+            # Probe-χ₀ reuse: the χ was accumulated inside the static
+            # role's τ sweep above (requests are static-first by
+            # construction).  Same cadence function, χ phase replaced by
+            # the announced ``chi.reused`` row; the Dyson solve keeps the
+            # frozen-golden full-BZ route unchanged.
+            W = compute_static_w(
+                wfns, V_q, quad, e_ref=e_ref,
+                sym=sym, centroid_indices=centroid_indices,
+                config=config, meta=meta, mesh_xy=mesh_xy,
+                role=req.role, force_full_bz=True, section="chi0_W_probe",
+                chi0_override=chi0_probe_reused)
+            chi0_probe_reused = None   # donated into solve_w — dead ref
+            with timing.section("W.gate", announce=True,
+                                label=f"{_w} finiteness + hermiticity gate"):
+                _gate_w(W, req, print_fn=print_fn)
+            W_by_role[req.role] = W
+            bar.step()
+            continue
         if on_imag:
             quad_used = build_imag_quadrature(
                 quad, abs(req.omega_ry.imag),
