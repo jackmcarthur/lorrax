@@ -163,7 +163,9 @@ template <typename T>
 static ffi::Error TrsmImpl(
     int64_t n, int64_t m, int64_t nb,
     int side_int, int uplo_int, int op_int, int diag_int,
-    double alpha_re, double alpha_im,
+    // maybe_unused: read only in the complex branch of the constexpr-if
+    // below; the T=double instantiation discards it.
+    double alpha_re, [[maybe_unused]] double alpha_im,
     lorrax_ffi::slate::SlateCtx* ctx,
     const T* A_in,
     const T* B_in,
@@ -499,7 +501,8 @@ template <typename T>
 static ffi::Error BatchedTrsmImpl(
     int64_t nbatch_local, int64_t n, int64_t m, int64_t nb,
     int side_int, int uplo_int, int op_int, int diag_int,
-    double alpha_re, double alpha_im,
+    // maybe_unused: read only in the complex branch (see TrsmImpl).
+    double alpha_re, [[maybe_unused]] double alpha_im,
     lorrax_ffi::slate::SlateCtx* ctx,
     const T* A_in,
     const T* B_in,

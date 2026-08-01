@@ -361,7 +361,14 @@ inline void scalapack_announce_slate_api(const char* op, const char* name) {
 //  moment a port misbehaves it is the first question worth asking.
 // ---------------------------------------------------------------------------
 inline void scalapack_log_providers_once() {
-    if (!lorrax_ffi::mklpin::log_here("LORRAX_SCALAPACK_PROVIDER_LOG")) return;
+    // Resolved ONCE per process: this runs on EVERY handler dispatch (via
+    // scalapack_slate_api_refusal), and the knob is a process-lifetime env
+    // fact like every other knob in this header (the waiver above, the
+    // thread pin below) — re-reading the environment per solve bought
+    // nothing but a getenv on the hot path (2026-08-01 seam-audit leftover).
+    static const bool enabled =
+        lorrax_ffi::mklpin::log_here("LORRAX_SCALAPACK_PROVIDER_LOG");
+    if (!enabled) return;
     static std::once_flag once;
     std::call_once(once, [] {
         static const char* kNames[] = {

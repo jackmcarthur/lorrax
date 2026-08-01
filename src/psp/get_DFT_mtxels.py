@@ -170,6 +170,31 @@ def spin_degeneracy_factor(wfn) -> float:
     return 1.0
 
 
+@partial(jax.jit, static_argnames=("nocc",))
+def _valence_density_kernel(
+    psi_k_box: jnp.ndarray,
+    weight: jnp.ndarray,
+    cell_volume: jnp.ndarray,
+    spin_degeneracy: jnp.ndarray,
+    *,
+    nocc: int | None,
+) -> jnp.ndarray:
+    """Jitted body of :func:`valence_density_from_kpoint`.
+
+    ``nocc`` is static (it fixes the slice shape); the three scalars are
+    traced operands so the per-k sweep with varying ``weight`` reuses ONE
+    compiled module per box shape instead of dispatching ~17 eager 1-op
+    modules per call (scorecard §BE).
+    """
+    nx, ny, nz = psi_k_box.shape[-3:]
+    ngrid = int(nx) * int(ny) * int(nz)
+    scale = jnp.sqrt(jnp.asarray(float(ngrid), dtype=jnp.float64) / cell_volume)
+    psi_occ = psi_k_box if nocc is None else psi_k_box[: int(nocc)]
+    psi_r = jnp.fft.ifftn(psi_occ, axes=(-3, -2, -1), norm='ortho') * scale
+    return (weight * spin_degeneracy) * jnp.sum(
+        jnp.real(jnp.conj(psi_r) * psi_r), axis=(0, 1))
+
+
 def valence_density_from_kpoint(
     psi_k_box: jnp.ndarray,
     *,
@@ -199,16 +224,15 @@ def valence_density_from_kpoint(
     all-k-resident :func:`compute_valence_density`, the chunked per-k
     CLI and the k/band-partitioned distributed sweep
     (``gw.kin_ion_io.build_valence_density_distributed``) all go
-    through this one function.
+    through this one function.  The arithmetic runs in ONE jitted module
+    (:func:`_valence_density_kernel`; ``nocc`` static, scalars traced).
     """
-    nx, ny, nz = psi_k_box.shape[-3:]
-    ngrid = int(nx) * int(ny) * int(nz)
-    scale = jnp.sqrt(jnp.asarray(ngrid, dtype=jnp.float64)
-                     / jnp.asarray(cell_volume, dtype=jnp.float64))
-    psi_occ = psi_k_box if nocc is None else psi_k_box[: int(nocc)]
-    psi_r = jnp.fft.ifftn(psi_occ, axes=(-3, -2, -1), norm='ortho') * scale
-    return (float(weight) * float(spin_degeneracy)) * jnp.sum(
-        jnp.real(jnp.conj(psi_r) * psi_r), axis=(0, 1))
+    return _valence_density_kernel(
+        psi_k_box,
+        jnp.asarray(float(weight), dtype=jnp.float64),
+        jnp.asarray(float(cell_volume), dtype=jnp.float64),
+        jnp.asarray(float(spin_degeneracy), dtype=jnp.float64),
+        nocc=None if nocc is None else int(nocc))
 
 
 def build_hartree_potential(

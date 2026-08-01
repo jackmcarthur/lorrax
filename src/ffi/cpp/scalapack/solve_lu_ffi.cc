@@ -30,12 +30,18 @@
 #include <cstring>
 #include <mutex>
 #include <sstream>
+#include <string>
 #include <vector>
 
 #include <mpi.h>
 
 #include "xla/ffi/api/ffi.h"
 
+// blacs_grid.h happens to pull both of these in, but this TU uses
+// std::string (the refusal) and SlateCtx/host_collective_mutex directly —
+// name the dependencies instead of leaning on transitive includes
+// (2026-08-01 seam-audit leftover).
+#include "../slate/ctx.h"
 #include "blacs_grid.h"
 
 namespace lorrax_ffi::scalapack_solve_lu {

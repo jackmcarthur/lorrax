@@ -39,6 +39,7 @@
 
 #include "ctx.h"
 #include "phdf5_interface.h"
+#include "../common/mpi_thread_guard.h"
 
 namespace lorrax_ffi::phdf5 {
 
@@ -90,27 +91,13 @@ static void throw_if_cuda(cudaError_t st, const char* what) {
 // ran when we called MPI_Init_thread ourselves would be void by
 // construction.  Rank now comes from MPI_Comm_rank rather than open_ctx's
 // argument, which is what let it live at the lower level.
+//
+// Mechanism shared with the slate twin in cpp/common/mpi_thread_guard.h
+// (2026-08-01 dedup); the hazard sentence and once-flag stay per family.
 static void warn_if_thread_level_insufficient() {
     static std::atomic<bool> warned{false};
-    int provided = 0;
-    MPI_Query_thread(&provided);
-    if (provided >= MPI_THREAD_MULTIPLE) return;
-    int rank = -1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    if (rank != 0) return;
-    if (warned.exchange(true)) return;
-    std::fprintf(stderr,
-        "[phdf5] WARNING: MPI granted thread level %d < "
-        "MPI_THREAD_MULTIPLE (%d) and MPI was initialized before "
-        "this library (jax cpu_collectives_implementation=mpi with "
-        "an unpatched MPIwrapper?).  The phdf5 writer thread's "
-        "collective MPI-IO is UNDEFINED at this level — measured "
-        "~29%% multi-node crash rate (scorecard AS.4b).  Fix: "
-        "point MPITRAMPOLINE_LIB at the MPIwrapper built by "
-        "config/frontera/build_mpiwrapper.sh, which upgrades every "
-        "init to MPI_THREAD_MULTIPLE (docs/dev/mpi_collectives.md).\n",
-        provided, MPI_THREAD_MULTIPLE);
-    std::fflush(stderr);
+    lorrax_ffi::mpiguard::warn_if_thread_level_insufficient(
+        "phdf5", "the phdf5 writer thread's collective MPI-IO", warned);
 }
 
 void ensure_mpi_initialized() {

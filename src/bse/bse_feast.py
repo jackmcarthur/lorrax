@@ -32,8 +32,8 @@ from .bse_ring_comm import (build_bse_ring_matvec, build_bse_ring_matvec_full,
 from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_preconditioner import energy_diff_cv_k
 import common.timing as timing
-from common.fft_helpers import local_ifftn3
-from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
+from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
+                     make_w_densifier)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -70,12 +70,17 @@ class QuadratureSpec:
     quadrature_type: str = "ellipse"
 
 
-def ensure_W_R(data: dict, include_W: bool) -> dict:
+def ensure_W_R(data: dict, include_W: bool, mesh_xy: Mesh) -> dict:
     """Populate ``data['W_R']`` — the 8th (real-space W) argument the ring/stack
     matvecs and the shifted-matvec chain (``_apply_shifted_matvec``) expect.
 
     The screened-direct term convolves the ISDF W-tile in real space, so the
-    reciprocal-space ``W_q`` (μ, ν, kx, ky, kz) is inverse-FFT'd on the k-axes.
+    reciprocal-space ``W_q`` (μ, ν, kx, ky, kz) is inverse-FFT'd on the k-axes
+    through :func:`bse_io.make_w_densifier` — the ONE sharded densifier
+    (degenerate ``fine_grid == coarse`` = plain sharded ifftn), so the (μ,ν)
+    sharding survives and no rank gathers an N_μ²-class tile (the eager
+    ``local_ifftn3`` form this replaces was audit-P0-4-class debt, gated by
+    ``tests/test_fft_shardmap_context.py``).
     For the RPA density-response / kernel (``include_W=False``) the W-term is
     never built, so ``W_R`` is only a shape/sharding-correct placeholder and
     ``W_q`` itself serves.  The restart loader emits ``W_q`` but not ``W_R``, so
@@ -83,9 +88,11 @@ def ensure_W_R(data: dict, include_W: bool) -> dict:
     must call this before invoking a matvec.  Mutates and returns ``data``.
     """
     if include_W:
-        # fft_helpers is THE single FFT entry point (owner rule) — raw
-        # jnp.fft is not called from BSE (2026-07-29 sweep).
-        data["W_R"] = local_ifftn3(data["W_q"], axes=(2, 3, 4), norm="ortho")
+        W_q = data["W_q"]
+        densify = make_w_densifier(
+            mesh_xy, make_bse_shardings(mesh_xy).W.spec,
+            tuple(int(s) for s in W_q.shape[-3:]), output="R")
+        data["W_R"] = densify(W_q)
     else:
         data["W_R"] = data["W_q"]
     return data
@@ -598,14 +605,14 @@ def run_feast_ritz(
         )
     sh = make_bse_shardings(mesh_xy)
 
-    ensure_W_R(data, include_W)
+    ensure_W_R(data, include_W, mesh_xy)
 
     diag_h = build_preconditioner_diagonal_sharded(data, mesh_xy, include_W=include_W, use_tda=use_tda)
     data_gmres = data
     diag_h_gmres = diag_h
     runner_dtype = jnp.complex128
     if gmres_fp32:
-        data_gmres = ensure_W_R(_build_gmres_data_fp32(data), include_W)
+        data_gmres = ensure_W_R(_build_gmres_data_fp32(data), include_W, mesh_xy)
         diag_h_gmres = _cast_with_sharding(diag_h, jnp.float32)
         runner_dtype = jnp.complex64
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
@@ -799,7 +806,7 @@ def estimate_spectral_bounds_sharded(
     Uses an adaptive Lanczos run that stops when the largest Ritz value
     (of the tridiagonal) converges to within the specified tolerances.
     """
-    data_fp32 = ensure_W_R(_build_gmres_data_fp32(data), include_W)
+    data_fp32 = ensure_W_R(_build_gmres_data_fp32(data), include_W, mesh_xy)
 
     eps_c = data_fp32["eps_c"]
     eps_v = data_fp32["eps_v"]

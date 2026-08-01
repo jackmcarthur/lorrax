@@ -104,7 +104,7 @@ def _build_rpa_resolvent(mesh_xy: Mesh, data: dict):
     directly (see :func:`apply_screening_resolvent_block`).
     """
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
-    ensure_W_R(data, include_W=False)
+    ensure_W_R(data, include_W=False, mesh_xy=mesh_xy)
     matvec = build_bse_ring_matvec_full(
         mesh_xy, nkx, nky, nkz, include_W=False, screening=True)
     diag_h = build_preconditioner_diagonal_sharded(
@@ -640,7 +640,7 @@ def main(argv=None) -> None:
             t_b0 = time.perf_counter()
             with timing.section("w_exact.wq_build"):
                 dq = build_finite_q_data(data, (qx, qy, qz), mesh_xy)
-                ensure_W_R(dq, include_W=False)
+                ensure_W_R(dq, include_W=False, mesh_xy=mesh_xy)
                 diag_hq = build_preconditioner_diagonal_sharded(
                     dq, mesh_xy, include_W=False, use_tda=False)
                 W0 = np.asarray(jax.device_get(data["W_q"][:, :, qx, qy, qz]))

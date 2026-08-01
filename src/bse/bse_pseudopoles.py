@@ -18,6 +18,7 @@ from .bse_feast import (
     feast_zolotarev_quadrature,
     _get_feast_runner,
     _build_gmres_data_fp32,
+    ensure_W_R,
     _cast_with_sharding,
     build_preconditioner_diagonal_sharded,
     estimate_spectral_bounds_sharded,
@@ -34,7 +35,6 @@ from .bse_ring_comm import (
     make_bse_shardings,
 )
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
-from common.fft_helpers import local_ifftn3
 import common.timing as timing
 
 jax.config.update("jax_enable_x64", True)
@@ -171,15 +171,18 @@ def _feast_filter(
     ry_to_ev: float,
     gmres_fp32: bool,
     use_tda: bool,
+    mesh_xy: Mesh,
+    include_W: bool,
 ) -> tuple[jax.Array, np.ndarray]:
     n_vec = int(X_batch.shape[0])
     data_gmres = data
     diag_h_gmres = diag_h
     runner_dtype = jnp.complex128
     if gmres_fp32:
-        data_gmres = _build_gmres_data_fp32(data)
-        if "W_q" in data_gmres:
-            data_gmres["W_R"] = local_ifftn3(data_gmres["W_q"], axes=(2, 3, 4), norm="ortho")
+        # ensure_W_R = the ONE sharded W_q->W_R route (make_w_densifier);
+        # with include_W=False it installs the W_q placeholder instead of
+        # transforming an operand the matvec never reads.
+        data_gmres = ensure_W_R(_build_gmres_data_fp32(data), include_W, mesh_xy)
         diag_h_gmres = _cast_with_sharding(diag_h, jnp.float32)
         runner_dtype = jnp.complex64
 
@@ -248,10 +251,7 @@ def run_pseudopoles(
             include_W=include_W,
         )
 
-    if include_W:
-        data["W_R"] = local_ifftn3(data["W_q"], axes=(2, 3, 4), norm="ortho")
-    else:
-        data["W_R"] = data["W_q"]
+    ensure_W_R(data, include_W, mesh_xy)
 
     diag_h = build_preconditioner_diagonal_sharded(data, mesh_xy, include_W=include_W, use_tda=use_tda)
 
@@ -320,6 +320,8 @@ def run_pseudopoles(
             ry_to_ev,
             gmres_fp32,
             use_tda,
+            mesh_xy,
+            include_W,
         )
         filtered = [filtered_batch[i] for i in range(m0)]
         if gmres_fp32:

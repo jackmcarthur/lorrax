@@ -1,8 +1,10 @@
 # FFI layout: the compact tree
 
 Status: **wave 1 executed 2026-07-31** (one C++ tree, one CMakeLists, first
-facade modules + shims).  Wave 2 (consumer migration, module merges, dead-leg
-deletion) is DESIGNED here but NOT executed — see §6.
+facade modules + shims).  **Wave-2 module merges executed 2026-08-01**:
+`ffi/io.py` (phdf5 python), `ffi/linalg/_slate.py`, `ffi/linalg/_scalapack.py`
+— all three former packages remain as re-export shims (§6).  Consumer
+migration and dead-leg deletion are still open.
 
 Owner criterion: `src/ffi` must read as ONE FFI seam with vendor legs, not a
 sprawling vendor monorepo.  Before this restructure the tree held **9 separate
@@ -119,13 +121,20 @@ Callers updated in the same commit: `config/frontera/build_ffi.sh`,
 `config/frontera/build_ffi_host.sh`, `src/ffi/cpp/build.sh`,
 `src/ffi/cpp/build_host.sh`.
 
-### Wave-2 end state (designed, NOT executed)
+### Wave-2 end state (module merges EXECUTED 2026-08-01)
 
-* `ffi/io.py` — merge of `phdf5/{context,read,write}.py` (~770 LOC, one
-  module), `phdf5/` package deleted; `ffi/linalg.py` stays a package but
-  absorbs `scalapack/*.py` and `slate/*.py` as `linalg/_scalapack.py`,
-  `linalg/_slate.py` backend modules (vendor dispatch stays inside
-  `linalg/resolve.py`, exactly as today).
+* `ffi/io.py` — merge of `phdf5/{context,read,write}.py` (~740 LOC, one
+  module) — DONE; `phdf5/` is now a re-export shim package (kept until the
+  `file_io/` consumers move — deletion stays gated on
+  `grep -rn "ffi\.phdf5"` empty; `ARCHITECTURE.md` stays with the shim).
+  `ffi/linalg` absorbed `slate/*.py` → `linalg/_slate.py` (~900 LOC; the
+  three per-module `_FFI_TARGET` constants were disambiguated to
+  `_POTRF/_TRSM/_EIGH_FFI_TARGET` — target STRINGS unchanged) and
+  `scalapack/*.py` → `linalg/_scalapack.py` (shares the SlateCtx lifecycle
+  via `from ._slate import ...`).  `slate/` and `scalapack/` are re-export
+  shims, submodule paths preserved (`ffi.slate.context`, `.batched` for
+  `_mesh_key`, `ffi.phdf5.read/.write`); vendor dispatch stays inside
+  `linalg/resolve.py` (`backend_module` still hands out the shim packages).
 * shim packages `mklfft/`, `mklblas/`, `cufft/` deleted after consumers move
   to `ffi.fft` / `ffi.gemm` (§4 lists the call sites).
 * optional cpp compaction to per-service dirs (`cpp/fft/`, `cpp/gemm/`,
@@ -180,8 +189,12 @@ byte-identical to the pre-move baseline.
 
 Deferred (with reasons): CUDA-leg build validation (needs rtx/Perlmutter —
 the leg is a verbatim text relocation, path-existence-checked only);
-`io.py`/`linalg` merges (edits, not moves — beyond the pure-`git mv` bar);
 shim deletion (consumer churn); cusolvermp/cublasmp deletion (§5 gates).
+The `io.py`/`linalg` merges landed 2026-08-01 (see "Wave-2 end state"
+above) with the former packages kept as shims; the same commit removed the
+blanket `-Wno-unused-*` compile flags (third-party headers went SYSTEM,
+the two real warnings were fixed) — host lib rebuilt, LORRAX
+handler/entry-point symbol set identical.
 
 ## 7. FFT engine portability — the Occam target (owner-directed, 2026-07-31)
 

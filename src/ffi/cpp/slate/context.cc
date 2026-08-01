@@ -20,6 +20,7 @@
 #include <mpi.h>
 
 #include "ctx.h"
+#include "../common/mpi_thread_guard.h"
 
 namespace lorrax_ffi::slate {
 
@@ -44,37 +45,13 @@ namespace lorrax_ffi::slate {
 // already-initialised path is the hazardous one, so a guard that only ran
 // when we called MPI_Init_thread ourselves would be void by construction.
 //
-// NOT extracted into a shared header with the phdf5 twin, deliberately.
-// There are two call sites, and this project's own threshold (TEMPLATE.md
-// :194-195) is "extract when a THIRD library would copy it a third time".
-// The hazard sentences are also genuinely different — phdf5's is a
-// dedicated writer thread driving collective MPI-IO, SLATE's is its
-// internal OpenMP+MPI task engine — so a shared helper would carry a
-// parameterised message and save nothing but the four-line query.  The
-// mechanical part that WAS worth sharing (the MKL pin, three copies) is now
-// cpp/common/mkl_thread_pin.h.  If a third MPI FFI family appears, extract
-// then, and take the "query after ensuring init" placement with it.
+// Mechanism shared with the phdf5 twin in cpp/common/mpi_thread_guard.h
+// (2026-08-01 dedup; the copies had begun to drift).  The family-specific
+// hazard sentence and the per-family once-flag stay here.
 static void warn_if_thread_level_insufficient() {
     static std::atomic<bool> warned{false};
-    int provided = 0;
-    MPI_Query_thread(&provided);
-    if (provided >= MPI_THREAD_MULTIPLE) return;
-    int rank = -1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    if (rank != 0) return;
-    if (warned.exchange(true)) return;
-    std::fprintf(stderr,
-        "[slate] WARNING: MPI granted thread level %d < MPI_THREAD_MULTIPLE "
-        "(%d) and MPI was initialized before this library (jax "
-        "cpu_collectives_implementation=mpi with an unpatched MPIwrapper?).  "
-        "SLATE's internal OpenMP+MPI task engine is UNDEFINED at this level "
-        "— the same concurrent-MPI-progress hazard measured at a ~29%% "
-        "multi-node crash rate for the phdf5 writer thread (scorecard "
-        "AS.4b).  Fix: point MPITRAMPOLINE_LIB at the MPIwrapper built by "
-        "config/frontera/build_mpiwrapper.sh, which upgrades every init to "
-        "MPI_THREAD_MULTIPLE (docs/dev/mpi_collectives.md).\n",
-        provided, MPI_THREAD_MULTIPLE);
-    std::fflush(stderr);
+    lorrax_ffi::mpiguard::warn_if_thread_level_insufficient(
+        "slate", "SLATE's internal OpenMP+MPI task engine", warned);
 }
 
 static void ensure_mpi_initialized() {

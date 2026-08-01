@@ -531,7 +531,10 @@ set_target_properties(lorrax_ffi PROPERTIES
     INSTALL_RPATH "${CUSOLVERMP_LIBDIR};${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64;/lorrax_phdf5/lib;/lorrax_slate/lib;${LORRAX_SLATE_INSTALL_DIR}/lib64"
 )
 
-target_include_directories(lorrax_ffi PRIVATE
+# Third-party headers (XLA FFI + vendor toolkits) as SYSTEM — they are not
+# warning-clean under -Wall -Wextra and are not ours to fix; LORRAX's own
+# sources stay under the full warning set (no blanket -Wno-unused-*).
+target_include_directories(lorrax_ffi SYSTEM PRIVATE
     "${JAX_FFI_INCLUDE_DIR}"
     "${CUSOLVERMP_INCLUDE}"
     "${NCCL_INCLUDE}"
@@ -539,6 +542,8 @@ target_include_directories(lorrax_ffi PRIVATE
     "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/include"
     "${HDF5_INCLUDE_DIRS}"
     "${LORRAX_MPI_INCLUDE_DIR}"
+)
+target_include_directories(lorrax_ffi PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/common"
 )
@@ -585,11 +590,13 @@ target_compile_definitions(lorrax_ffi PRIVATE
     LORRAX_FFI_HAVE_PHDF5=$<BOOL:${LORRAX_FFI_HAVE_PHDF5}>
 )
 
+# -Wno-unused-parameter/-Wno-unused-variable removed 2026-08-01 (seam-audit
+# leftover): the blanket opt-outs also hid genuinely dead locals.  Warnings
+# are not errors here (no -Werror); host-leg sources were rebuilt clean —
+# CUDA-only TUs get their warning pass at the next rtx/Perlmutter build.
 target_compile_options(lorrax_ffi PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-Wall>
     $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
-    $<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-parameter>
-    $<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-variable>
 )
 
 # Ensure nvcc passes -fPIC to the host compiler for .cu TUs linked into
@@ -1235,8 +1242,13 @@ set_target_properties(lorrax_ffi_host PROPERTIES
     INSTALL_RPATH "${_host_rpaths}"
 )
 
-target_include_directories(lorrax_ffi_host PRIVATE
+# The XLA FFI headers are THIRD-PARTY (vendored with jaxlib) and are not
+# warning-clean under -Wall -Wextra; SYSTEM keeps their noise out of the
+# build log so LORRAX's own sources can be held to the no-opt-out bar above.
+target_include_directories(lorrax_ffi_host SYSTEM PRIVATE
     "${LORRAX_XLA_FFI_INCLUDE_DIR}"
+)
+target_include_directories(lorrax_ffi_host PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 if(LORRAX_MKLFFT_INCLUDE_DIR)
@@ -1262,8 +1274,10 @@ find_package(Threads REQUIRED)
 target_link_libraries(lorrax_ffi_host PRIVATE ${_host_link_libs}
                       Threads::Threads ${CMAKE_DL_LIBS})
 
-target_compile_options(lorrax_ffi_host PRIVATE -Wall -Wextra
-    -Wno-unused-parameter -Wno-unused-variable)
+# No -Wno-unused-* here (removed 2026-08-01): the host sources compile clean
+# under plain -Wall -Wextra; keep them that way rather than re-adding the
+# blanket opt-out.
+target_compile_options(lorrax_ffi_host PRIVATE -Wall -Wextra)
 
 # Announce-or-refuse at LINK time (audit P1.7): every link-time symbol the
 # handlers reference must resolve when the .so is built — an undefined

@@ -57,12 +57,10 @@ _SANCTIONED_EAGER = {
     # ζ box is a replicated fit product (host round-trip follows on the next
     # line); no (μ,ν)-sharded operand reaches this FFT.
     ("bse/vq_interp.py", "refit_vq"): 1,
-    # KNOWN DEBT — same eager W_q→W_R pattern as audit P0-4, on solver-local
-    # bundles.  Staged for a later wave; the ratchet stops it spreading.
-    ("bse/bse_feast.py", "ensure_W_R"): 1,
-    ("bse/bse_kpm.py", "run_kpm_dos"): 1,
-    ("bse/bse_pseudopoles.py", "_feast_filter"): 1,
-    ("bse/bse_pseudopoles.py", "run_pseudopoles"): 1,
+    # (The former KNOWN-DEBT block — bse_feast.ensure_W_R, bse_kpm.run_kpm_dos,
+    # bse_pseudopoles._feast_filter/run_pseudopoles — was closed 2026-08-01:
+    # every solver W_q→W_R now routes through bse_feast.ensure_W_R →
+    # bse_io.make_w_densifier.)
     # Diagnostics on tiny synthetic decks (smoke / correctness cross-checks),
     # run at sizes where a replicated W is intended and harmless.
     ("bse/bse_ring_comm.py", "ring_matvec_smoke_test"): 1,

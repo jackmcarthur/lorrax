@@ -1,29 +1,12 @@
-"""Parallel-HDF5 FFI subpackage.
-
-Public API:
-
-    from ffi.phdf5 import open_file, close_file, \\
-                          write_sharded_slab, read_sharded_slab
-
-    fh = open_file("/path/to/out.h5", mesh=mesh, mode="w")
-    write_sharded_slab(fh, ds_name="eigenvectors", A=Q,
-                       global_shape=(n, n), mesh=mesh)
-    close_file(fh)
-
-    fh = open_file("/path/to/out.h5", mesh=mesh, mode="r")
-    Q = read_sharded_slab(fh, ds_name="eigenvectors",
-                          global_shape=(n, n),
-                          dtype=jnp.complex128, mesh=mesh)
-    close_file(fh)
-
-Each process reads/writes its local shard directly to a hyperslab of
-the shared HDF5 file via MPI-IO — no gather through rank 0.  See
-``src/ffi/AGENTS.md`` for required environment and
-``src/ffi/PORTING.md`` for per-cluster setup.
-"""
-from .context import open_file, close_file
-from .write import write_sharded_slab
-from .read import read_sharded_slab
+"""Re-export shim — the implementation moved to ``ffi/io.py`` (wave 2,
+docs/architecture/ffi_layout.md §3/§6, 2026-08-01).  Consumers
+(file_io/_slab_io_ffi.py, file_io/wfn_loader.py) still import
+``ffi.phdf5``; deleting this package is the gate that the consumer
+migration to ``ffi.io`` is complete (`grep -rn "ffi\\.phdf5"` empty).
+Nothing here but re-exports."""
+from ..io import (  # noqa: F401
+    open_file, close_file, write_sharded_slab, read_sharded_slab,
+)
 
 __all__ = [
     "open_file", "close_file",

@@ -1,32 +1,26 @@
-"""SLATE FFI — distributed dense linear algebra on GPUs from JAX.
+"""Re-export shim — the SLATE backend implementation moved to
+``ffi/linalg/_slate.py`` (wave 2, docs/architecture/ffi_layout.md §3/§6,
+2026-08-01).  ``linalg.resolve.backend_module("slate")`` hands out this
+package; consumers and the bench tests import these names from here.
+Deleting this package is the gate that the consumer migration to
+``ffi.linalg._slate`` is complete.
 
-SLATE is a tile-based, MPI + GPU library from ICL.  This package calls
-SLATE from inside JAX FFI handlers, one process per GPU on a 2-D
-``('x', 'y')`` mesh.  See ``src/ffi/slate/README.md`` for the design
-notes (layout, MPI, GPU-aware comms) and ``src/ffi/slate/{cholesky,
-trsm, eigh}.py`` for per-op shape contracts.
-
-Public API::
-
-    from ffi.slate import distributed_cholesky, distributed_trsm
-    L = distributed_cholesky(A, mesh=mesh)        # SlateLowerL handle
-    X = distributed_trsm(L, B, mesh=mesh, op='N') # forward solve
-
-    from ffi.slate import distributed_eigh
-    W, Q = distributed_eigh(A, mesh=mesh)         # eigenvectors buggy; W ok
-
-cholesky + trsm work on any p×q mesh (p == q for eigh).
+SLATE is a tile-based, MPI + GPU dense linear-algebra library from ICL,
+driven from JAX FFI handlers, one process per GPU on a 2-D ``('x','y')``
+mesh; see ``src/ffi/slate/README.md`` and the module docstrings in
+``ffi/linalg/_slate.py`` for layout/MPI/GPU-comm notes.
 """
 from __future__ import annotations
 
-from .batched import (  # noqa: F401
+from ..linalg._slate import (  # noqa: F401
     SlateBatchedLowerL,
+    SlateLowerL,
     batched_distributed_cholesky,
     batched_distributed_trsm,
+    distributed_cholesky,
+    distributed_eigh,
+    distributed_trsm,
 )
-from .cholesky import SlateLowerL, distributed_cholesky  # noqa: F401
-from .eigh import distributed_eigh  # noqa: F401
-from .trsm import distributed_trsm  # noqa: F401
 
 __all__ = [
     "SlateBatchedLowerL",

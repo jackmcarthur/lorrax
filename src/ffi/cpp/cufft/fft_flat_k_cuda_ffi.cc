@@ -256,10 +256,16 @@ static const DriverApi& driver_api() {
         auto need = [&](const char* name) -> void* {
             dlerror();
             void* p = dlsym(h, name);
-            if (p == nullptr && a.err.empty()) {
+            if (p == nullptr) {
+                // COMPLETE record (2026-08-01 seam-audit leftover): the old
+                // `&& a.err.empty()` guard kept only the FIRST missing
+                // symbol, so a driver missing several entry points produced
+                // a refusal naming one, and each fix round-tripped through
+                // another failing run.  Append every miss.
                 const char* e = dlerror();
-                a.err = std::string("dlsym(") + name + "): " +
-                        (e ? e : "symbol not found (no dlerror detail)");
+                if (!a.err.empty()) a.err += "; ";
+                a.err += std::string("dlsym(") + name + "): " +
+                         (e ? e : "symbol not found (no dlerror detail)");
             }
             return p;
         };
