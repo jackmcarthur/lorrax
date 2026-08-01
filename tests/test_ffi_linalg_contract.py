@@ -67,11 +67,19 @@ if __name__ == "__main__":
         # jax.distributed.initialize.
         from ffi.common.ffi_loader import platform_from_env
         _plat = platform_from_env()
-        try:
-            from ffi.common.ffi_loader import get_lib as _get_lib
-            _get_lib(_plat).lrx_slate_init_mpi()
-        except Exception as _exc:
-            print(f"slate_init_mpi skipped: {_exc}", flush=True)
+        # Production init ORDER (host + impl=mpi): the jax CPU mpi
+        # collectives plugin calls MPI_Init_thread unconditionally, so it
+        # must initialize MPI FIRST and the slate/BLACS context piggyback
+        # (its ensure_mpi_initialized is guarded; the plugin's is not).
+        # Eagerly calling lrx_slate_init_mpi here — the CUDA-era warm-up —
+        # aborts every cpu+impl=mpi run with "Cannot call MPI_INIT ...
+        # more than once" (job 7885123).  Keep the warm-up on CUDA only.
+        if _plat == "CUDA":
+            try:
+                from ffi.common.ffi_loader import get_lib as _get_lib
+                _get_lib(_plat).lrx_slate_init_mpi()
+            except Exception as _exc:
+                print(f"slate_init_mpi skipped: {_exc}", flush=True)
         import jax
         if _plat == "CUDA":
             jax.distributed.initialize(local_device_ids=[0])
@@ -359,6 +367,47 @@ def check_scalapack_lu(mesh, dtype, nq=2, n=32, nrhs=16, herm=True):
     assert np.array_equal(X1, X2), "scalapack solve_lu rerun not bit-deterministic"
     for q in range(nq):
         res = (np.linalg.norm(A_np[q] @ X1[q] - B_np[q])
+               / max(np.linalg.norm(B_np[q]), 1.0))
+        assert res < 1e-10, f"q={q}: res={res:.3e}"
+
+
+def check_scalapack_getrf_getrs(mesh, dtype, nq=2, n=32, nrhs=16):
+    """The SPLIT pair (hoisted transverse ζ factor stage): pXgetrf once,
+    pXgetrs per RHS, must be BIT-IDENTICAL to the fused
+    batched_distributed_solve_lu on the same operands — same descriptors,
+    same grid, only WHEN the factor work happens differs.  Also solves a
+    second RHS from the SAME factors (the r-chunk reuse the split
+    exists for)."""
+    from ffi.scalapack import (batched_distributed_getrf,
+                               batched_distributed_getrs,
+                               batched_distributed_solve_lu)
+    rng = np.random.default_rng(11)
+    A_np = _herm(rng, nq, n, dtype)         # Hermitian INDEFINITE
+    B_np = _rng_mat(rng, (nq, n, nrhs), dtype)
+    B2_np = _rng_mat(rng, (nq, n, nrhs), dtype)
+
+    def fused(Bx):
+        A = _put(A_np, mesh, (None, "x", "y"))
+        B = _put(Bx, mesh, (None, "x", "y"))
+        return _gather(batched_distributed_solve_lu(A, B, mesh=mesh))
+
+    def split():
+        A = _put(A_np, mesh, (None, "x", "y"))
+        LU, ipiv = batched_distributed_getrf(A, mesh=mesh)
+        X = _gather(batched_distributed_getrs(
+            LU, ipiv, _put(B_np, mesh, (None, "x", "y")), mesh=mesh))
+        X2 = _gather(batched_distributed_getrs(
+            LU, ipiv, _put(B2_np, mesh, (None, "x", "y")), mesh=mesh))
+        return X, X2
+
+    Xf, Xf2 = fused(B_np), fused(B2_np)
+    Xs, Xs2 = split()
+    assert np.array_equal(Xf, Xs), \
+        "split getrf+getrs drifts from fused solve_lu (RHS 1)"
+    assert np.array_equal(Xf2, Xs2), \
+        "split getrf+getrs drifts from fused solve_lu (RHS 2, factor reuse)"
+    for q in range(nq):
+        res = (np.linalg.norm(A_np[q] @ Xs[q] - B_np[q])
                / max(np.linalg.norm(B_np[q]), 1.0))
         assert res < 1e-10, f"q={q}: res={res:.3e}"
 
@@ -688,6 +737,12 @@ def test_scalapack_solve_lu_general_cpu(mesh_cpu11):
 
 
 @needs_host_ffi
+@pytest.mark.parametrize("dtype", ["complex128", "float64"])
+def test_scalapack_getrf_getrs_split_is_bit_identical_cpu(mesh_cpu11, dtype):
+    check_scalapack_getrf_getrs(mesh_cpu11, dtype)
+
+
+@needs_host_ffi
 def test_scalapack_resolver_and_host_only_guard(mesh_cpu11):
     """distributed_lu=scalapack resolves to scalapack_lu (explicit only —
     auto never picks it); a GPU-device mesh is rejected loudly."""
@@ -749,6 +804,8 @@ _CLI_CELLS = [
     ("scalapack_lu_general", False,
      lambda mesh, dt: check_scalapack_lu(mesh, dt, n=64, nrhs=32,
                                          herm=False)),
+    ("scalapack_getrf_getrs", False,
+     lambda mesh, dt: check_scalapack_getrf_getrs(mesh, dt, n=64, nrhs=32)),
     # Production wiring: the htransform fH_q eigh routed through the FFI.
     # rank=64 divides 1/2/4, so the same cell runs on every mesh the
     # wrappers accept.  dtype is ignored (fH_q is complex by construction).

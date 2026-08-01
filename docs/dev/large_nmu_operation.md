@@ -27,7 +27,7 @@ count, `r` = r-chunk size, `nq` = IBZ q count, all buffers complex128
 | zeta CCT build (`isdf/core.c_q_from_psi_sm`) | none (always sharded) | one 2-D-sharded shard_map; `C_q` at `P(None,'x','y')`: `nq·mu²/P` | same path (no second plan needed) |
 | zeta charge factor (`isdf/core.factor_c_q`) | `charge_zeta_solve = rank_truncate` (default) + `distributed_cholesky = auto` → replicated whole-tile eigh pseudo-inverse, q-parallel at P>1 (`LORRAX_ZETA_QPARALLEL`): transient ≤ one q-batch replicated (4 GiB cap), compute `ceil(nq/P)·mu³` | `distributed_zeta_solve = distributed` → ScaLAPACK `pzheevd`, truncation on the replicated spectrum, C⁺ kept 2-D-sharded: `nq·mu²/P` stored, no O(mu²) replica anywhere; compute `nq·mu³/P`-class |
 | zeta charge back-solve (per r-chunk, `solve_zeta`) | `distributed_zeta_solve = auto`: `replicated` gathers the whole factor, `nq·mu²·16` B/rank/r-chunk; `per_q` gathers one `(mu,mu)` tile at a time, `mu²·(1+1/Py)·16` B live (same total traffic) | `distributed` (same key): one stacked GEMM `C⁺@Z`, both operands 2-D-sharded; received bytes `nq·(mu²/Px + mu·r/Py)·16` per r-chunk, no whole tile ever |
-| zeta transverse factor+solve (bispinor mu_L=1,2,3) | `distributed_lu = auto` → on a CPU mesh always the per-q replicated pivoted LU (`jnp.linalg.solve` + ridge), re-factored EVERY r-chunk on EVERY rank: `nq·mu_T³·n_rchunks` redundant | `distributed_lu = scalapack` (host) / `cusolvermp` (CUDA) → per-q `pXgetrf`+`pXgetrs`, 2-D block-cyclic, no `mu_T²` tile per rank — but still re-factored every r-chunk (see "Transverse design gap") |
+| zeta transverse factor (bispinor mu_L=1,2,3; HOISTED 2026-08-01, once per channel) | `distributed_lu = auto` → per-q pivoted LU of the ridged LOGICAL tile via `lax.linalg.lu`, q-parallel at P>1 under the charge fold's policy; `(LU, piv)` stored, back-solve = `lu_solve` per r-chunk through the same replicated/per_q gather tiers — BIT-IDENTICAL to the old fused per-r-chunk `jnp.linalg.solve` | `distributed_lu = scalapack` (host) → `pXgetrf` ONCE at the logical extent, factors kept 2-D block-cyclic + per-rank ipiv threaded; `pXgetrs` per r-chunk (split FFI handlers).  `cusolvermp` (CUDA) still runs the FUSED per-r-chunk pair (hoist port pending) |
 | zeta Z_q build (`z_q_from_psi_sm`) | none (always sharded) | streaming band-chunk scan inside one shard_map; carries `(nk, ns, r/Py, mu/Px, ns)` → `/P`; per-iter FFT box `nk·(band_chunk/P)·ns·n_rtot` | same path |
 | zeta h5 write (G-flat accumulator + SlabIO) | `slab_io = auto` | accumulator `(nq_disk, mu/P, ngkmax)` → `/P`; `auto` → parallel-HDF5 FFI collective hyperslab write (no gather). The `h5py_allgather` fallback gathers the FULL `(nq_disk, mu, ngkmax)` tensor on rank 0 — announced, non-scaling; do not run large-mu with a demoted writer | same |
 | W Dyson solve (`gw/w_isdf`) | `w_dyson_solver = auto` = `local`: q-parallel per-q dense LU, `ceil(nq/P)` whole `(mu,mu)` tiles per rank — a mu² tile per rank exists | `w_dyson_solver = distributed`: 2-D block-cyclic backsolve via `ffi.linalg` `solve_lu`, `nq·mu²/P`; refuses loudly, never downgrades |
@@ -122,8 +122,12 @@ until fixed.  File:line references as of this page's commit.
    `bse/exciton_bands.py:241`).
 3. **zeta replicated/per_q back-solve gather** — `nq·mu²·16` B/rank per
    r-chunk unless `distributed_zeta_solve = distributed`.
-4. **transverse per-q LU** — replicated per rank AND re-factored per
-   r-chunk on the default path (see below).
+4. **transverse LU factor tiles** — the LOCAL plan's hoisted `(LU, piv)`
+   stack is gathered per q-tile by the replicated/per_q tiers exactly
+   like the CCT it replaced (an `mu_T²` tile per gather); the per-r-chunk
+   RE-FACTORING is gone on both plans since 2026-08-01 (see below), and
+   `distributed_lu = scalapack` keeps the factors block-cyclic
+   throughout.
 5. **W Dyson local plan** — `ceil(nq/P)` whole `(mu,mu)` tiles per rank
    unless `w_dyson_solver = distributed`.
 6. **dipole/kin-ion k-gathers** — FIXED: the CLI sweeps now gather
@@ -138,35 +142,53 @@ until fixed.  File:line references as of this page's commit.
 8. **h5py_allgather writer fallback** — rank-0 full-tensor gather when
    the parallel-HDF5 probe demotes; announced.
 
-## Transverse (bispinor) design gap
+## Transverse (bispinor) factor stage — CLOSED 2026-08-01
 
 The transverse CCT is Hermitian INDEFINITE: no Cholesky, no eigh-based
-rank truncation.  `factor_c_q` passes the (identity-padded) CCT through
-and the pivoted LU is fused into `solve_zeta`'s per-r-chunk path — there
-is NO standalone transverse factor stage.  Consequences:
+rank truncation.  The factor is a per-q pivoted LU with a ridge
+(`eps·|tr(C_log)|/n_log`, eps = 1e-12), historically fused into
+`solve_zeta`'s per-r-chunk path.  Since 2026-08-01 `factor_c_q` HOISTS
+it — one factorization per q per CHANNEL, `(factor, piv)` returned, and
+`solve_zeta` only applies it per r-chunk — with the charge family's two
+plans:
 
-* the LU factorization (`nq·mu_T³`) is repeated every r-chunk — on every
-  rank on the default path, on the mesh (but still per r-chunk) under
-  `distributed_lu = scalapack`;
-* the q-parallel fold does not apply (it schedules the factor stage,
-  which does not exist here);
-* the distributed route must run at the LOGICAL mu_T extent
-  (pad-extent LU roundoff is amplified O(1) in near-null transverse
-  modes), so it requires `mu_T_logical % Px == % Py == 0` — pick
-  transverse centroid counts divisible by the mesh axes, or auto demotes
-  (announced) to the replicated per-q LU.
+* **LOCAL** (`distributed_lu = auto`/`off`): `lax.linalg.lu` on the
+  whole ridged LOGICAL tile, q-parallel over devices under the charge
+  fold's policy (`LORRAX_ZETA_QPARALLEL` / nq·mu³ threshold), LU
+  identity-re-embedded at the padded extent so the replicated/per_q
+  gather tiers consume it unchanged; back-solve is
+  `jax.scipy.linalg.lu_solve` — the identical arithmetic
+  `jnp.linalg.solve` runs internally, so the hoist is a SCHEDULE, not a
+  numerical route.  Gate `tests/test_transverse_factor_hoist.py`: exact
+  bit equality vs the fused path across meshes, both gather tiers, both
+  factor schedules, two r-chunks per factor, non-dividing nq + padded mu.
+* **DISTRIBUTED** (`distributed_lu = scalapack`, host): `pXgetrf` ONCE
+  at the logical extent, factors kept 2-D block-cyclic, per-rank ipiv
+  threaded verbatim into `pXgetrs` per r-chunk (split FFI handlers
+  `lorrax_scalapack_batched_getrf`/`_getrs`; an old host .so without
+  them refuses at resolve time).  `pXgetrf` on the same tile is
+  bit-identical whether or not the `getrs` follows immediately — the
+  split-vs-fused contract cell `scalapack_getrf_getrs` pins exact
+  equality (incl. factor reuse across two RHS) at 1x1 and on a 2x2
+  process mesh.
+* `cusolvermp` (CUDA) still runs the FUSED per-r-chunk getrf+getrs —
+  the hoist port is pending; the CCT-passthrough + `lu_piv=None` fused
+  branches in `solve_zeta` are preserved exactly for it.
 
-Design for closing it (registered in the sandbox defect ledger): hoist a
-transverse factor stage that computes per-q LU factors ONCE per channel
-(`getrf` on the ridged logical tile is bit-identical whether or not the
-`getrs` follows immediately), stores them as the family's factor object
-(local plan: q-parallel whole-tile `lu_factor`, replicated gather tiers
-reused; distributed plan: keep the `pXgetrf` factors block-cyclic and call
-`pXgetrs` per r-chunk).  Gate idiom identical to the charge fold:
-bit-identity of the hoisted path vs the fused path at fixture size, both
-modes, non-dividing nq, padded mu.  This is a new stage + cache + gates,
-not a fold of an existing one — estimate 2–4 focused sessions including a
-bispinor A/B on the 4×4 deck.
+The distributed route still requires the LOGICAL mu_T extent to divide
+both mesh axes (pad-extent LU roundoff is amplified O(1) in near-null
+transverse modes): pick transverse centroid counts divisible by the mesh
+axes (the 4×4 deck now has `centroids_T_div136.txt`, 136 = %8==0) or
+auto demotes (announced) to the local plan.
+
+**Certified example (job 7885126, MoS2 4×4 bispinor deck, TLU host
+.so):** bi4 (402c+143T, P=4) and bi16 (785c+275T, P=16) hoisted-vs-fused
+EXACT-0 on eqp0/eqp1/eqp_g0w0/sigma_diag AND sigma_mnk.h5; scalapack
+split-vs-fused (402c+136T, P=4) EXACT-0 likewise; distributed-vs-local
+gauge delta 0.0 at .dat print precision, 1.1e-13 eV sigma_mnk.h5.
+Measured effect at bi16: per-channel `zeta_fit.chunk.solve` 4.3–12.8 s →
+1.7–2.8 s (per-r-chunk re-factorization gone), GW wall 214.3 → 201.2 s;
+grows with n_rchunks·P at production mu_T.
 
 ## Pointers
 

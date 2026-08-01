@@ -2023,6 +2023,291 @@ def _factor_c_q_replicated_qparallel(
 
 
 # =============================================================================
+# The hoisted TRANSVERSE factor stage (bispinor mu_L = 1, 2, 3)
+# =============================================================================
+#
+# The transverse CCT is Hermitian INDEFINITE — no Cholesky, no eigh-based
+# rank truncation.  Historically factor_c_q passed the (identity-padded)
+# CCT through unfactored and solve_zeta re-ran the pivoted LU on EVERY
+# r-chunk (on every rank on the local path; on the mesh but still per
+# r-chunk under distributed_lu=scalapack): nq·mu_T³·n_rchunks redundant
+# work, and the q-parallel charge fold could not apply because there was
+# no factor stage to schedule.  The functions below hoist the factor so
+# the transverse channels have the SAME two plans as the charge family:
+#
+# * LOCAL plan ('lu') — per-q pivoted LU on the whole ridged LOGICAL
+#   tile, computed ONCE per channel (q-parallel over devices at P>1 under
+#   the charge fold's policy), stored as (LU, perm) with the LU factors
+#   identity-re-embedded at the padded extent so every downstream gather
+#   tier (replicated / per_q) consumes them exactly like the CCT it
+#   replaced.  BIT-IDENTICAL to the fused per-r-chunk solve:
+#   jnp.linalg.solve(A, b) IS lax.linalg.lu(A) followed by
+#   lax.linalg.lu_solve(lu, perm, b, 0) (jax _solve), and this stage runs
+#   exactly those two ops with the factor cached between r-chunks.
+#   Gate: tests/test_transverse_factor_hoist.py (exact equality).
+# * DISTRIBUTED plan ('scalapack_lu', host mesh) — per-q ScaLAPACK
+#   pXgetrf run ONCE per channel at the LOGICAL extent, factors kept 2-D
+#   block-cyclic, per-rank ipiv threaded alongside; solve_zeta calls
+#   pXgetrs per r-chunk.  getrf on the ridged logical tile is
+#   bit-identical whether or not the getrs follows immediately (same
+#   descriptors, same grid — the fused handler runs the same two calls
+#   back to back), so this differs from the fused path only in WHEN the
+#   factor work happens.
+#
+# 'cusolvermp_lu' (CUDA mesh) keeps the FUSED per-r-chunk getrf+getrs
+# path for now: splitting its FFI handler is mechanical but cannot be
+# validated on the Frontera CPU stage — factor_c_q returns the CCT
+# passthrough with piv=None and solve_zeta dispatches as before.
+
+# The per-q diagonal ridge for the indefinite transverse LU:
+# eps·|tr(C_log)|/n_log lifts TRS-paired near-zero modes above the
+# partial-pivoting stability floor without perturbing well-conditioned
+# ones.  Module constant so the hoisted factor stage and solve_zeta's
+# fused fallback paths cannot drift.
+_TRANSVERSE_LU_RIDGE = 1e-12
+
+_transverse_lu_cache: dict = {}      # hoisted local LU factor kernels
+_transverse_scalapack_cache: dict = {}  # hoisted distributed getrf kernels
+
+
+def _transverse_lu_math(C_log: jax.Array, n_log: int):
+    """Per-q hoisted transverse LU arithmetic — ONE kernel shared by the
+    all-ranks and q-parallel executions (bit-identity contract, same role
+    as ``_charge_factor_math``).
+
+    ``C_log``: one whole REPLICATED logical tile ``(n_log, n_log)``.
+    Returns ``(lu, piv)`` with ``lu`` the packed L/U factors and ``piv``
+    the int32 LAPACK pivots — the pair ``jnp.linalg.solve`` computes
+    internally (``lax.linalg.lu``), so ``jax.scipy.linalg.lu_solve((lu,
+    piv), Z)`` at solve time runs the identical
+    ``lu_pivots_to_permutation`` + ``lax_linalg.lu_solve`` arithmetic and
+    reproduces the fused ``jnp.linalg.solve(C_reg, Z)`` to the bit.  The
+    ridge uses ``jnp.trace`` on the replicated tile — the same
+    expression (same reduction order, same bits) the fused
+    ``_ridge_indef_solve`` used.
+    """
+    ridge = _TRANSVERSE_LU_RIDGE * jnp.abs(jnp.trace(C_log)) / n_log
+    C_reg = C_log + ridge * jnp.eye(n_log, dtype=C_log.dtype)
+    lu, piv, _perm = jax.lax.linalg.lu(C_reg)
+    return lu, piv.astype(jnp.int32)
+
+
+def _embed_lu_padded(LU_log: jax.Array, n_rmu: int, n_log: int,
+                     mesh_xy: Mesh) -> jax.Array:
+    """Zero-embed per-q LOGICAL LU factors at the padded extent and set
+    identity on the pad-block diagonal (shape/sharding uniformity only:
+    the back-solve slices back to the logical block, so the pad content
+    is never part of any solve — same contract as the charge factor's
+    identity pad)."""
+    if int(n_rmu) == int(n_log):
+        return jax.lax.with_sharding_constraint(
+            LU_log, NamedSharding(mesh_xy, P(None, 'x', 'y')))
+    pad = int(n_rmu) - int(n_log)
+    LU_pad = jnp.pad(LU_log, ((0, 0), (0, pad), (0, pad)))
+    return _identity_pad_block_diagonal(
+        LU_pad, n_rmu_logical=int(n_log), mesh_xy=mesh_xy)
+
+
+def _factor_c_q_transverse_lu(
+    C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
+) -> tuple[jax.Array, jax.Array]:
+    """LOCAL-plan hoisted transverse factor: per-q pivoted LU of the
+    ridged LOGICAL block, once per channel.
+
+    Returns ``(LU_q, perm_q)``:
+
+    * ``LU_q`` ``(nq, n_rmu, n_rmu)`` at PADDED extent, sharded
+      ``P(None, 'x', 'y')`` — the packed L/U factors in the logical
+      block, identity in the pad block.  Downstream gather tiers
+      (replicated / per_q) consume it exactly like the CCT passthrough
+      they used to gather: same shape, same sharding, same bytes moved.
+    * ``perm_q`` ``(nq, n_log)`` int32, replicated — the LU permutation
+      for ``lax.linalg.lu_solve``.
+
+    Execution schedule mirrors the charge fold
+    (:func:`_factor_c_q_replicated_qparallel`): q-parallel over the
+    flattened mesh when :func:`_qparallel_factor_ok` says so (the factor
+    is per-q independent; scatter/gather reshards are exact byte moves;
+    the per-q arithmetic is the ONE shared kernel
+    :func:`_transverse_lu_math`), all-ranks whole-tile execution
+    otherwise.  Both produce the same bits.
+    """
+    nq, n_rmu, _ = C_q.shape
+    n_log = int(n_rmu_logical)
+    qparallel = _qparallel_factor_ok(nq, n_log, mesh_xy)
+    out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    if not qparallel:
+        # All-ranks execution: replicate whole logical tiles per q-batch
+        # (bounded exactly like the charge factor's batched path) and run
+        # the shared kernel vmapped.  Every rank factors every q —
+        # affordable because it now happens ONCE per channel, not per
+        # r-chunk; per-q independent, so concatenating batches reproduces
+        # the one-shot call.
+        step = _replicated_factor_q_chunk(nq, n_log)
+        key = (id(mesh_xy), int(n_rmu), n_log, 'batch')
+        if key not in _transverse_lu_cache:
+            @partial(jax.jit,
+                     out_shardings=(out_sh, NamedSharding(mesh_xy, P(None, None))))
+            def _fn(C):
+                def _fact_log(C_log):
+                    C_log = jax.lax.with_sharding_constraint(
+                        C_log, NamedSharding(mesh_xy, P(None, None, None)))
+                    return jax.vmap(
+                        lambda C1: _transverse_lu_math(C1, n_log))(C_log)
+                # Slice to logical, factor, re-embed (LU only; perm is
+                # logical-extent by definition).
+                LU_log, perm = _fact_log(C[:, :n_log, :n_log])
+                return _embed_lu_padded(LU_log, int(n_rmu), n_log,
+                                        mesh_xy), perm
+            _transverse_lu_cache[key] = _fn
+        _fn = _transverse_lu_cache[key]
+        if step >= nq:
+            return _fn(C_q)
+        parts = [_fn(C_q[q0:min(q0 + step, nq)])
+                 for q0 in range(0, nq, step)]
+        LU_q = jax.device_put(
+            jnp.concatenate([p[0] for p in parts], axis=0), out_sh)
+        perm_q = jax.device_put(
+            jnp.concatenate([p[1] for p in parts], axis=0),
+            NamedSharding(mesh_xy, P(None, None)))
+        return LU_q, perm_q
+    key = (id(mesh_xy), int(nq), int(n_rmu), n_log, 'qpar')
+    if key not in _transverse_lu_cache:
+        _qparallel_announce_transverse(nq, n_rmu, n_log, mesh_xy)
+        ndev = int(mesh_xy.devices.size)
+        py = int(mesh_xy.shape['y'])
+        nq_pad = round_up(int(nq), ndev)
+        blk = nq_pad // ndev
+        q_sh = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
+        mid_sh = NamedSharding(mesh_xy, P('x', None, 'y'))
+
+        def _local_factor(C_loc):
+            # C_loc: (blk, n_log, n_log) whole logical tiles for the
+            # q's this device owns (global q = dev·blk + i).
+            dev = jax.lax.axis_index('x') * py + jax.lax.axis_index('y')
+
+            def _fact(C1):
+                lu1, perm1 = _transverse_lu_math(C1[0], n_log)
+                return lu1[None], perm1[None]
+
+            def _skip(C1):
+                return (jnp.zeros_like(C1),
+                        jnp.zeros((1, n_log), dtype=jnp.int32))
+
+            def _one(i, accs):
+                LU_acc, perm_acc = accs
+                C1 = jax.lax.dynamic_slice_in_dim(C_loc, i, 1, axis=0)
+                LU1, perm1 = jax.lax.cond(
+                    dev * blk + i < nq, _fact, _skip, C1)
+                return (jax.lax.dynamic_update_slice(
+                            LU_acc, LU1, (i, 0, 0)),
+                        jax.lax.dynamic_update_slice(
+                            perm_acc, perm1, (i, 0)))
+
+            return jax.lax.fori_loop(
+                0, blk, _one,
+                (jnp.zeros_like(C_loc),
+                 jnp.zeros((blk, n_log), dtype=jnp.int32)))
+
+        _sm = shard_map(_local_factor, mesh=mesh_xy,
+                        in_specs=P(('x', 'y'), None, None),
+                        out_specs=(P(('x', 'y'), None, None),
+                                   P(('x', 'y'), None)),
+                        check_rep=False)
+
+        @partial(jax.jit,
+                 out_shardings=(out_sh, NamedSharding(mesh_xy, P(None, None))))
+        def _fn(C):
+            C = C[:, :n_log, :n_log]
+            if nq_pad > nq:
+                C = jnp.pad(C, ((0, nq_pad - nq), (0, 0), (0, 0)))
+            # Single-axis staging both ways (see the charge fold).
+            C = jax.lax.with_sharding_constraint(C, mid_sh)
+            C = jax.lax.with_sharding_constraint(C, q_sh)
+            LU_log, perm = _sm(C)
+            LU_log = LU_log[:nq]
+            perm = perm[:nq]
+            LU_log = jax.lax.with_sharding_constraint(LU_log, mid_sh)
+            return _embed_lu_padded(LU_log, int(n_rmu), n_log,
+                                    mesh_xy), perm
+        _transverse_lu_cache[key] = _fn
+    return _transverse_lu_cache[key](C_q)
+
+
+_transverse_qparallel_announced: set = set()
+
+
+def _qparallel_announce_transverse(nq: int, n_rmu: int, n_log: int,
+                                   mesh_xy: Mesh) -> None:
+    """Rank-0, deduplicated: name the schedule the hoisted transverse
+    factor runs (mirror of ``_qparallel_announce``)."""
+    if jax.process_index() != 0:
+        return
+    ndev = int(mesh_xy.devices.size)
+    sig = ('T', id(mesh_xy), int(nq), int(n_rmu), int(n_log))
+    if sig in _transverse_qparallel_announced:
+        return
+    _transverse_qparallel_announced.add(sig)
+    blk = -(-int(nq) // ndev)
+    print(f"  [zeta transverse factor] hoisted per-q LU, q-parallel "
+          f"execution: nq={nq} scattered over {ndev} devices "
+          f"(ceil(nq/P)={blk} whole ({n_log},{n_log}) tile(s)/device); "
+          f"factors are bit-identical to the all-ranks execution "
+          f"(LORRAX_ZETA_QPARALLEL=0 restores it)", flush=True)
+
+
+def _factor_c_q_transverse_scalapack(
+    C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
+) -> tuple[jax.Array, jax.Array]:
+    """DISTRIBUTED-plan hoisted transverse factor: per-q ScaLAPACK
+    ``pXgetrf`` on the ridged LOGICAL block, once per channel, factors
+    kept 2-D block-cyclic.
+
+    Returns ``(LU_q, ipiv_q)``:
+
+    * ``LU_q`` ``(nq, n_log, n_log)`` at the LOGICAL extent (the resolve
+      contract guarantees ``n_log % px == n_log % py == 0`` on this
+      path), sharded ``P(None, 'x', 'y')`` — each rank's shard IS its
+      block-cyclic local block (one-tile-per-rank layout).
+    * ``ipiv_q`` ``(nq, P·ipiv_len)`` int32 sharded
+      ``P(None, ('x','y'))`` — each rank's own ScaLAPACK ipiv rows,
+      threaded back verbatim into ``pXgetrs`` per r-chunk.  Never
+      gathered, never interpreted host-side.
+
+    The ridge uses the SAME einsum expression over the sharded logical
+    block that ``fit_zeta_to_h5`` fed the fused path as
+    ``cct_trace_per_q`` — same reduction order, same bits, so the
+    factored matrix is bit-identical to the one the fused
+    ``batched_distributed_solve_lu`` factored every r-chunk.
+    """
+    nq, n_rmu, _ = C_q.shape
+    n_log = int(n_rmu_logical)
+    batched_distributed_getrf = backend_module(
+        'scalapack').batched_distributed_getrf
+    xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+
+    key = (id(mesh_xy), int(nq), int(n_rmu), n_log)
+    if key not in _transverse_scalapack_cache:
+        @jax.jit
+        def _prep(C):
+            # Slice to the LOGICAL extent (load-bearing: pad-extent LU
+            # roundoff is amplified O(1) in the near-null transverse
+            # modes — ROOT_CAUSE.md 2026-07-08) and add the per-q ridge.
+            C_log = jax.lax.with_sharding_constraint(
+                C[:, :n_log, :n_log], xy_shard)
+            trace_per_q = jnp.einsum('qii->q', C_log)
+            ridge = (_TRANSVERSE_LU_RIDGE
+                     * jnp.abs(trace_per_q) / n_log)[:, None, None]
+            eye_n = jnp.eye(n_log, dtype=C.dtype)[None, :, :]
+            return jax.lax.with_sharding_constraint(
+                C_log + ridge * eye_n, xy_shard)
+        _transverse_scalapack_cache[key] = _prep
+    C_reg = _transverse_scalapack_cache[key](C_q)
+    LU_q, ipiv_q = batched_distributed_getrf(C_reg, mesh=mesh_xy)
+    return LU_q, ipiv_q
+
+
+# =============================================================================
 # The `distributed` ζ tier — 2D-sharded rank truncation and back-solve
 # =============================================================================
 #
@@ -2491,12 +2776,15 @@ def factor_c_q(
     triangular solves per-q.
 
     For ``vertex_mu_L != 0`` (transverse Lorentz channels γ̃^i, i∈{1,2,3})
-    the CCT is Hermitian but **indefinite** — Cholesky NaNs and the LU
-    fallback in :func:`solve_zeta` is required.  In this case
-    we skip the factorization here and pass C_q through unchanged; the
-    solve routine consumes it via ``jnp.linalg.solve`` on a per-q-batch
-    basis (one LU per call, small enough that explicit
-    ``lu_factor`` + ``lu_solve`` reuse buys nothing).
+    the CCT is Hermitian but **indefinite** — Cholesky NaNs; the factor
+    is a per-q pivoted LU with a stabilising ridge, HOISTED here (once
+    per channel) since 2026-08-01.  The return value is a PAIR
+    ``(factor, piv)``: the local plan stores ``(LU, perm)`` for
+    ``lax.linalg.lu_solve`` (bit-identical to the fused per-r-chunk
+    ``jnp.linalg.solve`` it replaced), the scalapack plan stores the
+    block-cyclic ``pXgetrf`` factors + per-rank ``ipiv`` for ``pXgetrs``
+    per r-chunk, and the cusolvermp plan still passes the CCT through
+    (fused per-r-chunk getrf+getrs; hoist not yet ported to CUDA).
 
     Padded-input path (``n_rmu_logical < C_q.shape[-1]``):
     n_rmu may be padded to mesh divisibility at the boundary so the
@@ -2553,12 +2841,13 @@ def factor_c_q(
             slated for removal.
 
     Returns:
-        L_q: ``(nq, n_rmu, n_rmu)`` at PADDED extent, sharded
-        ``P(None, 'x', 'y')``.  For ``vertex_mu_L == 0``: the Cholesky
-        factor (block-diagonal ``[L_log 0; 0 I_pad]``) for the cholesky
-        paths, or the rank-revealing pseudo-inverse factor ``B``
-        (``B Bᴴ = C⁺``) for ``'replicated_rank_truncate'``; passthrough
-        identity-padded CCT for ``vertex_mu_L ≠ 0``.
+        For ``vertex_mu_L == 0``: L_q ``(nq, n_rmu, n_rmu)`` at PADDED
+        extent, sharded ``P(None, 'x', 'y')`` — the Cholesky factor
+        (block-diagonal ``[L_log 0; 0 I_pad]``) for the cholesky paths,
+        or the rank-revealing pseudo-inverse factor ``B``
+        (``B Bᴴ = C⁺``) for ``'replicated_rank_truncate'``.
+        For ``vertex_mu_L ≠ 0``: the PAIR ``(factor, piv)`` described
+        above (piv is None only on the cusolvermp passthrough).
     """
     nq, n_rmu, n_rmu2 = C_q.shape
     assert n_rmu == n_rmu2, f"C_q must be square, got {n_rmu} x {n_rmu2}"
@@ -2575,12 +2864,30 @@ def factor_c_q(
     C_q = _identity_pad_block_diagonal(
         C_q, n_rmu_logical=n_rmu_logical, mesh_xy=mesh_xy)
 
-    # Indefinite-CCT path: skip the Cholesky outright.  ``solve_zeta``
-    # consumes C_q directly via the SVD pseudoinverse / pivoted-LU
-    # branch.  After identity-pad the matrix is non-singular at the
-    # padded extent; the indefinite logical block is untouched.
+    # Indefinite-CCT path: no Cholesky, no eigh truncation — the factor
+    # is a per-q pivoted LU, HOISTED here so it runs ONCE per channel
+    # instead of on every r-chunk (see the "hoisted TRANSVERSE factor
+    # stage" section above).  Returns a (factor, piv) PAIR:
+    #   'lu'           -> (LU embedded at padded extent, perm)  [local]
+    #   'scalapack_lu' -> (block-cyclic LU at logical extent, ipiv)
+    #   'cusolvermp_lu'-> (identity-padded CCT passthrough, None)
+    #                     [fused per-r-chunk getrf+getrs kept on CUDA]
     if int(vertex_mu_L) != 0:
-        return C_q
+        t_kind = _resolve_solver_kind(
+            mesh_xy, int(vertex_mu_L), solver_kind, n_rmu=n_rmu_logical)
+        if t_kind == 'scalapack_lu':
+            return _factor_c_q_transverse_scalapack(
+                C_q, mesh_xy, n_rmu_logical)
+        if t_kind == 'cusolvermp_lu':
+            if jax.process_index() == 0:
+                print("  [zeta transverse factor] cusolvermp_lu keeps the "
+                      "fused per-r-chunk getrf+getrs (factor hoist not yet "
+                      "ported to the CUDA backend)", flush=True)
+            return C_q, None
+        if t_kind != 'lu':
+            raise ValueError(
+                f"factor_c_q: unknown transverse solver_kind {t_kind!r}")
+        return _factor_c_q_transverse_lu(C_q, mesh_xy, n_rmu_logical)
 
     solver_kind = _resolve_solver_kind(mesh_xy, vertex_mu_L=0, solver_kind=solver_kind)
 
@@ -2782,6 +3089,7 @@ def solve_zeta(
     cct_trace_per_q: jax.Array | None = None,
     n_rmu_logical: int | None = None,
     zeta_gather: str = "replicated",
+    lu_piv: jax.Array | None = None,
 ) -> jax.Array:
     """
     Solve for zeta_q given pre-computed system matrix from
@@ -2792,13 +3100,19 @@ def solve_zeta(
     (``L y = Z`` then ``L^H ζ = y``).  This is the historical fast
     path — bit-identical to the previous implementation.
 
-    For ``vertex_mu_L != 0`` ``L_q`` is the *unfactored* CCT^μ matrix.
-    The transverse-channel CCT^μ is Hermitian but indefinite — γ̃^i ⊗
-    γ̃^i has both signs of eigenvalue (eigenvalues of α^i are ±1), so
-    Cholesky is invalid.  We solve via pivoted LU (``jnp.linalg.solve``)
-    with a small diagonal ridge ``ε·|tr(L)|/n_rmu`` (ε = 1e-12) added
-    to lift TRS-paired near-zero modes safely above the LU stability
-    floor.  Bunch-Kaufman LDL^T would be the natural Hermitian-
+    For ``vertex_mu_L != 0`` the transverse CCT^μ is Hermitian but
+    indefinite — γ̃^i ⊗ γ̃^i has both signs of eigenvalue, so Cholesky is
+    invalid and the factor is a pivoted LU with a small diagonal ridge
+    ``ε·|tr(C_log)|/n_log`` (ε = :data:`_TRANSVERSE_LU_RIDGE`).  Since
+    the 2026-08 hoist ``factor_c_q`` computes that LU ONCE per channel:
+    ``L_q`` then carries the packed factors and ``lu_piv`` the
+    permutation (local plan) / per-rank ScaLAPACK ipiv (scalapack plan),
+    and this routine only APPLIES them per r-chunk
+    (``lax.linalg.lu_solve`` — bit-identical to the fused
+    ``jnp.linalg.solve`` — or ``pXgetrs``).  When ``lu_piv`` is None
+    (cusolvermp plan, or a legacy caller passing the raw CCT) the fused
+    per-r-chunk factor+solve paths below remain and behave exactly as
+    before.  Bunch-Kaufman LDL^T would be the natural Hermitian-
     indefinite factorization but JAX doesn't expose it; pivoted LU is
     numerically equivalent for our purposes.
 
@@ -2925,13 +3239,50 @@ def solve_zeta(
             Z_q, mesh_xy,
             lambda Z: _mp.batched_distributed_potrs(L_handle, Z, mesh=mesh_xy))
 
+    if solver_kind == 'scalapack_lu' and lu_piv is not None:
+        # HOISTED distributed plan: ``L_q`` carries the block-cyclic
+        # ``pXgetrf`` factors at the LOGICAL extent (factored ONCE per
+        # channel in :func:`_factor_c_q_transverse_scalapack`, ridge
+        # baked in) and ``lu_piv`` the per-rank ipiv shards.  Only
+        # ``pXgetrs`` runs per r-chunk — same descriptors, same grid,
+        # same solve bits as the fused handler's back-to-back pair.
+        batched_distributed_getrs = backend_module(
+            'scalapack').batched_distributed_getrs
+        xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+        n_rows_pad = int(Z_q.shape[1])
+
+        def _run_getrs(Z):
+            # μ-slice the RHS to the LOGICAL extent and zero-refill ζ's
+            # pad rows after — the solve_at_logical invariant, written
+            # out because the extent comes from Z (the factor operand is
+            # ALREADY logical, so the helper would read the wrong pad
+            # extent off it).  Z pad rows are exact zeros by the Phase 3a
+            # contract, so the sliced system IS the logical system.
+            Z_log = jax.lax.with_sharding_constraint(
+                Z[:, :n_log, :], xy_shard)
+            X_log = batched_distributed_getrs(
+                L_q, lu_piv, Z_log, mesh=mesh_xy)
+            if n_rows_pad != n_log:
+                X_log = jnp.pad(
+                    X_log, ((0, 0), (0, n_rows_pad - n_log), (0, 0)))
+            return jax.lax.with_sharding_constraint(X_log, xy_shard)
+
+        return _distributed_backsolve(Z_q, mesh_xy, _run_getrs)
+
     if solver_kind in ('cusolvermp_lu', 'scalapack_lu'):
-        # Distributed getrf+getrs for the transverse channels.  L_q here
-        # is the *unfactored* CCT^μ (Hermitian indefinite) — factor_c_q
-        # passes it through.  Same input sharding, output reshard, and
-        # column padding pattern as the cholesky branch.  The two
-        # backends share this branch verbatim — identical call contract;
-        # scalapack is the host/CPU-backend twin (Cray LibSci).
+        # FUSED distributed getrf+getrs for the transverse channels
+        # (cusolvermp always — factor hoist not yet ported to CUDA — and
+        # scalapack only for legacy callers that passed the raw CCT).
+        # L_q here is the *unfactored* CCT^μ (Hermitian indefinite) —
+        # factor_c_q passes it through.  Same input sharding, output
+        # reshard, and column padding pattern as the cholesky branch.
+        # The two backends share this branch verbatim — identical call
+        # contract; scalapack is the host/CPU-backend twin (Cray LibSci).
+        if lu_piv is not None:
+            raise ValueError(
+                f"solve_zeta: lu_piv was passed with solver_kind="
+                f"{solver_kind!r}, but the fused branch expects the raw "
+                f"CCT (the {solver_kind} factor hoist does not exist).")
         batched_distributed_solve_lu = backend_module(
             'scalapack' if solver_kind == 'scalapack_lu' else 'cusolvermp'
         ).batched_distributed_solve_lu
@@ -3010,7 +3361,15 @@ def solve_zeta(
     # near-zero modes from TRS-paired band cancellations safely above
     # the LU stability floor — small enough not to perturb the
     # well-conditioned modes.
-    LU_RIDGE = 1e-12
+    LU_RIDGE = _TRANSVERSE_LU_RIDGE
+
+    # HOISTED transverse back-solve: factor_c_q already ran the pivoted
+    # LU (once per channel) and handed us (LU factors, permutation).
+    # This routine then only APPLIES lax.linalg.lu_solve per r-chunk —
+    # the same call jnp.linalg.solve makes after its internal lu(), so
+    # the bits match the fused path exactly.  ``lu_piv is None`` keeps
+    # the fused per-r-chunk factor+solve (legacy callers, cusolvermp).
+    hoisted_lu = bool(use_lu and lu_piv is not None)
 
     # ``use_rank_trunc`` selects the matmul back-solve for the charge
     # rank-truncation factor: ``L_q`` is then the pseudo-inverse factor B
@@ -3041,7 +3400,16 @@ def solve_zeta(
     # cache too.
     cache_key = ('solve_from_L', id(mesh_xy), nq, n_rmu, n_log,
                  n_zchunk_padded, q_chunk_size, bool(use_lu),
-                 bool(use_rank_trunc), bool(per_q_gather))
+                 bool(use_rank_trunc), bool(per_q_gather),
+                 bool(hoisted_lu))
+
+    # Uniform piv operand for the kernels below: the real (nq, n_log)
+    # permutation on the hoisted-LU path, a (nq, 1) placeholder (dead
+    # operand, DCE'd by XLA) everywhere else — same idiom as the
+    # cct_trace placeholder in fit_one_rchunk.
+    piv_arr = (lu_piv if hoisted_lu
+               else jnp.zeros((nq, 1), dtype=jnp.int32))
+    piv_rep_shard = NamedSharding(mesh_xy, P(None, None))
 
     def _ridge_indef_solve(L: jax.Array, Z: jax.Array) -> jax.Array:
         """Solve (L + ε·tr(L)/n · I) · ζ = Z via pivoted LU at the
@@ -3060,6 +3428,23 @@ def solve_zeta(
             L_reg = L_log + ridge * jnp.eye(n_log, dtype=L.dtype)
             return jnp.linalg.solve(L_reg, Z_log)
         return solve_at_logical(_ridged_lu, n_log, (L,), Z)
+
+    def _lu_apply_logical(LU: jax.Array, piv: jax.Array,
+                          Z: jax.Array) -> jax.Array:
+        """HOISTED transverse back-solve at the LOGICAL μ extent: apply
+        the per-q ``(LU, piv)`` factor that ``factor_c_q`` computed once
+        per channel.  ``jax.scipy.linalg.lu_solve((lu, piv), Z)`` runs
+        ``lu_pivots_to_permutation`` + ``lax_linalg.lu_solve`` — exactly
+        the arithmetic ``jnp.linalg.solve`` runs after its internal
+        ``lu()`` — so the result is bit-identical to the fused
+        ``_ridge_indef_solve`` path this replaces (the ridge is baked
+        into the factor).  ``piv`` is built at the logical extent
+        already; ``solve_at_logical`` slices LU/Z and zero-refills ζ's
+        pad rows (gate: tests/test_transverse_factor_hoist.py)."""
+        return solve_at_logical(
+            lambda LU_log, Z_log: jax.scipy.linalg.lu_solve(
+                (LU_log, piv), Z_log, trans=0),
+            n_log, (LU,), Z)
 
     def _tri_solve_logical(L: jax.Array, Z: jax.Array) -> jax.Array:
         """Charge-channel two-triangular back-solve at the LOGICAL μ
@@ -3098,38 +3483,50 @@ def solve_zeta(
                 return _ridge_indef_solve(L, Z_cols)
             return _tri_solve_logical(L, Z_cols)
 
-        # Vectorized solve for a batch of q-points
+        # Vectorized solve for a batch of q-points.  ``piv_batch`` is the
+        # hoisted-LU permutation (replicated; placeholder + dead on every
+        # other path — see ``piv_arr`` above).
         @partial(shard_map, mesh=mesh_xy,
-                 in_specs=(P(None, None, None), P(None, None, ('x', 'y'))),
+                 in_specs=(P(None, None, None), P(None, None, ('x', 'y')),
+                           P(None, None)),
                  out_specs=P(None, None, ('x', 'y')))
-        def _sharded_cho_solve_batch(L_batch: jax.Array, Z_batch: jax.Array) -> jax.Array:
+        def _sharded_cho_solve_batch(L_batch: jax.Array, Z_batch: jax.Array,
+                                     piv_batch: jax.Array) -> jax.Array:
             """Solve (B_q, n_rmu, n_rmu) @ (B_q, n_rmu, n_cols) -> (B_q, n_rmu, n_cols)"""
             if use_rank_trunc:
                 # C⁺ factor matmul back-solve, per-q vmapped (same reshard
                 # plan as the Cholesky/LU paths so the caller is agnostic).
                 return jax.vmap(_pinv_matmul_logical)(L_batch, Z_batch)
+            if hoisted_lu:
+                # Apply the once-per-channel (LU, perm) factor.
+                return jax.vmap(_lu_apply_logical)(
+                    L_batch, piv_batch, Z_batch)
             if use_lu:
-                # ``jnp.linalg.solve`` is natively batched on the leading
-                # axis and dispatches one LU factorization per q.  Same
-                # vmap structure as the Cholesky path so reshard plans
-                # match.  We vmap the ridge-add per-q so each LU sees
-                # its own conditioning shift.
+                # FUSED fallback (lu_piv=None): ``jnp.linalg.solve`` is
+                # natively batched on the leading axis and dispatches one
+                # LU factorization per q.  Same vmap structure as the
+                # Cholesky path so reshard plans match.  We vmap the
+                # ridge-add per-q so each LU sees its own conditioning
+                # shift.
                 return jax.vmap(_ridge_indef_solve)(L_batch, Z_batch)
             return jax.vmap(_tri_solve_logical)(L_batch, Z_batch)
 
         @partial(jax.jit, donate_argnums=(2,))
-        def _solve_batch_and_update(L_batch_sharded, Z_batch_col, zeta_acc, q_start):
+        def _solve_batch_and_update(L_batch_sharded, Z_batch_col, zeta_acc,
+                                    q_start, piv_batch):
             """Solve one q-batch and update zeta_acc via dynamic_update_slice.
             donate_argnums=(2,) donates zeta_acc so XLA reuses its buffer."""
             L_rep = jax.lax.with_sharding_constraint(L_batch_sharded, L_batch_rep_shard)
-            batch_result = _sharded_cho_solve_batch(L_rep, Z_batch_col)
+            piv_rep = jax.lax.with_sharding_constraint(piv_batch, piv_rep_shard)
+            batch_result = _sharded_cho_solve_batch(L_rep, Z_batch_col, piv_rep)
             return jax.lax.dynamic_update_slice(zeta_acc, batch_result, (q_start, 0, 0))
 
         @jax.jit
-        def _solve_all_at_once(L_q_sharded, Z_col):
+        def _solve_all_at_once(L_q_sharded, Z_col, piv):
             """Fast path: solve all q-points in a single batched call."""
             L_full_rep = jax.lax.with_sharding_constraint(L_q_sharded, L_batch_rep_shard)
-            return _sharded_cho_solve_batch(L_full_rep, Z_col)
+            piv_rep = jax.lax.with_sharding_constraint(piv, piv_rep_shard)
+            return _sharded_cho_solve_batch(L_full_rep, Z_col, piv_rep)
 
         # PER-Q tier.  The q-selection happens INSIDE a shard_map, where
         # the gather is a `lax.all_gather` on an already-sliced tile — so
@@ -3166,10 +3563,11 @@ def solve_zeta(
                  in_specs=(P(None, 'x', 'y'),            # L_q  (nq, μ, μ)
                            P(None, None, ('x', 'y')),    # Z_col
                            P(None, None, ('x', 'y')),    # zeta_acc
-                           P()),                         # q (replicated scalar)
+                           P(),                          # q (replicated scalar)
+                           P(None, None)),               # piv (replicated)
                  out_specs=P(None, None, ('x', 'y')),
                  check_rep=False)
-        def _per_q_block(L_loc, Z_loc, zeta_loc, q):
+        def _per_q_block(L_loc, Z_loc, zeta_loc, q, piv_loc):
             # L_loc: (nq, μ/Px, μ/Py) — this rank's 2-D block of the stack.
             L_one = jax.lax.dynamic_slice_in_dim(L_loc, q, 1, axis=0)
             # Rebuild EXACTLY the replicated (1, μ, μ) tile the batched
@@ -3178,11 +3576,14 @@ def solve_zeta(
             L_row = jax.lax.all_gather(L_one, 'x', axis=1, tiled=True)
             L_tile = jax.lax.all_gather(L_row, 'y', axis=2, tiled=True)
             Z_one = jax.lax.dynamic_slice_in_dim(Z_loc, q, 1, axis=0)
-            # Same three back-solve bodies as ``_sharded_cho_solve_batch``
+            piv_one = jax.lax.dynamic_slice_in_dim(piv_loc, q, 1, axis=0)
+            # Same back-solve bodies as ``_sharded_cho_solve_batch``
             # at batch 1 — identical shapes, identical operand values,
             # therefore bit-identical arithmetic.
             if use_rank_trunc:
                 out = jax.vmap(_pinv_matmul_logical)(L_tile, Z_one)
+            elif hoisted_lu:
+                out = jax.vmap(_lu_apply_logical)(L_tile, piv_one, Z_one)
             elif use_lu:
                 out = jax.vmap(_ridge_indef_solve)(L_tile, Z_one)
             else:
@@ -3191,7 +3592,7 @@ def solve_zeta(
                 zeta_loc, out, q, axis=0)
 
         @partial(jax.jit, donate_argnums=(2,))
-        def _solve_one_q_and_update(L_q_sharded, Z_col, zeta_acc, q):
+        def _solve_one_q_and_update(L_q_sharded, Z_col, zeta_acc, q, piv):
             """PER-Q tier: gather ONE ``(μ, μ)`` factor tile, solve that q,
             scatter into ``zeta_acc``.
 
@@ -3204,7 +3605,9 @@ def solve_zeta(
             """
             L_xy = jax.lax.with_sharding_constraint(
                 L_q_sharded, L_batch_xy_shard)
-            return _per_q_block(L_xy, Z_col, zeta_acc, jnp.asarray(q))
+            piv_rep = jax.lax.with_sharding_constraint(piv, piv_rep_shard)
+            return _per_q_block(L_xy, Z_col, zeta_acc, jnp.asarray(q),
+                                piv_rep)
 
         # Z reshard P(None,'x','y') → P(None,None,('x','y')), staged
         # through P('x',None,'y') so each step moves ONE mesh axis (see
@@ -3292,7 +3695,8 @@ def solve_zeta(
         # makes SPMD replicate the accumulator (documented at the
         # q-batch loop below).  Same reason, same shape of fix.
         for q in range(nq):
-            zeta = helpers.solve_one_q_and_update(L_q, Z_col, zeta, q)
+            zeta = helpers.solve_one_q_and_update(L_q, Z_col, zeta, q,
+                                                  piv_arr)
         del Z_col
         zeta = _reshard_zeta_r_XY_to_mu_XY(zeta, mesh_xy)
         if needs_padding:
@@ -3301,7 +3705,7 @@ def solve_zeta(
 
     # Fast path: solve all q-points at once
     if q_batch >= nq:
-        result = helpers.solve_all_at_once(L_q, Z_col)
+        result = helpers.solve_all_at_once(L_q, Z_col, piv_arr)
         del Z_col
         # Reshard r_XY → μ_XY so the downstream G-flat FFT runs
         # sharding-preserving (see _reshard_zeta_r_XY_to_mu_XY).
@@ -3323,7 +3727,8 @@ def solve_zeta(
     # constant DUS offsets AND sequential memory reuse.
     for q0 in range(0, nq_padded, q_batch):
         q1 = q0 + q_batch
-        zeta = helpers.solve_batch_and_update(L_q[q0:q1], Z_col[q0:q1], zeta, q0)
+        zeta = helpers.solve_batch_and_update(L_q[q0:q1], Z_col[q0:q1], zeta,
+                                              q0, piv_arr[q0:q1])
 
     del Z_col
 
@@ -3373,6 +3778,7 @@ def _make_fit_one_rchunk_kernel(
     solver_kind: str = 'auto',
     q_irr_full_idx: np.ndarray | None = None,
     zeta_gather: str = 'replicated',
+    lu_hoisted: bool = False,
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
     over every piece of static structure + a :class:`PsiGStore` that
@@ -3456,12 +3862,13 @@ def _make_fit_one_rchunk_kernel(
             mesh_xy=mesh_xy,
         )
 
-    def solve_phase(Z_q, L_q, cct_trace_per_q):
-        # IBZ-only solve (Phase B): L_q + cct_trace come in PRE-SLICED
-        # at IBZ rows (via ``symmetry_maps.slice_q_full_to_ibz``
-        # upstream in ``fit_zeta_to_h5``).  Z_q is built at full BZ by
-        # ``z_q_phase``, so it gets the IBZ slice here.  When
-        # ``q_irr_full_idx`` is None (write_ibz_only=False), all three
+    def solve_phase(Z_q, L_q, cct_trace_per_q, lu_piv=None):
+        # IBZ-only solve (Phase B): L_q + cct_trace + lu_piv come in
+        # PRE-SLICED at IBZ rows (via ``symmetry_maps.slice_q_full_to_ibz``
+        # upstream in ``fit_zeta_to_h5``; the factor stage runs after the
+        # slice, so its piv q-axis is already IBZ).  Z_q is built at full
+        # BZ by ``z_q_phase``, so it gets the IBZ slice here.  When
+        # ``q_irr_full_idx`` is None (write_ibz_only=False), all
         # arrays are full-BZ and the solve runs as before.
         if q_irr_idx_j is not None:
             Z_q_for_solve = Z_q[q_irr_idx_j]
@@ -3476,7 +3883,8 @@ def _make_fit_one_rchunk_kernel(
             solver_kind=solver_kind,
             cct_trace_per_q=cct_trace_per_q,
             n_rmu_logical=int(meta.n_rmu),
-            zeta_gather=zeta_gather)
+            zeta_gather=zeta_gather,
+            lu_piv=lu_piv)
 
     @jax.jit
     def _kernel(
@@ -3489,16 +3897,20 @@ def _make_fit_one_rchunk_kernel(
         gamma_perm,
         gamma_phase,
         cct_trace_per_q,
+        lu_piv,
     ):
         # Composed (z_q ∘ solve) under one ``@jax.jit`` — preserved for
         # the AOT memory model path which lowers a single callable.
         # Production ``fit_one_rchunk`` calls ``z_q_phase`` and
         # ``solve_phase`` directly with ``timing.section`` between, so
-        # the per-r-chunk breakdown is host-visible.
+        # the per-r-chunk breakdown is host-visible.  ``lu_piv`` is a
+        # placeholder unless ``lu_hoisted`` (the closure static that keys
+        # the cache) — the hoisted/fused distinction must be structural.
         Z_q = z_q_phase(
             psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
             norms_l, norms_r, r_start_dyn, gamma_perm, gamma_phase)
-        return solve_phase(Z_q, L_q, cct_trace_per_q)
+        return solve_phase(Z_q, L_q, cct_trace_per_q,
+                           lu_piv if lu_hoisted else None)
 
     # Attach the un-fused phases so ``fit_one_rchunk`` can time them.
     _kernel.z_q_phase = z_q_phase
@@ -3529,6 +3941,7 @@ def fit_one_rchunk(
     q_irr_full_idx: np.ndarray | None = None,
     cct_trace_per_q: jax.Array | None = None,
     zeta_gather: str = 'replicated',
+    lu_piv: jax.Array | None = None,
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -3560,6 +3973,7 @@ def fit_one_rchunk(
         bool(is_charge),
         str(solver_kind),
         str(zeta_gather),
+        bool(lu_piv is not None),
         (None if q_irr_full_idx is None
          else (int(q_irr_full_idx.shape[0]),
                hash(np.asarray(q_irr_full_idx,
@@ -3581,6 +3995,7 @@ def fit_one_rchunk(
             solver_kind=str(solver_kind),
             q_irr_full_idx=q_irr_full_idx,
             zeta_gather=str(zeta_gather),
+            lu_hoisted=bool(lu_piv is not None),
         )
         _fit_one_rchunk_cache[cache_key] = fn
     # cct_trace_per_q is None for the charge channel (Cholesky path
@@ -3615,7 +4030,7 @@ def fit_one_rchunk(
     _r1 = host_rss_gb() if _dbg else 0.0
     _t_s0 = time.perf_counter() if _dbg else 0.0
     with timing.section("zeta_fit.chunk.solve"):
-        zeta = fn.solve_phase(Z_q, L_q, cct_trace_per_q)
+        zeta = fn.solve_phase(Z_q, L_q, cct_trace_per_q, lu_piv)
         zeta.block_until_ready()
     _t_s = (time.perf_counter() - _t_s0) if _dbg else 0.0
     if _dbg and jax.process_index() == 0:
