@@ -56,7 +56,11 @@ nav:
       - Overview: installation/index.md
       - FFI native libraries: installation/ffi-native-libs.md
       - Perlmutter (NERSC): installation/perlmutter.md
-      - Environment reference: ENVIRONMENT_COMPREHENSIVE.md
+  - Environment:
+      - Overview: environment/overview.md
+      - Collective transports: environment/transports.md
+      - Frontera (TACC): environment/machines/frontera.md
+      - Perlmutter (NERSC): environment/machines/perlmutter.md
   - User guide:
       - Overview: user-guide/index.md
   - Theory:
@@ -68,6 +72,7 @@ nav:
       - HL-GPP derivation: theory/hl-gpp-derivation.md
   - Architecture:
       - Layers: architecture/layers.md
+      - Substrate services: architecture/services.md
       - Codebase: architecture/codebase.md
       - Memory model: architecture/memory-model.md
       - Multi-host: architecture/multihost.md

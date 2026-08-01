@@ -12,6 +12,8 @@ This folder contains older documentation that has been **superseded** by the com
 | `ZETA_FITTING_ALGORITHM.md` | `../PHYSICS_COMPREHENSIVE.md` §4-5 | Redundant with comprehensive doc |
 | `isdf_spin_galerkin_derivation.md` | `../PHYSICS_COMPREHENSIVE.md` §3 | CCT/ZCT derivation already included |
 | `ctsp_revised.md` | `../MINIMAX_QUADRATURE.md` | Overlaps with minimax quadrature reference |
+| `cold_start_2026-07.md` | `../../environment/machines/frontera.md` §3 | Point-in-time measurement record (jobs 7882055/7882076/7882070/7882139) — preserved verbatim; the operative recipe moved |
+| `HANDOFF_2026-07-28.md`, `HANDOFF_2026-07-29.md`, `HANDOFF_cpu_frontera_2026-07.md` | current docs + `SPEEDUP_SCORECARD.md` | Point-in-time campaign handoffs |
 
 ## Current Documentation
 
@@ -20,7 +22,7 @@ For up-to-date information, see:
 ### Primary Guides
 - **Physics/theory**: [`physics.md`](../../theory/physics.md)
 - **Codebase structure**: [`codebase.md`](../../architecture/codebase.md)
-- **Environment setup**: [`ENVIRONMENT_COMPREHENSIVE.md`](../../ENVIRONMENT_COMPREHENSIVE.md)
+- **Environment setup**: [`environment/overview.md`](../../environment/overview.md)
 
 ### Specialized Topics
 - **Memory model**: [`memory-model.md`](../../architecture/memory-model.md)
