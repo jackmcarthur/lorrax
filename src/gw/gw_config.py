@@ -1116,7 +1116,27 @@ _DEFAULTS = {
     # Ignored by the distributed-eigh path, whose chunk is 1 by
     # construction.  See bandstructure.bse_setup.compute_wfns_fi.
     "wfn_fi_q_chunk": 0,
+
+    # Deck hygiene.  False (DEFAULT): a key that is not in _DEFAULTS and
+    # not covered by a legacy/deprecation branch is reported in one
+    # aggregated rank-0 warning and ignored.  True: the same condition
+    # raises ValueError naming every unknown key — for CI decks and fresh
+    # runs where a typo must not silently drop a knob.
+    "strict_keys": False,
 }
+
+# Deck keys REMOVED from _DEFAULTS but still handled by an explicit
+# legacy/deprecation branch in ``read_lorrax_input`` (raise or dedicated
+# DeprecationWarning).  The unknown-key check skips these so one deck key
+# never draws two messages.  Keys that are deprecated but still in
+# _DEFAULTS (self_consistent, sigma_at_dft_energies, use_ffi_io) need no
+# entry here.
+_LEGACY_DECK_KEYS = frozenset({
+    "use_shipped_minimax_tables",   # refused with replacement named
+    "chunk_size",                   # warn-and-ignore (planner-owned)
+    "output_file",                  # warn-and-ignore (sigma_diag_file)
+    "eqp_output_file",              # warn-and-ignore (auto eqp0/eqp1)
+})
 
 # Keys whose string values should be lowercased and stripped
 _NORMALIZE_STR = {
@@ -1246,12 +1266,60 @@ def read_lorrax_input(filename: str) -> dict:
         # overlapping DeprecationWarnings for one key (audit fix/zq
         # 2026-07-28).
 
-        # REMOVED keys (owner-approved deletions, 2026-07-31; unknown deck
-        # keys are ignored by this parser, so these now behave like any
-        # other unknown key): ``isdf_memory_mode`` (two-plan W cleanup —
-        # the W Dyson solve is selected by w_dyson_solver=local|distributed)
-        # and the legacy aliases ``cusolvermp_charge``/``cusolvermp_lu``
-        # (use distributed_cholesky / distributed_lu).
+        # REMOVED keys (owner-approved deletions, 2026-07-31; these behave
+        # like any other unknown deck key — reported by the unknown-key
+        # check below, never steering anything): ``isdf_memory_mode``
+        # (two-plan W cleanup — the W Dyson solve is selected by
+        # w_dyson_solver=local|distributed) and the legacy aliases
+        # ``cusolvermp_charge``/``cusolvermp_lu`` (use distributed_cholesky
+        # / distributed_lu).
+
+        # --- Unknown-key check -----------------------------------------
+        # Every key in the deck that is neither in ``_DEFAULTS`` nor
+        # handled by one of the explicit legacy branches above is reported
+        # in ONE aggregated rank-0 warning (key, line number, "ignored").
+        # Silently dropping unknown keys turned every typo and every stale
+        # doc into silent wrong physics.  Warn, don't refuse — archived
+        # decks carry dead keys — unless the deck opts in via
+        # ``strict_keys = true``, which upgrades the warning to a
+        # ValueError naming all unknown keys at once.
+        unknown = [k for k in section
+                   if k not in _DEFAULTS and k not in _LEGACY_DECK_KEYS]
+        if unknown:
+            located = []
+            for key in unknown:
+                lineno = next(
+                    (i + 1 for i in range(start, end)
+                     if re.match(rf"\s*{re.escape(key)}\s*[=:]",
+                                 lines[i], re.IGNORECASE)),
+                    None)
+                where = f"line {lineno}" if lineno is not None else "line ?"
+                located.append(f"{key} ({where})")
+            if section.getboolean(
+                    "strict_keys",
+                    fallback=bool(_DEFAULTS["strict_keys"])):
+                raise ValueError(
+                    f"strict_keys = true: {len(unknown)} unknown deck "
+                    f"key(s) in {filename}:\n"
+                    + "\n".join(f"    {loc}: not a recognized deck key"
+                                for loc in located))
+            msg = (f"read_lorrax_input: {len(unknown)} unrecognized deck "
+                   f"key(s) in {filename}:\n"
+                   + "\n".join(
+                       f"    {loc}: ignored — not a recognized deck key"
+                       for loc in located))
+            # Rank-0-equivalent stdout.  ``process_rank`` is jax-free-safe
+            # (lazy jax import inside, falls back to 0 when jax is absent
+            # or uninitialised) — a downhill L1→L3 import, function-scoped
+            # so this parser stays importable without the common package
+            # fully initialised.
+            try:
+                from common.collectives import process_rank
+                _rank = process_rank()
+            except Exception:                              # noqa: BLE001
+                _rank = 0
+            if _rank == 0:
+                print(msg)
 
         # Build params from _DEFAULTS, overriding with parsed values
         params = {}

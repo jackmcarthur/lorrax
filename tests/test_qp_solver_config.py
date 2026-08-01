@@ -198,8 +198,10 @@ def test_distributed_lu_slate_rejected(tmp_path):
 
 def test_removed_legacy_aliases_are_inert(tmp_path, monkeypatch):
     # cusolvermp_charge / cusolvermp_lu were REMOVED (2026-07-31): they
-    # are unknown keys now and must neither warn nor steer the portable
-    # keys (the pre-removal alias honored 'on' → cusolvermp here).
+    # are unknown keys now and must neither DeprecationWarning nor steer
+    # the portable keys (the pre-removal alias honored 'on' → cusolvermp
+    # here).  They DO appear in the aggregated unknown-key stdout report
+    # like any other unknown key — that is the point of the removal.
     _pin_backend(monkeypatch, "gpu")
     cfg = _config(tmp_path, "cusolvermp_charge = on\ncusolvermp_lu = off\n")
     assert cfg.backend.distributed_cholesky == "auto"
@@ -220,6 +222,61 @@ def test_explicit_cusolvermp_on_cpu_refuses(tmp_path, monkeypatch, key):
     _pin_backend(monkeypatch, "cpu")
     with pytest.raises(ValueError, match="CUDA-only"):
         _config(tmp_path, f"{key} = cusolvermp\n")
+
+
+# ---------------------------------------------------------------------------
+# Unknown-key check (read_lorrax_input): a deck key that is neither in
+# _DEFAULTS nor covered by a legacy branch is reported in ONE aggregated
+# rank-0 stdout warning and ignored; ``strict_keys = true`` upgrades the
+# report to a ValueError naming every unknown key.  These cases call
+# ``read_lorrax_input`` directly — the parsing path needs no jax.
+# ---------------------------------------------------------------------------
+
+def test_unknown_key_warns_on_stdout_and_still_parses(tmp_path, capsys):
+    from gw.gw_config import read_lorrax_input
+    p = tmp_path / "deck_unknown.in"
+    p.write_text(BASE_INPUT + "x_only = true\nuse_chunked_isdf = false\n")
+    params = read_lorrax_input(str(p))
+    out = capsys.readouterr().out
+    # One aggregated report naming each key with its line number.
+    assert "unrecognized deck key" in out
+    assert "x_only (line 6)" in out
+    assert "use_chunked_isdf (line 7)" in out
+    assert "ignored" in out
+    # ...and the deck still parses: known keys land, unknown ones don't.
+    assert params["nval"] == 2
+    assert "x_only" not in params
+
+
+def test_strict_keys_true_raises_naming_every_unknown_key(tmp_path):
+    from gw.gw_config import read_lorrax_input
+    p = tmp_path / "deck_strict.in"
+    p.write_text(BASE_INPUT + "strict_keys = true\n"
+                 "x_only = true\nbogus_knob = 3\n")
+    with pytest.raises(ValueError, match="strict_keys") as exc:
+        read_lorrax_input(str(p))
+    # ALL unknown keys named at once, not just the first.
+    assert "x_only" in str(exc.value)
+    assert "bogus_knob" in str(exc.value)
+
+
+def test_legacy_keys_keep_their_dedicated_messages(tmp_path, capsys):
+    # Keys with an explicit legacy branch (dedicated DeprecationWarning or
+    # refusal) must NOT also be reported as unknown — one key, one message.
+    from gw.gw_config import read_lorrax_input
+    p = tmp_path / "deck_legacy.in"
+    p.write_text(BASE_INPUT + "chunk_size = 8\noutput_file = out.dat\n")
+    with pytest.warns(DeprecationWarning) as rec:
+        read_lorrax_input(str(p))
+    messages = [str(w.message) for w in rec]
+    assert any("chunk_size" in m for m in messages)
+    assert any("output_file" in m for m in messages)
+    assert "unrecognized deck key" not in capsys.readouterr().out
+    # The refusal branch also stays dedicated (no unknown-key rewording).
+    q = tmp_path / "deck_refused.in"
+    q.write_text(BASE_INPUT + "use_shipped_minimax_tables = true\n")
+    with pytest.raises(ValueError, match="regenerate_minimax_tables"):
+        read_lorrax_input(str(q))
 
 
 def test_auto_on_cpu_chol_passes_lu_demotes_announced(tmp_path, monkeypatch):
