@@ -585,7 +585,7 @@ def main():
     # is a pure function of the WFN + seed + candidate list and is identical on
     # every rank, so rank 0's file is the file any rank would have written.
     # No collective below this point, so gating cannot deadlock.
-    if jax.process_index() == 0:
+    if process_rank() == 0:
         np.savetxt(
             out_file, centroids_snapped,
             header=header,
