@@ -67,11 +67,19 @@ if __name__ == "__main__":
         # jax.distributed.initialize.
         from ffi.common.ffi_loader import platform_from_env
         _plat = platform_from_env()
-        try:
-            from ffi.common.ffi_loader import get_lib as _get_lib
-            _get_lib(_plat).lrx_slate_init_mpi()
-        except Exception as _exc:
-            print(f"slate_init_mpi skipped: {_exc}", flush=True)
+        # Production init ORDER (host + impl=mpi): the jax CPU mpi
+        # collectives plugin calls MPI_Init_thread unconditionally, so it
+        # must initialize MPI FIRST and the slate/BLACS context piggyback
+        # (its ensure_mpi_initialized is guarded; the plugin's is not).
+        # Eagerly calling lrx_slate_init_mpi here — the CUDA-era warm-up —
+        # aborts every cpu+impl=mpi run with "Cannot call MPI_INIT ...
+        # more than once" (job 7885123).  Keep the warm-up on CUDA only.
+        if _plat == "CUDA":
+            try:
+                from ffi.common.ffi_loader import get_lib as _get_lib
+                _get_lib(_plat).lrx_slate_init_mpi()
+            except Exception as _exc:
+                print(f"slate_init_mpi skipped: {_exc}", flush=True)
         import jax
         if _plat == "CUDA":
             jax.distributed.initialize(local_device_ids=[0])
