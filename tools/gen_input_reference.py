@@ -58,6 +58,8 @@ KEYS: dict[str, tuple[str, str]] = {
     "charge_zeta_solve": ("ISDF / zeta", "Charge zeta conditioner: rank_truncate (default; rank-revealing eigh pseudo-inverse) or the historical cholesky."),
     "distributed_zeta_solve": ("ISDF / zeta", "Zeta back-solve tier: replicated | per_q | distributed (nothing O(mu^2) replicated); auto = replicated under the 4 GiB gather cap, else per_q."),
     "zeta_rcond": ("ISDF / zeta", "Rank-truncation cutoff relative to lambda_max (default 1e-8, low end of the recovery plateau). Env LORRAX_ZETA_RCOND."),
+    "transverse_zeta_solve": ("ISDF / zeta", "Transverse (bispinor) zeta-solve family: ridge (default; hoisted pivoted LU + 1e-12 ridge, byte-identical historical path) or rank_truncate (per-q eigh pseudo-inverse with an |lambda| cut; distributed plan via distributed_zeta_solve=distributed runs pzheevd at the padded extent, so any centroid count fits any square mesh)."),
+    "transverse_zeta_rcond": ("ISDF / zeta", "Transverse rank-truncation cutoff tau relative to |lambda|_max (rank_truncate family only; no env twin)."),
     "zeta_cutoff": ("ISDF / zeta", "Zeta-sphere G-cutoff (Ry) for per-q zeta_q_G writes; None = ecutwfc; must be >= bare_coulomb_cutoff."),
     "gamma_contract_mode": ("ISDF / zeta", "HLO variant of the gamma-tilde double contraction: take (default) | einsum | scan; math-identical."),
     "gflat_chunk_size": ("ISDF / zeta", "Flat-axis chunk of the r-chunk G-accumulation; 0 = planner-chosen, explicit > 0 wins."),
