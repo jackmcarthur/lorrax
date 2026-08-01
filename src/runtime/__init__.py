@@ -207,23 +207,25 @@ def install_failfast_excepthook() -> None:
         # unaffected by this hook.
         rank = _resolve_proc_id()
         n = _resolve_proc_count()
-        try:
-            previous(exc_type, exc_value, exc_tb)
-        except Exception:
-            import traceback
-            traceback.print_exception(exc_type, exc_value, exc_tb)
-        try:
-            sys.stderr.write(
-                f"\n*** LORRAX FAIL-FAST: rank {rank}/{n} died with "
-                f"{exc_type.__name__}: {exc_value}\n"
-                f"*** Exiting rc=1 WITHOUT teardown so this failure reaches "
-                f"the job's exit code.  Peer ranks are blocked in a "
-                f"collective this rank will never join; srun will now kill "
-                f"the step.  (Disable with LORRAX_FAILFAST=0.)\n\n")
-            sys.stderr.flush()
-            sys.stdout.flush()
-        except Exception:
-            pass
+        # Emit on BOTH streams: under srun+apptainer, stderr written just
+        # before os._exit has been observed to vanish from the captured
+        # logs (validation jobs 7884599/7884602: 4 crashes, zero stderr
+        # text survived) while stdout survives.
+        import traceback
+        text = (
+            "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+            + f"\n*** LORRAX FAIL-FAST: rank {rank}/{n} died with "
+            f"{exc_type.__name__}: {exc_value}\n"
+            f"*** Exiting rc=1 WITHOUT teardown so this failure reaches "
+            f"the job's exit code.  Peer ranks are blocked in a "
+            f"collective this rank will never join; srun will now kill "
+            f"the step.  (Disable with LORRAX_FAILFAST=0.)\n\n")
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.write(text)
+                stream.flush()
+            except Exception:
+                pass
         os._exit(1)
 
     sys.excepthook = _failfast

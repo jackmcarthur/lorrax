@@ -1027,7 +1027,7 @@ def compute_sigma_c_ppm_omega_grid(
     sigma_kij_sharded = None  # sharded-layout result (set in tile_finalize)
     for br in branches:
         branch_tiles, _ = _run_sigma_branch(
-            omega_nonneg_ry=br.omega_abs, omega_global_idx=br.omega_idx,
+            omega_nonneg_ry=br.omega_abs,
             E_A=br.E_A, base_mask_A=br.base_mask_A,
             space=br.space, neg_omega_half=br.neg_omega_half,
             log_tag=br.tag,
