@@ -8,7 +8,14 @@ the two platform handlers behind them, written to the shape of
 Measurements: `wk_REL/sigma_perf_results.md`, `wk_REL/audit_gpu_fft.log`,
 `wk_REL/cufft_unit.log`, `wk_REL/audit_gpu_hlo.log` (job 7879378).*
 
-> **Adoption state, 2026-07-30.**  `ffi.mklfft` is the intended single
+> **Adoption state, 2026-07-30 — SUPERSEDED 2026-07-31.**  The 07-30 text
+> below is kept as history; the delegation has landed.  `ffi.mklfft`
+> (`src/ffi/fft.py`) IS the single implementation: `common/fft_helpers.py`
+> imports the gate and both wrapper bodies from it (`fft_helpers.py:304`)
+> and carries no copy of its own.  The A2/E/E2 pins now guard the
+> re-export seam, not a second copy.
+>
+> *(historical, 2026-07-30)* `ffi.mklfft` is the intended single
 > implementation and is byte-parity-gated against the live path, but
 > `src/common/fft_helpers.py` still carries its own copy of the gate and the
 > two wrapper bodies (that file belonged to another workstream this wave).
@@ -187,22 +194,24 @@ layout and is what class 2 measures.
 
 | var | where | effect |
 |---|---|---|
-| `LORRAX_MKLFFT_THREADS` | `fft_flat_k_ffi.cc` | OpenMP team size for the chunk loop |
-| `LORRAX_MKLFFT_CHUNK` | `fft_flat_k_ffi.cc` | compact-chunk staging size (the L2 lever, 2.8×) |
-| `LORRAX_MKLFFT_LOG` | `fft_flat_k_ffi.cc:255-262`, `:396-406` | per-descriptor-commit + first-call diagnostics |
-| `LORRAX_CUFFT_LOG` | `fft_flat_k_cuda_ffi.cc:352-358` etc. | plan/arena/enqueue diagnostics |
+| `LORRAX_FFT_FFI_THREADS` | `fft_flat_k_ffi.cc::team_threads` | OpenMP team size for the chunk loop |
+| `LORRAX_FFT_FFI_CHUNK` | `fft_flat_k_ffi.cc::chunk_elems` | compact-chunk staging size (the L2 lever, 2.8×) |
+| `LORRAX_FFT_FFI_LOG` | `fft_flat_k_ffi.cc::log_enabled`, `fft_flat_k_cuda_ffi.cc::log_enabled` | descriptor/plan/arena/first-call diagnostics, ONE spelling on both platforms |
 
-**None of these four is documented in `docs/dev/env_vars.md`** (verified by
-`grep -rln` for each literal over `docs/ config/ scripts/ tests/` — these
-are unique ASCII identifiers, so grep is sound here).  Adding them is a
-numbered request against that file.
+`LORRAX_MKLFFT_{THREADS,CHUNK,LOG}` and `LORRAX_CUFFT_LOG` are deprecated
+aliases, honored with a one-time announcement (`mklpin::knob_value`).
 
-**The C++ log output is NOT rank-guarded** in either handler — unlike
-`mklblas`, which has `announce_here()` (`gemm_batch_ffi.cc:229-235`).  At
-P=64 with `LORRAX_MKLFFT_LOG` set, `fft_flat_k_ffi.cc:255-262` prints once
-**per thread per descriptor geometry per rank**.  Fix by lifting
-`announce_here()` into the shared MPI-free header proposed in
-`vendor_gemm_service.md` §5.
+> **SUPERSEDED 2026-07-31** — two claims that stood here are closed:
+> *(a)* "none of these is documented in `docs/dev/env_vars.md`" — rows now
+> exist there (§2b for THREADS/CHUNK, §3b for LOG), under the current
+> `LORRAX_FFT_FFI_*` spellings with the alias policy stated;
+> *(b)* "the C++ log output is NOT rank-guarded" — both handlers are
+> rank-scoped since the 2026-07-30 audit (rank 0 by default, `=all` for
+> every rank), via the shared MPI-free header `cpp/common/mkl_thread_pin.h`
+> (`announce_here` / `log_value_here`) that `vendor_gemm_service.md` §5
+> proposed and that now exists.  Pre-audit, `LORRAX_MKLFFT_LOG` printed
+> once per thread per descriptor geometry per rank (kept as the reason the
+> default is rank 0).
 
 ## 7. How to gate a change
 

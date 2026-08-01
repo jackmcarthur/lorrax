@@ -1069,12 +1069,16 @@ endif()
 #  and Cray LibSci does not implement it, so a LibSci-only site gets no host
 #  FFT handler and LORRAX_FFT_FFI refuses at runtime (the default XLA lowering
 #  is untouched — this is a lost optimisation, never a wrong answer).  If that
-#  ever needs fixing, the portable target is the FFTW3 guru interface
-#  (fftw_plan_guru_dft), which takes the same arbitrary input/output strides
-#  this handler depends on and is implemented by FFTW, cray-fftw, AOCL — and
-#  by MKL itself, whose libmkl_intel_lp64 exports fftw_plan_many_dft /
-#  fftw_execute alongside the Dfti* entry points.  That is a rewrite of the
-#  descriptor construction, not a link-line change, and it is unmeasured.
+#  ever needs fixing, the portable target is the FFTW3 ADVANCED interface
+#  (fftw_plan_many_dft): the flat-k layout is one uniform batch —
+#  istride = howmany, idist = 1 — which that call expresses directly (the
+#  guru interface's arbitrary nested loops are not needed; this comment
+#  used to name fftw_plan_guru_dft — corrected 2026-07-31 to match
+#  docs/architecture/ffi_layout.md §7).  fftw_plan_many_dft is implemented
+#  by FFTW, cray-fftw, AOCL — and by MKL itself, whose libmkl_intel_lp64
+#  exports fftw_plan_many_dft / fftw_execute alongside the Dfti* entry
+#  points.  That is a rewrite of the descriptor construction, not a
+#  link-line change, and it is unmeasured.
 # ----------------------------------------------------------------------------
 if(_mkl_incdir AND EXISTS "${_mkl_incdir}/mkl_dfti.h")
     set(_mklfft_on 1)

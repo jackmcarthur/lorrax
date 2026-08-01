@@ -171,18 +171,22 @@ required because that handler is collective; this is a rank-LOCAL BLAS
 call, the same class as the plan-A local eigh that NEEDS the full thread
 count.
 
-The pin is currently the third copy of the same ~60-line block
-(`cpp/scalapack/blacs_grid.h:157-233`, `cpp/mklfft/fft_flat_k_ffi.cc:96-159`,
-here at `:277-338`), kept separate so each TU stays MPI-free
-(`blacs_grid.h:40` includes `<mpi.h>`).  The copies have already DRIFTED:
-this one resolves the pin with `resolve_sym` (`RTLD_DEFAULT` →
-`RTLD_NEXT`), the mklfft copy with bare `dlsym(RTLD_DEFAULT, ...)`, so
-under a local-scope `dlopen` the GEMM handler still pins MKL and the FFT
-handler silently does not.  `TEMPLATE.md:194-195`'s own threshold ("extract
-when a THIRD library would copy it a third time") is met — the fix is a new
-MPI-free `ffi/cpp/common/mkl_thread_pin.h`, **not** including
-`blacs_grid.h`.  Not done in this wave (C++ was out of scope); recorded so
-it is not rediscovered.
+**SUPERSEDED 2026-07-31 — the consolidation below is DONE.**
+`cpp/common/mkl_thread_pin.h` exists (MPI-free, CUDA-free) and both the
+GEMM and the mklfft TUs include it (`gemm_batch_ffi.cc:109`,
+`fft_flat_k_ffi.cc`); there is one resolver (`RTLD_DEFAULT` →
+`RTLD_NEXT`), so the local-scope-`dlopen` divergence described below is
+closed (2026-07-30 divergence audit, noted in `fft_flat_k_ffi.cc`).
+
+*(historical)* The pin was the third copy of the same ~60-line block
+(`cpp/scalapack/blacs_grid.h:157-233`, the mklfft TU, and here), kept
+separate so each TU stays MPI-free (`blacs_grid.h:40` includes
+`<mpi.h>`).  The copies had already DRIFTED: this one resolved the pin
+with `resolve_sym` (`RTLD_DEFAULT` → `RTLD_NEXT`), the mklfft copy with
+bare `dlsym(RTLD_DEFAULT, ...)`, so under a local-scope `dlopen` the GEMM
+handler pinned MKL and the FFT handler silently did not.
+`TEMPLATE.md:194-195`'s own threshold ("extract when a THIRD library
+would copy it a third time") was met — hence the shared header above.
 
 ## 6. Platform reach — what a GPU user sees
 

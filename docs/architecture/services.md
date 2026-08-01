@@ -252,11 +252,28 @@ def face_to_batch_reshard_supported(mesh, shape, *,
 divisibility refusals name the hint. `*_supported` is the no-raise probe
 for callers with a fallback. Trace time: operand rank/extent checks in the
 returned callable. Announces its route once per site via `log_fn`.
+**The factory must be invoked synchronously on every rank** — it warms
+the mesh cliques (a no-op off `impl=mpi` and on an already-warm mesh);
+under `impl=mpi` a rank that skips it deadlocks the others in the clique
+warm-up.
 
-**Level / deps.** L3. Used by `common.zeta_projection`'s basis change
-(W_μL,νL → W_μS,νS) among others.
+**Routes.** Two schedules, selected by `route=`, bit-exact against each
+other: `split_b_first` (default: all_to_all over `x` then `y`; needs
+`B % (p_x·p_y)` plus the input layout's `M % p_x`, `N % p_y`) and
+`flatten_m_first` (all_to_all over `y` then over the flattened
+`(x, y)`; additionally needs `M % (p_x·p_y)`, and pads M locally when it
+does not divide — e.g. M=672 → 704 at P=64, +4.76%).
 
-**Deep dive.** `docs/dev/staged_reshard_primitive.md`.
+**Level / deps.** L3. Sole consumer:
+`bandstructure/bse_setup.py:428` (the fH_q face→batch move in
+`_q_batch`). *(SUPERSEDED 2026-07-31: this section used to name
+`common.zeta_projection`'s basis change as a consumer — false;
+`zeta_projection` only cites the doctrine, it never calls the factory.)*
+
+**Deep dive.** The module docstring of `src/common/staged_reshard.py` is
+the real contract (routes, divisibility, residency proof, measured
+domain). `docs/dev/staged_reshard_primitive.md` documents the
+*contraction* sibling `common.contract_bands`, not this module.
 
 ---
 

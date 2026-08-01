@@ -153,11 +153,15 @@ failed guard, the mesh, and the available alternatives.
 > (`lorrax_mklblas_gemm_batch`, `LORRAX_BANDS_GEMM_FFI`, auto default on
 > CPU).  The GEMM handler is vendor-portable: it builds against any
 > standard CBLAS on the resolved linalg link line and prefers the
-> batched `cblas_?gemm_batch` entry when the BLAS has it (CMake
-> `check_symbol_exists` probe), falling back to a plain
-> `cblas_{d,z}gemm` loop otherwise — **works in principle with Intel MKL
-> or Cray LibSci (batched entry when available, plain-GEMM loop
-> otherwise); tested with Intel only so far.**
+> batched `cblas_?gemm_batch` entry when the BLAS has it, falling back
+> to a plain `cblas_?gemm` loop otherwise — **works in principle with
+> Intel MKL or Cray LibSci (batched entry when available, plain-GEMM
+> loop otherwise); tested with Intel only so far.**  *(SUPERSEDED
+> detail, 2026-07-31: this box used to say the batched entry was found
+> by a CMake `check_symbol_exists` probe.  That build-time probe was
+> DELETED 2026-07-29 after two false-negative gate cycles; the decision
+> is run-time `dlsym`, per precision, announced at first use —
+> `vendor_gemm_service.md` §4 is the current contract.)*
 
 **When does an FFI backend actually win?** It depends on the *regime* —
 and the two measured regimes point in opposite directions.

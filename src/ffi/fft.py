@@ -37,13 +37,11 @@ nest) and have no FFI route at all.  ``isdf/core.py`` and
 ``common/wfn_transforms.py`` call the second layer, so ``LORRAX_FFT_FFI``
 structurally cannot reach them.
 
-ADOPTION STATE (2026-07-30): this module is the intended single
-implementation, but ``common/fft_helpers.py`` still carries its own copy of
-the gate and the two bodies; that file is owned by another workstream this
-wave.  Until it delegates (numbered request in the wave report), treat
-``fft_helpers`` as the live path and this as its verbatim relocation.  The
-equivalence pin ``wk_REL/gatecheck.py`` compares the two gates across the
-full spelling matrix so a drift cannot be silent.
+ADOPTION STATE (2026-07-30; superseded 2026-07-31): this module IS the
+single implementation.  ``common/fft_helpers.py`` delegated — it imports
+the gate and both wrapper bodies from here (``fft_helpers.py:304``) and
+carries no copy of its own.  The equivalence pin ``wk_REL/gatecheck.py``
+(cells A2/E/E2) now guards the re-export seam rather than a second copy.
 """
 
 from __future__ import annotations

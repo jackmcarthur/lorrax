@@ -188,8 +188,13 @@ shim deletion (consumer churn); cusolvermp/cublasmp deletion (§5 gates).
 The CPU flat-k TU is today source-locked to MKL's DFTI descriptor API.  The
 layout requirement it encodes — "howmany transforms, element stride =
 batch count, distance 1" — is expressible verbatim in the FFTW *advanced*
-interface: `fftw_plan_many_dft(istride=howmany, idist=1)`.  Two facts make
-that the portable spelling:
+interface: `fftw_plan_many_dft(istride=howmany, idist=1)`.  Advanced, not
+guru, is the adjudicated target: the flat-k layout is one uniform batch
+(single stride, single distance), exactly what `fftw_plan_many_dft`
+expresses, and the guru interface's arbitrary nested loops buy nothing here
+(the `CMakeLists.txt` RESOLVE-3/4 comment, which used to name
+`fftw_plan_guru_dft`, was updated 2026-07-31 to match).  Two facts make
+the advanced interface the portable spelling:
 
 1. **MKL natively exports the FFTW3 C interface from its core libraries**
    (no wrapper build), so one source against `fftw_plan_many_dft` links MKL
@@ -200,11 +205,37 @@ that the portable spelling:
    to the ungated XLA path.  No engine present means slower-and-loud, never
    broken — the FFI stays an accelerator, not a dependency.
 
+**Symbol resolution on a non-MKL site — the design, fixed here.**  The
+FFTW entry points (`fftw_plan_many_dft`, `fftw_execute_dft`,
+`fftw_destroy_plan`, …) are resolved at RUN time by `dlsym`
+(`RTLD_DEFAULT` → `RTLD_NEXT`, the `mkl_thread_pin.h` resolver), exactly
+the pattern the GEMM service proved: on Frontera they resolve out of
+`libmkl_intel_lp64` already on the link line (MKL exports the FFTW3 C
+interface natively — no new link dependency); on a Cray/AMD site the host
+leg gains a CMake feature option (`LORRAX_HOST_HAVE_FFTW3`, detected from
+`fftw3.h` + `libfftw3` like the other RESOLVE legs) that links the
+system FFTW, and the same `dlsym` then finds it.  No new environment
+variable is introduced in either case — the engine is named by what the
+`.so` links, not by a knob — which is what invariant 2 (§2) requires;
+`LORRAX_FFT_FFI` still announces-or-refuses when no engine resolves, so
+absence stays slower-and-loud, never wrong.
+
+**Parity gate for the engine swap, stated once with its class:**
+value-level, **relative 1e-12** (the Σ-path class,
+`flat_k_fft_service.md` §7).  Not bit-exactness — `wk_REL/gatecheck.py`
+cells E/E2 assert `np.array_equal` only between two *callers of the same
+handler*, and swapping DFTI for FFTW changes the engine, where bit
+equality is not promised.  And not the 1e-16 figures — those are
+*measured* unit residuals (max 3.7e-16) sitting at the c128 ULP, where a
+threshold tests nothing (`ffi_gate_contract.md` §3.5: the first run of the
+gate found two cells perturbing below the ULP and testing nothing).
+
 The cuFFT mirror (`cufftPlanMany64` advanced layout) already covers the GPU
 leg of any site, Cray included.  Remaining items, in order: (i) rework the
-plan-creation section of `fft_flat_k_cpu.cc` from DFTI to the FFTW-many API
-+ dlsym table, then rerun the automated parity gates (unit 1e-16, h5
-<=2.5e-14 eV); (ii) verify MKL's FFTW3 interface maps interleaved c2c
+plan-creation section of `src/ffi/cpp/mklfft/fft_flat_k_ffi.cc` from DFTI
+to the FFTW-many API + dlsym table, then rerun the automated parity gates
+at the 1e-12 class above (the h5 end-to-end receipt stays ≤2.5e-14 eV);
+(ii) verify MKL's FFTW3 interface maps interleaved c2c
 many-plans cleanly (documented wrapper limitations are r2c-stride and
 wisdom no-ops — one-job check); (iii) threading: `fftw_init_threads` /
 `plan_with_nthreads` on non-MKL engines under the same
