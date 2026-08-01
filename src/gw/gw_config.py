@@ -385,6 +385,90 @@ class SlabIOBackend(str, enum.Enum):
     H5PY_ALLGATHER = "h5py_allgather"
 
 
+#: PMI/PMIx variable spellings a launcher (srun --mpi=pmi2/pmix,
+#: mpiexec.hydra, mpirun) leaves in the environment.  Prefix-matched so the
+#: versioned PMIx names (PMIX_SERVER_URI21, ...) are covered.  Plain SLURM
+#: batch variables (SLURM_JOB_ID etc.) are deliberately NOT in this list: a
+#: bare ``python`` inside an sbatch allocation has all of those and still no
+#: PMI server to register with — that is exactly the failing launch shape.
+_MPI_LAUNCHER_ENV_PREFIXES = ("PMI_", "PMIX_")
+_MPI_LAUNCHER_ENV_VARS = ("HYDI_CONTROL_FD",)
+
+
+def _mpi_launcher_env() -> "str | None":
+    """The first launcher PMI/PMIx variable present, else None."""
+    for name in _MPI_LAUNCHER_ENV_VARS:
+        if os.environ.get(name):
+            return name
+    for name in sorted(os.environ):
+        if name.startswith(_MPI_LAUNCHER_ENV_PREFIXES):
+            return name
+    return None
+
+
+def _mpi_singleton_probe(child_code: str, what: str,
+                         argv_extra=(), timeout_s: float = 60.0
+                         ) -> tuple[bool, str]:
+    """``(ok, reason)`` — run ``child_code`` in a THROWAWAY subprocess.
+
+    Why a subprocess: on a bare launch (no PMI environment) whether
+    ``MPI_Init_thread`` works as a singleton is a property of the MPI
+    stack, and on the production stack it does not fail catchably — Intel
+    MPI 2020 calls ``abort()`` inside ``MPIR_pmi_init`` (job 7884926), so
+    an in-process probe kills the run it was meant to protect.  The child
+    runs exactly the init the candidate tier would run; the router
+    survives the child's death.  Only reached on the bare-launch path, so
+    the ~1 s child never costs a production srun/mpirun start anything.
+
+    Never raises.  A hung child (the init blocking rather than aborting)
+    is killed at ``timeout_s`` and reported as not bootstrappable — the
+    demotion direction is the safe one.
+    """
+    import subprocess
+    import sys
+    try:
+        res = subprocess.run(
+            [sys.executable, "-c", child_code, *argv_extra],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return False, (f"the singleton {what} probe hung for {timeout_s:.0f} s "
+                       f"and was killed")
+    except Exception as exc:                          # pragma: no cover
+        return False, (f"the singleton {what} probe could not run "
+                       f"({type(exc).__name__}: {exc})")
+    if res.returncode == 0:
+        return True, f"singleton {what} succeeded in a probe subprocess"
+    return False, (f"singleton {what} exited rc={res.returncode} in a probe "
+                   f"subprocess (Intel MPI aborts in MPIR_pmi_init on a "
+                   f"PMI-less launch)")
+
+
+def _probe_mpi_bootstrap_ffi() -> tuple[bool, str]:
+    """``(bootstrappable, how)`` for the PHDF5_FFI tier's own MPI init.
+
+    A launcher PMI environment settles it — that is the environment every
+    green multi-rank run had (CLAIMS rows 3, 17).  Without one, probe the
+    exact call the tier would make (``lrx_phdf5_init_mpi`` in the loaded
+    host .so) in a throwaway subprocess; see :func:`_mpi_singleton_probe`.
+    """
+    var = _mpi_launcher_env()
+    if var is not None:
+        return True, f"launcher PMI environment present ({var})"
+    try:
+        from ffi.common.ffi_loader import loaded_lib_path
+        so = loaded_lib_path("cpu")
+    except Exception as exc:                          # pragma: no cover
+        return False, f"ffi_loader unavailable ({type(exc).__name__}: {exc})"
+    if not so:
+        return False, "no loaded host FFI library to probe MPI init with"
+    child = ("import ctypes, sys\n"
+             "lib = ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)\n"
+             "lib.lrx_phdf5_init_mpi()\n")
+    return _mpi_singleton_probe(child, "MPI_Init_thread (host FFI)",
+                                argv_extra=(so,))
+
+
 def _probe_phdf5_host_tier() -> tuple[bool, str]:
     """``(usable, reason)`` for the ``PHDF5_HOST`` (mpi4py + h5py-parallel)
     tier, testing exactly what a ``_MpiHostBackend`` will execute.
@@ -402,7 +486,22 @@ def _probe_phdf5_host_tier() -> tuple[bool, str]:
     — the router demotes and says why.  An explicit
     ``slab_io=phdf5_host`` request bypasses this probe and keeps
     fails-loudly semantics at the first SlabIO open.
+
+    BEFORE the in-process ``MPI_Init_thread``: on a bare launch (no PMI
+    environment) that init does not fail catchably — Intel MPI aborts the
+    whole process inside ``MPIR_pmi_init`` (job 7884926), which would turn
+    this probe into the crash it exists to prevent.  So a PMI-less launch
+    first proves singleton init in a throwaway subprocess and demotes when
+    the child dies.
     """
+    if _mpi_launcher_env() is None:
+        ok, how = _mpi_singleton_probe(
+            "from mpi4py import MPI\n", "MPI_Init_thread (mpi4py)")
+        if not ok:
+            return False, (
+                f"bare launch (no PMI/PMIx variables in the environment) "
+                f"and {how} — an in-process mpi4py init would abort, not "
+                f"raise")
     try:
         from mpi4py import MPI  # noqa: F401 — runs MPI_Init_thread
     except (Exception, SystemExit) as exc:
@@ -455,6 +554,17 @@ def _route_cpu_slab_io(print_fn) -> "SlabIOBackend":
     with the handler" (rebuild) from "lib could not be loaded"
     (``LD_LIBRARY_PATH``) — a distinction that cost workstream P a day.
     Never raises: any probe failure demotes to the next tier.
+
+    Handler presence alone is NOT capability: both MPI tiers call
+    ``MPI_Init_thread``, and on a bare launch with no PMI environment
+    Intel MPI aborts the process inside ``MPIR_pmi_init`` instead of
+    returning an error (job 7884926 — the fastloop's bare P=1 gw stage
+    died at the first collective H5Fcreate).  So tier 1 additionally
+    requires :func:`_probe_mpi_bootstrap_ffi` (launcher PMI environment,
+    else a subprocess singleton-init probe) and demotes with an
+    announcement when MPI cannot bootstrap — the same degrade-and-say-why
+    contract as the GPU router's multi-node FFI demotion.  An explicit
+    ``slab_io=phdf5_ffi`` still bypasses this and fails loudly.
     """
     reason = "ffi.common.ffi_loader import failed"
     try:
@@ -464,9 +574,17 @@ def _route_cpu_slab_io(print_fn) -> "SlabIOBackend":
         _ffi_write_ok = False
         reason = f"{type(exc).__name__}: {exc}"
     if _ffi_write_ok:
+        _mpi_ok, _mpi_how = _probe_mpi_bootstrap_ffi()
+        if not _mpi_ok:
+            _ffi_write_ok = False
+            reason = (
+                f"the host FFI exports the write handler but MPI cannot "
+                f"bootstrap in this process: {_mpi_how}")
+    if _ffi_write_ok:
         print_fn(
             "  [config] slab_io=auto on CPU backend: host FFI exports "
-            "the collective phdf5 write handler.  Routing SlabIO through "
+            "the collective phdf5 write handler and MPI can bootstrap "
+            f"({_mpi_how}).  Routing SlabIO through "
             "PHDF5_FFI (bare-MPI C++ collective MPI-IO, no mpi4py needed)."
         )
         return SlabIOBackend.PHDF5_FFI

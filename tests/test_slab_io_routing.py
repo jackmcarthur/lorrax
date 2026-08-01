@@ -204,3 +204,56 @@ def test_hartree_source_invalid_rejected(tmp_path, router_calls):
 def test_hartree_source_valid_accepted(tmp_path, router_calls):
     cfg = _config(tmp_path, "hartree_source = stored\n")
     assert cfg.hartree_source == "stored"
+
+
+# ---------------------------------------------------------------------------
+# MPI bootstrapability probe (the job-7884926 fastloop catch)
+# ---------------------------------------------------------------------------
+#
+# slab_io=auto used to route to PHDF5_FFI on handler presence alone; on a
+# bare launch (no PMI environment) the tier's MPI_Init_thread then ABORTS
+# the process inside MPIR_pmi_init — Intel MPI does not return an error.
+# The router now requires MPI bootstrapability: a launcher PMI variable,
+# else a throwaway-subprocess singleton-init probe.  These tests cover the
+# pure pieces; the end-to-end demotion is exercised by the sandbox fastloop
+# (bare P=1 gw stage with slab_io=auto).
+
+def test_launcher_env_detects_pmi_and_pmix(monkeypatch):
+    for var in ("PMI_RANK", "PMI_FD", "PMIX_RANK", "PMIX_SERVER_URI21",
+                "HYDI_CONTROL_FD"):
+        monkeypatch.setenv(var, "0")
+        assert gw_config._mpi_launcher_env() is not None, var
+        monkeypatch.delenv(var)
+
+
+def test_launcher_env_ignores_plain_slurm_batch_vars(monkeypatch):
+    # A bare python inside an sbatch allocation has SLURM_* but no PMI
+    # server — the exact launch shape that aborted (job 7884926).
+    for var in list(__import__("os").environ):
+        if var.startswith(("PMI_", "PMIX_")) or var == "HYDI_CONTROL_FD":
+            monkeypatch.delenv(var)
+    monkeypatch.setenv("SLURM_JOB_ID", "1234567")
+    monkeypatch.setenv("SLURM_NTASKS", "1")
+    assert gw_config._mpi_launcher_env() is None
+
+
+def test_singleton_probe_reports_a_dead_child_without_raising():
+    ok, how = gw_config._mpi_singleton_probe(
+        "import sys; sys.exit(13)\n", "MPI_Init_thread (synthetic)")
+    assert ok is False
+    assert "rc=13" in how
+
+
+def test_singleton_probe_reports_a_live_child():
+    ok, how = gw_config._mpi_singleton_probe(
+        "pass\n", "MPI_Init_thread (synthetic)")
+    assert ok is True
+    assert "succeeded" in how
+
+
+def test_singleton_probe_kills_a_hung_child():
+    ok, how = gw_config._mpi_singleton_probe(
+        "import time; time.sleep(600)\n", "MPI_Init_thread (synthetic)",
+        timeout_s=2.0)
+    assert ok is False
+    assert "hung" in how

@@ -82,7 +82,7 @@ import jax
 import jax.ffi
 
 __all__ = ["get_lib", "has_target", "probe_target", "has_phdf5_read",
-           "has_phdf5_write"]
+           "has_phdf5_write", "loaded_lib_path"]
 
 _LIBS: Dict[str, ctypes.CDLL] = {}
 #: platform -> the .so path actually loaded (for diagnostics).
@@ -526,6 +526,16 @@ def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
 def _loaded_path(platform: str) -> str:
     """The .so path loaded for ``platform`` (for error messages)."""
     return _LIB_PATHS.get(platform, f"<{platform} library>")
+
+
+def loaded_lib_path(platform: str) -> Optional[str]:
+    """The .so path loaded for ``platform``, or None if none is loaded yet.
+
+    Pure lookup — never loads.  Exists for callers that need the file path
+    of an ALREADY-probed library (the ``slab_io=auto`` router hands it to a
+    subprocess MPI-bootstrap probe) without repeating the load side effects.
+    """
+    return _LIB_PATHS.get(platform)
 
 
 # ---------------------------------------------------------------------------
