@@ -1865,9 +1865,26 @@ def _factor_c_q_replicated(
                 # ONE traced kernel shared with the q-parallel execution so
                 # the two schedules cannot drift (bit-identity contract).
                 C_log = jax.lax.with_sharding_constraint(C_log, rep_sh)
-                return _charge_factor_math(
+                F = _charge_factor_math(
                     C_log, mode=mode, n_log=n_log, ridge_extra=_re,
                     rcond=_rc, rank_log=_rank_log)
+                if mode == 'transverse_rank_truncate':
+                    # This mode's factor ENDS in a GEMM (C⁺ = Vs Vᴴ).
+                    # LAPACK factor outputs (cholesky/eigh) plus
+                    # elementwise tails are replicated-identical under
+                    # SPMD, but an unconstrained GEMM feeding the jit's
+                    # P(None,'x','y') out_shardings gets partitioned —
+                    # each device then runs a SHARD-shaped dot micro-
+                    # kernel whose fma grouping differs from the whole-
+                    # tile one, breaking the plan's mesh-invariance
+                    # contract (caught by the unit gate, job 7885328:
+                    # q-parallel legs exact, all-ranks multi-device legs
+                    # drifted).  Pin the product replicated so every
+                    # device computes the WHOLE tile — bit-identical to
+                    # 1x1 and to the q-parallel whole-tile GEMM; the
+                    # out_shardings shard afterwards is a local slice.
+                    F = jax.lax.with_sharding_constraint(F, rep_sh)
+                return F
 
             F_log = solve_at_logical(
                 _factor_log, n_log, (C,), pad_axes=(-2, -1))

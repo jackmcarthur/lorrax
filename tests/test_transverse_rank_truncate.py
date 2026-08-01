@@ -209,18 +209,22 @@ def _worker_gauge() -> int:
     mesh = Mesh(np.asarray(devs[:1]).reshape(1, 1), ('x', 'y'))
     in_sh = NamedSharding(mesh, P(None, 'x', 'y'))
     C_dev = jax.device_put(jnp.asarray(C), in_sh)
-    Z_dev = jax.device_put(jnp.asarray(Z), in_sh)
 
+    # solve_zeta DONATES its RHS (the reshard's donate_argnums), so each
+    # call gets a fresh device array — reusing one trips the deleted-
+    # array guard (caught by job 7885328).
     LU, piv = factor_c_q(C_dev, mesh, vertex_mu_L=1, n_rmu_logical=n_log,
                          solver_kind='lu')
     z_lu = np.asarray(jax.device_get(solve_zeta(
-        LU, Z_dev, mesh, nq, vertex_mu_L=1, solver_kind='lu',
+        LU, jax.device_put(jnp.asarray(Z), in_sh), mesh, nq,
+        vertex_mu_L=1, solver_kind='lu',
         n_rmu_logical=n_log, lu_piv=piv)))
     Cp, _ = factor_c_q(C_dev, mesh, vertex_mu_L=1, n_rmu_logical=n_log,
                        solver_kind='transverse_rank_truncate',
                        transverse_zeta_rcond=tau)
     z_rt = np.asarray(jax.device_get(solve_zeta(
-        Cp, Z_dev, mesh, nq, vertex_mu_L=1,
+        Cp, jax.device_put(jnp.asarray(Z), in_sh), mesh, nq,
+        vertex_mu_L=1,
         solver_kind='transverse_rank_truncate', n_rmu_logical=n_log)))
 
     kept_rel = 0.0
