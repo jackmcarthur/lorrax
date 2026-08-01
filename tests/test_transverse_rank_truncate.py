@@ -113,9 +113,13 @@ def _worker_rt() -> int:
 
     rng = np.random.default_rng(20260801)
     # nq=6 does not divide 4 devices (q-pad + cond-skip in the fold);
-    # n_z=32 is the bispinor spinor^2 column blocking (ns^2=16 x r=2);
-    # n_z2=30 does NOT divide the device count (needs_padding path).
-    nq, n_log, n_pad, n_z, n_z2 = 6, 60, 64, 32, 30
+    # n_z=32 / n_z2=16 are bispinor spinor^2 column blockings (ns^2=16
+    # x r) — the two r-chunks deliberately differ in width.  Column
+    # counts must divide the mesh 'y' axis: the P(None,'x','y') INPUT
+    # sharding requires it, exactly as z_q_from_psi_sm's planner-chosen
+    # r_chunk does in production (the hoist gate uses 24 for the same
+    # reason).
+    nq, n_log, n_pad, n_z, n_z2 = 6, 60, 64, 32, 16
     tau = 1e-8
     C, Z, Z2, spectra = _fixture(rng, nq, n_log, n_pad, n_z, n_z2)
     ref1 = _np_pinv_solve(spectra, Z[:, :n_log, :], tau)
