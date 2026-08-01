@@ -593,13 +593,46 @@ def test_owned_knobs_each_have_an_env_bool_call_site():
         "no env_bool() call site for: %s" % ", ".join(missing))
 
 
+#: Functions allowed to read DYNAMIC env keys in boolean context: launcher
+#: PMI/PMIx presence probes iterate over environment names, which is not a
+#: boolean LORRAX knob and has no literal key to route through env_bool.
+#: Each entry is asserted to still exist, so the exemption cannot outlive
+#: the function it excuses.
+_DYNAMIC_PROBE_FUNCS = (
+    ("gw/gw_config.py", "_mpi_launcher_env"),
+)
+
+
+def _func_line_span(src: str, funcname: str):
+    # max-lineno walk instead of end_lineno: the suites run on py3.7,
+    # where ast nodes have no end_lineno.
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == funcname:
+            last = max((n.lineno for n in ast.walk(node)
+                        if hasattr(n, "lineno")), default=node.lineno)
+            return node.lineno, last
+    return None
+
+
 def test_no_hand_rolled_boolean_env_parse_in_owned_files():
     """Broader net: any LORRAX_* env read used as a boolean is a defect."""
     offenders = []
     for rel in OWNED_FILES:
-        _, boolish = audit_source(_read(rel), rel)
+        src = _read(rel)
+        spans = []
+        for f, fn in _DYNAMIC_PROBE_FUNCS:
+            if f == rel:
+                span = _func_line_span(src, fn)
+                assert span is not None, (
+                    "%s: exempted dynamic-probe function %s no longer "
+                    "exists — remove it from _DYNAMIC_PROBE_FUNCS" % (rel, fn))
+                spans.append(span)
+        _, boolish = audit_source(src, rel)
         for name, line in boolish:
             if name in CROSS_FILE_BOOL_KNOBS:
+                continue
+            if name == "<dynamic>" and any(a <= line <= b for a, b in spans):
                 continue
             if name.startswith("LORRAX_") or name == "<dynamic>":
                 offenders.append("%s:%d %s" % (rel, line, name))
