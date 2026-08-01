@@ -144,20 +144,41 @@ def _is_jax(a: Any) -> bool:
         ("jaxlib", "jax."))
 
 
-def _finite_stats(a: Any) -> tuple[int, int, float, int]:
-    """Return ``(n_nonfinite, n_nan, max_abs, size)`` in ONE host fetch.
+_FINITE_STATS_CACHE: dict = {}
 
-    The reduction runs where the array lives (device for ``jax.Array``,
-    host for ``numpy``); exactly four scalars cross the PCIe/host seam.
-    Complex inputs are decomposed so ``inf+0j`` and ``nan+1j`` are both
-    caught (``jnp.isfinite`` on complex is elementwise on both parts, but
-    spelling it out keeps the semantics obvious and dtype-independent).
+
+def _finite_stats_fn(shape, dtype, sharding):
+    """The jitted ``(n_bad, n_nan, max_abs)`` reduction — ONE module.
+
+    Cached at module level for exactly the reason :func:`_herm_stats`
+    (twelve lines below) is: ``jax.jit`` keys on function identity, so a
+    fresh ``jit`` per gate call recompiles every time.
+
+    MEASURED (job 7884866, MoS2 4x4 b300 htransform, cold, persistent
+    cache off): run op-by-op EAGERLY this reduction is not one module but
+    THIRTEEN — ``real``, ``imag``, ``isfinite`` x2, ``isnan`` x2,
+    ``bitwise_and``, ``bitwise_or``, ``abs``, ``_where``, ``bitwise_not``,
+    ``_reduce_sum`` x2, ``convert_element_type`` x2, ``broadcast_in_dim``,
+    ``concatenate``, ``_reduce_max`` — because every eager jnp op is its
+    own single-primitive XLA module.  htransform's three ``check_finite``
+    gates (S, ctilde, E_nk) therefore compiled 35 of the driver's 137
+    modules, 1.04 s of its 4.07 s of XLA compile.  Fused: 3 modules, one
+    per distinct (shape, dtype, sharding).
+
+    Values are bit-unchanged: the ops and their order are identical, and
+    they are all either exact (isfinite/isnan/and/or/not, integer sums)
+    or order-independent reductions (max).
     """
-    if _is_jax(a):
-        import jax
-        import jax.numpy as jnp
+    import jax
+    import jax.numpy as jnp
 
-        arr = a
+    key = (tuple(shape), str(dtype), sharding)
+    fn = _FINITE_STATS_CACHE.get(key)
+    if fn is not None:
+        return fn
+
+    @jax.jit
+    def fn(arr):
         if jnp.iscomplexobj(arr):
             parts = (jnp.real(arr), jnp.imag(arr))
         else:
@@ -171,11 +192,31 @@ def _finite_stats(a: Any) -> tuple[int, int, float, int]:
         # masked copy gives the largest *finite* magnitude, which is the
         # number a human wants to see next to the failure count.
         mag = jnp.where(finite, jnp.abs(arr), 0.0)
-        stats = jnp.stack([
+        return jnp.stack([
             jnp.sum(~finite).astype(jnp.float64),
             jnp.sum(isnan).astype(jnp.float64),
             jnp.max(mag).astype(jnp.float64),
         ])
+
+    _FINITE_STATS_CACHE[key] = fn
+    return fn
+
+
+def _finite_stats(a: Any) -> tuple[int, int, float, int]:
+    """Return ``(n_nonfinite, n_nan, max_abs, size)`` in ONE host fetch.
+
+    The reduction runs where the array lives (device for ``jax.Array``,
+    host for ``numpy``); exactly four scalars cross the PCIe/host seam.
+    Complex inputs are decomposed so ``inf+0j`` and ``nan+1j`` are both
+    caught (``jnp.isfinite`` on complex is elementwise on both parts, but
+    spelling it out keeps the semantics obvious and dtype-independent).
+    """
+    if _is_jax(a):
+        import jax
+
+        arr = a
+        stats = _finite_stats_fn(
+            arr.shape, arr.dtype, getattr(arr, "sharding", None))(arr)
         n_bad, n_nan, max_abs = (float(v) for v in np.asarray(jax.device_get(stats)))
         return int(n_bad), int(n_nan), float(max_abs), int(arr.size)
 

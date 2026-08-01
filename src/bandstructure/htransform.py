@@ -625,7 +625,16 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     ctilde, ortho_err, B_at_mu = _finalize(coeffs, L, Vh)
     ctilde = jax.device_put(ctilde, rep)
     B_at_mu = jax.device_put(B_at_mu, rep)
-    S = jnp.eye(rank, dtype=jnp.complex128)
+    # ``jnp.eye`` run EAGERLY is not one module but six —
+    # ``iota`` x2 (compiled TWICE: the two operands differ only in
+    # dimension), ``add``, ``equal``, ``convert_element_type`` x2 — because
+    # every eager jnp op is its own single-primitive XLA module (measured,
+    # job 7884866: 6 of this driver's 137).  One jit, one module, and an
+    # explicit ``rep`` out_sharding rather than whatever the enclosing mesh
+    # context happens to infer — the same spelling ``_alloc_G`` and the Q
+    # allocation above already use.  Exact identity either way.
+    S = jax.jit(lambda: jnp.eye(rank, dtype=jnp.complex128),
+                out_shardings=rep)()
     log_fn(f"  ctilde[0] orthogonality error: {float(ortho_err):.3e}")
     log_fn(f"  Total Galerkin: {time.time()-t0:.2f}s")
 
@@ -721,14 +730,35 @@ def _f_params_from_energies(enk_nb_nk: jax.Array, top_band_index: int,
         If None, defaults to top_band_index (original behavior).
         Set this to the highest band you want to keep accurately.
     """
-    E_top_k = enk_nb_nk[top_band_index]
-    shift = float(jnp.max(E_top_k))
     if a_band_index is None:
         a_band_index = top_band_index
-    E_a_k = enk_nb_nk[a_band_index]
-    gap = 4.0 * float(jnp.max(E_a_k) - jnp.min(E_a_k) + 1e-14)
+    # ONE jit for the two host floats this returns.  Eagerly these five
+    # lines are six single-primitive XLA modules — ``dynamic_slice`` and
+    # ``squeeze`` for each band index (one compile each, shapes match),
+    # ``_reduce_max`` x2, ``_reduce_min``, ``subtract``, ``add`` — measured
+    # at 6 of this driver's 137 (job 7884866).  The band indices are static,
+    # so the whole thing folds into one module per (shape, index pair).
+    #
+    # Bit-identical: the ops and their order are unchanged, ``max``/``min``
+    # are order-independent reductions, and ``(max - min) + 1e-14`` is a
+    # subtract feeding an add with no multiply for a fusion to contract into
+    # an FMA.  ``* 4.0`` stays on the host exactly where it was.
+    stats = np.asarray(jax.device_get(
+        _f_params_jit(enk_nb_nk, int(top_band_index), int(a_band_index))))
+    shift = float(stats[0])
+    gap = 4.0 * float(stats[1])
     n = 3.0
     return gap, n, shift
+
+
+@partial(jax.jit, static_argnames=('top_band_index', 'a_band_index'))
+def _f_params_jit(enk_nb_nk: jax.Array, top_band_index: int,
+                  a_band_index: int) -> jax.Array:
+    """``[max ε_top, max ε_a - min ε_a + 1e-14]`` — see the caller."""
+    E_top_k = enk_nb_nk[top_band_index]
+    E_a_k = enk_nb_nk[a_band_index]
+    return jnp.stack([jnp.max(E_top_k),
+                      jnp.max(E_a_k) - jnp.min(E_a_k) + 1e-14])
 
 
 @partial(jax.jit, static_argnames=('a', 'n', 'shift'))
@@ -837,8 +867,12 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     # 'backward' = 1/N normalisation in IFFT — matches Σ_R e^{-2πik·R} fH_R = fH_k.
     local_ifftn = make_flat_k_ifftn(mesh_xy, kgrid_co, spec_3d, norm='backward')
 
+    # ``f_eps.T`` at the call site was its own eager ``transpose`` module;
+    # transposing inside costs nothing and removes one compile (exact — a
+    # transpose is a permutation of the same f64 values).
     @partial(jax.jit, out_shardings=(flat_xy, flat_xy))
-    def _build(ctilde_in, f_eps_T):
+    def _build(ctilde_in, f_eps_in):
+        f_eps_T = f_eps_in.T
         f_eps_ki = jnp.where(f_eps_T > 0, 0.0, f_eps_T)
         bw = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
         weighted = ctilde_in * bw[..., None]
@@ -933,7 +967,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
             f"per band chunk instead of summing into Q first.  Override with "
             f"LORRAX_FH_ORTHO_TOL only to reproduce a known-bad run.")
 
-    fH_k, fH_R = _build(ctilde, f_eps.T)
+    fH_k, fH_R = _build(ctilde, f_eps)
     return fH_k, fH_R, (a_f, n_f, shift), f_eps
 
 
@@ -1210,24 +1244,31 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
                 jnp.max(jnp.real(fH_k)),
                 jnp.max(jnp.abs(jnp.imag(fH_k))))
 
-    @jax.jit
-    def _diag_eig_at_gamma(fH_k0_rep, f_eps_col0):
+    # Takes the WHOLE ``f_eps`` and returns the four printed 5-element
+    # windows as well: ``f_eps[:, 0]`` and each ``np.array(x[a:b])`` below
+    # was its own eager ``dynamic_slice``/``squeeze`` module (4 of this
+    # driver's 137, job 7884866).  Slicing is exact, and these values reach
+    # the log only — never ``bandstructure.dat``.
+    @partial(jax.jit, static_argnames=('states',))
+    def _diag_eig_at_gamma(fH_k0_rep, f_eps_in, states):
         eigs0 = jnp.sort(jnp.linalg.eigvalsh(fH_k0_rep))
-        f_exp0 = jnp.sort(f_eps_col0)
+        f_exp0 = jnp.sort(f_eps_in[:, 0])
         eig_err = jnp.max(jnp.abs(eigs0[:f_exp0.shape[0]] - f_exp0))
-        return eigs0, f_exp0, eig_err
+        return (eig_err, f_exp0[:5], eigs0[:5], f_exp0[-5:],
+                eigs0[states - 5:states])
 
     re_min, re_max, im_max = _diag_stats_fast(fH_k)
     log_fn("fH_k real range: [{:.3e}, {:.3e}], |imag|max={:.3e}".format(
         float(re_min), float(re_max), float(im_max)))
     fH_k0_rep = jax.device_put(fH_k[0], rep)  # (rank, rank) replicated, ~7 MB
-    eigs_fHk0, f_expected_0, fH_eig_err_arr = _diag_eig_at_gamma(fH_k0_rep, f_eps[:, 0])
-    fH_eig_err = float(fH_eig_err_arr)
+    _eig_err, _f_head, _e_head, _f_tail, _e_tail = jax.device_get(
+        _diag_eig_at_gamma(fH_k0_rep, f_eps, int(states)))
+    fH_eig_err = float(_eig_err)
     log_fn(f"fH(k=0) eigenvalue error vs f(eps): {fH_eig_err:.6f} Ry = {fH_eig_err * 13.6057:.3f} eV")
-    log_fn(f"  f(eps) first 5: {np.array(f_expected_0[:5])}")
-    log_fn(f"  fH eig first 5: {np.array(eigs_fHk0[:5])}")
-    log_fn(f"  f(eps) last 5:  {np.array(f_expected_0[-5:])}")
-    log_fn(f"  fH eig last 5:  {np.array(eigs_fHk0[states-5:states])}")
+    log_fn(f"  f(eps) first 5: {np.asarray(_f_head)}")
+    log_fn(f"  fH eig first 5: {np.asarray(_e_head)}")
+    log_fn(f"  f(eps) last 5:  {np.asarray(_f_tail)}")
+    log_fn(f"  fH eig last 5:  {np.asarray(_e_tail)}")
 
     # S Cholesky (rank × rank, replicated, small) — bundle the symmetrise +
     # ridge + cholesky into one jit so each line isn't a separate compile.
@@ -1287,20 +1328,26 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
 
     # Round-trip diagnostic at Γ — single q, kept (i, j)-sharded (never whole
     # on any device: rank²·16/ndev instead of rank²·16).
-    q0 = jnp.zeros((1, 3), dtype=jnp.float64)
+    # ``q0`` is a numpy constant, not ``jnp.zeros``: eagerly that was two more
+    # single-primitive modules (``convert_element_type``, ``broadcast_in_dim``)
+    # for three zeros that only ever appear as a jit constant anyway.
+    q0 = np.zeros((1, 3), dtype=np.float64)
     face_one_shard = NamedSharding(mesh_xy, P('x', 'y'))
 
+    # The residual reduction is INSIDE the jit.  Eagerly it was four more
+    # modules (``subtract``, ``abs``, ``_reduce_max``, ``_reduce_min``); the
+    # arithmetic and the shardings of both operands are unchanged, and the
+    # scalar reaches the log only.
     @jax.jit
-    def _gamma_rt(fH_R):
+    def _gamma_rt(fH_R, fH_k):
         phase0 = jnp.exp(-2j * jnp.pi * (q0 @ R_grid.T))
         m = 0.5 * jnp.einsum('bk,kij->bij', phase0, fH_R)
         m = jax.lax.with_sharding_constraint(m, face_ij_shard)
         m = (m + jnp.swapaxes(m, 1, 2).conj())[0]
-        return jax.lax.with_sharding_constraint(m, face_one_shard)
+        m = jax.lax.with_sharding_constraint(m, face_one_shard)
+        return jnp.min(jnp.max(jnp.abs(fH_k - m), axis=(1, 2)))
 
-    fH_gamma_rt = _gamma_rt(fH_R)
-    diffs = jnp.max(jnp.abs(fH_k - fH_gamma_rt), axis=(1, 2))
-    rt_err = float(jnp.min(diffs))
+    rt_err = float(_gamma_rt(fH_R, fH_k))
     log_fn(f"FFT Γ round-trip max error: {rt_err:.3e}")
 
     fermi_energy = float(wfn.efermi)
@@ -1313,7 +1360,20 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     gamma_exact = None
 
     if kpath_frac is not None:
-        wrapped_k = (kpath_frac + 0.5) % 1.0 - 0.5
+        # Wrap + pad in ONE jit.  Eagerly this was five single-primitive
+        # modules — ``add``, ``remainder``, ``subtract`` for the wrap and
+        # ``broadcast_in_dim`` + ``concatenate`` for the pad (job 7884866).
+        # Op-for-op identical, so the k-points fed to ``_kpath_batch`` are
+        # bit-unchanged: an add feeding a remainder feeding a subtract, with
+        # no multiply anywhere for a fusion to contract into an FMA.
+        @partial(jax.jit, static_argnames=('n_pad',))
+        def _prep_kpath(kf, n_pad):
+            wk = (kf + 0.5) % 1.0 - 0.5
+            if n_pad:
+                wk = jnp.concatenate(
+                    [wk, jnp.zeros((n_pad, 3), dtype=wk.dtype)], axis=0)
+            return wk
+
         # Pad nq to a multiple of batch_size — every batch has the same
         # shape, _kpath_batch compiles ONCE.
         #
@@ -1331,11 +1391,9 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         # by the ``[:nq]`` slice in ``_post_kpath``, so this changes how many
         # q are evaluated and where, never a value.
         batch_size = _pad_to(mesh_xy, ('x', 'y'), 32)
-        nq = wrapped_k.shape[0]
+        nq = int(kpath_frac.shape[0])
         n_pad = (-nq) % batch_size
-        if n_pad:
-            wrapped_k = jnp.concatenate(
-                [wrapped_k, jnp.zeros((n_pad, 3), dtype=wrapped_k.dtype)], axis=0)
+        wrapped_k = _prep_kpath(kpath_frac, int(n_pad))
         nq_padded = wrapped_k.shape[0]
         lambda_q_list = []
         for i in range(0, nq_padded, batch_size):
