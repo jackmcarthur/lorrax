@@ -182,19 +182,22 @@ from ffi.mklblas import (                                    # noqa: E402
 
 
 def bands_gemm_ffi_mode() -> str:
-    """The LORRAX_BANDS_GEMM_FFI grammar: ``"on"`` | ``"off"`` | ``"auto"``
+    """The LORRAX_BANDS_GEMM_FFI grammar: ``"on"`` | ``"off"``
     (delegates to :data:`ffi.mklblas.GATE`)."""
     return _BANDS_GEMM_GATE.mode()
 
 
 def bands_gemm_ffi_enabled() -> bool:
     """True when the primitive's LARGE right contraction routes through the
-    vendor-BLAS GEMM host FFI handler.  DEFAULT is AUTO (2026-07-29 owner
-    order): ON when the platform is CPU and the handler resolves in the
-    host .so (announced once), OFF otherwise.  Read at FACTORY time —
-    kernel caches must key on this (ppm_tau_kernel's pipeline/cache keys
-    do), which is why the auto resolution is lexical and never initializes
-    the JAX backend (gate contract, tier 1)."""
+    vendor-BLAS GEMM host FFI handler.  DEFAULT is ON — the FFI layer is
+    REQUIRED (decisions.md 2026-08-01): a missing handler refuses at
+    startup (``Gate.enforce``) instead of demoting, and ``=0`` is an
+    announced, uncertified debug opt-out onto the retained XLA einsum arm
+    (retained because the ``extra='minor'`` order structurally cannot ride
+    a batched GEMM — see below — so the native arm is not a deletable
+    duplicate here).  Read at FACTORY time — kernel caches must key on
+    this (ppm_tau_kernel's pipeline/cache keys do); the read is env-only
+    and never initializes the JAX backend (gate contract, tier 1)."""
     return _BANDS_GEMM_GATE.enabled()
 
 
@@ -247,9 +250,9 @@ def contract_bands_block_reshard(
         caller's stack axis E (see canonical layout).  Both orders are
         first-class so the choice stays a measurement
         (wk_REL/contract_bands_notes.md records the microbench).
-        ``"minor"`` is refused under the FFI GEMM dial: the contracted
-        axis is then not GEMM-reachable without a full-tile transpose
-        copy — use ``"leading"`` there.
+        ``"minor"`` always takes the XLA plan (structural: the
+        contracted axis is not GEMM-reachable without a full-tile
+        transpose copy) — use ``"leading"`` where the GEMM plan matters.
     axes
         Mesh axis names ``(ax_x, ax_y)``; ax_x shards μ/m, ax_y shards
         ν/n.  Default matches every production mesh.
@@ -293,32 +296,24 @@ def contract_bands_block_reshard(
             f"Sec. 6.1 finding #1).  Build the mesh with {ax_y!r} minor, or "
             f"pass axes=(major, minor) matching your mesh.")
 
-    ffi_mode = bands_gemm_ffi_mode()
     use_ffi = bands_gemm_ffi_enabled()
-    if use_ffi and ffi_mode == "on":
-        # Explicit request: announce-or-REFUSE, never silently downgraded.
-        _require_bands_gemm_ffi(mesh_xy)
-        if extra == "minor":
-            raise RuntimeError(
-                "LORRAX_BANDS_GEMM_FFI does not support extra='minor': with "
-                "the stack axis minor the contracted (s', ν) axis is not "
-                "reachable by a strided batched GEMM without a full-tile "
-                "transpose copy (which would cost what the handler saves).  "
-                "Use extra='leading' with the FFI dial, or unset "
-                "LORRAX_BANDS_GEMM_FFI for the minor order (explicit "
-                "requests are never silently downgraded).")
-    elif use_ffi:
-        # AUTO (the default): capability detection, not policy — quietly
-        # keep the native lowering where the dial cannot apply.  The gate
-        # owns the mesh-platform half (non-CPU mesh: OFF, silent BY DESIGN
-        # and with the reason recorded in the gate's
-        # ``silent_platform_demote`` field — XLA:GPU's dot lowering already
-        # hits cuBLAS, which is optimal); THIS module owns extra='minor',
-        # which is a fact about the primitive's operand layout, not about
-        # BLAS: the contracted axis is not GEMM-reachable there (see the
-        # explicit-mode refusal above), so the minor order keeps the XLA
-        # plan.  The probe + AUTO-ON announce already ran inside
-        # bands_gemm_ffi_enabled().
+    if use_ffi:
+        # The REQUIRED path (decisions.md 2026-08-01).  Two structural
+        # exclusions keep the XLA plan, and only these — neither is a
+        # demotion to a duplicate:
+        # * non-CPU mesh — the dial does not exist there (host symbol
+        #   table only; XLA:GPU's dot lowering already hits cuBLAS, which
+        #   is optimal).  Silent BY DESIGN, reason recorded in the gate's
+        #   ``silent_platform_demote`` field; ``Gate.resolve`` returns
+        #   None for it and announce-or-REFUSES everything else (a
+        #   missing handler on a CPU mesh raises — startup enforcement
+        #   normally caught it already at initialize_communicator_stack).
+        # * extra='minor' — THIS module's fact, about the primitive's
+        #   operand layout rather than about BLAS: with the stack axis
+        #   minor the contracted (s', nu) axis is not reachable by a
+        #   strided batched GEMM without a full-tile transpose copy
+        #   (which would cost what the handler saves).  Use
+        #   extra='leading' where the GEMM plan matters.
         if _BANDS_GEMM_GATE.resolve(mesh_xy) is None or extra == "minor":
             use_ffi = False
 
@@ -334,17 +329,17 @@ def contract_bands_block_reshard(
         """The GEMM handler serves ALL FOUR BLAS precisions since the
         2026-07-29 owner order — f64/f32/c128/c64, dispatched on the
         buffer dtype onto cblas_{d,s,z,c}gemm[_batch].  The BSE fp32-GMRES
-        (complex64) path therefore RIDES the handler now; it used to be a
-        capability boundary (auto fell back, explicit ``=1`` refused).
+        (complex64) path rides the handler.
 
-        What remains excluded is only a genuinely unserveable dtype (f16,
-        bf16, c256, or a mismatched pair that the de-promotion policy
-        should have split upstream).  Explicit mode still REFUSES those
-        with the fix named; AUTO still quietly keeps the XLA lowering."""
+        A genuinely unserveable dtype (f16, bf16, c256, or a mismatched
+        pair that the de-promotion policy should have split upstream)
+        REFUSES with the fix named — the required layer never silently
+        demotes (decisions.md 2026-08-01); LORRAX_BANDS_GEMM_FFI=0 is the
+        announced debug escape onto the XLA lowering."""
         ok = (o_l.dtype == psi_l.dtype
               and o_l.dtype in (jnp.float64, jnp.float32,
                                 jnp.complex128, jnp.complex64))
-        if ok or ffi_mode != "on":
+        if ok:
             return ok
         raise TypeError(
             f"LORRAX_BANDS_GEMM_FFI: the vendor-BLAS GEMM host handler "
@@ -352,9 +347,9 @@ def contract_bands_block_reshard(
             f"{psi_l.dtype}.  A MISMATCHED pair means the de-promotion "
             f"policy did not split a mixed real/complex contraction "
             f"upstream (a bug — report it); a half/extended precision "
-            f"operand is genuinely unserved.  Unset LORRAX_BANDS_GEMM_FFI "
-            f"for this path — the XLA lowering accepts it, and explicit "
-            f"requests are never silently downgraded.")
+            f"operand is genuinely unserved.  LORRAX_BANDS_GEMM_FFI=0 is "
+            f"the announced debug escape onto the XLA lowering — the "
+            f"required layer never demotes silently.")
 
     def _right_none(o_l, psi_l):
         # (k, s, x, t, y) × (k, t, y, n) -> (k, s, x, n)

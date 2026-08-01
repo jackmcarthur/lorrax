@@ -37,34 +37,38 @@ __all__ = ["GEMM_TARGET", "GATE", "gemm_ffi_mode", "gemm_ffi_enabled",
 
 GEMM_TARGET = "lorrax_mklblas_gemm_batch"
 
-#: The ``LORRAX_BANDS_GEMM_FFI`` dial.  AUTO by default (owner order
-#: 2026-07-29, env-vars doctrine #8: capability detection, not policy).
+#: The ``LORRAX_BANDS_GEMM_FFI`` dial.  Default ON — the FFI layer is
+#: REQUIRED (owner ruling, ``docs/architecture/decisions.md`` 2026-08-01):
+#: on a CPU mesh a missing handler is a startup refusal naming the ``.so``
+#: (``Gate.enforce``), never a demotion.  The pre-ruling ``auto`` mode
+#: (capability detection, owner order 2026-07-29) was deleted with the
+#: ruling — auto-demotion to the XLA duplicate is exactly what it forbids.
+#:
+#: ``=0`` is a real, announced debug opt-out (off_policy="fallback"): the
+#: XLA einsum arm in ``common.contract_bands`` is RETAINED — not as a
+#: duplicate, but because the ``extra='minor'`` operand order structurally
+#: cannot ride a batched GEMM, so the native arm must exist regardless.
 #:
 #: ``silent_platform_demote`` is the one place this gate is allowed to keep
 #: quiet, and the reason is recorded in the field itself: on a GPU run the
-#: dial is not merely off, it does not exist (host symbol table only), so an
-#: announcement would report a non-decision on every GPU run and name a
-#: variable the user has no reason to have set.
+#: dial is not merely off, it does not exist (host symbol table only) and
+#: XLA:GPU's dot lowering already dispatches cuBLAS — the required path on
+#: that platform IS the native lowering.
 GATE = Gate(
     env="LORRAX_BANDS_GEMM_FFI",
     target=GEMM_TARGET,
     platforms=("cpu",),
-    modes=("auto", "off", "on"),
-    default="auto",
-    off_label="default XLA GEMM lowering",
+    modes=("off", "on"),
+    default="on",
+    off_label="native XLA dot lowering",
+    off_policy="fallback",
+    off_announce_msg=(
+        "[bands_gemm] LORRAX_BANDS_GEMM_FFI=0: explicit debug opt-out — "
+        "contract_bands right-GEMMs run the native XLA dot lowering "
+        "(1.6-1.9x below vendor-BLAS rate at full threads, jobs "
+        "7879008/7879010).  UNCERTIFIED for production: the FFI layer is "
+        "required (decisions.md 2026-08-01)."),
     label={"cpu": "MKL batched-GEMM host"},
-    lexical_default="CUDA",
-    auto_on_msg=(
-        "[bands_gemm] AUTO-ON: CPU platform and FFI target "
-        "'{target}' resolves in the host .so -> "
-        "contract_bands right-GEMMs at vendor-BLAS rate "
-        "(1.6-1.9x over the XLA:CPU Eigen dots at full "
-        "threads, jobs 7879008/7879010).  "
-        "LORRAX_BANDS_GEMM_FFI=0 disables."),
-    auto_unavailable_msg=(
-        "[bands_gemm] auto: FFI target '{target}' "
-        "unavailable -> default XLA GEMM lowering "
-        "({reason})"),
     resolved_msg={"cpu": (
         "[bands_gemm] contract_bands right-GEMMs -> vendor-BLAS "
         "GEMM host FFI handler ({target}): "
@@ -79,17 +83,20 @@ GATE = Gate(
         "backend, but the mesh devices are '{platform}'.  This dial is "
         "CPU-only BY DESIGN: the native XLA dot lowering on CUDA "
         "already dispatches cuBLAS (optimal there) and is deliberately "
-        "untouched.  Unset LORRAX_BANDS_GEMM_FFI on non-CPU meshes — "
-        "explicit requests are never silently downgraded."),
+        "untouched."),
     refuse_probe_msg=(
-        "LORRAX_BANDS_GEMM_FFI requested the MKL batched-GEMM host "
-        "backend, but FFI target '{target}' is unusable: "
-        "{reason}"),
+        "The required MKL batched-GEMM host backend is unavailable: FFI "
+        "target '{target}' is unusable: {reason}  The FFI layer is "
+        "REQUIRED (docs/architecture/decisions.md, 2026-08-01); "
+        "build/locate liblorrax_ffi_host.so per "
+        "docs/environment/overview.md (selected by LORRAX_FFI_HOST_SO), "
+        "or set LORRAX_BANDS_GEMM_FFI=0 for an announced, uncertified "
+        "debug run on the XLA lowering."),
 )
 
 
 def gemm_ffi_mode() -> str:
-    """``"on"`` | ``"off"`` | ``"auto"`` — the raw ``LORRAX_BANDS_GEMM_FFI``
+    """``"on"`` | ``"off"`` — the raw ``LORRAX_BANDS_GEMM_FFI``
     grammar (:meth:`ffi.gate.Gate.mode`)."""
     return GATE.mode()
 
@@ -103,9 +110,9 @@ def gemm_ffi_enabled() -> bool:
 
 
 def require_gemm_ffi(mesh) -> str:
-    """Announce-or-REFUSE for an EXPLICIT ``=1``: raises with the fix named
-    on a non-CPU mesh or a host ``.so`` without the handler (quoting the
-    ``probe_target`` reason)."""
+    """Announce-or-REFUSE for the required backend: raises with the fix
+    named on a non-CPU mesh or a host ``.so`` without the handler (quoting
+    the ``probe_target`` reason)."""
     return GATE.require(mesh)
 
 

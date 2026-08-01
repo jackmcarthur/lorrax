@@ -21,7 +21,14 @@ HLO — the only ground truth for lowering claims (QUALITY_PATTERNS #4):
 5. (when the host .so with the mklblas handler is reachable) the
    LORRAX_BANDS_GEMM_FFI plan: parity at 1e-14, the right-GEMM
    custom-calls present at the expected count, reduce-scatter payloads
-   byte-identical to the XLA plan, and the extra="minor" refusal.
+   byte-identical to the XLA plan, and the quiet extra="minor" XLA
+   fallback (structural — the contracted axis is not GEMM-reachable).
+
+The XLA-plan pins (1-4) run with the dial pinned =0 (the announced debug
+opt-out): since the FFI-required ruling (decisions.md 2026-08-01) the
+dial defaults ON and a missing handler REFUSES at the factory instead of
+demoting, so an unpinned run of these pins would either take the GEMM
+plan or die, depending on whether the .so is reachable.
 
 Run inside the container (login python has no jax), e.g.::
 
@@ -47,6 +54,10 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 os.environ.setdefault("XLA_FLAGS",
                       "--xla_force_host_platform_device_count=4")
+# The XLA-plan pins below assert the NATIVE lowering; the dial defaults ON
+# since the FFI-required ruling, so pin it to the announced debug opt-out.
+# The FFI-plan tests set =1 (and the default test unsets) explicitly.
+os.environ.setdefault("LORRAX_BANDS_GEMM_FFI", "0")
 
 import jax                                           # noqa: E402
 import jax.numpy as jnp                              # noqa: E402
@@ -271,67 +282,71 @@ def test_refusals():
 
 
 # ---------------------------------------------------------------------------
-# AUTO default (owner order 2026-07-29): ON iff CPU platform + handler in
-# the host .so; explicit 0 disables; auto quietly keeps the XLA plan where
-# the dial cannot apply (extra="minor"; the dtype boundary is GONE since
-# the handler serves all four BLAS precisions — c64 now rides it).
+# REQUIRED default (decisions.md 2026-08-01): the dial defaults ON; =0 is
+# an announced debug opt-out; a stale =auto (the deleted capability-
+# detection mode) resolves to the default with a grammar note; a missing
+# handler REFUSES at the factory instead of demoting.  extra="minor"
+# quietly keeps the XLA plan under every mode (structural).
 # ---------------------------------------------------------------------------
 
-def test_auto_default():
+def test_required_default():
     ok, reason = _ffi_available()
     prev = os.environ.pop("LORRAX_BANDS_GEMM_FFI", None)
     try:
-        assert bands_gemm_ffi_mode() == "auto"
-        auto_on = bands_gemm_ffi_enabled()
-        assert auto_on == ok, (
-            f"auto verdict {auto_on} != handler availability {ok} "
-            f"({reason})")
-        os.environ["LORRAX_BANDS_GEMM_FFI"] = "auto"
-        assert bands_gemm_ffi_enabled() == ok
+        assert bands_gemm_ffi_mode() == "on", (
+            "unset must resolve ON — the FFI layer is required")
+        assert bands_gemm_ffi_enabled()
+        os.environ["LORRAX_BANDS_GEMM_FFI"] = "auto"    # deleted mode
+        assert bands_gemm_ffi_mode() == "on", (
+            "a stale =auto must resolve to the default (announced grammar "
+            "note), never silently to off")
         os.environ["LORRAX_BANDS_GEMM_FFI"] = "0"
         assert bands_gemm_ffi_mode() == "off"
-        assert not bands_gemm_ffi_enabled(), "explicit =0 must disable auto"
+        assert not bands_gemm_ffi_enabled(), "explicit =0 must opt out"
         del os.environ["LORRAX_BANDS_GEMM_FFI"]
 
         mesh = _mesh()
         if ok:
-            # auto-ON: the leading plan carries the GEMM custom-call ...
+            # required-ON: the leading plan carries the GEMM custom-call ...
             proj = contract_bands_block_reshard(mesh, extra="leading")
             (psi_l, o, psi_r), dev = _operands(mesh, extra="leading")
             out = jax.jit(proj)(*dev)
             err = _relerr(out, _ref(psi_l, o, psi_r, extra="leading"))
-            assert err <= TOL, f"[auto leading] parity {err:.3e} > 1e-14"
+            assert err <= TOL, f"[req leading] parity {err:.3e} > 1e-14"
             txt = _compile_text(proj, dev)
             assert len(_CC_RE.findall(txt)) == 1, (
-                "[auto leading] expected the FFI custom-call under auto-ON")
-            # ... while extra="minor" quietly keeps the XLA plan (the
-            # explicit-mode refusal must NOT fire under auto) ...
+                "[req leading] expected the FFI custom-call by default")
+            # ... while extra="minor" quietly keeps the XLA plan
+            # (structural, not a demotion) ...
             proj_m = contract_bands_block_reshard(mesh, extra="minor")
             (psi_l, o, psi_r), dev = _operands(mesh, extra="minor")
             out = jax.jit(proj_m)(*dev)
             err = _relerr(out, _ref(psi_l, o, psi_r, extra="minor"))
-            assert err <= TOL, f"[auto minor] parity {err:.3e} > 1e-14"
+            assert err <= TOL, f"[req minor] parity {err:.3e} > 1e-14"
             txt = _compile_text(proj_m, dev)
             assert len(_CC_RE.findall(txt)) == 0, (
-                "[auto minor] must fall back to the XLA plan, not refuse")
-            # ... while complex64 now RIDES the handler (owner order
-            # 2026-07-29 added f32/c64 to the TU — it used to fall back).
+                "[req minor] must keep the XLA plan quietly, not refuse")
+            # ... while complex64 RIDES the handler (all four precisions).
             proj_c = contract_bands_block_reshard(mesh, channels="none")
             (psi_l, o, psi_r), dev = _operands(mesh)
             dev64 = tuple(jnp.asarray(d, dtype=jnp.complex64) for d in dev)
             txt = jax.jit(proj_c).lower(*dev64).compile().as_text()
             assert len(_CC_RE.findall(txt)) == 1, (
-                "[auto c64] complex64 must now use the cgemm custom-call "
-                "(the dtype boundary was removed)")
-            print("  [auto] AUTO-ON engages; minor falls back, c64 rides "
-                  "the handler", flush=True)
+                "[req c64] complex64 must use the cgemm custom-call")
+            print("  [required] default ON engages; minor keeps XLA "
+                  "quietly, c64 rides the handler", flush=True)
         else:
-            proj = contract_bands_block_reshard(mesh, extra="leading")
-            (psi_l, o, psi_r), dev = _operands(mesh, extra="leading")
-            txt = _compile_text(proj, dev)
-            assert len(_CC_RE.findall(txt)) == 0
-            print(f"  [auto] handler unavailable -> auto-OFF ({reason})",
-                  flush=True)
+            # REQUIRED: a missing handler refuses at the factory, naming
+            # the library — never a silent demotion to the XLA plan.
+            try:
+                contract_bands_block_reshard(mesh, extra="leading")
+                raise AssertionError(
+                    "required-handler refusal did not fire with the "
+                    "handler unavailable")
+            except RuntimeError as exc:
+                assert "REQUIRED" in str(exc), str(exc)
+            print(f"  [required] handler unavailable -> factory refusal "
+                  f"({reason})", flush=True)
     finally:
         if prev is None:
             os.environ.pop("LORRAX_BANDS_GEMM_FFI", None)
@@ -483,12 +498,16 @@ def test_ffi_gemm_plan():
         assert ncc == 1, (
             f"[ffi leading] expected 1 gemm custom-call, got {ncc}")
 
-        # extra=minor must REFUSE under the FFI dial.
-        try:
-            contract_bands_block_reshard(mesh, extra="minor")
-            raise AssertionError("ffi extra=minor refusal did not fire")
-        except RuntimeError as exc:
-            assert "minor" in str(exc)
+        # extra=minor quietly keeps the XLA plan even at =1 (structural:
+        # the contracted axis is not GEMM-reachable; not a demotion).
+        proj_m = contract_bands_block_reshard(mesh, extra="minor")
+        (psi_l, o, psi_r), dev = _operands(mesh, extra="minor")
+        out = jax.jit(proj_m)(*dev)
+        err = _relerr(out, _ref(psi_l, o, psi_r, extra="minor"))
+        assert err <= TOL, f"[ffi minor] parity {err:.3e} > 1e-14"
+        txt = _compile_text(proj_m, dev)
+        assert len(_CC_RE.findall(txt)) == 0, (
+            "[ffi minor] must keep the XLA plan (0 custom-calls)")
         print("  [ffi] all FFI-plan gates PASS", flush=True)
     finally:
         os.environ["LORRAX_BANDS_GEMM_FFI"] = "0"
