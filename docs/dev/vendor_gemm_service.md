@@ -8,12 +8,25 @@ is short).  Sources: `src/ffi/gemm.py`,
 Measurements: `wk_REL/RESHARD_OVERHEAD_MEMO.md` Sec. 4.4/4.5,
 `wk_REL/contract_bands_notes.md`, `wk_REL/gemm_portability_bse_notes.md`.*
 
+> **REQUIRED, 2026-08-01** (`docs/architecture/decisions.md`).  The dial
+> defaults **ON**; the `auto` capability-detection mode of §3 is DELETED
+> (a stale `=auto` resolves to the default with an announced grammar
+> note); a missing handler on a CPU mesh REFUSES — at startup
+> (`Gate.enforce` via `runtime.initialize_communicator_stack`) and at the
+> factory — naming `liblorrax_ffi_host.so` / `LORRAX_FFI_HOST_SO` /
+> `docs/environment/overview.md`.  `=0` is an announced, uncertified
+> debug opt-out onto the retained XLA einsum arm (retained because
+> `extra='minor'` structurally cannot ride a batched GEMM; that order
+> quietly keeps the XLA plan under every mode, where explicit `=1` used
+> to refuse it).  §3 below is kept as design history of the deleted
+> `auto` tier; where it conflicts with this box, this box wins.
+
 ## 1. API contract
 
 ```python
 from ffi.mklblas import (
     bands_gemm_ffi_enabled,   # the dial (factory-time, cache-key safe)
-    bands_gemm_ffi_mode,      # raw grammar: "on" | "off" | "auto"
+    bands_gemm_ffi_mode,      # raw grammar: "on" | "off"
     require_bands_gemm_ffi,   # announce-or-REFUSE on a mesh
     gemm_batch,               # the ffi_call
 )
@@ -55,8 +68,10 @@ Refusals, split by phase (the two-phase contract —
    policy failed to split a mixed real/complex contraction upstream (a bug,
    report it); half/extended precision is genuinely unserved.
 
-Under the AUTO default none of these refuse — auto quietly keeps the native
-lowering wherever the dial cannot apply.
+(Historical: under the deleted AUTO default none of these refused.  Since
+2026-08-01 the required default refuses 1/2/4; 3 — the minor order — keeps
+the XLA plan quietly under every mode, as a structural fact rather than a
+demotion.)
 
 ## 2. Why this is NOT a general GEMM service
 
@@ -77,7 +92,7 @@ GF/s MKL (memo Sec. 4.4/4.5).  Job 7879008 also showed the client
 thread-pool scaling is near-linear, so this is **not** a pool-wiring defect
 that could be fixed on the XLA side.
 
-## 3. The `auto` contract
+## 3. The `auto` contract (DELETED 2026-08-01 — design history)
 
 Default since the 2026-07-29 owner order: capability detection, not policy
 (env-vars doctrine #8).  `auto`/unset turns the body ON iff **the platform

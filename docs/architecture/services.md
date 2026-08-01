@@ -171,9 +171,11 @@ def device_count() -> int;   def barrier(name, *, print_fn=print) -> bool
   collective — call synchronously on every rank.
 * `resolve_mesh` refuses (resolve time) a mesh this process cannot compute
   on (`_require_addressable`) instead of a bare `StopIteration` inside a
-  jit; with no mesh given it returns the **canonical mesh** — the
-  most-square factorization of `jax.devices()`, built ONCE per process per
-  axis-name tuple and cached (`_CANONICAL_MESHES`, 2026-08-01): a library
+  jit; with no mesh given it returns the **canonical mesh** — the square
+  s×s mesh over `jax.devices()` (square-only ruling, decisions.md
+  2026-08-01: a non-perfect-square device count REFUSES, naming the square
+  counts to request — idle-rank truncation would deadlock under impl=mpi),
+  built ONCE per process per axis-name tuple and cached (`_CANONICAL_MESHES`, 2026-08-01): a library
   that re-resolves "the run's mesh" after `initialize_communicator_stack`
   gets THE object back, not an equal-but-distinct twin that would double
   every shape-keyed jit cache (the identity contract of
@@ -406,9 +408,11 @@ enters via `common.fft_helpers`, which delegates its gated bodies here —
 `fft_helpers.make_flat_k_fft` is the single door):
 
 ```python
-GATE       = Gate(env="LORRAX_FFT_FFI",       modes=("off","on"), default="off",
+GATE       = Gate(env="LORRAX_FFT_FFI",       modes=("off","on"), default="on",
+                  off_policy="refuse",    # the XLA twin is DELETED
                   platforms=("cpu","CUDA"), target=FLAT_K_TARGET)
-FUSED_GATE = Gate(env="LORRAX_FFT_FFI_FUSED", modes=("off","on"), default="off",
+FUSED_GATE = Gate(env="LORRAX_FFT_FFI_FUSED", modes=("off","on"), default="on",
+                  off_policy="fallback",  # decomposed chain, still FFI
                   platforms=("cpu","CUDA"), target=GW_CONV_TARGET)
 
 def fft_ffi_enabled() -> bool;   def fft_ffi_mode() -> str
@@ -420,10 +424,12 @@ def make_gw_conv_ffi(mesh, kgrid, g_spec, v_spec, *,
 def ffi_fft_scale(kind, norm, nk) -> float
 def validate_flat_spec(spec: P, what: str) -> P
 
-# the un-gated XLA entry points, common/fft_helpers.py:
+# the single door (common/fft_helpers.py; unconditionally FFI since the
+# 2026-08-01 ruling — the gated XLA twin is deleted, =0 refuses):
 def make_flat_k_fft(mesh, kgrid, spec, *, kind, norm='ortho', out_spec=None)
 def make_flat_k_ifftn(mesh, kgrid, spec, *, norm='ortho', out_spec=None)
 def make_flat_k_fftn(mesh, kgrid, spec, *, norm='ortho', out_spec=None)
+# shard_map-interior XLA layer, KEPT (no FFI route exists; BSE/isdf/psi):
 def make_sharded_ifftn_3d(mesh, in_spec, out_spec, *, norm=None,
                           axes=(-3, -2, -1))
 def make_sharded_fftn_3d(mesh, in_spec, out_spec, *, norm=None,
@@ -471,8 +477,9 @@ right-GEMMs at BLAS rate (1.6–1.9× over XLA:CPU Eigen dots, jobs
 historical `bands_gemm_*` names):
 
 ```python
-GATE = Gate(env="LORRAX_BANDS_GEMM_FFI", modes=("auto","off","on"),
-            default="auto", platforms=("cpu",), target=GEMM_TARGET)
+GATE = Gate(env="LORRAX_BANDS_GEMM_FFI", modes=("off","on"),
+            default="on", off_policy="fallback",  # XLA arm kept for minor
+            platforms=("cpu",), target=GEMM_TARGET)
 
 def gemm_ffi_enabled() -> bool;  def gemm_ffi_mode() -> str
 def require_gemm_ffi(mesh) -> str

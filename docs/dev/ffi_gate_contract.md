@@ -7,6 +7,32 @@ to believe the third one.  Sources: `src/ffi/gate.py`,
 2026-07-30; the assessment that motivated it is
 `wk_REL/FFI_MICROSERVICE_ASSESSMENT.md`.*
 
+> **REQUIRED-LAYER REVISION, 2026-08-01** (`docs/architecture/decisions.md`
+> — "FFI backends are required, not optional").  Every gate now defaults
+> **ON**; the `auto` capability-detection tier (`_auto_lexical`, the
+> memoized verdict, the AUTO-ON/auto-unavailable announcements) is
+> **deleted** — auto-demotion to a duplicate compute path is what the
+> ruling forbids.  Three consequences rewire this page:
+>
+> 1. **`Gate.enforce(mesh)`** is the new startup tier: called per gate by
+>    `runtime.initialize_communicator_stack` (step 6b) right after the
+>    mesh exists, so a missing/unloadable library refuses AT STARTUP,
+>    quoting `probe_target`'s three-way reason (which names the `.so`)
+>    and pointing at `docs/environment/overview.md`.
+> 2. **`=0` is per-gate policy** (`Gate.off_policy`): `"fallback"` runs a
+>    structurally-retained native path, announced once as an uncertified
+>    debug opt-out (`LORRAX_BANDS_GEMM_FFI` — the XLA einsum arm must
+>    exist for `extra='minor'`; `LORRAX_FFT_FFI_FUSED` — the decomposed
+>    chain is itself FFI-served); `"refuse"` names a DELETED duplicate
+>    (`LORRAX_FFT_FFI` — the XLA flat-k arm is gone).
+> 3. **The grammar fallback is the gate's default, not `off`**: with
+>    `off` able to refuse, a typo resolving to `off` would kill a run;
+>    resolving to the certified default (announced) cannot.
+>
+> Prose below describing `auto`, the two-tier lexical probe, or "default
+> OFF" is kept as design history; where it conflicts with this box, this
+> box wins.
+
 Before this existed there were **four** independent "resolve a backend"
 idioms sharing only `ffi_loader.probe_target`, and one of them
 (`gw/ppm_tau_kernel.py:81`, `LORRAX_FFT_FFI_FUSED`) had drifted far enough

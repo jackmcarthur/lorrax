@@ -8,6 +8,17 @@ the two platform handlers behind them, written to the shape of
 Measurements: `wk_REL/sigma_perf_results.md`, `wk_REL/audit_gpu_fft.log`,
 `wk_REL/cufft_unit.log`, `wk_REL/audit_gpu_hlo.log` (job 7879378).*
 
+> **REQUIRED, 2026-08-01** (`docs/architecture/decisions.md`).  This
+> service is the ONLY flat-k FFT: the gated XLA twin inside
+> `fft_helpers.make_flat_k_fft` was deleted under the FFI-required ruling.
+> Both dials default **ON**; a missing/unloadable library refuses at
+> startup (`Gate.enforce` in `runtime.initialize_communicator_stack`,
+> naming the `.so` and `docs/environment/overview.md`);
+> `LORRAX_FFT_FFI=0` REFUSES (nothing to opt out to), while
+> `LORRAX_FFT_FFI_FUSED=0` opts out to the decomposed three-transform
+> chain, which is itself FFI-served.  Statements below about "the flag
+> off = the XLA path" are historical.
+
 > **Adoption state, 2026-07-30 — SUPERSEDED 2026-07-31.**  The 07-30 text
 > below is kept as history; the delegation has landed.  `ffi.mklfft`
 > (`src/ffi/fft.py`) IS the single implementation: `common/fft_helpers.py`
@@ -65,8 +76,11 @@ spec; 7. leading extent != `nkx·nky·nkz`; 8. (conv) G/W shard-shape
 disagreement.  These are trace-time FACTS and cannot fire earlier.
 
 Both flags are read at FACTORY time and **must be part of every consumer's
-kernel cache key** — `gw/ppm_tau_kernel.py:231-233` and `:404-406` do this
-for all three FFI dials plus the stage-timing flag.
+kernel cache key** — `gw/ppm_tau_kernel.py` does this (via
+`ffi.ffi_dial_key()`) for all three FFI dials plus the stage-timing flag.
+Since 2026-08-01 both default ON; `fft_ffi_enabled()` False (an explicit
+`=0`) makes `make_flat_k_fft` REFUSE rather than select the deleted XLA
+arm.
 
 ## 2. Raison d'être: the layout anchor, stated structurally
 
@@ -248,7 +262,7 @@ aliases, honored with a one-time announcement (`mklpin::knob_value`).
 | the RELOCATED `ffi.mklfft` wrappers lower identically through cuFFT | **measured on real GPU**, job **7882123** (rtx-dev, `[CudaDevice(id=0)]`): `make_flat_k_fft_ffi` and `make_gw_conv_ffi` are **bit-exact** against the live `fft_helpers` path for both directions × three norms, and all 9 gate cells pass with their RED twins |
 | multi-GPU / sharded meshes | **UNMEASURED** — every GPU log is `[CudaDevice(id=0)]` |
 | the service inside the production Σ driver on GPU | **UNMEASURED** — all GPU runs are standalone benches |
-| an `auto` mode for `LORRAX_FFT_FFI` | **not decided.**  The GPU margin (2.1–2.4×) is larger than the one that justified the GEMM `auto`.  The defect the assessment recorded is the absence of a written REASON for the current default, not the value.  Owner call |
+| an `auto` mode for `LORRAX_FFT_FFI` | **CLOSED 2026-08-01** — the FFI-required ruling makes the backend mandatory (default ON, refusal on a missing library); `auto` capability-detection was deleted from the gate contract entirely |
 
 Job 7879378, 2026-07-29, node c196-012, 1× Quadro RTX 5000 sm_75,
 `src@0dd94a8` (`audit_gpu.7879378.out:1-13`).

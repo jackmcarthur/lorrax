@@ -230,8 +230,10 @@ leg gains a CMake feature option (`LORRAX_HOST_HAVE_FFTW3`, detected from
 system FFTW, and the same `dlsym` then finds it.  No new environment
 variable is introduced in either case — the engine is named by what the
 `.so` links, not by a knob — which is what invariant 2 (§2) requires;
-`LORRAX_FFT_FFI` still announces-or-refuses when no engine resolves, so
-absence stays slower-and-loud, never wrong.
+`LORRAX_FFT_FFI` still announces-or-refuses when no engine resolves — and
+since the 2026-08-01 FFI-required ruling the refusal fires at STARTUP
+(`Gate.enforce`): absence is loud and fatal, never a silent demotion and
+never wrong.
 
 **Parity gate for the engine swap, stated once with its class:**
 value-level, **relative 1e-12** (the Σ-path class,

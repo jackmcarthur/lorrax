@@ -32,7 +32,7 @@ count, `r` = r-chunk size, `nq` = IBZ q count, all buffers complex128
 | zeta h5 write (G-flat accumulator + SlabIO) | `slab_io = auto` | accumulator `(nq_disk, mu/P, ngkmax)` → `/P`; `auto` → parallel-HDF5 FFI collective hyperslab write (no gather). The `h5py_allgather` fallback gathers the FULL `(nq_disk, mu, ngkmax)` tensor on rank 0 — announced, non-scaling; do not run large-mu with a demoted writer | same |
 | W Dyson solve (`gw/w_isdf`) | `w_dyson_solver = auto` = `local`: q-parallel per-q dense LU, `ceil(nq/P)` whole `(mu,mu)` tiles per rank — a mu² tile per rank exists | `w_dyson_solver = distributed`: 2-D block-cyclic backsolve via `ffi.linalg` `solve_lu`, `nq·mu²/P`; refuses loudly, never downgrades |
 | band-interpolation / BSE eigh (htransform fH_q, vq_interp C_q) | `eigh_backend = auto` = q-batched native eigh, one whole `(rank,rank)` matrix per device | `eigh_backend = distributed` (or `use_low_mem_eigh = true`): one tile spread over the mesh (`pzheevd` on host); square or 1-D mesh, `n` divisible by both axes |
-| FFT / GEMM backends | env, not deck: `LORRAX_FFT_FFI=1`, `LORRAX_FFT_FFI_FUSED=1`, `LORRAX_BANDS_GEMM_FFI=auto` | orthogonal to the plan choice; certified on for production CPU runs (see `docs/dev/flat_k_fft_service.md`, `vendor_gemm_service.md`) | same |
+| FFT / GEMM backends | env, not deck: `LORRAX_FFT_FFI` / `LORRAX_FFT_FFI_FUSED` / `LORRAX_BANDS_GEMM_FFI`, all default ON (REQUIRED since 2026-08-01 — a missing handler refuses at startup; explicit exports are redundant) | orthogonal to the plan choice (see `docs/dev/flat_k_fft_service.md`, `vendor_gemm_service.md`, `docs/dev/env_vars.md`) | same |
 | transport | `config/frontera/mpi_transport_env.sh`: `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi` | required at distributed tiers (gloo banned there) | same |
 
 Constraints common to every distributed backend (checked at RESOLVE time
@@ -55,7 +55,7 @@ slab_io                = auto             # verify the FFI writer engages (banne
 ```
 
 plus the launch env of `config/frontera/templates/gw_dev.sbatch`
-(`srun --mpi=pmi2`, `impl=mpi`, `LORRAX_FFT_FFI=1`, `LORRAX_FFT_FFI_FUSED=1`).
+(`srun --mpi=pmi2`, `impl=mpi`; the FFI stack is the required default since 2026-08-01 — no gate exports needed).
 
 ## Certified example invocations
 
@@ -98,7 +98,7 @@ plus the launch env of `config/frontera/templates/gw_dev.sbatch`
 | `LORRAX_ZETA_REPLICATE_CAP_GIB` | 4 | whether the charge factorization may run replicated at all (per-q-batch criterion for rank_truncate) | mu ceiling `sqrt(cap/16)` = 16384/batch; production 12×12 runs raise to 16 |
 | `LORRAX_COLLECTIVE_CHUNK_MB` | 128 | max payload of ONE emitted collective in the distributed tier (host-level q-block loop, cannot be re-fused by XLA) | 1.15 GB single-shot AllGather fatal at P=144; 0.104 GB healthy on the same 144 ranks; at P=16 impl=mpi the cap is indistinguishable from unbounded.  A per-instruction transport cap, orthogonal to the 4 GiB live-bytes cap.  Note: once ONE q's collective exceeds the budget the bound is abandoned with a loud warning (q is the only split axis) |
 | `slab_io = auto` probe | launcher PMI env, else a subprocess MPI_Init probe | FFI parallel-HDF5 vs announced allgather demotion | bare-launch demotion path is a standing regression test |
-| `LORRAX_BANDS_GEMM_FFI = auto` | capability probe | vendor batched GEMM vs XLA dot | explicit `on` refuses when the handler probe fails |
+| `LORRAX_BANDS_GEMM_FFI` (default on — REQUIRED) | startup enforcement (`Gate.enforce`) | vendor batched GEMM; `=0` = announced uncertified XLA-dot debug opt-out | a missing handler refuses at startup naming the .so (decisions.md 2026-08-01) |
 
 ## Still replicated today (honest list)
 

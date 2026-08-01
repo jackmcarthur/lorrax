@@ -780,10 +780,10 @@ There is no offline fit / DOE / preset framework: the former
 `plan_gflat_chunks` always overwrote its chunk picks; see
 `reports/memplanner_cleanup_2026-07-02/PLAN.md`).
 
-### NOT modelled: the LORRAX FFI handler arenas (`LORRAX_FFT_FFI=1`)
+### NOT modelled: the LORRAX FFI handler arenas (the required flat-k FFT service)
 
 A third invisible allocation exists and this planner does **not** account for
-it. With the flat-k FFT service enabled, the handlers in
+it. The flat-k FFT service is the required default (2026-08-01); its handlers in
 `src/ffi/cpp/mklfft` (MKL DFTI descriptors) and `src/ffi/cpp/cufft` (cuFFT
 plans + the NVRTC-compiled fused multiply) hold their own workspace *outside
 both* XLA's buffer assignment and the `cufftMakePlanMany` query above — the

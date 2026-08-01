@@ -721,7 +721,7 @@ Implementation: `compute_sigma_c_ppm_omega_grid` in `gw/ppm_sigma.py`. Output wr
 
 ## 7. JAX Sharding Summary
 
-Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` built in `gw_jax._build_mesh` as a most-square factorization of `jax.process_count() * jax.local_device_count()`. There is no `'bands'` axis. Flat-k / flat-q: the 3-D `(nkx, nky, nkz)` form only appears inside `common/fft_helpers.make_flat_k_{fftn,ifftn}`.
+Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` — the square s×s mesh from `common.collectives.resolve_mesh` (square-only ruling 2026-08-01; non-square device counts refuse). There is no `'bands'` axis. Flat-k / flat-q: the 3-D `(nkx, nky, nkz)` form only appears inside `common/fft_helpers.make_flat_k_{fftn,ifftn}`.
 
 ### 7.1 Zeta Fitting Pipeline
 
