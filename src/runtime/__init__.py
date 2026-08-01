@@ -495,12 +495,24 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
     Opt out with ``LORRAX_CPU_SKIP_GPU_PLUGINS=0``; the opt-out announces
     itself, because "startup got a minute slower" is otherwise invisible.
     """
-    if _GPU_PLUGIN_SKIP_STATE["done"]:
-        return True
-
     plat = os.environ.get("JAX_PLATFORMS", "").strip().lower()
     plats = [p.strip() for p in plat.split(",") if p.strip()]
     wants_gpu = any(p in ("cuda", "gpu", "rocm") for p in plats)
+
+    if _GPU_PLUGIN_SKIP_STATE["done"]:
+        # The import blocker is already installed, but arm 2's OTHER half —
+        # pinning ``JAX_PLATFORMS=cpu`` so the resolved platform agrees with
+        # the hardware — is per-CALL state: a later caller (a second
+        # ``set_default_env()`` in the same process, e.g. another driver
+        # entry or a test) may have re-set ``JAX_PLATFORMS`` to a GPU
+        # request after the first arming.  Re-apply the demotion for this
+        # call's env; without it the function returns True while leaving a
+        # ``cuda,cpu`` request standing on a GPU-less node (the exact
+        # disagreement ``test_set_default_env_defaults`` pins).
+        if wants_gpu and not _gpu_is_present():
+            os.environ.pop("JAX_PLATFORM_NAME", None)
+            os.environ["JAX_PLATFORMS"] = "cpu"
+        return True
     if plats == ["cpu"]:
         arm = "JAX_PLATFORMS=cpu"
     elif wants_gpu and not _gpu_is_present():
@@ -530,7 +542,23 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
 
     if "jax_plugins.xla_cuda12" in sys.modules:
         # Too late: something already imported and initialised the plugin, so
-        # the libraries are loaded and stubbing now would only hide it.
+        # the libraries are loaded and stubbing now would only hide it.  The
+        # STARTUP SAVING is lost, but the arm-2 demotion is not: reaching
+        # this line at all means the run is CPU-only (arm 1 or arm 2 was
+        # chosen above), so pin ``JAX_PLATFORMS=cpu`` exactly as the normal
+        # arm-2 path does.  Without this, a caller asking ``cuda,cpu`` on a
+        # GPU-less node where the plugin import already happened (any pytest
+        # process: jax's own discovery imports the plugin during the first
+        # backend init) is left with a resolved platform that disagrees
+        # with the hardware.
+        if plats != ["cpu"] and not _gpu_is_present():
+            os.environ.pop("JAX_PLATFORM_NAME", None)
+            os.environ["JAX_PLATFORMS"] = "cpu"
+            _record_demotion(
+                f"JAX_PLATFORMS was requested as {plat!r} and was pinned to "
+                f"'cpu' (no NVIDIA device on this node); the CUDA plugin was "
+                f"already imported, so only the demotion — not the startup "
+                f"saving — is in force.")
         if announce:
             _gpu_plugin_say(
                 "[runtime] NOTE: the CUDA PJRT plugin was already imported "
