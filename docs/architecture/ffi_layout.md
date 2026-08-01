@@ -182,3 +182,34 @@ Deferred (with reasons): CUDA-leg build validation (needs rtx/Perlmutter —
 the leg is a verbatim text relocation, path-existence-checked only);
 `io.py`/`linalg` merges (edits, not moves — beyond the pure-`git mv` bar);
 shim deletion (consumer churn); cusolvermp/cublasmp deletion (§5 gates).
+
+## 7. FFT engine portability — the Occam target (owner-directed, 2026-07-31)
+
+The CPU flat-k TU is today source-locked to MKL's DFTI descriptor API.  The
+layout requirement it encodes — "howmany transforms, element stride =
+batch count, distance 1" — is expressible verbatim in the FFTW *advanced*
+interface: `fftw_plan_many_dft(istride=howmany, idist=1)`.  Two facts make
+that the portable spelling:
+
+1. **MKL natively exports the FFTW3 C interface from its core libraries**
+   (no wrapper build), so one source against `fftw_plan_many_dft` links MKL
+   on Frontera — same engine, same threading — and `cray-fftw` or stock
+   FFTW3 on a Cray/AMD machine.
+2. The GEMM service already proved the resolution pattern: **runtime dlsym
+   per symbol with announced refusal** (`gemm_batch_ffi.cc`), falling back
+   to the ungated XLA path.  No engine present means slower-and-loud, never
+   broken — the FFI stays an accelerator, not a dependency.
+
+The cuFFT mirror (`cufftPlanMany64` advanced layout) already covers the GPU
+leg of any site, Cray included.  Remaining items, in order: (i) rework the
+plan-creation section of `fft_flat_k_cpu.cc` from DFTI to the FFTW-many API
++ dlsym table, then rerun the automated parity gates (unit 1e-16, h5
+<=2.5e-14 eV); (ii) verify MKL's FFTW3 interface maps interleaved c2c
+many-plans cleanly (documented wrapper limitations are r2c-stride and
+wisdom no-ops — one-job check); (iii) threading: `fftw_init_threads` /
+`plan_with_nthreads` on non-MKL engines under the same
+`LORRAX_FFT_FFI_THREADS` grammar; (iv) the `fftwf_` twin table if BSE
+adoption wants c64; (v) only then gate the shard_map-interior
+`local_*fftn3` entry so the FFI can become the permanent backend of
+`make_sharded_ifftn_3d` — per `flat_k_fft_service.md` that flip is a
+measurement, not a move.
