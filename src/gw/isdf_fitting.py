@@ -488,7 +488,14 @@ def fit_zeta_to_h5(
             print(f"  Computing L_q = {_how}  [PSD, charge channel, "
                   f"path={_resolved_solver_kind}]")
         else:
-            print(f"  Pass through C_q  [γ̃^{vertex_mu_L} indefinite — "
+            _how_t = ("hoisted per-q pivoted LU (once per channel)"
+                      if _resolved_solver_kind == 'lu'
+                      else "hoisted distributed pXgetrf (block-cyclic, "
+                           "once per channel)"
+                      if _resolved_solver_kind == 'scalapack_lu'
+                      else "CCT passthrough (fused per-r-chunk getrf+getrs)")
+            print(f"  Computing transverse factor = {_how_t}  "
+                  f"[γ̃^{vertex_mu_L} indefinite — "
                   f"path={_resolved_solver_kind}]")
         _gather_gb = (int(C_q_flat.shape[0]) * int(n_rmu_padded) ** 2
                       * 16 / 1e9)
@@ -501,21 +508,33 @@ def fit_zeta_to_h5(
               f"replicated (nq,μ,μ) gather would be {_gather_gb:.2f} GB/rank; "
               f"per-q tile {_tile_gb:.3f} GB (×nq executions/r-chunk); "
               f"distributed tier gathers NO (μ,μ) object")
-        L_q = factor_c_q(
-            C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
-            n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
-            zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond)
+        if int(vertex_mu_L) != 0:
+            # Transverse: the factor stage is HOISTED (2026-08) — one
+            # pivoted LU per q per CHANNEL instead of per r-chunk.
+            # factor_c_q returns (factor, piv): (LU, perm) on the local
+            # plan, (block-cyclic LU, per-rank ipiv) on the scalapack
+            # plan, (CCT passthrough, None) on the cusolvermp plan
+            # (fused per-r-chunk getrf+getrs kept there).
+            L_q, lu_piv = factor_c_q(
+                C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
+                n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
+                zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond)
+        else:
+            L_q = factor_c_q(
+                C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
+                n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
+                zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond)
+            lu_piv = None
         L_q.block_until_ready()
         print(f"  L_q: {L_q.shape}")
 
-    # Pre-compute per-q trace of L_q ONCE per channel.  Only the
-    # transverse (LU) path uses it (for the ridge ``ε·|tr(L)|/n_rmu``
-    # before each per-q LU solve).  Computing inside solve_zeta means an
-    # all-reduce across the (mu/p_x, mu/p_y) mesh sharding fires on every
-    # r-chunk — 17 s of GPU stream time on MoS2 3×3 bispinor across 4
-    # r-chunks × 3 transverse channels.  L_q (which is CCT for the LU
-    # path) doesn't change across r-chunks, so the trace is invariant.
-    if int(vertex_mu_L) != 0:
+    # Pre-compute per-q trace of the CCT ONCE per channel — needed ONLY
+    # by the remaining FUSED transverse route (cusolvermp passthrough,
+    # piv None), whose per-r-chunk ridge is ``ε·|tr(CCT)|/n``.  On the
+    # hoisted routes the ridge is baked into the factor, so the trace
+    # (and its per-r-chunk all-reduce, 17 s of GPU stream at MoS2 3×3
+    # bispinor) is gone.
+    if int(vertex_mu_L) != 0 and lu_piv is None:
         with timing.section("zeta_fit.trace_L_q"):
             # LOGICAL-block trace only: the identity pad block would
             # contribute exactly +mu_pad to the padded trace, making
@@ -969,6 +988,7 @@ def fit_zeta_to_h5(
                         q_irr_full_idx=q_irr_full_idx,   # Phase B: gather inside the kernel
                         cct_trace_per_q=cct_trace_per_q,
                         zeta_gather=_resolved_zeta_gather,
+                        lu_piv=lu_piv,
                     )
                     zeta_chunk.block_until_ready()
             finally:
