@@ -1018,11 +1018,15 @@ def _replicate_rank_truncate_ok(nq: int | None, n_rmu: int | None) -> bool:
     resolves today, and it does not touch the ``cholesky`` branch at all.
 
     NOTE (the real μ ceiling on this route): memory is not what breaks
-    here.  The factor is a dense ``eigh`` per q run REDUNDANTLY on every
-    rank — O(nq·μ³) with no P-scaling at all (~5.5 h at μ=4k, ~86 h at
-    μ=10k on 28 cores).  Past ~4k centroids the route needs a genuinely
-    distributed eigh (SLATE/ScaLAPACK via ``ffi.linalg``; cuSOLVERMp is
-    out on a rectangular mesh), not a bigger cap.
+    here.  The factor is a dense whole-tile ``eigh`` per q (~5.5 h at
+    μ=4k, ~86 h at μ=10k on 28 cores for the FULL nq sweep).  Since
+    2026-08-01 the plan executes q-parallel above the fold threshold
+    (:func:`_factor_c_q_replicated_qparallel` — per-rank cost
+    ceil(nq/P)·μ³, bits unchanged), which divides those walls by
+    min(P, nq) but cannot touch the SINGLE-q eigh: past ~4k centroids the
+    route still needs a genuinely distributed eigh (SLATE/ScaLAPACK via
+    ``ffi.linalg``; cuSOLVERMp is out on a rectangular mesh), not a
+    bigger cap.
     """
     if nq is None or n_rmu is None:
         return False
@@ -1224,9 +1228,11 @@ def _resolve_solver_kind_charge(
                 f"n_mu <= {mu_max}.  "
                 f"Set LORRAX_ZETA_REPLICATE_CAP_GIB={-(-need // 1) + 1:.0f} to "
                 f"clear it if the device budget allows -- but note the factor "
-                f"is a dense eigh per q run REDUNDANTLY on every rank, "
-                f"O(nq*n_mu^3) with NO P-scaling (measured 4712 s at "
-                f"n_mu=10015 on 64 ranks, so ~20 h at n_mu=24933): raising the "
+                f"is a dense whole-tile eigh per q (q-parallel over devices "
+                f"above the fold threshold, so per-rank ceil(nq/P)*n_mu^3; "
+                f"the ALL-RANKS execution measured 4712 s at n_mu=10015 on "
+                f"64 ranks, so ~20 h at n_mu=24933 before the fold and still "
+                f"hours-per-q after it): raising the "
                 f"cap makes this RESOLVE, not finish.  For large n_mu use "
                 f"distributed_zeta_solve='distributed' instead (ScaLAPACK "
                 f"pzheevd, 236 s at the same size), or "
@@ -1505,9 +1511,11 @@ def _resolve_zeta_gather(
       eigendecomposed distributed (ScaLAPACK ``pzheevd``), truncated on the
       replicated spectrum, and the truncated pseudo-inverse ``C⁺`` is kept
       2D-sharded; the back-solve is a stacked 2D-sharded GEMM ``C⁺ @ Z``.
-      This is the ONLY tier whose factorisation cost scales with P — the
-      other two run one dense ``eigh`` per q REDUNDANTLY on every rank,
-      O(nq·μ³) with no P-scaling at all (~5.5 h at μ=4k, ~86 h at μ=10k).
+      This is the ONLY tier whose eigh ITSELF divides by P — the other two
+      run whole-tile dense ``eigh``s per q (q-parallel over devices above
+      the replicated plan's fold threshold, so min(P, nq)-scaling since
+      2026-08-01; redundant on every rank below it — ~5.5 h at μ=4k,
+      ~86 h at μ=10k for the full sweep, /min(P, nq) with the fold).
       EXPLICIT opt-in only: ``auto`` never picks it, because it changes the
       arithmetic (block-cyclic eigh ⇒ a different, equally valid gauge) and
       so is not bit-identical to the other two.
@@ -1581,6 +1589,90 @@ def _resolve_zeta_gather(
 
 
 _replicated_chol_cache = {}  # replicated dense Cholesky kernel (keyed by shape)
+
+
+def _charge_factor_math(C_log, *, mode: str, n_log: int,
+                        ridge_extra: float, rcond: float, rank_log: bool):
+    """The per-q charge factor arithmetic — ONE kernel, shared bit-for-bit
+    by the all-ranks (replicated) and q-parallel executions of the
+    replicated plan (:func:`_factor_c_q_replicated`,
+    :func:`_factor_c_q_replicated_qparallel`).
+
+    ``C_log``: ``(nqb, n_log, n_log)`` whole LOGICAL tiles; the caller
+    guarantees they are fully local / replicated per device.  Pure jnp with
+    NO sharding ops, so the emitted per-q LAPACK calls are identical
+    wherever it runs — the bit-identity contract of the q-parallel fold.
+    ``mode`` selects the factor exactly as documented on
+    :func:`_factor_c_q_replicated` (``'rank_truncate'`` | ``'cholesky'``).
+    """
+    if mode == 'rank_truncate':
+        # WHY THIS FEATURE EXISTS: the charge CCT near-singularizes when
+        # n_μ over-completes the pair-density rank (κ~1e13); plain
+        # Cholesky then amplifies ULP/mesh/nband roundoff into O(1) V_q
+        # errors that GN-PPM magnifies to tens of eV.  Rank-truncation
+        # DROPS eigenvalues < zeta_rcond·λ_max (the near-null
+        # directions) → a conditioned, mesh-invariant ζ = C⁺Z.
+        lam, V = jnp.linalg.eigh(C_log)      # Hermitian-SPD, λ ascending
+        lam_max = lam[..., -1:]              # (nqb,1) largest λ per q
+        keep = lam > (rcond * lam_max)       # near-null cut
+        # B = V·diag(1/√λ_kept) ⇒ B Bᴴ = Σ_{keep} vᵢvᵢᴴ/λᵢ = C⁺.
+        # Double-``where`` keeps rsqrt off the dropped (tiny/≤0) modes.
+        inv_sqrt = jnp.where(
+            keep, jax.lax.rsqrt(jnp.where(keep, lam, 1.0)), 0.0)
+        # OBSERVABILITY: the retained-mode count IS the conditioning
+        # signal for this route — it is what tells you whether n_μ has
+        # over-completed the pair-density rank (κ blow-up) and by how
+        # much.  It lives inside the jit, so print it from there.
+        # ``n_keep`` per q + the spectral span λ_max/λ_min(kept).
+        # Silence with LORRAX_ZETA_RANK_LOG=0.
+        #
+        # THE CRITERION, stated: ``keep`` above is NOT a search for a
+        # gap in λ — a real ISDF charge spectrum is smooth and has
+        # none.  It is a CAP on how much C⁺ may amplify round-off:
+        # κ_eff = λ_max/λ_min(kept) ≤ 1/zeta_rcond by construction.
+        # ``common/rank_criterion`` carries the derivation, the three
+        # standard alternatives (discrepancy principle / L-curve /
+        # GCV) and the measurement that refutes each of them here.
+        #
+        # The three extra fields below are the ones a run needs in
+        # order to be auditable without a sweep:
+        #   kappa/q     achieved amplification — the invariant
+        #   ldrop_hi/q  the LARGEST discarded λ, i.e. the top of the
+        #               discarded band (paired with lam_min_kept it
+        #               gives the whole cut, and shows there is no
+        #               plateau at the cut — there never is)
+        #   margin/q    fractional rank inflation from loosening
+        #               rcond by 1e-4.  §R19 measured +41 % of rank
+        #               costing 5000 eV, so a LARGE margin means the
+        #               basis is over-complete and rcond must NOT be
+        #               loosened on this run.
+        if rank_log:
+            lam_keep_min = jnp.min(
+                jnp.where(keep, lam, jnp.inf), axis=-1)
+            n_keep = jnp.sum(keep, axis=-1)
+            lam_drop_hi = jnp.max(
+                jnp.where(keep, -jnp.inf, lam), axis=-1)
+            n_loose = jnp.sum(lam > (rcond * 1e-4 * lam_max), axis=-1)
+            margin = (n_loose - n_keep) / jnp.maximum(n_keep, 1)
+            jax.debug.print(
+                "[zeta rank_truncate] n_log={n} rcond={rc:.1e} "
+                "n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn} "
+                "kappa/q={kp} ldrop_hi/q={dh} lam_min/q={lo} "
+                "margin/q={mg}",
+                n=n_log, rc=rcond,
+                k=n_keep,
+                mx=lam_max[..., 0], mn=lam_keep_min,
+                kp=lam_max[..., 0] / lam_keep_min,
+                dh=lam_drop_hi, lo=jnp.min(lam, axis=-1),
+                mg=margin,
+                ordered=False)
+        return V * inv_sqrt[..., None, :].astype(V.dtype)
+    tr = jnp.abs(jnp.trace(C_log, axis1=-2, axis2=-1))
+    # Floor (1e-14·|tr|, bit-identical to the historical path)
+    # + opt-in conditioning term (ε·|tr|/n).  Per-q scalars.
+    ridge_scalar = (1e-14 * tr + ridge_extra * tr / n_log)[:, None, None]
+    ridge = ridge_scalar * jnp.eye(n_log, dtype=C_log.dtype)[None, :, :]
+    return jnp.linalg.cholesky(C_log + ridge)
 
 
 def _factor_c_q_replicated(
@@ -1657,86 +1749,20 @@ def _factor_c_q_replicated(
                      and env_bool("LORRAX_ZETA_RANK_LOG", True))
         @partial(jax.jit, out_shardings=out_sh)
         def _fn(C):
-            def _ridged_chol(C_log):
+            def _factor_log(C_log):
                 # Replicate the logical block so every device factors the
                 # WHOLE matrix — this is what makes the factor grid-agnostic
                 # (the distributed potrf's block-cyclic accumulation is not).
+                # The arithmetic itself lives in ``_charge_factor_math`` —
+                # ONE traced kernel shared with the q-parallel execution so
+                # the two schedules cannot drift (bit-identity contract).
                 C_log = jax.lax.with_sharding_constraint(C_log, rep_sh)
-                tr = jnp.abs(jnp.trace(C_log, axis1=-2, axis2=-1))
-                # Floor (1e-14·|tr|, bit-identical to the historical path)
-                # + opt-in conditioning term (ε·|tr|/n).  Per-q scalars.
-                ridge_scalar = (1e-14 * tr + _re * tr / n_log)[:, None, None]
-                ridge = ridge_scalar * jnp.eye(n_log, dtype=C_log.dtype)[None, :, :]
-                return jnp.linalg.cholesky(C_log + ridge)
+                return _charge_factor_math(
+                    C_log, mode=mode, n_log=n_log, ridge_extra=_re,
+                    rcond=_rc, rank_log=_rank_log)
 
-            def _rank_trunc_factor(C_log):
-                # WHY THIS FEATURE EXISTS: the charge CCT near-singularizes when
-                # n_μ over-completes the pair-density rank (κ~1e13); plain
-                # Cholesky then amplifies ULP/mesh/nband roundoff into O(1) V_q
-                # errors that GN-PPM magnifies to tens of eV.  Rank-truncation
-                # DROPS eigenvalues < zeta_rcond·λ_max (the near-null
-                # directions) → a conditioned, mesh-invariant ζ = C⁺Z.
-                C_log = jax.lax.with_sharding_constraint(C_log, rep_sh)
-                lam, V = jnp.linalg.eigh(C_log)      # Hermitian-SPD, λ ascending
-                lam_max = lam[..., -1:]              # (nq,1) largest λ per q
-                keep = lam > (_rc * lam_max)         # near-null cut
-                # B = V·diag(1/√λ_kept) ⇒ B Bᴴ = Σ_{keep} vᵢvᵢᴴ/λᵢ = C⁺.
-                # Double-``where`` keeps rsqrt off the dropped (tiny/≤0) modes.
-                inv_sqrt = jnp.where(
-                    keep, jax.lax.rsqrt(jnp.where(keep, lam, 1.0)), 0.0)
-                # OBSERVABILITY: the retained-mode count IS the conditioning
-                # signal for this route — it is what tells you whether n_μ has
-                # over-completed the pair-density rank (κ blow-up) and by how
-                # much.  It lives inside the jit, so print it from there.
-                # ``n_keep`` per q + the spectral span λ_max/λ_min(kept).
-                # Silence with LORRAX_ZETA_RANK_LOG=0.
-                #
-                # THE CRITERION, stated: ``keep`` above is NOT a search for a
-                # gap in λ — a real ISDF charge spectrum is smooth and has
-                # none.  It is a CAP on how much C⁺ may amplify round-off:
-                # κ_eff = λ_max/λ_min(kept) ≤ 1/zeta_rcond by construction.
-                # ``common/rank_criterion`` carries the derivation, the three
-                # standard alternatives (discrepancy principle / L-curve /
-                # GCV) and the measurement that refutes each of them here.
-                #
-                # The three extra fields below are the ones a run needs in
-                # order to be auditable without a sweep:
-                #   kappa/q     achieved amplification — the invariant
-                #   ldrop_hi/q  the LARGEST discarded λ, i.e. the top of the
-                #               discarded band (paired with lam_min_kept it
-                #               gives the whole cut, and shows there is no
-                #               plateau at the cut — there never is)
-                #   margin/q    fractional rank inflation from loosening
-                #               rcond by 1e-4.  §R19 measured +41 % of rank
-                #               costing 5000 eV, so a LARGE margin means the
-                #               basis is over-complete and rcond must NOT be
-                #               loosened on this run.
-                if _rank_log:
-                    lam_keep_min = jnp.min(
-                        jnp.where(keep, lam, jnp.inf), axis=-1)
-                    n_keep = jnp.sum(keep, axis=-1)
-                    lam_drop_hi = jnp.max(
-                        jnp.where(keep, -jnp.inf, lam), axis=-1)
-                    n_loose = jnp.sum(lam > (_rc * 1e-4 * lam_max), axis=-1)
-                    margin = (n_loose - n_keep) / jnp.maximum(n_keep, 1)
-                    jax.debug.print(
-                        "[zeta rank_truncate] n_log={n} rcond={rc:.1e} "
-                        "n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn} "
-                        "kappa/q={kp} ldrop_hi/q={dh} lam_min/q={lo} "
-                        "margin/q={mg}",
-                        n=n_log, rc=_rc,
-                        k=n_keep,
-                        mx=lam_max[..., 0], mn=lam_keep_min,
-                        kp=lam_max[..., 0] / lam_keep_min,
-                        dh=lam_drop_hi, lo=jnp.min(lam, axis=-1),
-                        mg=margin,
-                        ordered=False)
-                return V * inv_sqrt[..., None, :].astype(V.dtype)
-
-            factor_fn = (_rank_trunc_factor if mode == 'rank_truncate'
-                         else _ridged_chol)
             F_log = solve_at_logical(
-                factor_fn, n_log, (C,), pad_axes=(-2, -1))
+                _factor_log, n_log, (C,), pad_axes=(-2, -1))
             # Pad-block factor = identity (√1 = 1 for L; for B the pad block
             # is sliced off in the back-solve, so identity is just a
             # non-singular filler): re-embed via the shared helper (no-op
@@ -1771,8 +1797,19 @@ def factor_c_q_replicated_batched(
     Per-q independent, so concatenating the batches reproduces the one-shot
     call; only the XLA workspace differs.  A single batch (every stack that
     already fitted) takes the identical code path it always did.
+
+    P>1 SCHEDULE (2026-08-01): above :data:`_QPARALLEL_MIN_NQ_MU3` the
+    same plan EXECUTES q-parallel (:func:`_factor_c_q_replicated_qparallel`
+    — q's scattered over all devices, whole tiles per q, bits unchanged)
+    instead of redundantly on every rank.  This is a fold INTO the
+    replicated plan, deliberately not a third resolution — see the WHY on
+    the q-parallel function.
     """
     nq, n_rmu, _ = C_q.shape
+    if _qparallel_factor_ok(nq, int(n_rmu_logical), mesh_xy):
+        _qparallel_announce(nq, n_rmu, int(n_rmu_logical), mesh_xy)
+        return _factor_c_q_replicated_qparallel(
+            C_q, mesh_xy, n_rmu_logical, **kw)
     step = _replicated_factor_q_chunk(nq, n_rmu)
     if step >= nq:
         return _factor_c_q_replicated(C_q, mesh_xy, n_rmu_logical, **kw)
@@ -1781,6 +1818,208 @@ def factor_c_q_replicated_batched(
              for q0 in range(0, nq, step)]
     return jax.device_put(jnp.concatenate(parts, axis=0),
                           NamedSharding(mesh_xy, P(None, 'x', 'y')))
+
+
+# ---------------------------------------------------------------------------
+# q-PARALLEL EXECUTION of the replicated charge factor — a schedule, NOT a
+# third plan.
+#
+# The replicated plan's contract is its OUTPUT: whole-tile dense per-q
+# factors, bit-identical across process grids and device counts.  Nothing in
+# that contract says every rank must COMPUTE every q — only that every q is
+# factored as ONE dense whole-tile call.  Above the fold threshold the plan
+# therefore scatters the q axis over all devices (the same q-parallel idiom
+# as the W solve's LOCAL plan, ``gw/w_isdf._get_w_solve_fn_local`` /
+# scorecard AN), each device factors its owned q's through the SAME traced
+# kernel (``_charge_factor_math``), and the factors are resharded back to
+# ``P(None, 'x', 'y')``.  Only data movement differs; the values are the
+# same bits, so mesh-invariance survives by construction and the ζ-fit
+# factor family keeps exactly TWO plans:
+#     replicated  (mesh-invariant whole-tile factor; q-parallel at P>1)
+#     distributed (2-D ScaLAPACK eigh — different gauge, explicit opt-in)
+#
+# MEASURED motivation (job 7884656, MoS2 4x4 b300, P=16 / 4x4 mesh,
+# nq_ibz=10, mu_log=2979): zeta_fit.cholesky = 105.1 s — one dense eigh per
+# q on EVERY rank — the dominant term of the 64%-of-GW-wall ζ-fit stage.
+# q-parallel caps the per-rank factor count at ceil(nq/P).
+# ---------------------------------------------------------------------------
+
+# Fold threshold, in nq·μ_log³ units (the eigh work the all-ranks execution
+# repeats on every rank).  Calibrated from job 7884656: 105.1 s at
+# nq·μ³ = 10·2979³ ≈ 2.6e11 on a 28-thread CLX rank → ~4e-10 s/unit, so
+# 5e9 ≈ 2 s of redundant per-rank factor work.  Below that, the fold's own
+# costs (two staged all-to-all reshards of the (nq, μ, μ) stack — ~stack/P
+# per rank each way — plus one extra jit compile) outweigh the saving: the
+# fastloop mini-deck (nq=4, μ≈400 → ~2.6e8 ≈ 0.1 s) stays on the pure
+# replicated execution, while every production fit from the b300 deck up
+# folds.  A module CONSTANT on purpose — this is machine capability, not
+# physics policy, and the AV audit retired policy env twins;
+# LORRAX_ZETA_QPARALLEL (below) is the schedule escape hatch / test hook.
+_QPARALLEL_MIN_NQ_MU3 = 5.0e9
+
+_qparallel_factor_cache: dict = {}
+_qparallel_announced: set = set()
+
+
+def _qparallel_factor_ok(nq: int, n_rmu_logical: int, mesh_xy: Mesh) -> bool:
+    """True when the replicated charge factor should EXECUTE q-parallel.
+
+    ``LORRAX_ZETA_QPARALLEL``: unset/``auto`` → fold above
+    :data:`_QPARALLEL_MIN_NQ_MU3` (needs >1 device and >1 q to scatter);
+    ``0`` → never (the pre-fold all-ranks execution, kept as the A/B
+    control); ``1`` → always (the bit-identity gate forces it at fixture
+    size).  Either way the RESULT is the same bits — this knob selects an
+    execution schedule, never a numerical route.
+    """
+    if int(mesh_xy.devices.size) <= 1:
+        return False
+    raw = os.environ.get("LORRAX_ZETA_QPARALLEL", "auto")
+    raw = raw.strip().lower() if raw else "auto"
+    if raw in ("", "auto"):
+        return (int(nq) >= 2
+                and float(nq) * float(n_rmu_logical) ** 3
+                >= _QPARALLEL_MIN_NQ_MU3)
+    return env_bool("LORRAX_ZETA_QPARALLEL", False)
+
+
+def _qparallel_announce(nq: int, n_rmu: int, n_log: int,
+                        mesh_xy: Mesh) -> None:
+    """One line naming the schedule the factor actually runs (rank 0,
+    deduplicated) — a fold that silently stopped engaging would otherwise
+    be invisible until the 105-s stage reappeared."""
+    if jax.process_index() != 0:
+        return
+    ndev = int(mesh_xy.devices.size)
+    sig = (id(mesh_xy), int(nq), int(n_rmu), int(n_log))
+    if sig in _qparallel_announced:
+        return
+    _qparallel_announced.add(sig)
+    blk = -(-int(nq) // ndev)
+    print(f"  [zeta factor] replicated plan, q-parallel execution: "
+          f"nq={nq} scattered over {ndev} devices "
+          f"(ceil(nq/P)={blk} whole ({n_rmu},{n_rmu}) tile(s)/device, "
+          f"q-pad {round_up(int(nq), ndev) - int(nq)}); factors are "
+          f"bit-identical to the all-ranks execution "
+          f"(LORRAX_ZETA_QPARALLEL=0 restores it)", flush=True)
+
+
+def _factor_c_q_replicated_qparallel(
+    C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
+    zeta_ridge: float = 0.0,
+    charge_zeta_solve: str = 'cholesky',
+    zeta_rcond: float = 1e-8,
+) -> jax.Array:
+    """The replicated charge factor, EXECUTED q-parallel.
+
+    WHY THIS IS A FOLD AND NOT A THIRD RESOLUTION: a plan in this family
+    is a numerical contract — ``replicated`` = whole-tile dense factor,
+    bit-identical across meshes and device counts; ``distributed`` =
+    block-cyclic eigh, a different (equally valid) gauge, explicit opt-in.
+    This path changes only WHICH device runs each per-q factorisation,
+    never what is computed, so its output is the replicated plan's output
+    to the bit and it carries no new resolver string, no new input key,
+    and no new downstream contract.  (Precedent: the W-solve family's
+    LOCAL plan is likewise q-parallel — scorecard AN.)
+
+    Schedule: zero-pad the q axis to the device count, scatter q over the
+    FLATTENED mesh (``P(('x','y'), None, None)``) through the measured
+    single-axis staging (``P('x', None, 'y')`` — see gw/w_isdf's
+    involuntary-remat note), factor each OWNED q as one whole-tile call
+    into :func:`_charge_factor_math` (per-q ``fori_loop``: the XLA eigh
+    workspace is bounded by ONE (μ, μ) tile, strictly tighter than
+    :func:`_replicated_factor_q_chunk`'s batch bound), skip pad q's with a
+    ``lax.cond`` (so the Cholesky branch never factors filler and the
+    rank log prints no phantom q's), then stage the factors back to
+    ``P(None, 'x', 'y')`` and re-embed the identity μ-pad block.
+
+    BIT-IDENTITY to the all-ranks execution, claim by claim:
+
+    * the factor is per-q independent — the q-batch split is already
+      relied on (``factor_c_q_replicated_batched`` concatenates cap-sized
+      batches) and XLA's batched LAPACK wrappers loop per matrix;
+    * the reshards move exact byte copies (pure data movement);
+    * the per-q arithmetic is the SAME traced kernel on the same whole
+      logical tile (``_charge_factor_math``; the μ-slice/zero-refill is
+      the same ``solve_at_logical``; the identity μ-pad re-embed is the
+      same helper).
+
+    Gate: ``tests/test_zeta_mesh_invariance.py::
+    test_qparallel_execution_is_bit_identical_to_replicated`` (exact
+    equality, both modes, non-dividing nq, padded μ).
+
+    Observability delta, deliberate: the rank_truncate conditioning log
+    prints per OWNED q from the owning process (the all-ranks execution
+    printed every q from every process); fields are unchanged.
+    """
+    nq, n_rmu, _ = C_q.shape
+    n_log = int(n_rmu_logical)
+    # DEPRECATED env forms — the input keys are the record (scorecard AV).
+    ridge_extra = _deprecated_env_float(
+        "LORRAX_ZETA_RIDGE", "zeta_ridge", zeta_ridge)
+    rcond = _deprecated_env_float(
+        "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
+    mode = str(charge_zeta_solve)
+    rank_log = (mode == 'rank_truncate'
+                and env_bool("LORRAX_ZETA_RANK_LOG", True))
+    ndev = int(mesh_xy.devices.size)
+    py = int(mesh_xy.shape['y'])
+    nq_pad = round_up(int(nq), ndev)
+    out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    q_sh = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
+    mid_sh = NamedSharding(mesh_xy, P('x', None, 'y'))
+
+    key = (id(mesh_xy), int(nq), int(n_rmu), n_log,
+           float(ridge_extra), mode, float(rcond), bool(rank_log))
+    if key not in _qparallel_factor_cache:
+        _re, _rc, _rl = ridge_extra, rcond, rank_log
+        blk = nq_pad // ndev
+
+        def _local_factor(C_loc):
+            # C_loc: (blk, n_rmu, n_rmu) — whole tiles for the q's this
+            # device owns (global q of local slot i = dev·blk + i, in the
+            # ('x','y') row-major order the flattened q-shard uses).
+            dev = jax.lax.axis_index('x') * py + jax.lax.axis_index('y')
+
+            def _fact(C1):
+                return solve_at_logical(
+                    lambda Cl: _charge_factor_math(
+                        Cl, mode=mode, n_log=n_log, ridge_extra=_re,
+                        rcond=_rc, rank_log=_rl),
+                    n_log, (C1,), pad_axes=(-2, -1))
+
+            def _one(i, F_acc):
+                C1 = jax.lax.dynamic_slice_in_dim(C_loc, i, 1, axis=0)
+                F1 = jax.lax.cond(dev * blk + i < nq, _fact,
+                                  jnp.zeros_like, C1)
+                return jax.lax.dynamic_update_slice(F_acc, F1, (i, 0, 0))
+
+            return jax.lax.fori_loop(0, blk, _one, jnp.zeros_like(C_loc))
+
+        _sm = shard_map(_local_factor, mesh=mesh_xy,
+                        in_specs=P(('x', 'y'), None, None),
+                        out_specs=P(('x', 'y'), None, None),
+                        check_rep=False)
+
+        @partial(jax.jit, out_shardings=out_sh)
+        def _fn(C):
+            if nq_pad > nq:
+                C = jnp.pad(C, ((0, nq_pad - nq), (0, 0), (0, 0)))
+            # Single-axis staging both ways: the composite reshard makes
+            # SPMD replicate-then-partition (the w_isdf reshard_mid
+            # measurement); each stage moves ONE mesh axis.
+            C = jax.lax.with_sharding_constraint(C, mid_sh)
+            C = jax.lax.with_sharding_constraint(C, q_sh)
+            F = _sm(C)
+            F = F[:nq]
+            F = jax.lax.with_sharding_constraint(F, mid_sh)
+            # Pad-block factor = identity — same re-embed (and same final
+            # P(None,'x','y') constraint) as the all-ranks execution;
+            # no-op when n_log == n_rmu.
+            return _identity_pad_block_diagonal(
+                F, n_rmu_logical=n_log, mesh_xy=mesh_xy)
+
+        _qparallel_factor_cache[key] = _fn
+    return _qparallel_factor_cache[key](C_q)
 
 
 # =============================================================================

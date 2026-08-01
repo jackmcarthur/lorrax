@@ -204,6 +204,63 @@ def _worker_rank_truncate() -> int:
     return 0
 
 
+def _worker_qparallel() -> int:
+    """Child process: the q-parallel EXECUTION of the replicated charge
+    factor (the P>1 fold, ``LORRAX_ZETA_QPARALLEL``) must return EXACTLY
+    the bits of the all-ranks execution — same plan, same bits — on every
+    mesh, in BOTH modes, with a q count that does not divide the device
+    count (q-pad + cond-skip) and a padded μ extent (identity-pad
+    re-embed).  Exact equality, not a tolerance: the fold is a schedule,
+    and any nonzero delta means it silently became a numerical route."""
+    import numpy as np
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from isdf import factor_c_q
+
+    devs = jax.devices()
+    if len(devs) < _NDEV:
+        print(json.dumps({"skip": f"only {len(devs)} devices"}))
+        return 0
+
+    # Well-conditioned SPD logical block (so the cholesky mode is valid),
+    # zero-embedded to a padded extent: n_log=60 inside n_pad=64 exercises
+    # solve_at_logical + the identity-pad re-embed; nq=6 does not divide
+    # 4 devices, exercising the q-pad + cond-skip.
+    rng = np.random.default_rng(20260801)
+    nq, n_log, n_pad, = 6, 60, 64
+    A = (rng.standard_normal((nq, n_log, n_log + 8))
+         + 1j * rng.standard_normal((nq, n_log, n_log + 8)))
+    C_log = A @ np.conj(np.transpose(A, (0, 2, 1)))
+    C_log = C_log + n_log * np.eye(n_log)[None]
+    C_log = 0.5 * (C_log + np.conj(np.transpose(C_log, (0, 2, 1))))
+    C = np.zeros((nq, n_pad, n_pad), dtype=np.complex128)
+    C[:, :n_log, :n_log] = C_log
+
+    exact = {}
+    max_abs = 0.0
+    for (px, py) in [(1, 2), (2, 1), (2, 2), (1, 4), (4, 1)]:
+        mesh = Mesh(np.asarray(devs[: px * py]).reshape(px, py), ('x', 'y'))
+        in_sh = NamedSharding(mesh, P(None, 'x', 'y'))
+        C_dev = jax.device_put(jnp.asarray(C), in_sh)
+        for mode, kind in (('rank_truncate', 'replicated_rank_truncate'),
+                           ('cholesky', 'replicated_cholesky')):
+            outs = {}
+            for force in ('0', '1'):
+                os.environ['LORRAX_ZETA_QPARALLEL'] = force
+                outs[force] = np.asarray(jax.device_get(factor_c_q(
+                    C_dev, mesh, vertex_mu_L=0, n_rmu_logical=n_log,
+                    solver_kind=kind, zeta_rcond=1e-10)))
+            exact[f"{px}x{py}_{mode}"] = bool(
+                np.array_equal(outs['0'], outs['1']))
+            max_abs = max(max_abs, float(
+                np.max(np.abs(outs['0'] - outs['1']))))
+    os.environ.pop('LORRAX_ZETA_QPARALLEL', None)
+    print(json.dumps({"exact": exact, "max_abs": max_abs}))
+    return 0
+
+
 def _worker_cap() -> int:
     """Child process: the replication-cap CONTRACT for the production
     ``charge_zeta_solve='rank_truncate'``.  Reports what the auto resolver
@@ -419,6 +476,24 @@ def test_zeta_fit_charge_rank_truncate_is_mesh_invariant_and_conditions():
         f"‖ζ_chol‖/‖ζ_rt‖ = {out['amp_chol_over_rt']:.3e} (expected ≫ 1)")
 
 
+def test_qparallel_execution_is_bit_identical_to_replicated():
+    """The folded q-parallel execution of the replicated charge factor
+    (``LORRAX_ZETA_QPARALLEL``, ``isdf.core._factor_c_q_replicated_qparallel``)
+    returns EXACTLY the bits of the all-ranks execution on every mesh, in
+    both charge modes, including a non-device-dividing nq and a padded μ
+    extent.  This is what makes the fold a SCHEDULE of the replicated plan
+    rather than a third resolution of the factor family — the moment this
+    gate needs a tolerance, it has become a plan and must be re-argued."""
+    out = _run_worker("worker_qpar")
+    if "skip" in out:
+        pytest.skip(f"q-parallel gate: {out['skip']}")
+    bad = sorted(k for k, v in out["exact"].items() if not v)
+    assert not bad, (
+        f"q-parallel factor bits drift from the all-ranks execution on "
+        f"{bad} (max abs delta {out['max_abs']:.3e}); the fold's "
+        f"bit-identity contract is broken")
+
+
 def test_rank_truncate_refuses_above_the_replication_cap():
     """``charge_zeta_solve='rank_truncate'`` must RAISE — never silently
     downgrade — when the CCT stack exceeds the replication cap, and the cap
@@ -606,6 +681,8 @@ if __name__ == "__main__":
         sys.exit(_worker())
     if len(sys.argv) > 1 and sys.argv[1] == "worker_rt":
         sys.exit(_worker_rank_truncate())
+    if len(sys.argv) > 1 and sys.argv[1] == "worker_qpar":
+        sys.exit(_worker_qparallel())
     if len(sys.argv) > 1 and sys.argv[1] == "worker_zq_band":
         sys.exit(_worker_zq_band_invariance())
     sys.exit(test_zeta_fit_charge_factor_solve_is_mesh_invariant() or 0)
