@@ -119,7 +119,7 @@ and **says so on rank 0**.
 
 Nothing here is a patched dependency: every file is a byte-for-byte copy of
 what uv installed, and the GPU venv is untouched. Full measurement and the
-falsified instruments: **`docs/dev/cold_start.md`**.
+falsified instruments: **`docs/dev/archive/cold_start_2026-07.md`**.
 
 ## Built since (formerly "Deferred" — updated 2026-07-28)
 

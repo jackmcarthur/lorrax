@@ -73,7 +73,7 @@ for non-NERSC users and is documented separately:
 
 ## See also
 
-- [`docs/ENVIRONMENT_COMPREHENSIVE.md`](../ENVIRONMENT_COMPREHENSIVE.md) — the full
+- [`docs/environment/overview.md`](../environment/overview.md) — the full
   environment / JAX-config / troubleshooting reference this page summarizes
 - [Perlmutter](perlmutter.md) — the NERSC reference cluster (module, `lxrun`/`lxpre`)
 - `src/ffi/PORTING.md` — the FFI porting checklist (in the repo, not the site)

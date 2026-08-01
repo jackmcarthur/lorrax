@@ -27,7 +27,7 @@ The third line runs a complete static-COHSEX calculation end-to-end on a fresh c
 the bundled fixture sets `use_ffi_io = false` and ships its own wavefunction, so it needs
 **no GPU and no native (FFI) build**. It is the fastest way to confirm LORRAX works on your
 machine. Everything distributed (sharded HDF5, distributed `eigh`, SLATE) additionally
-requires the native FFI stack — see [`docs/ENVIRONMENT_COMPREHENSIVE.md`](docs/ENVIRONMENT_COMPREHENSIVE.md).
+requires the native FFI stack — see [`docs/environment/overview.md`](docs/environment/overview.md).
 
 On NERSC Perlmutter: `module load lorrax` then use `lxrun` / `lxpre`. See [`config/README.md`](config/README.md).
 
@@ -37,7 +37,7 @@ Detailed physics, code architecture, and environment setup are in `docs/`:
 
 - **[`docs/theory/physics.md`](docs/theory/physics.md)** — ISDF theory, GW equations, ISDF basis (zeta) fitting, JAX sharding
 - **[`docs/architecture/codebase.md`](docs/architecture/codebase.md)** — Module map, data flow, key classes, entry points
-- **[`docs/ENVIRONMENT_COMPREHENSIVE.md`](docs/ENVIRONMENT_COMPREHENSIVE.md)** — Dependencies, installation, cluster usage, CUDA
+- **[`docs/environment/overview.md`](docs/environment/overview.md)** — The runtime stack, JAX configuration, transports, per-machine pages
 - **[`docs/architecture/memory-model.md`](docs/architecture/memory-model.md)** — Per-stage memory usage formulas for the ISDF basis construction, heavy chunked operations
 - **[`docs/theory/minimax-quadrature.md`](docs/theory/minimax-quadrature.md)** — Explanation of GW frequency integrals discretized via $\Sigma(omega) = \int dt e^{i \omega t} G(t)W(t)$, minimax quadrature
 

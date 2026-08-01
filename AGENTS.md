@@ -82,7 +82,7 @@ lxrun python3 -u -m gw.gw_jax -i cohsex.in        # 4-GPU GW
 LORRAX_NGPU=1 lxrun ...                           # single-GPU override
 ```
 
-See [`config/README.md`](config/README.md) for the full cluster reference. Docs: [`docs/ENVIRONMENT_COMPREHENSIVE.md`](docs/ENVIRONMENT_COMPREHENSIVE.md).
+See [`config/README.md`](config/README.md) for the full cluster reference. Docs: [`docs/environment/overview.md`](docs/environment/overview.md).
 
 ## Coding standards
 

@@ -105,5 +105,5 @@ segfault or a "cannot open shared object file" at start-up, not a clean message.
 
 - `src/ffi/PORTING.md` — the full FFI porting checklist (in the repo)
 - `src/ffi/AGENTS.md` — FFI subpackage entry points
-- [`docs/ENVIRONMENT_COMPREHENSIVE.md` §5](../ENVIRONMENT_COMPREHENSIVE.md) — the FFI stack
+- [`docs/environment/machines/perlmutter.md` §2](../environment/machines/perlmutter.md) — the FFI stack
   reference (bind-mounts, staging, MPI override)

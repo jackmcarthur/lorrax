@@ -16,4 +16,4 @@ Read these only if:
 - Working on multi-node/multi-GPU parallelization → `jax_multihost.md`
 - Implementing or debugging GPP models → `HL_GPP_derivation.md`
 
-For standard single-node usage, see [`ENVIRONMENT_COMPREHENSIVE.md`](../../ENVIRONMENT_COMPREHENSIVE.md) instead.
+For standard single-node usage, see [`environment/overview.md`](../../environment/overview.md) instead.

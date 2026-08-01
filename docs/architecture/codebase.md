@@ -1,6 +1,6 @@
 # Codebase Structure & Architecture
 
-Module organization, key classes, data flow, and file formats. Read this when working on implementation tasks. For physics/theory see [`PHYSICS_COMPREHENSIVE.md`](../theory/physics.md); for environment setup see [`ENVIRONMENT_COMPREHENSIVE.md`](../ENVIRONMENT_COMPREHENSIVE.md).
+Module organization, key classes, data flow, and file formats. Read this when working on implementation tasks. For physics/theory see [`PHYSICS_COMPREHENSIVE.md`](../theory/physics.md); for environment setup see [`environment/overview.md`](../environment/overview.md).
 
 > **Read [`layers.md`](layers.md) first if you are about to add or move a
 > module.** This page says *where things are*; that one says **what a module is
@@ -651,7 +651,7 @@ main                                       [gw/gw_jax.py]
 
 - Physics / theory: [`PHYSICS_COMPREHENSIVE.md`](../theory/physics.md)
 - Memory model: [`MEMORY_MODEL.md`](memory-model.md)
-- Environment / Perlmutter: [`ENVIRONMENT_COMPREHENSIVE.md`](../ENVIRONMENT_COMPREHENSIVE.md), [`../config/README.md`](../../config/README.md)
+- Environment / Perlmutter: [`environment/overview.md`](../environment/overview.md), [`environment/machines/perlmutter.md`](../environment/machines/perlmutter.md), [`../config/README.md`](../../config/README.md)
 - FFI internals: [`../src/ffi/AGENTS.md`](../../src/ffi/AGENTS.md)
 - GN-PPM Σ details: see developer notes under `docs/dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`
 - Current BGW-vs-LORRAX status: see developer notes under `docs/dev/progress/SIGMA_FREQ_AUDIT_STATUS.md`

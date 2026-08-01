@@ -444,7 +444,7 @@ LD_PRELOAD=/lorrax_slate/lib/libmpi_gtl_cuda.so.0   # CUDA-12 shim; see §Slate-
 > `memory_stats()`, which every LORRAX memory report reads.  Porting a
 > cluster: pick `cuda_async`, and on sm_75 pair it with the command-buffer
 > `XLA_FLAGS` restriction (`config/frontera/ffi_env.sh`).  Full table in
-> [`docs/ENVIRONMENT_COMPREHENSIVE.md`](../../docs/ENVIRONMENT_COMPREHENSIVE.md) §3.2.
+> [`docs/environment/overview.md`](../../docs/environment/overview.md) §2.1.
 
 `CUDA_VISIBLE_DEVICES=$SLURM_LOCALID` is set per-rank by
 `select_gpu.sh` (invoked from `lxrun`). JAX callers must pass

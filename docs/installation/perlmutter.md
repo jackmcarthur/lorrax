@@ -9,7 +9,7 @@ the generic [Installation](index.md) tracks.
     This page is a short orientation. The authoritative, maintained references are
     [`config/README.md`](../../config/README.md) (module, `lxalloc`/`lxrun`/`lxpre`,
     bind-mounts, porting) and
-    [`docs/ENVIRONMENT_COMPREHENSIVE.md`](../ENVIRONMENT_COMPREHENSIVE.md) §4–§5 (Lmod
+    [`docs/environment/machines/perlmutter.md`](../environment/machines/perlmutter.md) (Lmod
     module, JAX config, FFI stack).
 
 ## One-time install
@@ -47,6 +47,6 @@ container. Then `liblorrax_ffi.so` is built inside Shifter:
 src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh
 ```
 
-See [`docs/ENVIRONMENT_COMPREHENSIVE.md` §5](../ENVIRONMENT_COMPREHENSIVE.md) for staging
+See [`docs/environment/machines/perlmutter.md` §2](../environment/machines/perlmutter.md) for staging
 details and the Cray-MPICH GPU-Direct knobs, and
 [FFI native libraries](ffi-native-libs.md) for the off-NERSC acquisition recipes.
