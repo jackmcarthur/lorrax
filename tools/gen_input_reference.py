@@ -74,6 +74,7 @@ KEYS: dict[str, tuple[str, str]] = {
     "minimax_energy_reference": ("Screening", "Energy reference for the minimax transition range (midgap default)."),
     "ppm_model": ("Screening", "Plasmon-pole ansatz: gn (Godby-Needs, imaginary probe) | hl (Hybertsen-Louie, real probe)."),
     "ppm_omega_p": ("Screening", "Second PPM probe frequency (Ry): i*omega_p for GN, real omega_p for HL."),
+    "ppm_probe_chi_reuse": ("Screening", "off \\| auto. auto (GN only): represent the probe integrand on the static tau nodes plus the minimal augmentation from the dedicated quadrature's node set, and accumulate the probe chi0 inside ONE fused tau sweep — shared nodes' G-build/FFT/contraction tensors are computed once, only the k extra nodes cost new compute. Error gated at max(dedicated err, target_error) with a guaranteed exact-dedicated fallback. Same quadrature-error contract, not bit-identical to off — keep off for pinned-baseline decks."),
     "ppm_fallback_omega": ("Screening", "Positive real fallback pole (Ry) for elements with no valid Omega^2 fit."),
     "ppm_head_omega_h_ry": ("Screening", "Override the q->0 head pole Omega_h (Ry) directly; None = compute normally. BGW comparison aid."),
     "ppm_invalid_mode": ("Screening", "Invalid-pole treatment: static_limit (default, BGW mode 3) | zero (BGW 0) | 2ry (BGW 2)."),
