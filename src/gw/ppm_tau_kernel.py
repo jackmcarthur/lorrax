@@ -73,11 +73,12 @@ def _fft_ffi_fused_enabled() -> bool:
     (``common.fft_helpers.make_flat_k_gw_conv``) so the R-space G tile never
     materializes.  O(N log N) FFTs via MKL's DFTI descriptor API reading the
     dot-layout tile directly (NOT a DFT-as-matmul) — see the backend block
-    in fft_helpers.  Independent of ``LORRAX_FFT_FFI`` (which switches the
-    decomposed helpers); default OFF, production path untouched.  Read at
-    kernel-factory time and part of the kernel cache keys.  Announce/refuse
-    semantics live in the FFT service factory (raises if the platform's .so
-    lacks the handler).
+    in fft_helpers.  Independent of ``LORRAX_FFT_FFI``; default ON since
+    the FFI-required ruling (decisions.md 2026-08-01) — ``=0`` opts out to
+    the decomposed three-transform chain, which is itself FFI-served.  Read
+    at kernel-factory time and part of the kernel cache keys.
+    Announce/refuse semantics live in the FFT service factory (raises if
+    the platform's .so lacks the handler).
 
     THE FLAG IS NOT READ HERE (2026-07-30).  It used to be — a consumer
     parsing ``in ("1","true","yes","on")`` with no grammar check and no

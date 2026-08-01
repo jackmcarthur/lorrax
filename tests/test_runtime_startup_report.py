@@ -95,17 +95,23 @@ def _facts(**over):
                         "env_var": "LORRAX_FFI_HOST_SO",
                         "env_value": "/work2/liblorrax_ffi_host.so"},
         "ffi_dials": [
-            {"env": "LORRAX_BANDS_GEMM_FFI", "mode": "auto", "enabled": True,
-             "default": "auto", "target": "lorrax_mklblas_gemm_batch",
+            {"env": "LORRAX_BANDS_GEMM_FFI", "mode": "on", "enabled": True,
+             "default": "on", "target": "lorrax_mklblas_gemm_batch",
              "platforms": ("cpu",), "raw": None,
+             "off_policy": "fallback",
+             "off_label": "native XLA dot lowering",
              "detail": "the contract_bands right-GEMM contraction"},
-            {"env": "LORRAX_FFT_FFI", "mode": "off", "enabled": False,
-             "default": "off", "target": "lorrax_mklfft_flat_k",
+            {"env": "LORRAX_FFT_FFI", "mode": "on", "enabled": True,
+             "default": "on", "target": "lorrax_mklfft_flat_k",
              "platforms": ("cpu", "CUDA"), "raw": None,
+             "off_policy": "refuse",
+             "off_label": "(deleted) XLA flat-k FFT path",
              "detail": "the flat-k 3-D FFT helper path"},
             {"env": "LORRAX_FFT_FFI_FUSED", "mode": "off", "enabled": False,
-             "default": "off", "target": "lorrax_mklfft_gw_conv",
-             "platforms": ("cpu", "CUDA"), "raw": None,
+             "default": "on", "target": "lorrax_mklfft_gw_conv",
+             "platforms": ("cpu", "CUDA"), "raw": "0",
+             "off_policy": "fallback",
+             "off_label": "decomposed three-FFT chain (still FFI-served)",
              "detail": "the fused IFFT-multiply-FFT tau kernel"},
         ],
         "linalg": {"eigh": ["native", "scalapack"], "cholesky": ["native"],
@@ -491,24 +497,31 @@ def test_a_dial_missing_from_the_facts_is_missing_from_the_block():
 
 def test_a_dial_that_is_off_is_still_stated():
     """Silence about an off dial is indistinguishable from silence about an
-    on one; the block must state both."""
+    on one; the block must state both — including that an =0 opt-out is
+    uncertified (the FFI layer is required, decisions.md 2026-08-01)."""
     out = _text(_facts())
-    assert "The LORRAX_FFT_FFI dial is unset and resolved to off" in out
-    assert "left on the default XLA lowering" in out
+    assert ("The LORRAX_FFT_FFI_FUSED dial is set to '0' and resolved to "
+            "off") in out
+    assert "uncertified for production" in out
+    assert "decomposed three-FFT chain" in out
 
 
-def test_an_auto_dial_states_its_verdict_and_the_reason():
+def test_an_on_dial_states_the_required_route():
     out = _text(_facts())
-    assert "resolved to auto, which is ON here" in out
-    assert "lorrax_mklblas_gemm_batch" in out
+    assert "The LORRAX_FFT_FFI dial is unset and resolved to on" in out
+    assert "routed through the FFI handler (the required layer)" in out
 
 
-def test_an_auto_dial_that_demoted_states_that_it_did():
+def test_an_off_dial_whose_twin_was_deleted_states_the_refusal():
+    """LORRAX_FFT_FFI=0 has nothing to run (the XLA duplicate was deleted);
+    the report must say so rather than describe a path that is gone."""
     dials = [dict(d) for d in _facts()["ffi_dials"]]
-    dials[0].update(enabled=False)
-    out = _text(_facts(ffi_dials=dials, backend="gpu"))
-    assert "resolved to auto, which is OFF here" in out
-    assert "does not resolve" in out
+    for d in dials:
+        if d["env"] == "LORRAX_FFT_FFI":
+            d.update(mode="off", enabled=False, raw="0")
+    out = _text(_facts(ffi_dials=dials))
+    assert "native duplicate was deleted" in out
+    assert "startup enforcement refuses this setting" in out
 
 
 def test_a_missing_ffi_library_is_stated_once_and_clearly():
@@ -517,7 +530,8 @@ def test_a_missing_ffi_library_is_stated_once_and_clearly():
         "reason": "FileNotFoundError: could not locate liblorrax_ffi_host.so",
         "env_var": "LORRAX_FFI_HOST_SO", "env_value": None}))
     assert "No cpu FFI library could be loaded" in out
-    assert "native in-tree path" in out
+    assert "The FFI layer is REQUIRED" in out
+    assert "docs/environment/overview.md" in out
 
 
 def test_linalg_capability_is_reported_per_op():

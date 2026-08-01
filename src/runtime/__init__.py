@@ -1164,6 +1164,13 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     6. :func:`common.collectives.prepare_mesh` -- the run's mesh, then
        ``warm_mesh_cliques`` (CPU/MPI) and ``nccl_warmup`` (GPU/NCCL).
        Collective: every rank must reach it.  Needs (4) and (5).
+    6b. :func:`_enforce_required_ffi` -- the FFI layer is REQUIRED
+       (decisions.md 2026-08-01): each gate's :meth:`ffi.gate.Gate.enforce`
+       runs against the fresh mesh, so a missing or unloadable FFI library
+       refuses AT STARTUP, naming the ``.so`` and the fix, instead of at
+       the first kernel factory mid-run; an explicit ``=0`` either refuses
+       (deleted duplicate) or announces the uncertified opt-out here.
+       Needs (6): the refusal/announce vocabulary is mesh-platform-aware.
     7. ``ensure_jax_compile_cache`` -- needs ``jax.process_count()`` from
        (4)/(5), and its P>1 agreement layer rides the coordination service
        that (4) started.  Deliberately AFTER (6): the clique warm-up's jit
@@ -1224,6 +1231,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     # -- 6 ------------------------------------------------------------------
     from common.collectives import prepare_mesh
     mesh = prepare_mesh(axis_names=tuple(axis_names), print_fn=say)
+    # -- 6b -----------------------------------------------------------------
+    _enforce_required_ffi(mesh)
     _t_mesh = time.perf_counter()
     # -- 7 ------------------------------------------------------------------
     cache_error = None
@@ -1391,23 +1400,46 @@ def _thread_env() -> dict:
     }
 
 
+def _enforce_required_ffi(mesh) -> None:
+    """Startup enforcement of the REQUIRED FFI layer (decisions.md
+    2026-08-01) — step 6b of :func:`initialize_communicator_stack`.
+
+    Runs each capability gate's :meth:`ffi.gate.Gate.enforce` against the
+    run's mesh: a missing or unloadable FFI library REFUSES here, at
+    startup, quoting ``probe_target``'s three-way reason (which names the
+    ``.so`` and the LD_LIBRARY_PATH/build fix), instead of surfacing at the
+    first kernel factory mid-run; an explicit ``=0`` refuses (where the
+    native duplicate was deleted — LORRAX_FFT_FFI) or announces the
+    uncertified debug opt-out (where a native path is structurally
+    retained — LORRAX_BANDS_GEMM_FFI, LORRAX_FFT_FFI_FUSED's decomposed
+    FFI chain).  Out-of-scope platforms are skipped per each gate's
+    declared policy (the platform's native lowering IS the required path
+    there, e.g. cuBLAS dot on CUDA for the GEMM dial).
+
+    Raising here is the intended behaviour, not a startup fragility: the
+    fail-fast excepthook is already installed (step 0), so a refusal on
+    any rank exits the job non-zero with the message at the top of the
+    log.  An import failure of the gate modules themselves is a broken
+    build and propagates for the same reason.
+    """
+    from ffi.fft import FUSED_GATE, GATE as _FFT_GATE
+    from ffi.gemm import GATE as _GEMM_GATE
+
+    for gate in (_FFT_GATE, FUSED_GATE, _GEMM_GATE):
+        gate.enforce(mesh)
+
+
 def _ffi_dial_facts() -> list:
     """(env, mode, enabled, detail) for every FFI capability dial.
 
     Read through the services' own ``Gate`` objects, never by re-parsing the
     variables here: the gate owns the strict grammar (``=Y`` is a grammar
-    error, not a silent no-op) and memoizes the ``auto`` verdict, so asking
-    it HERE both reports the answer and pins the answer every later consumer
-    will key its kernel cache on.  Asking it here is also the first moment
-    the answer is RIGHT: ``auto`` resolves the platform lexically from
-    ``JAX_PLATFORMS``, and this runs after the CPU demotion has pinned that
-    variable, whereas a consumer that ran earlier would have read
-    ``cuda,cpu`` on a CPU node and demoted itself to OFF.
-
-    ``enabled()`` is tier 1 (lexical, backend-init-free).  It probes the
-    platform library only for a dial in ``auto`` mode -- ``on``/``off``
-    answer from the env alone -- so a run with everything off pays no dlopen
-    for this.
+    error, not a silent no-op), so asking it HERE both reports the answer
+    and pins the answer every later consumer will key its kernel cache on.
+    Since the FFI-required ruling (decisions.md 2026-08-01) the vocabulary
+    is two-valued -- ``on``/``off`` answer from the env alone, no probe --
+    and the hard availability check is :func:`_enforce_required_ffi`
+    (step 6b), which has already run by the time this collector reports.
     """
     out = []
     try:
@@ -1431,6 +1463,8 @@ def _ffi_dial_facts() -> list:
         out.append({"env": gate.env, "mode": mode, "enabled": enabled,
                     "default": gate.default, "target": gate.target,
                     "platforms": tuple(gate.platforms), "detail": detail,
+                    "off_label": gate.off_label,
+                    "off_policy": gate.off_policy,
                     # Captured HERE, not re-read in the formatter: the
                     # formatter is pure, and a report that re-read os.environ
                     # could print a value the gate never saw.
@@ -1766,26 +1800,29 @@ def format_startup_report(f: dict) -> list:
                f"{lib.get('env_var')} is unset."))
     else:
         add(f"  No {lib.get('platform')} FFI library could be loaded "
-            f"({lib.get('reason')}), so every FFI-backed dial below is off "
-            f"and every linalg op takes its native in-tree path.")
+            f"({lib.get('reason')}).  The FFI layer is REQUIRED "
+            f"(decisions.md 2026-08-01): startup enforcement refuses this "
+            f"state, so a run printing this line bypassed "
+            f"initialize_communicator_stack — see "
+            f"docs/environment/overview.md for the library build.")
     for d in f.get("ffi_dials", ()):
         if d.get("mode") is None:
             add(f"  The {d['env']} dial could not be resolved: {d['detail']}.")
             continue
         raw = d.get("raw")
         how = f"set to {raw!r}" if raw not in (None, "") else "unset"
-        route = ("is routed through the FFI handler" if d["enabled"]
-                 else "is left on the default XLA lowering")
-        if d["mode"] == "auto":
-            onoff = "ON" if d["enabled"] else "OFF"
-            probe = "resolves" if d["enabled"] else "does not resolve"
-            add(f"  The {d['env']} dial is {how} and resolved to auto, which "
-                f"is {onoff} here because the platform is "
-                f"{f.get('backend')!r} and the FFI target {d['target']!r} "
-                f"{probe} on it, so {d['detail']} {route}.")
+        if d["enabled"]:
+            route = "is routed through the FFI handler (the required layer)"
+        elif d.get("off_policy") == "refuse":
+            route = ("has NOTHING to run — the native duplicate was "
+                     "deleted (decisions.md 2026-08-01) and startup "
+                     "enforcement refuses this setting")
         else:
-            add(f"  The {d['env']} dial is {how} and resolved to "
-                f"{d['mode']}, so {d['detail']} {route}.")
+            route = (f"runs the retained opt-out path "
+                     f"({d.get('off_label', 'native lowering')}), which is "
+                     f"uncertified for production")
+        add(f"  The {d['env']} dial is {how} and resolved to "
+            f"{d['mode']}, so {d['detail']} {route}.")
     lin = f.get("linalg", {})
     if lin.get("error"):
         add(f"  The distributed dense-linalg facade could not be queried "

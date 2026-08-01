@@ -279,12 +279,14 @@ def make_sharded_fftn_3d(
 
 
 # ============================================================================
-# FFI backend for the flat-k helpers — GATED, OFF by default
+# FFI backend for the flat-k helpers — REQUIRED (decisions.md 2026-08-01)
 # ============================================================================
-# The service itself lives in ``src/ffi/mklfft`` (Python) + ``src/ffi/mklfft/
-# cpp`` and ``src/ffi/cufft/cpp`` (handlers).  THIS file used to carry a
-# second, drifting copy of the gate and both bodies; as of 2026-07-30 it
-# delegates, so there is ONE implementation and one env read.
+# The service itself lives in ``src/ffi/fft.py`` (Python) + ``src/ffi/cpp/
+# mklfft`` and ``src/ffi/cpp/cufft`` (handlers).  THIS file used to carry a
+# second, drifting copy of the gate and both bodies (delegated 2026-07-30),
+# and then a gated XLA twin of the flat-k transform (DELETED 2026-08-01
+# under the FFI-required ruling: where a certified FFI path exists, the
+# native-JAX duplicate is not maintained).
 #
 # What the service is: the flat-k batched 3-D FFTs dispatched to the platform
 # FFI library — MKL FFT via the DFTI descriptor API on cpu meshes, cuFFT with
@@ -297,11 +299,14 @@ def make_sharded_fftn_3d(
 # disappear instead of moving.  Contract: ``docs/dev/flat_k_fft_service.md``.
 #
 # What stays here: the OWNER RULE that these helpers are the single FFT entry
-# point.  ``make_flat_k_fft`` below is still the only door; it just asks
-# ``ffi.mklfft`` for the backend instead of implementing it twice.
+# point (``make_flat_k_fft`` below is still the only door), and the XLA
+# ``make_sharded_*fftn_3d`` / ``local_*fftn3`` layer above — those serve the
+# shard_map-INTERIOR call sites (isdf/core, wfn_transforms, BSE) that have
+# no FFI route, which the ruling explicitly keeps.
 # ============================================================================
 
 from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
+    GATE,
     fft_ffi_enabled,
     make_gw_conv_ffi as _make_gw_conv_ffi,
     make_flat_k_fft_ffi as _make_flat_k_fft_ffi,
@@ -333,18 +338,19 @@ def make_flat_k_gw_conv(
 
 # ============================================================================
 # Flat-k FFT helpers — callers operate on (nk, *trail) arrays everywhere and
-# the k-grid 3D form only exists inside this wrapper, matching the
+# the k-grid 3D form only exists in the spec vocabulary, matching the
 # "flatten kx/ky/kz except inside the FFT" convention used across the GW
 # pipeline (w_isdf chi0, ppm_sigma, gw_jax static COHSEX, isdf_fitting
-# CCT/ZCT).  Internally: reshape (nk, *trail) -> (nkx, nky, nkz, *trail),
-# pin with `with_sharding_constraint`, run a jittable device-local 3D FFT
-# over the leading (0, 1, 2) k-axes, reshape back to (nk, *trail).
+# CCT/ZCT).
 #
-# Backend gate: with LORRAX_FFT_FFI=1 the factory returns the platform FFI
-# variant instead (MKL DFTI on cpu, cuFFT strided on CUDA — see the block
-# above) — same ``(nk, *trail) -> (nk, *trail)`` contract, no 3-D reshape,
-# no layout anchoring.  Default (flag off): the XLA path below,
-# byte-for-byte untouched.
+# Backend: the platform FFI handler, unconditionally (MKL DFTI on cpu,
+# cuFFT strided on CUDA — see the block above) — ``(nk, *trail) ->
+# (nk, *trail)``, k-major end to end, no 3-D reshape, no layout anchoring.
+# The gated XLA twin (reshape -> make_sharded_*fftn_3d -> reshape) was
+# DELETED 2026-08-01 (decisions.md: FFI backends are required, not
+# optional); LORRAX_FFT_FFI=0 therefore refuses here rather than silently
+# selecting a path that no longer exists.  Recover the XLA arm from git
+# history for a debugging build.
 # ============================================================================
 
 
@@ -361,48 +367,21 @@ def make_flat_k_fft(
 
     ``spec`` is the ``PartitionSpec`` on the 3-D form
     ``(nkx, nky, nkz, *trail)``.  The three leading k-axes must be
-    replicated (``None``) so the inner custom-partitioned FFT sees the
-    full FFT axis on every device.  ``out_spec`` defaults to ``spec``;
-    pass a different one only if a post-FFT reshard is wanted.
+    replicated (``None``) so the batched per-rank FFT sees the full FFT
+    axis on every device.  ``out_spec`` must equal ``spec`` (the FFI
+    backend implements no post-FFT reshard).
 
     ``kind='ifftn'`` or ``'fftn'`` selects the direction.  ``norm``
     follows ``jnp.fft.*`` ('ortho', 'forward', 'backward' / None).
+
+    Always the platform FFI backend (announce-or-refuse inside; the
+    factory-time ``fft_ffi_enabled()`` read stays in every consumer's
+    kernel cache key — see ppm_tau_kernel).
     """
-    if fft_ffi_enabled():
-        # Gated backend (announce-or-refuse inside): the platform FFI
-        # handler (MKL DFTI on cpu, cuFFT strided on CUDA), k-major end to
-        # end.  Factory-time env read — kernel caches key on
-        # fft_ffi_enabled() (see ppm_tau_kernel).
-        return _make_flat_k_fft_ffi(mesh, kgrid, spec, kind=kind,
-                                    norm=norm, out_spec=out_spec)
-    nkx, nky, nkz = (int(v) for v in kgrid)
-    nk = nkx * nky * nkz
-    in_shard = NamedSharding(mesh, spec)
-    # Use the single 3D-cuFFT-plan variant rather than the 3-sequential-
-    # 1D-FFT (custom_partitioning per-axis) form.  Same correctness
-    # contract (FFT axes must be replicated in ``spec``); cuFFT's 3D
-    # plan handles the axis sequencing internally with far fewer
-    # explicit transposes in the generated HLO.  Si 4×4×4 BSE sweep
-    # measured this swap at ~1 s walltime savings in a 200-iter
-    # Lanczos run.
-    if kind == 'ifftn':
-        inner = make_sharded_ifftn_3d(
-            mesh, spec, out_spec if out_spec is not None else spec,
-            norm=norm, axes=(0, 1, 2))
-    elif kind == 'fftn':
-        inner = make_sharded_fftn_3d(
-            mesh, spec, out_spec if out_spec is not None else spec,
-            norm=norm, axes=(0, 1, 2))
-    else:
-        raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
-
-    def _flat_k_fft(x_flat):
-        trail = x_flat.shape[1:]
-        x_3d = jax.lax.with_sharding_constraint(
-            x_flat.reshape(nkx, nky, nkz, *trail), in_shard)
-        return inner(x_3d).reshape(nk, *trail)
-
-    return _flat_k_fft
+    if not fft_ffi_enabled():
+        raise RuntimeError(GATE.off_refuse_msg)
+    return _make_flat_k_fft_ffi(mesh, kgrid, spec, kind=kind,
+                                norm=norm, out_spec=out_spec)
 
 
 def make_flat_k_ifftn(

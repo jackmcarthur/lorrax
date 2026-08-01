@@ -6,36 +6,53 @@ dial has to get right, in one place instead of three drifting copies:
 
 1. **Grammar** — a strict, per-gate NAMED vocabulary (:data:`MODE_SPELLINGS`).
    A value outside the gate's own vocabulary is announced once and takes
-   the conservative direction (``off``) — never silently ignored.  This is
-   the defect that made ``LORRAX_FFT_FFI_FUSED=Y`` a no-op with no output.
+   the gate's DEFAULT — never silently ignored.  This is the defect that
+   made ``LORRAX_FFT_FFI_FUSED=Y`` a no-op with no output.  (The fallback
+   used to be ``off``; since the FFI layer became required — see below —
+   the direction that cannot break a run is the certified default.)
 2. **Platform** — resolved in TWO separate tiers (below), because one of
    them must not initialize the JAX backend.
 3. **Probe** — ``ffi_loader.probe_target``, whose three-way reason
    (*unknown target* / *library could not be loaded* / *loaded but does not
    export*) is quoted verbatim into every refusal.  A bare bool would tell
    somebody to rebuild a library that is fine.
-4. **Announce or refuse** — ``auto`` MAY demote, but must say so **from the
-   rank the demote happened on**; an explicit request that cannot be
-   honored RAISES at resolve time with the reason and the fix.
+4. **Announce or refuse** — a request that cannot be honored RAISES at
+   resolve time with the reason and the fix; the only silences are the
+   ones a gate DECLARES (:attr:`Gate.silent_platform_demote`).
+
+REQUIRED, NOT OPTIONAL (owner ruling, ``docs/architecture/decisions.md``
+2026-08-01).  The FFI layer is an essential part of the build: every gate
+now defaults ON, a missing or unloadable library is a STARTUP refusal that
+names the ``.so`` (:meth:`Gate.enforce`, called by
+``runtime.initialize_communicator_stack`` right after the mesh is built),
+and ``=0`` is an explicit debug opt-OUT whose meaning is per-gate
+(:attr:`Gate.off_policy`): where a native-JAX twin still exists for a
+structural reason it runs, announced; where the certified FFI path made the
+twin deletable, the twin is GONE and ``=0`` refuses, naming the deletion.
+The old ``auto`` capability-detection tier was deleted with the same
+ruling — auto-demotion to a duplicate compute path is exactly what the
+ruling forbids ("a refusal at startup ... not a silent demotion to a
+slower path"); ``auto`` remains in the vocabulary only so a stale
+``=auto`` export announces a grammar note instead of failing silently.
 
 Two tiers — keeping them apart is the whole reason this module exists
 ---------------------------------------------------------------------
-:meth:`Gate.enabled` — **tier 1, LEXICAL.**  Reads the env var and, for
-    ``auto``, the platform from ``JAX_PLATFORMS`` via
-    ``ffi_loader.platform_from_env``, then probes.  It never touches the
-    JAX backend, so it is safe before ``jax.distributed.initialize`` —
-    which it must be, because consumers use it as a KERNEL-CACHE KEY at
-    factory time (``gw.ppm_tau_kernel``'s ``pipeline_key``/``cache_key``).
-    The read is *lexical*: an unset ``JAX_PLATFORMS`` resolves CUDA-first,
-    and so does a CPU run whose ``JAX_PLATFORMS`` still reads ``cuda,cpu``.
-    Both give auto-OFF — the safe direction (XLA lowering, no error, just
-    no speedup); fix by exporting ``JAX_PLATFORMS=cpu`` or setting the dial
-    explicitly.
+:meth:`Gate.enabled` — **tier 1, LEXICAL.**  Reads the env var and nothing
+    else (the modes are two-valued now that ``auto`` is gone, so no probe
+    and no platform read).  It never touches the JAX backend, so it is safe
+    before ``jax.distributed.initialize`` — which it must be, because
+    consumers use it as a KERNEL-CACHE KEY at factory time
+    (``gw.ppm_tau_kernel``'s ``pipeline_key``/``cache_key``).
 
 :meth:`Gate.resolve` — **tier 2, MESH-AWARE.**  Takes the platform from the
     live devices, so it is exact; it needs a ``Mesh`` and therefore an
     initialized backend.  Returns the FFI platform key to lower on, or
-    ``None`` when the gate is off.  This is where explicit requests refuse.
+    ``None`` when the gate is off.  This is where requests refuse.
+
+:meth:`Gate.enforce` — **tier 2, STARTUP.**  The required-layer contract:
+    called once per gate by ``runtime.initialize_communicator_stack`` right
+    after the mesh exists, so a missing library refuses AT STARTUP, naming
+    the ``.so``, instead of at the first kernel factory mid-run.
 
 A single-tier resolver cannot serve both: tier 2 is exact but far too late
 for a cache key, tier 1 is early enough but only lexically right.  That —
@@ -101,13 +118,15 @@ MODE_HELP: dict[str, str] = {
     "on":   "1/on/true/yes",
 }
 
-#: A grammar error always resolves to OFF, even for a gate whose DEFAULT is
-#: ``auto``: an unparseable request is not evidence that the user wanted the
-#: capability, so take the direction that cannot break a run.
-_GRAMMAR_FALLBACK = "off"
+#: A grammar error resolves to the gate's DEFAULT (announced).  An
+#: unparseable value is not evidence of intent either way, so take the
+#: direction that cannot break a run — which, now that the FFI layer is
+#: required (decisions.md 2026-08-01), is the certified default path, not
+#: ``off``: for a gate whose deleted native twin makes ``off`` a REFUSAL,
+#: falling back to ``off`` would turn a typo into a dead run.
+#: (Kept as prose rather than a constant: the fallback IS ``self.default``.)
 
 _ANNOUNCED: set = set()
-_AUTO_VERDICT: dict[str, bool] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -178,9 +197,8 @@ def announce_once(key, msg: str, *, scope: str = "rank0") -> bool:
 
 
 def reset_gate_state() -> None:
-    """Forget every memoized auto verdict and announcement (tests only)."""
+    """Forget every memoized announcement (tests only)."""
     _ANNOUNCED.clear()
-    _AUTO_VERDICT.clear()
 
 
 def mesh_ffi_platform(mesh) -> str:
@@ -202,31 +220,40 @@ def mesh_ffi_platform(mesh) -> str:
 
 @dataclass(frozen=True)
 class Gate:
-    """One env-gated FFI capability.
+    """One env-gated, REQUIRED FFI capability (decisions.md 2026-08-01).
 
     Every message is a field rather than generated prose: these strings are
-    the product (harnesses grep ``[bands_gemm] AUTO-ON``; refusals must name
-    the caller's fix), so each service owns its own wording while the
-    *policy* — when to warn, when to demote, when to raise, and who speaks —
-    lives here and is identical for all of them.
+    the product (harnesses grep the announce lines; refusals must name the
+    caller's fix), so each service owns its own wording while the *policy* —
+    when to warn, when to raise, what ``=0`` means, and who speaks — lives
+    here and is identical for all of them.
     """
 
     env: str                          #: e.g. "LORRAX_FFT_FFI"
     target: str                       #: default FFI target to probe
     platforms: tuple[str, ...]        #: ffi_loader keys this dial exists on
     modes: tuple[str, ...]            #: THIS gate's vocabulary, in help order
-    default: str                      #: what unset/empty means: "off"|"auto"
-    off_label: str                    #: tail of the grammar warning
+    default: str                      #: what unset/empty means: "on"|"off"
+    off_label: str                    #: what =0 selects, for announcements
     label: Mapping[str, str] = field(default_factory=dict)   #: platform → name
-    lexical_default: str = "CUDA"     #: platform_from_env fallback
+    # -- required-layer policy (decisions.md 2026-08-01) ----------------
+    #: What an explicit ``=0`` means for THIS gate:
+    #: ``"fallback"`` — a native-JAX path still exists (kept for a
+    #:     structural reason, e.g. the GEMM minor-order case); ``=0`` runs
+    #:     it, announced once as an uncertified debug opt-out.
+    #: ``"refuse"``   — the native duplicate was DELETED under the ruling;
+    #:     ``=0`` names the deletion and raises at :meth:`enforce` (and the
+    #:     factory raises too, for callers outside the startup path).
+    off_policy: str = "fallback"
+    off_announce_msg: str = ""             #: fallback announce (no fields)
+    off_refuse_msg: str = ""               #: refuse prose (no fields)
     # -- prose: announce -----------------------------------------------
-    auto_on_msg: str = ""                  #: {target}
-    auto_unavailable_msg: str = ""         #: {target} {reason}
     resolved_msg: Mapping[str, str] = field(default_factory=dict)  #: {target}
-    #: Non-empty ⇒ an out-of-scope platform demotes ``auto`` SILENTLY, and
-    #: this string is the recorded reason.  Silence is allowed only when
-    #: declared: the alternative (announcing "no GPU GEMM dial here" on
-    #: every GPU run) is noise about a decision the user cannot act on.
+    #: Non-empty ⇒ an out-of-scope platform is skipped SILENTLY by
+    #: :meth:`enforce`/:meth:`resolve`, and this string is the recorded
+    #: reason.  Silence is allowed only when declared: the alternative
+    #: (announcing "no GPU GEMM dial here" on every GPU run) is noise about
+    #: a decision the user cannot act on.
     silent_platform_demote: str = ""
     platform_demote_msg: str = ""          #: {platform}  (announced demote)
     # -- prose: refuse -------------------------------------------------
@@ -241,11 +268,12 @@ class Gate:
     # -- tier 0: grammar ------------------------------------------------
 
     def mode(self) -> str:
-        """``"on"`` | ``"off"`` | ``"auto"`` — this gate's strict grammar.
+        """``"on"`` | ``"off"`` — this gate's strict grammar.
 
         Unset/empty → :attr:`default`.  A value outside :attr:`modes`
         announces once (rank-locally: the env is per-process) and returns
-        ``"off"``.
+        the DEFAULT — the certified required path, the direction that
+        cannot break a run now that ``off`` may itself refuse.
         """
         v = os.environ.get(self.env, "").strip().lower()
         if v == "":
@@ -257,67 +285,31 @@ class Gate:
             (self.env, "grammar"),
             f"*** {self.env}={v!r} is not a recognized value "
             f"(accepted: {', '.join(MODE_HELP[m] for m in self.modes)}).  "
-            f"Treating as OFF ({self.off_label}). ***",
+            f"Treating as the default ({self.default.upper()} — the FFI "
+            f"layer is required, decisions.md 2026-08-01). ***",
             scope="local")
-        return _GRAMMAR_FALLBACK
+        return self.default
 
     # -- tier 1: lexical (cache-key safe) -------------------------------
 
     def enabled(self) -> bool:
         """Is this capability ON?  **Never initializes the JAX backend.**
 
-        THE function consumers key their kernel caches on.  ``on``/``off``
-        answer from the env alone; ``auto`` resolves the platform lexically
-        from ``JAX_PLATFORMS`` and probes the handler, memoized per process.
+        THE function consumers key their kernel caches on.  Answers from
+        the env alone (the vocabulary is two-valued since the ``auto``
+        capability-detection tier was deleted, decisions.md 2026-08-01);
+        no probe, no platform read, O(1) at any call site.
         """
-        m = self.mode()
-        if m == "off":
-            return False
-        if m == "on":
-            return True
-        return self._auto_lexical()
-
-    def _auto_lexical(self) -> bool:
-        hit = _AUTO_VERDICT.get(self.env)
-        if hit is not None:
-            return hit
-        from ffi.common import ffi_loader
-        plat = ffi_loader.platform_from_env(default=self.lexical_default)
-        if plat not in self.platforms:
-            _AUTO_VERDICT[self.env] = False
-            if not self.silent_platform_demote:
-                announce_once((self.env, "auto", "platform"),
-                              self._demote_msg(plat), scope="rank0")
-            return False
-        ok, reason = ffi_loader.probe_target(self.target, plat)
-        _AUTO_VERDICT[self.env] = bool(ok)
-        if ok:
-            announce_once((self.env, "auto"),
-                          self.auto_on_msg.format(target=self.target)
-                          if self.auto_on_msg else
-                          f"[{self.env}] auto: ON ({self.target} resolves on "
-                          f"platform {plat}).",
-                          scope="rank0")
-        else:
-            # Rank-LOCAL: "the .so would not dlopen" is normally one rank's
-            # environment, and a rank-0 guard is precisely what hides it.
-            announce_once((self.env, "auto"),
-                          self.auto_unavailable_msg.format(
-                              target=self.target, reason=reason)
-                          if self.auto_unavailable_msg else
-                          f"[{self.env}] auto: OFF — FFI target "
-                          f"{self.target!r} unavailable ({reason})",
-                          scope="local")
-        return _AUTO_VERDICT[self.env]
+        return self.mode() != "off"
 
     def _demote_msg(self, plat: str) -> str:
-        """The announced ``auto`` platform demote.  Generated when the gate
-        did not write one, so an unset field can never turn a demote silent —
+        """The announced platform demote.  Generated when the gate did not
+        write one, so an unset field can never turn a demote silent —
         silence requires :attr:`silent_platform_demote`, which is checked by
         the caller and must carry its reason."""
         if self.platform_demote_msg:
             return self.platform_demote_msg.format(platform=plat)
-        return (f"[{self.env}] auto: OFF — this dial exists on "
+        return (f"[{self.env}] OFF — this dial exists on "
                 f"{'/'.join(self.platforms)} and the platform resolved to "
                 f"{plat!r}; keeping the default lowering.")
 
@@ -373,23 +365,15 @@ class Gate:
     def resolve(self, mesh, *, target: str | None = None) -> str | None:
         """Mode-aware resolution: the FFI platform key, or ``None`` if OFF.
 
-        * ``off`` — ``None``.  No probe, no library load, nothing printed.
-        * ``on``  — :meth:`require`; an unhonorable request RAISES here,
-          never downgrades.
-        * ``auto`` — the tier-1 lexical verdict decides first (so the
-          answer agrees with the cache key); then the mesh's platform must
-          be in scope.  Out of scope ⇒ ``None``, announced on rank 0 unless
-          :attr:`silent_platform_demote` declares why silence is right.
-          ``auto`` does NOT print the first-use receipt: the tier-1
-          ``AUTO-ON`` line already is that receipt, and printing both would
-          say the same thing twice per run.
+        * ``off`` — ``None``.  No probe, no library load, nothing printed
+          (the opt-out announcement is :meth:`enforce`'s, once at startup).
+        * ``on`` (the default) — out-of-scope platform ⇒ ``None``,
+          announced on rank 0 unless :attr:`silent_platform_demote`
+          declares why silence is right (the platform's own native lowering
+          IS the required path there); in scope ⇒ :meth:`require`, which
+          RAISES when the handler cannot be served — never downgrades.
         """
-        m = self.mode()
-        if m == "off":
-            return None
-        if m == "on":
-            return self.require(mesh, target=target)
-        if not self.enabled():
+        if self.mode() == "off":
             return None
         if not self.platform_ok(mesh):
             if not self.silent_platform_demote:
@@ -398,4 +382,50 @@ class Gate:
                     self._demote_msg(mesh.devices.flat[0].platform),
                     scope="rank0")
             return None
-        return mesh_ffi_platform(mesh)
+        return self.require(mesh, target=target)
+
+    def enforce(self, mesh) -> str | None:
+        """The startup contract of the REQUIRED FFI layer (decisions.md
+        2026-08-01).  Called once per gate by
+        ``runtime.initialize_communicator_stack`` right after the mesh is
+        built, so the outcome is decided — and any refusal fires — at
+        STARTUP, not at the first kernel factory mid-run.
+
+        * default / ``on`` — :meth:`require`: a missing or unloadable
+          library REFUSES here, naming the ``.so`` (``probe_target``'s
+          three-way reason, verbatim).  Out-of-scope platform ⇒ ``None``,
+          silently when :attr:`silent_platform_demote` declares why (the
+          platform's native lowering is the required path there).
+        * ``off`` with ``off_policy="fallback"`` — the retained native
+          path runs; announced once, rank-locally, as an uncertified debug
+          opt-out.
+        * ``off`` with ``off_policy="refuse"`` — the native duplicate was
+          deleted; RAISES, naming the deletion and the fix.
+        """
+        if self.mode() == "off":
+            if self.off_policy == "refuse":
+                raise RuntimeError(
+                    self.off_refuse_msg or
+                    f"{self.env}=0: there is nothing to opt out to.  The "
+                    f"native-JAX duplicate of the {self.target!r} path was "
+                    f"deleted under the FFI-required ruling "
+                    f"(docs/architecture/decisions.md, 2026-08-01); recover "
+                    f"it from git history for a debugging build, or unset "
+                    f"{self.env}.")
+            announce_once(
+                (self.env, "opt-out"),
+                self.off_announce_msg or
+                f"[{self.env}] =0: explicit debug opt-out — running the "
+                f"retained native-JAX path ({self.off_label}).  This path "
+                f"is UNCERTIFIED for production (the FFI layer is required, "
+                f"decisions.md 2026-08-01).",
+                scope="local")
+            return None
+        if not self.platform_ok(mesh):
+            if not self.silent_platform_demote:
+                announce_once(
+                    (self.env, "mesh", "platform"),
+                    self._demote_msg(mesh.devices.flat[0].platform),
+                    scope="rank0")
+            return None
+        return self.require(mesh)

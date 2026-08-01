@@ -68,21 +68,32 @@ __all__ = [
 FLAT_K_TARGET = "lorrax_mklfft_flat_k"
 GW_CONV_TARGET = "lorrax_mklfft_gw_conv"
 
-#: The ``LORRAX_FFT_FFI`` dial.  Default OFF and **no ``auto`` mode** — the
-#: vocabulary is two-valued, so ``LORRAX_FFT_FFI=auto`` is a grammar error
-#: here rather than a silently different policy from the GEMM dial.  Whether
-#: this dial should GET an ``auto`` (the GPU margin is 2.1-2.4x at
-#: production shapes, ``wk_REL/audit_gpu_fft.log:104-105``, ``:119-120`` —
-#: larger than the margin that justified the GEMM auto) is an owner call;
-#: the defect recorded by the 2026-07-30 assessment is the absence of a
-#: recorded REASON, not the value.
+#: The ``LORRAX_FFT_FFI`` dial.  Default ON — the FFI layer is REQUIRED
+#: (owner ruling, ``docs/architecture/decisions.md`` 2026-08-01): the flat-k
+#: XLA duplicate inside ``fft_helpers.make_flat_k_fft`` was deleted under
+#: that ruling, so ``=0`` REFUSES (off_policy="refuse") instead of selecting
+#: a path that no longer exists, and a missing/unloadable library is a
+#: startup refusal naming the ``.so`` (``Gate.enforce``, wired into
+#: ``runtime.initialize_communicator_stack``).  No ``auto`` mode — there is
+#: nothing to auto-detect when the backend is mandatory.
 GATE = Gate(
     env="LORRAX_FFT_FFI",
     target=FLAT_K_TARGET,
     platforms=("cpu", "CUDA"),
     modes=("off", "on"),
-    default="off",
-    off_label="default XLA FFT path",
+    default="on",
+    off_label="(deleted) XLA flat-k FFT path",
+    off_policy="refuse",
+    off_refuse_msg=(
+        "LORRAX_FFT_FFI=0: there is nothing to opt out to.  The XLA flat-k "
+        "FFT path (the native-JAX duplicate inside "
+        "common.fft_helpers.make_flat_k_fft) was DELETED under the "
+        "FFI-required ruling (docs/architecture/decisions.md, 2026-08-01) — "
+        "the certified backend is the platform FFI handler (MKL DFTI on "
+        "cpu, cuFFT strided on CUDA).  Unset LORRAX_FFT_FFI, or recover the "
+        "XLA arm from git history for a debugging build.  BSE and the "
+        "shard_map-interior local_*fftn3 aliases are unaffected (they never "
+        "had an FFI route)."),
     label={"cpu": "MKL FFT (DFTI API) host",
            "CUDA": "cuFFT strided CUDA"},
     resolved_msg={
@@ -97,14 +108,17 @@ GATE = Gate(
                  "scales applied by a fused device kernel."),
     },
     refuse_platform_msg=(
-        "LORRAX_FFT_FFI requested the FFI flat-k FFT backend, but the mesh "
-        "devices are '{platform}' — backends exist for cpu (MKL FFT via the "
-        "DFTI API) and CUDA (cuFFT strided) only.  Unset LORRAX_FFT_FFI on "
-        "this mesh (explicit requests are never silently downgraded)."),
+        "LORRAX_FFT_FFI: the required FFI flat-k FFT backend cannot serve "
+        "this mesh — its devices are '{platform}', and backends exist for "
+        "cpu (MKL FFT via the DFTI API) and CUDA (cuFFT strided) only."),
     refuse_probe_msg=(
-        "LORRAX_FFT_FFI requested the {label} "
-        "backend, but FFI target '{target}' is unusable on platform "
-        "'{platform}': {reason}"),
+        "The required {label} backend is unavailable: FFI target "
+        "'{target}' is unusable on platform '{platform}': {reason}  The "
+        "FFI layer is REQUIRED (docs/architecture/decisions.md, "
+        "2026-08-01); build/locate the library per "
+        "docs/environment/overview.md (host: build_host.sh -> "
+        "liblorrax_ffi_host.so, selected by LORRAX_FFI_HOST_SO; CUDA: "
+        "build.sh -> liblorrax_ffi.so, LORRAX_FFI_SO)."),
 )
 
 #: The ``LORRAX_FFT_FFI_FUSED`` dial — GRAMMAR ONLY, deliberately.
@@ -117,19 +131,34 @@ GATE = Gate(
 #: second set of refusal prose here would create two wordings for one
 #: condition.
 #:
+#: Default ON since the FFI-required ruling (decisions.md 2026-08-01): the
+#: fused entry is the certified production form (GATES.md: certified ``on``
+#: together with ``LORRAX_FFT_FFI``).  ``=0`` is a real opt-out
+#: (off_policy="fallback"), NOT a refusal: the thing it selects — the
+#: decomposed three-transform chain — is itself FFI-served through the same
+#: required handlers, so it is a structural choice between two certified
+#: FFI paths, not a native-JAX duplicate.
+#:
 #: Until 2026-07-30 this flag was read at a CONSUMER
 #: (``gw/ppm_tau_kernel.py:81``) with ``in ("1","true","yes","on")`` and no
-#: grammar check, in violation of the service's own stated rule
-#: (``fft_helpers.py:306-307``): ``=yes`` worked, ``=Y`` silently did
-#: nothing, and neither printed anything.  Every spelling that worked before
-#: still works; the only change is that an unrecognized value now SAYS so.
+#: grammar check, in violation of the service's own stated rule: ``=yes``
+#: worked, ``=Y`` silently did nothing, and neither printed anything.
+#: Every spelling that worked before still works; the only change is that
+#: an unrecognized value now SAYS so.
 FUSED_GATE = Gate(
     env="LORRAX_FFT_FFI_FUSED",
     target=GW_CONV_TARGET,
     platforms=("cpu", "CUDA"),
     modes=("off", "on"),
-    default="off",
-    off_label="decomposed IFFT/FFT chain, production path untouched",
+    default="on",
+    off_label="decomposed three-FFT chain (still FFI-served)",
+    off_policy="fallback",
+    off_announce_msg=(
+        "[LORRAX_FFT_FFI_FUSED] =0: explicit opt-out — the tau kernel "
+        "builds the decomposed IFFT/multiply/FFT chain instead of the "
+        "fused gw_conv entry.  Both forms ride the required FFI handlers; "
+        "the fused entry is the certified production default "
+        "(decisions.md 2026-08-01)."),
 )
 
 
@@ -154,8 +183,9 @@ def fused_fft_ffi_mode() -> str:
 def fused_fft_ffi_enabled() -> bool:
     """True when the τ kernel's IFFT·(G·W)·FFT step should be built as ONE
     fused FFI call (:func:`make_gw_conv_ffi`) instead of the decomposed
-    three-transform chain.  Independent of ``LORRAX_FFT_FFI``; default OFF;
-    read at kernel-factory time and part of the kernel cache keys."""
+    three-transform chain.  Independent of ``LORRAX_FFT_FFI``; default ON
+    (decisions.md 2026-08-01); read at kernel-factory time and part of the
+    kernel cache keys."""
     return FUSED_GATE.enabled()
 
 
