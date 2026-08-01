@@ -85,10 +85,14 @@ _RS_RE = re.compile(r"=\s+(\w+)\[([\d,]*)\]\S*\s+reduce-scatter\(")
 
 
 def _mesh():
+    import pytest
     n_dev = len(jax.devices())
-    assert n_dev >= 4, (
-        f"needs 4 (emulated) devices, got {n_dev}; set "
-        f"XLA_FLAGS=--xla_force_host_platform_device_count=4")
+    if n_dev < 4:
+        # skip, not assert — see test_contract_bands._mesh (the 4-device
+        # leg reruns these under xla_force_host_platform_device_count=4).
+        pytest.skip(
+            f"needs 4 (emulated) devices, got {n_dev}; set "
+            f"XLA_FLAGS=--xla_force_host_platform_device_count=4")
     return Mesh(np.asarray(jax.devices()[:4]).reshape(PX, PY), ("x", "y"))
 
 

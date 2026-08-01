@@ -310,6 +310,11 @@ def _build_zeta_h5(tmp_path, n_q_disk: int, n_rtot: int = 8, n_rmu: int = 4,
         fft_grid=(8, 8, 8),
         density=density,
         vertex_mu_L=vertex_mu_L,
+        # The builder writes its full (synthetic) payload below, so the
+        # file is complete: stamp it done, as the production writer does
+        # after the last chunk drains (ZetaLoader refuses partial files
+        # at open — the zeta_is_done completeness gate, 2026-07 audit).
+        zeta_is_done=True,
     )
     write_isdf_header(out_path, hdr, mode='a')
 
@@ -419,6 +424,7 @@ def _build_zeta_h5_gflat(tmp_path, n_q_disk: int, n_rmu: int, n_G_sph: int,
         fft_grid=(8, 8, 8),
         density='scalar',
         vertex_mu_L=0,
+        zeta_is_done=True,          # complete synthetic payload (see r-space builder)
         zeta_layout='G_flat',
         gvec_components=gvec_components,
         ngk_per_q=ngk_per_q,
@@ -532,8 +538,12 @@ from file_io.zeta_loader import ZetaLoader
 
 def _build_zeta_h5_rspace(tmp_path, n_q_disk: int, *, n_rtot: int = 8,
                    n_rmu: int = 4, density: str = "scalar",
-                   vertex_mu_L: int = 0, zeta_is_done: bool = False,
+                   vertex_mu_L: int = 0, zeta_is_done: bool = True,
                    fill: complex = 0.0):
+    # ``zeta_is_done`` defaults True: this builder writes its complete
+    # synthetic payload synchronously, and ``ZetaLoader`` refuses partial
+    # files at open (the completeness gate).  Pass False explicitly to
+    # exercise the partial/writer-path behaviour.
     wfn_path = str(tmp_path / "WFN.h5")
     out_path = str(tmp_path / "zeta_q.h5")
     _make_fake_wfn(wfn_path)
@@ -558,7 +568,7 @@ def _build_zeta_h5_rspace(tmp_path, n_q_disk: int, *, n_rtot: int = 8,
 
 
 def test_mark_zeta_done_flips_flag(tmp_path):
-    out = _build_zeta_h5_rspace(tmp_path, n_q_disk=4)
+    out = _build_zeta_h5_rspace(tmp_path, n_q_disk=4, zeta_is_done=False)
     assert read_isdf_header(out).zeta_is_done is False
     mark_zeta_done(out)
     assert read_isdf_header(out).zeta_is_done is True

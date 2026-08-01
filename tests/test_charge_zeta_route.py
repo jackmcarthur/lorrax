@@ -43,7 +43,12 @@ def _mesh(px: int, py: int) -> Mesh:
 
 # nq * n_mu**2 * 16 bytes vs the 4 GiB default cap.
 _UNDER_CAP = dict(nq=144, n_rmu=1200)      # 3.32 GiB
-_OVER_CAP = dict(nq=144, n_rmu=2412)       # 13.4 GiB
+_OVER_CAP = dict(nq=144, n_rmu=2412)       # 13.4 GiB stack; ~90 MiB per q-batch
+# Above the PER-Q-BATCH factor cap too (the binding limit for rank_truncate
+# since the _replicate_rank_truncate_ok widening: one (mu, mu) c128 matrix
+# alone exceeds _REPLICATED_FACTOR_MAX_BATCH_BYTES = 4 GiB, so the refusal —
+# not a batch split — is the contract).  17000^2 * 16 B = 4.31 GiB.
+_OVER_FACTOR_CAP = dict(nq=144, n_rmu=17000)
 
 
 class TestReplicatedRouteReachable:
@@ -98,11 +103,24 @@ class TestAboveCap:
 
     def test_rank_truncate_refuses_rather_than_downgrading(self):
         # Refuse loudly: silently returning a non-rank-conditioned factor is
-        # what produced the bad production ζ in the first place.
+        # what produced the bad production ζ in the first place.  The refusal
+        # threshold MOVED with the _replicate_rank_truncate_ok widening
+        # (ladder R15.1): a stack-over-cap fit (the old _OVER_CAP, 13.4 GiB
+        # stack but ~4 GiB per q-batch) now legitimately runs replicated
+        # one q-batch at a time; only a fit whose SINGLE (mu, mu) factor
+        # exceeds the per-batch cap has nowhere left to go and must refuse.
         with pytest.raises(ValueError, match="rank_truncate"):
             _resolve_solver_kind_charge(
                 _mesh(2, 2), override="auto",
-                charge_zeta_solve="rank_truncate", **_OVER_CAP)
+                charge_zeta_solve="rank_truncate", **_OVER_FACTOR_CAP)
+
+    def test_rank_truncate_stack_over_cap_still_runs_per_q_batch(self):
+        # The R15.1 widening pinned: stack-over-cap but batch-under-cap keeps
+        # the rank-truncation cure (refusing here lost physics, not memory).
+        got = _resolve_solver_kind_charge(
+            _mesh(2, 2), override="auto",
+            charge_zeta_solve="rank_truncate", **_OVER_CAP)
+        assert got == "replicated_rank_truncate"
 
     def test_cpu_mesh_never_auto_picks_cusolvermp(self):
         """cuSOLVERMp is CUDA-only; auto must not select it on a host mesh.

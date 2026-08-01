@@ -79,10 +79,16 @@ _F64DOT_RE = re.compile(r"=\s+f64\[[\d,]*\]\S*\s+dot\(")
 
 
 def _mesh():
+    import pytest
     n_dev = len(jax.devices())
-    assert n_dev >= 4, (
-        f"needs 4 (emulated) devices, got {n_dev}; set "
-        f"XLA_FLAGS=--xla_force_host_platform_device_count=4")
+    if n_dev < 4:
+        # skip, not assert: a plain 1-device invocation is a legitimate way
+        # to run the suite (the 4-device leg reruns these under
+        # XLA_FLAGS=--xla_force_host_platform_device_count=4) — same
+        # convention as test_staged_reshard / test_sharding_fit.
+        pytest.skip(
+            f"needs 4 (emulated) devices, got {n_dev}; set "
+            f"XLA_FLAGS=--xla_force_host_platform_device_count=4")
     return Mesh(np.asarray(jax.devices()[:4]).reshape(PX, PY), ("x", "y"))
 
 

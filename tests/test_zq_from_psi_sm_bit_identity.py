@@ -85,6 +85,10 @@ class _MockPsiGStore:
         bpd_per_bc = [
             (hi - lo) for (lo, hi) in self.band_chunk_ranges
         ]                                                  # p_xy=1 ⇒ no divide
+        # Mirrors ``PsiGStore._bpd_per_bc`` (psi_G_store.py:147): per-bc
+        # LOCAL band count, (hi-lo)//p — p_xy=1 here so no divide.  Read
+        # by ``isdf.core``'s bc-compaction reorder (core.py:534).
+        self._bpd_per_bc = tuple(bpd_per_bc)
         self._bpd_max = max(bpd_per_bc) if bpd_per_bc else 0
         self._per_rank_shape = (nk, nb_total, ns, ngkmax)
         self._g_index_dev = jax.device_put(
