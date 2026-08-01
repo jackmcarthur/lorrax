@@ -39,7 +39,7 @@ fastloop leg). Status with evidence:
 | b300 GW A/B under new defaults | GREEN, exact-0 | job 7885146 (CLAIMS 34) |
 | GPU leg under required-FFI | GREEN | jobs 7885151/7885153 (CLAIMS 35) |
 | Transverse-hoist merge certification | GREEN | job 7885137 (CLAIMS 32) |
-| Full pytest suite triage | **PENDING** — `tests/KNOWN_FAILURES.md` (sibling workstream; pytest job 7885154 running at time of writing; this row stays pending until that file is committed) | — |
+| Full pytest suite triage | **PENDING** — `tests/KNOWN_FAILURES.md` (sibling workstream; pytest job 7885154 running at time of writing; this row stays DONE — tests/KNOWN_FAILURES.md (f485b5a), job 7885154: 735 pass / 24 triaged / 1 ship-listed known-fail| — |
 | `git status` clean | PENDING — live workstreams hold uncommitted edits | release_check.sh reports the paths |
 
 ## Remainder and parked decisions
