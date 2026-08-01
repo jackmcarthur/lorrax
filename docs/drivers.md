@@ -116,6 +116,7 @@ Invoke: `python -m gw.gw_jax -i gw.in` under the certified Frontera CLX launch b
 | `sigma_omega_layout` | replicated | Σ_c(ω,k,m,n) cube: `sharded` keeps (m,n) mesh-tiled end-to-end; refuses at resolve time for self_consistent, σ window not dividing both mesh axes, or h5py_allgather at P>1 |
 
 FFI gates are env vars, not deck keys: `LORRAX_FFT_FFI` (MKL/cuFFT flat-k FFT backend), `LORRAX_FFT_FFI_FUSED` (fused IFFT·(G·W)·FFT τ kernel), `LORRAX_BANDS_GEMM_FFI` — grammar 0/off/false/no, 1/on/true/yes, auto; explicit `on` refuses if the handler probe fails, `auto` demotes with an announcement (src/ffi/gate.py).
+Large-N_mu / fully distributed operation — every distributed key per stage, per-rank memory scalings, what is still replicated, the auto-thresholds and the certified example jobs: `docs/dev/large_nmu_operation.md`.
 New-user failure modes: restart refusals naming a changed band window or centroid table ("same count, different points") → rerun `restart = false`; bispinor runs refuse on missing `psi_full_y_transverse`/`v_q_bispinor.h5` (Σ^B would silently drop); sanity gates kill runs with non-negative Σ_x diagonals or NaN kin_ion/Σ before eigh; sharded-layout ValueErrors quote the divisibility/backend fix.
 
 ## htransform — `bandstructure.htransform`
