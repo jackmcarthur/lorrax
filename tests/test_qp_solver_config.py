@@ -9,9 +9,8 @@ Covers the auto-resolution contract of ``LorraxConfig.qp_solver``
 3. Legacy ``sigma_at_dft_energies = true`` → ``ONE_SHOT_DFT`` (the orphan
    flag's intended meaning IS the default; deprecated, honored).
 4. Explicit ``qp_solver`` overrides the legacy flags.
-5. Validation: ``fixed_point`` × static mode → error;
-   ``fixed_point`` / ``self_consistent`` × dynamic × ``kij_stream`` → error
-   (previously that pair silently degraded the eigh outputs to static Σ).
+5. Validation: ``fixed_point`` × static mode → error; the removed
+   ``sigma_omega_accumulation = kij_stream`` spelling → parse-time error.
 6. ``SCConfig``: sc_* input keys parsed; ``LORRAX_SC_*`` envs honored as
    deprecated overrides; knob validation.
 
@@ -90,33 +89,26 @@ def test_fixed_point_static_mode_rejected(tmp_path):
         cfg.qp_solver
 
 
-@pytest.mark.parametrize("solver", ["fixed_point", "self_consistent"])
-def test_kij_stream_dynamic_rejected(tmp_path, solver):
-    cfg = _config(
-        tmp_path,
-        f"compute_mode = gn_ppm\nqp_solver = {solver}\n"
-        "sigma_omega_accumulation = kij_stream\n")
-    with pytest.raises(ValueError, match="kij_stream"):
-        cfg.qp_solver
+def test_kij_stream_refused_at_parse(tmp_path):
+    # kij_stream was REMOVED (2026-07-31).  A removed VALUE of a known
+    # key must refuse at parse with the removal named — never silently
+    # reroute an old deck (announce-or-refuse).
+    with pytest.raises(ValueError, match="REMOVED"):
+        _config(
+            tmp_path,
+            "compute_mode = gn_ppm\n"
+            "sigma_omega_accumulation = kij_stream\n")
 
 
-def test_kij_stream_one_shot_dft_ok(tmp_path):
-    # one_shot_dft × streamed is fine: the at-DFT diag comes from the h5.
-    cfg = _config(
-        tmp_path,
-        "compute_mode = gn_ppm\nqp_solver = one_shot_dft\n"
-        "sigma_omega_accumulation = kij_stream\n")
-    assert cfg.qp_solver is QPSolver.ONE_SHOT_DFT
-
-
-def test_kij_stream_static_self_consistent_ok(tmp_path):
-    # The accumulation knob is never read in static modes; SC-COHSEX
-    # must not be rejected on account of it.
-    cfg = _config(
-        tmp_path,
-        "compute_mode = cohsex\nqp_solver = self_consistent\n"
-        "sigma_omega_accumulation = kij_stream\n")
-    assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
+def test_kij_stream_refused_even_in_static_modes(tmp_path):
+    # The removed value refuses regardless of compute_mode — a removed
+    # spelling must not survive in decks just because the knob would
+    # not have been read.
+    with pytest.raises(ValueError, match="REMOVED"):
+        _config(
+            tmp_path,
+            "compute_mode = cohsex\nqp_solver = self_consistent\n"
+            "sigma_omega_accumulation = kij_stream\n")
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +156,8 @@ def test_sc_bad_accelerator_rejected(tmp_path):
 
 # ---------------------------------------------------------------------------
 # Distributed-linalg axes: distributed_cholesky / distributed_lu
-# (portable backend names; legacy cusolvermp_charge/cusolvermp_lu aliases)
+# (portable backend names; the legacy cusolvermp_charge/cusolvermp_lu
+# aliases were REMOVED 2026-07-31 — unknown deck keys are ignored)
 #
 # The parse outcome is JAX-backend-dependent (explicit cusolvermp REFUSES
 # on a CPU backend — doctrine 3, audit fix/zq 2026-07-28; 'auto' LU
@@ -203,25 +196,14 @@ def test_distributed_lu_slate_rejected(tmp_path):
         _config(tmp_path, "distributed_lu = slate\n")
 
 
-def test_legacy_cusolvermp_aliases_warn_and_map(tmp_path, monkeypatch):
-    # Non-CPU backend: the mapped 'cusolvermp' survives to the stored
-    # config (on CPU the same deck now refuses — see the CPU cells below).
+def test_removed_legacy_aliases_are_inert(tmp_path, monkeypatch):
+    # cusolvermp_charge / cusolvermp_lu were REMOVED (2026-07-31): they
+    # are unknown keys now and must neither warn nor steer the portable
+    # keys (the pre-removal alias honored 'on' → cusolvermp here).
     _pin_backend(monkeypatch, "gpu")
-    with pytest.warns(DeprecationWarning, match="cusolvermp_charge"):
-        cfg = _config(tmp_path, "cusolvermp_charge = on\n")
-    assert cfg.backend.distributed_cholesky == "cusolvermp"
-    with pytest.warns(DeprecationWarning, match="cusolvermp_lu"):
-        cfg = _config(tmp_path, "cusolvermp_lu = off\n", name="cohsex_qp2.in")
-    assert cfg.backend.distributed_lu == "off"
-
-
-def test_explicit_new_key_beats_legacy_alias(tmp_path, monkeypatch):
-    _pin_backend(monkeypatch, "gpu")
-    with pytest.warns(DeprecationWarning):
-        cfg = _config(
-            tmp_path,
-            "distributed_cholesky = off\ncusolvermp_charge = on\n")
-    assert cfg.backend.distributed_cholesky == "off"
+    cfg = _config(tmp_path, "cusolvermp_charge = on\ncusolvermp_lu = off\n")
+    assert cfg.backend.distributed_cholesky == "auto"
+    assert cfg.backend.distributed_lu == "auto"
 
 
 def test_distributed_cholesky_invalid_value_raises(tmp_path):
@@ -238,15 +220,6 @@ def test_explicit_cusolvermp_on_cpu_refuses(tmp_path, monkeypatch, key):
     _pin_backend(monkeypatch, "cpu")
     with pytest.raises(ValueError, match="CUDA-only"):
         _config(tmp_path, f"{key} = cusolvermp\n")
-
-
-def test_legacy_alias_cusolvermp_on_cpu_refuses(tmp_path, monkeypatch):
-    # The legacy 'on' spelling maps to cusolvermp and must hit the SAME
-    # refusal on CPU — the alias is not a loophole.
-    _pin_backend(monkeypatch, "cpu")
-    with pytest.warns(DeprecationWarning, match="cusolvermp_charge"):
-        with pytest.raises(ValueError, match="CUDA-only"):
-            _config(tmp_path, "cusolvermp_charge = on\n")
 
 
 def test_auto_on_cpu_chol_passes_lu_demotes_announced(tmp_path, monkeypatch):

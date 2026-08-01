@@ -29,7 +29,6 @@ from .tagged_arrays import (
     write_head_scalars_to_h5,
     read_restart_state_from_h5,
     load_restart_state_from_h5,
-    save_restart_state_per_proc,
 )
 from .sigma_output import (
     write_sigma_to_file,
@@ -37,7 +36,6 @@ from .sigma_output import (
     write_sigma_omega_h5,
     write_chunked_complex_dataset_h5,
     write_sigma_freq_debug_table,
-    copy_sigma_kij_h5_to_omega_h5,
 )
 from .qp_wfn import write_qp_rotations_h5
 from .kin_ion import (

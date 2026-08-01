@@ -257,7 +257,7 @@ def main(argv=None):
 	band_slices = BandSlices.from_band_edges(*meta.band_edges)
 
 	# ---- sigma_omega_layout=sharded: resolve-time geometry/backend gate ----
-	# The config-level axis checks (self_consistent, kij_stream) already ran
+	# The config-level axis checks (self_consistent) already ran
 	# in ``config.qp_solver``; the two conditions below need the mesh and the
 	# σ window, known only here.  Refusing NOW costs seconds; refusing at the
 	# Σ stage would waste the whole ζ fit (pattern #6: the resolve-time check

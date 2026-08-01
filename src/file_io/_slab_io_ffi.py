@@ -27,8 +27,6 @@ from __future__ import annotations
 
 import functools
 import os
-import shutil
-import subprocess
 from typing import Sequence
 
 import jax
@@ -48,8 +46,8 @@ def _rank0() -> bool:
 # copy whose whole body was ``try: sync_global_devices(tag); except
 # Exception: pass`` — seven lines below an import of the very module that
 # owns the correct one.  The swallow is the defect: every use of it here
-# guards a WRITE ordering (the inode replacement before the Lustre
-# prestripe hints, the prestripe before the collective open, the rank-0
+# guards a WRITE ordering (the inode replacement before the collective
+# open, the rank-0
 # deferred-attr write before close), so a barrier that silently did
 # nothing would let a rank read a file whose stripe layout or metadata
 # the writer has not finished changing — a data defect that reports rc=0.
@@ -91,9 +89,10 @@ def _replace_inode_for_write(path: str) -> None:
     ``H5Fcreate(H5F_ACC_TRUNC)`` are all no-ops against an existing
     inode, so a rerun over an existing 1-stripe file keeps 1 stripe
     forever (measured: job 7876423 funnelled 13.3 GB of ``V_qmunu``
-    through a single OST).  The only unlink used to live inside
-    :func:`_lustre_prestripe` AFTER its lfs-missing early return, i.e.
-    it never ran in the production apptainer image (audit 2026-07-28).
+    through a single OST).  The only unlink used to live inside the
+    deleted ``lfs setstripe`` prestripe helper AFTER its lfs-missing
+    early return, i.e. it never ran in the production apptainer image
+    (audit 2026-07-28).
 
     ``os.path.lexists`` (not ``exists``) so a dangling symlink is also
     replaced; a live symlink is announced before removal because the
@@ -176,72 +175,15 @@ def _shard_read_plan(
     return local_shape, dst, disk
 
 
-_PRESTRIPE_WARNED = False
-
-
-def _lustre_prestripe(path: str, stripe_count: int = 16,
-                      stripe_size: str = "4M") -> None:
-    """Pre-create ``path`` with an explicit Lustre stripe layout.
-
-    Must be called on rank 0 only, BEFORE ``open_file``.  On Lustre,
-    the MPI-IO hints ``striping_factor`` / ``striping_unit`` passed via
-    ``H5Pset_fapl_mpio`` are frequently ignored by Cray MPICH when the
-    containing directory has a fixed stripe (default 1×1 MiB on
-    Perlmutter's ``pscratch``) — the file inherits the directory
-    layout and the hint is silently dropped.  Pre-striping the file
-    with ``lfs setstripe`` forces the desired layout; HDF5's
-    ``H5Fcreate`` with ``H5F_ACC_TRUNC`` then truncates it in place and
-    the stripe metadata survives.
-
-    Measured on Si 10³ zeta_q.h5 write: with default 1×1 MiB stripe,
-    per-write effective bandwidth was ~32 MB/s/rank (64 GB total in
-    515 s).  With 16×4 MiB stripe we expect ~500 MB/s/rank on
-    Perlmutter's HDD OSTs.
-
-    Best-effort: if ``lfs`` isn't on PATH or striping fails (e.g.,
-    non-Lustre filesystem), this is a no-op.
-
-    **It IS a no-op on Frontera.**  Every production run executes inside
-    the apptainer image, which does not ship ``lfs`` (nor libraries for
-    it), so ``shutil.which`` returns None and this function has never
-    once set a stripe here — MEASURED on job 7876423's output:
-    ``zeta_q.h5`` and ``isdf_tensors_2406.h5`` both came back
-    ``lmm_stripe_count: 1``.  The no-op used to be silent, which is why
-    it survived; it now says so once.  The layout is instead requested
-    through MPI-IO's ``striping_factor``/``striping_unit`` hints, which
-    ROMIO applies via ``llapi`` with no binary on PATH
-    (``_slab_io_mpi_host._mpi_io_hints``; ``ffi/cpp/phdf5/context.cc``).
-
-    The ``mode='w'`` inode replace no longer depends on this function:
-    :func:`_replace_inode_for_write` unlinks unconditionally before
-    either PHDF5 writer opens (audit 2026-07-28 — the ``os.remove``
-    below sat behind the lfs early-return above and never ran in the
-    container), so on the lfs-available path the remove below merely
-    re-runs harmlessly against an already-removed file.
-    """
-    if shutil.which("lfs") is None:
-        global _PRESTRIPE_WARNED
-        if not _PRESTRIPE_WARNED and _rank0():
-            _PRESTRIPE_WARNED = True
-            print("  [SlabIO] `lfs` not on PATH (container): lfs prestripe "
-                  "SKIPPED; Lustre layout comes from the MPI-IO "
-                  "striping_factor/striping_unit hints instead.", flush=True)
-        return
-    try:
-        # Remove any existing file so lfs can set the stripe.  Safe for
-        # mode='w' callers since that mode is about to truncate anyway.
-        if os.path.exists(path):
-            os.remove(path)
-        subprocess.run(
-            ["lfs", "setstripe", "-c", str(stripe_count),
-             "-S", stripe_size, path],
-            check=False, capture_output=True, timeout=10,
-        )
-    except Exception:
-        # Best-effort; fall through to plain H5Fcreate.  A debug
-        # message would be nice here but we don't want to pollute
-        # stdout on non-Lustre targets.
-        pass
+# The ``lfs setstripe`` prestripe helper that used to live here was
+# DELETED (owner-approved, 2026-07-31): the production apptainer image
+# does not ship ``lfs``, so it had never once set a stripe (measured,
+# job 7876423 — both output files came back ``lmm_stripe_count: 1``).
+# The Lustre layout is requested through MPI-IO's ``striping_factor``/
+# ``striping_unit`` hints instead, which ROMIO applies via ``llapi``
+# with no binary on PATH (``_slab_io_mpi_host._mpi_io_hints``;
+# ``ffi/cpp/phdf5/context.cc``).  The ``mode='w'`` inode replace is
+# :func:`_replace_inode_for_write`, unconditional of ``lfs``.
 
 # Lazy imports happen inside the class methods; module-level imports
 # of ffi.phdf5 would break users who don't build the FFI .so.
@@ -528,20 +470,13 @@ class _FfiBackend:
         # shared with _MpiHostBackend — see _replace_inode_for_write):
         # Lustre layout is fixed at inode create, so H5Fcreate(TRUNC)
         # over an old file silently keeps its stripe count and the
-        # MPI_Info striping hints no-op.  Unconditional of `lfs`: the
-        # old unlink sat behind _lustre_prestripe's lfs-missing early
-        # return and never ran in the production container (audit
+        # MPI_Info striping hints no-op.  Unconditional of `lfs` (audit
         # 2026-07-28, job 7876423 1-stripe evidence).  'a'/'r' keep the
         # existing inode and its layout by design.  Barrier after the
-        # rank-0 prestripe so all ranks see the inode state before
+        # rank-0 unlink so all ranks see the inode state before
         # H5Fcreate.
         if mode == "w":
             _replace_inode_for_write(path)
-            if _rank0():
-                _lustre_prestripe(
-                    path, stripe_count=_stripe_count(),
-                    stripe_size=os.environ.get(
-                        "LORRAX_PHDF5_STRIPE_SIZE_FS", "4M"))
             _barrier("slab_io_ffi_prestripe")
         self.fh: int = self._open_file(path, mesh=mesh, mode=mode)
         self._ds_ids: dict[str, int] = {}

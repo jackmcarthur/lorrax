@@ -15,7 +15,6 @@ Copies are mandatory: the driver mutates the restart file in place
 * μ-pad flip, gnppm        (test_mu_pad_invariance.py::gnppm_pad12)
 * μ-pad flip, bispinor     (test_mu_pad_invariance.py::bispinor_pad4;
                             fresh runs — bispinor restart unsupported)
-* kij ↔ kij_stream         (test_sigma_ppm_gates.py::test_g1_*)
 * SC-iter-1 ≡ one-shot     (test_sc_oneshot_equivalence.py)
 * fixed-point rotations    (test_gw_jax_regression.py::
                             test_gnppm_fixed_point_reproduces_frozen_qp_rotations)
@@ -176,38 +175,6 @@ def test_mu_pad_flip_invariance_bispinor(bispinor_session, tmp_path):
         assert a == b, (
             f"bispinor pad-extent flip changed {out} at FIXED P — a "
             f"computation still runs on the padded μ extent.")
-
-
-# ===========================================================================
-#  kij ↔ kij_stream accumulator parity (Bug-B class: the stream path once
-#  dropped the analytic q→0 head — a 4.13 eV band-diagonal RED diff)
-# ===========================================================================
-
-@pytest.mark.regression
-def test_kij_stream_parity(gnppm_restart_baseline, tmp_path):
-    """Both accumulation modes must write the same sigma_c_kij_ev.
-
-    atol=5e-12: the two modes sum windows in different associations, so
-    the ~1.5e4 eV off-diagonals can differ in the last bit (measured
-    4.5e-13 on this fixture); a dropped head is 4.13 eV.
-    """
-    import h5py
-
-    base = gnppm_restart_baseline
-    stream_dir, _ = _run_restart_variant(
-        tmp_path, base.session, "kij_stream",
-        extra_mutations={
-            "sigma_omega_h5_file = sigma_mnk.h5":
-                "sigma_omega_accumulation = kij_stream\n"
-                "sigma_kij_h5_file = sigma_kij_stream.h5\n"
-                "sigma_omega_h5_file = sigma_mnk.h5",
-        })
-    with h5py.File(base.run_dir / "sigma_mnk.h5", "r") as f:
-        sig_host = np.asarray(f["sigma_c_kij_ev"], dtype=np.complex128)
-    with h5py.File(stream_dir / "sigma_mnk.h5", "r") as f:
-        sig_stream = np.asarray(f["sigma_c_kij_ev"], dtype=np.complex128)
-    assert sig_host.shape == sig_stream.shape
-    np.testing.assert_allclose(sig_stream, sig_host, rtol=0.0, atol=5e-12)
 
 
 # ===========================================================================

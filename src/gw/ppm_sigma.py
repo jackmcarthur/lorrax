@@ -36,7 +36,7 @@ alongside it (acyclic: driver → stages → engine):
                          Σc(−ω) decomposition, the minimax window builders).
     ppm_tau_kernel.py    the device τ-kernel unit + AOT precompile + caches.
     ppm_accumulators.py  the single numpy ω-projector + one async-D2H
-                         accumulator with a memory-tile / streamed-h5 sink.
+                         accumulator with the memory-tile sink.
 
 This driver retains the physics prologue (PPM fit + physics-state prep) plus the
 τ-loop orchestration that binds window × kernel × accumulator, and reads as the
@@ -54,7 +54,6 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
-import h5py
 
 from common import jax_profile, timing
 from common.units import RYD_TO_EV
@@ -75,12 +74,9 @@ from .ppm_windows import (
 )
 from .ppm_tau_kernel import _get_sigma_tau_kernel
 from .ppm_accumulators import (
-    _AccumMode,
-    _select_accum_mode,
     _SigmaAccumulator,
     _TauAccumulator,
     _MemoryTileSink,
-    _H5Sink,
 )
 
 
@@ -102,13 +98,12 @@ class PPMBuildResult:
 class SigmaOmegaResult:
     omega_ry: np.ndarray
     omega_ev: np.ndarray
-    # (n_omega, nk, nb, nb) or None if streamed.  Layout is carried BY THE
-    # ARRAY'S OWN SHARDING (single source of truth): replicated/uncommitted
-    # under sigma_omega_layout=replicated (historical), or
+    # (n_omega, nk, nb, nb).  Layout is carried BY THE ARRAY'S OWN
+    # SHARDING (single source of truth): replicated/uncommitted under
+    # sigma_omega_layout=replicated (historical), or
     # P(None, None, 'x', 'y') band-tiled under sigma_omega_layout=sharded —
     # consumers branch via qsgw_utils.is_band_sharded_sigma_omega.
-    sigma_c_kij: jax.Array | None
-    sigma_kij_h5_path: str | None = None
+    sigma_c_kij: jax.Array
 
 
 class _SigmaBranchTiles(NamedTuple):
@@ -415,10 +410,8 @@ def _integrate_tau_windows_for_branch(
 ) -> None:
     """Walk windows; for each, dispatch ``minimax_tau_integrate_sigma``
     with closures that bind this window's (psi, masks, E_ref, kernel) and
-    feed the window's σ^τ into the accumulator.  The result lands either
-    in per-rank host tiles or streamed to H5 — that decision is the
-    accumulator's sink, not this loop's.  See
-    _TauAccumulator + _MemoryTileSink / _H5Sink.
+    feed the window's σ^τ into the accumulator.  The result lands in
+    per-rank host tiles — see _TauAccumulator + _MemoryTileSink.
 
     Channel-plan dispatch (owner ruling 2026-07-28; made the default and
     only path by owner order the same day): Laplace windows
@@ -587,7 +580,6 @@ def strip_sigma_window(sigma_kij, nb_real: int):
 def _run_sigma_branch(
     *,
     omega_nonneg_ry: np.ndarray,
-    omega_global_idx: np.ndarray,
     E_A: jax.Array,
     base_mask_A: jax.Array,
     B_q: jax.Array,
@@ -607,7 +599,6 @@ def _run_sigma_branch(
     log_tag: str = "",
     print_fn=print,
     omega_batch_size: int = 4,
-    stream_writer: Callable[[np.ndarray, jax.Array], None] | None = None,
     use_shipped_minimax_tables: bool = True,
 ) -> tuple['_SigmaBranchTiles | None', list[_SigmaWindow]]:
     """Orchestrator for one branch (cond or val × pos or neg ω half).
@@ -616,12 +607,10 @@ def _run_sigma_branch(
         windows = _build_windows_for_branch(...)          # host
         acc     = _integrate_tau_windows_for_branch(...)  # device
 
-    Returns (memory-tile path) a :class:`_SigmaBranchTiles` of per-rank
-    HOST tiles still carrying the mesh pad — the driver sums branches on
-    host and performs the single end-of-stage gather + strip (comms fix
-    2026-07-28, see _SigmaBranchTiles).  Streamed path and empty branches
-    return ``None`` (the h5 RMWs, when streaming, already happened at the
-    window boundaries).
+    Returns a :class:`_SigmaBranchTiles` of per-rank HOST tiles still
+    carrying the mesh pad — the driver sums branches on host and performs
+    the single end-of-stage gather + strip (comms fix 2026-07-28, see
+    _SigmaBranchTiles).  Empty branches return ``None``.
     """
     omega_nonneg_ry = np.asarray(omega_nonneg_ry, dtype=np.float64)
     n_omega = int(omega_nonneg_ry.shape[0])
@@ -674,36 +663,15 @@ def _run_sigma_branch(
         merged_x=True,
     )
 
-    # One async-D2H accumulator; the sink decides where a finished window goes.
-    # Both sinks consume the SAME per-shard host tiles produced by the single
-    # numpy projector (copy_to_host_async + a short deque overlap GPU-τ_{k+lag}
-    # with the numpy-τ_k accumulate).
-    if stream_writer is None:
-        # Σ_c(ω,k,m,n) lives as per-rank numpy tiles matching σ(τ)'s
-        # (m_X, n_Y) sharding — the full (n_ω,n_k,n_b,n_b) buffer never
-        # exists on any GPU until the final device assembly at finalize().
-        sink: _MemoryTileSink | _H5Sink = _MemoryTileSink(
-            shape=(n_omega, nk_proj, m_pad, n_pad),
-            sharding=NamedSharding(mesh_xy, P(None, None, 'x', 'y')),
-        )
-    else:
-        # Single-process streamed: assemble each window on host and RMW it to
-        # the h5 dataset ω-batched (n_windows RMW, not n_τ).
-        assert m_pad == nb_proj and n_pad == nb_proj, (
-            f"streamed sigma sink cannot carry a padded QP window "
-            f"(m_pad={m_pad}, n_pad={n_pad}, nb_proj={nb_proj}); KIJ_STREAM "
-            f"is single-process only, where the mesh is 1x1 and no pad "
-            f"exists.")
-        sink = _H5Sink(
-            writer=stream_writer,
-            omega_global_idx=omega_global_idx,
-            omega_batch_size=int(max(1, omega_batch_size)),
-            # KIJ_STREAM is single-process only (ppm_accumulators
-            # _select_accum_mode: n_proc != 1 -> KIJ_HOST), and a 1x1 mesh
-            # cannot pad -- so the real and padded extents coincide here.
-            # Assert it rather than rely on the coincidence.
-            full_spatial_shape=(nk_proj, nb_proj, nb_proj),
-        )
+    # One async-D2H accumulator over the memory-tile sink: Σ_c(ω,k,m,n)
+    # lives as per-rank numpy tiles matching σ(τ)'s (m_X, n_Y) sharding —
+    # the full (n_ω,n_k,n_b,n_b) buffer never exists on any GPU until the
+    # final device assembly at finalize().  (copy_to_host_async + a short
+    # deque overlap GPU-τ_{k+lag} with the numpy-τ_k accumulate.)
+    sink = _MemoryTileSink(
+        shape=(n_omega, nk_proj, m_pad, n_pad),
+        sharding=NamedSharding(mesh_xy, P(None, None, 'x', 'y')),
+    )
     accumulator: _SigmaAccumulator = _TauAccumulator(
         omega_vec=omega_vec, sink=sink)
 
@@ -721,10 +689,6 @@ def _run_sigma_branch(
     # the branch elapsed (deque drain + device re-upload + full-slab
     # process_allgather).  On the memory-tile path the tail is now just the
     # host-tile handoff — the row exists to PROVE it stays near zero.
-    if stream_writer is not None:
-        with timing.section("sigma.finalize"):
-            accumulator.finalize()   # _H5Sink: windows already RMW-written; returns None
-        return None, windows
     with timing.section("sigma.finalize"):
         tiles, tile_index, tile_devices = accumulator.finalize_host_tiles()
     # The mesh pad block stays attached here; the driver strips it ONCE
@@ -819,7 +783,6 @@ def compute_sigma_c_ppm_omega_grid(
     ppm_cfg: PPMConfig,
     quad: MinimaxConfig,
     omega_grid_ry: np.ndarray,
-    sigma_kij_h5_path: str | None,
     print_fn=print,
 ) -> SigmaOmegaResult:
     """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration.
@@ -827,8 +790,8 @@ def compute_sigma_c_ppm_omega_grid(
     Config seam (WS2): scalar knobs are read by direct attribute access
     off the validated frozen ``ppm_cfg`` (no ``getattr(..., default)`` —
     a stale/typo'd name must raise, not silently default); the derived
-    ω-grid and the input_dir-resolved h5 path arrive as explicit data
-    arguments.  ``ppm_cfg``/``quad`` never travel below this driver.
+    ω-grid arrives as an explicit data argument.  ``ppm_cfg``/``quad``
+    never travel below this driver.
     """
 
     s = wfns.slices
@@ -870,7 +833,6 @@ def compute_sigma_c_ppm_omega_grid(
             f"HGL crossing quadrature ill-conditioned)")
         regularization_width_ry = xi_floor
     omega_batch_size = int(ppm_cfg.omega_batch_size)
-    omega_accumulation = ppm_cfg.omega_accumulation
     fermi_reference = ppm_cfg.fermi_reference
     invalid_mode = ppm_cfg.invalid_mode
 
@@ -955,9 +917,8 @@ def compute_sigma_c_ppm_omega_grid(
 
     # ppm_invalid_mode='static_limit': ω-independent static-COHSEX term for
     # the invalid poles (their dynamical poles were dropped via B_mask above).
-    # Computed once here, added to Σ_c at every ω on whichever accumulation
-    # path is active (host tensor add / streamed h5 RMW — same values, so
-    # kij↔kij_stream parity is preserved).
+    # Computed once here, added to Σ_c at every ω (host tensor add, or
+    # tile-local on the sharded layout — same values on both).
     sigma_static_host = None
     if invalid_static and n_invalid:
         sigma_static_host = _compute_invalid_static_sigma(
@@ -968,18 +929,12 @@ def compute_sigma_c_ppm_omega_grid(
             f"(diag max {float(np.max(np.abs(np.diagonal(sigma_static_host, axis1=1, axis2=2)))) * RYD_TO_EV:.4f} eV)"
         )
 
-    # Decide accumulation mode + allocate any backing storage.
+    # Host-tile accumulation is the only mode (``kij_stream`` REMOVED
+    # 2026-07-31; ``omega_accumulation`` is auto|kij, both host tiles).
     nk_proj = int(psi_proj_xr.shape[0])
     nb_proj = int(psi_proj_xr.shape[1])
     n_omega = int(omega_req.size)
     kij_bytes = float(n_omega * nk_proj * nb_proj * nb_proj * 16)
-    accum_mode = _select_accum_mode(
-        omega_accumulation,
-        sigma_kij_h5_path=sigma_kij_h5_path,
-        kij_bytes=kij_bytes,
-        n_proc=int(jax.process_count()),
-    )
-    streaming = (accum_mode == _AccumMode.KIJ_STREAM)
 
     # Σ_c(ω) end-of-stage layout (wk_REL ω-cube sharding).  "sharded" keeps
     # the per-rank (m_X, n_Y) host tiles where the stacked psum_scatter left
@@ -989,17 +944,7 @@ def compute_sigma_c_ppm_omega_grid(
     # 2751 MB/rank at nb=512) is elided, and every consumer reads the tiles
     # at their native sharding.  Movement-only: outputs are bit-identical
     # (A/B gated).  Announced here per doctrine 3.
-    sharded_layout = (str(ppm_cfg.omega_layout) == "sharded") and not streaming
-    if str(ppm_cfg.omega_layout) == "sharded" and streaming:
-        # Reachable only via omega_accumulation=auto resolving to KIJ_STREAM
-        # (single-process + stream path set); explicit kij_stream × sharded
-        # is refused at config parse.  The streamed path never materializes
-        # the cube, so the layout flag is inert — say so rather than
-        # silently ignore it.
-        print_fn(
-            "  Σc layout: sigma_omega_layout=sharded is INERT on the "
-            "streamed (kij_stream) accumulation path — no ω-cube is ever "
-            "materialized there.")
+    sharded_layout = (str(ppm_cfg.omega_layout) == "sharded")
     if sharded_layout:
         p_x = int(mesh_xy.shape['x'])
         p_y = int(mesh_xy.shape['y'])
@@ -1021,244 +966,187 @@ def compute_sigma_c_ppm_omega_grid(
             "(sigma_omega_layout=sharded).")
 
     sigma_kij_host = (
-        None if (streaming or sharded_layout)
+        None if sharded_layout
         else np.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=np.complex128)
     )
 
-    # Single-process stream-mode file setup.  The accumulator pattern
-    # itself is unchanged from pre-SlabIO (rank-0 h5py); the final
-    # sigma_mnk.h5 copy-over now lives in
-    # ``file_io.copy_sigma_kij_h5_to_omega_h5`` (called by gw_jax.main).
-    kij_stream_path = None
-    h5_kij = None
-    dset_sigma_kij = None
-    if streaming and jax.process_index() == 0:
-        kij_stream_path = str(sigma_kij_h5_path)
-        kij_dir = os.path.dirname(os.path.abspath(kij_stream_path))
-        if kij_dir:
-            os.makedirs(kij_dir, exist_ok=True)
-        k_chunks = max(1, min(4, nk_proj))
-        o_chunks = max(1, min(omega_batch_size, n_omega))
-        h5_kij = h5py.File(kij_stream_path, "w")
-        h5_kij.create_dataset("omega_ry", data=np.asarray(omega_req, dtype=np.float64))
-        h5_kij.create_dataset("omega_ev", data=np.asarray(omega_req * RYD_TO_EV, dtype=np.float64))
-        dset_sigma_kij = h5_kij.create_dataset(
-            "sigma_c_kij_ry",
-            shape=(n_omega, nk_proj, nb_proj, nb_proj),
-            dtype=np.complex128,
-            chunks=(o_chunks, k_chunks, nb_proj, nb_proj),
-            fillvalue=0j,  # h5py>=3.13 rejects a float fill on a complex dtype
+    common_branch_kwargs = dict(
+        B_q=B_corr,
+        Omega_q=Omega_abs,
+        base_mask_B=B_mask,
+        regularization_width_ry=regularization_width_ry,
+        edge_factor=edge_factor,
+        target_error=target_error,
+        max_nodes=max_nodes,
+        crossing_eps_q=crossing_eps_q,
+        crossing_max_nodes=crossing_max_nodes,
+        wfns=wfns,
+        mesh_xy=mesh_xy,
+        meta=meta,
+        print_fn=print_fn,
+        omega_batch_size=omega_batch_size,
+        use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
+    )
+
+    # Enumerate the 4 branches (ω sign × cond/val), skipping empty ω halves.
+    # See _iter_branches for how each branch's physical identity fixes its
+    # denominator/prefactor signs (no ±1 sign fields are carried).
+    branches = _iter_branches(
+        omega_pos=omega_pos, idx_pos=idx_pos,
+        omega_neg_abs=omega_neg_abs, idx_neg=idx_neg,
+        E_cond=E_cond, H_val=H_val,
+        cond_mask=cond_mask, val_mask=val_mask,
+    )
+
+    # Run each branch and fold its Σc tiles into per-rank HOST tile
+    # accumulators at the branch's global ω indices.  cond and val of a
+    # given ω-half share those indices, so the second branch's `+=` sums
+    # cond+val there — same values, same traversal order (cond before
+    # val), same pairwise-add order per element as the old per-branch
+    # allgather + host fold, so the result is bit-identical.
+    #
+    # Comms fix — scorecard AK.9's second named lever, the P-independent
+    # per-branch `_to_host_np(sigma_kij, tiled=False)` full-slab gather
+    # onto EVERY rank (≈237 MB/branch at 606c/b160, grows as nb²).
+    # (2026-07-28; evidence: AQ 4962c/P=64 run run_AQ_c4962_p64_mpi;
+    # measured at that shape by job 7878038: finalize+gather now
+    # 0.24 s total vs ~1-4 s before — small at nb=128; the target is
+    # the nb² growth term.)  Σ_c already lives as per-rank host numpy tiles in
+    # exactly the (m_X, n_Y) sharding the reduce-scatter projector
+    # emitted; the old tail re-uploaded them to device and
+    # process_allgather'd the FULL (n_ω_branch, nk, nb, nb) slab to all
+    # ranks once PER BRANCH.  Now the tiles stay on host across
+    # branches and ONE gather runs at the end of the stage
+    # ('sigma.host_gather' below).  Design-envelope scaling: the moved
+    # object is the QP-band-window slab (n_ω · nk · nb_σ² · 16 B),
+    # independent of N_μ; per-rank tiles shrink as 1/P, and the 4→1
+    # replication cut is flat in n_atoms / nk / N_μ / P on CPU and GPU
+    # backends — nothing here is tuned to the rehearsal shape.
+    tile_acc = None     # per-shard host accumulators, full ω extent
+    tile_meta = None    # first branch's _SigmaBranchTiles (layout metadata)
+    sigma_kij_sharded = None  # sharded-layout result (set in tile_finalize)
+    for br in branches:
+        branch_tiles, _ = _run_sigma_branch(
+            omega_nonneg_ry=br.omega_abs, omega_global_idx=br.omega_idx,
+            E_A=br.E_A, base_mask_A=br.base_mask_A,
+            space=br.space, neg_omega_half=br.neg_omega_half,
+            log_tag=br.tag,
+            **common_branch_kwargs,
         )
-        h5_kij.attrs["layout"] = "omega,k,i,j"
+        if branch_tiles is None:
+            continue
+        idx = np.asarray(br.omega_idx, dtype=np.int64)
+        if tile_acc is None:
+            tile_meta = branch_tiles
+            tile_acc = [
+                np.zeros((n_omega,) + t.shape[1:], dtype=np.complex128)
+                for t in branch_tiles.tiles]
+        else:
+            # All branches run the same ψ window on the same mesh, so
+            # their tile layouts must agree — a mismatch here is a bug,
+            # not a configuration (QUALITY_PATTERNS #7: guard it).
+            assert (branch_tiles.tile_index == tile_meta.tile_index
+                    and branch_tiles.spatial_padded == tile_meta.spatial_padded), (
+                f"sigma branch tile layout drifted across branches: "
+                f"{branch_tiles.spatial_padded} vs {tile_meta.spatial_padded}")
+        for d, t in enumerate(branch_tiles.tiles):
+            tile_acc[d][idx] += t
 
-    try:
-        def _accumulate_kij_stream(global_idx: np.ndarray, contrib_batch: np.ndarray) -> None:
-            # Called by _H5Sink once per (window × ω-batch) with an already-host
-            # numpy buffer (the assembled window slab), read-modify-write add.
-            if dset_sigma_kij is None:
-                return
-            idx = np.asarray(global_idx, dtype=np.int64)
-            buf = dset_sigma_kij[idx]
-            buf = buf + np.asarray(contrib_batch, dtype=np.complex128)
-            dset_sigma_kij[idx] = buf
+    # Single end-of-stage gather: assemble the global padded Σ_c from the
+    # per-rank host tiles and reconstruct it on every rank's host — ONCE,
+    # replacing the old 4 per-branch device round trips + allgathers.
+    # (Every rank needs the full tensor: downstream head injection /
+    # diag(Σ_c) interpolation / sigma_mnk write all read the replicated
+    # host copy, and the final jnp.asarray(sigma_kij_host) must agree
+    # across processes.)  Skipped entirely on the sharded layout, whose
+    # tail is the 'sigma.tile_finalize' block below.
+    if not sharded_layout and tile_acc is not None:
+        assert tile_meta.nb_real == nb_proj
+        with timing.section("sigma.host_gather"):
+            padded_shape = (n_omega,) + tuple(
+                int(s) for s in tile_meta.spatial_padded)
+            if int(jax.process_count()) == 1:
+                # Every shard is addressable (single process, any device
+                # count — no shard-0 assumption, Bug C): pure host
+                # assembly, no device hop at all.
+                full_pad = np.zeros(padded_shape, dtype=np.complex128)
+                for t, ix in zip(tile_acc, tile_meta.tile_index):
+                    full_pad[ix] = t
+            else:
+                arrays = [jax.device_put(t, d)
+                          for t, d in zip(tile_acc, tile_meta.devices)]
+                gathered = jax.make_array_from_single_device_arrays(
+                    padded_shape, tile_meta.sharding, arrays)
+                full_pad = _to_host_np(
+                    gathered, dtype=np.complex128, tiled=True)
+            # Strip the mesh pad block (exactly zero) — the ONE seam
+            # where the padded QP window stops; everything below (host
+            # Σ buffer, eqp write) sees only the real nb_proj extent.
+            sigma_kij_host += strip_sigma_window(full_pad, nb_proj)
 
-        common_branch_kwargs = dict(
-            B_q=B_corr,
-            Omega_q=Omega_abs,
-            base_mask_B=B_mask,
-            regularization_width_ry=regularization_width_ry,
-            edge_factor=edge_factor,
-            target_error=target_error,
-            max_nodes=max_nodes,
-            crossing_eps_q=crossing_eps_q,
-            crossing_max_nodes=crossing_max_nodes,
-            wfns=wfns,
-            mesh_xy=mesh_xy,
-            meta=meta,
-            print_fn=print_fn,
-            omega_batch_size=omega_batch_size,
-            stream_writer=_accumulate_kij_stream if streaming else None,
-            use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
-        )
-
-        # Enumerate the 4 branches (ω sign × cond/val), skipping empty ω halves.
-        # See _iter_branches for how each branch's physical identity fixes its
-        # denominator/prefactor signs (no ±1 sign fields are carried).
-        branches = _iter_branches(
-            omega_pos=omega_pos, idx_pos=idx_pos,
-            omega_neg_abs=omega_neg_abs, idx_neg=idx_neg,
-            E_cond=E_cond, H_val=H_val,
-            cond_mask=cond_mask, val_mask=val_mask,
-        )
-
-        # Run each branch and fold its Σc tiles into per-rank HOST tile
-        # accumulators at the branch's global ω indices.  cond and val of a
-        # given ω-half share those indices, so the second branch's `+=` sums
-        # cond+val there — same values, same traversal order (cond before
-        # val), same pairwise-add order per element as the old per-branch
-        # allgather + host fold, so the result is bit-identical.
-        #
-        # Comms fix — scorecard AK.9's second named lever, the P-independent
-        # per-branch `_to_host_np(sigma_kij, tiled=False)` full-slab gather
-        # onto EVERY rank (≈237 MB/branch at 606c/b160, grows as nb²).
-        # (2026-07-28; evidence: AQ 4962c/P=64 run run_AQ_c4962_p64_mpi;
-        # measured at that shape by job 7878038: finalize+gather now
-        # 0.24 s total vs ~1-4 s before — small at nb=128; the target is
-        # the nb² growth term.)  Σ_c already lives as per-rank host numpy tiles in
-        # exactly the (m_X, n_Y) sharding the reduce-scatter projector
-        # emitted; the old tail re-uploaded them to device and
-        # process_allgather'd the FULL (n_ω_branch, nk, nb, nb) slab to all
-        # ranks once PER BRANCH.  Now the tiles stay on host across
-        # branches and ONE gather runs at the end of the stage
-        # ('sigma.host_gather' below).  Design-envelope scaling: the moved
-        # object is the QP-band-window slab (n_ω · nk · nb_σ² · 16 B),
-        # independent of N_μ; per-rank tiles shrink as 1/P, and the 4→1
-        # replication cut is flat in n_atoms / nk / N_μ / P on CPU and GPU
-        # backends — nothing here is tuned to the rehearsal shape.
-        # Streaming writes straight to the h5 via the branch's _H5Sink; both
-        # cond and val RMW-add into the same dataset, so no host fold is
-        # needed (branch returns None there).
-        tile_acc = None     # per-shard host accumulators, full ω extent
-        tile_meta = None    # first branch's _SigmaBranchTiles (layout metadata)
-        sigma_kij_sharded = None  # sharded-layout result (set in tile_finalize)
-        for br in branches:
-            branch_tiles, _ = _run_sigma_branch(
-                omega_nonneg_ry=br.omega_abs, omega_global_idx=br.omega_idx,
-                E_A=br.E_A, base_mask_A=br.base_mask_A,
-                space=br.space, neg_omega_half=br.neg_omega_half,
-                log_tag=br.tag,
-                **common_branch_kwargs,
-            )
-            if streaming or branch_tiles is None:
-                continue
-            idx = np.asarray(br.omega_idx, dtype=np.int64)
+    # Sharded-layout tail: NO reconstruction collective.  The per-rank
+    # host tiles (already branch-summed at their global ω indices, in
+    # the same element order as the replicated path) get the
+    # static-COHSEX invalid-pole term added RANK-LOCALLY, are placed
+    # back on their owning local devices (device_put of a process-local
+    # buffer — no collective), and are published as ONE
+    # P(None,None,'x','y')-sharded jax.Array on the existing mesh.
+    # Consumers (head injection, diag extraction, QSGW build,
+    # sigma_mnk.h5 SlabIO write) read this array at its native
+    # sharding.  The timing row exists to PROVE the tail stays ~0 s
+    # (it replaces 'sigma.host_gather', which does not run here).
+    if sharded_layout:
+        with timing.section("sigma.tile_finalize"):
+            gshape = (n_omega, nk_proj, nb_proj, nb_proj)
             if tile_acc is None:
-                tile_meta = branch_tiles
-                tile_acc = [
-                    np.zeros((n_omega,) + t.shape[1:], dtype=np.complex128)
-                    for t in branch_tiles.tiles]
+                # No branch produced tiles (all-empty branches): a zero
+                # Σ_c, mirroring the replicated path's untouched zeros
+                # buffer.  Same metadata idiom as
+                # _MemoryTileSink.host_tiles()'s empty path.
+                sharding = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
+                devices = list(sharding.addressable_devices)
+                dmap = sharding.devices_indices_map(gshape)
+                local_shape = sharding.shard_shape(gshape)
+                tile_acc = [np.zeros(local_shape, dtype=np.complex128)
+                            for _ in devices]
+                tile_index = [tuple(dmap[d]) for d in devices]
             else:
-                # All branches run the same ψ window on the same mesh, so
-                # their tile layouts must agree — a mismatch here is a bug,
-                # not a configuration (QUALITY_PATTERNS #7: guard it).
-                assert (branch_tiles.tile_index == tile_meta.tile_index
-                        and branch_tiles.spatial_padded == tile_meta.spatial_padded), (
-                    f"sigma branch tile layout drifted across branches: "
-                    f"{branch_tiles.spatial_padded} vs {tile_meta.spatial_padded}")
-            for d, t in enumerate(branch_tiles.tiles):
-                tile_acc[d][idx] += t
+                assert tile_meta.nb_real == nb_proj
+                # The divisibility refusal above guarantees the mesh pad
+                # resolved to identity — padded extents ARE the real
+                # extents (pattern #7: assert it, don't assume it).
+                assert tuple(int(s) for s in tile_meta.spatial_padded) \
+                    == (nk_proj, nb_proj, nb_proj), (
+                    f"sharded Σ layout saw a padded window "
+                    f"{tile_meta.spatial_padded} despite the "
+                    f"divisibility guard (nb={nb_proj})")
+                sharding = tile_meta.sharding
+                devices = tile_meta.devices
+                tile_index = tile_meta.tile_index
+            # static_limit fold, rank-local — same per-element order as
+            # the replicated path (branch sum first, then the static
+            # term); tile_index[d] is (ω-slice, k-slice, m-slice,
+            # n-slice) into the global cube.
+            if sigma_static_host is not None:
+                for d, ix4 in enumerate(tile_index):
+                    tile_acc[d] += sigma_static_host[tuple(ix4[1:])][None, ...]
+            arrays = [jax.device_put(t, dev)
+                      for t, dev in zip(tile_acc, devices)]
+            sigma_kij_sharded = jax.make_array_from_single_device_arrays(
+                gshape, sharding, arrays)
 
-        # Single end-of-stage gather: assemble the global padded Σ_c from the
-        # per-rank host tiles and reconstruct it on every rank's host — ONCE,
-        # replacing the old 4 per-branch device round trips + allgathers.
-        # (Every rank needs the full tensor: downstream head injection /
-        # diag(Σ_c) interpolation / sigma_mnk write all read the replicated
-        # host copy, and the final jnp.asarray(sigma_kij_host) must agree
-        # across processes.)  Skipped entirely on the sharded layout, whose
-        # tail is the 'sigma.tile_finalize' block below.
-        if not streaming and not sharded_layout and tile_acc is not None:
-            assert tile_meta.nb_real == nb_proj
-            with timing.section("sigma.host_gather"):
-                padded_shape = (n_omega,) + tuple(
-                    int(s) for s in tile_meta.spatial_padded)
-                if int(jax.process_count()) == 1:
-                    # Every shard is addressable (single process, any device
-                    # count — no shard-0 assumption, Bug C): pure host
-                    # assembly, no device hop at all.
-                    full_pad = np.zeros(padded_shape, dtype=np.complex128)
-                    for t, ix in zip(tile_acc, tile_meta.tile_index):
-                        full_pad[ix] = t
-                else:
-                    arrays = [jax.device_put(t, d)
-                              for t, d in zip(tile_acc, tile_meta.devices)]
-                    gathered = jax.make_array_from_single_device_arrays(
-                        padded_shape, tile_meta.sharding, arrays)
-                    full_pad = _to_host_np(
-                        gathered, dtype=np.complex128, tiled=True)
-                # Strip the mesh pad block (exactly zero) — the ONE seam
-                # where the padded QP window stops; everything below (host
-                # Σ buffer, eqp write) sees only the real nb_proj extent.
-                sigma_kij_host += strip_sigma_window(full_pad, nb_proj)
-
-        # Sharded-layout tail: NO reconstruction collective.  The per-rank
-        # host tiles (already branch-summed at their global ω indices, in
-        # the same element order as the replicated path) get the
-        # static-COHSEX invalid-pole term added RANK-LOCALLY, are placed
-        # back on their owning local devices (device_put of a process-local
-        # buffer — no collective), and are published as ONE
-        # P(None,None,'x','y')-sharded jax.Array on the existing mesh.
-        # Consumers (head injection, diag extraction, QSGW build,
-        # sigma_mnk.h5 SlabIO write) read this array at its native
-        # sharding.  The timing row exists to PROVE the tail stays ~0 s
-        # (it replaces 'sigma.host_gather', which does not run here).
-        if sharded_layout:
-            with timing.section("sigma.tile_finalize"):
-                gshape = (n_omega, nk_proj, nb_proj, nb_proj)
-                if tile_acc is None:
-                    # No branch produced tiles (all-empty branches): a zero
-                    # Σ_c, mirroring the replicated path's untouched zeros
-                    # buffer.  Same metadata idiom as
-                    # _MemoryTileSink.host_tiles()'s empty path.
-                    sharding = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
-                    devices = list(sharding.addressable_devices)
-                    dmap = sharding.devices_indices_map(gshape)
-                    local_shape = sharding.shard_shape(gshape)
-                    tile_acc = [np.zeros(local_shape, dtype=np.complex128)
-                                for _ in devices]
-                    tile_index = [tuple(dmap[d]) for d in devices]
-                else:
-                    assert tile_meta.nb_real == nb_proj
-                    # The divisibility refusal above guarantees the mesh pad
-                    # resolved to identity — padded extents ARE the real
-                    # extents (pattern #7: assert it, don't assume it).
-                    assert tuple(int(s) for s in tile_meta.spatial_padded) \
-                        == (nk_proj, nb_proj, nb_proj), (
-                        f"sharded Σ layout saw a padded window "
-                        f"{tile_meta.spatial_padded} despite the "
-                        f"divisibility guard (nb={nb_proj})")
-                    sharding = tile_meta.sharding
-                    devices = tile_meta.devices
-                    tile_index = tile_meta.tile_index
-                # static_limit fold, rank-local — same per-element order as
-                # the replicated path (branch sum first, then the static
-                # term); tile_index[d] is (ω-slice, k-slice, m-slice,
-                # n-slice) into the global cube.
-                if sigma_static_host is not None:
-                    for d, ix4 in enumerate(tile_index):
-                        tile_acc[d] += sigma_static_host[tuple(ix4[1:])][None, ...]
-                arrays = [jax.device_put(t, dev)
-                          for t, dev in zip(tile_acc, devices)]
-                sigma_kij_sharded = jax.make_array_from_single_device_arrays(
-                    gshape, sharding, arrays)
-
-        # static_limit: fold the ω-independent invalid-pole static-COHSEX
-        # term into Σ_c at every ω (host add / streamed ω-batched h5 RMW —
-        # identical values on both paths; the sharded layout folded it
-        # tile-locally above).
-        if sigma_static_host is not None and not sharded_layout:
-            if not streaming:
-                sigma_kij_host += sigma_static_host[None, ...]
-            else:
-                for ibeg in range(0, n_omega, omega_batch_size):
-                    idx = np.arange(
-                        ibeg, min(ibeg + omega_batch_size, n_omega),
-                        dtype=np.int64)
-                    _accumulate_kij_stream(
-                        idx,
-                        np.broadcast_to(
-                            sigma_static_host,
-                            (idx.size, *sigma_static_host.shape)))
-    finally:
-        if h5_kij is not None:
-            h5_kij.close()
+    # static_limit: fold the ω-independent invalid-pole static-COHSEX
+    # term into Σ_c at every ω (host add; the sharded layout folded it
+    # tile-locally above — identical values).
+    if sigma_static_host is not None and not sharded_layout:
+        sigma_kij_host += sigma_static_host[None, ...]
 
     if sharded_layout:
         sigma_kij_req = sigma_kij_sharded
     else:
-        sigma_kij_req = None if sigma_kij_host is None else jnp.asarray(sigma_kij_host, dtype=jnp.complex128)
+        sigma_kij_req = jnp.asarray(sigma_kij_host, dtype=jnp.complex128)
     return SigmaOmegaResult(
         omega_ry=np.asarray(omega_req, dtype=np.float64),
         omega_ev=np.asarray(omega_req * RYD_TO_EV, dtype=np.float64),
         sigma_c_kij=sigma_kij_req,
-        sigma_kij_h5_path=kij_stream_path,
     )

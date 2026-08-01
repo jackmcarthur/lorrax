@@ -877,11 +877,8 @@ def dump_sigma_omega_h5_final(
         return None
     from .ppm_pipeline import _write_sigma_omega_h5
 
-    # Converged SC always writes from the in-memory Σ_c tensor
-    # (sigma_c_omega_kij_ry is not None here), so no streamed source.
     path = _write_sigma_omega_h5(
         sigma_result.sigma_c_omega_kij_ry,
-        sigma_kij_h5_path=None,
         sig_x=sigma_result.sigma_x_kij_ry,
         sig_h=sigma_result.v_h_kij_ry,
         config=config, input_dir=input_dir,

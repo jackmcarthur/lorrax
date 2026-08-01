@@ -497,28 +497,6 @@ def _agree_on_entries(cache_path: Path, n_proc: int, proc_idx: int,
     return len(keys), agreed
 
 
-def _single_stripe(cache_path: Path) -> None:
-    """Ask Lustre for one stripe per cache entry (best effort, rank 0, once).
-
-    Cache entries are TINY — 140 of them are 876 kB at 606 centroids / P=16 —
-    and reading them is pure per-file latency, not bandwidth.  A multi-stripe
-    default multiplies the RPCs per open for no benefit at all at this size.
-    Only affects files created afterwards, and only on Lustre; anywhere else
-    the command is missing or fails and we move on.
-    """
-    import shutil
-    import subprocess
-
-    if not shutil.which("lfs"):
-        return
-    try:
-        subprocess.run(["lfs", "setstripe", "-c", "1", str(cache_path)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=20, check=False)
-    except Exception:
-        pass
-
-
 def _prefetch_agreed(cache_path: Path, agreed, n_threads: int) -> float:
     """Pull the agreed entries into the page cache, in parallel.
 
@@ -882,10 +860,7 @@ def ensure_jax_compile_cache() -> None:
     cache_path = Path(cache_dir).expanduser() / f"np{n_proc}"
     _STATE.dir = str(cache_path)
     try:
-        fresh = not cache_path.exists()
         cache_path.mkdir(parents=True, exist_ok=True)
-        if fresh and proc_idx == 0:
-            _single_stripe(cache_path)
     except Exception as exc:
         if proc_idx == 0:
             _say(f"DISABLED: cannot create {cache_path} ({exc}). "

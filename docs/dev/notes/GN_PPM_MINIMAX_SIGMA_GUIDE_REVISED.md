@@ -160,9 +160,8 @@ The code **always** accumulates in band space ((k,i,j)) before applying the (\om
 
 Modes:
 
-* `omega_accumulation="kij"`: all (\omega) in one pass in memory
-* `omega_accumulation="kij_stream"`: write `sigma_c_kij_ry[omega,k,i,j]` to HDF5 in ω-chunks
-* `omega_accumulation="auto"` selects between them
+* `omega_accumulation="kij"` (or `"auto"`, identical): all (\omega) in one pass in memory
+* (the `"kij_stream"` streamed-HDF5 mode was removed 2026-07-31)
 
 ### 4.3 “Two-channel” accumulation at each time node
 

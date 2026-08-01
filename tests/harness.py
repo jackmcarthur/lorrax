@@ -10,7 +10,7 @@ Suite architecture (2026-07-09 redesign):
 * **Tier 1** — frozen e2e pins, one fresh ``gw.gw_jax`` subprocess per
   fixture (si_cohsex_3d / cohsex / gnppm / bispinor GN-PPM).
 * **Tier 2** — self-checking invariances (restart≡fresh, μ-pad flip,
-  kij↔kij_stream, SC-iter1≡one-shot, fixed-point rotations, IBZ≡full-BZ)
+  SC-iter1≡one-shot, fixed-point rotations, IBZ≡full-BZ)
   run as cheap ``restart = true`` variants from a COPY of the Tier-1
   gnppm session state (the ISDF ζ-fit + V_q are not redone).  Each
   variant copies the session ``tmp/`` because the driver WRITES W0 +

@@ -1021,7 +1021,7 @@ def prepare_isdf_and_wavefunctions(
 
 	Returns SimpleNamespace(V_qmunu, wf_bundle).
 	"""
-	from file_io import write_restart_state_to_h5, save_restart_state_per_proc
+	from file_io import write_restart_state_to_h5
 	from common.wfn_transforms import load_centroids_band_chunked
 
 	if not cfg.restart:
@@ -1228,9 +1228,6 @@ def prepare_isdf_and_wavefunctions(
 					       f"not stamped ({exc}); a restart will warn "
 					       f"instead of verifying the centroid tables.")
 			barrier("restart_centroid_stamp")
-		save_restart_state_per_proc(
-			os.path.join(tmp_dir, "isdf_tensors"),
-			V_qmunu, None, wfns.psi_yr, wfns.enk, meta, mesh_xy)
 		V_qmunu.block_until_ready()
 		print0("  Chunked ISDF path complete")
 	else:

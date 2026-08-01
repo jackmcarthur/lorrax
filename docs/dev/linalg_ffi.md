@@ -315,9 +315,8 @@ unchanged. `LORRAX_COLLECTIVE_CHUNK_LOG=0` silences the per-site line.
 
 * `--eigh-backend` (htransform, exciton_bands CLIs) **overrides** the
   `eigh_backend` key; unset, the key (default `auto`) applies.
-* Legacy keys `cusolvermp_charge` / `cusolvermp_lu` (`auto|on|off`) are
-  still honored with a deprecation warning when the portable key is left
-  at `auto`.
+* The legacy keys `cusolvermp_charge` / `cusolvermp_lu` were REMOVED
+  (2026-07-31); use `distributed_cholesky` / `distributed_lu`.
 * Env: `LORRAX_FFI_SO` / `LORRAX_FFI_HOST_SO` point at the CUDA/host
   `.so`; `LORRAX_ZETA_REPLICATE_CAP_GIB` moves the replication cap
   (default 4 GiB); `LORRAX_ZETA_RIDGE` / `LORRAX_ZETA_RCOND` condition

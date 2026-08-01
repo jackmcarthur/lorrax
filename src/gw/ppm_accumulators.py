@@ -2,10 +2,11 @@
 
 "What happens to σ^τ after the kernel returns": the ω-kernel projection (one
 numpy function — the single source of truth), the accumulator protocol, and
-**one** async-D2H accumulator (`_TauAccumulator`) with **two sinks** deciding
-whether a finished window becomes an in-memory Σ tensor (`_MemoryTileSink`) or
-streamed h5 read-modify-write additions (`_H5Sink`).  The τ loop doesn't care
-which sink is behind the accumulator; it just adds per-τ contributions and
+**one** async-D2H accumulator (`_TauAccumulator`) whose sink
+(`_MemoryTileSink`) turns each finished window into in-memory Σ tiles.
+(The streamed-h5 sink twin and the `kij_stream` accumulation mode were
+REMOVED 2026-07-31: single-process-only, superseded by the host tiles +
+sharded ω-cube layout.)  The τ loop just adds per-τ contributions and
 knows when a window boundary falls.
 
 Imports ``_SigmaWindow`` (type only) from the ``ppm_windows`` leaf; nothing here
@@ -14,68 +15,14 @@ imports the driver or the device kernel.
 
 from __future__ import annotations
 
-import enum
 from collections import deque
-from typing import Callable
+
 
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from .ppm_windows import _SigmaWindow
-
-
-class _AccumMode(enum.Enum):
-    """How Σ_c(ω, k, m, n) is materialised inside the τ-loop.
-
-    ``KIJ_HOST`` keeps Σ as per-rank numpy tiles matching the (m_X, n_Y)
-    shard layout of σ^τ; the full (n_ω, n_k, n_b, n_b) buffer never lives
-    on any GPU.  Default for typical ω grids.
-
-    ``KIJ_STREAM`` accumulates each window's contribution on host and writes
-    it (ω-batched, read-modify-write) directly to an ``sigma_c_kij_ry`` HDF5
-    dataset.  Single-process only (multi-process falls back to KIJ_HOST
-    because the read-modify-write storm is a real perf problem at scale).
-    Useful when the kij accumulator blows the GPU budget.
-    """
-    KIJ_HOST = "kij_host"
-    KIJ_STREAM = "kij_stream"
-
-
-def _select_accum_mode(
-    requested: str, *,
-    sigma_kij_h5_path: str | None,
-    kij_bytes: float,
-    n_proc: int,
-) -> _AccumMode:
-    """Map ``omega_accumulation`` (``auto`` / ``kij`` / ``kij_stream``) to a mode.
-
-    - "kij"      → KIJ_HOST
-    - "kij_stream" → KIJ_STREAM if a path is set AND single-process,
-                     else KIJ_HOST (safety fallback)
-    - "auto"     → KIJ_HOST if no path AND grid fits in 0.5 GiB host buffer,
-                   otherwise KIJ_STREAM (with the same multi-process safety)
-    """
-    requested = str(requested).strip().lower()
-    if requested not in ("auto", "kij", "kij_stream"):
-        raise ValueError("omega_accumulation must be one of: auto, kij, kij_stream.")
-
-    if requested == "kij":
-        return _AccumMode.KIJ_HOST
-
-    if requested == "auto":
-        small_grid = kij_bytes <= 0.5 * 1024**3
-        if sigma_kij_h5_path is None and small_grid:
-            return _AccumMode.KIJ_HOST
-        # Fall through: large grid OR a stream path is set → try streaming.
-
-    # requested == "kij_stream" or auto-selected streaming
-    if not sigma_kij_h5_path or n_proc != 1:
-        # Multi-process: read-modify-write storm is too expensive (~hundreds
-        # of collective MPI-IO round-trips per branch).  Fall back to host
-        # accumulation until we wire the collective-flush variant.
-        return _AccumMode.KIJ_HOST
-    return _AccumMode.KIJ_STREAM
 
 
 def _project_tau_onto_omega_np(
@@ -316,10 +263,7 @@ class _TauAccumulator(_SigmaAccumulator):
 
     def finalize_host_tiles(self):
         """Branch tail WITHOUT the device round trip — see
-        :meth:`_MemoryTileSink.host_tiles`.  Only meaningful behind a
-        memory-tile sink (the streamed _H5Sink has already written its
-        windows to disk and has nothing to hand back); calling it on a
-        sink without ``host_tiles`` is a caller bug and raises."""
+        :meth:`_MemoryTileSink.host_tiles`."""
         return self._sink.host_tiles()
 
 
@@ -433,40 +377,3 @@ class _MemoryTileSink(_WindowSink):
             ]
         return jax.make_array_from_single_device_arrays(
             self._shape, self._sharding, arrays)
-
-
-class _H5Sink(_WindowSink):
-    """Assemble each window's full (n_ω, nk, nb, nb) host buffer from its
-    per-shard tiles and RMW-add it into the streamed h5 dataset (rank-0),
-    ω-batched.
-
-    Streaming is single-process only (``_select_accum_mode`` gates on
-    ``n_proc == 1``), so this process owns every shard and the assembled buffer
-    is the complete window.  This replaces the old per-τ streamed accumulator:
-    D2H is now the ω-independent per-shard σ tile (was n_ω× the volume), and the
-    h5 read-modify-write count drops from ~n_τ per branch to n_windows per
-    branch.  The analytic q→0 head is RMW-added into this same dataset later by
-    ``ppm_pipeline._inject_analytic_head`` (idempotent via the ``head_injected``
-    attr); this sink leaves the dataset in exactly the head-less layout that
-    step expects.
-    """
-
-    def __init__(self, writer: Callable[[np.ndarray, np.ndarray], None], *,
-                 omega_global_idx: np.ndarray, omega_batch_size: int,
-                 full_spatial_shape: tuple[int, int, int]):
-        self._writer = writer
-        self._omega_global_idx = np.asarray(omega_global_idx, dtype=np.int64)
-        self._batch = int(max(1, omega_batch_size))
-        self._spatial = tuple(int(s) for s in full_spatial_shape)
-
-    def consume_window(self, win_shards, shard_index, shard_devices) -> None:
-        n_omega = int(win_shards[0].shape[0])
-        full = np.zeros((n_omega,) + self._spatial, dtype=np.complex128)
-        for tile, idx in zip(win_shards, shard_index):
-            full[(slice(None),) + tuple(idx)] = tile
-        for ibeg in range(0, n_omega, self._batch):
-            iend = min(ibeg + self._batch, n_omega)
-            self._writer(self._omega_global_idx[ibeg:iend], full[ibeg:iend])
-
-    def result(self) -> None:
-        return None

@@ -44,10 +44,9 @@ writes are NOT sufficient once JAX's own CPU collectives ride MPI:
 
 What we DO match from :class:`_FfiBackend`:
 
-* Same ``mode='w'`` inode replace + rank-0 prestripe before any rank
-  opens the file (the shared ``_replace_inode_for_write`` +
-  ``_lustre_prestripe``; the layout that actually sticks comes from
-  the MPI-IO striping hints — see :func:`_mpi_io_hints`).
+* Same ``mode='w'`` inode replace before any rank opens the file (the
+  shared ``_replace_inode_for_write``; the layout that actually sticks
+  comes from the MPI-IO striping hints — see :func:`_mpi_io_hints`).
 * Same collective-write default (``LORRAX_PHDF5_COLLECTIVE_WRITES``,
   on) with replica dedup (``LORRAX_PHDF5_DEDUP_REPLICAS``, on) — see
   ``__init__`` for the wk_AI measurements.
@@ -85,7 +84,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from ._slab_io_ffi import (
     _barrier,
-    _lustre_prestripe,
     _normalize_slab_request,
     _normalize_valid_shape,
     _rank0,
@@ -136,14 +134,15 @@ def _mpi_io_hints(MPI):
     """The ``MPI_Info`` handed to ``H5Pset_fapl_mpio``.
 
     **This is the striping lever that actually works on Frontera.**
-    :func:`_lustre_prestripe` shells out to ``lfs``, which does NOT
-    EXIST inside the apptainer container every production run uses, so
-    it has always been a silent no-op on this machine — MEASURED: both
-    files job 7876423 wrote (``zeta_q.h5``, ``isdf_tensors_2406.h5``)
-    came back ``lmm_stripe_count: 1``, i.e. 13.3 GB of ``V_qmunu``
-    funnelled through a SINGLE OST.  ROMIO sets the layout through
-    ``llapi`` at file-create time instead, so the hints below reach
-    Lustre from inside the container with no binary on PATH.
+    The deleted ``lfs setstripe`` prestripe helper shelled out to
+    ``lfs``, which does NOT EXIST inside the apptainer container every
+    production run uses, so it was a silent no-op on this machine —
+    MEASURED: both files job 7876423 wrote (``zeta_q.h5``,
+    ``isdf_tensors_2406.h5``) came back ``lmm_stripe_count: 1``, i.e.
+    13.3 GB of ``V_qmunu`` funnelled through a SINGLE OST.  ROMIO sets
+    the layout through ``llapi`` at file-create time instead, so the
+    hints below reach Lustre from inside the container with no binary
+    on PATH.
 
     Same keys, same defaults as the C++ writer's
     ``ffi/cpp/phdf5/context.cc`` (which has always set them) — the h5py
@@ -287,15 +286,10 @@ class _MpiHostBackend:
         # The helper uses lexists (dangling symlinks too) and RAISES on
         # a failed unlink instead of the old silent ``except OSError:
         # pass`` (audit 2026-07-28).  'a'/'r' inherit the existing
-        # inode's layout by design.  Barrier after the rank-0 prestripe
+        # inode's layout by design.  Barrier after the rank-0 unlink
         # so all ranks see the inode state before H5Fopen.
         if mode == "w":
             _replace_inode_for_write(path)
-            if _rank0():
-                _lustre_prestripe(
-                    path, stripe_count=_stripe_count(),
-                    stripe_size=os.environ.get(
-                        "LORRAX_PHDF5_STRIPE_SIZE_FS", "4M"))
             _barrier("slab_io_mpi_host_prestripe")
 
         h5_mode = {"w": "w", "a": "a", "r": "r"}[mode]

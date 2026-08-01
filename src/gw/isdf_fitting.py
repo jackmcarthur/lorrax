@@ -647,14 +647,14 @@ def fit_zeta_to_h5(
     # orbit permutation, G-sphere) is rebuilt at read time via
     # ``SymMaps`` + ``orbit_syms`` and is *not* stored.
     #
-    # Sequence: rank 0 pre-stripes the file, writes both header groups
-    # in mode='w' (truncate), closes.  Then SlabIO re-opens with
-    # mode='a' so the headers survive and ``create_dataset('zeta_q')``
-    # appends rather than truncates.
+    # Sequence: the inode is replaced (rank-0 unlink + barrier), rank 0
+    # writes both header groups in mode='w', closes.  Then SlabIO
+    # re-opens with mode='a' so the headers survive and
+    # ``create_dataset('zeta_q')`` appends rather than truncates.
     from file_io.slab_io import SlabIO
     from file_io.mf_header import copy_mf_header
     from file_io.isdf_header import IsdfHeader, write_isdf_header
-    from file_io._slab_io_ffi import _lustre_prestripe
+    from file_io._slab_io_ffi import _replace_inode_for_write
 
     _wfn_src_path = getattr(wfn, '_filename', None)
     if _wfn_src_path is None:
@@ -691,16 +691,16 @@ def fit_zeta_to_h5(
     _isdf_hdr = IsdfHeader.build(**_hdr_kwargs)
 
     with timing.section("zeta_fit.write_headers"):
+        # Replace the inode BEFORE any h5py create: h5py mode='w'
+        # truncates in place (reuses the inode), and a Lustre stripe
+        # layout is fixed at inode create — without the unlink a rerun
+        # over an existing 1-stripe zeta_q.h5 keeps 1 stripe forever.
+        # (The old ``lfs setstripe`` prestripe helper was deleted
+        # 2026-07-31: ``lfs`` is absent in the production container;
+        # the layout comes from the MPI-IO striping hints.)  The helper
+        # barriers internally, so it is called on ALL ranks.
+        _replace_inode_for_write(output_file)
         if jax.process_index() == 0:
-            # Pre-stripe the file (delete + lfs setstripe).  Idempotent
-            # no-op on non-Lustre filesystems.  Must happen before any
-            # h5py create so the stripe layout survives ``H5Fcreate``.
-            stripe_count = int(
-                os.environ.get("LORRAX_PHDF5_STRIPE_COUNT", "16"))
-            stripe_size = os.environ.get(
-                "LORRAX_PHDF5_STRIPE_SIZE_FS", "4M")
-            _lustre_prestripe(output_file, stripe_count=stripe_count,
-                              stripe_size=stripe_size)
             # Create file with mf_header, then append isdf_header.
             copy_mf_header(_wfn_src_path, output_file, dst_mode='w')
             write_isdf_header(output_file, _isdf_hdr, mode='a')
@@ -724,8 +724,8 @@ def fit_zeta_to_h5(
     # dataset and crashed whenever a μ pad existed (PADDING_AUDIT #2).
     #
     # mode='a' (not 'w') so the pre-written mf_header + isdf_header
-    # are preserved.  SlabIO's FFI prestripe step is skipped on 'a'
-    # — we already striped above.
+    # are preserved.  SlabIO's mode='w' inode replace is skipped on 'a'
+    # — the inode was already replaced above.
     #
     # Dataset layout ``(nq, n_rtot, n_rmu)`` — NOT ``(nq, n_rmu, n_rtot)``.
     # Rationale: per-r-chunk writes span the full innermost axis (n_rmu)

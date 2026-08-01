@@ -712,10 +712,7 @@ which is the correct reduced storage: see the "important frequency-dependent cav
 
 #### 6.9.5 Accumulation
 
-The $(n_\omega, n_k, m_X, n_Y)$ accumulator is chosen automatically (`omega_accumulation = auto | kij | kij_stream`):
-
-- `_ReduceScatterGpuAccumulator` — accumulate directly on-device, keep the `(m_X, n_Y)` sharding, gather once to host at the end. Multi-process safe. Default for typical ω grids.
-- `_StreamedH5Accumulator` — single-process only. Reads / modifies / writes `sigma_c_kij_ry` via rank-0 h5py on every (τ × ω-batch) dispatch. Hundreds of round-trips — currently falls back to accum mode under multi-process. Useful only for very large ω grids that blow the device budget.
+The $(n_\omega, n_k, m_X, n_Y)$ accumulator (`omega_accumulation = auto | kij`, identical) keeps Σ_c as per-rank host tiles matching the `(m_X, n_Y)` sharding and gathers once at stage end (or never, under `sigma_omega_layout = sharded`).  The single-process streamed-h5 mode (`kij_stream`) was removed 2026-07-31.
 
 Implementation: `compute_sigma_c_ppm_omega_grid` in `gw/ppm_sigma.py`. Output written to `sigma_mnk.h5` (`omega_ev`, `sigma_c_kij_ev`, `sigma_sx_kij_ev`, `hartree_kij_ev`) via `file_io.sigma_output.write_sigma_omega_h5`.
 

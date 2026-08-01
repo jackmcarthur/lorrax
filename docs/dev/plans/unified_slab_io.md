@@ -1,5 +1,10 @@
 # Plan — unified sharded-slab I/O for `gw_jax` sigma writes
 
+> **2026-07-31 note:** every reference to `_accumulate_kij_stream` /
+> `kij_stream` below is moot — the streamed accumulation mode was removed
+> (owner-approved deprecation sweep); only the `write_sigma_omega_h5`
+> targets remain relevant.
+
 ## Scope (narrowed after the second audit)
 
 Two write sites in `gw_jax` — both already routed through

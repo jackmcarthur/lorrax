@@ -767,7 +767,6 @@ _DEFAULTS = {
     "eqp0_file": "eqp0.dat",
     "eqp1_file": "eqp1.dat",
     "sigma_omega_h5_file": "sigma_mnk.h5",
-    "sigma_kij_h5_file": "",
     # Core flags
     "restart": True,
     # ``compute_mode`` is the single axis describing the self-energy ansatz.
@@ -856,8 +855,6 @@ _DEFAULTS = {
     #       transverse-channel LU.  scalapack = the host/CPU-backend
     #       backend (Cray LibSci pXgetrf+pXgetrs via liblorrax_ffi_host);
     #       explicit, never auto-picked.  (SLATE getrf not yet written.)
-    # Legacy aliases (deprecation-warned): cusolvermp_charge /
-    # cusolvermp_lu with values auto|on|off (on → cusolvermp).
     "distributed_cholesky": "auto",
     "distributed_lu":       "auto",
     #   eigh_backend = auto | off | distributed | cusolvermp | slate
@@ -965,10 +962,6 @@ _DEFAULTS = {
     # Mirrored by the isdf/core.py + gw/isdf_fitting.py signature defaults.
     # reports/gw_rank_truncation_2026-07-20 + gw_bandrange_centroids_2026-07-21.
     "zeta_rcond":           1e-8,
-    # Deprecated aliases (still parsed; warned at load; honored only when
-    # the portable key above is left at "auto"):
-    "cusolvermp_charge": "auto",   # auto | on | off
-    "cusolvermp_lu":     "auto",   # auto | on | off
     # γ̃-double-contract kernel variant inside the monolithic pair
     # pipeline (see ``common.gamma_matrices.gamma_double_contract``).
     # Math identical across all three; differ in HLO structure.
@@ -1078,7 +1071,7 @@ _DEFAULTS = {
     #       P(None,None,'x','y')-sharded cube directly.  Outputs are
     #       bit-identical to "replicated" (movement-only; A/B gated).
     #       Round-1 refusals (at config/driver resolve time, never mid-run):
-    #       self_consistent, kij_stream, indivisible σ band window, and
+    #       self_consistent, indivisible σ band window, and
     #       slab_io=h5py_allgather at P>1.
     "sigma_omega_layout": "replicated",
     # PPM sigma options
@@ -1247,47 +1240,18 @@ def read_lorrax_input(filename: str) -> dict:
                     DeprecationWarning, stacklevel=2,
                 )
 
-        for _legacy_key, _new_key in (
-            ("cusolvermp_charge", "distributed_cholesky"),
-            ("cusolvermp_lu", "distributed_lu"),
-        ):
-            if section.get(_legacy_key, fallback=None) is not None:
-                import warnings
-                warnings.warn(
-                    f"Input key '{_legacy_key}' is deprecated; use "
-                    f"'{_new_key} = auto|off|cusolvermp' (legacy 'on' → "
-                    f"'cusolvermp').",
-                    DeprecationWarning, stacklevel=2,
-                )
-
         # 'use_ffi_io' deprecation warns ONCE, at the resolution site in
         # ``from_input_file`` (which distinguishes the true/false/overridden
         # cases).  A second generic warning here made one deck emit two
         # overlapping DeprecationWarnings for one key (audit fix/zq
         # 2026-07-28).
 
-        # isdf_memory_mode: REMOVED key (two-plan W cleanup 2026-07-27).
-        # auto/high_mem selected the route that is now w_dyson_solver=local
-        # (the default) — deprecation-warn and ignore.  low_mem selected
-        # the fused cuBLASMp W solve, which was DELETED (superseded by
-        # w_dyson_solver = distributed, which binds cusolvermp on CUDA
-        # meshes through the ffi.linalg plan facade) — fail informatively
-        # so old decks do not silently reroute.
-        _imm = section.get("isdf_memory_mode", fallback=None)
-        if _imm is not None:
-            _imm_s = str(_imm).strip().lower()
-            if _imm_s == "low_mem":
-                raise ValueError(
-                    "isdf_memory_mode = low_mem was REMOVED: the fused "
-                    "cuBLASMp W solve is gone (two-plan W cleanup).  Use "
-                    "w_dyson_solver = distributed for the 2-D-sharded "
-                    "backsolve (ScaLAPACK on CPU, cuSOLVERMp on CUDA).")
-            import warnings
-            warnings.warn(
-                f"Input key 'isdf_memory_mode' (= {_imm_s!r}) is "
-                f"deprecated and ignored: the W Dyson solve is selected "
-                f"by w_dyson_solver = local|distributed.",
-                DeprecationWarning, stacklevel=2)
+        # REMOVED keys (owner-approved deletions, 2026-07-31; unknown deck
+        # keys are ignored by this parser, so these now behave like any
+        # other unknown key): ``isdf_memory_mode`` (two-plan W cleanup —
+        # the W Dyson solve is selected by w_dyson_solver=local|distributed)
+        # and the legacy aliases ``cusolvermp_charge``/``cusolvermp_lu``
+        # (use distributed_cholesky / distributed_lu).
 
         # Build params from _DEFAULTS, overriding with parsed values
         params = {}
@@ -1377,7 +1341,6 @@ class FilePaths:
     eqp0_file: str
     eqp1_file: str
     sigma_omega_h5_file: str
-    sigma_kij_h5_file: str
 
 
 @dataclass(frozen=True)
@@ -1440,7 +1403,7 @@ class PPMConfig:
     regularization_ev: float
     window_edge_factor: float
     omega_batch_size: int
-    omega_accumulation: str       # "auto" | "kij" | "kij_stream"
+    omega_accumulation: str       # "auto" | "kij"
     #: Σ_c(ω) end-of-stage layout: "replicated" gathers the full cube onto
     #: every rank (historical path); "sharded" keeps it (m_X, n_Y)-tiled on
     #: the existing mesh and consumers read the tiles directly (movement-only,
@@ -1465,22 +1428,23 @@ class PPMConfig:
             raise ValueError("ppm.omega_max_ev must be >= ppm.omega_min_ev.")
         if self.fermi_reference not in ("vbm", "midgap"):
             raise ValueError("ppm.fermi_reference must be 'vbm' or 'midgap'.")
-        if self.omega_accumulation not in ("auto", "kij", "kij_stream"):
+        if self.omega_accumulation == "kij_stream":
+            # REMOVED mode (2026-07-31): the single-process streamed-h5
+            # accumulator is gone.  Refuse the removed VALUE of a known
+            # key rather than silently rerouting an old deck.
             raise ValueError(
-                "ppm.omega_accumulation must be auto/kij/kij_stream.")
+                "sigma_omega_accumulation = kij_stream was REMOVED: the "
+                "single-process streamed-h5 accumulator is gone "
+                "(superseded by host-tile accumulation and "
+                "sigma_omega_layout=sharded for cubes that do not fit).  "
+                "Use 'kij' or 'auto'.")
+        if self.omega_accumulation not in ("auto", "kij"):
+            raise ValueError(
+                "ppm.omega_accumulation must be auto/kij.")
         if self.omega_layout not in ("replicated", "sharded"):
             raise ValueError(
                 "sigma_omega_layout must be 'replicated' or 'sharded'; "
                 f"got {self.omega_layout!r}.")
-        if self.omega_layout == "sharded" and self.omega_accumulation == "kij_stream":
-            # kij_stream never materializes the ω-cube (it RMW-streams each
-            # window to h5), so a sharded layout request would be silently
-            # inert — refuse the contradiction at parse time (doctrine 3).
-            raise ValueError(
-                "sigma_omega_layout=sharded is incompatible with "
-                "sigma_omega_accumulation=kij_stream: the streamed path "
-                "never materializes the Σ_c(ω) cube, so there is nothing "
-                "to shard.  Use 'kij' or 'auto'.")
         if self.invalid_mode not in (
             "zero", "skip", "2ry", "static_limit", "infinity", "imaginary"
         ):
@@ -1743,11 +1707,6 @@ class LorraxConfig:
 
         - ``fixed_point`` × static mode → error (no ω-grid to solve on;
           a silent no-op would blur the axis).
-        - ``fixed_point`` / ``self_consistent`` × dynamic mode with
-          ``sigma_omega_accumulation = kij_stream`` → error (streamed
-          Σ_c(ω) leaves no in-memory tensor for the on-shell solve /
-          QSGW rebuild; previously this pair silently degraded the eigh
-          outputs to static COHSEX).
         """
         raw = (self.qp_solver_raw or "auto").strip().lower()
         if raw == "auto":
@@ -1768,15 +1727,6 @@ class LorraxConfig:
                 f"(gn_ppm / hl_ppm); static Σ ({mode.value}) has no ω-grid "
                 f"to solve E = h0 + ReΣ(E) on.  Use one_shot_dft (identical "
                 f"physics for static Σ) or self_consistent.")
-        if (solver in (QPSolver.FIXED_POINT, QPSolver.SELF_CONSISTENT)
-                and mode.is_dynamic
-                and self.ppm.omega_accumulation == "kij_stream"):
-            raise ValueError(
-                f"qp_solver={solver.value} is incompatible with "
-                f"sigma_omega_accumulation=kij_stream: streamed Σ_c(ω) "
-                f"leaves no in-memory ω-tensor for the on-shell solve / "
-                f"QSGW build (the eigh-family outputs would silently "
-                f"degrade to static Σ).  Use 'kij' or 'auto'.")
         if (solver is QPSolver.SELF_CONSISTENT
                 and self.ppm.omega_layout == "sharded"):
             # Round-1 scope of the ω-cube sharding workstream: the SC driver
@@ -1928,7 +1878,6 @@ class LorraxConfig:
             eqp0_file=str(_g("eqp0_file")),
             eqp1_file=str(_g("eqp1_file")),
             sigma_omega_h5_file=str(_g("sigma_omega_h5_file")),
-            sigma_kij_h5_file=str(_g("sigma_kij_h5_file") or ""),
         )
         head = HeadConfig(
             wcoul0_source=str(_g("wcoul0_source")).strip().lower(),
@@ -2036,8 +1985,7 @@ class LorraxConfig:
         #     ``false`` forces H5PY_ALLGATHER (the pre-FFI writer),
         #     ``true`` is the routed default anyway (no-op), unset means
         #     "route".  Superseded by ``slab_io=<backend>``.
-        #   * on CPU, explicit ``cusolvermp`` (incl. via the legacy
-        #     ``cusolvermp_charge``/``cusolvermp_lu = on`` aliases) is
+        #   * on CPU, explicit ``cusolvermp`` is
         #     REFUSED at parse time (CUDA-only backend; doctrine 3);
         #     ``distributed_lu = auto`` demotes to ``"off"`` (in-tree
         #     per-q ``jnp.linalg.solve``) with an announcement.
@@ -2051,26 +1999,9 @@ class LorraxConfig:
             raise ValueError(
                 f"slab_io={_slab_io_in!r} invalid; expected auto / phdf5_ffi "
                 f"/ phdf5_host / h5py_allgather.")
-        # Distributed-linalg axes.  Legacy ``cusolvermp_charge`` /
-        # ``cusolvermp_lu`` (auto|on|off; deprecation-warned at parse)
-        # are honored only when the portable key is left at "auto".
-        _LEGACY_LINALG = {"auto": "auto", "on": "cusolvermp", "off": "off"}
+        # Distributed-linalg axes.
         _dist_chol = str(_g("distributed_cholesky")).strip().lower()
         _dist_lu = str(_g("distributed_lu")).strip().lower()
-        for _legacy_key, _cur in (
-            ("cusolvermp_charge", _dist_chol),
-            ("cusolvermp_lu", _dist_lu),
-        ):
-            _legacy_val = str(_g(_legacy_key)).strip().lower()
-            _mapped = _LEGACY_LINALG.get(_legacy_val)
-            if _mapped is None:
-                raise ValueError(
-                    f"{_legacy_key}={_legacy_val!r} invalid; expected auto/on/off.")
-            if _cur == "auto" and _mapped != "auto":
-                if _legacy_key == "cusolvermp_charge":
-                    _dist_chol = _mapped
-                else:
-                    _dist_lu = _mapped
         if _dist_chol not in ("auto", "off", "cusolvermp", "slate"):
             raise ValueError(
                 f"distributed_cholesky={_dist_chol!r} invalid; expected "

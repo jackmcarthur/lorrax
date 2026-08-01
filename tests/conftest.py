@@ -121,9 +121,10 @@ def gnppm_session(tmp_path_factory):
 def gnppm_restart_baseline(gnppm_session, tmp_path_factory):
     """Canonical restart=true variant of the gnppm session state.
 
-    One-shot, freq-debug writers off (the kij_stream accumulation mode
-    crashes on the debug writers' None-Σ_c handling, so the baseline all
-    dynamic variants diff against uses the same debug-off config).
+    One-shot, freq-debug writers off (historical: the since-removed
+    kij_stream mode crashed on the debug writers' None-Σ_c handling; the
+    baseline all dynamic variants diff against keeps the same debug-off
+    config so existing goldens stay comparable).
     """
     run_dir = harness.copy_fixture(
         harness.REG / "gnppm_debug",

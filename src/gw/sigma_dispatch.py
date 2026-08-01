@@ -396,36 +396,6 @@ def compute_sigma_xc(
         print_fn=print_fn,
     )
 
-    if ppm_outputs.sigma_c_omega is None:
-        # Streamed Σ_c (kij_stream): no in-memory ω-tensor → no QSGW
-        # build.  The eigh family degrades to the static-COHSEX stand-in
-        # (same behavior the pre-unification driver had); eqp0/eqp1 stay
-        # correct — they are written downstream from the at-DFT
-        # diagnostics, which the streamed h5 path fills in.  Config
-        # validation already rejects kij_stream × fixed_point /
-        # self_consistent, so this branch is one-shot-only.
-        statics = compute_cohsex_sigma(
-            wfns, V_q, W_static, meta, mesh_xy,
-            Gij=Gij,
-            do_screened=True,
-            static_head_terms=static_head_terms,
-            compute_bare_x=False,
-        )
-        return SigmaResult(
-            v_h_kij_ry=sig_h,
-            sigma_x_kij_ry=sig_x,
-            sigma_xc_kij_ry=statics["sig_sx"] + statics["sig_coh"],
-            sigma_sx_kij_ry=statics["sig_sx"],
-            sigma_coh_kij_ry=statics["sig_coh"],
-            sigma_c_at_dft_diag_ev=ppm_outputs.sigma_c_at_dft_ev,
-            omega_dft_rel_ev=ppm_outputs.omega_dft_rel_ev,
-            omega_grid_ev=config.omega_grid_ev,
-            omega_grid_ry=config.omega_grid_ry,
-            head_sigma_diag_w_kn_ry=ppm_outputs.head_sigma_diag_w_kn_ry,
-            sigma_omega_h5_path=ppm_outputs.sigma_omega_h5_path,
-            efermi_dft_ev=ppm_outputs.efermi_dft_ev,
-        )
-
     # QSGW Σ_xc^QSGW evaluated at e_qp_ev.  Static Σ_x is added inside
     # the kernel, so the result already includes Σ_x.  The E_F reference
     # is the LORRAX-canonical midgap (``wfn.efermi`` — the same value

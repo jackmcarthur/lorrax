@@ -6,11 +6,10 @@ _build_windows_for_branch into ppm_windows.py) must stay identical
 against.  Also guards against a split silently dropping a branch (all 4
 branches × their windows asserted non-empty).
 
-G1 (kij ↔ kij_stream accumulator parity — the gate that detected Bug B,
-the streamed path dropping the analytic q→0 head) lives in
-``tests/test_invariance_gates.py::test_kij_stream_parity`` as a cheap
-from-restart Tier-2 variant.  G3 (the head negative-branch regression)
-lives in ``tests/test_head_correction.py``.
+G1 (the kij ↔ kij_stream accumulator parity gate that detected Bug B)
+was RETIRED 2026-07-31 with the removal of the kij_stream mode itself.
+G3 (the head negative-branch regression) lives in
+``tests/test_head_correction.py``.
 """
 
 import sys

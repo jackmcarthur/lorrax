@@ -193,13 +193,12 @@ class PsiGStore:
                     self._per_rank_shape, dtype=np.complex128)
 
         # NOTE: this read is deliberately SYNCHRONOUS.  A prefetching
-        # AsyncWfnReader (a worker thread issuing ``loader.load(bc+1)``
-        # against bc[i]'s shard_to_host copy) was implemented and
-        # measured here: at MoS2 3×3 scale xprof shows H2D/compute
-        # overlap_frac = 0.000 even with depth-2 prefetch — XLA's stream
-        # scheduler does not pipeline our H2D against compute.  The class
-        # was deleted 2026-07-25 as production-dead code (it had no
-        # callers).  If the async-reader story comes back at larger scale
+        # async wfn reader (a worker thread issuing ``loader.load(bc+1)``
+        # against bc[i]'s shard_to_host copy) was implemented, measured,
+        # and deleted 2026-07-25: at MoS2 3×3 scale xprof shows
+        # H2D/compute overlap_frac = 0.000 even with depth-2 prefetch —
+        # XLA's stream scheduler does not pipeline our H2D against
+        # compute.  If the async-reader story comes back at larger scale
         # (CrI3), rebuild it on ``common.async_io.AsyncDispatcher``, which
         # is still here and drives the SlabIO write side.
         from common import timing

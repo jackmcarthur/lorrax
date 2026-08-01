@@ -28,7 +28,6 @@ import common.timing as timing
 
 from .gw_config import ComputeMode, LorraxConfig
 from common.jax_profile import profile_section
-from file_io.paths import resolve_input_path
 from .head_correction import HeadResolver
 from .ppm_sigma import (
     compute_sigma_c_ppm_omega_grid,
@@ -41,7 +40,7 @@ from .ppm_tau_kernel import precompile_sigma
 class PPMOutputs:
     """Frequency-dependent PPM Σ^c results returned to the GW driver."""
 
-    sigma_c_omega: jax.Array | None        # (n_omega, nk, nb, nb)  Ry, or None if streamed
+    sigma_c_omega: jax.Array | None        # (n_omega, nk, nb, nb)  Ry
     sigma_c_at_dft_ev: np.ndarray | None   # (nk, nb)  diag(Σ_c) at E_DFT
     sigma_xc_at_dft_ev: np.ndarray | None  # (nk, nb)  diag(Σ_x) + diag(Σ_c) at E_DFT
     omega_dft_rel_ev: np.ndarray | None    # (nk, nb)  E_DFT - E_F  (eV)
@@ -103,30 +102,26 @@ def _fit_head_correction(
 
 
 def _inject_analytic_head(
-    sigma_c_omega: jax.Array | None, head_gn, *,
+    sigma_c_omega: jax.Array, head_gn, *,
     config: LorraxConfig,
     band_slices,
     wfn, sym, meta,
-    sigma_kij_h5_path: str | None,
     print_fn,
-) -> tuple[jax.Array | None, np.ndarray | None]:
-    """Add the analytic q→0, G=G'=0 head to Σ^c(ω) on rank 0.
+) -> tuple[jax.Array, np.ndarray | None]:
+    """Add the analytic q→0, G=G'=0 head to Σ^c(ω).
 
-    Two accumulation paths, one head.  When ``sigma_c_omega`` is in memory
-    (KIJ_HOST) the head is added to the tensor and returned.  When Σ_c was
-    streamed to an h5 (KIJ_STREAM) the streamed accumulator wrote a
-    *head-less* ``sigma_c_kij_ry``; here we RMW-add the identical analytic
-    head into that dataset on rank 0 so both paths land the same Σ_c
-    (Bug B, reports/sigma_ppm_tighten_2026-07-04).  The head is computed
-    once (same call, same ω-grid) and consumed by whichever path applies.
+    One head, added to the in-memory tensor (replicated add, or a
+    rank-local band-diagonal add on the sharded layout).  A head-less
+    Σ_c is a silent wrong answer (Bug B,
+    reports/sigma_ppm_tighten_2026-07-04); the streamed (kij_stream)
+    h5-RMW arm of this function was REMOVED 2026-07-31 with the mode.
 
     Returns
     -------
     sigma_c_omega_with_head, head_sigma_diag_w_kn_ry
-        Post-head Σ_c (same shape as input, or ``None`` in streamed mode
-        where the correction lands in the h5 instead) and the band-diagonal
-        of the head-only contribution ``(nω, nk, nb)`` in Ry (head is
-        diagonal in band so this is a lossless decomposition).
+        Post-head Σ_c (same shape as input) and the band-diagonal of the
+        head-only contribution ``(nω, nk, nb)`` in Ry (head is diagonal
+        in band so this is a lossless decomposition).
     """
     from .head_correction import compute_ppm_head_sigma_diag
 
@@ -141,8 +136,8 @@ def _inject_analytic_head(
 
     # The head is band-DIAGONAL; compute that (nω, nk, nb) representation
     # once.  The dense (nω, nk, nb, nb) tensor — n_ω·nk·nb²·16 B per rank,
-    # a full-cube-sized transient — is embedded from it ONLY on the paths
-    # that add densely (in-memory replicated add, streamed h5 RMW); the
+    # a full-cube-sized transient — is embedded from it ONLY on the path
+    # that adds densely (the in-memory replicated add); the
     # sharded layout injects the diagonal rank-locally and never
     # materializes the dense head anywhere.  The dense embed below is
     # bit-identical to the historical compute_ppm_head_sigma_kij output
@@ -178,38 +173,6 @@ def _inject_analytic_head(
     )
     head_diag_w_kn_ry = np.asarray(head_sigma_diag_ry)
 
-    if sigma_c_omega is None:
-        # Streamed mode: RMW-add the head into the sigma_kij h5.  A head-less
-        # streamed Σ_c is a silent wrong answer, so refuse to proceed without
-        # a file to correct rather than dropping the head.
-        if sigma_kij_h5_path is None:
-            raise ValueError(
-                "streamed Σ_c requested (sigma_c_kij is None) but no "
-                "sigma_kij h5 path is available; the analytic q→0 head "
-                "cannot be injected and a head-less Σ_c would be silently "
-                "wrong. Set sigma_kij_h5_file, or use "
-                "sigma_omega_accumulation=kij (in-memory).")
-        if meta.rank == 0:
-            import h5py
-            head_np = _embed_dense(head_diag_w_kn_ry)
-            n_omega = int(head_np.shape[0])
-            # The head is diagonal-in-band; head_np's off-diagonals are exactly
-            # zero, so adding the full (nω, nk, nb, nb) tile touches only the
-            # band-diagonal — bit-identical to the in-memory path's tensor add.
-            # ω-batch the read-modify-write to match the chunked dataset.
-            batch = int(max(1, config.ppm.omega_batch_size))
-            with h5py.File(sigma_kij_h5_path, "r+") as h5:
-                if bool(h5.attrs.get("head_injected", False)):
-                    print_fn(
-                        f"  Σ_c head: {sigma_kij_h5_path} already carries "
-                        "head_injected=True; skipping RMW to avoid double-add.")
-                else:
-                    dset = h5["sigma_c_kij_ry"]
-                    for ibeg in range(0, n_omega, batch):
-                        iend = min(ibeg + batch, n_omega)
-                        dset[ibeg:iend] = dset[ibeg:iend] + head_np[ibeg:iend]
-                    h5.attrs["head_injected"] = True
-        return None, head_diag_w_kn_ry
 
     from .qsgw_utils import add_band_diag_sharded, is_band_sharded_sigma_omega
     if is_band_sharded_sigma_omega(sigma_c_omega):
@@ -231,8 +194,7 @@ def _inject_analytic_head(
 
 
 def _eval_sigma_c_at_dft_energies(
-    sigma_c_omega: jax.Array | None,
-    sigma_omega: 'object', *,                          # noqa: F821 (forward decl)
+    sigma_c_omega: jax.Array, *,
     config: LorraxConfig,
     sig_x: jax.Array,
     band_slices, wfn, sym, meta, mesh_xy,
@@ -244,8 +206,7 @@ def _eval_sigma_c_at_dft_energies(
     :func:`qsgw_utils.extract_sigma_diag_replicated` (cheap allgather of
     the diagonal only, ~MB) so the result is consistent across ranks —
     required by the post-Σ flow in ``gw_jax`` which now runs on all
-    ranks.  The streamed-mode fallback (``sigma_c_omega is None``) uses
-    a single rank-0 h5 read followed by an MPI broadcast.
+    ranks.
 
     Returns ``(sigma_c_at_dft_ev, sigma_xc_at_dft_ev, omega_dft_rel_ev,
     efermi_dft_ev)``, all replicated.
@@ -266,25 +227,10 @@ def _eval_sigma_c_at_dft_energies(
     )
 
     omega_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
-    if sigma_c_omega is not None:
-        from .qsgw_utils import extract_sigma_diag_replicated
-        sig_c_diag = (
-            np.asarray(extract_sigma_diag_replicated(sigma_c_omega, mesh_xy))
-            * RYD_TO_EV)
-    else:
-        # Streamed mode: rank-0 reads, then broadcast to all ranks.
-        import h5py
-        if meta.rank == 0:
-            with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5:
-                sig_c_diag = np.diagonal(
-                    np.asarray(h5["sigma_c_kij_ry"], dtype=np.complex128),
-                    axis1=2, axis2=3,
-                ) * RYD_TO_EV
-        else:
-            sig_c_diag = np.zeros(
-                (omega_ev.size, *enk_dft_ev.shape), dtype=np.complex128)
-        from jax.experimental.multihost_utils import broadcast_one_to_all
-        sig_c_diag = np.asarray(broadcast_one_to_all(sig_c_diag))
+    from .qsgw_utils import extract_sigma_diag_replicated
+    sig_c_diag = (
+        np.asarray(extract_sigma_diag_replicated(sigma_c_omega, mesh_xy))
+        * RYD_TO_EV)
 
     from .qsgw_utils import interp_along_omega
     sigma_c_at_dft_ev = interp_along_omega(
@@ -301,8 +247,7 @@ def _eval_sigma_c_at_dft_energies(
 
 
 def _write_sigma_omega_h5(
-    sigma_c_omega: jax.Array | None, *,
-    sigma_kij_h5_path: str | None,
+    sigma_c_omega: jax.Array, *,
     sig_x: jax.Array,
     sig_h: jax.Array,
     config: LorraxConfig,
@@ -310,74 +255,57 @@ def _write_sigma_omega_h5(
     meta,
     mesh_xy,
 ) -> str:
-    """Write the canonical sigma_mnk.h5 file (one writer, two backends).
-
-    ``sigma_kij_h5_path`` is the streamed-Σ_c source (or ``None`` for the
-    in-memory path, which the SC end-of-run writer always takes).
-    """
+    """Write the canonical sigma_mnk.h5 file (one writer, two backends)."""
     import os
-    from file_io import (
-        copy_sigma_kij_h5_to_omega_h5,
-        write_sigma_omega_h5,
-    )
+    from file_io import write_sigma_omega_h5
 
     out_path = config.paths.sigma_omega_h5_file
     if not os.path.isabs(out_path):
         out_path = os.path.join(input_dir, out_path)
 
-    if sigma_c_omega is not None:
-        from .qsgw_utils import is_band_sharded_sigma_omega
-        if is_band_sharded_sigma_omega(sigma_c_omega):
-            # Sharded layout: derive the eV tensors with the OUTPUT sharding
-            # pinned to the cube's own (m_X, n_Y) tiling, so the partitioner
-            # cannot resolve the sharded+replicated elementwise mix by
-            # gathering the cube (pattern #4: make the constraint
-            # structural).  Same expression, same operand order as the
-            # writer's own derivation on the replicated path:
-            # total = (Ry→eV Σ_c + Ry→eV Σ_x[None]) + Ry→eV V_H[None] —
-            # bit-identical elementwise.  SlabIO's per-rank hyperslab
-            # writers (PHDF5_FFI / PHDF5_HOST) then write each rank's tile
-            # directly; the h5py_allgather backend is refused at P>1 for
-            # this layout at driver start.
-            shd = sigma_c_omega.sharding
+    from .qsgw_utils import is_band_sharded_sigma_omega
+    if is_band_sharded_sigma_omega(sigma_c_omega):
+        # Sharded layout: derive the eV tensors with the OUTPUT sharding
+        # pinned to the cube's own (m_X, n_Y) tiling, so the partitioner
+        # cannot resolve the sharded+replicated elementwise mix by
+        # gathering the cube (pattern #4: make the constraint
+        # structural).  Same expression, same operand order as the
+        # writer's own derivation on the replicated path:
+        # total = (Ry→eV Σ_c + Ry→eV Σ_x[None]) + Ry→eV V_H[None] —
+        # bit-identical elementwise.  SlabIO's per-rank hyperslab
+        # writers (PHDF5_FFI / PHDF5_HOST) then write each rank's tile
+        # directly; the h5py_allgather backend is refused at P>1 for
+        # this layout at driver start.
+        shd = sigma_c_omega.sharding
 
-            def _ev_tensors(c_ry, x_ry, h_ry):
-                c_ev = RYD_TO_EV * c_ry
-                total = (c_ev + (RYD_TO_EV * x_ry)[None, ...]) \
-                    + (RYD_TO_EV * h_ry)[None, ...]
-                return total, c_ev
+        def _ev_tensors(c_ry, x_ry, h_ry):
+            c_ev = RYD_TO_EV * c_ry
+            total = (c_ev + (RYD_TO_EV * x_ry)[None, ...]) \
+                + (RYD_TO_EV * h_ry)[None, ...]
+            return total, c_ev
 
-            total_ev, sigma_c_ev = jax.jit(
-                _ev_tensors, out_shardings=(shd, shd))(
-                    sigma_c_omega, sig_x, sig_h)
-            write_sigma_omega_h5(
-                out_path, config.omega_grid_ev, total_ev,
-                sigma_c_kij_ev=sigma_c_ev,
-                sigma_sx_kij_ev=RYD_TO_EV * sig_x,
-                hartree_kij_ev=RYD_TO_EV * sig_h,
-                mesh=mesh_xy,
-                backend=config.backend.slab_io,
-            )
-            return out_path
-        # SlabIO handles rank-0 dispatch internally; both backends need
-        # all ranks to enter, so no ``if rank == 0`` guard.
+        total_ev, sigma_c_ev = jax.jit(
+            _ev_tensors, out_shardings=(shd, shd))(
+                sigma_c_omega, sig_x, sig_h)
         write_sigma_omega_h5(
-            out_path, config.omega_grid_ev, None,
-            sigma_c_kij_ev=RYD_TO_EV * sigma_c_omega,
+            out_path, config.omega_grid_ev, total_ev,
+            sigma_c_kij_ev=sigma_c_ev,
             sigma_sx_kij_ev=RYD_TO_EV * sig_x,
             hartree_kij_ev=RYD_TO_EV * sig_h,
             mesh=mesh_xy,
             backend=config.backend.slab_io,
         )
-    elif meta.rank == 0 and sigma_kij_h5_path:
-        copy_sigma_kij_h5_to_omega_h5(
-            sigma_kij_h5_path,
-            out_path,
-            config.omega_grid_ev,
-            sigma_sx_kij_ev=sig_x,
-            hartree_kij_ev=sig_h,
-            omega_batch_size=int(max(1, config.ppm.omega_batch_size)),
-        )
+        return out_path
+    # SlabIO handles rank-0 dispatch internally; both backends need
+    # all ranks to enter, so no ``if rank == 0`` guard.
+    write_sigma_omega_h5(
+        out_path, config.omega_grid_ev, None,
+        sigma_c_kij_ev=RYD_TO_EV * sigma_c_omega,
+        sigma_sx_kij_ev=RYD_TO_EV * sig_x,
+        hartree_kij_ev=RYD_TO_EV * sig_h,
+        mesh=mesh_xy,
+        backend=config.backend.slab_io,
+    )
     return out_path
 
 
@@ -425,10 +353,6 @@ def compute_ppm_sigma_pipeline(
     if not config.do_screened:
         raise ValueError("PPM Σ^c pipeline requires do_screened=true.")
 
-    # Resolve the streamed-Σ_c h5 path at the driver seam (input_dir lives
-    # here); "" normalizes to None so the kernel contract is str | None.
-    sigma_kij_h5_path = resolve_input_path(
-        input_dir, str(config.paths.sigma_kij_h5_file or "").strip()) or None
     label = "HL-PPM" if config.compute_mode is ComputeMode.HL_PPM else "GN-PPM"
     from .gw_output import print_section
     print_section(f"{label} + FREQUENCY-INTEGRATED SIGMA", print_fn)
@@ -462,10 +386,9 @@ def compute_ppm_sigma_pipeline(
                 ppm_cfg=config.ppm,
                 quad=config.sigma_quadrature_config,
                 omega_grid_ry=config.omega_grid_ry,
-                sigma_kij_h5_path=sigma_kij_h5_path,
                 print_fn=print_fn,
             )
-        sigma_c_omega = sigma_omega.sigma_c_kij  # None if streamed
+        sigma_c_omega = sigma_omega.sigma_c_kij
 
         # Step 3: q→0 head injection (analytic, mini-BZ-averaged)
         head_gn = _fit_head_correction(
@@ -476,7 +399,6 @@ def compute_ppm_sigma_pipeline(
             sigma_c_omega, head_gn,
             config=config, band_slices=band_slices,
             wfn=wfn, sym=sym, meta=meta,
-            sigma_kij_h5_path=sigma_omega.sigma_kij_h5_path,
             print_fn=print_fn,
         )
 
@@ -485,7 +407,7 @@ def compute_ppm_sigma_pipeline(
          sigma_xc_at_dft_ev,
          omega_dft_rel_ev,
          efermi_dft_ev) = _eval_sigma_c_at_dft_energies(
-            sigma_c_omega, sigma_omega,
+            sigma_c_omega,
             config=config, sig_x=sig_x,
             band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
             mesh_xy=mesh_xy,
@@ -498,7 +420,6 @@ def compute_ppm_sigma_pipeline(
         if write_sigma_omega_h5:
             sigma_omega_h5_path = _write_sigma_omega_h5(
                 sigma_c_omega,
-                sigma_kij_h5_path=sigma_omega.sigma_kij_h5_path,
                 sig_x=sig_x, sig_h=sig_h,
                 config=config, input_dir=input_dir,
                 meta=meta, mesh_xy=mesh_xy,
