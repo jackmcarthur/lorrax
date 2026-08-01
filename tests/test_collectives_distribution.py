@@ -681,15 +681,26 @@ def test_the_driver_still_runs_its_sweep_through_the_service():
 
 
 def test_the_driver_gets_its_mesh_and_its_warm_up_from_one_call():
-    """The driver must not hand-roll the warm-up next to the mesh: exactly
-    one ``prepare_mesh`` call, and no ``nccl_warmup`` import of its own.
+    """The driver must not hand-roll mesh or warm-up.  Since the 2026-08-01
+    ``initialize_communicator_stack`` adoption the ONE call is at module
+    top (``RUNTIME = initialize_communicator_stack()``), the run mesh is
+    ``RUNTIME.mesh``, and the driver builds NO mesh and imports NO warm-up
+    of its own.  (This pin previously demanded exactly one bare
+    ``prepare_mesh`` call and had gone stale against the adoption — it
+    counted 0 and failed on a contract the tree had already outgrown.)
     """
     src = _DRIVER.read_text()
     tree = ast.parse(src)
+    stacks = [n for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+              and n.func.id == "initialize_communicator_stack"]
+    assert len(stacks) == 1, (
+        "the driver brings the runtime up exactly once, at module top")
     prep = [n for n in ast.walk(tree)
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
             and n.func.id == "prepare_mesh"]
-    assert len(prep) == 1, "the driver builds its run mesh exactly once"
+    assert prep == [], (
+        "the driver must take RUNTIME.mesh, not build a second mesh")
     warms = [a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
              for a in n.names if a.name in ("nccl_warmup", "warm_mesh_cliques")]
     assert warms == [], f"driver still imports a warm-up itself: {warms}"
