@@ -259,7 +259,9 @@ lrx_slate_init_mpi lrx_slate_context_create"
     # line; the two are independent of the SLATE group in the CMakeLists,
     # and this list will need splitting the day a caller enables one
     # without the other.
-    WANT="$WANT ScalapackBatchedSolveLuHostFfi ScalapackEighHostFfi \
+    WANT="$WANT ScalapackBatchedSolveLuHostFfi \
+ScalapackBatchedGetrfHostFfi ScalapackBatchedGetrsHostFfi \
+ScalapackEighHostFfi \
 MklFftFlatKHostFfi MklFftGwConvHostFfi"
 fi
 echo "[build_host] --- exported handlers ---"
