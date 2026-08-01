@@ -347,7 +347,8 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
     Greedy pivoting on the pair-density Gram keeps the candidates that add
     the most independent interpolation directions over the σ band window;
     the achieved rank is the number it actually certified.  Returns
-    ``(indices, fractional, n_unique)``.
+    ``(indices, n_kept, rank, n_orbit_keep, n_val, max_band)`` — the last
+    four feed the rank gate in ``main()``.
     """
     from .pivoted_cholesky import prune_candidates_by_pivoted_cholesky
 
@@ -385,7 +386,9 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
         keep_idx, rank, *_ = prune_candidates_by_pivoted_cholesky(**kwargs)
     indices = np.asarray(keep_idx, dtype=np.int64)
     print(f"After pruning: {indices.shape[0]} centroids (rank={rank})")
-    return indices, indices.shape[0]
+    # The rank gate in main() compares rank against n_orbit_keep and names
+    # the effective prune window in its refusal — return all four.
+    return indices, indices.shape[0], int(rank), n_orbit_keep, n_val, max_band
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -516,7 +519,8 @@ def main():
                              Rinv, tau, n_sym, M_cand)
 
     if oversample > 1.0 and n_unique > N_c:
-        centroid_indices, n_unique = _prune(
+        (centroid_indices, n_unique, rank, n_orbit_keep,
+         _n_val_eff, _max_band) = _prune(
             args, wfn, sym, mesh, centroid_indices, orbit_id_arr,
             n_unique, N_c)
         centroids_snapped = centroid_indices.astype(float) / np.asarray(fft_grid)

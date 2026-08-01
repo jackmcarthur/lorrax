@@ -487,6 +487,8 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main(argv=None):
+    import time as _time
+    _t_main = _time.perf_counter()
     args = build_argparser().parse_args(argv)
 
     timing.reset()
@@ -785,7 +787,8 @@ def main(argv=None):
         print0("  V_H     diag (eV), k=0, first 8: "
               + "  ".join(f"{v:.4f}" for v in v0[:8]))
     if rank == 0:
-        timing.report(title="--- Timing (seconds) ---")
+        timing.report(title="--- Timing (seconds) ---",
+                      wall=_time.perf_counter() - _t_main)
     return 0
 
 

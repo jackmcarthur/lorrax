@@ -14,6 +14,7 @@ initializes QE-style projectors so downstream development can fill it in.
 import os
 import argparse
 import functools
+import time
 from pathlib import Path
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
@@ -35,6 +36,7 @@ fallback_to_cpu_if_no_gpu_backend()
 
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps
+from common import timing
 from common.collectives import barrier, gather_k_blocks, prepare_mesh
 from common.wfn_transforms import load_kpoint_fftbox_local
 from common import Meta
@@ -608,6 +610,7 @@ def _prov_show(v) -> str:
 # --------------------------
 
 def main(argv=None):
+	_t_main = time.perf_counter()
 	parser = argparse.ArgumentParser(allow_abbrev=False, description="Dipole/velocity matrix elements <mk|v|nk>")
 	parser.add_argument(
 		"-i",
@@ -905,8 +908,9 @@ def main(argv=None):
 	# per rank and ONE indexed gather at the end — the same contract
 	# ``gw.kin_ion_io``'s ⟨mk|V_H|nk⟩ sweep runs on.  Returns
 	# ``(nk, 3, nb, nb)`` identical on every rank.
-	dip_k_major = gather_k_blocks(nk, _dipole_block, item_shape=(3, nb, nb),
-	                              label="dipole")
+	with timing.section("dipole_sweep"):
+		dip_k_major = gather_k_blocks(nk, _dipole_block, item_shape=(3, nb, nb),
+		                              label="dipole")
 	dipole = np.ascontiguousarray(np.moveaxis(dip_k_major, 0, 1))
 	del dip_k_major
 
@@ -916,7 +920,8 @@ def main(argv=None):
 	if args.with_finite_q:
 		print("\nComputing finite-q matrix elements (SOS pipeline)...")
 		iq_list = args.iq_list if args.iq_list is not None else list(range(int(sym.nk_tot)))
-		rho_cvkq, v_cvkq, kminq_idx_kq, n_occ_eff, v_lo, c_hi = compute_finite_q_mtxels(
+		with timing.section("finite_q"):
+			rho_cvkq, v_cvkq, kminq_idx_kq, n_occ_eff, v_lo, c_hi = compute_finite_q_mtxels(
 			wfn, sym, meta, vnl_setup, gtab,
 			nb=nb,
 			bispinor=bispinor,
@@ -948,7 +953,7 @@ def main(argv=None):
 		barrier("dipole_write")
 		print(f"\nWrote dipole data to {out_path} (by rank 0)")
 		return 0
-	with h5py.File(str(out_path), 'w') as h5:
+	with timing.section("write_h5"), h5py.File(str(out_path), 'w') as h5:
 		h5.create_dataset('dipole_cart', data=dipole)
 		h5.create_dataset('deltaE', data=deltaE)
 		h5.attrs['nbands'] = int(wfn.nbands)
@@ -975,6 +980,8 @@ def main(argv=None):
 				"kminq_idx[k, q] = canonical k-q index in unfolded_kpts.")
 	barrier("dipole_write")
 	print(f"\nWrote dipole data to {out_path}")
+	timing.report(title="--- Timing (seconds) ---",
+	              wall=time.perf_counter() - _t_main)
 
 
 if __name__ == '__main__':

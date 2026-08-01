@@ -23,6 +23,7 @@ from file_io import WfnLoader as WFNReader
 from common import symmetry_maps
 from common import Meta
 from common import rank_criterion
+from common import timing
 from runtime.padding import round_up
 from common.wfn_transforms import (
     get_enk_bandrange, load_centroids_band_chunked, iter_psi_rchunk_bandwise,
@@ -1137,15 +1138,23 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
 
     # Optionally override energies with EQP values from a file only if explicitly requested via CLI
     if eqp_file:
+        # --eqp-file is an explicit request: a file that cannot be found or
+        # parsed must refuse, not silently fall back to the DFT energies —
+        # the output would be a DFT bandstructure labeled as quasiparticle.
         eqp_path = _resolve(eqp_file)
         if not os.path.isfile(eqp_path):
-            log_fn(f"EQP file not found: {eqp_path}")
-        else:
-            try:
-                enk_sigma = read_eqp_energies(eqp_path, sym, nsigmarange)
-                log_fn(f"Using EQP energies from {os.path.basename(eqp_path)} for band window {nsigmarange}")
-            except Exception as exc:
-                log_fn(f"EQP override skipped for {os.path.basename(eqp_path)}: {exc}")
+            raise SystemExit(f"FATAL: --eqp-file was given but not found: {eqp_path}")
+        try:
+            enk_sigma = read_eqp_energies(eqp_path, sym, nsigmarange)
+            log_fn(f"Using EQP energies from {os.path.basename(eqp_path)} for band window {nsigmarange}")
+        except Exception as exc:
+            raise SystemExit(
+                f"FATAL: --eqp-file {os.path.basename(eqp_path)} could not be "
+                f"consumed: {exc}\nExpected format: 'k-point <K>:' blocks "
+                f"covering all {getattr(sym, 'nk_tot', '?')} k-points with "
+                f"EQP=/sigX= tokens, energies in Ry. Use "
+                f"make_eqp_htformat.py to convert BGW-column eqp files."
+            ) from exc
 
     band_range = (int(nsigmarange[0]), int(nsigmarange[1]))
     with mesh_xy:
@@ -1440,6 +1449,8 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path):
 
 
 def main(argv=None):
+    import time as _time
+    _t_main = _time.perf_counter()
     parser = argparse.ArgumentParser(allow_abbrev=False, description="Hamiltonian interpolation driver")
     parser.add_argument("-i", "--input", default="cohsex_test.in", help="Input file")
     parser.add_argument("-wfn", "--wfn-file", default=None, help="Override WFN file (e.g. WFN_qp.h5)")
@@ -1489,8 +1500,9 @@ def main(argv=None):
 
     from common import sanity
 
-    wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma = initialize_wfns(
-        args.input, params, log, args.eqp_file)
+    with timing.section("initialize_wfns"):
+        wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma = initialize_wfns(
+            args.input, params, log, args.eqp_file)
     # ── Galerkin-input gate ───────────────────────────────────────────
     # S is the ISDF overlap Gram matrix (Hermitian positive-definite by
     # construction) and ``enk_sigma`` is the band energies the whole
@@ -1518,7 +1530,7 @@ def main(argv=None):
             0.0, 20.0, unit="Ry", print_fn=log)
 
     kpath_data = initialize_kpath(wfn, params)
-    with mesh_xy:
+    with mesh_xy, timing.section("h_transform"):
         result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
                              a_band_index=args.a_band)
 
@@ -1529,7 +1541,7 @@ def main(argv=None):
         from .bse_setup import compute_wfns_fi
         b_min = int(params["wfn_fi_min"])
         b_max = int(params["wfn_fi_max"]) or int(ctilde.shape[1])
-        with mesh_xy:
+        with mesh_xy, timing.section("wfns_fi"):
             wfns_fi = compute_wfns_fi(
                 ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
                 kgrid_co=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
@@ -1566,6 +1578,8 @@ def main(argv=None):
     if result['path_range'] is not None:
         summary += f", path range [{result['path_range'][0]:.6f}, {result['path_range'][1]:.6f}] Ry"
     print(summary)
+    timing.report(title="--- Timing (seconds) ---",
+                  wall=_time.perf_counter() - _t_main)
     return 0
 
 
