@@ -49,6 +49,7 @@ Part II — Theory & Methods (~22 pp)
 
 Part III — Reference (~14 pp)
 10. Workflow & files · 11. Complete input reference (regenerated from `gw_config.py`;
+    seeded by `docs/input_reference.md` + `tools/gen_input_reference.py`;
     + BSE CLI + bandstructure CLI; CI-diffed) · 12. Running at scale: 12.1 execution
     model · 12.2 memory planning · 12.3 distributed linear algebra · 12.4 parallel
     I/O · 12.5 troubleshooting

@@ -49,6 +49,7 @@ bash $LORRAX_ROOT/config/frontera/templates/gw_dev.sbatch
 Detailed physics, code architecture, and environment setup are in `docs/`:
 
 - **[`docs/drivers.md`](docs/drivers.md)** — The seven pipeline drivers in chain order: invocation, keys/flags, outputs, failure modes
+- **[`docs/input_reference.md`](docs/input_reference.md)** — Every deck key: name, default, one-line meaning (regenerated from `gw_config._DEFAULTS` by `tools/gen_input_reference.py`)
 - **[`docs/theory/physics.md`](docs/theory/physics.md)** — ISDF theory, GW equations, ISDF basis (zeta) fitting, JAX sharding
 - **[`docs/architecture/codebase.md`](docs/architecture/codebase.md)** — Module map, data flow, key classes, entry points
 - **[`docs/environment/overview.md`](docs/environment/overview.md)** — The runtime stack, JAX configuration, transports, per-machine pages

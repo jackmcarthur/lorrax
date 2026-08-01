@@ -64,6 +64,7 @@ nav:
   - User guide:
       - Overview: user-guide/index.md
       - Drivers: drivers.md
+      - Input reference: input_reference.md
   - Theory:
       - Overview: theory/overview.md
       - Physics: theory/physics.md

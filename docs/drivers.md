@@ -2,7 +2,8 @@
 
 The seven pipeline drivers in chain order: input generation (centroids, dipole,
 kin-ion) → GW self-energy → QP bandstructure interpolation → BSE → exciton bands.
-Deck keys and defaults are verified against `gw_config._DEFAULTS` as of 2026-07-31.
+Deck keys and defaults are verified against `gw_config._DEFAULTS` as of 2026-07-31;
+the complete key list is in [input_reference.md](input_reference.md).
 
 ## centroids — `centroid.kmeans_cli`
 
