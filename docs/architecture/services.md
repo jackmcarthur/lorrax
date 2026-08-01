@@ -5,7 +5,7 @@ each one, its purpose, its **public API as it exists in the code today**,
 its contract (what it refuses, what it announces, and **when** — resolve
 time vs trace time), its level and allowed import direction, and its
 dependencies. Deep-dive documents are linked; signatures here are verified
-against `src/` (2026-07-31) and win over any older doc prose.*
+against `src/` (2026-08-01) and win over any older doc prose.*
 
 Conventions used throughout:
 
@@ -74,6 +74,7 @@ around the first backend init, in the one order that is correct.
 def initialize_communicator_stack(*, platform: str = "gpu",
                                   axis_names=("x", "y"),
                                   print_fn=None) -> RuntimeStack
+def finalize_process(rc: int = 0)                        # does NOT return
 def bootstrap(*, platform: str = "gpu") -> None          # steps 2–5 only
 def set_default_env(*, platform: str = "gpu") -> None
 def install_failfast_excepthook() -> None
@@ -98,7 +99,13 @@ never build a second one), `platform`, `device_kind`, `n_devices`,
 
 **Contract.** Call `initialize_communicator_stack()` ONCE at the top of a
 driver, **above the driver's own `import jax`** (the module imports jax
-only inside function bodies). Order: failfast hook → env defaults →
+only inside function bodies); all seven chain drivers do (2026-08-01).
+`finalize_process(rc)` is the sanctioned driver exit: explicit ordered
+teardown (effects barrier → unregister jax's `clean_up` atexit →
+`jax.distributed.shutdown()` → run remaining atexit hooks → announced
+`os._exit(rc)`) — it exists because jax's own interpreter-exit client
+destruction deadlocks after fully-cold in-process compile storms (jobs
+7884928/7884989); `gw.gw_jax` is the adopter. Order: failfast hook → env defaults →
 collectives announcement → plugin skip → `jax.distributed` → backend init
 (the CPU demotion point) → mesh + warm-up → compile cache → the rank-0
 startup report. Refuses: an unrecognized `XLA_PYTHON_CLIENT_ALLOCATOR`
@@ -126,8 +133,10 @@ report fails `tests/test_runtime_startup_report.py`.
 collective a driver should need — callers never touch `Mesh`,
 `NamedSharding`, `shard_map` or `multihost_utils` directly.
 
-**Public API** (`src/common/collectives.py`, selected — the two calls a
-driver actually wants are `prepare_mesh` and `gather_k_blocks`):
+**Public API** (`src/common/collectives.py`, selected — drivers get their
+warmed mesh from `runtime.initialize_communicator_stack` (all seven do,
+2026-08-01); `prepare_mesh` is the library-level door, `gather_k_blocks`
+the workhorse collective):
 
 ```python
 def prepare_mesh(mesh=None, *, axis_names=("x", "y"), print_fn=print)
@@ -162,8 +171,13 @@ def device_count() -> int;   def barrier(name, *, print_fn=print) -> bool
   collective — call synchronously on every rank.
 * `resolve_mesh` refuses (resolve time) a mesh this process cannot compute
   on (`_require_addressable`) instead of a bare `StopIteration` inside a
-  jit; with no mesh given it builds the most-square factorization of
-  `jax.devices()`.
+  jit; with no mesh given it returns the **canonical mesh** — the
+  most-square factorization of `jax.devices()`, built ONCE per process per
+  axis-name tuple and cached (`_CANONICAL_MESHES`, 2026-08-01): a library
+  that re-resolves "the run's mesh" after `initialize_communicator_stack`
+  gets THE object back, not an equal-but-distinct twin that would double
+  every shape-keyed jit cache (the identity contract of
+  `single_device_mesh`, extended to the run mesh).
 * `single_device_mesh` — the ONE 1×1 process-local mesh per process
   (identity is load-bearing: shape-keyed jit caches embed the mesh
   object). `wfn_transforms.process_local_mesh` is an alias, not a copy.
@@ -354,6 +368,12 @@ def mesh_ffi_platform(mesh) -> str
 def reset_gate_state() -> None               # tests only
 MODE_SPELLINGS = {"auto": ("auto",), "off": ("0","off","false","no"),
                   "on": ("1","on","true","yes")}
+
+# src/ffi/__init__.py — the ONE aggregate of factory-time dial state;
+# consumers fold it into kernel cache keys (ppm_tau_kernel, cohsex_sigma,
+# w_isdf).  Tier-1 lexical reads only: safe in any cache-lookup path.
+def ffi_dial_key() -> tuple    # (("fft_ffi", bool), ("fft_ffi_fused", bool),
+                               #  ("bands_gemm_ffi", bool))
 ```
 
 **Contract.** Two tiers, deliberately: `enabled()` never initializes the
