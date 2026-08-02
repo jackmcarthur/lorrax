@@ -1080,6 +1080,31 @@ _DEFAULTS = {
     # Mirrored by the isdf/core.py + gw/isdf_fitting.py signature defaults.
     # reports/gw_rank_truncation_2026-07-20 + gw_bandrange_centroids_2026-07-21.
     "zeta_rcond":           1e-8,
+    # Transverse ζ-solve family (bispinor μ_L=1,2,3 channels only; inert
+    # otherwise).  "ridge" (DEFAULT) = the historical hoisted pivoted-LU
+    # with the 1e-12·|tr|/n diagonal ridge — byte-identical to the
+    # pre-feature behavior.  "rank_truncate" = per-q eigh pseudo-inverse
+    # of the Hermitian INDEFINITE transverse CCT with an |λ| cut (drop
+    # |λ| < transverse_zeta_rcond·|λ|_max): the charge channel's
+    # conditioning cure ported to the transverse channel — TRS-paired
+    # near-null current modes are REMOVED instead of inverted through at
+    # the ridge floor (κ~1e12), and the per-q n_keep log doubles as the
+    # transverse basis-adequacy instrument.  Grammar mirrors
+    # charge_zeta_solve.  Its LOCAL plan (replicated whole-tile eigh,
+    # q-parallel at P>1) runs at ANY centroid count on ANY mesh; its
+    # DISTRIBUTED plan is selected by distributed_zeta_solve=distributed
+    # (pzheevd at the padded extent — the mesh-divisibility constraint of
+    # distributed_lu=scalapack does not apply).  distributed_lu is an LU
+    # backend key and conflicts with this family: explicit
+    # scalapack/cusolvermp + rank_truncate refuses at parse time.
+    "transverse_zeta_solve": "ridge",   # ridge | rank_truncate
+    # Transverse rank-truncation cutoff τ (relative to |λ|_max, per q).
+    # Only read by transverse_zeta_solve=rank_truncate.  Default from the
+    # 2026-08 MoS2 4×4 bispinor calibration ladder (eqp drift vs the
+    # ridge control monotone in τ and within the 1e-4 eV gauge tolerance
+    # across transverse set sizes).  No env twin (scorecard AV: policy
+    # knobs live in the deck).
+    "transverse_zeta_rcond": 1e-10,
     # γ̃-double-contract kernel variant inside the monolithic pair
     # pipeline (see ``common.gamma_matrices.gamma_double_contract``).
     # Math identical across all three; differ in HLO structure.
@@ -1750,6 +1775,8 @@ class BackendConfig:
     charge_zeta_solve: str     # "rank_truncate" | "cholesky"
     distributed_zeta_solve: str  # "auto"|"replicated"|"per_q"|"distributed"
     zeta_rcond: float          # rank-truncation cutoff (·λ_max)
+    transverse_zeta_solve: str  # "ridge" | "rank_truncate" (bispinor ζ_T)
+    transverse_zeta_rcond: float  # transverse cut τ (·|λ|_max)
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
 
     def summary(self) -> str:
@@ -1771,6 +1798,9 @@ class BackendConfig:
                if self.zeta_ridge else '')
             + (f", distributed_zeta_solve={self.distributed_zeta_solve}"
                if self.distributed_zeta_solve != 'auto' else '')
+            + (f", transverse_zeta_solve={self.transverse_zeta_solve}"
+               f"(rcond={self.transverse_zeta_rcond:g})"
+               if self.transverse_zeta_solve != 'ridge' else '')
             + f", gamma_contract={self.gamma_contract_mode}"
         )
 
@@ -2253,6 +2283,29 @@ class LorraxConfig:
             raise ValueError(
                 f"distributed_zeta_solve={_dist_zeta_solve!r} invalid; "
                 f"expected auto / replicated / per_q / distributed.")
+        _transverse_zeta_solve = str(
+            _g("transverse_zeta_solve")).strip().lower()
+        if _transverse_zeta_solve not in ("ridge", "rank_truncate"):
+            raise ValueError(
+                f"transverse_zeta_solve={_transverse_zeta_solve!r} invalid; "
+                f"expected ridge / rank_truncate.")
+        if (_transverse_zeta_solve == "rank_truncate"
+                and _dist_lu in ("scalapack", "cusolvermp", "on")):
+            # Same refusal isdf/core._resolve_solver_kind_transverse makes
+            # at resolve time, surfaced at PARSE time so a doomed bispinor
+            # deck refuses in seconds, not after the charge fit.
+            raise ValueError(
+                f"transverse_zeta_solve=rank_truncate selects the eigh "
+                f"pseudo-inverse family (distributed plan via "
+                f"distributed_zeta_solve=distributed), but "
+                f"distributed_lu={_dist_lu!r} explicitly requests an LU "
+                f"backend that family does not run.  Leave distributed_lu "
+                f"at auto/off, or keep transverse_zeta_solve=ridge.")
+        _transverse_zeta_rcond = float(_g("transverse_zeta_rcond"))
+        if not (0.0 < _transverse_zeta_rcond < 1.0):
+            raise ValueError(
+                f"transverse_zeta_rcond={_transverse_zeta_rcond!r} must be "
+                f"a relative cutoff in (0, 1).")
         try:
             import jax as _jax
             _is_cpu_backend = _jax.default_backend() == "cpu"
@@ -2386,6 +2439,8 @@ class LorraxConfig:
             charge_zeta_solve=_charge_zeta_solve,
             distributed_zeta_solve=_dist_zeta_solve,
             zeta_rcond=float(_g("zeta_rcond")),
+            transverse_zeta_solve=_transverse_zeta_solve,
+            transverse_zeta_rcond=_transverse_zeta_rcond,
             gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
         )
         # Validate the V_H source at PARSE time, not at the read that

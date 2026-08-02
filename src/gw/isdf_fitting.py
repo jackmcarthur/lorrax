@@ -162,6 +162,8 @@ def fit_zeta_to_h5(
     charge_zeta_solve: str = "cholesky",
     distributed_zeta_solve: str = "auto",
     zeta_rcond: float = 1e-8,
+    transverse_zeta_solve: str = "ridge",
+    transverse_zeta_rcond: float = 1e-10,
     gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
@@ -454,14 +456,16 @@ def fit_zeta_to_h5(
             distributed_zeta_solve,
             n_rmu=int(n_rmu_padded), nq=int(C_q_flat.shape[0]),
             mesh_xy=mesh_xy, vertex_mu_L=int(vertex_mu_L),
-            charge_zeta_solve=charge_zeta_solve)
+            charge_zeta_solve=charge_zeta_solve,
+            transverse_zeta_solve=transverse_zeta_solve)
         _resolved_solver_kind = _resolve_solver_kind(
             mesh_xy, int(vertex_mu_L), solver_kind,
             distributed_cholesky=distributed_cholesky,
             distributed_lu=distributed_lu,
             n_rmu=int(n_rmu), nq=int(C_q_flat.shape[0]),
             charge_zeta_solve=charge_zeta_solve,
-            replicated_factor_used=(_resolved_zeta_gather != 'distributed'))
+            replicated_factor_used=(_resolved_zeta_gather != 'distributed'),
+            transverse_zeta_solve=transverse_zeta_solve)
         if _resolved_zeta_gather == 'distributed':
             # The tier IS a charge-channel route: it replaces the whole
             # factor+back-solve pair, not just the gather granularity of
@@ -471,14 +475,27 @@ def fit_zeta_to_h5(
             # LIBRARY, `distributed_zeta_solve` picks whether the factor is
             # ever replicated.  Refuses rather than downgrades if the user
             # also pinned an incompatible factor route.
-            if _resolved_solver_kind not in ('replicated_rank_truncate',):
-                raise ValueError(
-                    f"distributed_zeta_solve='distributed' resolves the "
-                    f"charge factor itself, but distributed_cholesky "
-                    f"resolved to {_resolved_solver_kind!r}.  Leave "
-                    f"distributed_cholesky at 'auto' (which gives "
-                    f"replicated_rank_truncate) for this tier.")
-            _resolved_solver_kind = 'distributed_rank_truncate'
+            if int(vertex_mu_L) != 0:
+                # Transverse rank_truncate family (the ONLY way the
+                # transverse channel reaches this tier — the ridge
+                # family's resolver returns per_q above): replace the
+                # local eigh factor with the pzheevd 2D-sharded C⁺.
+                if _resolved_solver_kind != 'transverse_rank_truncate':
+                    raise ValueError(
+                        f"distributed_zeta_solve='distributed' on a "
+                        f"transverse channel expects the rank_truncate "
+                        f"family, but the solver resolved to "
+                        f"{_resolved_solver_kind!r}.")
+                _resolved_solver_kind = 'distributed_transverse_rank_truncate'
+            else:
+                if _resolved_solver_kind not in ('replicated_rank_truncate',):
+                    raise ValueError(
+                        f"distributed_zeta_solve='distributed' resolves the "
+                        f"charge factor itself, but distributed_cholesky "
+                        f"resolved to {_resolved_solver_kind!r}.  Leave "
+                        f"distributed_cholesky at 'auto' (which gives "
+                        f"replicated_rank_truncate) for this tier.")
+                _resolved_solver_kind = 'distributed_rank_truncate'
         if int(vertex_mu_L) == 0:
             _how = ("rank-truncated pinv"
                     if _resolved_solver_kind == 'replicated_rank_truncate'
@@ -493,6 +510,15 @@ def fit_zeta_to_h5(
                       else "hoisted distributed pXgetrf (block-cyclic, "
                            "once per channel)"
                       if _resolved_solver_kind == 'scalapack_lu'
+                      else "rank-truncated pinv (|lambda| cut, explicit "
+                           "C+, once per channel, rcond="
+                           f"{float(transverse_zeta_rcond):g})"
+                      if _resolved_solver_kind == 'transverse_rank_truncate'
+                      else "distributed rank-truncated pinv (pzheevd, "
+                           "2D-sharded C+, rcond="
+                           f"{float(transverse_zeta_rcond):g})"
+                      if _resolved_solver_kind
+                      == 'distributed_transverse_rank_truncate'
                       else "CCT passthrough (fused per-r-chunk getrf+getrs)")
             print(f"  Computing transverse factor = {_how_t}  "
                   f"[γ̃^{vertex_mu_L} indefinite — "
@@ -518,7 +544,8 @@ def fit_zeta_to_h5(
             L_q, lu_piv = factor_c_q(
                 C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
                 n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
-                zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond)
+                zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
+                transverse_zeta_rcond=float(transverse_zeta_rcond))
         else:
             L_q = factor_c_q(
                 C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
@@ -534,7 +561,13 @@ def fit_zeta_to_h5(
     # hoisted routes the ridge is baked into the factor, so the trace
     # (and its per-r-chunk all-reduce, 17 s of GPU stream at MoS2 3×3
     # bispinor) is gone.
-    if int(vertex_mu_L) != 0 and lu_piv is None:
+    if (int(vertex_mu_L) != 0 and lu_piv is None
+            and _resolved_solver_kind not in (
+                'transverse_rank_truncate',
+                'distributed_transverse_rank_truncate')):
+        # Rank-truncate kinds also return piv=None but carry no fused LU
+        # path — no ridge, hence no trace operand (their L_q is C⁺, whose
+        # trace would be a different, meaningless quantity here).
         with timing.section("zeta_fit.trace_L_q"):
             # LOGICAL-block trace only: the identity pad block would
             # contribute exactly +mu_pad to the padded trace, making

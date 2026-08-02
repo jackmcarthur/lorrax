@@ -27,7 +27,7 @@ count, `r` = r-chunk size, `nq` = IBZ q count, all buffers complex128
 | zeta CCT build (`isdf/core.c_q_from_psi_sm`) | none (always sharded) | one 2-D-sharded shard_map; `C_q` at `P(None,'x','y')`: `nq·mu²/P` | same path (no second plan needed) |
 | zeta charge factor (`isdf/core.factor_c_q`) | `charge_zeta_solve = rank_truncate` (default) + `distributed_cholesky = auto` → replicated whole-tile eigh pseudo-inverse, q-parallel at P>1 (`LORRAX_ZETA_QPARALLEL`): transient ≤ one q-batch replicated (4 GiB cap), compute `ceil(nq/P)·mu³` | `distributed_zeta_solve = distributed` → ScaLAPACK `pzheevd`, truncation on the replicated spectrum, C⁺ kept 2-D-sharded: `nq·mu²/P` stored, no O(mu²) replica anywhere; compute `nq·mu³/P`-class |
 | zeta charge back-solve (per r-chunk, `solve_zeta`) | `distributed_zeta_solve = auto`: `replicated` gathers the whole factor, `nq·mu²·16` B/rank/r-chunk; `per_q` gathers one `(mu,mu)` tile at a time, `mu²·(1+1/Py)·16` B live (same total traffic) | `distributed` (same key): one stacked GEMM `C⁺@Z`, both operands 2-D-sharded; received bytes `nq·(mu²/Px + mu·r/Py)·16` per r-chunk, no whole tile ever |
-| zeta transverse factor (bispinor mu_L=1,2,3; HOISTED 2026-08-01, once per channel) | `distributed_lu = auto` → per-q pivoted LU of the ridged LOGICAL tile via `lax.linalg.lu`, q-parallel at P>1 under the charge fold's policy; `(LU, piv)` stored, back-solve = `lu_solve` per r-chunk through the same replicated/per_q gather tiers — BIT-IDENTICAL to the old fused per-r-chunk `jnp.linalg.solve` | `distributed_lu = scalapack` (host) → `pXgetrf` ONCE at the logical extent, factors kept 2-D block-cyclic + per-rank ipiv threaded; `pXgetrs` per r-chunk (split FFI handlers).  `cusolvermp` (CUDA) still runs the FUSED per-r-chunk pair (hoist port pending) |
+| zeta transverse factor (bispinor mu_L=1,2,3; HOISTED 2026-08-01, once per channel) | `transverse_zeta_solve = ridge` (default) + `distributed_lu = auto` → per-q pivoted LU of the ridged LOGICAL tile via `lax.linalg.lu`, q-parallel at P>1 under the charge fold's policy; `(LU, piv)` stored, back-solve = `lu_solve` per r-chunk through the same replicated/per_q gather tiers — BIT-IDENTICAL to the old fused per-r-chunk `jnp.linalg.solve`.  `transverse_zeta_solve = rank_truncate` → per-q eigh pseudo-inverse with an \|λ\| cut (τ = `transverse_zeta_rcond`), explicit C⁺ stored, ONE GEMM per r-chunk; same replicated scaffolding (q-parallel fold, any count on any mesh) | ridge family: `distributed_lu = scalapack` (host) → `pXgetrf` ONCE at the logical extent (needs mu_T %% both mesh axes == 0), factors kept 2-D block-cyclic + per-rank ipiv threaded; `pXgetrs` per r-chunk (split FFI handlers).  `cusolvermp` (CUDA) still runs the FUSED per-r-chunk pair (hoist port pending).  rank_truncate family: `distributed_zeta_solve = distributed` → `pzheevd` at the PADDED extent (divisible by construction; pad modes zeroed = exactly inert, truncated at every τ), C⁺ kept 2-D-sharded — NO transverse divisibility constraint |
 | zeta Z_q build (`z_q_from_psi_sm`) | none (always sharded) | streaming band-chunk scan inside one shard_map; carries `(nk, ns, r/Py, mu/Px, ns)` → `/P`; per-iter FFT box `nk·(band_chunk/P)·ns·n_rtot` | same path |
 | zeta h5 write (G-flat accumulator + SlabIO) | `slab_io = auto` | accumulator `(nq_disk, mu/P, ngkmax)` → `/P`; `auto` → parallel-HDF5 FFI collective hyperslab write (no gather). The `h5py_allgather` fallback gathers the FULL `(nq_disk, mu, ngkmax)` tensor on rank 0 — announced, non-scaling; do not run large-mu with a demoted writer | same |
 | W Dyson solve (`gw/w_isdf`) | `w_dyson_solver = auto` = `local`: q-parallel per-q dense LU, `ceil(nq/P)` whole `(mu,mu)` tiles per rank — a mu² tile per rank exists | `w_dyson_solver = distributed`: 2-D block-cyclic backsolve via `ffi.linalg` `solve_lu`, `nq·mu²/P`; refuses loudly, never downgrades |
@@ -65,26 +65,43 @@ plus the launch env of `config/frontera/templates/gw_dev.sbatch`
   GW wall 335.9 → 214.6 s, eqp/sigma parity exact-0 vs control and vs the
   pre-fold baseline (job 7884656).  Bit-identity gate
   `tests/test_zeta_mesh_invariance.py::test_qparallel_execution_is_bit_identical_to_replicated`.
+  **CEILING (measured 2026-08-01): the fold saturates at P = nq_ibz** —
+  q is its only parallel axis, so every rank past nq idles for the whole
+  factor stage.  At nq=10 / P=64 (b600 deck, job 7885316) 54 of 64 ranks
+  idled for 53.7 s = 22.4 % of the GW wall; P=16→64 bought the stage
+  nothing (already 1 q/rank at P=16), so its 4.57× growth was pure μ³.
+  The announcement now states the ceiling whenever P > nq.
 * **Distributed tier, same deck** — job 7885077 (same geometry,
   `distributed_zeta_solve = distributed`): rc=0, GW wall 222.1 s;
   `zeta_fit.cholesky` 24.25 s (pzheevd + explicit 2-D-sharded C⁺
-  formation — 2.1× the q-parallel local factor at this size, EXPECTED:
-  the tier buys memory shape and P-scaling, not wall time at 16 ranks);
+  formation — 2.1× the q-parallel local factor at P/nq = 1.6);
   per-r-chunk back-solve 12.50 s vs 16.0 s local (one GEMM instead of
   two, no factor gather).  Parity vs the local tier AND vs the pre-fold
   baseline: max|Δ| = 8.6e-6 eV (eqp0/eqp1), 9.0e-6 eV
   (eqp_g0w0/sigma_diag), 4.9e-5 eV (sigma_mnk.h5) — the documented
   ~kappa·eps gauge difference (kappa ≤ 1/zeta_rcond = 1e8), 20×+ under
   physical significance (1e-3 eV); truncation active at real
-  conditioning (n_keep ≈ 1995/2992 per q).  Per-rank MaxRSS (sacct,
-  sampled) 6.0 GiB vs 4.6 GiB for the all-ranks control leg — same
-  few-GiB class, no O(nq·mu²) gather term; largest single collective
+  conditioning (n_keep ≈ 1995/2992 per q).  Largest single collective
   payload 485 MB (the `mu·r_chunk/Py` GEMM gather at r_chunk = 40544,
   announced as the documented over-budget floor; the C⁺-formation site
-  chunked at 107 MB × 4).  Wall-time crossover: at mu = 10015 the
-  all-ranks factor measured 4712 s on 64 ranks vs 236 s distributed
-  (size-campaign figures quoted in the resolver refusal text,
-  `isdf/core.py`).
+  chunked at 107 MB × 4).
+  **Wall/memory framing, corrected 2026-08-01 (jobs 7885316 local vs
+  7885323 distributed, μ=4775 / nq=10 / P=64, one deck key changed):**
+  the wall crossover is governed by **P/nq, not μ alone** — at
+  P/nq = 1.6 (b300/P=16) the distributed factor is 2.1× slower; at
+  P/nq = 6.4 it is 1.64× FASTER (`zeta_fit.cholesky` 53.71 → 32.74 s,
+  `chunk.solve` 10.20 → 6.68 s, GW wall minus startup 214.8 → 177.6 s =
+  0.83×).  The μ=10015 figure quoted in the resolver refusal text
+  (4712 s all-ranks vs 236 s distributed on 64 ranks) is the UNFOLDED
+  all-ranks comparison, not the fold's crossover.  Memory: the tier
+  removes the replicated `(nq, μ, μ)` back-solve gather, but per-rank
+  peak moves ONLY when that gather is the binder — at b600/P=64 the
+  binder was the `C_fit_one_rchunk` transient and peak VmHWM was
+  unchanged (16.24 → 16.22 GiB) despite the announced 3.69 GB/rank
+  gather being absent.  A memory claim for this tier must name the
+  binder it relieves.  Parity at this shape: 1.1–1.5e-5 eV on all four
+  .dat outputs at the run's own κ/q = 9.98e7 — the same κ·ε gauge
+  class.
 * **Fixture gates** — 2×2/4×4 distributed-vs-replicated eqp max|Δ| =
   0.00e+00 at print precision; 2×4 refused at resolve time
   (`tests/test_zeta_mesh_invariance.py`, `tests/test_ffi_linalg_contract.py`).
@@ -93,7 +110,7 @@ plus the launch env of `config/frontera/templates/gw_dev.sbatch`
 
 | threshold | value | what it decides | calibration |
 |---|---|---|---|
-| `_QPARALLEL_MIN_NQ_MU3` | 5e9 (module constant; `LORRAX_ZETA_QPARALLEL` overrides) | replicated charge factor executes q-parallel above it | 105.1 s redundant factor at nq·mu³ = 2.6e11 (job 7884656) → ~4e-10 s/unit on a 28-thread CLX rank; 5e9 ≈ 2 s, below which the two staged reshards + one compile outweigh the saving.  Mini-deck (2.6e8) stays below by design |
+| `_QPARALLEL_MIN_NQ_MU3` | 5e9 (module constant; `LORRAX_ZETA_QPARALLEL` overrides) | replicated charge factor executes q-parallel above it | 105.1 s redundant factor at nq·mu³ = 2.6e11 (job 7884656) → ~4e-10 s/unit on a 28-thread CLX rank; 5e9 ≈ 2 s, below which the two staged reshards + one compile outweigh the saving.  Mini-deck (2.6e8) stays below by design.  The fold SATURATES at P = nq (ranks past nq idle; announced whenever P > nq — jobs 7885316/7885323, see the certified-examples ceiling note); the transverse folds share the identical shape |
 | `LORRAX_ZETA_GATHER_CAP_GIB` | 4 | `auto` back-solve tier: `replicated` under the cap, `per_q` above | live-bytes budget for the gathered factor; 12×12/mu=2016 stack (9.4 GB) lands on per_q |
 | `LORRAX_ZETA_REPLICATE_CAP_GIB` | 4 | whether the charge factorization may run replicated at all (per-q-batch criterion for rank_truncate) | mu ceiling `sqrt(cap/16)` = 16384/batch; production 12×12 runs raise to 16 |
 | `LORRAX_COLLECTIVE_CHUNK_MB` | 128 | max payload of ONE emitted collective in the distributed tier (host-level q-block loop, cannot be re-fused by XLA) | 1.15 GB single-shot AllGather fatal at P=144; 0.104 GB healthy on the same 144 ranks; at P=16 impl=mpi the cap is indistinguishable from unbounded.  A per-instruction transport cap, orthogonal to the 4 GiB live-bytes cap.  Note: once ONE q's collective exceeds the budget the bound is abandoned with a loud warning (q is the only split axis) |
@@ -175,11 +192,47 @@ plans:
   the hoist port is pending; the CCT-passthrough + `lu_piv=None` fused
   branches in `solve_zeta` are preserved exactly for it.
 
-The distributed route still requires the LOGICAL mu_T extent to divide
-both mesh axes (pad-extent LU roundoff is amplified O(1) in near-null
-transverse modes): pick transverse centroid counts divisible by the mesh
-axes (the 4×4 deck now has `centroids_T_div136.txt`, 136 = %8==0) or
-auto demotes (announced) to the local plan.
+The LU (ridge-family) distributed route still requires the LOGICAL mu_T
+extent to divide both mesh axes (pad-extent LU roundoff is amplified
+O(1) in near-null transverse modes): pick transverse centroid counts
+divisible by the mesh axes (the 4×4 deck now has
+`centroids_T_div136.txt`, 136 = %8==0) or auto demotes (announced) to
+the local plan.
+
+## Transverse rank_truncate family (2026-08-01)
+
+`transverse_zeta_solve = rank_truncate` ports the charge channel's
+rank-truncating ζ solve to the transverse channels: per-q eigh of the
+Hermitian INDEFINITE transverse CCT, drop |λ| < τ·|λ|_max
+(τ = `transverse_zeta_rcond`), store the EXPLICIT truncated
+pseudo-inverse C⁺ (no BBᴴ factor exists for an indefinite C⁺; explicit
+C⁺ makes the per-r-chunk back-solve ONE GEMM).  The TRS-paired near-null
+current modes the ridge merely lifts to its 1e-12 floor (κ~1e12) are
+REMOVED, so κ_eff ≤ 1/τ by construction, and the per-q `n_keep` log is
+the transverse basis-adequacy instrument.  Default remains `ridge`
+(byte-identical legacy path) pending the calibration-driven flip.
+
+Two plans, exactly the charge family's:
+
+* **LOCAL** — replicated whole-tile eigh at the LOGICAL extent through
+  the charge factor scaffolding (`_charge_factor_math` mode
+  `'transverse_rank_truncate'`): batched under the replication cap,
+  q-parallel over devices above the fold threshold, bit-identical
+  across schedules/meshes/gather tiers by the same argument as the
+  charge fold.  Valid at ANY centroid count on ANY mesh.  Carries the
+  charge fold's P = nq saturation ceiling (per-channel nq is the same;
+  announced whenever P > nq).
+* **DISTRIBUTED** — `distributed_zeta_solve = distributed` (the same
+  key as the charge tier; `distributed_lu` is an LU-family key and
+  conflicts — refused at parse/resolve).  ScaLAPACK `pzheevd` at the
+  PADDED extent with the pad block ZEROED: pad eigenvalues are exactly
+  0, truncated at every τ, never contaminate |λ|_max — exactly-inert
+  pads, so the mesh-divisibility constraint of the LU route does not
+  exist here.  C⁺ formed and kept 2-D-sharded
+  (`_factor_c_q_distributed_rank_truncate(indefinite=True)`), back-solve
+  is the charge tier's stacked 2-D GEMM.  Different (equally valid)
+  gauge, ~κ_eff·ε vs the local plan — explicit opt-in, like the charge
+  tier.
 
 **Certified example (job 7885126, MoS2 4×4 bispinor deck, TLU host
 .so):** bi4 (402c+143T, P=4) and bi16 (785c+275T, P=16) hoisted-vs-fused

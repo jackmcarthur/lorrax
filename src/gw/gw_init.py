@@ -224,6 +224,25 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 			'distributed'
 			if str(cfg.backend.distributed_zeta_solve).strip().lower()
 			== 'distributed' else 'replicated'),
+		# TRANSVERSE solve family + cut (2026-08-01, same reader-matrix
+		# idiom as the tier key above): recorded so a family change is
+		# never silently absorbed by reuse.  Collapsed to the inert
+		# canonical ('ridge', None) when the run has no transverse
+		# channel (non-bispinor) — the keys do not change the CHARGE ζ
+		# numerically, so a non-bispinor deck toggling them must not
+		# force a spurious refit.  τ is likewise collapsed to None under
+		# the ridge family (it is not read there).  A stamp MISSING these
+		# keys is a legacy ridge-family fit (every pre-2026-08 ζ was);
+		# `_zeta_reuse_ok` allows reuse for a ridge-family rerun and
+		# refits on a real family mismatch.
+		'transverse_zeta_solve': (
+			str(cfg.backend.transverse_zeta_solve).strip().lower()
+			if cfg.bispinor else 'ridge'),
+		'transverse_zeta_rcond': (
+			float(cfg.backend.transverse_zeta_rcond)
+			if (cfg.bispinor
+			    and str(cfg.backend.transverse_zeta_solve).strip().lower()
+			    == 'rank_truncate') else None),
 		'gamma_contract_mode':  str(cfg.backend.gamma_contract_mode),
 		'write_ibz_only':       bool(write_ibz_only),
 		'vertex_mu_L':          0,
@@ -302,28 +321,43 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 			old = new = None
 			diff = None
 			detail = "(provenance unparseable)"
-		# Legacy-stamp compatibility (owner-approved, 2026-08-01): stamps
-		# written before the `distributed_zeta_solve` tier key existed are
-		# all replicated-gauge fits (the distributed tier post-dates the
-		# key).  When that key is the ONLY difference and the on-disk
-		# stamp simply lacks it, a replicated-gauge rerun may reuse the
-		# zeta (one-line notice); a distributed-tier rerun must refit —
-		# that IS a tier mismatch, just against an implicit legacy value.
-		# The schema number stays at 1 on purpose: bumping it would force
-		# a refit of every existing on-disk zeta, which this branch exists
-		# to avoid.
-		if (diff == ['distributed_zeta_solve']
-				and 'distributed_zeta_solve' not in old):
-			if str(new.get('distributed_zeta_solve')) == 'replicated':
+		# Legacy-stamp compatibility (owner-approved, 2026-08-01): a stamp
+		# MISSING a key predates that key's feature, and every pre-feature
+		# fit ran the feature's legacy value.  When the only differences
+		# are such missing keys, reuse is allowed iff this run requests
+		# exactly the legacy value for each (one-line notice); requesting
+		# anything else IS a real mismatch — refit, naming the key.  The
+		# schema number stays at 1 on purpose: bumping it would force a
+		# refit of every existing on-disk zeta, which this branch exists
+		# to avoid.  Keys and their implied legacy values:
+		#   distributed_zeta_solve  'replicated'  (the distributed tier's
+		#       block-cyclic eigh is a different gauge — 2026-08-01)
+		#   transverse_zeta_solve   'ridge'       (the rank_truncate
+		#       family is a different transverse solve — 2026-08-01)
+		#   transverse_zeta_rcond   None          (unused under ridge)
+		_LEGACY_KEY_DEFAULTS = {
+			'distributed_zeta_solve': 'replicated',
+			'transverse_zeta_solve': 'ridge',
+			'transverse_zeta_rcond': None,
+		}
+		_legacy_missing = [k for k in (diff or [])
+		                   if k in _LEGACY_KEY_DEFAULTS and k not in old]
+		if diff and diff == _legacy_missing:
+			_mismatch = [k for k in diff
+			             if new.get(k) != _LEGACY_KEY_DEFAULTS[k]]
+			if not _mismatch:
 				print_fn(f"    [zeta reuse] {zeta_h5_path}: legacy stamp "
-				         f"(no distributed_zeta_solve key) — treating as "
-				         f"replicated tier; reuse allowed.")
+				         f"(missing {', '.join(diff)}) — this run requests "
+				         f"the legacy value(s) those imply; reuse allowed.")
 			else:
+				_d2 = "; ".join(
+					f"{k}: legacy-implied={_LEGACY_KEY_DEFAULTS[k]!r} "
+					f"requested={new.get(k)!r}" for k in _mismatch)
 				print_fn(
-					f"    [zeta reuse] {zeta_h5_path}: legacy stamp has no "
-					f"distributed_zeta_solve key (= replicated-gauge fit), "
-					f"but this run requests the DISTRIBUTED tier — its "
-					f"block-cyclic eigh is a different gauge, so refitting.")
+					f"    [zeta reuse] {zeta_h5_path}: legacy stamp lacks "
+					f"{', '.join(diff)} and this run requests a DIFFERENT "
+					f"value than the legacy fit implies ({_d2}) — "
+					f"refitting.")
 				return False
 		else:
 			print_fn(f"    [zeta reuse] {zeta_h5_path} was fit under "
@@ -487,7 +521,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			cfg.paths.centroids_file_current, meta.fft_grid)
 		_resolve_solver_kind_transverse(
 			mesh_xy, cfg.backend.distributed_lu,
-			n_rmu_logical=int(_n_rmu_T_pf))
+			n_rmu_logical=int(_n_rmu_T_pf),
+			transverse_zeta_solve=cfg.backend.transverse_zeta_solve)
 	# ── ζ REUSE: skip the fit when tmp/zeta_q.h5 is complete AND provably
 	# the same fit.  Before this, a rerun in the same directory always
 	# refit (gw_init only VALIDATED the μ extent), costing 20+ min at
@@ -743,6 +778,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					distributed_lu=cfg.backend.distributed_lu,
 					zeta_ridge=cfg.backend.zeta_ridge,
 					distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
+					transverse_zeta_solve=cfg.backend.transverse_zeta_solve,
+					transverse_zeta_rcond=cfg.backend.transverse_zeta_rcond,
 					gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
 					vertex_mu_L=mu_L,
 					# Transverse ζ IBZ-write activates whenever the
