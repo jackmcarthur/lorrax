@@ -227,12 +227,34 @@ static void async_worker(
                           "phdf5 async write: H5Sget_simple_extent_dims failed"));
         return;
     }
-    bool out_of_bounds = false;
+    // Decide emptiness FIRST, and let it veto the bounds test.
+    //
+    // An empty selection writes nothing, and `offset` never reaches HDF5:
+    // the empty branch below replaces the hyperslab with H5Sselect_none,
+    // which takes no offset.  Two callers arrive here that way BY DESIGN --
+    // a rank whose local block is entirely mu padding (the shard loop above
+    // zeroes file_count when local_start >= valid_shape) and a non-canonical
+    // replica writer (`replica_dup`, which zeroes every count precisely to
+    // keep the collective H5Dwrite rendezvous).  Both still carry an offset
+    // advanced by `rank_coord * mem_dims[d]`, measured against a file that
+    // stores the LOGICAL extent -- so bounds-testing them rejects a write
+    // that was always going to be a no-op.  Only a NON-empty selection can
+    // run off the end of the dataset.
+    //
+    // Left ungated, this refuses the rank and returns without entering the
+    // collective H5Dwrite that its peers are already inside, which strands
+    // the whole communicator.  The read path never had the bug: read_ffi.cc
+    // checks emptiness and does not bounds-test at all.
     bool empty_selection = false;
     for (int d = 0; d < rank; ++d) {
-        if (file_count[(size_t)d] == 0) empty_selection = true;
-        if (offset[(size_t)d] + file_count[(size_t)d] > extent[(size_t)d]) {
-            out_of_bounds = true;
+        if (file_count[(size_t)d] == 0) { empty_selection = true; break; }
+    }
+    bool out_of_bounds = false;
+    if (!empty_selection) {
+        for (int d = 0; d < rank; ++d) {
+            if (offset[(size_t)d] + file_count[(size_t)d] > extent[(size_t)d]) {
+                out_of_bounds = true;
+            }
         }
     }
     bool debug = write_debug_enabled();

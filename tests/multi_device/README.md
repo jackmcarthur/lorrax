@@ -10,5 +10,15 @@ from `reports/device_invariance_2026-07-08/ROOT_CAUSE.md` (lorrax_sandbox).
 - `eqp_invariance_cross_p.py compare <case> <p1_dir> <p4_dir>` — the
   launcher-agnostic compare step (tolerances + rationale in its docstring).
 
-The sharp fixed-P pad-extent gate (Tier 1) IS in the default suite:
-`tests/test_mu_pad_invariance.py`.
+Padded-rank collective-write gate: `phdf5_padded_rank_write.py`, one case per
+process launch (`PADRANK_CASE=repro|control|exact`), any square P>1. The
+`repro` case makes at least one rank own a μ block that is entirely padding —
+the shape that killed two 32-node bispinor legs on 2026-08-02 by rejecting an
+empty selection before it could join the collective `H5Dwrite`. It needs a
+real `liblorrax_ffi_host.so`, so it cannot run under plain pytest.
+
+    PADRANK_CASE=repro srun -n 4 python3 -m phdf5_padded_rank_write
+
+If it ever fails, read each rank's OWN stderr file: the writer's diagnostic is
+lost from the merged log under srun+apptainer at teardown, which is precisely
+why the original failure went unattributed for a day.
