@@ -203,6 +203,8 @@ def rho_from_band_range(
     sym_ops: np.ndarray | None = None,
     chunk_gb: float = 4.0,
     verbose: bool = True,
+    dist_mesh=None,
+    chunk_bands: int | None = None,
 ) -> np.ndarray:
     """k-means weight from the density of the BAND RANGE IN USE.
 
@@ -230,6 +232,15 @@ def rho_from_band_range(
         to symmetrize, so the weight cannot itself break the k-star
         symmetry the orbit closure is there to protect.
     chunk_gb : band-chunk size target for the r-space buffer.
+    dist_mesh : the run's GLOBAL mesh (``devices.size == process_count()``).
+        Supplied ⇒ the band sweep is split across ranks and reassembled with
+        one psum per chunk; omitted ⇒ every rank recomputes the whole sweep
+        (the historical behaviour).  This is the only knob: there is no env
+        opt-out, because the distributed form is a work split, not a
+        different quadrature.  NOTE the split also cuts the per-rank ψ read
+        by ``P`` — this loader is opened process-locally (eager h5py), so
+        ranks reading disjoint bands is safe; do not "improve" it into a
+        collective read without making the call counts rank-independent.
 
     Returns
     -------
@@ -239,7 +250,8 @@ def rho_from_band_range(
     from file_io.wfn_loader import WfnLoader
     from common.wfn_transforms import to_rbox
 
-    from common.collectives import single_device_mesh
+    from common.collectives import (single_device_mesh, process_count,
+                                    process_rank, psum_replicate)
 
     b_lo, b_hi = int(band_range[0]), int(band_range[1])
     if b_hi <= b_lo:
@@ -268,24 +280,84 @@ def rho_from_band_range(
         per_band = n_k * nspinor * n_r * 16
         nb_chunk = int(max(1, min(b_hi - b_lo,
                                   (chunk_gb * 1024 ** 3) // max(per_band, 1))))
+        # The memory budget alone sizes chunks for a SERIAL sweep, where
+        # fewer/larger chunks are strictly better.  Distributed, the chunk is
+        # also the unit of work: at 600 bands / 4 GB this deck yields THREE
+        # chunks, which caps the split at 3 ranks no matter how many are
+        # available (measured job 7885968: 0.70x, i.e. slower).  Shrink to at
+        # least one chunk per rank -- never above the budget, so peak memory
+        # only falls.  Chunk boundaries are part of the summation grouping,
+        # so this changes the weight in the last bits; that is measured
+        # against the legacy chunking rather than assumed harmless.
+        if chunk_bands is not None:
+            nb_chunk = int(max(1, min(b_hi - b_lo, chunk_bands)))
+        elif dist_mesh is not None and process_count() > 1:
+            nb_chunk = int(max(1, min(
+                nb_chunk,
+                -(-(b_hi - b_lo) // int(process_count())))))
         scale = float(np.sqrt(n_r / float(wfn.cell_volume)))
         kw_j = jnp.asarray(kw).reshape(-1, 1, 1, 1, 1, 1)  # (n_k,b,s,x,y,z)
-        w = jnp.zeros(fft_grid, dtype=jnp.float64)
+        chunks = [(lo, min(lo + nb_chunk, b_hi))
+                  for lo in range(b_lo, b_hi, nb_chunk)]
+        world, rank = process_count(), process_rank()
+        # The band sum is separable, so at P>1 each rank computes only the
+        # chunks it owns and one psum per chunk puts the whole back on every
+        # rank.  Ownership is round-robin over the SAME canonical chunk list
+        # on every rank, so all ranks make the same number of psum calls (a
+        # non-owner contributes exact zeros) — a rank-dependent call count
+        # would deadlock.  Accumulating the psummed chunk totals in canonical
+        # order reproduces the serial left-fold; adding zeros is exact in
+        # IEEE-754, so the only thing that can move a bit is XLA compiling
+        # the per-chunk reduction differently when it is not fused into the
+        # accumulate.  That is measured, not assumed (see docs); P=1 keeps
+        # the original fused loop verbatim and cannot regress.
+        distribute = world > 1 and dist_mesh is not None
         if verbose:
+            how = (f"{len(chunks)} chunk(s) over {world} ranks, one psum each"
+                   if distribute else
+                   f"{len(chunks)} chunk(s), replicated on every rank"
+                   + ("" if world <= 1 else
+                      "  [no dist_mesh passed — sweep NOT distributed]"))
             print(f"[band_range weight] bands [{b_lo},{b_hi}) over {n_k} "
                   f"stored k (Σw_k={kw.sum():.4f}), grid {fft_grid}, "
-                  f"chunk={nb_chunk} bands")
-        for lo in range(b_lo, b_hi, nb_chunk):
-            hi = min(lo + nb_chunk, b_hi)
-            psi = loader.load_process_local(bands=(lo, hi), k="ibz")
-            psi_r = to_rbox(psi, g_index, fft_grid, mesh=mesh, norm="ortho")
-            # ``load_process_local`` returns exactly ``hi - lo`` bands (no
-            # mesh-divisibility padding — nothing about it is global), so this
-            # slice is a no-op there and still drops ``load``'s pad rows at P=1.
-            psi_r = psi_r[:, :hi - lo] * scale     # drop band-axis pad rows
-            w = w + jnp.sum(
-                (psi_r.real ** 2 + psi_r.imag ** 2) * kw_j, axis=(0, 1, 2))
-        w = np.asarray(jax.device_get(w), dtype=np.float64)
+                  f"chunk={nb_chunk} bands, {how}")
+        if not distribute:
+            w = jnp.zeros(fft_grid, dtype=jnp.float64)
+            for lo, hi in chunks:
+                psi = loader.load_process_local(bands=(lo, hi), k="ibz")
+                psi_r = to_rbox(psi, g_index, fft_grid, mesh=mesh, norm="ortho")
+                # ``load_process_local`` returns exactly ``hi - lo`` bands (no
+                # mesh-divisibility padding — nothing about it is global), so
+                # this slice is a no-op there and still drops ``load``'s pad
+                # rows at P=1.
+                psi_r = psi_r[:, :hi - lo] * scale   # drop band-axis pad rows
+                w = w + jnp.sum(
+                    (psi_r.real ** 2 + psi_r.imag ** 2) * kw_j, axis=(0, 1, 2))
+            w = np.asarray(jax.device_get(w), dtype=np.float64)
+        else:
+            # ONE psum for the whole sweep, not one per chunk.  Per-chunk
+            # psums are bit-identical to the serial left-fold, but the
+            # collective's FIXED cost dominates at this payload (368 KB):
+            # measured 0.85 s per call, job 7885969 — 4 chunks made the
+            # distributed sweep 12x SLOWER than replicated on the sparse leg,
+            # and at P=64 it would have cost ~50 s of pure latency.  Summing
+            # locally first and reducing once regroups the additions, which
+            # perturbs the last bits exactly like re-chunking does (measured
+            # 6.6e-16 relative, ~3 ulp).  The weight is a SAMPLING DENSITY
+            # whose consumers snap to grid points, so the gate that matters
+            # is "the centroid set does not move", not bit-identity.
+            w_loc = jnp.zeros(fft_grid, dtype=jnp.float64)
+            for i, (lo, hi) in enumerate(chunks):
+                if (i % world) != rank:
+                    continue
+                psi = loader.load_process_local(bands=(lo, hi), k="ibz")
+                psi_r = to_rbox(psi, g_index, fft_grid, mesh=mesh,
+                                norm="ortho")
+                psi_r = psi_r[:, :hi - lo] * scale
+                w_loc = w_loc + jnp.sum(
+                    (psi_r.real ** 2 + psi_r.imag ** 2) * kw_j, axis=(0, 1, 2))
+            w = psum_replicate(
+                np.asarray(jax.device_get(w_loc), dtype=np.float64), dist_mesh)
 
     if sym_ops is not None:
         n_op = int(np.asarray(sym_ops).reshape(-1, 3, 3).shape[0])

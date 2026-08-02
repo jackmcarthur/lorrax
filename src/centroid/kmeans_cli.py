@@ -260,7 +260,7 @@ def _resolve_symmetry(args, wfn, sym, charge_density):
     return None, None, None, 1, False
 
 
-def _resolve_weight(args, wfn, charge_density, Rinv, tau):
+def _resolve_weight(args, wfn, charge_density, Rinv, tau, dist_mesh=None):
     """WHICH density weights the k-means — i.e. where the quadrature gets
     points at all.  Returns ``(weight, label)``.
 
@@ -296,7 +296,8 @@ def _resolve_weight(args, wfn, charge_density, Rinv, tau):
     print(f"k-means weight: band_range Σ_{{n∈[{b_lo},{b_hi})}} Σ_k w_k|ψ_nk|²"
           f"{'' if ops is None else f' (symmetrized, {len(ops)} ops)'}")
     from .charge_density import rho_from_band_range
-    return (rho_from_band_range(wfn, (b_lo, b_hi), sym_ops=ops),
+    return (rho_from_band_range(wfn, (b_lo, b_hi), sym_ops=ops,
+                                dist_mesh=dist_mesh),
             f"band-range density Σ_{{n∈[{b_lo},{b_hi})}} Σ_k w_k|ψ_nk(r)|²")
 
 
@@ -476,7 +477,7 @@ def main():
             args.centroid_weight = ("band_range" if args.density_mode == "scalar"
                                     else "charge_density")
         weight, weight_label = _resolve_weight(
-            args, wfn, charge_density, Rinv, tau)
+            args, wfn, charge_density, Rinv, tau, dist_mesh=mesh)
 
     # w^α re-weighting.  Per Gersho the asymptotic centroid number density
     # goes as w^(3α/5), so α > 1 pulls points into high-density regions.
