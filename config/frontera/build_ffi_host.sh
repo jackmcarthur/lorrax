@@ -290,4 +290,45 @@ if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
              echo "             -Wl,--no-as-needed link line did not take." >&2
              exit 1; }
 fi
+
+# ---------------------------------------------------------------------------
+# Stamp the build's identity NEXT TO the .so.
+#
+# Stage dirs are hand-named (build_host_ONE, build_host_PADFIX, ...) and a
+# harness exports the path from a shell variable that a later line may
+# override, so a log line naming a path has never established which BYTES ran.
+# That cost real debugging time on 2026-08-02, when the certified
+# build_host_ONE turned out to predate the tree it was being compared against
+# (453 exported symbols vs 475) and nothing on disk said so.
+#
+# ffi.common.ffi_loader.library_provenance reads this file and the runtime
+# startup report prints it, so every job log now records the build it loaded.
+# Keep the format flat key=value: it is parsed by that function.
+# ---------------------------------------------------------------------------
+SO="$BUILD/liblorrax_ffi_host.so"
+if [ -f "$SO" ]; then
+    _rev=$(git -C "$LORRAX_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
+    _dirty=no
+    git -C "$LORRAX_ROOT" diff --quiet 2>/dev/null || _dirty=yes
+    {
+        echo "so=$SO"
+        echo "sha256=$(sha256sum "$SO" | cut -d' ' -f1)"
+        echo "bytes=$(stat -c %s "$SO")"
+        echo "git_rev=$_rev"
+        echo "git_dirty=$_dirty"
+        echo "source_tree=$LORRAX_ROOT"
+        echo "built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "built_on=$(hostname)"
+        echo "slate=$([ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ] && echo on || echo off)"
+        echo "exported_symbols=$(nm -D --defined-only "$SO" 2>/dev/null | wc -l)"
+        echo "hdf5_root=$LORRAX_HDF5_ROOT"
+        echo "impi_root=$LORRAX_IMPI_ROOT"
+    } > "$BUILD/PROVENANCE"
+    echo "[build_host] stamped $BUILD/PROVENANCE"
+    sed 's/^/[build_host]   /' "$BUILD/PROVENANCE"
+    if [ "$_dirty" = yes ]; then
+        echo "[build_host] WARNING: source tree had uncommitted changes; this" >&2
+        echo "             .so does not correspond to any commit." >&2
+    fi
+fi
 echo "[build_host] done."

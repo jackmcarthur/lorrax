@@ -530,6 +530,49 @@ def _loaded_path(platform: str) -> str:
     return _LIB_PATHS.get(platform, f"<{platform} library>")
 
 
+def library_provenance(platform: str) -> str:
+    """WHICH BUILD of the .so this process loaded, as one printable line.
+
+    A path is not an identity.  Stage dirs are hand-named
+    (``build_host_ONE``, ``build_host_PADFIX``, ...), a harness echoes the
+    path it *intends* from a shell variable that a later line may override,
+    and nothing in a log has ever recorded the bytes that were actually
+    dlopened.  That cost real time on 2026-08-02: two 32-node legs were
+    debugged against a lib whose revision nobody had checked, and the
+    certified ``build_host_ONE`` turned out to predate the tree it was being
+    compared with (453 exported symbols vs 475).
+
+    So: report the ``PROVENANCE`` file ``build_ffi_host.sh`` stamps beside
+    the .so, and when there is none, fall back to facts measured from the
+    file itself (size + sha256 prefix) so an unstamped legacy lib is still
+    identified rather than merely located.  Never raises — an unmeasurable
+    provenance is a string, not an exception.
+    """
+    path = _LIB_PATHS.get(platform)
+    if not path:
+        return f"{platform}: no library loaded"
+    p = Path(path)
+    try:
+        stamp = p.parent / "PROVENANCE"
+        if stamp.is_file():
+            fields = {}
+            for line in stamp.read_text().splitlines():
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    fields[k.strip()] = v.strip()
+            rev = fields.get("git_rev", "?")[:12]
+            dirty = " +dirty" if fields.get("git_dirty") == "yes" else ""
+            return (f"{p} | rev {rev}{dirty} | sha {fields.get('sha256','?')[:16]}"
+                    f" | built {fields.get('built_utc','?')}"
+                    f" | slate={fields.get('slate','?')}")
+        import hashlib
+        h = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+        return (f"{p} | NO PROVENANCE FILE (pre-stamp build) | "
+                f"{p.stat().st_size} bytes | sha {h}")
+    except Exception as exc:                                   # noqa: BLE001
+        return f"{p} | provenance unmeasurable ({type(exc).__name__}: {exc})"
+
+
 def loaded_lib_path(platform: str) -> Optional[str]:
     """The .so path loaded for ``platform``, or None if none is loaded yet.
 

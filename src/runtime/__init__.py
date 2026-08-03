@@ -1542,6 +1542,10 @@ def _ffi_library_facts(platform_key: str) -> dict:
         ffi_loader.get_lib(platform_key)
         return {"platform": platform_key,
                 "path": ffi_loader._loaded_path(platform_key),
+                # The BYTES that were dlopened, not the path a shell echoed.
+                # See ffi_loader.library_provenance for why a path alone has
+                # proved insufficient.
+                "provenance": ffi_loader.library_provenance(platform_key),
                 "loaded": True, "reason": "",
                 "env_var": ffi_loader._PLATFORMS[platform_key]["env"],
                 "env_value": os.environ.get(
@@ -1826,6 +1830,10 @@ def format_startup_report(f: dict) -> list:
                if lib.get("env_value") else
                f", which is the in-tree default because "
                f"{lib.get('env_var')} is unset."))
+        # The path is not the identity: stage dirs are hand-named and a
+        # harness can echo one path and export another.  State the BYTES.
+        if lib.get("provenance"):
+            add(f"  FFI build provenance: {lib.get('provenance')}")
     else:
         add(f"  No {lib.get('platform')} FFI library could be loaded "
             f"({lib.get('reason')}).  The FFI layer is REQUIRED "

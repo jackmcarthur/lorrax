@@ -210,7 +210,23 @@ def rho_from_band_range(
 
     ``w(r) = Σ_{n ∈ [b_lo, b_hi)} Σ_k w_k |ψ_nk(r)|²`` (the k-average over
     the WFN's stored k-set, using its k-weights), in the same
-    normalisation as :func:`rho_from_qe_save`.
+    normalisation as :func:`rho_from_qe_save` **for the nspinor=2 decks
+    LORRAX runs**.  Unlike ``psp.get_DFT_mtxels.valence_density_from_kpoint``
+    this applies NO ``spin_degeneracy_factor``: the spinor components are
+    summed over, which is the f_spin=1 case.  On a spin-restricted scalar
+    deck (f_spin=2) the two would differ by that factor.  Harmless here —
+    the k-means normalises its weight, so only the SHAPE of w matters — but
+    do not reuse this array as a physical ρ without checking f_spin.
+
+    Point-group treatment, and how it differs from the psp density: that
+    routine is handed either the IBZ (⇒ ``wfn.kweights``) or an already
+    UNFOLDED full-BZ k-set (⇒ equal 1/nk_tot), and never symmetrises ρ,
+    because the rotation is already carried by the unfolded ψ.  This
+    routine reads the RAW IBZ (``k='ibz'``, no unfold) and symmetrises the
+    summed density afterwards instead — the dual operation, since averaging
+    the un-rotated IBZ sum over G reproduces the star sum.  Avoiding the
+    unfold is deliberate: it keeps the weight independent of the machinery
+    that ``common.density_symmetry_check`` exists to test.
 
     WHY THIS FEATURE EXISTS: the occupied-only ρ(r) is entirely inside the
     slab, so a ρ-weighted k-means puts ZERO centroids in the vacuum and the
@@ -234,13 +250,23 @@ def rho_from_band_range(
     chunk_gb : band-chunk size target for the r-space buffer.
     dist_mesh : the run's GLOBAL mesh (``devices.size == process_count()``).
         Supplied ⇒ the band sweep is split across ranks and reassembled with
-        one psum per chunk; omitted ⇒ every rank recomputes the whole sweep
-        (the historical behaviour).  This is the only knob: there is no env
-        opt-out, because the distributed form is a work split, not a
-        different quadrature.  NOTE the split also cuts the per-rank ψ read
-        by ``P`` — this loader is opened process-locally (eager h5py), so
-        ranks reading disjoint bands is safe; do not "improve" it into a
-        collective read without making the call counts rank-independent.
+        ONE psum for the whole sweep; omitted ⇒ every rank recomputes the
+        whole sweep (the historical behaviour).  This is the only knob:
+        there is no env opt-out, because the distributed form is a work
+        split, not a different quadrature.  NOTE the split also cuts the
+        per-rank ψ read by ``P`` — this loader is opened process-locally
+        (eager h5py), so ranks reading disjoint bands is safe; do not
+        "improve" it into a collective read without making the call counts
+        rank-independent.  Peak memory only FALLS: the chunk is also the
+        unit of work, so it is shrunk (never grown) to give every rank one,
+        and the accumulator is the same size as the replicated ``w``.
+    chunk_bands : TEST-ONLY override of the band-chunk size, bypassing both
+        the memory budget and the per-rank split.  No caller in ``src``
+        passes it; it exists so an A/B can force the replicated leg to use
+        the SAME chunk boundaries as the distributed one, which is what
+        separates "the work split changed the answer" from "re-chunking
+        changed the answer" — two different questions that the default
+        sizing would otherwise confound.  Do not use it in a driver.
 
     Returns
     -------
@@ -301,19 +327,19 @@ def rho_from_band_range(
                   for lo in range(b_lo, b_hi, nb_chunk)]
         world, rank = process_count(), process_rank()
         # The band sum is separable, so at P>1 each rank computes only the
-        # chunks it owns and one psum per chunk puts the whole back on every
-        # rank.  Ownership is round-robin over the SAME canonical chunk list
-        # on every rank, so all ranks make the same number of psum calls (a
-        # non-owner contributes exact zeros) — a rank-dependent call count
-        # would deadlock.  Accumulating the psummed chunk totals in canonical
-        # order reproduces the serial left-fold; adding zeros is exact in
-        # IEEE-754, so the only thing that can move a bit is XLA compiling
-        # the per-chunk reduction differently when it is not fused into the
-        # accumulate.  That is measured, not assumed (see docs); P=1 keeps
-        # the original fused loop verbatim and cannot regress.
+        # chunks it owns, sums them LOCALLY, and ONE psum puts the whole back
+        # on every rank.  Ownership is round-robin over the SAME canonical
+        # chunk list on every rank, and the psum is outside the loop, so the
+        # collective call count is rank-independent by construction (a rank
+        # owning no chunk reduces its zero accumulator) — a rank-dependent
+        # count would deadlock.  Summing locally first REGROUPS the additions
+        # relative to the serial left-fold, so the result is NOT bit-identical
+        # to it; that is deliberate and measured (see the else: branch), not
+        # an oversight.  P=1 keeps the original fused loop verbatim and cannot
+        # regress.
         distribute = world > 1 and dist_mesh is not None
         if verbose:
-            how = (f"{len(chunks)} chunk(s) over {world} ranks, one psum each"
+            how = (f"{len(chunks)} chunk(s) over {world} ranks, one psum total"
                    if distribute else
                    f"{len(chunks)} chunk(s), replicated on every rank"
                    + ("" if world <= 1 else
@@ -369,8 +395,8 @@ def rho_from_band_range(
         w = w_sym
     if verbose:
         print(f"[band_range weight] Σ_r w = {w.sum():.4f} over {b_hi - b_lo} "
-              f"bands (same normalisation as rho_from_qe_save, whose Σ_r ρ "
-              f"covers the {int(wfn.nelec)} occupied)")
+              f"bands (rho_from_qe_save normalisation at f_spin=1, whose "
+              f"Σ_r ρ covers the {int(wfn.nelec)} occupied)")
     return w
 
 
