@@ -503,9 +503,14 @@ def test_auditor_truncation_guard_can_fail():
 
 _FFBZ = "LORRAX_FORCE_FULL_BZ"
 
-#: The five modules that read it.  Enumerated rather than discovered so a
-#: SIXTH reader appearing with a hand-rolled parse fails this test.
-_FFBZ_SITES = {"gw/gw_init.py": 3, "gw/screening.py": 1, "gw/v_q_g_flat.py": 1}
+#: The modules that read it.  Enumerated rather than discovered so a NEW
+#: reader appearing with a hand-rolled parse fails this test.  gw_init
+#: went 3 → 2 on 2026-08-04: the transverse ζ IBZ gate is now DERIVED
+#: from the charge one (``_write_ibz_only_transverse = cfg.bispinor and
+#: _write_ibz_only_charge``) instead of re-reading the environment, so
+#: the ζ_T provenance stamp and the ζ_T fit call cannot disagree about
+#: what was requested.  Total is 4.
+_FFBZ_SITES = {"gw/gw_init.py": 2, "gw/screening.py": 1, "gw/v_q_g_flat.py": 1}
 
 
 def _audit_env_grammar(src, name, knob):
@@ -532,7 +537,7 @@ def _audit_env_grammar(src, name, knob):
     return good, bad
 
 
-def test_force_full_bz_has_one_grammar_at_all_five_sites():
+def test_force_full_bz_has_one_grammar_at_every_site():
     """R5.  All five were ``bool(int(os.environ.get(...)))``, which accepts
     decimal digits ONLY: ``=true``/``=on``/``=yes`` raised a bare
     ``invalid literal for int()`` from inside the ISDF / V_q / W paths, and
@@ -548,7 +553,7 @@ def test_force_full_bz_has_one_grammar_at_all_five_sites():
             % (relpath, good, _FFBZ, expect))
         total += good
     assert complaints == [], complaints
-    assert total == 5, total
+    assert total == 4, total
 
 
 def test_no_module_anywhere_reads_force_full_bz_by_hand():

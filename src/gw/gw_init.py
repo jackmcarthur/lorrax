@@ -141,7 +141,8 @@ _ZETA_PROVENANCE_SCHEMA = 1
 
 def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
                          zeta_cutoff, zeta_vcoul_cutoff, write_ibz_only,
-                         band_norms):
+                         band_norms, vertex_mu_L=0,
+                         transverse_identity=None):
 	"""Canonical JSON description of everything the ζ fit consumed.
 
 	Every entry is an input that CHANGES ζ numerically.  Deliberately
@@ -172,8 +173,37 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	flip it off when the orbit-closure check fails — but that check is a
 	deterministic function of (centroids, symmetry), both of which are
 	pinned by other entries here, so the effective value is pinned too.
+
+	``meta`` / ``vertex_mu_L`` select WHICH ζ file this stamp describes.
+	A bispinor run writes FOUR ζ files from one configuration — the
+	charge ζ (``meta``, ``vertex_mu_L=0``) and three transverse ζ
+	(``meta_T``, ``vertex_mu_L ∈ {1,2,3}``) — so the same builder is
+	called once per file with that file's own μ extent and vertex.  The
+	stamps then differ in exactly the two entries that make the files
+	different, and a ζ_T stamped for one vertex can never be reused as
+	another.
+
+	``transverse_identity`` pins the transverse CHANNEL on every stamp,
+	including the charge one: the transverse centroid count, that
+	table's content hash, and the two knobs that set the transverse
+	solve gauge (``distributed_lu`` and the resolved transverse solver
+	kind).  It is REQUIRED for a bispinor run — a bispinor ζ set whose
+	stamp did not name its transverse basis could be reused by a rerun
+	that changed ``centroids_file_current``, which is the σ^B analogue
+	of pattern #10.  It is ignored (all four keys collapse to ``None``)
+	for a non-bispinor run, where no transverse channel exists and the
+	keys must not force a spurious refit of any existing charge-only ζ.
 	"""
 	import json
+	if bool(cfg.bispinor) and not transverse_identity:
+		raise ValueError(
+			"_zeta_fit_provenance: cfg.bispinor is set but no "
+			"transverse_identity was supplied.  A bispinor ζ stamp that "
+			"omits the transverse centroid table / solver identity would "
+			"let a rerun with a DIFFERENT centroids_file_current reuse "
+			"this fit (Σ^B evaluated at the wrong r_μ).  Pass the dict "
+			"built in fit_zeta's bispinor pre-flight.")
+	_ti = dict(transverse_identity or {}) if bool(cfg.bispinor) else {}
 	from isdf.core import deprecated_env_record as _dep_env_record
 	# ``wfn._filename`` is the same source path fit_zeta_to_h5 copies
 	# mf_header from — the authoritative identity of the ζ's input WFN.
@@ -243,9 +273,44 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 			if (cfg.bispinor
 			    and str(cfg.backend.transverse_zeta_solve).strip().lower()
 			    == 'rank_truncate') else None),
+		# TRANSVERSE CHANNEL identity (2026-08-04, same reader-matrix
+		# idiom as the two key generations above).  ζ reuse used to be
+		# switched off for the whole bispinor run, so none of this had
+		# anywhere to be recorded; with reuse live, everything that
+		# changes a ζ_T has to be here or a wrong ζ_T gets reused.
+		#   n_rmu_transverse         — the transverse μ extent.
+		#   centroids_transverse_md5 — that table's CONTENT (same hash
+		#       `_centroid_table_md5` stamps on the restart tensors): a
+		#       regenerated centroids_file_current with the SAME count
+		#       but different points is pattern #10 and passes a
+		#       count-only check.
+		#   distributed_lu           — the transverse LU backend.  A ζ_T
+		#       fit under `scalapack` (block-cyclic gauge) must not be
+		#       reused by an `off` rerun (per-q jnp.linalg.solve) and
+		#       vice versa.  This is the RESOLVED deck value: gw_config
+		#       already demotes `auto`→`off` on a CPU backend, so the
+		#       recorded string is what the fit ran.
+		#   transverse_solver_kind   — what `_resolve_solver_kind_transverse`
+		#       actually returned ('lu' | 'scalapack_lu' | 'cusolvermp_lu'
+		#       | 'transverse_rank_truncate').  Recorded IN ADDITION to
+		#       the two knobs above because on a GPU mesh `auto` resolves
+		#       by mesh shape, and those two resolutions are genuinely
+		#       different gauges.  This is the one place a device-count
+		#       dependence is deliberately admitted into the stamp: the
+		#       exclusion at the top of this docstring covers quantities
+		#       ζ is INVARIANT under, and this is not one of them.
+		# All four collapse to None on a non-bispinor deck (no transverse
+		# channel ⇒ inert), so a charge-only rerun over a pre-2026-08-04
+		# stamp reuses under the legacy-missing-key rule below.
+		'n_rmu_transverse':     (int(_ti['n_rmu']) if _ti else None),
+		'centroids_transverse_md5': (
+			str(_ti['centroids_md5']) if _ti else None),
+		'distributed_lu':       (str(_ti['distributed_lu']) if _ti else None),
+		'transverse_solver_kind': (
+			str(_ti['solver_kind']) if _ti else None),
 		'gamma_contract_mode':  str(cfg.backend.gamma_contract_mode),
 		'write_ibz_only':       bool(write_ibz_only),
-		'vertex_mu_L':          0,
+		'vertex_mu_L':          int(vertex_mu_L),
 		'band_norms':           bn,
 		'fft_grid':             [int(x) for x in np.asarray(meta.fft_grid).reshape(3)],
 		'ecutwfc':              round(float(wfn.ecutwfc), 9),
@@ -257,7 +322,7 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 
 
 def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
-                   print_fn=print):
+                   print_fn=print, *, n_rmu_expected=None):
 	"""Can we skip the ζ fit and reuse ``zeta_h5_path`` as-is?
 
 	Returns ``True`` only when EVERY one of these holds:
@@ -267,11 +332,19 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 	  3. ``zeta_is_done`` is True (the writer flipped it after the last
 	     H5Dwrite drained — a crashed fit leaves it False);
 	  4. ``fit_provenance`` is present AND byte-identical to this run's —
-	     with ONE named exception: a legacy stamp lacking the
-	     ``distributed_zeta_solve`` key is treated as a replicated-gauge
-	     fit (announced), so pre-2026-08 run dirs stay reusable by
-	     replicated-tier reruns while a distributed-tier rerun refits;
-	  5. the on-disk centroid table equals this run's centroid indices.
+	     with ONE named exception, the legacy-key table below: a stamp
+	     that differs ONLY by keys added after it was written is read as
+	     having run each of those keys' legacy value, so old run dirs
+	     stay reusable by a rerun that asks for exactly those values
+	     (announced) while any other request refits, naming the key;
+	  5. the on-disk centroid table equals this run's centroid indices;
+	  6. (``n_rmu_expected`` given) the ζ DATASET's μ extent equals it.
+	     The header and the dataset are written by two different calls,
+	     so a file can carry a good header over a ζ of the wrong shape.
+	     :func:`_check_zeta_h5_matches_basis` RAISES on that for the
+	     charge file; here the same probe only declines to reuse,
+	     because a transverse ζ from a different centroid set is a
+	     legitimate thing to overwrite and must not kill the run.
 
 	Anything unexpected — missing attr, unreadable file, legacy header —
 	returns False, i.e. REFIT.  Every failure mode costs compute; none
@@ -313,13 +386,32 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		try:
 			old = json.loads(hdr.fit_provenance)
 			new = json.loads(provenance_json)
-			diff = sorted(k for k in set(old) | set(new)
-			              if old.get(k) != new.get(k))
+			# THREE distinct ways two stamps disagree, kept apart because
+			# they get different verdicts (2026-08-04).  The earlier code
+			# collapsed them into one value-difference list over the key
+			# UNION, which silently mis-handled a key ADDED with a value
+			# equal to its legacy default: `old.get(k) is None == new[k]`
+			# put the key in NEITHER list, so the difference list came out
+			# empty while the JSON strings still differed — and an empty
+			# list fell through to the generic "fit under DIFFERENT
+			# inputs" refit with an EMPTY "Changed:" detail.  That is a
+			# spurious refit of every pre-2026-08-04 charge ζ, i.e. the
+			# exact outcome this whole branch exists to prevent.  Caught
+			# by tests/test_zeta_provenance_matrix.py.
+			_added = sorted(set(new) - set(old))       # stamp predates key
+			_dropped = sorted(set(old) - set(new))     # stamp is NEWER
+			diff = sorted(k for k in (set(old) & set(new))
+			              if old[k] != new[k])
 			detail = "; ".join(
-				f"{k}: on-disk={old.get(k)!r} now={new.get(k)!r}" for k in diff)
+				[f"{k}: on-disk={old.get(k)!r} now={new.get(k)!r}"
+				 for k in diff]
+				+ ([f"keys ADDED since the stamp: {', '.join(_added)}"]
+				   if _added else [])
+				+ ([f"keys the stamp has and this LORRAX does not write: "
+				    f"{', '.join(_dropped)}"] if _dropped else []))
 		except Exception:
 			old = new = None
-			diff = None
+			diff = _added = _dropped = None
 			detail = "(provenance unparseable)"
 		# Legacy-stamp compatibility (owner-approved, 2026-08-01): a stamp
 		# MISSING a key predates that key's feature, and every pre-feature
@@ -335,19 +427,41 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		#   transverse_zeta_solve   'ridge'       (the rank_truncate
 		#       family is a different transverse solve — 2026-08-01)
 		#   transverse_zeta_rcond   None          (unused under ridge)
+		#   n_rmu_transverse         None  ┐ 2026-08-04: ζ reuse was
+		#   centroids_transverse_md5 None  │ charge-channel-only before,
+		#   distributed_lu           None  │ so a stamp lacking these
+		#   transverse_solver_kind   None  ┘ four was written by a run
+		#       whose reuse decision never consulted a transverse
+		#       channel.  A non-bispinor rerun requests None for all
+		#       four and reuses (they are inert without a transverse
+		#       channel); a BISPINOR rerun requests real values and
+		#       refits — the only safe reading, because such a stamp
+		#       carries no evidence about the ζ_T files beside it and
+		#       those ζ_T carry no stamp of their own at all.
 		_LEGACY_KEY_DEFAULTS = {
 			'distributed_zeta_solve': 'replicated',
 			'transverse_zeta_solve': 'ridge',
 			'transverse_zeta_rcond': None,
+			'n_rmu_transverse': None,
+			'centroids_transverse_md5': None,
+			'distributed_lu': None,
+			'transverse_solver_kind': None,
 		}
-		_legacy_missing = [k for k in (diff or [])
-		                   if k in _LEGACY_KEY_DEFAULTS and k not in old]
-		if diff and diff == _legacy_missing:
-			_mismatch = [k for k in diff
+		# The exception applies ONLY when the difference is entirely
+		# "this stamp predates some keys": every key the two stamps share
+		# agrees, nothing the stamp carries has been dropped, and every
+		# added key has a declared legacy meaning.  A stamp carrying a key
+		# this LORRAX no longer writes came from a NEWER build and gets no
+		# exception — its meaning is unknown here.
+		_legacy_shaped = (
+			old is not None and not diff and not _dropped and _added
+			and all(k in _LEGACY_KEY_DEFAULTS for k in _added))
+		if _legacy_shaped:
+			_mismatch = [k for k in _added
 			             if new.get(k) != _LEGACY_KEY_DEFAULTS[k]]
 			if not _mismatch:
 				print_fn(f"    [zeta reuse] {zeta_h5_path}: legacy stamp "
-				         f"(missing {', '.join(diff)}) — this run requests "
+				         f"(missing {', '.join(_added)}) — this run requests "
 				         f"the legacy value(s) those imply; reuse allowed.")
 			else:
 				_d2 = "; ".join(
@@ -355,7 +469,7 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 					f"requested={new.get(k)!r}" for k in _mismatch)
 				print_fn(
 					f"    [zeta reuse] {zeta_h5_path}: legacy stamp lacks "
-					f"{', '.join(diff)} and this run requests a DIFFERENT "
+					f"{', '.join(_added)} and this run requests a DIFFERENT "
 					f"value than the legacy fit implies ({_d2}) — "
 					f"refitting.")
 				return False
@@ -372,6 +486,36 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		print_fn(f"    [zeta reuse] {zeta_h5_path} holds a DIFFERENT centroid "
 		         f"set ({got.shape} vs {want.shape}) — refitting.")
 		return False
+	if n_rmu_expected is not None:
+		# Header ≠ dataset: the two are written by separate calls
+		# (write_isdf_header, then the SlabIO create/write), so a file
+		# can pass every check above and still hold a ζ of the wrong
+		# shape — e.g. a run killed after the header write, or a
+		# transverse ζ left over from a different centroids_file_current.
+		_ext = None
+		try:
+			with h5py.File(zeta_h5_path, 'r') as f:
+				# G-flat (production): (n_q, n_rmu, ngkmax).
+				# r-space (legacy):    (n_q, n_rtot, n_rmu).
+				for _name, _mu_axis in (('zeta_q_G', 1), ('zeta_q', 2)):
+					_d = f.get(_name)
+					if _d is not None and _d.ndim == 3:
+						_ext = int(_d.shape[_mu_axis])
+						break
+		except Exception as exc:
+			print_fn(f"    [zeta reuse] {zeta_h5_path}: ζ dataset unreadable "
+			         f"({type(exc).__name__}: {exc}) — refitting.")
+			return False
+		if _ext is None:
+			print_fn(f"    [zeta reuse] {zeta_h5_path} has an isdf_header but "
+			         f"NO ζ dataset (neither zeta_q_G nor zeta_q) — "
+			         f"refitting.")
+			return False
+		if _ext != int(n_rmu_expected):
+			print_fn(f"    [zeta reuse] {zeta_h5_path} holds a ζ at "
+			         f"n_mu={_ext} but this channel has "
+			         f"n_mu={int(n_rmu_expected)} — refitting.")
+			return False
 	return True
 
 
@@ -393,6 +537,37 @@ def _centroid_table_md5(centroid_fft_idx) -> str:
 	arr = np.ascontiguousarray(
 		np.asarray(jax.device_get(centroid_fft_idx), dtype=np.int64))
 	return hashlib.md5(arr.tobytes()).hexdigest()
+
+
+def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
+                         band_slices, chunks):
+	"""Sample ψ at the TRANSVERSE centroid set and package it for σ^B.
+
+	This is the whole of ``transverse_wfn_data``: ψ at r_{μ_T} over the
+	full band window, plus the transverse ``meta`` and centroid table.
+	It is a pure function of (WFN.h5, symmetry, transverse centroids,
+	band window) — the ζ_T fit contributes NOTHING to it, which is why
+	the ζ-reuse path can rebuild it instead of refitting.
+
+	ONE call site per path (fit and reuse) on purpose: the reuse leg
+	must produce bit-identical ψ to the fit leg, and the cheapest way
+	to guarantee that is for both to run the same code.
+	"""
+	from common.wfn_transforms import load_centroids_band_chunked
+	with timing.section("gw_jax.load_centroid_wfns_current"):
+		psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
+			wfn, sym, meta_T, cent_T_idx, cfg.bispinor, mesh_xy,
+			band_range=band_slices.full_range,
+			band_chunk_size=chunks['band_chunk'],
+		)
+	# Keeping these arrays alive across the return is intentional —
+	# they are the only way the σ^B kernel can sample ψ at r_{μ_T}.
+	return {
+		'psi_rmu_Y':        psi_curr_rmu_Y,
+		'psi_rmuT_X':       psi_curr_rmuT_X,
+		'meta':             meta_T,
+		'centroid_indices': cent_T_idx,
+	}
 
 
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
@@ -495,8 +670,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# transverse distributed-LU contract BEFORE any compute.  The
 	# divisibility refusal (isdf/core._resolve_solver_kind_transverse)
 	# used to fire only inside the transverse fit_zeta_to_h5 calls below,
-	# which run AFTER the charge fit completes — and a bispinor run always
-	# refits the charge channel (ζ reuse is charge-only), so an explicit
+	# which run AFTER the charge fit completes, so an explicit
 	# distributed_lu whose transverse centroid count does not divide the
 	# mesh burned the multi-hour charge fit before the inevitable
 	# ValueError.  Every input needed to refuse — mesh shape,
@@ -505,6 +679,22 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# call announces an ``auto`` demotion up front (rank 0).  The
 	# per-channel resolution inside fit_zeta_to_h5 later re-resolves
 	# identically (defense in depth).
+	#
+	# The pre-flight also OWNS the transverse channel's identity for the
+	# rest of this function (2026-08-04): the centroid table, its μ
+	# extent, ``meta_T`` and the resolved solver kind are all needed
+	# before the ζ-reuse decision — which now covers the transverse
+	# channel — and were previously rebuilt from scratch after the charge
+	# fit.  One construction site, consumed by the provenance stamp, the
+	# reuse check, the ψ sampling and the μ_L fit loop alike.
+	_meta_T = None
+	_cent_T_idx = None
+	_transverse_identity = None
+	# Transverse ζ IBZ-write activates whenever the bispinor V_q
+	# orchestrator iterates IBZ q's — the SAME gate the charge ζ uses,
+	# so it is derived from the charge value rather than re-reading the
+	# environment (one env_bool call, one announcement).
+	_write_ibz_only_transverse = bool(cfg.bispinor) and _write_ibz_only_charge
 	if cfg.bispinor:
 		# Requirement check hoisted with the pre-flight (it used to sit
 		# after the charge fit, same late-refusal shape).
@@ -515,39 +705,130 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				"centroids_frac_NNN_current.txt from "
 				"`centroid.kmeans_cli --density-mode current ...`)."
 			)
+		import dataclasses
 		from file_io.centroids import load_centroids as _load_cent_pf
 		from isdf.core import _resolve_solver_kind_transverse
-		_, _, _n_rmu_T_pf = _load_cent_pf(
+		from runtime.padding import padded_mu_extent
+		_, _cent_T_idx_np, _n_rmu_T_pf = _load_cent_pf(
 			cfg.paths.centroids_file_current, meta.fft_grid)
-		_resolve_solver_kind_transverse(
+		_transverse_solver_kind = _resolve_solver_kind_transverse(
 			mesh_xy, cfg.backend.distributed_lu,
 			n_rmu_logical=int(_n_rmu_T_pf),
 			transverse_zeta_solve=cfg.backend.transverse_zeta_solve)
-	# ── ζ REUSE: skip the fit when tmp/zeta_q.h5 is complete AND provably
+		_cent_T_idx = jnp.asarray(_cent_T_idx_np, dtype=jnp.int32)
+		# n_rmu_padded uses world_size (= ∏ p_a over the device mesh).
+		# Without this refresh the bispinor transverse fit_zeta inherits
+		# the charge-channel padded extent, and the C_q reshape at
+		# isdf_fitting.py:1442 trips a TypeError when the transverse
+		# centroid count differs from the charge count.
+		# ``padded_mu_extent`` also honors the test-only
+		# LORRAX_EXTRA_MU_PAD knob (pad-extent-invariance gate).
+		_meta_T = dataclasses.replace(
+			meta,
+			n_rmu=int(_n_rmu_T_pf),
+			n_rmu_padded=int(padded_mu_extent(int(_n_rmu_T_pf),
+			                                  int(jax.device_count()))),
+		)
+		# ``sys_dim`` is set dynamically on ``meta`` by gw_jax.main
+		# (Meta has no sys_dim field), so dataclasses.replace doesn't
+		# carry it over.  Copy it explicitly — fit_zeta_to_h5 reads
+		# meta.sys_dim when building the per-q G-flat sphere.
+		_meta_T.sys_dim = meta.sys_dim
+		# Hashed off the HOST table (no device round-trip), which is the
+		# same int64 view ``_centroid_table_md5`` takes of the device
+		# array stamped on the restart tensors — the two hashes of one
+		# centroid file are equal by construction.
+		_transverse_identity = {
+			'n_rmu':          int(_n_rmu_T_pf),
+			'centroids_md5':  _centroid_table_md5(_cent_T_idx_np),
+			'distributed_lu': str(cfg.backend.distributed_lu).strip().lower(),
+			'solver_kind':    str(_transverse_solver_kind),
+		}
+	# ── ζ REUSE: skip the fit when the ζ files are complete AND provably
 	# the same fit.  Before this, a rerun in the same directory always
 	# refit (gw_init only VALIDATED the μ extent), costing 20+ min at
 	# fixture scale and ~22 min at MoS2 12×12/P=80 for a byte-identical
-	# result.  Reuse is charge-channel-only: the bispinor branch below
-	# also produces ``transverse_wfn_data``, which is not on disk, so a
-	# bispinor run always refits.  Override with LORRAX_FORCE_REFIT=1.
+	# result.  Override with LORRAX_FORCE_REFIT=1.
+	#
+	# BISPINOR (2026-08-04).  Reuse used to be gated off for the whole
+	# bispinor run — ``_reuse = (not cfg.bispinor) and ...`` — because
+	# the bispinor branch also returns ``transverse_wfn_data`` and "that
+	# is not on disk".  It does not need to be: that dict is ψ sampled at
+	# the transverse centroids (plus meta_T and the centroid table), a
+	# pure function of WFN.h5 + the centroid file that the ζ_T fit does
+	# not contribute to.  The reuse path REBUILDS it via
+	# ``_transverse_wfn_data`` — the same call the fit path makes —
+	# instead of returning None.  Returning None here would silently drop
+	# Σ^B (rc=0, wrong physics), which is exactly the failure commit
+	# 3d89885 fixed on the restart round-trip.  Measured at b600 bispinor
+	# (job 7885966) the rebuild costs ~9 s against a 318 s refit.
+	#
+	# A bispinor reuse is ALL FOUR channels or none: the charge ζ and all
+	# three ζ_T must each pass, or every one is refit.  Partial reuse
+	# would be defensible (the channels are numerically independent) but
+	# it doubles the number of states this cache can be in for no
+	# measured gain — the expensive case is the whole set.
 	_provenance = _zeta_fit_provenance(
 		wfn=wfn, meta=meta, cfg=cfg,
 		band_range_left=band_range_left, band_range_right=band_range_right,
 		zeta_cutoff=_zeta_cutoff, zeta_vcoul_cutoff=_zeta_vcoul_cutoff,
-		write_ibz_only=_write_ibz_only_charge, band_norms=_band_norms)
-	_reuse = (not cfg.bispinor) and _zeta_reuse_ok(
-		zeta_h5_path, _provenance, centroid_indices, print_fn=print_fn)
+		write_ibz_only=_write_ibz_only_charge, band_norms=_band_norms,
+		vertex_mu_L=0, transverse_identity=_transverse_identity)
+
+	def _provenance_T(mu_L):
+		"""The charge stamp with this transverse channel's μ and vertex."""
+		return _zeta_fit_provenance(
+			wfn=wfn, meta=_meta_T, cfg=cfg,
+			band_range_left=band_range_left,
+			band_range_right=band_range_right,
+			zeta_cutoff=_zeta_cutoff, zeta_vcoul_cutoff=_zeta_vcoul_cutoff,
+			write_ibz_only=_write_ibz_only_transverse,
+			band_norms=_band_norms,
+			vertex_mu_L=int(mu_L), transverse_identity=_transverse_identity)
+
+	_zeta_T_paths = {
+		mu_L: os.path.join(tmp_dir, f"zeta_q_mu{mu_L}.h5")
+		for mu_L in (1, 2, 3)
+	}
+	_reuse = _zeta_reuse_ok(
+		zeta_h5_path, _provenance, centroid_indices, print_fn=print_fn,
+		n_rmu_expected=int(meta.n_rmu))
+	if _reuse and cfg.bispinor:
+		for mu_L, _zeta_T_path in _zeta_T_paths.items():
+			if not _zeta_reuse_ok(
+					_zeta_T_path, _provenance_T(mu_L), _cent_T_idx,
+					print_fn=print_fn,
+					n_rmu_expected=int(_meta_T.n_rmu)):
+				print_fn(
+					f"    [zeta reuse] the transverse ζ for μ_L={mu_L} "
+					f"({_zeta_T_path}) is NOT reusable, so the charge ζ is "
+					f"not reused either — refitting all four channels.")
+				_reuse = False
+				break
 	if _reuse:
 		print_fn("")
 		print_fn("  " + "=" * 68)
 		print_fn(f"  REUSING the existing ζ at {zeta_h5_path} — FIT SKIPPED.")
+		if cfg.bispinor:
+			print_fn( "  ...and the three transverse ζ at "
+			          "zeta_q_mu{1,2,3}.h5.")
 		print_fn( "  isdf_header/zeta_is_done is True, the centroid table")
 		print_fn( "  matches, and fit_provenance is identical to this run's")
 		print_fn( "  inputs (band windows, cutoffs, solver knobs, source WFN).")
 		print_fn( "  Set LORRAX_FORCE_REFIT=1 to refit unconditionally.")
 		print_fn("  " + "=" * 68)
 		print_fn("")
-		return zeta_h5_path, mem_est, None
+		if not cfg.bispinor:
+			return zeta_h5_path, mem_est, None
+		# ψ at r_{μ_T} is NOT on disk here (the restart tensors file is a
+		# different mechanism and may not exist yet), so re-sample it.
+		# Same call as the fit path — see ``_transverse_wfn_data``.
+		print_fn(f"  [bispinor] re-sampling ψ at the {int(_meta_T.n_rmu)} "
+		         f"transverse centroids for σ^B (the ζ_T fit is skipped, "
+		         f"but Σ^B still needs ψ(r_{{μ_T}})).")
+		return zeta_h5_path, mem_est, _transverse_wfn_data(
+			wfn, sym, _meta_T, _cent_T_idx, cfg, mesh_xy,
+			band_slices, chunks)
 
 	with timing.section("gw_jax.zeta_fit_chunked"), jax_profile.trace_section("zeta_fit"):
 		peak_bytes = fit_zeta_to_h5(
@@ -696,44 +977,18 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# bispinor PRE-FLIGHT above (before the charge fit), so this branch
 	# gate is only reachable with the path present.
 	if cfg.bispinor and getattr(cfg.paths, 'centroids_file_current', None):
-		import dataclasses
-		from common.wfn_transforms import load_centroids_band_chunked
-		from file_io.centroids import load_centroids
-
-		cents_curr_path = cfg.paths.centroids_file_current
 		print_fn(f"\n  [bispinor] fitting ζ^{{μ_L=1,2,3}} on current-density "
-		         f"centroids: {cents_curr_path}")
-		_, cents_curr_idx, n_rmu_curr = load_centroids(
-			cents_curr_path, meta.fft_grid)
-		# n_rmu_padded uses world_size (= ∏ p_a over the device mesh).
-		# Without this refresh the bispinor transverse fit_zeta inherits
-		# the charge-channel padded extent, and the C_q reshape at
-		# isdf_fitting.py:1442 trips a TypeError when the transverse
-		# centroid count differs from the charge count.
-		# ``padded_mu_extent`` also honors the test-only
-		# LORRAX_EXTRA_MU_PAD knob (pad-extent-invariance gate).
-		from runtime.padding import padded_mu_extent
-		_world_size = int(jax.device_count())
-		n_rmu_curr_padded = padded_mu_extent(n_rmu_curr, _world_size)
-		meta_curr = dataclasses.replace(
-			meta,
-			n_rmu=int(n_rmu_curr),
-			n_rmu_padded=int(n_rmu_curr_padded),
-		)
-		# ``sys_dim`` is set dynamically on ``meta`` by gw_jax.main
-		# (Meta has no sys_dim field), so dataclasses.replace doesn't
-		# carry it over.  Copy it explicitly — fit_zeta_to_h5 reads
-		# meta.sys_dim when building the per-q G-flat sphere.
-		meta_curr.sys_dim = meta.sys_dim
-
-		with timing.section("gw_jax.load_centroid_wfns_current"):
-			psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
-				wfn, sym, meta_curr,
-				jnp.asarray(cents_curr_idx, dtype=jnp.int32),
-				cfg.bispinor, mesh_xy,
-				band_range=band_slices.full_range,
-				band_chunk_size=chunks['band_chunk'],
-			)
+		         f"centroids: {cfg.paths.centroids_file_current}")
+		# ``meta_T``, the centroid table and its μ padding were built ONCE
+		# in the bispinor pre-flight (they are inputs to the ζ-reuse
+		# decision, which runs before the charge fit).
+		meta_curr = _meta_T
+		cents_curr_idx = _cent_T_idx
+		transverse_wfn_data = _transverse_wfn_data(
+			wfn, sym, meta_curr, cents_curr_idx, cfg, mesh_xy,
+			band_slices, chunks)
+		psi_curr_rmu_Y = transverse_wfn_data['psi_rmu_Y']
+		psi_curr_rmuT_X = transverse_wfn_data['psi_rmuT_X']
 
 		# Per-channel cache hygiene.  The 2026-05-04 bispinor branch needed
 		# ``jax.clear_caches()`` here because the original ζ-fit cached
@@ -756,13 +1011,13 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 
 		for mu_L in (1, 2, 3):
 			_drop_traced_caches()
-			zeta_mu_path = os.path.join(tmp_dir, f"zeta_q_mu{mu_L}.h5")
+			zeta_mu_path = _zeta_T_paths[mu_L]
 			print_fn(f"  [bispinor] μ_L={mu_L} → {zeta_mu_path}")
 			with timing.section(f"gw_jax.zeta_fit_chunked_mu{mu_L}"), \
 			     jax_profile.trace_section(f"zeta_fit_mu{mu_L}"):
 				fit_zeta_to_h5(
 					wfn=wfn, sym=sym, meta=meta_curr,
-					centroid_indices=jnp.asarray(cents_curr_idx, dtype=jnp.int32),
+					centroid_indices=cents_curr_idx,
 					mesh_xy=mesh_xy,
 					chunk_r=chunks['chunk_r'], output_file=zeta_mu_path,
 					psi_rmu_Y=psi_curr_rmu_Y, psi_rmuT_X=psi_curr_rmuT_X,
@@ -784,26 +1039,31 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					vertex_mu_L=mu_L,
 					# Transverse ζ IBZ-write activates whenever the
 					# bispinor V_q orchestrator iterates IBZ q's — same
-					# gate the charge ζ uses (LORRAX_FORCE_FULL_BZ off).
+					# gate the charge ζ uses (LORRAX_FORCE_FULL_BZ off),
+					# resolved once in the pre-flight so the provenance
+					# stamp and this call cannot disagree.
 					# Orbit-closure of the transverse centroid set is
 					# checked downstream in ``fit_zeta_to_h5``; failure
 					# is loud per the bispinor IBZ requirement.
-					write_ibz_only=(bool(cfg.bispinor)
-					                and not env_bool(
-						                'LORRAX_FORCE_FULL_BZ', False,
-						                print_fn=print_fn)),
+					write_ibz_only=_write_ibz_only_transverse,
 					zeta_cutoff_ry=_zeta_cutoff,
 				)
-		# Surface the transverse-centroid ψ to the caller so it can build
-		# the second Wfns bundle for σ^B without re-loading from WFN.h5.
-		# Keeping these arrays alive across the return is intentional —
-		# they're the only way the σ^B kernel can sample ψ at r_{μ_T}.
-		transverse_wfn_data = {
-			'psi_rmu_Y':       psi_curr_rmu_Y,
-			'psi_rmuT_X':      psi_curr_rmuT_X,
-			'meta':            meta_curr,
-			'centroid_indices': jnp.asarray(cents_curr_idx, dtype=jnp.int32),
-		}
+			# Stamp this ζ_T so a later run can reuse it — same ordering
+			# and same truncating-knob veto as the charge stamp above
+			# (fit → mark_zeta_done → stamp; a run killed between the
+			# last two leaves a complete-but-unstamped file, which
+			# ``_zeta_reuse_ok`` refits).  The μ_L loop was previously
+			# unstamped altogether, which is why bispinor ζ from before
+			# 2026-08-04 is never reusable.
+			if not _trunc and jax.process_index() == 0:
+				try:
+					from file_io.isdf_header import stamp_fit_provenance
+					stamp_fit_provenance(zeta_mu_path, _provenance_T(mu_L))
+				except Exception as exc:
+					print_fn(f"    [zeta provenance] μ_L={mu_L} not stamped "
+					         f"({exc}); this ζ_T will be refit on the next "
+					         f"run.")
+			barrier(f"zeta_provenance_mu{mu_L}")
 
 	return zeta_h5_path, mem_est, transverse_wfn_data
 
