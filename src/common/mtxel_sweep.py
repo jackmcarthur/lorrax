@@ -141,6 +141,7 @@ from runtime.padding import pad_axis_to
 
 __all__ = [
     "SweepGeometry",
+    "band_sphere_spec",
     "Operator",
     "kinetic_operator",
     "local_potential_operator",
@@ -151,6 +152,20 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
+
+def band_sphere_spec() -> P:
+    """THE ψ layout: ``(n_k, nb, nspinor, ngkmax)``, bands over the mesh.
+
+    One definition, three consumers — ``file_io.wfn_loader`` defaults to
+    it, this sweep contracts in it, and ``gw.qsgw_density`` builds ρ from
+    it.  A second literal of the same PartitionSpec would not raise if it
+    drifted; it would silently insert a reshard between them, which is the
+    same class of latent bug ``runtime.padding.spec_divisor`` removed on
+    the band divisor.
+    """
+    return P(None, ("x", "y"), None, None)
+
+
 
 class SweepGeometry:
     """The fixed shapes every operator and the scan agree on.
@@ -196,7 +211,7 @@ class SweepGeometry:
     # rather than transforming inside the column layout.
     @property
     def spec_sphere_xy(self) -> P:
-        return P(None, ("x", "y"), None, None)
+        return band_sphere_spec()
 
     @property
     def spec_sphere_x(self) -> P:
