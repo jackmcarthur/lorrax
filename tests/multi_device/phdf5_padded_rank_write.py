@@ -210,9 +210,13 @@ def main():
                f"offset=(0,1,0) valid=(.,{mu},.) vs extent {mu}")
             sys.stdout.flush()
             try:
+                # No global_shape: the dataset exists, so stating it would
+                # be refused for THAT reason instead (a contradiction with
+                # the dataset's extent) and this case would gate nothing.
+                # The subject here is the explicit valid_shape override
+                # overrunning the dataset.
                 io.write_slab("zeta_like", A,
                               offset=(0, 1, 0),
-                              global_shape=(N_Q, mu_pad, N_G),
                               valid_shape=(N_Q, mu, N_G))
                 io.close()
             except Exception as exc:                          # noqa: BLE001
