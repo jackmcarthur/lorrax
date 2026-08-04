@@ -301,8 +301,39 @@ def _normalize_slab_request(
     return off, shape, gshape
 
 
-# ``valid_shape`` is the logical file prefix inside a padded physical
-# slab.  It may be ragged; only the physical slab must divide the mesh.
+# ---------------------------------------------------------------------------
+# The logical extent of a slab — derived, not configured
+# ---------------------------------------------------------------------------
+#
+# decisions.md 2026-08-04, "Padding is SlabIO's business, not the caller's":
+# a caller states LOGICAL shapes only.  ``valid_shape`` therefore DEFAULTS to
+# the operand's own extent clipped to the dataset, and survives only as an
+# OVERRIDE for the ragged-chunk case (a chunk buffer whose tail is not part of
+# the write, which SlabIO cannot derive because both extents are legitimate).
+#
+# The derivation is the whole point of the entry: it is exactly the arithmetic
+# that every call site used to do by hand, and getting it wrong at any one of
+# them produced a wholly-padded rank, an overrun, or a silent prefix write.
+def _derive_valid_shape(
+    slab_shape: Sequence[int],
+    offset: Sequence[int],
+    ds_shape: Sequence[int],
+) -> tuple[int, ...]:
+    """``min(slab, dataset - offset)`` per dim, floored at 0.
+
+    ``slab_shape`` is the PHYSICAL extent the caller handed us (possibly
+    padded for mesh divisibility); ``ds_shape`` is the dataset's LOGICAL
+    extent.  The clip is what turns "my buffer has pad rows" into "those
+    rows are not part of the file", with no caller-side arithmetic.
+
+    A slab that starts past the end of the dataset yields 0 on that dim,
+    i.e. a globally empty request, which is a legitimate no-op rendezvous
+    (every rank selects nothing) and not a refusal.
+    """
+    return tuple(max(0, min(int(s), int(g) - int(o)))
+                 for s, o, g in zip(slab_shape, offset, ds_shape))
+
+
 def _normalize_valid_shape(
     *,
     op: str,
@@ -310,19 +341,41 @@ def _normalize_valid_shape(
     valid_shape: Sequence[int] | None,
     slab_shape: Sequence[int],
     offset: Sequence[int],
-    global_shape: Sequence[int] | None = None,
+    ds_shape: Sequence[int] | None = None,
 ) -> tuple[int, ...]:
     """Return the logical on-file extent inside a possibly padded slab.
 
-    ``slab_shape`` is the physical JAX array shape.  ``valid_shape`` is
-    the prefix of that array that should map to file data; omitted means
-    the whole slab is valid.  The valid shape itself need not be
-    divisible by the mesh because the C++ FFI clips the last rank(s).
+    ``slab_shape`` is the physical JAX array shape.  ``ds_shape`` is the
+    dataset's own extent — a REPLICATED quantity (it comes from the
+    create_dataset call, the auto-create global shape, or a metadata read
+    every rank performs), which is what makes the bounds verdict below
+    rank-invariant.
+
+    ``valid_shape=None`` (the ordinary case) derives the extent via
+    :func:`_derive_valid_shape`.  An explicit ``valid_shape`` is the
+    ragged-chunk override: it must fit inside the physical slab, and
+    ``offset + valid_shape`` must fit inside the dataset — an override
+    that overruns is a REFUSAL, because the caller asserted an extent
+    SlabIO has no licence to silently shrink.
+
+    ``ds_shape=None`` means the dataset does not exist yet and is about
+    to be created at exactly ``slab_shape``; then the whole slab is
+    valid by construction.
     """
     shape = tuple(int(s) for s in slab_shape)
-    vshape = tuple(int(s) for s in (valid_shape if valid_shape is not None
-                                    else shape))
     off = tuple(int(o) for o in offset)
+    gshape = None if ds_shape is None else tuple(int(s) for s in ds_shape)
+
+    if valid_shape is None:
+        if gshape is None:
+            return shape
+        if len(gshape) != len(shape):
+            raise ValueError(
+                f"{op} {name!r}: dataset rank {len(gshape)} does not match "
+                f"slab rank {len(shape)} (dataset={gshape}, slab={shape})")
+        return _derive_valid_shape(shape, off, gshape)
+
+    vshape = tuple(int(s) for s in valid_shape)
     if len(vshape) != len(shape):
         raise ValueError(
             f"{op} {name!r}: valid_shape rank mismatch "
@@ -339,8 +392,7 @@ def _normalize_valid_shape(
                             for i, v, s in too_large)
         raise ValueError(
             f"{op} {name!r}: valid_shape exceeds slab shape ({details})")
-    if global_shape is not None:
-        gshape = tuple(int(s) for s in global_shape)
+    if gshape is not None:
         over = [
             (i, off[i], vshape[i], gshape[i])
             for i in range(len(shape))
@@ -350,8 +402,97 @@ def _normalize_valid_shape(
             details = ", ".join(
                 f"dim {i}: {o}+{s}>{g}" for i, o, s, g in over)
             raise ValueError(
-                f"{op} {name!r}: valid slab exceeds global shape ({details})")
+                f"{op} {name!r}: valid slab exceeds dataset extent "
+                f"({details}).  valid_shape is an explicit override; drop it "
+                f"and SlabIO clips the slab to the dataset instead.")
     return vshape
+
+
+# ---------------------------------------------------------------------------
+# Dataset geometry — the replicated record that makes the derivation legal
+# ---------------------------------------------------------------------------
+class _DatasetGeometry:
+    """Per-handle record of each dataset's LOGICAL shape and dtype.
+
+    Every entry is written from a RANK-INDEPENDENT quantity: the shape
+    passed to ``create_dataset`` (SPMD by contract), the ``global_shape``
+    an auto-creating ``write_slab`` used, or a metadata read that every
+    rank performs on the same file.  So ``_known_shape`` returns the same
+    tuple on every rank, which is the precondition for deriving
+    ``valid_shape`` from it — a per-rank dataset shape would put the
+    ranks back on different sides of the bounds test.
+
+    The record is authoritative because ``create_dataset`` REFUSES a
+    shape/dtype change on an existing dataset (decisions.md 2026-08-04);
+    without that rule an ``H5Dopen`` of a differently-shaped dataset
+    would leave this dict describing geometry the file does not have.
+    """
+
+    def _geom_init(self) -> None:
+        self._ds_geom: dict[str, tuple[tuple[int, ...], "np.dtype"]] = {}
+
+    def _remember_geom(self, name: str, shape, dtype) -> None:
+        self._ds_geom[str(name)] = (
+            tuple(int(s) for s in shape), np.dtype(dtype))
+
+    def _known_shape(self, name: str) -> tuple[int, ...] | None:
+        got = self._ds_geom.get(str(name))
+        return None if got is None else got[0]
+
+    def _refuse_geometry_change(
+        self, *, op: str, name: str, want_shape, want_dtype,
+        have_shape, have_dtype,
+    ) -> bool:
+        """Return True if the existing dataset is reusable; else REFUSE.
+
+        decisions.md 2026-08-04: identical logical shape and dtype ⇒
+        reuse (idempotent); anything else ⇒ refuse, naming both shapes.
+        Never delete-and-recreate (silent data loss — the pre-2026-08-04
+        allgather behaviour) and never write into the previous geometry
+        (wrong physics with no symptom — the pre-2026-08-04 FFI and
+        phdf5_host behaviour, which clipped an ``mode='a'`` rerun at a
+        new μ against the OLD extent).
+        """
+        want_shape = tuple(int(s) for s in want_shape)
+        have_shape = tuple(int(s) for s in have_shape)
+        want_dtype = np.dtype(want_dtype)
+        have_dtype = np.dtype(have_dtype)
+        if want_shape == have_shape and want_dtype == have_dtype:
+            return True
+        raise ValueError(
+            f"{op} {name!r}: dataset already exists with shape "
+            f"{have_shape} dtype {have_dtype.name}, but was requested at "
+            f"shape {want_shape} dtype {want_dtype.name}.  SlabIO will "
+            f"neither delete-and-recreate it (data loss) nor write into "
+            f"the previous geometry (wrong extent, no symptom).  Open the "
+            f"file with mode='w', use a different dataset name, or delete "
+            f"the file.")
+
+
+def _shard_divisors(
+    *,
+    axis_count_per_dim: Sequence[int],
+    axis_flat: Sequence[int],
+    mesh_shape: Sequence[int],
+    ndim: int,
+) -> tuple[int, ...]:
+    """Per-dim product of the mesh axis sizes sharding that dim (1 = replicated).
+
+    The divisor the FFI's equal-block rank arithmetic needs each dim to
+    be a multiple of — which is also JAX's own divisor for building a
+    ``NamedSharding`` block over that dim.  Read by
+    :func:`_validate_block_divisible`.
+    """
+    divs: list[int] = []
+    flat_idx = 0
+    for d in range(ndim):
+        na = int(axis_count_per_dim[d])
+        div = 1
+        for k in range(na):
+            div *= int(mesh_shape[int(axis_flat[flat_idx + k])])
+        flat_idx += na
+        divs.append(div)
+    return tuple(divs)
 
 
 def _validate_block_divisible(
@@ -363,21 +504,40 @@ def _validate_block_divisible(
     axis_flat: Sequence[int],
     mesh_shape: Sequence[int],
 ) -> None:
-    """Reject sharded dimensions that cannot form equal block shards."""
-    flat_idx = 0
+    """Reject a (shape, spec) pair that cannot form equal block shards.
+
+    NOT a SlabIO padding requirement — decisions.md 2026-08-04 takes
+    divisibility out of the caller's contract, and this check is what is
+    left after it: a restatement of JAX's OWN constraint, raised early
+    and with the numbers named.
+
+    MEASURED (gate ``PADRANK_CASE=nodiv``, job 7888644, jax 0.9.1): a
+    ``jax.Array`` whose sharded dim does not divide its mesh-axis product
+    cannot be constructed at all — ``device_put`` raises
+    ``IndivisibleError``.  So SlabIO is never HANDED such an operand on
+    the write path (there is nothing to pad), and on the read path it
+    could not RETURN one either: padding the read and trimming would
+    only replace this message with JAX's, at the same refusal.  That also
+    settles the audit's item 5 — ``_MpiHostBackend``'s absent check is
+    not a capability difference, because the case it would accept cannot
+    be expressed.
+
+    A caller who wants a padded extent asks for the padded SHAPE, which
+    is a legitimate request and needs no other argument.
+    """
+    divs = _shard_divisors(
+        axis_count_per_dim=axis_count_per_dim, axis_flat=axis_flat,
+        mesh_shape=mesh_shape, ndim=len(tuple(shape)))
     for d, size in enumerate(tuple(int(s) for s in shape)):
-        na = int(axis_count_per_dim[d])
-        div = 1
-        axes = []
-        for k in range(na):
-            ax = int(axis_flat[flat_idx + k])
-            axes.append(ax)
-            div *= int(mesh_shape[ax])
-        flat_idx += na
-        if div > 1 and size % div:
+        if divs[d] > 1 and size % divs[d]:
             raise ValueError(
                 f"{op} {name!r}: dimension {d} size {size} is not "
-                f"divisible by mesh axes {axes} product {div}")
+                f"divisible by its mesh-axis product {divs[d]}, so the "
+                f"array you asked for cannot be sharded this way — JAX "
+                f"itself refuses to build it (IndivisibleError).  Ask for "
+                f"dimension {d} at {-(-size // divs[d]) * divs[d]} "
+                f"instead: SlabIO fills what the dataset covers and zeroes "
+                f"the rest, and you state nothing else.")
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +611,7 @@ def _get_write_sm(mesh, in_specs, *,
 # ---------------------------------------------------------------------------
 # Backend
 # ---------------------------------------------------------------------------
-class _FfiBackend:
+class _FfiBackend(_DatasetGeometry):
     """Collective MPI-IO SlabIO backend."""
 
     def __init__(self, path: str, mesh: Mesh, mode: str = "w") -> None:
@@ -480,6 +640,9 @@ class _FfiBackend:
             _barrier("slab_io_ffi_prestripe")
         self.fh: int = self._open_file(path, mesh=mesh, mode=mode)
         self._ds_ids: dict[str, int] = {}
+        # Replicated record of every dataset's LOGICAL geometry — the
+        # thing ``valid_shape`` is derived from.  See _DatasetGeometry.
+        self._geom_init()
         # write_attr needs plain h5py (the FFI doesn't expose a
         # collective attr-write path), so we defer attr writes to
         # close() — concurrent h5py + MPI-IO on the same file would
@@ -545,11 +708,17 @@ class _FfiBackend:
         # interleaves and the next H5Dwrite trips ``MPI_File_set_view:
         # Invalid datatype``.  Drain first.
         self._drain_pending()
+        # ``phdf5_ensure_dataset`` REFUSES (on every rank — it is
+        # collective and its inputs are replicated) when the dataset
+        # exists at a different shape or dtype, and reuses it when they
+        # match: decisions.md 2026-08-04.  That refusal is what makes the
+        # geometry recorded below authoritative.
         ds_id = self._loader.phdf5_ensure_dataset(
             self.fh, name, tuple(int(s) for s in shape),
             str(jnp.dtype(dtype).name),
         )
         self._ds_ids[name] = ds_id
+        self._remember_geom(name, shape, jnp.dtype(dtype))
         # chunks + attrs are runtime-set on the underlying H5 dataset.
         # The FFI backend doesn't yet expose a collective "set chunks"
         # after H5Dcreate (it would need a new ctypes entry and some
@@ -618,9 +787,30 @@ class _FfiBackend:
         self._ds_ids[name] = ds_id
         return ds_id
 
+    def _dataset_geom(self, name: str) -> tuple[tuple[int, ...], "np.dtype"]:
+        """``(shape, dtype)`` of ``name``, from the record where possible.
+
+        The record FIRST, and the serial-h5py introspect only for a
+        dataset this handle did not create.  That ordering is not a
+        micro-optimisation: opening this path with h5py while the same
+        file is open for collective MPI-IO writing reads a superblock
+        that is not durable yet, and h5py fails with "file signature not
+        found" (measured, job 7888644 probe/raw, when an unconditional
+        introspect was tried here).  A dataset this handle created is
+        already described by the record, so the read-after-write-on-one-
+        handle case never reaches the file.
+        """
+        got = self._ds_geom.get(str(name))
+        if got is not None:
+            return got
+        shape, dtype = self._introspect_dataset(name)
+        self._remember_geom(name, shape, dtype)
+        return tuple(int(s) for s in shape), np.dtype(dtype)
+
     # ------------------------------------------------------------------
     # FFI write padding contract: shard ``A`` with equal local blocks,
-    # then let C++ clip each rank's file hyperslab to ``valid_shape``.
+    # then let C++ clip each rank's file hyperslab to ``valid_shape``,
+    # which SlabIO derives from the dataset's own extent.
     def write_slab(
         self,
         name: str,
@@ -649,25 +839,43 @@ class _FfiBackend:
 
         axis_count_per_dim, axis_flat = _sharding_to_axis_info(
             A.sharding, A.ndim)
-        off, slab_shape, gshape = _normalize_slab_request(
+        off, slab_shape, req_gshape = _normalize_slab_request(
             op="write_slab", name=name, offset=offset,
             slab_shape=A.shape, global_shape=global_shape,
             check_bounds=False)
-        vshape = _normalize_valid_shape(
-            op="write_slab", name=name, valid_shape=valid_shape,
-            slab_shape=slab_shape, offset=off, global_shape=gshape)
         mesh_shape = tuple(self.mesh.shape[ax] for ax in self.mesh.axis_names)
         _validate_block_divisible(
             op="write_slab", name=name, shape=slab_shape,
             axis_count_per_dim=axis_count_per_dim,
             axis_flat=axis_flat, mesh_shape=mesh_shape)
 
-        if name not in self._ds_ids:
+        # The dataset's LOGICAL extent, in this order of authority:
+        #   1. what this handle already created/opened for ``name``;
+        #   2. the caller's ``global_shape`` (creating the dataset now);
+        #   3. ``A.shape`` (whole-dataset write of a fresh dataset).
+        # A caller that states BOTH must agree with the file, or the
+        # dataset it thinks it is writing is not the one on disk.
+        ds_shape = self._known_shape(name)
+        if ds_shape is None:
+            ds_shape = req_gshape
+            self._drain_pending()
             ds_id = self._loader.phdf5_ensure_dataset(
-                self.fh, name, tuple(int(s) for s in gshape),
+                self.fh, name, tuple(int(s) for s in ds_shape),
                 str(jnp.dtype(A.dtype).name),
             )
             self._ds_ids[name] = ds_id
+            self._remember_geom(name, ds_shape, A.dtype)
+        elif global_shape is not None and req_gshape != ds_shape:
+            raise ValueError(
+                f"write_slab {name!r}: global_shape={req_gshape} contradicts "
+                f"the dataset's extent {ds_shape}.  global_shape is only "
+                f"needed to CREATE a dataset; drop it and SlabIO uses the "
+                f"dataset's own shape.")
+
+        vshape = _normalize_valid_shape(
+            op="write_slab", name=name, valid_shape=valid_shape,
+            slab_shape=slab_shape, offset=off, ds_shape=ds_shape)
+        gshape = ds_shape
 
         if os.environ.get("LORRAX_FFI_DEBUG_SHARDS"):
             import sys
@@ -726,24 +934,39 @@ class _FfiBackend:
         # the public SlabIO.read_slab handles the numpy conversion.
     ) -> jax.Array:
         mesh = mesh or self.mesh
-        if shape is None or dtype is None:
+        # Drain queued writes BEFORE anything in this method touches the
+        # file.  Three distinct hazards, all of them silent:
+        #
+        #  1. Read-after-write ordering.  ``write_slab`` only ENQUEUES; a
+        #     read issued before the queue drains sees the pre-write bytes
+        #     with no error anywhere.
+        #  2. ``ctx->pinned_buf`` is one buffer shared by the writer thread
+        #     and this read.  ``ReadImpl`` runs SYNCHRONOUSLY on the XLA
+        #     thread and starts with ensure_pinned + memset; on the CUDA
+        #     build that is the very buffer an in-flight H5Dwrite is reading
+        #     from, and ensure_pinned may free and realloc it underneath.
+        #  3. Two threads inside HDF5/MPI-IO on one file handle.  This is
+        #     the hazard ``create_dataset`` and ``_ds_id`` already drain for
+        #     ("MPI's datatype-cache state on the file handle interleaves"),
+        #     and worse for a collective transfer: rank A doing read-then-
+        #     write while rank B does write-then-read mismatches the
+        #     MPI-IO collective order and hangs.
+        #
+        # ``_ds_id`` drains too, but only on the first sight of a dataset
+        # name — a read of an ALREADY-cached dataset skipped every drain in
+        # the method, and ``_introspect_dataset`` (serial h5py on the same
+        # path) ran before even that.  One unconditional drain at the top.
+        self._drain_pending()
+        ds_shape, ds_dtype = self._dataset_geom(name)
+        if shape is None:
             # Symmetry with the allgather backend: callers that don't
             # need padding shouldn't have to compute shape themselves.
-            # Cheap h5py introspect (collective-free, locking off);
-            # the result is also the file's intrinsic shape, which is
-            # what the kernel will read into when valid_shape isn't
-            # set.
-            ds_shape, ds_dtype = self._introspect_dataset(name)
-            if shape is None:
-                shape = ds_shape
-            if dtype is None:
-                dtype = ds_dtype
+            shape = ds_shape
+        if dtype is None:
+            dtype = ds_dtype
         off, read_shape, _ = _normalize_slab_request(
             op="read_slab", name=name, offset=offset,
             slab_shape=shape, global_shape=None, check_bounds=False)
-        vshape = _normalize_valid_shape(
-            op="read_slab", name=name, valid_shape=valid_shape,
-            slab_shape=read_shape, offset=off, global_shape=None)
 
         # Default: fully replicated.  Caller can provide partition_spec
         # to shard the read.
@@ -753,6 +976,10 @@ class _FfiBackend:
         axis_count_per_dim, axis_flat = _sharding_to_axis_info(
             sharding, len(read_shape))
         mesh_shape = tuple(mesh.shape[ax] for ax in mesh.axis_names)
+
+        vshape = _normalize_valid_shape(
+            op="read_slab", name=name, valid_shape=valid_shape,
+            slab_shape=read_shape, offset=off, ds_shape=ds_shape)
         _validate_block_divisible(
             op="read_slab", name=name, shape=read_shape,
             axis_count_per_dim=axis_count_per_dim,
@@ -811,15 +1038,36 @@ class _FfiBackend:
         if _verbose:
             print(f"  [SlabIO.close] draining {_pending} pending writes "
                   f"for {os.path.basename(self.path)} …", flush=True)
+        # ── A rank must not skip a collective because of its OWN error ──
+        # decisions.md 2026-08-04.  A worker exception surfaces on this
+        # rank's ``drain()``; if it propagated from here it would skip the
+        # collective ``H5Fclose`` below on THIS rank only, and the peers
+        # would sit inside it with no message.  ``AsyncDispatcher.
+        # _raise_if_error`` also CLEARS the error as it raises, so nothing
+        # downstream would re-raise it either.  Record it, complete the
+        # teardown every rank is inside, then raise at the end.
+        _worker_error: BaseException | None = None
         _t0 = _time.perf_counter()
-        self._drain_pending()
+        try:
+            self._drain_pending()
+        except BaseException as exc:                          # noqa: BLE001
+            _worker_error = exc
         _t_drain = _time.perf_counter() - _t0
         if _verbose:
             print(f"  [SlabIO.close] Python dispatch drained in "
                   f"{_t_drain:.1f} s; joining writer thread", flush=True)
         _t0 = _time.perf_counter()
-        self._dispatcher.close()                # drain + poison pill + join
+        try:
+            self._dispatcher.close()            # drain + poison pill + join
+        except BaseException as exc:                          # noqa: BLE001
+            if _worker_error is None:
+                _worker_error = exc
         _t_join = _time.perf_counter() - _t0
+        if _worker_error is not None:
+            print(f"  [SlabIO.close rank={jax.process_index()}] write worker "
+                  f"raised {type(_worker_error).__name__}: {_worker_error} — "
+                  f"completing the collective teardown before re-raising.",
+                  flush=True)
         if self.fh:
             if _verbose:
                 print(f"  [SlabIO.close] writer thread joined in "
@@ -835,20 +1083,33 @@ class _FfiBackend:
         # Now that MPI-IO has released the file, rank 0 can safely
         # reopen with h5py to tack on any deferred small-metadata
         # datasets (omega_ev and friends).
-        if self._deferred_attrs:
+        #
+        # The rank-0 h5py block is gated on ``self._deferred_attrs``; the
+        # BARRIER is not, and must not be.  ``_deferred_attrs`` is a
+        # per-rank Python list, so gating a collective on it makes the
+        # number of barriers a rank executes depend on that rank's own
+        # control flow — the deadlock shape this audit is looking for.
+        # Today every ``write_attr`` call site is SPMD so the list is the
+        # same everywhere, but that is a property of the callers, not of
+        # this method, and it is not checkable here.  An unconditional
+        # barrier costs one rendezvous per file close and removes the
+        # question.
+        if (_worker_error is None and self._deferred_attrs
+                and jax.process_index() == 0):
             import h5py
             import numpy as np
-            if jax.process_index() == 0:
-                with h5py.File(self.path, "a") as h5:
-                    for name, value in self._deferred_attrs:
-                        if name in h5:
-                            del h5[name]
-                        host = value
-                        if not isinstance(host, np.ndarray):
-                            host = np.asarray(jax.device_get(host))
-                        h5.create_dataset(name, data=host)
-            # Same barrier, same reason as the write-ordering ones above:
-            # rank 0 has just rewritten datasets in this file with serial
-            # h5py, and no other rank may reopen it until that is durable.
-            _barrier("slab_io_ffi_close_attrs")
-            self._deferred_attrs = []
+            with h5py.File(self.path, "a") as h5:
+                for name, value in self._deferred_attrs:
+                    if name in h5:
+                        del h5[name]
+                    host = value
+                    if not isinstance(host, np.ndarray):
+                        host = np.asarray(jax.device_get(host))
+                    h5.create_dataset(name, data=host)
+        # Same reason as the write-ordering barriers above: rank 0 may
+        # have just rewritten datasets in this file with serial h5py, and
+        # no other rank may reopen it until that is durable.
+        _barrier("slab_io_ffi_close_attrs")
+        self._deferred_attrs = []
+        if _worker_error is not None:
+            raise _worker_error

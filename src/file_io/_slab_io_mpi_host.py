@@ -84,6 +84,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from ._slab_io_ffi import (
     _barrier,
+    _DatasetGeometry,
     _normalize_slab_request,
     _normalize_valid_shape,
     _rank0,
@@ -256,7 +257,7 @@ def _clip_shard_to_valid(
 
 
 # ---------------------------------------------------------------------------
-class _MpiHostBackend:
+class _MpiHostBackend(_DatasetGeometry):
     """Collective MPI-IO SlabIO via parallel h5py + mpi4py.
 
     The interface mirrors :class:`_slab_io_ffi._FfiBackend` so they
@@ -346,6 +347,10 @@ class _MpiHostBackend:
         # MPI-IO on the same file handle.  Same hazard as the FFI
         # path's _deferred_attrs.
         self._deferred_attrs: list[tuple[str, object]] = []
+        # Replicated record of each dataset's LOGICAL geometry; here it
+        # is only a cache, because ``self._fh`` is a parallel handle that
+        # every rank can query directly.
+        self._geom_init()
 
     # ------------------------------------------------------------------
     def create_dataset(
@@ -360,22 +365,51 @@ class _MpiHostBackend:
         # H5Dcreate is collective; all ranks must reach it before any
         # rank writes.  Synchronous writes elsewhere in this module
         # guarantee that ordering naturally.
-        if name in self._fh:
-            # idempotent on 'a' mode: respect the existing dataset
-            return
         shape_t = tuple(int(s) for s in shape)
         h5_dtype = jnp.dtype(dtype) if not isinstance(dtype, np.dtype) else dtype
+        if name in self._fh:
+            # Idempotent only when the geometry MATCHES: decisions.md
+            # 2026-08-04.  The old unconditional early return let an
+            # ``mode='a'`` rerun at a different μ write into the previous
+            # extent — wrong physics with no symptom.  Every rank holds
+            # the same parallel handle, so this verdict is rank-invariant
+            # and either everyone refuses or nobody does.
+            existing = self._fh[name]
+            self._refuse_geometry_change(
+                op="create_dataset", name=name,
+                want_shape=shape_t, want_dtype=h5_dtype,
+                have_shape=existing.shape, have_dtype=existing.dtype)
+            self._remember_geom(name, existing.shape, existing.dtype)
+            return
         # Collective H5Dcreate via h5py.  All ranks participate;
         # parallel HDF5 broadcasts the dataset metadata from rank 0.
         ds = self._fh.create_dataset(
             name, shape=shape_t, dtype=h5_dtype,
             chunks=tuple(chunks) if chunks else None,
         )
+        self._remember_geom(name, shape_t, h5_dtype)
         if attrs:
             # h5py attribute write is small + replicated; all ranks
             # write identical bytes, parallel HDF5 dedup's.
             for k, v in attrs.items():
                 ds.attrs[k] = v
+
+    # ------------------------------------------------------------------
+    def _dataset_shape(self, name: str) -> tuple[int, ...] | None:
+        """LOGICAL extent of ``name``, or None if it does not exist yet.
+
+        Read straight off the parallel handle, so it is the same tuple on
+        every rank — the precondition for deriving ``valid_shape`` from
+        it (decisions.md 2026-08-04).
+        """
+        known = self._known_shape(name)
+        if known is not None:
+            return known
+        if name not in self._fh:
+            return None
+        ds = self._fh[name]
+        self._remember_geom(name, ds.shape, ds.dtype)
+        return tuple(int(s) for s in ds.shape)
 
     def write_attr(self, name: str, value) -> None:
         # Tiny rank-0-only writes — defer to close() to avoid mixing
@@ -422,18 +456,28 @@ class _MpiHostBackend:
             A = jnp.asarray(A)
 
         # Resolve offset / shapes via the same helpers the FFI uses.
-        off, slab_shape, gshape = _normalize_slab_request(
+        off, slab_shape, req_gshape = _normalize_slab_request(
             op="write_slab", name=name, offset=offset,
             slab_shape=tuple(A.shape), global_shape=global_shape,
             check_bounds=False)
+
+        # Ensure dataset exists (collective if it needs creating), then
+        # derive the logical extent from the DATASET, not from the
+        # caller (decisions.md 2026-08-04).
+        ds_shape = self._dataset_shape(name)
+        if ds_shape is None:
+            self.create_dataset(name, shape=req_gshape, dtype=A.dtype,
+                                chunks=chunks)
+            ds_shape = req_gshape
+        elif global_shape is not None and req_gshape != ds_shape:
+            raise ValueError(
+                f"write_slab {name!r}: global_shape={req_gshape} contradicts "
+                f"the dataset's extent {ds_shape}.  global_shape is only "
+                f"needed to CREATE a dataset; drop it and SlabIO uses the "
+                f"dataset's own shape.")
         vshape = _normalize_valid_shape(
             op="write_slab", name=name, valid_shape=valid_shape,
-            slab_shape=slab_shape, offset=off, global_shape=gshape)
-
-        # Ensure dataset exists (collective if it needs creating).
-        if name not in self._fh:
-            self.create_dataset(name, shape=gshape, dtype=A.dtype,
-                                chunks=chunks)
+            slab_shape=slab_shape, offset=off, ds_shape=ds_shape)
 
         local, shard_offset = _local_shard_and_global_offset(A)
         clipped = _clip_shard_to_valid(local, shard_offset, off, vshape)
@@ -515,14 +559,14 @@ class _MpiHostBackend:
         match ``partition_spec``).
         """
         mesh = mesh or self.mesh
-        if shape is None or dtype is None:
-            ds = self._fh[name]
-            ds_shape = tuple(int(s) for s in ds.shape)
-            ds_dtype = np.dtype(ds.dtype)
-            if shape is None:
-                shape = ds_shape
-            if dtype is None:
-                dtype = ds_dtype
+        ds = self._fh[name]
+        ds_shape = tuple(int(s) for s in ds.shape)
+        ds_dtype = np.dtype(ds.dtype)
+        self._remember_geom(name, ds_shape, ds_dtype)
+        if shape is None:
+            shape = ds_shape
+        if dtype is None:
+            dtype = ds_dtype
 
         off, read_shape, _ = _normalize_slab_request(
             op="read_slab", name=name, offset=offset,
@@ -530,7 +574,7 @@ class _MpiHostBackend:
             check_bounds=False)
         vshape = _normalize_valid_shape(
             op="read_slab", name=name, valid_shape=valid_shape,
-            slab_shape=read_shape, offset=off, global_shape=None)
+            slab_shape=read_shape, offset=off, ds_shape=ds_shape)
 
         if partition_spec is None:
             partition_spec = P(*([None] * len(read_shape)))
@@ -582,6 +626,22 @@ class _MpiHostBackend:
             tuple(read_shape), sharding, [local_arr],
         )
         if as_numpy:
+            # ``host_local`` is this rank's BLOCK, not the slab.  Returning
+            # it for a sharded request would hand the caller 1/P of the
+            # data typed as the whole thing — the allgather backend's
+            # ``as_numpy`` returns the full replicated slab, so the two
+            # backends would silently disagree on what they returned.
+            # (Unreachable through ``SlabIO.read_slab``, which does not
+            # forward ``as_numpy`` on the phdf5 paths and converts the
+            # returned array itself; reachable by using this backend
+            # directly, which the tests do.)
+            if any(s is not None for s in partition_spec):
+                raise ValueError(
+                    f"_MpiHostBackend.read_slab({name!r}): as_numpy=True is "
+                    f"only defined for a replicated request; got "
+                    f"partition_spec={partition_spec!r}, whose per-rank "
+                    f"block is 1/P of the slab.  Drop as_numpy and convert "
+                    f"the sharded jax.Array, or ask for P().")
             return np.asarray(host_local)
         return result
 
@@ -591,14 +651,43 @@ class _MpiHostBackend:
         # create_dataset (it's collective under parallel HDF5); we
         # broadcast the rank-0 value to all ranks so every rank writes
         # the same bytes.
-        if self._deferred_attrs:
-            for ds_name, value in self._deferred_attrs:
-                arr = np.asarray(value) if _rank0() else None
-                arr = self._comm.bcast(arr, root=0)
-                # Default: top-level dataset.  Could extend to
-                # "dset:attr" form if a caller ever needs per-dataset
-                # attrs deferred; today no caller does.
-                if ds_name not in self._fh:
-                    self._fh.create_dataset(ds_name, data=arr)
-        # All ranks close — collective MPI-IO H5Fclose.
-        self._fh.close()
+        #
+        # The loop body is TWO collectives per attr (``comm.bcast`` and a
+        # collective ``create_dataset``), so its trip count must be the
+        # same on every rank or close() deadlocks.  ``_deferred_attrs`` is
+        # a per-rank Python list built by per-rank ``write_attr`` calls;
+        # every call site in the tree is SPMD today, but that is a property
+        # of the callers, not of this method.  Agree the count first — one
+        # unconditional allgather of a small int, on every rank — so a
+        # divergence becomes a NAMED refusal on every rank instead of a
+        # hang with no message (the failure mode that costs runs: stderr
+        # is lost under srun+apptainer at teardown).
+        names = [n for n, _ in self._deferred_attrs]
+        all_names = self._comm.allgather(names)
+        # A rank must not skip a collective because of its own error
+        # (decisions.md 2026-08-04).  The divergence verdict IS
+        # rank-invariant (every rank sees the same allgather result), but
+        # the H5Fclose below is collective either way, so run the
+        # teardown first and raise after — otherwise a future
+        # rank-dependent refusal here would strand the file handle.
+        divergent = any(n != names for n in all_names)
+        try:
+            if not divergent:
+                for ds_name, value in self._deferred_attrs:
+                    arr = np.asarray(value) if _rank0() else None
+                    arr = self._comm.bcast(arr, root=0)
+                    # Default: top-level dataset.  Could extend to
+                    # "dset:attr" form if a caller ever needs per-dataset
+                    # attrs deferred; today no caller does.
+                    if ds_name not in self._fh:
+                        self._fh.create_dataset(ds_name, data=arr)
+        finally:
+            # All ranks close — collective MPI-IO H5Fclose.
+            self._fh.close()
+        if divergent:
+            raise RuntimeError(
+                f"SlabIO(phdf5_host).close: deferred write_attr lists differ "
+                f"across ranks — rank {self._comm.Get_rank()} has {names!r}, "
+                f"rank 0 has {all_names[0]!r}.  The flush loop is "
+                f"collective, so a divergent list would deadlock every rank. "
+                f"write_attr must be called identically on all ranks.")

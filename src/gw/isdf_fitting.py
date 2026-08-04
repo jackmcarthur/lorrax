@@ -248,8 +248,8 @@ def fit_zeta_to_h5(
     # ``factor_c_q`` slices internally to logical via the
     # ``n_rmu_logical=`` kwarg (Phase 3b-Cholesky) so the factorization
     # sees a non-singular matrix at its true extent.  zeta_q on disk
-    # has logical extent (SlabIO ``valid_shape=`` clips the padded
-    # output before write).
+    # has logical extent (SlabIO clips the padded output against the
+    # dataset's extent on write).
     n_rmu = meta.n_rmu                      # logical
     n_rmu_padded = meta.n_rmu_padded        # padded
     n_rtot = meta.n_rtot
@@ -771,7 +771,7 @@ def fit_zeta_to_h5(
     # handle serves BOTH backends: the allgather backend's handle is a
     # cheap rank-0 h5py file object, and routing its final write through
     # ``write_slab`` (instead of a hand-rolled gather + ``[...] =``)
-    # applies the shared ``valid_shape`` prefix clip — the bypass used
+    # applies the shared logical-extent clip — the bypass used
     # to write the PADDED gathered buffer into the logical-shaped
     # dataset and crashed whenever a μ pad existed (PADDING_AUDIT #2).
     #
@@ -1168,18 +1168,13 @@ def fit_zeta_to_h5(
                 _mask, gflat_acc, jnp.zeros_like(gflat_acc))
         jax.block_until_ready(gflat_acc)
         _n_G_sph = int(gflat_acc.shape[-1])
-        # On-disk extent is LOGICAL n_rmu; in-memory buffer is
-        # PADDED ``n_rmu_padded``.  SlabIO ``valid_shape=`` clips
-        # the trailing μ pad rows on write (they are zero by
-        # construction — L_q's pad block is identity).  Both backends
-        # implement the same prefix clip (FFI hyperslab / allgather
-        # rank-0 slice), so this is the single write path.
-        zeta_io.write_slab(
-            'zeta_q_G', gflat_acc,
-            offset=(0, 0, 0),
-            global_shape=(n_q_disk, n_rmu, _n_G_sph),
-            valid_shape=(n_q_disk, n_rmu, _n_G_sph),
-        )
+        # On-disk extent is LOGICAL n_rmu (stated once, at the
+        # ``create_dataset`` above); in-memory buffer is PADDED
+        # ``n_rmu_padded``.  SlabIO clips the trailing μ pad rows
+        # against the dataset's own extent (they are zero by
+        # construction — L_q's pad block is identity), identically on
+        # every backend, with nothing said here.
+        zeta_io.write_slab('zeta_q_G', gflat_acc)
     del gflat_acc
 
     with timing.section("zeta_fit.close_io"):

@@ -56,14 +56,15 @@ File handles are cached per-process so repeated ``open_file(path)``
 calls return the same handle until ``close_file`` is called.
 """
 _LOCK = threading.Lock()
-# path -> (int64 ctx handle, owning platform "CUDA"|"cpu").  The platform
-# is recorded at open and used for EVERY lifecycle call on the handle: a
+# path -> (int64 ctx handle, owning platform "CUDA"|"cpu", open mode).
+# The platform is recorded at open and used for EVERY lifecycle call on
+# the handle: a
 # PhdfCtx* allocated by one platform's .so (its heap, its HDF5/MPI state)
 # must never be handed to the other library — the dual-platform
 # (JAX_PLATFORMS=cuda,cpu) hazard the mesh routing exists for.  Routing
 # only the open by mesh platform while close/ensure_dataset followed the
 # JAX default backend was exactly that bug (audit fix/zq 2026-07-28).
-_FILE_CTXS: Dict[str, Tuple[int, str]] = {}
+_FILE_CTXS: Dict[str, Tuple[int, str, str]] = {}
 
 
 def validate_mesh_2d(mesh: Mesh) -> tuple[int, int]:
@@ -121,13 +122,33 @@ def open_file(path: str, *, mesh: Mesh, mode: str = "w") -> int:
 
     with _LOCK:
         if path in _FILE_CTXS:
-            return _FILE_CTXS[path][0]
+            # Handle reuse is deliberate (see the module docstring), but it
+            # is only sound when the second caller wants the SAME access.
+            # Silently handing back a 'r' context to a 'w' caller loses the
+            # write; handing back a 'w' context to a 'w' caller is worse,
+            # because ``_slab_io_ffi._replace_inode_for_write`` has already
+            # unlinked the path on rank 0 — the cached ctx still points at
+            # the ORPHANED inode, so every subsequent write lands in a file
+            # with no name and the run finishes rc=0 with nothing on disk.
+            # Rank-invariant (every rank performs the same opens), so this
+            # refuses on every rank or on none.
+            prev_ctx, prev_plat, prev_mode = _FILE_CTXS[path]
+            if prev_mode != mode:
+                raise RuntimeError(
+                    f"phdf5 open_file({path!r}, mode={mode!r}): this path is "
+                    f"already open in this process with mode={prev_mode!r} "
+                    f"(handle {prev_ctx}).  Handles are cached per path, so "
+                    f"you would get the mode={prev_mode!r} context back — "
+                    f"and on mode='w' the target inode has already been "
+                    f"unlinked, so the writes would go to an orphaned file. "
+                    f"Close the existing SlabIO/handle first.")
+            return prev_ctx
         ctx = ffi_loader.phdf5_open(
             path, p, q,
             int(jax.process_index()), int(jax.process_count()),
             _MODE_FLAGS[mode], platform=platform,
         )
-        _FILE_CTXS[path] = (ctx, platform)
+        _FILE_CTXS[path] = (ctx, platform, mode)
         return ctx
 
 
@@ -138,7 +159,7 @@ def platform_for_handle(ctx_handle: int) -> Optional[str]:
     must go through the owning platform's .so — this is the lookup the
     write-side lifecycle sites use to route theirs."""
     with _LOCK:
-        for _ctx, _plat in _FILE_CTXS.values():
+        for _ctx, _plat, _mode in _FILE_CTXS.values():
             if _ctx == int(ctx_handle):
                 return _plat
     return None
@@ -180,7 +201,7 @@ def _atexit_close_all() -> None:
     close_file calls.  Runs on every process.  Each handle closes through
     its own recorded platform library."""
     with _LOCK:
-        for path, (ctx, platform) in list(_FILE_CTXS.items()):
+        for path, (ctx, platform, _mode) in list(_FILE_CTXS.items()):
             try:
                 ffi_loader.phdf5_close(int(ctx), platform=platform)
             except Exception:

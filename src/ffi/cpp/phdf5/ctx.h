@@ -60,6 +60,33 @@ struct PhdfCtx {
     // tail is a std::memcpy into the (host-resident) XLA output buffer.
     // The buffer + capacity fields are shared by both; the CUDA-only
     // stream/event/device fields below are compiled out on the host build.
+    //
+    // OWNERSHIP (audit 2026-08-04, item 4 — precise statement of a known
+    // limitation, not a claim of safety).  There is exactly ONE staging
+    // buffer per ctx and TWO producers of work that use it:
+    //
+    //   a) the ctx writer thread, running FIFO tasks: the async write
+    //      (CUDA build only — the host build hands H5Dwrite the XLA input
+    //      buffer directly) and ``ReadKchunkUnion``.  Serialisation
+    //      BETWEEN these is by construction: one thread, one queue, and
+    //      each task synchronises the previous task's H2D before touching
+    //      the buffer (see async_read_kchunk_union_worker).
+    //   b) the SYNCHRONOUS ``ReadImpl``, which runs on the XLA thread and
+    //      begins with ensure_pinned + memset.  Nothing orders it against
+    //      (a): ensure_pinned may free and realloc the buffer while a
+    //      queued task holds the old pointer.
+    //
+    // The window is closed for every SlabIO caller, at the Python level:
+    // ``_FfiBackend.read_slab`` drains the dispatcher unconditionally
+    // before it touches the file, so the writer thread is idle for the
+    // whole of ReadImpl.  It is NOT closed for a direct ``ffi.io`` user
+    // that mixes the sync reader with the kchunk-union reader (or, on
+    // CUDA, with an in-flight write) on ONE handle: that is a genuine
+    // data race on ``pinned_buf`` and there is no guard here to stop it.
+    // Fixing it means routing ReadImpl through the writer queue — a C++
+    // redesign, deliberately not attempted; registered in
+    // KNOWN_LORRAX_ISSUES.md.  Do not add a second sync entry point that
+    // touches this buffer without doing that redesign first.
     void*        pinned_buf          = nullptr;
     size_t       pinned_capacity     = 0;
 #ifndef LORRAX_FFI_NO_CUDA

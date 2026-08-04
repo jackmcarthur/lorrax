@@ -190,6 +190,8 @@ static void async_worker(
     std::vector<hsize_t> offset,
     std::vector<hsize_t> file_count,
     std::vector<hsize_t> mem_dims,
+    std::vector<int64_t> offset_base,    // pre-shard origin, SAME on every rank
+    std::vector<int64_t> valid_shape,    // logical extent, SAME on every rank
     void* src_buf,
     bool wait_for_d2h,
     ffi::Promise promise)
@@ -227,32 +229,49 @@ static void async_worker(
                           "phdf5 async write: H5Sget_simple_extent_dims failed"));
         return;
     }
-    // Decide emptiness FIRST, and let it veto the bounds test.
+    // ── Emptiness is PER-RANK; the bounds test must be RANK-INVARIANT. ──
     //
-    // An empty selection writes nothing, and `offset` never reaches HDF5:
-    // the empty branch below replaces the hyperslab with H5Sselect_none,
-    // which takes no offset.  Two callers arrive here that way BY DESIGN --
-    // a rank whose local block is entirely mu padding (the shard loop above
-    // zeroes file_count when local_start >= valid_shape) and a non-canonical
+    // `empty_selection` decides which selection this rank makes.  An empty
+    // selection writes nothing and `offset` never reaches HDF5: the empty
+    // branch below replaces the hyperslab with H5Sselect_none, which takes
+    // no offset.  Two callers arrive here that way BY DESIGN -- a rank whose
+    // local block is entirely mu padding (the shard loop above zeroes
+    // file_count when local_start >= valid_shape) and a non-canonical
     // replica writer (`replica_dup`, which zeroes every count precisely to
     // keep the collective H5Dwrite rendezvous).  Both still carry an offset
     // advanced by `rank_coord * mem_dims[d]`, measured against a file that
-    // stores the LOGICAL extent -- so bounds-testing them rejects a write
-    // that was always going to be a no-op.  Only a NON-empty selection can
-    // run off the end of the dataset.
+    // stores the LOGICAL extent -- so bounds-testing THAT rejects a write
+    // that was always going to be a no-op (commit d935ce7; two 32-node legs).
     //
-    // Left ungated, this refuses the rank and returns without entering the
-    // collective H5Dwrite that its peers are already inside, which strands
-    // the whole communicator.  The read path never had the bug: read_ffi.cc
-    // checks emptiness and does not bounds-test at all.
+    // The bounds test itself is now taken on `offset_base + valid_shape`,
+    // the LOGICAL slab, instead of on this rank's advanced offset.  Both
+    // buffers are replicated control vectors -- identical on every rank by
+    // construction -- and max over ranks of (offset[d] + file_count[d]) is
+    // exactly offset_base[d] + valid_shape[d], so this accepts and refuses
+    // exactly the same calls as the per-rank test.  What changes is WHO
+    // refuses: every rank, or none.  The per-rank form reached its verdict
+    // only on ranks with a non-empty selection, so a caller overrunning the
+    // dataset while some ranks were wholly padding refused on a PROPER
+    // SUBSET -- the empty ranks entered the collective H5Dwrite alone and
+    // stranded the communicator, the same failure mode d935ce7 fixed, one
+    // step further out.  A refusal that fires on a subset of ranks inside a
+    // collective is a hang, not an error.
+    //
+    // A globally empty request (valid_shape[d] == 0 on any dim: nothing is
+    // selected on ANY rank) is not bounds-tested at all -- same doctrine.
     bool empty_selection = false;
     for (int d = 0; d < rank; ++d) {
         if (file_count[(size_t)d] == 0) { empty_selection = true; break; }
     }
+    bool globally_empty = false;
+    for (int d = 0; d < rank; ++d) {
+        if (valid_shape[(size_t)d] == 0) { globally_empty = true; break; }
+    }
     bool out_of_bounds = false;
-    if (!empty_selection) {
+    if (!globally_empty) {
         for (int d = 0; d < rank; ++d) {
-            if (offset[(size_t)d] + file_count[(size_t)d] > extent[(size_t)d]) {
+            if ((hsize_t)(offset_base[(size_t)d] + valid_shape[(size_t)d])
+                    > extent[(size_t)d]) {
                 out_of_bounds = true;
             }
         }
@@ -261,22 +280,27 @@ static void async_worker(
     if (debug || out_of_bounds) {
         std::fprintf(stderr,
             "[phdf5-write rank=%d ds=%s id=%lld] extent=%s offset=%s count=%s "
-            "mem_dims=%s collective=%d oob=%d empty=%d\n",
+            "mem_dims=%s base=%s valid=%s collective=%d oob=%d empty=%d\n",
             ctx->rank, h5_object_name(ds_id).c_str(), (long long)ds_id,
             vec_to_string(extent).c_str(), vec_to_string(offset).c_str(),
             vec_to_string(file_count).c_str(), vec_to_string(mem_dims).c_str(),
+            vec_to_string(offset_base).c_str(),
+            vec_to_string(valid_shape).c_str(),
             ctx->use_collective_write ? 1 : 0,
             out_of_bounds ? 1 : 0, empty_selection ? 1 : 0);
         std::fflush(stderr);
     }
     if (out_of_bounds) {
         std::ostringstream os;
-        os << "phdf5 async write: hyperslab out of bounds"
+        os << "phdf5 async write: logical slab out of bounds"
            << " ds=" << h5_object_name(ds_id)
            << " extent=" << vec_to_string(extent)
-           << " offset=" << vec_to_string(offset)
-           << " count=" << vec_to_string(file_count)
-           << " rank=" << ctx->rank;
+           << " offset_base=" << vec_to_string(offset_base)
+           << " valid_shape=" << vec_to_string(valid_shape)
+           << " (this rank: offset=" << vec_to_string(offset)
+           << " count=" << vec_to_string(file_count) << ")"
+           << " rank=" << ctx->rank
+           << " -- refused identically on every rank";
         H5Sclose(filespace);
         promise.SetError(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
         return;
@@ -590,12 +614,15 @@ static ffi::Future WriteDispatch(
                  offset = std::move(offset),
                  file_count = std::move(file_count),
                  mem_dims = std::move(mem_dims),
+                 offset_base = std::move(offset_host),
+                 valid_shape = std::move(valid_shape_host),
                  src_buf, wait_for_d2h,
                  promise = std::move(promise)]() mutable
     {
         async_worker(ctx, dset, native_type,
                      std::move(offset), std::move(file_count),
                      std::move(mem_dims),
+                     std::move(offset_base), std::move(valid_shape),
                      src_buf, wait_for_d2h,
                      std::move(promise));
     };

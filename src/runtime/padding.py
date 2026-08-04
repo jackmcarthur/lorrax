@@ -5,8 +5,9 @@ contract: arrays in memory may be padded to mesh-divisibility (so a JIT
 boundary with a product- or single-axis sharding spec doesn't trip
 ``ValueError: should be divisible by N``), but files on disk store the
 logical (unpadded) extent so they can be re-read on any process count
-(SlabIO ``valid_shape=`` clips on write; readers re-pad via
-:func:`padded_mu_extent`).
+(SlabIO clips the pad rows against the dataset's own extent on write —
+the caller states nothing; readers re-pad by asking for the padded shape,
+via :func:`padded_mu_extent`).
 
 The pad zone is always zero-filled.  Downstream operators that contract
 along a padded axis (e.g. einsums in V_q tile, V·χ in W solve) see no

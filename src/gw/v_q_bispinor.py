@@ -332,26 +332,18 @@ def compute_V_q_bispinor_g_flat_to_h5(
             #     6 TT tiles would inflate peak memory; we preserve the
             #     pre-IBZ "free between tiles" behaviour exactly.
             name = tile_dataset_name(mu_L, nu_L)
-            v_padded_shape = tuple(int(s) for s in V_acc.shape)
-            v_logical_shape = (int(v_padded_shape[0]), n_rmu_L, n_rmu_R)
+            v_logical_shape = (int(V_acc.shape[0]), n_rmu_L, n_rmu_R)
             with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
                         backend=backend, use_ffi_io=use_ffi_io) as tile_io:
                 tile_io.create_dataset(
                     name, shape=v_logical_shape, dtype=V_acc.dtype)
-                tile_io.write_slab(
-                    name, V_acc,
-                    global_shape=v_logical_shape,
-                    valid_shape=v_logical_shape)
+                tile_io.write_slab(name, V_acc)
                 if write_g0 and g0_acc is not None:
-                    g0_padded_shape = tuple(int(s) for s in g0_acc.shape)
-                    g0_logical_shape = (int(g0_padded_shape[0]), n_rmu_L)
+                    g0_logical_shape = (int(g0_acc.shape[0]), n_rmu_L)
                     tile_io.create_dataset(
                         f"{name}_g0", shape=g0_logical_shape,
                         dtype=g0_acc.dtype)
-                    tile_io.write_slab(
-                        f"{name}_g0", g0_acc,
-                        global_shape=g0_logical_shape,
-                        valid_shape=g0_logical_shape)
+                    tile_io.write_slab(f"{name}_g0", g0_acc)
             del V_acc, g0_acc
         else:
             # Buffer for post-loop Lorentz mixing (IBZ cascade active on
@@ -388,16 +380,12 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 continue
             V_mix = tt_mixed[(mu_L, nu_L)]
             name = tile_dataset_name(mu_L, nu_L)
-            v_padded_shape = tuple(int(s) for s in V_mix.shape)
-            v_logical_shape = (int(v_padded_shape[0]), n_rmu_T, n_rmu_T)
+            v_logical_shape = (int(V_mix.shape[0]), n_rmu_T, n_rmu_T)
             with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
                         backend=backend, use_ffi_io=use_ffi_io) as tile_io:
                 tile_io.create_dataset(
                     name, shape=v_logical_shape, dtype=V_mix.dtype)
-                tile_io.write_slab(
-                    name, V_mix,
-                    global_shape=v_logical_shape,
-                    valid_shape=v_logical_shape)
+                tile_io.write_slab(name, V_mix)
         del tt_full_in, tt_mixed
     del tt_buffer
 
@@ -536,7 +524,6 @@ class BispinorVqReader:
             V_companion = self._io.read_slab(
                 tile_dataset_name(*companion),
                 shape=(self.n_q_total, n_L_p, n_R_p),
-                valid_shape=(self.n_q_total, n_L_c, n_R_c),
                 mesh=self._mesh, partition_spec=spec)
             # Hermitian: V[j,i](q,μ,ν) = V[i,j](q,ν,μ)*
             return jnp.conj(jnp.swapaxes(V_companion, -1, -2))
@@ -546,7 +533,6 @@ class BispinorVqReader:
         return self._io.read_slab(
             tile_dataset_name(mu_L, nu_L),
             shape=(self.n_q_total, n_L_p, n_R_p),
-            valid_shape=(self.n_q_total, n_L, n_R),
             mesh=self._mesh, partition_spec=spec)
 
     def get_g0_CC(self) -> jax.Array | None:
@@ -557,7 +543,6 @@ class BispinorVqReader:
             return self._io.read_slab(
                 tile_dataset_name(0, 0) + "_g0",
                 shape=(self.n_q_total, n_L_p),
-                valid_shape=(self.n_q_total, n_L),
                 mesh=self._mesh,
                 partition_spec=P(None, 'x'))
         except Exception:

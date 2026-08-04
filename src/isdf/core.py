@@ -4087,9 +4087,10 @@ def _make_fit_one_rchunk_kernel(
     # is also at padded extent (factor_c_q embeds the
     # logical-extent factor with identity in the pad block — pad rows
     # of zeta come out as zero, logical block byte-identical to a
-    # pure-logical solve).  meta.n_rmu (logical) is used only at the
-    # SlabIO valid_shape= seam in fit_zeta_to_h5 so on-disk
-    # extent stays logical and round-trips across mesh sizes.
+    # pure-logical solve).  meta.n_rmu (logical) is used only as the
+    # dataset shape stated in fit_zeta_to_h5, which is what SlabIO
+    # clips the pad rows against, so the on-disk extent stays logical
+    # and round-trips across mesh sizes.
     n_rmu = meta.n_rmu_padded
     nspinor = meta.nspinor
     kgrid = meta.kgrid
@@ -4109,8 +4110,9 @@ def _make_fit_one_rchunk_kernel(
     # PADDED extent too (factor_c_q embeds the logical-extent factor
     # with identity in the pad block); the back-solve produces zeta
     # with zero pad rows, logical block byte-identical to a logical-
-    # only solve.  zeta is returned at padded extent; the SlabIO write
-    # uses valid_shape=meta.n_rmu so on-disk extent stays logical.
+    # only solve.  zeta is returned at padded extent; the dataset is
+    # created at meta.n_rmu, so SlabIO clips the pad rows against it
+    # and the on-disk extent stays logical.
 
     def z_q_phase(
         psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,

@@ -6,8 +6,9 @@ merged 2026-07-09):
 
 * **Slab API** (the production V_q reader of record):
   :meth:`read_zeta_r_slab` / :meth:`read_zeta_G_slab` — explicit
-  ``(q_offset, q_count, mu_offset, mu_count)`` windows, ``valid_mu``
-  trailing-μ zero-fill for padded reads.
+  ``(q_offset, q_count, mu_offset, mu_count)`` windows; a ``mu_count``
+  past the on-disk extent comes back zero-filled (SlabIO's business,
+  decisions.md 2026-08-04).
 * **Load API** (WfnLoader-shaped, test bench + future consumers):
   :meth:`load` — symbolic ``q='ibz' | 'full_bz' | seq[int]`` ranges,
   μ slices, and the IBZ→full-BZ symmetry unfold of ζ(r).
@@ -197,23 +198,21 @@ class ZetaLoader:
         mu_count: int,
         mesh: Mesh | None = None,
         partition_spec=P(None, None, ('x', 'y')),
-        valid_mu: int | None = None,
     ) -> jax.Array:
         """Read an r-space ζ slab.
 
         Returns ``(q_count, n_rtot, mu_count)`` complex128, sharded
-        per ``partition_spec``.  Trailing μ pad slots are zero-filled
-        when ``mu_offset + mu_count`` exceeds the logical extent and
-        ``valid_mu`` is set.
+        per ``partition_spec``.  Ask for the μ extent you want to
+        consume: SlabIO fills what the dataset covers and zeroes the
+        rest (decisions.md 2026-08-04), so a padded ``mu_count`` needs
+        no further argument.
         """
         if mesh is None:
             mesh = self._mesh
         n_rtot = self.n_rtot_disk
-        valid_count = (mu_count if valid_mu is None else valid_mu)
         return self.slab_io.read_slab(
             'zeta_q',
             shape=(int(q_count), int(n_rtot), int(mu_count)),
-            valid_shape=(int(q_count), int(n_rtot), int(valid_count)),
             dtype=np.complex128,
             offset=(int(q_offset), 0, int(mu_offset)),
             mesh=mesh,
@@ -230,7 +229,6 @@ class ZetaLoader:
         qvec_batch_frac: jax.Array,
         sphere_idx: jax.Array | None,
         mesh: Mesh | None = None,
-        valid_mu: int | None = None,
     ) -> jax.Array:
         """Read ζ in G-flat layout.
 
@@ -263,9 +261,6 @@ class ZetaLoader:
             keep the full FFT box).
         mesh : Mesh | None
             Override of the loader's stored mesh.
-        valid_mu : int | None
-            Logical μ extent if smaller than ``mu_count`` (pad-aware
-            reads).
         """
         if mesh is None:
             mesh = self._mesh
@@ -293,11 +288,9 @@ class ZetaLoader:
             # via the components table belongs in the V_q wrapper and
             # is not implemented here yet.
             n_G_sph_disk = int(self.n_G_sph_disk)
-            valid_count = (mu_count if valid_mu is None else int(valid_mu))
             zeta_g_disk = self.slab_io.read_slab(
                 self._zeta_dataset_name,
                 shape=(int(q_count), int(mu_count), n_G_sph_disk),
-                valid_shape=(int(q_count), int(valid_count), n_G_sph_disk),
                 dtype=np.complex128,
                 offset=(int(q_offset), int(mu_offset), 0),
                 mesh=mesh,
@@ -317,7 +310,7 @@ class ZetaLoader:
         zeta_disk = self.read_zeta_r_slab(
             q_offset=q_offset, q_count=q_count,
             mu_offset=mu_offset, mu_count=mu_count,
-            mesh=mesh, valid_mu=valid_mu,
+            mesh=mesh,
         )
 
         return _do_disk_to_G(
@@ -338,7 +331,6 @@ class ZetaLoader:
         layout: LayoutSpec = "r_space",
         qvec_frac: jax.Array | None = None,
         sphere_idx: jax.Array | None = None,
-        valid_mu: int | None = None,
     ) -> jax.Array:
         """Read a ζ window.
 
@@ -363,7 +355,7 @@ class ZetaLoader:
             ``'r_space'``   — ``(Q, n_rtot, μ)`` complex128 (default).
             ``'G_flat'``    — ``(Q, μ/p_prod, n_G_sph)`` complex128.
                                 Requires ``qvec_frac`` + ``sphere_idx``.
-        qvec_frac, sphere_idx, valid_mu
+        qvec_frac, sphere_idx
             Forwarded to the G-flat post-processing (FFT + sphere
             gather); ignored on ``r_space``.
         """
@@ -378,7 +370,6 @@ class ZetaLoader:
         # --- μ axis ---------------------------------------------------
         mu_lo, mu_hi = self._resolve_mu(mu)
         mu_count = mu_hi - mu_lo
-        valid_count = mu_count if valid_mu is None else int(valid_mu)
 
         # --- Default sharding for layout ------------------------------
         if sharding is None:
@@ -402,14 +393,14 @@ class ZetaLoader:
                     "Use q='ibz' and unfold in the V_q consumer.")
             return self._read_g_flat_disk(
                 q_indices=q_indices,
-                mu_lo=mu_lo, mu_count=mu_count, valid_mu=valid_count,
+                mu_lo=mu_lo, mu_count=mu_count,
                 partition_spec=sharding,
             )
 
         # --- r-space read (the disk-native layout) --------------------
         zeta_r = self._read_r_space(
             q_indices=q_indices,
-            mu_lo=mu_lo, mu_count=mu_count, valid_mu=valid_count,
+            mu_lo=mu_lo, mu_count=mu_count,
             partition_spec=sharding if layout == 'r_space'
                             else P(None, None, ('x', 'y')),
         )
@@ -611,7 +602,6 @@ class ZetaLoader:
         q_indices: np.ndarray,
         mu_lo: int,
         mu_count: int,
-        valid_mu: int,
         partition_spec: P,
     ) -> jax.Array:
         """Read a G-flat ζ slab ``(Q, μ, ngkmax)`` from ``zeta_q_G``.
@@ -628,7 +618,6 @@ class ZetaLoader:
             return self.slab_io.read_slab(
                 'zeta_q_G',
                 shape=(q_count, mu_count, ngkmax),
-                valid_shape=(q_count, valid_mu, ngkmax),
                 dtype=np.complex128,
                 offset=(q_offset, mu_lo, 0),
                 mesh=self._mesh,
@@ -640,7 +629,6 @@ class ZetaLoader:
             row = self.slab_io.read_slab(
                 'zeta_q_G',
                 shape=(1, mu_count, ngkmax),
-                valid_shape=(1, valid_mu, ngkmax),
                 dtype=np.complex128,
                 offset=(int(qi), mu_lo, 0),
                 mesh=self._mesh,
@@ -655,7 +643,6 @@ class ZetaLoader:
         q_indices: np.ndarray,
         mu_lo: int,
         mu_count: int,
-        valid_mu: int,
         partition_spec: P,
     ) -> jax.Array:
         """Issue the underlying SlabIO read for an r-space ζ slab.
@@ -673,7 +660,6 @@ class ZetaLoader:
             return self.slab_io.read_slab(
                 'zeta_q',
                 shape=(q_count, self.n_rtot_disk, mu_count),
-                valid_shape=(q_count, self.n_rtot_disk, valid_mu),
                 dtype=np.complex128,
                 offset=(q_offset, 0, mu_lo),
                 mesh=self._mesh,
@@ -688,7 +674,6 @@ class ZetaLoader:
             row = self.slab_io.read_slab(
                 'zeta_q',
                 shape=(1, self.n_rtot_disk, mu_count),
-                valid_shape=(1, self.n_rtot_disk, valid_mu),
                 dtype=np.complex128,
                 offset=(int(qi), 0, mu_lo),
                 mesh=self._mesh,
