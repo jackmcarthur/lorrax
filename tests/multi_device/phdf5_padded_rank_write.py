@@ -83,6 +83,42 @@ before any collective is entered); the C++ tests in ``write_ffi.cc`` /
 ``read_ffi.cc`` remain as the backstop for direct ``ffi.io`` users and
 still take the verdict on the replicated logical slab.
 
+The four cases that drive the C++ handlers DIRECTLY
+---------------------------------------------------
+Because the Python guard now fires first, ``oob_write`` / ``oob_read`` no
+longer reach the C++ tests at all: they gate SlabIO, and SlabIO alone.  A
+backstop nothing exercises rots.  These four bypass ``SlabIO`` entirely and
+call ``ffi.io.ffi_write_call`` / ``ffi_read_call`` inside a ``shard_map``,
+which is exactly what a direct ``ffi.io`` user does.
+
+    PADRANK_CASE=cpp_pad        <launcher> -n 4  python3 -m phdf5_padded_rank_write
+    PADRANK_CASE=cpp_oob_write  <launcher> -n 4  python3 -m phdf5_padded_rank_write
+    PADRANK_CASE=cpp_oob_read   <launcher> -n 4  python3 -m phdf5_padded_rank_write
+    PADRANK_CASE=cpp_badaxis    <launcher> -n 4  python3 -m phdf5_padded_rank_write
+
+    cpp_pad        the ACCEPT path at mu = P+1 through the raw handlers:
+                   write the padded buffer, read it back at the padded
+                   physical shape, every rank checks its own block.  This
+                   is what proves the added validation did not break the
+                   empty-selection rendezvous, and it is the control the
+                   three refusals are read against.
+    cpp_oob_write  the logical slab overruns the dataset (offset 1 on the
+                   mu axis) while wholly-padded ranks exist.  rc=0 iff THIS
+                   rank refused with the C++ message, i.e. iff
+                   ``write_ffi.cc``'s bounds test still takes its verdict
+                   on ``offset_base + valid_shape``.
+    cpp_oob_read   the same for ``read_ffi.cc``.
+    cpp_badaxis    ``axis_count_per_dim`` claims two mesh axes on the mu
+                   dim while ``axis_flat`` carries one.  The dispatch walks
+                   ``axis_flat`` with a running index, so before the
+                   2026-08-04 hardening this read PAST THE END of an
+                   XLA-owned span and used whatever it found as a mesh
+                   coordinate -- a silently wrong file offset, no crash.
+                   rc=0 iff THIS rank refused by name.
+
+All four are rank-invariant refusals or rank-invariant accepts, so the
+verdict is per-rank and the failure is again a hang.  Run under a bound.
+
 The two cases added when padding became implicit (decisions.md 2026-08-04)
 ------------------------------------------------------------------------
     PADRANK_CASE=implicit  <launcher> -n 4  python3 -m phdf5_padded_rank_write
@@ -136,7 +172,9 @@ PATH = os.environ.get("PADRANK_PATH", "padrank_gate.h5")
 
 
 _PAD_CASES = ("repro", "read_pad", "oob_write", "oob_read",
-              "implicit", "nodiv")
+              "implicit", "nodiv",
+              "cpp_pad", "cpp_oob_write", "cpp_oob_read", "cpp_badaxis")
+_CPP_CASES = ("cpp_pad", "cpp_oob_write", "cpp_oob_read", "cpp_badaxis")
 _CONTROL_CASES = ("control", "exact")
 
 
@@ -150,6 +188,161 @@ def _mu_for(case: str, world: int) -> int:
     raise SystemExit(
         f"unknown PADRANK_CASE={case!r} (expected "
         f"{' | '.join(_PAD_CASES + _CONTROL_CASES)})")
+
+
+# ---------------------------------------------------------------------------
+# The direct-handler cases: SlabIO is not in the picture at all
+# ---------------------------------------------------------------------------
+def _raw_encoding(mesh, spec, ndim):
+    """``(mesh_shape, axis_count_per_dim, axis_flat)`` for the FFI attrs.
+
+    Taken from ``file_io._slab_io_ffi`` so this test speaks the encoding the
+    production caller speaks; ``cpp_badaxis`` then corrupts it deliberately.
+    """
+    from jax.sharding import NamedSharding
+    from file_io._slab_io_ffi import _sharding_to_axis_info
+    acpd, aflat = _sharding_to_axis_info(NamedSharding(mesh, spec), ndim)
+    mesh_shape = tuple(int(mesh.shape[ax]) for ax in mesh.axis_names)
+    return mesh_shape, acpd, aflat
+
+
+def _raw_write(fh, ds_id, A, mesh, spec, offset, valid, enc):
+    from jax.experimental.shard_map import shard_map
+    from ffi.io import ffi_write_call
+    mesh_shape, acpd, aflat = enc
+
+    def _per_rank(A_local, off_l, vs_l):
+        return ffi_write_call(
+            A_local, off_l, vs_l,
+            ctx_handle=int(fh), ds_id=int(ds_id),
+            mesh_shape=mesh_shape,
+            axis_count_per_dim=acpd, axis_flat=aflat)
+
+    tok = shard_map(_per_rank, mesh=mesh,
+                    in_specs=(spec, P(), P()), out_specs=P(),
+                    check_rep=False)(
+        A,
+        jnp.asarray(offset, dtype=jnp.int64),
+        jnp.asarray(valid, dtype=jnp.int64))
+    return jax.block_until_ready(tok)
+
+
+def _raw_read(fh, ds_id, local_shape, mesh, spec, offset, valid, enc):
+    from jax.experimental.shard_map import shard_map
+    from ffi.io import ffi_read_call
+    mesh_shape, acpd, aflat = enc
+    out_struct = jax.ShapeDtypeStruct(tuple(int(s) for s in local_shape),
+                                      jnp.complex128)
+
+    def _per_rank(off_l, vs_l):
+        return ffi_read_call(
+            out_struct, off_l, vs_l,
+            ctx_handle=int(fh), ds_id=int(ds_id),
+            mesh_shape=mesh_shape,
+            axis_count_per_dim=acpd, axis_flat=aflat)
+
+    out = shard_map(_per_rank, mesh=mesh,
+                    in_specs=(P(), P()), out_specs=spec,
+                    check_rep=False)(
+        jnp.asarray(offset, dtype=jnp.int64),
+        jnp.asarray(valid, dtype=jnp.int64))
+    return jax.block_until_ready(out)
+
+
+def _run_cpp_case(case, rank, mesh, mu, loc, buf, ref, p0):
+    """One case per launch; each opens its own handle and closes it."""
+    import ffi.io as ffi_io
+    from ffi.common import ffi_loader
+
+    spec = P(None, ('x', 'y'), None)
+    enc = _raw_encoding(mesh, spec, 3)
+    if case == "cpp_badaxis":
+        # axis_count_per_dim says the mu dim is sharded over TWO mesh axes;
+        # axis_flat carries one.  The dispatch walks axis_flat with a running
+        # index, so this used to read past the end of the span.
+        mesh_shape, acpd, aflat = enc
+        enc = (mesh_shape, (0, 2, 0), (0,))
+        p0(f"[padrank-gate] corrupted encoding: axis_count_per_dim={enc[1]} "
+           f"axis_flat={enc[2]} (sums to 2, carries 1)")
+
+    A = jax.device_put(jnp.asarray(buf),
+                       NamedSharding(mesh, spec))
+    path = PATH + ".cpp"
+    if rank == 0 and os.path.exists(path):
+        os.remove(path)
+    jax.experimental.multihost_utils.sync_global_devices("cpp_unlink")
+
+    fh = ffi_io.open_file(path, mesh=mesh, mode="w")
+    ds_id = ffi_loader.phdf5_ensure_dataset(
+        fh, "zeta_like", (N_Q, mu, N_G), "complex128")
+
+    # ---- the accept path, which is also the control for the three refusals
+    if case == "cpp_pad":
+        _raw_write(fh, ds_id, A, mesh, spec, (0, 0, 0), (N_Q, mu, N_G), enc)
+        jax.experimental.multihost_utils.sync_global_devices("cpp_written")
+        out = _raw_read(fh, ds_id, (N_Q, loc, N_G), mesh, spec,
+                        (0, 0, 0), (N_Q, mu, N_G), enc)
+        blk = np.asarray(out.addressable_shards[0].data)
+        start = int(out.addressable_shards[0].index[1].start or 0)
+        want = buf[:, start:start + blk.shape[1], :]
+        bad = (blk.shape != want.shape or int(np.count_nonzero(blk != want)))
+        wholly = "(WHOLLY PADDED)" if start >= mu else ""
+        print(f"[padrank-gate rank={rank}] raw handlers: block rows "
+              f"[{start},{start + blk.shape[1]}) {wholly} mismatched={bad}",
+              flush=True)
+        ffi_io.close_file(path)
+        if rank == 0:
+            import h5py
+            with h5py.File(path, "r") as f:
+                got = np.asarray(f["zeta_like"])
+            if got.shape != ref.shape:
+                print(f"[padrank-gate] raw round-trip: SHAPE MISMATCH "
+                      f"{got.shape} want {ref.shape}", flush=True)
+                bad = True
+            else:
+                n = int(np.count_nonzero(got != ref))
+                print(f"[padrank-gate] raw round-trip: {n} mismatched of "
+                      f"{ref.size}", flush=True)
+                bad = bool(bad) or bool(n)
+            print(f"[padrank-gate] VERDICT case=cpp_pad mu={mu}: "
+                  f"{'FAIL' if bad else 'PASS'}", flush=True)
+        return 0 if not bad else 1
+
+    # ---- the three refusals.  rc=0 iff THIS rank refused.
+    what = {"cpp_oob_write": "the overrunning write",
+            "cpp_oob_read": "the overrunning read",
+            "cpp_badaxis": "the write with a corrupted axis encoding"}[case]
+    p0(f"[padrank-gate] issuing {what} through the raw C++ handler")
+    sys.stdout.flush()
+
+    if case == "cpp_oob_read":
+        # Populate the dataset first so the read has something to refuse
+        # ABOUT rather than something to fail on.
+        _raw_write(fh, ds_id, A, mesh, spec, (0, 0, 0), (N_Q, mu, N_G), enc)
+        jax.experimental.multihost_utils.sync_global_devices("cpp_r_written")
+
+    try:
+        if case == "cpp_oob_read":
+            _raw_read(fh, ds_id, (N_Q, loc, N_G), mesh, spec,
+                      (0, 1, 0), (N_Q, mu, N_G), enc)
+        elif case == "cpp_oob_write":
+            _raw_write(fh, ds_id, A, mesh, spec,
+                       (0, 1, 0), (N_Q, mu, N_G), enc)
+        else:
+            _raw_write(fh, ds_id, A, mesh, spec,
+                       (0, 0, 0), (N_Q, mu, N_G), enc)
+    except Exception as exc:                                  # noqa: BLE001
+        text = str(exc)
+        want = ("logical slab out of bounds" if case != "cpp_badaxis"
+                else "axis_flat")
+        named = want in text
+        print(f"[padrank-gate rank={rank}] REFUSED (correct), names "
+              f"'{want}'={named}: {type(exc).__name__}: {text[:300]}",
+              flush=True)
+        return 0 if named else 1
+    print(f"[padrank-gate rank={rank}] FAIL: the raw C++ handler ACCEPTED "
+          f"{what}", flush=True)
+    return 1
 
 
 def main():
@@ -196,6 +389,11 @@ def main():
     if rank == 0 and os.path.exists(PATH):
         os.remove(PATH)
     jax.experimental.multihost_utils.sync_global_devices("padrank_unlink")
+
+    # ---- the direct-handler cases own their own file and never construct a
+    # SlabIO, so they must run before the shared write below.
+    if CASE in _CPP_CASES:
+        return _run_cpp_case(CASE, rank, mesh, mu, loc, buf, ref, p0)
 
     # ---- oob_write: refuse BEFORE the file is written, so nothing else in
     # this launch depends on the outcome.  The verdict is per-rank: rc=0

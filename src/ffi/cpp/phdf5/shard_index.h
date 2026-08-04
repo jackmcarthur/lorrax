@@ -37,12 +37,22 @@ namespace lorrax_ffi::phdf5 {
 
 namespace ffi = ::xla::ffi;
 
+// INTERNAL LINKAGE, deliberately.  The originals in write_ffi.cc /
+// read_ffi.cc were ``static``, so they never reached the .so's dynamic
+// symbol table.  Plain header ``inline`` would give them vague linkage and
+// export them, and both platform libraries are loaded RTLD_GLOBAL in a
+// dual-platform process -- the reason the handlers themselves register under
+// DISTINCT names (read_ffi.cc's registration note).  An anonymous namespace
+// keeps one copy per TU and the exported-symbol set unchanged, which is the
+// control every .so rebuild in this tree is checked against.
+namespace {
+
 // Un-ravel a linear rank id through a row-major mesh shape into per-axis
 // coordinates.  rank = sum(coord[i] * prod(shape[i+1:])).  PRECONDITION:
 // ``validate_shard_encoding`` has accepted ``mesh_shape`` — it is what rules
 // out the zero entry that would divide by zero here, and the rank >= prod
 // that would silently wrap this rank onto another rank's hyperslab.
-inline std::vector<int64_t> unravel_rank(
+[[maybe_unused]] std::vector<int64_t> unravel_rank(
     int64_t rank, ffi::Span<const int64_t> mesh_shape)
 {
     std::vector<int64_t> coord(mesh_shape.size(), 0);
@@ -55,7 +65,7 @@ inline std::vector<int64_t> unravel_rank(
 }
 
 template <typename T>
-inline std::string vec_to_string(const std::vector<T>& v)
+std::string vec_to_string(const std::vector<T>& v)
 {
     std::ostringstream os;
     os << "[";
@@ -67,7 +77,7 @@ inline std::string vec_to_string(const std::vector<T>& v)
     return os.str();
 }
 
-inline std::string span_to_string(ffi::Span<const int64_t> v)
+[[maybe_unused]] std::string span_to_string(ffi::Span<const int64_t> v)
 {
     std::ostringstream os;
     os << "[";
@@ -92,7 +102,7 @@ inline std::string span_to_string(ffi::Span<const int64_t> v)
 // This is for ERROR paths only.  Clipping an overhanging slab is NOT an error
 // and must stay silent — decisions.md 2026-08-04, "CLIPPING IS SILENT AND
 // THAT IS INTENDED".
-inline void announce_error(const PhdfCtx* ctx, const std::string& msg)
+[[maybe_unused]] void announce_error(const PhdfCtx* ctx, const std::string& msg)
 {
     std::fprintf(stderr, "[phdf5 ERROR rank=%d] %s\n",
                  ctx ? ctx->rank : -1, msg.c_str());
@@ -105,7 +115,7 @@ inline void announce_error(const PhdfCtx* ctx, const std::string& msg)
 // is asked to allocate and what the following ``memset`` uses, while H5Dread
 // still transfers the true element count of the dataspace.  A wrap therefore
 // buys a heap overflow with no HDF5 error.
-inline bool checked_buffer_bytes(const std::vector<hsize_t>& dims,
+[[maybe_unused]] bool checked_buffer_bytes(const std::vector<hsize_t>& dims,
                                  size_t elt_bytes, const char* who,
                                  size_t* out_bytes, std::string* err)
 {
@@ -151,7 +161,7 @@ inline bool checked_buffer_bytes(const std::vector<hsize_t>& dims,
 //     coordinate.  ``ffi.io.open_file`` already refuses ``p*q !=
 //     jax.process_count()``, so this is that invariant restated where the
 //     arithmetic actually happens.
-inline bool validate_shard_encoding(
+[[maybe_unused]] bool validate_shard_encoding(
     const PhdfCtx* ctx, const char* who,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
@@ -240,7 +250,7 @@ inline bool validate_shard_encoding(
 // vector.  ``write_ffi.cc`` has always had this guard and ``read_ffi.cc``
 // gained it in the 2026-08-04 audit; these are its remaining siblings.
 // Rank-invariant: same dataset, same request, on every rank.
-inline bool check_dataset_rank(hid_t filespace, int want_rank,
+[[maybe_unused]] bool check_dataset_rank(hid_t filespace, int want_rank,
                                const char* who, int* file_rank_out,
                                std::string* err)
 {
@@ -254,5 +264,7 @@ inline bool check_dataset_rank(hid_t filespace, int want_rank,
     *err = os.str();
     return false;
 }
+
+}  // namespace
 
 }  // namespace lorrax_ffi::phdf5
