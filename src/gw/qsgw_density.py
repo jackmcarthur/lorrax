@@ -98,7 +98,7 @@ from runtime.padding import pad_axis_to, spec_divisor
 
 
 __all__ = ["rho_from_wfns", "rho_r_to_G", "band_rotation_spec",
-           "distributed_eigh_bands"]
+           "distributed_eigh_bands", "symmetrise_density"]
 
 
 def _band_spec() -> P:
@@ -127,9 +127,41 @@ def band_rotation_spec() -> P:
     return P(None, "x", "y")
 
 
+def symmetrise_density(rho_r, sym_perm):
+    """ρ_sym[r] = (1/n_sym) Σ_s ρ[sym_perm[s, r]] — the star average.
+
+    ``sym_perm`` is ``centroid.orbit_syms.compute_rgrid_sym_perm``'s table,
+    ``sym_perm[s, r_new] = r_old`` with ``r_{r_new} ≡ S_s·r_{r_old} + τ_s``
+    on the FFT grid, so the fractional translations are already handled and
+    this is a pure gather.
+
+    IDEMPOTENT IFF THE TABLE IS A GROUP.  The star average is a projector
+    onto the symmetric subspace only when the permutations are closed
+    under composition, which ``compute_rgrid_sym_perm`` emits and an
+    ad-hoc table need not.  Not checked here: closure costs
+    ``O(n_sym² · N_r)`` and the producer already guarantees it.
+
+    WHY IT IS NOT OPTIONAL ON A REDUCED k-SET.  A k-weighted sum over the
+    IBZ produces the density of the IBZ representatives, not of the
+    crystal: the star members each contribute their own rotated copy and
+    only their average is the true ρ.  The failure is quiet — an
+    unsymmetrised IBZ ρ still integrates to the exact electron count,
+    because the star average is a permutation average and preserves
+    ``Σ_r`` — so the one check that guards everything else in this module
+    is blind to it.  That is why :func:`rho_from_wfns` REFUSES a
+    non-uniformly-weighted k-set unless it is given this table, rather
+    than documenting the requirement and hoping.
+    """
+    rho = jnp.asarray(rho_r, dtype=jnp.float64)
+    grid = rho.shape
+    perm = jnp.asarray(sym_perm, dtype=jnp.int32)
+    flat = rho.reshape(-1)
+    return (jnp.mean(flat[perm], axis=0)).reshape(grid)
+
+
 def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                   fft_grid, cell_volume: float, spin_degeneracy: float,
-                  U=None):
+                  U=None, sym_perm=None):
     """ρ(r) = Σ_k w_k f_spin Σ_{n,s} f_nk |ψ̃_nks(r)|², scanned over k.
 
     Parameters
@@ -166,14 +198,20 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     into the accumulation, so there is ONE collective class for the whole
     build rather than one materialised ψ̃ per k.
 
-    SYMMETRISATION IS THE CALLER'S, AND THAT IS A KNOWN ROUGH EDGE.  Handed
-    IBZ weights this returns the weighted IBZ sum, which is not the density
-    until symmetrised over the star (``centroid.orbit_syms``).  Leaving a
-    correctness step to the caller is the inverse of the SlabIO padding
-    ruling and should be closed once the star machinery of
-    ``docs/dev/ibz_self_consistency_scaffold.md`` exists; until then the
-    electron-count check is what catches a caller who forgets, because an
-    unsymmetrised IBZ ρ still integrates to the right number.
+    SYMMETRISATION IS ENFORCED, NOT DOCUMENTED.  ``sym_perm`` (from
+    ``centroid.orbit_syms.compute_rgrid_sym_perm``) makes the result the
+    star average; see :func:`symmetrise_density`.  A k-set with
+    NON-UNIFORM weights is by construction reduced, and this routine
+    REFUSES it without ``sym_perm`` rather than returning the
+    unsymmetrised sum — which would integrate to the exact electron count
+    and pass every other check in this module.  Uniform weights are taken
+    to be the full BZ and need no table.
+
+    The residual hole, stated rather than papered over: a REDUCED set
+    whose stars all happen to have equal size also has uniform weights and
+    would not be caught.  That is exotic on a Monkhorst–Pack grid but not
+    impossible; pass ``sym_perm`` whenever the k-set is reduced, uniform
+    weights or not.
     """
     from common.fft_helpers import make_sharded_ifftn_3d
 
@@ -205,6 +243,17 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     else:
         U_j = jnp.zeros((1, 1, 1), dtype=jnp.complex128)   # unused operand
 
+    w_np = np.asarray(kweights, dtype=np.float64)
+    if sym_perm is None and w_np.size > 1 and not np.allclose(
+            w_np, w_np[0], rtol=0, atol=1e-12):
+        raise ValueError(
+            f"rho_from_wfns: kweights are non-uniform "
+            f"(min {w_np.min():.6g}, max {w_np.max():.6g}), so this k-set is "
+            f"reduced, but sym_perm=None.  A weighted sum over a reduced set "
+            f"is the density of the representatives, not of the crystal, and "
+            f"it still integrates to the exact electron count — so no other "
+            f"check here would catch it.  Pass "
+            f"centroid.orbit_syms.compute_rgrid_sym_perm(...).")
     w_j = jnp.asarray(kweights, dtype=jnp.float64)
     bidx_j = jnp.asarray(box_index, dtype=jnp.int32)
 
@@ -256,13 +305,18 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                 (psi_.shape[0], 1, 1), dtype=jnp.complex128)
             rho, _ = jax.lax.scan(
                 body, rho0, (psi_xy, psi_mx, U_xs, occ_, w_, bidx_))
-            return jax.lax.with_sharding_constraint(rho, rho_sharding)
+            rho = jax.lax.with_sharding_constraint(rho, rho_sharding)
+            if sym_perm is not None:
+                rho = symmetrise_density(rho, sym_perm)
+                rho = jax.lax.with_sharding_constraint(rho, rho_sharding)
+            return rho
         return fn
 
     fn = _cached_jit(
         "rho_from_wfns",
         (psi.shape, tuple(np.shape(U_j)), grid, float(cell_volume), f_spin,
-         have_U, _sharding_key(psi)),
+         have_U, None if sym_perm is None else tuple(np.shape(sym_perm)),
+         _sharding_key(psi)),
         build)
     return fn(psi, U_j, occ_j, w_j, bidx_j)
 

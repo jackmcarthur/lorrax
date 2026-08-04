@@ -38,7 +38,8 @@ from common.collectives import (process_count, process_rank,   # noqa: E402
                                 resolve_mesh)
 from gw.qsgw_density import (rho_from_wfns, rho_r_to_G,          # noqa: E402
                              band_rotation_spec,
-                             distributed_eigh_bands)
+                             distributed_eigh_bands,
+                             symmetrise_density)
 from psp.get_DFT_mtxels import valence_density_from_kpoint     # noqa: E402
 
 NB = int(os.environ.get("QD_NB", "16"))
@@ -99,8 +100,12 @@ def main():
     psi_j = jax.make_array_from_callback(psi.shape, sharding,
                                          lambda idx: psi[idx])
 
+    # Identity sym table: these synthetic psi carry no real symmetry, so
+    # the star average must be a no-op for checks 1-6 to mean what they say.
+    ident_perm = np.arange(ngrid, dtype=np.int32)[None, :]
     kw = dict(mesh=mesh, box_index=bidx, fft_grid=GRID,
-              cell_volume=volume, spin_degeneracy=f_spin)
+              cell_volume=volume, spin_degeneracy=f_spin,
+              sym_perm=ident_perm)
 
     # ---- baseline: unrotated -------------------------------------------
     rho_ref = np.asarray(rho_from_wfns(psi_j, occ, kweights, **kw))
@@ -224,11 +229,50 @@ def main():
            f"{str(exc)[:110]}")
         ok6 = ok6b = False
 
+    # ---- 7. symmetrisation is ENFORCED on a reduced k-set ---------------
+    # kweights here are random ⇒ non-uniform ⇒ a reduced set.  Every rho
+    # above was built with sym_perm supplied as the identity table; asking
+    # without one must REFUSE, because the unsymmetrised sum integrates to
+    # the exact electron count and no other check sees it.
+    try:
+        rho_from_wfns(psi_j, occ, kweights,
+                      **{k: v for k, v in kw.items() if k != "sym_perm"})
+        ok7 = False
+        p0("[qd] 7. reduced k-set without sym_perm  FAIL (not refused)")
+    except ValueError as exc:
+        ok7 = "non-uniform" in str(exc)
+        p0(f"[qd] 7. reduced k-set without sym_perm  "
+           f"{'PASS refused' if ok7 else 'FAIL wrong error'}")
+
+    # ---- 8. symmetrise_density properties -------------------------------
+    ident = np.arange(ngrid, dtype=np.int32)[None, :]     # identity only
+    r_id = np.asarray(symmetrise_density(rho_ref, ident))
+    ok8a = float(np.abs(r_id - rho_ref).max()) == 0.0
+    # A CLOSED 2-op table (a Z2 group): identity + roll by nx/2, whose
+    # square is the identity.  Idempotence of the star average holds iff
+    # the table is a GROUP -- {identity, roll-by-1} is not one (its square
+    # is roll-by-2, absent from the table) and correctly fails this.
+    # compute_rgrid_sym_perm emits a group; an ad-hoc table need not.
+    rolled = np.roll(np.arange(ngrid, dtype=np.int32).reshape(GRID),
+                     nx // 2, axis=0).ravel()
+    tab = np.stack([np.arange(ngrid, dtype=np.int32), rolled])
+    r_s = np.asarray(symmetrise_density(rho_ref, tab))
+    ok8b = abs(float(r_s.sum()) - float(rho_ref.sum())) / abs(
+        float(rho_ref.sum())) < 1e-12          # integral preserved
+    r_ss = np.asarray(symmetrise_density(r_s, tab))
+    ok8c = float(np.abs(r_ss - r_s).max()) / max(
+        float(np.abs(r_s).max()), 1e-300) < 1e-12   # idempotent on its orbit
+    p0(f"[qd] 8. symmetrise: identity no-op={ok8a} integral-preserved="
+       f"{ok8b} idempotent={ok8c}  "
+       f"{'PASS' if (ok8a and ok8b and ok8c) else 'FAIL'}")
+    ok8 = ok8a and ok8b and ok8c
+
     rho_G = rho_r_to_G(rho_ref, mesh=mesh)
     p0(f"[qd] rho(G=0) = {complex(np.asarray(rho_G).ravel()[0]):.6e} "
        f"(= sum_r rho = {float(rho_ref.sum()):.6e})")
 
-    ok = ok1 and ok2 and ok3 and ok4 and ok4b and ok5 and ok5b and ok6 and ok6b
+    ok = (ok1 and ok2 and ok3 and ok4 and ok4b and ok5 and ok5b
+          and ok6 and ok6b and ok7 and ok8)
     p0(f"[qd] VERDICT {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 

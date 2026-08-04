@@ -54,6 +54,39 @@ Licenses deleting: caller-side pad/unpad arithmetic that exists only to
 satisfy SlabIO, and per-call-site `valid_shape` computation that merely
 restates the logical extent.
 
+## 2026-08-04 — The TRS veto is about k-grid FFT sums, and only those
+
+Scope of the standing veto below ("No time-reversal-symmetry-based
+reductions"), given by the owner 2026-08-04 because the wording read
+absolutely and the code did the opposite:
+
+* **FORBIDDEN** — using TRS to reduce sums over k for the **self-energy and
+  related observables that are evaluated by FFT over the k-grid**. Those
+  convolutions need the whole grid; halving them on an antiunitary
+  identity is the case the veto exists for.
+* **ALLOWED, AND PREFERRED** — TRS for every sum NOT strategically done by
+  k-grid FFT. The charge density, the IBZ self-consistent update, matrix
+  elements and k-weighted accumulations are all in this class.
+
+So the standing entry is a statement about ONE class of sum, not about the
+symmetry. It was never violated: `SymMaps.trs_allowed` defaulting to True,
+`unfold_psi`'s TRS branch, and reading a `nrk=10` WFN are all outside the
+forbidden class — unfolding 10 k to 16 is an EXPANSION, and ends in
+full-grid work.
+
+Why the wording was absolute: TRS is antiunitary, so the rule has two
+halves — the `iσ_y·conj` spinor factor and the negation of the G list —
+and they are applied in *different* places (`unfold_psi` and its caller).
+Applying one without the other replaces ψ(r) by ψ*(−r), which is norm-,
+orthogonality- and ⟨T⟩-preserving and therefore **invisible to every cheap
+check**, while being wrong by O(100 eV) in V_loc/V_NL (the scorecard §Q
+bug). The veto was a burn, not a physics objection.
+
+Licenses: an IBZ-reduced self-consistent update on a TRS-reduced k-set
+(`docs/dev/ibz_self_consistency_scaffold.md`); `gw.qsgw_density` consuming
+`WfnLoader.kweights` on the IBZ. Does NOT license folding χ⁰, W or Σ over
+±q.
+
 ## 2026-07-30 — D10: fixed-shape ngkmax G loading (ratified 2026-08-04)
 
 G-vector counts differ per k-point. Every per-k kernel takes the loader's
