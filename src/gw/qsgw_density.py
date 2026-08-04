@@ -10,18 +10,33 @@ STRUCTURE: ONE SCAN, U NEVER REPLICATED
 ---------------------------------------
 A single ``lax.scan`` over k.  Per k, in this order:
 
-    ψ_m^Y   ← reshard ψ[k] so the CONTRACTED band index m lies on 'y'
-    ψ̃_n^X  ← einsum('nm,msg->nsg', U[k], ψ_m^Y)     # U is P('x','y')
+    ψ_m^X   ← reshard ψ[k] so the CONTRACTED band index m lies on 'x'
+    ψ̃_n^Y  ← einsum('mn,msg->nsg', Z[k], ψ_m^X)     # Z is P('x','y')
     ψ̃_n^XY ← reshard onto the whole mesh
     box → ifft → ρ(r) += w_k · f_spin · Σ_n f_nk |ψ̃_nk(r)|²
 
-``U`` is sharded ``P(None, 'x', 'y')`` — n on 'x', m on 'y' — so no rank
-ever holds a full ``(nb, nb)``.  At nb=640/P=64 each rank carries
+``Z`` is sharded ``P(None, 'x', 'y')`` — m on 'x', n on 'y' — so no rank
+ever holds a full ``(nb, nb)``.  That is the NATIVE layout of both
+eigenvector producers (``ffi.linalg._scalapack.batched_distributed_eigh``
+and a ``jnp.linalg.eigh`` constrained to it), and the contraction is
+written to consume it as-is: transposing Z to put n on 'x' would swap the
+sharding to ``P(None,'y','x')`` and cost an all-to-all on the largest
+object in the loop, for nothing.  At nb=640/P=64 each rank carries
 80×80×16 B = 102 kB per k against 6.5 MB replicated, and the replicated
 form is the ``(nk, nb, nb)`` W2-class object that reaches 9.2 GB at
-nb=2000/nk=144.  The contraction index m is on 'y' and the output index n
-on 'x', so the sum over m is a reduction along 'y' ALONE, not a global
+nb=2000/nk=144.  The contraction index m is on 'x' and the output index n
+on 'y', so the sum over m is a reduction along 'x' ALONE, not a global
 collective.
+
+EIGENVECTORS ARE COLUMNS.  ``Z[k, m, n]`` is component m of eigenvector
+n: ``A[k] @ Z[k] == Z[k] @ diag(W[k])``.  That is ScaLAPACK's convention,
+``jnp.linalg.eigh``'s, and the one ``sc_iteration._rotate_to_dft_basis``
+already assumes, so ψ̃_n = Σ_m Z[m,n] ψ_m.  The transpose of this is a
+CONVENTION BUG THAT MOST TESTS CANNOT SEE: for a unitary Q, Qᵀ is also
+unitary and also mixes only within the occupied block, so occupied-block
+invariance, the electron count and the norm all survive it.  The gate
+therefore pins the convention against an explicit host-side rotation
+rather than relying on an invariance.
 
 The third step — resharding ψ̃ from ``P('x',…)`` back onto ``('x','y')``
 — is what makes the rest uniform.  Straight out of the rotation the bands
@@ -82,7 +97,8 @@ from common.wfn_transforms import _box_kernel, _cached_jit, _sharding_key
 from runtime.padding import pad_axis_to, spec_divisor
 
 
-__all__ = ["rho_from_wfns", "rho_r_to_G", "band_rotation_spec"]
+__all__ = ["rho_from_wfns", "rho_r_to_G", "band_rotation_spec",
+           "distributed_eigh_bands"]
 
 
 def _band_spec() -> P:
@@ -100,12 +116,13 @@ def _band_spec() -> P:
 
 
 def band_rotation_spec() -> P:
-    """``U`` layout: ``(n_k, nb, nb)`` with n on 'x' and m on 'y'.
+    """``Z`` layout: ``(n_k, nb, nb)`` with m on 'x' and n on 'y'.
 
-    The eigenvector matrix from ``sc_iteration``, sharded so no rank holds
-    a full ``(nb, nb)``.  Ask ``_make_kshard_eigh(..., u_spec=...)`` for it
-    rather than resharding a replicated U after the fact — the replicated
-    intermediate is the whole cost being avoided.
+    The eigenvector matrix, columns, sharded so no rank holds a full
+    ``(nb, nb)``.  It is exactly ``batched_distributed_eigh``'s declared
+    output layout, so the FFI path needs no reshard at all; ask
+    ``_make_kshard_eigh(..., u_spec=...)`` for the same layout from the
+    native path rather than resharding a replicated U after the fact.
     """
     return P(None, "x", "y")
 
@@ -129,8 +146,11 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
         star afterwards — a weighted IBZ sum is not the full-BZ density
         until it is.  See the SYMMETRISATION note below.
     U : (n_k, nb, nb) complex, sharded :func:`band_rotation_spec`, optional
-        ``U[k, n, m]`` takes DFT band m into rotated band n.  ``None``
-        builds ρ from ``psi_G`` unrotated, which is the DFT density and
+        Eigenvectors as COLUMNS — ``U[k, m, n]`` is component m of
+        rotated band n, so ψ̃_n = Σ_m U[m,n] ψ_m.  This is what
+        ``ffi.linalg`` and ``jnp.linalg.eigh`` return and what
+        ``sc_iteration`` already assumes; do not pass a transpose.
+        ``None`` builds ρ from ``psi_G`` unrotated — the DFT density and
         the gate's baseline.
 
     Returns
@@ -189,7 +209,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     bidx_j = jnp.asarray(box_index, dtype=jnp.int32)
 
     band_xy = NamedSharding(mesh, _band_spec())
-    m_on_y = NamedSharding(mesh, P(None, "y", None, None))
+    m_on_x = NamedSharding(mesh, P(None, "x", None, None))
     U_sh = NamedSharding(mesh, band_rotation_spec())
     box_spec = P(None, ("x", "y"), None, None, None, None)
     ifftn = make_sharded_ifftn_3d(mesh, box_spec, box_spec,
@@ -202,17 +222,18 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
             psi_xy = jax.lax.with_sharding_constraint(psi_, band_xy)
             if have_U:
                 # m on 'y' so the contraction reduces along 'y' alone.
-                psi_my = jax.lax.with_sharding_constraint(psi_, m_on_y)
+                psi_mx = jax.lax.with_sharding_constraint(psi_, m_on_x)
                 U_x = jax.lax.with_sharding_constraint(U_, U_sh)
             else:
-                psi_my = psi_xy
+                psi_mx = psi_xy
                 U_x = U_
 
             def body(rho, xs):
-                psi_xy_k, psi_my_k, U_k, occ_k, w_k, bidx_k = xs
+                psi_xy_k, psi_mx_k, U_k, occ_k, w_k, bidx_k = xs
                 if have_U:
-                    # n from U's 'x', m summed along 'y'.
-                    psi_t = jnp.einsum('nm,msg->nsg', U_k, psi_my_k,
+                    # COLUMNS: psi~_n = sum_m Z[m,n] psi_m.  m is on 'x'
+                    # so the sum reduces along 'x' alone; n lands on 'y'.
+                    psi_t = jnp.einsum('mn,msg->nsg', U_k, psi_mx_k,
                                        optimize=True)
                     # Back onto the WHOLE mesh: straight out of the
                     # rotation the bands sit on 'x' and are replicated on
@@ -234,7 +255,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
             U_xs = U_x if have_U else jnp.zeros(
                 (psi_.shape[0], 1, 1), dtype=jnp.complex128)
             rho, _ = jax.lax.scan(
-                body, rho0, (psi_xy, psi_my, U_xs, occ_, w_, bidx_))
+                body, rho0, (psi_xy, psi_mx, U_xs, occ_, w_, bidx_))
             return jax.lax.with_sharding_constraint(rho, rho_sharding)
         return fn
 
@@ -260,3 +281,57 @@ def rho_r_to_G(rho_r, *, mesh: Mesh):
     fftn = make_sharded_fftn_3d(mesh, spec, spec, norm='backward',
                                 axes=(-3, -2, -1))
     return fftn(rho)
+
+
+def distributed_eigh_bands(H, *, mesh: Mesh):
+    """(E, Z) for every k, with NO ``(nb, nb)`` ever on one rank.
+
+    ``H`` is ``(n_k, nb, nb)`` Hermitian at :func:`band_rotation_spec`.
+    Returns ``E`` ``(n_k, nb)`` replicated ascending and ``Z``
+    ``(n_k, nb, nb)`` at the same 2-D layout, eigenvectors as COLUMNS.
+
+    Routed to ``ffi.linalg._scalapack.batched_distributed_eigh``
+    (``pXheevd``) ON PURPOSE, and against the usual cost argument.
+    ``ffi/linalg/dispatch.py`` records that the native path solves ``ndev``
+    matrices at once while the FFI solves one matrix ``ndev``-ways and
+    walks the batch serially, so ``off`` wins by roughly ``ndev`` whenever
+    a whole matrix fits on one device.  At nb=640 it does (6.5 MB) and the
+    native path is ~ndev faster.
+
+    **At nb=10⁴ it does not.**  One ``(nb, nb)`` complex128 tile is 1.6 GB
+    at nb=10⁴ and 6.4 GB at nb=2·10⁴, and the native path needs that on a
+    SINGLE device on top of ψ and the FFT boxes.  The distributed backend
+    is the one that still runs there, so it is what this uses: the owner's
+    ruling is robustness at 10⁴⁺ bands over speed at 10³ (2026-08-04).
+    The batched entry point costs one collective-serialisation round for
+    the whole k stack, not one per k.
+
+    CONSTRAINTS, all checked by the callee: host (CPU) mesh only — a CUDA
+    mesh wants ``ffi.cusolvermp.distributed_eigh``; square or 1-D mesh,
+    because ``pXheevd`` needs square descriptor blocks; and ``nb``
+    divisible by ``max(Px, Py)``, which the band pad to ``px·py`` already
+    guarantees.
+
+    GAUGE.  ``Z`` is NOT mesh-invariant — a degenerate eigenvalue leaves
+    an arbitrary unitary inside its subspace and the block-cyclic
+    reduction picks a different representative on a different grid.  ρ is
+    unaffected: it is ``Σ_n f_n |Z_n|²``, i.e. ``Z f(W) Zᴴ`` contracted
+    with ψ, which is gauge-invariant whenever ``f`` is constant across a
+    degenerate set — and a step occupation from
+    :func:`gw.efermi.fermi_level_step` is exactly that, because it REFUSES
+    to split a degenerate manifold.  The two guarantees are the same
+    guarantee, which is why that refusal is load-bearing rather than
+    fussy.
+    """
+    from ffi.linalg._scalapack import batched_distributed_eigh
+
+    H_j = jnp.asarray(H)
+    p_prod = spec_divisor(mesh, _band_spec(), 1)
+    H_j, _ = pad_axis_to(H_j, p_prod, axis=1)
+    H_j, _ = pad_axis_to(H_j, p_prod, axis=2)
+    H_sh = NamedSharding(mesh, band_rotation_spec())
+    H_j = jax.lax.with_sharding_constraint(H_j, H_sh)
+    # Hermitise explicitly: pXheevd reads one triangle, so a non-Hermitian
+    # input is silently interpreted rather than refused.
+    H_j = 0.5 * (H_j + jnp.conj(jnp.swapaxes(H_j, -1, -2)))
+    return batched_distributed_eigh(H_j, mesh=mesh)

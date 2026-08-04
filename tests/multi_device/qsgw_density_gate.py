@@ -37,7 +37,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P    # noqa: E402
 from common.collectives import (process_count, process_rank,   # noqa: E402
                                 resolve_mesh)
 from gw.qsgw_density import (rho_from_wfns, rho_r_to_G,          # noqa: E402
-                             band_rotation_spec)
+                             band_rotation_spec,
+                             distributed_eigh_bands)
 from psp.get_DFT_mtxels import valence_density_from_kpoint     # noqa: E402
 
 NB = int(os.environ.get("QD_NB", "16"))
@@ -158,11 +159,76 @@ def main():
     p0(f"[qd] 4b. general U electron count {got_gen:.12f}  "
        f"{'PASS' if ok4b else 'FAIL'}")
 
+    # ---- 5. CONVENTION PIN: eigenvectors are COLUMNS --------------------
+    # Checks 1, 2, 4 and every norm check survive a TRANSPOSED U, because
+    # for a unitary Q the transpose is also unitary and also mixes only
+    # within the occupied block.  So the convention has to be pinned
+    # against an explicit host-side rotation, not against an invariance.
+    psi_rot_np = np.einsum('kmn,kmsg->knsg', U_gen, psi, optimize=True)
+    rho_pin = np.zeros(GRID, dtype=np.float64)
+    for ik in range(NK):
+        box = np.zeros((NB, NS, nx, ny, nz), dtype=np.complex128)
+        box[:, :, gv[ik, :, 0], gv[ik, :, 1], gv[ik, :, 2]] = psi_rot_np[ik]
+        rho_pin += np.asarray(valence_density_from_kpoint(
+            jnp.asarray(box), nocc=NOCC, weight=float(kweights[ik]),
+            cell_volume=volume, spin_degeneracy=f_spin))
+    d_pin = float(np.abs(rho_gen - rho_pin).max()) / max(
+        float(np.abs(rho_pin).max()), 1e-300)
+    ok5 = d_pin <= RTOL
+    p0(f"[qd] 5. column-convention pin  rel {d_pin:.3e}  "
+       f"{'PASS' if ok5 else 'FAIL'}")
+    # ...and the transpose must DISAGREE, or the pin proves nothing.
+    psi_rotT = np.einsum('knm,kmsg->knsg', U_gen, psi, optimize=True)
+    rho_T = np.zeros(GRID, dtype=np.float64)
+    for ik in range(NK):
+        box = np.zeros((NB, NS, nx, ny, nz), dtype=np.complex128)
+        box[:, :, gv[ik, :, 0], gv[ik, :, 1], gv[ik, :, 2]] = psi_rotT[ik]
+        rho_T += np.asarray(valence_density_from_kpoint(
+            jnp.asarray(box), nocc=NOCC, weight=float(kweights[ik]),
+            cell_volume=volume, spin_degeneracy=f_spin))
+    d_T = float(np.abs(rho_pin - rho_T).max()) / max(
+        float(np.abs(rho_pin).max()), 1e-300)
+    ok5b = d_T > 1e-6
+    p0(f"[qd] 5b. transpose must DIFFER  rel {d_T:.3e}  "
+       f"{'PASS' if ok5b else 'FAIL'}")
+
+    # ---- 6. distributed eigh: E and Z with no (nb,nb) on one rank -------
+    rngH = np.random.default_rng(7)
+    A = rngH.standard_normal((NK, NB, NB)) + 1j * rngH.standard_normal((NK, NB, NB))
+    A = 0.5 * (A + np.conj(np.swapaxes(A, -1, -2)))
+    A_j = jax.make_array_from_callback(A.shape, U_sh, lambda idx: A[idx])
+    try:
+        E_d, Z_d = distributed_eigh_bands(A_j, mesh=mesh)
+        E_d = np.asarray(E_d)
+        E_ref = np.linalg.eigvalsh(A)
+        d_E = float(np.abs(E_d - E_ref).max()) / max(
+            float(np.abs(E_ref).max()), 1e-300)
+        ok6 = d_E <= 1e-10
+        p0(f"[qd] 6. distributed eigh eigenvalues  rel {d_E:.3e}  "
+           f"Z spec={Z_d.sharding.spec}  {'PASS' if ok6 else 'FAIL'}")
+        # rho built from the DISTRIBUTED Z must match rho from the same
+        # eigenvectors computed natively -- rho is gauge-invariant even
+        # though Z is not, which is the whole point of the gauge warning.
+        occ_d = np.zeros((NK, NB)); occ_d[:, :NOCC] = 1.0
+        rho_d = np.asarray(rho_from_wfns(psi_j, occ_d, kweights, U=Z_d, **kw))
+        _, Z_n = np.linalg.eigh(A)
+        Z_nj = jax.make_array_from_callback(Z_n.shape, U_sh, lambda idx: Z_n[idx])
+        rho_n = np.asarray(rho_from_wfns(psi_j, occ_d, kweights, U=Z_nj, **kw))
+        d_g = float(np.abs(rho_d - rho_n).max()) / max(
+            float(np.abs(rho_n).max()), 1e-300)
+        ok6b = d_g <= 1e-9
+        p0(f"[qd] 6b. rho is gauge-invariant (dist Z vs native Z)  "
+           f"rel {d_g:.3e}  {'PASS' if ok6b else 'FAIL'}")
+    except Exception as exc:
+        p0(f"[qd] 6. distributed eigh UNAVAILABLE: {type(exc).__name__}: "
+           f"{str(exc)[:110]}")
+        ok6 = ok6b = False
+
     rho_G = rho_r_to_G(rho_ref, mesh=mesh)
     p0(f"[qd] rho(G=0) = {complex(np.asarray(rho_G).ravel()[0]):.6e} "
        f"(= sum_r rho = {float(rho_ref.sum()):.6e})")
 
-    ok = ok1 and ok2 and ok3 and ok4 and ok4b
+    ok = ok1 and ok2 and ok3 and ok4 and ok4b and ok5 and ok5b and ok6 and ok6b
     p0(f"[qd] VERDICT {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
