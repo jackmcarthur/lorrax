@@ -95,8 +95,8 @@ def write_restart_state_to_h5(
     attribute written); with ``mode="a"`` the file is opened for
     append / overwrite of the named datasets.
 
-    ``n_rmu_logical`` (= ``meta.n_rmu``) clips every μ axis to the
-    logical extent on disk (SlabIO ``valid_shape``): in-memory arrays
+    ``n_rmu_logical`` (= ``meta.n_rmu``) is the μ extent stated on
+    disk; SlabIO clips the in-memory pad rows against it.  In-memory arrays
     carry the P-dependent padded extent ``meta.n_rmu_padded`` whose pad
     rows are exact zeros, and persisting them verbatim would make the
     restart file unreadable at a different device count (the
@@ -165,8 +165,11 @@ def write_restart_state_to_h5(
             n_log = n_rmu_logical if n_logical is None else n_logical
             shape = _mu_logical_shape(arr.shape, mu_axes, n_log)
             _t0 = time.time()
+            # The LOGICAL shape is stated once, to create_dataset; the
+            # write clips ``arr``'s μ pad rows against it on its own
+            # (decisions.md 2026-08-04).
             io.create_dataset(name, shape=shape, dtype=arr.dtype)
-            io.write_slab(name, arr, global_shape=shape, valid_shape=shape)
+            io.write_slab(name, arr)
             _log_restart_write(name, shape, arr.dtype, time.time() - _t0)
 
         _write("V_qmunu",      V_qmunu,      mu_axes=(-2, -1))
@@ -243,8 +246,7 @@ def write_w0_qmunu_to_h5(
                 backend=backend, use_ffi_io=use_ffi_io) as io:
         _t0 = time.time()
         io.create_dataset("W0_qmunu", shape=shape, dtype=W0_qmunu.dtype)
-        io.write_slab("W0_qmunu", W0_qmunu, global_shape=shape,
-                      valid_shape=shape)
+        io.write_slab("W0_qmunu", W0_qmunu)
         # Same instrument as ``write_restart_state_to_h5`` (AF.4c).  This
         # is the SECOND (nq, mu, mu) tensor the run writes -- another
         # 13.34 GB at c2406 -- and it had no telemetry at all, so a repeat
@@ -430,8 +432,8 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
     elif V_qmunu.ndim == 6:
         V_qmunu = jnp.asarray(V_qmunu)[0, 0, 0]
 
-    # Disk stores the LOGICAL μ extent (the writer clips via SlabIO
-    # ``valid_shape``); in-memory arrays carry the padded extent
+    # Disk stores the LOGICAL μ extent (SlabIO clips the writer's pad
+    # rows against it); in-memory arrays carry the padded extent
     # ``padded_mu_extent(n_rmu, world_size)`` with exact-zero pad rows.
     # Re-apply the pad here so downstream shapes match ``Meta``.
     # Restart files predating the clip carry an already-padded extent

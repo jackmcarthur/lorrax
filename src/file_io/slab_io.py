@@ -32,13 +32,28 @@ One primitive:
   (the isdf_fitting zeta loop, ppm_sigma stream).  Opens once,
   creates/ensures datasets, writes/reads, closes.
 
-All methods accept an ``offset`` N-tuple giving where the local slab
-lands in the dataset.  ``valid_shape`` defaults to ``A.shape`` for
-ordinary writes; pass a smaller prefix when ``A`` is padded for even
-sharding but the padded tail should not be written. ``global_shape``
-defaults to ``A.shape`` for whole-dataset writes; pass it explicitly
-when writing a sub-slab of a larger dataset (e.g. one ω-batch of
-Σ_c(ω,k,i,j)).
+Padding is SlabIO's business, not the caller's (decisions.md
+2026-08-04).  A caller states LOGICAL shapes and nothing else:
+
+    io.create_dataset("A", shape=(n_q, n_mu, n_G), dtype=c128)
+    io.write_slab("A", A_padded)                       # pad rows dropped
+    B = io.read_slab("A", shape=(n_q, n_mu_pad, n_G),  # pad rows zeroed
+                     dtype=c128, mesh=mesh, partition_spec=spec)
+
+* ``write_slab(name, A, offset=...)`` accepts any ``A``.  The extent
+  that reaches the file is ``min(A.shape, dataset - offset)`` per dim,
+  derived from the dataset SlabIO already knows about — so a buffer
+  padded for mesh divisibility needs no argument at all.
+* ``read_slab(name, shape=...)`` returns exactly ``shape``.  Whatever
+  padding the backend needs (mesh divisibility) is read and trimmed
+  internally; positions past the dataset come back zero-filled.
+* ``valid_shape`` survives ONLY as the ragged-chunk override: a chunk
+  buffer whose tail is genuinely not part of this write, which SlabIO
+  cannot derive because both extents are legitimate.  An override that
+  overruns the dataset is a refusal, on every rank.
+* ``global_shape`` is only needed to CREATE a dataset inside
+  ``write_slab``.  Once the dataset exists it is redundant, and a
+  ``global_shape`` that contradicts the dataset is a refusal.
 """
 from __future__ import annotations
 
@@ -176,15 +191,17 @@ class SlabIO:
         chunks: Sequence[int] | None = None,
         attrs: dict | None = None,
     ) -> None:
-        """Pre-create a dataset with the given shape + dtype + chunks.
+        """Pre-create a dataset with the given LOGICAL shape + dtype + chunks.
 
-        Padding policy: SlabIO writes ``A`` at exactly the dataset's
-        shape; pass ``valid_shape`` on ``write_slab`` for chunk writes
-        or to clip a padded ``A`` down to a smaller logical extent.
-        Driver-side padding/unpadding is the caller's responsibility
-        (see ``runtime.padding``);
-        files always store the logical shape so they can be re-read
-        on a different mesh size.
+        ``shape`` is what the file stores, so it can be re-read on any
+        process count.  Everything a subsequent ``write_slab`` needs to
+        know about padding is derived from it.
+
+        On an existing dataset: identical shape and dtype reuse it
+        (idempotent); anything else REFUSES, naming both shapes, on
+        every rank.  SlabIO never deletes-and-recreates (data loss) and
+        never writes into the previous geometry (wrong extent, no
+        symptom) — decisions.md 2026-08-04.
         """
         self._backend.create_dataset(
             name, shape=shape, dtype=dtype, chunks=chunks, attrs=attrs)
@@ -197,9 +214,10 @@ class SlabIO:
         """
         self._backend.write_attr(name, value)
 
-    # Padding contract for sharded producers: make ``A.shape`` divisible
-    # by the mesh, but pass ``valid_shape`` for the logical prefix that
-    # should reach disk.  The padded tail of ``A`` is ignored.
+    # Padding contract for sharded producers: hand over the array you
+    # have.  SlabIO clips it to the dataset's own extent, so a buffer
+    # padded for mesh divisibility writes its logical prefix and nothing
+    # else, with no argument from the caller.
     def write_slab(
         self,
         name: str,
@@ -219,10 +237,17 @@ class SlabIO:
         FFI path; ignored on the allgather path (which gathers the
         whole thing to rank 0).
 
-        ``offset`` (default all zeros) + ``valid_shape`` define the
-        logical hyperslab.  ``valid_shape`` defaults to ``A.shape``;
-        pass a smaller prefix when the physical array is padded for
-        sharding but the padded tail should not be written.
+        ``offset`` (default all zeros) is where the slab starts in the
+        dataset.  The extent written is ``min(A.shape, dataset - offset)``
+        per dim — pad rows past the dataset's extent are dropped, with
+        no argument from the caller.
+
+        ``valid_shape`` is the ragged-chunk OVERRIDE and nothing else:
+        pass it only when ``A``'s trailing rows are not part of THIS
+        write even though the dataset has room for them (a chunk buffer
+        whose last chunk is short).  An override that overruns the
+        dataset refuses, on every rank.  ``global_shape`` is likewise
+        only needed when ``write_slab`` has to create the dataset.
 
         ``k_chunk_size`` is an allgather-backend-only knob that
         streams the rank-0 write along axis 1 to keep memory bounded
@@ -236,9 +261,10 @@ class SlabIO:
             dtype=dtype, chunks=chunks, k_chunk_size=k_chunk_size,
         )
 
-    # Padding contract for sharded consumers: request a mesh-divisible
-    # physical ``shape`` and pass smaller ``valid_shape`` for the file
-    # prefix to populate.  The returned padded tail is zero-filled.
+    # Padding contract for sharded consumers: ask for the shape you want
+    # to consume.  SlabIO fills the part the dataset covers and zeroes
+    # the rest, and handles mesh divisibility internally, so a consumer
+    # that runs at a padded μ extent just asks for the padded shape.
     def read_slab(
         self,
         name: str,
@@ -261,10 +287,14 @@ class SlabIO:
         ``partition_spec`` on ``mesh`` (``as_numpy`` still forces a
         host ndarray via ``device_get``).
 
-        ``shape`` is the physical output shape and may include padding.
-        ``valid_shape`` is the logical file extent to read into the
-        prefix of that output; padded tail elements are zero-filled.
-        Defaults to ``shape``.
+        ``shape`` is returned EXACTLY.  It may exceed the dataset (a
+        μ-padded consumer buffer): the overhang comes back zero-filled.
+        It need not be mesh-divisible under ``partition_spec`` either —
+        SlabIO reads the rounded-up extent and trims.  Defaults to the
+        dataset's own shape.
+
+        ``valid_shape`` is the ragged-chunk override; see
+        :meth:`write_slab`.  Routine reads do not pass it.
         """
         if self.use_ffi_io:
             arr = self._backend.read_slab(

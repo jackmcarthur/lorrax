@@ -30,6 +30,7 @@ from jax.experimental import multihost_utils
 
 from ._slab_io_ffi import (
     _barrier,
+    _DatasetGeometry,
     _normalize_slab_request,
     _normalize_valid_shape,
     _rank0,
@@ -73,7 +74,7 @@ def _to_host(A: Any) -> np.ndarray:
     return np.asarray(jax.device_get(gathered))
 
 
-class _AllgatherBackend:
+class _AllgatherBackend(_DatasetGeometry):
     """Rank-0-only h5py file handle with collective process barriers.
 
     Non-rank-0 processes hold `_file = None` and no-op on every method;
@@ -97,6 +98,12 @@ class _AllgatherBackend:
         _barrier(f"slab_io_open/{self.path}")
         if _rank0():
             self._file = h5py.File(self.path, mode)
+        # Replicated record of each dataset's LOGICAL geometry.  This
+        # backend NEEDS the record rather than a file query: only rank 0
+        # holds a handle, so a per-rank lookup would be rank-DEPENDENT,
+        # and ``valid_shape`` has to be derived from a replicated
+        # quantity (decisions.md 2026-08-04).
+        self._geom_init()
 
     # ------------------------------------------------------------------
     def create_dataset(
@@ -108,17 +115,67 @@ class _AllgatherBackend:
         chunks: Sequence[int] | None = None,
         attrs: dict | None = None,
     ) -> None:
+        shape_t = tuple(int(s) for s in shape)
+        dtype_t = np.dtype(dtype)
+        # ── reuse-if-identical, refuse otherwise; NEVER delete-and-recreate ──
+        # decisions.md 2026-08-04.  This backend used to ``del`` the
+        # existing dataset and recreate it, silently resetting its
+        # contents — the outlier among the three backends, and data loss
+        # for a caller that creates then writes only part of the extent.
+        #
+        # Only rank 0 holds a handle, so the verdict is computed there and
+        # BROADCAST: a rank-0-only raise would leave the peers inside the
+        # barrier below with no message, which is the failure mode this
+        # whole entry exists to remove.  The broadcast replaces nothing —
+        # it is a rendezvous, so it also serves as the barrier.
+        clash = 0
+        _rank0_clash = None
         if _rank0() and self._file is not None:
             if name in self._file:
-                del self._file[name]
-            ds = self._file.create_dataset(
-                name, shape=tuple(shape), dtype=dtype,
-                chunks=tuple(chunks) if chunks else None,
-            )
-            if attrs:
-                for k, v in attrs.items():
-                    ds.attrs[k] = v
+                existing = self._file[name]
+                have = (tuple(int(s) for s in existing.shape),
+                        np.dtype(existing.dtype))
+                if have == (shape_t, dtype_t):
+                    self._remember_geom(name, *have)
+                    clash = 0
+                else:
+                    clash = 1
+                    _rank0_clash = have
+            else:
+                ds = self._file.create_dataset(
+                    name, shape=shape_t, dtype=dtype_t,
+                    chunks=tuple(chunks) if chunks else None,
+                )
+                if attrs:
+                    for k, v in attrs.items():
+                        ds.attrs[k] = v
+        clash = int(np.asarray(jax.device_get(
+            multihost_utils.broadcast_one_to_all(np.int32(clash)))))
+        if clash:
+            if _rank0():
+                self._refuse_geometry_change(
+                    op="create_dataset", name=name,
+                    want_shape=shape_t, want_dtype=dtype_t,
+                    have_shape=_rank0_clash[0], have_dtype=_rank0_clash[1])
+            raise ValueError(
+                f"create_dataset {name!r}: rank 0 refused — the dataset "
+                f"already exists at a shape or dtype other than the "
+                f"requested {shape_t} / {dtype_t.name}.  SlabIO will "
+                f"neither delete-and-recreate it nor write into the "
+                f"previous geometry (decisions.md 2026-08-04); rank 0's "
+                f"message names both shapes.")
+        self._remember_geom(name, shape_t, dtype_t)
         _barrier(f"slab_io_create_dataset/{name}")
+
+    # ------------------------------------------------------------------
+    def _dataset_shape(self, name: str) -> tuple[int, ...] | None:
+        """LOGICAL extent of ``name`` as this handle recorded it.
+
+        No file query: see :meth:`__init__`.  ``read_slab`` supplies its
+        own (every rank has its own ``'r'`` handle there, so that lookup
+        IS replicated).
+        """
+        return self._known_shape(name)
 
     # ------------------------------------------------------------------
     def write_attr(self, name: str, value) -> None:
@@ -161,25 +218,37 @@ class _AllgatherBackend:
         ``shape = global_shape`` (defaults to A.shape) and the caller's
         ``chunks`` / ``dtype``.
         """
-        off, local_shape, gshape = _normalize_slab_request(
+        off, local_shape, req_gshape = _normalize_slab_request(
             op="write_slab", name=name, offset=offset,
             slab_shape=A.shape, global_shape=global_shape,
             check_bounds=False)
-        vshape = _normalize_valid_shape(
-            op="write_slab", name=name, valid_shape=valid_shape,
-            slab_shape=local_shape, offset=off, global_shape=gshape)
 
         # Gather once; rank 0 then owns the full slab.
         host = _to_host(A)
         if dtype is None:
             dtype = host.dtype
 
+        # Derive the logical extent from the DATASET (decisions.md
+        # 2026-08-04).  Auto-create routes through ``create_dataset`` so
+        # a geometry clash refuses on EVERY rank instead of only on the
+        # one that holds the file.
+        ds_shape = self._dataset_shape(name)
+        if ds_shape is None:
+            self.create_dataset(name, shape=req_gshape, dtype=dtype,
+                                chunks=chunks)
+            ds_shape = req_gshape
+        elif global_shape is not None and req_gshape != ds_shape:
+            raise ValueError(
+                f"write_slab {name!r}: global_shape={req_gshape} contradicts "
+                f"the dataset's extent {ds_shape}.  global_shape is only "
+                f"needed to CREATE a dataset; drop it and SlabIO uses the "
+                f"dataset's own shape.")
+        gshape = ds_shape
+        vshape = _normalize_valid_shape(
+            op="write_slab", name=name, valid_shape=valid_shape,
+            slab_shape=local_shape, offset=off, ds_shape=ds_shape)
+
         if _rank0() and self._file is not None:
-            if name not in self._file:
-                self._file.create_dataset(
-                    name, shape=gshape, dtype=dtype,
-                    chunks=tuple(chunks) if chunks else None,
-                )
             dset = self._file[name]
             slicer = tuple(slice(o, o + s) for o, s in zip(off, vshape))
             src_slicer = tuple(slice(0, s) for s in vshape)
@@ -243,13 +312,15 @@ class _AllgatherBackend:
         if self._read_file is None:
             self._read_file = h5py.File(self.path, 'r')
         dset = self._read_file[name]
-        full_shape = tuple(dset.shape) if shape is None else tuple(shape)
+        ds_shape = tuple(int(s) for s in dset.shape)
+        self._remember_geom(name, ds_shape, dset.dtype)
+        full_shape = ds_shape if shape is None else tuple(shape)
         off, out_shape, _ = _normalize_slab_request(
             op="read_slab", name=name, offset=offset,
             slab_shape=full_shape, global_shape=None, check_bounds=False)
         vshape = _normalize_valid_shape(
             op="read_slab", name=name, valid_shape=valid_shape,
-            slab_shape=out_shape, offset=off, global_shape=None)
+            slab_shape=out_shape, offset=off, ds_shape=ds_shape)
         # ---- SHARDED fast path ------------------------------------------
         # When the caller asks for a sharded result, read ONLY this
         # process's shard.  The whole-slab path below allocates the FULL

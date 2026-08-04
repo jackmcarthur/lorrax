@@ -55,6 +55,14 @@ class AsyncDispatcher:
     matches SlabIO's existing behaviour — exceptions don't silently
     disappear, but they don't tear down the worker either, so the
     main thread gets a clean re-raise on the next coordination point.
+
+    ``_raise_if_error`` CLEARS the stash as it raises: the error is
+    delivered exactly once, so a caller that catches it owns it and
+    must not assume a later ``close()`` will resurface it.  That is why
+    ``_slab_io_ffi._FfiBackend.close`` records the drain's exception
+    itself and re-raises after the collective ``H5Fclose`` — under
+    decisions.md 2026-08-04 no rank may skip a collective because of
+    its own error.
     """
 
     def __init__(self, name: str, maxsize: int = 2):
@@ -89,12 +97,20 @@ class AsyncDispatcher:
             return self._pending
 
     def close(self) -> None:
+        # The worker MUST be joined even when the drain re-raises: the
+        # caller (SlabIO) is inside a collective teardown and a rank that
+        # abandoned its writer thread here would leave the thread alive
+        # with a live MPI file handle while its peers close theirs.
+        # ``try/finally``, not ``except``, so the error still reaches the
+        # caller — it just reaches it after the thread is gone.
         if self._closed:
             return
-        self.drain()
-        self._closed = True
-        self._queue.put(None)  # poison pill
-        self._worker.join()
+        try:
+            self.drain()
+        finally:
+            self._closed = True
+            self._queue.put(None)  # poison pill
+            self._worker.join()
 
     def __enter__(self):
         return self

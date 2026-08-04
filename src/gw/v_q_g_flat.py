@@ -261,23 +261,22 @@ def _pick_g_chunk(ngkmax: int, target: int = 4096) -> int:
 def _make_read_all_ibz(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
     """Return ``read_all_ibz(n_q_ibz) -> (n_q_ibz, n_rmu_padded, ngkmax)``.
 
-    One read shape: ``ZetaLoader.read_zeta_G_slab`` with the padded-μ
-    contract — read ``n_rmu_padded`` rows (zero-filled past the logical
-    extent via ``valid_mu``), which is what the V_q kernels consume.
+    One read shape: ``ZetaLoader.read_zeta_G_slab`` at ``n_rmu_padded``
+    rows.  SlabIO zero-fills past the dataset's own μ extent
+    (decisions.md 2026-08-04), so the caller states the extent it wants
+    to consume and nothing else.
     The batched single-call form avoids the ``n_q_ibz`` separate
     ``read_slab`` closures (each one a distinct
     ``_FfiBackend.read_slab.<locals>._per_rank`` closure id) that would
     each cost a JAX trace cache miss.
     """
-    n_rmu_logical = int(zeta_loader.n_rmu)
-
     def read_all_ibz(n_q_ibz: int) -> jax.Array:
         return zeta_loader.read_zeta_G_slab(
             q_offset=0, q_count=int(n_q_ibz),
             mu_offset=0, mu_count=int(n_rmu_padded),
             qvec_batch_frac=jnp.zeros((int(n_q_ibz), 3), dtype=jnp.float64),
             sphere_idx=None,
-            mesh=mesh_xy, valid_mu=n_rmu_logical,
+            mesh=mesh_xy,
         )
 
     return read_all_ibz

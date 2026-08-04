@@ -722,16 +722,16 @@ def _load_real_zeta(loader, n_q, n_mu, n_g_pad, mesh, spec):
     # so the READ needs μ divisible by P = p_x·p_y — a stricter condition
     # than the overlap's (μ divisible by p_x and by p_y separately), and
     # one that 2406 % 4 = 2 and 606 % 4 = 2 both violate (job 7879524).
-    # ``valid_mu`` is the loader's own answer: read a P-divisible μ window
-    # zero-filled past the logical extent, then slice the pad off before
-    # the reshard, so no zero ζ row ever reaches the Gram.
+    # SlabIO's answer: ask for a P-divisible μ window, which comes back
+    # zero-filled past the dataset's own extent, then slice the pad off
+    # before the reshard, so no zero ζ row ever reaches the Gram.
     n_mu, n_q = int(n_mu), int(n_q)
     p_tot = int(mesh.size)
     mu_read = n_mu + (-n_mu) % p_tot
     z = loader.read_zeta_G_slab(
         q_offset=0, q_count=n_q, mu_offset=0, mu_count=mu_read,
         qvec_batch_frac=jnp.zeros((n_q, 3)), sphere_idx=None,
-        mesh=mesh, valid_mu=n_mu)
+        mesh=mesh)
     n_g = int(z.shape[-1])
     pad = int(n_g_pad) - n_g
     if pad < 0:
@@ -768,7 +768,7 @@ def cell_real(mesh, args) -> int:
         for name, n in (("mu_S", mu_s), ("mu_L", mu_l)):
             if n % p_x or n % p_y:
                 _log(f"  REFUSE: {name}={n} is not divisible by p_x={p_x} "
-                     f"and p_y={p_y}.  The READ pad is handled (valid_mu), "
+                     f"and p_y={p_y}.  The READ pad is handled by SlabIO, "
                      f"but padding μ_S into the GRAM would make G_S "
                      f"singular; pick a mesh whose axes divide {mu_s} and "
                      f"{mu_l} (gcd here is 6, so 1/2/3/6 per axis).")

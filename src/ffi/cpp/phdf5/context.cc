@@ -503,16 +503,84 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
 //  any write_sharded_slab.  Creates the dataset if it doesn't exist,
 //  opens it if it does.  Returns the cached hid_t on ctx->open_datasets.
 // -----------------------------------------------------------------
-hid_t ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
-                     const int64_t* shape, int ndim, int dtype_tag) {
-    {
-        std::lock_guard<std::mutex> g(ctx->datasets_mu);
-        auto it = ctx->open_datasets.find(ds_name);
-        if (it != ctx->open_datasets.end() && it->second >= 0) {
-            return it->second;
+// Format a dims vector for a refusal message: "[2,5,8]".
+static std::string dims_to_string(const std::vector<hsize_t>& v) {
+    std::ostringstream os;
+    os << "[";
+    for (size_t i = 0; i < v.size(); ++i) { if (i) os << ","; os << v[i]; }
+    os << "]";
+    return os.str();
+}
+
+static std::string dims_to_string(const int64_t* p, int n) {
+    std::ostringstream os;
+    os << "[";
+    for (int i = 0; i < n; ++i) { if (i) os << ","; os << p[i]; }
+    os << "]";
+    return os.str();
+}
+
+// Verify an EXISTING dataset against the requested geometry.
+//
+// decisions.md 2026-08-04, "Padding is SlabIO's business": identical
+// logical shape and dtype => reuse (idempotent); anything else => REFUSE,
+// naming both shapes.  Before this check H5Dopen simply succeeded and the
+// write clipped against whatever extent the dataset happened to have, so an
+// `mode='a'` rerun at a different mu silently wrote a PREFIX into the old
+// geometry -- wrong physics, no symptom.  It is also what makes SlabIO's
+// Python-side record of the dataset shape authoritative, which is where
+// `valid_shape` is now derived from.
+//
+// Rank-invariant by construction: every input is a replicated control value
+// and the file is the same file, so all ranks reach the same verdict.  A
+// refusal on a proper subset of ranks inside a collective is a hang.
+static void check_existing_geometry(
+    hid_t dset, const std::string& ds_name,
+    const int64_t* shape, int ndim, hid_t native)
+{
+    hid_t space = H5Dget_space(dset);
+    if (space < 0) {
+        throw std::runtime_error(
+            "phdf5 ensure_dataset: H5Dget_space failed for '" + ds_name + "'");
+    }
+    int have_ndim = H5Sget_simple_extent_ndims(space);
+    std::vector<hsize_t> have((size_t)(have_ndim > 0 ? have_ndim : 0), 0);
+    if (have_ndim > 0 &&
+        H5Sget_simple_extent_dims(space, have.data(), nullptr) < 0) {
+        H5Sclose(space);
+        throw std::runtime_error(
+            "phdf5 ensure_dataset: H5Sget_simple_extent_dims failed for '"
+            + ds_name + "'");
+    }
+    H5Sclose(space);
+
+    bool shape_ok = (have_ndim == ndim);
+    if (shape_ok) {
+        for (int i = 0; i < ndim; ++i) {
+            if (have[(size_t)i] != (hsize_t)shape[i]) { shape_ok = false; break; }
         }
     }
 
+    hid_t have_type = H5Dget_type(dset);
+    htri_t same_type = (have_type < 0) ? -1 : H5Tequal(have_type, native);
+    if (have_type >= 0) H5Tclose(have_type);
+
+    if (shape_ok && same_type > 0) return;
+
+    std::ostringstream os;
+    os << "phdf5 ensure_dataset: dataset '" << ds_name
+       << "' already exists with shape " << dims_to_string(have)
+       << (same_type > 0 ? "" : " and a DIFFERENT dtype")
+       << ", but was requested at shape " << dims_to_string(shape, ndim)
+       << ".  SlabIO will neither delete-and-recreate it (data loss) nor "
+          "write into the previous geometry (wrong extent, no symptom).  "
+          "Open with mode='w', use a different dataset name, or delete the "
+          "file.  Refused identically on every rank.";
+    throw std::runtime_error(os.str());
+}
+
+hid_t ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
+                     const int64_t* shape, int ndim, int dtype_tag) {
     hid_t native = dt::h5_native_for_tag(dtype_tag);
     if (native < 0) {
         throw std::runtime_error("phdf5 ensure_dataset: unsupported dtype_tag " +
@@ -520,6 +588,18 @@ hid_t ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
     }
     if (ndim <= 0) {
         throw std::runtime_error("phdf5 ensure_dataset: ndim must be >= 1");
+    }
+
+    // Cached hid: still CHECK it.  A second ensure_dataset for the same
+    // name at a different shape would otherwise take the cache hit and
+    // return a handle to geometry the caller does not think it has.
+    {
+        std::lock_guard<std::mutex> g(ctx->datasets_mu);
+        auto it = ctx->open_datasets.find(ds_name);
+        if (it != ctx->open_datasets.end() && it->second >= 0) {
+            check_existing_geometry(it->second, ds_name, shape, ndim, native);
+            return it->second;
+        }
     }
 
     hid_t dset = -1;
@@ -540,6 +620,17 @@ hid_t ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
         if (dset < 0) {
             throw std::runtime_error(
                 "phdf5 ensure_dataset: H5Dcreate failed for '" + ds_name + "'");
+        }
+    } else {
+        // Pre-existing on disk: reuse only if the geometry matches.  On a
+        // refusal close the handle we just opened -- the throw skips every
+        // caller-side cleanup, and leaking an hid_t here means H5Fclose
+        // later reports an open-object error on top of the real one.
+        try {
+            check_existing_geometry(dset, ds_name, shape, ndim, native);
+        } catch (...) {
+            H5Dclose(dset);
+            throw;
         }
     }
 

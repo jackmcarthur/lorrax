@@ -32,7 +32,7 @@ class Meta:
                               # over the device mesh).  Worst-case sharding divisor — any
                               # single- or product-axis PartitionSpec on the μ dim divides this.
                               # Mirrors the band-axis pattern (b_id_4 padded vs b_id_4_user
-                              # logical).  Output writers + SlabIO valid_shape= use n_rmu;
+                              # logical).  Output writers state n_rmu as the dataset shape;
                               # in-memory shardings use n_rmu_padded.
     b_id_4_user: int = 0      # original user-supplied nband; b_id_4_user == b_id_4 when no pad. Output writers slice to this.
 

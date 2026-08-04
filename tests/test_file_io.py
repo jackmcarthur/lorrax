@@ -476,7 +476,6 @@ def test_read_zeta_G_slab_zero_pads_trailing_mu(tmp_path, single_device_mesh):
             qvec_batch_frac=jax.numpy.zeros((n_q_disk, 3),
                                             dtype=jax.numpy.float64),
             sphere_idx=None,
-            valid_mu=n_rmu_logical,
         )
         host = np.asarray(zeta_g)
 
@@ -512,7 +511,6 @@ def test_read_zeta_G_slab_pad_smaller_than_one_per_rank(
             qvec_batch_frac=jax.numpy.zeros((n_q_disk, 3),
                                             dtype=jax.numpy.float64),
             sphere_idx=None,
-            valid_mu=n_rmu_logical,
         )
         host = np.asarray(zeta_g)
 
@@ -765,6 +763,8 @@ def test_normalize_slab_request_allows_nonzero_read_offset_without_extent():
 
 
 def test_validate_block_divisible_rejects_ragged_write_axis():
+    # INTERNAL post-condition since decisions.md 2026-08-04 — both FFI
+    # entry points pad to divisibility before they reach it.
     with pytest.raises(ValueError, match="dimension 1 size 70001"):
         _validate_block_divisible(
             op="write_slab",
@@ -795,7 +795,7 @@ def test_normalize_valid_shape_rejects_prefix_larger_than_physical_slab():
             valid_shape=(36, 70001, 1500),
             slab_shape=(36, 70000, 1500),
             offset=(0, 0, 0),
-            global_shape=(36, 1125000, 1500),
+            ds_shape=(36, 1125000, 1500),
         )
 
 
@@ -806,30 +806,121 @@ def test_normalize_valid_shape_allows_ragged_last_file_chunk():
         valid_shape=(36, 65432, 1500),
         slab_shape=(36, 70000, 1500),
         offset=(0, 1050000, 0),
-        global_shape=(36, 1125432, 1500),
+        ds_shape=(36, 1125432, 1500),
     )
     assert vshape == (36, 65432, 1500)
 
 
-def test_allgather_valid_shape_write_and_zero_padded_read(tmp_path):
+def test_normalize_valid_shape_derives_the_dataset_clip_by_default():
+    """decisions.md 2026-08-04: with no ``valid_shape`` the extent is
+    ``min(slab, dataset - offset)`` — the arithmetic every call site used
+    to do by hand."""
+    vshape = _normalize_valid_shape(
+        op="write_slab",
+        name="zeta_q_G",
+        valid_shape=None,
+        slab_shape=(36, 70000, 1500),        # padded for mesh divisibility
+        offset=(0, 0, 0),
+        ds_shape=(36, 69997, 1500),          # LOGICAL extent on disk
+    )
+    assert vshape == (36, 69997, 1500)
+
+
+def test_normalize_valid_shape_default_clips_a_sub_slab_at_its_offset():
+    vshape = _normalize_valid_shape(
+        op="write_slab", name="zeta_q_G", valid_shape=None,
+        slab_shape=(4, 8, 3), offset=(0, 6, 0), ds_shape=(4, 10, 3))
+    assert vshape == (4, 4, 3)
+
+
+def test_normalize_valid_shape_default_never_refuses_an_overhang():
+    """A slab starting past the end of the dataset derives an EMPTY
+    request (a legitimate no-op rendezvous), not a refusal."""
+    vshape = _normalize_valid_shape(
+        op="read_slab", name="A", valid_shape=None,
+        slab_shape=(4, 8), offset=(0, 12), ds_shape=(4, 10))
+    assert vshape == (4, 0)
+
+
+def test_normalize_valid_shape_override_that_overruns_refuses():
+    with pytest.raises(ValueError, match="exceeds dataset extent"):
+        _normalize_valid_shape(
+            op="write_slab", name="A", valid_shape=(4, 8),
+            slab_shape=(4, 8), offset=(0, 6), ds_shape=(4, 10))
+
+
+def test_allgather_implicit_pad_write_and_zero_padded_read(tmp_path):
+    """The padded write/read round-trip with NO padding argument.
+
+    decisions.md 2026-08-04: the caller states the dataset's logical
+    shape once and hands over the padded buffer.  Compare against
+    ``..._matches_explicit_valid_shape`` below, which pins that this is
+    byte-identical to the pre-ruling spelling.
+    """
     path = tmp_path / "slab.h5"
     physical = np.arange(12, dtype=np.float64).reshape(3, 4)
     with SlabIO(str(path), mode="w") as io:
-        io.write_slab(
-            "A",
-            physical,
-            global_shape=(3, 3),
-            valid_shape=(3, 3),
-        )
+        io.create_dataset("A", shape=(3, 3), dtype=np.float64)
+        io.write_slab("A", physical)
 
     with SlabIO(str(path), mode="r") as io:
-        host = io.read_slab(
-            "A",
-            shape=(3, 4),
-            valid_shape=(3, 3),
-            as_numpy=True,
-        )
+        host = io.read_slab("A", shape=(3, 4), as_numpy=True)
 
     expected = np.zeros((3, 4), dtype=np.float64)
     expected[:, :3] = physical[:, :3]
     np.testing.assert_array_equal(host, expected)
+
+
+def test_allgather_implicit_pad_matches_explicit_valid_shape(tmp_path):
+    """BYTE-IDENTITY: dropping ``valid_shape`` must not move a bit.
+
+    The unit-level twin of the ``implicit`` case in
+    ``tests/multi_device/phdf5_padded_rank_write.py``.
+    """
+    physical = np.arange(12, dtype=np.float64).reshape(3, 4)
+
+    old = tmp_path / "old.h5"
+    with SlabIO(str(old), mode="w") as io:
+        io.create_dataset("A", shape=(3, 3), dtype=np.float64)
+        io.write_slab("A", physical, global_shape=(3, 3),
+                      valid_shape=(3, 3))
+    new = tmp_path / "new.h5"
+    with SlabIO(str(new), mode="w") as io:
+        io.create_dataset("A", shape=(3, 3), dtype=np.float64)
+        io.write_slab("A", physical)
+
+    import h5py
+    with h5py.File(str(old), "r") as f:
+        a = np.asarray(f["A"])
+    with h5py.File(str(new), "r") as f:
+        b = np.asarray(f["A"])
+    assert a.shape == b.shape
+    assert a.tobytes() == b.tobytes()
+
+    with SlabIO(str(new), mode="r") as io:
+        explicit = io.read_slab("A", shape=(3, 4), valid_shape=(3, 3),
+                                as_numpy=True)
+        implicit = io.read_slab("A", shape=(3, 4), as_numpy=True)
+    assert explicit.tobytes() == implicit.tobytes()
+
+
+def test_create_dataset_refuses_a_geometry_change(tmp_path):
+    """decisions.md 2026-08-04: reuse-if-identical, refuse otherwise.
+
+    The allgather backend used to ``del`` and recreate, silently
+    discarding the previous contents.
+    """
+    path = tmp_path / "geom.h5"
+    with SlabIO(str(path), mode="w") as io:
+        io.create_dataset("A", shape=(3, 3), dtype=np.float64)
+        io.write_slab("A", np.ones((3, 3), dtype=np.float64))
+
+    with SlabIO(str(path), mode="a") as io:
+        io.create_dataset("A", shape=(3, 3), dtype=np.float64)   # idempotent
+        with pytest.raises(ValueError, match="already exists"):
+            io.create_dataset("A", shape=(4, 4), dtype=np.float64)
+
+    import h5py
+    with h5py.File(str(path), "r") as f:
+        np.testing.assert_array_equal(np.asarray(f["A"]),
+                                      np.ones((3, 3)))

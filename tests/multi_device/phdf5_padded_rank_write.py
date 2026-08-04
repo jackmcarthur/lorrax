@@ -2,8 +2,9 @@
 
 Why this gate exists
 --------------------
-Sharded producers pad ``mu`` up to a multiple of the world size and pass the
-logical prefix as ``valid_shape``; files store the LOGICAL shape.  Rank ``r``
+Sharded producers pad ``mu`` up to a multiple of the world size; files store
+the LOGICAL shape, and SlabIO clips the pad rows against it with no argument
+from the caller (decisions.md 2026-08-04).  Rank ``r``
 owns local block ``[r*loc, (r+1)*loc)`` with ``loc = mu_padded / P``.  When
 ``r*loc >= mu`` that rank's block is ENTIRELY padding: C++ clips its file
 hyperslab to ``file_count = 0`` and the write is meant to proceed through the
@@ -75,7 +76,35 @@ message.
 
 The oob cases fail by HANGING, so run them under a wall-clock bound and
 read each rank's own rc: the gate is "every rank refused", and a rank that
-neither refused nor finished is the failure.
+neither refused nor finished is the failure.  Since decisions.md
+2026-08-04 both refusals fire in PYTHON (``_normalize_valid_shape``
+bounds-tests the explicit override against the dataset's own extent
+before any collective is entered); the C++ tests in ``write_ffi.cc`` /
+``read_ffi.cc`` remain as the backstop for direct ``ffi.io`` users and
+still take the verdict on the replicated logical slab.
+
+The two cases added when padding became implicit (decisions.md 2026-08-04)
+------------------------------------------------------------------------
+    PADRANK_CASE=implicit  <launcher> -n 4  python3 -m phdf5_padded_rank_write
+    PADRANK_CASE=nodiv     <launcher> -n 4  python3 -m phdf5_padded_rank_write
+
+    implicit  BYTE-IDENTITY.  Write the same padded buffer twice at mu = P+1:
+              once in the pre-ruling spelling (explicit ``global_shape`` +
+              ``valid_shape``) and once as bare ``write_slab(name, A)``.  The
+              two files' dataset bytes must be IDENTICAL, and so must the
+              two spellings of the padded read.  This is the gate that
+              proves the derived default is the same predicate the call
+              sites used to compute by hand — if it ever fails, the sweep
+              that deleted those arguments changed physics.
+    nodiv     mu = P+1 requested WITHOUT rounding it up: a shape that does
+              not divide the mesh under ``P(None,('x','y'),None)``.  Before
+              the ruling this refused ("dimension 1 size N is not divisible
+              by mesh axes"), which is what forced every consumer to
+              compute ``n_rmu_padded`` for itself.  SlabIO now reads the
+              rounded-up extent and trims; the result must equal the
+              logical reference exactly.  The case also REPORTS whether
+              JAX will build a non-divisibly-sharded array at all, which
+              is what decides whether the write-side pad is reachable.
 """
 import os
 import sys
@@ -100,7 +129,8 @@ N_G = int(os.environ.get("PADRANK_NG", "8"))
 PATH = os.environ.get("PADRANK_PATH", "padrank_gate.h5")
 
 
-_PAD_CASES = ("repro", "read_pad", "oob_write", "oob_read")
+_PAD_CASES = ("repro", "read_pad", "oob_write", "oob_read",
+              "implicit", "nodiv")
 _CONTROL_CASES = ("control", "exact")
 
 
@@ -187,15 +217,140 @@ def main():
               f"ACCEPTED", flush=True)
         return 1
 
+    # ---- implicit: the whole point of decisions.md 2026-08-04.  Two files,
+    # same buffer, two spellings; the bytes must not differ.  Run BEFORE the
+    # shared write below so this case owns both of its files outright.
+    if CASE == "implicit":
+        p_old = PATH + ".explicit"
+        p_new = PATH + ".implicit"
+        for p in (p_old, p_new):
+            if rank == 0 and os.path.exists(p):
+                os.remove(p)
+        jax.experimental.multihost_utils.sync_global_devices("implicit_unlink")
+
+        # (a) the pre-ruling spelling: state the logical extent three times.
+        with SlabIO(p_old, mode="w", mesh=mesh,
+                    backend=SlabIOBackend.PHDF5_FFI) as io:
+            io.create_dataset("zeta_like", shape=(N_Q, mu, N_G),
+                              dtype=jnp.complex128)
+            io.write_slab("zeta_like", A,
+                          offset=(0, 0, 0),
+                          global_shape=(N_Q, mu, N_G),
+                          valid_shape=(N_Q, mu, N_G))
+        # (b) the ruling's spelling: state it once, to create_dataset.
+        with SlabIO(p_new, mode="w", mesh=mesh,
+                    backend=SlabIOBackend.PHDF5_FFI) as io:
+            io.create_dataset("zeta_like", shape=(N_Q, mu, N_G),
+                              dtype=jnp.complex128)
+            io.write_slab("zeta_like", A)
+        jax.experimental.multihost_utils.sync_global_devices("implicit_written")
+
+        # Read both spellings back off the IMPLICIT file, padded + mu-sharded.
+        with SlabIO(p_new, mode="r", mesh=mesh,
+                    backend=SlabIOBackend.PHDF5_FFI) as io:
+            r_exp = io.read_slab("zeta_like", shape=(N_Q, mu_pad, N_G),
+                                 dtype=np.complex128, offset=(0, 0, 0),
+                                 valid_shape=(N_Q, mu, N_G), mesh=mesh,
+                                 partition_spec=P(None, ('x', 'y'), None))
+            r_imp = io.read_slab("zeta_like", shape=(N_Q, mu_pad, N_G),
+                                 dtype=np.complex128, offset=(0, 0, 0),
+                                 mesh=mesh,
+                                 partition_spec=P(None, ('x', 'y'), None))
+        b_exp = np.asarray(r_exp.addressable_shards[0].data)
+        b_imp = np.asarray(r_imp.addressable_shards[0].data)
+        read_same = (b_exp.shape == b_imp.shape
+                     and b_exp.tobytes() == b_imp.tobytes())
+        start = int(r_imp.addressable_shards[0].index[1].start or 0)
+        want = buf[:, start:start + b_imp.shape[1], :]
+        read_right = (b_imp.shape == want.shape
+                      and not int(np.count_nonzero(b_imp != want)))
+        print(f"[padrank-gate rank={rank}] read: explicit==implicit="
+              f"{read_same} matches_reference={read_right} "
+              f"rows [{start},{start + b_imp.shape[1]})", flush=True)
+
+        ok = read_same and read_right
+        if rank == 0:
+            import hashlib
+            import h5py
+            digests = {}
+            for tag, p in (("explicit", p_old), ("implicit", p_new)):
+                with h5py.File(p, "r") as f:
+                    arr = np.asarray(f["zeta_like"])
+                digests[tag] = (arr.shape,
+                                hashlib.sha256(arr.tobytes()).hexdigest())
+                if arr.shape != ref.shape or np.count_nonzero(arr != ref):
+                    print(f"[padrank-gate] {tag} file does NOT match the "
+                          f"reference", flush=True)
+                    ok = False
+            print(f"[padrank-gate] explicit  {digests['explicit'][0]} "
+                  f"sha256={digests['explicit'][1][:16]}", flush=True)
+            print(f"[padrank-gate] implicit  {digests['implicit'][0]} "
+                  f"sha256={digests['implicit'][1][:16]}", flush=True)
+            byte_identical = digests["explicit"] == digests["implicit"]
+            print(f"[padrank-gate] VERDICT case=implicit mu={mu}: "
+                  f"BYTE-IDENTICAL={byte_identical} "
+                  f"{'PASS' if (ok and byte_identical) else 'FAIL'}",
+                  flush=True)
+            ok = ok and byte_identical
+        sys.stdout.flush()
+        return 0 if ok else 1
+
     with SlabIO(PATH, mode="w", mesh=mesh,
                 backend=SlabIOBackend.PHDF5_FFI) as io:
         io.create_dataset("zeta_like", shape=(N_Q, mu, N_G),
                           dtype=jnp.complex128)
-        io.write_slab("zeta_like", A,
-                      offset=(0, 0, 0),
-                      global_shape=(N_Q, mu, N_G),
-                      valid_shape=(N_Q, mu, N_G))
+        io.write_slab("zeta_like", A)
     jax.experimental.multihost_utils.sync_global_devices("padrank_written")
+
+    # ---- nodiv: ask for the LOGICAL mu extent, which does not divide the
+    # mesh.  Before the ruling this refused and the caller had to round up
+    # for itself; SlabIO now reads the rounded-up extent and trims.
+    if CASE == "nodiv":
+        assert mu % world, f"case nodiv needs mu={mu} indivisible by {world}"
+        # Does JAX even build a non-divisibly-sharded array?  That decides
+        # whether the WRITE-side divisibility pad is reachable at all.
+        uneven_ok = True
+        try:
+            _probe = jax.device_put(
+                jnp.zeros((N_Q, mu, N_G), dtype=jnp.complex128),
+                NamedSharding(mesh, P(None, ('x', 'y'), None)))
+            _probe.block_until_ready()
+            jax_uneven = (f"YES (jax {jax.__version__}, local block "
+                          f"{_probe.addressable_shards[0].data.shape})")
+        except Exception as exc:                              # noqa: BLE001
+            uneven_ok = False
+            jax_uneven = (f"NO (jax {jax.__version__}: "
+                          f"{type(exc).__name__}: {str(exc)[:90]})")
+        p0(f"[padrank-gate] JAX builds a non-divisibly-sharded array: "
+           f"{jax_uneven}")
+        if not uneven_ok:
+            # Then no SlabIO backend can RETURN one either: the limit is
+            # JAX's array model, not SlabIO's contract.  Report the
+            # measurement rather than assert a verdict it cannot reach.
+            p0("[padrank-gate] VERDICT case=nodiv: NOT APPLICABLE — a "
+               "non-divisibly-sharded jax.Array cannot be constructed on "
+               "this JAX, so read_slab cannot be asked to return one.")
+            sys.stdout.flush()
+            return 0
+        sys.stdout.flush()
+
+        with SlabIO(PATH, mode="r", mesh=mesh,
+                    backend=SlabIOBackend.PHDF5_FFI) as io:
+            out = io.read_slab("zeta_like",
+                               shape=(N_Q, mu, N_G),
+                               dtype=np.complex128,
+                               offset=(0, 0, 0),
+                               mesh=mesh,
+                               partition_spec=P(None, ('x', 'y'), None))
+        if tuple(out.shape) != (N_Q, mu, N_G):
+            print(f"[padrank-gate rank={rank}] FAIL: read_slab returned "
+                  f"{tuple(out.shape)}, asked for {(N_Q, mu, N_G)}", flush=True)
+            return 1
+        got = np.asarray(jax.device_get(out))
+        bad = int(np.count_nonzero(got != ref))
+        print(f"[padrank-gate rank={rank}] nodiv shape={got.shape} "
+              f"mismatched={bad}", flush=True)
+        return 0 if bad == 0 else 1
 
     # ---- read_pad: the READ-side empty rendezvous.  Physical shape is the
     # padded one, valid_shape is the logical file extent, mu is sharded —

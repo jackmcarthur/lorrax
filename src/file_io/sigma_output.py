@@ -324,25 +324,19 @@ def write_sigma_omega_h5(
 		io.write_attr("omega_ev", np.asarray(omega_ev, dtype=np.float64))
 		io.create_dataset("sigma_total_kij_ev",
 			shape=shape_ref, dtype=np.complex128, chunks=om_chunks)
-		io.write_slab("sigma_total_kij_ev", total,
-			global_shape=shape_ref, k_chunk_size=k_chunk)
+		io.write_slab("sigma_total_kij_ev", total, k_chunk_size=k_chunk)
 		if sigma_c_kij_ev is not None:
 			io.create_dataset("sigma_c_kij_ev",
 				shape=shape_ref, dtype=np.complex128, chunks=om_chunks)
-			io.write_slab("sigma_c_kij_ev", sigma_c_kij_ev,
-				global_shape=shape_ref, k_chunk_size=k_chunk)
+			io.write_slab("sigma_c_kij_ev", sigma_c_kij_ev, k_chunk_size=k_chunk)
 		if sigma_sx_kij_ev is not None:
 			io.create_dataset("sigma_sx_kij_ev",
 				shape=tuple(sigma_sx_kij_ev.shape),
 				dtype=np.complex128, chunks=kij_chunks)
-			io.write_slab("sigma_sx_kij_ev", sigma_sx_kij_ev,
-				global_shape=tuple(sigma_sx_kij_ev.shape),
-				k_chunk_size=k_chunk)
+			io.write_slab("sigma_sx_kij_ev", sigma_sx_kij_ev, k_chunk_size=k_chunk)
 		if hartree_kij_ev is not None:
 			io.create_dataset("hartree_kij_ev",
 				shape=tuple(hartree_kij_ev.shape),
 				dtype=np.complex128, chunks=kij_chunks)
-			io.write_slab("hartree_kij_ev", hartree_kij_ev,
-				global_shape=tuple(hartree_kij_ev.shape),
-				k_chunk_size=k_chunk)
+			io.write_slab("hartree_kij_ev", hartree_kij_ev, k_chunk_size=k_chunk)
 	return abs_path
