@@ -98,7 +98,8 @@ from runtime.padding import pad_axis_to, spec_divisor
 
 
 __all__ = ["rho_from_wfns", "rho_r_to_G", "band_rotation_spec",
-           "distributed_eigh_bands", "symmetrise_density"]
+           "distributed_eigh_bands", "symmetrise_density",
+           "hartree_from_orbitals"]
 
 
 def _band_spec() -> P:
@@ -389,3 +390,56 @@ def distributed_eigh_bands(H, *, mesh: Mesh):
     # input is silently interpreted rather than refused.
     H_j = 0.5 * (H_j + jnp.conj(jnp.swapaxes(H_j, -1, -2)))
     return batched_distributed_eigh(H_j, mesh=mesh)
+
+
+def hartree_from_orbitals(psi_G, occ, kweights, wfn, *, mesh: Mesh,
+                          box_index, fft_grid, truncation_2d: bool,
+                          spin_degeneracy: float, sym_perm=None, U=None,
+                          expected_electrons=None, print_fn=print):
+    """ψ (+ optional rotation) → ρ(r) → V_H(r).  The self-consistency seam.
+
+    This is what makes iteration n+1's Hartree potential come from
+    iteration n's DENSITY rather than from the DFT one.  Today
+    ``sc_iteration`` passes ``hartree_basis_rotation=U`` into
+    ``compute_sigma_xc``, which applies U†V_H U — a BASIS CHANGE of the
+    fixed DFT V_H.  That is exact only if ρ has not moved; it has, as soon
+    as U mixes occupied with unoccupied bands.
+
+    Composes two routines that already existed and already agree on
+    conventions:
+
+    * :func:`rho_from_wfns` — ρ(r) on the ψ FFT box grid.
+    * ``psp.get_DFT_mtxels.build_hartree_potential`` — ρ(r) → V_H(r), with
+      the ``∫ρ d³r`` refusal that is the cheap guard against a factor-2
+      spin slip or a grid-normalisation error, either of which would
+      rescale a ~500 eV term.
+
+    NO ρ(G) STEP.  ``build_hartree_potential`` takes ρ in REAL space and
+    does its own transform, so the Poisson solve inherits ρ's grid and
+    V_H lands on the same box the ψ live on — the grid
+    ``common.mtxel_sweep.local_potential_operator`` needs.
+    :func:`rho_r_to_G` is not on this path; it exists for inspection and
+    for consumers that want the G-space density directly.
+
+    ``truncation_2d`` MUST match the Coulomb convention the rest of the
+    run uses.  Mixing it between ``kin_ion``'s V_loc and V_H puts a large
+    SYSTEMATIC error into H₀ that cannot be told apart from a
+    basis-convergence problem — the callee says so and refuses nothing,
+    so it is the caller's to get right.
+
+    ``expected_electrons`` is ``f_spin · Σ_k w_k Σ_n f_nk``, i.e.
+    ``gw.efermi.occupied_band_count(occ, kweights) * spin_degeneracy``.
+    Pass it: it is the only check that a rotated, re-occupied density
+    still holds the right charge.
+    """
+    from psp.get_DFT_mtxels import build_hartree_potential
+
+    rho_r = rho_from_wfns(psi_G, occ, kweights, mesh=mesh,
+                          box_index=box_index, fft_grid=fft_grid,
+                          cell_volume=float(wfn.cell_volume),
+                          spin_degeneracy=spin_degeneracy,
+                          U=U, sym_perm=sym_perm)
+    V_H_r = build_hartree_potential(
+        rho_r, wfn, truncation_2d=bool(truncation_2d),
+        expected_electrons=expected_electrons, print_fn=print_fn)
+    return rho_r, V_H_r

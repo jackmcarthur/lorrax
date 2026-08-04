@@ -39,8 +39,13 @@ from common.collectives import (process_count, process_rank,   # noqa: E402
 from gw.qsgw_density import (rho_from_wfns, rho_r_to_G,          # noqa: E402
                              band_rotation_spec,
                              distributed_eigh_bands,
-                             symmetrise_density)
-from psp.get_DFT_mtxels import valence_density_from_kpoint     # noqa: E402
+                             symmetrise_density,
+                             hartree_from_orbitals)
+from psp.get_DFT_mtxels import (valence_density_from_kpoint,    # noqa: E402
+                                compute_local_V_k)
+from common.mtxel_sweep import (SweepGeometry,                  # noqa: E402
+                                local_potential_operator,
+                                sweep_matrix_elements)
 
 NB = int(os.environ.get("QD_NB", "16"))
 NS = int(os.environ.get("QD_NS", "2"))
@@ -267,12 +272,75 @@ def main():
        f"{'PASS' if (ok8a and ok8b and ok8c) else 'FAIL'}")
     ok8 = ok8a and ok8b and ok8c
 
+    # ---- 9. END TO END: psi -> rho -> V_H -> <m|V_H|n> ------------------
+    # The actual self-consistency seam.  Proves the density module and the
+    # matrix-element sweep compose: same grid, same Coulomb convention, and
+    # a V_H that feeds local_potential_operator without any reshaping.
+    class _Wfn:                     # build_hartree_potential reads 4 fields
+        cell_volume = volume
+        bdot = np.eye(3) * 1.31 + 0.07
+        bvec = np.eye(3) * 0.9
+        blat = 1.0
+    wfn_stub = _Wfn()
+    n_elec = f_spin * float(np.einsum('k,kn->', kweights, occ))
+    rho_e2e, V_H_r = hartree_from_orbitals(
+        psi_j, occ, kweights, wfn_stub, mesh=mesh, box_index=bidx,
+        fft_grid=GRID, truncation_2d=False, spin_degeneracy=f_spin,
+        sym_perm=ident_perm, U=None, expected_electrons=n_elec,
+        print_fn=(lambda *a, **k: None))
+    V_H_r = np.asarray(V_H_r)
+    ok9a = V_H_r.shape == GRID
+    e_h = 0.5 * float(np.sum(np.asarray(rho_e2e) * V_H_r)) * deltaV
+    ok9b = e_h > 0.0                       # self-repulsion is positive
+    p0(f"[qd] 9. V_H shape {V_H_r.shape} == grid {ok9a}; "
+       f"Hartree energy {e_h:.6f} Ry > 0 {ok9b}  "
+       f"{'PASS' if (ok9a and ok9b) else 'FAIL'}")
+
+    # Feed that V_H straight into the sweep and check it against the
+    # per-k kernel: the whole chain, one tolerance.
+    geom = SweepGeometry(mesh=mesh, fft_grid=GRID, ngkmax=NGK, nb=NB,
+                         ns=NS, nk=NK, cell_volume=volume)
+    gmask = np.ones((NK, NGK), dtype=np.float64)
+    op = local_potential_operator(geom, V_H_r)
+    H_vh = sweep_matrix_elements(psi_j, operator=op, geom=geom, gvecs=gv,
+                                 gmask=gmask, box_index=bidx,
+                                 kvecs=np.zeros((NK, 3)))
+    V_kern = np.zeros((NK, NB, NB), dtype=np.complex128)
+    for ik in range(NK):
+        box = np.zeros((NB, NS, nx, ny, nz), dtype=np.complex128)
+        box[:, :, gv[ik, :, 0], gv[ik, :, 1], gv[ik, :, 2]] = psi[ik]
+        V_kern[ik] = np.asarray(compute_local_V_k(
+            jnp.asarray(box), jnp.asarray(gv[ik]), jnp.asarray(V_H_r),
+            volume, g_mask=jnp.asarray(gmask[ik])))
+    worst = 0.0
+    for sh in H_vh.addressable_shards:
+        ref = V_kern[sh.index]
+        worst = max(worst, float(np.abs(np.asarray(sh.data) - ref).max())
+                    / max(float(np.abs(ref).max()), 1e-300))
+    ok9c = worst <= RTOL
+    p0(f"[qd] 9b. <m|V_H|n> sweep vs per-k kernel  rel {worst:.3e}  "
+       f"{'PASS' if ok9c else 'FAIL'}")
+    ok9 = ok9a and ok9b and ok9c
+
+    # ---- 10. the charge refusal fires -----------------------------------
+    try:
+        hartree_from_orbitals(
+            psi_j, occ, kweights, wfn_stub, mesh=mesh, box_index=bidx,
+            fft_grid=GRID, truncation_2d=False, spin_degeneracy=f_spin,
+            sym_perm=ident_perm, expected_electrons=n_elec * 2.0,
+            print_fn=(lambda *a, **k: None))
+        ok10 = False
+    except ValueError:
+        ok10 = True
+    p0(f"[qd] 10. wrong expected_electrons refused  "
+       f"{'PASS' if ok10 else 'FAIL'}")
+
     rho_G = rho_r_to_G(rho_ref, mesh=mesh)
     p0(f"[qd] rho(G=0) = {complex(np.asarray(rho_G).ravel()[0]):.6e} "
        f"(= sum_r rho = {float(rho_ref.sum()):.6e})")
 
     ok = (ok1 and ok2 and ok3 and ok4 and ok4b and ok5 and ok5b
-          and ok6 and ok6b and ok7 and ok8)
+          and ok6 and ok6b and ok7 and ok8 and ok9 and ok10)
     p0(f"[qd] VERDICT {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
