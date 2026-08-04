@@ -10,10 +10,17 @@ by ``mtxel_sweep_gate.py``.
            production route today: k partitioned round-robin over ranks,
            each k's FULL-BAND FFT BOX built on one rank (wall W1), result
            gathered to an ``(nk, nb, nb)`` array IDENTICAL on every rank
-           (wall W2), and ``min(P, nk)/P`` of the ranks doing anything at
-           all (wall W3).
-  after  — ``mtxel_sweep.sweep_matrix_elements``.  Bands sharded 2-D, only
-           the n side transformed, output sharded ``P(None,'x','y')``.
+           (wall W2), and — wall W3 — no ability to use more than ``nk``
+           ranks at all, so its wall is one full-band k however large P is.
+  after  — ``mtxel_sweep.sweep_matrix_elements``.  One k at a time, that
+           k's bands sharded over EVERY process, output sharded
+           ``P(None,'x','y')``.  Its efficiency is ``nb/P`` and does not
+           depend on ``nk``; it keeps scaling to ``P = nb``.
+
+``nk`` is therefore NOT a variable in the after arm's efficiency and this
+benchmark does not treat it as one.  What the sweep pays instead is a per-k
+reshard collective, which the k-partitioned arm does not need — so the two
+arms differ in COMMUNICATION vs SCALABILITY, not in how many ranks are busy.
 
 THE COMPARISON IS DELIBERATELY UNFAIR TO THE NEW PLAN.  Both arms start
 from the same RESIDENT sphere ψ, so the ``before`` arm builds its FFT box

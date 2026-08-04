@@ -18,7 +18,36 @@ array **identical on every rank**.  Three walls follow (measured in
       matrix element out of one box.
   W2  the replicated ``(nk, nb, nb)``: 829 MB at 12×12, 9.2 GB at
       nb=2000, ×3 for dipole.
-  W3  ``min(P, nk)/P`` efficiency: 48 of 64 ranks idle at b600/P=64.
+  W3  the k-partitioned plan CANNOT USE MORE THAN ``nk`` RANKS. Each rank
+      takes whole k, so its wall is one full-band k no matter how large P
+      is: adding processors past ``nk`` changes nothing. Measured — the
+      before arm is 4.02 s at nb=512/P=16 and 4.87 s at nb=600/P=64,
+      i.e. flat in P once scaled for nb (jobs 7888868, 7888877).
+
+PARALLELISM OF THIS DESIGN, STATED ONCE SO IT IS NOT RE-DERIVED WRONG
+--------------------------------------------------------------------
+The scan processes **one k at a time** and shards **that k's bands over
+every process**.  Therefore:
+
+* ``nk`` DOES NOT AFFECT PARALLEL EFFICIENCY.  It is the scan trip count
+  and nothing else — it scales total work linearly and the wall linearly,
+  exactly as a serial loop bound would.  Any statement of the form "this
+  wins when P > nk" is wrong and describes the plan being replaced.
+* Efficiency is ``nb_logical / nb_padded`` and nothing else.  The sweep
+  keeps scaling until ``P = nb``, where the k-partitioned plan stopped
+  scaling at ``P = nk``.
+* THE ONLY WAY A RANK GOES IDLE is ``nb_logical < P``: the band pad rounds
+  ``nb`` up to a multiple of ``∏ p_a`` and the ranks holding only pad
+  bands do zero work.  That is the whole of it — there is no other idle
+  case at any ``P``, ``nk`` or mesh shape.
+
+What the sweep pays for this is a per-k reshard collective, which the
+k-partitioned plan does not need (a rank owning a whole k communicates
+nothing).  So the trade is COMMUNICATION against SCALABILITY, not idle
+ranks: at ``P = nk`` the old plan is already at its own ceiling and the
+sweep is slower by the collective (measured 1.45× at nb=512/P=16); past
+``P = nk`` the old plan is stuck and the sweep is not (2.05× at
+nb=600/P=64).
 
 THE STRUCTURAL FACT THAT COLLAPSES THE THREE
 --------------------------------------------

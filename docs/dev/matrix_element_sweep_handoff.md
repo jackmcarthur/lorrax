@@ -52,7 +52,16 @@ All three call `common/collectives.py:985 gather_k_blocks`, which is
 consequences, measured in `rho_vh_2d_design.md` §1: the per-k full-band FFT
 box (1.77 GB at b600 bispinor, 37 GB and OOM at 12×12), the replicated
 `(nk,nb,nb)` (829 MB at 12×12, 9.2 GB at nb=2000, ×3 for dipole), and
-`min(P,nk)/P` efficiency (48 of 64 ranks idle at b600/P=64).
+and the inability to use more than `nk` ranks at all — each rank takes whole
+k, so the wall is one full-band k however large P is.
+
+The replacement's parallelism, stated once: the scan does **one k at a time**
+and shards **that k's bands over every process**. `nk` is the scan trip count
+and does not enter parallel efficiency; efficiency is `nb_logical/nb_padded`,
+and the only way a rank goes idle is `nb_logical < P`, where the band pad
+leaves it holding only zero-bands. The sweep scales to `P = nb` where the
+k-partitioned plan stopped at `P = nk`, and pays a per-k reshard collective
+for it.
 
 Fixing the scaling today means making the same change in three places.
 This spec makes it one routine.
