@@ -148,9 +148,18 @@ def main():
 
     else:
         # ---- the k-scan --------------------------------------------------
-        psi_j = jax.device_put(
-            jnp.asarray(psi),
-            NamedSharding(mesh, P(None, ('x', 'y'), None, None)))
+        # NOT jax.device_put(array, NamedSharding) IN MULTI-PROCESS.  That
+        # path goes through multihost_utils.assert_equal, which runs a
+        # process_allgather(tiled=True) of the WHOLE array to check every
+        # process passed the same value -- an O(P x array) collective before
+        # any work starts.  Measured: 13.0 GiB peak at nb=64/P=16 (against
+        # 1.5 GiB for the whole k-partitioned arm) and >900 s at nb=128,
+        # which is what made the first bench look as though the SWEEP had a
+        # memory problem (jobs 7888820/7888821).  make_array_from_callback
+        # builds each process's own shards locally, no collective.
+        sharding = NamedSharding(mesh, P(None, ('x', 'y'), None, None))
+        psi_j = jax.make_array_from_callback(
+            psi.shape, sharding, lambda idx: psi[idx])
         geom = SweepGeometry(mesh=mesh, fft_grid=GRID, ngkmax=ngkmax,
                              nb=NB, ns=NS, nk=NK, cell_volume=volume)
         op = local_potential_operator(geom, V_r)

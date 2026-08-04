@@ -111,8 +111,15 @@ def main():
     geom = SweepGeometry(mesh=mesh, fft_grid=GRID, ngkmax=ngkmax,
                          nb=NB, ns=NS, nk=NK, cell_volume=volume)
 
-    psi_j = jax.device_put(jnp.asarray(psi),
-                           NamedSharding(mesh, P(None, ('x', 'y'), None, None)))
+    # make_array_from_callback, NOT device_put(array, NamedSharding): the
+    # latter runs a process_allgather of the whole array through
+    # multihost_utils.assert_equal before any work starts.  Harmless at the
+    # gate's size, fatal at the bench's (13.0 GiB / >900 s, jobs
+    # 7888820/7888821).  Same idiom in both so the gate cannot drift into
+    # measuring a different setup path than the bench.
+    sharding = NamedSharding(mesh, P(None, ('x', 'y'), None, None))
+    psi_j = jax.make_array_from_callback(psi.shape, sharding,
+                                         lambda idx: psi[idx])
 
     # ---- reference: the local per-k plan, on the FULL FFT box (wall W1) ---
     T_ref = np.zeros((NK, NB, NB), dtype=np.complex128)

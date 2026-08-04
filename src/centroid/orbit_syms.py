@@ -52,9 +52,18 @@ def recover_symmorphic_density_point_group(
     Orbit-closing the centroids fixes it — but the orbit must be closed
     under the **crystal** point group, and the WFN's stored symmetry list
     can be *smaller* than that.  A non-collinear SOC MoS₂ WFN, for example,
-    stores only ``ntran=2`` = {E, σ_h}: pw2bgw drops the C3 rotations (they
-    would need a spinor rotation the BGW ``mtrx`` format can't carry), even
-    though the crystal — and the charge density — are fully D3h symmetric.
+    stores only ``ntran=2`` = {E, σ_h} even though the crystal — and the
+    charge density — are fully D3h symmetric.
+
+    (CORRECTED 2026-08-04, owner.  This comment previously blamed pw2bgw for
+    dropping the C3 rotations "because the BGW ``mtrx`` format can't carry
+    their spinor rotation".  That is wrong on both counts: BGW carries spinor
+    rotations, and pw2bgw does not drop the ops.  A short stored list comes
+    from the symmetries allowed in the QE input that produced the deck, so
+    the fix is upstream in that input, not here.  This routine remains useful
+    for a deck whose stored list is already short — it recovers the group
+    from the density rather than from the file — but it is a recovery path,
+    not a workaround for a format limitation.)
     Closing centroids under the stored {E, σ_h} leaves V_H C3-broken.
 
     The physically-correct group to close under is the one that leaves the
