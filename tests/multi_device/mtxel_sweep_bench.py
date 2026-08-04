@@ -157,11 +157,21 @@ def main():
         # which is what made the first bench look as though the SWEEP had a
         # memory problem (jobs 7888820/7888821).  make_array_from_callback
         # builds each process's own shards locally, no collective.
-        sharding = NamedSharding(mesh, P(None, ('x', 'y'), None, None))
-        psi_j = jax.make_array_from_callback(
-            psi.shape, sharding, lambda idx: psi[idx])
         geom = SweepGeometry(mesh=mesh, fft_grid=GRID, ngkmax=ngkmax,
                              nb=NB, ns=NS, nk=NK, cell_volume=volume)
+        # Pad the band axis BEFORE constructing the sharded array: an
+        # indivisible band extent is refused at CONSTRUCTION
+        # (IndivisibleError, job 7888869), so padding inside the sweep would
+        # be too late.  geom.nb is the mesh-padded extent, geom.nb_logical
+        # what the caller has; round_up is the same helper both use.
+        psi_pad = psi
+        if geom.nb != NB:
+            psi_pad = np.pad(psi, ((0, 0), (0, geom.nb - NB), (0, 0), (0, 0)))
+            p0(f"[bench] band pad {NB} -> {geom.nb} for a "
+               f"{px}x{py} mesh (p_prod={geom.p_prod})")
+        sharding = NamedSharding(mesh, P(None, ('x', 'y'), None, None))
+        psi_j = jax.make_array_from_callback(
+            psi_pad.shape, sharding, lambda idx: psi_pad[idx])
         op = local_potential_operator(geom, V_r)
         kw = dict(geom=geom, gvecs=gv, gmask=gmask, box_index=bidx,
                   kvecs=kvecs)

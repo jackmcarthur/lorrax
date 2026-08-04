@@ -93,6 +93,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.wfn_transforms import _box_kernel
+from runtime.padding import pad_axis_to
 
 
 __all__ = [
@@ -115,19 +116,33 @@ class SweepGeometry:
     is what lets the scan body lower ONCE for the whole k range (D10).
     """
 
-    __slots__ = ("mesh", "fft_grid", "ngkmax", "nb", "ns", "nk",
-                 "cell_volume", "ngrid")
+    __slots__ = ("mesh", "fft_grid", "ngkmax", "nb", "nb_logical", "ns",
+                 "nk", "cell_volume", "ngrid", "p_prod")
 
     def __init__(self, *, mesh: Mesh, fft_grid: Sequence[int], ngkmax: int,
                  nb: int, ns: int, nk: int, cell_volume: float):
+        from runtime.padding import round_up, mesh_divisor
+
         self.mesh = mesh
         self.fft_grid = tuple(int(s) for s in fft_grid)
         self.ngkmax = int(ngkmax)
-        self.nb = int(nb)
         self.ns = int(ns)
         self.nk = int(nk)
         self.cell_volume = float(cell_volume)
         self.ngrid = int(np.prod(self.fft_grid))
+
+        # ``nb`` is the LOGICAL band count the caller has.  The band axis is
+        # sharded over the whole mesh, so it must divide ∏ p_a; the pad is
+        # computed here and applied by the sweep, and the caller never states
+        # it.  Same routine and same zero-band argument as the ψ loader's
+        # ``wfn_transforms.gflat_to_rmu`` — ``runtime.padding.pad_axis_to``.
+        #
+        # This is not a nicety at production shapes: nb=600 on an 8×8 mesh is
+        # 64·9.375, and JAX raises IndivisibleError when the sharded array is
+        # constructed rather than degrading (job 7888869).
+        self.p_prod = mesh_divisor(mesh)
+        self.nb_logical = int(nb)
+        self.nb = round_up(int(nb), self.p_prod)
 
     # Sphere-shaped operands, band-sharded over the WHOLE mesh.  Used for
     # the n side during the operator: FFT work is 2nb/P per rank with no
@@ -338,12 +353,26 @@ def sweep_matrix_elements(
     nk = geom.nk
 
     psi = jnp.asarray(psi_G, dtype=jnp.complex128)
-    if psi.shape != (nk, geom.nb, geom.ns, geom.ngkmax):
+    if psi.shape[1] not in (geom.nb_logical, geom.nb):
+        raise ValueError(
+            f"sweep_matrix_elements: psi_G band axis must be the logical "
+            f"nb={geom.nb_logical} or the mesh-padded nb={geom.nb}; got "
+            f"{tuple(psi.shape)}")
+    if psi.shape[0] != nk or psi.shape[2] != geom.ns \
+            or psi.shape[3] != geom.ngkmax:
         raise ValueError(
             f"sweep_matrix_elements: psi_G must be "
             f"(nk, nb, ns, ngkmax) = "
-            f"({nk}, {geom.nb}, {geom.ns}, {geom.ngkmax}), "
+            f"({nk}, {geom.nb_logical}, {geom.ns}, {geom.ngkmax}), "
             f"got {tuple(psi.shape)}")
+
+    # THE BAND PAD, applied here so no caller states it (SlabIO ruling,
+    # decisions.md 2026-08-04: padding is the infrastructure's business).
+    # Pad bands are ψ = 0, so the extra rows AND columns of ⟨m|O|n⟩ are
+    # exactly zero -- they are not "close to zero", they are the product of
+    # an exact zero, so no downstream mask is needed and no tolerance is
+    # spent on them.
+    psi, _ = pad_axis_to(psi, geom.p_prod, axis=1)
 
     gvecs_j = jnp.asarray(gvecs, dtype=jnp.int32)
     gmask_j = jnp.asarray(gmask, dtype=jnp.float64)

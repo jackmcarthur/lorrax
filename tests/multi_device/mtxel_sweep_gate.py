@@ -111,6 +111,13 @@ def main():
     geom = SweepGeometry(mesh=mesh, fft_grid=GRID, ngkmax=ngkmax,
                          nb=NB, ns=NS, nk=NK, cell_volume=volume)
 
+    # Band pad BEFORE construction -- an indivisible band extent is refused
+    # when the sharded array is built, not when it is used.
+    psi_pad = psi
+    if geom.nb != NB:
+        psi_pad = np.pad(psi, ((0, 0), (0, geom.nb - NB), (0, 0), (0, 0)))
+        p0(f"[mtxel] band pad {NB} -> {geom.nb} (p_prod={geom.p_prod})")
+
     # make_array_from_callback, NOT device_put(array, NamedSharding): the
     # latter runs a process_allgather of the whole array through
     # multihost_utils.assert_equal before any work starts.  Harmless at the
@@ -118,22 +125,26 @@ def main():
     # 7888820/7888821).  Same idiom in both so the gate cannot drift into
     # measuring a different setup path than the bench.
     sharding = NamedSharding(mesh, P(None, ('x', 'y'), None, None))
-    psi_j = jax.make_array_from_callback(psi.shape, sharding,
-                                         lambda idx: psi[idx])
+    psi_j = jax.make_array_from_callback(psi_pad.shape, sharding,
+                                         lambda idx: psi_pad[idx])
 
     # ---- reference: the local per-k plan, on the FULL FFT box (wall W1) ---
-    T_ref = np.zeros((NK, NB, NB), dtype=np.complex128)
-    V_ref = np.zeros((NK, NB, NB), dtype=np.complex128)
+    # References at the PADDED extent, filled only on the logical block.  The
+    # pad rows/columns stay exact zeros, so comparing against them also
+    # asserts the sweep's pad bands contribute exactly nothing -- not "close
+    # to zero", exactly zero, since they are products of an exact zero.
+    T_ref = np.zeros((NK, geom.nb, geom.nb), dtype=np.complex128)
+    V_ref = np.zeros((NK, geom.nb, geom.nb), dtype=np.complex128)
     hwm_before = vmhwm_gib()
     for ik in range(NK):
         box = np.zeros((NB, NS, nx, ny, nz), dtype=np.complex128)
         for i in range(NGK):
             box[:, :, gv[ik, i, 0], gv[ik, i, 1], gv[ik, i, 2]] = psi[ik, :, :, i]
         box_j = jnp.asarray(box)
-        T_ref[ik] = np.asarray(compute_kinetic_k(
+        T_ref[ik, :NB, :NB] = np.asarray(compute_kinetic_k(
             box_j, jnp.asarray(gv[ik]), jnp.asarray(kvecs[ik]), bdot,
             g_mask=jnp.asarray(gmask[ik])))
-        V_ref[ik] = np.asarray(compute_local_V_k(
+        V_ref[ik, :NB, :NB] = np.asarray(compute_local_V_k(
             box_j, jnp.asarray(gv[ik]), jnp.asarray(V_r), volume,
             g_mask=jnp.asarray(gmask[ik])))
     hwm_local = vmhwm_gib()

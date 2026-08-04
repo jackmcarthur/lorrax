@@ -158,24 +158,69 @@ def solve_at_logical(solve_fn, n_logical, mats, rhs=None, *, pad_axes=(-2,)):
     return jnp.pad(out, widths)
 
 
-def pad_last_axis_to(A, divisor):
-    """Zero-pad the last axis of ``A`` up to ``round_up(extent, divisor)``.
+def pad_axis_to(A, divisor, *, axis: int = -1):
+    """Zero-pad ``axis`` of ``A`` up to ``round_up(extent, divisor)``.
 
-    The NRHS-pad idiom for distributed solves whose block-cyclic RHS
-    descriptor needs last-axis divisibility: zero RHS columns produce
-    zero solution columns — trim with ``[..., :n_orig]`` on return.
+    THE mesh-divisibility pad for an array axis, shared by every consumer
+    that has to make an axis divide a device mesh.  Returns
+    ``(A_padded, n_orig)``; a no-op returning the SAME array when the
+    extent already divides, so divisible meshes stay byte-identical.
 
-    Returns ``(A_padded, n_orig)``; a no-op (same array) when already
-    divisible.
+    Two established uses, and they are the same arithmetic:
+
+    * ``axis=-1`` (:func:`pad_last_axis_to`) — the NRHS pad for
+      distributed solves whose block-cyclic RHS descriptor needs
+      last-axis divisibility.  Zero RHS columns give zero solution
+      columns.
+    * ``axis=1`` — the BAND pad.  ``psi`` is ``(n_k, nb, nspinor,
+      ngkmax)`` and band-flat sharding needs ``nb`` to divide the mesh.
+      Pad bands are ψ = 0, so every quantity linear or bilinear in ψ is
+      exactly zero on them: zero centroid samples in
+      ``wfn_transforms.gflat_to_rmu``, zero rows AND columns of
+      ⟨m|O|n⟩ in ``common.mtxel_sweep``.  Nothing about the physics
+      knows the pad is there.
+
+    The band case is not optional at production shapes: ``nb`` must
+    divide ``∏ p_a``, and e.g. ``nb = 600`` on an 8×8 mesh does not
+    (600 = 64·9.375).  Constructing that sharded array raises JAX's
+    ``IndivisibleError`` outright (measured, job 7888869) rather than
+    degrading — mesh divisibility is JAX's constraint, not ours
+    (decisions.md 2026-08-04).
     """
     import jax.numpy as jnp
 
-    n = int(A.shape[-1])
+    ax = int(axis) % int(A.ndim)
+    n = int(A.shape[ax])
     n_pad = round_up(n, divisor)
     if n_pad == n:
         return A, n
-    widths = [(0, 0)] * (A.ndim - 1) + [(0, n_pad - n)]
+    widths = [(0, 0)] * A.ndim
+    widths[ax] = (0, n_pad - n)
     return jnp.pad(A, widths), n
+
+
+def pad_last_axis_to(A, divisor):
+    """``pad_axis_to(A, divisor, axis=-1)`` — kept as the named NRHS spelling."""
+    return pad_axis_to(A, divisor, axis=-1)
+
+
+def mesh_divisor(mesh_or_int) -> int:
+    """``∏ p_a`` for a Mesh, or the int itself.
+
+    The band pad and the μ pad both need the worst-case shard divisor and
+    both were deriving it inline.  One spelling.
+    """
+    if isinstance(mesh_or_int, int):
+        return int(mesh_or_int)
+    try:
+        prod = 1
+        for axis in mesh_or_int.axis_names:
+            prod *= int(mesh_or_int.shape[axis])
+        return prod
+    except AttributeError as exc:
+        raise TypeError(
+            f"mesh_divisor: expected an int or a Mesh; "
+            f"got {type(mesh_or_int)!r}") from exc
 
 
 __all__ = [
@@ -183,5 +228,7 @@ __all__ = [
     "extra_mu_pad",
     "padded_mu_extent",
     "solve_at_logical",
+    "pad_axis_to",
     "pad_last_axis_to",
+    "mesh_divisor",
 ]

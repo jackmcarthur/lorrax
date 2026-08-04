@@ -46,7 +46,7 @@ from typing import Sequence, TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
-from runtime.padding import round_up
+from runtime.padding import round_up, pad_axis_to
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -925,10 +925,11 @@ def gflat_to_rmu(
     # Pad bands are ψ=0 ⇒ zero centroid samples, dropped from the output
     # below.  No-op when nb_total already divides p_prod (nb_pad_total ==
     # nb_total): single-node / divisible meshes stay byte-identical.
-    nb_pad_total = round_up(nb_total, p_prod)             # round up to p_prod (canonical helper)
-    if nb_pad_total != nb_total:
-        psi_G = jnp.pad(
-            psi_G, ((0, 0), (0, nb_pad_total - nb_total), (0, 0), (0, 0)))
+    # ``runtime.padding.pad_axis_to`` is THE band pad, shared with
+    # ``common.mtxel_sweep`` — same arithmetic, same zero-band argument, one
+    # implementation.  This call site used to inline the round_up + jnp.pad.
+    psi_G, _ = pad_axis_to(psi_G, p_prod, axis=1)
+    nb_pad_total = int(psi_G.shape[1])
     nb_local = nb_pad_total // p_prod
     N        = nk * nb_local
 

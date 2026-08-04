@@ -66,14 +66,29 @@ Two consequences, and only the second is an action item:
    **Owner question, not an implementer's**: the veto and the file format
    currently disagree in wording. Most likely the veto is narrower than it
    reads (it forbids halving the q-sum in Σ, not reading a TRS-reduced WFN).
-2. `ntran = 2` looks small for a D3h crystal. The likely cause is the symmetry
-   list allowed in the original QE input, not any limitation of the file
-   format or of BGW — **BGW carries spinor rotations fine**. If the C3
-   operations are wanted, the fix is upstream in the QE input; failing that,
-   `orbit_syms.recover_symmorphic_density_point_group` recovers a symmorphic
-   group from the charge density and `SymMaps.get_spinor_rotations` builds
-   SU(2) for **arbitrary** Cartesian rotations passed as an argument, so the
-   two compose into a recovery path. Check the deck's QE input first.
+2. `ntran = 2` is small for a D3h crystal, and the likely cause is the
+   symmetry list allowed in the QE input that produced the deck — not the
+   file format and not BGW, which carries spinor rotations fine.
+
+   **This is not a reason to regenerate the deck, and the implementation must
+   not assume anyone will.** The requirement is the opposite: the
+   infrastructure takes the operation list as *input* and is correct for
+   whatever it is handed — `ntran = 1` (no reduction, the degenerate case
+   that must still be exercised), `ntran = 2` (this deck, 1.6×), or the 48
+   operations of a cubic crystal (~24× on a 12×12×12 grid). Nothing in §1,
+   §3 or §4 depends on the size or content of the list.
+
+   `mos2_4x4` at `ntran = 2` is therefore the **test case**, not a problem to
+   be routed around. A design that only shows a win at 48 operations and is
+   untested at 2 is not general; a 1.6× deck exercises every code path
+   (star construction, τ phases, spinor rotations, the ψ handoff) at a size
+   where the answer can be checked by hand.
+
+   `orbit_syms.recover_symmorphic_density_point_group` +
+   `SymMaps.get_spinor_rotations` (which builds SU(2) for **arbitrary**
+   Cartesian rotations passed as an argument) compose into an *optional*
+   recovery path for a deck whose stored list is shorter than its crystal
+   symmetry. Optional: the loop must be correct without it.
 
 ## 3. ψ at the ISDF centroids
 
