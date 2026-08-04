@@ -45,6 +45,37 @@ size, so the gate is meaningful at any square P.
 
 rc=0 iff the file round-trips to the exact reference.  P=1 is skipped: with
 one rank there is no padding and nothing to test.
+
+The three cases added by the 2026-08-04 SlabIO audit
+----------------------------------------------------
+The write path is only half the contract, and a bounds test that fires on a
+PROPER SUBSET of ranks is the same class of defect one step out: the ranks
+that do not refuse enter the collective alone and the job hangs with no
+message.
+
+    PADRANK_CASE=read_pad   <launcher> -n 4  python3 -m phdf5_padded_rank_write
+    PADRANK_CASE=oob_write  <launcher> -n 4  python3 -m phdf5_padded_rank_write
+    PADRANK_CASE=oob_read   <launcher> -n 4  python3 -m phdf5_padded_rank_write
+
+    read_pad   mu = P+1.  Read at the PADDED physical shape with
+               valid_shape = the logical extent, mu-sharded, so wholly-
+               padded ranks take the empty-selection branch of the READ
+               collective.  Every rank checks its own block; the padded
+               ones must come back EXACTLY zero.  This is the shape
+               ``zeta_loader.read_zeta_G_slab`` uses in production.
+    oob_write  the LOGICAL slab overruns the dataset extent (offset 1 on
+               the mu axis) while wholly-padded ranks exist.  rc=0 iff THIS
+               rank refused.  Measured on the unfixed writer at P=4: rank 2
+               alone reported oob=1, ranks 0/1/3 entered H5Dwrite, and the
+               job died 306 s later at the JAX shutdown barrier deadline
+               (job 7888470).
+    oob_read   the same for the read path, which before the audit had no
+               bounds test at all.  Unfixed at P=4 this HANGS with no
+               message on any rank (job 7888470 p4_oobr, killed at 420 s).
+
+The oob cases fail by HANGING, so run them under a wall-clock bound and
+read each rank's own rc: the gate is "every rank refused", and a rank that
+neither refused nor finished is the failure.
 """
 import os
 import sys
@@ -69,15 +100,20 @@ N_G = int(os.environ.get("PADRANK_NG", "8"))
 PATH = os.environ.get("PADRANK_PATH", "padrank_gate.h5")
 
 
+_PAD_CASES = ("repro", "read_pad", "oob_write", "oob_read")
+_CONTROL_CASES = ("control", "exact")
+
+
 def _mu_for(case: str, world: int) -> int:
-    if case == "repro":
+    if case in _PAD_CASES:
         return world + 1
     if case == "control":
         return 2 * world - 1
     if case == "exact":
         return 2 * world
-    raise SystemExit(f"unknown PADRANK_CASE={case!r} "
-                     f"(expected repro | control | exact)")
+    raise SystemExit(
+        f"unknown PADRANK_CASE={case!r} (expected "
+        f"{' | '.join(_PAD_CASES + _CONTROL_CASES)})")
 
 
 def main():
@@ -99,11 +135,11 @@ def main():
        f"loc={loc} pad_rows={mu_pad - mu}")
     p0(f"[padrank-gate] wholly-padded ranks: "
        f"{pure_pad if pure_pad else 'none'}")
-    if CASE == "repro" and not pure_pad:
-        p0("[padrank-gate] REFUSING: the repro case produced no wholly-padded "
-           "rank, so it would gate nothing at this world size.")
+    if CASE in _PAD_CASES and not pure_pad:
+        p0(f"[padrank-gate] REFUSING: case {CASE} produced no wholly-padded "
+           f"rank, so it would gate nothing at this world size.")
         return 2
-    if CASE != "repro" and pure_pad:
+    if CASE in _CONTROL_CASES and pure_pad:
         p0(f"[padrank-gate] REFUSING: control case unexpectedly has "
            f"wholly-padded ranks {pure_pad}.")
         return 2
@@ -125,6 +161,32 @@ def main():
         os.remove(PATH)
     jax.experimental.multihost_utils.sync_global_devices("padrank_unlink")
 
+    # ---- oob_write: refuse BEFORE the file is written, so nothing else in
+    # this launch depends on the outcome.  The verdict is per-rank: rc=0
+    # iff THIS rank refused.  A rank that neither refuses nor returns is
+    # the failure the case exists to catch, and it presents as a hang.
+    if CASE == "oob_write":
+        with SlabIO(PATH, mode="w", mesh=mesh,
+                    backend=SlabIOBackend.PHDF5_FFI) as io:
+            io.create_dataset("zeta_like", shape=(N_Q, mu, N_G),
+                              dtype=jnp.complex128)
+            p0(f"[padrank-gate] issuing the overrunning write: "
+               f"offset=(0,1,0) valid=(.,{mu},.) vs extent {mu}")
+            sys.stdout.flush()
+            try:
+                io.write_slab("zeta_like", A,
+                              offset=(0, 1, 0),
+                              global_shape=(N_Q, mu_pad, N_G),
+                              valid_shape=(N_Q, mu, N_G))
+                io.close()
+            except Exception as exc:                          # noqa: BLE001
+                print(f"[padrank-gate rank={rank}] REFUSED (correct): "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+                return 0
+        print(f"[padrank-gate rank={rank}] FAIL: the overrunning write was "
+              f"ACCEPTED", flush=True)
+        return 1
+
     with SlabIO(PATH, mode="w", mesh=mesh,
                 backend=SlabIOBackend.PHDF5_FFI) as io:
         io.create_dataset("zeta_like", shape=(N_Q, mu, N_G),
@@ -134,6 +196,54 @@ def main():
                       global_shape=(N_Q, mu, N_G),
                       valid_shape=(N_Q, mu, N_G))
     jax.experimental.multihost_utils.sync_global_devices("padrank_written")
+
+    # ---- read_pad: the READ-side empty rendezvous.  Physical shape is the
+    # padded one, valid_shape is the logical file extent, mu is sharded —
+    # so ranks in ``pure_pad`` select nothing and must come back at exactly
+    # the zero fill.  Every rank checks its OWN block, so a rank that gets
+    # someone else's data fails on that rank.
+    if CASE == "read_pad":
+        with SlabIO(PATH, mode="r", mesh=mesh,
+                    backend=SlabIOBackend.PHDF5_FFI) as io:
+            out = io.read_slab("zeta_like",
+                               shape=(N_Q, mu_pad, N_G),
+                               dtype=np.complex128,
+                               offset=(0, 0, 0),
+                               valid_shape=(N_Q, mu, N_G),
+                               mesh=mesh,
+                               partition_spec=P(None, ('x', 'y'), None))
+        shard = out.addressable_shards[0]
+        blk = np.asarray(shard.data)
+        start = int(shard.index[1].start or 0)
+        want = buf[:, start:start + blk.shape[1], :]
+        bad = (blk.shape != want.shape
+               or int(np.count_nonzero(blk != want)))
+        print(f"[padrank-gate rank={rank}] block rows [{start},"
+              f"{start + blk.shape[1]}) {'(WHOLLY PADDED)' if rank in pure_pad else ''}"
+              f" mismatched={bad}", flush=True)
+        return 0 if not bad else 1
+
+    if CASE == "oob_read":
+        with SlabIO(PATH, mode="r", mesh=mesh,
+                    backend=SlabIOBackend.PHDF5_FFI) as io:
+            p0(f"[padrank-gate] issuing the overrunning read: "
+               f"offset=(0,1,0) valid=(.,{mu},.) vs extent {mu}")
+            sys.stdout.flush()
+            try:
+                io.read_slab("zeta_like",
+                             shape=(N_Q, mu_pad, N_G),
+                             dtype=np.complex128,
+                             offset=(0, 1, 0),
+                             valid_shape=(N_Q, mu, N_G),
+                             mesh=mesh,
+                             partition_spec=P(None, ('x', 'y'), None))
+            except Exception as exc:                          # noqa: BLE001
+                print(f"[padrank-gate rank={rank}] REFUSED (correct): "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+                return 0
+        print(f"[padrank-gate rank={rank}] FAIL: the overrunning read was "
+              f"ACCEPTED past the dataset extent", flush=True)
+        return 1
 
     ok = 1
     if rank == 0:
