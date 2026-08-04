@@ -1138,11 +1138,26 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		cfg.bispinor and all(os.path.exists(p) for p in zeta_T_paths)
 	)
 	if cfg.bispinor and not bispinor_ready:
-		print_fn(
-			f"  [bispinor] cfg.bispinor=True but transverse ζ files "
-			f"not all present at {zeta_dir}/zeta_q_mu{{1,2,3}}.h5 — "
-			f"falling back to scalar V_q.  Did fit_zeta receive "
-			f"cfg.centroids_file_current?"
+		# REFUSE, do not demote.  This used to print the sentence below and
+		# carry on with a scalar V_q — i.e. silently return NON-BISPINOR
+		# physics from a deck that asked for bispinor, with Σ^B absent and
+		# no symptom in any output.  decisions.md 2026-08-01 rules that a
+		# missing capability is a refusal naming what is missing, never a
+		# demotion to a different compute path; this is the same class as
+		# the FFI entry and the same class as the restart regression
+		# 3d89885 fixed.
+		_missing = [p for p in zeta_T_paths if not os.path.exists(p)]
+		raise FileNotFoundError(
+			f"bispinor = true, but {len(_missing)} of 3 transverse ζ files "
+			f"are missing:\n  "
+			+ "\n  ".join(_missing)
+			+ f"\nRefusing to fall back to a scalar V_q: that would drop "
+			f"Σ^B and return non-bispinor physics from a bispinor deck "
+			f"with no symptom in any output.  Either the ζ fit did not run "
+			f"for the transverse channel (check that fit_zeta received "
+			f"cfg.centroids_file_current) or the files were removed after "
+			f"it did.  Re-run the fit, or set bispinor = false if a scalar "
+			f"run is what you want."
 		)
 
 	if bispinor_ready:

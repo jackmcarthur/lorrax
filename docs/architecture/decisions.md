@@ -29,6 +29,15 @@ caller to reason about.
   silently delete-and-recreate (data loss) and never silently write into the
   previous geometry (wrong physics, no symptom).
 
+CLIPPING IS SILENT AND THAT IS INTENDED (owner, 2026-08-04). A logical slab
+that overhangs the dataset is clipped to the dataset extent and writes a
+slightly smaller version of the same array. No warning. The overhang case and
+the ordinary pad-row case are indistinguishable from inside SlabIO, and the
+owner does not want a diagnostic for a path that is robust — a warning nobody
+can act on is noise that trains people to ignore the log. An EXPLICIT
+`valid_shape` override still refuses, because there the caller has stated an
+intent that can be contradicted.
+
 Rationale: every SlabIO defect found on 2026-08-02/04 — the wholly-padded
 rank refusal, its residual asymmetric-bounds twin in both directions, the
 mode-ignoring context cache, the ragged `valid_shape` hazards — is the same
