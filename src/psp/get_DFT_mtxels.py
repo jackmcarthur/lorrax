@@ -44,6 +44,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from functools import partial, lru_cache
+from typing import NamedTuple
 
 
 # Full-BZ G-vectors for compute_valence_density (replaces
@@ -428,6 +429,73 @@ from psp.dft_operators import padded_gvectors              # noqa: F401
 from psp.dft_operators import generate_gvectors_k          # noqa: F401  (D10 reference)
 
 
+class LocalPotentialScalars(NamedTuple):
+    """The four constants of a ``⟨m|V(r)|n⟩`` FFT round trip.
+
+    ``scale`` (ψ_G → ψ_r), ``deltaV`` and ``fft_norm`` (φ_r → φ_G) and
+    ``post`` (applied to the finished block).
+    """
+    scale: jax.Array
+    deltaV: jax.Array
+    fft_norm: jax.Array
+    post: jax.Array
+
+
+def local_potential_scalars(volume, ngrid) -> LocalPotentialScalars:
+    """THE normalisation chain of every local-potential matrix element.
+
+    One definition, two sharding plans.  ``_compute_local_V_k_jit`` (the
+    local plan: whole FFT box on one rank) and
+    ``common.mtxel_sweep.local_potential_operator`` (the 2-D band-sharded
+    plan) both call this, so the two agree to round-off BY CONSTRUCTION
+    and the only difference between them is the reassociation the
+    sharding forces on the G sum.  Before this existed the chain was
+    written out three times and the agreement was a coincidence
+    maintained by hand.
+
+    Works on traced or concrete inputs.  The sweep calls it once at
+    factory-build time and takes ``float()`` of each field, so the
+    constants are baked into the jaxpr as literals rather than riding
+    through the scan as operands.
+    """
+    ngrid = jnp.asarray(ngrid, dtype=jnp.float64)
+    volume = jnp.asarray(volume, dtype=jnp.float64)
+    return LocalPotentialScalars(
+        scale=jnp.sqrt(ngrid / volume),
+        deltaV=volume / ngrid,
+        fft_norm=jnp.sqrt(ngrid),
+        post=jnp.sqrt(1.0 / volume),
+    )
+
+
+def kinetic_diagonal(G_float, kpoint_crys, bdot, g_mask=None):
+    """``T_G = |k+G|²`` in Ry — THE kinetic diagonal, one definition.
+
+    Shared by ``_compute_kinetic_k_jit`` (local plan) and
+    ``common.mtxel_sweep.kinetic_operator`` (2-D plan).
+
+    ``g_mask`` is applied to the DIAGONAL rather than to ψ.  That is
+    sufficient — a masked ``T_G`` makes the pad column contribute exactly
+    zero to the contraction however ψ is laid out — and it is what the
+    local plan has always done, so masking here keeps the two routes
+    term-for-term identical.
+
+    NOT the same job as the ``|k+G|²`` in ``psp.gvec_utils`` /
+    ``psp.dft_operators`` / ``file_io.wfn_writer``: those are host-side
+    and SELECT or SORT a G-sphere by kinetic energy.  This one applies an
+    operator to ψ.  Same formula, different question; they are not
+    unified on purpose.
+    """
+    K_crys = jnp.asarray(G_float, dtype=jnp.float64) + \
+        jnp.asarray(kpoint_crys, dtype=jnp.float64)[None, :]
+    T_G = jnp.einsum('gi,ij,gj->g', K_crys,
+                     jnp.asarray(bdot, dtype=jnp.float64), K_crys,
+                     optimize=True)
+    if g_mask is not None:
+        T_G = T_G * jnp.asarray(g_mask, dtype=jnp.float64)
+    return T_G
+
+
 def compute_kinetic_k(wfn_k, Gk_crys, kpoint_crys, bdot, g_mask: jax.Array | None = None):
     """
     Compute kinetic energy matrix elements <mk|T|nk> for a single k-point.
@@ -460,135 +528,13 @@ def _compute_kinetic_k_jit(
     bdot: jax.Array,
     g_mask: jax.Array | None,
 ) -> jax.Array:
-    K_crys = G_float + k_crys[None, :]
-    T_G = jnp.einsum('gi,ij,gj->g', K_crys, bdot, K_crys, optimize=True)
-    if g_mask is not None:
-        T_G = T_G * g_mask
+    T_G = kinetic_diagonal(G_float, k_crys, bdot, g_mask=g_mask)
     Gx = G_int[:, 0]
     Gy = G_int[:, 1]
     Gz = G_int[:, 2]
     psi_G = wfn_k[:, :, Gx, Gy, Gz]
     T_psi = T_G[None, None, :] * psi_G
     return jnp.einsum('msg,nsg->mn', jnp.conj(psi_G), T_psi, optimize=True)
-
-def compute_local_V_k_2d(
-    psi_m_sphere,
-    psi_n_sphere,
-    g_index,
-    gvecs,
-    fft_grid,
-    V_r,
-    cell_volume,
-    *,
-    mesh,
-    g_mask,
-):
-    """⟨mk|V(r)|nk⟩ for one k, **2-D band-sharded**, no rank holding (nb,nb).
-
-    The distributed plan of ``docs/dev/rho_vh_2d_design.md`` §5.1/§5.5.
-    ``compute_local_V_k`` is the local (k-parallel) plan and stays the
-    default; this is the one that scales past ``P = nk``.
-
-    Operands are the **G-sphere** ψ, ``(1, nb, ns, ngkmax)``, exactly the
-    ``psi_m_X,k(G)`` / ``psi_n_Y,k(G)`` layout the owner specified — NOT the
-    FFT box.  That is what removes wall W1: the local plan puts every band at
-    one k into the box on one rank (``nb·ns·N_r·16`` = 1.77 GB at b600
-    bispinor, 37 GB and OOM at 12×12), whereas here only the n side is ever
-    boxed and only ``nb/P`` bands of it at a time.
-
-    Returns ``(1, nb, nb)`` sharded ``P(None, 'x', 'y')``.  No rank forms a
-    full ``(nb, nb)`` tile, so wall W2 (the replicated ``(nk,nb,nb)``, 829 MB
-    at 12×12 and 9.2 GB at nb=2000) is gone too.
-
-    THE ONE COLLECTIVE, AND WHY IT IS NOT px-FOLD REDUNDANT
-    -------------------------------------------------------
-    The naive 2-D form has each of the ``px`` ranks in a column transform its
-    whole n-block, which is ``px``-fold redundant FFT work.  Instead the n
-    side is carried over the WHOLE mesh for the transform (``P(None,
-    ('x','y'), ...)``) so FFT work is ``2nb/P`` per rank — optimal — and then
-    constrained to the column layout ``P(None, 'y', ...)``.  That single
-    re-shard IS the x-all-gather; XLA inserts it.  Payload is the
-    sphere-space ``vpsi`` (9.4 MB at b600/P=64), not the r-space box.
-
-    The m side never needs a transform at all: the contraction consumes
-    sphere coefficients, and ψ is already stored that way.  The local plan
-    only boxes it because it takes both sides out of one box.
-
-    ``g_mask`` is mandatory whenever the G table is padded (owner decision
-    D10 pads to ``ngkmax`` with ``(0,0,0)`` rows, i.e. Γ — a REAL G-vector,
-    so unmasked pad columns would fold the Γ coefficient in rather than
-    zero).
-
-    Normalisation is term-for-term the local plan's, so the two agree to
-    round-off and the difference is pure reassociation from the sharding.
-    """
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    from common.wfn_transforms import to_rbox, from_rbox
-
-    gv = np.asarray(gvecs)
-    ngrid = int(np.prod(tuple(int(s) for s in fft_grid)))
-    volume = float(cell_volume)
-    scale = float(np.sqrt(ngrid / volume))
-    deltaV = volume / ngrid
-    fft_norm = float(np.sqrt(ngrid))
-
-    # REFUSE an unmasked padded table.  Pad rows are (0,0,0) — a valid FFT-box
-    # index that ALIASES physical Γ — so a forgotten mask does not crash, it
-    # silently double-counts ψ(G=0) into every pad column.  The 1-D pipeline
-    # has this check, but it lives in ``gw.kin_ion_io.get_kin_ion_k``, one
-    # level ABOVE the kernels, so a caller reaching a kernel directly got
-    # nothing.  ``g_mask`` is therefore a required keyword here and the table
-    # is checked, not trusted.
-    if g_mask is None:
-        n_zero_rows = int(np.count_nonzero(~gv.any(axis=1)))
-        if n_zero_rows > 1:
-            raise ValueError(
-                f"compute_local_V_k_2d: g_mask=None but the G table has "
-                f"{n_zero_rows} all-zero rows, i.e. it is ngkmax-padded.  Pad "
-                f"rows are (0,0,0) = Γ, a REAL G-vector, so an unmasked "
-                f"contraction silently folds ψ(G=0) into every pad column "
-                f"instead of contributing zero.  Pass the mask from "
-                f"psp.dft_operators.padded_gvectors(...).at(ik).")
-
-    # NOT wrapped in an outer jit, deliberately.  ``to_rbox`` / ``from_rbox``
-    # memoise a DEVICE array of the G index (``_cached_gindex_dev``); called
-    # inside an enclosing trace that cache captures a tracer, which escapes
-    # and raises UnexpectedTracerError (measured, job 7888526).  They are
-    # already cached jits themselves, so what an outer jit would buy is
-    # fusion across the FFT / ×V_r / gather / einsum boundary, not fewer
-    # COMPILES: shapes are fixed by D10, so every transform lowers once for
-    # the whole k sweep regardless.  The cost of the glue is therefore a
-    # handful of extra dispatches per k, not a compile storm.  If that
-    # overhead is ever measured to matter, the fix is to hoist the device
-    # G-index out of the transforms and pass it as an operand — not to wrap
-    # this body.
-    psi_m = jnp.asarray(psi_m_sphere, dtype=jnp.complex128)
-    psi_n = jnp.asarray(psi_n_sphere, dtype=jnp.complex128)
-    mask = None if g_mask is None else jnp.asarray(g_mask,
-                                                   dtype=jnp.complex128)
-
-    # n side: carried over the WHOLE mesh for the round trip, so FFT work is
-    # 2nb/P per rank with no px-fold redundancy.
-    psi_n_w = jax.lax.with_sharding_constraint(
-        psi_n, NamedSharding(mesh, P(None, ('x', 'y'), None, None)))
-    psi_r = to_rbox(psi_n_w, g_index, fft_grid, mesh=mesh, norm='ortho') * scale
-    phi_r = psi_r * jnp.asarray(V_r, dtype=jnp.complex128)
-    vpsi = from_rbox(phi_r, gv, mesh=mesh, norm='ortho',
-                     g_mask=mask) * (deltaV * fft_norm)
-
-    # The x-all-gather, expressed as a re-shard.
-    vpsi_y = jax.lax.with_sharding_constraint(
-        vpsi, NamedSharding(mesh, P(None, 'y', None, None)))
-    psi_m_x = jax.lax.with_sharding_constraint(
-        psi_m if mask is None else psi_m * mask,
-        NamedSharding(mesh, P(None, 'x', None, None)))
-
-    V_loc = jnp.einsum('kbsg,knsg->kbn',
-                       jnp.conj(psi_m_x), vpsi_y, optimize=True)
-    V_loc = V_loc * jnp.sqrt(1.0 / volume)
-    return jax.lax.with_sharding_constraint(
-        V_loc, NamedSharding(mesh, P(None, 'x', 'y')))
-
 
 def compute_local_V_k(wfn_k, Gk_crys, V_r, cell_volume, g_mask: jax.Array | None = None):
     """
@@ -627,13 +573,12 @@ def _compute_local_V_k_jit(
     nx, ny, nz = psi_G.shape[-3:]
 
     ngrid = nx * ny * nz
-    scale = jnp.sqrt(ngrid / volume)
-    deltaV = volume / ngrid
-    fft_norm = jnp.sqrt(ngrid)
+    sc = local_potential_scalars(volume, ngrid)
 
-    psi_r = jnp.fft.ifftn(psi_G, axes=(-3, -2, -1), norm='ortho') * scale
+    psi_r = jnp.fft.ifftn(psi_G, axes=(-3, -2, -1), norm='ortho') * sc.scale
     phi_r = psi_r * V_r
-    phi_G = jnp.fft.fftn(phi_r, axes=(-3, -2, -1), norm='ortho') * (deltaV * fft_norm)
+    phi_G = jnp.fft.fftn(phi_r, axes=(-3, -2, -1), norm='ortho') * (
+        sc.deltaV * sc.fft_norm)
 
     psi_coeffs = psi_G[:, :, Gx, Gy, Gz]
     vpsi = phi_G[:, :, Gx, Gy, Gz]
@@ -641,7 +586,7 @@ def _compute_local_V_k_jit(
         psi_coeffs = psi_coeffs * g_mask[None, None, :]
         vpsi = vpsi * g_mask[None, None, :]
     V_loc = jnp.einsum('bsg,nsg->bn', jnp.conj(psi_coeffs), vpsi, optimize=True)
-    return V_loc * jnp.sqrt(1.0 / volume)
+    return V_loc * sc.post
 
 
 @timing.timed("psp.get_DFT_mtxels.get_H_matrix_elements", watch=True)

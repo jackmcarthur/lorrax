@@ -1,8 +1,36 @@
 # One k-scan for V_H, kin+ion and dipole — implementation handoff
 
-Status: SPEC, owner-designed. Supersedes `rho_vh_2d_design.md` §5.1 for the
+Status: PARTLY IMPLEMENTED. Supersedes `rho_vh_2d_design.md` §5.1 for the
 matrix-element sweep (that document's ρ, wall and self-consistency analysis
-still stands). Nothing here is implemented.
+still stands).
+
+Landed:
+
+* `src/common/mtxel_sweep.py` — the skeleton (`SweepGeometry`,
+  `sweep_matrix_elements`), the kinetic operator and the local-potential
+  operator. `use_scan=False` runs the identical body in a Python loop and is
+  the control the scan is gated against.
+* The physics is CONSOLIDATED, not copied. `psp.get_DFT_mtxels` gained
+  `local_potential_scalars` (the FFT normalisation chain) and
+  `kinetic_diagonal` (`|k+G|²`); the local plan's `_compute_local_V_k_jit`
+  and `_compute_kinetic_k_jit` now call them, and so does the sweep. The two
+  plans therefore agree BY CONSTRUCTION and differ only in the reassociation
+  the sharding forces. Before this the chain was written out three times.
+* `compute_local_V_k_2d` DELETED (119 lines) — the dead seam this spec
+  subsumes, as §4 required.
+* Gate `tests/multi_device/mtxel_sweep_gate.py`.
+
+Not yet: dipole and V_NL operators (§6.3), the collector and SlabIO write
+(§6.4), the `hartree_basis_rotation` consumer audit, and the b600/P=64
+benchmark (§6.5).
+
+Where the physics lives, and why it is split that way: `gw.kin_ion_io`,
+`psp.get_DFT_mtxels` and `psp.get_dipole_mtxels` all carry a jax-plumbing
+budget of **0** (`tests/test_layering.py`), so no operator factory naming
+`Mesh`/`PartitionSpec` may live in them. The sweep therefore holds the
+plumbing and imports the pure-physics scalars from `psp` — L1→L1, which
+`test_layering` allows. `common/wfn_transforms.py` is the precedent: L1 by
+default, names plumbing, not budgeted.
 
 Read `docs/architecture/decisions.md` first — D10 (fixed-shape ngkmax) and the
 2026-08-04 SlabIO padding entry are both load-bearing here.
