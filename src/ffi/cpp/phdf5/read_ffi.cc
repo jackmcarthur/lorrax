@@ -3,8 +3,10 @@
 // lessons from the write-path investigation.
 //
 // Work shape per call:
-//  1. H5Dread (MPI-IO collective) into ``ctx->pinned_buf`` on the
-//     XLA executor thread — blocks for the read duration.
+//  1. H5Dread (MPI-IO collective) into the ctx's SYNCHRONOUS-READER
+//     staging buffer ``ctx->read_buf`` on the XLA executor thread —
+//     blocks for the read duration.  (``ctx->pinned_buf`` is the writer
+//     thread's; ctx.h OWNERSHIP says why they are two buffers.)
 //  2. cudaMemcpyAsync H2D onto ``ctx->stream`` into the XLA-allocated
 //     output buffer ``A_out``.
 //  3. cudaEventRecord(ctx->h2d_event) so downstream ops on xla_stream
@@ -29,8 +31,8 @@
 #include <vector>
 
 // LORRAX_FFI_NO_CUDA (host build): the collective MPI-IO read core below —
-// hyperslab selection + H5Dread into ctx->pinned_buf — is byte-identical on
-// both platforms.  Only three things switch on the flag:
+// hyperslab selection + H5Dread into the staging buffer — is byte-identical
+// on both platforms.  Only three things switch on the flag:
 //   1. the handler's leading PlatformStream<cudaStream_t> ctx (absent on the
 //      CPU platform, which hands the handler host buffers directly),
 //   2. the small offset/count buffer copy (cudaMemcpy D2H vs a plain read of
@@ -53,28 +55,36 @@
 #include "ctx.h"
 #include "phdf5_interface.h"
 #include "platform_seam.h"
+#include "shard_index.h"
 
 namespace lorrax_ffi::phdf5 {
 
 namespace ffi = ::xla::ffi;
 
-// Stage ``bytes`` from ctx->pinned_buf (where H5Dread landed) into the XLA
-// output buffer ``d_dst``.  CUDA: async H2D on ctx->stream, recorded on the
-// pooled h2d_event, with xla_stream made to wait so downstream ops defer
-// until the copy completes.  Host: d_dst is host memory, so a plain memcpy
-// (the writer thread has already serialized this task, so no event needed).
+// Stage ``bytes`` from the staging buffer ``src`` (where H5Dread landed) into
+// the XLA output buffer ``d_dst``.  CUDA: async H2D on ctx->stream, recorded
+// on the pooled h2d_event, with xla_stream made to wait so downstream ops
+// defer until the copy completes.  Host: d_dst is host memory, so a plain
+// memcpy.
+//
+// ``src`` is a PARAMETER, not ``ctx->pinned_buf``: the synchronous readers
+// stage through ``ctx->read_buf`` and only the writer-thread task stages
+// through ``ctx->pinned_buf`` (ctx.h OWNERSHIP).  Reading the buffer off the
+// ctx here would have quietly re-merged the two.
 #ifdef LORRAX_FFI_NO_CUDA
-static inline ffi::Error stage_pinned_to_output(
-    PhdfCtx* ctx, void* d_dst, size_t bytes)
+static inline ffi::Error stage_host_to_output(
+    PhdfCtx* ctx, const void* src, void* d_dst, size_t bytes)
 {
-    std::memcpy(d_dst, ctx->pinned_buf, bytes);
+    (void)ctx;
+    std::memcpy(d_dst, src, bytes);
     return ffi::Error::Success();
 }
 #else
-static inline ffi::Error stage_pinned_to_output(
-    cudaStream_t xla_stream, PhdfCtx* ctx, void* d_dst, size_t bytes)
+static inline ffi::Error stage_host_to_output(
+    cudaStream_t xla_stream, PhdfCtx* ctx, const void* src,
+    void* d_dst, size_t bytes)
 {
-    LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_dst, ctx->pinned_buf, bytes,
+    LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_dst, src, bytes,
                                       cudaMemcpyHostToDevice, ctx->stream));
     LORRAX_CUDA_CHECK(cudaEventRecord(ctx->h2d_event, ctx->stream));
     LORRAX_CUDA_CHECK(cudaStreamWaitEvent(xla_stream, ctx->h2d_event, 0));
@@ -83,32 +93,10 @@ static inline ffi::Error stage_pinned_to_output(
 #endif
 
 // ``copy_index_to_host`` (seam 2) is in platform_seam.h — shared with
-// write_ffi.cc so the two TUs cannot drift.
-
-static std::vector<int64_t> unravel_rank(
-    int64_t rank, ffi::Span<const int64_t> mesh_shape)
-{
-    std::vector<int64_t> coord(mesh_shape.size(), 0);
-    int64_t r = rank;
-    for (ssize_t i = (ssize_t)mesh_shape.size() - 1; i >= 0; --i) {
-        coord[i] = r % mesh_shape[i];
-        r /= mesh_shape[i];
-    }
-    return coord;
-}
-
-template <typename T>
-static std::string vec_to_string(const std::vector<T>& v)
-{
-    std::ostringstream os;
-    os << "[";
-    for (size_t i = 0; i < v.size(); ++i) {
-        if (i) os << ",";
-        os << v[i];
-    }
-    os << "]";
-    return os.str();
-}
+// write_ffi.cc so the two TUs cannot drift.  ``unravel_rank`` /
+// ``vec_to_string`` / ``validate_shard_encoding`` / ``checked_buffer_bytes``
+// / ``check_dataset_rank`` / ``announce_error`` are in shard_index.h, for the
+// same reason.
 
 template <typename T>
 static ffi::Error ReadImpl(
@@ -122,29 +110,46 @@ static ffi::Error ReadImpl(
     const std::vector<int64_t>& valid_shape,   // SAME on every rank
     hid_t ds_id)
 {
-    const int rank = (int)offset.size();
-    size_t n_local_elts = 1;
-    for (auto c : mem_dims) n_local_elts *= (size_t)c;
-    const size_t bytes = n_local_elts * sizeof(T);
+    // Announce before returning: a rank that refuses here does not enter the
+    // collective H5Dread its peers are inside, and the message otherwise dies
+    // with the process (see shard_index.h announce_error).
+    auto fail_read = [ctx](ffi::ErrorCode code, const std::string& msg) {
+        announce_error(ctx, msg);
+        return ffi::Error(code, msg);
+    };
 
-    if (!ensure_pinned(ctx, bytes)) {
+    const int rank = (int)offset.size();
+    size_t bytes = 0;
+    {
+        std::string ov_err;
+        if (!checked_buffer_bytes(mem_dims, sizeof(T), "phdf5 read",
+                                  &bytes, &ov_err)) {
+            return fail_read(ffi::ErrorCode::kInvalidArgument, ov_err);
+        }
+    }
+
+    // ``read_buf``, NOT ``pinned_buf``: this handler is synchronous and runs
+    // on the XLA thread, so it used to race the ctx writer thread on one
+    // shared buffer (audit 2026-08-04 item 4).  ctx.h OWNERSHIP has the split.
+    if (!ensure_read_buf(ctx, bytes)) {
         std::ostringstream os;
         os << "phdf5 read: staging-buffer alloc of " << bytes << " bytes failed";
-        return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
+        return fail_read(ffi::ErrorCode::kResourceExhausted, os.str());
     }
-    std::memset(ctx->pinned_buf, 0, bytes);
+    void* stage = ctx->read_buf;
+    std::memset(stage, 0, bytes);
 
     hid_t dset = ds_id;
     hid_t native_type = dt::h5_native_type<T>();
     if (dset < 0 || H5Iis_valid(dset) <= 0) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-            "phdf5 read: ds_id is invalid");
+        return fail_read(ffi::ErrorCode::kInvalidArgument,
+                         "phdf5 read: ds_id is invalid");
     }
 
     hid_t filespace = H5Dget_space(dset);
     if (filespace < 0) {
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 read: H5Dget_space failed");
+        return fail_read(ffi::ErrorCode::kInternal,
+                         "phdf5 read: H5Dget_space failed");
     }
     // Rank agreement, checked BEFORE H5Sget_simple_extent_dims below writes
     // file_rank entries into an rank-sized buffer.  write_ffi.cc has always
@@ -153,20 +158,18 @@ static ffi::Error ReadImpl(
     // Rank-invariant (the dataset and the request are the same on every
     // rank), so it refuses everywhere or nowhere.
     {
-        int file_rank = H5Sget_simple_extent_ndims(filespace);
-        if (file_rank != rank) {
-            std::ostringstream os;
-            os << "phdf5 read: dataset rank mismatch file_rank=" << file_rank
-               << " read_rank=" << rank;
+        std::string rank_err;
+        if (!check_dataset_rank(filespace, rank, "phdf5 read",
+                                nullptr, &rank_err)) {
             H5Sclose(filespace);
-            return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+            return fail_read(ffi::ErrorCode::kInvalidArgument, rank_err);
         }
     }
     hid_t memspace = H5Screate_simple(rank, mem_dims.data(), nullptr);
     if (memspace < 0) {
         H5Sclose(filespace);
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 read: H5Screate_simple(memspace) failed");
+        return fail_read(ffi::ErrorCode::kInternal,
+                         "phdf5 read: H5Screate_simple(memspace) failed");
     }
     // ── Emptiness is PER-RANK; the bounds test is RANK-INVARIANT. ──
     //
@@ -192,8 +195,8 @@ static ffi::Error ReadImpl(
     if (H5Sget_simple_extent_dims(filespace, extent.data(), nullptr) < 0) {
         H5Sclose(memspace);
         H5Sclose(filespace);
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 read: H5Sget_simple_extent_dims failed");
+        return fail_read(ffi::ErrorCode::kInternal,
+                         "phdf5 read: H5Sget_simple_extent_dims failed");
     }
     bool globally_empty = false;
     for (int d = 0; d < rank; ++d) {
@@ -217,7 +220,7 @@ static ffi::Error ReadImpl(
                << " -- refused identically on every rank";
             H5Sclose(memspace);
             H5Sclose(filespace);
-            return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+            return fail_read(ffi::ErrorCode::kInvalidArgument, os.str());
         }
     }
     bool empty_selection = false;
@@ -228,16 +231,16 @@ static ffi::Error ReadImpl(
         if (H5Sselect_none(filespace) < 0 || H5Sselect_none(memspace) < 0) {
             H5Sclose(memspace);
             H5Sclose(filespace);
-            return ffi::Error(ffi::ErrorCode::kInternal,
-                              "phdf5 read: H5Sselect_none failed");
+            return fail_read(ffi::ErrorCode::kInternal,
+                             "phdf5 read: H5Sselect_none failed");
         }
     } else if (H5Sselect_hyperslab(filespace, H5S_SELECT_SET,
                              offset.data(), nullptr,
                              file_count.data(),  nullptr) < 0) {
         H5Sclose(memspace);
         H5Sclose(filespace);
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 read: H5Sselect_hyperslab failed");
+        return fail_read(ffi::ErrorCode::kInternal,
+                         "phdf5 read: H5Sselect_hyperslab failed");
     } else {
         std::vector<hsize_t> mem_start((size_t)rank, 0);
         if (H5Sselect_hyperslab(memspace, H5S_SELECT_SET,
@@ -245,19 +248,18 @@ static ffi::Error ReadImpl(
                                 file_count.data(), nullptr) < 0) {
             H5Sclose(memspace);
             H5Sclose(filespace);
-            return ffi::Error(ffi::ErrorCode::kInternal,
-                              "phdf5 read: H5Sselect_hyperslab(mem) failed");
+            return fail_read(ffi::ErrorCode::kInternal,
+                             "phdf5 read: H5Sselect_hyperslab(mem) failed");
         }
     }
 
     hid_t dxpl = ctx->use_collective_read ? ctx->dxpl_coll : ctx->dxpl_indep;
-    herr_t st = H5Dread(dset, native_type, memspace, filespace, dxpl,
-                        ctx->pinned_buf);
+    herr_t st = H5Dread(dset, native_type, memspace, filespace, dxpl, stage);
     H5Sclose(memspace);
     H5Sclose(filespace);
     if (st < 0) {
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 read: H5Dread failed");
+        return fail_read(ffi::ErrorCode::kInternal,
+                         "phdf5 read: H5Dread failed");
     }
 
     // Device-staging tail (the ONLY hardware-specific step): CUDA async H2D
@@ -265,7 +267,7 @@ static ffi::Error ReadImpl(
     // until the copy completes; host = plain memcpy into the host-resident
     // output.  XLA's FFI contract guarantees the output buffer is available
     // for writing at handler entry, so no cross-stream wait is needed.
-    return stage_pinned_to_output(LRX_STREAM_ARG ctx, d_dst, bytes);
+    return stage_host_to_output(LRX_STREAM_ARG ctx, stage, d_dst, bytes);
 }
 
 // Padding contract: A_out dimensions are the equal-block physical
@@ -283,13 +285,26 @@ static ffi::Error ReadDispatch(
     ffi::Span<const int64_t> axis_flat)
 {
     auto* ctx = reinterpret_cast<PhdfCtx*>(ctx_handle);
+
+    // Every refusal in this dispatch is computed from replicated inputs (FFI
+    // Attrs, the equal-block output shape, a collectively-opened ds_id), so
+    // it fires on every rank or none — the only kind a collective tolerates.
+    auto fail = [ctx](ffi::ErrorCode code, const std::string& msg) {
+        announce_error(ctx, msg);
+        return ffi::Error(code, msg);
+    };
+
     if (!ctx) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "phdf5 read: ctx_handle is null");
+        return fail(ffi::ErrorCode::kInvalidArgument,
+                    "phdf5 read: ctx_handle is null");
     }
 
     const auto dims = A_out->dimensions();
     const size_t N = dims.size();
+    if (N == 0) {
+        return fail(ffi::ErrorCode::kInvalidArgument,
+                    "phdf5 read: output is 0-D; there is no hyperslab to read");
+    }
     if (offset_buf.dimensions().size() != 1 ||
         (size_t)offset_buf.dimensions()[0] != N ||
         valid_shape_buf.dimensions().size() != 1 ||
@@ -300,7 +315,15 @@ static ffi::Error ReadDispatch(
            << " offset_buf.ndim=" << offset_buf.dimensions().size()
            << " valid_shape_buf.ndim=" << valid_shape_buf.dimensions().size()
            << " axis_count_per_dim.size=" << axis_count_per_dim.size();
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+        return fail(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    {
+        std::string enc_err;
+        if (!validate_shard_encoding(ctx, "phdf5 read", mesh_shape,
+                                     axis_count_per_dim, axis_flat,
+                                     &enc_err)) {
+            return fail(ffi::ErrorCode::kInvalidArgument, enc_err);
+        }
     }
 
     // Bring the small offset + valid_shape buffers (N × 8 bytes each) into
@@ -309,15 +332,15 @@ static ffi::Error ReadDispatch(
     std::string cperr;
     if (!copy_index_to_host(offset_host.data(), offset_buf.untyped_data(),
                             N * sizeof(int64_t), &cperr)) {
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 read: copy(offset) failed: " + cperr);
+        return fail(ffi::ErrorCode::kInternal,
+                    "phdf5 read: copy(offset) failed: " + cperr);
     }
     std::vector<int64_t> valid_shape_host(N);
     if (!copy_index_to_host(valid_shape_host.data(),
                             valid_shape_buf.untyped_data(),
                             N * sizeof(int64_t), &cperr)) {
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 read: copy(valid_shape) failed: " + cperr);
+        return fail(ffi::ErrorCode::kInternal,
+                    "phdf5 read: copy(valid_shape) failed: " + cperr);
     }
 
     std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
@@ -329,7 +352,15 @@ static ffi::Error ReadDispatch(
             os << "phdf5 read: negative offset/valid_shape at dim " << d
                << " offset=" << offset_host[d]
                << " valid_shape=" << valid_shape_host[d];
-            return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+            return fail(ffi::ErrorCode::kInvalidArgument, os.str());
+        }
+        if (offset_host[d] > INT64_MAX - valid_shape_host[d]) {
+            std::ostringstream os;
+            os << "phdf5 read: offset+valid_shape overflows int64 at dim "
+               << d << " (" << offset_host[d] << "+" << valid_shape_host[d]
+               << "); the bounds test would wrap negative and accept an "
+               << "out-of-range slab";
+            return fail(ffi::ErrorCode::kInvalidArgument, os.str());
         }
         mem_dims[d] = (hsize_t)dims[d];
         offset[d] = (hsize_t)offset_host[d];
@@ -337,12 +368,13 @@ static ffi::Error ReadDispatch(
         int64_t rank_coord = 0;
         int64_t stride_acc = 1;
         for (int64_t k = na - 1; k >= 0; --k) {
+            // In range: validate_shard_encoding checked the length agreement.
             int64_t ax = axis_flat[flat_idx + k];
             if (ax < 0 || (size_t)ax >= mesh_shape.size()) {
                 std::ostringstream os;
                 os << "phdf5 read: bad axis " << ax
                    << " at dim " << d << " axis " << k;
-                return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+                return fail(ffi::ErrorCode::kInvalidArgument, os.str());
             }
             rank_coord += coord[ax] * stride_acc;
             stride_acc *= mesh_shape[ax];
@@ -394,7 +426,7 @@ static ffi::Error ReadDispatch(
         default: {
             std::ostringstream os;
             os << "phdf5 read: unsupported dtype " << static_cast<int>(dtype);
-            return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+            return fail(ffi::ErrorCode::kInvalidArgument, os.str());
         }
     }
 }
@@ -447,36 +479,72 @@ static ffi::Error ReadKchunkImpl(
     };
     auto t0 = now();
 
-    size_t per_k_elts = 1;
-    for (auto c : count) per_k_elts *= (size_t)c;
-    const size_t total_elts = per_k_elts * (size_t)n_kchunk;
-    const size_t bytes = total_elts * sizeof(T);
+    auto fail_kchunk = [ctx](ffi::ErrorCode code, const std::string& msg) {
+        announce_error(ctx, msg);
+        return ffi::Error(code, msg);
+    };
 
-    if (!ensure_pinned(ctx, bytes)) {
+    if (n_kchunk <= 0) {
+        return fail_kchunk(ffi::ErrorCode::kInvalidArgument,
+                           "phdf5 read_kchunk: n_kchunk must be >= 1");
+    }
+    size_t bytes = 0;
+    size_t per_k_elts = 1;
+    {
+        std::string ov_err;
+        std::vector<hsize_t> all = count;
+        all.push_back((hsize_t)n_kchunk);
+        if (!checked_buffer_bytes(count, 1, "phdf5 read_kchunk",
+                                  &per_k_elts, &ov_err) ||
+            !checked_buffer_bytes(all, sizeof(T), "phdf5 read_kchunk",
+                                  &bytes, &ov_err)) {
+            return fail_kchunk(ffi::ErrorCode::kInvalidArgument, ov_err);
+        }
+    }
+
+    // ``read_buf``: this handler returns ffi::Error, i.e. it runs to
+    // completion on the XLA thread, so it is a SYNCHRONOUS reader and must
+    // not share the writer thread's staging buffer (ctx.h OWNERSHIP).  The
+    // audit's item-4 note named only ReadImpl; this is its twin.
+    if (!ensure_read_buf(ctx, bytes)) {
         std::ostringstream os;
         os << "phdf5 read_kchunk: staging-buffer alloc of " << bytes << " bytes failed";
-        return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
+        return fail_kchunk(ffi::ErrorCode::kResourceExhausted, os.str());
     }
+    void* stage = ctx->read_buf;
     auto t_pin = now();
 
     hid_t native_type = dt::h5_native_type<T>();
     if (ds_id < 0 || H5Iis_valid(ds_id) <= 0) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-            "phdf5 read_kchunk: ds_id is invalid");
+        return fail_kchunk(ffi::ErrorCode::kInvalidArgument,
+                           "phdf5 read_kchunk: ds_id is invalid");
     }
 
     hid_t dxpl = ctx->use_collective_read ? ctx->dxpl_coll : ctx->dxpl_indep;
 
     hid_t filespace = H5Dget_space(ds_id);
     if (filespace < 0) {
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 read_kchunk: H5Dget_space failed");
+        return fail_kchunk(ffi::ErrorCode::kInternal,
+                           "phdf5 read_kchunk: H5Dget_space failed");
+    }
+    // The sibling of read_ffi's own dataset-rank check.  H5Sselect_hyperslab
+    // reads `file_rank` entries from ``offsets[k]`` and ``count``, both of
+    // which have exactly N_file; an (N_file+k)-D dataset therefore reads k
+    // entries past the end of two vectors, with the values landing in a file
+    // offset.  Rank-invariant: same dataset, same request, every rank.
+    {
+        std::string rank_err;
+        if (!check_dataset_rank(filespace, N_file, "phdf5 read_kchunk",
+                                nullptr, &rank_err)) {
+            H5Sclose(filespace);
+            return fail_kchunk(ffi::ErrorCode::kInvalidArgument, rank_err);
+        }
     }
     hid_t memspace = H5Screate_simple(N_file, count.data(), nullptr);
     if (memspace < 0) {
         H5Sclose(filespace);
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 read_kchunk: H5Screate_simple(memspace) failed");
+        return fail_kchunk(ffi::ErrorCode::kInternal,
+                           "phdf5 read_kchunk: H5Screate_simple(memspace) failed");
     }
     auto t_spaces = now();
 
@@ -490,10 +558,10 @@ static ffi::Error ReadKchunkImpl(
             H5Sclose(filespace);
             std::ostringstream os;
             os << "phdf5 read_kchunk: H5Sselect_hyperslab failed at k=" << k;
-            return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+            return fail_kchunk(ffi::ErrorCode::kInternal, os.str());
         }
         auto tb = now();
-        T* k_buf = static_cast<T*>(ctx->pinned_buf) + (size_t)k * per_k_elts;
+        T* k_buf = static_cast<T*>(stage) + (size_t)k * per_k_elts;
         herr_t st = H5Dread(ds_id, native_type, memspace, filespace, dxpl, k_buf);
         auto tc = now();
         t_select_total += ms(ta, tb);
@@ -503,7 +571,7 @@ static ffi::Error ReadKchunkImpl(
             H5Sclose(filespace);
             std::ostringstream os;
             os << "phdf5 read_kchunk: H5Dread failed at k=" << k;
-            return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+            return fail_kchunk(ffi::ErrorCode::kInternal, os.str());
         }
     }
     H5Sclose(memspace);
@@ -511,7 +579,7 @@ static ffi::Error ReadKchunkImpl(
     auto t_reads = now();
 
     FFI_RETURN_IF_ERROR(
-        stage_pinned_to_output(LRX_STREAM_ARG ctx, d_dst, bytes));
+        stage_host_to_output(LRX_STREAM_ARG ctx, stage, d_dst, bytes));
     auto t_h2d = now();
 
     if (do_time && ctx->rank == 0) {
@@ -539,14 +607,20 @@ static ffi::Error ReadKchunkDispatch(
     int64_t n_kchunk_attr)
 {
     auto* ctx = reinterpret_cast<PhdfCtx*>(ctx_handle);
+
+    auto fail = [ctx](ffi::ErrorCode code, const std::string& msg) {
+        announce_error(ctx, msg);
+        return ffi::Error(code, msg);
+    };
+
     if (!ctx) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "phdf5 read_kchunk: ctx_handle is null");
+        return fail(ffi::ErrorCode::kInvalidArgument,
+                    "phdf5 read_kchunk: ctx_handle is null");
     }
 
     const auto dims = A_out->dimensions();
     if (dims.size() < 2) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+        return fail(ffi::ErrorCode::kInvalidArgument,
             "phdf5 read_kchunk: output must have at least 2 dims "
             "(n_kchunk + file dims)");
     }
@@ -557,13 +631,13 @@ static ffi::Error ReadKchunkDispatch(
         std::ostringstream os;
         os << "phdf5 read_kchunk: dims[0]=" << n_kchunk
            << " != n_kchunk attr=" << n_kchunk_attr;
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+        return fail(ffi::ErrorCode::kInvalidArgument, os.str());
     }
     if (axis_count_per_dim.size() != N_file) {
         std::ostringstream os;
         os << "phdf5 read_kchunk: axis_count_per_dim.size="
            << axis_count_per_dim.size() << " != N_file=" << N_file;
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+        return fail(ffi::ErrorCode::kInvalidArgument, os.str());
     }
     const auto obd = offset_buf.dimensions();
     if (obd.size() != 2 || (int64_t)obd[0] != n_kchunk
@@ -573,7 +647,15 @@ static ffi::Error ReadKchunkDispatch(
            << "(" << n_kchunk << "," << N_file << "); got "
            << "(" << (obd.size() >= 1 ? obd[0] : -1)
            << "," << (obd.size() >= 2 ? obd[1] : -1) << ")";
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+        return fail(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    {
+        std::string enc_err;
+        if (!validate_shard_encoding(ctx, "phdf5 read_kchunk", mesh_shape,
+                                     axis_count_per_dim, axis_flat,
+                                     &enc_err)) {
+            return fail(ffi::ErrorCode::kInvalidArgument, enc_err);
+        }
     }
 
     // Bring the small offset buffer (n_kchunk × N_file × 8 bytes) to host.
@@ -582,8 +664,8 @@ static ffi::Error ReadKchunkDispatch(
         std::string cperr;
         if (!copy_index_to_host(offset_host.data(), offset_buf.untyped_data(),
                                 offset_host.size() * sizeof(int64_t), &cperr)) {
-            return ffi::Error(ffi::ErrorCode::kInternal,
-                              "phdf5 read_kchunk: copy(offset) failed: " + cperr);
+            return fail(ffi::ErrorCode::kInternal,
+                        "phdf5 read_kchunk: copy(offset) failed: " + cperr);
         }
     }
 
@@ -604,7 +686,7 @@ static ffi::Error ReadKchunkDispatch(
                     std::ostringstream os;
                     os << "phdf5 read_kchunk: bad axis " << ax
                        << " at dim " << d << " axis " << k;
-                    return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+                    return fail(ffi::ErrorCode::kInvalidArgument, os.str());
                 }
                 rc += coord[ax] * stride;
                 stride *= mesh_shape[ax];
@@ -634,7 +716,7 @@ static ffi::Error ReadKchunkDispatch(
                 std::ostringstream os;
                 os << "phdf5 read_kchunk: negative offset at k=" << k
                    << " d=" << d << " off=" << off_kd;
-                return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+                return fail(ffi::ErrorCode::kInvalidArgument, os.str());
             }
             offsets[(size_t)k][d] = (hsize_t)off_kd;
         }
@@ -669,7 +751,7 @@ static ffi::Error ReadKchunkDispatch(
         default: {
             std::ostringstream os;
             os << "phdf5 read_kchunk: unsupported dtype " << static_cast<int>(dtype);
-            return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+            return fail(ffi::ErrorCode::kInvalidArgument, os.str());
         }
     }
 }
@@ -709,7 +791,10 @@ static ffi::Error ReadKchunkDispatch(
 // scales we've measured so far it's a small perf delta.  See
 // ``common/phdf5_async_overlap_bench.py`` for the measurement.
 //
-// Single-buffer (``ctx->pinned_buf``) reuse is safe because:
+// This is the ONE user of ``ctx->pinned_buf`` on the host build (ctx.h
+// OWNERSHIP): the synchronous readers stage through ``ctx->read_buf``, so
+// nothing on another thread can be inside this buffer here.  Its reuse
+// across tasks is safe because:
 //   1. Tasks run strictly sequentially on the writer thread.
 //   2. The task *starts* by ``cudaEventSynchronize(h2d_event)`` which
 //      blocks until the PREVIOUS task's async H2D has drained — so the
@@ -740,6 +825,15 @@ static void async_read_kchunk_union_worker(
     };
     auto t0 = now();
 
+    // Announce before setting the Promise: this task runs after the caller
+    // has returned, so an error here reaches Python only if the process
+    // survives to report it, and the failure mode under test is that it does
+    // not (shard_index.h announce_error).
+    auto fail_task = [&](ffi::ErrorCode code, const std::string& msg) {
+        announce_error(ctx, msg);
+        promise.SetError(ffi::Error(code, msg));
+    };
+
     // Block until the previous task's async H2D has finished reading
     // from ``pinned_buf`` — guards the pinned-buffer reuse.  On the host
     // build the staging tail is a synchronous std::memcpy that fully
@@ -750,15 +844,38 @@ static void async_read_kchunk_union_worker(
 #endif
     auto t_prev_h2d_done = now();
 
-    size_t per_k_elts = 1;
-    for (auto c : per_rank_max_shape) per_k_elts *= (size_t)c;
-    const size_t total_elts = per_k_elts * (size_t)n_kchunk;
-    const size_t bytes = total_elts * element_size;
+    if (n_kchunk <= 0 || N_file <= 0) {
+        fail_task(ffi::ErrorCode::kInvalidArgument,
+                  "phdf5 read_kchunk_union: n_kchunk and N_file must be >= 1");
+        return;
+    }
+    if (ds_id < 0 || H5Iis_valid(ds_id) <= 0) {
+        // ``ReadImpl`` and ``ReadKchunkImpl`` have always checked this; the
+        // union path did not, and H5Dget_space on a stale hid_t is where a
+        // closed-then-reused handle turns into an HDF5 error stack instead of
+        // a sentence.
+        fail_task(ffi::ErrorCode::kInvalidArgument,
+                  "phdf5 read_kchunk_union: ds_id is invalid");
+        return;
+    }
+
+    size_t bytes = 0;
+    {
+        std::string ov_err;
+        std::vector<hsize_t> all = per_rank_max_shape;
+        all.push_back((hsize_t)n_kchunk);
+        if (!checked_buffer_bytes(all, element_size,
+                                  "phdf5 read_kchunk_union", &bytes,
+                                  &ov_err)) {
+            fail_task(ffi::ErrorCode::kInvalidArgument, ov_err);
+            return;
+        }
+    }
 
     if (!ensure_pinned(ctx, bytes)) {
         std::ostringstream os;
         os << "phdf5 read_kchunk_union: staging-buffer alloc of " << bytes << " bytes failed";
-        promise.SetError(ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str()));
+        fail_task(ffi::ErrorCode::kResourceExhausted, os.str());
         return;
     }
     // Zero the pinned buffer so padding cells stay at exact zero.
@@ -780,16 +897,30 @@ static void async_read_kchunk_union_worker(
     }
     hid_t memspace = H5Screate_simple(N_out, mem_shape.data(), nullptr);
     if (memspace < 0) {
-        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
-            "phdf5 read_kchunk_union: H5Screate_simple(memspace) failed"));
+        fail_task(ffi::ErrorCode::kInternal,
+            "phdf5 read_kchunk_union: H5Screate_simple(memspace) failed");
         return;
     }
     hid_t filespace = H5Dget_space(ds_id);
     if (filespace < 0) {
         H5Sclose(memspace);
-        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
-            "phdf5 read_kchunk_union: H5Dget_space failed"));
+        fail_task(ffi::ErrorCode::kInternal,
+            "phdf5 read_kchunk_union: H5Dget_space failed");
         return;
+    }
+    // Third sibling of read_ffi's dataset-rank check: the per-k
+    // ``file_offsets[k]`` / ``file_counts[k]`` vectors have exactly N_file
+    // entries and H5Sselect_hyperslab reads `file_rank` of them.
+    {
+        std::string rank_err;
+        if (!check_dataset_rank(filespace, N_file,
+                                "phdf5 read_kchunk_union", nullptr,
+                                &rank_err)) {
+            H5Sclose(memspace);
+            H5Sclose(filespace);
+            fail_task(ffi::ErrorCode::kInvalidArgument, rank_err);
+            return;
+        }
     }
     H5Sselect_none(filespace);
     H5Sselect_none(memspace);
@@ -805,7 +936,7 @@ static void async_read_kchunk_union_worker(
             std::ostringstream os;
             os << "phdf5 read_kchunk_union: file H5Sselect_hyperslab(OR) "
                << "failed at k=" << k;
-            promise.SetError(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
+            fail_task(ffi::ErrorCode::kInternal, os.str());
             return;
         }
         int fi = 0;
@@ -825,7 +956,7 @@ static void async_read_kchunk_union_worker(
             std::ostringstream os;
             os << "phdf5 read_kchunk_union: mem H5Sselect_hyperslab(OR) "
                << "failed at k=" << k;
-            promise.SetError(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
+            fail_task(ffi::ErrorCode::kInternal, os.str());
             return;
         }
     }
@@ -839,7 +970,7 @@ static void async_read_kchunk_union_worker(
         os << "phdf5 read_kchunk_union: selection size mismatch — "
            << "filespace=" << npts_file << " memspace=" << npts_mem
            << " (overlapping per-k slabs?)";
-        promise.SetError(ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str()));
+        fail_task(ffi::ErrorCode::kInvalidArgument, os.str());
         return;
     }
 
@@ -849,8 +980,8 @@ static void async_read_kchunk_union_worker(
     H5Sclose(memspace);
     H5Sclose(filespace);
     if (st < 0) {
-        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
-                                     "phdf5 read_kchunk_union: H5Dread failed"));
+        fail_task(ffi::ErrorCode::kInternal,
+                  "phdf5 read_kchunk_union: H5Dread failed");
         return;
     }
 
@@ -869,9 +1000,9 @@ static void async_read_kchunk_union_worker(
     cudaError_t ce = cudaMemcpyAsync(
         d_dst, ctx->pinned_buf, bytes, cudaMemcpyHostToDevice, ctx->stream);
     if (ce != cudaSuccess) {
-        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
+        fail_task(ffi::ErrorCode::kInternal,
             std::string("phdf5 read_kchunk_union: cudaMemcpyAsync: ") +
-            cudaGetErrorString(ce)));
+            cudaGetErrorString(ce));
         return;
     }
     cudaEventRecord(ctx->h2d_event, ctx->stream);
@@ -910,46 +1041,56 @@ static ffi::Future ReadKchunkUnionDispatch(
     int64_t n_kchunk_attr,
     int64_t kchunk_axis_attr)  // position of the n_kchunk axis in A_out
 {
-    auto fail = [](ffi::Error err) {
+    auto* ctx = reinterpret_cast<PhdfCtx*>(ctx_handle);
+
+    auto fail = [ctx](ffi::ErrorCode code, const std::string& msg) {
+        announce_error(ctx, msg);
         ffi::Promise p;
         ffi::Future f(p);
-        p.SetError(std::move(err));
+        p.SetError(ffi::Error(code, msg));
         return f;
     };
 
-    auto* ctx = reinterpret_cast<PhdfCtx*>(ctx_handle);
     if (!ctx) {
-        return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                               "phdf5 read_kchunk_union: ctx_handle is null"));
+        return fail(ffi::ErrorCode::kInvalidArgument,
+                    "phdf5 read_kchunk_union: ctx_handle is null");
     }
 
     const auto dims = A_out->dimensions();
     if (dims.size() < 2) {
-        return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument,
-            "phdf5 read_kchunk_union: output must have >= 2 dims"));
+        return fail(ffi::ErrorCode::kInvalidArgument,
+            "phdf5 read_kchunk_union: output must have >= 2 dims");
     }
     const size_t N_out = dims.size();
     const size_t N_file = N_out - 1;
     if (kchunk_axis_attr < 0 || (size_t)kchunk_axis_attr >= N_out) {
-        return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument,
-            "phdf5 read_kchunk_union: kchunk_axis out of range"));
+        return fail(ffi::ErrorCode::kInvalidArgument,
+            "phdf5 read_kchunk_union: kchunk_axis out of range");
     }
     const int kax = (int)kchunk_axis_attr;
     const int64_t n_kchunk = (int64_t)dims[kax];
     if (n_kchunk != n_kchunk_attr) {
-        return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument,
-            "phdf5 read_kchunk_union: dims[kchunk_axis] mismatch vs n_kchunk attr"));
+        return fail(ffi::ErrorCode::kInvalidArgument,
+            "phdf5 read_kchunk_union: dims[kchunk_axis] mismatch vs n_kchunk attr");
     }
     if (axis_count_per_dim.size() != N_file) {
-        return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument,
-            "phdf5 read_kchunk_union: axis_count_per_dim / N_file mismatch"));
+        return fail(ffi::ErrorCode::kInvalidArgument,
+            "phdf5 read_kchunk_union: axis_count_per_dim / N_file mismatch");
     }
     const auto obd = offset_buf.dimensions();
     const auto cbd = count_buf.dimensions();
     if (obd.size() != 2 || (int64_t)obd[0] != n_kchunk || (size_t)obd[1] != N_file
         || cbd.size() != 2 || (int64_t)cbd[0] != n_kchunk || (size_t)cbd[1] != N_file) {
-        return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument,
-            "phdf5 read_kchunk_union: offset_buf / count_buf shape mismatch"));
+        return fail(ffi::ErrorCode::kInvalidArgument,
+            "phdf5 read_kchunk_union: offset_buf / count_buf shape mismatch");
+    }
+    {
+        std::string enc_err;
+        if (!validate_shard_encoding(ctx, "phdf5 read_kchunk_union",
+                                     mesh_shape, axis_count_per_dim,
+                                     axis_flat, &enc_err)) {
+            return fail(ffi::ErrorCode::kInvalidArgument, enc_err);
+        }
     }
 
     // Bring both small index buffers to host (D2H on CUDA; already host-
@@ -960,13 +1101,13 @@ static ffi::Future ReadKchunkUnionDispatch(
         std::string cperr;
         if (!copy_index_to_host(off_host.data(), offset_buf.untyped_data(),
                                 off_host.size() * sizeof(int64_t), &cperr)) {
-            return fail(ffi::Error(ffi::ErrorCode::kInternal,
-                "phdf5 read_kchunk_union: copy(offset): " + cperr));
+            return fail(ffi::ErrorCode::kInternal,
+                "phdf5 read_kchunk_union: copy(offset): " + cperr);
         }
         if (!copy_index_to_host(cnt_host.data(), count_buf.untyped_data(),
                                 cnt_host.size() * sizeof(int64_t), &cperr)) {
-            return fail(ffi::Error(ffi::ErrorCode::kInternal,
-                "phdf5 read_kchunk_union: copy(count): " + cperr));
+            return fail(ffi::ErrorCode::kInternal,
+                "phdf5 read_kchunk_union: copy(count): " + cperr);
         }
     }
 
@@ -984,8 +1125,8 @@ static ffi::Future ReadKchunkUnionDispatch(
             for (int64_t k = na - 1; k >= 0; --k) {
                 int64_t ax = axis_flat[flat_idx + k];
                 if (ax < 0 || (size_t)ax >= mesh_shape.size()) {
-                    return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                        "phdf5 read_kchunk_union: bad axis"));
+                    return fail(ffi::ErrorCode::kInvalidArgument,
+                        "phdf5 read_kchunk_union: bad axis");
                 }
                 rc += coord[ax] * stride;
                 stride *= mesh_shape[ax];
@@ -1020,7 +1161,7 @@ static ffi::Future ReadKchunkUnionDispatch(
                 os << "phdf5 read_kchunk_union: bad (off,cnt) at k=" << k
                    << " d=" << d << " off=" << off << " cnt=" << cnt
                    << " max=" << per_rank_max[d];
-                return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str()));
+                return fail(ffi::ErrorCode::kInvalidArgument, os.str());
             }
             offsets[(size_t)k][d] = (hsize_t)off;
             counts[(size_t)k][d] = (hsize_t)cnt;
@@ -1046,8 +1187,8 @@ static ffi::Future ReadKchunkUnionDispatch(
         case ffi::DataType::C128: element_size = sizeof(std::complex<double>);
                                    native_type = dt::h5_native_type<std::complex<double>>(); break;
         default:
-            return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                "phdf5 read_kchunk_union: unsupported dtype"));
+            return fail(ffi::ErrorCode::kInvalidArgument,
+                "phdf5 read_kchunk_union: unsupported dtype");
     }
 
     // Async handoff: Promise/Future pair; task lambda runs the H5Dread
