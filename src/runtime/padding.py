@@ -207,8 +207,9 @@ def pad_last_axis_to(A, divisor):
 def mesh_divisor(mesh_or_int) -> int:
     """``∏ p_a`` for a Mesh, or the int itself.
 
-    The band pad and the μ pad both need the worst-case shard divisor and
-    both were deriving it inline.  One spelling.
+    The worst-case shard divisor, for a pad that must be safe under ANY
+    spec.  When the spec is known, prefer :func:`spec_divisor` — a pad to
+    ``∏ p_a`` where the axis is only sharded over ``'x'`` wastes bands.
     """
     if isinstance(mesh_or_int, int):
         return int(mesh_or_int)
@@ -223,6 +224,41 @@ def mesh_divisor(mesh_or_int) -> int:
             f"got {type(mesh_or_int)!r}") from exc
 
 
+def spec_divisor(mesh, spec, axis: int) -> int:
+    """The divisor ``axis`` of an array under ``spec`` must satisfy.
+
+    ``∏`` of the mesh-axis sizes that ``spec`` places on array axis
+    ``axis``; 1 when that entry is ``None`` (replicated).
+
+    THE spelling for "how much must this axis be padded by", derived from
+    the SPEC rather than assumed.  It matters that this is not
+    :func:`mesh_divisor`: a band axis sharded ``P(None,'x',...)`` on an
+    8×8 mesh needs a multiple of 8, not 64, and padding to 64 would
+    allocate 8× the pad bands for nothing.
+
+    Single-sourced because two subsystems derive it and must agree, or
+    ψ produced by one is refused by the other:
+
+    * ``file_io.wfn_loader._default_sharding`` — allocates ψ at
+      ``(n_k, round_up(nb, p_band), nspinor, ngkmax)`` so the array is
+      born divisible.
+    * ``common.mtxel_sweep.SweepGeometry`` — consumes that ψ.
+
+    Both default to ``P(None, ('x','y'), None, None)``, so both get
+    ``px·py`` and the loader's ψ needs no further padding.  That
+    agreement is the reason the sweep's own band pad is a no-op in
+    production, and it is only guaranteed while both call THIS.
+    """
+    entry = tuple(spec)[axis] if axis < len(tuple(spec)) else None
+    if entry is None:
+        return 1
+    names = (entry,) if isinstance(entry, str) else tuple(entry)
+    prod = 1
+    for a in names:
+        prod *= int(mesh.shape[a])
+    return int(prod)
+
+
 __all__ = [
     "round_up",
     "extra_mu_pad",
@@ -231,4 +267,5 @@ __all__ = [
     "pad_axis_to",
     "pad_last_axis_to",
     "mesh_divisor",
+    "spec_divisor",
 ]

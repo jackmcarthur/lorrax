@@ -688,18 +688,12 @@ class WfnLoader:
         if self._mesh is None:
             return None, 1                       # replicated even with explicit spec
         named = NamedSharding(self._mesh, sharding)
-        # Compute band-axis pad factor from the spec's band-dim entry.
-        spec = list(sharding)
-        band_axes = spec[1] if len(spec) > 1 else None
-        if band_axes is None:
-            p_band = 1
-        elif isinstance(band_axes, str):
-            p_band = int(self._mesh.shape[band_axes])
-        else:
-            p_band = 1
-            for a in band_axes:
-                p_band *= int(self._mesh.shape[a])
-        return named, int(p_band)
+        # Band-axis pad factor, derived from the spec by the SHARED helper.
+        # ``common.mtxel_sweep`` derives its own with the same call, so the
+        # sweep can consume this loader's psi without re-padding; a second
+        # local copy of this arithmetic is how the two would silently drift.
+        from runtime.padding import spec_divisor
+        return named, spec_divisor(self._mesh, sharding, 1)
 
     # ------------------------------------------------------------------
     # Shared sharded-read scaffolding (used by the phdf5 paths AND the

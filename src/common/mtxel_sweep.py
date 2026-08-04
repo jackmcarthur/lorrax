@@ -150,7 +150,7 @@ class SweepGeometry:
 
     def __init__(self, *, mesh: Mesh, fft_grid: Sequence[int], ngkmax: int,
                  nb: int, ns: int, nk: int, cell_volume: float):
-        from runtime.padding import round_up, mesh_divisor
+        from runtime.padding import round_up, spec_divisor
 
         self.mesh = mesh
         self.fft_grid = tuple(int(s) for s in fft_grid)
@@ -160,16 +160,19 @@ class SweepGeometry:
         self.cell_volume = float(cell_volume)
         self.ngrid = int(np.prod(self.fft_grid))
 
-        # ``nb`` is the LOGICAL band count the caller has.  The band axis is
-        # sharded over the whole mesh, so it must divide ∏ p_a; the pad is
-        # computed here and applied by the sweep, and the caller never states
-        # it.  Same routine and same zero-band argument as the ψ loader's
-        # ``wfn_transforms.gflat_to_rmu`` — ``runtime.padding.pad_axis_to``.
+        # ``nb`` is the LOGICAL band count.  The divisor is derived FROM THE
+        # SPEC by the shared ``spec_divisor``, not assumed to be ∏ p_a — the
+        # same call ``file_io.wfn_loader._default_sharding`` makes for its own
+        # ``p_band``.  Both default to ``P(None, ('x','y'), None, None)``, so
+        # both get px·py and ψ FROM THE LOADER IS ALREADY BAND-PADDED FOR
+        # THIS SWEEP: the pad below is a no-op on the production path and
+        # exists for callers that build ψ themselves.  That agreement holds
+        # only while both derive it here.
         #
-        # This is not a nicety at production shapes: nb=600 on an 8×8 mesh is
+        # Not a nicety at production shapes: nb=600 on an 8×8 mesh is
         # 64·9.375, and JAX raises IndivisibleError when the sharded array is
-        # constructed rather than degrading (job 7888869).
-        self.p_prod = mesh_divisor(mesh)
+        # CONSTRUCTED rather than degrading (job 7888869).
+        self.p_prod = spec_divisor(mesh, self.spec_sphere_xy, 1)
         self.nb_logical = int(nb)
         self.nb = round_up(int(nb), self.p_prod)
 
