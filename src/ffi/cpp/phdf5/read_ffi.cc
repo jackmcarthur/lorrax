@@ -98,6 +98,19 @@ static std::vector<int64_t> unravel_rank(
 }
 
 template <typename T>
+static std::string vec_to_string(const std::vector<T>& v)
+{
+    std::ostringstream os;
+    os << "[";
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i) os << ",";
+        os << v[i];
+    }
+    os << "]";
+    return os.str();
+}
+
+template <typename T>
 static ffi::Error ReadImpl(
     LRX_STREAM_PARAM
     PhdfCtx* ctx,
@@ -105,6 +118,8 @@ static ffi::Error ReadImpl(
     const std::vector<hsize_t>& offset,
     const std::vector<hsize_t>& file_count,
     const std::vector<hsize_t>& mem_dims,
+    const std::vector<int64_t>& offset_base,   // SAME on every rank
+    const std::vector<int64_t>& valid_shape,   // SAME on every rank
     hid_t ds_id)
 {
     const int rank = (int)offset.size();
@@ -131,11 +146,79 @@ static ffi::Error ReadImpl(
         return ffi::Error(ffi::ErrorCode::kInternal,
                           "phdf5 read: H5Dget_space failed");
     }
+    // Rank agreement, checked BEFORE H5Sget_simple_extent_dims below writes
+    // file_rank entries into an rank-sized buffer.  write_ffi.cc has always
+    // had this guard; the read path did not, and reading an N-D request
+    // against an (N+k)-D dataset would have overrun the extent vector.
+    // Rank-invariant (the dataset and the request are the same on every
+    // rank), so it refuses everywhere or nowhere.
+    {
+        int file_rank = H5Sget_simple_extent_ndims(filespace);
+        if (file_rank != rank) {
+            std::ostringstream os;
+            os << "phdf5 read: dataset rank mismatch file_rank=" << file_rank
+               << " read_rank=" << rank;
+            H5Sclose(filespace);
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+        }
+    }
     hid_t memspace = H5Screate_simple(rank, mem_dims.data(), nullptr);
     if (memspace < 0) {
         H5Sclose(filespace);
         return ffi::Error(ffi::ErrorCode::kInternal,
                           "phdf5 read: H5Screate_simple(memspace) failed");
+    }
+    // ── Emptiness is PER-RANK; the bounds test is RANK-INVARIANT. ──
+    //
+    // `empty_selection` picks this rank's selection.  A rank whose local
+    // block lies wholly in the mu padding gets file_count == 0 from the
+    // shard loop, selects nothing, and still enters the collective H5Dread
+    // its peers are inside; its output stays at the memset zeros.  That is
+    // the read-side twin of the write path's empty rendezvous and it must
+    // never be bounds-tested (write_ffi.cc, commit d935ce7).
+    //
+    // Until now this handler took NO bounds test at all, which made
+    // H5Sselect_hyperslab the de-facto one -- and that fires only on ranks
+    // with a non-empty selection.  So a caller whose logical slab overran
+    // the dataset while some ranks were wholly padding refused on a PROPER
+    // SUBSET: the empty ranks entered the collective H5Dread alone and
+    // stranded the communicator.  offset_base and valid_shape are
+    // replicated control vectors, identical on every rank, and max over
+    // ranks of (offset[d] + file_count[d]) is exactly offset_base[d] +
+    // valid_shape[d] -- so testing THOSE reaches the same verdict on every
+    // rank, before anyone enters the collective.  A globally empty request
+    // (valid_shape[d] == 0 anywhere) is not bounds-tested, same doctrine.
+    std::vector<hsize_t> extent((size_t)rank, 0);
+    if (H5Sget_simple_extent_dims(filespace, extent.data(), nullptr) < 0) {
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+        return ffi::Error(ffi::ErrorCode::kInternal,
+                          "phdf5 read: H5Sget_simple_extent_dims failed");
+    }
+    bool globally_empty = false;
+    for (int d = 0; d < rank; ++d) {
+        if (valid_shape[(size_t)d] == 0) { globally_empty = true; break; }
+    }
+    if (!globally_empty) {
+        bool out_of_bounds = false;
+        for (int d = 0; d < rank; ++d) {
+            if ((hsize_t)(offset_base[(size_t)d] + valid_shape[(size_t)d])
+                    > extent[(size_t)d]) {
+                out_of_bounds = true;
+            }
+        }
+        if (out_of_bounds) {
+            std::ostringstream os;
+            os << "phdf5 read: logical slab out of bounds"
+               << " extent=" << vec_to_string(extent)
+               << " offset_base=" << vec_to_string(offset_base)
+               << " valid_shape=" << vec_to_string(valid_shape)
+               << " rank=" << ctx->rank
+               << " -- refused identically on every rank";
+            H5Sclose(memspace);
+            H5Sclose(filespace);
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+        }
     }
     bool empty_selection = false;
     for (auto c : file_count) {
@@ -281,27 +364,33 @@ static ffi::Error ReadDispatch(
         case ffi::DataType::F32:
             return ReadImpl<float>(LRX_STREAM_ARG ctx,
                 static_cast<float*>(A_out->untyped_data()),
-                offset, file_count, mem_dims, (hid_t)ds_id);
+                offset, file_count, mem_dims,
+                offset_host, valid_shape_host, (hid_t)ds_id);
         case ffi::DataType::F64:
             return ReadImpl<double>(LRX_STREAM_ARG ctx,
                 static_cast<double*>(A_out->untyped_data()),
-                offset, file_count, mem_dims, (hid_t)ds_id);
+                offset, file_count, mem_dims,
+                offset_host, valid_shape_host, (hid_t)ds_id);
         case ffi::DataType::S32:
             return ReadImpl<int32_t>(LRX_STREAM_ARG ctx,
                 static_cast<int32_t*>(A_out->untyped_data()),
-                offset, file_count, mem_dims, (hid_t)ds_id);
+                offset, file_count, mem_dims,
+                offset_host, valid_shape_host, (hid_t)ds_id);
         case ffi::DataType::S64:
             return ReadImpl<int64_t>(LRX_STREAM_ARG ctx,
                 static_cast<int64_t*>(A_out->untyped_data()),
-                offset, file_count, mem_dims, (hid_t)ds_id);
+                offset, file_count, mem_dims,
+                offset_host, valid_shape_host, (hid_t)ds_id);
         case ffi::DataType::C64:
             return ReadImpl<std::complex<float>>(LRX_STREAM_ARG ctx,
                 static_cast<std::complex<float>*>(A_out->untyped_data()),
-                offset, file_count, mem_dims, (hid_t)ds_id);
+                offset, file_count, mem_dims,
+                offset_host, valid_shape_host, (hid_t)ds_id);
         case ffi::DataType::C128:
             return ReadImpl<std::complex<double>>(LRX_STREAM_ARG ctx,
                 static_cast<std::complex<double>*>(A_out->untyped_data()),
-                offset, file_count, mem_dims, (hid_t)ds_id);
+                offset, file_count, mem_dims,
+                offset_host, valid_shape_host, (hid_t)ds_id);
         default: {
             std::ostringstream os;
             os << "phdf5 read: unsupported dtype " << static_cast<int>(dtype);

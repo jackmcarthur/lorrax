@@ -582,6 +582,22 @@ class _MpiHostBackend:
             tuple(read_shape), sharding, [local_arr],
         )
         if as_numpy:
+            # ``host_local`` is this rank's BLOCK, not the slab.  Returning
+            # it for a sharded request would hand the caller 1/P of the
+            # data typed as the whole thing — the allgather backend's
+            # ``as_numpy`` returns the full replicated slab, so the two
+            # backends would silently disagree on what they returned.
+            # (Unreachable through ``SlabIO.read_slab``, which does not
+            # forward ``as_numpy`` on the phdf5 paths and converts the
+            # returned array itself; reachable by using this backend
+            # directly, which the tests do.)
+            if any(s is not None for s in partition_spec):
+                raise ValueError(
+                    f"_MpiHostBackend.read_slab({name!r}): as_numpy=True is "
+                    f"only defined for a replicated request; got "
+                    f"partition_spec={partition_spec!r}, whose per-rank "
+                    f"block is 1/P of the slab.  Drop as_numpy and convert "
+                    f"the sharded jax.Array, or ask for P().")
             return np.asarray(host_local)
         return result
 
@@ -591,14 +607,33 @@ class _MpiHostBackend:
         # create_dataset (it's collective under parallel HDF5); we
         # broadcast the rank-0 value to all ranks so every rank writes
         # the same bytes.
-        if self._deferred_attrs:
-            for ds_name, value in self._deferred_attrs:
-                arr = np.asarray(value) if _rank0() else None
-                arr = self._comm.bcast(arr, root=0)
-                # Default: top-level dataset.  Could extend to
-                # "dset:attr" form if a caller ever needs per-dataset
-                # attrs deferred; today no caller does.
-                if ds_name not in self._fh:
-                    self._fh.create_dataset(ds_name, data=arr)
+        #
+        # The loop body is TWO collectives per attr (``comm.bcast`` and a
+        # collective ``create_dataset``), so its trip count must be the
+        # same on every rank or close() deadlocks.  ``_deferred_attrs`` is
+        # a per-rank Python list built by per-rank ``write_attr`` calls;
+        # every call site in the tree is SPMD today, but that is a property
+        # of the callers, not of this method.  Agree the count first — one
+        # unconditional allgather of a small int, on every rank — so a
+        # divergence becomes a NAMED refusal on every rank instead of a
+        # hang with no message (the failure mode that costs runs: stderr
+        # is lost under srun+apptainer at teardown).
+        names = [n for n, _ in self._deferred_attrs]
+        all_names = self._comm.allgather(names)
+        if any(n != names for n in all_names):
+            raise RuntimeError(
+                f"SlabIO(phdf5_host).close: deferred write_attr lists differ "
+                f"across ranks — rank {self._comm.Get_rank()} has {names!r}, "
+                f"rank 0 has {all_names[0]!r}.  The flush loop below is "
+                f"collective, so a divergent list would deadlock every rank. "
+                f"write_attr must be called identically on all ranks.")
+        for ds_name, value in self._deferred_attrs:
+            arr = np.asarray(value) if _rank0() else None
+            arr = self._comm.bcast(arr, root=0)
+            # Default: top-level dataset.  Could extend to
+            # "dset:attr" form if a caller ever needs per-dataset
+            # attrs deferred; today no caller does.
+            if ds_name not in self._fh:
+                self._fh.create_dataset(ds_name, data=arr)
         # All ranks close — collective MPI-IO H5Fclose.
         self._fh.close()

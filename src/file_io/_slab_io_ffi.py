@@ -726,6 +726,29 @@ class _FfiBackend:
         # the public SlabIO.read_slab handles the numpy conversion.
     ) -> jax.Array:
         mesh = mesh or self.mesh
+        # Drain queued writes BEFORE anything in this method touches the
+        # file.  Three distinct hazards, all of them silent:
+        #
+        #  1. Read-after-write ordering.  ``write_slab`` only ENQUEUES; a
+        #     read issued before the queue drains sees the pre-write bytes
+        #     with no error anywhere.
+        #  2. ``ctx->pinned_buf`` is one buffer shared by the writer thread
+        #     and this read.  ``ReadImpl`` runs SYNCHRONOUSLY on the XLA
+        #     thread and starts with ensure_pinned + memset; on the CUDA
+        #     build that is the very buffer an in-flight H5Dwrite is reading
+        #     from, and ensure_pinned may free and realloc it underneath.
+        #  3. Two threads inside HDF5/MPI-IO on one file handle.  This is
+        #     the hazard ``create_dataset`` and ``_ds_id`` already drain for
+        #     ("MPI's datatype-cache state on the file handle interleaves"),
+        #     and worse for a collective transfer: rank A doing read-then-
+        #     write while rank B does write-then-read mismatches the
+        #     MPI-IO collective order and hangs.
+        #
+        # ``_ds_id`` drains too, but only on the first sight of a dataset
+        # name — a read of an ALREADY-cached dataset skipped every drain in
+        # the method, and ``_introspect_dataset`` (serial h5py on the same
+        # path) ran before even that.  One unconditional drain at the top.
+        self._drain_pending()
         if shape is None or dtype is None:
             # Symmetry with the allgather backend: callers that don't
             # need padding shouldn't have to compute shape themselves.
@@ -835,20 +858,30 @@ class _FfiBackend:
         # Now that MPI-IO has released the file, rank 0 can safely
         # reopen with h5py to tack on any deferred small-metadata
         # datasets (omega_ev and friends).
-        if self._deferred_attrs:
+        #
+        # The rank-0 h5py block is gated on ``self._deferred_attrs``; the
+        # BARRIER is not, and must not be.  ``_deferred_attrs`` is a
+        # per-rank Python list, so gating a collective on it makes the
+        # number of barriers a rank executes depend on that rank's own
+        # control flow — the deadlock shape this audit is looking for.
+        # Today every ``write_attr`` call site is SPMD so the list is the
+        # same everywhere, but that is a property of the callers, not of
+        # this method, and it is not checkable here.  An unconditional
+        # barrier costs one rendezvous per file close and removes the
+        # question.
+        if self._deferred_attrs and jax.process_index() == 0:
             import h5py
             import numpy as np
-            if jax.process_index() == 0:
-                with h5py.File(self.path, "a") as h5:
-                    for name, value in self._deferred_attrs:
-                        if name in h5:
-                            del h5[name]
-                        host = value
-                        if not isinstance(host, np.ndarray):
-                            host = np.asarray(jax.device_get(host))
-                        h5.create_dataset(name, data=host)
-            # Same barrier, same reason as the write-ordering ones above:
-            # rank 0 has just rewritten datasets in this file with serial
-            # h5py, and no other rank may reopen it until that is durable.
-            _barrier("slab_io_ffi_close_attrs")
-            self._deferred_attrs = []
+            with h5py.File(self.path, "a") as h5:
+                for name, value in self._deferred_attrs:
+                    if name in h5:
+                        del h5[name]
+                    host = value
+                    if not isinstance(host, np.ndarray):
+                        host = np.asarray(jax.device_get(host))
+                    h5.create_dataset(name, data=host)
+        # Same reason as the write-ordering barriers above: rank 0 may
+        # have just rewritten datasets in this file with serial h5py, and
+        # no other rank may reopen it until that is durable.
+        _barrier("slab_io_ffi_close_attrs")
+        self._deferred_attrs = []
