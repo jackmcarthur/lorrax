@@ -97,14 +97,20 @@ The two cases added when padding became implicit (decisions.md 2026-08-04)
               sites used to compute by hand — if it ever fails, the sweep
               that deleted those arguments changed physics.
     nodiv     mu = P+1 requested WITHOUT rounding it up: a shape that does
-              not divide the mesh under ``P(None,('x','y'),None)``.  Before
-              the ruling this refused ("dimension 1 size N is not divisible
-              by mesh axes"), which is what forced every consumer to
-              compute ``n_rmu_padded`` for itself.  SlabIO now reads the
-              rounded-up extent and trims; the result must equal the
-              logical reference exactly.  The case also REPORTS whether
-              JAX will build a non-divisibly-sharded array at all, which
-              is what decides whether the write-side pad is reachable.
+              not divide the mesh under ``P(None,('x','y'),None)``.  The
+              question the ruling raised is whether SlabIO should PAD such
+              a request internally.  MEASURED (job 7888644, jax 0.9.1): it
+              cannot help — ``device_put`` of that (shape, spec) pair
+              raises ``IndivisibleError``, so the array the caller asked
+              for cannot exist, and reading a rounded-up extent then
+              trimming would only replace SlabIO's message with JAX's at
+              the same refusal.  The case therefore asserts BOTH: that JAX
+              refuses the array, and that ``read_slab`` refuses first, by
+              name, on EVERY rank (it is a pure check on replicated
+              inputs, so no collective is entered).  This is also what
+              settles the audit's item 5: the phdf5_host backend's absent
+              divisibility check is not a capability difference, because
+              the case it would accept cannot be expressed.
 """
 import os
 import sys
@@ -302,55 +308,55 @@ def main():
         io.write_slab("zeta_like", A)
     jax.experimental.multihost_utils.sync_global_devices("padrank_written")
 
-    # ---- nodiv: ask for the LOGICAL mu extent, which does not divide the
-    # mesh.  Before the ruling this refused and the caller had to round up
-    # for itself; SlabIO now reads the rounded-up extent and trims.
+    # ---- nodiv: ask for the LOGICAL mu extent under a spec that cannot
+    # shard it.  Two assertions, in order: JAX cannot build the array, and
+    # SlabIO refuses first and by name on every rank.
     if CASE == "nodiv":
-        assert mu % world, f"case nodiv needs mu={mu} indivisible by {world}"
-        # Does JAX even build a non-divisibly-sharded array?  That decides
-        # whether the WRITE-side divisibility pad is reachable at all.
-        uneven_ok = True
+        if mu % world == 0:
+            p0(f"[padrank-gate] REFUSING: mu={mu} divides world={world}, so "
+               f"case nodiv would gate nothing at this world size.")
+            return 2
+
+        # (1) Can JAX build a non-divisibly-sharded array at all?  This is
+        # the measurement that decides whether an internal pad could ever
+        # have helped.
         try:
             _probe = jax.device_put(
                 jnp.zeros((N_Q, mu, N_G), dtype=jnp.complex128),
                 NamedSharding(mesh, P(None, ('x', 'y'), None)))
             _probe.block_until_ready()
-            jax_uneven = (f"YES (jax {jax.__version__}, local block "
-                          f"{_probe.addressable_shards[0].data.shape})")
+            jax_verdict = (f"BUILT (jax {jax.__version__}, local block "
+                           f"{_probe.addressable_shards[0].data.shape})")
         except Exception as exc:                              # noqa: BLE001
-            uneven_ok = False
-            jax_uneven = (f"NO (jax {jax.__version__}: "
-                          f"{type(exc).__name__}: {str(exc)[:90]})")
-        p0(f"[padrank-gate] JAX builds a non-divisibly-sharded array: "
-           f"{jax_uneven}")
-        if not uneven_ok:
-            # Then no SlabIO backend can RETURN one either: the limit is
-            # JAX's array model, not SlabIO's contract.  Report the
-            # measurement rather than assert a verdict it cannot reach.
-            p0("[padrank-gate] VERDICT case=nodiv: NOT APPLICABLE — a "
-               "non-divisibly-sharded jax.Array cannot be constructed on "
-               "this JAX, so read_slab cannot be asked to return one.")
-            sys.stdout.flush()
-            return 0
-        sys.stdout.flush()
+            jax_verdict = (f"REFUSED (jax {jax.__version__}: "
+                           f"{type(exc).__name__}: {str(exc)[:110]})")
+        print(f"[padrank-gate rank={rank}] jax.device_put of "
+              f"({N_Q},{mu},{N_G}) under P(None,('x','y'),None): "
+              f"{jax_verdict}", flush=True)
 
-        with SlabIO(PATH, mode="r", mesh=mesh,
-                    backend=SlabIOBackend.PHDF5_FFI) as io:
-            out = io.read_slab("zeta_like",
-                               shape=(N_Q, mu, N_G),
-                               dtype=np.complex128,
-                               offset=(0, 0, 0),
-                               mesh=mesh,
-                               partition_spec=P(None, ('x', 'y'), None))
-        if tuple(out.shape) != (N_Q, mu, N_G):
-            print(f"[padrank-gate rank={rank}] FAIL: read_slab returned "
-                  f"{tuple(out.shape)}, asked for {(N_Q, mu, N_G)}", flush=True)
+        # (2) read_slab must refuse first, by name, on THIS rank.
+        try:
+            with SlabIO(PATH, mode="r", mesh=mesh,
+                        backend=SlabIOBackend.PHDF5_FFI) as io:
+                io.read_slab("zeta_like",
+                             shape=(N_Q, mu, N_G),
+                             dtype=np.complex128,
+                             offset=(0, 0, 0),
+                             mesh=mesh,
+                             partition_spec=P(None, ('x', 'y'), None))
+        except ValueError as exc:
+            named = ("not divisible" in str(exc)
+                     and f"{mu_pad}" in str(exc))
+            print(f"[padrank-gate rank={rank}] REFUSED (correct), names the "
+                  f"rounded-up extent={named}: {exc}", flush=True)
+            return 0 if named else 1
+        except Exception as exc:                              # noqa: BLE001
+            print(f"[padrank-gate rank={rank}] FAIL: refused, but not by "
+                  f"SlabIO — {type(exc).__name__}: {exc}", flush=True)
             return 1
-        got = np.asarray(jax.device_get(out))
-        bad = int(np.count_nonzero(got != ref))
-        print(f"[padrank-gate rank={rank}] nodiv shape={got.shape} "
-              f"mismatched={bad}", flush=True)
-        return 0 if bad == 0 else 1
+        print(f"[padrank-gate rank={rank}] FAIL: the indivisible request "
+              f"was ACCEPTED (jax verdict was: {jax_verdict})", flush=True)
+        return 1
 
     # ---- read_pad: the READ-side empty rendezvous.  Physical shape is the
     # padded one, valid_shape is the logical file extent, mu is sharded —

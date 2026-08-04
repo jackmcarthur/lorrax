@@ -479,9 +479,9 @@ def _shard_divisors(
     """Per-dim product of the mesh axis sizes sharding that dim (1 = replicated).
 
     The divisor the FFI's equal-block rank arithmetic needs each dim to
-    be a multiple of.  Single source of truth for the loop that
-    :func:`_validate_block_divisible` and :func:`_mesh_divisible_shape`
-    both walk.
+    be a multiple of — which is also JAX's own divisor for building a
+    ``NamedSharding`` block over that dim.  Read by
+    :func:`_validate_block_divisible`.
     """
     divs: list[int] = []
     flat_idx = 0
@@ -495,22 +495,6 @@ def _shard_divisors(
     return tuple(divs)
 
 
-def _mesh_divisible_shape(
-    shape: Sequence[int], divisors: Sequence[int],
-) -> tuple[int, ...]:
-    """``shape`` with every sharded dim rounded up to its mesh divisor.
-
-    The PHYSICAL extent the FFI's equal-block arithmetic requires.  It is
-    SlabIO's business, not the caller's (decisions.md 2026-08-04): a
-    caller asks for the logical extent and SlabIO reads the rounded-up
-    one and trims, or pads the operand and writes only the logical
-    prefix.  Returns ``tuple(shape)`` unchanged when nothing is needed,
-    so the common (already-divisible) path is a pure identity.
-    """
-    from runtime.padding import round_up
-    return tuple(round_up(int(s), int(d)) for s, d in zip(shape, divisors))
-
-
 def _validate_block_divisible(
     *,
     op: str,
@@ -520,12 +504,26 @@ def _validate_block_divisible(
     axis_flat: Sequence[int],
     mesh_shape: Sequence[int],
 ) -> None:
-    """Reject sharded dimensions that cannot form equal block shards.
+    """Reject a (shape, spec) pair that cannot form equal block shards.
 
-    INTERNAL post-condition, not a caller-facing contract: since
-    decisions.md 2026-08-04 both FFI entry points round the physical
-    extent up to :func:`_mesh_divisible_shape` before they get here, so a
-    failure means SlabIO's own padding step was skipped or wrong.
+    NOT a SlabIO padding requirement — decisions.md 2026-08-04 takes
+    divisibility out of the caller's contract, and this check is what is
+    left after it: a restatement of JAX's OWN constraint, raised early
+    and with the numbers named.
+
+    MEASURED (gate ``PADRANK_CASE=nodiv``, job 7888644, jax 0.9.1): a
+    ``jax.Array`` whose sharded dim does not divide its mesh-axis product
+    cannot be constructed at all — ``device_put`` raises
+    ``IndivisibleError``.  So SlabIO is never HANDED such an operand on
+    the write path (there is nothing to pad), and on the read path it
+    could not RETURN one either: padding the read and trimming would
+    only replace this message with JAX's, at the same refusal.  That also
+    settles the audit's item 5 — ``_MpiHostBackend``'s absent check is
+    not a capability difference, because the case it would accept cannot
+    be expressed.
+
+    A caller who wants a padded extent asks for the padded SHAPE, which
+    is a legitimate request and needs no other argument.
     """
     divs = _shard_divisors(
         axis_count_per_dim=axis_count_per_dim, axis_flat=axis_flat,
@@ -533,10 +531,13 @@ def _validate_block_divisible(
     for d, size in enumerate(tuple(int(s) for s in shape)):
         if divs[d] > 1 and size % divs[d]:
             raise ValueError(
-                f"{op} {name!r}: INTERNAL — dimension {d} size {size} is "
-                f"not divisible by its mesh-axis product {divs[d]} after "
-                f"SlabIO's own divisibility pad; this is a SlabIO defect, "
-                f"not a caller error")
+                f"{op} {name!r}: dimension {d} size {size} is not "
+                f"divisible by its mesh-axis product {divs[d]}, so the "
+                f"array you asked for cannot be sharded this way — JAX "
+                f"itself refuses to build it (IndivisibleError).  Ask for "
+                f"dimension {d} at {-(-size // divs[d]) * divs[d]} "
+                f"instead: SlabIO fills what the dataset covers and zeroes "
+                f"the rest, and you state nothing else.")
 
 
 # ---------------------------------------------------------------------------
@@ -580,21 +581,6 @@ def _get_read_sm(mesh, partition_spec, *,
         check_rep=False,
     )
     return jax.jit(sm_bare)
-
-
-@functools.lru_cache(maxsize=None)
-def _get_trim_jit(want_shape, sharding):
-    """Slice SlabIO's own divisibility pad off a read result.
-
-    Only reached when the caller's requested shape does not divide the
-    mesh; cached so a repeated non-divisible read does not recompile.
-    """
-    lo = [0] * len(want_shape)
-    hi = list(int(s) for s in want_shape)
-
-    def _trim(x):
-        return jax.lax.slice(x, lo, hi)
-    return jax.jit(_trim, out_shardings=sharding)
 
 
 @functools.lru_cache(maxsize=None)
@@ -801,56 +787,25 @@ class _FfiBackend(_DatasetGeometry):
         self._ds_ids[name] = ds_id
         return ds_id
 
-    def _dataset_shape(self, name: str) -> tuple[int, ...] | None:
-        """The dataset's LOGICAL extent, or None if it does not exist yet.
+    def _dataset_geom(self, name: str) -> tuple[tuple[int, ...], "np.dtype"]:
+        """``(shape, dtype)`` of ``name``, from the record where possible.
 
-        Prefers this handle's own record (rank-independent by
-        construction, and free); falls back to the cached h5py
-        introspect for a dataset this handle has not created — the
-        READ path, where the queue is already drained.
+        The record FIRST, and the serial-h5py introspect only for a
+        dataset this handle did not create.  That ordering is not a
+        micro-optimisation: opening this path with h5py while the same
+        file is open for collective MPI-IO writing reads a superblock
+        that is not durable yet, and h5py fails with "file signature not
+        found" (measured, job 7888644 probe/raw, when an unconditional
+        introspect was tried here).  A dataset this handle created is
+        already described by the record, so the read-after-write-on-one-
+        handle case never reaches the file.
         """
-        known = self._known_shape(name)
-        if known is not None:
-            return known
-        try:
-            shape, dtype = self._introspect_dataset(name)
-        except (KeyError, OSError):
-            return None
+        got = self._ds_geom.get(str(name))
+        if got is not None:
+            return got
+        shape, dtype = self._introspect_dataset(name)
         self._remember_geom(name, shape, dtype)
-        return shape
-
-    # ------------------------------------------------------------------
-    def _pad_operand_for_mesh(self, name: str, A):
-        """Round ``A``'s sharded dims up to mesh divisibility, zero-filled.
-
-        The FFI's C++ rank arithmetic advances each sharded dim by
-        ``coord * local_dim``, so it needs EQUAL blocks.  Divisibility is
-        SlabIO's business (decisions.md 2026-08-04), so a caller that
-        hands us an unevenly-sharded operand gets it padded here rather
-        than a refusal; the pad rows never reach the file because
-        ``valid_shape`` is derived from the DATASET extent, not from the
-        padded buffer.
-
-        Identity (same object, no copy, no collective) whenever ``A`` is
-        already divisible — which is every production call site today.
-        """
-        if not isinstance(A.sharding, NamedSharding):
-            return A
-        counts, flat = _sharding_to_axis_info(A.sharding, A.ndim)
-        mesh_shape = tuple(self.mesh.shape[ax] for ax in self.mesh.axis_names)
-        divs = _shard_divisors(
-            axis_count_per_dim=counts, axis_flat=flat,
-            mesh_shape=mesh_shape, ndim=A.ndim)
-        padded = _mesh_divisible_shape(tuple(A.shape), divs)
-        if padded == tuple(A.shape):
-            return A
-        print(f"  [SlabIO.ffi] write_slab({name!r}): operand shape "
-              f"{tuple(int(s) for s in A.shape)} is not mesh-divisible "
-              f"under spec {A.sharding.spec}; padding to {padded} "
-              f"internally (pad rows are not written).", flush=True)
-        widths = [(0, p - s) for s, p in zip(A.shape, padded)]
-        return device_put_process_local(
-            jnp.pad(A, widths), NamedSharding(self.mesh, A.sharding.spec))
+        return tuple(int(s) for s in shape), np.dtype(dtype)
 
     # ------------------------------------------------------------------
     # FFI write padding contract: shard ``A`` with equal local blocks,
@@ -881,7 +836,6 @@ class _FfiBackend(_DatasetGeometry):
         if not isinstance(A.sharding, NamedSharding) or A.sharding.mesh is not self.mesh:
             A = device_put_process_local(
                 A, _replicated_sharding(self.mesh, A.ndim))
-        A = self._pad_operand_for_mesh(name, A)
 
         axis_count_per_dim, axis_flat = _sharding_to_axis_info(
             A.sharding, A.ndim)
@@ -1003,44 +957,25 @@ class _FfiBackend(_DatasetGeometry):
         # the method, and ``_introspect_dataset`` (serial h5py on the same
         # path) ran before even that.  One unconditional drain at the top.
         self._drain_pending()
-        ds_shape, ds_dtype = self._introspect_dataset(name)
-        self._remember_geom(name, ds_shape, ds_dtype)
+        ds_shape, ds_dtype = self._dataset_geom(name)
         if shape is None:
             # Symmetry with the allgather backend: callers that don't
             # need padding shouldn't have to compute shape themselves.
             shape = ds_shape
         if dtype is None:
             dtype = ds_dtype
-        off, want_shape, _ = _normalize_slab_request(
+        off, read_shape, _ = _normalize_slab_request(
             op="read_slab", name=name, offset=offset,
             slab_shape=shape, global_shape=None, check_bounds=False)
 
         # Default: fully replicated.  Caller can provide partition_spec
         # to shard the read.
         if partition_spec is None:
-            partition_spec = P(*([None] * len(want_shape)))
+            partition_spec = P(*([None] * len(read_shape)))
         sharding = NamedSharding(mesh, partition_spec)
         axis_count_per_dim, axis_flat = _sharding_to_axis_info(
-            sharding, len(want_shape))
+            sharding, len(read_shape))
         mesh_shape = tuple(mesh.shape[ax] for ax in mesh.axis_names)
-
-        # ── Mesh divisibility is SlabIO's, not the caller's ─────────────
-        # ``read_slab`` returns EXACTLY ``shape`` (decisions.md
-        # 2026-08-04).  When that shape does not divide the mesh under
-        # ``partition_spec``, the FFI's equal-block rank arithmetic
-        # cannot express it, so read the rounded-up extent — whose tail
-        # rows are zero-filled by the same clip that handles μ padding —
-        # and slice back before returning.  Identity when the request is
-        # already divisible, which is every production call site.
-        divs = _shard_divisors(
-            axis_count_per_dim=axis_count_per_dim, axis_flat=axis_flat,
-            mesh_shape=mesh_shape, ndim=len(want_shape))
-        read_shape = _mesh_divisible_shape(want_shape, divs)
-        if read_shape != want_shape:
-            print(f"  [SlabIO.ffi] read_slab({name!r}): requested shape "
-                  f"{want_shape} is not mesh-divisible under spec "
-                  f"{partition_spec}; reading {read_shape} and trimming.",
-                  flush=True)
 
         vshape = _normalize_valid_shape(
             op="read_slab", name=name, valid_shape=valid_shape,
@@ -1081,12 +1016,6 @@ class _FfiBackend(_DatasetGeometry):
         valid_shape_arr = _replicated_i64_vector(vshape, mesh)
         result = sm(offset_arr, valid_shape_arr)
         result.block_until_ready()
-        if read_shape != want_shape:
-            # Trim SlabIO's own divisibility pad.  The caller asked for
-            # ``want_shape`` and gets exactly that; the rows dropped here
-            # are the zero-filled ones SlabIO added, never file data.
-            result = _get_trim_jit(want_shape, sharding)(result)
-            result.block_until_ready()
         return result
 
     # ------------------------------------------------------------------
