@@ -92,8 +92,8 @@ I/O, and that obstacle disappears once ψ is already on device.  Check the
 number for your deck before assuming it: at 12×12 with nb=2000 it is ~10×
 larger.
 
-WHY THE FFT IS INLINED HERE RATHER THAN CALLED THROUGH wfn_transforms
----------------------------------------------------------------------
+WHY THE FFT IS INLINED HERE, AND WHY THAT BUYS THE OUTER JIT
+------------------------------------------------------------
 ``to_rbox``/``from_rbox`` memoise a **device** G-index
 (``_cached_gindex_dev``).  Inside ``lax.scan`` the per-k G table is a
 dynamic slice, i.e. a TRACER, and that cache would capture it — the
@@ -105,6 +105,20 @@ so tracers are fine) and builds the sharded transforms from the SAME
 ``fft_helpers`` factories those helpers use.  Nothing in ``fft_helpers``
 or ``wfn_transforms`` is modified or duplicated — the transform is still
 the certified shard_map'd FFI FFT, just handed a traced index.
+
+**Consequence: the whole sweep IS wrapped in one ``jax.jit``.** The
+earlier prohibition ("do NOT wrap the body in an outer jit", job 7888526)
+applied to a version that called ``to_rbox``/``from_rbox``; this one does
+not touch them, so nothing memoises a device G-index and there is no
+tracer to escape. The jit is cached in ``_KERNEL_CACHE`` — the same
+``_cached_jit`` the transforms use — keyed on the shapes, the sharding
+and the operator identity, so it is built once and not once per call.
+
+The outer jit means the two hoisted reshards, the scan and the final
+constraint lower as ONE program, so XLA can place the ``psi_m_X`` /
+``psi_n_XY`` all-gathers relative to the scan rather than seeing them as
+separate eagerly-dispatched ops. Everything is one k at a time inside it;
+the jit changes what XLA is allowed to see, not the algorithm.
 
 A bare ``jnp.fft`` here would be the CrI3 6×6×1 80 Ry 121 GB OOM: on a
 sharded tensor XLA's planner is free to insert an all-gather and emit a
@@ -121,7 +135,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.wfn_transforms import _box_kernel
+from common.wfn_transforms import _box_kernel, _cached_jit, _sharding_key
 from runtime.padding import pad_axis_to
 
 
@@ -411,55 +425,70 @@ def sweep_matrix_elements(
     kvecs_j = jnp.asarray(kvecs, dtype=jnp.float64)
     bidx_j = jnp.asarray(box_index, dtype=jnp.int32)
 
-    # THE HOISTED RESHARD.  ψ_m is never transformed, so the column
-    # layout is built ONCE and reused across every k *and* every
-    # operator: nk+1 all-gathers for a sweep, not 2·nk, and not 3× that
-    # for three sweeps.  ≈151 MB/rank at b600/P=64.
-    psi_m_X = jax.lax.with_sharding_constraint(
-        psi, NamedSharding(mesh, geom.spec_sphere_x))
-    psi_n_XY = jax.lax.with_sharding_constraint(
-        psi, NamedSharding(mesh, geom.spec_sphere_xy))
-
     block_sharding = NamedSharding(mesh, geom.spec_block)
 
-    def one_k(ik_psi_n, ik_psi_m, gvec, gm, bidx, kvec):
-        """The body.  Identical under scan and under the Python loop."""
-        Opsi = operator.apply(ik_psi_n, gvec, gm, bidx, kvec)
+    def _run(psi, gvecs_, gmask_, bidx_, kvecs_):
+        # THE HOISTED RESHARD.  ψ_m is never transformed, so the column
+        # layout is built ONCE and reused across every k *and* every
+        # operator: nk+1 all-gathers for a sweep, not 2·nk, and not 3× that
+        # for three sweeps.  ≈151 MB/rank at b600/P=64.
+        #
+        # The X and Y copies are the POINT, not a cost to be optimised
+        # away (owner, 2026-08-04): ⟨m|O|n⟩ contracts every m with every
+        # n, so one copy sharded on 'x' and one on 'y' is what spreads
+        # that contraction over the mesh instead of over one axis of it.
+        psi_m_X = jax.lax.with_sharding_constraint(
+            psi, NamedSharding(mesh, geom.spec_sphere_x))
+        psi_n_XY = jax.lax.with_sharding_constraint(
+            psi, NamedSharding(mesh, geom.spec_sphere_xy))
 
-        # THE ONE PER-K COLLECTIVE, expressed as a re-shard rather than a
-        # hand-rolled all-gather: XLA inserts it, and it is along 'x'
-        # only, not a global collective.  Payload is the sphere-space
-        # operator output (9.4 MB at b600/P=64), never the r-space box.
-        Opsi_Y = jax.lax.with_sharding_constraint(
-            Opsi, NamedSharding(mesh, geom.spec_sphere_y))
+        def one_k(ik_psi_n, ik_psi_m, gvec, gm, bidx, kvec):
+            """The body.  Identical under scan and under the Python loop."""
+            Opsi = operator.apply(ik_psi_n, gvec, gm, bidx, kvec)
 
-        m_side = ik_psi_m * gm[None, None, None, :].astype(ik_psi_m.dtype)
-        m_side_X = jax.lax.with_sharding_constraint(
-            m_side, NamedSharding(mesh, geom.spec_sphere_x))
+            # THE ONE PER-K COLLECTIVE, expressed as a re-shard rather than a
+            # hand-rolled all-gather: XLA inserts it, and it is along 'x'
+            # only, not a global collective.  Payload is the sphere-space
+            # operator output (9.4 MB at b600/P=64), never the r-space box.
+            Opsi_Y = jax.lax.with_sharding_constraint(
+                Opsi, NamedSharding(mesh, geom.spec_sphere_y))
 
-        blk = jnp.einsum('kbsg,knsg->kbn',
-                         jnp.conj(m_side_X), Opsi_Y, optimize=True)
-        blk = blk * operator.post
-        return jax.lax.with_sharding_constraint(blk, block_sharding)
+            m_side = ik_psi_m * gm[None, None, None, :].astype(ik_psi_m.dtype)
+            m_side_X = jax.lax.with_sharding_constraint(
+                m_side, NamedSharding(mesh, geom.spec_sphere_x))
 
-    if not use_scan:
-        # Reference control.  Same arithmetic and shardings, Python
-        # control flow — so a scan-vs-loop disagreement is the scan.
-        out = [one_k(psi_n_XY[ik:ik + 1], psi_m_X[ik:ik + 1],
-                     gvecs_j[ik], gmask_j[ik], bidx_j[ik:ik + 1], kvecs_j[ik])
-               for ik in range(nk)]
-        return jax.lax.with_sharding_constraint(
-            jnp.concatenate(out, axis=0), block_sharding)
+            blk = jnp.einsum('kbsg,knsg->kbn',
+                             jnp.conj(m_side_X), Opsi_Y, optimize=True)
+            blk = blk * operator.post
+            return jax.lax.with_sharding_constraint(blk, block_sharding)
 
-    def body(carry, xs):
-        psi_n_k, psi_m_k, gvec, gm, bidx, kvec = xs
-        # scan strips the leading axis; put the singleton k axis back so
-        # every shape inside the body matches the non-scan path exactly.
-        blk = one_k(psi_n_k[None], psi_m_k[None], gvec, gm,
-                    bidx[None], kvec)
-        return carry, blk[0]
+        if not use_scan:
+            # Reference control.  Same arithmetic and shardings, Python
+            # control flow — so a scan-vs-loop disagreement is the scan.
+            out = [one_k(psi_n_XY[ik:ik + 1], psi_m_X[ik:ik + 1],
+                         gvecs_[ik], gmask_[ik], bidx_[ik:ik + 1],
+                         kvecs_[ik])
+                   for ik in range(nk)]
+            return jax.lax.with_sharding_constraint(
+                jnp.concatenate(out, axis=0), block_sharding)
 
-    _, H = jax.lax.scan(
-        body, None,
-        (psi_n_XY, psi_m_X, gvecs_j, gmask_j, bidx_j, kvecs_j))
-    return jax.lax.with_sharding_constraint(H, block_sharding)
+        def body(carry, xs):
+            psi_n_k, psi_m_k, gvec, gm, bidx, kvec = xs
+            # scan strips the leading axis; put the singleton k axis back
+            # so every shape inside the body matches the non-scan path.
+            blk = one_k(psi_n_k[None], psi_m_k[None], gvec, gm,
+                        bidx[None], kvec)
+            return carry, blk[0]
+
+        _, H = jax.lax.scan(
+            body, None,
+            (psi_n_XY, psi_m_X, gvecs_, gmask_, bidx_, kvecs_))
+        return jax.lax.with_sharding_constraint(H, block_sharding)
+
+    fn = _cached_jit(
+        'sweep_matrix_elements',
+        (psi.shape, geom.ngkmax, geom.ns, nk, bool(use_scan),
+         id(operator.apply), float(operator.post),
+         geom.fft_grid, _sharding_key(psi)),
+        lambda: jax.jit(_run))
+    return fn(psi, gvecs_j, gmask_j, bidx_j, kvecs_j)
