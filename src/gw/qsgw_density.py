@@ -6,14 +6,31 @@ leaves ρ at its DFT value; this rebuilds ρ from the rotated orbitals, so
 the Hartree potential of iteration n+1 comes from iteration n's density
 rather than from the DFT one.
 
-STRUCTURE, AND WHY IT IS IN THIS ORDER
---------------------------------------
-Two stages, deliberately separate:
+STRUCTURE: ONE SCAN, U NEVER REPLICATED
+---------------------------------------
+A single ``lax.scan`` over k.  Per k, in this order:
 
-1. :func:`rotate_bands` — ψ'_nk(G) = Σ_m U_nm(k) ψ_mk(G).  ONE sharded
-   einsum over the whole (k, band) block, done ONCE, on the G-SPHERE.
-2. :func:`rho_from_wfns` — a ``lax.scan`` over k that boxes, transforms
-   and accumulates ``Σ_n f_nk |ψ'_nk(r)|²`` into a carried ρ(r).
+    ψ_m^Y   ← reshard ψ[k] so the CONTRACTED band index m lies on 'y'
+    ψ̃_n^X  ← einsum('nm,msg->nsg', U[k], ψ_m^Y)     # U is P('x','y')
+    ψ̃_n^XY ← reshard onto the whole mesh
+    box → ifft → ρ(r) += w_k · f_spin · Σ_n f_nk |ψ̃_nk(r)|²
+
+``U`` is sharded ``P(None, 'x', 'y')`` — n on 'x', m on 'y' — so no rank
+ever holds a full ``(nb, nb)``.  At nb=640/P=64 each rank carries
+80×80×16 B = 102 kB per k against 6.5 MB replicated, and the replicated
+form is the ``(nk, nb, nb)`` W2-class object that reaches 9.2 GB at
+nb=2000/nk=144.  The contraction index m is on 'y' and the output index n
+on 'x', so the sum over m is a reduction along 'y' ALONE, not a global
+collective.
+
+The third step — resharding ψ̃ from ``P('x',…)`` back onto ``('x','y')``
+— is what makes the rest uniform.  Straight out of the rotation the bands
+are split over 'x' and REPLICATED over 'y', so an FFT there would do px-
+fold redundant work and the final reduction would have to know to sum over
+'x' only (double-counting by py if it did not).  One cheap sphere-space
+reshard buys: full-mesh FFT parallelism, and a reduction identical to the
+unrotated path, so there is one reduction rule in this file rather than
+two.
 
 **The rotation happens on the sphere, never in r.**  Rotating in real
 space would need every band of a k in the FFT box at once — the per-k
@@ -65,7 +82,7 @@ from common.wfn_transforms import _box_kernel, _cached_jit, _sharding_key
 from runtime.padding import pad_axis_to, spec_divisor
 
 
-__all__ = ["rotate_bands", "rho_from_wfns", "rho_r_to_G"]
+__all__ = ["rho_from_wfns", "rho_r_to_G", "band_rotation_spec"]
 
 
 def _band_spec() -> P:
@@ -82,74 +99,39 @@ def _band_spec() -> P:
     return band_sphere_spec()
 
 
-def rotate_bands(psi_G, U, *, mesh: Mesh):
-    """ψ'_nk(G) = Σ_m U_nm(k) ψ_mk(G) — one sharded einsum, on the sphere.
+def band_rotation_spec() -> P:
+    """``U`` layout: ``(n_k, nb, nb)`` with n on 'x' and m on 'y'.
 
-    Parameters
-    ----------
-    psi_G : (n_k, nb, ns, ngkmax) c128, band-sharded
-    U : (n_k, nb, nb) complex
-        ``U[k, n, m]`` takes DFT band ``m`` into rotated band ``n`` — the
-        eigenvector matrix ``sc_iteration`` gets from ``eigh(H_qp_dft)``,
-        in that index order.  Its rows are the new orbitals.
-    mesh : Mesh
-
-    Returns
-    -------
-    (n_k, nb, ns, ngkmax) c128, band-sharded on the OUTPUT band axis ``n``.
-
-    The contraction runs over ``m``, which is the sharded axis, so a
-    collective is unavoidable — ``with_sharding_constraint`` on the output
-    lets XLA choose it (a reduce-scatter) rather than hand-rolling one.
-    That is the same delegation ``mtxel_sweep`` makes for its per-k
-    reshard, and for the same reason: XLA sees the whole program and can
-    place the collective; a hand-rolled ``psum`` cannot be moved.
-
-    ``U`` is REPLICATED.  It is ``(n_k, nb, nb)`` — 105 MB at nb=640 /
-    nk=16, but 9.2 GB at nb=2000 / nk=144, i.e. the W2-class object.  That
-    residency is inherited from the self-consistency loop, which already
-    carries ``H_qp_dft`` at that shape, so it is not introduced here; it
-    is the reason the loop as a whole does not yet scale to a 12×12 deck.
-    Recorded rather than hidden.
+    The eigenvector matrix from ``sc_iteration``, sharded so no rank holds
+    a full ``(nb, nb)``.  Ask ``_make_kshard_eigh(..., u_spec=...)`` for it
+    rather than resharding a replicated U after the fact — the replicated
+    intermediate is the whole cost being avoided.
     """
-    psi = jnp.asarray(psi_G, dtype=jnp.complex128)
-    U_j = jnp.asarray(U, dtype=jnp.complex128)
-    band_sharding = NamedSharding(mesh, _band_spec())
-
-    def build():
-        @jax.jit
-        def fn(psi_, U_):
-            out = jnp.einsum('knm,kmsg->knsg', U_, psi_, optimize=True)
-            return jax.lax.with_sharding_constraint(out, band_sharding)
-        return fn
-
-    fn = _cached_jit('rotate_bands',
-                     (psi.shape, U_j.shape, _sharding_key(psi)), build)
-    return fn(psi, U_j)
+    return P(None, "x", "y")
 
 
 def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
-                  fft_grid, cell_volume: float, spin_degeneracy: float):
-    """ρ(r) = Σ_k w_k f_spin Σ_{n,s} f_nk |ψ_nks(r)|², scanned over k.
+                  fft_grid, cell_volume: float, spin_degeneracy: float,
+                  U=None):
+    """ρ(r) = Σ_k w_k f_spin Σ_{n,s} f_nk |ψ̃_nks(r)|², scanned over k.
 
     Parameters
     ----------
     psi_G : (n_k, nb, ns, ngkmax) c128, band-sharded
-        Already rotated if a rotation is wanted — this routine does not
-        care whether the orbitals are DFT or QP.
     occ : (n_k, nb) float64
-        Per-state occupations, ``gw.efermi.step_occupations`` today and a
+        Per-state occupations — ``gw.efermi.step_occupations`` today, a
         Fermi–Dirac factor later.  A WEIGHT, not a mask: nothing here
-        assumes it is 0 or 1.
+        assumes it is 0 or 1.  Indexed by the ROTATED band n when ``U`` is
+        given, which is the band the eigenvalue E_nk belongs to.
     kweights : (n_k,) float64
         Weights of the SAME k-set as ``psi_G``.  On the IBZ these are
         ``WfnLoader.kweights`` and the result MUST be symmetrised over the
-        star afterwards (``centroid.orbit_syms``) — a weighted IBZ sum is
-        not the full-BZ density until it is.
-    box_index : (n_k, nx, ny, nz) int32
-        Sphere→box map, ``WfnLoader.box_index``.
-    cell_volume, spin_degeneracy
-        ``psp.get_DFT_mtxels.spin_degeneracy_factor`` supplies the latter.
+        star afterwards — a weighted IBZ sum is not the full-BZ density
+        until it is.  See the SYMMETRISATION note below.
+    U : (n_k, nb, nb) complex, sharded :func:`band_rotation_spec`, optional
+        ``U[k, n, m]`` takes DFT band m into rotated band n.  ``None``
+        builds ρ from ``psi_G`` unrotated, which is the DFT density and
+        the gate's baseline.
 
     Returns
     -------
@@ -157,16 +139,21 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
 
     NORMALISATION is term-for-term ``psp.get_DFT_mtxels.
     valence_density_from_kpoint``: ψ_r = ifftn(box, 'ortho')·√(N/Ω), so
-    ``ΔV · Σ_r ρ = f_spin · Σ_k w_k Σ_n f_nk``.  With step occupations and
-    an E_F from ``gw.efermi`` that is ``f_spin · n_occ_bands``, which is
-    the electron count — the gate checks exactly this.
+    ``ΔV · Σ_r ρ = f_spin · Σ_k w_k Σ_n f_nk``.
 
-    THE CARRY IS ρ(r).  ``(nx, ny, nz)`` f64 is 750 kB at a 60×60×26 grid,
-    so the scan carries something negligible and there is ONE collective
-    for the whole build (the final psum), not one per k.  This is the
-    reason the k loop is a scan and not a partition: a k-partitioned build
-    would need a psum of ρ per rank-group anyway, and could not use more
-    than n_k ranks.
+    THE CARRY IS ρ(r) — ``(nx, ny, nz)`` f64, 750 kB at a 60×60×26 grid.
+    The scan carries something negligible and the band reduction is folded
+    into the accumulation, so there is ONE collective class for the whole
+    build rather than one materialised ψ̃ per k.
+
+    SYMMETRISATION IS THE CALLER'S, AND THAT IS A KNOWN ROUGH EDGE.  Handed
+    IBZ weights this returns the weighted IBZ sum, which is not the density
+    until symmetrised over the star (``centroid.orbit_syms``).  Leaving a
+    correctness step to the caller is the inverse of the SlabIO padding
+    ruling and should be closed once the star machinery of
+    ``docs/dev/ibz_self_consistency_scaffold.md`` exists; until then the
+    electron-count check is what catches a caller who forgets, because an
+    unsymmetrised IBZ ρ still integrates to the right number.
     """
     from common.fft_helpers import make_sharded_ifftn_3d
 
@@ -177,57 +164,86 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
 
     psi = jnp.asarray(psi_G, dtype=jnp.complex128)
     p_prod = spec_divisor(mesh, _band_spec(), 1)
-    psi, _ = pad_axis_to(psi, p_prod, axis=1)
+    psi, nb_logical = pad_axis_to(psi, p_prod, axis=1)
     nb_pad = int(psi.shape[1])
+    ngkmax = int(psi.shape[3])
 
     occ_j = jnp.asarray(occ, dtype=jnp.float64)
     if int(occ_j.shape[1]) != nb_pad:
-        # Pad bands carry ψ = 0, so their occupation is irrelevant to the
-        # arithmetic — but the scan needs the shapes to line up, and a
-        # zero is the value that stays correct if the ψ pad ever changes.
         occ_j = jnp.pad(occ_j, ((0, 0), (0, nb_pad - int(occ_j.shape[1]))))
+
+    have_U = U is not None
+    if have_U:
+        U_j = jnp.asarray(U, dtype=jnp.complex128)
+        if U_j.shape[1] != nb_pad or U_j.shape[2] != nb_pad:
+            # ZERO pad, not identity.  A pad ROW of U would otherwise build
+            # a rotated pad band out of physical ones; zeros keep ψ̃'s pad
+            # bands exactly zero, matching ψ's and occ's.
+            U_j = jnp.pad(U_j, ((0, 0),
+                                (0, nb_pad - int(U_j.shape[1])),
+                                (0, nb_pad - int(U_j.shape[2]))))
+    else:
+        U_j = jnp.zeros((1, 1, 1), dtype=jnp.complex128)   # unused operand
 
     w_j = jnp.asarray(kweights, dtype=jnp.float64)
     bidx_j = jnp.asarray(box_index, dtype=jnp.int32)
 
+    band_xy = NamedSharding(mesh, _band_spec())
+    m_on_y = NamedSharding(mesh, P(None, "y", None, None))
+    U_sh = NamedSharding(mesh, band_rotation_spec())
     box_spec = P(None, ("x", "y"), None, None, None, None)
     ifftn = make_sharded_ifftn_3d(mesh, box_spec, box_spec,
-                                  norm='ortho', axes=(-3, -2, -1))
-    band_sharding = NamedSharding(mesh, _band_spec())
+                                  norm="ortho", axes=(-3, -2, -1))
     rho_sharding = NamedSharding(mesh, P(None, None, None))
 
     def build():
         @jax.jit
-        def fn(psi_, occ_, w_, bidx_):
-            psi_x = jax.lax.with_sharding_constraint(psi_, band_sharding)
+        def fn(psi_, U_, occ_, w_, bidx_):
+            psi_xy = jax.lax.with_sharding_constraint(psi_, band_xy)
+            if have_U:
+                # m on 'y' so the contraction reduces along 'y' alone.
+                psi_my = jax.lax.with_sharding_constraint(psi_, m_on_y)
+                U_x = jax.lax.with_sharding_constraint(U_, U_sh)
+            else:
+                psi_my = psi_xy
+                U_x = U_
 
             def body(rho, xs):
-                psi_k, occ_k, w_k, bidx_k = xs
-                box = _box_kernel(psi_k[None], bidx_k[None], ngkmax=psi_.shape[3])
+                psi_xy_k, psi_my_k, U_k, occ_k, w_k, bidx_k = xs
+                if have_U:
+                    # n from U's 'x', m summed along 'y'.
+                    psi_t = jnp.einsum('nm,msg->nsg', U_k, psi_my_k,
+                                       optimize=True)
+                    # Back onto the WHOLE mesh: straight out of the
+                    # rotation the bands sit on 'x' and are replicated on
+                    # 'y', which would make the FFT px-fold redundant and
+                    # the final reduction a different rule than the
+                    # unrotated path's.  One cheap sphere reshard fixes
+                    # both.
+                    psi_t = jax.lax.with_sharding_constraint(
+                        psi_t[None], NamedSharding(mesh, _band_spec()))
+                else:
+                    psi_t = psi_xy_k[None]
+                box = _box_kernel(psi_t, bidx_k[None], ngkmax=ngkmax)
                 psi_r = ifftn(box) * scale
-                # |ψ|² summed over the SPINOR axis (both components of a
-                # spinor are the same state) and over bands with the
-                # occupation as the weight.  Bands are sharded, so this
-                # sum is rank-local and the cross-rank reduction happens
-                # once, on ρ, after the scan.
-                dens = jnp.einsum(
-                    'n,knsxyz->xyz',
-                    occ_k, jnp.abs(psi_r) ** 2, optimize=True)
+                dens = jnp.einsum('n,knsxyz->xyz', occ_k,
+                                  jnp.abs(psi_r) ** 2, optimize=True)
                 return rho + (w_k * f_spin) * dens, None
 
             rho0 = jnp.zeros(grid, dtype=jnp.float64)
-            rho, _ = jax.lax.scan(body, rho0, (psi_x, occ_, w_, bidx_))
-            # THE one collective: bands were sharded, so each rank holds a
-            # partial ρ over its own bands.  Constraining to replicated is
-            # the all-reduce, and XLA places it.
+            U_xs = U_x if have_U else jnp.zeros(
+                (psi_.shape[0], 1, 1), dtype=jnp.complex128)
+            rho, _ = jax.lax.scan(
+                body, rho0, (psi_xy, psi_my, U_xs, occ_, w_, bidx_))
             return jax.lax.with_sharding_constraint(rho, rho_sharding)
         return fn
 
     fn = _cached_jit(
-        'rho_from_wfns',
-        (psi.shape, grid, float(cell_volume), f_spin, _sharding_key(psi)),
+        "rho_from_wfns",
+        (psi.shape, tuple(np.shape(U_j)), grid, float(cell_volume), f_spin,
+         have_U, _sharding_key(psi)),
         build)
-    return fn(psi, occ_j, w_j, bidx_j)
+    return fn(psi, U_j, occ_j, w_j, bidx_j)
 
 
 def rho_r_to_G(rho_r, *, mesh: Mesh):

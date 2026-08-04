@@ -2,6 +2,8 @@
 
 Four checks, strongest first:
 
+  0. U IS NEVER REPLICATED: it is sharded P(None,'x','y') and the
+     rotation runs inside the k scan, so no rank holds a full (nb,nb).
   1. OCC-BLOCK INVARIANCE.  A unitary mixing only WITHIN the occupied
      manifold leaves ρ exactly invariant — ρ is the trace of the projector
      onto that subspace and a rotation inside it does not move the
@@ -34,7 +36,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P    # noqa: E402
 
 from common.collectives import (process_count, process_rank,   # noqa: E402
                                 resolve_mesh)
-from gw.qsgw_density import rotate_bands, rho_from_wfns, rho_r_to_G  # noqa: E402
+from gw.qsgw_density import (rho_from_wfns, rho_r_to_G,          # noqa: E402
+                             band_rotation_spec)
 from psp.get_DFT_mtxels import valence_density_from_kpoint     # noqa: E402
 
 NB = int(os.environ.get("QD_NB", "16"))
@@ -106,8 +109,10 @@ def main():
     for ik in range(NK):
         U_occ[ik] = np.eye(NB)
         U_occ[ik, :NOCC, :NOCC] = _haar(rng, NOCC)      # mix inside occ only
-    psi_rot = rotate_bands(psi_j, U_occ, mesh=mesh)
-    rho_occ = np.asarray(rho_from_wfns(psi_rot, occ, kweights, **kw))
+    U_sh = NamedSharding(mesh, band_rotation_spec())
+    U_occ_j = jax.make_array_from_callback(
+        U_occ.shape, U_sh, lambda idx: U_occ[idx])
+    rho_occ = np.asarray(rho_from_wfns(psi_j, occ, kweights, U=U_occ_j, **kw))
     d_occ = float(np.abs(rho_occ - rho_ref).max())
     bit = bool(np.array_equal(rho_occ, rho_ref))
     scale = max(float(np.abs(rho_ref).max()), 1e-300)
@@ -139,9 +144,10 @@ def main():
 
     # ---- 4. negative control: a general U MUST move rho -----------------
     U_gen = np.stack([_haar(rng, NB) for _ in range(NK)])
+    U_gen_j = jax.make_array_from_callback(
+        U_gen.shape, U_sh, lambda idx: U_gen[idx])
     rho_gen = np.asarray(
-        rho_from_wfns(rotate_bands(psi_j, U_gen, mesh=mesh),
-                      occ, kweights, **kw))
+        rho_from_wfns(psi_j, occ, kweights, U=U_gen_j, **kw))
     d_gen = float(np.abs(rho_gen - rho_ref).max()) / scale
     ok4 = d_gen > 1e-6
     p0(f"[qd] 4. general U vs unrotated   rel {d_gen:.3e}  "

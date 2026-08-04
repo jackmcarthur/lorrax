@@ -186,7 +186,8 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
 # Iteration map
 # ---------------------------------------------------------------------------
 
-def _make_kshard_eigh(mesh_xy: Mesh, *, eigvalsh_only: bool):
+def _make_kshard_eigh(mesh_xy: Mesh, *, eigvalsh_only: bool,
+                      u_spec: P | None = None):
     """Return a jit'd eigh that briefly k-shards the input over the mesh
     so each device only does its slice of the per-k diagonalisations,
     then allgathers the eigenvalues (and U if requested) back to
@@ -196,7 +197,14 @@ def _make_kshard_eigh(mesh_xy: Mesh, *, eigvalsh_only: bool):
     ``mesh_xy.size`` must divide ``nk``; otherwise the resharding fails.
     """
     rep_E = NamedSharding(mesh_xy, P(None, None))
-    rep_U = NamedSharding(mesh_xy, P(None, None, None))
+    # ``u_spec`` chooses where U LANDS.  The default replicates it, which
+    # is what every consumer wanted until ``gw.qsgw_density`` -- that one
+    # contracts U against band-sharded psi one k at a time and wants
+    # ``P(None, 'x', 'y')`` so no rank holds a full (nb, nb).  Parametrised
+    # rather than copied: the eigh itself, the k-shard hint and the
+    # hermitisation are identical and must not drift.
+    rep_U = NamedSharding(mesh_xy,
+                          P(None, None, None) if u_spec is None else u_spec)
     k_shard_3d = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
 
     if eigvalsh_only:
