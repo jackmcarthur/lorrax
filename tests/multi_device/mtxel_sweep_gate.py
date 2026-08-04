@@ -189,9 +189,17 @@ def main():
 
 
 if __name__ == "__main__":
+    # finalize_process() ends the process with os._exit and DOES NOT RETURN,
+    # so a bare `finally: finalize_process()` swallows the exception and
+    # exits 0 — a gate that reports PASS on a crash.  Found in the sibling
+    # bench (job 7888809): rc=0 on all 16 ranks, no traceback, no result.
+    import traceback
     rc = 1
     try:
         rc = main()
-    finally:
-        finalize_process()
-    sys.exit(rc)
+    except BaseException:
+        traceback.print_exc()
+        sys.stderr.flush()
+        sys.stdout.flush()
+        rc = 1
+    finalize_process(rc)
