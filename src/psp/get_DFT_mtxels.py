@@ -481,7 +481,7 @@ def compute_local_V_k_2d(
     cell_volume,
     *,
     mesh,
-    g_mask=None,
+    g_mask,
 ):
     """⟨mk|V(r)|nk⟩ for one k, **2-D band-sharded**, no rank holding (nb,nb).
 
@@ -525,22 +525,55 @@ def compute_local_V_k_2d(
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.wfn_transforms import to_rbox, from_rbox
 
+    gv = np.asarray(gvecs)
     ngrid = int(np.prod(tuple(int(s) for s in fft_grid)))
     volume = float(cell_volume)
     scale = float(np.sqrt(ngrid / volume))
     deltaV = volume / ngrid
     fft_norm = float(np.sqrt(ngrid))
 
+    # REFUSE an unmasked padded table.  Pad rows are (0,0,0) — a valid FFT-box
+    # index that ALIASES physical Γ — so a forgotten mask does not crash, it
+    # silently double-counts ψ(G=0) into every pad column.  The 1-D pipeline
+    # has this check, but it lives in ``gw.kin_ion_io.get_kin_ion_k``, one
+    # level ABOVE the kernels, so a caller reaching a kernel directly got
+    # nothing.  ``g_mask`` is therefore a required keyword here and the table
+    # is checked, not trusted.
+    if g_mask is None:
+        n_zero_rows = int(np.count_nonzero(~gv.any(axis=1)))
+        if n_zero_rows > 1:
+            raise ValueError(
+                f"compute_local_V_k_2d: g_mask=None but the G table has "
+                f"{n_zero_rows} all-zero rows, i.e. it is ngkmax-padded.  Pad "
+                f"rows are (0,0,0) = Γ, a REAL G-vector, so an unmasked "
+                f"contraction silently folds ψ(G=0) into every pad column "
+                f"instead of contributing zero.  Pass the mask from "
+                f"psp.dft_operators.padded_gvectors(...).at(ik).")
+
+    # NOT wrapped in an outer jit, deliberately.  ``to_rbox`` / ``from_rbox``
+    # memoise a DEVICE array of the G index (``_cached_gindex_dev``); called
+    # inside an enclosing trace that cache captures a tracer, which escapes
+    # and raises UnexpectedTracerError (measured, job 7888526).  They are
+    # already cached jits themselves, so what an outer jit would buy is
+    # fusion across the FFT / ×V_r / gather / einsum boundary, not fewer
+    # COMPILES: shapes are fixed by D10, so every transform lowers once for
+    # the whole k sweep regardless.  The cost of the glue is therefore a
+    # handful of extra dispatches per k, not a compile storm.  If that
+    # overhead is ever measured to matter, the fix is to hoist the device
+    # G-index out of the transforms and pass it as an operand — not to wrap
+    # this body.
     psi_m = jnp.asarray(psi_m_sphere, dtype=jnp.complex128)
     psi_n = jnp.asarray(psi_n_sphere, dtype=jnp.complex128)
-    mask = None if g_mask is None else jnp.asarray(g_mask, dtype=jnp.complex128)
+    mask = None if g_mask is None else jnp.asarray(g_mask,
+                                                   dtype=jnp.complex128)
 
-    # n side: split over the FULL mesh for the transform round trip.
+    # n side: carried over the WHOLE mesh for the round trip, so FFT work is
+    # 2nb/P per rank with no px-fold redundancy.
     psi_n_w = jax.lax.with_sharding_constraint(
         psi_n, NamedSharding(mesh, P(None, ('x', 'y'), None, None)))
     psi_r = to_rbox(psi_n_w, g_index, fft_grid, mesh=mesh, norm='ortho') * scale
     phi_r = psi_r * jnp.asarray(V_r, dtype=jnp.complex128)
-    vpsi = from_rbox(phi_r, gvecs, mesh=mesh, norm='ortho',
+    vpsi = from_rbox(phi_r, gv, mesh=mesh, norm='ortho',
                      g_mask=mask) * (deltaV * fft_norm)
 
     # The x-all-gather, expressed as a re-shard.
