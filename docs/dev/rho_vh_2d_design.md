@@ -1,6 +1,6 @@
 # ρ and ⟨mk|V_H|nk⟩ on the 2-D process grid — design spec
 
-Status: SPEC. Nothing here is implemented yet.
+Status: SPEC + OWNER RULINGS (see §4.1). Implementation in progress; §9 is the order.
 Author's measurements: jobs 7885315/7885316 (b600/P=64 charge), 7885966
 (b600 bispinor), and the code as of `eff3bb7`.
 
@@ -114,6 +114,45 @@ The `psi_rotation` seam for that exists in `build_valence_density_distributed`
 and `compute_hartree_matrix` — and **no caller anywhere passes it**.  It is
 plumbed, documented, and dead.
 
+### 4.1 OWNER RULINGS (2026-08-02) — these are decided, not open
+
+1. **Density-updating QSGW is the target.**  ρ is rebuilt each iteration;
+   `psi_rotation` gets wired up.  So ρ's cost is paid per iteration, not once,
+   and §5.2 must keep a k-only mode (band chunking is illegal once the
+   rotation couples all `nmix` bands).
+2. **The Hartree basis rotation stays** — it is how step *n*'s V_H becomes
+   step *n+1*'s.  Rebuilding ρ does not remove it: Σ is computed in the
+   current QP basis, so V_H must be rotated to match before it is added.
+   The two are complementary, not alternatives.
+3. **The rotation must be DISTRIBUTED**, through the linalg FFI, in the same
+   2-D sharded stacked layout — not gathered to single procs.  Today it is
+   `jnp.einsum('kpm,kpq,kqn->kmn', conj(U), v_h_ext, U)` on a **replicated**
+   `(nk,nb,nb)`, which is W2 again and is incompatible with the sharded
+   output of §5.1.  With V_H sharded `P('x','y')` the rotation is a
+   distributed `U†·V·U` per k; the existing distributed-linalg plumbing
+   (the ScaLAPACK/SLATE host targets already linked into the FFI) is the
+   place to look, and the owner's instruction is explicitly to prefer the
+   distributed form over saving a few seconds by gathering.
+4. **ψ is carried as `psi_m_X,k(G)` and `psi_n_Y,k(G)`** — G-sphere, not the
+   FFT box.  This is what removes W1, and it is also the natural input to the
+   contraction, which already consumes sphere coefficients.
+5. **V_q=0(G) is REGENERATED**, not stored or gathered.  It is a closed-form
+   function of the reciprocal metric (plus the 2-D Ismail-Beigi truncation
+   when `sys_dim == 2`); recomputing it on each rank costs nothing and
+   removes a replicated array and a consistency hazard.  It MUST use the
+   same truncation convention as `kin_ion`'s V_loc — the module docstring
+   already warns that mixing conventions puts a large systematic error
+   straight into H₀ where it cannot be told from a basis-convergence
+   problem.
+6. **Unify the k-weighting of the IBZ-only charge-density routine.**
+   `rho_from_wfn_ibz` → `compute_valence_density` currently decides weights
+   by the heuristic `use_kweights = (nk_local == len(wfn.kweights))`, falls
+   back to uniform `1/nk_tot` otherwise, and is all-k-resident and
+   replicated.  It must share ONE k-weighting convention (and the same
+   sharded ψ layout) with `build_valence_density_distributed`.  That is both
+   the correctness unification and, because it removes a fully replicated
+   all-k sweep, the "a lot faster" the owner is after.
+
 Consequences this design must honour:
 
 1. **ρ must be cheap to rebuild**, because a density-updating loop pays it
@@ -214,7 +253,25 @@ path is currently not covered — adjacent to open task #28).
 
 ---
 
-## 6. FFT routing — an existing antipattern on this path
+### 5.5 How the sharding is expressed in JAX
+
+The `x`-all-gather of §5.1 step 3 does not need to be hand-rolled.  Carry the
+n-side over the **whole** mesh for the FFT and then constrain it to the
+column layout; XLA inserts the collective:
+
+```python
+psi_n_r = ifftn_sharded(box(psi_n))                  # P(('x','y'), None, ...)
+phi_G   = fftn_sharded(psi_n_r * V_r)
+vpsi    = to_sphere(phi_G)                           # P(('x','y'), None, None)
+vpsi_y  = with_sharding_constraint(vpsi, P('y',  None, None))   # the x-allgather
+psi_m_x = with_sharding_constraint(psi_m, P('x',  None, None))
+V_loc   = einsum('bsg,nsg->bn', conj(psi_m_x), vpsi_y)          # -> P('x','y')
+```
+
+FFT work is spread over all `P` (no `px`-fold redundancy), the GEMM is local,
+and the only collective is the one re-shard.
+
+
 
 `LORRAX_FFT_FFI` is documented as **required**, with "nothing to opt out to",
 and `common/wfn_transforms.py` routes through it.  `psp/get_DFT_mtxels.py`
@@ -226,6 +283,17 @@ The FFI target is a *flat-k batched 3-D FFT*, and these shapes
 The flat-k FFI measured **3.78× on Σ**.  Routing this path through it is part
 of "as fast as reasonably possible", and should be done **before** any
 micro-tuning of the GEMM.
+
+**Use the existing sharded helper, do not write a new one.**
+`common.fft_helpers.make_sharded_ifftn_3d / make_sharded_fftn_3d(mesh,
+in_spec, out_spec, norm=, axes=)` already wrap the FFI in a `shard_map` that
+runs the transform locally per device with the three FFT axes replicated and
+only batch dims sharded — exactly this kernel's shape.
+`common.wfn_transforms._local_box_fft` shows the intended call pattern and the
+jit-cache keying (`_sharding_key`, `_output_sharding`), and `to_rbox` already
+implements "sphere → box → IFFT" for a sharded ψ, which is precisely the
+n-side of §5.1.  The missing piece is the return leg (r → box FFT → sphere
+gather); add it next to `to_rbox` rather than inline in `psp`.
 
 ---
 
