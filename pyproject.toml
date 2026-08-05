@@ -6,7 +6,11 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "h5py>=3.14.0",
-    "jax[cuda12]>=0.9.0",
+    # NO CUDA VARIANT PINNED HERE — it is a SITE fact, not a package fact.
+    # Pick one at install time:  pip install -e '.[cuda13]'  (Perlmutter)
+    #                            pip install -e '.[cuda12]'  (Frontera rtx)
+    # See [project.optional-dependencies] below for the support matrix.
+    "jax>=0.9.0",
     "jaxlib>=0.9.0",
     "matplotlib>=3.10.3",
     "numpy>=2.3.1",
@@ -24,13 +28,27 @@ docs = [
     "mkdocstrings>=0.30.1",
     "mkdocstrings-python>=1.18.2",
 ]
-# NOTE: the default GPU stack here is CUDA 12 / JAX >=0.9 (see
-# [project.dependencies] `jax[cuda12]`). This was switched from `cuda13` to
-# support TACC Frontera, whose RTX 5000 (Turing, sm_75) GPU nodes run NVIDIA
-# driver 535.113.01 (CUDA 12.2) — CUDA 13 needs a >=580 driver. Driver 535
-# runs the full CUDA 12.x userspace via minor-version compatibility, and JAX
-# on CUDA 12 supports sm_52+, so Turing is well within range. To go back to
-# CUDA 13 on a newer-driver machine, flip `jax[cuda12]` -> `jax[cuda13]`.
+# ---------------------------------------------------------------------------
+# GPU SUPPORT MATRIX — one extra per CUDA major, chosen per SITE.
+#
+# This used to be a single hard pin in [project.dependencies], flipped
+# cuda13 -> cuda12 on 2026-07-24 for TACC Frontera and thereby silently
+# downgrading every other machine.  A global pin cannot express a fact that
+# differs per machine; an extra can.  The driver is what constrains this:
+#
+#   site                 GPU              driver        CUDA userspace  extra
+#   -------------------  ---------------  ------------  --------------  ------
+#   NERSC Perlmutter     A100 (sm_80)     580.159.04    13.0            cuda13
+#   TACC Frontera (rtx)  RTX 5000 (sm_75) 535.113.01    12.2            cuda12
+#
+# CUDA 13 needs a >=580 driver, which is why Frontera cannot use it.  Driver
+# 535 runs the full CUDA 12.x userspace via minor-version compatibility and
+# JAX on CUDA 12 supports sm_52+, so Turing is well within range there.
+#
+# CPU-ONLY installs need NEITHER extra: the base `jax`/`jaxlib` dependency is
+# the CPU build, which is what the host-platform FFI leg runs against.
+cuda12 = ["jax[cuda12]>=0.9.0"]
+cuda13 = ["jax[cuda13]>=0.9.0"]
 
 [project.scripts]
 lorrax-gw = "gw.gw_jax:main"
@@ -80,7 +98,9 @@ dev = [
     "pytest>=8.0.0",
 ]
 jax = [
-    "jax[cuda12]>=0.9.0",
+    # CPU/base only — see [project.optional-dependencies] cuda12 / cuda13 for
+    # the per-site GPU variant.  Do not re-pin a CUDA major here.
+    "jax>=0.9.0",
     "jaxlib>=0.9.0",
 ]
 build = [

@@ -254,6 +254,53 @@ def _announce_auto_geometry_demote(op: str, px: int, py: int) -> None:
             f"instead.", flush=True)
 
 
+#: (op, target) pairs whose auto→native CAPABILITY demote has already been
+#: announced this process.
+_AUTO_CAPABILITY_DEMOTE_ANNOUNCED: set[tuple[str, str]] = set()
+
+
+def _announce_auto_capability_demote(op: str, target: str) -> None:
+    """Rank-0, once-per-(op, target) announcement that ``auto`` demoted to
+    native because the handler is NOT LOADABLE — the mesh geometry was fine.
+
+    Why this exists (2026-08-05, Perlmutter port).  This arm used to be the
+    one silent demote left in the resolver: ``has_target()`` swallows every
+    reason it can answer "no" for (library missing, library present but
+    unloadable, library loaded but the symbol absent from a partial build),
+    so a stale or half-built ``liblorrax_ffi.so`` on a true-2-D GPU mesh
+    quietly ran the replicated JAX path with no print, no ledger entry and
+    no exception.  Only the startup report's ``_linalg_facts`` block
+    witnessed it.
+
+    That is precisely the failure class that produced the worst measured
+    defect in this tree — a full MoS2 12x12 G0W0 that ran to completion
+    with rc=0 and a QP gap of -161 eV after a config rewrite silently took
+    the only route carrying the cure (tests/test_charge_zeta_route.py).
+    Doctrine 3 says 'auto' MAY demote but MUST announce; this closes the
+    last gap in that rule.  We quote ``probe_target``'s three-way reason
+    because it names the ``.so`` and distinguishes "not built" from "built
+    but unloadable" — the two have completely different fixes.
+    """
+    key = (op, target)
+    if key in _AUTO_CAPABILITY_DEMOTE_ANNOUNCED:
+        return
+    _AUTO_CAPABILITY_DEMOTE_ANNOUNCED.add(key)
+    if _process_index() != 0:
+        return
+    try:
+        reason = ffi_loader.probe_target(target, "CUDA")
+    except Exception as exc:  # noqa: BLE001 - never let the witness raise
+        reason = f"(probe_target itself failed: {exc!r})"
+    print(
+        f"  [linalg.resolve] {op} backend 'auto': the mesh geometry "
+        f"supports '{target}' but the handler is NOT AVAILABLE — "
+        f"demoting to the replicated native path.  Reason: {reason}.  "
+        f"This is a PERFORMANCE AND MEMORY cliff, not a correctness "
+        f"fallback; an explicit backend request refuses here instead.  "
+        f"Fix the FFI build or set the backend explicitly to make this "
+        f"fail loudly.", flush=True)
+
+
 def _process_index() -> int:
     import jax
     try:
@@ -355,6 +402,12 @@ def resolve_backend(op: str, requested: str, mesh_xy: Mesh,
         # repeated plan() calls do not spam.  (audit fix/zq 2026-07-28)
         if ffi_loader.has_target(target, "CUDA") and not (px >= 2 and py >= 2):
             _announce_auto_geometry_demote(op, px, py)
+        elif px >= 2 and py >= 2:
+            # Geometry was fine, so the ONLY reason we are here is that the
+            # handler could not be resolved.  Announce it — see the
+            # docstring for why this used to be silent and why that was the
+            # highest-consequence failure mode in the resolver.
+            _announce_auto_capability_demote(op, target)
         return NATIVE
 
     # ── explicit FFI backend: run the full guard ladder ──────────────
