@@ -38,7 +38,7 @@ Typical use::
 
     print(linalg.list_backends("cholesky", mesh))  # what CAN run here?
 """
-from .dispatch import dispatch_eigh
+from .dispatch import dispatch_batched_eigh, dispatch_eigh
 from .plan import LinalgPlan, ensure_sharding, plan
 from .resolve import (
     BACKEND_CHOICES,
@@ -63,6 +63,7 @@ __all__ = [
     "NATIVE",
     "OPS",
     "backend_module",
+    "dispatch_batched_eigh",
     "dispatch_eigh",
     "ensure_sharding",
     "list_backends",

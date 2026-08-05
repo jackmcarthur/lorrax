@@ -230,7 +230,7 @@ def compute_sigma_xc(
     bispinor_v_q_path: str | None = None,
     write_sigma_omega_h5: bool = True,
     hartree_basis_rotation: jax.Array | None = None,
-    v_h_dft_override: jax.Array | None = None,
+    v_h_qp_override: jax.Array | None = None,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -333,16 +333,16 @@ def compute_sigma_xc(
     # running it unconditionally keeps the graph shape source-independent.
     source, v_h_ext = resolve_external_hartree(
         config, meta, band_slices, mesh_xy, wfn=wfn, sym=sym, print_fn=print_fn)
-    if v_h_dft_override is not None:
+    if v_h_qp_override is not None:
         # DENSITY SELF-CONSISTENCY.  The resolved V_H is built from the DFT
-        # density and is a FIXED operator; rotating it into the QP basis
-        # below is exact for that operator but wrong the moment rho moves,
-        # which it does as soon as U mixes occupied with unoccupied bands.
-        # The override is <m_dft|V_H[rho_n]|n_dft> for the CURRENT density
-        # (gw.qsgw_density.hartree_from_orbitals + the k-scan), still in
-        # the DFT basis, so the rotation below stays correct and unchanged
-        # -- only the operator being rotated is now the right one.
-        source, v_h_ext = "density_sc", v_h_dft_override
+        # density; rotating it is exact for THAT operator but wrong once ρ
+        # moves, which it does as soon as U_qp mixes occupied with
+        # unoccupied bands.  The override is ⟨m|V_H[ρ_i]|n⟩ contracted
+        # from the ROTATED orbitals, so it is ALREADY in the QP basis and
+        # the U†·V·U below must be skipped -- applying it would rotate
+        # twice.
+        sig_h = jnp.asarray(v_h_qp_override, dtype=sig_h.dtype)
+        source, v_h_ext = "density_sc", None
     if source == "folded":
         sig_h = jnp.zeros_like(sig_h)
     elif v_h_ext is not None:

@@ -99,7 +99,7 @@ from runtime.padding import pad_axis_to, spec_divisor
 
 __all__ = ["rho_from_wfns", "rho_r_to_G", "band_rotation_spec",
            "distributed_eigh_bands", "symmetrise_density",
-           "hartree_from_orbitals"]
+           "hartree_from_orbitals", "rotate_bands"]
 
 
 def _band_spec() -> P:
@@ -338,99 +338,125 @@ def rho_r_to_G(rho_r, *, mesh: Mesh):
     return fftn(rho)
 
 
-def distributed_eigh_bands(H, *, mesh: Mesh):
-    """(E, Z) for every k, with NO ``(nb, nb)`` ever on one rank.
+def rotate_bands(psi_G, U_qp, *, mesh: Mesh):
+    """ψ̃_nk(G) = Σ_m U_qp[k,m,n] ψ_mk(G) — one sharded einsum, on the sphere.
 
-    ``H`` is ``(n_k, nb, nb)`` Hermitian at :func:`band_rotation_spec`.
-    Returns ``E`` ``(n_k, nb)`` replicated ascending and ``Z``
-    ``(n_k, nb, nb)`` at the same 2-D layout, eigenvectors as COLUMNS.
+    Eigenvectors are COLUMNS (``U_qp[k, m, n]`` = component m of QP band
+    n), matching ``ffi.linalg``, ``jnp.linalg.eigh`` and
+    ``sc_iteration._rotate_to_dft_basis``.
 
-    Routed to ``ffi.linalg._scalapack.batched_distributed_eigh``
-    (``pXheevd``) ON PURPOSE, and against the usual cost argument.
-    ``ffi/linalg/dispatch.py`` records that the native path solves ``ndev``
-    matrices at once while the FFI solves one matrix ``ndev``-ways and
-    walks the batch serially, so ``off`` wins by roughly ``ndev`` whenever
-    a whole matrix fits on one device.  At nb=640 it does (6.5 MB) and the
-    native path is ~ndev faster.
+    ``U_qp`` is :func:`band_rotation_spec` — m on 'x', n on 'y' — so the
+    sum over m reduces along 'x' alone and no rank holds a full (nb, nb).
 
-    **At nb=10⁴ it does not.**  One ``(nb, nb)`` complex128 tile is 1.6 GB
-    at nb=10⁴ and 6.4 GB at nb=2·10⁴, and the native path needs that on a
-    SINGLE device on top of ψ and the FFT boxes.  The distributed backend
-    is the one that still runs there, so it is what this uses: the owner's
-    ruling is robustness at 10⁴⁺ bands over speed at 10³ (2026-08-04).
-    The batched entry point costs one collective-serialisation round for
-    the whole k stack, not one per k.
-
-    CONSTRAINTS, all checked by the callee: host (CPU) mesh only — a CUDA
-    mesh wants ``ffi.cusolvermp.distributed_eigh``; square or 1-D mesh,
-    because ``pXheevd`` needs square descriptor blocks; and ``nb``
-    divisible by ``max(Px, Py)``, which the band pad to ``px·py`` already
-    guarantees.
-
-    GAUGE.  ``Z`` is NOT mesh-invariant — a degenerate eigenvalue leaves
-    an arbitrary unitary inside its subspace and the block-cyclic
-    reduction picks a different representative on a different grid.  ρ is
-    unaffected: it is ``Σ_n f_n |Z_n|²``, i.e. ``Z f(W) Zᴴ`` contracted
-    with ψ, which is gauge-invariant whenever ``f`` is constant across a
-    degenerate set — and a step occupation from
-    :func:`gw.efermi.fermi_level_step` is exactly that, because it REFUSES
-    to split a degenerate manifold.  The two guarantees are the same
-    guarantee, which is why that refusal is load-bearing rather than
-    fussy.
+    WHY RETURN ψ̃ RATHER THAN FOLD THE ROTATION INTO ρ.  ψ̃ is needed
+    TWICE per iteration: once to build ρ, once to contract ⟨m|V_H|n⟩ in
+    the QP basis.  Rotating once and reusing it replaces an ``nk·nb³``
+    matrix rotation (U†VU) with nothing, and removes a basis change from
+    a ~400 Ry term.  Materialising ψ̃ is not an extra cost — the matrix
+    elements need it resident anyway.
     """
-    from ffi.linalg._scalapack import batched_distributed_eigh
+    psi = jnp.asarray(psi_G, dtype=jnp.complex128)
+    p_prod = spec_divisor(mesh, _band_spec(), 1)
+    psi, _ = pad_axis_to(psi, p_prod, axis=1)
+    nb_pad = int(psi.shape[1])
+    U = jnp.asarray(U_qp, dtype=jnp.complex128)
+    if U.shape[1] != nb_pad or U.shape[2] != nb_pad:
+        # ZERO pad: a pad ROW of U would build a rotated pad band out of
+        # physical ones; zeros keep ψ̃'s pad bands exactly zero.
+        U = jnp.pad(U, ((0, 0), (0, nb_pad - int(U.shape[1])),
+                        (0, nb_pad - int(U.shape[2]))))
+    m_on_x = NamedSharding(mesh, P(None, "x", None, None))
+    band_xy = NamedSharding(mesh, _band_spec())
+    U_sh = NamedSharding(mesh, band_rotation_spec())
+
+    def build():
+        @jax.jit
+        def fn(psi_, U_):
+            psi_mx = jax.lax.with_sharding_constraint(psi_, m_on_x)
+            U_x = jax.lax.with_sharding_constraint(U_, U_sh)
+            out = jnp.einsum('kmn,kmsg->knsg', U_x, psi_mx, optimize=True)
+            return jax.lax.with_sharding_constraint(out, band_xy)
+        return fn
+
+    fn = _cached_jit('rotate_bands',
+                     (psi.shape, U.shape, _sharding_key(psi)), build)
+    return fn(psi, U)
+
+
+def distributed_eigh_bands(H, *, mesh: Mesh):
+    """(E, U_qp) for every k, with NO ``(nb, nb)`` ever on one rank.
+
+    ``H`` is ``(n_k, nb, nb)`` Hermitian at :func:`band_rotation_spec`;
+    returns ``E`` ``(n_k, nb)`` replicated ascending and ``U_qp`` at the
+    same 2-D layout, eigenvectors as COLUMNS.
+
+    Backend-agnostic.  ``resolve_backend('eigh', 'distributed', mesh)``
+    picks the platform's distributed eigh — ScaLAPACK ``pXheevd`` on a
+    host mesh, cuSOLVERMp on CUDA — and ``backend_module`` hands out that
+    module, which is the idiom every other FFI consumer uses
+    (``isdf.core`` for getrf/getrs/solve_lu, ``common.eigh_block_sweep``
+    for cusolvermp).  Resolving first is the point: a CPU-only backend on
+    a CUDA mesh, an uncompiled handler, a rectangular mesh or an
+    indivisible ``n`` are refused THERE with the guard named, instead of
+    failing or deadlocking inside the call.
+
+    Batching asymmetry (only ScaLAPACK has a batched entry; cuSOLVERMp
+    and SLATE do not) is handled by ``ffi.linalg.dispatch_batched_eigh``,
+    not here — it is a backend-capability question, not a physics one.
+
+    ``pXheevd`` is the permanent CPU distributed eigh; the batched entry
+    costs one collective-serialisation round for the whole k stack rather
+    than one per k.  Chosen against the usual cost argument on purpose:
+    ``ffi/linalg/dispatch.py`` records that the native path solves ndev
+    matrices at once and wins by roughly ndev whenever a tile fits on one
+    device, which at nb=640 (6.5 MB) it does.  At nb=10⁴ a tile is 1.6 GB
+    and at 2·10⁴ it is 6.4 GB, on ONE device on top of ψ and the FFT
+    boxes — the owner's ruling is robustness there over speed here
+    (2026-08-04).
+
+    GAUGE.  ``U_qp`` is not mesh-invariant (a degenerate eigenvalue leaves
+    an arbitrary unitary in its subspace and the block-cyclic reduction
+    picks a different representative per grid).  ρ is unaffected: it is
+    ``U f(E) U†`` contracted with ψ, gauge-invariant whenever f is
+    constant across a degenerate set — which a step occupation from
+    :func:`gw.efermi.fermi_level_step` is, because that routine refuses to
+    split a degenerate manifold.  Same guarantee, twice.
+    """
+    from ffi.linalg import dispatch_batched_eigh
 
     H_j = jnp.asarray(H)
     p_prod = spec_divisor(mesh, _band_spec(), 1)
     H_j, _ = pad_axis_to(H_j, p_prod, axis=1)
     H_j, _ = pad_axis_to(H_j, p_prod, axis=2)
-    H_sh = NamedSharding(mesh, band_rotation_spec())
-    H_j = jax.lax.with_sharding_constraint(H_j, H_sh)
-    # Hermitise explicitly: pXheevd reads one triangle, so a non-Hermitian
-    # input is silently interpreted rather than refused.
+    H_j = jax.lax.with_sharding_constraint(
+        H_j, NamedSharding(mesh, band_rotation_spec()))
+    # pXheevd reads ONE triangle, so a non-Hermitian input is silently
+    # interpreted rather than refused.  Hermitise here.
     H_j = 0.5 * (H_j + jnp.conj(jnp.swapaxes(H_j, -1, -2)))
-    return batched_distributed_eigh(H_j, mesh=mesh)
+    return dispatch_batched_eigh(H_j, mesh, "distributed")
 
 
 def hartree_from_orbitals(psi_G, occ, kweights, wfn, *, mesh: Mesh,
                           box_index, fft_grid, truncation_2d: bool,
-                          spin_degeneracy: float, sym_perm=None, U=None,
+                          spin_degeneracy: float, sym_perm=None,
                           expected_electrons=None, print_fn=print):
-    """ψ (+ optional rotation) → ρ(r) → V_H(r).  The self-consistency seam.
+    """ψ → ρ(r) → V_H(r).  ``psi_G`` must ALREADY be the rotated orbitals.
 
-    This is what makes iteration n+1's Hartree potential come from
-    iteration n's DENSITY rather than from the DFT one.  Today
-    ``sc_iteration`` passes ``hartree_basis_rotation=U`` into
-    ``compute_sigma_xc``, which applies U†V_H U — a BASIS CHANGE of the
-    fixed DFT V_H.  That is exact only if ρ has not moved; it has, as soon
-    as U mixes occupied with unoccupied bands.
+    No ``U`` argument: rotate once with :func:`rotate_bands` and pass ψ̃
+    here, so the same ψ̃ also builds ⟨m|V_H|n⟩ directly in the QP basis.
+    Rotating inside would force the matrix elements to be built in the DFT
+    basis and rotated afterwards — an ``nk·nb³`` U†VU and a second basis
+    change on a ~400 Ry term, both avoidable.
 
-    Composes two routines that already existed and already agree on
-    conventions:
+    Composes :func:`rho_from_wfns` with
+    ``psp.get_DFT_mtxels.build_hartree_potential``, which takes ρ in REAL
+    space and does its own transform — so V_H lands on the ψ box grid,
+    which is what ``common.mtxel_sweep.local_potential_operator`` needs,
+    and no ρ(G) step enters.
 
-    * :func:`rho_from_wfns` — ρ(r) on the ψ FFT box grid.
-    * ``psp.get_DFT_mtxels.build_hartree_potential`` — ρ(r) → V_H(r), with
-      the ``∫ρ d³r`` refusal that is the cheap guard against a factor-2
-      spin slip or a grid-normalisation error, either of which would
-      rescale a ~500 eV term.
-
-    NO ρ(G) STEP.  ``build_hartree_potential`` takes ρ in REAL space and
-    does its own transform, so the Poisson solve inherits ρ's grid and
-    V_H lands on the same box the ψ live on — the grid
-    ``common.mtxel_sweep.local_potential_operator`` needs.
-    :func:`rho_r_to_G` is not on this path; it exists for inspection and
-    for consumers that want the G-space density directly.
-
-    ``truncation_2d`` MUST match the Coulomb convention the rest of the
-    run uses.  Mixing it between ``kin_ion``'s V_loc and V_H puts a large
-    SYSTEMATIC error into H₀ that cannot be told apart from a
-    basis-convergence problem — the callee says so and refuses nothing,
-    so it is the caller's to get right.
-
-    ``expected_electrons`` is ``f_spin · Σ_k w_k Σ_n f_nk``, i.e.
-    ``gw.efermi.occupied_band_count(occ, kweights) * spin_degeneracy``.
-    Pass it: it is the only check that a rotated, re-occupied density
-    still holds the right charge.
+    ``expected_electrons`` is ``f_spin · Σ_k w_k Σ_n f_nk``.  Pass it: it
+    is the only check that a rotated, re-occupied density still holds the
+    right charge, and V_H is a ~400 Ry term.
     """
     from psp.get_DFT_mtxels import build_hartree_potential
 
@@ -438,7 +464,7 @@ def hartree_from_orbitals(psi_G, occ, kweights, wfn, *, mesh: Mesh,
                           box_index=box_index, fft_grid=fft_grid,
                           cell_volume=float(wfn.cell_volume),
                           spin_degeneracy=spin_degeneracy,
-                          U=U, sym_perm=sym_perm)
+                          U=None, sym_perm=sym_perm)
     V_H_r = build_hartree_potential(
         rho_r, wfn, truncation_2d=bool(truncation_2d),
         expected_electrons=expected_electrons, print_fn=print_fn)

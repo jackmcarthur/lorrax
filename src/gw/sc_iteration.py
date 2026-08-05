@@ -301,28 +301,31 @@ def _dft_psi_sphere(inputs):
     return hit
 
 
-def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
-    """⟨m_dft|V_H[ρ(U)]|n_dft⟩ — the density-self-consistent Hartree.
+def rebuild_hartree_qp_basis(inputs, U_qp, E_qp_ry):
+    """⟨m|V_H[ρ_i]|n⟩ in the QP basis, from iteration i's own orbitals.
 
-    Returns the matrix in the **DFT basis**, because that is what
-    ``sigma_dispatch`` rotates into the QP basis.  Rotating a fixed
-    operator was never the bug; using the DFT DENSITY's operator was.
+    The cycle this closes::
 
-    Chain, all of it separately gated
-    (``tests/multi_device/qsgw_density_gate.py``):
+        H_i --eigh--> E, U_qp --+--> psi_qp = rotate(psi_dft, U_qp)
+                                +--> occ = f(E);  rho_i = sum_n f|psi_qp|^2
+                                +--> V_H[rho_i],  W_i,  Sigma_i
+        H_{i+1} = T + V_loc + V_NL + V_H[rho_i] + Sigma[psi_i, W_i]
 
-        E_qp → gw.efermi.fermi_level_step → step_occupations
-        ψ_dft, U, f, w → gw.qsgw_density.rho_from_wfns   (scan over k)
-        ρ → build_hartree_potential → V_H(r)
-        V_H(r) → common.mtxel_sweep → ⟨m|V_H|n⟩
+    V_H and Sigma are built from the SAME iteration-i orbitals and both
+    land in H_{i+1}, so the fixed point is rho = rho[psi(H)] with H
+    containing V_H[rho].  ``kin_ion_dft`` stays pristine T+V_loc+V_NL, so
+    V_H arrives only through ``delta_h`` and cannot double-count.
 
-    The SC k-set is the FULL BZ with uniform weights, so no star
-    symmetrisation is needed and none is passed; an IBZ build (legal under
-    the 2026-08-04 TRS ruling, and cheaper) must supply ``sym_perm``, and
-    ``rho_from_wfns`` refuses without it.
+    ONE ROTATION, NOT TWO.  psi is rotated ONCE and reused for both rho
+    and the contraction, so the matrix elements come out in the QP basis
+    directly.  Building them in the DFT basis and applying U dag V U
+    afterwards -- the shape this had first -- costs an extra nk*nb^3 and a
+    second basis change on a ~400 Ry term, for the same answer.
+
+    No mixing: straight rho_out feedback, by owner ruling (2026-08-04).
     """
     from gw.efermi import fermi_level_step, step_occupations
-    from gw.qsgw_density import hartree_from_orbitals
+    from gw.qsgw_density import rotate_bands, hartree_from_orbitals
     from psp.get_DFT_mtxels import spin_degeneracy_factor
     from common.mtxel_sweep import (SweepGeometry, local_potential_operator,
                                     sweep_matrix_elements)
@@ -330,20 +333,20 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
 
     psi_G, bidx = _dft_psi_sphere(inputs)
     nk, nb = int(psi_G.shape[0]), int(psi_G.shape[1])
-    kweights = np.full(nk, 1.0 / nk)          # full BZ ⇒ uniform
+    kweights = np.full(nk, 1.0 / nk)          # full BZ => uniform, no star
 
     E_np = np.asarray(E_qp_ry)
-    n_occ_bands = float(inputs.meta.nelec)
-    e_f = fermi_level_step(E_np, kweights, n_occ_bands)
+    e_f = fermi_level_step(E_np, kweights, float(inputs.meta.nelec))
     occ = step_occupations(E_np, e_f)
 
+    psi_qp = rotate_bands(psi_G, U_qp, mesh=inputs.mesh_xy)
     f_spin = spin_degeneracy_factor(inputs.wfn)
     grid = tuple(int(v) for v in inputs.wfn.fft_grid)
-    rho_r, V_H_r = hartree_from_orbitals(
-        psi_G, occ, kweights, inputs.wfn, mesh=inputs.mesh_xy,
+    _rho, V_H_r = hartree_from_orbitals(
+        psi_qp, occ, kweights, inputs.wfn, mesh=inputs.mesh_xy,
         box_index=bidx, fft_grid=grid,
         truncation_2d=bool(getattr(inputs.config, "sys_dim", 3) == 2),
-        spin_degeneracy=f_spin, U=U_qp,
+        spin_degeneracy=f_spin,
         expected_electrons=f_spin * float(np.einsum("k,kn->", kweights, occ)),
         print_fn=inputs.print_fn)
 
@@ -352,11 +355,11 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
                          ngkmax=int(psi_G.shape[3]), nb=nb,
                          ns=int(psi_G.shape[2]), nk=nk,
                          cell_volume=float(inputs.wfn.cell_volume))
-    op = local_potential_operator(geom, V_H_r)
     H_vh = sweep_matrix_elements(
-        psi_G, operator=op, geom=geom, gvecs=gtab.gvecs, gmask=gtab.mask,
-        box_index=bidx, kvecs=np.asarray(inputs.sym.unfolded_kpts))
-    return H_vh, e_f, rho_r
+        psi_qp, operator=local_potential_operator(geom, V_H_r), geom=geom,
+        gvecs=gtab.gvecs, gmask=gtab.mask, box_index=bidx,
+        kvecs=np.asarray(inputs.sym.unfolded_kpts))
+    return H_vh, e_f
 
 
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
@@ -422,12 +425,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         active_slice=inputs.band_slices.sigma,
     )
 
-    # DENSITY SELF-CONSISTENCY (opt-in).  Rebuild V_H from THIS iteration's
-    # orbitals and occupations instead of rotating the fixed DFT one.  Off
-    # by default, so the one-shot equivalence gate keeps its meaning.
-    v_h_dft_new = None
+    # DENSITY SELF-CONSISTENCY (opt-in).  V_H[rho_i] from THIS iteration's
+    # orbitals, alongside Sigma_i and from the same U_qp, both feeding
+    # H_{i+1}.  Off by default, so the one-shot equivalence gate holds.
+    v_h_qp_new = None
     if bool(getattr(inputs.config, "density_self_consistent", False)):
-        v_h_dft_new, e_f_ry, _rho = rebuild_hartree_dft_basis(
+        v_h_qp_new, e_f_ry = rebuild_hartree_qp_basis(
             inputs, U_qp, E_qp_ry)
         inputs.print_fn(
             f"    density-SC: rebuilt V_H from iteration {state.iteration} "
@@ -463,7 +466,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # The stored/gspace V_H lives in the DFT basis; this is the U that
         # takes it into the basis ``wfns_qp`` is expressed in.
         hartree_basis_rotation=U_qp,
-        v_h_dft_override=v_h_dft_new,
+        v_h_qp_override=v_h_qp_new,
         write_sigma_omega_h5=False,
         print_fn=inputs.print_fn,
     )

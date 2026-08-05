@@ -19,7 +19,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 
 from .plan import plan as _plan
-from .resolve import EIGH_BACKENDS, NATIVE
+from .resolve import EIGH_BACKENDS, NATIVE, backend_module, resolve_backend
 
 __all__ = ["dispatch_eigh", "EIGH_BACKENDS"]
 
@@ -97,3 +97,58 @@ def dispatch_eigh(A, mesh_xy: Mesh, backend: str):
     # eigenvector-layout normalisation (cuSOLVERMp's raw buffer is the
     # conjugate transpose of the column form; slate/scalapack are columns).
     return p(A)
+
+
+def dispatch_batched_eigh(A, mesh_xy: Mesh, backend: str = "distributed"):
+    """A STACK of Hermitian matrices, backend-dispatched.
+
+    PLACEHOLDER (2026-08-04) — contract is final, implementation is the
+    minimum that is correct.  See the scoping note at the end.
+
+    Parameters
+    ----------
+    A : (Nq, N, N)  P(None, 'x', 'y')   Hermitian (lower triangle read)
+    mesh_xy : ('x','y') device mesh
+    backend : any ``EIGH_BACKENDS`` name; ``'distributed'`` resolves to the
+        platform's distributed eigh (ScaLAPACK on host, cuSOLVERMp on CUDA).
+
+    Returns
+    -------
+    (W, Z)
+        ``W`` ``(Nq, N)`` REPLICATED float64 ascending; ``Z``
+        ``(Nq, N, N)`` ``P(None,'x','y')`` eigenvectors as COLUMNS
+        (``A[q] @ Z[q] == Z[q] @ diag(W[q])``).  Same layout contract as
+        ``_scalapack.batched_distributed_eigh``, whatever backend ran.
+
+    WHY THIS EXISTS.  Batching is not universal: only the ScaLAPACK
+    backend exposes ``batched_distributed_eigh``, which costs ONE
+    collective-serialisation round for the whole stack instead of ``Nq``.
+    cuSOLVERMp and SLATE expose the single-matrix ``distributed_eigh``
+    only.  A caller that reaches for the batched name directly therefore
+    works on a host mesh and ``AttributeError``s on CUDA.  This is the one
+    place that asymmetry is handled.
+
+    The capability test is ``getattr``, not a platform test, so a backend
+    that gains a batched entry later is picked up with no edit here.
+
+    SCOPE FOR HARDENING (deliberately not done in this placeholder):
+    per-matrix guards hoisted out of the loop; whether the serial fallback
+    should preserve donation; a gate that the two paths agree to round-off
+    on a mesh where both are available; and whether the loop should be a
+    ``lax.scan`` rather than Python (it cannot be today — the FFI call is
+    not scan-safe — which is itself worth recording).
+    """
+    if backend in ("auto", "off", NATIVE):
+        return jnp.linalg.eigh(A)
+    if A.ndim != 3 or A.shape[1] != A.shape[2]:
+        raise ValueError(
+            f"dispatch_batched_eigh: expected (Nq, N, N); got {A.shape}")
+    resolved = resolve_backend("eigh", backend, mesh_xy, n=int(A.shape[1]))
+    mod = backend_module(resolved)
+    batched = getattr(mod, "batched_distributed_eigh", None)
+    if batched is not None:
+        return batched(A, mesh=mesh_xy)
+    outs = [mod.distributed_eigh(A[q], mesh=mesh_xy)
+            for q in range(int(A.shape[0]))]
+    return (jnp.stack([o[0] for o in outs]),
+            jnp.stack([o[1] for o in outs]))
