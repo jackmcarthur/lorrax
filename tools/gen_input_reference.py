@@ -126,6 +126,8 @@ KEYS: dict[str, tuple[str, str]] = {
     "write_wfn_h5": ("IO / restart", "End-of-run WFN_qp.h5 write (BGW format, psi rotated by the final U, E_QP energies)."),
     "strict_keys": ("IO / restart", "Unknown deck keys refuse (ValueError naming every one) instead of the default aggregated warning."),
     # ---- Solver ----
+    "density_self_consistent": ("Solver", "Rebuild V_H from the current orbitals every SC iteration instead of rotating the fixed DFT V_H into the QP basis; off keeps QSGW fixed-density."),
+    "sc_on_ibz": ("Solver", "Run the SC loop's H/E/U and carried state on the IBZ, broadcasting back at the boundary; Sigma stays on the full BZ. Ignored when every k-star is a singleton."),
     "qp_solver": ("Solver", "QP extraction: one_shot_dft (G0W0 at E_DFT; auto default) | fixed_point (on-shell) | self_consistent (QSGW loop)."),
     "do_G0": ("Solver", "Compute the analytic q->0 static head terms (needs dipole.h5); part of every production run."),
     "self_consistent": ("Solver", "DEPRECATED alias for qp_solver = self_consistent."),
