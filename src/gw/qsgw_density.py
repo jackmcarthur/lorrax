@@ -93,6 +93,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common import timing
 from common.wfn_transforms import _box_kernel, _cached_jit, _sharding_key
 from runtime.padding import pad_axis_to, spec_divisor
 
@@ -160,6 +161,14 @@ def symmetrise_density(rho_r, sym_perm):
     return (jnp.mean(flat[perm], axis=0)).reshape(grid)
 
 
+# FORCED SYNC, AND IT COSTS NOTHING HERE.  ρ(r) is ``(nx, ny, nz)`` f64 —
+# 750 kB at 60×60×26 — and the very next statement in the only production
+# caller (:func:`hartree_from_orbitals` → ``build_hartree_potential``) is
+# ``float(jnp.sum(rho_r))``, a full host synchronisation for the charge
+# check.  ``watch=True`` therefore moves the block a few Python statements
+# earlier and changes nothing else about the pipeline; what it buys is that
+# ρ's compute is charged to this row instead of to ``vh.poisson``.
+@timing.timed("vh.rho", watch=True)
 def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                   fft_grid, cell_volume: float, spin_degeneracy: float,
                   U=None, sym_perm=None):
@@ -355,6 +364,17 @@ def rho_r_to_G(rho_r, *, mesh: Mesh):
     return fftn(rho)
 
 
+# FORCED SYNC.  ψ̃ is a jit OUTPUT — the buffer is materialised whatever
+# this row does — so ``watch=True`` waits, it does not transfer and it does
+# not add residency.  Nothing is donated across the boundary (the ρ scan
+# takes ψ̃ as a plain argument), so the block cannot cost a donation either.
+# What it gives up is the overlap between this einsum's device work and the
+# handful of Python statements that follow it in
+# ``rebuild_hartree_dft_basis`` (shape checks and a ``_cached_jit`` lookup,
+# µs).  Without the block this row would be the dispatch alone and the
+# rotation would be charged to ``vh.rho``, which is the one split the
+# breakdown exists to make.
+@timing.timed("vh.rotate_bands", watch=True)
 def rotate_bands(psi_G, U_qp, *, mesh: Mesh):
     """ψ̃_nk(G) = Σ_m U_qp[k,m,n] ψ_mk(G) — one sharded einsum, on the sphere.
 
@@ -414,6 +434,13 @@ def rotate_bands(psi_G, U_qp, *, mesh: Mesh):
     return fn(psi, U)
 
 
+# FORCED SYNC, ALREADY IMPLIED BY THE CALLER.  ``watch=True`` blocks on
+# both returned arrays (the section walks tuples).  ``gw_iteration_map``
+# does ``np.asarray(E_qp_ry)`` on the next line for the Fermi level and
+# ``np.asarray(U_qp)`` a few lines later for the k-star broadcast, so both
+# were being synchronised immediately regardless; E and Z come out of one
+# FFI call, so blocking on the pair is the same wait as blocking on either.
+@timing.timed("sc.eigh", watch=True)
 def distributed_eigh_bands(H, *, mesh: Mesh):
     """(E, U_qp) for every k, with NO ``(nb, nb)`` ever on one rank.
 
@@ -496,7 +523,15 @@ def hartree_from_orbitals(psi_G, occ, kweights, wfn, *, mesh: Mesh,
                           cell_volume=float(wfn.cell_volume),
                           spin_degeneracy=spin_degeneracy,
                           U=None, sym_perm=sym_perm)
-    V_H_r = build_hartree_potential(
-        rho_r, wfn, truncation_2d=bool(truncation_2d),
-        expected_electrons=expected_electrons, print_fn=print_fn)
+    # NO FORCED SYNC NEEDED — this stage is synchronous by construction.
+    # ``build_hartree_potential`` computes ``float(jnp.sum(rho_r))`` for the
+    # charge check on entry and ``float(jnp.sum(rho_r * V_H_r))`` for the
+    # Hartree energy on exit; both are host readbacks, so the row already
+    # ends after V_H(r) exists.  ρ's own compute is charged to ``vh.rho``,
+    # which blocks before this section opens, so what is left here is the
+    # 1/G² solve and its two reductions.
+    with timing.section("vh.poisson"):
+        V_H_r = build_hartree_potential(
+            rho_r, wfn, truncation_2d=bool(truncation_2d),
+            expected_electrons=expected_electrons, print_fn=print_fn)
     return rho_r, V_H_r

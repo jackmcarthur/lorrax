@@ -67,6 +67,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common import timing
 from common.collectives import barrier, device_put_process_local
 from common.units import RYD_TO_EV
 from .band_partition import BandPartition, apply_band_partition
@@ -308,9 +309,15 @@ def _dft_psi_sphere(inputs):
     key = (id(inputs.wfn), nb)
     hit = _PSI_G_CACHE.get(key)
     if hit is None:
-        spec = band_sphere_spec()
-        psi = inputs.wfn.load(bands=(0, nb), k="full_bz", sharding=spec)
-        bidx = np.asarray(inputs.wfn.box_index(k="full_bz"))
+        # ONE-TIME ROW.  The section is entered every iteration but only
+        # the first does work, so ``vh.psi_load``'s count is the iteration
+        # count and its total is the single WFN.h5 read.  It exists so
+        # that read shows as its own row instead of as unexplained SELF
+        # time on ``vh.rebuild``.
+        with timing.section("vh.psi_load"):
+            spec = band_sphere_spec()
+            psi = inputs.wfn.load(bands=(0, nb), k="full_bz", sharding=spec)
+            bidx = np.asarray(inputs.wfn.box_index(k="full_bz"))
         hit = (psi, bidx)
         _PSI_G_CACHE[key] = hit
     return hit
@@ -330,6 +337,34 @@ def _kstar(inputs):
     return KStarMap.identity(int(inputs.kin_ion_dft.shape[0]))
 
 
+# THE DENSITY-SC ROW, AND ITS FOUR CHILDREN.  ``vh.rebuild`` is the whole
+# rebuild; under it the timing tree carries ``vh.psi_load``,
+# ``vh.rotate_bands``, ``vh.rho``, ``vh.poisson`` and ``mtxel.sweep``.
+# No ``watch`` on the parent: every child that produces a device array
+# blocks on it (see each one's note), so the last statement of this
+# function has already been synchronised and the inclusive time is real.
+# What is left in the parent's SELF column is host work only — the
+# ``np.asarray(E_qp_ry)`` readback, ``fermi_level_step`` and
+# ``step_occupations`` in numpy, and ``padded_gvectors``.
+#
+# MEASURED, MoS2 4x4 / nb=128 / nk=16 (IBZ 10) / N_mu=785 / P=1, 5
+# iterations, job 7889362.  Per iteration, against a 62.4 s SC iteration:
+#
+#   vh.rebuild        8.90 s   14.3 %
+#     mtxel.sweep     5.72 s    9.2 %   <m|V_H|n> over 16 k x 128 bands
+#     vh.rho          2.96 s    4.7 %   16 k x 128 band inverse FFTs
+#     vh.poisson      0.12 s    0.2 %
+#     vh.rotate_bands 0.04 s    0.1 %
+#     vh.psi_load     0.05 s    0.1 %   (0.272 s once, amortised)
+#     self            0.01 s
+#
+# The same deck with ``density_self_consistent`` off runs the driver in
+# 269.6 s against 312.2 s (53.9 vs 62.4 s/iteration, same job), so the
+# difference confirms the rows: +8.5 s/iteration measured end to end
+# against the +8.90 s the tree reports.  The cost is NOT the rotation the
+# module docstrings worry about — it is the matrix-element sweep, which
+# alone exceeds this deck's whole chi0+W screening (5.51 s/iteration).
+@timing.timed("vh.rebuild")
 def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
     """⟨m|V_H[ρ_i]|n⟩ in the DFT basis, from iteration i's own orbitals.
 
@@ -475,6 +510,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # plus a conjugation on time-reversed members -- a band index is
     # symmetry-inert, so no umklapp phase or centroid permutation enters
     # (see common.symmetry_maps, above star_select).
+    # NOT TIMED, AND THE NUMBER IS THE REASON.  A ``sc.kstar`` section over
+    # this broadcast, the V_H select below and the Σ spread/select together
+    # measured 0.071 s over 15 calls inside a 312 s SC driver (0.02%) on the
+    # MoS2 4x4 IBZ deck, nk 16 -> 10, job 7889362 — and exactly 0.000 s over
+    # 5 calls on a full-BZ deck, where ``is_identity`` makes all three
+    # no-ops (job 7889360).  Both are index takes on host numpy arrays that
+    # ``np.asarray`` had to produce anyway; the row would be 0.0% in every
+    # table that prints it.
     ks = _kstar(inputs)
     U_full = ks.broadcast(np.asarray(U_qp)) if not ks.is_identity else U_qp
     E_full = ks.broadcast(np.asarray(E_qp_ry)) if not ks.is_identity else E_qp_ry

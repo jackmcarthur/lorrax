@@ -197,6 +197,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common import timing
 from common.wfn_transforms import _box_kernel, _cached_jit, _sharding_key
 from runtime.padding import pad_axis_to
 
@@ -643,6 +644,25 @@ def sum_operators(*ops: Operator) -> Operator:
 # The sweep
 # ---------------------------------------------------------------------------
 
+# FORCED SYNC, AND WHAT IT COSTS.  ``watch=True`` makes the section
+# ``block_until_ready`` the returned block before it stops its clock, so the
+# row is the sweep's COMPUTE, not its dispatch.  Without it the row would be
+# the ~ms it takes to enqueue and the nk·nb²·ngkmax of work would land on
+# whichever unrelated stage blocked next — the failure
+# ``collectives.sweep_local_k`` records, and the reason
+# ``kin_ion_io`` already wraps this call in one section instead of nk.
+#
+# The sync is free at three of the four call sites (``kin_ion_io``'s two
+# sweeps and ``get_dipole_mtxels``): each follows the call with
+# ``blocks_to_host``, which gathers and therefore blocks on the next line
+# anyway.  At the fourth (``sc_iteration.rebuild_hartree_dft_basis``) it is
+# free only on the IBZ path, where ``KStarMap.select`` reads the block back
+# to host immediately; on the full-BZ path it is a REAL change — H_vh would
+# otherwise stay lazy across ``compute_screening``, so the sweep's device
+# work could overlap the screening's host-side compile. That overlap is
+# given up on purpose: it is the only way the row is the sweep's own time
+# rather than χ₀'s.
+@timing.timed("mtxel.sweep", watch=True)
 def sweep_matrix_elements(
     psi_G,
     *,
