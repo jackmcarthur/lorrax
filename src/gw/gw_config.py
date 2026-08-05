@@ -924,6 +924,9 @@ _DEFAULTS = {
     "sc_history_depth": 5,       # rCROP history depth
     "sc_mixing": 1.0,            # linear-mixing α (accelerator=linear only)
     "sc_dump_dir": "",           # E-history npy dump dir ("" = off)
+    "sc_eigh": "auto",           # auto | native | distributed (per-iteration
+                                 # eigh of the (nk, nb, nb) carry; a LAYOUT
+                                 # choice, independent of the physics knobs)
     "use_ppm_sigma": False,
     # BGW-style averaging of diagonal Σ within degenerate sets (mirrors
     # ``Sigma/shiftenergy.f90`` band-averaging).  ``no_degen_averaging =
@@ -1318,6 +1321,7 @@ _NORMALIZE_STR = {
     "compute_mode",
     "qp_solver",
     "sc_accelerator",
+    "sc_eigh",
     "wcoul0_source", "screening_method", "minimax_energy_reference",
     "sigma_omega_accumulation", "sigma_omega_layout", "fermi_reference",
     "w_dyson_solver",
@@ -1723,6 +1727,13 @@ class SCConfig:
     - ``history_depth``: rCROP history (m=5 is BGW's QSGW default).
     - ``mixing``: linear-mixing α (``accelerator="linear"`` only).
     - ``dump_dir``: per-iteration E-history .npy dump dir (None = off).
+    - ``eigh``: which eigh diagonalises the ``(nk, nb, nb)`` carry each
+      iteration — ``"native"`` (k-sharded batch: one WHOLE ``(nb, nb)``
+      tile per device), ``"distributed"`` (one tile spread over the mesh),
+      or ``"auto"``.  A LAYOUT choice: it does not change the physics and
+      it is deliberately not a side effect of ``density_self_consistent``,
+      which is what used to select it.  Resolution lives in
+      ``sc_iteration._resolve_sc_eigh``.
     """
     max_iter: int
     tol_ev: float
@@ -1730,6 +1741,7 @@ class SCConfig:
     history_depth: int
     mixing: float
     dump_dir: str | None
+    eigh: str = "auto"    # "auto" | "native" | "distributed"
 
     def __post_init__(self):
         if self.max_iter < 1:
@@ -1744,6 +1756,10 @@ class SCConfig:
             raise ValueError("sc_history_depth must be >= 1.")
         if not (0.0 < self.mixing <= 1.0):
             raise ValueError("sc_mixing must be in (0, 1].")
+        if self.eigh not in ("auto", "native", "distributed"):
+            raise ValueError(
+                f"sc_eigh must be 'auto', 'native' or 'distributed'; "
+                f"got {self.eigh!r}.")
 
 
 @dataclass(frozen=True)
@@ -2203,6 +2219,9 @@ class LorraxConfig:
             dump_dir=_sc_env(
                 "LORRAX_SC_DUMP_DIR", str, str(_g("sc_dump_dir") or ""),
                 "sc_dump_dir") or None,
+            # No env override: the LORRAX_SC_* envs are deprecated and a
+            # new knob must not add one.
+            eigh=str(_g("sc_eigh")).strip().lower(),
         )
         memory = MemoryConfig(
             per_device_gb=memory_per_device_gb,

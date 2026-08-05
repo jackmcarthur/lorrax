@@ -126,6 +126,7 @@ Longer discussions of the load-bearing keys are in [drivers.md](drivers.md).
 | `sc_history_depth` | `5` | rCROP history depth. |
 | `sc_mixing` | `1.0` | Linear-mixing alpha (accelerator = linear only). |
 | `sc_dump_dir` | `""` | Directory for per-iteration E-history npy dumps; empty = off. |
+| `sc_eigh` | `"auto"` | Eigh for the per-iteration (nk, nb, nb) carry: native = k-sharded batch, one whole (nb, nb) tile per device; distributed = one tile spread over the mesh; auto = distributed once a tile exceeds a fraction of `memory_per_device_gb` and the mesh divides nb, else native. Layout only — the eigenvalues agree and the physics does not change. |
 | `distributed_cholesky` | `"auto"` | Charge-channel zeta-fit Cholesky backend: auto | off | cusolvermp | slate. |
 | `distributed_lu` | `"auto"` | Transverse-channel LU backend: auto | off | cusolvermp | scalapack (host CPU; explicit only). |
 | `eigh_backend` | `"auto"` | BSE/htransform distributed-eigh sites: auto|off = q-batched native eigh; distributed | cusolvermp | slate | scalapack spread ONE tile over the mesh. CLI --eigh-backend overrides. |

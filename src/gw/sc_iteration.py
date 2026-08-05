@@ -218,7 +218,14 @@ def _make_kshard_eigh(mesh_xy: Mesh, *, eigvalsh_only: bool,
     replicated.  Pure perf hint — the math is identical to running
     ``vmap(eigh)`` on the replicated input.
 
-    ``mesh_xy.size`` must divide ``nk``; otherwise the resharding fails.
+    ``nk`` NEED NOT divide ``mesh_xy.size``.  ``with_sharding_constraint``
+    is a layout hint and GSPMD shards the k axis unevenly when it has to —
+    some devices simply get one fewer k.  (This docstring previously
+    asserted the opposite; job 7889742 ran the ``sc_on_ibz`` arm green at
+    P=4 with ``nk_irr = 10``, and ``_run_linear_mixing`` calls the
+    eigvalsh kernel on that ``(10, nb, nb)`` carry — ``10 % 4 != 0``.
+    ``dsc_demo/ibz44v.7889742.out:26``.)  What it costs at ``nk <
+    mesh.size`` is idle devices, not a failure.
     """
     rep_E = NamedSharding(mesh_xy, P(None, None))
     # ``u_spec`` chooses where U LANDS.  The SC loop asks for
@@ -272,6 +279,23 @@ def _kshard_eigh_kernels(mesh_xy: Mesh, u_spec: P | None = None) -> tuple:
     return eigh, eigvalsh
 
 
+def _midgap_efermi(E: jax.Array, n_occ: int) -> jax.Array:
+    """Fixed-band-cut midgap E_F from ascending eigenvalues.
+
+    One spelling, two callers (:func:`_diagonalize_and_get_efermi` and
+    :func:`gw_iteration_map`), because which EIGH ran and which E_F rule
+    applies are now independent decisions and the rule must not be
+    duplicated inside one of the eigh branches.
+
+    Valid for an insulator with a fixed occupied count; the general
+    answer, and the one the IBZ needs, is
+    :func:`gw.efermi.fermi_level_step` with star weights.
+    """
+    vbm = jnp.max(E[:, :n_occ])
+    cbm = jnp.where(n_occ < E.shape[1], jnp.min(E[:, n_occ:]), vbm)
+    return 0.5 * (vbm + cbm)
+
+
 def _diagonalize_and_get_efermi(
     H: jax.Array, n_occ: int, mesh_xy: Mesh, u_spec: P | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -288,10 +312,96 @@ def _diagonalize_and_get_efermi(
     """
     eigh_kshard, _ = _kshard_eigh_kernels(mesh_xy, u_spec)
     E, U = eigh_kshard(H)
-    vbm = jnp.max(E[:, :n_occ])
-    cbm = jnp.where(n_occ < E.shape[1], jnp.min(E[:, n_occ:]), vbm)
-    efermi = 0.5 * (vbm + cbm)
-    return E, U, efermi
+    return E, U, _midgap_efermi(E, n_occ)
+
+
+# The largest share of the per-device memory budget one (nb, nb) tile is
+# allowed to take before the native eigh stops being acceptable.
+#
+# The native path is a k-sharded BATCH: each device runs whole per-k
+# eighs, so it materialises the input tile, the eigenvector tile and
+# LAPACK's workspace — call it three tiles — on ONE device, on top of ψ,
+# the FFT boxes and the ω-cube.  Capping ONE tile at 3% of the budget
+# therefore caps the eigh's single-device footprint near 10%.
+#
+# Derived from bytes and the budget rather than from a band count, so it
+# tracks the device it runs on: at ``memory_per_device_gb = 40`` the
+# switch is at nb ≈ 8.7e3 (tile 1.2 GB), which is where the comment on
+# ``distributed_eigh_bands`` puts the concern ("1.6 GB at nb=1e4"); at
+# 8 GB/device it is nb ≈ 3.9e3.  Below the switch the native batch is
+# kept because it solves ndev matrices at once and wins by roughly ndev
+# (``ffi/linalg/resolve.py``, eigh ``auto`` policy).
+_SC_EIGH_TILE_BUDGET_FRACTION = 0.03
+
+
+def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
+    """``"native"`` or ``"distributed"`` for this iteration's eigh.
+
+    A LAYOUT decision and nothing else.  It used to be a side effect of
+    ``density_self_consistent`` — a physics knob, defaulting to False —
+    so the only eigh that keeps no whole ``(nb, nb)`` tile on one rank
+    was unreachable on the default path.  ``config.sc.eigh`` selects it
+    now; the E_F rule stays where it was, with ``density_self_consistent``.
+
+    ``"auto"`` picks ``distributed`` only when all three hold:
+
+    * the mesh has more than one device — on one device "distributed" is
+      the same tile with an FFI call around it;
+    * ``nb`` divides both mesh axes.  ``distributed_eigh_bands`` pads the
+      band axes up to the mesh divisor and does NOT undo the pad, so an
+      indivisible ``nb`` there returns ``(nk, nb_pad)`` / ``(nk, nb_pad,
+      nb_pad)`` — a silent shape change, not a refusal.  ``auto`` must
+      not walk into that; an explicit ``sc_eigh = distributed`` refuses
+      instead of returning padded arrays;
+    * one tile exceeds :data:`_SC_EIGH_TILE_BUDGET_FRACTION` of the
+      per-device budget.
+
+    and then only if the distributed backend actually resolves on this
+    mesh.  ``resolve_backend`` is the probe: it raises at RESOLVE time
+    naming the failed guard (platform, uncompiled handler, mesh geometry,
+    divisibility), so ``auto`` degrades to native with the reason printed
+    rather than failing inside the eigh.  An explicit request is not
+    probed — it must raise.
+    """
+    requested = str(getattr(getattr(config, "sc", None), "eigh", "auto"))
+    if requested == "native":
+        return "native"
+
+    ndev = int(mesh_xy.size)
+    px, py = (int(mesh_xy.shape[a]) for a in mesh_xy.axis_names)
+    divides = (nb % px == 0) and (nb % py == 0)
+
+    if requested == "distributed":
+        if not divides:
+            raise ValueError(
+                f"sc_eigh = distributed needs the SC band window nb={nb} to "
+                f"divide the mesh on both axes ({px}x{py}); it does not. "
+                f"distributed_eigh_bands would pad the band axes to "
+                f"{px * py} and return the PADDED shapes, which the carry "
+                f"and every band-indexed operand beside it would not match. "
+                f"Use sc_eigh = native or a mesh that divides nb.")
+        return "distributed"
+
+    tile_b = float(nb) * float(nb) * 16.0
+    budget_b = float(getattr(getattr(config, "memory", None),
+                             "per_device_gb", 0.0)) * 1e9
+    big = budget_b > 0.0 and tile_b > _SC_EIGH_TILE_BUDGET_FRACTION * budget_b
+    if ndev <= 1 or not divides or not big:
+        return "native"
+
+    from ffi.linalg import resolve_backend
+    try:
+        resolve_backend("eigh", "distributed", mesh_xy, n=nb)
+    except Exception as exc:                                  # noqa: BLE001
+        print_fn(
+            f"  SC eigh: auto wanted the distributed eigh (one (nb, nb) tile "
+            f"is {tile_b / 2**30:.3f} GiB, over "
+            f"{_SC_EIGH_TILE_BUDGET_FRACTION:.0%} of the "
+            f"{budget_b / 1e9:.1f} GB/device budget) but the backend refused "
+            f"— {type(exc).__name__}: {exc}.  Falling back to the k-sharded "
+            f"native batch, which puts that whole tile on ONE device.")
+        return "native"
+    return "distributed"
 
 
 def _band_rotation_spec() -> P:
@@ -788,23 +898,61 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                     np.eye(nb, dtype=np.complex128), H_np.shape),
                 NamedSharding(inputs.mesh_xy, _band_rotation_spec()))
     if E_qp_ry is None:
-        # DISTRIBUTED EIGH when density-SC is on.  ``_diagonalize_and_get_efermi``
-        # k-shards the eigh, so each device does nk/P of the per-k
-        # diagonalisations, but one (nb, nb) tile still lands whole on one
-        # device -- 1.6 GB at nb=1e4.  ``distributed_eigh_bands`` spreads
-        # each tile over the mesh instead (owner ruling 2026-08-04:
-        # robustness at 1e4+ bands over speed at 1e3, where the native batch
-        # wins by ~ndev).  E_F then comes from the k-weighted step routine
-        # rather than the fixed-band-cut midgap, which is the general answer
-        # and the one the IBZ needs.  Both branches now RETURN U at
-        # ``band_rotation_spec``, so the code below is layout-blind.
-        if bool(getattr(inputs.config, "density_self_consistent", False)):
+        # TWO INDEPENDENT DECISIONS, and they used to be one condition.
+        #
+        # (a) WHICH EIGH -- a LAYOUT question, answered by
+        # ``_resolve_sc_eigh`` from ``config.sc.eigh``.  The k-sharded
+        # batch gives each device nk/P of the per-k diagonalisations but
+        # still lands one WHOLE (nb, nb) tile on one device -- 1.6 GB at
+        # nb=1e4; ``distributed_eigh_bands`` spreads each tile over the
+        # mesh instead (owner ruling 2026-08-04: robustness at 1e4+ bands
+        # over speed at 1e3, where the native batch wins by ~ndev).  Until
+        # 2026-08-05 the distributed one was reachable ONLY by turning on
+        # ``density_self_consistent``, a physics knob defaulting to False,
+        # so the default -- and only shipped -- configuration had no way
+        # to ask for it.
+        #
+        # (b) WHICH E_F RULE -- a PHYSICS question, and it stays with
+        # ``density_self_consistent``: the k-weighted step routine there,
+        # the fixed-band-cut midgap otherwise.  Moving it would change
+        # numbers; moving (a) does not.
+        #
+        # Both eigh branches return U at ``band_rotation_spec``, so
+        # everything below is layout-blind.  The k-sharded one used to
+        # allgather U back to replicated by default; every consumer here
+        # is a device-side rotation that either wants
+        # ``band_rotation_spec`` outright (``qsgw_density.rotate_bands``)
+        # or reshards from whatever it is given (``rotate_wavefunctions``
+        # → ``band_mix_spec``), and the two matrix rotations
+        # (``_rotate_to_dft_basis`` and ``sigma_dispatch``'s V_H basis
+        # change) contract in this layout through
+        # ``qsgw_density.rotate_band_matrix``.  Per-rank U drops by px·py
+        # — 4.00 MiB → 1.00 MiB at nk=16/nb=128 on a 2×2 mesh (job
+        # 7889423), and it is the (nk, nb, nb) object that reaches 9.2 GB
+        # at nb=2000/nk=144.
+        nb_carry = int(state.H_qp_dft.shape[1])
+        eigh_kind = _resolve_sc_eigh(
+            nb_carry, inputs.mesh_xy, inputs.config,
+            print_fn=inputs.print_fn)
+        if state.iteration == 0:
+            inputs.print_fn(
+                f"    SC eigh: {eigh_kind} (nb={nb_carry}, one (nb, nb) tile "
+                f"= {nb_carry * nb_carry * 16 / 2**20:.2f} MiB, "
+                f"sc_eigh="
+                f"{getattr(getattr(inputs.config, 'sc', None), 'eigh', 'auto')})")
+        if eigh_kind == "distributed":
             from gw.qsgw_density import distributed_eigh_bands
+            E_qp_ry, U_qp = distributed_eigh_bands(
+                state.H_qp_dft, mesh=inputs.mesh_xy)
+        else:
+            eigh_kshard, _ = _kshard_eigh_kernels(
+                inputs.mesh_xy, _band_rotation_spec())
+            E_qp_ry, U_qp = eigh_kshard(state.H_qp_dft)
+
+        if bool(getattr(inputs.config, "density_self_consistent", False)):
             from gw.efermi import fermi_level_step
 
             from .scissor import k_star_weights
-            E_qp_ry, U_qp = distributed_eigh_bands(
-                state.H_qp_dft, mesh=inputs.mesh_xy)
             # THE SECOND REDUCTION OVER k IN THIS LOOP, and it needs the
             # same star weights the scissor does: the electron count is
             # Σ_k w_k Σ_n f_nk, so on the IBZ each star must carry its
@@ -816,21 +964,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             efermi_ry = fermi_level_step(
                 E_qp_ry, w_k / float(w_k.sum()), float(n_occ))
         else:
-            # SAME U LAYOUT AS THE DENSITY-SC BRANCH.  The k-sharded eigh
-            # allgathered U back to replicated by default; every consumer
-            # in this function is a device-side rotation that either wants
-            # ``band_rotation_spec`` outright (``qsgw_density.rotate_bands``)
-            # or reshards from whatever it is given
-            # (``rotate_wavefunctions`` → ``band_mix_spec``), and the two
-            # matrix rotations (``_rotate_to_dft_basis`` and
-            # ``sigma_dispatch``'s V_H basis change) contract in this
-            # layout through ``qsgw_density.rotate_band_matrix``.
-            # Per-rank U drops by px·py — 4.00 MiB → 1.00 MiB at
-            # nk=16/nb=128 on a 2×2 mesh (job 7889423), and it is the
-            # (nk, nb, nb) object that reaches 9.2 GB at nb=2000/nk=144.
-            E_qp_ry, U_qp, efermi_ry = _diagonalize_and_get_efermi(
-                state.H_qp_dft, n_occ, inputs.mesh_xy,
-                u_spec=_band_rotation_spec())
+            efermi_ry = _midgap_efermi(E_qp_ry, n_occ)
 
     # Rotate the active subspace of the DFT bundle to this iteration's QP
     # basis.  Bands outside ``slices.sigma`` keep their DFT ψ + DFT energy
