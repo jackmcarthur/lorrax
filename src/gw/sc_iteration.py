@@ -267,6 +267,98 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array) -> jax.Array:
     return jnp.einsum('kmp,kpq,knq->kmn', U, O_qp, jnp.conj(U), optimize=True)
 
 
+# ---------------------------------------------------------------------------
+# Density self-consistency: rebuild V_H from the CURRENT orbitals
+# ---------------------------------------------------------------------------
+#
+# OFF BY DEFAULT (``config.density_self_consistent``).  With it off this
+# module is byte-identical to before, which is what keeps
+# tests/test_sc_oneshot_equivalence.py meaningful.
+
+_PSI_G_CACHE: dict = {}
+
+
+def _dft_psi_sphere(inputs):
+    """DFT ψ(G) on the SC k-set, loaded ONCE and cached.
+
+    The SC bundle carries ψ at ISDF CENTROIDS, which cannot reconstruct
+    ρ on the FFT grid, so the density rebuild needs the G-sphere.  ψ_DFT
+    is constant across iterations — only U moves — so this is one read per
+    run, not one per iteration.
+    """
+    from jax.sharding import NamedSharding as _NS
+    from common.mtxel_sweep import band_sphere_spec
+
+    nb = int(inputs.kin_ion_dft.shape[1])
+    key = (id(inputs.wfn), nb)
+    hit = _PSI_G_CACHE.get(key)
+    if hit is None:
+        spec = band_sphere_spec()
+        psi = inputs.wfn.load(bands=(0, nb), k="full_bz", sharding=spec)
+        bidx = np.asarray(inputs.wfn.box_index(k="full_bz"))
+        hit = (psi, bidx)
+        _PSI_G_CACHE[key] = hit
+    return hit
+
+
+def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
+    """⟨m_dft|V_H[ρ(U)]|n_dft⟩ — the density-self-consistent Hartree.
+
+    Returns the matrix in the **DFT basis**, because that is what
+    ``sigma_dispatch`` rotates into the QP basis.  Rotating a fixed
+    operator was never the bug; using the DFT DENSITY's operator was.
+
+    Chain, all of it separately gated
+    (``tests/multi_device/qsgw_density_gate.py``):
+
+        E_qp → gw.efermi.fermi_level_step → step_occupations
+        ψ_dft, U, f, w → gw.qsgw_density.rho_from_wfns   (scan over k)
+        ρ → build_hartree_potential → V_H(r)
+        V_H(r) → common.mtxel_sweep → ⟨m|V_H|n⟩
+
+    The SC k-set is the FULL BZ with uniform weights, so no star
+    symmetrisation is needed and none is passed; an IBZ build (legal under
+    the 2026-08-04 TRS ruling, and cheaper) must supply ``sym_perm``, and
+    ``rho_from_wfns`` refuses without it.
+    """
+    from gw.efermi import fermi_level_step, step_occupations
+    from gw.qsgw_density import hartree_from_orbitals
+    from psp.get_DFT_mtxels import spin_degeneracy_factor
+    from common.mtxel_sweep import (SweepGeometry, local_potential_operator,
+                                    sweep_matrix_elements)
+    from psp.dft_operators import padded_gvectors
+
+    psi_G, bidx = _dft_psi_sphere(inputs)
+    nk, nb = int(psi_G.shape[0]), int(psi_G.shape[1])
+    kweights = np.full(nk, 1.0 / nk)          # full BZ ⇒ uniform
+
+    E_np = np.asarray(E_qp_ry)
+    n_occ_bands = float(inputs.meta.nelec)
+    e_f = fermi_level_step(E_np, kweights, n_occ_bands)
+    occ = step_occupations(E_np, e_f)
+
+    f_spin = spin_degeneracy_factor(inputs.wfn)
+    grid = tuple(int(v) for v in inputs.wfn.fft_grid)
+    rho_r, V_H_r = hartree_from_orbitals(
+        psi_G, occ, kweights, inputs.wfn, mesh=inputs.mesh_xy,
+        box_index=bidx, fft_grid=grid,
+        truncation_2d=bool(getattr(inputs.config, "sys_dim", 3) == 2),
+        spin_degeneracy=f_spin, U=U_qp,
+        expected_electrons=f_spin * float(np.einsum("k,kn->", kweights, occ)),
+        print_fn=inputs.print_fn)
+
+    gtab = padded_gvectors(inputs.wfn, k="full_bz")
+    geom = SweepGeometry(mesh=inputs.mesh_xy, fft_grid=grid,
+                         ngkmax=int(psi_G.shape[3]), nb=nb,
+                         ns=int(psi_G.shape[2]), nk=nk,
+                         cell_volume=float(inputs.wfn.cell_volume))
+    op = local_potential_operator(geom, V_H_r)
+    H_vh = sweep_matrix_elements(
+        psi_G, operator=op, geom=geom, gvecs=gtab.gvecs, gmask=gtab.mask,
+        box_index=bidx, kvecs=np.asarray(inputs.sym.unfolded_kpts))
+    return H_vh, e_f, rho_r
+
+
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     """One self-consistent QSGW step in the DFT basis.
 
@@ -330,6 +422,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         active_slice=inputs.band_slices.sigma,
     )
 
+    # DENSITY SELF-CONSISTENCY (opt-in).  Rebuild V_H from THIS iteration's
+    # orbitals and occupations instead of rotating the fixed DFT one.  Off
+    # by default, so the one-shot equivalence gate keeps its meaning.
+    v_h_dft_new = None
+    if bool(getattr(inputs.config, "density_self_consistent", False)):
+        v_h_dft_new, e_f_ry, _rho = rebuild_hartree_dft_basis(
+            inputs, U_qp, E_qp_ry)
+        inputs.print_fn(
+            f"    density-SC: rebuilt V_H from iteration {state.iteration} "
+            f"orbitals (E_F = {e_f_ry:.6f} Ry)")
+
     # Per-mode screening: solve W at every frequency the Σ scheme needs.
     # XLA cache hits on iteration ≥ 2 (same shapes, new values).
     requests = screening_requests_for(
@@ -360,6 +463,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # The stored/gspace V_H lives in the DFT basis; this is the U that
         # takes it into the basis ``wfns_qp`` is expressed in.
         hartree_basis_rotation=U_qp,
+        v_h_dft_override=v_h_dft_new,
         write_sigma_omega_h5=False,
         print_fn=inputs.print_fn,
     )

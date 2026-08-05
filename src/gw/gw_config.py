@@ -849,6 +849,10 @@ _DEFAULTS = {
     "ncond": 5,
     "nband": 100,
     "sys_dim": 2,
+    # Rebuild V_H from the CURRENT orbitals each self-consistent iteration
+    # instead of rotating the fixed DFT one into the QP basis.  Off keeps
+    # QSGW fixed-density, which is what every result before 2026-08-04 was.
+    "density_self_consistent": False,
     # Density-grid cutoff (Ry) for the psp matrix-element tools (kin_ion /
     # dipole).  None → the consumer defaults it to the WFN's own ``ecutwfc``.
     "ecutrho": None,
@@ -1855,6 +1859,7 @@ class LorraxConfig:
     ncond: int
     nband: int
     sys_dim: int
+    density_self_consistent: bool
     #: auto | stored | isdf | gspace — see HARTREE_SOURCES.
     hartree_source: str
 
@@ -2476,6 +2481,7 @@ class LorraxConfig:
             ncond=int(_g("ncond")),
             nband=int(_g("nband")),
             sys_dim=int(_g("sys_dim")),
+            density_self_consistent=bool(_g("density_self_consistent")),
             hartree_source=_hartree_source,
             restart=bool(_g("restart")),
             compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
