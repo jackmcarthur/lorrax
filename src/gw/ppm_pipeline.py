@@ -128,7 +128,7 @@ def _inject_analytic_head(
         of the head-only contribution ``(nω, nk, nb)`` in Ry (head is
         diagonal in band so this is a lossless decomposition).
     """
-    from .head_correction import compute_ppm_head_sigma_kij
+    from .head_correction import compute_ppm_head_sigma_diag
 
     enk_full, _ = get_enk_bandrange(
         wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
@@ -139,7 +139,15 @@ def _inject_analytic_head(
     efermi_ry = float(wfn.efermi)
     n_occ = min(meta.nelec, enk_full_np.shape[1])
 
-    head_sigma_kij_ry = compute_ppm_head_sigma_kij(
+    # The head is band-DIAGONAL; compute that (nω, nk, nb) representation
+    # once.  The dense (nω, nk, nb, nb) tensor — n_ω·nk·nb²·16 B per rank,
+    # a full-cube-sized transient — is embedded from it ONLY on the paths
+    # that add densely (in-memory replicated add, streamed h5 RMW); the
+    # sharded layout injects the diagonal rank-locally and never
+    # materializes the dense head anywhere.  The dense embed below is
+    # bit-identical to the historical compute_ppm_head_sigma_kij output
+    # (that function now embeds this same array — single source of truth).
+    head_sigma_diag_ry = compute_ppm_head_sigma_diag(
         head_gn,
         omega_grid_ry=np.asarray(config.omega_grid_ry, dtype=np.float64),
         enk_ry=enk_full_np,
@@ -148,7 +156,17 @@ def _inject_analytic_head(
         cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot),
     )
-    head_max_ev = float(np.max(np.abs(head_sigma_kij_ry))) * RYD_TO_EV
+
+    def _embed_dense(diag_w_kn: np.ndarray) -> np.ndarray:
+        n_w, nk_h, nb_h = diag_w_kn.shape
+        dense = np.zeros((n_w, nk_h, nb_h, nb_h), dtype=np.complex128)
+        idx = np.arange(nb_h)
+        dense[:, :, idx, idx] = diag_w_kn
+        return dense
+
+    # max|dense| == max|diag| (off-diagonals are exact zeros; |diag| >= 0),
+    # so the diagnostic is unchanged on every path.
+    head_max_ev = float(np.max(np.abs(head_sigma_diag_ry))) * RYD_TO_EV
     on_shell_occ = (
         -head_gn.R_h
         / (head_gn.omega_h * meta.cell_volume * meta.nk_tot)
@@ -158,8 +176,7 @@ def _inject_analytic_head(
         f"  Σ_c head shift: max|Σ^head_diag| = {head_max_ev:.4f} eV "
         f"(on-shell occ band → {on_shell_occ:+.4f} eV)"
     )
-    head_diag_w_kn_ry = np.diagonal(
-        np.asarray(head_sigma_kij_ry), axis1=2, axis2=3)
+    head_diag_w_kn_ry = np.asarray(head_sigma_diag_ry)
 
     if sigma_c_omega is None:
         # Streamed mode: RMW-add the head into the sigma_kij h5.  A head-less
@@ -174,7 +191,7 @@ def _inject_analytic_head(
                 "sigma_omega_accumulation=kij (in-memory).")
         if meta.rank == 0:
             import h5py
-            head_np = np.asarray(head_sigma_kij_ry, dtype=np.complex128)
+            head_np = _embed_dense(head_diag_w_kn_ry)
             n_omega = int(head_np.shape[0])
             # The head is diagonal-in-band; head_np's off-diagonals are exactly
             # zero, so adding the full (nω, nk, nb, nb) tile touches only the
@@ -194,8 +211,21 @@ def _inject_analytic_head(
                     h5.attrs["head_injected"] = True
         return None, head_diag_w_kn_ry
 
+    from .qsgw_utils import add_band_diag_sharded, is_band_sharded_sigma_omega
+    if is_band_sharded_sigma_omega(sigma_c_omega):
+        # Sharded layout (sigma_omega_layout=sharded): rank-local add of the
+        # band-diagonal head onto each rank's (m_X, n_Y) tile — zero
+        # communication, no dense head anywhere.  Element-for-element the
+        # same IEEE add as the dense path performs on the diagonal (its
+        # off-diagonal adds are exact +0.0).
+        return (
+            add_band_diag_sharded(sigma_c_omega, head_diag_w_kn_ry),
+            head_diag_w_kn_ry,
+        )
+
     return (
-        sigma_c_omega + jnp.asarray(head_sigma_kij_ry, dtype=jnp.complex128),
+        sigma_c_omega + jnp.asarray(_embed_dense(head_diag_w_kn_ry),
+                                    dtype=jnp.complex128),
         head_diag_w_kn_ry,
     )
 
@@ -296,6 +326,39 @@ def _write_sigma_omega_h5(
         out_path = os.path.join(input_dir, out_path)
 
     if sigma_c_omega is not None:
+        from .qsgw_utils import is_band_sharded_sigma_omega
+        if is_band_sharded_sigma_omega(sigma_c_omega):
+            # Sharded layout: derive the eV tensors with the OUTPUT sharding
+            # pinned to the cube's own (m_X, n_Y) tiling, so the partitioner
+            # cannot resolve the sharded+replicated elementwise mix by
+            # gathering the cube (pattern #4: make the constraint
+            # structural).  Same expression, same operand order as the
+            # writer's own derivation on the replicated path:
+            # total = (Ry→eV Σ_c + Ry→eV Σ_x[None]) + Ry→eV V_H[None] —
+            # bit-identical elementwise.  SlabIO's per-rank hyperslab
+            # writers (PHDF5_FFI / PHDF5_HOST) then write each rank's tile
+            # directly; the h5py_allgather backend is refused at P>1 for
+            # this layout at driver start.
+            shd = sigma_c_omega.sharding
+
+            def _ev_tensors(c_ry, x_ry, h_ry):
+                c_ev = RYD_TO_EV * c_ry
+                total = (c_ev + (RYD_TO_EV * x_ry)[None, ...]) \
+                    + (RYD_TO_EV * h_ry)[None, ...]
+                return total, c_ev
+
+            total_ev, sigma_c_ev = jax.jit(
+                _ev_tensors, out_shardings=(shd, shd))(
+                    sigma_c_omega, sig_x, sig_h)
+            write_sigma_omega_h5(
+                out_path, config.omega_grid_ev, total_ev,
+                sigma_c_kij_ev=sigma_c_ev,
+                sigma_sx_kij_ev=RYD_TO_EV * sig_x,
+                hartree_kij_ev=RYD_TO_EV * sig_h,
+                mesh=mesh_xy,
+                backend=config.backend.slab_io,
+            )
+            return out_path
         # SlabIO handles rank-0 dispatch internally; both backends need
         # all ranks to enter, so no ``if rank == 0`` guard.
         write_sigma_omega_h5(

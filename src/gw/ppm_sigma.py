@@ -102,7 +102,12 @@ class PPMBuildResult:
 class SigmaOmegaResult:
     omega_ry: np.ndarray
     omega_ev: np.ndarray
-    sigma_c_kij: jax.Array | None      # (n_omega, nk, nb, nb) or None if streamed
+    # (n_omega, nk, nb, nb) or None if streamed.  Layout is carried BY THE
+    # ARRAY'S OWN SHARDING (single source of truth): replicated/uncommitted
+    # under sigma_omega_layout=replicated (historical), or
+    # P(None, None, 'x', 'y') band-tiled under sigma_omega_layout=sharded —
+    # consumers branch via qsgw_utils.is_band_sharded_sigma_omega.
+    sigma_c_kij: jax.Array | None
     sigma_kij_h5_path: str | None = None
 
 
@@ -922,8 +927,47 @@ def compute_sigma_c_ppm_omega_grid(
     )
     streaming = (accum_mode == _AccumMode.KIJ_STREAM)
 
+    # Σ_c(ω) end-of-stage layout (wk_REL ω-cube sharding).  "sharded" keeps
+    # the per-rank (m_X, n_Y) host tiles where the stacked psum_scatter left
+    # them and publishes them as ONE P(None,None,'x','y')-sharded jax.Array
+    # on the EXISTING mesh — the full-cube reconstruction gather (the
+    # P-independent n_ω·nk·nb²·16 B 'sigma.host_gather' collective,
+    # 2751 MB/rank at nb=512) is elided, and every consumer reads the tiles
+    # at their native sharding.  Movement-only: outputs are bit-identical
+    # (A/B gated).  Announced here per doctrine 3.
+    sharded_layout = (str(ppm_cfg.omega_layout) == "sharded") and not streaming
+    if str(ppm_cfg.omega_layout) == "sharded" and streaming:
+        # Reachable only via omega_accumulation=auto resolving to KIJ_STREAM
+        # (single-process + stream path set); explicit kij_stream × sharded
+        # is refused at config parse.  The streamed path never materializes
+        # the cube, so the layout flag is inert — say so rather than
+        # silently ignore it.
+        print_fn(
+            "  Σc layout: sigma_omega_layout=sharded is INERT on the "
+            "streamed (kij_stream) accumulation path — no ω-cube is ever "
+            "materialized there.")
+    if sharded_layout:
+        p_x = int(mesh_xy.shape['x'])
+        p_y = int(mesh_xy.shape['y'])
+        if nb_proj % p_x != 0 or nb_proj % p_y != 0:
+            # Round-1 scope: the mesh-pad block (pad_sigma_window) cannot
+            # ride the sharded consumer path yet — the QSGW Hermitize needs
+            # a square unpadded extent.  Refuse with the fix named rather
+            # than fall back silently (doctrine 3 / pattern #6).
+            raise ValueError(
+                f"sigma_omega_layout=sharded (round 1) requires the σ band "
+                f"window to divide the mesh on both axes: nb={nb_proj}, "
+                f"mesh {p_x}x{p_y} (nb%p_x={nb_proj % p_x}, "
+                f"nb%p_y={nb_proj % p_y}).  Choose nval+ncond divisible by "
+                f"both mesh extents, or use sigma_omega_layout=replicated.")
+        print_fn(
+            "  Σc layout: sharded — Σ_c(ω,k,m,n) stays (m_X, n_Y)-tiled on "
+            "the existing mesh; the end-of-stage full-cube replication "
+            f"gather ({kij_bytes / 1e6:.2f} MB/rank) is ELIDED "
+            "(sigma_omega_layout=sharded).")
+
     sigma_kij_host = (
-        None if streaming
+        None if (streaming or sharded_layout)
         else np.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=np.complex128)
     )
 
@@ -1022,6 +1066,7 @@ def compute_sigma_c_ppm_omega_grid(
         # needed (branch returns None there).
         tile_acc = None     # per-shard host accumulators, full ω extent
         tile_meta = None    # first branch's _SigmaBranchTiles (layout metadata)
+        sigma_kij_sharded = None  # sharded-layout result (set in tile_finalize)
         for br in branches:
             branch_tiles, _ = _run_sigma_branch(
                 omega_nonneg_ry=br.omega_abs, omega_global_idx=br.omega_idx,
@@ -1055,8 +1100,9 @@ def compute_sigma_c_ppm_omega_grid(
         # (Every rank needs the full tensor: downstream head injection /
         # diag(Σ_c) interpolation / sigma_mnk write all read the replicated
         # host copy, and the final jnp.asarray(sigma_kij_host) must agree
-        # across processes.)
-        if not streaming and tile_acc is not None:
+        # across processes.)  Skipped entirely on the sharded layout, whose
+        # tail is the 'sigma.tile_finalize' block below.
+        if not streaming and not sharded_layout and tile_acc is not None:
             assert tile_meta.nb_real == nb_proj
             with timing.section("sigma.host_gather"):
                 padded_shape = (n_omega,) + tuple(
@@ -1080,10 +1126,62 @@ def compute_sigma_c_ppm_omega_grid(
                 # Σ buffer, eqp write) sees only the real nb_proj extent.
                 sigma_kij_host += strip_sigma_window(full_pad, nb_proj)
 
+        # Sharded-layout tail: NO reconstruction collective.  The per-rank
+        # host tiles (already branch-summed at their global ω indices, in
+        # the same element order as the replicated path) get the
+        # static-COHSEX invalid-pole term added RANK-LOCALLY, are placed
+        # back on their owning local devices (device_put of a process-local
+        # buffer — no collective), and are published as ONE
+        # P(None,None,'x','y')-sharded jax.Array on the existing mesh.
+        # Consumers (head injection, diag extraction, QSGW build,
+        # sigma_mnk.h5 SlabIO write) read this array at its native
+        # sharding.  The timing row exists to PROVE the tail stays ~0 s
+        # (it replaces 'sigma.host_gather', which does not run here).
+        if sharded_layout:
+            with timing.section("sigma.tile_finalize"):
+                gshape = (n_omega, nk_proj, nb_proj, nb_proj)
+                if tile_acc is None:
+                    # No branch produced tiles (all-empty branches): a zero
+                    # Σ_c, mirroring the replicated path's untouched zeros
+                    # buffer.  Same metadata idiom as
+                    # _MemoryTileSink.host_tiles()'s empty path.
+                    sharding = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
+                    devices = list(sharding.addressable_devices)
+                    dmap = sharding.devices_indices_map(gshape)
+                    local_shape = sharding.shard_shape(gshape)
+                    tile_acc = [np.zeros(local_shape, dtype=np.complex128)
+                                for _ in devices]
+                    tile_index = [tuple(dmap[d]) for d in devices]
+                else:
+                    assert tile_meta.nb_real == nb_proj
+                    # The divisibility refusal above guarantees the mesh pad
+                    # resolved to identity — padded extents ARE the real
+                    # extents (pattern #7: assert it, don't assume it).
+                    assert tuple(int(s) for s in tile_meta.spatial_padded) \
+                        == (nk_proj, nb_proj, nb_proj), (
+                        f"sharded Σ layout saw a padded window "
+                        f"{tile_meta.spatial_padded} despite the "
+                        f"divisibility guard (nb={nb_proj})")
+                    sharding = tile_meta.sharding
+                    devices = tile_meta.devices
+                    tile_index = tile_meta.tile_index
+                # static_limit fold, rank-local — same per-element order as
+                # the replicated path (branch sum first, then the static
+                # term); tile_index[d] is (ω-slice, k-slice, m-slice,
+                # n-slice) into the global cube.
+                if sigma_static_host is not None:
+                    for d, ix4 in enumerate(tile_index):
+                        tile_acc[d] += sigma_static_host[tuple(ix4[1:])][None, ...]
+                arrays = [jax.device_put(t, dev)
+                          for t, dev in zip(tile_acc, devices)]
+                sigma_kij_sharded = jax.make_array_from_single_device_arrays(
+                    gshape, sharding, arrays)
+
         # static_limit: fold the ω-independent invalid-pole static-COHSEX
         # term into Σ_c at every ω (host add / streamed ω-batched h5 RMW —
-        # identical values on both paths).
-        if sigma_static_host is not None:
+        # identical values on both paths; the sharded layout folded it
+        # tile-locally above).
+        if sigma_static_host is not None and not sharded_layout:
             if not streaming:
                 sigma_kij_host += sigma_static_host[None, ...]
             else:
@@ -1100,7 +1198,10 @@ def compute_sigma_c_ppm_omega_grid(
         if h5_kij is not None:
             h5_kij.close()
 
-    sigma_kij_req = None if sigma_kij_host is None else jnp.asarray(sigma_kij_host, dtype=jnp.complex128)
+    if sharded_layout:
+        sigma_kij_req = sigma_kij_sharded
+    else:
+        sigma_kij_req = None if sigma_kij_host is None else jnp.asarray(sigma_kij_host, dtype=jnp.complex128)
     return SigmaOmegaResult(
         omega_ry=np.asarray(omega_req, dtype=np.float64),
         omega_ev=np.asarray(omega_req * RYD_TO_EV, dtype=np.float64),

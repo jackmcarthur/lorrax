@@ -736,9 +736,44 @@ def compute_ppm_head_sigma_kij(
         raise ValueError("enk_ry must be 2D (nk, nb)")
     n_omega = int(omega.size)
     nk, nb = enk.shape
+    sigma_diag = compute_ppm_head_sigma_diag(
+        head, omega_grid_ry=omega, enk_ry=enk, efermi_ry=efermi_ry,
+        n_occ=n_occ, cell_volume=cell_volume, nk_tot=nk_tot, eta=eta)
     out = np.zeros((n_omega, nk, nb, nb), dtype=np.complex128)
+    idx = np.arange(nb)
+    out[:, :, idx, idx] = sigma_diag
+    return out
+
+
+def compute_ppm_head_sigma_diag(
+    head: HeadGNParams,
+    *,
+    omega_grid_ry: np.ndarray,
+    enk_ry: np.ndarray,
+    efermi_ry: float,
+    n_occ: int,
+    cell_volume: float,
+    nk_tot: int,
+    eta: float = 1.0e-6,
+) -> np.ndarray:
+    """Band-DIAGONAL of :func:`compute_ppm_head_sigma_kij` — ``(nω, nk, nb)``.
+
+    The q→0 head enters only the band diagonal (``M_{nm}(k, q→0, G=0) =
+    δ_{nm}``), so this is the complete information content of the dense
+    ``(nω, nk, nb, nb)`` tensor at nb× less memory — the representation the
+    sharded-Σ layout (``sigma_omega_layout=sharded``) injects rank-locally
+    instead of materializing the dense cube on every rank.  The dense
+    builder above embeds exactly this array, so the two representations are
+    bit-identical by construction (single source of truth).
+    """
+    omega = np.asarray(omega_grid_ry, dtype=np.float64).reshape(-1)
+    enk = np.asarray(enk_ry, dtype=np.float64)
+    if enk.ndim != 2:
+        raise ValueError("enk_ry must be 2D (nk, nb)")
+    n_omega = int(omega.size)
+    nk, nb = enk.shape
     if abs(head.R_h) < 1.0e-30 or abs(head.omega_h) < 1.0e-30:
-        return out
+        return np.zeros((n_omega, nk, nb), dtype=np.complex128)
 
     eps_rel = enk - float(efermi_ry)                                # (nk, nb)
     f = np.zeros((nb,), dtype=np.float64)
@@ -747,10 +782,7 @@ def compute_ppm_head_sigma_kij(
     occ_term = f[None, None, :] / (delta + head.omega_h - 1j * eta)
     emp_term = (1.0 - f[None, None, :]) / (delta - head.omega_h + 1j * eta)
     sigma_diag = (head.R_h / (float(cell_volume) * float(nk_tot))) * (occ_term + emp_term)
-
-    idx = np.arange(nb)
-    out[:, :, idx, idx] = sigma_diag
-    return out
+    return np.asarray(sigma_diag, dtype=np.complex128)
 
 
 def format_head_diagnostics(head: HeadGNParams, cell_volume: float) -> str:

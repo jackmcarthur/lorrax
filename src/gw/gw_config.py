@@ -730,6 +730,19 @@ _DEFAULTS = {
     "sigma_window_edge_factor": 1.5,
     "sigma_omega_batch_size": 4,
     "sigma_omega_accumulation": "auto",
+    # Σ_c(ω,k,m,n) end-of-stage layout (wk_REL ω-cube sharding workstream):
+    #   "replicated" (default) — today's path: the per-rank (m_X, n_Y) host
+    #       tiles are gathered into the FULL cube on EVERY rank
+    #       (n_ω·nk·nb²·16 B replicated; 2751 MB/rank at nb=512).
+    #   "sharded" — the tiles stay where the stacked psum_scatter left them
+    #       on the existing 2-D mesh; consumers (head injection, diag/eqp
+    #       interpolation, QSGW build, sigma_mnk.h5 SlabIO write) read the
+    #       P(None,None,'x','y')-sharded cube directly.  Outputs are
+    #       bit-identical to "replicated" (movement-only; A/B gated).
+    #       Round-1 refusals (at config/driver resolve time, never mid-run):
+    #       self_consistent, kij_stream, indivisible σ band window, and
+    #       slab_io=h5py_allgather at P>1.
+    "sigma_omega_layout": "replicated",
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
     # poles (BGW mode 0); '2ry' keeps the fit's fallback pole (BGW mode 2);
@@ -767,7 +780,7 @@ _NORMALIZE_STR = {
     "qp_solver",
     "sc_accelerator",
     "wcoul0_source", "screening_method", "minimax_energy_reference",
-    "sigma_omega_accumulation", "fermi_reference",
+    "sigma_omega_accumulation", "sigma_omega_layout", "fermi_reference",
     "w_dyson_solver",
     "ppm_invalid_mode",
     "ppm_model",
@@ -1077,6 +1090,11 @@ class PPMConfig:
     window_edge_factor: float
     omega_batch_size: int
     omega_accumulation: str       # "auto" | "kij" | "kij_stream"
+    #: Σ_c(ω) end-of-stage layout: "replicated" gathers the full cube onto
+    #: every rank (historical path); "sharded" keeps it (m_X, n_Y)-tiled on
+    #: the existing mesh and consumers read the tiles directly (movement-only,
+    #: bit-identical outputs; see _DEFAULTS["sigma_omega_layout"]).
+    omega_layout: str             # "replicated" | "sharded"
 
     # --- on-shell evaluation knobs ---
     invalid_mode: str             # "zero" | "2ry" | "static_limit" | "infinity"(alias)
@@ -1099,6 +1117,19 @@ class PPMConfig:
         if self.omega_accumulation not in ("auto", "kij", "kij_stream"):
             raise ValueError(
                 "ppm.omega_accumulation must be auto/kij/kij_stream.")
+        if self.omega_layout not in ("replicated", "sharded"):
+            raise ValueError(
+                "sigma_omega_layout must be 'replicated' or 'sharded'; "
+                f"got {self.omega_layout!r}.")
+        if self.omega_layout == "sharded" and self.omega_accumulation == "kij_stream":
+            # kij_stream never materializes the ω-cube (it RMW-streams each
+            # window to h5), so a sharded layout request would be silently
+            # inert — refuse the contradiction at parse time (doctrine 3).
+            raise ValueError(
+                "sigma_omega_layout=sharded is incompatible with "
+                "sigma_omega_accumulation=kij_stream: the streamed path "
+                "never materializes the Σ_c(ω) cube, so there is nothing "
+                "to shard.  Use 'kij' or 'auto'.")
         if self.invalid_mode not in (
             "zero", "skip", "2ry", "static_limit", "infinity", "imaginary"
         ):
@@ -1390,6 +1421,18 @@ class LorraxConfig:
                 f"leaves no in-memory ω-tensor for the on-shell solve / "
                 f"QSGW build (the eigh-family outputs would silently "
                 f"degrade to static Σ).  Use 'kij' or 'auto'.")
+        if (solver is QPSolver.SELF_CONSISTENT
+                and self.ppm.omega_layout == "sharded"):
+            # Round-1 scope of the ω-cube sharding workstream: the SC driver
+            # captures Σ_c(ω) across iterations and its rotate-back seam has
+            # not been ported to the tiled layout.  Refuse at resolve time
+            # rather than fail (or silently gather) mid-loop (pattern #6).
+            raise ValueError(
+                "sigma_omega_layout=sharded does not support "
+                "qp_solver=self_consistent yet (round 1 of the ω-cube "
+                "sharding workstream): the SC loop's Σ_c(ω) capture / "
+                "rotation seam still assumes the replicated cube.  Use "
+                "sigma_omega_layout=replicated for SC runs.")
         return solver
 
     @property
@@ -1577,6 +1620,7 @@ class LorraxConfig:
             window_edge_factor=float(_g("sigma_window_edge_factor")),
             omega_batch_size=int(_g("sigma_omega_batch_size")),
             omega_accumulation=str(_g("sigma_omega_accumulation")).strip().lower(),
+            omega_layout=str(_g("sigma_omega_layout")).strip().lower(),
             invalid_mode=str(_g("ppm_invalid_mode") or "static_limit").strip().lower(),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
