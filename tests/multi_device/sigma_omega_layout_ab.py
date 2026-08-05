@@ -8,6 +8,7 @@ arms with your launcher on the SAME deck, changing ONLY
 ``sigma_omega_layout``, then:
 
     python3 sigma_omega_layout_ab.py compare <replicated_dir> <sharded_dir>
+            [--solver one_shot_dft|self_consistent]
 
 ``sigma_omega_layout = sharded`` is a MOVEMENT-ONLY change: the per-rank
 (m_X, n_Y) host tiles produced by the stacked psum_scatter are published as
@@ -67,6 +68,55 @@ deck MoS2 4x4x1 / 128 bands / nω=41 / nk=16 (cube 171.97 MB/rank),
 
 Bit-identity held here but is NOT asserted (see the tolerance note above).
 
+MEASURED, job 7889782, same deck and mesh, ``qp_solver = self_consistent``,
+sc_max_iter=3 / sc_tol_ev=1e-12 / default rcrop accelerator (= 7 Σ
+evaluations), frozen tree
+/scratch2/08271/jackmc/omegacube_ab/frozen_24673e6_noguard/lorrax, which is
+24673e6 with the 12-line SC refusal at gw_config.py:1985-1996 deleted and
+nothing else changed:
+
+    eqp0.dat, eqp1.dat        max|ΔE_QP| = 0.000e+00 eV
+    sigma_diag.dat            max|Δ| = 0.000e+00 eV, all five columns
+    sigma_mnk.h5 (4 datasets) BIT-IDENTICAL
+    WFN_qp.h5 el              BIT-IDENTICAL
+    qp_wfn_rotations.h5       BIT-IDENTICAL, E_qp AND U_mnk
+    SC trajectory             7 iterations both arms; final RMS ΔE
+                              1.3130e-02 eV both
+    sigma.host_gather         replicated 7 calls / 2.010 s (once per Σ
+                              evaluation); ABSENT sharded
+    sigma.tile_finalize       sharded 7 calls / 0.057 s
+    wall                      232.162 s replicated → 232.636 s sharded
+    VmHWM (max over 4 ranks)  6752.6 MB replicated → 6476.2 MB sharded
+
+The five SC-path cube consumers and the branch each takes (read at 24673e6):
+
+  head injection      ppm_pipeline.py:178 branches on
+                      is_band_sharded_sigma_omega — sharded takes
+                      add_band_diag_sharded (rank-local scatter-add, no dense
+                      head), replicated takes the _embed_dense + `+` at :189.
+                      Once per Σ evaluation.
+  diag(Σ_c) at E_DFT  qsgw_utils.py:337 — sharded takes
+                      _extract_diag_sharded_kernel (shard_map + one psum of
+                      an (nω,nk,nb) array), replicated takes
+                      _extract_diag_kernel (with_sharding_constraint to a
+                      replicated 4-D, then the einsum trace).  Called from
+                      ppm_pipeline.py:230, once per Σ evaluation.
+  sigma_mnk.h5 write  ppm_pipeline.py:267 — sharded derives the eV tensors
+                      under out_shardings pinned to the cube's own sharding
+                      and hands per-rank tiles to SlabIO; replicated takes
+                      the dense call at :301.  Once per SC run, from
+                      sc_iteration.py:1297.
+  eqp1 Z-factor diag  gw_jax.py:651-653 — the same call as the second row,
+                      so the same branch.  Once, after the driver returns.
+  QSGW Σ_xc build     qsgw_utils._qsgw_build_kernel:355-389 — NO branch, and
+                      none is needed: take_along_axis indexes axis 0 (ω),
+                      which is None in both layouts' PartitionSpec, so it is
+                      shard-local either way, and the
+                      with_sharding_constraint(M, rep_3d) at :383 replicates
+                      the (nk,nb,nb) result before the Hermitisation.  That
+                      line is where the two layouts converge.  Called from
+                      sigma_dispatch.py:445, once per Σ evaluation.
+
 Exit code 0 = every gated quantity passes.
 """
 from __future__ import annotations
@@ -94,6 +144,20 @@ H5_SIGMA_DATASETS = (
 # QP eigenvalues inside WFN_qp.h5 (Ry).  'elda' is absent in some writers'
 # output, so the list is probed, not required.
 WFN_QP_DATASETS = ("mf_header/kpoints/el", "mf_header/kpoints/elda")
+
+# qp_wfn_rotations.h5 (file_io.qp_wfn.write_qp_rotations_h5): the eigenvalues
+# and eigenvectors of the converged H_qp_dft.  E_qp is gated; U_mnk is
+# REPORTED ONLY, because an eigenvector is defined up to a phase and, inside a
+# degenerate multiplet, up to a unitary mixing — a difference there is not
+# evidence of a physics difference unless E_qp also moved.  (This deck is
+# heavily degenerate: eqp0.dat shows every level twice.)
+QP_ROT_DATASETS = ("E_qp_nk_hartree", "U_mnk")
+QP_ROT_REPORT_ONLY = ("U_mnk",)
+
+# "SC done: 7 iterations, final RMS ΔE = 1.3130e-02 eV" (sc_iteration).
+_SC_DONE = re.compile(
+    r'SC done:\s*(\d+)\s*iterations'
+    r'(?:,\s*final RMS\s*\S*E\s*=\s*([-\d.eE+]+)\s*eV)?')
 
 
 # --------------------------------------------------------------------------
@@ -209,7 +273,8 @@ def compare_arrays(name: str, a: np.ndarray, b: np.ndarray) -> tuple[float, bool
     return (rel, ok)
 
 
-def compare_h5(name: str, pa: Path, pb: Path, datasets, required: bool) -> bool:
+def compare_h5(name: str, pa: Path, pb: Path, datasets, required: bool,
+               report_only=()) -> bool:
     import h5py
     if not pa.exists() or not pb.exists():
         miss = pa if not pa.exists() else pb
@@ -229,7 +294,10 @@ def compare_h5(name: str, pa: Path, pb: Path, datasets, required: bool) -> bool:
             _, good = compare_arrays(
                 f"{name}[{ds}]",
                 np.asarray(fa[ds]), np.asarray(fb[ds]))
-            ok &= good
+            if ds in report_only:
+                print(f"    ^ {ds}: reported, NOT gated (eigenvector gauge)")
+            else:
+                ok &= good
     if required and seen == 0:
         print(f"  {name}: none of {datasets} present  FAIL")
         ok = False
@@ -324,9 +392,57 @@ def compare_timing(da: Path, db: Path, log_name: str) -> bool:
     return ok
 
 
+def compare_sc(da: Path, db: Path, log_name: str) -> bool:
+    """SC-only checks.
+
+    The guard this gate exists to test claims SC is special because the driver
+    "captures Σ_c(ω) across iterations".  So the SC arm must show (i) that the
+    two layouts walked the SAME trajectory, not just landed on the same point —
+    a different number of iterations with the same endpoint would hide a
+    per-iteration difference; and (ii) that the replicated arm really did pay
+    the full-cube gather once per Σ evaluation, which is what makes SC the
+    workload with the most to gain.
+    """
+    la, lb = da / log_name, db / log_name
+    if not la.exists() or not lb.exists():
+        print(f"  SC: {log_name} absent in one arm  FAIL")
+        return False
+    ma = _SC_DONE.search(la.read_text(errors="replace"))
+    mb = _SC_DONE.search(lb.read_text(errors="replace"))
+    if ma is None or mb is None:
+        print("  SC: no 'SC done:' line — the arms did not run the SC driver"
+              "  FAIL")
+        return False
+    na, nb = int(ma.group(1)), int(mb.group(1))
+    ok = (na == nb)
+    print(f"  SC iterations: replicated={na} sharded={nb} "
+          f"{'PASS' if ok else 'FAIL'}")
+    if ma.group(2) and mb.group(2):
+        ra, rb = float(ma.group(2)), float(mb.group(2))
+        same = (ra == rb)
+        print(f"  SC final RMS ΔE: {ra:.4e} vs {rb:.4e} eV  |Δ|={abs(ra - rb):.3e}"
+              f"  {'IDENTICAL' if same else 'DIFFER'} {'PASS' if same else 'FAIL'}")
+        ok &= same
+    # The payoff claim: the gather is per Σ evaluation, not per run.
+    ta = parse_timing_rows(la)
+    g = ta.get("sigma.host_gather")
+    if g is None:
+        print("  SC: replicated arm has no sigma.host_gather row  FAIL")
+        ok = False
+    elif g[0] < 2:
+        print(f"  SC: replicated sigma.host_gather ran {g[0]}x — the "
+              f"per-iteration cost is not exercised by this deck  FAIL")
+        ok = False
+    else:
+        print(f"  SC: replicated sigma.host_gather ran {g[0]}x "
+              f"(once per Σ evaluation) — {g[1]:.3f} s total  PASS")
+    return ok
+
+
 def compare_run(da: Path, db: Path, *, log_name: str,
-                sigma_diag_name: str) -> bool:
-    print(f"\n===== sigma_omega_layout A/B =====")
+                sigma_diag_name: str, solver: str) -> bool:
+    sc = (solver == "self_consistent")
+    print(f"\n===== sigma_omega_layout A/B  (qp_solver = {solver}) =====")
     print(f"  replicated: {da}")
     print(f"  sharded   : {db}")
     ok = True
@@ -335,8 +451,17 @@ def compare_run(da: Path, db: Path, *, log_name: str,
     ok &= compare_sigma_diag(sigma_diag_name, da, db)
     ok &= compare_h5("sigma_mnk.h5", da / "sigma_mnk.h5", db / "sigma_mnk.h5",
                      H5_SIGMA_DATASETS, required=True)
+    # SC always dumps the QP artifacts (sc_iteration.dump_qp_wfn_artifacts);
+    # the one-shot dump refuses when Σ is on the full BZ and the WFN carries
+    # the IBZ, so they are optional there.
     ok &= compare_h5("WFN_qp.h5", da / "WFN_qp.h5", db / "WFN_qp.h5",
-                     WFN_QP_DATASETS, required=False)
+                     WFN_QP_DATASETS, required=sc)
+    ok &= compare_h5("qp_wfn_rotations.h5",
+                     da / "qp_wfn_rotations.h5", db / "qp_wfn_rotations.h5",
+                     QP_ROT_DATASETS, required=sc,
+                     report_only=QP_ROT_REPORT_ONLY)
+    if sc:
+        ok &= compare_sc(da, db, log_name)
     ok &= compare_timing(da, db, log_name)
     print(f"===== {'PASS' if ok else 'FAIL'} =====")
     return ok
@@ -348,6 +473,7 @@ def main() -> int:
         sys.exit(__doc__)
     log_name = "gw_rank0.out"
     sigma_diag_name = "sigma_diag.dat"
+    solver = "one_shot_dft"
     pos = []
     i = 1
     while i < len(argv):
@@ -355,12 +481,15 @@ def main() -> int:
             log_name = argv[i + 1]; i += 2
         elif argv[i] == "--sigma-diag":
             sigma_diag_name = argv[i + 1]; i += 2
+        elif argv[i] == "--solver":
+            solver = argv[i + 1]; i += 2
         else:
             pos.append(argv[i]); i += 1
-    if len(pos) != 2:
+    if len(pos) != 2 or solver not in ("one_shot_dft", "self_consistent"):
         sys.exit(__doc__)
     ok = compare_run(Path(pos[0]), Path(pos[1]),
-                     log_name=log_name, sigma_diag_name=sigma_diag_name)
+                     log_name=log_name, sigma_diag_name=sigma_diag_name,
+                     solver=solver)
     return 0 if ok else 1
 
 
