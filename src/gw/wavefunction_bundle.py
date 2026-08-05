@@ -146,7 +146,17 @@ class Wavefunctions:
     psi_yr: jax.Array   # (nk, n, s, μ_Y)
     psi_yn: jax.Array   # (nk, s, μ_Y, n)
     enk: jax.Array       # (nk, nb_full) replicated
-    occ: jax.Array       # (nk, nb_full) replicated
+    #: (nk, nb_full) float64 replicated.  Storage is a WEIGHT, but only ρ
+    #: (``qsgw_density.rho_from_wfns``) consumes it as one today.  χ₀ takes
+    #: its val/cond split from a BAND-INDEX CUT (``minimax_screening.py``
+    #: :943-944, ``s.val``/``s.cond``), static Σ_x/Σ_SX from the
+    #: ``nocc = min(nelec, nb_sigma)`` band projector
+    #: (``cohsex_sigma.py``:72-74), and the one Σ site that does read this
+    #: array thresholds it (``ppm_sigma.py``:181, ``occ_full > 0.5``).  So
+    #: a fractional-occupation port must change those three as well:
+    #: filling ``occ`` alone leaves χ₀ and Σ on a step function while ρ
+    #: alone is smeared, and nothing would flag the disagreement.
+    occ: jax.Array
     slices: BandSlices
 
     # Slice accessors — bands is a Python ``slice`` (hashable in 3.12+) so
