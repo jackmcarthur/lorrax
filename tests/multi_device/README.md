@@ -50,3 +50,16 @@ its only prior certification was two batch jobs named in commit 712a866.
 
 Harness: `/scratch2/08271/jackmc/omegacube_ab/{one_shot,sc}.sbatch` +
 `ab_common.sh` (N=2, n=4, P=4, frozen source tree under the same directory).
+
+Sharded-Σ_c rotation probe: `sigma_omega_rotate_probe.py`, any square P. Reads
+the COMPILED (already SPMD-partitioned) HLO of a per-ω rotation of a
+P(None,None,'x','y')-sharded Σ_c(ω,k,m,n) by a replicated (nk,nb,nb) W — the
+contraction a same-basis `sigma_mnk.h5` / `WFN_qp.h5` write would need — and
+reports the collective census and peak transient against the full cube. Four
+formulations; a small-shape leg executes them all against a host reference.
+Run at TWO mesh sizes: at P=4 four tiles and one cube are the same byte count.
+
+    srun -n 4 python3 -m sigma_omega_rotate_probe   # SOR_NW/NK/NB
+
+Harness: `/scratch2/08271/jackmc/omegacube_ab/rotprobe.sbatch` (N=8, legs at
+P=4 and P=16, frozen tree). Green at job 7889790.
