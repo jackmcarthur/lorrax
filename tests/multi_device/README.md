@@ -3,7 +3,9 @@
 Tier-2 device-count-invariance gate: runs the gnppm + bispinor e2e fixtures at
 P=1 (1 GPU) and P=4 (4 GPUs, one process per device) and compares ζ / Σ_X /
 minimax node counts / invalid census / off-pole eqp against the tolerances
-from `reports/device_invariance_2026-07-08/ROOT_CAUSE.md` (lorrax_sandbox).
+from `reports/device_invariance_2026-07-08/ROOT_CAUSE.md`, committed in this
+repo since fdc48ae.  It was previously attributed to lorrax_sandbox, which
+never held it — the set lived untracked in a sibling checkout.
 
 - `run_tier2.sh` — Perlmutter driver (needs `module load lorrax_X
   lorrax_agent` + a GPU allocation): `bash tests/multi_device/run_tier2.sh`.
