@@ -1708,3 +1708,120 @@ class SymMaps:
             raise ValueError(f"No matching q-point found within tolerance {tol}")
 
         return jnp.argmin(total_diffs)
+
+
+# ---------------------------------------------------------------------------
+# k-stars: selecting to the IBZ and broadcasting back
+# ---------------------------------------------------------------------------
+#
+# WHY THERE IS NO CENTROID PERMUTATION HERE, unlike :func:`unfold_v_q`.
+#
+# ``WfnLoader.load(k='full_bz')`` builds the full-BZ ψ BY UNFOLDING the IBZ
+# ψ in G-space — rotating G-vectors, applying the τ phase, the spinor
+# rotation and the TRS conjugation (loader docstring, ``load``).  So for a
+# star member ``Sk̄``, band n IS the unfold of band n at ``k̄``:
+#
+#     ψ_{Sk̄,n} = 𝒰(S) ψ_{k̄,n}          at FIXED band index n
+#
+# Any operator O that commutes with S therefore has the SAME matrix at
+# every member of a star,
+#
+#     ⟨m,Sk̄|O|n,Sk̄⟩ = ⟨m,k̄|𝒰†O𝒰|n,k̄⟩ = ⟨m,k̄|O|n,k̄⟩
+#
+# and so does its eigenvector matrix.  Moving a BAND-INDEX object between
+# the IBZ and the full BZ is consequently an INDEX MAP, not arithmetic:
+# no umklapp phase, no ``sym_perm`` gather, no spinor rotation.
+#
+# ``unfold_v_q`` needs all of those because ``V_q[μ,ν]`` is indexed by
+# REAL-SPACE centroids, and a symmetry moves r.  ``H[m,n]`` and ``U[m,n]``
+# are indexed by bands, and a symmetry does not move a band.  The two
+# routines are not variants of each other and must not be unified.
+#
+# SPATIAL IS EQUALITY, TIME REVERSAL IS CONJUGATION.  Θ = iσ_y K is
+# ANTIunitary, so for a Hermitian O commuting with it,
+#
+#     ⟨Θm,k|O|Θn,k⟩ = conj(⟨m,k|O|n,k⟩)   ⇒   O(−k) = conj(O(k))
+#
+# MEASURED, job 7889235, MoS₂ 4×4 (nk 16→10, ntran=2): spatial pairs 0,
+# TRS pairs 6, ``max|O(−k) − conj(O(k))| = 1.19e-16`` while plain equality
+# is off by 3.6e-01 RELATIVE.  Assuming equality is therefore not a small
+# error on a TRS-reduced deck — it is the whole matrix, on every
+# non-singleton star, and it is invisible to hermiticity, to the norm and
+# to the electron count.  Same shape as the two-halves-of-TRS bug
+# ``unfold_psi`` documents.
+#
+# Conjugation rather than transposition is written here even though the
+# two agree for Hermitian O, matching ``unfold_v_q``'s choice and for its
+# reason: it stays correct for a non-Hermitian channel.
+#
+# The premise — that full-BZ ψ really is the unfold — is checkable, and
+# :func:`star_spread` is the check.  If some path ever produces full-BZ ψ
+# another way (an independent nscf, a re-phasing), the residual stops
+# being round-off and everything below is invalid.
+
+
+def star_select(A_full, irr_idx_k):
+    """The IBZ rows of a band-index quantity: ``A[k̄]`` for each IBZ k̄.
+
+    ``A_full`` is ``(n_k_full, ...)``; returns ``(n_k_irr, ...)``.  Pure
+    index selection — the first occurrence of each IBZ parent in
+    ``irr_idx_k``.  Costs nothing and is exact.
+    """
+    irr = np.asarray(irr_idx_k)
+    _, first = np.unique(irr, return_index=True)
+    return A_full[np.sort(first)], np.sort(irr[np.sort(first)])
+
+
+def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
+                   irr_labels=None):
+    """Spread an IBZ band-index quantity over the full BZ.
+
+    ``A_irr`` is ``(n_k_irr, ...)`` in the order :func:`star_select`
+    returned; the result is ``(n_k_full, ...)``.  A gather plus a
+    CONJUGATION on the time-reversed members — ``sym_idx_k >=
+    n_sym_spatial`` marks those, the same convention ``unfold_psi`` and
+    ``unfold_v_q`` use.
+
+    ``sym_idx_k`` and ``n_sym_spatial`` are REQUIRED, not optional with an
+    equality default: a caller that omitted them would get silently wrong
+    matrices on every TRS pair (measured 3.6e-01 relative, job 7889235),
+    and nothing downstream would notice.
+    """
+    irr = np.asarray(irr_idx_k)
+    sidx = np.asarray(sym_idx_k)
+    labels = np.unique(irr) if irr_labels is None else np.asarray(irr_labels)
+    pos = {int(v): i for i, v in enumerate(labels)}
+    take = np.array([pos[int(v)] for v in irr], dtype=np.int32)
+    out = np.asarray(A_irr)[take]
+    trs = sidx >= int(n_sym_spatial)
+    if np.any(trs):
+        out = np.where(trs.reshape((-1,) + (1,) * (out.ndim - 1)),
+                       np.conj(out), out)
+    return out
+
+
+def star_spread(A_full, irr_idx_k, sym_idx_k, n_sym_spatial):
+    """max residual of ``A_full`` against its own star, by the right rule.
+
+    Compares each member to its star's first member — directly for a
+    spatial row, against the CONJUGATE for a time-reversed one.  Zero up
+    to round-off iff the full-BZ basis really is the unfolded IBZ one and
+    the operator commutes with the symmetry.
+
+    Cheap, and the only thing that catches a gauge mismatch introduced
+    upstream: hermiticity, the norm and the electron count all survive
+    one.
+    """
+    A = np.asarray(A_full)
+    irr = np.asarray(irr_idx_k)
+    sidx = np.asarray(sym_idx_k)
+    worst = 0.0
+    for v in np.unique(irr):
+        mem = np.where(irr == v)[0]
+        if mem.size < 2:
+            continue
+        base = A[mem[0]]
+        for j in mem[1:]:
+            ref = np.conj(base) if int(sidx[j]) >= int(n_sym_spatial) else base
+            worst = max(worst, float(np.abs(A[j] - ref).max()))
+    return worst
