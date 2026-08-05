@@ -899,6 +899,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
              ("sigma_xc_kij_ry", sigma_result.sigma_xc_kij_ry),
              ("sigma_x_kij_ry", sigma_result.sigma_x_kij_ry),
              ("v_h_kij_ry", sigma_result.v_h_kij_ry),
+             # THE ω-CUBE.  (nω, nk, nb, nb) and the largest object the
+             # loop carries; it is the one whose retention across
+             # iterations ``residual_fn`` now drops, so its measured
+             # per-rank size is the size of that saving.
+             ("sigma_c_omega_kij_ry", sigma_result.sigma_c_omega_kij_ry),
              ("delta_h_qp", delta_h_qp),
              ("delta_h_dft", delta_h_dft),
              ("H_qp_dft_full", H_qp_dft_full)),
@@ -1105,6 +1110,13 @@ def _run_linear_mixing(
         print_fn(f"  SC mixing α = {mixing:.3f} (linear)")
 
     for it in range(max_iter):
+        # DROP ITERATION i-1's SigmaResult BEFORE BUILDING ITERATION i's.
+        # See the note in ``_run_rcrop.residual_fn``; the shape is the
+        # same here — ``state`` is both the loop carry and the argument
+        # to the map, so without this rebind both generations of the
+        # ω-cube are live for the whole of ``gw_iteration_map``.  The
+        # LAST iteration's is kept: it leaves the loop in ``state_new``.
+        state = SCState(H_qp_dft=state.H_qp_dft, iteration=state.iteration)
         state_new = gw_iteration_map(state, inputs)
         if mixing != 1.0:
             H_mixed = (
@@ -1248,9 +1260,20 @@ def _run_rcrop(
         # exactly (numeric drift); re-Hermitise before feeding the
         # iteration map so eigh stays well-defined.
         H = 0.5 * (H + jnp.conj(jnp.swapaxes(H, -1, -2)))
-        state_in = SCState(
-            H_qp_dft=H, iteration=_iter_idx[0],
-            last_sigma_result=_last_sigma[0])
+        # DROP ITERATION i-1's SigmaResult BEFORE BUILDING ITERATION i's.
+        # ``gw_iteration_map`` reads ``state.iteration`` and
+        # ``state.H_qp_dft`` and nothing else, so the previous result was
+        # passed in and held in this cell for the whole call for no
+        # reader.  Its ``sigma_c_omega_kij_ry`` is the largest object on
+        # the SC path and, at the default ``sigma_omega_layout =
+        # "replicated"``, does not shrink with P: 2751 MB/rank at nb=512
+        # (``gw_config.py``), so holding two generations was a
+        # P-independent doubling of the peak.  Only the LAST one has a
+        # consumer -- ``dump_sigma_omega_h5_final`` -- and it survives:
+        # this cell is refilled below and the loop exits with it.
+        _last_sigma[0] = None
+        _last_basis_U[0] = None
+        state_in = SCState(H_qp_dft=H, iteration=_iter_idx[0])
         state_out = gw_iteration_map(state_in, inputs)
         _last_sigma[0] = state_out.last_sigma_result
         _last_basis_U[0] = state_out.last_sigma_basis_U
