@@ -156,3 +156,39 @@ psi'_full = unfold_psi(psi'_red, ...)               # EXISTING path
 This reduces the *update* (build H, diagonalize, rotate ψ), not the Σ
 construction, which still runs on full k. Profile the update's share of an
 iteration before predicting a speedup.
+
+---
+
+## 7. Status 2026-08-05 — wired, not verified; and the method was wrong
+
+`KStarMap` (`common.symmetry_maps`) is an argument to the SC loop,
+`config.sc_on_ibz` turns it on, and it builds correctly:
+`KStarMap(nk_full=16, nk_irr=10, reduction=1.60x, n_sym_spatial=2)` on
+MoS₂ 4×4. `star_select`/`star_broadcast` are gated at 1.19e-16 with a
+negative control (job 7889237), and the TRS rule they encode —
+`O(−k) = conj(O(k))`, not equality — was itself found by that gate
+(assuming equality is off by 3.6e-01 relative, job 7889235).
+
+**No end-to-end IBZ-vs-full-BZ agreement has been demonstrated.** Four
+separate k-set mismatches were hit and fixed ONE TRACEBACK AT A TIME:
+
+| # | site | operand |
+|---|---|---|
+| 1 | `sigma_dispatch.py:360` | `hartree_basis_rotation` — needed `U_full` |
+| 2 | `qsgw_utils.py:449` | `e_qp_ev` — needed `E_full` |
+| 3 | `qp_wfn.py:136` | the QP WFN writer wants **IBZ** (`wfn.nkpts`), so the blanket broadcast at the exit was wrong |
+| 4 | `sc_iteration.py:1042` | `_rotate_to_dft_basis` AFTER the loop: `last_sigma_basis_U` is IBZ, `last_sigma_result` is full-BZ |
+
+Finding them serially is the wrong method and is why this is not finished.
+**Do the audit first**: enumerate every k-indexed operand that crosses
+into or out of the loop and label its k-set, then fix them together. The
+rule is simple enough to apply by inspection —
+
+* everything `compute_sigma_xc` / `compute_screening` touch is FULL BZ,
+  because Σ is an FFT over the k-grid;
+* the carried state, `kin_ion`, the scissor operands and the eigh are IBZ;
+* each CONSUMER states its own k-set — they do not share one, and #3 is
+  the proof: `write_qp_wfn_h5` requires the IBZ because a WFN file stores
+  the IBZ by BGW convention.
+
+Band-only quantities (the `BandPartition` masks) need nothing.

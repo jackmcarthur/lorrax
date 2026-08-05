@@ -291,8 +291,16 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                     # the final reduction a different rule than the
                     # unrotated path's.  One cheap sphere reshard fixes
                     # both.
+                    # Same two-step as rotate_bands: land on 'y' (the
+                    # contraction's natural output) so the reduce is
+                    # (nb/py, ns, ngkmax), then slice to ('x','y') for
+                    # free.  One constraint straight to ('x','y')
+                    # all-reduces the whole global psi_tilde.
                     psi_t = jax.lax.with_sharding_constraint(
-                        psi_t[None], NamedSharding(mesh, _band_spec()))
+                        psi_t[None],
+                        NamedSharding(mesh, P(None, "y", None, None)))
+                    psi_t = jax.lax.with_sharding_constraint(
+                        psi_t, NamedSharding(mesh, _band_spec()))
                 else:
                     psi_t = psi_xy_k[None]
                 box = _box_kernel(psi_t, bidx_k[None], ngkmax=ngkmax)
@@ -384,6 +392,20 @@ def rotate_bands(psi_G, U_qp, *, mesh: Mesh):
             psi_mx = jax.lax.with_sharding_constraint(psi_, m_on_x)
             U_x = jax.lax.with_sharding_constraint(U_, U_sh)
             out = jnp.einsum('kmn,kmsg->knsg', U_x, psi_mx, optimize=True)
+            # TWO CONSTRAINTS, AND THE ORDER IS THE WHOLE POINT.  The
+            # contraction is over m ('x') and n comes from U's 'y', so the
+            # NATURAL output is n on 'y', partial over 'x'.  Constraining
+            # straight to ('x','y') forced XLA to finish the reduction
+            # before it could re-split, i.e. to all-reduce the FULL global
+            # psi_tilde across 'x' -- measured c128[16,640,2,11008],
+            # 3.36 GiB/rank, 4.93 s at b600/P=64 (audit 2026-08-05).
+            #
+            # Landing on 'y' first completes the same sum at (nb/py, ns,
+            # ngkmax) = 28 MB, and the second constraint is then FREE: a
+            # rank holding its whole y-block replicated over 'x' takes its
+            # own x-th sub-slice with no communication at all.
+            out = jax.lax.with_sharding_constraint(
+                out, NamedSharding(mesh, P(None, "y", None, None)))
             return jax.lax.with_sharding_constraint(out, band_xy)
         return fn
 
