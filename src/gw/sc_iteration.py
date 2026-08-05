@@ -131,6 +131,13 @@ class SCInputs:
 class SCState:
     """State carried across self-consistent iterations.
 
+    K-SET INVARIANT (with ``SCInputs.kstar``):
+      * ``H_qp_dft`` is on the LOOP's k-set — the IBZ when a map is given.
+      * ``last_sigma_result`` and ``last_sigma_basis_U`` are on the FULL
+        BZ and must AGREE, because they are consumed together by
+        ``run_sc_driver``'s final rotate-back.  Σ is a k-grid FFT, so its
+        k-set is not negotiable; the U stored beside it follows.
+
     The iteration "carry" is **just** ``H_qp_dft`` — the QP Hamiltonian
     on the active subspace (``slices.sigma`` of the wfn bundle), in
     the original DFT basis.  Everything else (``E_qp``, ``U_dft_to_qp``,
@@ -637,7 +644,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         H_qp_dft=H_qp_dft_new,
         iteration=state.iteration + 1,
         last_sigma_result=sigma_result,
-        last_sigma_basis_U=U_qp,
+        # FULL-BZ U.  These two fields are consumed TOGETHER by
+        # run_sc_driver's final rotate-back, so they must share a k-set,
+        # and ``sigma_result``'s is the full BZ by construction --
+        # compute_sigma_xc runs there.  Storing the IBZ U_qp here is the
+        # mismatch that raised 'k' 10 vs 16.
+        last_sigma_basis_U=U_full,
     )
 
 
@@ -1003,23 +1015,33 @@ def run_sc_driver(
         protected_mask=in_range, in_range_mask=in_range)
     partition.warn_if_protected_outside_grid(print_fn=print_fn)
 
-    # THE k-STAR MAP.  Opt-in (``config.sc_on_ibz``); absent, the loop runs
-    # entirely on the full BZ exactly as before.  When present, H / E / U
-    # and the carried state live on the IBZ and only Σ is built on the
-    # full BZ -- Σ comes from an FFT over the k-grid and needs the whole
-    # grid (decisions.md 2026-08-04, TRS veto scope).
+    # THE k-STAR MAP.  Built UNCONDITIONALLY, because it has two
+    # independent jobs and only the first is optional:
+    #
+    #  1. ``config.sc_on_ibz`` -- run the LOOP reduced.  Opt-in; absent,
+    #     H / E / U and the carried state stay on the full BZ exactly as
+    #     before.  Σ is built on the full BZ either way (it comes from an
+    #     FFT over the k-grid; decisions.md 2026-08-04, TRS veto scope).
+    #  2. the post-SC writers -- ``dump_qp_wfn_artifacts`` puts each one
+    #     on ITS OWN k-set, and ``write_qp_wfn_h5`` wants the WFN file's
+    #     IBZ whatever the loop did (qp_wfn.py:136).  On a deck whose WFN
+    #     stores a reduced k-set that is a REDUCTION, not a broadcast, so
+    #     the map is needed with ``sc_on_ibz`` off as well.  Omitting it
+    #     there is the crash "U shape (16,128,128) inconsistent with
+    #     (nk=10, nb_active=128)".
+    #
+    # Construction is two numpy index arrays plus a ``np.unique``.
+    from common.symmetry_maps import KStarMap
+    kstar_io = KStarMap.from_sym(sym, int(wfn.ntran))
     kstar = None
     if bool(getattr(config, "sc_on_ibz", False)):
-        from common.symmetry_maps import KStarMap
-        kstar = KStarMap.from_sym(sym, int(wfn.ntran))
-        if kstar.is_identity:
+        if kstar_io.is_identity:
             print_fn("  SC: sc_on_ibz requested but every k-star is a "
                      "singleton on this deck; running on the full BZ.")
-            kstar = None
         else:
+            kstar = kstar_io
             print_fn(f"  SC: {kstar!r} — H/E/U on the IBZ, Σ on the full BZ")
-        kin_ion = jnp.asarray(kstar.select(np.asarray(kin_ion))) \
-            if kstar is not None else kin_ion
+            kin_ion = jnp.asarray(kstar.select(np.asarray(kin_ion)))
 
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
@@ -1067,7 +1089,8 @@ def run_sc_driver(
     if config.debug.write_wfn_h5:
         dump_qp_wfn_artifacts(
             state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
-            wfn=wfn, band_slices=band_slices, kgrid=meta.kgrid,
+            kstar=kstar_io, state_on_ibz=kstar is not None,
+            wfn=wfn, sym=sym, band_slices=band_slices, kgrid=meta.kgrid,
             output_dir=input_dir, print_fn=print_fn,
         )
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
@@ -1104,15 +1127,25 @@ def run_sc_driver(
 
 
 def final_qp_eigenstates(
-    state: SCState, *, n_occ: int, mesh_xy: Mesh, kstar=None,
+    state: SCState, *, n_occ: int, mesh_xy: Mesh,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Diagonalise the converged ``state.H_qp_dft`` and return the QP eigenstates.
 
-    ``kstar`` broadcasts the result back to the FULL BZ, because every
-    consumer (WFN_qp.h5, eqp.dat, the htransform interpolation) is
-    indexed by full-BZ k.  The loop reduces; the boundary restores.
-    Omitting it on an IBZ state would silently hand downstream code a
-    short k axis.
+    ON THE STATE'S OWN k-SET, and no k-set argument.  Placing the result
+    on a CONSUMER's k-set belongs to the consumer's call site
+    (:func:`dump_qp_wfn_artifacts`), because the consumers do not share
+    one: ``write_qp_wfn_h5`` wants the WFN file's IBZ (qp_wfn.py:136)
+    while ``write_qp_rotations_h5`` wants the full BZ (its
+    ``kpoints_crys`` is ``sym.unfolded_kpts`` in the canonical writer,
+    gw_output.py:865-875, and ``rotate_wfn_to_qp.py:159`` indexes
+    ``U_mnk`` with a full-BZ index).  A single k-set kwarg here can only
+    be right for one of them; it used to broadcast for both, and that is
+    what made the WFN writer fail on an IBZ loop
+    (ibz_self_consistency_scaffold.md §7 row 3).
+
+    ``efermi_ry`` is k-set independent: every full-BZ k shares its star's
+    eigenvalues, so the midgap over the IBZ and over the full BZ are the
+    same number.
 
     Returned arrays are host-side numpy (not jax.Array) since the
     typical consumers (WFN_qp.h5 writer, eqp.dat tooling) operate on
@@ -1128,18 +1161,25 @@ def final_qp_eigenstates(
     """
     E_ry, U, efermi_ry = _diagonalize_and_get_efermi(
         state.H_qp_dft, n_occ, mesh_xy)
-    if kstar is not None and not kstar.is_identity:
-        # Back to the full BZ for the consumers.  U conjugates on
-        # time-reversed members; E does not (eigenvalues are real and a
-        # star shares them), which ``broadcast`` handles because conj is
-        # the identity on a real array.
-        E_ry = kstar.broadcast(np.asarray(E_ry))
-        U = kstar.broadcast(np.asarray(U))
     return (
         np.asarray(E_ry, dtype=np.float64),
         np.asarray(U, dtype=np.complex128),
         float(efermi_ry),
     )
+
+
+def _on_kset(arrays, *, kstar, have_ibz: bool, want_ibz: bool):
+    """Move band-index arrays between the IBZ and the full BZ.
+
+    ``kstar.select`` / ``kstar.broadcast`` only.  A hand-rolled gather is
+    wrong on any TRS-reduced deck: Θ is antiunitary, so
+    ``O(-k) = conj(O(k))`` and not ``O(k)`` (symmetry_maps.py:1740-1751);
+    assuming equality is off by 3.6e-01 relative, job 7889235.
+    """
+    if kstar is None or kstar.is_identity or have_ibz == want_ibz:
+        return [np.asarray(a) for a in arrays]
+    op = kstar.select if want_ibz else kstar.broadcast
+    return [np.asarray(op(np.asarray(a))) for a in arrays]
 
 
 def dump_sigma_omega_h5_final(
@@ -1182,8 +1222,10 @@ def dump_qp_wfn_artifacts(
     state: SCState, *,
     n_occ: int,
     mesh_xy: Mesh,
-    kstar=None,                          # IBZ->full BZ for the written arrays
+    kstar=None,                          # IBZ <-> full BZ map (KStarMap)
+    state_on_ibz: bool = False,          # k-set ``state.H_qp_dft`` is on
     wfn,                                 # WFNReader (source of base coeffs + crystal)
+    sym,                                 # SymMaps (full-BZ k-list + kirr_fullids)
     band_slices,
     kgrid,                               # (nkx, nky, nkz)
     output_dir: str,
@@ -1202,6 +1244,38 @@ def dump_qp_wfn_artifacts(
       ``(U, E_qp)`` for tools that prefer to apply the rotation
       themselves.
 
+    THE TWO WRITERS ARE ON DIFFERENT k-SETS and neither is the loop's:
+
+    * ``write_qp_wfn_h5`` — the WFN FILE's k-set, ``wfn.nkpts``, checked
+      at qp_wfn.py:136.  A WFN file stores the IBZ by BGW convention and
+      this writer copies the source file's ``kpoints``/``mtrx``/``tnp``
+      through unchanged, so its ``U`` must be the rotation of the stored
+      ψ at the stored k.  ``KStarMap.select`` delivers exactly that only
+      because the row it takes — the first full-BZ member of each star —
+      is the stored k itself, reached by the IDENTITY operation.
+      MEASURED on mos2_4x4 (job 7889366): ``kirr_fullids`` =
+      [0,1,2,4,5,6,7,8,9,10] is strictly increasing (so ``select``'s row
+      order is ``wfn.kpoints`` order), ``sym_idx_k[kirr_fullids]`` is 0
+      at all 10 (so no member is a rotated or time-reversed image),
+      ``max|unfolded_kpts[kirr_fullids] − wfn.kpoints|`` = 5.6e-17, and
+      ``select(broadcast(A)) − A`` = 0 exactly.  Both properties follow
+      from the grid enumeration order, not from a construction that
+      enforces them, so a deck that violates either would silently give
+      this writer a conjugated or rotated U; re-measure with the probe
+      before trusting the artifact on a new symmetry group.
+    * ``write_qp_rotations_h5`` — the FULL BZ.  Its ``kpoints_crys``
+      labels the rows of ``U_mnk``; the canonical writer of this same
+      file passes ``sym.unfolded_kpts`` there (gw_output.py:865-875) and
+      the consumer indexes ``U_mnk`` by full-BZ index
+      (postprocess/rotate_wfn_to_qp.py:159).  ``write_results`` rewrites
+      this file later in the same run from the driver's own full-BZ
+      eigh, so writing it on any other k-set would also make the two
+      writes of one path disagree in shape.
+
+    ``state_on_ibz`` says which k-set the loop ran on (``config.sc_on_ibz``)
+    and ``kstar`` is the map; both writers are then reached by
+    :func:`_on_kset` from wherever the state is.
+
     Both files are rank-0-only writes (h5py is single-writer); a
     multihost barrier follows so the caller can rely on both files
     existing on every rank when this function returns.
@@ -1210,28 +1284,44 @@ def dump_qp_wfn_artifacts(
     """
     from file_io.qp_wfn import write_qp_rotations_h5, write_qp_wfn_h5
 
-    # NO broadcast here: write_qp_wfn_h5 requires ``wfn.nkpts`` -- the WFN
-    # file's own IBZ count (qp_wfn.py:136) -- because a WFN file stores the
-    # IBZ by BGW convention.  So this consumer's natural k-set IS the loop's
-    # when sc_on_ibz is on, and broadcasting would break it.  Consumers do
-    # not share one k-set; each states its own.
-    enk_qp_ry, U_kmn, efermi_ry = final_qp_eigenstates(
-        state, n_occ=n_occ, mesh_xy=mesh_xy, kstar=None)
+    enk_loop_ry, U_loop, efermi_ry = final_qp_eigenstates(
+        state, n_occ=n_occ, mesh_xy=mesh_xy)
+    enk_irr_ry, U_irr = _on_kset(
+        (enk_loop_ry, U_loop), kstar=kstar,
+        have_ibz=state_on_ibz, want_ibz=True)
+    enk_full_ry, U_full = _on_kset(
+        (enk_loop_ry, U_loop), kstar=kstar,
+        have_ibz=state_on_ibz, want_ibz=False)
+    # State the two k-sets rather than letting a mismatch surface as a
+    # shape error two frames down (that is how this was found: "U shape
+    # (16, 128, 128) inconsistent with (nk=10, nb_active=128)").
+    nk_irr, nk_full = int(U_irr.shape[0]), int(U_full.shape[0])
+    if nk_irr != int(wfn.nkpts) or nk_full != int(sym.unfolded_kpts.shape[0]):
+        raise ValueError(
+            f"dump_qp_wfn_artifacts: k-set placement failed — loop nk="
+            f"{int(U_loop.shape[0])} (on_ibz={state_on_ibz}) gave "
+            f"WFN_qp nk={nk_irr} (need wfn.nkpts={int(wfn.nkpts)}) and "
+            f"rotations nk={nk_full} (need full BZ "
+            f"{int(sym.unfolded_kpts.shape[0])}); kstar={kstar!r}")
+    print_fn(f"  QP dump k-sets: WFN_qp {nk_irr} (WFN file), "
+             f"rotations {nk_full} (full BZ), loop {int(U_loop.shape[0])}")
     qp_wfn_path = os.path.join(output_dir, "WFN_qp.h5")
     qp_rot_path = os.path.join(output_dir, "qp_wfn_rotations.h5")
     if jax.process_index() == 0:
         write_qp_wfn_h5(
             qp_wfn_path, wfn=wfn,
-            U_kmn=U_kmn, enk_active_qp_ry=enk_qp_ry,
+            U_kmn=U_irr, enk_active_qp_ry=enk_irr_ry,
             band_start=band_slices.b0, band_stop=band_slices.b3,
         )
         write_qp_rotations_h5(
             qp_rot_path,
-            U_mnk=U_kmn,
-            E_qp_nk=enk_qp_ry * 0.5,                       # Ry → Hartree
+            U_mnk=U_full,
+            E_qp_nk=enk_full_ry * 0.5,                     # Ry → Hartree
             band_start=band_slices.b0, band_stop=band_slices.b3,
-            kpoints_crys=np.asarray(wfn.kpoints, dtype=np.float64),
+            kpoints_crys=np.asarray(sym.unfolded_kpts, dtype=np.float64),
             nkx=int(kgrid[0]), nky=int(kgrid[1]), nkz=int(kgrid[2]),
+            kpoints_reduced=np.asarray(wfn.kpoints, dtype=np.float64),
+            kirr_to_kfull=np.asarray(sym.kirr_fullids, dtype=np.int32),
         )
     barrier("qp_wfn_h5_write")
     print_fn(f"  QP WFN:       {qp_wfn_path}")

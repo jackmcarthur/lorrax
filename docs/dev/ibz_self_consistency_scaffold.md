@@ -192,3 +192,114 @@ rule is simple enough to apply by inspection —
   the IBZ by BGW convention.
 
 Band-only quantities (the `BandPartition` masks) need nothing.
+
+---
+
+## 8. Status 2026-08-05 — the writers are separated; the two arms do NOT agree
+
+### 8.1 Each post-SC writer's own k-set, read from its own consumer
+
+`dump_qp_wfn_artifacts` used to hand both its writers whatever k-set the
+loop ran on, so it was wrong for one of them in both directions: with
+`sc_on_ibz` on, the earlier blanket broadcast broke the WFN writer (§7
+row 3); with `sc_on_ibz` OFF — the DEFAULT — the loop is on the full BZ
+and the same writer died on any deck whose WFN stores a reduced k-set,
+
+    ValueError: write_qp_wfn_h5: U shape (16, 128, 128) inconsistent with
+    (nk=10, nb_active=128).
+
+That killed the `fullbz` arm, which is the CONTROL for the IBZ path, so
+no agreement number existed at all.
+
+| writer | k-set | how that was determined |
+|---|---|---|
+| `write_qp_wfn_h5` | the WFN FILE's, `wfn.nkpts` (10 here) | shape check `qp_wfn.py:136`; the writer copies the source `kpoints`/`mtrx`/`tnp` through and rotates the ψ stored at those k, so `U` must be in the file's own gauge |
+| `write_qp_rotations_h5` | FULL BZ (16) | `kpoints_crys` labels `U_mnk`'s rows, and the canonical writer of this same file passes `sym.unfolded_kpts` (`gw_output.py:865-875`); the consumer indexes `U_mnk` by full-BZ index (`postprocess/rotate_wfn_to_qp.py:159`). `write_results` rewrites the file later in the same run from the driver's own full-BZ eigh, so the SC-side copy must match it |
+| `eqp0.dat` / `eqp1.dat` | full-BZ INPUT, IBZ OUTPUT | `gw_output.py:770-800` subsets full-BZ arrays with `kirr_to_kfull` and lists the IBZ wedge. Its arrays come from the driver's own eigh of `kin_ion + sigma_total` (`gw_jax.py:630`), both full BZ in both arms — the SC loop's k-set never reaches it, so it needed no change |
+| `write_qp_wfn_oneshot` | the WFN file's | already SKIPS with a warning when `nk != wfn.nkpts` (`gw_output.py:368`). Same reduction would make it work; not done, out of scope |
+
+`final_qp_eigenstates` lost its k-set argument: it returns the state's own
+k-set and the placement is the caller's, because one argument cannot be
+right for two consumers.
+
+`KStarMap.select` is the correct reduction for the WFN writer only because
+the row it takes — the first full-BZ member of each star — is the stored k
+itself, reached by the IDENTITY operation. MEASURED on mos2_4x4, job
+7889366: `kirr_fullids = [0,1,2,4,5,6,7,8,9,10]` strictly increasing,
+`sym_idx_k[kirr_fullids] = 0` at all 10, `max|unfolded_kpts[kirr_fullids] −
+wfn.kpoints| = 5.6e-17`, `select(broadcast(A)) − A = 0` exactly. Both
+properties come from the grid enumeration order, not from a construction
+that enforces them; re-measure on a deck with a larger group.
+
+### 8.2 The agreement number: they do not agree, by 0.39 eV
+
+Both arms now run to completion and write `eqp0.dat`, `eqp1.dat`,
+`WFN_qp.h5` and `qp_wfn_rotations.h5` (jobs 7889366, 7889373, both arms
+rc=0). The comparison is therefore possible for the first time, and it
+FAILS.
+
+Deck `mos2_4x4` (`run_800c_valsmoke_fftoff`), `qp_solver = self_consistent`,
+`gn_ppm`, identical decks except `sc_on_ibz`:
+
+| run | accelerator | eqp0 E_QP max\|Δ\| | rms | eqp1 max\|Δ\| |
+|---|---|---|---|---|
+| job 7889366 | rcrop, 2 iters (`converged=False`) | 3.926e-01 eV | 3.739e-02 eV | 3.417e-01 eV |
+| job 7889373 | linear α=1, 3 iters | 3.861e-01 eV | 3.676e-02 eV | 3.355e-01 eV |
+
+The rCROP row alone would not prove anything: rCROP mixes a flattened `H`
+whose length differs between the arms (16·nb² vs 10·nb²), so its trial
+steps are not the same function of the previous iterate and a truncated
+rCROP comparison is path-dependent by construction. The `linear` α=1 row
+removes that objection — step *n* is then a pure function of step *n−1* in
+both arms — and the disagreement survives at the same size. The `E_DFT`
+column is identical (max\|Δ\| = 0.000e+00) in both runs, so the k-lists,
+band ordering and file layout match and the difference is entirely in the
+QP column. `WFN_qp.h5` QP eigenvalues, both arms on the same 10 k, differ
+by 1.970e-02 Ry = 2.68e-01 eV.
+
+The disagreement is spread over all 128 active bands and peaks at bands
+41-44 (E_DFT ≈ +5.0 to +5.5 eV) at 3.86e-01 eV; the smallest per-band
+figures are ~3e-04 eV. Nothing agrees to round-off.
+
+### 8.3 Bisected: Σ is exact, the CARRY is not
+
+Repeat at `sc_max_iter = 1` — a single `gw_iteration_map`, no carry, no
+accelerator (job 7889375, both arms rc=0). The same run produces two
+numbers from two different points of the same iteration:
+
+| quantity | built from | IBZ vs full BZ |
+|---|---|---|
+| `eqp0.dat`, `eqp1.dat` | the driver's own eigh of `kin_ion + sigma_total` — i.e. Σ, the k-star select, and the post-loop rotate-back | **0.000000e+00 eV**, bit-identical |
+| `WFN_qp.h5` QP energies | `eigh(state_final.H_qp_dft)` — the CARRY, after the scissor refit and the band partition | 1.673e-02 Ry = 2.28e-01 eV |
+
+So in one and the same iteration the Σ path is EXACT and the carry is off
+by 0.23 eV. Everything §1 rests on is confirmed: the star-invariance
+premise (`KStarMap.spread` on the real Σ+V_H prints 7.559e-12, 1.470e-12,
+1.583e-12 relative, job 7889373), the `select`/`broadcast` pair, the ψ
+rotation, the Σ build and the rotate-back all reproduce the full-BZ answer
+to the last bit. The disagreement is entirely in the post-Σ assembly of
+the next carry.
+
+### 8.4 The cause: a REDUCTION over k needs star WEIGHTS
+
+§7 labels each operand with a k-SET. That is not the whole rule. There is
+a fourth class it does not name — a REDUCTION OVER k needs star WEIGHTS,
+not just a k-set — and the carry contains exactly one such reduction.
+
+Between the (exact) `H_qp_dft_full = kin_ion + delta_h_dft` and the carry
+there are only two steps: `_scissor_E_qp_for_outofrange`
+(`sc_iteration.py:660`) and `apply_band_partition`. The partition masks
+are band-only, so by elimination the 1.673e-02 Ry is the scissor.
+`fit_scissor` (`scissor.py:177`) is an unweighted least squares over every
+`(k, n)` sample in the fit mask: the full-BZ arm fits 16 k, with 6 of the
+10 stars entering twice, while the IBZ arm fits each star once. Different
+α/β, hence a different scissor diagonal on the 98 of 128 bands that are
+out of the ω-grid window on this deck (`SC partition: protected/in-range =
+30/128 bands`, both arms). That diagonal enters the carry, and by
+iteration 3 it has reached every band — which is why the 3-iteration
+comparison in §8.2 shows a non-zero difference on all 128 bands with the
+peak (3.86e-01 eV) at bands 41-44, E_DFT ≈ +5.0 to +5.5 eV.
+
+Fix direction: pass star multiplicities (`np.bincount(sym.irr_idx_k)`) as
+sample weights into `fit_scissor` when the loop runs reduced, so the fit
+sees the same weighted point cloud on either k-set. Not attempted here.
