@@ -599,6 +599,56 @@ def _residency_census(named, print_fn) -> None:
             f"1/{a.nbytes / max(local, 1):<4.0f} {spec}")
 
 
+def _check_sigma_stage(sigma_result: SigmaResult, *, print_fn) -> None:
+    """The Σ stage gates, once per SC iteration.
+
+    ``gw_jax`` applies these four to the Σ it builds, inside
+    ``if qp_solver is not QPSolver.SELF_CONSISTENT:`` — so the ONE path
+    that rebuilds Σ_x in a rotated band basis, 2·max_iter + 1 times, was
+    the one path with no gate on it.  They belong here rather than there
+    anyway: they are per-iteration invariants, and the SC loop is the
+    place a band-index or conjugation slip can enter, because it is the
+    only place the Σ basis is not the DFT one.  Spelling is deliberately
+    identical to ``gw_jax``'s so there is one set of messages to grep.
+
+    Σ_x[i,i] = −Σ_{m∈occ} ⟨im|V|mi⟩ is a negative-definite quadratic form
+    in a positive-semidefinite kernel, so the sign and the −200…0 eV
+    bracket hold in ANY orthonormal band basis; nothing here assumes the
+    DFT one.  The bracket is loose on purpose (bare exchange runs
+    −40…−5 eV on the production decks): it catches a unit or
+    basis-normalisation slip, not physics.
+
+    COST.  Four device reductions to ≤ 4 scalars, hence four host syncs
+    per iteration.  The iteration already synchronises three times
+    (``eigvalsh_kshard``, the k-star spread, the scissor's ``np.asarray``
+    of the H diagonal), so this adds reductions, not a new class of
+    stall.  The diagonal is taken ON DEVICE: ``gw_jax`` writes
+    ``np.diagonal(np.asarray(sigma_x))``, which pulls the whole
+    (nk, nb, nb) to the host — 9.2 GB at nk=144/nb=2000 — and that would
+    be the most expensive thing in the iteration.
+
+    NOT applied here: ``average_within_degenerate_sets``.  It needs the
+    band energies on the host and only narrows the diagonal's spread, so
+    omitting it makes both gates harder to pass, never easier.
+
+    NOT covered: a NaN confined to Σ_c.  It reaches ``sigma_xc_kij_ry``
+    but not ``sigma_x_kij_ry``, and ``rcrop_nojit``'s ``res <= tol`` is
+    False for NaN, so such a run still costs the full ``maxit``.  Stated
+    because it is the remaining hole on this surface, not because it is
+    fixed here.
+    """
+    from common import sanity
+
+    sanity.check_finite("Σ_x", sigma_result.sigma_x_kij_ry, print_fn=print_fn)
+    sanity.check_finite("V_H", sigma_result.v_h_kij_ry, print_fn=print_fn)
+    sig_x_diag_ev = jnp.real(jnp.diagonal(
+        sigma_result.sigma_x_kij_ry, axis1=1, axis2=2)) * RYD_TO_EV
+    sanity.check_sign("Σ_x diagonal (eV)", sig_x_diag_ev,
+                      expect="negative", print_fn=print_fn)
+    sanity.check_in_range("Σ_x diagonal (eV)", sig_x_diag_ev,
+                          -200.0, 0.0, unit="eV", print_fn=print_fn)
+
+
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     """One self-consistent QSGW step in the DFT basis.
 
@@ -809,6 +859,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         write_sigma_omega_h5=False,
         print_fn=inputs.print_fn,
     )
+    _check_sigma_stage(sigma_result, print_fn=inputs.print_fn)
 
     # Rotate (V_H + Σ_xc) back to DFT basis and form the *full* QSGW H
     # (as if every band were protected); the partition step below masks
