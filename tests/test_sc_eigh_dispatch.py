@@ -198,8 +198,31 @@ def test_sc_eigh_defaults_to_auto():
 
 
 # ---------------------------------------------------------------------------
-# The two implementations agree
+# The eigh the dispatch selects satisfies the contract
 # ---------------------------------------------------------------------------
+#
+# THE DISTRIBUTED SIDE IS NOT EXERCISED HERE, DELIBERATELY.  Calling
+# ``distributed_eigh_bands`` in a bare pytest process resolves — the FFI
+# host library is loaded and every mesh guard passes on a 1x1 mesh — and
+# then ScaLAPACK/BLACS ABORTS THE INTERPRETER, because there is no MPI
+# context.  A ``resolve_backend`` probe does not predict that: resolve
+# succeeded and the process still died.  Measured on job 7890040, where
+# it killed the run at the last test of the file and would have taken the
+# whole suite with it.  (Under ``srun --mpi=pmi2`` the same test passes —
+# same job, step 3 — which is exactly why a probe-and-skip is not enough:
+# whether it aborts depends on the launcher, not on anything the process
+# can ask.)
+#
+# The two paths are compared END TO END instead, on a real deck, which is
+# a stronger statement than a unit test: job 7890020 ran the mos2_4x4
+# 3-iteration rCROP/IBZ arm twice on the same tree, once at the default
+# (native) and once at ``sc_eigh = distributed``, and eqp0 agreed to
+# max|dE_QP| = 7.000001e-09 eV, rms 1.694661e-09 eV (eqp1: 7.000001e-09 /
+# 1.627162e-09).  ``multi_device/batched_eigh_dispatch_gate.py`` item 7
+# gates ``distributed_eigh_bands`` itself.
+#
+# What runs here is the branch the default path takes, against a host
+# reference — no FFI, no MPI, no abort.
 
 def _random_hermitian(rng, nk, nb):
     A = (rng.normal(size=(nk, nb, nb))
@@ -207,47 +230,41 @@ def _random_hermitian(rng, nk, nb):
     return 0.5 * (A + np.conj(np.swapaxes(A, -1, -2)))
 
 
-def test_native_and_distributed_eigh_agree():
-    """Eigenvalues at 1e-12 relative; U only through a gauge-invariant form.
+def test_the_native_eigh_matches_a_host_reference():
+    """The contract both branches owe, checked on the one that always runs.
 
-    A degenerate eigenvalue leaves an arbitrary unitary inside its
-    subspace and the block-cyclic reduction picks a different
-    representative per grid, so ``U`` itself is not comparable.
-    ``U diag(E) Uᴴ`` is, and it is what the SC loop actually consumes: ψ
-    is rotated with U and Σ is rotated back with the same U.
+    Eigenvalues at 1e-12 relative; ``U`` only through ``U diag(E) Uᴴ``,
+    because a degenerate eigenvalue leaves an arbitrary unitary inside
+    its subspace and no implementation promises a representative.  That
+    reconstruction is also exactly what the SC loop consumes ``U`` for —
+    psi is rotated with U and Sigma is rotated back with the same U — so
+    it is the comparable quantity, not a weakened one.
 
-    Skipped where no distributed eigh backend resolves — the FFI host
-    library is not on every test node.
+    The transposed-U negative control matters: the transpose of a
+    unitary is also unitary, so the reconstruction alone would pass on an
+    implementation that returned ROWS instead of columns.
     """
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
     rng = np.random.default_rng(2)
-    nk, nb = 3, 8
-    H = _random_hermitian(rng, nk, nb)
+    H = _random_hermitian(rng, 3, 8)
 
-    from ffi.linalg import resolve_backend
-    try:
-        resolve_backend("eigh", "distributed", mesh, n=nb)
-    except Exception as exc:                                  # noqa: BLE001
-        pytest.skip(f"no distributed eigh on this mesh: {exc}")
-
-    from gw.qsgw_density import distributed_eigh_bands
     eigh_kshard, _ = sc_iteration._kshard_eigh_kernels(
         mesh, sc_iteration._band_rotation_spec())
-
     E_n, U_n = (np.asarray(a) for a in eigh_kshard(jnp.asarray(H)))
-    E_d, U_d = (np.asarray(a) for a in
-                distributed_eigh_bands(jnp.asarray(H), mesh=mesh))
+    E_h, U_h = np.linalg.eigh(H)
 
-    assert E_d.shape == E_n.shape
-    scale = float(np.abs(E_n).max())
-    assert float(np.abs(E_d - E_n).max()) <= 1e-12 * scale
+    scale = float(np.abs(E_h).max())
+    assert E_n.shape == E_h.shape
+    assert float(np.abs(E_n - E_h).max()) <= 1e-12 * scale
 
     def rebuild(E, U):
         return U @ (E[:, :, None] * np.conj(np.swapaxes(U, -1, -2)))
 
-    assert np.allclose(rebuild(E_n, U_n), rebuild(E_d, U_d),
+    assert np.allclose(rebuild(E_n, U_n), rebuild(E_h, U_h),
                        atol=1e-11 * scale, rtol=0.0)
-    # Both must satisfy the columns contract against the ORIGINAL matrix.
-    for E, U in ((E_n, U_n), (E_d, U_d)):
-        assert np.allclose(H @ U, U * E[:, None, :],
+    # Columns, not rows: A U == U diag(E).
+    assert np.allclose(H @ U_n, U_n * E_n[:, None, :],
+                       atol=1e-11 * scale, rtol=0.0)
+    U_bad = np.conj(np.swapaxes(U_n, -1, -2))
+    assert not np.allclose(H @ U_bad, U_bad * E_n[:, None, :],
                            atol=1e-11 * scale, rtol=0.0)
