@@ -230,7 +230,7 @@ def compute_sigma_xc(
     bispinor_v_q_path: str | None = None,
     write_sigma_omega_h5: bool = True,
     hartree_basis_rotation: jax.Array | None = None,
-    v_h_qp_override: jax.Array | None = None,
+    omit_v_h: bool = False,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -333,16 +333,17 @@ def compute_sigma_xc(
     # running it unconditionally keeps the graph shape source-independent.
     source, v_h_ext = resolve_external_hartree(
         config, meta, band_slices, mesh_xy, wfn=wfn, sym=sym, print_fn=print_fn)
-    if v_h_qp_override is not None:
-        # DENSITY SELF-CONSISTENCY.  The resolved V_H is built from the DFT
-        # density; rotating it is exact for THAT operator but wrong once ρ
-        # moves, which it does as soon as U_qp mixes occupied with
-        # unoccupied bands.  The override is ⟨m|V_H[ρ_i]|n⟩ contracted
-        # from the ROTATED orbitals, so it is ALREADY in the QP basis and
-        # the U†·V·U below must be skipped -- applying it would rotate
-        # twice.
-        sig_h = jnp.asarray(v_h_qp_override, dtype=sig_h.dtype)
-        source, v_h_ext = "density_sc", None
+    if omit_v_h:
+        # DENSITY SELF-CONSISTENCY.  V_H is supplied by the caller in the
+        # DFT basis and added straight to ``kin_ion_dft``, which is also
+        # DFT — so it must NOT travel through here.  Everything this
+        # function returns is in the QP basis and gets rotated back by
+        # ``sc_iteration``; routing V_H through that round trip would
+        # rotate it twice for no reason.  Zero it and let the caller own
+        # it.  ``resolve_external_hartree`` still runs above so the graph
+        # shape stays source-independent.
+        source, v_h_ext = "caller_dft", None
+        sig_h = jnp.zeros_like(sig_h)
     if source == "folded":
         sig_h = jnp.zeros_like(sig_h)
     elif v_h_ext is not None:

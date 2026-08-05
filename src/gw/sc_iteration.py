@@ -301,8 +301,8 @@ def _dft_psi_sphere(inputs):
     return hit
 
 
-def rebuild_hartree_qp_basis(inputs, U_qp, E_qp_ry):
-    """⟨m|V_H[ρ_i]|n⟩ in the QP basis, from iteration i's own orbitals.
+def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
+    """⟨m|V_H[ρ_i]|n⟩ in the DFT basis, from iteration i's own orbitals.
 
     The cycle this closes::
 
@@ -316,11 +316,13 @@ def rebuild_hartree_qp_basis(inputs, U_qp, E_qp_ry):
     containing V_H[rho].  ``kin_ion_dft`` stays pristine T+V_loc+V_NL, so
     V_H arrives only through ``delta_h`` and cannot double-count.
 
-    ONE ROTATION, NOT TWO.  psi is rotated ONCE and reused for both rho
-    and the contraction, so the matrix elements come out in the QP basis
-    directly.  Building them in the DFT basis and applying U dag V U
-    afterwards -- the shape this had first -- costs an extra nk*nb^3 and a
-    second basis change on a ~400 Ry term, for the same answer.
+    RETURNED IN THE DFT BASIS, AND CONTRACTED THERE.  psi is rotated for
+    RHO -- rho needs the occupied QP orbitals -- but the matrix elements
+    are contracted with the UNROTATED psi_dft, because H is assembled in
+    the DFT basis around a pristine ``kin_ion_dft``.  A DFT-basis V_H adds
+    to it directly, with NO rotation at all.  Contracting with psi_qp
+    instead would put V_H in the QP basis only for the caller to rotate it
+    straight back, an nk*nb^3 round trip for the same number.
 
     No mixing: straight rho_out feedback, by owner ruling (2026-08-04).
     """
@@ -339,6 +341,7 @@ def rebuild_hartree_qp_basis(inputs, U_qp, E_qp_ry):
     e_f = fermi_level_step(E_np, kweights, float(inputs.meta.nelec))
     occ = step_occupations(E_np, e_f)
 
+    # Rotated orbitals: needed for rho, NOT for the contraction below.
     psi_qp = rotate_bands(psi_G, U_qp, mesh=inputs.mesh_xy)
     f_spin = spin_degeneracy_factor(inputs.wfn)
     grid = tuple(int(v) for v in inputs.wfn.fft_grid)
@@ -356,7 +359,7 @@ def rebuild_hartree_qp_basis(inputs, U_qp, E_qp_ry):
                          ns=int(psi_G.shape[2]), nk=nk,
                          cell_volume=float(inputs.wfn.cell_volume))
     H_vh = sweep_matrix_elements(
-        psi_qp, operator=local_potential_operator(geom, V_H_r), geom=geom,
+        psi_G, operator=local_potential_operator(geom, V_H_r), geom=geom,
         gvecs=gtab.gvecs, gmask=gtab.mask, box_index=bidx,
         kvecs=np.asarray(inputs.sym.unfolded_kpts))
     return H_vh, e_f
@@ -428,9 +431,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # DENSITY SELF-CONSISTENCY (opt-in).  V_H[rho_i] from THIS iteration's
     # orbitals, alongside Sigma_i and from the same U_qp, both feeding
     # H_{i+1}.  Off by default, so the one-shot equivalence gate holds.
-    v_h_qp_new = None
+    v_h_dft_new = None
     if bool(getattr(inputs.config, "density_self_consistent", False)):
-        v_h_qp_new, e_f_ry = rebuild_hartree_qp_basis(
+        v_h_dft_new, e_f_ry = rebuild_hartree_dft_basis(
             inputs, U_qp, E_qp_ry)
         inputs.print_fn(
             f"    density-SC: rebuilt V_H from iteration {state.iteration} "
@@ -466,7 +469,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # The stored/gspace V_H lives in the DFT basis; this is the U that
         # takes it into the basis ``wfns_qp`` is expressed in.
         hartree_basis_rotation=U_qp,
-        v_h_qp_override=v_h_qp_new,
+        omit_v_h=v_h_dft_new is not None,
         write_sigma_omega_h5=False,
         print_fn=inputs.print_fn,
     )
@@ -475,8 +478,15 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # (as if every band were protected); the partition step below masks
     # off non-protected off-diagonals and overrides out-of-range
     # diagonals with the per-iteration scissor.
+    # Σ_xc is genuinely built in the QP basis (from ``wfns_qp``) and must
+    # be rotated back.  V_H is not: under density-SC it arrives already in
+    # the DFT basis and adds to the pristine ``kin_ion_dft`` with no
+    # rotation, which is the whole reason it is contracted with ψ_dft.
+    # ``sigma_result.v_h_kij_ry`` is zero in that case (``omit_v_h``).
     delta_h_qp = sigma_result.v_h_kij_ry + sigma_result.sigma_xc_kij_ry
     delta_h_dft = _rotate_to_dft_basis(delta_h_qp, U_qp)
+    if v_h_dft_new is not None:
+        delta_h_dft = delta_h_dft + v_h_dft_new
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
     scissor_E_qp_kn_ry = _scissor_E_qp_for_outofrange(
         H_qp_dft_full, inputs.e_dft_active_kn_ry,
