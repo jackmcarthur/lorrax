@@ -39,6 +39,11 @@ from common.wfn_transforms import to_rchunk_inner
 # import seam for the FFI backend packages (cusolvermp / slate / scalapack).
 from ffi.linalg import backend_module, mesh_is_cpu as _mesh_is_cpu, \
     plan as linalg_plan, resolve_backend as _resolve_linalg_backend
+# STABLE Mesh identity (axes + extents + platform + device ids).  The rule
+# and the two helpers are in common/collectives.py:638-644: ``id(mesh)`` is
+# only safe where the CACHED VALUE retains the mesh, which is every kernel
+# cache in this file but NOT the two announcement sets below.
+from ffi.linalg._slate import _mesh_key
 
 
 def host_rss_gb() -> float:
@@ -2015,7 +2020,7 @@ def _qparallel_announce(nq: int, n_rmu: int, n_log: int,
     if jax.process_index() != 0:
         return
     ndev = int(mesh_xy.devices.size)
-    sig = (id(mesh_xy), int(nq), int(n_rmu), int(n_log))
+    sig = (_mesh_key(mesh_xy), int(nq), int(n_rmu), int(n_log))
     if sig in _qparallel_announced:
         return
     _qparallel_announced.add(sig)
@@ -2389,7 +2394,7 @@ def _qparallel_announce_transverse(nq: int, n_rmu: int, n_log: int,
     if jax.process_index() != 0:
         return
     ndev = int(mesh_xy.devices.size)
-    sig = ('T', id(mesh_xy), int(nq), int(n_rmu), int(n_log))
+    sig = ('T', _mesh_key(mesh_xy), int(nq), int(n_rmu), int(n_log))
     if sig in _transverse_qparallel_announced:
         return
     _transverse_qparallel_announced.add(sig)
