@@ -1065,11 +1065,13 @@ def _run_rcrop(
         ‖H_new − H_old‖_2 / √(nk · nb²) ≈ RMS-per-element ≈ RMS ΔE / RYD_TO_EV
 
     RESIDENCY BUDGET, because it is the number that decides the deck size.
-    The solver holds 2·``history_depth`` copies of the carry plus an
-    (n, m+1) window transient, n = nk·nb², complex128::
+    With n = nk·nb², m = ``history_depth``, complex128, at the production
+    shape nk=144, nb=2000, m=5 (n = 5.76e8, one copy = 9.22 GB)::
 
-        history   2·m·nk·nb²·16 B    92.2 GB at nk=144, nb=2000, m=5
-        transient   2·(m+1)/m × that / 2  →  22.1 GB at the same shape
+        Xhist + Fhist   2·m·n·16 B        92.2 GB   held for the whole solve
+        Xw + Fw         2·(m+1)·n·16 B   110.6 GB   per iteration, and live
+                                                    alongside the roll's
+                                                    X_ord/F_ord (92.2 GB)
 
     Those are ROW-SHARDED over ``inputs.mesh_xy`` (``row_sharding`` below),
     so each rank holds 1/ndev of them; unsharded they would all land on one

@@ -134,8 +134,9 @@ def _solve_crop_alpha_v2(Fw: jnp.ndarray, filled_cols: jnp.ndarray) -> jnp.ndarr
     axis of ``Fw`` is the flattened iterate and may be SHARDED over the
     device mesh (``rcrop_nojit(row_sharding=...)``).  ``jnp.linalg.qr`` has
     no distributed lowering, so GSPMD all-gathers its whole (n, k) operand
-    onto one device — 22.1 GB at nk=144, nb=2000, m=5, complex128, i.e.
-    exactly the single-device object the sharding exists to remove.  Every
+    onto one device — 55.3 GB at nk=144, nb=2000, m=5, complex128 (k = m+1
+    columns of n = 5.76e8), i.e. exactly the single-device object the
+    sharding exists to remove.  Every
     row-axis contraction below reduces to at most a 6×6 complex all-reduce.
 
     Normal equations square the condition number, which for a general
@@ -858,8 +859,9 @@ def rcrop_nojit(
             AND ARE THE LARGEST OBJECTS IN THE SOLVER.  Left ``None``,
             ``jnp.zeros`` builds them uncommitted, i.e. on ONE device: at
             nk=144, nb=2000, m=5, complex128 that is n = 5.76e8, 9.22 GB
-            per copy, 92.2 GB of history and a 22.1 GB ``concatenate``
-            transient on a single device, which no rank has.  Given a
+            per copy, 92.2 GB of history and a further 110.6 GB of
+            ``concatenate`` window (Xw + Fw at (n, m+1)) on a single
+            device, which no rank has.  Given a
             sharding, the buffers are BORN distributed (``out_shardings``,
             not a ``device_put`` of a single-device zeros) and every
             derived array — x, f, the trial vectors, the (n, m+1) window —
