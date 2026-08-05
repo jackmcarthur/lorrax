@@ -1060,27 +1060,33 @@ def _run_rcrop(
     count, not the underlying pipeline call count.
 
     Convergence tolerance is converted from per-band RMS ΔE (eV) to a
-    flat L2-norm-of-residual on H_flat (Ry) the rCROP solver expects::
+    L2-norm-of-residual on H (Ry) the rCROP solver expects::
 
         ‖H_new − H_old‖_2 / √(nk · nb²) ≈ RMS-per-element ≈ RMS ΔE / RYD_TO_EV
 
     RESIDENCY BUDGET, because it is the number that decides the deck size.
-    With n = nk·nb², m = ``history_depth``, complex128, at the production
-    shape nk=144, nb=2000, m=5 (n = 5.76e8, one copy = 9.22 GB)::
+    The solver holds 2·``history_depth`` copies of the carry plus a window
+    of 2·(m+1).  With m = 5, complex128, at the production shape nk=144,
+    nb=2000 (one copy = 9.22 GB)::
 
-        Xhist + Fhist   2·m·n·16 B        92.2 GB   held for the whole solve
-        Xw + Fw         2·(m+1)·n·16 B   110.6 GB   per iteration, and live
-                                                    alongside the roll's
-                                                    X_ord/F_ord (92.2 GB)
+        Xhist + Fhist   2·m·nk·nb²·16 B        92.2 GB  whole solve
+        Xw + Fw         2·(m+1)·nk·nb²·16 B   110.6 GB  per iteration
 
-    Those are ROW-SHARDED over ``inputs.mesh_xy`` (``row_sharding`` below),
-    so each rank holds 1/ndev of them; unsharded they would all land on one
-    device.  The CARRY ITSELF is still replicated — ``gw_iteration_map``
-    adds it to a replicated ``kin_ion_dft`` and reads it back on the host
-    at iteration 0 — so each rCROP call all-gathers one (nk, nb, nb) on
-    entry (9.22 GB at the shape above).  Distributing the carry is a
-    separate change; see ``_rotate_to_dft_basis``'s note on the three host
-    readbacks that would have to move first.
+    The history entries keep the carry's own (nk, nb, nb) shape at
+    ``qsgw_density.band_rotation_spec`` — bra band on 'x', ket band on 'y',
+    k replicated — stacked on a LEADING history axis that is never sharded.
+    Per rank that is the above over ``mesh.size``.  ``nk`` is the LOOP's
+    k-set, so under ``sc_on_ibz`` it is the IBZ: measured n = 163840
+    (nk=10) against 262144 (nk=16) on mos2_4x4, job 7889876.
+
+    The accelerator's only collective is one (m+1, m+1) Gram; the update is
+    an elementwise combination over the history axis.  What is NOT free is
+    the seam here: ``gw_iteration_map`` needs a REPLICATED carry (it adds a
+    replicated ``kin_ion_dft`` and, at iteration 0, reads the carry on the
+    host to test exact diagonality), so ``residual_fn`` gathers one
+    (nk, nb, nb) per call and reshards the residual back.  Distributing the
+    carry itself is a separate change and needs that iteration-0 readback
+    (:628) and ``kin_ion``'s replicated load to move first.
     """
     from mixing.acceleration import rcrop_nojit
 
@@ -1088,54 +1094,49 @@ def _run_rcrop(
     nk, nb, _ = H0.shape
     n_elem = nk * nb * nb
     mesh = inputs.mesh_xy
-    ndev = int(mesh.size)
-    rep3 = NamedSharding(mesh, P(None, None, None))
     print_fn(
         f"  SC rCROP: history_depth={history_depth}, "
         f"max_iter={max_iter}, tol={tol_ev:.1e} eV/band-RMS")
-    # DEGRADE, DO NOT REFUSE.  The split needs ndev | n_elem.  It holds on
-    # every shape reached so far — n_elem = nk·nb² and nb is large — but
-    # ``nk`` here is the LOOP's k-set, which under ``sc_on_ibz`` is the IBZ
-    # and need not be a multiple of anything.  A refusal would kill a run
-    # that worked before this change, so an indivisible shape falls back to
-    # the previous single-device history and says so.
-    if n_elem % ndev:
-        row_sh = None
-        x0 = np.asarray(H0).flatten()
-        local_b = x0.nbytes
+    # DEGRADE, DO NOT REFUSE.  ``band_rotation_spec`` puts the two band
+    # axes on the two mesh axes, so it needs px | nb and py | nb — the same
+    # condition every other user of that spec is under.  A refusal here
+    # would kill a run that worked before this change, so a shape that does
+    # not divide falls back to the previous unsharded history and says so.
+    px, py = (int(mesh.shape[a]) for a in mesh.axis_names)
+    if nb % px or nb % py:
+        entry_sh = None
+        x0 = H0
+        local_b = H0.nbytes
         print_fn(
-            f"  SC rCROP residency: n={n_elem} is not divisible by ndev="
-            f"{ndev} — history NOT sharded, {2.0 * history_depth * local_b / 2**30:.4f}"
-            f" GiB on ONE device.  This is the pre-2026-08-05 behaviour and"
-            f" is a wall at production shapes.")
+            f"  SC rCROP residency: nb={nb} is not divisible by the mesh "
+            f"({px}x{py}) — history NOT sharded, "
+            f"{2.0 * history_depth * local_b / 2**30:.4f} GiB on ONE device. "
+            f"This is the pre-2026-08-05 behaviour and is a wall at "
+            f"production shapes.")
     else:
-        # Both mesh axes, so the flat axis splits over every device.  n's
-        # slowest index is k, so a contiguous row block IS a contiguous k
-        # block: reshape to (nk, nb, nb) is a relabel, not a collective.
-        row_sh = NamedSharding(mesh, P(tuple(mesh.axis_names)))
-        # DEVICE ARRAY, NOT ``np.asarray(H0).flatten()``.  The host round
-        # trip was on the largest operand in the loop, on every rank; H0 is
-        # replicated, so this reshape+reshard is a local slice.
-        x0 = jax.device_put(H0.reshape(-1), row_sh)
-        # MEASURED, not derived from n and ndev.  A ``device_put`` that fell
-        # back to replicated would print the full n here, and that is
-        # exactly the failure mode that makes this change a silent no-op.
-        local_b = sum(s.data.nbytes for s in x0.addressable_shards)
+        entry_sh = NamedSharding(mesh, _band_rotation_spec())
+        x0 = jax.device_put(H0, entry_sh)
+        # MEASURED, not derived from the shape and the mesh.  A
+        # ``device_put`` that fell back to replicated would print the full
+        # size here, and that is the failure mode that would make this a
+        # silent no-op.
+        local_b = sum(sh.data.nbytes for sh in x0.addressable_shards)
         print_fn(
-            f"  SC rCROP residency: n={n_elem} (nk={nk} on the loop's k-set,"
-            f" nb={nb}), ndev={ndev}; iterate {x0.nbytes / 2**20:.2f} MiB "
-            f"global / {local_b / 2**20:.2f} MiB addressable here; history "
-            f"2x{history_depth} copies = "
+            f"  SC rCROP residency: carry {tuple(H0.shape)} (nk={nk} on the "
+            f"loop's k-set), n={n_elem}, mesh {px}x{py}; entry "
+            f"{x0.nbytes / 2**20:.2f} MiB global / {local_b / 2**20:.2f} MiB "
+            f"addressable here; history 2x{history_depth} entries = "
             f"{2.0 * history_depth * x0.nbytes / 2**30:.4f} GiB global / "
             f"{2.0 * history_depth * local_b / 2**30:.4f} GiB here")
 
-    if row_sh is None:
-        # Pre-change spelling, kept so the fallback is bit-identical to it.
-        def _to_carry(A): return A.reshape(H0.shape)
-        def _to_iterate(A): return A.flatten()
-    else:
-        def _to_carry(A): return jax.device_put(A.reshape(H0.shape), rep3)
-        def _to_iterate(A): return jax.device_put(A.reshape(-1), row_sh)
+    # THE SEAM, and the only reshard in the loop.  History entries live at
+    # ``entry_sh``; ``gw_iteration_map`` needs the carry REPLICATED.  No
+    # reshape in either direction — the carry never changes shape.
+    def _to_carry(A):
+        return _place(A, mesh)
+
+    def _to_entry(A):
+        return A if entry_sh is None else jax.device_put(A, entry_sh)
 
     # Bookkeeping for per-iteration printing + final SigmaResult capture.
     _e_history: list[np.ndarray] = [
@@ -1145,15 +1146,12 @@ def _run_rcrop(
     _iter_idx = [0]
     rms_history: list[float] = []
 
-    def residual_fn(H_flat: jnp.ndarray) -> jnp.ndarray:
-        # ROW-SHARDED IN, REPLICATED CARRY, ROW-SHARDED OUT.  The solver's
-        # iterate is distributed; ``gw_iteration_map`` needs a replicated
-        # carry (it adds a replicated ``kin_ion_dft`` and, at iteration 0,
-        # reads the carry back on the host to test exact diagonality), so
-        # the gather is here and is one (nk, nb, nb) per call.  The return
-        # goes straight back to the iterate layout so nothing downstream of
-        # it re-materialises the residual whole.
-        H = _to_carry(H_flat)
+    def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
+        # SHARDED IN, REPLICATED CARRY, SHARDED OUT.  The gather is one
+        # (nk, nb, nb) per call and is the price of the map's replicated
+        # carry; the residual goes straight back to the entry layout, so the
+        # history never holds a replicated copy.
+        H = _to_carry(H_in)
         # rCROP's mixing combinations don't preserve Hermitisation
         # exactly (numeric drift); re-Hermitise before feeding the
         # iteration map so eigh stays well-defined.
@@ -1179,7 +1177,7 @@ def _run_rcrop(
             f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
         )
         _iter_idx[0] += 1
-        return _to_iterate(state_out.H_qp_dft - H)
+        return _to_entry(state_out.H_qp_dft - H)
 
     # rCROP residual tolerance: ‖f‖₂ ≤ tol_ry · √(n_elem) ⇔ per-element
     # RMS ≤ tol_ry.  Convert RMS ΔE in eV → Ry first.
@@ -1188,12 +1186,13 @@ def _run_rcrop(
 
     result = rcrop_nojit(
         residual_fn,
+        # THE CARRY ITSELF, not a flattened copy of it.
         x0,
         m=history_depth,
         maxit=max_iter,
         tol=tol_resid,
         print_fn=None,  # we print our own RMS-ΔE history above
-        row_sharding=row_sh,
+        entry_sharding=entry_sh,
     )
     print_fn(
         f"  SC rCROP done: {result.iterations} iterations, "
@@ -1206,7 +1205,7 @@ def _run_rcrop(
     # Back to the REPLICATED carry layout: every consumer of the returned
     # state (``_scissor_E_qp_for_outofrange``, ``final_qp_eigenstates``,
     # the h5 writers) reads it back on the host.
-    H_final = _to_carry(jnp.asarray(result.x))
+    H_final = _to_carry(result.x)
     H_final = 0.5 * (H_final + jnp.conj(jnp.swapaxes(H_final, -1, -2)))
     state_final = SCState(
         H_qp_dft=H_final,
