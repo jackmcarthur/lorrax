@@ -78,3 +78,31 @@ the only remaining red is the ring-vma class.
 4. e2e regression fixtures run the drivers on the CPU node via
    `ISDF_COHSEX_TEST_PLATFORM=auto` (jax native pick); compile cache under
    `$SCRATCH` keeps the whole suite ~21 min.
+
+## eqp0.dat / eqp1.dat mix two bases on the self-consistent path
+
+OPEN, UNMEASURED, 2026-08-05.  `gw_jax.py:652-654` reads
+`sigma_c_omega_kij_ry` off the object `run_sc_driver` returns and emits its
+diagonal as `sigma_c_omega_diag_ev`.  That field is in the QP basis and is
+correct there — Σ is Hermitised as ½(Σ(E_n)+Σ(E_m)), which only means
+anything in the basis whose eigenvalues are those E_n, so it must not be
+rotated.  The finalize rotates the five static Σ fields to the DFT basis
+and carries the cube through unrotated, which is deliberate.
+
+The defect is downstream: `compute_eqp_diag` forms
+`Δ = kin_ion + V_H + Σ_x + Σ_c(E_DFT) − E_DFT` from three DFT-basis
+diagonals plus that one QP-basis diagonal.  The sum is basis-consistent
+only at U = identity.  `write_results` is unguarded, so both files are
+written on the SC path (unlike `eqp_g0w0.dat`, guarded at
+`gw_output.py:846`).  The same mixing reaches `sigma_xc_at_dft_ev`
+(`gw_jax.py:600-603`).
+
+The error scales with ‖U − 1‖ and NO ONE HAS MEASURED IT.  To measure:
+read `U_mnk` from an SC run's `qp_wfn_rotations.h5`, report the largest
+off-diagonal element, and bound the eqp error by the off-diagonal Σ weight
+it mixes in.  One-shot runs are unaffected — `solve_qp` is reached only in
+the non-SC branch (`gw_jax.py:543`), where the whole object is DFT basis.
+
+`tests/test_sigma_result_basis.py` pins which field is in which basis, so
+a new Σ channel cannot join the wrong group silently.  It does not and
+cannot catch this: the mixing is in the consumer, not the declaration.
