@@ -63,3 +63,23 @@ Run at TWO mesh sizes: at P=4 four tiles and one cube are the same byte count.
 
 Harness: `/scratch2/08271/jackmc/omegacube_ab/rotprobe.sbatch` (N=8, legs at
 P=4 and P=16, frozen tree). Green at job 7889790.
+
+Band-rotation primitive gate: `band_rotate_gate.py`, any square P (1, 2×2 and
+4×4 are the standard legs). Certifies `gw.qsgw_density.rotate_band_axis` /
+`rotate_band_matrix` — the one rotation primitive, `U` kept at
+`band_rotation_spec` — against the replicated-U kernel it replaces at the two
+matrix call sites (`sc_iteration._rotate_to_dft_basis` and `sigma_dispatch`'s
+V_H basis change), in both directions, plus an explicit host rotation. Two
+negative controls: the transposed reference — `U A U†` and `U† A U` share
+hermiticity, trace and Frobenius norm, so no invariance check can separate
+them — and a `conj_u` that is NOT flipped between the two axis rotations, which
+does break hermiticity but which nothing in the pipeline looks at.
+Also reports per-rank U residency, module argument/temp/output bytes and a
+collective census of both compiled modules, and pins `rotate_bands` (which now
+routes through the same primitive) bit-identical to its old spelling.
+
+    srun -n 4 python3 -m band_rotate_gate     # BR_NK/NB/NS/NG
+
+Harness: `/scratch2/08271/jackmc/bandrot/brgate.sbatch` (N=4, legs at P=1, 4,
+16, frozen tree). Green at job 7889851: worst delta against the replicated-U
+kernel 5.4e-16 relative, per-rank U 0.1250 → 0.0312 (2×2) → 0.0078 MiB (4×4).

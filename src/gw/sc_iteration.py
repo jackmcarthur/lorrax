@@ -309,18 +309,18 @@ def _band_rotation_spec() -> P:
     return band_rotation_spec()
 
 
-def _replicate(x, mesh: Mesh) -> jax.Array:
-    """``x`` as a REPLICATED global array on ``mesh``, by the right route.
+def _place(x, mesh: Mesh, spec: P | None = None) -> jax.Array:
+    """``x`` as a global array on ``mesh`` at ``spec`` (default replicated).
 
     Three input kinds reach the U consumers and each needs a different
-    one; a single ``jnp.asarray`` is wrong for two of them.
+    route; a single ``jnp.asarray`` is wrong for two of them.
 
-    * an already-replicated ``jax.Array`` — ``jax.device_put`` onto the
-      same sharding is a no-op, so the default SC path pays nothing;
-    * a MESH-SHARDED ``jax.Array``, which is what
+    * an already-correctly-placed ``jax.Array`` — ``jax.device_put`` onto
+      the same sharding is a no-op, so the default SC path pays nothing;
+    * a ``jax.Array`` at another mesh layout, which is what
       ``qsgw_density.distributed_eigh_bands`` and
-      ``_make_kshard_eigh(u_spec=...)`` both emit — ``device_put`` reshards it
-      on the device.  ``jnp.asarray`` would leave it sharded and
+      ``_make_kshard_eigh(u_spec=...)`` both emit — ``device_put`` reshards
+      it on the device.  ``jnp.asarray`` would leave it where it was and
       ``np.asarray`` raises "Fetching value for jax.Array that spans
       non-addressable (non process local) devices" at P>1 (measured,
       job 7889419);
@@ -330,11 +330,17 @@ def _replicate(x, mesh: Mesh) -> jax.Array:
       error against the mesh-sharded operands at P>1) and plain
       ``jax.device_put`` fires JAX's hidden replica ``assert_equal``
       all-gather (common.collectives header).
+
+    ``spec=None`` means replicated, which is still what the ω-grid and
+    eqp writers want.  The U consumers ask for
+    ``qsgw_density.band_rotation_spec`` instead — see
+    :func:`_rotate_to_dft_basis`.
     """
-    rep = NamedSharding(mesh, P(*([None] * int(np.ndim(x)))))
+    nd = int(np.ndim(x))
+    sh = NamedSharding(mesh, P(*([None] * nd)) if spec is None else spec)
     if isinstance(x, jax.Array):
-        return jax.device_put(x, rep)
-    return device_put_process_local(x, rep)
+        return jax.device_put(x, sh)
+    return device_put_process_local(x, sh)
 
 
 @_functools.partial(jax.jit, static_argnames=("mesh",))
@@ -342,35 +348,50 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array, *,
                          mesh: Mesh) -> jax.Array:
     """``O_DFT[m, n] = Σ_pq U[m, p] · O_QP[p, q] · U[n, q]^*`` per k.
 
-    U AND THE RESULT ARE PINNED REPLICATED, and that is what makes the
-    producer's U layout a free choice everywhere else.  Both U factors
-    put a FREE index (m from the first, n from the second) on the same
-    mesh axis, so a U at ``qsgw_density.band_rotation_spec`` has no
-    2-D-sharded output to land in: left to infer, GSPMD returns
-    ``P(None,'x')`` (measured, job 7889423), and a sharded result is a
-    sharded SC carry — ``_run_rcrop``, ``_run_linear_mixing`` and
-    ``_scissor_E_qp_for_outofrange`` all read the carry back on the host
-    and would raise the non-addressable-devices error at P>1.
+    Two calls into ``qsgw_density.rotate_band_matrix``, i.e. the SAME
+    primitive ``rotate_bands`` uses, applied once per index.  U STAYS AT
+    ``band_rotation_spec`` — no rank holds a full (nb, nb) of it, and
+    the (nk, nb, nb) intermediate is sharded too.
 
-    Gathering U first is also the cheapest of the three options, because
-    it turns the whole contraction local.  Measured at nk=16/nb=128 on a
-    2×2 mesh (job 7889423), against the 6.31 ms the replicated path takes
-    with no collective at all:
+    ONLY THE RESULT IS PINNED REPLICATED, and it has to be: the SC carry
+    is ``kin_ion + this``, and ``_run_rcrop``, ``_run_linear_mixing`` and
+    ``_scissor_E_qp_for_outofrange`` all read the carry back on the host,
+    which raises the non-addressable-devices error on a sharded array at
+    P>1.  ``O_qp`` arrives replicated from ``compute_sigma_xc`` for the
+    same reason.  So this seam still holds two replicated (nk, nb, nb)
+    objects; what it no longer holds is the two U-shaped ones (U itself
+    and the rotation's intermediate), which is 2/4 of its former peak.
+    Making the carry itself distributed is a separate change and would
+    have to move those three host readbacks first.
+
+    THIS REPLACES A GATHERED U, AND THAT WAS A DELIBERATE CHOICE ONCE.
+    The previous form pinned U replicated and did the whole contraction
+    locally, measured at nk=16/nb=128 on a 2×2 mesh (job 7889423):
 
         U sharded, layout inferred    3 collectives   7.63 ms  out P(None,'x')
         U sharded, result pinned      4 collectives  12.35 ms  out replicated
-        U sharded, U pinned (this)    2 collectives  10.11 ms  out replicated
+        U pinned replicated (old)     2 collectives  10.11 ms  out replicated
 
-    and the pin costs the replicated path nothing: with U already
-    replicated the module has no collectives and runs in 6.35 ms.  The
-    U-pinned result is BIT-IDENTICAL to the replicated one (0.0e+00);
-    the inferred-layout one is not (7.4e-16 relative), because it
-    reassociates the band sums.
+    It is the right trade only while U fits: replicated U is 9.2 GB/rank
+    at nk=144/nb=2000, which is the scaling target's refusal case, and
+    the same owner ruling that put ``distributed_eigh_bands`` on this
+    layout (2026-08-04, robustness at 1e4+ bands over speed at 1e3)
+    applies here.  Measured at nk=8/nb=32 (job 7889851), per-rank U:
+    0.1250 MiB replicated → 0.0312 MiB at 2×2 and 0.0078 MiB at 4×4,
+    exactly px·py; module argument bytes 0.2500 → 0.1562 (2×2) →
+    0.1328 MiB (4×4).
+
+    Gathering U also made the result bit-identical to the fully-replicated
+    path; the distributed form reassociates the band sums and does not —
+    5.4e-16 relative at worst over both directions and P ∈ {1, 4, 16}
+    (``tests/multi_device/band_rotate_gate.py``, job 7889851), against an
+    explicit host rotation at 5.6e-16.
     """
-    rep = NamedSharding(mesh, P(None, None, None))
-    U = jax.lax.with_sharding_constraint(U, rep)
-    out = jnp.einsum('kmp,kpq,knq->kmn', U, O_qp, jnp.conj(U), optimize=True)
-    return jax.lax.with_sharding_constraint(out, rep)
+    from gw.qsgw_density import rotate_band_matrix
+
+    out = rotate_band_matrix(O_qp, U, mesh=mesh, to_qp=False)
+    return jax.lax.with_sharding_constraint(
+        out, NamedSharding(mesh, P(None, None, None)))
 
 
 # ---------------------------------------------------------------------------
@@ -600,8 +621,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # against 117.6 ms replicated, same three collectives, argument
             # 41 MiB against 44 MiB — job 7889424), and
             # ``rotate_wavefunctions`` reshards to ``band_mix_spec``
-            # whichever it gets.  ``_rotate_to_dft_basis`` gathers it back
-            # and is bit-identical either way (job 7889423).
+            # whichever it gets.  ``_rotate_to_dft_basis`` contracts in
+            # this layout directly and no longer gathers it.
             # Process-local placement — see the H_qp_dft note above (same
             # hidden assert_equal; same rank-invariance argument, and here
             # each rank stages only its own nb²/(px·py) block).
@@ -645,8 +666,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # ``band_rotation_spec`` outright (``qsgw_density.rotate_bands``)
             # or reshards from whatever it is given
             # (``rotate_wavefunctions`` → ``band_mix_spec``), and the two
-            # that need it replicated (``_rotate_to_dft_basis`` and
-            # ``sigma_dispatch``'s V_H basis change) pin it themselves.
+            # matrix rotations (``_rotate_to_dft_basis`` and
+            # ``sigma_dispatch``'s V_H basis change) contract in this
+            # layout through ``qsgw_density.rotate_band_matrix``.
             # Per-rank U drops by px·py — 4.00 MiB → 1.00 MiB at
             # nk=16/nb=128 on a 2×2 mesh (job 7889423), and it is the
             # (nk, nb, nb) object that reaches 9.2 GB at nb=2000/nk=144.
@@ -667,7 +689,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # (``common.symmetry_maps``, ``_row_out_sharding``), so U_full arrives
     # at ``band_rotation_spec`` — what ``rotate_bands`` and
     # ``rotate_wavefunctions`` want — and U never crosses to the host.  It
-    # needs no ``_replicate`` first, unlike the host-numpy form it replaces.
+    # needs no ``_place`` first, unlike the host-numpy form it replaces.
     ks = _kstar(inputs)
     U_full = U_qp if ks.is_identity else ks.broadcast(U_qp)
     E_full = E_qp_ry if ks.is_identity else ks.broadcast(E_qp_ry)
@@ -1305,14 +1327,17 @@ def run_sc_driver(
     # ``state.last_sigma_basis_U``.  Downstream driver code (H build +
     # eigh, writer, freq_debug) is written for DFT-basis matrices
     # (kin_ion is DFT basis throughout).
-    # REPLICATED ONCE, FOR ALL FIVE ROTATIONS.  ``_rotate_to_dft_basis``
-    # pins U replicated itself, so without this the five calls would each
-    # emit their own gather of the same array.  ``jnp.asarray`` alone is
-    # not enough for either producer: on a sharded U it is a no-op, and on
-    # the HOST U the k-star broadcast leaves on a reduced k-set it builds
-    # a SINGLE-DEVICE array, which is an operand-sharding error against
-    # the mesh-sharded Σ at P>1 rather than a slow success.
-    U = _replicate(state_final.last_sigma_basis_U, mesh_xy)
+    # PLACED ONCE, FOR ALL FIVE ROTATIONS, at ``band_rotation_spec`` —
+    # the layout ``_rotate_to_dft_basis`` contracts in and the layout
+    # every producer of this array already emits, so on the default SC
+    # path this is a no-op ``device_put``.  It is NOT dead: ``jnp.asarray``
+    # alone is wrong for the HOST U the k-star broadcast leaves on a
+    # reduced k-set — it builds a SINGLE-DEVICE array, which is an
+    # operand-sharding error against the mesh-sharded Σ at P>1 rather
+    # than a slow success — and plain ``jax.device_put`` of a host array
+    # fires the hidden replica ``assert_equal`` all-gather.  ``_place``
+    # routes each kind correctly; only the spec changed.
+    U = _place(state_final.last_sigma_basis_U, mesh_xy, _band_rotation_spec())
     sig_h = _rotate_to_dft_basis(sigma_result.v_h_kij_ry, U, mesh=mesh_xy)
     sig_x = _rotate_to_dft_basis(sigma_result.sigma_x_kij_ry, U, mesh=mesh_xy)
     sigma_xc_dft = _rotate_to_dft_basis(

@@ -19,6 +19,7 @@ This module owns *no compute* of its own — every kernel lives under
 
 from __future__ import annotations
 
+import functools as _functools
 import os
 from dataclasses import dataclass
 from typing import Callable
@@ -125,6 +126,39 @@ def _mesh_cache_key(mesh_xy) -> tuple:
     """
     return (tuple(mesh_xy.shape.items()),
             tuple(int(d.id) for d in mesh_xy.devices.flat))
+
+
+def _place_band_rotation(U, mesh_xy, dtype):
+    """``U`` as a global array at ``qsgw_density.band_rotation_spec``.
+
+    A no-op ``device_put`` on the SC path (every producer already emits
+    that layout).  The host branch is not dead: on a reduced k-set the
+    k-star broadcast can leave a numpy U, and plain ``jax.device_put`` of
+    a host array onto a multi-process sharding fires JAX's hidden replica
+    ``assert_equal`` all-gather (common.collectives header).
+    """
+    from .qsgw_density import band_rotation_spec
+
+    sh = NamedSharding(mesh_xy, band_rotation_spec())
+    if isinstance(U, jax.Array):
+        return jax.device_put(jnp.asarray(U, dtype=dtype), sh)
+    return device_put_process_local(np.asarray(U, dtype=dtype), sh)
+
+
+@_functools.partial(jax.jit, static_argnames=("mesh",))
+def _rotate_v_h_to_qp(v_h_dft, U, *, mesh: Mesh):
+    """``V_H^QP = U† · V_H^DFT · U`` with U kept at ``band_rotation_spec``.
+
+    The RESULT is pinned replicated because ``SigmaResult.v_h_kij_ry``
+    feeds the k-star select and the host readbacks downstream; U is not,
+    because it is the (nk, nb, nb) object that reaches 9.2 GB/rank at
+    nk=144/nb=2000.
+    """
+    from .qsgw_density import rotate_band_matrix
+
+    out = rotate_band_matrix(v_h_dft, U, mesh=mesh, to_qp=True)
+    return jax.lax.with_sharding_constraint(
+        out, NamedSharding(mesh, P(None, None, None)))
 
 
 def invalidate_hartree_cache() -> None:
@@ -357,26 +391,23 @@ def compute_sigma_xc(
             # raw would make the rotate-back return ``U·V_H·U†`` and put a
             # basis error into a ~500 eV term with no other symptom.
             #
-            # U IS PINNED REPLICATED FIRST, for the same reason
-            # ``sc_iteration._rotate_to_dft_basis`` pins it: both factors
-            # below put a FREE index (m from conj(U), n from U) on the same
-            # mesh axis, so a U at ``qsgw_density.band_rotation_spec`` —
-            # which is what ``sc_iteration`` hands over since the eigh
-            # sites were switched to it — has no 2-D-sharded output to land
-            # in.  Left to infer, GSPMD returns v_h_ext at ``P(None,'y')``
-            # and a sharded ``SigmaResult.v_h_kij_ry`` propagates into the
-            # k-star select and the host readbacks downstream.  Measured at
-            # nk=16/nb=128 on a 2×2 mesh (job 7889424): gathering U first
-            # costs two all-gathers (2 + 4 MiB) and 10.7 ms against 5.3 ms
-            # for an already-replicated U, and the result is BIT-IDENTICAL
-            # to it (0.0e+00), where the inferred layout is 7.0e-16
-            # relative.  This branch is skipped entirely under density-SC
-            # (``omit_v_h`` zeroes sig_h above).
-            U = jax.device_put(
-                jnp.asarray(hartree_basis_rotation, dtype=sig_h.dtype),
-                NamedSharding(mesh_xy, P(None, None, None)))
-            v_h_ext = jnp.einsum('kpm,kpq,kqn->kmn',
-                                 jnp.conj(U), v_h_ext, U, optimize=True)
+            # U STAYS AT ``qsgw_density.band_rotation_spec``, which is what
+            # ``sc_iteration`` hands over, and the rotation is
+            # ``rotate_band_matrix`` — the same primitive
+            # ``sc_iteration._rotate_to_dft_basis`` and
+            # ``qsgw_density.rotate_bands`` use.  Only the RESULT is pinned
+            # replicated: a sharded ``SigmaResult.v_h_kij_ry`` propagates
+            # into the k-star select and the host readbacks downstream.
+            # (The previous form gathered U replicated first — 10.7 ms
+            # against 5.3 ms for an already-replicated U at nk=16/nb=128 on
+            # a 2×2 mesh, job 7889424 — which is the 9.2 GB/rank object at
+            # nk=144/nb=2000.)  This branch is skipped entirely under
+            # density-SC (``omit_v_h`` zeroes sig_h above).
+            v_h_ext = _rotate_v_h_to_qp(
+                jnp.asarray(v_h_ext, dtype=sig_h.dtype),
+                _place_band_rotation(hartree_basis_rotation, mesh_xy,
+                                     sig_h.dtype),
+                mesh=mesh_xy)
         sig_h = v_h_ext
     sig_sx = cohsex["sig_sx"]                    # zero placeholders for V-only path
     sig_coh = cohsex["sig_coh"]

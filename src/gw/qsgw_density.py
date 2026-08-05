@@ -100,7 +100,8 @@ from runtime.padding import pad_axis_to, spec_divisor
 
 __all__ = ["rho_from_wfns", "rho_r_to_G", "band_rotation_spec",
            "distributed_eigh_bands", "symmetrise_density",
-           "hartree_from_orbitals", "rotate_bands"]
+           "hartree_from_orbitals", "rotate_bands",
+           "rotate_band_axis", "rotate_band_matrix"]
 
 
 def _band_spec() -> P:
@@ -127,6 +128,143 @@ def band_rotation_spec() -> P:
     native path rather than resharding a replicated U after the fact.
     """
     return P(None, "x", "y")
+
+
+# ---------------------------------------------------------------------------
+# THE band-rotation primitive.  One operation, two uses.
+# ---------------------------------------------------------------------------
+#
+# Every U consumer in the tree does the same thing: contract ONE index of
+# ``U`` at :func:`band_rotation_spec` against ONE band axis of an operand.
+#
+#   (a) state rotation      psi~_n     = sum_m U[m,n] psi_m
+#   (b) similarity transform A -> U A U^dagger  (and U^dagger A U)
+#
+# and (b) is (a) applied once per index.  :func:`rotate_band_axis` is (a);
+# :func:`rotate_band_matrix` is (b) written as two calls to it.  Both are
+# TRACED HELPERS, not jit boundaries -- the caller keeps its own jit and
+# its own cache key, so the compiled graph is exactly the constraints and
+# einsum written here, with nothing inserted between them.
+#
+# THE POINT IS WHERE U LIVES.  U stays at ``band_rotation_spec`` (m on
+# 'x', n on 'y'); no rank ever holds a full (nb, nb).  The contracted
+# index rides U's mesh axis and the free index lands on the OTHER one, so
+# each application is one psum along one mesh axis.
+
+def rotate_band_axis(X, U, *, mesh: Mesh, axis: int, to_qp: bool,
+                     conj_u: bool = False):
+    """Rotate ONE band axis of ``X`` through ``U``, U kept distributed.
+
+    ``U[k, m, n] = <DFT_m | QP_n>`` -- eigenvectors are COLUMNS, the same
+    convention as ``ffi.linalg``, ``jnp.linalg.eigh``,
+    :func:`distributed_eigh_bands` and
+    ``wavefunction_bundle.rotate_wavefunctions``.
+
+    ``to_qp`` picks which index of U is contracted, i.e. which way the
+    axis is carried:
+
+    * ``True``  -- ``Y[..., n, ...] = sum_m U[k, m, n] X[..., m, ...]``.
+      ``X``'s ``axis`` is a DFT band index and becomes a QP one.  The sum
+      is over U's 'x' index, so the reduction is along 'x' and the free
+      index lands on 'y'.
+    * ``False`` -- ``Y[..., m, ...] = sum_n U[k, m, n] X[..., n, ...]``.
+      ``X``'s ``axis`` is a QP band index and becomes a DFT one.  Mirror
+      image: reduce along 'y', land on 'x'.
+
+    ``conj_u`` uses ``conj(U)`` as the kernel.  A similarity transform
+    needs it on EXACTLY ONE of its two applications -- the bra index
+    carries the complex conjugate of the ket index's transformation.  Use
+    :func:`rotate_band_matrix` rather than pairing the calls by hand.
+    Of the two ways to pair them wrong, only one is loud: an unflipped
+    ``conj_u`` breaks hermiticity (measured max|Y - Y^dagger| = 3.9 on a
+    Hermitian operand at nk=8/nb=32, job 7889851), while the wrong
+    ``to_qp`` -- ``U A U^dagger`` where ``U^dagger A U`` was meant -- is
+    Hermitian, has the same trace and the same Frobenius norm, so no
+    invariance check can see it.  The gate pins both against an explicit
+    host rotation.
+
+    SHARDING CONTRACT, and it is the whole reason this is one function:
+
+    * ``U``  -> :func:`band_rotation_spec`, always.
+    * ``X``  -> ``axis`` on the CONTRACTED mesh axis, every other axis
+      replicated.  On an operand that arrives replicated this is a free
+      slice; on one that arrives sharded elsewhere it is the reshard the
+      contraction needs, emitted here instead of being inferred.
+    * ``Y``  -> ``axis`` on the FREE mesh axis, every other axis
+      replicated.
+
+    Landing on U's own free axis rather than on the caller's final layout
+    is deliberate and measured: constraining straight to a re-split layout
+    forced XLA to finish the reduction before it could re-split, i.e. to
+    all-reduce the FULL global result -- c128[16,640,2,11008], 3.36
+    GiB/rank, 4.93 s at b600/P=64 (audit 2026-08-05, ``rotate_bands``).
+    A caller that wants another layout constrains again afterwards; from
+    the free axis that second step is local.
+
+    ``axis`` must not be 0 -- axis 0 is k, the batch index U is indexed
+    by.
+    """
+    axis = int(axis)
+    nd = int(getattr(X, "ndim", np.ndim(X)))
+    if axis <= 0 or axis >= nd:
+        raise ValueError(
+            f"rotate_band_axis: axis={axis} out of range for a {nd}-D "
+            f"operand, and axis 0 is k (the batch index U is indexed by).")
+    contract_ax, free_ax = ("x", "y") if to_qp else ("y", "x")
+    in_spec = P(*[contract_ax if i == axis else None for i in range(nd)])
+    out_spec = P(*[free_ax if i == axis else None for i in range(nd)])
+
+    U = jax.lax.with_sharding_constraint(
+        U, NamedSharding(mesh, band_rotation_spec()))
+    X = jax.lax.with_sharding_constraint(X, NamedSharding(mesh, in_spec))
+
+    # Subscripts: axis 0 is 'k'; the rotated axis takes U's contracted
+    # letter on input and U's free letter on output.  'k', 'm', 'n' are
+    # reserved for U, so the operand's other axes are lettered from 'a'.
+    other = "abcdefghij"
+    x_sub = ["k"] + [other[i] for i in range(1, nd)]
+    j = x_sub[axis]
+    u_sub = f"k{j}n" if to_qp else f"km{j}"
+    o_sub = list(x_sub)
+    o_sub[axis] = "n" if to_qp else "m"
+    out = jnp.einsum(f"{u_sub},{''.join(x_sub)}->{''.join(o_sub)}",
+                     jnp.conj(U) if conj_u else U, X, optimize=True)
+    return jax.lax.with_sharding_constraint(out, NamedSharding(mesh, out_spec))
+
+
+def rotate_band_matrix(A, U, *, mesh: Mesh, to_qp: bool):
+    """``A_QP = U^dagger A_DFT U`` (``to_qp``) or ``A_DFT = U A_QP U^dagger``.
+
+    ``A`` is ``(n_k, nb, nb)`` with axis 1 the bra index and axis 2 the
+    ket index; ``U`` is at :func:`band_rotation_spec` and stays there.
+    Two :func:`rotate_band_axis` calls, ket first, with ``conj_u``
+    flipped between them -- see there for why that flip is the one thing
+    no invariance check can catch.
+
+    THE OUTPUT IS SHARDED, ``P(None, free_ax, None)``.  A caller that
+    needs it replicated (the SC carry is read on the host) says so; this
+    function does not, because that gather is the caller's cost and the
+    point here is that ``U`` never pays it.
+
+    Ket first is not arbitrary: it leaves the intermediate's free index
+    on the mesh axis the second call's ``in_spec`` does NOT claim, so the
+    reshard between them is an all-to-all of the TILE, not a gather.
+    Census at nk=8/nb=32 on a 2x2 mesh (job 7889851), one full
+    (nk, nb, nb) = 0.1250 MiB, both directions identical:
+
+        all-reduce         c128[8,32,16]    0.0625 MiB   group=2
+        all-to-all         c128[8,1,16,16]  0.0312 MiB   group=2
+        collective-permute c128[8,16,32]    0.0625 MiB
+        all-reduce         c128[8,16,32]    0.0625 MiB   group=2
+
+    -- ``nb^2/(px*py)`` for the reshard, ``nb^2/px`` for the two psums,
+    and nothing full-size.  The only full-size collective in the shipped
+    seam is the CALLER's gather of the result to replicated.
+    """
+    A = rotate_band_axis(A, U, mesh=mesh, axis=2,
+                         to_qp=to_qp, conj_u=not to_qp)
+    return rotate_band_axis(A, U, mesh=mesh, axis=1,
+                            to_qp=to_qp, conj_u=to_qp)
 
 
 def symmetrise_density(rho_r, sym_perm):
@@ -399,6 +537,11 @@ def rotate_bands(psi_G, U_qp, *, mesh: Mesh):
     ``U_qp`` is :func:`band_rotation_spec` — m on 'x', n on 'y' — so the
     sum over m reduces along 'x' alone and no rank holds a full (nb, nb).
 
+    This is :func:`rotate_band_axis` on ψ's band axis; what is local here
+    is the mesh padding (ψ's band axis is padded to the mesh divisor and
+    U is zero-padded to match) and the second constraint that re-splits
+    the result from U's free axis 'y' onto ``_band_spec``'s ('x','y').
+
     WHY RETURN ψ̃ RATHER THAN FOLD THE ROTATION INTO ρ.  ψ̃ is needed
     TWICE per iteration: once to build ρ, once to contract ⟨m|V_H|n⟩ in
     the QP basis.  Rotating once and reusing it replaces an ``nk·nb³``
@@ -416,30 +559,23 @@ def rotate_bands(psi_G, U_qp, *, mesh: Mesh):
         # physical ones; zeros keep ψ̃'s pad bands exactly zero.
         U = jnp.pad(U, ((0, 0), (0, nb_pad - int(U.shape[1])),
                         (0, nb_pad - int(U.shape[2]))))
-    m_on_x = NamedSharding(mesh, P(None, "x", None, None))
     band_xy = NamedSharding(mesh, _band_spec())
-    U_sh = NamedSharding(mesh, band_rotation_spec())
 
     def build():
         @jax.jit
         def fn(psi_, U_):
-            psi_mx = jax.lax.with_sharding_constraint(psi_, m_on_x)
-            U_x = jax.lax.with_sharding_constraint(U_, U_sh)
-            out = jnp.einsum('kmn,kmsg->knsg', U_x, psi_mx, optimize=True)
-            # TWO CONSTRAINTS, AND THE ORDER IS THE WHOLE POINT.  The
-            # contraction is over m ('x') and n comes from U's 'y', so the
-            # NATURAL output is n on 'y', partial over 'x'.  Constraining
-            # straight to ('x','y') forced XLA to finish the reduction
-            # before it could re-split, i.e. to all-reduce the FULL global
-            # psi_tilde across 'x' -- measured c128[16,640,2,11008],
-            # 3.36 GiB/rank, 4.93 s at b600/P=64 (audit 2026-08-05).
-            #
-            # Landing on 'y' first completes the same sum at (nb/py, ns,
-            # ngkmax) = 28 MB, and the second constraint is then FREE: a
-            # rank holding its whole y-block replicated over 'x' takes its
-            # own x-th sub-slice with no communication at all.
-            out = jax.lax.with_sharding_constraint(
-                out, NamedSharding(mesh, P(None, "y", None, None)))
+            # ``rotate_band_axis`` emits psi at P(None,'x',None,None), U at
+            # band_rotation_spec, the einsum, and the landing constraint
+            # P(None,'y',None,None) -- U's own free axis.
+            out = rotate_band_axis(psi_, U_, mesh=mesh, axis=1, to_qp=True)
+            # THE SECOND CONSTRAINT, AND THE ORDER IS THE WHOLE POINT.
+            # Constraining straight to ('x','y') forced XLA to finish the
+            # reduction before it could re-split, i.e. to all-reduce the
+            # FULL global psi_tilde across 'x' -- measured
+            # c128[16,640,2,11008], 3.36 GiB/rank, 4.93 s at b600/P=64
+            # (audit 2026-08-05).  From the 'y' landing this step is FREE:
+            # a rank holding its whole y-block replicated over 'x' takes
+            # its own x-th sub-slice with no communication at all.
             return jax.lax.with_sharding_constraint(out, band_xy)
         return fn
 
