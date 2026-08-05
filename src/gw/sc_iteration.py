@@ -308,12 +308,36 @@ def _dft_psi_sphere(inputs):
     ρ on the FFT grid, so the density rebuild needs the G-sphere.  ψ_DFT
     is constant across iterations — only U moves — so this is one read per
     run, not one per iteration.
+
+    THE BAND RANGE IS GLOBAL, THE CARRY'S EXTENT IS b0-RELATIVE.
+    ``WfnLoader.load`` indexes the file's bands, ``[0, wfn.nbands)``
+    (``wfn_loader.py:1158-1165``), while ``kin_ion_dft`` is
+    ``(nk, nb_sigma, nb_sigma)`` with ``nb_sigma = b3 − b0``
+    (``load_kin_ion_submatrix``, and the shape check in this module's
+    header note).  This used to read ``bands=(0, kin_ion_dft.shape[1])``,
+    which is the correct window only while ``b0 == 0`` and silently the
+    WRONG BANDS otherwise — ``[0, nb_sigma)`` instead of ``[b0, b3)``.
+    V_H is an O(400 Ry) term and the band count would still be right, so
+    neither the electron-count check in ``rho_from_wfns`` nor any norm or
+    hermiticity check downstream would see it.  Take the range from
+    ``band_slices.sigma_range``, which IS the global pair, and never
+    reconstruct one from an extent.
     """
     from jax.sharding import NamedSharding as _NS
     from common.mtxel_sweep import band_sphere_spec
 
-    nb = int(inputs.kin_ion_dft.shape[1])
-    key = (id(inputs.wfn), nb)
+    b_lo, b_hi = inputs.band_slices.sigma_range
+    nb_sigma = int(inputs.kin_ion_dft.shape[1])
+    if (b_hi - b_lo) != nb_sigma:
+        raise ValueError(
+            f"_dft_psi_sphere: band_slices.sigma_range={(b_lo, b_hi)} spans "
+            f"{b_hi - b_lo} bands but the SC carry is {nb_sigma} wide.  These "
+            f"describe the same active subspace and a mismatch means one of "
+            f"them is b0-relative where the other is global.")
+    # Key on the GLOBAL RANGE, not on its width: two windows of equal
+    # extent at different b0 are different ψ and must not share a cache
+    # entry.
+    key = (id(inputs.wfn), b_lo, b_hi)
     hit = _PSI_G_CACHE.get(key)
     if hit is None:
         # ONE-TIME ROW.  The section is entered every iteration but only
@@ -323,7 +347,8 @@ def _dft_psi_sphere(inputs):
         # time on ``vh.rebuild``.
         with timing.section("vh.psi_load"):
             spec = band_sphere_spec()
-            psi = inputs.wfn.load(bands=(0, nb), k="full_bz", sharding=spec)
+            psi = inputs.wfn.load(
+                bands=(b_lo, b_hi), k="full_bz", sharding=spec)
             bidx = np.asarray(inputs.wfn.box_index(k="full_bz"))
         hit = (psi, bidx)
         _PSI_G_CACHE[key] = hit
@@ -498,12 +523,20 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if bool(getattr(inputs.config, "density_self_consistent", False)):
             from gw.qsgw_density import distributed_eigh_bands
             from gw.efermi import fermi_level_step
+
+            from .scissor import k_star_weights
             E_qp_ry, U_qp = distributed_eigh_bands(
                 state.H_qp_dft, mesh=inputs.mesh_xy)
-            nk_loc = int(np.asarray(E_qp_ry).shape[0])
+            # THE SECOND REDUCTION OVER k IN THIS LOOP, and it needs the
+            # same star weights the scissor does: the electron count is
+            # Σ_k w_k Σ_n f_nk, so on the IBZ each star must carry its
+            # multiplicity.  ``1/nk`` here would count the 6 doubled stars
+            # of mos2_4x4 once each and put E_F in the wrong place.
+            # ``fermi_level_step`` wants weights summing to 1 over its own
+            # k-set (efermi.py:50-53), hence the divide by nk_full.
+            w_k = k_star_weights(_kstar(inputs))
             efermi_ry = fermi_level_step(
-                np.asarray(E_qp_ry), np.full(nk_loc, 1.0 / nk_loc),
-                float(n_occ))
+                np.asarray(E_qp_ry), w_k / float(w_k.sum()), float(n_occ))
         else:
             E_qp_ry, U_qp, efermi_ry = _diagonalize_and_get_efermi(
                 state.H_qp_dft, n_occ, inputs.mesh_xy)
@@ -629,9 +662,16 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     if not ks.is_identity:
         e_dft_act = jnp.asarray(ks.select(np.asarray(e_dft_act)))
         val_mask = jnp.asarray(ks.select(np.asarray(val_mask)))
+    # ``ks``, NOT A WEIGHT ARRAY.  The scissor refit is a REDUCTION over k
+    # and the only one in the carry, so it needs star multiplicities, not
+    # just the right k-set (§7 of the scaffold labels operands by k-set;
+    # that rule is incomplete).  Handing the callee the SAME map that did
+    # the ``select`` three lines up is what makes the weights impossible
+    # to get out of step with the rows.
     scissor_E_qp_kn_ry = _scissor_E_qp_for_outofrange(
         H_qp_dft_full, e_dft_act, val_mask,
-        inputs.partition.in_range_mask,
+        inputs.partition.in_range_mask, ks,
+        print_fn=inputs.print_fn,
     )
     H_qp_dft_new = apply_band_partition(
         H_qp_dft_full,
@@ -662,6 +702,8 @@ def _scissor_E_qp_for_outofrange(
     e_dft_kn_ry: jax.Array,
     valence_mask_kn: jax.Array,
     in_range_mask: jax.Array,
+    kstar,
+    print_fn=None,
 ) -> jax.Array:
     """Return ``E_QP_scissor[k, n]`` for use as the diagonal of bands
     that are out of the ω-grid range.
@@ -675,7 +717,22 @@ def _scissor_E_qp_for_outofrange(
     Short-circuits to ``E_DFT`` (no correction) when every band is
     in-range — the all-protected default — so the per-iteration cost
     is one ``np.diagonal`` call.
+
+    ``kstar`` IS REQUIRED AND IS THE MAP THAT PRODUCED THESE ROWS.  The
+    fit is a least squares over every (k, n) sample, so it is a reduction
+    over k and its answer depends on how often each k appears.  With the
+    loop on the IBZ each star appears once but stands for
+    ``multiplicity`` full-BZ points; fitting those rows unweighted gave a
+    different α/β, a different scissor diagonal on the 98/128 out-of-range
+    bands of mos2_4x4, and eqp0 differing from the full-BZ arm by 0.386 eV
+    max / 0.037 eV rms at 3 iterations (job 7889373) while Σ itself was
+    bit-identical (job 7889375).  Taking the map instead of a weight array
+    means the weights cannot be omitted, and cannot be built from a
+    different k-set than the rows.  On an identity map
+    ``k_star_weights`` returns ones and the arithmetic is unchanged.
     """
+    from .scissor import k_star_weights
+
     e_dft_np = np.asarray(e_dft_kn_ry, dtype=np.float64)
     in_range = np.asarray(in_range_mask, dtype=bool)
     # Fast path: nothing to extrapolate.
@@ -691,7 +748,12 @@ def _scissor_E_qp_for_outofrange(
         H_diag_np * RYD_TO_EV,
         valence_mask_kn=np.asarray(valence_mask_kn, dtype=bool),
         fit_mask_kn=in_range_kn,
+        k_weights=k_star_weights(kstar),
     )
+    if print_fn is not None:
+        # The two arms' agreement is readable here: ``n`` differs with the
+        # k-set, ``w`` must not.
+        print_fn(f"    SC scissor: {fit.summary()}")
     # ΔE = (α − 1) · E + β; E_QP = E_DFT + ΔE.
     delta_ev = fit.predict(
         e_dft_np * RYD_TO_EV, np.asarray(valence_mask_kn, dtype=bool))
@@ -987,6 +1049,29 @@ def run_sc_driver(
 
     from .band_partition import BandPartition
     from .scissor import classify_bands_in_grid
+
+    # THE b0 == 0 ASSUMPTION, MADE EXPLICIT.  Every occupancy in this
+    # module indexes the ACTIVE window with a GLOBAL band count:
+    # ``val_mask_active`` below, ``n_occ`` in ``gw_iteration_map``, the
+    # ``E[:, :n_occ]`` midgap in ``_diagonalize_and_get_efermi``, and the
+    # ``fermi_level_step`` target in ``rebuild_hartree_dft_basis``.  All
+    # four are ``meta.nelec``, which counts from band 0, while the window
+    # starts at ``b0``.  They coincide only at ``b0 == 0``.  On a deck
+    # with ``nval < nelec`` the masks would silently mark the wrong bands
+    # occupied and the density-SC rebuild would omit the ``b0`` bands
+    # below the window from ρ — an O(400 Ry) V_H error with no local
+    # symptom, since ``rho_from_wfns`` checks only the electron count it
+    # was handed.  Refuse instead of computing it.
+    b0_sigma, b3_sigma = band_slices.sigma_range
+    if int(b0_sigma) != 0:
+        raise NotImplementedError(
+            f"run_sc_driver: the SC active window starts at b0={int(b0_sigma)} "
+            f"(sigma_range={(int(b0_sigma), int(b3_sigma))}), but every "
+            f"occupancy here is meta.nelec={int(meta.nelec)} indexed into the "
+            f"window, i.e. counted from band 0.  Self-consistency on a deck "
+            f"with b0 != 0 needs the occupancies re-expressed relative to b0 "
+            f"and the density rebuild extended to the bands below b0; neither "
+            f"is implemented.  Use nval = nelec, or qp_solver = one_shot_dft.")
 
     e_dft_active_kn_ry = jnp.asarray(np.asarray(enk_dft, dtype=np.float64))
     nb_active = e_dft_active_kn_ry.shape[1]

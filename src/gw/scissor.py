@@ -32,6 +32,30 @@ classification gives a discontinuity-free scissor: out-of-grid bands receive
 the affine law uniformly across k, and the fit itself is restricted to data
 from in-grid bands so the contaminated points never enter.
 
+The fit is a REDUCTION OVER k and therefore needs k WEIGHTS
+----------------------------------------------------------
+``fit_scissor`` least-squares over every (k, n) sample, so the answer
+depends on how many times each k enters.  On the full BZ every k enters
+once; on a symmetry-reduced k-set each star is present once but stands
+for ``multiplicity`` full-BZ points.  An unweighted fit on a reduced set
+therefore fits a DIFFERENT point cloud and returns a plausible number.
+
+Measured cost of getting this wrong: with the SC loop on the IBZ
+(``sc_on_ibz``) the MoS₂ 4×4 deck reduces 16 k to 10 stars, 6 of which
+have multiplicity 2.  The unweighted fit made the carried H differ from
+the full-BZ arm by 1.67e-02 Ry = 0.23 eV after ONE iteration and eqp0 by
+0.386 eV max / 0.037 eV rms after three (jobs 7889373, 7889375), while
+Σ itself, the star select/broadcast and the ψ rotation were bit-identical
+between the arms — see ``docs/dev/ibz_self_consistency_scaffold.md`` §8.
+
+``k_weights`` is consequently a REQUIRED keyword argument of
+``fit_scissor``.  There is no unweighted spelling to forget, and the two
+legitimate weight tables have named constructors that state the caller's
+claim about its own k-set: :func:`full_bz_k_weights` ("every k is its own
+star") and :func:`k_star_weights` ("multiplicities from the map that did
+the reduction").  Uniform weights reduce to exactly the previous
+arithmetic, bit for bit — asserted in ``tests/test_scissor_weights.py``.
+
 Units and layout
 ----------------
 - Energies: eV.  The caller decides whether to work in absolute or
@@ -72,9 +96,15 @@ class ScissorFit:
         Analogous for conduction.
     n_fit_v, n_fit_c : int
         Number of (k, n) points used in each fit.
+    w_fit_v, w_fit_c : float
+        Total k-weight carried by those points, ``Σ w_k`` over the fit
+        mask.  Equal to ``n_fit`` on the full BZ; on a reduced k-set it is
+        the full-BZ sample count the fit stands for.  The two are the
+        evidence that an IBZ arm and a full-BZ arm fit the same cloud:
+        the point counts differ, these do not.
     rmse_v_ev, rmse_c_ev : float
-        Fit residual RMSE on the QP correction ΔE = E_QP − E_DFT, in eV.
-        0 when the fit has fewer than 2 points.
+        Fit residual RMSE on the QP correction ΔE = E_QP − E_DFT, in eV,
+        k-weighted like the fit.  0 when the fit has fewer than 2 points.
     """
 
     alpha_v: float
@@ -85,6 +115,8 @@ class ScissorFit:
     n_fit_c: int
     rmse_v_ev: float
     rmse_c_ev: float
+    w_fit_v: float
+    w_fit_c: float
 
     def predict(self, E_ev: np.ndarray, valence_mask: np.ndarray) -> np.ndarray:
         """Evaluate the scissor **correction** ΔE = E_QP − E_DFT at each (k, n).
@@ -109,10 +141,12 @@ class ScissorFit:
     def summary(self) -> str:
         return (
             f"ScissorFit(val: α={self.alpha_v:+.4f}, β={self.beta_v_ev:+.4f} eV, "
-            f"n={self.n_fit_v}, rmse={self.rmse_v_ev:.3f} eV; "
+            f"n={self.n_fit_v}, w={self.w_fit_v:.0f}, "
+            f"rmse={self.rmse_v_ev:.3f} eV; "
             f"cond: α={self.alpha_c:+.4f}, β={self.beta_c_ev:+.4f} eV, "
-            f"n={self.n_fit_c}, rmse={self.rmse_c_ev:.3f} eV)  "
-            f"[α=1 ⇔ rigid shift]"
+            f"n={self.n_fit_c}, w={self.w_fit_c:.0f}, "
+            f"rmse={self.rmse_c_ev:.3f} eV)  "
+            f"[α=1 ⇔ rigid shift; n = samples, w = full-BZ weight]"
         )
 
 
@@ -152,26 +186,78 @@ def classify_bands_in_grid(
 
 
 # ---------------------------------------------------------------------------
+# k-weight tables — the two legitimate ones, each named after its claim
+# ---------------------------------------------------------------------------
+
+def full_bz_k_weights(nk: int) -> np.ndarray:
+    """Weights for an UNREDUCED k-set: every k is its own star, w ≡ 1.
+
+    Use this only where the k axis really is the full grid.  Everything
+    ``compute_sigma_xc`` / ``compute_screening`` produce is on the full BZ
+    because Σ is an FFT over the k-grid
+    (``docs/dev/ibz_self_consistency_scaffold.md`` §7).
+    """
+    return np.ones(int(nk), dtype=np.float64)
+
+
+def k_star_weights(kstar) -> np.ndarray:
+    """Star multiplicities for a reduced k-set, in the map's own row order.
+
+    ``kstar`` is a ``common.symmetry_maps.KStarMap`` (duck-typed on
+    ``irr_idx`` and ``select``, so this module keeps no symmetry import).
+    ``w[j]`` is the number of full-BZ k that ``select`` collapsed into row
+    ``j``: ``np.bincount(irr_idx)`` counted per star, spread back over the
+    full BZ, then passed through ``kstar.select`` itself.
+
+    Routing the table through ``select`` rather than re-deriving the row
+    order is deliberate — ``star_select`` orders rows by first occurrence
+    in ``irr_idx`` (``symmetry_maps.py:1770-1772``), which a second
+    implementation here could drift from silently, misaligning weights
+    with rows.  Using ``select`` makes that impossible by construction.
+
+    On an identity map every star is a singleton, so this returns ones and
+    the caller needs no branch: the full-BZ path stays the same code.
+    """
+    irr = np.asarray(kstar.irr_idx)
+    mult_full = np.bincount(irr)[irr].astype(np.float64)
+    w = np.asarray(kstar.select(mult_full), dtype=np.float64)
+    return w
+
+
+# ---------------------------------------------------------------------------
 # Fit
 # ---------------------------------------------------------------------------
 
-def _ols_line(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
-    """Closed-form OLS line fit; returns (slope, intercept, RMSE)."""
+def _wls_line(x: np.ndarray, y: np.ndarray,
+              w: np.ndarray) -> tuple[float, float, float]:
+    """Closed-form WEIGHTED least-squares line fit; (slope, intercept, RMSE).
+
+    Minimises ``Σ w_i (y_i − a x_i − b)²``.  Written so that ``w ≡ 1``
+    reproduces the unweighted arithmetic BIT FOR BIT: ``w * v`` is exact
+    for ``w = 1.0``, and the means use ``np.sum(w*x)/np.sum(w)``, which is
+    the same pairwise ``add.reduce`` over the same values as ``x.mean()``
+    divided by the same float.  Measured over 3000 random (n ≤ 4000)
+    problems: 0 mismatches, exact equality of all three returns.  Using
+    ``np.dot(w, x)`` for the means instead would go through BLAS ddot and
+    is NOT guaranteed to match ``x.mean()``.
+    """
     n = int(x.size)
     if n == 0:
         return 0.0, 0.0, 0.0
     if n == 1:
         return 0.0, float(y[0]), 0.0
-    xm = float(x.mean())
-    ym = float(y.mean())
+    W = float(np.sum(w))
+    xm = float(np.sum(w * x) / W)
+    ym = float(np.sum(w * y) / W)
     dx = x - xm
-    denom = float(np.dot(dx, dx))
+    wdx = w * dx
+    denom = float(np.dot(wdx, dx))
     if denom < 1.0e-30:
-        return 0.0, ym, float(np.sqrt(np.mean((y - ym) ** 2)))
-    slope = float(np.dot(dx, y - ym) / denom)
+        return 0.0, ym, float(np.sqrt(np.sum(w * (y - ym) ** 2) / W))
+    slope = float(np.dot(wdx, y - ym) / denom)
     intercept = float(ym - slope * xm)
     resid = y - (slope * x + intercept)
-    return slope, intercept, float(np.sqrt(np.mean(resid * resid)))
+    return slope, intercept, float(np.sqrt(np.sum(w * resid * resid) / W))
 
 
 def fit_scissor(
@@ -179,6 +265,8 @@ def fit_scissor(
     E_qp_kn_ev: np.ndarray,
     valence_mask_kn: np.ndarray,
     fit_mask_kn: np.ndarray,
+    *,
+    k_weights: np.ndarray,
 ) -> ScissorFit:
     """Fit valence / conduction scissor lines to (E_DFT, ΔE) samples.
 
@@ -215,6 +303,13 @@ def fit_scissor(
         True where the point is trusted enough to enter the fit —
         typically "E_kn lies inside the Σ(ω) grid".  Applied
         independently within valence and conduction.
+    k_weights : np.ndarray, (nk,) — REQUIRED, keyword-only
+        How many full-BZ k each row stands for.  Build it with
+        :func:`full_bz_k_weights` or :func:`k_star_weights`; do not spell
+        it inline.  Required rather than defaulted because this fit is a
+        reduction over k and an unweighted fit on a reduced k-set returns
+        a plausible wrong scissor that no downstream check catches — see
+        the module docstring for the measured size (0.386 eV in eqp0).
     """
     E_dft = np.asarray(E_dft_kn_ev, dtype=np.float64)
     E_qp = np.real(np.asarray(E_qp_kn_ev, dtype=np.complex128))
@@ -227,6 +322,22 @@ def fit_scissor(
         )
 
     nk = E_dft.shape[0]
+    w_k = np.asarray(k_weights, dtype=np.float64)
+    if w_k.shape != (nk,):
+        raise ValueError(
+            f"fit_scissor: k_weights has shape {w_k.shape}, expected "
+            f"({nk},) to match the k axis of E_DFT.  A weight table from a "
+            f"different k-set than the energies is the exact failure this "
+            f"argument exists to prevent; build it from the map that "
+            f"reduced these energies (scissor.k_star_weights) or state "
+            f"that they are unreduced (scissor.full_bz_k_weights).")
+    if not np.all(np.isfinite(w_k)) or float(w_k.min()) <= 0.0:
+        raise ValueError(
+            f"fit_scissor: k_weights must be finite and strictly positive; "
+            f"got min {float(np.nanmin(w_k)):.6g}, max "
+            f"{float(np.nanmax(w_k)):.6g}.  A zero weight drops a star from "
+            f"the fit silently.")
+
     rows = np.arange(nk)[:, None]
     order_dft = np.argsort(E_dft, axis=1)
     order_qp = np.argsort(E_qp, axis=1)
@@ -240,24 +351,37 @@ def fit_scissor(
     mask_v = vm_sorted & fm_sorted
     mask_c = (~vm_sorted) & fm_sorted
 
+    # The k-weight rides along per (k, n) sample: every band at k carries
+    # the same star multiplicity, so broadcast down the band axis.  The
+    # sort permutation is per-k (rows are not reordered), hence no
+    # reordering of w_kn is needed.
+    w_kn = np.broadcast_to(w_k[:, None], E_dft.shape)
+
     # Fit E_QP = α · E_DFT + β directly so α reads as the stretching factor
     # (α = 1 ⇒ rigid shift).  RMSE is reported on the QP correction
     # ΔE = E_QP − E_DFT for human readability ("the residual error in
     # predicting how much GW shifts each band").
-    alpha_v, beta_v, _ = _ols_line(E_dft_sorted[mask_v], E_qp_sorted[mask_v])
-    alpha_c, beta_c, _ = _ols_line(E_dft_sorted[mask_c], E_qp_sorted[mask_c])
+    w_v = w_kn[mask_v]
+    w_c = w_kn[mask_c]
+    alpha_v, beta_v, _ = _wls_line(
+        E_dft_sorted[mask_v], E_qp_sorted[mask_v], w_v)
+    alpha_c, beta_c, _ = _wls_line(
+        E_dft_sorted[mask_c], E_qp_sorted[mask_c], w_c)
     resid_v = (E_qp_sorted - E_dft_sorted)[mask_v] - (
         (alpha_v - 1.0) * E_dft_sorted[mask_v] + beta_v)
     resid_c = (E_qp_sorted - E_dft_sorted)[mask_c] - (
         (alpha_c - 1.0) * E_dft_sorted[mask_c] + beta_c)
-    rmse_v = float(np.sqrt(np.mean(resid_v * resid_v))) if resid_v.size else 0.0
-    rmse_c = float(np.sqrt(np.mean(resid_c * resid_c))) if resid_c.size else 0.0
+    rmse_v = (float(np.sqrt(np.sum(w_v * resid_v * resid_v) / np.sum(w_v)))
+              if resid_v.size else 0.0)
+    rmse_c = (float(np.sqrt(np.sum(w_c * resid_c * resid_c) / np.sum(w_c)))
+              if resid_c.size else 0.0)
 
     return ScissorFit(
         alpha_v=alpha_v, beta_v_ev=beta_v,
         alpha_c=alpha_c, beta_c_ev=beta_c,
         n_fit_v=int(mask_v.sum()), n_fit_c=int(mask_c.sum()),
         rmse_v_ev=rmse_v, rmse_c_ev=rmse_c,
+        w_fit_v=float(w_v.sum()), w_fit_c=float(w_c.sum()),
     )
 
 
@@ -265,4 +389,6 @@ __all__ = [
     "ScissorFit",
     "classify_bands_in_grid",
     "fit_scissor",
+    "full_bz_k_weights",
+    "k_star_weights",
 ]

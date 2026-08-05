@@ -303,3 +303,132 @@ peak (3.86e-01 eV) at bands 41-44, E_DFT ≈ +5.0 to +5.5 eV.
 Fix direction: pass star multiplicities (`np.bincount(sym.irr_idx_k)`) as
 sample weights into `fit_scissor` when the loop runs reduced, so the fit
 sees the same weighted point cloud on either k-set. Not attempted here.
+
+---
+
+## 9. Status 2026-08-05 — weighted; the two arms agree
+
+### 9.1 The numbers
+
+Deck `mos2_4x4` (`run_800c_valsmoke_fftoff`), `qp_solver = self_consistent`,
+`gn_ppm`, `sc_accelerator = linear`, `sc_mixing = 1.0`,
+`sc_tol_ev = 1e-12`, identical decks except `sc_on_ibz`. Metric: the QP
+column of `eqp0.dat` / `eqp1.dat`, parsed structurally
+(`/scratch2/08271/jackmc/dsc_demo/cmp_arms.py` — a flat `np.loadtxt` mixes
+the k-header lines into the comparison, since both line kinds have four
+fields).
+
+| iters | eqp0 max\|Δ\| | eqp0 rms | eqp1 max\|Δ\| | `WFN_qp.h5` QP (THE CARRY) | job |
+|---|---|---|---|---|---|
+| 3, unweighted | 3.860857e-01 eV | 3.690288e-02 eV | 3.354576e-01 eV | 1.969640e-02 Ry = 2.680e-01 eV | 7889373 |
+| 3, **weighted** | **8.000001e-09 eV** | **1.129851e-09 eV** | 8.000001e-09 eV | **2.819540e-10 Ry = 3.836e-09 eV** | 7889398 |
+| 1, unweighted | 0.000000e+00 eV | 0 | 0.000000e+00 eV | 1.672891e-02 Ry = 2.276e-01 eV | 7889375 |
+| 1, **weighted** | 0.000000e+00 eV | 0 | 0.000000e+00 eV | **1.124372e-10 Ry = 1.530e-09 eV** | 7889398 |
+
+Read the last column first: it is `eigh(state_final.H_qp_dft)`, i.e. the
+carry, and it is the quantity §8.3 used to localise the bug. At ONE
+iteration it fell from 1.673e-02 Ry to 1.124e-10 Ry — eight orders — with
+`eqp0` bit-identical on both sides of the change, which is the direct
+statement that the scissor refit was the whole of the disagreement.
+
+8.0e-09 eV in the `eqp0` column is one unit in the last printed place of
+that file's `%.9f` QP field at |E| ≈ 16 eV, so at 3 iterations the two
+arms agree to the file's write precision; the underlying arrays agree to
+2.8e-10 Ry. `E_DFT` remains identical (0.000e+00) as in §8.2. All four
+runs rc=0, both arms. Comparison re-run under one metric for all four
+rows in job 7889406, which also carries the pre-fix rows so the before
+and after are not measured differently.
+
+The direct evidence is in the log. Each iteration now prints its scissor
+fit; the point COUNT differs with the k-set and the total WEIGHT does not:
+
+    fullbz  val: α=+1.1141, β=+0.6025 eV, n=224, w=224  cond: α=+0.8959, β=+1.5693 eV, n=256, w=256
+    ibz     val: α=+1.1141, β=+0.6025 eV, n=140, w=224  cond: α=+0.8959, β=+1.5693 eV, n=160, w=256
+
+14 in-grid valence bands × 16 k = 224 samples on the full BZ, × 10 stars =
+140 on the IBZ, weight 224 either way; α and β agree to every printed
+digit. That line is the gate a future regression trips first.
+
+### 9.2 What was changed, and why in that shape
+
+`fit_scissor` (`gw/scissor.py`) takes `k_weights` as a REQUIRED
+keyword-only argument. There is no unweighted spelling left to forget: a
+call site that omits it raises `TypeError`, and one that supplies a table
+from a different k-set raises `ValueError` on the shape. The two
+legitimate tables have named constructors that state the caller's claim
+about its own k-set — `full_bz_k_weights(nk)` ("every k is its own star")
+and `k_star_weights(kstar)` ("multiplicities from the map that did the
+reduction") — so the claim is greppable rather than an inline `np.ones`.
+
+`k_star_weights` routes `np.bincount(irr_idx)[irr_idx]` through
+`kstar.select` instead of re-deriving the row order. `star_select` orders
+rows by first occurrence in `irr_idx` (`symmetry_maps.py:1770-1772`); a
+second implementation of that ordering could drift and misalign weights
+with rows silently, and using `select` makes that impossible.
+
+`_scissor_E_qp_for_outofrange` (`gw/sc_iteration.py`) takes the
+`KStarMap` itself, not a weight array. It is handed the same `ks` that
+performed the `select` three lines above it, so the weights cannot be
+built from a different k-set than the rows they weight. An identity map
+returns ones, so the full-BZ path is the same code, not a branch.
+
+The full-BZ arithmetic is unchanged BIT FOR BIT, not approximately.
+`_wls_line` uses `np.sum(w*x)/np.sum(w)` for the means — with `w = 1.0`
+that is the same pairwise `add.reduce` over the same values as
+`x.mean()`, divided by the same float — and `np.dot(w*dx, dx)` for the
+normal equations, where `w*dx` is bitwise `dx`. `np.dot(w, x)` for the
+means would have gone through BLAS `ddot` and is not guaranteed to match
+`x.mean()`. Asserted by `tests/test_scissor_weights.py`, which
+transcribes the pre-weighting `_ols_line`/`fit_scissor` verbatim and
+compares with `==` over 24 random shapes, plus a red twin that perturbs
+one weight and asserts the comparison then fails.
+
+### 9.3 The other reduction over k in the loop, and the one left
+
+`gw_iteration_map` had a second one: the density-SC branch called
+`fermi_level_step(E, np.full(nk, 1/nk), nelec)`. The electron count is
+`Σ_k w_k Σ_n f_nk`, so on the IBZ each star must carry its multiplicity;
+`1/nk` would count the 6 doubled stars of this deck once each and put E_F
+in the wrong place. Now `k_star_weights(_kstar(inputs)) / Σw`. Not
+exercised by the runs above (`density_self_consistent` is off in this
+deck), and identical to the previous expression on the full BZ.
+
+Left unweighted, deliberately and visibly: the CONVERGENCE metric
+`RMS ΔE` in `_run_linear_mixing` / `_run_rcrop` is an unweighted mean over
+the loop's k-set, so the two arms report slightly different values
+(1.582383 vs 1.582231 eV at iteration 1, job 7889398 — 1.5e-04 eV). It
+decides only WHEN to stop, never what is carried, and the difference is
+printed every iteration rather than hidden. rCROP's residual norm is
+structurally arm-dependent for the reason in §8.2 (a flattened `H` of
+different length) and cannot be fixed by weights.
+
+Star-invariant reductions that need nothing: the midgap E_F in
+`_diagonalize_and_get_efermi` is a max/min over k, and star members carry
+identical eigenvalues.
+
+### 9.4 A separate defect found in the same file: `[b0, b3)` is GLOBAL
+
+`_dft_psi_sphere` read `wfn.load(bands=(0, kin_ion_dft.shape[1]))`.
+`WfnLoader.load` indexes the FILE's bands, `[0, wfn.nbands)`
+(`wfn_loader.py:1158-1165`), while `kin_ion_dft.shape[1]` is
+`nb_sigma = b3 − b0`, a WIDTH. The read was therefore the right number of
+the WRONG BANDS on any deck with `b0 != 0` — `[0, nb_sigma)` instead of
+`[b0, b3)` — and both decks in use have `b0 = nelec − nval = 0`, so it
+never showed. V_H is O(400 Ry); the band COUNT would still be right, so
+`rho_from_wfns`'s electron-count check, which verifies the count it was
+handed, could not catch it. Now `bands = band_slices.sigma_range`, the
+global pair, with a `ValueError` when that pair's width disagrees with the
+carry, and a cache key on the RANGE rather than its width.
+
+The wrong slice was the first symptom, not the defect. Every occupancy in
+`sc_iteration` is `meta.nelec` — a count from band 0 — indexed into the
+active window: `val_mask_active`, `n_occ` in `gw_iteration_map`, the
+`E[:, :n_occ]` midgap, and the `fermi_level_step` target. All four are
+correct only at `b0 == 0`, and the density rebuild would additionally omit
+the `b0` bands below the window from ρ. `run_sc_driver` now raises
+`NotImplementedError` on `b0 != 0` naming both, rather than computing a
+plausible number.
+
+Gated by `tests/test_sc_band_window.py` on a SYNTHETIC `b0 = 12` window
+with a recording loader stub — there is no deck with `nval < nelec` in the
+tree, so this is coverage of the call, not of a physical result.

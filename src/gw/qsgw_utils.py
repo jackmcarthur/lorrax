@@ -577,7 +577,8 @@ def solve_qp(
     # fallback when the scissor flag is off: E_DFT (the natural
     # zeroth-order QP correction = 0 estimate); the older fallback
     # of using ``eigvalsh(H_qp)`` was unreliable for pseudobands.
-    from .scissor import classify_bands_in_grid, fit_scissor
+    from .scissor import (
+        classify_bands_in_grid, fit_scissor, full_bz_k_weights)
     band_in_grid, in_grid_kn_band = classify_bands_in_grid(
         E_dft_rel_ry, float(omega_grid_ry[0]), float(omega_grid_ry[-1]))
     n_bands_in = int(band_in_grid.sum())
@@ -602,6 +603,12 @@ def solve_qp(
             E_sc_rel_ry * RYD_TO_EV,
             valence_mask_kn=occ_mask_kn,
             fit_mask_kn=in_grid_kn_band,
+            # UNREDUCED k.  Every operand here descends from
+            # ``sigma_result``, which compute_sigma_xc builds on the full
+            # BZ (Σ is an FFT over the k-grid); this path never sees an
+            # IBZ k-set.  The SC loop's own refit is the one that can, and
+            # it weights by star multiplicity — sc_iteration.py.
+            k_weights=full_bz_k_weights(E_dft_rel_ry.shape[0]),
         )
         print_fn(f"  Scissor fit: {fit.summary()}")
         extrap_rel_ry = E_dft_rel_ry + fit.predict(
