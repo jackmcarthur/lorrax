@@ -853,6 +853,10 @@ _DEFAULTS = {
     # instead of rotating the fixed DFT one into the QP basis.  Off keeps
     # QSGW fixed-density, which is what every result before 2026-08-04 was.
     "density_self_consistent": False,
+    # Run the SC loop's H / E / U on the IBZ, broadcasting back at the
+    # boundary.  Sigma stays on the full BZ -- it is an FFT over the
+    # k-grid.  Off keeps the loop entirely full-BZ.
+    "sc_on_ibz": False,
     # Density-grid cutoff (Ry) for the psp matrix-element tools (kin_ion /
     # dipole).  None → the consumer defaults it to the WFN's own ``ecutwfc``.
     "ecutrho": None,
@@ -1860,6 +1864,7 @@ class LorraxConfig:
     nband: int
     sys_dim: int
     density_self_consistent: bool
+    sc_on_ibz: bool
     #: auto | stored | isdf | gspace — see HARTREE_SOURCES.
     hartree_source: str
 
@@ -2482,6 +2487,7 @@ class LorraxConfig:
             nband=int(_g("nband")),
             sys_dim=int(_g("sys_dim")),
             density_self_consistent=bool(_g("density_self_consistent")),
+            sc_on_ibz=bool(_g("sc_on_ibz")),
             hartree_source=_hartree_source,
             restart=bool(_g("restart")),
             compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),

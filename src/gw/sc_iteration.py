@@ -116,6 +116,13 @@ class SCInputs:
     partition: BandPartition
     e_dft_active_kn_ry: jax.Array      # (nk, nb_active) DFT energies for scissor fit
     valence_mask_active_kn: jax.Array  # (nk, nb_active) bool — for scissor val/cond split
+    #: IBZ ⇄ full-BZ map for BAND-INDEX quantities.  ``None`` ⇒ the loop
+    #: runs entirely on the full BZ, which is what every result before
+    #: 2026-08-04 did and what the one-shot equivalence gate pins.  When
+    #: given, H / E / U / the carried state live on the IBZ and only Σ is
+    #: built on the full BZ — Σ comes from an FFT over the k-grid, which
+    #: needs the whole grid (decisions.md, TRS veto scope).
+    kstar: object | None = None
     print_fn: Callable = print
 
 
@@ -170,6 +177,14 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     # iteration carry.
     H0 = (enk_dft_ry[:, :, None] * np.eye(nb_active)[None, :, :]).astype(
         np.complex128)
+    # The carried state lives on whatever k-set the loop runs on.  With a
+    # k-star map that is the IBZ, so H0 is selected here ONCE rather than
+    # every iteration; diag(E_DFT) is star-consistent by construction, so
+    # the selection is exact and the iteration-0 shortcut below (which
+    # requires H0 to be exactly diagonal) still fires.
+    ks = getattr(inputs, "kstar", None)
+    if ks is not None and not ks.is_identity:
+        H0 = ks.select(H0)
     rep = NamedSharding(inputs.mesh_xy, P(None, None, None))
     # Process-local replication (plain ``jax.device_put`` of host numpy
     # onto a multi-process sharding fires JAX's hidden ``assert_equal``
@@ -299,6 +314,20 @@ def _dft_psi_sphere(inputs):
         hit = (psi, bidx)
         _PSI_G_CACHE[key] = hit
     return hit
+
+
+def _kstar(inputs):
+    """The loop's k-star map; identity when symmetry is not in use.
+
+    Returning an identity map rather than ``None`` is what lets
+    ``gw_iteration_map`` be written ONCE: ``select``/``broadcast`` are
+    no-ops on it, so the full-BZ path is the same code, not a branch.
+    """
+    from common.symmetry_maps import KStarMap
+    ks = getattr(inputs, "kstar", None)
+    if ks is not None:
+        return ks
+    return KStarMap.identity(int(inputs.kin_ion_dft.shape[0]))
 
 
 def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
@@ -440,9 +469,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # Rotate the active subspace of the DFT bundle to this iteration's QP
     # basis.  Bands outside ``slices.sigma`` keep their DFT ψ + DFT energy
     # (their QP corrections come from the scissor extrapolation downstream).
+    # THE ONE PLACE THE TWO k-SETS MEET.  H, E and U live on the IBZ; the
+    # bundle, W and Σ live on the full BZ because Σ is an FFT over the
+    # k-grid and needs the whole grid.  ``broadcast`` is an index gather
+    # plus a conjugation on time-reversed members -- a band index is
+    # symmetry-inert, so no umklapp phase or centroid permutation enters
+    # (see common.symmetry_maps, above star_select).
+    ks = _kstar(inputs)
+    U_full = ks.broadcast(np.asarray(U_qp)) if not ks.is_identity else U_qp
+    E_full = ks.broadcast(np.asarray(E_qp_ry)) if not ks.is_identity else E_qp_ry
+
     wfns_qp = rotate_wavefunctions(
-        inputs.wfns_dft, U_qp,
-        enk_active_new=E_qp_ry, efermi=float(efermi_ry),
+        inputs.wfns_dft, U_full,
+        enk_active_new=E_full, efermi=float(efermi_ry),
         mesh_xy=inputs.mesh_xy,
         active_slice=inputs.band_slices.sigma,
     )
@@ -452,8 +491,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # H_{i+1}.  Off by default, so the one-shot equivalence gate holds.
     v_h_dft_new = None
     if bool(getattr(inputs.config, "density_self_consistent", False)):
+        # rho is built from FULL-BZ psi (uniform weights, no star sum),
+        # so it takes the broadcast U and E; the matrix it returns is
+        # selected to the IBZ to match delta_h_dft.
         v_h_dft_new, e_f_ry = rebuild_hartree_dft_basis(
-            inputs, U_qp, E_qp_ry)
+            inputs, U_full, E_full)
+        if not ks.is_identity:
+            v_h_dft_new = jnp.asarray(ks.select(np.asarray(v_h_dft_new)))
         inputs.print_fn(
             f"    density-SC: rebuilt V_H from iteration {state.iteration} "
             f"orbitals (E_F = {e_f_ry:.6f} Ry)")
@@ -503,13 +547,33 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # rotation, which is the whole reason it is contracted with ψ_dft.
     # ``sigma_result.v_h_kij_ry`` is zero in that case (``omit_v_h``).
     delta_h_qp = sigma_result.v_h_kij_ry + sigma_result.sigma_xc_kij_ry
+    if not ks.is_identity:
+        # Σ ARRIVES ON THE FULL BZ AND IS SELECTED HERE.  Selection is a
+        # row take, not a symmetry operation -- these ARE the IBZ k.  The
+        # star spread is the free check that the two k-sets agree, and the
+        # only one that catches a gauge mismatch upstream; hermiticity,
+        # the norm and the electron count all survive one.
+        resid = ks.spread(np.asarray(delta_h_qp))
+        scale = max(float(np.abs(np.asarray(delta_h_qp)).max()), 1e-300)
+        inputs.print_fn(
+            f"    k-star: Σ+V_H residual {resid / scale:.3e} rel over "
+            f"{ks.nk_full}->{ks.nk_irr} k ({ks.reduction:.2f}x)")
+        delta_h_qp = jnp.asarray(ks.select(np.asarray(delta_h_qp)))
     delta_h_dft = _rotate_to_dft_basis(delta_h_qp, U_qp)
     if v_h_dft_new is not None:
         delta_h_dft = delta_h_dft + v_h_dft_new
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
+    # The scissor and partition operands are indexed by k and were built
+    # on the full BZ; take their IBZ rows so every operand of the H
+    # assembly is on one k-set.  The masks are band-only, so selecting
+    # rows cannot change what they mean.
+    e_dft_act = inputs.e_dft_active_kn_ry
+    val_mask = inputs.valence_mask_active_kn
+    if not ks.is_identity:
+        e_dft_act = jnp.asarray(ks.select(np.asarray(e_dft_act)))
+        val_mask = jnp.asarray(ks.select(np.asarray(val_mask)))
     scissor_E_qp_kn_ry = _scissor_E_qp_for_outofrange(
-        H_qp_dft_full, inputs.e_dft_active_kn_ry,
-        inputs.valence_mask_active_kn,
+        H_qp_dft_full, e_dft_act, val_mask,
         inputs.partition.in_range_mask,
     )
     H_qp_dft_new = apply_band_partition(
@@ -889,6 +953,24 @@ def run_sc_driver(
         protected_mask=in_range, in_range_mask=in_range)
     partition.warn_if_protected_outside_grid(print_fn=print_fn)
 
+    # THE k-STAR MAP.  Opt-in (``config.sc_on_ibz``); absent, the loop runs
+    # entirely on the full BZ exactly as before.  When present, H / E / U
+    # and the carried state live on the IBZ and only Σ is built on the
+    # full BZ -- Σ comes from an FFT over the k-grid and needs the whole
+    # grid (decisions.md 2026-08-04, TRS veto scope).
+    kstar = None
+    if bool(getattr(config, "sc_on_ibz", False)):
+        from common.symmetry_maps import KStarMap
+        kstar = KStarMap.from_sym(sym, int(wfn.ntran))
+        if kstar.is_identity:
+            print_fn("  SC: sc_on_ibz requested but every k-star is a "
+                     "singleton on this deck; running on the full BZ.")
+            kstar = None
+        else:
+            print_fn(f"  SC: {kstar!r} — H/E/U on the IBZ, Σ on the full BZ")
+        kin_ion = jnp.asarray(kstar.select(np.asarray(kin_ion))) \
+            if kstar is not None else kin_ion
+
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
         quad=quad, e_ref=e_ref,
@@ -900,6 +982,7 @@ def run_sc_driver(
         partition=partition,
         e_dft_active_kn_ry=e_dft_active_kn_ry,
         valence_mask_active_kn=val_mask_active,
+        kstar=kstar,
         print_fn=print_fn,
     )
     state_init = make_initial_state_from_dft(inputs)
@@ -971,9 +1054,15 @@ def run_sc_driver(
 
 
 def final_qp_eigenstates(
-    state: SCState, *, n_occ: int, mesh_xy: Mesh,
+    state: SCState, *, n_occ: int, mesh_xy: Mesh, kstar=None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Diagonalise the converged ``state.H_qp_dft`` and return the QP eigenstates.
+
+    ``kstar`` broadcasts the result back to the FULL BZ, because every
+    consumer (WFN_qp.h5, eqp.dat, the htransform interpolation) is
+    indexed by full-BZ k.  The loop reduces; the boundary restores.
+    Omitting it on an IBZ state would silently hand downstream code a
+    short k axis.
 
     Returned arrays are host-side numpy (not jax.Array) since the
     typical consumers (WFN_qp.h5 writer, eqp.dat tooling) operate on
@@ -989,6 +1078,13 @@ def final_qp_eigenstates(
     """
     E_ry, U, efermi_ry = _diagonalize_and_get_efermi(
         state.H_qp_dft, n_occ, mesh_xy)
+    if kstar is not None and not kstar.is_identity:
+        # Back to the full BZ for the consumers.  U conjugates on
+        # time-reversed members; E does not (eigenvalues are real and a
+        # star shares them), which ``broadcast`` handles because conj is
+        # the identity on a real array.
+        E_ry = kstar.broadcast(np.asarray(E_ry))
+        U = kstar.broadcast(np.asarray(U))
     return (
         np.asarray(E_ry, dtype=np.float64),
         np.asarray(U, dtype=np.complex128),
@@ -1036,6 +1132,7 @@ def dump_qp_wfn_artifacts(
     state: SCState, *,
     n_occ: int,
     mesh_xy: Mesh,
+    kstar=None,                          # IBZ->full BZ for the written arrays
     wfn,                                 # WFNReader (source of base coeffs + crystal)
     band_slices,
     kgrid,                               # (nkx, nky, nkz)
@@ -1064,7 +1161,7 @@ def dump_qp_wfn_artifacts(
     from file_io.qp_wfn import write_qp_rotations_h5, write_qp_wfn_h5
 
     enk_qp_ry, U_kmn, efermi_ry = final_qp_eigenstates(
-        state, n_occ=n_occ, mesh_xy=mesh_xy)
+        state, n_occ=n_occ, mesh_xy=mesh_xy, kstar=kstar)
     qp_wfn_path = os.path.join(output_dir, "WFN_qp.h5")
     qp_rot_path = os.path.join(output_dir, "qp_wfn_rotations.h5")
     if jax.process_index() == 0:

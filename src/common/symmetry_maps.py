@@ -1825,3 +1825,89 @@ def star_spread(A_full, irr_idx_k, sym_idx_k, n_sym_spatial):
             ref = np.conj(base) if int(sidx[j]) >= int(n_sym_spatial) else base
             worst = max(worst, float(np.abs(A[j] - ref).max()))
     return worst
+
+
+class KStarMap:
+    """IBZ ⇄ full BZ for BAND-INDEX quantities.  Pass one to the SC loop.
+
+    Bundles the three index arrays that always travel together
+    (``irr_idx_k``, ``sym_idx_k``, ``ntran``) so no call site can supply
+    two of the three — omitting ``sym_idx_k`` is the failure that returns
+    the wrong matrix on every time-reversed star and is invisible to
+    hermiticity, the norm and the electron count (job 7889235: 3.6e-01
+    relative).
+
+    :meth:`identity` is the no-reduction map, so a driver written against
+    this reads the same whether or not symmetry is in use, and the
+    symmetry-off path stays byte-identical rather than becoming a
+    separate branch.
+
+    See the module note above :func:`star_select` for WHY this is an index
+    map and not an unfold: the loader builds full-BZ ψ by unfolding in
+    G-space, so a band index is symmetry-inert.
+    """
+
+    __slots__ = ("irr_idx", "sym_idx", "n_sym_spatial", "labels")
+
+    def __init__(self, irr_idx, sym_idx, n_sym_spatial, labels=None):
+        self.irr_idx = np.asarray(irr_idx, dtype=np.int32)
+        self.sym_idx = np.asarray(sym_idx, dtype=np.int32)
+        self.n_sym_spatial = int(n_sym_spatial)
+        self.labels = (np.unique(self.irr_idx) if labels is None
+                       else np.asarray(labels, dtype=np.int32))
+        if self.sym_idx.shape != self.irr_idx.shape:
+            raise ValueError(
+                f"KStarMap: irr_idx {self.irr_idx.shape} and sym_idx "
+                f"{self.sym_idx.shape} must both be (n_k_full,)")
+
+    @classmethod
+    def from_sym(cls, sym, n_sym_spatial) -> "KStarMap":
+        """From a :class:`SymMaps` — ``irr_idx_k`` / ``sym_idx_k``."""
+        return cls(sym.irr_idx_k, sym.sym_idx_k, n_sym_spatial)
+
+    @classmethod
+    def identity(cls, n_k) -> "KStarMap":
+        """Every k its own star: ``select`` and ``broadcast`` are no-ops."""
+        idx = np.arange(int(n_k), dtype=np.int32)
+        return cls(idx, np.zeros(int(n_k), dtype=np.int32), 1, idx)
+
+    @property
+    def nk_full(self) -> int:
+        return int(self.irr_idx.shape[0])
+
+    @property
+    def nk_irr(self) -> int:
+        return int(self.labels.shape[0])
+
+    @property
+    def reduction(self) -> float:
+        return self.nk_full / max(self.nk_irr, 1)
+
+    @property
+    def is_identity(self) -> bool:
+        return self.nk_irr == self.nk_full
+
+    def select(self, A_full):
+        """``(n_k_full, …)`` → ``(n_k_irr, …)``.  Index selection."""
+        A_irr, _ = star_select(A_full, self.irr_idx)
+        return A_irr
+
+    def broadcast(self, A_irr):
+        """``(n_k_irr, …)`` → ``(n_k_full, …)``, conjugating TRS members."""
+        return star_broadcast(A_irr, self.irr_idx, self.sym_idx,
+                              self.n_sym_spatial, self.labels)
+
+    def spread(self, A_full) -> float:
+        """Residual of ``A_full`` against its own stars; see :func:`star_spread`.
+
+        Σ is built on the full BZ and then selected to the IBZ, so this is
+        free evidence that the two k-sets agree — and the only check that
+        catches a gauge mismatch introduced upstream.
+        """
+        return star_spread(A_full, self.irr_idx, self.sym_idx,
+                           self.n_sym_spatial)
+
+    def __repr__(self) -> str:
+        return (f"KStarMap(nk_full={self.nk_full}, nk_irr={self.nk_irr}, "
+                f"reduction={self.reduction:.2f}x, "
+                f"n_sym_spatial={self.n_sym_spatial})")
