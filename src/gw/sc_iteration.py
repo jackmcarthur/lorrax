@@ -321,17 +321,26 @@ def _diagonalize_and_get_efermi(
 # The native path is a k-sharded BATCH: each device runs whole per-k
 # eighs, so it materialises the input tile, the eigenvector tile and
 # LAPACK's workspace — call it three tiles — on ONE device, on top of ψ,
-# the FFT boxes and the ω-cube.  Capping ONE tile at 3% of the budget
-# therefore caps the eigh's single-device footprint near 10%.
+# the FFT boxes and the ω-cube.  Capping ONE tile at 1% of the budget
+# therefore caps the eigh's single-device footprint near 3%.
 #
 # Derived from bytes and the budget rather than from a band count, so it
-# tracks the device it runs on: at ``memory_per_device_gb = 40`` the
-# switch is at nb ≈ 8.7e3 (tile 1.2 GB), which is where the comment on
-# ``distributed_eigh_bands`` puts the concern ("1.6 GB at nb=1e4"); at
-# 8 GB/device it is nb ≈ 3.9e3.  Below the switch the native batch is
-# kept because it solves ndev matrices at once and wins by roughly ndev
-# (``ffi/linalg/resolve.py``, eigh ``auto`` policy).
-_SC_EIGH_TILE_BUDGET_FRACTION = 0.03
+# tracks the device it runs on.  Where 1% puts the switch, against the
+# budgets ``gw_config`` actually resolves:
+#
+#   80 GB GPU   → budget 72 GB (0.9·bytes_limit)      → nb ≈ 6.7e3
+#   CLX node    → budget 169 GB (0.9·RAM / n_devices) → nb ≈ 1.0e4
+#   8 GB device → budget 7.2 GB                       → nb ≈ 2.2e3
+#
+# which is the band the owner ruling names — robustness at 1e4+ bands
+# over speed at 1e3, where the native batch solves ndev matrices at once
+# and wins by roughly ndev (``ffi/linalg/resolve.py``, eigh ``auto``
+# policy).  3% was the first choice and was wrong on the CPU arm: the
+# CPU budget is the whole node's RAM divided by the JAX device count, so
+# with several ranks per node it over-counts, and 3% of 169 GB puts the
+# switch past nb = 1.8e4 — it would not have fired on the nb = 1e4 case
+# the distributed eigh exists for.
+_SC_EIGH_TILE_BUDGET_FRACTION = 0.01
 
 
 def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
