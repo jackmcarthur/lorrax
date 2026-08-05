@@ -1968,21 +1968,31 @@ def dump_qp_wfn_artifacts(
     # shape error two frames down (that is how this was found: "U shape
     # (16, 128, 128) inconsistent with (nk=10, nb_active=128)").
     nk_irr, nk_full = int(U_irr.shape[0]), int(U_full.shape[0])
-    if nk_irr != int(wfn.nkpts) or nk_full != int(sym.unfolded_kpts.shape[0]):
+    nk_wfn = int(wfn.nkpts)
+    # THE FILE DECIDES WHICH PLACEMENT THE WFN WRITER GETS, not the BGW
+    # convention that a WFN stores the IBZ.  ``write_qp_wfn_h5`` copies the
+    # source file's kpoints/mtrx/tnp through unchanged, so its U must be the
+    # rotation of the stored ψ at the stored k — whichever k-set the file
+    # happens to hold.  mos2_4x4's WFN holds the full BZ (9), not its 5-point
+    # IBZ, and hard-wiring the IBZ placement refused a run that is fine.
+    placements = {nk_irr: (enk_irr_ry, U_irr), nk_full: (enk_full_ry, U_full)}
+    if nk_wfn not in placements or nk_full != int(sym.unfolded_kpts.shape[0]):
         raise ValueError(
             f"dump_qp_wfn_artifacts: k-set placement failed — loop nk="
             f"{int(U_loop.shape[0])} (on_ibz={state_on_ibz}) gave "
-            f"WFN_qp nk={nk_irr} (need wfn.nkpts={int(wfn.nkpts)}) and "
+            f"WFN_qp nk={sorted(placements)} (need wfn.nkpts={nk_wfn}) and "
             f"rotations nk={nk_full} (need full BZ "
             f"{int(sym.unfolded_kpts.shape[0])}); kstar={kstar!r}")
-    print_fn(f"  QP dump k-sets: WFN_qp {nk_irr} (WFN file), "
+    enk_wfn_ry, U_wfn = placements[nk_wfn]
+    print_fn(f"  QP dump k-sets: WFN_qp {nk_wfn} (WFN file, "
+             f"{'IBZ' if nk_wfn == nk_irr else 'full BZ'}), "
              f"rotations {nk_full} (full BZ), loop {int(U_loop.shape[0])}")
     qp_wfn_path = os.path.join(output_dir, "WFN_qp.h5")
     qp_rot_path = os.path.join(output_dir, "qp_wfn_rotations.h5")
     if jax.process_index() == 0:
         write_qp_wfn_h5(
             qp_wfn_path, wfn=wfn,
-            U_kmn=U_irr, enk_active_qp_ry=enk_irr_ry,
+            U_kmn=U_wfn, enk_active_qp_ry=enk_wfn_ry,
             band_start=band_slices.b0, band_stop=band_slices.b3,
         )
         write_qp_rotations_h5(
