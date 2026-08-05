@@ -12,6 +12,10 @@ total exchange-correlation contribution to ``H_QP = kin_ion + V_H +
 head decomposition) live as optional fields and are populated only when
 the mode produces them.
 
+Every band-indexed field comes back in the basis of the ``wfns`` bundle
+this module was handed; the four field tuples beside the dataclass say
+which of them a consumer sees in which basis.
+
 This module owns *no compute* of its own — every kernel lives under
 ``cohsex_sigma`` (static channels), ``ppm_pipeline`` (dynamic Σ_c) or
 ``qsgw_utils`` (the QSGW Hermitisation).  It only orchestrates.
@@ -68,6 +72,12 @@ class SigmaResult:
     omega_grid_ry             : (nω,)     ω-grid in Ry.
     head_sigma_diag_w_kn_ry   : (nω, nk, nb)  PPM analytic head diagonal.
     sigma_omega_h5_path       : str       on-disk Σ_c(ω) HDF5 path.
+
+    Basis
+    -----
+    Every band-indexed field is built in the basis of the ``wfns`` bundle
+    ``compute_sigma_xc`` was handed.  Which basis that is, per field,
+    after the object reaches a consumer: see the four tuples below.
     """
 
     v_h_kij_ry: jax.Array
@@ -83,6 +93,68 @@ class SigmaResult:
     head_sigma_diag_w_kn_ry: np.ndarray | None = None
     sigma_omega_h5_path: str | None = None
     efermi_dft_ev: float | None = None
+
+
+# ---------------------------------------------------------------------------
+# Which basis each field is in
+# ---------------------------------------------------------------------------
+#
+# ``compute_sigma_xc`` builds every band-indexed output in the basis of
+# the ``wfns`` bundle it was handed: the current QP basis under
+# self-consistency, the DFT basis for a one-shot call.  The SC driver
+# owes the post-Σ seam a DFT-basis object, so its finalize
+# (``sc_iteration.run_sc_driver``) rotates the matrices named in
+# ``ROTATED_TO_DFT_FIELDS`` with ``O_DFT = U·O_QP·U†`` and leaves the
+# rest untouched.  The returned object therefore holds TWO BASES AT
+# ONCE, deliberately; these four tuples are the record of which field is
+# in which, and they partition ``dataclasses.fields(SigmaResult)``
+# exactly (``tests/test_sigma_result_basis.py`` fails when they do not).
+
+#: Band-basis matrices, rotated together or not at all.  A Σ channel
+#: added to the dataclass and NOT added here comes back from the SC
+#: driver in the QP basis with the right shape, dtype and sharding: no
+#: shape gate, finiteness gate or SC invariance gate can see it (the
+#: ``max_iter=1`` invariance gate runs at U = identity, where the two
+#: bases agree by construction).
+ROTATED_TO_DFT_FIELDS = (
+    "v_h_kij_ry",
+    "sigma_x_kij_ry",
+    "sigma_xc_kij_ry",
+    "sigma_sx_kij_ry",
+    "sigma_coh_kij_ry",
+)
+
+#: Left in the Σ compute basis on purpose — do NOT rotate these.
+#: ``sigma_c_omega_kij_ry`` is the operand of the QSGW ansatz
+#: ``Σ_ij^QSGW = ½[Σ_ij(E_i) + Σ_ij(E_j)]ʰ`` (``qsgw_utils.py``:402),
+#: whose band indices must label the states whose energies E_i, E_j it
+#: is evaluated at, so the construction is only itself in that basis;
+#: it is also the (nω, nk, nb, nb) sharded tensor and the contents of
+#: sigma_mnk.h5.  The other two are already band DIAGONALS, on which a
+#: basis rotation does not act element-wise.
+SIGMA_BASIS_FIELDS = (
+    "sigma_c_omega_kij_ry",
+    "sigma_c_at_dft_diag_ev",
+    "head_sigma_diag_w_kn_ry",
+)
+
+#: Band-indexed but read from the WFN file, hence DFT basis on every
+#: path: ``omega_dft_rel_ev`` is E_DFT − E_F (``ppm_pipeline.py``:219-223,
+#: from ``get_enk_bandrange``).  TRAP: under self-consistency it labels
+#: bands by the DFT index while ``sigma_c_at_dft_diag_ev`` — the
+#: interpolation it drives, ``ppm_pipeline.py``:236 — labels them by the
+#: QP index.
+DFT_BASIS_FIELDS = (
+    "omega_dft_rel_ev",
+)
+
+#: No band index; basis-independent.
+BASIS_FREE_FIELDS = (
+    "omega_grid_ev",
+    "omega_grid_ry",
+    "sigma_omega_h5_path",
+    "efermi_dft_ev",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -495,4 +567,11 @@ def compute_sigma_xc(
     )
 
 
-__all__ = ["SigmaResult", "compute_sigma_xc"]
+__all__ = [
+    "SigmaResult",
+    "compute_sigma_xc",
+    "ROTATED_TO_DFT_FIELDS",
+    "SIGMA_BASIS_FIELDS",
+    "DFT_BASIS_FIELDS",
+    "BASIS_FREE_FIELDS",
+]

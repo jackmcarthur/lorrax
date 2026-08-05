@@ -572,9 +572,20 @@ def main(argv=None):
 				qp_solver, sigma_result, kin_ion,
 				config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
 
-	# ---- Post-Σ seam: bare locals from the (DFT-basis) SigmaResult ----
+	# ---- Post-Σ seam: bare locals from the SigmaResult ----
 	# One extraction for SC and one-shot alike; PPM-only fields are None
 	# in static modes.
+	#
+	# TWO BASES ON ONE OBJECT on the SC path, by design: the finalize
+	# rotated ``sigma_dispatch.ROTATED_TO_DFT_FIELDS`` (sig_h, sig_x,
+	# sig_sx, sig_coh below) back to the DFT basis and left
+	# ``SIGMA_BASIS_FIELDS`` (sigma_c_omega, sigma_c_at_dft_ev,
+	# head_sigma_diag_w_kn_ry) in the QP basis, where the QSGW ansatz
+	# that consumes Σ_c(ω) is defined.  Their band diagonals meet in
+	# ``sigma_xc_at_dft_ev`` below and in eqp{0,1}.dat
+	# (``eqp_bgw.compute_eqp_diag``); that sum is basis-consistent only
+	# at U = identity.  One-shot: every field is DFT basis and the
+	# question does not arise.
 	sig_h   = sigma_result.v_h_kij_ry
 	sig_x   = sigma_result.sigma_x_kij_ry
 	sig_sx  = (sigma_result.sigma_sx_kij_ry
