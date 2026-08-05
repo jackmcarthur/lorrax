@@ -1,0 +1,100 @@
+# MoS2 exciton-bandstructure Q paths — K_POINTS crystal_b blocks
+#
+# PROVENANCE / STATUS: **RECONSTRUCTED**, not lifted verbatim from an archived deck.
+#   No `cohsex.in` / `exciton.in` survives in the Perlmutter salvage archive
+#   (`/work2/08271/jackmc/frontera/lorrax_perlmutter_salvage/` holds only .md/.log/
+#   .txt/.png — no .in, .dat, .npz or .h5).  The segment structure below is
+#   reconstructed from the driver's own path banner in the run logs plus the
+#   per-Q |Q| column of the comparison dumps, and each reconstruction is
+#   arithmetically consistent with both.  Verify against your own lattice before
+#   quoting physics from it.
+#
+# FORMAT (src/gw/gw_config.py read_lorrax_input; documented at
+#   reports/gw_refactor_map_2026-07-01/archive/files/gw_config.md:22):
+#     K_POINTS crystal_b
+#     <nseg>
+#     kx ky kz [n] [# | ! | ;  label]
+#   ... one line per segment endpoint; `n` = number of intervals to the NEXT
+#   endpoint.  The block is stripped out of the INI text before configparser
+#   runs and parsed into params["kpoints_crystal_b"] = {"segments": [...]}.
+#   `bse.exciton_bands` reads the SAME block the htransform bandstructure
+#   driver consumes (reports/bse_refactor_map_2026-07-15/PHASE2_LOG.md:1431).
+#   The GW k-grid is NEVER taken from this block — it comes from WFN.h5
+#   (reports/gw_refactor_map_2026-07-01/archive/FLAGS.md:227,393).
+
+
+# ---------------------------------------------------------------------------
+# (A) 13-point ON-GRID Gamma-M-K-Gamma, for a 12x12x1 BSE grid.
+#     Used by the ONLY converged-GW exciton-bands run in the archive
+#     (reports/bse_exciton_converged_2026-07-21/report.md:221-223:
+#      "The Q path is the on-grid Γ-M-K-Γ: 6 + 2 + 4 intervals = 13 Q.
+#       Γ, M, K *and* Λ = (⅙,⅙) all land on it").
+#     EVERY point lands on the 12x12 mesh, which is what makes
+#     `--vq-mode ongrid` (exact stored exchange tiles, no interpolation
+#     error, no mini-BZ head model) legal.  Lambda = (1/6,1/6,0) is the
+#     converged CBM and is the 2nd point in from the final Gamma.
+# ---------------------------------------------------------------------------
+K_POINTS crystal_b
+4
+0.0000000000 0.0000000000 0.0000000000 6  ! G
+0.5000000000 0.0000000000 0.0000000000 2  ! M
+0.3333333333 0.3333333333 0.0000000000 4  ! K
+0.0000000000 0.0000000000 0.0000000000 1  ! G
+
+
+# ---------------------------------------------------------------------------
+# (B) 40-point Gamma-M-K-Gamma (mostly OFF-grid; needs --vq-mode interp and a
+#     full-BZ zeta_q.h5).  This is the path of the 16-GPU multinode and
+#     cuBLASMp-recon runs.
+#     Driver banner: "Q path: 40 points, nodes at [0, 15, 23, 39]
+#                     labels ['Γ', 'M', 'K', 'Γ']"
+#       reports/bse_multinode_2026-07-20/logs/run16_on.log:186
+#       reports/bse_cublasmp_recon_2026-07-20/logs/exciton_drecon.log:186
+#     Cross-check: the |Q| column of
+#     reports/bse_cublasmp_recon_2026-07-20/logs/compare_drecon_vs_dir10.log
+#     steps 0 -> 0.5 in 15 equal increments of 0.03333 (= 1/30) on G->M, and
+#     decays 0.47136 -> 0 in 16 equal increments of 0.02946 on K->G.
+# ---------------------------------------------------------------------------
+K_POINTS crystal_b
+4
+0.0000000000 0.0000000000 0.0000000000 15 ! G
+0.5000000000 0.0000000000 0.0000000000 8  ! M
+0.3333333333 0.3333333333 0.0000000000 16 ! K
+0.0000000000 0.0000000000 0.0000000000 1  ! G
+
+
+# ---------------------------------------------------------------------------
+# (C) 39-point M-Gamma-K (the "smooth"/arbitrary-Q diagnostic path).
+#     Driver banner: "Q path: 39 points, nodes at [0, 19, 38]
+#                     labels ['M', 'Γ', 'K']"
+#       reports/bse_exciton_smooth_2026-07-21/logs/run_exciton_smooth.log:74
+#     An 11-point coarse twin of the same path (nodes [0, 6, 10]) appears at
+#       reports/bse_exciton_smooth_2026-07-21/logs/run_exciton_interp.log:44
+#     Neither of those runs is reported as having produced a validated result
+#     (that report dir has NO report.md; see EXCITON_AND_PERF_SALVAGE.md §1.4).
+# ---------------------------------------------------------------------------
+K_POINTS crystal_b
+3
+0.5000000000 0.0000000000 0.0000000000 19 ! M
+0.0000000000 0.0000000000 0.0000000000 19 ! G
+0.3333333333 0.3333333333 0.0000000000 1  ! K
+
+
+# ---------------------------------------------------------------------------
+# NOT reconstructable from the archive:
+#   * the 32-point 3x3-trained path of the FIRST deliverable
+#     (runs/MoS2/B_exciton_bands_2026-07-17) — segment split never logged;
+#   * the 56-point path of reports/bse_figures_2026-07-20 (WORKLOG.md:129
+#     records "Q path: 56 points Γ-M-K-Γ" and nothing else; that run was HELD
+#     and produced no numbers);
+#   * the 139-point path of the htransform window sweep
+#     (htransform_window_sweep_ht_lean_2026-07-20.log: "[path] nQ=139
+#     nodes=[0, 50, 80, 138]" -> 50 + 30 + 58 intervals, G-M-K-G on a 6x6
+#     grid) — that one IS reconstructable and is given here for completeness:
+#
+# K_POINTS crystal_b
+# 4
+# 0.0000000000 0.0000000000 0.0000000000 50 ! G
+# 0.5000000000 0.0000000000 0.0000000000 30 ! M
+# 0.3333333333 0.3333333333 0.0000000000 58 ! K
+# 0.0000000000 0.0000000000 0.0000000000 1  ! G

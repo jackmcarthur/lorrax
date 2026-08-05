@@ -1,0 +1,189 @@
+--- src/gw/ppm_tau_kernel.py	2026-07-28 12:18:23.000000000 -0500
++++ /tmp/claude-875701/-home1-08271-jackmc/a988409f-476f-4c90-83b4-a0c41d7ce7d5/scratchpad/ppm_tau_kernel.with_fused.py	2026-07-28 12:18:08.186946445 -0500
+@@ -63,15 +63,37 @@
+         "1", "true", "yes", "on")
+ 
+ 
++def _fused_tau_enabled() -> bool:
++    """``LORRAX_SIGMA_FUSED_TAU=1`` selects the monolithic one-shard_map τ kernel.
++
++    Perf-path knob (owner-directed fusion round, 2026-07-28; default OFF
++    until its acceptance gates pass — parity 1e-12, near-zero large
++    transposes in the fused HLO, zero collectives in the fft steps).  The
++    fused kernel evaluates the SAME arithmetic sequence as the decomposed
++    path (same build_G_tau einsums, same fft_helpers local FFT kernels at
++    the same per-rank shapes/axes/norm, same shared ``_project_ri_local``
++    projection body) inside ONE shard_map on rank-local tiles, following
++    the ``isdf/core.py`` monolithic pair-pipeline pattern: one layout
++    chosen once, no jit/custom-partitioning seams between the dot-layout
++    and fft-layout stages for GSPMD/XLA to renegotiate through full-tile
++    transpose+copy passes (evidence: AQ 4962c/P=64 HLO module_0912
++    fused_computation.6 — the G·W multiply is transposed k-major and back
++    k-minor purely at the flat-k helper boundary; staged rows job 7878038:
++    G_ifft 79.6 s + GW_mult_fft 95.7 s + V_ifft 16.5 s of the 295 s τ
++    total).  Read at kernel-factory time; part of the kernel cache key.
++    """
++    return os.environ.get("LORRAX_SIGMA_FUSED_TAU", "0").strip().lower() in (
++        "1", "true", "yes", "on")
++
++
+ def _project_ri_local(psi_xr_local, sigma_k_local, psi_yn_local):
+     """Rank-local body of the ψ* σ ψ reduce-scatter projection.
+ 
+-    ONE source for the projection tail, called from inside the standalone
+-    projector's shard_map (``_make_project_ri_reduce_scatter``).  Kept at
+-    module level so any future kernel variant shares the byte-identical
+-    body (the 2026-07-28 monolithic-fusion experiment did exactly that; see
+-    wk_REL/sigma_perf_results.md — refuted at nb=128, patch preserved).
+-    Local shapes:
++    ONE source for the projection tail, called from inside a shard_map by
++    BOTH the standalone projector (``_make_project_ri_reduce_scatter``) and
++    the monolithic fused τ kernel (``LORRAX_SIGMA_FUSED_TAU``) — sharing the
++    body is what makes the two paths arithmetically identical by
++    construction.  Local shapes:
+ 
+         psi_xr_local  (nk, m, s, μ_X_loc)
+         sigma_k_local (nk, s, μ_X_loc, s', μ_Y_loc)
+@@ -266,7 +288,8 @@
+     # The stage-timing flag is part of the cache key: the two variants are
+     # different callables (fused jit vs staged dispatcher) and must not
+     # shadow each other across a flag flip inside one process (tests).
+-    pipeline_key = (id(mesh_xy), kgrid, _stage_timing_enabled())
++    pipeline_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
++                    _fused_tau_enabled())
+     if pipeline_key in _sigma_kij_kernel_cache:
+         return _sigma_kij_kernel_cache[pipeline_key]
+ 
+@@ -310,6 +333,122 @@
+         sigma_k = _G_fftn(G_R * V_R * inv_sqrt_nk)
+         return _project_ri_rs(psi_proj_xr, sigma_k, psi_proj_yn)
+ 
++    if _fused_tau_enabled():
++        # --------------------------------------------------------------
++        # Monolithic one-shard_map τ kernel (LORRAX_SIGMA_FUSED_TAU=1).
++        # isdf/core.py c_q_from_psi_sm is the reference pattern: rank-local
++        # tiles, direct local FFT kernels, no helper/jit seams inside.
++        #
++        # Arithmetic identity with the decomposed path, piece by piece:
++        #   * G build: the SAME ``build_G_tau`` call.  Under GSPMD the
++        #     global einsum partitions to exactly this local einsum (the
++        #     contraction axis nb is replicated; μ_X/μ_Y are free), so the
++        #     local call evaluates the same contraction at the same
++        #     per-rank shapes.
++        #   * FFTs: ``fft_helpers.local_ifftn3/local_fftn3`` — the SAME
++        #     single-source local kernels the mandatory ``make_flat_k_*``
++        #     helpers execute per rank (their shard_map wrapper cannot be
++        #     nested inside another shard_map; fft_helpers' own docstring
++        #     designates the local_* entry points for exactly this
++        #     situation).  Same axes (0,1,2) over the replicated k grid,
++        #     same norm='ortho', same flat↔3-D reshape (a bitcast on the
++        #     k-leading layout).  100% of FFT ops remain fft_helpers'.
++        #   * multiply: same expression ``(G_R * V_R_broadcast) *
++        #     inv_sqrt_nk``, elementwise — 3-D vs flat indexing changes no
++        #     element's value.
++        #   * projection: the SHARED ``_project_ri_local`` body (channel
++        #     structure + AK.9 stacking + axis order identical by
++        #     construction).
++        # What the fusion removes is movement only: the flat-k helper
++        # boundaries whose fixed (k-major) boundary layouts forced XLA to
++        # transpose the ~400 MB tile k-major and back k-minor around the
++        # G·W multiply (module_0912 fused_computation.6, two full-tile
++        # passes) and to re-anchor layouts at every stage seam.  Staged
++        # rows (job 7878038): G_ifft 79.6 + GW_mult_fft 95.7 + V_ifft
++        # 16.5 s of 295 s.  Acceptance gates (owner): fused-module HLO has
++        # zero collectives in the fft steps and near-zero large
++        # transposes; parity 1e-12; per-τ A/B.  Scale-neutral: removes
++        # per-τ full-tile passes at every shape; no new object, no
++        # shape-tuned constant; valid on CPU and GPU backends.
++        # Evidence: AQ 4962c/P=64 HLO module_0912, 2026-07-28.
++        # --------------------------------------------------------------
++        from jax.experimental.shard_map import shard_map
++        from common.fft_helpers import local_ifftn3, local_fftn3
++
++        nkx, nky, nkz = kgrid
++        p_x = int(mesh_xy.shape['x'])
++        p_y = int(mesh_xy.shape['y'])
++
++        fused_in_specs = (
++            P(None, None, 'x', None),      # psi_coh_xn : (nk, s, μ_X, nb)
++            P(None, None, None, 'y'),      # psi_coh_yr : (nk, nb, s, μ_Y)
++            P(None, None, None, 'x'),      # psi_proj_xr: (nk, m, s, μ_X)
++            P(None, None, 'y', None),      # psi_proj_yn: (nk, s', μ_Y, n)
++            P(None, None),                 # E_A    (nk, nb) replicated
++            P(None, None),                 # mask_A (nk, nb) replicated
++            P(),                           # E_ref_A scalar
++            P(),                           # t_node  scalar
++            P(None, 'x', 'y'),             # W_q (nk, μ_X, μ_Y)
++        )
++        fused_out_specs = (P(None, 'x', 'y'), P(None, 'x', 'y'))
++
++        def _fused_local(psi_coh_xn_, psi_coh_yr_, psi_proj_xr_,
++                         psi_proj_yn_, E_A_, mask_A_, E_ref_A_, t_node_,
++                         W_q_):
++            G_k = build_G_tau(
++                psi_coh_xn_, psi_coh_yr_, E_A_, 1j * t_node_,
++                e_ref=E_ref_A_, mask=mask_A_,
++            )   # (nk, s, μ_X_loc, s', μ_Y_loc)
++            ns, xl, tl, yl = (G_k.shape[1], G_k.shape[2],
++                              G_k.shape[3], G_k.shape[4])
++            G_R = local_ifftn3(
++                G_k.reshape(nkx, nky, nkz, ns, xl, tl, yl),
++                axes=(0, 1, 2), norm='ortho')
++            V_R = local_ifftn3(
++                W_q_.reshape(nkx, nky, nkz, xl, yl),
++                axes=(0, 1, 2), norm='ortho')
++            sigma_3d = local_fftn3(
++                G_R * V_R[:, :, :, None, :, None, :] * inv_sqrt_nk,
++                axes=(0, 1, 2), norm='ortho')
++            sigma_k = sigma_3d.reshape(nk_tot, ns, xl, tl, yl)
++            return _project_ri_local(psi_proj_xr_, sigma_k, psi_proj_yn_)
++
++        _sm_fused = shard_map(
++            _fused_local, mesh=mesh_xy,
++            in_specs=fused_in_specs, out_specs=fused_out_specs,
++            check_rep=False)
++
++        @partial(jax.jit, donate_argnums=(8,))
++        def _sigma_kij_fused(
++            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
++            E_A, mask_A, E_ref_A, t_node, W_q,
++        ):
++            # Same divisibility guard as _make_project_ri_reduce_scatter —
++            # the psum_scatters inside _project_ri_local need it.
++            m, n = psi_proj_xr.shape[1], psi_proj_yn.shape[3]
++            assert m % p_x == 0 and n % p_y == 0, (
++                f"sigma reduce-scatter needs the band window divisible by "
++                f"the mesh: m={m} vs p_x={p_x}, n={n} vs p_y={p_y}; pad "
++                f"via gw.ppm_sigma.pad_sigma_window at the caller.")
++            return _sm_fused(psi_coh_xn, psi_coh_yr, psi_proj_xr,
++                             psi_proj_yn, E_A, mask_A, E_ref_A, t_node,
++                             W_q)
++
++        if _stage_timing_enabled():
++            # One blocking row for the whole fused kernel — its A/B partner
++            # is the SUM of the decomposed path's stage rows (w_phase
++            # excluded; that row still comes from the staged τ wrapper).
++            def _sigma_kij_fused_timed(*args):
++                with timing.section("sigma.tau.fused_kernel") as sec:
++                    out = _sigma_kij_fused(*args)
++                    sec.watch(out)
++                return out
++            _sigma_kij_kernel_cache[pipeline_key] = _sigma_kij_fused_timed
++            return _sigma_kij_fused_timed
++
++        _sigma_kij_kernel_cache[pipeline_key] = _sigma_kij_fused
++        return _sigma_kij_fused
++
+     if not _stage_timing_enabled():
+         _sigma_kij_kernel_cache[pipeline_key] = _sigma_kij_kernel
+         return _sigma_kij_kernel
+@@ -378,7 +517,8 @@
+     """Return a cached tau-node sigma builder with jittable local FFTs."""
+ 
+     kgrid = tuple(int(x) for x in kgrid)
+-    cache_key = (id(mesh_xy), kgrid, _stage_timing_enabled())
++    cache_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
++                 _fused_tau_enabled())
+     if cache_key in _sigma_tau_kernel_cache:
+         return _sigma_tau_kernel_cache[cache_key]
+ 

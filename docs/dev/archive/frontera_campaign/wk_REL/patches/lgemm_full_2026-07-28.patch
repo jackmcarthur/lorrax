@@ -1,0 +1,137 @@
+diff --git a/src/gw/ppm_tau_kernel.py b/src/gw/ppm_tau_kernel.py
+index cdc53c4..03a03fc 100644
+--- a/src/gw/ppm_tau_kernel.py
++++ b/src/gw/ppm_tau_kernel.py
+@@ -143,7 +143,7 @@ def _project_ri_local(psi_xr_local, sigma_k_local, psi_yn_local):
+     ``LORRAX_SIGMA_LAPLACE_MERGE=1`` they dispatch the merged single-chain
+     body ``_project_x_local`` instead.
+ 
+-    Two approved movement-only levers are applied on top:
++    Three approved movement-only levers are applied on top:
+ 
+     * AK.9 stacking (scorecard, 2026-07-28): both channels' psum_scatter
+       payloads ride ONE collective per mesh axis, stacked on a fresh
+@@ -162,15 +162,49 @@ def _project_ri_local(psi_xr_local, sigma_k_local, psi_yn_local):
+       payloads 2×40.9 MB vs 2×0.52 MB pre-swap).  Per-channel contraction
+       order becomes ψ*·(σ·ψ) — same math/flops, value-level identical,
+       gated by the 1e-12 parity suite (not claimed bit-exact).
+-
+-    Scale-neutral: both levers are flat in n_atoms / N_μ / nk / nb / P and
++    * L-GEMM f64-split relowering (2026-07-28;
++      wk_REL/RESHARD_OVERHEAD_MEMO.md Sec. 4.4 exit (a) / Sec. 7 lever 1):
++      each channel's f64 × c128 right-einsum is expressed as TWO f64
++      dgemms against Re ψ / Im ψ plus one ``lax.complex`` recombine,
++      instead of one mixed-dtype einsum.  Mechanism fixed (HLO-proven,
++      reshard-ubench dump module_0009.jit__project_ri_reduce_scatter):
++      XLA promotes a mixed f64/c128 dot by CONVERTING the f64 channel
++      operand to c128 (a ~400 MB materialization per channel at
++      nb=128/P=64) and issues Eigen zgemm at 2× the mathematically
++      required flops — measured 295 GF/s vs 1263 GF/s for the same
++      contraction through BLAS.  The relowering changes ONLY the
++      representation of the complex ψ operand: the owner-held channel
++      algebra (independent σ_R / σ_I chains) is untouched, the
++      collectives are byte-identical (same stacked c128 payloads, same
++      2 psum_scatters/τ, same replica groups), and the small left dots
++      stay genuinely complex.  Value-level identical (the dgemm pair
++      sums the same products in a different order than the promoted
++      zgemm), NOT bit-exact — 1e-12 parity-gated.  Envelope: the flop
++      halving and the promotion-copy removal are shape-independent
++      (any n_atoms / N_μ / nb / nk / P); mixed-dtype dots promote on
++      GPU as well, so the relowering is neutral-or-better on both
++      backends (measured on XLA:CPU only).
++
++    Scale-neutral: all levers are flat in n_atoms / N_μ / nk / nb / P and
+     backend; no new N_μ²-sized object is created.
+     """
++    # L-GEMM f64-split relowering (see docstring): decompose the complex ψ
++    # operand ONCE into its f64 parts; each real channel then rides two
++    # f64 dgemms.  No mixed-dtype einsum survives, so XLA has nothing to
++    # promote.  ψ_yn is (nk, s', μ_Y_loc, n) — small next to σ, and the
++    # extracts are shared by both channels (CSE'd within the module).
++    psi_yn_re = jnp.real(psi_yn_local)
++    psi_yn_im = jnp.imag(psi_yn_local)
++
+     def _right(sigma_real_or_imag):
+-        # 'ksxty' × 'ktyn' -> 'ksxn'  (contracts s', local μ_Y)
+-        return jnp.einsum(
+-            'ksxty,ktyn->ksxn',
+-            sigma_real_or_imag, psi_yn_local, optimize=True)
++        # 'ksxty' × 'ktyn' -> 'ksxn'  (contracts s', local μ_Y) as TWO
++        # f64 dgemms (σ_ch·Re ψ, σ_ch·Im ψ) + complex recombine — the
++        # same contraction, real arithmetic only.
++        re = jnp.einsum('ksxty,ktyn->ksxn',
++                        sigma_real_or_imag, psi_yn_re, optimize=True)
++        im = jnp.einsum('ksxty,ktyn->ksxn',
++                        sigma_real_or_imag, psi_yn_im, optimize=True)
++        return jax.lax.complex(re, im)
+ 
+     right_re = _right(jnp.real(sigma_k_local))
+     right_im = _right(jnp.imag(sigma_k_local))
+@@ -214,7 +248,11 @@ def _project_x_local(psi_xr_local, sigma_k_local, psi_yn_local):
+     reduce-scatter payload per mesh axis (one c128 tile vs the stacked
+     re/im pair — both channels of the stacked pair are complex, since
+     real-σ × complex-ψ GEMMs emit complex tiles), and half the per-τ D2H
+-    bytes.  No symmetry assumption enters: the identity survives HL-probe
++    bytes.  ⚠ CLAIM-SCOPE (L-GEMM relowering, 2026-07-28): "half the
++    GEMM work" was measured in the promoted-zgemm era; with BOTH bodies'
++    right-einsums f64-split (below), each plan's right side is four f64
++    dgemms, so the merged plan's surviving wins are the halved collective
++    payload, halved D2H, and one left chain instead of two.  No symmetry assumption enters: the identity survives HL-probe
+     fits, deck gauge, and any hermiticity defect ε_H of B_q.  Crossing
+     windows must NOT dispatch this body — their consumer needs (S_R, S_I)
+     separately and X under-determines them (see ``_project_ri_local``).
+@@ -235,10 +273,37 @@ def _project_x_local(psi_xr_local, sigma_k_local, psi_yn_local):
+     two-channel outputs (complex-GEMM association differs — not bit-exact);
+     gated by the P=4 production-kernel S_R + i·S_I = X check at 1e-12 and
+     the nb=128/nb=256 A/B parity suite.
++
++    L-GEMM f64-split relowering (2026-07-28; wk_REL/RESHARD_OVERHEAD_MEMO.md
++    Sec. 4.4 exit (a) / Sec. 7 lever 1, movement-only): the complex right
++    contraction is lowered as FOUR f64 dgemms over the Re/Im parts of σ
++    and ψ plus one complex recombine,
++
++        σψ = (σ_R·ψ_re − σ_I·ψ_im) + i·(σ_R·ψ_im + σ_I·ψ_re),
++
++    — the SAME contraction at the same mathematically required flops, but
++    through Eigen's f64 dot instead of its ~4.3×-below-BLAS-roofline
++    zgemm (the two-channel body's measured 295 vs 1263 GF/s applies to
++    the identical dot shapes here).  What X is — ψ†σψ by bilinearity —
++    is untouched, as are the collectives (one c128 psum_scatter per mesh
++    axis at the halved merged-plan payload) and the complex left dot.
++    Value-level identical (product summation order differs from zgemm),
++    NOT bit-exact — covered by the same 1e-12 gates.  Shape-independent;
++    see ``_project_ri_local`` for the envelope statement.
+     """
+-    # 'ksxty' × 'ktyn' -> 'ksxn'  (contracts s', local μ_Y) — one complex GEMM
+-    right = jnp.einsum('ksxty,ktyn->ksxn',
+-                       sigma_k_local, psi_yn_local, optimize=True)
++    # L-GEMM f64-split relowering (see docstring): four f64 dgemms + one
++    # complex recombine replace the single mixed-lowered complex einsum.
++    sig_re = jnp.real(sigma_k_local)
++    sig_im = jnp.imag(sigma_k_local)
++    psi_re = jnp.real(psi_yn_local)
++    psi_im = jnp.imag(psi_yn_local)
++
++    def _r(a, b):
++        # 'ksxty' × 'ktyn' -> 'ksxn'  (contracts s', local μ_Y), pure f64
++        return jnp.einsum('ksxty,ktyn->ksxn', a, b, optimize=True)
++
++    right = jax.lax.complex(_r(sig_re, psi_re) - _r(sig_im, psi_im),
++                            _r(sig_re, psi_im) + _r(sig_im, psi_re))
+     # ONE psum_scatter(y): (nk, s, μ_X_loc, n) → (nk, s, μ_X_loc, n/p_y)
+     right_rs = jax.lax.psum_scatter(right, 'y', scatter_dimension=3, tiled=True)
+     # 'kmsx' × 'ksxn' -> 'kmn'  (contracts s, local μ_X) — one complex GEMM
+@@ -294,6 +359,13 @@ def _make_project_ri_reduce_scatter(
+         value-level (not bit-level) identical; gated by the 1e-12 output
+         parity suite.  Scale-neutral: locality preference and message
+         count are flat in n_atoms / N_μ / nk / nb / P and backend.
++      * L-GEMM f64-split relowering (2026-07-28, movement-only; details
++        + evidence in the body docstrings): the LARGE right-einsums are
++        expressed as pure-f64 dgemms + a complex recombine so XLA never
++        promotes an f64 operand to c128 (no ~400 MB convert copies, no
++        Eigen zgemm at 2× flops).  Collectives, payload dtypes/shapes,
++        and the channel algebra are untouched; value-level identical,
++        1e-12 parity-gated.
+     Channel plans (owner ruling 2026-07-28): ``merged_x=False`` (default)
+     builds the two-channel (S_R, S_I) projector above — REQUIRED for
+     crossing windows, whose consumer weights the channels independently and

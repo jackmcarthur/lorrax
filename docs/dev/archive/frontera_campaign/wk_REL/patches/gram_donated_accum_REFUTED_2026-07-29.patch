@@ -1,0 +1,54 @@
+diff --git a/src/centroid/pivoted_cholesky.py b/src/centroid/pivoted_cholesky.py
+index 34205d0..1550e39 100644
+--- a/src/centroid/pivoted_cholesky.py
++++ b/src/centroid/pivoted_cholesky.py
+@@ -1012,7 +1012,30 @@ def build_gram_q0_via_loadwfns(
+                 psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
+             psi_r_rmu_Y.block_until_ready()
+         with timing.section("q0_sum"):
+-            g_blocks = []
++            # Assemble the (M, M) Gram IN PLACE.  The previous form kept a
++            # Python list of column blocks alive, ``jnp.concatenate``d it, and
++            # then hermitized with TWO more eager full-size temporaries, so at
++            # the peak FOUR (M, M) copies were live at once:
++            #     g_blocks + concat(G) + conj(G.T) + the sum
++            # = 4 x 16 x M^2 bytes (12.3 GB at the rung-5 acceptance size
++            # M = 13872; grows as M^2 -- 127 GB at the M ~= 44.5k of the
++            # c32000 set, which is the whole 192 GB node).  Writing each block
++            # into ONE donated accumulator and hermitizing under a donated jit
++            # leaves at most TWO.  The arithmetic is untouched (the same
++            # gram_q0_from_pair blocks, placed by dynamic_update_slice instead
++            # of concatenate, then the same 0.5*(G + G^H)) -> G is bit-identical.
++            @partial(jax.jit, donate_argnums=(0,))
++            def _place_block(G_acc, G_b, c0):
++                # Both start indices must share a dtype (JAX_ENABLE_X64 makes a
++                # bare Python 0 an int64 while c0 arrives as int32).
++                row0 = jnp.zeros((), dtype=c0.dtype)
++                return jax.lax.dynamic_update_slice(G_acc, G_b, (row0, c0))
++
++            @partial(jax.jit, donate_argnums=(0,))
++            def _hermitize(G_acc):
++                return 0.5 * (G_acc + jnp.conj(G_acc.T))
++
++            G = None
+             for c0 in range(0, M_cols, col_block):
+                 c1 = min(c0 + col_block, M_cols)
+                 P_l_b = pair_density(
+@@ -1022,12 +1045,14 @@ def build_gram_q0_via_loadwfns(
+                 G_b = gram_q0_from_pair(P_l_b, P_r_b, kw, mesh_xy=mesh_xy,
+                                         symmetrize=False)
+                 G_b.block_until_ready()
+-                g_blocks.append(G_b)
+                 del P_l_b, P_r_b
+-            G = jnp.concatenate(g_blocks, axis=1)
++                if G is None:
++                    G = jnp.zeros((M_cols, M_cols), dtype=G_b.dtype)
++                G = _place_block(G, G_b, jnp.int32(c0))
++                del G_b
+             # Same Hermitian symmetrization the unblocked kernel applies,
+             # once, on the assembled square matrix.
+-            G = 0.5 * (G + jnp.conj(G.T))
++            G = _hermitize(G)
+             G.block_until_ready()
+         del psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X
+         return G
