@@ -130,6 +130,24 @@ def _solve_crop_alpha_v2(Fw: jnp.ndarray, filled_cols: jnp.ndarray) -> jnp.ndarr
     We convert to affine coordinates centered on the trial vector:
         α = [γ, 1 - sum(γ)] where γ minimizes ||f_trial + F_valid @ γ||
 
+    SOLVED FROM THE (k, k) GRAM MATRIX, NOT FROM A QR OF ``Fw``.  The row
+    axis of ``Fw`` is the flattened iterate and may be SHARDED over the
+    device mesh (``rcrop_nojit(row_sharding=...)``).  ``jnp.linalg.qr`` has
+    no distributed lowering, so GSPMD all-gathers its whole (n, k) operand
+    onto one device — 22.1 GB at nk=144, nb=2000, m=5, complex128, i.e.
+    exactly the single-device object the sharding exists to remove.  Every
+    row-axis contraction below reduces to at most a 6×6 complex all-reduce.
+
+    Normal equations square the condition number, which for a general
+    least squares would be the wrong trade.  Here k ≤ 6 and the columns are
+    residual DIFFERENCES whose norms span orders of magnitude, so what
+    actually bites is column SCALE, not column angle: each column is
+    normalised before the Gram is formed and the scale is undone after.
+    Equilibration also fixes the ridge's meaning — the Gram of a
+    unit-column matrix has unit diagonal, so the absolute 1e-12 below IS
+    relative.  (The previous form added 1e-12 to the diagonal of R, which
+    for a near-null direction returns a HUGE γ rather than a damped one.)
+
     Args:
         Fw: Residual window matrix, shape (n, history_size + 1)
         filled_cols: Number of valid history columns
@@ -155,12 +173,17 @@ def _solve_crop_alpha_v2(Fw: jnp.ndarray, filled_cols: jnp.ndarray) -> jnp.ndarr
     F_prev = F_hist - f_trial[:, None]
     F_prev_masked = jnp.where(valid_hist[None, :], F_prev, 0.0 + 0.0j)
 
-    # Solve via QR: min ||f_trial + F_prev_masked @ γ||
-    # Note: This includes zero columns, but they won't affect the solution
-    Q, R = jnp.linalg.qr(F_prev_masked, mode="reduced")
-    rhs = Q.conj().T @ (-f_trial)
-    R_reg = R + 1e-12 * jnp.eye(R.shape[0], dtype=R.dtype)
-    gamma = solve_triangular(R_reg, rhs, lower=False)
+    # Column equilibration.  A null column keeps scale 1 so its Gram row
+    # and column stay exactly zero and the ridge damps its γ to 0.
+    col_norm = jnp.linalg.norm(F_prev_masked, axis=0)
+    scale = jnp.where(col_norm > 0.0, col_norm, 1.0)
+    F_scaled = F_prev_masked / scale[None, :]
+
+    # min ||f_trial + F_scaled δ||  ⇒  (F^H F) δ = −F^H f_trial;  γ = δ/scale.
+    G = F_scaled.conj().T @ F_scaled
+    b = -(F_scaled.conj().T @ f_trial)
+    G = G + 1e-12 * jnp.eye(hist_cols, dtype=G.dtype)
+    gamma = jnp.linalg.solve(G, b) / scale
 
     # Zero out coefficients for invalid columns
     gamma = jnp.where(valid_hist, gamma, 0.0 + 0.0j)
@@ -816,12 +839,13 @@ def rcrop_nojit(
     maxit: int = 100,
     tol: float = 1e-10,
     print_fn: Callable = None,
+    row_sharding=None,
 ) -> AccelerationResult:
     """rCROP without JIT - for use when residual_fn contains JIT'd code.
-    
+
     This avoids XLA constant folding issues when the residual function
     calls pre-JIT'd pipelines.
-    
+
     Args:
         residual_fn: f(x) -> residual (NOT JIT'd as static)
         x0: Initial guess
@@ -829,20 +853,65 @@ def rcrop_nojit(
         maxit: Maximum iterations
         tol: Convergence tolerance
         print_fn: Optional print function for progress
-        
+        row_sharding: optional ``NamedSharding`` over the (n,) iterate's one
+            axis.  THE TWO HISTORY BUFFERS ARE 2·m COPIES OF THE ITERATE
+            AND ARE THE LARGEST OBJECTS IN THE SOLVER.  Left ``None``,
+            ``jnp.zeros`` builds them uncommitted, i.e. on ONE device: at
+            nk=144, nb=2000, m=5, complex128 that is n = 5.76e8, 9.22 GB
+            per copy, 92.2 GB of history and a 22.1 GB ``concatenate``
+            transient on a single device, which no rank has.  Given a
+            sharding, the buffers are BORN distributed (``out_shardings``,
+            not a ``device_put`` of a single-device zeros) and every
+            derived array — x, f, the trial vectors, the (n, m+1) window —
+            is pinned to the same layout, so per-device history is
+            92.2 GB / ndev.  ``n`` must be divisible by the mesh size and
+            ``x0`` must already be a ``jax.Array`` (a host array here would
+            fire JAX's hidden replica ``assert_equal`` all-gather).
+
     Returns:
         AccelerationResult
     """
     n = x0.size
     dtype = x0.dtype
-    
-    x = x0
-    f = residual_fn(x)
-    
+
+    if row_sharding is None:
+        hist_sharding = None
+    else:
+        from jax.sharding import NamedSharding, PartitionSpec as P
+        if not isinstance(x0, jax.Array):
+            raise TypeError(
+                "rcrop_nojit: row_sharding given but x0 is not a jax.Array "
+                f"({type(x0).__name__}).  Placing a host array on a "
+                "multi-process sharding fires JAX's replica assert_equal "
+                "all-gather; hand in a device array.")
+        if n % int(row_sharding.mesh.size):
+            raise ValueError(
+                f"rcrop_nojit: iterate length n={n} is not divisible by the "
+                f"mesh size {int(row_sharding.mesh.size)}, so the history "
+                f"buffers cannot be row-sharded.")
+        hist_sharding = NamedSharding(
+            row_sharding.mesh, P(row_sharding.spec[0], None))
+
+    def _row(v):
+        """Pin an (n,) array to the iterate layout (identity if unsharded)."""
+        return v if row_sharding is None else jax.device_put(v, row_sharding)
+
+    def _zeros_hist():
+        if hist_sharding is None:
+            return jnp.zeros((n, m), dtype=dtype)
+        # out_shardings, NOT device_put(jnp.zeros(...)): the latter would
+        # materialise the whole (n, m) on one device before resharding it,
+        # which is the allocation this argument exists to remove.
+        return jax.jit(lambda: jnp.zeros((n, m), dtype=dtype),
+                       out_shardings=hist_sharding)()
+
+    x = _row(x0)
+    f = _row(residual_fn(x))
+
     # History buffers
-    Xhist = jnp.zeros((n, m), dtype=dtype)
-    Fhist = jnp.zeros((n, m), dtype=dtype)
-    
+    Xhist = _zeros_hist()
+    Fhist = _zeros_hist()
+
     # Store initial
     Xhist = Xhist.at[:, 0].set(x)
     Fhist = Fhist.at[:, 0].set(f)
@@ -858,9 +927,9 @@ def rcrop_nojit(
     
     for it in range(maxit):
         # Trial step
-        x_trial = x + f
-        f_trial = residual_fn(x_trial)
-        
+        x_trial = _row(x + f)
+        f_trial = _row(residual_fn(x_trial))
+
         # Roll history to chronological order
         oldest_pos = (head - filled) % m
         X_ord = jnp.roll(Xhist, shift=-oldest_pos, axis=1)
@@ -871,19 +940,21 @@ def rcrop_nojit(
         X_ord = jnp.where(mask_cols, X_ord, 0.0 + 0.0j)
         F_ord = jnp.where(mask_cols, F_ord, 0.0 + 0.0j)
         
-        # Build window
+        # Build window.  The (n, m+1) transient inherits the row layout
+        # from its operands, so it is sharded whenever the history is.
         Xw = jnp.concatenate([X_ord, x_trial[:, None]], axis=1)
         Fw = jnp.concatenate([F_ord, f_trial[:, None]], axis=1)
-        
+
         # Solve for mixing coefficients
         alpha = _solve_crop_alpha_v2(Fw, jnp.int32(filled))
-        
-        # Update iterate
-        x_new = Xw @ alpha
-        
+
+        # Update iterate.  The contraction is over the (unsharded) history
+        # axis, so this is row-local: no collective, layout preserved.
+        x_new = _row(Xw @ alpha)
+
         # rCROP: compute real residual
-        f_new = residual_fn(x_new)
-        
+        f_new = _row(residual_fn(x_new))
+
         # Store in history
         Xhist = Xhist.at[:, head].set(x_new)
         Fhist = Fhist.at[:, head].set(f_new)
