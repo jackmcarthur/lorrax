@@ -57,6 +57,7 @@ SC updates" is undecided; flagged for a separate design pass.
 
 from __future__ import annotations
 
+import functools as _functools
 import os
 from dataclasses import dataclass
 from typing import Callable
@@ -220,12 +221,12 @@ def _make_kshard_eigh(mesh_xy: Mesh, *, eigvalsh_only: bool,
     ``mesh_xy.size`` must divide ``nk``; otherwise the resharding fails.
     """
     rep_E = NamedSharding(mesh_xy, P(None, None))
-    # ``u_spec`` chooses where U LANDS.  The default replicates it, which
-    # is what every consumer wanted until ``gw.qsgw_density`` -- that one
-    # contracts U against band-sharded psi one k at a time and wants
-    # ``P(None, 'x', 'y')`` so no rank holds a full (nb, nb).  Parametrised
-    # rather than copied: the eigh itself, the k-shard hint and the
-    # hermitisation are identical and must not drift.
+    # ``u_spec`` chooses where U LANDS.  The SC loop asks for
+    # ``qsgw_density.band_rotation_spec`` (``P(None,'x','y')``, so no rank
+    # holds a full (nb, nb)); the default replicates it and is kept for
+    # ``final_qp_eigenstates``, whose only consumers are host writers.
+    # Parametrised rather than copied: the eigh itself, the k-shard hint
+    # and the hermitisation are identical and must not drift.
     rep_U = NamedSharding(mesh_xy,
                           P(None, None, None) if u_spec is None else u_spec)
     k_shard_3d = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
@@ -250,33 +251,42 @@ def _make_kshard_eigh(mesh_xy: Mesh, *, eigvalsh_only: bool,
         return _f
 
 
-# Kernel cache: one (eigh, eigvalsh) pair per mesh.  Re-used across all
-# SC iterations so the JIT cost is paid once.
-_KSHARD_EIGH_CACHE: dict[int, tuple] = {}
+# Kernel cache.  The eigh is keyed by ``(mesh, u_spec)`` because ``u_spec``
+# changes its output sharding and therefore its lowering; the eigvalsh has
+# no U and is cached on its own key so a second U layout does not retrace
+# it.  Re-used across all SC iterations, so the JIT cost is paid once.
+_KSHARD_EIGH_CACHE: dict[tuple, object] = {}
 
 
-def _kshard_eigh_kernels(mesh_xy: Mesh) -> tuple:
-    key = id(mesh_xy)
-    pair = _KSHARD_EIGH_CACHE.get(key)
-    if pair is None:
-        pair = (
-            _make_kshard_eigh(mesh_xy, eigvalsh_only=False),
-            _make_kshard_eigh(mesh_xy, eigvalsh_only=True),
-        )
-        _KSHARD_EIGH_CACHE[key] = pair
-    return pair
+def _kshard_eigh_kernels(mesh_xy: Mesh, u_spec: P | None = None) -> tuple:
+    key = (id(mesh_xy), u_spec)
+    eigh = _KSHARD_EIGH_CACHE.get(key)
+    if eigh is None:
+        eigh = _make_kshard_eigh(mesh_xy, eigvalsh_only=False, u_spec=u_spec)
+        _KSHARD_EIGH_CACHE[key] = eigh
+    ev_key = (id(mesh_xy), "eigvalsh")
+    eigvalsh = _KSHARD_EIGH_CACHE.get(ev_key)
+    if eigvalsh is None:
+        eigvalsh = _make_kshard_eigh(mesh_xy, eigvalsh_only=True)
+        _KSHARD_EIGH_CACHE[ev_key] = eigvalsh
+    return eigh, eigvalsh
 
 
 def _diagonalize_and_get_efermi(
-    H: jax.Array, n_occ: int, mesh_xy: Mesh,
+    H: jax.Array, n_occ: int, mesh_xy: Mesh, u_spec: P | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Hermitise + eigh + midgap E_F.  Returns (E, U, efermi_ry).
 
     Per-k eighs are briefly k-sharded over the device mesh so each
     device only does ``nk / mesh_size`` of them.  The midgap reduction
     runs on the gathered E (small, replicated).
+
+    ``u_spec`` is where U lands; ``None`` replicates it.  Pass
+    ``qsgw_density.band_rotation_spec()`` when the CALLER's consumers are
+    the device-side rotations, and leave it ``None`` when they are host
+    writers — see the two call sites.
     """
-    eigh_kshard, _ = _kshard_eigh_kernels(mesh_xy)
+    eigh_kshard, _ = _kshard_eigh_kernels(mesh_xy, u_spec)
     E, U = eigh_kshard(H)
     vbm = jnp.max(E[:, :n_occ])
     cbm = jnp.where(n_occ < E.shape[1], jnp.min(E[:, n_occ:]), vbm)
@@ -284,10 +294,83 @@ def _diagonalize_and_get_efermi(
     return E, U, efermi
 
 
-@jax.jit
-def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array) -> jax.Array:
-    """``O_DFT[m, n] = Σ_pq U[m, p] · O_QP[p, q] · U[n, q]^*`` per k."""
-    return jnp.einsum('kmp,kpq,knq->kmn', U, O_qp, jnp.conj(U), optimize=True)
+def _band_rotation_spec() -> P:
+    """``gw.qsgw_density.band_rotation_spec()``, resolved lazily.
+
+    Reused rather than re-spelled — a second literal ``P(None,'x','y')``
+    in this file would be exactly the drift that spec is a function to
+    avoid, and a spec that disagreed would not raise, it would insert a
+    silent reshard between the eigh and every ψ rotation.  Lazy because
+    every other reference to ``gw.qsgw_density`` in this module is too:
+    its import graph adds the FFT and matrix-element helpers, which most
+    importers of ``sc_iteration`` do not need.
+    """
+    from gw.qsgw_density import band_rotation_spec
+    return band_rotation_spec()
+
+
+def _replicate(x, mesh: Mesh) -> jax.Array:
+    """``x`` as a REPLICATED global array on ``mesh``, by the right route.
+
+    Three input kinds reach the U consumers and each needs a different
+    one; a single ``jnp.asarray`` is wrong for two of them.
+
+    * an already-replicated ``jax.Array`` — ``jax.device_put`` onto the
+      same sharding is a no-op, so the default SC path pays nothing;
+    * a MESH-SHARDED ``jax.Array``, which is what
+      ``qsgw_density.distributed_eigh_bands`` and
+      ``_make_kshard_eigh(u_spec=...)`` both emit — ``device_put`` reshards it
+      on the device.  ``jnp.asarray`` would leave it sharded and
+      ``np.asarray`` raises "Fetching value for jax.Array that spans
+      non-addressable (non process local) devices" at P>1 (measured,
+      job 7889419);
+    * a HOST array, which is what the k-star broadcast produces on a
+      reduced k-set — ``device_put_process_local``, because plain
+      ``jnp.asarray`` builds a SINGLE-DEVICE array (an operand-sharding
+      error against the mesh-sharded operands at P>1) and plain
+      ``jax.device_put`` fires JAX's hidden replica ``assert_equal``
+      all-gather (common.collectives header).
+    """
+    rep = NamedSharding(mesh, P(*([None] * int(np.ndim(x)))))
+    if isinstance(x, jax.Array):
+        return jax.device_put(x, rep)
+    return device_put_process_local(x, rep)
+
+
+@_functools.partial(jax.jit, static_argnames=("mesh",))
+def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array, *,
+                         mesh: Mesh) -> jax.Array:
+    """``O_DFT[m, n] = Σ_pq U[m, p] · O_QP[p, q] · U[n, q]^*`` per k.
+
+    U AND THE RESULT ARE PINNED REPLICATED, and that is what makes the
+    producer's U layout a free choice everywhere else.  Both U factors
+    put a FREE index (m from the first, n from the second) on the same
+    mesh axis, so a U at ``qsgw_density.band_rotation_spec`` has no
+    2-D-sharded output to land in: left to infer, GSPMD returns
+    ``P(None,'x')`` (measured, job 7889423), and a sharded result is a
+    sharded SC carry — ``_run_rcrop``, ``_run_linear_mixing`` and
+    ``_scissor_E_qp_for_outofrange`` all read the carry back on the host
+    and would raise the non-addressable-devices error at P>1.
+
+    Gathering U first is also the cheapest of the three options, because
+    it turns the whole contraction local.  Measured at nk=16/nb=128 on a
+    2×2 mesh (job 7889423), against the 6.31 ms the replicated path takes
+    with no collective at all:
+
+        U sharded, layout inferred    3 collectives   7.63 ms  out P(None,'x')
+        U sharded, result pinned      4 collectives  12.35 ms  out replicated
+        U sharded, U pinned (this)    2 collectives  10.11 ms  out replicated
+
+    and the pin costs the replicated path nothing: with U already
+    replicated the module has no collectives and runs in 6.35 ms.  The
+    U-pinned result is BIT-IDENTICAL to the replicated one (0.0e+00);
+    the inferred-layout one is not (7.4e-16 relative), because it
+    reassociates the band sums.
+    """
+    rep = NamedSharding(mesh, P(None, None, None))
+    U = jax.lax.with_sharding_constraint(U, rep)
+    out = jnp.einsum('kmp,kpq,knq->kmn', U, O_qp, jnp.conj(U), optimize=True)
+    return jax.lax.with_sharding_constraint(out, rep)
 
 
 # ---------------------------------------------------------------------------
@@ -502,24 +585,37 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             cbm = E_np[:, n_occ:].min() if n_occ < nb else vbm
             efermi_ry = 0.5 * (vbm + cbm)
             rep2 = NamedSharding(inputs.mesh_xy, P(None, None))
-            rep3 = NamedSharding(inputs.mesh_xy, P(None, None, None))
-            # Process-local replication — see the H_qp_dft note above
-            # (same hidden assert_equal; same rank-invariance argument).
+            # U AT band_rotation_spec, NOT REPLICATED.  This is the same
+            # (nk, nb, nb) object ``distributed_eigh_bands`` emits sharded
+            # at every iteration ≥ 1 (9.2 GB replicated at nb=2000/nk=144),
+            # and iteration 0 was the last producer still handing a
+            # replicated one to ``rotate_wavefunctions`` /
+            # ``qsgw_density.rotate_bands``.  Sharding it is free for both:
+            # ``rotate_bands`` takes this layout as-is (measured 115.7 ms
+            # against 117.6 ms replicated, same three collectives, argument
+            # 41 MiB against 44 MiB — job 7889424), and
+            # ``rotate_wavefunctions`` reshards to ``band_mix_spec``
+            # whichever it gets.  ``_rotate_to_dft_basis`` gathers it back
+            # and is bit-identical either way (job 7889423).
+            # Process-local placement — see the H_qp_dft note above (same
+            # hidden assert_equal; same rank-invariance argument, and here
+            # each rank stages only its own nb²/(px·py) block).
             E_qp_ry = device_put_process_local(E_np, rep2)
             U_qp = device_put_process_local(
                 np.broadcast_to(
                     np.eye(nb, dtype=np.complex128), H_np.shape),
-                rep3)
+                NamedSharding(inputs.mesh_xy, _band_rotation_spec()))
     if E_qp_ry is None:
         # DISTRIBUTED EIGH when density-SC is on.  ``_diagonalize_and_get_efermi``
-        # k-shards the eigh but allgathers U back to REPLICATED, i.e. every
-        # rank holds the whole (nk, nb, nb) -- 9.2 GB at nb=2000/nk=144, and
-        # one (nb,nb) tile alone is 1.6 GB at nb=1e4.  ``distributed_eigh_bands``
-        # spreads each tile over the mesh instead (owner ruling 2026-08-04:
+        # k-shards the eigh, so each device does nk/P of the per-k
+        # diagonalisations, but one (nb, nb) tile still lands whole on one
+        # device -- 1.6 GB at nb=1e4.  ``distributed_eigh_bands`` spreads
+        # each tile over the mesh instead (owner ruling 2026-08-04:
         # robustness at 1e4+ bands over speed at 1e3, where the native batch
         # wins by ~ndev).  E_F then comes from the k-weighted step routine
         # rather than the fixed-band-cut midgap, which is the general answer
-        # and the one the IBZ needs.
+        # and the one the IBZ needs.  Both branches now RETURN U at
+        # ``band_rotation_spec``, so the code below is layout-blind.
         if bool(getattr(inputs.config, "density_self_consistent", False)):
             from gw.qsgw_density import distributed_eigh_bands
             from gw.efermi import fermi_level_step
@@ -538,8 +634,20 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             efermi_ry = fermi_level_step(
                 np.asarray(E_qp_ry), w_k / float(w_k.sum()), float(n_occ))
         else:
+            # SAME U LAYOUT AS THE DENSITY-SC BRANCH.  The k-sharded eigh
+            # allgathered U back to replicated by default; every consumer
+            # in this function is a device-side rotation that either wants
+            # ``band_rotation_spec`` outright (``qsgw_density.rotate_bands``)
+            # or reshards from whatever it is given
+            # (``rotate_wavefunctions`` → ``band_mix_spec``), and the two
+            # that need it replicated (``_rotate_to_dft_basis`` and
+            # ``sigma_dispatch``'s V_H basis change) pin it themselves.
+            # Per-rank U drops by px·py — 4.00 MiB → 1.00 MiB at
+            # nk=16/nb=128 on a 2×2 mesh (job 7889423), and it is the
+            # (nk, nb, nb) object that reaches 9.2 GB at nb=2000/nk=144.
             E_qp_ry, U_qp, efermi_ry = _diagonalize_and_get_efermi(
-                state.H_qp_dft, n_occ, inputs.mesh_xy)
+                state.H_qp_dft, n_occ, inputs.mesh_xy,
+                u_spec=_band_rotation_spec())
 
     # Rotate the active subspace of the DFT bundle to this iteration's QP
     # basis.  Bands outside ``slices.sigma`` keep their DFT ψ + DFT energy
@@ -558,8 +666,18 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # no-ops (job 7889360).  Both are index takes on host numpy arrays that
     # ``np.asarray`` had to produce anyway; the row would be 0.0% in every
     # table that prints it.
+    # ``_replicate`` BEFORE THE HOST READ, and it is not cosmetic: the
+    # broadcast runs on host numpy, and ``np.asarray`` of a mesh-sharded
+    # jax.Array raises "Fetching value for jax.Array that spans
+    # non-addressable (non process local) devices" at P>1 (measured, job
+    # 7889419).  U has been sharded on the density-SC branch since
+    # ``distributed_eigh_bands`` landed, so this was already unreachable at
+    # P>1 with ``sc_on_ibz`` on; both branches emit a sharded U now.  On a
+    # replicated U the ``device_put`` is a no-op, so the full-BZ default
+    # path is untouched.
     ks = _kstar(inputs)
-    U_full = ks.broadcast(np.asarray(U_qp)) if not ks.is_identity else U_qp
+    U_full = (ks.broadcast(np.asarray(_replicate(U_qp, inputs.mesh_xy)))
+              if not ks.is_identity else U_qp)
     E_full = ks.broadcast(np.asarray(E_qp_ry)) if not ks.is_identity else E_qp_ry
 
     wfns_qp = rotate_wavefunctions(
@@ -649,7 +767,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"    k-star: Σ+V_H residual {resid / scale:.3e} rel over "
             f"{ks.nk_full}->{ks.nk_irr} k ({ks.reduction:.2f}x)")
         delta_h_qp = jnp.asarray(ks.select(np.asarray(delta_h_qp)))
-    delta_h_dft = _rotate_to_dft_basis(delta_h_qp, U_qp)
+    delta_h_dft = _rotate_to_dft_basis(delta_h_qp, U_qp, mesh=inputs.mesh_xy)
     if v_h_dft_new is not None:
         delta_h_dft = delta_h_dft + v_h_dft_new
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
@@ -1189,10 +1307,18 @@ def run_sc_driver(
     # ``state.last_sigma_basis_U``.  Downstream driver code (H build +
     # eigh, writer, freq_debug) is written for DFT-basis matrices
     # (kin_ion is DFT basis throughout).
-    U = jnp.asarray(state_final.last_sigma_basis_U)
-    sig_h = _rotate_to_dft_basis(sigma_result.v_h_kij_ry, U)
-    sig_x = _rotate_to_dft_basis(sigma_result.sigma_x_kij_ry, U)
-    sigma_xc_dft = _rotate_to_dft_basis(sigma_result.sigma_xc_kij_ry, U)
+    # REPLICATED ONCE, FOR ALL FIVE ROTATIONS.  ``_rotate_to_dft_basis``
+    # pins U replicated itself, so without this the five calls would each
+    # emit their own gather of the same array.  ``jnp.asarray`` alone is
+    # not enough for either producer: on a sharded U it is a no-op, and on
+    # the HOST U the k-star broadcast leaves on a reduced k-set it builds
+    # a SINGLE-DEVICE array, which is an operand-sharding error against
+    # the mesh-sharded Σ at P>1 rather than a slow success.
+    U = _replicate(state_final.last_sigma_basis_U, mesh_xy)
+    sig_h = _rotate_to_dft_basis(sigma_result.v_h_kij_ry, U, mesh=mesh_xy)
+    sig_x = _rotate_to_dft_basis(sigma_result.sigma_x_kij_ry, U, mesh=mesh_xy)
+    sigma_xc_dft = _rotate_to_dft_basis(
+        sigma_result.sigma_xc_kij_ry, U, mesh=mesh_xy)
     sigma_total = sigma_xc_dft + sig_h
     sigma_result_dft = dataclasses.replace(
         sigma_result,
@@ -1200,10 +1326,10 @@ def run_sc_driver(
         sigma_x_kij_ry=sig_x,
         sigma_xc_kij_ry=sigma_xc_dft,
         sigma_sx_kij_ry=(
-            _rotate_to_dft_basis(sigma_result.sigma_sx_kij_ry, U)
+            _rotate_to_dft_basis(sigma_result.sigma_sx_kij_ry, U, mesh=mesh_xy)
             if sigma_result.sigma_sx_kij_ry is not None else None),
         sigma_coh_kij_ry=(
-            _rotate_to_dft_basis(sigma_result.sigma_coh_kij_ry, U)
+            _rotate_to_dft_basis(sigma_result.sigma_coh_kij_ry, U, mesh=mesh_xy)
             if sigma_result.sigma_coh_kij_ry is not None else None),
         sigma_omega_h5_path=sigma_omega_h5_path,
         efermi_dft_ev=float(wfn.efermi) * RYD_TO_EV,
@@ -1237,6 +1363,16 @@ def final_qp_eigenstates(
     NumPy.  Use this once after :func:`run_self_consistency` to extract
     the (E_qp_ry, U_qp, efermi_ry) needed for downstream rotation +
     serialisation.
+
+    THE ONE PLACE THAT KEEPS THE REPLICATED U, deliberately.  The SC loop
+    asks ``_diagonalize_and_get_efermi`` for U at
+    ``qsgw_density.band_rotation_spec`` because its consumers are device
+    rotations; this function's only consumers are ``np.asarray`` two lines
+    below and the two h5py writers behind it, which need the whole
+    ``(nk, nb, nb)`` on the host on rank 0 whatever the device layout is.
+    Sharding U here would buy nothing and add a gather, and the host read
+    would then need the same guard ``gw_iteration_map``'s k-star broadcast
+    carries.
 
     Returns
     -------

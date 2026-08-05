@@ -356,7 +356,25 @@ def compute_sigma_xc(
             # the QP basis first (``O_QP = U†·O_DFT·U``) — substituting it
             # raw would make the rotate-back return ``U·V_H·U†`` and put a
             # basis error into a ~500 eV term with no other symptom.
-            U = jnp.asarray(hartree_basis_rotation, dtype=sig_h.dtype)
+            #
+            # U IS PINNED REPLICATED FIRST, for the same reason
+            # ``sc_iteration._rotate_to_dft_basis`` pins it: both factors
+            # below put a FREE index (m from conj(U), n from U) on the same
+            # mesh axis, so a U at ``qsgw_density.band_rotation_spec`` —
+            # which is what ``sc_iteration`` hands over since the eigh
+            # sites were switched to it — has no 2-D-sharded output to land
+            # in.  Left to infer, GSPMD returns v_h_ext at ``P(None,'y')``
+            # and a sharded ``SigmaResult.v_h_kij_ry`` propagates into the
+            # k-star select and the host readbacks downstream.  Measured at
+            # nk=16/nb=128 on a 2×2 mesh (job 7889424): gathering U first
+            # costs two all-gathers (2 + 4 MiB) and 10.7 ms against 5.3 ms
+            # for an already-replicated U, and the result is BIT-IDENTICAL
+            # to it (0.0e+00), where the inferred layout is 7.0e-16
+            # relative.  This branch is skipped entirely under density-SC
+            # (``omit_v_h`` zeroes sig_h above).
+            U = jax.device_put(
+                jnp.asarray(hartree_basis_rotation, dtype=sig_h.dtype),
+                NamedSharding(mesh_xy, P(None, None, None)))
             v_h_ext = jnp.einsum('kpm,kpq,kqn->kmn',
                                  jnp.conj(U), v_h_ext, U, optimize=True)
         sig_h = v_h_ext

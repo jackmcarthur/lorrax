@@ -278,21 +278,35 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     def build():
         @jax.jit
         def fn(psi_, U_, occ_, w_, bidx_, sp_):
-            psi_xy = jax.lax.with_sharding_constraint(psi_, band_xy)
+            # ONE ψ LAYOUT PER BRANCH, AND ONLY WHAT THE BODY READS.  The
+            # scanned tuple used to carry BOTH layouts plus a U dummy in
+            # both branches, while the body reads ψ_mx alone under
+            # ``have_U`` and ψ_xy alone without it.  XLA already dropped
+            # the unread ones, so this is a legibility change and not an
+            # optimisation: at nk=16 / nb=128 / ngkmax=5120 / grid
+            # 60×60×26 on a 2×2 mesh the lowered ``while`` carry is the
+            # same tuple before and after —
+            # ``(s64, f64[60,60,26], f64[16], c128[16,64,64],
+            # c128[16,64,1,5120], s64, s32)``, ONE ψ and not two — with
+            # the same four collectives and the same 171.4 MiB temp, and
+            # ``vh.rho`` runs 1175.9 → 1165.3 ms under U and 969.9 →
+            # 955.3 ms without it (jobs 7889425 → 7889426, inside the
+            # run-to-run spread).  Production takes the ``have_U=False``
+            # branch: ``hartree_from_orbitals`` rotates once with
+            # :func:`rotate_bands` and passes ``U=None``.
             if have_U:
-                # m on 'y' so the contraction reduces along 'y' alone.
-                psi_mx = jax.lax.with_sharding_constraint(psi_, m_on_x)
+                # m on 'x' so the contraction reduces along 'x' alone.
+                psi_s = jax.lax.with_sharding_constraint(psi_, m_on_x)
                 U_x = jax.lax.with_sharding_constraint(U_, U_sh)
             else:
-                psi_mx = psi_xy
-                U_x = U_
+                psi_s = jax.lax.with_sharding_constraint(psi_, band_xy)
 
             def body(rho, xs):
-                psi_xy_k, psi_mx_k, U_k, occ_k, w_k, bidx_k = xs
                 if have_U:
+                    psi_k, U_k, occ_k, w_k, bidx_k = xs
                     # COLUMNS: psi~_n = sum_m Z[m,n] psi_m.  m is on 'x'
                     # so the sum reduces along 'x' alone; n lands on 'y'.
-                    psi_t = jnp.einsum('mn,msg->nsg', U_k, psi_mx_k,
+                    psi_t = jnp.einsum('mn,msg->nsg', U_k, psi_k,
                                        optimize=True)
                     # Back onto the WHOLE mesh: straight out of the
                     # rotation the bands sit on 'x' and are replicated on
@@ -311,7 +325,8 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                     psi_t = jax.lax.with_sharding_constraint(
                         psi_t, NamedSharding(mesh, _band_spec()))
                 else:
-                    psi_t = psi_xy_k[None]
+                    psi_k, occ_k, w_k, bidx_k = xs
+                    psi_t = psi_k[None]
                 box = _box_kernel(psi_t, bidx_k[None], ngkmax=ngkmax)
                 psi_r = ifftn(box) * scale
                 dens = jnp.einsum('n,knsxyz->xyz', occ_k,
@@ -319,10 +334,9 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                 return rho + (w_k * f_spin) * dens, None
 
             rho0 = jnp.zeros(grid, dtype=jnp.float64)
-            U_xs = U_x if have_U else jnp.zeros(
-                (psi_.shape[0], 1, 1), dtype=jnp.complex128)
-            rho, _ = jax.lax.scan(
-                body, rho0, (psi_xy, psi_mx, U_xs, occ_, w_, bidx_))
+            xs = ((psi_s, U_x, occ_, w_, bidx_) if have_U
+                  else (psi_s, occ_, w_, bidx_))
+            rho, _ = jax.lax.scan(body, rho0, xs)
             rho = jax.lax.with_sharding_constraint(rho, rho_sharding)
             if sym_perm is not None:
                 rho = symmetrise_density(rho, sp_)
