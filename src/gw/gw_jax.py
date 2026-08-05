@@ -425,7 +425,8 @@ def main(argv=None):
 	# (fit → 4-branch τ-integration → analytic q→0 head → at-DFT interp)
 	# for the dynamic modes, with the QSGW-symmetrised Σ_xc evaluated at
 	# E_DFT (textbook G0W0; ``solve_qp`` re-evaluates for fixed_point).
-	# SC-iteration-1 ≡ this call, pinned by test_sc_oneshot_equivalence.
+	# SC-iteration-1 ≡ this call, pinned by tests/test_invariance_gates.py
+	# ::test_sc_iteration1_equals_one_shot.
 	# SC runs skip it — the iteration map would re-do this work on iter 1.
 	#
 	# History note (kept here because it explains a specific decision and

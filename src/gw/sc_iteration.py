@@ -400,7 +400,8 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array, *,
 #
 # OFF BY DEFAULT (``config.density_self_consistent``).  With it off this
 # module is byte-identical to before, which is what keeps
-# tests/test_sc_oneshot_equivalence.py meaningful.
+# tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot
+# meaningful.
 
 _PSI_G_CACHE: dict = {}
 
@@ -601,7 +602,29 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # as the Fix-3 on-pole census sensitivity in
         # reports/device_invariance_2026-07-08/ROOT_CAUSE.md).  The exact
         # eigensystem keeps SC-iteration-1 ≡ one-shot G0W0 bit-exactly
-        # (gated by tests/test_sc_oneshot_equivalence.py).
+        # (gated by tests/test_invariance_gates.py::
+        # test_sc_iteration1_equals_one_shot).
+        #
+        # TWO MORE THINGS THE BYPASS PINS THAT ``eigh`` DOES NOT PROMISE.
+        # (a) ORDER: eigh returns eigenvalues ASCENDING, while every
+        # band-indexed operand here — ``e_dft_active_kn_ry``,
+        # ``valence_mask_active_kn``, ``slices.val``/``cond`` — is in the
+        # WFN's band order.  They coincide only while E_DFT is sorted at
+        # every k; the bypass makes the band labelling identity by
+        # construction instead of by coincidence.
+        # (b) GAUGE IN A DEGENERATE MANIFOLD: for repeated eigenvalues the
+        # eigenvector basis is arbitrary up to a unitary on the degenerate
+        # block, and LAPACK does not promise the identity even for an
+        # exactly diagonal input.  Any such mixing rotates ψ, and Σ's
+        # off-diagonals are not invariant under it.  Returning U = I
+        # removes the dependence rather than relying on it.
+        #
+        # The predicate below is EXACT (bitwise all-zero off-diagonal),
+        # not a tolerance, so it cannot fire on a carry that is merely
+        # nearly diagonal, and a non-finite diagonal makes the difference
+        # non-zero and falls through to eigh.  ``.real`` on the diagonal is
+        # exact for the only producer of iteration 0
+        # (``make_initial_state_from_dft`` writes a real diagonal).
         H_np = np.asarray(state.H_qp_dft)
         nb = H_np.shape[1]
         diag = np.diagonal(H_np, axis1=1, axis2=2)
@@ -1228,7 +1251,10 @@ def run_sc_driver(
         the basis-of-record U (``state.last_sigma_basis_U`` — the
         unitary that defined the basis the last ``compute_sigma_xc``
         call ran in; the converged U is one iteration ahead and agrees
-        only at the fixed point — see test_sc_oneshot_equivalence).
+        only at the fixed point — worst case ``max_iter=1``, where the
+        correct U is the identity, which is the case
+        ``tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot``
+        runs).
         ``sigma_omega_h5_path`` points at the converged single-write
         sigma_mnk.h5; ``efermi_dft_ev`` is filled for every mode.
     sigma_total : (nk, nb, nb) Ry

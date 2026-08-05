@@ -9,7 +9,9 @@ of the Tier-1 gnppm session state (``conftest.gnppm_session``), so the
 dominant ζ-fit + V_q build happens once per suite, not once per gate.
 
 Copies are mandatory: the driver mutates the restart file in place
-(``persist_w0_and_head``).  Ports of the pre-redesign standalone gates:
+(``persist_w0_and_head``).  Ports of the pre-redesign standalone gates —
+the parenthesised names are the FORMER files, none of which still exist;
+each gate now lives in this one:
 
 * restart ≡ fresh          (NEW — was implicit, never gated)
 * μ-pad flip, gnppm        (test_mu_pad_invariance.py::gnppm_pad12)
