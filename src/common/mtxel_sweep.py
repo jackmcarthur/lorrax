@@ -82,6 +82,20 @@ alternative (shard over G, psum the partials) needs every rank to hold a
 full ``(nb, nb)`` to reduce into, which is exactly W2.  Not a
 preference; forced.
 
+A Cartesian operator (dipole) appends a length-3 REPLICATED component
+axis and comes back ``(nk, 3, nb, nb)`` at ``P(None, None, 'x', 'y')``.
+Three components ride ONE sweep rather than three, so the hoisted
+m-side reshard stays at one all-gather; only the per-k payload is 3×.
+
+WHO GATHERS, AND WHERE IT IS SAID
+---------------------------------
+The sharded block is the RETURN VALUE.  ``blocks_to_host`` at the end of
+this module is the only boundary that undoes it, and it is called by
+name at the sinks that cannot take a sharded operand (two serial h5py
+writes, one replicated global operand).  A consumer that can stay
+sharded — ``gw.sc_iteration.rebuild_hartree_dft_basis`` — does not call
+it.  There is no implicit gather anywhere in this path.
+
 WHY ψ(G) IS RESIDENT AND THE BOX NEVER IS
 -----------------------------------------
 The *box* is huge; the G-sphere is not.  ``nk·nb·ns·ngkmax·16`` is 1.2 GB
@@ -145,7 +159,11 @@ __all__ = [
     "Operator",
     "kinetic_operator",
     "local_potential_operator",
+    "vnl_operator",
+    "dipole_operator",
+    "sum_operators",
     "sweep_matrix_elements",
+    "blocks_to_host",
 ]
 
 
@@ -229,6 +247,21 @@ class SweepGeometry:
     def spec_block(self) -> P:
         return P(None, "x", "y")
 
+    # --- the optional COMPONENT axis (dipole: 3 Cartesian directions) ---
+    # It is length 3 and REPLICATED: it cannot usefully divide a mesh
+    # axis, and carrying all three through one sweep is what keeps the
+    # hoisted m-side reshard at ONE all-gather instead of three (the
+    # handoff's §3b, which is stated for "all four operators" and holds
+    # verbatim for the three Cartesian components of one operator).
+    # Sphere operands carry it LAST so the band axis stays at index 1 and
+    # every spec above extends by appending a single ``None``.
+    @staticmethod
+    def with_comp(spec: P, ncomp: int) -> P:
+        return spec if not ncomp else P(*spec, None)
+
+    def spec_block_for(self, ncomp: int) -> P:
+        return P(None, "x", "y") if not ncomp else P(None, None, "x", "y")
+
 
 # ---------------------------------------------------------------------------
 # The operator protocol
@@ -245,8 +278,15 @@ class Operator(NamedTuple):
       bidx    (1, nx, ny, nz) i32 — sphere→box index map for this k
       kvec    (3,) f64
 
-    and must return ``(1, nb, ns, ngkmax)`` in the same layout.  It must
-    NOT form anything of shape ``(nb, nb)`` and must not gather over bands.
+    and must return ``(1, nb, ns, ngkmax)`` in the same layout — or, when
+    ``ncomp > 0``, ``(1, nb, ns, ngkmax, ncomp)``: the band axis stays at
+    index 1 and the component axis is appended.  It must NOT form
+    anything of shape ``(nb, nb)`` and must not gather over bands.
+
+    ``ncomp`` is 0 for a scalar operator (T, V_loc, V_H, V_NL) and 3 for
+    a Cartesian one (dipole).  It is not a shape the sweep can infer:
+    the sweep has to pick its einsum and its output spec at trace time,
+    before it has seen the operator's output.
 
     ``post`` rides WITH the operator rather than being a sweep argument.
     The factor is part of the operator's own normalisation — the local
@@ -258,6 +298,7 @@ class Operator(NamedTuple):
     """
     apply: Callable
     post: float = 1.0
+    ncomp: int = 0
 
 
 def kinetic_operator(geom: SweepGeometry, bdot) -> Operator:
@@ -341,6 +382,154 @@ def local_potential_operator(geom: SweepGeometry, V_r) -> Operator:
     return Operator(apply=op, post=float(_sc.post))
 
 
+def _ket(psi_n, gmask):
+    """The scan's ``(1, nb, ns, ngkmax)`` ket as the ``(nb, ns, nG)`` the
+    ``psp`` apply-to-ket kernels take, masked on the D10 pad columns.
+
+    The mask has to reach ψ for the projector operators, not just the
+    diagonal: ``Z`` (and ``dZ``) are FINITE on a pad column — they are
+    evaluated at ``K = kvec`` there, not at a zero form factor — so an
+    unmasked ket adds ``ngkmax - ngk`` spurious projector overlaps.
+    ``psp.dft_operators.vnl_matrix_from_kdata`` documents the same rule
+    for the local plan and satisfies it the same way.
+
+    The leading k axis is singleton, so dropping it moves the band axis
+    from 1 to 0 without moving any data; the sweep re-adds it before the
+    einsum.  No sharding constraint is issued here — XLA carries the band
+    sharding through a squeeze, and the one per-k collective is the
+    reshard in the sweep body, which this must not duplicate.
+    """
+    psi = psi_n[0]
+    return psi * gmask[None, None, :].astype(psi.dtype)
+
+
+def _pad_spinor(x, ns: int):
+    """Zero-fill a ``(..., nb, ns_op, nG)`` operator output back to ``ns``.
+
+    ``E_super`` is built at the FILE's ``nspinor``; a bispinor ψ carries
+    4 components, of which V_NL acts on the first 2.  The local plan
+    handles this by slicing BOTH sides of the matrix element
+    (``dft_operators.vnl_matrix_from_kdata``).  The sweep cannot: the m
+    side is shared by every operator in a sum, so it is the ket that is
+    padded back.  The two are identical because the pad rows are exact
+    zeros — ``Σ_s conj(ψ_m,s)(Oψ)_{n,s}`` then runs over ``s < ns_op``
+    either way.
+    """
+    have = int(x.shape[-2])
+    if have == ns:
+        return x
+    pad = [(0, 0)] * x.ndim
+    pad[-2] = (0, ns - have)
+    return jnp.pad(x, tuple(pad))
+
+
+def vnl_operator(geom: SweepGeometry, vnl_setup) -> Operator:
+    """``V_NL ∘ ψ = Z E Z† ψ`` — a projector sum: no FFT, no band gather.
+
+    Why it fits the ``Operator`` protocol at all: the G sum inside the
+    projector overlap ``P[R,s,n] = Σ_G conj(Z) ψ`` runs over the
+    REPLICATED G axis, so it is rank-local; the free index is the band,
+    which stays sharded.  Nothing here needs a collective and nothing
+    forms an ``(nb, nb)``.
+
+    ``vnl_ops.apply_vnl`` is the kernel, unmodified — the same
+    ``Z E Z†`` the local plan's ``vnl_ops.vnl_matrix`` contracts, taken
+    one step earlier.  The two therefore differ only in where the bra is
+    applied, which reassociates the G sum: gate at 1e-12 relative, not
+    bit-identity.
+
+    Cost per k: ``Z`` is ``(total_R, ngkmax)`` REPLICATED (32 MB at
+    total_R=100, ngkmax=20000) — it does not scale with nb, so it does
+    not enter the per-rank wall this sweep exists to remove.
+    """
+    from psp import vnl_ops
+
+    def op(psi_n, gvec, gmask, bidx, kvec):
+        psi = _ket(psi_n, gmask)
+        kdata = vnl_ops.build_vnl_kdata_traced(kvec, gvec, vnl_setup)
+        ns_e = int(kdata.E_super.shape[0])
+        out = vnl_ops.apply_vnl(psi[:, :ns_e], kdata.Z, kdata.E_super)
+        return _pad_spinor(out, int(psi.shape[1]))[None]
+
+    return Operator(apply=op, post=1.0)
+
+
+def dipole_operator(geom: SweepGeometry, *, bvec, blat,
+                    vnl_setup=None) -> Operator:
+    """``v ∘ ψ = 2(k+G)_cart ψ − (∂V_NL/∂K_cart) ψ`` — THREE components.
+
+    The velocity matrix ``psp.get_dipole_mtxels`` writes is
+    ``p + i[r, V_NL]``, assembled there as ``p_cart - v_NL_cart`` (the
+    sign flip at its ``vNL_cart = -vNL_cart`` line, which exists so the
+    stored convention matches BGW's).  Both halves already have
+    apply-to-ket kernels — ``dft_operators.apply_kinetic_velocity_to_ket``
+    and ``vnl_ops.apply_vnl_velocity_to_ket``, each ``(3, nb, ns, nG)`` —
+    so this operator is their difference and no velocity physics is
+    written twice.
+
+    ``vnl_setup=None`` reproduces ``--skip-vnl`` (p̂ only).
+
+    The component axis is moved to the END, where the sweep's specs
+    expect it; that is a transpose of the operator output, not of ψ.
+    """
+    from psp.dft_operators import apply_kinetic_velocity_to_ket
+    from psp import vnl_ops
+
+    B = jnp.asarray(np.asarray(bvec, dtype=np.float64) * float(blat),
+                    dtype=jnp.float64)
+
+    def op(psi_n, gvec, gmask, bidx, kvec):
+        psi = _ket(psi_n, gmask)
+        v = apply_kinetic_velocity_to_ket(psi, gvec, kvec, B)
+        if vnl_setup is not None:
+            kdata = vnl_ops.build_vnl_kdata_traced(kvec, gvec, vnl_setup,
+                                                   compute_dZ=True)
+            ns_e = int(kdata.E_super.shape[0])
+            v_nl = vnl_ops.apply_vnl_velocity_to_ket(
+                psi[:, :ns_e], kdata.Z, kdata.dZ, kdata.E_super)
+            v = v - _pad_spinor(v_nl, int(psi.shape[1]))
+        return jnp.moveaxis(v, 0, -1)[None]
+
+    return Operator(apply=op, post=1.0, ncomp=3)
+
+
+def sum_operators(*ops: Operator) -> Operator:
+    """``(O₁ + O₂ + …) ∘ ψ`` — one sweep, one per-k collective.
+
+    ``⟨m|T+V_loc+V_NL|n⟩`` is ONE matrix element, so it is one sweep:
+    summing on the KET costs one extra ``(nb/P, ns, ngkmax)`` add per
+    term and leaves the reshard and the einsum — the expensive halves —
+    paid once, where three sweeps would pay all three three times.
+
+    Each term's ``post`` is folded into its own contribution before the
+    sum, which is what lets operators with different normalisations
+    (``local_potential_operator`` carries ``sqrt(1/Ω)``, the others 1)
+    share one einsum.  Algebraically identical, since the einsum is
+    linear; numerically it moves one scalar multiply from after the G
+    sum to before it, i.e. ~1 ulp, inside the 1e-12 gate.
+    """
+    if not ops:
+        raise ValueError("sum_operators: at least one operator required")
+    ncomp = int(ops[0].ncomp)
+    bad = [i for i, o in enumerate(ops) if int(o.ncomp) != ncomp]
+    if bad:
+        raise ValueError(
+            f"sum_operators: operands disagree on ncomp — operand 0 has "
+            f"{ncomp}, operands {bad} do not.  A scalar and a Cartesian "
+            f"operator do not add.")
+
+    def op(psi_n, gvec, gmask, bidx, kvec):
+        acc = None
+        for o in ops:
+            term = o.apply(psi_n, gvec, gmask, bidx, kvec)
+            if o.post != 1.0:
+                term = term * o.post
+            acc = term if acc is None else acc + term
+        return acc
+
+    return Operator(apply=op, post=1.0, ncomp=ncomp)
+
+
 # ---------------------------------------------------------------------------
 # The sweep
 # ---------------------------------------------------------------------------
@@ -385,8 +574,11 @@ def sweep_matrix_elements(
 
     Returns
     -------
-    (nk, nb, nb) c128 sharded ``P(None, 'x', 'y')``.  No rank ever holds a
-    full ``(nb, nb)`` tile.
+    (nk, nb, nb) c128 sharded ``P(None, 'x', 'y')`` — or, for an operator
+    with ``ncomp > 0``, ``(nk, ncomp, nb, nb)`` sharded
+    ``P(None, None, 'x', 'y')``.  No rank ever holds a full ``(nb, nb)``
+    tile.  Band extents are the mesh-PADDED ``geom.nb``;
+    :func:`blocks_to_host` is the boundary that trims back to logical.
 
     MASKING IS IMPLICIT AND UNCONDITIONAL, AND THAT IS THE POINT
     ------------------------------------------------------------
@@ -440,7 +632,11 @@ def sweep_matrix_elements(
     kvecs_j = jnp.asarray(kvecs, dtype=jnp.float64)
     bidx_j = jnp.asarray(box_index, dtype=jnp.int32)
 
-    block_sharding = NamedSharding(mesh, geom.spec_block)
+    ncomp = int(operator.ncomp)
+    block_sharding = NamedSharding(mesh, geom.spec_block_for(ncomp))
+    # 'kbsg,knsg->kbn' for a scalar operator; the Cartesian one carries a
+    # replicated component axis through the SAME contraction.
+    contraction = 'kbsg,knsg->kbn' if not ncomp else 'kbsg,knsgc->kcbn'
 
     def _run(psi, gvecs_, gmask_, bidx_, kvecs_):
         # THE HOISTED RESHARD.  ψ_m is never transformed, so the column
@@ -466,13 +662,14 @@ def sweep_matrix_elements(
             # only, not a global collective.  Payload is the sphere-space
             # operator output (9.4 MB at b600/P=64), never the r-space box.
             Opsi_Y = jax.lax.with_sharding_constraint(
-                Opsi, NamedSharding(mesh, geom.spec_sphere_y))
+                Opsi, NamedSharding(
+                    mesh, geom.with_comp(geom.spec_sphere_y, ncomp)))
 
             m_side = ik_psi_m * gm[None, None, None, :].astype(ik_psi_m.dtype)
             m_side_X = jax.lax.with_sharding_constraint(
                 m_side, NamedSharding(mesh, geom.spec_sphere_x))
 
-            blk = jnp.einsum('kbsg,knsg->kbn',
+            blk = jnp.einsum(contraction,
                              jnp.conj(m_side_X), Opsi_Y, optimize=True)
             blk = blk * operator.post
             return jax.lax.with_sharding_constraint(blk, block_sharding)
@@ -503,7 +700,75 @@ def sweep_matrix_elements(
     fn = _cached_jit(
         'sweep_matrix_elements',
         (psi.shape, geom.ngkmax, geom.ns, nk, bool(use_scan),
-         id(operator.apply), float(operator.post),
+         id(operator.apply), float(operator.post), ncomp,
          geom.fft_grid, _sharding_key(psi)),
         lambda: jax.jit(_run))
     return fn(psi, gvecs_j, gmask_j, bidx_j, kvecs_j)
+
+
+# ---------------------------------------------------------------------------
+# The boundary
+# ---------------------------------------------------------------------------
+
+#: Payload cap for one collective in :func:`blocks_to_host`.  256 MiB is
+#: the same order as ``common.collectives``' owner-gather chunk and is
+#: what keeps a peer's transient below the full table it is not keeping.
+_HOST_CHUNK_BYTES = 1 << 28
+
+
+def blocks_to_host(H, *, nb: int, owner_only: bool = False):
+    """Sharded ``H[k, …, m_X, n_Y]`` → a host ``numpy`` array.
+
+    THE BOUNDARY IS EXPLICIT AND IT IS NOT FREE.  ``sweep_matrix_elements``
+    returns the block SHARDED, which is the point: no rank holds a full
+    ``(nb, nb)``.  Every consumer that keeps its result in that layout
+    (``gw.sc_iteration.rebuild_hartree_dft_basis``) must NOT call this.
+    It exists for the sinks that cannot take a sharded operand — the
+    serial ``h5py`` writes in ``gw.kin_ion_io`` and
+    ``psp.get_dipole_mtxels``, and the replicated global operand
+    ``gw.sigma_dispatch``'s gspace route builds — and it re-materialises
+    the replicated ``(nk, nb, nb)`` on the ranks that keep it.  What the
+    sweep removes upstream of here is the per-k full-band FFT box and the
+    ``P ≤ nk`` ceiling; the table itself is the output and something has
+    to hold it.
+
+    ``owner_only=True`` keeps it on rank 0 and returns ``None`` elsewhere
+    — the same contract ``collectives.gather_k_blocks(owner_only=True)``
+    offers, and for the same reason (the only consumer is the rank-0 file
+    write).  The gather runs in leading-axis chunks so a peer's transient
+    is one chunk rather than the whole table; the chunk count is derived
+    from replicated shapes, so every rank enters the same number of
+    collectives.
+
+    ``nb`` is the LOGICAL band count.  The sweep's output carries the
+    mesh-padded extent and the pad rows and columns are exact zeros
+    (products of a zero band); trimming them here is the caller stating
+    logical shapes only, per decisions.md 2026-08-04.
+    """
+    from common.collectives import gather_to_host, process_rank
+
+    nk = int(H.shape[0])
+    tail = tuple(int(s) for s in H.shape[1:])
+    per_k = int(np.prod(tail)) * 16
+    step = max(1, min(nk, _HOST_CHUNK_BYTES // max(per_k, 1)))
+    keep = (not owner_only) or process_rank() == 0
+
+    mesh = H.sharding.mesh
+    rep = NamedSharding(mesh, P(*([None] * H.ndim)))
+    out = None
+    for a in range(0, nk, step):
+        chunk = H if step >= nk else H[a:a + step]
+        # XLA's own all-gather, not a host-side one: constraining to a
+        # fully replicated spec inside a jit is the reshard the transport
+        # is certified on, and it lands ``gather_to_host`` on its
+        # ``is_fully_replicated`` arm (a local read, no second collective).
+        fn = _cached_jit(
+            'mtxel_replicate', (chunk.shape, _sharding_key(chunk)),
+            lambda: jax.jit(
+                lambda x: jax.lax.with_sharding_constraint(x, rep)))
+        blk = gather_to_host(fn(chunk))[..., :nb, :nb]
+        if keep:
+            if out is None:
+                out = np.empty((nk,) + blk.shape[1:], dtype=blk.dtype)
+            out[a:a + blk.shape[0]] = blk
+    return out

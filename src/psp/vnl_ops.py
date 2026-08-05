@@ -374,6 +374,26 @@ def build_vnl_kdata_from_kvec(
                                   setup, compute_dZ=compute_dZ)
 
 
+def build_vnl_kdata_traced(kvec, Gk_int, setup: VNLSetup, *,
+                           compute_dZ: bool = False) -> VNLKData:
+    """:func:`build_vnl_kdata_from_kvec` for a TRACED ``kvec``/``Gk_int``.
+
+    Same body, minus the ``np.asarray`` coercion of the two per-k
+    operands — which is what forbids the eager entry point inside a
+    trace: ``np.asarray`` on a ``lax.scan`` carry raises
+    ``TracerArrayConversionError``.  The core is already pure jax in
+    both branches (``_assemble_Z_jit`` for ``compute_dZ=False``, jnp +
+    ``jax.jvp`` for the derivative), so nothing else has to change.
+
+    The caller is ``common.mtxel_sweep``'s V_NL and dipole operators,
+    which build Z (and dZ) for the scan's current k.  Everything the
+    setup carries is k-independent and closes over as a constant; only
+    ``kvec`` and the D10 fixed-shape G table vary per iteration, so the
+    body lowers ONCE for the whole sweep.
+    """
+    return _build_vnl_kdata_core(kvec, Gk_int, setup, compute_dZ=compute_dZ)
+
+
 @functools.partial(jax.jit, static_argnames=('l_max',))
 def _assemble_Z_jit(
     kvec, Gk_int,

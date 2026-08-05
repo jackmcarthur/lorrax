@@ -38,6 +38,9 @@ from file_io import WfnLoader as WFNReader
 from common import symmetry_maps
 from common import timing
 from common.collectives import barrier, gather_k_blocks
+from common.mtxel_sweep import (SweepGeometry, band_sphere_spec,
+                                blocks_to_host, dipole_operator,
+                                sweep_matrix_elements)
 from common.wfn_transforms import load_kpoint_fftbox_local
 from common import Meta
 from gw.gw_config import read_lorrax_input as read_cohsex_input
@@ -721,10 +724,11 @@ def main(argv=None):
 	print("\nCreating system metadata...")
 	meta = Meta.from_system(wfn, sym, nval, ncond, nband, 0, bispinor)
 
-	# Every communicator the closing gather will use was warmed by the
-	# module-top ``initialize_communicator_stack()`` (mandatory under
-	# impl=mpi, from the main thread).  The mesh itself is not needed
-	# below: nothing in this driver holds a globally-sharded array any more.
+	# Every communicator the sweep and the closing gather will use was
+	# warmed by the module-top ``initialize_communicator_stack()``
+	# (mandatory under impl=mpi, from the main thread).  ``RUNTIME.mesh``
+	# is the run's own ('x','y') mesh and IS used below: the k-scan holds
+	# ψ and ⟨mk|v|nk⟩ as globally-sharded arrays over it.
 
 	# Ensure we load enough conduction bands for debug/output comparisons.
 	# ψ is NOT loaded here — see the k sweep below.
@@ -833,15 +837,21 @@ def main(argv=None):
 	def _dipole_block(i):
 		"""⟨mk|v|nk⟩ = p + i[r, V_NL] for ONE k — ``(3, nb, nb)`` on device.
 
-		THE MEMORY CONTRACT.  ψ enters through
-		``load_kpoint_fftbox_local``, which reads and boxes exactly this
-		k: ``nb·nspinor·nx·ny·nz·16`` B, 189 MB on MoS₂ 4×4 at 128 bands.
-		It is dropped when the block returns.  The route this replaces
-		indexed a RESIDENT ``(nk, nb, ns, nx, ny, nz)`` array — every k's
-		box alive for the whole sweep, 3.0 GB on the same deck, and a
-		second 3.0 GB while the k-major reshard of it was in flight.
-		Nothing about that residency shrank with P: the loop ran all
-		``nk`` on every rank.
+		THE LOCAL PLAN, kept for two callers only: ``--vnl-mode=numeric``
+		(whose finite difference picks its step from THIS k's median |K|
+		on the host, and costs 4–8 extra projector builds per component
+		per k) and the ``--debug`` table, which needs p and p+v_NL
+		SEPARATELY — the sweep sums them on the ket and no longer has
+		them apart.  The default analytic path is
+		``common.mtxel_sweep``; see the sweep below.
+
+		THE MEMORY CONTRACT, and why the default no longer pays it.  ψ
+		enters through ``load_kpoint_fftbox_local``, which reads and
+		boxes exactly this k: ``nb·nspinor·nx·ny·nz·16`` B, 189 MB on
+		MoS₂ 4×4 at 128 bands.  It is dropped when the block returns.
+		The sweep forms no box at all — 2(k+G)ψ and ∂V_NL/∂K ψ are
+		diagonal in G and a projector sum respectively, so both act on
+		the stored G-sphere.
 		"""
 		wfn_k = load_kpoint_fftbox_local(wfn, meta, i, nb,
 		                                 bispinor=bispinor)
@@ -909,15 +919,49 @@ def main(argv=None):
 
 		return p_cart + vNL_cart
 
-	# One k per dispatch, round-robin over the processes, ONE host readback
-	# per rank and ONE indexed gather at the end — the same contract
-	# ``gw.kin_ion_io``'s ⟨mk|V_H|nk⟩ sweep runs on.  ``owner_only``: the
-	# only consumer of the gathered ``(nk, 3, nb, nb)`` table is the
-	# rank-0 h5 write below, so it is assembled on rank 0 alone (None on
-	# the peers) instead of being replicated on every rank (BD.4).
-	with timing.section("dipole_sweep"):
-		dip_k_major = gather_k_blocks(nk, _dipole_block, item_shape=(3, nb, nb),
-		                              label="dipole", owner_only=True)
+	# ⟨mk|v|nk⟩: ONE k-scan with THIS k's bands sharded over every process
+	# (``common.mtxel_sweep``), replacing the k-partitioned
+	# ``gather_k_blocks`` route.  That route took a whole k per rank, so
+	# its wall was one full-band k however large P was and it could not
+	# use more than ``nk`` ranks at all; the scan makes ``nk`` a trip
+	# count and parallel efficiency ``nb_logical/nb_padded``.  Measured
+	# on the sibling V_H sweep, b600-class at P=64, worst rank: 4.975 s /
+	# 10.83 GiB before, 2.162 s / 8.21 GiB after (jobs 7888877, 7888907);
+	# at P = nk it is ~1.45x slower, which is the documented crossover.
+	#
+	# The three Cartesian components ride ONE sweep, so the hoisted
+	# m-side reshard is paid once rather than three times; only the
+	# per-k reshard payload is 3x.
+	if args.vnl_mode == "numeric":
+		with timing.section("dipole_sweep"):
+			dip_k_major = gather_k_blocks(nk, _dipole_block,
+			                              item_shape=(3, nb, nb),
+			                              label="dipole", owner_only=True)
+	else:
+		if args.debug and jax.process_index() == 0:
+			_dipole_block(int(args.debug_kindex))     # the table, nothing else
+		psi_G = wfn.load(bands=(0, nb), k="full_bz",
+		                 sharding=band_sphere_spec(), bispinor=bispinor)
+		geom = SweepGeometry(mesh=RUNTIME.mesh, fft_grid=meta.fft_grid,
+		                     ngkmax=int(psi_G.shape[3]), nb=nb,
+		                     ns=int(psi_G.shape[2]), nk=nk,
+		                     cell_volume=float(wfn.cell_volume))
+		op = dipole_operator(
+			geom, bvec=wfn.bvec, blat=wfn.blat,
+			vnl_setup=None if args.skip_vnl else vnl_setup)
+		with timing.section("dipole_sweep"):
+			H_v = sweep_matrix_elements(
+				psi_G, operator=op, geom=geom,
+				gvecs=gtab.gvecs, gmask=gtab.mask,
+				box_index=wfn.box_index(k="full_bz"),
+				kvecs=np.asarray(sym.unfolded_kpts))
+			# THE BOUNDARY, named rather than implied: the only consumer
+			# of the (nk, 3, nb, nb) table is the serial h5py write on
+			# rank 0 below, which cannot take a sharded operand.
+			# ``owner_only`` keeps it off the peers (BD.4) and the gather
+			# runs in chunks so a peer's transient is one chunk.
+			dip_k_major = blocks_to_host(H_v, nb=nb, owner_only=True)
+		del H_v, psi_G
 	if dip_k_major is not None:
 		dipole = np.ascontiguousarray(np.moveaxis(dip_k_major, 0, 1))
 	else:

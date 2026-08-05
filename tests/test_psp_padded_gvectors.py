@@ -419,6 +419,14 @@ def test_psp_drivers_import_the_service():
 # structural: nothing else in the file changes if someone reintroduces the
 # resident load, and the failure would be a silent 4.5x memory regression
 # that the value gates cannot see.
+#
+# WHAT IS RESIDENT NOW, and why it is not the thing this pins.  The default
+# path is ``common.mtxel_sweep``, which holds ψ on the G-SPHERE for all k,
+# band-sharded (nk·nb·ns·ngkmax·16 B — 1.2 GB globally at b600, ≈19 MB/rank
+# at P=64).  That is the OTHER array: the box is nx·ny·nz per band where the
+# sphere is ngkmax, and the sweep forms no box at all.  The streaming
+# spellings below stay because the per-k route survives for
+# ``--vnl-mode=numeric`` and the ``--debug`` table.
 
 _RESIDENT_SPELLINGS = ("read_Gvecs_to_devices", "shard_over_k")
 _STREAMING_SPELLINGS = ("load_kpoint_fftbox_local", "gather_k_blocks")

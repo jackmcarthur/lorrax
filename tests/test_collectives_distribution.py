@@ -666,18 +666,33 @@ def test_kin_ion_io_shim_if_present_forwards_and_does_not_copy():
                 f"shim has drifted into a private copy")
 
 
-def test_the_driver_still_runs_its_sweep_through_the_service():
-    """Not merely importable: the two per-k sweeps must go through
-    ``gather_k_blocks``, or the driver quietly kept a private copy.
+def test_the_driver_still_runs_its_sweeps_through_a_shared_kernel():
+    """Not merely importable: both matrix-element sweeps must go through
+    ``common.mtxel_sweep``, or the driver quietly kept a private copy.
+
+    This pin used to demand two ``gather_k_blocks`` calls labelled
+    ``kin_ion`` and ``vh_matrix``.  That route is gone: it was
+    k-partitioned, so each rank took a whole k and the driver could not
+    use more than ``nk`` ranks at all.  ``sweep_matrix_elements`` scans k
+    one at a time with that k's bands sharded over the whole mesh.  The
+    contract the pin exists for is unchanged — the driver states physics
+    and the distribution lives in one shared kernel — so what it counts
+    moved, and ``gather_k_blocks`` must now be ABSENT rather than
+    present twice.
     """
     src = _DRIVER.read_text()
-    calls = [n for n in ast.walk(ast.parse(src))
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-             and n.func.id == "gather_k_blocks"]
-    assert len(calls) == 2, "expected the V_H and kin_ion sweeps"
-    labels = sorted(ast.literal_eval(kw.value) for c in calls
-                    for kw in c.keywords if kw.arg == "label")
-    assert labels == ["kin_ion", "vh_matrix"]
+    tree = ast.parse(src)
+    names = [n.func.id for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    assert names.count("gather_k_blocks") == 0, (
+        "kin_ion_io is back on the k-partitioned gather, which cannot use "
+        "more than nk ranks")
+    assert names.count("sweep_matrix_elements") == 2, (
+        "expected the V_H and kin_ion sweeps, both through "
+        "common.mtxel_sweep")
+    assert names.count("blocks_to_host") == 2, (
+        "each sweep's sharded block must be undone at a NAMED boundary, "
+        "never by an implicit gather")
 
 
 def test_the_driver_gets_its_mesh_and_its_warm_up_from_one_call():

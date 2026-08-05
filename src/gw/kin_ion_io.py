@@ -25,14 +25,16 @@ the two terms are −502 eV and +461 eV and their sum is −42 eV, so V_H's
 *relative* accuracy is H₀'s accuracy in absolute eV.
 
 * **stored / gspace (exact FFT-grid).**  ⟨mk|V_H|nk⟩ through the same
-  ``compute_local_V_k`` route V_loc takes: analytically exact and
+  local-potential normalisation V_loc takes: analytically exact and
   centroid-count independent.  Pinned to QE's ``kih.dat`` at rms
   1e-4 eV.  Built by ONE distributed kernel
   (:func:`compute_hartree_matrix`) shared by this CLI, the driver's
   ``gspace`` route and the QSGW loop: ρ is partitioned over
   (k, band-chunk) and reduced with a single 1.4 MB psum, the Poisson
-  solve is replicated on purpose, and ⟨mk|V_H|nk⟩ is partitioned over
-  k with no reduction at all.  It strong-scales; see scorecard §X.
+  solve is replicated on purpose, and ⟨mk|V_H|nk⟩ is one k-scan with
+  that k's bands sharded over every process (``common.mtxel_sweep``),
+  so it keeps scaling to P = nb where the previous k-partitioned route
+  stopped at P = nk.
 * **isdf (V_q[0] tile).**  Costs nothing extra, inherits the GW run's
   full P-way distribution, recomputable in-loop for QSGW.  Measured vs
   the exact route (MoS₂, scorecard §S.5): ~1 % on the occupied manifold
@@ -78,7 +80,7 @@ import jax.numpy as jnp
 import h5py
 
 from common import symmetry_maps, Meta
-from common.collectives import (barrier, device_count, gather_k_blocks,
+from common.collectives import (barrier, device_count,
                                 local_share, process_rank_world,
                                 psum_replicate, resolve_mesh)
 from common.wfn_transforms import load_kpoint_fftbox_local
@@ -186,21 +188,25 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
 #                     (1.4 MB at 12×12).  Nothing else is reduced.
 #   V_H(r) = Poisson  **REPLICATED BY DESIGN** — zero collectives; see the
 #                     step-2 comment inside ``compute_hartree_matrix``.
-#   ⟨mk|V_H|nk⟩       partitioned over k, each k computed rank-locally with
-#                     NO cross-rank reduction (a k block is independent);
-#                     combined by one ~15-35 MB all-gather.
-#   ψ                 loaded per rank for the (k, band) windows that rank
-#                     owns — process-local, never a global sharded array,
-#                     so the I/O scales with P too and no collective is
-#                     implied by the load.
+#   ⟨mk|V_H|nk⟩       ONE k-scan (``common.mtxel_sweep``): k is a trip
+#                     count, and THAT k's bands are sharded over every
+#                     process.  One reshard per k along 'x' (9.4 MB at
+#                     b600/P=64); the output stays sharded
+#                     ``P(None,'x','y')`` and is gathered only at the
+#                     boundary, by name.
+#   ψ                 for ρ: loaded per rank for the (k, band) windows that
+#                     rank owns — process-local, no collective implied.
+#                     For the matrix elements: the G-SPHERE for all k,
+#                     band-sharded and resident (≈19 MB/rank at b600/P=64).
 #
 # Why the partitions differ between the two sweeps: ρ is a sum over
-# (k, band) and both axes are free, whereas ⟨mk|V_H|nk⟩ contracts the FULL
-# band window against itself at fixed k, so bands cannot be split without
-# introducing a reduction.  k is the axis both share, and it is the one the
-# dominant sweep (matrix elements, 1.05e12 of the 1.2e12 flops at 12×12)
-# needs.  Band chunking is layered on top of the ρ sweep only when P > nk,
-# which is the only regime where k alone stops filling the machine.
+# (k, band) and both axes are free, so k alone suffices until P > nk and a
+# band chunking is layered on.  ⟨mk|V_H|nk⟩ contracts the FULL band window
+# against itself at fixed k, so splitting bands means either a reduction or
+# a two-sided split — and the two-sided split is what ``mtxel_sweep``
+# does: shard the OUTPUT ``H[m_X, n_Y]`` and replicate the contraction
+# axis.  The alternative (shard G, psum the partials) needs every rank to
+# hold a full (nb, nb) to reduce into, which is the wall being removed.
 
 
 def rho_work_items(nk: int, nocc: int, world: int) -> list[tuple[int, int, int]]:
@@ -355,26 +361,32 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
 
     Distribution: see the contract block at the head of this section.
     ρ is partitioned over (k, band-chunk) and reduced with one psum;
-    the Poisson solve is replicated; ⟨mk|V_H|nk⟩ is partitioned over k
-    with no reduction at all and gathered once.  ``mesh`` is the
-    collectives' device mesh — pass the run's own (the driver does) or
-    leave it None and one is derived, 1×1 on a single device.  P=1 is
-    bit-for-bit the serial result.
+    the Poisson solve is replicated; ⟨mk|V_H|nk⟩ is ONE k-scan with that
+    k's bands sharded over every process (``common.mtxel_sweep``).
+    ``mesh`` is the collectives' device mesh — pass the run's own (the
+    driver does) or leave it None and one is derived, 1×1 on a single
+    device.  P=1 is bit-for-bit the serial result.
 
     Needs no pseudopotentials: ρ comes from ψ, V_H from the Poisson
-    solve, and the matrix element from the same ``compute_local_V_k``
-    route V_loc takes.  ``truncation_2d`` MUST be the run's own
-    convention (deck ``sys_dim``); mixing it with V_loc's is a large
-    systematic error inside a ~500 eV cancellation.
+    solve, and the matrix element from the same normalisation chain
+    (``psp.get_DFT_mtxels.local_potential_scalars``) V_loc takes — the
+    two plans call it, so they agree by construction and differ only in
+    the reassociation the sharding forces on the G sum.
+    ``truncation_2d`` MUST be the run's own convention (deck
+    ``sys_dim``); mixing it with V_loc's is a large systematic error
+    inside a ~500 eV cancellation.
 
     Returns the FULL matrix as a host ``numpy`` array replicated on
     every rank, not the diagonal: a QSGW band rotation needs
-    ⟨m|V_H|n⟩ off-diagonals to transform H₀ into the QP basis.
+    ⟨m|V_H|n⟩ off-diagonals to transform H₀ into the QP basis.  A caller
+    that wants the SHARDED block instead calls
+    :func:`common.mtxel_sweep.sweep_matrix_elements` directly, which is
+    what ``gw.sc_iteration.rebuild_hartree_dft_basis`` does.
 
     ``owner_only=True`` (this module's CLI, whose only consumer is the
     rank-0 h5 write) assembles on rank 0 alone and returns ``None`` on
-    every other rank — see :func:`common.collectives.gather_k_blocks`.
-    Replicated consumers (gspace route, QSGW) keep the default.
+    every other rank — see :func:`common.mtxel_sweep.blocks_to_host`.
+    Replicated consumers (gspace route) keep the default.
     """
     mesh = resolve_mesh(mesh)
     _, world = process_rank_world()
@@ -423,44 +435,67 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
         expected_electrons=f_spin * float(nocc),
         print_fn=print_fn,
     )
-    # Force it back to a process-local host array so the k sweep below
-    # runs entirely in single-device land (no global operands ⇒ XLA can
-    # emit no collective there even in principle).
+    # V_H(r) is replicated (step 2), so it is closed over by the operator
+    # as a constant; nothing about it is per-k.
     V_H_r = jnp.asarray(np.asarray(V_H_r, dtype=np.float64),
                         dtype=jnp.float64)
     del rho_np
 
-    # ---- 3. ⟨mk|V_H|nk⟩: k-partitioned, no reduction, one gather ------
+    # ---- 3. ⟨mk|V_H|nk⟩: ONE k-scan, this k's bands over EVERY rank ----
     #
-    # Fixed-shape G (owner decision D10, 2026-07-30).  ``padded_gvectors``
-    # hands over the loader's OWN ``(nk, ngkmax, 3)`` table instead of
-    # slicing it back to each k's ``ngk``, so every k presents identical
-    # operand shapes: ``_compute_local_V_k_jit`` lowers ONCE instead of
-    # once per distinct ngk, and the loop becomes a sequence of dispatches
-    # of the same executable that ``collectives.sweep_local_k`` can
-    # pipeline behind a single readback.  The pad columns are made inert by
-    # ``g_mask`` — see ``PaddedGVectors`` for why the mask is mandatory
-    # rather than merely tidy (pad rows are ``(0,0,0)``, i.e. Γ).
+    # Replaces the k-partitioned ``gather_k_blocks`` sweep.  That sweep
+    # built each k's FULL-BAND FFT box on one rank (1.77 GB at b600
+    # bispinor) and could not use more than ``nk`` ranks at all — each
+    # rank took a whole k, so its wall was one full-band k however large
+    # P was.  ``sweep_matrix_elements`` scans k one at a time with that
+    # k's bands sharded over every process, so ``nk`` is a trip count and
+    # parallel efficiency is ``nb_logical/nb_padded``.  Measured
+    # b600-class at P=64, worst rank: 4.975 s / 10.83 GiB before,
+    # 2.162 s / 8.21 GiB after (jobs 7888877, 7888907).  At P = nk it is
+    # ~1.45× SLOWER — the per-k reshard is pure overhead once the old
+    # plan already fills the machine — which is expected and is the
+    # documented crossover, not a regression.
     #
-    # This supersedes the pre-D10 COMPILE NOTE, whose stated objection was
-    # that pad columns "change the summation order" of a matrix element
-    # inside H₀'s ~500 eV cancellation.  Appending exact zeros does not
-    # change a sum; what a shape change moves is XLA's reduction
-    # BLOCKING, which means the ragged route was itself carrying a
-    # per-ngk-dependent association and this route makes it uniform.
-    # Neither is a reference, so the two are compared on the merits at
-    # 1e-12 (tests/test_kin_ion_padded_gvectors.py).
+    # Fixed-shape G (owner decision D10, 2026-07-30): ``padded_gvectors``
+    # hands over the loader's OWN ``(nk, ngkmax, 3)`` table, so the scan
+    # body lowers ONCE for the whole k range.  The pad columns are made
+    # inert by ``g_mask`` — mandatory, not tidy: pad rows hold ``(0,0,0)``,
+    # a valid box index that ALIASES physical Γ, so a forgotten mask is
+    # silently wrong inside H₀'s ~500 eV cancellation rather than loud.
+    #
+    # ψ arrives on the G-SPHERE, band-sharded, resident for all k: 1.2 GB
+    # globally at b600 but ≈19 MB/rank at P=64, against the 1.77 GB ONE
+    # box the route above materialised per k.  ``band_sphere_spec`` is the
+    # single definition of that layout, shared with the loader, so no
+    # reshard is inserted between the read and the scan.
+    from common.mtxel_sweep import (SweepGeometry, band_sphere_spec,
+                                    blocks_to_host,
+                                    local_potential_operator,
+                                    sweep_matrix_elements)
     gtab = padded_gvectors(wfn, k="full_bz")
-
-    def _vh_block(ik):
-        wfn_k = load_kpoint_fftbox_local(wfn, meta, ik, nb)
-        G_pad, g_mask = gtab.at(ik)
-        return compute_local_V_k(
-            wfn_k, G_pad, V_H_r, wfn.cell_volume, g_mask=g_mask)
-
-    return gather_k_blocks(nk, _vh_block, item_shape=(nb, nb),
-                           label="vh_matrix", print_fn=print_fn,
-                           owner_only=owner_only)
+    psi_G = wfn.load(bands=(0, nb), k="full_bz", sharding=band_sphere_spec())
+    geom = SweepGeometry(mesh=mesh, fft_grid=meta.fft_grid,
+                         ngkmax=int(psi_G.shape[3]), nb=nb,
+                         ns=int(psi_G.shape[2]), nk=nk,
+                         cell_volume=float(wfn.cell_volume))
+    print_fn(f"\n⟨mk|V_H|nk⟩: one k-scan over {nk} k-points, "
+             f"{geom.nb} bands sharded over P={world}...")
+    with timing.section("vh_matrix"):
+        H_vh = sweep_matrix_elements(
+            psi_G, operator=local_potential_operator(geom, V_H_r), geom=geom,
+            gvecs=gtab.gvecs, gmask=gtab.mask,
+            box_index=wfn.box_index(k="full_bz"),
+            kvecs=np.asarray(sym.unfolded_kpts))
+        # THE BOUNDARY, stated rather than implied.  Both consumers of this
+        # function want a host ``(nk, nb, nb)``: the CLI writes it with
+        # serial h5py on rank 0 (``owner_only=True``), and
+        # ``sigma_dispatch``'s gspace route hands it to
+        # ``replicate_to_mesh`` as a replicated global operand.  Neither
+        # can take a sharded block, so the sharding is undone HERE and
+        # named.  The QSGW consumer that CAN stay sharded
+        # (``sc_iteration.rebuild_hartree_dft_basis``) calls
+        # ``sweep_matrix_elements`` directly and never reaches this line.
+        return blocks_to_host(H_vh, nb=nb, owner_only=owner_only)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -522,9 +557,10 @@ def main(argv=None):
     # This used to refuse ``srun -n P`` outright, because every rank redid
     # the whole calculation on device 0 and then overwrote the same
     # ``kin_ion.h5`` at rc=0.  Both halves of that are now fixed: the k
-    # loops below are partitioned over ranks (``collectives.gather_k_blocks``),
-    # and the write is coordinated — rank 0 alone opens the file, after a
-    # gather that has already given it every k.
+    # sweeps below are distributed (ρ over (k, band-chunk); the matrix
+    # elements over bands, one k at a time, ``common.mtxel_sweep``), and
+    # the write is coordinated — rank 0 alone opens the file, after the
+    # boundary gather that has already given it every k.
     #
     # What is still fatal is the *other* multi-rank failure mode: a
     # launcher that starts P tasks while ``jax.distributed`` sees one
@@ -711,37 +747,59 @@ def main(argv=None):
                 wfn, sym, meta, truncation_2d=ctx.truncation_2d, nb=nb_eff,
                 mesh=mesh_xy, print_fn=print0, owner_only=True)
 
-    # ---- compute kin+ion per k-point (k-partitioned, one gather) --------
+    # ---- compute kin+ion: ONE k-scan, bands sharded over every rank -----
     # ``kin_ion`` stays PRISTINE (T + V_loc + V_NL) unless --fold-hartree
     # is given: V_H rides along as its own dataset so the same file can
     # feed a run that wants the exact V_H and one that wants the ISDF
     # quadrature, and so a QSGW rotation has the full ⟨m|V_H|n⟩ matrix.
     #
-    # Same partition as the V_H matrix sweep and for the same reason: a
-    # k block of ⟨mk|T+V|nk⟩ is independent of every other, so this is
-    # embarrassingly parallel with one indexed gather at the end and no
-    # reduction anywhere.  (The two sweeps are kept separate rather than
-    # fused so that ``compute_hartree_matrix`` stays the one shared kernel
-    # all three consumers call; the price is one extra ψ read per k, which
-    # is itself now P-way parallel.)
+    # Same replacement, same reasons as ⟨mk|V_H|nk⟩ above: the k-partitioned
+    # route boxed a whole k's bands on one rank and stopped scaling at
+    # P = nk.  Here the three terms are summed ON THE KET
+    # (``sum_operators``) so ⟨m|T+V_loc+V_NL|n⟩ is ONE sweep with one
+    # reshard and one einsum, not three of each.
+    #
+    #   T       |k+G|² ψ            diagonal in G, no FFT
+    #   V_loc   F[V(r) F⁻¹ψ]        the only real-space excursion
+    #   V_NL    Z E Z† ψ            projector sum, G-local, no FFT
+    #
+    # V_NL DID fit the operator protocol: its G sum is over the replicated
+    # G axis with the band index free, so it needs no collective and forms
+    # no (nb, nb).  ``get_kin_ion_k`` is left in place — it is the per-k
+    # local-plan kernel the sweep is gated against.
     out_path = args.output or os.path.join(input_dir, "kin_ion.h5")
+    from common.mtxel_sweep import (SweepGeometry, band_sphere_spec,
+                                    blocks_to_host, kinetic_operator,
+                                    local_potential_operator, sum_operators,
+                                    sweep_matrix_elements, vnl_operator)
     gtab = padded_gvectors(wfn, k="full_bz")
-
-    def _kin_ion_block(ik):
-        wfn_k = load_kpoint_fftbox_local(wfn, meta, ik, nb_eff)
-        G_pad, g_mask = gtab.at(ik)
-        return get_kin_ion_k(wfn_k, G_pad, sym.unfolded_kpts[ik],
-                             V_loc_r, vnl_setup, wfn, g_mask=g_mask)
-
-    # ``gather_k_blocks`` records ONE ``kin_ion_k`` section around the WHOLE
-    # sweep, count 1 — not one per k.  The per-k timer this replaces only
-    # worked because ``np.asarray(H_k)`` synchronised inside it; with the
-    # readback deferred a per-k section would time the dispatch and
-    # attribute the compute to whoever happened to block next.
-    kin_ion_all = gather_k_blocks(sym.nk_tot, _kin_ion_block,
-                                  item_shape=(nb_eff, nb_eff),
-                                  label="kin_ion", print_fn=print0,
-                                  owner_only=True)
+    psi_G = wfn.load(bands=(0, nb_eff), k="full_bz",
+                     sharding=band_sphere_spec())
+    geom = SweepGeometry(mesh=mesh_xy, fft_grid=meta.fft_grid,
+                         ngkmax=int(psi_G.shape[3]), nb=nb_eff,
+                         ns=int(psi_G.shape[2]), nk=int(sym.nk_tot),
+                         cell_volume=float(wfn.cell_volume))
+    terms = [kinetic_operator(geom, np.asarray(wfn.bdot, dtype=float)),
+             local_potential_operator(geom, V_loc_r)]
+    if vnl_setup is not None:
+        terms.append(vnl_operator(geom, vnl_setup))
+    print0(f"\n⟨mk|T+V_loc+V_NL|nk⟩: one k-scan over {sym.nk_tot} k-points, "
+           f"{geom.nb} bands sharded over P={world}...")
+    # ONE ``kin_ion`` timing section around the WHOLE sweep, count 1 — not
+    # one per k.  A per-k section would time the dispatch and attribute the
+    # compute to whoever happened to block next.
+    with timing.section("kin_ion"):
+        H_kin_ion = sweep_matrix_elements(
+            psi_G, operator=sum_operators(*terms), geom=geom,
+            gvecs=gtab.gvecs, gmask=gtab.mask,
+            box_index=wfn.box_index(k="full_bz"),
+            kvecs=np.asarray(sym.unfolded_kpts))
+        # THE BOUNDARY: the sink is a serial h5py write on rank 0, which
+        # cannot take a sharded operand, so the block is gathered to the
+        # owner here and nowhere else.  ``owner_only`` keeps the peers'
+        # transient at one chunk instead of the whole (nk, nb, nb).
+        kin_ion_all = blocks_to_host(H_kin_ion, nb=nb_eff, owner_only=True)
+    del H_kin_ion, psi_G
 
     # ``owner_only``: from here on ``kin_ion_all``/``v_h_all`` exist on
     # rank 0 ONLY (None on the peers) — every consumer below is rank-0.
