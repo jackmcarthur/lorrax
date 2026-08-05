@@ -70,11 +70,23 @@ THE PLAN
 --------
 ::
 
-    psi_m_X  ←  reshard ONCE, outside the loop   # shared by ALL k and ALL operators
     scan over k:
         Opsi    ←  O ∘ psi_XY[k]                 # nb/P bands per rank
-        Opsi_Y  ←  reshard along 'x'             # the ONE per-k collective
-        H[k]    ←  einsum('bsg,nsg->bn', conj(psi_m_X[k]), Opsi_Y)
+        Opsi_Y  ←  reshard onto 'y'              # the per-k ket collective
+        psi_m_X ←  reshard psi_XY[k] onto 'x'    # the per-k bra collective
+        H[k]    ←  einsum('bsg,nsg->bn', conj(psi_m_X), Opsi_Y)
+
+BOTH reshards are per-k.  The bra one used to be hoisted out of the scan
+— one ``(nk, nb, ns, ngkmax)`` all-gather instead of ``nk`` slice-sized
+ones, on the argument that fewer collectives is fewer collectives.  That
+was measured and it is the wrong way round: at b600/P=64 (nk=16, nb=640,
+ns=2, ngkmax=11008) hoisting costs **2.220 s against 1.985 s**, 1.12×,
+and holds a 430 MiB/rank ``P(None,'x',…)`` copy of ψ live across the
+whole scan on top of the 54 MiB/rank ``('x','y')`` one (jobs 7889241,
+7889250, arms ``vh`` / ``vh_nohoist``).  Per k the same bytes move, but
+in ``nk`` pieces that overlap with the FFT round trip instead of one
+serialised block, and the mask multiply that precedes the reshard runs
+on the ``nb/(p_x·p_y)`` shard rather than the ``nb/p_x`` one.
 
 ``H`` comes out ``(nk, nb, nb)`` sharded ``P(None, 'x', 'y')`` — the
 output is sharded and the CONTRACTION axis is replicated.  The
@@ -84,8 +96,16 @@ preference; forced.
 
 A Cartesian operator (dipole) appends a length-3 REPLICATED component
 axis and comes back ``(nk, 3, nb, nb)`` at ``P(None, None, 'x', 'y')``.
-Three components ride ONE sweep rather than three, so the hoisted
-m-side reshard stays at one all-gather; only the per-k payload is 3×.
+Three components ride ONE sweep rather than three, so the bra reshard,
+the bra mask and the scan are paid once instead of three times; only the
+ket payload and the einsum are 3×.  The component axis is MINOR on the
+ket by measurement, not by convenience: carrying it LEADING instead —
+``'kbsg,kcnsg->kcbn'`` on a ``(1, 3, nb, ns, ngkmax)`` operator output,
+which also removes the ``moveaxis`` — is 3.8 % SLOWER at b600/P=64
+(1.327 s against 1.279 s, job 7889241, arms ``dip_first`` /
+``dip_last``), and the ``moveaxis`` itself costs nothing because XLA
+folds it into the copy that feeds the dot (1.288 s for a variant that
+never forms it, arm ``dip_last_nomv``).
 
 WHO GATHERS, AND WHERE IT IS SAID
 ---------------------------------
@@ -118,7 +138,14 @@ operand, which is what this module does: it reuses
 so tracers are fine) and builds the sharded transforms from the SAME
 ``fft_helpers`` factories those helpers use.  Nothing in ``fft_helpers``
 or ``wfn_transforms`` is modified or duplicated — the transform is still
-the certified shard_map'd FFI FFT, just handed a traced index.
+``fft_helpers.make_sharded_{i,}fftn_3d``, i.e. ``shard_map`` around
+XLA's own local ``jnp.fft``, just handed a traced index.  That is NOT
+the flat-k FFI handler and should not be confused with it: the FFI
+handler reads the FFT axes as the LEADING flattened one, this box has
+them minor, and routing this shape through it measured 2.0× slower
+(0.206 s against 0.104 s for the same volume, job 7889250 arm
+``fftbench``).  The FFI's win in the Σ τ kernel is avoiding a μ²-tile
+transpose; there is no such transpose here.
 
 **Consequence: the whole sweep IS wrapped in one ``jax.jit``.** The
 earlier prohibition ("do NOT wrap the body in an outer jit", job 7888526)
@@ -128,11 +155,32 @@ tracer to escape. The jit is cached in ``_KERNEL_CACHE`` — the same
 ``_cached_jit`` the transforms use — keyed on the shapes, the sharding
 and the operator identity, so it is built once and not once per call.
 
-The outer jit means the two hoisted reshards, the scan and the final
-constraint lower as ONE program, so XLA can place the ``psi_m_X`` /
-``psi_n_XY`` all-gathers relative to the scan rather than seeing them as
-separate eagerly-dispatched ops. Everything is one k at a time inside it;
-the jit changes what XLA is allowed to see, not the algorithm.
+The outer jit means the input constraint, the scan and the final
+constraint lower as ONE program, so XLA places the per-k collectives
+relative to the scan body's compute rather than seeing them as separate
+eagerly-dispatched ops. Everything is one k at a time inside it; the jit
+changes what XLA is allowed to see, not the algorithm.
+
+WHAT THE SWEEP'S WALL IS ACTUALLY MADE OF
+-----------------------------------------
+Measured at b600/P=64 (job 7889241), worst rank, median of 3, by
+substituting the operator and by running the skeleton's pieces alone:
+
+    whole sweep, local-potential operator          2.220 s   100 %
+    same skeleton with an IDENTITY operator        0.862 s    39 %
+    the per-k ket reshard alone                    0.176 s     8 %
+
+So the operator — the sphere→box gather, the FFT round trip, the V(r)
+multiply and the box→sphere gather — is 61 % of the wall and the
+collective is 8 %.  A statement that the per-k reshard is the sweep's
+cost at ``P ≤ nk`` is wrong at this shape; the box traffic is.  Two
+consequences that were tested and came out negative are recorded so they
+are not re-proposed: routing the transforms through the flat-k FFT FFI
+(``ffi.fft``) is **2.0× slower** here, 0.206 s against 0.104 s for the
+same volume, because that handler's win is avoiding a μ²-tile transpose
+and this path's box is already FFT-minor; and moving the per-k gather
+onto the other mesh axis is within noise, 0.180 s against 0.176 s
+(job 7889241, arms ``fftbench``, ``reshard_only`` / ``reshard_only_x``).
 
 A bare ``jnp.fft`` here would be the CrI3 6×6×1 80 Ry 121 GB OOM: on a
 sharded tensor XLA's planner is free to insert an all-gather and emit a
@@ -299,6 +347,44 @@ class Operator(NamedTuple):
     apply: Callable
     post: float = 1.0
     ncomp: int = 0
+    #: Runtime operands.  The sweep threads them through its own jit and
+    #: hands them to ``apply`` after ``kvec``.  Anything CLOSED OVER instead
+    #: is a jaxpr CONSTANT, which ties the compiled program to that value —
+    #: see :func:`_operator_key`.
+    consts: tuple = ()
+    #: STRUCTURAL identity for the sweep's jit cache.  See
+    #: :func:`_operator_key`; an operator that leaves it empty falls back to
+    #: ``id(apply)``, i.e. one lowering per factory call.
+    key: tuple = ()
+
+
+def _operator_key(op: "Operator") -> tuple:
+    """Structural identity of an operator, for the sweep's jit cache.
+
+    ``id(op.apply)`` is not it.  Every factory call builds a fresh closure,
+    so a caller that rebuilds its operator per iteration misses on every
+    one and re-traces, re-lowers and re-COMPILES the whole sweep — and
+    ``gw.sc_iteration.rebuild_hartree_dft_basis`` rebuilds
+    ``local_potential_operator`` once per density-SC step.  The persistent
+    compile cache does not cover it either, because V_H changes each step
+    and was baked into the module as a ``c128[nx,ny,nz]`` literal (visible
+    in the lowered HLO as ``%constant.465``).
+
+    Measured at b600/P=64, three successive sweeps with a fresh operator
+    and a perturbed V_H, CACHE-COLD: steady-state 2.394 s/iteration with
+    one XLA compile and one permanent ``_KERNEL_CACHE`` entry each, against
+    2.167 s with zero of both once the key is structural and V_H rides in
+    as an operand (job 7889250, arms ``base:recompile:cold`` and
+    ``pat:recompile:cold``).  The cache growth is the more important half:
+    it is one live executable plus its baked potential per iteration, for
+    the life of the process.
+
+    ``id(vnl_setup)`` inside a key is deliberate and safe: the cache entry
+    holds the jitted ``_run``, which holds the operator closure, which
+    holds the setup, so the id cannot be recycled onto a different object
+    while the entry lives.
+    """
+    return tuple(op.key) if op.key else ('id', id(op.apply))
 
 
 def kinetic_operator(geom: SweepGeometry, bdot) -> Operator:
@@ -317,11 +403,13 @@ def kinetic_operator(geom: SweepGeometry, bdot) -> Operator:
     """
     from psp.get_DFT_mtxels import kinetic_diagonal
 
-    def op(psi_n, gvec, gmask, bidx, kvec):
-        T_G = kinetic_diagonal(gvec, kvec, bdot, g_mask=gmask)
+    def op(psi_n, gvec, gmask, bidx, kvec, bdot_j):
+        T_G = kinetic_diagonal(gvec, kvec, bdot_j, g_mask=gmask)
         return psi_n * T_G[None, None, None, :].astype(psi_n.dtype)
 
-    return Operator(apply=op, post=1.0)
+    return Operator(apply=op, post=1.0,
+                    consts=(jnp.asarray(np.asarray(bdot, dtype=np.float64)),),
+                    key=('kinetic', geom.ngkmax, geom.ns))
 
 
 def local_potential_operator(geom: SweepGeometry, V_r) -> Operator:
@@ -362,7 +450,7 @@ def local_potential_operator(geom: SweepGeometry, V_r) -> Operator:
     fft_norm = float(_sc.fft_norm)
     V_r_j = jnp.asarray(V_r, dtype=jnp.complex128)
 
-    def op(psi_n, gvec, gmask, bidx, kvec):
+    def op(psi_n, gvec, gmask, bidx, kvec, V_r_j):
         # sphere → box.  ``_box_kernel`` is reused verbatim: it is pure
         # jax, band sharding rides through (the gather is over the G
         # axis, no cross-rank op), and its ngkmax zero-slot makes the
@@ -379,7 +467,15 @@ def local_potential_operator(geom: SweepGeometry, V_r) -> Operator:
         out = phi_G[..., gx, gy, gz]
         return out * gmask[None, None, None, :].astype(out.dtype)
 
-    return Operator(apply=op, post=float(_sc.post))
+    # V(r) rides in as an OPERAND, not as a closed-over constant.  It is the
+    # only input of this operator that moves between calls, and baking it
+    # ties one compiled sweep to one V_H — a full lowering per density-SC
+    # step (:func:`_operator_key`).  The scalars above stay literals: they
+    # are functions of the geometry and do not move.
+    return Operator(apply=op, post=float(_sc.post), consts=(V_r_j,),
+                    key=('local_potential', geom.fft_grid, geom.ngkmax,
+                         geom.ns, scale, deltaV, fft_norm,
+                         tuple(int(d) for d in V_r_j.shape)))
 
 
 def _ket(psi_n, gmask):
@@ -451,7 +547,8 @@ def vnl_operator(geom: SweepGeometry, vnl_setup) -> Operator:
         out = vnl_ops.apply_vnl(psi[:, :ns_e], kdata.Z, kdata.E_super)
         return _pad_spinor(out, int(psi.shape[1]))[None]
 
-    return Operator(apply=op, post=1.0)
+    return Operator(apply=op, post=1.0,
+                    key=('vnl', geom.ngkmax, geom.ns, id(vnl_setup)))
 
 
 def dipole_operator(geom: SweepGeometry, *, bvec, blat,
@@ -478,7 +575,7 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
     B = jnp.asarray(np.asarray(bvec, dtype=np.float64) * float(blat),
                     dtype=jnp.float64)
 
-    def op(psi_n, gvec, gmask, bidx, kvec):
+    def op(psi_n, gvec, gmask, bidx, kvec, B):
         psi = _ket(psi_n, gmask)
         v = apply_kinetic_velocity_to_ket(psi, gvec, kvec, B)
         if vnl_setup is not None:
@@ -490,7 +587,9 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
             v = v - _pad_spinor(v_nl, int(psi.shape[1]))
         return jnp.moveaxis(v, 0, -1)[None]
 
-    return Operator(apply=op, post=1.0, ncomp=3)
+    return Operator(apply=op, post=1.0, ncomp=3, consts=(B,),
+                    key=('dipole', geom.ngkmax, geom.ns, float(blat),
+                         None if vnl_setup is None else id(vnl_setup)))
 
 
 def sum_operators(*ops: Operator) -> Operator:
@@ -518,16 +617,26 @@ def sum_operators(*ops: Operator) -> Operator:
             f"{ncomp}, operands {bad} do not.  A scalar and a Cartesian "
             f"operator do not add.")
 
-    def op(psi_n, gvec, gmask, bidx, kvec):
+    # Each term keeps its OWN consts; the sum concatenates them and hands
+    # every term back its own span, so one operand list serves the sweep and
+    # no term learns anything about its neighbours.
+    spans, off = [], 0
+    for o in ops:
+        spans.append((off, off + len(o.consts)))
+        off += len(o.consts)
+    all_consts = tuple(c for o in ops for c in o.consts)
+
+    def op(psi_n, gvec, gmask, bidx, kvec, *cs):
         acc = None
-        for o in ops:
-            term = o.apply(psi_n, gvec, gmask, bidx, kvec)
+        for (a, b), o in zip(spans, ops):
+            term = o.apply(psi_n, gvec, gmask, bidx, kvec, *cs[a:b])
             if o.post != 1.0:
                 term = term * o.post
             acc = term if acc is None else acc + term
         return acc
 
-    return Operator(apply=op, post=1.0, ncomp=ncomp)
+    return Operator(apply=op, post=1.0, ncomp=ncomp, consts=all_consts,
+                    key=('sum',) + tuple(_operator_key(o) for o in ops))
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +710,13 @@ def sweep_matrix_elements(
     have to reason about.  The cost of always masking is one multiply per
     operand per k against a ``(ngkmax,)`` vector.  That is not worth a
     decision, so there is no decision to make.
+
+    Now priced, so the question stays closed: dropping the bra-side mask
+    entirely is 2.208 s against 2.220 s at b600/P=64, i.e. inside the
+    noise (job 7889241, arms ``vh`` / ``vh_nomask``).  The lowered HLO
+    says why — the mask is fused into the ``kLoop`` copy that already has
+    to lay the bra out as ``c128[nb/p_x, ns·ngkmax]`` for the dot, so it
+    costs a multiply on bytes that were being touched anyway.
     """
     mesh = geom.mesh
     nk = geom.nk
@@ -638,33 +754,47 @@ def sweep_matrix_elements(
     # replicated component axis through the SAME contraction.
     contraction = 'kbsg,knsg->kbn' if not ncomp else 'kbsg,knsgc->kcbn'
 
-    def _run(psi, gvecs_, gmask_, bidx_, kvecs_):
-        # THE HOISTED RESHARD.  ψ_m is never transformed, so the column
-        # layout is built ONCE and reused across every k *and* every
-        # operator: nk+1 all-gathers for a sweep, not 2·nk, and not 3× that
-        # for three sweeps.  ≈151 MB/rank at b600/P=64.
-        #
-        # The X and Y copies are the POINT, not a cost to be optimised
-        # away (owner, 2026-08-04): ⟨m|O|n⟩ contracts every m with every
-        # n, so one copy sharded on 'x' and one on 'y' is what spreads
-        # that contraction over the mesh instead of over one axis of it.
-        psi_m_X = jax.lax.with_sharding_constraint(
-            psi, NamedSharding(mesh, geom.spec_sphere_x))
+    # The operator's runtime operands.  They are jit ARGUMENTS, so one
+    # executable serves every value of them; anything the operator closes
+    # over instead is a jaxpr constant and forces a lowering per value.
+    op_consts = tuple(jnp.asarray(c) for c in operator.consts)
+
+    def _run(psi, gvecs_, gmask_, bidx_, kvecs_, *consts_):
+        # ONE resident layout.  ⟨m|O|n⟩ contracts every m with every n, so
+        # the bra must reach 'x' and the ket 'y' — that split is the POINT,
+        # not a cost to be optimised away (owner, 2026-08-04) — but BOTH
+        # are reached per k, from this one ``('x','y')`` copy.  Hoisting the
+        # bra's ``P(None,'x',…)`` copy out of the scan was measured slower
+        # and 430 MiB/rank heavier at b600/P=64; see the module docstring.
         psi_n_XY = jax.lax.with_sharding_constraint(
             psi, NamedSharding(mesh, geom.spec_sphere_xy))
 
         def one_k(ik_psi_n, ik_psi_m, gvec, gm, bidx, kvec):
             """The body.  Identical under scan and under the Python loop."""
-            Opsi = operator.apply(ik_psi_n, gvec, gm, bidx, kvec)
+            Opsi = operator.apply(ik_psi_n, gvec, gm, bidx, kvec, *consts_)
 
-            # THE ONE PER-K COLLECTIVE, expressed as a re-shard rather than a
-            # hand-rolled all-gather: XLA inserts it, and it is along 'x'
-            # only, not a global collective.  Payload is the sphere-space
-            # operator output (9.4 MB at b600/P=64), never the r-space box.
+            # THE PER-K KET COLLECTIVE, expressed as a re-shard rather than
+            # a hand-rolled all-gather: XLA inserts it.  Payload is the
+            # sphere-space operator output, never the r-space box —
+            # 3.4 MiB/rank in, 26.9 MiB/rank out at b600/P=64.
+            #
+            # It lowers to TWO instructions, not one (HLO read at
+            # b600/P=64, job 7889241): a ``collective-permute`` of the whole
+            # shard that transposes the 8×8 rank grid, then an
+            # ``all-gather`` over ``replica_groups=[8,8]<=[8,8]T(1,0)``,
+            # i.e. the STRIDED 'x' groups.  The permute is what makes
+            # ``('x','y') → 'y'`` expressible as a contiguous gather at all,
+            # and it is a global exchange, not an 'x'-local one.  Both are
+            # inside the scan body; the whole per-k collective measures
+            # 0.176 s of the sweep's 2.220 s, and issuing it over the other
+            # mesh axis instead is 0.180 s, i.e. within noise.
             Opsi_Y = jax.lax.with_sharding_constraint(
                 Opsi, NamedSharding(
                     mesh, geom.with_comp(geom.spec_sphere_y, ncomp)))
 
+            # THE PER-K BRA COLLECTIVE.  The mask runs FIRST, on the
+            # ``('x','y')`` shard, so the multiply touches nb/(p_x·p_y)
+            # bands and only the masked result is gathered onto 'x'.
             m_side = ik_psi_m * gm[None, None, None, :].astype(ik_psi_m.dtype)
             m_side_X = jax.lax.with_sharding_constraint(
                 m_side, NamedSharding(mesh, geom.spec_sphere_x))
@@ -677,7 +807,15 @@ def sweep_matrix_elements(
         if not use_scan:
             # Reference control.  Same arithmetic and shardings, Python
             # control flow — so a scan-vs-loop disagreement is the scan.
-            out = [one_k(psi_n_XY[ik:ik + 1], psi_m_X[ik:ik + 1],
+            # It is ALSO 1.33× faster at b600/P=64 (1.674 s against
+            # 2.220 s, job 7889250 arm ``vh_unrollfull``): the scan's while
+            # body serialises the per-k collective against the compute that
+            # XLA can overlap once the trip is unrolled.  Not the default,
+            # because unrolling makes the module — and the compile — linear
+            # in nk, which at a 12×12 deck's nk=144 is the cost
+            # ``gw.v_q_g_flat`` moved to a scan to escape.  Left as the
+            # caller's flag, with the number attached.
+            out = [one_k(psi_n_XY[ik:ik + 1], psi_n_XY[ik:ik + 1],
                          gvecs_[ik], gmask_[ik], bidx_[ik:ik + 1],
                          kvecs_[ik])
                    for ik in range(nk)]
@@ -685,25 +823,27 @@ def sweep_matrix_elements(
                 jnp.concatenate(out, axis=0), block_sharding)
 
         def body(carry, xs):
-            psi_n_k, psi_m_k, gvec, gm, bidx, kvec = xs
+            psi_k, gvec, gm, bidx, kvec = xs
             # scan strips the leading axis; put the singleton k axis back
             # so every shape inside the body matches the non-scan path.
-            blk = one_k(psi_n_k[None], psi_m_k[None], gvec, gm,
-                        bidx[None], kvec)
+            # ONE ψ operand serves both sides: the bra and the ket start
+            # from the same ``('x','y')`` slice and are resharded inside.
+            blk = one_k(psi_k[None], psi_k[None], gvec, gm, bidx[None], kvec)
             return carry, blk[0]
 
         _, H = jax.lax.scan(
-            body, None,
-            (psi_n_XY, psi_m_X, gvecs_, gmask_, bidx_, kvecs_))
+            body, None, (psi_n_XY, gvecs_, gmask_, bidx_, kvecs_))
         return jax.lax.with_sharding_constraint(H, block_sharding)
 
     fn = _cached_jit(
         'sweep_matrix_elements',
         (psi.shape, geom.ngkmax, geom.ns, nk, bool(use_scan),
-         id(operator.apply), float(operator.post), ncomp,
-         geom.fft_grid, _sharding_key(psi)),
+         _operator_key(operator), float(operator.post), ncomp,
+         geom.fft_grid, _sharding_key(psi),
+         tuple((tuple(int(d) for d in c.shape), str(c.dtype))
+               for c in op_consts)),
         lambda: jax.jit(_run))
-    return fn(psi, gvecs_j, gmask_j, bidx_j, kvecs_j)
+    return fn(psi, gvecs_j, gmask_j, bidx_j, kvecs_j, *op_consts)
 
 
 # ---------------------------------------------------------------------------

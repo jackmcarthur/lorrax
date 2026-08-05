@@ -283,10 +283,17 @@ def main():
         blat = 1.0
     wfn_stub = _Wfn()
     n_elec = f_spin * float(np.einsum('k,kn->', kweights, occ))
+    # No ``U=``: ``hartree_from_orbitals`` lost that argument at d70e7fa
+    # ("one rotation instead of two"), which made ψ̃ the CALLER's job via
+    # ``rotate_bands``.  The gate kept passing ``U=None`` and has therefore
+    # been dying with ``TypeError`` at this line ever since — after
+    # printing PASS for checks 1-8, so the failure reads as a green gate
+    # unless the return code is checked (job 7889252).  ``psi_j`` is
+    # unrotated here, which is what ``U=None`` used to mean.
     rho_e2e, V_H_r = hartree_from_orbitals(
         psi_j, occ, kweights, wfn_stub, mesh=mesh, box_index=bidx,
         fft_grid=GRID, truncation_2d=False, spin_degeneracy=f_spin,
-        sym_perm=ident_perm, U=None, expected_electrons=n_elec,
+        sym_perm=ident_perm, expected_electrons=n_elec,
         print_fn=(lambda *a, **k: None))
     V_H_r = np.asarray(V_H_r)
     ok9a = V_H_r.shape == GRID

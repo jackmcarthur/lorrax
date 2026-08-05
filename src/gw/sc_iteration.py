@@ -521,7 +521,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         wfns=wfns_qp, V_q=inputs.V_q, W_by_role=W_by_role,
-        e_qp_ev=np.asarray(E_qp_ry) * RYD_TO_EV,
+        # FULL-BZ E, for the same reason as hartree_basis_rotation above:
+        # every operand compute_sigma_xc sees is on the full BZ.
+        e_qp_ev=np.asarray(E_full) * RYD_TO_EV,
         static_head_terms=inputs.static_head_terms,
         head_resolver=inputs.head_resolver,
         quad=inputs.quad, e_ref=inputs.e_ref,
@@ -531,7 +533,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         input_dir=inputs.input_dir,
         # The stored/gspace V_H lives in the DFT basis; this is the U that
         # takes it into the basis ``wfns_qp`` is expressed in.
-        hartree_basis_rotation=U_qp,
+        # FULL-BZ U: everything compute_sigma_xc touches -- wfns_qp, the
+        # resolved external V_H, every Sigma channel -- is on the full BZ.
+        # The IBZ U_qp would mismatch resolve_external_hartree's k axis
+        # (measured: einsum 'k' 10 vs 16).  Selection to the IBZ happens
+        # once, below, after this returns.
+        hartree_basis_rotation=U_full,
         omit_v_h=v_h_dft_new is not None,
         write_sigma_omega_h5=False,
         print_fn=inputs.print_fn,
@@ -1160,8 +1167,13 @@ def dump_qp_wfn_artifacts(
     """
     from file_io.qp_wfn import write_qp_rotations_h5, write_qp_wfn_h5
 
+    # NO broadcast here: write_qp_wfn_h5 requires ``wfn.nkpts`` -- the WFN
+    # file's own IBZ count (qp_wfn.py:136) -- because a WFN file stores the
+    # IBZ by BGW convention.  So this consumer's natural k-set IS the loop's
+    # when sc_on_ibz is on, and broadcasting would break it.  Consumers do
+    # not share one k-set; each states its own.
     enk_qp_ry, U_kmn, efermi_ry = final_qp_eigenstates(
-        state, n_occ=n_occ, mesh_xy=mesh_xy, kstar=kstar)
+        state, n_occ=n_occ, mesh_xy=mesh_xy, kstar=None)
     qp_wfn_path = os.path.join(output_dir, "WFN_qp.h5")
     qp_rot_path = os.path.join(output_dir, "qp_wfn_rotations.h5")
     if jax.process_index() == 0:

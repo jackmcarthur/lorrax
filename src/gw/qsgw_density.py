@@ -268,7 +268,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
 
     def build():
         @jax.jit
-        def fn(psi_, U_, occ_, w_, bidx_):
+        def fn(psi_, U_, occ_, w_, bidx_, sp_):
             psi_xy = jax.lax.with_sharding_constraint(psi_, band_xy)
             if have_U:
                 # m on 'y' so the contraction reduces along 'y' alone.
@@ -308,7 +308,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                 body, rho0, (psi_xy, psi_mx, U_xs, occ_, w_, bidx_))
             rho = jax.lax.with_sharding_constraint(rho, rho_sharding)
             if sym_perm is not None:
-                rho = symmetrise_density(rho, sym_perm)
+                rho = symmetrise_density(rho, sp_)
                 rho = jax.lax.with_sharding_constraint(rho, rho_sharding)
             return rho
         return fn
@@ -319,7 +319,16 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
          have_U, None if sym_perm is None else tuple(np.shape(sym_perm)),
          _sharding_key(psi)),
         build)
-    return fn(psi, U_j, occ_j, w_j, bidx_j)
+    # sym_perm is an OPERAND, not a closure.  The cache key can only carry
+    # its SHAPE, so two different permutation tables of the same
+    # (n_sym, N_r) would otherwise reuse the first one's compiled kernel and
+    # return a silently wrong star average -- the one failure the
+    # symmetrisation refusal above cannot catch, since an unsymmetrised or
+    # WRONGLY symmetrised rho still integrates to the exact electron count.
+    # Same class as V_r baked in as a jit constant (audit 2026-08-05).
+    sp_j = (jnp.zeros((1, 1), dtype=jnp.int32) if sym_perm is None
+            else jnp.asarray(sym_perm, dtype=jnp.int32))
+    return fn(psi, U_j, occ_j, w_j, bidx_j, sp_j)
 
 
 def rho_r_to_G(rho_r, *, mesh: Mesh):
