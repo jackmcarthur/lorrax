@@ -415,8 +415,27 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                     np.eye(nb, dtype=np.complex128), H_np.shape),
                 rep3)
     if E_qp_ry is None:
-        E_qp_ry, U_qp, efermi_ry = _diagonalize_and_get_efermi(
-            state.H_qp_dft, n_occ, inputs.mesh_xy)
+        # DISTRIBUTED EIGH when density-SC is on.  ``_diagonalize_and_get_efermi``
+        # k-shards the eigh but allgathers U back to REPLICATED, i.e. every
+        # rank holds the whole (nk, nb, nb) -- 9.2 GB at nb=2000/nk=144, and
+        # one (nb,nb) tile alone is 1.6 GB at nb=1e4.  ``distributed_eigh_bands``
+        # spreads each tile over the mesh instead (owner ruling 2026-08-04:
+        # robustness at 1e4+ bands over speed at 1e3, where the native batch
+        # wins by ~ndev).  E_F then comes from the k-weighted step routine
+        # rather than the fixed-band-cut midgap, which is the general answer
+        # and the one the IBZ needs.
+        if bool(getattr(inputs.config, "density_self_consistent", False)):
+            from gw.qsgw_density import distributed_eigh_bands
+            from gw.efermi import fermi_level_step
+            E_qp_ry, U_qp = distributed_eigh_bands(
+                state.H_qp_dft, mesh=inputs.mesh_xy)
+            nk_loc = int(np.asarray(E_qp_ry).shape[0])
+            efermi_ry = fermi_level_step(
+                np.asarray(E_qp_ry), np.full(nk_loc, 1.0 / nk_loc),
+                float(n_occ))
+        else:
+            E_qp_ry, U_qp, efermi_ry = _diagonalize_and_get_efermi(
+                state.H_qp_dft, n_occ, inputs.mesh_xy)
 
     # Rotate the active subspace of the DFT bundle to this iteration's QP
     # basis.  Bands outside ``slices.sigma`` keep their DFT ψ + DFT energy
