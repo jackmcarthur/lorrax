@@ -1,0 +1,13 @@
+# Exciton bandstructure E_S(Q), TDA, LORRAX
+# input: /pscratch/sd/j/jackm/lorrax_sandbox/sources/worktrees/lorrax_A_bse_integration/tmp/coarsew/smoke/exb44.in
+# window: n_val=4 n_cond=4; n_eig=6; kgrid 6x6x1; vq_mode=interp
+# conventions: |v k, c k+Q>; exchange tile at wrap(-Q) keeps G=0 at finite Q (energy_loss); Gamma uses the production q=0 head-body tile; energies in eV
+# nodes: 0:G 5:M 6:K
+# iQ  s_path  Qx  Qy  Qz  mode  E_1..E_neig (eV)
+   0 0.000000  0.000000  0.000000  0.000000 interp 1.459964 1.460254 1.472557 1.473476 1.588325 1.588339
+   1 0.762349  0.000000  0.100000  0.000000 interp 1.631564 1.633087 1.659120 1.688960 1.763579 1.773071
+   2 1.524698  0.000000  0.200000  0.000000 interp 1.778490 1.779222 1.795776 1.806899 1.880600 1.889173
+   3 2.287046  0.000000  0.300000  0.000000 interp 1.764276 1.764880 1.765788 1.774296 1.861203 1.870319
+   4 3.049395  0.000000  0.400000  0.000000 interp 1.683717 1.684201 1.721924 1.766704 1.822831 1.825206
+   5 3.811744  0.000000  0.500000  0.000000 interp 1.547059 1.547195 1.600870 1.646281 1.685578 1.710258
+   6 6.012235  0.333300  0.333300  0.000000 interp 1.452828 1.465749 1.580166 1.591214 1.605569 1.608594

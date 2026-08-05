@@ -1,0 +1,1 @@
+/pscratch/sd/j/jackm/lorrax_sandbox/runs/MoS2/A_bse_w0_resolvent_2026-07-16/interp_study/mos2_6x6/lorrax/centroids_frac_640.txt
