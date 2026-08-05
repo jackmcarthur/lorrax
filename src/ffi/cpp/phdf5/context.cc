@@ -154,43 +154,92 @@ static bool env_flag(const char* name, bool default_value) {
     return s == "1" || s == "true" || s == "yes" || s == "on";
 }
 
-// Grow the staging buffer to >= need_bytes.  The read core H5Dreads into
-// this buffer identically on both platforms; only the allocator differs —
-// cudaMallocHost (page-locked, for fast async H2D) on the CUDA build vs a
-// plain aligned host malloc on the host build, where the staging tail is a
-// std::memcpy and page-locking would be pointless.
-bool ensure_pinned(PhdfCtx* ctx, size_t need_bytes) {
-    if (ctx->pinned_capacity >= need_bytes) return true;
-    if (ctx->pinned_buf) {
+// Free one staging buffer through the allocator that made it.
+static void staging_free(void* p) {
+    if (!p) return;
 #ifdef LORRAX_FFI_NO_CUDA
-        std::free(ctx->pinned_buf);
+    std::free(p);
 #else
-        cudaFreeHost(ctx->pinned_buf);
+    cudaFreeHost(p);
 #endif
-        ctx->pinned_buf = nullptr;
-        ctx->pinned_capacity = 0;
+}
+
+// Grow *slot to >= need_bytes.  H5Dread/H5Dwrite land in these buffers
+// identically on both platforms; only the allocator differs — cudaMallocHost
+// (page-locked, for fast async H2D) on the CUDA build vs a plain aligned host
+// malloc on the host build, where the staging tail is a std::memcpy and
+// page-locking would be pointless.
+static bool ensure_staging(void** slot, size_t* capacity, size_t need_bytes,
+                           const char* who) {
+    if (*capacity >= need_bytes) return true;
+    // Round up to a multiple of 2 MiB to reduce re-allocation churn across
+    // transfers of slightly varying sizes.  The round-up is where an absurd
+    // request stops being absurd and starts being SMALL: need_bytes near
+    // SIZE_MAX wraps to a few bytes, the allocation succeeds, and the caller
+    // then memsets/reads far past it.  Refuse before rounding.
+    const size_t kChunk = (size_t)2 << 20;
+    if (need_bytes > SIZE_MAX - (kChunk - 1)) {
+        std::fprintf(stderr,
+            "[phdf5 ERROR] %s: staging request of %zu bytes cannot be "
+            "rounded without overflowing size_t\n", who, need_bytes);
+        std::fflush(stderr);
+        return false;
     }
-    // Round up to a multiple of 2 MiB to reduce re-allocation churn
-    // across writes of slightly varying sizes.
-    size_t rounded = ((need_bytes + (2 << 20) - 1) / (2 << 20)) * (2 << 20);
+    staging_free(*slot);
+    *slot = nullptr;
+    *capacity = 0;
+    const size_t rounded = ((need_bytes + kChunk - 1) / kChunk) * kChunk;
 #ifdef LORRAX_FFI_NO_CUDA
     // 64-byte aligned so the H5Dread lands on a cache-line boundary
     // (rounded is a 2-MiB multiple, so it satisfies aligned_alloc's
     // size-multiple-of-alignment requirement).
-    ctx->pinned_buf = std::aligned_alloc(64, rounded);
-    if (ctx->pinned_buf == nullptr) {
-        ctx->pinned_capacity = 0;
-        return false;
-    }
+    *slot = std::aligned_alloc(64, rounded);
+    if (*slot == nullptr) return false;
 #else
-    if (cudaMallocHost(&ctx->pinned_buf, rounded) != cudaSuccess) {
-        ctx->pinned_buf = nullptr;
-        ctx->pinned_capacity = 0;
+    if (cudaMallocHost(slot, rounded) != cudaSuccess) {
+        *slot = nullptr;
         return false;
     }
 #endif
-    ctx->pinned_capacity = rounded;
+    *capacity = rounded;
     return true;
+}
+
+// WRITER-THREAD staging (ctx.h OWNERSHIP).
+bool ensure_pinned(PhdfCtx* ctx, size_t need_bytes) {
+#ifdef LORRAX_FFI_NO_CUDA
+    // Host build: ``pinned_buf`` has exactly one producer, the writer thread
+    // (H5Dwrite reads the XLA input buffer in place, so the write path never
+    // stages).  Enforce it rather than assert it in a comment: the buffer's
+    // whole safety argument is "one thread, one FIFO queue", and the audit's
+    // item 4 was precisely a second, synchronous entry point that nothing
+    // stopped anyone from adding.  Now the first such call fails, by name,
+    // instead of corrupting a read months later.  Synchronous readers have
+    // their own buffer — use ``ensure_read_buf``.
+    const unsigned long long me =
+        (unsigned long long)std::hash<std::thread::id>{}(
+            std::this_thread::get_id());
+    const unsigned long long owner = ctx->writer_tid_hash.load(
+        std::memory_order_acquire);
+    if (owner == 0 || owner != me) {
+        std::fprintf(stderr,
+            "[phdf5 ERROR rank=%d] ensure_pinned called off the writer "
+            "thread.  ctx->pinned_buf is writer-thread-only on the host "
+            "build (ctx.h OWNERSHIP); a synchronous handler that stages must "
+            "use ensure_read_buf, or be routed through the writer queue.\n",
+            ctx->rank);
+        std::fflush(stderr);
+        return false;
+    }
+#endif
+    return ensure_staging(&ctx->pinned_buf, &ctx->pinned_capacity,
+                          need_bytes, "ensure_pinned");
+}
+
+// SYNCHRONOUS-READER staging (ctx.h OWNERSHIP).
+bool ensure_read_buf(PhdfCtx* ctx, size_t need_bytes) {
+    return ensure_staging(&ctx->read_buf, &ctx->read_capacity,
+                          need_bytes, "ensure_read_buf");
 }
 
 // -----------------------------------------------------------------
@@ -216,8 +265,55 @@ static hid_t h5_open_or_create(const std::string& path, int mode_flag, hid_t fap
     }
 }
 
+// Undo a PARTIALLY built ctx.
+//
+// ``open_ctx`` allocates a PhdfCtx and then creates, in order, an MPI_Info,
+// four property lists, the file and (on CUDA) a stream and two events — and
+// throws from a dozen places in between.  Every one of those throws used to
+// leak the whole partial context: the ctx itself, whichever hid_t's already
+// existed, and the MPI_Info.  Leaking an hid_t is not merely untidy here,
+// because HDF5's library-wide id table then reports open objects at
+// H5Fclose and the real error arrives wearing a second, spurious one.
+// Called only before ``writer_thread`` is started, so there is no thread to
+// join and no queue to drain.
+static void abandon_partial_ctx(PhdfCtx* ctx, MPI_Info* info) noexcept {
+    if (info && *info != MPI_INFO_NULL) MPI_Info_free(info);
+    if (!ctx) return;
+    if (ctx->file_id    >= 0) H5Fclose(ctx->file_id);
+    if (ctx->dxpl_coll  >= 0) H5Pclose(ctx->dxpl_coll);
+    if (ctx->dxpl_indep >= 0) H5Pclose(ctx->dxpl_indep);
+    if (ctx->dcpl_id    >= 0) H5Pclose(ctx->dcpl_id);
+    if (ctx->fapl_id    >= 0) H5Pclose(ctx->fapl_id);
+    if (ctx->fcpl_id    >= 0) H5Pclose(ctx->fcpl_id);
+#ifndef LORRAX_FFI_NO_CUDA
+    if (ctx->d2h_event) cudaEventDestroy(ctx->d2h_event);
+    if (ctx->h2d_event) cudaEventDestroy(ctx->h2d_event);
+    if (ctx->stream)    cudaStreamDestroy(ctx->stream);
+#endif
+    delete ctx;
+}
+
+static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
+                              int rank, int world_size, int mode_flag,
+                              PhdfCtx** ctx_out, MPI_Info* info_out);
+
 PhdfCtx* open_ctx(const std::string& path, int p, int q,
                   int rank, int world_size, int mode_flag)
+{
+    PhdfCtx* ctx = nullptr;
+    MPI_Info info = MPI_INFO_NULL;
+    try {
+        return open_ctx_impl(path, p, q, rank, world_size, mode_flag,
+                             &ctx, &info);
+    } catch (...) {
+        abandon_partial_ctx(ctx, &info);
+        throw;
+    }
+}
+
+static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
+                              int rank, int world_size, int mode_flag,
+                              PhdfCtx** ctx_out, MPI_Info* info_out)
 {
     // Covers the thread-level guard too — it lives in
     // ensure_mpi_initialized now (see the note there), so the eager
@@ -225,6 +321,7 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     ensure_mpi_initialized();
 
     auto* ctx = new PhdfCtx{};
+    *ctx_out = ctx;
     ctx->path = path;
     ctx->p = p;
     ctx->q = q;
@@ -262,6 +359,10 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     // Alignment default matches the new striping_unit default (4 MiB) so
     // H5 objects start on Lustre stripe boundaries.
     long align_mb        = env_long("LORRAX_PHDF5_ALIGN_MB", 4);
+    // Clamp before the shift: a typo'd LORRAX_PHDF5_ALIGN_MB of 2^50 wraps
+    // ``<< 20`` around size_t and hands H5Pset_alignment a small or absurd
+    // threshold with no complaint.  16 GiB is far past any useful value.
+    if (align_mb > (1L << 14)) align_mb = 1L << 14;
     ctx->align_threshold = (align_mb > 0) ? (size_t)align_mb << 20 : 0;
     ctx->align_length    = ctx->align_threshold;
 
@@ -300,6 +401,7 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     // thing in every writer: ROMIO decides.
     MPI_Info info = MPI_INFO_NULL;
     MPI_Info_create(&info);
+    *info_out = info;                       // so a throw below still frees it
     auto info_set = [&](const char* key, const char* val) {
         MPI_Info_set(info, const_cast<char*>(key), const_cast<char*>(val));
     };
@@ -356,6 +458,10 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
         long parsed = std::strtol(b, nullptr, 10);
         if (parsed > 0) stripe_bytes = parsed;
     }
+    // A non-positive striping_unit is not a hint ROMIO can act on; keep the
+    // default rather than pass "0" or a negative through (strtod on "-4M",
+    // or a v*mult that overflowed, both land here).
+    if (stripe_bytes <= 0) stripe_bytes = 4L << 20;
     {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%ld", stripe_bytes);
@@ -369,6 +475,7 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
         throw std::runtime_error("H5Pset_fapl_mpio failed");
     }
     MPI_Info_free(&info);
+    *info_out = MPI_INFO_NULL;              // handed to HDF5, ours no longer
     // Use the latest HDF5 format version — enables modern layout and avoids
     // the 2 GB dataset size cap in the legacy format.  Recommended by NERSC.
     H5Pset_libver_bounds(ctx->fapl_id, H5F_LIBVER_LATEST, H5F_LIBVER_LATEST);
@@ -480,6 +587,14 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
 #ifndef LORRAX_FFI_NO_CUDA
         cudaSetDevice(ctx->cuda_device);
 #endif
+        // Publish this thread's identity BEFORE any task can run; it is what
+        // ``ensure_pinned`` checks on the host build (ctx.h OWNERSHIP).  A
+        // task can only be picked up inside the loop below, so every legal
+        // caller observes the published value.
+        ctx->writer_tid_hash.store(
+            (unsigned long long)std::hash<std::thread::id>{}(
+                std::this_thread::get_id()),
+            std::memory_order_release);
         for (;;) {
             std::function<void()> task;
             {
@@ -491,7 +606,23 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
                 task = std::move(ctx->task_queue.front());
                 ctx->task_queue.pop_front();
             }
-            task();
+            // A task that escapes with an exception never sets its Promise,
+            // so the Future never resolves and the rank hangs INSIDE the
+            // collective its peers are waiting in — the failure signature
+            // that cost 2026-08-02.  We cannot rescue the Promise from here
+            // (it was moved into the task), so terminate is the honest
+            // outcome; say what happened first, flushed, because a message
+            // written as the process dies is otherwise lost under
+            // srun+apptainer.
+            try {
+                task();
+            } catch (const std::exception& e) {
+                std::fprintf(stderr,
+                    "[phdf5 ERROR rank=%d] writer-thread task threw: %s\n",
+                    ctx->rank, e.what());
+                std::fflush(stderr);
+                throw;
+            }
         }
     });
 
@@ -588,6 +719,26 @@ hid_t ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
     }
     if (ndim <= 0) {
         throw std::runtime_error("phdf5 ensure_dataset: ndim must be >= 1");
+    }
+    if (ndim > H5S_MAX_RANK) {
+        throw std::runtime_error(
+            "phdf5 ensure_dataset: ndim " + std::to_string(ndim) +
+            " exceeds HDF5's maximum dataspace rank " +
+            std::to_string((int)H5S_MAX_RANK));
+    }
+    if (shape == nullptr) {
+        throw std::runtime_error("phdf5 ensure_dataset: shape is null");
+    }
+    // A negative extent becomes a colossal hsize_t two lines further down;
+    // H5Screate_simple then fails with a message about a shape nobody asked
+    // for.  Name the actual mistake.  Rank-invariant: replicated arguments.
+    for (int i = 0; i < ndim; ++i) {
+        if (shape[i] < 0) {
+            throw std::runtime_error(
+                "phdf5 ensure_dataset: negative extent " +
+                std::to_string((long long)shape[i]) + " at dim " +
+                std::to_string(i) + " of '" + ds_name + "'");
+        }
     }
 
     // Cached hid: still CHECK it.  A second ensure_dataset for the same
@@ -686,30 +837,41 @@ void close_ctx(PhdfCtx* ctx) {
     }
 
     // Close cached datasets first (so their metadata flushes into file).
+    //
+    // These returns were dropped on the floor.  H5Dclose/H5Fclose are where a
+    // collective write's metadata actually reaches the file: a failure here
+    // means the run finishes rc=0 with a truncated or unflushed dataset and
+    // NOTHING says so.  close_ctx cannot throw (it is called from an extern
+    // "C" void, and from atexit), so announce — flushed, immediately.
+    auto closed_ok = [ctx](herr_t st, const char* what) {
+        if (st >= 0) return;
+        std::fprintf(stderr,
+            "[phdf5 ERROR rank=%d] %s failed while closing '%s'; data may "
+            "not have reached the file\n",
+            ctx->rank, what, ctx->path.c_str());
+        std::fflush(stderr);
+    };
     {
         std::lock_guard<std::mutex> g(ctx->datasets_mu);
         for (auto& kv : ctx->open_datasets) {
-            if (kv.second >= 0) H5Dclose(kv.second);
+            if (kv.second >= 0) closed_ok(H5Dclose(kv.second), "H5Dclose");
         }
         ctx->open_datasets.clear();
     }
 
-    if (ctx->file_id    >= 0) H5Fclose(ctx->file_id);
+    if (ctx->file_id    >= 0) closed_ok(H5Fclose(ctx->file_id), "H5Fclose");
     if (ctx->dxpl_coll  >= 0) H5Pclose(ctx->dxpl_coll);
     if (ctx->dxpl_indep >= 0) H5Pclose(ctx->dxpl_indep);
     if (ctx->dcpl_id    >= 0) H5Pclose(ctx->dcpl_id);
     if (ctx->fapl_id    >= 0) H5Pclose(ctx->fapl_id);
     if (ctx->fcpl_id    >= 0) H5Pclose(ctx->fcpl_id);
 
-    if (ctx->pinned_buf) {
-#ifdef LORRAX_FFI_NO_CUDA
-        std::free(ctx->pinned_buf);
-#else
-        cudaFreeHost(ctx->pinned_buf);
-#endif
-        ctx->pinned_buf = nullptr;
-        ctx->pinned_capacity = 0;
-    }
+    staging_free(ctx->pinned_buf);
+    ctx->pinned_buf = nullptr;
+    ctx->pinned_capacity = 0;
+    staging_free(ctx->read_buf);
+    ctx->read_buf = nullptr;
+    ctx->read_capacity = 0;
 #ifndef LORRAX_FFI_NO_CUDA
     if (ctx->d2h_event) cudaEventDestroy(ctx->d2h_event);
     if (ctx->h2d_event) cudaEventDestroy(ctx->h2d_event);

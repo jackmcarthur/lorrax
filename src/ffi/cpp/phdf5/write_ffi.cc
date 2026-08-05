@@ -122,37 +122,15 @@
 #include "ctx.h"
 #include "phdf5_interface.h"
 #include "platform_seam.h"
+#include "shard_index.h"
 
 namespace lorrax_ffi::phdf5 {
 
 namespace ffi = ::xla::ffi;
 
-// Un-ravel a linear rank id through a row-major mesh shape into
-// per-axis coordinates.  rank = sum(coord[i] * prod(shape[i+1:])).
-static std::vector<int64_t> unravel_rank(
-    int64_t rank, ffi::Span<const int64_t> mesh_shape)
-{
-    std::vector<int64_t> coord(mesh_shape.size(), 0);
-    int64_t r = rank;
-    for (ssize_t i = (ssize_t)mesh_shape.size() - 1; i >= 0; --i) {
-        coord[i] = r % mesh_shape[i];
-        r /= mesh_shape[i];
-    }
-    return coord;
-}
-
-template <typename T>
-static std::string vec_to_string(const std::vector<T>& v)
-{
-    std::ostringstream os;
-    os << "[";
-    for (size_t i = 0; i < v.size(); ++i) {
-        if (i) os << ",";
-        os << v[i];
-    }
-    os << "]";
-    return os.str();
-}
+// ``unravel_rank`` / ``vec_to_string`` / ``validate_shard_encoding`` /
+// ``checked_buffer_bytes`` / ``announce_error`` are in shard_index.h, shared
+// verbatim with read_ffi.cc so the two TUs cannot drift.
 
 static bool write_debug_enabled()
 {
@@ -203,30 +181,39 @@ static void async_worker(
 #else
     (void)wait_for_d2h;   // no D2H copy on the host build (seam 3)
 #endif
+    // Every error return below goes through here.  It announces first,
+    // flushed, THEN sets the Promise: when a handler refuses, this rank does
+    // not enter the collective its peers are inside, and the job dies minutes
+    // later at a barrier deadline with the Promise's message still buffered
+    // (audit 2026-08-04: two 32-node legs, no traceback anywhere).
+    auto fail_task = [&](ffi::ErrorCode code, const std::string& msg) {
+        announce_error(ctx, msg);
+        promise.SetError(ffi::Error(code, msg));
+    };
+
     const int rank = (int)offset.size();
     hid_t filespace = H5Dget_space(ds_id);
     if (filespace < 0) {
-        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 async write: H5Dget_space failed"));
+        fail_task(ffi::ErrorCode::kInternal,
+                  "phdf5 async write: H5Dget_space failed");
         return;
     }
-    int file_rank = H5Sget_simple_extent_ndims(filespace);
-    if (file_rank != rank) {
-        std::ostringstream os;
-        os << "phdf5 async write: dataset rank mismatch"
-           << " ds=" << h5_object_name(ds_id)
-           << " file_rank=" << file_rank
-           << " write_rank=" << rank;
-        H5Sclose(filespace);
-        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
-        return;
+    {
+        std::string rank_err;
+        if (!check_dataset_rank(filespace, rank, "phdf5 async write",
+                                nullptr, &rank_err)) {
+            rank_err += " ds=" + h5_object_name(ds_id);
+            H5Sclose(filespace);
+            fail_task(ffi::ErrorCode::kInternal, rank_err);
+            return;
+        }
     }
     std::vector<hsize_t> extent((size_t)rank, 0);
     std::vector<hsize_t> max_extent((size_t)rank, 0);
     if (H5Sget_simple_extent_dims(filespace, extent.data(), max_extent.data()) < 0) {
         H5Sclose(filespace);
-        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 async write: H5Sget_simple_extent_dims failed"));
+        fail_task(ffi::ErrorCode::kInternal,
+                  "phdf5 async write: H5Sget_simple_extent_dims failed");
         return;
     }
     // ── Emptiness is PER-RANK; the bounds test must be RANK-INVARIANT. ──
@@ -302,14 +289,15 @@ static void async_worker(
            << " rank=" << ctx->rank
            << " -- refused identically on every rank";
         H5Sclose(filespace);
+        // Already printed above by the debug||oob banner; do not double it.
         promise.SetError(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
         return;
     }
     hid_t memspace = H5Screate_simple(rank, mem_dims.data(), nullptr);
     if (memspace < 0) {
         H5Sclose(filespace);
-        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 async write: H5Screate_simple(memspace) failed"));
+        fail_task(ffi::ErrorCode::kInternal,
+                  "phdf5 async write: H5Screate_simple(memspace) failed");
         return;
     }
 
@@ -317,8 +305,8 @@ static void async_worker(
         if (H5Sselect_none(filespace) < 0 || H5Sselect_none(memspace) < 0) {
             H5Sclose(memspace);
             H5Sclose(filespace);
-            promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
-                              "phdf5 async write: H5Sselect_none failed"));
+            fail_task(ffi::ErrorCode::kInternal,
+                      "phdf5 async write: H5Sselect_none failed");
             return;
         }
     } else if (H5Sselect_hyperslab(filespace, H5S_SELECT_SET,
@@ -327,8 +315,8 @@ static void async_worker(
         if (debug) H5Eprint2(H5E_DEFAULT, stderr);
         H5Sclose(memspace);
         H5Sclose(filespace);
-        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 async write: H5Sselect_hyperslab failed"));
+        fail_task(ffi::ErrorCode::kInternal,
+                  "phdf5 async write: H5Sselect_hyperslab failed");
         return;
     } else {
         std::vector<hsize_t> mem_start((size_t)rank, 0);
@@ -338,8 +326,8 @@ static void async_worker(
             if (debug) H5Eprint2(H5E_DEFAULT, stderr);
             H5Sclose(memspace);
             H5Sclose(filespace);
-            promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
-                              "phdf5 async write: H5Sselect_hyperslab(mem) failed"));
+            fail_task(ffi::ErrorCode::kInternal,
+                      "phdf5 async write: H5Sselect_hyperslab(mem) failed");
             return;
         }
     }
@@ -353,8 +341,9 @@ static void async_worker(
     H5Sclose(filespace);
 
     if (st < 0) {
-        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 async write: H5Dwrite failed"));
+        fail_task(ffi::ErrorCode::kInternal,
+                  "phdf5 async write: H5Dwrite failed ds=" +
+                  h5_object_name(ds_id));
         return;
     }
     promise.SetAvailable();
@@ -384,21 +373,34 @@ static ffi::Future WriteDispatch(
     ffi::Span<const int64_t> axis_count_per_dim,
     ffi::Span<const int64_t> axis_flat)
 {
-    auto fail = [](ffi::Error err) {
+    auto* ctx = reinterpret_cast<PhdfCtx*>(ctx_handle);
+
+    // Every dispatch-level refusal below happens BEFORE the task is enqueued,
+    // so the rank never reaches H5Dwrite.  That is only safe because every
+    // input tested here is replicated by construction — the FFI Attrs are
+    // baked into the compiled module, A's dimensions are the equal-block
+    // shard shape, and ds_id/ctx_handle come from collective lifecycle calls
+    // — so these refuse on every rank or on none.  See shard_index.h.
+    auto fail = [ctx](ffi::ErrorCode code, const std::string& msg) {
+        announce_error(ctx, msg);
         ffi::Promise p;
         ffi::Future f(p);
-        p.SetError(std::move(err));
+        p.SetError(ffi::Error(code, msg));
         return f;
     };
 
-    auto* ctx = reinterpret_cast<PhdfCtx*>(ctx_handle);
     if (!ctx) {
-        return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                               "phdf5 write: ctx_handle is null"));
+        return fail(ffi::ErrorCode::kInvalidArgument,
+                    "phdf5 write: ctx_handle is null");
     }
 
     const auto dims = A.dimensions();
     const size_t N = dims.size();
+    if (N == 0) {
+        return fail(ffi::ErrorCode::kInvalidArgument,
+                    "phdf5 write: operand is 0-D; there is no hyperslab to "
+                    "write");
+    }
     if (offset_buf.dimensions().size() != 1 ||
         (size_t)offset_buf.dimensions()[0] != N ||
         valid_shape_buf.dimensions().size() != 1 ||
@@ -409,7 +411,15 @@ static ffi::Future WriteDispatch(
            << " offset_buf.ndim=" << offset_buf.dimensions().size()
            << " valid_shape_buf.ndim=" << valid_shape_buf.dimensions().size()
            << " axis_count_per_dim.size=" << axis_count_per_dim.size();
-        return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str()));
+        return fail(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    {
+        std::string enc_err;
+        if (!validate_shard_encoding(ctx, "phdf5 write", mesh_shape,
+                                     axis_count_per_dim, axis_flat,
+                                     &enc_err)) {
+            return fail(ffi::ErrorCode::kInvalidArgument, enc_err);
+        }
     }
 
     // Seam 2 — fetch the small index buffers (N × 8 bytes = 24-40 bytes
@@ -419,15 +429,15 @@ static ffi::Future WriteDispatch(
     std::vector<int64_t> offset_host(N);
     if (!copy_index_to_host(offset_host.data(), offset_buf.untyped_data(),
                             N * sizeof(int64_t), &idx_err)) {
-        return fail(ffi::Error(ffi::ErrorCode::kInternal,
-                    "phdf5 write: index copy(offset) failed: " + idx_err));
+        return fail(ffi::ErrorCode::kInternal,
+                    "phdf5 write: index copy(offset) failed: " + idx_err);
     }
     std::vector<int64_t> valid_shape_host(N);
     if (!copy_index_to_host(valid_shape_host.data(),
                             valid_shape_buf.untyped_data(),
                             N * sizeof(int64_t), &idx_err)) {
-        return fail(ffi::Error(ffi::ErrorCode::kInternal,
-                    "phdf5 write: index copy(valid_shape) failed: " + idx_err));
+        return fail(ffi::ErrorCode::kInternal,
+                    "phdf5 write: index copy(valid_shape) failed: " + idx_err);
     }
 
     std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
@@ -466,7 +476,15 @@ static ffi::Future WriteDispatch(
             os << "phdf5 write: negative offset/valid_shape at dim " << d
                << " offset=" << offset_host[d]
                << " valid_shape=" << valid_shape_host[d];
-            return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str()));
+            return fail(ffi::ErrorCode::kInvalidArgument, os.str());
+        }
+        if (offset_host[d] > INT64_MAX - valid_shape_host[d]) {
+            std::ostringstream os;
+            os << "phdf5 write: offset+valid_shape overflows int64 at dim "
+               << d << " (" << offset_host[d] << "+"
+               << valid_shape_host[d] << "); the bounds test would wrap "
+               << "negative and accept an out-of-range slab";
+            return fail(ffi::ErrorCode::kInvalidArgument, os.str());
         }
         mem_dims[d] = (hsize_t)dims[d];
         offset[d] = (hsize_t)offset_host[d];
@@ -476,12 +494,14 @@ static ffi::Future WriteDispatch(
         int64_t rank_coord = 0;
         int64_t stride_acc = 1;
         for (int64_t k = na - 1; k >= 0; --k) {
+            // flat_idx + k is in range: validate_shard_encoding checked that
+            // axis_count_per_dim sums to exactly axis_flat.size().
             int64_t ax = axis_flat[flat_idx + k];
             if (ax < 0 || (size_t)ax >= mesh_shape.size()) {
                 std::ostringstream os;
                 os << "phdf5 write: bad axis " << ax
                    << " at dim " << d << " axis " << k;
-                return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str()));
+                return fail(ffi::ErrorCode::kInvalidArgument, os.str());
             }
             rank_coord += coord[ax] * stride_acc;
             stride_acc *= mesh_shape[ax];
@@ -538,19 +558,24 @@ static ffi::Future WriteDispatch(
         default: {
             std::ostringstream os;
             os << "phdf5 write: unsupported dtype " << static_cast<int>(dtype);
-            return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str()));
+            return fail(ffi::ErrorCode::kInvalidArgument, os.str());
         }
     }
 
     hid_t dset = (hid_t)ds_id;
     if (dset < 0 || H5Iis_valid(dset) <= 0) {
-        return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                               "phdf5 write: ds_id is invalid"));
+        return fail(ffi::ErrorCode::kInvalidArgument,
+                    "phdf5 write: ds_id is invalid");
     }
 
-    size_t n_local_elts = 1;
-    for (auto c : mem_dims) n_local_elts *= (size_t)c;
-    const size_t bytes = n_local_elts * elt_bytes;
+    size_t bytes = 0;
+    {
+        std::string ov_err;
+        if (!checked_buffer_bytes(mem_dims, elt_bytes, "phdf5 write",
+                                  &bytes, &ov_err)) {
+            return fail(ffi::ErrorCode::kInvalidArgument, ov_err);
+        }
+    }
 
     // ---- Seam 3: get the local shard to a host pointer H5Dwrite can read.
 #ifdef LORRAX_FFI_NO_CUDA
@@ -568,10 +593,18 @@ static ffi::Future WriteDispatch(
     // H5Dwrite has already completed (buffer released) by the time
     // the next dispatch reaches us.  ``cudaMallocHost`` at 270 MB is
     // ~50-100 ms — a per-call cost we can't afford.
+    // NOTE (rank-invariance): this is the one dispatch-level refusal in this
+    // handler whose input is NOT replicated — a host-memory OOM is per-rank.
+    // A rank that hits it never enters the collective H5Dwrite, so the job
+    // hangs rather than reporting.  Closing that needs a cross-rank error
+    // rendezvous on a communicator of our own; registered in
+    // KNOWN_LORRAX_ISSUES.md, not attempted here.  The announce is what makes
+    // it diagnosable in the meantime.  CUDA build only: the host build stages
+    // nothing on the write path.
     if (!ensure_pinned(ctx, bytes)) {
         std::ostringstream os;
         os << "phdf5 write: ensure_pinned(" << bytes << ") failed";
-        return fail(ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str()));
+        return fail(ffi::ErrorCode::kResourceExhausted, os.str());
     }
     void* src_buf = ctx->pinned_buf;
     const bool wait_for_d2h = true;
@@ -599,7 +632,7 @@ static ffi::Future WriteDispatch(
         std::ostringstream os;
         os << "phdf5 write: cudaMemcpyAsync D2H failed: "
            << cudaGetErrorString(ce);
-        return fail(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
+        return fail(ffi::ErrorCode::kInternal, os.str());
     }
     cudaEventRecord(ctx->d2h_event, ctx->stream);
 #endif  // LORRAX_FFI_NO_CUDA
