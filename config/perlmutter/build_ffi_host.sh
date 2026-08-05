@@ -133,6 +133,33 @@ module unload cudatoolkit           2>/dev/null || true
 : "${CRAY_MPICH_DIR:?cray-mpich did not set CRAY_MPICH_DIR}"
 : "${HDF5_DIR:?cray-hdf5-parallel did not set HDF5_DIR}"
 
+# Capture the prefixes, THEN unload cray-libsci.
+#
+# WHY: the Cray CC wrapper auto-injects `-lsci_gnu` — the SEQUENTIAL LibSci —
+# whenever the cray-libsci module is loaded.  Our own link line asks for the
+# THREADED `_mp` pair (to match the gpu_backend=none SLATE, which links
+# threaded), so leaving the module loaded puts BOTH flavours in the .so.  That
+# is not a theoretical concern: the Cray runtime itself detects it and prints
+#     [CRAYBLAS_WARNING] Application linked against multiple cray-libsci libraries
+# on the first BLAS call.  ELF order makes it deterministic (the _mp pair comes
+# first and wins), but "deterministic if you re-derive the link order" is not a
+# property to rely on.  Unloading the module leaves the wrapper adding no
+# libsci at all, and the explicit -L/-l below is then the only source.
+LORRAX_PM_LIBSCI_DIR="$CRAY_LIBSCI_PREFIX_DIR"
+LORRAX_PM_MPICH_DIR="$CRAY_MPICH_DIR"
+LORRAX_PM_HDF5_DIR="$HDF5_DIR"
+module unload cray-libsci 2>/dev/null || true
+
+# Unloading the module also unsets CRAY_LIBSCI_PREFIX_DIR, which the
+# CMakeLists' CBLAS probe reads from the ENVIRONMENT:
+#     find_path(LORRAX_CBLAS_INCLUDE_DIR cblas.h
+#               HINTS "$ENV{CRAY_LIBSCI_PREFIX_DIR}/include"
+#                     "$ENV{LORRAX_CBLAS_DIR}/include" ...)
+# Without a hint it finds no cblas.h, silently drops the vendor-BLAS GEMM
+# handler, and LORRAX_BANDS_GEMM_FFI then refuses at runtime.  Hand it the
+# documented site-neutral hint instead of re-exporting a Cray-private name.
+export LORRAX_CBLAS_DIR="$LORRAX_PM_LIBSCI_DIR"
+
 if [[ ! -f "$LORRAX_XLA_FFI_HEADERS_DIR/xla/ffi/api/ffi.h" ]]; then
     echo "[build_ffi_host] ERROR: XLA FFI headers not staged at" >&2
     echo "[build_ffi_host]   $LORRAX_XLA_FFI_HEADERS_DIR" >&2
@@ -151,7 +178,7 @@ fi
 # A capability check, not a version check — this is what makes the script
 # survive a LibSci upgrade or a move to netlib/AOCL.
 # ---------------------------------------------------------------------------
-SCALAPACK_SO="$CRAY_LIBSCI_PREFIX_DIR/lib/libsci_gnu_mpi${LORRAX_PM_LIBSCI_FLAVOUR}.so"
+SCALAPACK_SO="$LORRAX_PM_LIBSCI_DIR/lib/libsci_gnu_mpi${LORRAX_PM_LIBSCI_FLAVOUR}.so"
 # Dump the symbol table ONCE.  Do not pipe nm into `grep -q` in a loop: under
 # `set -o pipefail`, grep -q exits on first match and closes the pipe, nm dies
 # of SIGPIPE, and the pipeline reports failure — which reads as "symbol
@@ -202,10 +229,12 @@ cmake "$SRC" \
     -DCMAKE_CXX_COMPILER=CC \
     -DLORRAX_XLA_FFI_INCLUDE_DIR="$LORRAX_XLA_FFI_HEADERS_DIR" \
     -DLORRAX_SLATE_HOST_INSTALL_DIR="$LORRAX_SLATE_HOST_INSTALL_DIR" \
-    -DLORRAX_SCALAPACK_LIBRARIES="-L$CRAY_LIBSCI_PREFIX_DIR/lib -Wl,--no-as-needed -lsci_gnu_mpi${F} -lsci_gnu${F} -lgomp -lpthread -lm -ldl" \
-    -DLORRAX_MPI_INCLUDE_DIR="$CRAY_MPICH_DIR/include" \
-    -DLORRAX_MPICH_LIB_DIR="$CRAY_MPICH_DIR/lib" \
-    -DHDF5_ROOT="$HDF5_DIR"
+    -DLORRAX_SCALAPACK_LIBRARIES="-L$LORRAX_PM_LIBSCI_DIR/lib -Wl,--no-as-needed -lsci_gnu_mpi${F} -lsci_gnu${F} -lgomp -lpthread -lm -ldl" \
+    -DLORRAX_CBLAS_INCLUDE_DIR="$LORRAX_PM_LIBSCI_DIR/include" \
+    -DLORRAX_CBLAS_LIBRARY="$LORRAX_PM_LIBSCI_DIR/lib/libsci_gnu${F}.so" \
+    -DLORRAX_MPI_INCLUDE_DIR="$LORRAX_PM_MPICH_DIR/include" \
+    -DLORRAX_MPICH_LIB_DIR="$LORRAX_PM_MPICH_DIR/lib" \
+    -DHDF5_ROOT="$LORRAX_PM_HDF5_DIR"
 
 cmake --build . --parallel "${LORRAX_BUILD_JOBS:-8}"
 
@@ -248,11 +277,20 @@ echo "[build_ffi_host] GATE 1 (S3, one cray-mpich ABI) PASSED: $mpi_variants"
 # re-derives the order after a link-line edit.
 sci_seq=$(readelf -d "$SO_FILE" | grep NEEDED | grep -cE 'libsci_gnu(_mpi)?\.so' || true)
 sci_mp=$(readelf -d "$SO_FILE"  | grep NEEDED | grep -cE 'libsci_gnu(_mpi)?_mp\.so' || true)
+if [[ "$sci_seq" -gt 0 && "$sci_mp" -gt 0 ]]; then
+    echo "[build_ffi_host] GATE FAILED (S8): BOTH LibSci flavours linked" >&2
+    echo "[build_ffi_host]   (sequential=$sci_seq threaded=$sci_mp).  The Cray runtime" >&2
+    echo "[build_ffi_host]   reports this as [CRAYBLAS_WARNING] Application linked" >&2
+    echo "[build_ffi_host]   against multiple cray-libsci libraries.  Usually means the" >&2
+    echo "[build_ffi_host]   cray-libsci module was still loaded at configure time and" >&2
+    echo "[build_ffi_host]   the CC wrapper auto-injected the sequential libsci." >&2
+    exit 1
+fi
 if [[ "$F" == "_mp" && "$sci_mp" -eq 0 ]]; then
     echo "[build_ffi_host] GATE FAILED (S8): asked for threaded LibSci, none linked." >&2
     exit 1
 fi
-echo "[build_ffi_host] GATE 2 (S8, LibSci flavour) : sequential=$sci_seq threaded=$sci_mp (want flavour '$F')"
+echo "[build_ffi_host] GATE 2 (S8, one LibSci flavour '$F') PASSED: sequential=$sci_seq threaded=$sci_mp"
 
 # GATE 3: CUDA-free by construction.
 if readelf -d "$SO_FILE" | grep NEEDED | grep -qiE 'cuda|nccl|nvshmem|cal\.so'; then
