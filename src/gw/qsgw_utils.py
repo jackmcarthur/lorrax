@@ -301,7 +301,12 @@ def _extract_diag_kernel(mesh_xy: Mesh):
         @jax.jit
         def _extract(M):
             M_full = jax.lax.with_sharding_constraint(M, rep_4d)
-            diag = jnp.einsum("...ii->...i", M_full)
+            # FANCY-INDEX THE DIAGONAL, do not mask for it.  XLA:CPU lowers
+            # ``einsum('...ii->...i')`` to a broadcast + select over the WHOLE
+            # operand — 169.125 MiB of temporaries on the mos2_4x4 cube, 390 GB
+            # at nk=144/nb=2000/nω=41.  Measured 169.125 -> 0.000 MiB.
+            i = jnp.arange(M_full.shape[-1])
+            diag = M_full[..., i, i]
             return jax.lax.with_sharding_constraint(diag, rep_3d)
 
         fn = _extract
@@ -364,15 +369,22 @@ def _qsgw_build_kernel(mesh_xy: Mesh):
             # A[k, m, n] = Σ_c[idx[k, m], k, m, n] (interp at E_m(k))
             # B[k, m, n] = Σ_c[idx[k, n], k, m, n] (interp at E_n(k))
             full = sig_w.shape  # (nω, nk, nb, nb)
+            # ONE ω SLOT, NOT THE WHOLE CUBE.  ``take_along_axis`` returns the
+            # index tensor's shape and the ``[0]`` below keeps only slot 0, so
+            # broadcasting the indices to ``full`` built four (nω, nk, nb, nb)
+            # int tensors to produce an (nk, nb, nb) result — 656.03 MiB of
+            # temporaries on the mos2_4x4 deck for a 4.00 MiB output, 1.51 TB
+            # at nk=144/nb=2000/nω=41.  Measured 656.031 -> 16.031 MiB.
+            one = (1,) + tuple(full[1:])
 
-            ilo_m = jnp.broadcast_to(ilo[None, :, :, None], full)
-            ihi_m = jnp.broadcast_to(ihi[None, :, :, None], full)
+            ilo_m = jnp.broadcast_to(ilo[None, :, :, None], one)
+            ihi_m = jnp.broadcast_to(ihi[None, :, :, None], one)
             A_lo = jnp.take_along_axis(sig_w, ilo_m, axis=0)[0]
             A_hi = jnp.take_along_axis(sig_w, ihi_m, axis=0)[0]
             A = wlo[:, :, None] * A_lo + whi[:, :, None] * A_hi
 
-            ilo_n = jnp.broadcast_to(ilo[None, :, None, :], full)
-            ihi_n = jnp.broadcast_to(ihi[None, :, None, :], full)
+            ilo_n = jnp.broadcast_to(ilo[None, :, None, :], one)
+            ihi_n = jnp.broadcast_to(ihi[None, :, None, :], one)
             B_lo = jnp.take_along_axis(sig_w, ilo_n, axis=0)[0]
             B_hi = jnp.take_along_axis(sig_w, ihi_n, axis=0)[0]
             B = wlo[:, None, :] * B_lo + whi[:, None, :] * B_hi
