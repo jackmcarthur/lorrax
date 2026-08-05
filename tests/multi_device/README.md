@@ -36,3 +36,17 @@ bytes, replica-group size) of the compiled kernel, which is where the claim
 
 Harness: `/scratch2/08271/jackmc/wfn_rotate/wrgate.sbatch` (N=2, n=4, live
 tree). Green at job 7889407.
+
+Σ_c(ω) layout A/B gate: `sigma_omega_layout_ab.py`, the launcher-agnostic
+compare step for two full driver runs of the SAME deck that differ only in
+`sigma_omega_layout = replicated | sharded`. Compares eqp0/eqp1.dat,
+sigma_diag.dat, all four sigma_mnk.h5 tensors and (when present) the WFN_qp.h5
+QP eigenvalues at 1e-12 relative, and checks that `sigma.host_gather` is
+ELIDED under `sharded` rather than renamed. The layout had no regression
+coverage before this (`grep -rln sigma_omega_layout tests/` returned nothing);
+its only prior certification was two batch jobs named in commit 712a866.
+
+    python3 sigma_omega_layout_ab.py compare <replicated_dir> <sharded_dir>
+
+Harness: `/scratch2/08271/jackmc/omegacube_ab/{one_shot,sc}.sbatch` +
+`ab_common.sh` (N=2, n=4, P=4, frozen source tree under the same directory).
