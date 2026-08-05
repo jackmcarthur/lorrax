@@ -8,6 +8,7 @@ gamma_matrices, cholesky_2d, fft_helpers, wfn_transforms, psi_G_store) and
 (func-local) ``ffi/`` (cusolvermp).  NO ``gw`` / LorraxConfig / h5 / V_q
 packaging lives here — GW and BSE are consumers.
 """
+import math
 import os
 import time
 from types import SimpleNamespace
@@ -1189,15 +1190,48 @@ def _resolve_solver_kind_charge(
             # buffer.  Return the nominal kind and let the caller override.
             return 'replicated_rank_truncate'
         if charge_zeta_solve == 'rank_truncate':
-            need = (int(nq) * int(n_rmu) ** 2 * 16 / 1024**3
+            # REPORT THE QUANTITY THAT ACTUALLY FAILED (DLM campaign
+            # 2026-07-29, jobs 7879700 / 7879689).  Reaching here means BOTH
+            # gates above said no, and they test DIFFERENT things:
+            #   _replicate_charge_ok      whole stack   nq * mu^2 * 16
+            #   _replicate_rank_truncate_ok  one q-batch  batch * mu^2 * 16
+            # The second is the weaker one, so IT is what binds, and the cap
+            # that would clear it is the per-batch figure -- not the stack.
+            # The old message quoted the stack and advised the stack-sized cap
+            # (61 / 94 GiB at the two sizes measured), which over-states the
+            # fix by ~10x: 6 / 10 GiB is what those runs actually needed.
+            stack = (int(nq) * int(n_rmu) ** 2 * 16 / 1024**3
+                     if nq and n_rmu else 0.0)
+            batch = (_replicated_factor_q_chunk(int(nq), int(n_rmu))
+                     if nq and n_rmu else 1)
+            need = (batch * int(n_rmu) ** 2 * 16 / 1024**3
                     if nq and n_rmu else 0.0)
+            # The exact mu ceiling this route carries, from the two 4 GiB caps:
+            # batch collapses to 1 once one (mu, mu) c128 matrix exceeds
+            # _REPLICATED_FACTOR_MAX_BATCH_BYTES, so the criterion reduces to
+            # mu <= sqrt(max(cap, factor_cap) / 16).
+            _cap = max(_REPLICATED_CHOL_MAX_STACK_BYTES,
+                       _REPLICATED_FACTOR_MAX_BATCH_BYTES)
+            mu_max = int(math.isqrt(_cap // 16))
             raise ValueError(
-                f"charge_zeta_solve='rank_truncate' needs the replicated route, "
-                f"but the CCT stack (nq={nq}, n_mu={n_rmu}) is {need:.2f} GiB > "
-                f"the {_REPLICATED_CHOL_MAX_STACK_BYTES / 1024**3:.2f} GiB cap.  "
-                f"Set LORRAX_ZETA_REPLICATE_CAP_GIB={-(-need // 1) + 1:.0f} if the "
-                f"device budget allows, or charge_zeta_solve='cholesky' to accept "
-                f"the distributed factor (NOT rank-conditioned — verify V_q).")
+                f"charge_zeta_solve='rank_truncate' needs the replicated "
+                f"factor, and the binding limit is ONE q-batch, not the "
+                f"stack: batch={batch} x (n_mu={n_rmu})^2 x 16 B = "
+                f"{need:.2f} GiB > the {_cap / 1024**3:.2f} GiB per-batch cap.  "
+                f"(The whole CCT stack, nq={nq}, is {stack:.2f} GiB -- context "
+                f"only; it is NOT what failed.)  On this route the replicated "
+                f"factor is allocated one q-batch at a time, so the ceiling is "
+                f"n_mu <= {mu_max}.  "
+                f"Set LORRAX_ZETA_REPLICATE_CAP_GIB={-(-need // 1) + 1:.0f} to "
+                f"clear it if the device budget allows -- but note the factor "
+                f"is a dense eigh per q run REDUNDANTLY on every rank, "
+                f"O(nq*n_mu^3) with NO P-scaling (measured 4712 s at "
+                f"n_mu=10015 on 64 ranks, so ~20 h at n_mu=24933): raising the "
+                f"cap makes this RESOLVE, not finish.  For large n_mu use "
+                f"distributed_zeta_solve='distributed' instead (ScaLAPACK "
+                f"pzheevd, 236 s at the same size), or "
+                f"charge_zeta_solve='cholesky' to accept the distributed "
+                f"factor (NOT rank-conditioned — verify V_q).")
         return None
 
     return _resolve_channel_ladder(

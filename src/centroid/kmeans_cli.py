@@ -231,12 +231,18 @@ def _build_mesh(args, n_points: int) -> tuple[Mesh, tuple[str, ...]]:
     (which uses ``load_centroids_band_chunked`` and friends) only has one
     codepath to worry about.
     """
+    from common.wfn_transforms import process_local_mesh
+
     devices = jax.devices()
     n_dev = len(devices)
     multi_host = jax.process_count() > 1
 
+    # Single-device fallbacks use THIS PROCESS's device, never
+    # ``jax.devices()[0]`` (the global list's first entry = process 0's device
+    # on every rank, a mesh no other rank can compute on).  At P=1 the two are
+    # the same object, so single-process behaviour is byte-identical.
     if args.no_shard or n_dev < 2:
-        return Mesh(np.asarray(devices[:1]).reshape(1, 1), ("x", "y")), ("x", "y")
+        return process_local_mesh(), ("x", "y")
 
     # Most-square 2-D factorisation (same recipe as ``gw_jax._build_mesh``).
     nx = max(k for k in range(1, int(math.isqrt(n_dev)) + 1) if n_dev % k == 0)
@@ -251,7 +257,7 @@ def _build_mesh(args, n_points: int) -> tuple[Mesh, tuple[str, ...]]:
         print(f"P/{n_shards} = {per_shard} < {_P_PER_SHARD_MIN} points per "
               "shard; falling back to single-device. Pass --force-shard to "
               "override.")
-        return Mesh(np.asarray(devices[:1]).reshape(1, 1), ("x", "y")), ("x", "y")
+        return process_local_mesh(), ("x", "y")
 
     if multi_host and per_shard < _P_PER_SHARD_MIN:
         print(f"P/{n_shards} = {per_shard} < {_P_PER_SHARD_MIN}; sharding "
@@ -570,12 +576,21 @@ def main():
         f"intended channels: "
         f"{'γ̃^0 (charge) ISDF' if args.density_mode == 'scalar' else 'γ̃^{1,2,3} (current) ISDF'}"
     )
-    np.savetxt(
-        out_file, centroids_snapped,
-        header=header,
-        fmt="%.6f", delimiter=" ", comments="# ",
-    )
-    print(f"Saved centroids to {out_file}")
+    # ONE writer.  Every rank used to reach this savetxt on the same shared
+    # path.  It survived P=16 only because all ranks write identical bytes —
+    # which is precisely the latent form of the bug that DID bite at P=64 in
+    # ``bse_io.write_eigenvectors_stream`` (64 concurrent h5py creators,
+    # rc=1 plus a structurally valid file; wk_REL S4.8).  ``centroids_snapped``
+    # is a pure function of the WFN + seed + candidate list and is identical on
+    # every rank, so rank 0's file is the file any rank would have written.
+    # No collective below this point, so gating cannot deadlock.
+    if jax.process_index() == 0:
+        np.savetxt(
+            out_file, centroids_snapped,
+            header=header,
+            fmt="%.6f", delimiter=" ", comments="# ",
+        )
+        print(f"Saved centroids to {out_file}")
 
     if jax.process_index() == 0:
         timing.report(title="--- kmeans_cli timing (s) ---")
