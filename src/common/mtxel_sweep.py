@@ -36,10 +36,30 @@ every process**.  Therefore:
 * Efficiency is ``nb_logical / nb_padded`` and nothing else.  The sweep
   keeps scaling until ``P = nb``, where the k-partitioned plan stopped
   scaling at ``P = nk``.
-* THE ONLY WAY A RANK GOES IDLE is ``nb_logical < P``: the band pad rounds
-  ``nb`` up to a multiple of ``∏ p_a`` and the ranks holding only pad
-  bands do zero work.  That is the whole of it — there is no other idle
-  case at any ``P``, ``nk`` or mesh shape.
+* The one IDLE-RANK case is ``nb_logical < P``: the band pad rounds ``nb``
+  up to a multiple of ``∏ p_a`` and the ranks holding only pad bands do
+  zero work.
+* There is ALSO one REPLICATED term, and an earlier version of this
+  paragraph denied it ("there is no other idle case at any P, nk or mesh
+  shape").  That was asserted, not measured, and it is false: the V_NL and
+  dipole operators call ``vnl_ops.build_vnl_kdata_traced`` inside the scan
+  body, and Z is ``(total_R, ngkmax)`` REPLICATED — every rank builds the
+  same Z for every k, where the k-partitioned plan built it for ``nk/P``
+  k.  Now measured (``tests/multi_device/mtxel_vnl_scaling_probe.py``, job
+  7889392, MoS2 4×4 deck_b300, nk=16, nb=128, ns=2, ngkmax=1964,
+  total_R=62 so Z is 1.9 MiB): the build costs 0.017 s at P=1, 0.010 s at
+  P=4 and 0.020 s at P=16 — FLAT, no trend — while the whole V_NL operator
+  over the kinetic baseline is 0.064 / 0.031 / 0.039 s.  So the build is
+  27 % of V_NL's cost at P=1 and 51 % at P=16: the share rises with P
+  exactly as replicated work must.  Z+dZ for the dipole is 0.046 / 0.055 /
+  0.061 s, likewise flat.
+  NOT FIXED, deliberately.  The candidate fixes are to shard the G axis of
+  the build and all-gather Z per k, or to hoist a per-k Z table out of the
+  scan; the first pays a collective per k to save ~1 ms of arithmetic (the
+  per-k reshard this sweep already issues measures 0.176 s at b600/P=64),
+  and the second does not reduce the build count at all — it is already
+  one per k.  Against a V_H sweep of 5.740 s at P=1 the whole term is
+  ≤ 20 ms.  The claim is corrected rather than the code.
 
 What the sweep pays for this is a per-k reshard collective, which the
 k-partitioned plan does not need (a rank owning a whole k communicates
@@ -185,6 +205,66 @@ onto the other mesh axis is within noise, 0.180 s against 0.176 s
 A bare ``jnp.fft`` here would be the CrI3 6×6×1 80 Ry 121 GB OOM: on a
 sharded tensor XLA's planner is free to insert an all-gather and emit a
 global FFT.  See the module comment above ``wfn_transforms._local_box_fft``.
+
+WHERE THE OPERATOR'S WALL GOES, AND THE FUSION ARGUMENT THAT IS WRONG
+---------------------------------------------------------------------
+Measured on the MoS2 4×4 density-SC shape — nk=16, nb=128, ns=2, grid
+24×24×80, ngkmax=1968, i.e. the sweep
+``gw.sc_iteration.rebuild_hartree_dft_basis`` issues and the one behind the
+5.72 s/iteration ``mtxel.sweep`` row of job 7889362 — by running the SAME
+skeleton with operators that add one stage at a time
+(``tests/multi_device/mtxel_fusion_probe.py``; jobs 7889383, 7889385,
+7889386; median of 3, worst rank)::
+
+                                     P=1      P=4      P=16
+      identity (scan+reshards+dot)   0.047 s  0.071 s  0.037 s
+      + sphere→box, box→sphere       0.046 s  0.060 s  0.033 s
+      + V(r) multiply                0.044 s  0.059 s  0.032 s
+      + ifftn                        2.963 s  0.805 s  0.204 s
+      + fftn   (= production)        5.740 s  1.566 s  0.359 s
+      bare ifftn+fftn on the box     2.797 s  0.836 s  0.188 s
+
+FIRST: the operator's wall IS the two transforms — 5.70 s of 5.74 s at P=1,
+99.2 %.  The sphere→box gather, the V(r) multiply, the box→sphere gather,
+the scan, BOTH per-k reshards and the einsum together are 0.047 s.  Nothing
+outside the transforms is worth optimising at this shape, and the b600/P=64
+attribution above (operator 61 %, collective 8 %) is a statement about that
+shape, not this one.
+
+SECOND: THE SHARD_MAP BOUNDARIES ARE NOT A COST.  The argument that they are
+— ``ifftn`` and ``fftn`` are each a ``shard_map``, a shard_map is a hard
+fusion boundary, therefore the 180 MiB box is re-materialised at each of the
+four crossings — was tested by putting sphere→box, both transforms, the
+multiply and box→sphere inside ONE ``shard_map`` (two crossings, not eight).
+The single-region operator is SLOWER: 5.909 s against 5.740 s at P=1
+(−2.9 %), −1.5 % at P=4, −2.6 % at P=16, and bit-identical (max rel delta
+0.000e+00).  It cannot help.  XLA never fuses an elementwise op into an
+``fft`` — it is a library call — so the box materialises between the stages
+either way, and collapsing the regions removes only the
+``SPMDFullToShardShape`` pairs, which the SPMD partitioner has already
+elided (0 of them in the optimized HLO at every P).
+
+THERE IS NO 30× OVERHEAD; THERE IS A 30× SHORTFALL IN CORES.  The 29.2
+GFLOP of transform arithmetic is "≈0.2 s" only at ~150 GFLOP/s, which is
+what 16 ranks deliver and one does not: the bare transform pair measures
+10.5 GFLOP/s at P=1, 35.0 at P=4, 155.8 at P=16.  Job 7889362 ran ``-N 1
+-n 1``.  The sweep itself is 5.740 s at P=1 and 0.359 s at P=16 — 16.0× on
+16 ranks, linear.  A wall that scales linearly in P is work.
+
+WHAT IS LEFT is a P-INDEPENDENT 1.9–2.1× over a bare transform pair on the
+same box, and it is on the PRODUCER side.  The same two transforms fed by a
+box built in-jit from ``_box_kernel`` measure 5.956 s against 2.803 s
+parameter-fed, and dropping the trailing box→sphere gather does not move it
+(5.869 s; job 7889385).  The optimized HLO says why: ``_box_kernel``'s
+gather emits the box r-major/band-minor
+(``c128[128,2,1,24,24,80]{1,0,5,4,3,2}``) and XLA:CPU's ``fft`` demands
+band-major/r-minor, so the fft operand is a relayout —
+``fft(%copy_bitcast_fusion)`` here against ``fft(%b.1)`` in the bare pair.
+Expressing the box→sphere gather on a FLATTENED r axis, so the consumer
+stops pulling the layout the other way, does NOT remove it: 5.567 s against
+5.535 s at P=1 and 0.355 s against 0.368 s at P=16, values bit-identical
+(job 7889386, arm ``prod_flatg``).  Closing it means changing the layout
+``wfn_transforms._box_kernel`` produces, which is not this module.
 """
 
 from __future__ import annotations
@@ -538,6 +618,14 @@ def vnl_operator(geom: SweepGeometry, vnl_setup) -> Operator:
     Cost per k: ``Z`` is ``(total_R, ngkmax)`` REPLICATED (32 MB at
     total_R=100, ngkmax=20000) — it does not scale with nb, so it does
     not enter the per-rank wall this sweep exists to remove.
+
+    IT DOES, HOWEVER, ENTER THE PARALLEL EFFICIENCY, and the module
+    docstring used to deny that.  Building Z is replicated work: every rank
+    builds it for every k.  Measured at MoS2 4×4 deck_b300 (nk=16, nb=128,
+    ngkmax=1964, total_R=62; job 7889392) the build is 0.017 / 0.010 /
+    0.020 s at P = 1 / 4 / 16 — flat — and 27 % → 51 % of this operator's
+    whole cost over the kinetic baseline across that range.  Read the
+    parallelism section of the module docstring for why it is left alone.
     """
     from psp import vnl_ops
 
@@ -737,6 +825,24 @@ def sweep_matrix_elements(
     says why — the mask is fused into the ``kLoop`` copy that already has
     to lay the bra out as ``c128[nb/p_x, ns·ngkmax]`` for the dot, so it
     costs a multiply on bytes that were being touched anyway.
+
+    A BAND WINDOW NEEDS NO ARGUMENT
+    -------------------------------
+    ``⟨m|O|n⟩`` takes BOTH indices from one ψ, so restricting the sweep to a
+    band window is a windowed ψ plus a geometry built at the window's
+    ``nb``::
+
+        sweep_matrix_elements(psi_G[:, lo:hi], geom=SweepGeometry(
+            ..., nb=hi - lo), ...)      ->  (nk, hi-lo, hi-lo)
+
+    and the block comes back at WINDOW indices.  Everything else keys off
+    ``geom``: the band pad, both reshards, the einsum and the output spec.
+    A ``band_window=`` argument would be a second way to say the same thing
+    and one more thing for every call site to get right — the mistake the
+    2026-08-04 SlabIO padding ruling names — so there deliberately is none.
+    The one cost is that slicing a ``('x','y')``-sharded ψ on the SHARDED
+    axis is an eager reshard; it is paid once, outside the scan, against a
+    scan whose every stage is then ``nb/(hi-lo)`` times smaller.
     """
     mesh = geom.mesh
     nk = geom.nk
@@ -855,6 +961,17 @@ def sweep_matrix_elements(
             body, None, (psi_n_XY, gvecs_, gmask_, bidx_, kvecs_))
         return jax.lax.with_sharding_constraint(H, block_sharding)
 
+    # NO ``donate_argnums``, and that is a decision rather than an omission.
+    # ψ is the only operand big enough to be worth donating — 129 MB global
+    # at the MoS2 4×4 shape, 8 MB/rank at P=16 — and its lifetime is a
+    # property of the CALLER, not of the sweep: ``gw.kin_ion_io`` does
+    # ``del H_kin_ion, psi_G`` on the next line, but
+    # ``gw.sc_iteration._PSI_G_CACHE`` holds the SAME ψ across every
+    # density-SC iteration, so a blanket donation would invalidate a buffer
+    # the next iteration reads.  Expressing it would need a per-call-site
+    # flag, and it would not reach the thing that is actually large: the
+    # 180 MiB per-k box lives inside the scan body, where donation of a jit
+    # argument cannot help it (job 7889383's stage table).
     fn = _cached_jit(
         'sweep_matrix_elements',
         (psi.shape, geom.ngkmax, geom.ns, nk, bool(use_scan),
@@ -870,10 +987,28 @@ def sweep_matrix_elements(
 # The boundary
 # ---------------------------------------------------------------------------
 
-#: Payload cap for one collective in :func:`blocks_to_host`.  256 MiB is
-#: the same order as ``common.collectives``' owner-gather chunk and is
-#: what keeps a peer's transient below the full table it is not keeping.
-_HOST_CHUNK_BYTES = 1 << 28
+def _host_chunk_bytes() -> int:
+    """Payload cap for one collective in :func:`blocks_to_host`.
+
+    THE SAME KNOB AS THE ROUTINE THIS ONE MIRRORS, not a second number.
+    ``LORRAX_COLLECTIVE_CHUNK_MB`` is the calibrated per-instruction
+    transport cap (default 128 MB; ``docs/dev/env_vars.md``), and
+    ``common.collectives._owner_gather_chunk_bytes`` is its one resolver —
+    imported here rather than re-derived, so a recalibration reaches this
+    path too.  A hard-coded ``1 << 28`` stood here until 2026-08-05, which
+    made this the only chunked collective in the tree that ignored the dial
+    it claimed to follow.
+
+    ONE DIFFERENCE IN HOW THE CAP IS SPENT, stated because in both places it
+    means PER-RANK TRANSIENT: ``gather_indexed_blocks_to_owner`` divides the
+    cap by ``world`` because ``process_allgather`` stacks one copy per rank;
+    the gather below is a reshard to a fully replicated spec, whose
+    transient is ONE chunk however large P is.  So the chunk extent here is
+    ``cap // per_k`` with no world factor, and the two are consistent, not
+    divergent.
+    """
+    from common.collectives import _owner_gather_chunk_bytes
+    return _owner_gather_chunk_bytes()
 
 
 def blocks_to_host(H, *, nb: int, owner_only: bool = False):
@@ -904,13 +1039,39 @@ def blocks_to_host(H, *, nb: int, owner_only: bool = False):
     mesh-padded extent and the pad rows and columns are exact zeros
     (products of a zero band); trimming them here is the caller stating
     logical shapes only, per decisions.md 2026-08-04.
+
+    WALL W2 SURVIVES HERE, AND WHAT IT WOULD TAKE TO REMOVE IT
+    ----------------------------------------------------------
+    The handoff's §6.4 is open: W1 (the per-k full-band FFT box) and W3
+    (the ``P ≤ nk`` ceiling) are gone, the replicated ``(nk, nb, nb)`` is
+    not — this function re-materialises it.  Scoped, because a partial
+    version that gathers anyway would be worse than an honest boundary:
+
+    * Both h5 sinks (``gw.kin_ion_io.main``, ``psp.get_dipole_mtxels.main``)
+      are RAW ``h5py.File`` writes on rank 0, not SlabIO.  ``SlabIO.
+      write_slab`` does take a sharded ``jax.Array`` and write it as a
+      hyperslab, so converting them is the mechanism — but only its FFI
+      backend writes from the shards; the allgather backend gathers to
+      rank 0 first, so under ``slab_io=auto`` resolving to allgather the
+      conversion saves nothing and the claim would be false on exactly the
+      configurations that cannot afford it.
+    * The third consumer cannot be converted at all by itself:
+      ``gw.sigma_dispatch.resolve_external_hartree`` READS the table back
+      as a replicated global operand and rotates it with
+      ``hartree_basis_rotation``, and ``gw.sc_iteration``'s
+      ``_rotate_to_dft_basis`` / ``apply_band_partition`` consume the
+      result the same way.  Removing W2 end to end is a read-side and
+      consumer change of the same size as the write-side one.
+
+    So it is three files this module does not own plus a backend-dependent
+    claim, not a change to this function.  Recorded rather than half-landed.
     """
     from common.collectives import gather_to_host, process_rank
 
     nk = int(H.shape[0])
     tail = tuple(int(s) for s in H.shape[1:])
     per_k = int(np.prod(tail)) * 16
-    step = max(1, min(nk, _HOST_CHUNK_BYTES // max(per_k, 1)))
+    step = max(1, min(nk, _host_chunk_bytes() // max(per_k, 1)))
     keep = (not owner_only) or process_rank() == 0
 
     mesh = H.sharding.mesh
