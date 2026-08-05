@@ -16,12 +16,15 @@ apply :func:`jnp.conj` themselves.
 from __future__ import annotations
 
 import functools
+import math
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+from runtime.padding import round_up, spec_divisor
 
 
 # ---------------------------------------------------------------------------
@@ -255,16 +258,207 @@ def build_wavefunctions(
 # Self-consistent QSGW: rotate the bundle into a new band basis
 # ---------------------------------------------------------------------------
 
-@jax.jit
-def _rotate_psi_bandlast(psi: jax.Array, U: jax.Array) -> jax.Array:
-    # band-last layout (k,s,μ,n): ψ'[k,s,μ,n] = Σ_m ψ[k,s,μ,m]·U[k,m,n]  (xn, yn)
-    return jnp.einsum('ksum,kmn->ksun', psi, U, optimize=True)
+#: ``(ψ field, its spec, the array axis carrying the band index)`` for the
+#: four copies, in the order :class:`Wavefunctions` stores them.  The band
+#: axis is not restated as a literal anywhere below; it is read from here.
+_PSI_LAYOUTS = (
+    ('psi_xn', PSI_XN_SPEC, 3),
+    ('psi_xr', PSI_XR_SPEC, 1),
+    ('psi_yr', PSI_YR_SPEC, 1),
+    ('psi_yn', PSI_YN_SPEC, 3),
+)
 
 
-@jax.jit
-def _rotate_psi_bandfirst(psi: jax.Array, U: jax.Array) -> jax.Array:
-    # band-first layout (k,m,s,μ): ψ'[k,n,s,μ] = Σ_m U[k,m,n]·ψ[k,m,s,μ]  (xr, yr)
-    return jnp.einsum('kmn,kmsu->knsu', U, psi, optimize=True)
+def band_mix_spec(contract_axis: str) -> P:
+    """``U`` layout for the ψ rotation: ``(nk, nb, nb)`` with the
+    CONTRACTED index m on ``contract_axis`` and n replicated.
+
+    NOT ``gw.qsgw_density.band_rotation_spec`` (``P(None,'x','y')``), and
+    the difference is forced rather than chosen.  That spec is right for
+    the G-sphere copy ``(nk, nb, ns, ngkmax)``, whose ONLY sharded axis is
+    the band axis, so m and n can take one mesh axis each.  Here μ already
+    owns a mesh axis in all four copies (``PSI_*_SPEC`` above), so n has
+    nowhere to go: n on the free mesh axis would collide with μ in the
+    output and the collision can only be paid for by resharding ψ — the
+    largest object in the bundle, and the one thing this layout exists to
+    leave alone.  m on the axis μ does NOT own contracts each rank's own
+    band slice against its existing μ slice, reduces along that one mesh
+    axis, and lands the result in the INPUT layout.
+
+    The price of a replicated n, stated because it is real: per-rank U is
+    ``nb·(nb/p)`` instead of the ``(nb/px)·(nb/py)`` that
+    ``band_rotation_spec`` gets.  Per k at nb=640 on an 8×8 mesh that is
+    819 kB against 102 kB — and against 6.5 MB replicated, which is the
+    comparison that matters, since the replicated form is the
+    ``(nk, nb, nb)`` object that reaches 9.2 GB at nb=2000/nk=144.
+    """
+    return P(None, contract_axis, None)
+
+
+def _spec_entries(spec: P, ndim: int) -> list:
+    """``spec`` as a length-``ndim`` list, so it can be indexed by ARRAY axis.
+
+    JAX can hand back a PartitionSpec with trailing ``None`` entries trimmed
+    — the hazard ``common.wfn_transforms._sharding_key`` normalises against.
+    Here it would ``IndexError`` on the band axis of the two band-last
+    copies rather than merely recompile.
+    """
+    entries = list(tuple(spec))
+    if len(entries) > ndim:
+        raise ValueError(f"spec {spec} is longer than ndim={ndim}")
+    return entries + [None] * (ndim - len(entries))
+
+
+def _contract_axis(mesh: Mesh, psi_spec: P) -> str:
+    """The mesh axis U's contracted index m must occupy for ``psi_spec``.
+
+    Whichever axis of the 2-D mesh that copy's μ index does not already
+    own — DERIVED from the spec and the mesh, not passed in.  There is
+    exactly one correct answer per copy, so an argument would be a knob
+    with a single right setting and nothing to check it against; and it
+    would have to be got right four times per call.
+    """
+    named = [e for e in tuple(psi_spec) if e is not None]
+    if len(named) != 1 or not isinstance(named[0], str):
+        raise ValueError(
+            f"rotate_wavefunctions: ψ spec {psi_spec} must place exactly one "
+            f"mesh axis (μ's); got {named}.")
+    free = [a for a in mesh.axis_names if a != named[0]]
+    if len(free) != 1:
+        raise ValueError(
+            f"rotate_wavefunctions needs a 2-D mesh with one axis free of μ; "
+            f"mesh axes {tuple(mesh.axis_names)} minus μ's '{named[0]}' left "
+            f"{free}.")
+    return free[0]
+
+
+def _place_U(U, mesh: Mesh, nb_pad: int):
+    """``U`` onto the mesh without ever building a replicated ``(nk,nb,nb)``.
+
+    A ``jax.Array`` is handed through untouched: the kernel constrains it
+    to :func:`band_mix_spec` per copy and XLA emits the minimal reshard
+    from whatever layout it arrived in — a free local slice from a
+    replicated input, a small all-gather from ``band_rotation_spec``.
+    Resharding it here to a canonical layout first would ADD a collective
+    on the replicated-input path (local slice, then gather back what the
+    rank already had).
+
+    A HOST array — what ``sc_iteration``'s k-star broadcast produces on a
+    reduced k-set — is placed straight at
+    ``gw.qsgw_density.band_rotation_spec``, reused rather than re-spelled:
+    it is the smallest of the three layouts (nb²/(px·py) per rank) and the
+    layout the distributed eigh already emits.  ``jnp.asarray`` here would
+    build the whole ``(nk, nb, nb)`` on ONE device first — 9.2 GB at
+    nb=2000/nk=144, the object this path exists to avoid — and at P>1 it
+    would be a single-device array, which is an operand-sharding error
+    against the mesh-sharded ψ rather than a slow success.
+    """
+    if isinstance(U, jax.Array):
+        return U
+    from common.collectives import device_put_process_local
+    from gw.qsgw_density import band_rotation_spec
+
+    U_np = np.asarray(U, dtype=np.complex128)
+    n_in = int(U_np.shape[1])
+    if n_in != nb_pad:
+        # Both axes, on the host: ``band_rotation_spec`` shards m AND n, so
+        # both must divide the mesh before the placement.  Zero pad — a pad
+        # ROW would rotate physical bands into a pad band and a pad COLUMN
+        # would build a pad QP state out of physical ones; zeros keep both
+        # exactly zero, and the pad columns are sliced off downstream.
+        U_np = np.pad(U_np, ((0, 0), (0, nb_pad - n_in), (0, nb_pad - n_in)))
+    return device_put_process_local(
+        U_np, NamedSharding(mesh, band_rotation_spec()))
+
+
+def _make_rotate_bundle(mesh: Mesh, a_lo: int, nb_active: int, nb_pad: int):
+    """Build the jit'd four-copy rotation.  One kernel, one lowering.
+
+    Per copy: slice the active block, put its BAND axis on the mesh axis μ
+    does not own, contract against U at :func:`band_mix_spec` for that same
+    axis, and constrain the result back to the copy's own ``PSI_*_SPEC``.
+
+    THE OUTPUT CONSTRAINT IS ONE STEP HERE, AND THAT IS NOT AN OVERSIGHT.
+    ``qsgw_density.rotate_bands`` needs two (land on 'y', then re-split)
+    because its contraction's natural output — n from U's 'y', partial over
+    'x' — is not its target layout, and constraining straight to the target
+    made XLA all-reduce the full global ψ̃ (3.36 GiB/rank measured, audit
+    2026-08-05).  Here the natural output IS the target: n comes from U's
+    REPLICATED axis and μ stays on the mesh axis it started on, so the only
+    thing left to do is finish the partial sum over the contraction axis, at
+    the size of the output shard.  That identity is the whole reason for
+    :func:`band_mix_spec`'s replicated n.
+    """
+    def rot_one(psi_full, U, spec, band_axis):
+        axis = _contract_axis(mesh, spec)
+        act = jax.lax.slice_in_dim(psi_full, a_lo, a_lo + nb_active,
+                                   axis=band_axis)
+        if nb_pad != nb_active:
+            widths = [(0, 0)] * psi_full.ndim
+            widths[band_axis] = (0, nb_pad - nb_active)
+            act = jnp.pad(act, widths)
+        # ψ's μ axis keeps the mesh axis it already had; the band axis, so
+        # far replicated over the free axis, becomes a local sub-slice of
+        # data the rank already holds.  MEASURED, because "local" is a claim
+        # about the lowering and not only about the layout: XLA lowers this
+        # as dynamic-slice + a one-hop collective-permute of the FULLY
+        # sharded active tile (source_target_pairs {{0,1},{2,3}} on a 2×2
+        # mesh, 6 kB at the gate shape, job 7889407) -- a device-order
+        # fix-up, not a gather.  Its payload is nb_act·ns·n_μ/(px·py) per
+        # rank, the smallest object in the kernel, and it SHRINKS with P.
+        m_spec = _spec_entries(spec, psi_full.ndim)
+        m_spec[band_axis] = axis
+        act = jax.lax.with_sharding_constraint(
+            act, NamedSharding(mesh, P(*m_spec)))
+        U_m = jax.lax.with_sharding_constraint(
+            U, NamedSharding(mesh, band_mix_spec(axis)))
+        if band_axis == 1:
+            # band-first (k,m,s,μ): ψ'[k,n,s,μ] = Σ_m U[k,m,n]·ψ[k,m,s,μ]
+            out = jnp.einsum('kmn,kmsu->knsu', U_m, act, optimize=True)
+        else:
+            # band-last (k,s,μ,m): ψ'[k,s,μ,n] = Σ_m ψ[k,s,μ,m]·U[k,m,n]
+            out = jnp.einsum('ksum,kmn->ksun', act, U_m, optimize=True)
+        # The reduction over m is a psum along ``axis`` ALONE, not a global
+        # collective: m is the only index on that axis and every other index
+        # of the result is either replicated (n, s) or already placed (μ).
+        # Measured on a 2×2 mesh (job 7889407): two all-reduces, replica
+        # group 2 not 4, each at exactly one ψ output shard, and XLA's
+        # combiner merges the two copies that share a contraction axis into
+        # one.  The replicated-U path it replaces had NO collective at all
+        # and paid for it with a full (nb, nb) per rank and px-fold
+        # redundant flops -- that is the trade, stated rather than implied.
+        out = jax.lax.with_sharding_constraint(out, NamedSharding(mesh, spec))
+        if nb_pad != nb_active:
+            out = jax.lax.slice_in_dim(out, 0, nb_active, axis=band_axis)
+        return jax.lax.dynamic_update_slice_in_dim(psi_full, out, a_lo,
+                                                   axis=band_axis)
+
+    @jax.jit
+    def fn(psi_xn, psi_xr, psi_yr, psi_yn, U):
+        U = jnp.asarray(U, dtype=jnp.complex128)
+        n_in = int(U.shape[1])
+        if n_in != nb_pad:
+            U = jnp.pad(U, ((0, 0), (0, nb_pad - n_in), (0, nb_pad - n_in)))
+        return tuple(
+            rot_one(psi, U, spec, band_axis)
+            for psi, (_, spec, band_axis) in zip(
+                (psi_xn, psi_xr, psi_yr, psi_yn), _PSI_LAYOUTS))
+    return fn
+
+
+def _rotate_kernel(mesh: Mesh, a_lo: int, nb_active: int, nb_pad: int):
+    """One built kernel per (mesh, active window, pad extent).
+
+    ``common.wfn_transforms._cached_jit`` rather than a private dict here:
+    it is the tree's one kernel-cache idiom (``qsgw_density`` and the ψ
+    transforms both use it), so the caches share a namespace and a
+    lifetime.  Imported lazily to keep this module's import graph — jax,
+    numpy and ``runtime.padding`` — unchanged for its many importers.
+    """
+    from common.wfn_transforms import _cached_jit
+    return _cached_jit(
+        'rotate_wavefunctions', (id(mesh), a_lo, nb_active, nb_pad),
+        lambda: _make_rotate_bundle(mesh, a_lo, nb_active, nb_pad))
 
 
 def rotate_wavefunctions(
@@ -278,6 +472,49 @@ def rotate_wavefunctions(
 ) -> Wavefunctions:
     """Return a new ``Wavefunctions`` bundle with the **active subspace**
     rotated by ``U_dft_to_qp_active[k, m, n] = ⟨DFT_m | QP_n⟩``.
+
+    COLUMN CONVENTION.  ``U[k, m, n]`` is component m of QP band n, so
+    ψ̃_n = Σ_m U[m,n] ψ_m — ``jnp.linalg.eigh``'s convention, ScaLAPACK's,
+    ``qsgw_density.rotate_bands``' and ``sc_iteration._rotate_to_dft_basis``'.
+    The transpose is a bug MOST TESTS CANNOT SEE: for a unitary Q, Qᵀ is
+    also unitary and also mixes only within the occupied block, so norms,
+    orthonormality and occupied-block invariance all survive it.  It is
+    pinned in ``tests/multi_device/wfn_rotate_gate.py`` against an explicit
+    host-side rotation with a negative control, not against an invariance.
+
+    U IS NEVER REPLICATED
+    ---------------------
+    Each ψ copy is rotated against U sharded :func:`band_mix_spec` for the
+    mesh axis that copy's μ does NOT own — m on 'x' for the two y-copies,
+    m on 'y' for the two x-copies.  So no rank holds a full ``(nb, nb)``,
+    ψ stays where it is, and the sum over m is a psum along a single mesh
+    axis rather than a global collective.  See :func:`band_mix_spec` for
+    why n is replicated and :func:`_make_rotate_bundle` for why the output
+    needs only one sharding constraint and what the lowering actually
+    emits.
+
+    The arithmetic drops by the same factor.  Under a replicated U every
+    rank contracted the WHOLE band sum against its own μ slice, so the p
+    ranks sharing a μ slice each did the identical work; now each does
+    ``nb/p`` of it and the psum adds the pieces.  That redundancy, not the
+    bytes, is the larger of the two effects on a square mesh.
+
+    Two U layouts are materialised, not one — the x-copies and the
+    y-copies contract on different mesh axes.  What the scaling target
+    bounds is the LARGEST U operand any single rank must hold, and that is
+    ``nk·nb²/p·16 B`` against ``nk·nb²·16 B`` replicated on every mesh with
+    an axis > 1: 6.25 MiB → 0.78 MiB per k at nb=640 on an 8×8 mesh.  Their
+    SUM is ``nk·nb²·(1/px + 1/py)·16 B``, a factor px·py/(px+py), and since
+    the mesh is square (``common.collectives.resolve_mesh`` refuses others)
+    that is p/2: no saving at 2×2, 4× at 8×8 (P=64), 8× at 16×16.  Measured
+    at 2×2 (job 7889407): worst operand 2.00×, sum 1.00×.
+
+    What arrives already sharded is the CALLER's half of this.  A
+    replicated ``U`` costs nothing extra here (the constraint is a local
+    slice) but was replicated before the call; ``sc_iteration`` can hand
+    over a distributed one by asking ``_make_kshard_eigh`` for
+    ``u_spec=qsgw_density.band_rotation_spec()``, which it already
+    supports, or by using ``distributed_eigh_bands``, which emits it.
 
     Active / inactive partition
     ---------------------------
@@ -329,23 +566,29 @@ def rotate_wavefunctions(
             f"rotate_wavefunctions: U shape {U_dft_to_qp_active.shape} "
             f"inconsistent with active block size {nb_active}.")
 
-    # Pull the active sub-blocks via the bundle's jit'd accessors (cached),
-    # rotate, then dynamic-update-slice back into a copy of the full ψ.
-    with mesh_xy:
-        psi_xn_act = _rotate_psi_bandlast(wfns_dft.xn(active_slice), U_dft_to_qp_active)
-        psi_xr_act = _rotate_psi_bandfirst(wfns_dft.xr(active_slice), U_dft_to_qp_active)
-        psi_yr_act = _rotate_psi_bandfirst(wfns_dft.yr(active_slice), U_dft_to_qp_active)
-        psi_yn_act = _rotate_psi_bandlast(wfns_dft.yn(active_slice), U_dft_to_qp_active)
+    # THE CONTRACTED BAND EXTENT MUST DIVIDE THE MESH.  ``nb_active`` is a
+    # band WINDOW (b3 - b0), not the loader's mesh-divisible ψ extent, so it
+    # need not divide px or py; ``with_sharding_constraint`` refuses an
+    # indivisible axis outright rather than degrading (runtime.padding).
+    # The divisors come from the spec, not from mesh.shape, so a
+    # band_mix_spec that ever became a product axis stays covered.
+    pad_div = 1
+    for _field, spec, _band_axis in _PSI_LAYOUTS:
+        pad_div = math.lcm(pad_div, spec_divisor(
+            mesh_xy, band_mix_spec(_contract_axis(mesh_xy, spec)), 1))
+    nb_pad = round_up(nb_active, pad_div)
 
-        # Reassemble — bands outside the active block stay DFT.
-        psi_xn = jax.lax.dynamic_update_slice_in_dim(
-            wfns_dft.psi_xn, psi_xn_act, a_lo, axis=-1)
-        psi_xr = jax.lax.dynamic_update_slice_in_dim(
-            wfns_dft.psi_xr, psi_xr_act, a_lo, axis=1)
-        psi_yr = jax.lax.dynamic_update_slice_in_dim(
-            wfns_dft.psi_yr, psi_yr_act, a_lo, axis=1)
-        psi_yn = jax.lax.dynamic_update_slice_in_dim(
-            wfns_dft.psi_yn, psi_yn_act, a_lo, axis=-1)
+    U = _place_U(U_dft_to_qp_active, mesh_xy, nb_pad)
+
+    # Slice the active block, rotate it against the sharded U, and
+    # dynamic-update-slice it back into a copy of the full ψ — one jit for
+    # all four copies, so there is a single lowering and no eager pjit per
+    # accessor call.  Bands outside the active block stay DFT.
+    with mesh_xy:
+        rotate = _rotate_kernel(mesh_xy, a_lo, nb_active, nb_pad)
+        psi_xn, psi_xr, psi_yr, psi_yn = rotate(
+            wfns_dft.psi_xn, wfns_dft.psi_xr, wfns_dft.psi_yr,
+            wfns_dft.psi_yn, U)
 
         # enk: copy DFT, replace the active block with the new eigenvalues.
         enk_full = wfns_dft.enk.at[:, active_slice].set(

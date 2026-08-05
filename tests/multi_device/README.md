@@ -22,3 +22,17 @@ real `liblorrax_ffi_host.so`, so it cannot run under plain pytest.
 If it ever fails, read each rank's OWN stderr file: the writer's diagnostic is
 lost from the merged log under srun+apptainer at teardown, which is precisely
 why the original failure went unattributed for a day.
+
+Sharded-U ψ rotation gate: `wfn_rotate_gate.py`, any square P (2×2 is the
+standard leg). Certifies `gw.wavefunction_bundle.rotate_wavefunctions` against
+the replicated-U path it replaces AND against an explicit host rotation with a
+transposed-U negative control — the transpose of a unitary is also unitary and
+also mixes only within the occupied block, so no invariance check can see it.
+Also reports the per-rank U residency and a collective census (kind, result
+bytes, replica-group size) of the compiled kernel, which is where the claim
+"the band sum reduces along ONE mesh axis" is actually checked.
+
+    srun -n 4 python3 -m wfn_rotate_gate      # WR_NK/NB/NS/NMU/NACT/NOCC
+
+Harness: `/scratch2/08271/jackmc/wfn_rotate/wrgate.sbatch` (N=2, n=4, live
+tree). Green at job 7889407.
