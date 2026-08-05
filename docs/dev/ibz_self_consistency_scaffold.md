@@ -432,3 +432,76 @@ plausible number.
 Gated by `tests/test_sc_band_window.py` on a SYNTHETIC `b0 = 12` window
 with a recording loader stub — there is no deck with `nval < nelec` in the
 tree, so this is coverage of the call, not of a physical result.
+
+## 10. Status 2026-08-05 — the k-star map runs on the device
+
+§9 left every `KStarMap` call as host numpy. `select`, `broadcast` and
+`spread` are called four times per iteration on `(n_k, nb, nb)`
+complex128 — 4.2 MB at nk=16/nb=128, 9.2 GB at nk=144/nb=2000 — and each
+call was a device→host copy, a host index, a re-upload and the pipeline
+sync `np.asarray` forces.
+
+### 10.1 What moved
+
+`common.symmetry_maps` dispatches on the operand. The index tables stay
+host int32 (`n_k` integers, built once in `KStarMap.__init__`); a
+`jax.Array` operand is gathered where it is, by one cached jit per (index
+table, aval, layout) with the table baked into the closure as a constant,
+the pattern `_get_unfold_v_q_jit` already uses. A numpy operand takes the
+numpy path unchanged, which `gw.scissor.k_star_weights` and the star gate
+rely on.
+
+The output sharding is the operand's own (`_row_out_sharding`): a take
+along axis 0 leaves the trailing axes alone, so `P(None,'x','y')` in gives
+`P(None,'x','y')` out. Star gate check 4 reports the in and out specs and
+requires the device result to be bit-identical to the host one (`0.0e+00`
+for all three helpers at P=1 and P=4).
+
+`gw.efermi` moved for the same reason: `fermi_level_step` runs every
+iteration on `E` fresh off the eigh, and a numpy body forced a `(n_k, nb)`
+readback and a mid-iteration sync. Its body is one `jax.jit` kernel. The
+degenerate-manifold refusal, which `qsgw_density.distributed_eigh_bands`'s
+gauge argument depends on, is computed in the kernel and returned as a
+flag in the same 3-vector that carries E_F; the host wrapper raises the
+same `ValueError`.
+
+### 10.2 The `spread` diagnostic
+
+Kept: it is the only check in the loop that sees a gauge mismatch
+introduced upstream, since hermiticity, the norm and the electron count
+all survive one. `KStarMap.spread_rel` does both reductions (residual and
+scale) in one compiled module and transfers 16 bytes, where the two-call
+form read Σ+V_H back twice to print one number. It still synchronises,
+which costs nothing here: `_run_linear_mixing` and `_run_rcrop` each do
+`np.asarray(eigvalsh_kshard(H))` on the new carry once per iteration
+anyway.
+
+### 10.3 P>1
+
+The IBZ arm had never run at P>1. The audit predicted the failure at
+`U_full`'s two consumers; it is not there. `jnp.asarray` of a host array
+yields an *uncommitted* `jax.Array`, which JAX moves to match committed
+sharded operands, so `rotate_bands` and `rotate_wavefunctions` accepted
+the host U. The first failure was the V_H select — `np.asarray` of the
+matrix-element sweep's `P(None,'x','y')` output — `RuntimeError: Fetching
+value for jax.Array that spans non-addressable (non process local)
+devices`, at `sc_iteration.py:701` of the pre-change tree, measured at P=4
+(job 7889591). With the gathers on the device the same deck runs to
+completion at P=4.
+
+### 10.4 A one-ulp cliff in the step-occupation E_F
+
+`fermi_level_step` located the exact-fill (gapped) case with
+`searchsorted(cum, target)` and then tested `|cum[i] − target| ≤ tol`. In
+the gapped case `cum` lands on the target to round-off and which side
+depends on the summation order, i.e. on the backend: on
+`test_agrees_with_sc_iteration_midgap_on_a_real_gap` numpy's sequential
+cumsum gives `cum[47] = 8.000000000000005`, XLA's a couple of ulp below 8.
+`searchsorted` returns 47 in one case and 48 in the other, and at 48 the
+exact-fill test compares against a partial sum a whole state above the
+target, fails, and the metallic branch interpolates ~1e-14 into the gap:
+E_F at the VBM (0.2644556) instead of midgap (4.9158349), so `E < E_F`
+drops one band per k from ρ. The pre-change host code has the same cliff
+and landed on the safe side (forcing its `cum[47]` one ulp low returns the
+VBM). The search is now at `target − tol`, which finds the nearest partial
+sum in the exact case and the same index as before in the metallic one.

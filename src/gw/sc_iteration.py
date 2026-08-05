@@ -458,9 +458,10 @@ def _kstar(inputs):
 # No ``watch`` on the parent: every child that produces a device array
 # blocks on it (see each one's note), so the last statement of this
 # function has already been synchronised and the inclusive time is real.
-# What is left in the parent's SELF column is host work only — the
-# ``np.asarray(E_qp_ry)`` readback, ``fermi_level_step`` and
-# ``step_occupations`` in numpy, and ``padded_gvectors``.
+# What is left in the parent's SELF column is host work only —
+# ``padded_gvectors`` and the two scalars ``gw.efermi`` brings back (E_F
+# and the electron count).  ``fermi_level_step`` and ``step_occupations``
+# are jit kernels, so E is no longer read back here.
 #
 # MEASURED, MoS2 4x4 / nb=128 / nk=16 (IBZ 10) / N_mu=785 / P=1, 5
 # iterations, job 7889362.  Per iteration, against a 62.4 s SC iteration:
@@ -505,7 +506,8 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
 
     No mixing: straight rho_out feedback, by owner ruling (2026-08-04).
     """
-    from gw.efermi import fermi_level_step, step_occupations
+    from gw.efermi import (fermi_level_step, occupied_band_count,
+                           step_occupations)
     from gw.qsgw_density import rotate_bands, hartree_from_orbitals
     from psp.get_DFT_mtxels import spin_degeneracy_factor
     from common.mtxel_sweep import (SweepGeometry, local_potential_operator,
@@ -516,9 +518,10 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
     nk, nb = int(psi_G.shape[0]), int(psi_G.shape[1])
     kweights = np.full(nk, 1.0 / nk)          # full BZ => uniform, no star
 
-    E_np = np.asarray(E_qp_ry)
-    e_f = fermi_level_step(E_np, kweights, float(inputs.meta.nelec))
-    occ = step_occupations(E_np, e_f)
+    # E stays on the device: both are jit kernels over ``E`` (``gw.efermi``
+    # header) and only E_F and the degeneracy flag cross.
+    e_f = fermi_level_step(E_qp_ry, kweights, float(inputs.meta.nelec))
+    occ = step_occupations(E_qp_ry, e_f)
 
     # Rotated orbitals: needed for rho, NOT for the contraction below.
     psi_qp = rotate_bands(psi_G, U_qp, mesh=inputs.mesh_xy)
@@ -529,7 +532,9 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
         box_index=bidx, fft_grid=grid,
         truncation_2d=bool(getattr(inputs.config, "sys_dim", 3) == 2),
         spin_degeneracy=f_spin,
-        expected_electrons=f_spin * float(np.einsum("k,kn->", kweights, occ)),
+        # ``occupied_band_count`` rather than a second einsum: same
+        # contraction, and it is the number ``fermi_level_step`` targets.
+        expected_electrons=f_spin * occupied_band_count(occ, kweights),
         print_fn=inputs.print_fn)
 
     gtab = padded_gvectors(inputs.wfn, k="full_bz")
@@ -632,7 +637,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # k-set (efermi.py:50-53), hence the divide by nk_full.
             w_k = k_star_weights(_kstar(inputs))
             efermi_ry = fermi_level_step(
-                np.asarray(E_qp_ry), w_k / float(w_k.sum()), float(n_occ))
+                E_qp_ry, w_k / float(w_k.sum()), float(n_occ))
         else:
             # SAME U LAYOUT AS THE DENSITY-SC BRANCH.  The k-sharded eigh
             # allgathered U back to replicated by default; every consumer
@@ -658,27 +663,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # plus a conjugation on time-reversed members -- a band index is
     # symmetry-inert, so no umklapp phase or centroid permutation enters
     # (see common.symmetry_maps, above star_select).
-    # NOT TIMED, AND THE NUMBER IS THE REASON.  A ``sc.kstar`` section over
-    # this broadcast, the V_H select below and the Σ spread/select together
-    # measured 0.071 s over 15 calls inside a 312 s SC driver (0.02%) on the
-    # MoS2 4x4 IBZ deck, nk 16 -> 10, job 7889362 — and exactly 0.000 s over
-    # 5 calls on a full-BZ deck, where ``is_identity`` makes all three
-    # no-ops (job 7889360).  Both are index takes on host numpy arrays that
-    # ``np.asarray`` had to produce anyway; the row would be 0.0% in every
-    # table that prints it.
-    # ``_replicate`` BEFORE THE HOST READ, and it is not cosmetic: the
-    # broadcast runs on host numpy, and ``np.asarray`` of a mesh-sharded
-    # jax.Array raises "Fetching value for jax.Array that spans
-    # non-addressable (non process local) devices" at P>1 (measured, job
-    # 7889419).  U has been sharded on the density-SC branch since
-    # ``distributed_eigh_bands`` landed, so this was already unreachable at
-    # P>1 with ``sc_on_ibz`` on; both branches emit a sharded U now.  On a
-    # replicated U the ``device_put`` is a no-op, so the full-BZ default
-    # path is untouched.
+    # The broadcast is a device gather and keeps the operand's sharding
+    # (``common.symmetry_maps``, ``_row_out_sharding``), so U_full arrives
+    # at ``band_rotation_spec`` — what ``rotate_bands`` and
+    # ``rotate_wavefunctions`` want — and U never crosses to the host.  It
+    # needs no ``_replicate`` first, unlike the host-numpy form it replaces.
     ks = _kstar(inputs)
-    U_full = (ks.broadcast(np.asarray(_replicate(U_qp, inputs.mesh_xy)))
-              if not ks.is_identity else U_qp)
-    E_full = ks.broadcast(np.asarray(E_qp_ry)) if not ks.is_identity else E_qp_ry
+    U_full = U_qp if ks.is_identity else ks.broadcast(U_qp)
+    E_full = E_qp_ry if ks.is_identity else ks.broadcast(E_qp_ry)
 
     wfns_qp = rotate_wavefunctions(
         inputs.wfns_dft, U_full,
@@ -698,7 +690,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         v_h_dft_new, e_f_ry = rebuild_hartree_dft_basis(
             inputs, U_full, E_full)
         if not ks.is_identity:
-            v_h_dft_new = jnp.asarray(ks.select(np.asarray(v_h_dft_new)))
+            v_h_dft_new = ks.select(v_h_dft_new)
         inputs.print_fn(
             f"    density-SC: rebuilt V_H from iteration {state.iteration} "
             f"orbitals (E_F = {e_f_ry:.6f} Ry)")
@@ -761,12 +753,15 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # star spread is the free check that the two k-sets agree, and the
         # only one that catches a gauge mismatch upstream; hermiticity,
         # the norm and the electron count all survive one.
-        resid = ks.spread(np.asarray(delta_h_qp))
-        scale = max(float(np.abs(np.asarray(delta_h_qp)).max()), 1e-300)
+        # ``spread_rel`` does both reductions (residual and scale) in one
+        # compiled module and brings back 16 bytes, where the two-call form
+        # read this (nk, nb, nb) array back twice to print one line.  Its
+        # scalar read still synchronises, but the iteration synchronises
+        # anyway in ``_run_linear_mixing`` / ``_run_rcrop``.
         inputs.print_fn(
-            f"    k-star: Σ+V_H residual {resid / scale:.3e} rel over "
-            f"{ks.nk_full}->{ks.nk_irr} k ({ks.reduction:.2f}x)")
-        delta_h_qp = jnp.asarray(ks.select(np.asarray(delta_h_qp)))
+            f"    k-star: Σ+V_H residual {ks.spread_rel(delta_h_qp):.3e} rel "
+            f"over {ks.nk_full}->{ks.nk_irr} k ({ks.reduction:.2f}x)")
+        delta_h_qp = ks.select(delta_h_qp)
     delta_h_dft = _rotate_to_dft_basis(delta_h_qp, U_qp, mesh=inputs.mesh_xy)
     if v_h_dft_new is not None:
         delta_h_dft = delta_h_dft + v_h_dft_new
@@ -778,8 +773,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     e_dft_act = inputs.e_dft_active_kn_ry
     val_mask = inputs.valence_mask_active_kn
     if not ks.is_identity:
-        e_dft_act = jnp.asarray(ks.select(np.asarray(e_dft_act)))
-        val_mask = jnp.asarray(ks.select(np.asarray(val_mask)))
+        e_dft_act = ks.select(e_dft_act)
+        val_mask = ks.select(val_mask)
     # ``ks``, NOT A WEIGHT ARRAY.  The scissor refit is a REDUCTION over k
     # and the only one in the carry, so it needs star multiplicities, not
     # just the right k-set (§7 of the scaffold labels operands by k-set;
@@ -1244,7 +1239,10 @@ def run_sc_driver(
         else:
             kstar = kstar_io
             print_fn(f"  SC: {kstar!r} — H/E/U on the IBZ, Σ on the full BZ")
-            kin_ion = jnp.asarray(kstar.select(np.asarray(kin_ion)))
+            # Device gather — ``np.asarray`` here would raise "spans
+            # non-addressable devices" the moment ``kin_ion`` arrives
+            # sharded, and it is the same (nk, nb, nb) object as U.
+            kin_ion = kstar.select(kin_ion)
 
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,

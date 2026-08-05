@@ -22,6 +22,12 @@ The negative control matters as much as the check: a matrix that is NOT
 symmetry-related must show a large spread, or the test would pass on a
 deck whose stars are all singletons and prove nothing.
 
+Check 4 is about WHERE the operand lives.  ``select``/``broadcast``/
+``spread`` dispatch on the operand so a sharded ``jax.Array`` never
+crosses to the host, and the device and host paths must be BIT-IDENTICAL:
+they are index takes plus a conj, so any difference means one of them is
+doing arithmetic the other is not.
+
 Env: STAR_NB, STAR_DECK (an input dir containing WFN.h5 + deck.in).
 """
 import os
@@ -34,8 +40,10 @@ RUNTIME = initialize_communicator_stack()
 import numpy as np                                            # noqa: E402
 import jax                                                    # noqa: E402
 import jax.numpy as jnp                                       # noqa: E402
+from jax.sharding import NamedSharding, PartitionSpec as P    # noqa: E402
 
-from common.collectives import (process_count, process_rank,   # noqa: E402
+from common.collectives import (device_put_process_local,      # noqa: E402
+                                process_count, process_rank,
                                 resolve_mesh)
 from common.symmetry_maps import (SymMaps, star_select,        # noqa: E402
                                   star_broadcast, star_spread)
@@ -148,7 +156,39 @@ def main():
     p0(f"[star]    IBZ block {T_irr.shape} from full {T.shape} — the eigh "
        f"cost drops by {nk / max(n_star, 1):.2f}x")
 
-    ok = ok1 and ok2 and ok3
+    # ---- 4. the same three helpers on a DEVICE operand -------------------
+    # The SC loop hands these a sharded jax.Array and must get one back,
+    # with the same numbers and the same sharding.  The bar is
+    # bit-identical, not close: see the module note.
+    sh = NamedSharding(mesh, P(None, "x", "y"))
+    # ``device_put_process_local``: T is already the same on every rank
+    # (``blocks_to_host(owner_only=False)`` gathered it), so a plain
+    # ``jax.device_put`` would spend a hidden all-gather to assert that.
+    T_dev = device_put_process_local(np.ascontiguousarray(T), sh)
+    def _host(a):
+        """Gather to replicated FIRST — ``np.asarray`` of a mesh-sharded
+        array raises "spans non-addressable devices" at P>1."""
+        rep = NamedSharding(mesh, P(*([None] * int(a.ndim))))
+        return np.asarray(jax.device_put(a, rep))
+
+    T_irr_d, _ = star_select(T_dev, irr)
+    T_back_d = star_broadcast(T_irr_d, irr, sidx, n_spatial, labels)
+    spread_d = star_spread(T_dev, irr, sidx, n_spatial)
+    d_sel = float(np.abs(_host(T_irr_d) - T_irr).max())
+    d_bck = float(np.abs(_host(T_back_d) - T_back).max())
+    d_spr = abs(spread_d - spread)
+    stayed = (isinstance(T_irr_d, jax.Array)
+              and isinstance(T_back_d, jax.Array)
+              and T_irr_d.sharding.spec == sh.spec
+              and T_back_d.sharding.spec == sh.spec)
+    ok4 = (d_sel == 0.0) and (d_bck == 0.0) and (d_spr == 0.0) and stayed
+    p0(f"[star] 4. device operand: select {d_sel:.1e}  broadcast {d_bck:.1e}  "
+       f"spread {d_spr:.1e}  (all must be 0.0)  sharding kept={stayed}  "
+       f"{'PASS' if ok4 else 'FAIL'}")
+    p0(f"[star]    out specs: select {T_irr_d.sharding.spec}  "
+       f"broadcast {T_back_d.sharding.spec}  (in {sh.spec})")
+
+    ok = ok1 and ok2 and ok3 and ok4
     p0(f"[star] VERDICT {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 

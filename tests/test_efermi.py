@@ -1,23 +1,21 @@
 """Step-occupation Fermi level: gapped, metallic, degenerate, k-weighted.
 
-Pure numpy — ``gw.efermi`` imports nothing from jax, so this runs on a
-login node without the container.  Loaded by path rather than by package
-import for that reason (``gw/__init__.py`` pulls in jax transitively).
-"""
-import importlib.util
-import os
+RUNS IN THE CONTAINER, NOT ON A LOGIN NODE.  ``gw.efermi`` is a jax.jit
+kernel now, so this imports it normally instead of by path and runs with
+the container gates: ``/scratch2/08271/jackmc/dsc_demo/sc_gates.sbatch``
+runs it alongside ``test_scissor_weights`` / ``test_sc_band_window`` /
+``test_layering``.
 
+The degenerate refusal and the occupation dtype are checked with E on a
+device as well as on the host — that is the path the SC loop takes, and
+the refusal is decoded from a kernel flag rather than raised where it is
+found.
+"""
 import numpy as np
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src", "gw", "efermi.py")
-_spec = importlib.util.spec_from_file_location("efermi", os.path.abspath(_SRC))
-efermi = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(efermi)
-
-fermi_level_step = efermi.fermi_level_step
-step_occupations = efermi.step_occupations
-occupied_band_count = efermi.occupied_band_count
+from gw.efermi import (fermi_level_step, occupied_band_count,
+                       step_occupations)
 
 
 def _roundtrip(E, w, n):
@@ -69,10 +67,16 @@ def test_degenerate_manifold_is_refused_not_approximated():
     ``E < E_F`` takes every state at that energy or none, so any returned
     number would surface only as a wrong electron count much later.
     """
+    import jax.numpy as jnp
+
     E = np.array([[0.0, 1.0, 1.0, 1.0, 5.0]] * 2)
     w = np.array([0.5, 0.5])
     with pytest.raises(ValueError, match="degenerate manifold"):
         fermi_level_step(E, w, 3.0)
+    # And with E on a device: the condition is decoded from the kernel's
+    # returned 3-vector there, and that is the path the SC loop takes.
+    with pytest.raises(ValueError, match="degenerate manifold"):
+        fermi_level_step(jnp.asarray(E), w, 3.0)
 
 
 def test_agrees_with_sc_iteration_midgap_on_a_real_gap():
@@ -105,8 +109,18 @@ def test_kweights_shape_mismatch_refuses():
 
 
 def test_occupations_are_float64_for_the_fractional_successor():
-    """The dtype is the contract ρ contracts against; keep it float64."""
+    """The dtype is the contract ρ contracts against; keep it float64.
+
+    ``rho_from_wfns`` takes these as a WEIGHT, so the finite-temperature
+    successor swaps in a Fermi–Dirac factor with no consumer changing.
+    The device operand must keep the dtype: it is the one that reaches ρ.
+    """
+    import jax.numpy as jnp
+
     E = np.array([[0.0, 1.0, 2.0]])
     occ = step_occupations(E, 1.5)
     assert occ.dtype == np.float64
     assert occ.tolist() == [[1.0, 1.0, 0.0]]
+    occ_dev = step_occupations(jnp.asarray(E), 1.5)
+    assert occ_dev.dtype == np.float64
+    assert occ_dev.tolist() == [[1.0, 1.0, 0.0]]

@@ -1714,62 +1714,254 @@ class SymMaps:
 # k-stars: selecting to the IBZ and broadcasting back
 # ---------------------------------------------------------------------------
 #
-# WHY THERE IS NO CENTROID PERMUTATION HERE, unlike :func:`unfold_v_q`.
-#
-# ``WfnLoader.load(k='full_bz')`` builds the full-BZ ψ BY UNFOLDING the IBZ
-# ψ in G-space — rotating G-vectors, applying the τ phase, the spinor
-# rotation and the TRS conjugation (loader docstring, ``load``).  So for a
-# star member ``Sk̄``, band n IS the unfold of band n at ``k̄``:
+# AN INDEX MAP, NOT AN UNFOLD.  ``WfnLoader.load(k='full_bz')`` builds the
+# full-BZ ψ by unfolding the IBZ ψ in G-space (rotated G-vectors, τ phase,
+# spinor rotation, TRS conjugation), so band n at a star member ``Sk̄`` is
+# the unfold of band n at ``k̄``:
 #
 #     ψ_{Sk̄,n} = 𝒰(S) ψ_{k̄,n}          at FIXED band index n
 #
-# Any operator O that commutes with S therefore has the SAME matrix at
-# every member of a star,
-#
-#     ⟨m,Sk̄|O|n,Sk̄⟩ = ⟨m,k̄|𝒰†O𝒰|n,k̄⟩ = ⟨m,k̄|O|n,k̄⟩
-#
-# and so does its eigenvector matrix.  Moving a BAND-INDEX object between
-# the IBZ and the full BZ is consequently an INDEX MAP, not arithmetic:
-# no umklapp phase, no ``sym_perm`` gather, no spinor rotation.
-#
-# ``unfold_v_q`` needs all of those because ``V_q[μ,ν]`` is indexed by
-# REAL-SPACE centroids, and a symmetry moves r.  ``H[m,n]`` and ``U[m,n]``
-# are indexed by bands, and a symmetry does not move a band.  The two
-# routines are not variants of each other and must not be unified.
+# An operator O commuting with S then has the same matrix at every member
+# of the star, ⟨m,Sk̄|O|n,Sk̄⟩ = ⟨m,k̄|O|n,k̄⟩, and so does its eigenvector
+# matrix.  Moving a BAND-INDEX object between the IBZ and the full BZ is
+# therefore pure indexing: no umklapp phase, no ``sym_perm`` gather, no
+# spinor rotation.  ``unfold_v_q`` needs all three because ``V_q[μ,ν]`` is
+# indexed by real-space centroids and a symmetry moves r; bands it does
+# not move.  The two routines are not variants of each other.
 #
 # SPATIAL IS EQUALITY, TIME REVERSAL IS CONJUGATION.  Θ = iσ_y K is
-# ANTIunitary, so for a Hermitian O commuting with it,
+# ANTIunitary, so for O commuting with it,
 #
 #     ⟨Θm,k|O|Θn,k⟩ = conj(⟨m,k|O|n,k⟩)   ⇒   O(−k) = conj(O(k))
 #
-# MEASURED, job 7889235, MoS₂ 4×4 (nk 16→10, ntran=2): spatial pairs 0,
-# TRS pairs 6, ``max|O(−k) − conj(O(k))| = 1.19e-16`` while plain equality
-# is off by 3.6e-01 RELATIVE.  Assuming equality is therefore not a small
-# error on a TRS-reduced deck — it is the whole matrix, on every
-# non-singleton star, and it is invisible to hermiticity, to the norm and
-# to the electron count.  Same shape as the two-halves-of-TRS bug
-# ``unfold_psi`` documents.
+# ``sym_idx_k >= n_sym_spatial`` marks the time-reversed members, the same
+# convention ``unfold_psi`` and ``unfold_v_q`` use.  Assuming equality
+# instead is not a small error: on MoS₂ 4×4 (nk 16→10, 6 TRS pairs) the
+# conjugation rule holds to 1.2e-16 while equality is off by 3.6e-01
+# RELATIVE, on every non-singleton star, and hermiticity, the norm and the
+# electron count all survive it.  Conjugation rather than transposition:
+# the two agree for Hermitian O, only conjugation stays correct for a
+# non-Hermitian channel.
 #
-# Conjugation rather than transposition is written here even though the
-# two agree for Hermitian O, matching ``unfold_v_q``'s choice and for its
-# reason: it stays correct for a non-Hermitian channel.
+# :func:`star_spread` checks the premise that full-BZ ψ really is the
+# unfold.  A path that built it another way (an independent nscf, a
+# re-phasing) would show a large residual, and nothing here would hold.
 #
-# The premise — that full-BZ ψ really is the unfold — is checkable, and
-# :func:`star_spread` is the check.  If some path ever produces full-BZ ψ
-# another way (an independent nscf, a re-phasing), the residual stops
-# being round-off and everything below is invalid.
+# WHICH OPERAND MOVES.  The index tables — ``irr_idx_k``, ``sym_idx_k``
+# and the row tables built from them — are ``n_k`` integers and stay on
+# the host.  The array operand is ``(n_k, nb, nb)`` complex128, 9.2 GB at
+# nk=144/nb=2000 and four calls per SC iteration, so every helper below
+# dispatches on it: a ``jax.Array`` is gathered where it already is and
+# keeps its sharding, a numpy array takes the numpy path unchanged
+# (``gw.scissor.k_star_weights`` and the star gate pass host arrays in).
+# The index tables are baked into the jit closure as constants, as
+# :func:`_get_unfold_v_q_jit` bakes the centroid tables (runtime-arg form
+# measured ~2× slower per call).
+
+
+_STAR_JIT_CACHE: dict = {}
+
+
+def _cached_star_jit(key, build):
+    """One compiled module per (index table, operand aval, layout)."""
+    fn = _STAR_JIT_CACHE.get(key)
+    if fn is None:
+        fn = build()
+        _STAR_JIT_CACHE[key] = fn
+    return fn
+
+
+def _jit_with(fn, out_sh):
+    """``jax.jit(fn)``, pinning the output sharding only when there is one.
+
+    In jax 0.9 ``out_shardings=None`` is not the same as omitting the
+    argument (``pjit._parse_jit_arguments`` keeps ``None`` as a leaf,
+    distinct from ``UnspecifiedValue``), so the two cases are two calls.
+    """
+    return jax.jit(fn) if out_sh is None else jax.jit(fn, out_shardings=out_sh)
+
+
+def _row_out_sharding(A):
+    """``A``'s own sharding, when a row gather cannot invalidate it.
+
+    A take along axis 0 leaves the trailing axes alone, so the operand's
+    spec is still valid for the result PROVIDED axis 0 is replicated — it
+    is for every SC operand (U and Σ are ``P(None, 'x', 'y')`` from
+    ``qsgw_density.band_rotation_spec``, E is ``P(None, None)``).  If axis
+    0 were mesh-sharded the new k extent need not divide that mesh axis,
+    so return None and leave the layout to GSPMD.
+    """
+    sh = getattr(A, "sharding", None)
+    if isinstance(sh, NamedSharding) and (
+            len(sh.spec) == 0 or sh.spec[0] is None):
+        return sh
+    return None
+
+
+def _scalar_out_sharding(A):
+    """Replicated ``P()`` on ``A``'s mesh — for the spread's 2-vector.
+
+    Pinned rather than inferred so the result is fully replicated on every
+    rank: that is what makes the single ``np.asarray`` below legal at P>1,
+    since a partially-addressable array raises "spans non-addressable
+    devices".
+    """
+    sh = getattr(A, "sharding", None)
+    if isinstance(sh, NamedSharding):
+        return NamedSharding(sh.mesh, P())
+    return None
+
+
+def _star_row_order(irr_idx_k):
+    """``(rows, labels)`` — the ONE IBZ row order both directions use.
+
+    ``rows[j]`` is the full-BZ row :func:`star_select` keeps for star
+    ``j`` — the FIRST occurrence of each star label, in full-BZ order —
+    and ``labels[j] = irr_idx_k[rows[j]]``.
+
+    The two directions agree only if first-occurrence order is ASCENDING
+    IN THE LABEL: :func:`star_select` orders rows by first occurrence,
+    :func:`star_broadcast` addresses ``A_irr`` by position in
+    ``np.unique(irr)``.  Checked here rather than assumed, because if it
+    failed ``broadcast`` would silently return a DIFFERENT star's matrix
+    at every affected k.
+    """
+    irr = np.asarray(irr_idx_k)
+    _, first = np.unique(irr, return_index=True)
+    rows = np.sort(first).astype(np.int32)
+    labels = np.asarray(irr[rows])
+    if labels.size > 1 and not np.all(np.diff(labels.astype(np.int64)) > 0):
+        raise ValueError(
+            "star row order: the first occurrence of the stars in "
+            "irr_idx_k is not ascending in the star label, so "
+            "``star_select``'s row order (first occurrence) and "
+            "``star_broadcast``'s row order (np.unique, ascending) "
+            "disagree and the round trip would silently return another "
+            f"star's matrix.  labels in row order = {labels.tolist()}.")
+    return rows, labels
+
+
+def _take_rows(A, rows):
+    """``A[rows]`` along axis 0, evaluated where ``A`` already is."""
+    if not isinstance(A, jax.Array):
+        return np.asarray(A)[rows]
+    out_sh = _row_out_sharding(A)
+    key = ("take", rows.tobytes(), tuple(int(s) for s in A.shape),
+           A.dtype, repr(out_sh))
+
+    def _build():
+        rows_j = jnp.asarray(rows)
+
+        def _f(x):
+            return x[rows_j]
+        return _jit_with(_f, out_sh)
+
+    return _cached_star_jit(key, _build)(A)
+
+
+def _broadcast_rows(A_irr, take, trs):
+    """``A_irr[take]`` with ``conj`` on the rows ``trs`` marks."""
+    if not isinstance(A_irr, jax.Array):
+        out = np.asarray(A_irr)[take]
+        if np.any(trs):
+            out = np.where(trs.reshape((-1,) + (1,) * (out.ndim - 1)),
+                           np.conj(out), out)
+        return out
+    out_sh = _row_out_sharding(A_irr)
+    ndim = int(A_irr.ndim)
+    any_trs = bool(np.any(trs))
+    key = ("bcast", take.tobytes(), trs.tobytes(),
+           tuple(int(s) for s in A_irr.shape), A_irr.dtype, repr(out_sh))
+
+    def _build():
+        take_j = jnp.asarray(take)
+        trs_j = jnp.asarray(np.asarray(trs).reshape((-1,) + (1,) * (ndim - 1)))
+
+        def _f(x):
+            out = x[take_j]
+            if any_trs:
+                out = jnp.where(trs_j, jnp.conj(out), out)
+            return out
+        return _jit_with(_f, out_sh)
+
+    return _cached_star_jit(key, _build)(A_irr)
+
+
+def _spread_tables(irr_idx_k, sym_idx_k, n_sym_spatial):
+    """``(members, refs, conj)`` — :func:`star_spread`'s comparison set.
+
+    ``members`` are the rows compared — every row after the first in its
+    star, so singleton stars are absent — ``refs[i]`` is the first row of
+    ``members[i]``'s star, and ``conj[i]`` says ``members[i]`` is
+    time-reversed relative to it.  Rows rather than a mask, so the device
+    kernel gathers only what it compares: ``2 · n_members`` tiles with
+    ``n_members = n_k − n_k_irr``, not ``2 · n_k``.
+    """
+    irr = np.asarray(irr_idx_k)
+    sidx = np.asarray(sym_idx_k)
+    rows, labels = _star_row_order(irr)
+    pos = {int(v): int(r) for v, r in zip(labels, rows)}
+    ref_all = np.array([pos[int(v)] for v in irr], dtype=np.int32)
+    members = np.where(ref_all != np.arange(ref_all.shape[0]))[0].astype(
+        np.int32)
+    return (members, ref_all[members],
+            np.asarray(sidx >= int(n_sym_spatial))[members])
+
+
+def _star_stats(A_full, members, refs, conj):
+    """``(worst, scale)``: the star residual and ``max|A|`` it is relative to.
+
+    Both reductions are in one compiled module, so a device operand costs
+    one 16-byte transfer rather than a full host readback per number.  The
+    only transient is the two ``n_members``-row gathers, which inherit the
+    operand's sharding.
+    """
+    n_mem = int(members.shape[0])
+    if not isinstance(A_full, jax.Array):
+        A = np.asarray(A_full)
+        scale = float(np.abs(A).max())
+        if n_mem == 0:
+            return 0.0, scale
+        bshape = (-1,) + (1,) * (A.ndim - 1)
+        gathered = A[refs]
+        ref_v = np.where(conj.reshape(bshape), np.conj(gathered), gathered)
+        return float(np.abs(A[members] - ref_v).max()), scale
+
+    out_sh = _scalar_out_sharding(A_full)
+    ndim = int(A_full.ndim)
+    key = ("spread", members.tobytes(), refs.tobytes(),
+           np.asarray(conj).tobytes(), tuple(int(s) for s in A_full.shape),
+           A_full.dtype, repr(out_sh))
+
+    def _build():
+        mem_j = jnp.asarray(members)
+        ref_j = jnp.asarray(refs)
+        conj_j = jnp.asarray(
+            np.asarray(conj).reshape((-1,) + (1,) * (ndim - 1)))
+
+        def _f(x):
+            scale = jnp.max(jnp.abs(x))
+            if n_mem == 0:
+                return jnp.stack([jnp.zeros_like(scale), scale])
+            gathered = x[ref_j]
+            ref_v = jnp.where(conj_j, jnp.conj(gathered), gathered)
+            return jnp.stack([jnp.max(jnp.abs(x[mem_j] - ref_v)), scale])
+        return _jit_with(_f, out_sh)
+
+    vals = np.asarray(_cached_star_jit(key, _build)(A_full))
+    return float(vals[0]), float(vals[1])
 
 
 def star_select(A_full, irr_idx_k):
     """The IBZ rows of a band-index quantity: ``A[k̄]`` for each IBZ k̄.
 
-    ``A_full`` is ``(n_k_full, ...)``; returns ``(n_k_irr, ...)``.  Pure
-    index selection — the first occurrence of each IBZ parent in
-    ``irr_idx_k``.  Costs nothing and is exact.
+    ``A_full`` is ``(n_k_full, ...)``; returns ``(n_k_irr, ...)`` plus the
+    star labels of those rows.  Pure index selection — the first
+    occurrence of each IBZ parent in ``irr_idx_k`` — so it is exact.  A
+    device operand is gathered on the device and keeps its sharding.
     """
-    irr = np.asarray(irr_idx_k)
-    _, first = np.unique(irr, return_index=True)
-    return A_full[np.sort(first)], np.sort(irr[np.sort(first)])
+    rows, labels = _star_row_order(irr_idx_k)
+    return _take_rows(A_full, rows), labels
 
 
 def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
@@ -1780,7 +1972,7 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
     returned; the result is ``(n_k_full, ...)``.  A gather plus a
     CONJUGATION on the time-reversed members — ``sym_idx_k >=
     n_sym_spatial`` marks those, the same convention ``unfold_psi`` and
-    ``unfold_v_q`` use.
+    ``unfold_v_q`` use.  A device operand never leaves the device.
 
     ``sym_idx_k`` and ``n_sym_spatial`` are REQUIRED, not optional with an
     equality default: a caller that omitted them would get silently wrong
@@ -1792,12 +1984,7 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
     labels = np.unique(irr) if irr_labels is None else np.asarray(irr_labels)
     pos = {int(v): i for i, v in enumerate(labels)}
     take = np.array([pos[int(v)] for v in irr], dtype=np.int32)
-    out = np.asarray(A_irr)[take]
-    trs = sidx >= int(n_sym_spatial)
-    if np.any(trs):
-        out = np.where(trs.reshape((-1,) + (1,) * (out.ndim - 1)),
-                       np.conj(out), out)
-    return out
+    return _broadcast_rows(A_irr, take, sidx >= int(n_sym_spatial))
 
 
 def star_spread(A_full, irr_idx_k, sym_idx_k, n_sym_spatial):
@@ -1810,21 +1997,11 @@ def star_spread(A_full, irr_idx_k, sym_idx_k, n_sym_spatial):
 
     Cheap, and the only thing that catches a gauge mismatch introduced
     upstream: hermiticity, the norm and the electron count all survive
-    one.
+    one.  Callers that also want the scale should use
+    :meth:`KStarMap.spread_rel`, which gets both from one reduction.
     """
-    A = np.asarray(A_full)
-    irr = np.asarray(irr_idx_k)
-    sidx = np.asarray(sym_idx_k)
-    worst = 0.0
-    for v in np.unique(irr):
-        mem = np.where(irr == v)[0]
-        if mem.size < 2:
-            continue
-        base = A[mem[0]]
-        for j in mem[1:]:
-            ref = np.conj(base) if int(sidx[j]) >= int(n_sym_spatial) else base
-            worst = max(worst, float(np.abs(A[j] - ref).max()))
-    return worst
+    return _star_stats(A_full, *_spread_tables(
+        irr_idx_k, sym_idx_k, n_sym_spatial))[0]
 
 
 class KStarMap:
@@ -1845,20 +2022,32 @@ class KStarMap:
     See the module note above :func:`star_select` for WHY this is an index
     map and not an unfold: the loader builds full-BZ ψ by unfolding in
     G-space, so a band index is symmetry-inert.
+
+    The row tables are pure functions of ``irr_idx``/``sym_idx``, so they
+    are built once in ``__init__`` as host int arrays and the per-call
+    work is one gather.
     """
 
-    __slots__ = ("irr_idx", "sym_idx", "n_sym_spatial", "labels")
+    __slots__ = ("irr_idx", "sym_idx", "n_sym_spatial", "labels",
+                 "_rows", "_take", "_trs", "_members", "_refs", "_conj")
 
     def __init__(self, irr_idx, sym_idx, n_sym_spatial, labels=None):
         self.irr_idx = np.asarray(irr_idx, dtype=np.int32)
         self.sym_idx = np.asarray(sym_idx, dtype=np.int32)
         self.n_sym_spatial = int(n_sym_spatial)
-        self.labels = (np.unique(self.irr_idx) if labels is None
-                       else np.asarray(labels, dtype=np.int32))
         if self.sym_idx.shape != self.irr_idx.shape:
             raise ValueError(
                 f"KStarMap: irr_idx {self.irr_idx.shape} and sym_idx "
                 f"{self.sym_idx.shape} must both be (n_k_full,)")
+        self._rows, row_labels = _star_row_order(self.irr_idx)
+        self.labels = (row_labels if labels is None
+                       else np.asarray(labels, dtype=np.int32))
+        pos = {int(v): i for i, v in enumerate(self.labels)}
+        self._take = np.array([pos[int(v)] for v in self.irr_idx],
+                              dtype=np.int32)
+        self._trs = self.sym_idx >= self.n_sym_spatial
+        self._members, self._refs, self._conj = _spread_tables(
+            self.irr_idx, self.sym_idx, self.n_sym_spatial)
 
     @classmethod
     def from_sym(cls, sym, n_sym_spatial) -> "KStarMap":
@@ -1888,14 +2077,16 @@ class KStarMap:
         return self.nk_irr == self.nk_full
 
     def select(self, A_full):
-        """``(n_k_full, …)`` → ``(n_k_irr, …)``.  Index selection."""
-        A_irr, _ = star_select(A_full, self.irr_idx)
-        return A_irr
+        """``(n_k_full, …)`` → ``(n_k_irr, …)``.  Index selection.
+
+        A ``jax.Array`` stays on the device and keeps its sharding; a
+        numpy array stays on the host (``gw.scissor.k_star_weights``).
+        """
+        return _take_rows(A_full, self._rows)
 
     def broadcast(self, A_irr):
         """``(n_k_irr, …)`` → ``(n_k_full, …)``, conjugating TRS members."""
-        return star_broadcast(A_irr, self.irr_idx, self.sym_idx,
-                              self.n_sym_spatial, self.labels)
+        return _broadcast_rows(A_irr, self._take, self._trs)
 
     def spread(self, A_full) -> float:
         """Residual of ``A_full`` against its own stars; see :func:`star_spread`.
@@ -1904,8 +2095,20 @@ class KStarMap:
         free evidence that the two k-sets agree — and the only check that
         catches a gauge mismatch introduced upstream.
         """
-        return star_spread(A_full, self.irr_idx, self.sym_idx,
-                           self.n_sym_spatial)
+        return _star_stats(A_full, self._members, self._refs,
+                           self._conj)[0]
+
+    def spread_rel(self, A_full) -> float:
+        """:meth:`spread` divided by ``max|A_full|`` — what callers print.
+
+        One reduction and one 16-byte transfer for a device operand; the
+        two-call form (``spread`` then a separate ``max``) was two full
+        host readbacks.  The floor on the scale avoids a divide by zero;
+        on a zero operand the residual is zero too, so the ratio is 0.
+        """
+        worst, scale = _star_stats(A_full, self._members, self._refs,
+                                   self._conj)
+        return worst / max(scale, 1e-300)
 
     def __repr__(self) -> str:
         return (f"KStarMap(nk_full={self.nk_full}, nk_irr={self.nk_irr}, "
