@@ -599,8 +599,8 @@ def solve_qp(
         # robust to QSGW reorderings; one-shot G0W0 has no
         # reordering and the sort is a no-op.
         fit = fit_scissor(
-            E_dft_rel_ry * RYD_TO_EV,
-            E_sc_rel_ry * RYD_TO_EV,
+            E_dft_kn_ev=E_dft_rel_ry * RYD_TO_EV,
+            E_qp_kn_ev=E_sc_rel_ry * RYD_TO_EV,
             valence_mask_kn=occ_mask_kn,
             fit_mask_kn=in_grid_kn_band,
             # UNREDUCED k.  Every operand here descends from

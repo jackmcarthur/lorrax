@@ -16,6 +16,10 @@ self-consistency work (``docs/dev/ibz_self_consistency_scaffold.md`` §8):
 4. ``k_star_weights`` returns the multiplicities in ``select``'s own row
    order, and ones on an identity map.
 
+A fifth property is asserted but not yet held: the two energy arrays must
+not be passable positionally, because they are the same shape and dtype
+and a swap is silent.  See the xfail below.
+
 ``src/gw/scissor.py`` is loaded FROM ITS PATH, not as ``gw.scissor``:
 ``gw/__init__.py`` imports ``common.meta``, which imports jax, and jax is
 not importable on a login node.  The module itself needs only numpy, so
@@ -131,7 +135,8 @@ def test_fit_scissor_refuses_to_run_without_k_weights():
     rng = np.random.default_rng(0)
     e_dft, e_qp, vm, fm = _random_deck(rng, 6, 16)
     with pytest.raises(TypeError):
-        fit_scissor(e_dft, e_qp, valence_mask_kn=vm, fit_mask_kn=fm)
+        fit_scissor(E_dft_kn_ev=e_dft, E_qp_kn_ev=e_qp,
+                    valence_mask_kn=vm, fit_mask_kn=fm)
 
 
 def test_fit_scissor_refuses_weights_from_a_different_k_set():
@@ -139,7 +144,8 @@ def test_fit_scissor_refuses_weights_from_a_different_k_set():
     rng = np.random.default_rng(1)
     e_dft, e_qp, vm, fm = _random_deck(rng, 10, 16)
     with pytest.raises(ValueError, match="k_weights has shape"):
-        fit_scissor(e_dft, e_qp, valence_mask_kn=vm, fit_mask_kn=fm,
+        fit_scissor(E_dft_kn_ev=e_dft, E_qp_kn_ev=e_qp,
+                    valence_mask_kn=vm, fit_mask_kn=fm,
                     k_weights=full_bz_k_weights(16))
 
 
@@ -149,8 +155,32 @@ def test_fit_scissor_refuses_a_zero_weight():
     w = full_bz_k_weights(4)
     w[2] = 0.0
     with pytest.raises(ValueError, match="strictly positive"):
-        fit_scissor(e_dft, e_qp, valence_mask_kn=vm, fit_mask_kn=fm,
+        fit_scissor(E_dft_kn_ev=e_dft, E_qp_kn_ev=e_qp,
+                    valence_mask_kn=vm, fit_mask_kn=fm,
                     k_weights=w)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="fit_scissor still accepts the energy arrays positionally: "
+           "src/gw/sc_iteration.py passes them that way and that file is "
+           "held by another workstream.  Move the '*' to the front of "
+           "fit_scissor's parameter list and fix that call site together, "
+           "then delete this marker.")
+def test_fit_scissor_energy_arrays_cannot_be_passed_positionally():
+    """A swap of the two energy arrays must be a TypeError, not a fit.
+
+    ``E_dft_kn_ev`` and ``E_qp_kn_ev`` are the same shape and dtype, so
+    exchanging them fits the inverse line and returns a ScissorFit with a
+    plausible slope and a plausible RMSE -- no exception, no shape error,
+    and nothing downstream checks it.  Keyword-only parameters delete the
+    positional spelling that makes the accident possible.
+    """
+    rng = np.random.default_rng(11)
+    e_dft, e_qp, vm, fm = _random_deck(rng, 6, 16)
+    with pytest.raises(TypeError):
+        fit_scissor(e_dft, e_qp, valence_mask_kn=vm, fit_mask_kn=fm,
+                    k_weights=full_bz_k_weights(6))
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +193,8 @@ def test_uniform_weights_are_bit_identical_to_the_unweighted_fit(seed):
     nk = int(rng.integers(1, 33))
     nb = int(rng.integers(8, 129))
     e_dft, e_qp, vm, fm = _random_deck(rng, nk, nb)
-    got = fit_scissor(e_dft, e_qp, valence_mask_kn=vm, fit_mask_kn=fm,
+    got = fit_scissor(E_dft_kn_ev=e_dft, E_qp_kn_ev=e_qp,
+                      valence_mask_kn=vm, fit_mask_kn=fm,
                       k_weights=full_bz_k_weights(nk))
     want = _legacy_fit_scissor(e_dft, e_qp, vm, fm)
     assert (got.alpha_v, got.beta_v_ev, got.alpha_c, got.beta_c_ev,
@@ -178,7 +209,8 @@ def test_the_bit_identity_check_can_fail():
     e_dft, e_qp, vm, fm = _random_deck(rng, 8, 32)
     w = full_bz_k_weights(8)
     w[3] = 2.0
-    got = fit_scissor(e_dft, e_qp, valence_mask_kn=vm, fit_mask_kn=fm,
+    got = fit_scissor(E_dft_kn_ev=e_dft, E_qp_kn_ev=e_qp,
+                      valence_mask_kn=vm, fit_mask_kn=fm,
                       k_weights=w)
     want = _legacy_fit_scissor(e_dft, e_qp, vm, fm)
     assert got.alpha_v != want[0]
@@ -211,11 +243,11 @@ def test_weighted_ibz_fit_equals_unweighted_full_bz_fit():
     e_dft_f, e_qp_f = e_dft_i[take], e_qp_i[take]
     vm_f, fm_f = vm_i[take], fm_i[take]
 
-    full = fit_scissor(e_dft_f, e_qp_f, valence_mask_kn=vm_f,
-                       fit_mask_kn=fm_f,
+    full = fit_scissor(E_dft_kn_ev=e_dft_f, E_qp_kn_ev=e_qp_f,
+                       valence_mask_kn=vm_f, fit_mask_kn=fm_f,
                        k_weights=full_bz_k_weights(16))
-    ibz = fit_scissor(e_dft_i, e_qp_i, valence_mask_kn=vm_i,
-                      fit_mask_kn=fm_i,
+    ibz = fit_scissor(E_dft_kn_ev=e_dft_i, E_qp_kn_ev=e_qp_i,
+                      valence_mask_kn=vm_i, fit_mask_kn=fm_i,
                       k_weights=k_star_weights(ks))
 
     # Point counts differ; total weight and the fit itself do not.
@@ -229,8 +261,8 @@ def test_weighted_ibz_fit_equals_unweighted_full_bz_fit():
     # And the unweighted IBZ fit -- what the code did before -- does not
     # reproduce the full-BZ fit.  Without this the test above would pass
     # on a deck where weighting happened not to matter.
-    unweighted = fit_scissor(e_dft_i, e_qp_i, valence_mask_kn=vm_i,
-                             fit_mask_kn=fm_i,
+    unweighted = fit_scissor(E_dft_kn_ev=e_dft_i, E_qp_kn_ev=e_qp_i,
+                             valence_mask_kn=vm_i, fit_mask_kn=fm_i,
                              k_weights=full_bz_k_weights(nk_irr))
     assert abs(unweighted.beta_c_ev - full.beta_c_ev) > 1.0e-9
 
@@ -246,11 +278,12 @@ def test_predicted_correction_agrees_between_the_arms():
     labels = irr_idx[np.sort(first)]
     take = np.array([int(np.where(labels == v)[0][0]) for v in irr_idx])
 
-    full = fit_scissor(e_dft_i[take], e_qp_i[take],
+    full = fit_scissor(E_dft_kn_ev=e_dft_i[take], E_qp_kn_ev=e_qp_i[take],
                        valence_mask_kn=vm_i[take], fit_mask_kn=fm_i[take],
                        k_weights=full_bz_k_weights(16))
-    ibz = fit_scissor(e_dft_i, e_qp_i, valence_mask_kn=vm_i,
-                      fit_mask_kn=fm_i, k_weights=k_star_weights(ks))
+    ibz = fit_scissor(E_dft_kn_ev=e_dft_i, E_qp_kn_ev=e_qp_i,
+                      valence_mask_kn=vm_i, fit_mask_kn=fm_i,
+                      k_weights=k_star_weights(ks))
     d_full = full.predict(e_dft_i, vm_i)
     d_ibz = ibz.predict(e_dft_i, vm_i)
     assert float(np.abs(d_full - d_ibz).max()) <= 1.0e-11
