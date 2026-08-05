@@ -1812,7 +1812,7 @@ def _scalar_out_sharding(A):
     return None
 
 
-def _star_row_order(irr_idx_k):
+def _star_row_order(irr_idx_k, *, validate: bool = True):
     """``(rows, labels)`` — the ONE IBZ row order both directions use.
 
     ``rows[j]`` is the full-BZ row :func:`star_select` keeps for star
@@ -1830,6 +1830,22 @@ def _star_row_order(irr_idx_k):
     _, first = np.unique(irr, return_index=True)
     rows = np.sort(first).astype(np.int32)
     labels = np.asarray(irr[rows])
+    if validate:
+        require_round_trip_order(labels)
+    return rows, labels
+
+
+def require_round_trip_order(labels) -> None:
+    """Refuse a k-map whose two row orders disagree.
+
+    CHECKED AT USE, NOT AT CONSTRUCTION.  ``run_sc_driver`` builds a
+    ``KStarMap`` on every self-consistent run whether or not the reduced
+    path is taken, so raising in ``__init__`` stops a full-BZ run that
+    never selects or broadcasts anything — which is what it did between
+    24673e6 and this commit, taking
+    ``test_invariance_gates::test_sc_iteration1_equals_one_shot`` with it.
+    """
+    labels = np.asarray(labels)
     if labels.size > 1 and not np.all(np.diff(labels.astype(np.int64)) > 0):
         raise ValueError(
             "star row order: the first occurrence of the stars in "
@@ -1838,7 +1854,6 @@ def _star_row_order(irr_idx_k):
             "``star_broadcast``'s row order (np.unique, ascending) "
             "disagree and the round trip would silently return another "
             f"star's matrix.  labels in row order = {labels.tolist()}.")
-    return rows, labels
 
 
 def _take_rows(A, rows):
@@ -1887,7 +1902,8 @@ def _broadcast_rows(A_irr, take, trs):
     return _cached_star_jit(key, _build)(A_irr)
 
 
-def _spread_tables(irr_idx_k, sym_idx_k, n_sym_spatial):
+def _spread_tables(irr_idx_k, sym_idx_k, n_sym_spatial, *,
+                   validate: bool = True):
     """``(members, refs, conj)`` — :func:`star_spread`'s comparison set.
 
     ``members`` are the rows compared — every row after the first in its
@@ -1899,7 +1915,7 @@ def _spread_tables(irr_idx_k, sym_idx_k, n_sym_spatial):
     """
     irr = np.asarray(irr_idx_k)
     sidx = np.asarray(sym_idx_k)
-    rows, labels = _star_row_order(irr)
+    rows, labels = _star_row_order(irr, validate=validate)
     pos = {int(v): int(r) for v, r in zip(labels, rows)}
     ref_all = np.array([pos[int(v)] for v in irr], dtype=np.int32)
     members = np.where(ref_all != np.arange(ref_all.shape[0]))[0].astype(
@@ -2039,7 +2055,9 @@ class KStarMap:
             raise ValueError(
                 f"KStarMap: irr_idx {self.irr_idx.shape} and sym_idx "
                 f"{self.sym_idx.shape} must both be (n_k_full,)")
-        self._rows, row_labels = _star_row_order(self.irr_idx)
+        # NOT VALIDATED HERE.  Constructing a map is not using one, and
+        # ``run_sc_driver`` constructs one on every SC run.
+        self._rows, row_labels = _star_row_order(self.irr_idx, validate=False)
         self.labels = (row_labels if labels is None
                        else np.asarray(labels, dtype=np.int32))
         pos = {int(v): i for i, v in enumerate(self.labels)}
@@ -2047,7 +2065,7 @@ class KStarMap:
                               dtype=np.int32)
         self._trs = self.sym_idx >= self.n_sym_spatial
         self._members, self._refs, self._conj = _spread_tables(
-            self.irr_idx, self.sym_idx, self.n_sym_spatial)
+            self.irr_idx, self.sym_idx, self.n_sym_spatial, validate=False)
 
     @classmethod
     def from_sym(cls, sym, n_sym_spatial) -> "KStarMap":
@@ -2082,10 +2100,12 @@ class KStarMap:
         A ``jax.Array`` stays on the device and keeps its sharding; a
         numpy array stays on the host (``gw.scissor.k_star_weights``).
         """
+        require_round_trip_order(self.labels)
         return _take_rows(A_full, self._rows)
 
     def broadcast(self, A_irr):
         """``(n_k_irr, …)`` → ``(n_k_full, …)``, conjugating TRS members."""
+        require_round_trip_order(self.labels)
         return _broadcast_rows(A_irr, self._take, self._trs)
 
     def spread(self, A_full) -> float:
