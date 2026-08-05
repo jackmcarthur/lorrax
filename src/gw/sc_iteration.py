@@ -1090,35 +1090,52 @@ def _run_rcrop(
     mesh = inputs.mesh_xy
     ndev = int(mesh.size)
     rep3 = NamedSharding(mesh, P(None, None, None))
-    # n_elem = nk·nb² and ``_make_kshard_eigh`` already requires
-    # ndev | nk, so this holds wherever the loop runs at all — it is an
-    # assertion of that dependency, not a new constraint.
-    if n_elem % ndev:
-        raise ValueError(
-            f"_run_rcrop: nk·nb²={n_elem} is not divisible by mesh size "
-            f"{ndev}; the k-sharded eigh already requires nk={nk} to be, so "
-            f"this run cannot have reached here.")
-    # Both mesh axes, so the flat axis splits over every device.  n's
-    # slowest index is k, so a contiguous row block IS a contiguous k
-    # block: reshape to (nk, nb, nb) is a relabel, not a collective.
-    row_sh = NamedSharding(mesh, P(tuple(mesh.axis_names)))
-    # DEVICE ARRAY, NOT ``np.asarray(H0).flatten()``.  The host round trip
-    # was on the largest operand in the loop, on every rank; H0 is
-    # replicated, so this reshape+reshard is a local slice.
-    x0 = jax.device_put(H0.reshape(-1), row_sh)
-    # MEASURED, not derived from n and ndev.  A ``device_put`` that fell
-    # back to replicated would print the full n here, and that is exactly
-    # the failure mode that makes this whole change a silent no-op.
-    local_b = sum(s.data.nbytes for s in x0.addressable_shards)
     print_fn(
         f"  SC rCROP: history_depth={history_depth}, "
         f"max_iter={max_iter}, tol={tol_ev:.1e} eV/band-RMS")
-    print_fn(
-        f"  SC rCROP residency: n={n_elem}, ndev={ndev}; iterate "
-        f"{x0.nbytes / 2**20:.2f} MiB global / {local_b / 2**20:.2f} MiB "
-        f"addressable here; history 2x{history_depth} copies = "
-        f"{2.0 * history_depth * x0.nbytes / 2**30:.4f} GiB global / "
-        f"{2.0 * history_depth * local_b / 2**30:.4f} GiB here")
+    # DEGRADE, DO NOT REFUSE.  The split needs ndev | n_elem.  It holds on
+    # every shape reached so far — n_elem = nk·nb² and nb is large — but
+    # ``nk`` here is the LOOP's k-set, which under ``sc_on_ibz`` is the IBZ
+    # and need not be a multiple of anything.  A refusal would kill a run
+    # that worked before this change, so an indivisible shape falls back to
+    # the previous single-device history and says so.
+    if n_elem % ndev:
+        row_sh = None
+        x0 = np.asarray(H0).flatten()
+        local_b = x0.nbytes
+        print_fn(
+            f"  SC rCROP residency: n={n_elem} is not divisible by ndev="
+            f"{ndev} — history NOT sharded, {2.0 * history_depth * local_b / 2**30:.4f}"
+            f" GiB on ONE device.  This is the pre-2026-08-05 behaviour and"
+            f" is a wall at production shapes.")
+    else:
+        # Both mesh axes, so the flat axis splits over every device.  n's
+        # slowest index is k, so a contiguous row block IS a contiguous k
+        # block: reshape to (nk, nb, nb) is a relabel, not a collective.
+        row_sh = NamedSharding(mesh, P(tuple(mesh.axis_names)))
+        # DEVICE ARRAY, NOT ``np.asarray(H0).flatten()``.  The host round
+        # trip was on the largest operand in the loop, on every rank; H0 is
+        # replicated, so this reshape+reshard is a local slice.
+        x0 = jax.device_put(H0.reshape(-1), row_sh)
+        # MEASURED, not derived from n and ndev.  A ``device_put`` that fell
+        # back to replicated would print the full n here, and that is
+        # exactly the failure mode that makes this change a silent no-op.
+        local_b = sum(s.data.nbytes for s in x0.addressable_shards)
+        print_fn(
+            f"  SC rCROP residency: n={n_elem} (nk={nk} on the loop's k-set,"
+            f" nb={nb}), ndev={ndev}; iterate {x0.nbytes / 2**20:.2f} MiB "
+            f"global / {local_b / 2**20:.2f} MiB addressable here; history "
+            f"2x{history_depth} copies = "
+            f"{2.0 * history_depth * x0.nbytes / 2**30:.4f} GiB global / "
+            f"{2.0 * history_depth * local_b / 2**30:.4f} GiB here")
+
+    if row_sh is None:
+        # Pre-change spelling, kept so the fallback is bit-identical to it.
+        def _to_carry(A): return A.reshape(H0.shape)
+        def _to_iterate(A): return A.flatten()
+    else:
+        def _to_carry(A): return jax.device_put(A.reshape(H0.shape), rep3)
+        def _to_iterate(A): return jax.device_put(A.reshape(-1), row_sh)
 
     # Bookkeeping for per-iteration printing + final SigmaResult capture.
     _e_history: list[np.ndarray] = [
@@ -1136,7 +1153,7 @@ def _run_rcrop(
         # the gather is here and is one (nk, nb, nb) per call.  The return
         # goes straight back to the iterate layout so nothing downstream of
         # it re-materialises the residual whole.
-        H = jax.device_put(H_flat.reshape(H0.shape), rep3)
+        H = _to_carry(H_flat)
         # rCROP's mixing combinations don't preserve Hermitisation
         # exactly (numeric drift); re-Hermitise before feeding the
         # iteration map so eigh stays well-defined.
@@ -1162,8 +1179,7 @@ def _run_rcrop(
             f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
         )
         _iter_idx[0] += 1
-        return jax.device_put(
-            (state_out.H_qp_dft - H).reshape(-1), row_sh)
+        return _to_iterate(state_out.H_qp_dft - H)
 
     # rCROP residual tolerance: ‖f‖₂ ≤ tol_ry · √(n_elem) ⇔ per-element
     # RMS ≤ tol_ry.  Convert RMS ΔE in eV → Ry first.
@@ -1190,7 +1206,7 @@ def _run_rcrop(
     # Back to the REPLICATED carry layout: every consumer of the returned
     # state (``_scissor_E_qp_for_outofrange``, ``final_qp_eigenstates``,
     # the h5 writers) reads it back on the host.
-    H_final = jax.device_put(result.x.reshape(H0.shape), rep3)
+    H_final = _to_carry(jnp.asarray(result.x))
     H_final = 0.5 * (H_final + jnp.conj(jnp.swapaxes(H_final, -1, -2)))
     state_final = SCState(
         H_qp_dft=H_final,
