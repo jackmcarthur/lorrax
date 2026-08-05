@@ -356,11 +356,15 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
 
     * the mesh has more than one device — on one device "distributed" is
       the same tile with an FFI call around it;
-    * ``nb`` divides both mesh axes.  ``distributed_eigh_bands`` pads the
-      band axes up to the mesh divisor and does NOT undo the pad, so an
-      indivisible ``nb`` there returns ``(nk, nb_pad)`` / ``(nk, nb_pad,
-      nb_pad)`` — a silent shape change, not a refusal.  ``auto`` must
-      not walk into that; an explicit ``sc_eigh = distributed`` refuses
+    * ``nb`` divides ``spec_divisor(mesh, band_sphere_spec(), 1)``, which
+      is ``px·py`` on the default ψ layout.  ``distributed_eigh_bands``
+      pads both band axes up to THAT divisor and does NOT undo the pad,
+      so a ``nb`` it does not divide returns ``(nk, nb_pad)`` /
+      ``(nk, nb_pad, nb_pad)`` — a silent shape change, not a refusal.
+      The divisor is taken from the same expression the callee uses, not
+      from ``px`` and ``py`` separately: ``nb = 10`` on a 2×2 mesh
+      divides both axes and still gets padded to 12.  ``auto`` must not
+      walk into that; an explicit ``sc_eigh = distributed`` refuses
       instead of returning padded arrays;
     * one tile exceeds :data:`_SC_EIGH_TILE_BUDGET_FRACTION` of the
       per-device budget.
@@ -376,19 +380,24 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     if requested == "native":
         return "native"
 
+    from common.mtxel_sweep import band_sphere_spec
+    from runtime.padding import spec_divisor
+
     ndev = int(mesh_xy.size)
     px, py = (int(mesh_xy.shape[a]) for a in mesh_xy.axis_names)
-    divides = (nb % px == 0) and (nb % py == 0)
+    pad_div = spec_divisor(mesh_xy, band_sphere_spec(), 1)
+    divides = nb % pad_div == 0
 
     if requested == "distributed":
         if not divides:
             raise ValueError(
                 f"sc_eigh = distributed needs the SC band window nb={nb} to "
-                f"divide the mesh on both axes ({px}x{py}); it does not. "
-                f"distributed_eigh_bands would pad the band axes to "
-                f"{px * py} and return the PADDED shapes, which the carry "
-                f"and every band-indexed operand beside it would not match. "
-                f"Use sc_eigh = native or a mesh that divides nb.")
+                f"be a multiple of {pad_div} (the band divisor of the "
+                f"{px}x{py} mesh); it is not.  distributed_eigh_bands would "
+                f"pad both band axes to {pad_div} and return the PADDED "
+                f"shapes, which the carry and every band-indexed operand "
+                f"beside it would not match.  Use sc_eigh = native or a mesh "
+                f"whose band divisor divides nb.")
         return "distributed"
 
     tile_b = float(nb) * float(nb) * 16.0

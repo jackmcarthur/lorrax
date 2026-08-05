@@ -134,8 +134,22 @@ def test_an_indivisible_band_window_stays_native_under_auto():
 
 
 def test_an_indivisible_band_window_is_refused_when_asked_explicitly():
-    with pytest.raises(ValueError, match="divide the mesh on both axes"):
+    with pytest.raises(ValueError, match="be a multiple of 64"):
         _resolve(46, 8, 8, eigh="distributed")
+
+
+def test_the_divisor_is_the_band_divisor_not_the_two_axes_separately():
+    """nb = 10 on a 2×2 mesh divides both axes and is STILL padded.
+
+    ``distributed_eigh_bands`` pads to
+    ``spec_divisor(mesh, band_sphere_spec(), 1)``, which is px·py on the
+    default psi layout, so a per-axis test would let nb = 10 through and
+    get back arrays of width 12.
+    """
+    assert 10 % 2 == 0
+    assert _resolve(10, 2, 2) == "native"
+    with pytest.raises(ValueError, match="be a multiple of 4"):
+        _resolve(10, 2, 2, eigh="distributed")
 
 
 def test_a_large_tile_leaves_the_native_batch():
