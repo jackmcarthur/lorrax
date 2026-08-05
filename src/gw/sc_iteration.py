@@ -599,6 +599,61 @@ def _residency_census(named, print_fn) -> None:
             f"1/{a.nbytes / max(local, 1):<4.0f} {spec}")
 
 
+# Refusal threshold on ``KStarMap.spread_rel`` of Σ + V_H, relative.
+#
+# MEASURED on healthy mos2_4x4 runs, every ``k-star:`` line recorded on
+# scratch: 1.470e-12 … 7.559e-12 on the linear/rCROP arms
+# (dsc_demo/ibz44v.7889742.out:26,28,30; dsc44.7889362.out:121-129) and
+# 2.303e-11 … 1.178e-10 on the density-SC arms, which is where the
+# largest value sits (dsc_demo/dev/dev1_p1.7889590.out:11,19 at P=1;
+# dsc44.7889362.out:13,23 at P=4).  The largest observed is 1.178e-10.
+#
+# 1e-6 is four decades above that and four decades below the failure it
+# exists for: a gauge mismatch puts a phase on the off-diagonals of the
+# doubled stars, so its residual is a fixed FRACTION of max|Σ| — O(1e-2)
+# relative or worse — while every mechanism that legitimately grows this
+# number (a larger k-grid, more bands, a longer float64 accumulation)
+# grows it by decades, not by eight.  Do not tighten it toward the
+# observed maximum: the cost of a false refusal on a 40-node job is a
+# dead run, and the check discriminates just as well from here.
+_KSTAR_SPREAD_TOL = 1.0e-6
+
+
+def _check_kstar_spread(kstar, delta_h_qp, *, print_fn) -> float:
+    """Enforce the star spread of Σ + V_H before selecting the IBZ rows.
+
+    ``KStarMap.spread``/``spread_rel`` is documented as the only check
+    that catches a gauge mismatch introduced upstream — hermiticity, the
+    norm and the electron count all survive one — and the value was
+    formatted into a log line and dropped.  A number that is only printed
+    is not a check, and this one is the sole guard on the two-k-set seam.
+
+    REFUSES, does not warn: the whole point is that nothing downstream
+    notices.  A warning on rank 0 of a 64-rank job is a line in a log
+    somebody reads after the run produced numbers.
+
+    One reduction and one 16-byte host read, which the iteration pays
+    already (the accelerators read the eigenvalues back every call).
+    """
+    spread = float(kstar.spread_rel(delta_h_qp))
+    print_fn(
+        f"    k-star: Σ+V_H residual {spread:.3e} rel "
+        f"over {kstar.nk_full}->{kstar.nk_irr} k ({kstar.reduction:.2f}x)")
+    # ``not (x <= tol)`` and not ``x > tol``: NaN must refuse.
+    if not (spread <= _KSTAR_SPREAD_TOL):
+        raise ValueError(
+            f"k-star spread of Σ+V_H is {spread:.6e} relative, above the "
+            f"refusal threshold {_KSTAR_SPREAD_TOL:.1e}.  Members of a star "
+            f"must carry the same Σ up to round-off; they do not, so the "
+            f"full-BZ Σ and the IBZ carry are in different gauges and "
+            f"selecting the star representatives would silently keep the "
+            f"wrong one.  Healthy runs on this deck measure ≤ 1.2e-10.  "
+            f"Suspect the wavefunction rotation or the symmetry map, not "
+            f"convergence: hermiticity, the norm and the electron count all "
+            f"survive this fault.")
+    return spread
+
+
 def _check_sigma_stage(sigma_result: SigmaResult, *, print_fn) -> None:
     """The Σ stage gates, once per SC iteration.
 
@@ -882,9 +937,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # read this (nk, nb, nb) array back twice to print one line.  Its
         # scalar read still synchronises, but the iteration synchronises
         # anyway in ``_run_linear_mixing`` / ``_run_rcrop``.
-        inputs.print_fn(
-            f"    k-star: Σ+V_H residual {ks.spread_rel(delta_h_qp):.3e} rel "
-            f"over {ks.nk_full}->{ks.nk_irr} k ({ks.reduction:.2f}x)")
+        # ENFORCED, not printed -- see ``_check_kstar_spread``.
+        _check_kstar_spread(ks, delta_h_qp, print_fn=inputs.print_fn)
         delta_h_qp = ks.select(delta_h_qp)
     delta_h_dft = _rotate_to_dft_basis(delta_h_qp, U_qp, mesh=inputs.mesh_xy)
     if v_h_dft_new is not None:
