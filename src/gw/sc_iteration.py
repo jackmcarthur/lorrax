@@ -571,6 +571,34 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
     return H_vh, e_f
 
 
+def _residency_census(named, print_fn) -> None:
+    """One line per named array: global bytes, bytes addressable HERE, spec.
+
+    The SC loop's (nk, nb, nb)-class objects are what decide how many bands
+    a rank can hold, and a replicated one is invisible in any aggregate
+    number — every rank simply has its own full copy.  Reading the bytes
+    off ``addressable_shards`` is the only way to tell "sharded" from
+    "sharded in the docstring": a ``device_put`` that silently fell back to
+    replicated reports the global size here.
+
+    Printed once per run (iteration 0), so it costs one host round trip of
+    metadata and no device work.
+    """
+    print_fn("    SC residency census (global / addressable here):")
+    for name, a in named:
+        if a is None:
+            continue
+        try:
+            local = sum(sh.data.nbytes for sh in a.addressable_shards)
+            spec = getattr(getattr(a, "sharding", None), "spec", "?")
+        except AttributeError:
+            local, spec = int(np.asarray(a).nbytes), "host"
+        print_fn(
+            f"      {name:22s} {tuple(a.shape)!s:18s} "
+            f"{a.nbytes / 2**20:10.3f} / {local / 2**20:9.3f} MiB  "
+            f"1/{a.nbytes / max(local, 1):<4.0f} {spec}")
+
+
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     """One self-consistent QSGW step in the DFT basis.
 
@@ -811,6 +839,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     if v_h_dft_new is not None:
         delta_h_dft = delta_h_dft + v_h_dft_new
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
+    if state.iteration == 0:
+        _residency_census(
+            (("kin_ion_dft", inputs.kin_ion_dft),
+             ("H_qp_dft (carry in)", state.H_qp_dft),
+             ("U_qp", U_qp),
+             ("U_full", U_full),
+             ("sigma_xc_kij_ry", sigma_result.sigma_xc_kij_ry),
+             ("sigma_x_kij_ry", sigma_result.sigma_x_kij_ry),
+             ("v_h_kij_ry", sigma_result.v_h_kij_ry),
+             ("delta_h_qp", delta_h_qp),
+             ("delta_h_dft", delta_h_dft),
+             ("H_qp_dft_full", H_qp_dft_full)),
+            inputs.print_fn)
     # The scissor and partition operands are indexed by k and were built
     # on the full BZ; take their IBZ rows so every operand of the H
     # assembly is on one k-set.  The masks are band-only, so selecting
