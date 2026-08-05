@@ -1239,10 +1239,15 @@ _DEFAULTS = {
     #       on the existing 2-D mesh; consumers (head injection, diag/eqp
     #       interpolation, QSGW build, sigma_mnk.h5 SlabIO write) read the
     #       P(None,None,'x','y')-sharded cube directly.  Outputs are
-    #       bit-identical to "replicated" (movement-only; A/B gated).
-    #       Round-1 refusals (at config/driver resolve time, never mid-run):
-    #       self_consistent, indivisible σ band window, and
-    #       slab_io=h5py_allgather at P>1.
+    #       bit-identical to "replicated" (movement-only; A/B gated by
+    #       tests/multi_device/sigma_omega_layout_ab.py under BOTH
+    #       one_shot_dft and self_consistent).
+    #       Refusals (at driver resolve time, never mid-run): indivisible
+    #       σ band window, and slab_io=h5py_allgather at P>1.  There is no
+    #       qp_solver refusal: the SC loop never rotates the cube (it is
+    #       absent from the finalize `replace` at sc_iteration.py:1321),
+    #       so there is no rotation seam to port, and the two layouts
+    #       measure bit-identical under SC (jobs 7889782/7889789).
     "sigma_omega_layout": "replicated",
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
@@ -1982,18 +1987,6 @@ class LorraxConfig:
                 f"(gn_ppm / hl_ppm); static Σ ({mode.value}) has no ω-grid "
                 f"to solve E = h0 + ReΣ(E) on.  Use one_shot_dft (identical "
                 f"physics for static Σ) or self_consistent.")
-        if (solver is QPSolver.SELF_CONSISTENT
-                and self.ppm.omega_layout == "sharded"):
-            # Round-1 scope of the ω-cube sharding workstream: the SC driver
-            # captures Σ_c(ω) across iterations and its rotate-back seam has
-            # not been ported to the tiled layout.  Refuse at resolve time
-            # rather than fail (or silently gather) mid-loop (pattern #6).
-            raise ValueError(
-                "sigma_omega_layout=sharded does not support "
-                "qp_solver=self_consistent yet (round 1 of the ω-cube "
-                "sharding workstream): the SC loop's Σ_c(ω) capture / "
-                "rotation seam still assumes the replicated cube.  Use "
-                "sigma_omega_layout=replicated for SC runs.")
         return solver
 
     @property

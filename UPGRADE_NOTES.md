@@ -123,8 +123,11 @@ typo must not silently pick a known-bad policy — e.g.
   (`auto` is a permanent alias of `local`); `distributed` refuses loudly
   when unavailable, never downgrades.
 - `sigma_omega_layout = replicated | sharded` — Σ_c(ω,k,m,n) cube stays
-  mesh-tiled end-to-end under `sharded`; refuses for self_consistent, an
-  indivisible window, or `h5py_allgather` at P>1.
+  mesh-tiled end-to-end under `sharded`, for every `qp_solver`; refuses an
+  indivisible window or `h5py_allgather` at P>1.  The `self_consistent`
+  refusal shipped with this key was REMOVED 2026-08-05: the SC loop never
+  rotates the cube, so the "rotation seam" it named does not exist, and the
+  two layouts measure bit-identical under SC (jobs 7889782/7889789).
 - `eigh_backend = auto | off | distributed | cusolvermp | slate |
   scalapack` — BSE/htransform distributed-eigh sites; `use_low_mem_eigh =
   true` + `auto` resolves to `distributed`.

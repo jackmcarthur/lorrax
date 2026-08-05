@@ -87,7 +87,7 @@ Longer discussions of the load-bearing keys are in [drivers.md](drivers.md).
 | `sigma_window_edge_factor` | `1.5` | Widens the minimax window past the sigma omega-grid edges (T = omega_max + factor*xi). |
 | `sigma_omega_batch_size` | `4` | Omega points evaluated per batch in the Sigma^c(omega) loop. |
 | `sigma_omega_accumulation` | `"auto"` | How per-branch Sigma(omega) contributions are accumulated (auto = pick by size). |
-| `sigma_omega_layout` | `"replicated"` | Sigma_c(omega,k,m,n) cube layout: replicated (default) | sharded (stays mesh-tiled end-to-end; refuses for self_consistent, indivisible window, h5py_allgather at P>1). |
+| `sigma_omega_layout` | `"replicated"` | Sigma_c(omega,k,m,n) cube layout: replicated (default) | sharded (stays mesh-tiled end-to-end; works for every qp_solver; refuses an indivisible window or h5py_allgather at P>1). |
 | `sigma_at_dft_extrapolate` | false | Extrapolate Sigma to E_DFT outside the omega grid instead of clamping. |
 | `sigma_at_dft_energies` | false | DEPRECATED alias for qp_solver = one_shot_dft (now the default). |
 | `sigma_freq_debug_output` | false | Dump the per-branch Sigma(omega) debug table. |

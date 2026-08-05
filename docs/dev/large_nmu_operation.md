@@ -156,6 +156,24 @@ until fixed.  File:line references as of this page's commit.
 7. **eigenvalue vectors** — `lambda (nq, mu)` replicated in the
    distributed zeta tier (ScaLAPACK's own contract); `Sigma_c(omega,k,m,n)`
    cube replicated under the default `sigma_omega_layout = replicated`.
+   `sharded` removes that residency for every `qp_solver` (the
+   `self_consistent` refusal was deleted 2026-08-05); under SC the gather
+   it elides runs once per Sigma evaluation, not once per run.
+
+   IF A CUBE ROTATION IS EVER ADDED (e.g. to put `sigma_mnk.h5` and
+   `WFN_qp.h5` in one basis), the sharded layout does NOT force the cube
+   back onto every rank — but only if the output sharding is pinned.
+   Measured at nomega=41/nk=16/nb=512 (cube 2624 MiB), job 7889790: the
+   einsum `U Sigma U^dagger` with its output sharding LEFT FREE emits an
+   all-reduce of the FULL 2624 MB cube and six full-cube buffers, identical
+   at P=4 and P=16 — exactly the per-rank residency 712a866 removed, and it
+   does not improve with P.  The SAME einsum with the output PINNED to the
+   cube's own tiling emits two all-gathers of cube/p_axis and no full-cube
+   buffer (transient 1.02 cube at 2x2, 0.51 at 4x4).  The difference is one
+   `with_sharding_constraint`.  A two-half shard_map form that scans over
+   the destination band block does better still: largest collective operand
+   one tile, transient ~4 tiles (0.26 cube at 4x4).  See
+   `tests/multi_device/sigma_omega_rotate_probe.py`.
 8. **h5py_allgather writer fallback** — rank-0 full-tensor gather when
    the parallel-HDF5 probe demotes; announced.
 
