@@ -103,13 +103,23 @@ def _eigh_columns(backend: str, lam, Q):
 
     ``A @ Q == Q @ diag(lam)``.  cuSOLVERMp's wrapper returns the raw
     device buffer, whose documented layout is the conjugate transpose of
-    that; SLATE and ScaLAPACK already return columns.  This is the ONE
-    place the difference is known — it used to live inside
-    ``dispatch_eigh`` only, so anything calling ``backend_module`` (the ζ
-    tier, four bench scripts) had to remember it independently.
+    that (``ffi/cusolvermp/eigh.py`` Layout note); SLATE and ScaLAPACK
+    already return columns.  This is the ONE place the difference is
+    known — it used to live inside ``dispatch_eigh`` only, so anything
+    calling ``backend_module`` (the ζ tier, four bench scripts) had to
+    remember it independently.
+
+    RANK-AGNOSTIC: the transpose is on the LAST TWO axes, so one
+    normaliser serves a ``(n, n)`` tile and a ``(nq, n, n)`` stack alike.
+    It has to be, because ``dispatch.dispatch_batched_eigh`` probes for a
+    backend's stacked entry with ``getattr`` rather than a name table —
+    the day cuSOLVERMp grows a ``batched_distributed_eigh`` this function
+    starts receiving stacks with no other edit, and the old ``.T``
+    (reverse ALL axes) would have silently returned ``(n, n, nq)``.  On a
+    2-D ``Q`` this is exactly the old ``jnp.conj(Q).T``.
     """
     if backend == "cusolvermp":
-        return lam, jnp.conj(Q).T
+        return lam, jnp.conj(jnp.swapaxes(Q, -1, -2))
     return lam, Q
 
 

@@ -66,7 +66,18 @@ Four layers, one module each in `src/ffi/linalg/`:
   output conventions.  See "The plan API" below.
 * **`dispatch.py`** — `dispatch_eigh`, the older single-call entry point,
   now a thin shim over a plan.  Kept for back-compat; new code takes a
-  plan.
+  plan.  Plus `dispatch_batched_eigh`, which is *not* back-compat: it is
+  the one place the **batching asymmetry** is handled.  Only ScaLAPACK
+  exposes `batched_distributed_eigh`, so a caller that names it directly
+  works on a host mesh and `AttributeError`s on CUDA.  The capability
+  test is a `getattr` on the resolved module, not a platform test, so a
+  backend that gains a stacked entry later is picked up with no edit;
+  the fallback walks the batch through `plan(A[q])`, which is what
+  applies the per-backend eigenvector-layout normaliser (calling
+  `mod.distributed_eigh` directly returns cuSOLVERMp's RAW buffer —
+  rows, not columns).  Gated by
+  `tests/multi_device/batched_eigh_dispatch_gate.py`; see that function's
+  docstring for the donation and `lax.scan` rulings and their job ids.
 * **backends** — `ffi/cusolvermp/` (CUDA), `ffi/slate/` (CUDA + host),
   `ffi/scalapack/` (host), each a thin `shard_map`+`jax.ffi` wrapper
   over one C++ handler in `liblorrax_ffi.so` / `liblorrax_ffi_host.so`;
