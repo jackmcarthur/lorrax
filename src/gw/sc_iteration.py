@@ -952,7 +952,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         eigh_kind = _resolve_sc_eigh(
             nb_carry, inputs.mesh_xy, inputs.config,
             print_fn=inputs.print_fn)
-        if state.iteration == 0:
+        # ``<= 1``, NOT ``== 0``.  Iteration 0 reaches this block only when
+        # the carry is not exactly diagonal, which the canonical
+        # ``make_initial_state_from_dft`` never produces — so an
+        # ``== 0`` guard printed nothing on any real run (job 7890020,
+        # every arm).  Iteration 1 is the first that actually runs an
+        # eigh; both are allowed so a non-canonical initial carry still
+        # reports.
+        if state.iteration <= 1:
             inputs.print_fn(
                 f"    SC eigh: {eigh_kind} (nb={nb_carry}, one (nb, nb) tile "
                 f"= {nb_carry * nb_carry * 16 / 2**20:.2f} MiB, "

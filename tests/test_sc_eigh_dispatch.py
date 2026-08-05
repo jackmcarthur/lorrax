@@ -128,7 +128,7 @@ def test_an_indivisible_band_window_stays_native_under_auto():
     """``distributed_eigh_bands`` pads and does not unpad — auto must not.
 
     nb = 46 is the repo's own gnppm fixture (nval + ncond = 26 + 20);
-    46 % 8 = 6, so an 8×8 mesh does not divide it.
+    the band divisor of an 8×8 mesh is 64 and 46 % 64 = 46.
     """
     assert _resolve(46, 8, 8) == "native"
 
