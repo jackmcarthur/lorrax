@@ -91,5 +91,29 @@ echo
 echo "[build] --- ldd check ---"
 ldd "${SO_FILE}" | grep -Ei 'cusolver|nccl|cuda|cal' || true
 
+# GATE (hazard S3): exactly ONE cray-mpich runtime object in the closure.
+# The CUDA/container leg was previously UNGATED -- only the bare-metal host
+# leg checked this, and it checked with 'readelf -d', which sees direct
+# DT_NEEDED only and so cannot see an MPI pulled in transitively through
+# libhdf5_parallel_gnu_123.  gate_one_mpi.sh resolves the full ldd closure
+# and dedupes by resolved file.  No expected-variant is pinned here: inside
+# the Shifter container the ONLY cray-mpich available is shifter's
+# --module=mpich bind-mount (8.1.25 / libmpi_gnu_91); the phdf5 stage
+# deliberately aliases libmpi_gnu_123.so.12 onto it so HDF5 and the FFI
+# share ONE runtime.  What must hold is one mapped object, not a version.
+GATE_TAG=build "${SCRIPT_DIR}/gate_one_mpi.sh" "${SO_FILE}" || exit 1
+
+# Build provenance beside the artifact.  ffi_loader.build_provenance()
+# prints it in every run's startup report; without it the loader can only say
+# "NO PROVENANCE FILE (pre-stamp build)".  On 2026-08-05 a 4-node GPU log was
+# analysed against an on-disk liblorrax_ffi.so that had been rebuilt SEVEN
+# MINUTES after that log's last write, and nothing on disk recorded the fact.
+"${SCRIPT_DIR}/stage/stamp_provenance.sh" "${SO_FILE}" \
+    "leg=cuda" \
+    "nvhpc_cuda=${NVHPC_CUDA}" \
+    "build_dir=${BUILD_DIR}" || {
+        echo "[build] WARNING: provenance stamp failed (build itself is fine)" >&2
+    }
+
 echo
 echo "[build] done.  .so at: ${SO_FILE}"

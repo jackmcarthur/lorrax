@@ -263,20 +263,12 @@ readelf -d "$SO_FILE" | grep NEEDED
 # libmpi in one process means MPI_COMM_WORLD and the MPI_Comm handle passed
 # to Csys2blacs_handle mean different things in different frames.  It links
 # fine and corrupts or hangs at the first collective.
-mpi_variants=$(readelf -d "$SO_FILE" | grep NEEDED | grep -oE 'libmpi_gnu_[0-9]+' | sort -u)
-mpi_count=$(printf '%s\n' "$mpi_variants" | grep -c . || true)
-if [[ "$mpi_count" -ne 1 ]]; then
-    echo "[build_ffi_host] GATE FAILED (S3): expected exactly ONE libmpi_gnu_*," >&2
-    echo "[build_ffi_host]   found $mpi_count: $mpi_variants" >&2
-    exit 1
-fi
-if [[ "$mpi_variants" != "libmpi_gnu_123" ]]; then
-    echo "[build_ffi_host] GATE FAILED (S3): linked $mpi_variants, expected" >&2
-    echo "[build_ffi_host]   libmpi_gnu_123 (cray-mpich 9.0.1 — what LibSci and" >&2
-    echo "[build_ffi_host]   the SLATE install carry).  Check the loaded modules." >&2
-    exit 1
-fi
-echo "[build_ffi_host] GATE 1 (S3, one cray-mpich ABI) PASSED: $mpi_variants"
+# NOTE 2026-08-05: this gate USED to test `readelf -d` (DIRECT DT_NEEDED
+# only) and therefore passed binaries that pulled a second libmpi in
+# transitively through libhdf5_parallel_gnu_123.  It now resolves the FULL
+# closure with ldd and dedupes by the resolved FILE, not the name string.
+# See src/ffi/cpp/gate_one_mpi.sh for why both changes are load-bearing.
+GATE_TAG=build_ffi_host "$SRC/gate_one_mpi.sh" "$SO_FILE" libmpi_gnu_123 || exit 1
 
 # GATE 2 (hazard S8): ONE LibSci threading flavour.  Mixing libsci_gnu_mpi
 # with libsci_gnu_mpi_mp puts a sequential and an OpenMP BLAS/ScaLAPACK in the
@@ -317,6 +309,17 @@ if command -v ldd >/dev/null 2>&1; then
         }
     echo "[build_ffi_host] GATE 4 (load-time resolution) PASSED"
 fi
+
+# Build provenance beside the artifact — see the note in src/ffi/cpp/build.sh.
+"$LORRAX_ROOT/src/ffi/cpp/stage/stamp_provenance.sh" "$SO_FILE" \
+    "leg=host" \
+    "prgenv=$LORRAX_PM_PRGENV" \
+    "libsci=$LORRAX_PM_LIBSCI$LORRAX_PM_LIBSCI_FLAVOUR" \
+    "hdf5=$LORRAX_PM_HDF5" \
+    "fftw=$LORRAX_PM_FFTW" \
+    "slate=$LORRAX_SLATE_HOST_INSTALL_DIR" || {
+        echo "[build_ffi_host] WARNING: provenance stamp failed" >&2
+    }
 
 echo
 echo "[build_ffi_host] done.  .so at: $SO_FILE"
