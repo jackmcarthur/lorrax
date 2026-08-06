@@ -4,6 +4,137 @@ Dated, binding rulings from the code owner. Each entry states the decision,
 its consequence for code, and what it licenses deleting. Newest first.
 These override older prose anywhere in the tree.
 
+## 2026-08-05 — One Coulomb kernel; the mini-BZ sampler bug is fixed
+
+Owner ruling: consolidate `v(q+G)` onto one formula and one Monte-Carlo
+sampler, INCLUDING the physics change, and keep every feature that only one
+of the ~10 copies had.
+
+**The bug.** `gw/compute_vcoul.py::build_v_head_miniBZ_avg_3d` drew mini-BZ
+samples as `randvals @ bvec.T`. The lattice period is the ROWS of `bvec`
+(`q_cart = q_frac @ bvec` everywhere else in the tree); its columns are not in
+general a period, so the parallelepiped being sampled was not a fundamental
+domain and the Voronoi wrap that follows was not measure-preserving. The
+mini-BZ average was then biased. `gw/coulomb/base.py:152` had the correct
+`U @ bvec` and carries a comment about exactly this bug class — it was fixed
+there in 2026-07 and never propagated back. Introduced 0c8083d (2026-04-05),
+live and default-on (`mc_average_vcoul_body = True`, `gw_config.py:1142`;
+gated to `sys_dim == 3` at `v_q_g_flat.py:540`).
+
+**`allclose(bvec, bvec.T)` IS THE WRONG PREDICATE, and this correction
+matters.** The audit that opened this work — and this entry's own first
+draft — classified cells by whether `bvec` is symmetric. The estimator is
+unbiased under the weaker condition that `bvec.T` is a SIGNED ROW-PERMUTATION
+of `bvec`: then `u @ bvec.T` and `u @ bvec` are different points but the same
+distribution on the same parallelepiped, so only the MC realisation changes.
+Measured against a REJECTION ground truth (uniform on the mini-BZ Voronoi
+cell by construction, sharing no code with the production sampler), max and
+mean relative error over the 63 nonzero q of a 4x4x4 grid — Frontera job
+7890650:
+
+| cell | bvec.T a signed row-perm of bvec | deleted `bvec.T` | fixed `bvec` | MC self-noise |
+|---|---|---|---|---|
+| cubic | yes | 3.0e-03 | 3.0e-03 (identical) | 3.8e-03 |
+| **Si WFN — the only 3D deck on this machine** | **yes** (perm (2,0,1)) | **3.7e-03** | 4.4e-03 | 2.2e-03 |
+| fcc from `2pi inv(A).T` | no | **6.4e-01** / 8.4e-02 mean | 3.7e-03 | 2.2e-03 |
+| hexagonal a=5.9 c=23 | no | **1.7e-01** / 6.5e-02 mean | 3.9e-03 | 3.7e-03 |
+| triclinic (generic) | no | **2.3e-02** / 7.4e-03 mean | 2.6e-03 | 2.5e-03 |
+
+So: the defect is real and up to 64% per-q on a genuinely skewed cell — a 3D
+HEXAGONAL deck would have been wrong by ~6.5% in the mean — but the one 3D
+deck that exists here happens to sit in the benign class. Both halves of that
+have to be said. An earlier draft of this entry, and the commit messages of
+the consolidation steps, cited a "4.25% fcc ibrav=2" figure for the Si deck;
+that number belongs to an fcc `bvec` CONSTRUCTED as `2pi inv(A).T`, not to
+the one pw2bgw wrote into this fixture. Corrected here.
+
+**Measured Sigma impact** (Frontera job 7890626): bulk Si 4x4x4, `sys_dim = 3`,
+`mc_average_vcoul_body` at its default, the two sampling lines as the only
+difference, everything else byte-frozen:
+
+    max |d sigTOT| = 1.63 meV     MAE = 0.147 meV
+    max |d sigCOH| = 1.63 meV     max |d sigSX| = 0.12 meV
+    VH and Eo bit-identical
+
+Because this cell is in the benign class, that 1.63 meV is a RE-SEEDING
+effect — a different Monte-Carlo realisation of an unbiased estimator — not a
+bias being removed. It is nevertheless a real change to a pinned number
+(noise floor for the comparison, arm A vs the previous GPU-generated
+reference: 0.054 meV; the move is 30x that and above the gate's own 1 meV
+atol), so `eqp_si_ref.dat` is re-pinned. It is NOT evidence that any past Si
+number was wrong.
+
+**Which past results are affected: NONE.** A filesystem-wide sweep of
+Frontera (`/work2`, `/scratch1`, `/scratch2`, `/home1`: 2669 decks, 567 run
+dirs) found that no deck anywhere sets `mc_average_vcoul_body`, so all run at
+the default true; 2438 decks are `sys_dim = 2` and 152 leave it unset, where
+the default is 2 (`gw_config.py:851`) — `sys_dim == 2` short-circuits the call
+entirely. Every `sys_dim = 3` deck on the machine is one file, the
+`si_cohsex_debug` fixture (79 identical copies), and its cell is in the
+benign class above. Nothing needs re-running. The only artifact that moves is
+the frozen reference, and it moves by MC reseeding.
+
+**The new sampler is also more accurate.** Against the same ground truth on
+the Si cell, head-table error drops from 4.0e-03 max / 9.2e-04 mean to
+4.7e-04 / 1.6e-04 — about 8x — from `nmax` 1 -> 3 (BGW `ncell`), scrambled
+Sobol instead of `RandomState(42)` uniform, and BGW's adaptive per-q sample
+count. Cost on the Si 4x4x4 deck: 7.2 s for the whole 64-q table, one draw
+reused across q (job 7890648).
+
+**Kept, because exactly one copy had each.** The `slab_sr`
+`-expm1(-K^2/4a^2)` channel (only `bse/vq_interp.py:319`); the full
+{bulk, slab} x {full, lr, sr} product; the `argmin_G |q+G|^2` head-slot rule
+for the BSE arbitrary-Q path; `bse.vq_interp.minibz_head_vlr`'s rank-invariant
+`fold_in(key, global_slot)` distribution, which is why the sampler
+distributes by default; and `make_eval_vq._body`'s `out_shardings` /
+`with_sharding_constraint` structure, which the shared kernel is called
+INSIDE, never around.
+
+**Two guard tolerances, not one.** `TOL_QG_ZERO = 1e-12` identifies the exact
+q=G=0 reciprocal-lattice slot. `TOL_MC_NAN = 1e-24` is a 0/0 guard on
+Monte-Carlo draws, where a sample at |K|^2 ~ 1e-13 is a legitimate draw from
+an integrable integrand and zeroing it biases the estimator low. They are not
+interchangeable in either direction.
+
+**REFUSAL: do not zero `v(G=0)` at `q != 0`.** Only `|q+G|^2 < TOL_QG_ZERO`
+is zeroed. Zeroing the whole G=0 column is the natural tidy-up and it is
+wrong: measured, it moves the BSE makeVq-vs-disk residual from ~1e-9 to 0.33
+(`bse/vq_interp.py:325-328`). Guarded by
+`tests/test_coulomb_kernel.py::test_G0_at_finite_q_is_NOT_zeroed`.
+
+**Volume convention.** `q0_average` returns BARE (no `1/Omega_cell`).
+`Bulk3D`/`Slab2D` were right; the `CoulombKernel` docstring claimed the
+opposite and `Box0D` divided. `units` is now a required keyword on the kernel
+with no default, and `get_kernel` ASSERTS `q0_units == "bare"` rather than
+trusting a docstring.
+
+**Pad policy is genuinely divergent and both sides are correct.**
+`compute_v_q_per_G` leaves pad slots evaluated (the G-flat contract has
+zeta-tilde = 0 there); `bse.vq_interp.v_sphere_padded` zeroes them (its `ZG`
+carries junk in the pad columns). This is now an explicit `pad_policy`
+parameter on both, defaulting to what each consumer needs. Silently picking
+one corrupts whichever loses.
+
+**Deleted.** The `gw/coulomb` per-dimension `v_qG` layer (never had a caller
+from its creating commit d5b5119 to 2026-08-05), `Slab2D._vq_2d`,
+`Slab2D.v_head_minibz_avg`, `psp/finite_q_head_interp.{v_head_3d,
+v_head_2d_slab}`, and `build_v_head_miniBZ_avg_3d`.
+
+**NOT merged, each for a reason.** `compute_vcoul_0d.compute_vcoul_box` (a
+real-space Wigner-Seitz FFT — a different algorithm, not a truncation
+factor); `file_io/read_bgw_vcoul.py` + `fill_v_grid_for_q` (a deliberate
+independent cross-check, `use_bgw_vcoul`; merging it destroys its purpose);
+`psp/dft_operators.solve_poisson` (DFT Hartree at q=0);
+`v_q_bispinor`'s `eps_K2` (a projector guard on K-hat, a different quantity).
+
+**OPEN, deliberately not decided here.** The head-SLOT rule in the GW driver
+was left at Miller-(0,0,0). See the "Coulomb head slot" item in
+`docs/dev/STATE.md`.
+
+Licenses deleting: any remaining private spelling of `8pi/|q+G|^2`, any second
+mini-BZ sampler, and the `nmax=1` / `RandomState(42)` / non-adaptive MC
+settings.
+
 ## 2026-08-04 — Padding is SlabIO's business, not the caller's
 
 A caller states LOGICAL shapes only. Physical padding, mesh divisibility and

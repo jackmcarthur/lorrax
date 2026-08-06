@@ -528,7 +528,8 @@ def compute_all_V_q_g_flat(
         raise NotImplementedError(
             f"compute_all_V_q_g_flat: sys_dim must be 2 or 3 "
             f"(0-D box per-q v(G) not wired); got {sys_dim}.")
-    from .compute_vcoul import compute_v_q_per_G, build_v_head_miniBZ_avg_3d
+    from .compute_vcoul import (compute_v_q_per_G,
+                                build_v_head_minibz_table_3d)
 
     # 3D bulk: precompute the mini-BZ-averaged v(q, G=0) table once.
     # The IBZ → full-BZ V_q unfold is bilinear in ζ and inherits this
@@ -538,7 +539,7 @@ def compute_all_V_q_g_flat(
     # only refinement and is silently no-op'd for sys_dim=2.
     _v_head_table = None
     if mc_average_vcoul_body and sys_dim == 3:
-        _v_head_table = build_v_head_miniBZ_avg_3d(
+        _v_head_table = build_v_head_minibz_table_3d(
             kgrid, bvec, cell_volume)
 
     def _bare_v_per_G(q_irr_frac, gvec_components):

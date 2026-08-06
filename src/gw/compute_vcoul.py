@@ -6,9 +6,10 @@ what the live G-flat V_q path needs:
 * :func:`compute_v_q_per_G` — evaluate ``v(q+G)`` at the writer's per-q
   WFN.h5-style G-sphere (the ``isdf_header/gvec_components`` table).
   This is the only ``v`` builder the G-flat contract consumes.
-* :func:`build_v_head_miniBZ_avg_3d` — the 3D mini-BZ-averaged
+* :func:`build_v_head_minibz_table_3d` — the 3D mini-BZ-averaged
   ``<v(q, G=0)>`` head table injected into ``compute_v_q_per_G`` for
-  bulk systems.
+  bulk systems.  Thin loop over the ONE sampler
+  (:func:`gw.coulomb.sampler.minibz_cell_average`).
 * :func:`compute_all_V_q` — the thin dispatcher: for a G-flat on-disk ζ
   it hands off to :func:`gw.v_q_g_flat.compute_all_V_q_g_flat`; any
   other layout raises ``NotImplementedError``.
@@ -31,37 +32,56 @@ from file_io.paths import resolve_input_path
 from .coulomb.kernel import TOL_QG_ZERO, v_qG
 
 
-def build_v_head_miniBZ_avg_3d(
+def build_v_head_minibz_table_3d(
     kgrid: tuple[int, int, int],
     bvec: np.ndarray,
     cell_volume: float,
     *,
-    nmc: int = 2**18,
-    seed: int = 42,
+    nsamples: int = 2**18,
+    qmc_reps: int = 10,
+    method: str = "sobol",
+    nmax: int = 3,
+    seed_offset: int = 0,
+    n_coarse: int = 250_000,
+    distribute: bool = True,
 ) -> np.ndarray:
     """Mini-BZ-averaged bare Coulomb head ``<v(q+δq, G=0)>_miniBZ`` per q.
 
-    3D bulk only.  Returns ``(nkx, nky, nkz)`` real array of head values
-    in Rydberg / cell-volume units.  q=0 returns 0 (the actual head is
-    injected separately via a rank-1 correction in the Σ_X path).
+    3D bulk only.  Returns ``(nkx, nky, nkz)`` real, per-volume units
+    (``·1/Ω_cell``), consumed by :func:`compute_v_q_per_G` as
+    ``v_head_miniBZ``.  q=0 returns 0 — the true head is injected
+    separately as a rank-1 correction in the Σ_X path.
 
-    The MC integration draws ``nmc`` (default 2¹⁸) points uniformly on
-    the Voronoi cell of the mini-BZ and averages ``8π/|q+δq|²``.  The
-    G-flat path (:func:`compute_v_q_per_G`, called from
-    :func:`gw.v_q_g_flat.compute_all_V_q_g_flat`) consumes this table
-    as the ``v_head_miniBZ`` argument.
+    Replaces ``build_v_head_miniBZ_avg_3d`` (deleted 2026-08-05), which
+    was WRONG.  Four defects, in order of size:
+
+    1. **It sampled the wrong parallelepiped.**  ``randvals @ bvec.T``
+       spans the COLUMNS of ``bvec``; the lattice period is its ROWS.  The
+       Voronoi wrap that follows is only measure-preserving on a
+       fundamental domain, so the mini-BZ average was biased.  Exactly
+       zero error when ``bvec`` is symmetric (a cubic cell — which is why
+       this survived from 2026-04-05); up to **64% per-q, 8.4% mean** on
+       fcc QE ``ibrav=2`` at 4×4×4 and 16.6%/6.5% hexagonal (Frontera job
+       7890612).  Every 3D deck in the tree is fcc.
+    2. ``nmax=1`` — one Voronoi replica shell.  Too narrow for a skewed
+       cell; BGW uses ``ncell=3``.
+    3. ``RandomState(42)`` uniform — no low-discrepancy sequence, no
+       replicate error bar.  Now scrambled Sobol × ``qmc_reps``.
+    4. No adaptive sample count.  BGW spends samples where the integrand
+       varies (``minibzaverage.f90:63-75``); away from the pole a few
+       thousand draws are already converged.
+
+    The offsets are drawn ONCE and reused for every q — the adaptive rule
+    only changes how many of them each q keeps, which is what
+    ``minibz_average``'s ``v[:n_q]`` slice already meant.
     """
-    from .vcoul import wrap_points_to_voronoi
+    from .coulomb.sampler import minibz_cell_average, minibz_offsets
     nkx, nky, nkz = (int(s) for s in kgrid)
-    bvec_j = jnp.asarray(bvec, dtype=jnp.float64)
-    rng = np.random.RandomState(seed)
-    randvals = rng.uniform(0, 1, (nmc, 3))
-    randcart = (randvals @ bvec.T)
-    wrapped = np.asarray(wrap_points_to_voronoi(
-        jnp.asarray(randcart), bvec_j, nmax=1))
+    bvec = np.asarray(bvec, dtype=np.float64)
     kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
-    randlims = bvec.T @ (np.diag(1.0 / kgrid_arr) @ np.linalg.inv(bvec.T))
-    dq_cart = (randlims @ wrapped.T).T  # (nmc, 3) mini-BZ offsets in Cartesian
+    dq = minibz_offsets(bvec, (nkx, nky, nkz), sys_dim=3, nsamples=nsamples,
+                        qmc_reps=qmc_reps, method=method, nmax=nmax,
+                        seed_offset=seed_offset)
 
     v_head_avg = np.zeros((nkx, nky, nkz), dtype=np.float64)
     for qx in range(nkx):
@@ -69,15 +89,18 @@ def build_v_head_miniBZ_avg_3d(
             for qz in range(nkz):
                 qw = np.array([qx, qy, qz], dtype=np.float64)
                 qw = np.where(qw > kgrid_arr / 2, qw - kgrid_arr, qw)
-                q_frac = qw / kgrid_arr
-                q_cart = q_frac @ bvec
-                if np.dot(q_cart, q_cart) < 1e-12:
-                    v_head_avg[qx, qy, qz] = 0.0  # q=0 head handled separately
-                else:
-                    shifted = q_cart[None, :] + dq_cart  # (nmc, 3)
-                    denom = np.sum(shifted**2, axis=1)
-                    v_head_avg[qx, qy, qz] = np.mean(8.0 * np.pi / denom)
-    return v_head_avg * (1.0 / float(cell_volume))
+                q_cart = (qw / kgrid_arr) @ bvec
+                if float(q_cart @ q_cart) < TOL_QG_ZERO:
+                    continue          # q=0 head handled separately
+                v_head_avg[qx, qy, qz] = minibz_cell_average(
+                    q_cart, bvec=bvec, kgrid=(nkx, nky, nkz), sys_dim=3,
+                    channel="full", units="per_volume", celvol=cell_volume,
+                    n_kpts=nkx * nky * nkz, nsamples=nsamples,
+                    qmc_reps=qmc_reps, method=method, nmax=nmax,
+                    seed_offset=seed_offset, analytic_sphere=False,
+                    adaptive=True, n_coarse=n_coarse, distribute=distribute,
+                    dq_batches=dq)
+    return v_head_avg
 
 
 def compute_v_q_per_G(
