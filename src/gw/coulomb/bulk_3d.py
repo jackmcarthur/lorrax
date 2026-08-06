@@ -7,14 +7,22 @@ import numpy as np
 from common import Meta
 from .base import (SysDim, sample_minibz_qpoints, minibz_average,
                    minibz_inscribed_sphere_r2)
+from .kernel import TOL_MC_NAN, v_qG
 
 
 class Bulk3D:
     sys_dim = SysDim.BULK_3D
 
     def _vq_isotropic(self, qcart):
-        denom = jnp.einsum("ij,ij->i", qcart, qcart)
-        return 8.0 * jnp.pi / denom
+        """8π/|q|² on MC draws (N, 3), BARE units — see q0_average's contract.
+
+        ``TOL_MC_NAN`` (not ``TOL_QG_ZERO``): these are Monte-Carlo samples,
+        and a draw at |q|² ~ 1e-13 is a legitimate sample of an integrable
+        integrand carrying real weight.  The guard exists only to stop an
+        exact 0/0.
+        """
+        return v_qG(qcart, axis=1, sys_dim=3, channel="full", units="bare",
+                    zero_tol=TOL_MC_NAN, xp=jnp)
 
     def q0_average(
         self, wfn, meta: Meta, *,

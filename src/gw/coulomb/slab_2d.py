@@ -12,6 +12,7 @@ import jax.numpy as jnp
 
 from common import Meta
 from .base import SysDim, sample_minibz_qpoints
+from .kernel import TOL_MC_NAN, v_qG
 
 
 class Slab2D:
@@ -37,20 +38,14 @@ class Slab2D:
             wfn, meta, nsamples=nsamples, method=method, qmc_reps=qmc_reps,
             nmax=nmax,
         )
-        # Sobol path uses the per-rep formula with the *cosine* term included
-        # (since rq.z is exactly zero by construction, cos(qz·zc) == 1, but
-        # we mirror the historical 8π form for bit-identity with prior runs).
-        # Uniform fallback uses the 4π form below.
-        # In practice: Sobol uses the explicit formula in the historical
-        # code; we replicate it.
+        # The slab kernel on MC draws, BARE units (see q0_average's contract),
+        # with the MC NaN guard rather than the lattice-slot guard: a draw at
+        # tiny |q| is a real sample of an integrable integrand, not the q=G=0
+        # lattice slot.  rq[:, 2] is already 0 by construction, so the cosine
+        # is 1 — kept in the shared formula for explicitness.
         def _vq_sobol(rq):
-            denom = jnp.einsum("ij,ij->i", rq, rq)
-            base = 8.0 * jnp.pi / denom
-            kxy = jnp.linalg.norm(rq[:, :2], axis=1)
-            # rq[:, 2] is already 0 → cos(...) is 1 numerically, kept for
-            # explicitness against prior bit-identical reference output.
-            f2d = 1.0 - jnp.exp(-zc * kxy) * jnp.cos(rq[:, 2] * zc)
-            return base * f2d
+            return v_qG(rq, axis=1, sys_dim=2, channel="full", units="bare",
+                        zc=zc, zero_tol=TOL_MC_NAN, xp=jnp)
 
         means = [jnp.mean(_vq_sobol(rq)) for rq in batches]
         vc0_mean = jnp.mean(jnp.stack(means))

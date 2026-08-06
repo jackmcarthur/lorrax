@@ -88,6 +88,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.collectives import device_put_process_local
 from common.fft_helpers import local_fftn3
 from ffi.linalg import plan as linalg_plan
+from gw.coulomb.kernel import TOL_QG_ZERO, v_qG
 
 # pipeline constants (§13.5 production shape; reference values verbatim)
 ALPHA = 0.30          # Gaussian split width, 1/bohr; broad optimum ~1.5-2x dq
@@ -316,30 +317,33 @@ def to_sphere(zx, zr, q):
     return out
 
 
+_KIND_CHANNEL = {"slab": "full", "slab_lr": "lr", "slab_sr": "sr"}
+
+
 def v_slab_on_set(zx, qfrac, GS, kind="slab", alpha=None):
     """Slab-truncated Coulomb kernel on an explicit Miller set at momentum
     ``qfrac`` (wrapped fractional), per G channel, K = q+G Cartesian (1/bohr):
         v(K) = 8π / K² · f2d / V_cell,
         f2d  = 1 − exp(−z_c |K_∥|) cos(K_z z_c),   z_c = π / b3_z
-    Only the true divergence K² < 1e-12 is zeroed (the q=0 G=0 slot);
+    Only the true divergence K² < TOL_QG_ZERO is zeroed (the q=0 G=0 slot);
     at q ≠ 0 the finite G=0 term is part of the body (measured: zeroing it
     moves makeVq-vs-disk from ~1e-9 to 0.33).  Split (stable expm1;
     vSR+vLR == v to 1e-13, gated):
         slab_lr: v · e^{−K²/4α²}      slab_sr: v · (−expm1(−K²/4α²))
+
+    The formula itself is :func:`gw.coulomb.kernel.v_qG` — the same source
+    line the GW per-sphere builder and the mini-BZ sampler evaluate.  This
+    wrapper only supplies the geometry (K from the stored ``bvec``) and the
+    ``kind`` → ``channel`` name map.  Values are within 2 ULP of the
+    pre-2026-08-05 local copy, which spelled the volume factor ``/ celvol``
+    where the shared kernel spells ``* (1/celvol)`` (measured, Frontera job
+    7890613; ``tests/test_coulomb_kernel.py`` holds the bound).
     """
     K = zx["bvec"].T @ (np.asarray(qfrac)[:, None] + GS.astype(np.float64))
-    K2 = np.sum(K * K, axis=0)
-    zero = K2 < 1e-12
-    K2s = np.where(zero, 1.0, K2)
-    zc = np.pi / zx["bvec"][2, 2]
-    f2d = 1.0 - np.exp(-zc * np.sqrt(K[0] ** 2 + K[1] ** 2)) \
-        * np.cos(K[2] * zc)
-    v = 8.0 * np.pi / K2s * f2d / zx["celvol"]
-    if kind == "slab_lr":
-        v = v * np.exp(-K2 / (4.0 * alpha ** 2))
-    elif kind == "slab_sr":
-        v = v * (-np.expm1(-K2 / (4.0 * alpha ** 2)))
-    return np.where(zero, 0.0, v)
+    return v_qG(K, axis=0, sys_dim=2, channel=_KIND_CHANNEL[kind],
+                units="per_volume", celvol=float(zx["celvol"]),
+                alpha=alpha, zc=float(np.pi / zx["bvec"][2, 2]),
+                zero_tol=TOL_QG_ZERO)
 
 
 def v_sphere(zx, q, kind="slab", alpha=None):
@@ -356,15 +360,37 @@ def make_vq(zx, zt, q, kind="slab", alpha=None):
     return np.conj(A) @ A.T
 
 
-def v_sphere_padded(zx, kind="slab", alpha=None):
-    """Kernel rows on every stored sphere, zero-padded to ``ngkmax``:
-    (nq, ngkmax) with v = 0 beyond ngk[q].  The zero pad makes batched
-    A = ZG·√v identical to the per-q truncated ``make_vq`` factor (pad
-    channels multiply any stored junk columns to exact zeros)."""
+def v_sphere_padded(zx, kind="slab", alpha=None, *, pad_policy="zero"):
+    """Kernel rows on every stored sphere, padded to ``ngkmax``: (nq, ngkmax).
+
+    ``pad_policy`` — what the slots beyond ``ngk[q]`` hold.  THE TWO LIVE
+    CONSUMERS GENUINELY DISAGREE AND BOTH ARE RIGHT; picking one silently
+    corrupts whichever loses:
+
+    ``"zero"`` (default here)
+        v = 0 beyond ``ngk[q]``.  Required by this caller: the batched
+        ``A = ZG·√v`` must reproduce the per-q TRUNCATED ``make_vq``
+        factor, and ``ZG`` carries stored junk in the pad columns — only a
+        zero ``v`` multiplies it away exactly.
+    ``"leave"``
+        whatever ``v`` evaluates to at the pad slot.  That is what
+        :func:`gw.compute_vcoul.compute_v_q_per_G` does, and it is correct
+        THERE because the G-flat V_q contract has ζ̃ = 0 at pad slots, so
+        the pad value is multiplied out on the other side.  Do not "fix"
+        it into zeroing: the sentinel Miller index ``(-nx/2, -ny/2, -nz/2)``
+        is a real reciprocal vector and zeroing by value would also hit
+        legitimate G's on a wrapped sphere.
+    """
+    if pad_policy not in ("zero", "leave"):
+        raise ValueError(f"v_sphere_padded: pad_policy must be 'zero' or "
+                         f"'leave'; got {pad_policy!r}")
     v_all = np.zeros((zx["nq"], zx["ngkmax"]))
     for q in range(zx["nq"]):
         v, n = v_sphere(zx, q, kind, alpha)
-        v_all[q, :n] = v[:n]
+        if pad_policy == "zero":
+            v_all[q, :n] = v[:n]
+        else:
+            v_all[q, :v.shape[0]] = v
     return v_all
 
 
@@ -1143,14 +1169,13 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None,
         for i, (g, spec, cols) in enumerate(specs):
             Phi = _phi(K[:2][:, cols], spec)                  # (ncol, nb)
             M = M.at[:, cols].set((Phi @ coeffs_tuple[i]).T)
-        K2 = jnp.sum(K * K, axis=0)
-        zero = K2 < 1e-12                                     # q=0 G=0 slot only
-        K2s = jnp.where(zero, 1.0, K2)
-        f2d = 1.0 - jnp.exp(-zc * jnp.sqrt(K[0] ** 2 + K[1] ** 2)) \
-            * jnp.cos(K[2] * zc)
-        v = 8.0 * jnp.pi / K2s * f2d / celvol \
-            * jnp.exp(-K2 / (4.0 * alpha ** 2))
-        v = jnp.where(zero, 0.0, v)
+        # LR slab kernel — the SHARED formula traced with xp=jnp.  Only the
+        # q=0 G=0 slot (K² < TOL_QG_ZERO) is zeroed; the finite G=0 term at
+        # Q ≠ 0 is body.  Nothing here is jitted or sharded by v_qG itself:
+        # this body owns the out_shardings / with_sharding_constraint.
+        v = v_qG(K, axis=0, sys_dim=2, channel="lr", units="per_volume",
+                 celvol=celvol, alpha=alpha, zc=zc, zero_tol=TOL_QG_ZERO,
+                 xp=jnp)
         # mini-BZ head: replace the LR POINT value at G*=gstar with the
         # cell-averaged <v_LR(Q+G*)>_mBZ.  Sentinel gstar=-1 (off path) →
         # arange==-1 all-False → v unchanged, exact no-op (bit-identical).
