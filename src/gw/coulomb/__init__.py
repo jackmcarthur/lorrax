@@ -10,12 +10,11 @@ Driver pattern::
 
     from gw.coulomb import get_kernel
     kernel = get_kernel(meta.sys_dim)        # raises on invalid
-    v_qG = kernel.v_qG(wfn, qvec_wrapped, comps_qG)
     vc0_mean, wcoul0 = kernel.q0_average(wfn, meta, S_cart=S_omega)
 
-The dimension-independent ``D_munu`` projector — when present — runs
-*outside* this package on the kernel output; ``v_qG`` itself never
-depends on it.
+``v(q+G)`` on a per-q sphere is not this package's job — see
+:func:`gw.compute_vcoul.compute_v_q_per_G` (GW) and
+:func:`bse.vq_interp.v_slab_on_set` (BSE).
 """
 from .base import CoulombKernel, SysDim, get_kernel
 from .bulk_3d import Bulk3D

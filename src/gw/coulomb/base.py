@@ -1,16 +1,21 @@
 """Coulomb-kernel dispatcher: SysDim enum, abstract base, sampling helper.
 
-The driver wants two things from "the Coulomb interaction" given a system
+The driver wants ONE thing from "the Coulomb interaction" given a system
 dimensionality:
 
-1. ``v_qG(wfn, qvec, comps_qG)`` — V(q+G) on the per-q sphere, with
-   q+G=0 zeroed (the head is added back as a separate rank-1 term).
-2. ``q0_average(wfn, meta, ...)`` — the (vc0_mean, wcoul0) pair at q→0,
-   typically by Monte-Carlo over the mini-BZ Voronoi cell.
+* ``q0_average(wfn, meta, ...)`` — the (vc0_mean, wcoul0) pair at q→0,
+  typically by Monte-Carlo over the mini-BZ Voronoi cell.
 
 Each dimension lives in its own module (``bulk_3d``, ``slab_2d``,
 ``box_0d``); :func:`get_kernel` picks one off ``meta.sys_dim``.  The
 shared mini-BZ sampler lives here so 2D and 3D don't duplicate it.
+
+``v(q+G)`` on a per-q sphere is NOT here: the live builders are
+:func:`gw.compute_vcoul.compute_v_q_per_G` (GW) and
+:func:`bse.vq_interp.v_slab_on_set` (BSE).  A per-dimension ``v_qG``
+method existed on these classes from their creating commit (d5b5119)
+until 2026-08-05 and was never called by anything; it was deleted rather
+than left as a second, drifting spelling of the same formula.
 """
 from __future__ import annotations
 
@@ -37,19 +42,8 @@ class SysDim(int, enum.Enum):
 
 
 class CoulombKernel(Protocol):
-    """One implementation per dimensionality.
-
-    All kernels return arrays with the same q+G=0-zeroed convention
-    (head is injected separately via :class:`gw.head_correction.HeadResolver`).
-    Volume-factor convention: outputs are in Rydberg with the
-    BerkeleyGW factor ``v_q(G) · (1/Ω_cell)`` already applied so the
-    downstream ``ζ Vc(G) ζ†`` contraction comes out in Ry directly.
-    """
+    """One implementation per dimensionality."""
     sys_dim: SysDim
-
-    def v_qG(self, wfn, qvec_wrapped, comps_qG) -> jax.Array:
-        """V_q(G) on the per-q G-vector list, length nG, with q+G=0 zeroed."""
-        ...
 
     def q0_average(
         self, wfn, meta: Meta, *,

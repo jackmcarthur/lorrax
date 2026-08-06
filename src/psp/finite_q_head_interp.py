@@ -93,9 +93,6 @@ finite-q W-interpolation experiment, leaning on the existing SOS pipeline:
 
 Public surface:
 
-  Coulomb head (analytic, never interpolated)
-    :func:`v_head_3d`, :func:`v_head_2d_slab`
-
   Absolute-channel projection at any q
     :func:`compute_g_mu_at_q`,
     :func:`extract_V_body_from_V_q`              rank-1 subtract from V_qmunu
@@ -163,52 +160,6 @@ import numpy as np
 # swapping `xp` below; ``compute_pair_density_*`` already accept jnp arrays
 # transparently because numpy/jnp agree on the einsum contract.
 import jax.numpy as jnp
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  Coulomb head  v_head(Q)
-# ════════════════════════════════════════════════════════════════════════
-
-def v_head_3d(Qcart: np.ndarray) -> np.ndarray:
-    """Singular Coulomb head in 3D bulk:  v(Q) = 8π/|Q|² (Ry-Bohr units).
-
-    The factor of 8π (not 4π) matches the LORRAX/BGW convention used in
-    ``gw.compute_vcoul``: see the ``8.0 * π`` prefactor in the ``sys_dim=3``
-    branch of :func:`compute_sqrt_vcoul_0d`.
-
-    Q must NOT be the absolute-zone origin — the caller is responsible for
-    routing  Q→0  through :func:`reconstruct_W_at_target_Q` with the q=0
-    dispersion tensors.
-    """
-    Qcart = np.asarray(Qcart, dtype=np.float64)
-    q2 = float(np.dot(Qcart, Qcart))
-    if q2 < 1e-30:
-        raise ValueError("v_head_3d called at Q=0; use the q=0 dispersion path.")
-    return 8.0 * math.pi / q2
-
-
-def v_head_2d_slab(Qcart: np.ndarray, zc: float) -> np.ndarray:
-    """Singular Coulomb head in a slab (2D-truncated) geometry.
-
-    For an in-plane Q with magnitude  q∥ = |Q∥|  and out-of-plane component
-    Q_z, the Ismail-Beigi truncated head is
-
-        v(Q) = (8π / |Q|²) · [1 − e^{−q∥ z_c} · cos(Q_z z_c)]
-
-    with z_c the truncation half-length. The caller supplies the cartesian
-    Q and z_c (Bohr).  The (q∥, Q_z) split assumes the slab normal is the
-    cartesian-z axis (LORRAX/BGW convention).
-
-    For purely in-plane Q (Q_z = 0) and small q∥ this reduces to the 1/q∥
-    "2D Coulomb" leading form — ie head singularity is weaker than 3D.
-    """
-    Qcart = np.asarray(Qcart, dtype=np.float64)
-    q_par = float(np.hypot(Qcart[0], Qcart[1]))
-    q_z = float(Qcart[2])
-    q2 = q_par * q_par + q_z * q_z
-    if q2 < 1e-30:
-        raise ValueError("v_head_2d_slab called at Q=0; use the q=0 dispersion path.")
-    return (8.0 * math.pi / q2) * (1.0 - math.exp(-q_par * zc) * math.cos(q_z * zc))
 
 
 # ════════════════════════════════════════════════════════════════════════

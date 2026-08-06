@@ -9,7 +9,6 @@ The numerical FFT routine ``compute_vcoul_box`` lives in
 """
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -20,14 +19,6 @@ from .base import SysDim
 
 class Box0D:
     sys_dim = SysDim.BOX_0D
-
-    def v_qG(self, wfn, qvec_wrapped, comps_qG) -> jax.Array:
-        bdot = np.asarray(wfn.bdot, dtype=np.float64)
-        fft_grid = np.asarray(wfn.fft_grid, dtype=int)
-        gvecs = np.asarray(comps_qG, dtype=int)
-        v_raw = compute_vcoul_box(bdot, fft_grid, gvecs)
-        return jnp.asarray(v_raw / float(wfn.cell_volume),
-                           dtype=jnp.complex128)
 
     def q0_average(
         self, wfn, meta: Meta, *,

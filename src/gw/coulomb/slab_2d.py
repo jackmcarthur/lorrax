@@ -1,88 +1,21 @@
-"""2D slab (Ismail-Beigi) Coulomb truncation along the c axis.
+"""2D slab (Ismail-Beigi) Coulomb truncation along the c axis — q→0 head.
 
   v_2D(q+G) = (8π/|q+G|²) · (1 − exp(−zc·|q‖+G‖|) cos((qz+Gz)·zc)),  zc = π/b_z
 
 The sampler in ``base.sample_minibz_qpoints`` already sets ``qz=0`` for
-2D; this module just supplies the formula.
+2D; this module supplies the q→0 ``(vc0_mean, wcoul0)`` average only.  The
+per-sphere ``v(q+G)`` builder is :func:`gw.compute_vcoul.compute_v_q_per_G`.
 """
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
-import numpy as np
 
 from common import Meta
-from .base import (SysDim, sample_minibz_qpoints, minibz_average,
-                   minibz_voronoi_batches, minibz_inscribed_sphere_r2)
+from .base import SysDim, sample_minibz_qpoints
 
 
 class Slab2D:
     sys_dim = SysDim.SLAB_2D
-
-    def v_qG(self, wfn, qvec_wrapped, comps_qG) -> jax.Array:
-        bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
-        comps = np.asarray(comps_qG, dtype=np.float64)
-        qvec = np.asarray(qvec_wrapped, dtype=np.float64)
-        G_cart = (comps + qvec) @ bvec
-        denom = np.sum(G_cart * G_cart, axis=1)
-        denom_zero = denom < 1e-12
-
-        zc = float(np.pi / bvec[2, 2])
-        kxy = np.linalg.norm(G_cart[:, :2], axis=1)
-        kz = G_cart[:, 2]
-        f2d = 1.0 - np.exp(-zc * kxy) * np.cos(kz * zc)
-
-        denom_safe = np.where(denom_zero, 1.0, denom)
-        v = (8.0 * np.pi / denom_safe) * f2d
-        v = v / float(wfn.cell_volume)
-        v = np.where(denom_zero, 0.0, v)
-        return jnp.asarray(v, dtype=jnp.complex128)
-
-    def _vq_2d(self, qcart, zc):
-        # qcart already has qz=0 from sample_minibz_qpoints
-        denom = jnp.einsum("ij,ij->i", qcart, qcart)
-        base = 4.0 * jnp.pi / denom
-        kxy = jnp.linalg.norm(qcart[:, :2], axis=1)
-        # The "2 ·" pulls the 4π → 8π in front while the truncation factor
-        # ``(1 − e^{-zc·kxy})`` runs against the physical (qz=0) shell.
-        f2d = 2.0 * (1.0 - jnp.exp(-zc * kxy))
-        return base * f2d
-
-    def v_head_minibz_avg(
-        self, wfn, meta: Meta, shift_frac, *,
-        alpha: float | None = None,
-        kind: str = "slab",
-        nsamples: int = 2**18,
-        method: str = "sobol",
-        qmc_reps: int = 10,
-        n_coarse: int = 250_000,
-    ) -> float:
-        """Mini-BZ CELL AVERAGE of the slab Coulomb head at a FINITE shift.
-
-        ``shift_frac`` — fractional ``Q + G*`` (the smallest-|Q+G|
-        umklapp).  Returns ``<v_slab(Q+G*)>_mBZ`` in **bare** units (no
-        ``1/celvol``).  In-plane pure adaptive MC — the 2D head is a ``|Q|``
-        cusp, not a ``1/q²`` pole, so no inscribed-sphere split (BGW
-        ``minibzaverage_2d``, ``minibzaverage.f90:97-186``).  ``kind`` picks
-        the bare ``slab`` or the Gaussian ``slab_lr`` (b26p SR/LR) channel.
-
-        This is the finite-q cell-average path §16.4 flagged missing for the
-        2D slab (the stored ``V_qmunu`` body uses a POINT value); it shares
-        the single-source :func:`base.minibz_average` with the 3D head and
-        the BSE per-Q ``eval_vq`` head.
-        """
-        bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
-        kgrid = (meta.nkx, meta.nky, meta.nkz)
-        shift_cart = np.asarray(shift_frac, dtype=np.float64) @ bvec
-        dq = minibz_voronoi_batches(
-            bvec, kgrid, nsamples=nsamples, method=method,
-            qmc_reps=qmc_reps, nmax=3, is_2d=True)
-        q0sph2 = minibz_inscribed_sphere_r2(bvec, kgrid, is_2d=True)
-        return minibz_average(
-            shift_cart, dq, kind=kind, celvol=float(wfn.cell_volume),
-            n_kpts=int(meta.nkx * meta.nky * meta.nkz), q0sph2=q0sph2,
-            alpha=alpha, zc=float(np.pi / bvec[2, 2]),
-            analytic_sphere=False, adaptive=True, n_coarse=n_coarse)
 
     def q0_average(
         self, wfn, meta: Meta, *,

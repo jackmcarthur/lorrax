@@ -1,7 +1,6 @@
 """3D bulk Coulomb: v(q+G) = 8π/|q+G|², no truncation.  This is the default."""
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -12,19 +11,6 @@ from .base import (SysDim, sample_minibz_qpoints, minibz_average,
 
 class Bulk3D:
     sys_dim = SysDim.BULK_3D
-
-    def v_qG(self, wfn, qvec_wrapped, comps_qG) -> jax.Array:
-        bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
-        comps = np.asarray(comps_qG, dtype=np.float64)
-        qvec = np.asarray(qvec_wrapped, dtype=np.float64)
-        G_cart = (comps + qvec) @ bvec  # (nG, 3)
-        denom = np.sum(G_cart * G_cart, axis=1)
-        denom_zero = denom < 1e-12
-        denom_safe = np.where(denom_zero, 1.0, denom)
-        v = 8.0 * np.pi / denom_safe
-        v = v / float(wfn.cell_volume)
-        v = np.where(denom_zero, 0.0, v)
-        return jnp.asarray(v, dtype=jnp.complex128)
 
     def _vq_isotropic(self, qcart):
         denom = jnp.einsum("ij,ij->i", qcart, qcart)
