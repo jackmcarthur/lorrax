@@ -48,6 +48,7 @@ reports/slate_linalg_ffi_2026-07-10/report.md for the full matrix):
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import sys
 
@@ -102,8 +103,113 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 
-def _ffi_skip_reason():
-    """Return None if liblorrax_ffi.so loads, else the reason to skip.
+# ---------------------------------------------------------------------------
+# ABSENT IS A SKIP.  BUILT-AND-BROKEN IS A FAILURE.
+# ---------------------------------------------------------------------------
+# Both probes used to answer one question — "does the .so load?" — and turn
+# any negative answer into a skip.  That collapses two situations that mean
+# opposite things:
+#
+#   ABSENT   the library was never built here.  Nothing is wrong; these tests
+#            do not apply on this machine.  A skip is the honest report.
+#   BROKEN   the library WAS built, is sitting right there, and will not
+#            dlopen.  Something IS wrong, and it is exactly the kind of wrong
+#            that a test suite exists to catch.
+#
+# Reporting BROKEN as a skip is how the host leg was lost on 2026-08-06: the
+# .so carried a DT_NEEDED on cray-fftw's `libfftw3.so.mpi31.3`, which the
+# Shifter container does not mount, so dlopen failed and NINETEEN
+# ScaLAPACK/SLATE/GEMM contract tests — none of which perform an FFT — were
+# reported as "19 skipped" alongside "0 failed".  The suite looked green.  A
+# skip reads as "not applicable on this platform"; what it meant was "did not
+# run".  Nothing in the output distinguished them.
+#
+# This is the `src/ffi/gate.py` rule applied to test collection: an explicit
+# request that cannot be honored REFUSES rather than silently downgrading.  A
+# built .so is an explicit request.
+#
+# WHY THE FAILURE IS PER-TEST AND NOT A COLLECTION ERROR.  Raising at import
+# would be louder still, but it would take the whole module down — including
+# the CUDA cells, which on 2026-08-06 were genuinely passing 33/33.  Losing
+# real signal to report a different defect is the same mistake in the other
+# direction.  Each affected cell fails, naming the library and the loader
+# error; everything unaffected still reports.
+#
+# WHO DECIDES ABSENT-VS-BROKEN.  The loader does, when it can.  CLAIMS 81
+# landed `FfiLibraryNotBuilt` / `FfiLibraryUnusable` in ffi.common.ffi_loader
+# for exactly this split, so this file ASKS rather than re-deriving: if those
+# types are importable they are authoritative, because the loader knows which
+# candidate path it tried and why it gave up, which a stat() from out here can
+# only guess at.  The filesystem check below is the fallback for a tree where
+# that work has not merged yet — same distinction, coarser instrument.  When
+# the loader change is everywhere, delete `_lib_is_built` and the fallback
+# branch; nothing else here moves.
+
+_ABSENT = "absent"      # not built here — skip is honest
+_BROKEN = "broken"      # built and will not load — this is a defect
+_OK = "ok"
+
+try:
+    from ffi.common.ffi_loader import (FfiLibraryNotBuilt,
+                                       FfiLibraryUnusable)
+    _LOADER_SPLITS = True
+except Exception:       # pre-CLAIMS-81 loader
+    class FfiLibraryNotBuilt(Exception):
+        pass
+
+    class FfiLibraryUnusable(Exception):
+        pass
+    _LOADER_SPLITS = False
+
+
+def _lib_is_built(env_var, so_name):
+    """True if the library exists on disk, i.e. somebody built it here.
+
+    FALLBACK ONLY — used when the loader does not raise the CLAIMS 81 types.
+    Deliberately a FILESYSTEM question: the pre-81 loader cannot tell us
+    "present but unloadable" without conflating it with "missing", which is
+    the whole bug being fixed.
+    """
+    explicit = os.environ.get(env_var)
+    if explicit:
+        return os.path.exists(explicit)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for sub in ("build_host", "build"):
+        if os.path.exists(os.path.join(root, "src", "ffi", "cpp", sub, so_name)):
+            return True
+    return False
+
+
+def _probe_lib(platform, env_var, so_name):
+    """Return (state, reason) for one FFI library."""
+    try:
+        from ffi.common.ffi_loader import get_lib
+        get_lib(platform)
+    except FfiLibraryNotBuilt as exc:
+        return _ABSENT, f"{so_name} not built on this machine: {exc}"
+    except Exception as exc:
+        broken = (isinstance(exc, FfiLibraryUnusable) if _LOADER_SPLITS
+                  else _lib_is_built(env_var, so_name))
+        if broken:
+            return _BROKEN, (
+                f"{so_name} IS BUILT but will not load: {exc}\n"
+                f"This is a DEFECT, not an unavailable platform — the library "
+                f"is present on disk and the dynamic linker refused it.  It is "
+                f"reported as a failure rather than a skip on purpose: a skip "
+                f"here reads as 'not applicable on this machine', which is "
+                f"false, and it hides the loss behind a green suite.\n"
+                f"Most likely a DT_NEEDED that cannot be resolved in this "
+                f"environment — check `readelf -d <so> | grep NEEDED` against "
+                f"`ldd <so> | grep 'not found'` IN THE ENVIRONMENT THAT FAILED "
+                f"(in-container and bare-host have different closures; "
+                f"/opt/cray/pe is not mounted inside the Shifter image).\n"
+                f"Set {env_var} to select a different build.")
+        return _ABSENT, f"{so_name} not built on this machine: {exc}"
+    return _OK, None
+
+
+def _ffi_state():
+    """(state, reason) for liblorrax_ffi.so (CUDA leg).
 
     Loading the .so pulls every native dependency (cuSOLVERMp, cuBLASMp,
     SLATE, NCCL, HDF5, MPI) via DT_NEEDED, so one probe covers them all.
@@ -112,46 +218,50 @@ def _ffi_skip_reason():
         import jax
         if not any(getattr(d, "platform", "") in ("gpu", "cuda")
                    for d in jax.devices()):
-            return "no CUDA GPU visible"
+            return _ABSENT, "no CUDA GPU visible"
     except Exception as exc:  # jax missing / no backend
-        return f"jax backend unavailable: {exc}"
+        return _ABSENT, f"jax backend unavailable: {exc}"
     if jax.process_count() != 1:
-        return "contract tests are single-process (use the CLI mode)"
-    try:
-        from ffi.common.ffi_loader import get_lib
-        get_lib("CUDA")
-    except Exception as exc:
-        return f"liblorrax_ffi.so unavailable: {exc}"
-    return None
+        return _ABSENT, "contract tests are single-process (use the CLI mode)"
+    return _probe_lib("CUDA", "LORRAX_FFI_SO", "liblorrax_ffi.so")
 
 
-def _host_ffi_skip_reason():
-    """Return None if liblorrax_ffi_host.so loads, else the skip reason.
+def _host_ffi_state():
+    """(state, reason) for liblorrax_ffi_host.so.
 
     The host library is CUDA-free (slate + MPI only), so this probe
-    passes on CPU-only machines where ``_ffi_skip_reason`` skips.
+    passes on CPU-only machines where ``_ffi_state`` reports absent.
     """
     try:
         import jax
         jax.devices("cpu")
     except Exception as exc:
-        return f"jax cpu backend unavailable: {exc}"
+        return _ABSENT, f"jax cpu backend unavailable: {exc}"
     if jax.process_count() != 1:
-        return "contract tests are single-process (use the CLI mode)"
-    try:
-        from ffi.common.ffi_loader import get_lib
-        get_lib("cpu")
-    except Exception as exc:
-        return f"liblorrax_ffi_host.so unavailable: {exc}"
-    return None
+        return _ABSENT, "contract tests are single-process (use the CLI mode)"
+    return _probe_lib("cpu", "LORRAX_FFI_HOST_SO", "liblorrax_ffi_host.so")
 
 
-_SKIP = _ffi_skip_reason()
-needs_ffi = pytest.mark.skipif(_SKIP is not None, reason=_SKIP or "")
+def _gate(state, reason):
+    """Decorator: run / skip / refuse, per the rule above."""
+    def decorate(fn):
+        if state == _OK:
+            return fn
+        if state == _ABSENT:
+            return pytest.mark.skip(reason=reason or "")(fn)
 
-_HOST_SKIP = _host_ffi_skip_reason()
-needs_host_ffi = pytest.mark.skipif(_HOST_SKIP is not None,
-                                    reason=_HOST_SKIP or "")
+        @functools.wraps(fn)
+        def _refuse(*args, **kwargs):
+            pytest.fail(reason, pytrace=False)
+        return _refuse
+    return decorate
+
+
+_STATE, _SKIP = _ffi_state()
+needs_ffi = _gate(_STATE, _SKIP)
+
+_HOST_STATE, _HOST_SKIP = _host_ffi_state()
+needs_host_ffi = _gate(_HOST_STATE, _HOST_SKIP)
 
 
 def _mesh_1x1():
