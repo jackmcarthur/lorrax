@@ -67,6 +67,8 @@ def init_bse_subspace(
     eps_v,
     n_eig: int,
     *,
+    n_cond: Optional[int] = None,
+    n_val: Optional[int] = None,
     n_random: int = 5,
     mesh: Optional[Mesh] = None,
     sharding: Optional[NamedSharding] = None,
@@ -88,9 +90,16 @@ def init_bse_subspace(
 
     Parameters
     ----------
-    eps_c : (nk, nc) jax array (any sharding)
-    eps_v : (nk, nv) jax array (any sharding)
+    eps_c : (nk, nc) jax array (any sharding) — nc is the PADDED extent
+    eps_v : (nk, nv) jax array (any sharding) — nv is the PADDED extent
     n_eig : total subspace size returned
+    n_cond, n_val : LOGICAL band counts (``data['n_cond']`` /
+        ``data['n_val']``).  The returned subspace has exact-zero support
+        outside the logical block, so no trial vector lives in the padded,
+        decoupled subspace the loader's ``PAD_EPS_GUARD_RY`` sentinel
+        parks at ~1e3 Ry.  Default None means "the arrays are unpadded",
+        which is only true when ``n_*_pad == n_*``; every production
+        caller should pass them.
     n_random : how many of those slots are random (default 5)
     mesh, sharding : if given, the result is shard-constrained to
         ``sharding`` (canonically P(None, "x", "y", None) for ``bse_simple``).
@@ -109,27 +118,57 @@ def init_bse_subspace(
     n_random = max(0, min(n_random, n_eig))
     n_pick = n_eig - n_random
 
-    # ── Part 1: lowest (c, v, k) by energy ────────────────────────────
-    delta_E = eps_c_np[:, :, None] - eps_v_np[:, None, :]   # (nk, nc, nv)
+    # Physical extents.  DROP THE PAD BY COUNT, never by value.
+    #
+    # This used to be `finite = isfinite(flat) & (flat > 1e-12)` with the
+    # comment "skip padded / non-physical bands (zero or negative ΔE)".
+    # That is a value filter and it does not do what it says.  With the
+    # loader's OLD zero ε pad the pad transitions were
+    #     (c_pad, v_pad) -> 0        caught by the filter
+    #     (c_pad, v_real) -> |ε_v|   POSITIVE, sails through
+    #     (c_real, v_pad) -> ε_c     POSITIVE, sails through
+    # and since ΔE_physical = ε_c + |ε_v| exceeds both mixed terms, those
+    # two families sort BELOW every real transition — so the "lowest
+    # transitions" seed picked pad states preferentially, exactly the
+    # states the filter was written to exclude.  The loader now writes a
+    # signed sentinel (``bse_io.PAD_EPS_GUARD_RY``) which makes the value
+    # filter incidentally work, but a filter that is only correct because
+    # of a constant defined in another module is not a filter.  The count
+    # is exact and local: pass ``n_cond``/``n_val`` and slice.
+    nc_log = nc if n_cond is None else int(n_cond)
+    nv_log = nv if n_val is None else int(n_val)
+    if not (0 < nc_log <= nc and 0 < nv_log <= nv):
+        raise ValueError(
+            f"init_bse_subspace: logical extents (n_cond={nc_log}, "
+            f"n_val={nv_log}) must be in (0, padded] = (0, {nc}] x (0, {nv}]")
+
+    # ── Part 1: lowest PHYSICAL (c, v, k) by energy ───────────────────
+    delta_E = (eps_c_np[:, :nc_log, None]
+               - eps_v_np[:, None, :nv_log])              # (nk, nc_log, nv_log)
     flat = delta_E.reshape(-1)
-    # Skip padded / non-physical bands (zero or negative ΔE).
+    # Residual value guard: a genuinely non-physical ΔE (NaN, or <= 0 from a
+    # metallic/misordered window) is still skipped.  It is no longer load
+    # bearing for the pad.
     finite = np.isfinite(flat) & (flat > 1e-12)
     order = np.argsort(np.where(finite, flat, np.inf))
     picks = order[:n_pick]
-    k_idx, c_idx, v_idx = np.unravel_index(picks, (nk, nc, nv))
+    k_idx, c_idx, v_idx = np.unravel_index(picks, (nk, nc_log, nv_log))
 
     V_np = np.zeros((n_eig, nc, nv, nk), dtype=np.complex128)
     V_np[np.arange(n_pick), c_idx, v_idx, k_idx] = 1.0
 
-    # ── Part 2: random tail ───────────────────────────────────────────
+    # ── Part 2: random tail, PHYSICAL block only ──────────────────────
+    # Drawn at the logical shape and embedded, so the pad zone stays exact
+    # zero: a random start with support on the pad block hands the solver a
+    # vector inside a decoupled subspace whose eigenvalues are the sentinel.
     if n_random > 0:
         rng = np.random.default_rng(seed)
-        rand = (rng.standard_normal((n_random, nc, nv, nk))
-                + 1j * rng.standard_normal((n_random, nc, nv, nk)))
+        rand = (rng.standard_normal((n_random, nc_log, nv_log, nk))
+                + 1j * rng.standard_normal((n_random, nc_log, nv_log, nk)))
         norms = np.sqrt(
             np.sum(np.abs(rand) ** 2, axis=(1, 2, 3), keepdims=True))
         rand = rand / np.maximum(norms, 1e-30)
-        V_np[n_pick:] = rand
+        V_np[n_pick:, :nc_log, :nv_log, :] = rand
 
     if sharding is not None:
         V = jax.make_array_from_callback(

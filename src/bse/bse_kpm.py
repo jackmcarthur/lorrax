@@ -33,7 +33,8 @@ from solvers.chebyshev import (
 from .bse_ring_comm import build_bse_ring_matvec, build_bse_ring_matvec_full, make_bse_shardings
 from .bse_feast import (estimate_spectral_bounds_sharded, _create_mesh_xy,
                         _build_gmres_data_fp32, ensure_W_R)
-from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
+from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
+                     pad_zone_mask_np)
 import common.timing as timing
 
 jax.config.update("jax_enable_x64", True)
@@ -85,8 +86,16 @@ def make_bse_random_vector(data, use_tda):
     dtype_real = data["eps_c"].dtype
     dtype_cplx = jnp.complex64 if dtype_real == jnp.float32 else jnp.complex128
 
-    mask = jnp.zeros((1, n_cond_pad, n_val_pad, nk), dtype=dtype_real)
-    mask = mask.at[:, :n_cond, :n_val, :].set(1.0)
+    # ONE spelling of "restrict to the physical block" — bse_io owns the
+    # band pad, so it owns the mask.  This was the only masked seed in BSE;
+    # the others are now either masked through the same helper
+    # (bse_feast.estimate_spectral_bounds_sharded), built from ψ and hence
+    # exactly zero on the pad by bilinearity (dipoles, w_omega_chain's seed
+    # block), or restricted by count at construction
+    # (bse_davidson_helpers.init_bse_subspace).
+    mask = jnp.asarray(
+        pad_zone_mask_np(n_cond, n_val, n_cond_pad, n_val_pad, nk),
+        dtype=dtype_real)
 
     shape_1 = (1, n_cond_pad, n_val_pad, nk)
 

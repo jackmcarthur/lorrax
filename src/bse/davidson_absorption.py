@@ -149,7 +149,9 @@ def main(argv=None):
 
     # ── Initial subspace ───────────────────────────────────────────────
     V0 = init_bse_subspace(
-        eps_c, eps_v, n_eig=args.n_eig, n_random=args.n_random_init,
+        eps_c, eps_v, n_eig=args.n_eig,
+        n_cond=int(data["n_cond"]), n_val=int(data["n_val"]),
+        n_random=args.n_random_init,
         mesh=mesh_xy, sharding=sh.X, seed=42,
     )
     if rank0:

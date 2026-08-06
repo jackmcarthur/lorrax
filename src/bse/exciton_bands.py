@@ -97,7 +97,8 @@ jax.config.update("jax_enable_x64", True)
 from solvers.lanczos import block_lanczos_eig_jit
 from common.fft_helpers import make_sharded_ifftn_3d
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
-                     decimate_W_q_to_subgrid, make_w_densifier)
+                     decimate_W_q_to_subgrid, make_w_densifier,
+                     PAD_EPS_GUARD_RY)
 from .bse_ring_comm import make_bse_shardings
 from .bse_serial import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
@@ -105,7 +106,11 @@ from .bse_w_exact import _create_mesh_xy
 from . import vq_interp
 
 RY2EV = 13.6056980659
-PAD_EPS_GUARD_RY = 1.0e3
+# PAD_EPS_GUARD_RY now lives in bse_io — the module that OWNS the band pad —
+# and is imported above.  It was defined here because this driver was the
+# only one that knew the loader's zero ε pad was a wrong number and repaired
+# it locally; the loader is correct now, so the constant belongs at the seam
+# and every BSE driver inherits the guard instead of one of nine.
 
 
 def _gather_host(x):
@@ -626,9 +631,21 @@ def main(argv=None):
             f"QP shifts min/max = {_shift_ev.min():+.4f} / {_shift_ev.max():+.4f} eV; "
             f"BSE runs on QUASIPARTICLE energies")
     if nv_pad > n_val:
-        _band_ax = jnp.arange(nv_pad)
-        data["eps_v"] = jnp.where(_band_ax[None, :] >= n_val,
-                                  -PAD_EPS_GUARD_RY, data["eps_v"])
+        # The loader (and apply_eqp_and_reslice_bands, above) now write the
+        # signed guard themselves, so this is no longer a repair — it is the
+        # CHECK that they did.  Kept because this driver is where the wrong
+        # number was first noticed; a silent regression to a zero ε pad puts
+        # spurious transitions BELOW the exciton onset on every BSE driver,
+        # not just this one, and this is the cheapest place that would see it.
+        _pad_eps_v = jnp.asarray(data["eps_v"])[:, n_val:]
+        _worst = float(jnp.max(_pad_eps_v.real))
+        if _worst > -0.5 * PAD_EPS_GUARD_RY:
+            raise ValueError(
+                f"exciton_bands: loader returned an unguarded valence pad — "
+                f"max eps_v over the {nv_pad - n_val} pad bands is {_worst:.3e} "
+                f"Ry, expected <= {-0.5 * PAD_EPS_GUARD_RY:.3e}. A zero pad "
+                f"here makes DeltaE = eps_c - 0 a spurious transition BELOW "
+                f"every physical one. See bse_io.PAD_EPS_GUARD_RY.")
     tick("load_bse", t0)
 
     # ── htransform setup + Q path ────────────────────────────────────────

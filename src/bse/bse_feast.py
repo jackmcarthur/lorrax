@@ -33,7 +33,7 @@ from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_preconditioner import energy_diff_cv_k
 import common.timing as timing
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
-                     make_w_densifier)
+                     make_w_densifier, pad_zone_mask_np)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -834,11 +834,23 @@ def estimate_spectral_bounds_sharded(
 
     key = jax.random.PRNGKey(seed)
 
+    # The Lanczos start vector must have NO support on the padded block.
+    # e_min above is already taken on the logical slices; e_max comes from
+    # this Krylov space, and the pad block is decoupled with a diagonal at
+    # ``PAD_EPS_GUARD_RY`` (~1e3 Ry) — an unmasked start would return that
+    # as e_max and blow the Chebyshev half-width every KPM/FEAST consumer
+    # of this function scales by.  The mask is BY COUNT, from the logical
+    # extents the loader put in the bundle.
+    _pad_mask = jnp.asarray(
+        pad_zone_mask_np(n_cond, n_val, n_cond_pad, n_val_pad, nk),
+        dtype=jnp.float32)
+
     @jax.jit
     def _make_random_vector(key_in):
         k1, k2 = jax.random.split(key_in)
         q = jax.random.normal(k1, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float32)
         q = q + 1j * jax.random.normal(k2, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float32)
+        q = q * _pad_mask
         q = q / jnp.linalg.norm(q)
         return jax.lax.with_sharding_constraint(q, sh.X)
 
