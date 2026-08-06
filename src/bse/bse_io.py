@@ -690,9 +690,9 @@ def _read_wq_sharded(
 # 2026-08-05).  What changes is only who moves the bytes.
 #
 # The serial readers stay, and stay reachable: SlabIO's parallel tiers need
-# the phdf5 FFI (or the mpi4py overlay), and where neither is available the
-# config router refuses above one process and hands back H5PY_ALLGATHER at
-# one process.  Routing a single-process BSE through the allgather backend
+# the phdf5 FFI; where it is unavailable SlabIO refuses outright (there is
+# no router and no allgather tier left to hand back).  Routing a
+# single-process BSE through a gather-to-rank-0 transport
 # would buy nothing (at P=1 "gather to rank 0" and "this rank's tile" are the
 # same bytes) and would put a second transport under the tests, so the
 # SlabIO path is taken for the PHDF5 tiers only.

@@ -1,12 +1,14 @@
 """FFI SlabIO backend — collective MPI-IO via ``ffi.phdf5``.
 
-FIRST tier of the ``slab_io = auto`` capability router on BOTH JAX
-backends (``gw_config._route_cpu_slab_io`` / ``_route_gpu_slab_io``:
-PHDF5_FFI → PHDF5_HOST → H5PY_ALLGATHER), also selectable explicitly
-via ``slab_io = phdf5_ffi``.  The legacy ``use_ffi_io`` boolean no
-longer routes here: ``true`` is a deprecated no-op, ``false`` forces
-the allgather backend.  Imported lazily by :mod:`file_io.slab_io` so
-the fallback tiers work without ``liblorrax_ffi*.so`` being built.
+THE transport.  Not a tier: the capability router, the sibling tiers
+(``PHDF5_HOST``, ``H5PY_ALLGATHER``), the ``slab_io`` and ``use_ffi_io``
+deck keys and the ``SlabIOBackend`` enum were all deleted in the
+one-backend port.  :mod:`file_io.slab_io` has one path and it is this
+one; if ``liblorrax_ffi*.so`` is missing or lacks the write symbol,
+SlabIO REFUSES naming the library rather than moving the bytes some
+other way.  Nothing falls back, because the thing it used to fall back
+to gathered a global array onto one rank -- an OOM at the design
+envelope, not a slow path.
 
 PLATFORM-AGNOSTIC.  Nothing in this module is CUDA-specific: the
 ``jax.ffi.ffi_call`` sites name only the target string, and
