@@ -289,9 +289,22 @@ class SlabIO:
 
         ``shape`` is returned EXACTLY.  It may exceed the dataset (a
         μ-padded consumer buffer): the overhang comes back zero-filled.
-        It need not be mesh-divisible under ``partition_spec`` either —
-        SlabIO reads the rounded-up extent and trims.  Defaults to the
-        dataset's own shape.
+        Defaults to the dataset's own shape.
+
+        ``shape`` MUST be mesh-divisible under ``partition_spec``.  This
+        docstring used to promise the opposite — "it need not be
+        mesh-divisible either, SlabIO reads the rounded-up extent and
+        trims" — and that was never true of any backend (measured, job
+        56389339, 4 nodes / 16 ranks: ``read_slab(shape=(17,16),
+        partition_spec=P('x','y'))`` on a 4x4 mesh REFUSES on PHDF5_FFI
+        with ``_validate_block_divisible``'s ValueError, and on
+        H5PY_ALLGATHER with JAX's own ``IndivisibleError``).  It cannot
+        be true: the return value is a ``jax.Array`` of exactly
+        ``shape`` sharded by ``partition_spec``, and JAX will not build
+        that array at a non-divisible extent, so there is nothing to
+        trim TO.  Ask for the rounded-up shape — that IS the padded
+        consumer buffer, and the overhang comes back zero-filled, which
+        is the padding contract stated above.
 
         ``valid_shape`` is the ragged-chunk override; see
         :meth:`write_slab`.  Routine reads do not pass it.

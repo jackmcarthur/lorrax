@@ -126,6 +126,160 @@ def _replace_inode_for_write(path: str) -> None:
     _barrier("slab_io_replace_inode")
 
 
+# ---------------------------------------------------------------------------
+# The MPI world this context ACTUALLY has, vs the one it was opened for
+# ---------------------------------------------------------------------------
+#
+# MEASURED, job 56389339, 4 nodes / 16 ranks, ``srun --mpi=pmi2`` (the wrong
+# PMI flavour for this stack; the right one is ``cray_shasta``):
+#
+#     MPI_Comm_size(MPI_COMM_WORLD) == 1 on every rank
+#     jax.process_count()           == 16
+#     ... 8 hostile geometries written and read back BIT-EXACT, rc=0,
+#         file 16-striped and fully populated, no warning anywhere.
+#
+# Nothing in the stack noticed.  ``ffi.io.open_file`` checks ``p*q ==
+# jax.process_count()``, and ``shard_index.h::validate_shard_encoding`` checks
+# ``prod(mesh_shape) == ctx->world_size`` — but ``ctx->world_size`` is
+# ``jax.process_count()``, passed down from Python.  Both checks compare JAX
+# to JAX and agree.  The MPI communicator that H5Dwrite actually collects on
+# is never consulted, so a PMI-mismatched launch gives every rank a private
+# singleton MPI_COMM_WORLD and 16 unsynchronised writers on one file.
+#
+# It "works" only because the hyperslabs happen to be disjoint and each rank
+# is writing its own byte ranges: there is no collective handshake left to
+# fail.  Change the geometry so two ranks touch one HDF5 chunk, or let one
+# rank's metadata update race another's, and it is silent corruption with
+# rc=0 — which is precisely the class of defect the collective path exists
+# to make impossible.
+#
+# With collective writes ON (the current default) the same launch does NOT
+# survive, but it does not diagnose either: it dies inside Cray ROMIO as
+#     Out of memory in .../ad_cray/ad_cray_write_coll.c, line 669
+# followed by MPI_Abort and "HDF5: infinite loop closing library".  That is
+# the SAME line ``stage/phdf5_stage_cray.sh`` documents as a known Cray-MPICH
+# >=1 GB/rank OOM whose remedy is ``LORRAX_PHDF5_COLLECTIVE_WRITES=0`` /
+# ``LORRAX_PHDF5_INDEPENDENT=1``.  An operator who follows that documented
+# remedy converts the loud crash into the silent-wrong-answer regime above.
+# So the misdiagnosis is not hypothetical; the tree points at it.
+#
+# Hence: ask MPI, once, at the first collective open.  The verdict is
+# rank-invariant by construction (every rank compares its own
+# MPI_Comm_size against a replicated jax.process_count()), so it refuses
+# everywhere or nowhere — the only kind of refusal a collective tolerates.
+_MPI_WORLD_VERDICT: tuple[str, str] | None = None
+
+
+def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *, require):
+    """Pure decision function for the MPI-world guard — ``(verdict, msg)``.
+
+    Split out from the ctypes probe so it can be tested without an MPI.
+    ``verdict`` is one of ``"ok"``, ``"unprobed"``, ``"refuse"``.
+    """
+    if mpi_size is None:
+        msg = (f"SlabIO PHDF5_FFI: could not verify the MPI world size "
+               f"({probe_detail}).  jax.process_count()={proc_count}; if the "
+               f"launcher's PMI flavour does not match this MPI stack every "
+               f"rank gets a private singleton MPI_COMM_WORLD and the "
+               f"collective write silently degrades to {proc_count} "
+               f"unsynchronised writers on one file.  Set "
+               f"LORRAX_PHDF5_REQUIRE_MPI_WORLD=1 to make this a refusal.")
+        return ("refuse" if require else "unprobed"), msg
+    if int(mpi_size) == int(proc_count):
+        return "ok", (f"MPI_Comm_size={mpi_size} == "
+                      f"jax.process_count()={proc_count} ({probe_detail})")
+    return "refuse", (
+        f"SlabIO PHDF5_FFI: MPI_Comm_size(MPI_COMM_WORLD)={mpi_size} but "
+        f"jax.process_count()={proc_count} ({probe_detail}).  This context "
+        f"would derive {proc_count} distinct per-rank hyperslabs and hand "
+        f"them to a communicator of {mpi_size} process(es), so the "
+        f"'collective' write has no collective in it: every rank writes "
+        f"alone, nothing synchronises the HDF5 metadata, and the result is "
+        f"wrong-with-rc=0 whenever two ranks touch one chunk.  The usual "
+        f"cause is the launcher's PMI flavour: on Perlmutter/Cray MPICH use "
+        f"`srun --mpi=cray_shasta`, NOT --mpi=pmi2.  Refused identically on "
+        f"every rank.  LORRAX_PHDF5_REQUIRE_MPI_WORLD=0 downgrades this to "
+        f"a warning.")
+
+
+def _probe_mpi_world_size():
+    """``(size, detail)`` from the live MPI, or ``(None, why-not)``.
+
+    Reads the ALREADY-INITIALISED MPI that ``open_file`` just brought up
+    (``context.cc::ensure_mpi_initialized``); it never initialises MPI
+    itself, so it cannot perturb the bring-up it is auditing.
+    """
+    import ctypes
+    cands = [(None, "global symbol table")]
+    cands += [(s, s) for s in ("libmpi.so.12", "libmpi.so.40", "libmpi.so")]
+    last = "no libmpi found"
+    for so, label in cands:
+        try:
+            lib = ctypes.CDLL(so)
+        except OSError as e:
+            last = f"{label}: {e}"
+            continue
+        if not hasattr(lib, "MPI_Comm_size"):
+            last = f"{label}: no MPI_Comm_size symbol"
+            continue
+        try:
+            flag = ctypes.c_int(0)
+            if lib.MPI_Initialized(ctypes.byref(flag)) != 0:
+                last = f"{label}: MPI_Initialized failed"
+                continue
+            if not flag.value:
+                return None, f"{label}: MPI not initialized at this point"
+            size = ctypes.c_int(-1)
+            # MPICH ABI: MPI_COMM_WORLD is the integer handle 0x44000000.
+            comm = ctypes.c_int(0x44000000)
+            if lib.MPI_Comm_size(comm, ctypes.byref(size)) == 0 \
+                    and size.value > 0:
+                return size.value, f"{label}, MPICH ABI"
+            # Open MPI ABI: MPI_COMM_WORLD is &ompi_mpi_comm_world.
+            try:
+                addr = ctypes.addressof(
+                    ctypes.c_void_p.in_dll(lib, "ompi_mpi_comm_world"))
+                size2 = ctypes.c_int(-1)
+                if lib.MPI_Comm_size(ctypes.c_void_p(addr),
+                                     ctypes.byref(size2)) == 0 \
+                        and size2.value > 0:
+                    return size2.value, f"{label}, Open MPI ABI"
+            except (ValueError, AttributeError):
+                pass
+            last = f"{label}: MPI_Comm_size returned no usable size"
+        except (AttributeError, OSError) as e:
+            last = f"{label}: {type(e).__name__}: {e}"
+    return None, last
+
+
+def _assert_mpi_world(mesh) -> None:
+    """Refuse a PHDF5_FFI context whose MPI world is not the JAX world.
+
+    Runs ONCE per process, at the first collective open — the answer cannot
+    change afterwards, and the probe costs one ctypes call.
+    """
+    global _MPI_WORLD_VERDICT
+    if os.environ.get("LORRAX_PHDF5_SKIP_MPI_WORLD_CHECK", "").strip() in (
+            "1", "true", "yes", "on"):
+        return
+    require = os.environ.get(
+        "LORRAX_PHDF5_REQUIRE_MPI_WORLD", "").strip().lower() not in (
+            "0", "false", "no", "off")
+    if _MPI_WORLD_VERDICT is None:
+        size, detail = _probe_mpi_world_size()
+        _MPI_WORLD_VERDICT = _mpi_world_verdict(
+            size, jax.process_count(), detail, require=require)
+    verdict, msg = _MPI_WORLD_VERDICT
+    if verdict == "refuse":
+        import sys
+        sys.__stderr__.write(
+            f"[SlabIO ERROR rank={jax.process_index()}] {msg}\n")
+        sys.__stderr__.flush()
+        raise RuntimeError(msg)
+    if verdict == "unprobed" and _rank0():
+        print(f"  [SlabIO] WARNING: {msg}", flush=True)
+
+
 def _shard_read_plan(
     index: Sequence[slice],
     out_shape: Sequence[int],
@@ -639,6 +793,11 @@ class _FfiBackend(_DatasetGeometry):
             _replace_inode_for_write(path)
             _barrier("slab_io_ffi_prestripe")
         self.fh: int = self._open_file(path, mesh=mesh, mode=mode)
+        # ``open_file`` has now brought MPI up (context.cc::
+        # ensure_mpi_initialized).  Ask it how big the world REALLY is
+        # before a single hyperslab is derived from jax.process_count().
+        # See _assert_mpi_world for the measurement this exists for.
+        _assert_mpi_world(mesh)
         self._ds_ids: dict[str, int] = {}
         # Replicated record of every dataset's LOGICAL geometry — the
         # thing ``valid_shape`` is derived from.  See _DatasetGeometry.
