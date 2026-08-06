@@ -4,6 +4,37 @@ Dated, binding rulings from the code owner. Each entry states the decision,
 its consequence for code, and what it licenses deleting. Newest first.
 These override older prose anywhere in the tree.
 
+## 2026-08-05 — An allgather is a refusal, not a fallback
+
+Any I/O route whose cost is "gather the whole global array onto one rank"
+is **not a slow tier the system may fall back to**. The design envelope is
+arrays that need hundreds of GPUs to hold, so a rank-0 gather does not buy
+a slow run — it buys an out-of-memory some minutes later, behind a banner
+nobody read. A slow correct path is a fallback; a path that cannot complete
+at the design size is a refusal that has not been written yet.
+
+Implemented 2026-08-06 in commit `0d8e50c`, as one rule covering every
+route into the tier:
+
+> `H5PY_ALLGATHER` is reachable at exactly one process, and nowhere else.
+
+At P=1 the gather and the per-rank write are the *same operation*, so there
+is nothing to refuse about; above P=1 both routes raise at parse time.
+
+Consequences already landed: the silent demotion from the parallel FFI
+writer is deleted, as is the decline branch that read
+`max(SLURM_JOB_NUM_NODES, SLURM_NNODES)`.
+
+This refines the 2026-08-01 entry below, which licensed auto-demotion
+"where the alternative is a different *service tier* (e.g. the h5py write
+route on launches where MPI cannot bootstrap)". That licence no longer
+extends to the allgather tier above one process: if MPI cannot bootstrap at
+P>1, the correct behaviour is to refuse and say so, not to write the file a
+way that cannot work at scale.
+
+Licenses deleting: demotion branches into rank-0-gather I/O, and the
+announcement machinery that existed only to narrate them.
+
 ## 2026-08-04 — Padding is SlabIO's business, not the caller's
 
 A caller states LOGICAL shapes only. Physical padding, mesh divisibility and
@@ -134,22 +165,40 @@ FFI handlers (plain-loop CBLAS, FFTW-vs-MKL resolution) — those are how
 the required layer stays buildable everywhere; and BSE's XLA FFTs, which
 have no FFI route yet.
 
-## 2026-08-01 — Square process meshes only; nonsquare P truncates
+## 2026-08-01 — Square process meshes only; nonsquare P REFUSES
 
-Only square 2-D device meshes are supported. When a run is launched with
-a nonsquare process count P, the mesh resolver uses s = floor(sqrt(P)),
-builds the s x s mesh, and announces that P - s^2 processes are idle;
-it does not build a rectangular mesh and does not refuse. Launch scripts
-should request square counts; the truncation is the safety net, not the
-recommendation.
+Only square 2-D device meshes are supported. A device count that is not a
+perfect square **refuses**, naming the two nearest square counts to
+request. Launch scripts should request square counts.
 
 Rationale: rectangular meshes complicate ScaLAPACK grid geometry and the
 divisibility contracts for no measured benefit at our scales (ruled
-2026-07-27; this entry adds the truncation default, 2026-08-01).
+2026-07-27).
+
+AMENDED 2026-08-06. This entry previously said the resolver truncates to
+`s = floor(sqrt(P))`, idles the surplus, "and does not refuse". **The
+implementation refuses, and has since before the entry was written** —
+`common/collectives.py:289-300`. The truncation safety net is deliberately
+NOT implemented, because idle ranks cannot be made deadlock-free without
+deep surgery:
+
+* under the production transport `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`,
+  communicator creation is `MPI_Comm_split`, collective over
+  `MPI_COMM_WORLD` — a rank outside the mesh that never executes the
+  warm-up jits leaves every in-mesh rank blocked in the split;
+* `psum_replicate` and the k-sweep gathers assume mesh size == process
+  count;
+* `multihost_utils` barriers span the WORLD, so idle ranks would have to
+  replay the entire driver control flow in lockstep while skipping every
+  mesh-touching jit.
+
+A refusal that names the square count is the deadlock-free form of the same
+rule. The record is reconciled in favour of the implementation; the
+"truncate" wording is withdrawn rather than kept alongside.
 
 Licenses deleting: rectangular-mesh accommodation in the mesh resolver
 and any divisibility contortions that exist only to serve non-square
-grids.
+grids. Does NOT license adding idle-rank truncation.
 
 ## Standing (recorded earlier, restated for one-page reference)
 
