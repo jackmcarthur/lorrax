@@ -590,13 +590,39 @@ def rotate_bands(psi_G, U_qp, *, mesh: Mesh):
 # ``np.asarray(U_qp)`` a few lines later for the k-star broadcast, so both
 # were being synchronised immediately regardless; E and Z come out of one
 # FFI call, so blocking on the pair is the same wait as blocking on either.
+# Pad-diagonal sentinel for the band-axis pad below.  Ry; physical QP
+# eigenvalues are O(1) Ry, so this is ~10 orders clear and the pad
+# eigenvalues cannot interleave with the physical spectrum at any deck.
+# Same spelling as the tree's other sentinel, psp/dft_operators.py:736.
+_EIGH_PAD_SENTINEL_RY = 1e10
+
+
 @timing.timed("sc.eigh", watch=True)
 def distributed_eigh_bands(H, *, mesh: Mesh):
     """(E, U_qp) for every k, with NO ``(nb, nb)`` ever on one rank.
 
     ``H`` is ``(n_k, nb, nb)`` Hermitian at :func:`band_rotation_spec`;
     returns ``E`` ``(n_k, nb)`` replicated ascending and ``U_qp`` at the
-    same 2-D layout, eigenvectors as COLUMNS.
+    same 2-D layout, eigenvectors as COLUMNS — at the **logical** ``nb``,
+    whatever the mesh's band divisor.  A band axis that the divisor does
+    not divide is padded to it with a large diagonal SENTINEL and sliced
+    back BY COUNT after the solve; see the block comment at the pad.
+    Callers therefore never see a padded shape, and ``nb`` need not
+    divide anything.
+
+    PARITY, and its limit.  Padding is **reduction-order gauge, not
+    bit-exactness**.  The pad modes are exactly inert — the block is
+    block-diagonal with zero coupling, so physical eigenpairs are
+    unchanged in exact arithmetic — but a wider array changes how XLA
+    *groups* the nonzeros inside full-array reductions, so ``E`` at
+    ``nb_pad > nb`` can differ from ``E`` at ``nb_pad == nb`` in the last
+    few ulp.  Drift scales with reduction length and with the trajectory,
+    not with a fixed ULP count: measured 0.2 eps at ``nk*nb^2 = 243`` and
+    39.9 eps at 29768, a contracting run staying <= 8.3 eps while a
+    stalled one reached 2.9e5.  What bounds it is the RESIDUAL, not eps:
+    ``|dH| <= 6.1e-8`` of the per-element residual norm.  Do not gate this
+    on a ULP count — that passes on a fixture and fails at production
+    shapes.
 
     Backend-agnostic.  ``resolve_backend('eigh', 'distributed', mesh)``
     picks the platform's distributed eigh — ScaLAPACK ``pXheevd`` on a
@@ -633,15 +659,62 @@ def distributed_eigh_bands(H, *, mesh: Mesh):
     from ffi.linalg import dispatch_batched_eigh
 
     H_j = jnp.asarray(H)
+    nb = int(H_j.shape[1])
     p_prod = spec_divisor(mesh, _band_spec(), 1)
     H_j, _ = pad_axis_to(H_j, p_prod, axis=1)
     H_j, _ = pad_axis_to(H_j, p_prod, axis=2)
+    nb_pad = int(H_j.shape[1])
     H_j = jax.lax.with_sharding_constraint(
         H_j, NamedSharding(mesh, band_rotation_spec()))
     # pXheevd reads ONE triangle, so a non-Hermitian input is silently
     # interpreted rather than refused.  Hermitise here.
     H_j = 0.5 * (H_j + jnp.conj(jnp.swapaxes(H_j, -1, -2)))
-    return dispatch_batched_eigh(H_j, mesh, "distributed")
+    if nb_pad != nb:
+        # SENTINEL pad, then drop BY COUNT.  ``pad_axis_to`` zero-fills, so
+        # the pad block is [H 0; 0 0] and the pad eigenvalues are exactly
+        # 0.0 — which sort into the MIDDLE of a Ry spectrum whose occupied
+        # states are negative.  Two things then go wrong, and only the
+        # first is obvious: band order moves (so `E[:, :n_occ]` straddles
+        # the wrong bands, and `_midgap_efermi`/`fermi_level_step`/
+        # `step_occupations` all read a wrong number), and — the quieter
+        # one — if H itself has an eigenvalue near 0 the degenerate
+        # subspace MIXES physical and pad eigenvectors, so no post-hoc
+        # rule can separate them.  An identity pad (λ = 1 Ry = 13.6 eV)
+        # fixes neither: it still lands inside a realistic QP window.
+        #
+        # With a large sentinel on the pad diagonal the block stays exactly
+        # block-diagonal with zero coupling, so the padded subspace
+        # decouples EXACTLY: physical eigenvectors keep zero weight on pad
+        # rows, physical eigenvalues are unchanged, and the sentinel
+        # eigenvalues provably occupy the LAST nb_pad-nb slots of an
+        # ascending spectrum.  That is what makes "drop by count" correct
+        # rather than probably-correct — the slice below is exact, not a
+        # threshold.  Same argument the transverse rank-truncate makes for
+        # its zero pad (isdf/core.py:2699-2714): a decoupled pad block
+        # deflates exactly; only the safe VALUE differs, because there the
+        # pad modes are dropped by |lambda| and here by position.
+        #
+        # Sentinel value: 1e10, the tree's existing spelling
+        # (psp/dft_operators.py:736,759). Physical eigenvalues here are
+        # O(1) Ry, so it is ~10 orders clear. NOTE it is safe *because it
+        # is dropped*: common/wfn_transforms.py:1606-1618 deliberately
+        # chose a FINITE max(E)+1 Ry sentinel for band energies that are
+        # KEPT, since those flow into PPM resolvents 1/(w - e + i.eta).
+        # These do not survive this function, and a value that is absurd
+        # on sight makes a future leak loud instead of silent.
+        i = jnp.arange(nb_pad)[:, None]
+        j = jnp.arange(nb_pad)[None, :]
+        on_pad_diag = ((i == j) & (i >= nb))[None]
+        H_j = jnp.where(on_pad_diag, _EIGH_PAD_SENTINEL_RY, H_j)
+    E, U = dispatch_batched_eigh(H_j, mesh, "distributed")
+    if nb_pad != nb:
+        # THE SEAM. Drop by COUNT, never by value — same shape contract the
+        # rCROP carry restores at sc_iteration.py:1509-1514. Callers get the
+        # LOGICAL extent, so no band-indexed operand beside the carry has to
+        # know a pad ever existed.
+        E = E[:, :nb]
+        U = U[:, :nb, :nb]
+    return E, U
 
 
 def hartree_from_orbitals(psi_G, occ, kweights, wfn, *, mesh: Mesh,

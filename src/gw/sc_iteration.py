@@ -353,20 +353,10 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     was unreachable on the default path.  ``config.sc.eigh`` selects it
     now; the E_F rule stays where it was, with ``density_self_consistent``.
 
-    ``"auto"`` picks ``distributed`` only when all three hold:
+    ``"auto"`` picks ``distributed`` only when both hold:
 
     * the mesh has more than one device — on one device "distributed" is
       the same tile with an FFI call around it;
-    * ``nb`` divides ``spec_divisor(mesh, band_sphere_spec(), 1)``, which
-      is ``px·py`` on the default ψ layout.  ``distributed_eigh_bands``
-      pads both band axes up to THAT divisor and does NOT undo the pad,
-      so a ``nb`` it does not divide returns ``(nk, nb_pad)`` /
-      ``(nk, nb_pad, nb_pad)`` — a silent shape change, not a refusal.
-      The divisor is taken from the same expression the callee uses, not
-      from ``px`` and ``py`` separately: ``nb = 10`` on a 2×2 mesh
-      divides both axes and still gets padded to 12.  ``auto`` must not
-      walk into that; an explicit ``sc_eigh = distributed`` refuses
-      instead of returning padded arrays;
     * one tile exceeds :data:`_SC_EIGH_TILE_BUDGET_FRACTION` of the
       per-device budget.
 
@@ -376,41 +366,57 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     divisibility), so ``auto`` degrades to native with the reason printed
     rather than failing inside the eigh.  An explicit request is not
     probed — it must raise.
+
+    DIVISIBILITY IS NO LONGER A CONDITION (2026-08-06).  It used to be a
+    third clause here, and an explicit ``sc_eigh = distributed`` used to
+    raise on an indivisible ``nb``, because ``distributed_eigh_bands``
+    padded both band axes to the divisor and did **not** undo the pad —
+    returning ``(nk, nb_pad)`` / ``(nk, nb_pad, nb_pad)``, a silent shape
+    change the carry and every band-indexed operand beside it would not
+    match.  That callee now pads with a large diagonal sentinel and slices
+    back BY COUNT, so it returns the LOGICAL extent at any ``nb``.  The
+    refusal had nothing left to protect.  Note what actually changed: the
+    old objection was a SHAPE objection, not a spectral one — a sentinel
+    alone would not have answered it, and zero-padding without the slice
+    would still be wrong (pad eigenvalues at exactly 0.0 sort into the
+    middle of a Ry spectrum and move band order, ``_midgap_efermi`` and
+    the occupations).  It took both halves.
+
+    The backend probe is asked about ``round_up(nb, pad_div)`` — the
+    extent the eigh actually runs at — not about ``nb``.  Probing ``nb``
+    would trip ``resolve.py``'s own divisibility guard and degrade every
+    indivisible window to native, i.e. reinstate the lifted refusal by
+    accident.
     """
     requested = str(getattr(getattr(config, "sc", None), "eigh", "auto"))
     if requested == "native":
         return "native"
 
     from common.mtxel_sweep import band_sphere_spec
-    from runtime.padding import spec_divisor
+    from runtime.padding import spec_divisor, round_up
 
     ndev = int(mesh_xy.size)
     px, py = (int(mesh_xy.shape[a]) for a in mesh_xy.axis_names)
     pad_div = spec_divisor(mesh_xy, band_sphere_spec(), 1)
-    divides = nb % pad_div == 0
+    # ``distributed_eigh_bands`` pads to this and slices BACK by count, so
+    # an indivisible nb is no longer a reason to refuse or to degrade — it
+    # is just a pad.  The backend probe below must therefore be asked about
+    # the extent the eigh actually runs at, not about nb.
+    nb_solve = round_up(nb, pad_div)
 
     if requested == "distributed":
-        if not divides:
-            raise ValueError(
-                f"sc_eigh = distributed needs the SC band window nb={nb} to "
-                f"be a multiple of {pad_div} (the band divisor of the "
-                f"{px}x{py} mesh); it is not.  distributed_eigh_bands would "
-                f"pad both band axes to {pad_div} and return the PADDED "
-                f"shapes, which the carry and every band-indexed operand "
-                f"beside it would not match.  Use sc_eigh = native or a mesh "
-                f"whose band divisor divides nb.")
         return "distributed"
 
     tile_b = float(nb) * float(nb) * 16.0
     budget_b = float(getattr(getattr(config, "memory", None),
                              "per_device_gb", 0.0)) * 1e9
     big = budget_b > 0.0 and tile_b > _SC_EIGH_TILE_BUDGET_FRACTION * budget_b
-    if ndev <= 1 or not divides or not big:
+    if ndev <= 1 or not big:
         return "native"
 
     from ffi.linalg import resolve_backend
     try:
-        resolve_backend("eigh", "distributed", mesh_xy, n=nb)
+        resolve_backend("eigh", "distributed", mesh_xy, n=nb_solve)
     except Exception as exc:                                  # noqa: BLE001
         print_fn(
             f"  SC eigh: auto wanted the distributed eigh (one (nb, nb) tile "
