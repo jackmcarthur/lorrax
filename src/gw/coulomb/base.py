@@ -164,8 +164,22 @@ def minibz_voronoi_batches(
     # Reuse the production wrap helper.  Reimplementing it locally ate a
     # ``shifts @ bvec.T`` vs ``shifts @ bvec`` bug in an earlier draft.
     from ..vcoul import wrap_points_to_voronoi
+    from .sampler import assert_fill_matches_wrap, probe_fill_basis
     bvec = jnp.asarray(bvec, dtype=jnp.float64)
     nkx, nky, nkz = (int(s) for s in kgrid)
+
+    # The ONE fill spelling for both arms below.  Kept as
+    # ``(bvec.T @ U.T).T`` verbatim — it is bit-identical to ``U @ bvec``
+    # in exact arithmetic but not necessarily in the last bits, and this
+    # path feeds numbers pinned before 2026-08-05 (tests/test_minibz_
+    # average.py, the BSE head scorecard).  What IS new is that the fold
+    # below is checked against the basis this expression actually uses,
+    # recovered by probing it rather than by reading the comment:
+    # ``gw.coulomb.sampler.assert_fill_matches_wrap``.
+    def _fill(Uarr):
+        return (bvec.T @ jnp.asarray(Uarr, dtype=jnp.float64).T).T
+
+    assert_fill_matches_wrap(probe_fill_basis(_fill), bvec)
     randlims = bvec.T @ (
         jnp.diag(1.0 / jnp.asarray((nkx, nky, nkz), dtype=jnp.float64))
         @ jnp.linalg.inv(bvec.T)
@@ -184,7 +198,7 @@ def minibz_voronoi_batches(
             sob = _qmc.Sobol(d=3, scramble=True, seed=rep + int(seed_offset))
             U = sob.random_base2(m)
             Uj = jnp.asarray(np.asarray(U, dtype=np.float64))
-            randcart = (bvec.T @ Uj.T).T
+            randcart = _fill(Uj)
             wrapped = wrap_points_to_voronoi(randcart, bvec, nmax=nmax)
             rq = (randlims @ wrapped.T).T
             if is_2d:
@@ -198,7 +212,7 @@ def minibz_voronoi_batches(
     # Uniform fallback (also the path on systems without scipy.stats.qmc)
     key = jax.random.PRNGKey(int(seed_offset))
     randvals = jax.random.uniform(key, (nsamples, 3), dtype=jnp.float64)
-    randcart = (bvec.T @ randvals.T).T
+    randcart = _fill(randvals)
     wrapped = wrap_points_to_voronoi(randcart, bvec, nmax=nmax)
     rq = (randlims @ wrapped.T).T
     if is_2d:

@@ -1013,6 +1013,8 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     """
     from gw.coulomb.base import (_minibz_kernel_bare,
                                  minibz_inscribed_sphere_r2)
+    from gw.coulomb.sampler import (assert_fill_matches_wrap,
+                                    probe_fill_basis)
     from gw.vcoul import wrap_points_to_voronoi
     if alpha is None:
         alpha = float(prep["alpha"])
@@ -1028,6 +1030,16 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     shift_cart = K[:, gstar]                               # cartesian Q+G*
     len_shift2 = float(shift_cart @ shift_cart)
     q0sph2 = minibz_inscribed_sphere_r2(bvec, kgrid, is_2d=True)
+
+    # The ONE fill spelling used below, and the basis it ACTUALLY uses,
+    # recovered by probing it — then checked against the basis the Voronoi
+    # fold takes its candidate shifts from.  Convention check, ~3 flops per
+    # call; `randvals @ bvec.T` (the 2026-04-05 defect) refuses here.
+    # Spelling kept verbatim: this head feeds pinned BSE scorecard numbers.
+    def _fill(Uarr):
+        return (bvec.T @ np.asarray(Uarr, dtype=np.float64).T).T
+
+    assert_fill_matches_wrap(probe_fill_basis(_fill), bvec)
 
     # BGW adaptive per-batch sample count (minibzaverage.f90:63-75); the 2D
     # slab head always takes this (non-analytic-sphere) branch.
@@ -1060,7 +1072,7 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
         U = np.asarray(_draw(gidx), dtype=np.float64)       # (local, 3) ∈ [0,1)
         # δq mapping — VERBATIM minibz_voronoi_batches geometry (single source
         # for the wrap + mini-BZ affine map), nmax=3 = BGW ncell.
-        randcart = (bvec.T @ U.T).T
+        randcart = _fill(U)
         wrapped = np.asarray(wrap_points_to_voronoi(
             jnp.asarray(randcart), jnp.asarray(bvec), nmax=3),
             dtype=np.float64)
