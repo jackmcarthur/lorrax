@@ -2,7 +2,65 @@
 
 Dated, binding rulings from the code owner. Each entry states the decision,
 its consequence for code, and what it licenses deleting. Newest first.
-These override older prose anywhere in the tree.
+**These override older prose anywhere in the tree**, including every page the
+[register](../index.md#register) names as an owner.
+
+An entry records a *decision*. Whether the decision has been implemented is a
+separate question and is stated per entry — an approved ruling that has not
+landed is marked so, with the branch that carries it, because documenting an
+unlanded change as live is how a tuning table becomes a lie.
+
+## 2026-08-06 — `minimax` is the only screening method; `ctsp` is refused
+
+`screening_method` accepts exactly one value, `minimax`, which is also its
+default. Any other value raises at parse time.
+
+The specific thing this closes: `screening_method = ctsp` **parsed,
+normalised, and ran minimax**. The field was pure decoration — the spelling
+never selected a different method, so every deck carrying it has been running
+minimax all along and replacing the key (or deleting it) changes no result.
+That is worse than an unsupported option, because the deck, the run log and
+the provenance record all agreed on a method the code never had.
+
+Implemented `c6b6aa0`; the refusal text says all of the above, so a deck
+author reading the error does not have to come here. The one fixture whose
+name asserted `ctsp` is renamed.
+
+Licenses deleting: the `ctsp` spelling, its normalisation, and any prose
+describing LORRAX as having two screening methods.
+
+## 2026-08-05 — The Lustre stripe count is the aggregator count, so it is `nranks`
+
+*(APPROVED. **Not implemented in this branch** — see the status note.)*
+
+`LORRAX_PHDF5_STRIPE_COUNT` is not a filesystem-layout preference that
+happens to affect speed. ROMIO sets `cb_nodes = min(striping_factor,
+nranks)`, so **the stripe count IS the collective-buffering aggregator
+count**. A fixed 16 therefore caps aggregation at 16 aggregators no matter
+how many ranks write, which is exactly backwards for a design envelope of
+hundreds of ranks. The default becomes `nranks`.
+
+Why the existing measurement did not catch it: the sweep that chose 16 ran at
+4 and 16 ranks, where `nranks <= 16` makes the two policies nearly the same
+choice. A default tuned inside the region where it cannot be distinguished
+from its replacement is not evidence for it.
+
+Shape of the replacement: clamp to roughly [4, 128], ramp the striping unit
+1 → 4 MiB with it, and **refuse a negative count** — a negative
+`striping_factor` means "every OST on the filesystem", the
+maximum-*contention* layout, and the current Python parse passes it straight
+through.
+
+**Status, verified 2026-08-06.** Implemented on
+`feat/slab-io-stripe-nranks-2026-08-06` (`e5c9618`), which is **not an
+ancestor of this branch** (`merge-base --is-ancestor`, checked). Both sites
+here still default to 16. Even on that branch the policy is Python-side only:
+the C++ writer's `context.cc` still carries the literal `"16"`, so landing it
+is not finished until both writers agree — one environment must mean one
+layout in every writer, which is the rule the stripe *size* already follows.
+
+Licenses deleting: nothing yet. It licenses *adding* the refusal on a
+negative count, which is a live hazard independent of the default.
 
 ## 2026-08-05 — An allgather is a refusal, not a fallback
 
@@ -195,6 +253,12 @@ deep surgery:
 A refusal that names the square count is the deadlock-free form of the same
 rule. The record is reconciled in favour of the implementation; the
 "truncate" wording is withdrawn rather than kept alongside.
+
+CONSEQUENCE, worth stating because it has already cost a plan: the reachable
+device counts are 1, 4, 9, 16, 25, 36, … A scaling ladder cannot include
+**32**, which is the natural next rung on a 4-GPU-per-node machine (8 nodes).
+One has already been re-planned around it. Request 16 or 36; a run submitted
+at 32 refuses at mesh resolution, before any work.
 
 Licenses deleting: rectangular-mesh accommodation in the mesh resolver
 and any divisibility contortions that exist only to serve non-square
