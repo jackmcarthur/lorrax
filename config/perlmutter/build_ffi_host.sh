@@ -104,6 +104,13 @@ BUILD="${LORRAX_FFI_HOST_STAGE:-$SRC/build_host}"
 LORRAX_PM_PRGENV="${LORRAX_PM_PRGENV:-PrgEnv-gnu}"
 LORRAX_PM_LIBSCI="${LORRAX_PM_LIBSCI:-cray-libsci}"
 LORRAX_PM_HDF5="${LORRAX_PM_HDF5:-cray-hdf5-parallel/1.14.3.7}"
+# cray-fftw supplies the FFT engine.  The flat-k handlers call the FFTW3
+# ADVANCED interface and resolve every entry point by RUNTIME dlsym, so this
+# module exists only to put libfftw3 into the .so's DT_NEEDED for that dlsym
+# to find.  On an MKL site it is unnecessary -- MKL exports the FFTW3 C
+# interface natively from libmkl_intel_lp64.  With no engine at all,
+# LORRAX_FFT_FFI refuses at STARTUP naming the unresolved symbol.
+LORRAX_PM_FFTW="${LORRAX_PM_FFTW:-cray-fftw}"
 LORRAX_PM_CMAKE="${LORRAX_PM_CMAKE:-cmake}"
 # LibSci threading flavour.  MUST match the SLATE install's, or the process
 # ends up with both libsci_gnu_mpi and libsci_gnu_mpi_mp loaded and ELF load
@@ -125,7 +132,7 @@ if ! type module >/dev/null 2>&1; then
     # shellcheck disable=SC1091
     source /usr/share/lmod/lmod/init/bash
 fi
-module load "$LORRAX_PM_PRGENV" "$LORRAX_PM_LIBSCI" "$LORRAX_PM_HDF5" "$LORRAX_PM_CMAKE"
+module load "$LORRAX_PM_PRGENV" "$LORRAX_PM_LIBSCI" "$LORRAX_PM_HDF5" "$LORRAX_PM_FFTW" "$LORRAX_PM_CMAKE"
 module unload craype-accel-nvidia80 2>/dev/null || true
 module unload cudatoolkit           2>/dev/null || true
 
