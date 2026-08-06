@@ -85,25 +85,56 @@ reading the last column answers "which layer is broken" from a job log.
 >
 > **Measured 2026-08-06.** Frontera's venv is **jax 0.9.1**. Perlmutter's GPU
 > container (`nvcr.io/nvidia/jax:25.04-py3`) ships **0.5.3.dev20260806**.
-> `pyproject.toml` declares `jax>=0.9.0` and `jaxlib>=0.9.0` for both, and
-> **nothing enforces it** — there is no runtime version check anywhere under
-> `src/`, so Perlmutter runs several minor versions below the declared floor
-> and says nothing.
+> `pyproject.toml` declares `jax>=0.9.0` / `jaxlib>=0.9.0` for both, and
+> **nothing enforces it** — grepping `__version__` across `src/` finds exactly
+> one hit, `runtime/__init__.py:1589`, and it *records* the version into the
+> run fingerprint rather than checking it. So Perlmutter runs below the
+> declared floor and says nothing.
 >
-> This is not a footnote; it decides what you can believe on which machine:
+> **What the straddle does *not* threaten**, because this was the load-bearing
+> worry and it was measured clean:
 >
-> * `tests/test_orbit_syms.py:241` fails **only** under 0.5.3. A red run there
->   on Perlmutter is a JAX artifact, not a defect in the code under test.
-> * `common/jax_compile_cache.py:595` `_canonical_accelerator` is called with
->   the wrong arity against 0.5.3's signature, which kills **every P>1 run**
->   that has a cache directory set.
-> * `jax.memory_stats()` returns `None` in the container, so device peak memory
->   is **unmeasurable** there. Every allocator figure in §2.1 below was taken
->   on Frontera hardware and is carried forward, not re-measured.
+> * **The FFI surface is the modern one on both generations.** `jax.ffi`
+>   exports the full set on each; `jax.extend.ffi.ffi_call` is the *same
+>   object* reached through a deprecation shim; and
+>   `register_ffi_target(api_version=1)` / `ffi_call(custom_call_api_version=4)`
+>   are byte-identical across the two. LORRAX's ~30 `ffi_call` sites and 2
+>   `register_ffi_target` sites are **not** part of the divergence.
+> * **No measured numerical result is undermined.** A 2×2 probe
+>   ({0.5.3, 0.9.1} × {GPU, CPU}, one script, one node) matched every cell to
+>   its version-partner to the last printed digit, including
+>   `jax_use_shardy_partitioner=False` on both. *Scope: single-device
+>   arithmetic only. Multi-rank reduction order was **not** measured.*
 >
-> Treat "measured on one machine" as "unknown on the other" until the pin is
-> reconciled. Which of the two generations LORRAX is going to support is an
-> open owner decision, not something these docs can settle.
+> **The entire real divergence is `jax._src`** — private-API arities, reached
+> from `common/jax_compile_cache.py`, which monkeypatches jax internals. That
+> is the whole blast radius: every *public* symbol LORRAX touches exists with a
+> compatible signature on both generations. Which generation LORRAX supports
+> is an open owner decision; a version gate would make the straddle visible
+> either way.
+>
+> ### Device memory is unmeasurable on Perlmutter GPU, silently
+>
+> `memory_stats()` returns `None` on Perlmutter GPU **under both JAX
+> generations**. This is the **PJRT plugin**, not the JAX version, so
+> upgrading JAX will not restore it. Do not file it under the straddle above.
+>
+> It fails in the worst available way: the `hasattr` guard passes, the caller
+> receives `None`, and nothing announces it. Every allocator figure in §2.1
+> below was therefore taken on **Frontera** hardware and is carried forward,
+> not re-measured on Perlmutter. (There is also no top-level `jax.memory_stats`
+> symbol on either generation — the `src/` references to that spelling are a
+> docstring and an f-string label, not calls.)
+>
+> ### f32 does not mean the same thing on the two machines
+>
+> Unrelated to the straddle, identical under either JAX generation, and worth
+> knowing before you compare numbers across machines: an f32 result on
+> Perlmutter GPU carries **TF32** error, not true f32 — measured **3.08e-04**
+> against CPU's **5.66e-07**. That is the hardware, not a bug and not a
+> regression. The GW/BSE production path is complex128 throughout, so it does
+> not bite there; a cross-machine f32 comparison that has not accounted for it
+> will look like a defect and is not one.
 
 Set **before `import jax`**. `runtime.initialize_communicator_stack()` /
 `bootstrap()` set the hard defaults; cluster modules and env scripts set the
