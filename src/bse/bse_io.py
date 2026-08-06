@@ -49,13 +49,28 @@ from .bse_serial import compute_pair_amplitude
 #
 # Value: 1e3 Ry ≈ 13.6 keV.  This is the constant the exciton-bands driver
 # already shipped (it was defined there, and that driver ALSO carried a
-# hand-rolled repair of this loader's zero ε_v pad — the repair is gone
-# now that the loader is correct).  It is deliberately NOT the 1e10 used
-# by ``psp/dft_operators.py`` for ``T_diag``: 1e3 Ry is already seven
-# orders above the widest QP window this code will ever see, it keeps the
-# float32 KPM leg's ΔE well inside single precision, and matching the
-# in-tree BSE value means the loader now AGREES with the one BSE driver
-# that had this right rather than moving its numbers.
+# hand-rolled repair of this loader's zero ε_v pad — the repair is now an
+# assertion that the loader did it).
+#
+# FINITE, and that is the point.  The tree has two sentinel families and
+# they are chosen on whether the pad SURVIVES the function that writes it:
+#
+#   * ``psp/dft_operators.py`` uses 1e10 on ``T_diag`` — a preconditioner
+#     diagonal and an argsort basis for a selection.  The pad entries do
+#     not leave; an absurd value is free.
+#   * ``common/wfn_transforms.py:1644-1651`` pads band ENERGIES with
+#     ``max(real ε) + 1 Ry`` and its comment says why it is not ∞:
+#     "keeps PPM resolvent arithmetic 1/(ω − e + iη) safe under fp
+#     warnings".  Those pad energies are KEPT and flow downstream.
+#
+# The BSE ε pad is the SECOND family, unambiguously: it is stored in the
+# bundle as ``data['eps_c']``/``['eps_v']`` and handed to every driver,
+# and ``bse_preconditioner`` builds exactly a resolvent from it,
+# 1/(ΔE − λ + ε_shift).  So the sentinel must stay finite and in scale.
+# 1e3 Ry is seven orders above the widest QP window this code will ever
+# see, keeps the float32 KPM leg's ΔE well inside single precision, and
+# matching the in-tree BSE value means the loader now AGREES with the one
+# BSE driver that had this right rather than moving its numbers.
 PAD_EPS_GUARD_RY = 1.0e3
 
 
