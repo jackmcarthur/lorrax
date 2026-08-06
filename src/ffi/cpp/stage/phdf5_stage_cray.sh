@@ -29,7 +29,7 @@
 
 set -euo pipefail
 
-: "${LORRAX_FFI_PHDF5_DIR:=$HOME/software/lorrax_phdf5_cray/stage}"
+: "${LORRAX_FFI_PHDF5_DIR:=$HOME/software/lorrax_phdf5_cray_1.14.3.7/stage}"
 
 # The cray-hdf5-parallel module's install root, and the cray-mpich root
 # for the mpi.h the FFI build needs (the shifter mpich module is
@@ -98,6 +98,44 @@ if [[ ! -d "${CRAY_HDF5_PATH}" ]]; then
     exit 2
 fi
 
+# A STAGE IS ONE HDF5.  `cp -rL` onto a populated tree does not replace it,
+# it OVERLAYS it: 1.14 ships libhdf5_parallel_gnu.so.310 and 1.12 ships
+# libhdf5_parallel_gnu_123.so.200, the names do not collide, and you are left
+# with BOTH majors in one directory that is bind-mounted at /lorrax_phdf5 and
+# put on the container LD_LIBRARY_PATH.  That resolves — which is the problem.
+# The two FFI legs then bind different HDF5s and both get mapped into one
+# process, each with its own error stack, file locks and open-file table over
+# the same .h5.  A tree in exactly that state was found on Perlmutter on
+# 2026-08-06 ($HOME/software/lorrax_phdf5_cray114/stage: 1.12 files at 23:30,
+# 1.14 files overlaid at 23:32).
+#
+# So: refuse a non-empty lib/.  The stage is cheap (~77 MB, seconds) and
+# rebuilding it from scratch is always the right move.
+if [[ -d "${LORRAX_FFI_PHDF5_DIR}/lib" ]] && \
+   [[ -n "$(ls -A "${LORRAX_FFI_PHDF5_DIR}/lib" 2>/dev/null)" ]]; then
+    if [[ "${LORRAX_PHDF5_STAGE_CLOBBER:-0}" != "1" ]]; then
+        echo "phdf5_stage_cray.sh: REFUSED — the stage is already populated." >&2
+        echo "  rule   a stage holds ONE HDF5.  cp -rL overlays rather than" >&2
+        echo "         replaces, and two HDF5 majors under one mount both" >&2
+        echo "         resolve, so nothing fails until the numbers do." >&2
+        echo "  got    ${LORRAX_FFI_PHDF5_DIR}/lib is non-empty:" >&2
+        for _v in $(for _f in "${LORRAX_FFI_PHDF5_DIR}"/lib/libhdf5*.so.*; do
+                        [[ -e "$_f" && ! -L "$_f" ]] || continue
+                        readelf -d "$_f" 2>/dev/null |
+                            sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p'
+                    done | grep -oE "[0-9]+$" | sort -u); do
+            echo "           SOVERSION ${_v}" >&2
+        done
+        echo "  wanted an empty or absent stage dir." >&2
+        echo "  fix    rm -rf ${LORRAX_FFI_PHDF5_DIR}   (then re-run)" >&2
+        echo "         or LORRAX_PHDF5_STAGE_CLOBBER=1 to overlay anyway," >&2
+        echo "         which you almost certainly do not want." >&2
+        exit 2
+    fi
+    echo "[stage] WARNING: overlaying a populated stage on your say-so" >&2
+    echo "[stage]          (LORRAX_PHDF5_STAGE_CLOBBER=1)." >&2
+fi
+
 echo "[stage] src hdf5:  ${CRAY_HDF5_PATH}"
 echo "[stage] src mpich: ${CRAY_MPICH_PATH}"
 echo "[stage] dst:       ${LORRAX_FFI_PHDF5_DIR}"
@@ -128,6 +166,38 @@ fi
 for soname in libmpi_gnu_91.so.12 libmpi_gnu_110.so.12 libmpi_gnu_123.so.12; do
     ln -sf "${SHIM_TARGET}" "${LORRAX_FFI_PHDF5_DIR}/lib/${soname}"
 done
+
+# What landed, beside the artifact.  Which HDF5 is in a stage was invisible
+# for months — the directory name did not say, nothing inside it said, and the
+# host FFI leg moved to 1.14 while this tree stayed on 1.12 (CLAIMS 89).
+{
+    echo "stage=${LORRAX_FFI_PHDF5_DIR}"
+    echo "src_hdf5=${CRAY_HDF5_PATH}"
+    echo "hdf5_version=$(sed -n 's/^#define H5_VERS_INFO[^"]*"\(.*\)"/\1/p' \
+                        "${LORRAX_FFI_PHDF5_DIR}/include/H5public.h" 2>/dev/null)"
+    echo "src_mpich=${CRAY_MPICH_PATH}"
+    echo "shim_target=${SHIM_TARGET}"
+    echo "staged_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "staged_on=$(hostname)"
+    echo "staged_by=${USER:-unknown}"
+} > "${LORRAX_FFI_PHDF5_DIR}/STAGE_PROVENANCE"
+
+# Self-check: exactly one HDF5 SOVERSION landed.  Same invariant GATE 7
+# enforces on the .so side (src/ffi/cpp/gate_one_hdf5.sh); checked here too
+# because this is where a second one gets INTRODUCED, and the sooner it is
+# named the less of the stack has to be rebuilt.
+_sov=$(for _f in "${LORRAX_FFI_PHDF5_DIR}"/lib/libhdf5*.so.*; do
+           [[ -e "$_f" && ! -L "$_f" ]] || continue
+           readelf -d "$_f" 2>/dev/null | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p'
+       done | grep -oE "[0-9]+$" | sort -u)
+_n=$(printf %s "$_sov" | grep -c . || true)
+if [[ "$_n" -ne 1 ]]; then
+    echo "[stage] FAILED: the staged tree carries $_n HDF5 SOVERSIONs:" >&2
+    echo "$_sov" | sed "s/^/[stage]   SOVERSION /" >&2
+    echo "[stage]   A stage is ONE HDF5.  rm -rf the tree and re-run." >&2
+    exit 1
+fi
+echo "[stage] one HDF5 SOVERSION staged: ${_sov}"
 
 echo "[stage] done."
 echo "[stage] inspect libhdf5 NEEDED:"
