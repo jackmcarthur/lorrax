@@ -31,15 +31,58 @@ set -euo pipefail
 
 : "${LORRAX_FFI_PHDF5_DIR:=$HOME/software/lorrax_phdf5_cray/stage}"
 
-# The cray-hdf5-parallel module's install root.  If env sets HDF5_DIR
-# (from `module load cray-hdf5-parallel`), prefer that.  Otherwise fall
-# back to the path observed on Perlmutter as of April 2026.
-: "${CRAY_HDF5_PATH:=${HDF5_DIR:-/opt/cray/pe/hdf5-parallel/1.12.2.9/gnu/12.3}}"
+# The cray-hdf5-parallel module's install root, and the cray-mpich root
+# for the mpi.h the FFI build needs (the shifter mpich module is
+# runtime-only and ships no headers).
+#
+# BOTH REFUSE WHEN UNSET.  Until 2026-08-06 each fell back to a path
+# observed on Perlmutter in April 2026 —
+#     ${HDF5_DIR:-/opt/cray/pe/hdf5-parallel/1.12.2.9/gnu/12.3}
+#     ${MPICH_DIR:-/opt/cray/pe/mpich/9.0.1/ofi/gnu/12.3}
+# — which is the "quietly substitute a default for a missing environment
+# fact" shape, in the one place where it does the most damage.  What gets
+# staged here is what every later build LINKS against, and the resulting
+# .so does not fail at link time when the guess is wrong; it fails much
+# later, as a wrong answer or a hang, with nothing on disk recording that
+# a different HDF5 was substituted.  The guess is also demonstrably stale:
+# config/perlmutter/build_ffi_host.sh loads cray-hdf5-parallel/1.14.3.7,
+# so a run of THIS script with no module loaded would stage 1.12 under a
+# tree the host build fills with 1.14.  Staging against the wrong HDF5 is
+# exactly the class that "links cleanly, fails later".
+#
+# The fix is one command, and it is in the usage block above:
+#   module load cray-hdf5-parallel cray-mpich
+# Or name the trees outright with CRAY_HDF5_PATH / CRAY_MPICH_PATH, which
+# still take precedence — an explicit path is a stated fact, not a guess.
+if [[ -z "${CRAY_HDF5_PATH:-}" && -z "${HDF5_DIR:-}" ]]; then
+    echo "phdf5_stage_cray.sh: REFUSED — HDF5_DIR is not set." >&2
+    echo "  rule   the staged HDF5 is what every later FFI build links" >&2
+    echo "         against; a substituted default links cleanly and fails" >&2
+    echo "         later, as a wrong answer or a hang." >&2
+    echo "  got    neither HDF5_DIR nor CRAY_HDF5_PATH in the environment." >&2
+    echo "  wanted HDF5_DIR, as exported by the module." >&2
+    echo "  fix    module load cray-hdf5-parallel cray-mpich" >&2
+    echo "         (or set CRAY_HDF5_PATH=<hdf5 install root> explicitly)." >&2
+    echo "  note   this script no longer guesses" >&2
+    echo "         /opt/cray/pe/hdf5-parallel/1.12.2.9/gnu/12.3; the host" >&2
+    echo "         FFI build uses cray-hdf5-parallel/1.14.3.7." >&2
+    exit 2
+fi
+: "${CRAY_HDF5_PATH:=${HDF5_DIR}}"
 
-# Likewise for cray-mpich headers.  We need mpi.h + friends at build
-# time for the FFI; they're not shipped by the shifter mpich module
-# (runtime-only).
-: "${CRAY_MPICH_PATH:=${MPICH_DIR:-/opt/cray/pe/mpich/9.0.1/ofi/gnu/12.3}}"
+if [[ -z "${CRAY_MPICH_PATH:-}" && -z "${MPICH_DIR:-}" ]]; then
+    echo "phdf5_stage_cray.sh: REFUSED — MPICH_DIR is not set." >&2
+    echo "  rule   the mpi.h staged here is the ABI the FFI compiles" >&2
+    echo "         against; the wrong one links and then corrupts or hangs" >&2
+    echo "         at the first collective (hazard S3)." >&2
+    echo "  got    neither MPICH_DIR nor CRAY_MPICH_PATH in the" >&2
+    echo "         environment." >&2
+    echo "  wanted MPICH_DIR, as exported by the module." >&2
+    echo "  fix    module load cray-mpich" >&2
+    echo "         (or set CRAY_MPICH_PATH=<mpich install root>)." >&2
+    exit 2
+fi
+: "${CRAY_MPICH_PATH:=${MPICH_DIR}}"
 
 # Where shifter --module=mpich places the MPICH-ABI libmpi inside the
 # container.  The shim symlinks below map cray-pe compiler-specific
