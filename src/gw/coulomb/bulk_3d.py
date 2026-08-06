@@ -7,24 +7,32 @@ import numpy as np
 
 from common import Meta
 from .base import (SysDim, sample_minibz_qpoints, minibz_average,
-                   minibz_inscribed_sphere_r2)
+                   minibz_inscribed_sphere_r2, v_qG_table, v_qG_single)
 
 
 class Bulk3D:
     sys_dim = SysDim.BULK_3D
 
-    def v_qG(self, wfn, qvec_wrapped, comps_qG) -> jax.Array:
-        bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
-        comps = np.asarray(comps_qG, dtype=np.float64)
-        qvec = np.asarray(qvec_wrapped, dtype=np.float64)
-        G_cart = (comps + qvec) @ bvec  # (nG, 3)
-        denom = np.sum(G_cart * G_cart, axis=1)
+    def _v_bare_per_q(self, qf, gvec_q, *, bvec_f, fact,
+                      bdot=None, fft_grid=None):
+        """``8π/|q+G|² / Ω_cell``, no truncation.  See the base Protocol.
+
+        Arithmetic order is the shipped production order (``v_reg * fact``,
+        NOT ``v / cell_volume``) — the two differ in the last ulp and this
+        path is bit-compared against the pre-port table.
+        """
+        del bdot, fft_grid
+        qG_frac = qf[:, None] + gvec_q                        # (3, nG)
+        qG_cart = bvec_f.T @ qG_frac                          # (3, nG)
+        denom = np.sum(qG_cart * qG_cart, axis=0)             # (nG,)
         denom_zero = denom < 1e-12
         denom_safe = np.where(denom_zero, 1.0, denom)
-        v = 8.0 * np.pi / denom_safe
-        v = v / float(wfn.cell_volume)
-        v = np.where(denom_zero, 0.0, v)
-        return jnp.asarray(v, dtype=jnp.complex128)
+        v_reg = 8.0 * np.pi / denom_safe
+        v = np.where(denom_zero, 0.0, v_reg * fact)
+        return v, denom
+
+    def v_qG(self, wfn, qvec_wrapped, comps_qG) -> jax.Array:
+        return v_qG_single(self, wfn, qvec_wrapped, comps_qG)
 
     def _vq_isotropic(self, qcart):
         denom = jnp.einsum("ij,ij->i", qcart, qcart)

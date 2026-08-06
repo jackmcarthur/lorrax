@@ -64,6 +64,19 @@ class _Config:
         self.memory = _Mem(per_device_gb)
 
 
+def _resolver_src():
+    """Body of ``_resolve_sc_eigh`` — sliced to the NEXT top-level def.
+
+    Not to ``def _midgap_efermi(``: that is defined EARLIER in the file
+    (line ~283 vs ~347), so slicing to it silently yields an empty string
+    and every assertion on the body passes vacuously.
+    """
+    src = pathlib.Path(sc_iteration.__file__).read_text()
+    at = src.index("def _resolve_sc_eigh(")
+    nxt = src.index("\ndef ", at)
+    return src[at:nxt]
+
+
 def _resolve(nb, px, py, lines=None, **kw):
     return _resolve_sc_eigh(nb, _FakeMesh(px, py), _Config(**kw),
                             print_fn=(lines.append if lines is not None
@@ -124,32 +137,136 @@ def test_one_device_stays_native():
     assert _resolve(100_000, 1, 1) == "native"
 
 
-def test_an_indivisible_band_window_stays_native_under_auto():
-    """``distributed_eigh_bands`` pads and does not unpad — auto must not.
+def test_an_indivisible_band_window_stays_native_under_auto_for_SIZE():
+    """nb = 46 stays native, but the REASON changed on 2026-08-06.
+
+    It used to be divisibility: ``distributed_eigh_bands`` padded and did
+    not unpad, so ``auto`` refused to walk into a silent shape change.
+    That callee now pads with a sentinel and slices back by count, so
+    divisibility is not a condition any more — nb = 46 stays native
+    purely because one (46, 46) tile is 33 kB, far under
+    ``_SC_EIGH_TILE_BUDGET_FRACTION`` of the 40 GB/device budget.
 
     nb = 46 is the repo's own gnppm fixture (nval + ncond = 26 + 20);
     the band divisor of an 8×8 mesh is 64 and 46 % 64 = 46.
     """
-    assert _resolve(46, 8, 8) == "native"
+    assert 46 % 64 != 0
+    lines = []
+    assert _resolve(46, 8, 8, lines=lines) == "native"
+    assert not lines, ("a small tile must resolve on size alone, without "
+                       "probing a backend")
+    # ...and it is the SIZE holding it there, not divisibility: shrink the
+    # budget and the SAME indivisible window now reaches the backend probe.
+    # (It may still land on native when no distributed backend resolves on
+    # this node -- that is the documented degrade, and it PRINTS, which is
+    # what distinguishes "tried and degraded" from "short-circuited".)
+    lines = []
+    _resolve(46, 8, 8, per_device_gb=1e-6, lines=lines)
+    assert any("auto wanted the distributed eigh" in L for L in lines), (
+        "an indivisible nb must now reach the backend probe; if it never "
+        "does, the lifted refusal has been reinstated by the auto branch")
 
 
-def test_an_indivisible_band_window_is_refused_when_asked_explicitly():
-    with pytest.raises(ValueError, match="be a multiple of 64"):
-        _resolve(46, 8, 8, eigh="distributed")
+def test_an_indivisible_band_window_is_SERVED_when_asked_explicitly():
+    """The 2026-08-06 contract change: this used to raise ValueError.
+
+    The old refusal was a SHAPE objection — the callee returned
+    ``(nk, nb_pad)`` / ``(nk, nb_pad, nb_pad)`` which the carry and every
+    band-indexed operand beside it would not match.  It now returns the
+    logical extent at any nb, so there is nothing left to refuse.
+    """
+    assert _resolve(46, 8, 8, eigh="distributed") == "distributed"
+    assert _resolve(10, 2, 2, eigh="distributed") == "distributed"
+
+
+def test_the_backend_probe_asks_about_the_PADDED_extent():
+    """``auto`` must probe the extent the eigh runs at, not ``nb``.
+
+    ``ffi.linalg.resolve`` has its own divisibility guard.  Probing the
+    logical ``nb`` would trip it for every indivisible window and degrade
+    to native — reinstating the lifted refusal by accident, silently.
+    """
+    body = _resolver_src()
+    assert "n=nb_solve" in body, (
+        "the resolve_backend probe must be asked about round_up(nb, "
+        "pad_div), not nb")
+    assert "round_up(nb, pad_div)" in body
 
 
 def test_the_divisor_is_the_band_divisor_not_the_two_axes_separately():
-    """nb = 10 on a 2×2 mesh divides both axes and is STILL padded.
+    """nb = 10 on a 2×2 mesh divides both axes and is STILL padded to 12.
 
-    ``distributed_eigh_bands`` pads to
-    ``spec_divisor(mesh, band_sphere_spec(), 1)``, which is px·py on the
-    default psi layout, so a per-axis test would let nb = 10 through and
-    get back arrays of width 12.
+    The divisor is ``spec_divisor(mesh, band_sphere_spec(), 1)`` — px·py
+    on the default psi layout — not the two axes separately.  That still
+    matters after the refusal was lifted, because it is the extent the
+    backend probe and the pad both use; it is simply no longer a reason
+    to refuse.
     """
-    assert 10 % 2 == 0
-    assert _resolve(10, 2, 2) == "native"
-    with pytest.raises(ValueError, match="be a multiple of 4"):
-        _resolve(10, 2, 2, eigh="distributed")
+    from runtime.padding import round_up
+    assert 10 % 2 == 0                       # divides both axes...
+    assert round_up(10, 2 * 2) == 12         # ...and is still padded to 12
+    # and the resolver takes that divisor from the spec, not from px, py
+    assert "spec_divisor(mesh_xy, band_sphere_spec(), 1)" in _resolver_src()
+
+
+# ---------------------------------------------------------------------------
+# The pad contract the lifted refusal now depends on
+# ---------------------------------------------------------------------------
+
+def test_the_pad_is_a_sentinel_and_the_result_is_sliced_back_by_count():
+    """Source gate on ``distributed_eigh_bands``.
+
+    The refusal above was lifted ONLY because this callee stopped
+    returning padded shapes.  If the slice-back is ever removed, the
+    resolver silently starts handing the carry ``(nk, nb_pad)`` again —
+    so pin both halves here, next to the test that depends on them.
+    """
+    from gw import qsgw_density
+    src = pathlib.Path(qsgw_density.__file__).read_text()
+    body = src[src.index("def distributed_eigh_bands("):]
+    body = body[:body.index("\ndef ")]
+    assert "_EIGH_PAD_SENTINEL_RY" in body, (
+        "the band pad must carry the large diagonal sentinel; a zero pad "
+        "injects exact-0.0 eigenvalues mid-spectrum and moves band order, "
+        "_midgap_efermi and the occupations")
+    assert "E = E[:, :nb]" in body and "U = U[:, :nb, :nb]" in body, (
+        "the eigh result must be sliced back to the LOGICAL band extent "
+        "by COUNT — that is what makes the sentinel correct rather than "
+        "merely convenient, and what the lifted refusal relies on")
+
+
+def test_the_sentinel_is_orders_clear_of_any_physical_eigenvalue():
+    """1e10 Ry vs O(1) Ry QP eigenvalues.
+
+    Not a style check: the sentinel is only safe if pad eigenvalues
+    cannot interleave with the physical spectrum at ANY deck.  An
+    identity pad (1.0 Ry = 13.6 eV) fails exactly this — it is above most
+    states of interest but inside a wide QP window.
+    """
+    from gw.qsgw_density import _EIGH_PAD_SENTINEL_RY as S
+    assert S >= 1e8
+    assert S / 13.6057 > 1e6          # eV, vs any conceivable QP window
+
+
+def test_a_sentinel_pad_block_decouples_exactly():
+    """The property the whole scheme rests on, checked numerically.
+
+    ``[H 0; 0 sI]`` is block diagonal with zero coupling, so the pad
+    eigenvalues are EXACTLY s, they occupy the last slots of an ascending
+    spectrum, and the physical eigenvectors carry zero weight on pad rows.
+    """
+    from gw.qsgw_density import _EIGH_PAD_SENTINEL_RY as S
+    rng = np.random.default_rng(3)
+    nb, nb_pad = 10, 16
+    A = rng.normal(size=(nb, nb))
+    H = 0.5 * (A + A.T)
+    Hp = np.zeros((nb_pad, nb_pad))
+    Hp[:nb, :nb] = H
+    Hp[np.arange(nb, nb_pad), np.arange(nb, nb_pad)] = S
+    w, V = np.linalg.eigh(Hp)
+    assert np.all(w[nb:] == S)                       # exactly, not approx
+    assert np.abs(w[:nb] - np.linalg.eigh(H)[0]).max() < 1e-10
+    assert np.abs(V[nb:, :nb]).max() == 0.0          # no leakage into pad rows
 
 
 def test_a_large_tile_leaves_the_native_batch():

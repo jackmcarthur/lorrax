@@ -5,7 +5,12 @@ what the live G-flat V_q path needs:
 
 * :func:`compute_v_q_per_G` — evaluate ``v(q+G)`` at the writer's per-q
   WFN.h5-style G-sphere (the ``isdf_header/gvec_components`` table).
-  This is the only ``v`` builder the G-flat contract consumes.
+  This is the only ``v`` builder the G-flat contract consumes.  Since
+  2026-08-06 it is a **thin dispatcher** over
+  :func:`gw.coulomb.base.v_qG_table`: the arithmetic lives once per
+  dimensionality in :mod:`gw.coulomb`, shared with that package's
+  ``CoulombKernel.v_qG``.  There is no second implementation to keep in
+  step any more.
 * :func:`build_v_head_miniBZ_avg_3d` — the 3D mini-BZ-averaged
   ``<v(q, G=0)>`` head table injected into ``compute_v_q_per_G`` for
   bulk systems.
@@ -87,6 +92,7 @@ def compute_v_q_per_G(
     sys_dim: int,
     vcoul_cutoff_ry: float | None = None,
     bdot: np.ndarray | None = None,
+    fft_grid: np.ndarray | None = None,
     v_head_miniBZ: np.ndarray | None = None,
 ) -> np.ndarray:
     """Compute ``v(q+G)`` at the per-q WFN.h5-style G-list.
@@ -109,11 +115,12 @@ def compute_v_q_per_G(
         by kgrid).
     gvec_components : ``(n_q, 3, ngkmax)`` int32
         Per-q Miller indices from ``isdf_header.gvec_components``.
-    bvec, cell_volume, sys_dim, vcoul_cutoff_ry, bdot
+    bvec, cell_volume, sys_dim, vcoul_cutoff_ry, bdot, fft_grid
         Coulomb geometry / truncation.  ``vcoul_cutoff_ry`` zeroes
         ``v`` at G's with |q+G|² past the cutoff (== V_q's bare-Coulomb
         cutoff; may be < the ζ-sphere cutoff that built
-        ``gvec_components``).
+        ``gvec_components``).  ``bdot`` / ``fft_grid`` are read only by
+        the 0-D box kernel.
 
     Returns
     -------
@@ -126,74 +133,33 @@ def compute_v_q_per_G(
     at consumer setup and pushed to device.  Not jitted; not sharded.
     For very large ngkmax this could be vectorised across q on device,
     but it's a one-shot cost per V_q run.
+
+    Since 2026-08-06 this is a **thin dispatcher** over
+    :func:`gw.coulomb.base.v_qG_table` — the arithmetic lives once per
+    dimensionality in ``gw/coulomb/{bulk_3d,slab_2d,box_0d}.py`` and is
+    shared with :meth:`gw.coulomb.base.CoulombKernel.v_qG`.  The
+    dimension-independent capabilities (``vcoul_cutoff_ry`` masking, G=0
+    head-slot injection, the ``(n_q, ngkmax)`` float64 contract) are
+    implemented once in that driver.  ``sys_dim=0`` is now SERVED rather
+    than refused — ``Box0D`` supplies the WS-box formula at q=0 — but the
+    G-flat V_q pipeline still cannot reach it, because
+    ``gw.isdf_fitting`` builds no per-q sphere for ``sys_dim == 0``
+    (``isdf_fitting.py:670``) and ``compute_all_V_q_g_flat`` refuses
+    ``sys_dim not in (2, 3)`` (``v_q_g_flat.py:527``).  Those two are the
+    real, accurate gate; the refusal that used to live here was not.
     """
     if sys_dim not in (0, 2, 3):
         raise NotImplementedError(
             f"compute_v_q_per_G: sys_dim must be 0 / 2 / 3; got {sys_dim}")
-    q_irr_frac = np.asarray(q_irr_frac, dtype=np.float64).reshape(-1, 3)
-    gvec = np.asarray(gvec_components, dtype=np.float64)         # (n_q, 3, ngkmax)
-    if gvec.ndim != 3 or gvec.shape[1] != 3:
-        raise ValueError(
-            f"gvec_components must be (n_q, 3, ngkmax); got {gvec.shape}")
-    n_q, _, ngkmax = gvec.shape
-    bvec_f = np.asarray(bvec, dtype=np.float64)
-    fact = 1.0 / float(cell_volume)
-
-    if sys_dim == 2:
-        zc = float(np.pi / float(bvec_f[2, 2]))
-    if v_head_miniBZ is not None:
-        # Per-q grid index: round (q_frac * kgrid) and wrap modulo kgrid.
-        # ``v_head_miniBZ`` is indexed by integer (qx, qy, qz) on the
-        # k-grid (the table the legacy ``get_sqrt_v_and_phase`` consumes).
-        head_arr = np.asarray(v_head_miniBZ, dtype=np.float64)
-        if head_arr.ndim != 3:
-            raise ValueError(
-                f"v_head_miniBZ must be (nkx, nky, nkz); got shape "
-                f"{head_arr.shape}")
-        head_kgrid = np.array(head_arr.shape, dtype=np.float64)
-    out = np.zeros((n_q, ngkmax), dtype=np.float64)
-
-    for qi in range(n_q):
-        qf = q_irr_frac[qi]
-        # gvec[qi]: (3, ngkmax) -> per-G Miller; (q + G) in fractional.
-        qG_frac = qf[:, None] + gvec[qi]                          # (3, ngkmax)
-        qG_cart = bvec_f.T @ qG_frac                              # (3, ngkmax)
-        denom = np.sum(qG_cart * qG_cart, axis=0)                 # (ngkmax,)
-        denom_zero = denom < 1e-12
-        denom_safe = np.where(denom_zero, 1.0, denom)
-        if sys_dim == 3:
-            v_reg = 8.0 * np.pi / denom_safe
-            v = np.where(denom_zero, 0.0, v_reg * fact)
-            if v_head_miniBZ is not None:
-                # Replace the G=0 entry (the (0,0,0) Miller slot) with the
-                # mini-BZ averaged head value for this q.  Same formula the
-                # legacy ``get_sqrt_v_and_phase`` uses; q=0 keeps v=0 by
-                # construction (the actual head is injected via a separate
-                # rank-1 path in Σ_X).
-                qx_i = int(np.round(qf[0] * head_kgrid[0])) % int(head_kgrid[0])
-                qy_i = int(np.round(qf[1] * head_kgrid[1])) % int(head_kgrid[1])
-                qz_i = int(np.round(qf[2] * head_kgrid[2])) % int(head_kgrid[2])
-                g0_mask = np.all(gvec[qi] == 0.0, axis=0)         # (ngkmax,)
-                v = np.where(g0_mask, head_arr[qx_i, qy_i, qz_i], v)
-        elif sys_dim == 2:
-            kxy = np.sqrt(qG_cart[0]**2 + qG_cart[1]**2)
-            kz = qG_cart[2]
-            f2d = 1.0 - np.exp(-zc * kxy) * np.cos(kz * zc)
-            v_reg = (8.0 * np.pi / denom_safe) * f2d
-            v = np.where(denom_zero, 0.0, v_reg * fact)
-        else:
-            # sys_dim == 0: caller passes ``bdot`` and we'd build the
-            # FFT-grid sqrt_v0d here; not yet wired to per-q lookup.
-            raise NotImplementedError(
-                "compute_v_q_per_G: sys_dim=0 path not wired — the 0-D "
-                "box truncation builds v on the full FFT grid via "
-                "compute_sqrt_vcoul_0d; the per-q gather would map "
-                "components → flat-FFT index → v(G).  Plumb when "
-                "needed.")
-        if vcoul_cutoff_ry is not None:
-            v = np.where(denom > float(vcoul_cutoff_ry), 0.0, v)
-        out[qi] = v
-    return out
+    from .coulomb import get_kernel
+    from .coulomb.base import v_qG_table
+    return v_qG_table(
+        get_kernel(sys_dim), q_irr_frac, gvec_components,
+        bvec=bvec, cell_volume=cell_volume,
+        vcoul_cutoff_ry=vcoul_cutoff_ry,
+        v_head_miniBZ=v_head_miniBZ,
+        bdot=bdot, fft_grid=fft_grid,
+    )
 
 
 def compute_all_V_q(

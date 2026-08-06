@@ -13,30 +13,38 @@ import numpy as np
 
 from common import Meta
 from .base import (SysDim, sample_minibz_qpoints, minibz_average,
-                   minibz_voronoi_batches, minibz_inscribed_sphere_r2)
+                   minibz_voronoi_batches, minibz_inscribed_sphere_r2,
+                   v_qG_table, v_qG_single)
 
 
 class Slab2D:
     sys_dim = SysDim.SLAB_2D
 
-    def v_qG(self, wfn, qvec_wrapped, comps_qG) -> jax.Array:
-        bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
-        comps = np.asarray(comps_qG, dtype=np.float64)
-        qvec = np.asarray(qvec_wrapped, dtype=np.float64)
-        G_cart = (comps + qvec) @ bvec
-        denom = np.sum(G_cart * G_cart, axis=1)
+    def _v_bare_per_q(self, qf, gvec_q, *, bvec_f, fact,
+                      bdot=None, fft_grid=None):
+        """Ismail-Beigi slab truncation.  See the base Protocol.
+
+        Arithmetic order is the shipped production order — ``v_reg * fact``
+        rather than ``v / cell_volume``, and ``sqrt(x² + y²)`` rather than
+        ``linalg.norm``; both differ from the old class spelling in the
+        last ulp, and this path is bit-compared against the pre-port table.
+        """
+        del bdot, fft_grid
+        zc = float(np.pi / float(bvec_f[2, 2]))
+        qG_frac = qf[:, None] + gvec_q                        # (3, nG)
+        qG_cart = bvec_f.T @ qG_frac                          # (3, nG)
+        denom = np.sum(qG_cart * qG_cart, axis=0)             # (nG,)
         denom_zero = denom < 1e-12
-
-        zc = float(np.pi / bvec[2, 2])
-        kxy = np.linalg.norm(G_cart[:, :2], axis=1)
-        kz = G_cart[:, 2]
-        f2d = 1.0 - np.exp(-zc * kxy) * np.cos(kz * zc)
-
         denom_safe = np.where(denom_zero, 1.0, denom)
-        v = (8.0 * np.pi / denom_safe) * f2d
-        v = v / float(wfn.cell_volume)
-        v = np.where(denom_zero, 0.0, v)
-        return jnp.asarray(v, dtype=jnp.complex128)
+        kxy = np.sqrt(qG_cart[0]**2 + qG_cart[1]**2)
+        kz = qG_cart[2]
+        f2d = 1.0 - np.exp(-zc * kxy) * np.cos(kz * zc)
+        v_reg = (8.0 * np.pi / denom_safe) * f2d
+        v = np.where(denom_zero, 0.0, v_reg * fact)
+        return v, denom
+
+    def v_qG(self, wfn, qvec_wrapped, comps_qG) -> jax.Array:
+        return v_qG_single(self, wfn, qvec_wrapped, comps_qG)
 
     def v_head_minibz_avg(
         self, wfn, meta: Meta, shift_frac, *,
