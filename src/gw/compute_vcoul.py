@@ -28,6 +28,8 @@ from jax.sharding import Mesh
 
 from file_io.paths import resolve_input_path
 
+from .coulomb.kernel import TOL_QG_ZERO, v_qG
+
 
 def build_v_head_miniBZ_avg_3d(
     kgrid: tuple[int, int, int],
@@ -88,6 +90,8 @@ def compute_v_q_per_G(
     vcoul_cutoff_ry: float | None = None,
     bdot: np.ndarray | None = None,
     v_head_miniBZ: np.ndarray | None = None,
+    pad_policy: str = "leave",
+    ngk_per_q: np.ndarray | None = None,
 ) -> np.ndarray:
     """Compute ``v(q+G)`` at the per-q WFN.h5-style G-list.
 
@@ -97,10 +101,23 @@ def compute_v_q_per_G(
     the input the G-flat V_q contract needs.  Returns one ``(ngkmax,)``
     row of ``v(q+G)`` per q in ``q_irr_frac``.
 
-    Pad slots in ``gvec_components`` (sentinel Miller index
-    ``(-nx/2, -ny/2, -nz/2)``) get whatever ``v`` is at that
-    position — caller need not zero them because the contract uses
-    ζ̃ = 0 at those slots.
+    The formula is :func:`gw.coulomb.kernel.v_qG` — the same source line
+    the BSE builder and the mini-BZ sampler evaluate; the values are
+    BYTE-IDENTICAL to the pre-2026-08-05 local copy in both ``sys_dim``
+    (measured, Frontera job 7890613).
+
+    ``pad_policy`` — what the pad slots of ``gvec_components`` (sentinel
+    Miller index ``(-nx/2, -ny/2, -nz/2)``) hold.  ``"leave"`` (the
+    default, and the only value this caller wants) evaluates ``v`` there
+    like any other slot: the G-flat V_q contract has ζ̃ = 0 at pad slots,
+    so the value is multiplied out.  ``"zero"`` is the OTHER live
+    convention (:func:`bse.vq_interp.v_sphere_padded`), which needs the
+    explicit zero because its ``ZG`` carries junk in the pad columns; it
+    requires ``ngk_per_q`` (the per-q valid sphere length) because "which
+    slot is pad" is caller knowledge, not something this function can
+    infer from a Miller index.  Both conventions are correct for their own
+    consumer; the parameter exists so that neither gets silently handed
+    the other's.
 
     Parameters
     ----------
@@ -130,6 +147,12 @@ def compute_v_q_per_G(
     if sys_dim not in (0, 2, 3):
         raise NotImplementedError(
             f"compute_v_q_per_G: sys_dim must be 0 / 2 / 3; got {sys_dim}")
+    if pad_policy not in ("leave", "zero"):
+        raise ValueError(f"compute_v_q_per_G: pad_policy must be 'leave' or "
+                         f"'zero'; got {pad_policy!r}")
+    if pad_policy == "zero" and ngk_per_q is None:
+        raise ValueError("compute_v_q_per_G: pad_policy='zero' needs "
+                         "ngk_per_q (per-q valid sphere length)")
     q_irr_frac = np.asarray(q_irr_frac, dtype=np.float64).reshape(-1, 3)
     gvec = np.asarray(gvec_components, dtype=np.float64)         # (n_q, 3, ngkmax)
     if gvec.ndim != 3 or gvec.shape[1] != 3:
@@ -137,7 +160,6 @@ def compute_v_q_per_G(
             f"gvec_components must be (n_q, 3, ngkmax); got {gvec.shape}")
     n_q, _, ngkmax = gvec.shape
     bvec_f = np.asarray(bvec, dtype=np.float64)
-    fact = 1.0 / float(cell_volume)
 
     if sys_dim == 2:
         zc = float(np.pi / float(bvec_f[2, 2]))
@@ -159,29 +181,7 @@ def compute_v_q_per_G(
         qG_frac = qf[:, None] + gvec[qi]                          # (3, ngkmax)
         qG_cart = bvec_f.T @ qG_frac                              # (3, ngkmax)
         denom = np.sum(qG_cart * qG_cart, axis=0)                 # (ngkmax,)
-        denom_zero = denom < 1e-12
-        denom_safe = np.where(denom_zero, 1.0, denom)
-        if sys_dim == 3:
-            v_reg = 8.0 * np.pi / denom_safe
-            v = np.where(denom_zero, 0.0, v_reg * fact)
-            if v_head_miniBZ is not None:
-                # Replace the G=0 entry (the (0,0,0) Miller slot) with the
-                # mini-BZ averaged head value for this q.  Same formula the
-                # legacy ``get_sqrt_v_and_phase`` uses; q=0 keeps v=0 by
-                # construction (the actual head is injected via a separate
-                # rank-1 path in Σ_X).
-                qx_i = int(np.round(qf[0] * head_kgrid[0])) % int(head_kgrid[0])
-                qy_i = int(np.round(qf[1] * head_kgrid[1])) % int(head_kgrid[1])
-                qz_i = int(np.round(qf[2] * head_kgrid[2])) % int(head_kgrid[2])
-                g0_mask = np.all(gvec[qi] == 0.0, axis=0)         # (ngkmax,)
-                v = np.where(g0_mask, head_arr[qx_i, qy_i, qz_i], v)
-        elif sys_dim == 2:
-            kxy = np.sqrt(qG_cart[0]**2 + qG_cart[1]**2)
-            kz = qG_cart[2]
-            f2d = 1.0 - np.exp(-zc * kxy) * np.cos(kz * zc)
-            v_reg = (8.0 * np.pi / denom_safe) * f2d
-            v = np.where(denom_zero, 0.0, v_reg * fact)
-        else:
+        if sys_dim == 0:
             # sys_dim == 0: caller passes ``bdot`` and we'd build the
             # FFT-grid sqrt_v0d here; not yet wired to per-q lookup.
             raise NotImplementedError(
@@ -190,6 +190,27 @@ def compute_v_q_per_G(
                 "compute_sqrt_vcoul_0d; the per-q gather would map "
                 "components → flat-FFT index → v(G).  Plumb when "
                 "needed.")
+        v = v_qG(qG_cart, axis=0, sys_dim=sys_dim, channel="full",
+                 units="per_volume", celvol=cell_volume,
+                 zc=(zc if sys_dim == 2 else None), zero_tol=TOL_QG_ZERO)
+        if sys_dim == 3 and v_head_miniBZ is not None:
+            # Replace the G=0 entry (the (0,0,0) Miller slot) with the
+            # mini-BZ averaged head value for this q.  The head TABLE is
+            # built around the SAME slot (the Miller-(0,0,0) shift q_cart),
+            # so slot and shift agree.  ``argmin_G |q+G|²`` and
+            # Miller-(0,0,0) do NOT coincide for every BGW-wrapped q on a
+            # non-orthogonal lattice (12/64 q on the Si 4×4×4 fcc deck,
+            # Frontera job 7890613) — moving the slot without moving the
+            # shift would inject an average of the wrong neighbourhood.
+            # See docs/dev/STATE.md, "Coulomb head slot".
+            qx_i = int(np.round(qf[0] * head_kgrid[0])) % int(head_kgrid[0])
+            qy_i = int(np.round(qf[1] * head_kgrid[1])) % int(head_kgrid[1])
+            qz_i = int(np.round(qf[2] * head_kgrid[2])) % int(head_kgrid[2])
+            g0_mask = np.all(gvec[qi] == 0.0, axis=0)             # (ngkmax,)
+            v = np.where(g0_mask, head_arr[qx_i, qy_i, qz_i], v)
+        if pad_policy == "zero":
+            v = v.copy()
+            v[int(ngk_per_q[qi]):] = 0.0
         if vcoul_cutoff_ry is not None:
             v = np.where(denom > float(vcoul_cutoff_ry), 0.0, v)
         out[qi] = v
