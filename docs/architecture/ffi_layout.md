@@ -139,40 +139,58 @@ dependency.
 > `DT_NEEDED` entries plus `ldd` **inside the container on a compute node**
 > (§7c on why the login node cannot answer this).
 
-**But `DT_NEEDED` is still load-bearing at load time**, and that is a live
-failure today. Measured 2026-08-06, in-container on compute node
-nid001644: the host `.so` carries the right directory in its **RPATH**
+**`DT_NEEDED` is load-bearing at load time**, and until 2026-08-06 that was
+a live failure. Measured that day, in-container on compute node nid001644:
+the host `.so` carried the right directory in its **RPATH**
 (`/opt/cray/pe/fftw/3.3.10.11/x86_milan/lib`), so on the bare host it
-resolves — but inside the Shifter image `/opt/cray/pe` **does not exist at
-all**, so all three FFTW entries report `not found` and the entire
-`liblorrax_ffi_host.so` fails to load. Tier-1 on the CUDA leg is
+resolved -- but inside the Shifter image `/opt/cray/pe` **does not exist at
+all**, so all three FFTW entries reported `not found` and the entire
+`liblorrax_ffi_host.so` failed to load. Tier-1 on the CUDA leg was
 consequently 33 passed / **19 skipped**, every skip reading
 `liblorrax_ffi_host.so unavailable: libfftw3.so.mpi31.3: cannot open
 shared object file`.
 
-No `LD_LIBRARY_PATH` value repairs this — the files are not in the
+No `LD_LIBRARY_PATH` value repaired that -- the files are not in the
 container's mount namespace. **The containerized host leg had never been
 green**; the "35/35 on both vendors" certification was a bare-host run.
 A skip is not a pass.
 
-> **Fixed — on a branch this one does not contain.** `411e257`
-> ("the run-time-resolved FFT engine stops being a load-time dependency", on
+> **Fixed, and IN this tree.** `411e257` ("the run-time-resolved FFT engine
+> stops being a load-time dependency", from
 > `fix/host-ffi-fftw-dt-needed-2026-08-06`) removes the link-time dependency
 > so the engine is `dlopen`'d rather than `DT_NEEDED`, and adds the
-> sufficient invariant — **zero `fftw` in `DT_NEEDED`** — as a build gate in
-> `config/perlmutter/build_ffi_host.sh`. In-container Tier-1 host then reads
-> **49 passed / 2 skipped / 1 failed** against the 33/19/0 above; the 2 skips
-> are the known SLATE `heev` L-2 and the 1 failure is the FFT cell honestly
-> reporting that the container ships no FFTW3.
+> sufficient invariant -- **zero `fftw` in `DT_NEEDED`** -- as GATE 5 in
+> `config/perlmutter/build_ffi_host.sh`.
 >
-> **Verified 2026-08-06: `411e257` is NOT an ancestor of `8789131`**
-> (`merge-base --is-ancestor`). So the failure described above is live *in
-> this branch* and the numbers above are this branch's numbers. One closure
-> hole survives the fix and is not in its scope:
-> `libhdf5_parallel_gnu.so.310` against the staged HDF5 1.12 — owned by the
-> phdf5 stage.
+> **Verified 2026-08-06 on `integration/2026-08-06`.** `411e257` is an
+> ancestor here (it arrives via `fix/host-ffi-hdf5-closure-2026-08-06`).
+> `readelf -d` on the rebuilt host `.so` shows **0** `fftw` `NEEDED` entries,
+> against **3** on the pre-fix library still staged in `lorrax_P`. In-container
+> Tier-1 host then reads **49 passed / 2 skipped / 1 failed** against the
+> 33/19/0 above; the 2 skips are the known SLATE `heev` L-2 pair and the 1
+> failure is `test_compute_wfns_fi_scalapack_matches_native_cpu`, the FFT cell
+> honestly reporting `mklfft: no FFTW3 engine in this process` because the
+> Shifter image ships no FFTW3. The library itself loads: ScaLAPACK, SLATE and
+> GEMM all pass.
 >
-> The earlier repair suggestion here — bind-mount `/opt/cray/pe` — is
+> **Read the launch geometry before comparing numbers.** Those counts require
+> **exactly one visible GPU**. With four GPUs visible (`lx run -G 4`), eight
+> SLATE/ScaLAPACK cells fail with `blas::get_device_count()=4 but JAX
+> one-process-per-GPU model requires exactly 1`, giving 41/2/9 -- a launch
+> artifact, not a regression. Measured both ways on this branch and on
+> `fix/host-ffi-hdf5-closure-2026-08-06`: identical in both trees.
+>
+> The closure hole that used to survive this fix is also closed:
+> `libhdf5_parallel_gnu.so.310` needs the **1.14.3.7** phdf5 stage
+> (`bbfa026`), not the 1.12 stage. `config/perlmutter/site_config.sh` now
+> defaults `LORRAX_FFI_PHDF5_DIR_DEFAULT` to
+> `$HOME/software/lorrax_phdf5_cray_1.14.3.7/stage`. **An installed modulefile
+> generated before 2026-08-06 still mounts the 1.12 stage**, and against that
+> stage the repaired `.so` fails to load with
+> `libhdf5_parallel_gnu.so.310: cannot open shared object file`. Re-run the
+> installer, or pass `LORRAX_FFI_PHDF5_DIR` explicitly.
+>
+> The earlier repair suggestion here -- bind-mount `/opt/cray/pe` -- is
 > withdrawn. It treats a load-time dependency that should not exist as a
 > mount problem, and `411e257` is the better shape.
 
