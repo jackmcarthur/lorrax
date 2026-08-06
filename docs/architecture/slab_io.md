@@ -5,6 +5,13 @@ container on Perlmutter, 2026-08-05/06 (allocation 56389339, 4 × A100-40G
 nodes). Where this page and older prose disagree, this page wins. Every
 number below names the command that produced it.*
 
+**This page owns SlabIO**: the tiers, the routing, the striping, the
+certification. It does not own the owner rulings behind them
+([`decisions.md`](decisions.md)), the native layer underneath
+([`ffi_layout.md`](ffi_layout.md)), or knob spellings
+([`../dev/env_vars.md`](../dev/env_vars.md)) — see the
+[register](../index.md#register).
+
 Conventions used here, same as [`services.md`](services.md):
 
 - **Level / imports.** `file_io.slab_io` is L3; it imports `ffi.io` lazily.
@@ -70,6 +77,20 @@ raise at parse time:
 |---|---|---|
 | `slab_io=auto`, both parallel tiers declined | selected, announced with the tier-1 reason and the note that the same config refuses at larger P | `_refuse_slab_io_no_parallel_writer` |
 | explicit `slab_io = h5py_allgather`, or deprecated `use_ffi_io = false` | honoured, announced | `_refuse_explicit_h5py_allgather` |
+
+Both refusals live in `gw/gw_config.py`, both always raise, and both sit
+*after* the whole precedence chain, so no deck branch escapes them.
+
+> **Scope of "raises at parse time": the DECK. Not the library.** Verified
+> 2026-08-06. `file_io/slab_io.py:88-90` still returns
+> `SlabIOBackend.H5PY_ALLGATHER` when `use_ffi_io is None`, at **any**
+> process count, and `:97-98` maps `use_ffi_io=False` the same way. Neither
+> path consults the process count, because neither goes through the deck
+> router. A caller constructing `SlabIO` directly — a test, a bench driver, a
+> notebook — therefore still reaches the tier above one process. The ruling
+> is implemented where decks are parsed; closing it at the library entry
+> point is open work, and until then "it refuses at P>1" is a statement about
+> configured runs only.
 
 The auto refusal names **which** of the two tier-1 probes declined and
 gives the repair *for that probe* — `probe_target`'s three states have
@@ -353,7 +374,7 @@ on each swept file returned exactly the requested count and size, so the
 | `LORRAX_PHDF5_COLLECTIVE_WRITES` | `1` | 29× cliff at N4 when off; the asymmetry decides |
 | `LORRAX_PHDF5_INDEPENDENT` (reads) | `0` (collective) | 1.84× at N4; read evidence is cache-warm, so no change on it |
 | `LORRAX_PHDF5_COLL_META` | `0` | within noise both geometries — keep the simpler one |
-| `LORRAX_PHDF5_STRIPE_COUNT` | `16` | 8 wins at N1 and loses at N4; 32 the reverse; 16 wins both |
+| `LORRAX_PHDF5_STRIPE_COUNT` | `16` | 8 wins at N1 and loses at N4; 32 the reverse; 16 wins both. **Superseded in principle, not yet in this branch** — see below |
 | `LORRAX_PHDF5_STRIPE_SIZE_FS` | `1M` | **changed from `4M`** — the only layout that wins at both geometries (see below) |
 | `LORRAX_PHDF5_ALIGN_MB` | `4` | unchanged; `4`/`1`/`0` all inside repeat noise, so not worth a second knob to keep in sync |
 | `LORRAX_PHDF5_CB_*` | unset | hand-set hints cost 30 % at N4 |
@@ -361,6 +382,25 @@ on each swept file returned exactly the requested count and size, so the
 
 Everything except the stripe size is the configuration that was already
 in the tree; the sweep is its measured justification rather than a change.
+
+> **A fixed stripe count of 16 is the wrong shape, and the replacement is
+> approved but NOT in this branch.** The reason 16 wins the sweep above is
+> that the sweep ran at 4 and 16 ranks. ROMIO sets
+> `cb_nodes = min(striping_factor, nranks)`, so **the stripe count IS the
+> aggregator count** — pinning it to 16 caps aggregation at 16 however many
+> ranks write, which is exactly backwards for a design envelope of hundreds.
+> The owner approved `stripe_count = nranks` on 2026-08-05.
+>
+> **Status, verified 2026-08-06:** it is implemented on
+> `feat/slab-io-stripe-nranks-2026-08-06` (`e5c9618`), which is **not an
+> ancestor of this branch**. There, `_stripe_policy(nranks)` clamps to
+> [4, 128], ramps the unit 1 → 4 MiB, and **refuses a negative count**
+> (a negative `striping_factor` means "every OST on the filesystem", the
+> maximum-contention layout). Note that even on that branch the policy is
+> Python-side only: `context.cc:463` is still the literal `"16"`.
+>
+> Until that lands, both sites in this branch default to 16 and the numbers
+> in the table above are the ones that apply.
 
 The stripe-size choice, across both geometries (GiB/s write / read):
 
@@ -512,18 +552,13 @@ and were run with the old manual
 
 **`ldd` on the login node lies about the MPI closure.** *Looks like:*
 `libmpi_gnu_91` and `libmpi_gnu_123` resolving to two distinct real files,
-i.e. an apparent two-MPI-ABI defect. **There is no such defect.**
-`libmpi_gnu_123.so.12` is a deliberate SONAME alias created by
-`src/ffi/cpp/stage/phdf5_stage_cray.sh`, pointing at Shifter's
-`/opt/udiImage/modules/mpich/libmpi.so.12`, so HDF5 and the FFI share one
-runtime. That alias lives under `/lorrax_phdf5/lib`, **which only exists
-inside the container**, and `LD_LIBRARY_PATH` puts it first there. On a
-login node the symlink dangles and `ldd` falls through to the system
-cray-mpich, manufacturing the appearance of two MPIs. This exact
-inspection produced a false defect report on 2026-08-05. *Rule: any claim
-about the library closure must be measured inside the container.* The
-in-container gate is `src/ffi/cpp/gate_one_mpi.sh` (one *mapped object*,
-not one version), run by both build legs.
+i.e. an apparent two-MPI-ABI defect. **There is no such defect** — the second
+name is a deliberate SONAME alias that only resolves inside the container.
+This inspection produced a false defect report on 2026-08-05, retracted
+2026-08-06. *Rule: any claim about the library closure must be measured
+inside the container, on a compute node.* Mechanism, the alias, and the
+`gate_one_mpi.sh` in-container gate: [`ffi_layout.md`](ffi_layout.md) §7c,
+which owns it.
 
 **Routing to `H5PY_ALLGATHER` at scale.** *Looks like:* a routing banner
 naming that tier, then a run that OOMs rank 0 or takes forever. See

@@ -16,6 +16,34 @@ re-learning (QUALITY_PATTERNS #8):
 > and for *debug switches*.  Where an env var still overrides an input
 > key, that override is DEPRECATED and prints loudly.
 
+## What this page is, and what it is not
+
+**This page owns four columns and nothing else: the SPELLING, the DEFAULT,
+the CLASS, and the PARSE GRAMMAR of every variable LORRAX reads.** Those four
+are what `tests/test_env_registry.py` enforces and what nothing else in the
+tree records.
+
+**It does not own the explanation.** Why collective writes are on, what the
+nvhpc stage selects, how the allocator changes what `memory_stats()` reports
+— each of those has an owner page, named in the
+[register](../index.md#register), and each row below links to it instead of
+repeating it. Rows that used to carry a paragraph of measurement now carry
+one sentence and a link.
+
+That is a deliberate reduction and it is the point. This page had grown to
+carry a second copy of `slab_io.md`'s tuning campaign, a second copy of
+`environment/overview.md`'s allocator table and a second copy of
+`mpi_collectives.md`'s transport argument. Three copies of a fact is three
+places for it to go stale, and it did: the `LORRAX_FFT_FFI` row still said
+the CPU engine was "MKL FFT (DFTI API)" five days after `DftiCreateDescriptor`
+was deleted from the translation unit.
+
+Parse grammar stays here in full, including the ugly parts, because a knob's
+grammar *is* its interface and there is nowhere else it is written down. Where
+two sites read one variable with two different parses, that is recorded in the
+[consistency audit](#consistency-audit) — a split parse is a defect this page
+is responsible for surfacing.
+
 ## How to read this page
 
 Three classes, in three sections:
@@ -165,8 +193,8 @@ wall time, and those carry their measured scope.
 | `LORRAX_GALERKIN_CHUNK_GIB` | `6` | htransform's Galerkin accumulation chunk budget (`bandstructure/htransform.py`).  Perf only. | |
 | `LORRAX_PPM_FIT_ARENA_GIB` | `8` | Temp-arena budget for the GN-PPM fit's q-chunk loop (`gw/minimax_screening.py::_gn_ppm_fit_q_block`).  Sizes `q_block` so `q_block · tile_bytes · _GN_PPM_FIT_LIVE_TILES` fits; `q_block ≥ nq` takes the untouched single-shot path.  Bit-exact by construction: the kernel is elementwise in q and its two reductions are exact integer counts, so chunking changes evaluation order/placement only.  Perf/memory only. | Arena 74.27 → 4.64 GiB at μ=24,933/P=64; gated bit-exact on the pinned Σ reference on the single-shot AND a forced `q_block=1` path (ladder notes R32/R33). |
 | `LORRAX_CENTROID_RANK_TOL` | `0.01` | Tolerance fraction for the centroid rank-shortfall HARD REFUSAL (`centroid/kmeans_cli.py`): after pivoted-Cholesky pruning, `rank < ceil((1−tol)·n_orbit_keep)` is FATAL — the candidate pool cannot supply the requested independent ISDF directions (the pre-2026-07-29 clamped prune window produced 630/897 silently; see `_resolve_sigma_window`).  Fail-closed; raising it is a deliberate, logged act.  Promotion candidate (it gates run acceptance). | b1024 rung: 630/897 (70.2%) refused; widened window: 897/897 passes (ladder notes R12). |
-| `LORRAX_FAILFAST` | `1` (on) | CLI failure propagation (`runtime/__init__.py::bootstrap`): an uncaught exception aborts the whole step instead of leaving P−1 ranks hanging (QUALITY_PATTERNS #7).  `0` disables.  `SystemExit(0)` (e.g. `LORRAX_EXIT_AFTER_ZETA`) stays a clean exit. | |
-| `LORRAX_MALLOC_TUNE` / `LORRAX_MALLOC_MMAP_MB` (`1`) / `LORRAX_MALLOC_TRIM_MB` (`128`) | on | glibc malloc tuning at bootstrap — the arena-retention cure (scorecard T).  `LORRAX_MALLOC_TUNE=0` disables. | RSS ramp root-caused + cured at 12×12/P=80 (T.2) |
+| `LORRAX_FAILFAST` | `1` (on) | **One variable, two mechanisms — this page carried them as two rows in two sections until 2026-08-06, which read as a default disagreement and was not one.** (a) CLI failure propagation in `runtime/__init__.py::bootstrap`: an uncaught exception aborts the whole step rather than leaving P−1 ranks in a collective (QUALITY_PATTERNS #7). (b) `install_failfast_excepthook`, **P>1 only**: a per-rank uncaught exception prints a rank-tagged banner and calls `os._exit(1)`, so the *job* fails instead of the peers hanging in a collective the dead rank never joins; no-op single-process. `0`/`off` disables both. `SystemExit(0)` (e.g. `LORRAX_EXIT_AFTER_ZETA`) stays a clean exit. | |
+| `LORRAX_MALLOC_TUNE` / `LORRAX_MALLOC_MMAP_MB` (`1`) / `LORRAX_MALLOC_TRIM_MB` (`128`) | on | glibc malloc tuning at bootstrap (`runtime/__init__.py:tune_glibc_malloc`): pins `M_MMAP_THRESHOLD`/`M_TRIM_THRESHOLD` so freed XLA:CPU transients return to the OS — the arena-retention cure (scorecard T), ≤4 % wall cost. `LORRAX_MALLOC_TUNE=0` disables. | RSS-∝-FLOPs ramp root-caused + cured at 12×12/P=80 (T.2); it had OOM'd the 1998c fits |
 | `LORRAX_MALLOC_TRIM` | `1` (on) | Per-r-chunk `malloc_trim` in the ζ-fit loop (`gw/isdf_fitting.py`); glibc-only, no-op elsewhere. | same (T.2) |
 | `LORRAX_BSE_MATVEC_OPT` | unset (→ none) | Comma-set of BSE stack-matvec strategy opts, `yhoist` \| `krep` (`bse/bse_stack_matvec.py::matvec_opts`).  An unknown token REFUSES rather than silently running the baseline under an optimised label.  Perf/collective-structure only, never numerics.  SCALING ENVELOPE (stated per the module comment, every time): `krep` replicates the Lanczos basis — `(max_iter+1)·n_flat·block·16` bytes on EVERY rank, 5.4 MB at n_flat=1024 but 525 MB at n_flat=1e5 — right for a small pair space, wrong for a large one; a dial, not a default. |
 | `LORRAX_FACE_TO_BATCH_ROUTE` | unset (→ `staged_reshard.DEFAULT_ROUTE`) | Which `common.staged_reshard` schedule performs the fH_q face→batch move (`bandstructure/bse_setup.py::resolve_reshard_route` — the ONE resolver; the `reshard_route` kwarg wins when the caller passes it).  Exists so the two routes can be A/B'd through the production `bse.exciton_bands` driver.  Movement only, value-identical.  An unrecognised token is ANNOUNCED (`*** LORRAX SANITY`) and the default runs — never silently. |
@@ -176,8 +204,6 @@ wall time, and those carry their measured scope.
 
 | var | default | effect |
 |---|---|---|
-| `LORRAX_FAILFAST` | `1` (on, P>1 only) | Uncaught per-rank exception → rank-tagged banner + `os._exit(1)` so the *job* fails instead of the peers hanging in a collective the dead rank never joins (`runtime/__init__.py:install_failfast_excepthook`). `0`/`off` disables. No-op single-process. |
-| `LORRAX_MALLOC_TUNE` | `1` (on) | Pins glibc `M_MMAP_THRESHOLD`/`M_TRIM_THRESHOLD` so freed XLA:CPU transients return to the OS (`runtime/__init__.py:tune_glibc_malloc`; workstream T: cures the RSS-∝-FLOPs ramp that OOM'd the 1998c fits, ≤4 % wall cost). `LORRAX_MALLOC_MMAP_MB` (`1`) / `LORRAX_MALLOC_TRIM_MB` (`128`) set the thresholds. `0` disables. |
 | `LORRAX_FFI_SO` | in-tree `src/ffi/cpp/build/liblorrax_ffi.so` | Path to the **CUDA** FFI library (`ffi/common/ffi_loader.py:96`). |
 | `LORRAX_FFI_HOST_SO` | in-tree `src/ffi/cpp/build_host/liblorrax_ffi_host.so` | Path to the **host** FFI library (`ffi_loader.py`, `_PLATFORMS["cpu"]`). The in-tree default is what `src/ffi/cpp/build_host.sh` produces; `config/frontera/build_ffi_host.sh` (the Frontera SLATE+ScaLAPACK build) writes `$LORRAX_FFI_STAGE_WTA/build_host/liblorrax_ffi_host.so` (default `$WORK/lorrax_ffi_wtA/build_host/…`) — point this variable there for that build. FFI dependency note: the linalg handlers call the ScaLAPACK API, which MKL supplies on Frontera and Cray LibSci elsewhere (`-DLORRAX_SCALAPACK_LIBRARIES` takes any vendor's link line); the GEMM handler below builds against any standard CBLAS — the batched `cblas_?gemm_batch` entry when the BLAS provides it, plain-GEMM loop otherwise, decided at RUN time and announced on first use (there is deliberately no configure-time probe). Works in principle with Intel MKL or Cray LibSci; **tested with Intel only so far**. |
 | `LORRAX_BANDS_GEMM_FFI` | unset (→ `on` — REQUIRED) | The `contract_bands_block_reshard` FFI GEMM dial (`common/contract_bands.py`, read at kernel-FACTORY time — consumers key their kernel caches on it). **REQUIRED since the 2026-08-01 ruling** (`docs/architecture/decisions.md`): unset/`1` = the vendor-BLAS host handler (`lorrax_mklblas_gemm_batch`); a missing/unloadable handler on a CPU mesh REFUSES at startup (`Gate.enforce`, wired into `runtime.initialize_communicator_stack`) and at the factory, naming `liblorrax_ffi_host.so` / `LORRAX_FFI_HOST_SO` / `docs/environment/overview.md` — never a silent demotion. The pre-ruling `auto` mode is DELETED; a stale `=auto` resolves to the default with an announced grammar note. `0` = explicit debug opt-OUT onto the retained native XLA einsum arm, announced once as UNCERTIFIED (the arm is retained because `extra="minor"` structurally cannot ride a batched GEMM — that order quietly keeps the XLA plan under every mode). On CUDA the dial does not exist (host symbol table only; XLA:GPU's dot lowering already dispatches cuBLAS — the required path there IS the native lowering; silent by declared design). PERFORMANCE PURPOSE: XLA:CPU lowers the LARGE right contraction through Eigen dots **1.6–1.9× below vendor BLAS at full threads**; the handler measured project_rs 29.4→19.6 s and sigma.exec 58.3→49.2 at nb=128/P=64 (jobs 7879008/7879010). **All four BLAS precisions served** — f64/f32/c128/c64 onto `cblas_{d,s,z,c}gemm[_batch]` (BSE fp32-GMRES c64 rides it); an unserveable dtype (f16/bf16/mismatched pair) REFUSES with the fix named. Perf only, value-level identical (1e-12 gate class, not bit-exact). |
@@ -188,10 +214,11 @@ wall time, and those carry their measured scope.
 | `LORRAX_GRAM_COL_BLOCK` | `""` (→ auto) | Column-block width for the pivoted-Cholesky Gram update (`centroid/pivoted_cholesky.py:819`).  Falsy tokens (`""`/`0`/`false`/`no`/`off`) select the auto policy (sized from `memory_per_device_gb`, floor 256); a positive integer pins (floor 256); anything else REFUSES naming the accepted grammar.  Perf/memory only. |
 | `LORRAX_FH_ORTHO_TOL` | `1e-6` | Cap for the `build_fH_R` ctilde-orthonormality HARD GATE (`bandstructure/htransform.py::resolve_fh_ortho_tol`): `max|C Cᴴ − I|` above the cap refuses, because fH's eigenvalues are then not f(ε) and on-grid energies are wrong by ≈9.0e3× the residual, silently.  `0` disables — only to reproduce a known-bad run.  Blank/unset → the default (a blank used to silently DISABLE the gate — fixed by the P1 audit); garbage REFUSES (`gw_config.env_float` refuse mode); a non-default value is announced. |
 | `LORRAX_SCALAPACK_ALLOW_SLATE_API` | off | C++ (`cpp/scalapack/blacs_grid.h:273`): waives the refusal against SLATE's `libslate_scalapack_api` overlay answering the pzheevd/pzgetrf-family symbols.  Standard boolean spellings, case-insensitive; a malformed value is announced and takes the SAFE direction (still refused).  See `SLATE_SCALAPACK_TARGET` in §5 for the overlay's own target demotion. |
-| `LORRAX_FFT_FFI` | unset (→ `on` — REQUIRED) | The flat-k FFT backend (`common/fft_helpers.make_flat_k_*` → `ffi/fft.py`; factory-time read, kernel caches key on it): MKL FFT (DFTI API) on cpu meshes, cuFFT strided on CUDA meshes — same target names, resolved per lowering platform. **REQUIRED since the 2026-08-01 ruling** (`docs/architecture/decisions.md`): the XLA flat-k twin inside `make_flat_k_fft` was DELETED, so `0` REFUSES (there is nothing to opt out to — recover the XLA arm from git history for a debugging build), and a missing/unloadable library refuses at startup naming the `.so` and `docs/environment/overview.md`. The handlers are c128-only (any other dtype refuses at trace time). **SCOPE — read this before assuming a subsystem is covered:** the dial reaches ONLY `make_flat_k_*` call sites, i.e. `gw/` + `bandstructure/htransform`. **BSE has no `make_flat_k_*` call site and is NOT affected on either platform** — its FFTs ride `fft_helpers.local_ifftn3`/`local_fftn3`, which are *aliases* of `jnp.fft.ifftn`/`fftn` (bit-identical, dtype-agnostic, shard_map-interior — no FFI route exists, and the ruling explicitly keeps them). |
+| `LORRAX_FFT_FFI` | unset (→ `on` — REQUIRED) | The flat-k FFT backend (`common/fft_helpers.make_flat_k_*` → `ffi/fft.py`; factory-time read, kernel caches key on it). **REQUIRED since the 2026-08-01 ruling**: `0` REFUSES — the XLA flat-k twin was deleted, so there is nothing to opt out to. c128-only; any other dtype refuses at trace time. **SCOPE:** the dial reaches ONLY `make_flat_k_*` call sites — `gw/` + `bandstructure/htransform`. **BSE has no `make_flat_k_*` call site and is NOT affected on either platform**; its FFTs ride `fft_helpers.local_ifftn3`/`local_fftn3`, aliases of `jnp.fft.ifftn`/`fftn` kept deliberately by the ruling. *Which engine answers is not this variable's business and is not recorded here — see `docs/architecture/ffi_layout.md` §3. This row previously said "MKL FFT (DFTI API) on cpu meshes", which has been false since 2026-08-05: `mklfft/fft_flat_k_ffi.cc` contains zero `DftiCreateDescriptor` calls and four `fftw_plan_many_dft`, and the engine is resolved by `dlsym` against whatever the `.so` links. Re-verified 2026-08-06.* |
 | `LORRAX_FFT_FFI_FUSED` | unset (→ `on`) | The fused IFFT·(G·W)·FFT τ-kernel entry (`gw/ppm_tau_kernel.py` → `make_flat_k_gw_conv`); independent of `LORRAX_FFT_FFI`. Default ON since 2026-08-01 (the certified production form). `0` is a real, announced opt-out onto the decomposed three-transform chain — which is itself FFI-served through the same required handlers, so this is a structural choice between two certified FFI forms, not a native-JAX fallback. |
 | `LORRAX_WFN_BACKEND` | `""` (→ config/auto) | Forces the WFN read backend: `eager` \| `phdf5` \| `phdf5_host` (`file_io/wfn_loader.py:277`). |
 | `ISDF_JAX_CACHE_DIR` | `$SCRATCH/lorrax_jax_cache`, else `$XDG_CACHE_HOME/isdf_jax_compilation` (→ `~/.cache/...`) | JAX persistent compile-cache dir (`common/jax_compile_cache.py:835-846`). Default chain is **$SCRATCH-first** (announced once, rank 0): a populated world size is several hundred small files (886 measured for a big deck), and the home-filesystem fallback eats the inode quota that locks a user out of the machine — with the cache on by default at every P, the safe location is the CODE's default, not a docstring plea (release audit 2026-07-28).  The no-`$SCRATCH` fallback announces the inode warning.  `""` (or whitespace-only) opts out entirely — **announced on rank 0 since AT** (the silent opt-out let harnesses keep exporting `""` for the pre-AH deadlock reason long after AH removed the deadlock). **Entries live in ONE shared `{base}/np{P}/` per world size and the cache is ON at every P** (scorecard AH). It used to be refused at `process_count() > 1` because the old per-rank `rank{i}/` layout combined with JAX's process-0-only write (`jax/_src/compiler.py::_cache_write`) guaranteed a divergent hit/miss pattern, and XLA:GPU compilation is a collective (`xla::gpu::AutotunerPass` → `MultiProcessKeyValueStore` → `CoordinationServiceAgent::GetKeyValue`) → permanent silent hang (scorecard AG). AH replaces the refusal with a real fix: a process-invariant cache key, a coordination-service agreement on the usable entry set taken before any compile, atomic writes, and JAX's rank-asymmetric XLA sub-caches disabled. |
+| ⚠ **the whole `LORRAX_JAX_CACHE_*` family, on the GPU leg** | — | **Currently inert at P=1 and the failure is silent.** Measured 2026-08-06: with `ISDF_JAX_CACHE_DIR` unset, JAX's native cache works and writes entries; with LORRAX's patch armed, `enabled` reports `True` and **zero entries are written**. Not the container — the native path works in the same image. Every row in this family below describes a design that is currently reaching the **CPU leg only**; read them that way until it is fixed. `docs/environment/overview.md` §2 carries the finding. |
 | `LORRAX_JAX_CACHE_MULTIPROCESS` | `1` (**on** — was `0`) | Historically the escape hatch that "re-armed the deadlock"; now the DEFAULT path. Set it to `0` to restore the scorecard-AG refusal (no persistent cache at all when P > 1) if you ever need to bisect against it (`common/jax_compile_cache.py`). |
 | `LORRAX_JAX_CACHE_INVARIANT_KEY` | `1` (on, P>1 only) | Makes jax's persistent-cache key process-invariant (forces the GPU-only device-assignment strip on every platform and canonicalises the accelerator-config hash). MEASURED without it (4 CPU ranks): rank 0 hits 7/7 while ranks 1-3 hit 0/7 and compile — which is the AG divergence, so `0` does not merely lose the win, it switches the cache OFF at P > 1 rather than let process 0 hit alone. The per-rank component is `accelerator_config` (the serialized topology), not the device assignment. |
 | `LORRAX_JAX_CACHE_AGREE_TIMEOUT_S` | `300` | Timeout for the P>1 hit/miss agreement. On expiry the run degrades to cache-off with a printed reason; it never hangs. |
@@ -202,15 +229,17 @@ wall time, and those carry their measured scope.
 | `LORRAX_JAX_CACHE_PREFETCH` | `1` (on, P>1) | After the agreement, pulls the agreed entries into the page cache from a thread pool. Cache entries are tiny (876 kB for 140 of them) so reading them is pure per-file Lustre latency: measured **29 s serial** at 606c/P=16, against ~4.5 s of XLA compile saved — without this the cache is a net loss on a cold-read CPU run. `LORRAX_JAX_CACHE_PREFETCH_THREADS` (16) sets the pool size. |
 | `LORRAX_MINIMAX_CACHE_DIR` | package dir | Where minimax grid tables are cached (`gw/minimax_screening.py:69`). |
 | `LORRAX_DISABLE_MINIMAX_DISK_CACHE` | `""` (off) | Disables that disk cache (`minimax_screening.py:67`). |
-| `LORRAX_PHDF5_STRIPE_COUNT` | `16` | Lustre stripe count. Read at 4 sites (`_slab_io_ffi.py`, `_slab_io_mpi_host.py`, `isdf_fitting.py`, C++ `context.cc`) — all `'16'`, consistent. |
-| `LORRAX_PHDF5_STRIPE_SIZE_FS` | `1M` | Lustre stripe size in the `lfs setstripe -S` spelling. **Default changed `4M`→`1M` 2026-08-05, MEASURED on Perlmutter/`/pscratch` at 2.000 GiB C128** (job 56389339): 16×1M gave 0.818/2.29 GiB/s write/read at 1 node/4 ranks and 2.93/4.74 at 4 nodes/16 ranks, against 0.654/1.30 and 2.07/3.23 for 16×4M. 16×2M is faster still at 4 nodes (3.12/5.06) and the *worst* measured at 1 node (0.626/1.30), so 1M is taken as the only layout that wins at both — see `docs/architecture/slab_io.md`. Now read at 2 live Python sites (`_slab_io_mpi_host.py`, and `_slab_io_ffi.py` for the count sibling) plus C++ `context.cc`; `isdf_fitting.py` no longer reads it. Was 4 sites since workstream AW — previously the C++ writer read only the undocumented byte-valued `LORRAX_PHDF5_STRIPE_SIZE`, so THE documented knob silently did not reach the `PHDF5_FFI` writer (the default CPU route since AM). The byte spelling still works as a C++-side legacy fallback. |
+| `LORRAX_PHDF5_STRIPE_COUNT` | `16` | Lustre stripe count. **Read at exactly 2 sites** (re-counted 2026-08-06): `_slab_io_ffi.py:59-79` (`_stripe_count()`, which `_slab_io_mpi_host.py` *imports* rather than re-reading) and C++ `context.cc:462`. This row previously claimed 4 sites and the consistency table claimed 3; `gw/isdf_fitting.py` contains no `LORRAX_PHDF5` reference at all. **The two sites do NOT agree on parse**: Python refuses loudly on a non-integer, C++ passes the string to `MPI_Info_set("striping_factor", …)` uninterpreted, with no validation. A stripe count of `sixteen` is a loud error in one writer and a silently-ignored hint in the other. Python also passes a *negative* value straight through — and a negative `striping_factor` means "every OST on the filesystem", the maximum-contention layout. |
+| `LORRAX_PHDF5_STRIPE_SIZE_FS` | `1M` | Lustre stripe size, in the `lfs setstripe -S` spelling. Changed `4M`→`1M` on 2026-08-05; the measurements that chose it belong to `docs/architecture/slab_io.md` §Tuning and are not repeated here. Read at `_slab_io_mpi_host.py:122` and C++ `context.cc:464`. The undocumented byte-valued `LORRAX_PHDF5_STRIPE_SIZE` still works as a C++-side legacy fallback. ⚠ **Three stale copies of the old `4M` default survive in source comments and sibling docs** — `context.cc:15`, `src/ffi/phdf5/ARCHITECTURE.md:316`, `src/ffi/PORTING.md:535` — while the code on both sides uses 1 MiB. Found 2026-08-06; those files are owned elsewhere, so this is reported, not edited. |
 | `LORRAX_PHDF5_MPI_STACK` | `mpich` | Build+launch: which MPI the phdf5 FFI links/loads (`run_shifter.sh:42`). |
 | `LORRAX_PHDF5_ALIGN_MB` | `4` | C++: `H5Pset_alignment` threshold, MiB; `0` disables. Deliberately NOT tied to `STRIPE_SIZE_FS` (it was justified that way when both were 4M). MEASURED non-load-bearing at 16×1M striping, job 56389339: `4`/`1`/`0` gave 0.830/0.809/0.813 GiB/s write at 1 node and 2.975/2.883/2.915 at 4 nodes — all inside the ±1.5 % repeat noise. Left at 4 rather than becoming a second knob to keep in sync. |
 | `LORRAX_PHDF5_COLL_META` | `0` | C++: `1` re-enables collective metadata ops (default off is faster). |
-| `LORRAX_PHDF5_CB_NODES` / `LORRAX_PHDF5_CB_PER_NODE` / `LORRAX_PHDF5_CB_BUFFER_SIZE` / `LORRAX_PHDF5_CB_WRITE` / `LORRAX_PHDF5_DS_WRITE` | unset (→ ROMIO auto) | ROMIO collective-buffering pass-throughs, forwarded VERBATIM by **both** writers when non-empty; unset means ROMIO's automatic policy in both (unified by AW). The C++ writer used to FORCE Perlmutter-era defaults (`romio_cb_write=enable`, `romio_ds_write=disable`, `cb_buffer_size=64M`, `cb_nodes=world_size`); on Frontera forcing `romio_cb_write=enable` measured *slower* than ROMIO auto (wk_AI: 1826 vs 2066 MB/s) and the rest were never revalidated off Perlmutter. Keep them unset; they exist as A/B levers. |
+| `LORRAX_PHDF5_CB_NODES` / `LORRAX_PHDF5_CB_PER_NODE` / `LORRAX_PHDF5_CB_BUFFER_SIZE` / `LORRAX_PHDF5_CB_WRITE` / `LORRAX_PHDF5_DS_WRITE` | unset (→ ROMIO auto) | ROMIO collective-buffering pass-throughs; unset means ROMIO's automatic policy in both writers (unified by AW). **Corrected 2026-08-06 — "forwarded VERBATIM by both writers" was wrong twice.** (a) `LORRAX_PHDF5_CB_PER_NODE` is **C++-only**: the Python writer's forwarding loop (`_slab_io_mpi_host.py:173-181`) covers `CB_WRITE`/`DS_WRITE`/`CB_NODES`/`CB_BUFFER_SIZE` and not this one. (b) It is **not verbatim** even in C++ — `context.cc:423-427` rewrites it as `cb_config_list = "*:" + value`. The other four are genuinely verbatim in both. The C++ writer used to FORCE Perlmutter-era defaults (`romio_cb_write=enable`, `romio_ds_write=disable`, `cb_buffer_size=64M`, `cb_nodes=world_size`); on Frontera forcing `romio_cb_write=enable` measured *slower* than ROMIO auto (wk_AI: 1826 vs 2066 MB/s) and the rest were never revalidated off Perlmutter. Keep them unset; they exist as A/B levers. |
 | `LORRAX_PHDF5_INDEPENDENT` | off | Independent instead of collective MPI-IO **reads** (C++). |
 | `LORRAX_PHDF5_COLLECTIVE_WRITES` | `1` (on) | Collective (two-phase) MPI-IO for the bulk **writes**, in BOTH writers (C++ `ffi/cpp/phdf5/context.cc:env_flag` and the Python `phdf5_host` writer `file_io/_slab_io_mpi_host.py:_env_flag` — one shared boolean grammar since the fix/zq audit; word spellings like `false` used to flip only the Python writer).  Default flipped 0→1 on this branch, MEASURED (wk_AI microbench, production tile geometry): `V_qmunu`'s strided 2-D tile decomposes into 4.1 M × 3.2 kB independent writes at P=144 (scorecard AF.4c's 1.7 MB/s), vs a few large aggregated writes per ROMIO aggregator under `H5FD_MPIO_COLLECTIVE` — ~3 orders of magnitude on the same transport.  `0` restores independent writes (pre-AI behaviour).  Cray caution: the `ad_cray_write_coll.c` OOM at ≥1 GB/rank aggregates predates this default — recorded in context.cc; not reproduced at 512 MiB/rank in the 2026-08-05 Perlmutter campaign. **Perlmutter revalidation done** (job 56389339): keep `1`. Independent writes are not uniformly slower — at 16×1M striping they measured 2.927 GiB/s at 4 nodes and 0.915 at 1 node, level with collective — but at 16×4M striping they collapsed to **0.068 GiB/s at 4 nodes**, a 43× spread across one unrelated knob. Collective never varied more than ~10 % from the best at its geometry. The default is chosen for bounded worst case, not mean throughput; see `docs/architecture/slab_io.md`. |
 | `LORRAX_PHDF5_DEDUP_REPLICAS` | `1` (on) | One canonical writer per distinct hyperslab when a mesh axis is replicated (both writers).  `0` lets every replica rank write its identical copy — merely wasteful under independent MPI-IO, **undefined behaviour** (overlapping selections) under collective MPI-IO.  Debug-only off. |
+| `LORRAX_PHDF5_REQUIRE_MPI_WORLD` | **`1` (require)** | **Added to this doc 2026-08-06; it was an undocumented fail-closed run gate.** `_slab_io_ffi.py:266`. At the first collective PHDF5_FFI open the backend asks MPI for `MPI_Comm_size(MPI_COMM_WORLD)` and compares it to `jax.process_count()`. A mismatch always refuses. This knob controls only the *unprobeable* case: `1` makes "could not determine the MPI world" a refusal, `0` downgrades it to a warning. Why it matters: `ffi.io.open_file` and `shard_index.h::validate_shard_encoding` both compare JAX to JAX and agree, so without this probe a PMI-flavour mismatch gives every rank a private singleton `MPI_COMM_WORLD` and 16 unsynchronised writers on one file — measured at job 56389339, bit-exact readback with rc=0 and no warning anywhere. **Grammar note: this is a falsy-set test** (`not in ("0","false","no","off")`), the inverse of the `_env_flag` truthy-set used by its neighbours. |
+| `LORRAX_PHDF5_SKIP_MPI_WORLD_CHECK` | off | **Added 2026-08-06; previously undocumented.** `_slab_io_ffi.py:262` — early-returns from `_assert_mpi_world`, disabling the guard above entirely. Debugging escape hatch, **never a remedy**: it removes the only check that distinguishes a genuine Cray collective-buffer OOM from a PMI-mismatched launch. **Grammar defect: no `.lower()`**, so `=TRUE` and `=On` do NOT enable it, unlike every neighbouring knob. |
 | `LORRAX_SCALAPACK_MKL_THREADS` | unset (→ `auto` = cap 4) | MKL team size pinned (thread-locally) inside the ScaLAPACK FFI handlers (`eigh`, `solve_lu`). MEASURED (wk_ENV AW, pz_bench n=2448, mlx): at the production 12×12 grid pzheevd is **11.28 s/q at 14 MKL threads vs 0.463 s/q at 4** (24×); 17.0 s/q oversubscribed at 28; 8×8 at the production 2×28 placement shows the same cliff; 4×4 (P=16) is flat. `auto`/unset caps the calling thread's MKL team at 4 (only when the global setting is larger); `off`/`0` restores the pre-AW behaviour (handler inherits `MKL_NUM_THREADS`, i.e. 28 in production — do not do this at P ≥ 64); an integer pins exactly that. The global `MKL_NUM_THREADS=28` stays right for the local `zheevd_` plan-A route and is untouched.  Values are case-insensitive since the fix/zq audit, and an UNRECOGNIZED value announces loudly on stderr and falls back to `auto` — it used to fall through `atoi()` to `off`, silently restoring the 24× configuration. |
 | `LORRAX_FORCE_REFIT` | `""` (off) | `1` (or any standard truthy value: `true`/`yes`/`on`, case-insensitive — `gw_config.env_bool` since P1.3; unknown tokens announce) forces the ζ fit even when `tmp/zeta_q.h5` is complete and its provenance matches (`gw_init.py`).  Ops escape hatch for the ζ-reuse cache (the reuse gate itself is provenance-checked). |
 | `LORRAX_ALLOW_PARTIAL_ZETA` | `0` | Permits reading a ζ file whose `zeta_is_done` flag is unset (`file_io/zeta_loader.py`).  Forensics-only: a half-written ζ is otherwise indistinguishable from a complete one (QUALITY_PATTERNS #7). |
@@ -256,10 +285,17 @@ observability failures) — cheap keeps, not clutter.
 | `LORRAX_FFI_PROFILE` | off | C++: per-call FFI timing. |
 | `LORRAX_SCALAPACK_EIGH_LOG` | unset (presence-test) | C++ `cpp/scalapack/eigh_ffi.cc`: prints the pzheevd workspace sizes (lwork/lrwork/liwork, GiB) once per call — the workspace is malloc'd outside XLA and invisible to the JAX-side memory planner. |
 | `LORRAX_MKLBLAS_LOG` | unset (presence-test) | C++ `cpp/mklblas/gemm_batch_ffi.cc`: one stderr line on the first GEMM-handler call (dtype, batch/M/N/K, threads, batched-entry vs plain-loop path). |
-| `LORRAX_PHDF5_TIME` / `LORRAX_PHDF5_WRITE_DEBUG` / `LORRAX_PHDF5_DUMP_HINTS` | off | C++-side phdf5 diagnostics.  (`_SKIP_DESTROY` and `_NO_COLL_META` were listed here historically but NOTHING reads them — `_NO_COLL_META`'s live replacement is `LORRAX_PHDF5_COLL_META` in §2b, `_SKIP_DESTROY` survives only as ARCHITECTURE.md prose; dropped by the fix/zq audit.) |
+| `LORRAX_PHDF5_TIME` | off | C++ `read_ffi.cc:475` **and** `:821` (two independent sites, same expression): `std::getenv(...) != nullptr` — a **PURE PRESENCE TEST**, so `LORRAX_PHDF5_TIME=0` turns per-phase timing **ON**. This is a live instance of exactly the defect the `LORRAX_MEM_DEBUG` warning box in §"consistency audit" is about; `_MEM_DEBUG` was converted and `_TIME` was not. Unset it, do not set it to `0`. |
+| `LORRAX_PHDF5_WRITE_DEBUG` | off | C++ `write_ffi.cc:137-138`: non-empty **and not exactly `"0"`**, so `=false` / `=off` / `=no` all ENABLE it. A third grammar again. |
+| `LORRAX_PHDF5_DUMP_HINTS` | off | C++ `context.cc:544`: full `env_flag` (the canonical `1/true/yes/on` set), rank 0 only. The only one of the three with the shared grammar. |
+
+The three rows above were a single row reading "off — C++-side phdf5
+diagnostics" until 2026-08-06. They have **three different parses**, one of
+which inverts on `=0`. (`_SKIP_DESTROY` and `_NO_COLL_META` were listed here
+historically but NOTHING reads them — `_NO_COLL_META`'s live replacement is
+`LORRAX_PHDF5_COLL_META` in §2b, `_SKIP_DESTROY` survives only as
+ARCHITECTURE.md prose; dropped by the fix/zq audit.)
 | `LORRAX_LU_DEBUG` / `LORRAX_LU_NO_PIVOT` / `LORRAX_LU_DEBUG_DUMP` | off | cuSOLVERMp LU diagnostics. |
-| `LORRAX_JAX_CACHE_EXPLAIN` | `0` | Turns on `jax_explain_cache_misses` logging. |
-| `LORRAX_JAX_CACHE_FORCE_DIVERGE` / `LORRAX_JAX_CACHE_NO_AGREE` | `0` | Compile-cache TEST HOOKS: positive control / the deadlock reproducer.  Never in production. |
 | `KP2_DEBUG` / `STERN_DEBUG` | unset / `0` | Sternheimer debug (`psp/run_sternheimer.py`, `solvers/sternheimer_solve.py`). |
 | `PF_ARTIFACTS_DIR` / `ISDF_JAX_PROFILE_DIR` | `profile` / unset | Trace output dirs (`common/jax_profile.py`, `tests/bench/test_bse.py`). |
 | `ISDF_COHSEX_TEST_PLATFORM` | `auto` | Test harness: force `cpu`/`gpu` for the e2e gates (`tests/harness.py`). |
@@ -274,7 +310,11 @@ Never by the running Python; setting them in a job script does nothing.
 `LORRAX_IMAGE`, `LORRAX_SIF`, `LORRAX_SHIFTER*`, `LORRAX_MODULE*`,
 `LORRAX_FFI_STAGE*`, `LORRAX_FFI_BUILD_DIR`, `LORRAX_FFI_SOURCES`,
 `LORRAX_FFI_HOST_*`, `LORRAX_FFI_IMAGE`, `LORRAX_FFI_PYTHON`,
-`LORRAX_FFI_NO_CUDA`, `LORRAX_FFI_HAVE_{PHDF5,CAL,CUBLASMP}`,
+`LORRAX_FFI_NO_CUDA`, `LORRAX_FFI_HAVE_{PHDF5,CAL,CUBLASMP,CUFFT}`,
+`LORRAX_FFI_PLATFORM`, `LORRAX_HOST_HAVE_{FFTW3,SCALAPACK}`,
+`LORRAX_CBLAS_{DIR,INCLUDE_DIR,LIBRARY}`,
+`LORRAX_FFTW3_{INCLUDE_DIR,LIBRARY}`,
+`LORRAX_MKL_{BLACS,THREAD_LIB,SCALAPACK_LIBRARY}`,
 `LORRAX_FFI_ALLOW_DEFAULT_MPI`, `LORRAX_FFI_{PHDF5,SLATE,NVHPC}_DIR*`,
 `LORRAX_XLA_FFI_INCLUDE_DIR`, `LORRAX_XLA_FFI_HEADERS_DIR`,
 `LORRAX_HDF5_ROOT`, `LORRAX_MPI_INCLUDE_DIR`, `LORRAX_MPICH_LIB_DIR`,
@@ -291,12 +331,46 @@ Never by the running Python; setting them in a job script does nothing.
 `LORRAX_GPUS_PER_NODE`, `LORRAX_SELECT_GPU`, `LORRAX_TIER2_WORKDIR`,
 `LORRAX_INPUT`.
 
+### 4a. Perlmutter launch + site config (added 2026-08-06)
+
+Everything above §4 is Frontera-shaped. These were in source and in **no**
+section of this page. Audited against `lorrax_P` @ `886139f`; the Frontera
+tree at `b61c1df` does not have the first four at all.
+
+| var | default | meaning |
+|---|---|---|
+| `LORRAX_NVHPC_SUBPATH` | `0.7.2_cuda12.9/math_libs/12.9/lib64` (`run_shifter.sh:171`) | The single source of truth for which cuSOLVERMp stage a run loads. ⚠ **It selects a communication path, not just a version, and every stage exports the same SONAME so a mismatch links cleanly and warns about nothing.** That is the whole of what this registry says about it; the stage/comm-path table, the CMake-default skew and the measured evidence are owned by **`docs/architecture/ffi_layout.md` §4** — read it before touching the CUDA leg. |
+| `LORRAX_NVHPC_ROOT` / `LORRAX_NVHPC_MOUNT` | no default — **`build.sh:54-91` REFUSES** | The stage the `.so` is COMPILED against, and the bind-mount point (`/lorrax_nvhpc`). Refuses rather than guessing, because there is no safe default: a guess picks a comm path silently. |
+| `LORRAX_PLATFORM` | `gpu` (`run_shifter.sh:55-63`) | `gpu` \| `cpu`/`host`. Decides `MPICH_GPU_SUPPORT_ENABLED` for the Shifter launch — it is per platform, not a constant; on the CPU leg it must be 0 or Cray MPICH aborts in `MPI_Init_thread`. |
+| `LORRAX_MPICH_GPU_SUPPORT` | derived from the above (`run_shifter.sh:70`) | Explicit `0\|1` override; anything else refuses. Carried under a `LORRAX_` name because shifter's mpich module **unsets** `MPICH_GPU_SUPPORT_ENABLED` itself, so `in_container.sh` re-derives on the far side of that boundary. |
+| `LORRAX_GATE_ONE_MPI` | `on` (`cpp/gate_one_mpi.sh:41`) | The "exactly one MPI implementation in this address space" gate (hazard S3). `=off` disables it and says so loudly on every run. |
+| `LORRAX_RUN_DIR` | no default — **mandatory** (`config/frontera/templates/gw_dev.sbatch:44`) | The run directory holding the input deck. A peer of `LORRAX_ROOT`/`LORRAX_INPUT`, which were listed while this was not. |
+| `LORRAX_PM_{PRGENV,CMAKE,FFTW,HDF5,HDF5_DIR,LIBSCI,LIBSCI_DIR,LIBSCI_FLAVOUR,MPICH_DIR}` | per `config/perlmutter/site_config.sh` | The Perlmutter module/prefix family: PrgEnv, cmake, cray-fftw, cray-hdf5 (+ dir), cray-libsci (+ dir, + flavour) and cray-mpich dir. Consumed by `config/perlmutter/build_ffi_host.sh`. |
+| `LORRAX_FFI_{NVHPC,PHDF5,SLATE}_HOST` | `config/modulefiles/lorrax/0.1.0.lua:210-212` | Host-side counterparts of the `_DIR*` knobs above; not matched by this page's `_DIR*` globs. |
+| `LORRAX_BUILD_JOBS` | `8` (`config/perlmutter/build_ffi_host.sh:246`) | `cmake --build --parallel N`. |
+| `LORRAX_MPICH_CONTAINER_DIR` | `/opt/udiImage/modules/mpich` | In-container MPICH module dir, substituted into the modulefile. |
+| `LORRAX_SLATE_{SRC,SCALAPACK_API_DIR}`, `LORRAX_SAPI_EXTRA_INCLUDES` | see `cpp/stage/slate_build_scalapack_api.sh:46,57,90` | SLATE ScaLAPACK-API overlay build: source tree (mandatory, `:?`), output prefix, extra `-I` flags when `nvcc` is not in the expected layout. |
+| `LORRAX_{PY,VENV_DIR,SRC_DIR}`, `LORRAX_OVERLAY_BUILD_DIR`, `LORRAX_MPIWRAPPER_SO`, `LORRAX_SLATE_HOST_LIB`, `LORRAX_MKL_LIB` | `config/frontera/stage_runtime.sh`, `build_mpi_overlay.sh`, `templates/gw_dev.sbatch` | Frontera staging outputs and link-line paths; peers of the already-listed `LORRAX_STAGED`/`LORRAX_OVERLAY_DIR`. `LORRAX_MPIWRAPPER_SO` is the variable behind the `MPITRAMPOLINE_LIB` row in §5, which named the path but never the variable. |
+
 `LORRAX_CUDA_CHECK` and `LORRAX_LIB_CHECK` are **C macros**, not env
 vars — the earlier grep-based counts were misleading.  So are
-`LORRAX_CUSOLVERMP_CHECK` (`cpp/cusolvermp` error-check macro) and
+`LORRAX_CFG_STR` / `LORRAX_CFG_STR2`
+(`cpp/common/build_config.cc:16-17`, the two-level stringification macro
+pair) and the whole `LORRAX_CFG_*` family, which are CMake vars configured
+into `lorrax_config.h` rather than anything the environment can set; and so
+are `LORRAX_CUSOLVERMP_CHECK` (`cpp/cusolvermp` error-check macro) and
 `LORRAX_CUBLASMP_CHECK` (`cpp/cublasmp/batched_gemm_ffi.cc:44`), which
 this list used to carry as if they were the STAGE/PIN staging knobs'
 siblings (P1 audit, 2026-07-31).
+
+Likewise **not variables**, and excluded on purpose so a future grep-based
+diff does not re-add them: `LORRAX_ISSUES` (a substring of the filename
+`KNOWN_LORRAX_ISSUES.md`), `LORRAX_SC_` / `LORRAX_JAX_CACHE_` /
+`LORRAX_SLURM_` / `LORRAX_PHDF5_` / `LORRAX_FFI_` (prefix fragments from
+prose globs and `startswith()` scans, whose real members are all listed
+elsewhere on this page), and the `LORRAX_TEST_*` / `LORRAX_FAKE_*` /
+`LORRAX_PAIR_*` / `LORRAX_T_*` family, which are string literals inside
+`tests/test_env_registry.py` and `tests/test_env_grammar.py`.
 
 Two entries removed from the list above, with reasons (P1 audit):
 
@@ -310,7 +384,7 @@ Two entries removed from the list above, with reasons (P1 audit):
   Recorded here so the name stays reserved; do not add an in-repo reader
   without moving the row to a live section.
 
-### 4a. Launch/staging scripts (read at job-launch time, not by Python)
+### 4b. Launch/staging scripts (read at job-launch time, not by Python)
 
 Read by `config/frontera/stage_runtime.sh` /
 `build_cpu_runtime_bundle.sh` / `build_mpiwrapper.sh` /
@@ -348,7 +422,8 @@ them inside the running Python does nothing.
 | `FI_PROVIDER` | not read by LORRAX.  On Frontera CLX **leave it UNSET** — Intel MPI then auto-selects `mlx`: 1.07 µs / 11.4 GB/s vs the old `FI_PROVIDER=tcp` pin's 10.9 µs / 2.15 GB/s, and pzheevd n=2448 at P=144 goes 12 s/q → 0.5–0.9 s/q (AP.3/AP.4; reproduced in-container by AS.2).  Keep `I_MPI_DEBUG≥4` so rank 0 announces `libfabric provider:`; do NOT trust `fi_info`, which reports −61 for `mlx` even where it works.  In-container: apptainer's default mount already exposes the host `/dev` (uverbs included) — **never `--bind /dev[/...]`** (a nosuid,nodev shadow copy breaks every device open, AS.1); stage the RDMA userspace via the `/hostlibs` symlink pattern (AS.1 / wk_AS `as_inner.sh`), or the provider falls back to tcp, announced. |
 | `CUDA_VISIBLE_DEVICES` | read to derive `local_device_ids`; `tests/conftest.py` rewrites it per xdist worker. |
 | `_LORRAX_JAX_DISTRIBUTED_DONE` | LORRAX's own idempotency sentinel for `jax.distributed.initialize` — env-scoped on purpose, so it survives module re-imports.  Self-set, not a user knob.  (`_LORRAX_GLOO_PIN_DONE` went with the Gloo interface pin.) |
-| `XLA_PYTHON_CLIENT_ALLOCATOR`, `TF_GPU_ALLOCATOR`, `XLA_PYTHON_CLIENT_PREALLOCATE`, `XLA_CLIENT_MEM_FRACTION` (current spelling) / `XLA_PYTHON_CLIENT_MEM_FRACTION` (deprecated) | **The "Not an inconsistency" verdict this row used to carry was wrong on all three of its claims** (2026-07-30, jobs 7882442/7882447/7882468).  Corrected: (1) `PREALLOCATE=false` is `setdefault` in **`runtime.set_default_env()`**, so every driver inherits it — `psp/get_DFT_mtxels.py` keeps a copy only because it is also a standalone CLI that never calls `bootstrap()`.  (2) `ALLOCATOR` is `setdefault` **nowhere** in `src/`; it is deliberately left unset (= BFC, the only kind that keeps `memory_stats()` populated).  `config/frontera/ffi_env.sh` `export`s `cuda_async` because it is the one file that also sets the sm_75 command-buffer `XLA_FLAGS` that allocator needs.  `runtime._check_allocator_env()` now *validates* a caller-supplied value and *removes* a blank one — a WRITE, not a read.  (3) it is **`platform`**, not `cuda_async`, that under-reports: `platform` is plain `cudaMalloc` and gives `bytes_limit=0`/`peak_bytes_in_use=0`; `cuda_async` is cudaMallocAsync and keeps `peak_bytes_in_use`.  `TF_GPU_ALLOCATOR` is a TensorFlow variable, **inert for JAX**, and has been deleted from every table that listed it.  The fraction is read new-spelling-first (`runtime/xla_memory.py:194`: `XLA_CLIENT_MEM_FRACTION`, then the deprecated `XLA_PYTHON_CLIENT_MEM_FRACTION`, flagged deprecated in the startup report) — the same precedence jaxlib's `generate_pjrt_gpu_plugin_options` applies.  Full table: `docs/environment/overview.md` §2.1. |
+| `XLA_PYTHON_CLIENT_ALLOCATOR`, `XLA_PYTHON_CLIENT_PREALLOCATE`, `XLA_CLIENT_MEM_FRACTION` (current spelling) / `XLA_PYTHON_CLIENT_MEM_FRACTION` (deprecated) | Registry facts only; **what the three allocators do, and which of them keeps `memory_stats()` alive, is owned by `docs/environment/overview.md` §2.1** and is no longer duplicated here. `PREALLOCATE=false` is `setdefault` in `runtime.set_default_env()`, so every driver inherits it (`psp/get_DFT_mtxels.py` keeps its own copy only because it is a standalone CLI that never calls `bootstrap()`). `ALLOCATOR` is `setdefault` **nowhere** in `src/` — deliberately left unset; `runtime._check_allocator_env()` *validates* a caller-supplied value and *removes* a blank one, which is a WRITE, not a read. The fraction is read new-spelling-first (`runtime/xla_memory.py:194`), matching jaxlib's own `generate_pjrt_gpu_plugin_options` precedence, with the deprecated spelling flagged in the startup report. |
+| `TF_GPU_ALLOCATOR` | **Not a LORRAX variable and inert for JAX.** Listed only so a future grep-based diff does not re-add it: it is a TensorFlow knob, measured byte-identical with and without (job 7882442), and has no writer anywhere in `src/`. |
 | `SLATE_SCALAPACK_TARGET` | SLATE's OWN dial, read by its ScaLAPACK-compat shim (`scalapack_slate.hh:170-188`), surfaced here because `blacs_grid.h:305` reads it to ANNOUNCE the demotion it controls: unset defaults to `HostTask`, so a SLATE built `gpu_backend=cuda` still runs on the **CPU** unless it is set to `devices`.  Only meaningful with `LORRAX_SCALAPACK_ALLOW_SLATE_API` (§2b). |
 | `XDG_CACHE_HOME` | base for the JAX compile cache. |
 | `HDF5_USE_FILE_LOCKING` | `setdefault "FALSE"` in one psp test; exported `FALSE` by every production harness. AUDITED (AW, 2026-07-27): **not load-bearing on Frontera `/scratch2`** — the mount has real `flock`, and a full 785c/P=16 e2e with the variable UNSET (HDF5 default locking) ran rc=0 with all four eqp/sigma files bit-identical (`run_800c_awlock`). The MPI-IO VFD takes no POSIX locks at all, so the variable only ever governs the serial-h5py side paths (eager reads, deferred attrs, `_introspect_dataset`). KEEP the harness export anyway: `/work2` mounts `localflock` (locks are node-LOCAL — cross-node "locking" there is silently incoherent, so honest intent is to disable), and h5py wheel HDF5s differ in lock default. Machine fact, one export per harness, never per-tool. |
@@ -389,8 +464,8 @@ default drift (re-checked 2026-07-27).
 | var | sites | defaults | parse |
 |---|---|---|---|
 | `LORRAX_FORCE_FULL_BZ` | 5 | all default-off ✓ | all `gw_config.env_bool` ✓ — converted together 2026-07-30; previously all five were `bool(int(os.environ.get(...)))`, which accepts decimal digits ONLY, so `=true`/`=on`/`=yes` raised `invalid literal for int()` from inside the ISDF/V_q/W paths and `=2` silently meant "on" |
-| `LORRAX_PHDF5_STRIPE_COUNT` | 3 | all `'16'` ✓ | strict int parse, refuses loudly ✓ |
-| `LORRAX_PHDF5_STRIPE_SIZE_FS` | 2 | all `'1M'` ✓ | strict suffix parse, refuses loudly ✓ |
+| `LORRAX_PHDF5_STRIPE_COUNT` | **2** (was miscounted as 3 here and 4 in §2b; re-counted 2026-08-06) | both `16` ✓ | **✗ SPLIT** — `_slab_io_ffi.py:69` refuses loudly on a non-integer; `context.cc:462` forwards the raw string to `MPI_Info_set` with no validation at all. Same default, opposite failure modes. |
+| `LORRAX_PHDF5_STRIPE_SIZE_FS` | 2 | both `1M` ✓ | **✗ SPLIT** (corrected 2026-08-06; this row used to read "strict suffix parse, refuses loudly ✓" for both) — `_slab_io_mpi_host.py:122` refuses loudly naming the `lfs setstripe -S` grammar; `context.cc:464-487` computes `mult=0` for an unknown suffix and **silently keeps 1 MiB**. This is precisely what the warning box above says the audit cannot catch: identical defaults, different parses. |
 | `LORRAX_MEM_DEBUG` | 4 | all default-off ✓ | all `gw_config.env_bool` ✓ (was: presence-test at all 4, i.e. `=0` turned the probes ON — the row the note above is about) |
 | `LORRAX_RCHUNK_DEBUG` | 2 | both default-off ✓ | one grammar ✓ — `gw/isdf_fitting.py` and `isdf/core.py` both read it through `gw_config.env_bool` (P1.3 unification, 2026-07-31; the historical split — a bare presence test in `isdf/core` under which `=0` meant **on** — is closed, and `tests/test_env_grammar.py` now scans `isdf/core.py` as an owned file so the class cannot recur silently) |
 | `LORRAX_ZETA_RCOND` | 2 factor sites + 1 provenance echo | ONE shared non-empty-env-wins rule (`isdf/core._env_override_raw`) ✓ | that one rule serves both the factor sites (`_deprecated_env_float`) and the provenance record (`deprecated_env_record`); the inline mirror in `gw_init` was deleted by the fix/zq audit ✓ |
@@ -430,39 +505,19 @@ matches `getenv`/`log_here`/`env_flag` literals only, so reads funneled
 through `mklpin::knob_value(...)` are invisible to it — those rows are
 maintained by hand.
 
-## CPU collectives: why `mpi`, and a correction to the earlier AS.7 note
+## Why CPU collectives run on `impl=mpi`
 
-*(supersedes the "AS.7 upgrade scope — GW-ONLY, `mpi` BREAKS BSE" block that
-stood here. That block was wrong in both its stated mechanism and its scope.)*
+Not on this page. The mechanism, the gloo silent-corruption evidence, the
+`MPI_Is_thread_main` gate and the launch recipe are owned by
+**`docs/dev/mpi_collectives.md`**, with the measured transport verdicts in
+**`docs/environment/transports.md`**.
 
-**Corrected mechanism.** The earlier note gave the discriminator as "any kernel
-whose collectives sit inside a `lax.scan`/`while_loop` inside a `shard_map`
-inside a single jit". It is not that. A clean-room probe of exactly that shape
-**passes** under `impl=mpi`, and so does a bare subgroup `psum` with no warm-up
-of any kind. The real gate is jaxlib's `MPI_Is_thread_main` check in
-`xla::cpu::MpiCollectives::CreateCommunicators`, which fires on communicator
-CREATION only, and which XLA:CPU trips whenever the `ThunkExecutor` takes its
-PARALLEL path and hands the collective thunk to an intra-op pool worker.
-`ExecuteSequential` runs thunks inline on the main thread, which is why small
-graphs pass and real ones do not. It is not a thread-LEVEL test: no
-`MPI_THREAD_*` value and no collective warm-up ordering can satisfy it.
-
-**Corrected scope.** `mpi` is therefore **not** GW-only, and BSE does not have
-to stay on gloo.
-
-**SUPERSEDED remedy** *(kept as history; the mechanism above is still
-correct).* The remedy this section originally taught —
-`LORRAX_MPI_FORCE_THREAD_MAIN=1` with the MPIwrapper from
-`config/frontera/build_mpiwrapper.sh`, which answered the guard inside the
-wrapper and let the BSE TDA Lanczos that used to die on every rank (job
-7879458) run clean, eigenvalues character-identical to the gloo reference —
-is superseded, consistent with this knob's §5 registry row: leave
-`LORRAX_MPI_FORCE_THREAD_MAIN` UNSET. The current mechanism is the warm-up
-in `common.collectives.warm_mesh_cliques()`, which creates every mesh-axis
-communicator (plus the world one) from the Python main thread at
-mesh-construction time; XLA's clique cache then serves every later
-collective and the `MPI_Is_thread_main` guard is never re-evaluated. The
-knob is retained only as a fallback and as the positive control in the
-gates.
-
-Full rationale, evidence and launch recipe: **`docs/dev/mpi_collectives.md`**.
+A ~35-line retelling stood here until 2026-08-06 and is deleted rather than
+trimmed. It had already gone wrong twice in ways the owner page had not — it
+carried a superseded remedy (`LORRAX_MPI_FORCE_THREAD_MAIN=1`) as the current
+one, and before that a mechanism ("collectives inside a `lax.scan` inside a
+`shard_map`") that a clean-room probe refuted. Both errors are exactly what a
+second copy is for. The registry rows for
+`JAX_CPU_COLLECTIVES_IMPLEMENTATION`, `MPITRAMPOLINE_LIB`,
+`LORRAX_MPI_FORCE_THREAD_MAIN` and `LORRAX_MPI_FINALIZE_FIX` stay in §5,
+where they belong; their *explanations* now live in one place.

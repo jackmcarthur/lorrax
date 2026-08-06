@@ -29,7 +29,7 @@ count, `r` = r-chunk size, `nq` = IBZ q count, all buffers complex128
 | zeta charge back-solve (per r-chunk, `solve_zeta`) | `distributed_zeta_solve = auto`: `replicated` gathers the whole factor, `nq·mu²·16` B/rank/r-chunk; `per_q` gathers one `(mu,mu)` tile at a time, `mu²·(1+1/Py)·16` B live (same total traffic) | `distributed` (same key): one stacked GEMM `C⁺@Z`, both operands 2-D-sharded; received bytes `nq·(mu²/Px + mu·r/Py)·16` per r-chunk, no whole tile ever |
 | zeta transverse factor (bispinor mu_L=1,2,3; HOISTED 2026-08-01, once per channel) | `transverse_zeta_solve = ridge` (default) + `distributed_lu = auto` → per-q pivoted LU of the ridged LOGICAL tile via `lax.linalg.lu`, q-parallel at P>1 under the charge fold's policy; `(LU, piv)` stored, back-solve = `lu_solve` per r-chunk through the same replicated/per_q gather tiers — BIT-IDENTICAL to the old fused per-r-chunk `jnp.linalg.solve`.  `transverse_zeta_solve = rank_truncate` → per-q eigh pseudo-inverse with an \|λ\| cut (τ = `transverse_zeta_rcond`), explicit C⁺ stored, ONE GEMM per r-chunk; same replicated scaffolding (q-parallel fold, any count on any mesh) | ridge family: `distributed_lu = scalapack` (host) → `pXgetrf` ONCE at the logical extent (needs mu_T %% both mesh axes == 0), factors kept 2-D block-cyclic + per-rank ipiv threaded; `pXgetrs` per r-chunk (split FFI handlers).  `cusolvermp` (CUDA) still runs the FUSED per-r-chunk pair (hoist port pending).  rank_truncate family: `distributed_zeta_solve = distributed` → `pzheevd` at the PADDED extent (divisible by construction; pad modes zeroed = exactly inert, truncated at every τ), C⁺ kept 2-D-sharded — NO transverse divisibility constraint |
 | zeta Z_q build (`z_q_from_psi_sm`) | none (always sharded) | streaming band-chunk scan inside one shard_map; carries `(nk, ns, r/Py, mu/Px, ns)` → `/P`; per-iter FFT box `nk·(band_chunk/P)·ns·n_rtot` | same path |
-| zeta h5 write (G-flat accumulator + SlabIO) | `slab_io = auto` | accumulator `(nq_disk, mu/P, ngkmax)` → `/P`; `auto` → parallel-HDF5 FFI collective hyperslab write (no gather). The `h5py_allgather` fallback gathers the FULL `(nq_disk, mu, ngkmax)` tensor on rank 0 — announced, non-scaling; do not run large-mu with a demoted writer | same |
+| zeta h5 write (G-flat accumulator + SlabIO) | `slab_io = auto` | accumulator `(nq_disk, mu/P, ngkmax)` → `/P`; `auto` → parallel-HDF5 FFI collective hyperslab write (no gather). **`h5py_allgather` is no longer a fallback: since `0d8e50c` (2026-08-06) it is reachable at exactly one process and REFUSES above P=1.** It would gather the FULL `(nq_disk, mu, ngkmax)` tensor on rank 0, which at this tier's scale is an OOM rather than a slow path (owner ruling 2026-08-05, repo `decisions.md`). There is no longer a "demoted writer" to avoid running with — the demotion raises at parse time | same |
 | W Dyson solve (`gw/w_isdf`) | `w_dyson_solver = auto` = `local`: q-parallel per-q dense LU, `ceil(nq/P)` whole `(mu,mu)` tiles per rank — a mu² tile per rank exists | `w_dyson_solver = distributed`: 2-D block-cyclic backsolve via `ffi.linalg` `solve_lu`, `nq·mu²/P`; refuses loudly, never downgrades |
 | band-interpolation / BSE eigh (htransform fH_q, vq_interp C_q) | `eigh_backend = auto` = q-batched native eigh, one whole `(rank,rank)` matrix per device | `eigh_backend = distributed` (or `use_low_mem_eigh = true`): one tile spread over the mesh (`pzheevd` on host); square or 1-D mesh, `n` divisible by both axes |
 | FFT / GEMM backends | env, not deck: `LORRAX_FFT_FFI` / `LORRAX_FFT_FFI_FUSED` / `LORRAX_BANDS_GEMM_FFI`, all default ON (REQUIRED since 2026-08-01 — a missing handler refuses at startup; explicit exports are redundant) | orthogonal to the plan choice (see `docs/dev/flat_k_fft_service.md`, `vendor_gemm_service.md`, `docs/dev/env_vars.md`) | same |
@@ -51,11 +51,20 @@ distributed_zeta_solve = distributed      # zeta factor+solve: nothing O(mu²) r
 distributed_lu         = scalapack        # transverse channels, bispinor runs (CPU mesh)
 w_dyson_solver         = distributed      # W Dyson backsolve
 eigh_backend           = distributed      # only when one (rank,rank) tile no longer fits
-slab_io                = auto             # verify the FFI writer engages (banner), not the allgather fallback
+slab_io                = auto             # verify the FFI writer engages (read the banner)
 ```
 
 plus the launch env of `config/frontera/templates/gw_dev.sbatch`
 (`srun --mpi=pmi2`, `impl=mpi`; the FFI stack is the required default since 2026-08-01 — no gate exports needed).
+
+> **`--mpi=pmi2` is a FRONTERA line. Do not carry it to Perlmutter.** It is
+> right for Intel MPI under TACCs SLURM. Against Shifters Cray MPICH it
+> makes MPI initialise as a **singleton** — every rank gets its own
+> `MPI_COMM_WORLD` of size 1 — which under independent I/O can still produce
+> a correct-looking file. Perlmutter needs `--mpi=cray_shasta`. This is the
+> single most dangerous failure mode in the I/O subsystem;
+> [`docs/architecture/slab_io.md`](../architecture/slab_io.md) owns it and
+> carries the three-line world-size assertion every gate should run.
 
 ## Certified example invocations
 
@@ -114,7 +123,7 @@ plus the launch env of `config/frontera/templates/gw_dev.sbatch`
 | `LORRAX_ZETA_GATHER_CAP_GIB` | 4 | `auto` back-solve tier: `replicated` under the cap, `per_q` above | live-bytes budget for the gathered factor; 12×12/mu=2016 stack (9.4 GB) lands on per_q |
 | `LORRAX_ZETA_REPLICATE_CAP_GIB` | 4 | whether the charge factorization may run replicated at all (per-q-batch criterion for rank_truncate) | mu ceiling `sqrt(cap/16)` = 16384/batch; production 12×12 runs raise to 16 |
 | `LORRAX_COLLECTIVE_CHUNK_MB` | 128 | max payload of ONE emitted collective in the distributed tier (host-level q-block loop, cannot be re-fused by XLA) | 1.15 GB single-shot AllGather fatal at P=144; 0.104 GB healthy on the same 144 ranks; at P=16 impl=mpi the cap is indistinguishable from unbounded.  A per-instruction transport cap, orthogonal to the 4 GiB live-bytes cap.  Note: once ONE q's collective exceeds the budget the bound is abandoned with a loud warning (q is the only split axis) |
-| `slab_io = auto` probe | launcher PMI env, else a subprocess MPI_Init probe | FFI parallel-HDF5 vs announced allgather demotion | bare-launch demotion path is a standing regression test |
+| `slab_io = auto` probe | launcher PMI env, else a subprocess MPI_Init probe | FFI parallel-HDF5, or a **refusal** — the announced allgather demotion was deleted in `0d8e50c` (2026-08-06) | the bare-launch path is still a standing regression test, but it now asserts a REFUSAL above P=1, not a demotion. Related and separate: at P>1 the FFI backend also compares `MPI_Comm_size(MPI_COMM_WORLD)` against `jax.process_count()` and refuses on a mismatch (`LORRAX_PHDF5_REQUIRE_MPI_WORLD`), because a PMI-flavour mismatch otherwise yields unsynchronised writers with rc=0 |
 | `LORRAX_BANDS_GEMM_FFI` (default on — REQUIRED) | startup enforcement (`Gate.enforce`) | vendor batched GEMM; `=0` = announced uncertified XLA-dot debug opt-out | a missing handler refuses at startup naming the .so (decisions.md 2026-08-01) |
 
 ## Still replicated today (honest list)

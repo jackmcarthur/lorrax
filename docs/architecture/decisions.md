@@ -2,7 +2,96 @@
 
 Dated, binding rulings from the code owner. Each entry states the decision,
 its consequence for code, and what it licenses deleting. Newest first.
-These override older prose anywhere in the tree.
+**These override older prose anywhere in the tree**, including every page the
+[register](../index.md#register) names as an owner.
+
+An entry records a *decision*. Whether the decision has been implemented is a
+separate question and is stated per entry — an approved ruling that has not
+landed is marked so, with the branch that carries it, because documenting an
+unlanded change as live is how a tuning table becomes a lie.
+
+## 2026-08-06 — `minimax` is the only screening method; `ctsp` is refused
+
+`screening_method` accepts exactly one value, `minimax`, which is also its
+default. Any other value raises at parse time.
+
+The specific thing this closes: `screening_method = ctsp` **parsed,
+normalised, and ran minimax**. The field was pure decoration — the spelling
+never selected a different method, so every deck carrying it has been running
+minimax all along and replacing the key (or deleting it) changes no result.
+That is worse than an unsupported option, because the deck, the run log and
+the provenance record all agreed on a method the code never had.
+
+Implemented `c6b6aa0`; the refusal text says all of the above, so a deck
+author reading the error does not have to come here. The one fixture whose
+name asserted `ctsp` is renamed.
+
+Licenses deleting: the `ctsp` spelling, its normalisation, and any prose
+describing LORRAX as having two screening methods.
+
+## 2026-08-05 — The Lustre stripe count is the aggregator count, so it is `nranks`
+
+*(APPROVED. **Not implemented in this branch** — see the status note.)*
+
+`LORRAX_PHDF5_STRIPE_COUNT` is not a filesystem-layout preference that
+happens to affect speed. ROMIO sets `cb_nodes = min(striping_factor,
+nranks)`, so **the stripe count IS the collective-buffering aggregator
+count**. A fixed 16 therefore caps aggregation at 16 aggregators no matter
+how many ranks write, which is exactly backwards for a design envelope of
+hundreds of ranks. The default becomes `nranks`.
+
+Why the existing measurement did not catch it: the sweep that chose 16 ran at
+4 and 16 ranks, where `nranks <= 16` makes the two policies nearly the same
+choice. A default tuned inside the region where it cannot be distinguished
+from its replacement is not evidence for it.
+
+Shape of the replacement: clamp to roughly [4, 128], ramp the striping unit
+1 → 4 MiB with it, and **refuse a negative count** — a negative
+`striping_factor` means "every OST on the filesystem", the
+maximum-*contention* layout, and the current Python parse passes it straight
+through.
+
+**Status, verified 2026-08-06.** Implemented on
+`feat/slab-io-stripe-nranks-2026-08-06` (`e5c9618`), which is **not an
+ancestor of this branch** (`merge-base --is-ancestor`, checked). Both sites
+here still default to 16. Even on that branch the policy is Python-side only:
+the C++ writer's `context.cc` still carries the literal `"16"`, so landing it
+is not finished until both writers agree — one environment must mean one
+layout in every writer, which is the rule the stripe *size* already follows.
+
+Licenses deleting: nothing yet. It licenses *adding* the refusal on a
+negative count, which is a live hazard independent of the default.
+
+## 2026-08-05 — An allgather is a refusal, not a fallback
+
+Any I/O route whose cost is "gather the whole global array onto one rank"
+is **not a slow tier the system may fall back to**. The design envelope is
+arrays that need hundreds of GPUs to hold, so a rank-0 gather does not buy
+a slow run — it buys an out-of-memory some minutes later, behind a banner
+nobody read. A slow correct path is a fallback; a path that cannot complete
+at the design size is a refusal that has not been written yet.
+
+Implemented 2026-08-06 in commit `0d8e50c`, as one rule covering every
+route into the tier:
+
+> `H5PY_ALLGATHER` is reachable at exactly one process, and nowhere else.
+
+At P=1 the gather and the per-rank write are the *same operation*, so there
+is nothing to refuse about; above P=1 both routes raise at parse time.
+
+Consequences already landed: the silent demotion from the parallel FFI
+writer is deleted, as is the decline branch that read
+`max(SLURM_JOB_NUM_NODES, SLURM_NNODES)`.
+
+This refines the 2026-08-01 entry below, which licensed auto-demotion
+"where the alternative is a different *service tier* (e.g. the h5py write
+route on launches where MPI cannot bootstrap)". That licence no longer
+extends to the allgather tier above one process: if MPI cannot bootstrap at
+P>1, the correct behaviour is to refuse and say so, not to write the file a
+way that cannot work at scale.
+
+Licenses deleting: demotion branches into rank-0-gather I/O, and the
+announcement machinery that existed only to narrate them.
 
 ## 2026-08-04 — Padding is SlabIO's business, not the caller's
 
@@ -134,22 +223,46 @@ FFI handlers (plain-loop CBLAS, FFTW-vs-MKL resolution) — those are how
 the required layer stays buildable everywhere; and BSE's XLA FFTs, which
 have no FFI route yet.
 
-## 2026-08-01 — Square process meshes only; nonsquare P truncates
+## 2026-08-01 — Square process meshes only; nonsquare P REFUSES
 
-Only square 2-D device meshes are supported. When a run is launched with
-a nonsquare process count P, the mesh resolver uses s = floor(sqrt(P)),
-builds the s x s mesh, and announces that P - s^2 processes are idle;
-it does not build a rectangular mesh and does not refuse. Launch scripts
-should request square counts; the truncation is the safety net, not the
-recommendation.
+Only square 2-D device meshes are supported. A device count that is not a
+perfect square **refuses**, naming the two nearest square counts to
+request. Launch scripts should request square counts.
 
 Rationale: rectangular meshes complicate ScaLAPACK grid geometry and the
 divisibility contracts for no measured benefit at our scales (ruled
-2026-07-27; this entry adds the truncation default, 2026-08-01).
+2026-07-27).
+
+AMENDED 2026-08-06. This entry previously said the resolver truncates to
+`s = floor(sqrt(P))`, idles the surplus, "and does not refuse". **The
+implementation refuses, and has since before the entry was written** —
+`common/collectives.py:289-300`. The truncation safety net is deliberately
+NOT implemented, because idle ranks cannot be made deadlock-free without
+deep surgery:
+
+* under the production transport `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`,
+  communicator creation is `MPI_Comm_split`, collective over
+  `MPI_COMM_WORLD` — a rank outside the mesh that never executes the
+  warm-up jits leaves every in-mesh rank blocked in the split;
+* `psum_replicate` and the k-sweep gathers assume mesh size == process
+  count;
+* `multihost_utils` barriers span the WORLD, so idle ranks would have to
+  replay the entire driver control flow in lockstep while skipping every
+  mesh-touching jit.
+
+A refusal that names the square count is the deadlock-free form of the same
+rule. The record is reconciled in favour of the implementation; the
+"truncate" wording is withdrawn rather than kept alongside.
+
+CONSEQUENCE, worth stating because it has already cost a plan: the reachable
+device counts are 1, 4, 9, 16, 25, 36, … A scaling ladder cannot include
+**32**, which is the natural next rung on a 4-GPU-per-node machine (8 nodes).
+One has already been re-planned around it. Request 16 or 36; a run submitted
+at 32 refuses at mesh resolution, before any work.
 
 Licenses deleting: rectangular-mesh accommodation in the mesh resolver
 and any divisibility contortions that exist only to serve non-square
-grids.
+grids. Does NOT license adding idle-rank truncation.
 
 ## Standing (recorded earlier, restated for one-page reference)
 

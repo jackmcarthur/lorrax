@@ -175,4 +175,7 @@ regenerate with `tools/gen_input_reference.py`), `docs/environment/`
 `docs/dev/large_nmu_operation.md` (two-plans-per-family map, keys,
 thresholds), `docs/dev/env_vars.md` (the env registry — gated by
 `tests/test_env_registry.py`), `docs/architecture/decisions.md` (binding
-rulings). Tree state and certification scope: `docs/dev/STATE.md`.
+rulings). Which page owns which fact is stated once, in the register at the
+top of `docs/index.md`; certification scope lives in the sandbox `CLAIMS.md`
+ledger rather than in a doc page, because a page recording it goes stale
+silently.

@@ -177,7 +177,7 @@ $\chi^{0i},\chi^{ij}$ • $W^{\mu\nu}$ Dyson (4×4 matrix) • retarded Breit ($
 
 Key validation log: [`runs/MoS2/B_bispinor_pd_smoke_2026-05-02/`](../../runs/MoS2/B_bispinor_pd_smoke_2026-05-02/) — pair-density smoke (`run_pd_smoke.py`), ζ-fit smoke (`run_zeta_fit.py`), channel-aware ζ-fit (`run_zeta_channel_aware.py`), bvec-units diagnostic (`check_bvec_units.py`).
 
-Internal: [`docs/PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md) (scalar ISDF GW); [`docs/CODEBASE_COMPREHENSIVE.md`](CODEBASE_COMPREHENSIVE.md).
+Internal: [`docs/theory/physics.md`](theory/physics.md) (scalar ISDF GW) and [`docs/architecture/codebase.md`](architecture/codebase.md). *These two links named `PHYSICS_COMPREHENSIVE.md` / `CODEBASE_COMPREHENSIVE.md` until 2026-08-06; both were deleted in the 2026-07-31 restructure, and the banner at the top of this page had already recorded their successors while these links kept pointing at the graves.*
 
 ## 11. q=Γ treatment of the CC, TT and CT tiles (2026-08-01 audit)
 

@@ -56,6 +56,8 @@ Detailed physics, code architecture, and environment setup are in `docs/`:
 - **[`docs/architecture/memory-model.md`](docs/architecture/memory-model.md)** — Per-stage memory usage formulas for the ISDF basis construction, heavy chunked operations
 - **[`docs/theory/minimax-quadrature.md`](docs/theory/minimax-quadrature.md)** — Explanation of GW frequency integrals discretized via $\Sigma(omega) = \int dt e^{i \omega t} G(t)W(t)$, minimax quadrature
 
-The documentation site is built with mkdocs (`uv run --extra docs mkdocs serve`); developer notes, plans, and the frozen archive live under `docs/dev/` (outside the rendered site). The current state-of-the-tree note — certification scope and the pre-push checklist — is [`docs/dev/STATE.md`](docs/dev/STATE.md); users upgrading from origin/main should read [`UPGRADE_NOTES.md`](UPGRADE_NOTES.md).
+**Which page owns which fact** is stated once, in the register at the top of [`docs/index.md`](docs/index.md#register). Start there — every page below links back to it rather than restating its neighbours.
+
+The documentation site is built with mkdocs (`uv run --extra docs mkdocs serve`); developer notes, plans, and the frozen archive live under `docs/dev/` (outside the rendered site). The pre-push checklist is [`docs/contributing.md`](docs/contributing.md); users upgrading from origin/main should read [`UPGRADE_NOTES.md`](UPGRADE_NOTES.md).
 
 Contributors and coding agents working in this repository should also read [`AGENTS.md`](AGENTS.md) for the module map and coding standards.
