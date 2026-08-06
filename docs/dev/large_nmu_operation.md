@@ -32,6 +32,10 @@ count, `r` = r-chunk size, `nq` = IBZ q count, all buffers complex128
 | zeta h5 write (G-flat accumulator + SlabIO) | `slab_io = auto` | accumulator `(nq_disk, mu/P, ngkmax)` → `/P`; `auto` → parallel-HDF5 FFI collective hyperslab write (no gather). The `h5py_allgather` fallback gathers the FULL `(nq_disk, mu, ngkmax)` tensor on rank 0 — announced, non-scaling; do not run large-mu with a demoted writer | same |
 | W Dyson solve (`gw/w_isdf`) | `w_dyson_solver = auto` = `local`: q-parallel per-q dense LU, `ceil(nq/P)` whole `(mu,mu)` tiles per rank — a mu² tile per rank exists | `w_dyson_solver = distributed`: 2-D block-cyclic backsolve via `ffi.linalg` `solve_lu`, `nq·mu²/P`; refuses loudly, never downgrades |
 | band-interpolation / BSE eigh (htransform fH_q, vq_interp C_q) | `eigh_backend = auto` = q-batched native eigh, one whole `(rank,rank)` matrix per device | `eigh_backend = distributed` (or `use_low_mem_eigh = true`): one tile spread over the mesh (`pzheevd` on host); square or 1-D mesh, `n` divisible by both axes |
+| **BSE restart-bundle load** (`bse/bse_io`) | NOT a deck key — selected by DEVICE COUNT at `bse/bse_jax.py:143` (`use_sharded = n_devices > 1 or not tda`). LOCAL = `_load_ring_subset`: whole-file `V_qmunu` + `W0_qmunu` + `psi_full_y`, `2·nq·mu²·16` B of host staging and `nq·mu²·16` B on the one device. **It REFUSES above one process** (`bse_io.py:1466-1472`), so it cannot silently become the P>1 path | `load_bse_data_from_restart_sharded`: per-rank `(mu,nu)` h5py hyperslabs, **no allgather anywhere**. `W_q` at `P('x','y',None,None,None)` = `nk·mu²/P`; `V_q0` at `P('x','y')` = `mu²/P`; `V_q_full` (opt-in `load_v_full`) a SECOND `nk·mu²/P`. Largest host staging buffer is exactly one rank's tile. ψ/`M` are single-axis (`1/px`, `1/py`) — see the honest list item 2 |
+| **BSE matvec** (`bse_ring_comm` / `bse_stack_matvec` / `bse_simple`) | `--matvec-kind` CLI flag, not a deck key. LOCAL = `bse_serial.apply_bse_hamiltonian_single_device`: the `T` tensor `(b, mu, mu, ns, ns, nk)` whole on one device — the 1-device reference path only | `ring` (default) / `simple` / `stack`: `shard_map` with a `ppermute` ring and `psum_scatter`, `T`/`U` at `P(None,'x','y',None,None,None)` = `b·nk·ns²·mu²/P`. Every collective is over pair-space `(c,v,k)` or one mu axis — **no collective carries a `mu²` payload**. `stack` keeps one trial live inside a `lax.scan` |
+| **BSE coarse→fine W densify** (`bse_io.make_w_densifier`) | none (always sharded) | one `jax.jit` with `out_shardings` pinned to `w_spec`, shard_map-interior FFTs both ways: per-rank peak is the local `(mu/px, nu/py, nk_fine)` tile. The eager `local_ifftn3` + `device_put` twin it replaced all-gathered the full tensor per rank; `tests/test_fft_shardmap_context.py` bans it | same path |
+| **BSE arbitrary-Q exchange model** (`bse/vq_interp`) | none — **NO DISTRIBUTED PLAN EXISTS**; this is the BSE stage's live scaling defect. See the section below | — |
 | FFT / GEMM backends | env, not deck: `LORRAX_FFT_FFI` / `LORRAX_FFT_FFI_FUSED` / `LORRAX_BANDS_GEMM_FFI`, all default ON (REQUIRED since 2026-08-01 — a missing handler refuses at startup; explicit exports are redundant) | orthogonal to the plan choice (see `docs/dev/flat_k_fft_service.md`, `vendor_gemm_service.md`, `docs/dev/env_vars.md`) | same |
 | transport | `config/frontera/mpi_transport_env.sh`: `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi` | required at distributed tiers (gloo banned there) | same |
 
@@ -260,6 +264,109 @@ gauge delta 0.0 at .dat print precision, 1.1e-13 eV sigma_mnk.h5.
 Measured effect at bi16: per-channel `zeta_fit.chunk.solve` 4.3–12.8 s →
 1.7–2.8 s (per-r-chunk re-factorization gone), GW wall 214.3 → 201.2 s;
 grows with n_rchunks·P at production mu_T.
+
+## BSE stage — the plan family, and the one hole in it
+
+Registered 2026-08-06.  Until then the BSE stage appeared in no plan
+table, and the sandbox `INVARIANTS.md` row 6 recorded the gap as
+"`bse_io._load_ring_subset` has no distributed counterpart".  **That
+wording is wrong and is retracted here.**  `_load_ring_subset` is the
+*single-device* full-file reader, it says so in its own docstring, and
+it has REFUSED above one process since the BD.4 scorecard
+(`bse_io.py:1466-1472`).  Its distributed counterpart is
+`load_bse_data_from_restart_sharded`, which has existed the whole time.
+
+**Measured, MoS2 6x6 / mu=1496 / nq=36 / nb=200 / CUDA, Perlmutter job
+56389339, cache-cold** (`bse_memprofile.py` census of every bundle
+array's global shape, PartitionSpec and per-rank shard bytes, plus
+`/proc/self/status` VmHWM):
+
+| leg | loader | bundle GB/rank | `W_q` GB/rank | VmHWM GiB/rank |
+|---|---|---|---|---|
+| P=1 (1x1) | `_load_ring_subset` | 1.2468 | 1.2006 (whole) | 3.074 |
+| P=4 (2x2) | sharded | 0.3342 | 0.3001 | 2.145-2.162 |
+| P=16 (4x4) | sharded | 0.0909 | 0.0758 | 1.598-1.705 |
+
+`W_q` divides by P exactly (1.2006 / 4 = 0.30015; at P=16 the global
+grows to 1.2131 GB because `padded_mu_extent` rounds 1496 up to 1504,
+then divides by 16).  The bundle total divides by 3.73x and 3.68x
+instead of 4x for one reason only: ψ and `M` are single-axis sharded,
+so they divide by `px` (= sqrt(P)) while `W_q` divides by `P`.  At P=16
+they are 15% of the per-rank bundle and that fraction grows like
+sqrt(P).
+
+Per-rank scaling at the design envelope, from those shapes:
+
+* `W_q`, `V_q0`, `V_q_full`, matvec `T`/`U`  →  `mu²·(...)/P`.  Sound.
+* ψ_{c,v}^{X,Y} `(nk, nb, ns, mu)` and `M_{X,Y}` `(nk, nc, nv, mu)`
+  →  `/px` = `/sqrt(P)`.  `M` is `nc·nv` times ψ and TWO copies are
+  held for the whole run; it is the largest ψ-side object and the
+  first thing to fix after the hole below.
+
+### The hole: `bse/vq_interp` has no distributed plan
+
+Everything above has two plans.  The arbitrary-Q exchange model has
+one, and it is the local one.  `build_vq_evaluator` is on the
+`exciton_bands` and `bse_k_grid` paths, so this is reachable from a
+production deck, and it is the BSE stage's INVARIANTS-row-6 defect:
+
+1. `vq_interp.py:147` — `zx["psi"] = fr["psi_full_y"][()]`: the WHOLE
+   `(nk, nb, ns, mu)` ψ read into host numpy on EVERY rank,
+   unconditionally.  The module docstring quotes 3.7 GB at the MoS2
+   reference.  Ungated.
+2. `vq_interp.py:773,775` — `S_np` and `V_SRc_np`, two `(nq, mu, mu)`
+   host mirrors, i.e. **two full `mu²·nq` tensors per process**.  The
+   docstring at `:669-675` puts the pair at 26.8 GB/proc and names it
+   as the node OOM.  Gated on `run_diagnostics` only.
+3. `vq_interp.py:778` — `Fch`, `(nq, mu, nG)` host, **ungated**: it is
+   allocated whether or not diagnostics run.
+4. `vq_interp.py:822-826` — `_to_host(S_b/V_b/F_b)` is a
+   `process_allgather` of `(q_chunk, mu, mu)` onto every process.
+   Under the 2026-08-05 ruling an allgather is a refusal, not a
+   fallback; this one is not even announced.
+5. `vq_interp.py:1477-1608` — `refit_vq` (`--vq-mode=both`) accepts
+   `mesh_xy` and applies **no sharding constraint at all**: `C=(mu,mu)`,
+   `Z=(mu,n_rp)`, `zeta=(mu,n_rtot)`, `ztG_box=(mu,n_rtot)` are
+   whole-array device buffers on every rank.
+
+The design for closing it is the charge-zeta family's, unchanged: keep
+the `(q, mu, mu)` stacks 2-D-sharded on `('x','y')` end to end — they
+already are on the device side (`V_SRc` at `vq_interp.py:831-838`,
+`C_q` at `:434`, `P_R` at `:452`) — and delete the host mirrors rather
+than gate them, replacing the diagnostics that consume them with
+on-device reductions of the kind `exciton_bands._gate_stats_on_device`
+(`exciton_bands.py:291-328`) already uses.  Item 1 is a per-rank
+`(nk, nb_window, ns, mu/px)` hyperslab read through the same
+`_read_psi_mu_sharded` the BSE loader uses.  Item 4 disappears with the
+mirrors.  Item 5 needs the same `with_sharding_constraint` treatment
+the W densifier got in 2026-07-31.
+
+### BSE I/O: correct, but not on the certified transport
+
+`bse/` reads its restart with plain serial `h5py` hyperslabs and never
+touches `file_io.slab_io` — so it does not get the parallel-HDF5 FFI
+collective read that `GATES.md`'s `slab_io` row certifies, and it is
+also not exposed to that row's refusal.  Memory-wise it is correct
+(nothing larger than one rank's tile is ever materialised).
+Bandwidth-wise it is not: 1.2 GB in 12.4 s at P=4 is ~0.1 GB/s, against
+the 2.9 GiB/s CLAIMS 69 measured for the phdf5 path at 16 ranks.
+Porting the two `bse_io` readers onto `SlabIO.read_slab(name,
+shape=..., mesh=..., partition_spec=...)` is the follow-up; the shapes
+already match what `read_slab` wants (`P('x','y',None,None,None)` for
+`W_q`, `P('x','y')` for `V_q0`), and `read_slab` requires the padded,
+mesh-divisible extent, which the loader already computes as
+`padded_mu_extent(n_rmu, px*py)`.
+
+One byte-level defect on that path was found and fixed 2026-08-06:
+`_read_vq0_sharded` read all `nq` q-tiles and used one, so `V_q0` cost
+`nq`x its own size in disk traffic.  `_resolve_munu_reader` now returns
+a `read_q_slab(q, ...)` single-q hyperslab for all three on-disk
+layouts.  Load wall 12.4 s -> 7.4 s at P=4, and the per-shard SHA-256
+of all 13 bundle arrays is bit-identical before and after on all four
+ranks — an element-selection change, so exact equality is the right
+bar, not a gauge tolerance.  It is NOT a measured memory win at that
+shape (VmHWM 2.145-2.162 -> 2.144-2.152 GiB, unchanged): the transient
+it removes is 0.32 GB/rank and is not the binder.
 
 ## Pointers
 
