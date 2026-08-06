@@ -103,14 +103,118 @@ and commit messages written before 2026-07-31 use the old spelling.
 
 ## 3. What each machine provides
 
-| Service | Perlmutter (GPU leg + host leg) | Frontera *(unverified 2026-08-06)* |
+| Service | Perlmutter (GPU leg + host leg) | Frontera |
 |---|---|---|
-| FFT (CPU) | `cray-fftw/3.3.10.11` | MKL's native FFTW3 export |
-| FFT (GPU) | cuFFT (`cufftPlanMany64`) | n/a |
+| FFT (CPU) | `cray-fftw/3.3.10.11` | MKL's native FFTW3 export *(verified 2026-08-06, below)* |
+| FFT (GPU) | cuFFT (`cufftPlanMany64`) | n/a on the CPU leg |
 | GEMM | Cray LibSci CBLAS | MKL CBLAS |
 | Dense solvers | SLATE (GPU + host), cuSOLVERMp | ScaLAPACK (MKL), SLATE |
 | Parallel HDF5 | `cray-hdf5-parallel` + Cray MPICH | HDF5 + Intel MPI |
 | Container | Shifter (`run_shifter.sh`) | apptainer |
+
+### 3a. The dependency matrix — one row per routine we call out for
+
+**This table is the register's answer to "how LORRAX reaches a vendor
+library", at routine granularity.** The service table above says which
+*vendors* are on each machine; this one says, for each numerical or I/O
+routine LORRAX does not implement itself, who serves it, what else could,
+**how you would know it built right**, and whether that check is passing.
+
+The last two columns are the point. A row whose "how you know" is *(none)*
+is a routine we are trusting without evidence.
+
+| Routine | Perlmutter | Frontera | Reachable alternatives | How you know it built right | Passing? |
+|---|---|---|---|---|---|
+| **3-D FFT** (in-`shard_map`) | XLA:GPU `fft` → **cuFFT** in jaxlib | XLA:CPU `fft` → **DUCC/Eigen** in XLA | none — `fft_helpers.local_fftn3`/`local_ifftn3` are bare `jnp.fft` aliases with **no FFI route**; `LORRAX_FFT_FFI` structurally cannot reach them | **(none)** | — |
+| **flat-k FFT** (batched 3-D) | CUDA leg: **cuFFT** `cufftPlanMany64` + NVRTC. Host leg: FFTW3 ABI by `dlopen` → **cray-fftw** bare-metal; **nothing in-container** | **MKL**'s FFTW3 export, bound at `resolve_sym` stage 1 (MKL is already loaded via the ScaLAPACK link line, so the ladder never runs) | the whole `fftw3_candidates()` ladder: `$LORRAX_FFTW3_SO` → build-time `LORRAX_FFTW3_SO_HINT` → `libfftw3.so.3` → `libfftw3.so.mpi31.3` → `libmkl_rt.so` → `libfftw3.so`. On Frontera `libfftw3.so.3` **is** reachable (`/usr/lib64`, FFTW 3.3.2) and would win over `libmkl_rt.so` if MKL were not already resident | **GATE 5b** — zero `fftw` in `DT_NEEDED` (`build_ffi_host.sh`). Covers *load* time only | **PASS**, Perlmutter, measured 2026-08-06 |
+| ↳ *which engine actually answered* | — | — | — | **GATE 8** (`gate_one_fftw.sh`) — **NOT ON THIS BRANCH**, see §3b | **no check** |
+| **GEMM / batched GEMM** | Host leg: **Cray LibSci** CBLAS. GPU: no FFI — XLA:GPU `dot` → **cuBLAS** | **MKL** CBLAS | LibSci exports no `cblas_?gemm_batch`, so the run-time `dlsym` picks the plain-`cblas_?gemm` loop; MKL has the batched entry. Also netlib/AOCL/OpenBLAS/BLIS/ATLAS are accepted as CBLAS providers | **GATE 2** — one LibSci flavour, no sequential/threaded mix. Which *entry* was chosen is **announced at run time, not gated** | **PASS**, Perlmutter (`seq=0 mp=2`), measured 2026-08-06 |
+| **`eigh`** | default **native** `jnp.linalg.eigh` → cuSOLVER via jaxlib | default **native** → LAPACK via jaxlib | `eigh_backend` deck key: `scalapack` \| `cusolvermp` \| `slate`. SLATE `heev` on a **host** mesh is refused outright (bug L-2, deterministic SIGSEGV) | the 11-symbol ScaLAPACK/BLACS **pre-flight** in `build_ffi_host.sh`; then `tests/test_ffi_linalg_contract.py` at run time | pre-flight **PASS**, Perlmutter. Contract tests: 2 skips are the SLATE `heev` pair |
+| **`eigh`, distributed** | **cuSOLVERMp** `syevd` (GPU); **ScaLAPACK** `pzheevd`/`pdsyevd` from Cray LibSci (CPU) | **ScaLAPACK** from MKL (`libmkl_scalapack_lp64` + `libmkl_blacs_intelmpi_lp64`) | SLATE `heev` (CUDA only) | as above — **no gate asserts which vendor answered**; `CMakeLists.txt` states nothing at run time can observe it | see above |
+| **Cholesky** (`potrf`) | **cuSOLVERMp** batched `potrf`/`potrs`; **SLATE** `potrf`/`trsm` | **SLATE** host `potrf` against MKL (opt-in; unset stage ⇒ phdf5-only lib) | **there is no ScaLAPACK `potrf` handler anywhere in the tree** | **(none at build time)** — `test_ffi_linalg_contract.py` only | contract tests only |
+| **LU** (`getrf`/`getrs`) | **cuSOLVERMp** batched `solve_lu` (GPU); **ScaLAPACK** `pXgetrf`/`pXgetrs` from LibSci (CPU) | **ScaLAPACK** from MKL | fused `solve_lu` **and** the split `getrf`+`getrs` pair; resolve refuses if any of the three targets is missing | **(none at build time)** — contract tests only. `LORRAX_LU_NO_PIVOT` can disable pivoting at run time with no gate | contract tests only |
+| **Distributed transport** | **NCCL** (cuSOLVERMp ≥0.7.2) or **CAL** (≤0.6.x); **NVSHMEM** transitively via cuBLASMp; `MPI_COMM_WORLD` dup for SLATE/ScaLAPACK | Intel MPI; NCCL for the pip cuSOLVERMp on the rtx leg | the stage choice *is* the transport choice — one string, `LORRAX_NVHPC_SUBPATH`; build refuses if unstated | build-time refusal on an unstated stage (`build.sh`) | — |
+| **Parallel HDF5** | **`cray-hdf5-parallel/1.14.3.7`** (`libhdf5_parallel_gnu.so.310`) over **Cray MPICH** `libmpi_gnu_123.so.12` | **phdf5 1.14.6** (`libhdf5.so.310`) over **Intel MPI 2020.4** | h5py-parallel host tier (`_MpiHostBackend`); rank-0 serial h5py **only at one process** — above that it refuses | **GATE 1** (`gate_one_mpi.sh`, one cray-mpich object) and **GATE 7** (`gate_one_hdf5.sh`, one HDF5 SOVERSION + the stage provides it) | **both PASS**, Perlmutter, measured 2026-08-06 |
+| **OpenMP runtime** | `libgomp.so.1` | `libiomp5` (Intel) | `libgomp` \| `libiomp5` \| `libomp` | **GATE 6** — the OpenMP runtime really is OpenMP | **PASS**, Perlmutter — but see §3b, it passes on an empty set too |
+
+**Scope of every "PASS" above:** Perlmutter, login node, bare metal, against
+`lorrax_hdf5/src/ffi/cpp/build_host/liblorrax_ffi_host.so` (2026-08-06) —
+the newest host artifact, built from `fix/host-ffi-hdf5-closure-2026-08-06`,
+which is an ancestor of this branch. **No host `.so` has been built from
+`integration/2026-08-06` itself**, and **no artifact exists on Frontera at
+all** (`find $WORK $SCRATCH -name 'liblorrax_ffi*.so'` returns only
+`lorrax_ffi_wtA` / `lorrax_ffi_unified` build dirs from earlier campaigns,
+none from this branch). Every Frontera cell above is a claim about what the
+build *would* select, verified at the library level — `nm -D` on
+`libmkl_rt.so` exports all three FFTW3 advanced-ABI entry points — not a
+claim about a built artifact.
+
+### 3b. The routines with no check, and the gates that cannot fail
+
+Four gaps, worst first.
+
+1. **Nothing verifies which FFT engine actually answered.** GATE 5b proves
+   nothing *binds* at load time; after that the engine arrives by `dlopen`
+   and no static tool can see it. The gate written for this — **GATE 8**,
+   `src/ffi/cpp/gate_one_fftw.sh`, which drives one real flat-k FFT and
+   reads `/proc/self/maps` — **exists, is certified, and is not on this
+   branch.** It is four commits (707 insertions) on
+   `fix/host-ffi-fftw-container-stage-2026-08-06`, unmerged:
+
+   ```
+   c973968 docs(env_vars): register the five deployment variables the FFTW3 stage adds
+   85f346a shifter: mount the FFTW3 stage at /lorrax_fftw, beside phdf5/slate/nvhpc
+   7e48d66 ffi build: GATE 8 -- one FFTW3 engine, MAPPED, and it is the staged one
+   a3fafdc ffi stage: the container ships no FFTW3, so stage the one the ladder needs
+   ```
+
+   The hazard is concrete: the Shifter image ships **`libcufftw.so.11`**,
+   which exports `fftw_plan_many_dft` / `fftw_execute_dft` /
+   `fftw_destroy_plan` — all three names the ladder binds. Point
+   `LORRAX_FFTW3_SO` at it and every FFT cell goes green while the **host**
+   handler transforms on the GPU. Merging that branch closes both this and
+   the in-container "no FFTW3 engine in this process" failure below.
+
+2. **GATE 5a reads 0 by construction, and still prints in the PASS banner.**
+   `nm -D --undefined-only … | grep -c fftw_` counts *undefined symbol
+   references*, which `dlsym`ing every entry point drives to zero whatever
+   else is true. Measured on both artifacts, same day:
+
+   | | GATE 5a (`nm -D`) | GATE 5b (`DT_NEEDED`) |
+   |---|---|---|
+   | post-fix `.so` (`lorrax_hdf5`) | 0 → pass | 0 → pass |
+   | **pre-fix `.so` (`lorrax_P`, the broken one)** | **0 → pass** | **3 → fail** |
+
+   Same library, same day: the check that was used for certification passes
+   on the build that could not load. 5b is the load-bearing half.
+
+3. **Two gates announce PASS having scanned nothing.**
+   * **GATE 6** — with zero `lib*omp*.so` entries in `DT_NEEDED`,
+     `omp_needed` is empty, `bad_omp` strips to empty, and the gate prints
+     `GATE 6 … PASSED`. Verified by running the gate's own expression on an
+     empty input.
+   * **`gate_one_hdf5.sh`** guards `ldd` (`GATE FAILED (7d): ldd is not
+     available`) but never guards `readelf`. Handed a non-ELF file it takes
+     the `GATE 7 N/A: none of the 1 artifact(s) link HDF5 at all` branch and
+     exits **0**. Verified directly. This is the failure mode
+     `gate_one_mpi.sh:30-36` was rewritten to remove — *"A GATE THAT CANNOT
+     RUN IS NOT A GATE THAT PASSED"* — left in place one tool over.
+
+4. **Whole routine classes have no build-time check at all.** Cholesky and
+   LU are asserted only by `tests/test_ffi_linalg_contract.py` at run time;
+   nothing at build time says which vendor supplies them, and
+   `CMakeLists.txt` notes that nothing at run time can observe it either.
+   The 3-D FFT row has no check of any kind, on either machine.
+   `LORRAX_LU_NO_PIVOT` disables pivoting from the environment with no gate
+   and, until 2026-08-06, no registry row.
+
+**The Frontera leg shares no numbered gate with Perlmutter.**
+`config/frontera/build_ffi_host.sh` calls neither `gate_one_mpi.sh` nor
+`gate_one_hdf5.sh`; it has its own CUDA-free grep, an exported-handler list,
+and a `readelf -d | grep -E 'scalapack|blacs|libsci'` non-emptiness test.
+`config/frontera/build_ffi.sh` asserts nothing beyond the file existing.
+So the machine with no built artifact is also the machine with the weakest
+gates — the two facts compound.
 
 **One FFT source serves both.** The CPU flat-k translation unit was
 source-locked to MKL's DFTI descriptor API until 2026-08-05; it is not any
