@@ -420,7 +420,7 @@ GWResults → write_results → eqp.dat / eqp1.dat / sigma_mnk.h5 / qp_rotations
 
 ### 6.1 Input — `cohsex.in`
 
-Parsed by `LorraxConfig.from_input_file()`. Canonical reference: [`docs/docs_gwjax/COHSEX_INPUT.md`](../../../docs/docs_gwjax/COHSEX_INPUT.md) in the sandbox (not in this repo) — covers every flag (band ranges, ISDF parameters, memory budget, screening knobs, head-correction policy, frequency grid, etc.).
+Parsed by `LorraxConfig.from_input_file()`. Canonical reference: [`docs/input_reference.md`](../input_reference.md), generated from the parser by `tools/gen_input_reference.py` and drift-checked in `tools/release_check.sh`. (A prose companion, `docs/docs_gwjax/COHSEX_INPUT.md`, lives in the sandbox repo — not here, which is why the relative link that stood here could never resolve.) Between them they cover every flag (band ranges, ISDF parameters, memory budget, screening knobs, head-correction policy, frequency grid, etc.).
 
 ### 6.2 Input — `centroids_frac.h5`
 
