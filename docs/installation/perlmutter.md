@@ -24,18 +24,42 @@ To install several checkouts side-by-side, set a distinct `LORRAX_MODULE_NAME`
 
 ## Every session
 
+**`lx` is the entry point.** Never a login node, never `sbatch`:
+
 ```bash
-module load lorrax
-lxalloc                                  # 1 node / 4 GPUs / 2 h, exports SLURM_JOBID
-lxpre cohsex.in 640                      # 3 preprocessing steps (centroids, dipole, kin_ion)
-lxrun python3 -u -m gw.gw_jax -i cohsex.in   # 4-GPU GW
+lx run python3 -u -m gw.gw_jax -i cohsex.in   # one step on a compute node
+lx run -G 4 python3 -u -m gw.gw_jax -i cohsex.in   # whole node, 4 GPUs
+lx test                                       # the suite, on a compute node, in cwd
+lx doctor                                     # which checkout will actually run
 ```
 
-`lxpre` runs, in order:
+`lx` allocates if nothing is live and attaches if something is. It takes the
+checkout it runs from a **base module**, not from `cwd` — run `lx doctor`
+before trusting that you are exercising your own worktree. The full command
+set, the `LX_BASE_MODULE` override, and why `module load lorrax` is *not* the
+recommended entry point are in
+[`environment/machines/perlmutter.md` §1](../environment/machines/perlmutter.md#1-entry-point-lx).
+
+The older `module load lorrax` + `lxalloc`/`lxrun`/`lxpre` workflow still
+exists. Measured 2026-08-06, the module installed on this machine resolves
+`LORRAX_ROOT` to an **older worktree** and exports
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`, which
+[`environment/overview.md` §2.1](../environment/overview.md#21-the-three-allocators)
+identifies as the setting that starves NCCL into `cusolverMpSyevd: status=7`.
+Prefer `lx`.
+
+`lxpre <deck> <N>` bundles the three preprocessing steps:
 
 1. `python3 -m centroid.kmeans_cli <N> --seed 42` → `centroids_frac_<N>.txt`
 2. `python3 -m psp.get_dipole_mtxels -i <in>` → `dipole.h5`
 3. `python3 -m gw.kin_ion_io -i <in>` → `kin_ion.h5`
+
+**Three of those steps have defects that bite on a first run** — the
+wavefunction filename step 1 reads is hardcoded, the filename it writes does
+not carry the `N` you asked for, and step 2's output cannot satisfy the
+consistency guard step 4 applies to it. See
+[Quickstart → Your first real calculation](../quickstart.md#your-first-real-calculation)
+before running them.
 
 ## Native FFI stack on Perlmutter
 
