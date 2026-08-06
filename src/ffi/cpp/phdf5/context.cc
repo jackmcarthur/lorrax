@@ -130,29 +130,14 @@ static long env_long(const char* name, long default_value) {
     return parsed;
 }
 
-// Pull a BOOLEAN tunable from env.  Grammar is defined in ONE place —
-// Python's ``file_io/_slab_io_mpi_host._env_flag`` — and mirrored here
-// exactly (keep the two in sync):
-//   unset or empty                                  -> default
-//   strip + lowercase in {"1", "true", "yes", "on"} -> true
-//   anything else ("0", "false", "no", "off", ...)  -> false
+// env_flag (the boolean grammar) moved to ctx.h on 2026-08-06 so every
+// phdf5 translation unit shares it.  It was static here, which is why
+// read_ffi.cc's LORRAX_PHDF5_TIME had to be a bare presence test.
 // Boolean knobs used to go through env_long, whose strtol grammar
 // silently kept the DEFAULT on word spellings — so e.g.
 // LORRAX_PHDF5_COLLECTIVE_WRITES=false left the FFI writer collective
 // while the Python phdf5_host writer went independent: the two writers
 // diverged on the same environment (audit fix/zq 2026-07-28).
-static bool env_flag(const char* name, bool default_value) {
-    const char* v = std::getenv(name);
-    if (!v || !*v) return default_value;
-    std::string s(v);
-    // strip (all-whitespace strips to "" -> false, matching Python, where
-    // only unset / exactly-empty return the default)
-    const auto b = s.find_first_not_of(" \t\r\n");
-    const auto e = s.find_last_not_of(" \t\r\n");
-    s = (b == std::string::npos) ? std::string() : s.substr(b, e - b + 1);
-    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
-    return s == "1" || s == "true" || s == "yes" || s == "on";
-}
 
 // Free one staging buffer through the allocator that made it.
 static void staging_free(void* p) {
@@ -459,31 +444,100 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     // a PER-FILE single-OST ceiling near 0.65 GiB/s -- note it barely
     // moves from 4 to 16 ranks, so it is not the "~30 MB/s per rank" the
     // old lxrun comment claimed.  Always pre-stripe, or pass the hints.
-    const char* stripe_count = std::getenv("LORRAX_PHDF5_STRIPE_COUNT");
-    info_set("striping_factor", stripe_count && *stripe_count ? stripe_count : "16");
+    // Both stripe knobs REFUSE malformed input, naming the variable and the
+    // grammar, because their Python siblings in file_io/_slab_io_ffi.py
+    // (_stripe_count, _stripe_size_bytes) already do.  Until 2026-08-06 this
+    // side did neither: STRIPE_COUNT was passed to ROMIO as an unvalidated
+    // STRING (so `=sixteen` became the literal hint "striping_factor=sixteen"),
+    // and STRIPE_SIZE_FS silently kept 1 MiB on a bad suffix -- the exact
+    // "an explicit =4MiB A/B experiment quietly measured the default
+    // configuration" failure its own sibling's docstring post-mortems.
+    // Two writers that disagree about one environment is the bug class
+    // env_flag was introduced for; leaving the numeric knobs split was the
+    // half of that audit that did not land.
+    if (const char* sc = std::getenv("LORRAX_PHDF5_STRIPE_COUNT");
+        sc && *sc) {
+        char* end = nullptr;
+        const long parsed = std::strtol(sc, &end, 10);
+        while (end && *end && std::isspace((unsigned char)*end)) ++end;
+        if (end == sc || (end && *end)) {
+            throw std::runtime_error(
+                std::string("LORRAX_PHDF5_STRIPE_COUNT=\"") + sc +
+                "\" is not a valid stripe count: expected a plain integer "
+                "(e.g. 16; 0 disables the striping hints).  Refusing rather "
+                "than handing ROMIO a hint it will ignore while the caller "
+                "believes the layout was chosen.");
+        }
+        if (parsed < 0) {
+            throw std::runtime_error(
+                std::string("LORRAX_PHDF5_STRIPE_COUNT=\"") + sc +
+                "\" is refused.  A negative striping_factor means 'every OST "
+                "on the filesystem', the maximum-CONTENTION layout: 0.105 "
+                "GiB/s at 64 ranks writing 32 GiB against 10.63 for the "
+                "policy (job 56389339).  Pass a positive count, or unset it.");
+        }
+        info_set("striping_factor", sc);
+    } else {
+        info_set("striping_factor", "16");
+    }
     long stripe_bytes = 1L << 20;
     if (const char* fs = std::getenv("LORRAX_PHDF5_STRIPE_SIZE_FS");
         fs && *fs) {
         char* end = nullptr;
         double v = std::strtod(fs, &end);
         long mult = 1;
+        if (end == fs) {
+            throw std::runtime_error(
+                std::string("LORRAX_PHDF5_STRIPE_SIZE_FS=\"") + fs +
+                "\" is not a valid stripe size: expected a number with an "
+                "optional K/M/G suffix (e.g. 4M).");
+        }
         if (end && *end) {
             switch (*end) {
                 case 'k': case 'K': mult = 1L << 10; break;
                 case 'm': case 'M': mult = 1L << 20; break;
                 case 'g': case 'G': mult = 1L << 30; break;
-                default: mult = 0; break;  // unparseable -> keep default
+                default: mult = 0; break;
             }
+            // Exactly ONE suffix character, nothing after it.  Python's
+            // _stripe_size_bytes tests raw[-1], so it refuses "4MiB"; if we
+            // accepted it as 4 MiB the two writers would once again disagree
+            // about one environment -- and "4MiB" is the very spelling that
+            // docstring records someone actually exporting.
+            const char* tail = end + 1;
+            while (*tail && std::isspace((unsigned char)*tail)) ++tail;
+            if (*tail) mult = 0;
         }
-        if (end != fs && mult > 0) stripe_bytes = (long)(v * (double)mult);
+        if (mult == 0) {
+            throw std::runtime_error(
+                std::string("LORRAX_PHDF5_STRIPE_SIZE_FS=\"") + fs +
+                "\" has an unrecognised suffix.  Accepted: K, M, G (e.g. "
+                "4M), or a bare byte count.  Refusing rather than silently "
+                "keeping the 1 MiB default while the knob looks in force.");
+        }
+        stripe_bytes = (long)(v * (double)mult);
+        if (stripe_bytes <= 0) {
+            throw std::runtime_error(
+                std::string("LORRAX_PHDF5_STRIPE_SIZE_FS=\"") + fs +
+                "\" resolves to a non-positive striping_unit, which is not a "
+                "hint ROMIO can act on.");
+        }
     } else if (const char* b = std::getenv("LORRAX_PHDF5_STRIPE_SIZE");
                b && *b) {
-        long parsed = std::strtol(b, nullptr, 10);
-        if (parsed > 0) stripe_bytes = parsed;
+        char* end = nullptr;
+        const long parsed = std::strtol(b, &end, 10);
+        if (end == b || (end && *end) || parsed <= 0) {
+            throw std::runtime_error(
+                std::string("LORRAX_PHDF5_STRIPE_SIZE=\"") + b +
+                "\" is not a valid byte count: expected a positive plain "
+                "integer.");
+        }
+        stripe_bytes = parsed;
     }
-    // A non-positive striping_unit is not a hint ROMIO can act on; keep the
-    // default rather than pass "0" or a negative through (strtod on "-4M",
-    // or a v*mult that overflowed, both land here).
+    // Backstop only.  Every reachable way to get here non-positive now
+    // throws above, naming the variable; this catches a v*mult that
+    // overflowed long.  It is deliberately NOT the silent-default path it
+    // used to be -- that is what let "=4MiB" measure the 1 MiB default.
     if (stripe_bytes <= 0) stripe_bytes = 1L << 20;
     {
         char buf[32];

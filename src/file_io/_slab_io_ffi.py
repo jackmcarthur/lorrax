@@ -484,8 +484,14 @@ def _assert_mpi_world(mesh, *, mpi_size=None, probe_detail=None,
     and ``probe_detail`` instead, skipping the probe: same comparison,
     one less ABI guess.
     """
-    if os.environ.get("LORRAX_PHDF5_SKIP_MPI_WORLD_CHECK", "").strip() in (
-            "1", "true", "yes", "on"):
+    # ``.lower()`` is load-bearing and was missing here until 2026-08-06,
+    # two lines above a sibling that has it: SKIP_MPI_WORLD_CHECK=ON (or
+    # True, or YES) silently did NOT skip.  Failing closed is the safe
+    # direction for this particular knob, which is why it survived — but a
+    # knob that ignores half its own documented vocabulary is not a knob,
+    # and the next one written this way will fail open.
+    if os.environ.get("LORRAX_PHDF5_SKIP_MPI_WORLD_CHECK",
+                      "").strip().lower() in ("1", "true", "yes", "on"):
         return
     require = os.environ.get(
         "LORRAX_PHDF5_REQUIRE_MPI_WORLD", "").strip().lower() not in (

@@ -8,8 +8,10 @@
 #pragma once
 
 #include <atomic>
+#include <cctype>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -31,6 +33,32 @@
 #include <hdf5.h>
 
 namespace lorrax_ffi::phdf5 {
+
+// The ONE boolean grammar for this translation unit family.  Mirrors
+// Python's ``file_io/_slab_io_mpi_host._env_flag`` exactly (keep in sync):
+//   unset or empty                                  -> default
+//   strip + lowercase in {"1", "true", "yes", "on"} -> true
+//   anything else ("0", "false", "no", "off", ...)  -> false
+//
+// It lives in the header, not in context.cc, because it was static there
+// and read_ffi.cc could not see it -- so LORRAX_PHDF5_TIME was written as
+// a bare `getenv(...) != nullptr` presence test, in which `=0` turns
+// timing ON.  That is the same defect this project already post-mortems
+// for LORRAX_MEM_DEBUG and LORRAX_EXIT_AFTER_ZETA (gw_config.env_bool's
+// docstring).  A grammar only one file can reach is a grammar the next
+// file will re-invent wrongly.
+inline bool env_flag(const char* name, bool default_value) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return default_value;
+    std::string s(v);
+    // strip (all-whitespace strips to "" -> false, matching Python, where
+    // only unset / exactly-empty return the default)
+    const auto b = s.find_first_not_of(" \t\r\n");
+    const auto e = s.find_last_not_of(" \t\r\n");
+    s = (b == std::string::npos) ? std::string() : s.substr(b, e - b + 1);
+    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+    return s == "1" || s == "true" || s == "yes" || s == "on";
+}
 
 struct PhdfCtx {
     // Identity / process grid
