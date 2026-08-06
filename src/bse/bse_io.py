@@ -18,6 +18,97 @@ from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
 from .bse_serial import compute_pair_amplitude
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  The band-pad sentinel — why the ε pad is NOT zero
+# ═══════════════════════════════════════════════════════════════════════
+# A zero pad is inert for operators LINEAR or BILINEAR in the padded axis
+# and a WRONG NUMBER for a diagonalisation.  Both cases are live on the
+# BSE (c, v) band axes and they need DIFFERENT fills:
+#
+#   ψ pad rows -> EXACT ZERO.  Every kernel term (V and W) is bilinear in
+#     ψ, so a zero-ψ pad band contributes exactly nothing and, critically,
+#     couples the pad block to the physical block with EXACTLY zero
+#     off-diagonal.  The pad block decouples; that is what makes the
+#     sentinel below safe.
+#
+#   ε pad entries -> ±PAD_EPS_GUARD_RY.  ``H_BSE``'s diagonal is
+#     ΔE(c,v,k) = ε_c(k,c) − ε_v(k,v) (``bse_ring_comm._apply_D_term``,
+#     and the same construction in bse_serial / bse_simple /
+#     w_omega_chain / bse_preconditioner).  With a ZERO ε pad the pad
+#     transitions acquire diagonal energies
+#         (c_pad, v_pad) -> 0 − 0        = 0
+#         (c_pad, v_real)-> 0 − ε_v      = |ε_v|
+#         (c_real, v_pad)-> ε_c − 0      = ε_c
+#     and, because ΔE_physical = ε_c − ε_v = ε_c + |ε_v| is LARGER than
+#     either of the mixed terms, every one of those spurious transitions
+#     sits BELOW the true absorption onset.  An eigensolver asked for the
+#     lowest excitons returns them.  Signing the pad ±guard puts every pad
+#     transition at ΔE ≳ PAD_EPS_GUARD_RY instead, decoupled and outside
+#     any physical window, so the padded modes are dropped BY COUNT
+#     (n_cond_pad·n_val_pad − n_cond·n_val per k) and never by value.
+#
+# Value: 1e3 Ry ≈ 13.6 keV.  This is the constant the exciton-bands driver
+# already shipped (it was defined there, and that driver ALSO carried a
+# hand-rolled repair of this loader's zero ε_v pad — the repair is now an
+# assertion that the loader did it).
+#
+# FINITE, and that is the point.  The tree has two sentinel families and
+# they are chosen on whether the pad SURVIVES the function that writes it:
+#
+#   * ``psp/dft_operators.py`` uses 1e10 on ``T_diag`` — a preconditioner
+#     diagonal and an argsort basis for a selection.  The pad entries do
+#     not leave; an absurd value is free.
+#   * ``common/wfn_transforms.py:1644-1651`` pads band ENERGIES with
+#     ``max(real ε) + 1 Ry`` and its comment says why it is not ∞:
+#     "keeps PPM resolvent arithmetic 1/(ω − e + iη) safe under fp
+#     warnings".  Those pad energies are KEPT and flow downstream.
+#
+# The BSE ε pad is the SECOND family, unambiguously: it is stored in the
+# bundle as ``data['eps_c']``/``['eps_v']`` and handed to every driver,
+# and ``bse_preconditioner`` builds exactly a resolvent from it,
+# 1/(ΔE − λ + ε_shift).  So the sentinel must stay finite and in scale.
+# 1e3 Ry is seven orders above the widest QP window this code will ever
+# see, keeps the float32 KPM leg's ΔE well inside single precision, and
+# matching the in-tree BSE value means the loader now AGREES with the one
+# BSE driver that had this right rather than moving its numbers.
+PAD_EPS_GUARD_RY = 1.0e3
+
+
+def pad_zone_mask_np(n_cond, n_val, n_cond_pad, n_val_pad, nk, dtype=np.float64):
+    """``(1, nc_pad, nv_pad, nk)`` 1.0 on physical transitions, 0.0 on pad.
+
+    THE spelling for "restrict a BSE pair-basis vector to the physical
+    block", derived BY COUNT from the logical/padded extents the loader
+    puts in the bundle — never by thresholding an energy.  Callers that
+    seed a Krylov space with random numbers over the PADDED shape must
+    apply this, or they hand the solver a start vector with support in a
+    block whose eigenvalues are the ``PAD_EPS_GUARD_RY`` sentinel.
+
+    Vectors built from ψ (dipoles, ``w_omega_chain``'s seed block) already
+    have exact zeros there by the bilinearity above and need no mask.
+    """
+    mask = np.zeros((1, int(n_cond_pad), int(n_val_pad), int(nk)), dtype=dtype)
+    mask[:, :int(n_cond), :int(n_val), :] = 1.0
+    return mask
+
+
+def pad_zone_mask(data, dtype=None):
+    """:func:`pad_zone_mask_np` read off a loader bundle, as a jax array."""
+    nk = int(data["nkx"]) * int(data["nky"]) * int(data["nkz"])
+    if dtype is None:
+        dtype = data["eps_c"].dtype
+    return jnp.asarray(pad_zone_mask_np(
+        int(data["n_cond"]), int(data["n_val"]),
+        int(data["n_cond_pad"]), int(data["n_val_pad"]), nk), dtype=dtype)
+
+
+def n_pad_transitions(data) -> int:
+    """How many pair-basis entries are pad — the COUNT to drop by."""
+    nk = int(data["nkx"]) * int(data["nky"]) * int(data["nkz"])
+    return nk * (int(data["n_cond_pad"]) * int(data["n_val_pad"])
+                 - int(data["n_cond"]) * int(data["n_val"]))
+
+
 _BARE_V_FALLBACK_WARNING = (
     "\n" + "=" * 72 + "\n"
     "BSE WARNING: W0_qmunu not ready (missing or W0_ready=False) -- falling\n"
@@ -380,7 +471,18 @@ def decimate_W_q_to_subgrid(W_q: jax.Array,
     return W_q[:, :, ::rx, ::ry, ::rz]
 
 
-def _pad_axis_to_multiple(x: jax.Array, axis: int, multiple: int) -> tuple[jax.Array, int]:
+def _pad_axis_to_multiple(x: jax.Array, axis: int, multiple: int,
+                          *, fill: float = 0.0) -> tuple[jax.Array, int]:
+    """Pad ``axis`` up to a multiple of ``multiple``; return (padded, PADDED extent).
+
+    ``fill`` is the value written into the pad zone and it is NOT a
+    detail: ψ must be padded with 0.0 (bilinear ⇒ inert) and ε with
+    ±:data:`PAD_EPS_GUARD_RY` (diagonal of a diagonalisation ⇒ a zero pad
+    is a wrong number).  See the module-level note on the sentinel.  It is
+    keyword-only so that no call site can pick the fill positionally by
+    accident — a mis-signed ε guard puts pad transitions BELOW the onset,
+    which is the failure this parameter exists to make unspellable.
+    """
     size = x.shape[axis]
     pad = (-size) % multiple
     if pad == 0:
@@ -392,7 +494,16 @@ def _pad_axis_to_multiple(x: jax.Array, axis: int, multiple: int) -> tuple[jax.A
     # mesh-rounded value (e.g. bse_ring_comm's `n_cond_pad % px == 0` guard).
     # Previously wrong only when the band count was not already a mesh
     # multiple — invisible on all mesh-divisible validated runs.
-    return jnp.pad(x, pad_width, mode="constant"), size + pad
+    #
+    # NOTE the opposite convention to ``runtime.padding.pad_axis_to``,
+    # which returns the LOGICAL extent (n_orig) from the same position.
+    # Two helpers returning different extents from the same slot is how
+    # the bug above happened; do not "unify" them by silently swapping
+    # one — the bundle carries BOTH (``n_val``/``n_cond`` logical,
+    # ``n_val_pad``/``n_cond_pad`` padded) and consumers must name which
+    # they want.  ``tests/test_pad_parity_gates.py`` pins this.
+    return jnp.pad(x, pad_width, mode="constant",
+                   constant_values=fill), size + pad
 
 
 def _get_local_mesh_coords(
@@ -1082,8 +1193,13 @@ def _interpolate_bse_data_to_grid(
                                 (0, n_rmu_pad - psi.shape[3])))
         psi_c = jnp.pad(psi_c, ((0, 0), (0, nc_pad - n_cond), (0, 0),
                                 (0, n_rmu_pad - psi.shape[3])))
-        eps_v = jnp.pad(enk[:, :n_val], ((0, 0), (0, nv_pad - n_val)))
-        eps_c = jnp.pad(enk[:, n_val:n_val + n_cond], ((0, 0), (0, nc_pad - n_cond)))
+        # ε pad = SIGNED SENTINEL, not zero (module note): ΔE = ε_c − ε_v is
+        # the diagonal of the operator the BSE drivers diagonalise.
+        eps_v = jnp.pad(enk[:, :n_val], ((0, 0), (0, nv_pad - n_val)),
+                        constant_values=-PAD_EPS_GUARD_RY)
+        eps_c = jnp.pad(enk[:, n_val:n_val + n_cond],
+                        ((0, 0), (0, nc_pad - n_cond)),
+                        constant_values=PAD_EPS_GUARD_RY)
         return (jax.lax.with_sharding_constraint(psi_v, x4),
                 jax.lax.with_sharding_constraint(psi_v, y4),
                 jax.lax.with_sharding_constraint(psi_c, x4),
@@ -1325,10 +1441,14 @@ def load_bse_data_from_restart_sharded(
         load_v_full=load_v_full, input_file=input_file)
 
     if pad_bands:
+        # ψ pad = 0 (bilinear ⇒ inert, and it is what decouples the pad
+        # block); ε pad = signed sentinel (diagonal of a diagonalisation).
         psi_v_X, n_val_pad = _pad_axis_to_multiple(psi_v_X, axis=1, multiple=grid_y)
         psi_c_X, n_cond_pad = _pad_axis_to_multiple(psi_c_X, axis=1, multiple=grid_x)
-        eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=grid_y)
-        eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=grid_x)
+        eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=grid_y,
+                                         fill=-PAD_EPS_GUARD_RY)
+        eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=grid_x,
+                                         fill=PAD_EPS_GUARD_RY)
     else:
         n_val_pad = int(psi_v_X.shape[1])
         n_cond_pad = int(psi_c_X.shape[1])
@@ -1709,8 +1829,12 @@ def apply_eqp_and_reslice_bands(
     cond_idx = np.arange(n_occ_eff, n_occ_eff + n_cond)
     eps_v = jnp.asarray(enk_full_np[:, val_idx])
     eps_c = jnp.asarray(enk_full_np[:, cond_idx])
-    eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=grid_y)
-    eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=grid_x)
+    # Signed sentinel, as at the loader seam — this REPLACES data['eps_*'],
+    # so a zero pad here would re-open the wrong-number path after --eqp.
+    eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=grid_y,
+                                     fill=-PAD_EPS_GUARD_RY)
+    eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=grid_x,
+                                     fill=PAD_EPS_GUARD_RY)
     return eps_v, eps_c, n_occ_eff
 
 
@@ -1875,8 +1999,10 @@ def _load_ring_subset(
     psi_c = _pad_last_axis(psi_c, n_rmu_pad)
     psi_v, n_val_pad = _pad_axis_to_multiple(psi_v, axis=1, multiple=py)
     psi_c, n_cond_pad = _pad_axis_to_multiple(psi_c, axis=1, multiple=px)
-    eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=py)
-    eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=px)
+    eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=py,
+                                     fill=-PAD_EPS_GUARD_RY)
+    eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=px,
+                                     fill=PAD_EPS_GUARD_RY)
     # V_qmunu is now flat-q (nq, μ, μ) post-shim; q=0 is V_qmunu[0].
     V_q0 = V_qmunu[0]
     V_q0 = _pad_last_two_axes(V_q0, n_rmu_pad)

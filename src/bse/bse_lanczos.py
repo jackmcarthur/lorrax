@@ -233,7 +233,9 @@ def solve_bse_sharded(
             eps_c, eps_v, sharding=NamedSharding(mesh_xy, P("x", "y", None)),
             epsilon_shift=davidson_eps_shift_Ry)
         X0 = init_bse_subspace(
-            eps_c, eps_v, n_eig=n_eig, n_random=davidson_n_random_init,
+            eps_c, eps_v, n_eig=n_eig,
+            n_cond=int(data["n_cond"]), n_val=int(data["n_val"]),
+            n_random=davidson_n_random_init,
             mesh=mesh_xy, sharding=bse_sharding)
 
         # Pre-compile _ritz_and_residuals at every subspace size m ∈ {n_eig,

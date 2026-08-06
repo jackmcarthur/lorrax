@@ -268,7 +268,32 @@ observability failures) — cheap keeps, not clutter.
 | `LORRAX_TIMING_TRACE` / `LORRAX_TIMING_TRACE_DEPTH` | `0` / `3` | Every `timing.section` announces entry/exit on rank 0, nesting capped at the depth (`common/timing.py`).  A malformed depth REFUSES naming the variable (the parse that swallowed `ValueError` killed every rank before). |
 | `LORRAX_SIGMA_TAU_TIMING` | `0` | Per-stage blocking timing rows for the staged τ kernel (`gw/ppm_tau_kernel.py:66`; the sub-rows are documented at `gw/ppm_sigma.py:377`).  Numerics identical (same primitives, same order, separate XLA modules); walltime NOT comparable to the fused path.  Scale-neutral: O(1) host work per τ stage. |
 | `LORRAX_PPM_HERM_DIAG` | `0` | Deck-level ε_H measurement of the PPM amplitude's inherited hermiticity residual — `check_hermitian` over B_q and Ω_q, all q, rtol 1.0 (`gw/ppm_sigma.py:275`).  Diagnostic, not a gate (the channel merge needs no hermiticity). |
-| `LORRAX_EXTRA_RANK_PAD` | `""` (→ 0) | **Test-only** extra null directions on the htransform Galerkin rank axis, on top of the mesh-lcm round-up (`bandstructure/htransform.py::resolve_extra_rank_pad`) — the pad-extent-invariance knob for this axis, exactly the role `LORRAX_EXTRA_MU_PAD` plays for μ.  Any result that moves under it at fixed P is a defect.  Negative or malformed REFUSES.  NEVER set in production. |
+| `LORRAX_EXTRA_RANK_PAD` | `""` (→ 0) | **Test-only** extra null directions on the htransform Galerkin rank axis, on top of the mesh-lcm round-up (`bandstructure/htransform.py::resolve_extra_rank_pad`) — the pad-extent-invariance knob for this axis, exactly the role `LORRAX_EXTRA_MU_PAD` plays for μ.  Any result that moves under it at fixed P is a defect.  Negative or malformed REFUSES.  NEVER set in production.  Exercised by `tests/test_pad_parity_gates.py` — until 2026-08-06 the ONLY test-suite mention was `test_layering.py`'s `_L1_LIBRARY_ENV_READS` registry, whose two consumers are `ast.parse` static analysis and cannot tell a working resolver from a dead one. |
+
+### There is deliberately no `LORRAX_EXTRA_BAND_PAD`
+
+Asked and **declined**, 2026-08-06 (ledger 0169), even though the band
+axis is now the most-padded axis in the tree.
+
+`LORRAX_EXTRA_MU_PAD` works because every μ extent funnels through the
+single `runtime.padding.padded_mu_extent`, so one knob reaches all
+eleven call sites. **The band pad has no single source.**
+`spec_divisor` is shared by five sites (`wfn_loader`, `mtxel_sweep`,
+`sc_iteration`, `qsgw_density`, `wfn_transforms`) but each does its own
+round-up; `bse/bse_io.py` hand-rolls `_pad_axis_to_multiple` entirely
+(and returns the PADDED extent where `pad_axis_to` returns the LOGICAL
+one, from the same slot); `gw/ppm_sigma.pad_sigma_window` pads m and n
+independently.
+
+A knob honoured inside `pad_axis_to` would therefore reach **neither the
+BSE band axis nor the Σ window** while reporting a green pad-flip run for
+the band axis as a whole — a false all-clear, which is worse than no
+check because it stops anyone else looking.
+
+**Precondition for adding it:** single-source the band extent first
+(a `padded_band_extent()` beside `padded_mu_extent()`, with `bse_io` and
+`ppm_sigma` routed through it). The knob is cheap and correct after that
+and manufactures a false all-clear before it.
 | `LORRAX_FFT_FFI_LOG` | unset (presence-test) | C++ FFT-handler debug logging, ONE spelling on both platforms (`cpp/mklfft/fft_flat_k_ffi.cc::log_enabled`, `cpp/cufft/fft_flat_k_cuda_ffi.cc::log_enabled`).  Rank-scoped since the 2026-07-30 audit: rank 0 by default, `=all` for every rank (at P=1000 the old all-ranks default multiplied a 5-line answer by the process count).  Alias policy: `LORRAX_MKLFFT_LOG` and `LORRAX_CUFFT_LOG` are deprecated aliases, honored on BOTH platforms with a one-time announcement. |
 | `LORRAX_SCALAPACK_PROVIDER_LOG` | unset (presence-test) | C++ (`cpp/scalapack/blacs_grid.h:369`): one stderr block, once per process, naming which library resolves each of the 11 ScaLAPACK/BLACS symbols this build calls.  Opt-in — noise in a healthy build, the first question worth asking the moment a port misbehaves. |
 | `LORRAX_MEM_DEBUG` | unset | Memory high-water probes at named sites (`gw_init.py`, `isdf_fitting.py` ×3).  All four read it through `gw_config.env_bool`; they were bare presence-tests until 2026-07, under which `LORRAX_MEM_DEBUG=0` turned the probes ON. |

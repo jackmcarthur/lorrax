@@ -1517,6 +1517,42 @@ def apply_bloch_phase_on_slice(
 from common.collectives import single_device_mesh as process_local_mesh
 
 
+def _refuse_spinor_zero_fill(ns_want: int, ns_have: int, *, origin: str):
+    """Refuse a ψ spinor-extent mismatch instead of zero-filling it.
+
+    This is NOT a mesh-divisibility pad and it never was, which is why it
+    gets a refusal rather than a parity story.  ``meta.nspinor`` is set
+    CATEGORICALLY — ``4 if bispinor else wfn.nspinor`` (``common/meta.py``)
+    — so it is never rounded up to a device count and there is no divisor
+    to be inert with respect to.  A 2→4 mismatch means exactly one thing:
+    the caller asked the loader for the 2-component ψ (``bispinor=False``,
+    the kwarg default) while running under a ``bispinor = true`` deck.
+
+    Zero-filling components 2 and 3 is not an inert pad; it DELETES the
+    small components, whose correct value is ``(α/2)(σ·(k+G)) ψ_L``
+    (``common/bispinor_init.lift_to_4spinor``).  Every consumer contracts
+    the spinor axis (``einsum('msg,nsg->mn')``, ``Σ_s|ψ|²``), so the loss
+    is silent and algebraically well-formed: ρ, V_H and every
+    ⟨mk|V_H|nk⟩ come out built from large components only, ~4e-4 relative
+    at 30 Ry, under ``build_hartree_potential``'s 1e-3 ∫ρ tolerance.  A
+    wrong number under every tolerance that would have caught it is the
+    exact trade the pad-everywhere program exists to avoid, so the branch
+    refuses.
+
+    The fix at a call site is to pass ``bispinor=True`` so the loader
+    LIFTS (producing real small components), never to widen the array.
+    """
+    raise ValueError(
+        f"{origin}: refusing to zero-fill the spinor axis from {ns_have} to "
+        f"{ns_want} components. meta.nspinor={ns_want} means this is a "
+        f"bispinor deck, but the loader was asked for {ns_have} components, "
+        f"so the small components psi_S = (alpha/2)(sigma.(k+G)) psi_L would "
+        f"be silently replaced by zeros (~4e-4 relative in rho and V_H, below "
+        f"every tolerance that would catch it). Pass bispinor=True to this "
+        f"loader call so the small components are LIFTED, not invented. See "
+        f"common.bispinor_init.lift_to_4spinor.")
+
+
 def load_kpoint_fftbox_local(wfn, meta, k_idx, nb, *, b_lo: int = 0,
                              bispinor: bool = False):
     """One k-point's ψ in the FFT box, **process-local**.
@@ -1541,8 +1577,8 @@ def load_kpoint_fftbox_local(wfn, meta, k_idx, nb, *, b_lo: int = 0,
         bands=(int(b_lo), int(nb)), k=[int(k_idx)], bispinor=bool(bispinor))
     ns_have = int(psi.shape[2])
     if int(meta.nspinor) > ns_have:
-        psi = jnp.pad(psi, ((0, 0), (0, 0), (0, int(meta.nspinor) - ns_have),
-                            (0, 0)))
+        _refuse_spinor_zero_fill(int(meta.nspinor), ns_have,
+                                 origin="wfn_transforms.load_kpoint_fftbox_local")
     psi_box = to_box(psi, loader.box_index(k=[int(k_idx)]),
                      tuple(int(s) for s in meta.fft_grid),
                      mesh=process_local_mesh())
@@ -1680,9 +1716,8 @@ def read_Gvecs_to_devices(
     )
     ns_after_lift = 4 if bispinor else int(loader.nspinor)
     if int(meta.nspinor) > ns_after_lift:
-        ns_pad = int(meta.nspinor) - ns_after_lift
-        psi_G_flat = jnp.pad(
-            psi_G_flat, ((0, 0), (0, 0), (0, ns_pad), (0, 0)))
+        _refuse_spinor_zero_fill(int(meta.nspinor), ns_after_lift,
+                                 origin="wfn_transforms.read_Gvecs_to_devices")
     psi_box = to_box(psi_G_flat, loader.box_index(k=k),
                       tuple(int(s) for s in meta.fft_grid),
                       mesh=mesh_xy)

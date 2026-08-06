@@ -246,11 +246,16 @@ def _load_rotated_occ_fftbox(wfn, meta, ik: int, U_k):
     from common.collectives import single_device_mesh
     from common.wfn_transforms import to_box
     nmix = int(np.shape(U_k)[0])
-    psi_g = wfn.load_process_local(bands=(0, nmix), k=[int(ik)])
+    # Same reasoning as the unrotated leg in build_valence_density_distributed:
+    # ask the loader for the extent meta declares, so the small components are
+    # lifted rather than zero-filled below.
+    psi_g = wfn.load_process_local(bands=(0, nmix), k=[int(ik)],
+                                   bispinor=(int(meta.nspinor) == 4))
     ns_have = int(psi_g.shape[2])
     if int(meta.nspinor) > ns_have:
-        psi_g = jnp.pad(psi_g, ((0, 0), (0, 0),
-                                (0, int(meta.nspinor) - ns_have), (0, 0)))
+        from common.wfn_transforms import _refuse_spinor_zero_fill
+        _refuse_spinor_zero_fill(int(meta.nspinor), ns_have,
+                                 origin="kin_ion_io._load_rotated_occ_fftbox")
     U = jnp.asarray(U_k, dtype=psi_g.dtype)
     psi_g = jnp.einsum('mn,kmsg->knsg', U, psi_g, optimize=True)
     box = to_box(psi_g, wfn.box_index(k=[int(ik)]),
@@ -334,7 +339,15 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
             psi_k = _load_rotated_occ_fftbox(
                 wfn, meta, ik, np.asarray(psi_rotation)[ik])
         else:
-            psi_k = load_kpoint_fftbox_local(wfn, meta, ik, b_hi, b_lo=b_lo)
+            # bispinor from meta, not defaulted: meta.nspinor == 4 IS the
+            # bispinor flag (common/meta.py), and omitting it here made the
+            # loader return 2 components that the callee then zero-filled to
+            # 4 — silently building rho and V_H from large components only.
+            # The zero fill now refuses; this is the call that keeps it
+            # unreachable, by LIFTING the small components instead.
+            psi_k = load_kpoint_fftbox_local(
+                wfn, meta, ik, b_hi, b_lo=b_lo,
+                bispinor=(int(meta.nspinor) == 4))
         rho_local = rho_local + valence_density_from_kpoint(
             psi_k, nocc=None, weight=wk,
             cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin,
