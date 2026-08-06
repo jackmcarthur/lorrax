@@ -150,6 +150,112 @@ def test_invalid_slab_io_rejected(tmp_path, router_calls):
 
 
 # ---------------------------------------------------------------------------
+# H5PY_ALLGATHER is a refusal, not a fallback (owner ruling 2026-08-05,
+# enforced 2026-08-06).  Three properties, and all three are load-bearing:
+# the escape must survive (or somebody deletes the refusal), the refusal
+# must fire above one process, and the routers must not have a third tier.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def at_processes(monkeypatch):
+    """Make ``_slab_io_process_count`` report N.
+
+    Uses the LAUNCHER spelling rather than patching ``jax.process_count``
+    on purpose: the max-of-all-evidence rule is the part that must not
+    regress — a deck parsed before ``jax.distributed.initialize`` sees
+    ``process_count()==1`` on every one of 16 ranks, and the launcher
+    variable is the only thing standing between that and a green light.
+    """
+    def _set(n: int):
+        monkeypatch.setenv("SLURM_NTASKS", str(n))
+    return _set
+
+
+def test_explicit_allgather_refuses_above_one_process(
+        tmp_path, router_calls, at_processes):
+    at_processes(4)
+    with pytest.raises(RuntimeError) as ei:
+        _config(tmp_path, "slab_io = h5py_allgather\n")
+    msg = str(ei.value)
+    assert "REFUSED at 4 processes" in msg
+    assert "SLURM_NTASKS=4" in msg              # names the evidence
+    assert "slab_io.md" in msg                  # names the doc
+
+
+def test_deprecated_use_ffi_io_false_also_refuses_above_one_process(
+        tmp_path, router_calls, at_processes):
+    at_processes(16)
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        with pytest.raises(RuntimeError, match="use_ffi_io = false"):
+            _config(tmp_path, "use_ffi_io = false\n")
+
+
+def test_explicit_allgather_honored_at_one_process(
+        tmp_path, router_calls, at_processes):
+    at_processes(1)
+    lines: list[str] = []
+    cfg = _config(tmp_path, "slab_io = h5py_allgather\n",
+                  print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    assert cfg.backend.slab_io is SlabIOBackend.H5PY_ALLGATHER
+    # ...and it says so.  A silently-honoured escape is how the tier got
+    # into multi-rank production logs in the first place.
+    assert any("EXPLICIT" in l and "single-process" in l for l in lines)
+
+
+@pytest.mark.parametrize("probe_reason,fix_marker", [
+    ("unknown target: 'lorrax_phdf5_write' is not a target",
+     "three-way"),                              # probe stage
+    (None, "LAUNCHER fact"),                    # mpi stage
+])
+def test_router_refuses_instead_of_demoting(monkeypatch, at_processes,
+                                            probe_reason, fix_marker):
+    """No third tier: out of parallel tiers ⇒ RuntimeError, and the fix
+    line is keyed to WHICH probe declined."""
+    at_processes(8)
+    import ffi.common.ffi_loader as loader
+    if probe_reason is None:                    # handler present, MPI down
+        monkeypatch.setattr(loader, "probe_target",
+                            lambda t, p: (True, "available"))
+        monkeypatch.setattr(gw_config, "_probe_mpi_bootstrap_ffi",
+                            lambda platform="cpu": (False, "no PMI"))
+    else:
+        monkeypatch.setattr(loader, "probe_target",
+                            lambda t, p: (False, probe_reason))
+    monkeypatch.setattr(gw_config, "_probe_phdf5_host_tier",
+                        lambda: (False, "no mpi4py"))
+    for router in (gw_config._route_cpu_slab_io, gw_config._route_gpu_slab_io):
+        with pytest.raises(RuntimeError) as ei:
+            router(lambda *a, **k: None)
+        msg = str(ei.value)
+        assert "REFUSED" in msg
+        assert fix_marker in msg
+        assert "srun -n 1" in msg                 # the escape is stated
+
+
+def test_router_at_one_process_selects_allgather_loudly(
+        monkeypatch, at_processes):
+    """The softening that keeps the refusal alive: at ONE process the same
+    dead-end SELECTS the tier instead of refusing, because there the
+    gather IS the per-rank write — and it says so, including that the
+    identical configuration refuses at larger P."""
+    at_processes(1)
+    import ffi.common.ffi_loader as loader
+    monkeypatch.setattr(loader, "probe_target",
+                        lambda t, p: (False, "unknown target: nope"))
+    monkeypatch.setattr(gw_config, "_probe_phdf5_host_tier",
+                        lambda: (False, "no mpi4py"))
+    lines: list[str] = []
+    got = gw_config._route_gpu_slab_io(
+        lambda *a, **k: lines.append(" ".join(map(str, a))))
+    assert got is SlabIOBackend.H5PY_ALLGATHER
+    blob = " ".join(lines)
+    assert "SINGLE-PROCESS" in blob
+    assert "REFUSES" in blob                     # states the boundary
+    assert "unknown target: nope" in blob        # states the tier-1 reason
+
+
+# ---------------------------------------------------------------------------
 # normalize_w_dyson_solver — the two-plan vocabulary
 # ---------------------------------------------------------------------------
 
