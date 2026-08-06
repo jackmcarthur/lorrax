@@ -444,28 +444,76 @@ def _mpi_singleton_probe(child_code: str, what: str,
                    f"PMI-less launch)")
 
 
-def _probe_mpi_bootstrap_ffi() -> tuple[bool, str]:
+def _slab_io_geometry() -> str:
+    """The run geometry, as a one-line fragment for the routing banner.
+
+    Printed WITH every routing decision, on purpose.  No archived
+    multi-node log records a node count and the routing banner postdates
+    every historical run, so settling "does phdf5 work across nodes"
+    needed an archaeology pass rather than a grep.  The geometry belongs
+    next to the decision it qualifies.
+
+    SLURM's own node count is reported when present but is NOT the
+    primary source, and the spelling matters.  Measured inside the
+    Shifter container on Perlmutter, 2026-08-05, ``srun -N 4 -n 16``:
+    ``SLURM_NNODES=4``, ``SLURM_NTASKS=16`` and ``SLURM_JOB_NODELIST``
+    are all present, while ``SLURM_JOB_NUM_NODES`` is ABSENT — it is a
+    batch/allocation-level variable, not a step-level one, so anything
+    reading only that spelling sees nothing on a plain ``srun`` step.
+    JAX's own process/device counts do not depend on the launcher's
+    vocabulary at all, so they come first.
+    """
+    import jax as _jax
+    parts = []
+    try:
+        parts.append(f"processes={_jax.process_count()}")
+        parts.append(f"devices={_jax.device_count()}")
+        parts.append(f"local_devices={_jax.local_device_count()}")
+    except Exception:                                 # pragma: no cover
+        parts.append("jax process/device counts unavailable")
+    for _k in ("SLURM_JOB_NUM_NODES", "SLURM_NNODES", "SLURM_NTASKS"):
+        _v = os.environ.get(_k)
+        if _v:
+            parts.append(f"{_k}={_v}")
+    return ", ".join(parts)
+
+
+def _probe_mpi_bootstrap_ffi(platform: str = "cpu") -> tuple[bool, str]:
     """``(bootstrappable, how)`` for the PHDF5_FFI tier's own MPI init.
+
+    ``platform`` is an :mod:`ffi.common.ffi_loader` platform key —
+    ``"cpu"`` (the host lib) or ``"CUDA"``.  Both routers use this; the
+    GPU one did not until 2026-08-05, because it declined the tier on
+    node count instead of probing it.
 
     A launcher PMI environment settles it — that is the environment every
     green multi-rank run had (CLAIMS rows 3, 17).  Without one, probe the
     exact call the tier would make (``lrx_phdf5_init_mpi`` in the loaded
-    host .so) in a throwaway subprocess; see :func:`_mpi_singleton_probe`.
+    .so) in a throwaway subprocess; see :func:`_mpi_singleton_probe`.
+
+    NOTE what this does and does not prove.  A PMI environment proves a
+    launcher registered this process; it does NOT prove the PMI flavour
+    matches the MPI library.  A mismatch (``srun --mpi=pmi2`` against
+    Shifter's Cray MPICH) yields singleton MPI — every rank sees
+    ``MPI_Comm_size()==1`` — which no probe here detects and which
+    independent-I/O writes survive silently.  ``--mpi=cray_shasta`` is
+    the launcher's responsibility; see docs/architecture/slab_io.md.
     """
     var = _mpi_launcher_env()
     if var is not None:
         return True, f"launcher PMI environment present ({var})"
     try:
         from ffi.common.ffi_loader import loaded_lib_path
-        so = loaded_lib_path("cpu")
+        so = loaded_lib_path(platform)
     except Exception as exc:                          # pragma: no cover
         return False, f"ffi_loader unavailable ({type(exc).__name__}: {exc})"
     if not so:
-        return False, "no loaded host FFI library to probe MPI init with"
+        return False, (f"no loaded {platform} FFI library to probe MPI init "
+                       f"with")
     child = ("import ctypes, sys\n"
              "lib = ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)\n"
              "lib.lrx_phdf5_init_mpi()\n")
-    return _mpi_singleton_probe(child, "MPI_Init_thread (host FFI)",
+    return _mpi_singleton_probe(child, f"MPI_Init_thread ({platform} FFI)",
                                 argv_extra=(so,))
 
 
@@ -563,8 +611,12 @@ def _route_cpu_slab_io(print_fn) -> "SlabIOBackend":
     requires :func:`_probe_mpi_bootstrap_ffi` (launcher PMI environment,
     else a subprocess singleton-init probe) and demotes with an
     announcement when MPI cannot bootstrap — the same degrade-and-say-why
-    contract as the GPU router's multi-node FFI demotion.  An explicit
+    contract the GPU router uses.  An explicit
     ``slab_io=phdf5_ffi`` still bypasses this and fails loudly.
+
+    Node count is not a tier condition here and never was; as of
+    2026-08-05 it is not one in the GPU router either (see
+    :func:`_route_gpu_slab_io`).
     """
     reason = "ffi.common.ffi_loader import failed"
     try:
@@ -574,7 +626,7 @@ def _route_cpu_slab_io(print_fn) -> "SlabIOBackend":
         _ffi_write_ok = False
         reason = f"{type(exc).__name__}: {exc}"
     if _ffi_write_ok:
-        _mpi_ok, _mpi_how = _probe_mpi_bootstrap_ffi()
+        _mpi_ok, _mpi_how = _probe_mpi_bootstrap_ffi("cpu")
         if not _mpi_ok:
             _ffi_write_ok = False
             reason = (
@@ -585,7 +637,8 @@ def _route_cpu_slab_io(print_fn) -> "SlabIOBackend":
             "  [config] slab_io=auto on CPU backend: host FFI exports "
             "the collective phdf5 write handler and MPI can bootstrap "
             f"({_mpi_how}).  Routing SlabIO through "
-            "PHDF5_FFI (bare-MPI C++ collective MPI-IO, no mpi4py needed)."
+            "PHDF5_FFI (bare-MPI C++ collective MPI-IO, no mpi4py needed) "
+            f"[{_slab_io_geometry()}]."
         )
         return SlabIOBackend.PHDF5_FFI
 
@@ -618,59 +671,64 @@ def _route_gpu_slab_io(print_fn) -> "SlabIOBackend":
     router.  Tiers:
 
     1. ``PHDF5_FFI`` — the CUDA FFI lib exports the collective write
-       handler, and the run is single-node.  Cross-node GPU FFI is
-       demoted: the FFI's internal MPI bring-up is a known failure on
-       multi-node GPU stacks (Intel-MPI/OFI, campaign ledger 2026-07)
-       and ``slab_io=auto`` must degrade with an announcement, not die.
-       An explicit ``slab_io=phdf5_ffi`` still fails loudly instead.
+       handler AND MPI can bootstrap in this process.  **Node count is
+       not a condition.**
+
+       It used to be.  Until 2026-08-05 this router declined PHDF5_FFI
+       outright whenever ``SLURM_JOB_NUM_NODES > 1``, *without running
+       the probe*, citing a "known cross-node failure on multi-node GPU
+       stacks".  The failure that justified it was Intel MPI refusing a
+       launch configured with ``I_MPI_FABRICS=shm`` on Frontera — a
+       launcher misconfiguration, on an MPI stack and a machine this
+       router does not run on.  The Perlmutter GPU path is Cray MPICH
+       through Shifter.
+
+       Deleted after measuring the cell it forbade (job 56389339,
+       ``srun --mpi=cray_shasta -N 4 -n 16``): ``MPI_Comm_size()``
+       asserted == 16 on every rank, PHDF5_FFI write and read of a
+       0.5 GiB C128 array bit-exact on round-trip, and the payload md5
+       byte-identical to the same logical array written by 4 ranks on 1
+       node through a 2x2 mesh.  The branch was LIVE, not merely wrong: it read the max of
+       ``SLURM_JOB_NUM_NODES`` and ``SLURM_NNODES``, and while the former
+       is absent inside the Shifter container (it is a batch-level
+       variable), ``SLURM_NNODES`` is exported by every ``srun`` step —
+       measured 4 on the 4-node run.  So every multi-node GPU run really
+       did get silently demoted off the FFI writer, which is what the
+       archived logs show.
     2. ``PHDF5_HOST`` — mpi4py + h5py-parallel present, MPI inits, AND
        exactly one addressable device per process (the backend's
        one-shard-per-process contract; a single process driving N GPUs
        would fail at write time, so the probe declines it up front).
     3. ``H5PY_ALLGATHER`` — always works: gather via JAX collectives,
-       rank-0 serial h5py write of host arrays.
+       rank-0 serial h5py write of host arrays.  Note this tier is a
+       last resort and NOT a supported production path at scale: it
+       materialises the whole array on rank 0, which is the memory wall
+       the per-rank-tile contract exists to avoid.
     """
     import jax as _jax
 
-    # Multi-node detection: capability fact, not policy.  SLURM exports
-    # the node count; other launchers without the variable are treated
-    # as single-node (the probe below still guards the library itself).
-    # A malformed value used to be swallowed, leaving _nnodes=1 — i.e. a
-    # multi-node run silently routed to the CUDA phdf5 FFI, the one path
-    # documented below as a known cross-node failure.  Say so instead: the
-    # detection still degrades to single-node (that is the safe direction
-    # for a capability probe), but not in silence.
-    _nnodes = 1
-    for _k in ("SLURM_JOB_NUM_NODES", "SLURM_NNODES"):
-        _raw = os.environ.get(_k)
-        if _raw is None or not _raw.strip():
-            continue
-        try:
-            _nnodes = max(_nnodes, int(_raw))
-        except ValueError:
-            print_fn(f"  *** LORRAX SANITY: {_k}={_raw!r} is not an integer; "
-                     f"multi-node detection falls back to 1 node, which "
-                     f"routes slab_io=auto to the CUDA phdf5 FFI.  On a real "
-                     f"multi-node GPU run set slab_io explicitly. ***")
-
     reason = "ffi.common.ffi_loader import failed"
     _ffi_write_ok = False
-    if _nnodes > 1:
-        reason = (f"multi-node GPU run detected ({_nnodes} nodes): the "
-                  "CUDA FFI's MPI bring-up is a known cross-node failure "
-                  "on GPU stacks; auto declines it (explicit "
-                  "slab_io=phdf5_ffi overrides and fails loudly)")
-    else:
-        try:
-            from ffi.common.ffi_loader import probe_target
-            _ffi_write_ok, reason = probe_target("lorrax_phdf5_write", "CUDA")
-        except Exception as exc:                  # pragma: no cover
-            reason = f"{type(exc).__name__}: {exc}"
+    _mpi_how = "not probed"
+    try:
+        from ffi.common.ffi_loader import probe_target
+        _ffi_write_ok, reason = probe_target("lorrax_phdf5_write", "CUDA")
+    except Exception as exc:                      # pragma: no cover
+        reason = f"{type(exc).__name__}: {exc}"
+    if _ffi_write_ok:
+        # Handler presence is not capability: the tier calls
+        # MPI_Init_thread.  Same gate the CPU router applies.
+        _mpi_ok, _mpi_how = _probe_mpi_bootstrap_ffi("CUDA")
+        if not _mpi_ok:
+            _ffi_write_ok = False
+            reason = ("the CUDA FFI exports the write handler but MPI "
+                      f"cannot bootstrap in this process: {_mpi_how}")
     if _ffi_write_ok:
         print_fn(
             "  [config] slab_io=auto on GPU backend: CUDA FFI exports "
-            "the collective phdf5 write handler (single-node).  Routing "
-            "SlabIO through PHDF5_FFI."
+            "the collective phdf5 write handler and MPI can bootstrap "
+            f"({_mpi_how}).  Routing SlabIO through PHDF5_FFI "
+            f"[{_slab_io_geometry()}]."
         )
         return SlabIOBackend.PHDF5_FFI
 
@@ -686,7 +744,8 @@ def _route_gpu_slab_io(print_fn) -> "SlabIOBackend":
             "  [config] slab_io=auto on GPU backend: CUDA FFI write "
             f"handler unavailable ({reason}).  Routing SlabIO through "
             "PHDF5_HOST (mpi4py + h5py-parallel, per-rank collective "
-            "MPI-IO of the device shard via host staging)."
+            f"MPI-IO of the device shard via host staging) "
+            f"[{_slab_io_geometry()}]."
         )
         return SlabIOBackend.PHDF5_HOST
 

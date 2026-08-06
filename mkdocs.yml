@@ -75,6 +75,7 @@ nav:
   - Architecture:
       - Layers: architecture/layers.md
       - Substrate services: architecture/services.md
+      - SlabIO (sharded-slab HDF5): architecture/slab_io.md
       - Codebase: architecture/codebase.md
       - Memory model: architecture/memory-model.md
       - Multi-host: architecture/multihost.md

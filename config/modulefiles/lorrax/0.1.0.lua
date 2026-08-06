@@ -256,14 +256,20 @@ set_shell_function("lxalloc", [[
 
 set_shell_function("lxrun", [[
     # Lustre pre-stripe for large parallel-HDF5 writes under $PWD/tmp.
-    # Without this, files inherit pscratch's default 1×1MB layout (~30
-    # MB/s/rank cap).  `lfs` isn't in the container so it must run
-    # host-side.  Override with LORRAX_NO_PRESTRIPE=1 or
+    # Without this, files inherit pscratch's default 1x1MB layout, which
+    # is a PER-FILE single-OST ceiling of ~0.65 GiB/s: measured 0.616
+    # GiB/s at 4 ranks and 0.695 GiB/s at 16 ranks, i.e. quadrupling the
+    # ranks bought 13%.  (The previous "~30 MB/s/rank" phrasing here was
+    # the same ceiling divided by the 16-rank count; stated per rank it
+    # looks like something more parallelism can fix, which it is not.)
+    # 16 x 1M is the measured optimum at BOTH 1 and 4 nodes -- see
+    # docs/architecture/slab_io.md.  `lfs` isn't in the container so it
+    # must run host-side.  Override with LORRAX_NO_PRESTRIPE=1 or
     # LORRAX_LUSTRE_STRIPE_{COUNT,SIZE}.
     if [ -z "${LORRAX_NO_PRESTRIPE:-}" ] && command -v lfs >/dev/null 2>&1; then
         mkdir -p "$PWD/tmp" 2>/dev/null
         lfs setstripe -c "${LORRAX_LUSTRE_STRIPE_COUNT:-16}" \
-                      -S "${LORRAX_LUSTRE_STRIPE_SIZE:-4M}" \
+                      -S "${LORRAX_LUSTRE_STRIPE_SIZE:-1M}" \
                       "$PWD/tmp" >/dev/null 2>&1 || true
     fi
     local ngpu="${LORRAX_NGPU:-]] .. gpus_per_node .. [[}"

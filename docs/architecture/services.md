@@ -597,8 +597,17 @@ tail (driver-side padding is `runtime.padding`'s job). The host-MPI path
 writes synchronously by design (the threaded FFI deadlocks at `H5Fclose`
 under `MPI_THREAD_SINGLE` — `_slab_io_mpi_host.py` docstring).
 
+`H5PY_ALLGATHER` is a **refusal, not a fallback** at any process count
+> 1: it materialises the whole array on rank 0, which is the memory wall
+the per-rank-tile contract exists to avoid.
+
 **Level / deps.** L3. `ffi.phdf5` (lazy), mpi4py/h5py (lazy), the R1 lazy
 enum import.
+
+**See also.** [`slab_io.md`](slab_io.md) — the transport in full: the
+per-rank-tile contract, the routing rules and why node count is not one of
+them, the `--mpi=cray_shasta` launcher requirement and the singleton-MPI
+trap it avoids, the measured tuning defaults, and the failure modes.
 
 ---
 

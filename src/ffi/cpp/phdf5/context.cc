@@ -356,8 +356,14 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     ctx->use_collective_write = coll_write;
     ctx->coll_metadata        = force_coll_metadata;
     ctx->dedup_replicas       = env_flag("LORRAX_PHDF5_DEDUP_REPLICAS", true);
-    // Alignment default matches the new striping_unit default (4 MiB) so
-    // H5 objects start on Lustre stripe boundaries.
+    // Alignment is deliberately NOT tied to the striping_unit default.
+    // It used to be justified as "matches the striping unit so H5 objects
+    // start on stripe boundaries", but it is measured non-load-bearing on
+    // this filesystem: at 16 x 1 MiB striping, ALIGN_MB of 4 / 1 / 0 gave
+    // 0.830 / 0.809 / 0.813 GiB/s write at 1 node and 2.975 / 2.883 /
+    // 2.915 at 4 nodes -- all inside the +-1.5% repeat noise (job
+    // 56389339).  So it stays at 4 rather than becoming a second knob
+    // that has to be kept in sync with a value it does not depend on.
     long align_mb        = env_long("LORRAX_PHDF5_ALIGN_MB", 4);
     // Clamp before the shift: a typo'd LORRAX_PHDF5_ALIGN_MB of 2^50 wraps
     // ``<< 20`` around size_t and hands H5Pset_alignment a small or absurd
@@ -436,9 +442,26 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     // LORRAX_PHDF5_STRIPE_SIZE, so the documented knob silently did not
     // reach the C++ writer.  The legacy byte spelling still works as a
     // fallback.
+    // MEASURED DEFAULT (2026-08-05, job 56389339, /pscratch, 2.000 GiB
+    // C128, GiB/s aggregate write/read, best of 2 reps, MPI world size
+    // asserted):
+    //                  1 node / 4 ranks    4 nodes / 16 ranks
+    //   16 x 4 MiB      0.654 / 1.30        2.07 / 3.23   <- previous
+    //   16 x 1 MiB      0.818 / 2.29        2.93 / 4.74   <- this default
+    //   16 x 2 MiB      0.626 / 1.30        3.12 / 5.06   best at 4 nodes,
+    //                                                     WORST at 1 node
+    //   32 x 1 MiB      0.754 / 2.28        2.78 / 5.52
+    //    8 x 1 MiB      0.867 / 2.28        2.52 / 3.53
+    //    1 x 1 MiB      0.616 / 1.01        0.695 / 0.761  (fs default)
+    // 16 x 1 MiB is the only layout that wins at BOTH geometries; 2 MiB
+    // and 32-wide each win one and lose the other.  Count stays 16 for
+    // the same reason.  The 1-stripe row is the /pscratch default and is
+    // a PER-FILE single-OST ceiling near 0.65 GiB/s -- note it barely
+    // moves from 4 to 16 ranks, so it is not the "~30 MB/s per rank" the
+    // old lxrun comment claimed.  Always pre-stripe, or pass the hints.
     const char* stripe_count = std::getenv("LORRAX_PHDF5_STRIPE_COUNT");
     info_set("striping_factor", stripe_count && *stripe_count ? stripe_count : "16");
-    long stripe_bytes = 4L << 20;
+    long stripe_bytes = 1L << 20;
     if (const char* fs = std::getenv("LORRAX_PHDF5_STRIPE_SIZE_FS");
         fs && *fs) {
         char* end = nullptr;
@@ -461,7 +484,7 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     // A non-positive striping_unit is not a hint ROMIO can act on; keep the
     // default rather than pass "0" or a negative through (strtod on "-4M",
     // or a v*mult that overflowed, both land here).
-    if (stripe_bytes <= 0) stripe_bytes = 4L << 20;
+    if (stripe_bytes <= 0) stripe_bytes = 1L << 20;
     {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%ld", stripe_bytes);

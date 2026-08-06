@@ -110,11 +110,30 @@ def _setup_runtime(config, mesh_xy, *, print_fn=print) -> None:
 	from .gw_config import SlabIOBackend
 
 	if config.backend.slab_io is SlabIOBackend.PHDF5_FFI:
+		# NOT swallowed.  This call is the phdf5 FFI's MPI_Init_thread.
+		# If it fails, every subsequent collective H5Fcreate/H5Dwrite in
+		# the run is either dead or — worse — silently singleton, and a
+		# singleton-MPI run under independent I/O produces plausible,
+		# wrong-looking-at-nothing output.  A swallowed bring-up failure
+		# here is precisely how "phdf5 works multi-node" and "phdf5 fails
+		# multi-node" could BOTH be believed for months, so it now
+		# refuses, naming the launcher flag that fixes the usual cause.
+		from ffi.common.ffi_loader import phdf5_init_mpi
 		try:
-			from ffi.common.ffi_loader import phdf5_init_mpi
 			phdf5_init_mpi()
 		except Exception as exc:
-			print_fn(f"  [phdf5 init_mpi] skipped: {exc}")
+			raise RuntimeError(
+				f"slab_io=phdf5_ffi selected but the FFI's MPI bring-up "
+				f"({type(exc).__name__}: {exc}) FAILED.  Every parallel "
+				f"write in this run would go through that MPI.  Usual "
+				f"cause: the launcher's PMI flavour does not match the "
+				f"MPI library — on Perlmutter/Shifter launch with "
+				f"`srun --mpi=cray_shasta` (pmi2 and pmix both yield "
+				f"singleton MPI, where every rank sees world_size==1 and "
+				f"independent writes still produce a plausible file).  "
+				f"See docs/architecture/slab_io.md.  Set "
+				f"slab_io=h5py_allgather to run without parallel HDF5."
+			) from exc
 	elif config.backend.slab_io is SlabIOBackend.PHDF5_HOST:
 		# mpi4py initialises MPI on first import; do it here so the
 		# ~400 ms MPI_Init cost is amortised before the first SlabIO

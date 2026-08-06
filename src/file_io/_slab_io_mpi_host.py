@@ -115,7 +115,11 @@ def _stripe_size_bytes() -> int:
     ``LORRAX_PHDF5_STRIPE_COUNT`` refuses the same way, see
     ``_slab_io_ffi._stripe_count``).
     """
-    raw = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE_FS", "4M").strip()
+    # Default 1M since 2026-08-05; measured basis in
+    # src/ffi/cpp/phdf5/context.cc and docs/architecture/slab_io.md.
+    # Kept identical to the C++ writer's default on purpose: a given
+    # environment must mean the same layout in every writer.
+    raw = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE_FS", "1M").strip()
     mult = 1
     base = raw
     if raw and raw[-1] in "kKmMgG":
