@@ -496,7 +496,7 @@ def _resolve_munu_reader(
     dset: h5py.Dataset,
     kgrid: Optional[tuple[int, int, int]] = None,
 ):
-    """Resolve ``(n_rmu, n_rnu, nkx, nky, nkz, read_slab)`` for a V/W μν dataset.
+    """Resolve ``(n_rmu, n_rnu, nkx, nky, nkz, read_slab, read_q_slab)``.
 
     Single source of the on-disk layout shim both sharded readers need.
     Handles three layouts:
@@ -509,6 +509,15 @@ def _resolve_munu_reader(
     the dataset must carry a ``'kgrid'`` attribute).  ``read_slab(mu0, mu1,
     nu0, nu1)`` returns the ``(μ, ν, nkx, nky, nkz)`` slab for that μ/ν block;
     q=0 is the ``(0, 0, 0)`` k-slice.
+
+    ``read_q_slab(q, mu0, mu1, nu0, nu1)`` returns the ``(μ, ν)`` tile at ONE
+    flat q index.  It exists because ``read_slab`` reads the FULL q axis: a
+    consumer that wants a single q (``_read_vq0_sharded`` wants only q=0) went
+    through ``read_slab(...)[:, :, 0, 0, 0]`` and paid ``nq``× the bytes it
+    used — 36× on the nq=36 MoS2 6×6 deck, 144× on a 12×12 grid, and the
+    discarded remainder is exactly as large as the whole ``W_q`` tile the same
+    loader reads next.  Element-for-element the two routes select the same
+    numbers; this one just does not read the other q's.
     """
     if dset.ndim == 8:
         n_rmu = int(dset.shape[6])
@@ -516,19 +525,28 @@ def _resolve_munu_reader(
         nkx, nky, nkz = (int(s) for s in dset.shape[3:6])
         read_slab = lambda mu0, mu1, nu0, nu1: np.transpose(
             dset[0, 0, 0, :, :, :, mu0:mu1, nu0:nu1], (3, 4, 0, 1, 2))
-        return n_rmu, n_rnu, nkx, nky, nkz, read_slab
+
+        def read_q_slab(q, mu0, mu1, nu0, nu1, _n=(nkx, nky, nkz)):
+            qx, qy, qz = np.unravel_index(int(q), _n)
+            return np.asarray(dset[0, 0, 0, qx, qy, qz, mu0:mu1, nu0:nu1])
+
+        return n_rmu, n_rnu, nkx, nky, nkz, read_slab, read_q_slab
     if dset.ndim == 6:
         n_rmu = int(dset.shape[-2])
         n_rnu = int(dset.shape[-1])
         nq = int(dset.shape[3])
         _flat = lambda mu0, mu1, nu0, nu1: np.asarray(
             dset[0, 0, 0, :, mu0:mu1, nu0:nu1])
+        _flat_q = lambda q, mu0, mu1, nu0, nu1: np.asarray(
+            dset[0, 0, 0, int(q), mu0:mu1, nu0:nu1])
     else:  # 3-D flat-q
         n_rmu = int(dset.shape[-2])
         n_rnu = int(dset.shape[-1])
         nq = int(dset.shape[0])
         _flat = lambda mu0, mu1, nu0, nu1: np.asarray(
             dset[:, mu0:mu1, nu0:nu1])
+        _flat_q = lambda q, mu0, mu1, nu0, nu1: np.asarray(
+            dset[int(q), mu0:mu1, nu0:nu1])
     if kgrid is not None:
         nkx, nky, nkz = (int(v) for v in kgrid)
     elif 'kgrid' in dset.attrs:
@@ -545,7 +563,7 @@ def _resolve_munu_reader(
         _flat(mu0, mu1, nu0, nu1)
         .reshape(nkx, nky, nkz, mu1 - mu0, nu1 - nu0)
         .transpose(3, 4, 0, 1, 2))
-    return n_rmu, n_rnu, nkx, nky, nkz, read_slab
+    return n_rmu, n_rnu, nkx, nky, nkz, read_slab, _flat_q
 
 
 def _read_vq0_sharded(
@@ -562,7 +580,8 @@ def _read_vq0_sharded(
         mesh_xy, origin="bse_io._read_vq0_sharded")
     local_x, local_y = _get_local_axis_coords(local_coords)
     _assert_local_block(local_coords, local_x, local_y)
-    n_rmu, n_rnu, _nkx, _nky, _nkz, read_slab = _resolve_munu_reader(dset, kgrid=kgrid)
+    (n_rmu, n_rnu, _nkx, _nky, _nkz,
+     _read_slab, read_q_slab) = _resolve_munu_reader(dset, kgrid=kgrid)
 
     local_mu = mu_per_x * len(local_x)
     local_nu = nu_per_y * len(local_y)
@@ -578,8 +597,10 @@ def _read_vq0_sharded(
             nu_end = min(nu_start + nu_per_y, n_rnu)
             if nu_start >= n_rnu:
                 continue
-            # q=0 is the (0, 0, 0) k-slice of the normalized (μ, ν, k...) slab.
-            slab = read_slab(mu_start, mu_end, nu_start, nu_end)[:, :, 0, 0, 0]
+            # q=0 only.  ``read_q_slab`` hyperslabs the single q on DISK; the
+            # old ``read_slab(...)[:, :, 0, 0, 0]`` read all nq and threw
+            # nq-1 of them away (see _resolve_munu_reader).  Same elements.
+            slab = read_q_slab(0, mu_start, mu_end, nu_start, nu_end)
             if slab.shape[0] < mu_per_x or slab.shape[1] < nu_per_y:
                 pad_mu = mu_per_x - slab.shape[0]
                 pad_nu = nu_per_y - slab.shape[1]
@@ -614,7 +635,8 @@ def _read_wq_sharded(
     # Layout shim (8-D / 6-D / 3-D-flat-q) is single-sourced in
     # ``_resolve_munu_reader``.  Internal BSE work below stays in the
     # ``(μ, μ, nkx, nky, nkz)`` form the reader already produces.
-    n_rmu, n_rnu, nkx, nky, nkz, _read_munu_slab = _resolve_munu_reader(dset, kgrid=kgrid)
+    (n_rmu, n_rnu, nkx, nky, nkz,
+     _read_munu_slab, _read_q_slab) = _resolve_munu_reader(dset, kgrid=kgrid)
 
     local_mu = mu_per_x * len(local_x)
     local_nu = nu_per_y * len(local_y)
