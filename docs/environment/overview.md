@@ -212,12 +212,46 @@ a different worktree, which the path makes obvious and nothing else would.
 >   `jax_use_shardy_partitioner=False` on both. *Scope: single-device
 >   arithmetic only. Multi-rank reduction order was **not** measured.*
 >
-> **The entire real divergence is `jax._src`** — private-API arities, reached
-> from `common/jax_compile_cache.py`, which monkeypatches jax internals. That
-> is the whole blast radius: every *public* symbol LORRAX touches exists with a
-> compatible signature on both generations. Which generation LORRAX supports
-> is an open owner decision; a version gate would make the straddle visible
-> either way.
+> **Two real divergences, not one.** *(This paragraph said "the entire real
+> divergence is `jax._src`" until 2026-08-06. The second one below was
+> measured that day and is the one that actually blocks the move.)*
+>
+> 1. **`jax._src` private-API arities**, reached from
+>    `common/jax_compile_cache.py`, which monkeypatches jax internals. Every
+>    *public* symbol LORRAX touches does exist with a compatible signature on
+>    both generations, so this half of the old claim stands.
+> 2. **`shard_map` behaviour, from jax 0.7.0** — a public-API divergence that
+>    a signature comparison cannot see. From 0.7.0 `shard_map` tracks
+>    **varying manual axes** (VMA): every value in the body carries the set of
+>    mesh axes it may differ over, and `scan` / `fori_loop` / `while_loop`
+>    require that set to be **equal** at carry input and output. An
+>    accumulator built by `jnp.zeros` has an empty set, so the first
+>    `A = A + <sharded data>` makes the output varying and the loop is
+>    **rejected at trace time**. Tracking starts at **0.7.0, not 0.9** — a
+>    guard written as "only 0.9 needs this" is wrong across the whole
+>    0.7–0.8 range. Worse, `lax.pcast` does not exist on 0.7.x at all, so the
+>    obvious `try: lax.pcast / except AttributeError: identity` shim installs
+>    a **no-op on exactly the versions that enforce the rule**; that defect
+>    was live in `common/cholesky_2d.py`.
+>
+> **The blast radius of (2) is small and was counted, not estimated.** An AST
+> census over `src/` — `shard_map` entry points → within-module call-graph
+> closure → loop carries, classified by how the init is built — finds 21
+> loop-carry sites reachable from a `shard_map` body, of which **8 need
+> marking, all in `src/bse/bse_ring_comm.py`**. Marking is not free either
+> way: a carry that is invariant by construction and leaves through a
+> *replicated* `out_specs` entry **fails** if it is marked, so "mark all the
+> mesh axes to be safe" is its own bug.
+>
+> **Status.** The port is done on `agent/jax-070-land-2026-08-06`
+> (**unmerged** — not an ancestor of `integration/2026-08-06` or of
+> `origin/main`): `src/common/vma.py` owns the version decision once and
+> refuses at import on a jax that tracks VMA but offers neither spelling;
+> the container moves to `ghcr.io/nvidia/jax:jax-2025-07-21` (jax 0.7.0,
+> CUDA 12.9); `common/jax_support.py` gates the window at
+> `[0.7.0, 0.10.0)`; and four of the five compile-cache shims are deleted.
+> The startup version gate itself is already on this branch
+> (`agent/jax-version-gate-2026-08-06`, merged).
 >
 > **"Just move to a newer container" is not available, and this is the first
 > thing to check before planning around it.** Measured 2026-08-06: **no NVIDIA
@@ -229,6 +263,13 @@ a different worktree, which the path makes obvious and nothing else would.
 > against everything staged under `/lorrax_nvhpc` for CUDA 12.9 (§4 of
 > [`ffi_layout.md`](../architecture/ffi_layout.md)). That is a port, not a pin
 > change.
+>
+> **But the exit is not to 0.9 — it is to 0.7.0, and that image does exist.**
+> `ghcr.io/nvidia/jax:jax-2025-07-21` ships jax 0.7.0 on CUDA 12.9 and is the
+> **last CUDA-12 image**. It clears the VMA divergence above and lets the
+> supported window be `[0.7.0, 0.10.0)` — a window both machines can meet —
+> without touching the CUDA-12 stage. Taken on
+> `agent/jax-070-land-2026-08-06`, unmerged.
 >
 > **A version string read from a container is not evidence.** Every container
 > JAX is a dev build that restamps its display string to the *run* date: all
