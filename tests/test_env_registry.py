@@ -101,7 +101,39 @@ def registry_vocabulary(text):
             globs.add(tok[:-1])
         else:
             exact.add(tok)
+    globs -= universal_globs(globs)
     return exact, globs
+
+
+#: The namespace this gate polices.  A glob prefix at or above it matches
+#: EVERY name the gate could ever check.
+_GATED_NAMESPACE = "LORRAX_"
+
+
+def universal_globs(globs):
+    """The subset of ``globs`` that would cover the whole gated namespace.
+
+    ``registry_vocabulary`` harvests any ``ALLCAPS*`` token in the page,
+    which is the right rule for a family row like ``LORRAX_SLATE_*`` and
+    the WRONG one for the same spelling used in a SENTENCE.  A bare
+    ``LORRAX_*`` in prose is not a family — it is the English for "all of
+    them" — and admitting it as a prefix makes :func:`covered` return True
+    for every name, so the gate cannot fail.
+
+    That is not hypothetical.  Until 2026-08-06 the only such token on the
+    page was in the line documenting the gate itself::
+
+        python3 tests/test_env_registry.py    # ENFORCEMENT: every LORRAX_* read site
+
+    so the sentence describing the enforcement was the thing disabling it,
+    and `LORRAX_FFTW3_SO` sat unregistered underneath.  Dropping these is
+    safe: a family row that genuinely means "every LORRAX var is
+    documented" would be a claim no page can support.
+
+    Same defect class as `nm -D --undefined-only | grep -c fftw_` (CLAIMS
+    88) — a check driven to its passing value by construction.
+    """
+    return {g for g in globs if _GATED_NAMESPACE.startswith(g)}
 
 
 def covered(name, exact, globs):
@@ -237,6 +269,41 @@ def test_registry_coverage_can_fail():
         "the gate is decorative")
     assert not covered("LORRAX_PAIR_THREE", exact, globs), (
         "brace expansion invented an alternative that is not in the text")
+
+
+def test_the_real_registry_has_no_universal_glob():
+    """The gate must be able to FAIL against the page as it is written.
+
+    The control above proves ``covered`` can say no on a SYNTHETIC text.
+    It cannot see a universal glob in the real page, which is exactly how
+    one survived: one ``LORRAX_*`` in a prose line silently made every
+    name covered, and both registry tests passed while reporting nothing.
+
+    A gate whose vocabulary matches everything is decorative.  This is the
+    control that watches the real input.
+    """
+    raw_globs = set()
+    for tok in _NAME_RE.findall(_BRACE_RE.sub(" ", _registry_text())):
+        if tok.endswith("*"):
+            raw_globs.add(tok[:-1])
+    bad = universal_globs(raw_globs)
+    assert not bad, (
+        "docs/dev/env_vars.md contains %r, a prefix glob covering the whole "
+        "%s namespace.  Every read site would be 'covered' and neither "
+        "registry test could ever fail.  Write the family out (e.g. "
+        "`LORRAX_SLATE_*`), or say 'every LORRAX variable' in words without "
+        "the trailing star." % (sorted(bad), _GATED_NAMESPACE))
+
+
+def test_universal_glob_would_hide_an_unregistered_name():
+    """The mechanism, demonstrated end to end on a fixture."""
+    honest, _ = registry_vocabulary("`LORRAX_REAL_KNOB` is a row")
+    assert not covered("LORRAX_UNREGISTERED", honest, set())
+    # Add the prose spelling and, without the filter, everything is covered.
+    raw = {"LORRAX_"}
+    assert covered("LORRAX_UNREGISTERED", set(), raw), (
+        "fixture is wrong: a bare LORRAX_ prefix should match everything")
+    assert not covered("LORRAX_UNREGISTERED", set(), raw - universal_globs(raw))
 
 
 def test_cpp_regex_can_fail_and_can_match():
