@@ -36,7 +36,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.scipy.linalg import solve_triangular
 
 # jax 0.9 tracks varying-manual-axes (VMA) inside shard_map and its strict

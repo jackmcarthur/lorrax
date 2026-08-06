@@ -646,7 +646,7 @@ def _psum_kernel(ndim: int, mesh):
     from functools import partial
 
     import jax
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
     from jax.sharding import PartitionSpec as P
 
     key = (int(ndim), id(mesh))
@@ -656,7 +656,7 @@ def _psum_kernel(ndim: int, mesh):
         axes = tuple(mesh.axis_names)
 
         @partial(shard_map, mesh=mesh, in_specs=(P(axes, *rest),),
-                 out_specs=P(*rest), check_rep=False)
+                 out_specs=P(*rest), check_vma=False)
         def _body(x):
             return jax.lax.psum(x[0], axes)
 
@@ -1322,7 +1322,7 @@ def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
     import jax.numpy as jnp
     from jax import lax
     from jax.sharding import PartitionSpec as P
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
     if jax.process_count() <= 1:
         return 0.0
     key = (tuple(int(d.id) for d in mesh.devices.ravel()),
@@ -1336,7 +1336,7 @@ def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
     for ax in groups:
         f = jax.jit(shard_map(lambda a, ax=ax: lax.psum(a, ax), mesh=mesh,
                               in_specs=(P(None),), out_specs=P(None),
-                              check_rep=False))
+                              check_vma=False))
         jax.block_until_ready(f(tiny))
     dt = time.perf_counter() - t0
     # Mark AFTER the collectives succeed: marking first would skip the warm-up

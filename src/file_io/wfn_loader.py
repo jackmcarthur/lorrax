@@ -56,7 +56,7 @@ import h5py as h5
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
@@ -1655,7 +1655,7 @@ def _phdf5_unfold_kernel(
     out_specs = P(None, ("x", "y"), None, None)        # (n_k, bpr→band, ns, ngkmax)
     return jax.jit(shard_map(
         _per_rank, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
-        check_rep=False,
+        check_vma=False,
     ))
 
 

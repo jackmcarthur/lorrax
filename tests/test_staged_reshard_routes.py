@@ -116,7 +116,7 @@ def test_route_comparison_detects_a_wrong_block_map():
     comparison to reject it — otherwise the passes above would also pass
     for a route that shuffles the batch.
     """
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
     b, m, n = 8, 12, 20
     mesh = _mesh()
 
@@ -127,7 +127,7 @@ def test_route_comparison_detects_a_wrong_block_map():
         return t
 
     bad = jax.jit(shard_map(_body_ymajor, mesh=mesh, in_specs=(FACE,),
-                            out_specs=BATCH, check_rep=False))
+                            out_specs=BATCH, check_vma=False))
     a = jax.device_put(_probe(b, m, n), NamedSharding(mesh, FACE))
     ref = np.asarray(_unstaged(mesh)(a))
     with pytest.raises(AssertionError):

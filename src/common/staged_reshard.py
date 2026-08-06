@@ -43,7 +43,7 @@ Stage 2's tile multiset still is not a permutation *of the whole mesh* —
 but it is one **within each 'x' group**, which is precisely what
 ``lax.all_to_all(..., 'y', ...)`` expresses and what the partitioner
 could not infer.  Issuing both exchanges by hand inside ONE ``shard_map``
-(``check_rep=False``) is therefore not an optimisation hint but a
+(``check_vma=False``) is therefore not an optimisation hint but a
 structural guarantee: the partitioner cannot hoist, merge or re-plan
 collectives written inside a manual-axis region (the per_q lesson,
 QUALITY_PATTERNS §4; the same reason
@@ -251,7 +251,7 @@ def face_to_batch_reshard(mesh: Mesh, *,
     created from an intra-op pool worker dies on jaxlib's
     ``MPI_Is_thread_main`` guard.
     """
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
 
     if route not in ROUTES:
         raise ValueError(
@@ -333,7 +333,7 @@ def face_to_batch_reshard(mesh: Mesh, *,
         return shard_map(body, mesh=mesh,
                          in_specs=(P(None, ax_x, ax_y),),
                          out_specs=P((ax_x, ax_y), None, None),
-                         check_rep=False)
+                         check_vma=False)
 
     _sm_cache: dict = {}
 

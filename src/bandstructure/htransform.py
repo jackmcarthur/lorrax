@@ -18,7 +18,7 @@ from jax.scipy import linalg as jsp_linalg
 from jax.scipy.special import erf
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from functools import partial
 
 from file_io import WfnLoader as WFNReader

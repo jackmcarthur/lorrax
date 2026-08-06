@@ -299,7 +299,7 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
     bands (reports/device_invariance_2026-07-08/ROOT_CAUSE.md, charge
     manifestation).  At zero pad the slice/fill are no-ops.
     """
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
 
     n_log = int(n_rmu_logical) if n_rmu_logical is not None else int(n_rmu)
     if n_log > int(n_rmu):
@@ -487,7 +487,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
     from ffi.linalg.plan import plan as linalg_plan
     # House chunking pattern — single source (scorecard AF): one emitted
     # collective's payload is bounded by LORRAX_COLLECTIVE_CHUNK_MB.
@@ -527,7 +527,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
 
     @partial(shard_map, mesh=mesh_xy,
              in_specs=(P(None, 'x', 'y'), P(None, 'x', 'y')),
-             out_specs=P(None, 'x', 'y'), check_rep=False)
+             out_specs=P(None, 'x', 'y'), check_vma=False)
     def _a_local(V_loc, chi_loc):
         # A[q,i,j] = δ_ij − Σ_k V[q,i,k]·χs[q,k,j] on my (i on 'x',
         # j on 'y') tile.  Classic 2-D block GEMM pairing — same shape
@@ -561,7 +561,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     if n_log < n_ext:
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=P(None, 'x', 'y'), out_specs=P(None, 'x', 'y'),
-                 check_rep=False)
+                 check_vma=False)
         def _mask_pads_local(W_loc):
             # W pad rows/cols → exact zeros (they are already exact by
             # the block-diagonal argument above; the mask makes the

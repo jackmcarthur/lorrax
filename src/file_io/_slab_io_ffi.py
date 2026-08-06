@@ -32,7 +32,7 @@ from typing import Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import barrier as _barrier, device_put_process_local
@@ -959,7 +959,7 @@ def _get_read_sm(mesh, partition_spec, *,
     sm_bare = shard_map(
         _per_rank, mesh=mesh,
         in_specs=(P(), P()), out_specs=partition_spec,
-        check_rep=False,
+        check_vma=False,
     )
     return jax.jit(sm_bare)
 
@@ -984,7 +984,7 @@ def _get_write_sm(mesh, in_specs, *,
     sm_bare = shard_map(
         _per_rank, mesh=mesh,
         in_specs=(in_specs, P(), P()), out_specs=P(),
-        check_rep=False,
+        check_vma=False,
     )
     return sm_bare if no_jit else jax.jit(sm_bare)
 

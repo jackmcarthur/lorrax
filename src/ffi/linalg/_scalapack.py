@@ -28,7 +28,7 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 from ._slate import (_mesh_key, ensure_registered, get_or_init_context,
@@ -154,7 +154,7 @@ def batched_distributed_eigh(
         @partial(shard_map, mesh=mesh,
                  in_specs=P(None, "x", "y"),
                  out_specs=(P(), P(None, "y", "x")),
-                 check_rep=False)
+                 check_vma=False)
         def _call(local_A):
             # Inner transpose: row-major shard → col-major local block
             # (same convention as every slate/scalapack wrapper).
@@ -164,7 +164,7 @@ def batched_distributed_eigh(
 
         @partial(shard_map, mesh=mesh,
                  in_specs=P(None, "y", "x"), out_specs=P(None, "x", "y"),
-                 check_rep=False)
+                 check_vma=False)
         def _untranspose(local_Z_T):
             return jnp.transpose(local_Z_T, (0, 2, 1))
 
@@ -311,7 +311,7 @@ def batched_distributed_getrf(
         @partial(shard_map, mesh=mesh,
                  in_specs=(P(None, "x", "y"),),
                  out_specs=(P(None, "x", "y"), P(None, ("x", "y"))),
-                 check_rep=False)
+                 check_vma=False)
         def _getrf(local_A):
             local_A_T = jnp.transpose(local_A, (0, 2, 1))
             LU_T, ipiv = jax.ffi.ffi_call(
@@ -378,7 +378,7 @@ def batched_distributed_getrs(
                  in_specs=(P(None, "x", "y"), P(None, ("x", "y")),
                            P(None, "x", "y")),
                  out_specs=P(None, "x", "y"),
-                 check_rep=False)
+                 check_vma=False)
         def _getrs(local_LU, local_ipiv, local_B):
             local_LU_T = jnp.transpose(local_LU, (0, 2, 1))
             local_B_T = jnp.transpose(local_B, (0, 2, 1))
@@ -455,7 +455,7 @@ def batched_distributed_solve_lu(
         @partial(shard_map, mesh=mesh,
                  in_specs=(P(None, "x", "y"), P(None, "x", "y")),
                  out_specs=P(None, "x", "y"),
-                 check_rep=False)
+                 check_vma=False)
         def _solve(local_A, local_B):
             # Inner transpose: row-major shard → col-major local block
             # (same convention as every slate/cusolvermp wrapper).

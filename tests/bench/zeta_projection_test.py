@@ -91,7 +91,7 @@ _init()
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P   # noqa: E402
 from jax.experimental import multihost_utils                       # noqa: E402
-from jax.experimental.shard_map import shard_map                   # noqa: E402
+from common.shard_map import shard_map                   # noqa: E402
 
 from common.zeta_projection import (                                # noqa: E402
     build_zeta_transfer,
@@ -151,7 +151,7 @@ def _make_zeta(mesh, n_q, n_mu, n_g, tag, axes=("x", "y")):
 
     return jax.jit(shard_map(
         _body, mesh=mesh, in_specs=(P(None),),
-        out_specs=P(None, None, (ax_x, ax_y)), check_rep=False))(dummy)
+        out_specs=P(None, None, (ax_x, ax_y)), check_vma=False))(dummy)
 
 
 def _zeta_block(n_q, m_idx, g_idx, n_g, tag):
@@ -202,7 +202,7 @@ def _make_zeta_2d(mesh, n_q, n_mu, n_g, tag, *, mu_axis, g_axis):
 
     return jax.jit(shard_map(
         _body, mesh=mesh, in_specs=(P(None),), out_specs=spec,
-        check_rep=False))(dummy)
+        check_vma=False))(dummy)
 
 
 # W_L:  W[q,i,j] = f[q,i] · conj(f[q,j]) · g[|i-j|]  with g REAL  ⇒ exactly
@@ -243,7 +243,7 @@ def _make_W_L(mesh, f_host, g_host, axes=("x", "y")):
 
     return jax.jit(shard_map(
         _body, mesh=mesh, in_specs=(P(None, None), P(None)),
-        out_specs=P(None, ax_x, ax_y), check_rep=False))(f_dev, g_dev)
+        out_specs=P(None, ax_x, ax_y), check_vma=False))(f_dev, g_dev)
 
 
 def _w_host_block(f, g, rows, cols):
@@ -281,7 +281,7 @@ def _selection_operands(mesh, n_q, mu_l, mu_s, axes=("x", "y")):
             return jnp.broadcast_to(sel[None], (n_q,) + sel.shape)
         return jax.jit(shard_map(
             _body, mesh=mesh, in_specs=(P(None),),
-            out_specs=P(None, None, ax), check_rep=False))(idx_dev)
+            out_specs=P(None, None, ax), check_vma=False))(idx_dev)
 
     ops = jax.jit(lambda a, b: transfer_operands_from_dense(a, b, mesh, axes))
     return (*ops(_mk(ax_x, p_x), _mk(ax_y, p_y)), idx)
@@ -588,7 +588,7 @@ def _rank_checksum(mesh, A, mu_axis, axes=("x", "y")):
 
     v = jax.jit(shard_map(
         _body, mesh=mesh, in_specs=(P(None, None, mu_axis),),
-        out_specs=P((ax_x, ax_y)), check_rep=False))(A)
+        out_specs=P((ax_x, ax_y)), check_vma=False))(A)
     # The (P,) result is itself sharded one-entry-per-rank, so a bare
     # np.asarray raises "spans non-addressable devices" (it did, job
     # 7879519, and took the localization dump down with it).

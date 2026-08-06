@@ -28,11 +28,11 @@ Facts the census encodes, all MEASURED on the 0.7.0 container (JID 56405696,
   * ``jnp.zeros_like(x)`` PROPAGATES x's varying axes — those carries need no
     mark.  Only shape/dtype constructors start with an empty set.
   * ``lax.scan`` with ``init=None`` has no carry and cannot mismatch.
-  * ``check_rep=False`` (experimental spelling) / ``check_vma=False`` (the
-    ``jax.shard_map`` spelling) switch the check OFF, so those bodies are
-    exempt.  The two kwargs are NOT interchangeable: passing the wrong one is
-    a TypeError on 0.7.0, which is what ``test_check_kwarg_matches_import``
-    guards.
+  * ``check_vma=False`` switches the check OFF, so those bodies are exempt.
+    Since 2026-08-06 that is the only spelling in this tree: ``shard_map``
+    comes from ``common.shard_map``, which translates to the legacy
+    ``check_rep=`` on the one jax that needs it.  Which symbol and which
+    kwarg is ``tests/test_shard_map_spelling.py``'s fact, not this file's.
   * Over-marking is NOT safe: a carry that is invariant by construction and
     leaves through a replicated ``out_specs`` entry FAILS if marked.  So the
     census reports sites; it does not authorise a blanket edit.
@@ -387,42 +387,3 @@ def test_no_unmarked_replicated_carry_under_a_checked_shard_map():
         "unmarked replicated loop carry under a VMA-checked shard_map — these "
         "raise 'the varying manual axes do not match' on jax >= 0.7.0:\n"
         + "\n".join("  %s:%d  %s in %s (carry element %d)" % b for b in bad))
-
-
-def test_check_kwarg_matches_the_shard_map_that_was_imported():
-    """``check_rep=`` and ``check_vma=`` belong to DIFFERENT shard_map symbols.
-
-    Measured on jax 0.7.0::
-
-        jax.shard_map                        -> (f, out_specs, axis_names,
-                                                 in_specs, mesh, check_vma)
-        jax.experimental.shard_map.shard_map -> (f, mesh, in_specs, out_specs,
-                                                 check_rep, auto)
-
-    Passing the wrong one raises TypeError; it is not ignored.  Roughly sixty
-    shard_maps in this tree rely on ``check_rep=False`` to switch VMA checking
-    off, and every one of them must therefore be calling the EXPERIMENTAL
-    symbol.  A file that switches its import to ``from jax import shard_map``
-    while keeping ``check_rep=`` breaks on every jax >= 0.7 at once.
-    """
-    offenders = []
-    for rel, src in _iter_src():
-        if "check_rep" not in src:
-            continue
-        try:
-            tree = ast.parse(src, filename=rel)
-        except SyntaxError:
-            continue
-        # AST, not grep: this module's own docstring names the kwarg.
-        uses = any(isinstance(n, ast.keyword) and n.arg == "check_rep"
-                   for n in ast.walk(tree))
-        if not uses:
-            continue
-        if "from jax.experimental.shard_map import shard_map" in src \
-                or "from jax.experimental import shard_map" in src:
-            continue
-        offenders.append(rel)
-    assert not offenders, (
-        "these files pass check_rep= but do not import shard_map from "
-        "jax.experimental.shard_map; on jax >= 0.7.0 jax.shard_map has no "
-        "check_rep kwarg and raises TypeError:\n  " + "\n  ".join(offenders))

@@ -11,7 +11,7 @@ from functools import partial
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from file_io import WfnLoader as WFNReader
 
@@ -440,7 +440,7 @@ def _get_unfold_v_q_jit(
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=P(None, 'x', 'y'),
                  out_specs=P(None, 'x', 'y'),
-                 check_rep=False)
+                 check_vma=False)
         def _kernel(V_ibz_local):
             # V_ibz_local: (n_q_ibz, μ/Px, ν/Py)
             perm_q = fwd_perm_j[sym_j]                      # (n_q_full, n_rmu)

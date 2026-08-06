@@ -43,7 +43,7 @@ from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 from ..common.ffi_loader import get_lib
@@ -161,7 +161,7 @@ def batched_distributed_cholesky(
         @partial(shard_map, mesh=mesh,
                  in_specs=P(None, "x", "y"),
                  out_specs=P(None, "y", "x"),
-                 check_rep=False)
+                 check_vma=False)
         def _potrf(local_A):
             local_A_T = jnp.transpose(local_A, (0, 2, 1))
             # Alias A → L: factor in place, skip the D2D memcpy in the
@@ -246,7 +246,7 @@ def batched_distributed_potrs(
         @partial(shard_map, mesh=mesh,
                  in_specs=(P(None, "y", "x"), P(None, "x", "y")),
                  out_specs=P(None, "x", "y"),
-                 check_rep=False)
+                 check_vma=False)
         def _potrs(local_L, local_B):
             # B row-major (Nq, N/Px, Mrhs/Py) → inner transpose →
             # (Nq, Mrhs/Py, N/Px) row-major = (N/Px, Mrhs/Py) col-major per slice.
@@ -301,7 +301,7 @@ def cholesky_handle_to_natural_L(L_handle: CusolverMpBatchedLowerL) -> jax.Array
     @partial(shard_map, mesh=mesh,
              in_specs=P(None, "y", "x"),
              out_specs=P(None, "x", "y"),
-             check_rep=False)
+             check_vma=False)
     def _to_natural(L_raw_T):
         # L_raw_T local bytes = L^T (row-major view of col-major L bytes).
         # Swap inner dims to recover L in row-major (materialized copy).
@@ -392,7 +392,7 @@ def batched_distributed_solve_lu(
         @partial(shard_map, mesh=mesh,
                  in_specs=(P(None, "x", "y"), P(None, "x", "y")),
                  out_specs=P(None, "x", "y"),
-                 check_rep=False)
+                 check_vma=False)
         def _solve(local_A, local_B):
             local_A_T = jnp.transpose(local_A, (0, 2, 1))
             local_B_T = jnp.transpose(local_B, (0, 2, 1))

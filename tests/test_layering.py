@@ -72,7 +72,12 @@ _L3_MODULES = frozenset({
     # movement primitives.  Named, owned patterns — NOT generic ``shard_map``
     # wrappers, which is a refusal recorded in docs/architecture/layers.md.
     "common.contract_bands", "common.staged_reshard", "common.sharding_fit",
-    # jax glue and instrumentation
+    # jax glue and instrumentation.  ``common.shard_map`` is a VERSION SHIM,
+    # not the generic wrapper layers.md rule 2 forbids -- it selects a symbol
+    # and a kwarg spelling and forwards in_specs/out_specs untouched; see its
+    # docstring.  It is L3 because L3 kernels (fft_helpers, ffi.*, file_io)
+    # import it.
+    "common.shard_map",
     "common.jax_compile_cache", "common.jax_profile", "common.timing",
     "common.progress", "common.gpu_utils", "common.async_io", "common.sanity",
     # FFT kernels
@@ -383,13 +388,14 @@ _DRIVER_PLUMBING_BUDGET = {
     # freed ``kin_ion_io``, and it is a physics decision about where the
     # exciton-band assembly lives.  Numbered request.
     "bse.exciton_bands": 1,
-    # ``jax.sharding`` + ``jax.experimental.shard_map`` at :18-19.  Same
-    # shape, larger: htransform is the H-matrix interpolation LIBRARY with a
-    # CLI bolted on, and its Galerkin solve is written in ``shard_map``.  Its
-    # hand-rolled ``_build_mesh_xy`` is gone (2026-07-31; since 2026-08-01 it
-    # hands back the mesh ``initialize_communicator_stack`` built) — so the
-    # residue is the kernel half only.
-    "bandstructure.htransform": 2,
+    # ``jax.sharding`` at :20.  Same shape as exciton_bands, larger:
+    # htransform is the H-matrix interpolation LIBRARY with a CLI bolted on,
+    # and its Galerkin solve is written in ``shard_map``.  Its hand-rolled
+    # ``_build_mesh_xy`` is gone (2026-07-31; since 2026-08-01 it hands back
+    # the mesh ``initialize_communicator_stack`` built), and since 2026-08-06
+    # its ``shard_map`` comes from ``common.shard_map`` rather than from
+    # ``jax.experimental`` — so the residue is one ``jax.sharding`` import.
+    "bandstructure.htransform": 1,
     # One ``from jax.sharding import ...`` each.  The four BSE CLIs also
     # default ``--px/--py`` to 1 and slice ``devices[:px*py]``, so on 16
     # devices with no flags they run a 1x1 mesh with no warning.  That is a

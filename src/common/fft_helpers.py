@@ -4,7 +4,7 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 
 
 # =============================================================================

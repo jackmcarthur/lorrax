@@ -47,7 +47,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.experimental import multihost_utils as _mh
 from functools import partial
 
@@ -574,7 +574,7 @@ def make_sharded_pivoted_cholesky_select(
         return shard_map(
             _entry, mesh=mesh,
             in_specs=tuple(specs), out_specs=out_specs,
-            check_rep=False,
+            check_vma=False,
         )(*args)
 
     return step

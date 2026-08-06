@@ -42,7 +42,7 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 from ..common.ffi_loader import get_lib
@@ -137,7 +137,7 @@ def distributed_eigh(
              mesh=mesh,
              in_specs=P("x", "y"),
              out_specs=(P(), P("x", "y")),
-             check_rep=False)
+             check_vma=False)
     def _call(local_A):
         return jax.ffi.ffi_call(
             _FFI_TARGET, (W_local, Q_local))(local_A, **attrs)

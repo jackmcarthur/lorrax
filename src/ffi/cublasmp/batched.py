@@ -26,7 +26,7 @@ from typing import Union
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 from ..common.ffi_loader import get_lib
@@ -188,7 +188,7 @@ def batched_distributed_gemm(
                            P(None, "x", "y"),
                            P(None, "x", "y")),
                  out_specs=P(None, "x", "y"),
-                 check_rep=False)
+                 check_vma=False)
         def _gemm(local_A, local_B, local_C):
             # Pre-transpose inner dims (row-major → col-major bytes).
             A_T = jnp.transpose(local_A, (0, 2, 1))
@@ -302,7 +302,7 @@ def batched_fused_w_solve_jit(
     @partial(shard_map, mesh=mesh,
              in_specs=(P(None, "x", "y"), P(None, "x", "y")),
              out_specs=P(None, "x", "y"),
-             check_rep=False)
+             check_vma=False)
     def _w_solve(local_V, local_chi):
         # Pre-transpose so bytes are col-major (N/Px × N/Py) per rank.
         V_T   = jnp.transpose(local_V,   (0, 2, 1))
