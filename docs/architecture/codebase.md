@@ -50,9 +50,12 @@ src/
 │   ├── greens_function_kernel.py  build_G (single entry point)
 │   ├── head_correction.py     q→0 head sample + exact static head terms
 │   ├── wavefunction_bundle.py BandSlices + Wavefunctions (4 sharded ψ copies); project, project_ri (band-space contractions)
-│   ├── vcoul.py               v(q+G), MC q=0 averages, 2D/3D/0D truncation
-│   ├── compute_vcoul.py       V_qμν from ζ (μ-chunked FFT + H5 prefetch)
-│   ├── compute_vcoul_0d.py    box-truncated Coulomb (molecules)
+│   ├── coulomb/               dimension-aware Coulomb kernels behind get_kernel():
+│   │                            base.py (SysDim, dispatcher, mini-BZ sampler),
+│   │                            bulk_3d.py, slab_2d.py, box_0d.py
+│   ├── vcoul.py               MC q=0 averages, Voronoi wrap helpers
+│   ├── compute_vcoul.py       V_qμν from ζ (μ-chunked FFT + H5 prefetch); compute_v_q_per_G
+│   ├── compute_vcoul_0d.py    box-truncated Coulomb driver (molecules)
 │   ├── qsgw_utils.py          diagonal fixed-point + QSGW from sigma_mnk.h5
 │   ├── scissor.py             valence/conduction scissor fit (out-of-grid bands)
 │   └── kin_ion_io.py          kinetic + ionic H matrix elements
@@ -615,8 +618,8 @@ main                                       [gw/gw_jax.py]
 | **ζ solve** | `common/isdf_fitting.py : solve_zeta_from_L_q` |
 | **Full ζ pipeline** | `common/isdf_fitting.py : fit_zeta_chunked_to_h5` |
 | **Compute V_q** | `gw/compute_vcoul.py : compute_all_V_q` → `gw/v_q_g_flat.py : compute_all_V_q_g_flat` (charge) / `gw/v_q_bispinor.py : compute_V_q_bispinor_g_flat_to_h5` (bispinor) |
-| **Voronoi MC for q=0** | `gw/vcoul.py : compute_q0_averages` |
-| **Coulomb kernel + truncation** | `gw/vcoul.py : compute_V_qfullG_for_q` (`sys_dim=2` 2D slab, `3` 3D bulk, `0` box via `compute_vcoul_0d.py`) |
+| **Voronoi MC for q=0** | `gw/vcoul.py : compute_q0_averages`, or `gw/coulomb/base.py : sample_minibz_qpoints` + each kernel's `q0_average` |
+| **Coulomb kernel + truncation** | `gw/coulomb/` — `get_kernel(meta.sys_dim)` → `Bulk3D` (3) \| `Slab2D` (2) \| `Box0D` (0). Production `v(q+G)` enters at `gw/compute_vcoul.py : compute_v_q_per_G`. *(This row named `gw/vcoul.py : compute_V_qfullG_for_q` until 2026-08-06; that function does not exist anywhere in `src/`.)* **On `feat/vcoul-consolidation-2026-08-06` (unmerged)** `compute_v_q_per_G` becomes a thin dispatcher over one `coulomb/base.py : v_qG_table` driver: each kernel contributes only `_v_bare_per_q` (the dimension's bare formula at one q), and the per-q loop, the `vcoul_cutoff_ry` mask, the G=0 head-slot injection and the `(n_q, ngkmax)` float64 contract live once — so the cutoff, head injection and batching that used to exist only in `compute_vcoul` become available in every dimension, and `Box0D` refuses q≠0 rather than returning a wrong number. |
 | **χ₀ minimax kernel** | `gw/w_isdf.py : _get_chi_minimax_kernel`, `compute_chi0_minimax` |
 | **W Dyson solve** | `gw/w_isdf.py : solve_w`, `_get_w_solve_fn` |
 | **Static minimax lookup** | `gw/minimax_screening.py : build_static_minimax_window_pair` |
