@@ -54,13 +54,37 @@ log as a **failed run that has not noticed yet** — it will either OOM rank
 correct response is to fix the tier-1 probe's stated reason, not to
 proceed.
 
-> **Known gap.** The routers currently *demote* to `H5PY_ALLGATHER` with an
-> announcement rather than refusing. Per the owner's 2026-08-05 ruling the
-> supported contract is per-rank tiles only, so at any process count > 1
-> this demotion should become a refusal that names the tier-1 probe reason.
-> Not changed here: that is a behavioural change beyond the scope of the
-> multi-node certification, and single-process workflows legitimately use
-> the tier. Until then, treat the banner as the alarm.
+**Enforced since 2026-08-06** (the note that used to stand here recorded
+this as a known gap). One rule now covers every route into the tier:
+
+> **`H5PY_ALLGATHER` is reachable at exactly one process, and nowhere
+> else.**
+
+At one process the gather and the per-rank write are the *same operation*,
+so there is no contract to violate and nothing to refuse about — laptop
+debugging, `-n 1` smoke runs and the config test suite are untouched, and
+the tier announces itself when selected. Above one process, both routes in
+raise at parse time:
+
+| route in | at `process_count() == 1` | at `process_count() > 1` |
+|---|---|---|
+| `slab_io=auto`, both parallel tiers declined | selected, announced with the tier-1 reason and the note that the same config refuses at larger P | `_refuse_slab_io_no_parallel_writer` |
+| explicit `slab_io = h5py_allgather`, or deprecated `use_ffi_io = false` | honoured, announced | `_refuse_explicit_h5py_allgather` |
+
+The auto refusal names **which** of the two tier-1 probes declined and
+gives the repair *for that probe* — `probe_target`'s three states have
+three different fixes, and "the writer is unavailable" would be barely
+better than the silent demotion it replaced. The explicit refusal is the
+one case where a named deck value does *not* win: explicit-wins exists so a
+deck can gate a stack, not so it can authorise a transport that cannot hold
+the run's own arrays.
+
+The process count is `max(jax.process_count(), SLURM_NTASKS,
+SLURM_STEP_NUM_TASKS, PMI_SIZE, OMPI_COMM_WORLD_SIZE)`. The launcher's world
+size is consulted alongside JAX's so that a deck parsed before
+`jax.distributed.initialize` cannot see 1 on all sixteen ranks and wave the
+run through; over-counting at worst refuses a run that could have limped,
+under-counting restores the exact failure this rule deletes.
 
 ---
 
@@ -74,7 +98,7 @@ branch so the FFI only loads when selected):
 |---|---|---|---|
 | `PHDF5_FFI` | `_slab_io_ffi.py` | collective MPI-IO from C++ via `ffi.io`; the tile goes D2H into a pinned buffer and out through HDF5's MPI-IO VFD | a 2-D mesh; the FFI lib exports `lorrax_phdf5_write` / `lorrax_phdf5_read`; MPI can bootstrap |
 | `PHDF5_HOST` | `_slab_io_mpi_host.py` | the same MPI-IO, driven from Python by mpi4py + `HDF5_MPI=ON` h5py | a 2-D mesh; the overlay; **exactly one addressable device per process** |
-| `H5PY_ALLGATHER` | `_slab_io_allgather.py` | gather to rank 0, serial h5py | nothing — see the refusal note above |
+| `H5PY_ALLGATHER` | `_slab_io_allgather.py` | gather to rank 0, serial h5py | **`process_count() == 1`** — see the refusal note above |
 
 `PHDF5_FFI` is the only tier that runs on both platforms from one C++
 core: the same sources compile into the CUDA lib (`liblorrax_ffi.so`) and
@@ -101,6 +125,11 @@ An explicit value is honoured verbatim and **skips every probe** — that is
 what makes it usable as a gate. `slab_io=phdf5_ffi` on a broken stack fails
 loudly instead of quietly producing a slower correct answer, which is
 exactly what you want when the question is "does this path work".
+
+One exception, and only one: `h5py_allgather` is additionally gated on
+`process_count() == 1` (see [the refusal
+note](#h5py_allgather-is-a-refusal-not-a-fallback)). Every other value is
+honoured as written, at any process count.
 
 `auto` runs `_route_cpu_slab_io` or `_route_gpu_slab_io`. Both apply the
 same two tier-1 conditions:
@@ -447,21 +476,39 @@ container by default:
 | `libfftw3.so.mpi31.3` (+ `f`, `_omp` variants) | `/opt/cray/pe/fftw/*/x86_milan/lib` | `/opt/cray` is **not** a valid Shifter `--volume` source; copy under `$HOME/software` and bind-mount |
 | `libslate.so.2`, `libblaspp`, `liblapackpp` | `$HOME/software/slate_builds/cpu/install/lib64` | `/global/homes` is siteFs-visible, so put it on `LD_LIBRARY_PATH` directly |
 
-Note `phdf5_stage_cray.sh` silently falls back to a hardcoded 1.12 path
-when `HDF5_DIR` is unset, so `module load cray-hdf5-parallel/1.14.3.7`
-inside a non-login shell that never initialised Lmod produces a 1.12 stage
-with no warning. Pass `CRAY_HDF5_PATH` explicitly.
+`phdf5_stage_cray.sh` used to fall back to a hardcoded 1.12 path when
+`HDF5_DIR` was unset, so `module load cray-hdf5-parallel/1.14.3.7` inside a
+non-login shell that never initialised Lmod produced a 1.12 stage with no
+warning. **Since 2026-08-06 it refuses instead**, naming `HDF5_DIR` and the
+`module load` that sets it (same for `MPICH_DIR`). `CRAY_HDF5_PATH` /
+`CRAY_MPICH_PATH` still take precedence — an explicit path is a stated
+fact, not a guess.
 
 **`MPIDI_CRAY_init: GPU_SUPPORT_ENABLED is requested, but GTL library is
 not linked`.** *Looks like:* an immediate MPI abort (rank 0 rc=255, peers
-segfault) the moment anything calls `MPI_Init_thread`. *Cause:*
-`in_container.sh` exports `MPICH_GPU_SUPPORT_ENABLED=1` **unconditionally**,
-which is right for the GPU leg (it is paired with an `LD_PRELOAD` of the
-CUDA-12 `libmpi_gtl_cuda.so.0`) and wrong for a CPU-platform launch that
-has no reason to preload it. *Fix:* for a `JAX_PLATFORMS=cpu` run, either
-preload the GTL anyway or override after the wrapper —
-`… in_container.sh env MPICH_GPU_SUPPORT_ENABLED=0 python3 …`. The CPU
-cells in [Certification](#certification) were run the second way.
+segfault) the moment anything calls `MPI_Init_thread`. *Cause (fixed
+2026-08-06):* `in_container.sh` exported `MPICH_GPU_SUPPORT_ENABLED=1`
+**unconditionally**, which is right for the GPU leg (it is paired with an
+`LD_PRELOAD` of the CUDA-12 `libmpi_gtl_cuda.so.0`) and wrong for a
+CPU-platform launch that has no GTL to preload — so the CPU FFI leg was
+unusable in-container without a manual override. The variable is now
+**per platform**: `run_shifter.sh` resolves `LORRAX_PLATFORM` (inferred
+from `JAX_PLATFORMS` when unset) and `in_container.sh` exports `1` on
+`gpu`, `0` on `cpu`. It is re-derived inside the container rather than
+passed through because shifter's `--module=mpich` *unsets*
+`MPICH_GPU_SUPPORT_ENABLED` on the way in; the two `LORRAX_*` variables
+survive that and carry the intent.
+
+So the CPU leg is now simply:
+
+```
+JAX_PLATFORMS=cpu src/ffi/cpp/run_shifter.sh python3 …
+```
+
+*Escape hatch:* `LORRAX_MPICH_GPU_SUPPORT=0|1` overrides the inference
+outright. (The CPU cells in [Certification](#certification) predate the fix
+and were run with the old manual
+`… in_container.sh env MPICH_GPU_SUPPORT_ENABLED=0 python3 …`.)
 
 **`ldd` on the login node lies about the MPI closure.** *Looks like:*
 `libmpi_gnu_91` and `libmpi_gnu_123` resolving to two distinct real files,
