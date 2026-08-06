@@ -5,11 +5,21 @@ provides, which knobs decide correctness rather than speed, and how to tell
 the failure modes apart.
 
 > **Verification scope.** Every `file:line` and every default below was read
-> from source on **Perlmutter**, in `~/software/lorrax_P` at commit
-> `886139f`, on **2026-08-06**. Statements marked *(Frontera, unverified
-> 2026-08-06)* were not checked on Frontera and must be re-read there before
-> being relied on. Line numbers drift: they are provided so you can find the
-> code, not so you can quote them. **Read the file.**
+> from source on **Perlmutter**, on **2026-08-06**. The first pass read
+> `886139f`; the page was then rebased onto `8789131` and the statements in
+> §§3–8 that a commit in between could have moved were **re-read at
+> `8789131`** the same day — the stripe defaults, the CAL option default, the
+> `run_shifter.sh` library path, the DFTI/FFTW3 counts, the `phdf5` context
+> defaults and the three shim call-site counts. Statements marked *(Frontera,
+> unverified 2026-08-06)* were not checked on Frontera and must be re-read
+> there before being relied on. Line numbers drift: they are provided so you
+> can find the code, not so you can quote them. **Read the file.**
+>
+> This page owns the *native boundary*. It does not own owner rulings
+> ([`decisions.md`](decisions.md)), the SlabIO tiers and their measurements
+> ([`slab_io.md`](slab_io.md)), or knob spellings and defaults
+> ([`../dev/env_vars.md`](../dev/env_vars.md)). See the
+> [register](../index.md#register).
 
 ---
 
@@ -42,10 +52,11 @@ real modules. `phdf5/`, `slate/`, `scalapack/`, `mklfft/`, `mklblas/`,
 across four files.
 
 Deleting a shim is gated on its consumers moving, and **none has moved
-yet**: at `886139f`, outside `src/ffi/`, there are still 10 `ffi.phdf5`
-references (chiefly `file_io/_slab_io_ffi.py`, `file_io/wfn_loader.py`), 6
-`ffi.mklblas` (`common/contract_bands.py`), and 4 `ffi.mklfft`
-(`common/fft_helpers.py`, `gw/ppm_tau_kernel.py`). The gate is
+yet**: outside `src/ffi/` there are still 10 `ffi.phdf5` references (chiefly
+`file_io/_slab_io_ffi.py`, `file_io/wfn_loader.py`), 6 `ffi.mklblas`
+(`common/contract_bands.py`), and 4 `ffi.mklfft` (`common/fft_helpers.py`,
+`gw/ppm_tau_kernel.py`) — counted at `886139f` and **re-counted unchanged at
+`8789131`, 2026-08-06**. The gate is
 `grep -rn "ffi\.mklfft" src/ tests/ | grep -v '^src/ffi/'` returning empty.
 Run the grep; do not trust a count written down here.
 
@@ -117,6 +128,17 @@ the library is *loaded* for `dlsym` to resolve against; nothing binds at
 link time. That is the `-Wl,--no-as-needed` idiom, not a dangling
 dependency.
 
+> **That count is not a gate, and it was used as one.** The host-FFI leg was
+> certified partly on `nm -D --undefined-only | grep -c fftw_` → 0. The check
+> is **necessary but not sufficient**: once entry points are resolved by
+> `dlsym`, the count is driven to 0 *by construction* — it would read 0 for a
+> build with no FFTW anywhere near it. It never inspects `DT_NEEDED`, which
+> is the part that actually decides whether the library loads, and the next
+> paragraph is what happens when only the count is checked. A check that
+> cannot fail is not evidence. The sufficient form is `readelf -d` for the
+> `DT_NEEDED` entries plus `ldd` **inside the container on a compute node**
+> (§7c on why the login node cannot answer this).
+
 **But `DT_NEEDED` is still load-bearing at load time**, and that is a live
 failure today. Measured 2026-08-06, in-container on compute node
 nid001644: the host `.so` carries the right directory in its **RPATH**
@@ -180,11 +202,17 @@ Three further facts, each of which has bitten:
    `run_shifter.sh:165-166` and `build.sh:27-29,65-66` describe this as
    "returns WRONG getrf/getrs answers", which overstates a race as a
    deterministic result. A rerun that agrees proves nothing here.
-3. **Both stages are on `LD_LIBRARY_PATH` at runtime.** `run_shifter.sh:186`
+3. **Both stages are on `LD_LIBRARY_PATH` at runtime.** `run_shifter.sh:202`
    places the *selected* stage first and `25.5_cuda12.9` after it, on
    purpose: only that tree ships `libcal.so.0`, which a CAL-built `.so`
-   carries in `DT_NEEDED`. Correct as written — and it means the ordering,
-   not the mount, is what decides which `libcusolverMp` you get.
+   carries in `DT_NEEDED`. It means the ordering, not the mount, is what
+   decides which `libcusolverMp` you get.
+   *Still true at `8789131`, re-read 2026-08-06.* Commit `b2df35f`
+   ("the 25.5 libcal fallback is vestigial after the 0.7.2 rebuild") is
+   **comment-only** — it adds sixteen lines above an unchanged `LDLIB=`
+   and says so: "The entry is left in place — an older CAL-linked .so still
+   needs it … No behaviour change." Do not read that commit subject as a
+   removal.
 
 The single source of truth is `LORRAX_NVHPC_SUBPATH`. `run_shifter.sh`
 exports both it and a `LORRAX_NVHPC_ROOT` derived from its first component
@@ -213,44 +241,41 @@ inferred from the CMake option.
 
 ---
 
-## 5. Parallel HDF5 — the tiers
+## 5. Parallel HDF5 — what the FFI side of it is
 
-`slab_io` (an input-deck key, default `auto`) chooses how a sharded array
-reaches disk.
+**[`slab_io.md`](slab_io.md) owns this subsystem**: the three tiers, the
+`slab_io` deck key that routes between them, the striping campaign, the
+launcher requirements and the multi-node certification. Only the two
+FFI-side facts belong here.
 
-**Tier 1 — `PHDF5_FFI`, the supported path.** Collective MPI-IO through the
-C++ handler. Every rank writes its own 2-D tile; nothing larger than one
-rank's tile is ever materialised. This is the path everything else is
-measured against.
+**The C++ handler is one source serving both legs.** The same `phdf5/`
+sources compile into `liblorrax_ffi.so` and into the CUDA-free
+`liblorrax_ffi_host.so`, where the D2H staging into a pinned buffer degrades
+to an in-place read of the XLA host buffer. Tier 1 (`PHDF5_FFI`) is that
+handler; tier 2 (`phdf5_host`) drives the same MPI-IO from Python and needs
+no `.so` at all.
 
-**Tier 2 — `phdf5_host`.** The Python MPI-IO writer
-(`file_io/_slab_io_mpi_host.py`). Same collective semantics, no FFI `.so`
-required. Its boolean grammar is shared with the C++ writer, so
-`LORRAX_PHDF5_COLLECTIVE_WRITES=0` means "independent" in *both*.
+**One boolean grammar spans both writers**, so
+`LORRAX_PHDF5_COLLECTIVE_WRITES=0` means "independent" in each of them — §6.
 
-**Tier 3 — `H5PY_ALLGATHER`, which is a REFUSAL above one process.**
+One thing is worth repeating from `slab_io.md`, because getting it wrong
+sends you hunting for a demotion that no longer exists: **`H5PY_ALLGATHER`
+is a refusal above one process, not a fallback** (owner ruling 2026-08-05,
+implemented `0d8e50c`). It is not a tier the system may choose; it is a tier
+the system refuses to choose.
 
-This is the part most likely to be misremembered, so it is stated plainly.
-The allgather tier gathers the whole global array onto rank 0 and writes it
-with h5py. The design envelope is arrays that need **hundreds of GPUs to
-hold**. A rank-0 gather of such an array is therefore not a slow path — it
-is an **out-of-memory some minutes later, behind a banner nobody read**.
-
-Owner ruling 2026-08-05; implemented in commit `0d8e50c` (2026-08-06). One
-rule covers every route in:
-
-> `H5PY_ALLGATHER` is reachable at exactly one process, and nowhere else.
-
-At P=1 the gather and the per-rank write are the *same operation*, so there
-is nothing to refuse about. Above P=1 both routes raise at parse time. The
-silent demotion is deleted, as is the decline branch that read
-`max(SLURM_JOB_NUM_NODES, SLURM_NNODES)`.
-
-Do not describe this as a fallback. It is not a tier the system may choose;
-it is a tier the system refuses to choose.
-
-Details of the router, striping and the write path itself live in
-`docs/architecture/slab_io.md`, which owns them.
+> **A gap in that refusal, found 2026-08-06.** The rule is enforced in
+> `gw/gw_config.py` — `_refuse_explicit_h5py_allgather` and
+> `_refuse_slab_io_no_parallel_writer`, both of which always raise, and both
+> placed after the whole precedence chain so no deck branch escapes them.
+> **But it is deck-level only.** The library entry point
+> `file_io/slab_io.py:88-90` still returns `SlabIOBackend.H5PY_ALLGATHER`
+> when `use_ffi_io is None`, at any process count, and `:97-98` maps
+> `use_ffi_io=False` the same way. A caller who constructs `SlabIO` directly
+> instead of going through a parsed deck still reaches the tier at P>1.
+> Anywhere you read "both routes raise at parse time" — including on this
+> page before today — that is a statement about the deck router, which is
+> the only place it is true.
 
 ---
 
@@ -418,7 +443,7 @@ it, participate in the teardown, then raise. See `decisions.md` 2026-08-04.
 
 ## 8. Hard invariants
 
-Checked at `886139f`, not aspirational.
+Checked at `886139f` and re-checked at `8789131` on 2026-08-06; not aspirational.
 
 1. **Registered FFI custom-call target names do not change.** The full set
    is in `src/ffi/common/ffi_loader.py` (`_CUDA_TARGET_SYMBOLS`,
