@@ -1755,8 +1755,18 @@ def read_lorrax_input(filename: str) -> dict:
         # decks carry dead keys — unless the deck opts in via
         # ``strict_keys = true``, which upgrades the warning to a
         # ValueError naming all unknown keys at once.
-        unknown = [k for k in section
-                   if k not in _DEFAULTS and k not in _LEGACY_DECK_KEYS]
+        # configparser lower-cases option names (``optionxform = str.lower``),
+        # so iterating ``section`` yields ``do_g0`` for a deck that writes
+        # the documented ``do_G0`` -- the ONE non-lower-case key among the
+        # 99 in _DEFAULTS.  Comparing the two raw made that key BOTH
+        # honoured and unrecognised at the same time: ``section.get`` folds
+        # the LOOKUP too, so ``do_G0 = false`` really did steer the run,
+        # while this check reported it as an unknown key -- and, under
+        # ``strict_keys``, REFUSED a valid deck outright.  Fold both sides
+        # so recognition matches the lookup that already happens.
+        _known = ({k.lower() for k in _DEFAULTS}
+                  | {k.lower() for k in _LEGACY_DECK_KEYS})
+        unknown = [k for k in section if k.lower() not in _known]
         if unknown:
             located = []
             for key in unknown:
