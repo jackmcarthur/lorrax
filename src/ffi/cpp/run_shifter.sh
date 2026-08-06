@@ -121,11 +121,36 @@ if [[ -d "${LORRAX_FFI_SLATE_DIR}" ]]; then
     VOL_FLAGS+=(--volume="${LORRAX_FFI_SLATE_DIR}:/lorrax_slate")
 fi
 
+# Which cuSOLVERMp / cuBLASMp stage to RUN against, as a subpath under the
+# /lorrax_nvhpc bind-mount.  SOURCE OF TRUTH: the site config's
+# LORRAX_NVHPC_SUBPATH (config/perlmutter/site_config.sh).
+#
+# THIS MUST NOT BE HARDCODED, and was until 2026-08-05.  The staged tree
+# carries SEVERAL cuSOLVERMp builds and they ALL export the same SONAME
+# libcusolverMp.so.0, so whichever directory comes first in LD_LIBRARY_PATH
+# silently decides which implementation runs — nothing fails, nothing warns.
+# On Perlmutter 25.5_cuda12.9 is cuSolverMp 0.6.0, which returns WRONG
+# getrf/getrs answers on any Px>1 AND Py>1 mesh (site_config.sh ~L80), while
+# 0.7.2_cuda12.9 carries both the CAL->NCCL ABI fix and the race fix and is
+# what site_config selects.  Hardcoding 25.5 here silently overrode that
+# choice for every run launched through this script: a wrong-answer path,
+# not a performance one.
+: "${LORRAX_NVHPC_SUBPATH:=0.7.2_cuda12.9/math_libs/12.9/lib64}"
+if [[ ! -e "${NVHPC_HOST}/${LORRAX_NVHPC_SUBPATH}/libcusolverMp.so" ]]; then
+    echo "run_shifter.sh: LORRAX_NVHPC_SUBPATH='${LORRAX_NVHPC_SUBPATH}' does not" >&2
+    echo "  name a cuSOLVERMp stage under ${NVHPC_HOST}." >&2
+    echo "  Looked for: ${NVHPC_HOST}/${LORRAX_NVHPC_SUBPATH}/libcusolverMp.so" >&2
+    echo "  Set LORRAX_NVHPC_SUBPATH (see config/perlmutter/site_config.sh)." >&2
+    exit 2
+fi
 # LD_LIBRARY_PATH: slate install (libslate + bundled blaspp/lapackpp) + slate
 # cray-stack stage (libsci etc.) come first; then phdf5 stage (libhdf5 +
-# SONAME shims, including libmpi_gnu_123.so.12 reused by SLATE); NVHPC
-# (cusolverMp); stack's MPI runtime; darshan (libdarshan.so.0 via siteFs).
-LDLIB="${SLATE_INSTALL_HOST}/lib64:/lorrax_slate/lib:/lorrax_phdf5/lib:/lorrax_nvhpc/25.5_cuda12.9/math_libs/12.9/lib64:${MPI_LIB_DIR_CT}:/global/common/software/nersc9/darshan/default/lib"
+# SONAME shims, including libmpi_gnu_123.so.12 reused by SLATE); the SELECTED
+# NVHPC stage (cusolverMp/cublasmp); the 25.5 stage AFTER it purely as the
+# fallback for libcal.so.0, which only that tree ships and which the .so
+# carries in DT_NEEDED when built against it; stack's MPI runtime; darshan
+# (libdarshan.so.0 via siteFs).
+LDLIB="${SLATE_INSTALL_HOST}/lib64:/lorrax_slate/lib:/lorrax_phdf5/lib:/lorrax_nvhpc/${LORRAX_NVHPC_SUBPATH}:/lorrax_nvhpc/25.5_cuda12.9/math_libs/12.9/lib64:${MPI_LIB_DIR_CT}:/global/common/software/nersc9/darshan/default/lib"
 if [[ "${MPI_STACK}" == mpich ]]; then
     # mpich module ships its own PMI/libfabric deps under dep/
     LDLIB="${LDLIB}:/opt/udiImage/modules/mpich/dep"
