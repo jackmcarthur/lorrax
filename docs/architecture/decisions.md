@@ -31,7 +31,8 @@ describing LORRAX as having two screening methods.
 
 ## 2026-08-05 — The Lustre stripe count is the aggregator count, so it is `nranks`
 
-*(APPROVED. **Not implemented in this branch** — see the status note.)*
+*(APPROVED. **Implemented on the Python side in this branch; the C++
+writer still defaults to 16** — see the status note.)*
 
 `LORRAX_PHDF5_STRIPE_COUNT` is not a filesystem-layout preference that
 happens to affect speed. ROMIO sets `cb_nodes = min(striping_factor,
@@ -51,16 +52,38 @@ Shape of the replacement: clamp to roughly [4, 128], ramp the striping unit
 maximum-*contention* layout, and the current Python parse passes it straight
 through.
 
-**Status, verified 2026-08-06.** Implemented on
-`feat/slab-io-stripe-nranks-2026-08-06` (`e5c9618`), which is **not an
-ancestor of this branch** (`merge-base --is-ancestor`, checked). Both sites
-here still default to 16. Even on that branch the policy is Python-side only:
-the C++ writer's `context.cc` still carries the literal `"16"`, so landing it
-is not finished until both writers agree — one environment must mean one
-layout in every writer, which is the rule the stripe *size* already follows.
+**Status, re-verified 2026-08-06 after the merge.** `e5c9618`
+(`feat/slab-io-stripe-nranks-2026-08-06`) **is now an ancestor of
+`integration/2026-08-06`** — `merge-base --is-ancestor`, checked. It is
+**not** on `origin/main`. *(This paragraph previously said the commit was
+not an ancestor and that "both sites here still default to 16"; that was
+true when written and is now wrong in both halves.)*
 
-Licenses deleting: nothing yet. It licenses *adding* the refusal on a
-negative count, which is a live hazard independent of the default.
+What actually landed, in `file_io/_slab_io_ffi.py`:
+
+* `_stripe_policy(nranks)` is a pure function of the rank count — no env,
+  no MPI, no filesystem — returning `count = clamp(nranks, 4, 128)` and a
+  striping unit ramped 1 → 4 MiB with the rank count by exact integer
+  comparison. `LORRAX_PHDF5_STRIPE_COUNT` unset now means *the policy*,
+  not `16`.
+* **The negative count refuses**, naming the measurement: `-1` means
+  "every OST on the filesystem", which is the maximum-*contention* layout
+  and measures like one — 0.105 GiB/s at 64 ranks / 32 GiB against 10.63
+  for the policy (job 56389339).
+* `_stripe_size_bytes` moved to sit beside `_stripe_count`, because the
+  two were previously resolved in two modules with two different notions
+  of "the default".
+
+**Still open, and it is the same hazard the entry named:** the C++ writer
+`src/ffi/cpp/phdf5/context.cc:463` carries the literal `"16"` as its
+fallback, so with the variable unset the two writers now choose
+*different* layouts — which is worse than both being wrong the same way.
+One environment must mean one layout in every writer. Until that is fixed,
+`LORRAX_PHDF5_STRIPE_COUNT` should be set explicitly for any run whose
+numbers matter.
+
+Licenses deleting: the fixed `16` default wherever it is still restated as
+the Python-side value.
 
 ## 2026-08-05 — An allgather is a refusal, not a fallback
 
