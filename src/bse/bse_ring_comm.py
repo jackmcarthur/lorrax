@@ -25,6 +25,7 @@ from common.fft_helpers import (
     make_sharded_fftn_3d,
     make_sharded_ifftn_3d,
 )
+from common.vma import mark_varying
 from .bse_io import _find_restart_file, _load_ring_subset, load_bse_data_from_restart_sharded
 from .bse_serial import apply_D, apply_bse_hamiltonian_single_device, compute_pair_amplitude
 
@@ -208,6 +209,29 @@ def _ring_perm(axis_size: int) -> tuple[tuple[int, int], ...]:
     return tuple((i, (i + 1) % axis_size) for i in range(axis_size))
 
 
+# ---------------------------------------------------------------------------
+# Why the ring accumulators below are ``mark_varying``-ed
+# ---------------------------------------------------------------------------
+# Every ring sum here is ``acc = jnp.zeros(...)`` followed by a fori_loop whose
+# body does ``acc = acc + <something built from a sharded operand>``.  From jax
+# 0.7.0 ``shard_map`` tracks varying manual axes, and the loop carry's VMA set
+# must be EQUAL at input and output -- so the empty set on the zeros init does
+# not match the {x,y} the body produces, and the loop is rejected:
+#
+#   TypeError: scan body function carry input and carry output must have equal
+#   types ... complex128[1,2,399,9] vs complex128[1,2,399,9]{x,y}
+#
+# (fori_loop with static bounds lowers to scan, which is why the message says
+# "scan body".)  These shard_maps go through ``jax.shard_map`` with checking
+# ON, so the marking is required; the ``check_rep=False`` shard_maps elsewhere
+# in the tree are exempt.  ``mark_varying`` is the identity on jax 0.5.3, so
+# the production leg is bit-unchanged.  See ``common/vma.py``.
+#
+# ('x','y') is what jax itself names in the error, and it is what the bodies
+# introduce: the ring buffers come from X (in_spec P(None,'x','y',None)) and
+# the psi slices from operands on 'x' or 'y'.  Do NOT widen a mark "to be
+# safe" -- a carry marked over an axis it does not vary on fails when it
+# leaves through a replicated out_specs entry.
 def _ring_sum_valence(
     X: jax.Array,
     psi_v_Y: jax.Array,
@@ -218,7 +242,9 @@ def _ring_sum_valence(
     axis_index_y = jnp.asarray(lax.axis_index("y"), dtype=jnp.int32)
     nk, _, nspinor, _ = psi_v_Y.shape
 
-    R0 = jnp.zeros((X.shape[0], X.shape[1], nk, nspinor, nu_local), dtype=X.dtype)
+    R0 = mark_varying(
+        jnp.zeros((X.shape[0], X.shape[1], nk, nspinor, nu_local), dtype=X.dtype),
+        ("x", "y"))
     perm = _ring_perm(py)
 
     def step(i, carry):
@@ -248,7 +274,10 @@ def _ring_sum_conduction(
     nk, _, nspinor, _ = psi_c_X.shape
     nu_local = R.shape[4]
 
-    T0 = jnp.zeros((R.shape[0], mu_local, nu_local, nspinor, nspinor, nk), dtype=R.dtype)
+    T0 = mark_varying(
+        jnp.zeros((R.shape[0], mu_local, nu_local, nspinor, nspinor, nk),
+                  dtype=R.dtype),
+        ("x", "y"))
     perm = _ring_perm(px)
 
     def step(i, carry):
@@ -279,7 +308,9 @@ def _ring_sum_conduction_first(
     nk, _, nspinor, _ = psi_c_Y.shape
     v_chunk = X.shape[2]
 
-    R0 = jnp.zeros((X.shape[0], v_chunk, nk, nspinor, nu_local), dtype=X.dtype)
+    R0 = mark_varying(
+        jnp.zeros((X.shape[0], v_chunk, nk, nspinor, nu_local), dtype=X.dtype),
+        ("x", "y"))
     perm = _ring_perm(px)
 
     def step(i, carry):
@@ -310,7 +341,10 @@ def _ring_sum_valence_second(
     nk, _, nspinor, _ = psi_v_X.shape
     nu_local = R.shape[4]
 
-    T0 = jnp.zeros((R.shape[0], mu_local, nu_local, nspinor, nspinor, nk), dtype=R.dtype)
+    T0 = mark_varying(
+        jnp.zeros((R.shape[0], mu_local, nu_local, nspinor, nspinor, nk),
+                  dtype=R.dtype),
+        ("x", "y"))
     perm = _ring_perm(py)
 
     def step(i, carry):
@@ -364,7 +398,9 @@ def apply_V_ring(
         psi_c_Y, (z, c_start_local, z, z), (nk_local, c_chunk, nspinor, nu_local)
     )
 
-    A0 = jnp.zeros((nb_trial, c_chunk, nu_local, nk_local), dtype=X.dtype)
+    A0 = mark_varying(
+        jnp.zeros((nb_trial, c_chunk, nu_local, nk_local), dtype=X.dtype),
+        ("x", "y"))
     perm_y = _ring_perm(py)
 
     def step_y(i, carry):
@@ -381,7 +417,9 @@ def apply_V_ring(
 
     _, A_local = lax.fori_loop(0, py, step_y, (X, A0))
 
-    S0 = jnp.zeros((nb_trial, nu_local, nk_local), dtype=X.dtype)
+    S0 = mark_varying(
+        jnp.zeros((nb_trial, nu_local, nk_local), dtype=X.dtype),
+        ("x", "y"))
     perm_x = _ring_perm(px)
 
     def step_x(i, carry):
@@ -1056,7 +1094,9 @@ def build_density_snapshot_operator(
             psi_c_Y, (z, c_start_local, z, z), (nk_local, c_chunk, nspinor, nu_local)
         )
 
-        A0 = jnp.zeros((nb_trial, c_chunk, nu_local, nk_local), dtype=s.dtype)
+        A0 = mark_varying(
+            jnp.zeros((nb_trial, c_chunk, nu_local, nk_local), dtype=s.dtype),
+            ("x", "y"))
         perm_y = _ring_perm(py)
 
         def step_y(i, carry):
@@ -1073,7 +1113,9 @@ def build_density_snapshot_operator(
 
         _, A_local = lax.fori_loop(0, py, step_y, (s, A0))
 
-        S0 = jnp.zeros((nb_trial, nu_local, nk_local), dtype=s.dtype)
+        S0 = mark_varying(
+            jnp.zeros((nb_trial, nu_local, nk_local), dtype=s.dtype),
+            ("x", "y"))
         perm_x = _ring_perm(px)
 
         def step_x(i, carry):
