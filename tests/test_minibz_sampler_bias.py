@@ -41,6 +41,31 @@ from the rejection ground truth over those 63 q:
     Si fixture   YES        DELETED `bvec.T`           3.70e-03   1.03e-03
     cubic        YES        DELETED `bvec.T`           3.00e-03   6.57e-04
 
+CORRECTION, 2026-08-05 (Frontera job 7890705).  Two claims above are wrong
+and are kept only because the code below still depends on them; the
+replacement measurement lives in
+``tests/test_minibz_sampler_lattice_classes.py``.
+
+1. The predicate is UNIMODULARITY, not "signed row-permutation".  The
+   columns of ``bvec`` span a fundamental domain of its row lattice iff
+   ``M = bvec.T @ inv(bvec)`` is an integer matrix with ``|det M| = 1``.
+   The ``BVEC_FCC`` built below satisfies that with
+   ``M = [[0,0,1],[1,1,1],[-1,0,0]]`` — integer, unimodular, and NOT a
+   permutation.  So this fcc cell is in the BENIGN class, contrary to the
+   table above.
+2. The 6.43e-01 attributed to ``bvec.T`` on that cell is not attributable to
+   ``bvec.T``.  ``deleted_buggy_offsets`` reproduces the deleted routine
+   with BOTH of its defects — the wrong parallelepiped and ``nmax=1``, a
+   fold one replica shell wide.  Re-measured with ``nmax=3`` so the fill is
+   isolated, the deleted spelling deviates 5.0e-03 on this cell, at the
+   3.4e-03 self-noise: unbiased.  The 64% was the narrow fold.
+   ``test_the_deleted_spelling_is_biased_on_a_skewed_cell`` below therefore
+   passes for a reason other than the one its name gives.  It is left
+   standing (it is a true statement about the deleted ROUTINE) and the
+   ``bvec.T`` claim is gated properly on hexagonal / rhombohedral /
+   triclinic cells in the sibling module, where the fill alone deviates
+   1.5e-01 / 8.5e-02 / 6.5e-02 at ``nmax=3``.
+
 Pure numpy + the production sampler; no fixture, no GPU (~a minute).
 """
 import numpy as np

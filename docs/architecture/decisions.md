@@ -48,6 +48,53 @@ the consolidation steps, cited a "4.25% fcc ibrav=2" figure for the Si deck;
 that number belongs to an fcc `bvec` CONSTRUCTED as `2pi inv(A).T`, not to
 the one pw2bgw wrote into this fixture. Corrected here.
 
+**CORRECTION, same day (Frontera job 7890705).** Two things above are wrong,
+in the same direction as the error they were correcting.
+
+*The predicate is UNIMODULARITY, not "signed row-permutation".* The columns
+of `bvec` span a fundamental domain of its ROW lattice — which is all the
+Voronoi fold needs to stay measure-preserving — iff `M = bvec.T @ inv(bvec)`
+is an INTEGER matrix with `|det M| = 1`. A signed row-permutation is a
+special case. Row-permutation is a stricter test than the physics requires,
+so it produces FALSE ALARMS: it files unbiased cells as biased.
+
+*The `fcc from 2pi inv(A).T` row is one of those false alarms, and its
+6.4e-01 is misattributed.* That cell has
+`M = [[0,0,1],[1,1,1],[-1,0,0]]` — integer, `det = +1`, and NOT a
+permutation. It is in the BENIGN class. Re-measured against a rejection
+ground truth whose box is validated by `acceptance x box volume = |det
+B_miniBZ|` (the 2026-08-05 draft's box CLIPPED 4-10% of the Voronoi cell on
+skewed cells and manufactured a spurious 3e-02 "residual bias" in the FIXED
+sampler), with the fold width held at `nmax=3` so the fill is isolated from
+the separate `nmax=1` defect of the same deleted routine:
+
+| cell | M integer, \|det\|=1 | deleted `bvec.T` at nmax=3 | self-noise |
+|---|---|---|---|
+| cubic | yes (M = I) | 3.9e-03 | 3.0e-03 |
+| fcc from `2pi inv(A).T` | **yes** (M != I) | **5.0e-03** | 3.4e-03 |
+| hexagonal a=5.9 c=9.4 | no | 1.5e-01 | 2.3e-03 |
+| rhombohedral a=6.4 alpha=68 | no | 8.5e-02 | 2.5e-03 |
+| triclinic 4.6/6.1/8.3, 62/78/104 | no | 6.5e-02 | 4.4e-03 |
+
+(max over the 63 nonzero q of a 4x4x4 grid, relative; 150k accepted
+rejection samples per cloud.) So on that fcc cell the deleted fill is
+unbiased at the MC self-noise, and the 6.4e-01 in the table above is the
+`nmax=1` fold, not `bvec.T`. The two defects were reproduced together and
+reported as one.
+
+What survives unchanged: the defect is real, it is up to 15% per-q on a
+hexagonal cell from the fill ALONE, no deck in the tree was in the biased
+class, and the Si-fixture conclusion (benign, 1.63 meV is re-seeding) is
+untouched — a permutation is unimodular.
+
+Gates: `tests/test_minibz_sampler_lattice_classes.py` (numerical, hexagonal
+/ rhombohedral / triclinic + cubic control, tolerance set from self-noise
+measured in the same run) and `tests/test_minibz_fill_wrap_convention.py`
+(structural — `gw.coulomb.sampler.assert_fill_matches_wrap` refuses on the
+fill path when the cloud is filled from one basis and folded against
+another, self-tested at import, and an AST check that no fold site in the
+tree can skip it).
+
 **Measured Sigma impact** (Frontera job 7890626): bulk Si 4x4x4, `sys_dim = 3`,
 `mc_average_vcoul_body` at its default, the two sampling lines as the only
 difference, everything else byte-frozen:

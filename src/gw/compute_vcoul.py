@@ -63,6 +63,19 @@ def build_v_head_minibz_table_3d(
        this survived from 2026-04-05); up to **64% per-q, 8.4% mean** on
        fcc QE ``ibrav=2`` at 4×4×4 and 16.6%/6.5% hexagonal (Frontera job
        7890612).  Every 3D deck in the tree is fcc.
+
+       ATTRIBUTION CORRECTED 2026-08-05 (job 7890705).  The 64% is the
+       combined effect of defects 1 AND 2 — the job-7890612 reproduction
+       carried ``nmax=1``.  Isolated at ``nmax=3``, defect 1 alone is
+       ZERO on fcc: the columns of that ``bvec`` span a fundamental
+       domain of its row lattice (``M = bvec.T @ inv(bvec)`` is integer
+       with ``|det M| = 1``), so the fold stays measure-preserving and
+       the deviation is 5.0e-03, at the 3.4e-03 MC self-noise.  The
+       predicate is unimodularity of ``M``, NOT symmetry of ``bvec`` and
+       not a signed row-permutation.  Defect 1 alone costs 1.5e-01
+       (hexagonal), 8.5e-02 (rhombohedral), 6.5e-02 (triclinic).  Gate:
+       ``tests/test_minibz_sampler_lattice_classes.py``; the structural
+       half is ``gw.coulomb.sampler.assert_fill_matches_wrap``.
     2. ``nmax=1`` — one Voronoi replica shell.  Too narrow for a skewed
        cell; BGW uses ``ncell=3``.
     3. ``RandomState(42)`` uniform — no low-discrepancy sequence, no
