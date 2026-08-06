@@ -83,7 +83,14 @@ CASES = {
     ),
     "bispinor": dict(
         sigma_out="sigma_diag_bispinor_test.dat",
-        labels=("sigSX", "sigCOH", "sigTOT"),
+        # The sigma_diag writer emits sigX/sigC/sigXC for the bispinor case too
+        # (verified: "sigSX"/"sigCOH"/"sigTOT" occur ZERO times in the frozen
+        # reference tests/regression/bispinor_debug/sigma_diag_bispinor_ref.dat
+        # and zero times in any fresh run output).  With the old COHSEX-era
+        # names parse_sigma_diag matched no rows and sys.exit()ed, so this arm
+        # of the gate ABORTED rather than measuring anything -- dark since at
+        # least 7801d46 (2026-07-08).  Names corrected; NO tolerance changed.
+        labels=("sigX", "sigC", "sigXC"),
         zeta_files=("tmp/zeta_q.h5", "tmp/zeta_q_mu1.h5",
                     "tmp/zeta_q_mu2.h5", "tmp/zeta_q_mu3.h5"),
         charge=False,
