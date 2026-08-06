@@ -238,6 +238,60 @@ a different worktree, which the path makes obvious and nothing else would.
 > carries the real tuple, and record that instead — including in any gate or
 > provenance record that currently captures the string.
 >
+> #### The 0.7.0 option was evaluated end-to-end and is NOT taken yet {#jax-070-eval}
+>
+> The paragraph above rules out JAX ≥ 0.9 on CUDA 12. The obvious follow-up is
+> to move the *floor* instead of the container:
+> **`ghcr.io/nvidia/jax:jax-2025-07-21` is JAX 0.7.0 on CUDA 12.9**, and it is
+> the **last CUDA-12 image on the shelf** — the next tag, `jax-2025-08-25`, is
+> already 0.7.2 / CUDA 13.0. It was probed and A/B-run in full on 2026-08-06
+> (JID 56405158/56405696). **Everything the port was expected to risk is
+> clean, and it is blocked on something nobody had listed.**
+>
+> Clean, measured on an A100, same source tree and the *same pinned* `.so`
+> files on both arms:
+>
+> | | 0.5.3 (`25.04-py3`) | 0.7.0 (`jax-2025-07-21`) |
+> |---|---|---|
+> | `jax.shard_map` top-level | absent | **present** |
+> | `jax.experimental.shard_map` | present, old signature | present, **same signature, not deprecated** |
+> | `jax.ffi` surface, `custom_call_api_version=4`, `register_ffi_target(api_version=1)` | modern | **identical** |
+> | `jax._src` compile-cache surface (6 symbols) | 3 differ | **identical to 0.9.x** |
+> | GATE 1 / 5 / 7, both legs, in-container | — | **bit-identical to baseline** |
+> | device `.so` `DT_NEEDED`, one cray-mpich `libmpi_gnu_91.so.12`, one HDF5 | — | **unchanged** |
+> | CUDA runtime | 12.9.37 | 12.9.79, **same sonames** |
+>
+> **The blocker is VMA.** JAX tracks *varying manual axes* inside `shard_map`
+> from **0.7.0** — not from 0.9, which is where this tree's only VMA guard
+> (`common/cholesky_2d.py`) assumed it began. A `scan`/`fori_loop` carry
+> written per-device-conditionally must be marked varying, or the carry-type
+> check rejects it:
+>
+> ```text
+> TypeError: scan body function carry input and carry output must have equal types
+>   ... has type complex128[1,2,399,9] but the corresponding output carry
+>   component has type complex128[1,2,399,9]{y,x}, so the varying manual axes
+>   do not match.
+>   This might be fixed by applying `jax.lax.pvary(..., ('y', 'x'))` ...
+> ```
+>
+> Full-suite A/B: **27 failed / 992 passed on 0.5.3 → 36 failed / 983 passed on
+> 0.7.0.** All ten new failures are BSE (`test_bse_dense_reference`,
+> `test_bse_w0_resolvent`, `test_bse_w_omega_chain`, `test_bse_stack_matvec`);
+> re-run alone, those four files are **20/20 pass on 0.5.3 and 10/20 on
+> 0.7.0**, same source, same `.so`. The scan-inside-`shard_map` sites live in
+> `bse/bse_ring_comm.py` (the default `ring` matvec), `bse/bse_stack_matvec.py`
+> and `bse/bse_lanczos.py`, and none of them mark their carries.
+>
+> **So the VMA port is the price of leaving 0.5.3 at all, not a 0.7.0 quirk** —
+> 0.9.x enforces the same rule, so this work is owed on any target above 0.5.3.
+> It is bounded and well-signposted (JAX names the fix in the error text). The
+> spelling is version-dependent, and **measured**: `lax.pvary` exists on
+> 0.7.0+; `lax.pcast` only on 0.9+, where `pvary` is deprecated in its favour.
+>
+> **Order of operations: do the VMA port first, then flip the image in one
+> commit.** Flipping first would land ten known BSE failures.
+>
 > ### `memory_stats()` returns `None` because the modulefile asks for it
 >
 > **Measured across ten container images, 2026-08-06: `memory_stats()` returns
