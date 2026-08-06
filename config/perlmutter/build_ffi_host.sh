@@ -136,6 +136,23 @@ LORRAX_PM_HDF5="${LORRAX_PM_HDF5:-cray-hdf5-parallel/1.14.3.7}"
 # naming the unresolved symbol and every non-FFT handler still works.
 LORRAX_PM_FFTW="${LORRAX_PM_FFTW:-cray-fftw}"
 LORRAX_PM_CMAKE="${LORRAX_PM_CMAKE:-cmake}"
+# The CONTAINER stage this bare-metal .so has to agree with — GATE 7.
+#
+# This leg is built on the login node against the cray-hdf5-parallel
+# MODULE; the device leg is built inside Shifter against whatever is
+# bind-mounted at /lorrax_phdf5.  Two populations, two HDF5s, and until
+# 2026-08-06 nothing compared them: the module moved to 1.14.3.7 while the
+# stage stayed on 1.12, so this .so carried a SONAME the container did not
+# have and would not dlopen there at all (CLAIMS 89).  The path is read
+# from config/perlmutter/site_config.sh so there is ONE source of truth for
+# it — the modulefile's --volume= source and this gate must not be able to
+# name different trees.
+if [[ -z "${LORRAX_FFI_PHDF5_DIR:-}" && -r "$(dirname "$0")/site_config.sh" ]]; then
+    # shellcheck disable=SC1091
+    LORRAX_FFI_PHDF5_DIR="$(. "$(dirname "$0")/site_config.sh" >/dev/null 2>&1;
+                            printf %s "$LORRAX_FFI_PHDF5_DIR_DEFAULT")"
+fi
+LORRAX_PM_PHDF5_STAGE="${LORRAX_FFI_PHDF5_DIR:-}"
 # LibSci threading flavour.  MUST match the SLATE install's, or the process
 # ends up with both libsci_gnu_mpi and libsci_gnu_mpi_mp loaded and ELF load
 # order silently decides which BLAS/ScaLAPACK runs.  The gpu_backend=none
@@ -428,6 +445,31 @@ if [[ -n "${bad_omp//[[:space:]]/}" ]]; then
 fi
 echo "[build_ffi_host] GATE 6 (OpenMP runtime is really OpenMP) PASSED"
 
+# GATE 7: ONE HDF5, and the container stage provides it.
+#
+# GATE 5 removed the fftw SONAME from DT_NEEDED and left the host leg with
+# exactly one remaining in-container `not found`: libhdf5_parallel_gnu.so.310,
+# because this script loads cray-hdf5-parallel/1.14.3.7 (SOVERSION 310) and
+# the stage bind-mounted at /lorrax_phdf5 held HDF5 1.12 (SOVERSION 200).
+# Same shape as GATE 5 one library over: a dependency this leg cannot see is
+# missing, because it is only ever missing somewhere this leg does not run.
+# So the check has to be made HERE, against the OTHER population.
+#
+# It is deliberately not just "does the SONAME resolve".  See
+# src/ffi/cpp/gate_one_hdf5.sh for why the two-HDF5s-in-one-process repair
+# is worse than the failure it fixes.
+if [[ -z "$LORRAX_PM_PHDF5_STAGE" ]]; then
+    echo "[build_ffi_host] GATE 7 CANNOT RUN: no phdf5 stage named." >&2
+    echo "[build_ffi_host]   Neither LORRAX_FFI_PHDF5_DIR nor" >&2
+    echo "[build_ffi_host]   LORRAX_FFI_PHDF5_DIR_DEFAULT in site_config.sh" >&2
+    echo "[build_ffi_host]   is set, so the HDF5 this .so links cannot be" >&2
+    echo "[build_ffi_host]   compared against the one the container will" >&2
+    echo "[build_ffi_host]   provide.  That comparison is the whole gate." >&2
+    exit 1
+fi
+GATE_TAG=build_ffi_host LORRAX_PHDF5_STAGE="$LORRAX_PM_PHDF5_STAGE" \
+    "$SRC/gate_one_hdf5.sh" "$SO_FILE" || exit 1
+
 # GATE 4: nothing left unresolved at load time.  -Wl,--no-undefined already
 # fails the LINK on a missing link-time symbol; this catches the other half —
 # a NEEDED library that cannot itself be found at run time.
@@ -446,6 +488,7 @@ fi
     "prgenv=$LORRAX_PM_PRGENV" \
     "libsci=$LORRAX_PM_LIBSCI$LORRAX_PM_LIBSCI_FLAVOUR" \
     "hdf5=$LORRAX_PM_HDF5" \
+    "phdf5_stage=$LORRAX_PM_PHDF5_STAGE" \
     "fftw=$LORRAX_PM_FFTW" \
     "slate=$LORRAX_SLATE_HOST_INSTALL_DIR" || {
         echo "[build_ffi_host] WARNING: provenance stamp failed" >&2
