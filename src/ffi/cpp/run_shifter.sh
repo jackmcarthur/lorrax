@@ -183,6 +183,22 @@ fi
 # fallback for libcal.so.0, which only that tree ships and which the .so
 # carries in DT_NEEDED when built against it; stack's MPI runtime; darshan
 # (libdarshan.so.0 via siteFs).
+#
+# THE 25.5 FALLBACK IS NOW VESTIGIAL FOR THE SUPPORTED BUILD, and is kept
+# only for older artifacts.  As of the 2026-08-06 corrective rebuild the
+# deployed .so is built against 0.7.2 with LORRAX_FFI_HAVE_CAL=OFF, so it
+# has NO libcal.so.0 in DT_NEEDED and no cal_* undefined symbols at all
+# (`nm -D` count 0; the pre-rebuild .so had cal_comm_create/cal_comm_destroy).
+# Nothing in the supported configuration reads that directory any more.
+#
+# What it still does is keep a SECOND libcusolverMp.so.0 on the search path
+# permanently — the exact duplicate-SONAME hazard described 20 lines above.
+# It is harmless ONLY because the SELECTED stage is listed before it; that
+# ordering is the single thing standing between this launcher and silently
+# running cuSolverMp 0.6.0, whose getrf/getrs is wrong on any Px>1 AND Py>1
+# mesh.  Removing the entry is NOT done here because it would break any
+# still-CAL-linked .so loudly at dlopen; that is the owner's call, not this
+# script's.  Left as a comment rather than a silent edit.
 LDLIB="${SLATE_INSTALL_HOST}/lib64:/lorrax_slate/lib:/lorrax_phdf5/lib:/lorrax_nvhpc/${LORRAX_NVHPC_SUBPATH}:/lorrax_nvhpc/25.5_cuda12.9/math_libs/12.9/lib64:${MPI_LIB_DIR_CT}:/global/common/software/nersc9/darshan/default/lib"
 if [[ "${MPI_STACK}" == mpich ]]; then
     # mpich module ships its own PMI/libfabric deps under dep/
