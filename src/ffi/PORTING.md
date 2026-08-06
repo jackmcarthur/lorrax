@@ -376,7 +376,7 @@ was skipped.
 | NVIDIA GPU              | CC ≥ 7.0 | A100 / H100 tested. |
 | CUDA toolkit            | 12.0    | 12.9 is what we link against. |
 | NCCL                    | 2.18    | Ships with CUDA 12.4+; JAX bundles it. |
-| JAX with `jax.ffi`      | 0.5     | Must match CUDA major. `nvcr.io/nvidia/jax:25.04-py3` is our container. |
+| JAX with `jax.ffi`      | 0.7     | Must match CUDA major. `ghcr.io/nvidia/jax:jax-2025-07-21` (jax 0.7.0 / CUDA 12.9) is our container — the LAST CUDA-12 tag in that family. `XLA_FFI_API_MAJOR/MINOR` is 0/1 on 0.5.3 and 0.7.0 alike; the `xla/ffi/api` headers differ only by additions. |
 | NVHPC SDK (cuSOLVERMp)  | 22.7    | 25.5 validated. Only the `libcusolverMp` + `libcal` subset is needed. |
 | Parallel HDF5           | 1.12    | Either Cray HDF5 (MPICH ABI) or a MPI-linked conda-forge build. |
 | SLATE (+ blaspp/lapackpp)| any     | Built from source against the target MPI + libsci/BLAS. |
@@ -492,9 +492,9 @@ composition) is runtime-agnostic.
 
 Shifter forbids `--volume` sources outside `/pscratch` and a handful
 of other paths, which is why every "stage" script copies to
-`$SCRATCH` first. The `nvcr.io/nvidia/jax:25.04-py3` container does
+`$SCRATCH` first. The `ghcr.io/nvidia/jax:jax-2025-07-21` container does
 **not** ship NVHPC SDK, Cray MPICH, Cray HDF5, or SLATE — all four
-come in via bind-mount.
+come in via bind-mount. (Nor FFTW3; it does ship NCCL.)
 
 `lxrun` uses `--mpi=cray_shasta` (not `pmi2` or `pmix`) — both of
 those silently give singleton `MPI_COMM_WORLD` with

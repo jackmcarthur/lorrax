@@ -43,7 +43,9 @@
 #                          is enough for the CPU leg.
 #   LORRAX_MPICH_GPU_SUPPORT  0|1 — override the above outright.
 #   LORRAX_FFI_NVHPC_DIR   host path to the staged nvhpc subset.
-#   LORRAX_FFI_IMAGE       shifter image tag.  Default: nvcr.io/nvidia/jax:25.04-py3
+#   LORRAX_FFI_IMAGE       shifter image tag.  Default:
+#                          ghcr.io/nvidia/jax:jax-2025-07-21 (jax 0.7.0,
+#                          CUDA 12.9) -- the tag site_config.sh runs.
 #   LORRAX_NGPU            for srun-mode, # GPUs to request (default 1)
 #   LORRAX_NNODES          for srun-mode, # nodes
 #   LORRAX_NTASKS          for srun-mode, # total ranks
@@ -81,7 +83,8 @@ case "${LORRAX_MPICH_GPU_SUPPORT:-}" in
 esac
 
 NVHPC_HOST="${LORRAX_FFI_NVHPC_DIR:-$HOME/software/lorrax_nvhpc}"
-IMAGE="${LORRAX_FFI_IMAGE:-nvcr.io/nvidia/jax:25.04-py3}"
+# config/perlmutter/site_config.sh owns this tag and the reason for it.
+IMAGE="${LORRAX_FFI_IMAGE:-ghcr.io/nvidia/jax:jax-2025-07-21}"
 NGPU="${LORRAX_NGPU:-1}"
 NTASKS="${LORRAX_NTASKS:-${NGPU}}"
 NNODES="${LORRAX_NNODES:-1}"
