@@ -51,11 +51,20 @@ distributed_zeta_solve = distributed      # zeta factor+solve: nothing O(mu²) r
 distributed_lu         = scalapack        # transverse channels, bispinor runs (CPU mesh)
 w_dyson_solver         = distributed      # W Dyson backsolve
 eigh_backend           = distributed      # only when one (rank,rank) tile no longer fits
-slab_io                = auto             # verify the FFI writer engages (banner), not the allgather fallback
+slab_io                = auto             # verify the FFI writer engages (read the banner)
 ```
 
 plus the launch env of `config/frontera/templates/gw_dev.sbatch`
 (`srun --mpi=pmi2`, `impl=mpi`; the FFI stack is the required default since 2026-08-01 — no gate exports needed).
+
+> **`--mpi=pmi2` is a FRONTERA line. Do not carry it to Perlmutter.** It is
+> right for Intel MPI under TACCs SLURM. Against Shifters Cray MPICH it
+> makes MPI initialise as a **singleton** — every rank gets its own
+> `MPI_COMM_WORLD` of size 1 — which under independent I/O can still produce
+> a correct-looking file. Perlmutter needs `--mpi=cray_shasta`. This is the
+> single most dangerous failure mode in the I/O subsystem;
+> [`docs/architecture/slab_io.md`](../architecture/slab_io.md) owns it and
+> carries the three-line world-size assertion every gate should run.
 
 ## Certified example invocations
 
