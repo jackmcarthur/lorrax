@@ -28,6 +28,9 @@ See the [Quickstart](quickstart.md) for the worked example, and
 
 ## High-level pipeline
 
+LORRAX starts from a BerkeleyGW-format `WFN.h5`; producing one from a crystal is
+[Inputs from DFT](preprocessing.md).
+
 1. Charge density from selected bands → choose ISDF points $r_\mu$ via k-means/CVT
 2. Read wavefunctions $c_{nk}(G)$, FFT to real space $\psi_{nk}(r)$
 3. For each $q$, construct $\zeta_{q,\mu}(r)$ by solving $C_q \zeta_q = Z_q$ by least-squares
