@@ -1919,12 +1919,43 @@ class HeadConfig:
 
 @dataclass(frozen=True)
 class ScreeningConfig:
-    """χ₀ / W screening: method choice + minimax-quadrature knobs."""
-    method: str                   # "minimax" (only one currently)
+    """χ₀ / W screening: method choice + minimax-quadrature knobs.
+
+    ``method`` selects the chi0 frequency treatment, and minimax is the
+    ONLY one LORRAX implements (owner ruling 2026-08-06).  Nothing
+    downstream branches on this field, and that is deliberate -- there is
+    no second branch to take.  Its whole job is the ``__post_init__``
+    check below, which is what makes it honest: before that check the
+    field was pure decoration, so ``screening_method = ctsp`` parsed,
+    normalised, and ran minimax without a word.
+    """
+    method: str                   # "minimax" -- the only supported value
     minimax_target_error: float
     minimax_max_nodes: int
     regenerate_minimax_tables: bool
     minimax_energy_reference: str  # "midgap" | "vbm"
+
+    def __post_init__(self):
+        # REFUSE, naming what IS supported, instead of silently resolving
+        # to it.  ``ctsp`` (contour-tail / separable-pole terminology from
+        # the pre-minimax era) was accepted here for months and always ran
+        # minimax, because no reader of this field has ever existed -- so
+        # tests/regression/cohsex_debug/cohsex_test_ctsp_compare.in was a
+        # "comparison" fixture comparing minimax against minimax.  A
+        # silent downgrade of an EXPLICIT request is the failure mode
+        # ffi/gate.py exists to prevent; the same rule applies to a
+        # synonym that resolves to the supported method by accident
+        # rather than by design.
+        if self.method != "minimax":
+            raise ValueError(
+                f"screening_method = {self.method!r} is not supported.  "
+                f"'minimax' (minimax quadrature for chi0 on the imaginary "
+                f"axis) is the only screening method LORRAX implements.  "
+                f"Note for decks carrying 'ctsp': that spelling was "
+                f"accepted historically and SILENTLY RAN MINIMAX -- it "
+                f"never selected a different method, so replacing it with "
+                f"'screening_method = minimax' (or deleting the key, "
+                f"which defaults to minimax) changes no result.")
 
 
 @dataclass(frozen=True)
