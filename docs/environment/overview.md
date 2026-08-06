@@ -14,12 +14,18 @@ This section replaces the old `ENVIRONMENT_COMPREHENSIVE.md`. The pages:
 | [Frontera (TACC)](machines/frontera.md) | machine facts, cold start, build recipes, vendoring ledger |
 | [Perlmutter (NERSC)](machines/perlmutter.md) | Shifter module, FFI staging, what is and is not tested there |
 
-Two references deliberately stay **outside** this section:
+Three references deliberately stay **outside** this section — see the
+[register](../index.md#register) for the full ownership map:
 
 * **`docs/dev/env_vars.md`** — the environment-variable **registry**, every
   `LORRAX_*` read machine-enforced by `tests/test_env_registry.py` +
   `tools/env_audit.py`. Rows are never copied into prose here; the registry
-  is the single source for spellings, defaults, and classes.
+  is the single source for spellings, defaults, classes and parse grammar.
+* **`docs/architecture/ffi_layout.md`** — everything about *how* a native
+  library is reached: the build legs, which nvhpc stage selects which
+  communication path, which FFT engine a given `.so` links, and the
+  native-layer failure triage. This page owns only *whether the layer is
+  present on this machine and what it depends on*.
 * **The run's own startup report.** What a particular run *resolved* is
   printed in one rank-0 block by `runtime.initialize_communicator_stack()`.
   After backend init, `os.environ` is a false witness (measured, job
@@ -63,7 +69,7 @@ missing or wrong:
 | 3 | **venv** (`$WORK/lorrax_env/.venv`, uv-built, jax 0.9.1 CPU+CUDA-12 wheels) | *not vendored* — `pyproject.toml` is the dependency authority but did not build this exact wheel set | 2 | `ModuleNotFoundError` at the first import; a CUDA-13 wheel set on the 535.x driver fails at backend init |
 | 4 | **mpi4py + parallel-h5py overlay** (`$WORK/lorrax_env_mpi_overlay/site`, mpi4py 4.1.2 + h5py 3.16.0 `HDF5_MPI=ON` + `sitecustomize.py`) | `build_mpi_overlay.sh` (`fetch` on login, `build` in the SIF on a compute node; sha256-pinned sdists) | 2, 3, host Intel MPI 2020.4, host parallel HDF5 1.14.6 | `h5py.get_config().mpi` is False → the `PHDF5_HOST` slab-IO tier is unavailable; without the overlay `sitecustomize`: **every run exits rc=1 after succeeding** ("MPI routine after finalizing MPICH") |
 | 5 | **MPIwrapper** (upstream v2.11.1 + `mpiwrapper/lorrax_thread.patch`; the `MPI_THREAD_MULTIPLE` upgrade) | `build_mpiwrapper.sh --fresh` (**login node** — needs gfortran; machine-code verification of the patch) | host gcc/gfortran + Intel MPI (not the container) | `MPITRAMPOLINE_LIB` unset/missing → MPItrampoline refuses loudly at startup; an **unpatched** wrapper loads fine and reintroduces the measured ~29% multi-node segfault/hang class (AS.4b) — which is why the build script verifies the patch in the disassembly |
-| 6 | **host FFI `.so`** (`liblorrax_ffi_host.so`: phdf5 + ScaLAPACK + SLATE + MKL FFT/GEMM legs) | `build_ffi_host.sh`; GPU twin `stage_ffi_deps.sh` + `build_ffi.sh` | 2, host MPI, MKL, a SLATE install (*not vendored*) | never fatal by design: `auto` gates announce `FFI target … unavailable` and fall back to XLA lowering / lower slab-IO tiers; an **explicit** dial (`…=on` / `backend=<ffi>`) refuses with the probe reason |
+| 6 | **host FFI `.so`** (`liblorrax_ffi_host.so`: phdf5 + ScaLAPACK + SLATE + FFT/GEMM legs) | `build_ffi_host.sh`; GPU twin `stage_ffi_deps.sh` + `build_ffi.sh` | 2, host MPI, a CBLAS/ScaLAPACK vendor, a SLATE install (*not vendored*) | **fatal at startup.** Since the 2026-08-01 ruling the FFI layer is *required*: a missing or unloadable library refuses in `Gate.enforce`, naming the `.so`. The row that stood here — "never fatal by design … falls back to XLA lowering / lower slab-IO tiers" — described the pre-ruling world and is withdrawn, not kept alongside. Corrected 2026-08-06 during doc consolidation; the ruling is [`decisions.md`](../architecture/decisions.md) 2026-08-01, and the layer itself is [`ffi_layout.md`](../architecture/ffi_layout.md) |
 | 7 | **env glue** (`gpu_env.sh`, `mpi_transport_env.sh`; staged PMI2 lib from `stage_host_pmi.sh`) | sourced per job | 5, 6, host SLURM | without the staged PMI2 lib, `srun --mpi=pmi2` bootstraps against TACC's PMI-1 `libpmi.so` → `MPIR_pmi_init` fails; without `mpi_transport_env.sh`, the login shell's leaked `FI_PROVIDER`/`I_MPI_PMI_LIBRARY` win silently |
 | 8 | **staged runtime bundle** (`lorrax_cpu_bundle.tar` → node-local `/tmp` SSD) | `build_cpu_runtime_bundle.sh` (in the SIF, once per venv/src revision) then `stage_runtime.sh` (sourced per job, `flock`-once per node) | 3, 4, `src/` | not fatal, **loud**: falls back to the Lustre venv and says so on rank 0; cold import returns to the 44–88 s class from the 4.6 s staged path |
 | 9 | **launch template** (`templates/gw_dev.sbatch`) | vendored | all of the above | — the certified composition; edit the `#SBATCH` block and deck variables, leave the env block alone |
@@ -75,6 +81,30 @@ reading the last column answers "which layer is broken" from a job log.
 
 ## 2. JAX configuration (all platforms)
 
+> ### The two machines are not on the same JAX generation
+>
+> **Measured 2026-08-06.** Frontera's venv is **jax 0.9.1**. Perlmutter's GPU
+> container (`nvcr.io/nvidia/jax:25.04-py3`) ships **0.5.3.dev20260806**.
+> `pyproject.toml` declares `jax>=0.9.0` and `jaxlib>=0.9.0` for both, and
+> **nothing enforces it** — there is no runtime version check anywhere under
+> `src/`, so Perlmutter runs several minor versions below the declared floor
+> and says nothing.
+>
+> This is not a footnote; it decides what you can believe on which machine:
+>
+> * `tests/test_orbit_syms.py:241` fails **only** under 0.5.3. A red run there
+>   on Perlmutter is a JAX artifact, not a defect in the code under test.
+> * `common/jax_compile_cache.py:595` `_canonical_accelerator` is called with
+>   the wrong arity against 0.5.3's signature, which kills **every P>1 run**
+>   that has a cache directory set.
+> * `jax.memory_stats()` returns `None` in the container, so device peak memory
+>   is **unmeasurable** there. Every allocator figure in §2.1 below was taken
+>   on Frontera hardware and is carried forward, not re-measured.
+>
+> Treat "measured on one machine" as "unknown on the other" until the pin is
+> reconciled. Which of the two generations LORRAX is going to support is an
+> open owner decision, not something these docs can settle.
+
 Set **before `import jax`**. `runtime.initialize_communicator_stack()` /
 `bootstrap()` set the hard defaults; cluster modules and env scripts set the
 rest.
@@ -84,8 +114,20 @@ rest.
 | `JAX_ENABLE_X64` | `1` | 64-bit precision (required for GW) |
 | `JAX_PLATFORMS` | `cuda,cpu` (GPU) / `cpu` (CPU runs) | an explicit `cpu` also arms the CUDA-plugin-skip (below) |
 | `XLA_PYTHON_CLIENT_PREALLOCATE` | `false` | don't pre-grab a fixed XLA pool (set by `runtime.set_default_env()`) |
-| `JAX_COMPILATION_CACHE_DIR` | `$SCRATCH/.jax_cache` | persistent XLA compile cache — keyed on shapes, so a new system size always misses |
 | `HDF5_USE_FILE_LOCKING` | `FALSE` | Lustre HDF5 compatibility |
+
+**There are two compile-cache variables and they are not the same knob.**
+This page used to list only the first, and `env_vars.md` only the second,
+which is how "just clear the cache directory" came to name the wrong
+directory.
+
+| variable | whose | what it is |
+|---|---|---|
+| `JAX_COMPILATION_CACHE_DIR` | **jax's own**, default `$SCRATCH/.jax_cache` | set by `config/modulefiles/lorrax/0.1.0.lua` and `config/README.md`; nothing under `src/` reads it. |
+| `ISDF_JAX_CACHE_DIR` | **LORRAX's**, `$SCRATCH/lorrax_jax_cache` → `$XDG_CACHE_HOME/isdf_jax_compilation` | the knob `common/jax_compile_cache.py` actually acts on, together with the whole `LORRAX_JAX_CACHE_*` family. Registry: [`env_vars.md`](../dev/env_vars.md) §2b. |
+
+Either way the key includes **every array shape**, so a new system size always
+misses.
 
 ### 2.1 The three allocators
 
@@ -171,7 +213,7 @@ the CUDA plugin cold load hiding inside the first `jax.devices()`.
 | every run exits rc=1 **after** succeeding (CPU/MPI) | the overlay `sitecustomize` + `LORRAX_MPI_FINALIZE_FIX=skip_atexit` are not on the path ([transports](transports.md)) |
 | HDF5 "file is already open" on Lustre | `HDF5_USE_FILE_LOCKING=FALSE` |
 | wrong data from `psum_scatter` on CPU, rc=0 | you are on gloo — see [transports](transports.md); this is the corruption that moved LORRAX to `impl=mpi` |
-| stale JIT cache `KeyError` warnings | `rm -rf $JAX_COMPILATION_CACHE_DIR` (per-checkout subdir via `common.jax_compile_cache`) |
+| stale JIT cache `KeyError` warnings | clear the directory `common.jax_compile_cache` actually used — that is `$ISDF_JAX_CACHE_DIR` (see §2), **not** `$JAX_COMPILATION_CACHE_DIR`. The run's startup block prints the resolved path; use that. |
 | `LORRAX_MPI_TYPE=pmix` hangs (Perlmutter) | opt-in legacy path; the unified default `cray_shasta` covers SLATE, cuSOLVERMp and phdf5 |
 
 Debug flags: `JAX_DEBUG_NANS=1`, `JAX_DISABLE_JIT=1`, `JAX_LOG_COMPILES=1`,
