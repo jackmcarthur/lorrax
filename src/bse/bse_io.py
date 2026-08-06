@@ -715,30 +715,40 @@ def _bse_slab_io_backend(input_file: Optional[str], log_fn=print):
     precedence chain in ``bse/`` is exactly the drift that warning is
     about.
 
-    A failure to resolve is NOT fatal: it logs and returns ``None``, and
-    the loader runs on the serial readers as it always has.  The one
-    thing that must not happen is a BSE run dying in the config layer
-    over a transport choice, since the transport it would have fallen
-    back to is correct.
+    An UNREADABLE DECK is not fatal — it logs and returns ``None``, and
+    the loader runs on the serial readers as it always has, because
+    those readers are correct and a BSE run should not die over a
+    transport preference it could not look up.
+
+    **A REFUSAL FROM THE RESOLVER IS NOT CAUGHT.**  That distinction is
+    the whole of the error handling here.  `resolve_slab_io_backend`
+    raises for exactly two reasons — a deck naming `h5py_allgather`
+    above one process, and `slab_io=auto` finding no parallel tier above
+    one process — and both are deliberate, owner-ruled refusals with
+    repair instructions in them.  Catching them would turn the tree's
+    loudest transport rule into a silent fall-through in `bse/`, which
+    is the antipattern the rule itself exists to delete.  The BSE run
+    stops, exactly as the GW driver stops on the same deck.
     """
     if input_file is None or not os.path.isfile(input_file):
         return None
+    from gw.gw_config import (read_lorrax_input, resolve_slab_io_backend,
+                              SlabIOBackend)
     try:
-        from gw.gw_config import (read_lorrax_input, resolve_slab_io_backend,
-                                  SlabIOBackend)
         # ``read_lorrax_input`` already fills every key from ``_DEFAULTS``,
         # so an absent ``slab_io`` arrives here as "auto" — the same value
         # ``from_input_file`` would have seen.
         params = read_lorrax_input(input_file)
-        backend = resolve_slab_io_backend(
-            params.get("slab_io", "auto"), params.get("use_ffi_io"),
-            print_fn=log_fn)
     except Exception as exc:                       # noqa: BLE001
-        log_fn(f"BSE-sharded: SlabIO backend not resolved from {input_file} "
-               f"({type(exc).__name__}: {exc}); reading the restart with the "
-               f"serial h5py tile readers (memory-correct, ~30x slower — "
-               f"CLAIMS 76).")
+        log_fn(f"BSE-sharded: cannot read {input_file} "
+               f"({type(exc).__name__}: {exc}); reading the restart with "
+               f"the serial h5py tile readers (memory-correct; measured "
+               f"~2x slower than the SlabIO path on Lustre at 16 ranks, "
+               f"CLAIMS 128).")
         return None
+    backend = resolve_slab_io_backend(
+        params.get("slab_io", "auto"), params.get("use_ffi_io"),
+        print_fn=log_fn)
     if backend is SlabIOBackend.H5PY_ALLGATHER:
         return None
     return backend
