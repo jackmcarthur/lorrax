@@ -62,7 +62,6 @@ nav:
       - Frontera (TACC): environment/machines/frontera.md
       - Perlmutter (NERSC): environment/machines/perlmutter.md
   - User guide:
-      - Overview: user-guide/index.md
       - Drivers: drivers.md
       - Input reference: input_reference.md
   - Theory:
@@ -73,12 +72,12 @@ nav:
       - Symmetry: theory/symmetry.md
       - HL-GPP derivation: theory/hl-gpp-derivation.md
   - Architecture:
+      - Design decisions: architecture/decisions.md
       - Layers: architecture/layers.md
-      - Substrate services: architecture/services.md
-      - SlabIO (sharded-slab HDF5): architecture/slab_io.md
       - Codebase: architecture/codebase.md
+      - Substrate services: architecture/services.md
+      - The FFI layer: architecture/ffi_layout.md
+      - SlabIO (sharded-slab HDF5): architecture/slab_io.md
       - Memory model: architecture/memory-model.md
       - Multi-host: architecture/multihost.md
-  - API reference: api/index.md
   - Contributing: contributing.md
-  - Changelog: changelog.md
