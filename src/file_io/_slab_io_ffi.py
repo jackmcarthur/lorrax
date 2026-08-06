@@ -17,7 +17,9 @@ platform="CUDA" and ``liblorrax_ffi_host.so``'s under platform="cpu"
 against those same strings.  So this backend drives the GPU collective
 write and (since workstream AE) the host one — on CPU the C++ side
 skips the D2H staging entirely and H5Dwrite reads the XLA buffer in
-place.  ``gw_config._route_cpu_slab_io`` capability-probes for it.
+place.  The capability probe for it lives in ``ffi_loader.has_phdf5_write``;
+``gw_config._route_cpu_slab_io``, which used to consume that probe to
+pick a tier, was deleted with the router.
 
 Every operation derives per-rank hyperslab offsets from the sharding
 spec of the JAX array being written (or a caller-provided one for
