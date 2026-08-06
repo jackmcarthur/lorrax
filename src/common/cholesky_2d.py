@@ -39,17 +39,17 @@ from jax import lax
 from jax.experimental.shard_map import shard_map
 from jax.scipy.linalg import solve_triangular
 
-# jax 0.9 tracks varying-manual-axes (VMA) inside shard_map and its strict
-# CPU check requires the fori_loop carry below to be pcast to 'varying'.
-# jax <= 0.8 has no VMA tracking — every value inside shard_map is
-# implicitly device-varying — so the identity is the correct (and only
-# possible) behavior there.  Guarded here so one source runs on both the
-# 0.7.2 production container and jax-0.9 venvs.
-try:
-    _pcast = lax.pcast
-except AttributeError:  # jax < 0.9
-    def _pcast(x, axes, *, to):
-        return x
+# Varying-manual-axes marking for the fori_loop carry below.  ONE module owns
+# which jax spells this how — ``common.vma`` — and it is deliberately not
+# re-decided here: this file used to carry its own
+# ``try: lax.pcast / except AttributeError: identity`` guard, commented "jax
+# <= 0.8 has no VMA tracking", and that comment was false.  Tracking starts at
+# jax 0.7.0 and 0.7.x has no ``lax.pcast`` at all, so the except-branch
+# installed a NO-OP on exactly the generation that enforces the marking —
+# including the container this file's docstring names.  A second version
+# branch is how that happened; see ``src/common/vma.py`` for the measured
+# table and for the refusal it raises on a tracking jax with neither spelling.
+from common.vma import mark_varying
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
@@ -190,13 +190,16 @@ def cholesky_2d_single(mesh: Mesh, J: int, b: int):
             A_local = lax.fori_loop(0, J_row, do_trsm, A_local)
             
             # Step 4: Broadcast panel L[:, k] via psum
-            # Each device contributes its local portion, then psum aggregates
-            # JAX 0.9+ on the CPU backend strictly enforces VMA: the
+            # Each device contributes its local portion, then psum aggregates.
+            # From jax 0.7.0 shard_map tracks varying manual axes: this
             # fori_loop carry must be marked varying on ('x','y') because
-            # ``fill_panel`` writes per-device-conditionally.  GPU is more
-            # forgiving, but the CPU check is the spec-correct one.
-            panel_init = _pcast(jnp.zeros((J, b, b), dtype),
-                                ('x', 'y'), to='varying')
+            # ``fill_panel`` writes per-device-conditionally, while
+            # ``jnp.zeros`` starts with an EMPTY varying set.  Unmarked, the
+            # carry-type check rejects the loop with "the varying manual axes
+            # do not match".  Mark the axes the body introduces, not every
+            # mesh axis: over-marking a carry that leaves through a replicated
+            # out_specs is itself an error (measured; see common.vma).
+            panel_init = mark_varying(jnp.zeros((J, b, b), dtype), ('x', 'y'))
             
             def fill_panel(i_loc, panel):
                 i_glob = my_row_start + i_loc

@@ -1189,6 +1189,14 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        (2)-(5) are ``bootstrap()``, unchanged and still separately tested;
        this function calls it rather than re-listing its steps, so there is
        exactly one implementation of the order.
+    5b. :func:`common.jax_support.enforce` -- the running JAX is the one this
+       tree is written against, or the run REFUSES here.  Needs (5): the
+       backend must exist so ``jax._src`` is fully populated and its
+       signatures are readable.  Before (6) because (6) performs the first
+       ``jit``, and the failure this catches is a ``TypeError`` inside that
+       jit -- or its silent variant, a compile cache reporting
+       ``enabled=True`` while writing zero entries.  Costs one
+       ``inspect.signature`` per patched hook.
     6. :func:`common.collectives.prepare_mesh` -- the run's mesh, then
        ``warm_mesh_cliques`` (CPU/MPI) and ``nccl_warmup`` (GPU/NCCL).
        Collective: every rank must reach it.  Needs (4) and (5).
@@ -1255,6 +1263,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     install_failfast_excepthook()
     # -- 1..5 ---------------------------------------------------------------
     bootstrap(platform=platform)
+    # -- 5b -----------------------------------------------------------------
+    _enforce_supported_jax(say)
     _t_boot = time.perf_counter()
     # -- 6 ------------------------------------------------------------------
     from common.collectives import prepare_mesh
@@ -1426,6 +1436,37 @@ def _thread_env() -> dict:
         "LORRAX_SCALAPACK_MKL_THREADS": os.environ.get(
             "LORRAX_SCALAPACK_MKL_THREADS"),
     }
+
+
+def _enforce_supported_jax(say) -> None:
+    """Startup enforcement of the declared JAX window — step 5b.
+
+    Refuses when ``jax.version.__version_info__`` is outside
+    ``common.jax_support``'s window, or when any ``jax._src`` private that
+    ``common/jax_compile_cache.py`` patches has a shape this tree is not
+    written against.  Both are startup facts; neither can change mid-run.
+
+    WHY IT IS HERE AT ALL, given that it was deliberately left unwired for a
+    day.  ``jax_compile_cache`` used to carry five compatibility shims that
+    absorbed exactly these conditions, and while they existed a refusal keyed
+    on them would have stopped runs that worked.  Four of the five went with
+    jax 0.5.3 support on 2026-08-06.  Unabsorbed, the conditions surface as a
+    ``TypeError`` on the first ``jit`` — or, in the variant that cost the most
+    time to find, as no surface at all: ``ensure_jax_compile_cache`` printing
+    ``enabled=True`` over a cache that wrote zero entries for months.
+
+    Raising here is intended, not startup fragility, and for the same reason
+    :func:`_enforce_required_ffi` raises one step later: the fail-fast
+    excepthook is already installed (step 0), so a refusal on any rank exits
+    the job non-zero with the message at the top of the log.
+
+    ``LORRAX_JAX_UNSUPPORTED_OK=1`` downgrades every refusal to one announced
+    line — the module's single declared silence, and it is announced on rank 0
+    rather than swallowed.
+    """
+    from common.jax_support import enforce as _enforce_jax
+
+    _enforce_jax(announce=say)
 
 
 def _enforce_required_ffi(mesh) -> None:

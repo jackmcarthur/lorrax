@@ -1,12 +1,19 @@
-"""Tests for the proposed JAX-support startup gate.
+"""Tests for the JAX-support startup gate (WIRED 2026-08-06, step 5b).
 
 These are negative-controlled: each refusal is proved to fire by CONSTRUCTING
 the unsupported condition, not by asserting that today's environment happens
 to be fine.  A gate that only ever sees a good environment is untested.
+
+Since the gate is wired, three further things are pinned here that were not
+before, because a wired gate can break a run: that the window is the one
+``pyproject.toml`` declares, that the JAX THIS PROCESS IS RUNNING satisfies it
+(so a container regression fails a test rather than every job), and that the
+startup path really calls it.
 """
 from __future__ import annotations
 
 import importlib
+import inspect
 import sys
 import types
 
@@ -19,12 +26,13 @@ from common import jax_support as js  # noqa: E402
 
 # ---------------------------------------------------------------- version leg
 @pytest.mark.parametrize("vi,supported", [
-    ((0, 9, 0), True),
-    ((0, 9, 1), True),
+    ((0, 7, 0), True),     # the Perlmutter GPU container from 2026-08-06
+    ((0, 7, 2), True),
+    ((0, 9, 1), True),     # the Frontera venv
     ((0, 9, 99), True),
     ((0, 10, 0), False),   # above the window
-    ((0, 5, 3), False),    # the Perlmutter container, measured 2026-08-06
-    ((0, 8, 9), False),    # below the floor
+    ((0, 6, 9), False),    # below the floor: no VMA tracking, no lax.pvary
+    ((0, 5, 3), False),    # the OLD Perlmutter container, measured 2026-08-06
 ])
 def test_version_window(monkeypatch, vi, supported):
     monkeypatch.setattr(js, "describe", lambda: {
@@ -37,14 +45,18 @@ def test_version_window(monkeypatch, vi, supported):
 
 
 def test_dev_stamp_does_not_smuggle_a_bad_version_through(monkeypatch):
-    """0.5.3.dev20260806 is stamped TODAY; a string compare would be fooled."""
+    """0.5.3.dev20260806 is stamped TODAY; a string compare would be fooled.
+
+    Both containers restamp: the 0.5.3 image and the 0.7.0 image BOTH print
+    ``.dev20260806``.  Only ``__version_info__`` separates them.
+    """
     monkeypatch.setattr(js, "describe", lambda: {
         "version": "0.5.3.dev20260806", "version_info": (0, 5, 3),
         "release_version": None, "is_dev_build": True,
         "file": "/opt/jax/jax/__init__.py", "shard_map_top_level": False,
     })
     problems = js.check_version()
-    assert problems, "a 0.5.3 dev build must not satisfy a >=0.9.0 floor"
+    assert problems, "a 0.5.3 dev build must not satisfy a >=0.7.0 floor"
     assert "0.5.3.dev20260806" in problems[0]
 
 
@@ -151,3 +163,72 @@ def test_describe_reports_the_real_jax():
     assert set(d) >= {"version", "version_info", "release_version",
                       "is_dev_build", "file", "shard_map_top_level"}
     assert isinstance(d["version"], str) and d["version"]
+
+
+# ------------------------------------------------------- the gate is now WIRED
+def test_the_jax_this_process_runs_actually_satisfies_the_wired_gate():
+    """The gate is enforced at startup, so an unsupported stack breaks EVERY run.
+
+    Scope: this is about the interpreter running pytest, which on Perlmutter is
+    the Shifter image and on Frontera is the venv.  It is here so an image
+    regression costs one red test with a named reason instead of every job
+    refusing at step 5b with the same message and no owner.
+    """
+    problems = (js.check_version() + js.check_private_arity()
+                + js.check_private_symbols())
+    assert problems == [], (
+        "the jax in this process does not satisfy the gate that "
+        "runtime.initialize_communicator_stack enforces at step 5b: %s"
+        % "; ".join(problems))
+
+
+def test_the_declared_window_matches_pyproject():
+    """``SUPPORTED_MIN``/``MAX`` and pyproject.toml must not drift apart.
+
+    The module says it is "the thing pyproject.toml means".  Nothing enforced
+    that, which is how the packaging floor and the running stack came to
+    differ by four minor versions with no diff to point at.
+    """
+    import re
+
+    root = __file__.rsplit("/tests/", 1)[0]
+    with open(root + "/pyproject.toml", encoding="utf-8") as fh:
+        text = fh.read()
+
+    want_lo = ".".join(map(str, js.SUPPORTED_MIN))
+    want_hi = ".".join(map(str, js.SUPPORTED_MAX_EXCLUSIVE))
+    specs = re.findall(r'"jax(?:lib)?(?:\[[a-z0-9]+\])?([^"]*)"', text)
+    assert specs, "no jax specifier found in pyproject.toml"
+    for spec in specs:
+        assert spec == f">={want_lo},<{want_hi}", (
+            "pyproject.toml pins jax %r but common/jax_support.py declares "
+            "the window [%s, %s)" % (spec, want_lo, want_hi))
+
+
+def test_the_startup_path_calls_the_gate():
+    """Wiring is the whole point; an unwired gate is a comment.
+
+    Read the AST of ``initialize_communicator_stack`` rather than running it
+    (running it builds a mesh and needs devices) and rather than searching its
+    text: the docstring names ``prepare_mesh`` several hundred characters
+    before the code calls it, so a substring compare answers a question about
+    prose, not about order of execution.
+    """
+    import ast
+    import runtime
+
+    tree = ast.parse(inspect.getsource(runtime.initialize_communicator_stack))
+    at = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            at.setdefault(node.func.id, node.lineno)
+
+    assert "_enforce_supported_jax" in at, (
+        "runtime.initialize_communicator_stack no longer CALLS the jax "
+        "support gate; it was wired at step 5b on 2026-08-06")
+    assert "prepare_mesh" in at, "prepare_mesh is no longer called here"
+    # The gate must run BEFORE the mesh, which performs the first jit.
+    assert at["_enforce_supported_jax"] < at["prepare_mesh"], (
+        "the jax gate must run before prepare_mesh(): the failure it catches "
+        "is a TypeError inside the first jit")
+    assert "jax_support" in inspect.getsource(runtime._enforce_supported_jax)

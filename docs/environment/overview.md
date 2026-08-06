@@ -123,15 +123,25 @@ the first stage line. Captured **2026-08-06 on Perlmutter, job 56393848**,
 ==============================================================================
 ```
 
+!!! note "The block above was captured on the OLD image and is kept verbatim"
+    It is a real run's output from `nvcr.io/nvidia/jax:25.04-py3` (jax 0.5.3),
+    the Perlmutter GPU container until 2026-08-06. It is **not** edited to
+    match today's stack, because a captured artifact that has been retouched
+    is no longer evidence of anything. Read the version and cache lines in it
+    as history; §2 below states what runs now.
+
 ### The four lines to read first
 
 **1. Platform and JAX generation.** `The JAX platform resolved to 'gpu' …
-under jax 0.5.3.dev20260806`. This is the line that tells you which of the
-two generations you are on (§2) — and note that the container restamps its
-display string to the *run* date, so `0.5.3.dev20260806` means "a 0.5.3-line
-build, looked at on 2026-08-06", not a build from that day. It is also the
-line that explains the warning printed immediately *after* the block on this
-run:
+under jax 0.5.3.dev20260806`. This is the line that tells you which JAX you
+are on (§2) — and note that the container restamps its display string to the
+*run* date, so `0.5.3.dev20260806` means "a 0.5.3-line build, looked at on
+2026-08-06", not a build from that day. **Today's image prints
+`0.7.0.dev20260806`: same date suffix, different generation.** That is why
+the string is never the evidence and `__version_info__` is.
+
+It is also the line that explains the warning printed immediately *after* the
+block on the captured run:
 
 ```text
 /opt/jax/jax/_src/compiler.py:723: UserWarning: Error reading persistent compilation cache entry for
@@ -139,9 +149,13 @@ run:
 'compilation_cache_check_contents'
 ```
 
-That is the 0.5.3-vs-0.9 private-API divergence of §2 surfacing as a dead
-compile cache — the block says the cache is *enabled*, and the warning says
-nothing is being read from it. Believe the warning.
+That is a private-API divergence surfacing as a dead compile cache — the block
+says the cache is *enabled*, and the warning says nothing is being read from
+it. Believe the warning. **That warning is gone on the current image**, not
+because the symbol appeared (it is still absent — it is absent on every NVIDIA
+container at every tag) but because `common/jax_compile_cache.py` resolves it
+once at install time instead of on every read. Measured on the 0.7.0 image:
+9 entries written cold, full warm hit with 0 recompiles.
 
 **2. The mesh.** `The run's device mesh is 1x1 over axes ('x', 'y')`. The
 axis names are the ones every `PartitionSpec` in the codebase refers to; a
@@ -187,15 +201,38 @@ a different worktree, which the path makes obvious and nothing else would.
 
 ## 2. JAX configuration (all platforms)
 
-> ### The two machines are not on the same JAX generation
+> ### The two machines are on different JAX versions, inside one declared window
 >
-> **Measured 2026-08-06.** Frontera's venv is **jax 0.9.1**. Perlmutter's GPU
-> container (`nvcr.io/nvidia/jax:25.04-py3`) ships **0.5.3.dev20260806**.
-> `pyproject.toml` declares `jax>=0.9.0` / `jaxlib>=0.9.0` for both, and
-> **nothing enforces it** — grepping `__version__` across `src/` finds exactly
-> one hit, `runtime/__init__.py:1589`, and it *records* the version into the
-> run fingerprint rather than checking it. So Perlmutter runs below the
-> declared floor and says nothing.
+> **Frontera's venv is jax 0.9.1. Perlmutter's GPU container
+> (`ghcr.io/nvidia/jax:jax-2025-07-21`) is jax 0.7.0.** `pyproject.toml`
+> declares `jax>=0.7.0,<0.10.0`, `common/jax_support.py` declares the same
+> window in `SUPPORTED_MIN`/`SUPPORTED_MAX_EXCLUSIVE`, a test fails if the two
+> drift apart, and **it is enforced at startup** — `jax_support.enforce()` at
+> step 5b of `runtime.initialize_communicator_stack`, after the backend exists
+> and before the first `jit`. `LORRAX_JAX_UNSUPPORTED_OK=1` is the one
+> declared, announced escape.
+>
+> **History, because the shape of the old problem explains the shape of the
+> fix.** Until 2026-08-06 Perlmutter ran **0.5.3** against a declared floor of
+> **0.9.0** with nothing checking it — `__version__` appeared once in `src/`,
+> at `runtime/__init__.py`, *recording* the version into the run fingerprint
+> rather than checking it. The repair was not "raise the container": no image
+> has both jax >= 0.9 and CUDA 12 (below), so the floor was unsatisfiable on
+> this platform by construction. The container went **up** to the last CUDA-12
+> image and the declared floor came **down** to meet it.
+>
+> **What 0.5.3 could not do, and 0.7.0 can** (measured in-container, both
+> images, one srun step each):
+>
+> * `jax.shard_map` and `lax.pvary` are **absent on 0.5.3, present on 0.7.0**.
+>   Varying-manual-axes tracking inside `shard_map` starts at 0.7.0; `common/vma.py`
+>   owns the spelling for the whole tree (`lax.pcast` >= 0.9, `lax.pvary` 0.7-0.8,
+>   identity <= 0.6, refuse otherwise).
+> * The cross-process **shared compile cache works at P>1 for the first time**.
+>   0.5.3's `get_executable_and_time` had no `executable_devices`, so a peer
+>   could name process 0's entry, fetch it and die loading it; the module
+>   degraded the whole cache to OFF above P=1. On 0.7.0 the parameter exists:
+>   measured at P=2, both ranks 9 probes / **9 hits** / 0 recompiles warm.
 >
 > **What the straddle does *not* threaten**, because this was the load-bearing
 > worry and it was measured clean:
@@ -212,16 +249,32 @@ a different worktree, which the path makes obvious and nothing else would.
 >   `jax_use_shardy_partitioner=False` on both. *Scope: single-device
 >   arithmetic only. Multi-rank reduction order was **not** measured.*
 >
-> **The entire real divergence is `jax._src`** — private-API arities, reached
-> from `common/jax_compile_cache.py`, which monkeypatches jax internals. That
-> is the whole blast radius: every *public* symbol LORRAX touches exists with a
-> compatible signature on both generations. Which generation LORRAX supports
-> is an open owner decision; a version gate would make the straddle visible
-> either way.
+> **The remaining divergence between 0.7.0 and 0.9.1 is two symbols, and it is
+> not a version difference at all.** `compilation_cache.VerificationCache` and
+> `config.compilation_cache_check_contents` are absent from **every NVIDIA JAX
+> container at every tag** — ten probed, 0.5.3 through 0.9.1 — and present only
+> in the released wheel. Every other `jax._src` private this tree patches has
+> the *same shape* on 0.7.0 and 0.9.1: `_hash_accelerator_config` 2 params,
+> `_hash_serialized_compile_options` 3, `get_executable_and_time` 4,
+> `is_executable_in_cache` 2, `backend_compile_and_load` present. That is why
+> `common/jax_compile_cache.py` carries **one** narrow guard where it used to
+> carry five, and why the other four were deleted rather than kept as a
+> permanent compatibility layer for an abandoned version.
 >
-> **"Just move to a newer container" is not available, and this is the first
-> thing to check before planning around it.** Measured 2026-08-06: **no NVIDIA
-> JAX container exists with both JAX ≥ 0.9 and CUDA 12.** The earliest tag
+> **The FFI headers move but the ABI does not.** `XLA_FFI_API_MAJOR`/`MINOR`
+> are `0`/`1` on both images; the three `xla/ffi/api/*.h` differ only by
+> additions (new `S1/S2/S4/U1/U2/U4` data types, `DeviceOrdinal_Get`, type-id
+> registration). A device `.so` compiled against the 25.04 headers loads and
+> runs on the 0.7.0 image with **zero** unresolved sonames.
+> `src/ffi/cpp/build_host.sh` stages headers keyed on the image tag, so it must
+> name the image the `.so` will be *loaded* under; its default moved with
+> `site_config.sh`.
+>
+> **"Just move to a newer container" stops here, and this is the first thing
+> to check before planning around it.** `ghcr.io/nvidia/jax:jax-2025-07-21` is
+> the **last CUDA-12 image in this family**; the next tag (`jax-2025-08-25`,
+> jax 0.7.2) is already CUDA 13. Measured 2026-08-06: **no NVIDIA JAX
+> container exists with both JAX ≥ 0.9 and CUDA 12.** The earliest tag
 > carrying JAX ≥ 0.9 is `26.02-py3`, and it ships **CUDA 13.1** — the
 > CUDA 12 → 13 flip lands three minors *before* JAX reaches 0.9, so the two
 > requirements never overlap in any published image. Satisfying the declared
@@ -241,7 +294,7 @@ a different worktree, which the path makes obvious and nothing else would.
 > ### `memory_stats()` returns `None` because the modulefile asks for it
 >
 > **Measured across ten container images, 2026-08-06: `memory_stats()` returns
-> a full dict on all ten, including today's `25.04`.** It is not the JAX
+> a full dict on all ten, including both the old `25.04` and today's `jax-2025-07-21`.** It is not the JAX
 > version and it is not the PJRT plugin. Adding the Perlmutter modulefile's
 > allocator environment is what turns it to `None`.
 >

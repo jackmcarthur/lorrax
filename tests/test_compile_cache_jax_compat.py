@@ -1,22 +1,36 @@
-"""Unit tests for the ``jax._src`` generation shims in ``jax_compile_cache``.
+"""Unit tests for the ``jax._src`` surface ``jax_compile_cache`` patches.
 
 These need no devices and no ``jax.distributed``.  Every case CONSTRUCTS the
-condition it is about — a fake ``jax._src`` submodule with the 0.5.3 shape, or
-the 0.9 shape, or neither — rather than asserting that today's environment
-happens to be fine.  A test that only passes because the machine it ran on was
-healthy is the kind of check this whole workstream exists to replace.
+condition it is about — a fake ``jax._src`` submodule with the shape this tree
+supports, or with a shape it does not — rather than asserting that today's
+environment happens to be fine.  A test that only passes because the machine it
+ran on was healthy is the kind of check this whole workstream exists to replace.
 
-The shims are numbered "COMPAT shim N of 5" in the module under test:
+WHAT CHANGED 2026-08-06.  This file used to test five compatibility shims
+numbered "COMPAT shim N of 5", which existed so one source ran on both jax
+0.5.3 (the old Perlmutter GPU container) and jax 0.9.  The GPU leg moved to
+jax 0.7.0 and 0.5.3 support was dropped, so four of the five are gone:
 
-  1  cache_key._hash_accelerator_config          3 params on 0.5.3, 2 on 0.9
-  2  compilation_cache.get_executable_and_time   3 params on 0.5.3, 4 on 0.9
-  3  VerificationCache / compilation_cache_check_contents   absent on 0.5.3
-  4  compiler.backend_compile_and_load           absent on 0.5.3
-  5  the missing ``executable_devices`` argument — NOT shimmable, degrades
+  1  cache_key._hash_accelerator_config          was 3 params on 0.5.3, 2 now
+  2  compilation_cache.get_executable_and_time   was 3 params on 0.5.3, 4 now
+  4  compiler.backend_compile_and_load           was absent on 0.5.3, present now
+  5  the missing ``executable_devices`` argument — the P>1 degradation
+
+Their tests are replaced by FALSIFICATIONS of the removal: each of the four
+0.5.3 shapes must now produce a loud failure rather than a quiet
+accommodation, which is what makes "the shim is gone" a measured statement
+instead of an absence.
+
+  3  VerificationCache / compilation_cache_check_contents
+
+SURVIVES, and its tests survive with it, because it was never a 0.5.3 shim:
+both symbols are absent from every NVIDIA JAX container at every tag (ten
+probed, 0.5.3 through 0.9.1 — CLAIMS 112) and present only in the released
+wheel.  Removing its guard would restore the CLAIMS 114 defect on the new
+image.
 """
 from __future__ import annotations
 
-import inspect
 import types
 
 import jax  # noqa: F401  -- populates the jax._src submodule attributes
@@ -31,11 +45,9 @@ def _clean_compat_state():
     """Each test starts with no announcement memo and rank 0 speaking."""
     jcc._COMPAT_SAID.clear()
     old_idx, jcc._STATE.proc_idx = jcc._STATE.proc_idx, 0
-    old_rebind, jcc._PEER_REBIND = jcc._PEER_REBIND, None
     yield
     jcc._COMPAT_SAID.clear()
     jcc._STATE.proc_idx = old_idx
-    jcc._PEER_REBIND = old_rebind
 
 
 def _fake_cache_key(n_accel_params: int):
@@ -75,44 +87,49 @@ def _device(kind="A100", platform="gpu"):
 
 
 # ---------------------------------------------------------------------------
-# shim 1 — the accelerator-config hook's arity
+# the accelerator-config hook — 2 parameters, and only 2
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("n_params", [2, 3])
-def test_invariant_key_hook_accepts_both_call_shapes(monkeypatch, capsys,
-                                                     n_params):
-    """JAX 0.5.3 calls the hook with a third ``backend``; 0.9 does not."""
-    mod, calls = _fake_cache_key(n_params)
+def test_invariant_key_hook_hashes_the_devices_at_the_supported_arity(
+        monkeypatch):
+    """The canonical string is built from the device array alone."""
+    mod, calls = _fake_cache_key(2)
     monkeypatch.setattr(jax_src, "cache_key", mod, raising=False)
-
     jcc._install_invariant_key_patch()
-    devices = _Devices([_device("A100"), _device("A100")])
-    if n_params == 3:
-        mod._hash_accelerator_config(object(), devices, "backend-object")
-    else:
-        mod._hash_accelerator_config(object(), devices)
+    mod._hash_accelerator_config(
+        object(), _Devices([_device("A100"), _device("A100")]))
 
     assert len(calls) == 1
     assert calls[0].startswith("lorrax-canon:gpu:2:A100,A100:")
 
 
-def test_invariant_key_announces_only_on_the_divergent_arity(monkeypatch,
-                                                             capsys):
-    mod_09, _ = _fake_cache_key(2)
-    monkeypatch.setattr(jax_src, "cache_key", mod_09, raising=False)
-    jcc._install_invariant_key_patch()
-    assert "_hash_accelerator_config" not in capsys.readouterr().out
+def test_invariant_key_hook_refuses_the_0_5_3_call_shape(monkeypatch):
+    """FALSIFICATION of shim 1's removal.
 
-    jcc._COMPAT_SAID.clear()
-    mod_05, _ = _fake_cache_key(3)
-    monkeypatch.setattr(jax_src, "cache_key", mod_05, raising=False)
+    jax 0.5.3 called this hook ``(hash_obj, devices, backend)``.  The shim
+    ended in ``*_compat_tail`` and swallowed that third positional silently.
+    With the shim gone the call must FAIL — a silently accepted argument on an
+    unsupported jax is exactly the class of quiet accommodation the owner's
+    ruling removes.  ``common.jax_support`` catches this at startup instead,
+    by name, before anything compiles.
+    """
+    mod, _calls = _fake_cache_key(2)
+    monkeypatch.setattr(jax_src, "cache_key", mod, raising=False)
     jcc._install_invariant_key_patch()
-    out = capsys.readouterr().out
-    assert "jax-compat" in out
-    assert "_hash_accelerator_config takes 3 parameters" in out
+
+    with pytest.raises(TypeError):
+        mod._hash_accelerator_config(object(), _Devices([_device()]),
+                                     "backend-object")
+
+
+def test_invariant_key_patch_is_silent_on_a_supported_jax(monkeypatch, capsys):
+    mod, _ = _fake_cache_key(2)
+    monkeypatch.setattr(jax_src, "cache_key", mod, raising=False)
+    jcc._install_invariant_key_patch()
+    assert "jax-compat" not in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
-# shim 2 — the lookup hook's arity
+# the lookup hook — forwards without interpreting
 # ---------------------------------------------------------------------------
 def _fake_compilation_cache(n_get_params: int, *, verification: bool):
     seen = []
@@ -139,6 +156,15 @@ def _fake_compilation_cache(n_get_params: int, *, verification: bool):
 
 @pytest.mark.parametrize("n_params", [3, 4])
 def test_agreement_hook_forwards_whatever_jax_hands_it(monkeypatch, n_params):
+    """``*passthrough`` is a design choice, not a leftover 0.5.3 branch.
+
+    The wrapper reads the cache key and NOTHING else, so it must not claim to
+    know what the remaining arguments mean.  Both arities are exercised
+    precisely to pin "untouched" — 4 is the shape both supported jaxes have,
+    3 is present here only as the negative case that proves the forwarding
+    interprets nothing.  Supporting a 3-parameter jax is a separate question
+    and the answer is no; ``common.jax_support`` refuses it at startup.
+    """
     mod, seen = _fake_compilation_cache(n_params, verification=True)
     monkeypatch.setattr(jax_src, "compilation_cache", mod, raising=False)
     monkeypatch.setattr(jcc._STATE, "agreed", frozenset({"k1"}))
@@ -152,33 +178,34 @@ def test_agreement_hook_forwards_whatever_jax_hands_it(monkeypatch, n_params):
 
 
 def test_agreement_hook_still_vetoes_an_unagreed_key(monkeypatch):
-    """The shim must not accidentally widen what the agreement lets through."""
-    mod, seen = _fake_compilation_cache(3, verification=False)
+    """The wrapper must not widen what the agreement lets through."""
+    mod, seen = _fake_compilation_cache(4, verification=False)
     monkeypatch.setattr(jax_src, "compilation_cache", mod, raising=False)
     monkeypatch.setattr(jcc._STATE, "agreed", frozenset({"k1"}))
 
     jcc._install_agreement_patch()
-    assert mod.get_executable_and_time("other", "opts", "backend") == (None,
-                                                                      None)
+    assert mod.get_executable_and_time(
+        "other", "opts", "backend", "devices") == (None, None)
     assert seen == []
 
 
-def test_agreement_announces_only_on_the_divergent_arity(monkeypatch, capsys):
-    mod_09, _ = _fake_compilation_cache(4, verification=True)
-    monkeypatch.setattr(jax_src, "compilation_cache", mod_09, raising=False)
-    jcc._install_agreement_patch()
-    assert "get_executable_and_time" not in capsys.readouterr().out
+def test_agreement_patch_is_silent_on_a_supported_jax(monkeypatch, capsys):
+    """FALSIFICATION of shim 2's removal: no arity probe, so no announcement.
 
-    jcc._COMPAT_SAID.clear()
-    mod_05, _ = _fake_compilation_cache(3, verification=False)
-    monkeypatch.setattr(jax_src, "compilation_cache", mod_05, raising=False)
-    jcc._install_agreement_patch()
-    out = capsys.readouterr().out
-    assert "get_executable_and_time takes 3 parameters" in out
+    The shim announced whenever ``get_executable_and_time`` was not the
+    4-parameter shape.  Nothing announces now on either arity, because there
+    is no longer a compatibility path to report having taken.
+    """
+    for n in (4, 3):
+        # A fresh namespace each time, so the install guard never short-circuits.
+        mod, _ = _fake_compilation_cache(n, verification=True)
+        monkeypatch.setattr(jax_src, "compilation_cache", mod, raising=False)
+        jcc._install_agreement_patch()
+        assert "get_executable_and_time" not in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
-# shim 3 — content verification is a jax 0.9 feature
+# THE SURVIVING SHIM — content verification exists only in the released wheel
 # ---------------------------------------------------------------------------
 def _fake_config(*, check_contents):
     mod = types.SimpleNamespace(
@@ -190,9 +217,9 @@ def _fake_config(*, check_contents):
 
 
 @pytest.mark.parametrize("check_contents,verification,wraps", [
-    (None, False, False),    # jax 0.5.3: neither symbol exists
-    (False, True, False),    # jax 0.9, verification off
-    (True, True, True),      # jax 0.9, verification on
+    (None, False, False),    # every NVIDIA container: neither symbol exists
+    (False, True, False),    # released wheel, verification off
+    (True, True, True),      # released wheel, verification on
 ])
 def test_atomic_put_uses_verification_only_where_it_exists(
         monkeypatch, tmp_path, check_contents, verification, wraps):
@@ -215,6 +242,12 @@ def test_atomic_put_uses_verification_only_where_it_exists(
 
 def test_atomic_put_announces_when_verification_is_absent(monkeypatch,
                                                           tmp_path, capsys):
+    """This is the announcement that must NOT disappear with the other four.
+
+    Absence here is the container's normal state, not an error, but it is a
+    capability the log has to name: the alternative is the CLAIMS 114 silence,
+    where ``enabled=True`` was printed over a cache writing zero entries.
+    """
     cc, _ = _fake_compilation_cache(4, verification=False)
     monkeypatch.setattr(jax_src, "compilation_cache", cc, raising=False)
     monkeypatch.setattr(jax_src, "config",
@@ -225,6 +258,27 @@ def test_atomic_put_announces_when_verification_is_absent(monkeypatch,
     assert "jax-compat" in out
     assert "VerificationCache" in out
     assert "compilation_cache_check_contents" in out
+
+
+def test_atomic_put_survives_a_half_present_verification_surface(
+        monkeypatch, tmp_path):
+    """One symbol without the other must not be treated as "verification on".
+
+    Constructed because the two names come from DIFFERENT modules
+    (``compilation_cache`` and ``config``), so a future jax can ship one
+    first, and reading only one of them would put a ``None`` where a class
+    belongs.
+    """
+    cc, _ = _fake_compilation_cache(4, verification=True)   # class present
+    monkeypatch.setattr(jax_src, "compilation_cache", cc, raising=False)
+    monkeypatch.setattr(jax_src, "config",
+                        _fake_config(check_contents=None),  # flag absent
+                        raising=False)
+
+    jcc._install_atomic_put_patch()
+    cache, _path = cc.get_file_cache(str(tmp_path))
+    from jax._src import lru_cache as _lru
+    assert isinstance(cache, _lru.LRUCache)
 
 
 def test_atomic_put_writes_through_a_temp_file(monkeypatch, tmp_path):
@@ -243,7 +297,7 @@ def test_atomic_put_writes_through_a_temp_file(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# shim 4 — where a real XLA compile is counted
+# where a real XLA compile is counted — one entry point, no preference order
 # ---------------------------------------------------------------------------
 def _fake_compiler(names):
     calls = {n: 0 for n in names}
@@ -257,7 +311,7 @@ def _fake_compiler(names):
     return types.SimpleNamespace(**{n: make(n) for n in names}), calls
 
 
-def test_counter_prefers_backend_compile_and_load(monkeypatch, capsys):
+def test_counter_patches_backend_compile_and_load_only(monkeypatch, capsys):
     mod, calls = _fake_compiler(["backend_compile_and_load", "backend_compile"])
     monkeypatch.setattr(jax_src, "compiler", mod, raising=False)
     monkeypatch.setattr(jcc._STATE, "compiles", 0)
@@ -267,30 +321,30 @@ def test_counter_prefers_backend_compile_and_load(monkeypatch, capsys):
 
     assert jcc._STATE.compiles == 1
     assert calls["backend_compile_and_load"] == 1
-    # NOT both: on jax 0.9 the preferred entry point calls the other one, so
-    # wrapping both would double-count every compile.
+    # NOT both: the preferred entry point calls the other one, so wrapping
+    # both would double-count every compile.
     mod.backend_compile("x")
     assert jcc._STATE.compiles == 1
     assert "jax-compat" not in capsys.readouterr().out
 
 
-def test_counter_falls_back_to_backend_compile_and_says_so(monkeypatch,
-                                                           capsys):
-    mod, calls = _fake_compiler(["backend_compile"])
+def test_counter_refuses_on_the_0_5_3_compiler_surface(monkeypatch):
+    """FALSIFICATION of shim 4's removal.
+
+    jax 0.5.3 had only ``backend_compile``, and the shim silently counted
+    there instead.  That fallback is gone: this surface must now REFUSE, so
+    the caller announces rather than reporting a confident ``xla_compiles=0``.
+    """
+    mod, _ = _fake_compiler(["backend_compile"])
     monkeypatch.setattr(jax_src, "compiler", mod, raising=False)
-    monkeypatch.setattr(jcc._STATE, "compiles", 0)
 
-    jcc._install_compile_counter()
-    mod.backend_compile("x")
-
-    assert jcc._STATE.compiles == 1
-    out = capsys.readouterr().out
-    assert "jax-compat" in out
-    assert "backend_compile()" in out
+    with pytest.raises(jcc._JaxSurfaceUnsupported) as excinfo:
+        jcc._install_compile_counter()
+    assert "backend_compile_and_load" in str(excinfo.value)
 
 
 def test_counter_refuses_rather_than_reporting_a_confident_zero(monkeypatch):
-    """Neither entry point exists ⇒ raise, so the caller can announce.
+    """No entry point at all ⇒ raise, so the caller can announce.
 
     The defect this replaces was a bare ``except: pass`` at the call site: the
     counter installed nowhere and every run reported ``xla_compiles=0``.
@@ -304,37 +358,48 @@ def test_counter_refuses_rather_than_reporting_a_confident_zero(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# shim 5 — the one difference no shim can bridge
+# the P>1 degradation is gone — the module must not carry it any more
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("n_params,supported", [(3, False), (4, True)])
-def test_peer_rebind_is_decided_by_the_executable_devices_parameter(
-        monkeypatch, n_params, supported):
-    mod, _ = _fake_compilation_cache(n_params, verification=False)
-    monkeypatch.setattr(jax_src, "compilation_cache", mod, raising=False)
-    assert jcc._peer_rebind_supported() is supported
+def test_peer_rebind_degradation_is_removed():
+    """FALSIFICATION of shim 5's removal, at the only altitude available.
 
+    Shim 5 turned the cache OFF at P>1 on a jax whose
+    ``get_executable_and_time`` has no ``executable_devices``.  Both supported
+    jaxes have it, so the branch was unreachable and was deleted rather than
+    left as a permanent compatibility layer.  Its detection duty moved to
+    ``common.jax_support``, which requires that hook to take 4 parameters.
 
-def test_peer_rebind_reads_jax_not_our_own_installed_shim(monkeypatch):
-    """Memoized on first call, because the agreement patch rewrites the hook.
-
-    ``_agreed_get`` is ``(cache_key, *passthrough)`` — 2 parameters — so a
-    later read would conclude "no executable_devices" on a jax 0.9 that has
-    it, and turn off a cache that works.
+    Asserting on the module's own surface is deliberate: the branch cannot be
+    exercised through :func:`ensure_jax_compile_cache` without a real P>1
+    launch, so the honest check is that neither the helper nor its memo is
+    still here, plus that the requirement really is stated where it moved to.
     """
-    mod, _ = _fake_compilation_cache(4, verification=False)
-    monkeypatch.setattr(jax_src, "compilation_cache", mod, raising=False)
-    assert jcc._peer_rebind_supported() is True
+    assert not hasattr(jcc, "_peer_rebind_supported")
+    assert not hasattr(jcc, "_PEER_REBIND")
 
-    jcc._install_agreement_patch()
-    assert len(inspect.signature(mod.get_executable_and_time).parameters) < 4
-    assert jcc._peer_rebind_supported() is True
+    from common import jax_support
+    assert jax_support.REQUIRED_PRIVATE_ARITY[
+        ("jax._src.compilation_cache", "get_executable_and_time")] == 4
 
 
-def test_peer_rebind_assumes_supported_when_it_cannot_introspect(monkeypatch):
-    """A shape we cannot read is not evidence of a mismatch."""
-    mod = types.SimpleNamespace(get_executable_and_time=print)
-    monkeypatch.setattr(jax_src, "compilation_cache", mod, raising=False)
-    assert jcc._peer_rebind_supported() is True
+def test_only_one_compat_announcement_site_is_left():
+    """The module documents ONE surviving shim; count the announcement sites.
+
+    A sixth ``_compat`` call appearing without a decision would be a
+    compatibility layer growing back by accident, which is the thing being
+    removed.  Counted from the AST, not from a substring, so a mention in a
+    comment or a docstring cannot move the number.
+    """
+    import ast
+    import inspect as _inspect
+
+    tree = ast.parse(_inspect.getsource(jcc))
+    sites = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "_compat"]
+    assert len(sites) == 1, (
+        "expected exactly one _compat() announcement site after the four "
+        "jax 0.5.3 shims were removed, found %d" % len(sites))
 
 
 # ---------------------------------------------------------------------------

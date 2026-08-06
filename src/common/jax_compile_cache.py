@@ -200,27 +200,22 @@ but that is inference from the sources, not something measured here.)  It is
 orthogonal to, not a substitute for, the agreement step.
 
 ===========================================================================
-TWO JAX GENERATIONS
+WHICH JAX THIS FILE IS WRITTEN AGAINST
 ===========================================================================
-The four patches above reach into ``jax._src``, and the two production legs
-run different generations of it: Frontera's venv has the released jax 0.9.1,
-Perlmutter's GPU container (``nvcr.io/nvidia/jax:25.04-py3``) is built from
-the 0.5.3 line.  All four patch targets differ between them.  Each difference
-has its own narrow shim, and each shim ANNOUNCES when it fires — see the
-``jax._src generation compatibility`` block below for the measured table and
-for why a blanket ``try/except`` around installation is the wrong instrument
-(it catches nothing: installing a patch is an assignment, and the arity error
-fires later, when JAX calls the hook).
+The four patches above reach into ``jax._src``.  Both production legs now run
+a generation with the same shapes: Frontera's venv has the released jax 0.9.1,
+Perlmutter's GPU container (``ghcr.io/nvidia/jax:jax-2025-07-21``) has jax
+0.7.0.  Every hook this file patches was MEASURED identical on the two — see
+the table in the ``jax._src surface this file patches`` block below.
 
-ONE difference is NOT shimmable, and it is not an arity: jax 0.9 lets the
-reading process bind a cached executable to its own devices
-(``get_executable_and_time(..., executable_devices)``) and jax 0.5.3 has no
-such argument.  Cross-process cache SHARING depends on it, so on the 0.5.3
-line this file degrades to cache-off at P > 1 — announced on every rank, with
-the reason and the fix — while P == 1 keeps a fully working cache.  MEASURED:
-without that degradation a warm 2-rank GPU run has rank 0 hit 9/9 and rank 1
-abort loading the first agreed entry.  A shim that "worked" here would be
-papering over a missing API.
+Until 2026-08-06 the GPU container was ``nvcr.io/nvidia/jax:25.04-py3`` (jax
+0.5.3), which differed on four of them, and this file carried five named
+compatibility shims for that.  Four are DELETED with the 0.5.3 support: the
+detection duty they served now belongs to ``common.jax_support``, which
+asserts those arities and symbols once at startup and refuses by name.  The
+FIFTH survives and is not a version shim at all — ``VerificationCache`` and
+``compilation_cache_check_contents`` are absent from every NVIDIA container at
+every tag, including the 0.9 ones, and present only in the released wheel.
 
 Do not read a container's ``jax.__version__``: NVIDIA re-stamps it with the
 build date, so ten images all print ``.dev<today>`` regardless of which line
@@ -297,46 +292,64 @@ def _say(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# jax._src generation compatibility
+# jax._src surface this file patches
 # ---------------------------------------------------------------------------
-# This file monkeypatches four ``jax._src`` privates, and it is written
-# against the jax 0.9 shapes (``pyproject.toml`` declares ``jax>=0.9.0``).
-# Perlmutter's GPU container carries the 0.5.3 line, where all four differ:
+# This file monkeypatches four ``jax._src`` privates.  It used to carry FIVE
+# named compatibility shims so that one source ran on both the jax 0.5.3 line
+# (Perlmutter's old ``nvcr.io/nvidia/jax:25.04-py3``) and the jax 0.9 line.
+# **Four of the five are gone**: the GPU leg moved to
+# ``ghcr.io/nvidia/jax:jax-2025-07-21`` (jax 0.7.0) and the owner ruled against
+# keeping a permanent compatibility layer for a version being abandoned.
 #
-#   hook                                     jax 0.5.3            jax 0.9.1
-#   ---------------------------------------  -------------------  -----------
-#   cache_key._hash_accelerator_config       3 (+ backend)        2
-#   compilation_cache.get_executable_and_time 3                   4 (+ devices)
-#   compilation_cache.VerificationCache      ABSENT               present
-#   config.compilation_cache_check_contents  ABSENT               present
-#   compiler.backend_compile_and_load        ABSENT               present
-#                                            (compiles via
-#                                             backend_compile)
+# Re-measured in-container on a Perlmutter A100, both images, one srun step
+# each, reading ``jax.version.__version_info__`` and ``inspect.signature`` —
+# capability-probed, never inferred from a version string (every container jax
+# is a dev build that restamps ``__version__`` to the run date; both of these
+# printed ``.dev20260806``):
 #
-# MEASURED 2026-08-06 on one Perlmutter node, container 25.04 vs the 0.9.1
-# venv (sig_probe).  The other two patched hooks are deliberately UNSHIMMED,
-# because they were measured IDENTICAL on both generations, not because nobody
-# looked: ``_hash_serialized_compile_options`` is 3 parameters with the
-# ``strip_device_assignment`` keyword on both, and ``is_executable_in_cache``
-# is 2 on both.  ``lru_cache.LRUCache.put`` is byte-identical too, so
-# :class:`_AtomicLRUCache` needs no shim.  Guarding shapes that do not differ
-# on any stack we can run would be a check with no failure mode to catch.
+#   hook                                       0.5.3    0.7.0    0.9.1†
+#   -----------------------------------------  -------  -------  -------
+#   cache_key._hash_accelerator_config          3        2        2
+#   cache_key._hash_serialized_compile_options  3        3        3
+#   compilation_cache.get_executable_and_time   3        4        4
+#   compilation_cache.is_executable_in_cache    2        2        2
+#   compiler.backend_compile_and_load           ABSENT   present  present
+#   compilation_cache.VerificationCache         ABSENT   ABSENT   present
+#   config.compilation_cache_check_contents     ABSENT   ABSENT   present
+#   lru_cache.LRUCache.put                      write_bytes, no rename, all three
 #
-# Each difference gets its OWN narrow, named shim below.  What we deliberately
-# do NOT do is wrap the installers in a blanket ``try/except``: that is what
-# hid this for months.  Installing a patch is an attribute ASSIGNMENT and never
-# raises, so an ``except`` around installation catches nothing — the arity
-# error fires later, when JAX CALLS the hook, long after that scope has exited.
-# At P == 1 the failure was not even loud: ``_atomic_get_file_cache`` raised
-# ``AttributeError`` inside JAX's own swallowing read path, so ``ensure``
-# reported ``enabled=True`` while the cache wrote ZERO entries (CLAIMS 114).
+#   † the 0.9.1 column is the released wheel in the Frontera venv, measured
+#     2026-08-06 and NOT re-measured here.  Both CONTAINER columns are
+#     re-measured, and a container is what the GPU leg runs.
 #
-# So every shim announces.  A compatibility path nobody can see in the log is
-# indistinguishable from the bug it replaced.  There are five: four arity/
-# symbol shims marked "COMPAT shim N of 5" at their patch sites, and a fifth
-# in :func:`ensure_jax_compile_cache` for the one difference no shim can
-# bridge — the missing ``executable_devices`` argument, without which a peer
-# cannot load process 0's entry at all.
+# Read the 0.7.0 column against the 0.9.1 one: on every row except the two
+# verification symbols they are the SAME SHAPE.  So shims 1 (accelerator-config
+# arity), 2 (lookup arity), 4 (compile entry point) and 5 (the P>1 degradation
+# for a jax that cannot rebind a cached executable to the reading process's
+# devices) had nothing left to bridge and were deleted.  Their detection duty
+# did not vanish with them: ``common.jax_support`` asserts exactly these
+# arities and symbols at startup and REFUSES by name, which is a better
+# instrument than an in-line branch — it fires once, before anything compiles,
+# instead of shaping every call site forever.
+#
+# **ONE shim survives, and it is NOT a 0.5.3 shim.**  ``VerificationCache`` and
+# ``compilation_cache_check_contents`` are ABSENT on the 0.7.0 container just
+# as they were on 0.5.3 — and, per CLAIMS 112, on all TEN NVIDIA JAX images
+# probed at any tag, INCLUDING the 0.9.0/0.9.1 ones.  They exist only in the
+# released wheel.  So this is a container-vs-released-wheel difference, not a
+# generation one, and removing its guard would restore the CLAIMS 114 defect
+# verbatim on the new image: every cache read raising ``AttributeError`` inside
+# JAX's own swallowing read path, zero entries written, ``enabled=True``
+# reported.  It stays, renamed for what it actually is.
+#
+# What we deliberately do NOT do is wrap the installers in a blanket
+# ``try/except``: that is what hid this for months.  Installing a patch is an
+# attribute ASSIGNMENT and never raises, so an ``except`` around installation
+# catches nothing — the error fires later, when JAX CALLS the hook, long after
+# that scope has exited.
+#
+# The surviving shim announces.  A compatibility path nobody can see in the log
+# is indistinguishable from the bug it replaced.
 _COMPAT_SAID: set[str] = set()
 
 
@@ -378,50 +391,6 @@ def _jax_generation() -> str:
         return f"{'.'.join(str(x) for x in vi)} {kind}" if vi else "unknown"
     except Exception:  # noqa: BLE001
         return "unknown"
-
-
-def _n_params(mod, attr: str) -> int | None:
-    """Parameter count of ``mod.attr``, or ``None`` if it cannot be read.
-
-    ``None`` means "not introspectable", which is not evidence of a mismatch;
-    callers treat it as "assume the shape we are written against".
-    """
-    import inspect
-
-    fn = getattr(mod, attr, None)
-    if fn is None:
-        return None
-    try:
-        return len(inspect.signature(fn).parameters)
-    except (TypeError, ValueError):
-        return None
-
-
-_PEER_REBIND: bool | None = None
-
-
-def _peer_rebind_supported() -> bool:
-    """Can a rank bind a CACHED executable to its OWN devices?
-
-    ``True`` on jax 0.9, whose ``get_executable_and_time`` takes
-    ``executable_devices`` and hands it to ``deserialize_executable``;
-    ``False`` on the 0.5.3 line, which has no such argument.  That single
-    difference decides whether a shared cache directory is usable at all at
-    P > 1 — see COMPAT shim 5 in :func:`ensure_jax_compile_cache`.
-
-    Memoized on FIRST call, deliberately: :func:`_install_agreement_patch`
-    replaces this very function with a ``*args`` wrapper, so reading the
-    arity afterwards would measure our own shim instead of JAX's.
-    """
-    global _PEER_REBIND
-    if _PEER_REBIND is None:
-        from jax._src import compilation_cache as _cc
-
-        n = _n_params(_cc, "get_executable_and_time")
-        # Not introspectable ⇒ assume the shape this tree is written against;
-        # a wrong guess here degrades a cache, it does not corrupt a result.
-        _PEER_REBIND = n is None or n >= 4
-    return _PEER_REBIND
 
 
 # ---------------------------------------------------------------------------
@@ -747,23 +716,14 @@ def _install_invariant_key_patch() -> None:
         return _orig_opts(hash_obj, compile_options_obj,
                           strip_device_assignment=True)
 
-    # COMPAT shim 1 of 5 — the accelerator-config hook's arity.
-    # jax 0.5.3 calls it ``(hash_obj, devices, backend)``; jax 0.9 dropped the
-    # backend argument.  The canonical string below is built from the device
-    # array ALONE — the backend was never read even on the generation that
-    # passes it — so accepting and discarding a trailing positional is exact,
-    # not a paper-over.  Announced from the arity we can actually see.
-    _n_acc = _n_params(_ck, "_hash_accelerator_config")
-    if _n_acc is not None and _n_acc != 2:
-        _compat(
-            "cache_key.accelerator_arity",
-            f"jax._src.cache_key._hash_accelerator_config takes {_n_acc} "
-            f"parameters on this jax ({_jax_generation()}); this tree is "
-            f"written against the 2 of jax 0.9.  The invariant-key patch "
-            f"accepts the extra positional and ignores it — it only ever "
-            f"used the device array.")
-
-    def _canonical_accelerator(hash_obj, accelerators, *_compat_tail):
+    # Two parameters, matching ``_hash_accelerator_config`` on every jax this
+    # tree supports (0.7.0 container and 0.9.1 wheel, both MEASURED).  It used
+    # to end in ``*_compat_tail`` to swallow the third positional jax 0.5.3
+    # passed (``backend``, never read); that shim is gone with 0.5.3, and
+    # ``common.jax_support`` asserts the arity at startup instead, so a jax
+    # that reintroduces a third argument is a named refusal rather than a
+    # silently discarded one.
+    def _canonical_accelerator(hash_obj, accelerators):
         devs = list(accelerators.flat)
         plat = getattr(devs[0], "platform", "?") if devs else "?"
         kinds = sorted(str(getattr(d, "device_kind", "?")) for d in devs)
@@ -786,22 +746,17 @@ def _install_agreement_patch() -> None:
     _orig_get = _cc.get_executable_and_time
     _orig_in_cache = _cc.is_executable_in_cache
 
-    # COMPAT shim 2 of 5 — the lookup hook's arity.
-    # ``(cache_key, compile_options, backend)`` on jax 0.5.3; jax 0.9 appends
-    # ``executable_devices``.  MEASURED: every call site in
-    # ``jax/_src/compiler.py`` passes them POSITIONALLY on both generations,
-    # so naming only the first argument (the one this wrapper actually reads)
-    # and forwarding the rest untouched is arity-agnostic by construction —
-    # we never interpret an argument whose meaning we have not measured.
-    _n_get = _n_params(_cc, "get_executable_and_time")
-    if _n_get is not None and _n_get != 4:
-        _compat(
-            "compilation_cache.get_arity",
-            f"jax._src.compilation_cache.get_executable_and_time takes "
-            f"{_n_get} parameters on this jax ({_jax_generation()}); this "
-            f"tree is written against the 4 of jax 0.9.  The agreement patch "
-            f"forwards whatever it is handed — it only reads the cache key.")
-
+    # ``get_executable_and_time`` is ``(cache_key, compile_options, backend,
+    # executable_devices)`` on both supported jaxes (0.7.0 container, 0.9.1
+    # wheel — MEASURED).  The arity PROBE and its announcement, which existed
+    # to report jax 0.5.3's 3-parameter form, are gone; ``common.jax_support``
+    # asserts the 4 at startup.
+    #
+    # ``*passthrough`` is NOT a leftover compatibility branch and is kept
+    # deliberately: this wrapper reads the cache key and nothing else, so
+    # naming three arguments it never interprets would be a claim about their
+    # meaning that this file has no reason to make.  It forwards them
+    # untouched, which is exact for any arity.
     def _agreed_get(cache_key, *passthrough):
         _STATE.probes += 1
         if cache_key not in _STATE.agreed:
@@ -840,10 +795,11 @@ def _install_atomic_put_patch() -> None:
     the default) is replaced; if eviction is on, JAX takes a file lock and we
     defer to it.
 
-    ``LRUCache.put`` is byte-identical on the 0.5.3 and 0.9.1 lines and
-    ``eviction_enabled``/``path`` are instance attributes on both (MEASURED,
-    ``lru_probe``), so the subclass below needs no shim.  What DOES differ is
-    the content-verification wrapper — see COMPAT shim 3 of 5 in the body.
+    ``LRUCache.put`` writes with ``write_bytes`` and no rename, and
+    ``eviction_enabled``/``path`` are instance attributes, on 0.5.3, 0.7.0 and
+    0.9.1 alike (MEASURED), so the subclass below needs no shim.  What is NOT
+    uniform is the content-verification wrapper — see THE SURVIVING SHIM in
+    the body.
     """
     from jax._src import compilation_cache as _cc
     from jax._src import config as _cfg
@@ -873,14 +829,22 @@ def _install_atomic_put_patch() -> None:
                     pass
                 raise
 
-    # COMPAT shim 3 of 5 — content verification is a jax 0.9 feature.
+    # THE SURVIVING SHIM — and the reason it survives is NOT a jax version.
+    #
     # ``VerificationCache`` and the ``compilation_cache_check_contents`` flag
-    # that selects it do not exist on the 0.5.3 line, and — MEASURED across
-    # ten container tags, CLAIMS 112 — on no NVIDIA image at ANY tag, only on
-    # the released 0.9.1.  Both were read at CALL time by the body below, so
-    # on the GPU leg EVERY cache read raised ``AttributeError`` inside JAX's
-    # own swallowing read path: zero entries written, ``enabled=True``
-    # reported, one ``UserWarning`` per jit the only trace (CLAIMS 114).
+    # that selects it are absent from every NVIDIA JAX CONTAINER at every tag
+    # probed — ten of them, 0.5.3 through 0.9.1, CLAIMS 112 — and are present
+    # only in the released wheel (the Frontera venv's 0.9.1).  Re-confirmed
+    # here on the new GPU image: on jax 0.7.0 both are still ABSENT.  So this
+    # is a container-vs-wheel difference, and moving the GPU leg off 0.5.3
+    # does nothing to it.
+    #
+    # Deleting this guard with the other four would have restored the CLAIMS
+    # 114 defect verbatim on the new image: both names were read at CALL time
+    # by the body below, so on the GPU leg EVERY cache read raised
+    # ``AttributeError`` inside JAX's own swallowing read path — zero entries
+    # written, ``enabled=True`` reported, one ``UserWarning`` per jit the only
+    # trace.
     #
     # Resolve them ONCE, here, where absence is a fact we can name.  Skipping
     # verification on a jax that has no such feature is not a downgrade: it is
@@ -916,49 +880,40 @@ def _install_atomic_put_patch() -> None:
     _cc._lorrax_atomic_put_installed = True
 
 
-#: The ``jax._src.compiler`` entry point a real XLA compile goes through, in
-#: preference order.  jax 0.9 routes compiles through
-#: ``backend_compile_and_load``, which itself calls ``backend_compile``; the
-#: 0.5.3 line has no ``backend_compile_and_load`` at all and
-#: ``compile_or_get_cached`` calls ``backend_compile`` directly (MEASURED, both
-#: legs).  We patch exactly ONE of them — wrapping both would double-count
-#: every compile on jax 0.9.
-_COMPILE_ENTRY_POINTS = ("backend_compile_and_load", "backend_compile")
+#: The ``jax._src.compiler`` entry point a real XLA compile goes through.
+#: Both supported jaxes route compiles through ``backend_compile_and_load``
+#: (MEASURED: present on the 0.7.0 container and the 0.9.1 wheel), and it
+#: itself calls ``backend_compile`` — so exactly ONE of them may be patched or
+#: every compile is counted twice.
+#:
+#: This used to be a two-element preference tuple with a fallback to
+#: ``backend_compile``, because jax 0.5.3 had no ``backend_compile_and_load``
+#: at all.  The fallback went with 0.5.3.
+_COMPILE_ENTRY_POINT = "backend_compile_and_load"
 
 
 def _install_compile_counter() -> None:
     """Count real XLA compiles so the storm is measurable, warm vs cold.
 
-    COMPAT shim 4 of 5.  Patches whichever of
-    :data:`_COMPILE_ENTRY_POINTS` this jax actually has, and says so when it
-    is not the one this tree is written against.  Raises
-    :class:`_JaxSurfaceUnsupported` when neither exists, so the caller can
-    report that the storm telemetry is OFF rather than leave
-    ``compile_cache_stats()['compiles']`` reading a confident 0.
+    Raises :class:`_JaxSurfaceUnsupported` when
+    :data:`_COMPILE_ENTRY_POINT` is absent, so the caller can report that the
+    storm telemetry is OFF rather than leave
+    ``compile_cache_stats()['compiles']`` reading a confident 0.  That is a
+    refusal, not a compatibility branch: there is no second entry point left
+    to silently prefer.
     """
     from jax._src import compiler as _compiler
 
     if getattr(_compiler, "_lorrax_compile_counter_installed", False):
         return
 
-    name = None
-    for candidate in _COMPILE_ENTRY_POINTS:
-        if getattr(_compiler, candidate, None) is not None:
-            name = candidate
-            break
-    if name is None:
+    name = _COMPILE_ENTRY_POINT
+    if getattr(_compiler, name, None) is None:
         raise _JaxSurfaceUnsupported(
-            f"jax._src.compiler has none of {_COMPILE_ENTRY_POINTS} on this "
-            f"jax ({_jax_generation()}) — no entry point left to count real "
-            f"XLA compiles at")
-    if name != _COMPILE_ENTRY_POINTS[0]:
-        _compat(
-            "compiler.entry_point",
-            f"jax._src.compiler has no {_COMPILE_ENTRY_POINTS[0]} on this "
-            f"jax ({_jax_generation()}); counting XLA compiles at "
-            f"{name}() instead, which is what compile_or_get_cached calls "
-            f"here.  (This is the counter that used to install nowhere and "
-            f"say nothing, leaving xla_compiles=0 on every GPU run.)")
+            f"jax._src.compiler has no {name} on this jax "
+            f"({_jax_generation()}) — no entry point left to count real XLA "
+            f"compiles at.  jax 0.5.3 spelled it backend_compile; support for "
+            f"that line was dropped when the GPU leg moved to jax 0.7.0.")
     _orig = getattr(_compiler, name)
 
     def _counting(*args, **kwargs):
@@ -1161,53 +1116,24 @@ def ensure_jax_compile_cache() -> None:
         _STATE.enabled = True
         return
 
-    # COMPAT shim 5 of 5 — a REAL incompatibility, not an arity one, and the
-    # one place where "make it work on both generations" is not achievable.
-    #
+    # NOTE for anyone re-reading the P>1 path.  There used to be a fifth
+    # compatibility shim here: a whole-cache degradation for a jax whose
+    # ``get_executable_and_time`` has no ``executable_devices`` parameter.
     # Sharing a cache across processes needs the reading rank to bind the
-    # deserialized executable to ITS OWN devices.  jax 0.9 added exactly that
-    # parameter — ``get_executable_and_time(..., executable_devices)``, passed
-    # straight to ``backend.deserialize_executable(blob, executable_devices,
-    # compile_options)``.  jax 0.5.3 calls
-    # ``backend.deserialize_executable(blob, compile_options)`` and has no way
-    # to be told (MEASURED, both sources side by side, ``deser_probe``).
+    # deserialized executable to ITS OWN devices, and jax 0.5.3 had no way to
+    # be told — so a process-invariant key was ACTIVELY HARMFUL there: rank 1
+    # named rank 0's entry, fetched it, and died loading it (MEASURED on one
+    # node, 2 GPUs, container 25.04, warm: rank 0 hit 9/9, rank 1 raised
+    # ``XlaRuntimeError: INVALID_ARGUMENT: Device assignment ... does not have
+    # any local devices`` and ``_fatal`` aborted the job, rc 70).
     #
-    # So on 0.5.3 a process-invariant key is ACTIVELY HARMFUL at P > 1: it
-    # makes rank 1 name rank 0's entry, fetch it, and then fail to load it.
-    # MEASURED on one node, 2 GPUs, container 25.04, warm run: rank 0 hit 9/9
-    # while rank 1 raised ``XlaRuntimeError: INVALID_ARGUMENT: Device
-    # assignment (Computations: 1 Replicas: 1 Computation 0: 0) does not have
-    # any local devices`` on the first agreed entry, and ``_fatal`` aborted the
-    # job (rc 70) — correctly, since that is the divergence that deadlocks
-    # XLA:GPU autotuning.
-    #
-    # No shim can fix this: the argument that carries the answer does not
-    # exist.  Take the degradation this module already declares for "the key
-    # cannot be made process-invariant here" — announced on every rank, every
-    # rank compiles, which is always correct — and additionally stop writing,
-    # because entries in this directory are unreadable by the peers that would
-    # need them and unreachable by process 0 (the agreement vetoes it too), so
-    # writing them is pure bloat.  P == 1 is unaffected and keeps a fully
-    # working cache; this branch is not reached there.
-    if not _peer_rebind_supported():
-        _STATE.agreed = frozenset()
-        _install_agreement_patch()      # veto everything -> symmetric miss
-        try:
-            _jax.config.update("jax_compilation_cache_dir", None)
-        except Exception:  # noqa: BLE001
-            pass
-        _say(f"rank {proc_idx}: DEGRADED TO CACHE-OFF at {n_proc} processes — "
-             f"this jax ({_jax_generation()}) cannot bind a cached executable "
-             f"to the loading process's devices "
-             f"(compilation_cache.get_executable_and_time has no "
-             f"'executable_devices' parameter; jax 0.9 added it).  A shared "
-             f"cache needs that: without it a peer names process 0's entry, "
-             f"fetches it, and dies loading it.  Every rank compiles from "
-             f"scratch this run, which is correct and ~1 min slower; nothing "
-             f"is written either, since no rank could read it back.  "
-             f"P == 1 is unaffected and still caches.  Fix: run this leg on "
-             f"jax >= 0.9, or run at P == 1.")
-        return
+    # Both supported jaxes HAVE the parameter (0.7.0 container measured at 4
+    # parameters with ``executable_devices`` named, same as the 0.9.1 wheel),
+    # so the branch was unreachable and is deleted rather than left as a
+    # permanent compatibility layer for a version being abandoned.  The
+    # condition itself is not unguarded: ``common.jax_support`` requires
+    # ``compilation_cache.get_executable_and_time`` to take 4 parameters and
+    # refuses at startup, by name, on a jax that does not.
 
     # A process-invariant key is load-bearing for SAFETY, not just for the
     # win: without it process 0 hits the entries it wrote while every peer

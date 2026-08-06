@@ -2,7 +2,7 @@
 
 Why this module exists
 ----------------------
-``pyproject.toml`` declares ``jax[cuda13]>=0.9.0``.  Nothing checked it, so on
+``pyproject.toml`` declared ``jax>=0.9.0`` and nothing checked it, so on
 2026-08-06 the two production legs were measured to be running *different JAX
 generations*:
 
@@ -10,10 +10,18 @@ generations*:
     Perlmutter GPU jax 0.5.3.dev20260806    (nvcr.io/nvidia/jax:25.04-py3, built
                                              from source; ``_release_version=None``)
 
-The GPU leg runs four declared-minor-versions BELOW the project's own floor,
+The GPU leg ran four declared-minor-versions BELOW the project's own floor,
 and it was nobody's decision.  This module is the missing teeth, written to the
 same contract as :mod:`src.ffi.gate`: *an explicit request that cannot be
 honored REFUSES, naming the fix — it never silently downgrades.*
+
+Both halves of that skew are now closed, and in opposite directions.  The GPU
+leg moved UP, to ``ghcr.io/nvidia/jax:jax-2025-07-21`` (jax 0.7.0, the last
+CUDA-12 image in the family).  The declared floor moved DOWN, from 0.9.0 to
+0.7.0, because 0.9.0 was unreachable on CUDA 12 by construction — see
+:data:`SUPPORTED_MIN`.  The two legs are now jax 0.7.0 and jax 0.9.1, one
+declared window contains both, and every ``jax._src`` shape this tree patches
+was MEASURED identical on them.
 
 Why a version-number check ALONE would be the wrong instrument
 --------------------------------------------------------------
@@ -34,17 +42,56 @@ So the gate asserts BOTH: the declared support window, *and* the specific
 private-API shapes the tree is written against.  A future container that
 reports a blessed version but carries a different ``jax._src`` still refuses.
 
-Where this belongs in the startup order
----------------------------------------
-:func:`enforce` is designed to be called from
-``runtime.initialize_communicator_stack``, in the same place and for the same
-reason as ``ffi.gate.Gate.enforce``: after the backend exists, before any real
-work compiles.  It costs one ``inspect.signature`` per hook.
+Where this sits in the startup order
+------------------------------------
+:func:`enforce` is called from ``runtime.initialize_communicator_stack`` as
+step 5b — after ``bootstrap()``, whose last act is the first ``jax.devices()``
+(so the backend exists and ``jax._src`` is fully populated), and before
+``prepare_mesh``, which performs the first ``jit``.  Same position and same
+reason as ``ffi.gate.Gate.enforce`` one step later: refuse before anything
+compiles, never in the middle of a run.  It costs one ``inspect.signature``
+per hook.
 
-NOT WIRED IN YET — deliberately.  Turning this on today would refuse every
-Perlmutter GPU run, which is the correct behavior for an unsupported stack but
-is the OWNER's call to make, not an agent's.  Wiring is one line; see
-``docs`` in :data:`RULE_UNSUPPORTED_VERSION`.
+WIRED IN 2026-08-06 — and why it was right to wait until then
+--------------------------------------------------------------
+This module spent a day deliberately unwired, for three reasons that were all
+correct at the time and are all gone now.  Recording them because "wire the
+gate" was recommended, then refused, then taken, and the difference each time
+was a measurement, not an opinion.
+
+1. **It was unsatisfiable on every image.**  Two required private symbols
+   (``VerificationCache``, ``compilation_cache_check_contents``) exist on no
+   NVIDIA container at any tag — ten probed, 0.5.3 through 0.9.1 — so wiring
+   it would have refused a correct stack for a reason having nothing to do
+   with that stack.  Removed 2026-08-06; see
+   :data:`REQUIRED_PRIVATE_SYMBOLS`.
+
+2. **The floor was unreachable.**  ``SUPPORTED_MIN`` was ``0.9.0`` while the
+   GPU leg ran 0.5.3 and no CUDA-12 image above 0.7.0 exists, so every GPU run
+   would have refused with no reachable remedy.  The leg is now on jax 0.7.0
+   and the floor is 0.7.0: MEASURED satisfiable, not asserted.
+
+3. **Every condition it tests was already handled elsewhere.**  While
+   ``common/jax_compile_cache.py`` carried five compatibility shims, the
+   arity/symbol clauses duplicated work the shims did quietly, so a refusal
+   keyed on them would have stopped runs that worked (that was the standing
+   ruling, and it was right).  **Four of those five shims are now deleted**
+   with jax 0.5.3 support.  That inverts the argument: the conditions are no
+   longer handled anywhere else, and unhandled they surface as a ``TypeError``
+   on the first ``jit`` — or, worse, as the silent variant, where
+   ``ensure_jax_compile_cache`` reported ``enabled=True`` over a cache writing
+   ZERO entries.  This gate is now the only thing standing between that class
+   of failure and a named startup refusal.
+
+So the gate and the shim removal are one decision, not two: the shims were
+per-call-site accommodation, this is a once-per-process assertion, and keeping
+both would be paying twice for one guarantee.
+
+MEASURED on both containers before wiring: on jax 0.7.0
+:func:`check_private_arity` and :func:`check_private_symbols` each return
+EMPTY and :func:`enforce` is clean; on jax 0.5.3 it refuses honestly, naming
+the version below the floor, the two wrong arities, and the absent
+``backend_compile_and_load``.
 """
 from __future__ import annotations
 
@@ -58,13 +105,38 @@ __all__ = [
     "enforce",
     "check_version",
     "check_private_arity",
+    "check_private_symbols",
 ]
 
 # --------------------------------------------------------------------------
 # The declared support window.  ONE place, and it is the thing pyproject.toml
 # means.  Widening it is a decision that should show up in a diff.
+#
+# FLOOR 0.7.0, lowered from 0.9.0 on 2026-08-06.  Not a relaxation of
+# standards — the opposite.  0.9.0 was a floor NO REACHABLE PERLMUTTER IMAGE
+# COULD MEET: the device FFI .so links CUDA 12, and no NVIDIA JAX image has
+# both jax >= 0.9 and CUDA 12 (ten tags probed; the CUDA 12 -> 13 flip happens
+# three minors before jax reaches 0.9).  A floor nothing can satisfy is not
+# enforcement, it is a permanent override, which is exactly why this gate sat
+# unwired.  0.7.0 is the floor the tree actually needs and can actually run:
+#
+#   * 0.5.3 has NO ``jax.shard_map`` and NO ``lax.pvary`` — the owner's
+#     ruling, and measured in-container.
+#   * varying-manual-axes tracking inside ``shard_map`` starts AT 0.7.0, and
+#     ``common.vma`` marks carries from there up.
+#   * both jax._src arities this tree patches reach their current shape at
+#     0.7.0 (see the table below) — 0.7.0 and 0.9.1 are the same shape.
+#
+# CEILING 0.10.0, unchanged, and it is a statement about what has been
+# measured rather than about what is broken: the two production legs are jax
+# 0.7.0 (Perlmutter container) and jax 0.9.1 (Frontera venv), both inside the
+# window.  Nothing at 0.10+ has been run.  One thing to check before raising
+# it: ``jax.experimental.shard_map`` is imported by ~24 files, ~60 of whose
+# call sites pass ``check_rep=False`` and are exempt from VMA marking BECAUSE
+# of it.  If that symbol is ever removed, those sites lose the exemption and
+# the import in the same release.
 # --------------------------------------------------------------------------
-SUPPORTED_MIN = (0, 9, 0)
+SUPPORTED_MIN = (0, 7, 0)
 SUPPORTED_MAX_EXCLUSIVE = (0, 10, 0)
 
 #: Escape hatch for deliberately running an unsupported stack (e.g. to
@@ -75,22 +147,56 @@ OVERRIDE_ENV = "LORRAX_JAX_UNSUPPORTED_OK"
 # --------------------------------------------------------------------------
 # The private-API shapes this tree is WRITTEN AGAINST.
 #
-# Measured 2026-08-06 on both legs (JID 56389339 / Frontera job 7890771):
+# Measured 2026-08-06 on both legs (JID 56389339 / Frontera job 7890771), and
+# re-measured the same day by importing jax._src inside FOUR container tags on
+# a Perlmutter A100 (JID 56405158) — which corrected two rows:
 #
-#   hook                              jax 0.5.3          jax 0.9.1
-#   --------------------------------  -----------------  ------------------
-#   _hash_accelerator_config          3 (…, backend)     2               <-- differs
-#   _hash_serialized_compile_options  3                  3
-#   get_executable_and_time           3                  4 (…, devices)  <-- differs
-#   is_executable_in_cache            2                  2
-#   compilation_cache_check_contents  ABSENT             present         <-- differs
-#   VerificationCache                 ABSENT             present         <-- differs
-#   backend_compile_and_load          ABSENT             present         <-- differs
+#   hook                              0.5.3   0.7.0   0.7.2   0.9.0   0.9.1
+#   --------------------------------  ------  ------  ------  ------  -----
+#   _hash_accelerator_config          3       2       2       2       2
+#   _hash_serialized_compile_options  3       3       3       3       3
+#   get_executable_and_time           3       4       4       4       4
+#   is_executable_in_cache            2       2       2       2       2
+#   backend_compile_and_load          ABSENT  pres.   pres.   pres.   pres.
+#   compilation_cache_check_contents  ABSENT  ABSENT  ABSENT  ABSENT  pres.†
+#   VerificationCache                 ABSENT  ABSENT  ABSENT  ABSENT  pres.†
 #
-# The three ABSENT rows are why the existing try/except around
-# ``_install_compile_counter`` degrades SILENTLY on the GPU leg: the counter
-# never installs, so the compile-storm telemetry the docs promise is simply
-# not collected, with no announcement.
+#   † the 0.9.1 column is the Frontera venv, measured earlier and NOT
+#     re-measured here.  Every container column IS re-measured, and the
+#     containers are what the GPU leg runs.
+#
+# The ``backend_compile_and_load`` ABSENT is why the try/except around
+# ``_install_compile_counter`` degrades SILENTLY on the 0.5.3 GPU leg: the
+# counter never installs, so the compile-storm telemetry the docs promise is
+# simply not collected, with no announcement.
+#
+# The last two rows are the correction, and they are why this gate could not
+# be wired: see :data:`REQUIRED_PRIVATE_SYMBOLS`.
+#
+# READ THE 0.7.0 AND 0.9.1 COLUMNS TOGETHER: they are identical on every row
+# except the two verification symbols.  That is what made it possible to
+# delete four of ``jax_compile_cache``'s five compatibility shims — and it is
+# what makes this table load-bearing rather than documentary.  Each entry
+# below is now the ONLY thing checking a condition that used to have an
+# in-line shim:
+#
+#   _hash_accelerator_config    2  <- was shim 1 (0.5.3 passed a 3rd arg)
+#   get_executable_and_time     4  <- was shims 2 AND 5.  The 4th parameter is
+#                                     ``executable_devices``; without it a
+#                                     peer CANNOT bind a cached executable to
+#                                     its own devices, so a shared cache dir
+#                                     at P>1 makes rank 1 name rank 0's entry,
+#                                     fetch it and die loading it (measured,
+#                                     2 GPUs, rc 70).  That whole degradation
+#                                     branch is gone; this row is its
+#                                     replacement, and it refuses at startup
+#                                     instead of degrading mid-run.
+#   backend_compile_and_load       <- was shim 4, in REQUIRED_PRIVATE_SYMBOLS
+#
+# So do not "simplify" this dict by dropping rows whose arity happens to match
+# on the two stacks you can reach today.  Matching is the point; the row is
+# what turns a future mismatch into a named refusal rather than a TypeError on
+# the first jit.
 # --------------------------------------------------------------------------
 REQUIRED_PRIVATE_ARITY: dict[tuple[str, str], int] = {
     ("jax._src.cache_key", "_hash_accelerator_config"): 2,
@@ -101,9 +207,24 @@ REQUIRED_PRIVATE_ARITY: dict[tuple[str, str], int] = {
 
 #: Private symbols that must merely EXIST for the compile-cache patches to
 #: resolve at call time.  Absence here is the silent class, so it refuses too.
+#:
+#: This list used to also demand ``compilation_cache.VerificationCache`` and
+#: ``config.compilation_cache_check_contents``.  Both are REMOVED, because
+#: neither exists on any NVIDIA JAX container at any tag — MEASURED
+#: 2026-08-06 on 0.5.3, 0.7.0, 0.7.2 and 0.9.0, absent on all four, including
+#: the 0.9 container that the table above was previously read as promising.
+#: A gate is only teeth if something can pass it: demanding a symbol no
+#: reachable image provides would have made :func:`enforce` refuse EVERY run
+#: the moment it was wired, on a stack that is otherwise fine.  That is worse
+#: than the silence it was written to replace, because it would have been read
+#: as "this JAX is unsupported" rather than "this check is unsatisfiable".
+#:
+#: ``common/jax_compile_cache.py`` reads both symbols with ``getattr(...,
+#: None)`` and skips content verification when they are absent, which is
+#: byte-for-byte what JAX's own ``get_file_cache`` does — so their absence is
+#: not a defect to refuse over.  If a future JAX does ship them, add them back
+#: as a measured capability, not as an inference from a version number.
 REQUIRED_PRIVATE_SYMBOLS: tuple[tuple[str, str], ...] = (
-    ("jax._src.compilation_cache", "VerificationCache"),
-    ("jax._src.config", "compilation_cache_check_contents"),
     ("jax._src.compiler", "backend_compile_and_load"),
     ("jax._src.api", "clean_up"),
     ("jax._src.distributed", "global_state"),
@@ -241,9 +362,12 @@ def enforce(*, announce=None) -> None:
             RULE_UNSUPPORTED_VERSION,
             got=version_problems[0],
             want=f"jax >= {_fmt(SUPPORTED_MIN)}, < {_fmt(SUPPORTED_MAX_EXCLUSIVE)} "
-                 f"(the floor pyproject.toml already declares)",
-            fix=f"install a supported jax in this environment, or set "
-                f"{OVERRIDE_ENV}=1 to run anyway and own the consequences",
+                 f"(same window as pyproject.toml; see SUPPORTED_MIN for why "
+                 f"the floor is {_fmt(SUPPORTED_MIN)} and not higher)",
+            fix=f"on Perlmutter, load a module whose image is "
+                f"ghcr.io/nvidia/jax:jax-2025-07-21 (config/perlmutter/"
+                f"site_config.sh); elsewhere install a jax in the window; or "
+                f"set {OVERRIDE_ENV}=1 to run anyway and own the consequences",
         )
     if symbol_problems:
         _refuse(
