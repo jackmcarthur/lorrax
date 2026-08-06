@@ -60,7 +60,11 @@ if [ ! -d "${LORRAX_SITE_PACKAGES:-}" ]; then
 fi
 
 MODULEFILE_DIR="${LORRAX_MODULEFILE_DIR:-$HOME/modulefiles}"
-IMAGE="${LORRAX_IMAGE:-nvcr.io/nvidia/jax:25.04-py3}"
+# Fallback only — site_config.sh above sets LORRAX_IMAGE and owns the reason
+# for the tag (CUDA-12 ceiling / shard_map floor).  Kept in sync with it on
+# purpose: a stale fallback here silently reinstates the old JAX whenever
+# site_config.sh is trimmed.
+IMAGE="${LORRAX_IMAGE:-ghcr.io/nvidia/jax:jax-2025-07-21}"
 DEPS="${LORRAX_DEPS:-}"
 MODULE_NAME="${LORRAX_MODULE_NAME:-lorrax}"
 
