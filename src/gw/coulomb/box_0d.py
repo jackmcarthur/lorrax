@@ -38,8 +38,10 @@ class Box0D:
         value as ``vc0``; this preserves the shipped ``v_qG`` behaviour.
         Whether the G=0 slot should additionally be zeroed to avoid
         double-counting against a rank-1 head injection is UNSETTLED and
-        untestable while the 0-D V_q path is unreachable (see below) —
-        it is deliberately not decided here.
+        untestable while the 0-D V_q path is unreachable — no per-q sphere
+        is built for sys_dim=0 at all (``gw/isdf_fitting.py:670``) and
+        ``compute_all_V_q_g_flat`` refuses sys_dim not in (2,3)
+        (``gw/v_q_g_flat.py:527``).  Deliberately not decided here.
         """
         if bdot is None or fft_grid is None:
             raise ValueError(
