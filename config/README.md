@@ -140,7 +140,7 @@ the common tests auto-detect this via `CUDA_VISIBLE_DEVICES`).
 | Host path (override)                | Container mount   | Contents |
 |-------------------------------------|-------------------|----------|
 | `$LORRAX_FFI_NVHPC_DIR` (default `$HOME/software/lorrax_nvhpc`)              | `/lorrax_nvhpc`   | NVHPC 25.5 subset: `libcusolverMp.so.0`, `libcal` |
-| `$LORRAX_FFI_PHDF5_DIR` (default `$HOME/software/lorrax_phdf5_cray/stage`)   | `/lorrax_phdf5`   | Cray HDF5 1.12 (libmpi_gnu_*.so.12) |
+| `$LORRAX_FFI_PHDF5_DIR` (default `$HOME/software/lorrax_phdf5_cray_1.14.3.7/stage`) | `/lorrax_phdf5`   | Cray HDF5 **1.14.3.7** (SOVERSION 310; `libmpi_gnu_*.so.12` shims). Exactly one HDF5 — both FFI legs bind this SOVERSION, enforced by GATE 7 (`src/ffi/cpp/gate_one_hdf5.sh`). The old `lorrax_phdf5_cray/stage` is 1.12 and is what the host leg could not load in-container (CLAIMS 89). |
 | `$LORRAX_FFI_SLATE_DIR` (default `$HOME/software/lorrax_slate_cray/stage`)   | `/lorrax_slate`   | Cray libsci + `libmpi_gtl_cuda.so.0` + xpmem + lustreapi |
 
 Container-side `LD_LIBRARY_PATH` (in order):

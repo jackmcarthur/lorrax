@@ -472,7 +472,7 @@ container by default:
 
 | missing SONAME | where it lives | how to expose it |
 |---|---|---|
-| `libhdf5_parallel_gnu.so.310` | cray-hdf5-parallel **1.14** | the shared stage is 1.12 (`.so.200`); re-run `src/ffi/cpp/stage/phdf5_stage_cray.sh` with `CRAY_HDF5_PATH=/opt/cray/pe/hdf5-parallel/1.14.3.7/gnu/12.3` into a separate stage dir |
+| `libhdf5_parallel_gnu.so.310` | cray-hdf5-parallel **1.14** | **DONE 2026-08-06**, and it was not enough on its own: the stage is now `$HOME/software/lorrax_phdf5_cray_1.14.3.7/stage` (`site_config.sh`), but the DEVICE leg linked the old 1.12 stage, so staging 1.14 *beside* it would have mapped two HDF5 majors into one process instead of failing loudly. Both legs were moved together and GATE 7 (`src/ffi/cpp/gate_one_hdf5.sh`) now refuses the skew and the two-HDF5 "repair" alike |
 | `libfftw3.so.mpi31.3` (+ `f`, `_omp` variants) | `/opt/cray/pe/fftw/*/x86_milan/lib` | `/opt/cray` is **not** a valid Shifter `--volume` source; copy under `$HOME/software` and bind-mount |
 | `libslate.so.2`, `libblaspp`, `liblapackpp` | `$HOME/software/slate_builds/cpu/install/lib64` | `/global/homes` is siteFs-visible, so put it on `LD_LIBRARY_PATH` directly |
 

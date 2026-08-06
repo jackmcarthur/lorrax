@@ -409,7 +409,7 @@ equivalent bindable location) via scripts under `src/ffi/cpp/stage/`:
 | Script                             | Produces                                     | Bind-mounted to |
 |------------------------------------|----------------------------------------------|-----------------|
 | [`cpp/stage/cusolvermp_stage_nvhpc.sh`](cpp/stage/cusolvermp_stage_nvhpc.sh) | `libcusolverMp.so.0`, `libcal.so.0`, cuSOLVERMp+NCCL headers (~80 MB) | `/lorrax_nvhpc` |
-| [`cpp/stage/phdf5_stage_cray.sh`](cpp/stage/phdf5_stage_cray.sh)         | Cray HDF5 1.12 + MPICH-ABI shim | `/lorrax_phdf5` |
+| [`cpp/stage/phdf5_stage_cray.sh`](cpp/stage/phdf5_stage_cray.sh)         | Cray HDF5 **1.14.3.7** + MPICH-ABI shim (whatever `HDF5_DIR` names — it refuses to guess) | `/lorrax_phdf5` |
 | [`cpp/stage/phdf5_stage_openmpi.sh`](cpp/stage/phdf5_stage_openmpi.sh)   | conda-forge HDF5 (OpenMPI)      | `/lorrax_phdf5` |
 | [`cpp/stage/slate_stage_cray.sh`](cpp/stage/slate_stage_cray.sh)         | Cray libsci + `libmpi_gtl_cuda.so.0` + xpmem + lustreapi | `/lorrax_slate` |
 

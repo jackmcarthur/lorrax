@@ -13,9 +13,15 @@
 #
 #   LORRAX_PHDF5_MPI_STACK=mpich   (default as of 2026-04-20)
 #     - shifter --module=mpich bind-mounts Cray MPICH (libmpi.so.12)
-#     - phdf5 stage: copy of cray-hdf5-parallel (1.12, libmpi_gnu_*.so.12)
+#     - phdf5 stage: copy of cray-hdf5-parallel/1.14.3.7
+#       (SOVERSION 310, libmpi_gnu_123.so.12 -> the mpich shim)
 #     - default LORRAX_FFI_PHDF5_DIR:
-#         $HOME/software/lorrax_phdf5_cray/stage
+#         $HOME/software/lorrax_phdf5_cray_1.14.3.7/stage
+#       The version is in the path deliberately.  This tree is what the
+#       DEVICE leg links (CMakeLists.txt defaults HDF5_ROOT to the mount),
+#       and build_ffi_host.sh links the module of the same version on bare
+#       metal.  They were 1.12 and 1.14 for months and nothing compared
+#       them; GATE 7 now does.
 #     - srun --mpi=pmi2
 #     - Perf (1 node / 4 GPUs / 4.29 GB C128): 3.79 GB/s, +24% over
 #       openmpi; at MoS2 3×3 scale within noise of openmpi.
@@ -91,7 +97,7 @@ case "${MPI_STACK}" in
         MPI_TYPE_DEFAULT="pmix"
         ;;
     mpich)
-        PHDF5_DEFAULT="$HOME/software/lorrax_phdf5_cray/stage"
+        PHDF5_DEFAULT="$HOME/software/lorrax_phdf5_cray_1.14.3.7/stage"
         SHIFTER_MODULES="gpu,mpich"
         MPI_LIB_DIR_CT="/opt/udiImage/modules/mpich"
         MPI_INCLUDE_DIR_CT="/lorrax_phdf5/include"  # staged MPICH headers
