@@ -10,11 +10,7 @@ import numpy as np
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-try:
-    from jax import shard_map as _shard_map_fn
-except ImportError:  # pragma: no cover - older JAX
-    from jax.experimental import shard_map as _shard_map_mod
-    _shard_map_fn = _shard_map_mod.shard_map
+from common.shard_map import shard_map as _shard_map_fn
 
 import common.timing as timing
 from common.collectives import prepare_mesh, resolve_mesh
@@ -223,7 +219,7 @@ def _ring_perm(axis_size: int) -> tuple[tuple[int, int], ...]:
 #
 # (fori_loop with static bounds lowers to scan, which is why the message says
 # "scan body".)  These shard_maps go through ``jax.shard_map`` with checking
-# ON, so the marking is required; the ``check_rep=False`` shard_maps elsewhere
+# ON, so the marking is required; the ``check_vma=False`` shard_maps elsewhere
 # in the tree are exempt.  ``mark_varying`` is the identity on jax 0.5.3, so
 # the production leg is bit-unchanged.  See ``common/vma.py``.
 #

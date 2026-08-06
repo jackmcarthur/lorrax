@@ -109,7 +109,7 @@ def test_value_parity_detects_a_wrong_block_map():
     ``P(('x','y'), ...)`` out_specs.  If the comparison above could not see
     a wrong block map it would be worthless, so this must fail.
     """
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
 
     mesh = _mesh()
 
@@ -120,7 +120,7 @@ def test_value_parity_detects_a_wrong_block_map():
 
     bad = jax.jit(shard_map(_body_swapped, mesh=mesh,
                             in_specs=(FACE,), out_specs=BATCH,
-                            check_rep=False))
+                            check_vma=False))
     a = jax.device_put(_probe(), NamedSharding(mesh, FACE))
     got = np.asarray(bad(a))
     assert got.shape == (B, M, N)

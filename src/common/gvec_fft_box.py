@@ -19,7 +19,7 @@ from typing import Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 
@@ -128,5 +128,5 @@ def make_fft_box_kernel(
             P(None, None, None, None),                # g_index
         ),
         out_specs=P(None, ("x", "y"), None, None, None, None),
-        check_rep=False,
+        check_vma=False,
     ))

@@ -359,7 +359,7 @@ def zeta_overlap_block_reshard(
     size ``(n_q, chunk, μ_L)``; ``mu_s_chunk`` bounds it independently of
     P (default: whatever keeps it under ``target_partial_mb``).
     """
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
 
     ax_x, ax_y = axes
     p_x, p_y = _check_mesh(mesh_xy, axes)
@@ -417,7 +417,7 @@ def zeta_overlap_block_reshard(
             in_specs=(P(None, None, (ax_x, ax_y)),
                       P(None, None, (ax_x, ax_y))),
             out_specs=(P(None, None, ax_x), P(None, None, ax_y)),
-            check_rep=False)(zeta_S, zeta_L)
+            check_vma=False)(zeta_S, zeta_L)
 
     warm_mesh_cliques(mesh_xy)
     return _overlap
@@ -465,7 +465,7 @@ def zeta_overlap_single_axis(
     μ_L², but it is the one operand here that does not scale with the
     full mesh.
     """
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
 
     names = tuple(mesh_xy.axis_names)
     if mu_axis not in names or g_axis not in names or mu_axis == g_axis:
@@ -506,7 +506,7 @@ def zeta_overlap_single_axis(
         return shard_map(
             _body, mesh=mesh_xy,
             in_specs=(P(None, None, g_axis), P(None, mu_axis, g_axis)),
-            out_specs=P(None, None, mu_axis), check_rep=False)(zeta_S, zeta_L)
+            out_specs=P(None, None, mu_axis), check_vma=False)(zeta_S, zeta_L)
 
     warm_mesh_cliques(mesh_xy)
     return _overlap
@@ -520,7 +520,7 @@ def zeta_gram_single_axis(mesh_xy: Mesh, *, g_axis: str) -> Callable:
     replicated everywhere — the same bounded (n_q, μ_S, μ_S) object the
     one-pass plan produces, by a cheaper route.
     """
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
 
     names = tuple(mesh_xy.axis_names)
     if g_axis not in names:
@@ -542,7 +542,7 @@ def zeta_gram_single_axis(mesh_xy: Mesh, *, g_axis: str) -> Callable:
         out_spec = P(None, None, None)
         return shard_map(
             _body, mesh=mesh_xy, in_specs=(P(None, None, g_axis),),
-            out_specs=out_spec, check_rep=False)(zeta_S)
+            out_specs=out_spec, check_vma=False)(zeta_S)
 
     warm_mesh_cliques(mesh_xy)
     return _gram
@@ -562,7 +562,7 @@ def zeta_gram_replicated(
     caller wants μ_S in the thousands this is the line to revisit — it is
     the only place in the module where an object does not fall with P.
     """
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
 
     ax_x, ax_y = axes
     p_x, p_y = _check_mesh(mesh_xy, axes)
@@ -591,7 +591,7 @@ def zeta_gram_replicated(
         return shard_map(
             _body, mesh=mesh_xy,
             in_specs=(P(None, None, (ax_x, ax_y)),),
-            out_specs=P(None, None, None), check_rep=False)(zeta_S)
+            out_specs=P(None, None, None), check_vma=False)(zeta_S)
 
     warm_mesh_cliques(mesh_xy)
     return _gram
@@ -636,7 +636,7 @@ def least_squares_transfer(
     property of (‡) survives truncation with "representable" read as
     "representable in the retained span".
     """
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
 
     if rcond is None:
         chol = jnp.linalg.cholesky(gram_S)
@@ -674,7 +674,7 @@ def least_squares_transfer(
         return shard_map(
             _body, mesh=mesh_xy,
             in_specs=(P(None, None, None), P(None, None, mu_axis)),
-            out_specs=P(None, None, mu_axis), check_rep=False)(chol, O_sharded)
+            out_specs=P(None, None, mu_axis), check_vma=False)(chol, O_sharded)
 
     if not (0.0 < float(rcond) < 1.0):
         raise ValueError(
@@ -752,7 +752,7 @@ def least_squares_transfer(
         _body, mesh=mesh_xy,
         in_specs=(P(None, None, None), P(None, None),
                   P(None, None, mu_axis)),
-        out_specs=P(None, None, mu_axis), check_rep=False)(V, w_inv, O_sharded)
+        out_specs=P(None, None, mu_axis), check_vma=False)(V, w_inv, O_sharded)
 
 
 # ---------------------------------------------------------------------------

@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax import lax
 from jax.scipy.linalg import solve_triangular
 from functools import partial

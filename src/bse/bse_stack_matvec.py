@@ -63,11 +63,7 @@ import numpy as np
 from jax import lax
 from jax.sharding import Mesh, PartitionSpec as P
 
-try:
-    from jax import shard_map as _shard_map_fn
-except ImportError:  # pragma: no cover - older JAX
-    from jax.experimental import shard_map as _shard_map_mod
-    _shard_map_fn = _shard_map_mod.shard_map
+from common.shard_map import shard_map as _shard_map_fn
 
 from common.fft_helpers import local_fftn3, local_ifftn3
 from .bse_ring_comm import make_bse_shardings

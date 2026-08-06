@@ -48,7 +48,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.experimental import io_callback
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 

@@ -25,7 +25,7 @@ from typing import Dict, Literal, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 from ..common import ffi_loader
@@ -301,7 +301,7 @@ class SlateLowerL:
         """
         @partial(shard_map, mesh=self.mesh,
                  in_specs=P("y", "x"), out_specs=P("x", "y"),
-                 check_rep=False)
+                 check_vma=False)
         def _local_T(local):
             return jnp.transpose(local, (1, 0))
         return jnp.tril(_local_T(self.raw))
@@ -342,7 +342,7 @@ def distributed_cholesky(
 
     @partial(shard_map, mesh=mesh,
              in_specs=P("x", "y"), out_specs=P("y", "x"),
-             check_rep=False)
+             check_vma=False)
     def _potrf(local_A):
         local_A_T = jnp.transpose(local_A, (1, 0))
         return jax.ffi.ffi_call(_POTRF_FFI_TARGET, L_local_T)(local_A_T, **attrs)
@@ -473,7 +473,7 @@ def distributed_trsm(
     if A_is_handle:
         @partial(shard_map, mesh=mesh,
                  in_specs=(P("y", "x"), P("x", "y")),
-                 out_specs=P("y", "x"), check_rep=False)
+                 out_specs=P("y", "x"), check_vma=False)
         def _trsm(local_A_handle, local_B):
             local_B_T = jnp.transpose(local_B, (1, 0))
             return jax.ffi.ffi_call(_TRSM_FFI_TARGET, X_local_T)(
@@ -482,7 +482,7 @@ def distributed_trsm(
     else:
         @partial(shard_map, mesh=mesh,
                  in_specs=(P("x", "y"), P("x", "y")),
-                 out_specs=P("y", "x"), check_rep=False)
+                 out_specs=P("y", "x"), check_vma=False)
         def _trsm(local_A, local_B):
             local_A_T = jnp.transpose(local_A, (1, 0))
             local_B_T = jnp.transpose(local_B, (1, 0))
@@ -493,7 +493,7 @@ def distributed_trsm(
     # Local-transpose X back to user's P('x','y') row-major.
     @partial(shard_map, mesh=mesh,
              in_specs=P("y", "x"), out_specs=P("x", "y"),
-             check_rep=False)
+             check_vma=False)
     def _untranspose(local_X_T):
         return jnp.transpose(local_X_T, (1, 0))
     return _untranspose(X_T)
@@ -596,7 +596,7 @@ def distributed_eigh(
              mesh=mesh,
              in_specs=P("x", "y"),
              out_specs=(P(), P("y", "x")),
-             check_rep=False)
+             check_vma=False)
     def _call(local_A):
         # Local transpose: row-major shard bytes → col-major block, the
         # layout SLATE reads (pure local op, pairs with the C++ comm
@@ -609,7 +609,7 @@ def distributed_eigh(
 
     @partial(shard_map, mesh=mesh,
              in_specs=P("y", "x"), out_specs=P("x", "y"),
-             check_rep=False)
+             check_vma=False)
     def _untranspose(local_Q_T):
         return jnp.transpose(local_Q_T, (1, 0))
 
@@ -756,7 +756,7 @@ def batched_distributed_cholesky(
         @partial(shard_map, mesh=mesh,
                  in_specs=P("x", None, "y"),
                  out_specs=P("x", "y", None),
-                 check_rep=False)
+                 check_vma=False)
         def _potrf(local_A):
             # local_A shape: (Nb_local, N, N/Py)
             local_A_T = jnp.transpose(local_A, (0, 2, 1))
@@ -883,7 +883,7 @@ def batched_distributed_trsm(
             @partial(shard_map, mesh=mesh,
                      in_specs=(P("x", "y", None), P("x", None, "y")),
                      out_specs=P("x", None, "y"),
-                     check_rep=False)
+                     check_vma=False)
             def _trsm(local_A_handle, local_B):
                 local_B_T = jnp.transpose(local_B, (0, 2, 1))
                 X_T = jax.ffi.ffi_call(_TRSM_TARGET, X_local_T)(
@@ -894,7 +894,7 @@ def batched_distributed_trsm(
             @partial(shard_map, mesh=mesh,
                      in_specs=(P("x", None, "y"), P("x", None, "y")),
                      out_specs=P("x", None, "y"),
-                     check_rep=False)
+                     check_vma=False)
             def _trsm(local_A, local_B):
                 local_A_T = jnp.transpose(local_A, (0, 2, 1))
                 local_B_T = jnp.transpose(local_B, (0, 2, 1))

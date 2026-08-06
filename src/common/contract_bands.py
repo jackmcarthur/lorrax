@@ -265,7 +265,7 @@ def contract_bands_block_reshard(
     jit / trace into larger kernels.  Output shardings per the canonical
     layout table.
     """
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
 
     if channels not in ("none", "split_reim"):
         raise ValueError(
@@ -491,7 +491,7 @@ def contract_bands_block_reshard(
 
     _sm = shard_map(body, mesh=mesh_xy,
                     in_specs=(psi_left_spec, o_spec, psi_right_spec),
-                    out_specs=out_spec, check_rep=False)
+                    out_specs=out_spec, check_vma=False)
 
     def _check_shapes(psi_left, o, psi_right):
         if o.ndim != len(o_axes):

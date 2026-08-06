@@ -29,7 +29,7 @@ from __future__ import annotations
 import jax
 from jax import lax, config
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 
 from common.collectives import (
     device_put_process_local,
@@ -212,7 +212,7 @@ def grid_parallel_loop(mesh: Mesh, iterate, *, grid_axis=MESH_AXES,
     def run(positions, centroids, rho, metric):
         return shard_map(
             iterate, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
-            check_rep=False,
+            check_vma=False,
         )(positions, centroids, rho, metric)
     return run
 

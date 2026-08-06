@@ -191,7 +191,7 @@ def _extract_diag_sharded_kernel(mesh_xy: Mesh):
     fn = _EXTRACT_DIAG_SHARDED_KERNEL_CACHE.get(key)
     if fn is None:
         from functools import partial
-        from jax.experimental.shard_map import shard_map
+        from common.shard_map import shard_map
 
         p_x = int(mesh_xy.shape['x'])
 
@@ -199,7 +199,7 @@ def _extract_diag_sharded_kernel(mesh_xy: Mesh):
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=P(None, None, 'x', 'y'),
                  out_specs=P(None, None, None),
-                 check_rep=False)
+                 check_vma=False)
         def _diag_sharded(tile):
             ix = jax.lax.axis_index('x')
             iy = jax.lax.axis_index('y')
@@ -243,13 +243,13 @@ def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
     fn = _ADD_BAND_DIAG_KERNEL_CACHE.get(key)
     if fn is None:
         from functools import partial
-        from jax.experimental.shard_map import shard_map
+        from common.shard_map import shard_map
 
         @jax.jit
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=(P(None, None, 'x', 'y'), P(None, None, None)),
                  out_specs=P(None, None, 'x', 'y'),
-                 check_rep=False)
+                 check_vma=False)
         def _add_diag(tile, diag):
             ix = jax.lax.axis_index('x')
             iy = jax.lax.axis_index('y')

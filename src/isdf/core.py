@@ -18,7 +18,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.experimental import io_callback as _io_callback
 
 from common import Meta
@@ -328,7 +328,7 @@ def c_q_from_psi_sm(
 		         in_specs=(L_spec, R_spec, L_spec, R_spec,
 		                   P(), P(), P(), P()),
 		         out_specs=out_spec,
-		         check_rep=False)
+		         check_vma=False)
 		def _local(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_,
 		           perm_L_, phase_L_, perm_R_, phase_R_):
 			# Per-rank shapes (n_rmu_local on 'x', n_col_local on 'y',
@@ -648,7 +648,7 @@ def z_q_from_psi_sm(
 		         in_specs=(L_spec, L_spec, P(), P(), P(), P(), P(),
 		                   g_index_spec, kvecs_frac_spec),
 		         out_specs=out_spec,
-		         check_rep=False)
+		         check_vma=False)
 		def _local(psi_l_X_, psi_r_X_, perm_L_, phase_L_,
 		           perm_R_, phase_R_, r_start_,
 		           g_index_dev, kvecs_frac_dev):
@@ -2148,7 +2148,7 @@ def _factor_c_q_replicated_qparallel(
         _sm = shard_map(_local_factor, mesh=mesh_xy,
                         in_specs=P(('x', 'y'), None, None),
                         out_specs=P(('x', 'y'), None, None),
-                        check_rep=False)
+                        check_vma=False)
 
         @partial(jax.jit, out_shardings=out_sh)
         def _fn(C):
@@ -2363,7 +2363,7 @@ def _factor_c_q_transverse_lu(
                         in_specs=P(('x', 'y'), None, None),
                         out_specs=(P(('x', 'y'), None, None),
                                    P(('x', 'y'), None)),
-                        check_rep=False)
+                        check_vma=False)
 
         @partial(jax.jit,
                  out_shardings=(out_sh, NamedSharding(mesh_xy, P(None, None))))
@@ -2764,7 +2764,7 @@ def _factor_c_q_distributed_rank_truncate(
 
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=(P(None, 'x', 'y'), P(None, None)),
-                 out_specs=P(None, 'x', 'y'), check_rep=False)
+                 out_specs=P(None, 'x', 'y'), check_vma=False)
         def _pinv_local(V_loc, inv_lam):
             # C⁺[i, j] = Σ_k V[i,k]·inv_k·conj(V[j,k]).
             #   V_loc     (nqb, μ/Px, μ/Py)  rows i on 'x', cols k on 'y'
@@ -2947,7 +2947,7 @@ def _distributed_pinv_apply(
     if key not in _dist_solve_cache:
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=(P(None, 'x', 'y'), P(None, 'x', 'y')),
-                 out_specs=P(None, 'x', 'y'), check_rep=False)
+                 out_specs=P(None, 'x', 'y'), check_vma=False)
         def _gemm(A_loc, B_loc):
             A_row = jax.lax.all_gather(A_loc, 'y', axis=2, tiled=True)
             B_col = jax.lax.all_gather(B_loc, 'x', axis=1, tiled=True)
@@ -3845,7 +3845,7 @@ def solve_zeta(
                            P(),                          # q (replicated scalar)
                            P(None, None)),               # piv (replicated)
                  out_specs=P(None, None, ('x', 'y')),
-                 check_rep=False)
+                 check_vma=False)
         def _per_q_block(L_loc, Z_loc, zeta_loc, q, piv_loc):
             # L_loc: (nq, μ/Px, μ/Py) — this rank's 2-D block of the stack.
             L_one = jax.lax.dynamic_slice_in_dim(L_loc, q, 1, axis=0)

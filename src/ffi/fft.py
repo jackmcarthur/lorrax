@@ -52,7 +52,7 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 from ffi.gate import Gate
@@ -276,7 +276,7 @@ def make_flat_k_fft_ffi(
 
     _sm = shard_map(_local, mesh=mesh,
                     in_specs=(flat_spec,), out_specs=flat_spec,
-                    check_rep=False)
+                    check_vma=False)
 
     def _flat_k_fft_ffi(x_flat):
         if x_flat.dtype != jnp.complex128:
@@ -357,7 +357,7 @@ def make_gw_conv_ffi(
 
     _sm = shard_map(_local, mesh=mesh,
                     in_specs=(g_flat, v_flat), out_specs=g_flat,
-                    check_rep=False)
+                    check_vma=False)
 
     def _gw_conv(G_flat, W_flat):
         if G_flat.dtype != jnp.complex128 or W_flat.dtype != jnp.complex128:

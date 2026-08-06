@@ -47,7 +47,7 @@ import numpy as np                                            # noqa: E402
 import jax                                                    # noqa: E402
 import jax.numpy as jnp                                       # noqa: E402
 from jax.sharding import NamedSharding, PartitionSpec as P    # noqa: E402
-from jax.experimental.shard_map import shard_map              # noqa: E402
+from common.shard_map import shard_map              # noqa: E402
 
 from common.collectives import (process_count, process_rank,   # noqa: E402
                                 resolve_mesh)

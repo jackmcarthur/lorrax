@@ -207,7 +207,7 @@ def _raw_encoding(mesh, spec, ndim):
 
 
 def _raw_write(fh, ds_id, A, mesh, spec, offset, valid, enc):
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
     from ffi.io import ffi_write_call
     mesh_shape, acpd, aflat = enc
 
@@ -220,7 +220,7 @@ def _raw_write(fh, ds_id, A, mesh, spec, offset, valid, enc):
 
     tok = shard_map(_per_rank, mesh=mesh,
                     in_specs=(spec, P(), P()), out_specs=P(),
-                    check_rep=False)(
+                    check_vma=False)(
         A,
         jnp.asarray(offset, dtype=jnp.int64),
         jnp.asarray(valid, dtype=jnp.int64))
@@ -228,7 +228,7 @@ def _raw_write(fh, ds_id, A, mesh, spec, offset, valid, enc):
 
 
 def _raw_read(fh, ds_id, local_shape, mesh, spec, offset, valid, enc):
-    from jax.experimental.shard_map import shard_map
+    from common.shard_map import shard_map
     from ffi.io import ffi_read_call
     mesh_shape, acpd, aflat = enc
     out_struct = jax.ShapeDtypeStruct(tuple(int(s) for s in local_shape),
@@ -243,7 +243,7 @@ def _raw_read(fh, ds_id, local_shape, mesh, spec, offset, valid, enc):
 
     out = shard_map(_per_rank, mesh=mesh,
                     in_specs=(P(), P()), out_specs=spec,
-                    check_rep=False)(
+                    check_vma=False)(
         jnp.asarray(offset, dtype=jnp.int64),
         jnp.asarray(valid, dtype=jnp.int64))
     return jax.block_until_ready(out)

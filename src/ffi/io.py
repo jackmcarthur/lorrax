@@ -25,7 +25,7 @@ from typing import Callable, Dict, Optional, Sequence, Tuple
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from .common import ffi_loader
@@ -424,7 +424,7 @@ def read_sharded_slab(
     return shard_map(
         _per_rank, mesh=mesh,
         in_specs=(P(), P()), out_specs=P("x", "y"),
-        check_rep=False,
+        check_vma=False,
     )(offset_zero, valid_shape)
 
 
@@ -501,7 +501,7 @@ def read_kchunk_sharded(
     return jax.jit(shard_map(
         _per_rank, mesh=mesh,
         in_specs=(P(),), out_specs=out_partition_spec,
-        check_rep=False,
+        check_vma=False,
     ))
 
 
@@ -633,7 +633,7 @@ def _read_kchunk_union_sharded_cached(
         _per_rank, mesh=mesh,
         in_specs=(P(), count_partition_spec),
         out_specs=out_partition_spec,
-        check_rep=False,
+        check_vma=False,
     ))
 
 
@@ -757,5 +757,5 @@ def write_sharded_slab(
     return shard_map(
         _per_rank, mesh=mesh,
         in_specs=(P("x", "y"), P(), P()), out_specs=P(),
-        check_rep=False,
+        check_vma=False,
     )(A, offset_array, valid_shape_arr)

@@ -47,7 +47,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from runtime.padding import round_up, pad_axis_to
-from jax.experimental.shard_map import shard_map
+from common.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import local_fftn3, local_ifftn3
 
@@ -677,7 +677,7 @@ def to_rchunk(
                 mesh=mesh,
                 in_specs=(psi_spec, P(None, None, None, None), P()),
                 out_specs=P(*out_spec),
-                check_rep=False,
+                check_vma=False,
             )
             def _local_rchunk(psi_l, g_index_l, r0_l):
                 return to_rchunk_inner(
@@ -694,7 +694,7 @@ def to_rchunk(
             in_specs=(psi_spec, P(None, None, None, None), P(),
                       P(None, None)),
             out_specs=P(*out_spec),
-            check_rep=False,
+            check_vma=False,
         )
         def _local_rchunk(psi_l, g_index_l, r0_l, kvecs_l):
             return to_rchunk_inner(
@@ -1029,7 +1029,7 @@ def gflat_to_rmu(
         @partial(shard_map, mesh=mesh,
                  in_specs=(in_spec, gidx_spec),
                  out_specs=out_spec,
-                 check_rep=False)
+                 check_vma=False)
         def _kernel(psi_, g_index_):
             # Per-rank: (nk, nb_local, ns, ngkmax).
             psi_flat = psi_.reshape(N, ns, ngkmax)
@@ -1304,7 +1304,7 @@ def accumulate_rchunk_to_gflat(
         @partial(shard_map, mesh=mesh,
                  in_specs=(in_spec, in_spec, P()),
                  out_specs=out_spec,
-                 check_rep=False)
+                 check_vma=False)
         def _kernel(rch_, acc_, r0_):
             # Per-rank: (n_q, n_mu_local, r_len) / (n_q, n_mu_local, ngkmax).
             rch_flat = rch_.reshape(N, r_len_i)
