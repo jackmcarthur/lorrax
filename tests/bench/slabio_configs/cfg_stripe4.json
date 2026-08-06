@@ -1,0 +1,66 @@
+[
+ {
+  "name": "stripe 1 x 1M",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "1",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  }
+ },
+ {
+  "name": "stripe 2 x 1M",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "2",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  }
+ },
+ {
+  "name": "stripe 4 x 1M",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "4",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  }
+ },
+ {
+  "name": "stripe 8 x 1M",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "8",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  }
+ },
+ {
+  "name": "stripe 16 x 1M",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "16",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  }
+ },
+ {
+  "name": "stripe 32 x 1M",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "32",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  }
+ },
+ {
+  "name": "stripe 4 x 4M",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "4",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "4M",
+   "LORRAX_PHDF5_ALIGN_MB": "4"
+  }
+ },
+ {
+  "name": "stripe 8 x 4M",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "8",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "4M",
+   "LORRAX_PHDF5_ALIGN_MB": "4"
+  }
+ }
+]

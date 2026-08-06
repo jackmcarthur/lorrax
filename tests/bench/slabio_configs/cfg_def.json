@@ -1,0 +1,3 @@
+[
+ {"name":"16x1M default","env":{"LORRAX_PHDF5_STRIPE_SIZE_FS":"1M","LORRAX_PHDF5_ALIGN_MB":"1"}}
+]

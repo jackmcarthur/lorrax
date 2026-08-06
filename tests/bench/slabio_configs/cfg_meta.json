@@ -1,0 +1,34 @@
+[
+ {
+  "name": "coll_meta=0 (default)",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1",
+   "LORRAX_PHDF5_COLL_META": "0"
+  }
+ },
+ {
+  "name": "coll_meta=1",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1",
+   "LORRAX_PHDF5_COLL_META": "1"
+  }
+ },
+ {
+  "name": "coll_meta=0 rep",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1",
+   "LORRAX_PHDF5_COLL_META": "0"
+  }
+ },
+ {
+  "name": "coll_meta=1 rep",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1",
+   "LORRAX_PHDF5_COLL_META": "1"
+  }
+ }
+]

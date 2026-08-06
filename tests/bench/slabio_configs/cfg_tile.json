@@ -1,0 +1,82 @@
+[
+ {
+  "name": "tile/rank    0.062MiB x512",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  },
+  "rows": 256,
+  "cols": 256,
+  "slabs": 512
+ },
+ {
+  "name": "tile/rank    0.250MiB x128",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  },
+  "rows": 512,
+  "cols": 512,
+  "slabs": 128
+ },
+ {
+  "name": "tile/rank    1.000MiB x64",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  },
+  "rows": 1024,
+  "cols": 1024,
+  "slabs": 64
+ },
+ {
+  "name": "tile/rank    4.000MiB x32",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  },
+  "rows": 2048,
+  "cols": 2048,
+  "slabs": 32
+ },
+ {
+  "name": "tile/rank   16.000MiB x8",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  },
+  "rows": 4096,
+  "cols": 4096,
+  "slabs": 8
+ },
+ {
+  "name": "tile/rank   64.000MiB x4",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  },
+  "rows": 8192,
+  "cols": 8192,
+  "slabs": 4
+ },
+ {
+  "name": "tile/rank  256.000MiB x2",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  },
+  "rows": 16384,
+  "cols": 16384,
+  "slabs": 2
+ },
+ {
+  "name": "tile/rank 1024.000MiB x1",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  },
+  "rows": 32768,
+  "cols": 32768,
+  "slabs": 1
+ }
+]

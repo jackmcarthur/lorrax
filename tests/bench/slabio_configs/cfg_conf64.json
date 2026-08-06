@@ -1,0 +1,66 @@
+[
+ {
+  "name": "16x1M DEFAULT",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "16",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  }
+ },
+ {
+  "name": "64x1M",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "64",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  }
+ },
+ {
+  "name": "64x4M",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "64",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "4M",
+   "LORRAX_PHDF5_ALIGN_MB": "4"
+  }
+ },
+ {
+  "name": "128x4M",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "128",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "4M",
+   "LORRAX_PHDF5_ALIGN_MB": "4"
+  }
+ },
+ {
+  "name": "16x1M DEFAULT rep",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "16",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  }
+ },
+ {
+  "name": "64x4M rep",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "64",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "4M",
+   "LORRAX_PHDF5_ALIGN_MB": "4"
+  }
+ },
+ {
+  "name": "64x2M",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "64",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "2M",
+   "LORRAX_PHDF5_ALIGN_MB": "2"
+  }
+ },
+ {
+  "name": "128x1M",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "128",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "1M",
+   "LORRAX_PHDF5_ALIGN_MB": "1"
+  }
+ }
+]

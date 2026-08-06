@@ -1,0 +1,50 @@
+[
+ {
+  "name": "sf=100 (=nranks, ratio 1)",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "100",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "4M",
+   "LORRAX_PHDF5_ALIGN_MB": "4"
+  }
+ },
+ {
+  "name": "sf=200 (2x nranks, ratio 2)",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "200",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "4M",
+   "LORRAX_PHDF5_ALIGN_MB": "4"
+  }
+ },
+ {
+  "name": "sf=150 (1.5x nranks, NON-integer)",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "150",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "4M",
+   "LORRAX_PHDF5_ALIGN_MB": "4"
+  }
+ },
+ {
+  "name": "sf=128 (1.28x, NON-integer)",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "128",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "4M",
+   "LORRAX_PHDF5_ALIGN_MB": "4"
+  }
+ },
+ {
+  "name": "sf=300 (3x nranks, ratio 3)",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "300",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "4M",
+   "LORRAX_PHDF5_ALIGN_MB": "4"
+  }
+ },
+ {
+  "name": "sf=50 (cb_nodes=50, ratio 1)",
+  "env": {
+   "LORRAX_PHDF5_STRIPE_COUNT": "50",
+   "LORRAX_PHDF5_STRIPE_SIZE_FS": "4M",
+   "LORRAX_PHDF5_ALIGN_MB": "4"
+  }
+ }
+]
