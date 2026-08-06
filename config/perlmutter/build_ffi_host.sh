@@ -86,9 +86,16 @@
 # /opt/cray/pe/fftw/3.3.10.11/x86_milan/lib/libfftw3.so) and which FFTW,
 # AOCL and MKL's own FFTW3 wrappers all implement.  The flat-k layout is one
 # uniform batch (istride = howmany, idist = 1), which that call expresses
-# directly.  NOT YET IMPLEMENTED — tracked separately; until it lands, this
-# host lib supports the ScaLAPACK/SLATE/GEMM/phdf5 targets and CPU chain
-# drivers refuse at startup.
+# directly.
+#
+# LANDED 2026-08-05 (commit d81507a), so the paragraph above is history: the
+# DFTI source-lock is gone and lorrax_mklfft_flat_k is exported by this host
+# library.  The engine is found at RUN time — dlsym for the entry points,
+# dlopen for the library that defines them — so an absent FFTW3 costs the FFT
+# handlers and nothing else, and LORRAX_FFT_FFI refuses at startup naming both
+# the unresolved symbol and every candidate it tried.  It is NOT a link-time
+# dependency; GATE 5 below enforces that, and the note at LORRAX_PM_FFTW
+# explains what it cost when it was one.
 # ============================================================================
 
 set -euo pipefail
@@ -105,11 +112,28 @@ LORRAX_PM_PRGENV="${LORRAX_PM_PRGENV:-PrgEnv-gnu}"
 LORRAX_PM_LIBSCI="${LORRAX_PM_LIBSCI:-cray-libsci}"
 LORRAX_PM_HDF5="${LORRAX_PM_HDF5:-cray-hdf5-parallel/1.14.3.7}"
 # cray-fftw supplies the FFT engine.  The flat-k handlers call the FFTW3
-# ADVANCED interface and resolve every entry point by RUNTIME dlsym, so this
-# module exists only to put libfftw3 into the .so's DT_NEEDED for that dlsym
-# to find.  On an MKL site it is unnecessary -- MKL exports the FFTW3 C
-# interface natively from libmkl_intel_lp64.  With no engine at all,
-# LORRAX_FFT_FFI refuses at STARTUP naming the unresolved symbol.
+# ADVANCED interface and resolve every entry point by RUNTIME dlsym, and the
+# library that defines them is brought in by a RUNTIME dlopen ladder
+# (src/ffi/cpp/mklfft/fft_flat_k_ffi.cc).  This module therefore exists only
+# to tell the build WHERE that engine lives, so CMake can record it as the
+# dlopen hint.  NOTHING FROM IT REACHES THE LINK LINE -- see GATE 5 below.
+#
+# WHAT THIS USED TO SAY, AND WHY IT WAS WRONG (corrected 2026-08-06)
+# ------------------------------------------------------------------
+# "this module exists only to put libfftw3 into the .so's DT_NEEDED for that
+# dlsym to find".  It did exactly that, and a DT_NEEDED entry is a LOAD-TIME
+# dependency: `libfftw3.so.mpi31.3` had to be findable before any code in the
+# library ran.  cray-fftw's SONAME is version- and MPI-flavour-stamped, and
+# the Shifter container does not bind-mount /opt/cray/pe/fftw at all, so the
+# .so simply would not dlopen in-container.  Measured 2026-08-06: nineteen
+# ScaLAPACK/SLATE/GEMM contract tests -- none of which perform an FFT --
+# turned into SKIPS, and the suite reported 0 failures.  A lost FFT
+# optimisation silently became a lost linear-algebra test suite.
+#
+# On an MKL site this module is unnecessary -- MKL exports the FFTW3 C
+# interface natively from libmkl_intel_lp64 and the ladder never reaches
+# dlopen.  With no engine reachable at all, LORRAX_FFT_FFI refuses at STARTUP
+# naming the unresolved symbol and every non-FFT handler still works.
 LORRAX_PM_FFTW="${LORRAX_PM_FFTW:-cray-fftw}"
 LORRAX_PM_CMAKE="${LORRAX_PM_CMAKE:-cmake}"
 # LibSci threading flavour.  MUST match the SLATE install's, or the process
@@ -156,6 +180,39 @@ LORRAX_PM_LIBSCI_DIR="$CRAY_LIBSCI_PREFIX_DIR"
 LORRAX_PM_MPICH_DIR="$CRAY_MPICH_DIR"
 LORRAX_PM_HDF5_DIR="$HDF5_DIR"
 module unload cray-libsci 2>/dev/null || true
+
+# Capture the FFTW3 prefix, THEN unload cray-fftw — the SAME hazard as
+# cray-libsci above, one level more insidious.
+#
+# WHY: with cray-fftw loaded, its lib dir is on the CC wrapper's IMPLICIT
+# link path, and CMake's FindOpenMP probes for an OpenMP runtime by link name.
+# It matched cray-fftw's `libfftw3f_omp` / `libfftw3_omp` and adopted them as
+# the OpenMP runtime for the WHOLE target.  Measured in the 2026-08-05 build's
+# CMakeCache.txt:
+#     OpenMP_CXX_LIB_NAMES:STRING=fftw3f_omp;fftw3_omp;gomp
+# So the .so acquired THREE fftw DT_NEEDED entries, and only one of them came
+# from the FFT leg at all — the other two were an OpenMP misdetection that
+# nothing in the build reported.  Unloading the module leaves FindOpenMP with
+# plain -fopenmp/-lgomp, and the FFTW3 location reaches CMake only through the
+# explicit -DLORRAX_FFTW3_LIBRARY below, where it is recorded as a runtime
+# dlopen hint and never linked.  Exactly the libsci idiom: capture, unload,
+# hand the value over explicitly.
+LORRAX_PM_FFTW_LIB=""
+for _d in "${FFTW_DIR:-}" "${FFTW_ROOT:-}/lib"; do
+    if [[ -n "$_d" && -e "$_d/libfftw3.so" ]]; then
+        LORRAX_PM_FFTW_LIB="$_d/libfftw3.so"
+        break
+    fi
+done
+if [[ -z "$LORRAX_PM_FFTW_LIB" ]]; then
+    echo "[build_ffi_host] NOTE: no libfftw3.so found via FFTW_DIR/FFTW_ROOT." >&2
+    echo "[build_ffi_host]   The FFT handlers still build; the runtime dlopen" >&2
+    echo "[build_ffi_host]   ladder will fall back to portable SONAMEs, and" >&2
+    echo "[build_ffi_host]   LORRAX_FFT_FFI refuses at startup if none loads." >&2
+else
+    echo "[build_ffi_host] fftw3 runtime dlopen hint: $LORRAX_PM_FFTW_LIB"
+fi
+module unload cray-fftw 2>/dev/null || true
 
 # Unloading the module also unsets CRAY_LIBSCI_PREFIX_DIR, which the
 # CMakeLists' CBLAS probe reads from the ENVIRONMENT:
@@ -230,7 +287,12 @@ mkdir -p "$BUILD"
 cd "$BUILD"
 
 F="$LORRAX_PM_LIBSCI_FLAVOUR"
+FFTW_ARGS=()
+if [[ -n "$LORRAX_PM_FFTW_LIB" ]]; then
+    FFTW_ARGS=(-DLORRAX_FFTW3_LIBRARY="$LORRAX_PM_FFTW_LIB")
+fi
 cmake "$SRC" \
+    "${FFTW_ARGS[@]}" \
     -DLORRAX_FFI_PLATFORM=host \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER=CC \
@@ -297,6 +359,74 @@ if readelf -d "$SO_FILE" | grep NEEDED | grep -qiE 'cuda|nccl|nvshmem|cal\.so'; 
     exit 1
 fi
 echo "[build_ffi_host] GATE 3 (CUDA-free) PASSED"
+
+# GATE 5: THE RUN-TIME-RESOLVED FFT ENGINE IS NOT A LOAD-TIME DEPENDENCY.
+#
+# This gate exists because its absence cost a test suite.  The FFT backend is
+# documented as resolved at RUN time, and the structural proof recorded for
+# that (CLAIMS 55) was
+#     nm -D --undefined-only liblorrax_ffi_host.so | grep -c fftw_   ->  0
+# which was TRUE on 2026-08-05 and TRUE on 2026-08-06 and detected nothing,
+# because it is the wrong measurement.  It counts undefined SYMBOL references,
+# and dlsym'ing every entry point drives that to zero BY CONSTRUCTION — it is
+# what you would measure to confirm the dlsym rewrite compiled, not to confirm
+# the library is unbound.  Meanwhile the build was passing -lfftw3 (plus two
+# more fftw libraries via a FindOpenMP misdetection), so the .so carried
+#     NEEDED libfftw3.so.mpi31.3
+#     NEEDED libfftw3f_omp.so.mpi31.3
+#     NEEDED libfftw3_omp.so.mpi31.3
+# and DT_NEEDED is resolved by the dynamic linker BEFORE any of this library's
+# code runs.  Result, measured in-container 2026-08-06: dlopen of the host
+# library failed outright and 19 ScaLAPACK/SLATE/GEMM contract tests that
+# never call an FFT reported as SKIPPED, with the suite green at 0 failures.
+#
+# So: keep the symbol check (it is still the right proof that the CALLS are
+# dlsym'd), and add the check that actually guards loadability.  Both, because
+# neither implies the other.
+echo "[build_ffi_host] GATE 5 (FFT engine is not a load-time dependency)"
+fftw_undef=$(nm -D --undefined-only "$SO_FILE" 2>/dev/null | grep -c 'fftw_' || true)
+if [[ "$fftw_undef" -ne 0 ]]; then
+    echo "[build_ffi_host] GATE FAILED (5a): $fftw_undef undefined fftw_ symbols." >&2
+    echo "[build_ffi_host]   The flat-k TU must resolve every FFTW3 entry point" >&2
+    echo "[build_ffi_host]   through mklpin::resolve_sym, never by direct call." >&2
+    exit 1
+fi
+fftw_needed=$(readelf -d "$SO_FILE" | grep NEEDED | grep -c 'fftw' || true)
+if [[ "$fftw_needed" -ne 0 ]]; then
+    echo "[build_ffi_host] GATE FAILED (5b): $fftw_needed fftw entries in DT_NEEDED:" >&2
+    readelf -d "$SO_FILE" | grep NEEDED | grep 'fftw' >&2
+    echo "[build_ffi_host]   An FFT engine resolved at RUN time must not be a" >&2
+    echo "[build_ffi_host]   LOAD-time dependency.  Any fftw in DT_NEEDED makes" >&2
+    echo "[build_ffi_host]   the WHOLE library — ScaLAPACK, SLATE, GEMM, phdf5" >&2
+    echo "[build_ffi_host]   handlers included — unloadable wherever that exact" >&2
+    echo "[build_ffi_host]   SONAME is absent, e.g. inside the Shifter container," >&2
+    echo "[build_ffi_host]   which does not bind-mount /opt/cray/pe/fftw." >&2
+    echo "[build_ffi_host]   Two known causes:" >&2
+    echo "[build_ffi_host]     1. an -lfftw3 on the link line (the CMakeLists" >&2
+    echo "[build_ffi_host]        records the path as a dlopen hint instead);" >&2
+    echo "[build_ffi_host]     2. FindOpenMP adopting cray-fftw's libfftw3*_omp" >&2
+    echo "[build_ffi_host]        as the OpenMP runtime — check that this script" >&2
+    echo "[build_ffi_host]        unloaded cray-fftw before invoking cmake, and" >&2
+    echo "[build_ffi_host]        check OpenMP_CXX_LIB_NAMES in CMakeCache.txt." >&2
+    exit 1
+fi
+echo "[build_ffi_host] GATE 5 PASSED: undefined fftw_ symbols=0, fftw in DT_NEEDED=0"
+
+# GATE 6: and more generally, the OpenMP runtime is an OpenMP runtime.  The
+# misdetection above was invisible because nothing ever looked.  gomp (GNU) or
+# iomp5/omp (LLVM/Intel) are the legitimate answers; anything else means
+# FindOpenMP matched on the substring "omp" in a library that is not one.
+omp_needed=$(readelf -d "$SO_FILE" | grep NEEDED \
+             | grep -oE 'lib[a-z0-9_]*omp[a-z0-9_]*\.so[^]]*' || true)
+bad_omp=$(grep -vE '^lib(gomp|iomp5|omp)\.so' <<<"$omp_needed" || true)
+if [[ -n "${bad_omp//[[:space:]]/}" ]]; then
+    echo "[build_ffi_host] GATE FAILED (6): non-OpenMP library adopted as the" >&2
+    echo "[build_ffi_host]   OpenMP runtime:" >&2
+    echo "$bad_omp" >&2
+    echo "[build_ffi_host]   Check OpenMP_CXX_LIB_NAMES in $BUILD/CMakeCache.txt." >&2
+    exit 1
+fi
+echo "[build_ffi_host] GATE 6 (OpenMP runtime is really OpenMP) PASSED"
 
 # GATE 4: nothing left unresolved at load time.  -Wl,--no-undefined already
 # fails the LINK on a missing link-time symbol; this catches the other half —
