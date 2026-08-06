@@ -69,6 +69,13 @@ Two rules for CALLERS, both measured
   ``check_rep=False`` / ``check_vma=False`` disables VMA checking for that
   ``shard_map``, so its carries are exempt.
 
+  **Since 2026-08-06 no caller has to make that choice.**  Every
+  ``shard_map`` in this tree comes from ``common.shard_map``, which owns the
+  symbol-and-kwarg decision the way this module owns the marking decision,
+  and whose kwarg is always the modern ``check_vma``.  The equivalence above
+  is upstream's own: the 0.7.0 experimental wrapper forwards
+  ``check_vma=check_rep`` verbatim to the same internal ``_shard_map``.
+
 Sites in this tree that need the mark are enumerated by
 ``tests/test_vma_marking.py``, which re-derives them from the AST so a new
 unmarked accumulator is caught without a GPU.
