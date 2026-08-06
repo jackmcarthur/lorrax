@@ -151,7 +151,7 @@ def select_mode(has_modern: bool, has_experimental: bool, version_info) -> str:
     """Which ``shard_map`` spelling applies, or raise.  PURE — no jax state.
 
     Split out from the module body, exactly as ``common.vma.select_mode`` is,
-    so the whole decision table is testable by construction on any jax --—
+    so the whole decision table is testable by construction on any jax ---
     including the branch the running container cannot exhibit and the refusal,
     which is the branch that most needs a test precisely because nobody can
     reach it by accident.
