@@ -39,15 +39,41 @@ from jax import lax
 from jax.experimental.shard_map import shard_map
 from jax.scipy.linalg import solve_triangular
 
-# jax 0.9 tracks varying-manual-axes (VMA) inside shard_map and its strict
-# CPU check requires the fori_loop carry below to be pcast to 'varying'.
-# jax <= 0.8 has no VMA tracking — every value inside shard_map is
-# implicitly device-varying — so the identity is the correct (and only
-# possible) behavior there.  Guarded here so one source runs on both the
-# 0.7.2 production container and jax-0.9 venvs.
-try:
+# Varying-manual-axes (VMA) tracking inside shard_map: a fori_loop / scan
+# carry that is written per-device-conditionally must be marked 'varying', or
+# the carry-type check rejects it with "the varying manual axes do not match".
+#
+# MEASURED 2026-08-06, four container tags imported on a Perlmutter A100.  The
+# feature does NOT arrive where this guard used to assume, and the spelling
+# changed twice:
+#
+#     jax     VMA tracked?   lax.pvary            lax.pcast
+#     0.5.3   no             absent               absent
+#     0.7.0   YES            present              absent
+#     0.7.2   YES            present              absent
+#     0.9.0   YES            present (deprecated) present
+#
+# The previous guard was ``try: lax.pcast / except AttributeError: identity``
+# with the comment "jax <= 0.8 has no VMA tracking".  That is false: VMA
+# tracking lands at 0.7.0, three minors earlier than the comment claimed, and
+# 0.7.x has no ``lax.pcast`` — so on exactly the range where the marking is
+# REQUIRED, the guard silently installed a no-op.  This file's own docstring
+# says it is meant to run on "the 0.7.2 production container", which is inside
+# that broken range.
+#
+# Probe for the capability, newest spelling first, and fall back to the
+# identity only on a jax that genuinely does not track VMA (where it is not
+# merely safe but the only possible behaviour).
+if hasattr(lax, "pcast"):            # jax >= 0.9
     _pcast = lax.pcast
-except AttributeError:  # jax < 0.9
+elif hasattr(lax, "pvary"):          # jax 0.7-0.8: same operation, older name
+    def _pcast(x, axes, *, to):
+        if to != "varying":
+            raise NotImplementedError(
+                f"lax.pvary can only mark values as 'varying', not {to!r}; "
+                f"this jax has no lax.pcast to express it")
+        return lax.pvary(x, axes)
+else:                                # jax <= 0.5: no VMA tracking at all
     def _pcast(x, axes, *, to):
         return x
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
