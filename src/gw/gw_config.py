@@ -701,6 +701,140 @@ def _refuse_explicit_h5py_allgather(*, key: str, processes: int,
         f"  doc     {_SLAB_IO_DOC}")
 
 
+def _validate_slab_io_key(slab_io_in: str) -> str:
+    """Vocabulary check for the ``slab_io`` deck key.  Returns it folded.
+
+    One function so the parse-time check and
+    :func:`resolve_slab_io_backend` cannot drift apart on what the key is
+    allowed to say (QUALITY_PATTERNS #3).
+    """
+    folded = str(slab_io_in).strip().lower()
+    if folded not in ("auto", "phdf5_ffi", "phdf5_host", "h5py_allgather"):
+        raise ValueError(
+            f"slab_io={folded!r} invalid; expected auto / phdf5_ffi "
+            f"/ phdf5_host / h5py_allgather.")
+    return folded
+
+
+def resolve_slab_io_backend(slab_io_in, use_ffi_io_in, *, print_fn=print,
+                            is_cpu_backend=None) -> "SlabIOBackend":
+    """THE ``slab_io`` decision, for every caller that has a deck.
+
+    Precedence:
+
+      1. explicit ``slab_io=<backend>`` — honoured verbatim (a wrong
+         choice fails loudly at SlabIO open, which beats silently
+         running a different backend than the input file says).
+         The capability probes are skipped: a deck that already
+         named its writer should not pay a host-lib dlopen.
+      2. ``use_ffi_io=false`` (deprecated) — forces H5PY_ALLGATHER.
+      3. ``slab_io=auto`` (default) — the platform router, always.
+
+    ...then ONE post-check that outranks all three: H5PY_ALLGATHER at
+    ``process_count() > 1`` refuses, however it was chosen.
+
+    ``use_ffi_io`` deprecation warns exactly ONCE per deck, here — each
+    deck hits exactly one of the three branches below, and the warning
+    text names what actually happened to the key (audit fix/zq
+    2026-07-28: ``read_lorrax_input`` used to emit a second,
+    differently-worded warning for mere presence of the key).
+
+    EXTRACTED from ``LorraxConfig.from_input_file`` 2026-08-06 so the BSE
+    stage can reach it.  ``bse/`` never builds a ``LorraxConfig`` — it
+    reads its deck through ``read_lorrax_input`` — and when
+    ``bse_io.load_bse_data_from_restart_sharded`` moved onto SlabIO it
+    needed exactly this decision and nothing else in the config.  Copying
+    the chain into ``bse/`` would have put a second, drifting answer to
+    "which transport" in the tree; ``SlabIO``'s own refusal explicitly
+    tells driver-chain callers to take the backend from the resolved
+    config rather than re-derive it, and this is that function.
+    """
+    slab_io_in = _validate_slab_io_key(slab_io_in)
+    if use_ffi_io_in is not None:
+        use_ffi_io_in = bool(use_ffi_io_in)
+    if is_cpu_backend is None:
+        try:
+            import jax as _jax
+            is_cpu_backend = _jax.default_backend() == "cpu"
+        except Exception:
+            is_cpu_backend = False
+    if slab_io_in != "auto":
+        if use_ffi_io_in is not None:
+            import warnings
+            warnings.warn(
+                f"Input key 'use_ffi_io' is deprecated and IGNORED "
+                f"here: slab_io={slab_io_in} is explicit and takes "
+                f"precedence.  Remove use_ffi_io from the deck.",
+                DeprecationWarning, stacklevel=2)
+            print_fn(
+                f"  [config] use_ffi_io={str(use_ffi_io_in).lower()} "
+                f"is ignored: slab_io={slab_io_in} is explicit and "
+                "takes precedence (use_ffi_io is deprecated).")
+        choice = SlabIOBackend(slab_io_in)
+    elif use_ffi_io_in is False:
+        import warnings
+        warnings.warn(
+            "Input key 'use_ffi_io' is deprecated; 'use_ffi_io = "
+            "false' is honored as 'slab_io = h5py_allgather' (the "
+            "pre-FFI rank-0 writer).  Set 'slab_io = h5py_allgather' "
+            "explicitly instead.",
+            DeprecationWarning, stacklevel=2)
+        print_fn(
+            "  [config] use_ffi_io=false (deprecated): forcing SlabIO "
+            "through H5PY_ALLGATHER (rank-0 serial write).  This "
+            "overrides the slab_io=auto router; prefer "
+            "slab_io = h5py_allgather.")
+        choice = SlabIOBackend.H5PY_ALLGATHER
+    else:
+        if use_ffi_io_in is True:
+            import warnings
+            warnings.warn(
+                "Input key 'use_ffi_io' is deprecated; 'use_ffi_io = "
+                "true' is a no-op — the slab_io=auto router already "
+                "picks the best available parallel writer.  Remove "
+                "the key.",
+                DeprecationWarning, stacklevel=2)
+            print_fn(
+                "  [config] use_ffi_io=true is deprecated and "
+                "redundant: slab_io=auto already routes to the best "
+                "available parallel writer.  Remove the key.")
+        choice = (_route_cpu_slab_io(print_fn) if is_cpu_backend
+                  else _route_gpu_slab_io(print_fn))
+    # THE boundary, applied to every route into H5PY_ALLGATHER at once
+    # (owner ruling 2026-08-05, implemented 2026-08-06): that tier is
+    # reachable at EXACTLY ONE process and nowhere else, because it
+    # materialises the whole global array on rank 0.
+    #
+    # The ``auto`` routers already applied it to themselves and refused,
+    # so anything that arrives here holding H5PY_ALLGATHER at P>1 came
+    # from a deck that NAMED it (``slab_io = h5py_allgather``) or from
+    # the deprecated ``use_ffi_io = false``.  This is the one place an
+    # explicit request does NOT win outright: explicit-wins exists so a
+    # deck can be used as a gate against a stack, not so it can
+    # authorise a transport that cannot hold the run's own arrays.
+    #
+    # Placed AFTER the whole precedence chain rather than inside its
+    # three branches on purpose — one check, no branch can be added
+    # later that forgets it.
+    if choice is SlabIOBackend.H5PY_ALLGATHER:
+        n_proc, proc_how = _slab_io_process_count()
+        if n_proc != 1:
+            _refuse_explicit_h5py_allgather(
+                key=("use_ffi_io = false" if slab_io_in == "auto"
+                     else f"slab_io = {slab_io_in}"),
+                processes=n_proc, how=proc_how)
+        if slab_io_in != "auto":
+            # The auto path already announced this from the router;
+            # only the named request still needs its receipt.
+            print_fn(
+                "  [config] slab_io=h5py_allgather: EXPLICIT "
+                f"single-process escape ({proc_how}).  This tier "
+                "gathers the whole array onto rank 0; it is NOT a "
+                "supported production path and REFUSES at "
+                f"process_count() > 1 — see {_SLAB_IO_DOC}.")
+    return choice
+
+
 def _probe_mpi_bootstrap_ffi(platform: str = "cpu") -> tuple[bool, str]:
     """``(bootstrappable, how)`` for the PHDF5_FFI tier's own MPI init.
 
@@ -2555,11 +2689,11 @@ class LorraxConfig:
         _use_ffi_io_in = _g("use_ffi_io")   # None (unset) | True | False
         if _use_ffi_io_in is not None:
             _use_ffi_io_in = bool(_use_ffi_io_in)
-        _slab_io_in = str(_g("slab_io")).strip().lower()
-        if _slab_io_in not in ("auto", "phdf5_ffi", "phdf5_host", "h5py_allgather"):
-            raise ValueError(
-                f"slab_io={_slab_io_in!r} invalid; expected auto / phdf5_ffi "
-                f"/ phdf5_host / h5py_allgather.")
+        # Vocabulary check HERE, at its original position in the parse
+        # order, so a typo'd key still refuses before the expensive
+        # validations below; ``resolve_slab_io_backend`` re-checks with the
+        # same function, which is the single source for the vocabulary.
+        _slab_io_in = _validate_slab_io_key(_g("slab_io"))
         # Distributed-linalg axes.
         _dist_chol = str(_g("distributed_cholesky")).strip().lower()
         _dist_lu = str(_g("distributed_lu")).strip().lower()
@@ -2626,97 +2760,16 @@ class LorraxConfig:
             _is_cpu_backend = _jax.default_backend() == "cpu"
         except Exception:
             _is_cpu_backend = False
-        # --- SlabIO backend resolution.  Precedence:
-        #   1. explicit ``slab_io=<backend>`` — honoured verbatim (a wrong
-        #      choice fails loudly at SlabIO open, which beats silently
-        #      running a different backend than the input file says).
-        #      The capability probes are skipped: a deck that already
-        #      named its writer should not pay a host-lib dlopen.
-        #   2. ``use_ffi_io=false`` (deprecated) — forces H5PY_ALLGATHER.
-        #   3. ``slab_io=auto`` (default) — the platform router, always.
-        # ...then ONE post-check that outranks all three: H5PY_ALLGATHER
-        # at process_count() > 1 refuses, however it was chosen.  See the
-        # block after the chain.
-        # 'use_ffi_io' deprecation warns exactly ONCE per deck, here —
-        # each deck hits exactly one of the three branches below, and the
-        # warning text names what actually happened to the key (audit
-        # fix/zq 2026-07-28: read_lorrax_input used to emit a second,
-        # differently-worded warning for mere presence of the key).
-        if _slab_io_in != "auto":
-            if _use_ffi_io_in is not None:
-                import warnings
-                warnings.warn(
-                    f"Input key 'use_ffi_io' is deprecated and IGNORED "
-                    f"here: slab_io={_slab_io_in} is explicit and takes "
-                    f"precedence.  Remove use_ffi_io from the deck.",
-                    DeprecationWarning, stacklevel=2)
-                print_fn(
-                    f"  [config] use_ffi_io={str(_use_ffi_io_in).lower()} "
-                    f"is ignored: slab_io={_slab_io_in} is explicit and "
-                    "takes precedence (use_ffi_io is deprecated).")
-            _slab_io_choice = SlabIOBackend(_slab_io_in)
-        elif _use_ffi_io_in is False:
-            import warnings
-            warnings.warn(
-                "Input key 'use_ffi_io' is deprecated; 'use_ffi_io = "
-                "false' is honored as 'slab_io = h5py_allgather' (the "
-                "pre-FFI rank-0 writer).  Set 'slab_io = h5py_allgather' "
-                "explicitly instead.",
-                DeprecationWarning, stacklevel=2)
-            print_fn(
-                "  [config] use_ffi_io=false (deprecated): forcing SlabIO "
-                "through H5PY_ALLGATHER (rank-0 serial write).  This "
-                "overrides the slab_io=auto router; prefer "
-                "slab_io = h5py_allgather.")
-            _slab_io_choice = SlabIOBackend.H5PY_ALLGATHER
-        else:
-            if _use_ffi_io_in is True:
-                import warnings
-                warnings.warn(
-                    "Input key 'use_ffi_io' is deprecated; 'use_ffi_io = "
-                    "true' is a no-op — the slab_io=auto router already "
-                    "picks the best available parallel writer.  Remove "
-                    "the key.",
-                    DeprecationWarning, stacklevel=2)
-                print_fn(
-                    "  [config] use_ffi_io=true is deprecated and "
-                    "redundant: slab_io=auto already routes to the best "
-                    "available parallel writer.  Remove the key.")
-            _slab_io_choice = (_route_cpu_slab_io(print_fn)
-                               if _is_cpu_backend
-                               else _route_gpu_slab_io(print_fn))
-        # THE boundary, applied to every route into H5PY_ALLGATHER at once
-        # (owner ruling 2026-08-05, implemented 2026-08-06): that tier is
-        # reachable at EXACTLY ONE process and nowhere else, because it
-        # materialises the whole global array on rank 0.
-        #
-        # The ``auto`` routers already applied it to themselves and refused,
-        # so anything that arrives here holding H5PY_ALLGATHER at P>1 came
-        # from a deck that NAMED it (``slab_io = h5py_allgather``) or from
-        # the deprecated ``use_ffi_io = false``.  This is the one place an
-        # explicit request does NOT win outright: explicit-wins exists so a
-        # deck can be used as a gate against a stack, not so it can
-        # authorise a transport that cannot hold the run's own arrays.
-        #
-        # Placed AFTER the whole precedence chain rather than inside its
-        # three branches on purpose — one check, no branch can be added
-        # later that forgets it.
-        if _slab_io_choice is SlabIOBackend.H5PY_ALLGATHER:
-            _n_proc, _proc_how = _slab_io_process_count()
-            if _n_proc != 1:
-                _refuse_explicit_h5py_allgather(
-                    key=("use_ffi_io = false" if _slab_io_in == "auto"
-                         else f"slab_io = {_slab_io_in}"),
-                    processes=_n_proc, how=_proc_how)
-            if _slab_io_in != "auto":
-                # The auto path already announced this from the router;
-                # only the named request still needs its receipt.
-                print_fn(
-                    "  [config] slab_io=h5py_allgather: EXPLICIT "
-                    f"single-process escape ({_proc_how}).  This tier "
-                    "gathers the whole array onto rank 0; it is NOT a "
-                    "supported production path and REFUSES at "
-                    f"process_count() > 1 — see {_SLAB_IO_DOC}.")
+        # --- SlabIO backend resolution.  The precedence chain, the
+        # deprecation warnings and the H5PY_ALLGATHER-above-one-process
+        # post-check all live in ``resolve_slab_io_backend`` (module
+        # scope) since 2026-08-06, so ``bse/`` — which never builds a
+        # LorraxConfig — can reach the SAME decision instead of growing a
+        # second copy of it.  Nothing about the resolution changed in the
+        # move; see that function's docstring for the rules.
+        _slab_io_choice = resolve_slab_io_backend(
+            _slab_io_in, _use_ffi_io_in, print_fn=print_fn,
+            is_cpu_backend=_is_cpu_backend)
         if _is_cpu_backend:
             # Doctrine 3 (audit fix/zq 2026-07-28): an EXPLICIT
             # ``cusolvermp`` on a CPU JAX backend REFUSES at parse time —
