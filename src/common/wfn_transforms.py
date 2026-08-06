@@ -1070,7 +1070,7 @@ def gflat_to_rmu(
                     out, samples, i0, axis=0), None
 
             out_flat, _ = jax.lax.scan(
-                body, out_flat, jnp.arange(n_chunks, dtype=jnp.int32))
+                body, out_flat, jnp.arange(n_chunks, dtype=jnp.int32), unroll=1)
             if pad_N:
                 out_flat = out_flat[:N]
             return out_flat.reshape(nk, nb_local, ns, n_rmu)
@@ -1351,7 +1351,7 @@ def accumulate_rchunk_to_gflat(
                     acc, acc_sub + contrib, i0, axis=0), None
 
             acc_flat, _ = jax.lax.scan(
-                body, acc_flat, jnp.arange(n_chunks, dtype=jnp.int32))
+                body, acc_flat, jnp.arange(n_chunks, dtype=jnp.int32), unroll=1)
             if pad_N:
                 acc_flat = acc_flat[:N]
             return acc_flat.reshape(n_q, n_mu_local, ngkmax)

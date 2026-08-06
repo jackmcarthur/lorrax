@@ -61,11 +61,11 @@ def species_structure_factors(
             return S + phase * (i < natoms), None
 
         S_sp, _ = jax.lax.scan(_one_atom, jnp.zeros(N, jnp.complex128),
-                                jnp.arange(max_atoms))
+                                jnp.arange(max_atoms), unroll=1)
         return None, S_sp
 
     _, S_all = jax.lax.scan(_one_species, None,
-                             (species_tau, species_natoms))
+                             (species_tau, species_natoms), unroll=1)
     return S_all   # (n_species, N)
 
 
@@ -105,6 +105,7 @@ def accumulate_species_on_G(
         _one,
         jnp.zeros(G_norm_flat.shape[0], dtype=jnp.complex128),
         (tables, prefactors, S_species),
+        unroll=1,
     )
     return total
 

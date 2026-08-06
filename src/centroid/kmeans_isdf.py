@@ -170,7 +170,7 @@ def assign_labels_chunked(
     init = (jnp.full((P,), jnp.inf, dtype=metric_tensor.dtype),
             jnp.zeros((P,), dtype=jnp.int32),
             jnp.int32(0))
-    (_, labels, _), _ = lax.scan(body, init, centroids_blocked)
+    (_, labels, _), _ = lax.scan(body, init, centroids_blocked, unroll=1)
     return labels
 
 
@@ -308,7 +308,7 @@ def assign_labels_orbit_chunked(
         jnp.zeros((P, n_sym), dtype=bool),
         jnp.int32(0),
     )
-    (best_d2, labels, tie_mask, _), _ = lax.scan(body, init, reps_blocked)
+    (best_d2, labels, tie_mask, _), _ = lax.scan(body, init, reps_blocked, unroll=1)
     return labels, best_d2, tie_mask
 
 

@@ -839,7 +839,7 @@ def z_q_from_psi_sm(
 			# reuse the slot (§3.5).
 			(P_l, P_r), _ = jax.lax.scan(
 				body, (P_l_init, P_r_init),
-				jnp.arange(n_bc, dtype=jnp.int32))
+				jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
 
 			# Post-pair pipeline (byte-identical to today's tail per §2.7).
 			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, r_loc, mu_loc, ns)

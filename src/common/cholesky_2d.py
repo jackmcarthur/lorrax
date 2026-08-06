@@ -234,7 +234,7 @@ def cholesky_2d_single(mesh: Mesh, J: int, b: int):
             return A_local, None
         
         # Scan over all J column steps
-        A_local, _ = lax.scan(body_k, A_local, jnp.arange(J))
+        A_local, _ = lax.scan(body_k, A_local, jnp.arange(J), unroll=1)
         return A_local
     
     return _chol_2d_local

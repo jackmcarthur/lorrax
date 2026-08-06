@@ -198,7 +198,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                              for i, a in enumerate(accs)), None
 
             final_R, _ = jax.lax.scan(
-                _body, acc0, (nodes.t, jnp.transpose(nodes.alpha)))
+                _body, acc0, (nodes.t, jnp.transpose(nodes.alpha)), unroll=1)
             return tuple(_chi_fftn_local(f) for f in final_R)
 
         _chi_minimax_kernel_cache[cache_key] = minimax_tau_integrate_chi_multi
@@ -262,7 +262,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             return chi_R_acc + alpha_scalar * chi_tau, None
 
         final_R, _ = jax.lax.scan(
-            _body, chi_R_zero, (nodes.t, nodes.alpha))
+            _body, chi_R_zero, (nodes.t, nodes.alpha), unroll=1)
         return _chi_fftn_local(final_R)
 
     # Minimax quadrature always delivers ≥1 node — the compiled scan

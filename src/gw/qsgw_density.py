@@ -474,7 +474,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
             rho0 = jnp.zeros(grid, dtype=jnp.float64)
             xs = ((psi_s, U_x, occ_, w_, bidx_) if have_U
                   else (psi_s, occ_, w_, bidx_))
-            rho, _ = jax.lax.scan(body, rho0, xs)
+            rho, _ = jax.lax.scan(body, rho0, xs, unroll=1)
             rho = jax.lax.with_sharding_constraint(rho, rho_sharding)
             if sym_perm is not None:
                 rho = symmetrise_density(rho, sp_)

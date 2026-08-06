@@ -122,7 +122,7 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
             L_w = jnp.conj(L_chunk) * v_chunk[None, :]
             return V_carry + L_w @ R_chunk.T, None
         V_q, _ = jax.lax.scan(
-            _g_chunk_body, V_q, jnp.arange(n_chunks, dtype=jnp.int32))
+            _g_chunk_body, V_q, jnp.arange(n_chunks, dtype=jnp.int32), unroll=1)
         V_q = jax.lax.with_sharding_constraint(V_q, V_block_sh)
 
         q_idx_32 = q_idx.astype(jnp.int32)
