@@ -31,6 +31,11 @@
 #     - Kept as fallback for non-Cray clusters.
 #
 # Other env:
+#   LORRAX_PLATFORM        gpu (default) | cpu.  Sets MPICH_GPU_SUPPORT_ENABLED
+#                          for the launch; inferred from JAX_PLATFORMS when
+#                          unset, so `JAX_PLATFORMS=cpu run_shifter.sh ...`
+#                          is enough for the CPU leg.
+#   LORRAX_MPICH_GPU_SUPPORT  0|1 — override the above outright.
 #   LORRAX_FFI_NVHPC_DIR   host path to the staged nvhpc subset.
 #   LORRAX_FFI_IMAGE       shifter image tag.  Default: nvcr.io/nvidia/jax:25.04-py3
 #   LORRAX_NGPU            for srun-mode, # GPUs to request (default 1)
@@ -40,6 +45,34 @@
 set -euo pipefail
 
 MPI_STACK="${LORRAX_PHDF5_MPI_STACK:-mpich}"
+
+# Which platform this launch is FOR.  Decides MPICH_GPU_SUPPORT_ENABLED
+# both here and in in_container.sh (see the long note there): 1 on GPU for
+# GPU-Direct RDMA, 0 on CPU because Cray MPICH aborts at MPI_Init_thread
+# trying to dlopen the GTL against a CUDA runtime a JAX_PLATFORMS=cpu run
+# does not have.  Derived from JAX_PLATFORMS when not stated, so the CPU
+# leg needs no second variable; "gpu" when neither is set.
+: "${LORRAX_PLATFORM:=}"
+if [[ -z "${LORRAX_PLATFORM}" ]]; then
+    _jp="${JAX_PLATFORMS:-}"
+    case "${_jp%%,*}" in
+        cpu|host) LORRAX_PLATFORM=cpu ;;
+        *)        LORRAX_PLATFORM=gpu ;;
+    esac
+fi
+case "${LORRAX_PLATFORM}" in
+    cpu|host) MPICH_GPU_SUPPORT=0 ;;
+    gpu|cuda) MPICH_GPU_SUPPORT=1 ;;
+    *) echo "run_shifter.sh: LORRAX_PLATFORM='${LORRAX_PLATFORM}' not recognised; use 'gpu' or 'cpu'." >&2
+       exit 2 ;;
+esac
+# An explicit LORRAX_MPICH_GPU_SUPPORT outranks the platform inference.
+case "${LORRAX_MPICH_GPU_SUPPORT:-}" in
+    0|1) MPICH_GPU_SUPPORT="${LORRAX_MPICH_GPU_SUPPORT}" ;;
+    "")  ;;
+    *) echo "run_shifter.sh: LORRAX_MPICH_GPU_SUPPORT='${LORRAX_MPICH_GPU_SUPPORT}' is not 0 or 1." >&2
+       exit 2 ;;
+esac
 
 NVHPC_HOST="${LORRAX_FFI_NVHPC_DIR:-$HOME/software/lorrax_nvhpc}"
 IMAGE="${LORRAX_FFI_IMAGE:-nvcr.io/nvidia/jax:25.04-py3}"
@@ -182,7 +215,16 @@ SHIFTER_ARGS=(
     # host RAM.  Required for any decent perf in SLATE (and other
     # MPI-based GPU libs); pairs with the libmpi_gtl_cuda LD_PRELOAD
     # above.  Shifter strips the host-set env, so we re-set it here.
-    --env=MPICH_GPU_SUPPORT_ENABLED=1
+    # PER PLATFORM, not unconditionally 1: on the CPU leg it must be 0 or
+    # Cray MPICH aborts in MPI_Init_thread (fixed 2026-08-06 here and in
+    # in_container.sh, which shifter --module=mpich forces to have the
+    # last word because it UNSETS this name on the way in).
+    --env=MPICH_GPU_SUPPORT_ENABLED="${MPICH_GPU_SUPPORT}"
+    # Carried under a LORRAX_ name because shifter's mpich module unsets
+    # MPICH_GPU_SUPPORT_ENABLED itself; in_container.sh re-derives from
+    # these two on the far side of that boundary.
+    --env=LORRAX_PLATFORM="${LORRAX_PLATFORM}"
+    --env=LORRAX_MPICH_GPU_SUPPORT="${MPICH_GPU_SUPPORT}"
     # Expose the chosen stack's MPI include + lib paths to CMake so the
     # FFI build picks the right headers / library without guessing.
     --env=LORRAX_MPI_INCLUDE_DIR="${MPI_INCLUDE_DIR_CT}"
@@ -209,11 +251,13 @@ if [[ -n "${SLURM_JOBID:-}" && -z "${SLURM_STEP_ID:-}" ]]; then
         SRUN_WRAPPER=("$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/select_gpu.sh")
     fi
     # in_container.sh runs inside shifter and re-exports
-    # MPICH_GPU_SUPPORT_ENABLED=1 (which shifter's --module=mpich
-    # explicitly unsets per /etc/shifter/udiRoot.conf).  Required so
-    # MPI calls with device pointers go GPU->GPU via Slingshot
-    # GPU-Direct RDMA.  Path is the host path; resolves the same
-    # inside the container via /global/u2 siteFs.
+    # MPICH_GPU_SUPPORT_ENABLED (which shifter's --module=mpich
+    # explicitly unsets per /etc/shifter/udiRoot.conf) at the value this
+    # launch's platform needs: 1 on GPU so MPI calls with device pointers
+    # go GPU->GPU via Slingshot GPU-Direct RDMA, 0 on CPU so
+    # MPI_Init_thread does not abort looking for the GTL's CUDA runtime.
+    # Path is the host path; resolves the same inside the container via
+    # /global/u2 siteFs.
     IN_CONTAINER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/in_container.sh"
     exec srun "${jobflag}" --mpi="${LORRAX_MPI_TYPE}" \
         --gres=gpu:"${NGPU}" -N "${NNODES}" -n "${NTASKS}" \
