@@ -58,6 +58,7 @@ SC updates" is undecided; flagged for a separate design pass.
 from __future__ import annotations
 
 import functools as _functools
+import math as _math
 import os
 from dataclasses import dataclass
 from typing import Callable
@@ -1414,46 +1415,107 @@ def _run_rcrop(
     print_fn(
         f"  SC rCROP: history_depth={history_depth}, "
         f"max_iter={max_iter}, tol={tol_ev:.1e} eV/band-RMS")
-    # DEGRADE, DO NOT REFUSE.  ``band_rotation_spec`` puts the two band
-    # axes on the two mesh axes, so it needs px | nb and py | nb — the same
-    # condition every other user of that spec is under.  A refusal here
-    # would kill a run that worked before this change, so a shape that does
-    # not divide falls back to the previous unsharded history and says so.
+    # PAD, DO NOT DEGRADE.  ``band_rotation_spec`` puts the two band axes
+    # on the two mesh axes, so it needs px | nb and py | nb — the same
+    # condition every other user of that spec is under.  What used to be
+    # here fell back to an UNSHARDED history when nb did not divide, i.e.
+    # to the 92.2 GB-on-one-device wall the residency budget in the
+    # docstring exists to describe.  Zero-padding both band axes up to the
+    # divisor keeps ONE shape and ONE layout for every nb instead, which
+    # is also the difference between one compiled executable and a
+    # recompile per ragged band count.
+    #
+    # PARITY CONTRACT — MEASURED (job 56389339, artifacts under
+    # ~/software/pad_artifacts_2026-08-06), and it is not the contract you
+    # would assume, nor the one the first pass at this change assumed.
+    # Three separate claims, because they have three different answers:
+    #
+    #   1. THE PAD MODES ARE EXACTLY INERT.  H reaches ``gw_iteration_map``
+    #      and ``eigvalsh_kshard`` only at the LOGICAL extent
+    #      (``_to_carry`` slices first), so no spurious zero eigenvalue is
+    #      ever admitted to the RMS-ΔE history, and the pad zone is
+    #      bit-for-bit 0.0 after 12 rCROP iterations — 60, 992 and 3072 pad
+    #      elements, on 4 GPUs and on 4- and 16-device CPU meshes.  Checked
+    #      at the bottom of this function rather than asserted here.
+    #
+    #   2. A DIVISIBLE EXTENT IS BYTE-IDENTICAL to the pre-pad code, and
+    #      SHARDING THE HISTORY IS ITSELF BIT-EXACT.  Both measured 0.0
+    #      difference, bit-identical, in every configuration tried.  That
+    #      second one matters: it means the pad is the ONLY thing in this
+    #      change that moves a number, and it removes the excuse that the
+    #      drift below hides under a pre-existing sharded/unsharded floor.
+    #      There is no such floor here — that comparison is exact.
+    #
+    #   3. THE PAD IS NOT BIT-EXACT, AND THE DRIFT IS NOT A FIXED FEW-eps
+    #      GAUGE.  rCROP's two primitives are full-array REDUCTIONS (the
+    #      (m+1, m+1) Gram, the residual 2-norm), so the extra zero terms
+    #      change how XLA GROUPS the nonzero ones.  That seeds a
+    #      reduction-order error which rCROP then amplifies, and the seed
+    #      grows with the reduction length: after ONE iteration it is 0.2
+    #      eps at nk·nb² = 243 and 39.9 eps at nk·nb² = 29768.  How far it
+    #      then grows is a property of the TRAJECTORY, not of the pad — on
+    #      a contracting one it stayed ≤ 8.3 eps through 12 iterations; on
+    #      a stalled one (residual plateaued, history Gram near-degenerate)
+    #      it reached 2.9e5 eps at 12 iterations and 9.2e6 eps at 16.
+    #      Quoting a single eps figure for this change is therefore wrong.
+    #
+    #      WHAT BOUNDS IT IS THE RESIDUAL, NOT eps.  Across both regimes
+    #      and every iteration count 1–16, |ΔH| stayed ≤ 6.1e-8 of the
+    #      per-element residual norm: the padded and unpadded runs are the
+    #      same iterate to within ~1e-8 of how far either still is from its
+    #      own fixed point.  So this is a gauge in the sense that matters —
+    #      it cannot move a converged answer by more than the convergence
+    #      criterion — but it is NOT a 3-eps effect, and a test that pins
+    #      this path to a few ULPs will fail at production shapes.
+    #
+    # An nb that already divides pads by zero rows: ``pad_axis_to`` returns
+    # the SAME array, so the production path is byte-identical to before.
+    from runtime.padding import pad_axis_to, round_up, spec_divisor
+
+    spec = _band_rotation_spec()
     px, py = (int(mesh.shape[a]) for a in mesh.axis_names)
-    if nb % px or nb % py:
-        entry_sh = None
-        x0 = H0
-        local_b = H0.nbytes
-        print_fn(
-            f"  SC rCROP residency: nb={nb} is not divisible by the mesh "
-            f"({px}x{py}) — history NOT sharded, "
-            f"{2.0 * history_depth * local_b / 2**30:.4f} GiB on ONE device. "
-            f"This is the pre-2026-08-05 behaviour and is a wall at "
-            f"production shapes.")
-    else:
-        entry_sh = NamedSharding(mesh, _band_rotation_spec())
-        x0 = jax.device_put(H0, entry_sh)
-        # MEASURED, not derived from the shape and the mesh.  A
-        # ``device_put`` that fell back to replicated would print the full
-        # size here, and that is the failure mode that would make this a
-        # silent no-op.
-        local_b = sum(sh.data.nbytes for sh in x0.addressable_shards)
-        print_fn(
-            f"  SC rCROP residency: carry {tuple(H0.shape)} (nk={nk} on the "
-            f"loop's k-set), n={n_elem}, mesh {px}x{py}; entry "
-            f"{x0.nbytes / 2**20:.2f} MiB global / {local_b / 2**20:.2f} MiB "
-            f"addressable here; history 2x{history_depth} entries = "
-            f"{2.0 * history_depth * x0.nbytes / 2**30:.4f} GiB global / "
-            f"{2.0 * history_depth * local_b / 2**30:.4f} GiB here")
+    # From the SPEC, not from px and py directly.  A band axis the spec
+    # replicates needs no pad at all, and ``spec_divisor`` is the single
+    # place that mapping lives (``runtime.padding``); re-deriving it from
+    # the mesh here is how the loader and the sweep would drift apart.
+    # ONE extent for BOTH axes, so the carry stays square — the residual is
+    # H_out − H_in and the re-Hermitisation below both need that.
+    band_div = _math.lcm(spec_divisor(mesh, spec, 1),
+                         spec_divisor(mesh, spec, 2))
+    nb_pad = round_up(nb, band_div)
+
+    def _pad_bands(A):
+        A, _ = pad_axis_to(A, band_div, axis=1)
+        A, _ = pad_axis_to(A, band_div, axis=2)
+        return A
+
+    entry_sh = NamedSharding(mesh, spec)
+    x0 = jax.device_put(_pad_bands(H0), entry_sh)
+    # MEASURED, not derived from the shape and the mesh.  A
+    # ``device_put`` that fell back to replicated would print the full
+    # size here, and that is the failure mode that would make this a
+    # silent no-op.
+    local_b = sum(sh.data.nbytes for sh in x0.addressable_shards)
+    print_fn(
+        f"  SC rCROP residency: carry {tuple(H0.shape)} (nk={nk} on the "
+        f"loop's k-set), n={n_elem} logical, mesh {px}x{py}; bands "
+        f"{nb}→{nb_pad} (band divisor {band_div}, "
+        f"+{100.0 * ((float(nb_pad) / nb) ** 2 - 1.0):.2f}% elements); entry "
+        f"{x0.nbytes / 2**20:.2f} MiB global / {local_b / 2**20:.2f} MiB "
+        f"addressable here; history 2x{history_depth} entries = "
+        f"{2.0 * history_depth * x0.nbytes / 2**30:.4f} GiB global / "
+        f"{2.0 * history_depth * local_b / 2**30:.4f} GiB here")
 
     # THE SEAM, and the only reshard in the loop.  History entries live at
-    # ``entry_sh``; ``gw_iteration_map`` needs the carry REPLICATED.  No
-    # reshape in either direction — the carry never changes shape.
+    # ``entry_sh`` at the PADDED band extent; ``gw_iteration_map`` needs the
+    # carry REPLICATED at the LOGICAL one.  The band extent is the only
+    # thing that crosses this seam — nk never changes, and at nb_pad == nb
+    # both directions collapse to exactly the pre-pad spelling.
     def _to_carry(A):
-        return _place(A, mesh)
+        return _place(A if nb_pad == nb else A[:, :nb, :nb], mesh)
 
     def _to_entry(A):
-        return A if entry_sh is None else jax.device_put(A, entry_sh)
+        return jax.device_put(_pad_bands(A), entry_sh)
 
     # Bookkeeping for per-iteration printing + final SigmaResult capture.
     _e_history: list[np.ndarray] = [
@@ -1508,7 +1570,10 @@ def _run_rcrop(
         return _to_entry(state_out.H_qp_dft - H)
 
     # rCROP residual tolerance: ‖f‖₂ ≤ tol_ry · √(n_elem) ⇔ per-element
-    # RMS ≤ tol_ry.  Convert RMS ΔE in eV → Ry first.
+    # RMS ≤ tol_ry.  Convert RMS ΔE in eV → Ry first.  ``n_elem`` is the
+    # LOGICAL element count on purpose: the pad modes contribute exactly
+    # zero to ‖f‖₂, so counting them would loosen the tolerance by
+    # nb_pad/nb per band axis for no physical reason.
     tol_ry = tol_ev / RYD_TO_EV
     tol_resid = float(np.sqrt(n_elem)) * tol_ry
 
@@ -1526,6 +1591,23 @@ def _run_rcrop(
         f"  SC rCROP done: {result.iterations} iterations, "
         f"converged={bool(result.converged)}, "
         f"final ‖residual‖₂ = {float(result.residual_norms[-1]):.4e} Ry")
+
+    # INERTNESS, CHECKED — a DIFFERENT claim from the parity one at the top
+    # of this function, and this pair has been measured to come apart: the
+    # pad modes can be bit-for-bit 0.0 while the reduction order still moves
+    # the answer by eps-scale.  Neither substitutes for the other, so the
+    # cheap one runs in-line.  Two slices and a max, once per solve, and it
+    # is a failure signature rather than a success marker — a nonzero here
+    # means something wrote into the pad zone, which would make every
+    # statement above about the pad wrong.
+    if nb_pad != nb:
+        pad_max = max(
+            float(jnp.max(jnp.abs(result.x[:, nb:, :]))),
+            float(jnp.max(jnp.abs(result.x[:, :, nb:]))))
+        print_fn(
+            f"  SC rCROP pad inertness: {nb_pad - nb} pad bands per axis, "
+            f"max|H| over the pad zone = {pad_max:.3e} "
+            f"(exactly 0.0: {pad_max == 0.0})")
 
     # Final state: use the last x from rCROP (Hermitised) and the last
     # captured SigmaResult so the writer downstream has the full
