@@ -20,11 +20,76 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # concurrently-used in-tree .so; point LORRAX_FFI_SO at the result.
 BUILD_DIR="${LORRAX_FFI_BUILD_DIR:-${SCRIPT_DIR}/build}"
 
-# Default HPC SDK install (a staged subset; see AGENTS.md).  The staged
-# tree is bind-mounted into Shifter at this path.  Override by setting
-# LORRAX_NVHPC_ROOT.
-NVHPC_ROOT="${LORRAX_NVHPC_ROOT:-/lorrax_nvhpc/25.5_cuda12.9}"
+# WHICH staged cuSOLVERMp this .so is COMPILED AND LINKED against.
+#
+# THIS MUST NOT BE HARDCODED, and was until 2026-08-06 — the same defect as
+# run_shifter.sh's LORRAX_NVHPC_SUBPATH (fixed 2026-08-05), one layer down.
+# The default here was `/lorrax_nvhpc/25.5_cuda12.9`, i.e. cuSolverMp 0.6.0,
+# which config/perlmutter/site_config.sh documents as silently returning
+# WRONG getrf/getrs answers on any Px>1 AND Py>1 mesh — while site_config's
+# LORRAX_NVHPC_SUBPATH selects 0.7.2 for the RUN.  Every stage exports the
+# same SONAME (libcusolverMp.so.0), so building against one and running
+# against the other links cleanly and warns about nothing.  It has been
+# latent rather than live only because 0.7.2 happens to come first on
+# LD_LIBRARY_PATH; that is luck, one path edit deep.
+#
+# THERE IS NO SAFE DEFAULT, which is the reason this refuses instead of
+# picking a better one.  The stages differ in more than a version number:
+#   25.5_cuda12.9  cuSolverMp 0.6.0, ships cal.h + libcal -> the CAL comm
+#                  path (LORRAX_FFI_HAVE_CAL=ON, the CMake default)
+#   0.7.2_cuda12.9 cuSolverMp 0.7.2, NCCL-native, ships NO cal.h/libcal ->
+#                  needs -DLORRAX_FFI_HAVE_CAL=OFF (CMakeLists.txt ~L40)
+# So a default does not merely guess a version, it silently picks a
+# COMMUNICATION PATH.  Defaulting to 0.7.2 would trade one silent
+# substitution for another.  State it.
+#
+# Normally you state it once, in the site config, and never think about it:
+# run_shifter.sh exports LORRAX_NVHPC_ROOT derived from the SAME
+# LORRAX_NVHPC_SUBPATH that decides the runtime library, so a build launched
+# through it agrees with the run it is built for BY CONSTRUCTION.
+NVHPC_ROOT="${LORRAX_NVHPC_ROOT:-}"
 NVHPC_CUDA="${LORRAX_NVHPC_CUDA:-12.9}"
+NVHPC_MOUNT="${LORRAX_NVHPC_MOUNT:-/lorrax_nvhpc}"
+
+if [[ -z "${NVHPC_ROOT}" ]]; then
+    # Second source of truth, same fact: the runtime subpath.  Its first
+    # component IS the stage directory.
+    if [[ -n "${LORRAX_NVHPC_SUBPATH:-}" ]]; then
+        NVHPC_ROOT="${NVHPC_MOUNT}/${LORRAX_NVHPC_SUBPATH%%/*}"
+        echo "[build] NVHPC_ROOT derived from LORRAX_NVHPC_SUBPATH='${LORRAX_NVHPC_SUBPATH}'" >&2
+    else
+        echo "[build] REFUSED — LORRAX_NVHPC_ROOT is not set." >&2
+        echo "  rule   this selects the cuSOLVERMp the .so is COMPILED and" >&2
+        echo "         LINKED against.  Every stage exports the same SONAME," >&2
+        echo "         so building against one and running against another" >&2
+        echo "         links cleanly and fails later, as wrong getrf/getrs" >&2
+        echo "         answers on a Px>1 AND Py>1 mesh (site_config.sh)." >&2
+        echo "  got    neither LORRAX_NVHPC_ROOT nor LORRAX_NVHPC_SUBPATH." >&2
+        echo "  wanted the stage that this build's RUNS will load." >&2
+        echo "  fix    launch through src/ffi/cpp/run_shifter.sh, which" >&2
+        echo "         exports both from config/perlmutter/site_config.sh;" >&2
+        echo "         or name it:  LORRAX_NVHPC_ROOT=${NVHPC_MOUNT}/<stage>" >&2
+        echo "  note   this script no longer guesses 25.5_cuda12.9" >&2
+        echo "         (cuSolverMp 0.6.0).  Stages present under" >&2
+        echo "         ${NVHPC_MOUNT}:" >&2
+        if [[ -d "${NVHPC_MOUNT}" ]]; then
+            for _s in "${NVHPC_MOUNT}"/*/; do
+                [[ -d "$_s" ]] || continue
+                _s="$(basename "$_s")"
+                # Only real stages: a dir with the cuSOLVERMp header tree.
+                [[ -f "${NVHPC_MOUNT}/${_s}/math_libs/${NVHPC_CUDA}/targets/x86_64-linux/include/cusolverMp.h" ]] || continue
+                if [[ -f "${NVHPC_MOUNT}/${_s}/math_libs/${NVHPC_CUDA}/targets/x86_64-linux/include/cal.h" ]]; then
+                    echo "           ${_s}  (has cal.h -> LORRAX_FFI_HAVE_CAL=ON)" >&2
+                else
+                    echo "           ${_s}  (no cal.h -> needs -DLORRAX_FFI_HAVE_CAL=OFF)" >&2
+                fi
+            done
+        else
+            echo "           (${NVHPC_MOUNT} is not mounted here)" >&2
+        fi
+        exit 2
+    fi
+fi
 
 # MPI stack sanity check.  The CMake config (see CMakeLists.txt ~L283-305)
 # reads LORRAX_MPI_INCLUDE_DIR + LORRAX_MPICH_LIB_DIR and silently falls
@@ -70,12 +135,43 @@ fi
 # version is baked into the header — headers and runtime must match.
 PYTHON_EXE="${LORRAX_FFI_PYTHON:-/usr/bin/python3}"
 
+# CAL vs NCCL comm path must MATCH the stage selected above.  cuSOLVERMp
+# >= 0.7 is NCCL-native and ships no cal.h/libcal; <= 0.6.x needs both.
+# CMake's LORRAX_FFI_HAVE_CAL defaults ON, so the 0.7.x stage with no flag
+# fails deep inside the compile on a missing cal.h — a confusing error for
+# a decision that is fully determined by the tree we just chose.  Check it
+# here, where the tree is in hand, and name the flag.
+CAL_INC="${NVHPC_ROOT}/math_libs/${NVHPC_CUDA}/targets/x86_64-linux/include/cal.h"
+CAL_ARGS=()
+if [[ -n "${LORRAX_FFI_HAVE_CAL:-}" ]]; then
+    # Explicit wins, unexamined: a port may know something this check does not.
+    CAL_ARGS=(-DLORRAX_FFI_HAVE_CAL="${LORRAX_FFI_HAVE_CAL}")
+    echo "[build] CAL comm path: LORRAX_FFI_HAVE_CAL=${LORRAX_FFI_HAVE_CAL} (explicit)"
+elif [[ ! -f "${CAL_INC}" ]]; then
+    echo "[build] REFUSED — the selected cuSOLVERMp stage ships no cal.h." >&2
+    echo "  rule   the CAL and NCCL comm paths are different code; the" >&2
+    echo "         stage decides which one is correct, not the default." >&2
+    echo "  got    NVHPC_ROOT=${NVHPC_ROOT}" >&2
+    echo "         with no ${CAL_INC}" >&2
+    echo "         (cuSOLVERMp >= 0.7 is NCCL-native and drops CAL)," >&2
+    echo "         but CMake's LORRAX_FFI_HAVE_CAL defaults ON." >&2
+    echo "  fix    rebuild with LORRAX_FFI_HAVE_CAL=OFF, i.e." >&2
+    echo "           LORRAX_FFI_HAVE_CAL=OFF bash src/ffi/cpp/build.sh" >&2
+    echo "         or select a stage that ships cal.h (25.5_cuda12.9 is" >&2
+    echo "         cuSolverMp 0.6.0 — see site_config.sh for why you" >&2
+    echo "         probably do not want it)." >&2
+    exit 2
+else
+    echo "[build] CAL comm path: cal.h present in the stage -> HAVE_CAL=ON"
+fi
+
 cmake "${SCRIPT_DIR}" \
     -DLORRAX_FFI_PLATFORM=cuda \
     -DCMAKE_BUILD_TYPE=Release \
     -DPython3_EXECUTABLE="${PYTHON_EXE}" \
     -DNVHPC_ROOT="${NVHPC_ROOT}" \
-    -DNVHPC_CUDA_SUBDIR="${NVHPC_CUDA}"
+    -DNVHPC_CUDA_SUBDIR="${NVHPC_CUDA}" \
+    "${CAL_ARGS[@]}"
 
 cmake --build . --parallel
 

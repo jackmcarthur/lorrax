@@ -230,6 +230,15 @@ SHIFTER_ARGS=(
     --env=LORRAX_MPI_INCLUDE_DIR="${MPI_INCLUDE_DIR_CT}"
     --env=LORRAX_MPICH_LIB_DIR="${MPI_LIB_DIR_CT}"
     --env=LORRAX_PHDF5_MPI_STACK="${MPI_STACK}"
+    # ONE source of truth for which cuSOLVERMp stage this container uses:
+    # LORRAX_NVHPC_SUBPATH decides the RUNTIME library (LD_LIBRARY_PATH
+    # above) and, through these, the one a build launched in here COMPILES
+    # against (src/ffi/cpp/build.sh).  Passing both means the .so and the
+    # library it will run against agree by construction instead of by two
+    # people remembering the same string.  Before 2026-08-06 build.sh
+    # hardcoded 25.5_cuda12.9 and silently disagreed with this line.
+    --env=LORRAX_NVHPC_SUBPATH="${LORRAX_NVHPC_SUBPATH}"
+    --env=LORRAX_NVHPC_ROOT="/lorrax_nvhpc/${LORRAX_NVHPC_SUBPATH%%/*}"
 )
 
 if [[ -n "${SLURM_JOBID:-}" && -z "${SLURM_STEP_ID:-}" ]]; then
