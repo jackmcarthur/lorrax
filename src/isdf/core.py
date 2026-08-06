@@ -33,7 +33,7 @@ from common.cholesky_2d import (
     dense_to_tiles,
     tiles_to_dense,
 )
-from common.fft_helpers import compute_block_size_for_2d_cholesky
+from common.fft_helpers import compute_block_size_for_2d_cholesky, local_fftn3, local_ifftn3
 from common.wfn_transforms import to_rchunk_inner
 # Distributed-linalg facade: mesh probing, guard resolution, and the ONE
 # import seam for the FFI backend packages (cusolvermp / slate / scalapack).
@@ -354,12 +354,12 @@ def c_q_from_psi_sm(
 			# Rank-7: (kx, ky, kz, ns_l, col, μ, ns_r).
 			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, col_loc, mu_loc, ns)
 			del P_l
-			P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
+			P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
 			P_l_R_conj = jnp.conj(P_l_R)
 			del P_l_3d, P_l_R
 			P_r_3d = P_r.reshape(nkx, nky, nkz, ns, col_loc, mu_loc, ns)
 			del P_r
-			P_r_R = jnp.fft.ifftn(P_r_3d, axes=(0, 1, 2), norm='forward')
+			P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
 			del P_r_3d
 			# Reduce over the spin axes (3=ns_l, 6=ns_r) of the rank-7
 			# form.  Output rank-5: (kx, ky, kz, col, μ).
@@ -372,7 +372,7 @@ def c_q_from_psi_sm(
 				spin_axes=(3, 6),
 			)
 			del P_l_R_conj, P_r_R
-			C_q_3d = jnp.fft.fftn(C_R, axes=(0, 1, 2), norm='forward')
+			C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
 			# Reshape back to (nk, col, μ); transpose final two axes
 			# to satisfy out_spec ``P(None, 'x', 'y')`` for (nk, μ, col).
 			# This transpose acts on the rank-3 reduced form (~16 MB),
@@ -844,12 +844,12 @@ def z_q_from_psi_sm(
 			# Post-pair pipeline (byte-identical to today's tail per §2.7).
 			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, r_loc, mu_loc, ns)
 			del P_l
-			P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
+			P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
 			P_l_R_conj = jnp.conj(P_l_R)
 			del P_l_3d, P_l_R
 			P_r_3d = P_r.reshape(nkx, nky, nkz, ns, r_loc, mu_loc, ns)
 			del P_r
-			P_r_R = jnp.fft.ifftn(P_r_3d, axes=(0, 1, 2), norm='forward')
+			P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
 			del P_r_3d
 			Z_R = gamma_double_contract(
 				P_l_R_conj, P_r_R,
@@ -860,7 +860,7 @@ def z_q_from_psi_sm(
 				spin_axes=(3, 6),
 			)
 			del P_l_R_conj, P_r_R
-			Z_q_3d = jnp.fft.fftn(Z_R, axes=(0, 1, 2), norm='forward')
+			Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
 			return jnp.transpose(
 				Z_q_3d.reshape(nkx * nky * nkz, r_loc, mu_loc),
 				(0, 2, 1))

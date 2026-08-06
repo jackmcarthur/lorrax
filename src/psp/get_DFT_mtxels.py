@@ -17,6 +17,7 @@ import configparser
 import re
 import glob
 from pathlib import Path
+from common.fft_helpers import local_fftn3, local_ifftn3
 
 # Set JAX configs BEFORE importing JAX (prefer GPU if available)
 os.environ.setdefault("JAX_ENABLE_X64", "1")
@@ -191,7 +192,7 @@ def _valence_density_kernel(
     ngrid = int(nx) * int(ny) * int(nz)
     scale = jnp.sqrt(jnp.asarray(float(ngrid), dtype=jnp.float64) / cell_volume)
     psi_occ = psi_k_box if nocc is None else psi_k_box[: int(nocc)]
-    psi_r = jnp.fft.ifftn(psi_occ, axes=(-3, -2, -1), norm='ortho') * scale
+    psi_r = local_ifftn3(psi_occ, axes=(-3, -2, -1), norm='ortho') * scale
     return (weight * spin_degeneracy) * jnp.sum(
         jnp.real(jnp.conj(psi_r) * psi_r), axis=(0, 1))
 
@@ -357,7 +358,7 @@ def compute_valence_density(wfn_k, sym, wfn):
                     return buf.at[Gx, Gy, Gz].set(row)
 
                 psi_G_padded_batch = jax.vmap(scatter_one, in_axes=0, out_axes=0)(C_occ)
-                psi_r_batch = jnp.fft.ifftn(psi_G_padded_batch, axes=(-3, -2, -1), norm='ortho') * scale_pad
+                psi_r_batch = local_ifftn3(psi_G_padded_batch, axes=(-3, -2, -1), norm='ortho') * scale_pad
                 rho_val_local += (wk * f_spin) * jnp.sum(
                     jnp.real(psi_r_batch.conj() * psi_r_batch), axis=0)
     
@@ -575,9 +576,9 @@ def _compute_local_V_k_jit(
     ngrid = nx * ny * nz
     sc = local_potential_scalars(volume, ngrid)
 
-    psi_r = jnp.fft.ifftn(psi_G, axes=(-3, -2, -1), norm='ortho') * sc.scale
+    psi_r = local_ifftn3(psi_G, axes=(-3, -2, -1), norm='ortho') * sc.scale
     phi_r = psi_r * V_r
-    phi_G = jnp.fft.fftn(phi_r, axes=(-3, -2, -1), norm='ortho') * (
+    phi_G = local_fftn3(phi_r, axes=(-3, -2, -1), norm='ortho') * (
         sc.deltaV * sc.fft_norm)
 
     psi_coeffs = psi_G[:, :, Gx, Gy, Gz]

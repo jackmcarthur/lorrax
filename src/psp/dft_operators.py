@@ -59,6 +59,7 @@ import jax
 import jax.numpy as jnp
 
 import common.timing as timing
+from common.fft_helpers import local_fftn3, local_ifftn3
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -804,10 +805,10 @@ def apply_H_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     H_G = T_diag[None, None, :] * psi_G
 
     # ── V_scf: self-consistent local potential (real-space multiply) ─
-    psi_r = jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm='ortho')
-    H_G = H_G + jnp.fft.fftn(
-        psi_r * V_scf, axes=(-3, -2, -1), norm='ortho'
-    )[:, :, Gx, Gy, Gz] * mask_f
+    psi_r = local_ifftn3(psi_box, axes=(-3, -2, -1), norm='ortho')
+    H_G = H_G + local_fftn3(
+       psi_r * V_scf, axes=(-3, -2, -1), norm='ortho'
+   )[:, :, Gx, Gy, Gz] * mask_f
 
     # ── V_NL: Kleinman–Bylander (project → D → unproject) ───────────
     P = jnp.einsum('RG,vsG->Rsv', jnp.conj(vnl_Z), psi_G, optimize=True)
@@ -858,8 +859,8 @@ def apply_H_k_from_G(psi_G, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     # already masked to 0 above) so the real entry survives.
     psi_box = jnp.zeros((*psi_G.shape[:2], nx, ny, nz), dtype=psi_G.dtype)
     psi_box = psi_box.at[:, :, Gx, Gy, Gz].add(psi_G_m)
-    psi_r = jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm='ortho')
-    Vpsi_box = jnp.fft.fftn(psi_r * V_scf, axes=(-3, -2, -1), norm='ortho')
+    psi_r = local_ifftn3(psi_box, axes=(-3, -2, -1), norm='ortho')
+    Vpsi_box = local_fftn3(psi_r * V_scf, axes=(-3, -2, -1), norm='ortho')
     H_G = H_G + Vpsi_box[:, :, Gx, Gy, Gz] * mask_f
 
     # V_NL on the G-sphere directly.
@@ -885,10 +886,10 @@ def build_matrix_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     )
 
     # V_scf
-    psi_r = jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm='ortho')
-    Vpsi_G = jnp.fft.fftn(
-        psi_r * V_scf, axes=(-3, -2, -1), norm='ortho'
-    )[:, :, Gx, Gy, Gz] * mask_f
+    psi_r = local_ifftn3(psi_box, axes=(-3, -2, -1), norm='ortho')
+    Vpsi_G = local_fftn3(
+       psi_r * V_scf, axes=(-3, -2, -1), norm='ortho'
+   )[:, :, Gx, Gy, Gz] * mask_f
     H_mn = H_mn + jnp.einsum(
         'msG,nsG->mn', jnp.conj(psi_G), Vpsi_G, optimize=True,
     )

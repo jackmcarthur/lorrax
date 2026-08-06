@@ -34,6 +34,7 @@ import numpy as np
 from psp.ionic_gspace import build_ionic_and_core
 from psp.dft_operators import build_G_cart, compute_V_H_and_V_xc, build_V_scf
 import psp.vnl_ops as vnl_ops
+from common.fft_helpers import local_ifftn3
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -150,7 +151,7 @@ def build_rho_val_from_wfn(wfn, sym, meta, n_occ: int, *, verbose: bool = True) 
         # rotation + fractional-translation phase + spinor rotation internally.
         psi_box = load_kpoint_fftbox(wfn, sym, meta, ik, n_occ)
         # Ortho IFFT to real space: <ψ|ψ> = Σ_j|ψ(r_j)|² = 1 per band.
-        psi_r = jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm='ortho')
+        psi_r = local_ifftn3(psi_box, axes=(-3, -2, -1), norm='ortho')
         rho_r = rho_r + jnp.sum(jnp.abs(psi_r) ** 2, axis=(0, 1))
 
     # Average over full BZ (uniform weights) and convert |ψ|² normalisation to

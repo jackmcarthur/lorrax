@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from common.gamma_matrices import sigma_x, sigma_y, sigma_z
+from common.fft_helpers import local_fftn3, local_ifftn3
 
 
 def _build_K_cart(gvecs_k, kvec_frac, bvec_dimless, alat):
@@ -79,7 +80,7 @@ def build_current_density(wfn, sym, n_occ: int, *,
         # Place ψ_G into FFT box: (n_occ, 2, nx, ny, nz)
         zero_box = jnp.zeros((n_occ_local, 2, nx, ny, nz), dtype=jnp.complex128)
         psi_box = zero_box.at[:, :, ng_x, ng_y, ng_z].set(psi_G_k)
-        psi_r = jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm='ortho')
+        psi_r = local_ifftn3(psi_box, axes=(-3, -2, -1), norm='ortho')
         # (n_occ, 2, nx, ny, nz)
 
         def _grad_i(i):
@@ -87,7 +88,7 @@ def build_current_density(wfn, sym, n_occ: int, *,
             iK_g = (1j * K_cart_g[:, i]).astype(jnp.complex128)
             grad_G = psi_G_k * iK_g[None, None, :]
             grad_box = zero_box.at[:, :, ng_x, ng_y, ng_z].set(grad_G)
-            return jnp.fft.ifftn(grad_box, axes=(-3, -2, -1), norm='ortho')
+            return local_ifftn3(grad_box, axes=(-3, -2, -1), norm='ortho')
 
         # Paramagnetic j^para_i(r) per band (use grad_i, then free)
         grad_x = _grad_i(0)
@@ -110,21 +111,21 @@ def build_current_density(wfn, sym, n_occ: int, *,
         del psi_r
 
         # FFT each component (per band); produce (n_occ, nx, ny, nz) cplx
-        sx_G = jnp.fft.fftn(s_x_n.astype(jnp.complex128),
-                             axes=(-3, -2, -1), norm='ortho')
-        sy_G = jnp.fft.fftn(s_y_n.astype(jnp.complex128),
-                             axes=(-3, -2, -1), norm='ortho')
-        sz_G = jnp.fft.fftn(s_z_n.astype(jnp.complex128),
-                             axes=(-3, -2, -1), norm='ortho')
+        sx_G = local_fftn3(s_x_n.astype(jnp.complex128),
+                            axes=(-3, -2, -1), norm='ortho')
+        sy_G = local_fftn3(s_y_n.astype(jnp.complex128),
+                            axes=(-3, -2, -1), norm='ortho')
+        sz_G = local_fftn3(s_z_n.astype(jnp.complex128),
+                            axes=(-3, -2, -1), norm='ortho')
         del s_x_n, s_y_n, s_z_n
 
         # Curl per direction (only two s components per call → no 5-D blowup)
-        curl_x = jnp.fft.ifftn(1j * (Kc_y[None, ...] * sz_G - Kc_z[None, ...] * sy_G),
-                                axes=(-3, -2, -1), norm='ortho').real
-        curl_y = jnp.fft.ifftn(1j * (Kc_z[None, ...] * sx_G - Kc_x[None, ...] * sz_G),
-                                axes=(-3, -2, -1), norm='ortho').real
-        curl_z = jnp.fft.ifftn(1j * (Kc_x[None, ...] * sy_G - Kc_y[None, ...] * sx_G),
-                                axes=(-3, -2, -1), norm='ortho').real
+        curl_x = local_ifftn3(1j * (Kc_y[None, ...] * sz_G - Kc_z[None, ...] * sy_G),
+                               axes=(-3, -2, -1), norm='ortho').real
+        curl_y = local_ifftn3(1j * (Kc_z[None, ...] * sx_G - Kc_x[None, ...] * sz_G),
+                               axes=(-3, -2, -1), norm='ortho').real
+        curl_z = local_ifftn3(1j * (Kc_x[None, ...] * sy_G - Kc_y[None, ...] * sx_G),
+                               axes=(-3, -2, -1), norm='ortho').real
         del sx_G, sy_G, sz_G
 
         # j^Gordon_n,i = j^para_n,i + (1/2) curl_n,i; sum over (n, i) of squares

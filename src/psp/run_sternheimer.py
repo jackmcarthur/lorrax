@@ -53,6 +53,7 @@ from __future__ import annotations
 # backend this CLI now falls back to CPU instead of dying at the first
 # jax call.
 from runtime import bootstrap
+from common.fft_helpers import local_fftn3, local_ifftn3
 bootstrap()
 
 import argparse
@@ -114,9 +115,9 @@ def build_sternheimer_source_preQ(
     Q_{k-q} with a Q that varies with q (needed when unfreezing the
     projector for ∂χ/∂q — see ``chi_col_contrib_at_kvec_traced``).
     """
-    u_r = jnp.fft.ifftn(U_box_k, axes=(-3, -2, -1), norm='ortho')
+    u_r = local_ifftn3(U_box_k, axes=(-3, -2, -1), norm='ortho')
     Vu_r = V_pert_real[None, None, :, :, :] * u_r
-    Vu_box = jnp.fft.fftn(Vu_r, axes=(-3, -2, -1), norm='ortho')
+    Vu_box = local_fftn3(Vu_r, axes=(-3, -2, -1), norm='ortho')
     return _gather_box_at_G(Vu_box, Gkminq_int)
 
 
@@ -153,11 +154,11 @@ def build_sternheimer_source(
     b : (nv, nspinor, ngk_p) complex — in range(Q_{k-q}).
     """
     # Ortho IFFT maps the G-box to the cell-periodic part u_{v,k}(r).
-    u_r = jnp.fft.ifftn(U_box_k, axes=(-3, -2, -1), norm='ortho')
+    u_r = local_ifftn3(U_box_k, axes=(-3, -2, -1), norm='ortho')
     # Multiply by V_pert(r) elementwise.
     Vu_r = V_pert_real[None, None, :, :, :] * u_r
     # Back to G-box, then gather on the (k-q) sphere.
-    Vu_box = jnp.fft.fftn(Vu_r, axes=(-3, -2, -1), norm='ortho')
+    Vu_box = local_fftn3(Vu_r, axes=(-3, -2, -1), norm='ortho')
     Vu_G = _gather_box_at_G(Vu_box, Gkminq_int)
     return Q_kminq(Vu_G)
 
@@ -178,7 +179,7 @@ def accumulate_chi_density(
     naive Bloch momentum — putting its Fourier content into the correct G-slot
     of the chi column.
     """
-    u_r = jnp.fft.ifftn(U_box_k, axes=(-3, -2, -1), norm='ortho')
+    u_r = local_ifftn3(U_box_k, axes=(-3, -2, -1), norm='ortho')
     nv, nspinor, _ = delta_u_G.shape
     nx, ny, nz = fft_grid
     ix = jnp.mod(Gkminq_int[:, 0], nx)
@@ -186,7 +187,7 @@ def accumulate_chi_density(
     iz = jnp.mod(Gkminq_int[:, 2], nz)
     du_box = jnp.zeros((nv, nspinor, nx, ny, nz), dtype=delta_u_G.dtype)
     du_box = du_box.at[:, :, ix, iy, iz].set(delta_u_G)
-    du_wrap_r = jnp.fft.ifftn(du_box, axes=(-3, -2, -1), norm='ortho')
+    du_wrap_r = local_ifftn3(du_box, axes=(-3, -2, -1), norm='ortho')
     # Gauge conversion wrapped → naive.
     if phase_unwrap is not None:
         du_naive_r = phase_unwrap[None, None, :, :, :] * du_wrap_r
@@ -200,7 +201,7 @@ def project_density_to_Gsphere(
     G_out_int: jax.Array,          # (ng_out, 3) int32 — target G' list
 ) -> jax.Array:
     """FFT δn(r) and gather at target G' indices.  Ortho FFT."""
-    box = jnp.fft.fftn(delta_n_r, axes=(-3, -2, -1), norm='ortho')
+    box = local_fftn3(delta_n_r, axes=(-3, -2, -1), norm='ortho')
     return _gather_box_at_G(box[None], G_out_int)[0]
 
 
