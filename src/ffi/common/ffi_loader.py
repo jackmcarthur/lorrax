@@ -224,13 +224,57 @@ def _candidate_paths(platform: str) -> list[Path]:
     return unique
 
 
+class FfiLibraryNotBuilt(FileNotFoundError):
+    """No FFI .so exists for this platform anywhere on the search path.
+
+    This is the LEGITIMATE platform gate: a CPU-only laptop, or a checkout
+    that was never built.  A caller may reasonably skip on it.
+    """
+
+
+class FfiLibraryUnusable(OSError):
+    """An FFI .so WAS located but cannot be used.
+
+    Distinct from :class:`FfiLibraryNotBuilt` on purpose.  "The library is
+    absent" and "the library is present and broken" want opposite
+    responses -- the first is an environment fact, the second is a DEFECT,
+    and collapsing them into one exception is how a broken dependency
+    closure gets reported as a platform skip.  Live example, measured
+    2026-08-06 inside the Shifter container on nid001644: the host .so at
+    src/ffi/cpp/build_host/liblorrax_ffi_host.so exists, but /opt/cray/pe
+    is not bind-mounted, so all three libfftw3*.so.mpi31.3 RPATH deps are
+    "not found" and 19 Tier-1 cells reported themselves as skipped.
+    """
+
+
 def _locate_so(platform: str) -> Path:
+    spec = _PLATFORMS[platform]
+
+    # AN EXPLICIT PIN THAT IS MISSING IS A REFUSAL, NEVER A FALL-THROUGH.
+    # Before 2026-08-06 a set-but-wrong ${env} was simply appended to the
+    # candidate list, so a stale or mistyped pin silently resolved to the
+    # IN-TREE build directory instead -- the run then used a .so nobody
+    # asked for, and the pin that was supposed to control it left no trace.
+    # Same shape as GATES.md's "an explicit request that cannot be honored
+    # refuses rather than silently downgrading" (src/ffi/gate.py).
+    pinned = os.environ.get(spec["env"])
+    if pinned:
+        pin = Path(pinned)
+        if pin.is_file():
+            return pin
+        raise FfiLibraryUnusable(
+            f"{spec['env']} is set to {pinned!r}, which is not a file.  "
+            f"Refusing to fall back to another {spec['so_name']}: an "
+            f"explicit pin that cannot be honored is a refusal, not a hint.  "
+            f"Fix the path, or unset {spec['env']} to search the default "
+            f"locations."
+        )
+
     for c in _candidate_paths(platform):
         if c.is_file():
             return c
-    spec = _PLATFORMS[platform]
     hints = "\n  ".join(str(p) for p in _candidate_paths(platform)) or "(none)"
-    raise FileNotFoundError(
+    raise FfiLibraryNotBuilt(
         f"Could not locate {spec['so_name']} (platform={platform}).  "
         f"Build with:\n    {spec['build_hint']}\n"
         "Paths searched:\n  " + hints
@@ -517,7 +561,18 @@ def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
         import h5py  # noqa: F401
     except Exception:
         pass
-    lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+    try:
+        lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+    except OSError as exc:
+        # The file is THERE; its dependency closure is not resolvable.  Say
+        # so in a way a caller can branch on -- see FfiLibraryUnusable.
+        raise FfiLibraryUnusable(
+            f"{path} exists but could not be loaded: {exc}.  This is a BROKEN "
+            f"BUILD OR ENVIRONMENT, not an absent library: check "
+            f"LD_LIBRARY_PATH and, in a container, that every RPATH "
+            f"directory is actually bind-mounted "
+            f"(ldd {path} | grep 'not found')."
+        ) from exc
     _set_argtypes(lib, platform)
     _register_ffi_targets(lib, platform)
     _LIBS[platform] = lib
