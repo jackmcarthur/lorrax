@@ -113,19 +113,57 @@ reading the last column answers "which layer is broken" from a job log.
 > is an open owner decision; a version gate would make the straddle visible
 > either way.
 >
-> ### Device memory is unmeasurable on Perlmutter GPU, silently
+> **"Just move to a newer container" is not available, and this is the first
+> thing to check before planning around it.** Measured 2026-08-06: **no NVIDIA
+> JAX container exists with both JAX ≥ 0.9 and CUDA 12.** The earliest tag
+> carrying JAX ≥ 0.9 is `26.02-py3`, and it ships **CUDA 13.1** — the
+> CUDA 12 → 13 flip lands three minors *before* JAX reaches 0.9, so the two
+> requirements never overlap in any published image. Satisfying the declared
+> `jax>=0.9.0` on Perlmutter therefore means taking a CUDA major bump with it,
+> against everything staged under `/lorrax_nvhpc` for CUDA 12.9 (§4 of
+> [`ffi_layout.md`](../architecture/ffi_layout.md)). That is a port, not a pin
+> change.
 >
-> `memory_stats()` returns `None` on Perlmutter GPU **under both JAX
-> generations**. This is the **PJRT plugin**, not the JAX version, so
-> upgrading JAX will not restore it. Do not file it under the straddle above.
+> **A version string read from a container is not evidence.** Every container
+> JAX is a dev build that restamps its display string to the *run* date: all
+> ten images probed on 2026-08-06 printed `.dev20260806`, whatever they
+> actually contain. So `jax.__version__` from inside a container tells you
+> when you looked, not what you have. **Read `jax.__version_info__`**, which
+> carries the real tuple, and record that instead — including in any gate or
+> provenance record that currently captures the string.
+>
+> ### `memory_stats()` returns `None` because the modulefile asks for it
+>
+> **Measured across ten container images, 2026-08-06: `memory_stats()` returns
+> a full dict on all ten, including today's `25.04`.** It is not the JAX
+> version and it is not the PJRT plugin. Adding the Perlmutter modulefile's
+> allocator environment is what turns it to `None`.
+>
+> `config/modulefiles/lorrax/0.1.0.lua:130` sets
+> `XLA_PYTHON_CLIENT_ALLOCATOR=platform` on the host and `:175` passes the
+> same value into the container. **§2.1 below already says what `platform`
+> costs** — it is plain `cudaMalloc`, so `bytes_limit` and
+> `peak_bytes_in_use` both read 0 — and `config/README.md:66` already says
+> the value should be `cuda_async`, "**not** `platform`". The modulefile sets
+> the one allocator both documents warn against.
+>
+> So this is **recoverable, and it is a trade rather than a limitation**: the
+> allocator setting buys whatever `platform` is there for and pays for it
+> with every memory report in the codebase (`gw_init`, `gw_output`,
+> `runtime.aot_memory`). Change the allocator and the numbers come back.
 >
 > It fails in the worst available way: the `hasattr` guard passes, the caller
-> receives `None`, and nothing announces it. Every allocator figure in §2.1
-> below was therefore taken on **Frontera** hardware and is carried forward,
-> not re-measured on Perlmutter. (There is also no top-level `jax.memory_stats`
-> symbol on either generation — the `src/` references to that spelling are a
-> docstring and an f-string label, not calls.)
+> receives `None`, and nothing announces it. Until the modulefile changes,
+> the allocator figures in §2.1 are **Frontera** measurements carried
+> forward. (There is also no top-level `jax.memory_stats` symbol on either
+> generation — the `src/` references to that spelling are a docstring and an
+> f-string label, not calls.)
 >
+> *Recorded because this cause was stated wrongly twice before it was
+> measured — first as version-linked, then as a PJRT-plugin limitation that
+> upgrading could not fix. Both were wrong, and the second would have sent
+> someone to rebuild a container. The measurement is ten images, one probe.*
+
 > ### f32 does not mean the same thing on the two machines
 >
 > Unrelated to the straddle, identical under either JAX generation, and worth
@@ -159,6 +197,23 @@ directory.
 
 Either way the key includes **every array shape**, so a new system size always
 misses.
+
+> **On the GPU leg the persistent compile cache is currently dead at P=1, and
+> LORRAX's own patch is what kills it.** Measured 2026-08-06. With
+> `ISDF_JAX_CACHE_DIR` unset, JAX's native cache works and writes entries.
+> With LORRAX's patch armed, `common.jax_compile_cache` reports
+> `enabled=True` and **zero entries are written** — so the run pays full
+> compile time on every launch while the startup block says the cache is on.
+>
+> This is not the container: the native path works in the same image. Any
+> statement anywhere promising compile-cache behaviour on the GPU leg —
+> including the `LORRAX_JAX_CACHE_*` rows in
+> [`env_vars.md`](../dev/env_vars.md) §2b, which describe the multi-process
+> design — is currently describing the CPU leg only.
+>
+> `enabled=True` with zero entries written is the exact shape QUALITY_PATTERNS
+> #7 is about: a status field reporting intent rather than outcome. Treat the
+> entry count, not the flag, as the observable.
 
 ### 2.1 The three allocators
 
