@@ -8,8 +8,16 @@ Two backends, selected by ``backend: SlabIOBackend``:
 
 - :attr:`SlabIOBackend.H5PY_ALLGATHER` — :mod:`file_io._slab_io_allgather`.
   Gather to rank 0 via ``jax.experimental.multihost_utils.process_allgather``,
-  write with plain serial ``h5py``.  Last-resort fallback for systems
-  without parallel HDF5; slow at scale (rank-0 disk bandwidth limit).
+  write with plain serial ``h5py``.  **Reachable at exactly one process**
+  (owner ruling 2026-08-05): at P=1 the gather and the per-rank write are
+  the same operation, above P=1 rank 0 would have to hold the whole global
+  array, which the production envelope makes an OOM rather than a slow
+  path.  Named explicitly it is honoured at P=1 and refused above; left
+  unstated it is refused above P=1.  Both refusals are raised by
+  :func:`_normalize_slab_backend`, so there is no route into this tier
+  above one process — the deck-level check in
+  ``gw_config.resolve_slab_io_backend`` is a second, earlier line, not
+  the only one.
 - :attr:`SlabIOBackend.PHDF5_FFI` — :mod:`file_io._slab_io_ffi`.
   Collective MPI-IO via ``ffi.phdf5``; each rank writes its own
   hyperslab directly.  Lazy import; only loads the FFI when selected.
@@ -73,29 +81,123 @@ def _normalize_slab_backend(backend, use_ffi_io):
     Accepts:
     - ``backend=SlabIOBackend.PHDF5_FFI | H5PY_ALLGATHER`` (preferred)
     - ``use_ffi_io=True | False`` (legacy boolean — coerced)
-    - both ``None``: defaults to allgather
+    - both ``None``: allgather at one process, a REFUSAL above one
 
     The legacy boolean is the only place strings/bools cross over into
     the enum world for SlabIO; everywhere else stays in enum land.
+
+    THE DEFAULT IS GATED BY PROCESS COUNT (2026-08-06).  ``0d8e50c``
+    turned the allgather demotion into a refusal in the config routers
+    and recorded, in its own message, that this function was left
+    pointing the same wrong way: ``SlabIO(path, mesh=mesh)`` with no
+    backend named lands on ``H5PY_ALLGATHER``, which gathers the whole
+    global array onto rank 0, and it does so BELOW the parse-time gate
+    that refuses exactly that.  No in-tree caller took the path — every
+    one of them passes ``backend=`` — so it was latent rather than live,
+    but "no caller does it today" is not a property a default can rely
+    on, and the failure it produces is an OOM minutes later with rc=0
+    behind it.  The refusal is raised HERE, at construction, where the
+    file is about to be opened, so a direct caller hits it in the same
+    place the config path does.
+
+    A NAMED ``backend=H5PY_ALLGATHER`` used to be returned verbatim here
+    at any process count, on the reasoning that the deck-level
+    ``_refuse_explicit_h5py_allgather`` already covered explicit
+    requests.  **It did not cover this one** (found 2026-08-06): that
+    refusal lives in ``gw_config.resolve_slab_io_backend`` and only sees
+    backends chosen from a deck.  A caller that hands the enum straight
+    to this constructor — ``SlabIO(path, mesh=mesh,
+    backend=SlabIOBackend.H5PY_ALLGATHER)``, or anything that defaults a
+    ``slab_io_backend=None`` parameter to the enum before getting here,
+    which ``gw/isdf_fitting.py:230-231`` still does — bypassed it
+    completely and got the rank-0 gather at any P.
+
+    This was the THIRD door found on one rule.  ``0d8e50c`` closed the
+    router demotion, ``252b80d`` closed the unstated default in this
+    function, and each landing was reported as closing the rule.  So the
+    post-check now lives where every route must pass: ``_refuse_or_
+    allgather`` for the unstated default, and here for the named one,
+    both calling the SAME ``_refuse_explicit_h5py_allgather`` the config
+    path calls.  The tier stays honoured by name at ONE process, which
+    is what the single-process tests and fixtures need and the only
+    place "gather to rank 0" and "this rank's tile" are the same bytes.
     """
     from gw.gw_config import SlabIOBackend  # avoid circular import at module load
     if backend is not None:
         if isinstance(backend, SlabIOBackend):
+            if backend is SlabIOBackend.H5PY_ALLGATHER:
+                # Same gate as the unstated default, in the same function,
+                # so no third landing can miss a branch.  Returns the tier
+                # at one process and raises above one.
+                return _refuse_or_allgather(
+                    "backend=SlabIOBackend.H5PY_ALLGATHER", named=True)
             return backend
         raise TypeError(
             f"backend={backend!r} must be SlabIOBackend, "
             f"not {type(backend).__name__}"
         )
     if use_ffi_io is None:
-        return SlabIOBackend.H5PY_ALLGATHER
+        return _refuse_or_allgather("backend=None, use_ffi_io=None")
     # The legacy ``use_ffi_io=True`` boolean predates the host-side
     # PHDF5 backend; on CPU runs the auto-router in
     # ``LorraxConfig.from_input_file`` has already resolved this to a
     # concrete backend enum.  Anyone still calling SlabIO directly with
     # ``use_ffi_io=True`` (a few tests + ad-hoc scripts) intends the
     # GPU FFI; preserve that mapping here.
-    return (SlabIOBackend.PHDF5_FFI if bool(use_ffi_io)
-            else SlabIOBackend.H5PY_ALLGATHER)
+    if bool(use_ffi_io):
+        return SlabIOBackend.PHDF5_FFI
+    return _refuse_or_allgather("use_ffi_io=False")
+
+
+def _refuse_or_allgather(how: str, *, named: bool = False):
+    """H5PY_ALLGATHER at one process; raise above one.  ``how`` names the
+    argument shape that got here, because the repair differs by caller.
+
+    ``named=True`` is the caller who asked for the tier BY NAME rather
+    than falling into it.  Both cases land here on purpose: the rule
+    "reachable at exactly one process and nowhere else" had already been
+    landed twice on two different doors and described as complete both
+    times, so the two doors in this module now share one gate instead of
+    each carrying its own.  A named request gets the config layer's own
+    ``_refuse_explicit_h5py_allgather`` — the SAME text a deck that names
+    the tier gets, because it is the same decision.
+
+    Process count comes from ``gw_config._slab_io_process_count`` — the
+    SAME function the parse-time refusals use, deliberately imported
+    rather than re-derived.  It takes the max of ``jax.process_count()``
+    and the launcher's own world size, because a caller that constructs
+    SlabIO before ``jax.distributed.initialize`` would otherwise see 1 on
+    every rank of a 16-rank job, which is the exact reading that lets the
+    gather through.
+    """
+    from gw.gw_config import (SlabIOBackend, _slab_io_process_count,
+                              _refuse_explicit_h5py_allgather,
+                              _SLAB_IO_DOC, _SLAB_IO_RULE)
+    processes, evidence = _slab_io_process_count()
+    if processes <= 1:
+        return SlabIOBackend.H5PY_ALLGATHER
+    if named:
+        _refuse_explicit_h5py_allgather(
+            key=f"SlabIO({how})", processes=processes, how=evidence)
+    raise ValueError(
+        f"\n*** SlabIO() with no backend named REFUSED at {processes} "
+        f"processes. ***\n"
+        f"  rule    {_SLAB_IO_RULE}\n"
+        f"  got     SlabIO(...) constructed with {how}, at {processes} "
+        f"process(es) ({evidence}).  The unstated default is "
+        f"H5PY_ALLGATHER.\n"
+        f"  wanted  a backend that writes one tile per rank: "
+        f"SlabIOBackend.PHDF5_FFI (GPU or CPU, needs the FFI lib) or "
+        f"SlabIOBackend.PHDF5_HOST (CPU, needs the mpi4py overlay).\n"
+        f"  fix     pass backend=<SlabIOBackend> explicitly.  Callers "
+        f"inside the driver chain should take it from the resolved "
+        f"config (LorraxConfig.slab_io_backend), which has already "
+        f"probed this stack and will name the reason if neither "
+        f"parallel tier is available — do not re-derive it here.\n"
+        f"  escape  backend=SlabIOBackend.H5PY_ALLGATHER is honoured by "
+        f"name at ONE process and refused above one — by this same "
+        f"function since 2026-08-06, not only by the config router.\n"
+        f"  doc     {_SLAB_IO_DOC}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -125,9 +227,11 @@ class SlabIO:
         Required by the FFI backend; the allgather backend ignores
         it (rank-0 always owns the file).
     backend : SlabIOBackend, optional
-        Selects the underlying I/O path.  Defaults to allgather when
-        omitted.  The legacy ``use_ffi_io: bool`` kwarg is also
-        accepted for back-compat.
+        Selects the underlying I/O path.  Omitting it is only legal at
+        ONE process (where it means allgather); above one process an
+        unstated backend is a refusal, not a default — see
+        :func:`_normalize_slab_backend`.  The legacy ``use_ffi_io: bool``
+        kwarg is also accepted for back-compat and gated the same way.
     """
 
     def __init__(

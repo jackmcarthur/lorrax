@@ -346,7 +346,66 @@ def assert_restart_window_matches(filename, band_slices=None,
 
 
 def read_restart_state_from_h5(filename):
-    """Read canonical restart state from HDF5 (restart format v2)."""
+    """Read canonical restart state from HDF5 (restart format v2).
+
+    FULL-FILE reader by construction, and therefore REFUSED above one
+    process.  Every dataset below is read with ``[:]`` into one array on
+    the calling process: ``V_qmunu`` and ``S_qmunu`` are ``(nq, μ, μ)``,
+    ``V0_noG0_munu`` is ``(μ, μ)`` — N_mu²-class objects, whole, per
+    rank, before ``load_restart_state_from_h5`` re-pads them and hands
+    them to ``with_sharding_constraint``.
+
+    It is not dead code and the refusal is not free: MEASURED 2026-08-06
+    (job 56389339, 4 processes, MoS2 6x6 restart, N_mu=1496, nq=36) this
+    path RUNS — ``load_restart_state_from_h5`` returned a correctly
+    sharded ``(36, 1496, 1496)`` in 3.2 s with a per-rank shard of
+    ``(36, 748, 748)`` — at a cost of **+1.53 GiB of VmHWM on every one
+    of the 4 ranks** (0.95 → 2.47 GiB), which is exactly the whole
+    ``V_qmunu`` + whole ``psi_full_y`` each rank read before any
+    sharding happened.  Nothing warned.  That is the failure mode this
+    refusal exists for: the cost is invisible at deck scale and is a
+    guaranteed OOM at the design envelope, where the same ``V_qmunu``
+    (N_mu=20000, nq=64) is **381.47 GiB** per rank (CLAIMS 69) — with
+    P in the thousands, all of it on each one.
+
+    THE REPLACEMENT IS NOT A FUNCTION, and this refusal does not invent
+    one.  ``bse_io._load_ring_subset`` can point at
+    ``load_bse_data_from_restart_sharded`` because BSE built a sharded
+    reader; the GW restart path has none — ``read_restart_state_from_h5``
+    is the only reader of these datasets in ``gw/``.  What exists is the
+    PRODUCER: ``restart = false`` rebuilds the same tensors through the
+    chunked ISDF path, which never materialises an N_mu²-class object on
+    any process.  That is the valid path the doctrine requires to exist,
+    and it is what the message names.  The missing sharded reader is
+    registered in ``KNOWN_LORRAX_ISSUES.md`` (file_io/tagged_arrays), not
+    papered over here.
+    """
+    if int(jax.process_count()) > 1:
+        raise RuntimeError(
+            f"\n*** read_restart_state_from_h5 REFUSED at "
+            f"{int(jax.process_count())} processes. ***\n"
+            f"  rule    no N_mu²-class object is materialised whole on "
+            f"any process (INVARIANTS row 6; owner ruling 2026-08-05).\n"
+            f"  got     the full-file restart reader for {filename} on "
+            f"{int(jax.process_count())} processes.  It reads V_qmunu / "
+            f"S_qmunu / V0_noG0_munu / psi_full_y with [:] — the WHOLE "
+            f"(nq, μ, μ) tensor on EVERY rank — and only then shards.  "
+            f"Measured 2026-08-06 at 4 processes on a 1496-centroid "
+            f"deck: +1.53 GiB VmHWM per rank, silently.  At the "
+            f"envelope (N_mu=20000, nq=64) that same read is 381.47 GiB "
+            f"per rank.\n"
+            f"  wanted  a reader that gives each process only its own "
+            f"(μ, ν) tile.  gw/ does NOT have one yet: this function is "
+            f"the only reader of these datasets, which is why this is a "
+            f"refusal and not a redirect.\n"
+            f"  fix     set 'restart = false' in the deck.  The chunked "
+            f"ISDF path rebuilds V_qmunu / psi_full_y sharded, never "
+            f"holding an N_mu²-class object on one process, and writes "
+            f"the same file through SlabIO.  At one process this reader "
+            f"is still honoured (there, 'whole' and 'this rank's tile' "
+            f"are the same object).\n"
+            f"  doc     KNOWN_LORRAX_ISSUES.md → file_io/tagged_arrays; "
+            f"docs/dev/large_nmu_operation.md")
     with h5py.File(filename, "r") as f:
         if "psi_full_y" not in f:
             raise ValueError(

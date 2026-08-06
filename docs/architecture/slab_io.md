@@ -61,8 +61,7 @@ log as a **failed run that has not noticed yet** — it will either OOM rank
 correct response is to fix the tier-1 probe's stated reason, not to
 proceed.
 
-**Enforced since 2026-08-06** (the note that used to stand here recorded
-this as a known gap). One rule now covers every route into the tier:
+**Enforced since 2026-08-06.** The rule is:
 
 > **`H5PY_ALLGATHER` is reachable at exactly one process, and nowhere
 > else.**
@@ -70,13 +69,43 @@ this as a known gap). One rule now covers every route into the tier:
 At one process the gather and the per-rank write are the *same operation*,
 so there is no contract to violate and nothing to refuse about — laptop
 debugging, `-n 1` smoke runs and the config test suite are untouched, and
-the tier announces itself when selected. Above one process, both routes in
-raise at parse time:
+the tier announces itself when selected.
 
-| route in | at `process_count() == 1` | at `process_count() > 1` |
-|---|---|---|
-| `slab_io=auto`, both parallel tiers declined | selected, announced with the tier-1 reason and the note that the same config refuses at larger P | `_refuse_slab_io_no_parallel_writer` |
-| explicit `slab_io = h5py_allgather`, or deprecated `use_ffi_io = false` | honoured, announced | `_refuse_explicit_h5py_allgather` |
+**It took three landings to actually cover every route, and the first two
+were each reported as complete.** That is worth recording, because the
+shape of the mistake was the same each time: a refusal was added to the
+door the author was standing at, and the rule was then described as
+enforced. `0d8e50c` converted the router demotion; `252b80d` converted the
+*unstated* default in `slab_io._normalize_slab_backend`; and this table's
+predecessor listed only the two DECK routes, which is what made the third
+door invisible — `_normalize_slab_backend` returned a **named**
+`backend=SlabIOBackend.H5PY_ALLGATHER` verbatim at any process count,
+because the deck-level `_refuse_explicit_h5py_allgather` only ever sees a
+backend chosen from a deck.
+
+The census below is therefore of **every** route, deck or not. Anything
+added later must appear here:
+
+| # | route in | at `P == 1` | at `P > 1` | closed by |
+|---|---|---|---|---|
+| A | `SlabIO(..., backend=SlabIOBackend.H5PY_ALLGATHER)` — the enum handed straight to the constructor | honoured | `_refuse_explicit_h5py_allgather` | **2026-08-06 (third landing)** |
+| B | `SlabIO(..., backend=None, use_ffi_io=None)` — the unstated default | `H5PY_ALLGATHER` | `_refuse_or_allgather` | `252b80d` |
+| C | `SlabIO(..., use_ffi_io=False)` | `H5PY_ALLGATHER` | `_refuse_or_allgather` | `252b80d` |
+| D | deck `slab_io = h5py_allgather` | honoured, announced | `_refuse_explicit_h5py_allgather` | `0d8e50c` |
+| E | deck `use_ffi_io = false` (deprecated) | honoured, announced | `_refuse_explicit_h5py_allgather` | `0d8e50c` |
+| F | `slab_io = auto`, both parallel tiers declined | selected, announced with the tier-1 reason | `_refuse_slab_io_no_parallel_writer` | `f5bd23c` / `0accb9b` |
+| G | `gw/isdf_fitting.py:230-231` — a caller's OWN `slab_io_backend=None` parameter defaulted to the enum, then passed down as a named backend | `H5PY_ALLGATHER` | refused via A since 2026-08-06 | **still wrong at source** |
+
+Row G is the one to watch. It is latent — both in-tree callers
+(`gw_init.py:845`, `:1030`) pass `cfg.backend.slab_io` — but a *default*
+that means "gather" is exactly the shape rows B and C had before they were
+fixed, and "no caller does it today" is not a property a default can rely
+on. With A closed it now refuses instead of gathering, which is the right
+failure, but the default should say "the caller must state it".
+
+Stale prose, not a door: `file_io/sigma_output.py:288` still documents
+`H5PY_ALLGATHER` as the default for `write_sigma_omega_h5`; since
+`252b80d` a `backend=None` there refuses above one process (row B).
 
 Both refusals live in `gw/gw_config.py`, both always raise, and both sit
 *after* the whole precedence chain, so no deck branch escapes them.
@@ -365,6 +394,131 @@ Stripe layouts were verified applied, not assumed — `lfs getstripe -c -S`
 on each swept file returned exactly the requested count and size, so the
 `LORRAX_PHDF5_STRIPE_*` hints do reach Lustre through ROMIO.
 
+### Striping is not a constant: the stripe count is the aggregator count
+
+Everything above this heading was measured at **16 ranks**, where the old
+default of `16 × 1 MiB` happens to equal `nranks × 1 MiB`. That coincidence
+is what made a constant look like a tuning.
+
+The mechanism, **read back from ROMIO rather than assumed**
+(`LORRAX_PHDF5_DUMP_HINTS=1`, which dumps `MPI_File_get_info` after
+`H5Fcreate` — the hints ROMIO *retained*, not the ones we asked for):
+
+| requested `striping_factor` | 4 ranks → `cb_nodes` | 16 ranks → `cb_nodes` |
+|---|---|---|
+| 1 | — | 1 |
+| 4 | **4** | 4 |
+| 16 | **4** | 16 |
+| 64 | — | 16 |
+| 128 | **4** | 16 |
+| 366 (`-1`, every OST) | — | 16 |
+
+`cb_nodes = min(striping_factor, nranks)`, exactly, at every point measured
+— and we never set `cb_nodes` ourselves (`romio_cb_write = automatic`,
+`cb_config_list = *:*` in the same dump). **So the stripe count IS the
+collective-buffering aggregator count.** A fixed 16 pins `cb_nodes = 16`
+forever, and every rank past the sixteenth is a rank that does not
+aggregate. Per-rank throughput rolls over just past 16 ranks for that
+reason and no other.
+
+Write bandwidth, GiB/s aggregate, `/pscratch`, phase-separated harness:
+
+| ranks | payload | `16 × 1 MiB` | `nranks` stripes | gain | artifact |
+|---|---|---|---|---|---|
+| 4 | 2.00 GiB | 0.803 | **0.873** (4 × 1M) | +8.6 % | `w_P4.json` |
+| 4 | 2.00 GiB | 0.813 | **0.906** (4 × 1M) | +11 % | `w_SC4.json` |
+| 16 | 8.00 GiB | 3.152 | 3.152 (16 × 1M) | *null control* | `w_SC16.json` |
+| 64 | 32.00 GiB | 5.189 | **10.630** (64 × 4M) | +105 % | `w_SC64.json` |
+| 64 | **381.47 GiB** | 7.403 | **13.222** (64 × 4M) | **+79 %** | `w_EV64.json` |
+| 100 | 50.00 GiB | 7.872 | **15.216** (100 × 4M) | +93 % | `w_R100.json` |
+
+The 16-rank row is the **null control**, not a win: there the two policies
+are literally the same configuration, and a policy that changed that row
+would be a policy with a bug. The 381 GiB row is the real envelope payload
+— `V_qmunu`, `(nq=64, 20000, 20000)` complex128 — where the old default
+leaves **44 % of the write bandwidth on the floor**. `stripe = nranks` won
+or tied at every rank count measured.
+
+### The read advantage in the table above was the page cache
+
+The `16 × 4M → 16 × 1M` change was justified partly on a **76 % read
+improvement**. That number was warm: `slabio_sweep.py` read the file it had
+just written, in the same process, so every byte came from the writing
+node's page cache. A production restart reads files nobody just wrote.
+
+Re-measured with write and read as separate `--phase` invocations on
+**disjoint node sets** (write `nid003837`, read `nid003840`; `lctl` is
+absent from the compute image and `drop_caches` needs root, so a disjoint
+node set is the only honest cold-read instrument here):
+
+| 4 ranks, 2.00 GiB | warm read | cold read | write |
+|---|---|---|---|
+| `16 × 1 MiB` | 2.29 | 0.932 | 0.803 |
+| `4 × 1 MiB` (policy) | — | 0.932 | 0.873 |
+
+Cold read ≈ write throughput, and the layout advantage shrinks from 76 % to
+**5.7 %**. Reads are not where the lever is. **Any benchmark on this
+filesystem must use disjoint node sets or it is measuring the cache**, and
+a read number quoted without its node sets is not a measurement.
+
+### What the policy is
+
+`file_io._slab_io_ffi._stripe_policy(nranks)` — one pure function of the
+rank count, no env, no MPI, no filesystem, so it is testable at rank counts
+no allocation on this machine can reach:
+
+```
+striping_factor = min(max(nranks, 4), 128)
+striping_unit   = the power of two NEAREST IN LOG2 to (nranks/16) MiB,
+                  clamped to [1 MiB, 4 MiB]
+```
+
+which is `1 MiB` below 22.6 ranks, `2 MiB` to 45.3, `4 MiB` above.
+
+**The unit is a ramp, not a step at 64.** Both ends are measured
+(`16 × 4M` = 2.07 vs `16 × 1M` = 2.93 at 16 ranks; `64 × 1M` = 7.068 vs
+`64 × 4M` = 10.630 at 64), and between them the rule is the geometric
+interpolation those two anchors imply, with no free parameter to pick.
+It has to be argued rather than measured, because **the midpoint of that
+range cannot be run here**: `resolve_mesh` requires a perfect-square device
+count, so 32 ranks is not a legal geometry, and `16 < n < 64` contains no
+power-of-two rank count that is also a legal mesh. The legal points in the
+gap are 25, 36 and 49.
+
+**4 MiB is a ceiling, not a trend to extrapolate.** The per-rank tile knee
+is 4 MiB — at 16 ranks, tiles of 0.06 / 0.25 / 1 / 4 / 16 MiB gave
+0.126 / 0.609 / 1.779 / 3.165 / 3.551 GiB/s: flat above 4 MiB, a cliff
+below (`w_TS16.json`). `V_qmunu` at `N_mu = 20000` on 1024 ranks is
+**~6.1 MiB per rank**, only 1.5× above that knee, so the envelope sits on
+the edge of the cliff and a stripe unit above the per-rank tile would
+starve aggregators.
+
+**`-1` is refused, not passed through.** It reads like a maximum and
+measures like a failure: on `/pscratch` (370 OSTs) it expands to 366
+stripes and gave **0.105 GiB/s** at 64 ranks / 32 GiB and 1.118 at 16 ranks
+/ 8 GiB, against 10.63 and 3.15 for the policy. Striping across every OST
+is the maximum-*contention* layout, not the maximum-bandwidth one.
+
+**Layouts are verified granted, not assumed.** `lfs getstripe -c -S` from a
+login node (the compute image has no `lfs`) returned exactly the requested
+`4 × 1M`, `16 × 1M` and `128 × 4M` on the files this branch wrote.
+
+#### The upper clamp is NOT verified in-policy {#clamp-open}
+
+`striping_factor = 128` is emitted only at `nranks >= 128`, and **no run at
+that scale has been made**: the interactive QOS maximum is 4 nodes / 16
+GPUs, so the largest legal mesh reachable here is 16 ranks. What *is*
+measured is that 128 stripes behave badly when the rank count is *below*
+128 — 1.014 GiB/s at 64 ranks and 0.825 at 100 ranks with `128 × 4M`,
+against 10.63 and 15.22 for `nranks × 4M`, and 0.501 vs 0.869 at 4 ranks.
+Those points are **off-policy** (the policy never emits a count above
+`nranks`), so they do not condemn the clamp — but they do mean the clamp
+endpoint has never been observed in the regime where the policy actually
+uses it, and 128 is anomalous even among its neighbours: at 100 ranks
+`sf = 150` and `sf = 200` measured 14.07 and 12.96 while `sf = 128`
+measured 0.416. **Measure `nranks = 128` (or 121, the nearest legal mesh)
+before an envelope run leans on it.**
+
 ---
 
 ## Defaults {#defaults}
@@ -374,33 +528,41 @@ on each swept file returned exactly the requested count and size, so the
 | `LORRAX_PHDF5_COLLECTIVE_WRITES` | `1` | 29× cliff at N4 when off; the asymmetry decides |
 | `LORRAX_PHDF5_INDEPENDENT` (reads) | `0` (collective) | 1.84× at N4; read evidence is cache-warm, so no change on it |
 | `LORRAX_PHDF5_COLL_META` | `0` | within noise both geometries — keep the simpler one |
-| `LORRAX_PHDF5_STRIPE_COUNT` | `16` | 8 wins at N1 and loses at N4; 32 the reverse; 16 wins both. **Superseded in principle, not yet in this branch** — see below |
-| `LORRAX_PHDF5_STRIPE_SIZE_FS` | `1M` | **changed from `4M`** — the only layout that wins at both geometries (see below) |
+| `LORRAX_PHDF5_STRIPE_COUNT` | **`nranks`, clamped to [4, 128]** | **changed from `16`** — the stripe count is the aggregator count (`cb_nodes = min(striping_factor, nranks)`, read back from ROMIO); a constant pins the aggregator count. +79 % on the 381 GiB envelope payload at 64 ranks. `-1` is refused |
+| `LORRAX_PHDF5_STRIPE_SIZE_FS` | **`1M`/`2M`/`4M` by rank count** | **now a ramp** — 1 MiB at <=16 ranks, 4 MiB at >=64, the power of two nearest in log2 to `nranks/16` MiB between; both ends measured, the midpoint is not runnable (32 ranks is not a legal mesh) |
 | `LORRAX_PHDF5_ALIGN_MB` | `4` | unchanged; `4`/`1`/`0` all inside repeat noise, so not worth a second knob to keep in sync |
 | `LORRAX_PHDF5_CB_*` | unset | hand-set hints cost 30 % at N4 |
 | `lxrun` pre-stripe | `-c 16 -S 1M` | same basis as `STRIPE_SIZE_FS` |
 
-Everything except the stripe size is the configuration that was already
-in the tree; the sweep is its measured justification rather than a change.
+Both striping rows are resolved by ONE pure function, `file_io._slab_io_ffi._stripe_policy(nranks)`, and an explicit `LORRAX_PHDF5_STRIPE_*` still wins over it. The FFI writer's hints are built in C++ whose only input is `getenv`, so the resolved values are exported back into `os.environ` before `open_file` — which is why a run log's environment remains a complete description of the layout, and why the `lfs getstripe` readback means anything.
 
-> **A fixed stripe count of 16 is the wrong shape, and the replacement is
-> approved but NOT in this branch.** The reason 16 wins the sweep above is
-> that the sweep ran at 4 and 16 ranks. ROMIO sets
+> **Why the stripe count is `nranks` and not a constant.** The reason 16
+> won the older sweep is that the sweep ran at 4 and 16 ranks. ROMIO sets
 > `cb_nodes = min(striping_factor, nranks)`, so **the stripe count IS the
-> aggregator count** — pinning it to 16 caps aggregation at 16 however many
+> aggregator count** -- pinning it to 16 caps aggregation at 16 however many
 > ranks write, which is exactly backwards for a design envelope of hundreds.
 > The owner approved `stripe_count = nranks` on 2026-08-05.
 >
-> **Status, verified 2026-08-06:** it is implemented on
-> `feat/slab-io-stripe-nranks-2026-08-06` (`e5c9618`), which is **not an
-> ancestor of this branch**. There, `_stripe_policy(nranks)` clamps to
-> [4, 128], ramps the unit 1 → 4 MiB, and **refuses a negative count**
+> **Status, verified 2026-08-06 in `integration/2026-08-06`:** implemented
+> and IN this tree, via `feat/slab-io-stripe-nranks-2026-08-06` (`e5c9618`,
+> `252b80d`), which reaches here as an ancestor of
+> `feat/bse-slabio-2026-08-06`. `_stripe_policy(nranks)` clamps the count to
+> [4, 128], ramps the unit 1 -> 4 MiB, and **refuses a negative count**
 > (a negative `striping_factor` means "every OST on the filesystem", the
-> maximum-contention layout). Note that even on that branch the policy is
-> Python-side only: `context.cc:463` is still the literal `"16"`.
+> maximum-contention layout). The measurements behind it are recorded above
+> `_stripe_policy` in `src/file_io/_slab_io_ffi.py`.
 >
-> Until that lands, both sites in this branch default to 16 and the numbers
-> in the table above are the ones that apply.
+> **The policy is Python-side, and that is sufficient -- but read why.**
+> `context.cc:463` is still the literal `"16"`. That literal is the fallback
+> for an UNSET `LORRAX_PHDF5_STRIPE_COUNT`, and on every LORRAX path the
+> variable is set before C++ can read it: `_FfiBackend.__init__` calls
+> `_export_striping_env()` immediately before `_open_file()`, and
+> `_open_file` is the call in which `context.cc` builds the `MPI_Info` and
+> `H5Fcreate` applies the layout. So the two writers agree by construction,
+> and the run log's environment stays a complete description of the layout.
+> The residual trap is narrow and real: a caller that reaches the phdf5 FFI
+> **without** going through `_FfiBackend` gets 16 stripes and no warning.
+> Anything added on that path must export the policy first.
 
 The stripe-size choice, across both geometries (GiB/s write / read):
 

@@ -496,7 +496,7 @@ def _resolve_munu_reader(
     dset: h5py.Dataset,
     kgrid: Optional[tuple[int, int, int]] = None,
 ):
-    """Resolve ``(n_rmu, n_rnu, nkx, nky, nkz, read_slab)`` for a V/W μν dataset.
+    """Resolve ``(n_rmu, n_rnu, nkx, nky, nkz, read_slab, read_q_slab)``.
 
     Single source of the on-disk layout shim both sharded readers need.
     Handles three layouts:
@@ -509,6 +509,15 @@ def _resolve_munu_reader(
     the dataset must carry a ``'kgrid'`` attribute).  ``read_slab(mu0, mu1,
     nu0, nu1)`` returns the ``(μ, ν, nkx, nky, nkz)`` slab for that μ/ν block;
     q=0 is the ``(0, 0, 0)`` k-slice.
+
+    ``read_q_slab(q, mu0, mu1, nu0, nu1)`` returns the ``(μ, ν)`` tile at ONE
+    flat q index.  It exists because ``read_slab`` reads the FULL q axis: a
+    consumer that wants a single q (``_read_vq0_sharded`` wants only q=0) went
+    through ``read_slab(...)[:, :, 0, 0, 0]`` and paid ``nq``× the bytes it
+    used — 36× on the nq=36 MoS2 6×6 deck, 144× on a 12×12 grid, and the
+    discarded remainder is exactly as large as the whole ``W_q`` tile the same
+    loader reads next.  Element-for-element the two routes select the same
+    numbers; this one just does not read the other q's.
     """
     if dset.ndim == 8:
         n_rmu = int(dset.shape[6])
@@ -516,19 +525,28 @@ def _resolve_munu_reader(
         nkx, nky, nkz = (int(s) for s in dset.shape[3:6])
         read_slab = lambda mu0, mu1, nu0, nu1: np.transpose(
             dset[0, 0, 0, :, :, :, mu0:mu1, nu0:nu1], (3, 4, 0, 1, 2))
-        return n_rmu, n_rnu, nkx, nky, nkz, read_slab
+
+        def read_q_slab(q, mu0, mu1, nu0, nu1, _n=(nkx, nky, nkz)):
+            qx, qy, qz = np.unravel_index(int(q), _n)
+            return np.asarray(dset[0, 0, 0, qx, qy, qz, mu0:mu1, nu0:nu1])
+
+        return n_rmu, n_rnu, nkx, nky, nkz, read_slab, read_q_slab
     if dset.ndim == 6:
         n_rmu = int(dset.shape[-2])
         n_rnu = int(dset.shape[-1])
         nq = int(dset.shape[3])
         _flat = lambda mu0, mu1, nu0, nu1: np.asarray(
             dset[0, 0, 0, :, mu0:mu1, nu0:nu1])
+        _flat_q = lambda q, mu0, mu1, nu0, nu1: np.asarray(
+            dset[0, 0, 0, int(q), mu0:mu1, nu0:nu1])
     else:  # 3-D flat-q
         n_rmu = int(dset.shape[-2])
         n_rnu = int(dset.shape[-1])
         nq = int(dset.shape[0])
         _flat = lambda mu0, mu1, nu0, nu1: np.asarray(
             dset[:, mu0:mu1, nu0:nu1])
+        _flat_q = lambda q, mu0, mu1, nu0, nu1: np.asarray(
+            dset[int(q), mu0:mu1, nu0:nu1])
     if kgrid is not None:
         nkx, nky, nkz = (int(v) for v in kgrid)
     elif 'kgrid' in dset.attrs:
@@ -545,7 +563,7 @@ def _resolve_munu_reader(
         _flat(mu0, mu1, nu0, nu1)
         .reshape(nkx, nky, nkz, mu1 - mu0, nu1 - nu0)
         .transpose(3, 4, 0, 1, 2))
-    return n_rmu, n_rnu, nkx, nky, nkz, read_slab
+    return n_rmu, n_rnu, nkx, nky, nkz, read_slab, _flat_q
 
 
 def _read_vq0_sharded(
@@ -562,7 +580,8 @@ def _read_vq0_sharded(
         mesh_xy, origin="bse_io._read_vq0_sharded")
     local_x, local_y = _get_local_axis_coords(local_coords)
     _assert_local_block(local_coords, local_x, local_y)
-    n_rmu, n_rnu, _nkx, _nky, _nkz, read_slab = _resolve_munu_reader(dset, kgrid=kgrid)
+    (n_rmu, n_rnu, _nkx, _nky, _nkz,
+     _read_slab, read_q_slab) = _resolve_munu_reader(dset, kgrid=kgrid)
 
     local_mu = mu_per_x * len(local_x)
     local_nu = nu_per_y * len(local_y)
@@ -578,8 +597,10 @@ def _read_vq0_sharded(
             nu_end = min(nu_start + nu_per_y, n_rnu)
             if nu_start >= n_rnu:
                 continue
-            # q=0 is the (0, 0, 0) k-slice of the normalized (μ, ν, k...) slab.
-            slab = read_slab(mu_start, mu_end, nu_start, nu_end)[:, :, 0, 0, 0]
+            # q=0 only.  ``read_q_slab`` hyperslabs the single q on DISK; the
+            # old ``read_slab(...)[:, :, 0, 0, 0]`` read all nq and threw
+            # nq-1 of them away (see _resolve_munu_reader).  Same elements.
+            slab = read_q_slab(0, mu_start, mu_end, nu_start, nu_end)
             if slab.shape[0] < mu_per_x or slab.shape[1] < nu_per_y:
                 pad_mu = mu_per_x - slab.shape[0]
                 pad_nu = nu_per_y - slab.shape[1]
@@ -614,7 +635,8 @@ def _read_wq_sharded(
     # Layout shim (8-D / 6-D / 3-D-flat-q) is single-sourced in
     # ``_resolve_munu_reader``.  Internal BSE work below stays in the
     # ``(μ, μ, nkx, nky, nkz)`` form the reader already produces.
-    n_rmu, n_rnu, nkx, nky, nkz, _read_munu_slab = _resolve_munu_reader(dset, kgrid=kgrid)
+    (n_rmu, n_rnu, nkx, nky, nkz,
+     _read_munu_slab, _read_q_slab) = _resolve_munu_reader(dset, kgrid=kgrid)
 
     local_mu = mu_per_x * len(local_x)
     local_nu = nu_per_y * len(local_y)
@@ -646,6 +668,311 @@ def _read_wq_sharded(
     if trim and (global_shape[0] > n_rmu or global_shape[1] > n_rnu):
         w_global = w_global[:n_rmu, :n_rnu, :, :, :]
     return w_global
+
+
+# ---------------------------------------------------------------------------
+# SlabIO transport for the sharded BSE loader
+# ---------------------------------------------------------------------------
+# The readers above are memory-correct — every one of them h5py-hyperslabs
+# only this rank's (μ, ν) tile and there is no allgather anywhere — and they
+# are also ~30x slower than the transport the rest of the tree certified.
+# MEASURED (CLAIMS 76, job 56389339): 1.25 GiB of restart tensors in 7.4 s at
+# P=4 is 0.17 GiB/s, against the 2.919 GiB/s CLAIMS 69 measured for the phdf5
+# tile path on a cold disjoint-node read at 16 ranks.  The gap is not the
+# hyperslab arithmetic, it is serial POSIX h5py: one rank's W_q tile is
+# nq × (μ/px) × (ν/py), i.e. nq × μ/px separate short row-runs of the file,
+# issued one at a time with no collective buffering and no aggregators.
+#
+# So the tile geometry below is DELIBERATELY the same tile geometry the
+# serial readers compute.  The memory contract is unchanged and is the point:
+# per-rank tiles, nothing larger than one rank's tile materialised anywhere,
+# no allgather (an allgather is a refusal, not a fallback — owner ruling
+# 2026-08-05).  What changes is only who moves the bytes.
+#
+# The serial readers stay, and stay reachable: SlabIO's parallel tiers need
+# the phdf5 FFI (or the mpi4py overlay), and where neither is available the
+# config router refuses above one process and hands back H5PY_ALLGATHER at
+# one process.  Routing a single-process BSE through the allgather backend
+# would buy nothing (at P=1 "gather to rank 0" and "this rank's tile" are the
+# same bytes) and would put a second transport under the tests, so the
+# SlabIO path is taken for the PHDF5 tiers only.
+
+
+def _bse_slab_io_backend(input_file: Optional[str], log_fn=print):
+    """Resolve the SlabIO backend for a BSE deck, or ``None``.
+
+    ``None`` means "stay on the serial h5py readers": either there is no
+    deck to ask (``input_file=None`` — several BSE entry points and every
+    unit test call the loader with a bare restart path), or the resolved
+    tier is the allgather one, which this module does not use (see the
+    block comment above).
+
+    The decision itself is NOT made here.  ``gw_config.
+    resolve_slab_io_backend`` is the single source — the same function
+    ``LorraxConfig.from_input_file`` uses — because ``SlabIO``'s own
+    refusal tells driver-chain callers to take the backend from the
+    resolved config and not re-derive it, and a second copy of the
+    precedence chain in ``bse/`` is exactly the drift that warning is
+    about.
+
+    An UNREADABLE DECK is not fatal — it logs and returns ``None``, and
+    the loader runs on the serial readers as it always has, because
+    those readers are correct and a BSE run should not die over a
+    transport preference it could not look up.
+
+    **A REFUSAL FROM THE RESOLVER IS NOT CAUGHT.**  That distinction is
+    the whole of the error handling here.  `resolve_slab_io_backend`
+    raises for exactly two reasons — a deck naming `h5py_allgather`
+    above one process, and `slab_io=auto` finding no parallel tier above
+    one process — and both are deliberate, owner-ruled refusals with
+    repair instructions in them.  Catching them would turn the tree's
+    loudest transport rule into a silent fall-through in `bse/`, which
+    is the antipattern the rule itself exists to delete.  The BSE run
+    stops, exactly as the GW driver stops on the same deck.
+    """
+    if input_file is None or not os.path.isfile(input_file):
+        return None
+    from gw.gw_config import (read_lorrax_input, resolve_slab_io_backend,
+                              SlabIOBackend)
+    try:
+        # ``read_lorrax_input`` already fills every key from ``_DEFAULTS``,
+        # so an absent ``slab_io`` arrives here as "auto" — the same value
+        # ``from_input_file`` would have seen.
+        params = read_lorrax_input(input_file)
+    except Exception as exc:                       # noqa: BLE001
+        log_fn(f"BSE-sharded: cannot read {input_file} "
+               f"({type(exc).__name__}: {exc}); reading the restart with "
+               f"the serial h5py tile readers (memory-correct; measured "
+               f"~2x slower than the SlabIO path on Lustre at 16 ranks, "
+               f"CLAIMS 128).")
+        return None
+    backend = resolve_slab_io_backend(
+        params.get("slab_io", "auto"), params.get("use_ffi_io"),
+        print_fn=log_fn)
+    if backend is SlabIOBackend.H5PY_ALLGATHER:
+        return None
+    return backend
+
+
+class _MunuSlabPlan:
+    """Where (μ, ν) and q live in a V/W dataset, for a SlabIO request.
+
+    The three on-disk layouts ``_resolve_munu_reader`` shims are the same
+    three here; this class states them as (offset, shape, spec) instead
+    of as a closure over ``dset``, because that is what
+    ``SlabIO.read_slab`` takes.  ``_resolve_munu_reader`` stays the
+    single source for the serial path and for the layout FACTS (which
+    axes, which order); this only re-expresses them.
+
+    * 8-D legacy ``(1, npol, npol, nkx, nky, nkz, μ, ν)``
+    * 6-D transitional ``(1, npol, npol, nq, μ, ν)``
+    * 3-D flat-q ``(nq, μ, ν)``
+    """
+
+    def __init__(self, ds_shape, kgrid):
+        self.ds_shape = tuple(int(s) for s in ds_shape)
+        self.ndim = len(self.ds_shape)
+        nkx, nky, nkz = (int(v) for v in kgrid)
+        self.kgrid = (nkx, nky, nkz)
+        self.nq = nkx * nky * nkz
+        if self.ndim == 8:
+            self.lead = 3
+            self.q_axes = 3                      # (nkx, nky, nkz) separately
+            self.q_extent = tuple(self.ds_shape[3:6])
+            if self.q_extent != self.kgrid:
+                raise ValueError(
+                    f"_MunuSlabPlan: 8-D dataset k-axes {self.q_extent} "
+                    f"disagree with kgrid {self.kgrid}")
+        elif self.ndim == 6:
+            self.lead = 3
+            self.q_axes = 1
+            self.q_extent = (int(self.ds_shape[3]),)
+        elif self.ndim == 3:
+            self.lead = 0
+            self.q_axes = 1
+            self.q_extent = (int(self.ds_shape[0]),)
+        else:
+            raise ValueError(
+                f"_MunuSlabPlan: unsupported V/W dataset rank {self.ndim} "
+                f"(shape {self.ds_shape}); expected 8-D, 6-D or 3-D flat-q.")
+        if self.q_axes == 1 and int(self.q_extent[0]) != self.nq:
+            raise ValueError(
+                f"_MunuSlabPlan: kgrid {self.kgrid} (nq={self.nq}) "
+                f"disagrees with the dataset q extent {self.q_extent[0]}")
+        self.n_rmu = int(self.ds_shape[-2])
+        self.n_rnu = int(self.ds_shape[-1])
+
+    def request(self, n_rmu_pad, q_index=None):
+        """``(offset, shape, partition_spec)`` for one read_slab call.
+
+        ``q_index`` selects a single FLAT q (the ``V_q0`` case, q=0);
+        ``None`` asks for every q, which is what the ``W_q`` consumer
+        needs.  Leading layout axes are always taken at index 0 with
+        extent 1 — the serial readers' ``[0, 0, 0]``.
+        """
+        offset = [0] * self.ndim
+        shape = [1] * self.lead
+        if q_index is None:
+            shape.extend(int(v) for v in self.q_extent)
+        elif self.q_axes == 3:
+            qx, qy, qz = (int(v) for v in
+                          np.unravel_index(int(q_index), self.kgrid))
+            offset[3], offset[4], offset[5] = qx, qy, qz
+            shape.extend((1, 1, 1))
+        else:
+            offset[self.lead] = int(q_index)
+            shape.append(1)
+        shape.extend((int(n_rmu_pad), int(n_rmu_pad)))
+        spec = P(*([None] * (len(shape) - 2) + ["x", "y"]))
+        return tuple(offset), tuple(shape), spec
+
+
+def _slabio_read_munu(io, name, plan, mesh_xy, n_rmu_pad, *,
+                      q_index=None, dtype=np.complex128):
+    """Read a V/W dataset through SlabIO into the BSE consumer layout.
+
+    Returns ``(μ_pad, ν_pad)`` when ``q_index`` is given and
+    ``(μ_pad, ν_pad, nkx, nky, nkz)`` otherwise — byte-for-byte the
+    shapes ``_read_vq0_sharded`` / ``_read_wq_sharded`` return at
+    ``trim=False``, with the same P('x','y',...) sharding.
+
+    The on-disk order is q-major and the consumer wants μ-major, so the
+    result is transposed.  That transpose is LOCAL: μ and ν stay on
+    ('x', 'y') across it and every other axis is replicated, so GSPMD
+    has nothing to communicate.  It is pinned with an explicit
+    ``out_shardings`` rather than left to inference — an inferred
+    resharding here would be a silent all-to-all on an N_mu²-class
+    object, which is the one thing this loader must never do.  Its
+    transient is one more per-rank tile, exactly what the serial
+    readers' host ``local_w`` buffer already cost.
+    """
+    offset, shape, spec = plan.request(n_rmu_pad, q_index=q_index)
+    arr = io.read_slab(name, shape=shape, dtype=dtype, offset=offset,
+                       mesh=mesh_xy, partition_spec=spec)
+    nkx, nky, nkz = plan.kgrid
+    if q_index is not None:
+        out_spec = P("x", "y")
+        target = (int(n_rmu_pad), int(n_rmu_pad))
+        fn = lambda a: jnp.reshape(a, target)
+    else:
+        out_spec = P("x", "y", None, None, None)
+        mid = (nkx, nky, nkz, int(n_rmu_pad), int(n_rmu_pad))
+        fn = lambda a: jnp.transpose(jnp.reshape(a, mid), (3, 4, 0, 1, 2))
+    return jax.jit(
+        fn, out_shardings=NamedSharding(mesh_xy, out_spec))(arr)
+
+
+def _slabio_read_psi(io, name, psi_shape, band_indices, axis, mesh_xy,
+                     n_rmu_pad, *, dtype=np.complex128):
+    """Read ψ's band window through SlabIO, μ on ``axis``.
+
+    Returns ``(nk, nb_sel, nspinor, μ_pad)`` with
+    ``P(None, None, None, axis)`` — what ``_read_psi_mu_sharded``
+    returns at ``trim=False``.
+
+    ``band_indices`` must be a CONTIGUOUS ascending range; the caller's
+    two windows (``arange(n_occ-n_val, n_occ)`` and
+    ``arange(n_occ, n_occ+n_cond)``) always are.  A hyperslab is an
+    offset and an extent, so a gap would silently read the wrong bands —
+    hence a refusal rather than an assumption.  Returning ``None``
+    instead would put the choice of transport inside a loop over band
+    windows; a caller that ever needs a ragged window should ask for the
+    serial reader for the whole load.
+    """
+    b = np.asarray(band_indices)
+    if b.size == 0 or not np.array_equal(b, np.arange(int(b[0]),
+                                                      int(b[0]) + b.size)):
+        raise ValueError(
+            f"_slabio_read_psi: band_indices must be a contiguous ascending "
+            f"range to become an HDF5 hyperslab; got {b[:8]}… (size {b.size}).")
+    nk, _nb, nspinor = (int(psi_shape[0]), int(psi_shape[1]),
+                        int(psi_shape[2]))
+    offset = (0, int(b[0]), 0, 0)
+    shape = (nk, int(b.size), nspinor, int(n_rmu_pad))
+    spec = P(None, None, None, axis)
+    return io.read_slab(name, shape=shape, dtype=dtype, offset=offset,
+                        mesh=mesh_xy, partition_spec=spec)
+
+
+def _read_bse_tensors(
+    restart_file: str,
+    *,
+    vq_key: str,
+    wq_key: str,
+    vq_shape,
+    wq_shape,
+    psi_shape,
+    val_indices,
+    cond_indices,
+    mu_per_x: int,
+    nu_per_y: int,
+    n_rmu_pad: int,
+    mesh_xy: Mesh,
+    kgrid,
+    load_v_full: bool,
+    input_file: Optional[str],
+    log_fn=print,
+):
+    """``(psi_v_X, psi_c_X, V_q0, W_q, V_q_full)`` — one transport decision.
+
+    THE seam between "which bytes" and "how they move".  Both branches
+    below return the identical arrays: identical global shapes,
+    identical PartitionSpecs, identical per-rank tiles, and the same
+    elements selected from the same datasets.  The parity bar for the
+    SlabIO branch is therefore BIT EQUALITY, not a tolerance — it is an
+    element-SELECTION change, not a reduction-order one, so neither
+    CLAIMS 71's padding gauge nor any eps floor applies (and the ~1.5-eps
+    "sharded/unsharded floor" quoted in earlier sessions does not
+    reproduce: sharding here is bit-exact).
+
+    The transport choice is per-rank but is a pure function of the deck
+    file and the platform probes, so every rank reaches the same answer
+    and the collective SlabIO open is well-formed.  That is the same
+    contract ``LorraxConfig.from_input_file`` already relies on for the
+    GW driver; it is stated here because a divergence would present as a
+    hang inside ``H5Fopen`` rather than as an error.
+    """
+    backend = _bse_slab_io_backend(input_file, log_fn=log_fn)
+    if backend is None:
+        with h5py.File(restart_file, "r") as f:
+            vq_dset = f[vq_key]
+            wq_dset = f[wq_key]
+            psi_dset = f["psi_full_y"]
+            psi_v_X = _read_psi_mu_sharded(psi_dset, val_indices, mu_per_x,
+                                           "x", mesh_xy, n_rmu_pad, trim=False)
+            psi_c_X = _read_psi_mu_sharded(psi_dset, cond_indices, mu_per_x,
+                                           "x", mesh_xy, n_rmu_pad, trim=False)
+            V_q0 = _read_vq0_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy,
+                                     n_rmu_pad, trim=False, kgrid=kgrid)
+            W_q = _read_wq_sharded(wq_dset, mu_per_x, nu_per_y, mesh_xy,
+                                   n_rmu_pad, trim=False, kgrid=kgrid)
+            # Full-q exchange tensor for the finite-q W_q resolvent: read
+            # every V tile with the SAME (μ, ν, nkx, nky, nkz) reader as
+            # W_q (no head; head is a q=0-only rank-1 piece).
+            # V_q_full[:, :, 0, 0, 0] == V_q0 (the head-less q=0 read) — a
+            # self-check the finite-q harness asserts.
+            V_q_full = (_read_wq_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy,
+                                         n_rmu_pad, trim=False, kgrid=kgrid)
+                        if load_v_full else None)
+        return psi_v_X, psi_c_X, V_q0, W_q, V_q_full
+
+    from file_io.slab_io import SlabIO
+    vq_plan = _MunuSlabPlan(vq_shape, kgrid)
+    wq_plan = _MunuSlabPlan(wq_shape, kgrid)
+    log_fn(f"BSE-sharded: restart tensors via SlabIO backend="
+           f"{getattr(backend, 'value', backend)} "
+           f"({os.path.basename(restart_file)})")
+    with SlabIO(restart_file, mode="r", mesh=mesh_xy, backend=backend) as io:
+        psi_v_X = _slabio_read_psi(io, "psi_full_y", psi_shape, val_indices,
+                                   "x", mesh_xy, n_rmu_pad)
+        psi_c_X = _slabio_read_psi(io, "psi_full_y", psi_shape, cond_indices,
+                                   "x", mesh_xy, n_rmu_pad)
+        V_q0 = _slabio_read_munu(io, vq_key, vq_plan, mesh_xy, n_rmu_pad,
+                                 q_index=0)
+        W_q = _slabio_read_munu(io, wq_key, wq_plan, mesh_xy, n_rmu_pad)
+        V_q_full = (_slabio_read_munu(io, vq_key, vq_plan, mesh_xy, n_rmu_pad)
+                    if load_v_full else None)
+    return psi_v_X, psi_c_X, V_q0, W_q, V_q_full
 
 
 def _parse_grid_spec(spec) -> Optional[tuple[int, int, int]]:
@@ -896,6 +1223,12 @@ def load_bse_data_from_restart_sharded(
             if use_nohead:
                 print("Warning: requested --nohead but W0_qmunu_nohead not found/ready.")
             print(_BARE_V_FALLBACK_WARNING)
+            # NAME the fallback, don't just alias the handle: the tensor
+            # readers below are given dataset NAMES (SlabIO opens by name),
+            # so a ``None`` here would have become "no W dataset" instead of
+            # "W is bare V", which is the bare-Coulomb fallback this branch
+            # just warned about.
+            wq_key = vq_key
             wq_dset = vq_dset
         if "psi_full_y" not in f or "enk_full" not in f:
             raise ValueError(
@@ -964,32 +1297,13 @@ def load_bse_data_from_restart_sharded(
         mu_per_x = n_rmu_pad // grid_x
         nu_per_y = n_rmu_pad // grid_y
 
-        psi_v_X = _read_psi_mu_sharded(psi_full_dset, val_indices, mu_per_x, "x", mesh_xy, n_rmu_pad, trim=False)
-        psi_c_X = _read_psi_mu_sharded(psi_full_dset, cond_indices, mu_per_x, "x", mesh_xy, n_rmu_pad, trim=False)
-
-        if pad_bands:
-            psi_v_X, n_val_pad = _pad_axis_to_multiple(psi_v_X, axis=1, multiple=grid_y)
-            psi_c_X, n_cond_pad = _pad_axis_to_multiple(psi_c_X, axis=1, multiple=grid_x)
-            eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=grid_y)
-            eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=grid_x)
-        else:
-            n_val_pad = int(psi_v_X.shape[1])
-            n_cond_pad = int(psi_c_X.shape[1])
-        psi_v_Y = jax.lax.with_sharding_constraint(psi_v_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
-        psi_c_Y = jax.lax.with_sharding_constraint(psi_c_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
-
-        V_q0 = _read_vq0_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy, n_rmu_pad,
-                                 trim=False, kgrid=(nkx, nky, nkz))
-        W_q = _read_wq_sharded(wq_dset, mu_per_x, nu_per_y, mesh_xy, n_rmu_pad,
-                               trim=False, kgrid=(nkx, nky, nkz))
-
-        # Full-q exchange tensor for the finite-q W_q resolvent: read every V
-        # tile with the SAME (μ, ν, nkx, nky, nkz) reader as W_q (no head; head
-        # is a q=0-only rank-1 piece).  V_q_full[:, :, 0, 0, 0] == V_q0 (the
-        # head-less q=0 read) — a self-check the finite-q harness asserts.
-        V_q_full = (_read_wq_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy,
-                                     n_rmu_pad, trim=False, kgrid=(nkx, nky, nkz))
-                    if load_v_full else None)
+        # Shapes are all the tensor readers need from the open handle; the
+        # bytes are moved AFTER this block closes the file, because the
+        # SlabIO transport reopens the same path under collective MPI-IO
+        # and two live handles on one file is a hazard nobody needs.
+        vq_shape = tuple(int(s) for s in vq_dset.shape)
+        wq_shape = tuple(int(s) for s in wq_dset.shape)
+        psi_shape = tuple(int(s) for s in psi_full_dset.shape)
 
         # ── q=0 head: load G0_mu_nu, dual-shard X/Y, inject as rank-1 ────
         # On the (μ,ν)-sharded V_q0 and W_q tensors, the rank-1 update
@@ -1018,6 +1332,29 @@ def load_bse_data_from_restart_sharded(
         else:
             g0_X = g0_Y = None
             vhead_restart = whead_restart = None
+
+    # ── The big tensors, on whichever transport this stack has ──────────
+    # Outside the h5py handle on purpose (see the shape capture above).
+    # ONE decision for the whole load: mixing transports across the four
+    # tensors would make a throughput number unattributable and would
+    # open the SlabIO file twice for no gain.
+    psi_v_X, psi_c_X, V_q0, W_q, V_q_full = _read_bse_tensors(
+        restart_file, vq_key=vq_key, wq_key=wq_key, vq_shape=vq_shape,
+        wq_shape=wq_shape, psi_shape=psi_shape, val_indices=val_indices,
+        cond_indices=cond_indices, mu_per_x=mu_per_x, nu_per_y=nu_per_y,
+        n_rmu_pad=n_rmu_pad, mesh_xy=mesh_xy, kgrid=(nkx, nky, nkz),
+        load_v_full=load_v_full, input_file=input_file)
+
+    if pad_bands:
+        psi_v_X, n_val_pad = _pad_axis_to_multiple(psi_v_X, axis=1, multiple=grid_y)
+        psi_c_X, n_cond_pad = _pad_axis_to_multiple(psi_c_X, axis=1, multiple=grid_x)
+        eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=grid_y)
+        eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=grid_x)
+    else:
+        n_val_pad = int(psi_v_X.shape[1])
+        n_cond_pad = int(psi_c_X.shape[1])
+    psi_v_Y = jax.lax.with_sharding_constraint(psi_v_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
+    psi_c_Y = jax.lax.with_sharding_constraint(psi_c_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
 
     if g0_X is not None and inject_head:
         vhead, whead, cell_volume = _resolve_head_params(

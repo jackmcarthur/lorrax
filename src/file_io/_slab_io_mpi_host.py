@@ -83,6 +83,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from ._slab_io_ffi import (
+    _assert_mpi_world,
     _barrier,
     _DatasetGeometry,
     _normalize_slab_request,
@@ -91,6 +92,7 @@ from ._slab_io_ffi import (
     _replace_inode_for_write,
     _shard_read_plan,
     _stripe_count,
+    _stripe_size_bytes,
 )
 
 _TRUE = ("1", "true", "yes", "on")
@@ -103,36 +105,12 @@ def _env_flag(name: str, default: bool) -> bool:
     return v.strip().lower() in _TRUE
 
 
-def _stripe_size_bytes() -> int:
-    """Lustre stripe size in bytes.
-
-    ``LORRAX_PHDF5_STRIPE_SIZE_FS`` is the ``lfs setstripe -S`` spelling
-    ("4M"); MPI-IO's ``striping_unit`` hint wants bytes, so accept both
-    and normalise here.  Malformed input REFUSES with the grammar: it
-    used to be silently replaced by the 4 MiB default, so an explicit
-    ``=4MiB`` A/B experiment quietly measured the default configuration
-    (doctrine 3; audit 2026-07-28 — the sibling
-    ``LORRAX_PHDF5_STRIPE_COUNT`` refuses the same way, see
-    ``_slab_io_ffi._stripe_count``).
-    """
-    # Default 1M since 2026-08-05; measured basis in
-    # src/ffi/cpp/phdf5/context.cc and docs/architecture/slab_io.md.
-    # Kept identical to the C++ writer's default on purpose: a given
-    # environment must mean the same layout in every writer.
-    raw = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE_FS", "1M").strip()
-    mult = 1
-    base = raw
-    if raw and raw[-1] in "kKmMgG":
-        mult = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[raw[-1].lower()]
-        base = raw[:-1]
-    try:
-        return int(float(base) * mult)
-    except ValueError:
-        raise ValueError(
-            f"LORRAX_PHDF5_STRIPE_SIZE_FS={raw!r} is not a valid stripe "
-            f"size: expected '<number>[k|M|G]' in the `lfs setstripe -S` "
-            f"single-letter-suffix grammar (e.g. '4M', '512k'; "
-            f"'MiB'/'MB' spellings are not accepted).") from None
+# ``_stripe_count`` and ``_stripe_size_bytes`` are imported, not defined
+# here, since 2026-08-06.  They used to live in two modules with two
+# different notions of "the default" (this one said 1 MiB, the C++ header
+# comment said 4 MiB), which is the shape of bug where two writers agree
+# on the environment and disagree on the layout.  Both are now one policy
+# function of the rank count in ``_slab_io_ffi``; see ``_stripe_policy``.
 
 
 def _mpi_io_hints(MPI):
@@ -301,6 +279,21 @@ class _MpiHostBackend(_DatasetGeometry):
         self._info = _mpi_io_hints(MPI)
         self._fh = h5py.File(path, h5_mode, driver="mpio",
                              comm=self._comm, info=self._info)
+        # The MPI world this handle ACTUALLY collects on, vs the JAX world
+        # the hyperslabs are derived from.  Same guard as _FfiBackend, and
+        # it was missing here until 2026-08-06 — tier 2 is a real
+        # multi-process path (``gw_config._route_cpu_slab_io`` falls to it
+        # whenever the host FFI lib lacks ``PhdfWriteHostFfi``), so the
+        # PMI-mismatch failure that guard exists for was reachable with no
+        # guard on it at all.  ``mpi4py``'s COMM_WORLD is handed in
+        # explicitly rather than probed through ctypes: this backend
+        # already holds the authoritative communicator, and it is the SAME
+        # one h5py's mpio driver collects on, so there is no ABI guess to
+        # get wrong.  Crucially it is still a different frame of reference
+        # from ``jax.process_count()`` — the whole point of the check.
+        _assert_mpi_world(mesh, mpi_size=int(self._comm.Get_size()),
+                          probe_detail="mpi4py MPI.COMM_WORLD.Get_size()",
+                          tier="PHDF5_HOST")
 
         # Collective (two-phase) MPI-IO for the bulk writes.  DEFAULT ON,
         # and this is the fix for scorecard AF.4c's 1.7 MB/s.  Rationale,
