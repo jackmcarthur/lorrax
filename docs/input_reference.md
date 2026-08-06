@@ -59,7 +59,7 @@ Longer discussions of the load-bearing keys are in [drivers.md](drivers.md).
 | `vhead` | None | Override the bare Coulomb head value; None = analytic. |
 | `whead_0freq` | None | Override the static W head; None = computed. |
 | `whead_imfreq` | None | Override the imaginary-frequency W head (GN probe); None = computed. |
-| `screening_method` | `"minimax"` | chi0 frequency treatment (minimax quadrature is the only production method). |
+| `screening_method` | `"minimax"` | chi0 frequency treatment. `minimax` is the ONLY supported value and any other REFUSES at config construction. The legacy spelling `ctsp` was accepted until 2026-08-06 and silently ran minimax, so replacing it with `minimax` (or deleting the key) changes no result. |
 | `minimax_target_error` | `1e-06` | Target uniform error of the minimax time/frequency quadrature. |
 | `minimax_max_nodes` | `64` | Node-count cap for the minimax quadrature solver. |
 | `regenerate_minimax_tables` | false | Force re-solving the minimax tables instead of reusing cached ones. |

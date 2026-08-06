@@ -32,8 +32,11 @@ twin deletable, the twin is GONE and ``=0`` refuses, naming the deletion.
 The old ``auto`` capability-detection tier was deleted with the same
 ruling — auto-demotion to a duplicate compute path is exactly what the
 ruling forbids ("a refusal at startup ... not a silent demotion to a
-slower path"); ``auto`` remains in the vocabulary only so a stale
-``=auto`` export announces a grammar note instead of failing silently.
+slower path").  ``auto`` is gone from :data:`MODE_SPELLINGS` too: no
+gate could declare it (:meth:`enabled` / :meth:`resolve` / :meth:`enforce`
+have no auto branch, so a gate listing it would resolve ``=auto``
+silently as ``on``), and a stale ``=auto`` export already announces the
+grammar note and takes the default without a vocabulary entry.
 
 Two tiers — keeping them apart is the whole reason this module exists
 ---------------------------------------------------------------------
@@ -104,16 +107,23 @@ __all__ = [
 # The named vocabulary.  A gate declares WHICH of these modes it accepts;
 # anything else is a grammar error.  ("" — unset or whitespace — always maps
 # to the gate's declared default, never to a mode spelling.)
+#
+# TWO-VALUED, deliberately.  The ``auto`` capability-detection tier was
+# deleted with decisions.md 2026-08-01 and there is no ``auto`` branch left
+# in :meth:`Gate.enabled` / :meth:`Gate.resolve` / :meth:`Gate.enforce` — so
+# a vocabulary entry for it could only mislead: a gate that declared
+# ``modes=("auto", ...)`` would accept ``=auto`` and then behave as ``on``
+# with no announcement, which is the silent-downgrade shape the ruling
+# forbids.  A stale ``=auto`` export is a grammar error and is announced as
+# one.  If an auto tier ever returns it needs a resolver, not a token.
 # ---------------------------------------------------------------------------
 MODE_SPELLINGS: dict[str, tuple[str, ...]] = {
-    "auto": ("auto",),
     "off":  ("0", "off", "false", "no"),
     "on":   ("1", "on", "true", "yes"),
 }
 
 #: How each mode is spelled in a grammar-error message.
 MODE_HELP: dict[str, str] = {
-    "auto": "auto/unset",
     "off":  "0/off/false/no",
     "on":   "1/on/true/yes",
 }
@@ -264,6 +274,27 @@ class Gate:
     #: a refusal without SOME message, which is why the fallback exists.
     refuse_platform_msg: str = ""          #: {platform}
     refuse_probe_msg: str = ""             #: {target} {platform} {label} {reason}
+
+    def __post_init__(self) -> None:
+        """Refuse a gate whose declared vocabulary this resolver cannot serve.
+
+        At construction, not at the first env read: ``mode()`` would
+        otherwise ``KeyError`` on ``MODE_SPELLINGS[m]`` on whichever rank
+        happened to read the variable first.  The check is what makes the
+        two-valued table above safe to rely on — a mode with no resolver
+        branch cannot be declared into existence.
+        """
+        unknown = [m for m in self.modes if m not in MODE_SPELLINGS]
+        if unknown:
+            raise ValueError(
+                f"Gate({self.env}): mode(s) {unknown} are not in the gate "
+                f"vocabulary {tuple(MODE_SPELLINGS)}.  Every declared mode "
+                f"needs a resolver branch in enabled()/resolve()/enforce(); "
+                f"adding a token alone makes it behave as 'on', silently.")
+        if self.default not in MODE_SPELLINGS:
+            raise ValueError(
+                f"Gate({self.env}): default={self.default!r} is not one of "
+                f"{tuple(MODE_SPELLINGS)}.")
 
     # -- tier 0: grammar ------------------------------------------------
 

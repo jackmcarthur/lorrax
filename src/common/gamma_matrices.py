@@ -235,7 +235,7 @@ def _gamma_double_contract_scan(P_l_conj, P_r, perm_L, phase_L,
             Pr_3, B, axis=1, keepdims=False)
         return acc + coef * Pl_3 * Pr_3, None
 
-    out, _ = jax.lax.scan(body, init, jnp.arange(ns * ns, dtype=jnp.int32))
+    out, _ = jax.lax.scan(body, init, jnp.arange(ns * ns, dtype=jnp.int32), unroll=1)
     return out
 
 

@@ -1,0 +1,43 @@
+[cohsex]
+# Minimax SELF-CONSISTENCY check -- NOT a method comparison.
+#
+# This fixture was named ``cohsex_test_ctsp_compare.in`` and set
+# ``screening_method = ctsp``, which reads as "compare CTSP against
+# minimax".  It never did that.  Nothing has ever read
+# ``ScreeningConfig.method``, so ``ctsp`` resolved to the same minimax
+# path as every other deck: the comparison was minimax against minimax,
+# and had been for its whole life.
+#
+# minimax is now the only supported screening method (owner ruling
+# 2026-08-06) and ``ctsp`` REFUSES rather than resolving silently, so the
+# original intent cannot be restored by editing this file -- there is no
+# second method to compare against.  What this deck still does honestly
+# is re-run the SAME minimax screening as ``cohsex_debug/cohsex_test.in``
+# on the same system and centroid set, from a restart, which makes it a
+# self-consistency (reproducibility) check of the minimax path.
+#
+# NOTE, do not mistake this for a wired gate: NO test collects this
+# fixture today -- ``ctsp`` and this filename appear in no test file
+# (grep over tests/, 2026-08-06).  ``eqp_minimax_selfcheck.dat`` beside
+# it is this deck's historical output, carried over under its old name
+# ``eqp_ctsp_compare.dat``; it is not asserted against by anything.
+# Wire this deck to a gate or delete it -- but do not read its name as
+# evidence that two screening methods are being compared.
+restart = true
+do_screened = true
+bispinor = false
+wfn_file = WFNsmall.h5
+centroids_file = centroids_frac_60.txt
+sigma_diag_file = sigma_diag_minimax_selfcheck.dat
+nval = 4
+ncond = 4
+nband = 40
+sys_dim = 2
+screening_method = minimax
+
+K_POINTS {crystal_b}
+5
+  0.0000 0.0000 0.0000 30  #gG
+  0.0000 0.5000 0.0000 30  #M
+  0.5000 0.5000 0.0000 30  #K
+  0.0000 0.0000 0.0000 20  #gG

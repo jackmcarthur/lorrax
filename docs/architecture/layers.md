@@ -260,11 +260,16 @@ them costs a campaign.
    ones in the tree written *to be* reusable `shard_map` wrappers, and they are
    two of the sites that omit `check_rep`.
 3. **Do not collapse `runtime._FALSY_TOKENS` into `gate.MODE_SPELLINGS`.**
-   Two-valued vs three-valued, on purpose: `auto` must be distinguishable from
-   an explicit `on`, because an AUTO default may demote silently while an
-   explicit `on` must announce-or-raise. Share the token table; keep two
-   resolvers. And any unified rank resolver must keep launcher env vars **ahead
-   of** `jax.process_index()` — the latter goes through `get_backend()` and
+   Both are two-valued since decisions.md 2026-08-01 deleted the `auto`
+   capability tier (the `auto` token itself left `MODE_SPELLINGS` on
+   2026-08-06 — with no `auto` branch in `enabled`/`resolve`/`enforce`, a gate
+   declaring it would have run as `on` in silence, which is the demotion the
+   ruling forbids). They stay separate for their **resolvers**, not their
+   tokens: `_env_falsy` answers "did someone turn this off", `Gate.mode`
+   answers "which of my declared modes is this" and *announces* a token it
+   does not recognise. Share the token table; keep two resolvers. And any
+   unified rank resolver must keep launcher env vars **ahead of**
+   `jax.process_index()` — the latter goes through `get_backend()` and
    **initialises the XLA backend**, destroying the before-`initialize` promise
    and the kernel-cache keys.
 4. **Do not give `ffi/` a shared C++ handler base.** The cuFFT plan workspace,

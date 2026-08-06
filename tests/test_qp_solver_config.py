@@ -292,6 +292,25 @@ def test_mixed_case_key_survives_strict_keys(tmp_path):
     assert params["do_G0"] is False
 
 
+def test_screening_method_ctsp_refuses_and_names_minimax(tmp_path):
+    """``ctsp`` must REFUSE, not resolve to minimax in silence.
+
+    It parsed and ran minimax for months because nothing reads
+    ``ScreeningConfig.method``.  The refusal has to name the supported
+    method, per the explicit-request-fails-loudly convention.
+    """
+    with pytest.raises(ValueError, match="minimax") as exc:
+        _config(tmp_path, "screening_method = ctsp\n")
+    assert "ctsp" in str(exc.value)
+
+
+def test_screening_method_minimax_and_default_still_parse(tmp_path):
+    """The supported value, and omitting the key, both stay clean."""
+    assert (_config(tmp_path, "screening_method = minimax\n")
+            .screening.method == "minimax")
+    assert _config(tmp_path, "").screening.method == "minimax"
+
+
 def test_legacy_keys_keep_their_dedicated_messages(tmp_path, capsys):
     # Keys with an explicit legacy branch (dedicated DeprecationWarning or
     # refusal) must NOT also be reported as unknown — one key, one message.

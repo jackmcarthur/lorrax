@@ -958,7 +958,7 @@ def sweep_matrix_elements(
             return carry, blk[0]
 
         _, H = jax.lax.scan(
-            body, None, (psi_n_XY, gvecs_, gmask_, bidx_, kvecs_))
+            body, None, (psi_n_XY, gvecs_, gmask_, bidx_, kvecs_), unroll=1)
         return jax.lax.with_sharding_constraint(H, block_sharding)
 
     # NO ``donate_argnums``, and that is a decision rather than an omission.
