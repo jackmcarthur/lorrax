@@ -117,6 +117,14 @@ LORRAX_FFI_NVHPC_DIR_DEFAULT="$HOME/software/lorrax_nvhpc"
 LORRAX_FFI_PHDF5_DIR_DEFAULT="$HOME/software/lorrax_phdf5_cray_1.14.3.7/stage"
 LORRAX_FFI_SLATE_DIR_DEFAULT="$HOME/software/lorrax_slate_cray/stage"
 
+# FFTW3 engine for the container.  The image ships none (measured
+# 2026-08-06, in-container on a compute node), and the flat-k FFT handler
+# resolves FFTW3 at RUN time by dlopen -- so without this mount the FFT
+# handlers refuse and every cell of tests/test_fft_flat_k_numerics.py fails
+# with "mklfft: no FFTW3 engine in this process".  Populate with
+# src/ffi/cpp/stage/fftw_stage_cray.sh after `module load cray-fftw`.
+LORRAX_FFI_FFTW_DIR_DEFAULT="$HOME/software/lorrax_fftw_cray/stage"
+
 # Host SLATE install (bundled blaspp/lapackpp alongside).  Override with
 # LORRAX_SLATE_INSTALL_DIR before `module load`.
 LORRAX_SLATE_INSTALL_DIR_DEFAULT="$HOME/software/slate/install"

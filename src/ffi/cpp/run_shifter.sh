@@ -159,6 +159,32 @@ SLATE_INSTALL_HOST="${LORRAX_SLATE_INSTALL_DIR:-$HOME/software/slate/install}"
 if [[ -d "${LORRAX_FFI_SLATE_DIR}" ]]; then
     VOL_FLAGS+=(--volume="${LORRAX_FFI_SLATE_DIR}:/lorrax_slate")
 fi
+# FFTW3 stage: the DOUBLE-PRECISION SERIAL cray-fftw engine, and nothing
+# else.  Populated by src/ffi/cpp/stage/fftw_stage_cray.sh.  Skipped if
+# absent (the image is then simply an MKL-less, FFTW-less site and the flat-k
+# handler refuses at first use, naming every candidate it tried).
+#
+# WHY A MOUNT IS THE ONLY REPAIR.  The flat-k FFT handler resolves the FFTW3
+# advanced interface at RUN time and deliberately keeps it out of DT_NEEDED
+# (GATE 5).  Run-time resolution still needs a file to resolve TO, and
+# measured 2026-08-06 in-container on a compute node, this image has none:
+# `find /usr /usr/local /opt /lib /lib64 /lorrax_{slate,phdf5,nvhpc} -name
+# 'libfftw3*'` is EMPTY, every ladder candidate returns "cannot open shared
+# object file", and /opt/cray/pe does not exist at all — so the host .so's
+# RPATH, which is what makes the BARE-HOST leg work, resolves nothing here.
+# Shifter at NERSC will not --volume a /opt/ system path (udiRoot siteFs), so
+# bind-mounting /opt/cray/pe/fftw directly is not available either.
+#
+# WHAT MUST NOT BE DONE INSTEAD: this image DOES ship libcufftw.so.11 in its
+# ldconfig cache, and it exports fftw_plan_many_dft / fftw_execute_dft /
+# fftw_destroy_plan — all three names the ladder binds.  Pointing
+# LORRAX_FFTW3_SO at it makes every FFT cell go green while the HOST
+# handler's transforms run on the GPU.  src/ffi/cpp/gate_one_fftw.sh
+# (GATE 8) is what tells those two states apart.
+: "${LORRAX_FFI_FFTW_DIR:=$HOME/software/lorrax_fftw_cray/stage}"
+if [[ -d "${LORRAX_FFI_FFTW_DIR}" ]]; then
+    VOL_FLAGS+=(--volume="${LORRAX_FFI_FFTW_DIR}:/lorrax_fftw")
+fi
 
 # Which cuSOLVERMp / cuBLASMp stage to RUN against, as a subpath under the
 # /lorrax_nvhpc bind-mount.  SOURCE OF TRUTH: the site config's
@@ -205,7 +231,14 @@ fi
 # mesh.  Removing the entry is NOT done here because it would break any
 # still-CAL-linked .so loudly at dlopen; that is the owner's call, not this
 # script's.  Left as a comment rather than a silent edit.
-LDLIB="${SLATE_INSTALL_HOST}/lib64:/lorrax_slate/lib:/lorrax_phdf5/lib:/lorrax_nvhpc/${LORRAX_NVHPC_SUBPATH}:/lorrax_nvhpc/25.5_cuda12.9/math_libs/12.9/lib64:${MPI_LIB_DIR_CT}:/global/common/software/nersc9/darshan/default/lib"
+#
+# /lorrax_fftw/lib is listed LAST of the lorrax stages, deliberately.  It
+# holds exactly one library and no other entry on this path ships a
+# libfftw3.*, so its position cannot decide a version the way the two NVHPC
+# entries above do — and putting it last means it can never shadow a vendor
+# library either.  A directory whose ordering is load-bearing is a hazard;
+# this one's is not, and that is a property worth keeping.
+LDLIB="${SLATE_INSTALL_HOST}/lib64:/lorrax_slate/lib:/lorrax_phdf5/lib:/lorrax_nvhpc/${LORRAX_NVHPC_SUBPATH}:/lorrax_nvhpc/25.5_cuda12.9/math_libs/12.9/lib64:/lorrax_fftw/lib:${MPI_LIB_DIR_CT}:/global/common/software/nersc9/darshan/default/lib"
 if [[ "${MPI_STACK}" == mpich ]]; then
     # mpich module ships its own PMI/libfabric deps under dep/
     LDLIB="${LDLIB}:/opt/udiImage/modules/mpich/dep"

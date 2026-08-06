@@ -36,6 +36,7 @@ Overrides (set before `module load`)
   LORRAX_FFI_NVHPC_DIR      default @LORRAX_FFI_NVHPC_DIR_DEFAULT@
   LORRAX_FFI_PHDF5_DIR      default @LORRAX_FFI_PHDF5_DIR_DEFAULT@
   LORRAX_FFI_SLATE_DIR      default @LORRAX_FFI_SLATE_DIR_DEFAULT@
+  LORRAX_FFI_FFTW_DIR       default @LORRAX_FFI_FFTW_DIR_DEFAULT@
   LORRAX_SLATE_INSTALL_DIR  default @LORRAX_SLATE_INSTALL_DIR_DEFAULT@
   LORRAX_MPI_TYPE           default @LORRAX_MPI_TYPE_DEFAULT@ (|none|pmi2|pmix)
   LORRAX_NGPU               default 4 for lxrun, 1 for lxshell
@@ -79,6 +80,7 @@ local darshan_lib_dir       = "@LORRAX_DARSHAN_LIB_DIR@"      -- may be ""
 local default_nvhpc_host    = "@LORRAX_FFI_NVHPC_DIR_DEFAULT@"
 local default_phdf5_host    = "@LORRAX_FFI_PHDF5_DIR_DEFAULT@"
 local default_slate_host    = "@LORRAX_FFI_SLATE_DIR_DEFAULT@"
+local default_fftw_host     = "@LORRAX_FFI_FFTW_DIR_DEFAULT@"
 local default_slate_install = "@LORRAX_SLATE_INSTALL_DIR_DEFAULT@"
 
 -- =========================================================================
@@ -108,6 +110,7 @@ end
 local nvhpc_host         = env_or("LORRAX_FFI_NVHPC_DIR",     default_nvhpc_host)
 local phdf5_host         = env_or("LORRAX_FFI_PHDF5_DIR",     default_phdf5_host)
 local slate_host         = env_or("LORRAX_FFI_SLATE_DIR",     default_slate_host)
+local fftw_host          = env_or("LORRAX_FFI_FFTW_DIR",      default_fftw_host)
 local slate_install_host = env_or("LORRAX_SLATE_INSTALL_DIR", default_slate_install)
 
 -- XLA persistent compile cache.  Amortises PTX JIT across JAX processes;
@@ -147,11 +150,18 @@ end
 --   4. /lorrax_nvhpc : libcusolverMp + libcal
 --   5. Shifter's mpich bind-mount (libmpi.so.12 + PMI + libfabric deps)
 --   6. (optional) Darshan I/O profiling
+--   4b. /lorrax_fftw : the double-precision SERIAL cray-fftw engine, and
+--                     nothing else.  It is LAST of the lorrax stages on
+--                     purpose: it holds one library, no other entry here
+--                     ships a libfftw3.*, so its position cannot select a
+--                     version the way the NVHPC entries do -- and last means
+--                     it can never shadow a vendor library either.
 local ldlib_parts = {
     slate_install_host .. "/lib64",
     "/lorrax_slate/lib",
     "/lorrax_phdf5/lib",
     "/lorrax_nvhpc/" .. nvhpc_subpath,
+    "/lorrax_fftw/lib",
     mpich_container_dir,
     mpich_container_dir .. "/dep",
 }
@@ -195,6 +205,21 @@ local shifter_args = table.concat({
     "--volume=" .. nvhpc_host .. ":/lorrax_nvhpc",
     "--volume=" .. phdf5_host .. ":/lorrax_phdf5",
     "--volume=" .. slate_host .. ":/lorrax_slate",
+    -- The image ships NO FFTW3 (measured in-container 2026-08-06: no
+    -- libfftw3* anywhere it can see, every dlopen candidate "cannot open
+    -- shared object file", and /opt/cray/pe absent entirely -- so the host
+    -- .so's RPATH, which is what makes the BARE-HOST leg work, resolves
+    -- nothing here).  The flat-k FFT handler keeps FFTW3 out of DT_NEEDED
+    -- by design (GATE 5), which means it needs a file to dlopen at run
+    -- time, which means a mount.  Shifter will not --volume a /opt/ system
+    -- path, so /opt/cray/pe/fftw cannot be mounted directly; stage it with
+    -- src/ffi/cpp/stage/fftw_stage_cray.sh.
+    --
+    -- NOT a repair: this image DOES carry libcufftw.so.11, which exports
+    -- all three entry points the handler binds.  Letting that answer makes
+    -- the FFT cells green while the HOST handler runs on the GPU.
+    -- src/ffi/cpp/gate_one_fftw.sh (GATE 8) is what distinguishes them.
+    "--volume=" .. fftw_host .. ":/lorrax_fftw",
     table.concat(shifter_env_parts, " "),
 }, " ")
 
@@ -210,6 +235,7 @@ setenv("LORRAX_SHIFTER",           "shifter " .. shifter_args)
 setenv("LORRAX_FFI_NVHPC_HOST",    nvhpc_host)
 setenv("LORRAX_FFI_PHDF5_HOST",    phdf5_host)
 setenv("LORRAX_FFI_SLATE_HOST",    slate_host)
+setenv("LORRAX_FFI_FFTW_HOST",     fftw_host)
 setenv("LORRAX_SLATE_INSTALL_DIR", slate_install_host)
 setenv("JAX_COMPILATION_CACHE_DIR", jax_cache_dir)
 
