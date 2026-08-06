@@ -56,26 +56,218 @@ def _rank0() -> bool:
 # multi-process barrier fails.
 
 
-def _stripe_count() -> int:
-    """``LORRAX_PHDF5_STRIPE_COUNT`` (Lustre ``striping_factor``), default 16.
+# ---------------------------------------------------------------------------
+# Lustre striping policy — ONE function, used by every writer
+# ---------------------------------------------------------------------------
+#
+# THE MECHANISM.  Cray ROMIO picks its collective-buffering aggregator count
+# as ``cb_nodes = min(striping_factor, nranks)`` unless cb_nodes is set
+# explicitly (it is not — hand-set cb_nodes measured 30% slower, slab_io.md
+# §Tuning).  So the stripe count IS the aggregator count.  A FIXED stripe
+# count therefore pins the aggregator count forever, and every rank added
+# past it is a rank that does not aggregate.  The old default of 16 was
+# tuned on a payload that happened to run at 16 ranks, where 16 is also
+# exactly ``nranks`` — the coincidence that made a constant look like a
+# tuning.
+#
+# MEASURED (job 56389339 + 16/25-node steps, /pscratch, GiB/s aggregate
+# write, phase-separated harness ``tests/bench/slabio_scaling_bench.py``):
+#
+#   ranks  payload      stripe=16 x 1M   stripe=nranks         gain
+#      4     2.00 GiB      0.813            0.906  (4 x 1M)    +11%
+#     16     8.00 GiB      3.152            3.152  (16 x 1M)     0%   [1]
+#     64    32.00 GiB      5.189           10.630  (64 x 4M)   +105%
+#     64   381.47 GiB      7.403           13.222  (64 x 4M)    +79%   [2]
+#    100    50.00 GiB      7.872           15.216  (100 x 4M)   +93%
+#
+#   [1] at 16 ranks the two policies are the SAME configuration; the row is
+#       the null control, not a win.
+#   [2] the real envelope payload: V_qmunu, (nq=64, 20000, 20000) c128.
+#       The old default leaves 44% of the write bandwidth on the floor.
+#
+# ``stripe=nranks`` won or tied at EVERY rank count measured.
+#
+# STRIPE UNIT.  1 MiB at <=16 ranks and 4 MiB at >=64 ranks are the two
+# measured anchors (64 x 1M = 7.068 vs 64 x 4M = 10.630 at 64 ranks;
+# 16 x 4M = 2.07 vs 16 x 1M = 2.93 at 16 ranks).  Between them the unit is
+# the power of two NEAREST IN LOG2 to ``nranks/16`` MiB — a geometric ramp
+# with no free parameters, anchored at both measured ends, rather than a
+# step at 64 chosen for convenience.  It matters that it is not a step:
+# a 32-rank run sits halfway between the anchors in exactly the sense that
+# log2 measures, and the ladder cannot even test it (``resolve_mesh``
+# requires a perfect-square device count, so 32 is not a legal geometry —
+# the interpolation region 16 < n < 64 contains NO power-of-two rank count
+# that is also a legal mesh).  A rule that cannot be measured at its
+# midpoint should at least be the one the two endpoints imply.
+#
+# WHY THE UNIT MUST STAY <= 4 MiB.  The per-rank tile knee is 4 MiB
+# (job 56389339, 16 ranks: tile/rank 0.06/0.25/1/4/16 MiB gave
+# 0.126/0.609/1.779/3.165/3.551 GiB/s — flat above 4 MiB, a cliff below).
+# At the envelope, ``V_qmunu`` at N_mu=20000 on 1024 ranks is ~6.1 MiB per
+# rank per slab: only 1.5x above the knee.  A stripe unit larger than the
+# per-rank tile starves aggregators, so 4 MiB is a ceiling, not a trend to
+# extrapolate.
+#
+#: Clamp on the stripe count.  Lower bound: below 4 the file is on too few
+#: OSTs to reach even 1 GiB/s (1 x 1M measured 0.61-0.75 GiB/s at every
+#: rank count from 4 to 64 — a per-FILE single-OST ceiling that adding
+#: ranks does not move).  Upper bound: see _STRIPE_COUNT_MAX.
+_STRIPE_COUNT_MIN = 4
+_STRIPE_COUNT_MAX = 128
 
-    Unset/empty → default; anything else must be a plain int.  Shared by
-    both PHDF5 writers.  A typo here used to crash with a bare
-    ``ValueError`` while the sibling ``LORRAX_PHDF5_STRIPE_SIZE_FS`` was
-    silently replaced by ITS default — two neighbouring knobs, opposite
-    failure modes (audit 2026-07-28).  Both now refuse loudly, naming
-    the variable and the accepted grammar (doctrine 3).
+_STRIPE_UNIT_MIN = 1 << 20
+_STRIPE_UNIT_MAX = 4 << 20
+
+
+def _stripe_policy(nranks: int) -> tuple[int, int]:
+    """``(striping_factor, striping_unit_bytes)`` for a world of ``nranks``.
+
+    Pure function of the rank count — no env, no MPI, no filesystem — so
+    the policy can be tested at rank counts no allocation can reach.
+    See the block comment above for the measurements behind every number.
+    """
+    n = max(1, int(nranks))
+    count = min(max(n, _STRIPE_COUNT_MIN), _STRIPE_COUNT_MAX)
+    # Unit: the power of two nearest in log2 to (nranks/16) MiB, clamped.
+    # Integer arithmetic, no floats: double the unit each time nranks
+    # passes the geometric midpoint between the current anchor and the
+    # next (16*sqrt(2) ~ 22.6, 32*sqrt(2) ~ 45.3).  Written as an
+    # exact integer comparison so it cannot drift with libm.
+    unit = _STRIPE_UNIT_MIN
+    while unit < _STRIPE_UNIT_MAX and 2 * n * n > (
+            (unit // _STRIPE_UNIT_MIN) * 32) ** 2:
+        unit *= 2
+    return count, unit
+
+
+def _stripe_count(nranks: int | None = None) -> int:
+    """Lustre ``striping_factor`` in force: the policy, or the env override.
+
+    ``LORRAX_PHDF5_STRIPE_COUNT`` overrides :func:`_stripe_policy`; unset
+    or empty means the policy.  Anything else must be a plain int.  A typo
+    here used to crash with a bare ``ValueError`` while the sibling
+    ``LORRAX_PHDF5_STRIPE_SIZE_FS`` was silently replaced by ITS default —
+    two neighbouring knobs, opposite failure modes (audit 2026-07-28).
+    Both refuse loudly, naming the variable and the accepted grammar.
+
+    ``-1`` ("stripe over every OST") is REFUSED rather than passed
+    through.  It is the one value that looks like a maximum and measures
+    like a failure: 0.105 GiB/s at 64 ranks / 32 GiB and 1.118 at 16
+    ranks / 8 GiB, against 10.63 and 3.15 for the policy — 100x and 3x
+    slower respectively (job 56389339, ``w_SC64``/``w_SC16``).  A
+    number-of-OSTs-wide layout puts every rank on every OST, which is the
+    maximum-contention arrangement, not the maximum-bandwidth one.
     """
     raw = os.environ.get("LORRAX_PHDF5_STRIPE_COUNT", "").strip()
     if not raw:
-        return 16
+        return _stripe_policy(
+            jax.process_count() if nranks is None else nranks)[0]
     try:
-        return int(raw)
+        val = int(raw)
     except ValueError:
         raise ValueError(
             f"LORRAX_PHDF5_STRIPE_COUNT={raw!r} is not a valid stripe "
-            f"count: expected a plain integer (e.g. 16; <=0 disables "
-            f"the striping hints).") from None
+            f"count: expected a plain integer (e.g. 16; 0 disables the "
+            f"striping hints; -1 is refused, see below).") from None
+    if val < 0:
+        raise ValueError(
+            f"LORRAX_PHDF5_STRIPE_COUNT={raw!r} is refused.  A negative "
+            f"striping_factor means 'every OST on the filesystem', which "
+            f"is the maximum-CONTENTION layout and measures like one: "
+            f"0.105 GiB/s at 64 ranks writing 32 GiB, and 1.118 GiB/s at "
+            f"16 ranks writing 8 GiB, against 10.63 and 3.15 for "
+            f"stripe=nranks (job 56389339).  Pass a positive count, or "
+            f"unset the variable and let the policy pick "
+            f"min(max(nranks, {_STRIPE_COUNT_MIN}), {_STRIPE_COUNT_MAX}).")
+    return val
+
+
+def _stripe_size_bytes(nranks: int | None = None) -> int:
+    """Lustre ``striping_unit`` in force, in bytes.
+
+    ``LORRAX_PHDF5_STRIPE_SIZE_FS`` is the ``lfs setstripe -S`` spelling
+    ("4M") and overrides :func:`_stripe_policy`; MPI-IO's ``striping_unit``
+    hint wants bytes, so accept both spellings and normalise here.
+    Malformed input REFUSES with the grammar: it used to be silently
+    replaced by the 4 MiB default, so an explicit ``=4MiB`` A/B experiment
+    quietly measured the default configuration (doctrine 3; audit
+    2026-07-28 — the sibling ``LORRAX_PHDF5_STRIPE_COUNT`` refuses the
+    same way).
+
+    Lives here, beside the count, since 2026-08-06: the two are one
+    policy and were previously resolved in two modules with two
+    different notions of "the default".
+    """
+    raw = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE_FS", "").strip()
+    if not raw:
+        legacy = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE", "").strip()
+        if legacy:
+            try:
+                v = int(legacy)
+            except ValueError:
+                raise ValueError(
+                    f"LORRAX_PHDF5_STRIPE_SIZE={legacy!r} is not a valid "
+                    f"byte count: expected a plain integer.") from None
+            if v > 0:
+                return v
+        return _stripe_policy(
+            jax.process_count() if nranks is None else nranks)[1]
+    mult = 1
+    base = raw
+    if raw and raw[-1] in "kKmMgG":
+        mult = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[raw[-1].lower()]
+        base = raw[:-1]
+    try:
+        return int(float(base) * mult)
+    except ValueError:
+        raise ValueError(
+            f"LORRAX_PHDF5_STRIPE_SIZE_FS={raw!r} is not a valid stripe "
+            f"size: expected '<number>[k|M|G]' in the `lfs setstripe -S` "
+            f"single-letter-suffix grammar (e.g. '4M', '512k'; "
+            f"'MiB'/'MB' spellings are not accepted).") from None
+
+
+def _export_striping_env(nranks: int | None = None) -> tuple[int, int]:
+    """Materialise the resolved striping into ``os.environ``; return it.
+
+    WHY THIS EXISTS, and why it is not spooky action.  There are two
+    writers of the same files and they take the hints by two different
+    routes: the Python writer builds an ``MPI_Info`` itself
+    (``_slab_io_mpi_host._mpi_io_hints``), while the FFI writer's hints
+    are built in C++ (``ffi/cpp/phdf5/context.cc``) whose ONLY input is
+    ``getenv``.  A policy that is a function of the rank count cannot be
+    a C++ string literal, and the C++ has no other channel from Python —
+    ``ffi.io.open_file`` passes a path, a mesh and a mode.  So the
+    resolved values are written back into the environment before
+    ``open_file``, which is the channel that already exists.
+
+    Consequences, deliberately:
+
+    * an operator's explicit ``LORRAX_PHDF5_STRIPE_*`` still wins — it is
+      read by the resolvers above and simply re-exported unchanged;
+    * both writers see one value, so "the environment" remains a
+      complete description of the layout, which is what makes the
+      ``lfs getstripe`` readback in the bench harness meaningful;
+    * the value is visible to anything that dumps ``os.environ`` in a run
+      log, instead of being implicit in a library nobody can grep.
+
+    The C++ literal default (``"16"``) survives only for a caller that
+    opens a phdf5 context without going through ``file_io`` — no in-tree
+    caller does.  Registered in KNOWN_LORRAX_ISSUES.md so the duplicate
+    default is not forgotten.
+    """
+    count = _stripe_count(nranks)
+    unit = _stripe_size_bytes(nranks)
+    os.environ["LORRAX_PHDF5_STRIPE_COUNT"] = str(count)
+    # Re-export in the `lfs setstripe -S` spelling both parsers accept, so
+    # a run log's environment reads the way the docs and `lfs` do.  A unit
+    # that is not a whole number of MiB (only reachable by an explicit
+    # override like '512k') keeps the byte spelling, which both parsers
+    # also accept — an exact value beats a pretty one.
+    os.environ["LORRAX_PHDF5_STRIPE_SIZE_FS"] = (
+        f"{unit >> 20}M" if unit >= (1 << 20) and unit % (1 << 20) == 0
+        else str(unit))
+    return count, unit
 
 
 def _replace_inode_for_write(path: str) -> None:
@@ -167,17 +359,27 @@ def _replace_inode_for_write(path: str) -> None:
 # rank-invariant by construction (every rank compares its own
 # MPI_Comm_size against a replicated jax.process_count()), so it refuses
 # everywhere or nowhere — the only kind of refusal a collective tolerates.
-_MPI_WORLD_VERDICT: tuple[str, str] | None = None
+#
+# CALLED ON EVERY PATH THAT OPENS A FILE COLLECTIVELY.  Both of them:
+# ``_FfiBackend.__init__`` (tier 1) and ``_MpiHostBackend.__init__``
+# (tier 2).  Tier 2 had no guard until 2026-08-06 even though it is a
+# routine multi-process route — a guard installed on one of two doors is
+# a guard on neither.  The remaining ``h5py.File`` opens in this package
+# are rank-0-only serial handles (``_introspect_dataset``, the deferred
+# attribute write in ``close``); they derive no per-rank hyperslab and
+# collect on nothing, so there is no MPI world for them to disagree with.
+_MPI_WORLD_VERDICT: dict[str, tuple[str, str]] = {}
 
 
-def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *, require):
+def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *, require,
+                       tier="PHDF5_FFI"):
     """Pure decision function for the MPI-world guard — ``(verdict, msg)``.
 
     Split out from the ctypes probe so it can be tested without an MPI.
     ``verdict`` is one of ``"ok"``, ``"unprobed"``, ``"refuse"``.
     """
     if mpi_size is None:
-        msg = (f"SlabIO PHDF5_FFI: could not verify the MPI world size "
+        msg = (f"SlabIO {tier}: could not verify the MPI world size "
                f"({probe_detail}).  jax.process_count()={proc_count}; if the "
                f"launcher's PMI flavour does not match this MPI stack every "
                f"rank gets a private singleton MPI_COMM_WORLD and the "
@@ -189,7 +391,7 @@ def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *, require):
         return "ok", (f"MPI_Comm_size={mpi_size} == "
                       f"jax.process_count()={proc_count} ({probe_detail})")
     return "refuse", (
-        f"SlabIO PHDF5_FFI: MPI_Comm_size(MPI_COMM_WORLD)={mpi_size} but "
+        f"SlabIO {tier}: MPI_Comm_size(MPI_COMM_WORLD)={mpi_size} but "
         f"jax.process_count()={proc_count} ({probe_detail}).  This context "
         f"would derive {proc_count} distinct per-rank hyperslabs and hand "
         f"them to a communicator of {mpi_size} process(es), so the "
@@ -252,24 +454,30 @@ def _probe_mpi_world_size():
     return None, last
 
 
-def _assert_mpi_world(mesh) -> None:
-    """Refuse a PHDF5_FFI context whose MPI world is not the JAX world.
+def _assert_mpi_world(mesh, *, mpi_size=None, probe_detail=None,
+                      tier="PHDF5_FFI") -> None:
+    """Refuse a collective context whose MPI world is not the JAX world.
 
-    Runs ONCE per process, at the first collective open — the answer cannot
-    change afterwards, and the probe costs one ctypes call.
+    Runs ONCE per process per tier, at that tier's first collective open —
+    the answer cannot change afterwards, and the ctypes probe costs one
+    call.  A caller that already holds the authoritative communicator
+    (``_MpiHostBackend`` has mpi4py's ``COMM_WORLD``) passes ``mpi_size``
+    and ``probe_detail`` instead, skipping the probe: same comparison,
+    one less ABI guess.
     """
-    global _MPI_WORLD_VERDICT
     if os.environ.get("LORRAX_PHDF5_SKIP_MPI_WORLD_CHECK", "").strip() in (
             "1", "true", "yes", "on"):
         return
     require = os.environ.get(
         "LORRAX_PHDF5_REQUIRE_MPI_WORLD", "").strip().lower() not in (
             "0", "false", "no", "off")
-    if _MPI_WORLD_VERDICT is None:
-        size, detail = _probe_mpi_world_size()
-        _MPI_WORLD_VERDICT = _mpi_world_verdict(
-            size, jax.process_count(), detail, require=require)
-    verdict, msg = _MPI_WORLD_VERDICT
+    if tier not in _MPI_WORLD_VERDICT:
+        if mpi_size is None:
+            mpi_size, probe_detail = _probe_mpi_world_size()
+        _MPI_WORLD_VERDICT[tier] = _mpi_world_verdict(
+            mpi_size, jax.process_count(), probe_detail, require=require,
+            tier=tier)
+    verdict, msg = _MPI_WORLD_VERDICT[tier]
     if verdict == "refuse":
         import sys
         sys.__stderr__.write(
@@ -792,6 +1000,21 @@ class _FfiBackend(_DatasetGeometry):
         if mode == "w":
             _replace_inode_for_write(path)
             _barrier("slab_io_ffi_prestripe")
+        # Resolve the striping policy and put it where the C++ writer can
+        # see it (its only input is getenv), BEFORE open_file — that call
+        # is where context.cc builds the MPI_Info and H5Fcreate applies
+        # the layout.  A file opened 'a'/'r' keeps the inode it already
+        # has, so the hints are a no-op there; export anyway so the log
+        # line and the environment agree on every path.
+        _sc, _su = _export_striping_env()
+        if mode == "w" and _rank0() and os.environ.get(
+                "LORRAX_PHDF5_LOG", "1").strip().lower() not in (
+                    "0", "false", "no", "off"):
+            print(f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} mode={mode} "
+                  f"ranks={jax.process_count()} stripe_count={_sc} "
+                  f"stripe_unit={_su} B (policy; "
+                  f"LORRAX_PHDF5_STRIPE_COUNT/_SIZE_FS override)",
+                  flush=True)
         self.fh: int = self._open_file(path, mesh=mesh, mode=mode)
         # ``open_file`` has now brought MPI up (context.cc::
         # ensure_mpi_initialized).  Ask it how big the world REALLY is
