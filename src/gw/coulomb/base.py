@@ -50,8 +50,20 @@ class SysDim(int, enum.Enum):
 
 
 class CoulombKernel(Protocol):
-    """One implementation per dimensionality."""
+    """One implementation per dimensionality.
+
+    VOLUME CONVENTION.  ``q0_average`` returns the head in **BARE** units
+    — ``8pi[...]/|q|^2``, NO ``1/Omega_cell``.  The consumer
+    (:func:`gw.head_correction.resolve_head`) applies its own volume
+    factor at injection.  The protocol docstring claimed the opposite
+    ("the BerkeleyGW factor v_q(G)*(1/Omega_cell) already applied") until
+    2026-08-05; ``Bulk3D``/``Slab2D`` were bare and right, ``Box0D``
+    divided and was wrong.  ``q0_units`` makes the convention a value the
+    dispatcher can CHECK rather than a sentence a reader can miss.
+    """
     sys_dim: SysDim
+    #: Volume convention of ``q0_average``'s return.  Must be "bare".
+    q0_units: str
 
     def q0_average(
         self, wfn, meta: Meta, *,
@@ -92,14 +104,33 @@ def get_kernel(sys_dim) -> CoulombKernel:
         )
     if sd is SysDim.BULK_3D:
         from .bulk_3d import Bulk3D
-        return Bulk3D()
+        return _checked(Bulk3D())
     if sd is SysDim.SLAB_2D:
         from .slab_2d import Slab2D
-        return Slab2D()
+        return _checked(Slab2D())
     if sd is SysDim.BOX_0D:
         from .box_0d import Box0D
-        return Box0D()
+        return _checked(Box0D())
     raise AssertionError(f"unhandled SysDim: {sd}")  # pragma: no cover
+
+
+def _checked(kernel):
+    """Refuse a kernel whose q0 volume convention is not the shared one.
+
+    Two volume conventions live in this package on purpose — ``bare`` for
+    the q->0 head, ``per_volume`` for the per-sphere builders — and the
+    only thing that keeps them apart is that each side names which it
+    means.  A kernel that returns per-volume from ``q0_average`` would be
+    off by Omega_cell at the head, which is invisible in a band plot.  So
+    the dispatcher asserts rather than trusting a docstring.
+    """
+    units = getattr(kernel, "q0_units", None)
+    if units != "bare":
+        raise AssertionError(
+            f"{type(kernel).__name__}.q0_units={units!r}; q0_average must "
+            f"return BARE (no 1/Omega_cell) — the head consumer applies the "
+            f"volume factor at injection.  Do not mix conventions silently.")
+    return kernel
 
 
 # ---------------------------------------------------------------------------

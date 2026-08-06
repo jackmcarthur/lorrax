@@ -12,6 +12,7 @@ from .kernel import TOL_MC_NAN, v_qG
 
 class Bulk3D:
     sys_dim = SysDim.BULK_3D
+    q0_units = "bare"
 
     def _vq_isotropic(self, qcart):
         """8π/|q|² on MC draws (N, 3), BARE units — see q0_average's contract.

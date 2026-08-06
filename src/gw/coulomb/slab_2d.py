@@ -17,6 +17,7 @@ from .kernel import TOL_MC_NAN, v_qG
 
 class Slab2D:
     sys_dim = SysDim.SLAB_2D
+    q0_units = "bare"
 
     def q0_average(
         self, wfn, meta: Meta, *,

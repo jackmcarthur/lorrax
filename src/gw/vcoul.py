@@ -1,14 +1,28 @@
 """Coulomb q=0 mini-BZ averaging + Voronoi-cell point wrapping.
 
 Two small helpers kept after the legacy per-q ``V(q,G)`` builder and the unused
-``compute_vcoul_comps_for_q`` / ``compute_wcoul0_with_S`` routines were removed
-(the dimension-aware ``CoulombKernel`` in :mod:`gw.coulomb` now owns that logic):
+``compute_vcoul_comps_for_q`` / ``compute_wcoul0_with_S`` routines were removed:
 
   * :func:`wrap_points_to_voronoi` — mini-BZ QMC sample wrapping (used by
-    :mod:`gw.compute_vcoul`).
+    :mod:`gw.coulomb.sampler` and :mod:`gw.coulomb.base`).
   * :func:`compute_q0_averages`    — q=0 ``(vc0, wcoul0)`` average, a thin wrapper
     over ``gw.coulomb.get_kernel(sys_dim).q0_average`` (used by
     :mod:`gw.head_correction`).
+
+WHAT ``gw.coulomb`` ACTUALLY OWNS (this file used to say "the
+dimension-aware CoulombKernel in gw.coulomb now owns that logic", which
+was never true of ``v(q+G)``):
+
+  * :mod:`gw.coulomb.kernel` — the ONE ``v(q+G)`` formula, evaluated by
+    every builder in the tree.
+  * :mod:`gw.coulomb.sampler` — the ONE mini-BZ Monte-Carlo cell average.
+  * ``gw.coulomb.{bulk_3d,slab_2d,box_0d}`` — the q->0 ``(vc0, wcoul0)``
+    head per dimensionality, and NOTHING else.
+
+The per-q-sphere ``v(q+G)`` BUILDERS live outside this package:
+:func:`gw.compute_vcoul.compute_v_q_per_G` (GW) and
+:func:`bse.vq_interp.v_slab_on_set` (BSE).  They share the formula, not
+the plumbing.
 """
 
 import functools
@@ -63,6 +77,10 @@ def compute_q0_averages(
 	(``head_minibz_average``) adds the Baldereschi-Tosatti analytic sphere
 	term (3D) / widens the Voronoi fold (both dims) to the q→0 head; default
 	False keeps the historical pure-Sobol average bit-identical.
+
+	Returns ``vc0`` in **BARE** units (no ``1/Omega_cell``) — the caller
+	applies the volume factor at injection.  ``get_kernel`` asserts this
+	(``CoulombKernel.q0_units``); it is not a docstring promise.
 	"""
 	from .coulomb import get_kernel
 	return get_kernel(getattr(meta, 'sys_dim', None)).q0_average(

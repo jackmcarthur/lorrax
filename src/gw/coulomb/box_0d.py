@@ -19,6 +19,7 @@ from .base import SysDim
 
 class Box0D:
     sys_dim = SysDim.BOX_0D
+    q0_units = "bare"
 
     def q0_average(
         self, wfn, meta: Meta, *,
@@ -34,12 +35,18 @@ class Box0D:
         BGW convention: ``wcoul0 = vc0`` for box truncation.  Screening
         enters only through the body of the dielectric matrix; the head
         is left untouched.  See BGW Common/vcoul_generator.f90:717.
+
+        BARE units, like every other kernel (``q0_units``).  Until
+        2026-08-05 this one alone divided by ``cell_volume`` while
+        :class:`~gw.coulomb.bulk_3d.Bulk3D` and
+        :class:`~gw.coulomb.slab_2d.Slab2D` returned bare — a factor
+        Omega_cell that the shared consumer
+        (:func:`gw.head_correction.resolve_head`) had no way to see.
         """
         del S_cart, epshead, nsamples, method, qmc_reps
         bdot = np.asarray(wfn.bdot, dtype=np.float64)
         fft_grid = np.asarray(wfn.fft_grid, dtype=int)
         g0 = np.array([[0, 0, 0]], dtype=int)
         vc0_raw = compute_vcoul_box(bdot, fft_grid, g0)[0]
-        vc0_mean = jnp.asarray(vc0_raw / float(wfn.cell_volume),
-                               dtype=jnp.complex128)
+        vc0_mean = jnp.asarray(vc0_raw, dtype=jnp.complex128)
         return vc0_mean, vc0_mean
