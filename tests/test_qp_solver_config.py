@@ -260,6 +260,38 @@ def test_strict_keys_true_raises_naming_every_unknown_key(tmp_path):
     assert "bogus_knob" in str(exc.value)
 
 
+def test_mixed_case_key_is_recognised_not_reported_unknown(tmp_path, capsys):
+    """``do_G0`` is honoured, so it must not also be called unrecognised.
+
+    configparser folds option names to lower case; ``do_G0`` is the only
+    key in _DEFAULTS that is not already lower case.  Before the fold was
+    applied to the recognition test, this deck BOTH steered the run
+    (``params["do_G0"] is False``) and printed ``do_g0 ... not a
+    recognized deck key`` -- and ``strict_keys = true`` refused it.
+    Checked for the failure signature (reported-unknown) rather than for
+    a success marker.
+    """
+    from gw.gw_config import read_lorrax_input
+    for spelling in ("do_G0", "do_g0"):
+        p = tmp_path / f"deck_{spelling}.in"
+        p.write_text(BASE_INPUT + f"{spelling} = false\n")
+        params = read_lorrax_input(str(p))
+        out = capsys.readouterr().out
+        assert params["do_G0"] is False, (
+            f"{spelling}: value not honoured -- test premise is wrong")
+        assert "not a recognized deck key" not in out, (
+            f"{spelling}: honoured key reported as unrecognised:\n{out}")
+
+
+def test_mixed_case_key_survives_strict_keys(tmp_path):
+    """The same key must not be REFUSED by the strict gate."""
+    from gw.gw_config import read_lorrax_input
+    p = tmp_path / "deck_strict_case.in"
+    p.write_text(BASE_INPUT + "strict_keys = true\ndo_G0 = false\n")
+    params = read_lorrax_input(str(p))     # must not raise
+    assert params["do_G0"] is False
+
+
 def test_legacy_keys_keep_their_dedicated_messages(tmp_path, capsys):
     # Keys with an explicit legacy branch (dedicated DeprecationWarning or
     # refusal) must NOT also be reported as unknown — one key, one message.

@@ -199,6 +199,16 @@ ldd "${SO_FILE}" | grep -Ei 'cusolver|nccl|cuda|cal' || true
 # share ONE runtime.  What must hold is one mapped object, not a version.
 GATE_TAG=build "${SCRIPT_DIR}/gate_one_mpi.sh" "${SO_FILE}" || exit 1
 
+# GATE 7: ONE HDF5.  On this leg the stage is what we built against, so the
+# want/have half is near-tautological -- what it really catches here is a
+# STALE build dir (a CMakeCache pinned to a stage that has since been
+# re-populated from a different module) and a stage that carries two HDF5
+# majors at once.  The cross-leg half of the invariant is enforced on the
+# host side, in config/perlmutter/build_ffi_host.sh, where the two
+# populations can actually be compared.
+GATE_TAG=build LORRAX_PHDF5_STAGE="${LORRAX_PHDF5_MOUNT:-/lorrax_phdf5}" \
+    "${SCRIPT_DIR}/gate_one_hdf5.sh" "${SO_FILE}" || exit 1
+
 # Build provenance beside the artifact.  ffi_loader.build_provenance()
 # prints it in every run's startup report; without it the loader can only say
 # "NO PROVENANCE FILE (pre-stamp build)".  On 2026-08-05 a 4-node GPU log was

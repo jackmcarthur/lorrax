@@ -1097,14 +1097,40 @@ endif()
 #  FFT am I running" must be answerable from what the .so links (invariant 2,
 #  ffi_layout.md §2) rather than from a knob somebody set three months ago.
 #
-#  This leg therefore exists for exactly one purpose: on a NON-MKL site
-#  (Cray/AMD), put a real FFTW3 into the library's DT_NEEDED so that the
-#  runtime dlsym has something to find.  Detected from fftw3.h + libfftw3,
-#  like every other RESOLVE leg, and downgraded to an announced skip when
-#  absent — at which point the handlers still build, and LORRAX_FFT_FFI
-#  refuses at STARTUP (Gate.enforce) naming the unresolved symbol.
+#  CORRECTED 2026-08-06 — THIS LEG USED TO LINK FFTW3, AND THAT WAS THE BUG.
+#  ------------------------------------------------------------------------
+#  Until today this leg put a real FFTW3 into the library's DT_NEEDED "so the
+#  runtime dlsym has something to find".  That defeats the entire point of
+#  resolving at run time.  A DT_NEEDED entry is a LOAD-TIME dependency: the
+#  dynamic linker must find that exact SONAME before a single byte of this
+#  library runs.  So the .so became unloadable on any machine that could not
+#  see `libfftw3.so.mpi31.3` — and cray-fftw's SONAME is not merely versioned,
+#  it is MPI-flavour-stamped, so it is not even the same string on two Cray
+#  sites.  Measured consequence (2026-08-06): the Shifter container does not
+#  bind-mount /opt/cray/pe/fftw at all, so `dlopen` of this library failed at
+#  DT_NEEDED resolution and NINETEEN ScaLAPACK/SLATE/GEMM contract tests —
+#  none of which touch FFT — turned into skips.  A lost FFT optimisation
+#  silently became a lost linear-algebra test suite.
+#
+#  The invariant recorded as proof that "nothing is link-bound"
+#  (`nm -D --undefined-only | grep -c fftw_` -> 0) was TRUE THROUGHOUT and did
+#  not catch it: it counts undefined SYMBOL references, and dlsym'ing every
+#  entry point correctly drives that to zero.  It says nothing about
+#  DT_NEEDED, which is what actually gates loading.  Necessary, not
+#  sufficient.  The sufficient check is now GATE 5 in
+#  config/perlmutter/build_ffi_host.sh: zero fftw in DT_NEEDED.
+#
+#  So this leg no longer contributes to the link line.  What it contributes
+#  instead is a compile-time ABSOLUTE-PATH HINT that heads the runtime dlopen
+#  candidate ladder in mklfft/fft_flat_k_ffi.cc.  The build still names the
+#  engine it was configured against — invariant 2 is preserved, and the answer
+#  to "which FFT am I running" is still baked into the artifact rather than
+#  set by a knob — but naming it can no longer prevent the library loading.
+#  Absence of the engine remains a STARTUP refusal from LORRAX_FFT_FFI
+#  (Gate.enforce) naming the unresolved symbol, which is the loud failure this
+#  was always supposed to have.
 option(LORRAX_HOST_HAVE_FFTW3
-       "Link a system FFTW3 so the runtime dlsym finds an FFT engine (not needed on MKL sites)"
+       "Record a system FFTW3 as the runtime dlopen hint (NOT linked; not needed on MKL sites)"
        ON)
 
 set(_fftw3_on 0)
@@ -1121,8 +1147,15 @@ if(LORRAX_HOST_HAVE_FFTW3)
     endif()
     if(TARGET FFTW3::fftw3)
         set(_fftw3_on 1)
-        set(_fftw3_link "FFTW3::fftw3")
-        message(STATUS "fftw3: found via FFTW3Config.cmake (imported target)")
+        # We want a PATH, not a link target: the result is a dlopen hint, not
+        # a link-line entry.  IMPORTED_LOCATION is where the imported target
+        # keeps the actual file.
+        get_target_property(_fftw3_hint FFTW3::fftw3 IMPORTED_LOCATION)
+        if(NOT _fftw3_hint)
+            get_target_property(_fftw3_hint FFTW3::fftw3
+                                IMPORTED_LOCATION_RELEASE)
+        endif()
+        message(STATUS "fftw3: found via FFTW3Config.cmake -> ${_fftw3_hint}")
     else()
         find_package(PkgConfig QUIET)
         if(PkgConfig_FOUND)
@@ -1136,9 +1169,7 @@ if(LORRAX_HOST_HAVE_FFTW3)
                   "$ENV{FFTW_DIR}" "$ENV{FFTW_ROOT}/lib")
         if(LORRAX_FFTW3_LIBRARY)
             set(_fftw3_on 1)
-            set(_fftw3_link "${LORRAX_FFTW3_LIBRARY}")
-            get_filename_component(_fftw3_libdir
-                                   "${LORRAX_FFTW3_LIBRARY}" DIRECTORY)
+            set(_fftw3_hint "${LORRAX_FFTW3_LIBRARY}")
             message(STATUS "fftw3: ${LORRAX_FFTW3_LIBRARY}")
         endif()
     endif()
@@ -1153,8 +1184,9 @@ set(_mklfft_on 1)
 if(_fftw3_on)
     message(STATUS
         "mklfft: flat-k FFT handlers ON — FFTW3 advanced interface "
-        "(fftw_plan_many_dft) resolved at runtime by dlsym; a system FFTW3 "
-        "is linked for the dlsym to find.")
+        "(fftw_plan_many_dft) resolved at runtime by dlsym.  System FFTW3 "
+        "recorded as the runtime dlopen HINT (${_fftw3_hint}) and "
+        "deliberately NOT linked — see the DT_NEEDED note above.")
 else()
     message(STATUS
         "mklfft: flat-k FFT handlers ON — FFTW3 advanced interface "
@@ -1238,11 +1270,17 @@ if(_mklfft_on)
     if(NOT LORRAX_MKL_THREAD_LIB STREQUAL "mkl_gnu_thread")
         list(APPEND _host_math_link "-lgomp")
     endif()
-    if(_fftw3_on)
-        list(APPEND _host_math_link "${_fftw3_link}")
-        if(_fftw3_libdir)
-            list(APPEND _host_math_rpaths "${_fftw3_libdir}")
-        endif()
+    # NOT `list(APPEND _host_math_link ...)`.  The detected FFTW3 is handed to
+    # the TU as a compile-time dlopen HINT and never reaches the link line —
+    # linking it is what made the whole library unloadable wherever that exact
+    # SONAME was absent (see the DT_NEEDED note at the detection block).  No
+    # rpath entry either, for the same reason: an rpath pointing at a
+    # bare-metal-only directory is how a container-invisible dependency gets
+    # baked in without anyone noticing.
+    if(_fftw3_on AND _fftw3_hint)
+        set_property(SOURCE mklfft/fft_flat_k_ffi.cc APPEND PROPERTY
+            COMPILE_DEFINITIONS
+            "LORRAX_FFTW3_SO_HINT=\"${_fftw3_hint}\"")
     endif()
 endif()
 if(_mklblas_on)
@@ -1297,8 +1335,10 @@ endif()
 #  in the library instead of only in a configure log nobody kept.
 #  lorrax_ffi_host_build_config() returns it as one line, so a run (or a
 #  `strings` on a .so found in a scratch directory) can report its own
-#  provenance.  Note it records whether an FFTW3 was LINKED, not which engine
-#  will bind: that is a runtime dlsym fact by design.
+#  provenance.  Note it records whether an FFTW3 was FOUND AT CONFIGURE TIME
+#  and recorded as the runtime dlopen hint — not that one was linked (none is,
+#  since 2026-08-06) and not which engine will actually bind: that is a
+#  runtime dlopen/dlsym fact by design.
 # ---------------------------------------------------------------------------
 if(_fftw3_on)
     set(LORRAX_CFG_FFTW3 1)

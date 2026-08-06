@@ -250,9 +250,51 @@ struct DescKey {
 //   * ONE SOURCE, NO FORK.  On Frontera the symbols resolve out of
 //     libmkl_intel_lp64, already on the link line, because MKL exports the
 //     FFTW3 C interface natively -- no wrapper build, no new link dep.  On a
-//     Cray/AMD site the LORRAX_HOST_HAVE_FFTW3 CMake leg links the system
-//     FFTW and the SAME dlsym finds it.  The engine is named by what the .so
-//     links, never by a knob -- invariant 2 (§2).
+//     Cray/AMD site the engine is brought in by the dlopen ladder below.
+//     The engine is named by what the process can load, never by a knob --
+//     invariant 2 (§2).
+//
+//  CORRECTED 2026-08-06 -- WHY THERE IS A dlopen LADDER AND NOT A LINK.
+//  --------------------------------------------------------------------
+//  This comment used to read "the LORRAX_HOST_HAVE_FFTW3 CMake leg links the
+//  system FFTW and the SAME dlsym finds it".  That is what the build did, and
+//  it was self-defeating.  Linking FFTW3 puts its SONAME in DT_NEEDED, which
+//  is a LOAD-TIME dependency: the dynamic linker must resolve it before any
+//  code in this library runs.  So the library became unloadable anywhere that
+//  exact SONAME was missing -- and cray-fftw's is `libfftw3.so.mpi31.3`,
+//  version- AND MPI-flavour-stamped, not a string that survives a move to
+//  another site, another cray-fftw, or (measured, 2026-08-06) into the
+//  Shifter container, which does not bind-mount /opt/cray/pe/fftw at all.
+//  Nineteen ScaLAPACK/SLATE/GEMM contract tests that never touch an FFT
+//  became skips because the FFT engine's library was not on disk.
+//
+//  Resolving symbols at run time is only half of run-time resolution.  The
+//  library that DEFINES them has to be loaded at run time too, or the
+//  link-time coupling is still there -- just moved from the symbol table to
+//  the DT_NEEDED list, where the recorded invariant
+//  (`nm -D --undefined-only | grep -c fftw_` -> 0) could not see it.  Hence:
+//
+//      stage 1  resolve_sym            -- already-loaded provider.  This is
+//                                        the MKL site: libmkl_intel_lp64 is
+//                                        in DT_NEEDED for ScaLAPACK anyway
+//                                        and exports the FFTW3 C interface,
+//                                        so Frontera never reaches stage 2.
+//      stage 2  dlopen(candidates)     -- non-MKL site.  RTLD_GLOBAL so the
+//                                        symbols enter the global scope and
+//                                        stage 1's resolver finds them on the
+//                                        retry.  Nothing is added to
+//                                        DT_NEEDED, so failure here costs the
+//                                        FFT handlers and NOTHING ELSE.
+//      stage 3  refuse, loudly         -- LORRAX_FFT_FFI's startup
+//                                        announce-or-refuse, naming the
+//                                        symbol AND every candidate tried.
+//
+//  The candidate list is ordered most-specific-first.  LORRAX_FFTW3_SO_HINT is
+//  the absolute path CMake recorded for the FFTW3 it was configured against --
+//  that is how "the engine is named by the build" survives the link removal.
+//  LORRAX_FFTW3_SO is deployment plumbing (GATES.md's "not gates" list), for a
+//  site whose SONAME nobody guessed; it is not a gate and selects nothing
+//  numerically -- every candidate implements the same FFTW3 advanced ABI.
 //   * NO NEW ENVIRONMENT VARIABLE.  Deliberate.  LORRAX_FFT_FFI still
 //     announces-or-refuses, and since the 2026-08-01 FFI-required ruling
 //     that refusal fires at STARTUP via Gate.enforce.
@@ -268,25 +310,111 @@ struct FftwApi {
     void (*destroy_plan)(fftw_plan_t) = nullptr;
     bool ok = false;
     const char* missing = nullptr;
+    // Where the engine came from, and — when it did not come at all — every
+    // candidate that was tried.  Both feed the refusal message: "no FFT
+    // engine" without the list of names looked for is an unactionable error.
+    std::string provider;
+    std::string tried;
 };
+
+// The dlopen candidate ladder.  Most specific first; every entry is the same
+// FFTW3 advanced ABI, so the order is about WHICH FILE, never about which
+// numerics.  Empty entries are skipped, so an unset env var costs nothing.
+static std::vector<std::string> fftw3_candidates() {
+    std::vector<std::string> out;
+    auto push = [&out](const char* s) {
+        if (s && *s) out.emplace_back(s);
+    };
+    // 1. Deployment plumbing: a site whose SONAME nobody guessed.
+    push(std::getenv("LORRAX_FFTW3_SO"));
+    // 2. What THIS BUILD was configured against, as an absolute path.  This
+    //    is how the artifact keeps naming its own engine now that the link
+    //    is gone.
+#ifdef LORRAX_FFTW3_SO_HINT
+    push(LORRAX_FFTW3_SO_HINT);
+#endif
+    // 3. Portable SONAMEs, in decreasing likelihood.  `libfftw3.so.3` is the
+    //    upstream FFTW3 SONAME everywhere; `.so.mpi31.3` is cray-fftw's
+    //    MPI-flavour-stamped one; the bare `.so` is a devel symlink, present
+    //    only where headers are installed, hence last.
+    push("libfftw3.so.3");
+    push("libfftw3.so.mpi31.3");
+    push("libmkl_rt.so");
+    push("libfftw3.so");
+    return out;
+}
 
 static const FftwApi& fftw_api() {
     static const FftwApi api = [] {
         FftwApi a;
-        a.plan_many = reinterpret_cast<decltype(a.plan_many)>(
-            mklpin::resolve_sym("fftw_plan_many_dft"));
-        a.execute_dft = reinterpret_cast<decltype(a.execute_dft)>(
-            mklpin::resolve_sym("fftw_execute_dft"));
-        a.destroy_plan = reinterpret_cast<decltype(a.destroy_plan)>(
-            mklpin::resolve_sym("fftw_destroy_plan"));
-        if (!a.plan_many)        a.missing = "fftw_plan_many_dft";
-        else if (!a.execute_dft) a.missing = "fftw_execute_dft";
+        auto bind = [&a] {
+            a.plan_many = reinterpret_cast<decltype(a.plan_many)>(
+                mklpin::resolve_sym("fftw_plan_many_dft"));
+            a.execute_dft = reinterpret_cast<decltype(a.execute_dft)>(
+                mklpin::resolve_sym("fftw_execute_dft"));
+            a.destroy_plan = reinterpret_cast<decltype(a.destroy_plan)>(
+                mklpin::resolve_sym("fftw_destroy_plan"));
+            return a.plan_many && a.execute_dft && a.destroy_plan;
+        };
+
+        // STAGE 1 — an engine already in the process.  The MKL site lands
+        // here: libmkl_intel_lp64 is in DT_NEEDED for ScaLAPACK and exports
+        // the FFTW3 C interface natively, so nothing is dlopen'd on Frontera
+        // and the behaviour there is byte-for-byte what it was.
+        if (bind()) {
+            a.provider = "already loaded (no dlopen needed)";
+        } else {
+            // STAGE 2 — bring one in.  RTLD_GLOBAL is load-bearing: the
+            // symbols must enter the global scope for the stage-1 resolver to
+            // find them on the retry.  RTLD_NOW so a broken engine fails HERE,
+            // naming itself, rather than at the first transform.
+            std::ostringstream tried;
+            bool first = true;
+            for (const std::string& cand : fftw3_candidates()) {
+                if (!first) tried << ", ";
+                first = false;
+                tried << cand;
+                void* h = dlopen(cand.c_str(), RTLD_NOW | RTLD_GLOBAL);
+                if (h == nullptr) {
+                    if (log_enabled()) {
+                        const char* e = dlerror();
+                        std::fprintf(stderr, "[mklfft] dlopen(%s) failed: %s\n",
+                                     cand.c_str(), e ? e : "(no dlerror)");
+                    }
+                    continue;
+                }
+                // Deliberately never dlclose'd: the plans below hold state
+                // inside the engine for the life of the process.
+                if (bind()) {
+                    a.provider = cand;
+                    break;
+                }
+                if (log_enabled()) {
+                    std::fprintf(stderr,
+                                 "[mklfft] dlopen(%s) succeeded but does not "
+                                 "export the FFTW3 advanced interface\n",
+                                 cand.c_str());
+                }
+            }
+            a.tried = tried.str();
+        }
+
+        if (!a.plan_many)         a.missing = "fftw_plan_many_dft";
+        else if (!a.execute_dft)  a.missing = "fftw_execute_dft";
         else if (!a.destroy_plan) a.missing = "fftw_destroy_plan";
         a.ok = (a.missing == nullptr);
         if (log_enabled()) {
-            std::fprintf(stderr, "[mklfft] FFTW3 engine %s\n",
-                         a.ok ? "resolved (fftw_plan_many_dft et al.)"
-                              : "NOT RESOLVED");
+            if (a.ok) {
+                std::fprintf(stderr,
+                             "[mklfft] FFTW3 engine resolved "
+                             "(fftw_plan_many_dft et al.) from %s\n",
+                             a.provider.c_str());
+            } else {
+                std::fprintf(stderr,
+                             "[mklfft] FFTW3 engine NOT RESOLVED (%s); "
+                             "tried: %s\n",
+                             a.missing, a.tried.c_str());
+            }
         }
         return a;
     }();
@@ -386,13 +514,21 @@ static inline void scale_strided(C128* p, long nk, long howmany, long stride,
 static ffi::Error engine_absent_error() {
     const FftwApi& api = fftw_api();
     std::ostringstream os;
-    os << "mklfft: no FFTW3 engine in this process — dlsym could not resolve "
+    os << "mklfft: no FFTW3 engine in this process — could not resolve "
        << (api.missing ? api.missing : "the FFTW3 entry points")
        << ".  The flat-k FFT handlers call the FFTW3 ADVANCED interface, "
           "which Intel MKL exports natively (libmkl_intel_lp64) and which "
-          "cray-fftw / stock FFTW3 / AOCL also provide.  Link one of them "
-          "into liblorrax_ffi_host.so: on a Cray site configure with "
-          "-DLORRAX_HOST_HAVE_FFTW3=ON after `module load cray-fftw`.";
+          "cray-fftw / stock FFTW3 / AOCL also provide.  No engine was "
+          "already loaded, and dlopen found none of: "
+       << (api.tried.empty() ? std::string("(no candidates tried)") : api.tried)
+       << ".  FIX: put an FFTW3 where the dynamic linker can see it "
+          "(LD_LIBRARY_PATH, or a bind-mount if you are in a container — note "
+          "that /opt/cray/pe/fftw is NOT mounted inside the Shifter image), "
+          "or name the file outright with LORRAX_FFTW3_SO=/path/to/libfftw3.so"
+          ".  Do NOT try to fix this by linking FFTW3 into "
+          "liblorrax_ffi_host.so: that was the pre-2026-08-06 arrangement, and "
+          "it made the ENTIRE library — ScaLAPACK, SLATE and GEMM handlers "
+          "included — fail to load wherever the FFTW3 SONAME was absent.";
     return ffi::Error(ffi::ErrorCode::kInternal, os.str());
 }
 

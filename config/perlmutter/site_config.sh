@@ -100,7 +100,21 @@ LORRAX_DARSHAN_LIB_DIR="/global/common/software/nersc9/darshan/default/lib"
 # inactivity, and these are small read-once libs that belong on non-purged $HOME
 # (matches LORRAX_SLATE_INSTALL_DIR_DEFAULT below).
 LORRAX_FFI_NVHPC_DIR_DEFAULT="$HOME/software/lorrax_nvhpc"
-LORRAX_FFI_PHDF5_DIR_DEFAULT="$HOME/software/lorrax_phdf5_cray/stage"
+# 2026-08-06: moved off lorrax_phdf5_cray/stage, which held HDF5 **1.12**
+# while config/perlmutter/build_ffi_host.sh has loaded
+# cray-hdf5-parallel/1.14.3.7 since it was written.  The host FFI leg
+# therefore asked the container for libhdf5_parallel_gnu.so.310 and got
+# `not found`, which took the WHOLE library down at dlopen (CLAIMS 89).
+# The version is IN THE PATH on purpose: which HDF5 is in the stage is the
+# fact that drifted, and a name that cannot express it is how it drifted
+# unnoticed for months.  GATE 7 (src/ffi/cpp/gate_one_hdf5.sh) now compares
+# this tree against what each leg links.
+#
+# CHANGING THIS INVALIDATES BOTH FFI .so FILES.  The device leg links
+# whatever is at /lorrax_phdf5 (src/ffi/cpp/CMakeLists.txt:356-360), so a
+# stage swap without a matching `src/ffi/cpp/build.sh` is the same skew
+# again with the legs reversed.  Move both together.
+LORRAX_FFI_PHDF5_DIR_DEFAULT="$HOME/software/lorrax_phdf5_cray_1.14.3.7/stage"
 LORRAX_FFI_SLATE_DIR_DEFAULT="$HOME/software/lorrax_slate_cray/stage"
 
 # Host SLATE install (bundled blaspp/lapackpp alongside).  Override with
