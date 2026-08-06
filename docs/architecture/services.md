@@ -84,7 +84,10 @@ as device-varying (`lax.pvary` on 0.7–0.8, `lax.pcast` from 0.9, identity
 below 0.7.0, and a **refusal at import** on a jax that tracks varying
 manual axes but offers neither). It is the same pattern applied to a
 library *version* rather than a vendor library, and it is what unblocks
-leaving jax 0.5.3.
+leaving jax 0.5.3. **Read `agent/jax-070-land-2026-08-06` instead** — it
+contains that branch plus the container move and the supported-version
+window, and is the branch the [JAX straddle
+note](../environment/overview.md) tracks. Both are unmerged.
 
 ## Which services expose a choice, and which hide one {#choice}
 
