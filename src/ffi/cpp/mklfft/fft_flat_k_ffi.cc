@@ -86,7 +86,19 @@
 #include <dlfcn.h>
 #include <omp.h>
 
-#include <mkl_dfti.h>
+// NO vendor FFT header.  The FFTW3 entry points are resolved at RUN time by
+// dlsym (see the table below), so this TU must compile on a site that has no
+// FFT development headers at all — and it must not bake in whose FFT it is.
+// The five declarations below are the FFTW3 ABI, which is stable and
+// identical across FFTW3, cray-fftw, AOCL and MKL's native FFTW3 interface:
+//   fftw_plan     is an opaque pointer
+//   fftw_complex  is double[2], layout-compatible with std::complex<double>
+//   the flag/sign values are fixed by the FFTW3 API contract
+using fftw_plan_t = void*;
+static constexpr int kFftwForward = -1;
+static constexpr int kFftwBackward = +1;
+static constexpr unsigned kFftwEstimate = 1U << 6;   // FFTW_ESTIMATE
+static constexpr unsigned kFftwUnaligned = 1U << 1;  // FFTW_UNALIGNED
 
 #include "../common/mkl_thread_pin.h"
 #include "xla/ffi/api/ffi.h"
@@ -211,134 +223,202 @@ static bool log_enabled() {
 // `inplace` field claiming a live, unit-gated DFTI_INPLACE path was deleted
 // by the 2026-07-31 audit (P1.8): it was 0 at every construction site.
 struct DescKey {
-    MKL_LONG d0, d1, d2;
-    MKL_LONG t_in, t_out;  // trail-stride multiplier (elements) in/out
-    MKL_LONG n;            // transforms per compute call
-    double sf, sb;         // forward / backward scale
+    // Kept the name: every call site below already speaks it, and the fields
+    // map one-for-one onto fftw_plan_many_dft's advanced-interface
+    // parameters.  t_in/t_out ARE istride/ostride; n IS howmany; idist and
+    // odist are both 1 (the flat-k layout is ONE uniform batch -- the whole
+    // reason the advanced interface is an exact fit and guru buys nothing).
+    long d0, d1, d2;
+    long t_in, t_out;      // element stride (istride / ostride)
+    long n;                // transforms per execute call (howmany)
+    int  sign;             // kFftwForward | kFftwBackward
 
     bool operator<(const DescKey& o) const {
-        return std::tie(d0, d1, d2, t_in, t_out, n, sf, sb) <
-               std::tie(o.d0, o.d1, o.d2, o.t_in, o.t_out, o.n, o.sf, o.sb);
+        return std::tie(d0, d1, d2, t_in, t_out, n, sign) <
+               std::tie(o.d0, o.d1, o.d2, o.t_in, o.t_out, o.n, o.sign);
     }
 };
+// ---------------------------------------------------------------------------
+//  THE FFTW3 SYMBOL TABLE, resolved at RUN time.
+//
+//  Design: docs/architecture/ffi_layout.md §7.  This is the pattern the GEMM
+//  service already proved (cpp/mklblas/gemm_batch_ffi.cc) -- resolve each
+//  vendor entry point through mklpin::resolve_sym (RTLD_DEFAULT then
+//  RTLD_NEXT) rather than taking a link-time dependency.  Three consequences,
+//  all of them the point:
+//
+//   * ONE SOURCE, NO FORK.  On Frontera the symbols resolve out of
+//     libmkl_intel_lp64, already on the link line, because MKL exports the
+//     FFTW3 C interface natively -- no wrapper build, no new link dep.  On a
+//     Cray/AMD site the LORRAX_HOST_HAVE_FFTW3 CMake leg links the system
+//     FFTW and the SAME dlsym finds it.  The engine is named by what the .so
+//     links, never by a knob -- invariant 2 (§2).
+//   * NO NEW ENVIRONMENT VARIABLE.  Deliberate.  LORRAX_FFT_FFI still
+//     announces-or-refuses, and since the 2026-08-01 FFI-required ruling
+//     that refusal fires at STARTUP via Gate.enforce.
+//   * ABSENCE IS LOUD.  A missing engine is a refusal naming the symbol,
+//     never a silent demotion to a slower path and never a wrong number.
+// ---------------------------------------------------------------------------
+struct FftwApi {
+    fftw_plan_t (*plan_many)(int, const int*, int,
+                             void*, const int*, int, int,
+                             void*, const int*, int, int,
+                             int, unsigned) = nullptr;
+    void (*execute_dft)(fftw_plan_t, void*, void*) = nullptr;
+    void (*destroy_plan)(fftw_plan_t) = nullptr;
+    bool ok = false;
+    const char* missing = nullptr;
+};
 
-static bool dfti_ok(MKL_LONG status) {
-    return status == 0 || DftiErrorClass(status, DFTI_NO_ERROR);
+static const FftwApi& fftw_api() {
+    static const FftwApi api = [] {
+        FftwApi a;
+        a.plan_many = reinterpret_cast<decltype(a.plan_many)>(
+            mklpin::resolve_sym("fftw_plan_many_dft"));
+        a.execute_dft = reinterpret_cast<decltype(a.execute_dft)>(
+            mklpin::resolve_sym("fftw_execute_dft"));
+        a.destroy_plan = reinterpret_cast<decltype(a.destroy_plan)>(
+            mklpin::resolve_sym("fftw_destroy_plan"));
+        if (!a.plan_many)        a.missing = "fftw_plan_many_dft";
+        else if (!a.execute_dft) a.missing = "fftw_execute_dft";
+        else if (!a.destroy_plan) a.missing = "fftw_destroy_plan";
+        a.ok = (a.missing == nullptr);
+        if (log_enabled()) {
+            std::fprintf(stderr, "[mklfft] FFTW3 engine %s\n",
+                         a.ok ? "resolved (fftw_plan_many_dft et al.)"
+                              : "NOT RESOLVED");
+        }
+        return a;
+    }();
+    return api;
 }
 
-// Create+commit (or fetch) the descriptor for one chunk geometry.  The
-// batch rides the unit-stride trail: NUMBER_OF_TRANSFORMS=n at DISTANCE 1,
-// FFT-axis strides {d1*d2*T, d2*T, T} — the documented MKL "transform
-// along a non-minor axis" layout (one-to-one because n <= T).  Both scales
-// are set so one handle serves forward and backward computes.
-static MKL_LONG get_descriptor(const DescKey& k, DFTI_DESCRIPTOR_HANDLE* out) {
-    static thread_local std::map<DescKey, DFTI_DESCRIPTOR_HANDLE> cache;
+// THREE FFTW HAZARDS THIS DESIGN IS BUILT AROUND
+// ----------------------------------------------
+// 1. THE PLANNER IS NOT THREAD-SAFE.  fftw_plan_* mutates global planner
+//    state; only fftw_execute* is re-entrant.  The chunk loop below is an
+//    OpenMP parallel region, so every plan lookup/creation is serialised by
+//    plan_mutex() and execution uses the NEW-ARRAY entry fftw_execute_dft,
+//    which is documented thread-safe.
+// 2. FFTW_MEASURE OVERWRITES ITS BUFFERS.  Planning with MEASURE would
+//    destroy the XLA operand we were handed.  FFTW_ESTIMATE is documented
+//    not to touch the arrays, so planning against live buffers is safe.
+//    MEASURE is a deliberate non-goal here.
+// 3. NEW-ARRAY EXECUTION HAS AN ALIGNMENT CONTRACT.  fftw_execute_dft may
+//    only be handed arrays whose alignment matches the planning arrays,
+//    because a plan can bake in SIMD assumptions.  Our pointers are chunk
+//    offsets into XLA buffers and are NOT alignment-stable, so every plan is
+//    created FFTW_UNALIGNED.  That costs some vectorisation and is the
+//    correct trade: the alternative is a wrong answer or a SIGSEGV on an
+//    unlucky offset.
+static std::mutex& plan_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+// Returns nullptr if the engine is absent or the planner failed.
+static fftw_plan_t get_descriptor(const DescKey& k, void* in_hint,
+                                  void* out_hint) {
+    const FftwApi& api = fftw_api();
+    if (!api.ok) return nullptr;
+    static std::map<DescKey, fftw_plan_t> cache;
+    std::lock_guard<std::mutex> g(plan_mutex());
     auto it = cache.find(k);
-    if (it != cache.end()) {
-        *out = it->second;
-        return 0;
-    }
-    DFTI_DESCRIPTOR_HANDLE h = nullptr;
-    MKL_LONG dims3[3] = {k.d0, k.d1, k.d2};
-    MKL_LONG st = DftiCreateDescriptor(&h, DFTI_DOUBLE, DFTI_COMPLEX, 3, dims3);
-    if (!dfti_ok(st)) return st;
-    MKL_LONG istr[4] = {0, k.d1 * k.d2 * k.t_in, k.d2 * k.t_in, k.t_in};
-    MKL_LONG ostr[4] = {0, k.d1 * k.d2 * k.t_out, k.d2 * k.t_out, k.t_out};
-    st = DftiSetValue(h, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
-    if (dfti_ok(st)) st = DftiSetValue(h, DFTI_INPUT_STRIDES, istr);
-    if (dfti_ok(st)) st = DftiSetValue(h, DFTI_OUTPUT_STRIDES, ostr);
-    if (dfti_ok(st)) st = DftiSetValue(h, DFTI_NUMBER_OF_TRANSFORMS, k.n);
-    if (dfti_ok(st)) st = DftiSetValue(h, DFTI_INPUT_DISTANCE, (MKL_LONG)1);
-    if (dfti_ok(st)) st = DftiSetValue(h, DFTI_OUTPUT_DISTANCE, (MKL_LONG)1);
-    if (dfti_ok(st)) st = DftiSetValue(h, DFTI_FORWARD_SCALE, k.sf);
-    if (dfti_ok(st)) st = DftiSetValue(h, DFTI_BACKWARD_SCALE, k.sb);
-    // One MKL thread per handle: the chunk loop is the parallel dimension.
-    if (dfti_ok(st)) st = DftiSetValue(h, DFTI_THREAD_LIMIT, (MKL_LONG)1);
-    if (dfti_ok(st)) st = DftiCommitDescriptor(h);
-    if (!dfti_ok(st)) {
-        if (h) DftiFreeDescriptor(&h);
-        return st;
-    }
-    // ONE line per distinct geometry per PROCESS.  The descriptor cache
-    // above is `thread_local`, so this site is reached once per (thread,
-    // key): before the 2026-07-30 audit the log was multiplied by the
-    // OpenMP team size (28/rank in production) and then again by the
-    // process count.  The diagnostic question this line answers — "which
-    // descriptor geometries did this process build?" — is a per-process
-    // property, so a process-wide seen-set preserves the whole answer and
-    // drops the multiplier.  The thread number is kept and now names the
-    // thread that FIRST committed the geometry.
+    if (it != cache.end()) return it->second;
+
+    int n3[3] = {static_cast<int>(k.d0), static_cast<int>(k.d1),
+                 static_cast<int>(k.d2)};
+    // inembed/onembed NULL => taken as n, so element (i0,i1,i2) of transform
+    // j sits at  base + j*dist + (i0*d1*d2 + i1*d2 + i2)*stride.  That is
+    // byte-for-byte the addressing the old DFTI strides
+    // {0, d1*d2*t, d2*t, t} with INPUT_DISTANCE 1 produced.
+    fftw_plan_t p = api.plan_many(
+        3, n3, static_cast<int>(k.n),
+        in_hint,  nullptr, static_cast<int>(k.t_in),  1,
+        out_hint, nullptr, static_cast<int>(k.t_out), 1,
+        k.sign, kFftwEstimate | kFftwUnaligned);
+    if (!p) return nullptr;
+
     if (log_enabled()) {
-        static std::mutex seen_mu;
         static std::map<DescKey, char> seen;
-        bool first = false;
-        {
-            std::lock_guard<std::mutex> g(seen_mu);
-            first = seen.emplace(k, '\0').second;
-        }
-        if (first) {
+        if (seen.emplace(k, '\0').second) {
             std::fprintf(stderr,
-                         "[mklfft] commit dims=(%ld,%ld,%ld) t_in=%ld "
-                         "t_out=%ld n=%ld sf=%.3e sb=%.3e "
-                         "(first committed by thread %d)\n",
-                         (long)k.d0, (long)k.d1, (long)k.d2, (long)k.t_in,
-                         (long)k.t_out, (long)k.n, k.sf, k.sb,
-                         omp_get_thread_num());
+                         "[mklfft] plan dims=(%ld,%ld,%ld) istride=%ld "
+                         "ostride=%ld howmany=%ld sign=%d "
+                         "(ESTIMATE|UNALIGNED)\n",
+                         k.d0, k.d1, k.d2, k.t_in, k.t_out, k.n, k.sign);
         }
     }
-    cache.emplace(k, h);
-    *out = h;
-    return 0;
+    cache.emplace(k, p);
+    return p;
 }
 
-static MKL_LONG compute(DFTI_DESCRIPTOR_HANDLE h, bool forward,
-                        const C128* in, C128* out) {
-    // Every descriptor is DFTI_NOT_INPLACE, which never writes the input
-    // buffer, so the const_cast is safe for the XLA (read-only) operand.
-    // The XLA-granted alias (in == out at the HANDLER level) is handled by
-    // the chunk engine's read-before-scatter ordering, never by DFTI
-    // placement (P1.8).
-    void* pin = const_cast<void*>(static_cast<const void*>(in));
-    return forward ? DftiComputeForward(h, pin, static_cast<void*>(out))
-                   : DftiComputeBackward(h, pin, static_cast<void*>(out));
+static inline void execute(fftw_plan_t p, const C128* in, C128* out) {
+    // Plans are never FFTW_IN_PLACE, so the transform never writes the input
+    // buffer and the const_cast is safe for the XLA (read-only) operand.  The
+    // XLA-granted alias (in == out at the HANDLER level) is handled by the
+    // chunk engine's read-before-scatter ordering, exactly as it was under
+    // DFTI's NOT_INPLACE descriptors (P1.8).
+    fftw_api().execute_dft(p, const_cast<void*>(static_cast<const void*>(in)),
+                           static_cast<void*>(out));
 }
 
-// Aggregate the first DFTI failure out of an OpenMP region.
+// FFTW normalises NOTHING in either direction (its backward transform is
+// unnormalised), where DFTI folded the scale into the descriptor via
+// FORWARD_SCALE/BACKWARD_SCALE.  The caller's pre-folded jnp-convention
+// scale therefore becomes an explicit pass here.  Same total, one extra
+// streaming multiply over the chunk.
+static inline void scale_contig(C128* p, long n, double s) {
+    if (s == 1.0) return;
+    for (long i = 0; i < n; ++i) p[i] *= s;
+}
+
+static inline void scale_strided(C128* p, long nk, long howmany, long stride,
+                                 double s) {
+    if (s == 1.0) return;
+    for (long k = 0; k < nk; ++k) {
+        C128* row = p + k * stride;
+        for (long j = 0; j < howmany; ++j) row[j] *= s;
+    }
+}
+
+// The one refusal, phrased so the fix is in the message.
+static ffi::Error engine_absent_error() {
+    const FftwApi& api = fftw_api();
+    std::ostringstream os;
+    os << "mklfft: no FFTW3 engine in this process — dlsym could not resolve "
+       << (api.missing ? api.missing : "the FFTW3 entry points")
+       << ".  The flat-k FFT handlers call the FFTW3 ADVANCED interface, "
+          "which Intel MKL exports natively (libmkl_intel_lp64) and which "
+          "cray-fftw / stock FFTW3 / AOCL also provide.  Link one of them "
+          "into liblorrax_ffi_host.so: on a Cray site configure with "
+          "-DLORRAX_HOST_HAVE_FFTW3=ON after `module load cray-fftw`.";
+    return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+}
+
 struct ErrSink {
     std::atomic<bool> failed{false};
     std::mutex mu;
     std::string msg;
 
-    void record(MKL_LONG status, const char* where) {
+    // Was DFTI status + DftiErrorMessage; FFTW has no status codes at all
+    // (plan creation simply returns NULL), so `where` carries the whole
+    // diagnostic and `status` is retained only so the call sites did not
+    // have to change shape during the engine swap.
+    void record(long status, const char* where) {
         if (failed.exchange(true)) return;
         std::lock_guard<std::mutex> lock(mu);
         std::ostringstream os;
-        os << "mklfft (MKL FFT via the DFTI API): " << where
-           << " failed, status=" << (long)status << " — "
-           << DftiErrorMessage(status);
+        os << "mklfft (FFTW3 advanced interface): " << where << " failed";
+        if (status) os << ", status=" << status;
+        const FftwApi& api = fftw_api();
+        if (!api.ok && api.missing) os << " — no FFTW3 engine: dlsym could not resolve " << api.missing;
         msg = os.str();
     }
 };
 
-// The batched-FFT engine: transform `T` trail elements of `in` -> `out`
-// (both in the strided flat-k layout with trail stride multiplier T),
-// chunked over the trail across an OpenMP team.
-//
-// Each chunk transforms strided-input -> a per-thread COMPACT buffer
-// (trail stride = chunk), then scatter-copies the nk contiguous k-lines
-// to the strided output.  Rationale (measured, unit gate 7878708): the
-// small 3-D FFT is computed dimension-by-dimension, so a strided→strided
-// transform streams the ~400 MB tile once per radix pass (161.7 ms at 28
-// threads, SLOWER than XLA's transpose+DUCC), while the compact form
-// keeps those passes in the per-core L2 and streams the big tile once
-// in + once out (the fused-conv path already worked this way and ran
-// ~2x faster per transform).  The extra cost is one L2->memory copy of
-// the chunk — 16 contiguous memcpys per chunk.
-// The `in == out` (XLA granted the alias) case needs no DFTI_INPLACE
-// here: the chunk's k-lines are read into the compact buffer before the
-// scatter-copy rewrites exactly those locations.
 static ffi::Error run_flat_batch(
-    MKL_LONG d0, MKL_LONG d1, MKL_LONG d2, int64_t T, bool forward,
+    long d0, long d1, long d2, int64_t T, bool forward,
     double scale, const C128* in, C128* out)
 {
     const int64_t nk = (int64_t)d0 * d1 * d2;
@@ -346,10 +426,8 @@ static ffi::Error run_flat_batch(
     const int64_t n_chunks = (T + C - 1) / C;
     const int nthr = static_cast<int>(
         std::min<int64_t>(team_threads(), n_chunks));
-    // 'ortho'/'backward'/'forward' totals arrive pre-folded from Python;
-    // the same value is planted on the direction actually computed.
-    const double sf = forward ? scale : 1.0;
-    const double sb = forward ? 1.0 : scale;
+    if (!fftw_api().ok) return engine_absent_error();
+    const int sign = forward ? kFftwForward : kFftwBackward;
     ErrSink err;
 
 #pragma omp parallel num_threads(nthr)
@@ -362,14 +440,15 @@ static ffi::Error run_flat_batch(
         for (int64_t ci = 0; ci < n_chunks; ++ci) {
             if (err.failed.load(std::memory_order_relaxed)) continue;
             const int64_t t0 = ci * C;
-            const MKL_LONG c = static_cast<MKL_LONG>(
+            const long c = static_cast<long>(
                 std::min<int64_t>(C, T - t0));
-            DescKey key{d0, d1, d2, (MKL_LONG)T, c, c, sf, sb};
-            DFTI_DESCRIPTOR_HANDLE h = nullptr;
-            MKL_LONG st = get_descriptor(key, &h);
-            if (!dfti_ok(st)) { err.record(st, "descriptor"); continue; }
-            st = compute(h, forward, in + t0, buf);
-            if (!dfti_ok(st)) { err.record(st, "compute"); continue; }
+            DescKey key{(long)d0, (long)d1, (long)d2, (long)T, (long)c,
+                        (long)c, sign};
+            fftw_plan_t h = get_descriptor(
+                key, const_cast<C128*>(in + t0), buf);
+            if (!h) { err.record(0, "plan creation"); continue; }
+            execute(h, in + t0, buf);
+            scale_contig(buf, (long)(nk * c), scale);
             for (int64_t k = 0; k < nk; ++k) {
                 std::memcpy(out + k * T + t0, buf + k * c,
                             (size_t)c * sizeof(C128));
@@ -427,7 +506,7 @@ static ffi::Error FlatKDispatch(
                          (long)chunk_elems(nk));
         }
     }
-    return run_flat_batch((MKL_LONG)nkx, (MKL_LONG)nky, (MKL_LONG)nkz, T,
+    return run_flat_batch((long)nkx, (long)nky, (long)nkz, T,
                           forward != 0, scale, in, out);
 }
 
@@ -480,6 +559,7 @@ static ffi::Error GwConvDispatch(
     const int64_t Tg = a * mx * b * my;
     const int64_t Tv = mx * my;
     if (Tg == 0 || Tv == 0) return ffi::Error::Success();
+    if (!fftw_api().ok) return engine_absent_error();
 
     const auto* g_in = static_cast<const C128*>(G.untyped_data());
     const auto* w_in = static_cast<const C128*>(W.untyped_data());
@@ -487,7 +567,7 @@ static ffi::Error GwConvDispatch(
     const bool aliased = (static_cast<const void*>(g_in) ==
                           static_cast<const void*>(s_out));
 
-    const MKL_LONG d0 = (MKL_LONG)nkx, d1 = (MKL_LONG)nky, d2 = (MKL_LONG)nkz;
+    const long d0 = (long)nkx, d1 = (long)nky, d2 = (long)nkz;
 
     // --- stage 1: V_R = IFFT[W] into the arena (strided, trail stride Tv).
     Arena& ar = vr_arena();
@@ -536,16 +616,17 @@ static ffi::Error GwConvDispatch(
         for (int64_t ci = 0; ci < n_chunks; ++ci) {
             if (err.failed.load(std::memory_order_relaxed)) continue;
             const int64_t t0 = ci * C;
-            const MKL_LONG c = static_cast<MKL_LONG>(
+            const long c = static_cast<long>(
                 std::min<int64_t>(C, Tg - t0));
 
             // (a) backward: strided G chunk -> compact buffer (scale_i).
-            DescKey kb{d0, d1, d2, (MKL_LONG)Tg, c, c, 1.0, scale_i};
-            DFTI_DESCRIPTOR_HANDLE hb = nullptr;
-            MKL_LONG st = get_descriptor(kb, &hb);
-            if (!dfti_ok(st)) { err.record(st, "conv bwd descriptor"); continue; }
-            st = compute(hb, /*forward=*/false, g_in + t0, buf);
-            if (!dfti_ok(st)) { err.record(st, "conv bwd compute"); continue; }
+            DescKey kb{(long)d0, (long)d1, (long)d2, (long)Tg, (long)c,
+                       (long)c, kFftwBackward};
+            fftw_plan_t hb = get_descriptor(
+                kb, const_cast<C128*>(g_in + t0), buf);
+            if (!hb) { err.record(0, "conv bwd plan"); continue; }
+            execute(hb, g_in + t0, buf);
+            scale_contig(buf, (long)(nk * c), scale_i);
 
             // (b) multiply by V_R with the (a, b) broadcast: trail index
             //     t = ((ai*mx + x)*b + bi)*my + y maps to V trail x*my + y.
@@ -576,12 +657,12 @@ static ffi::Error GwConvDispatch(
             // (c) forward: compact buffer -> strided S chunk (scale_f, with
             //     the caller's multiplier folded in).  Under the G->S alias
             //     this rewrites exactly the trail range read in (a) — safe.
-            DescKey kf{d0, d1, d2, c, (MKL_LONG)Tg, c, scale_f, 1.0};
-            DFTI_DESCRIPTOR_HANDLE hf = nullptr;
-            st = get_descriptor(kf, &hf);
-            if (!dfti_ok(st)) { err.record(st, "conv fwd descriptor"); continue; }
-            st = compute(hf, /*forward=*/true, buf, s_out + t0);
-            if (!dfti_ok(st)) { err.record(st, "conv fwd compute"); continue; }
+            DescKey kf{(long)d0, (long)d1, (long)d2, (long)c, (long)Tg,
+                       (long)c, kFftwForward};
+            fftw_plan_t hf = get_descriptor(kf, buf, s_out + t0);
+            if (!hf) { err.record(0, "conv fwd plan"); continue; }
+            execute(hf, buf, s_out + t0);
+            scale_strided(s_out + t0, (long)nk, (long)c, (long)Tg, scale_f);
         }
     }
 

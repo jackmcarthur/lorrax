@@ -1087,25 +1087,82 @@ endif()
 #  points.  That is a rewrite of the descriptor construction, not a
 #  link-line change, and it is unmeasured.
 # ----------------------------------------------------------------------------
-if(_mkl_incdir AND EXISTS "${_mkl_incdir}/mkl_dfti.h")
-    set(_mklfft_on 1)
-    set(LORRAX_MKLFFT_INCLUDE_DIR "${_mkl_incdir}")
-elseif(_mkl_incdir)
+#  UPDATED 2026-08-05: the flat-k TU no longer calls DFTI.  It calls the
+#  FFTW3 ADVANCED interface (fftw_plan_many_dft), resolved at RUN time by
+#  dlsym — the pattern the GEMM service proved.  So there is nothing to
+#  detect for MKL sites at all: MKL exports the FFTW3 C interface natively
+#  from libmkl_intel_lp64, which the ScaLAPACK link line already carries, and
+#  the same dlsym finds it.  ONE source serves both engines; there is no
+#  build-time engine selector and no environment variable, because "which
+#  FFT am I running" must be answerable from what the .so links (invariant 2,
+#  ffi_layout.md §2) rather than from a knob somebody set three months ago.
+#
+#  This leg therefore exists for exactly one purpose: on a NON-MKL site
+#  (Cray/AMD), put a real FFTW3 into the library's DT_NEEDED so that the
+#  runtime dlsym has something to find.  Detected from fftw3.h + libfftw3,
+#  like every other RESOLVE leg, and downgraded to an announced skip when
+#  absent — at which point the handlers still build, and LORRAX_FFT_FFI
+#  refuses at STARTUP (Gate.enforce) naming the unresolved symbol.
+option(LORRAX_HOST_HAVE_FFTW3
+       "Link a system FFTW3 so the runtime dlsym finds an FFT engine (not needed on MKL sites)"
+       ON)
+
+set(_fftw3_on 0)
+if(LORRAX_HOST_HAVE_FFTW3)
+    # Detection ladder, first hit wins: a real package description before a
+    # hand-held path, and the raw -D override last.
+    #   1. find_package(FFTW3 CONFIG)  -- upstream FFTW >= 3.3.7 ships this
+    #   2. pkg-config fftw3            -- cray-fftw ships fftw3.pc
+    #   3. FFTW_INC / FFTW_DIR / FFTW_ROOT hints (the cray-fftw modulefile
+    #      sets all three)
+    #   4. -DLORRAX_FFTW3_INCLUDE_DIR / -DLORRAX_FFTW3_LIBRARY (last resort)
+    if(NOT LORRAX_FFTW3_LIBRARY)
+        find_package(FFTW3 CONFIG QUIET)
+    endif()
+    if(TARGET FFTW3::fftw3)
+        set(_fftw3_on 1)
+        set(_fftw3_link "FFTW3::fftw3")
+        message(STATUS "fftw3: found via FFTW3Config.cmake (imported target)")
+    else()
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(PC_FFTW3 QUIET fftw3)
+        endif()
+        find_path(LORRAX_FFTW3_INCLUDE_DIR fftw3.h
+            HINTS ${PC_FFTW3_INCLUDE_DIRS}
+                  "$ENV{FFTW_INC}" "$ENV{FFTW_ROOT}/include")
+        find_library(LORRAX_FFTW3_LIBRARY NAMES fftw3
+            HINTS ${PC_FFTW3_LIBRARY_DIRS}
+                  "$ENV{FFTW_DIR}" "$ENV{FFTW_ROOT}/lib")
+        if(LORRAX_FFTW3_LIBRARY)
+            set(_fftw3_on 1)
+            set(_fftw3_link "${LORRAX_FFTW3_LIBRARY}")
+            get_filename_component(_fftw3_libdir
+                                   "${LORRAX_FFTW3_LIBRARY}" DIRECTORY)
+            message(STATUS "fftw3: ${LORRAX_FFTW3_LIBRARY}")
+        endif()
+    endif()
+endif()
+
+# The flat-k FFT handlers are ALWAYS built: the TU declares the FFTW3 ABI
+# itself and resolves every entry point by dlsym, so it needs no vendor
+# header and no vendor library at COMPILE time.  Whether an engine is
+# actually present is a RUN-time question, answered by the dlsym table and
+# reported by LORRAX_FFT_FFI's announce-or-refuse.
+set(_mklfft_on 1)
+if(_fftw3_on)
     message(STATUS
-        "mklfft: ${_mkl_incdir}/mkl_dfti.h not found — "
-        "flat-k FFT handlers skipped (LORRAX_FFT_FFI will "
-        "refuse at runtime).")
+        "mklfft: flat-k FFT handlers ON — FFTW3 advanced interface "
+        "(fftw_plan_many_dft) resolved at runtime by dlsym; a system FFTW3 "
+        "is linked for the dlsym to find.")
 else()
-    # Reached on the explicit -DLORRAX_SCALAPACK_LIBRARIES route and on any
-    # non-MKL site.  Before 2026-07-31 this case produced NO configure output
-    # at all, because the whole block lived inside the MKL branch above.
     message(STATUS
-        "mklfft: no MKL header directory resolved (the DFTI API is "
-        "Intel-only, and ScaLAPACK did not come from an MKL prefix) — "
-        "flat-k FFT handlers skipped.  Set -DLORRAX_MKL_ROOT as well as "
-        "-DLORRAX_SCALAPACK_LIBRARIES to build them against MKL's FFT "
-        "while linking someone else's ScaLAPACK; LORRAX_FFT_FFI otherwise "
-        "refuses at runtime and the default XLA lowering stands.")
+        "mklfft: flat-k FFT handlers ON — FFTW3 advanced interface "
+        "(fftw_plan_many_dft) resolved at runtime by dlsym.  No standalone "
+        "FFTW3 linked; this is CORRECT on an MKL site (libmkl_intel_lp64 "
+        "exports the FFTW3 C interface natively).  On a non-MKL site load "
+        "cray-fftw (or any FFTW3) and reconfigure, or LORRAX_FFT_FFI will "
+        "refuse at startup naming the unresolved symbol.")
 endif()
 
 # ----------------------------------------------------------------------------
@@ -1181,9 +1238,12 @@ if(_mklfft_on)
     if(NOT LORRAX_MKL_THREAD_LIB STREQUAL "mkl_gnu_thread")
         list(APPEND _host_math_link "-lgomp")
     endif()
-    message(STATUS
-        "mklfft: MKL FFT (DFTI API) flat-k handlers ON "
-        "(headers at ${LORRAX_MKLFFT_INCLUDE_DIR})")
+    if(_fftw3_on)
+        list(APPEND _host_math_link "${_fftw3_link}")
+        if(_fftw3_libdir)
+            list(APPEND _host_math_rpaths "${_fftw3_libdir}")
+        endif()
+    endif()
 endif()
 if(_mklblas_on)
     list(APPEND LORRAX_FFI_HOST_SOURCES mklblas/gemm_batch_ffi.cc)
@@ -1221,6 +1281,8 @@ endif()
 list(APPEND _host_rpaths ${_host_math_rpaths})
 list(APPEND _host_link_libs ${_host_math_link})
 
+list(APPEND LORRAX_FFI_HOST_SOURCES common/build_config.cc)
+
 if(NOT LORRAX_FFI_HOST_SOURCES)
     message(FATAL_ERROR
         "No host FFI components selected/found (phdf5 off and SLATE absent). "
@@ -1230,6 +1292,43 @@ endif()
 # ----------------------------------------------------------------------------
 # Build liblorrax_ffi_host.so
 # ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+#  GENERATED CAPABILITY HEADER — what the build ACTUALLY resolved, recorded
+#  in the library instead of only in a configure log nobody kept.
+#  lorrax_ffi_host_build_config() returns it as one line, so a run (or a
+#  `strings` on a .so found in a scratch directory) can report its own
+#  provenance.  Note it records whether an FFTW3 was LINKED, not which engine
+#  will bind: that is a runtime dlsym fact by design.
+# ---------------------------------------------------------------------------
+if(_fftw3_on)
+    set(LORRAX_CFG_FFTW3 1)
+else()
+    set(LORRAX_CFG_FFTW3 0)
+endif()
+if(_scalapack_on)
+    set(LORRAX_CFG_SCALAPACK 1)
+else()
+    set(LORRAX_CFG_SCALAPACK 0)
+endif()
+if(_mklblas_on)
+    set(LORRAX_CFG_GEMM 1)
+else()
+    set(LORRAX_CFG_GEMM 0)
+endif()
+if(slate_FOUND)
+    set(LORRAX_CFG_SLATE 1)
+else()
+    set(LORRAX_CFG_SLATE 0)
+endif()
+if(LORRAX_FFI_HAVE_PHDF5)
+    set(LORRAX_CFG_PHDF5 1)
+else()
+    set(LORRAX_CFG_PHDF5 0)
+endif()
+string(REPLACE ";" " " LORRAX_CFG_MATH_LINK "${_host_math_link}")
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/common/lorrax_config.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/lorrax_config.h" @ONLY)
+
 add_library(lorrax_ffi_host SHARED ${LORRAX_FFI_HOST_SOURCES})
 
 # The defining flag: every phdf5 TU compiled here switches its device-staging
@@ -1251,6 +1350,7 @@ target_include_directories(lorrax_ffi_host SYSTEM PRIVATE
 )
 target_include_directories(lorrax_ffi_host PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}"
 )
 if(LORRAX_MKLFFT_INCLUDE_DIR)
     target_include_directories(lorrax_ffi_host PRIVATE
