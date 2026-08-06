@@ -28,6 +28,9 @@ See the [Quickstart](quickstart.md) for the worked example, and
 
 ## High-level pipeline
 
+LORRAX starts from a BerkeleyGW-format `WFN.h5`; producing one from a crystal is
+[Inputs from DFT](preprocessing.md).
+
 1. Charge density from selected bands → choose ISDF points $r_\mu$ via k-means/CVT
 2. Read wavefunctions $c_{nk}(G)$, FFT to real space $\psi_{nk}(r)$
 3. For each $q$, construct $\zeta_{q,\mu}(r)$ by solving $C_q \zeta_q = Z_q$ by least-squares
@@ -58,7 +61,7 @@ one sentence and a link.
 | **how to run in the thousands-of-ranks regime** | [`docs/dev/large_nmu_operation.md`](dev/large_nmu_operation.md) | the LOCAL-vs-DISTRIBUTED plan table, per-stage per-rank scaling, and the fully-distributed deck. |
 | **what an environment variable is called and what it defaults to** | [`docs/dev/env_vars.md`](dev/env_vars.md) | **spelling, default, class, and parse grammar — and nothing else.** Machine-enforced by `tests/test_env_registry.py`. Every row's *explanation* lives on the owner page it links to. |
 | **what a deck key does** | [Input reference](input_reference.md) | generated from the parser; the deck is the record for anything that changes the numbers. |
-| **what a particular run actually resolved** | **the run's own rank-0 startup block** | see the warning below — it outranks every page here. |
+| **what a particular run actually resolved** | **the run's own rank-0 startup block** — [annotated, with a real one printed verbatim](environment/overview.md#startup-block) | see the warning below — it outranks every page here. |
 | **what the machine provides, and what breaks when a layer is missing** | [Environment overview](environment/overview.md) · [Frontera](environment/machines/frontera.md) · [Perlmutter](environment/machines/perlmutter.md) | the layered dependency tree, the shared JAX configuration, the three CUDA allocators, and the per-machine facts. |
 | **why CPU collectives run on `impl=mpi`** | [Collective transports](environment/transports.md) · [`docs/dev/mpi_collectives.md`](dev/mpi_collectives.md) | the gloo corruption evidence and the MPIwrapper recipe. |
 | **how to judge whether a claim or a check is any good** | [`docs/dev/QUALITY_PATTERNS.md`](dev/QUALITY_PATTERNS.md) | the ten failure classes and the assessment rubric. Cited by number (`#8`) from other pages. |
@@ -69,7 +72,9 @@ one sentence and a link.
 > which `os.environ` is a false witness — measured, job 7882443: two runs with
 > byte-identical environments and `bytes_limit` 11.805 GB vs 0.000 GB.
 > `runtime.initialize_communicator_stack()` prints one rank-0 block naming
-> every choice where more than one outcome was possible. Read the block.
+> every choice where more than one outcome was possible. Read the block —
+> [a real one, annotated](environment/overview.md#startup-block), if you
+> have not seen one before.
 
 ### Two things about this tree that surprise people
 

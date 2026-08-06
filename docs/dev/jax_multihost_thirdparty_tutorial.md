@@ -1,3 +1,32 @@
+<!-- THIRD-PARTY DOCUMENT — NOT LORRAX DOCUMENTATION -->
+
+> **Provenance and status.** This is a verbatim copy of a third-party JAX
+> multi-host tutorial by ASKabalan
+> (<https://github.com/ASKabalan/Jax-multihost/tree/main>), written about the
+> **JeanZay** machine. It contains **no LORRAX content** — it does not mention
+> LORRAX once — and its internal links (e.g. `slurms/02-multihost-2nodes.slurm`)
+> point at files that exist in the upstream repository, not this one.
+>
+> It sat in the rendered site as *Architecture → Multi-host* until 2026-08-06,
+> where it read as LORRAX's own multi-host architecture page. It was moved here,
+> under `docs/dev/` (excluded from the site build), rather than deleted, because
+> it is a useful general JAX reference.
+>
+> **For LORRAX's actual multi-host behaviour, read instead:**
+>
+> * `docs/environment/machines/perlmutter.md` §3 — the in-job topology contract
+>   (`SLURM_NTASKS > 1` auto-triggers `jax.distributed.initialize()`; expected
+>   `jax.local_devices()` and `len(jax.devices())`).
+> * `docs/environment/transports.md` — which collective transport runs, and the
+>   measured verdicts behind that choice.
+> * `docs/architecture/layers.md` — where `multihost_utils` / `shard_map` /
+>   `jax.sharding` are allowed to be imported, and the enforced budgets.
+> * `docs/architecture/slab_io.md` — how a sharded array reaches disk multi-node.
+>
+> A LORRAX-owned multi-host architecture page does not currently exist.
+
+---
+
 This guide from https://github.com/ASKabalan/Jax-multihost/tree/main is a great review as to multihost functionality in JAX.
 
 # 1. introduction

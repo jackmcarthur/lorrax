@@ -15,12 +15,38 @@ from the matrix below; the pure-JAX core works with zero native libraries.
 | Config | OS | CUDA | JAX | MPI | parallel HDF5 | Runtime | FFI features | Tested |
 |---|---|---|---|---|---|---|---|---|
 | **Pure-JAX (no FFI)** | any | 13 or none | ≥0.9 | — | — | bare venv | none (serial only) | CI / CPU |
-| **NERSC Perlmutter (reference)** | SLES 15 | 12.9 (staged native libs) | ≥0.9 | Cray MPICH | cray-hdf5-parallel | Shifter | all | 1–4 nodes × 4 A100 |
+| **NERSC Perlmutter (reference)** | SLES 15 | 12.9 (staged native libs) | **0.5.3** (container; *below* the declared floor — see below) | Cray MPICH | cray-hdf5-parallel | Shifter | all | 1–4 nodes × 4 A100 |
 | **Generic Cray EX** | — | 12.x/13.x | ≥0.9 | Cray MPICH | cray-hdf5-parallel | Apptainer | all | untested |
 | **Generic SLURM + OpenMPI** | Linux x86_64 | 12.x/13.x | ≥0.9 | OpenMPI 4/5 + UCX | conda-forge `hdf5=*mpi_openmpi*` | Apptainer / bare venv | all | untested |
 
 Only the pure-JAX path works with **zero native libs**. Everything distributed needs the
 [FFI native-library stack](ffi-native-libs.md).
+
+!!! warning "The reference platform runs *below* the JAX version this project declares"
+    `pyproject.toml` declares `jax>=0.9.0` / `jaxlib>=0.9.0`, and the `≥0.9` in the other
+    rows is that pin. **The Perlmutter container ships the 0.5.3 line** — measured
+    2026-08-06, a run's own startup block reports
+    `under jax 0.5.3.dev20260806`. Nothing enforces the floor, so the reference platform
+    runs below it silently.
+
+    **What happens when it is wrong**, measured on the same run: a `UserWarning` on the
+    first jit and a **silently dead persistent compile cache** —
+
+    ```text
+    /opt/jax/jax/_src/compiler.py:723: UserWarning: Error reading persistent compilation cache
+    entry for 'jit_convert_element_type': AttributeError: module 'jax._src.config' has no
+    attribute 'compilation_cache_check_contents'
+    ```
+
+    printed *immediately after* a startup block that says the cache is enabled. The run
+    pays full compile time on every launch. Numerical results are not implicated.
+
+    This is not a pin you can simply raise: **no NVIDIA JAX container exists with both
+    JAX ≥ 0.9 and CUDA 12**, so satisfying the declared floor on Perlmutter means taking a
+    CUDA major bump against everything staged for CUDA 12.9.
+    [`environment/overview.md` §2](../environment/overview.md) is the owner of this whole
+    question — the blast radius, the FFI-surface measurements, and why a version string
+    read from a container is not evidence. Read it before planning around the straddle.
 
 !!! warning "The `liblorrax_ffi.so` build cliff"
     A fresh `git clone` has **no** `liblorrax_ffi.so` (it is a gitignored build artifact).
@@ -75,5 +101,5 @@ for non-NERSC users and is documented separately:
 
 - [`docs/environment/overview.md`](../environment/overview.md) — the full
   environment / JAX-config / troubleshooting reference this page summarizes
-- [Perlmutter](perlmutter.md) — the NERSC reference cluster (module, `lxrun`/`lxpre`)
+- [Perlmutter](perlmutter.md) — the NERSC reference cluster (`lx`, the module, `lxpre`)
 - `src/ffi/PORTING.md` — the FFI porting checklist (in the repo, not the site)

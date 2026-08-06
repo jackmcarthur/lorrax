@@ -9,8 +9,9 @@ has not been exercised recently.*
 ## 0. Test status — honest
 
 * The GPU FFI stack (cuSOLVERMp eigh, phdf5 slab I/O, SLATE) and the
-  `lxalloc`/`lxrun` workflow below were production-certified on
-  Perlmutter (1–4 nodes × 4 A100).
+  `lxalloc`/`lxrun` module workflow were production-certified on
+  Perlmutter (1–4 nodes × 4 A100). `lx` (§1) drives the same
+  `select_gpu.sh` + Shifter + `in_container.sh` composition.
 * CPU multi-process MPI runs were validated end-to-end on Milan (§5):
   Si 4×4×4 μ=384, x_only + full COHSEX, 1 node, 4 ranks × 8 threads —
   in the **gloo/Cray-MPICH era**.
@@ -23,23 +24,82 @@ has not been exercised recently.*
   [transports](../transports.md) claims as Frontera-measured unless a
   jobid says otherwise.
 
-## 1. Module: install and session
+## 1. Entry point: `lx` {#1-entry-point-lx}
+
+**`lx` is how you run things on Perlmutter.** Never on a login node, never
+`sbatch`. It allocates if nothing is live, attaches if something is, and
+calling it twice never double-allocates.
 
 ```bash
-vi config/perlmutter/site_config.sh          # account, QoS, paths
-bash config/perlmutter/install.sh            # or LORRAX_MODULE_NAME=<name> bash …
+lx run python3 -u -m gw.gw_jax -i cohsex.in   # one step on a compute node
+lx test                                       # the suite, on a compute node, in cwd
+lx status                                     # who is running where
+lx doctor                                     # verify site, module, helpers
+lx shell -G 4                                 # interactive pty on a compute node
+lx alloc -N 4 --time 04:00:00                 # allocate deliberately (idempotent)
+lx release                                    # cancel only what lx created
 ```
 
-```bash
-module load lorrax
-lxalloc                    # 1 node / 4 GPUs / 2 h, exports SLURM_JOBID
-lxalloc 4                  # 4 nodes / 16 GPUs
-lxpre cohsex.in 640        # all 3 preprocessing steps (single-GPU)
-lxrun python3 -u -m gw.gw_jax -i cohsex.in        # 4-GPU GW
-LORRAX_NGPU=1 lxrun …      # single-GPU override
-lxshell                    # interactive single-rank shell in container
-lxkill                     # cancel allocation
-```
+Defaults are **one GPU per step** (so several steps share a node), and a new
+allocation is 4 nodes / 4 h. Ask for `-G 4` when you want a whole node,
+`-N n` for multiple nodes, `--cpu` for the Milan CPU partition. `--dry-run`
+prints the `srun` line and exits — the fastest way to see what your step will
+actually inherit.
+
+> ### `lx` runs the checkout its *base module* names, not the one you are standing in
+>
+> **Verified 2026-08-06.** `lx` obtains `LORRAX_ROOT` and the assembled
+> Shifter string from an installed base modulefile, and bakes the resulting
+> `PYTHONPATH` into the `srun` line. It does **not** derive them from `cwd`.
+> On this machine `lx run --dry-run` emits
+> `--env=PYTHONPATH=$HOME/software/lorrax_P/src:…` regardless of which
+> worktree you launch from.
+>
+> So `cd`-ing into your worktree and running `lx run` executes **`lorrax_P`'s
+> source**, and the run succeeds — against a tree you may not be editing. Two
+> things make this visible rather than silent:
+>
+> * `lx doctor` prints `base module` and `LORRAX_ROOT` before you run anything.
+> * every run's [startup block](../overview.md#startup-block) prints the path
+>   of the `.so` it loaded, which is inside that same tree.
+>
+> Point it somewhere else with `LX_BASE_MODULE=lorrax_A|_B|_C …`, or
+> `LORRAX_DEFAULT_BASE` for the default. `lx test` is the exception that does
+> use `cwd`: it runs pytest in the current directory, and only falls back to
+> `$LORRAX_ROOT/tests` when `cwd` has no `tests/`.
+
+### Do not start from `module load lorrax`
+
+The older `module load lorrax` + `lxalloc`/`lxrun`/`lxpre`/`lxshell`/`lxkill`
+workflow still exists, and the module is still what *produces* the Shifter
+string `lx` consumes. But it is not the entry point to hand a newcomer, for
+two measured reasons:
+
+**It resolves the wrong checkout.** The base module derives `LORRAX_ROOT` by
+matching its own path against `<root>/config/modulefiles/lorrax/`; an
+*installed* (copied, not symlinked) modulefile always fails that match and
+falls back to a hardcoded value. Measured on this machine 2026-08-06,
+`module show lorrax` sets `LORRAX_ROOT=$HOME/software/lorrax_C` — an older
+worktree — no matter which tree you are standing in.
+
+**The installed module exports the allocator setting
+[§2.1](../overview.md#21-the-three-allocators) condemns.** Measured
+2026-08-06, `module show lorrax` sets:
+
+| it sets | consequence |
+|---|---|
+| `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` | with the allocator left unset (BFC) this pre-grabs 95 % of the card, **starving NCCL** — the failure surfaces as `cusolverMpSyevd: status=7` (§2.1) |
+| `TF_GPU_ALLOCATOR=cuda_malloc_async` | **inert.** A TensorFlow variable; it selects nothing for JAX, and the startup block says so outright |
+
+Note the repo *template* `config/modulefiles/lorrax/0.1.0.lua` has since been
+changed to set `XLA_PYTHON_CLIENT_PREALLOCATE=false` +
+`XLA_PYTHON_CLIENT_ALLOCATOR=platform` instead, and carries no
+`MEM_FRACTION`. **The installed module on this machine predates that
+change.** Which one you get therefore depends on when `install.sh` was last
+run — which is the whole argument for not routing newcomers through it.
+`lx` reads the module for the Shifter string only and sets its own allocator
+pair (`preallocate=false`, `allocator=platform`); what any given run actually
+resolved is in its [startup block](../overview.md#startup-block).
 
 `lxrun` expands to `srun --mpi=cray_shasta … select_gpu.sh shifter …
 in_container.sh "$@"`: each rank sees exactly one GPU as device 0 via
@@ -49,8 +109,15 @@ breaks JAX's topology sync). Batch template:
 `LORRAX_NNODES=2 LORRAX_NGPU=8`.
 
 Per-invocation cost: ~7 s single-rank, 10–15 s multi-rank (srun step 2–5 s,
-Shifter bring-up ~5 s, `jax.distributed` handshake 3–5 s). `lxshell` and a
-persistent `JAX_COMPILATION_CACHE_DIR` are the fast-iteration knobs.
+Shifter bring-up ~5 s, `jax.distributed` handshake 3–5 s). `lx shell` and a
+persistent compile-cache directory are the fast-iteration knobs.
+
+### One-time install
+
+```bash
+vi config/perlmutter/site_config.sh          # account, QoS, paths
+bash config/perlmutter/install.sh            # or LORRAX_MODULE_NAME=<name> bash …
+```
 
 ## 2. FFI stack: staging and bind-mounts
 

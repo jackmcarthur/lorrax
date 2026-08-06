@@ -27,7 +27,8 @@ Three references deliberately stay **outside** this section — see the
   native-layer failure triage. This page owns only *whether the layer is
   present on this machine and what it depends on*.
 * **The run's own startup report.** What a particular run *resolved* is
-  printed in one rank-0 block by `runtime.initialize_communicator_stack()`.
+  printed in one rank-0 block by `runtime.initialize_communicator_stack()`
+  — [§2.0 below shows a real one, verbatim](#startup-block).
   After backend init, `os.environ` is a false witness (measured, job
   7882443: two byte-identical environments, `bytes_limit` 11.805 GB vs
   0.000 GB) — read the block, not the env.
@@ -76,6 +77,111 @@ missing or wrong:
 
 Reading the table downward answers "what do I need to build first";
 reading the last column answers "which layer is broken" from a job log.
+
+---
+
+## 2.0 What a run actually resolved — the startup block {#startup-block}
+
+Several pages in this tree, including the [register](../index.md#register),
+tell you that the run's own rank-0 startup block outranks every documented
+default. None of them showed one. This is one, verbatim, so you know what
+you are looking for before you need it.
+
+`runtime.initialize_communicator_stack()` prints it once on rank 0, ahead of
+the first stage line. Captured **2026-08-06 on Perlmutter, job 56393848**,
+`python3 -u -m gw.gw_jax -i cohsex_test.in` on the bundled COHSEX fixture,
+**1 process / 1 A100**, launched with `lx run`
+([Perlmutter §1](machines/perlmutter.md#1-entry-point-lx)):
+
+```text
+==============================================================================
+  LORRAX runtime — resolved startup configuration
+==============================================================================
+  This is a single-process run with 1 addressable device(s).
+  jax.distributed.initialize() was not called because this is a single-process run.
+  The JAX platform resolved to 'gpu' on devices of kind 'NVIDIA A100-SXM4-40GB', from JAX_PLATFORMS='cuda,cpu', under jax 0.5.3.dev20260806 with 64-bit values enabled.
+  The run's device mesh is 1x1 over axes ('x', 'y'), and its communicator cliques were warmed before the first physics jit.
+  Bringing this stack up took 2.5 s in total: 1.0 s for the environment, jax.distributed and backend init, 1.4 s to build the mesh and warm its communicators, 0.0 s to arm the compile cache and 0.1 s to measure everything in this block.
+  There are no cross-process collectives in this run, so JAX_CPU_COLLECTIVES_IMPLEMENTATION does not apply.
+  The live client reports no arena accounting at all, so there is no XLA pool figure for this run and any memory number it prints later came from an nvidia-smi sample of the whole GPU.
+  XLA_PYTHON_CLIENT_PREALLOCATE resolved to false (raw 'false') and XLA_PYTHON_CLIENT_ALLOCATOR resolved to 'platform' (raw 'platform') — NOT LORRAX's canonical pair, which is preallocate=false with the allocator left unset (BFC); a caller overrode it.
+  TF_GPU_ALLOCATOR='cuda_malloc_async' is set but is INERT for jax; it selects nothing here.
+  The CUDA FFI library loaded from /global/u2/j/jackm/software/lorrax_P/src/ffi/cpp/build/liblorrax_ffi.so, which is the in-tree default because LORRAX_FFI_SO is unset.
+  FFI build provenance: /global/u2/j/jackm/software/lorrax_P/src/ffi/cpp/build/liblorrax_ffi.so | rev 886139f8e000 | sha 5e2eaa7a30e82a85 | built 2026-08-06T08:10:39Z | slate=?
+  The LORRAX_BANDS_GEMM_FFI dial is unset and resolved to on, so the contract_bands right-GEMM contraction rides the platform's native lowering — the dial exists on cpu only and this run's backend is 'gpu', where startup enforcement skips it by the gate's declared platform policy (the native lowering IS the required path there).
+  The LORRAX_FFT_FFI dial is unset and resolved to on, so the flat-k 3-D FFT helper path is routed through the FFI handler (the required layer).
+  The LORRAX_FFT_FFI_FUSED dial is unset and resolved to on, so the fused IFFT-multiply-FFT tau kernel is routed through the FFI handler (the required layer).
+  The distributed backends available for eigh on this mesh are cusolvermp, distributed, native, slate; which one runs is the input-file key, not an environment variable.
+  The distributed backends available for cholesky on this mesh are native, slate; which one runs is the input-file key, not an environment variable.
+  The distributed backends available for solve_lu on this mesh are native; which one runs is the input-file key, not an environment variable.
+  This process is pinned to 128 schedulable CPUs, with OMP_NUM_THREADS=None, MKL_NUM_THREADS=None and OPENBLAS_NUM_THREADS=None.
+  Inside the FFI handlers the BLAS team size is LORRAX_MKLBLAS_THREADS=None for the batched GEMM, where unset means the ambient thread count, and LORRAX_SCALAPACK_MKL_THREADS=None for the ScaLAPACK handlers, where unset means a cap of 4 because pzheevd measured 11.28 s per q at 14 MKL threads against 0.463 s at 4.
+  The JAX persistent compile cache is enabled at /pscratch/sd/j/jackm/lorrax_jax_cache/np1, used by this single rank.
+  The cache key includes every array shape, so a system size this machine has not run before misses every entry no matter how warm the cache looks.
+  The fail-fast excepthook is not installed because a single-process run already fails with a traceback and rc=1.
+  glibc malloc tuning is in force with M_MMAP_THRESHOLD=1 MB and M_TRIM_THRESHOLD=128 MB, which is the mitigation for the per-r-chunk RSS ramp on long XLA:CPU runs.
+==============================================================================
+```
+
+### The four lines to read first
+
+**1. Platform and JAX generation.** `The JAX platform resolved to 'gpu' …
+under jax 0.5.3.dev20260806`. This is the line that tells you which of the
+two generations you are on (§2) — and note that the container restamps its
+display string to the *run* date, so `0.5.3.dev20260806` means "a 0.5.3-line
+build, looked at on 2026-08-06", not a build from that day. It is also the
+line that explains the warning printed immediately *after* the block on this
+run:
+
+```text
+/opt/jax/jax/_src/compiler.py:723: UserWarning: Error reading persistent compilation cache entry for
+'jit_convert_element_type': AttributeError: module 'jax._src.config' has no attribute
+'compilation_cache_check_contents'
+```
+
+That is the 0.5.3-vs-0.9 private-API divergence of §2 surfacing as a dead
+compile cache — the block says the cache is *enabled*, and the warning says
+nothing is being read from it. Believe the warning.
+
+**2. The mesh.** `The run's device mesh is 1x1 over axes ('x', 'y')`. The
+axis names are the ones every `PartitionSpec` in the codebase refers to; a
+mesh that is not the shape you asked for is the first thing to suspect when
+a distributed run is slow or wrong.
+
+**3. The allocator / preallocate pair.** On this run:
+
+```text
+XLA_PYTHON_CLIENT_PREALLOCATE resolved to false (raw 'false') and XLA_PYTHON_CLIENT_ALLOCATOR
+resolved to 'platform' (raw 'platform') — NOT LORRAX's canonical pair …; a caller overrode it.
+```
+
+This is the pair §2.1 is about, and it is the reason to read the block rather
+than the environment: after backend init `os.environ` is a false witness.
+**The sanctioned launcher resolves `platform`,** which is plain `cudaMalloc`
+— so `bytes_limit` and `peak_bytes_in_use` both read 0 and every memory
+figure the run prints later comes from an `nvidia-smi` sample of the whole
+GPU, not from LORRAX's own accounting. That is why the very next line of the
+block says there is no XLA pool figure, and why `[gpu_utils] WARNING:
+bytes_limit=None, falling back to nvidia-smi` appears further down. The
+adjacent `TF_GPU_ALLOCATOR='cuda_malloc_async'` is **inert** — it is a
+TensorFlow variable and selects nothing here, which the block says outright
+so that nobody credits it with the allocator behaviour.
+
+**4. The FFI `.so` provenance.**
+
+```text
+FFI build provenance: …/liblorrax_ffi.so | rev 886139f8e000 | sha 5e2eaa7a30e82a85 | built 2026-08-06T08:10:39Z
+```
+
+Path, source revision, content hash and build time of the native library
+actually loaded. Because the path is printed, this line is also how you catch
+a launcher that put a *different checkout* on `PYTHONPATH` than the one you
+are editing — the run above loaded from `lorrax_P` while being launched from
+a different worktree, which the path makes obvious and nothing else would.
+`LORRAX_FFI_SO` overrides it.
+
+> **Read the block, not the env, and not this page.** Where the block and any
+> documented default disagree, the block is what ran.
 
 ---
 

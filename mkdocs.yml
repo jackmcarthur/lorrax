@@ -52,6 +52,7 @@ extra_javascript:
 nav:
   - Home: index.md
   - Quickstart: quickstart.md
+  - Inputs from DFT: preprocessing.md
   - Installation:
       - Overview: installation/index.md
       - FFI native libraries: installation/ffi-native-libs.md
@@ -79,5 +80,4 @@ nav:
       - The FFI layer: architecture/ffi_layout.md
       - SlabIO (sharded-slab HDF5): architecture/slab_io.md
       - Memory model: architecture/memory-model.md
-      - Multi-host: architecture/multihost.md
   - Contributing: contributing.md
