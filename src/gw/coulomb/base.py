@@ -28,6 +28,14 @@ import numpy as np
 
 from common import Meta
 
+from .kernel import TOL_MC_NAN, v_qG
+# minibz_inscribed_sphere_r2 / minibz_cell_average live in .sampler (the ONE
+# MC path).  Re-exported here because .base is the historical import site
+# for every caller and for tests/test_minibz_average.py; single
+# implementation, single import, no second copy.
+from .sampler import (_qmc_engine, minibz_cell_average,  # noqa: F401
+                      minibz_inscribed_sphere_r2)
+
 
 class SysDim(int, enum.Enum):
     """System dimensionality for Coulomb truncation.
@@ -132,27 +140,29 @@ def minibz_voronoi_batches(
         @ jnp.linalg.inv(bvec.T)
     )
 
-    use_qmc = (str(method).lower() == "sobol")
-    if use_qmc:
-        try:
-            from scipy.stats import qmc as _qmc
-            import math as _math
-            m = max(1, int(_math.floor(_math.log2(max(2, int(nsamples))))))
-            batches = []
-            for rep in range(max(1, int(qmc_reps))):
-                sob = _qmc.Sobol(d=3, scramble=True, seed=rep + int(seed_offset))
-                U = sob.random_base2(m)
-                Uj = jnp.asarray(np.asarray(U, dtype=np.float64))
-                randcart = (bvec.T @ Uj.T).T
-                wrapped = wrap_points_to_voronoi(randcart, bvec, nmax=nmax)
-                rq = (randlims @ wrapped.T).T
-                if is_2d:
-                    rq = rq.at[:, 2].set(0.0)
-                batches.append(rq)
-            return batches
-        except Exception:
-            use_qmc = False
-            nsamples = max(int(nsamples), 2_500_000)
+    # ``_qmc_engine`` returns None and ANNOUNCES when scipy.stats.qmc is
+    # missing.  This used to be a bare ``except Exception``: a demotion from
+    # a low-discrepancy estimator to a plain one, in a production average,
+    # with no trace in any log.
+    _qmc = _qmc_engine() if str(method).lower() == "sobol" else None
+    if _qmc is not None:
+        import math as _math
+        m = max(1, int(_math.floor(_math.log2(max(2, int(nsamples))))))
+        batches = []
+        for rep in range(max(1, int(qmc_reps))):
+            sob = _qmc.Sobol(d=3, scramble=True, seed=rep + int(seed_offset))
+            U = sob.random_base2(m)
+            Uj = jnp.asarray(np.asarray(U, dtype=np.float64))
+            randcart = (bvec.T @ Uj.T).T
+            wrapped = wrap_points_to_voronoi(randcart, bvec, nmax=nmax)
+            rq = (randlims @ wrapped.T).T
+            if is_2d:
+                rq = rq.at[:, 2].set(0.0)
+            batches.append(rq)
+        return batches
+    if str(method).lower() == "sobol":
+        # announced demotion: compensate the worse convergence with N
+        nsamples = max(int(nsamples), 2_500_000)
 
     # Uniform fallback (also the path on systems without scipy.stats.qmc)
     key = jax.random.PRNGKey(int(seed_offset))
@@ -191,29 +201,15 @@ def sample_minibz_qpoints(
         nmax=nmax, is_2d=(int(meta.sys_dim) == 2))
 
 
-def minibz_inscribed_sphere_r2(bvec, kgrid, *, is_2d: bool = False) -> float:
-    """q0sph2 — squared radius of the largest sphere inscribed in the mini-BZ.
-
-    The mini-BZ is the Voronoi cell of the q-grid; its reciprocal lattice
-    is ``b_i / nk_i``.  The nearest Voronoi face sits at half the shortest
-    mini-BZ reciprocal vector, so ``q0sph2 = min_{n≠0} |0.5·Σ_i n_i b_i/nk_i|²``
-    (Cartesian).  Mirrors BGW ``vcoul_generator.f90:296-312``; the 2D slab
-    variant restricts the search to the in-plane replicas (n_3 = 0,
-    ``:318-331``).
-    """
-    bvec = np.asarray(bvec, dtype=np.float64)
-    nk = np.asarray([int(s) for s in kgrid], dtype=np.float64)
-    rng3 = range(0, 1) if is_2d else range(-2, 3)
-    best = np.inf
-    for i in range(-2, 3):
-        for j in range(-2, 3):
-            for k in rng3:
-                if i == 0 and j == 0 and k == 0:
-                    continue
-                fc_frac = 0.5 * np.array([i, j, k], dtype=np.float64) / nk
-                fc_cart = fc_frac @ bvec
-                best = min(best, float(fc_cart @ fc_cart))
-    return best
+#: MC ``kind`` label -> the (sys_dim, channel) cell of the shared kernel.
+_KIND_CELL = {
+    "bulk_3d":    (3, "full"),
+    "bulk_3d_lr": (3, "lr"),
+    "bulk_3d_sr": (3, "sr"),
+    "slab":       (2, "full"),
+    "slab_lr":    (2, "lr"),
+    "slab_sr":    (2, "sr"),
+}
 
 
 def _minibz_kernel_bare(shift_cart, dq_cart, *, kind, alpha=None, zc=None):
@@ -221,21 +217,24 @@ def _minibz_kernel_bare(shift_cart, dq_cart, *, kind, alpha=None, zc=None):
     evaluated on a batch of mini-BZ offsets ``dq_cart`` (N,3).  Returns
     (v (N,), len2 (N,)) with ``len2 = |shift+δq|²``.
 
-    ``kind``: ``bulk_3d`` (8π/K²), ``bulk_3d_lr`` (·e^{−K²/4α²}),
-    ``slab`` (·f2d), ``slab_lr`` (·f2d·e^{−K²/4α²}); f2d = 1 −
-    e^{−zc|K∥|}cos(K_z zc) is the Ismail-Beigi slab truncation.
+    ``kind`` names a cell of the shared formula
+    :func:`gw.coulomb.kernel.v_qG` — the full ``{bulk, slab} x {full, lr,
+    sr}`` product, including the ``slab_sr``/``bulk_3d_sr`` ``-expm1``
+    channels this local copy did not carry before 2026-08-05.  Bit-exact
+    against that copy on all four kinds it did carry (measured, Frontera
+    job 7890613; ``tests/test_coulomb_kernel.py`` is the committed gate).
+
+    The guard here is :data:`~gw.coulomb.kernel.TOL_MC_NAN` (1e-24), NOT
+    the 1e-12 lattice-slot tolerance: these are Monte-Carlo draws.
     """
+    if kind not in _KIND_CELL:
+        raise ValueError(f"_minibz_kernel_bare: unknown kind {kind!r}; "
+                         f"expected one of {sorted(_KIND_CELL)}")
+    sys_dim, channel = _KIND_CELL[kind]
     K = np.asarray(shift_cart, dtype=np.float64)[None, :] + np.asarray(dq_cart)
     len2 = np.sum(K * K, axis=1)
-    len2s = np.where(len2 < 1e-24, 1.0, len2)
-    v = 8.0 * np.pi / len2s
-    if kind in ("slab", "slab_lr"):
-        kxy = np.linalg.norm(K[:, :2], axis=1)
-        f2d = 1.0 - np.exp(-zc * kxy) * np.cos(K[:, 2] * zc)
-        v = v * f2d
-    if kind in ("bulk_3d_lr", "slab_lr"):
-        v = v * np.exp(-len2 / (4.0 * alpha ** 2))
-    v = np.where(len2 < 1e-24, 0.0, v)
+    v = v_qG(K, axis=1, sys_dim=sys_dim, channel=channel, units="bare",
+             alpha=alpha, zc=zc, zero_tol=TOL_MC_NAN)
     return v, len2
 
 
