@@ -1,0 +1,37 @@
+bash: line 6: cd: /pscratch/sd/j/jackm/lorrax_sandbox/runs/Si/08_4x4x4_sym_vs_nosym_2026-05-14/run_sym_floor_fix_2026-05-15: No such file or directory
+[lxrun] JID 53012905 · 1 nodes · 1:59:36 left · 1/1 free · incoming: lx-B
+  1  nid001033  free   —              —      —  ← starting lx-B  python3 -u -m gw.gw_jax 
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/global/homes/j/jackm/software/lorrax_B/src/gw/gw_jax.py", line 897, in <module>
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/global/homes/j/jackm/software/lorrax_B/src/gw/gw_jax.py", line 897, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/global/homes/j/jackm/software/lorrax_B/src/gw/gw_jax.py", line 113, in main
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/global/homes/j/jackm/software/lorrax_B/src/gw/gw_jax.py", line 113, in main
+    config = LorraxConfig.from_input_file(args.input, print_fn=print0)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/global/homes/j/jackm/software/lorrax_B/src/gw/gw_config.py", line 834, in from_input_file
+    config = LorraxConfig.from_input_file(args.input, print_fn=print0)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/global/homes/j/jackm/software/lorrax_B/src/gw/gw_config.py", line 834, in from_input_file
+    params = read_lorrax_input(filename)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/global/homes/j/jackm/software/lorrax_B/src/gw/gw_config.py", line 366, in read_lorrax_input
+    with open(filename, 'r') as f:
+         ^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'cohsex.in'
+    params = read_lorrax_input(filename)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/global/homes/j/jackm/software/lorrax_B/src/gw/gw_config.py", line 366, in read_lorrax_input
+    with open(filename, 'r') as f:
+         ^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'cohsex.in'
+srun: error: nid001033: tasks 0-1: Exited with exit code 1
+srun: Terminating StepId=53012905.0
