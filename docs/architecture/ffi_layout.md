@@ -117,6 +117,24 @@ the library is *loaded* for `dlsym` to resolve against; nothing binds at
 link time. That is the `-Wl,--no-as-needed` idiom, not a dangling
 dependency.
 
+**But `DT_NEEDED` is still load-bearing at load time**, and that is a live
+failure today. Measured 2026-08-06, in-container on compute node
+nid001644: the host `.so` carries the right directory in its **RPATH**
+(`/opt/cray/pe/fftw/3.3.10.11/x86_milan/lib`), so on the bare host it
+resolves — but inside the Shifter image `/opt/cray/pe` **does not exist at
+all**, so all three FFTW entries report `not found` and the entire
+`liblorrax_ffi_host.so` fails to load. Tier-1 on the CUDA leg is
+consequently 33 passed / **19 skipped**, every skip reading
+`liblorrax_ffi_host.so unavailable: libfftw3.so.mpi31.3: cannot open
+shared object file`.
+
+No `LD_LIBRARY_PATH` value repairs this — the files are not in the
+container's mount namespace. The repair is a `--volume` for `/opt/cray/pe`
+(or a container-side FFTW), belonging beside the existing `/lorrax_phdf5`
+and `/lorrax_nvhpc` mounts. **The containerized host leg has never been
+green**; the "35/35 on both vendors" certification was a bare-host run.
+A skip is not a pass.
+
 The GPU flat-k mirror (`cufftPlanMany64`, advanced layout) was **not**
 re-certified in the 2026-08-05 Perlmutter campaign. Treat a CUDA-leg FFT
 number as carried forward, not measured.
@@ -149,12 +167,19 @@ Three further facts, each of which has bitten:
 1. **Every stage exports the same SONAME**, `libcusolverMp.so.0`. Building
    against one and running against another links cleanly and warns about
    nothing.
-2. **`25.5_cuda12.9` (0.6.0) returns wrong `getrf`/`getrs` answers on any
-   mesh with `Px>1` *and* `Py>1`** — a wrong-answer path, not a slow one.
-   `0.7.2_cuda12.9` carries both the CAL→NCCL ABI fix and the race fix and
-   is what `config/perlmutter/site_config.sh` selects.
-   `run_shifter.sh:171` defaults `LORRAX_NVHPC_SUBPATH` to
+2. **`25.5_cuda12.9` (0.6.0) is racy on any mesh with `Px>1` *and*
+   `Py>1`.** MEASURED 2026-08-06: the failure signature is
+   **nondeterminism, not a stable wrong answer** — at 2×2 it trips a
+   rerun-bit-determinism assert before the residual is ever compared,
+   consistent with `config/perlmutter/site_config.sh` crediting 0.7.2 with
+   "the race fix". `0.7.2_cuda12.9` carries both the CAL→NCCL ABI fix and
+   the race fix, and is what `site_config.sh` selects; `run_shifter.sh:171`
+   defaults `LORRAX_NVHPC_SUBPATH` to
    `0.7.2_cuda12.9/math_libs/12.9/lib64`.
+   *Note for whoever edits the source:* the comments at
+   `run_shifter.sh:165-166` and `build.sh:27-29,65-66` describe this as
+   "returns WRONG getrf/getrs answers", which overstates a race as a
+   deterministic result. A rerun that agrees proves nothing here.
 3. **Both stages are on `LD_LIBRARY_PATH` at runtime.** `run_shifter.sh:186`
    places the *selected* stage first and `25.5_cuda12.9` after it, on
    purpose: only that tree ships `libcal.so.0`, which a CAL-built `.so`
@@ -166,6 +191,19 @@ exports both it and a `LORRAX_NVHPC_ROOT` derived from its first component
 (`run_shifter.sh:240-241`), so a build launched through `run_shifter.sh`
 agrees with the run it is built for **by construction** rather than by two
 people remembering the same string. Launch builds that way.
+
+**Verified end to end on the machine, 2026-08-06** (Perlmutter, compute
+node, in-container build):
+
+* `NVHPC_ROOT` resolved to `/lorrax_nvhpc/0.7.2_cuda12.9` from the single
+  `LORRAX_NVHPC_SUBPATH` string.
+* The rebuilt `.so` links cuSOLVERMp **0.7.2 with no CAL**: `libcal` absent
+  from `DT_NEEDED`, zero hits in the build log, `nm -D | grep cal_` → 0
+  symbols. The previous `.so` has `U cal_comm_create`. The runtime banner
+  reads `library 0.7.2, comm path: NCCL`.
+
+So the stage genuinely selects the comm path — this is measured, not
+inferred from the CMake option.
 
 > **Open skew, not yet resolved in code.** The CMake default is
 > `LORRAX_FFI_HAVE_CAL=ON` (`CMakeLists.txt:51`) while the runtime default
