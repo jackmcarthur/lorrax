@@ -249,17 +249,41 @@ a different worktree, which the path makes obvious and nothing else would.
 >   `jax_use_shardy_partitioner=False` on both. *Scope: single-device
 >   arithmetic only. Multi-rank reduction order was **not** measured.*
 >
-> **The remaining divergence between 0.7.0 and 0.9.1 is two symbols, and it is
-> not a version difference at all.** `compilation_cache.VerificationCache` and
-> `config.compilation_cache_check_contents` are absent from **every NVIDIA JAX
-> container at every tag** — ten probed, 0.5.3 through 0.9.1 — and present only
-> in the released wheel. Every other `jax._src` private this tree patches has
-> the *same shape* on 0.7.0 and 0.9.1: `_hash_accelerator_config` 2 params,
-> `_hash_serialized_compile_options` 3, `get_executable_and_time` 4,
-> `is_executable_in_cache` 2, `backend_compile_and_load` present. That is why
-> `common/jax_compile_cache.py` carries **one** narrow guard where it used to
-> carry five, and why the other four were deleted rather than kept as a
-> permanent compatibility layer for an abandoned version.
+> **Two real divergences, not one.** *(This paragraph said "the entire real
+> divergence is `jax._src`" until 2026-08-06. The second one below was
+> measured that day and is the one that actually blocks the move.)*
+>
+> 1. **`jax._src` private-API arities**, reached from
+>    `common/jax_compile_cache.py`, which monkeypatches jax internals. Every
+>    *public* symbol LORRAX touches does exist with a compatible signature on
+>    both generations, so this half of the old claim stands.
+> 2. **`shard_map` behaviour, from jax 0.7.0** — a public-API divergence that
+>    a signature comparison cannot see. From 0.7.0 `shard_map` tracks
+>    **varying manual axes** (VMA): every value in the body carries the set of
+>    mesh axes it may differ over, and `scan` / `fori_loop` / `while_loop`
+>    require that set to be **equal** at carry input and output. An
+>    accumulator built by `jnp.zeros` has an empty set, so the first
+>    `A = A + <sharded data>` makes the output varying and the loop is
+>    **rejected at trace time**. Tracking starts at **0.7.0, not 0.9** — a
+>    guard written as "only 0.9 needs this" is wrong across the whole
+>    0.7–0.8 range. Worse, `lax.pcast` does not exist on 0.7.x at all, so the
+>    obvious `try: lax.pcast / except AttributeError: identity` shim installs
+>    a **no-op on exactly the versions that enforce the rule**; that defect
+>    was live in `common/cholesky_2d.py`.
+>
+> **The blast radius of (2) is small and was counted, not estimated.** An AST
+> census over `src/` — `shard_map` entry points → within-module call-graph
+> closure → loop carries, classified by how the init is built — finds 21
+> loop-carry sites reachable from a `shard_map` body, of which **8 need
+> marking, all in `src/bse/bse_ring_comm.py`**. Marking is not free either
+> way: a carry that is invariant by construction and leaves through a
+> *replicated* `out_specs` entry **fails** if it is marked, so "mark all the
+> mesh axes to be safe" is its own bug.
+>
+> 
+> **Divergence (1) is now two symbols, and it is not a version difference at all.**  `compilation_cache.VerificationCache` and `config.compilation_cache_check_contents` are absent from **every NVIDIA JAX container at every tag** — ten probed, 0.5.3 through 0.9.1 — and present only in the released wheel.  Every other `jax._src` private this tree patches has the *same shape* on 0.7.0 and 0.9.1: `_hash_accelerator_config` 2 params, `_hash_serialized_compile_options` 3, `get_executable_and_time` 4, `is_executable_in_cache` 2, `backend_compile_and_load` present.  That is why `common/jax_compile_cache.py` carries **one** narrow guard where it used to carry five, and why the other four were deleted rather than kept as a permanent compatibility layer for an abandoned version.
+> 
+> **Status.**  Both halves are **merged** into `integration/2026-08-07` (2026-08-06): `agent/vma-pvary-marking-2026-08-06` @ `8e6e083` (`src/common/vma.py` owns the version decision once and refuses at import on a jax that tracks VMA but offers neither spelling), then `agent/jax-070-land-2026-08-06` @ `ace2d51` (container moves to jax 0.7.0 / CUDA 12.9, `common/jax_support.py` gates the window at `[0.7.0, 0.10.0)`, four of the five compile-cache shims deleted), then `agent/shard-map-modern-2026-08-06` @ `9a4a8d5` (all 94 `shard_map` sites routed through `common/shard_map.py`).  **Not yet an ancestor of `origin/main`** — check with `git merge-base --is-ancestor` before citing it as landed.  The startup version gate was already in (`agent/jax-version-gate-2026-08-06`).
 >
 > **The FFI headers move but the ABI does not.** `XLA_FFI_API_MAJOR`/`MINOR`
 > are `0`/`1` on both images; the three `xla/ffi/api/*.h` differ only by
@@ -282,6 +306,13 @@ a different worktree, which the path makes obvious and nothing else would.
 > against everything staged under `/lorrax_nvhpc` for CUDA 12.9 (§4 of
 > [`ffi_layout.md`](../architecture/ffi_layout.md)). That is a port, not a pin
 > change.
+>
+> **But the exit is not to 0.9 — it is to 0.7.0, and that image does exist.**
+> `ghcr.io/nvidia/jax:jax-2025-07-21` ships jax 0.7.0 on CUDA 12.9 and is the
+> **last CUDA-12 image**. It clears the VMA divergence above and lets the
+> supported window be `[0.7.0, 0.10.0)` — a window both machines can meet —
+> without touching the CUDA-12 stage. Taken on
+> `agent/jax-070-land-2026-08-06`, unmerged.
 >
 > **A version string read from a container is not evidence.** Every container
 > JAX is a dev build that restamps its display string to the *run* date: all

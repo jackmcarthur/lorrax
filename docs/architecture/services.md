@@ -1,11 +1,168 @@
-# Substrate services — the API reference
+# Substrate services
 
-*The L3 substrate ([layers](layers.md)) as a set of internal services: for
-each one, its purpose, its **public API as it exists in the code today**,
-its contract (what it refuses, what it announces, and **when** — resolve
-time vs trace time), its level and allowed import direction, and its
-dependencies. Deep-dive documents are linked; signatures here are verified
-against `src/` (2026-08-01) and win over any older doc prose.*
+*The L3 substrate ([layers](layers.md)) as a set of internal **services**.
+Part 1 says what a service is here, which capabilities are services, and
+which of them deliberately expose a choice to the caller. Part 2 is the
+API reference: per service, its purpose, its **public API as it exists in
+the code today**, its contract (what it refuses, what it announces, and
+**when**), its level, and its dependencies.*
+
+*Signatures are verified against `src/` on `integration/2026-08-06`; where
+a service is changing on an unmerged branch, the section says so and names
+the branch. Signatures here win over any older doc prose.*
+
+## What a service is, here {#what-is-a-service}
+
+The name is not decoration. A capability on this page is a service when it
+has all four of:
+
+1. **An interface a caller can use without knowing the backend.** The
+   caller states *what*, in its own vocabulary — a path, a mesh, a spec, an
+   operand — and never *how*.
+2. **A stated guarantee**, strong enough to design against. SlabIO's is
+   "nothing larger than one rank's tile is ever materialised".
+   `ffi.linalg`'s is "a returned backend name is a promise: its handler is
+   compiled in and every mesh guard passed, so the call cannot fail for an
+   availability reason".
+3. **Something that genuinely varies underneath, per machine** — a vendor
+   library, a transport, a driver generation. Where nothing varies, a
+   module is a helper, not a service, and does not need this page.
+4. **A gate proving it built right**, or a named admission that there is
+   none.
+
+The owner's statement of purpose for (1), which is the test to apply when
+designing a new one: *agents wiring in parallel I/O should not have to
+think about the nitty-gritty so much.*
+
+**Property 3 and 4 are recorded elsewhere and are not repeated here.**
+[`ffi_layout.md` §3](ffi_layout.md) is the routine × machine ×
+alternatives × gate matrix: for each numerical or I/O routine LORRAX does
+not implement itself, who serves it on Perlmutter and on Frontera, what
+else could, how you would know it built right, and whether that check
+passes. **This page is the other half of the same material — what a
+*caller* sees. Read them together; do not restate one in the other.**
+
+## The service inventory {#inventory}
+
+| service | the call a caller actually makes | guarantee | varies underneath | caller picks the backend? | gate |
+|---|---|---|---|---|---|
+| **`file_io.slab_io`** | `SlabIO(path, mode=, mesh=)` → `create_dataset` / `write_slab` / `read_slab` | no object larger than one rank's tile is materialised | Lustre striping, ROMIO collective buffering, the phdf5 handler, the MPI it was built against | **no — by design** (see [below](#choice)) | GATE 1, GATE 7 (`ffi_layout` §3); `tests/test_slab_io_routing.py` |
+| **`ffi.linalg`** | `plan(op, mesh_xy, backend=…)` → `plan(A_tile)` / `plan.batched(A_stack)` | a resolved backend name is a *promise*: handler compiled in and every geometry guard passed, so the call cannot fail for an availability reason | ScaLAPACK / SLATE / cuSOLVERMp / native, per op, machine and mesh geometry | **yes — by design**, via three deck keys (see [below](#choice)) | **none at build time**; `tests/test_ffi_linalg_contract.py` at run time |
+| **`ffi.fft`** (entered through `common.fft_helpers`) | `make_flat_k_fft(mesh, kgrid, spec, kind=…)` | one flat-k batched 3-D FFT under the same jax.ffi target names on cpu and CUDA | cuFFT / MKL-DFTI / an FFTW3-ABI `dlopen` ladder | no — capability only (`LORRAX_FFT_FFI` is on/off, and off *refuses*) | GATE 5b (load time only). **Which engine answered is not gated** — GATE 8 exists on `fix/host-ffi-fftw-container-stage-2026-08-06`, unmerged |
+| **`ffi.gemm`** | `gemm_batch(a3, b3)`, inside the caller's own `shard_map` | batched host GEMM at vendor-BLAS rate, or an announced XLA fallback | Cray LibSci / MKL / netlib / AOCL / OpenBLAS CBLAS; batched entry point present or not | no — capability only | GATE 2 (one LibSci flavour). Which *entry point* was chosen is announced, not gated |
+| **`ffi.io`** — parallel HDF5 | `open_file(path, mesh=, mode=)` → `write_sharded_slab` / `read_sharded_slab` | collective MPI-IO straight to a hyperslab; no rank-0 gather | cray-hdf5-parallel + Cray MPICH / phdf5 + Intel MPI; CUDA vs host `.so` | no — the platform comes from the mesh's devices | GATE 1, GATE 7 |
+| **`ffi.common.ffi_loader`** — the meta-service | `get_lib(platform)`, `probe_target(target, platform)` | a three-way reason for every failure: unknown target / library would not load / library loaded but exports no such handler | `liblorrax_ffi.so` vs `liblorrax_ffi_host.so`; per-site RPATH | no; `LORRAX_FFI_SO` / `_HOST_SO` pin a path, and since 2026-08-06 a **set-but-missing pin refuses** rather than falling through | every other service's refusal quotes it |
+| **`common.collectives`** | `prepare_mesh()`, `gather_k_blocks()` | the run's mesh with every communicator it will need already created | NCCL on CUDA; MPI — **not gloo** — on CPU ([transports](../environment/transports.md)) | no — `JAX_CPU_COLLECTIVES_IMPLEMENTATION` is a deployment fact, not a call-site choice | run-time, not build-time: `psum_scatter_checked` returns a Freivalds residual, because gloo's `reduce_scatter` is measured to return **wrong values** |
+| **`file_io.wfn_loader`** | `WfnLoader(...).load(...)` | ψ(G) in the G-flat layout, byte-identical between backends | `eager` (h5py + numpy) vs `phdf5` (collective FFI + on-device unfold) | **escape hatch only** — `LORRAX_WFN_BACKEND`; the parity contract is what makes the choice safe to expose | `tests/bench/wfn_loader_backend_parity_test.py` (byte-identical) |
+| **`common.jax_compile_cache`** | `ensure_jax_compile_cache()`, once, right after `runtime.bootstrap()` | a persistent compile cache that is safe across processes | filesystem (Lustre `$SCRATCH` vs `~/.cache`), world size, jaxlib generation | no | `tests/test_compile_cache_agreement.py`, with a `LORRAX_JAX_CACHE_FORCE_DIVERGE` positive control |
+| **`runtime`** | `initialize_communicator_stack()` | one ordered bootstrap; every choice with more than one possible outcome is printed on rank 0 | allocator, plugin discovery, CPU-vs-GPU backend, glibc malloc | no | `tests/test_runtime_startup_report.py` — a dial absent from the report fails |
+
+**The vendor packages are backends, not services.** `ffi.cusolvermp`,
+`ffi.slate` and `ffi.scalapack` have **zero** direct-import consumers in
+`src/`; every call site goes through `ffi.linalg.resolve.backend_module()`.
+Listing them here as peers of `ffi.linalg` would invite someone to import
+one. (`ffi.cublasmp` has no consumer at all — it is bench- and test-only.)
+
+**Not services, kept nearby because callers reach for them from the same
+place:** `common.timing` (pure instrumentation — nothing varies);
+`common.sharding_fit`, `common.staged_reshard` and `common.contract_bands`
+(movement patterns with no vendor library — `contract_bands` *consumes*
+the `ffi.gemm` service rather than being one; `staged_reshard` is an
+XLA-partitioner workaround with a single consumer); `runtime.xla_memory`
+(a read-only mirror of jaxlib's own env parse — a fact collector).
+
+**`ffi.gate` is the mechanism, not a service.** It is instantiated exactly
+three times — `ffi/gemm.py` (`LORRAX_BANDS_GEMM_FFI`) and `ffi/fft.py`
+twice (`LORRAX_FFT_FFI`, `LORRAX_FFT_FFI_FUSED`). `ffi.linalg`
+deliberately does **not** use it: it resolves once from arguments, because
+its choice comes from the deck rather than the environment.
+
+A candidate service is arriving on a branch: **`common.vma`**
+(`agent/vma-pvary-marking-2026-08-06`, unmerged) — one `mark_varying(init,
+axes)` helper hiding *which jax spelling* marks a `shard_map` loop carry
+as device-varying (`lax.pvary` on 0.7–0.8, `lax.pcast` from 0.9, identity
+below 0.7.0, and a **refusal at import** on a jax that tracks varying
+manual axes but offers neither). It is the same pattern applied to a
+library *version* rather than a vendor library, and it is what unblocks
+leaving jax 0.5.3. **Read `agent/jax-070-land-2026-08-06` instead** — it
+contains that branch plus the container move and the supported-version
+window, and is the branch the [JAX straddle
+note](../environment/overview.md) tracks. Both are unmerged.
+
+## Which services expose a choice, and which hide one {#choice}
+
+These two look inconsistent and are not. The difference is worth stating
+because harmonising them would be a regression in one direction or the
+other.
+
+**SlabIO hides the choice.** As of
+`feat/slabio-one-backend-2026-08-06` (unmerged) there is no `backend=`
+argument, no `use_ffi_io=`, no `SlabIOBackend`, and no `slab_io` deck key:
+a caller states a path, a mode, a mesh and *logical* shapes, and gets
+tiles. That is correct because **every alternative moved the same bytes
+to the same place, at equal or worse cost**. `H5PY_ALLGATHER` was a
+rank-0 gather — not a slow tier but an out-of-memory at the design size,
+and it had to be refused at seven separate doors before an eighth
+ungated route was found. `PHDF5_HOST` drove the *same* collective MPI-IO
+through two extra Python packages, selected only by a stale `.so`. A dial
+whose settings are "correct" and "worse in every measured respect" is not
+a choice; it is a way to get it wrong.
+
+**`ffi.linalg` exposes the choice, and should.** The choice is a deck
+key, in three parallel spellings — `eigh_backend`
+(`auto | off | distributed | cusolvermp | slate | scalapack`),
+`distributed_cholesky` (`auto | off | cusolvermp | slate`) and
+`distributed_lu` (`auto | off | distributed | cusolvermp | scalapack`) —
+and **`ffi.linalg` reads no environment at all**. The environment grants
+*capability* (which `.so`); the deck makes the *choice*.
+
+That is correct because the backends are not interchangeable
+implementations of one cost. `auto` for `eigh` resolves to **native** on
+every platform, because the q-batched `jnp` path solves ndev matrices
+concurrently while the FFI path solves one matrix ndev-ways and walks the
+batch serially — **measured 100–600× slower per fit-size matrix**
+(`common.eigh_benchmark --mode dispatch`). `distributed` is the name for
+the opposite shape, one tile spread over the mesh, and is the only way
+out of the replicated ζ-factor's O(nq·μ³)-with-no-P-scaling wall. Which is
+right depends on what the caller is solving — knowledge SlabIO's callers
+have no analogue of, because a byte transport has no such shape parameter.
+
+The exposure is disciplined in two ways worth copying. An **explicit**
+request never demotes: only `auto` demotes, and only with a rank-0
+announcement naming whether the cause was geometry or capability. And
+`eigh_backend`'s accepted vocabulary is *imported from the resolver*
+(`eigh_backend_choices()` reads `ffi.linalg.resolve.BACKEND_CHOICES`), so
+the deck parser cannot drift from the thing it configures. **The other two
+keys hardcode their vocabularies** and can drift; that is a defect in
+them, not a second design.
+
+**A third position: `file_io.wfn_loader`** exposes `LORRAX_WFN_BACKEND`
+(`eager` vs `phdf5`) as an *escape hatch*, not a tuning dial. That is only
+defensible because the two backends are held **byte-identical** by a
+parity test — the choice cannot change an answer, only how it was
+obtained. An escape hatch without a parity contract is just an
+undocumented backend selector.
+
+**The FFT and GEMM dials are neither.** `LORRAX_FFT_FFI` and
+`LORRAX_BANDS_GEMM_FFI` are two-valued capability switches, not backend
+selectors — you cannot ask for cuFFT-instead-of-MKL, only for the service
+or (for GEMM) an announced, uncertified debug fallback. Since the
+2026-08-01 ruling that [FFI backends are required](decisions.md),
+`LORRAX_FFT_FFI=0` **refuses** rather than falling back, because the XLA
+twin it would have fallen back to is deleted.
+
+**The rule this suggests**, stated so a new service has something to argue
+against: *expose a choice only where the alternatives have genuinely
+different costs that the call site — not the deployment — is in a position
+to judge; and where you expose one, either hold the alternatives to a
+parity contract or make the cost difference the documented reason.*
+Deployment facts (which MPI, which HDF5, which FFTW3 `.so`) belong to the
+environment and to [`ffi_layout.md`](ffi_layout.md); call-site facts (a
+batch of small tiles versus one large one) belong in the deck.
+
+---
+
+# Part 2 — the API reference
 
 Conventions used throughout:
 
@@ -16,9 +173,9 @@ Conventions used throughout:
   factory/plan is built (platform, mesh geometry, handler probe, env
   grammar); *trace-time* checks fire inside the returned callable on the
   operand (dtype, rank, extents) — a factory cannot know them earlier.
-* **Announce-or-refuse.** `auto` may demote but must say so from the rank
-  it happened on; an explicit request that cannot be honored raises with
-  the reason and the fix. Silence is legal only where declared.
+* **Announce-or-refuse.** A demotion must say so from the rank it
+  happened on; an explicit request that cannot be honored raises with the
+  reason and the fix. Silence is legal only where declared.
 
 ## The dependency tree
 
@@ -48,14 +205,17 @@ L3  substrate services (this page)
     │   ├─ ffi.gemm  (vendor-CBLAS batched GEMM, host)             │
     │   └─ ffi.linalg (plan → resolve → dispatch;                  │
     │        backends: scalapack / slate / cusolvermp / native)    │
+    │ ffi.io ─ parallel-HDF5 MPI-IO handlers (ffi.phdf5 = shim)    │
     │ file_io.slab_io ─ sharded-slab HDF5 transport                │
-    │   └─ tiers: _slab_io_ffi (ffi.phdf5) → _slab_io_mpi_host     │
+    │   └─ tiers: _slab_io_ffi (ffi.io) → _slab_io_mpi_host        │
     │             (mpi4py+h5py) → _slab_io_allgather               │
+    │             [collapsing to ONE tier — see slab_io below]     │
     │ common.timing ─ instrumentation (leaf; no deps)              │
     └──────────────────────────────────────────────────────────────┘
 
 sanctioned upward edges (tests/test_layering.py, argued in layers.md §5):
  !R1  file_io.slab_io ──▶ gw.gw_config          (lazy; SlabIOBackend enum)
+      — closed by deletion on feat/slabio-one-backend-2026-08-06
  !R2  solvers.sternheimer_solve ──▶ psp.dft_operators
  !R3  centroid.kmeans_isdf ──▶ centroid.orbit_syms   (lazy)
  !R4  mixing.acceleration writes JAX_ENABLE_X64 at import (env touch)
@@ -282,9 +442,8 @@ does not divide — e.g. M=672 → 704 at P=64, +4.76%).
 
 **Level / deps.** L3. Sole consumer:
 `bandstructure/bse_setup.py:428` (the fH_q face→batch move in
-`_q_batch`). *(SUPERSEDED 2026-07-31: this section used to name
-`common.zeta_projection`'s basis change as a consumer — false;
-`zeta_projection` only cites the doctrine, it never calls the factory.)*
+`_q_batch`). One consumer is why this is a helper and not a
+[service](#inventory).
 
 **Deep dive.** The module docstring of `src/common/staged_reshard.py` is
 the real contract (routes, divisibility, residency proof, measured
@@ -349,7 +508,10 @@ function's docstring says so.
 grammar, platform, probe, announce-or-refuse — in one place instead of
 per-dial drifting copies.
 
-**Public API** (`src/ffi/gate.py`; `ffi.common.gate` is a shim):
+**Public API** (`src/ffi/gate.py` — the only `gate.py` in the tree; the
+`ffi.common.gate` re-export shim was **deleted** 2026-08-06 in `ad71053`
+— on `integration/2026-08-06`, **not** on `origin/main` — with zero
+importers left):
 
 ```python
 @dataclass(frozen=True)
@@ -486,9 +648,16 @@ def require_gemm_ffi(mesh) -> str
 def gemm_batch(a3, b3)     # A (BA,M,K) @ B (BB,K,N) -> C (BA,M,N), C[i]=A[i]@B[i%BB]
 ```
 
-**Contract.** The only default-`auto` dial: AUTO-ON is announced
-(`[bands_gemm] AUTO-ON …`); on GPU meshes the demotion is declared-silent
-(XLA:GPU already dispatches cuBLAS — nothing to act on). Trace time:
+**Contract.** `platforms=("cpu",)`, so on a GPU mesh the demotion is
+**declared-silent** — this is the only `Gate` in the tree that sets
+`silent_platform_demote`, and it is justified: XLA:GPU already dispatches
+cuBLAS, so there is nothing for a reader to act on. *(This section used to
+call it "the only default-`auto` dial". That is false since `2a73b4b`
+(on `integration/2026-08-06`, not `origin/main`) deleted the `auto`
+vocabulary: `MODE_SPELLINGS` is
+two-valued, all three `Gate`s declare `modes=("off","on"), default="on"`,
+and `Gate.__post_init__` would now refuse a gate declaring `auto`.)*
+Trace time:
 `gemm_batch` refuses mismatched K, `BA % BB != 0`, and mixed dtypes;
 dtype dispatch (f64/f32/c128/c64) happens inside the `.so`. No
 `shard_map` here **by design**: it is a rank-local handler called from
@@ -540,16 +709,77 @@ replicated) and reshards operands into it; `plan.batched` is uniform
 whether or not the library has a batched entry point. `plan()` on a
 native Cholesky/LU **raises** — those fast paths belong to the caller's
 jit (`plan.is_native` says so); native `eigh` is the one runnable
-exception. Backend **choice** is an input-deck key; the env grants
-capability only. Backends today: ScaLAPACK `pzheevd` (the permanent CPU
-distributed eigh), SLATE, cuSOLVERMp (deletion candidate,
-[ffi_layout §5](ffi_layout.md)), `native`.
+exception.
+
+Backend **choice** is an input-deck key and **this package reads no
+environment at all**; `LORRAX_FFI_SO` / `_HOST_SO` grant capability via
+`ffi_loader`, and the platform comes from the mesh's devices, never from
+`JAX_PLATFORMS`. Vocabulary per op, and the deck key that sets it:
+
+| op | deck key | accepted | notes |
+|---|---|---|---|
+| `eigh` | `eigh_backend` | `auto \| off \| distributed \| cusolvermp \| slate \| scalapack` | vocabulary is **imported** from `resolve.BACKEND_CHOICES`, so parser and resolver cannot drift. `use_low_mem_eigh = true` rewrites `auto`/`native` to `distributed` |
+| `cholesky` | `distributed_cholesky` | `auto \| off \| cusolvermp \| slate` | no `distributed` spelling, deliberately. Vocabulary is a **hardcoded duplicate** — it can drift |
+| `solve_lu` | `distributed_lu` | `auto \| off \| distributed \| cusolvermp \| scalapack` | vocabulary is likewise a hardcoded duplicate |
+
+Six guards run in one fixed order (vocabulary → platform → known-broken →
+capability probe → process coverage → geometry → `n` divisibility), all at
+resolve time. Two are worth knowing at the call site: **SLATE `heev` on a
+CPU mesh is a hard `RuntimeError`**, not a demotion (bug L-2, deterministic
+SIGSEGV), and cuSOLVERMp `syevd` on a rectangular mesh **deadlocks inside a
+collective** rather than returning an error, so the square-mesh guard is
+load-bearing rather than tidy. `off` is an override, not a guard: it is
+honoured unconditionally, before every check.
+
+Backends today: ScaLAPACK `pzheevd` (the permanent CPU distributed eigh),
+SLATE, cuSOLVERMp (deletion candidate, [ffi_layout §5](ffi_layout.md)),
+`native`.
 
 **Level / deps.** L3. `ffi.common.ffi_loader` + the backend packages;
 consumed by `isdf/core`, `gw/w_isdf`, `bandstructure/bse_setup`,
 `bse/vq_interp`.
 
 **Deep dive.** `docs/dev/linalg_ffi.md`.
+
+---
+
+## ffi.io — parallel HDF5 {#ffiio}
+
+**Purpose.** The MPI-IO handlers themselves: each process reads and writes
+its own hyperslab of a shared HDF5 file, with no gather through rank 0.
+`file_io.slab_io` is the physics-facing service over this one; **`ffi.io`
+has a second, independent consumer in `file_io.wfn_loader`**, which is why
+it is listed separately rather than folded into SlabIO.
+
+**Public API** (`src/ffi/io.py`):
+
+```python
+def open_file(path: str, *, mesh: Mesh, mode: str = "w") -> int   # opaque PhdfCtx*
+def close_file(path_or_handle) -> None
+def write_sharded_slab(fh, ds_name, A, *, mesh,
+                       global_shape=None, valid_shape=None) -> None
+def read_sharded_slab(fh, ds_name, *, global_shape, dtype, mesh)
+def read_kchunk_sharded(...);  def read_kchunk_union_sharded(...)
+```
+
+**Contract.** Backend is hidden: `_platform_for_mesh` picks `CUDA` vs
+`cpu` from the mesh's devices, and the platform is recorded per handle so
+`close_file` routes back through the *opening* library. Refuses at resolve
+time: a mode outside `{w, a, r}`; a mesh without both `x` and `y` axes;
+`p*q != jax.process_count()`; a non-2-D operand to `write_sharded_slab`;
+and — the orphaned-inode guard — **re-opening an already-open path with a
+different mode**. No `Gate`, no env dial.
+
+**Level / deps.** L3. `ffi.common.ffi_loader` plus the C++ handlers in
+`src/ffi/cpp/phdf5/`.
+
+**Migration note.** `ffi.phdf5` is four re-export shims over this module,
+and their own docstring says deleting the shim is the gate that the
+migration is complete. **That gate is not met, and no production module
+has migrated**: every importer under `src/` still reaches `ffi.phdf5` —
+`file_io/_slab_io_ffi.py` (4 sites) and `file_io/wfn_loader.py` (3) —
+and `src/` contains **zero** direct imports of `ffi.io`. Only tests import
+the new name.
 
 ---
 
@@ -578,16 +808,16 @@ class SlabIO:   # context manager
     def close(self) -> None
 ```
 
-**Contract.** Three backend tiers, selected by
+**Contract on this branch.** Three backend tiers, selected by
 `SlabIOBackend` (defined in `gw.gw_config` — sanctioned exception R1;
 `slab_io = auto` in the deck resolves via the capability router in
 `LorraxConfig.from_input_file`):
 
 | tier | module | mechanism | requires |
 |---|---|---|---|
-| `PHDF5_FFI` | `_slab_io_ffi` | collective MPI-IO via `ffi.phdf5` (CUDA lib or CUDA-free host lib) | mesh; the lib exports the handler |
+| `PHDF5_FFI` | `_slab_io_ffi` | collective MPI-IO via `ffi.io` (CUDA lib or CUDA-free host lib) | mesh; the lib exports the handler |
 | `PHDF5_HOST` | `_slab_io_mpi_host` | same MPI-IO, driven by mpi4py + parallel h5py | mesh; the overlay |
-| `H5PY_ALLGATHER` | `_slab_io_allgather` | gather to rank 0, serial h5py | nothing (last resort; rank-0 bandwidth limit) |
+| `H5PY_ALLGATHER` | `_slab_io_allgather` | gather to rank 0, serial h5py | reachable at **exactly one process** |
 
 Resolve time: `PHDF5_FFI`/`PHDF5_HOST` without a mesh raise; a non-enum
 `backend` raises `TypeError`. Padding contract: files always store the
@@ -597,17 +827,56 @@ tail (driver-side padding is `runtime.padding`'s job). The host-MPI path
 writes synchronously by design (the threaded FFI deadlocks at `H5Fclose`
 under `MPI_THREAD_SINGLE` — `_slab_io_mpi_host.py` docstring).
 
-`H5PY_ALLGATHER` is a **refusal, not a fallback** at any process count
-> 1: it materialises the whole array on rank 0, which is the memory wall
-the per-rank-tile contract exists to avoid.
+`H5PY_ALLGATHER` is a **refusal, not a fallback** above one process
+([decisions.md](decisions.md) 2026-08-05): it materialises the whole array
+on rank 0, which is the memory wall the per-rank-tile contract exists to
+avoid.
 
-**Level / deps.** L3. `ffi.phdf5` (lazy), mpi4py/h5py (lazy), the R1 lazy
-enum import.
+### The interface is collapsing to one transport {#slab-io-one-transport}
+
+**On `feat/slabio-one-backend-2026-08-06` (unmerged — not an ancestor of
+`integration/2026-08-06` or of `origin/main`)** the three tiers, the enum,
+the router and the two deck keys are **deleted**, and the constructor
+becomes `SlabIO(path, *, mode="w", mesh)` — nothing else. This is the
+flagship worked example of the [hide-the-choice](#choice) position, and
+new services should be read against it:
+
+* **A caller no longer computes a mesh-divisible extent.** `read_slab`
+  with no `shape` returns the dataset rounded *up* to the mesh-divisible
+  extent under `partition_spec`, zero-filled past the dataset — which is
+  the padded consumer buffer every sharded consumer actually wanted. It
+  used to **refuse** that call, so every caller computed the round-up
+  itself and two of them computed it differently. The easy call is now the
+  correct call.
+* **`write_slab` clips the pad to the dataset**: the extent written is
+  `min(A.shape, dataset - offset)` per dimension, derived from the dataset
+  SlabIO already knows about, so a buffer padded for mesh divisibility
+  needs no extra argument. `valid_shape` survives only as the ragged-chunk
+  override.
+* **The deletion closed [layers.md](layers.md) request R1** — "the enum
+  needs a home neither package owns". The answer was *nowhere*: with one
+  transport there is no enum, no `backend` parameter, and no uphill
+  L3 → L1 import.
+* **Seven refusals were not enough.** `H5PY_ALLGATHER` had been closed at
+  seven separate doors across three sessions, each closure reported
+  complete, and an eighth ungated route survived all of them — a direct
+  `from file_io._slab_io_allgather import _to_host` in `gw/gw_init.py`,
+  bypassing the enum entirely. **A capability that must be refused at
+  seven doors is dead code wearing a safety label**; the branch deletes
+  the module instead, and the guarantee then holds by construction rather
+  than by a check. That lesson generalises past SlabIO and is the reason
+  this page has a "hide the choice" position at all.
+* **`restart = true` works at P>1 again**, ported to per-rank tiles and
+  bit-exact per shard at nspinor 1/2/4 including bispinor. The previous
+  full-file reader was guarded off above one process with no replacement.
+
+**Level / deps.** L3. `ffi.io` (lazy), mpi4py/h5py (lazy), the R1 lazy
+enum import — the last two go away with the tiers.
 
 **See also.** [`slab_io.md`](slab_io.md) — the transport in full: the
-per-rank-tile contract, the routing rules and why node count is not one of
-them, the `--mpi=cray_shasta` launcher requirement and the singleton-MPI
-trap it avoids, the measured tuning defaults, and the failure modes.
+per-rank-tile contract, the launcher requirement and the singleton-MPI
+trap it avoids, the measured striping policy, the certification, and the
+failure modes. That page is rewritten on the same branch.
 
 ---
 
@@ -643,11 +912,24 @@ block. Services on this page open their own sections
 
 ## Adding a service
 
-The bar, condensed from the pages above: one module owns the pattern; a
-typed `Gate` (or explicit parameters) instead of loose env reads; refusals
-at resolve time where the fact is known there, trace time where it is not;
-every announcement grep-able and rank-disciplined; the dial in
-`ffi.ffi_dial_key()` if factory-time; a deep-dive doc when the design
-encodes measurements. `tests/test_layering.py` and
+The mechanical bar, condensed from the pages above: one module owns the
+pattern; a typed `Gate` (or explicit parameters) instead of loose env
+reads; refusals at resolve time where the fact is known there, trace time
+where it is not; every announcement grep-able and rank-disciplined; the
+dial in `ffi.ffi_dial_key()` if factory-time; a deep-dive doc when the
+design encodes measurements. `tests/test_layering.py` and
 `tests/test_runtime_startup_report.py` enforce the level and the
 announcement halves mechanically.
+
+The design bar is the four properties in
+[§What a service is](#what-is-a-service), and one question they do not
+answer on their own: **does the caller pick the backend?** Answer it
+explicitly and record the reason, because both answers are in the tree and
+both are right ([above](#choice)). Default to *no*: the burden is on the
+dial to justify itself. A dial whose settings are "correct" and "worse in
+every measured respect" is not a choice, and each one costs a router, a
+vocabulary, a deck key, a refusal per door, and — as SlabIO measured — the
+possibility that an eighth door exists.
+
+Add the row to the [inventory](#inventory), and the vendor-and-gate facts
+to [`ffi_layout.md` §3](ffi_layout.md), not here.

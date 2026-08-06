@@ -10,6 +10,33 @@ separate question and is stated per entry — an approved ruling that has not
 landed is marked so, with the branch that carries it, because documenting an
 unlanded change as live is how a tuning table becomes a lie.
 
+## 2026-08-06 — There is deliberately no `LORRAX_EXTRA_BAND_PAD`
+
+Asked and **declined**, 2026-08-06 (ledger 0169), even though the band
+axis is now the most-padded axis in the tree.
+
+`LORRAX_EXTRA_MU_PAD` works because every μ extent funnels through the
+single `runtime.padding.padded_mu_extent`, so one knob reaches all
+eleven call sites. **The band pad has no single source.**
+`spec_divisor` is shared by five sites (`wfn_loader`, `mtxel_sweep`,
+`sc_iteration`, `qsgw_density`, `wfn_transforms`) but each does its own
+round-up; `bse/bse_io.py` hand-rolls `_pad_axis_to_multiple` entirely
+(and returns the PADDED extent where `pad_axis_to` returns the LOGICAL
+one, from the same slot); `gw/ppm_sigma.pad_sigma_window` pads m and n
+independently.
+
+A knob honoured inside `pad_axis_to` would therefore reach **neither the
+BSE band axis nor the Σ window** while reporting a green pad-flip run for
+the band axis as a whole — a false all-clear, which is worse than no
+check because it stops anyone else looking.
+
+**Precondition for adding it:** single-source the band extent first
+(a `padded_band_extent()` beside `padded_mu_extent()`, with `bse_io` and
+`ppm_sigma` routed through it). The knob is cheap and correct after that
+and manufactures a false all-clear before it.
+
+*Moved here from `docs/dev/env_vars.md` on 2026-08-06: that page's register entry restricts it to spelling, default, class and parse grammar, and this is a ruling.  The registry row for `LORRAX_EXTRA_RANK_PAD` links here.*
+
 ## 2026-08-06 — `minimax` is the only screening method; `ctsp` is refused
 
 `screening_method` accepts exactly one value, `minimax`, which is also its
@@ -31,7 +58,8 @@ describing LORRAX as having two screening methods.
 
 ## 2026-08-05 — The Lustre stripe count is the aggregator count, so it is `nranks`
 
-*(APPROVED. **Not implemented in this branch** — see the status note.)*
+*(APPROVED. **Implemented on the Python side in this branch; the C++
+writer still defaults to 16** — see the status note.)*
 
 `LORRAX_PHDF5_STRIPE_COUNT` is not a filesystem-layout preference that
 happens to affect speed. ROMIO sets `cb_nodes = min(striping_factor,
@@ -51,16 +79,38 @@ Shape of the replacement: clamp to roughly [4, 128], ramp the striping unit
 maximum-*contention* layout, and the current Python parse passes it straight
 through.
 
-**Status, verified 2026-08-06.** Implemented on
-`feat/slab-io-stripe-nranks-2026-08-06` (`e5c9618`), which is **not an
-ancestor of this branch** (`merge-base --is-ancestor`, checked). Both sites
-here still default to 16. Even on that branch the policy is Python-side only:
-the C++ writer's `context.cc` still carries the literal `"16"`, so landing it
-is not finished until both writers agree — one environment must mean one
-layout in every writer, which is the rule the stripe *size* already follows.
+**Status, re-verified 2026-08-06 after the merge.** `e5c9618`
+(`feat/slab-io-stripe-nranks-2026-08-06`) **is now an ancestor of
+`integration/2026-08-06`** — `merge-base --is-ancestor`, checked. It is
+**not** on `origin/main`. *(This paragraph previously said the commit was
+not an ancestor and that "both sites here still default to 16"; that was
+true when written and is now wrong in both halves.)*
 
-Licenses deleting: nothing yet. It licenses *adding* the refusal on a
-negative count, which is a live hazard independent of the default.
+What actually landed, in `file_io/_slab_io_ffi.py`:
+
+* `_stripe_policy(nranks)` is a pure function of the rank count — no env,
+  no MPI, no filesystem — returning `count = clamp(nranks, 4, 128)` and a
+  striping unit ramped 1 → 4 MiB with the rank count by exact integer
+  comparison. `LORRAX_PHDF5_STRIPE_COUNT` unset now means *the policy*,
+  not `16`.
+* **The negative count refuses**, naming the measurement: `-1` means
+  "every OST on the filesystem", which is the maximum-*contention* layout
+  and measures like one — 0.105 GiB/s at 64 ranks / 32 GiB against 10.63
+  for the policy (job 56389339).
+* `_stripe_size_bytes` moved to sit beside `_stripe_count`, because the
+  two were previously resolved in two modules with two different notions
+  of "the default".
+
+**Still open, and it is the same hazard the entry named:** the C++ writer
+`src/ffi/cpp/phdf5/context.cc:463` carries the literal `"16"` as its
+fallback, so with the variable unset the two writers now choose
+*different* layouts — which is worse than both being wrong the same way.
+One environment must mean one layout in every writer. Until that is fixed,
+`LORRAX_PHDF5_STRIPE_COUNT` should be set explicitly for any run whose
+numbers matter.
+
+Licenses deleting: the fixed `16` default wherever it is still restated as
+the Python-side value.
 
 ## 2026-08-05 — An allgather is a refusal, not a fallback
 
