@@ -1,6 +1,5 @@
 [cohsex]
 restart = false
-x_only = false
 do_screened = true
 bispinor = false
 wfn_file = WFNsmall.h5
@@ -10,8 +9,6 @@ nval = 26
 ncond = 5
 nband = 110
 sys_dim = 2
-profile_qloop = true
-profile_trace_dir = profile_trace
 
 K_POINTS {crystal_b}
 5

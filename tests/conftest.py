@@ -133,7 +133,6 @@ def gnppm_restart_baseline(gnppm_session, tmp_path_factory):
     harness.mutate_input(run_dir / "gnppm_test.in", {
         "restart = false": "restart = true",
         "sigma_freq_debug_output = true": "sigma_freq_debug_output = false",
-        "sigma_debug_split_contrib = true": "sigma_debug_split_contrib = false",
     })
     res = harness.run_gw_jax(run_dir, "gnppm_test.in")
     if res.returncode != 0:

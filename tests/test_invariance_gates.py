@@ -56,7 +56,6 @@ _OUT = "sigma_diag_gnppm_test.dat"
 _RESTART_MUTATIONS = {
     "restart = false": "restart = true",
     "sigma_freq_debug_output = true": "sigma_freq_debug_output = false",
-    "sigma_debug_split_contrib = true": "sigma_debug_split_contrib = false",
 }
 
 

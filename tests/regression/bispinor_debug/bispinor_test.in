@@ -20,9 +20,7 @@ centroids_file_current = centroids_frac_209_current.txt
 memory_per_device_gb = 30.0
 
 restart = false
-max_r_chunks = -1
 
-x_only = false
 do_screened = true
 compute_mode = gn_ppm
 
