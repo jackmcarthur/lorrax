@@ -428,6 +428,28 @@ if [[ "$fftw_needed" -ne 0 ]]; then
     exit 1
 fi
 echo "[build_ffi_host] GATE 5 PASSED: undefined fftw_ symbols=0, fftw in DT_NEEDED=0"
+# GATE 5 IS HALF THE PROPERTY, AND THIS SCRIPT CANNOT CHECK THE OTHER HALF.
+# Zero fftw in DT_NEEDED means nothing binds at LOAD time.  It says nothing
+# about which engine — or how many — the process ends up with, because after
+# GATE 5 the engine arrives by dlopen at first use, and no static tool can see
+# it: `ldd` on this artifact reports nothing about FFTW3 at all.  Measured
+# 2026-08-06, this exact .so, one build: the bare host maps cray-fftw and the
+# container maps NOTHING (the image ships no FFTW3) — a difference GATE 5
+# cannot express, and both pass it.
+#
+# src/ffi/cpp/gate_one_fftw.sh (GATE 8) closes it by driving one real flat-k
+# FFT and reading /proc/self/maps in that process.  It is NOT called from here
+# on purpose: this script runs bare-metal on a login node, where the dynamic
+# leg cannot import jax and would refuse every build.  Run it where the
+# process lives:
+#
+#   in-container:  LORRAX_FFTW3_STAGE=/lorrax_fftw \
+#                    src/ffi/cpp/gate_one_fftw.sh <host.so> [<device.so>]
+#   bare host:     LORRAX_GATE_FFTW_PY=<venv>/bin/python \
+#                    src/ffi/cpp/gate_one_fftw.sh <host.so>
+echo "[build_ffi_host] GATE 5 covers LOAD time only — run GATE 8"
+echo "[build_ffi_host]   (src/ffi/cpp/gate_one_fftw.sh) where the process"
+echo "[build_ffi_host]   runs, or the engine identity is unchecked."
 
 # GATE 6: and more generally, the OpenMP runtime is an OpenMP runtime.  The
 # misdetection above was invisible because nothing ever looked.  gomp (GNU) or
