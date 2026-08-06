@@ -79,6 +79,19 @@ route into the tier:
 At P=1 the gather and the per-rank write are the *same operation*, so there
 is nothing to refuse about; above P=1 both routes raise at parse time.
 
+**SUPERSEDED the same day — the tier is deleted, not refused.** The rule
+above was landed at seven separate doors over three sessions, each landing
+reported as complete, and an eighth ungated route (a direct import of the
+backend module from `gw/gw_init.py`) survived all seven. A tier that must
+be refused at seven doors is not a tier; it is dead code wearing a safety
+label. `H5PY_ALLGATHER` and `PHDF5_HOST` are both gone, along with the
+`slab_io` deck key, the `use_ffi_io` boolean, the `SlabIOBackend` enum and
+the `auto` router. There is one transport, so the contract holds by
+construction. See [`slab_io.md`](slab_io.md#tiers-history) for the
+per-tier evidence, including the `nm -D` measurements that showed
+`PHDF5_HOST`'s only selection condition to be false on every deployed
+library.
+
 Consequences already landed: the silent demotion from the parallel FFI
 writer is deleted, as is the decline branch that read
 `max(SLURM_JOB_NUM_NODES, SLURM_NNODES)`.

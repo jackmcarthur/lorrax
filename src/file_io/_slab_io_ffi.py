@@ -530,7 +530,7 @@ def _assert_mpi_world(mesh, *, mpi_size=None, probe_detail=None,
 # ---------------------------------------------------------------------------
 #: Where the contract is written down.  Quoted by the refusal: a refusal
 #: that does not name its doc sends the reader to grep.
-_SLAB_IO_DOC = "docs/architecture/slab_io.md#the-contract"
+_SLAB_IO_DOC = "docs/architecture/slab_io.md#contract"
 
 #: Fix prose per FAILED PROBE, keyed by the stage the chain stopped at,
 #: because that is what decides the repair — and ``probe_target``'s three

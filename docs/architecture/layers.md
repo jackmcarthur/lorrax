@@ -33,7 +33,7 @@ Measured with `grep -rioE '\b<word>s?\b' --include='*.py' src/` on
 
 | candidate | occurrences under `src/` | why it loses |
 |---|---:|---|
-| backend | 708 | `SlabIOBackend`, `resolve_backend`, `eigh_backend_choices`, `LORRAX_WFN_BACKEND`, `jax.default_backend()`. "The backend" already means "which native library answered", which is *one thing inside* this level. |
+| backend | 708 | `resolve_backend`, `eigh_backend_choices`, `LORRAX_WFN_BACKEND`, `jax.default_backend()`. "The backend" already means "which native library answered", which is *one thing inside* this level. |
 | kernel | 415 | `ppm_tau_kernel`, `greens_function_kernel` — "physics kernel" is the project's own word for **L1**. Naming L3 "kernels" inverts the vocabulary. |
 | platform | 405 | `Gate(platforms=("cpu","CUDA"))`, `mesh_platform`, `mesh_ffi_platform`, `JAX_PLATFORMS`. Already means "CPU or CUDA". |
 | primitive | 79 | collides with `jax.core.Primitive`, and `docs/dev/staged_reshard_primitive.md` uses it for `contract_bands` — a *pattern*, one level up from what it would name. |
@@ -149,7 +149,8 @@ timing, progress, gpu_utils, async_io, sanity}.py`.
 grammar, platform, probe, announce-or-refuse.
 
 **Sharded-file transport** — `file_io/{slab_io, _slab_io_ffi,
-_slab_io_allgather, _slab_io_mpi_host, paths}.py`. Note the split inside
+paths}.py` (`_slab_io_allgather` and `_slab_io_mpi_host` were deleted
+2026-08-06). Note the split inside
 `file_io/`: the *transport* is L3, the *format readers* above it
 (`wfn_loader`, `zeta_loader`, `epsreader`, `mf_header`, `sigma_output`,
 `tagged_arrays`, …) are L1, because they know what a band and a ζ are.
@@ -202,7 +203,7 @@ A level assignment nobody argued is a level assignment nobody will keep.
    it. Its *deck* half (`read_lorrax_input`, `LorraxConfig`, 900 lines of
    dataclasses) is genuinely GW's and should stay. Its *environment* half is
    not: the XLA-memory quarter moved out to `runtime/xla_memory.py` on
-   2026-07-31 (§6); `SlabIOBackend` still has not (§5).
+   2026-07-31 (§6); `SlabIOBackend` was resolved by deletion 2026-08-06 (§5).
 9. **`bandstructure/htransform.py` — an L1 driver and an L1 library in one
    file.** Same shape `gw/kin_ion_io.py` had before it was split. Its
    `shard_map` Galerkin solve is a kernel; its `main()` is a driver. Its
@@ -227,7 +228,7 @@ needed** — an exception that outlives its violation fails the suite.
 
 | # | violation | why it is still here |
 |---|---|---|
-| **R1** | `file_io.slab_io` → `gw.gw_config` (2 lazy sites) — `SlabIOBackend`, the enum that types the file-IO service's own `backend` parameter, is defined in the GW driver's deck parser. `slab_io`'s own public docstring tells users to `from gw.gw_config import SlabIOBackend`. | The obvious new home is `file_io`, but `file_io/__init__.py` and `slab_io.py` import jax and h5py at module scope, and `gw_config` is nearly jax-free by design. **The enum needs a home neither package owns.** That is a structural decision, not an enum move. |
+| **R1** | ~~`file_io.slab_io` → `gw.gw_config` (2 lazy sites)~~ — **CLOSED 2026-08-06 by deletion.** `SlabIOBackend` typed the file-IO service's own `backend` parameter and was defined in the GW driver's deck parser. The request asked where the enum should live, given that `file_io` imports jax and h5py at package scope while `gw_config` is nearly jax-free. The answer was nowhere: with one transport there is no enum, no `backend` parameter, and no uphill import. | — |
 | **R2** | `solvers.sternheimer_solve` → `psp.dft_operators`, plus `STERN_DEBUG` read at module scope as `bool(int(...))` — so a word spelling raises `ValueError` on **import**. | Both are the same question: is this an L2 CG solve or an L1 Sternheimer kernel? Split `SternheimerOp`'s operator out, or move the file to `psp/`. Physics decision. |
 | **R3** | `centroid.kmeans_isdf` → `centroid.orbit_syms` (lazy) | See §4.2. Inject the orbit map; signature change. |
 | **R4** | `mixing.acceleration` sets `JAX_ENABLE_X64` at module scope — a library mutating global jax configuration for whoever imports it. Same class as `centroid/kmeans_isdf.py`'s `config.update`, removed 2026-07-30. | Not free: the only consumer (`gw/sc_iteration.py:577`) is lazy and always post-`bootstrap()`, but a bare `import mixing.acceleration` in a fresh process would then run Anderson/CROP in **f32, silently**. Physics decision. |
