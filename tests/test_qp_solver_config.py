@@ -18,6 +18,7 @@ All tests run on a throwaway input file — no WFN, no GPU, no jit.
 """
 from __future__ import annotations
 
+import pathlib
 import pytest
 
 from gw.gw_config import LorraxConfig, QPSolver
@@ -309,6 +310,55 @@ def test_screening_method_minimax_and_default_still_parse(tmp_path):
     assert (_config(tmp_path, "screening_method = minimax\n")
             .screening.method == "minimax")
     assert _config(tmp_path, "").screening.method == "minimax"
+
+
+def test_every_tracked_fixture_deck_has_no_dead_keys(tmp_path):
+    """No tracked ``*.in`` fixture may carry a key nothing reads.
+
+    The guard for a cleanup that would otherwise silently rot: 7 of 7
+    fixtures once carried keys absent from _DEFAULTS (``x_only`` in six of
+    them -- a VALUE of ``compute_mode``, never a key -- plus
+    ``use_chunked_isdf``, ``sigma_debug_split_contrib``, ``max_r_chunks``,
+    ``profile_qloop``, ``profile_trace_dir``).  Every one parsed clean and
+    steered nothing.
+
+    ``strict_keys`` is forced ON here regardless of the shipped default,
+    so this stays a real gate if that default never flips.  The knob is
+    injected right after the ``[cohsex]`` header: appending at EOF can
+    land past the section end when a K_POINTS block follows, which would
+    silently test nothing.
+    """
+    import re
+    from gw.gw_config import read_lorrax_input
+
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    decks = sorted(p for p in repo.glob("tests/**/*.in")
+                   if re.search(r"^\s*\[cohsex\]", p.read_text(errors="replace"),
+                                re.I | re.M))
+    assert decks, "no [cohsex] fixture decks found -- glob is wrong"
+
+    offenders = {}
+    for deck in decks:
+        out, injected = [], False
+        for ln in deck.read_text().splitlines(keepends=True):
+            if re.match(r"\s*strict_keys\s*[=:]", ln, re.I):
+                continue
+            out.append(ln)
+            if not injected and ln.strip().lower().startswith("[cohsex]"):
+                out.append("strict_keys = true\n")
+                injected = True
+        probe = tmp_path / deck.name
+        probe.write_text("".join(out))
+        try:
+            read_lorrax_input(str(probe))
+        except ValueError as exc:
+            if "strict_keys" in str(exc):
+                offenders[deck.relative_to(repo)] = str(exc).splitlines()[1:]
+            else:
+                raise
+    assert not offenders, (
+        "tracked fixture decks carry keys that nothing reads:\n"
+        + "\n".join(f"  {k}: {v}" for k, v in offenders.items()))
 
 
 def test_legacy_keys_keep_their_dedicated_messages(tmp_path, capsys):

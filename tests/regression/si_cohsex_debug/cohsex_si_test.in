@@ -15,7 +15,6 @@ nband = 60
 sys_dim = 3
 bare_coulomb_cutoff = 25.0
 
-x_only = false
 do_screened = true
 bispinor = false
 qp_solver = one_shot_dft
@@ -27,7 +26,6 @@ screening_method = minimax
 vhead = 3303.748102
 whead_0freq = 150.395600
 
-use_chunked_isdf = true
 memory_per_device_gb = 28
 
 # zeta_rcond DELIBERATELY UNSET -> runs at the production default (1e-8).
@@ -46,7 +44,6 @@ memory_per_device_gb = 28
 # code path (reports/gw_bandrange_centroids_2026-07-21).
 
 sigma_freq_debug_output = true
-sigma_debug_split_contrib = true
 fermi_reference = midgap
 
 wfn_file = WFN.h5

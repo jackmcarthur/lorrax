@@ -1,6 +1,5 @@
 [cohsex]
 restart = false
-x_only = false
 do_screened = true
 bispinor = false
 wfn_file = WFNsmall.h5
