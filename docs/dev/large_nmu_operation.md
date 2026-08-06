@@ -341,32 +341,109 @@ on-device reductions of the kind `exciton_bands._gate_stats_on_device`
 mirrors.  Item 5 needs the same `with_sharding_constraint` treatment
 the W densifier got in 2026-07-31.
 
-### BSE I/O: correct, but not on the certified transport
+### BSE I/O: on the certified transport since 2026-08-06
 
-`bse/` reads its restart with plain serial `h5py` hyperslabs and never
-touches `file_io.slab_io` — so it does not get the parallel-HDF5 FFI
-collective read that `GATES.md`'s `slab_io` row certifies, and it is
-also not exposed to that row's refusal.  Memory-wise it is correct
-(nothing larger than one rank's tile is ever materialised).
-Bandwidth-wise it is not: 1.2 GB in 12.4 s at P=4 is ~0.1 GB/s, against
-the 2.9 GiB/s CLAIMS 69 measured for the phdf5 path at 16 ranks.
-Porting the two `bse_io` readers onto `SlabIO.read_slab(name,
-shape=..., mesh=..., partition_spec=...)` is the follow-up; the shapes
-already match what `read_slab` wants (`P('x','y',None,None,None)` for
-`W_q`, `P('x','y')` for `V_q0`), and `read_slab` requires the padded,
-mesh-divisible extent, which the loader already computes as
-`padded_mu_extent(n_rmu, px*py)`.
+`bse/` used to read its restart with plain serial `h5py` hyperslabs and
+never touch `file_io.slab_io`.  Memory-wise that was always correct
+(nothing larger than one rank's tile is ever materialised, and there is
+no allgather); it just was not the parallel-HDF5 FFI collective read
+that `GATES.md`'s `slab_io` row certifies.
+
+`load_bse_data_from_restart_sharded` now goes through
+`SlabIO.read_slab`.  The tile geometry is deliberately unchanged — the
+port moves bytes, not contracts:
+
+* `_MunuSlabPlan` restates the three on-disk V/W layouts (8-D legacy,
+  6-D transitional, 3-D flat-q) as `(offset, shape, partition_spec)`;
+  `_resolve_munu_reader` remains the single source of the layout facts
+  and drives the serial path.
+* `_slabio_read_munu` / `_slabio_read_psi` return exactly the shapes and
+  PartitionSpecs the serial readers return at `trim=False`.
+* `_read_bse_tensors` is the ONE place the transport is chosen, per
+  load; `_bse_slab_io_backend` asks `gw_config.resolve_slab_io_backend`
+  (extracted to module scope for this, since `bse/` builds no
+  `LorraxConfig`).
+* The serial readers remain and remain reachable — where no PHDF5 tier
+  exists the router refuses above one process, and routing a
+  single-process BSE through the allgather tier would buy nothing.
+
+**Parity is bit equality**, not a tolerance: this selects the same
+elements of the same datasets, so it is not a reduction-order change.
+SHA-256 of each rank's own shard (no gather) of all 13 bundle arrays is
+identical serial-vs-SlabIO on all 4 ranks, at `load_v_full` both False
+and True.  The 8-D and 6-D layouts, which no deck has, were exercised by
+writing one array of numbers in all three layouts at `N_mu=10` on a 2x2
+mesh (so the mu pad is live): serial == SlabIO per layout, and
+3-D == 6-D == 8-D per transport, on every rank.
+
+**What the transport is actually worth, and what it is not.**  Measured
+2026-08-06 (job 56389339 / 56393848), MoS2 6x6 restart, 1.2468 GiB of
+logical payload, each leg on its own never-read copy of the file:
+
+| where the file lives | P | serial reads | SlabIO reads | ROMIO `cb_nodes` |
+|---|---|---|---|---|
+| Lustre, stripe 4x1M | 4 | 1.98 s (0.62 GiB/s) | 1.41 s (0.88 GiB/s) | 4 |
+| Lustre, stripe 16x1M | 16 | 1.09 s (1.13 GiB/s) | 0.53 s (2.33 GiB/s) | 16 |
+| CFS (GPFS) | 16 | 3.89 s (0.32 GiB/s) | 3.31 s (0.37 GiB/s) | **1** |
+
+The SlabIO leg at 16 ranks on Lustre reaches 2.33 GiB/s against the
+2.919 GiB/s CLAIMS 69 certified for the phdf5 path at that rank count —
+i.e. the port does reach the certified transport.  But the older "~0.1
+GB/s, ~30x off" figure compared two different measurements: it was taken
+on a **CFS-resident** restart, where ROMIO reports `cb_nodes = 1` and
+neither transport can exceed ~0.37 GiB/s, against a Lustre 16-rank
+number.  On matched filesystem and rank count the transport is worth
+about 2x on the reads at P=16 and 1.4x at P=4.  **The larger lever is
+where the restart file lives**: 2.33 vs 0.37 GiB/s, 6.3x, for the same
+code.  A restart that a BSE run will read many times belongs on
+`$SCRATCH` with `stripe_count = nranks`, not on CFS.
+
+Whole-load wall barely moves (P=16: 4.33 s serial -> 3.61 s SlabIO;
+P=4: 4.16 -> 3.70) because at this payload the load is dominated by
+costs both legs share plus the collective `H5Fopen`, which the trace
+prices at 0.69 s of the SlabIO leg at 16 ranks.  XLA compilation of the
+read closures is 0.002-0.003 s and is not a term.
+
+It IS a host-memory win, unlike the `read_q_slab` fix: VmHWM delta per
+rank 1.198 -> 0.409 GiB at P=4 and 0.358 -> 0.300 at P=16, because the
+serial reader stages each tile through a host numpy buffer before
+`device_put` and the FFI path writes into the device buffer through a
+pinned staging buffer.  Device peak is UNMEASURED — `memory_stats()`
+returns `None` on the deployed jaxlib.
 
 One byte-level defect on that path was found and fixed 2026-08-06:
 `_read_vq0_sharded` read all `nq` q-tiles and used one, so `V_q0` cost
 `nq`x its own size in disk traffic.  `_resolve_munu_reader` now returns
 a `read_q_slab(q, ...)` single-q hyperslab for all three on-disk
-layouts.  Load wall 12.4 s -> 7.4 s at P=4, and the per-shard SHA-256
-of all 13 bundle arrays is bit-identical before and after on all four
-ranks — an element-selection change, so exact equality is the right
-bar, not a gauge tolerance.  It is NOT a measured memory win at that
-shape (VmHWM 2.145-2.162 -> 2.144-2.152 GiB, unchanged): the transient
-it removes is 0.32 GB/rank and is not the binder.
+layouts.  Load wall 12.4 s -> 7.4 s at P=4 (on the CFS-resident deck),
+and the per-shard SHA-256 of all 13 bundle arrays is bit-identical
+before and after on all four ranks — an element-selection change, so
+exact equality is the right bar, not a gauge tolerance.  It is NOT a
+measured memory win at that shape (VmHWM 2.145-2.162 -> 2.144-2.152
+GiB, unchanged): the transient it removes is 0.32 GB/rank and is not
+the binder.
+
+### GW restart: the reader that has no sharded twin
+
+`file_io.tagged_arrays.read_restart_state_from_h5` is the GW-side
+equivalent of `_load_ring_subset` — a full-file `[:]` read of
+`V_qmunu` / `S_qmunu` / `V0_noG0_munu` / `psi_full_y` on every rank —
+and it is the ONLY reader of those datasets in `gw/`.  It is reached
+from `gw_init.py:1593` on every `restart = true` deck.
+
+Measured at P=4 before it was guarded (N_mu=1496, nq=36): it RAN and
+returned correctly sharded tensors in 3.19 s, at a cost of **+1.53 GiB
+of VmHWM on every rank**, silently.  The same read at the envelope
+(N_mu=20000, nq=64) is 381.47 GiB per rank.  It now refuses above one
+process and names `restart = false` — the chunked-ISDF producer, which
+never materialises an N_mu^2-class object on one process — because
+there is no sharded reader to name.
+
+Building that reader is the open item: it is the `_MunuSlabPlan` +
+`_slabio_read_munu` pattern above against the same three layouts, with
+`P(None,'x','y')` for `V_qmunu` and `P(None,None,None,'y')` for
+`psi_full_y`.  Until it exists, `restart = true` above one process has
+no path.
 
 ## Pointers
 
