@@ -80,5 +80,4 @@ nav:
       - The FFI layer: architecture/ffi_layout.md
       - SlabIO (sharded-slab HDF5): architecture/slab_io.md
       - Memory model: architecture/memory-model.md
-      - Multi-host: architecture/multihost.md
   - Contributing: contributing.md
