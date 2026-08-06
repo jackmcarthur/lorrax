@@ -151,11 +151,30 @@ consequently 33 passed / **19 skipped**, every skip reading
 shared object file`.
 
 No `LD_LIBRARY_PATH` value repairs this — the files are not in the
-container's mount namespace. The repair is a `--volume` for `/opt/cray/pe`
-(or a container-side FFTW), belonging beside the existing `/lorrax_phdf5`
-and `/lorrax_nvhpc` mounts. **The containerized host leg has never been
+container's mount namespace. **The containerized host leg had never been
 green**; the "35/35 on both vendors" certification was a bare-host run.
 A skip is not a pass.
+
+> **Fixed — on a branch this one does not contain.** `411e257`
+> ("the run-time-resolved FFT engine stops being a load-time dependency", on
+> `fix/host-ffi-fftw-dt-needed-2026-08-06`) removes the link-time dependency
+> so the engine is `dlopen`'d rather than `DT_NEEDED`, and adds the
+> sufficient invariant — **zero `fftw` in `DT_NEEDED`** — as a build gate in
+> `config/perlmutter/build_ffi_host.sh`. In-container Tier-1 host then reads
+> **49 passed / 2 skipped / 1 failed** against the 33/19/0 above; the 2 skips
+> are the known SLATE `heev` L-2 and the 1 failure is the FFT cell honestly
+> reporting that the container ships no FFTW3.
+>
+> **Verified 2026-08-06: `411e257` is NOT an ancestor of `8789131`**
+> (`merge-base --is-ancestor`). So the failure described above is live *in
+> this branch* and the numbers above are this branch's numbers. One closure
+> hole survives the fix and is not in its scope:
+> `libhdf5_parallel_gnu.so.310` against the staged HDF5 1.12 — owned by the
+> phdf5 stage.
+>
+> The earlier repair suggestion here — bind-mount `/opt/cray/pe` — is
+> withdrawn. It treats a load-time dependency that should not exist as a
+> mount problem, and `411e257` is the better shape.
 
 The GPU flat-k mirror (`cufftPlanMany64`, advanced layout) was **not**
 re-certified in the 2026-08-05 Perlmutter campaign. Treat a CUDA-leg FFT
