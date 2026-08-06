@@ -272,8 +272,6 @@ def write_sigma_omega_h5(
 	hartree_kij_ev=None,
 	k_chunk_size: int = 16,
 	mesh=None,
-	backend=None,
-	use_ffi_io: bool | None = None,
 ):
 	"""Write frequency-dependent Sigma_mnk(omega) arrays to HDF5.
 
@@ -284,11 +282,8 @@ def write_sigma_omega_h5(
 	  - sigma_sx_kij_ev (optional): (nk, nb, nb)
 	  - hartree_kij_ev  (optional): (nk, nb, nb)
 
-	All large writes go through :mod:`file_io.slab_io`.  ``backend``
-	selects between :attr:`SlabIOBackend.H5PY_ALLGATHER` (default,
-	historical ``process_allgather`` → rank-0 ``h5py`` path) and
-	:attr:`SlabIOBackend.PHDF5_FFI` (parallel-HDF5 FFI).  The legacy
-	``use_ffi_io: bool`` kwarg is still accepted as an alias.
+	All large writes go through :mod:`file_io.slab_io`, which has one
+	transport (per-rank collective MPI-IO) and no selector.
 	"""
 	from .slab_io import SlabIO
 
@@ -319,24 +314,23 @@ def write_sigma_omega_h5(
 		if hartree_kij_ev is not None:
 			total = total + hartree_kij_ev[None, ...]
 
-	with SlabIO(abs_path, mode="w", mesh=mesh,
-	            backend=backend, use_ffi_io=use_ffi_io) as io:
+	with SlabIO(abs_path, mode="w", mesh=mesh) as io:
 		io.write_attr("omega_ev", np.asarray(omega_ev, dtype=np.float64))
 		io.create_dataset("sigma_total_kij_ev",
 			shape=shape_ref, dtype=np.complex128, chunks=om_chunks)
-		io.write_slab("sigma_total_kij_ev", total, k_chunk_size=k_chunk)
+		io.write_slab("sigma_total_kij_ev", total)
 		if sigma_c_kij_ev is not None:
 			io.create_dataset("sigma_c_kij_ev",
 				shape=shape_ref, dtype=np.complex128, chunks=om_chunks)
-			io.write_slab("sigma_c_kij_ev", sigma_c_kij_ev, k_chunk_size=k_chunk)
+			io.write_slab("sigma_c_kij_ev", sigma_c_kij_ev)
 		if sigma_sx_kij_ev is not None:
 			io.create_dataset("sigma_sx_kij_ev",
 				shape=tuple(sigma_sx_kij_ev.shape),
 				dtype=np.complex128, chunks=kij_chunks)
-			io.write_slab("sigma_sx_kij_ev", sigma_sx_kij_ev, k_chunk_size=k_chunk)
+			io.write_slab("sigma_sx_kij_ev", sigma_sx_kij_ev)
 		if hartree_kij_ev is not None:
 			io.create_dataset("hartree_kij_ev",
 				shape=tuple(hartree_kij_ev.shape),
 				dtype=np.complex128, chunks=kij_chunks)
-			io.write_slab("hartree_kij_ev", hartree_kij_ev, k_chunk_size=k_chunk)
+			io.write_slab("hartree_kij_ev", hartree_kij_ev)
 	return abs_path

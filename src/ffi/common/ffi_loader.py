@@ -126,11 +126,17 @@ _CUDA_TARGET_SYMBOLS = {
 # lowering platform; only the C++ SYMBOL names differ (Phdf*HostFfi vs
 # Phdf*Ffi) so the two platform .so's can co-exist under RTLD_GLOBAL.
 #
-# ``lorrax_phdf5_write`` is what makes ``SlabIOBackend.PHDF5_FFI`` reachable on
+# ``lorrax_phdf5_write`` is what makes SlabIO's tile path reachable on
 # the CPU backend (workstream AE) — a host lib built before that port exports
 # the three read symbols only, and ``has_phdf5_write('cpu')`` is False, which
-# is exactly how the gw_config router demotes gracefully to PHDF5_HOST /
-# H5PY_ALLGATHER instead of dying at the first ζ write.
+# means the tile path is unavailable, and SlabIO then REFUSES rather than
+# moving the bytes some other way.  There is no demotion: the tiers this
+# comment used to name (PHDF5_HOST, H5PY_ALLGATHER) and the gw_config
+# router that chose between them were deleted in the one-backend port.
+# An allgather is a refusal, not a fallback -- owner ruling 2026-08-05 --
+# because the design envelope is arrays needing hundreds of GPUs to hold,
+# where a rank-0 gather is an OOM and not a slow path.  A host lib without
+# the write symbol is a BUILD defect to fix, not a routing condition.
 _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_eigh":              "SlateEighHostFfi",
     "lorrax_slate_potrf":             "SlatePotrfHostFfi",
@@ -520,7 +526,7 @@ def has_phdf5_read(platform: str) -> bool:
 def has_phdf5_write(platform: str) -> bool:
     """True when ``platform``'s FFI library can serve the collective
     sharded-slab WRITE — the probe ``gw.gw_config`` uses to route
-    ``slab_io=auto`` to :attr:`SlabIOBackend.PHDF5_FFI`.
+    ``file_io.slab_io.assert_available`` refuses on.
 
     False on a host lib built before workstream AE (read-only), which is
     why the router demotes rather than failing at the first ζ write; use

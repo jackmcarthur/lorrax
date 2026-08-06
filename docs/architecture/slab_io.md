@@ -1,12 +1,14 @@
 # SlabIO — the sharded-slab HDF5 transport
 
 *Verified against `src/` and against measurements taken inside the Shifter
-container on Perlmutter, 2026-08-05/06 (allocation 56389339, 4 × A100-40G
-nodes). Where this page and older prose disagree, this page wins. Every
-number below names the command that produced it.*
+container on Perlmutter, 2026-08-05/06 (allocations 56389339, 56405696,
+4 × A100-40G nodes). Where this page and older prose disagree, this page
+wins. Every number below names the command that produced it and the
+filesystem it ran on.*
 
-**This page owns SlabIO**: the tiers, the routing, the striping, the
-certification. It does not own the owner rulings behind them
+**This page owns SlabIO**: the tile contract, the caller-facing API, the
+launcher requirement, the striping measurements, and the certification. It
+does not own the owner rulings behind them
 ([`decisions.md`](decisions.md)), the native layer underneath
 ([`ffi_layout.md`](ffi_layout.md)), or knob spellings
 ([`../dev/env_vars.md`](../dev/env_vars.md)) — see the
@@ -14,9 +16,11 @@ certification. It does not own the owner rulings behind them
 
 Conventions used here, same as [`services.md`](services.md):
 
-- **Level / imports.** `file_io.slab_io` is L3; it imports `ffi.io` lazily.
-- **Announce-or-refuse.** A tier that cannot run says so, naming the probe
-  that declined it. Nothing about which writer ran is ever silent.
+- **Level / imports.** `file_io.slab_io` is L3 and imports only downhill.
+  It used to reach *up* into `gw.gw_config` for the backend enum; that
+  import is gone with the enum (2026-08-06).
+- **Announce-or-refuse.** A deployment that cannot run says so, naming the
+  probe that declined. Nothing about the I/O path is ever silent.
 - **Shapes are logical.** Files store the logical shape; padding for mesh
   divisibility never reaches disk.
 
@@ -34,6 +38,11 @@ node's host RAM, let alone one device's. Any code path that gathers a
 whole array to one rank is therefore not a slow path, it is a path that
 **cannot run the workload it exists for**.
 
+The owner's statement of it, verbatim:
+
+> there should always exist a valid path that does not materialize
+> N_mu^2 on any proc because it is a guaranteed OOM.
+
 Consequences that follow directly, and that callers must not work around:
 
 - `write_slab` takes the array the rank already owns, in its existing
@@ -43,199 +52,195 @@ Consequences that follow directly, and that callers must not work around:
 - Peak host memory attributable to SlabIO is one rank's tile plus the
   pinned staging buffer, independent of process count.
 
-### `H5PY_ALLGATHER` is a refusal, not a fallback
-
-The `H5PY_ALLGATHER` tier gathers the array to rank 0 via
-`process_allgather` and writes it with serial h5py. **It is not a
-supported production path.** It violates the contract above by
-construction: rank 0 materialises the entire global array.
-
-It exists for exactly two situations:
-
-1. single-process development on a machine with no parallel HDF5 at all;
-2. small fixtures and tests, where the array demonstrably fits.
-
-Treat `Routing SlabIO through H5PY_ALLGATHER` in a multi-rank production
-log as a **failed run that has not noticed yet** — it will either OOM rank
-0 or serialise the whole write behind one process's disk bandwidth. The
-correct response is to fix the tier-1 probe's stated reason, not to
-proceed.
-
-**Enforced since 2026-08-06.** The rule is:
-
-> **`H5PY_ALLGATHER` is reachable at exactly one process, and nowhere
-> else.**
-
-At one process the gather and the per-rank write are the *same operation*,
-so there is no contract to violate and nothing to refuse about — laptop
-debugging, `-n 1` smoke runs and the config test suite are untouched, and
-the tier announces itself when selected.
-
-**It took three landings to actually cover every route, and the first two
-were each reported as complete.** That is worth recording, because the
-shape of the mistake was the same each time: a refusal was added to the
-door the author was standing at, and the rule was then described as
-enforced. `0d8e50c` converted the router demotion; `252b80d` converted the
-*unstated* default in `slab_io._normalize_slab_backend`; and this table's
-predecessor listed only the two DECK routes, which is what made the third
-door invisible — `_normalize_slab_backend` returned a **named**
-`backend=SlabIOBackend.H5PY_ALLGATHER` verbatim at any process count,
-because the deck-level `_refuse_explicit_h5py_allgather` only ever sees a
-backend chosen from a deck.
-
-The census below is therefore of **every** route, deck or not. Anything
-added later must appear here:
-
-| # | route in | at `P == 1` | at `P > 1` | closed by |
-|---|---|---|---|---|
-| A | `SlabIO(..., backend=SlabIOBackend.H5PY_ALLGATHER)` — the enum handed straight to the constructor | honoured | `_refuse_explicit_h5py_allgather` | **2026-08-06 (third landing)** |
-| B | `SlabIO(..., backend=None, use_ffi_io=None)` — the unstated default | `H5PY_ALLGATHER` | `_refuse_or_allgather` | `252b80d` |
-| C | `SlabIO(..., use_ffi_io=False)` | `H5PY_ALLGATHER` | `_refuse_or_allgather` | `252b80d` |
-| D | deck `slab_io = h5py_allgather` | honoured, announced | `_refuse_explicit_h5py_allgather` | `0d8e50c` |
-| E | deck `use_ffi_io = false` (deprecated) | honoured, announced | `_refuse_explicit_h5py_allgather` | `0d8e50c` |
-| F | `slab_io = auto`, both parallel tiers declined | selected, announced with the tier-1 reason | `_refuse_slab_io_no_parallel_writer` | `f5bd23c` / `0accb9b` |
-| G | `gw/isdf_fitting.py:230-231` — a caller's OWN `slab_io_backend=None` parameter defaulted to the enum, then passed down as a named backend | `H5PY_ALLGATHER` | refused via A since 2026-08-06 | **still wrong at source** |
-
-Row G is the one to watch. It is latent — both in-tree callers
-(`gw_init.py:845`, `:1030`) pass `cfg.backend.slab_io` — but a *default*
-that means "gather" is exactly the shape rows B and C had before they were
-fixed, and "no caller does it today" is not a property a default can rely
-on. With A closed it now refuses instead of gathering, which is the right
-failure, but the default should say "the caller must state it".
-
-Stale prose, not a door: `file_io/sigma_output.py:288` still documents
-`H5PY_ALLGATHER` as the default for `write_sigma_omega_h5`; since
-`252b80d` a `backend=None` there refuses above one process (row B).
-
-Both refusals live in `gw/gw_config.py`, both always raise, and both sit
-*after* the whole precedence chain, so no deck branch escapes them.
-
-> **Scope of "raises at parse time": the DECK. Not the library.** Verified
-> 2026-08-06. `file_io/slab_io.py:88-90` still returns
-> `SlabIOBackend.H5PY_ALLGATHER` when `use_ffi_io is None`, at **any**
-> process count, and `:97-98` maps `use_ffi_io=False` the same way. Neither
-> path consults the process count, because neither goes through the deck
-> router. A caller constructing `SlabIO` directly — a test, a bench driver, a
-> notebook — therefore still reaches the tier above one process. The ruling
-> is implemented where decks are parsed; closing it at the library entry
-> point is open work, and until then "it refuses at P>1" is a statement about
-> configured runs only.
-
-The auto refusal names **which** of the two tier-1 probes declined and
-gives the repair *for that probe* — `probe_target`'s three states have
-three different fixes, and "the writer is unavailable" would be barely
-better than the silent demotion it replaced. The explicit refusal is the
-one case where a named deck value does *not* win: explicit-wins exists so a
-deck can gate a stack, not so it can authorise a transport that cannot hold
-the run's own arrays.
-
-The process count is `max(jax.process_count(), SLURM_NTASKS,
-SLURM_STEP_NUM_TASKS, PMI_SIZE, OMPI_COMM_WORLD_SIZE)`. The launcher's world
-size is consulted alongside JAX's so that a deck parsed before
-`jax.distributed.initialize` cannot see 1 on all sixteen ranks and wave the
-run through; over-counting at worst refuses a run that could have limped,
-under-counting restores the exact failure this rule deletes.
+**Since 2026-08-06 the contract is enforced by construction rather than by
+a check: there is one transport, so there is nothing else to select.**
 
 ---
 
-## The tiers {#tiers}
+## The API — everything a caller must know {#api}
 
-Three backends behind one `SlabIO` facade
-(`src/file_io/slab_io.py`, dispatch in `SlabIO.__init__`, lazy import per
-branch so the FFI only loads when selected):
+```python
+from file_io.slab_io import SlabIO
 
-| tier | module | mechanism | requires |
-|---|---|---|---|
-| `PHDF5_FFI` | `_slab_io_ffi.py` | collective MPI-IO from C++ via `ffi.io`; the tile goes D2H into a pinned buffer and out through HDF5's MPI-IO VFD | a 2-D mesh; the FFI lib exports `lorrax_phdf5_write` / `lorrax_phdf5_read`; MPI can bootstrap |
-| `PHDF5_HOST` | `_slab_io_mpi_host.py` | the same MPI-IO, driven from Python by mpi4py + `HDF5_MPI=ON` h5py | a 2-D mesh; the overlay; **exactly one addressable device per process** |
-| `H5PY_ALLGATHER` | `_slab_io_allgather.py` | gather to rank 0, serial h5py | **`process_count() == 1`** — see the refusal note above |
+with SlabIO(path, mode="w", mesh=mesh) as io:
+    io.create_dataset("V_qmunu", shape=(n_q, n_mu, n_mu), dtype=c128)
+    io.write_slab("V_qmunu", V)                    # V may be padded
+    W = io.read_slab("V_qmunu", partition_spec=P(None, "x", "y"))
+```
 
-`PHDF5_FFI` is the only tier that runs on both platforms from one C++
-core: the same sources compile into the CUDA lib (`liblorrax_ffi.so`) and
-into the CUDA-free host lib (`liblorrax_ffi_host.so`, `LORRAX_FFI_NO_CUDA`),
-where the D2H staging degrades to an in-place read of the XLA host buffer.
+That is the entire surface. A caller states **a path, a mode, a mesh, and
+logical shapes**. A caller does *not*:
 
-**Writes are asynchronous.** The FFI backend owns a single writer thread
-per file with a task queue (`src/ffi/cpp/phdf5/ctx.h`). One thread, not
-per-call detached threads, because MPI collectives must be issued in the
-same order on every rank. `SlabIO.close()` drains the queue, joins the
-thread, and only then calls `H5Fclose` collectively — the three-line
-`[SlabIO.close] …` banner in a run log is that sequence.
+| ...need to know | because |
+|---|---|
+| which backend | there is one |
+| Lustre stripe count / size | resolved from the rank count by `_stripe_policy` and exported before `H5Fcreate`; see [Tuning](#tuning) |
+| ROMIO / MPI-IO hints | set by the C++ context; read them back with `MPI_File_get_info`, never assume |
+| whether the MPI world matches the JAX world | asserted at the first collective open, unconditionally ([Failure modes](#failures)) |
+| the mesh-divisible extent | omit `shape` and `read_slab` rounds up for you (below) |
+| whether the deployment can do parallel I/O | `assert_available()` runs at open and refuses naming the probe |
+
+**Padding is SlabIO's business, not the caller's** (decisions.md
+2026-08-04):
+
+- `write_slab(name, A, offset=...)` accepts any `A`. What reaches the file
+  is `min(A.shape, dataset - offset)` per dim, derived from the dataset —
+  a buffer padded for mesh divisibility needs no argument at all.
+- `read_slab(name, partition_spec=spec)` **with no `shape`** returns the
+  dataset rounded UP to the mesh-divisible extent under `spec`,
+  zero-filled past the dataset. That is the padded consumer buffer.
+  This is new in 2026-08-06 and it is the point: `shape=None` used to mean
+  "the dataset's own shape", which *refuses* whenever that shape is not
+  mesh-divisible — the normal case, since N_mu is a physics number and not
+  a multiple of the device count. Every caller therefore computed the
+  round-up itself. The easy call is now the correct call.
+- `shape` may still be stated exactly and is returned exactly. It must be
+  mesh-divisible under `partition_spec`: the return value is a `jax.Array`
+  of that shape sharded that way, and JAX will not build one at a
+  non-divisible extent, so there is nothing to trim to.
+- `valid_shape` survives **only** as the ragged-chunk override — a chunk
+  buffer whose tail is genuinely not part of this write. Routine calls do
+  not pass it.
+
+Two rounding rules exist and must not be confused. `mesh_divisible_shape`
+rounds each dim by the product of the mesh axes that shard *that dim*;
+`runtime.padding.padded_mu_extent` rounds the μ extent by the **total**
+device count, which is the separate in-memory convention `Meta.n_rmu_padded`
+carries. The restart path deliberately uses the latter.
 
 ---
 
-## Routing {#routing}
+## Availability — one probe, one refusal {#availability}
 
-`slab_io` is an **input-deck key only** — there is no environment variable
-and no CLI flag. Values: `auto` (default), `phdf5_ffi`, `phdf5_host`,
-`h5py_allgather`; anything else raises at parse time
-(`gw_config.py`, `from_input_file`).
+`SlabIO.__init__` calls `assert_available()` before touching the inode. It
+checks two things, which fail for unrelated reasons and are reported
+separately:
 
-An explicit value is honoured verbatim and **skips every probe** — that is
-what makes it usable as a gate. `slab_io=phdf5_ffi` on a broken stack fails
-loudly instead of quietly producing a slower correct answer, which is
-exactly what you want when the question is "does this path work".
+1. this platform's FFI library exports `lorrax_phdf5_write`, probed with
+   `ffi_loader.probe_target` — whose three states ("unknown target" /
+   "could not be loaded" / "does not export") are three *different*
+   repairs, which is why the refusal quotes its reason verbatim instead of
+   reducing it to a bool;
+2. MPI can bootstrap here. Handler presence is not capability: the write
+   calls `MPI_Init_thread`, and on a bare launch with no PMI environment
+   Intel MPI aborts inside `MPIR_pmi_init` rather than returning an error
+   (job 7884926), so the probe runs in a throwaway subprocess.
 
-One exception, and only one: `h5py_allgather` is additionally gated on
-`process_count() == 1` (see [the refusal
-note](#h5py_allgather-is-a-refusal-not-a-fallback)). Every other value is
-honoured as written, at any process count.
+The probe is cached per process. **Nothing here keys on process count.**
+The old refusals all did, because the tier they guarded was legal at
+exactly one process; this one guards the only path there is, so it either
+works or the deployment is broken.
 
-`auto` runs `_route_cpu_slab_io` or `_route_gpu_slab_io`. Both apply the
-same two tier-1 conditions:
+### There used to be three tiers and a router {#tiers-history}
 
-1. `ffi_loader.probe_target('lorrax_phdf5_write', <platform>)` — a
-   three-state probe, not a boolean. It distinguishes *unknown target*
-   (wrong platform), *library could not be loaded* (a `LD_LIBRARY_PATH`
-   problem — the handler may be perfectly well compiled), and *loaded but
-   does not export the symbol* (the only case that means "rebuild").
-2. `_probe_mpi_bootstrap_ffi(<platform>)` — handler presence is not
-   capability, because the tier calls `MPI_Init_thread`. A launcher PMI
-   environment satisfies it; on a bare launch it runs the init in a
-   throwaway subprocess, because on some stacks a failed init `abort()`s
-   the process rather than returning an error.
+Kept because the deletion is the design decision, and because the shape of
+the mistake recurs.
 
-Every decision prints the tier, the probe's reason, and — since
-2026-08-05 — the **run geometry** (`_slab_io_geometry()`).
+`PHDF5_FFI` (this one), `PHDF5_HOST` (the same collective MPI-IO driven
+from Python by mpi4py + h5py-parallel) and `H5PY_ALLGATHER` (gather the
+whole global array onto rank 0, write it with serial h5py), selected by a
+`slab_io` deck key with an `auto` platform router and a deprecated
+`use_ffi_io` boolean.
 
-### Node count is not a routing condition
+**`H5PY_ALLGATHER` was refused at SEVEN separate doors**, each closure
+landed and reported as complete, and an eighth door kept being found. The
+doors were: the `auto` router running out of tiers; the deck naming the
+tier (or `use_ffi_io = false`) post-checked after the whole precedence
+chain; three separate entries in `SlabIO.__init__`'s argument normaliser
+(named enum, unstated default, legacy boolean); the shared gate those
+three funnel through; and a resolve-time check in the sharded-σ layout
+path. An eighth, entirely ungated route survived all of them:
+`gw/gw_init.py` imported `_to_host` **directly from the allgather backend
+module**, bypassing every refusal.
 
-Until 2026-08-05 `_route_gpu_slab_io` declined `PHDF5_FFI` outright
-whenever `SLURM_JOB_NUM_NODES > 1`, **without running the probe**, citing a
-"known cross-node failure on multi-node GPU stacks".
+A tier that must be refused at seven doors is not a tier; it is dead code
+wearing a safety label. Deleted 2026-08-06 — the module, the enum member,
+the deck value, all seven refusals, and the direct import (repointed at
+`common.collectives.gather_to_host`, the sanctioned L3 gather it was a
+private copy of).
 
-That branch is deleted. The record:
+**`PHDF5_HOST` was deleted with it**, and the evidence for that is worth
+stating because it is a different argument. Its *only* selection condition
+was a host FFI library built before workstream AE, which exports the phdf5
+read symbols and not `PhdfWriteHostFfi`. Measured 2026-08-06 with `nm -D`:
 
-- The failure that justified it was Intel MPI refusing a launch configured
-  with `I_MPI_FABRICS=shm` on **Frontera** — a launcher misconfiguration,
-  on an MPI stack and a machine this router does not run on. The
-  Perlmutter GPU path is Cray MPICH through Shifter.
-- The transport it declared broken cross-node was demonstrably working
-  cross-node **in the same process**: in a 4-node job the phdf5 FFI *read*
-  path succeeded while the *write* path was declined by policy, from the
-  same `.so`.
-- Measured directly (see [Certification](#certification)): 16 ranks on 4
-  nodes, `MPI_Comm_size()` asserted == 16 on every rank, write and read
-  bit-exact, payload byte-identical to a 4-rank single-node write of the
-  same logical array.
-- The branch was **live**, not merely wrong. It read the max of
-  `SLURM_JOB_NUM_NODES` and `SLURM_NNODES`. Only the *first* spelling is
-  absent inside the container — it is a batch/allocation-level variable,
-  not a step-level one. `SLURM_NNODES` **is** exported by every `srun`
-  step and measured `4` on the 4-node run, so every multi-node GPU run
-  really was demoted off the FFI writer, which is what the archived logs
-  show.
+| library | `PhdfWriteHostFfi` | dated |
+|---|---|---|
+| Perlmutter `lorrax_P/.../build_host/liblorrax_ffi_host.so` | **present** | live |
+| Perlmutter `lorrax_P/.../build/liblorrax_ffi.so` (`PhdfWriteFfi`) | **present** | live |
+| Frontera `$WORK/lorrax_ffi_unified/build_host_W/` | **present** | 2026-07-26 |
+| Frontera `$WORK/lorrax_ffi_unified/build_host_V/` | absent | 2026-07-26 |
+| Frontera `$WORK/lorrax_ffi_unified/build_host/` | absent | 2026-07-25 |
 
-  (This is worth stating because the first pass of this investigation got
-  it backwards: an early probe read only `SLURM_JOB_NUM_NODES`, saw
-  nothing, and concluded the branch was dead code. It was not. Measured
-  inside the container, `srun -N 4 -n 16`: `SLURM_NNODES=4`,
-  `SLURM_NTASKS=16`, `SLURM_JOB_NODELIST=nid[001033,001644,003837,003840]`
-  present; `SLURM_JOB_NUM_NODES` absent.)
+So the tier's condition is false on every deployed library; the two that
+fail the probe are dated A/B control builds in a staging directory, and a
+post-AE build sits beside them. Frontera's live tree (`$WORK/lorrax`) has
+**no compiled `.so` at all**, so nothing there resolves either tier today.
+And `PHDF5_HOST` additionally needs an mpi4py + `HDF5_MPI=ON` h5py overlay
+that the FFI path does not — on Frontera's default python, `h5py` does not
+even import (`libhdf5.so.103: cannot open shared object file`).
 
-That variable-spelling trap is why `_slab_io_geometry()` reports JAX's
-process/device counts first: they do not depend on the launcher's
-vocabulary.
+A tier that requires *more* to do the *same* thing, selected only by a
+stale artifact, is not a fallback. The correct response to a stale `.so`
+is a refusal naming it, which is the repo-wide contract (CLAIMS 81) and is
+what `assert_available` now does.
+
+**Not deleted, and not a tier:** `bse_io`'s serial h5py readers. They
+hyperslab exactly one rank's (μ, ν) tile, allgather nothing, and are
+memory-correct at any process count — they are simply ~17× slower
+(0.17 GiB/s at P=4, CLAIMS 76, vs 2.919 GiB/s for the tile path at 16
+ranks, CLAIMS 69) because they issue `nq × μ/px` short row-runs one at a
+time with no collective buffering. `bse_io` falls back to them, loudly,
+when `probe_availability()` declines. Slow and correct is a legitimate
+fallback; the tier that was deleted was neither.
+
+---
+
+## Restart at P>1 {#restart}
+
+`restart = true` reads `V_qmunu`, `S_qmunu`, `V0_noG0_munu`,
+`psi_full_y` and (bispinor) `psi_full_y_transverse` back from
+`isdf_tensors_<n_rmu>.h5`. Until 2026-08-06
+`tagged_arrays.read_restart_state_from_h5` read every one of them with
+`[:]` — the whole `(nq, μ, μ)` tensor **on every rank** — and only then
+applied `jnp.pad` on both μ axes and `with_sharding_constraint`. Measured
+at P=4 (job 56389339, MoS2 6×6, N_mu=1496, nq=36): **+1.53 GiB VmHWM per
+rank**, silently. At the envelope (N_mu=20000, nq=64) the same read is
+**381.47 GiB per rank**.
+
+It was therefore *guarded off* above one process, which removed a
+capability that had worked at deck scale and left `restart = true` with no
+P>1 story. It is now on the tile path, following
+`bse_io.load_bse_data_from_restart_sharded`:
+
+1. one serial-h5py pass reads **shapes** and the small replicated arrays
+   (`enk_full`, `G0_mu_nu`, the stamps), then closes — two live handles on
+   one file is a hazard nobody needs;
+2. SlabIO reads the N_mu²-class tensors and ψ as per-rank tiles, asked for
+   at the **padded** extent so the zero-fill past the dataset *is* the pad.
+   No `jnp.pad`, and no sharding constraint applied to an already-resident
+   global array.
+
+What stays on serial h5py is μ-class or smaller (`G0` is 320 KB at the
+envelope) and is needed whole on every rank. The doctrine forbids
+materialising an N_mu²-class object, not reading a vector.
+
+**Spinor and bispinor.** `nspinor` is read from the ψ dataset and carried
+through as a replicated axis at its on-disk extent — 2 for spinor, 4 for
+bispinor — and is **never padded**. It is gated to `{1, 2, 4}`: an
+unexpected extent would otherwise sail through as a perfectly shardable
+replicated axis and misindex every downstream ψ contraction with no shape
+error. The bispinor `psi_full_y_transverse` is read at its **own** μ
+extent, since the transverse centroid count differs from the charge one
+and carries its own pad; the stamped `n_rmu_transverse_logical` is
+cross-checked against the dataset's extent *before any bytes move*.
+
+**Parity is bit equality**, not a tolerance: this is an element-*selection*
+change, not a reduction-order one. `tests/multi_device/restart_sharded_parity.py`
+asserts every returned element equals the serial-h5py read of the same
+file at the same index, at `RESTART_NS` ∈ {1, 2, 4}, and additionally that
+the pad rows are exact zeros and that no rank's shard is the whole array.
+`tests/test_restart_pad_roundtrip.py` covers the same round trip at 1×1.
 
 ---
 
@@ -722,9 +727,11 @@ inside the container, on a compute node.* Mechanism, the alias, and the
 `gate_one_mpi.sh` in-container gate: [`ffi_layout.md`](ffi_layout.md) §7c,
 which owns it.
 
-**Routing to `H5PY_ALLGATHER` at scale.** *Looks like:* a routing banner
-naming that tier, then a run that OOMs rank 0 or takes forever. See
-[the refusal note](#h5py_allgather-is-a-refusal-not-a-fallback).
+**A gather at scale.** *Used to look like:* a routing banner naming
+`H5PY_ALLGATHER`, then a run that OOMs rank 0 or takes forever. That tier
+no longer exists ([history](#tiers-history)); if you see a whole global
+array on one rank now, it is a caller doing its own `process_allgather`,
+not SlabIO.
 
 **`ad_cray_write_coll.c:669` OOM.** *Looks like:* an MPI-IO abort inside
 the collective write at ≳ 1 GiB per rank on Cray MPICH. Historical, from

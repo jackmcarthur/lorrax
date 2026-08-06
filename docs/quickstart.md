@@ -31,8 +31,7 @@ cd tests/regression/cohsex_debug
 lx run python3 -u -m gw.gw_jax -i cohsex_test.in
 ```
 
-The fixture sets `use_ffi_io = false` (the deprecated spelling of
-`slab_io = h5py_allgather` — the serial rank-0 writer) and ships its own wavefunction
+The fixture ships its own wavefunction
 (`WFNsmall.h5`), centroids (`centroids_frac_60.txt`), `dipole.h5`, and `kin_ion.h5`, so it
 needs nothing native. It writes `eqp_test.dat`; the reference is `eqp_ref.dat` in the same
 directory.

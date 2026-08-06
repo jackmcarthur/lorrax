@@ -107,52 +107,36 @@ def _setup_runtime(config, mesh_xy, *, print_fn=print) -> None:
 	``config.backend.slab_io``, which does not exist until the input file
 	has been read.
 	"""
-	from .gw_config import SlabIOBackend
-
-	if config.backend.slab_io is SlabIOBackend.PHDF5_FFI:
-		# NOT swallowed.  This call is the phdf5 FFI's MPI_Init_thread.
-		# If it fails, every subsequent collective H5Fcreate/H5Dwrite in
-		# the run is either dead or — worse — silently singleton, and a
-		# singleton-MPI run under independent I/O produces plausible,
-		# wrong-looking-at-nothing output.  A swallowed bring-up failure
-		# here is precisely how "phdf5 works multi-node" and "phdf5 fails
-		# multi-node" could BOTH be believed for months, so it now
-		# refuses, naming the launcher flag that fixes the usual cause.
-		from ffi.common.ffi_loader import phdf5_init_mpi
-		try:
-			phdf5_init_mpi()
-		except Exception as exc:
-			raise RuntimeError(
-				f"slab_io=phdf5_ffi selected but the FFI's MPI bring-up "
-				f"({type(exc).__name__}: {exc}) FAILED.  Every parallel "
-				f"write in this run would go through that MPI.  Usual "
-				f"cause: the launcher's PMI flavour does not match the "
-				f"MPI library — on Perlmutter/Shifter launch with "
-				f"`srun --mpi=cray_shasta` (pmi2 and pmix both yield "
-				f"singleton MPI, where every rank sees world_size==1 and "
-				f"independent writes still produce a plausible file).  "
-				f"See docs/architecture/slab_io.md.  Set "
-				f"slab_io=h5py_allgather to run without parallel HDF5."
-			) from exc
-	elif config.backend.slab_io is SlabIOBackend.PHDF5_HOST:
-		# mpi4py initialises MPI on first import; do it here so the
-		# ~400 ms MPI_Init cost is amortised before the first SlabIO
-		# open (same rationale as the FFI's phdf5_init_mpi).  When
-		# slab_io=auto routed here, the router already proved MPI
-		# inits; an explicit slab_io=phdf5_host can still hit a PMI
-		# mismatch, so say what the failure means — the SlabIO open
-		# will then fail loudly with the same cause.
-		try:
-			from mpi4py import MPI  # noqa: F401
-		except BaseException as exc:
-			print_fn(
-				f"  [phdf5_host mpi4py init] FAILED: {exc}\n"
-				"    An MPI_Init failure here (classic signature: "
-				"'MPI_Init_thread() failed ... error code: 16') usually "
-				"means a PMI mismatch between the launcher and the MPI "
-				"library.  On SLURM launch with `srun --mpi=pmi2`; some "
-				"MPI builds also need I_MPI_PMI_LIBRARY (or the site "
-				"equivalent) pointing at the system libpmi2.")
+	# Unconditional since 2026-08-06: there is one transport and it always
+	# needs this MPI.  This used to branch on ``config.backend.slab_io`` --
+	# PHDF5_FFI got a hard refusal here, PHDF5_HOST got a printed warning,
+	# H5PY_ALLGATHER got nothing -- which is why the docstring above says
+	# this step could not move with the rest of the runtime setup.  With one
+	# transport it no longer depends on the parsed config at all.
+	#
+	# NOT swallowed.  This call is the phdf5 FFI's MPI_Init_thread.  If it
+	# fails, every subsequent collective H5Fcreate/H5Dwrite in the run is
+	# either dead or -- worse -- silently singleton, and a singleton-MPI run
+	# under independent I/O produces plausible, wrong-looking-at-nothing
+	# output.  A swallowed bring-up failure here is precisely how "phdf5
+	# works multi-node" and "phdf5 fails multi-node" could BOTH be believed
+	# for months, so it refuses, naming the launcher flag that fixes the
+	# usual cause.
+	from ffi.common.ffi_loader import phdf5_init_mpi
+	try:
+		phdf5_init_mpi()
+	except Exception as exc:
+		raise RuntimeError(
+			f"the phdf5 FFI's MPI bring-up ({type(exc).__name__}: {exc}) "
+			f"FAILED.  Every parallel write in this run goes through that "
+			f"MPI.  Usual cause: the launcher's PMI flavour does not match "
+			f"the MPI library -- on Perlmutter/Shifter launch with "
+			f"`srun --mpi=cray_shasta` (pmi2 and pmix both yield singleton "
+			f"MPI, where every rank sees world_size==1 and independent "
+			f"writes still produce a plausible file).  There is no "
+			f"non-parallel writer to fall back to and that is deliberate; "
+			f"see docs/architecture/slab_io.md."
+		) from exc
 
 
 def _compute_static_head(head_resolver, meta, do_screened, print0):
@@ -283,7 +267,6 @@ def main(argv=None):
 	# must test what will execute).  The Σ driver re-checks divisibility at
 	# its own seam as the last-line guard.
 	if mode.is_dynamic and config.ppm.omega_layout == "sharded":
-		from .gw_config import SlabIOBackend
 		_p_x = int(mesh_xy.devices.shape[0])
 		_p_y = int(mesh_xy.devices.shape[1])
 		_nbs = int(meta.nb_sigma)
@@ -294,14 +277,12 @@ def main(argv=None):
 				f"({_p_x}x{_p_y}): the mesh-pad block cannot ride the sharded "
 				f"consumer path yet.  Use a divisible window or "
 				f"sigma_omega_layout=replicated.")
-		if (jax.process_count() > 1
-				and config.backend.slab_io is SlabIOBackend.H5PY_ALLGATHER):
-			raise ValueError(
-				"sigma_omega_layout=sharded with slab_io=h5py_allgather at "
-				"P>1 would re-introduce the full Σ_c(ω) cube gather inside "
-				"the sigma_mnk.h5 writer — the exact collective this layout "
-				"removes.  Use slab_io=auto (routes to a per-rank parallel "
-				"PHDF5 writer) or phdf5_ffi/phdf5_host.")
+		# The second refusal that used to live here -- sharded layout with
+		# slab_io=h5py_allgather at P>1, which would have re-introduced the
+		# full Σ_c(ω) cube gather inside the sigma_mnk.h5 writer -- is gone
+		# with the tier.  It was door 7 of 7 and the only one that read
+		# ``jax.process_count()`` raw instead of the launcher-aware count,
+		# so it was also the weakest.  Nothing can select that writer now.
 		print0(
 			f"  sigma_omega_layout = sharded: Σ_c(ω,k,m,n) stays "
 			f"(m_X, n_Y)-tiled on the {_p_x}x{_p_y} mesh end-to-end "
@@ -553,7 +534,7 @@ def main(argv=None):
 	kin_ion_has_hartree = (hartree_source == "folded")
 	kin_ion = load_kin_ion_submatrix(
 		config.paths.kin_ion_file, band_slices.b0, band_slices.b3,
-		mesh=mesh_xy, backend=config.backend.slab_io,
+		mesh=mesh_xy,
 	)
 	timing.record("gw_jax.kin_ion_load", time.perf_counter() - _t_kin)
 

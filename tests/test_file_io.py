@@ -723,7 +723,23 @@ from file_io._slab_io_ffi import (
     _normalize_valid_shape,
     _validate_block_divisible,
 )
-from file_io.slab_io import SlabIO
+from file_io.slab_io import SlabIO, probe_availability
+
+
+def _require_slabio():
+    """Skip, naming the missing capability, when the tile path is absent.
+
+    SlabIO has ONE transport since 2026-08-06.  These three tests used to
+    reach the rank-0 allgather tier by omitting ``mesh`` and ``backend``,
+    which was legal at exactly one process; with that tier deleted they
+    exercise the real collective writer instead -- better coverage, but it
+    needs the phdf5 FFI to be present.  A skip that names the probe stage
+    is honest; a silent fallback to a second transport is what this
+    change removed.
+    """
+    ok, stage, reason = probe_availability()
+    if not ok:
+        pytest.skip(f"SlabIO unavailable (probe stage '{stage}'): {reason}")
 
 
 def test_normalize_slab_request_rejects_rank_mismatch():
@@ -849,7 +865,8 @@ def test_normalize_valid_shape_override_that_overruns_refuses():
             slab_shape=(4, 8), offset=(0, 6), ds_shape=(4, 10))
 
 
-def test_allgather_implicit_pad_write_and_zero_padded_read(tmp_path):
+def test_slabio_implicit_pad_write_and_zero_padded_read(
+        tmp_path, single_device_mesh):
     """The padded write/read round-trip with NO padding argument.
 
     decisions.md 2026-08-04: the caller states the dataset's logical
@@ -857,13 +874,15 @@ def test_allgather_implicit_pad_write_and_zero_padded_read(tmp_path):
     ``..._matches_explicit_valid_shape`` below, which pins that this is
     byte-identical to the pre-ruling spelling.
     """
+    _require_slabio()
+    mesh = single_device_mesh
     path = tmp_path / "slab.h5"
     physical = np.arange(12, dtype=np.float64).reshape(3, 4)
-    with SlabIO(str(path), mode="w") as io:
+    with SlabIO(str(path), mode="w", mesh=mesh) as io:
         io.create_dataset("A", shape=(3, 3), dtype=np.float64)
         io.write_slab("A", physical)
 
-    with SlabIO(str(path), mode="r") as io:
+    with SlabIO(str(path), mode="r", mesh=mesh) as io:
         host = io.read_slab("A", shape=(3, 4), as_numpy=True)
 
     expected = np.zeros((3, 4), dtype=np.float64)
@@ -871,21 +890,24 @@ def test_allgather_implicit_pad_write_and_zero_padded_read(tmp_path):
     np.testing.assert_array_equal(host, expected)
 
 
-def test_allgather_implicit_pad_matches_explicit_valid_shape(tmp_path):
+def test_slabio_implicit_pad_matches_explicit_valid_shape(
+        tmp_path, single_device_mesh):
     """BYTE-IDENTITY: dropping ``valid_shape`` must not move a bit.
 
     The unit-level twin of the ``implicit`` case in
     ``tests/multi_device/phdf5_padded_rank_write.py``.
     """
+    _require_slabio()
+    mesh = single_device_mesh
     physical = np.arange(12, dtype=np.float64).reshape(3, 4)
 
     old = tmp_path / "old.h5"
-    with SlabIO(str(old), mode="w") as io:
+    with SlabIO(str(old), mode="w", mesh=mesh) as io:
         io.create_dataset("A", shape=(3, 3), dtype=np.float64)
         io.write_slab("A", physical, global_shape=(3, 3),
                       valid_shape=(3, 3))
     new = tmp_path / "new.h5"
-    with SlabIO(str(new), mode="w") as io:
+    with SlabIO(str(new), mode="w", mesh=mesh) as io:
         io.create_dataset("A", shape=(3, 3), dtype=np.float64)
         io.write_slab("A", physical)
 
@@ -897,30 +919,97 @@ def test_allgather_implicit_pad_matches_explicit_valid_shape(tmp_path):
     assert a.shape == b.shape
     assert a.tobytes() == b.tobytes()
 
-    with SlabIO(str(new), mode="r") as io:
+    with SlabIO(str(new), mode="r", mesh=mesh) as io:
         explicit = io.read_slab("A", shape=(3, 4), valid_shape=(3, 3),
                                 as_numpy=True)
         implicit = io.read_slab("A", shape=(3, 4), as_numpy=True)
     assert explicit.tobytes() == implicit.tobytes()
 
 
-def test_create_dataset_refuses_a_geometry_change(tmp_path):
+def test_create_dataset_refuses_a_geometry_change(
+        tmp_path, single_device_mesh):
     """decisions.md 2026-08-04: reuse-if-identical, refuse otherwise.
 
-    The allgather backend used to ``del`` and recreate, silently
+    The deleted allgather backend used to ``del`` and recreate, silently
     discarding the previous contents.
     """
+    _require_slabio()
+    mesh = single_device_mesh
     path = tmp_path / "geom.h5"
-    with SlabIO(str(path), mode="w") as io:
+    with SlabIO(str(path), mode="w", mesh=mesh) as io:
         io.create_dataset("A", shape=(3, 3), dtype=np.float64)
         io.write_slab("A", np.ones((3, 3), dtype=np.float64))
 
-    with SlabIO(str(path), mode="a") as io:
+    with SlabIO(str(path), mode="a", mesh=mesh) as io:
         io.create_dataset("A", shape=(3, 3), dtype=np.float64)   # idempotent
-        with pytest.raises(ValueError, match="already exists"):
+        # RuntimeError, not ValueError: the refusal is raised by the C++
+        # ``ensure_dataset`` and surfaces through the FFI as
+        # ``lorrax_ffi error (1)``.  The deleted allgather backend raised
+        # ValueError from Python for the same condition -- so this is the
+        # one place the tier deletion changed an exception TYPE, and the
+        # message (which names both shapes) is unchanged.
+        with pytest.raises((ValueError, RuntimeError),
+                           match="already exists"):
             io.create_dataset("A", shape=(4, 4), dtype=np.float64)
 
     import h5py
     with h5py.File(str(path), "r") as f:
         np.testing.assert_array_equal(np.asarray(f["A"]),
                                       np.ones((3, 3)))
+
+
+def test_read_slab_without_shape_rounds_up_to_the_mesh(
+        tmp_path, single_device_mesh):
+    """THE EASY CALL IS THE CORRECT CALL (2026-08-06).
+
+    ``read_slab(name, partition_spec=spec)`` with no ``shape`` returns the
+    dataset rounded UP to the mesh-divisible extent, zero-filled past the
+    dataset.  Before this, ``shape=None`` meant "the dataset's own shape",
+    which REFUSES whenever that shape is not mesh-divisible -- the normal
+    case, since N_mu is a physics number and not a multiple of the device
+    count.  So every caller computed the rounded-up extent itself, which is
+    the nitty-gritty the owner objected to.
+
+    Pinned at 1x1 (where the round-up is the identity) so the CONTRACT is
+    covered by the unit suite; ``tests/multi_device/restart_sharded_parity``
+    covers the case where the rounding actually moves the extent.
+    """
+    _require_slabio()
+    mesh = single_device_mesh
+    path = tmp_path / "autopad.h5"
+    a = np.arange(15, dtype=np.float64).reshape(3, 5)
+    with SlabIO(str(path), mode="w", mesh=mesh) as io:
+        io.create_dataset("A", shape=(3, 5), dtype=np.float64)
+        io.write_slab("A", a)
+
+    with SlabIO(str(path), mode="r", mesh=mesh) as io:
+        auto = io.read_slab("A", partition_spec=P("x", "y"), as_numpy=True)
+        explicit = io.read_slab("A", shape=(3, 5), partition_spec=P("x", "y"),
+                                as_numpy=True)
+    # Same bytes as the spelling that states the extent by hand.
+    assert auto.shape == explicit.shape
+    assert auto.tobytes() == explicit.tobytes()
+    np.testing.assert_array_equal(auto, a)
+
+
+def test_mesh_divisible_shape_rounds_each_axis_by_its_own_divisor():
+    """The rounding rule itself, without a file.
+
+    Each dim is rounded by the product of the mesh sizes of the axes that
+    shard it -- NOT by the total device count.  A caller that rounded both
+    μ axes by ``device_count`` would get a legal but larger buffer; the
+    restart path deliberately does exactly that (``padded_mu_extent``) for
+    its own reasons, and the two must not be confused.
+    """
+    import jax
+    from jax.sharding import Mesh
+    from file_io.slab_io import mesh_divisible_shape
+    devs = jax.devices()
+    if len(devs) < 4:
+        pytest.skip(f"needs >= 4 devices for a 2x2 mesh; have {len(devs)}")
+    mesh = Mesh(np.asarray(devs[:4]).reshape(2, 2), axis_names=("x", "y"))
+    assert mesh_divisible_shape((5, 7), mesh, P("x", "y")) == (6, 8)
+    assert mesh_divisible_shape((5, 7), mesh, P(None, "y")) == (5, 8)
+    assert mesh_divisible_shape((5, 7), mesh, P(None, None)) == (5, 7)
+    # Both axes on one dim -> that dim rounds by the product.
+    assert mesh_divisible_shape((5,), mesh, P(("x", "y"),)) == (8,)

@@ -739,7 +739,7 @@ def gather_to_host(x):
     that is not the one MPI was initialized from".
 
     When the array is fully replicated, this process ALREADY holds all of it:
-    read shard 0 locally and issue nothing.  ``file_io._slab_io_allgather``
+    read shard 0 locally and issue nothing.  ``file_io.slab_io``
     has carried this arm and its rationale all along
     (``PROCESS_ALLGATHER_DESIGN_REVIEW_2026-05-20.md``); the service did not,
     which is why it was the least correct of the five wrappers it was meant to

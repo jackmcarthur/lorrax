@@ -756,7 +756,7 @@ class WfnLoader:
           5. ``jax.make_array_from_single_device_arrays`` assembles the
              global array — no rank materialises the full host slab.
         """
-        from ._slab_io_mpi_host import _local_shard_and_global_offset
+        from ._slab_io_ffi import _local_shard_and_global_offset
         global_shape = tuple(int(s) for s in global_shape)
         proto = _sharded_zero_proto_fn(global_shape, dtype, sharding)()
         local_zero, offset = _local_shard_and_global_offset(proto)

@@ -842,7 +842,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
 			band_norms=_band_norms,
-			slab_io_backend=cfg.backend.slab_io,
 			gspace_mode=cfg.gspace_mode,
 			distributed_cholesky=cfg.backend.distributed_cholesky,
 			distributed_lu=cfg.backend.distributed_lu,
@@ -1027,8 +1026,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					band_range_left=band_range_left,
 					band_range_right=band_range_right,
 							band_norms=_band_norms,
-					slab_io_backend=cfg.backend.slab_io,
-					gspace_mode=cfg.gspace_mode,
+							gspace_mode=cfg.gspace_mode,
 					distributed_cholesky=cfg.backend.distributed_cholesky,
 					distributed_lu=cfg.backend.distributed_lu,
 					zeta_ridge=cfg.backend.zeta_ridge,
@@ -1210,13 +1208,13 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			from .v_q_bispinor import compute_V_q_bispinor_g_flat_to_h5
 			from file_io.zeta_loader import ZetaLoader
 			with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
-			                backend=cfg.backend.slab_io) as zc, \
+			                ) as zc, \
 			     ZetaLoader(zeta_T_paths[0], mesh=mesh_xy,
-			                backend=cfg.backend.slab_io) as zt1, \
+			                ) as zt1, \
 			     ZetaLoader(zeta_T_paths[1], mesh=mesh_xy,
-			                backend=cfg.backend.slab_io) as zt2, \
+			                ) as zt2, \
 			     ZetaLoader(zeta_T_paths[2], mesh=mesh_xy,
-			                backend=cfg.backend.slab_io) as zt3:
+			                ) as zt3:
 				with mesh_xy:
 					compute_V_q_bispinor_g_flat_to_h5(
 						zeta_C_loader=zc,
@@ -1232,7 +1230,6 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						       if meta.sys_dim == 0 else None),
 						g_chunk=(int(cfg.memory.vq_g_chunk_size)
 						         if cfg.memory.vq_g_chunk_size > 0 else None),
-						backend=cfg.backend.slab_io,
 						print_fn=print_fn,
 						sym=sym if _use_ibz_bispinor else None,
 						centroid_C_idx=_cent_C_idx_for_orchestrator,
@@ -1244,7 +1241,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# The TT tiles stay on disk; Σ_X^B / Σ_H^B will consume them
 		# via BispinorVqReader once those paths land.
 		with BispinorVqReader(bispinor_h5_path, mesh_xy,
-		                      backend=cfg.backend.slab_io) as reader:
+		                      ) as reader:
 			V_q_raw = reader.get_tile(0, 0)
 			G0_all = reader.get_g0_CC()
 		# V_q_raw is on disk at LOGICAL n_rmu (the orchestrator strips
@@ -1267,7 +1264,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		from file_io.zeta_loader import ZetaLoader
 		with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 			with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
-			                backend=cfg.backend.slab_io) as zeta_io:
+			                ) as zeta_io:
 				with mesh_xy:
 					V_q_raw, G0_all = compute_all_V_q(
 						zeta_io,
@@ -1290,7 +1287,14 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file via SlabIO's deferred
 	# attr path (small; rank-0-only after MPI-IO file is closed).
-	from file_io._slab_io_allgather import _to_host as _gather_to_host
+	# ``common.collectives.gather_to_host`` is the sanctioned L3 gather and
+	# is what ``_slab_io_allgather._to_host`` was a private copy of.  This
+	# import used to reach straight into the allgather backend, bypassing
+	# every one of the seven refusals that guarded that tier -- an eighth,
+	# ungated door.  G0 is (nq, mu), mu-class not mu^2-class, so the gather
+	# itself is not the doctrine violation; the unguarded private import
+	# was.  Same dispatch, public name.
+	from common.collectives import gather_to_host as _gather_to_host
 	G0_gathered = _gather_to_host(G0_all)
 	if jax.process_index() == 0:
 		with h5py.File(zeta_h5_path, 'a') as f:
@@ -1389,7 +1393,6 @@ def prepare_isdf_and_wavefunctions(
 			# band_chunk / chunk_r / q_chunk / gflat_chunk_size, the rank
 			# floor P_min, and the binding-stage report.
 			from gw.gflat_memory_model import plan_gflat_chunks
-			from gw.gw_config import SlabIOBackend
 			mem = cfg.memory
 			nb_total = ((band_slices.b3 - band_slices.b0)
 			            + (band_slices.b4 - band_slices.b1))
@@ -1411,13 +1414,15 @@ def prepare_isdf_and_wavefunctions(
 				                     if mem.band_chunk_size > 0 else None),
 				gflat_chunk_size_override=(int(mem.gflat_chunk_size)
 				                           if mem.gflat_chunk_size > 0 else None),
-				# Stage F (restart-tensor write) is UNSHARDED on the
-				# allgather backend — ``_slab_io_allgather._to_host``
-				# process_allgathers the whole (n_q, μ, μ) tensor onto every
-				# rank.  The parallel-HDF5 backends write per-rank hyperslabs
-				# and cost the sharded amount instead.
-				slab_io_replicates=(
-					cfg.backend.slab_io == SlabIOBackend.H5PY_ALLGATHER),
+				# Stage F (restart-tensor write) writes per-rank
+				# hyperslabs and therefore costs the SHARDED amount.  This
+				# used to be conditional: on the allgather backend
+				# ``_to_host`` process_allgathered the whole (n_q, μ, μ)
+				# tensor onto every rank and stage F was unsharded.  That
+				# backend is gone (2026-08-06), so the replicated branch is
+				# unreachable and the planner is told so explicitly rather
+				# than left on its ``True`` default.
+				slab_io_replicates=False,
 			)
 			if jax.process_index() == 0:
 				print0("")
@@ -1517,7 +1522,7 @@ def prepare_isdf_and_wavefunctions(
 				tensors_filename,
 				n_rmu_logical=int(meta.n_rmu),
 				V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
-				init_W0=True, mesh=mesh_xy, backend=cfg.backend.slab_io,
+				init_W0=True, mesh=mesh_xy,
 				mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
 				# Stamp the band window + n_rmu so a later restart
 				# under a CHANGED window fails loudly instead of
@@ -1557,7 +1562,7 @@ def prepare_isdf_and_wavefunctions(
 				tensors_filename,
 				n_rmu_logical=int(meta.n_rmu),
 				psi_full_y=wfns.psi_yr, mesh=mesh_xy,
-				backend=cfg.backend.slab_io, mode="a",
+				mode="a",
 				psi_full_y_transverse=(
 					wfns_transverse.psi_yr
 					if wfns_transverse is not None else None),

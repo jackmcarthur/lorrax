@@ -643,7 +643,7 @@ def _read_kchunk_union_sharded_cached(
 """Sharded-slab FFI writer — thin shard_map wrapper around PhdfWriteFfi.
 
 Preferred public entry point for gw_jax / isdf / etc. is
-:mod:`file_io.slab_io`, which dispatches on ``use_ffi_io`` between the
+:mod:`file_io.slab_io`, which has one transport (the phdf5 FFI) and
 allgather-and-rank-0-h5py backend (default) and this FFI backend.
 Call this module directly only for 2-D block-partitioned writes where
 you know you want the FFI path.

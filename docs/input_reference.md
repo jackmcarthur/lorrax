@@ -105,8 +105,6 @@ Longer discussions of the load-bearing keys are in [drivers.md](drivers.md).
 | `eqp1_file` | `"eqp1.dat"` | BGW-format Z-linearized QP energies output (Z=1 in static COHSEX). |
 | `sigma_omega_h5_file` | `"sigma_mnk.h5"` | Sigma_c(omega,k,m,n) HDF5 output. |
 | `restart` | true | Reuse tmp/isdf_tensors_{n_rmu}.h5 (skip zeta-fit/V_q); guarded by band-window attrs + centroid-table md5 stamps. |
-| `use_ffi_io` | None | DEPRECATED tri-state, superseded by slab_io; explicit false = h5py_allgather. |
-| `slab_io` | `"auto"` | Distributed HDF5 routing: auto (capability-probed) | phdf5_ffi | phdf5_host | h5py_allgather; explicit values fail loudly if unavailable. |
 | `gspace_mode` | `"host_cache"` | psi(G) host lifecycle: host_cache (resident, default) | file_reread (rebuild per r-chunk; zero persistent residency). |
 | `write_wfn_h5` | true | End-of-run WFN_qp.h5 write (BGW format, psi rotated by the final U, E_QP energies). |
 | `strict_keys` | false | Unknown deck keys refuse (ValueError naming every one) instead of the default aggregated warning. |
