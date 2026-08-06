@@ -505,9 +505,9 @@ def test_defect3_vocabulary_has_not_drifted():
     """DEFECT 3 — one recognised token set, checked against every live copy.
 
     Three named vocabularies remain in the tree and must stay set-equal:
-      * ``ffi/gate.py::MODE_SPELLINGS``  (three-valued; ``auto`` is
-        load-bearing there and is deliberately NOT merged into the
-        two-valued helpers — only the on/off halves are compared);
+      * ``ffi/gate.py::MODE_SPELLINGS``  (two-valued since 2026-08-06 —
+        the ``auto`` token was deleted with the auto tier it named; the
+        resolvers stay separate, the tokens agree);
       * ``runtime.__init__._FALSY_TOKENS``     (the falsy set exactly — the
         ``""`` it used to carry was the blank-token divergence, now fixed);
       * ``file_io/_slab_io_mpi_host.py::_TRUE`` (read from source: imports
@@ -524,6 +524,10 @@ def test_defect3_vocabulary_has_not_drifted():
         _literal_tuple_from_source("file_io/_slab_io_mpi_host.py", "_TRUE"))
     # ``auto`` must stay out of the two-valued sets.
     assert "auto" not in set(gw_config._ENV_TRUE) | set(gw_config._ENV_FALSE)
+    # ...and out of the gate vocabulary: a token with no resolver branch in
+    # enabled()/resolve()/enforce() would accept ``=auto`` and run as ``on``
+    # in silence (deleted 2026-08-06; decisions.md 2026-08-01 killed the tier).
+    assert "auto" not in gate.MODE_SPELLINGS and "auto" not in gate.MODE_HELP
 
 
 def test_isdf_core_grammar_copy_stays_dead():

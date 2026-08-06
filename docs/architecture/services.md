@@ -368,8 +368,8 @@ def rank_id() -> Optional[int];  def rank0() -> bool
 def announce_once(key, msg, *, scope: str = "rank0") -> bool
 def mesh_ffi_platform(mesh) -> str
 def reset_gate_state() -> None               # tests only
-MODE_SPELLINGS = {"auto": ("auto",), "off": ("0","off","false","no"),
-                  "on": ("1","on","true","yes")}
+MODE_SPELLINGS = {"off": ("0","off","false","no"),      # two-valued: the
+                  "on":  ("1","on","true","yes")}       # auto tier is gone
 
 # src/ffi/__init__.py — the ONE aggregate of factory-time dial state;
 # consumers fold it into kernel cache keys (ppm_tau_kernel, cohsex_sigma,
