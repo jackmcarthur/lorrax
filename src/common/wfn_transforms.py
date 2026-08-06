@@ -49,6 +49,7 @@ import numpy as np
 from runtime.padding import round_up, pad_axis_to
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from common.fft_helpers import local_fftn3, local_ifftn3
 
 if TYPE_CHECKING:
     from common.meta import Meta
@@ -612,7 +613,7 @@ def to_rchunk_inner(
     r_len_i = int(r_len)
 
     box = _box_kernel(psi, g_index, ngkmax=ngkmax)
-    rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+    rb = local_ifftn3(box, axes=(-3, -2, -1), norm=norm)
     # Reshape (..., nx, ny, nz) → (..., n_rtot).  Same contract as
     # to_rchunk._local_rchunk: assumes 3 leading axes before the spatial.
     rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
@@ -785,7 +786,7 @@ def to_rmu_inner(
     ngkmax = int(psi.shape[-1])
     fft_grid_t = tuple(int(s) for s in fft_grid)
     box = _box_kernel(psi, g_index, ngkmax=ngkmax)
-    rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+    rb = local_ifftn3(box, axes=(-3, -2, -1), norm=norm)
     if kvecs_frac is not None:
         rb = apply_bloch_phase(rb, kvecs_frac, fft_grid_t)
     # Gather centroid cells: trailing (nx, ny, nz) → (n_rmu,).
@@ -1052,7 +1053,7 @@ def gflat_to_rmu(
                 box = _box_kernel(
                     sub4, g_per_row, ngkmax=ngkmax)      # (cs, 1, ns, nx, ny, nz)
                 box = box.reshape(cs, ns, nx, ny, nz)
-                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                rb = local_ifftn3(box, axes=(-3, -2, -1), norm=norm)
                 # Centroid gather — (cs, ns, n_rmu).
                 samples = rb[:, :, r_mu_c[:, 0], r_mu_c[:, 1], r_mu_c[:, 2]]
                 if phx_rmu_all is not None:
@@ -1343,7 +1344,7 @@ def accumulate_rchunk_to_gflat(
                 buf = jnp.zeros((cs, n_rtot), dtype=sub.dtype)
                 buf = jax.lax.dynamic_update_slice_in_dim(buf, sub, r0_, axis=-1)
                 box = buf.reshape(cs, nx, ny, nz)
-                G = jnp.fft.fftn(box, axes=(-3, -2, -1), norm=norm).reshape(cs, n_rtot)
+                G = local_fftn3(box, axes=(-3, -2, -1), norm=norm).reshape(cs, n_rtot)
                 contrib = jnp.take_along_axis(
                     G, sphere_c[q_row], axis=-1, mode='promise_in_bounds')
                 acc_sub = jax.lax.dynamic_slice_in_dim(acc, i0, cs, axis=0)
