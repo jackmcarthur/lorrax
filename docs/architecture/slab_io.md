@@ -54,8 +54,7 @@ log as a **failed run that has not noticed yet** — it will either OOM rank
 correct response is to fix the tier-1 probe's stated reason, not to
 proceed.
 
-**Enforced since 2026-08-06** (the note that used to stand here recorded
-this as a known gap). One rule now covers every route into the tier:
+**Enforced since 2026-08-06.** The rule is:
 
 > **`H5PY_ALLGATHER` is reachable at exactly one process, and nowhere
 > else.**
@@ -63,13 +62,43 @@ this as a known gap). One rule now covers every route into the tier:
 At one process the gather and the per-rank write are the *same operation*,
 so there is no contract to violate and nothing to refuse about — laptop
 debugging, `-n 1` smoke runs and the config test suite are untouched, and
-the tier announces itself when selected. Above one process, both routes in
-raise at parse time:
+the tier announces itself when selected.
 
-| route in | at `process_count() == 1` | at `process_count() > 1` |
-|---|---|---|
-| `slab_io=auto`, both parallel tiers declined | selected, announced with the tier-1 reason and the note that the same config refuses at larger P | `_refuse_slab_io_no_parallel_writer` |
-| explicit `slab_io = h5py_allgather`, or deprecated `use_ffi_io = false` | honoured, announced | `_refuse_explicit_h5py_allgather` |
+**It took three landings to actually cover every route, and the first two
+were each reported as complete.** That is worth recording, because the
+shape of the mistake was the same each time: a refusal was added to the
+door the author was standing at, and the rule was then described as
+enforced. `0d8e50c` converted the router demotion; `252b80d` converted the
+*unstated* default in `slab_io._normalize_slab_backend`; and this table's
+predecessor listed only the two DECK routes, which is what made the third
+door invisible — `_normalize_slab_backend` returned a **named**
+`backend=SlabIOBackend.H5PY_ALLGATHER` verbatim at any process count,
+because the deck-level `_refuse_explicit_h5py_allgather` only ever sees a
+backend chosen from a deck.
+
+The census below is therefore of **every** route, deck or not. Anything
+added later must appear here:
+
+| # | route in | at `P == 1` | at `P > 1` | closed by |
+|---|---|---|---|---|
+| A | `SlabIO(..., backend=SlabIOBackend.H5PY_ALLGATHER)` — the enum handed straight to the constructor | honoured | `_refuse_explicit_h5py_allgather` | **2026-08-06 (third landing)** |
+| B | `SlabIO(..., backend=None, use_ffi_io=None)` — the unstated default | `H5PY_ALLGATHER` | `_refuse_or_allgather` | `252b80d` |
+| C | `SlabIO(..., use_ffi_io=False)` | `H5PY_ALLGATHER` | `_refuse_or_allgather` | `252b80d` |
+| D | deck `slab_io = h5py_allgather` | honoured, announced | `_refuse_explicit_h5py_allgather` | `0d8e50c` |
+| E | deck `use_ffi_io = false` (deprecated) | honoured, announced | `_refuse_explicit_h5py_allgather` | `0d8e50c` |
+| F | `slab_io = auto`, both parallel tiers declined | selected, announced with the tier-1 reason | `_refuse_slab_io_no_parallel_writer` | `f5bd23c` / `0accb9b` |
+| G | `gw/isdf_fitting.py:230-231` — a caller's OWN `slab_io_backend=None` parameter defaulted to the enum, then passed down as a named backend | `H5PY_ALLGATHER` | refused via A since 2026-08-06 | **still wrong at source** |
+
+Row G is the one to watch. It is latent — both in-tree callers
+(`gw_init.py:845`, `:1030`) pass `cfg.backend.slab_io` — but a *default*
+that means "gather" is exactly the shape rows B and C had before they were
+fixed, and "no caller does it today" is not a property a default can rely
+on. With A closed it now refuses instead of gathering, which is the right
+failure, but the default should say "the caller must state it".
+
+Stale prose, not a door: `file_io/sigma_output.py:288` still documents
+`H5PY_ALLGATHER` as the default for `write_sigma_omega_h5`; since
+`252b80d` a `backend=None` there refuses above one process (row B).
 
 The auto refusal names **which** of the two tier-1 probes declined and
 gives the repair *for that probe* — `probe_target`'s three states have

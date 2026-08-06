@@ -13,7 +13,11 @@ Two backends, selected by ``backend: SlabIOBackend``:
   the same operation, above P=1 rank 0 would have to hold the whole global
   array, which the production envelope makes an OOM rather than a slow
   path.  Named explicitly it is honoured at P=1 and refused above; left
-  unstated it is refused above P=1 by :func:`_normalize_slab_backend`.
+  unstated it is refused above P=1.  Both refusals are raised by
+  :func:`_normalize_slab_backend`, so there is no route into this tier
+  above one process — the deck-level check in
+  ``gw_config.resolve_slab_io_backend`` is a second, earlier line, not
+  the only one.
 - :attr:`SlabIOBackend.PHDF5_FFI` — :mod:`file_io._slab_io_ffi`.
   Collective MPI-IO via ``ffi.phdf5``; each rank writes its own
   hyperslab directly.  Lazy import; only loads the FFI when selected.
@@ -96,14 +100,37 @@ def _normalize_slab_backend(backend, use_ffi_io):
     file is about to be opened, so a direct caller hits it in the same
     place the config path does.
 
-    A named ``backend=H5PY_ALLGATHER`` is NOT re-refused here: that is
-    ``from_input_file``'s ``_refuse_explicit_h5py_allgather``, and the
-    tier legitimately serves single-process tests and fixtures which
-    construct it by name.  What is refused is the *unstated* default.
+    A NAMED ``backend=H5PY_ALLGATHER`` used to be returned verbatim here
+    at any process count, on the reasoning that the deck-level
+    ``_refuse_explicit_h5py_allgather`` already covered explicit
+    requests.  **It did not cover this one** (found 2026-08-06): that
+    refusal lives in ``gw_config.resolve_slab_io_backend`` and only sees
+    backends chosen from a deck.  A caller that hands the enum straight
+    to this constructor — ``SlabIO(path, mesh=mesh,
+    backend=SlabIOBackend.H5PY_ALLGATHER)``, or anything that defaults a
+    ``slab_io_backend=None`` parameter to the enum before getting here,
+    which ``gw/isdf_fitting.py:230-231`` still does — bypassed it
+    completely and got the rank-0 gather at any P.
+
+    This was the THIRD door found on one rule.  ``0d8e50c`` closed the
+    router demotion, ``252b80d`` closed the unstated default in this
+    function, and each landing was reported as closing the rule.  So the
+    post-check now lives where every route must pass: ``_refuse_or_
+    allgather`` for the unstated default, and here for the named one,
+    both calling the SAME ``_refuse_explicit_h5py_allgather`` the config
+    path calls.  The tier stays honoured by name at ONE process, which
+    is what the single-process tests and fixtures need and the only
+    place "gather to rank 0" and "this rank's tile" are the same bytes.
     """
     from gw.gw_config import SlabIOBackend  # avoid circular import at module load
     if backend is not None:
         if isinstance(backend, SlabIOBackend):
+            if backend is SlabIOBackend.H5PY_ALLGATHER:
+                # Same gate as the unstated default, in the same function,
+                # so no third landing can miss a branch.  Returns the tier
+                # at one process and raises above one.
+                return _refuse_or_allgather(
+                    "backend=SlabIOBackend.H5PY_ALLGATHER", named=True)
             return backend
         raise TypeError(
             f"backend={backend!r} must be SlabIOBackend, "
@@ -122,9 +149,18 @@ def _normalize_slab_backend(backend, use_ffi_io):
     return _refuse_or_allgather("use_ffi_io=False")
 
 
-def _refuse_or_allgather(how: str):
+def _refuse_or_allgather(how: str, *, named: bool = False):
     """H5PY_ALLGATHER at one process; raise above one.  ``how`` names the
     argument shape that got here, because the repair differs by caller.
+
+    ``named=True`` is the caller who asked for the tier BY NAME rather
+    than falling into it.  Both cases land here on purpose: the rule
+    "reachable at exactly one process and nowhere else" had already been
+    landed twice on two different doors and described as complete both
+    times, so the two doors in this module now share one gate instead of
+    each carrying its own.  A named request gets the config layer's own
+    ``_refuse_explicit_h5py_allgather`` — the SAME text a deck that names
+    the tier gets, because it is the same decision.
 
     Process count comes from ``gw_config._slab_io_process_count`` — the
     SAME function the parse-time refusals use, deliberately imported
@@ -135,10 +171,14 @@ def _refuse_or_allgather(how: str):
     gather through.
     """
     from gw.gw_config import (SlabIOBackend, _slab_io_process_count,
+                              _refuse_explicit_h5py_allgather,
                               _SLAB_IO_DOC, _SLAB_IO_RULE)
     processes, evidence = _slab_io_process_count()
     if processes <= 1:
         return SlabIOBackend.H5PY_ALLGATHER
+    if named:
+        _refuse_explicit_h5py_allgather(
+            key=f"SlabIO({how})", processes=processes, how=evidence)
     raise ValueError(
         f"\n*** SlabIO() with no backend named REFUSED at {processes} "
         f"processes. ***\n"
@@ -154,9 +194,9 @@ def _refuse_or_allgather(how: str):
         f"config (LorraxConfig.slab_io_backend), which has already "
         f"probed this stack and will name the reason if neither "
         f"parallel tier is available — do not re-derive it here.\n"
-        f"  escape  backend=SlabIOBackend.H5PY_ALLGATHER is still "
-        f"honoured by name at one process; above one it is refused by "
-        f"the config router for the same reason.\n"
+        f"  escape  backend=SlabIOBackend.H5PY_ALLGATHER is honoured by "
+        f"name at ONE process and refused above one — by this same "
+        f"function since 2026-08-06, not only by the config router.\n"
         f"  doc     {_SLAB_IO_DOC}\n")
 
 
