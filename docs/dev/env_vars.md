@@ -306,6 +306,11 @@ ARCHITECTURE.md prose; dropped by the fix/zq audit.)
 Read by `config/**/*.sh`, `src/ffi/cpp/common/**/build*.sh` and CMake.
 Never by the running Python; setting them in a job script does nothing.
 
+> **This section is 120 of the 234 `LORRAX` env names the tree actually
+> reads — an `arch.mk` expressed as environment.** Why that is the shape
+> to move away from, and which knobs defer a decision the build already
+> made, is [`architecture/ffi_layout.md` §3c](../architecture/ffi_layout.md).
+
 `LORRAX_ROOT`, `LORRAX_SRC`, `LORRAX_VENV`, `LORRAX_SITE`,
 `LORRAX_SITE_PACKAGES`, `LORRAX_INSTALL_ROOT`, `LORRAX_DEPS`,
 `LORRAX_IMAGE`, `LORRAX_SIF`, `LORRAX_SHIFTER*`, `LORRAX_MODULE*`,

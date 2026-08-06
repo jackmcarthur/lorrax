@@ -208,6 +208,53 @@ Four gaps, worst first.
    `LORRAX_LU_NO_PIVOT` disables pivoting from the environment with no gate
    and, until 2026-08-06, no registry row.
 
+### 3c. The shape of this surface: an arch.mk expressed as environment
+
+Census of `integration/2026-08-06`: **355 distinct `LORRAX_*` names appear
+in the tree; 234 are actually read.** Of those 234, **120 are build-time
+shell variables** — read only by `config/**/*.sh`, `src/ffi/cpp/**/build*.sh`
+and CMake, never by the running Python. 111 are run-time, 3 are both, and
+121 more names survive only in prose and post-mortem comments.
+
+That majority is the finding. **120 build-time knobs is an `arch.mk`
+expressed as environment.** BerkeleyGW answers the same questions this
+layer answers — which FFT, which BLAS/LAPACK, which ScaLAPACK, which HDF5,
+CPU or GPU — in a single ~70-line file per machine
+(`config/<machine>.<compiler>.<target>.<site>.mk`, symlinked to `arch.mk`),
+where the answers are **compile-time cpp macros** in one variable:
+
+```make
+MATHFLAG = -DUSESCALAPACK -DUNPACKED -DUSEFFTW3 -DHDF5   # Frontera
+MATHFLAG = -DUSESCALAPACK -DUNPACKED -DUSEFFTW3 -DHDF5 -DOMP_TARGET -DOPENACC
+FFTWLIB  = $(FFTW_DIR)/libfftw3.so ...                   # a PATH, not a soname
+```
+
+Its entire run-time environment is one commented `module load` line. Note
+what that buys on the exact hazard in §3b: BerkeleyGW's Perlmutter build
+links `libfftw3.so` **and** `-lcufft` into one binary and still cannot
+suffer the `libcufftw.so.11` substitution, because it names a **file path**
+at link time rather than resolving a **soname** at run time. There is no
+moment at which the question "which engine answered?" is open, so there is
+nothing for a GATE 8 to check.
+
+**A build-time fact should be a build-time fact.** The knobs worth moving
+are the ones that defer a decision the build already made — `LORRAX_FFTW3_SO`
+is the clearest (the build already recorded its engine as the compile-time
+`LORRAX_FFTW3_SO_HINT`; the env var exists to override it at run time).
+This is a direction, not a scheduled refactor: a census of read sites
+cannot tell you which knobs a deployment actually sets, and every knob
+tested during this audit turned out **reachable** — see the deletion
+finding below.
+
+**No `LORRAX_*` name was found safely deletable.** Every candidate a
+read-site census flagged as dead proved reachable through indirection the
+census could not see: `LORRAX_FFT_FFI_{CHUNK,LOG,THREADS}` are read through
+a C++ helper taking a name plus a deprecated-alias list;
+`LORRAX_KIN_ION_LOOKAHEAD` is bound to `collectives.SWEEP_LOOKAHEAD_ENV`
+and read through that constant; `LORRAX_RUN_DIR` is read in a `.sbatch`
+template. Treat "nothing reads it" as a hypothesis requiring a hand grep,
+not a result.
+
 **The Frontera leg shares no numbered gate with Perlmutter.**
 `config/frontera/build_ffi_host.sh` calls neither `gate_one_mpi.sh` nor
 `gate_one_hdf5.sh`; it has its own CUDA-free grep, an exported-handler list,
