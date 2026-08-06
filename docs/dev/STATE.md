@@ -49,6 +49,36 @@ fastloop leg). Status with evidence:
   ring/preview per-rank reads, eager-FFT debt, Σ_c full-frequency
   cross-check, probe-χ planner cheapening, cusolvermp hoist port, QE→pw2bgw
   certification.
+- **Coulomb head slot — OPEN, needs an owner ruling, 2026-08-05.** The
+  2026-08-05 consolidation was authorised to move the GW body-head slot from
+  the Miller-(0,0,0) rule to `argmin_G |q+G|^2`, on the stated premise that
+  the two coincide inside the first BZ so the change would be BSE-only. THE
+  PREMISE IS FALSE and the change was NOT made. Measured (Frontera job
+  7890613): over the full production q-list, `argmin` differs from
+  Miller-(0,0,0) at **12 of 64 q** on the Si 4x4x4 fcc deck and **1 of 4** on
+  the MoS2 mini deck. BGW wraps q to the fractional cube [-1/2, 1/2), which is
+  the parallelepiped, NOT the Wigner-Seitz cell — on a non-orthogonal lattice
+  those differ, and a wrapped q can sit outside the first BZ. So for GW this
+  is a physics change, not a relabelling, and its gate ("value-level for 3D")
+  could not have been met. It is also not a one-line change: the head TABLE is
+  averaged AROUND the slot it is injected at, so the slot and the shift have
+  to move together or the average lands on the wrong neighbourhood.
+  `argmin` is retained where it was already correct and already load-bearing
+  (`bse/vq_interp.py:1002`, the arbitrary-Q path, where Q is not on the grid
+  at all). Deciding for GW needs a Sigma A/B of the slot+shift change on the
+  Si deck; the harness for it is
+  `/scratch2/08271/jackmc/coulomb_consolidation/ab/` (two frozen source arms,
+  one sbatch, ~7 min/arm on one development node).
+
+- **`bare_coulomb_cutoff` is documented three ways — REGISTERED, not fixed.**
+  `docs/input_reference.md:53` says "None = ecutwfc";
+  `manual/06_coulomb/6.3_cutoffs.md:17` says "Default E_cut, matching
+  BerkeleyGW's `screened_coulomb_cutoff` default"; `gw_config.py:1167` has
+  `None` and `gw_init.py:227` records a resolved `zeta_vcoul_cutoff` into
+  provenance. These may all be consistent, but confirming that means tracing
+  the resolution chain, which the 2026-08-05 Coulomb work did not touch.
+  Noted rather than guessed at.
+
 - **SUP decisions parked with the owner**: bispinor transverse rank-gate /
   rcond policy; the 512b μ-convergence non-monotonicity verdict; Perlmutter
   head-wing rescue (data risk); plus the standing owner queue at

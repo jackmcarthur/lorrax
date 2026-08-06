@@ -293,9 +293,17 @@ $$z_{q,\mu}(\mathbf{G}) = \text{FFT}_{\mathbf{r}}[z_{q,\mu}(\mathbf{r})]$$
 
 **Step 5c**: Coulomb kernel (BerkeleyGW conventions):
 
-$$v_{\mathbf{q}}(\mathbf{G}) = \frac{4\pi}{|\mathbf{q}+\mathbf{G}|^2} \times T_{\text{cell}}(\mathbf{q}+\mathbf{G})$$
+$$v_{\mathbf{q}}(\mathbf{G}) = \frac{8\pi}{|\mathbf{q}+\mathbf{G}|^2} \times T_{\text{cell}}(\mathbf{q}+\mathbf{G})$$
 
-where $T_{\text{cell}}$ is the truncation factor (1 for 3D, analytical for 2D slab/wire, see `compute_vcoul.py`).
+The prefactor is $8\pi$, not $4\pi$: Rydberg atomic units ($e^2 = 2$), the
+BerkeleyGW convention. The code has always been $8\pi$ (`gw/coulomb/kernel.py`)
+and the BGW agreement is anchored to it; this page said $4\pi$ until 2026-08-05.
+
+$T_{\text{cell}}$ is the truncation factor: 1 for 3D, the analytical
+Ismail-Beigi factor for a 2D slab. **There is no wire (1D) truncation** —
+`sys_dim` accepts 0 / 2 / 3 only, and 0 is a real-space Wigner–Seitz box FFT
+rather than a multiplicative factor. The single implementation is
+`gw.coulomb.kernel.v_qG`.
 
 **Divergence at q=G=0**: Handled via Monte Carlo integration over Voronoi cell (see `compute_q0_averages` in `vcoul.py`).
 
@@ -513,7 +521,7 @@ $$(1 - V\chi^0) W = V$$
 
 ### 6.5 Head Correction for q=0, G=0 Divergence
 
-The bare Coulomb $v_{\mathbf{q}}(\mathbf{G}) = 4\pi/|\mathbf{q}+\mathbf{G}|^2$ diverges as $\mathbf{q}, \mathbf{G} \to 0$. We handle this via:
+The bare Coulomb $v_{\mathbf{q}}(\mathbf{G}) = 8\pi/|\mathbf{q}+\mathbf{G}|^2$ (Rydberg units) diverges as $\mathbf{q}, \mathbf{G} \to 0$. We handle this via:
 
 **Step 1**: Build $V_{q,\mu\nu}$ with $v_q(G=0)$ **zeroed** (done in `make_v_munu_kernel`).
 
