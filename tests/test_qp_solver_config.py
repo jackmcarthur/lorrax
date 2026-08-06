@@ -164,19 +164,15 @@ def test_sc_bad_accelerator_rejected(tmp_path):
 # on a CPU backend — doctrine 3, audit fix/zq 2026-07-28; 'auto' LU
 # demotes there with an announcement), so each cell PINS the backend via
 # monkeypatch instead of inheriting whatever the test box runs, and the
-# slab_io routers are stubbed so no capability probe / MPI init runs at
-# parse time.
+# parse time no longer runs any transport capability probe (2026-08-06).
 # ---------------------------------------------------------------------------
 
 def _pin_backend(monkeypatch, backend_name: str):
     import jax
-    import gw.gw_config as gw_config
-    from gw.gw_config import SlabIOBackend
     monkeypatch.setattr(jax, "default_backend", lambda: backend_name)
-    monkeypatch.setattr(gw_config, "_route_cpu_slab_io",
-                        lambda print_fn: SlabIOBackend.H5PY_ALLGATHER)
-    monkeypatch.setattr(gw_config, "_route_gpu_slab_io",
-                        lambda print_fn: SlabIOBackend.H5PY_ALLGATHER)
+    # The two slab_io router stubs that used to live here are gone with the
+    # routers (2026-08-06).  Parse time no longer runs any transport
+    # capability probe or MPI init, so there is nothing left to stub.
 
 
 def test_distributed_linalg_defaults(tmp_path, monkeypatch):

@@ -172,8 +172,6 @@ def compute_V_q_bispinor_g_flat_to_h5(
     bdot: np.ndarray | None = None,
     g_chunk: int | None = None,
     bgw_v_grid_fn=None,                         # only meaningful for the CC tile
-    backend=None,
-    use_ffi_io: bool | None = None,
     print_fn=print,
     verbose: bool = True,
     # IBZ cascade plumbing (default disabled — must opt in via gw_init).
@@ -213,7 +211,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
 
     # File creation + metadata (rank-0 + collective sync via SlabIO).
     with SlabIO(output_h5_path, mode="w", mesh=mesh_xy,
-                backend=backend, use_ffi_io=use_ffi_io) as io:
+) as io:
         io.write_attr("kgrid", np.asarray(kgrid, dtype=np.int64))
         io.write_attr("n_rmu_C", np.int64(n_rmu_C))
         io.write_attr("n_rmu_T", np.int64(n_rmu_T))
@@ -334,7 +332,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
             name = tile_dataset_name(mu_L, nu_L)
             v_logical_shape = (int(V_acc.shape[0]), n_rmu_L, n_rmu_R)
             with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
-                        backend=backend, use_ffi_io=use_ffi_io) as tile_io:
+) as tile_io:
                 tile_io.create_dataset(
                     name, shape=v_logical_shape, dtype=V_acc.dtype)
                 tile_io.write_slab(name, V_acc)
@@ -382,7 +380,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
             name = tile_dataset_name(mu_L, nu_L)
             v_logical_shape = (int(V_mix.shape[0]), n_rmu_T, n_rmu_T)
             with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
-                        backend=backend, use_ffi_io=use_ffi_io) as tile_io:
+) as tile_io:
                 tile_io.create_dataset(
                     name, shape=v_logical_shape, dtype=V_mix.dtype)
                 tile_io.write_slab(name, V_mix)
@@ -429,13 +427,13 @@ class BispinorVqReader:
     """
 
     def __init__(self, filename: Path | str, mesh_xy: Mesh,
-                 backend=None, use_ffi_io: bool | None = None):
+):
         from file_io.slab_io import SlabIO
         import h5py
         self._filename = Path(filename)
         self._mesh = mesh_xy
         self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy,
-                          backend=backend, use_ffi_io=use_ffi_io)
+)
         self._io.__enter__()
 
         # Small metadata scalars are written via SlabIO.write_attr (which

@@ -424,11 +424,13 @@ def plan_gflat_chunks(
            + _c128(mu, ngkmax, shard=p_x)               # ζ resharded on 'x'
            + _c128(mu, ngkmax, shard=p_y))              # ζ resharded on 'y'
 
-    # Stage F — the restart-tensor WRITE (isdf_tensors_<n_rmu>.h5).  On the
-    # H5PY_ALLGATHER SlabIO backend each written tensor lands UNSHARDED and
-    # TWICE (gathered device buffer + host numpy copy); the PHDF5 backends
-    # write per-rank hyperslabs and cost the sharded amount
-    # (``slab_io_replicates=False``).  TWO tensors cross this seam and the
+    # Stage F — the restart-tensor WRITE (isdf_tensors_<n_rmu>.h5).  SlabIO
+    # writes per-rank hyperslabs, so this costs the SHARDED amount
+    # (``slab_io_replicates=False``, which every in-tree caller now passes).
+    # The replicated branch below described the H5PY_ALLGATHER backend,
+    # where each tensor landed UNSHARDED and TWICE (gathered device buffer
+    # + host numpy copy); that backend was deleted 2026-08-06 and the
+    # branch is kept only so an archived plan can still be re-derived.  TWO tensors cross this seam and the
     # binder is the LARGER: V/W0 ``(n_q_ibz, μ, μ)`` and the G-flat ζ
     # ``(n_q_disk, μ, ngkmax)`` — whenever ngkmax > μ the ζ write wins.
     # Measured: memory-model.md §"Measured corrections behind the G-flat

@@ -48,7 +48,7 @@ def _to_host(arr) -> np.ndarray:
     Delegates to :func:`common.collectives.gather_to_host`.
 
     The docstring this replaces said it mirrored
-    ``file_io._slab_io_allgather._to_host`` — but that one uses
+    ``common.collectives.gather_to_host`` — but that one uses
     ``tiled=True`` and this one used ``tiled=False``, so it mirrored the
     reference incorrectly, and the same mis-citation appears in two other
     copies of the same body.  ``tiled=False`` raises on an array whose shards

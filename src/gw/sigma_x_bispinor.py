@@ -107,8 +107,6 @@ def compute_sigma_x_bispinor(
     bispinor_v_q_path: Path | str,
     meta,
     mesh_xy: Mesh,
-    backend=None,
-    use_ffi_io: bool | None = None,
     print_fn=print,
     verbose: bool = True,
 ) -> jax.Array:
@@ -143,7 +141,7 @@ def compute_sigma_x_bispinor(
         Path to ``v_q_bispinor.h5`` written by
         :func:`gw.v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5`.
 
-    meta, mesh_xy, backend, use_ffi_io
+    meta, mesh_xy
         Standard plumbing.
 
     Returns
@@ -174,7 +172,7 @@ def compute_sigma_x_bispinor(
     sig_x_b = None
     contributions: dict[tuple[int, int], float] = {}
     with BispinorVqReader(bispinor_v_q_path, mesh_xy,
-                          backend=backend, use_ffi_io=use_ffi_io) as reader:
+) as reader:
         for i in _TRANSVERSE_INDICES:
             for j in _TRANSVERSE_INDICES:
                 wfns_ij = _wfns_with_lorentz_vertices(wfns_transverse, i, j)

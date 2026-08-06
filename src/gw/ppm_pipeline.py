@@ -293,7 +293,6 @@ def _write_sigma_omega_h5(
             sigma_sx_kij_ev=RYD_TO_EV * sig_x,
             hartree_kij_ev=RYD_TO_EV * sig_h,
             mesh=mesh_xy,
-            backend=config.backend.slab_io,
         )
         return out_path
     # SlabIO handles rank-0 dispatch internally; both backends need
@@ -304,7 +303,6 @@ def _write_sigma_omega_h5(
         sigma_sx_kij_ev=RYD_TO_EV * sig_x,
         hartree_kij_ev=RYD_TO_EV * sig_h,
         mesh=mesh_xy,
-        backend=config.backend.slab_io,
     )
     return out_path
 

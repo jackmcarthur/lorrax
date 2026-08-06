@@ -78,8 +78,7 @@ _L3_MODULES = frozenset({
     # FFT kernels
     "common.fft_helpers",
     # the sharded-HDF5 transport (NOT the format readers above it)
-    "file_io.slab_io", "file_io._slab_io_ffi", "file_io._slab_io_allgather",
-    "file_io._slab_io_mpi_host", "file_io.paths",
+    "file_io.slab_io", "file_io._slab_io_ffi", "file_io.paths",
 })
 _L3_PACKAGES = ("ffi",)
 
@@ -728,19 +727,15 @@ def test_the_resolver_scan_can_fail():
 # the levels mean anything: a substrate module that reaches up into the GW
 # driver is not a substrate, it is part of GW with a misleading address.
 
-_L3_UPWARD_EXCEPTIONS = {
-    # ``SlabIOBackend`` — the enum that types the file-IO service's OWN
-    # backend parameter — is defined in the GW driver's 2.3 kLoC deck parser,
-    # so the transport imports it lazily at two sites with the comment
-    # "avoid circular import at module load", and slab_io's own public
-    # docstring tells users to ``from gw.gw_config import SlabIOBackend``.
-    #
-    # The audit called this a low-risk enum move.  It is not quite: the
-    # obvious new home, ``file_io``, imports jax and h5py at package scope,
-    # and gw_config is (nearly) jax-free by design.  The enum needs a home
-    # that neither package owns.  Numbered request.
-    ("file_io.slab_io", "gw.gw_config"): 2,
-}
+# EMPTY since 2026-08-06.  The one entry was ``SlabIOBackend`` — the enum
+# that typed the file-IO service's OWN backend parameter, defined in the GW
+# driver's 2.3 kLoC deck parser, which the transport imported lazily at two
+# sites with the comment "avoid circular import at module load".  The
+# numbered request asked where the enum should live, given that ``file_io``
+# imports jax and h5py at package scope while ``gw_config`` is (nearly)
+# jax-free.  The answer turned out to be nowhere: with one transport there
+# is no enum, so the uphill import is deleted rather than rehomed.
+_L3_UPWARD_EXCEPTIONS = {}
 
 _L2_UPWARD_EXCEPTIONS = {
     # ``from psp.dft_operators import apply_H_k_from_G``, module scope, used

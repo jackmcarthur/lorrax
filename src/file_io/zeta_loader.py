@@ -30,7 +30,6 @@ the r-space ζ itself).
 
 I/O backend: all data reads go through one :class:`SlabIO` handle, held
 open for the loader's lifetime to amortise open/close on the FFI
-backend.  ``backend`` takes the same :class:`~gw.gw_config.SlabIOBackend`
 value every other SlabIO consumer uses (``None`` = SlabIO's own
 auto-route).  Use as a context manager or call :meth:`close`.
 """
@@ -70,7 +69,6 @@ class ZetaLoader:
         path: str | Path,
         *,
         mesh: Mesh | None = None,
-        backend=None,
         mode: str = "r",
     ) -> None:
         self._path = str(path)
@@ -155,7 +153,7 @@ class ZetaLoader:
         # SlabIO handle (held open for the loader's lifetime so the
         # phdf5 FFI ctx is reused across reads).
         self._slab_io: SlabIO | None = SlabIO(
-            self._path, mode=mode, mesh=mesh, backend=backend)
+            self._path, mode=mode, mesh=mesh)
 
     # ------------------------------------------------------------------
     def close(self) -> None:

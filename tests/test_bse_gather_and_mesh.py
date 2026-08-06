@@ -293,7 +293,7 @@ def test_every_hand_rolled_gather_wrapper_delegates(monkeypatch, modname, fname)
     them exactly that (``bse_davidson_helpers.init_bse_subspace`` on the
     loader's k-sharded ``eps_c``/``eps_v``; ``davidson_absorption`` on
     ``eigvecs``).  Three of the five also cited
-    ``file_io._slab_io_allgather._to_host`` as the pattern they mirrored, but
+    ``common.collectives.gather_to_host`` as the pattern they mirrored, but
     that one uses ``tiled=True``, so the citation was wrong too.  One
     implementation, one branch, one explanation.
     """

@@ -265,7 +265,7 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
     if source == "stored":
         v_h = load_hartree_submatrix(
             path, band_slices.b0, band_slices.b3,
-            mesh=mesh_xy, backend=config.backend.slab_io)
+            mesh=mesh_xy)
         print_fn("  V_H: exact FFT-grid matrix read from kin_ion.h5's "
                  "'v_hartree' dataset; the ISDF quadrature is not used.")
     elif source == "gspace":
@@ -401,7 +401,6 @@ def compute_sigma_xc(
     # V-only path so PPM / X_ONLY modes never invoke the W-touching
     # kernels and the two paths each get their own jit-cached graph.
     W_static = W_by_role.get("static", V_q)
-    backend = config.backend.slab_io
     if mode is ComputeMode.COHSEX:
         cohsex = compute_cohsex_sigma(
             wfns, V_q, W_static, meta, mesh_xy,
@@ -411,7 +410,6 @@ def compute_sigma_xc(
             compute_bare_x=True,
             wfns_transverse=wfns_transverse,
             bispinor_v_q_path=bispinor_v_q_path,
-            backend=backend,
         )
     else:
         cohsex = compute_v_h_sigma_x(
@@ -420,7 +418,6 @@ def compute_sigma_xc(
             static_head_terms=static_head_terms,
             wfns_transverse=wfns_transverse,
             bispinor_v_q_path=bispinor_v_q_path,
-            backend=backend,
         )
     sig_h = cohsex["sig_h"]
     sig_x = cohsex["sig_x"]

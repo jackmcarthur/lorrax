@@ -698,60 +698,41 @@ def _read_wq_sharded(
 # SlabIO path is taken for the PHDF5 tiers only.
 
 
-def _bse_slab_io_backend(input_file: Optional[str], log_fn=print):
-    """Resolve the SlabIO backend for a BSE deck, or ``None``.
+def _bse_slabio_usable(log_fn=print) -> bool:
+    """Can this process move the restart tensors through SlabIO?
 
-    ``None`` means "stay on the serial h5py readers": either there is no
-    deck to ask (``input_file=None`` — several BSE entry points and every
-    unit test call the loader with a bare restart path), or the resolved
-    tier is the allgather one, which this module does not use (see the
-    block comment above).
+    NOT a transport preference any more.  This used to read the deck's
+    ``slab_io`` key through ``gw_config.resolve_slab_io_backend`` and
+    return ``None`` for the allgather tier, because ``bse/`` declined to
+    use that tier.  There is one transport now and no deck key, so the
+    only remaining question is a capability one — and it is asked of the
+    stack, not of the input file.  ``input_file`` is no longer a
+    parameter: several BSE entry points and every unit test call the
+    loader with a bare restart path and no deck, and that never had
+    anything to do with which transport is correct.
 
-    The decision itself is NOT made here.  ``gw_config.
-    resolve_slab_io_backend`` is the single source — the same function
-    ``LorraxConfig.from_input_file`` uses — because ``SlabIO``'s own
-    refusal tells driver-chain callers to take the backend from the
-    resolved config and not re-derive it, and a second copy of the
-    precedence chain in ``bse/`` is exactly the drift that warning is
-    about.
+    THE SERIAL READERS ARE NOT A TIER.  A False here does not select a
+    rank-0 gather — there is no such thing in this module.  It selects
+    the h5py tile readers above, which hyperslab exactly this rank's
+    (μ, ν) tile, allgather nothing, and are memory-correct at any
+    process count.  They are ~17x slower (0.17 GiB/s measured at P=4,
+    CLAIMS 76, against 2.919 GiB/s for the phdf5 tile path at 16 ranks,
+    CLAIMS 69) because they issue nq × μ/px short row-runs one at a time
+    with no collective buffering.  Slow and correct is a legitimate
+    fallback; the tier this file used to refuse was neither.
 
-    An UNREADABLE DECK is not fatal — it logs and returns ``None``, and
-    the loader runs on the serial readers as it always has, because
-    those readers are correct and a BSE run should not die over a
-    transport preference it could not look up.
-
-    **A REFUSAL FROM THE RESOLVER IS NOT CAUGHT.**  That distinction is
-    the whole of the error handling here.  `resolve_slab_io_backend`
-    raises for exactly two reasons — a deck naming `h5py_allgather`
-    above one process, and `slab_io=auto` finding no parallel tier above
-    one process — and both are deliberate, owner-ruled refusals with
-    repair instructions in them.  Catching them would turn the tree's
-    loudest transport rule into a silent fall-through in `bse/`, which
-    is the antipattern the rule itself exists to delete.  The BSE run
-    stops, exactly as the GW driver stops on the same deck.
+    Announced when it declines, because "which transport ran" is the
+    single most consequential thing about a large run's I/O profile and
+    a silent 17x is indistinguishable from a hang.
     """
-    if input_file is None or not os.path.isfile(input_file):
-        return None
-    from gw.gw_config import (read_lorrax_input, resolve_slab_io_backend,
-                              SlabIOBackend)
-    try:
-        # ``read_lorrax_input`` already fills every key from ``_DEFAULTS``,
-        # so an absent ``slab_io`` arrives here as "auto" — the same value
-        # ``from_input_file`` would have seen.
-        params = read_lorrax_input(input_file)
-    except Exception as exc:                       # noqa: BLE001
-        log_fn(f"BSE-sharded: cannot read {input_file} "
-               f"({type(exc).__name__}: {exc}); reading the restart with "
-               f"the serial h5py tile readers (memory-correct; measured "
-               f"~2x slower than the SlabIO path on Lustre at 16 ranks, "
-               f"CLAIMS 128).")
-        return None
-    backend = resolve_slab_io_backend(
-        params.get("slab_io", "auto"), params.get("use_ffi_io"),
-        print_fn=log_fn)
-    if backend is SlabIOBackend.H5PY_ALLGATHER:
-        return None
-    return backend
+    from file_io.slab_io import probe_availability
+    ok, stage, reason = probe_availability()
+    if not ok:
+        log_fn(f"BSE-sharded: SlabIO unavailable at probe stage '{stage}' "
+               f"({reason}); reading the restart with the serial h5py tile "
+               f"readers -- memory-correct (per-rank tiles, no allgather) "
+               f"and ~17x slower (CLAIMS 76 vs 69).")
+    return ok
 
 
 class _MunuSlabPlan:
@@ -932,8 +913,7 @@ def _read_bse_tensors(
     GW driver; it is stated here because a divergence would present as a
     hang inside ``H5Fopen`` rather than as an error.
     """
-    backend = _bse_slab_io_backend(input_file, log_fn=log_fn)
-    if backend is None:
+    if not _bse_slabio_usable(log_fn=log_fn):
         with h5py.File(restart_file, "r") as f:
             vq_dset = f[vq_key]
             wq_dset = f[wq_key]
@@ -959,10 +939,9 @@ def _read_bse_tensors(
     from file_io.slab_io import SlabIO
     vq_plan = _MunuSlabPlan(vq_shape, kgrid)
     wq_plan = _MunuSlabPlan(wq_shape, kgrid)
-    log_fn(f"BSE-sharded: restart tensors via SlabIO backend="
-           f"{getattr(backend, 'value', backend)} "
+    log_fn(f"BSE-sharded: restart tensors via SlabIO "
            f"({os.path.basename(restart_file)})")
-    with SlabIO(restart_file, mode="r", mesh=mesh_xy, backend=backend) as io:
+    with SlabIO(restart_file, mode="r", mesh=mesh_xy) as io:
         psi_v_X = _slabio_read_psi(io, "psi_full_y", psi_shape, val_indices,
                                    "x", mesh_xy, n_rmu_pad)
         psi_c_X = _slabio_read_psi(io, "psi_full_y", psi_shape, cond_indices,

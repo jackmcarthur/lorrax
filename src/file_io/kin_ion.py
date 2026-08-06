@@ -172,7 +172,6 @@ def load_hartree_submatrix(
 	band_stop: int,
 	*,
 	mesh: Mesh | None = None,
-	backend=None,
 ) -> jax.Array:
 	"""Read the stored exact ⟨mk|V_H|nk⟩ sub-window, replicated (Ry).
 
@@ -200,7 +199,7 @@ def load_hartree_submatrix(
 			f"{HARTREE_DATASET} only has {nb_total}.  Regenerate kin_ion.h5 "
 			f"with at least -n {band_stop}.")
 	nb = band_stop - band_start
-	with SlabIO(h5_path, mode="r", mesh=mesh, backend=backend) as io:
+	with SlabIO(h5_path, mode="r", mesh=mesh) as io:
 		return io.read_slab(
 			HARTREE_DATASET,
 			shape=(nk, nb, nb),
@@ -281,7 +280,6 @@ def load_kin_ion_submatrix(
 	band_stop: int,
 	*,
 	mesh: Mesh | None = None,
-	backend=None,
 ) -> jax.Array:
 	"""Read the [band_start, band_stop) sub-window of ``kin_ion`` replicated.
 
@@ -303,11 +301,10 @@ def load_kin_ion_submatrix(
 		0-based half-open band window; ``band_stop > band_start`` and
 		``band_stop ≤ nb_total``.
 	mesh
-		Device mesh.  Required by ``SlabIOBackend.PHDF5_FFI``; the
+		Device mesh.  Required; every slab read is collective over it.
 		allgather backend tolerates ``None`` and returns a host-backed
 		replicated JAX array.
 	backend
-		``SlabIOBackend`` selecting the underlying I/O path; defaults to
 		the allgather backend.
 
 	Returns
@@ -335,7 +332,7 @@ def load_kin_ion_submatrix(
 		)
 
 	nb = band_stop - band_start
-	with SlabIO(h5_path, mode="r", mesh=mesh, backend=backend) as io:
+	with SlabIO(h5_path, mode="r", mesh=mesh) as io:
 		arr = io.read_slab(
 			"kin_ion",
 			shape=(nk, nb, nb),

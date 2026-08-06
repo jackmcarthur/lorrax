@@ -119,6 +119,26 @@ _STRIPE_UNIT_MIN = 1 << 20
 _STRIPE_UNIT_MAX = 4 << 20
 
 
+#: The boolean env grammar, ONE copy.  Mirrors the C++ writer's
+#: ``env_flag`` (``ffi/cpp/phdf5/context.cc``) so the Python and C++ halves
+#: of the phdf5 writer stay one grammar.  Inherited from the deleted
+#: ``_slab_io_mpi_host`` (which carried it for the same reason, when there
+#: were two Python writers); this file already spelled the same tuple
+#: inline three times, so the move consolidated rather than relocated.
+#: Kept local rather than taken from ``gw.gw_config``: that would be an
+#: uphill L3 -> L1 import, which is exactly what this change deleted.
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """``name`` as a boolean, ``default`` when unset or empty."""
+    v = os.environ.get(name)
+    if v is None or not v.strip():
+        return default
+    return v.strip().lower() in _TRUE
+
+
 def _stripe_policy(nranks: int) -> tuple[int, int]:
     """``(striping_factor, striping_unit_bytes)`` for a world of ``nranks``.
 
@@ -484,12 +504,10 @@ def _assert_mpi_world(mesh, *, mpi_size=None, probe_detail=None,
     and ``probe_detail`` instead, skipping the probe: same comparison,
     one less ABI guess.
     """
-    if os.environ.get("LORRAX_PHDF5_SKIP_MPI_WORLD_CHECK", "").strip() in (
-            "1", "true", "yes", "on"):
+    if _env_flag("LORRAX_PHDF5_SKIP_MPI_WORLD_CHECK", False):
         return
     require = os.environ.get(
-        "LORRAX_PHDF5_REQUIRE_MPI_WORLD", "").strip().lower() not in (
-            "0", "false", "no", "off")
+        "LORRAX_PHDF5_REQUIRE_MPI_WORLD", "").strip().lower() not in _FALSE
     if tier not in _MPI_WORLD_VERDICT:
         if mpi_size is None:
             mpi_size, probe_detail = _probe_mpi_world_size()
@@ -505,6 +523,314 @@ def _assert_mpi_world(mesh, *, mpi_size=None, probe_detail=None,
         raise RuntimeError(msg)
     if verdict == "unprobed" and _rank0():
         print(f"  [SlabIO] WARNING: {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Availability — one probe, one refusal, no tiers
+# ---------------------------------------------------------------------------
+#: Where the contract is written down.  Quoted by the refusal: a refusal
+#: that does not name its doc sends the reader to grep.
+_SLAB_IO_DOC = "docs/architecture/slab_io.md#the-contract"
+
+#: Fix prose per FAILED PROBE, keyed by the stage the chain stopped at,
+#: because that is what decides the repair — and ``probe_target``'s three
+#: states are three DIFFERENT repairs, which is why the refusal quotes its
+#: reason verbatim rather than reducing it to a bool.
+_SLAB_IO_FIX = {
+    "loader": (
+        "the FFI loader itself did not import, so no probe ever ran.  "
+        "Check that PYTHONPATH reaches <lorrax>/src before looking at any "
+        "library -- src/ffi/cpp/run_shifter.sh sets it for you."),
+    "probe": (
+        "probe_target's reason above is three-way, and each state is a "
+        "DIFFERENT repair:\n"
+        "            * 'unknown target'      -- this platform's library "
+        "never carried the handler.  Rebuild it (GPU leg "
+        "src/ffi/cpp/build.sh, CPU leg config/perlmutter/build_ffi_host.sh) "
+        "and re-stage.\n"
+        "            * 'could not be loaded' -- the .so may be perfectly "
+        "good; the loader could not open it.  Fix LD_LIBRARY_PATH / the "
+        "Shifter bind-mounts, and measure INSIDE the container: a "
+        "login-node ldd lies about this closure (slab_io.md, Failure "
+        "modes).\n"
+        "            * 'does not export'     -- a stale .so is first on "
+        "the path.  Read the PROVENANCE file stamped beside it "
+        "(src/ffi/cpp/stage/stamp_provenance.sh) and compare it with the "
+        "build you meant to be running."),
+    "mpi": (
+        "the write handler IS present; MPI could not bootstrap, which is a "
+        "LAUNCHER fact and not a library one.  Launch under a "
+        "PMI-providing launcher: on Perlmutter/Shifter that is "
+        "`srun --mpi=cray_shasta` (pmi2 and pmix both yield singleton MPI "
+        "against shifter's Cray MPICH -- src/ffi/cpp/run_shifter.sh).  A "
+        "bare `python3` inside an salloc has every SLURM variable and no "
+        "PMI server, and is not a supported multi-rank launch."),
+}
+
+#: PMI/PMIx variable spellings a launcher (srun --mpi=pmi2/pmix,
+#: mpiexec.hydra, mpirun) leaves in the environment.  Prefix-matched so the
+#: versioned PMIx names (PMIX_SERVER_URI21, ...) are covered.  Plain SLURM
+#: batch variables (SLURM_JOB_ID etc.) are deliberately NOT in this list: a
+#: bare ``python`` inside an sbatch allocation has all of those and still no
+#: PMI server to register with — that is exactly the failing launch shape.
+_MPI_LAUNCHER_ENV_PREFIXES = ("PMI_", "PMIX_")
+_MPI_LAUNCHER_ENV_VARS = ("HYDI_CONTROL_FD",)
+
+#: ``(ok, stage, reason)`` from the first probe in this process.  The answer
+#: cannot change afterwards and the probe can cost a subprocess, so it runs
+#: once.
+_AVAILABILITY: "tuple[bool, str, str] | None" = None
+
+
+def _mpi_launcher_env() -> "str | None":
+    """The first launcher PMI/PMIx variable present, else None."""
+    for name in _MPI_LAUNCHER_ENV_VARS:
+        if os.environ.get(name):
+            return name
+    for name in sorted(os.environ):
+        if name.startswith(_MPI_LAUNCHER_ENV_PREFIXES):
+            return name
+    return None
+
+
+def _mpi_singleton_probe(child_code: str, what: str,
+                         argv_extra=(), timeout_s: float = 60.0
+                         ) -> tuple[bool, str]:
+    """``(ok, reason)`` — run ``child_code`` in a THROWAWAY subprocess.
+
+    Why a subprocess: on a bare launch (no PMI environment) whether
+    ``MPI_Init_thread`` works as a singleton is a property of the MPI
+    stack, and on the production stack it does not fail catchably — Intel
+    MPI 2020 calls ``abort()`` inside ``MPIR_pmi_init`` (job 7884926), so
+    an in-process probe kills the run it was meant to protect.  The child
+    runs exactly the init the tier would run; the probe survives the
+    child's death.  Only reached on the bare-launch path, so the ~1 s
+    child never costs a production srun/mpirun start anything.
+
+    Never raises.  A hung child (the init blocking rather than aborting)
+    is killed at ``timeout_s`` and reported as not bootstrappable — the
+    conservative direction.
+    """
+    import subprocess
+    import sys
+    try:
+        res = subprocess.run(
+            [sys.executable, "-c", child_code, *argv_extra],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return False, (f"the singleton {what} probe hung for {timeout_s:.0f} s "
+                       f"and was killed")
+    except Exception as exc:                          # pragma: no cover
+        return False, (f"the singleton {what} probe could not run "
+                       f"({type(exc).__name__}: {exc})")
+    if res.returncode == 0:
+        return True, f"singleton {what} succeeded in a probe subprocess"
+    return False, (f"singleton {what} exited rc={res.returncode} in a probe "
+                   f"subprocess (Intel MPI aborts in MPIR_pmi_init on a "
+                   f"PMI-less launch)")
+
+
+def _probe_mpi_bootstrap(platform: str) -> tuple[bool, str]:
+    """``(bootstrappable, how)`` for this tier's own MPI init.
+
+    A launcher PMI environment settles it — that is the environment every
+    green multi-rank run had (CLAIMS rows 3, 17).  Without one, probe the
+    exact call the tier would make (``lrx_phdf5_init_mpi`` in the loaded
+    .so) in a throwaway subprocess; see :func:`_mpi_singleton_probe`.
+
+    NOTE what this does and does not prove.  A PMI environment proves a
+    launcher registered this process; it does NOT prove the PMI flavour
+    matches the MPI library.  A mismatch (``srun --mpi=pmi2`` against
+    Shifter's Cray MPICH) yields singleton MPI — every rank sees
+    ``MPI_Comm_size()==1`` — which no probe here detects.  That one is
+    caught later and unconditionally by :func:`_assert_mpi_world`, at the
+    first collective open, against the LIVE communicator.
+    """
+    var = _mpi_launcher_env()
+    if var is not None:
+        return True, f"launcher PMI environment present ({var})"
+    try:
+        from ffi.common.ffi_loader import loaded_lib_path
+        so = loaded_lib_path(platform)
+    except Exception as exc:                          # pragma: no cover
+        return False, f"ffi_loader unavailable ({type(exc).__name__}: {exc})"
+    if not so:
+        return False, (f"no loaded {platform} FFI library to probe MPI init "
+                       f"with")
+    child = ("import ctypes, sys\n"
+             "lib = ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)\n"
+             "lib.lrx_phdf5_init_mpi()\n")
+    return _mpi_singleton_probe(child, f"MPI_Init_thread ({platform} FFI)",
+                                argv_extra=(so,))
+
+
+def probe_availability(platform: str | None = None) -> tuple[bool, str, str]:
+    """``(ok, stage, reason)`` — can this process write one tile per rank?
+
+    Two things must hold, and they fail for unrelated reasons, so the
+    stage is reported alongside the verdict:
+
+    1. this platform's FFI library exports ``lorrax_phdf5_write``.  Probed
+       with :func:`ffi_loader.probe_target`, not a bare ``has_target``:
+       its three-state reason separates "never built with the handler"
+       (rebuild) from "could not be loaded" (``LD_LIBRARY_PATH``) from
+       "a stale .so is first on the path" — a distinction that cost
+       workstream P a day, and the distinction the refusal's *fix* line
+       is keyed on.
+    2. MPI can bootstrap here.  Handler presence is NOT capability: the
+       write calls ``MPI_Init_thread``, and on a bare launch with no PMI
+       environment Intel MPI aborts the process inside ``MPIR_pmi_init``
+       (job 7884926 — the fastloop's bare P=1 gw stage died at the first
+       collective H5Fcreate).
+
+    Cached per process; the answer cannot change and probing can cost a
+    subprocess.
+    """
+    global _AVAILABILITY
+    if _AVAILABILITY is not None:
+        return _AVAILABILITY
+    if platform is None:
+        platform = "cpu" if jax.default_backend() == "cpu" else "CUDA"
+    stage, reason = "probe", "ffi.common.ffi_loader import failed"
+    try:
+        from ffi.common.ffi_loader import probe_target
+        ok, reason = probe_target("lorrax_phdf5_write", platform)
+    except Exception as exc:                          # pragma: no cover
+        ok, stage, reason = False, "loader", f"{type(exc).__name__}: {exc}"
+    if ok:
+        mpi_ok, mpi_how = _probe_mpi_bootstrap(platform)
+        if not mpi_ok:
+            ok, stage = False, "mpi"
+            reason = (f"the {platform} FFI exports the write handler but MPI "
+                      f"cannot bootstrap in this process: {mpi_how}")
+        else:
+            reason = f"{reason}; MPI can bootstrap ({mpi_how})"
+    _AVAILABILITY = (bool(ok), stage, reason)
+    return _AVAILABILITY
+
+
+def assert_available(platform: str | None = None) -> None:
+    """Refuse, naming the failed probe, if the tile path cannot run here.
+
+    THE ONLY REFUSAL LEFT ON THIS AXIS.  There used to be three tiers and
+    a router, and the router's job was to pick a lesser transport when
+    this probe failed; the lesser transports are gone (see
+    ``file_io.slab_io``'s module docstring), so a failed probe is now a
+    plain "this deployment cannot do the thing" and says which part.
+
+    Nothing here is about process count.  The old refusals all keyed on
+    ``process_count() > 1`` because the tier they guarded was legal at
+    exactly one process; this one is not legal-at-P=1-only, it is the
+    only path there is, so it either works or the deployment is broken.
+    """
+    ok, stage, reason = probe_availability(platform)
+    if ok:
+        return
+    raise RuntimeError(
+        "\n*** SlabIO REFUSED: this stack cannot write one tile per rank. "
+        "***\n"
+        f"  rule    one rank writes one tile, and nothing larger than one "
+        f"rank's tile is ever materialised (owner ruling 2026-08-05).  "
+        f"There is exactly one transport that does this and it is not "
+        f"available here.\n"
+        f"  got     probe stage '{stage}': {reason}\n"
+        f"          [{_slab_io_geometry()}]\n"
+        f"  wanted  the platform FFI library exports 'lorrax_phdf5_write' "
+        f"AND MPI_Init_thread succeeds in this process.\n"
+        f"  fix     {_SLAB_IO_FIX.get(stage, _SLAB_IO_FIX['probe'])}\n"
+        f"  doc     {_SLAB_IO_DOC}")
+
+
+def _slab_io_geometry() -> str:
+    """The run geometry, as a one-line fragment for the refusal.
+
+    Printed WITH the decision, on purpose.  No archived multi-node log
+    records a node count, so settling "does phdf5 work across nodes"
+    needed an archaeology pass rather than a grep.  The geometry belongs
+    next to the decision it qualifies.
+
+    SLURM's own node count is reported when present but is NOT the
+    primary source, and the spelling matters.  Measured inside the
+    Shifter container on Perlmutter, 2026-08-05, ``srun -N 4 -n 16``:
+    ``SLURM_NNODES=4``, ``SLURM_NTASKS=16`` and ``SLURM_JOB_NODELIST``
+    are all present, while ``SLURM_JOB_NUM_NODES`` is ABSENT — it is a
+    batch/allocation-level variable, not a step-level one.  JAX's own
+    process/device counts do not depend on the launcher's vocabulary at
+    all, so they come first.
+    """
+    parts = []
+    try:
+        parts.append(f"processes={jax.process_count()}")
+        parts.append(f"devices={jax.device_count()}")
+        parts.append(f"local_devices={jax.local_device_count()}")
+    except Exception:                                 # pragma: no cover
+        parts.append("jax process/device counts unavailable")
+    for _k in ("SLURM_JOB_NUM_NODES", "SLURM_NNODES", "SLURM_NTASKS"):
+        _v = os.environ.get(_k)
+        if _v:
+            parts.append(f"{_k}={_v}")
+    return ", ".join(parts)
+
+
+def mesh_divisible_shape(shape, mesh, partition_spec) -> tuple[int, ...]:
+    """``shape`` rounded UP so it is shardable by ``partition_spec``.
+
+    The one place the rounding rule lives.  ``read_slab`` applies it when
+    a caller omits ``shape``, which is what makes the easy call the
+    correct call — see :meth:`SlabIO.read_slab`.  Exposed because a
+    caller that must ALLOCATE a matching buffer (a consumer padding its
+    own μ extent) needs the same number and must not re-derive it.
+    """
+    axis_count_per_dim, axis_flat = _sharding_to_axis_info(
+        NamedSharding(mesh, partition_spec), len(shape))
+    out = [int(s) for s in shape]
+    flat = 0
+    for d in range(len(out)):
+        n_ax = axis_count_per_dim[d]
+        if n_ax <= 0:
+            continue
+        div = 1
+        for k in range(n_ax):
+            div *= int(mesh.shape[mesh.axis_names[axis_flat[flat + k]]])
+        flat += n_ax
+        out[d] = -(-out[d] // div) * div          # ceil to a multiple of div
+    return tuple(out)
+
+
+def _local_shard_and_global_offset(
+    A: jax.Array,
+) -> tuple[np.ndarray, tuple[int, ...]]:
+    """Return ``(local_numpy, global_offset)`` for the process-local shard.
+
+    LORRAX runs one JAX device per process under multi-process (mesh on
+    ``mesh_xy``), so each process has exactly one addressable shard.
+
+    The shard's ``.index`` is a tuple of ``slice`` objects giving the
+    GLOBAL start/stop along each axis.  Slabs are always contiguous
+    along each axis (no broadcast tiling) so ``.start`` is the offset
+    within A.shape.  Replicated axes give ``slice(0, A.shape[ax])`` —
+    every process holds the full axis and writes the same overlapping
+    rows; under independent MPI-IO that's a redundant write but
+    semantically correct (every rank writes identical bytes).
+    """
+    shards = A.addressable_shards
+    if len(shards) != 1:
+        # Multi-device-per-process (e.g. GPU with N visible devices
+        # under a single process).  Not the LORRAX CPU mesh-xy regime
+        # but worth a clear error rather than silent wrong data.
+        raise RuntimeError(
+            f"SlabIO expects 1 addressable shard per process; "
+            f"got {len(shards)} for A.shape={tuple(A.shape)}.  Did you "
+            f"set --xla_force_host_platform_device_count > 1 on a "
+            f"multi-process run?")
+    shard = shards[0]
+    local = np.asarray(shard.data)
+    # Replicated axes have ``slice(None, None)`` (no explicit bounds);
+    # treat ``start=None`` as 0 (the full-axis slab starts at 0).
+    offset = tuple(int(s.start) if s.start is not None else 0
+                   for s in shard.index)
+    return local, offset
 
 
 def _shard_read_plan(
@@ -1004,6 +1330,13 @@ class _FfiBackend(_DatasetGeometry):
         self._close_file = _close_file
         self._loader = _loader
 
+        # Refuse HERE, before the inode is touched, if this stack cannot
+        # serve the tile path.  One probe, cached per process.  There is
+        # nothing to demote to, which is the whole 2026-08-06 change: the
+        # router that used to answer this question by picking a lesser
+        # transport has no lesser transport left to pick.
+        assert_available()
+
         self.path = path
         self.mesh = mesh
         self.mode = mode
@@ -1026,9 +1359,7 @@ class _FfiBackend(_DatasetGeometry):
         # has, so the hints are a no-op there; export anyway so the log
         # line and the environment agree on every path.
         _sc, _su = _export_striping_env()
-        if mode == "w" and _rank0() and os.environ.get(
-                "LORRAX_PHDF5_LOG", "1").strip().lower() not in (
-                    "0", "false", "no", "off"):
+        if mode == "w" and _rank0() and _env_flag("LORRAX_PHDF5_LOG", True):
             print(f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} mode={mode} "
                   f"ranks={jax.process_count()} stripe_count={_sc} "
                   f"stripe_unit={_su} B (policy; "
@@ -1222,7 +1553,6 @@ class _FfiBackend(_DatasetGeometry):
         valid_shape: Sequence[int] | None = None,
         dtype=None,
         chunks: Sequence[int] | None = None,
-        k_chunk_size: int | None = None,
     ) -> None:
         if not isinstance(A, jax.Array):
             A = jnp.asarray(A)
@@ -1321,6 +1651,19 @@ class _FfiBackend(_DatasetGeometry):
     # ------------------------------------------------------------------
     # FFI read padding contract: output ``shape`` is equal-block
     # sharded; C++ reads only ``valid_shape`` and zero-fills the rest.
+    def padded_shape_for(self, name: str, *, mesh: Mesh, partition_spec: P
+                         ) -> tuple[int, ...]:
+        """The dataset's shape rounded UP to be shardable by ``partition_spec``.
+
+        What ``SlabIO.read_slab`` uses when the caller omits ``shape``.
+        Kept on the backend rather than in ``slab_io.py`` because it needs
+        the dataset geometry, which only the backend knows; the rounding
+        rule itself is :func:`mesh_divisible_shape`, single-sourced.
+        """
+        self._drain_pending()
+        ds_shape, _ = self._dataset_geom(name)
+        return mesh_divisible_shape(ds_shape, mesh, partition_spec)
+
     def read_slab(
         self,
         name: str,

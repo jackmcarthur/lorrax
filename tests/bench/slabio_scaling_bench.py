@@ -95,7 +95,6 @@ p0(f"[bench] phase={args.phase} tag={args.tag} ranks={NPROC} "
    f"nodes={NNODES} mesh={dict(mesh.shape)} MPI_Comm_size={_sz.value}")
 p0(f"[bench] nodelist={NODELIST}")
 
-from gw.gw_config import SlabIOBackend                      # noqa: E402
 from file_io.slab_io import SlabIO                          # noqa: E402
 
 SPEC = P("x", "y")
@@ -168,8 +167,7 @@ for ci, cfg in enumerate(CONFIGS):
         if args.phase in ("write", "both"):
             sync_global_devices(f"w-{ci}-{rep}")
             t0 = time.perf_counter()
-            with SlabIO(path, mode="w", mesh=mesh,
-                        backend=SlabIOBackend.PHDF5_FFI) as io:
+            with SlabIO(path, mode="w", mesh=mesh) as io:
                 io.create_dataset("A", shape=(NR * NS, NC),
                                   dtype=jnp.complex128)
                 for s in range(NS):
@@ -184,8 +182,7 @@ for ci, cfg in enumerate(CONFIGS):
                 continue
             sync_global_devices(f"r-{ci}-{rep}")
             t0 = time.perf_counter()
-            with SlabIO(path, mode="r", mesh=mesh,
-                        backend=SlabIOBackend.PHDF5_FFI) as io:
+            with SlabIO(path, mode="r", mesh=mesh) as io:
                 for s in range(NS):
                     B = io.read_slab("A", shape=(NR, NC),
                                      dtype=jnp.complex128,

@@ -152,7 +152,6 @@ def fit_zeta_to_h5(
     band_range_right: tuple[int, int] | None = None,
     band_norms: np.ndarray | None = None,
     *,
-    slab_io_backend=None,
     gspace_mode: str = "host_cache",
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
@@ -226,9 +225,6 @@ def fit_zeta_to_h5(
     reuse it for :func:`gw.wavefunction_bundle.build_wavefunctions` after
     the fit completes.
     """
-    from gw.gw_config import SlabIOBackend
-    if slab_io_backend is None:
-        slab_io_backend = SlabIOBackend.H5PY_ALLGATHER
 
     # P0 — entry of ζ-fit.  Captures the persistent state set up by
     # ``prepare_isdf_and_wavefunctions`` BEFORE ζ-fit starts: ψ at
@@ -800,7 +796,7 @@ def fit_zeta_to_h5(
         _n_G_sph = (int(_gflat_ngkmax)
                      if _gflat_ngkmax is not None else n_rtot)
         zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy,
-                         backend=slab_io_backend)
+                         )
         zeta_io.create_dataset(
             'zeta_q_G',
             shape=(n_q_disk, n_rmu, _n_G_sph),

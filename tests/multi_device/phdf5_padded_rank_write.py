@@ -163,7 +163,6 @@ from jax.sharding import NamedSharding, PartitionSpec as P    # noqa: E402
 from common.collectives import (process_count, process_rank,  # noqa: E402
                                 resolve_mesh)
 from file_io.slab_io import SlabIO                            # noqa: E402
-from gw.gw_config import SlabIOBackend                        # noqa: E402
 
 CASE = os.environ.get("PADRANK_CASE", "repro")
 N_Q = int(os.environ.get("PADRANK_NQ", "2"))
@@ -400,8 +399,7 @@ def main():
     # iff THIS rank refused.  A rank that neither refuses nor returns is
     # the failure the case exists to catch, and it presents as a hang.
     if CASE == "oob_write":
-        with SlabIO(PATH, mode="w", mesh=mesh,
-                    backend=SlabIOBackend.PHDF5_FFI) as io:
+        with SlabIO(PATH, mode="w", mesh=mesh) as io:
             io.create_dataset("zeta_like", shape=(N_Q, mu, N_G),
                               dtype=jnp.complex128)
             p0(f"[padrank-gate] issuing the overrunning write: "
@@ -437,8 +435,7 @@ def main():
         jax.experimental.multihost_utils.sync_global_devices("implicit_unlink")
 
         # (a) the pre-ruling spelling: state the logical extent three times.
-        with SlabIO(p_old, mode="w", mesh=mesh,
-                    backend=SlabIOBackend.PHDF5_FFI) as io:
+        with SlabIO(p_old, mode="w", mesh=mesh) as io:
             io.create_dataset("zeta_like", shape=(N_Q, mu, N_G),
                               dtype=jnp.complex128)
             io.write_slab("zeta_like", A,
@@ -446,16 +443,14 @@ def main():
                           global_shape=(N_Q, mu, N_G),
                           valid_shape=(N_Q, mu, N_G))
         # (b) the ruling's spelling: state it once, to create_dataset.
-        with SlabIO(p_new, mode="w", mesh=mesh,
-                    backend=SlabIOBackend.PHDF5_FFI) as io:
+        with SlabIO(p_new, mode="w", mesh=mesh) as io:
             io.create_dataset("zeta_like", shape=(N_Q, mu, N_G),
                               dtype=jnp.complex128)
             io.write_slab("zeta_like", A)
         jax.experimental.multihost_utils.sync_global_devices("implicit_written")
 
         # Read both spellings back off the IMPLICIT file, padded + mu-sharded.
-        with SlabIO(p_new, mode="r", mesh=mesh,
-                    backend=SlabIOBackend.PHDF5_FFI) as io:
+        with SlabIO(p_new, mode="r", mesh=mesh) as io:
             r_exp = io.read_slab("zeta_like", shape=(N_Q, mu_pad, N_G),
                                  dtype=np.complex128, offset=(0, 0, 0),
                                  valid_shape=(N_Q, mu, N_G), mesh=mesh,
@@ -503,8 +498,7 @@ def main():
         sys.stdout.flush()
         return 0 if ok else 1
 
-    with SlabIO(PATH, mode="w", mesh=mesh,
-                backend=SlabIOBackend.PHDF5_FFI) as io:
+    with SlabIO(PATH, mode="w", mesh=mesh) as io:
         io.create_dataset("zeta_like", shape=(N_Q, mu, N_G),
                           dtype=jnp.complex128)
         io.write_slab("zeta_like", A)
@@ -538,8 +532,7 @@ def main():
 
         # (2) read_slab must refuse first, by name, on THIS rank.
         try:
-            with SlabIO(PATH, mode="r", mesh=mesh,
-                        backend=SlabIOBackend.PHDF5_FFI) as io:
+            with SlabIO(PATH, mode="r", mesh=mesh) as io:
                 io.read_slab("zeta_like",
                              shape=(N_Q, mu, N_G),
                              dtype=np.complex128,
@@ -566,8 +559,7 @@ def main():
     # the zero fill.  Every rank checks its OWN block, so a rank that gets
     # someone else's data fails on that rank.
     if CASE == "read_pad":
-        with SlabIO(PATH, mode="r", mesh=mesh,
-                    backend=SlabIOBackend.PHDF5_FFI) as io:
+        with SlabIO(PATH, mode="r", mesh=mesh) as io:
             out = io.read_slab("zeta_like",
                                shape=(N_Q, mu_pad, N_G),
                                dtype=np.complex128,
@@ -587,8 +579,7 @@ def main():
         return 0 if not bad else 1
 
     if CASE == "oob_read":
-        with SlabIO(PATH, mode="r", mesh=mesh,
-                    backend=SlabIOBackend.PHDF5_FFI) as io:
+        with SlabIO(PATH, mode="r", mesh=mesh) as io:
             p0(f"[padrank-gate] issuing the overrunning read: "
                f"offset=(0,1,0) valid=(.,{mu},.) vs extent {mu}")
             sys.stdout.flush()

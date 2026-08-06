@@ -309,7 +309,7 @@ def persist_w0_and_head(
     # of W0_qmunu were already updated to flat-q in commit a052a1c.
     write_w0_qmunu_to_h5(tensors_filename, W_q,
                          n_rmu_logical=int(meta.n_rmu),
-                         mesh=mesh_xy, backend=config.backend.slab_io)
+                         mesh=mesh_xy)
     head_static = head_resolver.at(0.0 + 0.0j)
     if config.compute_mode.is_dynamic:
         # GN-PPM: probe at iωp on the imaginary axis.

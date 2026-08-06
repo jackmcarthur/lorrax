@@ -473,7 +473,7 @@ def test_blank_is_unset_in_every_vocabulary_including_runtime():
     ``export LORRAX_MALLOC_TUNE=`` DISABLED a default-on knob, whereas
     ``ffi/gate.py`` ("unset or whitespace always maps to the gate's
     declared default"), ``isdf.core._env_bool``,
-    ``file_io._slab_io_mpi_host._env_flag`` and this module's ``env_bool``
+    ``file_io._slab_io_ffi._env_flag`` and this module's ``env_bool``
     all read blank as unset.
 
     A blank export is what a shell leaves behind for ``export X=$UNDEFINED``,
@@ -510,8 +510,10 @@ def test_defect3_vocabulary_has_not_drifted():
         resolvers stay separate, the tokens agree);
       * ``runtime.__init__._FALSY_TOKENS``     (the falsy set exactly — the
         ``""`` it used to carry was the blank-token divergence, now fixed);
-      * ``file_io/_slab_io_mpi_host.py::_TRUE`` (read from source: imports
-        jax at package scope).
+      * ``file_io/_slab_io_ffi.py::_TRUE`` (read from source: imports
+        jax at package scope).  Was ``_slab_io_mpi_host.py`` until that
+        backend was deleted 2026-08-06; the tuple moved to the surviving
+        phdf5 writer, which already spelled it inline three times.
 
     ``isdf/core.py::_ENV_TRUE`` — the fourth copy this test used to pin —
     was RETIRED by P1.3: the module imports ``gw_config.env_bool``
@@ -521,7 +523,7 @@ def test_defect3_vocabulary_has_not_drifted():
     assert set(gw_config._ENV_FALSE) == set(gate.MODE_SPELLINGS["off"])
     assert set(_runtime._FALSY_TOKENS) == set(gw_config._ENV_FALSE)
     assert set(gw_config._ENV_TRUE) == set(
-        _literal_tuple_from_source("file_io/_slab_io_mpi_host.py", "_TRUE"))
+        _literal_tuple_from_source("file_io/_slab_io_ffi.py", "_TRUE"))
     # ``auto`` must stay out of the two-valued sets.
     assert "auto" not in set(gw_config._ENV_TRUE) | set(gw_config._ENV_FALSE)
     # ...and out of the gate vocabulary: a token with no resolver branch in
@@ -603,7 +605,7 @@ def test_owned_knobs_each_have_an_env_bool_call_site():
 #: Each entry is asserted to still exist, so the exemption cannot outlive
 #: the function it excuses.
 _DYNAMIC_PROBE_FUNCS = (
-    ("gw/gw_config.py", "_mpi_launcher_env"),
+    ("file_io/_slab_io_ffi.py", "_mpi_launcher_env"),
 )
 
 

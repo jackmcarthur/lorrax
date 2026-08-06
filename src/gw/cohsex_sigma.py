@@ -229,8 +229,6 @@ def compute_cohsex_sigma(
     compute_bare_x: bool = True,
     wfns_transverse=None,
     bispinor_v_q_path=None,
-    backend=None,
-    use_ffi_io: bool | None = None,
 ) -> dict:
     """Evaluate static COHSEX self-energy components.
 
@@ -318,7 +316,6 @@ def compute_cohsex_sigma(
                     Gij=Gij,
                     bispinor_v_q_path=bispinor_v_q_path,
                     meta=meta, mesh_xy=mesh_xy,
-                    backend=backend, use_ffi_io=use_ffi_io,
                 )
             sig_x_b.block_until_ready()
             sig_x = sig_x + sig_x_b
@@ -341,8 +338,6 @@ def compute_v_h_sigma_x(
     static_head_terms=None,
     wfns_transverse=None,
     bispinor_v_q_path=None,
-    backend=None,
-    use_ffi_io: bool | None = None,
 ) -> dict:
     """Two-kernel V-only path: ``sig_h`` (Hartree) + ``sig_x`` (bare exchange).
 
@@ -396,7 +391,6 @@ def compute_v_h_sigma_x(
                 Gij=Gij,
                 bispinor_v_q_path=bispinor_v_q_path,
                 meta=meta, mesh_xy=mesh_xy,
-                backend=backend, use_ffi_io=use_ffi_io,
             )
         sig_x_b.block_until_ready()
         sig_x = sig_x + sig_x_b

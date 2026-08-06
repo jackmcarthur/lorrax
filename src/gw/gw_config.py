@@ -11,7 +11,7 @@ along the same axes the input file's section comments already use:
     config.sigma_grid  — ω-grid for Σ_c(ω) output
     config.sc          — self-consistency loop knobs (qp_solver = self_consistent)
     config.memory      — chunk sizing
-    config.backend     — FFI/IO backend selection (slab_io / gspace_io / w_dyson_solver)
+    config.backend     — FFI/IO backend selection (gspace_io / w_dyson_solver)
     config.debug       — debug-only flags & file paths
     config.bse         — BSE interpolation setup (htransform-driven)
     config.paths       — output filenames
@@ -56,10 +56,6 @@ from common.units import RYD_TO_EV
 #     falsy-test resolver (the two-resolver doctrine,
 #     docs/architecture/layers.md): ``runtime`` must resolve knobs BEFORE
 #     jax/config imports are safe, so it keeps its own tiny parser.
-#   * ``file_io/_slab_io_mpi_host.py::_env_flag`` — mirrors the C++
-#     writer's ``env_flag`` (``ffi/cpp/phdf5/context.cc``) so the TWO
-#     phdf5 writers stay one grammar; jax-free file, kept local.
-#
 # ``isdf/core.py``'s ``_env_bool`` — historically the fourth copy — was
 # retired by the P1.3 unification (2026-07-31): ``isdf.core`` now imports
 # :func:`env_bool` from here (L1→L1; ``gw/__init__`` pulls only this
@@ -357,770 +353,6 @@ class QPSolver(str, enum.Enum):
     SELF_CONSISTENT = "self_consistent"
 
 
-class SlabIOBackend(str, enum.Enum):
-    """How big sigma/zeta/restart HDF5 files are written.
-
-    - ``PHDF5_FFI`` — every rank writes its hyperslab via the parallel-HDF5
-      FFI (collective MPI-IO).  Default on BOTH backends now: the C++ core
-      (``ffi/cpp/phdf5/write_ffi.cc``) compiles into the CUDA lib and, since
-      workstream AE, into the CUDA-free host lib under ``LORRAX_FFI_NO_CUDA``
-      — where the D2H staging collapses to "H5Dwrite reads the XLA buffer in
-      place".  ~5× faster than the rank-0 path once Lustre striping is
-      applied.  Needs the host lib to export ``PhdfWriteHostFfi``
-      (``ffi_loader.has_phdf5_write('cpu')``); the auto-router probes.
-    - ``PHDF5_HOST`` — host-side equivalent driven by mpi4py +
-      h5py(parallel) instead of the FFI.  Same per-rank collective MPI-IO
-      write semantics.  Now the SECOND tier on CPU: it needs an extra
-      environment (the ``lorrax_env_mpi_overlay`` two-package overlay,
-      workstream AB) that the FFI path does not, so it is kept only as the
-      fallback for a host lib without the write handler.
-    - ``H5PY_ALLGATHER`` — gather to rank 0 and write via serial h5py.
-      **Not a fallback: a refusal above one process** (owner ruling
-      2026-08-05, enforced 2026-08-06).  Reachable at EXACTLY ONE
-      process and nowhere else — where the gather and the per-rank write
-      are the same operation — whether by ``slab_io = h5py_allgather``
-      or by ``auto`` running out of parallel tiers; both announce it.
-      At ``process_count() > 1`` both paths raise at parse time
-      (:func:`_refuse_slab_io_no_parallel_writer`,
-      :func:`_refuse_explicit_h5py_allgather`).  Slow at scale (rank-0
-      disk bandwidth bottleneck), and the gather itself is the single
-      biggest collective in a large run (12.05 GB at 606 centroids /
-      P=16 — scorecard AB.2) — at the production envelope it is not slow
-      but impossible.
-    """
-    PHDF5_FFI = "phdf5_ffi"
-    PHDF5_HOST = "phdf5_host"
-    H5PY_ALLGATHER = "h5py_allgather"
-
-
-#: PMI/PMIx variable spellings a launcher (srun --mpi=pmi2/pmix,
-#: mpiexec.hydra, mpirun) leaves in the environment.  Prefix-matched so the
-#: versioned PMIx names (PMIX_SERVER_URI21, ...) are covered.  Plain SLURM
-#: batch variables (SLURM_JOB_ID etc.) are deliberately NOT in this list: a
-#: bare ``python`` inside an sbatch allocation has all of those and still no
-#: PMI server to register with — that is exactly the failing launch shape.
-_MPI_LAUNCHER_ENV_PREFIXES = ("PMI_", "PMIX_")
-_MPI_LAUNCHER_ENV_VARS = ("HYDI_CONTROL_FD",)
-
-
-def _mpi_launcher_env() -> "str | None":
-    """The first launcher PMI/PMIx variable present, else None."""
-    for name in _MPI_LAUNCHER_ENV_VARS:
-        if os.environ.get(name):
-            return name
-    for name in sorted(os.environ):
-        if name.startswith(_MPI_LAUNCHER_ENV_PREFIXES):
-            return name
-    return None
-
-
-def _mpi_singleton_probe(child_code: str, what: str,
-                         argv_extra=(), timeout_s: float = 60.0
-                         ) -> tuple[bool, str]:
-    """``(ok, reason)`` — run ``child_code`` in a THROWAWAY subprocess.
-
-    Why a subprocess: on a bare launch (no PMI environment) whether
-    ``MPI_Init_thread`` works as a singleton is a property of the MPI
-    stack, and on the production stack it does not fail catchably — Intel
-    MPI 2020 calls ``abort()`` inside ``MPIR_pmi_init`` (job 7884926), so
-    an in-process probe kills the run it was meant to protect.  The child
-    runs exactly the init the candidate tier would run; the router
-    survives the child's death.  Only reached on the bare-launch path, so
-    the ~1 s child never costs a production srun/mpirun start anything.
-
-    Never raises.  A hung child (the init blocking rather than aborting)
-    is killed at ``timeout_s`` and reported as not bootstrappable — the
-    demotion direction is the safe one.
-    """
-    import subprocess
-    import sys
-    try:
-        res = subprocess.run(
-            [sys.executable, "-c", child_code, *argv_extra],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        return False, (f"the singleton {what} probe hung for {timeout_s:.0f} s "
-                       f"and was killed")
-    except Exception as exc:                          # pragma: no cover
-        return False, (f"the singleton {what} probe could not run "
-                       f"({type(exc).__name__}: {exc})")
-    if res.returncode == 0:
-        return True, f"singleton {what} succeeded in a probe subprocess"
-    return False, (f"singleton {what} exited rc={res.returncode} in a probe "
-                   f"subprocess (Intel MPI aborts in MPIR_pmi_init on a "
-                   f"PMI-less launch)")
-
-
-def _slab_io_geometry() -> str:
-    """The run geometry, as a one-line fragment for the routing banner.
-
-    Printed WITH every routing decision, on purpose.  No archived
-    multi-node log records a node count and the routing banner postdates
-    every historical run, so settling "does phdf5 work across nodes"
-    needed an archaeology pass rather than a grep.  The geometry belongs
-    next to the decision it qualifies.
-
-    SLURM's own node count is reported when present but is NOT the
-    primary source, and the spelling matters.  Measured inside the
-    Shifter container on Perlmutter, 2026-08-05, ``srun -N 4 -n 16``:
-    ``SLURM_NNODES=4``, ``SLURM_NTASKS=16`` and ``SLURM_JOB_NODELIST``
-    are all present, while ``SLURM_JOB_NUM_NODES`` is ABSENT — it is a
-    batch/allocation-level variable, not a step-level one, so anything
-    reading only that spelling sees nothing on a plain ``srun`` step.
-    JAX's own process/device counts do not depend on the launcher's
-    vocabulary at all, so they come first.
-    """
-    import jax as _jax
-    parts = []
-    try:
-        parts.append(f"processes={_jax.process_count()}")
-        parts.append(f"devices={_jax.device_count()}")
-        parts.append(f"local_devices={_jax.local_device_count()}")
-    except Exception:                                 # pragma: no cover
-        parts.append("jax process/device counts unavailable")
-    for _k in ("SLURM_JOB_NUM_NODES", "SLURM_NNODES", "SLURM_NTASKS"):
-        _v = os.environ.get(_k)
-        if _v:
-            parts.append(f"{_k}={_v}")
-    return ", ".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# H5PY_ALLGATHER is a REFUSAL, not a fallback (owner ruling 2026-08-05;
-# implemented 2026-08-06).
-#
-# The routers below used to end with "falling back to H5PY_ALLGATHER" plus an
-# announcement.  That is the demotion the ruling forbids: the tier gathers the
-# whole global array onto rank 0, and the design envelope is arrays that need
-# hundreds of GPUs to hold at all, so the demotion does not buy a slow run --
-# it buys an OOM several minutes later, with a banner nobody read.  The tier
-# now survives only as an EXPLICIT single-process escape, checked in
-# ``from_input_file``; the routers refuse.
-#
-# Refusal shape follows ``ffi/gate.py``: rule / got / wanted / fix / doc, with
-# the FIX keyed to WHICH probe declined -- "unavailable" alone is barely
-# better than the demotion it replaced, because the three probe states have
-# three different repairs.
-# ---------------------------------------------------------------------------
-
-#: Where the rule is written down.  Quoted by every allgather refusal: a
-#: refusal that does not name its doc sends the reader to grep.
-_SLAB_IO_DOC = ("docs/architecture/slab_io.md"
-                "#h5py_allgather-is-a-refusal-not-a-fallback")
-
-#: The rule itself, stated once.  Both refusal sites quote this constant so
-#: they cannot drift into telling different stories about the same ruling.
-_SLAB_IO_RULE = (
-    "one rank writes one tile, and nothing larger than one rank's tile is "
-    "ever materialised (owner ruling 2026-08-05).  H5PY_ALLGATHER gathers "
-    "the WHOLE global array onto rank 0, so above one process it is a "
-    "refusal, not a slow path: the production envelope is arrays that need "
-    "hundreds of GPUs to hold at all, and a rank-0 gather of one of those "
-    "is an OOM, not a delay.")
-
-#: Fix prose per FAILED PROBE.  Keyed by the stage the tier-1 chain stopped
-#: at, because that is what decides the repair -- and the three
-#: ``probe_target`` states are three different repairs, which is exactly why
-#: the router quotes its reason verbatim rather than reducing it to a bool.
-_SLAB_IO_FIX = {
-    "loader": (
-        "the FFI loader itself did not import, so no probe ever ran.  "
-        "Check that PYTHONPATH reaches <lorrax>/src before looking at any "
-        "library -- src/ffi/cpp/run_shifter.sh sets it for you."),
-    "probe": (
-        "probe_target's reason above is three-way, and each state is a "
-        "DIFFERENT repair:\n"
-        "            * 'unknown target'      -- this platform's library "
-        "never carried the handler.  Rebuild it (GPU leg "
-        "src/ffi/cpp/build.sh, CPU leg config/perlmutter/build_ffi_host.sh) "
-        "and re-stage.\n"
-        "            * 'could not be loaded' -- the .so may be perfectly "
-        "good; the loader could not open it.  Fix LD_LIBRARY_PATH / the "
-        "Shifter bind-mounts, and measure INSIDE the container: a "
-        "login-node ldd lies about this closure (slab_io.md, Failure "
-        "modes).\n"
-        "            * 'does not export'     -- a stale .so is first on "
-        "the path.  Read the PROVENANCE file stamped beside it "
-        "(src/ffi/cpp/stage/stamp_provenance.sh) and compare it with the "
-        "build you meant to be running."),
-    "mpi": (
-        "the write handler IS present; MPI could not bootstrap, which is a "
-        "LAUNCHER fact and not a library one.  Launch under a "
-        "PMI-providing launcher: on Perlmutter/Shifter that is "
-        "`srun --mpi=cray_shasta` (pmi2 and pmix both yield singleton MPI "
-        "against shifter's Cray MPICH -- src/ffi/cpp/run_shifter.sh).  A "
-        "bare `python3` inside an salloc has every SLURM variable and no "
-        "PMI server, and is not a supported multi-rank launch."),
-}
-
-
-def _slab_io_process_count() -> "tuple[int, str]":
-    """``(processes, evidence)`` — how many processes this run has.
-
-    Used by the ONE decision that must not err on the permissive side:
-    whether ``H5PY_ALLGATHER`` — which materialises the whole global array
-    on rank 0 — is reachable at all.
-
-    ``jax.process_count()`` is the authority once the backend is up, and it
-    normally is: every driver calls
-    ``runtime.initialize_communicator_stack`` at module import, before any
-    deck is parsed (that is why the routing banner can print
-    ``processes=16``).  But a caller that parses a deck BEFORE distributed
-    init would see 1 on all 16 ranks, and that single wrong answer would
-    green-light a rank-0 gather of an array needing 16 nodes to hold.  So
-    the launcher's own world size is read too and the MAXIMUM wins:
-    over-counting at worst refuses a run that could have limped;
-    under-counting hands back the failure mode this whole rule exists to
-    delete.
-    """
-    counts: "list[tuple[int, str]]" = []
-    try:
-        import jax as _jax
-        counts.append((int(_jax.process_count()), "jax.process_count()"))
-    except Exception:                                 # pragma: no cover
-        pass
-    for _k in ("SLURM_NTASKS", "SLURM_STEP_NUM_TASKS", "PMI_SIZE",
-               "OMPI_COMM_WORLD_SIZE"):
-        _v = os.environ.get(_k, "").strip()
-        if not _v:
-            continue
-        try:
-            counts.append((int(_v), _k))
-        except ValueError:                            # pragma: no cover
-            pass
-    if not counts:                                    # pragma: no cover
-        return 1, "no process-count evidence at all (assuming 1)"
-    return (max(c for c, _ in counts),
-            "; ".join(f"{name}={c}" for c, name in counts))
-
-
-def _slab_io_no_parallel_writer(
-        print_fn, *, platform_label: str, tier1_stage: str,
-        tier1_reason: str, tier2_reason: str) -> "SlabIOBackend":
-    """What ``slab_io=auto`` does when it runs out of parallel tiers.
-
-    ONE rule, applied here and at the explicit-request site: **the
-    allgather tier is reachable at exactly one process and nowhere else.**
-
-    * ``process_count() > 1`` — REFUSE
-      (:func:`_refuse_slab_io_no_parallel_writer`).  This is the 2026-08-05
-      ruling: at scale a rank-0 gather is not a slow path, it is a path
-      that cannot run the workload, so the run stops.
-    * ``process_count() == 1`` — return ``H5PY_ALLGATHER``, announced.  At
-      one process "gather to rank 0" and "the rank writes its own tile"
-      are the SAME operation, so there is no contract to violate and
-      nothing to refuse about.  Refusing here would buy no safety and
-      would break every single-process workflow — a laptop debug run, the
-      config test suite — which is how a refusal gets deleted.  The
-      announcement states the boundary so nobody reads the tier's presence
-      in a P=1 log as a licence to scale the run up.
-    """
-    n, how = _slab_io_process_count()
-    if n != 1:
-        _refuse_slab_io_no_parallel_writer(
-            platform_label=platform_label, tier1_stage=tier1_stage,
-            tier1_reason=tier1_reason, tier2_reason=tier2_reason,
-            processes=n, how=how)
-    print_fn(
-        f"  [config] slab_io=auto on the {platform_label} backend: no "
-        f"parallel writer (tier 1 PHDF5_FFI: {tier1_reason}; tier 2 "
-        f"PHDF5_HOST: {tier2_reason}).  This is a SINGLE-PROCESS run "
-        f"({how}), so H5PY_ALLGATHER is selected — at one process the "
-        f"rank-0 gather IS the per-rank write.  It is not a supported "
-        f"path at any larger process count: the same configuration at "
-        f"process_count() > 1 REFUSES rather than demoting.  Fixing the "
-        f"tier-1 reason above is the prerequisite for scaling this run "
-        f"up.  See {_SLAB_IO_DOC}.")
-    return SlabIOBackend.H5PY_ALLGATHER
-
-
-def _refuse_slab_io_no_parallel_writer(
-        *, platform_label: str, tier1_stage: str, tier1_reason: str,
-        tier2_reason: str, processes: int, how: str) -> "None":
-    """The ``slab_io=auto`` refusal.  Always raises.
-
-    Replaced the demotion to ``H5PY_ALLGATHER`` on 2026-08-06.  Names which
-    probe declined and the repair for THAT probe — a refusal that only says
-    "unavailable" is barely better than the silent demotion it replaced.
-    """
-    n = processes
-    raise RuntimeError(
-        "\n*** slab_io=auto REFUSED: this stack has no per-rank parallel "
-        "writer. ***\n"
-        f"  rule    {_SLAB_IO_RULE}\n"
-        f"  got     slab_io=auto on the {platform_label} backend at "
-        f"{n} process(es) ({how}), and NEITHER parallel tier is "
-        f"available:\n"
-        f"            tier 1  PHDF5_FFI  -- {tier1_reason}\n"
-        f"            tier 2  PHDF5_HOST -- {tier2_reason}\n"
-        f"          [{_slab_io_geometry()}]\n"
-        f"  wanted  tier 1: the {platform_label} FFI library exports "
-        f"'lorrax_phdf5_write' AND MPI_Init_thread succeeds in this "
-        f"process.  Tier 1 is what production runs on; tier 2 is the same "
-        f"MPI-IO driven from Python and needs the mpi4py + "
-        f"HDF5_MPI=ON overlay.\n"
-        f"  fix     {_SLAB_IO_FIX.get(tier1_stage, _SLAB_IO_FIX['probe'])}\n"
-        f"  escape  the rank-0 gather tier (H5PY_ALLGATHER) is reachable "
-        f"at EXACTLY ONE process and nowhere else: this same run at "
-        f"srun -n 1 selects it and says so, and 'slab_io = h5py_allgather' "
-        f"names it outright.  At one process the gather and the per-rank "
-        f"write are the same operation; at {n} they are not, which is why "
-        f"there is no demotion here -- this refusal replaced one.\n"
-        f"  doc     {_SLAB_IO_DOC}")
-
-
-def _refuse_explicit_h5py_allgather(*, key: str, processes: int,
-                                    how: str) -> "None":
-    """The explicit-request refusal.  Always raises.
-
-    Reached when a deck NAMES the allgather tier (or the deprecated
-    ``use_ffi_io = false`` does) in a run with more than one process.  An
-    explicit request is normally honoured verbatim — that is what makes
-    ``slab_io`` usable as a gate — but "honour it verbatim" cannot extend
-    to a tier that provably cannot run the workload, so this one refusal
-    outranks the explicit request and says why.
-    """
-    raise RuntimeError(
-        f"\n*** slab_io = h5py_allgather REFUSED at {processes} "
-        f"processes. ***\n"
-        f"  rule    {_SLAB_IO_RULE}\n"
-        f"  got     an explicit request for the rank-0 gather tier "
-        f"({key}) in a run with {processes} processes ({how}) "
-        f"[{_slab_io_geometry()}].\n"
-        f"  wanted  the explicit escape is scoped to process_count()==1, "
-        f"where 'gather to rank 0' and 'each rank writes its own tile' "
-        f"are the SAME operation and the tier therefore costs nothing.  "
-        f"At {processes} processes they are not the same operation: rank "
-        f"0 would have to hold all {processes} tiles at once, which is "
-        f"the memory wall the per-rank-tile contract exists to delete.\n"
-        f"  fix     remove the key and let slab_io=auto route -- it picks "
-        f"PHDF5_FFI when the probes pass and refuses, naming the failed "
-        f"probe, when they do not.  To debug this tier specifically, "
-        f"rerun the same deck at one process (srun -n 1).\n"
-        f"  doc     {_SLAB_IO_DOC}")
-
-
-def _validate_slab_io_key(slab_io_in: str) -> str:
-    """Vocabulary check for the ``slab_io`` deck key.  Returns it folded.
-
-    One function so the parse-time check and
-    :func:`resolve_slab_io_backend` cannot drift apart on what the key is
-    allowed to say (QUALITY_PATTERNS #3).
-    """
-    folded = str(slab_io_in).strip().lower()
-    if folded not in ("auto", "phdf5_ffi", "phdf5_host", "h5py_allgather"):
-        raise ValueError(
-            f"slab_io={folded!r} invalid; expected auto / phdf5_ffi "
-            f"/ phdf5_host / h5py_allgather.")
-    return folded
-
-
-def resolve_slab_io_backend(slab_io_in, use_ffi_io_in, *, print_fn=print,
-                            is_cpu_backend=None) -> "SlabIOBackend":
-    """THE ``slab_io`` decision, for every caller that has a deck.
-
-    Precedence:
-
-      1. explicit ``slab_io=<backend>`` — honoured verbatim (a wrong
-         choice fails loudly at SlabIO open, which beats silently
-         running a different backend than the input file says).
-         The capability probes are skipped: a deck that already
-         named its writer should not pay a host-lib dlopen.
-      2. ``use_ffi_io=false`` (deprecated) — forces H5PY_ALLGATHER.
-      3. ``slab_io=auto`` (default) — the platform router, always.
-
-    ...then ONE post-check that outranks all three: H5PY_ALLGATHER at
-    ``process_count() > 1`` refuses, however it was chosen.
-
-    ``use_ffi_io`` deprecation warns exactly ONCE per deck, here — each
-    deck hits exactly one of the three branches below, and the warning
-    text names what actually happened to the key (audit fix/zq
-    2026-07-28: ``read_lorrax_input`` used to emit a second,
-    differently-worded warning for mere presence of the key).
-
-    EXTRACTED from ``LorraxConfig.from_input_file`` 2026-08-06 so the BSE
-    stage can reach it.  ``bse/`` never builds a ``LorraxConfig`` — it
-    reads its deck through ``read_lorrax_input`` — and when
-    ``bse_io.load_bse_data_from_restart_sharded`` moved onto SlabIO it
-    needed exactly this decision and nothing else in the config.  Copying
-    the chain into ``bse/`` would have put a second, drifting answer to
-    "which transport" in the tree; ``SlabIO``'s own refusal explicitly
-    tells driver-chain callers to take the backend from the resolved
-    config rather than re-derive it, and this is that function.
-    """
-    slab_io_in = _validate_slab_io_key(slab_io_in)
-    if use_ffi_io_in is not None:
-        use_ffi_io_in = bool(use_ffi_io_in)
-    if is_cpu_backend is None:
-        try:
-            import jax as _jax
-            is_cpu_backend = _jax.default_backend() == "cpu"
-        except Exception:
-            is_cpu_backend = False
-    if slab_io_in != "auto":
-        if use_ffi_io_in is not None:
-            import warnings
-            warnings.warn(
-                f"Input key 'use_ffi_io' is deprecated and IGNORED "
-                f"here: slab_io={slab_io_in} is explicit and takes "
-                f"precedence.  Remove use_ffi_io from the deck.",
-                DeprecationWarning, stacklevel=2)
-            print_fn(
-                f"  [config] use_ffi_io={str(use_ffi_io_in).lower()} "
-                f"is ignored: slab_io={slab_io_in} is explicit and "
-                "takes precedence (use_ffi_io is deprecated).")
-        choice = SlabIOBackend(slab_io_in)
-    elif use_ffi_io_in is False:
-        import warnings
-        warnings.warn(
-            "Input key 'use_ffi_io' is deprecated; 'use_ffi_io = "
-            "false' is honored as 'slab_io = h5py_allgather' (the "
-            "pre-FFI rank-0 writer).  Set 'slab_io = h5py_allgather' "
-            "explicitly instead.",
-            DeprecationWarning, stacklevel=2)
-        print_fn(
-            "  [config] use_ffi_io=false (deprecated): forcing SlabIO "
-            "through H5PY_ALLGATHER (rank-0 serial write).  This "
-            "overrides the slab_io=auto router; prefer "
-            "slab_io = h5py_allgather.")
-        choice = SlabIOBackend.H5PY_ALLGATHER
-    else:
-        if use_ffi_io_in is True:
-            import warnings
-            warnings.warn(
-                "Input key 'use_ffi_io' is deprecated; 'use_ffi_io = "
-                "true' is a no-op — the slab_io=auto router already "
-                "picks the best available parallel writer.  Remove "
-                "the key.",
-                DeprecationWarning, stacklevel=2)
-            print_fn(
-                "  [config] use_ffi_io=true is deprecated and "
-                "redundant: slab_io=auto already routes to the best "
-                "available parallel writer.  Remove the key.")
-        choice = (_route_cpu_slab_io(print_fn) if is_cpu_backend
-                  else _route_gpu_slab_io(print_fn))
-    # THE boundary, applied to every route into H5PY_ALLGATHER at once
-    # (owner ruling 2026-08-05, implemented 2026-08-06): that tier is
-    # reachable at EXACTLY ONE process and nowhere else, because it
-    # materialises the whole global array on rank 0.
-    #
-    # The ``auto`` routers already applied it to themselves and refused,
-    # so anything that arrives here holding H5PY_ALLGATHER at P>1 came
-    # from a deck that NAMED it (``slab_io = h5py_allgather``) or from
-    # the deprecated ``use_ffi_io = false``.  This is the one place an
-    # explicit request does NOT win outright: explicit-wins exists so a
-    # deck can be used as a gate against a stack, not so it can
-    # authorise a transport that cannot hold the run's own arrays.
-    #
-    # Placed AFTER the whole precedence chain rather than inside its
-    # three branches on purpose — one check, no branch can be added
-    # later that forgets it.
-    if choice is SlabIOBackend.H5PY_ALLGATHER:
-        n_proc, proc_how = _slab_io_process_count()
-        if n_proc != 1:
-            _refuse_explicit_h5py_allgather(
-                key=("use_ffi_io = false" if slab_io_in == "auto"
-                     else f"slab_io = {slab_io_in}"),
-                processes=n_proc, how=proc_how)
-        if slab_io_in != "auto":
-            # The auto path already announced this from the router;
-            # only the named request still needs its receipt.
-            print_fn(
-                "  [config] slab_io=h5py_allgather: EXPLICIT "
-                f"single-process escape ({proc_how}).  This tier "
-                "gathers the whole array onto rank 0; it is NOT a "
-                "supported production path and REFUSES at "
-                f"process_count() > 1 — see {_SLAB_IO_DOC}.")
-    return choice
-
-
-def _probe_mpi_bootstrap_ffi(platform: str = "cpu") -> tuple[bool, str]:
-    """``(bootstrappable, how)`` for the PHDF5_FFI tier's own MPI init.
-
-    ``platform`` is an :mod:`ffi.common.ffi_loader` platform key —
-    ``"cpu"`` (the host lib) or ``"CUDA"``.  Both routers use this; the
-    GPU one did not until 2026-08-05, because it declined the tier on
-    node count instead of probing it.
-
-    A launcher PMI environment settles it — that is the environment every
-    green multi-rank run had (CLAIMS rows 3, 17).  Without one, probe the
-    exact call the tier would make (``lrx_phdf5_init_mpi`` in the loaded
-    .so) in a throwaway subprocess; see :func:`_mpi_singleton_probe`.
-
-    NOTE what this does and does not prove.  A PMI environment proves a
-    launcher registered this process; it does NOT prove the PMI flavour
-    matches the MPI library.  A mismatch (``srun --mpi=pmi2`` against
-    Shifter's Cray MPICH) yields singleton MPI — every rank sees
-    ``MPI_Comm_size()==1`` — which no probe here detects and which
-    independent-I/O writes survive silently.  ``--mpi=cray_shasta`` is
-    the launcher's responsibility; see docs/architecture/slab_io.md.
-    """
-    var = _mpi_launcher_env()
-    if var is not None:
-        return True, f"launcher PMI environment present ({var})"
-    try:
-        from ffi.common.ffi_loader import loaded_lib_path
-        so = loaded_lib_path(platform)
-    except Exception as exc:                          # pragma: no cover
-        return False, f"ffi_loader unavailable ({type(exc).__name__}: {exc})"
-    if not so:
-        return False, (f"no loaded {platform} FFI library to probe MPI init "
-                       f"with")
-    child = ("import ctypes, sys\n"
-             "lib = ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)\n"
-             "lib.lrx_phdf5_init_mpi()\n")
-    return _mpi_singleton_probe(child, f"MPI_Init_thread ({platform} FFI)",
-                                argv_extra=(so,))
-
-
-def _probe_phdf5_host_tier() -> tuple[bool, str]:
-    """``(usable, reason)`` for the ``PHDF5_HOST`` (mpi4py + h5py-parallel)
-    tier, testing exactly what a ``_MpiHostBackend`` will execute.
-
-    ``import mpi4py`` alone proves nothing: the package import succeeds
-    on a broken PMI stack and the run then dies at the first SlabIO open
-    with ``MPI_Init_thread() failed [error code: 16]`` (a PMI flavour
-    mismatch between the launcher and the MPI library).  So the probe
-    does the real thing — ``from mpi4py import MPI`` — which runs
-    ``MPI_Init_thread``.  The init cost is not wasted: the selected
-    backend needed it anyway (same rationale as ``phdf5_init_mpi`` in
-    ``gw_jax.configure_run``).
-
-    Never raises: an init failure is a *probe* result, not a run killer
-    — the router demotes and says why.  An explicit
-    ``slab_io=phdf5_host`` request bypasses this probe and keeps
-    fails-loudly semantics at the first SlabIO open.
-
-    BEFORE the in-process ``MPI_Init_thread``: on a bare launch (no PMI
-    environment) that init does not fail catchably — Intel MPI aborts the
-    whole process inside ``MPIR_pmi_init`` (job 7884926), which would turn
-    this probe into the crash it exists to prevent.  So a PMI-less launch
-    first proves singleton init in a throwaway subprocess and demotes when
-    the child dies.
-    """
-    if _mpi_launcher_env() is None:
-        ok, how = _mpi_singleton_probe(
-            "from mpi4py import MPI\n", "MPI_Init_thread (mpi4py)")
-        if not ok:
-            return False, (
-                f"bare launch (no PMI/PMIx variables in the environment) "
-                f"and {how} — an in-process mpi4py init would abort, not "
-                f"raise")
-    try:
-        from mpi4py import MPI  # noqa: F401 — runs MPI_Init_thread
-    except (Exception, SystemExit) as exc:
-        # MPI init failures can be raw SystemExit — but NOT BaseException:
-        # that also swallowed KeyboardInterrupt, turning a Ctrl-C during
-        # config parse into a silent tier demotion with a misleading "PMI
-        # mismatch" diagnostic (audit fix/zq 2026-07-28).
-        return False, (
-            f"mpi4py MPI init failed ({type(exc).__name__}: {exc}).  "
-            "This usually means a PMI mismatch between the launcher and "
-            "the MPI library (classic signature: 'MPI_Init_thread() "
-            "failed ... error code: 16').  On SLURM launch with "
-            "`srun --mpi=pmi2`; some MPI builds also need "
-            "I_MPI_PMI_LIBRARY (or the site equivalent) pointing at the "
-            "system's libpmi2 — ask your site docs for the path.")
-    try:
-        import h5py
-        if not bool(h5py.get_config().mpi):
-            return False, ("h5py is built without MPI support "
-                           "(h5py.get_config().mpi is False) — an "
-                           "HDF5_MPI=ON h5py build is required")
-    except Exception as exc:
-        return False, f"h5py import failed ({type(exc).__name__}: {exc})"
-    return True, "available"
-
-
-def _route_cpu_slab_io(print_fn) -> "SlabIOBackend":
-    """Pick the ``slab_io=auto`` backend on the JAX **CPU** backend.
-
-    Runs UNCONDITIONALLY for ``slab_io=auto`` — routing depends on no
-    other input key (the legacy ``use_ffi_io`` boolean is honored only
-    as an explicit override, see ``from_input_file``).  Three tiers,
-    best first — each one loud about why it was or was not taken,
-    because "which writer ran" is the single most consequential thing
-    about a large run's memory profile:
-
-    1. ``PHDF5_FFI`` — the host FFI lib exports the collective write
-       handler.  Zero extra Python environment; the ζ tile never leaves
-       the rank that owns it.
-    2. ``PHDF5_HOST`` — no write handler in the lib, but the interpreter
-       has ``mpi4py`` + an ``HDF5_MPI=ON`` h5py (the AB overlay) and
-       MPI actually initializes (the probe runs ``MPI_Init_thread``, so
-       a PMI-mismatched harness demotes here instead of dying later).
-       Same MPI-IO semantics, extra env.
-    3. neither — :func:`_slab_io_no_parallel_writer`: **REFUSE** above
-       one process, ``H5PY_ALLGATHER`` (announced) at exactly one.
-       There is no tier 3 at scale.  This used to demote unconditionally
-       with an announcement; per the owner ruling 2026-08-05 a rank-0
-       gather is not a slow path but a path that cannot run the
-       workload, so above P=1 the run stops here, naming the probe that
-       declined and the repair for THAT probe.
-
-    The tier-1 probe is :func:`ffi_loader.probe_target`, not a bare
-    ``has_target``: its three-state reason distinguishes "lib not built
-    with the handler" (rebuild) from "lib could not be loaded"
-    (``LD_LIBRARY_PATH``) — a distinction that cost workstream P a day,
-    and the distinction the refusal's *fix* line is keyed on.  A probe
-    failure demotes to the next tier; running out of tiers RAISES.
-
-    Handler presence alone is NOT capability: both MPI tiers call
-    ``MPI_Init_thread``, and on a bare launch with no PMI environment
-    Intel MPI aborts the process inside ``MPIR_pmi_init`` instead of
-    returning an error (job 7884926 — the fastloop's bare P=1 gw stage
-    died at the first collective H5Fcreate).  So tier 1 additionally
-    requires :func:`_probe_mpi_bootstrap_ffi` (launcher PMI environment,
-    else a subprocess singleton-init probe) and demotes with an
-    announcement when MPI cannot bootstrap — the same degrade-and-say-why
-    contract the GPU router uses.  An explicit
-    ``slab_io=phdf5_ffi`` still bypasses this and fails loudly.
-
-    Node count is not a tier condition here and never was; as of
-    2026-08-05 it is not one in the GPU router either (see
-    :func:`_route_gpu_slab_io`).
-    """
-    reason = "ffi.common.ffi_loader import failed"
-    # WHICH probe declined, for the refusal's fix line (_SLAB_IO_FIX).
-    _stage = "probe"
-    try:
-        from ffi.common.ffi_loader import probe_target
-        _ffi_write_ok, reason = probe_target("lorrax_phdf5_write", "cpu")
-    except Exception as exc:                      # pragma: no cover
-        _ffi_write_ok = False
-        _stage = "loader"
-        reason = f"{type(exc).__name__}: {exc}"
-    if _ffi_write_ok:
-        _mpi_ok, _mpi_how = _probe_mpi_bootstrap_ffi("cpu")
-        if not _mpi_ok:
-            _ffi_write_ok = False
-            _stage = "mpi"
-            reason = (
-                f"the host FFI exports the write handler but MPI cannot "
-                f"bootstrap in this process: {_mpi_how}")
-    if _ffi_write_ok:
-        print_fn(
-            "  [config] slab_io=auto on CPU backend: host FFI exports "
-            "the collective phdf5 write handler and MPI can bootstrap "
-            f"({_mpi_how}).  Routing SlabIO through "
-            "PHDF5_FFI (bare-MPI C++ collective MPI-IO, no mpi4py needed) "
-            f"[{_slab_io_geometry()}]."
-        )
-        return SlabIOBackend.PHDF5_FFI
-
-    _host_ok, _host_reason = _probe_phdf5_host_tier()
-    if _host_ok:
-        print_fn(
-            "  [config] slab_io=auto on CPU backend: the host FFI write "
-            f"handler is unavailable ({reason}).  Routing SlabIO through "
-            "PHDF5_HOST (mpi4py + h5py-parallel) — same per-rank "
-            "collective MPI-IO write semantics."
-        )
-        return SlabIOBackend.PHDF5_HOST
-
-    return _slab_io_no_parallel_writer(
-        print_fn, platform_label="CPU (host)", tier1_stage=_stage,
-        tier1_reason=reason, tier2_reason=_host_reason)
-
-
-def _route_gpu_slab_io(print_fn) -> "SlabIOBackend":
-    """Pick the ``slab_io=auto`` backend on a non-CPU (GPU) JAX backend.
-
-    Same capability-probed, never-env-guessed contract as the CPU
-    router.  Tiers:
-
-    1. ``PHDF5_FFI`` — the CUDA FFI lib exports the collective write
-       handler AND MPI can bootstrap in this process.  **Node count is
-       not a condition.**
-
-       It used to be.  Until 2026-08-05 this router declined PHDF5_FFI
-       outright whenever ``SLURM_JOB_NUM_NODES > 1``, *without running
-       the probe*, citing a "known cross-node failure on multi-node GPU
-       stacks".  The failure that justified it was Intel MPI refusing a
-       launch configured with ``I_MPI_FABRICS=shm`` on Frontera — a
-       launcher misconfiguration, on an MPI stack and a machine this
-       router does not run on.  The Perlmutter GPU path is Cray MPICH
-       through Shifter.
-
-       Deleted after measuring the cell it forbade (job 56389339,
-       ``srun --mpi=cray_shasta -N 4 -n 16``): ``MPI_Comm_size()``
-       asserted == 16 on every rank, PHDF5_FFI write and read of a
-       0.5 GiB C128 array bit-exact on round-trip, and the payload md5
-       byte-identical to the same logical array written by 4 ranks on 1
-       node through a 2x2 mesh.  The branch was LIVE, not merely wrong: it read the max of
-       ``SLURM_JOB_NUM_NODES`` and ``SLURM_NNODES``, and while the former
-       is absent inside the Shifter container (it is a batch-level
-       variable), ``SLURM_NNODES`` is exported by every ``srun`` step —
-       measured 4 on the 4-node run.  So every multi-node GPU run really
-       did get silently demoted off the FFI writer, which is what the
-       archived logs show.
-    2. ``PHDF5_HOST`` — mpi4py + h5py-parallel present, MPI inits, AND
-       exactly one addressable device per process (the backend's
-       one-shard-per-process contract; a single process driving N GPUs
-       would fail at write time, so the probe declines it up front).
-    3. neither — :func:`_slab_io_no_parallel_writer`: **REFUSE** above
-       one process; ``H5PY_ALLGATHER``, announced, at exactly one.
-       "Always works" was never true at the scale this code is for: the
-       tier materialises the whole array on rank 0, which is precisely
-       the memory wall the per-rank-tile contract exists to delete, so
-       at P>1 routing to it is an OOM with a banner rather than a slow
-       success.  At P=1 the gather IS the per-rank write, so there is
-       nothing to refuse and refusing would only break laptop-scale
-       debugging.
-    """
-    import jax as _jax
-
-    reason = "ffi.common.ffi_loader import failed"
-    _ffi_write_ok = False
-    _mpi_how = "not probed"
-    # WHICH probe declined, for the refusal's fix line (_SLAB_IO_FIX).
-    _stage = "probe"
-    try:
-        from ffi.common.ffi_loader import probe_target
-        _ffi_write_ok, reason = probe_target("lorrax_phdf5_write", "CUDA")
-    except Exception as exc:                      # pragma: no cover
-        _stage = "loader"
-        reason = f"{type(exc).__name__}: {exc}"
-    if _ffi_write_ok:
-        # Handler presence is not capability: the tier calls
-        # MPI_Init_thread.  Same gate the CPU router applies.
-        _mpi_ok, _mpi_how = _probe_mpi_bootstrap_ffi("CUDA")
-        if not _mpi_ok:
-            _ffi_write_ok = False
-            _stage = "mpi"
-            reason = ("the CUDA FFI exports the write handler but MPI "
-                      f"cannot bootstrap in this process: {_mpi_how}")
-    if _ffi_write_ok:
-        print_fn(
-            "  [config] slab_io=auto on GPU backend: CUDA FFI exports "
-            "the collective phdf5 write handler and MPI can bootstrap "
-            f"({_mpi_how}).  Routing SlabIO through PHDF5_FFI "
-            f"[{_slab_io_geometry()}]."
-        )
-        return SlabIOBackend.PHDF5_FFI
-
-    _host_ok, _host_reason = _probe_phdf5_host_tier()
-    if _host_ok and _jax.local_device_count() != 1:
-        _host_ok = False
-        _host_reason = (
-            f"{_jax.local_device_count()} addressable devices in this "
-            "process; the PHDF5_HOST backend requires exactly one "
-            "shard per process (one GPU per process)")
-    if _host_ok:
-        print_fn(
-            "  [config] slab_io=auto on GPU backend: CUDA FFI write "
-            f"handler unavailable ({reason}).  Routing SlabIO through "
-            "PHDF5_HOST (mpi4py + h5py-parallel, per-rank collective "
-            f"MPI-IO of the device shard via host staging) "
-            f"[{_slab_io_geometry()}]."
-        )
-        return SlabIOBackend.PHDF5_HOST
-
-    return _slab_io_no_parallel_writer(
-        print_fn, platform_label="GPU (CUDA)", tier1_stage=_stage,
-        tier1_reason=reason, tier2_reason=_host_reason)
-
 
 class GspaceIO(str, enum.Enum):
     """How ψ(G) is moved into the ISDF r-chunk loop.
@@ -1356,24 +588,9 @@ _DEFAULTS = {
     # ``degen_avg_tol_ry`` matches BGW's ``TOL_Degeneracy = 1e-6 Ry``.
     "no_degen_averaging": False,
     "degen_avg_tol_ry": 1.0e-6,
-    # DEPRECATED (2026-07-27) tri-state boolean, superseded by
-    # ``slab_io``.  None (default) = unset: ``slab_io=auto`` routes by
-    # capability alone.  Explicit ``false`` forces the historical
-    # ``process_allgather`` + rank-0 ``h5py`` writer (same as
-    # ``slab_io = h5py_allgather``).  Explicit ``true`` is redundant —
-    # the router already prefers the parallel writers.
-    "use_ffi_io": None,
-    # SlabIO backend: "auto" (default — the capability-probed router for
-    # the active JAX platform, see ``_route_cpu_slab_io`` /
-    # ``_route_gpu_slab_io``) | "phdf5_ffi" | "phdf5_host" |
-    # "h5py_allgather".  Every enum value is reachable from the input
-    # file; an explicit value is honoured verbatim and fails loudly if
-    # unavailable.  ONE exception, and it is the whole point of the
-    # 2026-08-05 ruling: "h5py_allgather" is reachable at
-    # ``process_count() == 1`` and REFUSES above it, because that tier
-    # gathers the entire global array onto rank 0.  Same boundary for
-    # ``auto``: it selects that tier only at one process.
-    "slab_io": "auto",
+    # NOTE: ``slab_io`` and ``use_ffi_io`` were REMOVED as deck keys on
+    # 2026-08-06 — see ``_LEGACY_DECK_KEYS``.  There is one sharded-slab
+    # transport and the deck does not choose it.
     # ψ(G) source for the ISDF r-chunk loop.  Both modes keep ψ(G) on
     # the HOST in per-rank band-sharded layout and pull one band-chunk
     # at a time into the jit via io_callback — never more than one bc
@@ -1671,8 +888,10 @@ _DEFAULTS = {
     #       bit-identical to "replicated" (movement-only; A/B gated by
     #       tests/multi_device/sigma_omega_layout_ab.py under BOTH
     #       one_shot_dft and self_consistent).
-    #       Refusals (at driver resolve time, never mid-run): indivisible
-    #       σ band window, and slab_io=h5py_allgather at P>1.  There is no
+    #       Refusal (at driver resolve time, never mid-run): an
+    #       indivisible σ band window.  The second refusal here used to be
+    #       slab_io=h5py_allgather at P>1; that tier no longer exists
+    #       (2026-08-06), so the condition cannot arise.  There is no
     #       qp_solver refusal: the SC loop never rotates the cube (it is
     #       absent from the finalize `replace` at sc_iteration.py:1321),
     #       so there is no rotation seam to port, and the two layouts
@@ -1733,13 +952,21 @@ _DEFAULTS = {
 # legacy/deprecation branch in ``read_lorrax_input`` (raise or dedicated
 # DeprecationWarning).  The unknown-key check skips these so one deck key
 # never draws two messages.  Keys that are deprecated but still in
-# _DEFAULTS (self_consistent, sigma_at_dft_energies, use_ffi_io) need no
-# entry here.
+# _DEFAULTS (self_consistent, sigma_at_dft_energies) need no entry here.
 _LEGACY_DECK_KEYS = frozenset({
     "use_shipped_minimax_tables",   # refused with replacement named
     "chunk_size",                   # warn-and-ignore (planner-owned)
     "output_file",                  # warn-and-ignore (sigma_diag_file)
     "eqp_output_file",              # warn-and-ignore (auto eqp0/eqp1)
+    # 2026-08-06: the sharded-slab transport is no longer selectable from
+    # a deck.  There was one correct value and three wrong ones, two of
+    # which named tiers that have been deleted; a key whose only legal
+    # setting is the default is not configuration.  Both are
+    # warn-and-ignore rather than refuse: they never changed a NUMBER,
+    # only which library moved the bytes, so an old deck should keep
+    # running and say what it lost.  See file_io/slab_io.py.
+    "slab_io",                      # warn-and-ignore (one transport now)
+    "use_ffi_io",                   # warn-and-ignore (deprecated 2026-07-27)
 })
 
 # Keys whose string values should be lowercased and stripped
@@ -1762,7 +989,7 @@ _NORMALIZE_STR = {
 # Tri-state booleans: _DEFAULTS value is None (= unset), an explicit
 # input-file value parses as bool.  The parse loop needs the set because
 # ``default is None`` otherwise means "nullable float".
-_NULLABLE_BOOL = frozenset({"use_ffi_io"})
+_NULLABLE_BOOL = frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -1866,11 +1093,6 @@ def read_lorrax_input(filename: str) -> dict:
                     DeprecationWarning, stacklevel=2,
                 )
 
-        # 'use_ffi_io' deprecation warns ONCE, at the resolution site in
-        # ``from_input_file`` (which distinguishes the true/false/overridden
-        # cases).  A second generic warning here made one deck emit two
-        # overlapping DeprecationWarnings for one key (audit fix/zq
-        # 2026-07-28).
 
         # REMOVED keys (owner-approved deletions, 2026-07-31; these behave
         # like any other unknown deck key — reported by the unknown-key
@@ -1945,8 +1167,8 @@ def read_lorrax_input(filename: str) -> dict:
                 params[key] = default
             elif key in _NULLABLE_BOOL:
                 # Tri-state boolean (default None = unset); an explicit
-                # value parses as bool.  Currently only the deprecated
-                # ``use_ffi_io``.
+                # value parses as bool.  Currently EMPTY — the last member
+                # (``use_ffi_io``) became a legacy key on 2026-08-06.
                 params[key] = section.getboolean(key)
             elif isinstance(default, bool):
                 params[key] = section.getboolean(key)
@@ -2253,12 +1475,11 @@ class BackendConfig:
     """Three-axis backend selection: I/O + ψ(G) lifecycle + W Dyson plan.
 
     All three knobs were previously orthogonal-sounding boolean/string
-    flags in different namespaces (``use_ffi_io`` / ``gspace_mode`` /
+    flags in different namespaces (``gspace_mode`` /
     ``isdf_memory_mode``) that secretly toggled FFI paths.  Grouped here
     so :meth:`summary` can print one line at startup describing what's
     actually active per channel.
     """
-    slab_io: SlabIOBackend
     gspace_io: GspaceIO
     w_dyson_solver: str  # "local" | "distributed" (normalized; W Dyson plan)
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
@@ -2278,8 +1499,7 @@ class BackendConfig:
     def summary(self) -> str:
         """One-line "what's active" for the run banner."""
         return (
-            f"backend: slab_io={self.slab_io.value}, "
-            f"gspace_io={self.gspace_io.value}, "
+            f"backend: gspace_io={self.gspace_io.value}, "
             + (f"w_dyson_solver={self.w_dyson_solver}, "
                if self.w_dyson_solver != "local" else "")
             + f"distributed_cholesky={self.distributed_cholesky}, "
@@ -2338,7 +1558,6 @@ class LorraxConfig:
         config.compute_mode           # -> ComputeMode enum
         config.head.wcoul0_source     # head plumbing
         config.ppm.omega_p            # PPM probe ω
-        config.backend.slab_io        # which writer backend
         config.debug.sigma_freq_debug_output
 
     See module docstring for the full grouping.  ``cohsex.in`` keys
@@ -2520,16 +1739,10 @@ class LorraxConfig:
     #  ``config.memory.<field>`` etc. directly.
     # ------------------------------------------------------------------
 
-    @property
-    def use_ffi_io(self) -> bool:
-        """Legacy ``use_ffi_io: bool`` semantic — True for either of the
-        per-rank-parallel-write PHDF5 backends (``PHDF5_FFI`` on GPU,
-        ``PHDF5_HOST`` on CPU), False for the allgather fallback.
-        Callers use this to branch between rank-0-gather and per-rank
-        local-shard code paths; both PHDF5 variants share the latter.
-        """
-        return self.backend.slab_io in (
-            SlabIOBackend.PHDF5_FFI, SlabIOBackend.PHDF5_HOST)
+    # ``use_ffi_io`` (the property) is GONE with the tiers it
+    # distinguished.  It answered "is this a per-rank-parallel writer?",
+    # which now has one answer for every run, so a caller branching on it
+    # was branching on a constant.  2026-08-06.
 
     @property
     def gspace_mode(self) -> str:
@@ -2706,35 +1919,18 @@ class LorraxConfig:
         # ``ffi/cpp/phdf5/platform_seam.h``), so on CPU it is preferred
         # whenever the deployed lib exports the handler.
         #
-        #   * ``slab_io=auto`` (the default) ALWAYS runs the capability-
-        #     probed router for the active JAX backend — CPU:
-        #     ``_route_cpu_slab_io``, GPU: ``_route_gpu_slab_io``; both
-        #     PHDF5_FFI → PHDF5_HOST → (P>1: REFUSE | P==1:
-        #     H5PY_ALLGATHER, announced).  There is no third tier at
-        #     scale: the demotion was deleted 2026-08-06 (owner ruling,
-        #     per-rank tiles only).  Capability-probed, never
-        #     env-presence-guessed, loud about which tier it took, and
-        #     gated on NO other input key (an "auto" silently inert
-        #     behind a second key is quality-pattern #8; see
-        #     docs/dev/QUALITY_PATTERNS.md).
-        #   * ``use_ffi_io`` is a deprecated boolean override:
-        #     ``false`` forces H5PY_ALLGATHER (the pre-FFI writer),
-        #     ``true`` is the routed default anyway (no-op), unset means
-        #     "route".  Superseded by ``slab_io=<backend>``.
+        #   * the sharded-slab transport is NOT selected here any
+        #     more.  There is one, it is capability-checked at the file
+        #     open by ``file_io.slab_io.assert_available``, and a stack
+        #     that cannot serve it refuses there naming the probe that
+        #     declined.  Removing the deck key removed the router, the
+        #     three tiers and seven refusals with it (2026-08-06).
         #   * on CPU, explicit ``cusolvermp`` is
         #     REFUSED at parse time (CUDA-only backend; doctrine 3);
         #     ``distributed_lu = auto`` demotes to ``"off"`` (in-tree
         #     per-q ``jnp.linalg.solve``) with an announcement.
         #
         # User-facing: same ``cohsex.in`` works on both backends.
-        _use_ffi_io_in = _g("use_ffi_io")   # None (unset) | True | False
-        if _use_ffi_io_in is not None:
-            _use_ffi_io_in = bool(_use_ffi_io_in)
-        # Vocabulary check HERE, at its original position in the parse
-        # order, so a typo'd key still refuses before the expensive
-        # validations below; ``resolve_slab_io_backend`` re-checks with the
-        # same function, which is the single source for the vocabulary.
-        _slab_io_in = _validate_slab_io_key(_g("slab_io"))
         # Distributed-linalg axes.
         _dist_chol = str(_g("distributed_cholesky")).strip().lower()
         _dist_lu = str(_g("distributed_lu")).strip().lower()
@@ -2801,16 +1997,6 @@ class LorraxConfig:
             _is_cpu_backend = _jax.default_backend() == "cpu"
         except Exception:
             _is_cpu_backend = False
-        # --- SlabIO backend resolution.  The precedence chain, the
-        # deprecation warnings and the H5PY_ALLGATHER-above-one-process
-        # post-check all live in ``resolve_slab_io_backend`` (module
-        # scope) since 2026-08-06, so ``bse/`` — which never builds a
-        # LorraxConfig — can reach the SAME decision instead of growing a
-        # second copy of it.  Nothing about the resolution changed in the
-        # move; see that function's docstring for the rules.
-        _slab_io_choice = resolve_slab_io_backend(
-            _slab_io_in, _use_ffi_io_in, print_fn=print_fn,
-            is_cpu_backend=_is_cpu_backend)
         if _is_cpu_backend:
             # Doctrine 3 (audit fix/zq 2026-07-28): an EXPLICIT
             # ``cusolvermp`` on a CPU JAX backend REFUSES at parse time —
@@ -2872,7 +2058,6 @@ class LorraxConfig:
                 "the JAX backend is not CPU; use distributed_lu = "
                 "auto|off|cusolvermp on GPU runs.")
         backend = BackendConfig(
-            slab_io=_slab_io_choice,
             gspace_io=GspaceIO(str(_g("gspace_mode")).strip().lower()),
             w_dyson_solver=_w_dyson_solver,
             distributed_cholesky=_dist_chol,
