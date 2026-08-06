@@ -377,6 +377,22 @@ def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *, require,
 
     Split out from the ctypes probe so it can be tested without an MPI.
     ``verdict`` is one of ``"ok"``, ``"unprobed"``, ``"refuse"``.
+
+    ``require`` gates the UNPROBED case only, and the MISMATCH case below
+    is unconditional.  That asymmetry is deliberate — "we could not check"
+    and "we checked and it is broken" are different facts — but the
+    mismatch message used to end with "LORRAX_PHDF5_REQUIRE_MPI_WORLD=0
+    downgrades this to a warning", which was never true of that branch
+    (found 2026-08-06).  A refusal that advertises an escape hatch it
+    does not implement is worse than a bare one: it sends the reader
+    looking for a variable that cannot help, on a failure whose whole
+    point is that it is invisible.  The sentence is gone rather than
+    implemented, because CLAIMS 68 measured what proceeding costs — with
+    a private singleton ``MPI_COMM_WORLD`` per rank the 8 hostile
+    geometries wrote and read back bit-exact at rc=0, correctly striped,
+    and only because disjoint hyperslabs need no collective handshake.
+    Two ranks on one chunk would be silent corruption. There is nothing
+    to downgrade to.
     """
     if mpi_size is None:
         msg = (f"SlabIO {tier}: could not verify the MPI world size "
@@ -400,8 +416,11 @@ def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *, require,
         f"wrong-with-rc=0 whenever two ranks touch one chunk.  The usual "
         f"cause is the launcher's PMI flavour: on Perlmutter/Cray MPICH use "
         f"`srun --mpi=cray_shasta`, NOT --mpi=pmi2.  Refused identically on "
-        f"every rank.  LORRAX_PHDF5_REQUIRE_MPI_WORLD=0 downgrades this to "
-        f"a warning.")
+        f"every rank, with NO downgrade: LORRAX_PHDF5_REQUIRE_MPI_WORLD "
+        f"gates only the 'could not probe' case, and CLAIMS 68 measured "
+        f"that proceeding here yields bit-exact-looking output at rc=0 "
+        f"from a wholly broken MPI, so there is nothing safe to downgrade "
+        f"to.  Fix the launcher.")
 
 
 def _probe_mpi_world_size():
