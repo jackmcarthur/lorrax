@@ -45,6 +45,18 @@ NOT WIRED IN YET — deliberately.  Turning this on today would refuse every
 Perlmutter GPU run, which is the correct behavior for an unsupported stack but
 is the OWNER's call to make, not an agent's.  Wiring is one line; see
 ``docs`` in :data:`RULE_UNSUPPORTED_VERSION`.
+
+One thing about that has changed, and it matters if the wiring decision is
+ever taken: until 2026-08-06 this gate was **unsatisfiable on every image**,
+not merely unsatisfied by the current one.  Two of its required private
+symbols exist on no NVIDIA container at any tag (measured on four, 0.5.3
+through 0.9.0), so wiring it would have refused a correct stack for a reason
+that had nothing to do with that stack.  Those two are gone (see
+:data:`REQUIRED_PRIVATE_SYMBOLS`).  What remains is a gate whose every clause
+is now something a real image can satisfy — the 0.5.3 container fails it
+honestly (version below floor, two patched arities wrong,
+``backend_compile_and_load`` absent), and a jax >= 0.7 container passes the
+private-surface half outright.
 """
 from __future__ import annotations
 
@@ -75,22 +87,31 @@ OVERRIDE_ENV = "LORRAX_JAX_UNSUPPORTED_OK"
 # --------------------------------------------------------------------------
 # The private-API shapes this tree is WRITTEN AGAINST.
 #
-# Measured 2026-08-06 on both legs (JID 56389339 / Frontera job 7890771):
+# Measured 2026-08-06 on both legs (JID 56389339 / Frontera job 7890771), and
+# re-measured the same day by importing jax._src inside FOUR container tags on
+# a Perlmutter A100 (JID 56405158) — which corrected two rows:
 #
-#   hook                              jax 0.5.3          jax 0.9.1
-#   --------------------------------  -----------------  ------------------
-#   _hash_accelerator_config          3 (…, backend)     2               <-- differs
-#   _hash_serialized_compile_options  3                  3
-#   get_executable_and_time           3                  4 (…, devices)  <-- differs
-#   is_executable_in_cache            2                  2
-#   compilation_cache_check_contents  ABSENT             present         <-- differs
-#   VerificationCache                 ABSENT             present         <-- differs
-#   backend_compile_and_load          ABSENT             present         <-- differs
+#   hook                              0.5.3   0.7.0   0.7.2   0.9.0   0.9.1
+#   --------------------------------  ------  ------  ------  ------  -----
+#   _hash_accelerator_config          3       2       2       2       2
+#   _hash_serialized_compile_options  3       3       3       3       3
+#   get_executable_and_time           3       4       4       4       4
+#   is_executable_in_cache            2       2       2       2       2
+#   backend_compile_and_load          ABSENT  pres.   pres.   pres.   pres.
+#   compilation_cache_check_contents  ABSENT  ABSENT  ABSENT  ABSENT  pres.†
+#   VerificationCache                 ABSENT  ABSENT  ABSENT  ABSENT  pres.†
 #
-# The three ABSENT rows are why the existing try/except around
-# ``_install_compile_counter`` degrades SILENTLY on the GPU leg: the counter
-# never installs, so the compile-storm telemetry the docs promise is simply
-# not collected, with no announcement.
+#   † the 0.9.1 column is the Frontera venv, measured earlier and NOT
+#     re-measured here.  Every container column IS re-measured, and the
+#     containers are what the GPU leg runs.
+#
+# The ``backend_compile_and_load`` ABSENT is why the try/except around
+# ``_install_compile_counter`` degrades SILENTLY on the 0.5.3 GPU leg: the
+# counter never installs, so the compile-storm telemetry the docs promise is
+# simply not collected, with no announcement.
+#
+# The last two rows are the correction, and they are why this gate could not
+# be wired: see :data:`REQUIRED_PRIVATE_SYMBOLS`.
 # --------------------------------------------------------------------------
 REQUIRED_PRIVATE_ARITY: dict[tuple[str, str], int] = {
     ("jax._src.cache_key", "_hash_accelerator_config"): 2,
@@ -101,9 +122,24 @@ REQUIRED_PRIVATE_ARITY: dict[tuple[str, str], int] = {
 
 #: Private symbols that must merely EXIST for the compile-cache patches to
 #: resolve at call time.  Absence here is the silent class, so it refuses too.
+#:
+#: This list used to also demand ``compilation_cache.VerificationCache`` and
+#: ``config.compilation_cache_check_contents``.  Both are REMOVED, because
+#: neither exists on any NVIDIA JAX container at any tag — MEASURED
+#: 2026-08-06 on 0.5.3, 0.7.0, 0.7.2 and 0.9.0, absent on all four, including
+#: the 0.9 container that the table above was previously read as promising.
+#: A gate is only teeth if something can pass it: demanding a symbol no
+#: reachable image provides would have made :func:`enforce` refuse EVERY run
+#: the moment it was wired, on a stack that is otherwise fine.  That is worse
+#: than the silence it was written to replace, because it would have been read
+#: as "this JAX is unsupported" rather than "this check is unsatisfiable".
+#:
+#: ``common/jax_compile_cache.py`` reads both symbols with ``getattr(...,
+#: None)`` and skips content verification when they are absent, which is
+#: byte-for-byte what JAX's own ``get_file_cache`` does — so their absence is
+#: not a defect to refuse over.  If a future JAX does ship them, add them back
+#: as a measured capability, not as an inference from a version number.
 REQUIRED_PRIVATE_SYMBOLS: tuple[tuple[str, str], ...] = (
-    ("jax._src.compilation_cache", "VerificationCache"),
-    ("jax._src.config", "compilation_cache_check_contents"),
     ("jax._src.compiler", "backend_compile_and_load"),
     ("jax._src.api", "clean_up"),
     ("jax._src.distributed", "global_state"),
