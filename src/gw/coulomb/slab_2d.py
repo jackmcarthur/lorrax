@@ -38,16 +38,6 @@ class Slab2D:
         v = np.where(denom_zero, 0.0, v)
         return jnp.asarray(v, dtype=jnp.complex128)
 
-    def _vq_2d(self, qcart, zc):
-        # qcart already has qz=0 from sample_minibz_qpoints
-        denom = jnp.einsum("ij,ij->i", qcart, qcart)
-        base = 4.0 * jnp.pi / denom
-        kxy = jnp.linalg.norm(qcart[:, :2], axis=1)
-        # The "2 ·" pulls the 4π → 8π in front while the truncation factor
-        # ``(1 − e^{-zc·kxy})`` runs against the physical (qz=0) shell.
-        f2d = 2.0 * (1.0 - jnp.exp(-zc * kxy))
-        return base * f2d
-
     def v_head_minibz_avg(
         self, wfn, meta: Meta, shift_frac, *,
         alpha: float | None = None,
