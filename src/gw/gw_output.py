@@ -792,7 +792,19 @@ def write_results(
     # H₀ still reports itself exactly once, with the same wording.
     hartree_diag_ev = np.real(
         np.diagonal(sig_h_out[irr_idx], axis1=1, axis2=2))
-    sigma_x_diag_ev = np.real(np.diagonal(sig_x_out[irr_idx], axis1=1, axis2=2))
+    # MODE-CORRECT exchange, not the bare one.  ``sx_out`` is already
+    # resolved per mode ~50 lines up: results.sig_x under PPM (where Sigma =
+    # Sigma_x + Sigma_c and bare X is right), results.sig_sx under static
+    # COHSEX (where Sigma = Sigma_SX + Sigma_COH and there is no separate
+    # bare term).  ``assemble_eqp`` forms sigma_x_diag_ev +
+    # sigma_c_at_dft_diag_ev (eqp_bgw.py:378), so feeding it sig_x_out here
+    # substituted BARE exchange for SCREENED in every static run and dropped
+    # the SX-X piece: measured 6725.6 meV MAE against BGW Eqp0' on the Si
+    # 4x4x4 anchor, where the correct assembly gives 142.2 meV.  Invisible to
+    # the regression gate, which compares only the sigma_diag file -- and that
+    # writer already uses sx_out, which is why the two disagreed by exactly
+    # Sigma_SX (4.474 eV at Gamma band 1).
+    sigma_x_diag_ev = np.real(np.diagonal(sx_out[irr_idx], axis1=1, axis2=2))
     # Σ_c at E_DFT diagonal: in PPM mode this is the interpolated value
     # the driver already computed; in static modes it is the static Σ_COH
     # diagonal (post-degen-averaging if enabled).
