@@ -4,8 +4,8 @@ The header is intentionally small: only the irreducible content goes on
 disk.  Everything that can be derived from the file's ``mf_header``
 (crystal, k-grid, symmetry, FFT grid, ρ-cutoff) is **not** stored — the
 reader rebuilds those tables on the fly via
-:class:`common.symmetry_maps.SymMaps` and
-:mod:`centroid.orbit_syms`.
+:class:`symmetry_maps.SymMaps` and the
+:mod:`symmetry_maps` orbit helpers.
 
 What lives in ``isdf_header``
 -----------------------------

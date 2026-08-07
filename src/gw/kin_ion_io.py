@@ -156,7 +156,7 @@ def _resolve_against(path: str, base_dir: str) -> str:
 #   being Hermitian only to round-off.)
 #
 # Hence the unfold is a gather PLUS a conjugation on the time-reversed
-# rows, which is exactly what ``common.symmetry_maps.star_broadcast``
+# rows, which is exactly what ``symmetry_maps.star_broadcast``
 # does; this module calls it rather than re-deriving the rule.
 #
 # THE PREDICATE, AND WHY IT IS PASSED EXPLICITLY.  The rule below is
@@ -190,22 +190,31 @@ def _resolve_against(path: str, base_dir: str) -> str:
 # that CAN fail are a regenerated table diffed element-by-element against
 # one the full-BZ path produced, and a count of distinct rows.
 #
-# One more trap for whoever validates this next.  ``star_spread`` is the
-# obvious tool to reach for and it does NOT work on a TRS deck: it
-# compares each star member against the FIRST ROW of its star, and its
-# conjugation predicate is the member's own TRS flag, so whenever that
-# first row is itself time-reversed the comparison is off by a conjugate
-# and it reports a huge spread on a table that is exactly right.  The
-# predicate it wants is ``trs(member) XOR trs(ref)``.  That is not the
-# bug fixed here — the broadcast above is safe because ITS reference is
-# the untransformed IBZ slab, never a TRS row — but the two look alike
-# enough to be worth telling apart.
+# One more trap for whoever validates this next, and it is a DIFFERENT
+# trap than it was before 3e002f2.  ``star_spread`` is the obvious tool
+# to reach for and it now works on a TRS deck: it compares each member
+# against the FIRST ROW of its star and conjugates iff the two DIFFER in
+# TRS-ness — ``trs(member) XOR trs(ref)``, the one predicate, computed by
+# ``symmetry_maps._star_conj_flags`` and shared with ``star_broadcast``'s
+# ``trs_reference="star_row"`` branch and with both ``KStarMap`` paths.
+# (Before 3e002f2 it used the member's OWN flag and did report a huge
+# spread on a table that was exactly right whenever a star's first row
+# was time-reversed.  Comments written against that behaviour are stale.)
+#
+# What that does NOT make it is a check of the broadcast below.  The
+# operand here is the raw IBZ slab, so the predicate this module wants is
+# ``trs_reference="ibz_slab"``, the member's own flag — the two predicates
+# are still different rules for different operand flavours, and the 183.61
+# eV above is what mixing them up costs.  ``star_spread`` also still says
+# nothing about a table this routine wrote (the spread argument two
+# paragraphs up): it is a check on a table somebody ELSE produced at the
+# full-BZ k-points.
 
 
 def broadcast_ibz_to_full_bz(A_irr, sym):
     """``(nrk, …) → (nk_tot, …)`` through the star map, conjugating on TRS.
 
-    Thin adapter over :func:`common.symmetry_maps.star_broadcast` so the
+    Thin adapter over :func:`symmetry_maps.star_broadcast` so the
     time-reversal rule has ONE implementation in the tree.  ``star_broadcast``
     orders ``A_irr`` by ``star_select``'s first-occurrence rows; the sweeps
     here run on ``k='ibz'``, whose rows are raw IBZ indices, so the labels

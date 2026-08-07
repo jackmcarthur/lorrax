@@ -30,7 +30,7 @@ charge density from them and ask the density what symmetries it has.
     3. Invariants.  ∫ρ d³r = N_elec and ρ ≥ 0.
 
 The verdict from (1) is stored on the loader as ``trs_holds`` and is
-consulted by :class:`common.symmetry_maps.SymMaps`, which refuses to
+consulted by :class:`symmetry_maps.SymMaps`, which refuses to
 select time-reversal rows when the density says TRS is broken —
 regardless of what the flags imply.  Correctness of the unfold for
 magnetic systems is thereby protected *structurally*, not by convention.
@@ -50,7 +50,7 @@ THE TRS ALGEBRA, WRITTEN OUT SO IT CAN BE AUDITED
 =================================================
 Everything below is spin-1/2 (``nspinor == 2``), BGW/LORRAX conventions.
 The companion derivation for the *unfold* side lives in
-``common.symmetry_maps.unfold_psi``; the two must agree and are
+``symmetry_maps.unfold_psi``; the two must agree and are
 cross-checked in ``tests/test_symmetry_unfold.py``.
 
 **(T1) The operator.**  Time reversal for spin-1/2 is the ANTIUNITARY
@@ -507,7 +507,7 @@ def _grid_permutation(mtrx: np.ndarray, tau_2pi: np.ndarray,
     of grid point ``n``.  ``None`` when ``τ`` is not commensurate with
     the FFT grid (the op cannot be represented as a grid permutation).
 
-    Convention source: ``centroid.orbit_syms.compute_centroid_sym_perm``
+    Convention source: ``symmetry_maps.compute_centroid_sym_perm``
     and ``SymMaps.validate_atomic_symmetries`` — both use
     ``Rinv = inv(mtrx)`` and ``τ_frac = tnp / 2π``.
     """
@@ -956,8 +956,8 @@ def check_density_symmetries(
                     f"produce a wrong ψ. "
                     f"[audit: occupied-cut gap ε[{nocc}]−ε[{nocc - 1}] = "
                     f"{manifold_gap:.3e}; if that is ~0 see (T5) in "
-                    f"common/density_symmetry_check.py before believing "
-                    f"this verdict]")
+                    f"symmetry_maps/density_symmetry_check.py before "
+                    f"believing this verdict]")
 
     # --- 2. spatial table ---------------------------------------------
     spatial_residual = np.full(ntran, np.nan, dtype=np.float64)

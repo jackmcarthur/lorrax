@@ -1010,9 +1010,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # k-grid and needs the whole grid.  ``broadcast`` is an index gather
     # plus a conjugation on time-reversed members -- a band index is
     # symmetry-inert, so no umklapp phase or centroid permutation enters
-    # (see common.symmetry_maps, above star_select).
+    # (see symmetry_maps.maps, above star_select).
     # The broadcast is a device gather and keeps the operand's sharding
-    # (``common.symmetry_maps``, ``_row_out_sharding``), so U_full arrives
+    # (``symmetry_maps``, ``_row_out_sharding``), so U_full arrives
     # at ``band_rotation_spec`` — what ``rotate_bands`` and
     # ``rotate_wavefunctions`` want — and U never crosses to the host.  It
     # needs no ``_place`` first, unlike the host-numpy form it replaces.

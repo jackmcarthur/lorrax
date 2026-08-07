@@ -122,7 +122,7 @@ def build_rho_val_from_wfn(wfn, sym, meta, n_occ: int, *, verbose: bool = True) 
     Parameters
     ----------
     wfn : file_io.WFNReader
-    sym : common.symmetry_maps.SymMaps
+    sym : symmetry_maps.SymMaps
     meta : common.Meta
     n_occ : int
         Number of occupied bands per k (insulator).  For FR/nspinor=2 this

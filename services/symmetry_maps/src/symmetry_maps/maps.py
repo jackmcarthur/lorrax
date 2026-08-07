@@ -537,8 +537,31 @@ def unfold_v_q_bispinor_lorentz(
                                   · R_proper[s(q), j-1, β-1]
                                   · V^{α,β}_unfolded[q, μ, ν]
 
-    where ``s(q) = sym_idx[q]`` and ``R_proper`` is the proper (det = +1)
-    Cartesian rotation table on ``SymMaps``.  TRS rows reuse the spatial
+    where ``s(q) = sym_idx[q]`` and ``R_proper`` is the derivation's own
+    Cartesian rotation ``R_deriv = Aᵀ · mtrx⁻¹ · (Aᵀ)⁻¹``.
+
+    THE FORMULA ABOVE IS THE DERIVATION'S; THE TABLE THIS FUNCTION TAKES
+    IS ITS TRANSPOSE, AND THE CONTRACTION COMPENSATES.  ``SymMaps.R_proper``
+    is built from ``R_cart = Aᵀ · mtrx · (Aᵀ)⁻¹`` (with the det-flip), the
+    rotation ``get_spinor_rotations`` consumes and the one LORRAX's
+    ``U_spinor`` actually satisfies the σ-sandwich identity for.  Because
+    ``mtrx`` is orthogonal, that is ``R_deriv`` transposed row-wise, so
+    ``R_deriv^{i,α} = R_proper^{α,i}`` and the implemented contraction is
+
+        V^{i,j}_mixed[q, μ, ν]
+            = Σ_{α, β} R_proper[s(q), α, i-1] · R_proper[s(q), β, j-1]
+                       · V^{α,β}_unfolded[q, μ, ν]
+
+    (einsum ``'qai,qbj,abqmn->ijqmn'``).  Passing a table in the
+    derivation-text convention — e.g. the offline fixture
+    ``reports/bispinor_ibz_2026-05-16/cri3_R_proper.npz`` — WITHOUT
+    transposing it first applies the inverse rotation, which leaves norms,
+    hermiticity and traces intact.  This is the same inversion
+    ``syms_crystal_to_cartesian``'s docstring warns about; ``R_cart`` /
+    ``R_proper`` are the INVERSE Cartesian rotation and
+    ``SymMaps.R_cart_forward`` is the forward one.
+
+    TRS rows reuse the spatial
     ``R_proper``: the σ-flip TRS sigma-sign on (μ_L, ν_L) ∈ {1,2,3}²
     factorises as (−1)·(−1) = +1 on every stored UNIQUE_TILE and is
     absorbed by the existing scalar ``unfold_v_q`` conj-wrap (derivation
@@ -555,9 +578,10 @@ def unfold_v_q_bispinor_lorentz(
     sym_idx : np.ndarray | jax.Array
         ``(n_q_full,)`` int — ``SymMaps.sym_idx_q`` (TRS-augmented).
     R_proper_table : np.ndarray
-        ``(2·n_sym_spatial, 3, 3)`` float64 — ``SymMaps.R_proper``.
-        Both spatial and TRS halves contain the same spatial ``R_proper``
-        per the derivation.
+        ``(2·n_sym_spatial, 3, 3)`` float64 — ``SymMaps.R_proper``, in
+        the LORRAX ``Aᵀ · mtrx · (Aᵀ)⁻¹`` convention, NOT the derivation
+        text's transpose of it (see above).  Both spatial and TRS halves
+        contain the same spatial ``R_proper`` per the derivation.
     mesh_xy : jax.sharding.Mesh
         Device mesh (used to lock the output sharding).
 
@@ -794,7 +818,7 @@ def unfold_psi(
 
         INDEPENDENT MEASUREMENT. Whether TRS holds AT ALL for a given file
         is no longer inferred from ``ntran``/k-weights: it is measured from
-        the wavefunctions by ``common.density_symmetry_check`` (identity
+        the wavefunctions by ``density_symmetry_check`` (identity
         (★★★) there: m_{−k}(r) = −m_k(r)), and a False verdict removes the
         TRS rows from ``SymMaps``'s search set so this branch is never
         reached. That measurement deliberately uses NO symmetry operation,
@@ -910,7 +934,7 @@ class SymMaps:
                 (default) takes the value from ``wfn.trs_holds`` — the
                 MEASURED verdict that ``WfnLoader`` obtains by building
                 the spin-resolved density from the raw IBZ wavefunctions
-                (``common.density_symmetry_check``) — falling back to
+                (``density_symmetry_check``) — falling back to
                 ``True`` (the historical, permissive behaviour) for
                 wfn-shaped objects that carry no verdict.
 
@@ -1040,7 +1064,7 @@ class SymMaps:
         # BGW convention: `mtrx` (= `sym_matrices` here) acts on G-vectors
         # in column form: `G' = mtrx @ G`. For real-space coords the
         # corresponding action uses `Rinv = inv(mtrx)`: `r' = Rinv @ r + τ`
-        # (see centroid/orbit_syms.compute_centroid_sym_perm at line 285,
+        # (see orbit_syms.compute_centroid_sym_perm,
         # and BerkeleyGW/Common/symmetries.f90:189 which stores mtrx as
         # invert(mtrx_inv) where mtrx_inv is the real-space rotation).
         self.sym_matrices = wfn.sym_matrices[:wfn.ntran]
@@ -1077,11 +1101,11 @@ class SymMaps:
         #      supplied by ``sym_mats_k[sym_idx] = −S`` flowing into
         #      ``WfnLoader.gvecs(k='full_bz')``.  Half of Θ without the
         #      other half = ψ(r) → ψ*(−r) = scorecard §Q.
-        #   4. ``common.density_symmetry_check`` MEASURES whether TRS is
+        #   4. ``density_symmetry_check`` MEASURES whether TRS is
         #      a symmetry of these particular wavefunctions at all, from
         #      the magnetization density, using none of 1–3.  Its verdict
         #      arrives here as ``wfn.trs_holds`` and drives (2).
-        # ``centroid.orbit_syms.compute_centroid_sym_perm(extend_trs=True)``
+        # ``orbit_syms.compute_centroid_sym_perm(extend_trs=True)``
         # is the real-space counterpart: TRS leaves r fixed, so its rows
         # duplicate the spatial rows rather than negating anything.
         time_reversal_syms = -self.sym_mats_k  # S @ k -> -S @ k
@@ -1777,12 +1801,29 @@ class SymMaps:
 #
 #     ⟨Θm,k|O|Θn,k⟩ = conj(⟨m,k|O|n,k⟩)   ⇒   O(−k) = conj(O(k))
 #
-# ``sym_idx_k >= n_sym_spatial`` marks a time-reversed ROW, the same
-# convention ``unfold_psi`` and ``unfold_v_q`` use.  The star helpers need
-# one step past that: they relate a member to another FULL-BZ ROW (the
-# star's first member), which carries a ``sym_idx`` of its own, so the
-# conjugation applies iff the two DIFFER in TRS-ness — see
-# :func:`_star_conj_flags`.  Assuming equality
+# THE STAR PREDICATE IS AN XOR.  A star helper relates a member to
+# another FULL-BZ ROW — the star's first member — which carries a
+# ``sym_idx`` of its own, so the conjugation applies iff the two DIFFER
+# in TRS-ness:
+#
+#     conj(member) ⟺ trs(member) XOR trs(first row of member's star)
+#
+# That is :func:`_star_conj_flags`, and it is the ONLY conjugation rule
+# in this module's star surface: ``star_spread`` (via
+# :func:`_spread_tables`), ``star_broadcast(trs_reference="star_row")``
+# and both ``KStarMap`` paths all read it, and nothing re-derives it.
+# Landed 3e002f2; comments elsewhere in the tree that describe the star
+# helpers as using the member's own flag predate it.
+#
+# The member's own flag — ``sym_idx_k >= n_sym_spatial``, the convention
+# ``unfold_psi`` and ``unfold_v_q`` use — is the RIGHT predicate for
+# exactly one flavour of operand: a raw IBZ slab, whose rows carry no
+# symmetry operation and so are TRS-false by construction.  That is
+# ``star_broadcast(trs_reference="ibz_slab")``, and the XOR reduces to it
+# when every star's first row happens to be spatial.  The two flavours
+# are named, never defaulted between; see :func:`star_broadcast`.
+#
+# Assuming plain equality
 # instead is not a small error: on MoS₂ 4×4 (nk 16→10, 6 TRS pairs) the
 # conjugation rule holds to 1.2e-16 while equality is off by 3.6e-01
 # RELATIVE, on every non-singleton star, and hermiticity, the norm and the
@@ -2076,8 +2117,13 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
     # ANY ordering: both directions address ``A_irr`` by position in one
     # array.  ``np.unique`` is ascending in the label, which coincides with
     # first-occurrence order on most k-maps and not on all of them --
-    # mos2_4x4's WFN gives labels [0, 2, 6, 8, 7] -- and where they differ
-    # the broadcast returned another star's matrix.
+    # ``tests/regression/gnppm_debug`` gives labels [0, 2, 6, 8, 7] against
+    # a sorted [0, 2, 6, 7, 8], swapping the last two -- and where they
+    # differ the broadcast returned another star's matrix.  (That table is
+    # gnppm's own, re-derived from ``SymMaps(wfn)`` on 2026-08-07 and
+    # committed as ``tests/data/star_tables_e9340d1.json``; it was
+    # attributed to mos2_4x4 here until then, which is a deck this tree
+    # carries no fixture for.)
     labels = (_star_row_order(irr)[1] if irr_labels is None
               else np.asarray(irr_labels))
     pos = {int(v): i for i, v in enumerate(labels)}

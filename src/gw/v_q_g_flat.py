@@ -24,7 +24,7 @@ Math:
     V_q[μ, ν] = Σ_G  conj(ζ̃_{q,μ}(G)) · v(q+G) · ζ̃_{q,ν}(G)
     g0_μ(q)   = ζ̃_{q,μ}(G=0)               # = ζ̃[μ, 0] by sphere convention
 
-IBZ unfold runs post-loop via ``common.symmetry_maps.unfold_v_q`` (V_q)
+IBZ unfold runs post-loop via ``symmetry_maps.unfold_v_q`` (V_q)
 and the local :func:`_unfold_g0_ibz_to_full` (g0); the V_q output
 sharding ``P(None, 'x', 'y')`` matches.
 """

@@ -425,7 +425,7 @@ def fit_zeta_to_h5(
         # shape as V_q, and Cholesky is per-q independent — slice-then-
         # factor gives bit-equal L_q rows as factor-then-slice.  The
         # downstream solve still produces ζ_q at IBZ, and V_q unfolds via
-        # ``common.symmetry_maps.unfold_v_q`` from IBZ → full BZ.  Same
+        # ``symmetry_maps.unfold_v_q`` from IBZ → full BZ.  Same
         # slice helper applies to χ_q for the W_q = (1 − v_q χ_q)^{-1} v_q
         # path once that lands.
         if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:

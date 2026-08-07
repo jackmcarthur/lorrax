@@ -203,7 +203,7 @@ def full_bz_k_weights(nk: int) -> np.ndarray:
 def k_star_weights(kstar) -> np.ndarray:
     """Star multiplicities for a reduced k-set, in the map's own row order.
 
-    ``kstar`` is a ``common.symmetry_maps.KStarMap`` (duck-typed on
+    ``kstar`` is a ``symmetry_maps.KStarMap`` (duck-typed on
     ``irr_idx`` and ``select``, so this module keeps no symmetry import).
     ``w[j]`` is the number of full-BZ k that ``select`` collapsed into row
     ``j``: ``np.bincount(irr_idx)`` counted per star, spread back over the

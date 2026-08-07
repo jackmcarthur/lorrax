@@ -254,9 +254,15 @@ def check_spread_rel_is_one_replicated_scalar(mesh):
         f"a REPLICATED device operand must propagate NaN; got {rep!r}")
     assert not (rep <= 1e-6), "a NaN spread must REFUSE, not pass"
 
-    # RECORDED so the four-rank artifact carries the number: on an emulated
-    # mesh this is -inf (see the xfail cell); whether a REAL four-process
-    # all-reduce loses NaN the same way has never been measured.
+    # RECORDED so the four-rank artifact carries the number, and it is NOT
+    # the same number the emulated mesh gives.  MEASURED 2026-08-07,
+    # Perlmutter, jax 0.7.0, JAX_PLATFORMS=cpu, srun -n 4 at BOTH 2x2 and
+    # 4x1: this returns ``nan`` — the real cross-process all-reduce
+    # PROPAGATES.  On a single-process EMULATED four-device mesh it
+    # returns -inf (the strict xfail cell below).  Two variables move
+    # between those legs — process topology and jax version — and which
+    # one causes the loss is unresolved; this line is the artifact that
+    # keeps the distinction from being lost.
     _, shard_poisoned, _ = _nan_operand(mesh, P(None, "x", "y"))
     sharded = km.spread_rel(shard_poisoned)
     return (f"spread_rel {got:.3e}, replicated-NaN propagates, "
@@ -309,11 +315,13 @@ def test_the_check_body_passes_on_an_emulated_2x2(body):
 
 
 @pytest.mark.xfail(strict=True, reason=(
-    "MEASURED DEFECT, jax 0.9.1 / XLA CPU: a PARTITIONED max reduction "
-    "discards NaN.  Not this package's arithmetic — see the docstring — and "
-    "out of scope for the symmetry_maps branch, so it is carried as a "
-    "strict xfail rather than silently softened.  Delete the marker the day "
-    "the reduction propagates."))
+    "MEASURED DEFECT on an EMULATED four-device mesh, jax 0.9.1 / XLA CPU: "
+    "a PARTITIONED max reduction discards NaN.  A REAL srun -n 4 mesh "
+    "propagates it (measured 2026-08-07) — see the docstring for both legs. "
+    "Not this package's arithmetic, and out of scope for the symmetry_maps "
+    "branch, so it is carried as a strict xfail rather than silently "
+    "softened.  Delete the marker the day the emulated reduction "
+    "propagates."))
 def test_a_nan_survives_the_sharded_reduction():
     """S3's remaining half, and it does NOT hold.  Measured, not inferred.
 
@@ -343,9 +351,24 @@ def test_a_nan_survives_the_sharded_reduction():
     coming back from a collective that compared NaN and lost.  ``jnp.sum``
     is unaffected.
 
-    CONSEQUENCE, and this is the owner-visible part: at P>1 a NaN Σ makes
-    ``spread_rel`` return −inf, ``-inf <= 1e-6`` is True, and the k-star
-    spread gate PASSES a poisoned iteration.  Every production run is P>1.
+    WHAT THE REAL FOUR-RANK LEG SAYS, measured afterwards and NOT the same
+    answer.  2026-08-07, Perlmutter, jax 0.7.0, ``JAX_PLATFORMS=cpu``,
+    ``srun -n 4`` at 2x2 AND 4x1, the same
+    ``check_spread_rel_is_one_replicated_scalar`` body: ``sharded-NaN ->
+    nan``.  A real cross-process all-reduce PROPAGATES.  So the loss above
+    is so far an EMULATED-mesh result only, and two things differ between
+    the legs — process topology (one process holding four devices vs four
+    processes) and jax version (0.9.1 vs 0.7.0).  Which one causes it is
+    UNRESOLVED; a deconfound probe belongs in the land-readiness report,
+    not in this docstring.
+
+    CONSEQUENCE, and this is the owner-visible part: WHEREVER the loss
+    holds, a NaN Σ makes ``spread_rel`` return −inf, ``-inf <= 1e-6`` is
+    True, and the k-star spread gate PASSES a poisoned iteration.  The
+    real-rank measurement above is the reason that is not yet a statement
+    about production — it is a statement about every mesh that reduces the
+    way this one does, and about any jax upgrade that makes a production
+    mesh reduce that way.
 
     NOT FIXED HERE.  ``_star_stats`` is a diagnostic on a
     register-don't-touch module and the fix is a decision about which

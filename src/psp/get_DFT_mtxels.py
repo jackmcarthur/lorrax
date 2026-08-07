@@ -283,7 +283,7 @@ def valence_density_from_kpoint(
 # that residual, while every other term agrees to round-off.
 #
 # The permutation table and the star average are BOTH taken from the
-# existing implementations (``centroid.orbit_syms.compute_rgrid_sym_perm``,
+# existing implementations (``symmetry_maps.compute_rgrid_sym_perm``,
 # ``gw.qsgw_density.symmetrise_density``, already used by the QSGW density
 # loop and by ζ's full-BZ unfold) so there is one grid-rotation convention
 # in the code base, not two.
@@ -299,7 +299,8 @@ _RHO_SYM_PERM_CACHE: dict[tuple, "np.ndarray | None"] = {}
 #: cleaned up — either the k-set was reduced (legitimate, and the
 #: projection is then mandatory rather than cosmetic) or the file's
 #: symmetry block does not describe these wavefunctions (not legitimate,
-#: and ``common.density_symmetry_check`` will have said so at load time).
+#: and ``symmetry_maps.check_density_symmetries`` will have said so at
+#: load time).
 RHO_SYM_WARN = 1.0e-3
 
 
@@ -393,8 +394,9 @@ def symmetrize_valence_density(rho_r, wfn, *, print_fn=None):
             f"Expected when rho was built from a REDUCED k-set (the "
             f"projection is then what makes it the crystal's density at "
             f"all); otherwise the file's symmetry block does not describe "
-            f"these wavefunctions, and common.density_symmetry_check will "
-            f"have said so at load time.",
+            f"these wavefunctions, and "
+            f"symmetry_maps.check_density_symmetries will have said so at "
+            f"load time.",
             RuntimeWarning)
     return rho_sym
 
