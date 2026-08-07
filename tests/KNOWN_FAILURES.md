@@ -432,10 +432,29 @@ another code).  Those are the gates that would see a physics change; these
 two answer "does the frozen MoS2 output reproduce on a different machine",
 and that answer should not turn on the 6th decimal of a text file.
 
-`_assert_matches_reference` now PRINTS the observed max |Δ| and what
+`_assert_matches_reference` now REPORTS the observed max |Δ| and what
 fraction of the atol budget it used, on every run, pass or fail — a
 tolerance whose headroom is invisible cannot be audited, and this ruling
 is exactly the kind that needs auditing later.
+
+**VERIFIED ON PERLMUTTER**, `svc/distrib_la-2026-08-07` @ `52f5024`,
+jobid **56457930**, `lx test -N 1 -G 1 -n 1`, serial (`-n 0`), BUILD_NOTES
+pins, artifacts `/pscratch/sd/j/jackm/svc_distrib_la/_reports_p1/p1b.{log,xml}`:
+
+| cell | max abs Δ | atol | budget used | cells over | cells differing |
+|---|---|---|---|---|---|
+| `test_gnppm_matches_reference` | **1.000e-06 eV** | 1e-05 | **10.0 %** | 0 | 36 / 2484 |
+| `test_bispinor_gnppm_matches_reference` | **1.000e-06 eV** | 1e-05 | **10.0 %** | 0 | 50 / 1620 |
+
+`2 passed in 69.61 s`.  Both were previously RED.  The drift is exactly
+the 1-ULP-of-the-6th-decimal the census measured — no larger — so the
+band has a full decade of headroom and is not absorbing anything else.
+
+**The tolerance was actually exercised.**  Both cells took the
+`assert_allclose` path, not the byte-identity early return (the report
+distinguishes the two by name).  A green here therefore means "the drift
+is inside the band", not "the files happened to match", which is the
+difference between a verified ruling and a vacuous one.
 
 **Neither reference was re-frozen.**  Re-freezing is the move that created
 this row; the fix is the comparison, not the data.
@@ -449,7 +468,22 @@ quadrature τ points, riding in a `float64` `meta` row.  It is not a
 rounding difference, it is not in eV, and a tolerance would hide a real
 change in how many points the window integrates over.  The 2026-08-07
 ruling therefore does not reach it, and applying it here would be
-laundering.  Stays ship-listed, class (b), still an **OWNER DECISION**:
+laundering.
+
+**RE-MEASURED in the same leg** (jobid 56457930, `_reports_p1/p1.log`) and
+it is WORSE than the row above recorded — not a 100-vs-98 count with
+otherwise-matching values, but a **shape mismatch with different
+contents**:
+
+    ω≥E_F cond|0|core|t not bit-identical
+    (shapes (100,), (98,) mismatch)
+     ACTUAL:  [ 2.666561,  6.499882,  6.936903,  8.974977, ...]
+     DESIRED: [ 5.442279e-09, 7.894766, 10.45215, 10.63999, ...]
+
+The τ-node *positions* disagree from the first element, so this is two
+different quadratures, not one quadrature sampled twice.  Whatever the
+answer is, it is not a tolerance.  Stays ship-listed, class (b), still an
+**OWNER DECISION**:
 either the ladder legitimately differs between the two machines' minimax
 tables (in which case the reference is platform-dependent data and needs a
 different mechanism than an atol), or one of the two is wrong.  Nobody has
