@@ -172,9 +172,10 @@ import jax.numpy as jnp
 def v_head_3d(Qcart: np.ndarray) -> np.ndarray:
     """Singular Coulomb head in 3D bulk:  v(Q) = 8π/|Q|² (Ry-Bohr units).
 
-    The factor of 8π (not 4π) matches the LORRAX/BGW convention used in
-    ``gw.compute_vcoul``: see the ``8.0 * π`` prefactor in the ``sys_dim=3``
-    branch of :func:`compute_sqrt_vcoul_0d`.
+    The factor of 8π (not 4π) matches the LORRAX/BGW convention used
+    throughout the Coulomb path: see the ``8.0 * np.pi`` prefactor in
+    :meth:`vcoul.Bulk3D._v_bare_per_q` (reached from ``gw.coulomb`` and
+    from ``gw.compute_vcoul.compute_v_q_per_G``).
 
     Q must NOT be the absolute-zone origin — the caller is responsible for
     routing  Q→0  through :func:`reconstruct_W_at_target_Q` with the q=0
@@ -224,8 +225,10 @@ def compute_g_mu_at_q(
 ) -> np.ndarray:
     """Return  g_μ(Q) = z_{q_red, μ}(G_Q) = (FFT of e^{-iq_red·r} ζ_μ(r)) at G_Q.
 
-    Convention matches :func:`gw.compute_vcoul.compute_V_q_from_zeta_array`:
-    ``g0_mu = ζ_μ(G=0)`` is exactly this routine called with ``Q_int = (0,0,0)``.
+    Convention matches :func:`gw.v_q_g_flat.compute_all_V_q_g_flat`, which
+    writes ``g0_μ(q) = ζ̃_{q,μ}(G=0)`` as ``zeta_L[:, 0]`` (the per-q sphere
+    puts G=(0,0,0) at slot 0): ``g0_mu`` is exactly this routine called with
+    ``Q_int = (0,0,0)``.
 
     For finite-Q targets that don't wrap (G_Q = 0), this is just the (0,0,0)
     plane-wave coefficient of  e^{-iq_red·r} ζ_μ.  When the target Q crosses

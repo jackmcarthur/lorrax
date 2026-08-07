@@ -1,77 +1,37 @@
-"""0D cell-box truncation: Wigner-Seitz real-space FFT, no q→0 divergence.
+"""COMPAT SHIM — 0D cell-box truncation (Wigner-Seitz real-space FFT).
 
-The body kernel and head share the same FFT — at q=0, ``vc0`` is just
-the G=0 entry of the truncated v(G), which is finite, so no mini-BZ
-sampling is needed.  See BerkeleyGW Common/trunc_cell_box.f90.
+The arithmetic moved to :class:`vcoul.Box0D` (2026-08-07); this is the
+``(wfn, meta)``-facing adapter.  ``_v_bare_per_q`` — including the q≠0
+REFUSAL and the "G=0 is not zeroed here" convention — is INHERITED from
+the service class, not re-spelled.
 
-The numerical FFT routine ``compute_vcoul_box`` lives in
-``gw/compute_vcoul_0d.py`` (the existing file, unchanged).
+Note the default arguments: ``nsamples`` / ``method`` / ``qmc_reps``
+default to ``None`` here rather than to the 3D/2D values, because a box
+head is finite from the FFT and never samples.  That was the shipped
+signature and it is preserved exactly.
 """
 from __future__ import annotations
 
 import jax
-import jax.numpy as jnp
-import numpy as np
 
 from common import Meta
-from ..compute_vcoul_0d import compute_vcoul_box
-from .base import SysDim, v_qG_single
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                               # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+import vcoul                                                # noqa: E402
+from vcoul import CoulombGeometry                           # noqa: E402
+
+__all__ = ["Box0D"]
 
 
-class Box0D:
-    sys_dim = SysDim.BOX_0D
-
-    def _v_bare_per_q(self, qf, gvec_q, *, bvec_f, fact,
-                      bdot=None, fft_grid=None):
-        """Wigner-Seitz cell-box truncation.  See the base Protocol.
-
-        ``compute_vcoul_box`` builds ``v(G)`` from a real-space FFT of the
-        WS-truncated kernel and takes **no q** — it is a q=0 routine (see
-        its docstring, "for q=0", and BGW ``Common/trunc_cell_box.f90``,
-        which a 0-D deck only ever calls at Γ because a box has one
-        k-point).  A q≠0 request is therefore REFUSED rather than served
-        the q=0 answer: silently returning ``v(G)`` for ``v(q+G)`` would
-        be wrong by ``O(|q|)`` with no symptom.
-
-        G=0 is NOT zeroed here, unlike 3D/2D.  Box truncation makes
-        ``v(G=0)`` finite, and :meth:`q0_average` returns exactly that
-        value as ``vc0``; this preserves the shipped ``v_qG`` behaviour.
-        Whether the G=0 slot should additionally be zeroed to avoid
-        double-counting against a rank-1 head injection is UNSETTLED and
-        untestable while the 0-D V_q path is unreachable — no per-q sphere
-        is built for sys_dim=0 at all (``gw/isdf_fitting.py:670``) and
-        ``compute_all_V_q_g_flat`` refuses sys_dim not in (2,3)
-        (``gw/v_q_g_flat.py:527``).  Deliberately not decided here.
-        """
-        if bdot is None or fft_grid is None:
-            raise ValueError(
-                "Box0D._v_bare_per_q needs bdot and fft_grid (the cell-box "
-                "truncation is a real-space FFT, not a closed form in bvec).")
-        q = np.asarray(qf, dtype=np.float64)
-        if float(np.dot(q, q)) > 1e-24:
-            raise NotImplementedError(
-                f"Box0D: v(q+G) requested at q={q.tolist()} != 0.  "
-                f"compute_vcoul_box is a q=0 routine (real-space WS FFT of "
-                f"v(G), no q argument); serving it at finite q would return "
-                f"v(G) where v(q+G) was asked for.  A 0-D box deck is "
-                f"Gamma-only, so this should not arise — if it does, the "
-                f"k-grid is wrong, not this kernel.")
-        gvecs = np.asarray(np.rint(gvec_q.T), dtype=int)       # (nG, 3)
-        v_raw = compute_vcoul_box(
-            np.asarray(bdot, dtype=np.float64),
-            np.asarray(fft_grid, dtype=int),
-            gvecs)
-        # Volume convention matches 3D/2D: v(q+G) / Omega_cell.
-        v = v_raw * fact
-        # ``denom`` is |q+G|^2 in Ry from bvec, the SAME operand the shared
-        # vcoul_cutoff_ry mask compares against in 3D/2D — the cutoff means
-        # the same thing in every dimension even though v does not.
-        qG_cart = bvec_f.T @ (qf[:, None] + gvec_q)            # (3, nG)
-        denom = np.sum(qG_cart * qG_cart, axis=0)              # (nG,)
-        return v, denom
+class Box0D(vcoul.Box0D):
+    """``(wfn, meta)``-facing :class:`vcoul.Box0D`."""
 
     def v_qG(self, wfn, qvec_wrapped, comps_qG) -> jax.Array:
-        return v_qG_single(self, wfn, qvec_wrapped, comps_qG)
+        return super().v_qG(CoulombGeometry.from_wfn(wfn), qvec_wrapped,
+                            comps_qG)
 
     def q0_average(
         self, wfn, meta: Meta, *,
@@ -88,11 +48,10 @@ class Box0D:
         enters only through the body of the dielectric matrix; the head
         is left untouched.  See BGW Common/vcoul_generator.f90:717.
         """
-        del S_cart, epshead, nsamples, method, qmc_reps
-        bdot = np.asarray(wfn.bdot, dtype=np.float64)
-        fft_grid = np.asarray(wfn.fft_grid, dtype=int)
-        g0 = np.array([[0, 0, 0]], dtype=int)
-        vc0_raw = compute_vcoul_box(bdot, fft_grid, g0)[0]
-        vc0_mean = jnp.asarray(vc0_raw / float(wfn.cell_volume),
-                               dtype=jnp.complex128)
-        return vc0_mean, vc0_mean
+        del meta        # a box is Gamma-only; the service takes no kgrid here
+        return super().q0_average(
+            CoulombGeometry.from_wfn(wfn),
+            S_cart=S_cart, epshead=epshead, nsamples=nsamples,
+            method=method, qmc_reps=qmc_reps,
+            analytic_sphere=analytic_sphere,
+        )

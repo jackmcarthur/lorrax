@@ -13,7 +13,8 @@ what the live G-flat V_q path needs:
   step any more.
 * :func:`build_v_head_miniBZ_avg_3d` — the 3D mini-BZ-averaged
   ``<v(q, G=0)>`` head table injected into ``compute_v_q_per_G`` for
-  bulk systems.
+  bulk systems.  Since 2026-08-07 it LIVES in ``vcoul.minibz`` and is
+  re-exported here; the name and signature at this path are unchanged.
 * :func:`compute_all_V_q` — the thin dispatcher: for a G-flat on-disk ζ
   it hands off to :func:`gw.v_q_g_flat.compute_all_V_q_g_flat`; any
   other layout raises ``NotImplementedError``.
@@ -28,71 +29,21 @@ from typing import Callable, Optional
 import h5py
 import numpy as np
 import jax
-import jax.numpy as jnp
 from jax.sharding import Mesh
 
 from file_io.paths import resolve_input_path
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                               # owner's workspace fix -- see _services.py)
 
+_services.ensure_on_path()
 
-def build_v_head_miniBZ_avg_3d(
-    kgrid: tuple[int, int, int],
-    bvec: np.ndarray,
-    cell_volume: float,
-    *,
-    nmc: int = 2**18,
-    seed: int = 42,
-) -> np.ndarray:
-    """Mini-BZ-averaged bare Coulomb head ``<v(q+δq, G=0)>_miniBZ`` per q.
-
-    3D bulk only.  Returns ``(nkx, nky, nkz)`` real array of head values
-    in Rydberg / cell-volume units.  q=0 returns 0 (the actual head is
-    injected separately via a rank-1 correction in the Σ_X path).
-
-    The MC integration draws ``nmc`` (default 2¹⁸) points uniformly on
-    the Voronoi cell of the mini-BZ and averages ``8π/|q+δq|²``.  The
-    G-flat path (:func:`compute_v_q_per_G`, called from
-    :func:`gw.v_q_g_flat.compute_all_V_q_g_flat`) consumes this table
-    as the ``v_head_miniBZ`` argument.
-    """
-    from .vcoul import wrap_points_to_voronoi
-    nkx, nky, nkz = (int(s) for s in kgrid)
-    bvec_j = jnp.asarray(bvec, dtype=jnp.float64)
-    rng = np.random.RandomState(seed)
-    randvals = rng.uniform(0, 1, (nmc, 3))
-    # Row convention: ``bvec`` rows are the Cartesian reciprocal vectors, so
-    # ``randvals @ bvec`` spans the b1,b2,b3 parallelepiped — a fundamental
-    # domain of the reciprocal lattice, which the Voronoi wrap below maps
-    # measure-preservingly onto the Voronoi cell.  ``randvals @ bvec.T``
-    # (shipped 2026-05-16..2026-08-07) spans the COLUMN parallelepiped,
-    # which is not a fundamental domain: the wrapped cloud double-covers
-    # part of the cell and misses part, with the same total volume, so no
-    # normalisation check can see it.  Si FCC is provably blind to the
-    # difference (bvec.T = P·bvec, P cyclic ⇒ pure reseed); on non-cubic
-    # cells it is a bias worth ~50 % of the whole mc-average correction.
-    # Pinned by tests/test_vcoul_minibz_head_draw.py; matches
-    # coulomb/base.py:298 and bse/vq_interp.py's draw.
-    randcart = (randvals @ bvec)
-    wrapped = np.asarray(wrap_points_to_voronoi(
-        jnp.asarray(randcart), bvec_j, nmax=1))
-    kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
-    randlims = bvec.T @ (np.diag(1.0 / kgrid_arr) @ np.linalg.inv(bvec.T))
-    dq_cart = (randlims @ wrapped.T).T  # (nmc, 3) mini-BZ offsets in Cartesian
-
-    v_head_avg = np.zeros((nkx, nky, nkz), dtype=np.float64)
-    for qx in range(nkx):
-        for qy in range(nky):
-            for qz in range(nkz):
-                qw = np.array([qx, qy, qz], dtype=np.float64)
-                qw = np.where(qw > kgrid_arr / 2, qw - kgrid_arr, qw)
-                q_frac = qw / kgrid_arr
-                q_cart = q_frac @ bvec
-                if np.dot(q_cart, q_cart) < 1e-12:
-                    v_head_avg[qx, qy, qz] = 0.0  # q=0 head handled separately
-                else:
-                    shifted = q_cart[None, :] + dq_cart  # (nmc, 3)
-                    denom = np.sum(shifted**2, axis=1)
-                    v_head_avg[qx, qy, qz] = np.mean(8.0 * np.pi / denom)
-    return v_head_avg * (1.0 / float(cell_volume))
+#: The 3D mini-BZ body-head table.  Moved to :func:`vcoul.minibz` on
+#: 2026-08-07 and re-exported here VERBATIM — including the seed=42 /
+#: nmc=2**18 defaults, which the ``si_bse_debug`` frozen reference pins,
+#: and the row-convention comment block that records what the transposed
+#: draw cost.  ``tests/test_vcoul_minibz_head_draw.py`` and
+#: ``gw.v_q_g_flat`` both import it from THIS path.
+from vcoul import build_v_head_miniBZ_avg_3d                # noqa: E402,F401
 
 
 def compute_v_q_per_G(

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vcoul"
+version = "0.1.0"
+description = "The bare and truncated Coulomb interaction as pure math: v(q+G) for 3D bulk / 2D slab / 0D box, mini-BZ Voronoi head averaging, the bare-Coulomb sphere predicate, and BerkeleyGW vcoul-file parity"
+requires-python = ">=3.12"
+
+# THE QUARANTINE, DECLARED.  scipy is NOT here: it is optional, it is
+# reached from exactly one function (`minibz_voronoi_batches`, for the
+# scrambled-Sobol generator), and it sits behind an announce-or-refuse
+# gate — `method="sobol"` REFUSES without it, `method="auto"` demotes and
+# says so once, `method="uniform"` never asks.  An installed vcoul on a
+# machine with no scipy imports fine, computes every v(q+G) and every
+# uniform-draw head, and refuses exactly one generator by name.
+#
+# Unlike lxkit, `import vcoul` DOES import jax, and that is correct rather
+# than a concession: `wrap_points_to_voronoi` is a jitted kernel and the
+# q0_average pair comes back as jax arrays because the head resolver
+# consumes them inside a jax computation.  numpy is the arithmetic
+# substrate for the host-side v(q+G) tables, which are built once at
+# consumer setup and pushed to device.
+#
+# NOT depended on, deliberately: lxkit.  vcoul owns no .so, probes no
+# device and counts no processes — there is no capability gate to share.
+# `lxkit.testing` is a TEST-time dependency (the import-isolation cell),
+# which is what the `test` extra is for.
+dependencies = ["numpy", "jax"]
+
+[project.optional-dependencies]
+# The scrambled-Sobol mini-BZ draw.  With it, the numbers are the pinned
+# production numbers; without it, `method="auto"` demotes to a uniform
+# draw with nsamples raised to 2.5e6 and announces once.
+sobol = ["scipy>=1.16.0"]
+test = ["pytest>=8.0.0", "numpy", "lxkit"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The SAME two markers the monorepo registers.  Declared in both places on
+# purpose: `pytest services/vcoul/tests` from the monorepo root picks THIS
+# file as its rootdir config (it is the nearest pyproject.toml above the
+# argument), so a service that only registered them upstairs emits
+# PytestUnknownMarkWarning on exactly the invocation the charter calls its
+# standalone one.
+markers = [
+    "services: a standalone service's own suite, staged into the main one",
+    "vcoul: the vcoul service suite",
+]

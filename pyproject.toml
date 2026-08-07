@@ -123,6 +123,7 @@ markers = [
     "extra: staged/tooling suites deselected by default (run with -m extra)",
     "services: a standalone service's own suite, staged into this one",
     "distrib_la: the distrib_la service suite (services/distrib_la/tests)",
+    "vcoul: the vcoul service suite (services/vcoul/tests)",
 ]
 
 [dependency-groups]

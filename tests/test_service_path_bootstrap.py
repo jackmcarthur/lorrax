@@ -130,4 +130,9 @@ def test_the_bootstrap_is_idempotent_and_appends():
         "assert once[:len(before)] == before, 'it PREPENDED; must append'\n"
         "print('ADDED', len(added))\n")
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
-    assert "ADDED 2" in r.stdout, r.stdout      # lxkit + distrib_la
+    # One entry per services/*/src, so this number is a CENSUS of the
+    # registered services and moves whenever one lands: lxkit + distrib_la
+    # were 2; vcoul made it 3 on 2026-08-07.  Asserting the count rather
+    # than merely "added something" is what makes a service that silently
+    # failed to register visible here.
+    assert "ADDED 3" in r.stdout, r.stdout      # lxkit + distrib_la + vcoul
