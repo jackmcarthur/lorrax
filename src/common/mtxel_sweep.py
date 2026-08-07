@@ -774,10 +774,13 @@ def sweep_matrix_elements(
     gvecs : (nk, ngkmax, 3) i32
         The loader's own fixed-shape table (D10) — ``PaddedGVectors.gvecs``.
     gmask : (nk, ngkmax) f64
-        Its pad mask.  MANDATORY, not optional: pad rows hold ``(0,0,0)``,
-        a valid box index that ALIASES physical Γ, so a forgotten mask does
-        not crash — it silently folds ψ(G=0) into every pad column, inside
-        H₀'s ~500 eV cancellation.
+        Its pad mask.  MANDATORY, not optional.  Pad rows carry the
+        FFT-box sentinel Miller index (see ``common.gvec_fft_box``), which
+        is a valid box cell, so a forgotten mask does not crash — it
+        silently contracts the sentinel column into every matrix element.
+        The sentinel is chosen so that no physical G of a padded row maps
+        to it, which makes the omission detectable rather than harmless;
+        it does not make the mask optional.
     box_index : (nk, nx, ny, nz) i32
         Sphere→box index map (``WfnLoader.box_index``).  Only consumed by
         operators that transform; the kinetic and dipole operators ignore it.

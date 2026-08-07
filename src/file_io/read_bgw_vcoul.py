@@ -90,8 +90,10 @@ def read_bgw_vcoul(path: str) -> BGWVcoulTable:
     non-IBZ q's), each computed from a fresh mini-BZ Monte-Carlo draw, so
     redundant blocks for the same q are NOT bit-identical at the few-meV
     level.  Trusting the first block per q is what matches BGW's internal
-    behaviour at outer-k = ``rk(1)``; later occurrences are MC-noise
-    siblings and should not leak into downstream Σ_X / V_q construction.
+    behaviour at outer-k = ``rk(1)``.  Later occurrences are repeats of
+    the same q emitted on subsequent passes of the writer's outer-k loop;
+    only the first block of each q is consumed, and the remaining full-BZ
+    q are resolved through the symmetry map rather than from the file.
 
     We detect the boundary as "first repeated q-coord": once an
     already-seen q reappears, sigma has wrapped to its second outer-k

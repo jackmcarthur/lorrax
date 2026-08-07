@@ -1443,11 +1443,19 @@ class SymMaps:
         the cartesian image of LORRAX's ``mtrx`` (= ``sym_matrices``) — NOT
         of ``mtrx.T`` (= ``sym_mats_k``), NOT of ``inv(mtrx)``.
 
-        Empirically verified against nosym ground truth on Si 4×4×4 SOC
-        (Fd-3m, 48 ops): U_spinor built from this R_cart reproduces nosym ψ
-        to ~3e-6 within the degenerate-subspace unitary gauge — five orders
-        of magnitude tighter than the pre-fix code. See
-        ``reports/trs_sym_audit_2026-05-14/algebraic_unfold_{cri3,si}.md``.
+        Verified against nosym ground truth: U_spinor built from this
+        R_cart reproduces the nosym ψ within the degenerate-subspace
+        unitary gauge.
+
+        CAUTION FOR OTHER CONSUMERS.  Because ``mtrx`` is the inverse
+        real-space rotation while ``mtrx.T`` is what acts on k and G, this
+        matrix is the INVERSE of the Cartesian rotation that carries
+        k_irr to S·k_irr.  ``get_spinor_rotations`` is unaffected — its
+        quaternion extraction uses the transposed Shepperd form, so the two
+        inversions cancel — but anything rotating a Cartesian INDEX (a
+        dipole or any rank≥1 operator) must use the TRANSPOSE of this
+        matrix.  Using it untransposed leaves norms, hermiticity and traces
+        intact, so the error is invisible to the obvious checks.
 
         Conjugation formula (column form, ``r_cart = avec.T @ r_frac`` where
         ``avec[i, :]`` is the i-th real-space lattice vector):
