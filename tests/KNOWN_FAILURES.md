@@ -284,6 +284,36 @@ the non-xdist leg that must still be pinned.
 
 ## SHIP-LISTED FAILURES
 
+### **L-3 — cuSOLVERMp `eigh` with `compute_evecs=False` fails at every `n`** (library defect, now REFUSED at resolve time)
+
+| | |
+|---|---|
+| tests | none go red: the combination is refused before it can run.  Contract cells `test_resolve_cusolvermp_eigh_refuses_compute_evecs_false`, `test_resolve_cusolvermp_eigh_compute_evecs_true_is_unchanged`, `test_cusolvermp_wrapper_refuses_compute_evecs_false_without_a_gpu` |
+| class | (e) third-party library defect — cuSOLVERMp 0.7.2, not LORRAX code |
+| evidence | `XlaRuntimeError: INTERNAL: cusolverMpSyevd failed: status=7` (`CUSOLVER_STATUS_INTERNAL_ERROR`) at **n = 64, 256, 1024, 4096**, real 4-process 2×2 CUDA mesh, jobid **56447670**.  `/pscratch/sd/j/jackm/svc_distrib_la_perf/_reports/perf_gpu2x2_decomp.json` rows `"g2. distributed_eigh jobz='N'"`, reproduced independently in `perf_gpu2x2prof_decomp.json` (the `LORRAX_FFI_PROFILE=1` leg) |
+| covering leg | the step-6 eigh investigation's `gpu_decomp` and `gpu_decomp_prof` legs |
+
+`compute_evecs=False` (jobz='N') is a **documented parameter** of
+`_cusolvermp.distributed_eigh` and it has never worked.  It is not a
+wrapper bug: `cusolverMpSyevd_bufferSize` **succeeds** for jobz='N', and
+`src/ffi/cpp/cusolvermp/eigh_ffi.cc:106` is a one-line pass-through
+(`const char jobz = compute_evecs ? 'V' : 'N'`), so the library sizes the
+eigenvalues-only solve and then fails to run it.
+
+**NOT CHASED**, deliberately: no workaround flag was identified in 0.7.2
+and chasing a vendor library bug is out of scope for this branch.
+
+**REFUSED, PERMANENTLY, NOT AS A STOPGAP.**  The owner confirms
+(2026-08-07) that LORRAX wants `compute_evecs=True` in every case they
+can think of, so this parameter's only remaining value on this backend
+was a route to an unexplained `INTERNAL_ERROR` three call frames deep.
+`resolve.resolve_backend` guard **2c** refuses it, and
+`_cusolvermp.distributed_eigh` refuses it again as its first statement —
+both, because `Plan.__call__` forwards `**kwargs` straight to the wrapper
+(`plan.py:318`) and a resolve-time-only rule would have a hole in it.
+A caller who wants eigenvalues only should pass `compute_evecs=True` and
+ignore `Q`, or use `jnp.linalg.eigvalsh`.
+
 ### **L1 — the two platform `.so`s cross-wire their phdf5 through RTLD_GLOBAL** (latent, registered by B1's fix)
 
 | | |

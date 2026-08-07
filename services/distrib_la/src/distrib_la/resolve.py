@@ -12,6 +12,8 @@ lives here, applied in ONE fixed order — SEVEN steps, all at resolve time:
     2. platform     — does the backend run on this mesh's device kind?
                       (cusolvermp is CUDA-only; scalapack is host-only)
     2b. known-broken— slate eigh on a CPU mesh (bug L-2: SIGSEGV)
+    2c. known-broken— cusolvermp eigh with ``compute_evecs=False``
+                      (bug L-3: cusolverMpSyevd status=7 at every n)
     3. capability   — is the backend's FFI handler actually usable?
                       (``loader.probe_target``, which separates "the
                       library would not load" from "the library has no
@@ -465,7 +467,8 @@ def _announce_eigh_fixed_cost(px: int, py: int, n: int) -> None:
 
 
 def resolve_backend(op: str, requested: str, mesh_xy, *,
-                    n: int | None = None) -> str:
+                    n: int | None = None,
+                    compute_evecs: bool = True) -> str:
     """Resolve a requested backend name for ``op`` on ``mesh_xy``.
 
     Returns the concrete backend to run: ``"native"``, ``"native2d"``, or
@@ -495,6 +498,13 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
         given, the FFI backends additionally require ``n`` divisible by
         both mesh axes (guard 6) and ``native2d`` a legal tile
         decomposition.
+    compute_evecs
+        ``eigh`` only: whether the caller wants eigenVECTORS as well as
+        eigenvalues.  ``False`` is a documented parameter of both eigh
+        wrappers and is BROKEN on cuSOLVERMp 0.7.2 — guard 2c refuses it
+        (bug L-3).  Defaulted True because that is what LORRAX wants
+        everywhere (owner, 2026-08-07); a caller that does not pass it is
+        unaffected by the guard.
 
     Notes
     -----
@@ -605,6 +615,42 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
             "mesh at n=64 — not an MPI or layout problem).  Use "
             "'distributed' (= ScaLAPACK pzheevd, the permanent CPU default) "
             "or 'off'/'auto' for the replicated jnp.linalg.eigh.")
+
+    # 2c. KNOWN-BROKEN combination (bug L-3, found by the step-6 eigh
+    # investigation).  ``compute_evecs=False`` (jobz='N') is a DOCUMENTED
+    # parameter of _cusolvermp.distributed_eigh and it does not work:
+    # cuSOLVERMp 0.7.2 returns status=7 (CUSOLVER_STATUS_INTERNAL_ERROR)
+    # from cusolverMpSyevd at EVERY n tried — 64, 256, 1024, 4096 — on a
+    # real 4-process 2x2 CUDA mesh.  Reproduced twice (jobid 56447670, both
+    # the plain and the LORRAX_FFI_PROFILE=1 decomposition legs;
+    # _reports/perf_gpu2x2_decomp.json + perf_gpu2x2prof_decomp.json, rows
+    # "g2. distributed_eigh jobz='N'").
+    #
+    # NOT OURS.  cusolverMpSyevd_bufferSize SUCCEEDS with jobz='N' and the
+    # wrapper is a straight pass-through (src/ffi/cpp/cusolvermp/
+    # eigh_ffi.cc:106, `const char jobz = compute_evecs ? 'V' : 'N'`), so
+    # the library sizes the eigenvalues-only solve and then fails it.  No
+    # workaround flag was found and the library bug is NOT CHASED
+    # (deliberate scope call).
+    #
+    # A REFUSAL, PERMANENTLY — not a stopgap.  The owner confirms
+    # (2026-08-07) that LORRAX wants compute_evecs=True in every case they
+    # can think of, so the value of this parameter on this backend is
+    # exactly "a way to get an unexplained INTERNAL_ERROR three call
+    # frames deep".  Refusing at resolve time turns that into a message
+    # naming the library, the status code and the artifact.
+    if op == "eigh" and requested == "cusolvermp" and not compute_evecs:
+        raise RuntimeError(
+            "eigh backend 'cusolvermp' with compute_evecs=False is REJECTED: "
+            "cuSOLVERMp 0.7.2's cusolverMpSyevd returns status=7 "
+            "(CUSOLVER_STATUS_INTERNAL_ERROR) for jobz='N' at every n "
+            "measured (64/256/1024/4096, real 4-process 2x2 CUDA mesh, "
+            "jobid 56447670; _reports/perf_gpu2x2_decomp.json rows "
+            "\"g2. distributed_eigh jobz='N'\").  bufferSize succeeds and "
+            "the wrapper only forwards the flag, so this is a library "
+            "defect, not a LORRAX one.  Use compute_evecs=True (the "
+            "default, and what LORRAX wants everywhere) and ignore the "
+            "eigenvectors, or 'off'/'auto' for jnp.linalg.eigvalsh.")
 
     # 3. compiled capability
     #

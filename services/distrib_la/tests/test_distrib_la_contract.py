@@ -1269,6 +1269,71 @@ def test_resolve_cost_notice_does_not_change_the_resolved_backend(
     assert first == second == "cusolvermp" != R.NATIVE
 
 
+# ---------------------------------------------------------------------------
+# Guard 2c — bug L-3: cuSOLVERMp eigh with compute_evecs=False.
+# ---------------------------------------------------------------------------
+
+def test_resolve_cusolvermp_eigh_refuses_compute_evecs_false(monkeypatch):
+    """The refusal fires, and NAMES the evidence.
+
+    A refusal that says only "not supported" sends the reader to LORRAX's
+    wrapper, which is correct code.  This one has to point at the library
+    and its status code or it costs somebody an afternoon.
+    """
+    R = _mock_cuda_capabilities(monkeypatch, nproc=4)
+    mesh = _FakeCudaMesh(2, 2)
+    with pytest.raises(RuntimeError) as exc:
+        R.resolve_backend("eigh", "cusolvermp", mesh, n=256,
+                          compute_evecs=False)
+    msg = str(exc.value)
+    assert "status=7" in msg and "0.7.2" in msg
+    assert "56447670" in msg                       # the artifact's jobid
+    # 'distributed' resolves to cusolvermp on CUDA and must refuse the same.
+    with pytest.raises(RuntimeError, match="status=7"):
+        R.resolve_backend("eigh", "distributed", mesh, n=256,
+                          compute_evecs=False)
+
+
+def test_resolve_cusolvermp_eigh_compute_evecs_true_is_unchanged(
+        monkeypatch, capsys):
+    """RED TWIN of the cell above: the working path must still resolve.
+
+    Guard 2c is one boolean away from refusing every cuSOLVERMp eigh in
+    the tree, which is the whole production route on CUDA.  Both the
+    default and an explicit True are pinned, and so is the fact that the
+    guard does not leak onto the OTHER eigh backends or the other ops.
+    """
+    R = _mock_cuda_capabilities(monkeypatch, nproc=4)
+    mesh = _FakeCudaMesh(2, 2)
+    assert R.resolve_backend("eigh", "cusolvermp", mesh, n=256) == "cusolvermp"
+    assert R.resolve_backend("eigh", "cusolvermp", mesh, n=256,
+                             compute_evecs=True) == "cusolvermp"
+    # Not an eigh backend's problem: cholesky/solve_lu have no such flag
+    # and must not acquire one by accident.
+    assert R.resolve_backend("cholesky", "cusolvermp", mesh,
+                             compute_evecs=False) == "cusolvermp"
+    assert R.resolve_backend("solve_lu", "cusolvermp", mesh,
+                             compute_evecs=False) == "cusolvermp"
+    capsys.readouterr()
+
+
+def test_cusolvermp_wrapper_refuses_compute_evecs_false_without_a_gpu():
+    """The CALL-TIME half of guard 2c, on any machine.
+
+    ``Plan.__call__`` forwards ``**kwargs`` to the wrapper, so the resolver
+    can be bypassed.  This cell reaches the refusal with no mesh, no
+    ``.so`` and no GPU, because the check is deliberately the FIRST
+    statement in the wrapper -- which is also what makes it constructible
+    here.  RED ARM: move the check below ``_validate_mesh`` and this cell
+    fails with a mesh error instead.
+    """
+    from distrib_la import _cusolvermp
+    with pytest.raises(RuntimeError) as exc:
+        _cusolvermp.distributed_eigh(object(), mesh=object(),
+                                     compute_evecs=False)
+    assert "status=7" in str(exc.value) and "L-3" in str(exc.value)
+
+
 @needs_host_ffi
 def test_plan_batched_matches_the_backend_call_cpu():
     """``plan.batched`` on the CPU distributed eigh == the raw wrapper.

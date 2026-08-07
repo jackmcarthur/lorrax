@@ -225,8 +225,8 @@ def distributed_eigh(
         mesh.shape['y']`` must equal ``jax.process_count()``, and ``n``
         must be divisible by both axis sizes.
     compute_evecs
-        If False, only eigenvalues are meaningful (Q is still returned but
-        its contents should be ignored).
+        Must be True.  ``False`` (jobz='N') is REFUSED — see the guard
+        below and ``resolve.resolve_backend`` guard 2c (bug L-3).
     block_size
         Override the 2-D block-cyclic tile size.  Default ``n/p`` (one
         tile per rank — matches JAX's block sharding, eigenvectors come
@@ -244,6 +244,23 @@ def distributed_eigh(
         columns (see the section Layout note).
     """
     # --- validate ---------------------------------------------------------
+    # compute_evecs=False FIRST, before anything expensive.  The resolver's
+    # guard 2c refuses this too, but it CANNOT be the only place: ``Plan``
+    # forwards **kwargs straight to this wrapper (plan.py:318), so
+    # ``plan("eigh", mesh, backend="cusolvermp")(A, compute_evecs=False)``
+    # reaches here having passed a resolve that never saw the flag.  Same
+    # lesson as bug L-1 in the other direction: a rule enforced in only one
+    # of the two places is a rule with a hole in it.
+    if not compute_evecs:
+        raise RuntimeError(
+            "cuSOLVERMp distributed_eigh: compute_evecs=False is REJECTED "
+            "(bug L-3).  cuSOLVERMp 0.7.2 returns cusolverMpSyevd "
+            "status=7 (CUSOLVER_STATUS_INTERNAL_ERROR) for jobz='N' at "
+            "every n measured — 64/256/1024/4096 on a real 4-process 2x2 "
+            "CUDA mesh, jobid 56447670, _reports/perf_gpu2x2_decomp.json. "
+            "bufferSize succeeds and eigh_ffi.cc only forwards the flag, "
+            "so the defect is the library's.  Pass compute_evecs=True "
+            "(the default) and ignore Q, or use jnp.linalg.eigvalsh.")
     if A.ndim != 2 or A.shape[0] != A.shape[1]:
         raise ValueError(f"distributed_eigh: expected a square matrix, "
                          f"got {A.shape}")
