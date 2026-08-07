@@ -106,7 +106,7 @@ def _put(a, mesh, spec):
     return jax.device_put(np.asarray(a), NamedSharding(mesh, P(*spec)))
 
 
-def _time_one(fn, args, warmup, reps):
+def _time_one(fn, args, warmup, reps, build=None):
     """(compile_seconds, [timed seconds])  — first call is the compile.
 
     REFUSES to time anything that is not an array, and that refusal is the
@@ -117,8 +117,24 @@ def _time_one(fn, args, warmup, reps):
     flat across n = 64 and n = 1024, which is the tell.  A number that
     does not move with the problem size is not a measurement of the
     problem.
+
+    ``build`` REBUILDS the operands for every call, and the donating ops
+    need it.  Also measured (cpu2x2 / gpu2x2, 2026-08-07) and recorded in
+    those baseline files as ERROR rows rather than quietly dropped::
+
+        solve_lu distributed [2, 64] ->
+          ValueError: INVALID_ARGUMENT: Invalid buffer passed: buffer has
+          been deleted or donated.
+
+    ``solve_lu`` donates BOTH A and B (C6: donation is declared per OP),
+    so the second call of a warmup loop was handed a deleted buffer.  Not
+    a library defect — the bench was reusing operands the library had been
+    told it could consume.  Rebuilding them puts the host->device staging
+    inside the timed interval for those ops, which is why the row says so:
+    ``operands='fresh per call (donated)'``.
     """
     import jax
+    args = build() if build else args
     out = fn(*args)
     if not hasattr(out, "shape") and not isinstance(out, (tuple, list)):
         raise TypeError(
@@ -126,14 +142,15 @@ def _time_one(fn, args, warmup, reps):
             f"cannot wait on it, so the elapsed time would be dispatch "
             f"overhead wearing the name of a factorization")
     t0 = time.perf_counter()
-    jax.block_until_ready(fn(*args))
+    jax.block_until_ready(fn(*(build() if build else args)))
     compile_s = time.perf_counter() - t0
     for _ in range(warmup):
-        jax.block_until_ready(fn(*args))
+        jax.block_until_ready(fn(*(build() if build else args)))
     out = []
     for _ in range(reps):
+        a = build() if build else args
         t0 = time.perf_counter()
-        jax.block_until_ready(fn(*args))
+        jax.block_until_ready(fn(*a))
         out.append(time.perf_counter() - t0)
     return compile_s, out
 
@@ -159,11 +176,16 @@ def run(mesh, *, dtype="complex128", warmup=2, reps=5, only=""):
                                      str(exc).split())[:240]))
                 continue
             rng = np.random.default_rng(20260807)
-            A = _put(_hpd(rng, nq, n, dtype), mesh, (None, "x", "y"))
+            A_np = _hpd(rng, nq, n, dtype)
+            B_np = _rng_mat(rng, (nq, n, max(8, n // 4)), dtype)
+            A = _put(A_np, mesh, (None, "x", "y"))
+            build = None
             if op == "solve_lu":
-                B = _put(_rng_mat(rng, (nq, n, max(8, n // 4)), dtype),
-                         mesh, (None, "x", "y"))
-                fn, args = D.plan(op, mesh, backend=backend, n=n).batched, (A, B)
+                # DONATES A and B (C6), so every call needs its own.
+                def build(_A=A_np, _B=B_np):
+                    return (_put(_A, mesh, (None, "x", "y")),
+                            _put(_B, mesh, (None, "x", "y")))
+                fn, args = D.plan(op, mesh, backend=backend, n=n).batched, build()
             elif op == "cholesky" and resolved in ("slate", "cusolvermp"):
                 # MEASURED (cpu1x1 baseline, 2026-08-07): plan.batched
                 # REFUSES these -- their factor is a library HANDLE, not an
@@ -173,8 +195,7 @@ def run(mesh, *, dtype="complex128", warmup=2, reps=5, only=""):
                 # is the shape of a baseline table that quietly measures
                 # only the easy half.  factor()+solve() is the route those
                 # backends actually have, so it is the route timed.
-                B = _put(_rng_mat(rng, (nq, n, max(8, n // 4)), dtype),
-                         mesh, (None, "x", "y"))
+                B = _put(B_np, mesh, (None, "x", "y"))
 
                 def fn(a, b, _op=op, _bk=backend, _n=n):
                     return D.solve(
@@ -183,7 +204,7 @@ def run(mesh, *, dtype="complex128", warmup=2, reps=5, only=""):
             else:
                 fn, args = D.plan(op, mesh, backend=backend, n=n).batched, (A,)
             try:
-                compile_s, ts = _time_one(fn, args, warmup, reps)
+                compile_s, ts = _time_one(fn, args, warmup, reps, build)
             except Exception as exc:                           # noqa: BLE001
                 rows.append(dict(op=op, backend=backend, shape=[nq, n],
                                  mesh=f"{px}x{py}", resolved=resolved,
@@ -198,6 +219,8 @@ def run(mesh, *, dtype="complex128", warmup=2, reps=5, only=""):
                      else "plan.batched")
             row = dict(op=op, backend=backend, resolved=resolved,
                        route=route,
+                       operands=("fresh per call (donated)" if build
+                                 else "reused"),
                        shape=[nq, n], dtype=dtype, mesh=f"{px}x{py}",
                        seconds=statistics.median(ts),
                        seconds_min=min(ts), seconds_max=max(ts),
