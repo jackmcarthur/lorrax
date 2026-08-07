@@ -26,9 +26,39 @@ MAE = 0.12 meV (max |Δ| = 0.48 meV) — see
 `reports/cohsex_si_444_gamma_agreement_2026-05-02/`. That headline number
 was obtained with a full BGW `vcoul` body overlay (a 185 MB dump, not
 git-committable). This fixture instead uses LORRAX's **native** finite-q
-Coulomb body (which matches BGW's 4*pi/|q+G|^2 body for `cell_average_cutoff
-1d-12`, i.e. no fixwings) plus BGW's q->0 head injected as two scalars
-(`vhead`, `whead_0freq`). Verified against BGW `sigma_hp.log`
+Coulomb body plus BGW's q->0 head injected as two scalars (`vhead`,
+`whead_0freq`).
+
+CORRECTION 2026-08-06.  This paragraph used to claim the native body
+"matches BGW's 4*pi/|q+G|^2 body for `cell_average_cutoff 1d-12`".  That is
+FALSE for the deck as written, in exactly one slot per q, and it cost
+136 meV.  `mc_average_vcoul_body` defaults to TRUE, which MC mini-BZ
+cell-averages v(q, G=0) at EVERY q != 0.  BGW gates the same operation on
+`avgcut`; Common/vcoul_generator.f90:101-103 says it outright:
+
+    If |q+G|^2 < avgcut, calculate <1/(q+G)^2>.  Otherwise, calculate
+    1/(q+G)^2.  The default value for avgcut is TOL_SMALL, i.e., average
+    only done if G=0.
+
+So under `cell_average_cutoff 1d-12` BGW averages ONLY the literal q+G=0
+element and uses the point value everywhere else.  LORRAX averaged one
+q-shell too many.
+
+The deck therefore sets `mc_average_vcoul_body = false` explicitly.
+MEASURED against `06_si_4x4x4_nosoc/D_bgw_cohsex_noavg`, bare Sigma_X over
+128 (k,band) pairs:
+
+    mc_average_vcoul_body = true    MAE 136.202 meV   max 282.961
+    mc_average_vcoul_body = false   MAE   0.351 meV   max   1.122
+
+The pairing is a MATCHING CONVENTION, not a bug: BGW default (avgcut=1e12)
+<-> true; BGW noavg (avgcut=1d-12) <-> false.  This fixture is anchored to
+noavg, so it must set false.
+
+Why the old verification missed it: the check below is stated as a SPREAD,
+and a rigid per-occupancy offset cancels in a spread.  Sigma_X was never a
+compared column, and the pytest compares against this repo's own frozen
+eqp_si_ref.dat -- BerkeleyGW is not in that loop at all. Verified against BGW `sigma_hp.log`
 (`06_si_4x4x4_nosoc/D_bgw_cohsex_noavg`) at Gamma: sigCOH tracks BGW to
 0.22 meV spread, sigTOT to 3.2 meV spread — matching the validated
 185 MB-overlay run. (The residual rigid offsets in sigSX/sigCOH are the

@@ -48,7 +48,7 @@ Longer discussions of the load-bearing keys are in [drivers.md](drivers.md).
 | `do_screened` | true | Legacy mode flag: build W and the screened Sigma terms (false = bare exchange only); compute_mode=auto reads it. |
 | `use_ppm_sigma` | false | Legacy flag for the dynamic PPM Sigma^c(omega); compute_mode=auto reads it. |
 | `w_dyson_solver` | `"auto"` | W Dyson plan: local (per-q pivoted LU; auto alias) | distributed (2-D block-cyclic backsolve; refuses loudly, never downgrades). |
-| `mc_average_vcoul_body` | true | Monte-Carlo mini-BZ average of the Coulomb body (BGW convention). |
+| `mc_average_vcoul_body` | true | Monte-Carlo mini-BZ average of the Coulomb body at every q!=0. Matches BGW's **default** `cell_average_cutoff` (1e12, average everywhere). Set **false** to match a BGW run with `cell_average_cutoff 1d-12` ("noavg"), which averages ONLY the literal q+G=0 element (vcoul_generator.f90:101-103). Mismatching it cost 136 meV MAE in bare Sigma_X on the Si 4x4x4 anchor; see tests/regression/si_cohsex_debug/README.md. |
 | `head_minibz_average` | false | Coulomb head as mini-BZ cell average instead of point value (fixes 4-13% near-Gamma error at finite Q); false = bit-identical legacy. |
 | `bare_coulomb_cutoff` | None | G-cutoff (Ry) of the bare Coulomb V_q build; None = ecutwfc. |
 | `use_bgw_vcoul` | false | Diagnostic: read v(q,G) from a BGW vcoul file instead of building it. |
