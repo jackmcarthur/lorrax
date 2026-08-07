@@ -48,7 +48,16 @@ def vq_state():
     from bse import vq_interp as vqi
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1),
                 axis_names=("x", "y"))
-    zx = vqi.load_zeta_coarse(f"{FX}/isdf_tensors_640.h5", f"{FX}/zeta_q.h5")
+    # ``mesh=`` selects the ζ TRANSPORT: with it, ``prepare_coarse``'s
+    # q-chunk read is a per-rank SlabIO hyperslab; without it (or when
+    # the SlabIO probe declines, e.g. a checkout with no built FFI) the
+    # local h5py plan runs and the numbers are identical.  Passing it
+    # here is what exercises the distributed plan wherever the FFI is
+    # actually built — a bare checkout still takes the local plan, which
+    # is why this line cannot be read as evidence that the phdf5 path
+    # ran.
+    zx = vqi.load_zeta_coarse(f"{FX}/isdf_tensors_640.h5",
+                              f"{FX}/zeta_q.h5", mesh=mesh)
     C_q = vqi.build_cq(zx, mesh)
     vqi.run_gates(zx, C_q)                 # hard machine-level gates
     with mesh:
@@ -56,7 +65,8 @@ def vq_state():
     des = vqi.lr_design_blocks(zx, prep)
     coeffs = vqi.fit_lr_model(des)
     vqi.run_nulls(zx, prep, des, coeffs)   # hard machine-level nulls
-    return dict(vqi=vqi, mesh=mesh, zx=zx, prep=prep, des=des, coeffs=coeffs)
+    yield dict(vqi=vqi, mesh=mesh, zx=zx, prep=prep, des=des, coeffs=coeffs)
+    vqi.close_zeta_coarse(zx)              # explicit handle ownership
 
 
 @pytest.mark.gpu
