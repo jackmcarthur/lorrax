@@ -135,13 +135,20 @@ _L3_MODULES = frozenset({
     # the sharded-HDF5 transport (NOT the format readers above it)
     "file_io.slab_io", "file_io._slab_io_ffi", "file_io.paths",
 })
-#: Whole packages at L3.  The two services are here for the same reason
-#: ``ffi`` is: their entire subject is devices, meshes, processes, native
-#: libraries and files.  ``lxkit`` owns capability gates and the probe
+#: Whole packages at L3.  Two of the three services are here for the same
+#: reason ``ffi`` is: their entire subject is devices, meshes, processes,
+#: native libraries and files.  ``lxkit`` owns capability gates and the probe
 #: vocabulary; ``distrib_la`` owns distributed dense linalg over a device
 #: mesh, and the mathematics inside it (a blocked Cholesky) is the same
 #: mathematics ``ffi.linalg`` always carried at L3 — the level is decided by
 #: what a module is allowed to KNOW ABOUT, and both know about ranks.
+#:
+#: ``zeta_loader`` is DELIBERATELY NOT HERE.  Being a service says nothing
+#: about a level; it knows about q-points, centroids and ζ, which is physics,
+#: so it takes the L1 default that ``file_io.zeta_loader`` always had
+#: (docs/architecture/layers.md:163 — format readers are L1, only the
+#: transport ``slab_io``/``_slab_io_ffi``/``paths`` below them is L3).  The
+#: default is silent, so this note is where the decision is recorded.
 #:
 #: ``ffi`` stays only while ``src/ffi`` does;
 #: :func:`test_every_package_in_the_map_exists` is what forces its removal
@@ -1181,7 +1188,15 @@ def test_every_package_in_the_map_exists(sources):
 
 #: Service top-level package -> the name its door is spelled.  (Identity
 #: today; a service whose door is a submodule would say so here.)
-_SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la"}
+#:
+#: ``zeta_loader`` joined on 2026-08-07 with its extraction.  Its shim,
+#: ``src/file_io/zeta_loader.py``, does NOT appear in the exception table
+#: below and must not: it re-exports ``ZetaLoader`` off the top-level
+#: package, which is the door, so it is not a past-the-door edge and
+#: ``test_the_service_door_exceptions_are_all_still_needed`` would fail on
+#: an entry claiming otherwise.
+_SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
+                  "zeta_loader": "zeta_loader"}
 
 #: ``src/`` module -> how many past-the-door edges it is allowed.  These are
 #: the transitional re-export shims.

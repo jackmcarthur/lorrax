@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zeta_loader"
+version = "0.1.0"
+description = "The reader and format-contract owner of zeta_q.h5: header surface, the collective V_q slab read, the sanctioned local plan, the never-raising probe and the one post-close g0_mu append"
+requires-python = ">=3.12"
+
+# h5py IS this service's own declared native dependency, and it is the only
+# one: `zeta_q.h5` is an HDF5 file and reading its two header groups with
+# serial h5py is what makes `mesh=None` work on a stack with no phdf5 FFI.
+# The PARALLEL half of the I/O — the collective slab read — is reached
+# through `file_io.slab_io`, which appears nowhere in this list because
+# nothing here links it.
+#
+# THE WAVE-1B SEAM, DECLARED.  The data path imports `file_io.slab_io`,
+# `file_io.mf_header`, `file_io.isdf_header` and `common.gvec_fft_box` from
+# the LORRAX HOST TREE, lazily, at call time (see the four `_*_binders` /
+# `_*_helpers` refusals in zeta_loader.loader).  They are deliberately not
+# dependencies: `import zeta_loader` is clean with lorrax off sys.path, and
+# `probe_zeta_file` / `write_g0_mu` are fully functional there.  When
+# slab_io and the header binders are extracted as services of their own
+# (wave 1b), those four lazy imports become entries in this list and the
+# refusals go.  Until then the honest statement is that the DATA path
+# needs a lorrax checkout and the FORMAT path does not.
+#
+# lxkit is the shared foundation (Gate/probe vocabulary/jax-version shims).
+# jax is the substrate the slab path is written in; unlike lxkit,
+# `import zeta_loader` DOES import jax, and that is correct: every data
+# read takes a `jax.sharding.Mesh` and returns a sharded `jax.Array`.
+dependencies = ["lxkit", "jax", "numpy", "h5py"]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `bench/` holds claims-style baseline drivers, not a pytest suite.
+norecursedirs = ["bench"]
+# The SAME two markers the monorepo registers.  Declared in both places on
+# purpose: `pytest services/zeta_loader/tests` from the monorepo root picks
+# THIS file as its rootdir config (it is the nearest pyproject.toml above
+# the argument), so a service that only registered them upstairs emits
+# PytestUnknownMarkWarning on exactly the invocation the charter calls its
+# standalone one.
+markers = [
+    "services: a standalone service's own suite, staged into the main one",
+    "zeta_loader: the zeta_loader service suite",
+]

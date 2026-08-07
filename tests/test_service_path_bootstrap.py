@@ -115,7 +115,20 @@ def test_the_bootstrap_is_idempotent_and_appends():
     It APPENDS: an editable install or a PYTHONPATH entry keeps winning, so
     a machine that has been taught about ``services/`` does not silently
     switch to the in-tree copy the day a consumer imports the door.
+
+    The expected count is ENUMERATED FROM DISK here, by a different call
+    than the one under test (``pathlib.iterdir`` in this process vs
+    ``os.listdir`` in the subprocess's ``_services.service_roots``), and
+    the two services that must always be there are named.  It was the
+    literal ``2`` until 2026-08-07, which is a number every service
+    extraction has to come back and bump — four wave-1 branches editing one
+    line, i.e. a guaranteed conflict for a fact the filesystem already
+    states.  A bare ``len(added) > 0`` would be the tautology to avoid;
+    this is neither.
     """
+    expected = sorted(p.name for p in (_REPO / "services").iterdir()
+                      if (p / "src").is_dir())
+    assert {"lxkit", "distrib_la"} <= set(expected), expected
     r = _bare_run(
         "import sys\n"
         "from ffi import _services\n"
@@ -130,4 +143,6 @@ def test_the_bootstrap_is_idempotent_and_appends():
         "assert once[:len(before)] == before, 'it PREPENDED; must append'\n"
         "print('ADDED', len(added))\n")
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
-    assert "ADDED 2" in r.stdout, r.stdout      # lxkit + distrib_la
+    assert f"ADDED {len(expected)}" in r.stdout, (
+        f"the bootstrap added a different number of roots than the "
+        f"{len(expected)} services on disk ({expected}):\n{r.stdout}")
