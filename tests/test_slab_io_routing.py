@@ -29,6 +29,7 @@ WFN, no probes, no GPU.  Warning assertions are substring matches.
 """
 from __future__ import annotations
 
+import pathlib
 import warnings
 
 import pytest
@@ -132,6 +133,108 @@ def test_deleted_backend_modules_are_gone():
     for mod in ("file_io._slab_io_allgather", "file_io._slab_io_mpi_host"):
         with pytest.raises(ModuleNotFoundError):
             importlib.import_module(mod)
+
+
+def test_wfn_loader_has_no_phdf5_host_tier_either():
+    """The recurrence: the same shape of tier, in the WFN read path.
+
+    ``WfnLoader`` kept a ``phdf5_host`` backend after SlabIO's tiers went.
+    It was not a third transport — it read with the SAME independent
+    POSIX h5py hyperslabs the eager backend already uses at P>1 (no MPI,
+    no MPI-IO, no FFI), differing only in where the symmetry unfold ran.
+    A duplicate compute path auto-selected by a missing ``.so`` is what
+    decisions.md 2026-08-01 forbids demoting to.  Deleted 2026-08-06.
+    """
+    import inspect
+    from file_io.wfn_loader import WfnLoader
+    assert not hasattr(WfnLoader, "_phdf5_host_build")
+    ann = inspect.signature(WfnLoader.__init__).parameters["backend"]
+    assert "phdf5_host" not in str(ann.annotation), ann.annotation
+
+
+# ---------------------------------------------------------------------------
+# The two writers of one file must request ONE layout
+# ---------------------------------------------------------------------------
+#
+# SCOPE, up front: everything below is a SOURCE-LEVEL pin plus, where a
+# compiler is present, an arithmetic cross-check of an EXTRACTED pair of
+# functions.  Neither rebuilds `liblorrax_ffi*.so`, so neither says the
+# deployed library requests the policy layout — only that this tree's C++
+# would, if built.  A rebuild on the cluster is the missing evidence.
+
+_CONTEXT_CC = (pathlib.Path(__file__).resolve().parents[1]
+               / "src" / "ffi" / "cpp" / "phdf5" / "context.cc")
+
+
+def test_cpp_no_longer_carries_a_second_stripe_default():
+    """`context.cc` must derive the unset stripe layout, not hardcode it.
+
+    Python resolves `clamp(nranks, 4, 128)` + a 1->4 MiB unit ramp; C++
+    wrote the literals `"16"` and 1 MiB.  In-tree that was masked because
+    `_FfiBackend.__init__` calls `_export_striping_env()` before
+    `_open_file()`, so the getenv always found a value — but a caller
+    reaching `ffi.io.open_file` DIRECTLY got the old constants with no
+    warning, and two writers requesting different layouts is worse than
+    both being wrong the same way.
+    """
+    src = _CONTEXT_CC.read_text()
+    assert 'info_set("striping_factor", "16")' not in src
+    assert "stripe_policy_count(ctx->world_size)" in src
+    assert "stripe_policy_unit(ctx->world_size)" in src
+
+
+def test_cpp_stripe_policy_transcribes_the_python_one():
+    """Compile the two extracted C++ policy functions and diff them
+    against `_stripe_policy` over 0..4100 ranks.
+
+    This is the only thing that can hold a transcription in step, and it
+    is still NOT a build of the FFI library: it compiles two `static long`
+    functions in isolation with the host g++.  Skipped where no C++
+    compiler exists; a FAILURE to extract the functions is a failure, not
+    a skip, because that means they were renamed or removed.
+    """
+    import re
+    import shutil
+    import subprocess
+    import tempfile
+    from file_io._slab_io_ffi import _stripe_policy
+
+    src = _CONTEXT_CC.read_text()
+    bodies = re.findall(
+        r"^static long stripe_policy_(?:count|unit)\(int world_size\) \{.*?^\}",
+        src, re.S | re.M)
+    assert len(bodies) == 2, (
+        f"expected stripe_policy_count + stripe_policy_unit in "
+        f"{_CONTEXT_CC}, found {len(bodies)}")
+
+    cxx = shutil.which("g++") or shutil.which("c++") or shutil.which("clang++")
+    if cxx is None:
+        pytest.skip("no C++ compiler; source pin above still applies")
+
+    prog = ('#include <cstdio>\n' + "\n".join(bodies) +
+            '\nint main(){for(int n=0;n<=4100;++n)'
+            'printf("%d %ld %ld\\n",n,stripe_policy_count(n),'
+            'stripe_policy_unit(n));}\n')
+    with tempfile.TemporaryDirectory() as td:
+        cc = pathlib.Path(td) / "p.cc"
+        exe = pathlib.Path(td) / "p"
+        cc.write_text(prog)
+        subprocess.run([cxx, "-O1", "-std=c++17", "-o", str(exe), str(cc)],
+                       check=True, capture_output=True)
+        out = subprocess.run([str(exe)], check=True, capture_output=True,
+                             text=True).stdout
+
+    seen = set()
+    for line in out.splitlines():
+        n, c, u = (int(x) for x in line.split())
+        assert _stripe_policy(n) == (c, u), (
+            f"C++ and Python stripe policies disagree at nranks={n}: "
+            f"C++ {(c, u)} vs Python {_stripe_policy(n)}")
+        seen.add((c, u))
+    # Non-vacuity: the sweep must actually cross both clamps and both
+    # unit steps, or "they agree" would only mean "both are constant".
+    assert (4, 1 << 20) in seen and (128, 4 << 20) in seen
+    assert len({u for _c, u in seen}) == 3
 
 
 @pytest.mark.parametrize("spelling,expected", [

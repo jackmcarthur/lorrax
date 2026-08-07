@@ -13,18 +13,38 @@ never have to materialise the FFT box just to access a real-space slice.
 
 Backends
 --------
-``backend='auto'`` (default) picks the lightest path that works:
+There are TWO, and ``backend='auto'`` (default) picks the lightest that
+works:
 
 - **eager** (host h5py + numpy unfold + ``device_put``): single-process,
-  CPU JAX, or small files.
+  mesh-less, or an explicit ``LORRAX_WFN_BACKEND=eager``.  At P>1 with a
+  mesh it still reads only THIS rank's band block (``_eager_build_process_local``).
 - **phdf5** (collective parallel-HDF5 FFI + on-device unfold): multi-rank
-  GPU + 2-D mesh + FFI .so loadable.  Reuses the same union-read +
-  unfold kernel that powered the legacy ``PhdfWfnReader.coeffs_gspace``
-  path, but stops one step short of the FFT-box scatter so the output
-  stays G-flat (the loader's defining layout).
+  + 2-D mesh + an FFI .so exporting the kchunk-union read handler on
+  either platform.  Reuses the same union-read + unfold kernel that
+  powered the legacy ``PhdfWfnReader.coeffs_gspace`` path, but stops one
+  step short of the FFT-box scatter so the output stays G-flat (the
+  loader's defining layout).
 
 Both backends produce **byte-identical** output for the same ``(bands, k,
-sharding, bispinor)`` request — that's the P2 test contract.
+sharding, bispinor)`` request — that's the P2 test contract, and it is
+the only reason ``LORRAX_WFN_BACKEND`` is safe to expose at all
+(``docs/architecture/services.md``).
+
+There was a third, ``phdf5_host``: an h5py union read feeding the same
+on-device unfold kernel, auto-selected when no FFI library loaded on
+either platform.  Deleted 2026-08-06.  Its name promised a third
+transport and it was not one — it read with the SAME independent POSIX
+h5py hyperslabs the eager path already uses at P>1 (no MPI, no MPI-IO,
+no FFI), differing only in where the unfold ran.  So it was a duplicate
+compute path over an existing transport, auto-selected by a missing
+``.so``, which is exactly what the 2026-08-01 ruling forbids: *"a
+missing or unloadable FFI library is a refusal at startup (with the
+library named), not a silent demotion to a slower path.  Auto-demotion
+remains only where the alternative is a different service tier …
+never a duplicate compute path."*  ``_auto_pick_backend`` now refuses
+there and quotes ``probe_target``'s reason for both platforms;
+``LORRAX_WFN_BACKEND=eager`` is the operator's way through.
 
 Public surface
 --------------
@@ -61,6 +81,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
 
+from ._slab_io_ffi import _derive_valid_shape
 from .mf_header import bind_mf_attrs, kpt_starts, read_mf_header_from_file
 
 
@@ -75,52 +96,74 @@ def _build_phdf5_clamped_counts(
     world: int,
     bands_per_rank: int,
     b_lo_logical: int,
-    mnband_file: int,
+    band_extent: int,
     n_reads: int,
     ngk_per_ibz_read: Sequence[int],
+    kchunk_start_per_read: Sequence[int],
+    ngktot: int,
     ns: int,
 ) -> np.ndarray:
-    """Per-rank ``counts`` table for the kchunk-union phdf5 read,
-    clamped to the on-disk ``mnband_file`` band extent.
+    """Per-rank ``counts`` table for the kchunk-union phdf5 read.
+
+    This is the SlabIO padded-slab clip applied per rank: the arithmetic
+    itself is :func:`file_io._slab_io_ffi._derive_valid_shape`
+    (``max(0, min(slab, logical - offset))`` per dim) and lives there
+    only.  This function owns the table LAYOUT the C++ wants, not the
+    clip.  They were two implementations until 2026-08-06 and they had
+    diverged on the band axis — see below.
 
     The C++ ``read_kchunk_union`` handler computes each rank's
     band-axis file offset as
     ``offset_band = b_lo_logical + rank_coord_band * bands_per_rank``,
     where ``rank_coord_band = coord_x * p_y + coord_y`` for a 2-D
-    ``('x','y')`` mesh of shape ``(p_x, p_y)``.  Without clamping,
-    the tail rank can read past ``mnband_file`` whenever
-    ``(b_hi_logical - b_lo_logical)`` rounded up to ``world *
-    bands_per_rank`` extends past the file extent — H5Dread then
-    fails with "selection + offset not within extent".
+    ``('x','y')`` mesh of shape ``(p_x, p_y)``.  The rank slab is
+    therefore ``(bands_per_rank, ns, ngk[ibz], 2)`` at file offset
+    ``(offset_band, 0, kchunk_start, 0)``, and the count each rank
+    passes to H5Sselect_hyperslab is that slab clipped to the LOGICAL
+    extent of the read.
 
-    This helper returns a ``(world * n_reads, 4) int64`` table whose
-    rank ``r``-slice ``[r*n_reads:(r+1)*n_reads, :]`` has the band-axis
-    count clamped to ``max(0, min(bands_per_rank, mnband_file -
-    (b_lo_logical + r * bands_per_rank)))``.  Ranks fully past EOF get
-    band_cnt=0 — their pinned-buffer pre-zero (in the C++ worker)
-    becomes a zero-filled rank tile, which is the correct semantics for
-    band-pad rows.
+    ``band_extent`` IS THE LOGICAL WINDOW END ``b_hi``, NOT ``mnband``.
+    Both bounds matter and ``b_hi <= mnband`` always (``load`` refuses
+    otherwise), so the logical one subsumes the file one:
 
-    Sharded on the leading axis by ``('x','y')`` so each rank's
-    shard_map-local view is the ``(n_reads, 4)`` slice for its own
-    rank.  Rank-flattening matches the C++: outer loop over ``r``
+    * clipping to ``mnband`` alone is what stops the tail rank reading
+      past EOF — ``(b_hi - b_lo)`` rounded up to ``world *
+      bands_per_rank`` can extend past the file, and H5Dread then fails
+      with "selection + offset not within extent" (the 16-GPU CrI3
+      crash);
+    * clipping to ``b_hi`` additionally keeps the BAND-PAD rows empty.
+      Clipping to ``mnband`` only, the tail rank read REAL file bands
+      ``[b_hi, b_lo + nb_padded)`` into rows the loader documents as
+      zero ("Band axis pad rows are zero-filled", :meth:`WfnLoader.load`)
+      and that ``_eager_build`` / ``_eager_build_process_local`` do fill
+      with zeros.  That made the phdf5 backend disagree with the eager
+      backend on every request whose band count is not a multiple of the
+      world size — i.e. the P2 byte-identity contract held only on the
+      exactly-divisible geometries the parity harness happens to run.
+
+    Ranks whose whole block is past ``band_extent`` get band_cnt=0 —
+    their pinned-buffer pre-zero (in the C++ worker) becomes a
+    zero-filled rank tile, which is the correct semantics for pad rows.
+    Equivalently: ``sum_r band_cnt == b_hi - b_lo`` exactly, which is
+    the invariant the regression test asserts.
+
+    The table is sharded on the leading axis by ``('x','y')`` so each
+    rank's shard_map-local view is the ``(n_reads, 4)`` slice for its
+    own rank.  Rank-flattening matches the C++: outer loop over ``r``
     in 0..world-1 corresponds to ``coord_x = r // p_y,
     coord_y = r % p_y`` (leftmost-is-slowest in JAX's convention).
     """
-    counts = np.zeros((world, n_reads, 4), dtype=np.int64)
+    logical = (int(band_extent), int(ns), int(ngktot), 2)
+    counts = np.zeros((int(world), int(n_reads), 4), dtype=np.int64)
     for r in range(int(world)):
         file_off_band = int(b_lo_logical) + r * int(bands_per_rank)
-        avail = max(0, int(mnband_file) - file_off_band)
-        band_cnt = min(int(bands_per_rank), avail)
         for ki in range(int(n_reads)):
-            counts[r, ki, 0] = band_cnt
-            counts[r, ki, 1] = int(ns)
-            counts[r, ki, 2] = int(ngk_per_ibz_read[ki])
-            counts[r, ki, 3] = 2
+            counts[r, ki] = _derive_valid_shape(
+                (int(bands_per_rank), int(ns),
+                 int(ngk_per_ibz_read[ki]), 2),
+                (file_off_band, 0, int(kchunk_start_per_read[ki]), 0),
+                logical)
     return counts.reshape(int(world) * int(n_reads), 4)
-
-
-_PHDF5_HOST_ANNOUNCED = False
 
 
 class WfnLoader:
@@ -132,7 +175,7 @@ class WfnLoader:
         path: str | Path,
         *,
         mesh: Mesh | None = None,
-        backend: Literal["auto", "eager", "phdf5", "phdf5_host"] = "auto",
+        backend: Literal["auto", "eager", "phdf5"] = "auto",
     ) -> None:
         self._path = str(path)
         self._filename = self._path  # legacy WFNReader compat
@@ -147,9 +190,20 @@ class WfnLoader:
             # be on LD_LIBRARY_PATH.  Two GPU campaigns differed only in
             # this and nothing in either log said so (scorecard AG).
             self._announce_backend(backend)
-        if backend not in ("eager", "phdf5", "phdf5_host"):
-            raise ValueError(f"unknown backend {backend!r}")
-        if backend in ("phdf5", "phdf5_host") and mesh is None:
+        if backend == "phdf5_host":
+            raise ValueError(
+                "WfnLoader: backend='phdf5_host' was deleted 2026-08-06.  It "
+                "was not a third transport — it read with the same "
+                "independent POSIX h5py hyperslabs the 'eager' backend "
+                "already uses at P>1, and was auto-selected only by a "
+                "missing FFI .so, which the 2026-08-01 ruling makes a "
+                "refusal rather than a demotion.  Use backend='phdf5' (the "
+                "collective FFI read) or backend='eager'.")
+        if backend not in ("eager", "phdf5"):
+            raise ValueError(
+                f"unknown backend {backend!r}; accepted: "
+                f"'auto', 'eager', 'phdf5'")
+        if backend == "phdf5" and mesh is None:
             raise ValueError(
                 f"WfnLoader: backend={backend!r} requires a Mesh; pass mesh=...")
         self.backend = backend
@@ -194,8 +248,7 @@ class WfnLoader:
         # tightest).  ``_gvecs_raw`` (ngktot,3) + ``_kpt_starts`` are cheap
         # index metadata both backends use — keep those eager.
         self._coeffs_ds = (
-            self._file["wfns/coeffs"]
-            if self.backend in ("eager", "phdf5_host") else None)
+            self._file["wfns/coeffs"] if self.backend == "eager" else None)
         self._gvecs_raw = self._file["wfns/gvecs"][:]     # (ngktot, 3) int
         # kpt_starts = cumulative (exclusive prefix) sum of ngk.
         self._kpt_starts = kpt_starts(self.ngk)
@@ -254,7 +307,7 @@ class WfnLoader:
         # The verdict reaches ``SymMaps`` through ``_sym_wfn_stub`` below;
         # ``SymMaps`` is the ONLY consumer, and it is also the only place
         # that can turn a time-reversal row into a conjugated ψ, so
-        # gating there covers every backend (eager / phdf5 / phdf5_host).
+        # gating there covers every backend (eager / phdf5).
         #
         # Runs last in ``__init__`` because it needs ``nelec``,
         # ``kweights``, ``box_index`` and the open file handle.  Cost is
@@ -328,8 +381,6 @@ class WfnLoader:
         why = {
             "eager": "single-process or mesh-less: host h5py read per rank",
             "phdf5": "collective MPI-IO read through the phdf5 FFI .so",
-            "phdf5_host": "h5py union read + the shared on-device unfold "
-                          "(no phdf5-capable FFI .so found)",
         }.get(backend, "")
         print(f"  [WfnLoader] read backend = {backend} "
               f"(auto, {world} process{'es' if world != 1 else ''}) — {why}",
@@ -354,12 +405,14 @@ class WfnLoader:
             memcpy); the ffi_call resolves to the host handler by lowering
             platform and open_file routes the collective lifecycle to the
             host lib (liblorrax_ffi_host.so built with the phdf5 subpackage).
-          * Multi-process JAX + mesh, no phdf5-capable FFI .so at all →
-            phdf5_host (the zero-FFI h5py union-read FALLBACK).  It feeds
-            the SAME on-device vectorised unfold kernel as the FFI path, so
-            it stays a drop-in for the collective read when the host FFI
-            library is unavailable — but it is now a fallback, not the
-            default CPU path.
+          * Multi-process JAX + mesh, no phdf5-capable FFI .so on EITHER
+            platform → **REFUSE**, quoting ``probe_target``'s three-way
+            reason for both.  There used to be a ``phdf5_host`` tier here;
+            see the module docstring for why a duplicate compute path
+            selected by a missing ``.so`` is not a fallback.  An operator
+            who wants the host read anyway asks for it by name
+            (``LORRAX_WFN_BACKEND=eager``), which is checked above and so
+            never reaches the probe.
         """
         import os
         # A mesh-less loader can only run eager — there is no device mesh
@@ -372,8 +425,19 @@ class WfnLoader:
         forced = os.environ.get("LORRAX_WFN_BACKEND", "").strip().lower()
         if forced == "eager":
             return "eager"
-        if forced in ("phdf5", "phdf5_host"):
+        if forced == "phdf5":
             return forced           # mesh present (checked above) → viable
+        if forced == "phdf5_host":
+            # A deleted spelling must not resolve to something else: an
+            # operator who exported this asked for a specific read path,
+            # and silently giving them the FFI one (or eager) is how an
+            # A/B measures the wrong arm.
+            raise ValueError(
+                "LORRAX_WFN_BACKEND=phdf5_host names a backend deleted on "
+                "2026-08-06 (it was the eager backend's own POSIX h5py "
+                "transport with a different unfold kernel, auto-selected "
+                "by a missing FFI .so).  Set 'eager' for the host read or "
+                "'phdf5' for the collective FFI read, or unset it.")
         try:
             if int(jax.process_count()) <= 1:
                 return "eager"
@@ -381,21 +445,34 @@ class WfnLoader:
             return "eager"
         # GPU first, then CPU: the SAME collective MPI-IO read path, served
         # by whichever platform's FFI library exports the kchunk-union read
-        # handler.  ``ffi_loader.has_phdf5_read`` owns the per-platform
-        # symbol probe (adding a new FFI target platform touches only
-        # ffi_loader._PLATFORMS, not this ladder).  The h5py twin below is
-        # only for when no phdf5-capable .so exists on either platform.
-        try:
-            from ffi.common.ffi_loader import has_phdf5_read
-            for _plat in ("CUDA", "cpu"):
-                if has_phdf5_read(_plat):
-                    from ffi.phdf5 import open_file as _of  # noqa: F401
-                    return "phdf5"
-        except Exception:
-            pass
-        # No phdf5-capable FFI library on either platform: fall back to the
-        # zero-FFI h5py union read (shares the on-device unfold kernel).
-        return "phdf5_host"
+        # handler.  ``ffi_loader.probe_target`` owns the per-platform symbol
+        # probe (adding a new FFI target platform touches only
+        # ffi_loader._PLATFORMS, not this ladder), and it distinguishes the
+        # three ways a target can be unusable — which is why the refusal
+        # below quotes its reason verbatim instead of reducing it to a bool.
+        from ffi.common.ffi_loader import probe_target
+        reasons = []
+        for _plat in ("CUDA", "cpu"):
+            usable, why = probe_target("lorrax_phdf5_read_kchunk_union", _plat)
+            if usable:
+                from ffi.phdf5 import open_file as _of  # noqa: F401
+                return "phdf5"
+            reasons.append(f"  {_plat}: {why}")
+        raise RuntimeError(
+            "WfnLoader: no FFI library can serve the collective WFN read "
+            f"(jax.process_count()={int(jax.process_count())}, mesh "
+            f"{tuple(self._mesh.devices.shape)}), and there is no "
+            "second transport to demote to — the h5py 'phdf5_host' tier "
+            "was deleted 2026-08-06 because it was the eager backend's own "
+            "POSIX read with a different unfold kernel, i.e. a duplicate "
+            "compute path, and 'a missing or unloadable FFI library is a "
+            "refusal at startup (with the library named), not a silent "
+            "demotion to a slower path' (decisions.md 2026-08-01).\n"
+            + "\n".join(reasons)
+            + "\nRepair the library named above, or set "
+              "LORRAX_WFN_BACKEND=eager to take the per-rank host read "
+              "deliberately (it is byte-identical, and at P>1 it still "
+              "reads only this rank's band block).")
 
     def adopt_mesh(self, mesh) -> str:
         """Late-bind the device mesh and re-run the auto backend pick.
@@ -420,6 +497,13 @@ class WfnLoader:
         the eager state kept so far (the ``coeffs`` dataset HANDLE — no
         data) remains valid for ``load_process_local``.  Returns the
         backend now in force.
+
+        MAY RAISE since 2026-08-06.  It re-runs :meth:`_auto_pick_backend`,
+        which at P>1 refuses when no FFI library can serve the collective
+        read instead of demoting to the deleted ``phdf5_host`` tier.  That
+        is the intended place for it: this is called immediately after
+        ``dist.build_mesh``, i.e. still at startup, and the refusal names
+        the library and the ``LORRAX_WFN_BACKEND=eager`` way through.
         """
         if mesh is None or self._mesh is not None:
             return self.backend
@@ -696,14 +780,14 @@ class WfnLoader:
         return named, spec_divisor(self._mesh, sharding, 1)
 
     # ------------------------------------------------------------------
-    # Shared sharded-read scaffolding (used by the phdf5 paths AND the
+    # Shared sharded-read scaffolding (used by the phdf5 path AND the
     # §5b process-local eager path — single-sourced so the "learn my
     # band block / assemble sharded" idiom is written exactly once)
     # ------------------------------------------------------------------
     def _kplan(
         self, k_idxs: np.ndarray, unfold: bool,
     ) -> tuple[np.ndarray, int, np.ndarray, int]:
-        """Union-read bookkeeping shared by both phdf5 read paths.
+        """Union-read bookkeeping for the phdf5 collective read.
 
         Maps the requested k-set to the ascending-sorted union of IBZ
         source k-points (each read from disk exactly once) and each
@@ -737,8 +821,8 @@ class WfnLoader:
         fill_local,
     ) -> jax.Array:
         """Learn THIS rank's block of a band-sharded global array and
-        assemble it from a per-rank host build — the shared scaffold of
-        :meth:`_eager_build_process_local` and :meth:`_phdf5_host_build`.
+        assemble it from a per-rank host build — the scaffold
+        :meth:`_eager_build_process_local` runs on.
 
         Steps (the slab-io process-local idiom, written once):
 
@@ -788,15 +872,17 @@ class WfnLoader:
         ``_compute_phases_all_full_k`` + ``_device_put_static_tables``
         but without the FFT-box machinery (which lives downstream in
         ``wfn_transforms``).
+
+        Touches NO FFI: these are numpy tables staged process-locally, so
+        the collective context lives in :meth:`_ensure_phdf5_ctx` instead
+        of being a side effect of building them.  (It used to be one,
+        gated on ``self.backend == "phdf5"`` — a tier test that has had
+        exactly one reachable value since the ``phdf5_host`` tier was
+        deleted, and that made the pure table build un-callable without
+        an ``.so``.)
         """
         if self._phdf5_static_dev is not None:
             return self._phdf5_static_dev
-
-        # ``open_file`` is the CUDA FFI entry point; import it lazily and
-        # only when the FFI backend actually needs a collective context
-        # (``phdf5_host`` reuses the plain h5py handle instead).
-        if self.backend == "phdf5":
-            from ffi.phdf5 import open_file
 
         sym = self._ensure_sym()
         nk_full = int(sym.nk_tot)
@@ -841,12 +927,6 @@ class WfnLoader:
             if ph is not None:
                 phase[nk, :ngk_k] = ph
 
-        # Open the phdf5 collective context lazily.  Only the FFI backend
-        # needs it; ``phdf5_host`` reuses the plain h5py handle and must
-        # not touch the CUDA FFI (which would fail to load on a CPU node).
-        if self.backend == "phdf5" and self._phdf5_ctx is None:
-            self._phdf5_ctx = open_file(self._path, mesh=self._mesh, mode="r")
-
         # Device-stage the static tables once.  Sharding choice mirrors
         # ``PhdfWfnReader._device_put_static_tables`` — all replicated
         # since they're per-full-BZ-k metadata, not per-band data.
@@ -875,6 +955,16 @@ class WfnLoader:
         }
         return self._phdf5_static_dev
 
+    def _ensure_phdf5_ctx(self) -> int:
+        """Open (once) the collective phdf5 context this loader reads
+        through, and return its handle.  Held for the loader's lifetime;
+        :meth:`close` releases it."""
+        if self._phdf5_ctx is None:
+            from ffi.phdf5 import open_file
+            self._phdf5_ctx = open_file(
+                self._path, mesh=self._mesh, mode="r")
+        return self._phdf5_ctx
+
     def _phdf5_build(
         self,
         *,
@@ -892,9 +982,8 @@ class WfnLoader:
         """
         from ffi.phdf5.read import read_kchunk_union_sharded
 
-        self._ensure_phdf5_static()   # side effect: opens the phdf5 ctx
-        ctx = self._phdf5_ctx
-        assert ctx is not None
+        self._ensure_phdf5_static()
+        ctx = self._ensure_phdf5_ctx()
         p_x = int(self._mesh.shape["x"])
         p_y = int(self._mesh.shape["y"])
         world = p_x * p_y
@@ -921,39 +1010,45 @@ class WfnLoader:
             for ibz in ibz_unique_sorted
         ], axis=0).astype(np.int64)
         # Per-rank counts: the C++ adds ``rank_coord_band * bands_per_rank``
-        # to ``offsets[:, 0]`` to get each rank's band-axis file offset.
-        # When ``mnband`` is not divisible by the global pad
-        # (``world * (b_hi_logical-b_lo_logical-mnband-tail)``), the
-        # tail-padded ranks would otherwise read past the on-disk band
-        # extent.  Build a per-rank ``counts`` table that clamps the
-        # band-axis count so each rank's [offset, offset+count) stays
-        # inside the file's [0, mnband) extent.  Ranks fully past the
-        # extent get count=0 on the band axis → no H5Dread bytes
-        # contributed; the C++ pre-zeros the pinned buffer so the
-        # rank's tile reads as exactly zero.
+        # to ``offsets[:, 0]`` to get each rank's band-axis file offset,
+        # so each rank's slab must be clipped to the LOGICAL extent of
+        # the read before it becomes a hyperslab selection.  That clip is
+        # SlabIO's ``_derive_valid_shape``, applied per rank by
+        # ``_build_phdf5_clamped_counts`` (see its docstring for why the
+        # band bound is ``b_hi``, not ``mnband``, and what diverged while
+        # this file carried its own copy of the arithmetic).  Ranks whose
+        # block is entirely past the window get count=0 on the band axis
+        # → no H5Dread bytes contributed; the C++ pre-zeros the pinned
+        # buffer so the rank's tile reads as exactly zero.
         mnband_file = int(self.nbands)
         ngk_per_ibz_read = tuple(int(self.ngk[ibz]) for ibz in ibz_unique_sorted)
         counts_global = _build_phdf5_clamped_counts(
             world=world,
             bands_per_rank=bands_per_rank,
             b_lo_logical=b_lo_logical,
-            mnband_file=mnband_file,
+            # ``load`` refuses ``b_hi > mnband``, so the min() is the
+            # file-extent backstop for a direct caller of _phdf5_build.
+            band_extent=min(b_hi_logical, mnband_file),
             n_reads=n_reads,
             ngk_per_ibz_read=ngk_per_ibz_read,
+            kchunk_start_per_read=tuple(
+                int(self._kpt_starts[int(ibz)]) for ibz in ibz_unique_sorted),
+            ngktot=ngktot,
             ns=ns,
         )
 
-        # The (pure) per-rank band-axis cap doubles as a precondition
-        # for the pad-past-file case: if ``b_hi_logical > mnband_file``,
-        # the per-rank clamp above produces band_cnt < bands_per_rank
-        # for the tail-rank(s); the C++ honours that (count is per-rank
-        # and ≤ per_rank_max[0]=bands_per_rank).  This makes the prior
+        # The (pure) per-rank band-axis cap doubles as a precondition for
+        # the padded case: whenever ``b_lo + nb_padded > band_extent``,
+        # the per-rank clip above produces band_cnt < bands_per_rank for
+        # the tail-rank(s); the C++ honours that (count is per-rank and
+        # ≤ per_rank_max[0]=bands_per_rank).  This makes the prior
         # NotImplementedError-on-pad-past-file branch obsolete; the
         # phdf5 backend now matches the eager backend's zero-fill
-        # behaviour on past-file pads.  We leave a sanity check for the
-        # extreme case where ``b_lo`` itself starts past EOF
-        # (nonsensical request that ``WfnLoader.load`` rejects upstream
-        # at lines 678-681, but defended here too).
+        # behaviour on BOTH kinds of pad row (past the logical window,
+        # and past the file).  We leave a sanity check for the extreme
+        # case where ``b_lo`` itself starts past EOF (nonsensical request
+        # that ``WfnLoader.load`` rejects upstream in its band-range
+        # check, but defended here too).
         if b_lo_logical >= mnband_file:
             raise ValueError(
                 f"_phdf5_build: b_lo={b_lo_logical} >= mnband={mnband_file}; "
@@ -997,13 +1092,15 @@ class WfnLoader:
         self, cnk_at_ibz, *, k_idxs, unfold, n_reads, n_k, bands_per_rank,
         ns, ngkmax, position_in_reads, out_sharding,
     ) -> jax.Array:
-        """Shared tail of both phdf5 read paths: on-device symmetry unfold
-        (+ transpose to WfnLoader's G-flat layout) of the union buffer
-        ``cnk_at_ibz`` ``(bands_per_rank, ns, n_reads, ngkmax, 2)`` sharded
+        """Tail of the phdf5 read: on-device symmetry unfold (+ transpose
+        to WfnLoader's G-flat layout) of the union buffer ``cnk_at_ibz``
+        ``(bands_per_rank, ns, n_reads, ngkmax, 2)`` sharded
         ``P(('x','y'), None, None, None, None)``.
 
-        Single-sourced so the FFI (``_phdf5_build``) and host
-        (``_phdf5_host_build``) reads cannot drift in the unfold step.
+        Kept a separate method from :meth:`_phdf5_build` because it is
+        the only piece of the collective path that runs without an
+        ``.so``, so it is the piece a single-process test can pin against
+        ``_eager_build`` (``tests/test_wfn_loader_eager.py``).
         """
         static = self._ensure_phdf5_static()
         unfold_jit = _phdf5_unfold_kernel(
@@ -1028,99 +1125,6 @@ class WfnLoader:
         # psi shape after the kernel: (n_k, nb_padded, ns, ngkmax) c128
         # with band-axis sharding propagated from the read.
         return jax.lax.with_sharding_constraint(psi, out_sharding)
-
-    def _phdf5_host_build(
-        self,
-        *,
-        b_lo: int,
-        b_hi: int,
-        k_idxs: np.ndarray,
-        unfold: bool,
-        nb_padded: int,
-        out_sharding: NamedSharding,
-    ) -> jax.Array:
-        """(CPU) Host h5py union read + on-device unfold → G-flat ψ.
-
-        No-FFI FALLBACK for :meth:`_phdf5_build`, selected by
-        ``_auto_pick_backend`` only when no phdf5-capable FFI library is
-        loadable on either platform (the host lib built with the phdf5 read
-        handlers is preferred — it shares the collective MPI-IO read core).
-        Produces the *same*
-        ``cnk_at_ibz`` union buffer — per-rank
-        ``(bands_per_rank, ns, n_reads, ngkmax, 2)`` f64 sharded
-        ``P(('x','y'), None, None, None, None)`` — but each rank reads its
-        own contiguous band block with the plain h5py handle (independent
-        read-only POSIX hyperslabs of a *disjoint* band block; no MPI-IO,
-        no CUDA), then feeds the identical
-        :meth:`_phdf5_unfold_and_shard` kernel.
-
-        The unfold shard_map is ``lru_cache``d on its shape signature, so
-        it compiles **once** across the whole band sweep — this is the
-        fix for the eager path's per-k/per-chunk numpy-unfold compile
-        storm.  Output: ``(n_k, nb_padded, nspinor, ngkmax)`` c128.
-        """
-        world = int(self._mesh.shape["x"]) * int(self._mesh.shape["y"])
-        ns = int(self.nspinor)
-        ngkmax = int(self.ngkmax)
-        nb = int(nb_padded)
-        if nb % world:
-            raise ValueError(
-                f"_phdf5_host_build: nb_padded={nb} not divisible by "
-                f"world={world}; loader bug — _default_sharding should pad.")
-        bands_per_rank = nb // world
-        mnband_file = int(self.nbands)
-        b_lo = int(b_lo)
-        b_hi = int(b_hi)
-
-        # One-time banner so run logs unambiguously show the host union
-        # read is active (rules out a silent fallback to eager).
-        global _PHDF5_HOST_ANNOUNCED
-        if not _PHDF5_HOST_ANNOUNCED:
-            _PHDF5_HOST_ANNOUNCED = True
-            try:
-                if int(jax.process_index()) == 0:
-                    print(f"[WfnLoader] backend=phdf5_host active "
-                          f"(world={world}, bands_per_rank={bands_per_rank}, "
-                          f"ngkmax={ngkmax})", flush=True)
-            except Exception:
-                pass
-
-        # Union-read k-plan (identical bookkeeping to _phdf5_build).
-        ibz_unique_sorted, n_reads, position_in_reads, n_k = self._kplan(
-            k_idxs, unfold)
-
-        def _fill(band_off: int, local_shape: tuple[int, ...]) -> np.ndarray:
-            # Host union read: fill this rank's (bpr, ns, n_reads, ngk, 2).
-            local = np.zeros(local_shape, dtype=np.float64)
-            # File band rows for this rank's block, clamped so pad bands
-            # (past the logical window b_hi) and past-EOF bands (past
-            # mnband) stay zero — matching the eager zero-fill contract.
-            fb_lo = b_lo + band_off
-            fb_hi = min(fb_lo + local_shape[0], b_hi, mnband_file)
-            n_real = max(0, fb_hi - fb_lo)
-            if n_real > 0:
-                for r, ibz in enumerate(ibz_unique_sorted):
-                    start = int(self._kpt_starts[int(ibz)])
-                    ngk = int(self.ngk[int(ibz)])
-                    # (n_real, ns, ngk, 2) read-only hyperslab.
-                    raw = self._coeffs_ds[fb_lo:fb_hi, :, start:start + ngk, :]
-                    local[:n_real, :, r, :ngk, :] = raw
-            return local
-
-        # Learn THIS rank's band block + assemble via the shared §5b
-        # process-local scaffold (cached proto → compiles once).
-        cnk_at_ibz = self._assemble_process_local(
-            global_shape=(nb, ns, n_reads, ngkmax, 2),
-            sharding=NamedSharding(
-                self._mesh, P(("x", "y"), None, None, None, None)),
-            dtype=jnp.float64,
-            sharded_axis=0,
-            fill_local=_fill)
-
-        return self._phdf5_unfold_and_shard(
-            cnk_at_ibz, k_idxs=k_idxs, unfold=unfold, n_reads=n_reads,
-            n_k=n_k, bands_per_rank=bands_per_rank, ns=ns, ngkmax=ngkmax,
-            position_in_reads=position_in_reads, out_sharding=out_sharding)
 
     # ------------------------------------------------------------------
     def load(
@@ -1193,21 +1197,6 @@ class WfnLoader:
                 # same string set.
                 pass  # NamedSharding doesn't care about exact dim sizes
             psi = self._phdf5_build(
-                b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
-                nb_padded=nb_padded, out_sharding=named_sharding)
-            if bispinor:
-                psi = self._apply_bispinor_lift(
-                    psi, k=k, k_idxs=k_idxs, unfold=unfold,
-                    sharding=named_sharding)
-            return psi
-
-        if self.backend == "phdf5_host" and named_sharding is not None:
-            # Host union read + shared on-device unfold.  The output is
-            # inherently band-sharded (the unfold's out_specs is
-            # P(None,('x','y'),None,None)); a replicated request
-            # (named_sharding is None, rare test path) falls through to
-            # the eager builders below instead.
-            psi = self._phdf5_host_build(
                 b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
                 nb_padded=nb_padded, out_sharding=named_sharding)
             if bispinor:
@@ -1306,7 +1295,7 @@ class WfnLoader:
                 f"band range {bands} out of [0, {self.nbands})")
 
         k_idxs, unfold = self._resolve_k(k)
-        # The phdf5 backends never open the coeffs dataset (they read it
+        # The phdf5 backend never opens the coeffs dataset (it reads it
         # collectively through the FFI), but the host build below needs
         # the handle.  Opening it lazily costs one h5py lookup and keeps
         # this method usable from a driver whose loader is phdf5-backed.

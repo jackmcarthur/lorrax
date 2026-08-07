@@ -531,8 +531,8 @@ Env vars read at `open_file` time:
 | `LORRAX_PHDF5_CB_BUFFER_SIZE`    | _unset_ (ROMIO auto) | Per-aggregator CB buffer size (bytes) when set. |
 | `LORRAX_PHDF5_CB_NODES`          | _unset_ (ROMIO auto) | ROMIO aggregator count when set. |
 | `LORRAX_PHDF5_CB_PER_NODE`       | _unset_      | Cray MPICH: aggregators/node (`cb_config_list=*:N`). |
-| `LORRAX_PHDF5_STRIPE_COUNT`      | `16`         | Lustre `striping_factor` hint. |
-| `LORRAX_PHDF5_STRIPE_SIZE_FS`    | `4M`         | Lustre `striping_unit` hint (`lfs -S` spelling; legacy byte-valued `LORRAX_PHDF5_STRIPE_SIZE` also honoured). |
+| `LORRAX_PHDF5_STRIPE_COUNT`      | policy       | Lustre `striping_factor` hint; unset = `clamp(world_size, 4, 128)`, the same `_stripe_policy` the Python writer resolves. |
+| `LORRAX_PHDF5_STRIPE_SIZE_FS`    | policy       | Lustre `striping_unit` hint (`lfs -S` spelling; legacy byte-valued `LORRAX_PHDF5_STRIPE_SIZE` also honoured); unset = the 1->4 MiB rank-count ramp. |
 | `LORRAX_PHDF5_ALIGN_MB`          | `4`          | `H5Pset_alignment` threshold (MiB). |
 | `LORRAX_PHDF5_INDEPENDENT`       | `0`          | 1 → force **reads** to independent. |
 | `LORRAX_PHDF5_COLLECTIVE_WRITES` | `1`          | 0 → independent writes (pre-AI behaviour; the historical Cray `ad_cray_write_coll.c` OOM caution lives in context.cc). |

@@ -1079,7 +1079,7 @@ def load_wfns_and_enk_for_sigma(wfn, sym, nval: int, ncond: int, nband: int):
 
 def setup_wfn_and_sym(wfn_file: str, mesh_xy: Mesh | None = None):
     # Pass the device mesh so the loader can pick a sharded read backend
-    # (phdf5 FFI on GPU / phdf5_host union read on multi-process CPU),
+    # (the collective phdf5 FFI read, on GPU or the CUDA-free host lib),
     # band-sharding ψ instead of replicating the whole WFN on every rank.
     # Single-process / no-mesh transparently stays eager.
     wfn = WFNReader(wfn_file, mesh=mesh_xy)

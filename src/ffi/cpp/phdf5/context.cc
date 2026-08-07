@@ -11,10 +11,15 @@
 //   LORRAX_PHDF5_INDEPENDENT      (0)   force independent READS
 //   LORRAX_PHDF5_COLL_META        (0)   collective metadata ops
 //   LORRAX_PHDF5_ALIGN_MB         (4)   H5Pset_alignment threshold/length
-//   LORRAX_PHDF5_STRIPE_COUNT     (16)  Lustre striping_factor hint
-//   LORRAX_PHDF5_STRIPE_SIZE_FS   (4M)  Lustre striping_unit hint (lfs form;
+//   LORRAX_PHDF5_STRIPE_COUNT  (policy) Lustre striping_factor hint; unset =
+//                                       clamp(world_size, 4, 128)
+//   LORRAX_PHDF5_STRIPE_SIZE_FS(policy) Lustre striping_unit hint (lfs form;
 //                                       legacy byte-valued
-//                                       LORRAX_PHDF5_STRIPE_SIZE honoured)
+//                                       LORRAX_PHDF5_STRIPE_SIZE honoured);
+//                                       unset = the 1->4 MiB rank-count ramp.
+//                                       Both policies transcribe
+//                                       file_io/_slab_io_ffi._stripe_policy —
+//                                       see stripe_policy_count/_unit below
 //   LORRAX_PHDF5_CB_WRITE / _DS_WRITE / _CB_NODES / _CB_BUFFER_SIZE /
 //   _CB_PER_NODE                (unset) ROMIO pass-throughs; unset = ROMIO
 //                                       automatic policy (measured best on
@@ -128,6 +133,46 @@ static long env_long(const char* name, long default_value) {
     long parsed = std::strtol(v, &end, 10);
     if (end == v) return default_value;
     return parsed;
+}
+
+// ---------------------------------------------------------------------------
+// The Lustre stripe POLICY for an unset LORRAX_PHDF5_STRIPE_{COUNT,SIZE_FS}.
+// ---------------------------------------------------------------------------
+//
+// TRANSCRIPTION, not a second policy.  The one source of truth is
+// ``file_io/_slab_io_ffi.py::_stripe_policy(nranks)`` — that docstring and
+// the block comment above it carry every measurement (job 56389339,
+// 2026-08-05) and the reasoning for both clamps.  Keep the two in step; a
+// change to one without the other reinstates exactly the disagreement this
+// pair replaced (Python: clamp(nranks, 4, 128) + a 1->4 MiB ramp; C++: the
+// literals "16" and 1 MiB).
+//
+// Python, verbatim:
+//     n     = max(1, nranks)
+//     count = min(max(n, 4), 128)
+//     unit  = 1 MiB; while unit < 4 MiB and 2*n*n > ((unit//1MiB)*32)**2:
+//                        unit *= 2
+// i.e. the power of two nearest IN LOG2 to (nranks/16) MiB, clamped to
+// [1 MiB, 4 MiB]: 1 MiB below 16*sqrt(2) ~= 22.6 ranks, 2 MiB to
+// 32*sqrt(2) ~= 45.3, 4 MiB above.  Integer arithmetic on both sides so
+// neither can drift with libm.
+static long stripe_policy_count(int world_size) {
+    long n = world_size > 1 ? (long)world_size : 1L;
+    if (n < 4) n = 4;
+    if (n > 128) n = 128;
+    return n;
+}
+
+static long stripe_policy_unit(int world_size) {
+    const long n = world_size > 1 ? (long)world_size : 1L;
+    const long kMin = 1L << 20, kMax = 4L << 20;
+    long unit = kMin;
+    while (unit < kMax) {
+        const long anchor = (unit / kMin) * 32L;
+        if (2L * n * n <= anchor * anchor) break;
+        unit *= 2;
+    }
+    return unit;
 }
 
 // env_flag (the boolean grammar) moved to ctx.h on 2026-08-06 so every
@@ -413,12 +458,28 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     // striping_factor / striping_unit: MPI-IO's way to request a Lustre
     // stripe layout when it creates the file (ROMIO applies it through
     // llapi — works inside the container with no `lfs` binary on PATH).
-    // Default 16 x 4 MiB (scorecard AI: +57% on top of collective; the
-    // request is clamped to what Lustre grants — the banner prints the
-    // request, `lfs getstripe` prints the truth).  No-ops if the file
+    // The request is clamped to what Lustre grants — the banner prints
+    // the request, `lfs getstripe` prints the truth.  No-ops if the file
     // inode already exists — which is why, on mode='w', rank 0 unlinks
-    // the target before open in both Python backends, so the collective
+    // the target before open in the Python writer, so the collective
     // create here sees a fresh inode and the striping hints apply.
+    //
+    // THE UNSET DEFAULT IS A FUNCTION OF THE RANK COUNT, and it is the
+    // SAME function the Python writer resolves —
+    // `stripe_policy_count`/`stripe_policy_unit` above transcribe
+    // `file_io/_slab_io_ffi.py::_stripe_policy`, which owns the
+    // measurements.  Until 2026-08-06 this side wrote the literals "16"
+    // and 1 MiB while Python resolved `clamp(nranks, 4, 128)` and a
+    // 1→4 MiB ramp.  In-tree that was masked, because
+    // `_FfiBackend.__init__` calls `_export_striping_env()` immediately
+    // before `_open_file()` and so the getenv below always found a
+    // value; but anything reaching `ffi.io.open_file` DIRECTLY got the
+    // old constant, silently, and TWO WRITERS REQUESTING DIFFERENT
+    // LAYOUTS is worse than both being wrong the same way — it is the
+    // bug class `env_flag` and the STRIPE_* refusals were introduced
+    // for.  `world_size` here is the same `jax.process_count()` Python
+    // passes `_stripe_policy`, so the two agree by construction now
+    // rather than by call-ordering.
     //
     // Env naming: LORRAX_PHDF5_STRIPE_SIZE_FS is THE documented knob
     // (env_vars.md), spelled like `lfs setstripe -S` ("4M"); it is read
@@ -478,9 +539,12 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
         }
         info_set("striping_factor", sc);
     } else {
-        info_set("striping_factor", "16");
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%ld",
+                      stripe_policy_count(ctx->world_size));
+        info_set("striping_factor", buf);
     }
-    long stripe_bytes = 1L << 20;
+    long stripe_bytes = stripe_policy_unit(ctx->world_size);
     if (const char* fs = std::getenv("LORRAX_PHDF5_STRIPE_SIZE_FS");
         fs && *fs) {
         char* end = nullptr;
@@ -537,8 +601,8 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     // Backstop only.  Every reachable way to get here non-positive now
     // throws above, naming the variable; this catches a v*mult that
     // overflowed long.  It is deliberately NOT the silent-default path it
-    // used to be -- that is what let "=4MiB" measure the 1 MiB default.
-    if (stripe_bytes <= 0) stripe_bytes = 1L << 20;
+    // used to be -- that is what let "=4MiB" measure the policy value.
+    if (stripe_bytes <= 0) stripe_bytes = stripe_policy_unit(ctx->world_size);
     {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%ld", stripe_bytes);
