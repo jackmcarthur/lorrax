@@ -21,16 +21,22 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parent))
 import harness  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# ONE GPU PER PROCESS.  Not a preference — three separate things require it.
+# ONE GPU PER PROCESS THAT RUNS TESTS.  Not a preference — three separate
+# things require it, and a fourth requires that the xdist CONTROLLER be
+# excluded from it.
 # ---------------------------------------------------------------------------
 # Under pytest-xdist each worker takes its own GPU (gw0 → GPU 0, gw1 → GPU
 # 1, …) so the e2e regression gates — subprocess launchers that each need
 # ONE GPU — run N-wide on an N-GPU node instead of serially on GPU 0.
 # WITHOUT a worker id the process takes the FIRST visible device.  Must run
-# before the first CUDA/JAX init, which is why it lives at conftest module
-# scope.  This OVERRIDES any pre-set CUDA_VISIBLE_DEVICES (SLURM gres sets
-# "0,1,2,3" for the task); the mapping goes through the existing list so
-# SLURM's device selection is respected.
+# before the first CUDA/JAX init; ``pytest_configure`` is that moment (it
+# runs before collection, so before any test module — and therefore any
+# jax — is imported) and it is also the FIRST moment the controller can be
+# told apart from a plain single-process run, which is the whole reason
+# the pin lives in a hook instead of at module scope.  This OVERRIDES any
+# pre-set CUDA_VISIBLE_DEVICES (SLURM gres sets "0,1,2,3" for the task);
+# the mapping goes through the existing list so SLURM's device selection is
+# respected.
 #
 # THE `if _wid.startswith("gw")` GUARD THIS REPLACES WAS A REAL DEFECT, and
 # it is worth writing down because it hid behind a green leg.  Three things
@@ -73,14 +79,47 @@ import harness  # noqa: E402
 # The service conftest keeps its copy — it is the one that runs when the
 # suite is invoked BY PATH, which never loads this file at all.
 #
+# AND THE CONTROLLER DOES NOT PIN.  MEASURED, Perlmutter 2026-08-07
+# (KNOWN_FAILURES B2).  Making the pin unconditional gave it to the xdist
+# CONTROLLER too — a process with no worker id, so ``pin_one_gpu`` handed
+# it ``devs[0]`` and it wrote CUDA_VISIBLE_DEVICES="0" into its OWN
+# environ.  The workers are spawned FROM that environ, so all four
+# inherited ``preset="0"``, ``_visible_gpus`` returned a one-element list
+# in each of them, ``int(wid[2:]) % 1 == 0`` for all four, and the fan-out
+# three lines above quietly stopped existing:
+#
+#   gw0 gw1 gw2 gw3   xdist arm (6 gnppm-session files)
+#   '0' '1' '2' '3'   78ddcee        24 / 24 passed
+#   '0' '0' '0' '0'   6920171        11 P / 2 F / 11 E, RESOURCE_EXHAUSTED
+#                                    … 19.20 GiB on device ordinal 0
+#
+# The controller runs no tests, so it has nothing to pin FOR; the only
+# effect its write can have is to narrow what its workers inherit.  The
+# three reasons above are reasons for a process that COMPUTES, and a
+# single-process run is still one of those — which is why the arm is
+# "controller", read from pytest-xdist's own signal
+# (``harness.is_xdist_controller``), and not "no worker id".
+#
 # No-op where there is nothing to pin: unset CUDA_VISIBLE_DEVICES and no
 # nvidia-smi (every CPU leg, the WSL box) leaves the environment untouched.
 # ---------------------------------------------------------------------------
-_pinned = harness.pin_one_gpu(
-    os.environ.get("CUDA_VISIBLE_DEVICES"),
-    os.environ.get("PYTEST_XDIST_WORKER", ""))
-if _pinned is not None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = _pinned
+
+
+def pytest_configure(config):
+    """Pin this process's GPU, unless this process is the xdist controller.
+
+    ``config.option.dist`` is ``"no"`` for a plain run and for ``-n 0``,
+    and ``PYTEST_XDIST_WORKER`` is set in every worker's environment — so
+    the two together separate the three cases the pin has to tell apart.
+    """
+    pinned = harness.pin_one_gpu(
+        os.environ.get("CUDA_VISIBLE_DEVICES"),
+        os.environ.get("PYTEST_XDIST_WORKER", ""),
+        controller=harness.is_xdist_controller(
+            os.environ.get("PYTEST_XDIST_WORKER", ""),
+            getattr(config.option, "dist", "no")))
+    if pinned is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = pinned
 
 
 # ---------------------------------------------------------------------------

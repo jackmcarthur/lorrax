@@ -41,8 +41,34 @@ This pin is still correct and still free, and all three reasons above
 stand — it just never was the cause of the eight.  ``test_a_bare_process_
 still_gets_pinned`` is the cell that fails on the old code; the rest keep
 the fan-out and the no-op cases from regressing in the other direction.
+
+SECOND CORRECTION, 2026-08-07 (KNOWN_FAILURES B2) — WHAT UNCONDITIONAL
+COST.  "Without a worker id, take the first visible device" is right for a
+process that computes and wrong for exactly one process: the pytest-xdist
+CONTROLLER, which has no worker id, runs no tests, and whose environ is
+what the workers are SPAWNED FROM.  It took ``devs[0]``, wrote
+CUDA_VISIBLE_DEVICES="0" into itself, and every worker then inherited a
+one-element device list:
+
+    gw0 gw1 gw2 gw3    the six gnppm-session files under `lx test`
+    '0' '1' '2' '3'    78ddcee   24 / 24 passed
+    '0' '0' '0' '0'    6920171   11 P / 2 F / 11 E, RESOURCE_EXHAUSTED:
+                                 Failed to allocate 19.20 GiB on device
+                                 ordinal 0
+
+Every cell in this file stayed GREEN through that, because they all
+construct the preset by hand and none of them ever saw the controller's
+write.  That is the hole ``test_the_controller_does_not_narrow_what_the_
+workers_inherit`` closes: it spawns the real four-worker arm and reads
+each worker's own CUDA_VISIBLE_DEVICES back, which is the probe that
+caught it.
 """
 from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -91,6 +117,160 @@ def test_a_non_worker_id_is_not_read_as_a_worker():
     first device rather than crashing on ``int(...)``."""
     assert harness.pin_one_gpu("0,1,2,3", "master") == "0"
     assert harness.pin_one_gpu("0,1,2,3", "gw") == "0"
+
+
+# ---------------------------------------------------------------------------
+#  …and the one process that must NOT be pinned: the xdist controller
+# ---------------------------------------------------------------------------
+
+def test_the_controller_takes_no_device_at_all():
+    """THE B2 REGRESSION, as a pure cell.
+
+    ``devs[0]`` is the right answer for every process that computes and the
+    wrong answer for the one that does not: what the controller writes is
+    what its workers inherit as their preset, and a one-element preset
+    collapses the fan-out.
+    """
+    assert harness.pin_one_gpu("0,1,2,3", "", controller=True) is None
+    assert harness.pin_one_gpu(None, "", probe=_probe(4), controller=True) is None
+
+
+def test_the_controller_arm_can_fail():
+    """The FALSE case: the SAME inputs without the controller flag pin
+    ``"0"``.  Without this twin the cell above would pass on any change
+    that made ``pin_one_gpu`` return ``None`` for everything."""
+    assert harness.pin_one_gpu("0,1,2,3", "", controller=False) == "0"
+
+
+@pytest.mark.parametrize("worker_id,dist,want", [
+    ("",    "load", True),    # the controller: no worker id, fanning out
+    ("",    "each", True),
+    ("gw0", "load", False),   # a worker: has an id, and it computes
+    ("gw3", "load", False),
+    ("",    "no",   False),   # a plain single-process run: it computes too
+    ("",    None,   False),   # xdist not installed / -p no:xdist
+    ("",    "",     False),
+])
+def test_the_controller_signal_is_xdists_own(worker_id, dist, want):
+    """``PYTEST_XDIST_WORKER`` + ``config.option.dist``, which is exactly
+    ``xdist.is_xdist_controller``.
+
+    The row that matters most is ``("", "no")``: a non-xdist run has no
+    worker id either, and it is going to compute in this very process — so
+    "no worker id" alone is NOT the controller test, and using it would
+    re-open the leg that ``6920171`` was written to close.
+    """
+    assert harness.is_xdist_controller(worker_id, dist) is want
+
+
+def _gpu_ids():
+    """The node's real GPUs, or ``[]`` where there is no ``nvidia-smi``.
+
+    Same probe ``harness._probe_nvidia_smi`` uses, and it must not raise:
+    the CPU legs and the WSL box have no such binary and this cell has to
+    SKIP there, not error.
+    """
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True,
+                             text=True, timeout=30).stdout
+    except Exception:                                          # noqa: BLE001
+        return []
+    return [ln for ln in out.strip().splitlines() if ln.strip()]
+
+
+def test_the_controller_does_not_narrow_what_the_workers_inherit(tmp_path):
+    """THE PROBE THAT CAUGHT B2, frozen into the suite.
+
+    Every other cell here calls ``pin_one_gpu`` directly and none of them
+    could see the regression, because the defect was not in the decision —
+    it was in WHICH PROCESS applied it and what the next process inherited.
+    Only a real fan-out can answer that, so this one spawns the four-worker
+    arm and reads each worker's own ``CUDA_VISIBLE_DEVICES`` back out.
+
+    MEASURED (Perlmutter 2026-08-07): ``'0','1','2','3'`` at ``78ddcee``
+    against ``'0','0','0','0'`` at the census HEAD.  The assertion is
+    DISTINCTNESS rather than the literal list, because SLURM hands a subset
+    and the pick indexes into it.
+    """
+    pytest.importorskip("xdist")
+    gpus = _gpu_ids()
+    if len(gpus) < 2:
+        pytest.skip(f"needs >=2 real GPUs to fan out over, nvidia-smi -L "
+                    f"lists {len(gpus)}")
+    n = min(4, len(gpus))
+
+    # THE CONFTEST UNDER TEST, COPIED — not the repo's own tests/ dir.  The
+    # arm needs a rootdir whose conftest is this one, and writing a probe
+    # file into the checkout to get that would mutate the source tree from
+    # inside a test.  ``harness`` comes along because the conftest imports
+    # it by path.
+    for name in ("conftest.py", "harness.py"):
+        (tmp_path / name).write_text(
+            (harness.REPO_ROOT / "tests" / name).read_text())
+    # EACH WORKER REPORTS THROUGH A FILE, not through stdout.  Under xdist a
+    # worker's stdout does not reach the controller (execnet owns it, and -s
+    # does not change that) -- measured here first: 16 probe cells passed
+    # and the controller's stdout carried none of their prints.  A file per
+    # worker is the transport that survives the process boundary, and it is
+    # also the only one whose absence is unambiguous.
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (tmp_path / "test_cvd_probe.py").write_text(textwrap.dedent("""\
+        import os
+        import pathlib
+
+        import pytest
+
+
+        @pytest.mark.parametrize("i", range(16))
+        def test_probe(i):
+            wid = os.environ.get("PYTEST_XDIST_WORKER", "<none>")
+            out = pathlib.Path(os.environ["CVD_PROBE_DIR"]) / (wid + ".txt")
+            out.write_text(repr(os.environ.get("CUDA_VISIBLE_DEVICES")))
+        """))
+    # THIS PROCESS IS ITSELF ALREADY PINNED (it is a worker, or a bare run
+    # that took device 0), so its own CUDA_VISIBLE_DEVICES is a one-element
+    # list and inheriting it would make the arm trivially — and falsely —
+    # red.  Hand the child the full list instead; inside a SLURM cgroup
+    # ``nvidia-smi -L`` already lists only the devices this task owns, and
+    # CUDA numbers them 0..n-1.  The probe imports no jax and allocates
+    # nothing, so it cannot disturb a device another worker is using.
+    env = {**os.environ,
+           "JAX_PLATFORMS": "cpu",
+           "CVD_PROBE_DIR": str(reports),
+           "CUDA_VISIBLE_DEVICES": ",".join(str(i) for i in range(n))}
+    # AND THE CHILD IS A FRESH SESSION, NOT A CONTINUATION OF THIS ONE.
+    # When this cell runs under `lx test` it runs INSIDE a worker, whose
+    # environ carries PYTEST_XDIST_WORKER=gw2 — and the child's CONTROLLER
+    # would inherit that id, fail to recognise itself as a controller, pin
+    # devs[2], and hand its own workers a one-element preset.  All four then
+    # report '2' and this cell goes red for a reason that is about the
+    # fixture, not about the tree.  MEASURED here first, leg A at bb5b5b2:
+    # {'gw0': '2', 'gw1': '2', 'gw2': '2', 'gw3': '2'}.  (It is also the
+    # defect's own shape, arrived at from the other direction, which is
+    # some comfort about what the cell measures.)
+    for k in ("PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT",
+              "PYTEST_XDIST_TESTRUNUID", "PYTEST_CURRENT_TEST",
+              "PYTEST_ADDOPTS"):
+        env.pop(k, None)
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", "test_cvd_probe.py", "-n", str(n),
+         "-p", "no:randomly", "-q"],
+        cwd=str(tmp_path), capture_output=True, text=True, timeout=900,
+        env=env)
+
+    seen = {p.stem: p.read_text().strip() for p in sorted(reports.iterdir())}
+    assert len(seen) == n, (
+        f"expected {n} workers to report, got {sorted(seen)}.\n"
+        f"stdout:\n{res.stdout[-4000:]}\nstderr:\n{res.stderr[-2000:]}")
+    devices = sorted(seen.values())
+    assert len(set(devices)) == n, (
+        f"the {n} xdist workers landed on {len(set(devices))} distinct "
+        f"device(s): {seen}.  The fan-out is dead — which is what happens "
+        f"when the CONTROLLER pins CUDA_VISIBLE_DEVICES into its own "
+        f"environ and the workers inherit a one-element list.  Four gnppm "
+        f"sessions on one 40 GiB A100 is RESOURCE_EXHAUSTED, not a slow "
+        f"run.")
 
 
 # ---------------------------------------------------------------------------

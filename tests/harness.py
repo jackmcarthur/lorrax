@@ -51,7 +51,26 @@ def _probe_nvidia_smi() -> int:
         return 0
 
 
-def pin_one_gpu(preset: str | None, worker_id: str = "", probe=None):
+def is_xdist_controller(worker_id: str, dist: str | None) -> bool:
+    """True when this process fans tests out and runs NONE of them itself.
+
+    pytest-xdist's OWN predicate, in the two facts a conftest can read:
+    a worker has ``PYTEST_XDIST_WORKER`` in its environment, and the
+    controller is the process that has no worker id while ``--dist`` is
+    something other than ``no`` (``xdist.is_xdist_controller`` is
+    ``config.option.dist != "no" and not hasattr(config, "workerinput")``).
+
+    NOT a heuristic on ``sys.argv`` and not "no worker id": a plain
+    non-xdist run has no worker id either, and it is going to compute in
+    this very process, so it must still be pinned.  ``dist`` is
+    ``config.option.dist``, which is ``"no"`` when xdist is absent or was
+    given ``-n 0``.
+    """
+    return not worker_id and str(dist or "no") != "no"
+
+
+def pin_one_gpu(preset: str | None, worker_id: str = "", probe=None,
+                *, controller: bool = False):
     """The ONE device this process should see, or ``None`` for "leave it".
 
     ``preset`` is ``CUDA_VISIBLE_DEVICES`` as the process found it
@@ -59,12 +78,31 @@ def pin_one_gpu(preset: str | None, worker_id: str = "", probe=None):
     worker id the pick fans out across the visible list (``gw2`` -> the
     third one, wrapping); without one it is the FIRST visible device.
 
-    A PURE FUNCTION on purpose.  Its caller is a module-scope side effect
-    in ``tests/conftest.py`` — it has to run before the first CUDA init,
+    ``controller`` is the xdist CONTROLLER, and it gets ``None`` — never a
+    device.  IT RUNS NO TESTS, so it has nothing to pin FOR, and what it
+    writes into its own environ is what its workers INHERIT as their
+    preset.  MEASURED, Perlmutter 2026-08-07 (KNOWN_FAILURES B2): with the
+    controller pinning too, all four workers read ``preset="0"``, every
+    ``_visible_gpus`` list was one element long, ``int(wid[2:]) % 1 == 0``
+    for all of them, and the fan-out below silently became four sessions
+    on one 40 GiB A100 --
+
+        gw0 gw1 gw2 gw3 = '0','1','2','3'   before   24 / 24 passed
+        gw0 gw1 gw2 gw3 = '0','0','0','0'   after     7 P / 17 E,
+            RESOURCE_EXHAUSTED: Failed to allocate 19.9 GiB on device
+            ordinal 0
+
+    -- with this function's own unit tests still green throughout, because
+    they construct the preset by hand and never see the controller's write.
+
+    A PURE FUNCTION on purpose.  Its caller is a side effect in
+    ``tests/conftest.py`` — it has to run before the first CUDA init,
     which is the one place a test cannot observe — so the DECISION lives
     here where ``tests/test_gpu_pinning.py`` can construct every case,
-    including the one that regressed.
+    including the two that regressed.
     """
+    if controller:
+        return None
     devs = _visible_gpus(preset, probe or _probe_nvidia_smi)
     if not devs:
         return None
