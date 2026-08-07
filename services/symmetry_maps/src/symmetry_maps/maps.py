@@ -965,7 +965,6 @@ class SymMaps:
 
             # In no-symmetry case, unfolded grid equals irreducible grid
             self.unfolded_kpts = np.asarray(wfn.kpoints, dtype=float)
-            self.kpoint_map = np.arange(self.unfolded_kpts.shape[0], dtype=np.int32)
 
             # Maps: each full k maps to itself; only identity symmetry
             self.irr_idx_k = np.arange(self.unfolded_kpts.shape[0], dtype=np.int32)
@@ -1111,16 +1110,18 @@ class SymMaps:
                 "TRS-reduced mesh for a magnetic system is not physical.",
                 RuntimeWarning)
 
-        # get the list of full zone k-points and the map from k_full to k_irr
-        self.kpoint_map, self.unfolded_kpts = self.create_kpoint_symmetry_map(wfn)
-        self.kpoint_map = np.asarray(self.kpoint_map, dtype=np.int32)
-        if np.any(self.kpoint_map < 0) or np.any(self.kpoint_map >= wfn.nkpts):
-            raise ValueError(
-                "kpoint_map contains entries outside the irreducible-k range: "
-                f"[0, {wfn.nkpts})"
-            )
+        # The list of full-zone k-points.  The k_full -> k_irr PARENT MAP
+        # this used to compute alongside it is gone (design decision 4):
+        # it was a second, independently-ruled derivation of the same
+        # relationship ``find_symmetry_ops_simple`` produces below, it was
+        # published as ``self.kpoint_map``, and nothing live read it.
+        self.unfolded_kpts = self.create_kpoint_symmetry_map(wfn)
 
-        self.irr_idx_k, self.sym_idx_k = self.find_symmetry_ops_simple(wfn, self.kpoint_map, self.unfolded_kpts)
+        # ``None`` for the retired parent map: the parameter stays in the
+        # signature for older callers, and the method has discarded its
+        # argument since the ``del kpoint_map`` at the top of its body.
+        self.irr_idx_k, self.sym_idx_k = self.find_symmetry_ops_simple(
+            wfn, None, self.unfolded_kpts)
 
 
         self.nk_tot = int(self.unfolded_kpts.shape[0])
@@ -1268,63 +1269,34 @@ class SymMaps:
         return self._wrap_to_bz(np.stack([k.flatten() for k in kpts_mesh]).T)
 
     def create_kpoint_symmetry_map(self, wfn):
-        """
-        Build the map from each full-grid k-point to its irreducible-k partner.
-        
-        Args:
-            wfn (WfnReader): WFN reader object
-            
-        Returns:
-            tuple: (kpoint_map, full_kpoints)
-                - kpoint_map: Array mapping each full-grid k-point to the
-                  matching irreducible-k index in ``wfn.kpoints``
-                - full_kpoints: Array of all k-points in the full grid
-        """
-        full_kpoints = self._generate_uniform_full_kpoints(wfn)
-        irr_kpts = self._wrap_to_bz(wfn.kpoints)
+        """The full-grid k-point list.
 
-        # Map each full k-point to its irreducible representative.
-        kpoint_map = np.zeros(len(full_kpoints), dtype=np.int32)
-        unmatched_kpts = []
-        
-        for kfull_idx in range(len(full_kpoints)):
-            k_found = False
-            # ``_sym_mats_k_search`` is ``sym_mats_k`` unless the measured
-            # density says TRS is broken, in which case it is the spatial
-            # half only (see ``__init__``/``trs_allowed``).
-            for sym_idx, sym_mat in enumerate(self._sym_mats_k_search):
-                # Apply symmetry operation to k-point
-                k_transformed = self._wrap_to_bz(sym_mat @ full_kpoints[kfull_idx])
-                
-                # Check if transformed k-point matches any k-point in wfn.kpoints
-                for irk_idx, k_wrapped in enumerate(irr_kpts):
-                    if np.allclose(k_transformed, k_wrapped, atol=1e-6):
-                        kpoint_map[kfull_idx] = irk_idx
-                        k_found = True
-                        break
-                
-                if k_found:
-                    break
-            
-            if not k_found:
-                # Fallback: find nearest irreducible k-point and use identity
-                # This handles cases where WFN symmetry data is incomplete
-                kfull = full_kpoints[kfull_idx]
-                dists = np.linalg.norm(self._periodic_delta(irr_kpts, kfull), axis=1)
-                nearest_irr = np.argmin(dists)
-                kpoint_map[kfull_idx] = nearest_irr
-                unmatched_kpts.append((kfull_idx, full_kpoints[kfull_idx], nearest_irr))
-        
-        if unmatched_kpts:
-            import warnings
-            warnings.warn(f"WFN symmetry data incomplete: {len(unmatched_kpts)} k-points could not be "
-                         f"mapped via stored symmetries "
-                         f"(ntran={len(self._sym_mats_k_search)}"
-                         f"{'' if self.trs_allowed else ', TIME REVERSAL DISALLOWED by the measured density'}). "
-                         f"Using identity fallback. First unmatched: {unmatched_kpts[0][1]}")
-        
-        return kpoint_map, full_kpoints
-        
+        Returns ``full_kpoints`` — the uniform grid, wrapped to the BZ.
+
+        THE PARENT MAP THIS USED TO RETURN IS GONE (design decision 4,
+        2026-08-07).  It was a ``(n_k_full x 2*ntran x nrk)`` python triple
+        loop computing, by its OWN tie-break rule (lowest sym index that
+        maps ``k_full`` INTO the IBZ, plus a nearest-neighbour fallback),
+        the same k_full -> k_irr relationship that
+        :meth:`find_symmetry_ops_simple` computes a few lines later by the
+        SHIPPING rule (highest matching ``ikbar``, then lowest sym — the
+        register-don't-touch policy of survey §8.1).  3e002f2 recorded that
+        the two agreed on all four in-tree fixtures, which is exactly the
+        shape of a second source of truth waiting to drift.  It was
+        published as ``SymMaps.kpoint_map`` and read by nothing live: the
+        only readers in the tree are ``misc/archived_tests/
+        get_interp_vectors.py`` (:244, :249) and ``misc/archived_tests/
+        symtest.ipynb``, neither of which is collected, and the notebook
+        also prints a ``kpoint_map_ibz_ids`` that has not existed for
+        longer still.  The live tables come from ``find_symmetry_ops_simple``
+        and are pinned bit-for-bit on all four decks by
+        ``services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py``.
+
+        The method is KEPT (it is the only place the uniform grid is built,
+        and it is public surface) rather than inlined.
+        """
+        return self._generate_uniform_full_kpoints(wfn)
+
     def find_symmetry_ops_simple(self, wfn, kpoint_map, full_kpts):
         del kpoint_map  # kept in signature for compatibility with older callers
         irk_to_k_map = np.zeros(full_kpts.shape[0], dtype=np.int32)
@@ -1363,6 +1335,30 @@ class SymMaps:
                 f"magnetic ground state). Set LORRAX_TRS_CHECK=0 to restore "
                 f"the old flags-only behaviour at your own risk."
             )
+
+        # INHERITED FROM create_kpoint_symmetry_map, not new (design
+        # decision 4).  The retired parent map's loop carried the only
+        # "WFN symmetry data incomplete" warning in the class; the
+        # predicate is the same one -- ``sym_mats_k`` is a group, so
+        # "some S maps k_full into the IBZ" and "some S maps some IBZ k
+        # onto k_full" have the same truth value -- so it is re-raised
+        # here rather than deleted with the loop that used to own it.
+        # ``matched`` is already computed above for the TRS refusal.
+        # The FALLBACK differs and that is stated, not hidden: the old
+        # loop wrote the NEAREST irreducible k into the map it returned;
+        # the arrays returned here keep their zero initialisation, i.e.
+        # IBZ k 0 with the identity.  That was already this function's
+        # behaviour and is not changed.
+        if self.trs_allowed and not np.all(matched):
+            import warnings
+            bad = np.where(~matched)[0]
+            warnings.warn(
+                f"WFN symmetry data incomplete: {bad.size} k-points could "
+                f"not be mapped via stored symmetries "
+                f"(ntran={len(self._sym_mats_k_search)}). Falling back to "
+                f"irreducible k 0 with the identity operation for those "
+                f"rows. First unmatched: {full_kpts[bad[0]]}",
+                RuntimeWarning)
 
         # Note: TRS-augmented sym indices (irk_sym_map >= ntran) are now
         # handled correctly by ``unfold_psi`` (PR3, 2026-05-14). The

@@ -216,6 +216,97 @@ def test_gnppm_selects_only_the_identity_and_its_time_reversal(deck):
 
 
 # ---------------------------------------------------------------------------
+# The retired parent map (design decision 4)
+# ---------------------------------------------------------------------------
+
+class _MinimalDeck:
+    """A deck whose stored symmetries cannot reach its own full grid.
+
+    ``nrk = 1`` at Γ with a 2x2x1 grid and two ops: three of the four
+    full-BZ points have no preimage.  Synthetic, because no in-tree deck is
+    broken this way — and the diagnostic that fires here is the one the
+    retired parent-map loop used to own.
+    """
+
+    def __init__(self):
+        self.kpoints = np.zeros((1, 3))
+        self.kgrid = np.asarray([2, 2, 1], dtype=np.int32)
+        self.shift = np.zeros(3)
+        self.nkpts = 1
+        self.ntran = 2
+        self.sym_matrices = np.stack([np.eye(3, dtype=np.int32),
+                                      np.diag([1, -1, 1]).astype(np.int32)])
+        self.translations = np.zeros((2, 3))
+        self.avec = np.eye(3)
+        self.atom_types = np.array([1])
+        self.atom_crys = np.zeros((1, 3))
+        self.trs_holds = True
+
+
+@pytest.mark.parametrize("deck", DECKS)
+def test_symmaps_no_longer_publishes_the_lowest_sym_parent_map(deck):
+    """Decision 4.  ``kpoint_map`` is GONE, and the used half stayed.
+
+    It was a python triple loop computing, by its own tie-break rule, the
+    same k_full -> k_irr relationship ``find_symmetry_ops_simple`` computes
+    by the SHIPPING rule (survey §8.1, register-don't-touch).  Two
+    independent derivations of one fact, one of them published and read by
+    nothing live — 3e002f2 flagged that they agreed on all four fixtures,
+    which is the shape of a second source of truth waiting to drift.
+
+    What ``create_kpoint_symmetry_map`` keeps is the uniform grid, and that
+    is asserted to be exactly ``unfolded_kpts`` so "kept its used half" is a
+    measurement rather than a claim.
+    """
+    d = _deck(deck)
+    sym = SymMaps(d)
+    assert not hasattr(sym, "kpoint_map"), (
+        "SymMaps still publishes kpoint_map; decision 4 dropped it and the "
+        "only readers in the tree are under misc/archived_tests/")
+    grid = np.asarray(sym.create_kpoint_symmetry_map(d))
+    assert grid.ndim == 2 and grid.shape[1] == 3
+    np.testing.assert_array_equal(grid, np.asarray(sym.unfolded_kpts))
+
+
+def test_the_incomplete_symmetry_warning_survived_the_drop():
+    """RED TWIN for the removal: the diagnostic did NOT go with the loop.
+
+    The retired loop carried the class's only "WFN symmetry data
+    incomplete" warning.  Deleting a loop and its warning together is how a
+    cleanup silently removes coverage, so the warning moved into
+    ``find_symmetry_ops_simple``, whose ``matched`` array already computes
+    the same predicate (``sym_mats_k`` is a group, so "some S maps k_full
+    into the IBZ" and "some S maps some IBZ k onto k_full" have the same
+    truth value).
+
+    Constructed synthetically: Γ-only IBZ against a 2x2x1 grid, so three of
+    four full-BZ points are unreachable.  The message must name the COUNT,
+    the op count and the first offending k — "incomplete" alone sends the
+    reader to go and print them.
+    """
+    with pytest.warns(RuntimeWarning, match="WFN symmetry data incomplete"):
+        sym = SymMaps(_MinimalDeck())
+    # ...and the fallback is the one this function always used: IBZ k 0
+    # with the identity, NOT the retired loop's nearest-neighbour pick.
+    assert int(np.asarray(sym.irr_idx_k).max()) == 0
+    assert int(np.asarray(sym.sym_idx_k).max()) == 0
+
+
+def test_the_in_tree_decks_do_not_trip_that_warning():
+    """The other half — otherwise the twin above proves the warning fires
+    on everything, which would be a different defect wearing a pass."""
+    import warnings as _w
+    for deck in DECKS:
+        d = _deck(deck)
+        with _w.catch_warnings(record=True) as caught:
+            _w.simplefilter("always")
+            SymMaps(d)
+        bad = [str(x.message) for x in caught
+               if "symmetry data incomplete" in str(x.message)]
+        assert not bad, f"{deck}: {bad}"
+
+
+# ---------------------------------------------------------------------------
 # The I5 tripwire — cohsex_debug's TRS rows are a POLICY artefact
 # ---------------------------------------------------------------------------
 
