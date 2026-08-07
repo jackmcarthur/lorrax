@@ -528,7 +528,12 @@ def compute_all_V_q_g_flat(
         raise NotImplementedError(
             f"compute_all_V_q_g_flat: sys_dim must be 2 or 3 "
             f"(0-D box per-q v(G) not wired); got {sys_dim}.")
-    from .compute_vcoul import compute_v_q_per_G, build_v_head_miniBZ_avg_3d
+    # compute_v_q_per_G is gw's wfn-facing translation over the vcoul door
+    # (old bvec/cell_volume/sys_dim signature) and correctly stays a gw
+    # import; build_v_head_miniBZ_avg_3d is a pure service symbol, so its
+    # true dependency is the door (replumbed 2026-08-07).
+    from vcoul import build_v_head_miniBZ_avg_3d
+    from .compute_vcoul import compute_v_q_per_G
 
     # 3D bulk: precompute the mini-BZ-averaged v(q, G=0) table once.
     # The IBZ → full-BZ V_q unfold is bilinear in ζ and inherits this

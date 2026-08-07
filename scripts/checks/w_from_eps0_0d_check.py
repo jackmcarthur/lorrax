@@ -54,7 +54,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from gw.compute_vcoul_0d import compute_vcoul_box
+from vcoul import compute_vcoul_box
 from gw.gw_init import read_cohsex_input
 from gw.vcoul import compute_q0_averages
 from file_io import EPSReader, WFNReader, resolve_input_paths

@@ -1204,9 +1204,11 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     (the head magnitude scales with the mini-BZ cell area).  Default None uses
     the stored coarse grid (the exciton_bands Q-path convention, unchanged).
     """
-    from gw.coulomb.base import (_minibz_kernel_bare,
-                                 minibz_inscribed_sphere_r2)
-    from gw.vcoul import wrap_points_to_voronoi
+    # Replumbed 2026-08-07: these are pure service symbols; the door is
+    # the true dependency (the gw.coulomb.base / gw.vcoul spellings are
+    # compat shims kept for sibling branches this phase).
+    from vcoul import (_minibz_kernel_bare, minibz_inscribed_sphere_r2,
+                       wrap_points_to_voronoi)
     if alpha is None:
         alpha = float(prep["alpha"])
     GS = np.asarray(prep["GS"], dtype=np.float64)          # (3, nG)
