@@ -46,17 +46,29 @@ import harness  # noqa: E402
 #          FAILED_PRECONDITION: slate.potrf: blas::get_device_count()=4
 #          but JAX one-process-per-GPU model requires exactly 1.
 #      EIGHT contract cells (slate potrf / batched_potrf / eigh, plus the
-#      bse_setup wiring cell on top of them) died on it — and ONLY in the
-#      full-suite `-m distrib_la` leg.  In the service-only leg
-#      (`pytest services/distrib_la/tests`) the same cells were GREEN,
-#      because services/distrib_la/tests/conftest.py does this pinning too
-#      — but conditionally, on `"jax" not in sys.modules`, since
-#      CUDA_VISIBLE_DEVICES is read once at backend init.  In a full-suite
-#      run `testpaths = ["tests", "services"]` collects tests/ first, a
-#      lorrax module there imports jax during collection, and the service
-#      conftest's copy is INERT by the time it loads.  So the service
-#      suite's own guard cannot cover the full-suite leg by construction;
-#      the only conftest that loads early enough is this one.
+#      bse_setup wiring cell on top of them) died on it in the
+#      SERVICE-ONLY leg (`pytest services/distrib_la/tests`), which never
+#      loads this file at all.  services/distrib_la/tests/conftest.py does
+#      the pinning too — but conditionally, on `"jax" not in sys.modules`,
+#      since CUDA_VISIBLE_DEVICES is read once at backend init.  In a
+#      full-suite run `testpaths = ["tests", "services"]` collects tests/
+#      first, a lorrax module there imports jax during collection, and the
+#      service conftest's copy is INERT by the time it loads.  So the
+#      service suite's own guard cannot cover the full-suite leg by
+#      construction; the only conftest that loads early enough is this one.
+#
+#      DO NOT REUSE THIS AS THE EXPLANATION OF THE FULL-SUITE LEG.  An
+#      earlier revision of this comment said the same eight cells failed
+#      "and ONLY in the full-suite -m distrib_la leg".  They did fail
+#      there, with a DIFFERENT number — `get_device_count()=0`, at exactly
+#      ONE visible device, before and after this pin became unconditional
+#      — and a different cause: the two platform .so's share
+#      libslate.so.2 / libblaspp.so.2 by SONAME and the host build's
+#      blaspp has no CUDA to ask.  Fixed by a load-order rule in both
+#      loaders (`_open_cuda_before_host`), measured with dladdr in both
+#      legs.  This pin is still all three of the things above; it was
+#      never the cause of the eight, and believing it was is how the
+#      second cause stayed hidden behind the first for a day.
 #
 # The service conftest keeps its copy — it is the one that runs when the
 # suite is invoked BY PATH, which never loads this file at all.

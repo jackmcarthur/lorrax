@@ -99,9 +99,17 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 # GPUs, which SLATE reads through blas::get_device_count() and refuses.
 #
 # tests/conftest.py already does this for the monorepo suite, per pytest-
-# xdist worker (gw0 -> GPU 0, ...), and that is why the full-suite leg
-# never hit it.  The service suite is run BY PATH, which never loads that
-# conftest, so the pinning has to live here too.  Same mapping through the
+# xdist worker (gw0 -> GPU 0, ...).  The service suite is run BY PATH,
+# which never loads that conftest, so the pinning has to live here too.
+#
+# The full-suite leg failed anyway, on something else entirely: the two
+# platform .so's share libslate.so.2 / libblaspp.so.2 by SONAME and the
+# host build's blaspp answers get_device_count()=0 at ANY number of
+# visible devices, so whichever library is dlopened first decides.  That
+# is distrib_la.loader._open_cuda_before_host's job, not this pin's; see
+# the SONAME note there.  Two different refusals with the same shape --
+# `=4` here, `=0` there -- and the first one's fix is not the second
+# one's.  Same mapping through the
 # existing CUDA_VISIBLE_DEVICES list, so SLURM's selection is respected;
 # without a worker id the process takes the FIRST device, because these
 # cells are single-process 1x1 by construction (`_ffi_state` refuses
