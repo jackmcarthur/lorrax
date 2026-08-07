@@ -22,7 +22,7 @@ from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
 # isdf.core imports too — plus an announcement for anything outside it).
 # See gw/gw_config.py's module comment and tests/test_env_grammar.py for
 # the drift gate.
-from .gw_config import active_zeta_truncating_knobs, env_bool
+from .gw_config import ZETA_RCOND_DEFAULT, active_zeta_truncating_knobs, env_bool
 
 from isdf.core import (
     c_q_from_psi_sm,
@@ -165,7 +165,7 @@ def fit_zeta_to_h5(
     zeta_ridge: float = 0.0,
     charge_zeta_solve: str = "cholesky",
     distributed_zeta_solve: str = "auto",
-    zeta_rcond: float = 1e-8,
+    zeta_rcond: float = ZETA_RCOND_DEFAULT,
     transverse_zeta_solve: str = "ridge",
     transverse_zeta_rcond: float = 1e-10,
     gflat_chunk_size: int = 0,

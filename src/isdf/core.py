@@ -1506,7 +1506,7 @@ def deprecated_env_record(env_name: str, key_value) -> str:
 # deliberately jax-free and imports nothing from ``isdf``.
 # (P1.3 grammar unification, 2026-07-31; the drift gate is
 # ``tests/test_env_grammar.py``, which scans this file as an OWNED file.)
-from gw.gw_config import env_bool
+from gw.gw_config import ZETA_RCOND_DEFAULT, env_bool
 
 
 def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
@@ -1789,7 +1789,7 @@ def _factor_c_q_replicated(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
     zeta_ridge: float = 0.0,
     charge_zeta_solve: str = 'cholesky',
-    zeta_rcond: float = 1e-8,
+    zeta_rcond: float = ZETA_RCOND_DEFAULT,
 ) -> jax.Array:
     """Dense, fully REPLICATED factor of the identity-padded charge CCT.
 
@@ -2056,7 +2056,7 @@ def _factor_c_q_replicated_qparallel(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
     zeta_ridge: float = 0.0,
     charge_zeta_solve: str = 'cholesky',
-    zeta_rcond: float = 1e-8,
+    zeta_rcond: float = ZETA_RCOND_DEFAULT,
 ) -> jax.Array:
     """The replicated charge factor, EXECUTED q-parallel.
 
@@ -2666,7 +2666,7 @@ def _chunk_log(where: str, nq: int, qb: int, per_q_bytes: int) -> None:
 
 def _factor_c_q_distributed_rank_truncate(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
-    zeta_rcond: float = 1e-8,
+    zeta_rcond: float = ZETA_RCOND_DEFAULT,
     indefinite: bool = False,
 ) -> jax.Array:
     """Truncated pseudo-inverse ``C⁺``, formed and kept 2D-SHARDED.
@@ -2994,7 +2994,7 @@ def factor_c_q(
     n_rmu_logical: int | None = None,
     solver_kind: str = 'auto',
     zeta_ridge: float = 0.0,
-    zeta_rcond: float = 1e-8,
+    zeta_rcond: float = ZETA_RCOND_DEFAULT,
     transverse_zeta_rcond: float = 1e-10,
 ) -> jax.Array:
     """

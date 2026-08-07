@@ -538,6 +538,18 @@ def resolve_eigh_backend(params, *, override: str | None = None) -> str:
 #  Defaults — single source of truth for every input key
 # ---------------------------------------------------------------------------
 
+#: The production ζ rank-truncation cutoff.  ONE copy, importable.  Until
+#: 2026-08-07 this number lived six times — here in ``_DEFAULTS`` and as
+#: the signature default of five producer-side functions (one in
+#: ``gw/isdf_fitting.py``, four in ``isdf/core.py``) — "mirrored", i.e.
+#: kept equal by a comment, after a history of moving three times in one
+#: day (1e-10 → 1e-6 → 1e-8, all 2026-07-21, one move re-freezing a
+#: gate).  The five signature sites now import THIS name.  The measured
+#: rationale for the VALUE is at the ``"zeta_rcond"`` deck entry below;
+#: the value itself is owner-scoped (R19: lowering it on a noise-floor
+#: argument would have cost a 5000 eV error) and did not change here.
+ZETA_RCOND_DEFAULT: float = 1e-8
+
 _DEFAULTS = {
     # System geometry
     "nval": 5,
@@ -773,9 +785,10 @@ _DEFAULTS = {
     # its sigTOT by 1.021 meV where 1e-8 costs only 0.054 meV — the identical
     # over-complete cure at ~20× less drift (sweep table in
     # docs/docs_gwjax/COHSEX_INPUT.md).  Env override LORRAX_ZETA_RCOND.
-    # Mirrored by the isdf/core.py + gw/isdf_fitting.py signature defaults.
+    # The isdf/core.py + gw/isdf_fitting.py signature defaults IMPORT
+    # ZETA_RCOND_DEFAULT (defined above _DEFAULTS) — one copy, no mirrors.
     # reports/gw_rank_truncation_2026-07-20 + gw_bandrange_centroids_2026-07-21.
-    "zeta_rcond":           1e-8,
+    "zeta_rcond":           ZETA_RCOND_DEFAULT,
     # Transverse ζ-solve family (bispinor μ_L=1,2,3 channels only; inert
     # otherwise).  "ridge" (DEFAULT) = the historical hoisted pivoted-LU
     # with the 1e-12·|tr|/n diagonal ridge — byte-identical to the
