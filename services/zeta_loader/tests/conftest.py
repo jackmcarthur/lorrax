@@ -1,19 +1,18 @@
-"""The zeta_loader suite's own setup: path, devices, markers.
+"""The zeta_loader suite's own setup: path, devices, markers, skip-honesty.
 
-STUB.  The suite itself is step 2 of this service's process; this file is
-the shape it will be collected in, landed with the extraction so the
-markers and the path exist from the first commit rather than arriving with
-the first test.  Three of distrib_la's four sections are here; the fourth
-(SKIP-HONESTY) is deliberately absent and says why below.
+Four things, in the order they have to happen — distrib_la's shape, because
+this is the SERVICE FORM and wave-1 Fables conform rather than reinvent.
 
 1. PATH.  Put the in-tree ``zeta_loader`` and its ``lxkit`` foundation on
-   ``sys.path``.  Installing the services registers :mod:`lxkit.testing`
-   through the ``pytest11`` entry point, but this suite must also run from
-   a bare checkout — ``lx`` rewrites the container ``PYTHONPATH`` to
-   exactly ``<checkout>/src`` and the Shifter image pip-installs nothing —
-   so the hooks are imported directly.  ``pytest_plugins`` is not an
-   option: pytest honours it only in the ROOTDIR conftest, and this suite
-   is collected under the monorepo root.
+   ``sys.path``, plus THIS directory (``zeta_synth`` is imported by name by
+   every cell and by the multi-rank CLI script, which runs with nothing but
+   ``<checkout>/src`` on the path).  Installing the services would register
+   :mod:`lxkit.testing` through the ``pytest11`` entry point, but nothing is
+   installed here — ``lx`` rewrites the container ``PYTHONPATH`` to exactly
+   ``<checkout>/src`` and the Shifter image pip-installs nothing — so the
+   hooks are imported directly.  ``pytest_plugins`` is not an option: pytest
+   honours it only in the ROOTDIR conftest, and this suite is collected
+   under the monorepo root.
 
 2. DEVICES, before the first jax import.  See :data:`_XLA_FLAGS` below.
 
@@ -21,27 +20,17 @@ the first test.  Three of distrib_la's four sections are here; the fourth
    ``zeta_loader``, so the main suite can select or deselect the whole
    service without naming paths.
 
-WHY THE SKIP-HONESTY GATE IS NOT ARMED HERE, YET.  Two reasons, both
-measurable rather than stylistic:
+4. SKIP-HONESTY.  One gate per service (charter), armed below — and armed
+   WITHOUT disarming distrib_la's, which is the part that needed building
+   rather than copying.  See THE SINGLE-SLOT GATE.
 
-* :func:`lxkit.testing.arm_skip_honesty` writes a single module-level
-  ``_ARMED`` dict.  ``services/distrib_la/tests/conftest.py`` already
-  arms it, and in a full-suite run both conftests load — so a second
-  ``arm_skip_honesty`` call would OVERWRITE distrib_la's scope and
-  allowlist with this service's, silently disarming a gate that is
-  currently doing its job.  Arming a second service needs lxkit to hold
-  a list rather than a dict, which is an edit to a READ-ONLY package on
-  this branch: registered for step 2, not taken here.
-* An allowlist is a claim about the skips a suite emits, and this suite
-  emits none because it has no cells.  A gate armed over an empty scope
-  measures nothing; the honest version arrives with the tests.
-
-Why the markers arrive through a HOOK and not ``pytestmark``: a
-module-level ``pytestmark`` applies to the module that declares it, and
-pytest does not read one out of a conftest.  Writing ``pytestmark = [...]``
-here would be silent — the suite would collect, the marks would not exist,
-and ``-m zeta_loader`` would select nothing while looking like it worked.
-``pytest_collection_modifyitems`` is the mechanism that actually applies.
+Why the markers arrive through a HOOK and not ``pytestmark``: a module-level
+``pytestmark`` applies to the module that declares it, and pytest does not
+read one out of a conftest.  Writing ``pytestmark = [...]`` here would be
+silent — the suite would collect, the marks would not exist, and
+``-m zeta_loader`` would select nothing while looking like it worked.
+``pytest_collection_modifyitems`` is the mechanism that actually applies, and
+``test_zeta_loader_skip_honesty.py`` measures that it did.
 """
 
 import os
@@ -49,26 +38,47 @@ import sys
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 _SERVICES = os.path.dirname(os.path.dirname(_TESTS))
+_REPO = os.path.dirname(_SERVICES)
 
 for _svc in ("lxkit", "zeta_loader"):
     _src = os.path.join(_SERVICES, _svc, "src")
     if _src not in sys.path:
         sys.path.insert(0, _src)
+if _TESTS not in sys.path:
+    sys.path.insert(0, _TESTS)
 
 # ---------------------------------------------------------------------------
 # Layer L-b: four emulated devices — but ONLY when this suite is the reason
 # the process started.
 # ---------------------------------------------------------------------------
 # ``--xla_force_host_platform_device_count`` is read by XLA at the FIRST jax
-# import in a process and never again, and jax is imported at module scope
-# by a great many lorrax test modules.  So this setting is not "on or off";
-# it is "did this conftest load before anything imported jax".  Running the
-# service suite BY PATH makes this an initial conftest and the flag takes;
-# in the full-suite run ``testpaths = ["tests", "services"]`` collects
-# tests/ first, jax is already imported, and the flag is inert — which is
-# the CORRECT outcome, not a degradation, because forcing four host devices
-# on the whole monorepo run would change the device count every other
-# lorrax test sees.  ``setdefault``: an explicit XLA_FLAGS always wins.
+# import in a process and never again, and jax is imported at module scope by
+# a great many lorrax test modules.  So this setting is not "on or off"; it is
+# "did this conftest load before anything imported jax".
+#
+# THAT IS THE BEHAVIOUR WE WANT, and it is worth being explicit about because
+# the alternative is a real hazard rather than a stylistic one.  When someone
+# runs the service suite directly ---
+#
+#     pytest services/zeta_loader/tests
+#
+# --- this file is an INITIAL conftest (pytest loads the conftests along the
+# path of every command-line argument before it imports a single test module),
+# nothing has imported jax, the flag takes, and the L-b cells run on a real
+# 2x2 of emulated host devices.  When the FULL suite runs, ``testpaths =
+# ["tests", "services"]`` collects tests/ first, some module there imports jax
+# during collection, and by the time this file loads the flag is inert.  The
+# L-b cells then SKIP — via ``lxkit.testing.require_devices``, which skips and
+# never asserts (tests/KNOWN_FAILURES.md lists 11 cells that failed a
+# 1-device leg purely for writing ``assert n_dev >= 4``).
+#
+# Inert is the CORRECT outcome there, not a degradation.  Forcing four host
+# devices on the whole monorepo run would change the device count every other
+# lorrax test sees: cells that skip below four devices today would start
+# running, inside a leg whose reference numbers were measured at one.  The
+# full-suite set-diff is the check that this stayed true.
+#
+# ``setdefault``: an explicit XLA_FLAGS from the caller always wins.
 _XLA_FLAGS = "--xla_force_host_platform_device_count=4"
 if "jax" not in sys.modules:
     _existing = os.environ.get("XLA_FLAGS", "")
@@ -76,18 +86,161 @@ if "jax" not in sys.modules:
         os.environ["XLA_FLAGS"] = (
             f"{_existing} {_XLA_FLAGS}".strip() if _existing else _XLA_FLAGS)
 
-# x64 or the complex128 cells silently measure complex64.  tests/conftest.py
-# does this for the monorepo suite; a service-only run has no tests/conftest.
+# x64 or the complex128 cells silently measure complex64 — and every ζ payload
+# in this suite is complex128 by contract (``read_zeta_G_slab`` states the
+# dtype in its own signature).  tests/conftest.py does this for the monorepo
+# suite; a service-only run has no tests/conftest.
 os.environ.setdefault("JAX_ENABLE_X64", "1")
+
+import lxkit.testing as _lxt                                   # noqa: E402
+from lxkit.testing import (                                    # noqa: E402,F401
+    AllowedSkip, arm_skip_honesty, assert_skips_match_profile,
+    gate_state,                                    # gate_state is autouse
+    machine_profile, observed_skips,
+)
+
+# ---------------------------------------------------------------------------
+# The skips THIS service is allowed to emit, on top of lxkit's universal rows
+# ---------------------------------------------------------------------------
+# Every row names the leg that runs the cell instead.  A skip nobody can point
+# at a covering run for is evaporated coverage wearing a green dot, and the
+# allowlist is where that claim is written down.
+_ALLOWED = (
+    # THE WSL FACT.  The dev box has no phdf5 FFI library at all, so every
+    # collective SlabIO read refuses AT OPEN.  ABSENT, not BROKEN: nothing is
+    # built here to be broken, and `zeta_synth.slab_io_state` quotes the
+    # probe's own stage into the reason so the report says which.  The cells
+    # that need the transport are exactly the ones whose 4-rank answers come
+    # from leg L-c anyway.
+    AllowedSkip("", "SlabIO transport unavailable",
+                "leg L-c on Perlmutter: `lx run --cpu -N 1 -n 4 python3 "
+                "services/zeta_loader/tests/test_zeta_loader_multiproc.py "
+                "--mesh 2x2 --tmpdir $SCRATCH/...`, under the BUILD_NOTES "
+                "FFI pins (the Aug-7 pair; the Aug-6 one dies at the "
+                "96a6399 signature)"),
+    # The header binders and gvec_fft_box live in the host tree until wave
+    # 1b extracts them.  A standalone install has no lorrax, so the DATA
+    # cells cannot run there; the FORMAT cells (probe/write_g0_mu) have no
+    # such row because they have no such dependency, which is the whole
+    # claim test_zeta_loader_import_isolation makes.
+    AllowedSkip("", "no lorrax host tree",
+                "the monorepo run; a standalone install has no file_io/ "
+                "for the header binders to come from"),
+)
+
+
+def _allowed_for(profile):
+    """Rows a machine that PROMISES the phdf5 handler does not get to use.
+
+    The transport row is a platform fact on a laptop and a DEFECT on
+    Perlmutter, where the machine profile declares ``MustRow("phdf5",
+    "slab_io", "lorrax_phdf5_read", "cpu")`` and BUILD_NOTES pins the
+    library it lives in.  Filtering here rather than writing two lists
+    keeps the reason for the difference next to the row — distrib_la's
+    ``_allowed_for`` does the same thing for its ``.so`` acceptance tier.
+    """
+    if profile.machine == "perlmutter":
+        return tuple(r for r in _ALLOWED
+                     if "SlabIO transport" not in r.why)
+    return _ALLOWED
+
+
+PROFILE = machine_profile()
+_EXTRA_ALLOWED = _allowed_for(PROFILE)
+
+# ---------------------------------------------------------------------------
+# THE SINGLE-SLOT GATE, and why this file does not just call arm_skip_honesty
+# ---------------------------------------------------------------------------
+# ``lxkit.testing`` keeps ONE module-level ``_ARMED`` dict and ONE
+# ``pytest_sessionfinish`` that reads it.  ``services/distrib_la/tests/
+# conftest.py`` already arms it, and in a full-suite run BOTH conftests load —
+# so an unconditional ``arm_skip_honesty`` here would OVERWRITE distrib_la's
+# scope and allowlist and silently disarm a gate that is currently doing its
+# job.  (That is not a hypothesis: it is what the C1 stub of this file
+# predicted, in writing, as the reason it left the gate unarmed.)
+#
+# Fixing it properly means making ``_ARMED`` a LIST, which is an edit to
+# lxkit — READ-ONLY on this branch.  So the gate is built here instead, on
+# top of the PURE half of lxkit's harness:
+#
+#   * nothing else armed  -> arm through ``arm_skip_honesty`` verbatim and
+#     let lxkit's own ``pytest_sessionfinish`` run it.  This is the
+#     standalone ``pytest services/zeta_loader/tests`` leg, which is also
+#     the leg where the L-b tier actually runs.
+#   * something already armed -> DO NOT TOUCH ``_ARMED``.  Run the SAME
+#     ``assert_skips_match_profile`` over THIS directory's skips from a
+#     local ``pytest_sessionfinish``, so neither gate disarms the other.
+#
+# Both branches call one function with one profile and one allowlist, so
+# there is no second policy — only a second place the same policy is invoked
+# from.  ``test_zeta_loader_skip_honesty.py`` asserts the no-clobber property
+# directly, and REGISTERED as a consolidation wish: lxkit should hold a list
+# of armed scopes so services stop having to know about each other.
+_PREARMED_SCOPE = str(_lxt._ARMED.get("scope") or "")
+_WE_ARMED_IT = _lxt._ARMED.get("profile") is None
+
+if _WE_ARMED_IT:
+    # lxkit's recording hooks + its sessionfinish, imported into THIS
+    # conftest's namespace so pytest registers them.  Only in this branch:
+    # when distrib_la's conftest is also loaded it has already registered
+    # the very same function objects, and re-exporting them here would
+    # record every skip in the session TWICE.
+    from lxkit.testing import (                                # noqa: E402,F401
+        pytest_configure, pytest_runtest_logreport, pytest_sessionfinish,
+    )
+    arm_skip_honesty(PROFILE, scope=_TESTS, extra_allowed=_EXTRA_ALLOWED)
+else:
+    def pytest_sessionfinish(session, exitstatus):
+        """This service's half of the gate, when lxkit's slot is taken.
+
+        A transcription of ``lxkit.testing.pytest_sessionfinish``'s scoping
+        with the profile and allowlist bound to THIS suite.  The two
+        branches it keeps are the ones that were measured into the
+        original: the pytest-xdist CONTROLLER has an EMPTY ``session.items``
+        (the workers collected), so an items-only scope makes the gate
+        silently inert under ``-n 4`` — which is how ``lx test`` runs every
+        suite on Perlmutter; and a session that DELIBERATELY deselected this
+        suite (``--no-services``, ``-m`` something else, ``-k``) collected
+        other things and must not trip the minimum-collected floor.
+        """
+        root = os.path.realpath(_TESTS) + os.sep
+        total = int(getattr(session, "testscollected", 0) or 0)
+        items = getattr(session, "items", None) or []
+        if items:
+            mine = {str(getattr(it, "nodeid", "")) for it in items
+                    if os.path.realpath(
+                        str(getattr(it, "path", None)
+                            or getattr(it, "fspath", ""))).startswith(root)}
+            skips = [s for s in observed_skips() if s.nodeid in mine]
+            in_scope = len(mine)
+        else:
+            skips = [s for s in observed_skips() if s.path.startswith(root)]
+            in_scope = len(skips)
+        if in_scope == 0 and total > 0:
+            return
+        try:
+            assert_skips_match_profile(skips, PROFILE, collected=in_scope,
+                                       extra_allowed=_EXTRA_ALLOWED)
+        except AssertionError as exc:                          # noqa: BLE001
+            try:
+                tw = session.config.get_terminal_writer()
+                tw.line("")
+                tw.line("SKIP-HONESTY GATE FAILED (zeta_loader)",
+                        red=True, bold=True)
+                for line in str(exc).splitlines():
+                    tw.line(line, red=True)
+            except Exception:                                  # noqa: BLE001
+                print(f"SKIP-HONESTY GATE FAILED (zeta_loader)\n{exc}")
+            session.exitstatus = 1
 
 
 def pytest_collection_modifyitems(config, items):
     """Mark everything under this directory ``services`` + ``zeta_loader``.
 
-    Scoped by PATH, not by "every item in the session": this hook is
-    called with the whole collection, including lorrax's own tests when
-    the full suite runs, and marking those would make ``--no-services``
-    deselect the entire suite.
+    Scoped by PATH, not by "every item in the session": this hook is called
+    with the whole collection, including lorrax's own tests when the full
+    suite runs, and marking those would make ``--no-services`` deselect the
+    entire suite.
     """
     import pytest
     here = _TESTS + os.sep
