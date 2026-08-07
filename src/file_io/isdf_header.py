@@ -33,7 +33,9 @@ What lives in ``isdf_header``
 - ``zeta_layout`` (scalar str): ``'r_space'`` (legacy) or ``'G_flat'``.
   In G-flat mode the writer produces an extra metadata block —
   ``ngkmax``, ``ngk`` (per-q logical sphere size), ``gvec_components``
-  (per-q Miller indices padded with sentinel ``(-nx/2, -ny/2, -nz/2)``)
+  (per-q Miller indices padded with the FFT-box pad sentinel —
+  :func:`common.gvec_fft_box.fft_box_pad_sentinel`, the Miller index
+  sitting in the Nyquist-corner cell ``(nx//2, ny//2, nz//2)``)
   and ``zeta_cutoff_ry``.  These mirror the WFN.h5 ``wfns``
   group layout with the ragged G-axis replaced by a fixed
   ``ngkmax``-padded axis.
@@ -89,7 +91,13 @@ class IsdfHeader:
     gvec_components: np.ndarray | None = None
                                  # (n_q_disk, 3, ngkmax) int32 — per-q Miller
                                  # indices in the ``wfns/gvecs`` style.  Pad
-                                 # slots carry ``(-nx/2, -ny/2, -nz/2)``.
+                                 # slots carry the FFT-box pad sentinel,
+                                 # ``common.gvec_fft_box.fft_box_pad_sentinel``
+                                 # (``(-nx/2, -ny/2, -nz/2)`` on EVEN extents;
+                                 # ``+(n-1)/2`` on odd ones — MEASURED on the
+                                 # production 36x36x135 MoS2 ζ, whose sentinel
+                                 # is ``(-18, -18, +67)``.  Read it off
+                                 # ``fftfreq``; do not write ``-n//2``).
     ngk_per_q: np.ndarray | None = None
                                  # (n_q_disk,) int32 — per-q logical sphere
                                  # size.  ``zeta_q_G[q, :, ngk[q]:]`` is zero

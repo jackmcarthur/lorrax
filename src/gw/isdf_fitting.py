@@ -639,7 +639,9 @@ def fit_zeta_to_h5(
     # materialised on disk or as a persistent device buffer.  When
     # ``zeta_cutoff_ry`` is provided we build the per-q WFN.h5-style
     # sphere ``{G : |q+G|² ≤ cutoff}``, pad to a uniform ``ngkmax``
-    # with the sentinel Miller index ``(-nx/2, -ny/2, -nz/2)``, and
+    # with the shared FFT-box pad sentinel (Nyquist-corner cell; the
+    # Miller index is ``(-n/2)`` per even axis and ``+(n-1)/2`` per odd
+    # one — ``common.gvec_fft_box.fft_box_pad_sentinel``), and
     # store both the coeffs and the per-q components on disk.  Without
     # a cutoff the writer falls back to the full flat-FFT axis
     # (n_G_sph = n_rtot) — slow disk path, kept for sanity checks.
@@ -1149,7 +1151,7 @@ def fit_zeta_to_h5(
     with timing.section("zeta_fit.write_g_flat"):
         # Pad slot zero-fill (WFN.h5 ``coeffs = 0`` convention).  The
         # per-q gather inside ``accumulate_rchunk_to_gflat`` read the
-        # sentinel ``(-nx/2, -ny/2, -nz/2)`` flat-FFT slot into every
+        # FFT-box pad sentinel's flat slot into every
         # pad position; those values are physical (not zero) so we
         # mask them here.  Logical slots ``[..., :ngk[q]]`` carry the
         # real coeffs and are untouched.
