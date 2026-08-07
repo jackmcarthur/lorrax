@@ -1183,7 +1183,7 @@ _SERVICE_DOOR_EXCEPTIONS = {
     "ffi.linalg.plan":        3,   # Plan, ensure_sharding, plan
     "ffi.linalg.resolve":    12,   # the resolver's whole vocabulary
     "ffi.linalg.dispatch":    2,   # dispatch_batched_eigh, EIGH_BACKENDS
-    "ffi.linalg._slate":     13,   # incl. _mesh_key, which isdf/core takes
+    "ffi.linalg._slate":     12,   # incl. _mesh_key, which isdf/core takes
     "ffi.linalg._scalapack":  6,
     "ffi.cusolvermp.batched": 5,
     "ffi.cusolvermp.eigh":    1,

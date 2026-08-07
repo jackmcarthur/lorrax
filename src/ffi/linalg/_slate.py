@@ -15,7 +15,6 @@ from distrib_la._slate import distributed_eigh  # noqa: F401
 from distrib_la._slate import distributed_trsm  # noqa: F401
 from distrib_la._slate import ensure_registered  # noqa: F401
 from distrib_la._slate import get_or_init_context  # noqa: F401
-from distrib_la._slate import get_or_init_subrow_context  # noqa: F401
 from distrib_la._slate import validate_mesh  # noqa: F401
 from distrib_la._slate import validate_tile_layout  # noqa: F401
 
@@ -23,6 +22,6 @@ __all__ = [
     "SlateBatchedLowerL", "SlateLowerL",
     "batched_distributed_cholesky", "batched_distributed_trsm",
     "distributed_cholesky", "distributed_eigh", "distributed_trsm",
-    "ensure_registered", "get_or_init_context", "get_or_init_subrow_context",
+    "ensure_registered", "get_or_init_context",
     "validate_mesh", "validate_tile_layout",
 ]

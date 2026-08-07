@@ -29,7 +29,7 @@ from distrib_la._shard_map import shard_map
 
 __all__ = [
     # context (was slate/context.py)
-    "ensure_registered", "get_or_init_context", "get_or_init_subrow_context",
+    "ensure_registered", "get_or_init_context",
     "validate_mesh", "validate_tile_layout",
     # single-matrix ops
     "SlateLowerL", "distributed_cholesky", "distributed_trsm",
@@ -202,8 +202,14 @@ def _make_subrow_ctx(mesh: Mesh) -> int:
         platform=_mesh_platform(mesh)))
 
 
-def get_or_init_subrow_context(mesh: Mesh) -> int:
+def _get_or_init_subrow_context(mesh: Mesh) -> int:
     """The per-X-row Y-axis sub-comm SLATE context for this mesh.
+
+    PRIVATE.  It was exported, and re-exported twice more through the
+    ffi.slate shims, with no caller outside this file at 96a6399 -- a
+    per-process singleton over an MPI sub-communicator is not something a
+    consumer has any business holding.  Its two real callers are the two
+    batched wrappers below.
 
     ``MPI_COMM_WORLD`` split by x-coordinate: one comm of size ``Py`` per
     X-row.  Thread-safe; the first call collectively splits.  Used by the
@@ -715,7 +721,7 @@ def batched_distributed_cholesky(
             f"mesh 'y' axis size {Py}.")
 
     ensure_registered(mesh)
-    ctx_handle = get_or_init_subrow_context(mesh)
+    ctx_handle = _get_or_init_subrow_context(mesh)
 
     nb_batch_local = nbatch // Px
     nb = n // Py if block_size is None else int(block_size)
@@ -834,7 +840,7 @@ def batched_distributed_trsm(
             f"N={n}, M={m} must be divisible by mesh 'y' axis {Py}.")
 
     ensure_registered(mesh)
-    ctx_handle = get_or_init_subrow_context(mesh)
+    ctx_handle = _get_or_init_subrow_context(mesh)
     nbatch_local = nbatch // Px
     nb = n // Py if block_size is None else int(block_size)
     validate_tile_layout(n, nb, 1, Py, what="batched_distributed_trsm",
