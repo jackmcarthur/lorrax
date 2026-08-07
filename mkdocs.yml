@@ -82,4 +82,5 @@ nav:
       - Memory model: architecture/memory-model.md
   - Services:
       - distrib_la (distributed dense linalg): services/distrib_la.md
+      - symmetry_maps (k-grid reduction, stars, unfolds): services/symmetry_maps.md
   - Contributing: contributing.md
