@@ -52,10 +52,18 @@ under a steady load gave ``SymMaps(si_cohsex_debug)`` 54.23 / 53.70 /
 18 MiB-allocating rows (the numpy spreads, ``star_broadcast`` on the
 device) repeated to ±10%.  BETWEEN legs minutes apart the SAME median on
 the SAME code moved 51.4 → 93.4 → 124.6 → 124.4 → 117.8 ms, tracking a
-1-minute load average that ran 2.96–5.58 on this box's 12 cores while
-other work shared it — and ``seconds_min`` moved with it (49.6 → 84.6 →
-77.4 ms), so the min is not a clean floor either.  That is a 2.4× band
-that no N closes, because the variable is not sample size.
+1-minute load average that ran 2.96–5.58 while other work shared the box
+— and ``seconds_min`` moved with it (49.6 → 84.6 → 77.4 ms), so the min
+is not a clean floor either.  That is a 2.4× band that no N closes,
+because the variable is not sample size.
+
+SIX CORES, NOT TWELVE, and that is why the count is a recorded field and
+not a sentence.  ``os.cpu_count()`` and ``os.sched_getaffinity`` both
+answer 6 inside the benching process, matching ``/proc/cpuinfo``, while
+``nproc`` in an interactive shell on this same box answers 12 from a
+different namespace.  A load average of 5.5 against 6 usable cores is
+the box saturated, which is the reading that makes the drift above
+make sense — and it is the reading a prose "12 cores" would have hidden.
 
 Two consequences, both structural rather than advisory.  (1) The doc
 header records ``cpu_count`` and ``load_average``, so a row that looks
