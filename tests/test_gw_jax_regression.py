@@ -41,6 +41,7 @@ meV against measured values — see ``_BGW_TOL``.
 """
 
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -95,10 +96,38 @@ _CASES = [
 ]
 
 
+def _report_headroom(case_id, msg):
+    """Emit a comparison verdict that survives pytest's capture AND xdist.
+
+    ``print`` is not enough: under ``-n>0`` a worker's stdout is only
+    replayed for FAILING cells, so a PASSING cell's margin — the number
+    that says how close the gate is to the edge — vanishes exactly when
+    everything looks fine.  That is the number an auditor of the
+    2026-08-07 cross-machine tolerance ruling needs, so it goes to stderr
+    (replayed for passes under ``-rA``/``-s``) and to a warning, which
+    xdist forwards to the controller unconditionally.
+    """
+    line = f"[xmachine] {case_id}: {msg}"
+    print(line, flush=True)
+    sys.stderr.write(line + "\n")
+    sys.stderr.flush()
+    warnings.warn(line, stacklevel=2)
+
+
 def _assert_matches_reference(output_file, reference_file, labels, atol,
                               case_id):
     assert output_file.exists(), f"no output written: {output_file}"
+    # REPORT THE HEADROOM, ALWAYS — byte-identical, within tolerance, or
+    # over it.  A tolerance nobody can see the margin on is a tolerance
+    # nobody can audit: it absorbs a growing drift silently until the day
+    # it does not, and then the first number anyone has is the one that
+    # broke it.  Reporting only on the non-identical path is not enough
+    # either — "it passed" would then be ambiguous between "bit-for-bit"
+    # and "used 99% of the budget", which are completely different facts
+    # about the same green cell.
     if output_file.read_text() == reference_file.read_text():
+        _report_headroom(case_id, "BYTE-IDENTICAL to the reference "
+                                  f"(atol {atol:.0e} not exercised)")
         return
     ref_rows = parse_eqp_rows(reference_file, labels)
     out_rows = parse_eqp_rows(output_file, labels)
@@ -108,17 +137,13 @@ def _assert_matches_reference(output_file, reference_file, labels, atol,
     # Compare only real-valued physics columns: kpt, band, 3 Σ, VH_re
     # (byte-identity above is the primary check; this atol path only
     # absorbs GPU-nondeterministic last-ULP drift).
-    #
-    # REPORT THE HEADROOM, always, pass or fail.  A tolerance nobody can
-    # see the margin on is a tolerance nobody can audit: it silently
-    # absorbs a growing drift until the day it does not, and then the
-    # first number anyone has is the one that broke it.  This line is how
-    # the 2026-08-07 cross-machine ruling stays checkable on every run.
     _d = np.abs(out_rows[:, :6] - ref_rows[:, :6])
     _mx = float(_d.max()) if _d.size else 0.0
-    print(f"[{case_id}] max |Δ| vs reference = {_mx:.3e} "
-          f"(atol {atol:.0e}, {_mx / atol:.1%} of budget, "
-          f"{int((_d > atol).sum())} row-cells over)", flush=True)
+    _report_headroom(
+        case_id,
+        f"max |Δ| = {_mx:.3e} vs atol {atol:.0e} "
+        f"({_mx / atol:.1%} of budget, {int((_d > atol).sum())} cells over, "
+        f"{int((_d > 0).sum())} of {_d.size} cells differ at all)")
     try:
         np.testing.assert_allclose(
             out_rows[:, :6], ref_rows[:, :6], rtol=0.0, atol=atol)
