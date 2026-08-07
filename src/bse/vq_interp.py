@@ -87,9 +87,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
 from common.fft_helpers import local_fftn3
-from ffi import _services
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
 
-_services.ensure_on_path()          # services/*/src onto sys.path; transitional
+_services.ensure_on_path()
 
 from distrib_la import plan as linalg_plan                          # noqa: E402
 

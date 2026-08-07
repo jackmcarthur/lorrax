@@ -33,6 +33,11 @@ from isdf.core import (
     _resolve_zeta_gather,
     _band_norms_slice,
 )
+# The opaque distributed factor.  Re-exported through isdf.core rather than
+# imported from the door here: this module never CALLS distrib_la, it only
+# has to tell a token from an array in two places (a log line and the
+# fused-route trace predicate).
+from isdf.core import FactorToken
 
 
 # Running max of nvidia-smi used MB across all probe points within a run
@@ -534,9 +539,9 @@ def fit_zeta_to_h5(
             # Transverse: the factor stage is HOISTED (2026-08) — one
             # pivoted LU per q per CHANNEL instead of per r-chunk.
             # factor_c_q returns (factor, piv): (LU, perm) on the local
-            # plan, (block-cyclic LU, per-rank ipiv) on the scalapack
-            # plan, (CCT passthrough, None) on the cusolvermp plan
-            # (fused per-r-chunk getrf+getrs kept there).
+            # plan, a distrib_la FactorToken (ipiv inside it) on the
+            # scalapack plan, (CCT passthrough, None) on the cusolvermp
+            # plan (fused per-r-chunk getrf+getrs kept there).
             L_q, lu_piv = factor_c_q(
                 C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
                 n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
@@ -548,8 +553,14 @@ def fit_zeta_to_h5(
                 n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
                 zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond)
             lu_piv = None
-        L_q.block_until_ready()
-        print(f"  L_q: {L_q.shape}")
+        # A distributed library factor is an OPAQUE token: no ``.shape``
+        # to print and no single buffer to block on (a ScaLAPACK token
+        # holds factors AND pivots).  Report what it does publish.
+        if isinstance(L_q, FactorToken):
+            print(f"  L_q: {L_q!r}")
+        else:
+            L_q.block_until_ready()
+            print(f"  L_q: {L_q.shape}")
 
     # Pre-compute per-q trace of the CCT ONCE per channel — needed ONLY
     # by the remaining FUSED transverse route (cusolvermp passthrough,
@@ -558,12 +569,17 @@ def fit_zeta_to_h5(
     # (and its per-r-chunk all-reduce, 17 s of GPU stream at MoS2 3×3
     # bispinor) is gone.
     if (int(vertex_mu_L) != 0 and lu_piv is None
+            and not isinstance(L_q, FactorToken)
             and _resolved_solver_kind not in (
                 'transverse_rank_truncate',
                 'distributed_transverse_rank_truncate')):
-        # Rank-truncate kinds also return piv=None but carry no fused LU
-        # path — no ridge, hence no trace operand (their L_q is C⁺, whose
-        # trace would be a different, meaningless quantity here).
+        # ``not isinstance(...)`` is the ScaLAPACK hoist: its ridge is
+        # baked into the factored matrix, so it needs no trace operand —
+        # the condition used to read that off ``lu_piv is not None``, and
+        # the pivots live in the token now.  Rank-truncate kinds also
+        # return piv=None but carry no fused LU path — no ridge, hence no
+        # trace operand (their L_q is C⁺, whose trace would be a
+        # different, meaningless quantity here).
         with timing.section("zeta_fit.trace_L_q"):
             # LOGICAL-block trace only: the identity pad block would
             # contribute exactly +mu_pad to the padded trace, making

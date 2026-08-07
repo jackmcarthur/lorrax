@@ -33,9 +33,10 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from ffi import _services
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
 
-_services.ensure_on_path()          # services/*/src onto sys.path; transitional
+_services.ensure_on_path()
 
 from distrib_la import plan as linalg_plan                          # noqa: E402
 # Every extent this module shards is an input datum: n_μ is a k-means centroid

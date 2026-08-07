@@ -640,8 +640,8 @@ def _psum_kernel(ndim: int, mesh):
     closes over ``mesh`` through the shard_map, so the Mesh object cannot be
     collected while its entry lives and its id cannot be recycled underneath
     us.  The failure mode is therefore a redundant compile on a second, equal
-    Mesh object — never a stale hit.  Use ``ffi.slate.batched._mesh_key``
-    instead wherever the cached value does NOT retain the mesh.
+    Mesh object — never a stale hit.  Use ``distrib_la.mesh_key`` instead
+    wherever the cached value does NOT retain the mesh.
     """
     from functools import partial
 
