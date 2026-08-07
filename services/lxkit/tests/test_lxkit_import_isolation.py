@@ -15,8 +15,17 @@ it.  That is not paranoia: this repo's venv carries
 ``site-packages/__editable__.lorrax-0.1.0.pth``, so an ordinary subprocess of
 the test interpreter has ``<tree>/src`` on ``sys.path`` no matter what
 ``PYTHONPATH`` says — the hazard survey 3 (c4) names, measured here.  Legs
-that need pytest or jax pass ``SITE`` back in explicitly; it carries no
-``.pth`` processing when it arrives through ``PYTHONPATH``.
+that need pytest or jax ask for them BY NAME through ``deps=``; a directory
+carries no ``.pth`` processing when it arrives through ``PYTHONPATH``.
+
+NAMING them is not a spelling preference.  These three cells used to pass
+``sysconfig.get_paths()["purelib"]``, which is the obvious answer and is
+WRONG inside the Perlmutter Shifter image, where jax is a source checkout at
+``/opt/jax`` reached through an editable finder hook that ``python -S``
+skips.  The child then had no jax, died before printing its payload line,
+and three cells with nothing to do with isolation went red on the only
+machine that runs the FFI stack.  ``lxkit.testing.dep_dirs`` asks each
+dependency where it actually lives; see its docstring for the measurement.
 
 RED TWINS ARE MANDATORY (charter, falsification doctrine).  Both halves of
 the check — the ``sys.modules`` half and the ``sys.path`` half — are shown
@@ -27,7 +36,6 @@ this file would be its own best example without them.
 from __future__ import annotations
 
 import os
-import sysconfig
 
 import pytest
 
@@ -37,7 +45,11 @@ _TESTS = os.path.dirname(os.path.abspath(__file__))
 _LXKIT_SRC = os.path.join(os.path.dirname(_TESTS), "src")
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(_TESTS)))
 _LORRAX_SRC = os.path.join(_REPO, "src")
-SITE = sysconfig.get_paths()["purelib"]
+#: What a child needs back to import the module under test at all.  Handed
+#: over BY NAME (see the module docstring); anything not named here must be
+#: unreachable in the child, which is what the isolation check measures.
+_PYTEST_DEPS = ("pytest", "pluggy", "iniconfig", "packaging")
+_JAX_DEPS = ("jax", "jaxlib", "numpy", "scipy", "ml_dtypes", "opt_einsum")
 
 #: Roots a standalone lxkit must not touch.  Derived from the monorepo when
 #: it is there (so a new top-level package is covered the day it lands),
@@ -77,7 +89,7 @@ def test_the_pytest_plugin_imports_with_the_monorepo_absent():
     installs lxkit, so it is the module most able to poison a session.  It
     needs pytest, and nothing else."""
     run = import_isolation("lxkit.testing", _lorrax_roots(),
-                           src_dir=_LXKIT_SRC, extra_path=[SITE])
+                           src_dir=_LXKIT_SRC, deps=_PYTEST_DEPS)
     assert run.loaded == () and run.reachable == ()
 
 
@@ -87,7 +99,7 @@ def test_importing_lxkit_pulls_in_no_jax():
     lxkit does not reach for it."""
     forbidden = ("jax", "jaxlib", "numpy", "scipy", "h5py")
     run = import_isolation("lxkit", forbidden, src_dir=_LXKIT_SRC,
-                           extra_path=[SITE], check_path=False)
+                           deps=_JAX_DEPS, check_path=False)
     assert run.loaded == ()
     if not any(root == "jax" for root, _ in run.reachable):
         pytest.skip("jax is not installed in this interpreter, so 'lxkit "
@@ -98,8 +110,8 @@ def test_the_pytest_plugin_pulls_in_no_jax_either():
     """The plugin loads in EVERY pytest session of a suite that installs
     lxkit, including the WSL shape-algebra legs that have no jax at all."""
     run = import_isolation("lxkit.testing", ("jax", "jaxlib"),
-                           src_dir=_LXKIT_SRC, extra_path=[SITE],
-                           check_path=False)
+                           src_dir=_LXKIT_SRC,
+                           deps=_PYTEST_DEPS + _JAX_DEPS, check_path=False)
     assert run.loaded == ()
     if not any(root == "jax" for root, _ in run.reachable):
         pytest.skip("no jax installed; nothing could have been pulled in")
@@ -152,7 +164,7 @@ def test_the_jax_check_can_fail():
     pytest.importorskip("jax")
     with pytest.raises(AssertionError, match="pulled"):
         import_isolation("lxkit", ("jax",), src_dir=_LXKIT_SRC,
-                         extra_path=[SITE], check_path=False,
+                         deps=_JAX_DEPS, check_path=False,
                          preamble="import jax")
 
 

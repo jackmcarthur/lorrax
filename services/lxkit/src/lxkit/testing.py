@@ -21,7 +21,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from typing import Iterable, NamedTuple, Sequence
+from typing import Callable, Iterable, Mapping, NamedTuple, Sequence
 
 import pytest
 
@@ -31,8 +31,11 @@ __all__ = [
     "OK", "ABSENT", "BROKEN", "absent_or_broken",
     "gate_state", "require_devices",
     "HostileGeometry", "hostile_extents",
-    "IsolationRun", "import_isolation",
-    "machine_profile", "assert_skips_match_profile",
+    "IsolationRun", "import_isolation", "dep_dirs",
+    "MustRow", "AllowedSkip", "MachineProfile", "PROFILES",
+    "detect_machine", "machine_profile", "must_rows_for",
+    "assert_must_probe", "assert_skips_match_profile",
+    "arm_skip_honesty", "observed_skips",
 ]
 
 
@@ -259,9 +262,61 @@ class IsolationRun(NamedTuple):
     reachable: tuple[tuple[str, str], ...]   #: (root, sys.path entry) pairs
 
 
+def dep_dirs(names: Iterable[str]) -> list[str]:
+    """The directories THIS interpreter resolved ``names`` from.
+
+    NOT ``sysconfig.get_paths()['purelib']``, which is the obvious answer
+    for "give the child its dependencies back" and is WRONG on the machine
+    that matters.  MEASURED inside the Perlmutter Shifter image
+    (``lorrax_J070``, 2026-08-07, via ``lx run python3``)::
+
+        sys.executable  /usr/bin/python3
+        purelib         /usr/local/lib/python3.12/dist-packages
+        jax.__file__    /opt/jax/jax/__init__.py     <- NOT under purelib
+        pytest.__file__ ~/.local/perlmutter/.../site-packages/pytest/...
+
+    The image's jax is a source checkout reached through an editable
+    finder hook installed by ``site``, and :func:`import_isolation` runs
+    the child under ``python -S``, which skips ``site`` and therefore
+    every ``.pth`` and every such hook.  A child handed ``purelib`` had no
+    jax at all, the probe died before printing its payload line, and cells
+    with nothing to do with isolation failed:
+
+        lx test services/lxkit/tests services/distrib_la/tests
+          -> 8 failed, 107 passed, 1 skipped     (2026-08-07, before)
+
+    Asking each dependency where it ACTUALLY lives is right in both places
+    — a venv answers ``purelib`` for all of them, the container answers
+    ``/opt/jax`` for jax and ``dist-packages`` for the rest — and it keeps
+    the child's path a LIST OF NAMES.  That is the load-bearing part:
+    naming a dependency is the claim, and anything unnamed must stay
+    unreachable, which is what the isolation check measures.
+
+    A name this interpreter cannot resolve is silently dropped: the child
+    would not have been able to import it either, and a hard error here
+    would turn "scipy is not installed" into a test failure about
+    isolation.  Namespace packages are dropped too — they have no single
+    directory to hand over.
+    """
+    out: list[str] = []
+    for name in names:
+        try:
+            spec = importlib.util.find_spec(name)
+        except Exception:                                      # noqa: BLE001
+            continue
+        if spec is None or not spec.origin or spec.origin == "namespace":
+            continue
+        pkg = os.path.dirname(os.path.realpath(spec.origin))
+        root = os.path.dirname(pkg) if os.path.basename(pkg) == name else pkg
+        if root not in out:
+            out.append(root)
+    return out
+
+
 def import_isolation(pkg: str, forbidden_roots: Iterable[str], *,
                      src_dir: str | None = None,
                      extra_path: Sequence[str] = (),
+                     deps: Iterable[str] = (),
                      preamble: str = "",
                      check_path: bool = True) -> IsolationRun:
     """Import ``pkg`` in a subprocess with nothing but ``src_dir`` on the
@@ -280,10 +335,12 @@ def import_isolation(pkg: str, forbidden_roots: Iterable[str], *,
         every subprocess of that interpreter, whatever ``PYTHONPATH`` says.
         ``-S`` skips ``site`` and therefore every ``.pth``, so the child's
         path is exactly the stdlib plus what this function put there.  A
-        leg that needs pytest or jax back asks for them by name via
-        ``extra_path`` (the site-packages DIRECTORY carries no ``.pth``
-        processing when it arrives through ``PYTHONPATH``).
-    ``PYTHONPATH = src_dir`` (+ ``extra_path``)
+        leg that needs pytest or jax back asks for them BY NAME via
+        ``deps`` — :func:`dep_dirs` resolves each one to the directory it
+        actually lives in, which is not ``purelib`` on the machine that
+        matters (see :func:`dep_dirs`).  A directory carries no ``.pth``
+        processing when it arrives through ``PYTHONPATH``.
+    ``PYTHONPATH = src_dir`` (+ ``deps`` + ``extra_path``)
         Set, not popped.  The parent's ``PYTHONPATH`` is discarded outright.
     ``cwd`` outside the repo
         A temp dir, so ``sys.path[0]`` cannot smuggle sibling packages in.
@@ -318,7 +375,8 @@ def import_isolation(pkg: str, forbidden_roots: Iterable[str], *,
         pkg_dir = os.path.dirname(os.path.realpath(spec.origin))
         src_dir = os.path.dirname(pkg_dir)
     src_dir = os.path.realpath(src_dir)
-    path = [src_dir, *(os.path.realpath(p) for p in extra_path)]
+    path = list(dict.fromkeys([src_dir, *dep_dirs(deps),
+                               *(os.path.realpath(p) for p in extra_path)]))
 
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(path)
@@ -366,42 +424,374 @@ def import_isolation(pkg: str, forbidden_roots: Iterable[str], *,
 
 
 # ---------------------------------------------------------------------------
-# Skip-honesty (charter: an unexpected skip is a FAILURE)
+# SKIP-HONESTY.  An unexpected skip is a FAILURE.
 # ---------------------------------------------------------------------------
-# DELIBERATELY UNIMPLEMENTED.  The charter requires one gate per service
-# asserting that observed skips match the machine's declared expected-backend
-# profile (Perlmutter: scalapack, slate, cusolvermp, phdf5 MUST probe
-# available).  No such mechanism exists anywhere in the tree at 96a6399 --
-# tests/profiles/ holds xprof traces, not machine profiles -- so there is
-# nothing here to port and nothing measured to encode.  The design is
-# settled (DESIGN_distrib_la.md, "Test architecture": PROFILES keyed on
-# NERSC_HOST/LX_MACHINE with an explicit `unknown` row that asserts nothing;
-# positive half fails with the three-way probe reason; negative half diffs
-# observed skips against an allowed-skip predicate plus a
-# minimum-collected floor; red twins for both) but the profile ROWS are a
-# measurement that only the real machine can supply.
+# A skip reads as "not applicable on this machine".  When that is false it
+# is the quietest way a suite can lose coverage, and this tree has the
+# receipt: on 2026-08-06 nineteen ScaLAPACK/SLATE contract cells reported
+# "19 skipped" beside "0 failed" because a built-and-unloadable .so was
+# probed as absent.  Nothing in the output distinguished "does not apply"
+# from "did not run".
 #
-# **distrib_la step 2 (service test suite) fills these in**, with the
-# Perlmutter probe results as its evidence, and lifts them here once the
-# shape has survived one real service.  A plausible stub returning an empty
-# profile would be worse than none: every skip would match it and the gate
-# would report green while asserting nothing -- the exact failure mode
-# (2026-08-06, 19 cells) this whole section exists to prevent.
+# :func:`absent_or_broken` fixes the per-library half of that.  This
+# section fixes the per-MACHINE half, in the two directions a skip can lie:
+#
+#   POSITIVE  the machine DECLARES which backends must be there.  On
+#             Perlmutter scalapack, slate, cusolvermp and phdf5 must all
+#             probe available; if one does not, that is a defect in the
+#             build or the environment and the gate FAILS with the probe's
+#             own three-way reason (unknown target / library would not
+#             load / loaded but does not export), because those three have
+#             three different fixes.
+#
+#   NEGATIVE  every skip the session actually emitted is diffed against an
+#             ALLOWLIST, and each allowed row names the leg that DOES run
+#             the cell (the tests/KNOWN_FAILURES.md discipline: a skip
+#             with no covering leg is evaporated coverage wearing a green
+#             dot).  A skip that matches nothing fails the session.
+#
+# ...plus a MINIMUM-COLLECTED FLOOR, because both halves above are vacuous
+# in a session that collected nothing.  A 38-byte junitxml parses as zero
+# tests and zero failures; `lx` reports pytest rc=5 ("no tests collected")
+# as its own kind of not-a-pass for the same reason.  Judge by artifacts.
+#
+# THE `unknown` PROFILE ASSERTS NOTHING, EXPLICITLY.  A laptop has no
+# ScaLAPACK and never will, and a profile that demanded one would train
+# everybody to ignore the gate.  It is a named row rather than a
+# fall-through so that "this machine makes no promises" is a decision in
+# the table instead of an accident of lookup.
 
-_NOT_YET = (
-    "lxkit.testing.{name} is not implemented yet.  Skip-honesty profiles are "
-    "filled in by distrib_la step 2 (service test suite) from real Perlmutter "
-    "probe results -- see DESIGN_distrib_la.md 'Test architecture'.  lxkit "
-    "ships the refusal rather than a permissive stub: a profile that asserts "
-    "nothing turns the skip-honesty gate green while it measures nothing.")
+
+class MustRow(NamedTuple):
+    """One backend a machine PROMISES is available.
+
+    ``target``/``platform`` are the FFI vocabulary of ``service``'s own
+    loader, not lxkit's: lxkit owns the policy, each service owns its
+    tables.  The gate is handed a probe per service (see
+    :func:`assert_must_probe`) and a row whose service has no probe is
+    reported as UNASSERTED rather than passing quietly.
+    """
+
+    name: str
+    service: str
+    target: str
+    platform: str
 
 
-def machine_profile(machine: str | None = None):
-    """The declared expected-backend profile for this machine.  **Stub.**"""
-    raise NotImplementedError(_NOT_YET.format(name="machine_profile"))
+class AllowedSkip(NamedTuple):
+    """One skip this machine is allowed to emit, and what covers it.
+
+    ``where`` matches a substring of the test's nodeid, ``why`` a
+    substring of the skip reason; an empty string matches anything, and
+    BOTH must match for the row to apply.  ``covered_by`` names the leg
+    that actually runs the cell — required, not decorative: a skip nobody
+    can point at a covering run for is lost coverage, and writing the leg
+    down is what makes that checkable at review time.
+    """
+
+    where: str
+    why: str
+    covered_by: str
 
 
-def assert_skips_match_profile(*args, **kwargs):
-    """Fail when observed skips diverge from the profile.  **Stub.**"""
-    raise NotImplementedError(
-        _NOT_YET.format(name="assert_skips_match_profile"))
+class MachineProfile(NamedTuple):
+    """What a machine promises, and what it is allowed to skip."""
+
+    machine: str
+    must: tuple[MustRow, ...]
+    allowed_skips: tuple[AllowedSkip, ...]
+    min_collected: int
+    #: True for the ``unknown`` row: both halves become no-ops, loudly.
+    asserts_nothing: bool = False
+
+    def must_for(self, service: str) -> tuple[MustRow, ...]:
+        return tuple(r for r in self.must if r.service == service)
+
+
+#: Skips EVERY machine may emit, whatever else it promises.  These are
+#: properties of the invocation rather than of the machine: a suite run
+#: outside the monorepo cannot exercise the with-lorrax legs, and a suite
+#: run in one process cannot exercise a four-process mesh.  Each still
+#: names its covering leg.
+_UNIVERSAL_SKIPS = (
+    AllowedSkip("", "needs >= 4 devices",
+                "the service-only leg (`pytest services/<name>/tests`), "
+                "whose conftest sets XLA_FLAGS before the first jax import"),
+    AllowedSkip("", "needs >= 2 devices", "the same service-only leg"),
+    AllowedSkip("", "real multi-process",
+                "leg L-c: `lx run -N 1 -G 4 -n 4 python3 -m "
+                "<module> --mesh 2x2`"),
+    AllowedSkip("", "single-process", "leg L-c (the CLI mode of the "
+                "same file, under srun -n 4)"),
+    AllowedSkip("", "no lorrax src/", "the monorepo run; a standalone "
+                "install has no lorrax to be isolated from"),
+    AllowedSkip("", "no monorepo", "the monorepo run"),
+    AllowedSkip("", "jax is not installed",
+                "any leg with jax; the jax-free legs assert the property "
+                "that does not need it"),
+)
+
+#: Perlmutter's declared expected-backend profile.  The four MUST rows are
+#: the charter's, and they are measurable today: survey 2 verified all
+#: eleven ScaLAPACK symbols in LibSci 25.09.0, the SLATE host and device
+#: builds, cuSOLVERMp 0.7.2 and the phdf5 handlers at the ARTIFACT level
+#: (nm/readelf), and BUILD_NOTES.md pins the host .so those symbols live
+#: in.  ``cusolvermp`` is CUDA-only by construction, so its row is
+#: asserted on a GPU leg; ``scalapack`` is host-only for the same reason.
+_PERLMUTTER = MachineProfile(
+    machine="perlmutter",
+    must=(
+        MustRow("scalapack", "distrib_la", "lorrax_scalapack_eigh", "cpu"),
+        MustRow("slate", "distrib_la", "lorrax_slate_potrf", "cpu"),
+        MustRow("cusolvermp", "distrib_la", "lorrax_cusolvermp_eigh", "CUDA"),
+        # Not distrib_la's library to probe: phdf5 belongs to slab_io,
+        # which is not a service yet.  The row is declared HERE because
+        # the promise is the MACHINE's, and a gate that only listed rows
+        # it could already check would silently shrink to whatever was
+        # convenient.  distrib_la's gate reports it UNASSERTED; the
+        # slab_io retrofit (charter wave 1b) supplies the probe.
+        MustRow("phdf5", "slab_io", "lorrax_phdf5_read", "cpu"),
+    ),
+    allowed_skips=_UNIVERSAL_SKIPS + (
+        AllowedSkip("slate_eigh_true_eigenvectors_cpu", "SIGSEGV",
+                    "nothing — bug L-2 is CARRIED, not covered: SLATE's "
+                    "host heev faults deterministically and a SIGSEGV "
+                    "takes the whole pytest process down.  See "
+                    "docs/dev/linalg_ffi.md; the CPU eigh contract is "
+                    "covered by the ScaLAPACK cells instead"),
+    ),
+    min_collected=1,
+    asserts_nothing=False,
+)
+
+#: The explicit nothing-promised row.  NOT a fall-through.
+_UNKNOWN = MachineProfile(
+    machine="unknown",
+    must=(),
+    allowed_skips=(AllowedSkip("", "", "this machine declares no profile"),),
+    min_collected=1,
+    asserts_nothing=True,
+)
+
+PROFILES: Mapping[str, MachineProfile] = {
+    "perlmutter": _PERLMUTTER,
+    "unknown": _UNKNOWN,
+}
+
+
+def detect_machine() -> str:
+    """Which profile this process is running under.
+
+    ``LX_MACHINE`` wins so a leg can say what it is (and so the red twins
+    can name a machine that does not exist); ``NERSC_HOST`` is the site's
+    own variable and is what makes a Perlmutter run self-identifying with
+    no configuration.  Anything unrecognized is ``unknown``, which asserts
+    nothing — the honest answer for a machine nobody has measured.
+    """
+    for var in ("LX_MACHINE", "NERSC_HOST"):
+        val = (os.environ.get(var) or "").strip().lower()
+        if val:
+            return val
+    return "unknown"
+
+
+def machine_profile(machine: str | None = None) -> MachineProfile:
+    """The declared profile for ``machine`` (default: this machine).
+
+    An unrecognized name resolves to :data:`PROFILES` ``['unknown']`` — a
+    row that asserts nothing and says so — rather than raising, because a
+    new NERSC host appearing must not turn every service suite red.
+    """
+    name = (machine or detect_machine()).strip().lower()
+    return PROFILES.get(name, _UNKNOWN._replace(machine=name))
+
+
+def must_rows_for(service: str, machine: str | None = None):
+    return machine_profile(machine).must_for(service)
+
+
+# --- positive half ---------------------------------------------------------
+
+def assert_must_probe(profile: MachineProfile,
+                      probes: Mapping[str, Callable[[str, str], object]],
+                      *, service: str | None = None,
+                      fail: Callable[..., None] | None = None) -> list:
+    """FAIL when a MUST row of ``profile`` does not probe available.
+
+    ``probes`` maps a service name to its ``probe_target(target,
+    platform) -> (ok, reason)``.  The reason is quoted VERBATIM into the
+    failure: it is the three-way taxonomy (unknown target / library would
+    not load / loaded but does not export the symbol), and those three
+    have three different fixes, so collapsing them into "unavailable"
+    throws away the only part of the message anybody can act on.
+
+    ``pytrace=False``: the traceback would be this function, which is
+    never the interesting frame.  The interesting frame is a build script.
+
+    Returns the rows it could not assert (no probe for that service), so
+    the caller can report the GAP rather than let it pass as a success.
+    """
+    fail = fail or (lambda msg, **kw: pytest.fail(msg, pytrace=False))
+    if profile.asserts_nothing:
+        return []
+    rows = profile.must if service is None else profile.must_for(service)
+    unasserted, broken = [], []
+    for row in rows:
+        probe = probes.get(row.service)
+        if probe is None:
+            unasserted.append(row)
+            continue
+        ok, reason = probe(row.target, row.platform)
+        if not ok:
+            broken.append((row, reason))
+    if broken:
+        lines = [f"machine profile {profile.machine!r} declares "
+                 f"{len(rows)} backend(s) that MUST be available here; "
+                 f"{len(broken)} is/are not.  An unavailable MUST row is a "
+                 f"DEFECT in this machine's build or environment, not a "
+                 f"platform this suite does not apply to."]
+        for row, reason in broken:
+            lines.append(f"\n  {row.name}  ({row.service}: target "
+                         f"{row.target!r} on platform {row.platform!r})\n"
+                         f"    {reason}")
+        fail("\n".join(lines))
+    return unasserted
+
+
+# --- negative half ---------------------------------------------------------
+
+class ObservedSkip(NamedTuple):
+    nodeid: str
+    reason: str
+
+
+def _skip_is_allowed(skip: ObservedSkip, allowed) -> AllowedSkip | None:
+    for row in allowed:
+        if row.where in skip.nodeid and row.why in skip.reason:
+            return row
+    return None
+
+
+def assert_skips_match_profile(skips: Sequence[ObservedSkip],
+                               profile: MachineProfile, *,
+                               collected: int,
+                               extra_allowed: Sequence[AllowedSkip] = (),
+                               min_collected: int | None = None) -> None:
+    """Raise ``AssertionError`` when the session's skips break the profile.
+
+    PURE on purpose: it takes the observed skips and returns/raises, so it
+    is testable without a pytest session — which is what lets its red twin
+    be a direct call rather than an elaborate fixture.  The pytest wiring
+    (:func:`arm_skip_honesty`) is thirty lines on top of this.
+
+    The floor is checked FIRST.  A session that collected nothing has no
+    skips to diff, so every other assertion here would pass vacuously —
+    that is the 38-byte-junitxml failure mode, and checking it last would
+    reproduce it.
+    """
+    floor = profile.min_collected if min_collected is None else min_collected
+    if collected < floor:
+        raise AssertionError(
+            f"skip-honesty: the session collected {collected} test(s), "
+            f"below the floor of {floor}.  A session that collected "
+            f"nothing skips nothing and fails nothing, so every other "
+            f"check here would pass while measuring zero coverage.  "
+            f"(A 38-byte junitxml parses as 0 tests and 0 failures; "
+            f"pytest rc=5 is not a pass.)")
+    if profile.asserts_nothing:
+        return
+    allowed = tuple(profile.allowed_skips) + tuple(extra_allowed)
+    bad = [s for s in skips if _skip_is_allowed(s, allowed) is None]
+    if bad:
+        lines = [f"skip-honesty: machine profile {profile.machine!r} does "
+                 f"not allow {len(bad)} of the {len(skips)} skip(s) this "
+                 f"session emitted.  On this machine an unexpected skip is "
+                 f"a FAILURE: it is how coverage evaporates without "
+                 f"anything turning red."]
+        for s in bad:
+            lines.append(f"\n  {s.nodeid}\n    reason: {s.reason.strip()}")
+        lines.append(
+            f"\nIf the skip is legitimate, add an lxkit.testing.AllowedSkip "
+            f"row NAMING THE LEG that runs the cell instead — a skip with "
+            f"no covering leg is lost coverage, and the allowlist is where "
+            f"that claim is written down.  Allowed here: "
+            f"{[(r.where or '*', r.why or '*') for r in allowed]}")
+        raise AssertionError("\n".join(lines))
+
+
+# --- the pytest wiring -----------------------------------------------------
+# The hooks are ALWAYS collecting and NEVER asserting until a suite arms
+# them.  Recording a skip costs a list append; asserting on a session the
+# author never declared a profile for would make lxkit's plugin fail other
+# people's suites, which is how a good gate gets deleted.
+
+_OBSERVED: list = []
+_ARMED: dict = {}
+
+
+def observed_skips() -> tuple:
+    """Every skip this pytest session has emitted so far."""
+    return tuple(_OBSERVED)
+
+
+def arm_skip_honesty(profile: MachineProfile | None = None, *,
+                     extra_allowed: Sequence[AllowedSkip] = (),
+                     min_collected: int | None = None) -> MachineProfile:
+    """Turn the negative half on for THIS session.  Call from a conftest.
+
+    One call per service suite — the charter's "one gate per service".
+    Returns the profile in force so the caller can report it.
+    """
+    prof = profile or machine_profile()
+    _ARMED.update(profile=prof, extra_allowed=tuple(extra_allowed),
+                  min_collected=min_collected)
+    return prof
+
+
+def pytest_runtest_logreport(report):
+    """Record every skip, wherever it came from.
+
+    ``report.longrepr`` for a skip is ``(file, lineno, "Skipped: <reason>")``
+    — the reason as the REPORTER saw it, which is what a human reads and
+    therefore what the allowlist must match against.  Reaching into
+    ``item.own_markers`` instead would miss every in-body ``pytest.skip``,
+    and in-body is where this tree's device-count and library skips live.
+    """
+    if report.skipped:
+        longrepr = getattr(report, "longrepr", None)
+        reason = ""
+        if isinstance(longrepr, tuple) and len(longrepr) == 3:
+            reason = str(longrepr[2])
+        elif longrepr is not None:
+            reason = str(longrepr)
+        if reason.startswith("Skipped: "):
+            reason = reason[len("Skipped: "):]
+        _OBSERVED.append(ObservedSkip(report.nodeid, reason))
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Run the negative half, if this session armed it.
+
+    A violation is reported to the terminal AND turns the session red.
+    Both: the exit status is what CI reads, the text is what a human acts
+    on, and this tree's standing rule is to judge by the artifact.
+    """
+    armed = _ARMED.get("profile")
+    if armed is None:
+        return
+    try:
+        assert_skips_match_profile(
+            observed_skips(), armed,
+            collected=int(getattr(session, "testscollected", 0) or 0),
+            extra_allowed=_ARMED.get("extra_allowed", ()),
+            min_collected=_ARMED.get("min_collected"))
+    except AssertionError as exc:                              # noqa: BLE001
+        try:
+            tw = session.config.get_terminal_writer()
+            tw.line("")
+            tw.line("SKIP-HONESTY GATE FAILED", red=True, bold=True)
+            for line in str(exc).splitlines():
+                tw.line(line, red=True)
+        except Exception:                                      # noqa: BLE001
+            print(f"SKIP-HONESTY GATE FAILED\n{exc}")
+        session.exitstatus = 1

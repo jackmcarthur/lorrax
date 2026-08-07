@@ -11,8 +11,7 @@ import pytest
 
 from lxkit.gate import announce_once
 from lxkit.testing import (
-    ABSENT, BROKEN, OK, absent_or_broken, assert_skips_match_profile,
-    hostile_extents, machine_profile, require_devices,
+    ABSENT, BROKEN, OK, absent_or_broken, hostile_extents, require_devices,
 )
 
 
@@ -150,13 +149,11 @@ def test_the_rows_are_named_so_a_failure_says_which_geometry():
 
 
 # ---------------------------------------------------------------------------
-# Skip-honesty: not implemented, and saying so
+# Skip-honesty lives in its own file
 # ---------------------------------------------------------------------------
-
-def test_the_skip_honesty_stubs_refuse_instead_of_asserting_nothing():
-    """A profile that matches everything turns the gate green while it
-    measures nothing — the 2026-08-06 failure mode wearing a badge."""
-    for fn in (machine_profile, assert_skips_match_profile):
-        with pytest.raises(NotImplementedError) as ei:
-            fn()
-        assert "distrib_la step 2" in str(ei.value)
+# The stubs this file used to pin (``machine_profile`` /
+# ``assert_skips_match_profile`` raising NotImplementedError, with "a
+# permissive default would turn the gate green while measuring nothing" as
+# the reason) are IMPLEMENTED as of distrib_la step 2, from real Perlmutter
+# probe results.  Their tests -- including both red twins and the
+# session-level wiring -- are test_lxkit_machine_profile.py.

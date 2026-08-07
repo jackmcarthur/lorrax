@@ -24,14 +24,15 @@ of the test interpreter has ``<tree>/src`` on ``sys.path`` no matter what
 ``PYTHONPATH`` says.  ``-S`` skips ``site`` and therefore every ``.pth``;
 the child gets its dependencies back BY NAME, as DIRECTORIES, which carry
 no ``.pth`` processing when they arrive through ``PYTHONPATH``.
-:func:`import_isolation` does all of that; these cells choose the paths --
-and choosing them is where the second measured lesson lives, in
-:func:`_dep_dirs`.
+:func:`import_isolation` does all of that; these cells choose the NAMES --
+and where a name actually resolves to is the second measured lesson, which
+now lives with the rest of the harness policy in
+:func:`lxkit.testing.dep_dirs` (it is not ``purelib`` inside the Perlmutter
+Shifter image, and assuming it was cost three lxkit cells a red).
 """
 
 from __future__ import annotations
 
-import importlib.util
 import os
 
 import pytest
@@ -46,46 +47,12 @@ _REPO = os.path.dirname(_SERVICES)
 _LORRAX_SRC = os.path.join(_REPO, "src")
 
 #: distrib_la's declared runtime dependency, plus what jax itself needs to
-#: import.  The child gets these back BY NAME, which is the whole point:
-#: naming them is the claim, and anything not named must be unreachable.
+#: import.  The child gets these back BY NAME through ``deps=`` — naming
+#: them is the claim, and anything not named must be unreachable.
+#: :func:`lxkit.testing.dep_dirs` resolves each to where it ACTUALLY lives,
+#: which is not ``purelib`` inside the Perlmutter Shifter image; that
+#: measurement now lives in lxkit, with the rest of the harness policy.
 _DEPS = ("jax", "jaxlib", "numpy", "scipy", "ml_dtypes", "opt_einsum")
-
-
-def _dep_dirs() -> list[str]:
-    """The directories THIS interpreter resolved :data:`_DEPS` from.
-
-    NOT ``sysconfig.get_paths()['purelib']``, which is the obvious answer
-    and is WRONG on the machine that matters.  Measured inside the
-    Perlmutter Shifter image (``lorrax_J070``, 2026-08-07): ``purelib`` is
-    ``/usr/local/lib/python3.12/dist-packages`` and ``jax.__file__`` is
-    ``/opt/jax/jax/__init__.py`` — the image's jax is a source checkout
-    reached through an editable finder hook, so a child handed ``purelib``
-    and run under ``python -S`` has NO jax, ``import distrib_la`` dies
-    before printing, and the isolation cells fail for a reason that has
-    nothing to do with isolation.
-
-    Asking each dependency where it actually lives is right in both places
-    (a venv answers ``purelib`` for all of them) and it keeps the child's
-    path a list of names rather than a guess about layout.
-    """
-    out = []
-    for name in _DEPS:
-        try:
-            spec = importlib.util.find_spec(name)
-        except Exception:                                      # noqa: BLE001
-            continue
-        if spec is None or not spec.origin or spec.origin == "namespace":
-            continue
-        pkg = os.path.dirname(os.path.realpath(spec.origin))
-        root = os.path.dirname(pkg) if os.path.basename(pkg) == name else pkg
-        if root not in out:
-            out.append(root)
-    return out
-
-
-#: What the child needs to import distrib_la at all: its lxkit foundation
-#: and jax.  Everything else stays off the path — that is the measurement.
-DEPS = [_LXKIT_SRC] + _dep_dirs()
 
 #: What distrib_la must not touch.  Derived from the monorepo when it is
 #: there, so a new top-level lorrax package is covered the day it lands.
@@ -128,7 +95,7 @@ def test_distrib_la_imports_with_the_monorepo_absent():
     # ``python -S`` skips the editable-install .pth that would otherwise
     # put <tree>/src on every subprocess's path.
     run = import_isolation("distrib_la", _lorrax_roots(), src_dir=_SVC_SRC,
-                           extra_path=DEPS, check_path=True)
+                           deps=_DEPS, extra_path=[_LXKIT_SRC], check_path=True)
     assert run.file.startswith(_SVC_SRC + os.sep)
     assert run.loaded == () and run.reachable == ()
 
@@ -152,7 +119,7 @@ def test_the_backend_vocabulary_reads_with_no_so_anywhere():
         "'/nonexistent/liblorrax_ffi_host.so'\n")
     run = import_isolation(
         "distrib_la", _lorrax_roots(), src_dir=_SVC_SRC,
-        extra_path=DEPS, check_path=True, preamble=preamble
+        deps=_DEPS, extra_path=[_LXKIT_SRC], check_path=True, preamble=preamble
         + "import distrib_la as _d\n"
           "assert _d.BACKEND_CHOICES['eigh'][0] == 'auto'\n"
           "assert 'native2d' in _d.BACKEND_CHOICES['cholesky']\n"
@@ -201,7 +168,7 @@ def test_distrib_la_still_imports_clean_with_lorrax_on_the_path():
     _needs_monorepo()
     _needs_jax()
     run = import_isolation("distrib_la", _lorrax_roots(), src_dir=_SVC_SRC,
-                           extra_path=DEPS + [_LORRAX_SRC], check_path=False)
+                           deps=_DEPS, extra_path=[_LXKIT_SRC, _LORRAX_SRC], check_path=False)
     assert run.loaded == ()
     assert {r for r, _ in run.reachable} >= {"gw", "ffi", "common"}, (
         f"lorrax was supposed to be ON the path here; saw {run.reachable}")
@@ -222,7 +189,7 @@ def test_the_isolation_check_can_fail():
     _needs_jax()
     with pytest.raises(AssertionError, match="pulled"):
         import_isolation("distrib_la", _lorrax_roots(), src_dir=_SVC_SRC,
-                         extra_path=DEPS + [_LORRAX_SRC],
+                         deps=_DEPS, extra_path=[_LXKIT_SRC, _LORRAX_SRC],
                          check_path=False, preamble="import ffi")
 
 
@@ -233,4 +200,4 @@ def test_the_wrong_copy_of_the_package_is_a_failure():
     with pytest.raises(AssertionError, match="not under the src dir"):
         import_isolation("distrib_la", ("gw",),
                          src_dir=os.path.join(_REPO, "no_such_src"),
-                         extra_path=[_SVC_SRC] + DEPS, check_path=False)
+                         deps=_DEPS, extra_path=[_SVC_SRC, _LXKIT_SRC], check_path=False)
