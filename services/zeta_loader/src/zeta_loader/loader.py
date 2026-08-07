@@ -250,6 +250,42 @@ class ZetaLoader:
                 f"{_n_rmu_header} centroids but zeta_q has {self.n_rmu_disk}. "
                 f"The header and the ζ block were written by different runs.")
 
+        # ── The OTHER header-vs-dataset agreement: the padded sphere ──
+        # μ above, ngkmax here.  The two PLANS this loader offers read
+        # ngkmax from different places -- the collective plan takes it
+        # from the HEADER (``_read_g_flat_disk`` uses ``ngkmax_zeta``,
+        # i.e. ``gvec_components.shape[-1]``) and the local plan takes it
+        # from the DATASET's own G axis.  The writer sets both from one
+        # value (isdf_fitting's ``_gflat_ngkmax``), so they agree on any
+        # file it produced; if they ever did not, the two plans would
+        # silently read DIFFERENT EXTENTS of the same file and nothing
+        # would say so.  Check once, at open, for both.
+        #
+        # This check was ``_ZetaGTiles.__init__``'s in bse/vq_interp.py,
+        # where only the consumer that happened to build tiles got it.
+        if self.zeta_layout == 'G_flat':
+            _ngk_hdr = self.ngkmax_zeta
+            if (_ngk_hdr is not None
+                    and int(_ngk_hdr) != int(self.n_G_sph_disk)):
+                raise ValueError(
+                    f"{self._path}: isdf_header/gvec_components has "
+                    f"ngkmax={int(_ngk_hdr)} but zeta_q_G's G axis is "
+                    f"{int(self.n_G_sph_disk)}.  The header and the ζ "
+                    f"block disagree about the padded sphere size, so the "
+                    f"collective plan (which sizes from the header) and "
+                    f"the local plan (which sizes from the dataset) would "
+                    f"read different extents; the file is corrupt.  Refit "
+                    f"it — there is no reading of this that is right.")
+
+        # The LOCAL plan's serial h5py handle.  Opened on first
+        # ``read_zeta_G_local`` and not before: a loader nobody asks for
+        # a local tile must not hold a second file descriptor open, and
+        # a header-only loader on a stack with no phdf5 FFI must still
+        # construct.  Released by :meth:`close`.
+        self._local_h5 = None
+        self._local_ds = None
+        self._closed = False
+
         # SlabIO handle (held open for the loader's lifetime so the
         # phdf5 FFI ctx is reused across reads).  ``mesh=None`` is
         # HEADER-ONLY mode: no transport is opened, so nothing here
@@ -262,9 +298,20 @@ class ZetaLoader:
 
     # ------------------------------------------------------------------
     def close(self) -> None:
+        """Release BOTH handles.  Idempotent.
+
+        The collective SlabIO one and the local plan's serial h5py one:
+        the loader owns them, so dropping the loader is what closes them,
+        rather than the convention that nobody drops the wrapper.
+        """
         if self._slab_io is not None:
             self._slab_io.close()
             self._slab_io = None
+        if self._local_h5 is not None:
+            self._local_h5.close()
+            self._local_h5 = None
+            self._local_ds = None
+        self._closed = True
 
     def __enter__(self) -> "ZetaLoader":
         return self
@@ -452,6 +499,55 @@ class ZetaLoader:
             mesh=mesh,
             partition_spec=P(None, ('x', 'y'), None),
         )
+
+    # ------------------------------------------------------------------
+    # Local plan — NON-COLLECTIVE, and that is the contract
+    # ------------------------------------------------------------------
+    def read_zeta_G_local(self, key):
+        """``zeta_q_G[key]`` as HOST NUMPY, on THIS rank only.
+
+        A plain h5py hyperslab through a serial handle this loader owns.
+        Takes any h5py key (an int, a slice, a tuple of them) and
+        returns exactly what ``dataset[key]`` returns.
+
+        **LOCAL BY DESIGN.  PER-RANK INDEPENDENT.  DO NOT MAKE THIS
+        COLLECTIVE.**  A SlabIO read is collective over the mesh and
+        returns a ``jax.Array`` whose requested shape must be
+        mesh-divisible under its ``partition_spec``: a single-q
+        ``(1, n_mu, ngkmax)`` read cannot be q-sharded at all, a
+        replicated one materialises the same bytes on every rank plus a
+        device round-trip, and — the reason this method exists rather
+        than being an alias for :meth:`read_zeta_G_slab` — putting a
+        collective behind an ordinary-looking ``ds[q]`` turns any future
+        rank-0-only diagnostic into a HANG instead of an error.  That is
+        the named antipattern.  Every consumer of this is a replicated
+        host-side diagnostic; a caller that wants the distributed read
+        wants :meth:`read_zeta_G_slab`, which says so in its name.
+
+        The two plans are byte-identical where they overlap: both return
+        the same on-disk elements and neither reduces.  The agreement
+        that makes that true — header ngkmax == dataset G axis — is
+        checked once in ``__init__`` rather than assumed here.
+
+        WORKS IN HEADER-ONLY MODE.  ``mesh=None`` means no transport,
+        and this path needs none: it is serial h5py, the same library
+        ``__init__`` already used to read the headers.  A stack with no
+        phdf5 FFI can therefore still read ζ tiles, which is what the
+        host-only diagnostics and the fixture tests rely on.
+
+        The handle opens on the FIRST call and closes in :meth:`close`.
+        """
+        self._refuse_unless_g_flat("read_zeta_G_local")
+        if self._closed:
+            raise RuntimeError(
+                f"ZetaLoader({self._path!r}) is closed; its local ζ reads "
+                f"are no longer serviceable.  The serial h5py handle went "
+                f"with close() — re-open the loader if you still need "
+                f"tiles.")
+        if self._local_ds is None:
+            self._local_h5 = h5.File(self._path, "r")
+            self._local_ds = self._local_h5["zeta_q_G"]
+        return self._local_ds[key]
 
     # ------------------------------------------------------------------
     # Load API (WfnLoader-shaped)
