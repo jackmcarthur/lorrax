@@ -80,8 +80,16 @@ for _p in (os.path.join(_SERVICES, "lxkit", "src"),
 if __name__ == "__main__":
     os.environ.setdefault("JAX_ENABLE_X64", "1")
     if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
+        # select_gpu.sh already narrowed CUDA_VISIBLE_DEVICES to one GPU
+        # per rank; a bare initialize() narrows AGAIN by local process id
+        # and rank k dies on ordinal k of a 1-device view.  Same cure as
+        # the multiproc CLI and distrib_la's (local_device_ids=[0]).
+        from lxkit.gate import platform_from_env
         import jax
-        jax.distributed.initialize()
+        if platform_from_env() == "CUDA":
+            jax.distributed.initialize(local_device_ids=[0])
+        else:
+            jax.distributed.initialize()
 
 import zeta_synth as Z                                         # noqa: E402
 

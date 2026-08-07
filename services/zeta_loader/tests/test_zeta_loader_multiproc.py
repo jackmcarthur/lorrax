@@ -68,13 +68,25 @@ for _p in (os.path.join(_SERVICES, "lxkit", "src"),
 # CLI multi-rank mode: jax.distributed.initialize must run before ANY
 # XLA-backend touch, so it happens at import time when this module is the
 # entry point of a multi-task launch.  Same order as distrib_la's CLI mode.
-# The ζ path is HOST-side I/O (phdf5 over MPI-IO), so the CPU backend is the
-# one that matters and there is no per-platform library warm-up to do.
+# The ζ path is HOST-side I/O (phdf5 over MPI-IO), so there is no
+# per-platform library warm-up to do — but the DEVICE CLAIM is per-platform
+# all the same: under `lx run -G 4 -n 4`, select_gpu.sh has already pinned
+# CUDA_VISIBLE_DEVICES to ONE GPU per rank, and a bare `initialize()`
+# partitions the visible devices by local process id A SECOND TIME, so rank
+# k asks for ordinal k inside a 1-device view and dies with
+# CUDA_ERROR_INVALID_DEVICE (measured 2026-08-07, JID 56457930, on a fully
+# free node; the 1x1 and 4-rank-CPU legs green either side of it).
+# `local_device_ids=[0]` = "ordinal 0 of MY OWN narrowed view" — the same
+# cure distrib_la's CLI carries for the same launch machinery.
 if __name__ == "__main__":
     os.environ.setdefault("JAX_ENABLE_X64", "1")
     if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
+        from lxkit.gate import platform_from_env
         import jax
-        jax.distributed.initialize()
+        if platform_from_env() == "CUDA":
+            jax.distributed.initialize(local_device_ids=[0])
+        else:
+            jax.distributed.initialize()
 
 import zeta_synth as Z                                         # noqa: E402
 
