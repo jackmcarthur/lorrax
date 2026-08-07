@@ -59,7 +59,9 @@ from typing import NamedTuple
 # RAM per rank at CrI3-class ngktot — avoid it when possible.
 @lru_cache(maxsize=4)
 def _wfn_loader_for_path(path: str):
-    from file_io.wfn_loader import WfnLoader
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
     return WfnLoader(path)
 
 
@@ -88,7 +90,10 @@ except ImportError:
     _sys.path.append(str(_Path(__file__).resolve().parents[2]))  # .../src
     from psp.upf.normalize import normalize_dataclass
     from psp.upf.load_upf import load_upf
-    from file_io import WfnLoader as WFNReader
+    from ffi import _services      # noqa: F401  (path bootstrap; dies
+                                     # with the owner's workspace fix)
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
     from common import symmetry_maps
     from common.wfn_transforms import read_Gvecs_to_devices
     from common import Meta
@@ -767,7 +772,7 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
     computes V_NL elements for each k-point independently.
 
     Args:
-        wfn: WFNReader object
+        wfn: WfnLoader object
         sym: SymMaps object
         pseudos: Dictionary of loaded pseudopotentials
         global_psi_G: Global sharded wavefunction coefficients in G-space
@@ -1012,7 +1017,7 @@ def main(argv=None):
     print(f"\nLoading wavefunction file: {os.path.basename(params['wfn_file'])}")
     with timing.section("psp.get_DFT_mtxels.load_wfn"):
         try:
-            wfn = WFNReader(params["wfn_file"])
+            wfn = WfnLoader(params["wfn_file"])
             print(f"  Success: {wfn.nkpts} k-points, {wfn.nbands} bands, {wfn.nelec} electrons")
         except Exception as e:
             print(f"  Error loading WFN file: {e}")

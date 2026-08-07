@@ -69,7 +69,12 @@ import numpy as np
 
 from common import Meta, symmetry_maps
 from common.wfn_transforms import load_kpoint_fftbox
-from file_io import WfnLoader as WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from psp.dft_operators import setup_H_k_from_kvec
 from psp.h_dft import make_apply_H
 from psp.pseudos import load_pseudopotentials
@@ -848,7 +853,7 @@ def _psi_box_to_G_sphere(psi_box, G_int):
 #  G' output list
 # ═══════════════════════════════════════════════════════════════════════
 
-def build_Gprime_list(qvec_crys: np.ndarray, wfn: WFNReader, ng_out: int) -> np.ndarray:
+def build_Gprime_list(qvec_crys: np.ndarray, wfn: WfnLoader, ng_out: int) -> np.ndarray:
     """Return the ``ng_out`` lowest-|q+G'| integer G'-vectors (cell-periodic FFT-box
     indices, signed).  This is the column we output — G'=0 is the head, the rest
     are the wings."""
@@ -1096,7 +1101,7 @@ def run_sternheimer(
 
     # ── Load WFN + SymMaps + Meta ──────────────────────────────────────
     t_setup = time.perf_counter()
-    wfn = WFNReader(wfn_path)
+    wfn = WfnLoader(wfn_path)
     sym = symmetry_maps.SymMaps(wfn)
     nspinor = int(wfn.nspinor)
 
