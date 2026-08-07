@@ -563,6 +563,68 @@ def test_linalg_capability_is_reported_per_op():
     assert "input-file key, not an environment variable" in out
 
 
+def test_linalg_facts_answers_for_real_on_a_healthy_tree():
+    """``_linalg_facts`` must return CAPABILITY, not a printable excuse.
+
+    ARM B, SEAM 1 — the quietest seam in the replumb.  ``_linalg_facts``
+    wraps its import in ``except Exception: return {"error": …}``, and the
+    fixture row ``{"linalg": {"error": "ImportError: no distrib_la"}}``
+    above asserts that the report still forms a SENTENCE when it does.
+    Between them, a broken import degrades to a grammatical line, that row
+    passes on the literal failure it anticipates, and the startup banner
+    stops reporting backend capability forever with nothing failing.
+
+    Nothing asserted the OTHER half.  This does: on a tree where
+    ``distrib_la`` imports (this one — the assert says so), the dict has an
+    entry per op and no ``error`` key at all.
+
+    RED ARM: the FALSE case is the fixture row itself, and the twin below
+    constructs it.
+    """
+    pytest.importorskip("jax")
+    from ffi import _services
+    _services.ensure_on_path()
+    import distrib_la                                        # noqa: F401
+    import jax
+    from jax.sharding import Mesh
+    import numpy as np
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    facts = runtime._linalg_facts(mesh)
+    assert "error" not in facts, (
+        f"the startup report's linalg block degraded to a printed error on "
+        f"a tree where distrib_la imports: {facts['error']}")
+    assert set(facts) >= {"eigh", "cholesky", "solve_lu"}, facts
+    assert all(isinstance(v, (list, tuple)) and v for v in facts.values()), (
+        f"an op reported no backend at all — 'native' is the floor "
+        f"everywhere, so an empty list is a defect, not a capability: "
+        f"{facts}")
+
+
+def test_the_linalg_facts_error_path_is_labelled_when_it_is_taken(monkeypatch):
+    """The FALSE case, constructed — and it must stay LABELLED.
+
+    Swallowing is acceptable here (a startup banner must not abort a run)
+    only while the swallow is legible: the dict says ``error`` and the
+    string names the exception TYPE, so the sentence the report prints is
+    diagnosable rather than merely grammatical.
+    """
+    pytest.importorskip("jax")
+    import sys
+    import jax
+    from jax.sharding import Mesh
+    import numpy as np
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    monkeypatch.setitem(sys.modules, "distrib_la", None)     # -> ImportError
+    facts = runtime._linalg_facts(mesh)
+    assert set(facts) == {"error"}, facts
+    import builtins
+    kind = facts["error"].split(":", 1)[0]
+    assert issubclass(getattr(builtins, kind, object), ImportError), (
+        f"the swallow is only acceptable while it stays legible; the label "
+        f"{kind!r} is not an exception type a reader can act on: "
+        f"{facts['error']}")
+
+
 # ---------------------------------------------------------------------------
 # 6.  Threads
 # ---------------------------------------------------------------------------

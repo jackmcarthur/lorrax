@@ -431,6 +431,76 @@ def test_eigh_backend_vocabulary_is_the_resolvers_own():
         assert f'"{name}"' in src, f"fallback tuple is missing {name!r}"
 
 
+def test_the_vocabulary_came_from_the_resolver_and_not_the_fallback():
+    """The equality above cannot see which branch produced the answer.
+
+    ARM B, SEAM 7.  The literal and the door's list are EQUAL today, so
+    ``set(a) == set(b)`` passes identically whether ``gw_config`` imported
+    the resolver or its ``except`` quietly caught a ModuleNotFoundError and
+    returned the frozen tuple.  On a tree where the door IS importable —
+    which is what the assert above just established — taking the fallback
+    is a defect, and this is the observable that says so.
+
+    RED ARM: with ``ffi._services`` shadowed by a module that raises on
+    import, ``EIGH_CHOICES_SOURCE`` reads ``fallback (ImportError: …)`` and
+    this assert fires while the equality above still passes — which is the
+    whole point of the pair.
+    """
+    pytest.importorskip("jax")
+    from ffi import _services
+    _services.ensure_on_path()
+    import distrib_la                                        # noqa: F401
+    from gw import gw_config
+    gw_config.eigh_backend_choices()
+    assert gw_config.EIGH_CHOICES_SOURCE == "distrib_la.BACKEND_CHOICES", (
+        f"the deck parser answered from its frozen literal on a tree where "
+        f"distrib_la imports fine: {gw_config.EIGH_CHOICES_SOURCE}")
+
+
+def test_the_vocabulary_source_check_can_fail(monkeypatch):
+    """The FALSE case of the cell above, constructed.
+
+    Break the import the way a bad path would break it and watch BOTH
+    halves: the source label must say ``fallback``, and the returned tuple
+    must still equal the door's list — i.e. the equality assert is exactly
+    as green as before.  That is the tautology, exhibited.
+    """
+    pytest.importorskip("jax")
+    import sys
+    from ffi import _services
+    _services.ensure_on_path()
+    from distrib_la import BACKEND_CHOICES
+    from gw import gw_config
+
+    monkeypatch.setitem(sys.modules, "distrib_la", None)     # -> ImportError
+    got = gw_config.eigh_backend_choices()
+    assert gw_config.EIGH_CHOICES_SOURCE.startswith("fallback ("), (
+        gw_config.EIGH_CHOICES_SOURCE)
+    assert set(got) == set(BACKEND_CHOICES["eigh"])          # still equal!
+
+
+def test_a_door_that_renamed_the_op_raises_instead_of_falling_back(monkeypatch):
+    """A KeyError from the door is a CONTRACT break, not an environment fact.
+
+    The subscript sits OUTSIDE the narrowed ``except ImportError``, so a
+    door that stopped publishing an ``eigh`` row cannot be answered with a
+    frozen literal that describes a vocabulary nothing dispatches on.
+
+    RED ARM: widen the guard back to ``except Exception`` and this cell
+    fails with the fallback tuple in hand instead of the KeyError.
+    """
+    pytest.importorskip("jax")
+    from ffi import _services
+    _services.ensure_on_path()
+    import distrib_la
+    from gw import gw_config
+
+    monkeypatch.setattr(distrib_la, "BACKEND_CHOICES",
+                        {"cholesky": ("native",)})
+    with pytest.raises(KeyError):
+        gw_config.eigh_backend_choices()
+
+
 def test_resolve_eigh_backend_passthrough_and_promotion():
     from gw.gw_config import resolve_eigh_backend
     assert resolve_eigh_backend({}) == "auto"

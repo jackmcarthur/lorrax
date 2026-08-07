@@ -422,6 +422,14 @@ def normalize_w_dyson_solver(value) -> str:
     return s
 
 
+#: WHERE the last :func:`eigh_backend_choices` answer came from:
+#: ``"distrib_la.BACKEND_CHOICES"`` (the live import) or ``"fallback (…)"``
+#: naming the ImportError that forced the literal.  A returned tuple cannot
+#: say which, and the two are EQUAL today — so without this the one test
+#: that guards the drift passes identically in both worlds.
+EIGH_CHOICES_SOURCE = "not called"
+
+
 def eigh_backend_choices() -> tuple:
     """The legal ``eigh_backend`` spellings — the RESOLVER's own list.
 
@@ -439,15 +447,31 @@ def eigh_backend_choices() -> tuple:
     the FFI layer.  The literal fallback below covers the remaining case,
     a tree whose ``services/`` is not on the path at all; it is pinned
     equal to the door's list by ``tests/test_bse_setup_qchunk.py``.
+
+    :data:`EIGH_CHOICES_SOURCE` records WHICH of the two answered, because
+    a test comparing the two lists cannot: they are equal today, so the
+    comparison passes whether the live import ran or the except branch
+    caught it, and the drift this function exists to prevent would recur
+    with no signal at all.
     """
+    global EIGH_CHOICES_SOURCE
     try:
         from ffi import _services
         _services.ensure_on_path()
         from distrib_la import BACKEND_CHOICES
-        return tuple(BACKEND_CHOICES["eigh"])
-    except Exception:
+    except ImportError as exc:
+        # NARROW, and only around the two IMPORTS.  This used to be a bare
+        # ``except Exception`` wrapped around three failure points AND the
+        # dict subscript, so a KeyError from a door that renamed the op --
+        # a CONTRACT break -- was indistinguishable from "this tree has no
+        # services/ directory" and was answered with a frozen literal.  The
+        # subscript is outside the guard now: if the door stops publishing
+        # an ``eigh`` row, that raises here rather than being papered over.
+        EIGH_CHOICES_SOURCE = f"fallback ({type(exc).__name__}: {exc})"
         return ("auto", "off", "distributed", "cusolvermp", "slate",
                 "scalapack")
+    EIGH_CHOICES_SOURCE = "distrib_la.BACKEND_CHOICES"
+    return tuple(BACKEND_CHOICES["eigh"])
 
 
 def resolve_eigh_backend(params, *, override: str | None = None) -> str:
