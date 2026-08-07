@@ -183,8 +183,14 @@ REPLACES it, silently re-enabling 26 deselected suites).
 
 ## Performance
 
-**There are no `bench/baselines/` files yet — step 6 writes them**, in
-`distrib_la`'s claims format (op, shape, deck, mesh, seconds, jobid).
+**Baselines are `services/symmetry_maps/bench/baselines/`**, written by
+`bench/bench_symmetry_maps.py` in `distrib_la`'s claims format (op,
+backend, shape, mesh, seconds per row; nodes, jobid, machine per file) —
+`wsl1x1.json` (`SymMaps` construction on all four decks, the four star
+entry points host **and** device at nk=64/nb=60, `unfold_v_q` at 1×1) and
+`wsl2x2.json` (`unfold_v_q` on an emulated 2×2); the Perlmutter legs are
+run separately against the same schema, and the WSL rows are an
+under-load band, not a floor — the driver's module note has the numbers.
 Everything below is measured and is quoted, not re-run.
 
 **Suite cost**, both machines, HEAD `5daf979`:
