@@ -1,0 +1,564 @@
+{
+  "backend": "cpu",
+  "devices": 4,
+  "ffi_host_so": "/pscratch/sd/j/jackm/svc_distrib_la/build_host_h200/liblorrax_ffi_host.so",
+  "ffi_so": "/global/homes/j/jackm/software/lorrax_ffi_2026-08-07/liblorrax_ffi.so",
+  "jax_version": "0.7.0.dev20260807",
+  "jobid": "56444350",
+  "machine": "perlmutter",
+  "mesh": "2x2",
+  "nodes": 1,
+  "processes": 4,
+  "recorded": "2026-08-07T04:36:32-0700",
+  "rows": [
+    {
+      "backend": "off",
+      "compile_seconds": 0.2861139820306562,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "native",
+      "seconds": 0.0016889499966055155,
+      "seconds_max": 0.002166714984923601,
+      "seconds_min": 0.001669261953793466,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.0820981280412525,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "native",
+      "seconds": 0.04145799099933356,
+      "seconds_max": 0.23043382703326643,
+      "seconds_min": 0.03681904898257926,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.2849561700131744,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "native",
+      "seconds": 0.18572102597681805,
+      "seconds_max": 0.5267281270353124,
+      "seconds_min": 0.14870260999305174,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.6274470039643347,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "native",
+      "seconds": 0.8407303090207279,
+      "seconds_max": 0.8924009809852578,
+      "seconds_min": 0.7663792600505985,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "distributed",
+      "compile_seconds": 0.06781252200016752,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "scalapack",
+      "seconds": 0.002963727980386466,
+      "seconds_max": 0.00301688996842131,
+      "seconds_min": 0.0029519640374928713,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "distributed",
+      "compile_seconds": 0.06952125899260864,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "scalapack",
+      "seconds": 0.03333176899468526,
+      "seconds_max": 0.037899531016591936,
+      "seconds_min": 0.03280594100942835,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "distributed",
+      "compile_seconds": 0.15965116600273177,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "scalapack",
+      "seconds": 0.12239310599397868,
+      "seconds_max": 0.12849137204466388,
+      "seconds_min": 0.12077626696554944,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "distributed",
+      "compile_seconds": 1.1163041850086302,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "scalapack",
+      "seconds": 1.091298454964999,
+      "seconds_max": 1.1415979620069265,
+      "seconds_min": 1.072555460035801,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "compile_seconds": 0.003283095022197813,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "scalapack",
+      "seconds": 0.0026911190361715853,
+      "seconds_max": 0.002830680983606726,
+      "seconds_min": 0.0025731719797477126,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "compile_seconds": 0.03231150301871821,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "scalapack",
+      "seconds": 0.03173635998973623,
+      "seconds_max": 0.03204051899956539,
+      "seconds_min": 0.031191324000246823,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "compile_seconds": 0.12626488198293373,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "scalapack",
+      "seconds": 0.12130001100013033,
+      "seconds_max": 0.12391117599327117,
+      "seconds_min": 0.11826472403481603,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "compile_seconds": 1.103364945971407,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "scalapack",
+      "seconds": 1.1274625769583508,
+      "seconds_max": 1.1564912250032648,
+      "seconds_min": 1.088787354005035,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "2x2",
+      "op": "eigh",
+      "refused": "eigh backend 'cusolvermp' is CUDA-only but the mesh devices are 'cpu'. Available eigh backends on this mesh: native, slate, scalapack.",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "2x2",
+      "op": "eigh",
+      "refused": "eigh backend 'cusolvermp' is CUDA-only but the mesh devices are 'cpu'. Available eigh backends on this mesh: native, slate, scalapack.",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "2x2",
+      "op": "eigh",
+      "refused": "eigh backend 'cusolvermp' is CUDA-only but the mesh devices are 'cpu'. Available eigh backends on this mesh: native, slate, scalapack.",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "2x2",
+      "op": "eigh",
+      "refused": "eigh backend 'cusolvermp' is CUDA-only but the mesh devices are 'cpu'. Available eigh backends on this mesh: native, slate, scalapack.",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "slate",
+      "mesh": "2x2",
+      "op": "eigh",
+      "refused": "eigh backend 'slate' is REJECTED on CPU meshes: SLATE's host heev SIGSEGVs deterministically (bug L-2, reproduced on a 1x1 mesh at n=64 \u2014 not an MPI or layout problem). Use 'distributed' (= ScaLAPACK pzheevd, the permanent CPU default) or '",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "slate",
+      "mesh": "2x2",
+      "op": "eigh",
+      "refused": "eigh backend 'slate' is REJECTED on CPU meshes: SLATE's host heev SIGSEGVs deterministically (bug L-2, reproduced on a 1x1 mesh at n=64 \u2014 not an MPI or layout problem). Use 'distributed' (= ScaLAPACK pzheevd, the permanent CPU default) or '",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "slate",
+      "mesh": "2x2",
+      "op": "eigh",
+      "refused": "eigh backend 'slate' is REJECTED on CPU meshes: SLATE's host heev SIGSEGVs deterministically (bug L-2, reproduced on a 1x1 mesh at n=64 \u2014 not an MPI or layout problem). Use 'distributed' (= ScaLAPACK pzheevd, the permanent CPU default) or '",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "slate",
+      "mesh": "2x2",
+      "op": "eigh",
+      "refused": "eigh backend 'slate' is REJECTED on CPU meshes: SLATE's host heev SIGSEGVs deterministically (bug L-2, reproduced on a 1x1 mesh at n=64 \u2014 not an MPI or layout problem). Use 'distributed' (= ScaLAPACK pzheevd, the permanent CPU default) or '",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "native2d",
+      "compile_seconds": 0.7523392089642584,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "reps": 5,
+      "resolved": "native2d",
+      "seconds": 0.01267379499040544,
+      "seconds_max": 0.01275941199855879,
+      "seconds_min": 0.010534684988670051,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "native2d",
+      "compile_seconds": 0.542120725964196,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "reps": 5,
+      "resolved": "native2d",
+      "seconds": 0.06594847200904042,
+      "seconds_max": 0.1858392460271716,
+      "seconds_min": 0.04700316599337384,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "native2d",
+      "compile_seconds": 0.6517146039986983,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "reps": 5,
+      "resolved": "native2d",
+      "seconds": 0.36345013201935217,
+      "seconds_max": 0.5086453440017067,
+      "seconds_min": 0.12322439003037289,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "native2d",
+      "compile_seconds": 0.6874275750014931,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "reps": 5,
+      "resolved": "native2d",
+      "seconds": 0.31136669899569824,
+      "seconds_max": 0.3515548820141703,
+      "seconds_min": 0.28657505300361663,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "refused": "cholesky backend 'cusolvermp' is CUDA-only but the mesh devices are 'cpu'. Available cholesky backends on this mesh: native, native2d, slate.",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "refused": "cholesky backend 'cusolvermp' is CUDA-only but the mesh devices are 'cpu'. Available cholesky backends on this mesh: native, native2d, slate.",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "refused": "cholesky backend 'cusolvermp' is CUDA-only but the mesh devices are 'cpu'. Available cholesky backends on this mesh: native, native2d, slate.",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "refused": "cholesky backend 'cusolvermp' is CUDA-only but the mesh devices are 'cpu'. Available cholesky backends on this mesh: native, native2d, slate.",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "slate",
+      "error": "NotImplementedError: cholesky backend 'slate' has no batched entry point and its single-tile result is not an array, so plan.batched() cannot stack it. Use distrib_la.factor()/solve(), which carries the handle in an opaque token instead of flattening it.",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "resolved": "slate",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "slate",
+      "error": "NotImplementedError: cholesky backend 'slate' has no batched entry point and its single-tile result is not an array, so plan.batched() cannot stack it. Use distrib_la.factor()/solve(), which carries the handle in an opaque token instead of flattening it.",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "resolved": "slate",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "slate",
+      "error": "NotImplementedError: cholesky backend 'slate' has no batched entry point and its single-tile result is not an array, so plan.batched() cannot stack it. Use distrib_la.factor()/solve(), which carries the handle in an opaque token instead of flattening it.",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "resolved": "slate",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "slate",
+      "error": "NotImplementedError: cholesky backend 'slate' has no batched entry point and its single-tile result is not an array, so plan.batched() cannot stack it. Use distrib_la.factor()/solve(), which carries the handle in an opaque token instead of flattening it.",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "resolved": "slate",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "distributed",
+      "error": "ValueError: INVALID_ARGUMENT: Invalid buffer passed: buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "scalapack",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "distributed",
+      "error": "ValueError: INVALID_ARGUMENT: Invalid buffer passed: buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "scalapack",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "distributed",
+      "error": "ValueError: INVALID_ARGUMENT: Invalid buffer passed: buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "scalapack",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "distributed",
+      "error": "ValueError: INVALID_ARGUMENT: Invalid buffer passed: buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "scalapack",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "error": "ValueError: INVALID_ARGUMENT: Invalid buffer passed: buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "scalapack",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "error": "ValueError: INVALID_ARGUMENT: Invalid buffer passed: buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "scalapack",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "error": "ValueError: INVALID_ARGUMENT: Invalid buffer passed: buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "scalapack",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "error": "ValueError: INVALID_ARGUMENT: Invalid buffer passed: buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "scalapack",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'cusolvermp' is CUDA-only but the mesh devices are 'cpu'. Available solve_lu backends on this mesh: native, scalapack.",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'cusolvermp' is CUDA-only but the mesh devices are 'cpu'. Available solve_lu backends on this mesh: native, scalapack.",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'cusolvermp' is CUDA-only but the mesh devices are 'cpu'. Available solve_lu backends on this mesh: native, scalapack.",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'cusolvermp' is CUDA-only but the mesh devices are 'cpu'. Available solve_lu backends on this mesh: native, scalapack.",
+      "shape": [
+        2,
+        1024
+      ]
+    }
+  ],
+  "tag": "cpu2x2"
+}

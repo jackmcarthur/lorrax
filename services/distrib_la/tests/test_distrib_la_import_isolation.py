@@ -144,6 +144,19 @@ def test_list_backends_never_raises_without_a_library():
 
     import distrib_la as D
 
+    # RESTORE, never delete.  This cell used to `del os.environ[...]` in
+    # its finally block, which is not the inverse of setting it: on a
+    # machine where the variable WAS set -- i.e. Perlmutter, under the
+    # BUILD_NOTES pins -- it left every later cell in the process with no
+    # host .so pin at all.  MEASURED 2026-08-07: under a single-worker
+    # `-m distrib_la` run the five test_so_acceptance cells that follow
+    # went from checking a real library to
+    #
+    #     SKIPPED: LORRAX_FFI_HOST_SO is not set
+    #
+    # and the C++ acceptance tier evaporated silently.  The skip-honesty
+    # gate is what found it, which is the entire argument for that gate.
+    _saved = os.environ.get("LORRAX_FFI_HOST_SO")
     os.environ["LORRAX_FFI_HOST_SO"] = "/nonexistent/liblorrax_ffi_host.so"
     try:
         mesh = Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1),
@@ -157,7 +170,10 @@ def test_list_backends_never_raises_without_a_library():
                 assert "unavailable:" in text and len(text) > 40, (
                     f"{op}/{backend} refuses without saying why: {text!r}")
     finally:
-        del os.environ["LORRAX_FFI_HOST_SO"]
+        if _saved is None:
+            os.environ.pop("LORRAX_FFI_HOST_SO", None)
+        else:
+            os.environ["LORRAX_FFI_HOST_SO"] = _saved
 
 
 def test_distrib_la_still_imports_clean_with_lorrax_on_the_path():
@@ -204,3 +220,27 @@ def test_the_wrong_copy_of_the_package_is_a_failure():
         import_isolation("distrib_la", ("gw",),
                          src_dir=os.path.join(_REPO, "no_such_src"),
                          deps=_DEPS, extra_path=[_SVC_SRC, _LXKIT_SRC], check_path=False)
+
+
+def test_the_loader_pins_survive_this_file():
+    """RED TWIN for the restore above, and for every cell here that
+    touches the environment.
+
+    A test that leaves ``LORRAX_FFI_HOST_SO`` unset poisons everything
+    after it in the process: the C++ acceptance tier stops finding a
+    library to check and reports five clean-looking skips.  That is not
+    hypothetical — it is what this file did until 2026-08-07, caught by
+    the skip-honesty gate on a single-worker Perlmutter run.
+
+    Asserting the value is UNCHANGED rather than merely present is the
+    part that matters: restoring the wrong path would be the same defect
+    wearing a plausible value.
+    """
+    before = dict(os.environ)
+    test_list_backends_never_raises_without_a_library()
+    for var in ("LORRAX_FFI_SO", "LORRAX_FFI_HOST_SO"):
+        assert os.environ.get(var) == before.get(var), (
+            f"{var} changed from {before.get(var)!r} to "
+            f"{os.environ.get(var)!r}; a cell that edits a loader pin must "
+            f"put it back exactly, or every later cell measures a "
+            f"different machine")

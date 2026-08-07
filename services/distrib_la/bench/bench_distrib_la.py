@@ -107,8 +107,24 @@ def _put(a, mesh, spec):
 
 
 def _time_one(fn, args, warmup, reps):
-    """(compile_seconds, [timed seconds])  — first call is the compile."""
+    """(compile_seconds, [timed seconds])  — first call is the compile.
+
+    REFUSES to time anything that is not an array, and that refusal is the
+    difference between a baseline and a fiction.  MEASURED (gpu2x2,
+    2026-08-07): ``plan.batched`` on cuSOLVERMp cholesky returns a
+    ``CusolverMpBatchedLowerL`` HANDLE, ``jax.block_until_ready`` on a
+    handle waits for nothing, and the row came back at **0.032 ms** —
+    flat across n = 64 and n = 1024, which is the tell.  A number that
+    does not move with the problem size is not a measurement of the
+    problem.
+    """
     import jax
+    out = fn(*args)
+    if not hasattr(out, "shape") and not isinstance(out, (tuple, list)):
+        raise TypeError(
+            f"refusing to time a {type(out).__name__}: block_until_ready "
+            f"cannot wait on it, so the elapsed time would be dispatch "
+            f"overhead wearing the name of a factorization")
     t0 = time.perf_counter()
     jax.block_until_ready(fn(*args))
     compile_s = time.perf_counter() - t0
