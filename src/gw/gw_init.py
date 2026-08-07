@@ -1324,6 +1324,13 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	# was.  Same dispatch, public name.
 	from common.collectives import gather_to_host as _gather_to_host
 	G0_gathered = _gather_to_host(G0_all)
+	# The door's documented sequence (``write_g0_mu``: close -> barrier ->
+	# rank-0 write -> barrier) is now LITERALLY what this caller does.
+	# ``gather_to_host`` above is itself collective and synchronized this
+	# point in practice, but the step-3 blind audit (Arm B §7) found the
+	# pre-write barrier existing only by that side effect — one explicit
+	# line is cheaper than a sequence that is true by coincidence.
+	barrier("g0_pre_write")
 	if jax.process_index() == 0:
 		# Clip the μ axis to the LOGICAL extent: files on disk store
 		# logical extents so they re-read identically on any process
