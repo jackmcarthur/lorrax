@@ -988,8 +988,41 @@ class WfnLoader:
         :meth:`close` releases it."""
         if self._phdf5_ctx is None:
             from ffi.phdf5 import open_file
+            from ._slab_io_ffi import (
+                _assert_mpi_world, _env_flag, _rank0, file_stripe_layout)
             self._phdf5_ctx = open_file(
                 self._path, mesh=self._mesh, mode="r")
+            # MIRRORS _FfiBackend.__init__ (_slab_io_ffi.py), which this
+            # loader does NOT go through: it calls ffi.phdf5.open_file
+            # directly, so none of that constructor's open-time guards ran
+            # here.  ``open_file`` has now brought MPI up, so ask it how big
+            # the world REALLY is before a single hyperslab is derived from
+            # jax.process_count().  The measurement this exists for (ledger
+            # claims/0068, job 56389339): a wrong PMI flavour gave
+            # MPI_Comm_size()==1 on EVERY rank while jax.process_count()==16,
+            # and eight hostile geometries were written and read back
+            # BIT-EXACT, rc=0, with no warning anywhere.  Silent wrong
+            # parallelism is the failure this refuses.
+            _assert_mpi_world(self._mesh)
+            # Announce the layout the FILE HAS, which is not the layout the
+            # striping policy would request: a Lustre layout is fixed at
+            # create and WFN.h5 is created by pw2bgw, so _export_striping_env
+            # is inert on this path.  _FfiBackend logs striping only for
+            # mode='w' for exactly that reason, which left the read side
+            # silent about its own dominant term.  stripe_count=1 pins
+            # cb_nodes=1 -- one aggregator at any rank count.
+            if _rank0() and _env_flag("LORRAX_PHDF5_LOG", True):
+                _lay = file_stripe_layout(self._path)
+                if _lay is not None:
+                    _c, _s = _lay
+                    _warn = ("  <-- ONE STRIPE: cb_nodes=1, single-aggregator "
+                             "read at any rank count; `lfs setstripe -c 16 -S 4M`"
+                             " on the deck dir before pw2bgw, or `lfs migrate`"
+                             " this file" if _c == 1 else "")
+                    print(f"  [WfnLoader] {Path(self._path).name} "
+                          f"file stripe_count={_c} stripe_size={_s} B "
+                          f"(the file's own inode, not the policy){_warn}",
+                          flush=True)
         return self._phdf5_ctx
 
     def _phdf5_build(

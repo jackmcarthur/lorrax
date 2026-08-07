@@ -300,6 +300,50 @@ def _export_striping_env(nranks: int | None = None) -> tuple[int, int]:
     return count, unit
 
 
+def file_stripe_layout(path: str) -> tuple[int, int] | None:
+    """The stripe layout the FILE ACTUALLY HAS, or ``None`` if unknowable.
+
+    This is a DIFFERENT question from :func:`_stripe_count`, which is the
+    layout we would REQUEST.  A Lustre layout is a property of the inode,
+    fixed at create (see :func:`_replace_inode_for_write`), so on a
+    ``mode='r'`` open of a file LORRAX did not write the policy is inert
+    and *this* is the only number that governs the read.  Every ``WFN.h5``
+    is in that class: ``pw2bgw`` creates it, not us.
+
+    WHY THIS EXISTS.  ``striping_factor`` sets ``cb_nodes =
+    min(striping_factor, nranks)``, so a one-stripe file pins the read to a
+    SINGLE aggregator at any rank count.  Measured 2026-08-06, ``lfs
+    getstripe -c -S`` on two production files --
+    ``pre_august/ZG_yifan/WFN.h5`` and ``int0807_art/bse/WFN.h5`` -- both
+    return ``stripe_count 1, stripe_size 1 MiB``, which is also
+    ``/pscratch``'s directory default.  The ledger's cold-read ladder at 64
+    ranks puts a 1-stripe file at ~0.6-0.8 GiB/s against 5.6 for a striped
+    one.  No LORRAX code change reaches it -- the remedy is ``lfs setstripe``
+    on the deck directory BEFORE ``pw2bgw``, or ``lfs migrate`` after.
+
+    Nothing in the tree reported this before: ``_FfiBackend.__init__`` logs
+    striping only on ``mode='w'``, deliberately, because on a read the
+    POLICY is meaningless.  The file's own layout is not, and it was the
+    dominant term nobody could see.
+
+    Returns ``(stripe_count, stripe_size_bytes)``.  ``None`` when ``lfs`` is
+    absent, the path is not on Lustre, or the call fails for any reason --
+    this is an observation, never a gate, and must not break a read.
+    """
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["lfs", "getstripe", "-c", "-S", str(path)],
+            capture_output=True, text=True, timeout=10, check=False)
+        if out.returncode != 0:
+            return None
+        nums = [int(tok) for tok in out.stdout.split() if tok.isdigit()]
+        # `-c -S` prints the count then the size, one integer each.
+        return (nums[0], nums[1]) if len(nums) >= 2 else None
+    except Exception:
+        return None
+
+
 def _replace_inode_for_write(path: str) -> None:
     """Rank-0 unlink + barrier so ``mode='w'`` REPLACES the file's inode.
 
