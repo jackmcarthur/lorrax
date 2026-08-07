@@ -258,25 +258,48 @@ def distributed_eigh(
     mb = n // p if block_size is None else block_size
     nb = n // q if block_size is None else block_size
 
-    # Local output shapes + partition specs for shard_map.
-    W_local = jax.ShapeDtypeStruct((n,), jnp.float64)           # replicated
-    Q_local = jax.ShapeDtypeStruct((n // p, n // q), A.dtype)
-    # Attributes forwarded to the C++ handler.
-    attrs = dict(n=n, mb=mb, nb=nb,
-                 ctx_handle=int(ctx_handle),
-                 compute_evecs=bool(compute_evecs))
+    # jit(shard_map(...)) with a per-signature cache — the shape EVERY other
+    # FFI wrapper in this package has.  This one was the exception: it
+    # called shard_map at eager top level with no jax.jit around it, and the
+    # exception was recorded rather than fixed (the note lived in
+    # dispatch.py:230).  An eager shard_map RE-TRACES on every call, so a
+    # caller that loops q paid one trace per matrix and got no cached
+    # executable; measured on the same construction with a CPU stand-in,
+    # 8 calls traced the body 8 times eagerly and ONCE under jit.
+    #
+    # It also matters for correctness of the batched dispatcher's serial
+    # fallback: that path is the one taken on CUDA, and it calls this
+    # wrapper Nq times.
+    key = ("eigh", _mesh_key(mesh), A.dtype, n, mb, nb,
+           bool(compute_evecs), int(ctx_handle))
+    jit_eigh = _JIT_CACHE.get(key)
+    if jit_eigh is None:
+        # Local output shapes + partition specs for shard_map.
+        W_local = jax.ShapeDtypeStruct((n,), jnp.float64)       # replicated
+        Q_local = jax.ShapeDtypeStruct((n // p, n // q), A.dtype)
+        # Attributes forwarded to the C++ handler.
+        attrs = dict(n=n, mb=mb, nb=nb,
+                     ctx_handle=int(ctx_handle),
+                     compute_evecs=bool(compute_evecs))
 
-    @partial(shard_map,
-             mesh=mesh,
-             in_specs=P("x", "y"),
-             out_specs=(P(), P("x", "y")),
-             check_vma=False)
-    def _call(local_A):
-        return jax.ffi.ffi_call(
-            _EIGH_TARGET, (W_local, Q_local))(local_A, **attrs)
+        @partial(shard_map,
+                 mesh=mesh,
+                 in_specs=P("x", "y"),
+                 out_specs=(P(), P("x", "y")),
+                 check_vma=False)
+        def _call(local_A):
+            return jax.ffi.ffi_call(
+                _EIGH_TARGET, (W_local, Q_local))(local_A, **attrs)
 
-    W, Q = _call(A)
-    return W, Q
+        # NO donate_argnums / input_output_aliases, deliberately: this
+        # wrapper never donated its operand and distrib_la.plan.DONATES
+        # declares eigh as donating nothing.  Adding donation here would
+        # silently invalidate A for the caller — and the serial batched
+        # path slices A[q] out of a stack the next iteration still needs.
+        jit_eigh = jax.jit(_call)
+        _JIT_CACHE[key] = jit_eigh
+
+    return jit_eigh(A)
 
 
 # =========================================================================
