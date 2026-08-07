@@ -450,6 +450,15 @@ pins, artifacts `/pscratch/sd/j/jackm/svc_distrib_la/_reports_p1/p1b.{log,xml}`:
 the 1-ULP-of-the-6th-decimal the census measured — no larger — so the
 band has a full decade of headroom and is not absorbing anything else.
 
+> **Unit note, because the two tables disagree and should not be read as
+> contradicting.**  The census row above says "20 / 2484 rows"; the
+> measured row here says "36 / 2484 cells".  2484 is the CELL count
+> (414 rows × 6 compared columns), so the census's label was wrong even
+> though its denominator was right, and the counts differ (20 vs 36)
+> because they were taken from different runs of a GPU-nondeterministic
+> last-ULP effect.  The quantity that matters — the max |Δ| — is
+> **1.000e-06 eV in both**, and that is the one the band is set against.
+
 **The tolerance was actually exercised.**  Both cells took the
 `assert_allclose` path, not the byte-identity early return (the report
 distinguishes the two by name).  A green here therefore means "the drift
