@@ -862,35 +862,31 @@ def test_resolve_q_refuses_bad_q_specs(tmp_path, bad, match):
 
 
 def test_resolve_mu_refuses_a_strided_slice(tmp_path):
-    """A μ stride has no on-disk expression, and the refusal says so.
+    """A μ stride has no on-disk expression, and the refusal says so —
+    BEFORE the transport gets a word in.
 
-    DOCUMENTS CURRENT BEHAVIOUR, INCLUDING AN ORDERING THAT DOES NOT MATCH
-    THE STATED RULE.  ``load``'s own comment sets the order out loud —
-
-        the two refusals that are facts about the FILE AND THE REQUEST come
-        before the one that is a fact about the STACK, so a caller on a
-        machine with no phdf5 FFI still gets told that it asked for
-        something this reader does not do
-
-    — and the μ refusal is a fact about the REQUEST, but it fires in
-    ``_resolve_mu`` which runs AFTER ``_ = self.slab_io``.  So at
-    ``mesh=None`` (this WSL box, and every header-only caller) a strided μ
-    slice reports the TRANSPORT refusal, not the stride.  The layout and
-    full_bz refusals above are correctly ordered; only μ is not.
-
-    Both halves are asserted: what a caller actually sees today, and that
-    the refusal itself exists and is well-worded when reached.  REGISTERED
-    to the orchestrator as a product finding — moving the ``_resolve_mu``
-    call above the ``slab_io`` access is a one-line src change and step 2
-    modifies no production code.
+    ``load``'s stated rule is that refusals which are facts about the FILE
+    AND THE REQUEST come before the one that is a fact about the STACK.
+    Step 2 of this service found the μ refusal violating it (``_resolve_mu``
+    ran after ``_ = self.slab_io``, so at ``mesh=None`` a strided μ slice
+    reported the TRANSPORT refusal); this cell documented the defect and
+    registered it.  Step 4 moved the call, and this cell now PINS the
+    stated order: at ``mesh=None`` the stride refusal fires, and the
+    transport refusal still fires for a request that is otherwise valid —
+    which is the ordering's red twin, because a regression that swaps the
+    two back turns the first assertion into the HEADER-ONLY RuntimeError
+    again and this test goes red.
     """
     _needs_host_tree()
     path, _p = Z.build_gflat(tmp_path / "z.h5", n_q=2, n_rmu=6)
     with ZetaLoader(path) as zl:
-        # CURRENT: the stack refusal wins at mesh=None.
-        with pytest.raises(RuntimeError, match="HEADER-ONLY"):
+        # FIXED ORDER: the request refusal wins at mesh=None…
+        with pytest.raises(ValueError, match="step 1"):
             zl.load(mu=slice(0, 6, 2))
-        # The request refusal exists and names the fix, once reached.
+        # …and a VALID request still reaches the stack refusal.
+        with pytest.raises(RuntimeError, match="HEADER-ONLY"):
+            zl.load(mu=slice(0, 6))
+        # The refusal itself, reached directly, names the fix.
         with pytest.raises(ValueError, match="step 1"):
             zl._resolve_mu(slice(0, 6, 2))
         # …and the unstrided forms resolve, so the refusal is not a wall.

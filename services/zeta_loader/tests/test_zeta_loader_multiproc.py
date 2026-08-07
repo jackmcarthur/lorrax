@@ -540,21 +540,34 @@ _ALL_CHECKS = (check_mu_pad_non_divisible, check_q_window_non_divisible,
 
 
 def _pytest_mesh():
-    """The largest SQUARE host mesh this process can build, 2x2 or 1x1.
+    """The largest mesh the REAL transport will accept in this process.
 
-    Not ``_mesh_1x1``: the emulated 4-device tier is the whole reason the
-    service conftest sets ``--xla_force_host_platform_device_count=4``, and
-    a pytest cell that always built 1x1 would make that flag decorative.
-    Not ``require_devices(4)`` either, because the brief for these bodies is
-    that they DEGENERATE GRACEFULLY at one device — every anti-tautology
-    self-assertion in them still fires at 1x1, and the geometry each cell
-    actually ran on is in its return value and in the report.
+    ``p*q`` must equal ``jax.process_count()`` — the phdf5 FFI's own guard
+    (``src/ffi/io.py``: ``mesh 2x2=4 != jax.process_count()=1``), the same
+    per-PROCESS-context rule distrib_la's guard 4 states for its FFI
+    backends.  These cells only run when the transport is PRESENT
+    (``_needs_transport`` skips otherwise), and a present transport is
+    always the real one, so the emulated 4-device tier can never lawfully
+    give these bodies a 2x2: the first Perlmutter execution of this suite
+    proved it (JID 56447670, all five cells red on exactly that guard).
+    The 2x2 answers come from the CLI leg under ``srun -n 4``, where
+    ``process_count`` really is 4 — and if pytest itself is ever launched
+    under ``srun -n 4``, this function builds the 2x2 lawfully.
+
+    The bodies DEGENERATE GRACEFULLY at 1x1 by design: every
+    anti-tautology self-assertion still fires, and the geometry each cell
+    actually ran on is in its return value and in the report
+    (``hostile_*`` flags are false at 1x1 so a 1x1 record can never be
+    read as a 2x2 result).
     """
     import jax
     from jax.sharding import Mesh
+    n_proc = jax.process_count()
     devs = jax.devices("cpu")
-    n = 4 if len(devs) >= 4 else 1
-    px, py = (2, 2) if n == 4 else (1, 1)
+    if n_proc == 4 and len(devs) >= 4:
+        n, (px, py) = 4, (2, 2)
+    else:
+        n, (px, py) = 1, (1, 1)
     return Mesh(np.asarray(devs[:n]).reshape(px, py), ("x", "y"))
 
 
@@ -648,19 +661,33 @@ def test_the_per_rank_comparator_can_fail():
 
 
 def test_the_emulated_tier_really_gets_four_devices():
-    """L-b's own gate: when four host devices exist, the mesh IS 2x2.
+    """L-b's own gate, rewritten by its first Perlmutter run.
 
     ``--xla_force_host_platform_device_count`` is read at the FIRST jax
     import in a process and never again, so the emulated tier is not "on or
     off" — it is "did the service conftest load before anything imported
-    jax".  In the full-suite run it did not, the flag is inert, and this
-    cell skips.  Under ``pytest services/zeta_loader/tests`` it did, and
-    this asserts the flag actually took rather than silently leaving every
-    cell above at 1x1.
+    jax".  This half still holds and is still asserted: under
+    ``pytest services/zeta_loader/tests`` the flag takes and FOUR host
+    devices exist.
+
+    What the first Perlmutter execution falsified (JID 56447670, all five
+    transport cells red) is the leap from "four devices" to "a 2x2 mesh
+    for the TRANSPORT cells": the phdf5 FFI carries a per-process MPI
+    context and refuses ``p*q != jax.process_count()`` at open — the same
+    rule distrib_la's guard 4 states.  Emulated devices never satisfy it.
+    So the gate now pins BOTH halves of the corrected contract: the flag
+    took (4 devices), and ``_pytest_mesh`` still answers 1x1 in this
+    single process — because a 2x2 it handed out here would be refused by
+    the very transport these cells exist to drive.  The 2x2 answers come
+    from the CLI leg under ``srun -n 4``.
     """
     from lxkit.testing import require_devices
-    require_devices(4, "cpu")
-    assert _mesh_shape(_pytest_mesh()) == (2, 2)
+    import jax
+    require_devices(4, "cpu")            # the flag took: 4 devices exist…
+    if jax.process_count() == 1:         # …and the mesh stays lawful anyway.
+        assert _mesh_shape(_pytest_mesh()) == (1, 1)
+    else:
+        assert _mesh_shape(_pytest_mesh()) == (2, 2)
 
 
 def test_the_cli_cells_are_all_reachable():

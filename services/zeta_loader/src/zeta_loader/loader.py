@@ -604,11 +604,17 @@ class ZetaLoader:
                 "production does, because V_q is bilinear in ζ and the "
                 "unfold is a centroid double-permute there.")
 
-        _ = self.slab_io  # refuse now, naming header-only vs closed
-
         # --- μ axis ---------------------------------------------------
+        # BEFORE the transport check: the μ refusal is a fact about the
+        # REQUEST, and the ordering rule above says request facts come
+        # first.  Until 2026-08-07 this ran after the ``slab_io`` access,
+        # so at ``mesh=None`` a strided μ slice reported the TRANSPORT
+        # refusal instead of the stride — found by the suite's own
+        # documents-current-behaviour cell, which now pins this order.
         mu_lo, mu_hi = self._resolve_mu(mu)
         mu_count = mu_hi - mu_lo
+
+        _ = self.slab_io  # refuse now, naming header-only vs closed
 
         if sharding is None:
             sharding = P(None, ('x', 'y'), None)

@@ -168,6 +168,46 @@ def test_the_format_surface_is_fully_functional_with_no_lorrax():
     assert run.loaded == () and run.reachable == ()
 
 
+def test_the_format_surface_needs_no_jax():
+    """The whole format surface runs before jax is ever imported — and
+    touching the reader is exactly what imports it.
+
+    Measured, not hypothetical (step-4 lesson): the first login-node
+    diagnostic against a production ζ file could not even ``import
+    zeta_loader`` to reach the probe, because the loader's module-scope
+    jax import came in through ``__init__``.  Login-node ``python3`` has
+    numpy + h5py and NO jax, and the probe/append pair is pure h5py+numpy
+    — so the door now defers the loader (PEP 562) and this cell pins both
+    halves: the format surface leaves ``sys.modules`` jax-free, and the
+    ``ZetaLoader`` attribute is still served (its access is what pays the
+    jax import, asserted here on a stack that has jax so the positive
+    control can run).
+    """
+    _needs_jax()
+    preamble = (
+        "import sys, os, tempfile\n"
+        "import numpy as np\n"
+        "import zeta_loader as ZL\n"
+        "assert 'jax' not in sys.modules, 'import zeta_loader pulled jax'\n"
+        "tmp = tempfile.mkdtemp()\n"
+        "z = os.path.join(tmp, 'zeta_q.h5')\n"
+        "import zeta_synth as Z\n"
+        "Z.build_gflat(z, n_q=2, n_rmu=3, ngkmax=4)\n"
+        "p = ZL.probe_zeta_file(z)\n"
+        "assert p.readable and p.dataset_name == 'zeta_q_G'\n"
+        "ZL.write_g0_mu(z, np.zeros((2, 3), complex), n_rmu_expected=3)\n"
+        "assert 'jax' not in sys.modules, 'the format surface pulled jax'\n"
+        # the positive control: the reader is lazy, not gone.
+        "cls = ZL.ZetaLoader\n"
+        "assert cls.__name__ == 'ZetaLoader'\n"
+        "assert 'jax' in sys.modules, 'ZetaLoader access should import jax'\n"
+    )
+    run = import_isolation("zeta_loader", _lorrax_roots(), src_dir=_SVC_SRC,
+                           deps=_DEPS, extra_path=[_LXKIT_SRC, _TESTS],
+                           check_path=True, preamble=preamble)
+    assert run.loaded == () and run.reachable == ()
+
+
 def test_the_data_path_refuses_by_naming_the_missing_host_tree_module():
     """THE LAZY-REFUSAL LEG.  A REAL ζ file, and a construction that refuses.
 

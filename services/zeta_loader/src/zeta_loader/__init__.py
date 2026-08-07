@@ -89,11 +89,33 @@ dependencies.
 from __future__ import annotations
 
 from zeta_loader.format import ZetaFileProbe, probe_zeta_file, write_g0_mu
-from zeta_loader.loader import ZetaLoader
 
 __all__ = [
     # the reader
     "ZetaLoader",
-    # the format surface (pure h5py + numpy; works with no lorrax)
+    # the format surface (pure h5py + numpy; works with no lorrax, no jax)
     "probe_zeta_file", "ZetaFileProbe", "write_g0_mu",
 ]
+
+
+def __getattr__(name: str):
+    """Lazy door for the reader: ``ZetaLoader`` imports jax; the format
+    surface does not, and a jax-free stack must be able to use it.
+
+    Measured, not hypothetical: the first login-node diagnostic against a
+    production ζ file (2026-08-07, the fit-leg) could not even ``import
+    zeta_loader`` to reach :func:`probe_zeta_file` — plain ``python3``
+    there has numpy + h5py but no jax, and the loader's module-scope jax
+    import came in through this ``__init__``.  PEP 562: the format surface
+    imports eagerly above; the loader class materialises on first
+    attribute access.  ``from zeta_loader import ZetaLoader`` behaves
+    exactly as before on any stack that has jax.
+    """
+    if name == "ZetaLoader":
+        from zeta_loader.loader import ZetaLoader
+        return ZetaLoader
+    raise AttributeError(f"module 'zeta_loader' has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(__all__)
