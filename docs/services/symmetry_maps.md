@@ -178,13 +178,15 @@ Everything below is measured and is quoted, not re-run.
 | leg | result | wall |
 |---|---|---|
 | WSL venv, jax 0.9.1, `JAX_PLATFORMS=cpu JAX_ENABLE_X64=1` | 164 passed / 1 xfailed | 18.2 s |
-| Perlmutter container, jax 0.7.0, `lx test` | 163 passed / 1 skipped / 1 xfailed | 39.83 s |
+| Perlmutter container, jax 0.7.0, `lx test` | 163 passed / 1 skipped / 1 xfailed | 42.58 s |
 
 The one skip is the WSL-kernel row in skip-honesty, correctly refusing to
 assert about a machine it is not on; the xfail is the sharded-NaN
 reduction (see `tests/KNOWN_FAILURES.md`). The two legs differ by one cell
 and by a factor of two in wall time, which is the container's import cost,
-not the package's.
+not the package's. The same Perlmutter leg read 39.83 s one commit earlier
+(`1e90726`) on identical cell counts — quote the run-to-run band, not a
+single second.
 
 **`SymMaps(wfn)` construction**, before/after the dead parent-map drop
 (`1e90726`; 9 runs per deck, best-of, one process per arm, uncontended,
