@@ -137,9 +137,13 @@ def test_the_probe_is_not_consulted_when_the_env_already_says():
 # with a hole in it.
 
 def _record_ffi_loader_open_order(monkeypatch, *, disable_rule=False,
-                                  present=("CUDA", "cpu")):
+                                  present=("CUDA", "cpu"), cuda_capable=True):
     """``ffi_loader.get_lib('cpu')`` with every native step stubbed; returns
-    the platform library paths it dlopened, in order."""
+    the platform library paths it dlopened, in order.
+
+    ``cuda_capable`` stands in for the process's platform — the cells that
+    own the PREDICATE construct its inputs directly (below); these own the
+    ORDER."""
     import ctypes
     import pathlib
     from ffi.common import ffi_loader as F
@@ -169,6 +173,7 @@ def _record_ffi_loader_open_order(monkeypatch, *, disable_rule=False,
     monkeypatch.setattr(ctypes, "CDLL", _fake_cdll)
     monkeypatch.setattr(F, "_set_argtypes", lambda lib, platform: None)
     monkeypatch.setattr(F, "_register_ffi_targets", lambda lib, plat: None)
+    monkeypatch.setattr(F, "_process_can_use_cuda", lambda: bool(cuda_capable))
     if disable_rule:
         monkeypatch.setattr(F, "_open_cuda_before_host", lambda: None)
 
@@ -177,13 +182,13 @@ def _record_ffi_loader_open_order(monkeypatch, *, disable_rule=False,
 
 
 def test_lorraxs_loader_opens_the_cuda_library_before_the_host_one(monkeypatch):
-    """The load-order rule, in the loader that lost the race.
+    """CUDA-CAPABLE ARM: the load-order rule, in the loader that lost the race.
 
     RED ARM: disable ``_open_cuda_before_host`` and only the host library is
     opened — which is the process state that produced
     ``blas::get_device_count()=0``.
     """
-    opened = _record_ffi_loader_open_order(monkeypatch)
+    opened = _record_ffi_loader_open_order(monkeypatch, cuda_capable=True)
     assert opened == ["/fixture/liblorrax_ffi.so",
                       "/fixture/liblorrax_ffi_host.so"], opened
 
@@ -194,8 +199,63 @@ def test_the_lorrax_loader_open_order_cell_can_fail(monkeypatch):
     assert opened == ["/fixture/liblorrax_ffi_host.so"], opened
 
 
+def test_a_cpu_platform_process_opens_only_the_host_library(monkeypatch):
+    """CPU-PLATFORM ARM: B1, in the loader that carries it for lorrax.
+
+    A process whose jax platform is cpu has no CUDA SLATE handler for the
+    order to protect, and dlopening the CUDA library there brought a second
+    libslate/libblaspp AND a second phdf5 into it: ``tests/test_file_io.py``
+    on a CPU-platform Perlmutter leg went 42 passed / 1 skipped at the two
+    commits before the rule to three failures and ``Fatal Python error:
+    Aborted`` at the commit that added it.
+    """
+    opened = _record_ffi_loader_open_order(monkeypatch, cuda_capable=False)
+    assert opened == ["/fixture/liblorrax_ffi_host.so"], (
+        f"a CPU-platform process dlopened {opened} — it must open the host "
+        f"library and NOTHING else")
+
+
+def test_the_lorrax_loader_cpu_platform_cell_can_fail(monkeypatch):
+    """The FALSE case: same fixture, capability gate forced TRUE, and the
+    CUDA library IS opened first.  Without this twin the cell above would
+    stay green on any machine with no CUDA library to find — which is every
+    WSL leg, i.e. green for a reason unrelated to the rule."""
+    opened = _record_ffi_loader_open_order(monkeypatch, cuda_capable=True)
+    assert opened == ["/fixture/liblorrax_ffi.so",
+                      "/fixture/liblorrax_ffi_host.so"], opened
+
+
 def test_a_cpu_only_tree_pays_nothing_for_the_rule(monkeypatch):
     """No CUDA library to locate: the host library still loads and the
     refusal is swallowed, so every CPU-only tree is untouched."""
     opened = _record_ffi_loader_open_order(monkeypatch, present=("cpu",))
     assert opened == ["/fixture/liblorrax_ffi_host.so"], opened
+
+
+@pytest.mark.parametrize("env,devices,want", [
+    ({"JAX_PLATFORMS": "cpu"},      True,  False),   # the leg B1 killed
+    ({"JAX_PLATFORMS": "cpu,cuda"}, True,  False),
+    ({"JAX_PLATFORMS": "cuda,cpu"}, True,  True),
+    ({"JAX_PLATFORMS": "gpu"},      True,  True),
+    ({},                            True,  True),    # every `lx test` leg
+    ({},                            False, False),   # login node, WSL
+    ({"CUDA_VISIBLE_DEVICES": ""},  True,  False),
+    ({"CUDA_VISIBLE_DEVICES": "0"}, True,  True),
+])
+def test_the_lorrax_loader_cuda_capability_gate(monkeypatch, env, devices, want):
+    """The predicate, every input constructed.
+
+    Both loaders carry their own copy — the service may not import lorrax —
+    so both get their own table, and the two tables are the same table.
+    ``jax.default_backend()`` is deliberately NOT the signal: it
+    INITIALIZES the XLA backend, so asking it inside a loader call would
+    let the loader decide the process's platform instead of reading it.
+    """
+    from ffi.common import ffi_loader as F
+
+    monkeypatch.delenv("JAX_PLATFORMS", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(F, "_nvidia_device_visible", lambda: bool(devices))
+    assert F._process_can_use_cuda() is want

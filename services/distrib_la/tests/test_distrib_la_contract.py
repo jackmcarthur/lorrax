@@ -1431,10 +1431,26 @@ def test_w_dyson_distributed_refusal_reaches_the_caller():
 #   CUDA opened first  ->  slate/install/.../libblaspp.so.2, returns 1
 #
 # ``distrib_la.loader`` (and lorrax's ``ffi.common.ffi_loader``, which opens
-# the same two files) therefore opens CUDA before cpu.  These four cells are
-# that rule and its two FALSE cases.
+# the same two files) therefore opens CUDA before cpu -- IN A PROCESS THAT
+# CAN USE CUDA.
+#
+# THE OTHER ARM, and it is not symmetric with the first.  A CPU-platform
+# process has no CUDA SLATE handler for the order to protect, and opening
+# the CUDA library there costs it its host phdf5 path: measured
+# 2026-08-07 (KNOWN_FAILURES B1), ``tests/test_file_io.py`` under
+# ``JAX_PLATFORMS=cpu`` went 42 passed / 1 skipped at the two commits before
+# the rule to three failures and ``Fatal Python error: Aborted`` at the
+# commit that added it, printing ``offset_base=[0,0,0,4596944070643295330]``
+# -- a float64 read as int64, one library's handler on the other's argument
+# layout.  So:
+#
+#   CUDA-capable process  ->  CUDA first, then host
+#   CPU-platform process  ->  host only, CUDA never dlopened
+#
+# Both arms below, each with the FALSE case that constructs the other.
 
-def _drive_open_order(monkeypatch, *, disable_rule=False, present=("CUDA", "cpu")):
+def _drive_open_order(monkeypatch, *, disable_rule=False, present=("CUDA", "cpu"),
+                      cuda_capable=True):
     """Run ``get_lib('cpu')`` with every native step stubbed out, and return
     the platform library paths it dlopened, IN ORDER.
 
@@ -1442,6 +1458,13 @@ def _drive_open_order(monkeypatch, *, disable_rule=False, present=("CUDA", "cpu"
     registration) because the question is only which FILE ld.so sees first;
     stubbing keeps the cell pure enough to run on the WSL box in
     milliseconds, which is where a load-order regression should be caught.
+
+    ``cuda_capable`` stands in for the process's platform.  The predicate
+    itself reads the environment and the ``/dev`` nodes, neither of which a
+    pure cell can arrange honestly on an arbitrary machine -- so the cells
+    that own the PREDICATE construct its inputs directly (see
+    ``test_the_cuda_capability_gate_reads_...`` below) and the cells that
+    own the ORDER stub it.
     """
     import pathlib
     from distrib_la import loader as L
@@ -1472,6 +1495,7 @@ def _drive_open_order(monkeypatch, *, disable_rule=False, present=("CUDA", "cpu"
     monkeypatch.setattr(L, "_declare_cusolvermp", lambda lib: None)
     monkeypatch.setattr(L, "_declare_slate", lambda lib: None)
     monkeypatch.setattr(L, "_register_ffi_targets", lambda lib, platform: None)
+    monkeypatch.setattr(L, "_process_can_use_cuda", lambda: bool(cuda_capable))
     if disable_rule:
         monkeypatch.setattr(L, "_open_cuda_before_host", lambda: None)
 
@@ -1480,7 +1504,7 @@ def _drive_open_order(monkeypatch, *, disable_rule=False, present=("CUDA", "cpu"
 
 
 def test_the_host_library_is_never_opened_before_the_cuda_one(monkeypatch):
-    """Asking for the cpu library must open the CUDA one FIRST.
+    """CUDA-CAPABLE ARM: asking for the cpu library opens the CUDA one FIRST.
 
     Not a warm-up and not a preference: whichever platform library is
     dlopened first wins ``libblaspp.so.2`` for the whole process, and only
@@ -1488,7 +1512,7 @@ def test_the_host_library_is_never_opened_before_the_cuda_one(monkeypatch):
     ``slate::Target::HostTask`` and never ask for a device count; the CUDA
     ones refuse without one).
     """
-    opened = _drive_open_order(monkeypatch)
+    opened = _drive_open_order(monkeypatch, cuda_capable=True)
     assert opened == ["/fixture/liblorrax_ffi.so",
                       "/fixture/liblorrax_ffi_host.so"], (
         f"the two platform libraries were opened in the order {opened} -- the "
@@ -1497,7 +1521,7 @@ def test_the_host_library_is_never_opened_before_the_cuda_one(monkeypatch):
 
 
 def test_the_open_order_cell_can_fail(monkeypatch):
-    """The FALSE case of the cell above, constructed.
+    """The FALSE case of the CUDA-capable arm, constructed.
 
     With ``_open_cuda_before_host`` disabled, ``get_lib('cpu')`` opens the
     host library and NOTHING else -- which is exactly the process state that
@@ -1509,6 +1533,39 @@ def test_the_open_order_cell_can_fail(monkeypatch):
     assert opened == ["/fixture/liblorrax_ffi_host.so"], opened
 
 
+def test_a_cpu_platform_process_never_opens_the_cuda_library(monkeypatch):
+    """CPU-PLATFORM ARM: the pre-open must not fire at all.
+
+    The regression this pins is B1: with both libraries open in a process
+    whose jax platform is cpu, the host phdf5 handlers are answered across
+    the SONAME boundary and ``tests/test_file_io.py`` aborts.  A
+    CPU-platform process has no CUDA SLATE handler to protect, so opening
+    the CUDA library buys it nothing and costs it that.
+    """
+    opened = _drive_open_order(monkeypatch, cuda_capable=False)
+    assert opened == ["/fixture/liblorrax_ffi_host.so"], (
+        f"a CPU-platform process dlopened {opened} -- it must open the host "
+        f"library and NOTHING else: the CUDA library brings a second "
+        f"libslate/libblaspp AND a second phdf5 into a process that can "
+        f"never call a CUDA handler, and the host slab reads then come back "
+        f"with a float64 decoded as int64 "
+        f"(offset_base=[0,0,0,4596944070643295330]) or abort outright")
+
+
+def test_the_cpu_platform_cell_can_fail(monkeypatch):
+    """The FALSE case of the CPU-platform arm, constructed.
+
+    Same fixture, capability gate forced TRUE: the CUDA library IS opened
+    first.  Without this twin, the cell above would keep passing on a
+    machine that simply has no CUDA library to find, which is every WSL leg
+    -- i.e. it would be green for a reason that has nothing to do with the
+    rule.
+    """
+    opened = _drive_open_order(monkeypatch, cuda_capable=True)
+    assert opened == ["/fixture/liblorrax_ffi.so",
+                      "/fixture/liblorrax_ffi_host.so"], opened
+
+
 def test_a_missing_cuda_library_is_not_an_error_for_the_host_path(monkeypatch):
     """CPU-only trees pay nothing.  ``_open_cuda_before_host`` is best
     effort by construction: with no CUDA library to locate, the host library
@@ -1516,6 +1573,38 @@ def test_a_missing_cuda_library_is_not_an_error_for_the_host_path(monkeypatch):
     that only ever wanted the host path (every WSL leg does this)."""
     opened = _drive_open_order(monkeypatch, present=("cpu",))
     assert opened == ["/fixture/liblorrax_ffi_host.so"], opened
+
+
+@pytest.mark.parametrize("env,devices,want", [
+    # JAX_PLATFORMS decides first, because it forbids outright.
+    ({"JAX_PLATFORMS": "cpu"},                        True,  False),
+    ({"JAX_PLATFORMS": "cpu,cuda"},                   True,  False),
+    ({"JAX_PLATFORMS": "cuda,cpu"},                   True,  True),
+    ({"JAX_PLATFORMS": "gpu"},                        True,  True),
+    # Unset (the -m distrib_la leg, and every lx test leg) -> the hardware.
+    ({},                                              True,  True),
+    ({},                                              False, False),
+    # An explicit empty mask is "no GPU, deliberately".
+    ({"CUDA_VISIBLE_DEVICES": ""},                    True,  False),
+    ({"CUDA_VISIBLE_DEVICES": "0"},                   True,  True),
+])
+def test_the_cuda_capability_gate_reads_the_env_and_the_devices(
+        monkeypatch, env, devices, want):
+    """The predicate itself, every input constructed.
+
+    The two loaders diverge on everything except this decision, so it is
+    pinned where it can be driven rather than inferred from an open order.
+    ``devices`` stubs the ``/dev/nvidia*`` half so the same table gives the
+    same answers on the WSL box, on a login node and inside the container.
+    """
+    from distrib_la import loader as L
+
+    monkeypatch.delenv("JAX_PLATFORMS", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(L, "_nvidia_device_visible", lambda: bool(devices))
+    assert L._process_can_use_cuda() is want
 
 
 def _blaspp_in_charge():

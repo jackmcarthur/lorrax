@@ -73,6 +73,7 @@ level at open time.
 from __future__ import annotations
 
 import ctypes
+import glob
 import os
 import sys
 from pathlib import Path
@@ -537,7 +538,8 @@ def has_phdf5_write(platform: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# THE TWO PLATFORM LIBRARIES SHARE THEIR SLATE.  Open CUDA first or lose it.
+# THE TWO PLATFORM LIBRARIES SHARE THEIR SLATE.  Open CUDA first — IN A
+# PROCESS THAT CAN USE CUDA, and in no other.
 # ---------------------------------------------------------------------------
 # The target tables above say the two .so's "can co-exist under RTLD_GLOBAL"
 # because only their C++ SYMBOLS differ.  That is true of the symbols and
@@ -562,21 +564,140 @@ def has_phdf5_write(platform: str) -> bool:
 # a host target (a phdf5 host read, an mklfft probe) gets the same
 # device-less SLATE, and the message names a device count nobody set.
 #
-# ONE SAFE ORDER EXISTS.  The host SLATE handlers run
-# ``slate::Target::HostTask`` and never consult ``get_device_count``, so a
-# CUDA blaspp in charge costs the host path nothing; the reverse costs the
-# CUDA path everything.  ``distrib_la.loader`` carries the same rule for the
-# libraries it opens — the two loaders share the FILES, so both have to.
+# ONE SAFE ORDER EXISTS -- AMONG PROCESSES THAT OPEN BOTH.  The host SLATE
+# handlers run ``slate::Target::HostTask`` and never consult
+# ``get_device_count``, so a CUDA blaspp in charge costs the host path
+# nothing; the reverse costs the CUDA path everything.
+# ``distrib_la.loader`` carries the same rule for the libraries it opens --
+# the two loaders share the FILES, so both have to.
 #
-# Best effort: no CUDA library built, or one that cannot load on this node,
-# leaves the process untouched and is tried once.
+# AND THE CHEAPER ORDER IS TO OPEN ONLY ONE.  MEASURED, Perlmutter
+# 2026-08-07 (KNOWN_FAILURES B1): a pre-open with no CUDA arm to protect
+# costs a CPU-platform process its host phdf5 path outright.
+# ``tests/test_file_io.py`` on a CPU-platform leg (JAX_PLATFORMS=cpu, four
+# emulated host devices, same pins throughout):
+#
+#   96a6399 branch base                    42 passed / 1 skipped
+#   b3f3675 the commit before this rule     42 passed / 1 skipped
+#   32e61fe this rule, unconditional        3 failed, Fatal Python error: Aborted
+#
+# and where it refused instead of aborting it printed
+#
+#   phdf5 read: logical slab out of bounds
+#     extent=[2,4,1,6]
+#     offset_base=[0,0,0,4596944070643295330]
+#     valid_shape=[3,6,6,4609783128842618077]
+#
+# -- IEEE-754 float64 bit patterns (~0.19, ~1.87) decoded as int64: one
+# library's handler reading the other's argument layout.  See INTERPOSITION
+# below; that cross-wiring is a defect of its own and this rule must not
+# hand it any new processes.
+#
+# SO THE PRE-OPEN IS TWO-ARMED, on the one question that decides whether
+# there is a CUDA handler in this process for the order to protect:
+#
+#   CUDA-capable process  ->  CUDA first, then host.  SLATE survives.
+#   CPU-platform process  ->  host only.  The CUDA library is NEVER dlopened,
+#                             so there is no second libslate/libblaspp, no
+#                             second phdf5, and nothing to cross-wire.
+#
+# FALSIFIED at HEAD before the fix, on the same leg: point ``LORRAX_FFI_SO``
+# at a path that cannot be dlopened, so the best-effort ``get_lib("CUDA")``
+# raises and the process stays host-only -- 42 passed / 1 skipped, byte for
+# byte the base result, against a 300 s wall with the CUDA .so pinned.  That
+# arm is what this gate makes deliberate instead of accidental.
+#
+# Best effort on top: no CUDA library built, or one that cannot load on this
+# node, leaves the process untouched and is tried once.
+#
+# ---------------------------------------------------------------------------
+# INTERPOSITION -- THE LATENT DEFECT UNDERNEATH, registered not chased
+# ---------------------------------------------------------------------------
+# ``libslate``/``libblaspp`` are not the only SONAME-scale collision between
+# the two files.  MEASURED 2026-08-07, ``nm -D --defined-only`` on the two
+# pinned builds (deployed device lib; build_host_h200, md5 4c4422b8...):
+# SIXTEEN symbol names are DEFINED BY BOTH -- the nine C-linkage
+# ``lrx_phdf5_*`` / ``lrx_slate_*`` entry points and seven mangled
+# ``lorrax_ffi::phdf5::{open_ctx,close_ctx,ensure_dataset,ensure_read_buf,
+# ensure_pinned,ensure_mpi_initialized,open_dataset_ro}``.  Both are dlopened
+# RTLD_GLOBAL, so once both are open the FIRST one answers those names for
+# BOTH -- including for the other library's own internal calls.
+#
+# And they are not the same functions.  ``cpp/phdf5/ctx.h`` compiles
+# ``PhdfCtx`` with the CUDA stream / event / pinned-buffer members under
+# ``#ifndef LORRAX_FFI_NO_CUDA``; the host build defines that macro and drops
+# them.  One C++ type name, two struct layouts, both exporting
+# ``open_ctx(...) -> PhdfCtx*`` -- a cross-.so ODR violation.  A handler from
+# one build handed a ``PhdfCtx*`` minted by the other reads its fields at the
+# wrong offsets, which is what the float64-as-int64 ``offset_base`` above and
+# the ``phdf5 read: ctx_handle is null`` in the xdist arm both look like.
+#
+# NOT FIXED HERE and not chased: the fix is in C++ (distinct symbol
+# namespaces per build, or a hidden-visibility phdf5 core), it is not this
+# branch's regression, and the gate above keeps it latent by never putting a
+# host-only process into the mixed state.  It is NOT latent for a
+# CUDA-capable process that also does host phdf5 work -- there both libraries
+# are legitimately open.  Registered in tests/KNOWN_FAILURES.md as L1.
 _CUDA_FIRST_TRIED = False
 
 
+def _nvidia_device_visible() -> bool:
+    """A GPU device node this process can see.
+
+    Split out from :func:`_process_can_use_cuda` so its cells can construct
+    both answers without monkeypatching ``glob``/``os.path`` for the whole
+    session -- the hardware half of the question is the one a pure test
+    cannot arrange for real.
+    """
+    return (bool(glob.glob("/dev/nvidia[0-9]*"))
+            or os.path.exists("/dev/nvidiactl"))
+
+
+def _process_can_use_cuda() -> bool:
+    """Can THIS process run CUDA work at all?  Environment only.
+
+    TRUTHFUL AT LOAD TIME is the whole requirement, and it rules out the
+    obvious answer: ``jax.default_backend()`` INITIALIZES the XLA backend
+    (the reason :func:`get_lib` takes an explicit platform at all), so
+    asking it from inside a loader call would make the loader decide the
+    process's backend.  Both signals below are ones JAX itself acts on and
+    both are readable before any backend exists:
+
+      * ``JAX_PLATFORMS`` -- :func:`platform_from_env` resolves it exactly
+        as JAX picks its default backend (first entry wins).  ``cpu`` there
+        forbids a GPU backend outright, so no CUDA handler in this process
+        can ever run and there is nothing for the load order to protect.
+      * A VISIBLE NVIDIA DEVICE.  ``CUDA_VISIBLE_DEVICES=""`` is this
+        tree's spelling of "no GPU, deliberately", and JAX's own
+        ``backends()`` skips cuda when no device node is visible
+        (``xla_bridge.py``: ``if platform == "cuda" and not
+        has_visible_nvidia_gpu(): continue``).  Same two signals in the
+        same order as ``runtime._gpu_is_present`` -- the call this tree
+        already makes, made the same way, so the two cannot drift into
+        disagreeing about what platform a process is.
+
+    Deliberately NOT a probe of the library.  "Is the CUDA .so loadable
+    here" is a different question and the best-effort ``try`` in
+    :func:`_open_cuda_before_host` is what answers it.
+    """
+    if platform_from_env(default="CUDA") != "CUDA":
+        return False
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd is not None and cvd.strip() == "":
+        return False
+    return _nvidia_device_visible()
+
+
 def _open_cuda_before_host() -> None:
-    """Win the ``libslate``/``libblaspp`` SONAME for the CUDA build."""
+    """Win the ``libslate``/``libblaspp`` SONAME for the CUDA build.
+
+    Only where there is a CUDA build in the running to win it: a
+    CPU-platform process opens the host library and nothing else.
+    """
     global _CUDA_FIRST_TRIED
     if _CUDA_FIRST_TRIED or "CUDA" in _LIBS:
+        return
+    if not _process_can_use_cuda():
         return
     _CUDA_FIRST_TRIED = True
     try:
@@ -596,9 +717,11 @@ def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
     ``platform`` is "CUDA" or "cpu"; ``None`` follows the JAX default
     backend, so wrapper call sites stay platform-agnostic.
 
-    Opening the ``cpu`` library opens the ``CUDA`` one first when there is
-    one — see the SONAME note above; it is a correctness requirement, not a
-    warm-up.
+    In a CUDA-CAPABLE process, opening the ``cpu`` library opens the
+    ``CUDA`` one first — see the SONAME note above; it is a correctness
+    requirement, not a warm-up.  In a CPU-platform process it does NOT:
+    there is no CUDA handler to protect and the mixed load costs that
+    process its host phdf5 path.
     """
     if platform is None:
         platform = _default_platform()

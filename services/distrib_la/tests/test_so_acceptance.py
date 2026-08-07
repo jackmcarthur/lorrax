@@ -288,10 +288,10 @@ def test_check_5_the_two_libraries_still_share_their_slate_soname():
     This cell fails the day somebody gives the two stacks distinct
     sonames, or statically links one of them, or drops SLATE from the host
     build.  That is the GOOD failure: it is the signal to delete
-    ``_open_cuda_before_host`` from both loaders and the four cells in
-    test_distrib_la_contract.py that guard it, rather than leave a
-    workaround nobody can date.  Read the failure message before deleting
-    anything.
+    ``_open_cuda_before_host`` from both loaders and the cells under 'THE
+    SONAME RACE' in test_distrib_la_contract.py that guard it, rather than
+    leave a workaround nobody can date.  Read the failure message before
+    deleting anything.
     """
     shared = sorted(set(_readelf_needed(_pinned("cpu")))
                     & set(_readelf_needed(_pinned("CUDA"))))
@@ -302,5 +302,6 @@ def test_check_5_the_two_libraries_still_share_their_slate_soname():
         "distrib_la.loader._open_cuda_before_host enforces was written for "
         "exactly that collision and is now dead weight -- delete it from "
         "BOTH loaders (services/distrib_la/src/distrib_la/loader.py and "
-        "src/ffi/common/ffi_loader.py) together with the four cells under "
-        "'THE SONAME RACE' in test_distrib_la_contract.py.")
+        "src/ffi/common/ffi_loader.py) together with the cells under "
+        "'THE SONAME RACE' in test_distrib_la_contract.py and the "
+        "loader cells in tests/test_gpu_pinning.py.")
