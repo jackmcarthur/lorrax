@@ -107,6 +107,213 @@ def _resolve_against(path: str, base_dir: str) -> str:
     return path if os.path.isabs(path) else os.path.join(base_dir, path)
 
 
+# ===========================================================================
+# THE IRREDUCIBLE k-SET, AND WHAT THE UNFOLD ACTUALLY IS
+# ===========================================================================
+# ``kin_ion`` = T + V_loc + V_NL (and ``v_hartree`` = V_H) are SCALAR
+# operators built from the crystal's own potentials, so each commutes with
+# every operation of the space group AND with time reversal.  The WFN file
+# stores ψ on the IBZ only, and ψ(Sk) is *defined* — by
+# ``WfnLoader.load(k='full_bz')``, which is the only producer — as the
+# symmetry image of ψ(k_irr).  So the full-BZ table holds only ``nrk``
+# distinct matrices and computing it k by k is redundant work.
+#
+# But the symmetry table is TRS-AUGMENTED, and the two halves do NOT give
+# the same rule.  ``sym_mats_k`` is ``concat([S, -S])``: rows below
+# ``ntran`` are ordinary spatial operations, rows at or past it carry a
+# factor of time reversal.
+#
+#   UNITARY ROW (sym_idx < ntran).  ψ_n(Sk) = R ψ_n(k_irr) with R unitary
+#   (τ phase, umklapp and the spinor SU(2) all inside R), so
+#
+#       ⟨m,Sk|O|n,Sk⟩ = ⟨m,k_irr|R† O R|n,k_irr⟩ = ⟨m,k_irr|O|n,k_irr⟩
+#
+#   as a MATRIX, not merely isospectral: the same R acts on bra and ket
+#   and O commutes with it, so no rotation, no phase and no
+#   degenerate-subspace unitary is left over.  A pure copy.
+#
+#   ANTIUNITARY ROW (sym_idx >= ntran).  The image is Θ ψ with Θ = (spatial
+#   part)∘(time reversal), and Θ is antiunitary: ⟨Θa|Θb⟩ = conj⟨a|b⟩.
+#   With [O, Θ] = 0,
+#
+#       ⟨Θm|O|Θn⟩ = ⟨Θm|Θ(O n)⟩ = conj⟨m|O|n⟩
+#
+#   — the ELEMENT-WISE conjugate of the parent's matrix, not a copy of it.
+#   (For an exactly Hermitian O that equals the transpose, but the
+#   conjugate is what the derivation gives and what survives the operand
+#   being Hermitian only to round-off.)
+#
+# Hence the unfold is a gather PLUS a conjugation on the time-reversed
+# rows, which is exactly what ``common.symmetry_maps.star_broadcast``
+# does; this module calls it rather than re-deriving the rule.
+#
+# A CAVEAT THAT COSTS NOTHING TO STATE.  The predicate below is
+# ``sym_idx_k >= ntran``, i.e. "is this row time-reversed", but the
+# quantity that actually governs the conjugation is whether the row and
+# its REFERENCE differ in TRS-ness.  The two coincide here because the
+# reference is the file's own IBZ slab, read verbatim with no symmetry
+# operation applied at all — the representative is untransformed by
+# construction.  It would stop coinciding the moment a representative
+# were itself a time-reversed row.
+#
+# AND A WARNING ABOUT VALIDATING THIS.  A cell with inversion symmetry
+# needs no time-reversal rows to cover its mesh, so its ``sym_idx_k``
+# contains none and it cannot exercise the antiunitary branch at all.
+# Agreement measured on such a system says nothing whatever about the
+# conjugation; it has to be checked on a deck that actually has TRS rows.
+#
+# Nor does a within-star spread test say anything: this routine writes the
+# star members as exact copies (up to the conjugation), so the spread is
+# identically zero whether the unfold is right or wrong — a broadcast that
+# wrote ONE matrix everywhere would score just as perfectly.  The checks
+# that CAN fail are a regenerated table diffed element-by-element against
+# one the full-BZ path produced, and a count of distinct rows.
+#
+# One more trap for whoever validates this next.  ``star_spread`` is the
+# obvious tool to reach for and it does NOT work on a TRS deck: it
+# compares each star member against the FIRST ROW of its star, and its
+# conjugation predicate is the member's own TRS flag, so whenever that
+# first row is itself time-reversed the comparison is off by a conjugate
+# and it reports a huge spread on a table that is exactly right.  The
+# predicate it wants is ``trs(member) XOR trs(ref)``.  That is not the
+# bug fixed here — the broadcast above is safe because ITS reference is
+# the untransformed IBZ slab, never a TRS row — but the two look alike
+# enough to be worth telling apart.
+
+
+def broadcast_ibz_to_full_bz(A_irr, sym):
+    """``(nrk, …) → (nk_tot, …)`` through the star map, conjugating on TRS.
+
+    Thin adapter over :func:`common.symmetry_maps.star_broadcast` so the
+    time-reversal rule has ONE implementation in the tree.  ``star_broadcast``
+    orders ``A_irr`` by ``star_select``'s first-occurrence rows; the sweeps
+    here run on ``k='ibz'``, whose rows are raw IBZ indices, so the labels
+    passed are the identity — which makes its gather ``A[irr_idx_k]``, the
+    parent map, with ``conj`` applied on the time-reversed rows.
+
+    ``n_sym_spatial`` is derived from ``sym.sym_mats_k`` (always
+    ``2·ntran`` long, both SymMaps branches) rather than from the WFN
+    header, because that is the same derivation ``unfold_psi`` uses to
+    decide which rows get conjugated when it BUILDS ψ(Sk).  Reading it
+    from the header instead would let the producer and the consumer of
+    that convention drift apart.
+
+    ``None`` in, ``None`` out: the callers below gather with
+    ``owner_only=True``, so the peers hold no table to broadcast.
+    """
+    if A_irr is None:
+        return None
+    A = np.asarray(A_irr)
+    parent = np.asarray(sym.irr_idx_k, dtype=int)
+    if int(parent.max(initial=-1)) >= A.shape[0]:
+        raise ValueError(
+            f"broadcast_ibz_to_full_bz: irr_idx_k reaches IBZ row "
+            f"{int(parent.max())} but the computed table has only "
+            f"{A.shape[0]} — the sweep did not run on the IBZ k-set.")
+    n_sym_spatial = int(np.asarray(sym.sym_mats_k).shape[0]) // 2
+    return symmetry_maps.star_broadcast(
+        A, sym.irr_idx_k, sym.sym_idx_k, n_sym_spatial,
+        irr_labels=np.arange(A.shape[0], dtype=np.int32))
+
+
+# ---- artifact provenance ---------------------------------------------------
+# A kin_ion.h5 with no stamp of WHAT it was made from is how a stale
+# committed fixture survived a month of green tests.  The two stamps below
+# are deliberately BOUNDED (see each docstring) and each says its own scope
+# in a companion attr, so no reader can over-trust them.
+
+_WFN_CHECKSUM_SCOPE = (
+    "md5 over the WFN's /mf_header group ONLY (not the psi coefficients): "
+    "every dataset in sorted-path order contributing 'path|dtype|shape' "
+    "then its C-order raw bytes")
+
+
+def _wfn_checksum(wfn_path: str) -> str:
+    """Content hash of the WFN's ``mf_header`` — ``'md5:<hex>'``.
+
+    SCOPE IS THE HEADER ALONE, and that is a bound, not an oversight:
+    hashing the coefficients means a second full read of the WFN (9 MB on
+    the Si fixture, hundreds of GB in production) for a provenance stamp.
+    The header pins the lattice, the atoms, the FFT grid, the k-set,
+    ngk/ngkmax, the whole G-sphere and every DFT eigenvalue, so every way
+    a consumer's WFN can be a *different calculation* shows up here.  What
+    it does NOT catch is the same calculation rerun to a different ψ
+    gauge.  ``wfn_checksum_scope`` is written beside it so a consumer
+    comparing hashes knows exactly which of those two questions it just
+    answered.  Never raises: a stamp that can abort a 3-hour generator is
+    worse than no stamp.
+    """
+    import hashlib
+    try:
+        h = hashlib.md5()
+        with h5py.File(wfn_path, "r") as f:
+            grp = f["mf_header"]
+            names = []
+            grp.visit(names.append)
+            for name in sorted(names):
+                obj = grp.get(name)
+                if not isinstance(obj, h5py.Dataset):
+                    continue
+                arr = np.ascontiguousarray(obj[()])
+                h.update(f"{name}|{arr.dtype.str}|{arr.shape}".encode())
+                h.update(arr.tobytes())
+        return "md5:" + h.hexdigest()
+    except Exception as exc:                                  # noqa: BLE001
+        return f"unknown:{type(exc).__name__}"
+
+
+def _generator_commit() -> str:
+    """Commit of the SOURCE TREE THIS MODULE RAN FROM — not the cwd's.
+
+    The CLI is normally invoked from a scratch work directory that is not
+    a checkout (or is a *different* one), so ``git rev-parse`` in the cwd
+    names the wrong tree or nothing at all; ``git -C <src>`` anchors it to
+    the file that is actually executing.  Falls back to
+    ``'unknown:<reason>'`` rather than an empty string or a fake hash — a
+    named reason is information, a blank attr is the failure mode this
+    stamp exists to remove.
+
+    PRICED, because a provenance stamp that costs real wall is a stamp
+    someone will delete.  MEASURED from inside the shifter container with
+    the device stack up (the tree on Lustre), against 0.03 s for the same
+    commands from a login shell:
+
+        bare fork of this process        0.181 s   (page tables of a live
+                                                    JAX runtime)
+        rev-parse --short HEAD           0.519 s
+        status --porcelain -uno          0.625 s
+        describe --always --dirty        3.583 s   <- rejected
+
+    so this pair is ~1.1 s, once, on rank 0 — three orders below the
+    generator run it stamps at any production shape, and it is charged to
+    the ``write_h5`` timing section rather than hidden in ``(untimed)``.
+    ``describe --dirty`` would have done it in one fork and costs 3× more:
+    it walks the tag graph on top of the same worktree refresh.
+
+    The ``-dirty`` suffix is not decoration.  A stamp that reads clean on
+    an edited tree is worse than no stamp, because it is the exact claim
+    the reader wanted to check.
+    """
+    import subprocess
+    src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        rev = subprocess.run(
+            ["git", "-C", src, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=60)
+        if rev.returncode != 0:
+            return "unknown:not-a-git-checkout"
+        out = rev.stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", src, "status", "--porcelain",
+             "--untracked-files=no"],
+            capture_output=True, text=True, timeout=60)
+        if dirty.returncode == 0 and dirty.stdout.strip():
+            out += "-dirty"
+        return out
+    except Exception as exc:                                  # noqa: BLE001
+        return f"unknown:{type(exc).__name__}"
+
+
 def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
                   V_H_r=None):
     """Compute T + V_loc + V_NL (+ V_H) for a single k-point.
@@ -448,7 +655,23 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                         dtype=jnp.float64)
     del rho_np
 
-    # ---- 3. ⟨mk|V_H|nk⟩: ONE k-scan, this k's bands over EVERY rank ----
+    # ---- 3. ⟨mk|V_H|nk⟩: ONE k-scan over the IRREDUCIBLE k ----
+    #
+    # THE k-SET IS THE IBZ, and the full-BZ table is the star broadcast of
+    # it — see "THE IRREDUCIBLE k-SET" at the head of this module for the
+    # derivation, including the conjugation the time-reversed rows need.
+    # V_H is a local scalar potential, so it commutes with the space group
+    # and with time reversal like any other term here.
+    #
+    # ρ ABOVE IS UNTOUCHED and stays a full-BZ sum: it is a sum over the
+    # zone, not a per-k operator, and rebuilding it from the IBZ with
+    # weights is a different (unsymmetrised) quadrature.  V_H is then a
+    # local scalar potential on the FFT grid like V_loc, so it takes the
+    # same symmetry argument as the kin+ion sweep and no other.
+    #
+    # ``tests/multi_device/mtxel_callsite_gate.py`` check 5 compares this
+    # function against a full-BZ per-k local plan at 1e-12 relative and is
+    # the one gate in the tree that would notice if it did not.
     #
     # Replaces the k-partitioned ``gather_k_blocks`` sweep.  That sweep
     # built each k's FULL-BAND FFT box on one rank (1.77 GB at b600
@@ -479,30 +702,39 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                                     blocks_to_host,
                                     local_potential_operator,
                                     sweep_matrix_elements)
-    gtab = padded_gvectors(wfn, k="full_bz")
-    psi_G = wfn.load(bands=(0, nb), k="full_bz", sharding=band_sphere_spec())
+    nk_irr = int(wfn.nkpts)
+    gtab = padded_gvectors(wfn, k="ibz")
+    psi_G = wfn.load(bands=(0, nb), k="ibz", sharding=band_sphere_spec())
     geom = SweepGeometry(mesh=mesh, fft_grid=meta.fft_grid,
                          ngkmax=int(psi_G.shape[3]), nb=nb,
-                         ns=int(psi_G.shape[2]), nk=nk,
+                         ns=int(psi_G.shape[2]), nk=nk_irr,
                          cell_volume=float(wfn.cell_volume))
-    print_fn(f"\n⟨mk|V_H|nk⟩: one k-scan over {nk} k-points, "
+    print_fn(f"\n⟨mk|V_H|nk⟩: one k-scan over {nk_irr} IRREDUCIBLE k-points "
+             f"(broadcast to {nk} full-BZ k), "
              f"{geom.nb} bands sharded over P={world}...")
     with timing.section("vh_matrix"):
         H_vh = sweep_matrix_elements(
             psi_G, operator=local_potential_operator(geom, V_H_r), geom=geom,
             gvecs=gtab.gvecs, gmask=gtab.mask,
-            box_index=wfn.box_index(k="full_bz"),
-            kvecs=np.asarray(sym.unfolded_kpts))
+            box_index=wfn.box_index(k="ibz"),
+            # ``wfn.kpoints``, NOT ``sym.unfolded_kpts``: ψ and the G-list
+            # are the raw IBZ slab, and the only k that belongs with them
+            # is the file's own — the pairing is self-consistent by
+            # definition, whatever wrapping convention the unfold uses.
+            kvecs=np.asarray(wfn.kpoints, dtype=np.float64))
         # THE BOUNDARY, stated rather than implied.  Both consumers of this
-        # function want a host ``(nk, nb, nb)``: the CLI writes it with
-        # serial h5py on rank 0 (``owner_only=True``), and
-        # ``sigma_dispatch``'s gspace route hands it to
-        # ``replicate_to_mesh`` as a replicated global operand.  Neither
-        # can take a sharded block, so the sharding is undone HERE and
-        # named.  The QSGW consumer that CAN stay sharded
+        # function want a host ``(nk_tot, nb, nb)`` — the FULL BZ, which is
+        # why the star broadcast happens here and not at either call site:
+        # the CLI writes it with serial h5py on rank 0
+        # (``owner_only=True``), and ``sigma_dispatch``'s gspace route
+        # hands it to ``replicate_to_mesh`` as a replicated global operand.
+        # Neither can take a sharded block or an IBZ-shaped one, so both
+        # the sharding and the k-set are undone HERE and named.  The QSGW
+        # consumer that CAN stay sharded
         # (``sc_iteration.rebuild_hartree_dft_basis``) calls
         # ``sweep_matrix_elements`` directly and never reaches this line.
-        return blocks_to_host(H_vh, nb=nb, owner_only=owner_only)
+        return broadcast_ibz_to_full_bz(
+            blocks_to_host(H_vh, nb=nb, owner_only=owner_only), sym)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -779,18 +1011,29 @@ def main(argv=None):
                                     blocks_to_host, kinetic_operator,
                                     local_potential_operator, sum_operators,
                                     sweep_matrix_elements, vnl_operator)
-    gtab = padded_gvectors(wfn, k="full_bz")
-    psi_G = wfn.load(bands=(0, nb_eff), k="full_bz",
+    #
+    # THE k-SET IS THE IBZ, and the written table is the star broadcast of
+    # it — see "THE IRREDUCIBLE k-SET" at the head of this module for the
+    # derivation, including the conjugation the time-reversed rows need.
+    # T, V_loc and V_NL are built from the lattice and the atomic
+    # positions, so they are exactly symmetric by construction and this is
+    # the sweep the argument fits most cleanly.  The FILE is unchanged:
+    # still (nk_tot, nb, nb), still in full-BZ order, so no consumer of
+    # ``kin_ion.h5`` sees the k-set at all.
+    nk_irr = int(wfn.nkpts)
+    gtab = padded_gvectors(wfn, k="ibz")
+    psi_G = wfn.load(bands=(0, nb_eff), k="ibz",
                      sharding=band_sphere_spec())
     geom = SweepGeometry(mesh=mesh_xy, fft_grid=meta.fft_grid,
                          ngkmax=int(psi_G.shape[3]), nb=nb_eff,
-                         ns=int(psi_G.shape[2]), nk=int(sym.nk_tot),
+                         ns=int(psi_G.shape[2]), nk=nk_irr,
                          cell_volume=float(wfn.cell_volume))
     terms = [kinetic_operator(geom, np.asarray(wfn.bdot, dtype=float)),
              local_potential_operator(geom, V_loc_r)]
     if vnl_setup is not None:
         terms.append(vnl_operator(geom, vnl_setup))
-    print0(f"\n⟨mk|T+V_loc+V_NL|nk⟩: one k-scan over {sym.nk_tot} k-points, "
+    print0(f"\n⟨mk|T+V_loc+V_NL|nk⟩: one k-scan over {nk_irr} IRREDUCIBLE "
+           f"k-points (broadcast to {sym.nk_tot} full-BZ k), "
            f"{geom.nb} bands sharded over P={world}...")
     # ONE ``kin_ion`` timing section around the WHOLE sweep, count 1 — not
     # one per k.  A per-k section would time the dispatch and attribute the
@@ -799,13 +1042,18 @@ def main(argv=None):
         H_kin_ion = sweep_matrix_elements(
             psi_G, operator=sum_operators(*terms), geom=geom,
             gvecs=gtab.gvecs, gmask=gtab.mask,
-            box_index=wfn.box_index(k="full_bz"),
-            kvecs=np.asarray(sym.unfolded_kpts))
+            box_index=wfn.box_index(k="ibz"),
+            # the file's own IBZ k, for the same reason as the V_H sweep:
+            # ψ and the G-list here are the raw IBZ slab.
+            kvecs=np.asarray(wfn.kpoints, dtype=np.float64))
         # THE BOUNDARY: the sink is a serial h5py write on rank 0, which
         # cannot take a sharded operand, so the block is gathered to the
         # owner here and nowhere else.  ``owner_only`` keeps the peers'
-        # transient at one chunk instead of the whole (nk, nb, nb).
-        kin_ion_all = blocks_to_host(H_kin_ion, nb=nb_eff, owner_only=True)
+        # transient at one chunk instead of the whole (nrk, nb, nb).  The
+        # star broadcast follows immediately, so what leaves this block is
+        # the full-BZ table the writer has always been handed.
+        kin_ion_all = broadcast_ibz_to_full_bz(
+            blocks_to_host(H_kin_ion, nb=nb_eff, owner_only=True), sym)
     del H_kin_ion, psi_G
 
     # ``owner_only``: from here on ``kin_ion_all``/``v_h_all`` exist on
@@ -854,6 +1102,26 @@ def main(argv=None):
                 ds.attrs["bispinor"] = bool(bispinor)
                 ds.attrs["nspinor"] = int(wfn.nspinor)
                 ds.attrs["fft_grid"] = np.asarray(meta.fft_grid, dtype=np.int32)
+                # ---- WHAT THIS FILE WAS MADE FROM -------------------------
+                # ``wfn_file`` above is a BASENAME: every WFN in the project
+                # is called WFN.h5, so it identifies nothing.  A kin_ion.h5
+                # that carries no content hash of its WFN and no commit of
+                # the code that wrote it cannot be told from a stale one by
+                # any test — which is how a broken committed fixture (star
+                # spread 2.7e+01 meV against this generator's 6.6e-11 meV)
+                # went a month without being noticed.  ``ngkmax`` joins them
+                # because it is the ONE shape in the sweep that comes from
+                # the WFN rather than the deck, so a mismatch localises a
+                # wrong-WFN diagnosis immediately.
+                ds.attrs["ngkmax"] = int(wfn.ngkmax)
+                ds.attrs["wfn_checksum"] = _wfn_checksum(wfn_path)
+                ds.attrs["wfn_checksum_scope"] = _WFN_CHECKSUM_SCOPE
+                ds.attrs["generator_commit"] = _generator_commit()
+                # The k-set actually COMPUTED.  The dataset is and remains
+                # full-BZ ``(nk, nb, nb)``; these say that ``nk - nrk`` of
+                # those rows are symmetry copies, not independent evaluations.
+                ds.attrs["nrk"] = int(wfn.nkpts)
+                ds.attrs["k_set_computed"] = "ibz"
                 if v_h_all is not None and not folded:
                     vh = f.create_dataset(HARTREE_DATASET, data=v_h_all,
                                           dtype=np.complex128)
