@@ -20,6 +20,16 @@ number in a test: a threshold that has to hold on a shared machine either
 gets loosened until it means nothing or fails on somebody else's
 contention.
 
+THIS SCRIPT OVERWRITES ITS TAG'S FILE, AND SOME ROWS IN THERE ARE NOT
+ITS OWN.  ``cpu2x2.json`` / ``gpu2x2.json`` also carry the step-6 eigh
+investigation's single-matrix sweep (``shape [1, n]``, ``n`` up to 4096,
+tagged ``"leg": "step6.cross_size"`` / ``"step6.slate4096"``), produced by
+a DIFFERENT harness — ``svc_distrib_la_perf/perf_eigh.py``.  Re-running
+this script drops them.  Merge, do not clobber: the row key across the
+two sources is ``(op, backend, shape, route)``, because the step-6 rows
+record the replicated and the sharded native input layouts at the same
+shape and they are different measurements.
+
 WHAT IS TIMED, precisely.  The FIRST call of every (backend, shape) is a
 compile and is discarded; then ``warmup`` calls settle the executable
 cache, then ``reps`` timed calls, each ``block_until_ready``-ed, and the

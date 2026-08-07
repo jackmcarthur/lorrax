@@ -738,6 +738,380 @@
         2,
         1024
       ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 1.3941999220405705,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.sharded",
+      "seconds": 0.0018829029868356884,
+      "seconds_max": 0.0022978269844315946,
+      "seconds_min": 0.0018452689982950687,
+      "shape": [
+        1,
+        64
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.19425474299350753,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.replicated",
+      "seconds": 0.0014902600087225437,
+      "seconds_max": 0.0015057710115797818,
+      "seconds_min": 0.001486913999542594,
+      "shape": [
+        1,
+        64
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "compile_seconds": 2.9492277689860202,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.single",
+      "seconds": 1.5857143389876,
+      "seconds_max": 1.6251772959949449,
+      "seconds_min": 1.5321275779861026,
+      "shape": [
+        1,
+        64
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 0.5973599909921177,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "plan.single",
+      "seconds": 0.4005507430410944,
+      "seconds_max": 0.4130130860139616,
+      "seconds_min": 0.3673832790227607,
+      "shape": [
+        1,
+        64
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.2252904330380261,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.sharded",
+      "seconds": 0.005296683986671269,
+      "seconds_max": 0.006007572985254228,
+      "seconds_min": 0.005126664997078478,
+      "shape": [
+        1,
+        256
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.19326093600830063,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.replicated",
+      "seconds": 0.004124801023863256,
+      "seconds_max": 0.0041838749893940985,
+      "seconds_min": 0.003971091995481402,
+      "shape": [
+        1,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "compile_seconds": 1.754437658993993,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.single",
+      "seconds": 1.560662267031148,
+      "seconds_max": 1.6456919370102696,
+      "seconds_min": 1.5478204779792577,
+      "shape": [
+        1,
+        256
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 0.5468905059969984,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "plan.single",
+      "seconds": 0.5458041889942251,
+      "seconds_max": 0.6320307020214386,
+      "seconds_min": 0.4865103679476306,
+      "shape": [
+        1,
+        256
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.2560511989868246,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.sharded",
+      "seconds": 0.02072231500642374,
+      "seconds_max": 0.02967674401588738,
+      "seconds_min": 0.020108283031731844,
+      "shape": [
+        1,
+        1024
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.17652341001667082,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.replicated",
+      "seconds": 0.026619963988196105,
+      "seconds_max": 0.034362682956270874,
+      "seconds_min": 0.019493311003316194,
+      "shape": [
+        1,
+        1024
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "compile_seconds": 2.1261651149834506,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.single",
+      "seconds": 1.7540601280052215,
+      "seconds_max": 1.7796679600141943,
+      "seconds_min": 1.687321665987838,
+      "shape": [
+        1,
+        1024
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 1.6317593320272863,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "plan.single",
+      "seconds": 1.3873811149969697,
+      "seconds_max": 1.4878442020271905,
+      "seconds_min": 1.2474324480281211,
+      "shape": [
+        1,
+        1024
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.32068146200617775,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.sharded",
+      "seconds": 0.07743066101102158,
+      "seconds_max": 0.09413891000440344,
+      "seconds_min": 0.0765438710222952,
+      "shape": [
+        1,
+        2048
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.2725524159613997,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.replicated",
+      "seconds": 0.07275377900805324,
+      "seconds_max": 0.08612290199380368,
+      "seconds_min": 0.0726114739663899,
+      "shape": [
+        1,
+        2048
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "compile_seconds": 2.1130978779983707,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.single",
+      "seconds": 1.9315550419851206,
+      "seconds_max": 1.9642500289482996,
+      "seconds_min": 1.882855952018872,
+      "shape": [
+        1,
+        2048
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 5.55901286599692,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 3,
+      "resolved": "slate",
+      "route": "plan.single",
+      "seconds": 5.443630088993814,
+      "seconds_max": 5.689387430960778,
+      "seconds_min": 5.397280014003627,
+      "shape": [
+        1,
+        2048
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.7217128879856318,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.sharded",
+      "seconds": 0.42448003898607567,
+      "seconds_max": 0.43048454500967637,
+      "seconds_min": 0.40474035998340696,
+      "shape": [
+        1,
+        4096
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.5538845930132084,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.replicated",
+      "seconds": 0.39550099801272154,
+      "seconds_max": 0.4298656350001693,
+      "seconds_min": 0.3937511239782907,
+      "shape": [
+        1,
+        4096
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "compile_seconds": 3.00281332898885,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.single",
+      "seconds": 2.7393706620205194,
+      "seconds_max": 2.775997537013609,
+      "seconds_min": 2.7198488459689543,
+      "shape": [
+        1,
+        4096
+      ]
+    },
+    {
+      "backend": "slate",
+      "jobid": "56457930",
+      "leg": "step6.slate4096",
+      "mesh": "2x2",
+      "op": "eigh",
+      "refused": "SIGSEGV, not a refusal message: SLATE's CUDA eigh crashes deterministically at n=4096 on the 4-process 2x2 and takes every rank down (srun rc=139, 'nid001088: task 0: Segmentation fault'), jobid 56457930, _reports/gpu_slate4096_segv.log.  resolve_backend guard 2d now REFUSES this combination (bug L-4), so a future run of this bench records the refusal text instead of crashing.  It RUNS at n<=2048 on the same mesh.",
+      "route": "plan.single",
+      "shape": [
+        1,
+        4096
+      ]
     }
   ],
   "tag": "gpu2x2"

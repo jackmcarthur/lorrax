@@ -674,6 +674,246 @@
         2,
         1024
       ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.5892260620021261,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.sharded",
+      "seconds": 0.0011111549683846533,
+      "seconds_max": 0.0011467739823274314,
+      "seconds_min": 0.001102758978959173,
+      "shape": [
+        1,
+        64
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.03172162198461592,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.replicated",
+      "seconds": 0.0006322570261545479,
+      "seconds_max": 0.000653447990771383,
+      "seconds_min": 0.0006010560318827629,
+      "shape": [
+        1,
+        64
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "compile_seconds": 0.6060975079890341,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "scalapack",
+      "route": "plan.single",
+      "seconds": 0.002553453028667718,
+      "seconds_max": 0.0026060050004161894,
+      "seconds_min": 0.002495461027137935,
+      "shape": [
+        1,
+        64
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.11137899698223919,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.sharded",
+      "seconds": 0.030931909976061434,
+      "seconds_max": 0.04190198902506381,
+      "seconds_min": 0.02101653697900474,
+      "shape": [
+        1,
+        256
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.08804773999145254,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.replicated",
+      "seconds": 0.016255952999927104,
+      "seconds_max": 0.01847705099498853,
+      "seconds_min": 0.016187579953111708,
+      "shape": [
+        1,
+        256
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "compile_seconds": 0.24582905700663105,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "scalapack",
+      "route": "plan.single",
+      "seconds": 0.017174274020362645,
+      "seconds_max": 0.01753795996773988,
+      "seconds_min": 0.017087245010770857,
+      "shape": [
+        1,
+        256
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.3468105850042775,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.sharded",
+      "seconds": 0.45589585503330454,
+      "seconds_max": 0.5010602910188027,
+      "seconds_min": 0.4225018079741858,
+      "shape": [
+        1,
+        1024
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.5741030960343778,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.replicated",
+      "seconds": 0.27120111195836216,
+      "seconds_max": 0.2839612140087411,
+      "seconds_min": 0.2574612710159272,
+      "shape": [
+        1,
+        1024
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "compile_seconds": 0.9549759849905968,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "scalapack",
+      "route": "plan.single",
+      "seconds": 0.5543673540232703,
+      "seconds_max": 0.5635360190062784,
+      "seconds_min": 0.5456034439848736,
+      "shape": [
+        1,
+        1024
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 1.5433571670437232,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.sharded",
+      "seconds": 1.9494326820131391,
+      "seconds_max": 2.306697376014199,
+      "seconds_min": 1.5708156600012444,
+      "shape": [
+        1,
+        2048
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 3.1480052629485726,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "native.replicated",
+      "seconds": 1.4890357269905508,
+      "seconds_max": 1.5176949389860965,
+      "seconds_min": 1.4354622279643081,
+      "shape": [
+        1,
+        2048
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "compile_seconds": 4.82231567701092,
+      "dtype": "complex128",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "scalapack",
+      "route": "plan.single",
+      "seconds": 4.121572287054732,
+      "seconds_max": 4.147203197993804,
+      "seconds_min": 3.993065659014974,
+      "shape": [
+        1,
+        2048
+      ]
+    },
+    {
+      "backend": "off",
+      "leg": "step6.cross_size",
+      "mesh": "2x2",
+      "not_measured": "DID NOT RETURN.  One jax-CPU complex128 eigh at n=4096 on this 4-process / 1-node configuration ran >27 min without returning and was killed (jobid 56447670, step lx-Xg4-102234-1557641-7599).  n=4096 was then dropped from the whole CPU size sweep (drv_cpu.sh: SIZES=64,256,1024,2048), so the scalapack and native-sharded cells at this size were never attempted either.  This is an ANNOTATION, not a timing: nobody knows what this cell costs, only that it is more than 27 min.",
+      "op": "eigh",
+      "route": "native.replicated",
+      "shape": [
+        1,
+        4096
+      ]
     }
   ],
   "tag": "cpu2x2"
