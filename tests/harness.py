@@ -32,6 +32,51 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REG = REPO_ROOT / "tests" / "regression"
 
+
+def _visible_gpus(preset: str | None, probe) -> list[str]:
+    """The device ids this process may use, in the order it may use them."""
+    if preset is not None and preset.strip() != "":
+        return [d for d in preset.split(",") if d != ""]
+    if preset is not None:                       # explicitly masked: ""
+        return []
+    return [str(i) for i in range(probe())]
+
+
+def _probe_nvidia_smi() -> int:
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True,
+                             text=True, timeout=10).stdout
+        return len(out.strip().splitlines()) if out.strip() else 0
+    except Exception:                                          # noqa: BLE001
+        return 0
+
+
+def pin_one_gpu(preset: str | None, worker_id: str = "", probe=None):
+    """The ONE device this process should see, or ``None`` for "leave it".
+
+    ``preset`` is ``CUDA_VISIBLE_DEVICES`` as the process found it
+    (``None`` = unset), ``worker_id`` is ``PYTEST_XDIST_WORKER``.  With a
+    worker id the pick fans out across the visible list (``gw2`` -> the
+    third one, wrapping); without one it is the FIRST visible device.
+
+    A PURE FUNCTION on purpose.  Its caller is a module-scope side effect
+    in ``tests/conftest.py`` — it has to run before the first CUDA init,
+    which is the one place a test cannot observe — so the DECISION lives
+    here where ``tests/test_gpu_pinning.py`` can construct every case,
+    including the one that regressed.
+    """
+    devs = _visible_gpus(preset, probe or _probe_nvidia_smi)
+    if not devs:
+        return None
+    # ``worker_id[2:].isdigit()`` rather than ``startswith("gw")``: the
+    # xdist CONTROLLER sets no worker id at all and other spellings exist
+    # ("master"), and a bare ``int(worker_id[2:])`` on one of them raises
+    # ValueError out of a conftest at module scope — which pytest reports
+    # as a collection error for the entire suite, not as one bad pin.
+    tail = worker_id[2:] if worker_id.startswith("gw") else ""
+    i = int(tail) % len(devs) if tail.isdigit() else 0
+    return devs[i]
+
 # Output files never copied from a fixture dir into a run dir.
 _FIXTURE_IGNORE = (
     "tmp", "eqp_test.dat", "eqp0_test.dat", "eqp1_test.dat",

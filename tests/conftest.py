@@ -7,36 +7,68 @@ into one process, so the first import wins — set the env here.
 """
 
 import os
+import sys as _sys
+from pathlib import Path as _Path
+
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 
+# ``harness`` first, and BEFORE the GPU pin below, because the pin's
+# decision lives there as a pure function so it can be unit-tested (a
+# module-scope side effect in a conftest is otherwise unfalsifiable).
+# Safe at this point: harness imports stdlib + numpy and no jax, so
+# nothing has initialised a CUDA backend yet.
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+import harness  # noqa: E402
+
 # ---------------------------------------------------------------------------
-# pytest-xdist: pin each worker to its own GPU (gw0 → GPU 0, gw1 → GPU 1, …)
-# so the e2e regression gates — subprocess launchers that each need ONE
-# GPU — run N-wide on an N-GPU node instead of serially on GPU 0.  Must
-# run before the worker's first CUDA/JAX init, which is why it lives at
-# conftest module scope.  This OVERRIDES any pre-set CUDA_VISIBLE_DEVICES
-# (SLURM gres sets "0,1,2,3" for the task): without the override each
-# worker — and every gate subprocess it launches — sees all N GPUs and
-# runs the gate on an N-device mesh, which breaks the 1-GPU-frozen
-# references.  Mapping goes through the existing list so SLURM's device
-# selection is respected.  No-op without xdist.
+# ONE GPU PER PROCESS.  Not a preference — three separate things require it.
 # ---------------------------------------------------------------------------
-_wid = os.environ.get("PYTEST_XDIST_WORKER", "")
-if _wid.startswith("gw"):
-    _preset = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if _preset:
-        _devs = [d for d in _preset.split(",") if d != ""]
-    else:
-        try:
-            import subprocess as _sp
-            _n = len(_sp.run(
-                ["nvidia-smi", "-L"], capture_output=True, text=True,
-                timeout=10).stdout.strip().splitlines())
-        except Exception:
-            _n = 0
-        _devs = [str(i) for i in range(_n)]
-    if _devs:
-        os.environ["CUDA_VISIBLE_DEVICES"] = _devs[int(_wid[2:]) % len(_devs)]
+# Under pytest-xdist each worker takes its own GPU (gw0 → GPU 0, gw1 → GPU
+# 1, …) so the e2e regression gates — subprocess launchers that each need
+# ONE GPU — run N-wide on an N-GPU node instead of serially on GPU 0.
+# WITHOUT a worker id the process takes the FIRST visible device.  Must run
+# before the first CUDA/JAX init, which is why it lives at conftest module
+# scope.  This OVERRIDES any pre-set CUDA_VISIBLE_DEVICES (SLURM gres sets
+# "0,1,2,3" for the task); the mapping goes through the existing list so
+# SLURM's device selection is respected.
+#
+# THE `if _wid.startswith("gw")` GUARD THIS REPLACES WAS A REAL DEFECT, and
+# it is worth writing down because it hid behind a green leg.  Three things
+# want exactly one visible GPU and only one of them is about xdist:
+#
+#   1. xdist fan-out (the original reason).
+#   2. The 1-GPU-FROZEN REFERENCES.  Every gate subprocess inherits this
+#      env; seeing N GPUs makes it build an N-device mesh and compare
+#      against numbers measured at one.  That is true whether or not xdist
+#      is running, so gating it on the worker id made a NON-xdist run of
+#      the same suite a different measurement.
+#   3. SLATE REFUSES.  MEASURED, Perlmutter 2026-08-07, step 2:
+#          FAILED_PRECONDITION: slate.potrf: blas::get_device_count()=4
+#          but JAX one-process-per-GPU model requires exactly 1.
+#      EIGHT contract cells (slate potrf / batched_potrf / eigh, plus the
+#      bse_setup wiring cell on top of them) died on it — and ONLY in the
+#      full-suite `-m distrib_la` leg.  In the service-only leg
+#      (`pytest services/distrib_la/tests`) the same cells were GREEN,
+#      because services/distrib_la/tests/conftest.py does this pinning too
+#      — but conditionally, on `"jax" not in sys.modules`, since
+#      CUDA_VISIBLE_DEVICES is read once at backend init.  In a full-suite
+#      run `testpaths = ["tests", "services"]` collects tests/ first, a
+#      lorrax module there imports jax during collection, and the service
+#      conftest's copy is INERT by the time it loads.  So the service
+#      suite's own guard cannot cover the full-suite leg by construction;
+#      the only conftest that loads early enough is this one.
+#
+# The service conftest keeps its copy — it is the one that runs when the
+# suite is invoked BY PATH, which never loads this file at all.
+#
+# No-op where there is nothing to pin: unset CUDA_VISIBLE_DEVICES and no
+# nvidia-smi (every CPU leg, the WSL box) leaves the environment untouched.
+# ---------------------------------------------------------------------------
+_pinned = harness.pin_one_gpu(
+    os.environ.get("CUDA_VISIBLE_DEVICES"),
+    os.environ.get("PYTEST_XDIST_WORKER", ""))
+if _pinned is not None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = _pinned
 
 
 # ---------------------------------------------------------------------------
@@ -65,14 +97,9 @@ if _wid.startswith("gw"):
 # fixtures are per-process); tests stay order-independent and xdist-safe
 # because no test mutates a session dir — every variant copies first.
 # ---------------------------------------------------------------------------
-import sys as _sys
-from pathlib import Path as _Path
 from types import SimpleNamespace as _NS
 
 import pytest
-
-_sys.path.insert(0, str(_Path(__file__).resolve().parent))
-import harness  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
