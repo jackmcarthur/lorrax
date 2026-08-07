@@ -32,6 +32,10 @@ from common.wfn_transforms import (
     load_psi_gflat_padded,
 )
 from isdf import factor_c_q
+# ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE resolver;
+# this driver reads a raw params dict rather than a LorraxConfig, which is
+# exactly the case that function exists for.
+from gw.gw_config import eigh_backend_choices, resolve_eigh_backend
 from common.fft_helpers import make_flat_k_ifftn
 # Q's r axis is split over the ('x','y') PRODUCT and its extent is an FFT-box
 # size, so it divides that product only by luck.  Raw, that is a refusal, not a
@@ -1214,7 +1218,14 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             # Deck key, same family as the fH_q eigh; the CLI --eigh-backend
             # override is scoped to compute_wfns_fi and deliberately not
             # threaded here — the deck is the source of truth for the fit.
-            eigh_backend=str(params.get("eigh_backend", "auto")),
+            #
+            # RESOLVED, not raw.  ``eigh_backend`` and ``use_low_mem_eigh``
+            # are two spellings of ONE axis and ``gw_config.resolve_eigh_
+            # backend`` is the single place they combine; reading the raw
+            # key here meant a deck that said ``use_low_mem_eigh = true``
+            # got the native replicated Gram eigh anyway — the key was
+            # parsed, defaulted, stored and read by nobody on this driver.
+            eigh_backend=resolve_eigh_backend(params),
         )
     S, ctilde, B_at_mu = out[:3]
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={band_range[1]-band_range[0]}, rank={ctilde.shape[2]}")
@@ -1551,12 +1562,15 @@ def main(argv=None):
                         help="Band index (0-based) whose bandwidth sets 'a'. "
                              "E.g. nval+ncond_keep-1. Default: top band.")
     parser.add_argument("--eigh-backend", default=None,
-                        choices=("auto", "off", "cusolvermp", "slate"),
+                        choices=eigh_backend_choices(),
                         help="Eigensolver for the fH_q eigendecomposition of "
                              "the get_centroids_fi handoff.  auto|off = the "
-                             "q-batched native path; cusolvermp|slate spread "
-                             "ONE (rank, rank) tile over the mesh via the "
-                             "distributed-linalg FFI (wide band windows).  "
+                             "q-batched native path; distributed|cusolvermp|"
+                             "slate|scalapack spread ONE (rank, rank) tile "
+                             "over the mesh through the distrib_la door (wide "
+                             "band windows).  ``distributed`` is the portable "
+                             "spelling and the ONLY one that exists on a host "
+                             "mesh, where it means ScaLAPACK pzheevd.  "
                              "OVERRIDES the input-file ``eigh_backend`` key "
                              "(default: use the key, which defaults to auto).")
     args = parser.parse_args(argv)
@@ -1579,9 +1593,16 @@ def main(argv=None):
 
     from gw.gw_init import read_cohsex_input
     params = read_cohsex_input(args.input)
-    # Input file is the source of truth; the CLI flag is an override.
-    eigh_backend = (args.eigh_backend if args.eigh_backend is not None
-                    else str(params.get("eigh_backend", "auto")))
+    # Input file is the source of truth; the CLI flag is an override — and
+    # BOTH go through the one resolver, which is where ``use_low_mem_eigh``
+    # folds in.  This driver used to inline the precedence and never call
+    # it, so the deck key moved nothing here.
+    eigh_backend = resolve_eigh_backend(params, override=args.eigh_backend)
+    # The INTENT travels too.  ``compute_wfns_fi`` refuses at resolve time
+    # under this flag rather than falling back to the whole-matrix native
+    # path (bse_setup's no-fallback contract); passing only the resolved
+    # library name would leave that refusal disarmed on this driver.
+    use_low_mem_eigh = bool(params.get("use_low_mem_eigh", False))
     
     # Override WFN file if provided via CLI
     if args.wfn_file is not None:
@@ -1638,7 +1659,8 @@ def main(argv=None):
                 kgrid_fi=params["kgrid_fi"],
                 band_window_fi=(b_min, b_max),
                 mesh_xy=mesh_xy, a_band_index=args.a_band,
-                eigh_backend=eigh_backend, log_fn=log,
+                eigh_backend=eigh_backend,
+                use_low_mem_eigh=use_low_mem_eigh, log_fn=log,
             )
         log(f"BSE setup: psi_rmu_Y={wfns_fi.psi_rmu_Y.shape} "
             f"P{wfns_fi.psi_rmu_Y.sharding.spec}, "

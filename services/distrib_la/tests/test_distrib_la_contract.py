@@ -1353,3 +1353,60 @@ def test_compute_wfns_fi_rejects_bad_backend():
                         enk_sigma=jnp.asarray(enk), kgrid_co=kgrid,
                         band_window_fi=(1, 3), mesh_xy=mesh,
                         kgrid_fi=(2, 2, 1), eigh_backend="replicated")
+
+
+# ---------------------------------------------------------------------------
+#  The W Dyson solve's refusal — the third "must survive" contract
+# ---------------------------------------------------------------------------
+
+def test_w_dyson_distributed_refusal_reaches_the_caller():
+    """``w_dyson_solver='distributed'`` REFUSES; it never degrades to native.
+
+    ``gw/w_isdf._get_w_solve_fn_distributed`` resolves ``solve_lu`` with an
+    explicit ``'distributed'`` and deliberately does NO compensating
+    ``plan.is_native`` re-check, on the stated grounds that an explicit
+    request which cannot be honoured raises at resolve time (the former
+    silent 1-D-mesh degenerate-to-native was removed, audit fix/zq
+    2026-07-28).  That reasoning is only sound while the exception actually
+    PROPAGATES -- a ``try/except`` around the plan call, or a resolver that
+    demoted, would turn a refusal into a q-parallel per-q dense LU with one
+    whole (mu, mu) tile per rank, which is the memory profile the
+    distributed plan exists to avoid, computed silently and successfully.
+
+    Nothing pinned that before.  This cell is deliberately construable on a
+    machine with NO FFI library at all: absent-library is one of the guard
+    ladder's refusal reasons, so "no .so" is a legitimate instrument here
+    rather than a skip.  On a machine WITH the host library the same call
+    resolves and returns a callable, which is the other half and is what
+    ``test_scalapack_batched_solve_lu`` covers.
+
+    RED ARM: returning instead of raising fails, and so does raising the
+    wrong thing -- the message must name the backend the resolver picked.
+    """
+    jax = pytest.importorskip("jax")
+    from jax.sharding import Mesh
+    _needs_monorepo("gw.w_isdf._get_w_solve_fn_distributed")
+    from distrib_la import resolve_backend
+    from gw.w_isdf import _get_w_solve_fn_distributed
+
+    try:
+        devs = jax.devices("cpu")[:1]
+    except RuntimeError:                                    # no CPU backend
+        pytest.skip("jax cpu backend unavailable")
+    mesh = Mesh(np.asarray(devs).reshape(1, 1), ("x", "y"))
+
+    try:
+        resolve_backend("solve_lu", "distributed", mesh, n=8)
+    except (ValueError, RuntimeError) as why:
+        with pytest.raises((ValueError, RuntimeError)) as exc:
+            _get_w_solve_fn_distributed(mesh, 2, 8, 8)
+        assert "scalapack" in str(exc.value), (
+            f"the refusal reached the caller but does not name the backend "
+            f"the resolver chose: {exc.value}")
+        assert str(why).split(":")[0] in str(exc.value), (
+            f"w_isdf reworded or swallowed the resolver's reason; the "
+            f"resolver said {why!r}, the caller raised {exc.value!r}")
+        return
+    # Host library present and usable: the promise half.
+    fn = _get_w_solve_fn_distributed(mesh, 2, 8, 8)
+    assert callable(fn)

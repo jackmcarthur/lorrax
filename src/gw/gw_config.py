@@ -450,12 +450,22 @@ def eigh_backend_choices() -> tuple:
                 "scalapack")
 
 
-def resolve_eigh_backend(params) -> str:
+def resolve_eigh_backend(params, *, override: str | None = None) -> str:
     """``(eigh_backend, use_low_mem_eigh)`` → ONE backend string.
 
     THE single place the two spellings of one axis are combined, so a
     driver that reads the raw params dict (``bandstructure.htransform``,
     ``bse.exciton_bands``) gets the same answer as ``LorraxConfig``.
+
+    ``override`` is a CLI ``--eigh-backend`` value, or ``None`` for "the
+    deck decides".  It replaces the deck's ``eigh_backend`` and then goes
+    through the same combination, which is the only spelling of the
+    precedence that cannot drift: the flag names the LIBRARY, the deck key
+    ``use_low_mem_eigh`` names the INTENT, and one axis has one resolver.
+    The two CLI drivers used to do `args.X if args.X is not None else
+    params.get(...)` inline and never called this function at all, so
+    ``use_low_mem_eigh`` was parsed, stored, and read by nobody on either
+    of them.
 
     * ``use_low_mem_eigh`` unset/false → ``eigh_backend`` verbatim.
     * true + ``auto`` → ``"distributed"`` (the platform's distributed
@@ -471,7 +481,11 @@ def resolve_eigh_backend(params) -> str:
     Vocabulary is checked here too, so an unknown spelling fails at parse
     time rather than at the first eigh.
     """
-    raw = params.get("eigh_backend", "auto") if hasattr(params, "get") else "auto"
+    if override is not None:
+        raw = override
+    else:
+        raw = (params.get("eigh_backend", "auto")
+               if hasattr(params, "get") else "auto")
     backend = str("auto" if raw is None else raw).strip().lower()
     choices = eigh_backend_choices()
     if backend not in choices:

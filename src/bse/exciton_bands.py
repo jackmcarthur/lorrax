@@ -419,6 +419,14 @@ def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data,
 # ===========================================================================
 def main(argv=None):
     import argparse
+    # ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE
+    # resolver, and the CLI vocabulary is the resolver's own list rather
+    # than a hand-copied tuple that drifts (it had: this flag accepted
+    # auto|off|cusolvermp|slate while distrib_la had grown ``distributed``
+    # and ``scalapack``, so the CPU distributed eigh was unreachable from
+    # here).  Function-local because gw_config parses decks and this
+    # module is imported by things that do not.
+    from gw.gw_config import eigh_backend_choices, resolve_eigh_backend
 
     ap = argparse.ArgumentParser(allow_abbrev=False,
         description="Exciton bandstructure E_S(Q) along a K_POINTS crystal_b path")
@@ -468,7 +476,7 @@ def main(argv=None):
                          "arbitrary_q_bse.md §16.4).  Overrides the cohsex.in "
                          "``head_minibz_average`` key; default (unset) uses it.")
     ap.add_argument("--eigh-backend", default=None,
-                    choices=("auto", "off", "cusolvermp", "slate"),
+                    choices=eigh_backend_choices(),
                     help="OVERRIDES the input-file ``eigh_backend`` key "
                          "(default: use the key, which defaults to auto).  "
                          "Hermitian eigensolver for BOTH distributed-eigh "
@@ -566,11 +574,19 @@ def main(argv=None):
     from bandstructure.bse_setup import compute_wfns_fi
 
     params = read_lorrax_input(args.input)
-    # Input file is the source of truth; the CLI flag is an override.
+    # Input file is the source of truth; the CLI flag is an override — and
+    # BOTH go through the one resolver, which is where ``use_low_mem_eigh``
+    # folds in.  This driver used to inline the precedence and never call
+    # ``resolve_eigh_backend`` at all, so a deck saying
+    # ``use_low_mem_eigh = true`` got the native q-batched path anyway.
     # (Both distributed-eigh sites below — compute_wfns_fi and
     # build_vq_evaluator — read this resolved value.)
-    if args.eigh_backend is None:
-        args.eigh_backend = str(params.get("eigh_backend", "auto"))
+    args.eigh_backend = resolve_eigh_backend(
+        params, override=args.eigh_backend)
+    # The INTENT travels to compute_wfns_fi as well: its refusal contract
+    # (refuse at resolve time, never fall back to the whole-matrix native
+    # path) is armed by this flag, not by the resolved library name.
+    _use_low_mem_eigh = bool(params.get("use_low_mem_eigh", False))
     if not params.get("kpoints_crystal_b"):
         raise ValueError(f"{args.input} has no K_POINTS crystal_b block — "
                          "the exciton Q path comes from it (same format as "
@@ -750,7 +766,8 @@ def main(argv=None):
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=kgrid_co_ct, band_window_fi=(b_min, b_max),
         mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
-        eigh_backend=args.eigh_backend, log_fn=log)
+        eigh_backend=args.eigh_backend,
+        use_low_mem_eigh=_use_low_mem_eigh, log_fn=log)
     psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
         bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
     # Everything the htransform produced is now copied into the conduction

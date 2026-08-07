@@ -290,7 +290,8 @@ def test_use_low_mem_eigh_refuses_rather_than_running_native():
     """NO SILENT FALLBACK.
 
     ``slate`` eigh on a CPU mesh is refused unconditionally by
-    ``ffi.linalg.resolve`` (bug L-2: SLATE's host heev SIGSEGVs).  Asking
+    ``distrib_la.resolve_backend`` (bug L-2: SLATE's host heev SIGSEGVs).
+    Asking
     for it under ``use_low_mem_eigh`` must therefore RAISE — the failure
     mode this guards against is the opposite: quietly computing the answer
     with the q-batched native eigh, which is the whole-matrix path the flag
@@ -321,18 +322,105 @@ def test_use_low_mem_eigh_keeps_an_explicitly_named_library():
 
 
 # ---------------------------------------------------------------------------
+#  4b. …and the two raw-params drivers actually CALL the resolver
+# ---------------------------------------------------------------------------
+#
+# ``use_low_mem_eigh`` was a key that parsed, defaulted, validated, and was
+# read by nobody on ``bandstructure.htransform`` and ``bse.exciton_bands``:
+# both spelled the CLI-over-deck precedence inline
+# (``args.X if args.X is not None else params.get("eigh_backend")``) and
+# never called ``resolve_eigh_backend`` at all.  Grepping for the key
+# proved nothing — it was there, in the defaults table and in the parser.
+# These cells perturb it and watch the RESOLVED value move, which is the
+# only evidence that distinguishes a live knob from a stored one.
+
+def test_the_cli_override_still_folds_in_the_low_memory_intent():
+    """CLI names the LIBRARY, the deck key names the INTENT, one resolver.
+
+    RED ARM: an implementation that let ``override`` bypass the
+    combination (an early ``return override``) passes the first two
+    asserts and fails the third — ``off`` under the low-memory flag is a
+    contradiction whichever spelling asked for it.
+    """
+    from gw.gw_config import resolve_eigh_backend
+    deck = {"eigh_backend": "auto", "use_low_mem_eigh": False}
+    assert resolve_eigh_backend(deck, override=None) == "auto"
+    assert resolve_eigh_backend(deck, override="slate") == "slate"
+    low = {"eigh_backend": "auto", "use_low_mem_eigh": True}
+    assert resolve_eigh_backend(low, override=None) == "distributed"
+    assert resolve_eigh_backend(low, override="scalapack") == "scalapack"
+    with pytest.raises(ValueError, match="contradiction"):
+        resolve_eigh_backend(low, override="off")
+
+
+#: The two drivers that read a raw params dict instead of a LorraxConfig.
+#: Read as TEXT, never imported: ``bandstructure.htransform`` runs the
+#: whole runtime bootstrap at import (``initialize_communicator_stack``
+#: at module scope) and refuses without an FFI ``.so``, so an
+#: import-based cell would be a skip on every laptop and on the WSL leg —
+#: i.e. exactly the "green because it never ran" shape this key already
+#: fell into once.
+_RAW_PARAMS_DRIVERS = ("src/bandstructure/htransform.py",
+                       "src/bse/exciton_bands.py")
+
+
+def _driver_source(rel: str) -> str:
+    import pathlib
+    return (pathlib.Path(__file__).resolve().parents[1] / rel).read_text()
+
+
+@pytest.mark.parametrize("driver", _RAW_PARAMS_DRIVERS)
+def test_the_raw_params_drivers_resolve_the_eigh_axis(driver):
+    """Both drivers must REACH ``resolve_eigh_backend``, not re-implement it.
+
+    RED ARM: ``forbidden`` is the pre-replumb spelling verbatim, so this
+    cell fails on the tree it was written against — which is what makes
+    the green mean something.
+    """
+    src = _driver_source(driver)
+    assert "resolve_eigh_backend(" in src, (
+        f"{driver} does not call gw_config.resolve_eigh_backend, so its "
+        f"``use_low_mem_eigh`` deck key is parsed and never read")
+    forbidden = 'else str(params.get("eigh_backend", "auto"))'
+    assert forbidden not in src, (
+        f"{driver} still inlines the CLI-over-deck precedence "
+        f"({forbidden!r}), which is the spelling that skipped the "
+        f"low-memory intent entirely")
+    assert "use_low_mem_eigh" in src, (
+        f"{driver} must thread the low-memory INTENT to compute_wfns_fi; "
+        f"the resolved library name alone leaves bse_setup's no-fallback "
+        f"refusal disarmed")
+
+
+@pytest.mark.parametrize("driver", _RAW_PARAMS_DRIVERS)
+def test_the_cli_eigh_vocabulary_is_the_resolvers_own(driver):
+    """The two ``--eigh-backend`` flags accepted auto|off|cusolvermp|slate,
+    a hand-copied tuple missing ``distributed`` and ``scalapack`` — i.e.
+    the CPU distributed eigh was unreachable from either CLI, on the one
+    platform where ``distributed`` is the ONLY distributed eigh there is.
+    """
+    src = _driver_source(driver)
+    assert 'choices=("auto", "off", "cusolvermp", "slate")' not in src, (
+        f"{driver} still hard-codes the stale eigh vocabulary")
+    assert "choices=eigh_backend_choices()" in src, (
+        f"{driver}'s --eigh-backend must read the resolver's own list")
+
+
+# ---------------------------------------------------------------------------
 #  5. the input keys themselves
 # ---------------------------------------------------------------------------
 
 def test_eigh_backend_vocabulary_is_the_resolvers_own():
-    """gw_config's fallback list must equal ffi.linalg.resolve's.
+    """gw_config's fallback list must equal the distrib_la door's.
 
     They HAD drifted — the parser accepted only auto|off|cusolvermp|slate
     while the resolver had grown ``distributed`` and ``scalapack``, so the
     low-memory eigh was unrequestable through an input file on a host mesh.
     """
     pytest.importorskip("jax")
-    from ffi.linalg.resolve import BACKEND_CHOICES
+    from ffi import _services
+    _services.ensure_on_path()
+    from distrib_la import BACKEND_CHOICES
     from gw.gw_config import eigh_backend_choices
     assert set(eigh_backend_choices()) == set(BACKEND_CHOICES["eigh"])
     # …and the hard-coded fallback (used when ffi cannot be imported) too.
