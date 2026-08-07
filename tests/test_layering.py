@@ -1,4 +1,4 @@
-"""THE layering gate: every module in ``src/`` has a level, and the levels hold.
+"""THE layering gate: every module in the tree has a level, and the levels hold.
 
 Three levels, assigned by *what a module is allowed to know about*:
 
@@ -18,6 +18,19 @@ L3   substrate              knows about devices, meshes, processes, native
 Imports run **downhill only**: L1 → L2 → L3.  ``docs/architecture/layers.md``
 states the rules in prose and lists every sanctioned exception with its
 reason; this file is the same content in a form that fails.
+
+WHAT "THE TREE" MEANS SINCE THE SERVICE PHASE.  The scan covers ``src/``
+**and every ``services/*/src``** (:data:`ROOTS`).  A one-root scan would not
+have failed when the linalg stack moved out of ``src/ffi/linalg`` — it would
+have gone on passing while measuring 37 fewer files, which is coverage
+evaporating silently, the exact shape this file exists to prevent.  Module
+names are root-RELATIVE, so ``services/lxkit/src/lxkit/gate.py`` is
+``lxkit.gate``, which is what it is called at an import site.
+
+Services get one extra rule of their own (§8): lorrax may import a service's
+TOP-LEVEL package and nothing else.  That is the charter's measurable
+criterion — "direct-dependency import edges from lorrax → 0 outside doors" —
+and until this edit nothing counted them.
 
 WHY A TEST AND NOT A CONVENTION.  Every finding this file pins was found by
 hand at least twice: five hand-rolled host gathers each documenting that they
@@ -51,7 +64,25 @@ import pathlib
 import pytest
 
 
-SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
+_REPO = pathlib.Path(__file__).resolve().parents[1]
+SRC = _REPO / "src"
+_SERVICES = _REPO / "services"
+
+
+def _roots():
+    """``[src/, services/*/src/, …]`` — every source root in this monorepo.
+
+    Discovered, not listed: a service added next week is scanned the day it
+    lands, which is the only way an allowlist-free rule stays true.
+    """
+    out = [SRC]
+    if _SERVICES.is_dir():
+        out += [p / "src" for p in sorted(_SERVICES.iterdir())
+                if (p / "src").is_dir()]
+    return out
+
+
+ROOTS = _roots()
 
 
 # ===========================================================================
@@ -103,7 +134,18 @@ _L3_MODULES = frozenset({
     # the sharded-HDF5 transport (NOT the format readers above it)
     "file_io.slab_io", "file_io._slab_io_ffi", "file_io.paths",
 })
-_L3_PACKAGES = ("ffi",)
+#: Whole packages at L3.  The two services are here for the same reason
+#: ``ffi`` is: their entire subject is devices, meshes, processes, native
+#: libraries and files.  ``lxkit`` owns capability gates and the probe
+#: vocabulary; ``distrib_la`` owns distributed dense linalg over a device
+#: mesh, and the mathematics inside it (a blocked Cholesky) is the same
+#: mathematics ``ffi.linalg`` always carried at L3 — the level is decided by
+#: what a module is allowed to KNOW ABOUT, and both know about ranks.
+#:
+#: ``ffi`` stays only while ``src/ffi`` does;
+#: :func:`test_every_package_in_the_map_exists` is what forces its removal
+#: at the right moment instead of leaving a dead no-op entry.
+_L3_PACKAGES = ("ffi", "lxkit", "distrib_la")
 
 #: L2 by module.  Whole packages are in ``_L2_PACKAGES``.
 _L2_MODULES = frozenset({
@@ -167,9 +209,14 @@ _PLUMBING_NAMES = ("shard_map", "Mesh", "NamedSharding", "PartitionSpec",
                    "multihost_utils", "mesh_utils", "make_mesh")
 
 
-def module_name(path: pathlib.Path) -> str:
-    rel = path.relative_to(SRC)
-    parts = list(rel.parts)
+def module_name(path: pathlib.Path, root: pathlib.Path = SRC) -> str:
+    """The dotted name ``path`` is imported by, RELATIVE to its source root.
+
+    Root-relative is what makes multi-root scanning meaningful:
+    ``services/lxkit/src/lxkit/gate.py`` is ``lxkit.gate``, which is the
+    name an import site writes and the name the layer map has to key on.
+    """
+    parts = list(path.relative_to(root).parts)
     if parts[-1] == "__init__.py":
         parts = parts[:-1]
     else:
@@ -177,16 +224,45 @@ def module_name(path: pathlib.Path) -> str:
     return ".".join(parts)
 
 
-def all_modules():
-    """``{module name: source text}`` for every ``.py`` under ``src/``."""
+def _modules_under(root: pathlib.Path):
+    """``{module name: source text}`` for every ``.py`` under one root."""
     out = {}
-    for root, dirs, files in os.walk(SRC):
-        dirs[:] = [d for d in dirs if d not in ("__pycache__", ".ipynb_checkpoints")]
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs
+                   if d not in ("__pycache__", ".ipynb_checkpoints")]
         for fn in sorted(files):
             if fn.endswith(".py"):
-                p = pathlib.Path(root) / fn
-                out[module_name(p)] = p.read_text()
+                p = pathlib.Path(base) / fn
+                out[module_name(p, root)] = p.read_text()
     return out
+
+
+def all_modules():
+    """``{module name: source text}`` for every ``.py`` under :data:`ROOTS`.
+
+    A name collision between two roots would silently drop one of them, so
+    it raises instead: two files claiming one import name is a defect
+    whatever the layer rules say about them.
+    """
+    out = {}
+    for root in ROOTS:
+        for mod, text in _modules_under(root).items():
+            if mod in out:
+                raise AssertionError(
+                    f"two source roots both define module {mod!r}; one of "
+                    f"them would be invisible to every rule in this file")
+            out[mod] = text
+    return out
+
+
+def modules_under_src(sources):
+    """The subset of ``sources`` that lives in ``src/`` (i.e. is lorrax).
+
+    Rule 8 is about what LORRAX may import, so it needs the split; nothing
+    else does, and computing it from the filesystem once keeps the rule
+    from having to guess from a name.
+    """
+    return set(_modules_under(SRC))
 
 
 def packages_in(sources):
@@ -1056,6 +1132,210 @@ def test_every_module_in_the_map_exists(sources):
     missing = sorted(named - set(sources))
     assert not missing, (
         f"the layer map names modules that no longer exist: {missing}")
+
+
+def test_every_package_in_the_map_exists(sources):
+    """The PACKAGE half of the same ratchet, which did not exist.
+
+    ``test_every_module_in_the_map_exists`` checks ``_L*_MODULES`` only, so
+    ``_L3_PACKAGES = ("ffi",)`` could go dead-no-op the day ``src/ffi``
+    leaves and nothing would say so — a whole level's worth of files
+    silently reverting to the L1 default, which is the most permissive
+    level there is.  A package entry is a claim that the package is there.
+    """
+    pkgs = packages_in(sources)
+    for level, names in (("L3", _L3_PACKAGES), ("L2", _L2_PACKAGES)):
+        missing = sorted(n for n in names if n not in pkgs)
+        assert not missing, (
+            f"{level} names package(s) {missing} that are not packages in "
+            f"this tree.  Either the package moved (update the entry) or it "
+            f"is gone (delete it) — leaving it makes the level a no-op.")
+
+
+# ===========================================================================
+# 8.  RULE 6 — lorrax imports a service through its DOOR, and nothing else
+# ===========================================================================
+#
+# The charter's standalone criterion, made measurable: "Lorrax imports a
+# service ONLY through its door module.  Measurable criterion per service:
+# direct-dependency import edges from lorrax -> 0 outside doors."  Nothing
+# counted them before this rule.
+#
+# The door of a service is its TOP-LEVEL package.  ``import distrib_la`` and
+# ``from distrib_la import plan`` are the contract; ``import
+# distrib_la.plan``, ``from distrib_la.plan import plan`` and ``from
+# distrib_la import loader`` reach past it — and a reach past the door is
+# how a service stops being replaceable, because the thing on the other side
+# is no longer the API anybody agreed to.
+#
+# THE EXEMPTIONS ARE THE REPLUMB CHECKLIST.  Every entry is a module that
+# exists only to be deleted; the count can go down and the ratchet below
+# fails if an entry stops describing something real.
+
+#: Service top-level package -> the name its door is spelled.  (Identity
+#: today; a service whose door is a submodule would say so here.)
+_SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la"}
+
+#: ``src/`` module -> how many past-the-door edges it is allowed.  These are
+#: the transitional re-export shims, and every one of them is deleted by the
+#: replumb (each says so in its own docstring).
+_SERVICE_DOOR_EXCEPTIONS = {
+    "ffi.linalg.plan":        3,   # Plan, ensure_sharding, plan
+    "ffi.linalg.resolve":    12,   # the resolver's whole vocabulary
+    "ffi.linalg.dispatch":    2,   # dispatch_batched_eigh, EIGH_BACKENDS
+    "ffi.linalg._slate":     13,   # incl. _mesh_key, which isdf/core takes
+    "ffi.linalg._scalapack":  6,
+    "ffi.cusolvermp.batched": 5,
+    "ffi.cusolvermp.eigh":    1,
+    "ffi.cusolvermp.context": 1,
+    "common.cholesky_2d":     3,   # cholesky, dense_to_tiles, tiles_to_dense
+}
+
+
+def service_submodules(sources, service: str) -> set:
+    """Leaf names directly under ``service`` that are MODULES.
+
+    Needed because ``from distrib_la import plan`` is ambiguous in the AST:
+    ``plan`` is both a submodule and a name the door re-exports, and the
+    door's binding is what an importer actually gets.  So a name is a
+    past-the-door reach only if it is a submodule the door does NOT
+    re-export.
+    """
+    n = len(service) + 1
+    return {m[n:] for m in sources
+            if m.startswith(service + ".") and "." not in m[n:]}
+
+
+def door_names(sources, service: str) -> set:
+    """The strings in the service door's ``__all__``.
+
+    Read from the AST, not by importing: this suite must keep running on
+    any interpreter that can parse the tree, with no jax and no service
+    installed.
+    """
+    src = sources.get(service)
+    if src is None:
+        return set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "__all__"
+                for t in node.targets):
+            try:
+                return set(ast.literal_eval(node.value))
+            except Exception:                                # noqa: BLE001
+                return set()
+    return set()
+
+
+def scan_service_door(source: str, mod: str, service: str,
+                      submodules, doors, is_pkg: bool = False):
+    """Imports of ``service`` that go PAST its door. ``[(spelling, line)]``.
+
+    Three spellings, because the tree can write three:
+    ``import svc.sub`` / ``from svc.sub import x`` / ``from svc import
+    <submodule>``.  The last one is the one a hurried replumb writes.
+    """
+    hits = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.startswith(service + "."):
+                    hits.append((a.name, node.lineno))
+        elif isinstance(node, ast.ImportFrom):
+            tgt = _absolute_target(node, mod, is_pkg)
+            if tgt.startswith(service + "."):
+                hits.append((tgt, node.lineno))
+            elif tgt == service:
+                for a in node.names:
+                    if a.name in submodules and a.name not in doors:
+                        hits.append((service + "." + a.name, node.lineno))
+    return sorted(hits, key=lambda h: h[1])
+
+
+def _door_violations(sources):
+    """``{src module: [(spelling, line), …]}`` for every past-the-door edge."""
+    pkgs = packages_in(sources)
+    lorrax = modules_under_src(sources)
+    per_service = {svc: (service_submodules(sources, svc),
+                         door_names(sources, door))
+                   for svc, door in _SERVICE_DOORS.items()}
+    out = {}
+    for mod in sorted(lorrax):
+        hits = []
+        for svc, (subs, doors) in per_service.items():
+            hits += scan_service_door(sources[mod], mod, svc, subs, doors,
+                                      mod in pkgs)
+        if hits:
+            out[mod] = sorted(hits, key=lambda h: h[1])
+    return out
+
+
+def test_lorrax_reaches_a_service_only_through_its_door(sources):
+    bad = {m: h for m, h in _door_violations(sources).items()
+           if m not in _SERVICE_DOOR_EXCEPTIONS}
+    assert not bad, (
+        f"these src/ modules import past a service's door: {bad}.  A service "
+        f"is imported by its TOP-LEVEL package only ("
+        f"{', '.join(sorted(_SERVICE_DOORS))}); reaching a submodule is what "
+        f"stops it being replaceable.")
+    over = {m: (len(h), _SERVICE_DOOR_EXCEPTIONS[m])
+            for m, h in _door_violations(sources).items()
+            if m in _SERVICE_DOOR_EXCEPTIONS
+            and len(h) > _SERVICE_DOOR_EXCEPTIONS[m]}
+    assert not over, (
+        f"a transitional shim grew new past-the-door edges — the exception "
+        f"was for the count on the left, not for the direction: {over}")
+
+
+def test_the_service_door_exceptions_are_all_still_needed(sources):
+    """The ratchet.  A shim that stopped reaching past the door is a shim
+    that can be deleted, and this is where that is noticed."""
+    live = _door_violations(sources)
+    stale = sorted(set(_SERVICE_DOOR_EXCEPTIONS) - set(live))
+    assert not stale, (
+        f"these modules no longer reach past a service door — delete the "
+        f"exception, and probably the module: {stale}")
+    loose = {m: (len(live[m]), n) for m, n in _SERVICE_DOOR_EXCEPTIONS.items()
+             if m in live and len(live[m]) < n}
+    assert not loose, (
+        f"budgets above the real count are a licence to regress; lower them "
+        f"and keep the win: {loose}")
+
+
+def test_the_service_door_scan_can_fail(sources):
+    """RED TWIN for rule 6, over all three spellings the tree can write —
+    seeded with REAL names, so it cannot pass by testing a fiction."""
+    subs = service_submodules(sources, "distrib_la")
+    doors = door_names(sources, "distrib_la")
+    assert "loader" in subs and "loader" not in doors, (
+        "this twin needs a real distrib_la submodule that the door does NOT "
+        "re-export; 'loader' stopped being one")
+    assert "plan" in subs and "plan" in doors, (
+        "this twin needs a name that is BOTH a submodule and a door export, "
+        "or the third spelling's carve-out is untested")
+    cases = [
+        ("import distrib_la.loader\n",                "distrib_la.loader"),
+        ("from distrib_la.plan import plan\n",        "distrib_la.plan"),
+        ("from distrib_la import loader\n",           "distrib_la.loader"),
+        ("def f():\n    from distrib_la import _slate\n", "distrib_la._slate"),
+    ]
+    for src, expected in cases:
+        hits = scan_service_door(src, "m", "distrib_la", subs, doors)
+        assert hits and hits[0][0] == expected, (
+            f"the service-door scan does not detect {expected!r} in {src!r} "
+            f"— it found {hits}")
+
+
+def test_the_service_door_scan_does_not_cry_wolf(sources):
+    """...and the DOOR itself must stay quiet, or the rule is unusable."""
+    subs = service_submodules(sources, "distrib_la")
+    doors = door_names(sources, "distrib_la")
+    ok = ("import distrib_la\n"
+          "from distrib_la import plan, Plan, factor, solve, BACKEND_CHOICES\n"
+          "p = plan('eigh', mesh)\n")
+    assert scan_service_door(ok, "m", "distrib_la", subs, doors) == [], (
+        "the service-door scan flags the door itself; the gate would be "
+        "turned off")
 
 
 def test_no_module_is_in_two_levels():
