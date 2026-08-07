@@ -1992,15 +1992,42 @@ def star_select(A_full, irr_idx_k):
 
 
 def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
-                   irr_labels=None):
+                   irr_labels=None, *, trs_reference="star_row"):
     """Spread an IBZ band-index quantity over the full BZ.
 
-    ``A_irr`` is ``(n_k_irr, ...)`` in the order :func:`star_select`
-    returned; the result is ``(n_k_full, ...)``.  A gather plus a
-    CONJUGATION on every member whose TRS-ness DIFFERS from that of the
-    row :func:`star_select` kept for its star — see
-    :func:`_star_conj_flags` for why the member's own flag is not the
-    predicate.  A device operand never leaves the device.
+    ``A_irr`` is ``(n_k_irr, ...)``; the result is ``(n_k_full, ...)``.
+    A gather plus a CONJUGATION on the rows a predicate selects.  A
+    device operand never leaves the device.
+
+    WHICH PREDICATE DEPENDS ON WHAT ``A_irr``'s ROWS ARE, and there are
+    two callers in this tree that answer differently.  Θ is antiunitary,
+    so the conjugation applies iff the member and the row its value is
+    COPIED FROM differ in TRS-ness — and that source row is not the same
+    object in the two cases:
+
+    ``trs_reference="star_row"`` (default) — ``A_irr`` is what
+        :func:`star_select` returned, so row ``j`` is a FULL-BZ row (the
+        first member of star ``j``) and carries a ``sym_idx`` of its own,
+        which can itself be a time-reversal row.  Predicate: the XOR of
+        the two TRS flags (:func:`_star_conj_flags`).
+
+    ``trs_reference="ibz_slab"`` — ``A_irr`` is the file's own IBZ slab,
+        read verbatim with NO symmetry operation applied, so its rows are
+        untransformed by construction and their TRS flag is identically
+        False.  Predicate: the member's OWN flag, ``sym_idx_k >=
+        n_sym_spatial``.  ``gw.kin_ion_io.broadcast_ibz_to_full_bz`` is
+        this case.
+
+    THE TWO COINCIDE ONLY WHILE EVERY STAR'S FIRST FULL-BZ ROW IS
+    SPATIAL, which is a property of the op-selection policy and not of
+    the physics.  MEASURED on ``tests/regression/cohsex_debug`` with the
+    shipping policy, where star label 2's first row carries sym_idx 12 =
+    ntran (a pure time reversal): the two predicates disagree on 6 of 9
+    k-points, and using the XOR on the IBZ slab conjugates ⟨m|V_H|n⟩'s
+    OFF-DIAGONALS on those rows — 183.61 eV against a V_H computed
+    independently at every full-BZ k, with the DIAGONAL left exactly
+    intact, so the electron count, hermiticity, the spectrum and every
+    diagonal observable survive it unchanged.
 
     ``sym_idx_k`` and ``n_sym_spatial`` are REQUIRED, not optional with an
     equality default: a caller that omitted them would get silently wrong
@@ -2020,9 +2047,18 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
               else np.asarray(irr_labels))
     pos = {int(v): i for i, v in enumerate(labels)}
     take = np.array([pos[int(v)] for v in irr], dtype=np.int32)
-    # Conjugate relative to the star's kept ROW, not on the member's own
-    # TRS flag: ``_star_conj_flags`` carries the derivation.
-    _, conj = _star_conj_flags(irr, sidx, n_sym_spatial)
+    # The conjugation predicate follows ``trs_reference`` — see the
+    # docstring.  Neither branch is a default the other can be folded
+    # into: they disagree on real decks.
+    if trs_reference == "star_row":
+        _, conj = _star_conj_flags(irr, sidx, n_sym_spatial)
+    elif trs_reference == "ibz_slab":
+        conj = np.asarray(sidx) >= int(n_sym_spatial)
+    else:
+        raise ValueError(
+            "star_broadcast: trs_reference must be 'star_row' (A_irr came "
+            "from star_select, rows are full-BZ) or 'ibz_slab' (A_irr is "
+            f"the untransformed IBZ slab); got {trs_reference!r}.")
     return _broadcast_rows(A_irr, take, conj)
 
 

@@ -147,14 +147,23 @@ def _resolve_against(path: str, base_dir: str) -> str:
 # rows, which is exactly what ``common.symmetry_maps.star_broadcast``
 # does; this module calls it rather than re-deriving the rule.
 #
-# A CAVEAT THAT COSTS NOTHING TO STATE.  The predicate below is
-# ``sym_idx_k >= ntran``, i.e. "is this row time-reversed", but the
-# quantity that actually governs the conjugation is whether the row and
-# its REFERENCE differ in TRS-ness.  The two coincide here because the
+# THE PREDICATE, AND WHY IT IS PASSED EXPLICITLY.  The rule below is
+# ``sym_idx_k >= ntran``, i.e. "is this row time-reversed", because the
 # reference is the file's own IBZ slab, read verbatim with no symmetry
 # operation applied at all — the representative is untransformed by
-# construction.  It would stop coinciding the moment a representative
-# were itself a time-reversed row.
+# construction.  ``star_broadcast``'s DEFAULT predicate is a different
+# one (the XOR against the first FULL-BZ row of the star), correct for
+# the ``star_select`` output it is normally handed and wrong here.
+#
+# The two stopped coinciding.  On ``tests/regression/cohsex_debug`` the
+# shipping op-selection policy gives star label 2 a first full-BZ row
+# with sym_idx 12 = ntran (a pure time reversal), so the XOR inverts the
+# conjugation on 6 of the 9 k-points: MEASURED 183.61 eV of error in
+# ⟨m|V_H|n⟩ against a V_H computed independently at every full-BZ k,
+# entirely in the OFF-DIAGONALS (the diagonal, and therefore every
+# diagonal observable and the eqp.dat VH column, is exactly unchanged —
+# which is why nothing caught it).  Hence ``trs_reference="ibz_slab"``
+# is passed explicitly rather than relying on the default.
 #
 # AND A WARNING ABOUT VALIDATING THIS.  A cell with inversion symmetry
 # needs no time-reversal rows to cover its mesh, so its ``sym_idx_k``
@@ -190,6 +199,9 @@ def broadcast_ibz_to_full_bz(A_irr, sym):
     here run on ``k='ibz'``, whose rows are raw IBZ indices, so the labels
     passed are the identity — which makes its gather ``A[irr_idx_k]``, the
     parent map, with ``conj`` applied on the time-reversed rows.
+    ``trs_reference="ibz_slab"`` selects that conjugation predicate; see
+    the block above for the 183.61 eV this costs when it is left to
+    ``star_broadcast``'s default.
 
     ``n_sym_spatial`` is derived from ``sym.sym_mats_k`` (always
     ``2·ntran`` long, both SymMaps branches) rather than from the WFN
@@ -213,7 +225,8 @@ def broadcast_ibz_to_full_bz(A_irr, sym):
     n_sym_spatial = int(np.asarray(sym.sym_mats_k).shape[0]) // 2
     return symmetry_maps.star_broadcast(
         A, sym.irr_idx_k, sym.sym_idx_k, n_sym_spatial,
-        irr_labels=np.arange(A.shape[0], dtype=np.int32))
+        irr_labels=np.arange(A.shape[0], dtype=np.int32),
+        trs_reference="ibz_slab")
 
 
 # ---- artifact provenance ---------------------------------------------------
@@ -766,6 +779,18 @@ def build_argparser() -> argparse.ArgumentParser:
                            "reproducing old artifacts — the stored-array default is "
                            "strictly better (kin_ion stays reusable, QSGW gets the "
                            "full matrix, and the VH column stops reading 0.000).")
+    argp.add_argument("--soc", choices=("auto", "true", "false"), default="auto",
+                      help="which V_NL projectors to build from a FULLY-RELATIVISTIC "
+                           "pseudopotential.  'true' = j-resolved (spin-orbit ON, the "
+                           "historical behaviour, correct for lspinorb=.true. "
+                           "wavefunctions).  'false' = j-averaged scalar-relativistic "
+                           "V_NL ⊗ 1_spin, reproducing QE average_pp — correct for "
+                           "noncolin=.true., lspinorb=.false. wavefunctions.  'auto' "
+                           "(default) reads QE's <spinorbit> when the structure came "
+                           "from a .save and otherwise ANNOUNCES that it is assuming "
+                           "spin-orbit.  nspinor=2 means noncollinear, which does NOT "
+                           "imply spin-orbit; a BerkeleyGW WFN.h5 records nspinor and "
+                           "nothing else, so on that input this cannot be inferred.")
     return argp
 
 
@@ -952,14 +977,23 @@ def main(argv=None):
         V_loc_r = jnp.asarray(V_loc_r, dtype=jnp.float64)
 
     vnl_setup = None
+    soc_flag = {"auto": None, "true": True, "false": False}[args.soc]
     if pseudos:
         print0("Building unified V_NL setup...")
+        # ``soc`` decides which PROJECTORS get built — j-resolved (spin-orbit)
+        # or j-averaged (scalar-relativistic).  It is upstream of the
+        # projector contraction and does not touch it.  ``None`` means the
+        # caller did not declare, in which case ``resolve_soc_mode`` looks for
+        # QE's <spinorbit> and, failing that, announces the assumption instead
+        # of taking it silently.
         vnl_setup = vnl_ops.build_vnl_setup(
             wfn,
             sym,
             meta,
             pseudos,
             nspinor=int(wfn.nspinor),
+            soc=soc_flag,
+            print_fn=print0,
         )
 
     # ---- build the mean-field V_H on the same FFT grid (k-independent) ----
@@ -1052,9 +1086,29 @@ def main(argv=None):
         # transient at one chunk instead of the whole (nrk, nb, nb).  The
         # star broadcast follows immediately, so what leaves this block is
         # the full-BZ table the writer has always been handed.
-        kin_ion_all = broadcast_ibz_to_full_bz(
-            blocks_to_host(H_kin_ion, nb=nb_eff, owner_only=True), sym)
+        kin_ion_irr = blocks_to_host(H_kin_ion, nb=nb_eff, owner_only=True)
+        kin_ion_all = broadcast_ibz_to_full_bz(kin_ion_irr, sym)
     del H_kin_ion, psi_G
+
+    # ---- DOES THIS OPERATOR HAVE THE SYMMETRY OF THESE WAVEFUNCTIONS? ----
+    # Free: the matrix is already here.  Run on the IRREDUCIBLE rows, which
+    # are the ones ``wfn.energies`` indexes; the full-BZ table is their star
+    # broadcast and carries no independent information.
+    #
+    # This is the detector that needs NO metadata.  A BerkeleyGW WFN.h5
+    # records ``nspinor`` and not ``lspinorb``, so when the deck does not
+    # declare and there is no QE .save, the flag-based check in
+    # ``resolve_soc_mode`` can only announce an assumption — this one can
+    # still MEASURE whether the assumption was wrong, by asking whether
+    # T+V_loc+V_NL splits a manifold that ``el`` holds degenerate.
+    if rank == 0 and kin_ion_irr is not None:
+        from psp.operator_checks import check_degeneracy_consistency
+        _en = np.asarray(wfn.energies)
+        _en = _en[0] if _en.ndim == 3 else _en          # (nk, nb), Ry
+        check_degeneracy_consistency(
+            np.asarray(kin_ion_irr)[:nk_irr], _en[:nk_irr, :nb_eff],
+            label="kin_ion (T+V_loc+V_NL)", print_fn=print0)
+    del kin_ion_irr
 
     # ``owner_only``: from here on ``kin_ion_all``/``v_h_all`` exist on
     # rank 0 ONLY (None on the peers) — every consumer below is rank-0.
@@ -1101,6 +1155,15 @@ def main(argv=None):
                 ds.attrs["nelec_bands"] = int(wfn.nelec)
                 ds.attrs["bispinor"] = bool(bispinor)
                 ds.attrs["nspinor"] = int(wfn.nspinor)
+                # WHICH V_NL PROJECTORS.  ``nspinor`` alone does NOT say:
+                # noncollinear is not spin-orbit, and a file written with
+                # j-resolved projectors against a lspinorb=.false. WFN is
+                # indistinguishable from a correct one by every other attr
+                # here.  ``soc_requested`` records what the caller asked for,
+                # ``soc`` what was actually built.
+                ds.attrs["soc"] = bool(
+                    vnl_setup.soc) if vnl_setup is not None else False
+                ds.attrs["soc_requested"] = args.soc
                 ds.attrs["fft_grid"] = np.asarray(meta.fft_grid, dtype=np.int32)
                 # ---- WHAT THIS FILE WAS MADE FROM -------------------------
                 # ``wfn_file`` above is a BASENAME: every WFN in the project
