@@ -11,7 +11,7 @@ Two properties here, and they are different claims:
   the extraction had to buy with three edits and no others: the module-top
   ``common.shard_map`` / ``common.collectives`` imports became the private
   copies in this package, and ``common.gvec_fft_box`` / ``file_io.mf_header``
-  / ``file_io._slab_io_ffi`` became LAZY, inside the one method each is
+  / ``file_io.slab_io`` became LAZY, inside the one method each is
   used by.
 * ``import wfn_loader`` needs no ``.so`` and no MPI.  The collective phdf5
   read is reached through the slab_io door at CALL time; a metadata-only
@@ -120,10 +120,18 @@ def test_every_door_name_binds_with_no_lorrax_anywhere():
     own suite, rather than as an ImportError in lorrax's package
     ``__init__``.
 
-    The underscored names are in the list on purpose: two cells in
-    ``tests/test_wfn_loader_eager.py`` read ``_build_phdf5_clamped_counts``
-    by name (one of them its SOURCE), and that is why it is door surface
+    The underscored names are in the list on purpose:
+    ``tests/test_wfn_loader_eager.py`` pins ``_phdf5_unfold_kernel``'s
+    output against the eager backend, which is why it is door surface
     rather than an implementation detail.
+
+    ``_build_phdf5_clamped_counts`` was the name asserted here until
+    2026-08-07; it is now ``file_io._slab_io_ffi._derive_window_counts``,
+    behind the slab_io door, and the cells that read it moved with it.
+    The named assertion moved to the kernel that stayed rather than being
+    dropped: without one, this cell degrades to "``__all__`` is
+    self-consistent", which a door that re-exported only ``WfnLoader``
+    would also satisfy.
     """
     _needs_deps()
     run = import_isolation(
@@ -133,7 +141,7 @@ def test_every_door_name_binds_with_no_lorrax_anywhere():
                  "for _n in _w.__all__:\n"
                  "    assert getattr(_w, _n, None) is not None, _n\n"
                  "assert _w.WfnLoader.__name__ == 'WfnLoader'\n"
-                 "assert '_build_phdf5_clamped_counts' in _w.__all__\n"
+                 "assert '_phdf5_unfold_kernel' in _w.__all__\n"
                  "assert _w.KSpec is not None\n")
     assert run.loaded == ()
 
@@ -143,7 +151,7 @@ def test_wfn_loader_still_imports_clean_with_lorrax_on_the_path():
     with lorrax's src right there, wfn_loader still touches none of it.
 
     This is the cell the lazy imports are really about.  ``common.
-    gvec_fft_box``, ``file_io.mf_header`` and ``file_io._slab_io_ffi`` are
+    gvec_fft_box``, ``file_io.mf_header`` and ``file_io.slab_io`` are
     all IMPORTABLE here — so a module-scope import of any of them would
     succeed and show up in ``loaded``, which is precisely what the
     monorepo-absent cell above cannot distinguish from a typo in a path.

@@ -37,7 +37,7 @@ __all__ = [
     # readers (was phdf5/read.py)
     "handle_vector",
     "ffi_read_call", "ffi_read_kchunk_call", "ffi_read_kchunk_union_call",
-    "read_sharded_slab", "read_kchunk_sharded", "read_kchunk_union_sharded",
+    "read_sharded_slab", "read_kchunk_union_sharded",
     # writer (was phdf5/write.py)
     "write_sharded_slab", "ffi_write_call",
 ]
@@ -218,18 +218,12 @@ atexit.register(_atexit_close_all)
 # =========================================================================
 """Sharded-slab FFI readers for parallel-HDF5 datasets.
 
-Three entry points, each wrapping a C++ handler defined in
+Two entry points, each wrapping a C++ handler defined in
 ``cpp/read_ffi.cc``:
 
 ===========================  ===========================================
 ``read_sharded_slab``         2-D dataset → ``P('x','y')``-sharded array.
                               Thinnest convenience wrapper.
-``read_kchunk_sharded``       N-D dataset, ``n_kchunk`` independent
-                              windows, **one handler invocation doing
-                              n_kchunk sequential H5Dreads**.  Use when
-                              the per-k windows might overlap in the
-                              file (e.g. ngkmax slabs at variable-ngk
-                              WFN files).
 ``read_kchunk_union_sharded`` N-D dataset, ``n_kchunk`` **disjoint**
                               windows via ``H5S_SELECT_OR`` compound
                               hyperslab, **one H5Dread**.  Use when the
@@ -238,15 +232,26 @@ Three entry points, each wrapping a C++ handler defined in
                               construction.
 ===========================  ===========================================
 
+There were THREE until 2026-08-07.  ``read_kchunk_sharded`` wrapped
+``PhdfReadKchunk``, which does n_kchunk SEQUENTIAL H5Dreads inside one
+handler invocation, and it had zero callers in the tree — every reader of
+variable-ngk WFN windows takes the union path, whose per-k counts make the
+windows disjoint by construction and cost one collective instead of n.
+The measurement that settled the question (2026-08-07, ``_measure_fold``):
+n separate reads cost 1.4-3.6x the union call at every deck measured, and
+the gap grows with n.  A wrapper with no callers and a losing measurement
+behind it is not an option, it is a second spelling; DELETED.  Its C++
+handler is still in the deployed ``.so`` pair and its removal is
+registered to the owner, so ``ffi_read_kchunk_call`` below stays as the
+1:1 binding of a handler that still exists.
+
 Each high-level function returns a jitted ``shard_map`` closure: the
 caller dispatches against it with runtime buffer arguments (offsets,
 counts), and the same compiled module handles any offsets/counts
 combination at the same shapes/dtypes.
 
-Preferred public entry point for simple cases remains
-:mod:`file_io.slab_io`, which auto-dispatches between this FFI and an
-h5py+gather fallback.  The three functions here are the low-level
-building blocks.
+Preferred public entry point remains :mod:`file_io.slab_io`, whose
+``read_slab`` / ``read_slabs`` are the door onto these two.
 """
 
 _TARGET_READ = "lorrax_phdf5_read"
@@ -357,6 +362,12 @@ def ffi_read_kchunk_call(
     """Sequential-reads kchunk — one handler invocation doing
     ``n_kchunk`` H5Dread calls into a packed pinned buffer.  Each of the
     per-k rectangles has the same shape; only its file offset varies.
+
+    NO PYTHON CALLER since 2026-08-07: ``read_kchunk_sharded``, the only
+    one, was deleted on the measurement above.  Kept because the
+    ``PhdfReadKchunk`` handler is still exported by the deployed ``.so``
+    pair, and a binding is how anyone reaches or debugs one; it goes out
+    WITH the handler, which is registered to the owner.
     """
     return jax.ffi.ffi_call(_TARGET_READ_KCHUNK, out_struct)(
         offset_base,
@@ -448,83 +459,6 @@ def read_sharded_slab(
     )(handle, offset_zero, valid_shape)
 
 
-def read_kchunk_sharded(
-    fh: int,
-    ds_name: str,
-    *,
-    n_kchunk: int,
-    file_global_shape: Sequence[int],
-    per_rank_file_shape: Sequence[int],
-    dtype,
-    mesh: Mesh,
-    file_partition_spec: P,
-) -> Callable[[jax.Array], jax.Array]:
-    """Build a jitted ``f(offset_base) → array`` callable for
-    ``n_kchunk`` **same-shape** hyperslab windows.
-
-    Use when the per-k windows may overlap in the file (e.g. ngkmax
-    slabs at variable-ngk WFN files): the handler does n_kchunk
-    sequential H5Dreads under the hood, each reading into a distinct
-    stripe of the output.  One XLA op, n_kchunk MPI-IO collectives.
-
-    Parameters
-    ----------
-    fh : int
-        Context handle from :func:`ffi.phdf5.open_file`.
-    ds_name : str
-        HDF5 dataset path (e.g. ``"wfns/coeffs"``).
-    n_kchunk : int
-        Number of windows (compile-time constant).
-    file_global_shape : length ``ndim_file``
-        Dataset shape on disk (for sanity checks only).
-    per_rank_file_shape : length ``ndim_file``
-        One rank's portion of a single window.
-    dtype : numpy dtype
-    mesh : Mesh
-        2-D ``('x','y')`` mesh.
-    file_partition_spec : PartitionSpec, length ``ndim_file``
-        How the file dims are sharded on ``mesh``.
-
-    Returns
-    -------
-    callable
-        ``f(offset_base: (n_kchunk, ndim_file) int64) → (n_kchunk, *file_shape_sharded)``.
-        The leading n_kchunk axis is always replicated across ranks;
-        only the trailing file dims are sharded per ``file_partition_spec``.
-    """
-    ndim_file = len(per_rank_file_shape)
-    if len(file_global_shape) != ndim_file:
-        raise ValueError(
-            f"file_global_shape ndim {len(file_global_shape)} != "
-            f"per_rank_file_shape ndim {ndim_file}")
-    p = int(mesh.shape["x"])
-    q = int(mesh.shape["y"])
-
-    axis_count_per_dim, axis_flat = _encode_sharding_axes(
-        mesh, file_partition_spec, ndim_file)
-    ds_id = _register_and_open_dataset(fh, ds_name, mesh)
-
-    out_local_shape = (n_kchunk,) + tuple(int(s) for s in per_rank_file_shape)
-    out_struct = jax.ShapeDtypeStruct(out_local_shape, jnp.dtype(dtype))
-    out_partition_spec = P(None, *tuple(file_partition_spec))
-
-    def _per_rank(offset_base_local):
-        return ffi_read_kchunk_call(
-            out_struct, offset_base_local,
-            ctx_handle=int(fh), ds_id=int(ds_id),
-            mesh_shape=(p, q),
-            axis_count_per_dim=axis_count_per_dim,
-            axis_flat=axis_flat,
-            n_kchunk=int(n_kchunk),
-        )
-
-    return jax.jit(shard_map(
-        _per_rank, mesh=mesh,
-        in_specs=(P(),), out_specs=out_partition_spec,
-        check_vma=False,
-    ))
-
-
 def read_kchunk_union_sharded(
     fh: int,
     ds_name: str,
@@ -592,8 +526,10 @@ def _read_kchunk_union_sharded_cached(
 
     Parameters
     ----------
-    fh, ds_name :
-        As :func:`read_kchunk_sharded`.
+    fh : int
+        Context handle from :func:`open_file`.
+    ds_name : str
+        HDF5 dataset path (e.g. ``"wfns/coeffs"``).
     n_kchunk : int
         Number of windows (compile-time).
     kchunk_axis : int
@@ -604,9 +540,15 @@ def _read_kchunk_union_sharded_cached(
         Passing ``kchunk_axis=2`` for a ``(nb, ns, ngkmax, 2)``-shaped
         per-rank file shape produces the output
         ``(nb, ns, n_kchunk, ngkmax, 2)``.
-    file_global_shape, per_rank_file_shape, dtype, mesh,
-    file_partition_spec :
-        As :func:`read_kchunk_sharded`.
+    file_global_shape : length ``ndim_file``
+        Dataset shape on disk (for sanity checks only).
+    per_rank_file_shape : length ``ndim_file``
+        One rank's portion of a single window.
+    dtype : numpy dtype
+    mesh : Mesh
+        2-D ``('x','y')`` mesh.
+    file_partition_spec : PartitionSpec, length ``ndim_file``
+        How the file dims are sharded on ``mesh``.
 
     Returns
     -------

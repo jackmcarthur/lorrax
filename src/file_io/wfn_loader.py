@@ -38,7 +38,6 @@ from wfn_loader import (                                 # noqa: E402,F401
     KSpec,
     WfnLoader,
     _bispinor_lift_kernel,
-    _build_phdf5_clamped_counts,
     _get_bispinor_lift_jit,
     _phdf5_unfold_kernel,
     _sharded_zero_proto_fn,

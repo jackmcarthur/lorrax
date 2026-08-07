@@ -1442,7 +1442,7 @@ def test_the_wfn_loader_door_scan_does_not_cry_wolf(sources):
     doors = door_names(sources, "wfn_loader")
     ok = ("import wfn_loader\n"
           "from wfn_loader import WfnLoader, KSpec, "
-          "_build_phdf5_clamped_counts\n"
+          "_phdf5_unfold_kernel\n"
           "w = WfnLoader(path)\n")
     assert scan_service_door(ok, "m", "wfn_loader", subs, doors) == [], (
         "the service-door scan flags the door itself; the gate would be "

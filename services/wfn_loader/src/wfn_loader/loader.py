@@ -88,82 +88,6 @@ __all__ = ["WfnLoader"]
 KSpec = Sequence[int] | Literal["ibz", "full_bz"]
 
 
-def _build_phdf5_clamped_counts(
-    *,
-    world: int,
-    bands_per_rank: int,
-    b_lo_logical: int,
-    band_extent: int,
-    n_reads: int,
-    ngk_per_ibz_read: Sequence[int],
-    kchunk_start_per_read: Sequence[int],
-    ngktot: int,
-    ns: int,
-) -> np.ndarray:
-    """Per-rank ``counts`` table for the kchunk-union phdf5 read.
-
-    This is the SlabIO padded-slab clip applied per rank: the arithmetic
-    itself is :func:`file_io._slab_io_ffi._derive_valid_shape`
-    (``max(0, min(slab, logical - offset))`` per dim) and lives there
-    only.  This function owns the table LAYOUT the C++ wants, not the
-    clip.  They were two implementations until 2026-08-06 and they had
-    diverged on the band axis — see below.
-
-    The C++ ``read_kchunk_union`` handler computes each rank's
-    band-axis file offset as
-    ``offset_band = b_lo_logical + rank_coord_band * bands_per_rank``,
-    where ``rank_coord_band = coord_x * p_y + coord_y`` for a 2-D
-    ``('x','y')`` mesh of shape ``(p_x, p_y)``.  The rank slab is
-    therefore ``(bands_per_rank, ns, ngk[ibz], 2)`` at file offset
-    ``(offset_band, 0, kchunk_start, 0)``, and the count each rank
-    passes to H5Sselect_hyperslab is that slab clipped to the LOGICAL
-    extent of the read.
-
-    ``band_extent`` IS THE LOGICAL WINDOW END ``b_hi``, NOT ``mnband``.
-    Both bounds matter and ``b_hi <= mnband`` always (``load`` refuses
-    otherwise), so the logical one subsumes the file one:
-
-    * clipping to ``mnband`` alone is what stops the tail rank reading
-      past EOF — ``(b_hi - b_lo)`` rounded up to ``world *
-      bands_per_rank`` can extend past the file, and H5Dread then fails
-      with "selection + offset not within extent" (the 16-GPU CrI3
-      crash);
-    * clipping to ``b_hi`` additionally keeps the BAND-PAD rows empty.
-      Clipping to ``mnband`` only, the tail rank read REAL file bands
-      ``[b_hi, b_lo + nb_padded)`` into rows the loader documents as
-      zero ("Band axis pad rows are zero-filled", :meth:`WfnLoader.load`)
-      and that ``_eager_build`` / ``_eager_build_process_local`` do fill
-      with zeros.  That made the phdf5 backend disagree with the eager
-      backend on every request whose band count is not a multiple of the
-      world size — i.e. the P2 byte-identity contract held only on the
-      exactly-divisible geometries the parity harness happens to run.
-
-    Ranks whose whole block is past ``band_extent`` get band_cnt=0 —
-    their pinned-buffer pre-zero (in the C++ worker) becomes a
-    zero-filled rank tile, which is the correct semantics for pad rows.
-    Equivalently: ``sum_r band_cnt == b_hi - b_lo`` exactly, which is
-    the invariant the regression test asserts.
-
-    The table is sharded on the leading axis by ``('x','y')`` so each
-    rank's shard_map-local view is the ``(n_reads, 4)`` slice for its
-    own rank.  Rank-flattening matches the C++: outer loop over ``r``
-    in 0..world-1 corresponds to ``coord_x = r // p_y,
-    coord_y = r % p_y`` (leftmost-is-slowest in JAX's convention).
-    """
-    from file_io._slab_io_ffi import _derive_valid_shape
-    logical = (int(band_extent), int(ns), int(ngktot), 2)
-    counts = np.zeros((int(world), int(n_reads), 4), dtype=np.int64)
-    for r in range(int(world)):
-        file_off_band = int(b_lo_logical) + r * int(bands_per_rank)
-        for ki in range(int(n_reads)):
-            counts[r, ki] = _derive_valid_shape(
-                (int(bands_per_rank), int(ns),
-                 int(ngk_per_ibz_read[ki]), 2),
-                (file_off_band, 0, int(kchunk_start_per_read[ki]), 0),
-                logical)
-    return counts.reshape(int(world) * int(n_reads), 4)
-
-
 class WfnLoader:
     # ------------------------------------------------------------------
     # Lifecycle
@@ -208,9 +132,9 @@ class WfnLoader:
 
         self._file = h5.File(self._path, "r")
 
-        # phdf5 collective context (lazy on first load).  Held here so
+        # The collective read handle (lazy on first load).  Held here so
         # the file is kept open for the loader's lifetime.
-        self._phdf5_ctx: int | None = None
+        self._slab_io = None
         self._phdf5_static_dev: dict | None = None
 
         # mf_header surface — same names WFNReader exposes (drop-in compat).
@@ -338,14 +262,13 @@ class WfnLoader:
             except Exception:
                 pass
             self._file = None
-        ctx = getattr(self, "_phdf5_ctx", None)
-        if ctx is not None:
+        sio = getattr(self, "_slab_io", None)
+        if sio is not None:
             try:
-                from ffi.phdf5 import close_file
-                close_file(ctx)
+                sio.close()
             except Exception:
                 pass
-            self._phdf5_ctx = None
+            self._slab_io = None
 
     def __enter__(self) -> "WfnLoader":
         return self
@@ -444,18 +367,20 @@ class WfnLoader:
         except Exception:
             return "eager"
         # GPU first, then CPU: the SAME collective MPI-IO read path, served
-        # by whichever platform's FFI library exports the kchunk-union read
-        # handler.  ``ffi_loader.probe_target`` owns the per-platform symbol
-        # probe (adding a new FFI target platform touches only
-        # ffi_loader._PLATFORMS, not this ladder), and it distinguishes the
-        # three ways a target can be unusable — which is why the refusal
-        # below quotes its reason verbatim instead of reducing it to a bool.
-        from ffi.common.ffi_loader import probe_target
+        # by whichever platform's FFI library can serve a slab read.  The
+        # question "can this platform read a slab" belongs to the door that
+        # does the reading, so this ladder asks
+        # ``slab_io.probe_read_availability`` and nothing here names an FFI
+        # target.  That probe wraps ``ffi_loader.probe_target``, which
+        # distinguishes the three ways a target can be unusable — which is
+        # why the refusal below quotes its reason verbatim instead of
+        # reducing it to a bool — and it is per-platform UNCACHED, because a
+        # ladder is exactly what a platform-blind cache would poison.
+        from file_io.slab_io import probe_read_availability
         reasons = []
         for _plat in ("CUDA", "cpu"):
-            usable, why = probe_target("lorrax_phdf5_read_kchunk_union", _plat)
+            usable, why = probe_read_availability(_plat)
             if usable:
-                from ffi.phdf5 import open_file as _of  # noqa: F401
                 return "phdf5"
             reasons.append(f"  {_plat}: {why}")
         raise RuntimeError(
@@ -901,7 +826,7 @@ class WfnLoader:
         ``wfn_transforms``).
 
         Touches NO FFI: these are numpy tables staged process-locally, so
-        the collective context lives in :meth:`_ensure_phdf5_ctx` instead
+        the collective handle lives in :meth:`_ensure_slab_io` instead
         of being a side effect of building them.  (It used to be one,
         gated on ``self.backend == "phdf5"`` — a tier test that has had
         exactly one reachable value since the ``phdf5_host`` tier was
@@ -982,48 +907,25 @@ class WfnLoader:
         }
         return self._phdf5_static_dev
 
-    def _ensure_phdf5_ctx(self) -> int:
-        """Open (once) the collective phdf5 context this loader reads
-        through, and return its handle.  Held for the loader's lifetime;
-        :meth:`close` releases it."""
-        if self._phdf5_ctx is None:
-            from ffi.phdf5 import open_file
-            from file_io._slab_io_ffi import (
-                _assert_mpi_world, _env_flag, _rank0, file_stripe_layout)
-            self._phdf5_ctx = open_file(
-                self._path, mesh=self._mesh, mode="r")
-            # MIRRORS _FfiBackend.__init__ (_slab_io_ffi.py), which this
-            # loader does NOT go through: it calls ffi.phdf5.open_file
-            # directly, so none of that constructor's open-time guards ran
-            # here.  ``open_file`` has now brought MPI up, so ask it how big
-            # the world REALLY is before a single hyperslab is derived from
-            # jax.process_count().  The measurement this exists for (ledger
-            # claims/0068, job 56389339): a wrong PMI flavour gave
-            # MPI_Comm_size()==1 on EVERY rank while jax.process_count()==16,
-            # and eight hostile geometries were written and read back
-            # BIT-EXACT, rc=0, with no warning anywhere.  Silent wrong
-            # parallelism is the failure this refuses.
-            _assert_mpi_world(self._mesh)
-            # Announce the layout the FILE HAS, which is not the layout the
-            # striping policy would request: a Lustre layout is fixed at
-            # create and WFN.h5 is created by pw2bgw, so _export_striping_env
-            # is inert on this path.  _FfiBackend logs striping only for
-            # mode='w' for exactly that reason, which left the read side
-            # silent about its own dominant term.  stripe_count=1 pins
-            # cb_nodes=1 -- one aggregator at any rank count.
-            if _rank0() and _env_flag("LORRAX_PHDF5_LOG", True):
-                _lay = file_stripe_layout(self._path)
-                if _lay is not None:
-                    _c, _s = _lay
-                    _warn = ("  <-- ONE STRIPE: cb_nodes=1, single-aggregator "
-                             "read at any rank count; `lfs setstripe -c 16 -S 4M`"
-                             " on the deck dir before pw2bgw, or `lfs migrate`"
-                             " this file" if _c == 1 else "")
-                    print(f"  [WfnLoader] {Path(self._path).name} "
-                          f"file stripe_count={_c} stripe_size={_s} B "
-                          f"(the file's own inode, not the policy){_warn}",
-                          flush=True)
-        return self._phdf5_ctx
+    def _ensure_slab_io(self):
+        """The SlabIO handle this loader reads psi through, opened once.
+
+        Held for the loader's lifetime; :meth:`close` closes it.  SlabIO's
+        constructor runs the collective open's real guards — the capability
+        probe, the MPI-world check against the LIVE communicator, and the
+        read-side stripe-layout announcement — which this loader used to
+        hand-copy from ``_FfiBackend.__init__`` because it called
+        ``ffi.io.open_file`` itself.  It no longer does; the door is the
+        only phdf5 opener.
+
+        ``ffi.io`` caches one ``PhdfCtx`` per PATH, so a loader and a
+        SlabIO on the same file share one collective context and one
+        H5Fopen (measured on the step-0 legs: both handles printed equal).
+        """
+        if self._slab_io is None:
+            from file_io.slab_io import SlabIO
+            self._slab_io = SlabIO(self._path, mode="r", mesh=self._mesh)
+        return self._slab_io
 
     def _phdf5_build(
         self,
@@ -1035,21 +937,26 @@ class WfnLoader:
         nb_padded: int,
         out_sharding: NamedSharding,
     ) -> jax.Array:
-        """Collective FFI read + on-device unfold → G-flat ψ.
+        """Collective read through the slab_io door + on-device unfold.
 
         Output: ``(n_k, nb_padded, nspinor, ngkmax)`` c128 sharded as
         ``out_sharding`` (typically ``P(None, ('x','y'), None, None)``).
-        """
-        from ffi.phdf5.read import read_kchunk_union_sharded
 
+        The read is ONE call: n_reads windows of the SAME padded slab
+        shape, one per IBZ source k, in one collective H5Dread.  This
+        method builds the request — where each window starts and how much
+        of the slab is real — and states nothing about hyperslabs, ranks
+        or FFI targets; ``SlabIO.read_slabs`` owns all of that, including
+        the per-rank clip that used to be a second copy of the arithmetic
+        living here (see its docstring, and _slab_io_ffi's
+        ``_derive_window_counts``).
+        """
         self._ensure_phdf5_static()
-        ctx = self._ensure_phdf5_ctx()
         p_x = int(self._mesh.shape["x"])
         p_y = int(self._mesh.shape["y"])
         world = p_x * p_y
         ns = int(self.nspinor)
         ngkmax = int(self.ngkmax)
-        ngktot = int(np.sum(self.ngk))
         nb = nb_padded
         if nb % world:
             raise ValueError(
@@ -1058,87 +965,55 @@ class WfnLoader:
         bands_per_rank = nb // world
         b_lo_logical = int(b_lo)
         b_hi_logical = int(b_hi)
-
-        # Union-read k-plan (shared with the host twin via _kplan).
-        ibz_unique_sorted, n_reads, position_in_reads, n_k = self._kplan(
-            k_idxs, unfold)
-
-        # Hyperslab offsets/counts for the union read.
-        # Dataset layout: (mnband, nspinor, ngktot, 2) f64; kchunk_axis=2.
-        offsets = np.stack([
-            [b_lo_logical, 0, int(self._kpt_starts[ibz]), 0]
-            for ibz in ibz_unique_sorted
-        ], axis=0).astype(np.int64)
-        # Per-rank counts: the C++ adds ``rank_coord_band * bands_per_rank``
-        # to ``offsets[:, 0]`` to get each rank's band-axis file offset,
-        # so each rank's slab must be clipped to the LOGICAL extent of
-        # the read before it becomes a hyperslab selection.  That clip is
-        # SlabIO's ``_derive_valid_shape``, applied per rank by
-        # ``_build_phdf5_clamped_counts`` (see its docstring for why the
-        # band bound is ``b_hi``, not ``mnband``, and what diverged while
-        # this file carried its own copy of the arithmetic).  Ranks whose
-        # block is entirely past the window get count=0 on the band axis
-        # → no H5Dread bytes contributed; the C++ pre-zeros the pinned
-        # buffer so the rank's tile reads as exactly zero.
         mnband_file = int(self.nbands)
-        ngk_per_ibz_read = tuple(int(self.ngk[ibz]) for ibz in ibz_unique_sorted)
-        counts_global = _build_phdf5_clamped_counts(
-            world=world,
-            bands_per_rank=bands_per_rank,
-            b_lo_logical=b_lo_logical,
-            # ``load`` refuses ``b_hi > mnband``, so the min() is the
-            # file-extent backstop for a direct caller of _phdf5_build.
-            band_extent=min(b_hi_logical, mnband_file),
-            n_reads=n_reads,
-            ngk_per_ibz_read=ngk_per_ibz_read,
-            kchunk_start_per_read=tuple(
-                int(self._kpt_starts[int(ibz)]) for ibz in ibz_unique_sorted),
-            ngktot=ngktot,
-            ns=ns,
-        )
 
-        # The (pure) per-rank band-axis cap doubles as a precondition for
-        # the padded case: whenever ``b_lo + nb_padded > band_extent``,
-        # the per-rank clip above produces band_cnt < bands_per_rank for
-        # the tail-rank(s); the C++ honours that (count is per-rank and
-        # ≤ per_rank_max[0]=bands_per_rank).  This makes the prior
-        # NotImplementedError-on-pad-past-file branch obsolete; the
-        # phdf5 backend now matches the eager backend's zero-fill
-        # behaviour on BOTH kinds of pad row (past the logical window,
-        # and past the file).  We leave a sanity check for the extreme
-        # case where ``b_lo`` itself starts past EOF (nonsensical request
-        # that ``WfnLoader.load`` rejects upstream in its band-range
-        # check, but defended here too).
+        # ``load`` refuses ``b_hi > mnband``, so the min() is the
+        # file-extent backstop for a direct caller of _phdf5_build.  The
+        # per-rank clip inside the door then handles the padded case: when
+        # ``b_lo + nb_padded > band_extent`` the tail rank(s) get a band
+        # count below bands_per_rank and the rank past the end gets 0,
+        # which is how the collective path matches the eager backend's
+        # zero-fill on BOTH kinds of pad row (past the logical window, and
+        # past the file).  Only the extreme case is ours to refuse:
+        # ``b_lo`` itself past EOF, which ``load``'s band-range check
+        # rejects upstream and this defends anyway.
+        band_extent = min(b_hi_logical, mnband_file)
         if b_lo_logical >= mnband_file:
             raise ValueError(
                 f"_phdf5_build: b_lo={b_lo_logical} >= mnband={mnband_file}; "
                 "entire band window past file extent")
 
-        rep2 = NamedSharding(self._mesh, P(None, None))
-        counts_sharding = NamedSharding(self._mesh, P(("x", "y"), None))
-        # Process-local placement for both tables.  ``counts_global`` is
-        # the (world·n_reads, 4) table sharded ('x','y') on the leading
-        # axis, so this is literally the per-rank hyperslab: each rank
-        # keeps only its own ``(n_reads, 4)`` rows and never sends them.
-        # Via ``jax.device_put`` the hidden ``assert_equal`` gather on
-        # this one is O(P²) — ``P·(world·n_reads)·4·8`` B, 18.9 MB at
-        # P=64 but 95.5 MB at P=144.
-        # (``position_in_reads`` is staged inside _phdf5_unfold_and_shard.)
-        offsets_dev = device_put_process_local(offsets, rep2)
-        counts_dev = device_put_process_local(counts_global, counts_sharding)
+        # Union-read k-plan (shared with the host twin via _kplan).
+        ibz_unique_sorted, n_reads, position_in_reads, n_k = self._kplan(
+            k_idxs, unfold)
 
-        reader = read_kchunk_union_sharded(
-            ctx, "wfns/coeffs",
-            n_kchunk=n_reads,
-            kchunk_axis=2,
-            file_global_shape=(int(self.nbands), ns, ngktot, 2),
-            per_rank_file_shape=(bands_per_rank, ns, ngkmax, 2),
+        # One window per IBZ source k, in ascending file order (which is
+        # what _kplan's sort buys — the door requires the windows disjoint
+        # and ascending).  Dataset layout: (mnband, nspinor, ngktot, 2) f64,
+        # so the window axis goes at 2, immediately before the G axis that
+        # varies across windows.
+        offsets = np.stack([
+            [b_lo_logical, 0, int(self._kpt_starts[ibz]), 0]
+            for ibz in ibz_unique_sorted
+        ], axis=0).astype(np.int64)
+        # ...and how much of the padded slab is REAL in each: the band
+        # rows up to the logical window end, this k's own ngk on the G
+        # axis, everything on the replicated axes.  Stating extents is the
+        # whole request; the clip against them, per rank, is the door's.
+        valid_shapes = np.stack([
+            [band_extent - b_lo_logical, ns, int(self.ngk[ibz]), 2]
+            for ibz in ibz_unique_sorted
+        ], axis=0).astype(np.int64)
+
+        cnk_at_ibz = self._ensure_slab_io().read_slabs(
+            "wfns/coeffs",
+            shape=(nb, ns, ngkmax, 2),
+            offsets=offsets,
+            valid_shapes=valid_shapes,
+            partition_spec=P(("x", "y"), None, None, None),
+            window_axis=2,
             dtype=np.float64,
-            mesh=self._mesh,
-            file_partition_spec=P(("x", "y"), None, None, None),
-            count_partition_spec=P(("x", "y"), None),
         )
-        cnk_at_ibz = reader(offsets_dev, counts_dev)
         # cnk_at_ibz layout: per-rank
         # (bands_per_rank, ns, n_reads, ngkmax, 2) f64 sharded
         # P(('x','y'), None, None, None, None).

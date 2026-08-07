@@ -33,15 +33,21 @@ The surface
     of full-BZ indices.
 
 THE UNDERSCORED NAMES ARE PART OF THE DOOR, deliberately.  They are the
-module-level helpers ``tests/test_wfn_loader_eager.py`` pins directly
-(``_build_phdf5_clamped_counts`` is the per-rank hyperslab clip whose band
-bound drifted from ``b_hi`` to ``mnband`` once already, and two cells there
-read its SOURCE), plus the three jit/lru-cache factories the phdf5 path
-hangs off.  Re-exporting them here is what lets the transitional shim
-``src/file_io/wfn_loader.py`` keep every name the old module bound while
-still going through the door — the alternative is lorrax importing
-``wfn_loader.loader``, i.e. trading a counted re-export for an uncounted
-past-the-door reach.
+module-level kernel / jit-cache factories the in-tree tests pin by name —
+``_phdf5_unfold_kernel`` is the on-device symmetry unfold, the one piece of
+the collective path that runs without an ``.so`` and therefore the piece a
+single-process cell can pin against the eager backend.  Re-exporting them
+here is what lets the transitional shim ``src/file_io/wfn_loader.py`` keep
+every name the old module bound while still going through the door — the
+alternative is lorrax importing ``wfn_loader.loader``, i.e. trading a
+counted re-export for an uncounted past-the-door reach.
+
+``_build_phdf5_clamped_counts`` was on this list until 2026-08-07.  It was
+the per-rank hyperslab clip for the collective read, and it is now
+``file_io._slab_io_ffi._derive_window_counts``, behind the slab_io door
+that performs the read: the service states which windows it wants and how
+much of each is real, and knows nothing about hyperslabs, ranks or FFI
+targets.  Its cells moved with it.
 """
 
 from __future__ import annotations
@@ -50,7 +56,6 @@ from wfn_loader.loader import (
     KSpec,
     WfnLoader,
     _bispinor_lift_kernel,
-    _build_phdf5_clamped_counts,
     _get_bispinor_lift_jit,
     _phdf5_unfold_kernel,
     _sharded_zero_proto_fn,
@@ -60,7 +65,7 @@ __all__ = [
     # the class, and the k-spec vocabulary its methods take
     "WfnLoader", "KSpec",
     # module-level helpers the in-tree tests pin by name (see above)
-    "_build_phdf5_clamped_counts", "_phdf5_unfold_kernel",
+    "_phdf5_unfold_kernel",
     "_sharded_zero_proto_fn", "_get_bispinor_lift_jit",
     "_bispinor_lift_kernel",
 ]
