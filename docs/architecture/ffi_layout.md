@@ -51,9 +51,12 @@ real modules. `phdf5/`, `slate/`, `scalapack/`, `mklfft/`, `mklblas/`,
 `cufft/` survive as **re-export shims** — `src/ffi/phdf5/` is 40 lines
 across four files.
 
-Deleting a shim is gated on its consumers moving, and **none has moved
-yet**: outside `src/ffi/` there are still 10 `ffi.phdf5` references (chiefly
-`file_io/_slab_io_ffi.py`, `file_io/wfn_loader.py`), 6 `ffi.mklblas`
+Deleting a shim is gated on its consumers moving, and **one has now moved
+in part**: outside `src/ffi/` there are **5** `ffi.phdf5` references left
+(down from 10), all in `file_io/_slab_io_ffi.py` — `file_io/wfn_loader.py`
+had 3 and has none since the wave-1 wfn_loader extraction promoted the
+union read into `SlabIO.read_slabs` (2026-08-07,
+[docs/services/wfn_loader.md](../services/wfn_loader.md)). Also 6 `ffi.mklblas`
 (`common/contract_bands.py`), and 4 `ffi.mklfft` (`common/fft_helpers.py`,
 `gw/ppm_tau_kernel.py`) — counted at `886139f` and **re-counted unchanged at
 `8789131`, 2026-08-06**. The gate is

@@ -48,13 +48,31 @@ Public surface
 * :meth:`ngk_valid` — per-k logical ngk (for callers that care).
 * :meth:`get_gvec_nk` — deprecated thin shim for legacy vcoul / qp_wfn.
 
-P-roadmap
----------
-- P1 (this commit): eager backend; bit-match legacy WFNReader+SymMaps.
-- P2: phdf5 backend; bit-match eager.
-- P3: ``common/wfn_transforms.py`` (to_box / to_rbox / to_rmu / to_rchunk).
-- P4: migrate consumers; delete SymMaps unfold helpers + load_wfns helpers.
-- P5: delete WFNReader + PhdfWfnReader.
+P-roadmap — STATUS, not plan (2026-08-07, wave-1 wfn_loader branch)
+------------------------------------------------------------------
+- P1 DONE: eager backend, bit-matching the legacy WFNReader+SymMaps path.
+- P2 DONE: phdf5 backend, bit-identical to eager — ``np.array_equal``, no
+  atol, at world 4 on hostile geometry, CPU and CUDA.
+- P3 DONE: ``common/wfn_transforms.py`` owns to_box / to_rbox / to_rmu /
+  to_rchunk.  It is a CONSUMER of this loader, not part of it (the
+  service boundary decision), which is why the old ``load_wfns`` helpers
+  live THERE rather than being deleted.
+- P4 DONE for every consumer this branch owns: the step-3 replumb moved
+  lorrax onto the door, 45 old-path import edges over 36 files → 3 over
+  3 (converted delta 42).  The ``SymMaps`` unfold helpers are gone (see
+  ``common/symmetry_maps.py``'s head comment for where they went).  The
+  three remaining edges ride sibling wave-1 branches by ruling, not by
+  oversight.
+- P5 NOT DONE, deliberately.  ``PhdfWfnReader`` is gone, but ``WFNReader``
+  is a live ALIAS of this class (the same class object, not a subclass)
+  and ``src/file_io/wfn_loader.py`` is a transitional SHIM re-exporting
+  the door's own objects.  Both STAY until the phase-wide cleanup commit
+  after all four wave-1 branches land (coordination ruling 2) — the other
+  branches are written against the old spellings and have not rebased.
+  That cleanup is the gate; nothing here may delete either early.
+
+Docs: ``docs/services/wfn_loader.md`` (API, contract, backends, measured
+baselines); ``services/wfn_loader/docs/DESIGN.md`` (why).
 """
 from __future__ import annotations
 
