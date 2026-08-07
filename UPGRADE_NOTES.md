@@ -168,6 +168,39 @@ report warns when a multi-process CPU run lands on gloo.
 `LORRAX_MPI_FINALIZE_FIX=skip_atexit` (overlay sitecustomize) is mandatory
 for impl=mpi runs.
 
+**Two behaviour changes from the distrib_la replumb, ACCEPTED as correct
+rather than fixed** (2026-08-07; adjudication item 7 — recorded here because
+neither is a bug and both would otherwise read as one to the next person who
+finds them).
+
+1. **`solve_zeta`'s `mu_pad` divisibility net is now UNREACHABLE for
+   ScaLAPACK factors, and that is the fix, not a regression.** The net
+   (`isdf/core.solve_zeta`) demoted `scalapack_lu`/`cusolvermp_lu` to the
+   per-q `jnp.linalg.solve` when `n_rmu_logical` did not divide both mesh
+   axes. A ScaLAPACK factor now arrives as a `distrib_la.FactorToken` and
+   the token branch returns before the net, because `distrib_la.factor`
+   REFUSES a non-dividing extent at FACTOR time — earlier, with the failed
+   guard named, and before any collective. The supersession is strictly an
+   improvement: the old solve-time demote kept the ScaLAPACK factor's own
+   `ipiv` and handed it to `lax.linalg.lu_solve`, whose pivot convention is
+   not ScaLAPACK's, so the "safe fallback" computed a wrong answer
+   successfully. The net stays in place for the array-factor routes it is
+   still correct for; its `print` (not `warnings.warn`) is deliberate —
+   warning dedupe is what made the original demotion invisible in
+   production logs.
+
+2. **`use_low_mem_eigh` now threads into `compute_wfns_fi` on the two
+   raw-params drivers** (`bandstructure.htransform`, `bse.exciton_bands`).
+   Both used to spell the CLI-over-deck precedence inline and never call
+   `gw_config.resolve_eigh_backend`, so the key parsed, defaulted, validated
+   and was read by nobody on those two paths. It is live now: with
+   `use_low_mem_eigh = true` and `eigh_backend = auto`, htransform's Gram-eigh
+   line changes from the native description to the distributed one. Intended
+   — and the consequence is that a machine which cannot serve the
+   distributed eigh now REFUSES those runs where it used to run native
+   silently. That refusal is armed on purpose; it is the whole point of the
+   key.
+
 **Where the docs live now**: `docs/drivers.md` (the seven drivers: flags,
 outputs, failure modes), `docs/input_reference.md` (every deck key —
 regenerate with `tools/gen_input_reference.py`), `docs/environment/`
