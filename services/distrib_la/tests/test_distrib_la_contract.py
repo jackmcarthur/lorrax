@@ -1,21 +1,57 @@
-"""Contract tests for the block-cyclic distributed-linalg FFI wrappers.
+"""Contract tests for distrib_la's distributed-linalg backends.
+
+MIGRATED from ``tests/test_ffi_linalg_contract.py`` (history preserved:
+this file IS that file, moved).  What changed is the door it knocks on --
+every backend now arrives through :func:`distrib_la.backend_module` and
+:func:`distrib_la.plan` instead of the ``ffi.*`` shims -- and how the
+suite selects it.
+
+HOW THIS FILE IS SELECTED NOW.  It carried NO marker and was chosen purely
+by path: the full-suite census leg A2 named it in an ``--ignore`` because a
+bare (no-srun) launch with a loadable host .so kills the interpreter at
+import (KNOWN_FAILURES.md, MPI init without PMI2 glue).  It now carries
+``services`` and ``distrib_la`` markers from the service conftest, so:
+
+    pytest --no-services            SUPERSEDES leg A2's --ignore
+    pytest -m distrib_la            selects this suite and its siblings
+    pytest --only-service=distrib_la  the same, plus nothing else
+
+The deselection goes through tests/conftest.py's collection hook and NOT
+through a second ``-m``: pyproject's ``addopts = -m 'not extra'`` is
+OVERRIDDEN by an explicit ``-m`` on the command line, so ``-m "not
+services"`` would silently re-enable the whole deselected extra tier.
 
 One test per (op x backend): residual against a numpy/scipy reference AND
 bit-exact rerun determinism, on a 1x1 mesh (single process, one GPU) so
 the suite runs on any dev box.  The full multi-rank matrix (2x2 / 4x1 /
 1x4 process meshes) runs via the CLI mode of this same file inside a
-multi-task allocation — same check functions, no duplicated logic:
+multi-task allocation -- same check functions, no duplicated logic:
 
-    lxrun python3 -m tests.test_ffi_linalg_contract --mesh 2x2
+    lx run -N 1 -G 4 -n 4 python3 -m tests.test_distrib_la_contract --mesh 2x2
 
-Optional-dependency semantics: every test SKIPS cleanly when
-``liblorrax_ffi.so`` (or any native library it links: cuSOLVERMp,
-cuBLASMp, SLATE, NCCL, MPI) is absent — ``_ffi_skip_reason`` probes by
-actually loading the library.  Nothing here may fail on a machine
-without the FFI stack.
+Optional-dependency semantics, and the rule that makes them honest:
+ABSENT IS A SKIP, BUILT-AND-BROKEN IS A FAILURE.  The split now comes from
+:mod:`lxkit.testing` (``absent_or_broken``) over :mod:`lxkit.probe`'s
+types; the long comment that used to sit here explaining it lives with the
+implementation.  A machine that declares a profile
+(:func:`lxkit.testing.machine_profile`) additionally asserts that its MUST
+backends probed available at all -- see
+``test_distrib_la_skip_honesty.py``, the gate that keeps this file's skips
+from becoming the 2026-08-06 loss again.
+
+NEIGHBOURS THIS FILE STILL REACHES INTO.  Some cells here exercise
+production wiring in lorrax (``bandstructure.bse_setup``, ``isdf.core``,
+``runtime.padding``) or a backend that is NOT distrib_la's
+(``ffi.cublasmp`` -- cuBLASMp belongs to the future ``gemm`` service,
+charter wave 2).  They ride along behind :func:`_needs_monorepo`, which
+SKIPS with the reason naming what is missing, so a standalone install of
+this package still runs everything that is actually distrib_la's.  They
+move out at the replumb (step 3) and at the gemm extraction respectively;
+until then, deleting them would lose real coverage to make a boundary look
+tidy.
 
 Host platform: the slate ops also have CPU-backend handlers
-(``liblorrax_ffi_host.so``, registered under platform="cpu" — see
+(``liblorrax_ffi_host.so``, registered under platform="cpu" -- see
 src/ffi/cpp/slate/host_ffi.cc).  The ``*_cpu`` tests run the SAME check
 bodies on a 1x1 mesh of CPU devices in this very process (works on GPU
 nodes too: ``jax.ffi.ffi_call`` picks the handler by lowering platform)
@@ -24,7 +60,7 @@ meshes: run the CLI mode under ``JAX_PLATFORMS=cpu`` (non-slate cells
 are skipped there; ``--only slate`` narrows the log to the same set).
 Note: when BOTH libraries are loaded (GPU node), the shared
 ``libslate.so.2`` soname means the host handlers run against the
-already-loaded cuda-build SLATE (host-side execution) — the
+already-loaded cuda-build SLATE (host-side execution) -- the
 ``gpu_backend=none`` binary is exercised on CPU nodes, where the host
 library loads alone (see src/ffi/slate/README.md "Dual-lib caveat").
 
@@ -32,7 +68,7 @@ Multi-rank findings this file pins (see
 reports/slate_linalg_ffi_2026-07-10/report.md for the full matrix):
 
 * slate trsm with a rectangular RHS (m != n) used square-nb tiles for X
-  — uncatchable ``blas::Error`` abort (2x2) or silent corruption (1x4).
+  -- uncatchable ``blas::Error`` abort (2x2) or silent corruption (1x4).
   Fixed in trsm_ffi.cc / batched_trsm_ffi.cc; the rectangular case is
   exercised here on 1x1 and by the CLI matrix on multi-rank meshes.
 * slate eigh returned stale pre-back-transform eigenvector tiles (MOSI
@@ -40,7 +76,7 @@ reports/slate_linalg_ffi_2026-07-10/report.md for the full matrix):
   ``A @ Q == Q @ diag(W)`` contract is asserted here.
 * cuBLASMp comm-ABI generation must match the loaded library, not the
   cuSOLVERMp version (status=6 on every mesh when the stages drift).
-* cusolverMp syevd DEADLOCKS on non-square meshes (mb != nb) — no
+* cusolverMp syevd DEADLOCKS on non-square meshes (mb != nb) -- no
   status, just a hang.  distributed_eigh is square-mesh-only; there is
   no wrapper-level guard cheap enough to test single-process, so the
   CLI matrix documents it (XFAIL row).
@@ -48,12 +84,25 @@ reports/slate_linalg_ffi_2026-07-10/report.md for the full matrix):
 from __future__ import annotations
 
 import argparse
-import functools
 import os
 import sys
 
 import numpy as np
 import pytest
+
+# THIS FILE RUNS TWO WAYS and only one of them has a conftest: collected by
+# pytest (the service conftest puts services/*/src on sys.path) and as a
+# bare script under `srun -n 4` (nothing has).  Bootstrapping the path here
+# is what lets the multi-process leg be a plain command with no wrapper --
+# `lx` rewrites the container PYTHONPATH to exactly <checkout>/src, so
+# services/ is not on it and nothing in the launch chain knows it exists.
+_TESTS = os.path.dirname(os.path.abspath(__file__))
+_SERVICES = os.path.dirname(os.path.dirname(_TESTS))
+_REPO = os.path.dirname(_SERVICES)
+for _svc in ("lxkit", "distrib_la"):
+    _src = os.path.join(_SERVICES, _svc, "src")
+    if os.path.isdir(_src) and _src not in sys.path:
+        sys.path.insert(0, _src)
 
 # CLI multi-rank mode: jax.distributed.initialize must run before ANY
 # XLA-backend touch — including the availability probe below — so it
@@ -65,8 +114,10 @@ if __name__ == "__main__":
     if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
         # Platform must be EXPLICIT here: get_lib(None) asks
         # jax.default_backend(), which would initialize XLA before
-        # jax.distributed.initialize.
-        from ffi.common.ffi_loader import platform_from_env
+        # jax.distributed.initialize.  ``platform_from_env`` is lxkit's
+        # now — it reads env and nothing else, which is why it can run
+        # this early.
+        from lxkit.gate import platform_from_env
         _plat = platform_from_env()
         # Production init ORDER (host + impl=mpi): the jax CPU mpi
         # collectives plugin calls MPI_Init_thread unconditionally, so it
@@ -77,7 +128,7 @@ if __name__ == "__main__":
         # more than once" (job 7885123).  Keep the warm-up on CUDA only.
         if _plat == "CUDA":
             try:
-                from ffi.common.ffi_loader import get_lib as _get_lib
+                from distrib_la.loader import get_lib as _get_lib
                 _get_lib(_plat).lrx_slate_init_mpi()
             except Exception as _exc:
                 print(f"slate_init_mpi skipped: {_exc}", flush=True)
@@ -98,114 +149,56 @@ try:                                     # noqa: E402
 except Exception:
     pass
 
+from distrib_la import backend_module                        # noqa: E402
+from distrib_la.loader import (LibraryNotBuilt,              # noqa: E402
+                               LibraryUnusable, get_lib)
+from lxkit.testing import ABSENT, BROKEN, OK, absent_or_broken  # noqa: E402
+
+
 # ---------------------------------------------------------------------------
 # Availability probes (module import must stay cheap + exception-free).
+#
+# ABSENT IS A SKIP.  BUILT-AND-BROKEN IS A FAILURE.  The rule, the reason
+# and the 2026-08-06 receipt now live with the implementation in
+# lxkit.testing (:func:`absent_or_broken`) instead of in a 60-line comment
+# here, because every service needs them and only one of them can own them.
+# The two things that stayed BEHIND are the two things that are this
+# package's: WHICH libraries to probe, and how to ask.
+#
+# WHO DECIDES ABSENT-VS-BROKEN: the loader, always.  This file used to
+# carry a `_lib_is_built()` filesystem fallback for trees whose loader did
+# not yet raise the split types, plus a `_LOADER_SPLITS` flag to choose
+# between them.  distrib_la.loader raises lxkit.probe's LibraryNotBuilt /
+# LibraryUnusable unconditionally, so the fallback is gone: a stat() from
+# out here can only guess at which candidate path was tried and why it was
+# given up on, and keeping a coarser instrument alive "just in case" is how
+# the wrong one gets used.
 # ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# ABSENT IS A SKIP.  BUILT-AND-BROKEN IS A FAILURE.
-# ---------------------------------------------------------------------------
-# Both probes used to answer one question — "does the .so load?" — and turn
-# any negative answer into a skip.  That collapses two situations that mean
-# opposite things:
-#
-#   ABSENT   the library was never built here.  Nothing is wrong; these tests
-#            do not apply on this machine.  A skip is the honest report.
-#   BROKEN   the library WAS built, is sitting right there, and will not
-#            dlopen.  Something IS wrong, and it is exactly the kind of wrong
-#            that a test suite exists to catch.
-#
-# Reporting BROKEN as a skip is how the host leg was lost on 2026-08-06: the
-# .so carried a DT_NEEDED on cray-fftw's `libfftw3.so.mpi31.3`, which the
-# Shifter container does not mount, so dlopen failed and NINETEEN
-# ScaLAPACK/SLATE/GEMM contract tests — none of which perform an FFT — were
-# reported as "19 skipped" alongside "0 failed".  The suite looked green.  A
-# skip reads as "not applicable on this platform"; what it meant was "did not
-# run".  Nothing in the output distinguished them.
-#
-# This is the `src/ffi/gate.py` rule applied to test collection: an explicit
-# request that cannot be honored REFUSES rather than silently downgrading.  A
-# built .so is an explicit request.
-#
-# WHY THE FAILURE IS PER-TEST AND NOT A COLLECTION ERROR.  Raising at import
-# would be louder still, but it would take the whole module down — including
-# the CUDA cells, which on 2026-08-06 were genuinely passing 33/33.  Losing
-# real signal to report a different defect is the same mistake in the other
-# direction.  Each affected cell fails, naming the library and the loader
-# error; everything unaffected still reports.
-#
-# WHO DECIDES ABSENT-VS-BROKEN.  The loader does, when it can.  CLAIMS 81
-# landed `FfiLibraryNotBuilt` / `FfiLibraryUnusable` in ffi.common.ffi_loader
-# for exactly this split, so this file ASKS rather than re-deriving: if those
-# types are importable they are authoritative, because the loader knows which
-# candidate path it tried and why it gave up, which a stat() from out here can
-# only guess at.  The filesystem check below is the fallback for a tree where
-# that work has not merged yet — same distinction, coarser instrument.  When
-# the loader change is everywhere, delete `_lib_is_built` and the fallback
-# branch; nothing else here moves.
-
-_ABSENT = "absent"      # not built here — skip is honest
-_BROKEN = "broken"      # built and will not load — this is a defect
-_OK = "ok"
-
-try:
-    from ffi.common.ffi_loader import (FfiLibraryNotBuilt,
-                                       FfiLibraryUnusable)
-    _LOADER_SPLITS = True
-except Exception:       # pre-CLAIMS-81 loader
-    class FfiLibraryNotBuilt(Exception):
-        pass
-
-    class FfiLibraryUnusable(Exception):
-        pass
-    _LOADER_SPLITS = False
-
-
-def _lib_is_built(env_var, so_name):
-    """True if the library exists on disk, i.e. somebody built it here.
-
-    FALLBACK ONLY — used when the loader does not raise the CLAIMS 81 types.
-    Deliberately a FILESYSTEM question: the pre-81 loader cannot tell us
-    "present but unloadable" without conflating it with "missing", which is
-    the whole bug being fixed.
-    """
-    explicit = os.environ.get(env_var)
-    if explicit:
-        return os.path.exists(explicit)
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for sub in ("build_host", "build"):
-        if os.path.exists(os.path.join(root, "src", "ffi", "cpp", sub, so_name)):
-            return True
-    return False
 
 
 def _probe_lib(platform, env_var, so_name):
-    """Return (state, reason) for one FFI library."""
+    """Return ``(state, reason)`` for one FFI library."""
     try:
-        from ffi.common.ffi_loader import get_lib
         get_lib(platform)
-    except FfiLibraryNotBuilt as exc:
-        return _ABSENT, f"{so_name} not built on this machine: {exc}"
-    except Exception as exc:
-        broken = (isinstance(exc, FfiLibraryUnusable) if _LOADER_SPLITS
-                  else _lib_is_built(env_var, so_name))
-        if broken:
-            return _BROKEN, (
-                f"{so_name} IS BUILT but will not load: {exc}\n"
-                f"This is a DEFECT, not an unavailable platform — the library "
-                f"is present on disk and the dynamic linker refused it.  It is "
-                f"reported as a failure rather than a skip on purpose: a skip "
-                f"here reads as 'not applicable on this machine', which is "
-                f"false, and it hides the loss behind a green suite.\n"
-                f"Most likely a DT_NEEDED that cannot be resolved in this "
-                f"environment — check `readelf -d <so> | grep NEEDED` against "
-                f"`ldd <so> | grep 'not found'` IN THE ENVIRONMENT THAT FAILED "
-                f"(in-container and bare-host have different closures; "
-                f"/opt/cray/pe is not mounted inside the Shifter image).\n"
-                f"Set {env_var} to select a different build.")
-        return _ABSENT, f"{so_name} not built on this machine: {exc}"
-    return _OK, None
+    except LibraryNotBuilt as exc:
+        return ABSENT, f"{so_name} not built on this machine: {exc}"
+    except LibraryUnusable as exc:
+        return BROKEN, (
+            f"{so_name} IS BUILT but will not load: {exc}\n"
+            f"This is a DEFECT, not an unavailable platform — the library "
+            f"is present on disk and the dynamic linker refused it.  It is "
+            f"reported as a failure rather than a skip on purpose: a skip "
+            f"here reads as 'not applicable on this machine', which is "
+            f"false, and it hides the loss behind a green suite.\n"
+            f"Most likely a DT_NEEDED that cannot be resolved in this "
+            f"environment — check `readelf -d <so> | grep NEEDED` against "
+            f"`ldd <so> | grep 'not found'` IN THE ENVIRONMENT THAT FAILED "
+            f"(in-container and bare-host have different closures; "
+            f"/opt/cray/pe is not mounted inside the Shifter image).\n"
+            f"Set {env_var} to select a different build.")
+    except Exception as exc:                                   # noqa: BLE001
+        return ABSENT, f"{so_name} not built on this machine: {exc}"
+    return OK, None
 
 
 def _ffi_state():
@@ -218,11 +211,11 @@ def _ffi_state():
         import jax
         if not any(getattr(d, "platform", "") in ("gpu", "cuda")
                    for d in jax.devices()):
-            return _ABSENT, "no CUDA GPU visible"
+            return ABSENT, "no CUDA GPU visible"
     except Exception as exc:  # jax missing / no backend
-        return _ABSENT, f"jax backend unavailable: {exc}"
+        return ABSENT, f"jax backend unavailable: {exc}"
     if jax.process_count() != 1:
-        return _ABSENT, "contract tests are single-process (use the CLI mode)"
+        return ABSENT, "contract tests are single-process (use the CLI mode)"
     return _probe_lib("CUDA", "LORRAX_FFI_SO", "liblorrax_ffi.so")
 
 
@@ -236,32 +229,34 @@ def _host_ffi_state():
         import jax
         jax.devices("cpu")
     except Exception as exc:
-        return _ABSENT, f"jax cpu backend unavailable: {exc}"
+        return ABSENT, f"jax cpu backend unavailable: {exc}"
     if jax.process_count() != 1:
-        return _ABSENT, "contract tests are single-process (use the CLI mode)"
+        return ABSENT, "contract tests are single-process (use the CLI mode)"
     return _probe_lib("cpu", "LORRAX_FFI_HOST_SO", "liblorrax_ffi_host.so")
 
 
-def _gate(state, reason):
-    """Decorator: run / skip / refuse, per the rule above."""
-    def decorate(fn):
-        if state == _OK:
-            return fn
-        if state == _ABSENT:
-            return pytest.mark.skip(reason=reason or "")(fn)
-
-        @functools.wraps(fn)
-        def _refuse(*args, **kwargs):
-            pytest.fail(reason, pytrace=False)
-        return _refuse
-    return decorate
-
-
 _STATE, _SKIP = _ffi_state()
-needs_ffi = _gate(_STATE, _SKIP)
+needs_ffi = absent_or_broken(_STATE, _SKIP)
 
 _HOST_STATE, _HOST_SKIP = _host_ffi_state()
-needs_host_ffi = _gate(_HOST_STATE, _HOST_SKIP)
+needs_host_ffi = absent_or_broken(_HOST_STATE, _HOST_SKIP)
+
+
+def _needs_monorepo(what: str):
+    """SKIP a cell whose subject has not been extracted into a service yet.
+
+    Two kinds ride along in this file: lorrax PRODUCTION WIRING (the
+    call sites distrib_la exists to serve — they leave at the replumb,
+    step 3) and cuBLASMp (a backend that belongs to the future ``gemm``
+    service, charter wave 2).  Both are real coverage; deleting them to
+    make the package boundary look tidy would trade a measured check for
+    a tidier import graph.  A standalone install skips them, naming what
+    is missing and who will own it.
+    """
+    if not os.path.isdir(os.path.join(_REPO, "src")):
+        pytest.skip(f"no lorrax src/ next to this service (standalone "
+                    f"install); {what} is monorepo wiring — covered by the "
+                    f"monorepo run")
 
 
 def _mesh_1x1():
@@ -323,9 +318,10 @@ def _herm(rng, nq, n, dtype):
 
 
 def check_cusolvermp_chol(mesh, dtype, nq=2, n=32, mrhs=48):
-    from ffi.cusolvermp import (batched_distributed_cholesky,
-                                batched_distributed_potrs,
-                                cholesky_handle_to_natural_L)
+    cump = backend_module("cusolvermp")
+    batched_distributed_cholesky = cump.batched_distributed_cholesky
+    batched_distributed_potrs = cump.batched_distributed_potrs
+    cholesky_handle_to_natural_L = cump.cholesky_handle_to_natural_L
     rng = np.random.default_rng(7)
     A_np = _hpd(rng, nq, n, dtype)
     B_np = _rng_mat(rng, (nq, n, mrhs), dtype)
@@ -350,7 +346,8 @@ def check_cusolvermp_chol(mesh, dtype, nq=2, n=32, mrhs=48):
 
 
 def check_cusolvermp_lu(mesh, dtype, nq=2, n=32, nrhs=16, herm=True):
-    from ffi.cusolvermp import batched_distributed_solve_lu
+    batched_distributed_solve_lu = backend_module(
+        "cusolvermp").batched_distributed_solve_lu
     rng = np.random.default_rng(11)
     if herm:
         A_np = _herm(rng, nq, n, dtype)     # Hermitian INDEFINITE
@@ -377,7 +374,7 @@ def check_cusolvermp_eigh(mesh, dtype, n=32):
     """Contract: eigenvalues match numpy; the RAW Q buffer satisfies
     ``Q_raw^H = eigenvectors`` (cuSOLVERMp writes col-major tiles that JAX
     reads row-major — the documented conj-transpose convention)."""
-    from ffi.cusolvermp import distributed_eigh
+    distributed_eigh = backend_module("cusolvermp").distributed_eigh
     rng = np.random.default_rng(13)
     A_np = _herm(rng, 1, n, dtype)[0]
 
@@ -399,6 +396,7 @@ def check_cusolvermp_eigh(mesh, dtype, n=32):
 
 
 def check_cublasmp_gemm(mesh, dtype, transa="C", transb="N"):
+    _needs_monorepo("cuBLASMp gemm")
     from ffi.cublasmp import batched_distributed_gemm
     rng = np.random.default_rng(19)
     nq, m, k, n = 2, 32, 16, 24
@@ -432,6 +430,7 @@ def check_cublasmp_gemm(mesh, dtype, transa="C", transb="N"):
 
 
 def check_cublasmp_wsolve(mesh, dtype, nq=2, n=32, pref=0.37):
+    _needs_monorepo("cuBLASMp fused W-solve")
     from ffi.cublasmp import batched_fused_w_solve
     rng = np.random.default_rng(23)
     V_np = _hpd(rng, nq, n, dtype)
@@ -458,7 +457,8 @@ def check_cublasmp_wsolve(mesh, dtype, nq=2, n=32, pref=0.37):
 def check_scalapack_lu(mesh, dtype, nq=2, n=32, nrhs=16, herm=True):
     """Host-platform twin of check_cusolvermp_lu — ScaLAPACK pXgetrf+
     pXgetrs (Cray LibSci) through ffi.scalapack, same math contract."""
-    from ffi.scalapack import batched_distributed_solve_lu
+    batched_distributed_solve_lu = backend_module(
+        "scalapack").batched_distributed_solve_lu
     rng = np.random.default_rng(11)
     if herm:
         A_np = _herm(rng, nq, n, dtype)     # Hermitian INDEFINITE
@@ -488,9 +488,10 @@ def check_scalapack_getrf_getrs(mesh, dtype, nq=2, n=32, nrhs=16):
     same grid, only WHEN the factor work happens differs.  Also solves a
     second RHS from the SAME factors (the r-chunk reuse the split
     exists for)."""
-    from ffi.scalapack import (batched_distributed_getrf,
-                               batched_distributed_getrs,
-                               batched_distributed_solve_lu)
+    scal = backend_module("scalapack")
+    batched_distributed_getrf = scal.batched_distributed_getrf
+    batched_distributed_getrs = scal.batched_distributed_getrs
+    batched_distributed_solve_lu = scal.batched_distributed_solve_lu
     rng = np.random.default_rng(11)
     A_np = _herm(rng, nq, n, dtype)         # Hermitian INDEFINITE
     B_np = _rng_mat(rng, (nq, n, nrhs), dtype)
@@ -525,7 +526,9 @@ def check_scalapack_getrf_getrs(mesh, dtype, nq=2, n=32, nrhs=16):
 def check_slate_chol_trsm(mesh, dtype, n=32, m=32):
     """Includes the rectangular-RHS case (m != n) that used to abort the
     whole multi-rank job via an uncatchable blas::Error."""
-    from ffi.slate import distributed_cholesky, distributed_trsm
+    slate = backend_module("slate")
+    distributed_cholesky = slate.distributed_cholesky
+    distributed_trsm = slate.distributed_trsm
     rng = np.random.default_rng(29)
     A_np = _hpd(rng, 1, n, dtype)[0]
     B_np = _rng_mat(rng, (n, m), dtype)
@@ -554,8 +557,9 @@ def check_slate_chol_trsm(mesh, dtype, n=32, m=32):
 
 def check_slate_batched(mesh, dtype, nbatch=4, n=16, nrhs=8):
     """nrhs != n exercises the rectangular batched-trsm tile fix."""
-    from ffi.slate import (batched_distributed_cholesky,
-                           batched_distributed_trsm)
+    slate = backend_module("slate")
+    batched_distributed_cholesky = slate.batched_distributed_cholesky
+    batched_distributed_trsm = slate.batched_distributed_trsm
     rng = np.random.default_rng(31)
     A_np = _hpd(rng, nbatch, n, dtype)
     B_np = _rng_mat(rng, (nbatch, n, nrhs), dtype)
@@ -579,7 +583,7 @@ def check_slate_batched(mesh, dtype, nbatch=4, n=16, nrhs=8):
 def check_slate_eigh(mesh, dtype, n=32):
     """Strict contract (post-fix): W matches numpy, Q columns are TRUE
     eigenvectors of A (``A @ Q == Q @ diag(W)``), Q unitary."""
-    from ffi.slate import distributed_eigh
+    distributed_eigh = backend_module("slate").distributed_eigh
     rng = np.random.default_rng(37)
     A_np = _herm(rng, 1, n, dtype)[0]
 
@@ -607,7 +611,9 @@ def check_padding_solve_at_logical(mesh, dtype, nq=2, n_log=13, n_pad=16,
     identity-padded operands + ``solve_at_logical`` must reproduce the
     unpadded solve on the logical block bit-for-bit, with exact-zero pad
     rows, through the REAL distributed solver."""
-    from ffi.cusolvermp import batched_distributed_solve_lu
+    _needs_monorepo("runtime.padding.solve_at_logical")
+    batched_distributed_solve_lu = backend_module(
+        "cusolvermp").batched_distributed_solve_lu
     from runtime.padding import pad_last_axis_to, solve_at_logical
     rng = np.random.default_rng(41)
     A_log = _herm(rng, nq, n_log, dtype)
@@ -654,7 +660,7 @@ def check_tile_layout_validation():
     the guard must reject exactly the (n, nb, p, q) combos where JAX's
     block shards diverge from SLATE's block-cyclic tiles, plus the 1xq
     grids whose lld != nb stride mismatch SIGABRTs inside SLATE."""
-    from ffi.slate.context import validate_tile_layout
+    validate_tile_layout = backend_module("slate").validate_tile_layout
     validate_tile_layout(64, 64, 1, 1, what="t")       # 1x1: any nb
     validate_tile_layout(64, 7, 1, 1, what="t")
     validate_tile_layout(64, 32, 2, 2, what="t")       # one tile per rank
@@ -807,7 +813,7 @@ def check_scalapack_eigh(mesh, dtype, n=32):
     (``A @ Z == Z @ diag(W)`` — a wrong layout/transpose passes the
     eigenvalue check and fails this), Z unitary, rerun bit-deterministic
     on a fixed grid."""
-    from ffi.scalapack import distributed_eigh
+    distributed_eigh = backend_module("scalapack").distributed_eigh
     rng = np.random.default_rng(37)
     A_np = _herm(rng, 1, n, dtype)[0]
 
@@ -856,13 +862,15 @@ def test_scalapack_getrf_getrs_split_is_bit_identical_cpu(mesh_cpu11, dtype):
 def test_scalapack_resolver_and_host_only_guard(mesh_cpu11):
     """distributed_lu=scalapack resolves to scalapack_lu (explicit only —
     auto never picks it); a GPU-device mesh is rejected loudly."""
+    _needs_monorepo("isdf.core transverse-solver resolution")
     from isdf.core import _resolve_solver_kind_transverse
     assert _resolve_solver_kind_transverse(
         mesh_cpu11, "scalapack") == "scalapack_lu"
     assert _resolve_solver_kind_transverse(
         mesh_cpu11, "auto") != "scalapack_lu"
     import jax
-    from ffi.scalapack import batched_distributed_solve_lu
+    batched_distributed_solve_lu = backend_module(
+        "scalapack").batched_distributed_solve_lu
     gpus = [d for d in jax.devices() if d.platform in ("gpu", "cuda")]
     if gpus:
         from jax.sharding import Mesh
@@ -1000,6 +1008,7 @@ def check_factor_c_q_slate(mesh):
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
+    _needs_monorepo("isdf.core.factor_c_q")
     from isdf.core import factor_c_q, _resolve_solver_kind_charge
 
     assert _resolve_solver_kind_charge(mesh, "slate") == "slate_cholesky"
@@ -1034,6 +1043,7 @@ def test_factor_c_q_slate_matches_reference_cpu():
 
 @needs_ffi
 def test_resolver_never_auto_picks_slate():
+    _needs_monorepo("isdf.core charge-solver resolution")
     from isdf.core import _resolve_solver_kind_charge
     mesh = _mesh_1x1()
     assert _resolve_solver_kind_charge(mesh, "auto") != "slate_cholesky"
@@ -1041,15 +1051,21 @@ def test_resolver_never_auto_picks_slate():
 
 
 # ---------------------------------------------------------------------------
-# ffi.linalg.plan — the call-site interface.  These cells PIN the promise
+# distrib_la.plan — the call-site interface.  These cells PIN the promise
 # that a plan resolves EXACTLY like resolve_backend: the plan exists to
 # move resharding and batching off the call sites, not to change routes.
+#
+# THE DOOR, not the shim.  ``from ffi import linalg`` used to be the
+# spelling here; it re-exports these very names, so both spellings pass —
+# which is exactly why it must not be the one under test.  The service's
+# contract is what ``import distrib_la`` promises, and a cell measuring the
+# lorrax shim would keep passing for a while after the replumb deletes it.
 # ---------------------------------------------------------------------------
 
 def test_plan_resolution_is_identical_to_resolve_backend():
     """Every (op, requested) resolves the same through both spellings —
     including the ones that RAISE, with the same exception type."""
-    from ffi import linalg
+    import distrib_la as linalg
     mesh = _mesh_cpu_1x1()
     for op in linalg.OPS:
         for requested in linalg.BACKEND_CHOICES[op]:
@@ -1069,7 +1085,7 @@ def test_plan_native_contract():
     """A native plan advertises no sharding contract, runs eigh itself,
     and REFUSES the two ops whose native route lives in isdf/core."""
     import jax.numpy as jnp
-    from ffi import linalg
+    import distrib_la as linalg
     mesh = _mesh_cpu_1x1()
 
     p = linalg.plan("eigh", mesh, backend="auto")
@@ -1091,7 +1107,7 @@ def test_plan_native_contract():
 
 
 def test_plan_describe_and_module_are_honest():
-    from ffi import linalg
+    import distrib_la as linalg
     mesh = _mesh_cpu_1x1()
     p = linalg.plan("eigh", mesh, backend="off")
     assert "native" in p.describe() and "any layout" in p.describe()
@@ -1128,14 +1144,13 @@ def _mock_cuda_capabilities(monkeypatch, nproc):
     These cells mock the capability probe and the process count on purpose,
     so the guard-5 contract is asserted on any dev box with no GPU and no
     ``.so``.  A monkeypatch has to land on the module whose globals the
-    resolver looks up, and since the facade moved to ``services/distrib_la``
-    that is ``distrib_la.resolve`` / ``distrib_la.loader`` — patching
+    resolver looks up, which is ``distrib_la.resolve`` /
+    ``distrib_la.loader`` — patching
     ``ffi.linalg.resolve`` (a re-export shim) or ``ffi.common.ffi_loader``
     (which still owns fft/gemm/phdf5 and no longer answers for linalg)
     would set attributes nothing reads, and these cells would quietly start
     measuring the machine instead of the contract.
     """
-    import ffi.linalg  # noqa: F401  (puts services/*/src on sys.path)
     from distrib_la import loader as FL
     from distrib_la import resolve as R
     monkeypatch.setattr(FL, "probe_target", lambda t, p: (True, "ok"))
@@ -1193,12 +1208,12 @@ def test_plan_batched_matches_the_backend_call_cpu():
     is exactly what must stay true.
     """
     import jax.numpy as jnp
-    from ffi import linalg
+    import distrib_la as linalg
     mesh = _mesh_cpu_1x1()
     rng = np.random.default_rng(11)
     A = jnp.asarray(_hpd(rng, 2, 16, "complex128"))
     assert linalg.plan("eigh", mesh, backend="distributed").backend == "scalapack"
-    W_ref, Z_ref = linalg.backend_module("scalapack").batched_distributed_eigh(
+    W_ref, Z_ref = backend_module("scalapack").batched_distributed_eigh(
         A, mesh=mesh)
     W, Z = linalg.plan("eigh", mesh, backend="distributed", n=16).batched(A)
     assert np.array_equal(np.asarray(W), np.asarray(W_ref))
@@ -1251,6 +1266,7 @@ def check_compute_wfns_fi_backend(mesh, backend, dtype="complex128"):
     """
     import jax
     import jax.numpy as jnp
+    _needs_monorepo("bandstructure.bse_setup.compute_wfns_fi")
     from bandstructure.bse_setup import compute_wfns_fi
 
     ct, enk, B, kgrid = _synthetic_htransform()
@@ -1300,6 +1316,7 @@ def test_compute_wfns_fi_slate_refused_on_cpu(mesh_cpu11):
     it; ``resolve_backend`` therefore refuses the combination outright.
     """
     import jax.numpy as jnp
+    _needs_monorepo("bandstructure.bse_setup.compute_wfns_fi")
     from bandstructure.bse_setup import compute_wfns_fi
 
     ct, enk, B, kgrid = _synthetic_htransform()
@@ -1325,6 +1342,7 @@ def test_compute_wfns_fi_rejects_bad_backend():
     jax = pytest.importorskip("jax")
     import jax.numpy as jnp
     from jax.sharding import Mesh
+    _needs_monorepo("bandstructure.bse_setup.compute_wfns_fi")
     from bandstructure.bse_setup import compute_wfns_fi
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
     ct, enk, B, kgrid = _synthetic_htransform()

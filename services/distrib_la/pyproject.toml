@@ -30,3 +30,15 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `bench/` holds claims-style baseline drivers, not a pytest suite.
+norecursedirs = ["bench"]
+# The SAME two markers the monorepo registers.  Declared in both places on
+# purpose: `pytest services/distrib_la/tests` from the monorepo root picks
+# THIS file as its rootdir config (it is the nearest pyproject.toml above
+# the argument), so a service that only registered them upstairs emits
+# PytestUnknownMarkWarning on exactly the invocation the charter calls its
+# standalone one.
+markers = [
+    "services: a standalone service's own suite, staged into the main one",
+    "distrib_la: the distrib_la service suite",
+]

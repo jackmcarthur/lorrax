@@ -97,18 +97,32 @@ members = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# `services` carries the standalone service suites (charter: own fast
+# pytests STAGED INTO the main suite).  ORDER MATTERS: tests/ first, so a
+# lorrax module imports jax before any service conftest can force a host
+# device count on the whole run — see services/distrib_la/tests/conftest.py.
+testpaths = ["tests", "services"]
 # `bench` holds standalone bench/smoke drivers (moved out of src/ 2026-07-31);
 # they are argv-driven scripts with jax preambles, not pytest suites.
+# `services/*/bench` is the same thing for a service: claims-style baseline
+# drivers, never part of the default run.
 norecursedirs = ["archive", "bench"]
 # `extra` (tooling / experimental / out-of-repo-fixture suites) is
 # deselected by default; run them with `-m extra` (an explicit -m on the
 # command line overrides this addopts default).
+#
+# THE SERVICE TIERS ARE NOT DESELECTED HERE, and could not be: an explicit
+# `-m` on the command line REPLACES this default rather than composing with
+# it, so `-m "not services"` would silently re-enable the whole extra tier.
+# Service deselection goes through the collection hook in tests/conftest.py
+# (--no-services / --only-service / LX_SKIP_SERVICES), which composes.
 addopts = "-m 'not extra'"
 markers = [
     "regression: end-to-end physics regression tests with reference files",
     "gpu: tests that require a CUDA-capable JAX backend",
     "extra: staged/tooling suites deselected by default (run with -m extra)",
+    "services: a standalone service's own suite, staged into this one",
+    "distrib_la: the distrib_la service suite (services/distrib_la/tests)",
 ]
 
 [dependency-groups]

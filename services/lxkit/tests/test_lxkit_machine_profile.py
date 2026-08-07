@@ -333,3 +333,79 @@ def test_an_unarmed_session_asserts_nothing(tmp_path):
         text=True)
     assert "SKIP-HONESTY GATE FAILED" not in proc.stdout
     assert proc.returncode == 0, proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# scope — the gate rules on its own suite and nobody else's
+# ---------------------------------------------------------------------------
+
+_SCOPED_CONFTEST = '''
+import sys
+sys.path.insert(0, {src!r})
+from lxkit.testing import (AllowedSkip, MachineProfile, arm_skip_honesty,
+                           pytest_runtest_logreport, pytest_sessionfinish)
+
+arm_skip_honesty(MachineProfile(
+    machine="synthetic", must=(),
+    allowed_skips=(AllowedSkip("allowed", "on purpose", "leg Z"),),
+    min_collected=1), scope=str(__import__("pathlib").Path(__file__).parent / "mine"))
+'''
+
+
+def _run_scoped(tmp_path, args=()):
+    (tmp_path / "conftest.py").write_text(
+        _SCOPED_CONFTEST.format(src=_LXKIT_SRC))
+    (tmp_path / "mine").mkdir(exist_ok=True)
+    (tmp_path / "mine" / "test_mine.py").write_text(
+        "import pytest\n\n\ndef test_a():\n    assert True\n\n\n"
+        "def test_allowed():\n    pytest.skip('skipped on purpose')\n")
+    (tmp_path / "theirs").mkdir(exist_ok=True)
+    (tmp_path / "theirs" / "test_theirs.py").write_text(
+        "import pytest\n\n\ndef test_b():\n    assert True\n\n\n"
+        "def test_other():\n    pytest.skip('somebody else problem')\n")
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q",
+         *args, "."],
+        cwd=str(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True)
+
+
+def test_a_scoped_gate_ignores_skips_from_outside_its_suite(tmp_path):
+    """The monorepo case.  On Perlmutter lorrax's own suite emits ~45
+    device-count skips; a service's allowlist has no business ruling on
+    them, and a gate that fires on other people's business gets
+    disarmed."""
+    proc = _run_scoped(tmp_path)
+    assert "SKIP-HONESTY GATE FAILED" not in proc.stdout, proc.stdout
+    assert proc.returncode == 0, proc.stdout
+    assert "2 passed, 2 skipped" in proc.stdout, proc.stdout
+
+
+def test_a_scoped_gate_still_judges_its_own(tmp_path):
+    """...and it is still a gate: an in-scope skip outside the allowlist
+    fails, so the scoping did not turn it off."""
+    (tmp_path / "mine").mkdir(exist_ok=True)
+    proc = _run_scoped(tmp_path)
+    (tmp_path / "mine" / "test_extra.py").write_text(
+        "import pytest\n\n\ndef test_sneaky():\n    pytest.skip('nope')\n")
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "."],
+        cwd=str(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True)
+    assert "SKIP-HONESTY GATE FAILED" in proc.stdout, proc.stdout
+    assert "test_sneaky" in proc.stdout
+    assert proc.returncode != 0
+
+
+def test_a_deliberately_deselected_suite_is_inert_not_red(tmp_path):
+    """``--no-services``, ``-m other``, ``-k something`` all narrow a suite
+    away on purpose.  Failing the floor there would turn a deliberate
+    narrowing into a red every time somebody used the switches this tree
+    just grew — but a session that collected NOTHING AT ALL still trips
+    it, which is the case the floor is actually about."""
+    proc = _run_scoped(tmp_path, args=("--ignore=mine",))
+    assert "SKIP-HONESTY GATE FAILED" not in proc.stdout, proc.stdout
+    assert proc.returncode == 0, proc.stdout
+    # ...and the run really did collect the other suite, so "inert" is not
+    # standing in for "collected nothing".
+    assert "1 passed, 1 skipped" in proc.stdout, proc.stdout

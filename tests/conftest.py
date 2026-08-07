@@ -75,6 +75,107 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parent))
 import harness  # noqa: E402
 
 
+# ---------------------------------------------------------------------------
+# Service-tier selection: --no-services / --only-service=NAME /
+# LX_SKIP_SERVICES.  THE FIRST COLLECTION HOOKS IN THIS TREE.
+# ---------------------------------------------------------------------------
+# The services under services/ ship their own fast suites and are staged
+# into this one (charter).  Deselecting them has to go through a hook and
+# NOT through a second `-m`, because pyproject sets
+#
+#     addopts = "-m 'not extra'"
+#
+# and an explicit `-m` on the command line REPLACES that default instead of
+# composing with it.  `pytest -m "not services"` would therefore silently
+# re-enable the entire `extra` tier — 26 deselected suites — while looking
+# like it had narrowed the run.  A hook composes with addopts by
+# construction, since it acts on the items `-m` already selected.
+#
+# This supersedes the census's leg A2 `--ignore=tests/test_ffi_linalg_
+# contract.py`.  That file lives in services/distrib_la/tests now and
+# carries the `distrib_la` marker, so the leg that could not run it (a bare
+# no-srun launch, where a loadable host .so kills the interpreter at MPI
+# init — KNOWN_FAILURES.md) says `--no-services` and the leg that wants it
+# says `-m distrib_la`.  Naming a path was always a proxy for naming the
+# thing; now the thing has a name.
+#
+# KEPT MINIMAL ON PURPOSE.  These are the only collection hooks in the
+# tree, and a collection hook that is subtly wrong deselects real coverage
+# without failing anything — so this is 20 lines of predicate and the
+# measurement of what it selected lives in tests/test_service_selection.py,
+# which runs pytest --collect-only in a subprocess and DIFFS the sets.
+
+_SERVICES_ROOT = str(_Path(__file__).resolve().parent.parent / "services")
+
+
+def pytest_addoption(parser):
+    group = parser.getgroup("services", "LORRAX service suites")
+    group.addoption(
+        "--no-services", action="store_true", default=False,
+        help="deselect every services/ suite (the staged standalone "
+             "service tests).  Composes with addopts; never use a second "
+             "-m for this.")
+    group.addoption(
+        "--only-service", action="store", default="", metavar="NAME",
+        help="run ONLY the named service's suite (e.g. --only-service="
+             "distrib_la).  Deselects lorrax's own tests and every other "
+             "service.")
+
+
+def _service_of(item) -> str:
+    """The service a collected item belongs to, or "" for lorrax's own.
+
+    Keyed on the PATH rather than on the marker: the marker is applied by
+    the service's own conftest, so trusting it here would make the
+    deselection silently depend on a service having remembered to add it.
+    """
+    path = str(getattr(item, "fspath", ""))
+    if not path.startswith(_SERVICES_ROOT + os.sep):
+        return ""
+    return path[len(_SERVICES_ROOT) + 1:].split(os.sep)[0]
+
+
+def pytest_collection_modifyitems(config, items):
+    only = (config.getoption("--only-service") or "").strip()
+    skip_env = (os.environ.get("LX_SKIP_SERVICES", "") or "").strip()
+    no_services = (config.getoption("--no-services")
+                   or skip_env not in ("", "0", "false", "no"))
+    if not no_services and not only:
+        return
+
+    keep, drop = [], []
+    for item in items:
+        svc = _service_of(item)
+        if only:
+            (keep if svc == only else drop).append(item)
+        else:
+            (drop if svc else keep).append(item)
+    if drop:
+        reason = (f"--only-service={only}" if only else
+                  ("--no-services" if config.getoption("--no-services")
+                   else f"LX_SKIP_SERVICES={skip_env}"))
+        config.hook.pytest_deselected(items=drop)
+        items[:] = keep
+        config.stash.setdefault(_DESELECT_NOTE, []).append(
+            f"{reason}: deselected {len(drop)} service test(s)")
+
+
+_DESELECT_NOTE = pytest.StashKey[list]()
+
+
+def pytest_report_header(config):
+    """Say it out loud.  A run that quietly dropped a whole tier and
+    reported a smaller green number is exactly the shape of the losses
+    this tree keeps finding, so the deselection announces itself."""
+    only = (config.getoption("--only-service") or "").strip()
+    if only:
+        return f"services: ONLY {only} (lorrax's own tests deselected)"
+    if config.getoption("--no-services") or os.environ.get(
+            "LX_SKIP_SERVICES", "").strip() not in ("", "0", "false", "no"):
+        return "services: DESELECTED (--no-services / LX_SKIP_SERVICES)"
+    return None
+
+
 def pytest_sessionstart(session):
     """Make the checked-in regression fixtures read-only before anything runs.
 

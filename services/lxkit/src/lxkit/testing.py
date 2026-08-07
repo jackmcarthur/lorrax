@@ -735,15 +735,37 @@ def observed_skips() -> tuple:
 
 
 def arm_skip_honesty(profile: MachineProfile | None = None, *,
+                     scope: str = "",
                      extra_allowed: Sequence[AllowedSkip] = (),
                      min_collected: int | None = None) -> MachineProfile:
     """Turn the negative half on for THIS session.  Call from a conftest.
 
     One call per service suite — the charter's "one gate per service".
     Returns the profile in force so the caller can report it.
+
+    ``scope`` is a DIRECTORY, and passing it is close to mandatory in a
+    monorepo.  A service's allowlist describes the SERVICE's skips; without
+    a scope the gate would also judge every skip the surrounding suite
+    emitted — on Perlmutter that is ~45 device-count skips in lorrax's own
+    tests, none of which this service has any business ruling on, and the
+    gate would fail for reasons that are not about it.  A gate that fires
+    on other people's business is a gate that gets disarmed.
+
+    A DIRECTORY and not a nodeid prefix, because nodeids are relative to
+    whatever pytest picked as rootdir and that changes with the
+    invocation: ``pytest services/distrib_la/tests`` from the monorepo
+    root resolves rootdir to the SERVICE (its pyproject.toml is the
+    nearest one above the argument), so the same cell is
+    ``services/distrib_la/tests/test_x.py::t`` in one run and
+    ``tests/test_x.py::t`` in the next.  A prefix match would have
+    silently matched nothing on the standalone invocation — the gate would
+    have reported "not selected, inert" and asserted zero, which is the
+    quiet-failure shape this whole section exists to remove.  The
+    directory is resolved against the session's collected items, whose
+    paths are absolute.
     """
     prof = profile or machine_profile()
-    _ARMED.update(profile=prof, extra_allowed=tuple(extra_allowed),
+    _ARMED.update(profile=prof, scope=scope, extra_allowed=tuple(extra_allowed),
                   min_collected=min_collected)
     return prof
 
@@ -779,10 +801,32 @@ def pytest_sessionfinish(session, exitstatus):
     armed = _ARMED.get("profile")
     if armed is None:
         return
+    scope = _ARMED.get("scope") or ""
+    total = int(getattr(session, "testscollected", 0) or 0)
+    if scope:
+        root = os.path.realpath(scope) + os.sep
+        mine = {str(getattr(it, "nodeid", "")) for it in
+                getattr(session, "items", [])
+                if os.path.realpath(str(getattr(it, "path", None)
+                                        or getattr(it, "fspath", ""))
+                                    ).startswith(root)}
+        skips = [s for s in observed_skips() if s.nodeid in mine]
+        in_scope = len(mine)
+    else:
+        skips, in_scope = list(observed_skips()), total
+
+    # DELIBERATELY DESELECTED is not the same as EMPTY.  A run that said
+    # --no-services, -m something-else or -k narrowed this suite away
+    # collected other things; failing its floor would turn a deliberate
+    # narrowing into a red, and this tree has exactly the deselection
+    # switches that make that a daily occurrence.  A session that
+    # collected NOTHING AT ALL still trips the floor, which is the case
+    # the floor is actually about.
+    if in_scope == 0 and total > 0:
+        return
     try:
         assert_skips_match_profile(
-            observed_skips(), armed,
-            collected=int(getattr(session, "testscollected", 0) or 0),
+            skips, armed, collected=in_scope,
             extra_allowed=_ARMED.get("extra_allowed", ()),
             min_collected=_ARMED.get("min_collected"))
     except AssertionError as exc:                              # noqa: BLE001
