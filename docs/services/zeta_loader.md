@@ -141,12 +141,14 @@ staged into the main suite (deselect with `--no-services`; select with
 ## Performance
 
 Claims-style baselines in `services/zeta_loader/bench/baselines/`
-(`cpu1x1.json`, `cpu2x2.json`; op, shape, mesh, nodes, seconds, MB/s,
-jobid, FFI pins recorded in-file; jobid 56447670, 2026-08-07). The
-held-open-handle claim is measured as the `held_open` vs `open_close`
-row pair — the amortisation is worth 2.3–9.4× depending on shape
-(e.g. 1×1 `[8,64,512]`: 3098 vs 328 MB/s; 2×2 `[8,512,2048]`: 2886 vs
-1667 MB/s), and the two rows converging is the regression signal.
+(`cpu1x1.json`, `cpu2x2.json`, `gpu1x1.json`, `gpu2x2.json`; op, shape,
+mesh, nodes, seconds, MB/s, jobid, FFI pins recorded in-file; jobids
+56447670 cpu / 56457930 gpu, 2026-08-07). The held-open-handle claim is
+measured as the `held_open` vs `open_close` row pair on BOTH platforms —
+the amortisation is worth 2.3–9.4× on CPU meshes and 1.8–5.9× on CUDA
+meshes depending on shape (e.g. cpu1×1 `[8,64,512]`: 3098 vs 328 MB/s;
+gpu2×2 `[8,512,2048]`: 3241 vs 1709 MB/s), and the two rows converging
+is the regression signal on either platform.
 `read_zeta_G_local` (host numpy, no device round-trip) runs 4.4–11 GB/s
 on the same files. Reference band: slab_io's 2026-08-07 calibration
 (dd 725, serial h5py 967, SlabIO same-handle 953–961, open-close-per-leg
