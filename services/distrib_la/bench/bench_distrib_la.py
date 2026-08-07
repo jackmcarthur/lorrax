@@ -144,13 +144,28 @@ def run(mesh, *, dtype="complex128", warmup=2, reps=5, only=""):
                 continue
             rng = np.random.default_rng(20260807)
             A = _put(_hpd(rng, nq, n, dtype), mesh, (None, "x", "y"))
-            plan = D.plan(op, mesh, backend=backend, n=n)
             if op == "solve_lu":
                 B = _put(_rng_mat(rng, (nq, n, max(8, n // 4)), dtype),
                          mesh, (None, "x", "y"))
-                fn, args = plan.batched, (A, B)
+                fn, args = D.plan(op, mesh, backend=backend, n=n).batched, (A, B)
+            elif op == "cholesky" and resolved in ("slate", "cusolvermp"):
+                # MEASURED (cpu1x1 baseline, 2026-08-07): plan.batched
+                # REFUSES these -- their factor is a library HANDLE, not an
+                # array, and plan._stack_results declines to stack handles
+                # on purpose.  Timing the refusal would have left the two
+                # distributed cholesky backends with no row at all, which
+                # is the shape of a baseline table that quietly measures
+                # only the easy half.  factor()+solve() is the route those
+                # backends actually have, so it is the route timed.
+                B = _put(_rng_mat(rng, (nq, n, max(8, n // 4)), dtype),
+                         mesh, (None, "x", "y"))
+
+                def fn(a, b, _op=op, _bk=backend, _n=n):
+                    return D.solve(
+                        D.factor(_op, a, mesh, backend=_bk, n=_n), b)
+                args = (A, B)
             else:
-                fn, args = plan.batched, (A,)
+                fn, args = D.plan(op, mesh, backend=backend, n=n).batched, (A,)
             try:
                 compile_s, ts = _time_one(fn, args, warmup, reps)
             except Exception as exc:                           # noqa: BLE001
@@ -161,7 +176,12 @@ def run(mesh, *, dtype="complex128", warmup=2, reps=5, only=""):
                 if jax.process_index() == 0:
                     print(f"ERROR {tag}: {type(exc).__name__}", flush=True)
                 continue
+            route = ("factor+solve"
+                     if op == "cholesky" and resolved in ("slate",
+                                                          "cusolvermp")
+                     else "plan.batched")
             row = dict(op=op, backend=backend, resolved=resolved,
+                       route=route,
                        shape=[nq, n], dtype=dtype, mesh=f"{px}x{py}",
                        seconds=statistics.median(ts),
                        seconds_min=min(ts), seconds_max=max(ts),
