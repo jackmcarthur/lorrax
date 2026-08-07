@@ -130,4 +130,8 @@ def test_the_bootstrap_is_idempotent_and_appends():
         "assert once[:len(before)] == before, 'it PREPENDED; must append'\n"
         "print('ADDED', len(added))\n")
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
-    assert "ADDED 2" in r.stdout, r.stdout      # lxkit + distrib_la
+    # One per ``services/*/src`` that EXISTS — the count is the census, not
+    # a constant, so a service that lands without a ``src/`` (docs only, as
+    # ``services/wfn_loader`` was for one commit) is visible here as a
+    # number that did not move.
+    assert "ADDED 3" in r.stdout, r.stdout   # lxkit + distrib_la + wfn_loader

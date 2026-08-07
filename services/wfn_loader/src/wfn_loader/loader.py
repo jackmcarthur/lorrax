@@ -1,0 +1,1712 @@
+"""``WfnLoader`` — single entry point for ψ(G) loading.
+
+Replaces the {WFNReader + PhdfWfnReader + SymMaps.get_cnk_fullzone[_batch] +
+SymMaps.get_gvecs_kfull + load_wfns.read_Gvecs_to_devices + load_kpoint_fftbox}
+mess with one class.  Caller never thinks about backend, symmetry unfold,
+padding, or τ-phase.
+
+Returns ψ in **G-flat** layout (per-k, per-band, per-spinor, ngk_max_pad-padded).
+Downstream consumers compose with :mod:`common.wfn_transforms` (P3 landing
+target) to get FFT-box / r-space / centroid-gather outputs.  This split
+keeps the loader cheap (g_flat is ~6-11% of g_box) so band-chunk loops
+never have to materialise the FFT box just to access a real-space slice.
+
+Backends
+--------
+There are TWO, and ``backend='auto'`` (default) picks the lightest that
+works:
+
+- **eager** (host h5py + numpy unfold + ``device_put``): single-process,
+  mesh-less, or an explicit ``LORRAX_WFN_BACKEND=eager``.  At P>1 with a
+  mesh it still reads only THIS rank's band block (``_eager_build_process_local``).
+- **phdf5** (collective parallel-HDF5 FFI + on-device unfold): multi-rank
+  + 2-D mesh + an FFI .so exporting the kchunk-union read handler on
+  either platform.  Reuses the same union-read + unfold kernel that
+  powered the legacy ``PhdfWfnReader.coeffs_gspace`` path, but stops one
+  step short of the FFT-box scatter so the output stays G-flat (the
+  loader's defining layout).
+
+Both backends produce **byte-identical** output for the same ``(bands, k,
+sharding, bispinor)`` request — that's the P2 test contract, and it is
+the only reason ``LORRAX_WFN_BACKEND`` is safe to expose at all
+(``docs/architecture/services.md``).
+
+There was a third, ``phdf5_host``: an h5py union read feeding the same
+on-device unfold kernel, auto-selected when no FFI library loaded on
+either platform.  Deleted 2026-08-06.  Its name promised a third
+transport and it was not one — it read with the SAME independent POSIX
+h5py hyperslabs the eager path already uses at P>1 (no MPI, no MPI-IO,
+no FFI), differing only in where the unfold ran.  So it was a duplicate
+compute path over an existing transport, auto-selected by a missing
+``.so``, which is exactly what the 2026-08-01 ruling forbids: *"a
+missing or unloadable FFI library is a refusal at startup (with the
+library named), not a silent demotion to a slower path.  Auto-demotion
+remains only where the alternative is a different service tier …
+never a duplicate compute path."*  ``_auto_pick_backend`` now refuses
+there and quotes ``probe_target``'s reason for both platforms;
+``LORRAX_WFN_BACKEND=eager`` is the operator's way through.
+
+Public surface
+--------------
+* :class:`MfHeader` attributes — same names :class:`WFNReader` exposes
+  (``nkpts``, ``nbands``, ``nspinor``, ``kgrid``, ``fft_grid``, ``bvec``,
+  ``sym_matrices``, ``translations``, …).  Drop-in source.
+* :meth:`load` — one call: ψ array for a (band_range, k) window.
+* :meth:`bands` — band-chunked iterator for GW driver loops.
+* :meth:`gvecs` — cached G-vector lists per k-set.
+* :meth:`ngk_valid` — per-k logical ngk (for callers that care).
+* :meth:`get_gvec_nk` — deprecated thin shim for legacy vcoul / qp_wfn.
+
+P-roadmap
+---------
+- P1 (this commit): eager backend; bit-match legacy WFNReader+SymMaps.
+- P2: phdf5 backend; bit-match eager.
+- P3: ``common/wfn_transforms.py`` (to_box / to_rbox / to_rmu / to_rchunk).
+- P4: migrate consumers; delete SymMaps unfold helpers + load_wfns helpers.
+- P5: delete WFNReader + PhdfWfnReader.
+"""
+from __future__ import annotations
+
+import functools
+import types
+from pathlib import Path
+from typing import Iterator, Literal, Sequence
+
+import h5py as h5
+import jax
+import jax.numpy as jnp
+import numpy as np
+from ._shard_map import shard_map
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+from ._collectives import device_put_process_local
+
+
+__all__ = ["WfnLoader"]
+
+
+KSpec = Sequence[int] | Literal["ibz", "full_bz"]
+
+
+def _build_phdf5_clamped_counts(
+    *,
+    world: int,
+    bands_per_rank: int,
+    b_lo_logical: int,
+    band_extent: int,
+    n_reads: int,
+    ngk_per_ibz_read: Sequence[int],
+    kchunk_start_per_read: Sequence[int],
+    ngktot: int,
+    ns: int,
+) -> np.ndarray:
+    """Per-rank ``counts`` table for the kchunk-union phdf5 read.
+
+    This is the SlabIO padded-slab clip applied per rank: the arithmetic
+    itself is :func:`file_io._slab_io_ffi._derive_valid_shape`
+    (``max(0, min(slab, logical - offset))`` per dim) and lives there
+    only.  This function owns the table LAYOUT the C++ wants, not the
+    clip.  They were two implementations until 2026-08-06 and they had
+    diverged on the band axis — see below.
+
+    The C++ ``read_kchunk_union`` handler computes each rank's
+    band-axis file offset as
+    ``offset_band = b_lo_logical + rank_coord_band * bands_per_rank``,
+    where ``rank_coord_band = coord_x * p_y + coord_y`` for a 2-D
+    ``('x','y')`` mesh of shape ``(p_x, p_y)``.  The rank slab is
+    therefore ``(bands_per_rank, ns, ngk[ibz], 2)`` at file offset
+    ``(offset_band, 0, kchunk_start, 0)``, and the count each rank
+    passes to H5Sselect_hyperslab is that slab clipped to the LOGICAL
+    extent of the read.
+
+    ``band_extent`` IS THE LOGICAL WINDOW END ``b_hi``, NOT ``mnband``.
+    Both bounds matter and ``b_hi <= mnband`` always (``load`` refuses
+    otherwise), so the logical one subsumes the file one:
+
+    * clipping to ``mnband`` alone is what stops the tail rank reading
+      past EOF — ``(b_hi - b_lo)`` rounded up to ``world *
+      bands_per_rank`` can extend past the file, and H5Dread then fails
+      with "selection + offset not within extent" (the 16-GPU CrI3
+      crash);
+    * clipping to ``b_hi`` additionally keeps the BAND-PAD rows empty.
+      Clipping to ``mnband`` only, the tail rank read REAL file bands
+      ``[b_hi, b_lo + nb_padded)`` into rows the loader documents as
+      zero ("Band axis pad rows are zero-filled", :meth:`WfnLoader.load`)
+      and that ``_eager_build`` / ``_eager_build_process_local`` do fill
+      with zeros.  That made the phdf5 backend disagree with the eager
+      backend on every request whose band count is not a multiple of the
+      world size — i.e. the P2 byte-identity contract held only on the
+      exactly-divisible geometries the parity harness happens to run.
+
+    Ranks whose whole block is past ``band_extent`` get band_cnt=0 —
+    their pinned-buffer pre-zero (in the C++ worker) becomes a
+    zero-filled rank tile, which is the correct semantics for pad rows.
+    Equivalently: ``sum_r band_cnt == b_hi - b_lo`` exactly, which is
+    the invariant the regression test asserts.
+
+    The table is sharded on the leading axis by ``('x','y')`` so each
+    rank's shard_map-local view is the ``(n_reads, 4)`` slice for its
+    own rank.  Rank-flattening matches the C++: outer loop over ``r``
+    in 0..world-1 corresponds to ``coord_x = r // p_y,
+    coord_y = r % p_y`` (leftmost-is-slowest in JAX's convention).
+    """
+    from file_io._slab_io_ffi import _derive_valid_shape
+    logical = (int(band_extent), int(ns), int(ngktot), 2)
+    counts = np.zeros((int(world), int(n_reads), 4), dtype=np.int64)
+    for r in range(int(world)):
+        file_off_band = int(b_lo_logical) + r * int(bands_per_rank)
+        for ki in range(int(n_reads)):
+            counts[r, ki] = _derive_valid_shape(
+                (int(bands_per_rank), int(ns),
+                 int(ngk_per_ibz_read[ki]), 2),
+                (file_off_band, 0, int(kchunk_start_per_read[ki]), 0),
+                logical)
+    return counts.reshape(int(world) * int(n_reads), 4)
+
+
+class WfnLoader:
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        mesh: Mesh | None = None,
+        backend: Literal["auto", "eager", "phdf5"] = "auto",
+    ) -> None:
+        self._path = str(path)
+        self._filename = self._path  # legacy WFNReader compat
+        self._mesh = mesh
+        self._backend_was_auto = (backend == "auto")
+
+        if backend == "auto":
+            backend = self._auto_pick_backend()
+            # The auto-pick is invisible otherwise, and it is a REAL fork
+            # in behaviour (collective MPI-IO FFI read vs h5py union read
+            # vs per-rank eager) selected by whether an FFI .so happens to
+            # be on LD_LIBRARY_PATH.  Two GPU campaigns differed only in
+            # this and nothing in either log said so (scorecard AG).
+            self._announce_backend(backend)
+        if backend == "phdf5_host":
+            raise ValueError(
+                "WfnLoader: backend='phdf5_host' was deleted 2026-08-06.  It "
+                "was not a third transport — it read with the same "
+                "independent POSIX h5py hyperslabs the 'eager' backend "
+                "already uses at P>1, and was auto-selected only by a "
+                "missing FFI .so, which the 2026-08-01 ruling makes a "
+                "refusal rather than a demotion.  Use backend='phdf5' (the "
+                "collective FFI read) or backend='eager'.")
+        if backend not in ("eager", "phdf5"):
+            raise ValueError(
+                f"unknown backend {backend!r}; accepted: "
+                f"'auto', 'eager', 'phdf5'")
+        if backend == "phdf5" and mesh is None:
+            raise ValueError(
+                f"WfnLoader: backend={backend!r} requires a Mesh; pass mesh=...")
+        self.backend = backend
+
+        self._file = h5.File(self._path, "r")
+
+        # phdf5 collective context (lazy on first load).  Held here so
+        # the file is kept open for the loader's lifetime.
+        self._phdf5_ctx: int | None = None
+        self._phdf5_static_dev: dict | None = None
+
+        # mf_header surface — same names WFNReader exposes (drop-in compat).
+        from file_io.mf_header import (
+            bind_mf_attrs, kpt_starts, read_mf_header_from_file)
+        hdr = read_mf_header_from_file(self._file)
+        bind_mf_attrs(self, hdr)
+        # Cartesian-→-crystal: same expression legacy WFNReader exposed.
+        self.atom_crys = np.einsum(
+            'ij,kj->ki', np.linalg.inv(self.avec).T, self.atom_positions)
+
+        # Derived band-fill metadata — same names WFNReader exposed.
+        # ``ifmax`` is the 1-based index of the highest occupied band.
+        if np.size(self.ifmax) > 0:
+            self.nelec = int(np.max(self.ifmax))
+        else:
+            self.nelec = int(np.sum(self.occs[0, 0] > 0.5))
+        _nb = int(self.energies.shape[-1])
+        _occ_idx = max(0, min(self.nelec - 1, _nb - 1))
+        self.vbm = float(np.max(self.energies[:, :, _occ_idx]))
+        if _occ_idx + 1 < _nb:
+            self.cbm = float(np.min(self.energies[:, :, _occ_idx + 1]))
+            self.efermi = 0.5 * (self.vbm + self.cbm)
+        else:
+            self.cbm = float(self.vbm)
+            self.efermi = float(self.vbm)
+
+        # Eager-backend state.  Only the eager path reads coeffs host-side;
+        # keep the dataset HANDLE (no read) and hyperslab the requested
+        # ``[b_lo:b_hi, :, start:end, :]`` block per-call in ``_eager_build``.
+        # The phdf5 backend reads coeffs collectively via the FFI, so it
+        # never touches this — slurping the whole ``(nb, ns, ngktot, 2)`` f64
+        # array unconditionally was pure waste + a latent OOM (a second,
+        # whole-array read on the exact multi-rank path where memory is
+        # tightest).  ``_gvecs_raw`` (ngktot,3) + ``_kpt_starts`` are cheap
+        # index metadata both backends use — keep those eager.
+        self._coeffs_ds = (
+            self._file["wfns/coeffs"] if self.backend == "eager" else None)
+        self._gvecs_raw = self._file["wfns/gvecs"][:]     # (ngktot, 3) int
+        # kpt_starts = cumulative (exclusive prefix) sum of ngk.
+        self._kpt_starts = kpt_starts(self.ngk)
+
+        # Lazy state.
+        self._sym = None
+        self._gvecs_cache: dict[tuple, np.ndarray] = {}
+        self._ngk_valid_cache: dict[tuple, np.ndarray] = {}
+        # Device-resident g_index cache.  Sphere/g_index is a function of
+        # ``(k_set, fft_grid)`` only — identical across charge + transverse
+        # bispinor channels and across V_q tiles.  Caching the device copy
+        # here (not in ``psi_G_store._g_index_dev``, which dies with each
+        # ``fit_zeta_to_h5`` instance) deduplicates the (nk, nx, ny, nz)
+        # int32 buffer across the full GW pipeline.  Pre-fix:
+        # ``jax.device_put`` allocated a fresh REPLICATED buffer per
+        # ``psi_G_store`` construction → 1 buffer/channel × 4 channels =
+        # 4-8 leaked buffers ≈ 1.3 GB/rank wasted (agent_h §3 Finding 3).
+        # Post-fix: single shared device buffer per ``(k_cache_key, mesh)``.
+        # Keyed by ``(k_cache_key, id(mesh))`` so two ``WfnLoader``s on
+        # different meshes (rare) get distinct buffers; same loader+mesh
+        # always returns the same ``jax.Array``.
+        self._gvecs_dev_cache: dict[tuple, "jax.Array"] = {}
+
+        # ------------------------------------------------------------------
+        # Load-time symmetry MEASUREMENT (default ON).
+        #
+        # A WFN file states which spatial operations it *claims* and how
+        # its k-mesh was reduced, but never states whether time-reversal
+        # symmetry holds for the system.  Inferring that from flags
+        # (``ntran``, "is this a nosym deck") is what produced the
+        # ψ(r) → ψ*(−r) corruption of scorecard §Q, and several bugs
+        # before it.  Instead we build the spin-resolved charge density
+        # from the RAW IBZ wavefunctions and measure it: ``trs_holds``
+        # below is a MEASURED property of these coefficients, and
+        # ``SymMaps`` consults it before it will select any
+        # time-reversal row (see ``_sym_wfn_stub``).
+        #
+        # WHAT IS AND IS NOT ESTABLISHED BY ``self.trs_holds`` — read this
+        # before relying on it, and see the derivations it points at:
+        #   * MEASURED: whether the occupied manifold is time-reversal
+        #     invariant, via ``m_{−k}(r) = −m_k(r)`` summed over the ± k
+        #     pairs present in the file.  That identity involves NO
+        #     symmetry operation, NO fractional translation τ, NO umklapp
+        #     vector and NO ``U_spinor`` — so it is an INDEPENDENT check
+        #     on the unfold, not a restatement of it.  Derivation (T1)-(T5)
+        #     in ``common/density_symmetry_check.py``.
+        #   * ALSO MEASURED: that each claimed ``{S|τ}`` really leaves ρ
+        #     invariant.  Because ρ is a spinor TRACE, ``U_spinor`` and the
+        #     τ-phase cancel out of it, so this arm validates ``mtrx`` and
+        #     ``tnp`` only.
+        #   * NOT MEASURED: ``U_spinor`` and the τ-phase used by
+        #     ``unfold_psi`` (they cancel in ρ, see above), and TRS for
+        #     ``nspin == 2`` decks (this reader has no spin axis — coeffs
+        #     axis 1 is the spinor axis everywhere, so the two collinear
+        #     channels are not addressable and the check says so).
+        # The verdict reaches ``SymMaps`` through ``_sym_wfn_stub`` below;
+        # ``SymMaps`` is the ONLY consumer, and it is also the only place
+        # that can turn a time-reversal row into a conjugated ψ, so
+        # gating there covers every backend (eager / phdf5).
+        #
+        # Runs last in ``__init__`` because it needs ``nelec``,
+        # ``kweights``, ``box_index`` and the open file handle.  Cost is
+        # occupied-bands-only on a ±-closed k-subsample — order a second
+        # at fixture scale, ~5 s at 12x12 scale (measured, scorecard §U)
+        # — cached per (file, mtime, size) for the process.
+        # ``LORRAX_TRS_CHECK=0`` opts out; ``=strict`` raises instead of
+        # warning.
+        self.density_symmetry = None
+        self.trs_holds = True
+        self._run_density_symmetry_check()
+
+    def _run_density_symmetry_check(self) -> None:
+        """Measure TRS + the spatial symmetry table from ψ (see above)."""
+        from common.density_symmetry_check import cached_density_symmetry_check
+        report = cached_density_symmetry_check(self)
+        if report is None:
+            return
+        self.density_symmetry = report
+        self.trs_holds = bool(report.trs_holds)
+
+    # ------------------------------------------------------------------
+    def close(self) -> None:
+        f = getattr(self, "_file", None)
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+            self._file = None
+        ctx = getattr(self, "_phdf5_ctx", None)
+        if ctx is not None:
+            try:
+                from ffi.phdf5 import close_file
+                close_file(ctx)
+            except Exception:
+                pass
+            self._phdf5_ctx = None
+
+    def __enter__(self) -> "WfnLoader":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------
+    # Backend selection
+    # ------------------------------------------------------------------
+    _BACKEND_ANNOUNCED: set = set()
+
+    def _announce_backend(self, backend: str) -> None:
+        """Print the auto-picked read backend once per (backend, world).
+
+        Rank-0 only, once per distinct decision — so a driver that opens
+        several loaders does not spam, but a run whose read path changed
+        because an ``.so`` appeared on ``LD_LIBRARY_PATH`` says so.
+        """
+        try:
+            world = int(jax.process_count())
+            if int(jax.process_index()) != 0:
+                return
+        except Exception:
+            world = 1
+        key = (backend, world)
+        if key in WfnLoader._BACKEND_ANNOUNCED:
+            return
+        WfnLoader._BACKEND_ANNOUNCED.add(key)
+        why = {
+            "eager": "single-process or mesh-less: host h5py read per rank",
+            "phdf5": "collective MPI-IO read through the phdf5 FFI .so",
+        }.get(backend, "")
+        print(f"  [WfnLoader] read backend = {backend} "
+              f"(auto, {world} process{'es' if world != 1 else ''}) — {why}",
+              flush=True)
+
+    def _auto_pick_backend(self) -> str:
+        """Pick the lightest backend that works.
+
+        Rules:
+          * ``LORRAX_WFN_BACKEND`` env set → honour it verbatim (escape
+            hatch for A/B testing / forcing eager).
+          * Mesh missing → eager (single-device / laptop / pytest).
+          * Single-process JAX → eager (no benefit from a collective /
+            union read).
+          * Multi-process JAX + mesh + CUDA FFI .so loadable → phdf5
+            (collective MPI-IO read on GPU).  The probe pins the CUDA
+            library explicitly.
+          * Multi-process JAX + mesh + host FFI .so exposes the phdf5 read
+            handlers → phdf5 (collective MPI-IO read on CPU).  Same single
+            read path — the phdf5 C++ read core is shared and only its
+            device-staging tail switches (cudaMemcpyAsync H2D vs a host
+            memcpy); the ffi_call resolves to the host handler by lowering
+            platform and open_file routes the collective lifecycle to the
+            host lib (liblorrax_ffi_host.so built with the phdf5 subpackage).
+          * Multi-process JAX + mesh, no phdf5-capable FFI .so on EITHER
+            platform → **REFUSE**, quoting ``probe_target``'s three-way
+            reason for both.  There used to be a ``phdf5_host`` tier here;
+            see the module docstring for why a duplicate compute path
+            selected by a missing ``.so`` is not a fallback.  An operator
+            who wants the host read anyway asks for it by name
+            (``LORRAX_WFN_BACKEND=eager``), which is checked above and so
+            never reaches the probe.
+        """
+        import os
+        # A mesh-less loader can only run eager — there is no device mesh
+        # to express a sharded read against.  This dominates the env
+        # override: forcing a sharded backend onto a metadata-only,
+        # mesh-less loader (htransform builds one before its mesh exists)
+        # must not raise.
+        if self._mesh is None:
+            return "eager"
+        forced = os.environ.get("LORRAX_WFN_BACKEND", "").strip().lower()
+        if forced == "eager":
+            return "eager"
+        if forced == "phdf5":
+            return forced           # mesh present (checked above) → viable
+        if forced == "phdf5_host":
+            # A deleted spelling must not resolve to something else: an
+            # operator who exported this asked for a specific read path,
+            # and silently giving them the FFI one (or eager) is how an
+            # A/B measures the wrong arm.
+            raise ValueError(
+                "LORRAX_WFN_BACKEND=phdf5_host names a backend deleted on "
+                "2026-08-06 (it was the eager backend's own POSIX h5py "
+                "transport with a different unfold kernel, auto-selected "
+                "by a missing FFI .so).  Set 'eager' for the host read or "
+                "'phdf5' for the collective FFI read, or unset it.")
+        try:
+            if int(jax.process_count()) <= 1:
+                return "eager"
+        except Exception:
+            return "eager"
+        # GPU first, then CPU: the SAME collective MPI-IO read path, served
+        # by whichever platform's FFI library exports the kchunk-union read
+        # handler.  ``ffi_loader.probe_target`` owns the per-platform symbol
+        # probe (adding a new FFI target platform touches only
+        # ffi_loader._PLATFORMS, not this ladder), and it distinguishes the
+        # three ways a target can be unusable — which is why the refusal
+        # below quotes its reason verbatim instead of reducing it to a bool.
+        from ffi.common.ffi_loader import probe_target
+        reasons = []
+        for _plat in ("CUDA", "cpu"):
+            usable, why = probe_target("lorrax_phdf5_read_kchunk_union", _plat)
+            if usable:
+                from ffi.phdf5 import open_file as _of  # noqa: F401
+                return "phdf5"
+            reasons.append(f"  {_plat}: {why}")
+        raise RuntimeError(
+            "WfnLoader: no FFI library can serve the collective WFN read "
+            f"(jax.process_count()={int(jax.process_count())}, mesh "
+            f"{tuple(self._mesh.devices.shape)}), and there is no "
+            "second transport to demote to — the h5py 'phdf5_host' tier "
+            "was deleted 2026-08-06 because it was the eager backend's own "
+            "POSIX read with a different unfold kernel, i.e. a duplicate "
+            "compute path, and 'a missing or unloadable FFI library is a "
+            "refusal at startup (with the library named), not a silent "
+            "demotion to a slower path' (decisions.md 2026-08-01).\n"
+            + "\n".join(reasons)
+            + "\nRepair the library named above, or set "
+              "LORRAX_WFN_BACKEND=eager to take the per-rank host read "
+              "deliberately (it is byte-identical, and at P>1 it still "
+              "reads only this rank's band block).")
+
+    def adopt_mesh(self, mesh) -> str:
+        """Late-bind the device mesh and re-run the auto backend pick.
+
+        For the driver whose mesh cannot exist at construction time:
+        kmeans sizes its mesh from the FFT grid THIS file declares (and
+        from the charge density read against it), so the loader is
+        necessarily built mesh-less and, at P>1, lands on the per-rank
+        eager read even though every ψ load it will do is mesh-wide
+        (scorecard BD.2).  Calling this right after ``dist.build_mesh``
+        gives it the same collective phdf5 route htransform picks.
+
+        Deliberately narrow: only a MULTI-PROCESS run, and only a loader
+        constructed with ``backend="auto"`` that resolved to ``eager``,
+        switches — an explicit ``backend=`` request (A/B forcing) is
+        never overridden, a loader already on a sharded backend keeps
+        its mesh, and a single-process run (however many host devices)
+        keeps the mesh-less replicated-load contract its callers were
+        built against (no band-axis mesh padding appears that was not
+        there before).  The switch is safe mid-life because the phdf5
+        collective context is created lazily on the first ``load`` and
+        the eager state kept so far (the ``coeffs`` dataset HANDLE — no
+        data) remains valid for ``load_process_local``.  Returns the
+        backend now in force.
+
+        MAY RAISE since 2026-08-06.  It re-runs :meth:`_auto_pick_backend`,
+        which at P>1 refuses when no FFI library can serve the collective
+        read instead of demoting to the deleted ``phdf5_host`` tier.  That
+        is the intended place for it: this is called immediately after
+        ``dist.build_mesh``, i.e. still at startup, and the refusal names
+        the library and the ``LORRAX_WFN_BACKEND=eager`` way through.
+        """
+        if mesh is None or self._mesh is not None:
+            return self.backend
+        if not self._backend_was_auto or self.backend != "eager":
+            return self.backend
+        try:
+            if int(jax.process_count()) <= 1:
+                return self.backend
+        except Exception:
+            return self.backend
+        self._mesh = mesh
+        backend = self._auto_pick_backend()
+        if backend != self.backend:
+            self._announce_backend(backend)
+            self.backend = backend
+        return self.backend
+
+    # ------------------------------------------------------------------
+    # k-set resolution
+    # ------------------------------------------------------------------
+    def _ensure_sym(self):
+        from common.symmetry_maps import SymMaps
+        if self._sym is None:
+            self._sym = SymMaps(self._sym_wfn_stub())
+        return self._sym
+
+    def _sym_wfn_stub(self):
+        """Minimal namespace SymMaps's __init__ reads; lets us construct
+        SymMaps without holding a circular ref to the loader."""
+        return types.SimpleNamespace(
+            ntran=int(self.ntran),
+            sym_matrices=self.sym_matrices,
+            translations=self.translations,
+            kpoints=self.kpoints,
+            kgrid=self.kgrid,
+            shift=self.shift,
+            nkpts=int(self.nkpts),
+            bvec=self.bvec,
+            avec=self.avec,
+            atom_types=self.atom_types,
+            atom_positions=self.atom_positions,
+            atom_crys=np.einsum(
+                "ij,kj->ki",
+                np.linalg.inv(self.avec).T, self.atom_positions),
+            fft_grid=self.fft_grid,
+            # MEASURED (not inferred) time-reversal verdict — see
+            # ``_run_density_symmetry_check``.  ``SymMaps`` refuses to
+            # select time-reversal rows when this is False, whatever the
+            # ``ntran``/k-weight flags imply.
+            trs_holds=bool(getattr(self, "trs_holds", True)),
+        )
+
+    def _resolve_k(self, k: KSpec) -> tuple[np.ndarray, bool]:
+        """Resolve a k-spec to (k_idxs, unfold).
+
+        - ``'ibz'``: raw IBZ — returns np.arange(nkpts), unfold=False.
+        - ``'full_bz'``: full-BZ unfold — returns np.arange(sym.nk_tot),
+          unfold=True.
+        - explicit list: interpreted as **full-BZ indices**, unfold=True.
+        """
+        if isinstance(k, str):
+            if k == "ibz":
+                return np.arange(self.nkpts, dtype=np.int32), False
+            if k == "full_bz":
+                sym = self._ensure_sym()
+                return np.arange(int(sym.nk_tot), dtype=np.int32), True
+            raise ValueError(f"unknown k-spec {k!r}")
+        return np.asarray(k, dtype=np.int32), True
+
+    def _k_cache_key(self, k: KSpec) -> tuple:
+        if isinstance(k, str):
+            return (k,)
+        return ("list", tuple(int(v) for v in k))
+
+    # ------------------------------------------------------------------
+    # G-vector and ngk_valid accessors
+    # ------------------------------------------------------------------
+    def gvecs(self, *, k: KSpec = "full_bz") -> np.ndarray:
+        """Return ``(n_k, ngkmax, 3)`` int32 — G-vector list per k, padded
+        beyond logical ``ngk`` with the FFT-box **pad sentinel**.
+
+        The pad rows are ``common.gvec_fft_box.fft_box_pad_sentinel(
+        self.fft_grid)`` — the Nyquist-corner Miller index — NOT zeros.
+        Zeros are the Miller index of Γ, a physical component of every
+        G-sphere, so a consumer that dropped the ``ngk_valid`` mask used
+        to add ``ngkmax − ngk`` extra copies of ψ(Γ) without any symptom.
+        The sentinel is a cell no physical G occupies (enforced by
+        :func:`~common.gvec_fft_box.pad_gvecs_to_sentinel`, which refuses
+        the table otherwise), so the same mistake is now *detectable* —
+        see ``gw.kin_ion_io.get_kin_ion_k``'s refusal.
+
+        This is the SAME padded representation ``zeta_q.h5`` stores in
+        ``isdf_header/gvec_components``, built by the same routine; the
+        two on-disk layouts (ragged ψ, ngkmax-rectangular ζ) differ only
+        in how they are read, not in what they become.
+
+        Cached per k-set.
+        """
+        from common.gvec_fft_box import pad_gvecs_to_sentinel
+        key = self._k_cache_key(k)
+        if key in self._gvecs_cache:
+            return self._gvecs_cache[key]
+
+        k_idxs, unfold = self._resolve_k(k)
+
+        if not unfold:
+            rows = []
+            for ik in k_idxs:
+                start = int(self._kpt_starts[int(ik)])
+                end = start + int(self.ngk[int(ik)])
+                rows.append(self._gvecs_raw[start:end])
+        else:
+            sym = self._ensure_sym()
+            rows = []
+            for nk in k_idxs:
+                # Inlines the former ``sym.get_gvecs_kfull`` body — see
+                # the unfold derivation in ``test_wfn_loader_eager.py``
+                # ``test_gvecs_full_bz_matches_legacy``.  Each full-BZ k
+                # rotates its IBZ-source G-list by ``sym_krep`` and
+                # subtracts the BGW umklapp ``kg0``.
+                nk_int = int(nk)
+                sym_idx = int(sym.sym_idx_k[nk_int])
+                kbar = int(sym.irr_idx_k[nk_int])
+                sym_krep = np.asarray(
+                    sym.sym_mats_k[sym_idx], dtype=np.int32)
+                start = int(self._kpt_starts[kbar])
+                end = start + int(self.ngk[kbar])
+                k_gvecs = self._gvecs_raw[start:end]
+                Gkk = sym.get_umklapp_vector(
+                    self, nk_int, sym_idx, kbar, sym_krep)
+                rows.append(np.einsum('ij,kj->ki', sym_krep, k_gvecs) - Gkk)
+
+        # ``ngkmax=self.ngkmax`` (the FILE's max), not max(len(rows)):
+        # an explicit k-subset may not contain the widest k, but every
+        # ψ buffer in this loader is cut to the file's ngkmax.
+        out, _ = pad_gvecs_to_sentinel(
+            rows, tuple(int(s) for s in self.fft_grid),
+            ngkmax=int(self.ngkmax))
+        self._gvecs_cache[key] = out
+        return out
+
+    def ngk_valid(self, *, k: KSpec = "full_bz") -> np.ndarray:
+        """Per-k logical ngk (without pad).  Host numpy int32."""
+        key = self._k_cache_key(k)
+        if key in self._ngk_valid_cache:
+            return self._ngk_valid_cache[key]
+        k_idxs, unfold = self._resolve_k(k)
+        if not unfold:
+            out = np.asarray(self.ngk[k_idxs], dtype=np.int32)
+        else:
+            sym = self._ensure_sym()
+            ibz_per_full = np.asarray(sym.irr_idx_k, dtype=np.int32)
+            out = np.asarray(self.ngk[ibz_per_full[k_idxs]], dtype=np.int32)
+        self._ngk_valid_cache[key] = out
+        return out
+
+    def get_gvec_nk(self, ik: int) -> np.ndarray:
+        """Deprecated shim for legacy vcoul.py / qp_wfn.py callers.
+
+        Returns the (ngk[ik], 3) IBZ G-list for a single k.  New code
+        should use ``loader.gvecs(k='ibz')[ik, :loader.ngk_valid(k='ibz')[ik]]``
+        — but vcoul reads one k at a time, so the shim stays for one
+        release."""
+        start = int(self._kpt_starts[int(ik)])
+        end = start + int(self.ngk[int(ik)])
+        return self._gvecs_raw[start:end]
+
+    # ------------------------------------------------------------------
+    # G-flat → FFT-box index (zero-sentinel gather table)
+    # ------------------------------------------------------------------
+    def box_index(self, *, k: KSpec = "full_bz") -> np.ndarray:
+        """Return ``(n_k, nx, ny, nz)`` int32 — for each FFT-box cell, the
+        index along the ψ(G) axis to gather from.  Empty cells take the
+        sentinel value ``ngkmax``; downstream transforms append a zero
+        slot at that position so empty cells gather zero (see
+        :func:`common.wfn_transforms.to_box`).
+
+        Cached per (k-set, ``self.fft_grid``).  Reuses
+        :func:`common.gvec_fft_box.build_g_index_for_fft_box` so the
+        algorithm lives in one place — and hands it the loader's OWN
+        rectangular ``(n_k, ngkmax, 3)`` table plus ``ngk_valid``, so the
+        builder does a masked scatter with no ragged Python k-loop
+        between the two.
+        """
+        # ``fft_grid`` is in the key because the g_index is a function of
+        # (k-set, fft_grid) and the docstring above has always said so —
+        # it just wasn't true.  A loader's ``fft_grid`` is read-only in
+        # practice, so this has never fired; it costs one tuple.
+        cache_key = ("box_index", *self._k_cache_key(k),
+                     tuple(int(s) for s in self.fft_grid))
+        if cache_key in self._gvecs_cache:
+            return self._gvecs_cache[cache_key]
+
+        from common.gvec_fft_box import build_g_index_for_fft_box
+
+        g_index = build_g_index_for_fft_box(
+            self.gvecs(k=k), tuple(int(s) for s in self.fft_grid),
+            int(self.ngkmax), ngk_valid=self.ngk_valid(k=k))
+        self._gvecs_cache[cache_key] = g_index
+        return g_index
+
+    def box_index_dev(
+        self,
+        *,
+        k: KSpec = "full_bz",
+        mesh: "Mesh | None" = None,
+        sharding: "NamedSharding | PartitionSpec | None" = None,
+    ) -> "jax.Array":
+        """Return ``box_index(k=k)`` as a REPLICATED ``jax.Array`` on
+        ``mesh`` — but only do the ``device_put`` once per ``(k, mesh)``.
+
+        Fixes the sphere-idx replicated leak (agent_h §3 Finding 3):
+        every fresh ``psi_G_store._populate_from_loader`` used to call
+        ``jax.device_put(loader.box_index("full_bz"), ...)`` which
+        allocated a NEW REPLICATED ``(nk, nx, ny, nz) int32`` buffer
+        per channel (0.16 GB/rank each).  After 4 bispinor channels +
+        a couple of one-off calls the leak grew to 8 buffers ≈ 1.3
+        GB/rank.  Caching the ``jax.Array`` here means **every caller
+        for the same (k, mesh) gets the same device buffer**; the
+        XLA allocator references it once and Python GC retains it
+        through the loader's lifetime.
+
+        Parameters
+        ----------
+        k : KSpec
+            Same as :meth:`box_index` (defaults to ``"full_bz"`` — the
+            only path that's ever been observed to leak in production).
+        mesh : Mesh, optional
+            Device mesh to replicate over.  If absent, falls back to
+            ``self._mesh`` (the loader's own mesh, set at construction).
+            Raises if both are absent — there's no sensible single-device
+            fallback for a sharding-aware accessor.
+        sharding : NamedSharding | PartitionSpec, optional
+            For callers that need a non-default replicated layout.
+            Default ``None`` ⇒ ``NamedSharding(mesh, P(None, None, None, None))``
+            (the only layout used in production; centralised here so
+            future shape changes (e.g. 5-D ψ for bispinor) update one
+            site instead of three).
+        """
+        from jax.sharding import NamedSharding, PartitionSpec as P
+        mesh = mesh if mesh is not None else self._mesh
+        if mesh is None:
+            raise ValueError(
+                "box_index_dev: pass `mesh=` or construct the WfnLoader "
+                "with a mesh; cannot device_put without one.")
+        # Build the cache key.  ``id(mesh)`` is fine because the mesh
+        # outlives the loader in every production driver (the mesh is
+        # built once at top-of-main and threaded through every kernel).
+        cache_key = ("box_index_dev", *self._k_cache_key(k),
+                     tuple(int(s) for s in self.fft_grid), id(mesh))
+        if cache_key in self._gvecs_dev_cache:
+            return self._gvecs_dev_cache[cache_key]
+        # Resolve the requested sharding (default = replicated 4-axis).
+        if sharding is None:
+            sharding = NamedSharding(mesh, P(None, None, None, None))
+        elif isinstance(sharding, P):
+            sharding = NamedSharding(mesh, sharding)
+        # Process-local placement (``common.collectives``): every rank
+        # builds the SAME index table from the same file, so each may
+        # simply declare its own shard.  ``jax.device_put(numpy,
+        # multi_process_named_sharding)`` would instead fire JAX's silent
+        # ``multihost_utils.assert_equal`` → ``process_allgather``, which
+        # for THIS table is ``P·nk·n_rtot·4`` B on every rank: 6.45 GB at
+        # P=64, 14.5 GB projected at P=144 (scorecard Y.3, the larger of
+        # the two "P-LINEAR loader allgathers").  It was the single
+        # biggest collective in a ζ-fit at 276 centroids.
+        g_idx_np = self.box_index(k=k)
+        dev = device_put_process_local(g_idx_np, sharding)
+        self._gvecs_dev_cache[cache_key] = dev
+        return dev
+
+    # ------------------------------------------------------------------
+    # Sharding + padding
+    # ------------------------------------------------------------------
+    def _default_sharding(
+        self,
+        sharding: PartitionSpec | None,
+        *,
+        n_k: int,
+    ) -> tuple[NamedSharding | None, int]:
+        """Return ``(named_sharding, p_band)`` for the (k, nb, ns, ngk) layout.
+
+        - If caller passed ``sharding`` explicitly, use it; ``p_band`` is
+          the product of mesh axes on the band dim (for padding).
+        - Else default: if mesh available and multi-device, shard band
+          on ``('x','y')`` (the GW production layout); if not, replicate.
+        """
+        if sharding is None:
+            if self._mesh is None or len(self._mesh.devices.flat) <= 1:
+                return None, 1                   # replicated
+            sharding = P(None, ("x", "y"), None, None)
+
+        if self._mesh is None:
+            return None, 1                       # replicated even with explicit spec
+        named = NamedSharding(self._mesh, sharding)
+        # Band-axis pad factor, derived from the spec by the SHARED helper.
+        # ``common.mtxel_sweep`` derives its own with the same call, so the
+        # sweep can consume this loader's psi without re-padding; a second
+        # local copy of this arithmetic is how the two would silently drift.
+        from runtime.padding import spec_divisor
+        return named, spec_divisor(self._mesh, sharding, 1)
+
+    # ------------------------------------------------------------------
+    # Shared sharded-read scaffolding (used by the phdf5 path AND the
+    # §5b process-local eager path — single-sourced so the "learn my
+    # band block / assemble sharded" idiom is written exactly once)
+    # ------------------------------------------------------------------
+    def _kplan(
+        self, k_idxs: np.ndarray, unfold: bool,
+    ) -> tuple[np.ndarray, int, np.ndarray, int]:
+        """Union-read bookkeeping for the phdf5 collective read.
+
+        Maps the requested k-set to the ascending-sorted union of IBZ
+        source k-points (each read from disk exactly once) and each
+        request's position in that union — the axis along which the
+        union read concatenates its output.
+
+        Returns ``(ibz_unique_sorted, n_reads, position_in_reads, n_k)``.
+        """
+        if unfold:
+            static = self._ensure_phdf5_static()
+            ibz_per_full = np.asarray(static["ibz_per_full"])
+            ibz_per_k = ibz_per_full[np.asarray(k_idxs, dtype=np.int32)]
+        else:
+            # k_idxs are already IBZ indices.
+            ibz_per_k = np.asarray(k_idxs, dtype=np.int32)
+        ibz_unique_sorted = np.unique(ibz_per_k).astype(np.int32)
+        n_reads = int(ibz_unique_sorted.size)
+        # ``position_in_reads[j]`` = where ibz_per_k[j] sits in the
+        # ascending-sorted union.
+        position_in_reads = np.searchsorted(
+            ibz_unique_sorted, ibz_per_k).astype(np.int32)
+        return ibz_unique_sorted, n_reads, position_in_reads, int(len(k_idxs))
+
+    def _assemble_process_local(
+        self,
+        *,
+        global_shape: tuple[int, ...],
+        sharding: NamedSharding,
+        dtype,
+        sharded_axis: int,
+        fill_local,
+    ) -> jax.Array:
+        """Learn THIS rank's block of a band-sharded global array and
+        assemble it from a per-rank host build — the scaffold
+        :meth:`_eager_build_process_local` runs on.
+
+        Steps (the slab-io process-local idiom, written once):
+
+          1. Materialise a cheap sharded zero proto via the lru-cached
+             :func:`_sharded_zero_proto_fn` (each device makes only its
+             own zero shard; compiles ONCE per (shape, dtype, sharding)
+             signature — no per-call lambda re-lowering).
+          2. ``_local_shard_and_global_offset`` reports the local slab's
+             shape + global offset.
+          3. Validate that ONLY ``sharded_axis`` is sharded — a stray
+             non-band spec fails loud rather than silently wrong.
+          4. ``fill_local(axis_offset, local_shape) -> np.ndarray``
+             builds the rank's host block (caller owns zero-fill of pad
+             rows / past-EOF rows).
+          5. ``jax.make_array_from_single_device_arrays`` assembles the
+             global array — no rank materialises the full host slab.
+        """
+        from ._collectives import _local_shard_and_global_offset
+        global_shape = tuple(int(s) for s in global_shape)
+        proto = _sharded_zero_proto_fn(global_shape, dtype, sharding)()
+        local_zero, offset = _local_shard_and_global_offset(proto)
+        local_shape = tuple(int(x) for x in local_zero.shape)
+        del proto, local_zero
+        if any(
+            ax != sharded_axis
+            and (int(offset[ax]) != 0 or local_shape[ax] != global_shape[ax])
+            for ax in range(len(global_shape))
+        ):
+            raise ValueError(
+                f"process-local load supports only axis-{sharded_axis} "
+                f"(band) sharding; got offset={tuple(int(o) for o in offset)} "
+                f"local_shape={local_shape} for global {global_shape}.")
+        local_np = fill_local(int(offset[sharded_axis]), local_shape)
+        local_arr = jax.device_put(local_np, jax.local_devices()[0])
+        return jax.make_array_from_single_device_arrays(
+            global_shape, sharding, [local_arr])
+
+    # ------------------------------------------------------------------
+    # phdf5 backend — collective FFI read + on-device unfold
+    # ------------------------------------------------------------------
+    def _ensure_phdf5_static(self) -> dict:
+        """Lazy build of the per-full-BZ-k symmetry tables on device.
+
+        Builds once per ``WfnLoader`` instance; subsequent ``load()``
+        calls reuse the staged arrays.  Mirrors
+        ``PhdfWfnReader._build_symmetry_tables`` +
+        ``_compute_phases_all_full_k`` + ``_device_put_static_tables``
+        but without the FFT-box machinery (which lives downstream in
+        ``wfn_transforms``).
+
+        Touches NO FFI: these are numpy tables staged process-locally, so
+        the collective context lives in :meth:`_ensure_phdf5_ctx` instead
+        of being a side effect of building them.  (It used to be one,
+        gated on ``self.backend == "phdf5"`` — a tier test that has had
+        exactly one reachable value since the ``phdf5_host`` tier was
+        deleted, and that made the pure table build un-callable without
+        an ``.so``.)
+        """
+        if self._phdf5_static_dev is not None:
+            return self._phdf5_static_dev
+
+        sym = self._ensure_sym()
+        nk_full = int(sym.nk_tot)
+        ngkmax = int(self.ngkmax)
+        ibz_per_full = np.asarray(sym.irr_idx_k, dtype=np.int32)[:nk_full]
+        sym_idx_per_full = np.asarray(sym.sym_idx_k, dtype=np.int32)[:nk_full]
+        n_tran = int(sym.sym_matrices.shape[0])
+        tr_mask = (sym_idx_per_full >= n_tran).astype(np.bool_)
+
+        # Per-k spinor rotation matrix, single-sourced via the ψ-unfold
+        # spinor rule (spatial rows → ``sym.U_spinor[s]``; TRS rows →
+        # ``iσ_y · conj(sym.U_spinor[s − ntran])``, the T = iσ_y K rule).
+        # See ``common.symmetry_maps.{unfold_psi,trs_augment_U}`` and
+        # ``reports/trs_sym_audit_2026-05-14`` Sites #5–#7.  ``sym.U_spinor``
+        # is length ``ntran`` (PR3); the TRS half is built inside the helper.
+        from common.symmetry_maps import trs_augment_U
+        U_per = trs_augment_U(
+            sym.U_spinor, sym_idx_per_full, n_tran)                      # (nk_full, 2, 2)
+
+        # τ-phase per full-BZ k on the ibz-source ngkmax-padded G-list.
+        # Use the SAME formula for spatial and TRS rows:
+        #   phase = exp(-i (sym_mats_k[s] · G_kbar) · τ_{s_spatial})
+        # For TRS rows ``sym_mats_k[s] = -S_spatial`` so the formula yields
+        # ``exp(+i (S_spatial · G_kbar) · τ)``, which is ``conj`` of the
+        # spatial-row phase. Combined with the downstream kernel's
+        # ``where(tr_mask, conj(cnk), cnk)`` step, the per-element TRS rule
+        # ``ψ_full = (iσ_y · conj(U)) · conj(ψ_kbar) · conj(phase_spatial)``
+        # is reproduced. Pre-PR3 the TRS rows were set to 1 (skipped the
+        # phase entirely) — that bug fired on non-symmorphic non-inversion
+        # bispinor systems.
+        from common.symmetry_maps import tau_phase_row
+        phase = np.ones((nk_full, ngkmax), dtype=np.complex128)
+        for nk in range(nk_full):
+            s = int(sym_idx_per_full[nk])
+            s_spatial = s - n_tran if s >= n_tran else s
+            ibz = int(ibz_per_full[nk])
+            ngk_k = int(self.ngk[ibz])
+            start = int(self._kpt_starts[ibz])
+            g_bar = self._gvecs_raw[start:start + ngk_k]
+            ph = tau_phase_row(
+                sym.sym_mats_k[s], sym.translations[s_spatial], g_bar)
+            if ph is not None:
+                phase[nk, :ngk_k] = ph
+
+        # Device-stage the static tables once.  Sharding choice mirrors
+        # ``PhdfWfnReader._device_put_static_tables`` — all replicated
+        # since they're per-full-BZ-k metadata, not per-band data.
+        rep0 = NamedSharding(self._mesh, P())
+        rep1 = NamedSharding(self._mesh, P(None))
+        rep2 = NamedSharding(self._mesh, P(None, None))
+        rep3 = NamedSharding(self._mesh, P(None, None, None))
+        # Process-local placement, NOT ``jax.device_put(numpy, sharding)``.
+        # On a multi-process mesh the latter fires JAX's silent
+        # ``multihost_utils.assert_equal`` → ``process_allgather(tiled=True)``
+        # per table (see ``common.collectives.device_put_process_local``).
+        # ``phase`` is the second of scorecard Y.3's two P-LINEAR loader
+        # allgathers: ``P·nk·ngkmax·16`` = 1.27 GB/rank at P=64, 2.85 GB
+        # projected at P=144.  Every rank computes these tables from the
+        # same file with the same code, so they are bit-identical by
+        # construction and the assertion buys nothing.
+        self._phdf5_static_dev = {
+            "ibz_per_full": device_put_process_local(ibz_per_full, rep1),
+            "sym_idx_per_full": device_put_process_local(
+                sym_idx_per_full, rep1),
+            "tr_mask_per_full": device_put_process_local(tr_mask, rep1),
+            "U_per_full": device_put_process_local(U_per, rep3),
+            "phase_per_full": device_put_process_local(phase, rep2),
+            "n_tran": n_tran,
+            "nk_full": nk_full,
+        }
+        return self._phdf5_static_dev
+
+    def _ensure_phdf5_ctx(self) -> int:
+        """Open (once) the collective phdf5 context this loader reads
+        through, and return its handle.  Held for the loader's lifetime;
+        :meth:`close` releases it."""
+        if self._phdf5_ctx is None:
+            from ffi.phdf5 import open_file
+            from file_io._slab_io_ffi import (
+                _assert_mpi_world, _env_flag, _rank0, file_stripe_layout)
+            self._phdf5_ctx = open_file(
+                self._path, mesh=self._mesh, mode="r")
+            # MIRRORS _FfiBackend.__init__ (_slab_io_ffi.py), which this
+            # loader does NOT go through: it calls ffi.phdf5.open_file
+            # directly, so none of that constructor's open-time guards ran
+            # here.  ``open_file`` has now brought MPI up, so ask it how big
+            # the world REALLY is before a single hyperslab is derived from
+            # jax.process_count().  The measurement this exists for (ledger
+            # claims/0068, job 56389339): a wrong PMI flavour gave
+            # MPI_Comm_size()==1 on EVERY rank while jax.process_count()==16,
+            # and eight hostile geometries were written and read back
+            # BIT-EXACT, rc=0, with no warning anywhere.  Silent wrong
+            # parallelism is the failure this refuses.
+            _assert_mpi_world(self._mesh)
+            # Announce the layout the FILE HAS, which is not the layout the
+            # striping policy would request: a Lustre layout is fixed at
+            # create and WFN.h5 is created by pw2bgw, so _export_striping_env
+            # is inert on this path.  _FfiBackend logs striping only for
+            # mode='w' for exactly that reason, which left the read side
+            # silent about its own dominant term.  stripe_count=1 pins
+            # cb_nodes=1 -- one aggregator at any rank count.
+            if _rank0() and _env_flag("LORRAX_PHDF5_LOG", True):
+                _lay = file_stripe_layout(self._path)
+                if _lay is not None:
+                    _c, _s = _lay
+                    _warn = ("  <-- ONE STRIPE: cb_nodes=1, single-aggregator "
+                             "read at any rank count; `lfs setstripe -c 16 -S 4M`"
+                             " on the deck dir before pw2bgw, or `lfs migrate`"
+                             " this file" if _c == 1 else "")
+                    print(f"  [WfnLoader] {Path(self._path).name} "
+                          f"file stripe_count={_c} stripe_size={_s} B "
+                          f"(the file's own inode, not the policy){_warn}",
+                          flush=True)
+        return self._phdf5_ctx
+
+    def _phdf5_build(
+        self,
+        *,
+        b_lo: int,
+        b_hi: int,
+        k_idxs: np.ndarray,
+        unfold: bool,
+        nb_padded: int,
+        out_sharding: NamedSharding,
+    ) -> jax.Array:
+        """Collective FFI read + on-device unfold → G-flat ψ.
+
+        Output: ``(n_k, nb_padded, nspinor, ngkmax)`` c128 sharded as
+        ``out_sharding`` (typically ``P(None, ('x','y'), None, None)``).
+        """
+        from ffi.phdf5.read import read_kchunk_union_sharded
+
+        self._ensure_phdf5_static()
+        ctx = self._ensure_phdf5_ctx()
+        p_x = int(self._mesh.shape["x"])
+        p_y = int(self._mesh.shape["y"])
+        world = p_x * p_y
+        ns = int(self.nspinor)
+        ngkmax = int(self.ngkmax)
+        ngktot = int(np.sum(self.ngk))
+        nb = nb_padded
+        if nb % world:
+            raise ValueError(
+                f"_phdf5_build: nb_padded={nb} not divisible by world={world}; "
+                "this is a loader bug — _default_sharding should have padded.")
+        bands_per_rank = nb // world
+        b_lo_logical = int(b_lo)
+        b_hi_logical = int(b_hi)
+
+        # Union-read k-plan (shared with the host twin via _kplan).
+        ibz_unique_sorted, n_reads, position_in_reads, n_k = self._kplan(
+            k_idxs, unfold)
+
+        # Hyperslab offsets/counts for the union read.
+        # Dataset layout: (mnband, nspinor, ngktot, 2) f64; kchunk_axis=2.
+        offsets = np.stack([
+            [b_lo_logical, 0, int(self._kpt_starts[ibz]), 0]
+            for ibz in ibz_unique_sorted
+        ], axis=0).astype(np.int64)
+        # Per-rank counts: the C++ adds ``rank_coord_band * bands_per_rank``
+        # to ``offsets[:, 0]`` to get each rank's band-axis file offset,
+        # so each rank's slab must be clipped to the LOGICAL extent of
+        # the read before it becomes a hyperslab selection.  That clip is
+        # SlabIO's ``_derive_valid_shape``, applied per rank by
+        # ``_build_phdf5_clamped_counts`` (see its docstring for why the
+        # band bound is ``b_hi``, not ``mnband``, and what diverged while
+        # this file carried its own copy of the arithmetic).  Ranks whose
+        # block is entirely past the window get count=0 on the band axis
+        # → no H5Dread bytes contributed; the C++ pre-zeros the pinned
+        # buffer so the rank's tile reads as exactly zero.
+        mnband_file = int(self.nbands)
+        ngk_per_ibz_read = tuple(int(self.ngk[ibz]) for ibz in ibz_unique_sorted)
+        counts_global = _build_phdf5_clamped_counts(
+            world=world,
+            bands_per_rank=bands_per_rank,
+            b_lo_logical=b_lo_logical,
+            # ``load`` refuses ``b_hi > mnband``, so the min() is the
+            # file-extent backstop for a direct caller of _phdf5_build.
+            band_extent=min(b_hi_logical, mnband_file),
+            n_reads=n_reads,
+            ngk_per_ibz_read=ngk_per_ibz_read,
+            kchunk_start_per_read=tuple(
+                int(self._kpt_starts[int(ibz)]) for ibz in ibz_unique_sorted),
+            ngktot=ngktot,
+            ns=ns,
+        )
+
+        # The (pure) per-rank band-axis cap doubles as a precondition for
+        # the padded case: whenever ``b_lo + nb_padded > band_extent``,
+        # the per-rank clip above produces band_cnt < bands_per_rank for
+        # the tail-rank(s); the C++ honours that (count is per-rank and
+        # ≤ per_rank_max[0]=bands_per_rank).  This makes the prior
+        # NotImplementedError-on-pad-past-file branch obsolete; the
+        # phdf5 backend now matches the eager backend's zero-fill
+        # behaviour on BOTH kinds of pad row (past the logical window,
+        # and past the file).  We leave a sanity check for the extreme
+        # case where ``b_lo`` itself starts past EOF (nonsensical request
+        # that ``WfnLoader.load`` rejects upstream in its band-range
+        # check, but defended here too).
+        if b_lo_logical >= mnband_file:
+            raise ValueError(
+                f"_phdf5_build: b_lo={b_lo_logical} >= mnband={mnband_file}; "
+                "entire band window past file extent")
+
+        rep2 = NamedSharding(self._mesh, P(None, None))
+        counts_sharding = NamedSharding(self._mesh, P(("x", "y"), None))
+        # Process-local placement for both tables.  ``counts_global`` is
+        # the (world·n_reads, 4) table sharded ('x','y') on the leading
+        # axis, so this is literally the per-rank hyperslab: each rank
+        # keeps only its own ``(n_reads, 4)`` rows and never sends them.
+        # Via ``jax.device_put`` the hidden ``assert_equal`` gather on
+        # this one is O(P²) — ``P·(world·n_reads)·4·8`` B, 18.9 MB at
+        # P=64 but 95.5 MB at P=144.
+        # (``position_in_reads`` is staged inside _phdf5_unfold_and_shard.)
+        offsets_dev = device_put_process_local(offsets, rep2)
+        counts_dev = device_put_process_local(counts_global, counts_sharding)
+
+        reader = read_kchunk_union_sharded(
+            ctx, "wfns/coeffs",
+            n_kchunk=n_reads,
+            kchunk_axis=2,
+            file_global_shape=(int(self.nbands), ns, ngktot, 2),
+            per_rank_file_shape=(bands_per_rank, ns, ngkmax, 2),
+            dtype=np.float64,
+            mesh=self._mesh,
+            file_partition_spec=P(("x", "y"), None, None, None),
+            count_partition_spec=P(("x", "y"), None),
+        )
+        cnk_at_ibz = reader(offsets_dev, counts_dev)
+        # cnk_at_ibz layout: per-rank
+        # (bands_per_rank, ns, n_reads, ngkmax, 2) f64 sharded
+        # P(('x','y'), None, None, None, None).
+
+        return self._phdf5_unfold_and_shard(
+            cnk_at_ibz, k_idxs=k_idxs, unfold=unfold, n_reads=n_reads,
+            n_k=n_k, bands_per_rank=bands_per_rank, ns=ns, ngkmax=ngkmax,
+            position_in_reads=position_in_reads, out_sharding=out_sharding)
+
+    def _phdf5_unfold_and_shard(
+        self, cnk_at_ibz, *, k_idxs, unfold, n_reads, n_k, bands_per_rank,
+        ns, ngkmax, position_in_reads, out_sharding,
+    ) -> jax.Array:
+        """Tail of the phdf5 read: on-device symmetry unfold (+ transpose
+        to WfnLoader's G-flat layout) of the union buffer ``cnk_at_ibz``
+        ``(bands_per_rank, ns, n_reads, ngkmax, 2)`` sharded
+        ``P(('x','y'), None, None, None, None)``.
+
+        Kept a separate method from :meth:`_phdf5_build` because it is
+        the only piece of the collective path that runs without an
+        ``.so``, so it is the piece a single-process test can pin against
+        ``_eager_build`` (``tests/test_wfn_loader_eager.py``).
+        """
+        static = self._ensure_phdf5_static()
+        unfold_jit = _phdf5_unfold_kernel(
+            self._mesh, n_reads=n_reads, n_k=n_k, bands_per_rank=bands_per_rank,
+            nspinor=ns, ngkmax=ngkmax, unfold=unfold)
+        rep1 = NamedSharding(self._mesh, P(None))
+        position_in_reads_dev = device_put_process_local(
+            np.asarray(position_in_reads, dtype=np.int32), rep1)
+
+        if unfold:
+            U_k = jnp.take(static["U_per_full"],
+                           jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
+            phase_k = jnp.take(static["phase_per_full"],
+                                jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
+            tr_mask_k = jnp.take(static["tr_mask_per_full"],
+                                  jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
+            psi = unfold_jit(cnk_at_ibz, U_k, phase_k, tr_mask_k,
+                              position_in_reads_dev)
+        else:
+            psi = unfold_jit(cnk_at_ibz, position_in_reads_dev)
+
+        # psi shape after the kernel: (n_k, nb_padded, ns, ngkmax) c128
+        # with band-axis sharding propagated from the read.
+        return jax.lax.with_sharding_constraint(psi, out_sharding)
+
+    # ------------------------------------------------------------------
+    def load(
+        self,
+        *,
+        bands: tuple[int, int],
+        k: KSpec = "full_bz",
+        sharding: PartitionSpec | None = None,
+        bispinor: bool = False,
+    ) -> jax.Array:
+        """ψ(G) for a (band_range, k-set) window.
+
+        Returns ``(n_k, nb_padded, nspinor_out, ngkmax)`` complex128.
+
+        Padding contract:
+        * Band axis pad rows are zero-filled.
+        * G axis pad rows are zero-filled; the matching ``gvecs(k=...)``
+          rows beyond ``ngk_valid(k=...)`` hold the FFT-box pad sentinel
+          (:func:`common.gvec_fft_box.fft_box_pad_sentinel`).  Zero
+          COEFFICIENT + sentinel G-VECTOR is the whole contract: the
+          coefficient makes the slot inert in any contraction, the
+          sentinel makes an unmasked slot detectable rather than
+          silently aliased onto Γ.
+        * For ``k='full_bz'`` (or explicit list): symmetry unfold +
+          τ-phase + TR conjugation applied internally.
+        * For ``k='ibz'``: raw WFN-file IBZ slab; no unfold.
+
+        ``bispinor=True`` lifts the small spinor components via
+        ``(α/2) σ·(k+G) ψ_L``.  ``nspinor_out`` is then 4; else 2 (or
+        the file's ``nspinor``).  Requires the WFN file to have
+        ``nspinor == 2`` (BGW Pauli convention); ``ValueError``
+        otherwise.
+        """
+        if bispinor and int(self.nspinor) != 2:
+            raise ValueError(
+                f"WfnLoader.load(bispinor=True) requires a 2-spinor WFN; "
+                f"file has nspinor={int(self.nspinor)}.")
+
+        b_lo, b_hi = int(bands[0]), int(bands[1])
+        nb_logical = b_hi - b_lo
+        if nb_logical <= 0:
+            raise ValueError(f"empty band range: {bands}")
+        if b_lo < 0 or b_hi > int(self.nbands):
+            raise ValueError(
+                f"band range {bands} out of [0, {self.nbands}); use "
+                f"bands_pad_to-style external padding for over-file requests")
+
+        k_idxs, unfold = self._resolve_k(k)
+        named_sharding, p_band = self._default_sharding(
+            sharding, n_k=len(k_idxs))
+        from runtime.padding import round_up
+        nb_padded = round_up(nb_logical, p_band)
+
+        # Backends produce 2-spinor ψ in the canonical layout
+        # ``(n_k, nb_padded, nspinor, ngkmax)`` c128.  The optional
+        # bispinor lift below promotes the spinor axis 2 → 4 in one
+        # k-vectorised pass (eager: numpy → jnp; phdf5: stays on
+        # device).  Eager output is host-staged at the end via
+        # ``device_put``; the bispinor-True case routes through
+        # ``jnp`` for the lift but follows the same staging path.
+        if self.backend == "phdf5":
+            # phdf5 path requires a NamedSharding to express the
+            # collective output layout.  Caller passed sharding=None on
+            # a phdf5 loader → replicate output (rare in production but
+            # used by bit-equality tests).  Spinor axis size is 4 when
+            # bispinor=True.
+            ns_out = 4 if bispinor else int(self.nspinor)
+            if named_sharding is None:
+                named_sharding = NamedSharding(
+                    self._mesh, P(*([None] * 4)))
+            elif bispinor:
+                # Rebuild the sharding for the post-lift shape — only
+                # the spinor axis count changes; partition spec is the
+                # same string set.
+                pass  # NamedSharding doesn't care about exact dim sizes
+            psi = self._phdf5_build(
+                b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
+                nb_padded=nb_padded, out_sharding=named_sharding)
+            if bispinor:
+                psi = self._apply_bispinor_lift(
+                    psi, k=k, k_idxs=k_idxs, unfold=unfold,
+                    sharding=named_sharding)
+            return psi
+
+        if bispinor:
+            # Bispinor lift path (rarer): full build.  Process-local bispinor
+            # is future work (the lift appends per-band small components).
+            psi_np = self._eager_build(
+                b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
+                nb_padded=nb_padded)
+            psi_j = jnp.asarray(psi_np)
+            psi_j = self._apply_bispinor_lift(
+                psi_j, k=k, k_idxs=k_idxs, unfold=unfold, sharding=None)
+            if named_sharding is None:
+                return psi_j
+            # Process-local shard-out.  ``jax.device_put`` of an
+            # UNCOMMITTED array onto a multi-process sharding takes the
+            # same hidden ``assert_equal`` branch as the numpy case — and
+            # here the operand is the whole ψ window, so the assertion
+            # would gather ``P × nk·nb·ns·ngkmax·16``.
+            return device_put_process_local(psi_j, named_sharding)
+
+        if named_sharding is not None and int(jax.process_count()) > 1:
+            # (§5b) Build ONLY this process's band shard and assemble via the
+            # slab-io process-local idiom -- no rank materialises the full
+            # (n_k, nb_padded, ns, ngkmax) host array, which grows with
+            # world_size and OOMs past ~16 nodes.  Byte-identical to the full
+            # build + device_put below.
+            return self._eager_build_process_local(
+                b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
+                nb_padded=nb_padded, named_sharding=named_sharding)
+
+        # Single-process / replicated: the full host build is fine (no OOM).
+        psi_np = self._eager_build(
+            b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
+            nb_padded=nb_padded)
+        if named_sharding is None:
+            return jnp.asarray(psi_np)
+        return jax.device_put(psi_np, named_sharding)
+
+    def load_process_local(
+        self,
+        *,
+        bands: tuple[int, int],
+        k: KSpec = "full_bz",
+        bispinor: bool = False,
+    ) -> jax.Array:
+        """ψ(G) for THIS PROCESS ALONE — a **single-device** ``jax.Array``.
+
+        Layout contract
+        ---------------
+        Returns ``(n_k, nb, nspinor_out, ngkmax)`` c128 committed to
+        ``jax.local_devices()[0]``.  ``nb = bands[1] - bands[0]``
+        exactly: **no mesh-divisibility band padding**, because nothing
+        about this array is global.
+
+        How it differs from :meth:`load` — and why that matters
+        -------------------------------------------------------
+        :meth:`load` always returns a *global* array: every rank must
+        request the SAME ``(bands, k)`` window and each ends up owning a
+        band shard of one logical object.  That is the right primitive
+        for the GW pipeline, and the wrong one for any kernel whose
+        parallelism is over k, because rank *r* asking for ``k=[7]``
+        while rank *s* asks for ``k=[9]`` builds a global array whose
+        shards are pieces of different physical objects.
+
+        This method is the other primitive: the array it returns is
+        addressable by this process only, so each rank may load a
+        DIFFERENT ``(bands, k)`` window and run ordinary ``jax.jit``
+        computations on it with no collective, no barrier and no
+        cross-rank shape agreement.  Combining the per-rank results is
+        then an explicit, auditable step (one ``psum`` / one
+        ``process_allgather``) rather than something XLA's SPMD
+        partitioner infers.
+
+        Used by the exact-V_H kernel (``gw.kin_ion_io``), whose ρ sweep
+        and ⟨mk|V_H|nk⟩ sweep are both partitioned over k.
+
+        Identical values to ``load(..., sharding=None)`` on a mesh-less
+        loader — same ``_eager_build``, same symmetry unfold — so a P=1
+        run is bit-for-bit what the serial path produced.
+        """
+        if bispinor and int(self.nspinor) != 2:
+            raise ValueError(
+                f"load_process_local(bispinor=True) requires a 2-spinor WFN; "
+                f"file has nspinor={int(self.nspinor)}.")
+        b_lo, b_hi = int(bands[0]), int(bands[1])
+        if b_hi <= b_lo:
+            raise ValueError(f"empty band range: {bands}")
+        if b_lo < 0 or b_hi > int(self.nbands):
+            raise ValueError(
+                f"band range {bands} out of [0, {self.nbands})")
+
+        k_idxs, unfold = self._resolve_k(k)
+        # The phdf5 backend never opens the coeffs dataset (it reads it
+        # collectively through the FFI), but the host build below needs
+        # the handle.  Opening it lazily costs one h5py lookup and keeps
+        # this method usable from a driver whose loader is phdf5-backed.
+        if self._coeffs_ds is None:
+            self._coeffs_ds = self._file["wfns/coeffs"]
+
+        psi_np = self._eager_build(
+            b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
+            nb_padded=b_hi - b_lo)
+        psi = jax.device_put(psi_np, jax.local_devices()[0])
+        if bispinor:
+            psi = self._apply_bispinor_lift(
+                psi, k=k, k_idxs=k_idxs, unfold=unfold, sharding=None)
+        return psi
+
+    def _eager_build_process_local(
+        self,
+        *,
+        b_lo: int,
+        b_hi: int,
+        k_idxs: np.ndarray,
+        unfold: bool,
+        nb_padded: int,
+        named_sharding: NamedSharding,
+    ) -> jax.Array:
+        """(§5b) Process-local eager load: each rank builds only its band shard.
+
+        Runs on the shared :meth:`_assemble_process_local` scaffold (cached
+        sharded-zero proto → ``_local_shard_and_global_offset`` → per-rank
+        host build → ``jax.make_array_from_single_device_arrays``) so no rank
+        allocates the full (n_k, nb_padded, ns, ngkmax) host array.  The only
+        WFN-specific part is the symmetry unfold, which stays in ``_eager_build``.
+
+        Assumes the BAND axis (1) is the only sharded axis (the centroid-load
+        spec ``P(None, ('x','y'), None, None)``); asserts the rest are
+        replicated so a different spec fails loud rather than silently wrong.
+        """
+        ns = int(self.nspinor)
+        ngkmax = int(self.ngkmax)
+        n_k = int(len(k_idxs))
+        nb_logical = int(b_hi) - int(b_lo)
+
+        def _fill(band_off: int, local_shape: tuple[int, ...]) -> np.ndarray:
+            # Real bands in this rank's block map to its FRONT [0:n_real);
+            # the rest (pad bands, or blocks past nb_logical) stay zero.
+            local_nb = local_shape[1]
+            real_hi = min(band_off + local_nb, nb_logical)
+            n_real = max(0, real_hi - band_off)
+            if n_real > 0:
+                return self._eager_build(
+                    b_lo=int(b_lo) + band_off,
+                    b_hi=int(b_lo) + band_off + n_real,
+                    k_idxs=k_idxs, unfold=unfold, nb_padded=local_nb)
+            return np.zeros(local_shape, dtype=np.complex128)
+
+        return self._assemble_process_local(
+            global_shape=(n_k, int(nb_padded), ns, ngkmax),
+            sharding=named_sharding,
+            dtype=jnp.complex128,
+            sharded_axis=1,
+            fill_local=_fill)
+
+    # ------------------------------------------------------------------
+    # Iterator: band chunks
+    # ------------------------------------------------------------------
+    def bands(
+        self,
+        b_lo: int,
+        b_hi: int,
+        *,
+        chunk: int,
+        k: KSpec = "full_bz",
+        sharding: PartitionSpec | None = None,
+        bispinor: bool = False,
+    ) -> Iterator[tuple[tuple[int, int], jax.Array]]:
+        """Yield ``((bc_lo, bc_hi), psi)`` for a chunked sweep over bands."""
+        if chunk <= 0:
+            raise ValueError(f"chunk must be positive, got {chunk}")
+        for bc_lo in range(int(b_lo), int(b_hi), int(chunk)):
+            bc_hi = min(bc_lo + int(chunk), int(b_hi))
+            yield (bc_lo, bc_hi), self.load(
+                bands=(bc_lo, bc_hi), k=k, sharding=sharding,
+                bispinor=bispinor)
+
+    # ------------------------------------------------------------------
+    # Bispinor lift (G-flat)
+    # ------------------------------------------------------------------
+    def _apply_bispinor_lift(
+        self,
+        psi_2: jax.Array,
+        *,
+        k: KSpec,
+        k_idxs: np.ndarray,
+        unfold: bool,
+        sharding: NamedSharding | None,
+    ) -> jax.Array:
+        """ψ (2-spinor) → ψ (4-spinor) by appending the small components.
+
+        Computes the lower-2 spinor components via
+        ``(α/2) σ·(k+G) ψ_L`` on G-flat directly — no FFT box.  Sharding
+        propagates through (the lift is k-vectorised + band-broadcast;
+        no cross-rank op).  Matches the legacy
+        :func:`common.bispinor_init.get_small_psi_component` byte-for-byte
+        but is vectorised across k.
+
+        Pad rows of ψ are zero → small components of pad rows are also
+        zero (clean propagation, no per-k mask needed).
+
+        ``unfold`` tells us which kvec table to use: raw IBZ
+        (``wfn.kpoints``, k_idxs are IBZ indices) vs full-BZ
+        (``sym.unfolded_kpts``, k_idxs are full-BZ indices).
+        """
+        gvecs = np.asarray(self.gvecs(k=k))                  # (n_k, ngkmax, 3) int
+        if unfold:
+            sym = self._ensure_sym()
+            kvecs_np = np.asarray(
+                sym.unfolded_kpts, dtype=np.float64)[
+                    np.asarray(k_idxs, dtype=np.int32)]
+        else:
+            kvecs_np = np.asarray(
+                self.kpoints, dtype=np.float64)[
+                    np.asarray(k_idxs, dtype=np.int32)]
+        bvec = np.asarray(self.bvec, dtype=np.float64)
+        return _bispinor_lift_kernel(
+            psi_2,
+            jnp.asarray(gvecs, dtype=jnp.float64),
+            jnp.asarray(kvecs_np),
+            jnp.asarray(bvec),
+            sharding=sharding,
+        )
+
+    # ------------------------------------------------------------------
+    # Eager unfold core
+    # ------------------------------------------------------------------
+    def _eager_build(
+        self,
+        *,
+        b_lo: int,
+        b_hi: int,
+        k_idxs: np.ndarray,
+        unfold: bool,
+        nb_padded: int,
+    ) -> np.ndarray:
+        """Compose the (n_k, nb_padded, nspinor, ngkmax) host slab.
+
+        Algorithm (matches SymMaps.get_cnk_fullzone_batch +
+        WFNReader.get_cnk_batch byte-for-byte under the same inputs):
+
+          1. For each requested k, look up (sym_idx, kbar_idx, sym_krep).
+          2. Read raw IBZ band-block from ``self._coeffs_raw`` at
+             ``kpt_starts[kbar]:..+ngk[kbar]``; convert (re, im) → c128.
+          3. If TRS (sym_idx >= ntran): conjugate.
+             Else apply ``exp(-i (S·G_bar)·τ)`` per-G phase.
+          4. Apply U_spinor[sym_idx] rotation.
+          5. Place into output at ``[j, :nb_logical, :, :ngk]``; rest zero.
+        """
+        nb_logical = b_hi - b_lo
+        ns = int(self.nspinor)
+        ngkmax = int(self.ngkmax)
+        out = np.zeros((len(k_idxs), nb_padded, ns, ngkmax),
+                       dtype=np.complex128)
+
+        if not unfold:
+            # Raw IBZ — bypass sym entirely.
+            for j, ik in enumerate(k_idxs):
+                ibz = int(ik)
+                start = int(self._kpt_starts[ibz])
+                end = start + int(self.ngk[ibz])
+                raw = self._coeffs_ds[b_lo:b_hi, :, start:end, :]
+                out[j, :nb_logical, :, : end - start] = (
+                    raw[..., 0] + 1j * raw[..., 1])
+            return out
+
+        # Full-BZ unfold path.
+        from common.symmetry_maps import unfold_psi
+        sym = self._ensure_sym()
+        ntran = int(sym.sym_matrices.shape[0])
+        for j, nk in enumerate(k_idxs):
+            nk_int = int(nk)
+            sym_idx = int(sym.sym_idx_k[nk_int])
+            kbar = int(sym.irr_idx_k[nk_int])
+            ngk_k = int(self.ngk[kbar])
+
+            start = int(self._kpt_starts[kbar])
+            end = start + ngk_k
+            raw = self._coeffs_ds[b_lo:b_hi, :, start:end, :]
+            cnk = raw[..., 0] + 1j * raw[..., 1]                    # (nb, ns, ngk_k)
+            g_bar = self._gvecs_raw[start:end]                      # (ngk_k, 3)
+            cnk = unfold_psi(
+                cnk,
+                sym_idx=sym_idx,
+                g_kbar=g_bar,
+                sym_mats_k=sym.sym_mats_k,
+                translations=self.translations,
+                U_spinor_spatial=sym.U_spinor,
+            )
+            out[j, :nb_logical, :, :ngk_k] = cnk
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Bispinor small-component lift kernel
+# ---------------------------------------------------------------------------
+#
+# 2-spinor ψ (..., 2, ngkmax) → 4-spinor ψ (..., 4, ngkmax) via
+# (α/2) σ · (k+G) ψ_L applied to the upper components.  The constant + σ·p
+# contraction live once in :func:`common.bispinor_init.lift_to_4spinor`
+# (same math as :func:`common.bispinor_init.get_small_psi_component`, but
+# vectorised across k).  The loader only owns the jit-cache-by-sharding
+# wrapper below.
+
+
+@functools.lru_cache(maxsize=None)
+def _get_bispinor_lift_jit(sharding: NamedSharding | None):
+    """Cache one jit'd copy of the bispinor lift per output sharding.
+
+    Without this, each call to ``_bispinor_lift_kernel`` traces every
+    inner ``jnp`` op (``broadcast_in_dim``, ``_take``, ``concatenate``…)
+    through pjit's per-op cache.  The parent function id is stable but
+    JAX's "tracing context" comparison fires on calls from different
+    enclosing scopes, blowing the cache.  Wrapping the whole body in a
+    single ``jax.jit`` collapses all inner ops into one cached compile.
+    """
+    from common.bispinor_init import lift_to_4spinor
+
+    @jax.jit
+    def _kernel(psi_2, gvecs, kvecs, bvec):
+        out = lift_to_4spinor(psi_2, gvecs, kvecs, bvec)
+        if sharding is not None:
+            out = jax.lax.with_sharding_constraint(out, sharding)
+        return out
+    return _kernel
+
+
+def _bispinor_lift_kernel(
+    psi_2: jax.Array,
+    gvecs: jax.Array,
+    kvecs: jax.Array,
+    bvec: jax.Array,
+    *,
+    sharding: NamedSharding | None,
+) -> jax.Array:
+    """Append small components → 4-spinor ψ.
+
+    psi_2: (n_k, nb, 2, ngkmax) c128
+    gvecs: (n_k, ngkmax, 3)  float64 (already cast)
+    kvecs: (n_k, 3)          float64
+    bvec : (3, 3)            float64
+    """
+    return _get_bispinor_lift_jit(sharding)(psi_2, gvecs, kvecs, bvec)
+
+
+# ---------------------------------------------------------------------------
+# Sharded-zero proto factory (module-level so the JIT cache survives
+# across ``load()`` calls; used by the host union read to learn which
+# band block THIS rank owns without re-lowering a fresh lambda per call)
+# ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=None)
+def _sharded_zero_proto_fn(global_shape: tuple, dtype, sharding):
+    """A cached jitted ``() -> zeros(global_shape) @ sharding``.
+
+    Keyed by (shape, dtype, sharding) so it compiles exactly once per
+    signature.  Each device materialises only its own zero shard — no
+    full host/device allocation — and JAX's ``.addressable_shards`` then
+    reports the local slab's global offset, which is how the host read
+    discovers its band block for ``make_array_from_single_device_arrays``.
+    """
+    return jax.jit(lambda: jnp.zeros(global_shape, dtype=dtype),
+                   out_shardings=sharding)
+
+
+# ---------------------------------------------------------------------------
+# phdf5 unfold-and-relayout kernel (module-level so the JIT cache
+# survives multiple ``load()`` calls at the same shape signature)
+# ---------------------------------------------------------------------------
+#
+# ``@functools.lru_cache`` keys on the static shape signature; the
+# closure ``_per_rank`` is defined INSIDE the cached factory so its
+# Python ``id()`` is stable per cache entry.  Repeat invocations with
+# the same signature reuse the same closure, which lets JAX's
+# trace-cache hit on every inner op (``_where``, ``_take``,
+# ``broadcast_in_dim`` …) instead of re-tracing them on each call.
+
+@functools.lru_cache(maxsize=None)
+def _phdf5_unfold_kernel(
+    mesh: Mesh,
+    *,
+    n_reads: int,
+    n_k: int,
+    bands_per_rank: int,
+    nspinor: int,
+    ngkmax: int,
+    unfold: bool,
+):
+    """Jitted shard_map that takes the FFI's re/im-packed IBZ read and
+    returns G-flat ψ in WfnLoader's output layout.
+
+    Steps inside the kernel (mirroring ``PhdfWfnReader._make_unfold_kernel``
+    but rearranged to emit ``(n_k, nb_padded, ns, ngkmax)`` c128 directly
+    instead of the FFT-box-bound ``(bpr, ns, n_k, ngkmax, 2)``):
+
+      1. Re/im → c128.
+      2. ``jnp.take(axis=2, indices=position_in_reads)`` expands the
+         IBZ-union axis to the full requested k-set.
+      3. If ``unfold``: apply ``where(tr_mask, conj, identity)`` then
+         multiply by τ-phase then ``U_spinor`` spinor rotation.  If not
+         ``unfold`` (IBZ raw mode): skip step 3.
+      4. Transpose ``(bpr, ns, n_k, ngkmax) → (n_k, bpr, ns, ngkmax)``;
+         the rank's ``bpr`` slab becomes the local shard of the global
+         band axis.
+
+    Output sharding ``P(None, ('x','y'), None, None)`` on global shape
+    ``(n_k, nb_padded, ns, ngkmax)``.
+    """
+    if unfold:
+        def _per_rank(cnk_at_ibz, U_per_k, phase_per_k, tr_mask_per_k,
+                       position_in_reads):
+            cnk = cnk_at_ibz[..., 0] + 1j * cnk_at_ibz[..., 1]
+            cnk = jnp.take(cnk, position_in_reads, axis=2)
+            cnk = jnp.where(
+                tr_mask_per_k[None, None, :, None], jnp.conj(cnk), cnk)
+            cnk = cnk * phase_per_k[None, None, :, :]
+            cnk = jnp.einsum("kac,bckg->bakg", U_per_k, cnk)
+            # (bpr, ns, n_k, ngkmax) → (n_k, bpr, ns, ngkmax)
+            return jnp.transpose(cnk, (2, 0, 1, 3))
+
+        in_specs = (
+            P(("x", "y"), None, None, None, None),     # cnk_at_ibz
+            P(None, None, None),                        # U_per_k
+            P(None, None),                              # phase_per_k
+            P(None),                                    # tr_mask_per_k
+            P(None),                                    # position_in_reads
+        )
+    else:
+        # IBZ raw: skip unfold; just take(position_in_reads) and convert.
+        def _per_rank(cnk_at_ibz, position_in_reads):  # type: ignore[misc]
+            cnk = cnk_at_ibz[..., 0] + 1j * cnk_at_ibz[..., 1]
+            cnk = jnp.take(cnk, position_in_reads, axis=2)
+            return jnp.transpose(cnk, (2, 0, 1, 3))
+
+        in_specs = (
+            P(("x", "y"), None, None, None, None),     # cnk_at_ibz
+            P(None),                                    # position_in_reads
+        )
+
+    out_specs = P(None, ("x", "y"), None, None)        # (n_k, bpr→band, ns, ngkmax)
+    return jax.jit(shard_map(
+        _per_rank, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
+        check_vma=False,
+    ))

@@ -1181,7 +1181,8 @@ def test_every_package_in_the_map_exists(sources):
 
 #: Service top-level package -> the name its door is spelled.  (Identity
 #: today; a service whose door is a submodule would say so here.)
-_SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la"}
+_SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
+                  "wfn_loader": "wfn_loader"}
 
 #: ``src/`` module -> how many past-the-door edges it is allowed.  These are
 #: the transitional re-export shims.
@@ -1384,6 +1385,66 @@ def test_the_service_door_scan_does_not_cry_wolf(sources):
           "from distrib_la import plan, Plan, factor, solve, BACKEND_CHOICES\n"
           "p = plan('eigh', mesh)\n")
     assert scan_service_door(ok, "m", "distrib_la", subs, doors) == [], (
+        "the service-door scan flags the door itself; the gate would be "
+        "turned off")
+
+
+def test_the_wfn_loader_door_scan_can_fail(sources):
+    """RED TWIN for rule 6 over the SECOND extracted service.
+
+    A per-service twin, not a second copy of the same one: the rule is
+    parameterized by ``_SERVICE_DOORS`` and each service supplies its own
+    real submodule names, so a twin seeded from distrib_la says nothing
+    about whether ``wfn_loader`` was wired into the map at all.  The
+    ``subs`` assertion below is what makes that concrete — it fails if the
+    service is absent, renamed, or reduced to a single-module package with
+    nothing behind its door.
+
+    ``wfn_loader`` has no name that is BOTH a submodule and a door export
+    (distrib_la's ``plan`` is), so the third spelling is seeded with a
+    plain submodule and the ambiguous case stays covered by the
+    distrib_la twin above, which is the one that has it.
+    """
+    subs = service_submodules(sources, "wfn_loader")
+    doors = door_names(sources, "wfn_loader")
+    assert "loader" in subs and "loader" not in doors, (
+        "this twin needs a real wfn_loader submodule that the door does "
+        "NOT re-export; 'loader' stopped being one")
+    assert "WfnLoader" in doors, (
+        "the wfn_loader door exports no WfnLoader — either the service is "
+        "gone or its __all__ stopped being readable from the AST, and in "
+        "both cases the carve-out below tests nothing")
+    cases = [
+        ("import wfn_loader.loader\n",                    "wfn_loader.loader"),
+        ("from wfn_loader.loader import WfnLoader\n",     "wfn_loader.loader"),
+        ("from wfn_loader import loader\n",               "wfn_loader.loader"),
+        ("def f():\n    from wfn_loader import _collectives\n",
+         "wfn_loader._collectives"),
+    ]
+    for src, expected in cases:
+        hits = scan_service_door(src, "m", "wfn_loader", subs, doors)
+        assert hits and hits[0][0] == expected, (
+            f"the service-door scan does not detect {expected!r} in {src!r} "
+            f"— it found {hits}")
+
+
+def test_the_wfn_loader_door_scan_does_not_cry_wolf(sources):
+    """...and the shim that KEEPS the old spelling alive must stay quiet.
+
+    ``src/file_io/wfn_loader.py`` is a transitional re-export shim whose
+    whole body is the second line below, underscored helper names
+    included.  If those read as past-the-door reaches the rule fires on
+    the one module written specifically to obey it, and the gate gets an
+    exception entry it does not need — which is how ``_SERVICE_DOOR_
+    EXCEPTIONS`` stops being a replumb checklist.
+    """
+    subs = service_submodules(sources, "wfn_loader")
+    doors = door_names(sources, "wfn_loader")
+    ok = ("import wfn_loader\n"
+          "from wfn_loader import WfnLoader, KSpec, "
+          "_build_phdf5_clamped_counts\n"
+          "w = WfnLoader(path)\n")
+    assert scan_service_door(ok, "m", "wfn_loader", subs, doors) == [], (
         "the service-door scan flags the door itself; the gate would be "
         "turned off")
 
