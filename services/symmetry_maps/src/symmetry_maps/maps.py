@@ -1506,6 +1506,46 @@ class SymMaps:
         R_full = np.concatenate([R_spatial, -R_spatial], axis=0)
         return R_full
 
+    @property
+    def R_cart_forward(self):
+        """The FORWARD Cartesian rotation per op: ``R_cart[s].T``.
+
+        ``R_cart`` is the cartesian image of ``mtrx``, and ``mtrx`` is the
+        INVERSE real-space rotation.  ``syms_crystal_to_cartesian``'s own
+        caution says what follows, and it is quoted here rather than
+        paraphrased because paraphrasing it is how it got lost the first
+        time (061f8a3 added it as a comment on the wrong side of the call):
+
+            CAUTION FOR OTHER CONSUMERS.  Because ``mtrx`` is the inverse
+            real-space rotation while ``mtrx.T`` is what acts on k and G,
+            this matrix is the INVERSE of the Cartesian rotation that
+            carries k_irr to S·k_irr.  ``get_spinor_rotations`` is
+            unaffected — its quaternion extraction uses the transposed
+            Shepperd form, so the two inversions cancel — but anything
+            rotating a Cartesian INDEX (a dipole or any rank≥1 operator)
+            must use the TRANSPOSE of this matrix.  Using it untransposed
+            leaves norms, hermiticity and traces intact, so the error is
+            invisible to the obvious checks.
+
+        So: ``R_cart`` for the spinor sandwich, ``R_cart_forward`` for a
+        Cartesian INDEX.  This property is the named spelling of "the
+        transpose of this matrix" — an ADDITIVE surface, with no rename and
+        no change to either live consumer's math (both are provably
+        self-consistent today; their adoption of the name is registered
+        post-wave).  Its whole value is that the wrong pattern now has a
+        right one to sit beside, and the docs' Antipatterns section can
+        name it: *rotating a Cartesian index with ``sym.R_cart[s]``
+        untransposed*.
+
+        Shape and rows are ``R_cart``'s: ``(2·ntran, 3, 3)``, spatial ops
+        first, the time-reversal half duplicating them with the sign
+        convention ``R_cart[ntran:] = −R_cart[:ntran]``.  Orthogonal per
+        op, so the transpose IS the inverse — which is exactly why the two
+        spellings are so easy to confuse and so hard to tell apart by any
+        norm-, trace- or hermiticity-based check.
+        """
+        return np.swapaxes(np.asarray(self.R_cart), -1, -2)
+
     def get_spinor_rotations(self, wfn, sym_matrices_cart):
         """
         Converts a list of rotation matrices to their spinor representations using Markley's modification
