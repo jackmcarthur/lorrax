@@ -1412,9 +1412,11 @@ def accumulate_rchunk_to_gflat(
 # Bloch-phase formula lives.  Used by:
 #   * ψ-r box pipeline (post-IFFT, sign='+'):    to_rbox / to_rmu / to_rchunk
 #     for ``ψ_nk(r) = exp(+2πi k·r) · u_nk(r)``
-#   * ζ-r → G FFT (pre-FFT, sign='-'):           file_io.zeta_loader._do_disk_to_G
+#   * ζ-r → G FFT (pre-FFT, sign='-'):           gw.isdf_fitting, the ζ WRITER
 #     for ``z_q,μ(r) = exp(-2πi q·r) ζ_q,μ(r)``
-#     before scattering onto the (q + G) sphere.
+#     before scattering onto the (q + G) sphere.  It was also the READER's
+#     ``zeta_loader._do_disk_to_G`` until 2026-08-07, when that path was
+#     deleted: the writer emits G-flat only, so nothing reads r-space ζ.
 
 def apply_bloch_phase(
     box: jax.Array,

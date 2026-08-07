@@ -709,9 +709,9 @@ def _load_real_zeta(loader, n_q, n_mu, n_g_pad, mesh, spec):
     None)`` — the V_q driver's layout.  The overlap wants G sharded (or μ
     and G sharded), so there is exactly one reshard here; that is the
     interface cost §7.2 of the notes flagged, now paid rather than
-    described.  ``sphere_idx=None`` consumes the raw per-q sphere (the
-    loader refuses to narrow a per-q sphere with a shared index); the two
-    files having the SAME per-q sphere is what
+    described.  The read always delivers the raw per-q sphere — a shared
+    ``sphere_idx`` narrowing was never legal and the argument was deleted
+    on 2026-08-07; the two files having the SAME per-q sphere is what
     ``assert_zeta_bases_compatible`` verifies.
 
     G is zero-padded ngkmax → n_g_pad so the mesh divides it.  A zero G
@@ -730,7 +730,6 @@ def _load_real_zeta(loader, n_q, n_mu, n_g_pad, mesh, spec):
     mu_read = n_mu + (-n_mu) % p_tot
     z = loader.read_zeta_G_slab(
         q_offset=0, q_count=n_q, mu_offset=0, mu_count=mu_read,
-        qvec_batch_frac=jnp.zeros((n_q, 3)), sphere_idx=None,
         mesh=mesh)
     n_g = int(z.shape[-1])
     pad = int(n_g_pad) - n_g

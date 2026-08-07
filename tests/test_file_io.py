@@ -473,9 +473,6 @@ def test_read_zeta_G_slab_zero_pads_trailing_mu(tmp_path, single_device_mesh):
         zeta_g = zr.read_zeta_G_slab(
             q_offset=0, q_count=n_q_disk,
             mu_offset=0, mu_count=n_rmu_padded,
-            qvec_batch_frac=jax.numpy.zeros((n_q_disk, 3),
-                                            dtype=jax.numpy.float64),
-            sphere_idx=None,
         )
         host = np.asarray(zeta_g)
 
@@ -508,9 +505,6 @@ def test_read_zeta_G_slab_pad_smaller_than_one_per_rank(
         zeta_g = zr.read_zeta_G_slab(
             q_offset=0, q_count=n_q_disk,
             mu_offset=0, mu_count=n_rmu_padded,
-            qvec_batch_frac=jax.numpy.zeros((n_q_disk, 3),
-                                            dtype=jax.numpy.float64),
-            sphere_idx=None,
         )
         host = np.asarray(zeta_g)
 
@@ -635,81 +629,139 @@ def test_zeta_layout_rejects_garbage(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# .load surface
+# .load surface — G-FLAT ONLY since 2026-08-07
+#
+# These cells used to drive ``_build_zeta_h5_rspace`` files, because
+# ``load``'s default layout was ``'r_space'``.  That data surface is gone
+# (zeta_loader design D1/D3: no writer in the tree emits r_space), so the
+# same q/μ windowing coverage now runs on the G-flat builder and the
+# r-space cases become REFUSAL cells further down.  What is deliberately
+# NOT here any more is ``test_load_q_full_bz_unfold_path_exists``: the
+# ζ(r) IBZ→full-BZ unfold it reached is deleted, and the cell asserted
+# only that the path was *reached* (it accepted a clean answer OR
+# LinAlgError OR NotImplementedError OR a compute_rgrid_sym_perm
+# RuntimeError, because the fake WFN's mtrx is singular).  Its successor
+# is the refusal cell, which asserts something.
 # ---------------------------------------------------------------------------
 
 def test_load_q_ibz_returns_all_disk_rows(tmp_path, single_device_mesh):
-    out = _build_zeta_h5_rspace(tmp_path, n_q_disk=6, n_rmu=4)
+    out, _payload = _build_zeta_h5_gflat(
+        tmp_path, n_q_disk=6, n_rmu=4, n_G_sph=5)
     with ZetaLoader(out, mesh=single_device_mesh) as ld:
         z = np.asarray(ld.load(q='ibz'))
-        assert z.shape == (6, 8, 4)
+        assert z.shape == (6, 4, 5)
 
 
 def test_load_q_index_list_subset(tmp_path, single_device_mesh):
-    out = _build_zeta_h5_rspace(tmp_path, n_q_disk=6, n_rmu=4)
+    out, _payload = _build_zeta_h5_gflat(
+        tmp_path, n_q_disk=6, n_rmu=4, n_G_sph=5)
     with ZetaLoader(out, mesh=single_device_mesh) as ld:
         z = np.asarray(ld.load(q=[2, 3, 4]))
-        assert z.shape == (3, 8, 4)
+        assert z.shape == (3, 4, 5)
         # Should match the q=2,3,4 slice of the on-disk pattern.
         with h5py.File(out, 'r') as f:
-            ref = f['zeta_q'][2:5]
+            ref = f['zeta_q_G'][2:5]
         np.testing.assert_array_equal(z, ref)
 
 
 def test_load_mu_range(tmp_path, single_device_mesh):
-    out = _build_zeta_h5_rspace(tmp_path, n_q_disk=4, n_rmu=8)
+    out, _payload = _build_zeta_h5_gflat(
+        tmp_path, n_q_disk=4, n_rmu=8, n_G_sph=5)
     with ZetaLoader(out, mesh=single_device_mesh) as ld:
         z = np.asarray(ld.load(q='ibz', mu=(2, 6)))
-        assert z.shape == (4, 8, 4)
+        assert z.shape == (4, 4, 5)
         with h5py.File(out, 'r') as f:
-            ref = f['zeta_q'][:, :, 2:6]
+            ref = f['zeta_q_G'][:, 2:6, :]
         np.testing.assert_array_equal(z, ref)
 
 
 def test_load_q_full_bz_on_full_disk_returns_all(tmp_path, single_device_mesh):
     """When the on-disk layout IS full-BZ, q='full_bz' == q='ibz'."""
-    out = _build_zeta_h5_rspace(tmp_path, n_q_disk=24)   # full = 2*3*4
+    out, _payload = _build_zeta_h5_gflat(
+        tmp_path, n_q_disk=24, n_rmu=4, n_G_sph=5)   # full = 2*3*4
     with ZetaLoader(out, mesh=single_device_mesh) as ld:
         assert ld.q_layout == 'full_bz'
         z = np.asarray(ld.load(q='full_bz'))
-        assert z.shape == (24, 8, 4)
+        assert z.shape == (24, 4, 5)
 
 
-def test_load_q_full_bz_unfold_path_exists(tmp_path, single_device_mesh):
-    """The IBZ → full-BZ unfold is wired and dispatches.
+def test_load_q_full_bz_on_an_ibz_file_refuses_and_names_the_post_v_q_unfold(
+        tmp_path):
+    """The successor to ``test_load_q_full_bz_unfold_path_exists``.
 
-    The synthetic ``_make_fake_wfn`` writes random ``mtrx`` entries
-    that are typically singular, so ``compute_rgrid_sym_perm`` raises
-    ``LinAlgError`` / ``RuntimeError`` for fake files.  We accept any
-    of: clean unfold (would require valid sym group), the singular
-    matrix error from the fake WFN, or the TR-mapping
-    ``NotImplementedError`` — all confirm the unfold path was
-    reached.  End-to-end correctness comes from the MoS2 3×3 smoke
-    against real WFN symmetries.
+    ``mesh=None`` on purpose: the refusal is a LAYOUT/geometry decision
+    taken before any transport is touched, so this cell runs on a stack
+    with no phdf5 FFI — which is where the deleted cell could not run at
+    all.  The message must name the post-V_q route, because that is the
+    thing a caller is supposed to do instead.
     """
-    out = _build_zeta_h5_rspace(tmp_path, n_q_disk=1)
-    with ZetaLoader(out, mesh=single_device_mesh) as ld:
-        try:
-            z = np.asarray(ld.load(q='full_bz'))
-            # If we got here the syms were valid; identity ⇒ all rows equal.
-            with h5py.File(out, 'r') as f:
-                ibz = f['zeta_q'][0]
-            for q in range(z.shape[0]):
-                np.testing.assert_array_equal(z[q], ibz)
-        except NotImplementedError:
-            pass     # TR-mapping not supported — expected on this fake
-        except np.linalg.LinAlgError:
-            pass     # Random fake mtrx is singular — expected; smoke covers real case
-        except RuntimeError as e:
-            if "compute_rgrid_sym_perm" not in str(e):
-                raise
+    out, _payload = _build_zeta_h5_gflat(
+        tmp_path, n_q_disk=6, n_rmu=4, n_G_sph=5)     # 6 < 24 ⇒ IBZ on disk
+    ld = ZetaLoader(out)
+    assert ld.q_layout == 'ibz'
+    with pytest.raises(NotImplementedError, match=r"unfold_v_q"):
+        ld.load(q='full_bz')
 
 
-def test_load_layout_g_flat_requires_qvec_and_sphere(tmp_path, single_device_mesh):
-    out = _build_zeta_h5_rspace(tmp_path, n_q_disk=4)
-    with ZetaLoader(out, mesh=single_device_mesh) as ld:
-        with pytest.raises(ValueError, match=r"layout='G_flat'\) requires"):
-            ld.load(q='ibz', layout='G_flat')
+# ---------------------------------------------------------------------------
+# r-space ζ: the header still reads, the DATA surface refuses
+# ---------------------------------------------------------------------------
+# The refusal that replaces every deleted r-space cell.  ``mesh=None``
+# throughout, deliberately: __init__ must keep working on an r-space file
+# (the header surface is layout-independent and several callers want only
+# it), and the data methods must refuse BEFORE they reach the transport,
+# which is what lets these run on WSL.
+
+def test_r_space_header_surface_still_opens(tmp_path):
+    out = _build_zeta_h5_rspace(tmp_path, n_q_disk=6, n_rmu=4)
+    ld = ZetaLoader(out)
+    assert ld.zeta_layout == 'r_space'
+    assert ld.n_q_on_disk == 6
+    assert ld.n_rmu_disk == 4
+    assert ld.n_rtot_disk == 8
+    assert int(np.prod(ld.kgrid)) == 24
+
+
+@pytest.mark.parametrize("call", [
+    lambda ld: ld.load(q='ibz'),
+    lambda ld: ld.read_zeta_G_slab(q_offset=0, q_count=1,
+                                   mu_offset=0, mu_count=1),
+])
+def test_r_space_data_reads_refuse_naming_the_removal(tmp_path, call):
+    out = _build_zeta_h5_rspace(tmp_path, n_q_disk=6, n_rmu=4)
+    ld = ZetaLoader(out)
+    with pytest.raises(ValueError, match=r"2026-08-07"):
+        call(ld)
+
+
+def test_the_g_flat_data_reads_do_not_hit_that_refusal(tmp_path):
+    """The does-not-cry-wolf half: a G-flat file must get PAST the layout
+    gate.  Without this the refusal above would pass with the gate wired
+    to ``raise`` unconditionally, and both data methods would be dead."""
+    out, _payload = _build_zeta_h5_gflat(
+        tmp_path, n_q_disk=2, n_rmu=3, n_G_sph=4)
+    ld = ZetaLoader(out)                       # header-only: no transport
+    # It refuses for the MESH reason, not the layout one — i.e. the layout
+    # gate let it through.
+    with pytest.raises(RuntimeError, match=r"HEADER-ONLY"):
+        ld.load(q='ibz')
+
+
+def test_the_deleted_read_arguments_are_gone_from_the_signature(tmp_path):
+    """D3, pinned.  ``qvec_batch_frac``/``sphere_idx`` on
+    ``read_zeta_G_slab`` and ``layout``/``qvec_frac``/``sphere_idx`` on
+    ``load`` were removed on 2026-08-07; a caller that still passes one
+    must get a TypeError rather than have it silently ignored."""
+    out, _payload = _build_zeta_h5_gflat(
+        tmp_path, n_q_disk=2, n_rmu=3, n_G_sph=4)
+    ld = ZetaLoader(out)
+    with pytest.raises(TypeError):
+        ld.load(q='ibz', layout='G_flat')
+    with pytest.raises(TypeError):
+        ld.read_zeta_G_slab(q_offset=0, q_count=1, mu_offset=0, mu_count=1,
+                            sphere_idx=None)
+    assert not hasattr(ld, 'read_zeta_r_slab')
+    assert not hasattr(ld, 'has_slab_io')
 
 
 # ===========================================================================

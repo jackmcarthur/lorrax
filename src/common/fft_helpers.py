@@ -75,8 +75,10 @@ def query_fft_peak_bytes(
     spec = jax.ShapeDtypeStruct(
         tuple(int(s) for s in input_shape), dtype, sharding=sharding)
     # THE SAME FACTORY PRODUCTION USES.  Every real FFT box in the pipeline
-    # (wfn_transforms._local_box_fft, zeta_loader._do_disk_to_G, the flat-k
-    # helpers below) goes through make_sharded_*fftn_3d: one shard_map'd
+    # (wfn_transforms._local_box_fft, the ζ writer's r→G FFT in
+    # gw.isdf_fitting, the flat-k helpers below; zeta_loader's reader-side
+    # twin was deleted 2026-08-07) goes through
+    # make_sharded_*fftn_3d: one shard_map'd
     # rank-3 ``jnp.fft.fftn`` per rank over its local shard, which XLA:GPU
     # lowers to ONE cuFFT rank-3 plan.  Modelling the per-axis
     # ``make_jittable_local_fftn_3d`` form instead (as this function did

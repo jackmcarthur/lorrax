@@ -207,9 +207,10 @@ class _ZetaGTiles:
             raise ValueError(
                 f"vq_interp needs a G-flat ζ ('zeta_q_G'); {path} has "
                 f"zeta_layout={loader.zeta_layout!r}.  Refit with the "
-                f"G-flat writer (gw.isdf_fitting), or consume it through "
-                f"ZetaLoader.load(layout='G_flat', qvec_frac=…, "
-                f"sphere_idx=…) which does the FFT + sphere gather.")
+                f"G-flat writer (gw.isdf_fitting).  There is no longer a "
+                f"read path for r-space ζ at all: ZetaLoader's disk→G FFT "
+                f"+ sphere gather was deleted on 2026-08-07 because no "
+                f"writer in the tree emits that layout.")
         self.shape = (int(loader.n_q_on_disk), int(loader.n_rmu_disk),
                       int(loader.n_G_sph_disk))
         self.dtype = np.complex128
@@ -250,9 +251,13 @@ class _ZetaGTiles:
         """
         q_offset, q_count = int(q_offset), int(q_count)
         if self._distributed:
+            # No ``layout=`` since 2026-08-07: ZetaLoader.load reads G-flat
+            # and nothing else, so the kwarg had one legal value and the
+            # signature stopped carrying it (zeta_loader design D3).  This
+            # bundle already refuses a non-G-flat file in __init__.
             return self._loader.load(
                 q=np.arange(q_offset, q_offset + q_count, dtype=np.int32),
-                layout="G_flat", sharding=sharding.spec)
+                sharding=sharding.spec)
         return device_put_process_local(
             self[q_offset:q_offset + q_count], sharding)
 

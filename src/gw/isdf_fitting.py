@@ -662,9 +662,12 @@ def fit_zeta_to_h5(
     # a cutoff the writer falls back to the full flat-FFT axis
     # (n_G_sph = n_rtot) — slow disk path, kept for sanity checks.
     if q_irr_frac is None:
-        # Full-BZ q-vectors with BGW wrap, then / kgrid — same convention
-        # the V_q consumer's disk→G path (``zeta_loader._do_disk_to_G``)
-        # expects, via the local ``_bgw_wrap_q``.
+        # Full-BZ q-vectors with BGW wrap, then / kgrid — the convention
+        # the per-q sphere below is built in, via the local
+        # ``_bgw_wrap_q``.  (It used to be stated as "what the V_q
+        # consumer's disk→G path expects"; that path,
+        # ``zeta_loader._do_disk_to_G``, was deleted on 2026-08-07 — this
+        # writer bakes the phase in and the reader does no FFT at all.)
         _kgrid_arr_for_qfrac = np.asarray(meta.kgrid, dtype=np.float64)
         q_irr_frac = (_bgw_wrap_q(sym.kvecs_asints)
                        / _kgrid_arr_for_qfrac[None, :])

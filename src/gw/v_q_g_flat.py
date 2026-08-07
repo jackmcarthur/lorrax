@@ -274,8 +274,6 @@ def _make_read_all_ibz(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
         return zeta_loader.read_zeta_G_slab(
             q_offset=0, q_count=int(n_q_ibz),
             mu_offset=0, mu_count=int(n_rmu_padded),
-            qvec_batch_frac=jnp.zeros((int(n_q_ibz), 3), dtype=jnp.float64),
-            sphere_idx=None,
             mesh=mesh_xy,
         )
 
