@@ -31,20 +31,11 @@ sharding, bispinor)`` request — that's the P2 test contract, and it is
 the only reason ``LORRAX_WFN_BACKEND`` is safe to expose at all
 (``docs/architecture/services.md``).
 
-There was a third, ``phdf5_host``: an h5py union read feeding the same
-on-device unfold kernel, auto-selected when no FFI library loaded on
-either platform.  Deleted 2026-08-06.  Its name promised a third
-transport and it was not one — it read with the SAME independent POSIX
-h5py hyperslabs the eager path already uses at P>1 (no MPI, no MPI-IO,
-no FFI), differing only in where the unfold ran.  So it was a duplicate
-compute path over an existing transport, auto-selected by a missing
-``.so``, which is exactly what the 2026-08-01 ruling forbids: *"a
-missing or unloadable FFI library is a refusal at startup (with the
-library named), not a silent demotion to a slower path.  Auto-demotion
-remains only where the alternative is a different service tier …
-never a duplicate compute path."*  ``_auto_pick_backend`` now refuses
-there and quotes ``probe_target``'s reason for both platforms;
-``LORRAX_WFN_BACKEND=eager`` is the operator's way through.
+There was a third, ``phdf5_host``, deleted 2026-08-06: a duplicate compute
+path over the eager backend's own POSIX transport, auto-selected by a
+missing ``.so`` — which the 2026-08-01 ruling makes a refusal, not a
+demotion.  Full history: ``docs/services/wfn_loader.md`` (Backends).  The
+two refusal doors below are the tombstone and are load-bearing.
 
 Public surface
 --------------
@@ -359,12 +350,10 @@ class WfnLoader:
             host lib (liblorrax_ffi_host.so built with the phdf5 subpackage).
           * Multi-process JAX + mesh, no phdf5-capable FFI .so on EITHER
             platform → **REFUSE**, quoting ``probe_target``'s three-way
-            reason for both.  There used to be a ``phdf5_host`` tier here;
-            see the module docstring for why a duplicate compute path
-            selected by a missing ``.so`` is not a fallback.  An operator
-            who wants the host read anyway asks for it by name
-            (``LORRAX_WFN_BACKEND=eager``), which is checked above and so
-            never reaches the probe.
+            reason for both.  No demotion to the retired ``phdf5_host``
+            tier (``docs/services/wfn_loader.md``); an operator who wants
+            the host read asks by name, ``LORRAX_WFN_BACKEND=eager``,
+            which is checked above and never reaches the probe.
         """
         import os
         # A mesh-less loader can only run eager — there is no device mesh
@@ -415,13 +404,10 @@ class WfnLoader:
         raise RuntimeError(
             "WfnLoader: no FFI library can serve the collective WFN read "
             f"(jax.process_count()={int(jax.process_count())}, mesh "
-            f"{tuple(self._mesh.devices.shape)}), and there is no "
-            "second transport to demote to — the h5py 'phdf5_host' tier "
-            "was deleted 2026-08-06 because it was the eager backend's own "
-            "POSIX read with a different unfold kernel, i.e. a duplicate "
-            "compute path, and 'a missing or unloadable FFI library is a "
-            "refusal at startup (with the library named), not a silent "
-            "demotion to a slower path' (decisions.md 2026-08-01).\n"
+            f"{tuple(self._mesh.devices.shape)}), and there is no second "
+            "transport to demote to — the h5py 'phdf5_host' tier was "
+            "deleted 2026-08-06 (why: docs/services/wfn_loader.md, "
+            "Backends; decisions.md 2026-08-01).\n"
             + "\n".join(reasons)
             + "\nRepair the library named above, or set "
               "LORRAX_WFN_BACKEND=eager to take the per-rank host read "
@@ -452,12 +438,10 @@ class WfnLoader:
         data) remains valid for ``load_process_local``.  Returns the
         backend now in force.
 
-        MAY RAISE since 2026-08-06.  It re-runs :meth:`_auto_pick_backend`,
-        which at P>1 refuses when no FFI library can serve the collective
-        read instead of demoting to the deleted ``phdf5_host`` tier.  That
-        is the intended place for it: this is called immediately after
-        ``dist.build_mesh``, i.e. still at startup, and the refusal names
-        the library and the ``LORRAX_WFN_BACKEND=eager`` way through.
+        MAY RAISE since 2026-08-06: it re-runs :meth:`_auto_pick_backend`,
+        which refuses at P>1 rather than demoting, and startup — this is
+        called right after ``dist.build_mesh`` — is the intended place for
+        that (``docs/services/wfn_loader.md``).
         """
         if mesh is None or self._mesh is not None:
             return self.backend
@@ -866,12 +850,10 @@ class WfnLoader:
         ``wfn_transforms``).
 
         Touches NO FFI: these are numpy tables staged process-locally, so
-        the collective handle lives in :meth:`_ensure_slab_io` instead
-        of being a side effect of building them.  (It used to be one,
-        gated on ``self.backend == "phdf5"`` — a tier test that has had
-        exactly one reachable value since the ``phdf5_host`` tier was
-        deleted, and that made the pure table build un-callable without
-        an ``.so``.)
+        the collective handle lives in :meth:`_ensure_slab_io` instead of
+        being a side effect of building them (it used to be one, gated on
+        a ``self.backend`` test that made the pure table build un-callable
+        without an ``.so``; ``docs/services/wfn_loader.md``).
         """
         if self._phdf5_static_dev is not None:
             return self._phdf5_static_dev

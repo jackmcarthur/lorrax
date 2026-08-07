@@ -156,7 +156,14 @@ Public surface unchanged in name and semantics: `WfnLoader`, `load`,
 1b cross-wave, registered as survey Q6).
 
 - `path` becomes a public property; `_filename` stays as a compat attribute
-  (6 production sites; zero-cost).
+  (**7** production sites at a96439c — 4 convertible: `qp_wfn:160`,
+  `charge_density:122,286`, `current_density:145`; 3 held back behind
+  legacy-handle fallbacks where the arrival is not a `WfnLoader` and `.path`
+  would not exist: `dft_operators:160`, `get_DFT_mtxels:71,77`. Corrected
+  from 6, which matched no reading of the tree — step-3 adjudication ruling
+  5, B's tree count; the two defensive `getattr(wfn,'_filename',None)` reads
+  in `gw_init:210`/`isdf_fitting:727` are the compat attribute's other
+  documented use case, ruling 1. Zero-cost).
 - `symmetry()` becomes the public accessor; `_ensure_sym` stays as an alias
   (2 production sites replumb to the public name).
 - `kpt_starts` becomes a public property (for the density_symmetry_check
@@ -235,6 +242,15 @@ the shims; the shim-deletion gate is the phase-wide cleanup commit.
 Verification floor mirrors REPLUMB_BRIEF: full-suite set-diff empty both
 directions vs the step-0 baseline; Si COHSEX eqp BIT-IDENTICAL before/after
 (pure plumbing); layering green; the L-c legs re-run post-replumb.
+
+CENSUS CONVENTION (step-3 adjudication ruling 5, so the two arms stop
+publishing different door numbers): a door edge is an **AST import node**
+parsed from source, so `test_wfn_loader_import_isolation.py`'s door imports
+— spelled inside subprocess code STRINGS, never parsed as this tree's
+source — are counted SEPARATELY, a constant **+3 edges / +1 file**. That
+offset is the whole difference between the two arms' door-edge counts
+(7 → 49 without it, 10 → 52 with it); the OLD-PATH census both arms
+publish, 45/36 → 3/3 with converted delta 42, is unaffected either way.
 
 ## Registered / owner rows (running list; final table in the land report)
 
