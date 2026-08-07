@@ -26,6 +26,7 @@ from jax.sharding import Mesh, PartitionSpec as P
 
 from distrib_la import loader
 from distrib_la._shard_map import shard_map
+from distrib_la.resolve import mesh_key
 
 __all__ = [
     # context (was slate/context.py)
@@ -654,14 +655,10 @@ _TRSM_TARGET = "lorrax_slate_batched_trsm"
 _JIT_CACHE: dict = {}
 
 
-def _mesh_key(mesh: Mesh):
-    # Device identity (platform + ids) must be part of the key: two meshes
-    # with the same axis names/shape but different devices (e.g. a GPU 1x1
-    # and a CPU 1x1 in one process) lower to DIFFERENT platform handlers.
-    return (tuple(mesh.axis_names),
-            tuple(int(s) for s in mesh.shape.values()),
-            mesh.devices.flat[0].platform,
-            tuple(d.id for d in mesh.devices.flat))
+#: The package's ONE mesh cache key (:func:`distrib_la.mesh_key`).  This
+#: module's private spelling is kept because ``_scalapack`` and eight call
+#: sites in this file import it by that name; it is an alias, not a copy.
+_mesh_key = mesh_key
 
 
 @dataclass(frozen=True)

@@ -29,6 +29,7 @@ from jax.sharding import Mesh, PartitionSpec as P
 from distrib_la import loader
 from distrib_la._collectives import broadcast_bytes
 from distrib_la._shard_map import shard_map
+from distrib_la.resolve import mesh_key
 
 __all__ = [
     "CusolverMpBatchedLowerL",
@@ -182,8 +183,15 @@ _SOLVE_LU_TARGET = "lorrax_cusolvermp_batched_solve_lu"
 _JIT_CACHE: dict = {}
 
 
-def _mesh_key(mesh: Mesh):
-    return (tuple(mesh.axis_names), tuple(int(s) for s in mesh.shape.values()))
+#: The package's ONE mesh cache key (:func:`distrib_la.mesh_key`).
+#:
+#: This module used to carry a WEAKER one -- axis names and extents only,
+#: no platform and no device ids -- so two 1x1 meshes over different
+#: devices in one process (the CPU/GPU pair a mixed test session builds)
+#: hashed equal and the second took the first's compiled kernel.  A stale
+#: HIT, which is the one failure mode a cache key must not have.  Using the
+#: package key can only cost an extra compile, never a wrong one.
+_mesh_key = mesh_key
 
 
 def _validate_mesh(mesh: Mesh):

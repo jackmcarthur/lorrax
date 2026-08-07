@@ -53,6 +53,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from lxkit.jax_compat import mark_varying
 
 from distrib_la._shard_map import shard_map
+from distrib_la.resolve import mesh_key
 
 __all__ = ["cholesky", "block_size_for", "dense_to_tiles", "tiles_to_dense"]
 
@@ -239,9 +240,7 @@ _KERNEL_CACHE: dict = {}
 def _batched_kernel(mesh: Mesh, J: int, b: int):
     """``jit(lax.map(single))`` over the q axis — ONE XLA dispatch for the
     whole stack (~18x over a Python loop), memoized per (mesh, J, b)."""
-    key = (tuple(mesh.axis_names),
-           tuple(int(s) for s in mesh.shape.values()),
-           tuple(d.id for d in mesh.devices.flat), J, b)
+    key = (mesh_key(mesh), J, b)
     fn = _KERNEL_CACHE.get(key)
     if fn is None:
         single = _chol_2d_single(mesh, J, b)

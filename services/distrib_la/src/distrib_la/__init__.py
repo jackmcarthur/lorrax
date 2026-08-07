@@ -41,6 +41,9 @@ The surface
     a deck parser must not need the FFI layer to read a deck.
 ``dial_key() -> tuple``
     The factory-time cache-key aggregate.
+``mesh_key(mesh) -> tuple``
+    A stable, hashable mesh identity (axes, extents, platform, device ids)
+    for any cache whose stored value does NOT retain the mesh.
 
 Two phases, and they stay two
 -----------------------------
@@ -75,6 +78,7 @@ from distrib_la.resolve import (
     backend_module,
     list_backends,
     mesh_is_cpu,
+    mesh_key,
     mesh_platform,
     resolve_backend,
 )
@@ -87,7 +91,7 @@ __all__ = [
     # resolution
     "resolve_backend", "list_backends", "backend_module",
     "BACKEND_CHOICES", "EIGH_BACKENDS", "CHOLESKY_BACKENDS", "LU_BACKENDS",
-    "OPS", "NATIVE", "mesh_platform", "mesh_is_cpu",
+    "OPS", "NATIVE", "mesh_platform", "mesh_is_cpu", "mesh_key",
     # capability
     "probe_target", "has_target", "dial_key",
     # dispatch

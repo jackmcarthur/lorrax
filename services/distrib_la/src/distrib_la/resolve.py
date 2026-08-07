@@ -67,6 +67,7 @@ __all__ = [
     "FFI_PLATFORMS",
     "mesh_platform",
     "mesh_is_cpu",
+    "mesh_key",
     "resolve_backend",
     "list_backends",
     "backend_module",
@@ -188,6 +189,33 @@ def mesh_platform(mesh_xy) -> str:
     (``'tpu'`` reads better than ``'unknown'``).
     """
     return mesh_ffi_platform(mesh_xy, FFI_PLATFORMS)
+
+
+def mesh_key(mesh_xy) -> tuple:
+    """A STABLE, hashable identity for a mesh: axes, extents, devices.
+
+    THE cache key to use wherever the cached value does NOT retain the mesh.
+    ``id(mesh)`` is only safe when it does — then the entry keeps the Mesh
+    alive and the id cannot be recycled — and the failure mode when it does
+    not is a stale HIT, not a redundant miss.
+
+    Device IDENTITY, not just shape.  Two meshes with the same axis names
+    and extents over DIFFERENT devices (a GPU 1x1 and a CPU 1x1 in one
+    process) lower to different platform handlers, so a shape-only key
+    aliases them into each other's compiled kernels.
+
+    Public because LORRAX needs it and there is nowhere else honest to get
+    it: ``isdf/core.py`` keys two announcement sets (which do not retain
+    their mesh) and used to import ``ffi.linalg._slate._mesh_key`` — a
+    reach past this package's door into a backend-private module, for a
+    function that is neither SLATE's nor private in any real sense.  Three
+    of this package's four backends had their own copy of it; they all call
+    this one now.
+    """
+    return (tuple(mesh_xy.axis_names),
+            tuple(int(s) for s in mesh_xy.shape.values()),
+            mesh_xy.devices.flat[0].platform,
+            tuple(d.id for d in mesh_xy.devices.flat))
 
 
 def mesh_is_cpu(mesh_xy) -> bool:
