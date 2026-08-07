@@ -35,6 +35,12 @@ re-freezes turn out to be *platform-local* — see class **P1**.
 > were additionally RE-RUN at `efdbf9a` and came back byte-identical
 > (130/108P/22S, 120/120P, 130/127P/3S).
 
+> **AND WHICH COMMIT THE FIXES WERE VERIFIED AT.**  `7a1d64f` (B1) and
+> `f7c1b17` (B2) land after this census.  Every leg in *§ FIXED AFTER THE
+> CENSUS* below was re-run at `f7c1b17` on the same pins and the same node
+> class, artifacts in `_reports_fix/`; the leg table above is left as the
+> census measured it, at `e9340d1`.
+
 ## Verdicts by leg
 
 | leg | invocation | collected | passed | failed | error | skipped |
@@ -73,15 +79,45 @@ Both are clean; their residuals are quoted in
 
 ---
 
-## SHIP-LISTED FAILURES
+## FIXED AFTER THE CENSUS — the two reds this branch made
 
-### **B1 — BLOCKER, new on this branch: `_open_cuda_before_host` breaks the host phdf5 path**
+Both are fixed on this branch and re-verified; the diagnosis below is the
+census's, unchanged, and each row now carries the arm that closes it.  The
+rows stay here rather than disappearing: a census that deletes what it
+found cannot be audited against the next one.
+
+**Re-verification, branch tip `f7c1b17`, same node class, same BUILD_NOTES
+pins, artifacts in `/pscratch/sd/j/jackm/svc_distrib_la/_reports_fix/`
+(one `.log` + one `.xml` per leg):**
+
+| leg | census @ `e9340d1` | fix tip @ `f7c1b17` | reference it must match |
+|---|---|---|---|
+| `test_file_io.py`, CPU platform, 4 emulated devices | **ABORT** | **42 P / 1 S** | base `96a6399`: 42 P / 1 S |
+| cvd probe, 4 xdist workers | `'0','0','0','0'` | **`'0','1','2','3'`** | `78ddcee`: `'0','1','2','3'` |
+| xdist arm, 6 gnppm-session files | 7 P / 17 E | **24 / 24 P** | `78ddcee`: 24 / 24 P |
+| **B** full-suite `-m distrib_la` | 130 / 108 P / 0 F / 22 S | **140 / 118 P / 0 F / 22 S** | +10 new cells, 0 F, skips unchanged |
+| **E** lxkit by path | 120 / 120 P | **120 / 120 P** | unchanged |
+| **E2** distrib_la by path | 130 / 127 P / 3 S | **140 / 137 P / 0 F / 3 S** | +10 new cells, 0 F, skips unchanged |
+| **A** full suite, services deselected | 1191 / 1120 P / 8 F / 1 E / 62 S | **1211 / 1143 P / 6 F / 0 E / 62 S** | 0 newly red, 3 newly green |
+| **A2** full suite with services | 1441 / 1326 P / 9 F / 22 E / 84 S | **1471 / 1381 P / 6 F / 0 E / 84 S** | 0 newly red, **25 newly green** |
+| WSL full suite (jax 0.9.1, no FFI) | 1441 / 95 red | **1471 / 95 red** | set-diff EMPTY both directions |
+| `python3 tests/test_layering.py` | 75 / 75 | **75 / 75** | unchanged |
+
+The six reds left in A/A2 are P1 (3), P2 (2) and P3 (1) below — every one
+pre-existing or an owner row, none from this branch.  Leg B is the tension
+point and it holds: a CUDA-capable process still opens CUDA first (the
+`-m distrib_la` leg's SLATE cells are green, and
+`test_the_blaspp_the_cuda_slate_calls_can_see_the_device` passes there),
+while the CPU-platform leg opens the host library and nothing else.
+
+### **B1 — FIXED by `7a1d64f`: `_open_cuda_before_host` broke the host phdf5 path**
 
 | | |
 |---|---|
 | tests | `tests/test_file_io.py` — `test_read_slab_without_shape_rounds_up_to_the_mesh`, `test_slabio_implicit_pad_write_and_zero_padded_read` and every SlabIO write cell after them, on any leg whose jax platform resolves to **cpu** |
-| class | (a) real defect, introduced by this branch |
-| covering leg | none — the GPU legs (A/A2) do not reach it, the CPU leg dies in it |
+| class | (a) real defect, introduced by this branch — **FIXED, `7a1d64f`** |
+| covering leg (census) | none — the GPU legs (A/A2) did not reach it, the CPU leg died in it |
+| covering leg (now) | the CPU-platform `test_file_io` leg itself, **42 P / 1 S** at `f7c1b17`, plus the two-armed loader cells on every machine |
 
 `src/ffi/common/ffi_loader.py:576-613` (commit **`32e61fe`**, "the two FFI
 libraries share their SLATE, and the first one opened wins") makes
@@ -118,24 +154,44 @@ point `LORRAX_FFI_SO` at a path that cannot be `dlopen`ed, so
 swallowed and the process stays host-only — **42 passed / 1 skipped**, byte
 for byte the base result.  Same leg with the CUDA `.so` pinned: 300 s wall.
 
-**OWNER / FABLE DECISION — this should block landing as it stands.**  The
-rule it implements is real (it unblocked 8 SLATE-CUDA cells, `32e61fe`'s
-own evidence stands), so the fix is not "revert": it is to make the
-pre-open conditional on the process actually being able to use CUDA — a
-CPU-platform run has no SLATE-CUDA work to protect and pays the whole host
-path for it.  `services/distrib_la/src/distrib_la/loader.py` carries the
-same rule and `test_distrib_la_contract.py:1476,1502,1513` +
-`test_so_acceptance.py:278` pin it, so the change is four files and four
-cells, not one line.  **Not taken here**: undoing an evidenced fix at the
-land gate is the Fable's and the owner's call, not the census's.
+**FIXED, `7a1d64f`** — "the CUDA-first pre-open is for processes that can
+use CUDA, and only those".  Not a revert: the SLATE SONAME collision is
+real and `32e61fe`'s evidence stands, so a CUDA-capable process still opens
+CUDA first.  The pre-open is now gated on `_process_can_use_cuda()` —
+`JAX_PLATFORMS` resolved first-entry-wins plus a visible NVIDIA device
+(`CUDA_VISIBLE_DEVICES=""` explicitly masked, else a `/dev/nvidia*` node),
+the same two signals in the same order as `runtime._gpu_is_present`.  It is
+truthful AT LOAD TIME, which is why it is not `jax.default_backend()`: that
+INITIALIZES the XLA backend, so asking it inside a loader call would make
+the loader decide the process's platform.  Applied in BOTH loaders
+(`src/ffi/common/ffi_loader.py`, `services/distrib_la/src/distrib_la/loader.py`).
 
-### **B2 — the xdist launcher: the gnppm session dies at the SlabIO drain**
+VALIDATION: `tests/test_file_io.py`, CPU platform, 4 emulated devices, the
+CUDA `.so` **pinned** (not the census's unloadable-`.so` falsification arm)
+— **42 passed / 1 skipped**, the base `96a6399` result, at
+`_reports_fix/fix_fileio.xml`.  The CUDA arm is unharmed: leg B is 140
+cells / 0 failed / 22 skipped and
+`test_the_blaspp_the_cuda_slate_calls_can_see_the_device` passes in it.
+
+The four order cells are two-armed now, both sides with a red twin
+(`test_a_cpu_platform_process_never_opens_the_cuda_library` +
+`test_the_cpu_platform_cell_can_fail`, and the same pair for lorrax's
+loader in `tests/test_gpu_pinning.py`), plus an 8-row table per loader
+constructing every input of the capability gate.  The CPU-platform arm's
+red twin is the load-bearing one: without it that cell stays green on any
+machine with no CUDA library to find, which is every WSL leg.
+
+**The ABORT itself is a SECOND defect and it is registered, not fixed —
+see L1.**
+
+### **B2 — FIXED by `f7c1b17`: the xdist CONTROLLER narrowed the workers' preset**
 
 | | |
 |---|---|
 | tests | leg A: `test_bse_bgw_regression::test_bse_matches_frozen_and_bgw`, `test_bse_w0_resolvent::test_wq_resolvent_matches_restart_finite_q`, `test_restart_pad_roundtrip::test_restart_mu_pad_roundtrip` (worker crash).  Leg A2: those plus `test_bse_kgrid` (2) and a 21-error cascade over `test_bse_dense_reference` (12), `test_bse_stack_matvec` (3), `test_bse_w_omega_chain` (2), `test_bse_matvec_opts` (2), `test_bse_w0_resolvent` (2) |
-| class | (a) real defect, new on this branch — **root-caused to `6920171`**, second symptom layered on at `32e61fe` |
-| covering leg | the SINGLE-PROCESS leg: `iso_bse` **35/35 pass**, `iso_reds` passes all of these |
+| class | (a) real defect, new on this branch — **root-caused to `6920171`**, second symptom layered on at `32e61fe`; **FIXED, `f7c1b17`** (and `32e61fe`'s share by `7a1d64f`) |
+| covering leg (census) | the SINGLE-PROCESS leg: `iso_bse` **35/35 pass**, `iso_reds` passes all of these |
+| covering leg (now) | the xdist leg itself — **24 / 24 P**, and leg A2's 22-error cascade is 0 |
 
 Every one of these cells is green in one process and red under `lx test`
 (1 node, all GPUs, 4 xdist workers, one GPU pinned per worker).  The
@@ -185,16 +241,89 @@ caller, and `tests/test_gpu_pinning.py` is where the twin belongs: *four
 worker ids must map to four distinct devices even when the controller has
 already pinned one*.
 
-**OWNER / FABLE DECISION — this should block landing.**  `6920171` fixed a
-real thing (the non-xdist leg was unpinned, and that hid a leg); the fix is
-to stop the controller's write from becoming the workers' preset, not to
-revert.  **Not taken here** for the same reason as B1.
+**FIXED, `f7c1b17`** — "tests/conftest: the xdist CONTROLLER must not
+narrow what its workers inherit".  Not a revert: `6920171`'s three reasons
+and its 11 cells are untouched, and a plain non-xdist run is still pinned
+(that is the leg `6920171` existed to un-hide).  The controller — and only
+the controller — takes no device, detected with pytest-xdist's own
+predicate: no `PYTEST_XDIST_WORKER` **and** `config.option.dist != "no"`
+(`harness.is_xdist_controller`).  `-n 0` and a missing xdist plugin both
+leave `dist == "no"`, so both stay pinned.  The pin moves from conftest
+module scope to `pytest_configure`, which is where `config` exists and is
+still before collection — hence before the first test-module import, hence
+before jax.
+
+VALIDATION, all at `_reports_fix/`:
+
+| arm | result |
+|---|---|
+| cvd probe, 4 xdist workers | gw0..gw3 = **`'0','1','2','3'`** (`fix_cvd.log`) |
+| the same probe against the PRE-FIX conftest (`git show 35f3e06:tests/conftest.py`) | **`'0','0','0','0'`, 1 distinct device of 4 — RED ARM FIRES** (`fix_redarm.log`) |
+| xdist arm, the 6 gnppm-session files | **24 / 24 passed** (`fix_xdist.xml`) |
+| leg A2 | the 22-error cascade is **0**, 25 cells newly green, 0 newly red |
+
+`tests/test_gpu_pinning.py` grows the controller-does-not-pollute twin —
+the census probe frozen into the suite: it copies this conftest + harness
+into a tmp rootdir (never writing into the checkout), spawns the real
+4-worker arm and reads each worker's own `CUDA_VISIBLE_DEVICES` back out of
+a file (a worker's stdout does not reach the controller under xdist, `-s`
+included — measured).  It scrubs `PYTEST_XDIST_*` from the child env,
+because under `lx test` the cell runs INSIDE a worker and the child's
+controller would otherwise inherit `PYTEST_XDIST_WORKER=gw2` and pin
+`devs[2]` for all four — measured, and the same defect shape from the other
+direction.  Beside it: `test_the_controller_takes_no_device_at_all`, its
+red twin, and a 7-row `is_xdist_controller` table whose `("", "no")` row is
+the non-xdist leg that must still be pinned.
 
 > The compile cache is NOT the cause of the `ctx_handle is null` reads.
 > Arm run: same files with `ISDF_JAX_CACHE_DIR=""` → 4 passed; but the
 > control (cache ON, same isolation) is *also* green, so the arm is not
 > discriminating and the cache hypothesis is unsupported.  Recorded so
 > nobody re-derives it.
+
+
+## SHIP-LISTED FAILURES
+
+### **L1 — the two platform `.so`s cross-wire their phdf5 through RTLD_GLOBAL** (latent, registered by B1's fix)
+
+| | |
+|---|---|
+| tests | none can reach it today; it is what B1's ABORT *was* |
+| class | (b) pre-existing, structural — a cross-`.so` ODR violation in the C++ |
+| covering leg | none.  The B1 fix keeps it LATENT for host-only processes by never putting one into the mixed state; it is NOT latent for a CUDA-capable process that also does host phdf5 work |
+
+`liblorrax_ffi.so` and `liblorrax_ffi_host.so` collide on far more than
+`libslate`/`libblaspp`.  MEASURED 2026-08-07, `nm -D --defined-only` on the
+two BUILD_NOTES-pinned builds (deployed device lib; `build_host_h200`,
+md5 `4c4422b8…`): **sixteen symbol names are DEFINED BY BOTH** — the nine
+C-linkage `lrx_phdf5_*` / `lrx_slate_*` entry points and seven mangled
+`lorrax_ffi::phdf5::{open_ctx,close_ctx,ensure_dataset,ensure_read_buf,
+ensure_pinned,ensure_mpi_initialized,open_dataset_ro}`.  Both files are
+dlopened `RTLD_GLOBAL`, so once both are open the FIRST one answers those
+names for BOTH — including for the other library's own internal calls.
+
+And they are not the same functions.  `src/ffi/cpp/phdf5/ctx.h` compiles
+`PhdfCtx` with the CUDA stream / event / pinned-buffer members under
+`#ifndef LORRAX_FFI_NO_CUDA`; the host build defines that macro and drops
+them.  **One C++ type name, two struct layouts, both exporting
+`open_ctx(...) -> PhdfCtx*`.**  A handler from one build handed a
+`PhdfCtx*` minted by the other reads its fields at the wrong offsets, which
+is exactly what B1's
+
+    offset_base=[0,0,0,4596944070643295330]
+
+(a float64 read as int64) and the xdist arm's `phdf5 read: ctx_handle is
+null` look like.
+
+**NOT CHASED, deliberately.**  The fix is in C++ — distinct symbol
+namespaces per build, or a hidden-visibility phdf5 core, or `RTLD_LOCAL`
+with an explicit re-export set — and it is not this branch's regression:
+the two libraries have always shared these names.  What this branch changed
+was how many processes get put into the mixed state, and B1's fix takes
+CPU-platform processes back out of it.  `test_so_acceptance`'s check 5 is
+the ratchet on the premise for the SLATE half; there is no equivalent
+ratchet on the phdf5 half yet, and that is the first thing to add if
+anyone picks this up.
 
 ### **P1 — three Tier-1 pins are Frontera-frozen and cannot be green on both machines**
 
@@ -299,7 +428,7 @@ Leg A, 62 skips.  Leg A2 = these 62 plus leg B's 22.
 | 11 | `needs 4 (emulated) devices, got 1` (`test_contract_bands` 9, `test_projection_lgemm` 2) | **C** for `projection_lgemm`; `test_contract_bands` → **P6, uncovered** |
 | 7 + 1 | `needs 4 devices, have 1` / `needs 2 devices, have 1` (`test_charge_zeta_route`) | **C** and **C3** (green) |
 | 4 | `needs >=4 devices to build a 2x2 mesh` (`test_sharding_fit`) | **C** (green) |
-| 1 | `needs >= 4 devices for a 2x2 mesh; have 1` (`test_file_io`) | **B1 — the 4-device leg aborts, so this is UNCOVERED today** |
+| 1 | `needs >= 4 devices for a 2x2 mesh; have 1` (`test_file_io`) | the 4-device CPU leg — UNCOVERED at census time (B1 aborted it), **covered since `7a1d64f`: 42 P / 1 S** |
 | 1 | `device count 1 is a perfect square; the refusal arm needs a non-square count` | **C2** (1 passed at 3 devices) |
 | 1 | `needs 4 (emulated) devices` (`test_sanity_gates_jax::test_check_hermitian_sharded`) | **C** (green) |
 | 1 | `P=1: jax.devices()[0] IS this process's device, so the negative control cannot fire` | true P>1 srun leg; **not** the emulated legs |
@@ -336,9 +465,9 @@ CUDA-only and skip on F.  Between them every cell runs on one of the two.
    runs *inside* the container.  Every emulated-multi-device leg here uses
    that form, and the first attempt (recorded, superseded) did not.
 2. **`lx test` is xdist.**  One node, all GPUs, four workers, one GPU pinned
-   per worker by `tests/conftest.py`.  That is the launcher class **B2** is
-   about, and it is why the single-process `lx run … -m pytest` leg is the
-   control for every session-fixture red.
+   per worker by `tests/conftest.py` — and NOT by its controller, which is
+   what **B2** was.  It is why the single-process `lx run … -m pytest` leg
+   is the control for every session-fixture red.
 3. **Judge by artifacts.**  Leg A exits non-zero (`srun: task 0: Exited with
    exit code 1`) and still wrote a 246 kB junitxml with 1191 cells; leg C's
    first attempt exited 139 and wrote NO xml at all.  The exit code
@@ -357,6 +486,12 @@ CUDA-only and skip on F.  Between them every cell runs on one of the two.
 **1420 → 1441 collected, 95 → 95 red, identical ids, 0 removed, 0 newly
 red.**  The WSL leg cannot see any of B1/B2 (no FFI, no CUDA) — that is
 exactly why the Perlmutter census had to exist.
+
+Re-measured across the two fixes, `35f3e06` → `f7c1b17`: **1441 → 1471
+collected, 95 → 95 red, identical ids, 0 removed, 0 newly red, +30 new
+cells all green.**  The 30 are the two-armed load-order cells and the two
+capability tables (B1) and the controller cells (B2); the xdist twin skips
+on WSL for want of the plugin and runs on Perlmutter.
 
 ---
 ---
