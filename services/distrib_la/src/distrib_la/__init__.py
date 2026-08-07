@@ -1,0 +1,95 @@
+"""``distrib_la`` — distributed dense linear algebra over a JAX device mesh.
+
+One door for ``eigh``, ``cholesky`` and ``solve_lu`` on an ``('x','y')``
+device mesh, over four backend families: **scalapack** (CPU preferred),
+**slate** (CPU fallback where it is not broken; ROCm always,
+declared-untested), **cusolvermp** (CUDA preferred) and **native** (pure
+JAX, everywhere).  A caller says what it wants computed and on which mesh;
+which library runs is a resolved fact it can read but never has to
+branch on.
+
+THE PACKAGE IS THE DOOR.  There is no separate facade module: everything
+a consumer needs is a top-level name here, and importing
+``distrib_la.<submodule>`` from outside is a layering violation the
+monorepo's ``tests/test_layering.py`` fails on.  That is what makes
+"only distrib_la sees scalapack/slate/cusolvermp" checkable rather than
+aspirational — those three appear in exactly one dependency edge in this
+package (:mod:`distrib_la.loader`, which dlopens a ``.so`` by path) and in
+zero of its declared dependencies.
+
+The surface
+-----------
+``plan(op, mesh, *, backend='auto', n=None) -> Plan``
+    Resolve once, then call.  ``Plan(A)`` for one tile at ``P('x','y')``,
+    ``Plan.batched(A_stack)`` for ``P(None,'x','y')``.  Eigenvalues come
+    back replicated, eigenvectors as COLUMNS, on every backend.
+``Plan.native_fn``
+    A pure, trace-safe closure — native backends only — for a call site
+    that needs the math INSIDE its own ``jit``.
+``factor(op, A, mesh, ...) -> FactorToken`` / ``solve(token, B)``
+    Factor once, back-solve many.  The token is opaque and carries the
+    handle (scalapack's ``ipiv``, cuSOLVERMp's raw buffer, SLATE's
+    ``SlateLowerL``), so "never reshard, feed it back verbatim" is the
+    type rather than a comment.
+``resolve_backend(op, requested, mesh, *, n=None) -> str``
+    The raising probe.  ``n`` is decoupled from the operands on purpose:
+    a caller that will pad can ask before it has built anything.
+``list_backends(op, mesh) -> dict``
+    The never-raising report, for startup banners.
+``BACKEND_CHOICES``
+    The vocabulary.  Importable with NO ``.so`` anywhere on the machine —
+    a deck parser must not need the FFI layer to read a deck.
+``dial_key() -> tuple``
+    The factory-time cache-key aggregate.
+
+Two phases, and they stay two
+-----------------------------
+``plan()`` is EAGER (it dlopens and reads ``jax.process_count()``); what it
+returns is TRACE-SAFE.  Only platform and handler guards can fire at
+resolve time — operand dtype, rank and extent are trace-time facts — so a
+single-phase API would have to lie about when it checked.
+
+Promise semantics
+-----------------
+A returned backend name means EVERY guard passed; the call cannot then
+fail for an availability or geometry reason.  Explicit requests refuse
+rather than downgrade; only ``auto`` demotes, and it announces on rank 0.
+The worst measured defect in this tree was a silent route change that ran
+to completion with rc=0 and a QP gap of −161 eV, so this is not
+punctilio — it is the failure mode.
+"""
+
+from __future__ import annotations
+
+from distrib_la.dispatch import dispatch_batched_eigh
+from distrib_la.factor import FactorToken, factor, solve
+from distrib_la.loader import dial_key, has_target, probe_target
+from distrib_la.plan import DONATES, Plan, ensure_sharding, plan
+from distrib_la.resolve import (
+    BACKEND_CHOICES,
+    CHOLESKY_BACKENDS,
+    EIGH_BACKENDS,
+    LU_BACKENDS,
+    NATIVE,
+    OPS,
+    backend_module,
+    list_backends,
+    mesh_is_cpu,
+    mesh_platform,
+    resolve_backend,
+)
+
+__all__ = [
+    # plan
+    "Plan", "plan", "ensure_sharding", "DONATES",
+    # factor / solve
+    "FactorToken", "factor", "solve",
+    # resolution
+    "resolve_backend", "list_backends", "backend_module",
+    "BACKEND_CHOICES", "EIGH_BACKENDS", "CHOLESKY_BACKENDS", "LU_BACKENDS",
+    "OPS", "NATIVE", "mesh_platform", "mesh_is_cpu",
+    # capability
+    "probe_target", "has_target", "dial_key",
+    # dispatch
+    "dispatch_batched_eigh",
+]
