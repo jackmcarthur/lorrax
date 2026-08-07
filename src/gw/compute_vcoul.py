@@ -59,7 +59,19 @@ def build_v_head_miniBZ_avg_3d(
     bvec_j = jnp.asarray(bvec, dtype=jnp.float64)
     rng = np.random.RandomState(seed)
     randvals = rng.uniform(0, 1, (nmc, 3))
-    randcart = (randvals @ bvec.T)
+    # Row convention: ``bvec`` rows are the Cartesian reciprocal vectors, so
+    # ``randvals @ bvec`` spans the b1,b2,b3 parallelepiped — a fundamental
+    # domain of the reciprocal lattice, which the Voronoi wrap below maps
+    # measure-preservingly onto the Voronoi cell.  ``randvals @ bvec.T``
+    # (shipped 2026-05-16..2026-08-07) spans the COLUMN parallelepiped,
+    # which is not a fundamental domain: the wrapped cloud double-covers
+    # part of the cell and misses part, with the same total volume, so no
+    # normalisation check can see it.  Si FCC is provably blind to the
+    # difference (bvec.T = P·bvec, P cyclic ⇒ pure reseed); on non-cubic
+    # cells it is a bias worth ~50 % of the whole mc-average correction.
+    # Pinned by tests/test_vcoul_minibz_head_draw.py; matches
+    # coulomb/base.py:298 and bse/vq_interp.py's draw.
+    randcart = (randvals @ bvec)
     wrapped = np.asarray(wrap_points_to_voronoi(
         jnp.asarray(randcart), bvec_j, nmax=1))
     kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
