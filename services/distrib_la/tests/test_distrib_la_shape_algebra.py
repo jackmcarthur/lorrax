@@ -120,3 +120,147 @@ def test_dense_to_tiles_round_trips_on_the_lower_triangle():
 
     with pytest.raises(ValueError, match="divisible"):
         dense_to_tiles(A, 5)
+
+
+# ---------------------------------------------------------------------------
+# The other shape algebra: what the resolver refuses before anything runs
+# ---------------------------------------------------------------------------
+# Guard 6 (divisibility) and the SLATE/ScaLAPACK tile rules are the parts of
+# the layout contract that are pure arithmetic, so they belong at this tier
+# — a laptop can falsify them, and they must fire at RESOLVE time.  Bug L-1
+# is the reason that "at resolve time" matters: a rule enforced only at call
+# time turns a returned backend name into a broken promise, and the promise
+# is the whole API.
+#
+# The mesh is a stand-in with the 1.5 attributes resolve_backend reads.  Not
+# a convenience: a real jax Mesh at 4x4 needs sixteen devices, and the point
+# of this tier is that the shape algebra needs NO machine.
+
+
+class _FakeMesh:
+    """``mesh.shape['x'/'y']``, ``mesh.devices.flat[0].platform``,
+    ``mesh.devices.size`` — everything the resolver touches."""
+
+    def __init__(self, px, py, platform="cpu"):
+        from types import SimpleNamespace
+        self.shape = {"x": px, "y": py}
+        self.devices = SimpleNamespace(
+            flat=[SimpleNamespace(platform=platform)], size=px * py)
+
+
+@pytest.mark.parametrize("mesh_shape", [(2, 2), (4, 4)])
+def test_native2d_refuses_every_hostile_logical_extent_and_takes_the_pad(
+        mesh_shape):
+    """The pad IS the fix, and both halves are asserted.
+
+    For each hostile family the LOGICAL extent is refused (or tiles, when
+    the family happens to be divisible on this mesh) and the PADDED extent
+    tiles.  Asserting only the second would pass on a build that quietly
+    rounded; asserting only the first would pass on one that refused
+    everything.
+    """
+    from distrib_la.resolve import resolve_backend
+    Px, Py = mesh_shape
+    mesh = _FakeMesh(Px, Py)
+    refused = 0
+    for case in hostile_extents(mesh_shape):
+        n_log, n_pad = case.logical[0], case.padded[0]
+        try:
+            resolve_backend("cholesky", "native2d", mesh, n=n_log)
+        except ValueError as exc:
+            refused += 1
+            assert "no valid block size" in str(exc), (case.name, exc)
+        # The padded extent always tiles — that is what padding is FOR.
+        assert resolve_backend(
+            "cholesky", "native2d", mesh, n=n_pad) == "native2d", case.name
+    assert refused >= 1, (
+        f"no hostile family was refused on a {Px}x{Py} mesh, so the loop "
+        f"above proved nothing about refusal")
+
+
+def test_both_axes_can_have_a_remainder_at_once():
+    """The case a one-axis test cannot see.  ``n % Px`` and ``n % Py`` are
+    two conditions, and a check that only ever violates one of them passes
+    on an implementation that ANDs when it should OR."""
+    from distrib_la._native2d import block_size_for
+    # 4x6: lcm = 12.  n = 14 leaves a remainder against BOTH axes
+    # (14 % 4 = 2, 14 % 6 = 2) and against their lcm.
+    assert 14 % 4 and 14 % 6
+    with pytest.raises(ValueError, match="lcm"):
+        block_size_for(14, 4, 6)
+    # ...and 24, a multiple of the lcm, is accepted.
+    b, J = block_size_for(24, 4, 6)
+    assert 24 % b == 0 and J % 4 == 0 and J % 6 == 0
+
+
+def test_more_ranks_than_slices_is_refused_not_rounded():
+    """``n`` smaller than the mesh: some rank owns nothing.  The kernel has
+    no meaningful tiling and the honest answer is the raise — a silent
+    round UP changes the matrix, a silent round DOWN drops rows."""
+    from distrib_la._native2d import block_size_for
+    for n, (Px, Py) in ((1, (2, 2)), (3, (4, 4)), (2, (4, 4))):
+        with pytest.raises(ValueError, match="no valid block size"):
+            block_size_for(n, Px, Py)
+
+
+def test_an_empty_tile_row_is_representable_and_says_so():
+    """``n == lcm(Px,Py)``: one tile per rank row, block size 1.  The
+    smallest legal decomposition, and the boundary the refusals above sit
+    just below — without it, "refuses everything small" would pass."""
+    from distrib_la._native2d import block_size_for
+    assert block_size_for(4, 2, 2) == (2, 2)
+    assert block_size_for(2, 2, 2) == (1, 2)
+    assert block_size_for(4, 4, 4) == (1, 4)
+
+
+@pytest.mark.parametrize("mesh_shape", [(2, 2), (4, 4)])
+def test_the_scalapack_divisibility_guard_fires_at_resolve_time(mesh_shape):
+    """Guard 6 for an FFI backend, asserted WITHOUT a library.
+
+    The capability probe runs before divisibility, so on a machine with no
+    ``.so`` the refusal is the probe's.  Both are refusals at RESOLVE time
+    with a reason, which is the contract; the cell asserts the ladder
+    refuses rather than which rung it refused on, because the rung depends
+    on the machine and the promise does not.
+    """
+    from distrib_la.resolve import resolve_backend
+    Px, Py = mesh_shape
+    mesh = _FakeMesh(Px, Py)
+    for case in hostile_extents(mesh_shape):
+        n_log = case.logical[0]
+        if n_log % Px == 0 and n_log % Py == 0:
+            continue
+        with pytest.raises((ValueError, RuntimeError)) as ei:
+            resolve_backend("solve_lu", "scalapack", mesh, n=n_log)
+        assert str(ei.value).strip(), "a refusal with no reason"
+
+
+def test_a_1d_mesh_refuses_cusolvermp_by_geometry_alone():
+    """Guard 5, pure: cuSOLVERMp needs a true-2D grid and an EXPLICIT
+    request refuses rather than demoting.  No GPU, no ``.so``: the
+    geometry rung is reached before the capability rung on a CUDA mesh
+    only when the handler is there, so this cell asserts the refusal and
+    its 1x4 spelling, not which rung produced it."""
+    from distrib_la.resolve import resolve_backend
+    with pytest.raises((ValueError, RuntimeError)) as ei:
+        resolve_backend("cholesky", "cusolvermp", _FakeMesh(1, 4, "gpu"), n=64)
+    assert "cusolvermp" in str(ei.value)
+
+
+def test_the_hostile_table_reproduces_the_measured_4x4_row():
+    """``hostile_extents`` generalizes a table that was measured
+    end-to-end on Perlmutter job 56389339 (4 nodes / 16 ranks, 4x4 mesh).
+    Pinning the 4x4 instance is what makes the generalization checkable
+    rather than decorative — and it is the only tie this tier has to a
+    real run."""
+    rows = {g.name: g.logical for g in hostile_extents((4, 4))}
+    assert rows["prime-both-axes"] == (17, 23)
+    assert rows["prime-both-axes-tighter"] == (13, 17)
+    assert rows["nondivisible-axis0-only"] == (17, 16)
+    assert rows["fewer-slices-than-ranks"] == (1, 1)
+    assert rows["empty-tiles-on-axis0"] == (2, 16)
+    # ...and every padded extent really is a multiple of the mesh axis,
+    # which is the property the L-b and L-c tiers rely on.
+    for g in hostile_extents((4, 4)):
+        assert g.padded[0] % 4 == 0 and g.padded[1] % 4 == 0
+        assert g.padded[0] >= g.logical[0] and g.padded[1] >= g.logical[1]

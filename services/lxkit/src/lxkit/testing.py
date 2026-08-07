@@ -131,9 +131,18 @@ def gate_state():
     reset_gate_state()
 
 
-def require_devices(n: int) -> int:
+def require_devices(n: int, platform: str | None = None) -> int:
     """SKIP unless this process sees at least ``n`` jax devices; returns the
     count.
+
+    ``platform`` asks about ONE backend rather than the default one, and
+    the emulated tier has to: ``--xla_force_host_platform_device_count``
+    creates HOST devices, so on any box with a GPU the default backend is
+    ``cuda``, ``jax.device_count()`` answers 1, and an emulated-4-device
+    cell skips on the machine where the flag worked perfectly.  Measured
+    on the WSL dev box (one CudaDevice) while writing distrib_la's L-b
+    tier.  ``platform="cpu"`` asks the question the flag actually
+    answers.
 
     **Skips, never asserts.**  Suite-wide convention, and a recorded defect:
     ``tests/KNOWN_FAILURES.md`` lists 11 cells (``test_contract_bands`` (9) +
@@ -150,10 +159,16 @@ def require_devices(n: int) -> int:
     except Exception as exc:                              # noqa: BLE001
         pytest.skip(f"jax is not importable here ({exc}); this cell needs "
                     f">= {n} devices — covered by the emulated 4-device leg")
-    have = jax.device_count()
+    try:
+        have = (jax.device_count() if platform is None
+                else len(jax.devices(platform)))
+    except Exception as exc:                              # noqa: BLE001
+        pytest.skip(f"needs >= {n} devices on platform {platform!r}, which "
+                    f"this process has no backend for ({exc})")
     if have < n:
+        where = "" if platform is None else f" on platform {platform!r}"
         pytest.skip(
-            f"needs >= {n} devices, have {have}.  Set XLA_FLAGS="
+            f"needs >= {n} devices{where}, have {have}.  Set XLA_FLAGS="
             f"--xla_force_host_platform_device_count={n} BEFORE the first jax "
             f"import, or run the real multi-process leg")
     return have

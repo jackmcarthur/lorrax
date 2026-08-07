@@ -134,10 +134,13 @@ _ALLOWED = (
     # is no pinned .so to check, and the skip says which pin is missing.
     # ON Perlmutter this is NOT allowed — BUILD_NOTES pins the host lib,
     # so a skip there means the pin was not passed and the tier evaporated.
-    AllowedSkip("test_so_acceptance", "LORRAX_FFI_HOST_SO",
-                "the Perlmutter leg, where BUILD_NOTES.md pins the host .so "
-                "(this row is REMOVED by the perlmutter profile: see "
+    AllowedSkip("test_so_acceptance", "is not set, so there is no pinned",
+                "the Perlmutter leg, where BUILD_NOTES.md pins both .so "
+                "files (this row is REMOVED by the perlmutter profile: see "
                 "_allowed_for)"),
+    AllowedSkip("test_so_acceptance", "is not on PATH",
+                "any leg with binutils; the four acceptance checks ARE "
+                "nm/readelf, which is what BUILD_NOTES.md's commands are"),
     AllowedSkip("", "no CUDA GPU visible",
                 "the GPU leg (`lx test`, one task with every GPU)"),
     AllowedSkip("", "jax cpu backend unavailable",
