@@ -90,3 +90,29 @@ What this gate does NOT cover
   and has its own convention list.
 - The 8 valence x 8 conduction configuration, which is more sensitive to
   the Lanczos convergence window than the 4x4 one pinned here.
+
+## 2026-08-07 — the mini-BZ head-draw fix moves this frozen reference (expected)
+
+Commit 358bb0b fixed `build_v_head_miniBZ_avg_3d`'s uniform draw
+(`randvals @ bvec.T` → `randvals @ bvec`; see that commit's message and
+`tests/test_vcoul_minibz_head_draw.py`).  This deck pins
+`mc_average_vcoul_body = true`, so the head table enters the kernel.  On Si
+the fix is a pure RESEED of the MC average (bvec.T = P·bvec, P cyclic), and
+the reseed moves the lowest-20 eigenvalues by max 7.067e-5 eV / MAE
+7.42e-6 eV (8/20 cells over the 1e-6 pin; eigenvalues 8 and 16 carry it) —
+70.7× ATOL_FROZEN_EV but physics-insignificant: the BGW band arm stays
+green at MAE 3.4707 / max 8.8728 meV (the frozen ref itself sits at
+3.4650/8.8774; the move is noise-level).  The Si result proves Si is BLIND
+to the draw bug (cyclic-permutation degeneracy), not that the bug was
+small: on non-cubic 3D cells the transposed draw is a BIAS worth ~50 % of
+the whole mc-average correction (hexagonal z = 376).  The guard is the
+committed hexagonal test arm, not any Si gate.
+
+`bse_eigenvalues_ref.dat` is therefore stale at any HEAD ≥ 358bb0b.  The
+owner has authorized adopting the candidate generated at 358bb0b on the
+BUILD_NOTES pins —
+`/pscratch/sd/j/jackm/svc_vcoul/_gates_after/bse_eigenvalues_candidate.dat`
+(md5 cab1dd48…, byte-exact ref format; sidecar README records pins,
+jobid/steps and both delta tables) — as the new reference at the
+integration head.  ATOL_FROZEN_EV stays 1e-6: it is a bit-reproducibility
+pin, and loosening it instead of refreezing was considered and refused.
