@@ -1199,6 +1199,76 @@ def test_resolve_auto_1d_mesh_demotes_with_announcement(monkeypatch, capsys):
     assert "native" not in capsys.readouterr().out
 
 
+# ---------------------------------------------------------------------------
+# The distributed-eigh COST NOTICE (step 6).  Same mocked-mesh instrument as
+# guard 5 above, for the same reason: the contract is about what resolve
+# PRINTS and RETURNS, and neither needs a GPU.
+# ---------------------------------------------------------------------------
+
+def test_resolve_explicit_eigh_announces_the_measured_fixed_cost(
+        monkeypatch, capsys):
+    """Below the threshold: the notice fires, and changes NOTHING.
+
+    Both halves matter.  A cost notice that demoted would be the silent
+    route change this package exists to prevent (module docstring: the
+    -161 eV MoS2 run); a cost notice that never fires would leave the
+    ~1.55 s/matrix floor discoverable only by measuring it again.
+    """
+    R = _mock_cuda_capabilities(monkeypatch, nproc=4)
+    mesh = _FakeCudaMesh(2, 2)
+    assert R.resolve_backend("eigh", "cusolvermp", mesh, n=1024) == "cusolvermp"
+    out = capsys.readouterr().out
+    assert "1.55" in out and "cusolvermp" in out and "2x2" in out
+    assert "n=1024" in out
+    # It announces the extrapolation AS an extrapolation.
+    assert "EXTRAPOLATED" in out and "UNMEASURED" in out
+    # Once per (op, geometry): a second resolve of the same decision is
+    # quiet, and STILL returns the same backend.
+    assert R.resolve_backend("eigh", "cusolvermp", mesh, n=512) == "cusolvermp"
+    assert capsys.readouterr().out == ""
+
+
+def test_resolve_explicit_eigh_cost_notice_is_silent_at_and_above_16384(
+        monkeypatch, capsys):
+    """RED TWIN of the cell above: at n >= the threshold the notice must
+    NOT fire, and the resolved backend must be unchanged by its absence.
+
+    Without this arm the cell above passes on an implementation that
+    announces unconditionally, which would be a different (and wrong)
+    contract: at n >= 16384 the caller is at or past the extrapolated
+    crossover and the notice would be actively misleading.
+    """
+    R = _mock_cuda_capabilities(monkeypatch, nproc=4)
+    mesh = _FakeCudaMesh(2, 2)
+    assert R.resolve_backend("eigh", "cusolvermp", mesh,
+                             n=16384) == "cusolvermp"
+    assert capsys.readouterr().out == ""
+    assert R.resolve_backend("eigh", "distributed", mesh,
+                             n=32768) == "cusolvermp"
+    assert capsys.readouterr().out == ""
+    # ... and with n unknown there is no size to judge, so no notice.
+    assert R.resolve_backend("eigh", "cusolvermp", mesh) == "cusolvermp"
+    assert capsys.readouterr().out == ""
+
+
+def test_resolve_cost_notice_does_not_change_the_resolved_backend(
+        monkeypatch, capsys):
+    """The notice ANNOUNCES, never demotes (promise semantics C7).
+
+    Falsifiable by construction: the same resolve is run twice at the same
+    n, once with the notice armed and once with its dedupe key already
+    burned, and both must return ``'cusolvermp'``.  An implementation that
+    demoted after announcing would return ``'native'`` on the first.
+    """
+    R = _mock_cuda_capabilities(monkeypatch, nproc=4)
+    mesh = _FakeCudaMesh(2, 2)
+    first = R.resolve_backend("eigh", "cusolvermp", mesh, n=256)
+    assert capsys.readouterr().out != ""          # armed: it spoke
+    second = R.resolve_backend("eigh", "cusolvermp", mesh, n=256)
+    assert capsys.readouterr().out == ""          # burned: it did not
+    assert first == second == "cusolvermp" != R.NATIVE
+
+
 @needs_host_ffi
 def test_plan_batched_matches_the_backend_call_cpu():
     """``plan.batched`` on the CPU distributed eigh == the raw wrapper.

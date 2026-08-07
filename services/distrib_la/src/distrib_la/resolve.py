@@ -31,6 +31,13 @@ lives here, applied in ONE fixed order — SEVEN steps, all at resolve time:
     6. divisibility — ``n`` divisible by both mesh axes (only checked
                       when the caller passes ``n``)
 
+After all six pass, an explicit ``eigh`` on cuSOLVERMp below
+:data:`_EIGH_DISTRIBUTED_ANNOUNCE_BELOW` gets a rank-0 COST NOTICE
+(:func:`_announce_eigh_fixed_cost`).  A notice is not a guard: the
+resolution already succeeded and the caller gets exactly the backend they
+named.  It exists because the measured cost of that route is a ~1.55 s
+per-matrix floor that no amount of reading this module would reveal.
+
 PROMISE SEMANTICS ARE LAW.  A returned FFI name means every guard passed:
 the subsequent call cannot fail for an availability or geometry reason.
 Explicit requests REFUSE; only ``auto`` may demote, and it announces on
@@ -52,7 +59,7 @@ from __future__ import annotations
 
 from types import MappingProxyType
 
-from lxkit.gate import mesh_ffi_platform
+from lxkit.gate import announce_once, mesh_ffi_platform
 
 from distrib_la import loader
 
@@ -383,6 +390,80 @@ def _announce_auto_capability_demote(op: str, target: str) -> None:
         f"fail loudly.", flush=True)
 
 
+#: Below this ``n``, an EXPLICIT distributed eigh gets the measured-cost
+#: announcement below.  It is the extrapolated native/cuSOLVERMp crossover
+#: rounded DOWN to a power of two (see :func:`_announce_eigh_fixed_cost`):
+#: the extrapolation is soft, so the threshold is placed where being wrong
+#: costs a line of stdout rather than a suppressed warning.
+_EIGH_DISTRIBUTED_ANNOUNCE_BELOW = 16384
+
+
+def _announce_eigh_fixed_cost(px: int, py: int, n: int) -> None:
+    """Rank-0, once-per-(op, geometry): what the distributed eigh COSTS.
+
+    NOT a demote and never a demote.  The caller asked for cuSOLVERMp
+    explicitly (or via ``distributed``, which is explicit); promise
+    semantics (module docstring, doctrine C7) say they get exactly that.
+    This prints the measurement they would otherwise have to rediscover,
+    and returns.
+
+    THE MEASUREMENT (Perlmutter, jobid 56447670, 4 processes on a real 2x2
+    A100 mesh, complex128, warm medians; ``_reports/perf_gpu2x2_*.json``
+    of the step-6 eigh investigation):
+
+        n         cuSOLVERMp      native replicated     ratio
+        64          1.586 s           0.00149 s         1064x
+        256         1.561 s           0.00412 s          378x
+        1024        1.754 s           0.02662 s           66x
+        2048        1.932 s           0.07275 s           27x
+        4096        2.739 s           0.39550 s          6.9x
+
+    cuSOLVERMp's cost is a FLOOR, not a curve: 99.998% of the ~1.55 s at
+    n=64 is ``cusolverMpSyevd`` itself (``LORRAX_FFI_PROFILE=1`` split:
+    plan 9.6 us, context-cache hit 0.72 us, descriptors + bufferSize
+    <= 0.02 ms).  There is nothing in this package to fix; the charge is
+    inside the library's collective.
+
+    THE CROSSOVER IS AN EXTRAPOLATION AND IS LABELLED AS ONE.  Two fitted
+    power-law exponents over the rows above put the break-even near
+    n ~ 1.9e4 — **4.6x past the largest n anyone measured (4096)**, and
+    sensitive to the fit window (refitting on the last three points alone
+    moves it to ~1.4e4; on all five to ~2.8e4).  What survives every fit
+    is the ORDER: break-even is somewhere in the 10^4 decade, which is
+    also where a single 40 GB device stops holding an n x n complex128
+    matrix plus its eigenvector copy and workspace (~2.7e4).  Read the
+    number as "same decade as the capacity wall", never as 19000.
+
+    AND THE REGIME THAT MATTERS IS UNMEASURED.  Every row above fits on
+    one device, so every row above is a regime where the distributed
+    library has no reason to win.  The case ``distributed`` exists for --
+    a tile too large for one device, or a mesh spanning several nodes --
+    was NOT measured by this investigation: single node, 4 ranks, n<=4096
+    throughout.  MULTI-NODE IS THE LARGEST OPEN GAP in this package's
+    performance record (docs/services/distrib_la.md, "Open measurement
+    gaps").  Nobody should infer from a 1064x loss at n=64 that the
+    library is bad at what it is for.
+    """
+    announce_once(
+        ("distrib_la.resolve", "eigh", "cusolvermp", "fixed-cost", px, py),
+        f"  [distrib_la.resolve] eigh backend 'cusolvermp' on the {px}x{py} "
+        f"mesh: HONORED (explicit requests are never demoted).  Cost "
+        f"notice, once per mesh geometry.  MEASURED: this route costs a "
+        f"FLAT ~1.55 s PER MATRIX at n=64..2048 on a 4-process 2x2 "
+        f"(Perlmutter jobid 56447670) -- 99.998% of it inside "
+        f"cusolverMpSyevd, so it is a floor and not a curve.  The "
+        f"replicated native path (backend 'off'/'auto') was faster at "
+        f"EVERY measured size: 1064x at n=64, 6.9x at n=4096.  You asked "
+        f"at n={int(n)}.  Break-even is EXTRAPOLATED to n ~ 1.9e4 -- 4.6x "
+        f"beyond the largest measured n (4096), from two fitted exponents, "
+        f"so trust the decade and not the digits.  'distributed' eigh is "
+        f"for CAPACITY (a tile too large for one device, or a multi-node "
+        f"mesh), not for speed -- and that regime is UNMEASURED: the "
+        f"investigation was one node, 4 ranks, n<=4096.  If this call is "
+        f"in the fits-on-one-device regime, 'off' is faster; if it is not, "
+        f"you are past where anyone has numbers.", scope="rank0")
+
+
 def resolve_backend(op: str, requested: str, mesh_xy, *,
                     n: int | None = None) -> str:
     """Resolve a requested backend name for ``op`` on ``mesh_xy``.
@@ -582,6 +663,17 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
             f"{op} backend {requested!r} needs n ({n}) divisible by both "
             f"mesh axes ({px}, {py}) — the one-tile-per-rank block-cyclic "
             f"layout has no ragged tiles.  Pad n or change the mesh.")
+
+    # ── the resolution SUCCEEDED; say what it costs ──────────────────
+    # Strictly after every guard, so a refusal is never preceded by a cost
+    # notice about a route the caller is not going to get.  Only when ``n``
+    # is known: with n unknown there is no size to compare against the
+    # crossover, and guessing would make ``list_backends`` (which resolves
+    # every backend with n=None to build a startup report) print this once
+    # per report.
+    if (op == "eigh" and requested == "cusolvermp" and n is not None
+            and int(n) < _EIGH_DISTRIBUTED_ANNOUNCE_BELOW):
+        _announce_eigh_fixed_cost(px, py, int(n))
 
     return requested
 
