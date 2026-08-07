@@ -122,7 +122,7 @@ def test_the_whole_public_surface_answers_with_no_lorrax():
         preamble=(
             "import numpy as np\n"
             "import vcoul as V\n"
-            "assert len(V.__all__) == 27, V.__all__\n"
+            "assert len(V.__all__) == 29, V.__all__\n"
             "for _n in V.__all__:\n"
             "    assert hasattr(V, _n), _n\n"
             "class W:\n"

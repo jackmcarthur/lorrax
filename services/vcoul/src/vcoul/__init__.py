@@ -81,6 +81,8 @@ from vcoul.geometry import CoulombGeometry
 from vcoul.minibz import (
     build_v_head_miniBZ_avg_3d,
     minibz_average,
+    minibz_cell_affine,
+    minibz_frac_to_cart,
     minibz_inscribed_sphere_r2,
     minibz_voronoi_batches,
     sample_minibz_qpoints,
@@ -110,6 +112,7 @@ __all__ = [
     "wrap_points_to_voronoi", "minibz_voronoi_batches",
     "sample_minibz_qpoints", "minibz_inscribed_sphere_r2",
     "minibz_average", "_minibz_kernel_bare", "build_v_head_miniBZ_avg_3d",
+    "minibz_frac_to_cart", "minibz_cell_affine",
     # the sphere predicate
     "fft_box_miller", "bare_coulomb_sphere_mask",
     "bare_coulomb_sphere_indices",

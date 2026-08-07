@@ -15,9 +15,40 @@ Three things live here, and they are three because BerkeleyGW's
 
 THE ROW CONVENTION IS THE WHOLE BALLGAME.  ``bvec`` rows are the
 Cartesian reciprocal vectors, so a fractional draw ``U`` maps to
-Cartesian by ``U @ bvec``.  Every site here uses that spelling; see the
-comment block in :func:`build_v_head_miniBZ_avg_3d` for what the
-transposed spelling costs and why silicon cannot see it.
+Cartesian by ``U @ bvec``.  Since the 2026-08-07 consolidation that map
+exists ONCE, as :func:`minibz_frac_to_cart`, and every draw in this
+module routes through it (the mini-BZ affine likewise through
+:func:`minibz_cell_affine`); see the comment block in
+:func:`build_v_head_miniBZ_avg_3d` for what the transposed spelling cost
+and why silicon cannot see it.
+
+WHAT THE CONSOLIDATION DID AND DID NOT UNIFY.  The 3D body head
+(:func:`build_v_head_miniBZ_avg_3d`) and the q→0 head
+(:func:`minibz_voronoi_batches` + :func:`minibz_average`) were born as
+independent implementations that diverged nine ways (survey
+w1_vcoul.md §1.3).  Consolidated here — single-sourced, geometry only:
+the frac→Cartesian draw map, the mini-BZ affine, and the bare-3D kernel
+(the body head now evaluates through :func:`_minibz_kernel_bare`).
+DELIBERATELY KEPT DIVERGENT, because each would move the frozen
+``si_bse_debug`` reference beyond the 358bb0b fix and the phase allows
+exactly one physics-moving commit (all four are REGISTERED owner
+questions riding the same refreeze):
+
+  =============  =========================  ==========================
+  axis           body head (this file)      q→0 head (this file)
+  =============  =========================  ==========================
+  generator      RandomState(seed=42)       scrambled Sobol, seed=rep
+  estimator      plain mean over all nmc    BGW adaptive N_Q + analytic
+                                            sphere branch, qmc_reps=10
+  Voronoi fold   nmax=1 (hard)              nmax 1 or 3 (BGW ncell=3)
+  volume         × 1/celvol at return       bare; caller divides
+  =============  =========================  ==========================
+
+A fourth copy of the draw GEOMETRY lives in ``bse.vq_interp``
+(rank-parallel ``fold_in`` PRNG, correct spelling); rewiring it onto
+:func:`minibz_frac_to_cart` is registered alongside the estimator
+question rather than done here — its numbers feed BSE fixtures this
+phase must not move.
 
 SCIPY IS QUARANTINED HERE.  It is the service's one optional dependency,
 and the only thing it provides is the scrambled-Sobol generator.  See
@@ -34,12 +65,46 @@ import numpy as np
 
 __all__ = [
     "wrap_points_to_voronoi",
+    "minibz_frac_to_cart",
+    "minibz_cell_affine",
     "minibz_voronoi_batches",
     "sample_minibz_qpoints",
     "minibz_inscribed_sphere_r2",
     "minibz_average",
     "build_v_head_miniBZ_avg_3d",
 ]
+
+
+def minibz_frac_to_cart(U, bvec):
+    """Fractional draw → Cartesian: ``U @ bvec``, and ONLY that spelling.
+
+    ``bvec`` rows are the Cartesian reciprocal vectors, so the row-space
+    product maps the unit cube onto the b1,b2,b3 parallelepiped — a
+    fundamental domain of the reciprocal lattice, which
+    :func:`wrap_points_to_voronoi` then maps measure-preservingly onto
+    the Voronoi cell.  The transposed spelling (``U @ bvec.T``) is NOT a
+    fundamental domain of that lattice and shipped as a three-month bias
+    in the 3D body head (fixed 358bb0b).  Every draw in this module
+    routes through this function so the convention is decidable in
+    exactly one place; it is polymorphic over numpy/jax — the caller's
+    array module performs the matmul, so a numpy caller's bits do not
+    change because a jax caller exists.
+    """
+    return U @ bvec
+
+
+def minibz_cell_affine(bvec, kgrid):
+    """The mini-BZ affine: full-cell Voronoi points → mini-BZ δq offsets.
+
+    ``bvec.T @ diag(1/kgrid) @ inv(bvec.T)`` — scales fractional
+    coordinates by ``1/kgrid`` while staying in Cartesian, so a point
+    wrapped to the FULL reciprocal Voronoi cell becomes an offset in the
+    mini-BZ Voronoi cell.  numpy float64 (single implementation); jax
+    callers ``jnp.asarray`` the (3,3) result.
+    """
+    bvec = np.asarray(bvec, dtype=np.float64)
+    kg = np.asarray([int(s) for s in np.ravel(kgrid)], dtype=np.float64)
+    return bvec.T @ (np.diag(1.0 / kg) @ np.linalg.inv(bvec.T))
 
 #: nsamples the uniform fallback is raised to when Sobol demotes.  BGW's
 #: plain-MC arm needs many more points than a scrambled Sobol sequence for
@@ -149,12 +214,14 @@ def minibz_voronoi_batches(
         refusal, because a refusal here would be a behaviour change on a
         path nothing in the tree exercises.
     """
+    bvec_np = np.asarray(bvec, dtype=np.float64)
     bvec = jnp.asarray(bvec, dtype=jnp.float64)
     nkx, nky, nkz = (int(s) for s in kgrid)
-    randlims = bvec.T @ (
-        jnp.diag(1.0 / jnp.asarray((nkx, nky, nkz), dtype=jnp.float64))
-        @ jnp.linalg.inv(bvec.T)
-    )
+    # Consolidated 2026-08-07: the affine is the shared numpy helper (one
+    # implementation; was a jnp twin of the body head's numpy expression).
+    # Last-ulp move possible (np.linalg.inv vs jnp) — measured, and no
+    # frozen gate reaches this path (every pinned deck overrides the head).
+    randlims = jnp.asarray(minibz_cell_affine(bvec_np, (nkx, nky, nkz)))
 
     want = str(method).lower()
     if want in ("sobol", "auto"):
@@ -167,7 +234,7 @@ def minibz_voronoi_batches(
                 sob = _qmc.Sobol(d=3, scramble=True, seed=rep + int(seed_offset))
                 U = sob.random_base2(m)
                 Uj = jnp.asarray(np.asarray(U, dtype=np.float64))
-                randcart = (bvec.T @ Uj.T).T
+                randcart = minibz_frac_to_cart(Uj, bvec)
                 wrapped = wrap_points_to_voronoi(randcart, bvec, nmax=nmax)
                 rq = (randlims @ wrapped.T).T
                 if is_2d:
@@ -194,7 +261,7 @@ def minibz_voronoi_batches(
     # Uniform fallback (also the path on systems without scipy.stats.qmc)
     key = jax.random.PRNGKey(int(seed_offset))
     randvals = jax.random.uniform(key, (nsamples, 3), dtype=jnp.float64)
-    randcart = (bvec.T @ randvals.T).T
+    randcart = minibz_frac_to_cart(randvals, bvec)
     wrapped = wrap_points_to_voronoi(randcart, bvec, nmax=nmax)
     rq = (randlims @ wrapped.T).T
     if is_2d:
@@ -384,13 +451,15 @@ def build_v_head_miniBZ_avg_3d(
     # normalisation check can see it.  Si FCC is provably blind to the
     # difference (bvec.T = P·bvec, P cyclic ⇒ pure reseed); on non-cubic
     # cells it is a bias worth ~50 % of the whole mc-average correction.
-    # Pinned by tests/test_vcoul_minibz_head_draw.py; matches
-    # minibz_voronoi_batches' draw and bse/vq_interp.py's draw.
-    randcart = (randvals @ bvec)
+    # Pinned by tests/test_vcoul_minibz_head_draw.py; the draw, the affine
+    # and the kernel are the module's shared pieces (2026-08-07
+    # consolidation) — numpy in, numpy out, so the bits are the ones the
+    # 358bb0b refreeze candidate was generated with.
+    randcart = minibz_frac_to_cart(randvals, bvec)      # np: randvals @ bvec
     wrapped = np.asarray(wrap_points_to_voronoi(
         jnp.asarray(randcart), bvec_j, nmax=1))
     kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
-    randlims = bvec.T @ (np.diag(1.0 / kgrid_arr) @ np.linalg.inv(bvec.T))
+    randlims = minibz_cell_affine(bvec, (nkx, nky, nkz))
     dq_cart = (randlims @ wrapped.T).T  # (nmc, 3) mini-BZ offsets in Cartesian
 
     v_head_avg = np.zeros((nkx, nky, nkz), dtype=np.float64)
@@ -404,7 +473,12 @@ def build_v_head_miniBZ_avg_3d(
                 if np.dot(q_cart, q_cart) < 1e-12:
                     v_head_avg[qx, qy, qz] = 0.0  # q=0 head handled separately
                 else:
-                    shifted = q_cart[None, :] + dq_cart  # (nmc, 3)
-                    denom = np.sum(shifted**2, axis=1)
-                    v_head_avg[qx, qy, qz] = np.mean(8.0 * np.pi / denom)
+                    # Shared bare-3D kernel.  For |q+δq|² ≥ 1e-24 (every
+                    # sample at q≠0) the arithmetic is bit-identical to the
+                    # historical inline 8π/Σ(shifted²); the kernel's guard
+                    # additionally maps a pathological exact-hit to 0
+                    # instead of inf.  Estimator unchanged: plain mean.
+                    v, _len2 = _minibz_kernel_bare(
+                        q_cart, dq_cart, kind="bulk_3d")
+                    v_head_avg[qx, qy, qz] = np.mean(v)
     return v_head_avg * (1.0 / float(cell_volume))
