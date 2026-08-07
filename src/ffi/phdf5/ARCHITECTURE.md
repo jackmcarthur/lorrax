@@ -312,8 +312,8 @@ Environment variables, loosely in order of how often you'd touch them:
 | `LORRAX_PHDF5_DEDUP_REPLICAS` | `1` | if `0`, replica ranks all write their identical copy — UB under collective MPI-IO, debugging only |
 | `LORRAX_PHDF5_COLL_META` | `0` | if `1`, re-enable collective metadata ops — default is non-collective (faster everywhere: +100 ms on OpenMPI small writes, required on Cray for n ≥ 16384 C128 writes) |
 | `LORRAX_PHDF5_ALIGN_MB` | `4` | H5Pset_alignment threshold/stride in MiB; `0` disables |
-| `LORRAX_PHDF5_STRIPE_COUNT` | `16` | Lustre stripe count hint via MPI_Info |
-| `LORRAX_PHDF5_STRIPE_SIZE_FS` | `4M` | stripe size hint (`lfs -S` spelling, shared with the Python writers; legacy byte-valued `LORRAX_PHDF5_STRIPE_SIZE` honoured) |
+| `LORRAX_PHDF5_STRIPE_COUNT` | policy: `clamp(world_size, 4, 128)` | Lustre stripe count hint via MPI_Info.  Unset = the same `_stripe_policy` the Python writer resolves (`context.cc::stripe_policy_count`); it was the literal `16` until 2026-08-06 |
+| `LORRAX_PHDF5_STRIPE_SIZE_FS` | policy: 1/2/4 MiB by rank count | stripe size hint (`lfs -S` spelling, shared with the Python writer; legacy byte-valued `LORRAX_PHDF5_STRIPE_SIZE` honoured).  Unset = `context.cc::stripe_policy_unit`, the 1->4 MiB ramp; it was the literal 1 MiB until 2026-08-06 |
 | `LORRAX_PHDF5_CB_NODES` | _unset_ (ROMIO auto) | ROMIO aggregator count when set |
 | `LORRAX_PHDF5_CB_BUFFER_SIZE` | _unset_ (ROMIO auto) | ROMIO collective buffer per aggregator when set |
 | `LORRAX_PHDF5_CB_WRITE` | _unset_ (ROMIO auto) | `romio_cb_write` when set |

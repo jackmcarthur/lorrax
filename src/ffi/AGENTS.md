@@ -147,9 +147,11 @@ Each target's bootstrap + handler flow is self-contained in its `cpp/`:
   non-MPI CAL bootstrap.  `cusolverMpSyevd` on the resulting grid.
 - **phdf5** (`cpp/context.cc`, `cpp/write_ffi.cc`, `cpp/read_ffi.cc`):
   lazy `MPI_Init_thread` on first `open_file`; FAPL cached with
-  `H5Pset_fapl_mpio` + NERSC I/O tuning (`cb_nodes=world_size`,
-  `cb_buffer_size=64M`, `striping_factor=16`, 4 MiB alignment + stripe
-  unit, `H5D_FILL_TIME_NEVER`).  Handler: D2H-to-pinned on a private
+  `H5Pset_fapl_mpio` + I/O tuning (`cb_*` left at ROMIO's automatic
+  policy since 2026-07-27; `striping_factor`/`striping_unit` from
+  `stripe_policy_count`/`_unit`, which transcribe Python's
+  `_stripe_policy(nranks)`; 4 MiB alignment,
+  `H5D_FILL_TIME_NEVER`).  Handler: D2H-to-pinned on a private
   CUDA stream, then blocking `H5Dwrite`/`H5Dread` — host thread parks
   for the IO, XLA's device stream stays free for queued compute.  One
   write/read in flight at a time (shared pinned buffer).

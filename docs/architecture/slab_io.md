@@ -557,17 +557,32 @@ Both striping rows are resolved by ONE pure function, `file_io._slab_io_ffi._str
 > maximum-contention layout). The measurements behind it are recorded above
 > `_stripe_policy` in `src/file_io/_slab_io_ffi.py`.
 >
-> **The policy is Python-side, and that is sufficient -- but read why.**
-> `context.cc:463` is still the literal `"16"`. That literal is the fallback
-> for an UNSET `LORRAX_PHDF5_STRIPE_COUNT`, and on every LORRAX path the
-> variable is set before C++ can read it: `_FfiBackend.__init__` calls
-> `_export_striping_env()` immediately before `_open_file()`, and
-> `_open_file` is the call in which `context.cc` builds the `MPI_Info` and
-> `H5Fcreate` applies the layout. So the two writers agree by construction,
-> and the run log's environment stays a complete description of the layout.
-> The residual trap is narrow and real: a caller that reaches the phdf5 FFI
-> **without** going through `_FfiBackend` gets 16 stripes and no warning.
-> Anything added on that path must export the policy first.
+> **The policy is now on BOTH sides, and the C++ side is UNBUILT.** It
+> used to be Python-only: `context.cc` carried the literals `"16"` and
+> 1 MiB as the fallback for an unset `LORRAX_PHDF5_STRIPE_*`, and on every
+> LORRAX path the variables are set before C++ can read them
+> (`_FfiBackend.__init__` calls `_export_striping_env()` immediately before
+> `_open_file()`, which is the call in which `context.cc` builds the
+> `MPI_Info` and `H5Fcreate` applies the layout). That masked, rather than
+> removed, a real disagreement: a caller reaching `ffi.io.open_file`
+> **without** going through `_FfiBackend` got 16 × 1 MiB and no warning,
+> at any rank count. Two writers requesting *different* layouts is worse
+> than both being wrong the same way, so `context.cc` now derives the
+> layout from `ctx->world_size` via `stripe_policy_count` /
+> `stripe_policy_unit`, which transcribe `_stripe_policy` line for line.
+> `tests/test_slab_io_routing.py::test_cpp_stripe_policy_transcribes_the_python_one`
+> extracts those two functions, compiles them with the host `g++` and diffs
+> them against the Python over 0..4100 ranks.
+>
+> **Not verified, and here is the exact gap:** that test compiles two
+> `static long` functions in isolation. `liblorrax_ffi*.so` has **not been
+> rebuilt** with this change — no cluster, no toolchain, on the branch that
+> made it — so nothing yet shows a deployed library requesting the policy
+> layout. Required before leaning on it: rebuild both libs, then one
+> `lfs getstripe -c -S` readback of a file written through
+> `ffi.io.open_file` with `LORRAX_PHDF5_STRIPE_COUNT` **unset** at a rank
+> count away from 16 (the old literal), which is the only geometry where
+> the two answers differ.
 
 The stripe-size choice, across both geometries (GiB/s write / read):
 

@@ -220,11 +220,21 @@ def test_auto_backend_resolves_to_eager_on_single_process(synth_wfn_path):
 
 
 # ===========================================================================
-#  phdf5_host (CPU host union read + shared on-device unfold) vs eager
-#  bit-equality.  The host read + union + vectorised unfold + G-flat
-#  layout all execute here on a 1x1 CPU mesh (single addressable shard);
-#  the only untested piece is the multi-rank band split, which is the
-#  §5b ``_eager_build_process_local`` idiom (proven separately).
+#  The phdf5 collective read's on-device unfold tail, vs eager.
+#
+#  ``_phdf5_unfold_and_shard`` is the only part of the phdf5 backend that
+#  runs without an FFI ``.so``: it takes the re/im-packed IBZ union buffer
+#  the C++ read would have produced and turns it into G-flat ψ.  Feeding
+#  it a union buffer built here with plain h5py pins that kernel against
+#  ``_eager_build`` on a 1x1 mesh (single addressable shard).  Untested
+#  here: the collective read itself, and the multi-rank band split —
+#  those are `tests/bench/wfn_loader_backend_parity_test.py` on hardware.
+#
+#  (This test used to run through the ``phdf5_host`` BACKEND, deleted
+#  2026-08-06 — it was the eager backend's own POSIX h5py transport with
+#  this kernel bolted on, i.e. a duplicate compute path auto-selected by
+#  a missing .so.  The kernel it covered is real, so the coverage stays
+#  and only the tier goes.)
 # ===========================================================================
 def _mesh_1x1():
     import jax
@@ -233,9 +243,23 @@ def _mesh_1x1():
     return Mesh(devs, ("x", "y"))
 
 
+def _union_buffer_for_ibz(loader, b_lo, b_hi, ibz_unique_sorted, ngkmax):
+    """The ``(nb, ns, n_reads, ngkmax, 2)`` f64 buffer the C++ union read
+    delivers, built here with the plain h5py handle."""
+    ns = int(loader.nspinor)
+    n_reads = len(ibz_unique_sorted)
+    buf = np.zeros((b_hi - b_lo, ns, n_reads, ngkmax, 2), dtype=np.float64)
+    for r, ibz in enumerate(ibz_unique_sorted):
+        start = int(loader._kpt_starts[int(ibz)])
+        ngk = int(loader.ngk[int(ibz)])
+        buf[:, :, r, :ngk, :] = loader._coeffs_ds[
+            b_lo:b_hi, :, start:start + ngk, :]
+    return buf
+
+
 @pytest.mark.parametrize("bands", [(0, 6), (2, 5)])
-def test_phdf5_host_matches_eager_ibz(synth_wfn_path, bands):
-    """Raw IBZ read parity: phdf5_host host union read == eager h5py read.
+def test_phdf5_unfold_kernel_matches_eager_ibz(synth_wfn_path, bands):
+    """Raw IBZ parity: the on-device unfold tail == the eager h5py read.
 
     Restricted to ``k='ibz'``.  The tiny synth WFN builds a *degenerate*
     ``SymMaps`` whose ``sym_mats_k`` is length ``ntran`` rather than the
@@ -244,26 +268,92 @@ def test_phdf5_host_matches_eager_ibz(synth_wfn_path, bands):
     ``full_bz`` unfold parity is covered by the real-symmetry WFNsmall
     htransform regression, not this fixture.
     """
-    from jax.sharding import PartitionSpec as P
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
     mesh = _mesh_1x1()
-    # ``load(sharding=...)`` takes a PartitionSpec; the loader wraps it in
-    # a NamedSharding against its own mesh.
     shard = P(None, ("x", "y"), None, None)
+    b_lo, b_hi = bands
     with WfnLoader(synth_wfn_path, mesh=mesh, backend="eager") as le:
         ref = np.asarray(le.load(bands=bands, k="ibz", sharding=shard))
-    with WfnLoader(synth_wfn_path, mesh=mesh, backend="phdf5_host") as lh:
-        assert lh.backend == "phdf5_host"
-        got = np.asarray(lh.load(bands=bands, k="ibz", sharding=shard))
+
+        k_idxs, unfold = le._resolve_k("ibz")
+        assert not unfold
+        ibz_unique_sorted, n_reads, position_in_reads, n_k = le._kplan(
+            k_idxs, unfold)
+        ngkmax = int(le.ngkmax)
+        buf = _union_buffer_for_ibz(
+            le, b_lo, b_hi, ibz_unique_sorted, ngkmax)
+        cnk_at_ibz = jax.device_put(
+            buf, NamedSharding(mesh, P(("x", "y"), None, None, None, None)))
+        got = np.asarray(le._phdf5_unfold_and_shard(
+            cnk_at_ibz, k_idxs=k_idxs, unfold=unfold, n_reads=n_reads,
+            n_k=n_k, bands_per_rank=b_hi - b_lo, ns=int(le.nspinor),
+            ngkmax=ngkmax, position_in_reads=position_in_reads,
+            out_sharding=NamedSharding(mesh, shard)))
     assert got.shape == ref.shape
-    # Same numpy read + identical layout ⇒ bit-identical.
+    # Same numpy bytes + identical layout ⇒ bit-identical.
     np.testing.assert_allclose(got, ref, rtol=0, atol=0)
 
 
 def test_env_forces_backend(synth_wfn_path, monkeypatch):
-    monkeypatch.setenv("LORRAX_WFN_BACKEND", "phdf5_host")
+    monkeypatch.setenv("LORRAX_WFN_BACKEND", "eager")
     mesh = _mesh_1x1()
     with WfnLoader(synth_wfn_path, mesh=mesh, backend="auto") as loader:
-        assert loader.backend == "phdf5_host"
+        assert loader.backend == "eager"
+
+
+def test_no_ffi_at_P_gt_1_refuses_and_names_both_libraries(monkeypatch):
+    """The tier that WAS here is now a refusal, per decisions.md 2026-08-01.
+
+    Runs the resolver with ``jax.process_count`` monkeypatched to 4 on a
+    tree with no ``.so`` (which is this checkout — see the paths in the
+    message), so it reaches the terminal arm.  Asserts the refusal quotes
+    ``probe_target``'s reason for BOTH platforms and names the escape
+    hatch: a refusal that does not say what to do is a different defect.
+
+    NOT covered here: that the phdf5 backend then works when a library
+    IS present — that needs an FFI build (`tests/bench/…parity_test.py`).
+    """
+    import jax
+    from file_io.wfn_loader import WfnLoader as _WL
+    stub = _WL.__new__(_WL)
+    stub._mesh = _mesh_1x1()
+    monkeypatch.delenv("LORRAX_WFN_BACKEND", raising=False)
+    monkeypatch.setattr(jax, "process_count", lambda: 4)
+    with pytest.raises(RuntimeError) as ei:
+        stub._auto_pick_backend()
+    msg = str(ei.value)
+    assert "liblorrax_ffi.so" in msg and "liblorrax_ffi_host.so" in msg
+    assert "LORRAX_WFN_BACKEND=eager" in msg
+    assert "phdf5_host" in msg          # says what was removed, not just that
+
+
+def test_deleted_phdf5_host_tier_refuses_rather_than_resolving_elsewhere():
+    """A deleted backend spelling must not silently become another one.
+
+    Both doors: the constructor argument and the env escape hatch.  If
+    either resolved to 'eager' or 'phdf5' instead, an operator's A/B
+    would measure the arm they did not ask for — which is the failure
+    the `screening_method = ctsp` ruling names (decisions.md 2026-08-06).
+    """
+    import os
+    with pytest.raises(ValueError, match="deleted"):
+        WfnLoader("/nonexistent/WFN.h5", backend="phdf5_host")
+
+    # The env door, exercised on the pure resolver (no file needed).
+    from file_io.wfn_loader import WfnLoader as _WL
+    stub = _WL.__new__(_WL)
+    stub._mesh = _mesh_1x1()
+    old = os.environ.get("LORRAX_WFN_BACKEND")
+    os.environ["LORRAX_WFN_BACKEND"] = "phdf5_host"
+    try:
+        with pytest.raises(ValueError, match="deleted"):
+            stub._auto_pick_backend()
+    finally:
+        if old is None:
+            os.environ.pop("LORRAX_WFN_BACKEND", None)
+        else:
+            os.environ["LORRAX_WFN_BACKEND"] = old
 
 
 # ===========================================================================
@@ -279,14 +369,35 @@ from file_io.wfn_loader import _build_phdf5_clamped_counts
 # Unit-level: the clamp formula.
 # ---------------------------------------------------------------------------
 
+def _kstarts(ngk_per_read):
+    """Exclusive prefix sum + total, as ``_phdf5_build`` passes them."""
+    starts, acc = [], 0
+    for n in ngk_per_read:
+        starts.append(acc)
+        acc += int(n)
+    return tuple(starts), acc
+
+
+def _counts(*, world, bands_per_rank, b_lo_logical, band_extent,
+            ngk_per_ibz_read, ns, ngktot=None):
+    starts, tot = _kstarts(ngk_per_ibz_read)
+    return _build_phdf5_clamped_counts(
+        world=world, bands_per_rank=bands_per_rank,
+        b_lo_logical=b_lo_logical, band_extent=band_extent,
+        n_reads=len(ngk_per_ibz_read),
+        ngk_per_ibz_read=tuple(ngk_per_ibz_read),
+        kchunk_start_per_read=starts,
+        ngktot=tot if ngktot is None else ngktot,
+        ns=ns,
+    ).reshape(world, len(ngk_per_ibz_read), 4)
+
+
 def test_clamp_in_extent_passthrough():
-    """When the request fits in mnband, every rank gets the full
+    """When the request fills the window exactly, every rank gets the full
     bands_per_rank — no clamping."""
-    # world=16, bands_per_rank=4 → 64 bands, mnband=64 ⇒ all ranks fit.
-    counts = _build_phdf5_clamped_counts(
-        world=16, bands_per_rank=4, b_lo_logical=0, mnband_file=64,
-        n_reads=2, ngk_per_ibz_read=(50, 60), ns=2,
-    ).reshape(16, 2, 4)
+    # world=16, bands_per_rank=4 → 64 bands, window ends at 64 ⇒ all fit.
+    counts = _counts(world=16, bands_per_rank=4, b_lo_logical=0,
+                     band_extent=64, ngk_per_ibz_read=(50, 60), ns=2)
     assert (counts[:, :, 0] == 4).all(), "every rank gets bands_per_rank=4"
     # Other axes copied through:
     assert (counts[:, :, 1] == 2).all()
@@ -298,51 +409,42 @@ def test_clamp_in_extent_passthrough():
 def test_clamp_bispinor_16gpu_regression():
     """The exact case that crashed the bispinor 16-GPU gate.
 
-    world=16, mnband=86, bands_per_rank=6 (band-pad 96).
+    world=16, window end 86, bands_per_rank=6 (band-pad 96).
     Rank 14: offset 0+14*6=84 → count min(6, 86-84)=2.
-    Rank 15: offset 0+15*6=90 → past EOF, count=0.
+    Rank 15: offset 0+15*6=90 → past the window, count=0.
     Ranks 0..13: full count=6.
     """
-    counts = _build_phdf5_clamped_counts(
-        world=16, bands_per_rank=6, b_lo_logical=0, mnband_file=86,
-        n_reads=3, ngk_per_ibz_read=(100, 110, 120), ns=2,
-    ).reshape(16, 3, 4)
+    counts = _counts(world=16, bands_per_rank=6, b_lo_logical=0,
+                     band_extent=86, ngk_per_ibz_read=(100, 110, 120), ns=2)
     for r in range(14):
         assert (counts[r, :, 0] == 6).all(), \
             f"rank {r} should have band_cnt=6, got {counts[r, :, 0].tolist()}"
-    # Rank 14: straddles EOF.
+    # Rank 14: straddles the end.
     assert (counts[14, :, 0] == 2).all()
-    # Rank 15: fully past EOF.
+    # Rank 15: fully past it.
     assert (counts[15, :, 0] == 0).all()
 
 
 def test_clamp_extreme_zero_avail():
-    """All ranks past EOF (degenerate) ⇒ all band_cnt=0."""
-    counts = _build_phdf5_clamped_counts(
-        world=4, bands_per_rank=10, b_lo_logical=100, mnband_file=50,
-        n_reads=1, ngk_per_ibz_read=(20,), ns=2,
-    ).reshape(4, 1, 4)
+    """All ranks past the window (degenerate) ⇒ all band_cnt=0."""
+    counts = _counts(world=4, bands_per_rank=10, b_lo_logical=100,
+                     band_extent=50, ngk_per_ibz_read=(20,), ns=2)
     assert (counts[:, :, 0] == 0).all()
 
 
 def test_clamp_with_b_lo_offset():
-    """b_lo > 0 shifts each rank's window; clamp must respect it."""
+    """b_lo > 0 shifts each rank's window; the clip must respect it."""
     # bands (10, 30) ⇒ nb_logical=20, world=4 ⇒ bands_per_rank=5.
     # Rank 0: off=10+0*5=10, count=5. Rank 1: off=15, count=5.
     # Rank 2: off=20, count=5. Rank 3: off=25, count=min(5,30-25)=5.
-    # All fit in mnband=30.
-    counts = _build_phdf5_clamped_counts(
-        world=4, bands_per_rank=5, b_lo_logical=10, mnband_file=30,
-        n_reads=1, ngk_per_ibz_read=(40,), ns=1,
-    ).reshape(4, 1, 4)
+    counts = _counts(world=4, bands_per_rank=5, b_lo_logical=10,
+                     band_extent=30, ngk_per_ibz_read=(40,), ns=1)
     assert (counts[:, :, 0] == 5).all(), \
         f"all 5, got {counts[:, 0, 0].tolist()}"
 
-    # Same but mnband only 28: rank 3 reads [25, 28), count=3.
-    counts2 = _build_phdf5_clamped_counts(
-        world=4, bands_per_rank=5, b_lo_logical=10, mnband_file=28,
-        n_reads=1, ngk_per_ibz_read=(40,), ns=1,
-    ).reshape(4, 1, 4)
+    # Same but the window ends at 28: rank 3 reads [25, 28), count=3.
+    counts2 = _counts(world=4, bands_per_rank=5, b_lo_logical=10,
+                      band_extent=28, ngk_per_ibz_read=(40,), ns=1)
     assert counts2[0, 0, 0] == 5
     assert counts2[1, 0, 0] == 5
     assert counts2[2, 0, 0] == 5
@@ -351,14 +453,11 @@ def test_clamp_with_b_lo_offset():
 
 def test_clamp_shape_and_axes():
     """Result shape ``(world * n_reads, 4)`` with proper axis values."""
-    world, n_reads, ns = 8, 4, 2
+    world, ns = 8, 2
     ngk_list = (5, 7, 9, 11)
-    counts = _build_phdf5_clamped_counts(
-        world=world, bands_per_rank=3, b_lo_logical=0, mnband_file=24,
-        n_reads=n_reads, ngk_per_ibz_read=ngk_list, ns=ns,
-    )
-    assert counts.shape == (world * n_reads, 4)
-    counts_r = counts.reshape(world, n_reads, 4)
+    counts_r = _counts(world=world, bands_per_rank=3, b_lo_logical=0,
+                       band_extent=24, ngk_per_ibz_read=ngk_list, ns=ns)
+    assert counts_r.reshape(-1, 4).shape == (world * len(ngk_list), 4)
     # Spinor axis: all entries ns.
     assert (counts_r[:, :, 1] == ns).all()
     # G axis: per-ki value.
@@ -366,6 +465,79 @@ def test_clamp_shape_and_axes():
         assert (counts_r[:, ki, 2] == ngk).all()
     # Re/im axis: always 2.
     assert (counts_r[:, :, 3] == 2).all()
+
+
+# ---------------------------------------------------------------------------
+# The divergence the duplicated clamp was hiding.
+# ---------------------------------------------------------------------------
+#
+# ``_build_phdf5_clamped_counts`` used to clip the band axis to ``mnband``
+# (the FILE extent) while ``_eager_build`` / ``_eager_build_process_local``
+# clip to ``b_hi`` (the LOGICAL window) and zero the rest.  Since
+# ``WfnLoader.load`` refuses ``b_hi > mnband``, the file clip is never the
+# tighter of the two: it fires only past EOF, and NOT on the band-pad rows
+# between ``b_hi`` and ``b_lo + nb_padded``.  Those rows therefore came
+# back holding real file bands on the phdf5 backend and zeros on the eager
+# one — a break of both the documented padding contract ("Band axis pad
+# rows are zero-filled") and the P2 byte-identity contract, invisible to a
+# parity run whose band count happens to divide the world size.
+
+@pytest.mark.parametrize(
+    "world, bpr, b_lo, b_hi, mnband",
+    [
+        (4, 3, 0, 10, 20),     # nb_padded 12, pad rows 10,11 well inside file
+        (16, 1, 0, 4, 64),     # the parity harness's default --bands 0,4 @ 4x4
+        (4, 3, 5, 15, 40),     # b_lo offset, nb_padded 12, pad rows 10,11
+        (2, 4, 0, 8, 8),       # exactly divisible: no pad rows, nothing clipped
+    ],
+)
+def test_band_pad_rows_get_no_file_data(world, bpr, b_lo, b_hi, mnband):
+    """Per-rank band counts must sum to the LOGICAL band count.
+
+    Positive control, RUN: replaying the old ``min(bpr, mnband - off)``
+    clip over these four rows gives sums 12, 16, 12 and 8 against the
+    logical 10, 4, 10 and 8 — so the first three rows return False under
+    the pre-fix helper and only the exactly-divisible row (the geometry
+    the parity harness tends to use, which is why this went unseen)
+    agrees either way.
+    """
+    counts = _counts(world=world, bands_per_rank=bpr, b_lo_logical=b_lo,
+                     band_extent=min(b_hi, mnband),
+                     ngk_per_ibz_read=(11, 13), ns=2)
+    # counts[r, ki, 0] is the same for every ki; take read 0.
+    assert int(counts[:, 0, 0].sum()) == b_hi - b_lo
+    # ...and no rank that reads anything may reach past the window.  A
+    # rank whose whole block is past it gets count 0 and selects nothing,
+    # which is the pad-row semantics, not an overrun.
+    for r in range(world):
+        cnt = int(counts[r, 0, 0])
+        if cnt:
+            assert b_lo + r * bpr + cnt <= b_hi
+
+
+def test_clamp_agrees_with_the_slab_io_clip_on_every_dim():
+    """Every counts row equals ``_derive_valid_shape`` of that rank's
+    slab/offset/logical triple — on ALL FOUR dims, not just the band one.
+
+    SCOPE, stated because it is narrower than the name suggests: this is
+    a VALUE-equivalence check, not a no-second-copy check.  Re-inlining
+    an *equivalent* clip here passes it (measured: it does).  What it
+    catches is a re-inline that DIVERGES — which is what happened, on the
+    band axis, for as long as the two spellings coexisted.  The
+    structural half is ``test_helper_delegates_the_clip``.
+    """
+    from file_io._slab_io_ffi import _derive_valid_shape
+    world, bpr, b_lo, band_extent, ns = 5, 3, 2, 11, 2
+    ngk = (11, 13, 17)
+    starts, ngktot = _kstarts(ngk)
+    counts = _counts(world=world, bands_per_rank=bpr, b_lo_logical=b_lo,
+                     band_extent=band_extent, ngk_per_ibz_read=ngk, ns=ns)
+    for r in range(world):
+        for ki in range(len(ngk)):
+            assert tuple(int(v) for v in counts[r, ki]) == _derive_valid_shape(
+                (bpr, ns, ngk[ki], 2),
+                (b_lo + r * bpr, 0, starts[ki], 0),
+                (band_extent, ns, ngktot, 2))
 
 
 # ---------------------------------------------------------------------------
@@ -396,3 +568,22 @@ def test_helper_is_used_by_phdf5_build():
         "_phdf5_build no longer calls the per-rank clamp helper"
     assert "count_partition_spec" in src, \
         "_phdf5_build no longer requests sharded counts"
+
+
+def test_helper_delegates_the_clip():
+    """The clip ARITHMETIC must not be respelled in this module.
+
+    The structural half of the pair above: a value check cannot tell an
+    equivalent re-inline from the shared helper, and an equivalent
+    re-inline is how the two spellings started before they diverged.
+    String check, brittle by design — renaming ``_derive_valid_shape``
+    must force a look at this call site.
+    """
+    import inspect
+    import file_io.wfn_loader as wm
+    src = inspect.getsource(wm._build_phdf5_clamped_counts)
+    assert "_derive_valid_shape" in src, \
+        ("_build_phdf5_clamped_counts no longer delegates to SlabIO's "
+         "_derive_valid_shape — the padded-slab clip has been respelled "
+         "here, which is exactly how the band bound drifted from b_hi to "
+         "mnband last time")

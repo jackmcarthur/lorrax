@@ -254,16 +254,12 @@ def _stripe_size_bytes(nranks: int | None = None) -> int:
 def _export_striping_env(nranks: int | None = None) -> tuple[int, int]:
     """Materialise the resolved striping into ``os.environ``; return it.
 
-    WHY THIS EXISTS, and why it is not spooky action.  There are two
-    writers of the same files and they take the hints by two different
-    routes: the Python writer builds an ``MPI_Info`` itself
-    (``_slab_io_mpi_host._mpi_io_hints``), while the FFI writer's hints
-    are built in C++ (``ffi/cpp/phdf5/context.cc``) whose ONLY input is
-    ``getenv``.  A policy that is a function of the rank count cannot be
-    a C++ string literal, and the C++ has no other channel from Python —
-    ``ffi.io.open_file`` passes a path, a mesh and a mode.  So the
-    resolved values are written back into the environment before
-    ``open_file``, which is the channel that already exists.
+    WHY THIS EXISTS, and why it is not spooky action.  The FFI writer's
+    hints are built in C++ (``ffi/cpp/phdf5/context.cc``) whose only
+    input from an operator is ``getenv``: ``ffi.io.open_file`` passes a
+    path, a mesh and a mode, so an explicit ``LORRAX_PHDF5_STRIPE_*``
+    override has no other channel.  Exporting the resolved values before
+    ``open_file`` is that channel.
 
     Consequences, deliberately:
 
@@ -275,10 +271,20 @@ def _export_striping_env(nranks: int | None = None) -> tuple[int, int]:
     * the value is visible to anything that dumps ``os.environ`` in a run
       log, instead of being implicit in a library nobody can grep.
 
-    The C++ literal default (``"16"``) survives only for a caller that
-    opens a phdf5 context without going through ``file_io`` — no in-tree
-    caller does.  Registered in KNOWN_LORRAX_ISSUES.md so the duplicate
-    default is not forgotten.
+    WHAT THIS IS NO LONGER DOING (2026-08-06).  It used to be the ONLY
+    thing keeping the two writers on one layout: with the variable unset,
+    ``context.cc`` fell back to the literals ``"16"`` and 1 MiB while
+    :func:`_stripe_policy` resolved ``clamp(nranks, 4, 128)`` and the
+    1→4 MiB ramp, and the disagreement was masked purely by the fact
+    that ``_FfiBackend.__init__`` calls this immediately before
+    ``_open_file()``.  A caller reaching ``ffi.io.open_file`` DIRECTLY
+    got the old constants, silently.  The C++ now derives the same
+    policy from ``ctx->world_size`` (``stripe_policy_count`` /
+    ``stripe_policy_unit`` there transcribe ``_stripe_policy`` here, and
+    ``tests/test_slab_io_routing.py`` compiles them and diffs the two
+    over 0..4100 ranks), so the agreement is by construction and this
+    function is back to being only what its name says: the operator
+    override's channel to C++, and a run log's record of the layout.
     """
     count = _stripe_count(nranks)
     unit = _stripe_size_bytes(nranks)
