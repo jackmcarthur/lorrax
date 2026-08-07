@@ -86,7 +86,12 @@ from common.collectives import (barrier, device_count,
                                 psum_replicate, resolve_mesh)
 from common.wfn_transforms import load_kpoint_fftbox_local
 import common.timing as timing
-from file_io import WfnLoader as WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from file_io.kin_ion import HARTREE_DATASET
 from gw.gw_config import read_lorrax_input as read_cohsex_input
 from psp.pseudos import load_pseudopotentials, build_atom_pp_assignments
@@ -875,7 +880,7 @@ def main(argv=None):
     # did this, dipole/kin-ion/kmeans did not).
     mesh_xy = RUNTIME.mesh
     with timing.section("load_wfn"):
-        wfn = WFNReader(wfn_path)
+        wfn = WfnLoader(wfn_path)
         wfn.adopt_mesh(mesh_xy)
         sym = symmetry_maps.SymMaps(wfn)
 

@@ -207,10 +207,12 @@ def _symmetry_reduced_q_list(input_file: str) -> np.ndarray:
     """Symmetry-reduced (IBZ) q-grid points as integer kgrid steps ``(n_q, 3)``,
     from the ONE canonical ``SymMaps`` table (``q_irr_kgrid_int``); no new sym
     helper.  Row 0 is Γ = (0,0,0)."""
-    from file_io import WfnLoader as WFNReader
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
     from common.symmetry_maps import SymMaps
     from .bse_io import _parse_wfn_path
-    wfn = WFNReader(_parse_wfn_path(input_file))
+    wfn = WfnLoader(_parse_wfn_path(input_file))
     sym = SymMaps(wfn)
     return np.asarray(sym.q_irr_kgrid_int, dtype=int)
 

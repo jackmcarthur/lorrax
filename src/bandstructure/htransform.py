@@ -21,7 +21,12 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.shard_map import shard_map
 from functools import partial
 
-from file_io import WfnLoader as WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from common import symmetry_maps
 from common import Meta
 from common import rank_criterion
@@ -1018,7 +1023,7 @@ def setup_wfn_and_sym(wfn_file: str, mesh_xy: Mesh | None = None):
     # (the collective phdf5 FFI read, on GPU or the CUDA-free host lib),
     # band-sharding ψ instead of replicating the whole WFN on every rank.
     # Single-process / no-mesh transparently stays eager.
-    wfn = WFNReader(wfn_file, mesh=mesh_xy)
+    wfn = WfnLoader(wfn_file, mesh=mesh_xy)
     sym = symmetry_maps.SymMaps(wfn)
     return wfn, sym
 

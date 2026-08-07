@@ -55,9 +55,14 @@ import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 from file_io import (
-    WFNReader,
     load_kin_ion_submatrix, load_centroids,
 )
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from common import Meta, RYD_TO_EV, symmetry_maps
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
@@ -241,7 +246,7 @@ def main(argv=None):
 	)
 
 	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
-	wfn = WFNReader(config.paths.wfn_file, mesh=mesh_xy)
+	wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
 	sym = symmetry_maps.SymMaps(wfn)
 	_, centroid_indices, n_rmu = load_centroids(config.paths.centroids_file, wfn.fft_grid)
 	tmp_dir = os.path.join(input_dir, "tmp")
