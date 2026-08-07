@@ -340,33 +340,49 @@ def test_env_forces_backend(synth_wfn_path, monkeypatch):
 def test_no_ffi_at_P_gt_1_refuses_and_names_both_libraries(monkeypatch):
     """The tier that WAS here is now a refusal, per decisions.md 2026-08-01.
 
-    Runs the resolver with ``jax.process_count`` monkeypatched to 4 on a
-    tree with no ``.so`` (which is this checkout — see the paths in the
-    message), so it reaches the terminal arm.  Asserts the refusal quotes
-    ``probe_target``'s reason for BOTH platforms and names the escape
-    hatch: a refusal that does not say what to do is a different defect.
+    Runs the resolver with ``jax.process_count`` monkeypatched to 4 so it
+    reaches the terminal arm, and asserts the refusal quotes the read
+    door's reason for BOTH platforms and names the escape hatch: a
+    refusal that does not say what to do is a different defect.
 
-    NOT covered here: that the phdf5 backend then works when a library
-    IS present — that needs an FFI build (leg L-c).
+    THE SECOND DECLARED CHANGE to a moved cell (see the module docstring
+    for the first).  As written, this cell reached the terminal arm
+    because "this checkout has no ``.so``" — true on a laptop and FALSE
+    on Perlmutter, where BUILD_NOTES pins both libraries and the resolver
+    would return ``'phdf5'`` and the cell would report DID NOT RAISE.  A
+    cell that only fires on machines WITHOUT the library is exactly the
+    evaporated coverage this suite's skip-honesty gate exists to catch,
+    and it is the cluster leg that most needs the refusal text to be
+    right.  So the probe is now an INPUT: both platforms report absent
+    with their own reason string, on every machine, and what is asserted
+    is the message — which is the cell's actual claim.  On a machine with
+    no ``.so`` the real probe produces the identical arm.
+
+    NOT covered here: that the phdf5 backend then works when a library IS
+    present — that needs an FFI build (leg L-c).
     """
     import jax
+    from file_io import slab_io
     stub = WfnLoader.__new__(WfnLoader)
     stub._mesh = _mesh_1x1()
     monkeypatch.delenv("LORRAX_WFN_BACKEND", raising=False)
     monkeypatch.setattr(jax, "process_count", lambda: 4)
-    try:
+    monkeypatch.setattr(
+        slab_io, "probe_read_availability",
+        lambda plat=None: (False, (
+            "Could not locate liblorrax_ffi.so (platform=CUDA)"
+            if plat == "CUDA"
+            else "Could not locate liblorrax_ffi_host.so (platform=cpu)")))
+    with pytest.raises(RuntimeError) as ei:
         stub._auto_pick_backend()
-    except RuntimeError as exc:
-        msg = str(exc)
-    else:
-        pytest.skip(
-            "this machine HAS an FFI library that can serve the collective "
-            "WFN read, so the terminal refusal arm is unreachable here — it "
-            "is covered by any leg without the .so, and the arm this machine "
-            "does reach (phdf5 actually working) is leg L-c")
+    msg = str(ei.value)
     assert "liblorrax_ffi.so" in msg and "liblorrax_ffi_host.so" in msg
     assert "LORRAX_WFN_BACKEND=eager" in msg
     assert "phdf5_host" in msg          # says what was removed, not just that
+    # ...and it asked BOTH platforms before refusing, in that order: a
+    # ladder that stopped at the first no would refuse on a CUDA-less
+    # node that has a perfectly good host library.
+    assert msg.index("CUDA") < msg.index("cpu:")
 
 
 def test_deleted_phdf5_host_tier_refuses_rather_than_resolving_elsewhere():

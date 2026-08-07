@@ -131,15 +131,24 @@ DECKS = {
     "si_cohsex":    ("tests/regression/si_cohsex_debug/WFN.h5", 8, 62, 588, 537),
 }
 
-#: The reason string a deck-dependent cell skips with when the monorepo is
-#: not around it.  It contains ``no monorepo`` so that lxkit's UNIVERSAL
-#: allowed-skip row matches it, and this service's own gate
-#: (``test_wfn_loader_skip_honesty.py``) turns it into a FAILURE on any
-#: machine whose profile promises the fixtures.
-NO_DECK = ("no monorepo fixture tree beside this service (a standalone "
-           "install has no tests/regression/), so the hostile deck {name!r} "
-           "at {path!r} is absent — covered by the monorepo run and by leg "
-           "L-c (srun -n 4 on the checked-in gnppm deck)")
+#: The reason string a deck-dependent cell skips with when the monorepo
+#: fixture tree is not around it.
+#:
+#: THE WORDING IS LOad-BEARING and it cost a red red-twin to get right.
+#: It must NOT contain the phrases ``no monorepo`` or ``no lorrax src/``:
+#: those are lxkit UNIVERSAL allowed-skip rows, present in EVERY profile
+#: including Perlmutter's, and ``_skip_is_allowed`` matches by SUBSTRING.
+#: A reason worded to piggyback on the universal row would be allowed on
+#: Perlmutter no matter what this service's own allowlist did — i.e. the
+#: one machine that MUST have the fixtures would be the one machine where
+#: their absence could not be detected.  So it says ``checked-in deck
+#: absent``, which only this service's ``_ALLOWED`` matches, and
+#: ``test_wfn_loader_skip_honesty._allowed_for`` removes that row on
+#: Perlmutter.
+NO_DECK = ("checked-in deck absent: the hostile deck {name!r} is not at "
+           "{path!r} (a standalone install has no tests/regression/) — "
+           "covered by the monorepo run and by leg L-c (srun -n 4 on the "
+           "checked-in gnppm deck)")
 
 
 def deck_path(name: str) -> str | None:
@@ -212,6 +221,29 @@ def outcomes() -> dict:
 def collected() -> frozenset:
     """Every nodeid collected from this directory in this session."""
     return frozenset(_COLLECTED)
+
+
+@pytest.fixture
+def no_deck_reason() -> str:
+    """The exact skip text a missing deck produces, for the gate's twin.
+
+    The gate's red twin asserts that Perlmutter does NOT allow this
+    string.  Retyping it there would let the two drift and the twin would
+    then be proving something about a string nobody emits.
+    """
+    return NO_DECK.format(name="gnppm",
+                          path=os.path.join(_REPO, DECKS["gnppm"][0]))
+
+
+@pytest.fixture
+def deck_resolver():
+    """:func:`deck_path` itself, for the gate that asserts a deck resolves.
+
+    A fixture rather than an import for the reason spelled out on
+    ``observed_outcomes``: three directories in this monorepo have a
+    module called ``conftest``.
+    """
+    return deck_path
 
 
 @pytest.fixture
