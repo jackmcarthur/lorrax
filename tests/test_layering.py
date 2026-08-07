@@ -21,7 +21,8 @@ reason; this file is the same content in a form that fails.
 
 WHAT "THE TREE" MEANS SINCE THE SERVICE PHASE.  The scan covers ``src/``
 **and every ``services/*/src``** (:data:`ROOTS`).  A one-root scan would not
-have failed when the linalg stack moved out of ``src/ffi/linalg`` — it would
+have failed when the linalg stack moved out of ``src/ffi/linalg`` (now
+deleted) — it would
 have gone on passing while measuring 37 fewer files, which is coverage
 evaporating silently, the exact shape this file exists to prevent.  Module
 names are root-RELATIVE, so ``services/lxkit/src/lxkit/gate.py`` is
@@ -150,10 +151,16 @@ _L3_PACKAGES = ("ffi", "lxkit", "distrib_la")
 #: L2 by module.  Whole packages are in ``_L2_PACKAGES``.
 _L2_MODULES = frozenset({
     "common.minimax",          # minimax quadrature: a Remez problem
-    "common.cholesky_2d",      # blocked Cholesky of an arbitrary SPD matrix
     "common.rank_criterion",   # the pseudo-inverse truncation criterion
     "centroid.kmeans_isdf",    # density-weighted Lloyd loop under a metric
 })
+# ``common.cholesky_2d`` was here.  It is ``distrib_la``'s ``native2d``
+# backend now, so the L2-vs-L3 conflict layers.md:196-200 records
+# (blocked Cholesky is mathematics, but it is distributed mathematics)
+# dissolved by extraction rather than by a ruling: it left src/ entirely,
+# and inside the service it is L3 like the rest of the package.
+# ``test_every_module_in_the_map_exists`` is what forced this line to be
+# deleted at the right moment instead of rotting into a phantom.
 _L2_PACKAGES = ("solvers", "mixing")
 
 
@@ -1177,18 +1184,26 @@ def test_every_package_in_the_map_exists(sources):
 _SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la"}
 
 #: ``src/`` module -> how many past-the-door edges it is allowed.  These are
-#: the transitional re-export shims, and every one of them is deleted by the
-#: replumb (each says so in its own docstring).
+#: the transitional re-export shims.
+#:
+#: WAS 45 EDGES ACROSS 9 MODULES before the replumb (step 3).  Six of the
+#: nine are deleted: ``ffi.linalg.{plan,resolve,dispatch,_slate,_scalapack}``
+#: (3 + 12 + 2 + 12 + 6) and ``common.cholesky_2d`` (3), with the
+#: ``ffi.slate`` and ``ffi.scalapack`` re-export PACKAGES that reached them.
+#: Every consumer imports the top-level ``distrib_la`` door now, which this
+#: rule does not count because it is not a violation.
+#:
+#: THE REMAINING SEVEN ARE NOT A REPLUMB LEFTOVER.  ``ffi.cusolvermp`` has a
+#: live in-``src/`` reacher that is out of distrib_la's scope entirely --
+#: ``ffi/cublasmp/batched.py:33`` takes ``get_or_init_context`` from it, and
+#: cuBLASMp is a future ``gemm`` service, not this one.  Converting that edge
+#: would mean lorrax importing ``distrib_la._cusolvermp`` directly, i.e.
+#: trading three counted exceptions for one uncounted violation.  It goes
+#: when gemm is extracted; until then the number is 7 and it is honest.
 _SERVICE_DOOR_EXCEPTIONS = {
-    "ffi.linalg.plan":        3,   # Plan, ensure_sharding, plan
-    "ffi.linalg.resolve":    12,   # the resolver's whole vocabulary
-    "ffi.linalg.dispatch":    2,   # dispatch_batched_eigh, EIGH_BACKENDS
-    "ffi.linalg._slate":     12,   # incl. _mesh_key, which isdf/core takes
-    "ffi.linalg._scalapack":  6,
     "ffi.cusolvermp.batched": 5,
     "ffi.cusolvermp.eigh":    1,
     "ffi.cusolvermp.context": 1,
-    "common.cholesky_2d":     3,   # cholesky, dense_to_tiles, tiles_to_dense
 }
 
 
@@ -1300,6 +1315,41 @@ def test_the_service_door_exceptions_are_all_still_needed(sources):
     assert not loose, (
         f"budgets above the real count are a licence to regress; lower them "
         f"and keep the win: {loose}")
+
+
+def test_the_retired_shim_modules_are_gone(sources):
+    """DELETED, not merely unreachable.
+
+    The replumb's own gate, in the form its subjects asked for: every one
+    of these modules carried "DELETING THIS PACKAGE IS THE REPLUMB-COMPLETE
+    GATE" or "Deletion is the replumb-complete gate" in its docstring.  A
+    re-export shim that nothing imports is not harmless -- it is a second
+    spelling of the door that still works, so the next call site can be
+    written against it and the layering rule above will not fire, because
+    a shim importing past the door is exactly what the exception list
+    forgives.  The only enforceable end state is absence.
+
+    Checked against the AST source map rather than by importing, so this
+    stays runnable with no jax and no service installed.
+
+    RED ARM: ``test_the_service_door_exceptions_are_all_still_needed`` is
+    the other direction -- it fails if one of the three SURVIVING
+    exceptions stops describing something real.  Between them a module
+    cannot be quietly resurrected or quietly abandoned.
+    """
+    retired = (
+        "ffi.linalg", "ffi.linalg.plan", "ffi.linalg.resolve",
+        "ffi.linalg.dispatch", "ffi.linalg._slate", "ffi.linalg._scalapack",
+        "ffi.slate", "ffi.slate.batched", "ffi.slate.cholesky",
+        "ffi.slate.context", "ffi.slate.eigh", "ffi.slate.trsm",
+        "ffi.scalapack", "ffi.scalapack.eigh", "ffi.scalapack.solve_lu",
+        "common.cholesky_2d",
+    )
+    alive = sorted(m for m in retired if m in sources)
+    assert not alive, (
+        f"these re-export shims were deleted by the replumb and are back: "
+        f"{alive}.  Each one is a second spelling of a service door; the "
+        f"door is the package (import distrib_la), and nothing else.")
 
 
 def test_the_service_door_scan_can_fail(sources):

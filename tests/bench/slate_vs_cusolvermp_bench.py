@@ -104,7 +104,9 @@ def main() -> int:
 
     # Pick the eigh call.
     if args.backend == "slate":
-        from ffi.linalg import backend_module
+        from ffi import _services
+        _services.ensure_on_path()
+        from distrib_la import backend_module
         distributed_eigh = backend_module("slate").distributed_eigh
         kw = {"mesh": mesh, "compute_evecs": True}
         if args.nb:
@@ -112,7 +114,9 @@ def main() -> int:
         def eigh_call():
             return distributed_eigh(A, **kw)
     else:
-        from ffi.linalg import backend_module
+        from ffi import _services
+        _services.ensure_on_path()
+        from distrib_la import backend_module
         distributed_eigh = backend_module("cusolvermp").distributed_eigh
         kw = {"mesh": mesh, "compute_evecs": True}
         if args.nb:

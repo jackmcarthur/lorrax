@@ -8,9 +8,9 @@ ships five targets, all validated on NERSC Perlmutter (1–4 nodes × 4×A100):
 |---|---|---|---|---|
 | `cusolvermp` | cuSOLVERMp (multi-proc multi-GPU, NCCL-backed CAL) | 1 proc per GPU | `common.cusolvermp_eigh_test`, `common.cusolvermp_batched_test`, `tests/test_ffi_linalg_contract.py` | potrf/potrs/getrf+getrs 1e-16–1e-14 on 1×1/2×2/4×1/1×4; syevd square meshes only (rect mesh DEADLOCKS — wrapper rejects) |
 | `cublasmp` | cuBLASMp (batched gemm + fused W-solve) | 1 proc per GPU | `common.cublasmp_gemm_test`, `common.cublasmp_w_solve_test`, contract tests | 1e-16–1e-14 on all meshes.  Comm ABI must match the LOADED cuBLASMp generation (≥0.5.0 = NCCL) — see `cpp/stage/cusolvermp_stage_cublasmp_redist.sh` |
-| `slate` | SLATE (MPI + GPU tile linalg; AMD-portable path) | 1 proc per GPU | `common.slate_cholesky_trsm_test`, `common.slate_batched_test`, contract tests | potrf/trsm/heev ~1e-16/1e-14 on p==q or 1-D meshes; see [`slate/README.md`](slate/README.md) |
+| ~~`slate`~~ | **moved** — SLATE now lives in `services/distrib_la/` (`distrib_la._slate`, reached through `distrib_la.backend_module("slate")`).  The python package here was a re-export shim and was deleted by the wave-0 replumb; the C++ tree under `cpp/slate/` stays.  Its notes are [`services/distrib_la/docs/slate_backend.md`](../../services/distrib_la/docs/slate_backend.md). | | | |
 | `phdf5`      | parallel HDF5 via MPI-IO (read + write sharded slabs) | 1 proc per GPU | `common.phdf5_write_test`, `common.phdf5_multi_offset_test` | 0.000e+00 round-trip; 4 / 9 GB/s write / read @ 16 GPUs. See [`phdf5/ARCHITECTURE.md`](phdf5/ARCHITECTURE.md) for the async-design rationale and the non-obvious pitfalls encountered along the way. |
-| `scalapack` | the **ScaLAPACK API** (HOST platform — JAX CPU backend), supplied by whichever implementation the host lib was linked against: Cray LibSci on Perlmutter, Intel MKL on Frontera | 1 proc per rank | `tests/test_ffi_linalg_contract.py` (`scalapack_*` cells) | pXgetrf+pXgetrs fused per-q LU (`distributed_lu = scalapack`) + pXheevd eigh; square + 1-D meshes (square-block requirement); zero extra link deps (the provider is already in `liblorrax_ffi_host.so`) |
+| ~~`scalapack`~~ | **moved** — same story: `distrib_la._scalapack`, via `distrib_la.backend_module("scalapack")`.  Still the **ScaLAPACK API** (HOST platform, JAX CPU backend) supplied by whichever implementation the host lib was linked against (Cray LibSci on Perlmutter, Intel MKL on Frontera); pXgetrf+pXgetrs fused per-q LU + pXheevd eigh, square + 1-D meshes, zero extra link deps.  Its cells are `services/distrib_la/tests/test_distrib_la_contract.py` (`scalapack_*`). | | | |
 
 > **Which of these families are vendor-swappable and which are not** —
 > with the API each one actually calls, and the evidence — is
@@ -77,10 +77,17 @@ ffi/                       (full design: docs/architecture/ffi_layout.md)
 │   │                    handlers (CUDA → liblorrax_ffi.so; cpu →
 │   │                    liblorrax_ffi_host.so; same target names, jaxlib-style)
 │   └── broadcast.py     JAX-KV-store broadcast helpers
-├── cusolvermp/ cublasmp/ slate/ scalapack/ phdf5/
+├── cusolvermp/ cublasmp/ phdf5/
 │   │                    pure-python service packages (shard_map wrappers,
 │   │                    context/bootstrap); mklfft/ mklblas/ cufft/ are
-│   │                    re-export shims onto fft.py / gemm.py
+│   │                    re-export shims onto fft.py / gemm.py.
+│   │                    slate/ and scalapack/ used to sit here and are
+│   │                    services/distrib_la/ now — their C++ is still
+│   │                    cpp/slate/ and cpp/scalapack/, which is the point:
+│   │                    the SO is one build, the python is per service.
+├── _services.py         puts services/*/src on sys.path.  TRANSITIONAL —
+│                        see its docstring; it goes with the owner's
+│                        install/PYTHONPATH decision.
 └── cpp/                 THE one C++ tree (both platform legs)
     ├── CMakeLists.txt   ONE entry point; -DLORRAX_FFI_PLATFORM=cuda|host
     │                    selects the leg, refuses when unset

@@ -77,7 +77,9 @@ def run_multiprocess(n: int, repeats: int) -> int:
         os.environ[_DIST_SENTINEL] = "1"
 
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-    from ffi.linalg import plan as linalg_plan
+    from ffi import _services
+    _services.ensure_on_path()
+    from distrib_la import plan as linalg_plan
 
     world = jax.process_count()
     _log(f"\n=== multi-process mode, n={n}, repeats={repeats}, world={world} ===")
@@ -115,7 +117,7 @@ def run_multiprocess(n: int, repeats: int) -> int:
 def run_dispatch(sizes, repeats: int, batch: int, backend: str) -> int:
     """The dispatch question: q-BATCHED native vs ONE distributed tile.
 
-    This is the measurement ``ffi.linalg.LinalgPlan`` cites for
+    This is the measurement ``distrib_la.Plan`` cites for
     choosing a backend, and the one ``bandstructure.bse_setup`` faces per q.
     Both arms decompose the SAME kind of matrix — Hermitian complex128,
     ``(n, n)`` — and are reported as **ms per matrix**, the only comparable
@@ -126,7 +128,7 @@ def run_dispatch(sizes, repeats: int, batch: int, backend: str) -> int:
               ``batch/ndev`` WHOLE matrices concurrently.  Costs
               ``batch/ndev · n²·16`` bytes per device, so it stops fitting
               first.
-      ffi     a resolved ``ffi.linalg`` PLAN on ONE ``(n, n)`` sharded
+      ffi     a resolved ``distrib_la`` PLAN on ONE ``(n, n)`` sharded
               ``P('x','y')``: the whole mesh works on one matrix,
               ``n²·16/ndev`` per device.
 
@@ -138,7 +140,9 @@ def run_dispatch(sizes, repeats: int, batch: int, backend: str) -> int:
     One JAX process per GPU (the LORRAX process model), square mesh.
     """
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-    from ffi.linalg import plan as linalg_plan
+    from ffi import _services
+    _services.ensure_on_path()
+    from distrib_la import plan as linalg_plan
 
     world = jax.process_count()
     p = int(round(np.sqrt(world)))

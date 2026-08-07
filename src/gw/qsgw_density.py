@@ -641,7 +641,7 @@ def distributed_eigh_bands(H, *, mesh: Mesh):
     ``pXheevd`` is the permanent CPU distributed eigh; the batched entry
     costs one collective-serialisation round for the whole k stack rather
     than one per k.  Chosen against the usual cost argument on purpose:
-    ``ffi/linalg/dispatch.py`` records that the native path solves ndev
+    ``distrib_la.dispatch`` records that the native path solves ndev
     matrices at once and wins by roughly ndev whenever a tile fits on one
     device, which at nb=640 (6.5 MB) it does.  At nb=10⁴ a tile is 1.6 GB
     and at 2·10⁴ it is 6.4 GB, on ONE device on top of ψ and the FFT

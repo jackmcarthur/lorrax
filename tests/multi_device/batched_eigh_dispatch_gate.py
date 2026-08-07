@@ -1,8 +1,8 @@
-"""``ffi.linalg.dispatch_batched_eigh``: the two paths, and the scan question.
+"""``distrib_la.dispatch_batched_eigh``: the two paths, and the scan question.
 
 A host mesh is the only place BOTH paths of that dispatcher are reachable:
 ScaLAPACK is the only backend that exposes ``batched_distributed_eigh``
-(``ffi/linalg/_scalapack.py:109``), so on CUDA the serial fallback is the
+(``distrib_la._scalapack``), so on CUDA the serial fallback is the
 only path there is and there is nothing to compare it against.  Hence this
 gate, and hence the private ``_force_serial`` argument it uses to reach the
 fallback here.
@@ -22,7 +22,8 @@ fallback here.
      ``mod.distributed_eigh`` fallback did on CUDA before this change.
   4. eigenvalues against ``numpy.linalg.eigvalsh``.
   5. ONE resolve for an Nq-matrix serial call (the guard hoist), counted
-     by wrapping ``ffi.linalg.plan.resolve_backend``.
+     by wrapping ``distrib_la.plan.resolve_backend`` — the module whose
+     globals ``plan()`` actually looks the name up in.  See the check.
   6. an indivisible N and an off-platform backend still REFUSE at resolve
      time — hoisting the guards must not have dropped them.
   7. ``gw.qsgw_density.distributed_eigh_bands``, the only in-tree caller,
@@ -53,8 +54,10 @@ from jax.sharding import NamedSharding, PartitionSpec as P    # noqa: E402
 
 from common.collectives import (process_count, process_rank,  # noqa: E402
                                 resolve_mesh)
-from ffi import linalg                                        # noqa: E402
-from ffi.linalg import dispatch_batched_eigh                  # noqa: E402
+from ffi import _services                                     # noqa: E402
+_services.ensure_on_path()
+import distrib_la as linalg                                   # noqa: E402
+from distrib_la import dispatch_batched_eigh                  # noqa: E402
 
 NQ = int(os.environ.get("BE_NQ", "6"))
 N = int(os.environ.get("BE_N", "32"))
@@ -146,13 +149,13 @@ def main():
 
     # ---- 5. ONE resolve for the whole serial stack ----------------------
     # Patch the module whose globals ``plan()`` actually looks ``resolve_
-    # backend`` up in.  That is ``distrib_la.plan`` since the facade moved
-    # to services/distrib_la/; ``ffi.linalg.plan`` is a re-export shim, so
-    # rebinding its attribute would count ZERO calls and this check would
-    # pass while measuring nothing.  (``import ffi.linalg.plan`` also gives
-    # back the FUNCTION, not the module — the package re-exports ``plan``
-    # and that binding shadows the submodule of the same name — which is
-    # why this goes through sys.modules either way.)
+    # backend`` up in.  That is ``distrib_la.plan``; patching the DOOR
+    # (``distrib_la.resolve_backend``) would rebind a name ``plan()`` never
+    # reads, and this check would pass while counting zero calls — i.e.
+    # while measuring nothing.  (``from distrib_la import plan`` also gives
+    # back the FUNCTION, not the module — the door re-exports ``plan`` and
+    # that binding shadows the submodule of the same name — which is why
+    # this goes through sys.modules.)
     _planmod = sys.modules["distrib_la.plan"]
     seen = []
     _orig = _planmod.resolve_backend

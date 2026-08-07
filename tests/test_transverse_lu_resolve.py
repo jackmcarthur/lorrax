@@ -17,13 +17,14 @@ W treatment, quality pattern #6/#8):
     announcement or the demotion would not have failed any test).
 
 The 2×2 mesh comes from 4 forced host CPU devices in a subprocess (env
-must precede ``import jax``).  The worker STUBS the ffi.linalg facade
+must precede ``import jax``).  The worker STUBS the distrib_la door
 (``isdf.core._resolve_linalg_backend``): since the fix/zq audit every
 EXPLICIT FFI backend ('cusolvermp'/'on'/'scalapack') runs the facade's
 platform/capability/geometry guard ladder, which on this CPU test mesh
 refuses (cusolvermp is CUDA-only; scalapack needs the compiled host FFI)
 BEFORE the divisibility contract under test is reachable.  The facade's
-own guards are pinned by tests/test_ffi_linalg_contract.py.  NOTE:
+own guards are pinned by services/distrib_la/tests/
+test_distrib_la_contract.py.  NOTE:
 consequently nothing here asserts that 'cusolvermp' is a promise a CPU
 handler can run — it is not, and on a real CPU mesh the facade refuses
 it at resolve time.

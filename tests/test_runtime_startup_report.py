@@ -192,7 +192,7 @@ def test_the_sentence_check_can_fail():
     {"failfast": False},
     {"compile_cache": {"enabled": False, "n_proc": 16, "dir": None}},
     {"compile_cache_error": "OSError: read-only filesystem"},
-    {"linalg": {"error": "ImportError: no ffi.linalg"}},
+    {"linalg": {"error": "ImportError: no distrib_la"}},
     {"demotions": ["JAX_PLATFORMS was pinned to 'cpu'."]},
 ])
 def test_every_branch_still_produces_sentences(mut):

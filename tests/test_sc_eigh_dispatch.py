@@ -182,7 +182,8 @@ def test_an_indivisible_band_window_is_SERVED_when_asked_explicitly():
 def test_the_backend_probe_asks_about_the_PADDED_extent():
     """``auto`` must probe the extent the eigh runs at, not ``nb``.
 
-    ``ffi.linalg.resolve`` has its own divisibility guard.  Probing the
+    ``distrib_la.resolve_backend`` has its own divisibility guard.  Probing
+    the
     logical ``nb`` would trip it for every indivisible window and degrade
     to native — reinstating the lifted refusal by accident, silently.
     """

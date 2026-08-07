@@ -49,7 +49,15 @@ _init()
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import multihost_utils
-from ffi.slate import distributed_cholesky, distributed_trsm
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+from distrib_la import backend_module                                # noqa: E402
+
+_slate = backend_module("slate")
+distributed_cholesky = _slate.distributed_cholesky
+distributed_trsm = _slate.distributed_trsm
 
 
 def _log(s):

@@ -7,7 +7,7 @@ DEPRECATED / OWNER-LEDGER ITEM (handoff 2026-07-28 open ledger): the
 its w_isdf consumer (``_get_w_solve_fn_low_mem``) was deleted in the
 two-plan W cleanup (2026-07-27), superseded by
 ``w_dyson_solver = distributed`` (2-D-sharded backsolve through the
-ffi.linalg plan facade; cuSOLVERMp on CUDA meshes).  The package + this
+distrib_la plan door; cuSOLVERMp on CUDA meshes).  The package + this
 gate script are scheduled for the owner's deletion pass once the one rtx
 gate runs; do not add new consumers.
 """

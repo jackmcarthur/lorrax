@@ -1,4 +1,12 @@
-# `ffi.slate` — distributed dense linear algebra on GPUs from JAX
+# The SLATE backend — distributed dense linear algebra on GPUs from JAX
+
+Was `src/ffi/slate/README.md`.  The python package it documented is
+`distrib_la._slate` now, reached through
+`distrib_la.backend_module("slate")` — the wave-0 replumb deleted the
+`ffi.slate` re-export package, which was its own stated deletion gate.
+Names below that read `ffi.slate.X` are `distrib_la._slate.X`; the C++
+under `src/ffi/cpp/slate/` did not move and the FFI target strings are
+frozen (ffi_layout.md invariant 1).
 
 JAX FFI wrappers around [SLATE](https://icl.utk.edu/slate/) (a tile-based
 MPI + GPU dense linear algebra library from ICL).  Currently exposes:

@@ -59,7 +59,7 @@ Two tiers — keeping them apart is the whole reason this module exists
 
 A single-tier resolver cannot serve both: tier 2 is exact but far too late
 for a cache key, tier 1 is early enough but only lexically right.  That —
-not taste — is why these dials do not fold into ``ffi/linalg/resolve.py``,
+not taste — is why these dials do not fold into ``distrib_la.resolve``,
 whose ``plan(op, mesh, backend=, n=)`` receives everything as arguments and
 resolves once.  Full contract: ``docs/dev/ffi_gate_contract.md``.
 

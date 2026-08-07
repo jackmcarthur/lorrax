@@ -51,10 +51,19 @@ _init()
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import multihost_utils
-from ffi.slate import (
-    batched_distributed_cholesky,
-    batched_distributed_trsm,
-)
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+# The SLATE backend module, through the door's one import seam.  (The
+# ``ffi.slate`` re-export package this used to import died with the
+# replumb; its stated deletion gate was exactly this migration.)
+from distrib_la import backend_module                               # noqa: E402
+
+_slate = backend_module("slate")
+batched_distributed_cholesky = _slate.batched_distributed_cholesky
+batched_distributed_trsm = _slate.batched_distributed_trsm
 
 
 def _log(s):

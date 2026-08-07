@@ -62,7 +62,7 @@ Note: when BOTH libraries are loaded (GPU node), the shared
 ``libslate.so.2`` soname means the host handlers run against the
 already-loaded cuda-build SLATE (host-side execution) -- the
 ``gpu_backend=none`` binary is exercised on CPU nodes, where the host
-library loads alone (see src/ffi/slate/README.md "Dual-lib caveat").
+library loads alone (see ../docs/slate_backend.md "Dual-lib caveat").
 
 Multi-rank findings this file pins (see
 reports/slate_linalg_ffi_2026-07-10/report.md for the full matrix):
@@ -456,7 +456,7 @@ def check_cublasmp_wsolve(mesh, dtype, nq=2, n=32, pref=0.37):
 
 def check_scalapack_lu(mesh, dtype, nq=2, n=32, nrhs=16, herm=True):
     """Host-platform twin of check_cusolvermp_lu — ScaLAPACK pXgetrf+
-    pXgetrs (Cray LibSci) through ffi.scalapack, same math contract."""
+    pXgetrs (Cray LibSci) through _scalapack, same math contract."""
     batched_distributed_solve_lu = backend_module(
         "scalapack").batched_distributed_solve_lu
     rng = np.random.default_rng(11)
@@ -807,7 +807,7 @@ def test_slate_eigh_true_eigenvectors_cpu(mesh_cpu11, dtype):
 
 
 def check_scalapack_eigh(mesh, dtype, n=32):
-    """ScaLAPACK ``pzheevd``/``pdsyevd`` through ffi.scalapack — the same
+    """ScaLAPACK ``pzheevd``/``pdsyevd`` through _scalapack — the same
     STRICT contract ``check_slate_eigh`` states (and SLATE's host handler
     cannot meet): W matches numpy, Z's COLUMNS are true eigenvectors
     (``A @ Z == Z @ diag(W)`` — a wrong layout/transpose passes the
@@ -1146,10 +1146,12 @@ def _mock_cuda_capabilities(monkeypatch, nproc):
     ``.so``.  A monkeypatch has to land on the module whose globals the
     resolver looks up, which is ``distrib_la.resolve`` /
     ``distrib_la.loader`` — patching
-    ``ffi.linalg.resolve`` (a re-export shim) or ``ffi.common.ffi_loader``
-    (which still owns fft/gemm/phdf5 and no longer answers for linalg)
-    would set attributes nothing reads, and these cells would quietly start
-    measuring the machine instead of the contract.
+    the DOOR (``distrib_la.probe_target``, a re-exported binding) or
+    ``ffi.common.ffi_loader`` (which still owns fft/gemm/phdf5 and no
+    longer answers for linalg) would set attributes nothing reads, and
+    these cells would quietly start measuring the machine instead of the
+    contract.  The ``ffi.linalg`` re-export shim that used to be the third
+    wrong answer here is deleted.
     """
     from distrib_la import loader as FL
     from distrib_la import resolve as R

@@ -1,4 +1,4 @@
-"""Correctness smoke test for ffi.slate.distributed_eigh.
+"""Correctness smoke test for the SLATE backend's distributed_eigh.
 
 4-GPU 2x2 mesh: builds a random Hermitian matrix, runs slate::heev via
 the FFI, gathers eigenvalues + eigenvectors to rank 0, checks against
@@ -52,7 +52,13 @@ _init()
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import multihost_utils
-from ffi.slate import distributed_eigh
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+from distrib_la import backend_module                                # noqa: E402
+
+distributed_eigh = backend_module("slate").distributed_eigh
 
 
 def _log(s: str) -> None:
