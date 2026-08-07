@@ -50,7 +50,7 @@ from lxkit.probe import (AVAILABLE, LibraryNotBuilt, LibraryUnusable,
                          unknown_target)
 
 __all__ = ["get_lib", "has_target", "probe_target", "loaded_lib_path",
-           "LibraryNotBuilt", "LibraryUnusable"]
+           "loaded_platforms_in_order", "LibraryNotBuilt", "LibraryUnusable"]
 
 _LIBS: Dict[str, ctypes.CDLL] = {}
 #: platform -> the .so path actually loaded (for diagnostics).
@@ -79,7 +79,9 @@ _CUDA_TARGET_SYMBOLS = {
 # The host variants: the SAME target names registered under platform="cpu"
 # (the split jaxlib itself uses for lapack vs cusolver), so a call site
 # never mentions a platform and the lowering platform picks the handler.
-# Only the C++ SYMBOLS differ, so both .so's can coexist under RTLD_GLOBAL.
+# Only the C++ SYMBOLS differ, so the two .so's do not collide with EACH
+# OTHER under RTLD_GLOBAL — but their DEPENDENCIES do, and one of those
+# collisions is load-bearing: see the SONAME note above ``get_lib``.
 # ScaLAPACK is host-only: there is no CUDA row for it anywhere.
 _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_eigh":                    "SlateEighHostFfi",
@@ -284,6 +286,75 @@ def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
                 raise
 
 
+# ---------------------------------------------------------------------------
+# THE TWO PLATFORM LIBRARIES SHARE THEIR SLATE.  Open CUDA first or lose it.
+# ---------------------------------------------------------------------------
+# ``liblorrax_ffi.so`` and ``liblorrax_ffi_host.so`` do not merely differ in
+# their C++ symbols (the claim two comments in this file used to make).  BOTH
+# carry ``NEEDED libslate.so.2`` and ``NEEDED libblaspp.so.2``, and they
+# resolve those SONAMEs out of DIFFERENT BUILDS:
+#
+#   host  DT_RPATH   .../slate_builds/cpu/install/lib64   gpu_backend=none
+#   CUDA  DT_RUNPATH /lorrax_slate/lib, .../slate/install/lib64   CUDA
+#
+# ld.so keys a loaded object by SONAME, so whichever of the two is dlopened
+# FIRST decides which ``libblaspp.so.2`` the OTHER one calls for the rest of
+# the process.  The CPU build's ``blas::get_device_count()`` is a
+# compiled-in 0 -- it has no ``libcudart`` to ask.
+#
+# MEASURED, Perlmutter 2026-08-07, ``dladdr`` of ``blas::get_device_count``
+# at a failing cell, EXACTLY ONE visible GPU in both legs:
+#
+#   full-suite ``-m distrib_la``  host opened first
+#       -> .../slate_builds/cpu/install/lib64/libblaspp.so.2, returns 0
+#       -> FAILED_PRECONDITION: slate.potrf: blas::get_device_count()=0 but
+#          JAX one-process-per-GPU model requires exactly 1.       8 CELLS RED
+#   service-only (by path)        CUDA opened first
+#       -> .../slate/install/lib64/libblaspp.so.2, returns 1       ALL GREEN
+#
+# What opened the host library first was a MODULE-SCOPE probe during
+# COLLECTION: ``tests/test_fft_flat_k_numerics.py`` calls
+# ``ffi_loader.probe_target(FLAT_K_TARGET, "cpu")`` at import time.  ``-m
+# distrib_la`` deselects that file's CELLS; it does not un-import the module.
+#
+# So this is NOT a harness artefact.  Any GPU run whose first FFI touch is a
+# host target -- a phdf5 host read, an mklfft probe -- silently gets a
+# device-less SLATE, and the refusal it eventually prints names a device
+# count nobody set.
+#
+# ONE SAFE ORDER EXISTS, and the asymmetry is the reason: the host SLATE
+# handlers run ``slate::Target::HostTask`` and never consult
+# ``get_device_count``, so a CUDA blaspp in charge costs the host path
+# nothing (measured: the service-only leg is 244 cells / 0 failed with
+# exactly that arrangement).  The reverse costs the CUDA path everything.
+#
+# Best effort by construction: no CUDA library built (every CPU-only tree,
+# the WSL box) or one that cannot load (no driver on this node) leaves the
+# environment untouched, and is tried once.
+_CUDA_FIRST_TRIED = False
+
+
+def _open_cuda_before_host() -> None:
+    """Win the ``libslate``/``libblaspp`` SONAME for the CUDA build."""
+    global _CUDA_FIRST_TRIED
+    if _CUDA_FIRST_TRIED or "CUDA" in _LIBS:
+        return
+    _CUDA_FIRST_TRIED = True
+    try:
+        get_lib("CUDA")
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+def loaded_platforms_in_order() -> list:
+    """The platforms whose library this process has opened, in ORDER.
+
+    The ordering above is the whole contract, so it is readable rather than
+    inferable: ``tests`` assert on this list, and a diagnostic can print it.
+    """
+    return list(_LIBS)
+
+
 def get_lib(platform: str) -> ctypes.CDLL:
     """Return the loaded FFI library for ``platform``; idempotent.
 
@@ -292,6 +363,10 @@ def get_lib(platform: str) -> ctypes.CDLL:
     from the JAX default backend calls ``jax.default_backend()``, which
     INITIALIZES the XLA backend, and every caller here already knows the
     platform from its mesh.
+
+    Opening the ``cpu`` library opens the ``CUDA`` one first when there is
+    one — see the SONAME note above; it is a correctness requirement, not a
+    warm-up.
     """
     if platform not in _PLATFORMS:
         raise LibraryNotBuilt(
@@ -301,6 +376,11 @@ def get_lib(platform: str) -> ctypes.CDLL:
     lib = _LIBS.get(platform)
     if lib is not None:
         return lib
+    if platform == "cpu":
+        _open_cuda_before_host()
+        lib = _LIBS.get(platform)
+        if lib is not None:                    # re-entrancy, not reachable today
+            return lib
     path = _locate_so(platform)
     # Load h5py's HDF5 FIRST.  Both LORRAX libraries link the site's
     # parallel HDF5 and are dlopened RTLD_GLOBAL, which publishes every

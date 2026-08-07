@@ -268,3 +268,39 @@ def test_a_pin_that_does_not_exist_is_a_failure_not_a_skip(monkeypatch):
     monkeypatch.setenv("LORRAX_FFI_HOST_SO", "/nonexistent/liblorrax.so")
     with pytest.raises(pytest.fail.Exception, match="does not exist"):
         _pinned("cpu")
+
+
+# ---------------------------------------------------------------------------
+# The SONAME collision, at the artifact level
+# ---------------------------------------------------------------------------
+
+def test_check_5_the_two_libraries_still_share_their_slate_soname():
+    """A RATCHET on the reason ``_open_cuda_before_host`` exists.
+
+    Both platform libraries carry ``NEEDED libslate.so.2`` and ``NEEDED
+    libblaspp.so.2``, resolved out of different builds (the host lib's
+    DT_RPATH names a ``gpu_backend=none`` blaspp whose
+    ``blas::get_device_count()`` is a compiled-in 0; the CUDA lib's
+    DT_RUNPATH names the CUDA one).  ld.so keys a loaded object by SONAME,
+    so the FIRST of the two dlopened decides for both, and only one order
+    survives -- which is why both loaders open CUDA first.
+
+    This cell fails the day somebody gives the two stacks distinct
+    sonames, or statically links one of them, or drops SLATE from the host
+    build.  That is the GOOD failure: it is the signal to delete
+    ``_open_cuda_before_host`` from both loaders and the four cells in
+    test_distrib_la_contract.py that guard it, rather than leave a
+    workaround nobody can date.  Read the failure message before deleting
+    anything.
+    """
+    shared = sorted(set(_readelf_needed(_pinned("cpu")))
+                    & set(_readelf_needed(_pinned("CUDA"))))
+    collide = [n for n in shared if "slate" in n or "blaspp" in n]
+    assert collide, (
+        "the two platform libraries no longer share a SLATE/blaspp SONAME "
+        f"(shared DT_NEEDED: {shared}).  The dlopen-order rule "
+        "distrib_la.loader._open_cuda_before_host enforces was written for "
+        "exactly that collision and is now dead weight -- delete it from "
+        "BOTH loaders (services/distrib_la/src/distrib_la/loader.py and "
+        "src/ffi/common/ffi_loader.py) together with the four cells under "
+        "'THE SONAME RACE' in test_distrib_la_contract.py.")

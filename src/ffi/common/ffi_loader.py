@@ -534,11 +534,69 @@ def has_phdf5_write(platform: str) -> bool:
     return has_target("lorrax_phdf5_write", platform)
 
 
+# ---------------------------------------------------------------------------
+# THE TWO PLATFORM LIBRARIES SHARE THEIR SLATE.  Open CUDA first or lose it.
+# ---------------------------------------------------------------------------
+# The target tables above say the two .so's "can co-exist under RTLD_GLOBAL"
+# because only their C++ SYMBOLS differ.  That is true of the symbols and
+# FALSE of the dependency closure: both carry ``NEEDED libslate.so.2`` and
+# ``NEEDED libblaspp.so.2`` and resolve those SONAMEs out of DIFFERENT builds
+# (host DT_RPATH -> a gpu_backend=none blaspp; CUDA DT_RUNPATH -> the CUDA
+# one).  ld.so keys a loaded object by SONAME, so the FIRST of the two to be
+# dlopened decides which ``libblaspp.so.2`` the OTHER one calls for the rest
+# of the process, and the CPU build's ``blas::get_device_count()`` is a
+# compiled-in 0.
+#
+# MEASURED, Perlmutter 2026-08-07 (``dladdr`` at a failing cell, ONE visible
+# GPU in both legs).  THIS module lost the race, at COLLECTION time:
+# ``tests/test_fft_flat_k_numerics.py`` calls ``probe_target(FLAT_K_TARGET,
+# "cpu")`` at MODULE SCOPE, which opened the host lib before any CUDA cell
+# ran, and every CUDA SLATE handler then refused:
+#
+#   FAILED_PRECONDITION: slate.potrf: blas::get_device_count()=0 but JAX
+#   one-process-per-GPU model requires exactly 1.
+#
+# Eight cells.  Not a harness artefact: any GPU run whose first FFI touch is
+# a host target (a phdf5 host read, an mklfft probe) gets the same
+# device-less SLATE, and the message names a device count nobody set.
+#
+# ONE SAFE ORDER EXISTS.  The host SLATE handlers run
+# ``slate::Target::HostTask`` and never consult ``get_device_count``, so a
+# CUDA blaspp in charge costs the host path nothing; the reverse costs the
+# CUDA path everything.  ``distrib_la.loader`` carries the same rule for the
+# libraries it opens — the two loaders share the FILES, so both have to.
+#
+# Best effort: no CUDA library built, or one that cannot load on this node,
+# leaves the process untouched and is tried once.
+_CUDA_FIRST_TRIED = False
+
+
+def _open_cuda_before_host() -> None:
+    """Win the ``libslate``/``libblaspp`` SONAME for the CUDA build."""
+    global _CUDA_FIRST_TRIED
+    if _CUDA_FIRST_TRIED or "CUDA" in _LIBS:
+        return
+    _CUDA_FIRST_TRIED = True
+    try:
+        get_lib("CUDA")
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+def loaded_platforms_in_order() -> list:
+    """The platforms whose library this process has opened, in ORDER."""
+    return list(_LIBS)
+
+
 def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
     """Return the loaded FFI library for ``platform``; idempotent.
 
     ``platform`` is "CUDA" or "cpu"; ``None`` follows the JAX default
     backend, so wrapper call sites stay platform-agnostic.
+
+    Opening the ``cpu`` library opens the ``CUDA`` one first when there is
+    one — see the SONAME note above; it is a correctness requirement, not a
+    warm-up.
     """
     if platform is None:
         platform = _default_platform()
@@ -549,6 +607,11 @@ def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
     lib = _LIBS.get(platform)
     if lib is not None:
         return lib
+    if platform == "cpu":
+        _open_cuda_before_host()
+        lib = _LIBS.get(platform)
+        if lib is not None:                    # re-entrancy, not reachable today
+            return lib
     path = _locate_so(platform)
     # Load h5py's HDF5 FIRST.  Both FFI libraries link the site's Intel
     # parallel HDF5 (``libhdf5.so.310`` = 1.14.6 on Frontera) and we dlopen

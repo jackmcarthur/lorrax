@@ -1412,3 +1412,203 @@ def test_w_dyson_distributed_refusal_reaches_the_caller():
     # Host library present and usable: the promise half.
     fn = _get_w_solve_fn_distributed(mesh, 2, 8, 8)
     assert callable(fn)
+
+
+# ---------------------------------------------------------------------------
+#  THE SONAME RACE: which libblaspp the CUDA SLATE handlers actually call
+# ---------------------------------------------------------------------------
+# ``liblorrax_ffi.so`` and ``liblorrax_ffi_host.so`` both carry ``NEEDED
+# libslate.so.2`` and ``NEEDED libblaspp.so.2`` and resolve them out of
+# DIFFERENT builds (the host lib's DT_RPATH names a gpu_backend=none blaspp).
+# ld.so keys a loaded object by SONAME, so the first of the two dlopened
+# decides which ``blas::get_device_count()`` the OTHER one calls, and the CPU
+# build's is a compiled-in 0.  Measured on Perlmutter 2026-08-07 with ONE
+# visible GPU in both legs:
+#
+#   host opened first  ->  slate_builds/cpu/.../libblaspp.so.2, returns 0
+#       FAILED_PRECONDITION: slate.potrf: blas::get_device_count()=0 but JAX
+#       one-process-per-GPU model requires exactly 1.
+#   CUDA opened first  ->  slate/install/.../libblaspp.so.2, returns 1
+#
+# ``distrib_la.loader`` (and lorrax's ``ffi.common.ffi_loader``, which opens
+# the same two files) therefore opens CUDA before cpu.  These four cells are
+# that rule and its two FALSE cases.
+
+def _drive_open_order(monkeypatch, *, disable_rule=False, present=("CUDA", "cpu")):
+    """Run ``get_lib('cpu')`` with every native step stubbed out, and return
+    the platform library paths it dlopened, IN ORDER.
+
+    Everything below the dlopen is stubbed (symbol declaration, XLA target
+    registration) because the question is only which FILE ld.so sees first;
+    stubbing keeps the cell pure enough to run on the WSL box in
+    milliseconds, which is where a load-order regression should be caught.
+    """
+    import pathlib
+    from distrib_la import loader as L
+
+    opened = []
+
+    class _FakeLib:
+        def __getattr__(self, name):
+            return _FakeLib()
+
+        def __setattr__(self, name, value):
+            pass
+
+    def _fake_locate(platform):
+        if platform not in present:
+            raise L.LibraryNotBuilt(f"no {platform} library in this fixture")
+        return pathlib.Path("/fixture") / L._PLATFORMS[platform]["so_name"]
+
+    def _fake_cdll(path, mode=0):
+        opened.append(str(path))
+        return _FakeLib()
+
+    monkeypatch.setattr(L, "_LIBS", {})
+    monkeypatch.setattr(L, "_LIB_PATHS", {})
+    monkeypatch.setattr(L, "_CUDA_FIRST_TRIED", False)
+    monkeypatch.setattr(L, "_locate_so", _fake_locate)
+    monkeypatch.setattr(L.ctypes, "CDLL", _fake_cdll)
+    monkeypatch.setattr(L, "_declare_cusolvermp", lambda lib: None)
+    monkeypatch.setattr(L, "_declare_slate", lambda lib: None)
+    monkeypatch.setattr(L, "_register_ffi_targets", lambda lib, platform: None)
+    if disable_rule:
+        monkeypatch.setattr(L, "_open_cuda_before_host", lambda: None)
+
+    L.get_lib("cpu")
+    return opened
+
+
+def test_the_host_library_is_never_opened_before_the_cuda_one(monkeypatch):
+    """Asking for the cpu library must open the CUDA one FIRST.
+
+    Not a warm-up and not a preference: whichever platform library is
+    dlopened first wins ``libblaspp.so.2`` for the whole process, and only
+    one of the two orders is survivable (the host SLATE handlers run
+    ``slate::Target::HostTask`` and never ask for a device count; the CUDA
+    ones refuse without one).
+    """
+    opened = _drive_open_order(monkeypatch)
+    assert opened == ["/fixture/liblorrax_ffi.so",
+                      "/fixture/liblorrax_ffi_host.so"], (
+        f"the two platform libraries were opened in the order {opened} -- the "
+        f"CUDA one must come first or every CUDA SLATE handler in this "
+        f"process refuses with blas::get_device_count()=0")
+
+
+def test_the_open_order_cell_can_fail(monkeypatch):
+    """The FALSE case of the cell above, constructed.
+
+    With ``_open_cuda_before_host`` disabled, ``get_lib('cpu')`` opens the
+    host library and NOTHING else -- which is exactly the process state that
+    produced the eight red SLATE-CUDA cells.  Without this twin the cell
+    above could be passing because something else happened to open the CUDA
+    library first.
+    """
+    opened = _drive_open_order(monkeypatch, disable_rule=True)
+    assert opened == ["/fixture/liblorrax_ffi_host.so"], opened
+
+
+def test_a_missing_cuda_library_is_not_an_error_for_the_host_path(monkeypatch):
+    """CPU-only trees pay nothing.  ``_open_cuda_before_host`` is best
+    effort by construction: with no CUDA library to locate, the host library
+    still loads and the refusal is swallowed rather than raised at a caller
+    that only ever wanted the host path (every WSL leg does this)."""
+    opened = _drive_open_order(monkeypatch, present=("cpu",))
+    assert opened == ["/fixture/liblorrax_ffi_host.so"], opened
+
+
+def _blaspp_in_charge():
+    """``(providing .so, blas::get_device_count())`` for THIS process.
+
+    ``dladdr`` on the resolved symbol, which is the only way to ask the
+    question the C++ guard asks -- ``nm`` on either library answers about a
+    file, not about the process.
+    """
+    import ctypes
+
+    class _DlInfo(ctypes.Structure):
+        _fields_ = [("dli_fname", ctypes.c_char_p),
+                    ("dli_fbase", ctypes.c_void_p),
+                    ("dli_sname", ctypes.c_char_p),
+                    ("dli_saddr", ctypes.c_void_p)]
+
+    main = ctypes.CDLL(None)
+    fn = getattr(main, "_ZN4blas16get_device_countEv")
+    fn.restype = ctypes.c_int
+    fn.argtypes = []
+    info = _DlInfo()
+    fname = "<dladdr failed>"
+    if main.dladdr(ctypes.cast(fn, ctypes.c_void_p), ctypes.byref(info)):
+        fname = (info.dli_fname or b"?").decode()
+    return fname, fn()
+
+
+@needs_ffi
+@needs_host_ffi
+def test_the_blaspp_the_cuda_slate_calls_can_see_the_device():
+    """With BOTH platform libraries open, the blaspp in charge must be the
+    CUDA one.
+
+    This is the eight-cell failure, hoisted out of the C++ guard to where it
+    can say why.  It is not a restatement of ``pin_one_gpu``: the failing leg
+    had exactly ONE visible GPU and still read 0, because the device count
+    came from a library compiled without CUDA at all.
+    """
+    get_lib("cpu")                       # opens CUDA first, by the rule above
+    get_lib("CUDA")
+    provider, count = _blaspp_in_charge()
+    assert count >= 1, (
+        f"blas::get_device_count() = {count} with a CUDA device visible.  "
+        f"The symbol resolved into {provider!r}, which is a blaspp built "
+        f"without a GPU backend -- the host library won libblaspp.so.2 for "
+        f"this process and every CUDA SLATE handler will now refuse with "
+        f"'slate.potrf: blas::get_device_count()=0 but JAX "
+        f"one-process-per-GPU model requires exactly 1'.")
+
+
+@needs_ffi
+@needs_host_ffi
+def test_the_wrong_open_order_is_constructible_and_blinds_slate():
+    """The FALSE case of the cell above, constructed in a subprocess.
+
+    A fresh interpreter that opens the HOST library first must read 0 from a
+    DIFFERENT ``libblaspp.so.2`` than the in-process one -- which is what
+    makes the assertion above a measurement of load order rather than of the
+    machine.  No GPU math: two dlopens and a ``dladdr``.
+    """
+    import json
+    import subprocess
+    from distrib_la.loader import _locate_so
+
+    prog = (
+        "import ctypes,json\n"
+        "class D(ctypes.Structure):\n"
+        "    _fields_=[('f',ctypes.c_char_p),('b',ctypes.c_void_p),"
+        "('s',ctypes.c_char_p),('a',ctypes.c_void_p)]\n"
+        "import sys\n"
+        "ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)\n"
+        "ctypes.CDLL(sys.argv[2], mode=ctypes.RTLD_GLOBAL)\n"
+        "m=ctypes.CDLL(None)\n"
+        "fn=getattr(m,'_ZN4blas16get_device_countEv')\n"
+        "fn.restype=ctypes.c_int; fn.argtypes=[]\n"
+        "i=D()\n"
+        "m.dladdr(ctypes.cast(fn,ctypes.c_void_p),ctypes.byref(i))\n"
+        "print(json.dumps([(i.f or b'?').decode(), fn()]))\n")
+    host = str(_locate_so("cpu"))
+    cuda = str(_locate_so("CUDA"))
+    out = subprocess.run([sys.executable, "-c", prog, host, cuda],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, timeout=300)
+    assert out.returncode == 0, out.stdout[-3000:]
+    wrong_provider, wrong_count = json.loads(out.stdout.strip().splitlines()[-1])
+    right_provider, _ = _blaspp_in_charge()
+    assert wrong_count == 0, (
+        f"host-first no longer blinds SLATE (count={wrong_count}, provider "
+        f"{wrong_provider!r}).  Either the two libraries stopped sharing "
+        f"libblaspp.so.2 -- in which case delete _open_cuda_before_host from "
+        f"BOTH loaders and this pair of cells -- or this subprocess is not "
+        f"reproducing the order it claims to.")
+    assert wrong_provider != right_provider, (
+        f"both open orders resolve blas::get_device_count into "
+        f"{right_provider!r}; this cell is measuring nothing")
