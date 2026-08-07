@@ -172,7 +172,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         rtol: σ truncation tolerance (relative to s.max()); σ come from the
             Gram-eigh of A Aᴴ (see step 2), the same criterion as the old
             replicated SVD up to sqrt-of-eigenvalue round-off.
-        eigh_backend: ffi.linalg backend for the (nk·nb)² Gram eigh — the
+        eigh_backend: distrib_la backend for the (nk·nb)² Gram eigh — the
             same plan family (and deck key) as the fH_q eigh downstream;
             ``auto`` = native replicated eigh, ``distributed`` = ScaLAPACK
             pzheevd, one tile over the mesh.
@@ -280,7 +280,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # below); a deck whose retained block hugged the cut would fail the
     # ``rank_report`` violations gate, not silently drift.
     #
-    # The eigh goes through the ffi.linalg plan family: ``eigh_backend`` from
+    # The eigh goes through the distrib_la plan family: ``eigh_backend`` from
     # the deck (auto = native batched eigh, replicated — (nk·nb)² is small;
     # distributed = ScaLAPACK pzheevd, one tile over the mesh, for band
     # windows where even (nk·nb)² replicated is unaffordable).
@@ -298,7 +298,9 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
 
     M = _gram(psi_rmu_Y)
 
-    from ffi.linalg import plan as linalg_plan
+    from ffi import _services
+    _services.ensure_on_path()
+    from distrib_la import plan as linalg_plan
     eigh_plan = linalg_plan("eigh", mesh_xy, backend=eigh_backend, n=m_states)
     if eigh_plan.is_native:
         @partial(jax.jit, out_shardings=(rep, rep))

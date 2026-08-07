@@ -87,7 +87,11 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
 from common.fft_helpers import local_fftn3
-from ffi.linalg import plan as linalg_plan
+from ffi import _services
+
+_services.ensure_on_path()          # services/*/src onto sys.path; transitional
+
+from distrib_la import plan as linalg_plan                          # noqa: E402
 
 # pipeline constants (§13.5 production shape; reference values verbatim)
 ALPHA = 0.30          # Gaussian split width, 1/bohr; broad optimum ~1.5-2x dq
@@ -860,7 +864,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     which keeps the whole stage at ≤2 XLA compiles instead of one per
     distinct sphere size (15 at MoS2 12×12; the ``_clean_split`` census
     finding).  ``eigh_backend='auto'`` resolves to the batched native path —
-    see ``ffi.linalg.LinalgPlan`` for when the FFI backends win;
+    see ``distrib_la.Plan`` for when the FFI backends win;
     they are honored per-q if explicitly requested.  n_μ is used at its
     LOGICAL extent here; the jitted evaluator pads on output.
 
@@ -884,7 +888,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     ndev = int(mesh_xy.devices.size)
     # ONE resolved plan for the whole q loop: platform / compiled-capability
     # / coverage / geometry guards all fire here, before any q is touched
-    # (see ffi.linalg.resolve), and the plan then carries the backend, the
+    # (see distrib_la.resolve_backend), and the plan then carries the backend,
     # operand-sharding contract and the batch behaviour to the call site
     # below.  auto|off resolve to the q-batched native path.  Hoisted, not
     # per-chunk: resolution dlopens, and the first FFI call builds a BLACS /

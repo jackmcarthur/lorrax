@@ -387,7 +387,7 @@ def normalize_w_dyson_solver(value) -> str:
     - ``local`` / ``auto`` / None → ``"local"`` (the q-parallel per-q
       dense LU; ``auto`` is a permanent back-compat alias).
     - ``distributed`` → ``"distributed"`` (the 2-D-sharded stacked-GEMM
-      backsolve through the ffi.linalg plan facade).
+      backsolve through the distrib_la plan door).
     - ``lu`` → ``"local"`` with a DeprecationWarning (it was the same
       route under its old name).
     - ``lstsq`` → ``ValueError``: the SVD min-norm inner solve was
@@ -425,8 +425,8 @@ def normalize_w_dyson_solver(value) -> str:
 def eigh_backend_choices() -> tuple:
     """The legal ``eigh_backend`` spellings — the RESOLVER's own list.
 
-    Read from :data:`ffi.linalg.resolve.BACKEND_CHOICES` so the parser and
-    the thing that actually dispatches cannot drift.  They HAD drifted:
+    Read from :data:`distrib_la.BACKEND_CHOICES` so the parser and the
+    thing that actually dispatches cannot drift.  They HAD drifted:
     this parser accepted only ``auto|off|cusolvermp|slate`` while the
     resolver had grown ``distributed`` (the portable "spread ONE tile over
     the mesh" spelling, and the ONLY eigh backend that exists on a host
@@ -434,13 +434,16 @@ def eigh_backend_choices() -> tuple:
     effect was that the low-memory eigh could not be requested at all
     through a GW input file on CPU — the very platform it is needed on.
 
-    Falls back to the literal tuple if ``ffi`` cannot be imported (a
-    parser must not need the FFI package to read a deck); the fallback is
-    pinned equal to the resolver's list by
-    ``tests/test_bse_setup_qchunk.py``.
+    ``BACKEND_CHOICES`` is importable with NO ``.so`` on the machine — that
+    is a distrib_la door promise, precisely so a deck parser never needs
+    the FFI layer.  The literal fallback below covers the remaining case,
+    a tree whose ``services/`` is not on the path at all; it is pinned
+    equal to the door's list by ``tests/test_bse_setup_qchunk.py``.
     """
     try:
-        from ffi.linalg.resolve import BACKEND_CHOICES
+        from ffi import _services
+        _services.ensure_on_path()
+        from distrib_la import BACKEND_CHOICES
         return tuple(BACKEND_CHOICES["eigh"])
     except Exception:
         return ("auto", "off", "distributed", "cusolvermp", "slate",
@@ -641,7 +644,7 @@ _DEFAULTS = {
     #       resolve time — see ffi/linalg + docs/dev/linalg_ffi.md).
     #       ``distributed`` = the PLATFORM's distributed library (ScaLAPACK
     #       pzheevd on a host mesh, cuSOLVERMp on CUDA) and is the spelling
-    #       that ports; the vocabulary is ffi.linalg.resolve's own, checked
+    #       that ports; the vocabulary is distrib_la's own, checked
     #       against it at parse time so the two can never drift.  The
     #       --eigh-backend CLI flag of htransform / exciton_bands OVERRIDES
     #       this key.
@@ -775,7 +778,7 @@ _DEFAULTS = {
     #   local (default; auto is an alias)
     #                per-q pivoted LU inside the q-parallel shard_map.
     #   distributed  2-D-sharded stacked-GEMM backsolve through the
-    #                ffi.linalg plan facade (ScaLAPACK on CPU meshes,
+    #                distrib_la plan door (ScaLAPACK on CPU meshes,
     #                cuSOLVERMp on CUDA); no rank ever materialises a
     #                full (μ, μ) tile.  Refuses loudly at resolve time
     #                on an unsupported mesh/build — never silently
@@ -2020,14 +2023,14 @@ class LorraxConfig:
         # eigh_backend + use_low_mem_eigh are ONE axis; ``resolve_eigh_backend``
         # is the single place they combine (the raw-params drivers call the
         # same function).  It also owns the vocabulary check, read from
-        # ffi.linalg.resolve so parser and dispatcher cannot drift.
+        # distrib_la so parser and dispatcher cannot drift.
         _use_low_mem_eigh = bool(_g("use_low_mem_eigh"))
         _eigh_backend = resolve_eigh_backend({
             "eigh_backend": _g("eigh_backend"),
             "use_low_mem_eigh": _use_low_mem_eigh,
         })
         # No CPU rewriting for eigh_backend: an explicit FFI request keeps
-        # the fails-loudly semantics — ffi.linalg.resolve_backend rejects
+        # the fails-loudly semantics — distrib_la.resolve_backend rejects
         # cusolvermp on a CPU mesh (and a slate-less build) at resolve time.
         _charge_zeta_solve = str(_g("charge_zeta_solve")).strip().lower()
         if _charge_zeta_solve not in ("rank_truncate", "cholesky"):

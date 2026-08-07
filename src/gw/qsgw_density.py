@@ -17,7 +17,7 @@ A single ``lax.scan`` over k.  Per k, in this order:
 
 ``Z`` is sharded ``P(None, 'x', 'y')`` — m on 'x', n on 'y' — so no rank
 ever holds a full ``(nb, nb)``.  That is the NATIVE layout of both
-eigenvector producers (``ffi.linalg._scalapack.batched_distributed_eigh``
+eigenvector producers (``distrib_la``'s ScaLAPACK ``batched_distributed_eigh``
 and a ``jnp.linalg.eigh`` constrained to it), and the contraction is
 written to consume it as-is: transposing Z to put n on 'x' would swap the
 sharding to ``P(None,'y','x')`` and cost an all-to-all on the largest
@@ -156,7 +156,7 @@ def rotate_band_axis(X, U, *, mesh: Mesh, axis: int, to_qp: bool,
     """Rotate ONE band axis of ``X`` through ``U``, U kept distributed.
 
     ``U[k, m, n] = <DFT_m | QP_n>`` -- eigenvectors are COLUMNS, the same
-    convention as ``ffi.linalg``, ``jnp.linalg.eigh``,
+    convention as ``distrib_la``, ``jnp.linalg.eigh``,
     :func:`distributed_eigh_bands` and
     ``wavefunction_bundle.rotate_wavefunctions``.
 
@@ -328,7 +328,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     U : (n_k, nb, nb) complex, sharded :func:`band_rotation_spec`, optional
         Eigenvectors as COLUMNS — ``U[k, m, n]`` is component m of
         rotated band n, so ψ̃_n = Σ_m U[m,n] ψ_m.  This is what
-        ``ffi.linalg`` and ``jnp.linalg.eigh`` return and what
+        ``distrib_la`` and ``jnp.linalg.eigh`` return and what
         ``sc_iteration`` already assumes; do not pass a transpose.
         ``None`` builds ρ from ``psi_G`` unrotated — the DFT density and
         the gate's baseline.
@@ -531,7 +531,7 @@ def rotate_bands(psi_G, U_qp, *, mesh: Mesh):
     """ψ̃_nk(G) = Σ_m U_qp[k,m,n] ψ_mk(G) — one sharded einsum, on the sphere.
 
     Eigenvectors are COLUMNS (``U_qp[k, m, n]`` = component m of QP band
-    n), matching ``ffi.linalg``, ``jnp.linalg.eigh`` and
+    n), matching ``distrib_la``, ``jnp.linalg.eigh`` and
     ``sc_iteration._rotate_to_dft_basis``.
 
     ``U_qp`` is :func:`band_rotation_spec` — m on 'x', n on 'y' — so the
@@ -635,7 +635,7 @@ def distributed_eigh_bands(H, *, mesh: Mesh):
     failing or deadlocking inside the call.
 
     Batching asymmetry (only ScaLAPACK has a batched entry; cuSOLVERMp
-    and SLATE do not) is handled by ``ffi.linalg.dispatch_batched_eigh``,
+    and SLATE do not) is handled by ``distrib_la.dispatch_batched_eigh``,
     not here — it is a backend-capability question, not a physics one.
 
     ``pXheevd`` is the permanent CPU distributed eigh; the batched entry
@@ -656,7 +656,9 @@ def distributed_eigh_bands(H, *, mesh: Mesh):
     :func:`gw.efermi.fermi_level_step` is, because that routine refuses to
     split a degenerate manifold.  Same guarantee, twice.
     """
-    from ffi.linalg import dispatch_batched_eigh
+    from ffi import _services
+    _services.ensure_on_path()
+    from distrib_la import dispatch_batched_eigh
 
     H_j = jnp.asarray(H)
     nb = int(H_j.shape[1])

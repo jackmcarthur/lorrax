@@ -33,7 +33,11 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from ffi.linalg import plan as linalg_plan
+from ffi import _services
+
+_services.ensure_on_path()          # services/*/src onto sys.path; transitional
+
+from distrib_la import plan as linalg_plan                          # noqa: E402
 # Every extent this module shards is an input datum: n_μ is a k-means centroid
 # count, nb_fi is the caller's band window, and the q-batch is batch_size — so
 # each of them divides the mesh axis only by luck.  ``bse_io`` pads its own μ
@@ -183,7 +187,7 @@ def compute_wfns_fi(
                    ``distributed|cusolvermp|slate|scalapack`` route ONE
                    (rank, rank) tile at a time through the distributed-linalg
                    FFI.  See the eigh comment in the batch loop below for
-                   which regime is which, and ``ffi.linalg.LinalgPlan`` for
+                   which regime is which, and ``distrib_la.Plan`` for
                    the backends.
         use_low_mem_eigh: the SECOND eigenvalue path, named by intent rather
                    than by library (input key ``use_low_mem_eigh``).  False
@@ -192,7 +196,7 @@ def compute_wfns_fi(
                    (rank, rank) matrices.  True = keep the matrix spread over
                    the μ×ν face and run a DISTRIBUTED eigh, i.e. exactly
                    ``eigh_backend='distributed'`` (ScaLAPACK ``pzheevd`` on a
-                   host mesh, cuSOLVERMp on CUDA — ``ffi.linalg.resolve
+                   host mesh, cuSOLVERMp on CUDA — ``distrib_la.resolve
                    ._DISTRIBUTED_DEFAULT``).  Slower per q by construction
                    (one matrix ndev-ways, q walked serially) and chosen when
                    ONE whole (rank, rank) matrix no longer fits per rank.
@@ -277,7 +281,7 @@ def compute_wfns_fi(
     # Doctrine 3 (OWNER_DECISIONS / linalg.resolve): an explicit request that
     # cannot be honoured REFUSES; only ``auto`` may demote, and then it must
     # announce.  ``distributed`` is an explicit request in
-    # ``ffi.linalg.resolve`` — it runs the whole guard ladder and raises —
+    # ``distrib_la`` — it runs the whole guard ladder and raises —
     # which is precisely the behaviour this flag needs, so the flag is a
     # rename onto it and adds no second policy.
     _eigh_requested = str(eigh_backend or "auto").strip().lower()
@@ -377,7 +381,7 @@ def compute_wfns_fi(
     # Resolve-time backend resolution: every guard (vocabulary, platform,
     # compiled-capability, process coverage, SQUARE mesh — cusolverMpSyevd
     # DEADLOCKS on rectangular blocks — and rank divisibility) fires HERE,
-    # before any q is solved.  See ffi.linalg.resolve for the guard order.
+    # before any q is solved.  See distrib_la.resolve_backend for the order.
     try:
         eigh_plan = linalg_plan("eigh", mesh_xy, backend=_eigh_requested,
                                 n=rank)
@@ -404,13 +408,13 @@ def compute_wfns_fi(
     native = eigh_plan.is_native
     if use_low_mem_eigh and native:
         # Belt and braces: 'distributed' never resolves to native in
-        # ffi.linalg.resolve (it raises instead), so this is unreachable
+        # distrib_la's resolver (it raises instead), so this is unreachable
         # today — but it is the ONE assertion standing between a future
         # resolver change and a silent honour-in-name-only.
         raise RuntimeError(
             f"use_low_mem_eigh=True resolved to the NATIVE eigh "
             f"(requested {_eigh_requested!r}) — that is the whole-matrix "
-            f"path this flag exists to avoid.  ffi.linalg.resolve must "
+            f"path this flag exists to avoid.  distrib_la must "
             f"refuse rather than demote for an explicit request.")
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
 

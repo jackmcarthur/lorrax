@@ -1561,7 +1561,7 @@ def _ffi_dial_facts() -> list:
 def _linalg_facts(mesh) -> dict:
     """Which distributed dense-linalg backends this mesh can actually serve.
 
-    ``ffi.linalg.resolve.list_backends`` runs the same guards the real call
+    ``distrib_la.list_backends`` runs the same guards the real call
     will run (platform, compiled capability, one-process-per-device, mesh
     geometry), so "available" here is a promise, not a guess.  It never
     prints and never raises for an availability reason.
@@ -1574,13 +1574,15 @@ def _linalg_facts(mesh) -> dict:
     and the config echo reports the choice.
     """
     try:
-        from ffi.linalg import resolve as _lin
+        from ffi import _services
+        _services.ensure_on_path()
+        from distrib_la import list_backends as _list_backends
     except Exception as exc:                                  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {exc}"}
     out = {}
     for op in ("eigh", "cholesky", "solve_lu"):
         try:
-            status = _lin.list_backends(op, mesh)
+            status = _list_backends(op, mesh)
             out[op] = sorted(b for b, s in status.items()
                              if s.startswith("available"))
         except Exception as exc:                              # noqa: BLE001

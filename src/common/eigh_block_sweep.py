@@ -40,7 +40,9 @@ def main() -> int:
     args = ap.parse_args()
 
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from ffi.linalg import backend_module
+    from ffi import _services
+    _services.ensure_on_path()
+    from distrib_la import backend_module
     distributed_eigh = backend_module("cusolvermp").distributed_eigh
 
     # ``resolve_mesh`` builds the square s x s mesh (square-only ruling,

@@ -13,7 +13,7 @@ W Dyson solve — exactly TWO plans (input key ``w_dyson_solver``):
 ``distributed``
     2-D-sharded backsolve: A_q = 1 − V_q·χ_q formed by stacked block
     GEMMs with every operand at ``P(None,'x','y')``, factored and solved
-    through the ``ffi.linalg`` plan facade (ScaLAPACK ``pzgetrf`` /
+    through the ``distrib_la`` plan door (ScaLAPACK ``pzgetrf`` /
     ``pzgetrs`` on CPU meshes, cuSOLVERMp on CUDA).  No rank ever
     materialises a full (μ, μ) tile — the memory ceiling that matters at
     thousands of low-memory processes.  W lands natively in
@@ -444,7 +444,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
        (the AF transport bound; separate XLA executions cannot be
        re-combined by a compiler pass).
     2. **Factor + backsolve** — ONE resolved
-       :class:`ffi.linalg.plan.LinalgPlan` for ``solve_lu`` with
+       :class:`distrib_la.Plan` for ``solve_lu`` with
        ``backend='distributed'`` (ScaLAPACK ``pzgetrf``/``pzgetrs`` on a
        CPU mesh, cuSOLVERMp on CUDA — ``resolve._DISTRIBUTED_DEFAULT``),
        consuming the block-cyclic tiles where they already live.
@@ -488,7 +488,9 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
         return _w_solve_cache[cache_key]
 
     from common.shard_map import shard_map
-    from ffi.linalg.plan import plan as linalg_plan
+    from ffi import _services
+    _services.ensure_on_path()
+    from distrib_la import plan as linalg_plan
     # House chunking pattern — single source (scorecard AF): one emitted
     # collective's payload is bounded by LORRAX_COLLECTIVE_CHUNK_MB.
     # TODO(release): promote _chunk_q/_chunk_log to a public home (e.g.
@@ -705,7 +707,7 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None):
       shard_map.  Legal on any mesh; each rank holds whole (μ, μ)
       tiles for its q's.
     - ``distributed``: 2-D-sharded stacked-GEMM backsolve through the
-      ffi.linalg plan facade (ScaLAPACK on CPU, cuSOLVERMp on CUDA).
+      distrib_la plan door (ScaLAPACK on CPU, cuSOLVERMp on CUDA).
       No rank ever materialises a full (μ, μ) tile — the P→∞ memory
       ceiling.  Slower than ``local`` at moderate P; that is priced and
       accepted (the point is the per-rank memory ceiling, not speed).

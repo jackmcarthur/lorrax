@@ -414,7 +414,9 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     if ndev <= 1 or not big:
         return "native"
 
-    from ffi.linalg import resolve_backend
+    from ffi import _services
+    _services.ensure_on_path()
+    from distrib_la import resolve_backend
     try:
         resolve_backend("eigh", "distributed", mesh_xy, n=nb_solve)
     except Exception as exc:                                  # noqa: BLE001
