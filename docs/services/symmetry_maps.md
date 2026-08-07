@@ -42,7 +42,7 @@ so reaching *past* the door is the thing that still flags.
 | `SymMaps(wfn)` | The eager table builder. Symmetry ops (spatial + TRS-augmented halves), `irr_idx_k`/`sym_idx_k`, the q maps, `R_cart` / `R_cart_forward` / `R_proper`, `U_spinor`, umklapp vectors. Reads 11 header attributes of `wfn`, including the MEASURED `trs_holds`. |
 | `KStarMap(irr_idx, sym_idx, n_sym_spatial)` / `.from_sym(sym, nss)` | Band-index IBZ ⇄ full BZ. Bundles the three arrays that always travel together so no call site can supply two of the three. `.identity(nk)` is the no-reduction map, so a driver reads the same whether or not symmetry is in use. `select` / `broadcast` / `spread` / `spread_rel`. |
 | `star_select(A_full, irr_idx_k)` | Keep one row per star — the FIRST occurrence, in full-BZ order, never `np.unique`'s ascending label order. |
-| `star_broadcast(A_irr, irr, sidx, nss, *, trs_reference)` | IBZ → full BZ with the conjugation predicate. `trs_reference` is EXPLICIT and has exactly two legal values, one per operand flavour. Unknown values RAISE. |
+| `star_broadcast(A_irr, irr, sidx, nss, *, trs_reference='star_row')` | IBZ → full BZ with the conjugation predicate. Two legal values, one per operand flavour; an unknown value RAISES rather than defaulting. The default is `'star_row'` — see Contract for why the one `'ibz_slab'` caller passes it as a literal anyway. |
 | `star_spread(A_full, irr, sidx, nss)` | The one diagnostic that sees a gauge or conjugation mismatch. Hermiticity, norms and electron counts all survive one. |
 | `unfold_v_q(V_q_ibz, *, irr_idx, sym_idx, sym_perm, L_table, q_irr_frac, mesh_xy, n_sym_spatial)` | Sharded centroid double-gather + umklapp L-phase + TRS conj. `shard_map` + paired `all_to_all`, 1× single-tile peak memory per rank. |
 | `unfold_v_q_bispinor_lorentz(...)` | The 3-vector Lorentz mixing on the bispinor TT block. Its `R_proper_table` operand is in a convention the §A5 formula compensates for — see Antipatterns. |
@@ -64,7 +64,8 @@ kept rather than deleted, with the case where it returns FALSE constructed
   `_spread_tables`, and `KStarMap` twice. No site inside the package
   re-derives it, and nothing outside imports it. The hand-rolls that remain
   in `src/` are registered to their owners, not copied in here.
-* **`trs_reference` is explicit and refusal-guarded.** `"star_row"` means
+* **`trs_reference` names the operand flavour, and the one caller that needs
+  the non-default value says so in the source.** `"star_row"` means
   `A_irr`'s rows are the values at the KEPT FULL-BZ rows (what
   `star_select` returns), so the conjugation is the XOR. `"ibz_slab"` means
   `A_irr` is the raw IBZ slab, read with no symmetry operation applied, so
@@ -73,7 +74,13 @@ kept rather than deleted, with the case where it returns FALSE constructed
   spatial, which is a property of the op-selection policy and not of the
   physics. Getting the pairing wrong costs ~0.4–0.6 relative on real decks
   (measured: gnppm `kin_ion` 3.7e-16 right vs 5.6e-01 wrong) and is
-  entirely off-diagonal in Σ.
+  entirely off-diagonal in Σ. The parameter HAS a default (`"star_row"`,
+  right for what `star_select` hands back), so a caller on the other
+  flavour is one omitted keyword away from the 183.61 eV — which is why
+  `gw/kin_ion_io.py` passes the literal and
+  `tests/test_kin_ion_star_broadcast.py` asserts by AST that it is a string
+  CONSTANT, not a variable and not a conditional. An unknown spelling
+  raises with both legal values named; it never falls through.
 * **The op-selection policy is bit-frozen.** `find_symmetry_ops_simple` has
   no `break` — the HIGHEST matching `ikbar` wins, then the lowest sym — and
   `find_irreducible_bz_points`' anchored branch shadows it bit-for-bit.
@@ -137,7 +144,7 @@ to be indexed.
 | L-b emulated mesh | `test_symmetry_maps_emulated_mesh.py` | 17 | `XLA_FLAGS` set by the SERVICE conftest; **skips**, never asserts, below 4 devices |
 | L-c real multi-process | `test_symmetry_maps_multiproc.py` | 11 | `srun -n 4`; shared `check_*(mesh, …)` bodies + a `__main__` CLI (`_CLI_CELLS`) |
 | import isolation | `test_symmetry_maps_import_isolation.py` | 9 | `python -S` subprocess; `sys.modules` AND `sys.path` asserted, plus a red twin and a with-lorrax-still-passes |
-| skip honesty | `test_symmetry_maps_skip_honesty.py` | 14 | a machine profile; the TRS-active cells are MUST-RUN rows |
+| skip honesty | `test_symmetry_maps_skip_honesty.py` | 14 | a machine profile. Four MUST rows — the four in-tree decks, the `cohsex_debug` density fixture, `h5py`, and four forceable devices. ABSENT = skip, PRESENT-AND-BROKEN = **FAIL** |
 
 What the star tier does that the old gate did not:
 
@@ -152,9 +159,12 @@ What the star tier does that the old gate did not:
   (cohsex) or the test FAILS. A test that would pass on a deck where the
   two predicates agree is not testing the predicate.
 * **`SymMaps` on h5py header stubs of all four in-tree decks**, bit-compared
-  to the committed tables, with a WfnLoader parity arm that runs whenever
-  lorrax is importable — and skip-honesty makes that arm MUST-RUN rather
-  than a quiet skip.
+  to the committed tables, with a WfnLoader parity arm that re-derives them
+  through the PRODUCTION loader. That arm skips on a standalone install
+  (there is no lorrax to import `file_io` from — the quarantine working),
+  and skip-honesty makes that legal only because the allowlist NAMES the
+  leg that runs it: the monorepo run from the checkout root. A skip with no
+  covering leg named is evaporated coverage and fails the gate.
 * **Hostile geometry is mandatory**: `n_rmu % (Px·Py) != 0` must refuse, and
   the red twin constructs the case.
 

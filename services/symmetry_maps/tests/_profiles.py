@@ -78,11 +78,14 @@ _ALLOWED = (
     # A STRICT XFAIL REPORTS AS A SKIP, so the gate rules on it and must be
     # told.  Same shape as distrib_la's SLATE SIGSEGV row: a CARRIED
     # upstream defect, named, with no covering leg claimed — because there
-    # is none.  MEASURED 2026-08-07: jax 0.9.1 / XLA CPU loses NaN in a
-    # PARTITIONED max reduction (-inf, the reduce identity, comes back
-    # instead), so `KStarMap.spread_rel` cannot refuse a poisoned SHARDED
-    # operand and `sc_iteration._check_kstar_spread`'s `not (spread <= tol)`
-    # passes it.  The cell's docstring carries the full table.
+    # is none.  MEASURED 2026-08-07 on an EMULATED four-device mesh: jax
+    # 0.9.1 / XLA CPU loses NaN in a PARTITIONED max reduction (-inf, the
+    # reduce identity, comes back instead), so `KStarMap.spread_rel` cannot
+    # refuse a poisoned SHARDED operand there and
+    # `sc_iteration._check_kstar_spread`'s `not (spread <= tol)` passes it.
+    # A REAL `srun -n 4` mesh PROPAGATES the NaN (measured the same day,
+    # jax 0.7.0, at 2x2 and 4x1), so topology-vs-jax-version is unresolved.
+    # The cell's docstring carries both legs and the full table.
     # The wsl-profile detection cell asserts is_wsl() -> the wsl row; on
     # every other machine that predicate is FALSE BY CONSTRUCTION and the
     # cell skips.  First tripped on the real Perlmutter leg 2026-08-07 —
