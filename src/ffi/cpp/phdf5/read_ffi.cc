@@ -275,20 +275,56 @@ static ffi::Error ReadImpl(
 // outside it get zeros, and edge ranks read clipped hyperslabs.
 static ffi::Error ReadDispatch(
     LRX_STREAM_PARAM
+    ffi::Buffer<ffi::DataType::S64> handle_buf,   // shape (2,) {ctx_handle, ds_id}
     ffi::Buffer<ffi::DataType::S64> offset_buf,   // shape (ndim,)
     ffi::Buffer<ffi::DataType::S64> valid_shape_buf, // shape (ndim,)
     ffi::Result<ffi::AnyBuffer> A_out,
-    int64_t ctx_handle,
-    int64_t ds_id,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
     ffi::Span<const int64_t> axis_flat)
 {
-    auto* ctx = reinterpret_cast<PhdfCtx*>(ctx_handle);
+    // ``ctx_handle`` and ``ds_id`` arrive as a RUNTIME buffer, not as FFI
+    // Attrs.  Attrs are baked into the HLO, and ctx_handle is a heap
+    // address, so as an Attr it made every module unique PER PROCESS: the
+    // persistent compile cache could never hit one and rewrote it on every
+    // run.  MEASURED 2026-08-07 with a byte-identical workload and a
+    // private cache dir: jit__per_rank entries went 4 -> 8 -> 12 over three
+    // runs while a plain jit control stayed at 1, and the shared np1 cache
+    // held 6813 such corpses out of 14443 entries.  ds_id moves with it —
+    // as an Attr it also forked a module per (file, dataset) pair, so the
+    // module count scaled with the deck instead of with the geometry.
+    // This is the same argument that already made ``offset_base`` a Buffer;
+    // see the note above WriteDispatch in write_ffi.cc.
+    //
+    // Both values are replicated across the mesh (the shard_map passes them
+    // with ``P()``), so every refusal below is still computed from inputs
+    // that are identical on every rank.
+    if (handle_buf.dimensions().size() != 1 ||
+        handle_buf.dimensions()[0] != 2) {
+        return ffi::Error(
+            ffi::ErrorCode::kInvalidArgument,
+            "phdf5 read: handle_buf must have shape (2,) == "
+            "{ctx_handle, ds_id}");
+    }
+    int64_t handle_host[2] = {0, 0};
+    {
+        // No ctx yet, so there is nothing to announce through: return
+        // plainly.  A failure here is a broken D2H copy, not a collective
+        // divergence — it hits every rank identically.
+        std::string herr;
+        if (!copy_index_to_host(handle_host, handle_buf.untyped_data(),
+                                2 * sizeof(int64_t), &herr)) {
+            return ffi::Error(ffi::ErrorCode::kInternal,
+                              "phdf5 read: copy(handle) failed: " + herr);
+        }
+    }
+    auto* ctx = reinterpret_cast<PhdfCtx*>(handle_host[0]);
+    const hid_t ds_id = (hid_t)handle_host[1];
 
     // Every refusal in this dispatch is computed from replicated inputs (FFI
-    // Attrs, the equal-block output shape, a collectively-opened ds_id), so
-    // it fires on every rank or none — the only kind a collective tolerates.
+    // Attrs, the replicated handle buffer, the equal-block output shape, a
+    // collectively-opened ds_id), so it fires on every rank or none — the
+    // only kind a collective tolerates.
     auto fail = [ctx](ffi::ErrorCode code, const std::string& msg) {
         announce_error(ctx, msg);
         return ffi::Error(code, msg);
@@ -1246,11 +1282,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     LRX_PHDF_HANDLER(PhdfRead), lorrax_ffi::phdf5::ReadDispatch,
     xla::ffi::Ffi::Bind()
         LRX_PHDF_STREAM_CTX
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()  // handle {ctx, ds}
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()  // offset_base
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()  // valid_shape
         .Ret<xla::ffi::AnyBuffer>()
-        .Attr<int64_t>("ctx_handle")
-        .Attr<int64_t>("ds_id")
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
         .Attr<xla::ffi::Span<const int64_t>>("axis_flat"));

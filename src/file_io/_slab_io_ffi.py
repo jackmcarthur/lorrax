@@ -1312,40 +1312,53 @@ def _validate_block_divisible(
 # Module-level shard_map kernel factories (read / write)
 # ---------------------------------------------------------------------------
 #
-# A jit'd shard_map per ``(mesh, sharding, ctx_handle, ds_id, mesh_shape,
-# axis layout, dtype/shape)`` signature.  Caching at module scope means
-# all ``_FfiBackend`` instances share one cache — re-opening the same
-# file, or opening any file with a matching FFI signature, reuses the
-# compile.  The closure is built INSIDE the cached factory so its
-# Python ``id()`` is stable per cache entry (vs ``functools.partial``,
-# which constructs a fresh wrapper each call and defeats JAX's
-# trace-cache identity test).
+# A jit'd shard_map per ``(mesh, sharding, mesh_shape, axis layout,
+# dtype/shape)`` signature.  Caching at module scope means all
+# ``_FfiBackend`` instances share one cache — re-opening the same file,
+# or opening any file with a matching FFI signature, reuses the compile.
+# The closure is built INSIDE the cached factory so its Python ``id()``
+# is stable per cache entry (vs ``functools.partial``, which constructs
+# a fresh wrapper each call and defeats JAX's trace-cache identity test).
 #
-# FFI attrs (``ctx_handle``, ``ds_id``, mesh layout) remain compile-time
-# constants — distinct ``(file, dataset)`` tuples genuinely produce
-# distinct HLO modules (the FFI handler picks the dataset by ``ds_id``).
-# Coalescing across files would require making those attrs runtime args
-# on the C++ side, which is out of scope for this refactor.
+# ``ctx_handle`` and ``ds_id`` are NOT in that signature: they travel as
+# a runtime ``(2,)`` int64 buffer (``ffi.io.handle_vector``), so one
+# compiled module serves every file, every dataset and every process.
+#
+# They used to be FFI Attrs, which are baked into the HLO.  ctx_handle is
+# a heap address, so the module differed in EVERY PROCESS and the JAX
+# persistent compile cache could never hit one — it wrote a fresh entry
+# every run, forever.  MEASURED 2026-08-07, byte-identical workload into
+# a private cache dir: ``jit__per_rank`` entries went 4 -> 8 -> 12 across
+# three runs while a plain ``jax.jit`` control stayed at 1, and the
+# shared ``$SCRATCH/lorrax_jax_cache/np1`` had accumulated 6813 such dead
+# entries out of 14443 (47%, 27 MB, growing without bound).  The HLO diff
+# between two processes was a single token: ``ctx_handle = 56960080`` vs
+# ``58537408``.  ds_id moved out with it because as an Attr it forked a
+# module per (file, dataset) pair, so the module count scaled with the
+# deck rather than with the geometry.
+#
+# The C++ side reads both out of the buffer at the top of ReadDispatch /
+# WriteDispatch (one 16-byte D2H copy, alongside the two already there
+# for offset/valid_shape).  Changing one side without the other is a hard
+# FFI signature mismatch at the first call — they land together.
 
 @functools.lru_cache(maxsize=None)
 def _get_read_sm(mesh, partition_spec, *,
-                 ds_id, ctx_handle, mesh_shape,
-                 axis_count_per_dim, axis_flat, out_struct):
+                 mesh_shape, axis_count_per_dim, axis_flat, out_struct):
     """One H5Dread per rank.  Returns a jit'd shard_map; identity-stable
     via lru_cache so JAX's trace cache hits on repeat invocation."""
     from ffi.phdf5.read import ffi_read_call
 
-    def _per_rank(offset_local, valid_shape_local):
+    def _per_rank(handle_local, offset_local, valid_shape_local):
         return ffi_read_call(
-            out_struct, offset_local, valid_shape_local,
-            ctx_handle=ctx_handle, ds_id=ds_id,
+            out_struct, handle_local, offset_local, valid_shape_local,
             mesh_shape=mesh_shape,
             axis_count_per_dim=axis_count_per_dim,
             axis_flat=axis_flat,
         )
     sm_bare = shard_map(
         _per_rank, mesh=mesh,
-        in_specs=(P(), P()), out_specs=partition_spec,
+        in_specs=(P(), P(), P()), out_specs=partition_spec,
         check_vma=False,
     )
     return jax.jit(sm_bare)
@@ -1353,24 +1366,22 @@ def _get_read_sm(mesh, partition_spec, *,
 
 @functools.lru_cache(maxsize=None)
 def _get_write_sm(mesh, in_specs, *,
-                  ds_id, ctx_handle, mesh_shape,
-                  axis_count_per_dim, axis_flat, no_jit):
+                  mesh_shape, axis_count_per_dim, axis_flat, no_jit):
     """One H5Dwrite per rank.  ``LORRAX_WRITE_NO_JIT=1`` (passed via
     ``no_jit``) skips the jit wrapper — diagnostic for chasing the
     jit-argument-retention buffer leak on long write loops."""
     from ffi.phdf5.write import ffi_write_call
 
-    def _per_rank(A_local, offset_local, valid_shape_local):
+    def _per_rank(A_local, handle_local, offset_local, valid_shape_local):
         return ffi_write_call(
-            A_local, offset_local, valid_shape_local,
-            ctx_handle=ctx_handle, ds_id=ds_id,
+            A_local, handle_local, offset_local, valid_shape_local,
             mesh_shape=mesh_shape,
             axis_count_per_dim=axis_count_per_dim,
             axis_flat=axis_flat,
         )
     sm_bare = shard_map(
         _per_rank, mesh=mesh,
-        in_specs=(in_specs, P(), P()), out_specs=P(),
+        in_specs=(in_specs, P(), P(), P()), out_specs=P(),
         check_vma=False,
     )
     return sm_bare if no_jit else jax.jit(sm_bare)
@@ -1713,11 +1724,11 @@ class _FfiBackend(_DatasetGeometry):
         in_specs = A.sharding.spec  # PartitionSpec
 
         # Module-level lru_cache shared across all _FfiBackend instances.
-        # Keys on the FFI signature (ctx_handle / ds_id / mesh / sharding);
-        # offset is a RUNTIME arg so different chunks reuse one compile.
+        # Keys on the FFI signature (mesh / sharding / geometry) ONLY:
+        # ctx_handle, ds_id, offset and valid_shape are all RUNTIME args,
+        # so one compile serves every chunk, dataset, file and process.
         sm = _get_write_sm(
             self.mesh, in_specs,
-            ds_id=int(ds_id), ctx_handle=int(ctx_handle),
             mesh_shape=mesh_shape,
             axis_count_per_dim=axis_count_per_dim,
             axis_flat=axis_flat,
@@ -1727,11 +1738,15 @@ class _FfiBackend(_DatasetGeometry):
         # Enqueue dispatch onto the Python worker thread.  Main thread
         # returns in ~0.2ms; the worker thread calls ``sm(A, offset)``
         # in FIFO order.  The offset Buffer is tiny (ndim × 8 bytes).
+        # Same replicated-control-buffer path as offset/valid_shape:
+        # device_put_process_local, so this does NOT add a per-call
+        # blocking all-gather at P>1 (scorecard AA.1).
+        handle_arr = _replicated_i64_vector((ctx_handle, ds_id), self.mesh)
         offset_arr = _replicated_i64_vector(off, self.mesh)
         valid_shape_arr = _replicated_i64_vector(vshape, self.mesh)
 
         def _task():
-            tok = sm(A, offset_arr, valid_shape_arr)
+            tok = sm(A, handle_arr, offset_arr, valid_shape_arr)
             tok.block_until_ready()
 
         self._queued_bytes += int(A.nbytes)
@@ -1836,18 +1851,19 @@ class _FfiBackend(_DatasetGeometry):
         ctx_handle = self.fh
 
         # Module-level lru_cache shared across all _FfiBackend instances.
+        # ctx_handle / ds_id are runtime args, not part of the key.
         sm = _get_read_sm(
             mesh, partition_spec,
-            ds_id=int(ds_id), ctx_handle=int(ctx_handle),
             mesh_shape=mesh_shape,
             axis_count_per_dim=axis_count_per_dim,
             axis_flat=axis_flat,
             out_struct=out_struct,
         )
 
+        handle_arr = _replicated_i64_vector((ctx_handle, ds_id), mesh)
         offset_arr = _replicated_i64_vector(off, mesh)
         valid_shape_arr = _replicated_i64_vector(vshape, mesh)
-        result = sm(offset_arr, valid_shape_arr)
+        result = sm(handle_arr, offset_arr, valid_shape_arr)
         result.block_until_ready()
         return result
 

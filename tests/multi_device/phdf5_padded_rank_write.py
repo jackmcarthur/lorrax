@@ -207,20 +207,20 @@ def _raw_encoding(mesh, spec, ndim):
 
 def _raw_write(fh, ds_id, A, mesh, spec, offset, valid, enc):
     from common.shard_map import shard_map
-    from ffi.io import ffi_write_call
+    from ffi.io import ffi_write_call, handle_vector
     mesh_shape, acpd, aflat = enc
 
-    def _per_rank(A_local, off_l, vs_l):
+    def _per_rank(A_local, h_l, off_l, vs_l):
         return ffi_write_call(
-            A_local, off_l, vs_l,
-            ctx_handle=int(fh), ds_id=int(ds_id),
+            A_local, h_l, off_l, vs_l,
             mesh_shape=mesh_shape,
             axis_count_per_dim=acpd, axis_flat=aflat)
 
     tok = shard_map(_per_rank, mesh=mesh,
-                    in_specs=(spec, P(), P()), out_specs=P(),
+                    in_specs=(spec, P(), P(), P()), out_specs=P(),
                     check_vma=False)(
         A,
+        handle_vector(fh, ds_id),
         jnp.asarray(offset, dtype=jnp.int64),
         jnp.asarray(valid, dtype=jnp.int64))
     return jax.block_until_ready(tok)
@@ -228,21 +228,21 @@ def _raw_write(fh, ds_id, A, mesh, spec, offset, valid, enc):
 
 def _raw_read(fh, ds_id, local_shape, mesh, spec, offset, valid, enc):
     from common.shard_map import shard_map
-    from ffi.io import ffi_read_call
+    from ffi.io import ffi_read_call, handle_vector
     mesh_shape, acpd, aflat = enc
     out_struct = jax.ShapeDtypeStruct(tuple(int(s) for s in local_shape),
                                       jnp.complex128)
 
-    def _per_rank(off_l, vs_l):
+    def _per_rank(h_l, off_l, vs_l):
         return ffi_read_call(
-            out_struct, off_l, vs_l,
-            ctx_handle=int(fh), ds_id=int(ds_id),
+            out_struct, h_l, off_l, vs_l,
             mesh_shape=mesh_shape,
             axis_count_per_dim=acpd, axis_flat=aflat)
 
     out = shard_map(_per_rank, mesh=mesh,
-                    in_specs=(P(), P()), out_specs=spec,
+                    in_specs=(P(), P(), P()), out_specs=spec,
                     check_vma=False)(
+        handle_vector(fh, ds_id),
         jnp.asarray(offset, dtype=jnp.int64),
         jnp.asarray(valid, dtype=jnp.int64))
     return jax.block_until_ready(out)

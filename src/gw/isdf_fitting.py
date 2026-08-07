@@ -697,14 +697,16 @@ def fit_zeta_to_h5(
     # orbit permutation, G-sphere) is rebuilt at read time via
     # ``SymMaps`` + ``orbit_syms`` and is *not* stored.
     #
-    # Sequence: the inode is replaced (rank-0 unlink + barrier), rank 0
-    # writes both header groups in mode='w', closes.  Then SlabIO
-    # re-opens with mode='a' so the headers survive and
-    # ``create_dataset('zeta_q')`` appends rather than truncates.
+    # Sequence: SlabIO(mode='w') replaces the inode (rank-0 unlink +
+    # barrier) and CREATES it collectively, so H5Fcreate applies the
+    # Lustre striping hints; it closes immediately.  Rank 0 then appends
+    # both header groups with h5py mode='a'.  Then SlabIO re-opens with
+    # mode='a' so the headers survive and ``create_dataset('zeta_q')``
+    # appends rather than truncates.  The create-order matters and is
+    # explained at the write_headers section below.
     from file_io.slab_io import SlabIO
     from file_io.mf_header import copy_mf_header
     from file_io.isdf_header import IsdfHeader, write_isdf_header
-    from file_io._slab_io_ffi import _replace_inode_for_write
 
     _wfn_src_path = getattr(wfn, '_filename', None)
     if _wfn_src_path is None:
@@ -741,18 +743,44 @@ def fit_zeta_to_h5(
     _isdf_hdr = IsdfHeader.build(**_hdr_kwargs)
 
     with timing.section("zeta_fit.write_headers"):
-        # Replace the inode BEFORE any h5py create: h5py mode='w'
-        # truncates in place (reuses the inode), and a Lustre stripe
-        # layout is fixed at inode create — without the unlink a rerun
-        # over an existing 1-stripe zeta_q.h5 keeps 1 stripe forever.
-        # (The old ``lfs setstripe`` prestripe helper was deleted
-        # 2026-07-31: ``lfs`` is absent in the production container;
-        # the layout comes from the MPI-IO striping hints.)  The helper
-        # barriers internally, so it is called on ALL ranks.
-        _replace_inode_for_write(output_file)
+        # WHICHEVER CALL CREATES THE INODE DECIDES THE STRIPE LAYOUT.
+        # A Lustre layout is fixed at inode create, and the striping
+        # hints live in the MPI_Info that phdf5's H5Fcreate builds — so
+        # the inode has to be created by MPI-IO, and everything after
+        # inherits what it chose.  (The old ``lfs setstripe`` prestripe
+        # helper was deleted 2026-07-31: ``lfs`` is absent in the
+        # production container, so the hints are the only lever left.)
+        #
+        # This used to be ``_replace_inode_for_write`` followed straight
+        # by ``copy_mf_header(..., dst_mode='w')`` — i.e. rank-0 SERIAL
+        # h5py created the inode, MPI-IO never saw it, and the file took
+        # the DIRECTORY DEFAULT while the comment here claimed it got the
+        # hints.  MEASURED 2026-08-07: zeta_q.h5 stripe_count=1 against a
+        # resolved policy of 4 and a sibling isdf_tensors_*.h5 of 4
+        # (``lfs getstripe -c -S``; /pscratch directory default is 1).
+        # Cost at 1 rank is exactly zero, which is how it survived — it
+        # bites at P>1, where ROMIO sets cb_nodes = min(stripe_count,
+        # nranks), so a 1-stripe file pins collective buffering to a
+        # SINGLE aggregator however many ranks are writing.
+        #
+        # So: SlabIO(mode='w') creates and closes the file collectively
+        # (that H5Fcreate carries the striping hints), and only THEN does
+        # rank-0 h5py append the two header groups with mode='a', which
+        # keeps the inode it finds.  Serial h5py appending to a
+        # parallel-HDF5-created file is fine — verified through both
+        # readers by
+        # tests/test_file_io.py::test_zeta_q_inode_gets_striping_policy.
+        # Measured cost of the extra collective create+close on an empty
+        # file: 4 ms at 1 rank.
+        #
+        # SlabIO mode='w' runs the same rank-0 unlink + barrier helper
+        # (``_replace_inode_for_write``) internally, so the explicit call
+        # that used to be here would be doing its job twice.
+        with SlabIO(output_file, mode='w', mesh=mesh_xy):
+            pass
         if jax.process_index() == 0:
-            # Create file with mf_header, then append isdf_header.
-            copy_mf_header(_wfn_src_path, output_file, dst_mode='w')
+            # Append both header groups to the inode SlabIO just created.
+            copy_mf_header(_wfn_src_path, output_file, dst_mode='a')
             write_isdf_header(output_file, _isdf_hdr, mode='a')
         jax.experimental.multihost_utils.sync_global_devices(
             "zeta_fit_headers_written")

@@ -172,8 +172,25 @@ static void async_worker(
     std::vector<int64_t> valid_shape,    // logical extent, SAME on every rank
     void* src_buf,
     bool wait_for_d2h,
+    size_t bytes,                        // per-rank payload, for the timing line
     ffi::Promise promise)
 {
+    // Diagnostic timing, symmetric with read_ffi.cc's two do_time sites.
+    // LORRAX_PHDF5_TIME used to cover the READ path only, so setting it on
+    // a full run produced no write lines at all while its name and
+    // docs/dev/env_vars.md both promised phdf5 timing generally (measured
+    // 2026-08-07: zero write lines on a run that wrote 1.9 GB).  Timing
+    // lives HERE, on the ctx writer thread, because this is where the D2H
+    // wait and the collective H5Dwrite actually happen — the dispatch half
+    // of a write returns as soon as the task is queued, so a timer there
+    // would report queueing latency and call it I/O.
+    const bool do_time = env_flag("LORRAX_PHDF5_TIME", false);
+    auto now = []() { return std::chrono::steady_clock::now(); };
+    auto ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto t0 = now();
+
 #ifndef LORRAX_FFI_NO_CUDA
     if (wait_for_d2h) {
         cudaEventSynchronize(ctx->d2h_event);
@@ -181,6 +198,7 @@ static void async_worker(
 #else
     (void)wait_for_d2h;   // no D2H copy on the host build (seam 3)
 #endif
+    auto t_d2h = now();
     // Every error return below goes through here.  It announces first,
     // flushed, THEN sets the Promise: when a handler refuses, this rank does
     // not enter the collective its peers are inside, and the job dies minutes
@@ -300,6 +318,7 @@ static void async_worker(
                   "phdf5 async write: H5Screate_simple(memspace) failed");
         return;
     }
+    auto t_spaces = now();
 
     if (empty_selection) {
         if (H5Sselect_none(filespace) < 0 || H5Sselect_none(memspace) < 0) {
@@ -332,10 +351,13 @@ static void async_worker(
         }
     }
 
+    auto t_select = now();
+
     hid_t dxpl = ctx->use_collective_write ? ctx->dxpl_coll : ctx->dxpl_indep;
     herr_t st = H5Dwrite(ds_id, native_type, memspace, filespace, dxpl,
                          src_buf);
     if (st < 0 && debug) H5Eprint2(H5E_DEFAULT, stderr);
+    auto t_write = now();
 
     H5Sclose(memspace);
     H5Sclose(filespace);
@@ -345,6 +367,24 @@ static void async_worker(
                   "phdf5 async write: H5Dwrite failed ds=" +
                   h5_object_name(ds_id));
         return;
+    }
+
+    // Rank 0 only, like the read side.  ``empty`` is reported because a
+    // rank writing an empty selection still enters the collective, and a
+    // line showing write=... with empty=1 is the signature of a shard that
+    // contributed nothing but paid the barrier.
+    if (do_time && ctx->rank == 0) {
+        const double wr_ms = ms(t_select, t_write);
+        std::fprintf(stderr,
+            "[phdf5 write r0] ds=%s bytes/rank=%zu coll=%d empty=%d  "
+            "d2h_wait=%.2f  spaces=%.2f  select=%.2f  write=%.2f  "
+            "total=%.2f (ms)  %.0f MB/s\n",
+            h5_object_name(ds_id).c_str(), bytes,
+            ctx->use_collective_write ? 1 : 0, empty_selection ? 1 : 0,
+            ms(t0, t_d2h), ms(t_d2h, t_spaces), ms(t_spaces, t_select),
+            wr_ms, ms(t0, t_write),
+            (wr_ms > 0.0 ? (double)bytes / 1e3 / wr_ms : 0.0));
+        std::fflush(stderr);
     }
     promise.SetAvailable();
 }
@@ -361,26 +401,63 @@ static void async_worker(
 // stack's HLO dump 2026-04-19).  Passing offset as a traced device
 // buffer makes the trace signature shape-only (ndim), so shard_map
 // closures compile ONCE per (ds_id, ndim, dtype, sharding).
+// ``ctx_handle``/``ds_id`` follow offset_base for the SAME reason, one turn
+// of the screw further out.  An Attr is baked into the compiled module, and
+// ctx_handle is a heap address that differs every process, so the persistent
+// compile cache could never hit a SlabIO module and rewrote it on every run.
+// MEASURED 2026-08-07, byte-identical workload into a private cache dir:
+// jit__per_rank entries 4 -> 8 -> 12 over three runs while a plain jit
+// control stayed at 1; the shared np1 cache had accumulated 6813 such
+// corpses out of 14443 entries.  Moving ds_id out too collapses the module
+// count from O(files x datasets) to O(ndim, dtype, sharding).
 static ffi::Future WriteDispatch(
     LRX_STREAM_PARAM
     ffi::AnyBuffer A,
+    ffi::Buffer<ffi::DataType::S64> handle_buf,   // shape (2,) {ctx_handle, ds_id}
     ffi::Buffer<ffi::DataType::S64> offset_buf,   // shape (ndim,)
     ffi::Buffer<ffi::DataType::S64> valid_shape_buf, // shape (ndim,)
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> token_out,
-    int64_t ctx_handle,
-    int64_t ds_id,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
     ffi::Span<const int64_t> axis_flat)
 {
-    auto* ctx = reinterpret_cast<PhdfCtx*>(ctx_handle);
+    // The handle pair is replicated across the mesh (the shard_map passes it
+    // with ``P()``), so it keeps the every-rank-or-none property the refusals
+    // below depend on.
+    if (handle_buf.dimensions().size() != 1 ||
+        handle_buf.dimensions()[0] != 2) {
+        ffi::Promise p;
+        ffi::Future f(p);
+        p.SetError(ffi::Error(
+            ffi::ErrorCode::kInvalidArgument,
+            "phdf5 write: handle_buf must have shape (2,) == "
+            "{ctx_handle, ds_id}"));
+        return f;
+    }
+    int64_t handle_host[2] = {0, 0};
+    {
+        // No ctx yet, so there is nothing to announce through.
+        std::string herr;
+        if (!copy_index_to_host(handle_host, handle_buf.untyped_data(),
+                                2 * sizeof(int64_t), &herr)) {
+            ffi::Promise p;
+            ffi::Future f(p);
+            p.SetError(ffi::Error(
+                ffi::ErrorCode::kInternal,
+                "phdf5 write: copy(handle) failed: " + herr));
+            return f;
+        }
+    }
+    auto* ctx = reinterpret_cast<PhdfCtx*>(handle_host[0]);
+    const hid_t ds_id = (hid_t)handle_host[1];
 
     // Every dispatch-level refusal below happens BEFORE the task is enqueued,
     // so the rank never reaches H5Dwrite.  That is only safe because every
     // input tested here is replicated by construction — the FFI Attrs are
-    // baked into the compiled module, A's dimensions are the equal-block
-    // shard shape, and ds_id/ctx_handle come from collective lifecycle calls
-    // — so these refuse on every rank or on none.  See shard_index.h.
+    // baked into the compiled module, the handle buffer is replicated, A's
+    // dimensions are the equal-block shard shape, and ds_id/ctx_handle come
+    // from collective lifecycle calls — so these refuse on every rank or on
+    // none.  See shard_index.h.
     auto fail = [ctx](ffi::ErrorCode code, const std::string& msg) {
         announce_error(ctx, msg);
         ffi::Promise p;
@@ -649,14 +726,14 @@ static ffi::Future WriteDispatch(
                  mem_dims = std::move(mem_dims),
                  offset_base = std::move(offset_host),
                  valid_shape = std::move(valid_shape_host),
-                 src_buf, wait_for_d2h,
+                 src_buf, wait_for_d2h, bytes,
                  promise = std::move(promise)]() mutable
     {
         async_worker(ctx, dset, native_type,
                      std::move(offset), std::move(file_count),
                      std::move(mem_dims),
                      std::move(offset_base), std::move(valid_shape),
-                     src_buf, wait_for_d2h,
+                     src_buf, wait_for_d2h, bytes,
                      std::move(promise));
     };
 
@@ -683,11 +760,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     xla::ffi::Ffi::Bind()
         LRX_PHDF_STREAM_CTX
         .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // handle {ctx, ds}
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_base
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // valid_shape
         .Ret<xla::ffi::Buffer<xla::ffi::DataType::S32>>()
-        .Attr<int64_t>("ctx_handle")
-        .Attr<int64_t>("ds_id")
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
         .Attr<xla::ffi::Span<const int64_t>>("axis_flat"));

@@ -35,6 +35,7 @@ __all__ = [
     # lifecycle (was phdf5/context.py)
     "open_file", "close_file", "platform_for_handle", "validate_mesh_2d",
     # readers (was phdf5/read.py)
+    "handle_vector",
     "ffi_read_call", "ffi_read_kchunk_call", "ffi_read_kchunk_union_call",
     "read_sharded_slab", "read_kchunk_sharded", "read_kchunk_union_sharded",
     # writer (was phdf5/write.py)
@@ -294,30 +295,48 @@ def _register_and_open_dataset(fh: int, ds_name: str,
 # =============================================================================
 # Low-level padding contract: out_struct is the physical equal-block
 # shard; valid_shape is the logical file prefix that C++ reads.
+def handle_vector(ctx_handle: int, ds_id: int, mesh=None) -> jax.Array:
+    """The ``(2,)`` int64 ``[ctx_handle, ds_id]`` buffer the FFI expects.
+
+    Passed with ``P()`` so it is replicated — every rank sees the same
+    pair, which is what lets the C++ dispatch keep treating its refusals
+    as every-rank-or-none.  Defined here, next to the calls that consume
+    it, so the read and write paths cannot disagree about the layout.
+
+    ``mesh`` is accepted and ignored: the shard_map's ``in_specs``
+    already does the replication, and materialising this through an
+    explicit ``NamedSharding`` would run JAX's hidden ``assert_equal``
+    all-gather on every call (scorecard AA.1).  ``file_io/_slab_io_ffi``
+    builds the same vector through ``_replicated_i64_vector``, which uses
+    ``device_put_process_local`` for exactly that reason.
+    """
+    del mesh
+    return jnp.asarray([int(ctx_handle), int(ds_id)], dtype=jnp.int64)
+
+
 def ffi_read_call(
     out_struct: jax.ShapeDtypeStruct,
+    handle: jax.Array,
     offset_base: jax.Array,
     valid_shape: jax.Array,
     *,
-    ctx_handle: int,
-    ds_id: int,
     mesh_shape: Sequence[int],
     axis_count_per_dim: Sequence[int],
     axis_flat: Sequence[int],
 ) -> jax.Array:
     """Single-hyperslab read — one H5Dread of one rectangle.
 
-    ``offset_base`` and ``valid_shape`` are ``(ndim,)`` int64
-    ``jax.Array`` buffers passed at runtime (not as FFI Attrs), so the
-    shard_map closure compiles ONCE per ``(dataset, ndim, dtype,
-    sharding)`` tuple and re-dispatches across chunks with different
-    offsets or logical extents.
+    ``handle`` (``(2,)`` == ``[ctx_handle, ds_id]``), ``offset_base`` and
+    ``valid_shape`` are int64 ``jax.Array`` buffers passed at runtime (not
+    as FFI Attrs), so the shard_map closure compiles ONCE per ``(ndim,
+    dtype, sharding)`` tuple and re-dispatches across chunks, datasets,
+    files and processes.  See :func:`ffi_write_call` for the measurement
+    that moved ctx_handle/ds_id out of the Attrs.
     """
     return jax.ffi.ffi_call(_TARGET_READ, out_struct)(
+        handle,
         offset_base,
         valid_shape,
-        ctx_handle=int(ctx_handle),
-        ds_id=int(ds_id),
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
         axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
         axis_flat=np.asarray(axis_flat, dtype=np.int64),
@@ -412,10 +431,11 @@ def read_sharded_slab(
     offset_zero = jnp.zeros((2,), dtype=jnp.int64)
     valid_shape = jnp.asarray((n_rows, n_cols), dtype=jnp.int64)
 
-    def _per_rank(offset_local, valid_shape_local):
+    handle = handle_vector(fh, ds_id, mesh)
+
+    def _per_rank(handle_local, offset_local, valid_shape_local):
         return ffi_read_call(
-            out_struct, offset_local, valid_shape_local,
-            ctx_handle=int(fh), ds_id=int(ds_id),
+            out_struct, handle_local, offset_local, valid_shape_local,
             mesh_shape=(p, q),
             axis_count_per_dim=(1, 1),
             axis_flat=(0, 1),
@@ -423,9 +443,9 @@ def read_sharded_slab(
 
     return shard_map(
         _per_rank, mesh=mesh,
-        in_specs=(P(), P()), out_specs=P("x", "y"),
+        in_specs=(P(), P(), P()), out_specs=P("x", "y"),
         check_vma=False,
-    )(offset_zero, valid_shape)
+    )(handle, offset_zero, valid_shape)
 
 
 def read_kchunk_sharded(
@@ -658,37 +678,48 @@ _FFI_TARGET = "lorrax_phdf5_write"
 # valid_shape is the logical global slab prefix that C++ clips against.
 def ffi_write_call(
     A_local: jax.Array,
+    handle: jax.Array,
     offset_base: jax.Array,
     valid_shape: jax.Array,
     *,
-    ctx_handle: int,
-    ds_id: int,
     mesh_shape: Sequence[int],
     axis_count_per_dim: Sequence[int],
     axis_flat: Sequence[int],
 ) -> jax.Array:
     """Low-level FFI call for one rank's local shard.  Returns token.
 
-    ``offset_base`` and ``valid_shape`` are jax.Arrays of shape (ndim,)
-    dtype int64 — passed
-    as a traced Buffer input (not an FFI Attr) so that shard_map closures
-    compile ONCE per dataset-ndim-dtype-sharding tuple and re-dispatch
-    across chunks with different offsets or logical extents.  Without this, each chunk
-    triggers a fresh ~400 ms XLA compile for the FFI body (measured at
-    MoS2 3x3 scale, see reports/zeta_offset_runtime_2026-04-19/).
+    ``handle``, ``offset_base`` and ``valid_shape`` are jax.Arrays of
+    dtype int64 — passed as traced Buffer inputs (not FFI Attrs) so that
+    shard_map closures compile ONCE per ndim-dtype-sharding tuple and
+    re-dispatch across chunks, datasets and processes.
 
-    The other mesh/axis attrs ARE compile-time attrs — they don't change
-    across chunks of a given dataset, so no recompile happens.
+    ``handle`` is ``(2,)`` == ``[ctx_handle, ds_id]``; see
+    :func:`handle_vector`.  These were Attrs until 2026-08-07, and
+    ctx_handle is a heap address, so the compiled module differed in
+    every process and the JAX persistent compile cache could never hit
+    one — it rewrote the entry on every run instead.  MEASURED with a
+    byte-identical workload into a private cache dir: ``jit__per_rank``
+    entries went 4 -> 8 -> 12 over three runs while a plain jit control
+    stayed at 1; the shared ``np1`` cache had 6813 such dead entries out
+    of 14443.  ds_id moved with it because as an Attr it forked a module
+    per (file, dataset) pair, making the module count scale with the deck.
+
+    ``offset_base``/``valid_shape`` were made Buffers earlier for the same
+    class of reason: each distinct chunk offset otherwise triggered a
+    fresh ~400 ms XLA compile of the FFI body (measured at MoS2 3x3, see
+    reports/zeta_offset_runtime_2026-04-19/).
+
+    The mesh/axis attrs remain compile-time attrs — they are geometry, so
+    a change in them genuinely IS a different module.
 
     Use inside a ``shard_map`` body.
     """
     token_spec = jax.ShapeDtypeStruct((1,), jnp.int32)
     return jax.ffi.ffi_call(_FFI_TARGET, token_spec, has_side_effect=True)(
         A_local,
+        handle,
         offset_base,
         valid_shape,
-        ctx_handle=int(ctx_handle),
-        ds_id=int(ds_id),
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
         axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
         axis_flat=np.asarray(axis_flat, dtype=np.int64),
@@ -744,11 +775,11 @@ def write_sharded_slab(
     offset_array = jnp.zeros((2,), dtype=jnp.int64)
     valid_shape_arr = jnp.asarray((valid_rows, valid_cols), dtype=jnp.int64)
 
-    def _per_rank(A_local, offset_local, valid_shape_local):
+    handle = handle_vector(fh, ds_id, mesh)
+
+    def _per_rank(A_local, handle_local, offset_local, valid_shape_local):
         return ffi_write_call(
-            A_local, offset_local, valid_shape_local,
-            ctx_handle=int(fh),
-            ds_id=int(ds_id),
+            A_local, handle_local, offset_local, valid_shape_local,
             mesh_shape=(p, q),
             axis_count_per_dim=(1, 1),
             axis_flat=(0, 1),
@@ -756,6 +787,6 @@ def write_sharded_slab(
 
     return shard_map(
         _per_rank, mesh=mesh,
-        in_specs=(P("x", "y"), P(), P()), out_specs=P(),
+        in_specs=(P("x", "y"), P(), P(), P()), out_specs=P(),
         check_vma=False,
-    )(A, offset_array, valid_shape_arr)
+    )(A, handle, offset_array, valid_shape_arr)

@@ -1013,3 +1013,129 @@ def test_mesh_divisible_shape_rounds_each_axis_by_its_own_divisor():
     assert mesh_divisible_shape((5, 7), mesh, P(None, None)) == (5, 7)
     # Both axes on one dim -> that dim rounds by the product.
     assert mesh_divisible_shape((5,), mesh, P(("x", "y"),)) == (8,)
+
+
+# ---------------------------------------------------------------------------
+# zeta_q.h5 striping — the inode must be created by MPI-IO, not by h5py
+# ---------------------------------------------------------------------------
+#
+# A Lustre stripe layout is fixed at inode CREATE, and the striping hints live
+# in the MPI_Info that phdf5's H5Fcreate builds.  So a file whose inode rank-0
+# serial h5py created takes the DIRECTORY DEFAULT and ignores the policy
+# completely.  That was the state until 2026-08-07: zeta_q.h5 measured
+# stripe_count=1 against a resolved policy of 4, while its sibling
+# isdf_tensors_*.h5 measured 4.  It costs nothing at 1 rank, which is how it
+# survived; at P>1 ROMIO sets cb_nodes = min(stripe_count, nranks), so a
+# 1-stripe file pins collective buffering to a single aggregator however many
+# ranks are writing.
+#
+# ``gw/isdf_fitting.fit_zeta_to_h5`` therefore creates the inode with
+# SlabIO(mode='w') and appends the headers afterwards with h5py mode='a'.
+# The two halves of that claim are tested separately ON PURPOSE: the append
+# half runs everywhere, the striping half needs `lfs` and so cannot run in the
+# production container.  Merging them would have produced a single test that
+# reports "skipped" in the container while silently having checked the append.
+
+
+def _build_zeta_like_production(tmp_path, mesh):
+    """Lay out a file the way fit_zeta_to_h5 does, and return (path, A)."""
+    import jax
+    import numpy as np
+    from file_io.slab_io import SlabIO
+    from file_io.mf_header import copy_mf_header
+
+    out_path = str(tmp_path / "zeta_q.h5")
+    wfn_path = str(tmp_path / "WFN.h5")
+    _make_fake_wfn(wfn_path)
+
+    shape = (2, 8, 4)
+    A = jax.device_put(np.arange(int(np.prod(shape)), dtype=np.float64)
+                       .reshape(shape).astype(np.complex128))
+
+    # SlabIO creates the inode collectively (H5Fcreate under the striping
+    # hints) and closes; THEN rank 0 appends the headers; THEN the payload.
+    with SlabIO(out_path, mode='w', mesh=mesh):
+        pass
+    assert os.path.exists(out_path), \
+        "SlabIO(mode='w') did not create the inode"
+    copy_mf_header(wfn_path, out_path, dst_mode='a')
+    with SlabIO(out_path, mode='a', mesh=mesh) as io:
+        io.create_dataset('zeta_q_G', shape=shape, dtype=np.complex128)
+        io.write_slab('zeta_q_G', A)
+    return out_path, A
+
+
+def test_zeta_q_headers_append_onto_phdf5_created_inode(
+        tmp_path, single_device_mesh):
+    """Serial h5py can append the header groups to a PHDF5-created inode.
+
+    This is the property that makes the create-order swap safe, and it is
+    what lets the inode be created by MPI-IO (which is what carries the
+    striping hints) instead of by h5py.  Runs everywhere.
+    """
+    import jax
+    import numpy as np
+    from file_io.slab_io import SlabIO
+
+    out_path, A = _build_zeta_like_production(tmp_path, single_device_mesh)
+    expect = np.asarray(jax.device_get(A))
+
+    with h5py.File(out_path, 'r') as f:
+        assert 'mf_header' in f, \
+            "h5py mode='a' did not append mf_header to the PHDF5 inode"
+        np.testing.assert_allclose(f['zeta_q_G'][...], expect)
+    with SlabIO(out_path, mode='r', mesh=single_device_mesh) as io:
+        got = np.asarray(jax.device_get(io.read_slab('zeta_q_G')))
+    np.testing.assert_allclose(got, expect)
+
+
+def _lfs_stripe_count(path):
+    """Lustre stripe count of ``path``, or ``None`` when unknowable.
+
+    ``None`` means "``lfs`` could not answer" — it is NOT a stripe count of
+    1, and callers must skip rather than assert on it.  ``lfs`` is absent
+    from the production container, which is why the old prestripe helper
+    could not use it either.
+    """
+    import shutil
+    import subprocess
+    exe = shutil.which("lfs")
+    if exe is None:
+        return None
+    try:
+        out = subprocess.run([exe, "getstripe", "-c", str(path)],
+                             capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    for tok in out.stdout.split():
+        if tok.lstrip("-").isdigit():
+            return int(tok)
+    return None
+
+
+def test_zeta_q_inode_gets_striping_policy(tmp_path, single_device_mesh):
+    """The zeta_q.h5 inode carries the stripe count the policy resolves to.
+
+    SKIPS without ``lfs`` — i.e. it does NOT run inside the production
+    container.  This is the only assertion that catches a regression to
+    ``copy_mf_header(..., dst_mode='w')``, so a green container run has not
+    tested striping; run it on a Lustre login node to get that coverage.
+    """
+    import jax
+    from file_io._slab_io_ffi import _stripe_policy
+
+    out_path, _ = _build_zeta_like_production(tmp_path, single_device_mesh)
+
+    got_stripes = _lfs_stripe_count(out_path)
+    if got_stripes is None:
+        pytest.skip("`lfs` unavailable here, so the stripe count cannot be "
+                    "read — this test did NOT verify striping")
+    want = _stripe_policy(jax.process_count())[0]
+    assert got_stripes == want, (
+        f"zeta_q.h5 got stripe_count={got_stripes}, policy wants {want}. "
+        f"The inode was created by something that does not carry the MPI-IO "
+        f"striping hints — check that fit_zeta_to_h5 still creates it with "
+        f"SlabIO(mode='w') BEFORE copy_mf_header(dst_mode='a')."
+    )
