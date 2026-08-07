@@ -57,7 +57,13 @@ import numpy as np
 from gw.compute_vcoul_0d import compute_vcoul_box
 from gw.gw_init import read_cohsex_input
 from gw.vcoul import compute_q0_averages
-from file_io import EPSReader, WFNReader, resolve_input_paths
+from file_io import EPSReader, resolve_input_paths
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 
 RYD2EV = 13.6056980659
 
@@ -110,7 +116,7 @@ def _g0_index(gvecs: np.ndarray) -> int:
     return int(hits[0])
 
 
-def _build_v_0d_from_repo(wfn: WFNReader, gvecs_eps: np.ndarray) -> np.ndarray:
+def _build_v_0d_from_repo(wfn: WfnLoader, gvecs_eps: np.ndarray) -> np.ndarray:
     v_raw = compute_vcoul_box(
         np.asarray(wfn.bdot, dtype=np.float64),
         np.asarray(wfn.fft_grid, dtype=np.int32),
@@ -119,7 +125,7 @@ def _build_v_0d_from_repo(wfn: WFNReader, gvecs_eps: np.ndarray) -> np.ndarray:
     return np.asarray(v_raw / float(wfn.cell_volume), dtype=np.complex128)
 
 
-def _head_values_0d(wfn: WFNReader, v_head_override: float | None, w_head_override: float | None) -> tuple[complex, complex]:
+def _head_values_0d(wfn: WfnLoader, v_head_override: float | None, w_head_override: float | None) -> tuple[complex, complex]:
     meta = SimpleNamespace(sys_dim=0)
     vc0, wc0 = compute_q0_averages(
         wfn=wfn,
@@ -179,7 +185,7 @@ def _to_bgw_eps_orientation(eps_mat: np.ndarray) -> np.ndarray:
     return np.asarray(eps_mat.T, dtype=np.complex128)
 
 
-def _get_band_energies_ry(wfn: WFNReader, ik: int = 0, ispin: int = 0) -> np.ndarray:
+def _get_band_energies_ry(wfn: WfnLoader, ik: int = 0, ispin: int = 0) -> np.ndarray:
     e = np.asarray(wfn.energies)
     if e.ndim == 3:
         return np.asarray(e[int(ispin), int(ik), :], dtype=np.float64)
@@ -209,7 +215,7 @@ def _fft_plus_jax(arr: jax.Array, axes: tuple[int, ...]) -> jax.Array:
 
 
 def _load_bands_fft_plus_jax(
-    wfn: WFNReader,
+    wfn: WfnLoader,
     *,
     ik: int,
     band_indices: np.ndarray,
@@ -353,7 +359,7 @@ def _sigma_terms_kernel_jit(
 
 def _compute_sigma_terms_gspace(
     *,
-    wfn: WFNReader,
+    wfn: WfnLoader,
     epsinv0: np.ndarray,
     epsinvi: np.ndarray,
     v_vec: np.ndarray,
@@ -435,7 +441,7 @@ def run(args: argparse.Namespace) -> int:
     if sys_dim != 0:
         raise ValueError(f"This checker is for sys_dim=0 only (got sys_dim={sys_dim})")
 
-    wfn = WFNReader(str(params["wfn_file"]))
+    wfn = WfnLoader(str(params["wfn_file"]))
     eps = EPSReader(args.eps0mat)
 
     if int(eps.matrix_type) != 0:

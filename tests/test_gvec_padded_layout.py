@@ -166,7 +166,9 @@ def test_zeta_sphere_uses_the_same_pad_as_the_shared_routine(grid, cutoff):
                               for p in _WFN_FIXTURES])
 def test_wfn_loader_pads_with_the_shared_sentinel(path):
     """ψ's producer goes through the same routine as ζ's."""
-    from file_io.wfn_loader import WfnLoader
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
 
     with WfnLoader(path) as ld:
         grid = tuple(int(s) for s in ld.fft_grid)
@@ -311,7 +313,9 @@ def test_no_fixture_has_a_physical_G_on_the_sentinel_cell(path):
     rows) and reports the MARGIN — how far the sphere is from the corner
     — so a deck that is merely close shows up before it fails.
     """
-    from file_io.wfn_loader import WfnLoader
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
 
     with WfnLoader(path) as ld:
         grid = tuple(int(s) for s in ld.fft_grid)

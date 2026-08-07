@@ -23,7 +23,12 @@ from common.wfn_transforms import (
     to_box, to_rbox, to_rmu, to_rchunk,
     to_rchunk_inner, to_rmu_inner,
     gflat_to_rmu)
-from file_io.wfn_loader import WfnLoader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 
 # The synthetic-WFN builder moved WITH the loader (charter wave 1): it
 # writes a ``WFN.h5``, so it belongs to the service that reads one, and the

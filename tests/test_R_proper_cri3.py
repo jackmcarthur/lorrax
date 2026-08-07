@@ -68,7 +68,9 @@ def test_R_proper_cri3_matches_fixture():
             f"{[str(p) for p in _WFN_CANDIDATES]}.")
 
     # JAX x64 is set by tests/conftest.py via JAX_ENABLE_X64=1.
-    from file_io import WfnLoader as WFNReader
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
     from common.symmetry_maps import SymMaps
 
     npz = np.load(_FIXTURE_PATH, allow_pickle=True)
@@ -77,7 +79,7 @@ def test_R_proper_cri3_matches_fixture():
     ntran_fixture = int(np.asarray(npz['ntran']))
 
     # Live SymMaps
-    wfn = WFNReader(str(wfn_path))
+    wfn = WfnLoader(str(wfn_path))
     sym = SymMaps(wfn)
     R_proper_live = np.asarray(sym.R_proper, dtype=np.float64)
 

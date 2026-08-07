@@ -68,7 +68,13 @@ from common.chi_from_dipole import compute_S_omega, read_dipole_h5
 from gw.gw_init import read_cohsex_input
 from gw.minimax_screening import extract_gn_ppm_parameters_from_Wc
 from gw.vcoul import compute_q0_averages
-from file_io import EPSReader, WFNReader, resolve_input_paths
+from file_io import EPSReader, resolve_input_paths
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 
 RYD2EV = 13.6056980659
 
@@ -147,7 +153,7 @@ def _determine_wcoul0(
     eta: float,
     params: dict,
     input_dir: str,
-    wfn: WFNReader,
+    wfn: WfnLoader,
     sym,
     meta: Meta,
     print_fn: Callable[[str], None],
@@ -379,7 +385,7 @@ def run(cfg_path: str) -> int:
     elif not os.path.isabs(restart_file):
         restart_file = os.path.join(cfg_dir, restart_file)
 
-    wfn = WFNReader(params["wfn_file"])
+    wfn = WfnLoader(params["wfn_file"])
     sym = symmetry_maps.SymMaps(wfn)
     nrmu = None
     with h5py.File(restart_file, "r") as h5:

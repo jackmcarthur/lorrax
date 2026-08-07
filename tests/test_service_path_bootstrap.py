@@ -70,10 +70,25 @@ _SRC = str(_REPO / "src")
 #: shape of coverage that evaporates quietly.  The Si COHSEX fixture run
 #: covers it on the cluster, where the bootstrap is what the whole gate
 #: depends on.
+#: ``psp.operator_checks`` is the step-3 replumb's representative: that
+#: sweep turned ~14 lorrax modules into module-scope consumers of the
+#: ``wfn_loader`` door, and before it the only wfn_loader pair here was the
+#: SHIM — which cannot fail the way a converted consumer can, because the
+#: shim IS the bootstrap's own module.  A real consumer that reaches the
+#: door through ``ffi._services`` is a different edge and needs its own
+#: cell.  ``operator_checks`` is chosen out of the fourteen because its
+#: entire module-scope import list is ``dataclasses``, ``typing`` and the
+#: door: it needs no FFI ``.so``, no communicator stack and no deck, so
+#: this cell RUNS on every machine instead of skipping (the same reasoning
+#: that keeps ``bandstructure.bse_setup`` out, below).  The other thirteen
+#: converted module-scope consumers ride the same one bootstrap block, so
+#: one executing cell falsifies the class; the Si COHSEX fixture run is
+#: what covers them end to end on the cluster.
 _MODULE_SCOPE_CONSUMERS = (
     ("isdf.core", "distrib_la"),
     ("bse.vq_interp", "distrib_la"),
     ("file_io.wfn_loader", "wfn_loader"),
+    ("psp.operator_checks", "wfn_loader"),
 )
 
 #: Every service the pairs above reach.  The red arm runs once per service:
