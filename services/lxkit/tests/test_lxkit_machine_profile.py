@@ -249,12 +249,13 @@ _CHILD_CONFTEST = '''
 import sys
 sys.path.insert(0, {src!r})
 from lxkit.testing import (AllowedSkip, MachineProfile, arm_skip_honesty,
-                           pytest_runtest_logreport, pytest_sessionfinish)
+                           pytest_configure, pytest_runtest_logreport,
+                           pytest_sessionfinish)
 
 arm_skip_honesty(MachineProfile(
     machine="synthetic", must=(),
     allowed_skips=(AllowedSkip("allowed", "on purpose", "leg Z"),),
-    min_collected={floor}))
+    min_collected={floor}), scope={src2!r})
 '''
 
 _CHILD_TEST = '''
@@ -275,14 +276,15 @@ def test_sneaky():
 '''
 
 
-def _run_child(tmp_path, extra="", floor=1):
+def _run_child(tmp_path, extra="", floor=1, args=()):
     (tmp_path / "conftest.py").write_text(
-        _CHILD_CONFTEST.format(src=_LXKIT_SRC, floor=floor))
+        _CHILD_CONFTEST.format(src=_LXKIT_SRC, floor=floor,
+                               src2=str(tmp_path)))
     (tmp_path / "test_child.py").write_text(
         _CHILD_TEST.format(extra=textwrap.dedent(extra)))
     return subprocess.run(
         [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q",
-         str(tmp_path)],
+         *args, str(tmp_path)],
         cwd=str(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True)
 
@@ -409,3 +411,35 @@ def test_a_deliberately_deselected_suite_is_inert_not_red(tmp_path):
     # ...and the run really did collect the other suite, so "inert" is not
     # standing in for "collected nothing".
     assert "1 passed, 1 skipped" in proc.stdout, proc.stdout
+
+
+def test_the_gate_still_fires_under_pytest_xdist(tmp_path):
+    """RED TWIN for the hole `lx test` opened.
+
+    MEASURED on Perlmutter 2026-08-07: `lx test` runs every suite under
+    ``-n 4``, and pytest-xdist's CONTROLLER has an EMPTY ``session.items``
+    (the workers did the collecting).  A scope computed from items alone
+    therefore matched nothing on the controller, the gate reported "not
+    selected, inert", and a real skip -- cuSOLVERMp needs a true-2D mesh
+    -- sailed through an allowlist that did not contain it.  A
+    skip-honesty gate that evaporates on the machine it was written for
+    is the joke telling itself.
+
+    Skipped rather than failed when xdist is absent: the plugin is not a
+    declared dependency of lxkit, and asserting on a machine that does
+    not have it would report the wrong defect.
+    """
+    pytest.importorskip("xdist")
+    proc = _run_child(tmp_path, extra=_DISALLOWED, args=("-n", "2"))
+    assert "SKIP-HONESTY GATE FAILED" in proc.stdout, proc.stdout
+    assert "test_sneaky" in proc.stdout
+    assert proc.returncode != 0, proc.stdout
+
+
+def test_an_xdist_session_with_only_allowed_skips_stays_green(tmp_path):
+    """...and the fix did not turn the gate into something that always
+    fires: the same run without the stray skip is green."""
+    pytest.importorskip("xdist")
+    proc = _run_child(tmp_path, args=("-n", "2"))
+    assert "SKIP-HONESTY GATE FAILED" not in proc.stdout, proc.stdout
+    assert proc.returncode == 0, proc.stdout

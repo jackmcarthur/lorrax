@@ -122,7 +122,8 @@ if "jax" not in sys.modules and _cvd:
 
 from lxkit.testing import (                        # noqa: E402,F401
     AllowedSkip, arm_skip_honesty, gate_state,     # gate_state is autouse
-    machine_profile, pytest_runtest_logreport, pytest_sessionfinish,
+    machine_profile, pytest_configure, pytest_runtest_logreport,
+    pytest_sessionfinish,
 )
 
 #: Skips this SERVICE is allowed to emit on a machine that declares a
@@ -152,6 +153,14 @@ _ALLOWED = (
                 "makes and this row does not weaken"),
     AllowedSkip("", "monorepo wiring",
                 "the monorepo run; a standalone install has no lorrax"),
+    # MEASURED on Perlmutter 2026-08-07: `lx test` gives ONE process a
+    # 1x1 mesh, and cuSOLVERMp's block-cyclic layout degenerates there
+    # (guard 5 refuses px<2 or py<2).  The covering leg is real and was
+    # RUN: L-c on a 2x2 of four ranks, residual 6.0e-16.
+    AllowedSkip("", "needs a true-2D mesh",
+                "leg L-c GPU: `lx run -N 1 -G 4 -n 4 python3 "
+                "services/distrib_la/tests/test_distrib_la_multiproc.py "
+                "--mesh 2x2` (JID 56444350, cusolvermp residual 6.0e-16)"),
 )
 
 

@@ -734,6 +734,7 @@ def assert_must_probe(profile: MachineProfile,
 class ObservedSkip(NamedTuple):
     nodeid: str
     reason: str
+    path: str = ""          #: absolute file the cell came from, when known
 
 
 def _skip_is_allowed(skip: ObservedSkip, allowed) -> AllowedSkip | None:
@@ -798,6 +799,12 @@ def assert_skips_match_profile(skips: Sequence[ObservedSkip],
 
 _OBSERVED: list = []
 _ARMED: dict = {}
+_ROOTDIR: dict = {}
+#: nodeids seen in ANY phase whose file is under the armed scope.  Needed
+#: because the pytest-xdist CONTROLLER has an empty ``session.items`` (the
+#: workers did the collecting) while every report still passes through its
+#: ``pytest_runtest_logreport`` — see :func:`pytest_sessionfinish`.
+_SEEN_IN_SCOPE: set = set()
 
 
 def observed_skips() -> tuple:
@@ -841,6 +848,26 @@ def arm_skip_honesty(profile: MachineProfile | None = None, *,
     return prof
 
 
+def pytest_configure(config):
+    """Remember the rootdir, so a report's path can be made absolute.
+
+    ``report.fspath`` is ROOTDIR-RELATIVE and a report is all the
+    pytest-xdist controller ever sees, so without this the controller
+    cannot tell whether a skip came from the armed scope.
+    """
+    _ROOTDIR["path"] = str(getattr(config, "rootpath", "")
+                           or getattr(config, "rootdir", "") or "")
+
+
+def _report_path(report) -> str:
+    loc = getattr(report, "fspath", "") or ""
+    if not loc:
+        return ""
+    root = _ROOTDIR.get("path", "")
+    return os.path.realpath(os.path.join(root, str(loc)) if root
+                            else str(loc))
+
+
 def pytest_runtest_logreport(report):
     """Record every skip, wherever it came from.
 
@@ -859,7 +886,13 @@ def pytest_runtest_logreport(report):
             reason = str(longrepr)
         if reason.startswith("Skipped: "):
             reason = reason[len("Skipped: "):]
-        _OBSERVED.append(ObservedSkip(report.nodeid, reason))
+        _OBSERVED.append(ObservedSkip(report.nodeid, reason,
+                                      _report_path(report)))
+    scope = _ARMED.get("scope")
+    if scope:
+        path = _report_path(report)
+        if path and path.startswith(os.path.realpath(scope) + os.sep):
+            _SEEN_IN_SCOPE.add(report.nodeid)
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -876,13 +909,26 @@ def pytest_sessionfinish(session, exitstatus):
     total = int(getattr(session, "testscollected", 0) or 0)
     if scope:
         root = os.path.realpath(scope) + os.sep
-        mine = {str(getattr(it, "nodeid", "")) for it in
-                getattr(session, "items", [])
-                if os.path.realpath(str(getattr(it, "path", None)
-                                        or getattr(it, "fspath", ""))
-                                    ).startswith(root)}
-        skips = [s for s in observed_skips() if s.nodeid in mine]
-        in_scope = len(mine)
+        items = getattr(session, "items", None) or []
+        if items:
+            mine = {str(getattr(it, "nodeid", "")) for it in items
+                    if os.path.realpath(str(getattr(it, "path", None)
+                                            or getattr(it, "fspath", ""))
+                                        ).startswith(root)}
+            skips = [s for s in observed_skips() if s.nodeid in mine]
+            in_scope = len(mine)
+        else:
+            # THE pytest-xdist CONTROLLER.  Its session.items is EMPTY --
+            # the workers did the collecting -- so an items-only scope
+            # made this gate silently inert under `-n 4`, which is how
+            # `lx test` runs every suite on Perlmutter.  A skip-honesty
+            # gate that evaporates on the machine it was written for is
+            # the joke telling itself; MEASURED 2026-08-07, where a
+            # cusolvermp-needs-a-true-2D-mesh skip sailed through an
+            # allowlist that did not contain it.  Every report still
+            # reaches this process, so scope by the report's own path.
+            skips = [s for s in observed_skips() if s.path.startswith(root)]
+            in_scope = len(_SEEN_IN_SCOPE)
     else:
         skips, in_scope = list(observed_skips()), total
 
