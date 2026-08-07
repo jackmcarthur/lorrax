@@ -1,0 +1,35 @@
+# Si 4x4x4 SOC, 60-band COHSEX + BSE — rebuild of the 2026-04 BSE record deck.
+[cohsex]
+
+restart = false
+centroids_file = centroids_frac_480.txt
+
+nval = 8
+ncond = 52
+nband = 60
+sys_dim = 3
+bare_coulomb_cutoff = 25.0
+
+do_screened = true
+bispinor = false
+qp_solver = one_shot_dft
+
+use_ppm_sigma = false
+screening_method = minimax
+
+# BGW q->0 head scalars (the vcoul body dump from the original run is purged).
+vhead = 3303.748102
+whead_0freq = 150.395600
+
+memory_per_device_gb = 28
+
+sigma_freq_debug_output = true
+fermi_reference = midgap
+
+wfn_file = WFN.h5
+output_file = eqp0_bse.dat
+sigma_diag_file = sigma_diag_bse.dat
+sigma_omega_h5_file = sigma_mnk.h5
+
+mc_average_vcoul_body = true
+zeta_rcond = 1e-10
