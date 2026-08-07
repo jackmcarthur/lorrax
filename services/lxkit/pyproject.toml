@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lxkit"
+version = "0.1.0"
+description = "Shared foundation for LORRAX standalone services: capability gates, probe vocabulary, jax-version shims, pytest harness"
+requires-python = ">=3.12"
+
+# ZERO RUNTIME DEPENDENCIES, AND THAT IS A PINNED PROPERTY, NOT AN ACCIDENT.
+# `import lxkit` touches the standard library and nothing else; jax is
+# OPTIONAL and every jax import in the package sits inside a function body.
+# The reason is Gate.enabled(): consumers use it as a kernel-cache key at
+# FACTORY time, before jax.distributed.initialize, so anything that
+# initialized the jax backend at import would destroy that promise (and the
+# shape-algebra test tier could no longer run on a jax-free laptop).
+# tests/test_import_isolation.py enforces both halves in a subprocess.
+# If you are about to add a line here, you are about to break the property
+# every other service in this monorepo depends on.
+dependencies = []
+
+[project.optional-dependencies]
+# The pytest harness (lxkit.testing) is the one module that imports pytest.
+# It is not imported by lxkit/__init__.py, so this extra is a test-time fact.
+test = ["pytest>=8.0.0"]
+
+# The harness ships as a plugin, so a service suite gets the autouse
+# gate_state fixture (and with it a non-order-dependent announcement state)
+# by installing lxkit and writing nothing.
+[project.entry-points.pytest11]
+lxkit = "lxkit.testing"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
