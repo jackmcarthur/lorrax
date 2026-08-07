@@ -158,6 +158,15 @@ def test_g2_branch_window_tiles_are_frozen():
             assert w.n_tau > 0, f"{_t}:{w.name} zero τ nodes"
 
     # --- bit-identity against the frozen reference ------------------------
+    # NO CROSS-MACHINE TOLERANCE HERE, and the 2026-08-07 owner ruling
+    # ("the micro-eV level is fine for comparisons between machines") does
+    # NOT reach this gate.  The Perlmutter/Frontera disagreement in this
+    # cell is the crossing-core node ladder: 100 nodes here, 98 in the
+    # frozen array (KNOWN_FAILURES P1).  That is an INTEGER count of
+    # quadrature nodes riding in a float64 `meta` row, not a rounding
+    # difference and not a quantity in eV — an atol would hide a real
+    # change in how many τ points the window integrates over.  Whatever
+    # this cell's answer is, it is not "loosen the comparison".
     assert G2_REF.exists(), (
         f"missing G2 reference {G2_REF}; regenerate with "
         f"tests.test_sigma_ppm_gates._regenerate_g2_reference()")

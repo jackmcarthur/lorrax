@@ -385,11 +385,17 @@ anyone picks this up.
 
 ### **P1 — three Tier-1 pins are Frontera-frozen and cannot be green on both machines**
 
-| tests | class | evidence |
-|---|---|---|
-| `test_gw_jax_regression::test_gnppm_matches_reference` | (c) stale/relocated pin | 20 / 2484 rows, **max abs diff exactly 1.000e-6 eV** against `atol=1e-6` |
-| `test_gw_jax_regression::test_bispinor_gnppm_matches_reference` | " | 24 / 1620 rows, **max abs diff exactly 1.000e-6 eV** |
-| `test_sigma_ppm_gates::test_g2_branch_window_tiles_are_frozen` | " | crossing-core node ladder is **100** here, the frozen array is **98** |
+> **RULED, 2026-08-07 (owner): "the micro-eV level is fine for comparisons
+> between machines."**  Two of the three rows below are RESOLVED BY POLICY
+> and move to *FIXED BY POLICY* immediately after this table.  The third is
+> **not covered by the ruling** and stays ship-listed, for a reason given
+> where it is listed — it is not a micro-eV problem.
+
+| tests | class | evidence | disposition |
+|---|---|---|---|
+| `test_gw_jax_regression::test_gnppm_matches_reference` | (c) stale/relocated pin | 20 / 2484 rows, **max abs diff exactly 1.000e-6 eV** against `atol=1e-6` | **FIXED BY POLICY** — `_XMACHINE_ATOL_EV = 1e-5` |
+| `test_gw_jax_regression::test_bispinor_gnppm_matches_reference` | " | 24 / 1620 rows, **max abs diff exactly 1.000e-6 eV** | **FIXED BY POLICY** — same constant |
+| `test_sigma_ppm_gates::test_g2_branch_window_tiles_are_frozen` | (b) real behavioural difference, mis-filed under P1 | crossing-core node ladder is **100** here, the frozen array is **98** | **STILL SHIP-LISTED** — see P1b |
 
 The Frontera census (`f485b5a`, 2026-08-01, job 7885154) re-froze all three
 from Frontera CLX output.  Its own KNOWN_FAILURES row said the drift was
@@ -406,13 +412,49 @@ produces:
 Nothing on this branch moved them: the WSL full-suite red-set diff over the
 whole branch (`96a6399` → `d5cac09`) is empty in both directions.
 
-**OWNER DECISION.**  A 6-decimal `.dat` at `atol=1e-6` has no room for a
-cross-platform ULP, so "re-freeze on whichever machine ran last" is a
-permanent ping-pong and each re-freeze silently turns the other machine
-red.  The three options — platform-keyed references, `atol=2e-6`, or naming
-one platform authoritative — all change what the gate means.  **Not taken
-here.**  Do not re-freeze them on Perlmutter to make this census green:
-that is the move that produced this row.
+#### FIXED BY POLICY — the two float pins
+
+A 6-decimal `.dat` at `atol=1e-6` has no room for a cross-platform ULP, so
+"re-freeze on whichever machine ran last" was a permanent ping-pong in
+which each re-freeze silently turned the other machine red.  The owner's
+ruling ends it: the comparison tolerance for these two cross-machine-frozen
+pins is now **`_XMACHINE_ATOL_EV = 1e-5` eV** (`tests/test_gw_jax_regression.py`),
+10× the observed drift and five orders below anything physical.  The
+constant carries the ruling, the date, and the scope; it is named on two
+cells and nowhere else.
+
+**What still anchors these tightly.**  Loosening a *cross-machine* pin does
+not loosen the tree.  Same-machine drift is caught by the Si COHSEX
+byte-identity gate (`test_si_production_matches_frozen_reference`, exact
+text match, early return) and by the external BerkeleyGW anchor
+(`test_si_production_matches_berkeleygw`, `_BGW_TOL`, sub-meV MAE against
+another code).  Those are the gates that would see a physics change; these
+two answer "does the frozen MoS2 output reproduce on a different machine",
+and that answer should not turn on the 6th decimal of a text file.
+
+`_assert_matches_reference` now PRINTS the observed max |Δ| and what
+fraction of the atol budget it used, on every run, pass or fail — a
+tolerance whose headroom is invisible cannot be audited, and this ruling
+is exactly the kind that needs auditing later.
+
+**Neither reference was re-frozen.**  Re-freezing is the move that created
+this row; the fix is the comparison, not the data.
+
+#### P1b — `test_g2_branch_window_tiles_are_frozen` is NOT a micro-eV row
+
+Filed under P1 by resemblance and it does not belong there.  The
+Perlmutter/Frontera disagreement in this cell is the **crossing-core node
+ladder: 100 nodes here, 98 in the frozen array** — an integer count of
+quadrature τ points, riding in a `float64` `meta` row.  It is not a
+rounding difference, it is not in eV, and a tolerance would hide a real
+change in how many points the window integrates over.  The 2026-08-07
+ruling therefore does not reach it, and applying it here would be
+laundering.  Stays ship-listed, class (b), still an **OWNER DECISION**:
+either the ladder legitimately differs between the two machines' minimax
+tables (in which case the reference is platform-dependent data and needs a
+different mechanism than an atol), or one of the two is wrong.  Nobody has
+determined which.  `tests/test_sigma_ppm_gates.py` carries this note at the
+comparison itself.
 
 ### P2 — the chunk-width gauge cells (pre-existing)
 

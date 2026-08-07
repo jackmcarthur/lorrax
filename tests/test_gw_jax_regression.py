@@ -58,6 +58,36 @@ from harness import (          # noqa: E402
 
 SI_DIR = REG / "si_cohsex_debug"
 
+#: Cross-machine tolerance for the FRONTERA-FROZEN Tier-1 pins, in eV.
+#:
+#: OWNER RULING, 2026-08-07: *"the micro-eV level is fine for comparisons
+#: between machines."*
+#:
+#: The two pins below (`gnppm`, `bispinor`) are frozen from Frontera CLX
+#: output (`f485b5a`, 2026-08-01, job 7885154) and re-measured on
+#: Perlmutter at `svc/distrib_la-2026-08-07`.  Both drift by **exactly one
+#: unit in the 6th printed decimal** — 20/2484 rows for gnppm, 24/1620 for
+#: bispinor, max |Δ| exactly 1.000e-6 eV — in one direction on Frontera and
+#: the other on Perlmutter.  A 6-decimal `.dat` at `atol=1e-6` has no room
+#: for a cross-platform ULP, so "re-freeze on whichever machine ran last"
+#: is a permanent ping-pong that silently turns the other machine red.
+#: This is that ping-pong ended: 1e-5 eV is 10x the observed drift and
+#: five orders below anything physical.
+#:
+#: WHAT STILL ANCHORS THESE TIGHTLY.  Loosening a cross-machine pin does
+#: not loosen the tree.  Same-machine drift is caught by the Si COHSEX
+#: byte-identity gate (`test_si_production_matches_frozen_reference`,
+#: which returns early on an exact text match) and by the BerkeleyGW
+#: anchor (`test_si_production_matches_berkeleygw`, `_BGW_TOL`, sub-meV
+#: MAE against an external code).  Those are the gates that would catch a
+#: physics change; these two answer "does the frozen MoS2 output still
+#: reproduce on a different machine", and the answer should not depend on
+#: the 6th decimal of a text file.
+#:
+#: DO NOT reach for this constant to make an unrelated red go green.  It
+#: is scoped to the two cross-machine-frozen pins by name.
+_XMACHINE_ATOL_EV = 1e-5
+
 # (case_id, subdir, input_name, output_name, reference_name, sigma_labels, atol)
 _CASES = [
     ("cohsex", REG / "cohsex_debug", "cohsex_test.in", "eqp_test.dat",
@@ -78,6 +108,17 @@ def _assert_matches_reference(output_file, reference_file, labels, atol,
     # Compare only real-valued physics columns: kpt, band, 3 Σ, VH_re
     # (byte-identity above is the primary check; this atol path only
     # absorbs GPU-nondeterministic last-ULP drift).
+    #
+    # REPORT THE HEADROOM, always, pass or fail.  A tolerance nobody can
+    # see the margin on is a tolerance nobody can audit: it silently
+    # absorbs a growing drift until the day it does not, and then the
+    # first number anyone has is the one that broke it.  This line is how
+    # the 2026-08-07 cross-machine ruling stays checkable on every run.
+    _d = np.abs(out_rows[:, :6] - ref_rows[:, :6])
+    _mx = float(_d.max()) if _d.size else 0.0
+    print(f"[{case_id}] max |Δ| vs reference = {_mx:.3e} "
+          f"(atol {atol:.0e}, {_mx / atol:.1%} of budget, "
+          f"{int((_d > atol).sum())} row-cells over)", flush=True)
     try:
         np.testing.assert_allclose(
             out_rows[:, :6], ref_rows[:, :6], rtol=0.0, atol=atol)
@@ -236,11 +277,15 @@ def test_si_fast_matches_frozen_reference(si_fast_session):
 
 @pytest.mark.regression
 def test_gnppm_matches_reference(gnppm_session):
-    """MoS2 3×3 GN-PPM frozen gate, on the session run (Tier-2's state)."""
+    """MoS2 3×3 GN-PPM frozen gate, on the session run (Tier-2's state).
+
+    Frontera-frozen; runs on Perlmutter too at ``_XMACHINE_ATOL_EV``
+    (owner ruling 2026-08-07 — read that constant before touching it).
+    """
     _assert_matches_reference(
         gnppm_session.run_dir / gnppm_session.output_name,
         REG / "gnppm_debug" / "sigma_diag_gnppm_ref.dat",
-        ("sigX", "sigC", "sigXC"), 1e-6, "gnppm")
+        ("sigX", "sigC", "sigXC"), _XMACHINE_ATOL_EV, "gnppm")
     # The frozen values CANNOT detect a silently deactivated IBZ cascade
     # (IBZ ≡ full-BZ numerically) — pin the activation on the log.
     assert "unfold=IBZ→full" in gnppm_session.stdout, (
@@ -251,11 +296,15 @@ def test_gnppm_matches_reference(gnppm_session):
 
 @pytest.mark.regression
 def test_bispinor_gnppm_matches_reference(bispinor_session):
-    """Bispinor GN-PPM frozen gate (Σ^B folded into sigX)."""
+    """Bispinor GN-PPM frozen gate (Σ^B folded into sigX).
+
+    Frontera-frozen; runs on Perlmutter too at ``_XMACHINE_ATOL_EV``
+    (owner ruling 2026-08-07 — read that constant before touching it).
+    """
     _assert_matches_reference(
         bispinor_session.run_dir / bispinor_session.output_name,
         REG / "bispinor_debug" / "sigma_diag_bispinor_ref.dat",
-        ("sigX", "sigC", "sigXC"), 1e-6, "bispinor")
+        ("sigX", "sigC", "sigXC"), _XMACHINE_ATOL_EV, "bispinor")
     # Fixture properties (see its README): charge tiles full-BZ-direct,
     # transverse tiles through the IBZ cascade.
     assert "charge-centroid orbit closure failed" in bispinor_session.stdout
