@@ -195,12 +195,21 @@ def run(mesh, *, dtype="complex128", warmup=2, reps=5, only=""):
                 # is the shape of a baseline table that quietly measures
                 # only the easy half.  factor()+solve() is the route those
                 # backends actually have, so it is the route timed.
-                B = _put(B_np, mesh, (None, "x", "y"))
+                # factor() DONATES A and solve() DONATES B, so this
+                # route needs fresh operands per call for the same reason
+                # solve_lu does.  MEASURED (gpu2x2, 2026-08-07): without
+                # it, cholesky/cusolvermp came back as four
+                # XlaRuntimeError rows.  On the CPU 2x2 the slate rows
+                # happened to survive, which is exactly why the fix is
+                # keyed on the ROUTE and not on which one failed today.
+                def build(_A=A_np, _B=B_np):
+                    return (_put(_A, mesh, (None, "x", "y")),
+                            _put(_B, mesh, (None, "x", "y")))
 
                 def fn(a, b, _op=op, _bk=backend, _n=n):
                     return D.solve(
                         D.factor(_op, a, mesh, backend=_bk, n=_n), b)
-                args = (A, B)
+                args = build()
             else:
                 fn, args = D.plan(op, mesh, backend=backend, n=n).batched, (A,)
             try:

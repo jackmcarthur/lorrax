@@ -1,0 +1,636 @@
+{
+  "backend": "gpu",
+  "devices": 4,
+  "ffi_host_so": "/pscratch/sd/j/jackm/svc_distrib_la/build_host_h200/liblorrax_ffi_host.so",
+  "ffi_so": "/global/homes/j/jackm/software/lorrax_ffi_2026-08-07/liblorrax_ffi.so",
+  "jax_version": "0.7.0.dev20260807",
+  "jobid": "56444350",
+  "machine": "perlmutter",
+  "mesh": "2x2",
+  "nodes": 1,
+  "processes": 4,
+  "recorded": "2026-08-07T05:02:10-0700",
+  "rows": [
+    {
+      "backend": "off",
+      "compile_seconds": 0.0029312949627637863,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "native",
+      "route": "plan.batched",
+      "seconds": 0.0028353300294838846,
+      "seconds_max": 0.0029912309837527573,
+      "seconds_min": 0.002800130983814597,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.009261050960049033,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "native",
+      "route": "plan.batched",
+      "seconds": 0.008887055970262736,
+      "seconds_max": 0.009008090011775494,
+      "seconds_min": 0.008388412010390311,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.02923982299398631,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "native",
+      "route": "plan.batched",
+      "seconds": 0.02973046200349927,
+      "seconds_max": 0.04199551901547238,
+      "seconds_min": 0.028536020021419972,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.03995915700215846,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "native",
+      "route": "plan.batched",
+      "seconds": 0.041238482983317226,
+      "seconds_max": 0.053354491014033556,
+      "seconds_min": 0.03976398799568415,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "distributed",
+      "compile_seconds": 3.1720335819991305,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 3.176896168035455,
+      "seconds_max": 3.2000422209966928,
+      "seconds_min": 3.13001111097401,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "distributed",
+      "compile_seconds": 3.2481707629631273,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 3.15772801800631,
+      "seconds_max": 3.3092876540031284,
+      "seconds_min": 3.091775117034558,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "distributed",
+      "compile_seconds": 12.716821313020773,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 12.667330383963417,
+      "seconds_max": 12.828273913997691,
+      "seconds_min": 12.61626433301717,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "distributed",
+      "compile_seconds": 3.667783045966644,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 3.499456825957168,
+      "seconds_max": 3.6415950109949335,
+      "seconds_min": 3.397765557980165,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "2x2",
+      "op": "eigh",
+      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "2x2",
+      "op": "eigh",
+      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "2x2",
+      "op": "eigh",
+      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "2x2",
+      "op": "eigh",
+      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "compile_seconds": 3.0970978690311313,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 3.1168814139673486,
+      "seconds_max": 3.14672492898535,
+      "seconds_min": 3.0475937359733507,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "compile_seconds": 3.0909446110017598,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 3.2006388870067894,
+      "seconds_max": 3.2514758899924345,
+      "seconds_min": 3.1859680649940856,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "compile_seconds": 12.729115255991928,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 12.712868704053108,
+      "seconds_max": 12.772400592977647,
+      "seconds_min": 12.387228460982442,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "compile_seconds": 3.4471502309897915,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 3.525162959995214,
+      "seconds_max": 3.699106899963226,
+      "seconds_min": 3.4618169690365903,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 0.9510968690156005,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "plan.batched",
+      "seconds": 0.8761390820145607,
+      "seconds_max": 1.0679604199831374,
+      "seconds_min": 0.8493551680003293,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 1.1664401740417816,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "plan.batched",
+      "seconds": 1.2073882650001906,
+      "seconds_max": 1.6656506839790381,
+      "seconds_min": 1.0256962109706365,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 5.5524948660167865,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "plan.batched",
+      "seconds": 4.55533776502125,
+      "seconds_max": 5.055917582008988,
+      "seconds_min": 4.216958437988069,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 2.803573993034661,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "eigh",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "plan.batched",
+      "seconds": 2.733073154988233,
+      "seconds_max": 2.9419199760304764,
+      "seconds_min": 2.59570857899962,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "native2d",
+      "compile_seconds": 0.002935044001787901,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "reps": 5,
+      "resolved": "native2d",
+      "route": "plan.batched",
+      "seconds": 0.0022835319978185,
+      "seconds_max": 0.002289224008563906,
+      "seconds_min": 0.0022641050163656473,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "native2d",
+      "compile_seconds": 0.006480750977061689,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "reps": 5,
+      "resolved": "native2d",
+      "route": "plan.batched",
+      "seconds": 0.004095410986337811,
+      "seconds_max": 0.004171238048002124,
+      "seconds_min": 0.0040295139770023525,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "native2d",
+      "compile_seconds": 0.009033605980221182,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "reps": 5,
+      "resolved": "native2d",
+      "route": "plan.batched",
+      "seconds": 0.02201536699431017,
+      "seconds_max": 0.02375041600316763,
+      "seconds_min": 0.009435343032237142,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "native2d",
+      "compile_seconds": 0.01040274603292346,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "reps": 5,
+      "resolved": "native2d",
+      "route": "plan.batched",
+      "seconds": 0.010408437985461205,
+      "seconds_max": 0.010496628994587809,
+      "seconds_min": 0.010358901985455304,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "error": "XlaRuntimeError: INVALID_ARGUMENT: Buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "resolved": "cusolvermp",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "error": "XlaRuntimeError: INVALID_ARGUMENT: Buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "resolved": "cusolvermp",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "error": "XlaRuntimeError: INVALID_ARGUMENT: Buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "resolved": "cusolvermp",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "error": "XlaRuntimeError: INVALID_ARGUMENT: Buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "resolved": "cusolvermp",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 1.5676338439807296,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "factor+solve",
+      "seconds": 1.538168188999407,
+      "seconds_max": 1.567122754000593,
+      "seconds_min": 1.4714852970209904,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 1.4519922059844248,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "factor+solve",
+      "seconds": 1.3967622960335575,
+      "seconds_max": 1.454616369039286,
+      "seconds_min": 1.3868392380536534,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 5.509936981019564,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "factor+solve",
+      "seconds": 7.237241320020985,
+      "seconds_max": 7.3159654890187085,
+      "seconds_min": 6.951519618974999,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 1.8480861040297896,
+      "dtype": "complex128",
+      "mesh": "2x2",
+      "op": "cholesky",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "factor+solve",
+      "seconds": 1.9141511360066943,
+      "seconds_max": 2.112351062009111,
+      "seconds_min": 1.845324495981913,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "distributed",
+      "error": "XlaRuntimeError: INVALID_ARGUMENT: Buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "cusolvermp",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "distributed",
+      "error": "XlaRuntimeError: INVALID_ARGUMENT: Buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "cusolvermp",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "distributed",
+      "error": "XlaRuntimeError: INVALID_ARGUMENT: Buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "cusolvermp",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "distributed",
+      "error": "XlaRuntimeError: INVALID_ARGUMENT: Buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "cusolvermp",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available solve_lu backends on this mesh: native, cusolvermp.",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available solve_lu backends on this mesh: native, cusolvermp.",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available solve_lu backends on this mesh: native, cusolvermp.",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available solve_lu backends on this mesh: native, cusolvermp.",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "error": "XlaRuntimeError: INVALID_ARGUMENT: Buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "cusolvermp",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "error": "XlaRuntimeError: INVALID_ARGUMENT: Buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "cusolvermp",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "error": "XlaRuntimeError: INVALID_ARGUMENT: Buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "cusolvermp",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "error": "XlaRuntimeError: INVALID_ARGUMENT: Buffer has been deleted or donated.",
+      "mesh": "2x2",
+      "op": "solve_lu",
+      "resolved": "cusolvermp",
+      "shape": [
+        2,
+        1024
+      ]
+    }
+  ],
+  "tag": "gpu2x2"
+}
