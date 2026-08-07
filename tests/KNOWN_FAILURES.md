@@ -26,6 +26,15 @@ re-freezes turn out to be *platform-local* — see class **P1**.
 | jobids | **56447670** (gpu pool, all legs except F), **56446562** (Milan cpu pool) |
 | artifacts | `/pscratch/sd/j/jackm/svc_distrib_la/_reports_step6/` — one `.log` + one `.xml` per leg, sizes quoted below |
 
+> **Which commit the legs ran at.**  Every leg below ran at `e9340d1`.  The
+> two commits since — `d5cac09` (bench baselines) and `efdbf9a` (this file)
+> — touch four `.json` under `services/distrib_la/bench/baselines/` and one
+> `.md`.  `pyproject`'s `norecursedirs` excludes `bench`, so neither is
+> importable or collectable, and `pytest --collect-only` at `e9340d1` and at
+> `efdbf9a` returns the **same 1441 ids, diff empty**.  Legs B, E and E2
+> were additionally RE-RUN at `efdbf9a` and came back byte-identical
+> (130/108P/22S, 120/120P, 130/127P/3S).
+
 ## Verdicts by leg
 
 | leg | invocation | collected | passed | failed | error | skipped |
