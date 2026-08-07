@@ -102,6 +102,12 @@ from lxkit.testing import hostile_extents                     # noqa: E402
 #: would be demanding that the library not be distributed.
 RTOL = 1e-12
 
+#: Cholesky backends whose factor is a library HANDLE rather than an
+#: array, so ``plan.batched`` refuses them by design and the factor/solve
+#: token is the only route.  ``native2d`` is dense-in/dense-out and is not
+#: one of them.
+_HANDLE_CHOLESKY = ("slate", "cusolvermp")
+
 
 # ---------------------------------------------------------------------------
 # Operand builders and measures — host numpy, identical seed on every rank
@@ -185,11 +191,24 @@ def check_resolution_is_a_promise(mesh, dtype="complex128"):
             if resolved in (D.NATIVE, "native2d"):
                 continue
             A = jnp.asarray(_hpd(rng, 2, n, dtype))
-            if op == "eigh":
-                D.plan(op, mesh, backend=backend, n=n).batched(A)
-            elif op == "solve_lu":
+            if op == "solve_lu":
                 B = jnp.asarray(_rng_mat(rng, (2, n, 32), dtype))
                 D.plan(op, mesh, backend=backend, n=n).batched(A, B)
+            elif op == "cholesky" and resolved in _HANDLE_CHOLESKY:
+                # MEASURED, Perlmutter CPU 2x2, 2026-08-07: plan.batched
+                # REFUSES slate cholesky --
+                #
+                #   cholesky backend 'slate' has no batched entry point and
+                #   its single-tile result is not an array, so
+                #   plan.batched() cannot stack it.  Use
+                #   distrib_la.factor()/solve() ...
+                #
+                # -- which is the contract, not a defect.  Routing through
+                # the token here is what makes this check cover the
+                # handle-returning backends instead of reporting a GUARD
+                # and moving on, which is what the first draft did.
+                D.solve(D.factor(op, A, mesh, backend=backend, n=n),
+                        jnp.asarray(_rng_mat(rng, (2, n, 8), dtype)))
             else:
                 D.plan(op, mesh, backend=backend, n=n).batched(A)
             called.append(f"{op}/{backend}->{resolved}")
