@@ -996,6 +996,36 @@ _NULLABLE_BOOL = frozenset()
 #  Input file parser
 # ---------------------------------------------------------------------------
 
+def _deck_key_line(lines, start, end, key) -> str:
+    """Locate ``key`` in the ``[cohsex]`` section; return ``"line N"``.
+
+    Returns ``"line ?"`` when the key cannot be found on a line of its own
+    (it can still have been parsed — configparser accepts continuations).
+    """
+    lineno = next(
+        (i + 1 for i in range(start, end)
+         if re.match(rf"\s*{re.escape(key)}\s*[=:]", lines[i], re.IGNORECASE)),
+        None)
+    return f"line {lineno}" if lineno is not None else "line ?"
+
+
+def _print_deck_report(msg: str) -> None:
+    """Print one deck-hygiene report on rank 0.
+
+    ``process_rank`` is jax-free-safe (lazy jax import inside, falls back
+    to 0 when jax is absent or uninitialised) — a downhill L1→L3 import,
+    function-scoped so this parser stays importable without the common
+    package fully initialised.
+    """
+    try:
+        from common.collectives import process_rank
+        rank = process_rank()
+    except Exception:                                  # noqa: BLE001
+        rank = 0
+    if rank == 0:
+        print(msg)
+
+
 def read_lorrax_input(filename: str) -> dict:
     """Parse a LORRAX input file ([cohsex] section) into a params dict.
 
@@ -1054,6 +1084,24 @@ def read_lorrax_input(filename: str) -> dict:
             raise ValueError(
                 "Input key 'use_shipped_minimax_tables' is no longer supported. "
                 "Use 'regenerate_minimax_tables = true/false' instead.")
+
+        # RETIRED-KEY REPORT.  A key with an explicit legacy branch is
+        # exempt from the unknown-key check below so one deck key never
+        # draws two messages — but that exemption left
+        # ``warnings.warn(..., DeprecationWarning)`` as the ONLY report,
+        # and Python's default filter hides DeprecationWarning outside
+        # ``__main__``.  A retired key was therefore parsed, matched,
+        # ignored, and announced to nobody, which is exactly the failure
+        # the unknown-key check exists to prevent.  Collect every hit and
+        # print it through the same rank-0 reporter, in wording that keeps
+        # "retired" (the key was real once, and here is what replaced it)
+        # distinct from "unrecognized" (nothing ever read this).  The
+        # DeprecationWarnings stay — they are what a library consumer
+        # filters on.  This report never REFUSES: ``strict_keys`` governs
+        # unknown keys, and whether a retired key should be fatal is the
+        # deck owner's call, not the parser's.
+        retired = []                         # (key, what the run does with it)
+
         # ``chunk_size`` (legacy band-chunk knob) was a no-op: its only
         # consumer wrote ``meta.chunk_size``, which nothing ever read —
         # chunk sizing is owned by the gflat planner.  Dropped 2026-07-09.
@@ -1065,6 +1113,10 @@ def read_lorrax_input(filename: str) -> dict:
                 "see 'gflat_chunk_size' / 'band_chunk_size').",
                 DeprecationWarning, stacklevel=2,
             )
+            retired.append((
+                "chunk_size",
+                "IGNORED — it was a no-op; chunk sizing is planner-owned "
+                "(see 'gflat_chunk_size' / 'band_chunk_size')"))
         for legacy_key in ("output_file", "eqp_output_file"):
             if section.get(legacy_key, fallback=None) is not None:
                 import warnings
@@ -1078,6 +1130,32 @@ def read_lorrax_input(filename: str) -> dict:
                     f"input file.",
                     DeprecationWarning, stacklevel=2,
                 )
+                retired.append((
+                    legacy_key,
+                    "IGNORED — the LORRAX-native eqp0 filename is now "
+                    "'sigma_diag_file'; eqp0.dat / eqp1.dat are written "
+                    "automatically"))
+        # ``slab_io`` / ``use_ffi_io`` had no branch at all: named in
+        # ``_LEGACY_DECK_KEYS`` (so skipped by the unknown-key check) and
+        # then handled nowhere, which is the silent case in its purest
+        # form.  There is one sharded-slab transport and the deck does not
+        # select it; see file_io/slab_io.py.
+        for legacy_key in ("slab_io", "use_ffi_io"):
+            if section.get(legacy_key, fallback=None) is not None:
+                import warnings
+                warnings.warn(
+                    f"Input key '{legacy_key}' is no longer supported and "
+                    f"will be ignored: there is one sharded-slab transport "
+                    f"and the deck does not select it.  It never changed a "
+                    f"number, only which library moved the bytes.  Remove "
+                    f"'{legacy_key}' from your input file.",
+                    DeprecationWarning, stacklevel=2,
+                )
+                retired.append((
+                    legacy_key,
+                    "IGNORED — one sharded-slab transport, not deck-selectable "
+                    "(it never changed a number, only which library moved "
+                    "the bytes)"))
         # Deprecated qp_solver aliases (still honored via auto-resolution;
         # see ``LorraxConfig.qp_solver``).
         for legacy_key, replacement in (
@@ -1092,6 +1170,19 @@ def read_lorrax_input(filename: str) -> dict:
                     f"'{replacement}' instead.",
                     DeprecationWarning, stacklevel=2,
                 )
+                retired.append((
+                    legacy_key,
+                    f"deprecated but still HONORED via 'qp_solver = auto' "
+                    f"resolution; set '{replacement}' instead"))
+
+        if retired:
+            _print_deck_report(
+                f"read_lorrax_input: {len(retired)} retired deck key(s) in "
+                f"{filename}:\n"
+                + "\n".join(
+                    f"    {key} "
+                    f"({_deck_key_line(lines, start, end, key)}): {note}"
+                    for key, note in retired))
 
 
         # REMOVED keys (owner-approved deletions, 2026-07-31; these behave
@@ -1111,6 +1202,7 @@ def read_lorrax_input(filename: str) -> dict:
         # decks carry dead keys — unless the deck opts in via
         # ``strict_keys = true``, which upgrades the warning to a
         # ValueError naming all unknown keys at once.
+        # Retired keys are exempt (they got their own report above).
         # configparser lower-cases option names (``optionxform = str.lower``),
         # so iterating ``section`` yields ``do_g0`` for a deck that writes
         # the documented ``do_G0`` -- the ONE non-lower-case key among the
@@ -1124,15 +1216,8 @@ def read_lorrax_input(filename: str) -> dict:
                   | {k.lower() for k in _LEGACY_DECK_KEYS})
         unknown = [k for k in section if k.lower() not in _known]
         if unknown:
-            located = []
-            for key in unknown:
-                lineno = next(
-                    (i + 1 for i in range(start, end)
-                     if re.match(rf"\s*{re.escape(key)}\s*[=:]",
-                                 lines[i], re.IGNORECASE)),
-                    None)
-                where = f"line {lineno}" if lineno is not None else "line ?"
-                located.append(f"{key} ({where})")
+            located = [f"{key} ({_deck_key_line(lines, start, end, key)})"
+                       for key in unknown]
             if section.getboolean(
                     "strict_keys",
                     fallback=bool(_DEFAULTS["strict_keys"])):
@@ -1141,23 +1226,12 @@ def read_lorrax_input(filename: str) -> dict:
                     f"key(s) in {filename}:\n"
                     + "\n".join(f"    {loc}: not a recognized deck key"
                                 for loc in located))
-            msg = (f"read_lorrax_input: {len(unknown)} unrecognized deck "
-                   f"key(s) in {filename}:\n"
-                   + "\n".join(
-                       f"    {loc}: ignored — not a recognized deck key"
-                       for loc in located))
-            # Rank-0-equivalent stdout.  ``process_rank`` is jax-free-safe
-            # (lazy jax import inside, falls back to 0 when jax is absent
-            # or uninitialised) — a downhill L1→L3 import, function-scoped
-            # so this parser stays importable without the common package
-            # fully initialised.
-            try:
-                from common.collectives import process_rank
-                _rank = process_rank()
-            except Exception:                              # noqa: BLE001
-                _rank = 0
-            if _rank == 0:
-                print(msg)
+            _print_deck_report(
+                f"read_lorrax_input: {len(unknown)} unrecognized deck "
+                f"key(s) in {filename}:\n"
+                + "\n".join(
+                    f"    {loc}: ignored — not a recognized deck key"
+                    for loc in located))
 
         # Build params from _DEFAULTS, overriding with parsed values
         params = {}

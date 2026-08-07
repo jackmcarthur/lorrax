@@ -1742,8 +1742,12 @@ class SymMaps:
 #
 #     ⟨Θm,k|O|Θn,k⟩ = conj(⟨m,k|O|n,k⟩)   ⇒   O(−k) = conj(O(k))
 #
-# ``sym_idx_k >= n_sym_spatial`` marks the time-reversed members, the same
-# convention ``unfold_psi`` and ``unfold_v_q`` use.  Assuming equality
+# ``sym_idx_k >= n_sym_spatial`` marks a time-reversed ROW, the same
+# convention ``unfold_psi`` and ``unfold_v_q`` use.  The star helpers need
+# one step past that: they relate a member to another FULL-BZ ROW (the
+# star's first member), which carries a ``sym_idx`` of its own, so the
+# conjugation applies iff the two DIFFER in TRS-ness — see
+# :func:`_star_conj_flags`.  Assuming equality
 # instead is not a small error: on MoS₂ 4×4 (nk 16→10, 6 TRS pairs) the
 # conjugation rule holds to 1.2e-16 while equality is off by 3.6e-01
 # RELATIVE, on every non-singleton star, and hermiticity, the norm and the
@@ -1887,6 +1891,34 @@ def _broadcast_rows(A_irr, take, trs):
     return _cached_star_jit(key, _build)(A_irr)
 
 
+def _star_conj_flags(irr_idx_k, sym_idx_k, n_sym_spatial):
+    """``(ref_rows, conj)`` per full-BZ row: its star's reference row, and
+    whether the value there must be CONJUGATED to give this row's value.
+
+    THE REFERENCE IS A FULL-BZ ROW, NOT AN IBZ POINT.  Both directions of
+    the star map address the row :func:`star_select` keeps — the first
+    member of the star — and that row carries a ``sym_idx`` of its own,
+    which can itself be a time-reversal row.  Θ is antiunitary, so
+    ``O(−k) = conj(O(k))``; two rows that are both time-reversed images of
+    the same IBZ point are therefore related to each other WITHOUT a
+    conjugation, and a spatial row is related to a time-reversed reference
+    WITH one.  The predicate is the XOR of the two TRS flags.
+
+    Testing the member's flag alone — which these helpers used to do —
+    inverts the rule for every star whose first member is a time-reversal
+    row.  That costs nothing while every star begins on a spatial row, and
+    silently conjugates (or fails to conjugate) whole stars as soon as one
+    does not: the norm, hermiticity and the electron count all survive it,
+    and :func:`star_spread` is the only thing that sees it.
+    """
+    irr = np.asarray(irr_idx_k)
+    trs = np.asarray(sym_idx_k) >= int(n_sym_spatial)
+    rows, labels = _star_row_order(irr)
+    rep = {int(v): int(r) for v, r in zip(labels, rows)}
+    ref_rows = np.array([rep[int(v)] for v in irr], dtype=np.int32)
+    return ref_rows, np.asarray(trs ^ trs[ref_rows])
+
+
 def _spread_tables(irr_idx_k, sym_idx_k, n_sym_spatial):
     """``(members, refs, conj)`` — :func:`star_spread`'s comparison set.
 
@@ -1897,15 +1929,10 @@ def _spread_tables(irr_idx_k, sym_idx_k, n_sym_spatial):
     kernel gathers only what it compares: ``2 · n_members`` tiles with
     ``n_members = n_k − n_k_irr``, not ``2 · n_k``.
     """
-    irr = np.asarray(irr_idx_k)
-    sidx = np.asarray(sym_idx_k)
-    rows, labels = _star_row_order(irr)
-    pos = {int(v): int(r) for v, r in zip(labels, rows)}
-    ref_all = np.array([pos[int(v)] for v in irr], dtype=np.int32)
+    ref_all, conj_all = _star_conj_flags(irr_idx_k, sym_idx_k, n_sym_spatial)
     members = np.where(ref_all != np.arange(ref_all.shape[0]))[0].astype(
         np.int32)
-    return (members, ref_all[members],
-            np.asarray(sidx >= int(n_sym_spatial))[members])
+    return members, ref_all[members], conj_all[members]
 
 
 def _star_stats(A_full, members, refs, conj):
@@ -1970,9 +1997,10 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
 
     ``A_irr`` is ``(n_k_irr, ...)`` in the order :func:`star_select`
     returned; the result is ``(n_k_full, ...)``.  A gather plus a
-    CONJUGATION on the time-reversed members — ``sym_idx_k >=
-    n_sym_spatial`` marks those, the same convention ``unfold_psi`` and
-    ``unfold_v_q`` use.  A device operand never leaves the device.
+    CONJUGATION on every member whose TRS-ness DIFFERS from that of the
+    row :func:`star_select` kept for its star — see
+    :func:`_star_conj_flags` for why the member's own flag is not the
+    predicate.  A device operand never leaves the device.
 
     ``sym_idx_k`` and ``n_sym_spatial`` are REQUIRED, not optional with an
     equality default: a caller that omitted them would get silently wrong
@@ -1992,14 +2020,18 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
               else np.asarray(irr_labels))
     pos = {int(v): i for i, v in enumerate(labels)}
     take = np.array([pos[int(v)] for v in irr], dtype=np.int32)
-    return _broadcast_rows(A_irr, take, sidx >= int(n_sym_spatial))
+    # Conjugate relative to the star's kept ROW, not on the member's own
+    # TRS flag: ``_star_conj_flags`` carries the derivation.
+    _, conj = _star_conj_flags(irr, sidx, n_sym_spatial)
+    return _broadcast_rows(A_irr, take, conj)
 
 
 def star_spread(A_full, irr_idx_k, sym_idx_k, n_sym_spatial):
     """max residual of ``A_full`` against its own star, by the right rule.
 
-    Compares each member to its star's first member — directly for a
-    spatial row, against the CONJUGATE for a time-reversed one.  Zero up
+    Compares each member to its star's first member — directly when the
+    two lie on the same side of time reversal, against the CONJUGATE when
+    they do not (:func:`_star_conj_flags`).  Zero up
     to round-off iff the full-BZ basis really is the unfolded IBZ one and
     the operator commutes with the symmetry.
 
@@ -2037,7 +2069,8 @@ class KStarMap:
     """
 
     __slots__ = ("irr_idx", "sym_idx", "n_sym_spatial", "labels",
-                 "_rows", "_take", "_trs", "_members", "_refs", "_conj")
+                 "_rows", "_take", "_conj_bcast", "_members", "_refs",
+                 "_conj")
 
     def __init__(self, irr_idx, sym_idx, n_sym_spatial, labels=None):
         self.irr_idx = np.asarray(irr_idx, dtype=np.int32)
@@ -2053,7 +2086,10 @@ class KStarMap:
         pos = {int(v): i for i, v in enumerate(self.labels)}
         self._take = np.array([pos[int(v)] for v in self.irr_idx],
                               dtype=np.int32)
-        self._trs = self.sym_idx >= self.n_sym_spatial
+        # Broadcast conjugates RELATIVE to the star's kept row, so this
+        # is not ``sym_idx >= n_sym_spatial`` — see ``_star_conj_flags``.
+        _, self._conj_bcast = _star_conj_flags(
+            self.irr_idx, self.sym_idx, self.n_sym_spatial)
         self._members, self._refs, self._conj = _spread_tables(
             self.irr_idx, self.sym_idx, self.n_sym_spatial)
 
@@ -2093,8 +2129,9 @@ class KStarMap:
         return _take_rows(A_full, self._rows)
 
     def broadcast(self, A_irr):
-        """``(n_k_irr, …)`` → ``(n_k_full, …)``, conjugating TRS members."""
-        return _broadcast_rows(A_irr, self._take, self._trs)
+        """``(n_k_irr, …)`` → ``(n_k_full, …)``, conjugating the members
+        whose TRS-ness differs from their star's kept row."""
+        return _broadcast_rows(A_irr, self._take, self._conj_bcast)
 
     def spread(self, A_full) -> float:
         """Residual of ``A_full`` against its own stars; see :func:`star_spread`.

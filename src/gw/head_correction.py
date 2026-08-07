@@ -229,6 +229,31 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
     if override is not None:
         return override
 
+    # MIXED-HEAD ANNOUNCEMENT.  ``resolve_head_override`` keys on ONE deck
+    # scalar per frequency: ``whead_0freq`` at ω=0 and ``whead_imfreq`` at
+    # the PPM probe (the only non-zero ω the driver ever asks for).  A deck
+    # that sets ``vhead``/``whead_0freq`` and omits ``whead_imfreq``
+    # therefore overrides one end of the plasmon-pole fit and computes the
+    # other, which is a legitimate thing to want — it pins the static head
+    # to a reference code and lets the dispersion come from here — but it
+    # is not what "head override" reads like, and the per-sample
+    # diagnostics say "Head source: override" at ω=0 without ever naming
+    # the other end.  Printed once per run: the resolver memoizes per
+    # frequency.
+    if (abs(complex(omega)) > 1.0e-14
+            and params.get("vhead") is not None
+            and params.get("whead_0freq") is not None
+            and params.get("whead_imfreq") is None):
+        print_fn(
+            f"  [head] MIXED HEAD: 'vhead'/'whead_0freq' override W(q→0) at "
+            f"omega=0, but 'whead_imfreq' is unset, so W(q→0) at the PPM "
+            f"probe omega={complex(omega)} Ry is COMPUTED from "
+            f"wcoul0_source="
+            f"{str(params.get('wcoul0_source', 's_tensor')).strip().lower()}. "
+            f"The two-point pole fit therefore mixes an overridden head "
+            f"with a computed one; set 'whead_imfreq' to override both."
+        )
+
     want_source = str(params.get("wcoul0_source", "s_tensor")).strip().lower()
     if want_source not in ("epshead", "s_tensor"):
         print_fn(f"Unknown wcoul0_source={want_source}; defaulting to 's_tensor'")
