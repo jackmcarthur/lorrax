@@ -53,13 +53,19 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from file_io import WfnLoader as WFNReader
-from common import symmetry_maps, Meta
+from common import Meta
 from common.wfn_transforms import load_kpoint_fftbox
 from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
                                momentum_matrix_k)
 from psp.get_dipole_mtxels import compute_p_operator_k, compute_vnl_velocity_cart
 from psp.pseudos import load_pseudopotentials, print_atomic_structure
 import psp.vnl_ops as vnl_ops
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+import symmetry_maps                                            # noqa: E402
 
 RY2EV = 13.605693122994
 MU_B_PREFACTOR = 0.5  # |m_e/hbar^2| in Ry-a0^2 units (magnitude; sign handled below)

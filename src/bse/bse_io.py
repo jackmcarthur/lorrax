@@ -1753,7 +1753,9 @@ def apply_eqp_corrections(
 
     if input_file is not None:
         from file_io import WfnLoader as WFNReader
-        from common.symmetry_maps import SymMaps
+        from ffi import _services
+        _services.ensure_on_path()
+        from symmetry_maps import SymMaps
 
         wfn_path = _parse_wfn_path(input_file)
         wfn = WFNReader(wfn_path)

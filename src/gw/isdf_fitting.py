@@ -348,7 +348,9 @@ def fit_zeta_to_h5(
     # V_q orchestrator assumes IBZ ζ̃_T), so they loud-fail with a hint.
     if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
         try:
-            from centroid.orbit_syms import (
+            from ffi import _services
+            _services.ensure_on_path()
+            from symmetry_maps import (
                 compute_centroid_sym_perm as _check_perm,
             )
             _cent_idx_for_check = np.asarray(
@@ -427,7 +429,9 @@ def fit_zeta_to_h5(
         # slice helper applies to χ_q for the W_q = (1 − v_q χ_q)^{-1} v_q
         # path once that lands.
         if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
-            from common.symmetry_maps import slice_q_full_to_ibz
+            from ffi import _services
+            _services.ensure_on_path()
+            from symmetry_maps import slice_q_full_to_ibz
             C_q_flat = slice_q_full_to_ibz(
                 C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
 

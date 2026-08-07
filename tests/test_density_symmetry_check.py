@@ -22,12 +22,16 @@ import h5py
 import numpy as np
 import pytest
 
-from common.density_symmetry_check import (
+from file_io.wfn_loader import WfnLoader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from symmetry_maps import (                                     # noqa: E402
     check_density_symmetries,
     trs_check_mode,
 )
-from common.symmetry_maps import SymMaps
-from file_io.wfn_loader import WfnLoader
 
 
 _FIXTURE = os.path.join(
@@ -188,6 +192,11 @@ _ISY = np.array([[0, 1], [-1, 0]], dtype=complex)      # = i·σ_y
 
 def test_T1_isigma_y_matches_symmetry_maps_and_is_kramers():
     """(T1): Θ = iσ_y K with Θ² = −1, and LORRAX's stored constant is iσ_y."""
+    # PRIVATE NAME — stays on the ``common.symmetry_maps`` SHIM on purpose.
+    # The door re-exports the public surface only; ``_I_SIGMA_Y`` is
+    # module-private in ``symmetry_maps.maps``.  The phase-wide shim-deletion
+    # commit (WAVE1_BRIEF ruling 2) decides this cell's home — likely into
+    # the service's own suite, which may import the private directly.
     from common.symmetry_maps import _I_SIGMA_Y
 
     assert np.allclose(_ISY, 1j * _SY)
@@ -326,6 +335,11 @@ def test_raw_read_matches_the_loader_ibz_path():
     """``_raw_ibz_psi_k`` must stay bit-identical to the loader's
     documented raw-IBZ contract, so the deliberate independence of the
     check's reader can never become a silent divergence."""
+    # PRIVATE NAME — stays on the ``common.density_symmetry_check`` SHIM on
+    # purpose.  The door re-exports the four ``__all__`` names only;
+    # ``_raw_ibz_psi_k`` is module-private.  The phase-wide shim-deletion
+    # commit (WAVE1_BRIEF ruling 2) decides this cell's home — likely into
+    # the service's own suite, which may import the private directly.
     from common.density_symmetry_check import _raw_ibz_psi_k
 
     loader = WfnLoader(_FIXTURE)

@@ -67,7 +67,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from common import Meta, symmetry_maps
+from common import Meta
 from common.wfn_transforms import load_kpoint_fftbox
 from file_io import WfnLoader as WFNReader
 from psp.dft_operators import setup_H_k_from_kvec
@@ -81,6 +81,12 @@ from solvers.sternheimer_precond import (
     tpa_preconditioner_diag,
 )
 from solvers.sternheimer_solve import SternheimerOp, sternheimer_solve
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+import symmetry_maps                                            # noqa: E402
 
 
 # ═══════════════════════════════════════════════════════════════════════

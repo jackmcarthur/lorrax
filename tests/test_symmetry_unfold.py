@@ -33,8 +33,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from centroid.orbit_syms import compute_centroid_sym_perm
-from common.symmetry_maps import SymMaps, find_irreducible_bz_points
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from symmetry_maps import (                                     # noqa: E402
+    SymMaps, compute_centroid_sym_perm, find_irreducible_bz_points,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -276,8 +282,11 @@ jax.config.update("jax_enable_x64", True)
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from centroid.orbit_syms import compute_centroid_sym_perm
-from common.symmetry_maps import unfold_v_q
+# The service path bootstrap ran with this module's FIRST import block, at
+# the top of the file; it is idempotent and once is enough.
+from symmetry_maps import (                                     # noqa: E402
+    compute_centroid_sym_perm, unfold_v_q,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +520,15 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 import numpy as np
 import pytest
 
-from common.symmetry_maps import unfold_psi, _I_SIGMA_Y
+# The service path bootstrap ran with this module's FIRST import block, at
+# the top of the file; it is idempotent and once is enough.
+from symmetry_maps import unfold_psi                            # noqa: E402
+# PRIVATE NAME — stays on the ``common.symmetry_maps`` SHIM on purpose.  The
+# door re-exports the public surface only; ``_I_SIGMA_Y`` is module-private in
+# ``symmetry_maps.maps``.  The phase-wide shim-deletion commit (WAVE1_BRIEF
+# ruling 2) decides this cell's home — likely into the service's own suite,
+# which may import the private directly.
+from common.symmetry_maps import _I_SIGMA_Y                     # noqa: E402
 
 
 # ---------------------------------------------------------------------------

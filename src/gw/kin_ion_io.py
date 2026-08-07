@@ -79,7 +79,7 @@ import numpy as np
 import jax.numpy as jnp
 import h5py
 
-from common import symmetry_maps, Meta
+from common import Meta
 from common.gvec_fft_box import refuse_padded_gvecs_without_mask
 from common.collectives import (barrier, device_count,
                                 local_share, process_rank_world,
@@ -101,6 +101,18 @@ from psp.get_DFT_mtxels import (
 )
 from psp.operator_checks import validate_operator_inputs
 import psp.vnl_ops as vnl_ops
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+# THE MODULE BINDING, not ``from symmetry_maps import star_broadcast``.
+# ``broadcast_ibz_to_full_bz`` calls ``symmetry_maps.star_broadcast(...)``
+# and ``tests/test_kin_ion_star_broadcast.py::
+# test_the_call_site_passes_ibz_slab_as_a_literal`` finds that call by AST
+# on ``func.attr == "star_broadcast"``.  A bare-name import would make the
+# I8 wiring check silently find zero calls instead of one.
+import symmetry_maps                                            # noqa: E402
 
 
 def _resolve_against(path: str, base_dir: str) -> str:

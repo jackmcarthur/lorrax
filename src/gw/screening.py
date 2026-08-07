@@ -336,7 +336,9 @@ def compute_static_w(
             # IBZ slice on V_q and χ₀_q.  Both retain the canonical
             # ``P(None, 'x', 'y')`` sharding; the helper locks it in.
             if use_ibz_w:
-                from common.symmetry_maps import slice_q_full_to_ibz
+                from ffi import _services
+                _services.ensure_on_path()
+                from symmetry_maps import slice_q_full_to_ibz
                 _nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
                 with timing.section(
                         "W.slice_to_ibz", announce=True,
@@ -370,7 +372,9 @@ def compute_static_w(
             # + TRS conj) — same helper V_q uses.  Σ_COH/SX still
             # iterate over the full BZ in the k-q sums.
             if use_ibz_w:
-                from common.symmetry_maps import unfold_v_q
+                from ffi import _services
+                _services.ensure_on_path()
+                from symmetry_maps import unfold_v_q
                 with timing.section(
                         "W.unfold_to_full_bz", announce=True,
                         label=f"{_w} IBZ -> full-BZ unfold "

@@ -604,7 +604,9 @@ def _kstar(inputs):
     ``gw_iteration_map`` be written ONCE: ``select``/``broadcast`` are
     no-ops on it, so the full-BZ path is the same code, not a branch.
     """
-    from common.symmetry_maps import KStarMap
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import KStarMap
     ks = getattr(inputs, "kstar", None)
     if ks is not None:
         return ks
@@ -1769,7 +1771,9 @@ def run_sc_driver(
     #     (nk=10, nb_active=128)".
     #
     # Construction is two numpy index arrays plus a ``np.unique``.
-    from common.symmetry_maps import KStarMap
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import KStarMap
     kstar_io = KStarMap.from_sym(sym, int(wfn.ntran))
     kstar = None
     if bool(getattr(config, "sc_on_ibz", False)):

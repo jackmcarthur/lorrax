@@ -78,7 +78,6 @@ try:
     from .normalize import normalize_dataclass
     from .load_upf import load_upf
     from ..io import WFNReader
-    from ..common import symmetry_maps
     from ..common.wfn_transforms import read_Gvecs_to_devices
     from ..common import Meta
 except ImportError:
@@ -89,7 +88,6 @@ except ImportError:
     from psp.upf.normalize import normalize_dataclass
     from psp.upf.load_upf import load_upf
     from file_io import WfnLoader as WFNReader
-    from common import symmetry_maps
     from common.wfn_transforms import read_Gvecs_to_devices
     from common import Meta
 from psp.radial.build_projectors_qe import (
@@ -102,6 +100,20 @@ import h5py
 import psp.vnl_ops as vnl_ops
 
 import common.timing as timing
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+# ONE spelling.  This module used to import ``symmetry_maps`` TWICE — once
+# as ``from ..common import`` in the try arm above, once as ``from common
+# import`` in its fallback — a relative/absolute pair for "``python -m``
+# or direct script".  The relative arm never ran: ``from ..io import
+# WFNReader`` on the line above it names a package that does not exist, so
+# the try arm raises on every interpreter and the fallback is the only
+# live code.  The service door is reached by ONE absolute import, and a
+# dual spelling of it would be two module objects waiting to happen.
+import symmetry_maps                                            # noqa: E402
 
 
 def report_devices(print_fn=print) -> None:
@@ -323,7 +335,9 @@ def _rho_sym_perm(wfn, fft_grid: tuple[int, int, int]):
     if key in _RHO_SYM_PERM_CACHE:
         return _RHO_SYM_PERM_CACHE[key]
 
-    from centroid.orbit_syms import compute_rgrid_sym_perm
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import compute_rgrid_sym_perm
     try:
         perm = compute_rgrid_sym_perm(mats, taus, fft_grid, validate=True)
     except Exception as exc:

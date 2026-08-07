@@ -47,7 +47,12 @@ import numpy as np
 import jax.numpy as jnp
 
 from file_io import WfnLoader as WFNReader
-from common import symmetry_maps
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+import symmetry_maps                                            # noqa: E402
 
 
 # ═══════════════════════════════════════════════════════════════════════

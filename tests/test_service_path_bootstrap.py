@@ -1,4 +1,4 @@
-"""The distrib_la door is reachable in a BARE launch, not just under pytest.
+"""A service door is reachable in a BARE launch, not just under pytest.
 
 THE DEFECT THIS EXISTS TO CATCH is "green suite, red cluster".  Nothing in
 the launch chain puts ``services/*/src`` on ``sys.path``: ``lx`` rewrites
@@ -7,7 +7,7 @@ the container ``PYTHONPATH`` to exactly ``<checkout>/src``
 nothing, and ``tests/harness.run_gw_jax`` — the launcher every end-to-end
 regression gate goes through — sets ``PYTHONPATH`` to ``<repo>/src`` and
 nothing else.  Under pytest the path is there anyway, because
-``services/distrib_la/tests/conftest.py`` inserts it at collection.  So a
+each service's own ``tests/conftest.py`` inserts it at collection.  So a
 module-scope ``from distrib_la import ...`` with no bootstrap would pass
 the entire lorrax suite and ``ImportError`` on the first real run.
 
@@ -21,9 +21,17 @@ else, which is the cluster's environment exactly, and imports a consumer
 that reaches the door at MODULE scope.
 
 RED ARM: ``test_a_bare_launch_cannot_find_the_service_by_itself`` shows the
-same subprocess FAILING to import ``distrib_la`` directly.  Without it
-these cells could be passing because the service happens to be installed,
-and would say nothing about the bootstrap at all.
+same subprocess FAILING to import the door directly.  Without it these
+cells could be passing because the service happens to be installed, and
+would say nothing about the bootstrap at all.
+
+PER SERVICE, NOT PER TREE.  The cells were written against ``distrib_la``
+and hard-coded its name in five places; the symmetry_maps replumb put TEN
+more module-scope door imports into ``src/`` and not one of them was
+measured by anything here — the exact failure class this file exists for,
+arriving as a second service rather than as a bootstrap-free consumer of
+the first.  So the consumer list carries the door it reaches, and the red
+arm runs once per door.
 """
 from __future__ import annotations
 
@@ -37,20 +45,42 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 _SRC = str(_REPO / "src")
 
-#: Consumers that import the door at MODULE scope.  The lazy sites (eight
-#: of them since the symmetry_maps extraction added
-#: ``centroid/kmeans_isdf.py``'s, all ``ensure_on_path()`` inside the
-#: function) cannot fail at import time and are covered by the end-to-end
-#: run instead.
+#: ``(consumer, door)`` — modules that import a service door at MODULE
+#: scope, paired with the door they reach.  The LAZY sites (the
+#: ``ensure_on_path()`` inside a function body: 7 statements reaching
+#: distrib_la, 15 reaching symmetry_maps) cannot fail at import time and
+#: are covered by the end-to-end run instead.
 #:
-#: ``bandstructure.bse_setup`` is the third module-scope consumer and is
-#: deliberately NOT here: it runs ``initialize_communicator_stack()`` at
-#: import (through ``.htransform``), which REQUIRES an FFI ``.so``, so a
-#: cell naming it would be a skip on every machine without one — the exact
-#: shape of coverage that evaporates quietly.  The Si COHSEX fixture run
-#: covers it on the cluster, where the bootstrap is what the whole gate
-#: depends on.
-_MODULE_SCOPE_CONSUMERS = ("isdf.core", "bse.vq_interp")
+#: THE OMISSIONS ARE NAMED, because a list nobody can audit is a list that
+#: rots.  ``src/`` holds TEN module-scope ``symmetry_maps`` consumers
+#: outside the three transitional shims; the four here are the ones a
+#: machine with no FFI library can launch at all.  The other six —
+#: ``bandstructure.htransform``, ``centroid.kmeans_cli``, ``gw.gw_jax``,
+#: ``gw.kin_ion_io``, ``psp.get_dipole_mtxels``,
+#: ``psp.orbital_magnetization`` — reach
+#: ``runtime.initialize_communicator_stack()`` at import (directly or
+#: through a dependency), which REQUIRES the FFI ``.so``, so a cell naming
+#: one would be a skip on every machine without it: the exact shape of
+#: coverage that evaporates quietly.  MEASURED, not assumed — each was put
+#: through :func:`_bare_run` at the replumb and died on the missing
+#: library, never on the bootstrap.  The Si COHSEX fixture run covers them
+#: on the cluster, where the bootstrap is what the whole gate depends on.
+#:
+#: ``scripts/checks/sigma_direct_check.py`` is a script, not an importable
+#: module, and is covered the same way; ``bandstructure.bse_setup`` is
+#: distrib_la's third module-scope consumer and is absent for the same FFI
+#: reason it always was.
+_MODULE_SCOPE_CONSUMERS = (
+    ("isdf.core", "distrib_la"),
+    ("bse.vq_interp", "distrib_la"),
+    ("centroid.charge_density", "symmetry_maps"),
+    ("centroid.pivoted_cholesky", "symmetry_maps"),
+    ("psp.get_DFT_mtxels", "symmetry_maps"),
+    ("psp.run_sternheimer", "symmetry_maps"),
+)
+
+#: Every door some consumer above reaches.  Derived, not written twice.
+_DOORS = tuple(sorted({door for _, door in _MODULE_SCOPE_CONSUMERS}))
 
 
 def _bare_run(code: str) -> subprocess.CompletedProcess:
@@ -73,41 +103,48 @@ def _bare_run(code: str) -> subprocess.CompletedProcess:
                           capture_output=True, text=True, timeout=600)
 
 
-def test_a_bare_launch_cannot_find_the_service_by_itself():
-    """THE RED ARM.  ``import distrib_la`` alone must FAIL in this env.
+@pytest.mark.parametrize("door", _DOORS)
+def test_a_bare_launch_cannot_find_the_service_by_itself(door):
+    """THE RED ARM.  ``import <door>`` alone must FAIL in this env.
 
     If this ever passes, the machine has the service installed some other
     way and every other cell in this file has stopped measuring the
     bootstrap.  Fail loudly rather than let them go quietly tautological.
+
+    It runs PER DOOR because the answer is per door: a tree could have
+    ``distrib_la`` unreachable and ``symmetry_maps`` on a stray ``.pth``,
+    and one red arm for both would report the wrong service as honest.
     """
-    r = _bare_run("import distrib_la")
+    r = _bare_run(f"import {door}")
     assert r.returncode != 0, (
-        "`import distrib_la` SUCCEEDED with PYTHONPATH=<repo>/src only, so "
-        "this environment already exposes services/*/src by some other "
-        "route.  Every other cell in this file is now a tautology: they "
-        "would pass with the bootstrap deleted.  Find the route (an "
-        "editable install? a .pth?) before trusting them.")
+        f"`import {door}` SUCCEEDED with PYTHONPATH=<repo>/src only, so "
+        f"this environment already exposes services/*/src by some other "
+        f"route.  Every {door} cell in this file is now a tautology: they "
+        f"would pass with the bootstrap deleted.  Find the route (an "
+        f"editable install? a .pth?) before trusting them.")
     assert "ModuleNotFoundError" in r.stderr, r.stderr
 
 
-@pytest.mark.parametrize("mod", _MODULE_SCOPE_CONSUMERS)
-def test_a_module_scope_consumer_reaches_the_door_in_a_bare_launch(mod):
+@pytest.mark.parametrize("mod,door", _MODULE_SCOPE_CONSUMERS)
+def test_a_module_scope_consumer_reaches_the_door_in_a_bare_launch(mod, door):
     """…and importing the CONSUMER makes it resolvable, via the bootstrap."""
     r = _bare_run(
         f"import importlib, sys\n"
         f"importlib.import_module({mod!r})\n"
-        f"assert 'distrib_la' in sys.modules, 'consumer imported but the "
+        f"assert {door!r} in sys.modules, 'consumer imported but the "
         f"door did not'\n"
-        f"import distrib_la\n"
-        f"print('DOOR', distrib_la.__file__)\n")
+        f"import {door}\n"
+        f"print('DOOR', {door}.__file__)\n")
     assert r.returncode == 0, (
         f"{mod} does not import with PYTHONPATH=<repo>/src alone — this is "
         f"the cluster's environment, so this is a RUN failure, not a test "
         f"one.\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}")
     assert "DOOR" in r.stdout, r.stdout
-    resolved = r.stdout.split("DOOR", 1)[1].strip()
-    assert resolved.startswith(str(_REPO / "services" / "distrib_la")), (
-        f"{mod} resolved distrib_la to {resolved!r}, which is not this "
+    # Consumers print at import (``runtime``'s startup banner, for one), so
+    # take the DOOR line, not everything after the marker.
+    resolved = r.stdout.split("DOOR", 1)[1].strip().splitlines()[0].strip()
+    assert resolved.startswith(str(_REPO / "services" / door)), (
+        f"{mod} resolved {door} to {resolved!r}, which is not this "
         f"tree's service — the bootstrap found somebody else's copy")
 
 
