@@ -8,8 +8,8 @@ Sources: `src/gw/ppm_sigma.py`, `src/gw/ppm_windows.py`, `src/gw/ppm_tau_kernel.
 (`_project_ri_local` lines 107–135), `src/gw/ppm_accumulators.py`
 (`_project_tau_onto_omega_np`), `src/gw/greens_function_kernel.py`,
 `src/gw/minimax_screening.py` (`_gn_ppm_fit_kernel`), `src/gw/screening.py` (`_gate_w`),
-`src/gw/w_isdf.py`, `src/common/fft_helpers.py`, `src/common/symmetry_maps.py`,
-`src/common/density_symmetry_check.py`, `manual/05_isdf/5.1, 5.4`.
+`src/gw/w_isdf.py`, `src/common/fft_helpers.py`, `services/symmetry_maps/`
+(`maps.py`, `density_symmetry_check.py`), `manual/05_isdf/5.1, 5.4`.
 
 No code was changed; nothing was run. Where the code's index structure defeats a clean
 answer, that is stated explicitly (§3.6).
@@ -275,9 +275,9 @@ it composes with §3.3.
 ### 3.3 The TRS route
 
 **What the code actually assumes.** LORRAX does not blanket-assume TRS: it *measures* it
-from the density (`common/density_symmetry_check`, identity $m_{-k}(r) = -m_k(r)$,
+from the density (`symmetry_maps.check_density_symmetries`, identity $m_{-k}(r) = -m_k(r)$,
 verdict stored as `wfn.trs_holds`) and only then admits TRS rows into `SymMaps`
-(`symmetry_maps.py:911–931`). When a full-BZ $k$ is generated from an IBZ parent by a
+(`symmetry_maps/maps.py`, `SymMaps.__init__`'s TRS-augmentation branch). When a full-BZ $k$ is generated from an IBZ parent by a
 TRS row, `unfold_psi` constructs it as literally
 $\psi_{-k} = (i\sigma_y)\,\psi_k^*$ (spinor `ns=2`) or $\psi_{-k} = \psi_k^*$ (`ns=1`),
 with the non-symmorphic $\tau$ phase conjugated consistently (`unfold_psi` (★)).

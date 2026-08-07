@@ -62,7 +62,7 @@ src/
 │
 ├── common/               # Shared kernels + utilities
 │   ├── meta.py                Meta dataclass (system params, band edges)
-│   ├── symmetry_maps.py       SymMaps (IBZ → full BZ, spinor rotations)
+│   ├── symmetry_maps.py       forwarding shim → services/symmetry_maps
 │   ├── load_wfns.py           WFN.h5 reads, per-k FFT, kchunk helpers
 │   ├── isdf_fitting.py        CCT/ZCT kernels, Cholesky, zeta solve, full pipeline
 │   ├── cholesky_2d.py         2D blocked Cholesky (sharded)
@@ -203,13 +203,23 @@ Accessors: `wfns.xn(s.val)`, `wfns.xr(s.sigma)`, etc.
 
 Reads BerkeleyGW `WFN.h5`. Per-k raw reads return IBZ data without unfolding — all symmetry unfolding lives in `SymMaps`. `backend='auto'` (default) picks the eager or phdf5 (parallel HDF5) path. The legacy `WFNReader` / `PhdfWfnReader` readers (formerly in both `common/` and `file_io/`) were consolidated into this single class; `WFNReader` remains as a back-compat alias (`from file_io import WfnLoader as WFNReader`) used by the GW driver, BSE, and benchmarks.
 
-### 2.5 `SymMaps` — `src/common/symmetry_maps.py`
+### 2.5 `SymMaps` — `services/symmetry_maps/` (the door)
 
 IBZ → full BZ unfolding. Builds the full mesh, k→q maps, spinor SU(2) rotations (Markley quaternion), and fractional-translation phases for non-symmorphic operators. Key methods:
 
 - `get_gvecs_kfull(wfn, nk)` — rotated G-vectors at full-BZ k-point
 - `get_cnk_fullzone(wfn, nb, nk)` — rotated coefficients with spinor rotation + TR conjugation
 - `get_cnk_fullzone_batch(wfn, band_indices, nk)` — vectorized
+
+Since 2026-08-07 this class, the k-star index map, the sharded q-axis
+unfolds, the real-space orbit machinery and the TRS measurement live in
+`services/symmetry_maps/` and are reached by `import symmetry_maps` —
+never through a submodule path. `src/common/symmetry_maps.py`,
+`src/centroid/orbit_syms.py` and `src/common/density_symmetry_check.py`
+are forwarding shims that the phase-wide cleanup commit deletes. Read
+[`docs/services/symmetry_maps.md`](../services/symmetry_maps.md) for the
+contract — in particular which conjugation predicate goes with which
+operand flavour, which is a 183.61 eV question.
 
 ### 2.6 `EPSReader` — `src/file_io/epsreader.py`
 
@@ -609,7 +619,7 @@ main                                       [gw/gw_jax.py]
 | **Build `Meta`** | `common/meta.py : Meta.from_system` |
 | **Build wavefunction bundle** | `gw/wavefunction_bundle.py : build_wavefunctions_from_full` |
 | **Load WFN.h5** | `file_io/wfn_loader.py : WfnLoader`; band-chunked FFT `common/load_wfns.py : load_centroids_band_chunked` |
-| **Symmetry unfolding** | `common/symmetry_maps.py : SymMaps.get_cnk_fullzone[_batch]` |
+| **Symmetry unfolding** | `symmetry_maps : SymMaps.get_cnk_fullzone[_batch]` (service door) |
 | **Flat-k FFT helpers** | `common/fft_helpers.py : make_flat_k_fftn`, `make_flat_k_ifftn` |
 | **Pair density (spin-traced)** | `common/isdf_fitting.py : compute_pair_density_spin_traced` |
 | **CCT matrix** | `common/isdf_fitting.py : compute_CCT_from_left_right[_spin_matrix]` |

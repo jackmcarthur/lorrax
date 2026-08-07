@@ -343,14 +343,14 @@ The R_cart_q for each full-BZ q is just ``R_cart[full_to_irr_sym[q]]``.
 | ``src/common/isdf_fitting.py`` | ~1996 | writer's q-IBZ slice (B2, becomes no-op identity) |
 | ``src/common/isdf_fitting.py`` | 1742 | ``fit_zeta_to_h5`` header-write entry (C1.2: replace r-space chunked write with G-flat accumulator) |
 | ``src/common/isdf_fitting.py`` | 2092 | post-write ``mark_zeta_done`` (already there) |
-| ``src/common/symmetry_maps.py`` | 346 | ``find_irreducible_qpoints`` returns ``q_irr_full_idx`` (4-tuple, last entry) |
+| ``symmetry_maps`` (was ``src/common/symmetry_maps.py``) | — | ``find_irreducible_qpoints`` returns ``q_irr_full_idx`` (4-tuple, last entry) |
 | ``src/file_io/zeta_reader.py`` | 301 | ``_do_disk_to_G`` (existing r→G post-FFT; G-flat path skips this) |
 | ``src/file_io/zeta_loader.py`` | — | ``ZetaLoader.load`` (add ``zeta_layout`` dispatch in C1.3) |
 | ``src/file_io/isdf_header.py`` | — | Add ``zeta_layout`` field + ``n_G_sph`` + ``sphere_idx`` (C1.1) |
 | ``src/gw/v_q_tile.py`` | 1454 | ``_unfold_v_q_ibz_to_full`` (template; transverse mirror in D2) |
 | ``src/gw/v_q_tile.py`` | 1115 | ``_round_up_to_mesh`` (μ-padding pattern; already used by V_q) |
-| ``src/centroid/orbit_syms.py`` | 209 | ``compute_centroid_sym_perm`` (centroid π_S) |
-| ``src/centroid/orbit_syms.py`` | 340 | ``compute_rgrid_sym_perm`` (r-grid σ_S; from Pass-2) |
+| ``symmetry_maps`` (was ``src/centroid/orbit_syms.py``) | — | ``compute_centroid_sym_perm`` (centroid π_S) |
+| ``symmetry_maps`` (was ``src/centroid/orbit_syms.py``) | — | ``compute_rgrid_sym_perm`` (r-grid σ_S; from Pass-2) |
 | ``src/psp/gvec_utils.py`` | — | ``build_master_gvec_list(crystal)`` (C2.1) |
 | ``src/file_io/_slab_io_ffi.py`` | 339-410 | async write dispatch loop (reference; not modified) |
 

@@ -30,7 +30,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `services/distrib_la/` | **The distributed dense-linalg service**: one door for `eigh` / `cholesky` / `solve_lu` over scalapack, slate, cusolvermp and native (incl. the 2D-blocked `native2d` Cholesky that was `src/common/cholesky_2d.py`). Read `docs/services/distrib_la.md` first | Cholesky / eigh / LU on a mesh; backend refusals; `.so` pins |
 | `src/common/fft_helpers.py` | Flat-k FFT helpers | FFT plumbing |
 | `src/common/gvec_fft_box.py` | Sphere ↔ FFT-box gather | V_q G-space build |
-| `src/common/symmetry_maps.py` | `SymMaps`: IBZ→full BZ unfolding, spinor rotations | Symmetry / k-point unfolding |
+| `services/symmetry_maps/` | **The crystal-symmetry service**: one door for `SymMaps` (IBZ→full BZ tables, spinor rotations), the k-star index map, the sharded q-axis unfolds, the real-space orbit machinery and the time-reversal MEASUREMENT (was `src/common/symmetry_maps.py`, `src/centroid/orbit_syms.py`, `src/common/density_symmetry_check.py`). Read `docs/services/symmetry_maps.md` first | Symmetry / k-point unfolding; star conjugation; TRS verdicts |
 | `src/common/minimax.py` | Minimax quadrature solvers | Quadrature node/weight issues |
 | `src/common/meta.py` | `Meta` system-parameters dataclass | k/q-grid, band ranges |
 | `src/file_io/wfn_loader.py` | `WfnLoader`: canonical WFN.h5 reader; `backend='auto'` picks the phdf5 (parallel HDF5) async path | Wavefunction loading, async H5 reads |

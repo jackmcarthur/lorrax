@@ -68,10 +68,12 @@ and in its negation, which is the one that gets said in review:
 **The physics kernels** — everything in `gw/`, `bse/`, `psp/`, `isdf/`,
 `bandstructure/`, most of `centroid/`, the format readers and writers in
 `file_io/`, and the physics-aware modules in `common/`
-(`zeta_projection`, `wfn_transforms`, `symmetry_maps`, `gvec_fft_box`,
+(`zeta_projection`, `wfn_transforms`, `gvec_fft_box`,
 `psi_G_store`, `kq_mapping`, `coulomb_sphere`, `meta`, `units`,
-`gamma_matrices`, `bispinor_init`, `chi_from_dipole`,
-`density_symmetry_check`).
+`gamma_matrices`, `bispinor_init`, `chi_from_dipole`).  `symmetry_maps`
+and `density_symmetry_check` left `common/` for `services/symmetry_maps/`
+on 2026-08-07 and are reached through the service door; the modules at
+their old paths are forwarding shims.
 
 **The acceptance test for a driver** is the one the owner stated: *it should
 appear to contain only physics on inspection*. Concretely — no `jax.sharding`,
@@ -189,11 +191,13 @@ A level assignment nobody argued is a level assignment nobody will keep.
    change, so it is a request, not a landing. What extraction moved is the
    module's address, not its argument list.
 3. **`centroid/pivoted_cholesky.py` — L1, not L2.** Tempting as "pivoted
-   Cholesky, a numerical routine", but it imports `file_io`,
-   `common.symmetry_maps`, `common.meta`, `common.wfn_transforms` and `isdf`.
-   It prunes ISDF *candidate points* using ψ. The algorithm inside is L2; the
-   module is not, and pretending otherwise would have put five upward edges
-   under an exception list.
+   Cholesky, a numerical routine", but it imports `file_io`, `symmetry_maps`,
+   `common.meta`, `common.wfn_transforms` and `isdf`. It prunes ISDF
+   *candidate points* using ψ. The algorithm inside is L2; the module is not,
+   and pretending otherwise would have put five upward edges under an
+   exception list. (One of the five has since become a service-door edge and
+   would no longer be counted; the other four are unmoved, and the verdict
+   never rested on the count alone.)
 4. **`solvers/sternheimer_solve.py` — filed L2, and it fails its own test.**
    `from psp.dft_operators import apply_H_k_from_G` at module scope, used in
    the matvec. A solver that applies a *specific* Hamiltonian is not

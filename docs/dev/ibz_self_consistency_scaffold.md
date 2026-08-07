@@ -28,7 +28,8 @@ over-built that point. Recording the correct version:
 * U from that diagonalization is applied to ψ on the reduced k. This is a band
   rotation at fixed r_μ: `einsum('kmn,knu->kmu', U, psi_mu)`. Local GEMM over
   the band axis, no symmetry involved, shards like any other band contraction.
-* The rotated ψ is unfolded to full k by `symmetry_maps.unfold_psi`, which
+* The rotated ψ is unfolded to full k by `symmetry_maps.unfold_psi` (the
+  service door), which
   already exists and already handles the hard parts (non-symmorphic τ phases
   via `tau_phase_row`, spinor rotations, umklapp bookkeeping by the caller).
 
@@ -84,7 +85,7 @@ Two consequences, and only the second is an action item:
    (star construction, τ phases, spinor rotations, the ψ handoff) at a size
    where the answer can be checked by hand.
 
-   `orbit_syms.recover_symmorphic_density_point_group` +
+   `symmetry_maps.recover_symmorphic_density_point_group` +
    `SymMaps.get_spinor_rotations` (which builds SU(2) for **arbitrary**
    Cartesian rotations passed as an argument) compose into an *optional*
    recovery path for a deck whose stored list is shorter than its crystal
@@ -97,17 +98,18 @@ centroids is not**, and this is the one place the design needs a decision.
 
 A symmetry op acts on the argument: ψ_{Sk̄}(r) = ψ_k̄(S⁻¹(r − τ)). At a
 centroid r_μ the point S⁻¹(r_μ − τ) is in general **not another centroid**, so
-no permutation of μ implements the unfold. `orbit_syms.py` states the same
-fact from the quadrature side: a raw centroid sum is only point-group
+no permutation of μ implements the unfold. `symmetry_maps/orbit_syms.py`
+states the same fact from the quadrature side: a raw centroid sum is only point-group
 symmetric across a k-star if {r_μ} is closed under the group.
 
 **The existing centroid symmetry code handles fractional translations
 correctly** — this document previously implied otherwise and that was wrong.
-`orbit_syms` carries τ throughout: the stated convention is
-`image_row(r,s) = r @ Rinv[s].T + tau[s] (mod 1)` (`orbit_syms.py:11`), τ is
-read as `wfn.translations[:n_sym]/(2π)` (`:178`), `orbit_images` applies it
-(`:229`), and `compute_centroid_sym_perm` shifts by τ and raises a named error
-when τ lands off-grid (`:439`, `:453`, `:640`). The only τ = 0 routine is
+`symmetry_maps`'s orbit machinery carries τ throughout: the stated convention
+is `image_row(r,s) = r @ Rinv[s].T + tau[s] (mod 1)` (`orbit_syms.py` module
+note), τ is read as `wfn.translations[:n_sym]/(2π)` in
+`build_real_space_syms`, `orbit_images` applies it, and
+`compute_centroid_sym_perm` shifts by τ and raises a named error when τ lands
+off-grid. The only τ = 0 routine is
 `recover_symmorphic_density_point_group`, which is the optional *group
 recovery* helper, not the orbit closure, and it omits non-symmorphic ops
 conservatively rather than adding wrong ones.
@@ -161,7 +163,7 @@ iteration before predicting a speedup.
 
 ## 7. Status 2026-08-05 — wired, not verified; and the method was wrong
 
-`KStarMap` (`common.symmetry_maps`) is an argument to the SC loop,
+`KStarMap` (`import symmetry_maps`) is an argument to the SC loop,
 `config.sc_on_ibz` turns it on, and it builds correctly:
 `KStarMap(nk_full=16, nk_irr=10, reduction=1.60x, n_sym_spatial=2)` on
 MoS₂ 4×4. `star_select`/`star_broadcast` are gated at 1.19e-16 with a
@@ -362,7 +364,7 @@ reduction") — so the claim is greppable rather than an inline `np.ones`.
 
 `k_star_weights` routes `np.bincount(irr_idx)[irr_idx]` through
 `kstar.select` instead of re-deriving the row order. `star_select` orders
-rows by first occurrence in `irr_idx` (`symmetry_maps.py:1770-1772`); a
+rows by first occurrence in `irr_idx` (`star_select`, not `np.unique`); a
 second implementation of that ordering could drift and misalign weights
 with rows silently, and using `select` makes that impossible.
 
@@ -443,7 +445,7 @@ sync `np.asarray` forces.
 
 ### 10.1 What moved
 
-`common.symmetry_maps` dispatches on the operand. The index tables stay
+`symmetry_maps` dispatches on the operand. The index tables stay
 host int32 (`n_k` integers, built once in `KStarMap.__init__`); a
 `jax.Array` operand is gathered where it is, by one cached jit per (index
 table, aval, layout) with the table baked into the closure as a constant,
