@@ -32,6 +32,20 @@ I/O backend: all data reads go through one :class:`SlabIO` handle, held
 open for the loader's lifetime to amortise open/close on the FFI
 value every other SlabIO consumer uses (``None`` = SlabIO's own
 auto-route).  Use as a context manager or call :meth:`close`.
+
+HEADER-ONLY MODE (``mesh=None``).  The header surface above is read with
+plain serial h5py inside ``__init__`` and needs no transport at all, but
+until now ``mesh=None`` reached ``SlabIO(mesh=None)`` and raised, and a
+stack without the phdf5 FFI could not even ask this file how many q it
+holds — so a caller that wanted ONLY the layout contract (``ngk``,
+``gvec_components``, ``zeta_cutoff_ry``, the mf_header crystal block)
+had to open the file a second time with its own h5py and re-derive it.
+That second reader is the thing this class exists to prevent.  With
+``mesh=None`` the loader skips the SlabIO open entirely: every header
+attribute works, and :attr:`slab_io` / :meth:`load` / the two
+``read_*_slab`` methods refuse, naming the missing mesh.  Passing a mesh
+is UNCHANGED in every respect (eager SlabIO open, same collective, same
+refusal when the FFI is absent).
 """
 from __future__ import annotations
 
@@ -151,9 +165,13 @@ class ZetaLoader:
                 f"The header and the ζ block were written by different runs.")
 
         # SlabIO handle (held open for the loader's lifetime so the
-        # phdf5 FFI ctx is reused across reads).
-        self._slab_io: SlabIO | None = SlabIO(
-            self._path, mode=mode, mesh=mesh)
+        # phdf5 FFI ctx is reused across reads).  ``mesh=None`` is
+        # HEADER-ONLY mode: no transport is opened, so nothing here
+        # probes the FFI and every data read refuses instead (see the
+        # module docstring and :attr:`slab_io`).
+        self._slab_io: SlabIO | None = (
+            None if mesh is None else SlabIO(self._path, mode=mode, mesh=mesh))
+        self._header_only = mesh is None
 
     # ------------------------------------------------------------------
     def close(self) -> None:
@@ -177,10 +195,23 @@ class ZetaLoader:
         return nx * ny * nz
 
     @property
+    def has_slab_io(self) -> bool:
+        """True when this loader can serve DATA reads (a mesh was given
+        and the SlabIO handle is still open).  Header attributes work
+        either way."""
+        return self._slab_io is not None
+
+    @property
     def slab_io(self) -> SlabIO:
         """Underlying SlabIO handle for callers that still need the raw
         ``read_slab('zeta_q', ...)`` contract during migration."""
         if self._slab_io is None:
+            if self._header_only:
+                raise RuntimeError(
+                    f"ZetaLoader({self._path!r}) was opened HEADER-ONLY "
+                    f"(mesh=None), so it has no transport and cannot read ζ. "
+                    f"Re-open it with mesh=<the run's mesh_xy> to get the "
+                    f"SlabIO tile path.")
             raise RuntimeError("ZetaLoader: file already closed")
         return self._slab_io
 
@@ -359,8 +390,7 @@ class ZetaLoader:
         """
         if layout not in ("r_space", "G_flat"):
             raise ValueError(f"layout must be 'r_space' or 'G_flat'; got {layout!r}")
-        if self._slab_io is None:
-            raise RuntimeError("ZetaLoader: file already closed")
+        _ = self.slab_io  # refuse now, naming header-only vs closed
 
         # --- q axis ---------------------------------------------------
         q_indices, need_unfold = self._resolve_q(q)
