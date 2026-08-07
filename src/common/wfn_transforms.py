@@ -1933,7 +1933,7 @@ def iter_psi_rchunk_bandwise(
 
     loader = wfn  # reuse top-level WfnLoader
     g_index_full = loader.box_index(k="full_bz")
-    sym_loader = loader._ensure_sym()
+    sym_loader = loader.symmetry()
     kgrid_arr = np.asarray(meta.kgrid, dtype=np.float64)
     kvecs_frac_full = (
         np.asarray(sym_loader.kvecs_asints, dtype=np.float64)
@@ -2170,7 +2170,7 @@ def load_centroids_band_chunked(
     # device buffers for the same (nk, nx, ny, nz) data (agent_l Round-5
     # §2 measured live count = 3 at pre_rchunk_loop).
     g_index_full = loader.box_index_dev(k="full_bz", mesh=mesh_xy)
-    sym_loader = loader._ensure_sym()
+    sym_loader = loader.symmetry()
     kgrid_arr = np.asarray(meta.kgrid, dtype=np.float64)
     kvecs_frac_full = (
         np.asarray(sym_loader.kvecs_asints, dtype=np.float64)

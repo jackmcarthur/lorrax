@@ -258,7 +258,7 @@ class PsiGStore:
             self._g_index_dev = self.loader.box_index_dev(
                 k="full_bz", mesh=self.mesh)
             kgrid = np.asarray(self.meta.kgrid, dtype=np.float64)
-            sym = self.loader._ensure_sym()
+            sym = self.loader.symmetry()
             kvecs_frac = np.asarray(
                 sym.kvecs_asints, dtype=np.float64) / kgrid[None, :]
             # Process-local placement — see
