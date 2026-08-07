@@ -82,15 +82,28 @@ def check_unfold_matches_the_hand_reference(mesh):
     The reference lives in the L-b module and is imported, not copied: two
     references would be two chances to be wrong about the same formula.
     """
+    import jax
     import jax.numpy as jnp
     perm, L, n_rmu = L_b._divisible_geometry()
     V = L_b._hermitian_ibz(n_rmu)
     ref = L_b._hand_unfold(V, perm=perm, L=L, n_rmu=n_rmu)
-    got = np.asarray(unfold_v_q(jnp.asarray(V), irr_idx=L_b._IRR,
-                                sym_idx=L_b._SYM, sym_perm=perm, L_table=L,
-                                q_irr_frac=L_b._Q_IRR, mesh_xy=mesh,
-                                n_sym_spatial=L_b._NTRAN))
-    rel = float(np.abs(got - ref).max() / np.abs(ref).max())
+    out = unfold_v_q(jnp.asarray(V), irr_idx=L_b._IRR,
+                     sym_idx=L_b._SYM, sym_perm=perm, L_table=L,
+                     q_irr_frac=L_b._Q_IRR, mesh_xy=mesh,
+                     n_sym_spatial=L_b._NTRAN)
+    # The output is P(None,'x','y')-sharded: at P>1 no rank holds the
+    # global array, and ``np.asarray`` on it raises "spans non-addressable
+    # devices" (measured on the real 4-rank leg, 2026-08-07).  Compare each
+    # ADDRESSABLE shard against the reference block its ``index`` names —
+    # this also checks placement, which an allgather would erase.
+    if jax.process_count() == 1:
+        num = float(np.abs(np.asarray(out) - ref).max())
+    else:
+        num = 0.0
+        for shard in out.addressable_shards:
+            blk = ref[shard.index]
+            num = max(num, float(np.abs(np.asarray(shard.data) - blk).max()))
+    rel = num / float(np.abs(ref).max())
     assert rel < RTOL, f"unfold_v_q differs from the reference: {rel:.3e}"
     return f"rel {rel:.2e} n_rmu {n_rmu}"
 
@@ -169,7 +182,19 @@ def check_star_helpers_keep_the_sharding(mesh):
 
 
 def _nan_operand(mesh, spec):
-    """``(KStarMap, poisoned operand)`` — one all-NaN k row on ``spec``."""
+    """``(KStarMap, poisoned operand)`` — one all-NaN k row on ``spec``.
+
+    THE POISON IS APPLIED ON DEVICE, NOT ON THE HOST, AND THAT IS
+    LOAD-BEARING: ``device_put`` on a multi-process mesh verifies the value
+    is identical on every process by ELEMENTWISE COMPARISON, and
+    ``NaN != NaN``, so a NaN-carrying host array is rejected as "not the
+    same on each process" even though every rank built it identically
+    (measured on the real 4-rank leg, 2026-08-07).  The clean array goes
+    through ``device_put``; a jitted ``.at[3].set(nan)`` with explicit
+    ``out_shardings`` poisons it where it lives.
+    """
+    import functools
+
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding
@@ -178,11 +203,15 @@ def _nan_operand(mesh, spec):
     sidx = np.zeros(4, dtype=np.int32)
     A = np.ones((4, 8, 8), dtype=np.complex128)
     A[1] *= 2.0
-    poisoned = np.array(A)
-    poisoned[3] = np.nan
     km = KStarMap(irr, sidx, 1)
-    return km, jax.device_put(jnp.asarray(poisoned),
-                              NamedSharding(mesh, spec)), A
+    sh = NamedSharding(mesh, spec)
+    dev = jax.device_put(jnp.asarray(A), sh)
+
+    @functools.partial(jax.jit, out_shardings=sh)
+    def _poison(x):
+        return x.at[3].set(jnp.asarray(np.nan + 0j, dtype=x.dtype))
+
+    return km, _poison(dev), A
 
 
 def check_spread_rel_is_one_replicated_scalar(mesh):

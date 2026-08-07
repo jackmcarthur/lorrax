@@ -83,6 +83,18 @@ _ALLOWED = (
     # instead), so `KStarMap.spread_rel` cannot refuse a poisoned SHARDED
     # operand and `sc_iteration._check_kstar_spread`'s `not (spread <= tol)`
     # passes it.  The cell's docstring carries the full table.
+    # The wsl-profile detection cell asserts is_wsl() -> the wsl row; on
+    # every other machine that predicate is FALSE BY CONSTRUCTION and the
+    # cell skips.  First tripped on the real Perlmutter leg 2026-08-07 —
+    # the gate did exactly its job: a skip is legal only once this row
+    # names the leg that runs the cell.
+    AllowedSkip("the_wsl_profile_is_the_one_this_dev_box_selects",
+                "not a WSL kernel",
+                "the WSL dev-box leg (every local run of this suite), where "
+                "is_wsl() is true and the row's four MUST cells are "
+                "asserted; the machine actually running this session has "
+                "its OWN row asserted by "
+                "test_the_machine_profile_asserts_something"),
     AllowedSkip("test_a_nan_survives_the_sharded_reduction", "",
                 "nothing — this is a CARRIED upstream defect (jax 0.9.1 / "
                 "XLA CPU partitioned max discards NaN), not covered "
