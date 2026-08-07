@@ -52,10 +52,32 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from common.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 from ffi.gate import Gate
+
+# ``from common.shard_map import shard_map`` is DELIBERATELY NOT HERE.
+# Importing ANY ``common`` submodule runs ``common/__init__.py``, which
+# imports ``.wfn_transforms`` -> ``common.fft_helpers`` -> ``ffi.mklfft``
+# -> ``from ffi.fft import FLAT_K_TARGET``.  Entering that cycle at THIS
+# module means the re-entry finds ffi.fft half-executed and every name
+# below still unbound:
+#
+#     ImportError: cannot import name 'FLAT_K_TARGET' from partially
+#     initialized module 'ffi.fft' (most likely due to a circular import)
+#
+# so ``import ffi.fft`` was simply impossible as a process's first LORRAX
+# import.  pytest never saw it (conftest enters at ``common`` first, where
+# the cycle closes harmlessly), which is why it survived: the only thing
+# that entered at ffi.fft was src/ffi/cpp/gate_one_fftw.sh's dynamic leg,
+# and that gate has been unable to run since the cycle appeared.
+#
+# The import moves into the two factory bodies that use it (:277, :358) --
+# the function-local spelling twelve other sites in this tree already use
+# for common.shard_map, so this is the tree's own convention, not a
+# workaround.  ffi.fft is L3 substrate; the ``common`` package __init__ is
+# a physics-adjacent aggregator, and pulling all of it in to reach one
+# version shim was the actual defect.
 
 __all__ = [
     "FLAT_K_TARGET", "GW_CONV_TARGET", "GATE", "FUSED_GATE",
@@ -274,6 +296,7 @@ def make_flat_k_fft_ffi(
             input_output_aliases={0: 0},  # in-place when the operand is dead
         )(x_local, **attrs)
 
+    from common.shard_map import shard_map     # see the import-cycle note
     _sm = shard_map(_local, mesh=mesh,
                     in_specs=(flat_spec,), out_specs=flat_spec,
                     check_vma=False)
@@ -355,6 +378,7 @@ def make_gw_conv_ffi(
             input_output_aliases={0: 0},  # sigma_k in G_k's buffer when dead
         )(g_local, w_local, **attrs)
 
+    from common.shard_map import shard_map     # see the import-cycle note
     _sm = shard_map(_local, mesh=mesh,
                     in_specs=(g_flat, v_flat), out_specs=g_flat,
                     check_vma=False)
