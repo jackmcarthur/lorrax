@@ -58,6 +58,25 @@ from __future__ import annotations
 import os
 import subprocess
 
+# Step 5b's gate.  A SIBLING module (see its "WHY IT LIVES IN runtime/"), and
+# imported at module scope on purpose: it pulls only ``inspect``/``os`` at
+# import, so it costs this package nothing and — decisively — brings no jax
+# into a module that must be importable before jax reads its environment.
+# It used to be ``common.jax_support``, reached through a function-local
+# import; that was ``runtime`` reaching UP a layer, and hiding the edge inside
+# a function body is not the same as not having it.  Same shape and same
+# remedy as numbered request R9 (``runtime.xla_memory``, LANDED 2026-07-31).
+#
+# RELATIVE, like ``.xla_memory`` below, and that is not cosmetic: this package
+# is imported under BOTH names in this tree — as ``runtime`` (``sys.path``
+# has ``src/``) and as ``src.runtime`` (``tests/test_aot_memory.py``).  An
+# absolute ``from runtime.jax_support import …`` here resolves the top-level
+# name in the second case, which on a machine with an editable install of
+# LORRAX is a DIFFERENT checkout's ``runtime`` package.  Measured: it raised
+# ``ModuleNotFoundError: No module named 'runtime.jax_support'`` from the
+# other tree.
+from .jax_support import enforce as _enforce_jax_support
+
 
 _DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
 
@@ -1189,7 +1208,7 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        (2)-(5) are ``bootstrap()``, unchanged and still separately tested;
        this function calls it rather than re-listing its steps, so there is
        exactly one implementation of the order.
-    5b. :func:`common.jax_support.enforce` -- the running JAX is the one this
+    5b. :func:`runtime.jax_support.enforce` -- the running JAX is the one this
        tree is written against, or the run REFUSES here.  Needs (5): the
        backend must exist so ``jax._src`` is fully populated and its
        signatures are readable.  Before (6) because (6) performs the first
@@ -1442,7 +1461,7 @@ def _enforce_supported_jax(say) -> None:
     """Startup enforcement of the declared JAX window — step 5b.
 
     Refuses when ``jax.version.__version_info__`` is outside
-    ``common.jax_support``'s window, or when any ``jax._src`` private that
+    ``runtime.jax_support``'s window, or when any ``jax._src`` private that
     ``common/jax_compile_cache.py`` patches has a shape this tree is not
     written against.  Both are startup facts; neither can change mid-run.
 
@@ -1464,9 +1483,7 @@ def _enforce_supported_jax(say) -> None:
     line — the module's single declared silence, and it is announced on rank 0
     rather than swallowed.
     """
-    from common.jax_support import enforce as _enforce_jax
-
-    _enforce_jax(announce=say)
+    _enforce_jax_support(announce=say)
 
 
 def _enforce_required_ffi(mesh) -> None:

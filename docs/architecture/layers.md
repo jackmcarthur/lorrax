@@ -15,10 +15,14 @@ its directory:
 **Imports run downhill only: L1 → L2 → L3.** Nothing else is allowed, and
 `tests/test_layering.py` fails when it happens.
 
-Today: **140 L1, 18 L2, 56 L3**, and zero exempt bench drivers — the 26 that
+Today: **143 L1, 18 L2, 60 L3** over the 221 modules under `src/` — re-counted
+2026-08-06 from the map itself, because the previous figure (140/18/56) summed
+to 214 and the tree had grown past it. Zero exempt bench drivers — the 26 that
 used to live under `src/` moved to `tests/bench/` on 2026-07-31 (see
-[below](#the-26-exempt-bench-drivers)). Four upward edges survive, all named
-in [§5](#5-the-sanctioned-exceptions).
+[below](#the-26-exempt-bench-drivers)). **Two** upward edges survive, both
+named in [§5](#5-the-sanctioned-exceptions) (R2 and R3; R1 closed by deletion,
+and the two that arrived with `agent/jax-070-land` were closed on 2026-08-06 —
+[§8](#8-landed-2026-08-06--the-two-inherited-upward-edges)).
 
 ---
 
@@ -119,7 +123,7 @@ Two rules follow, and both are enforced:
 ## 3. L3 — substrate
 
 **Process bootstrap** — `runtime/` (`__init__`, `aot_memory`, `padding`,
-`xla_memory`). `initialize_communicator_stack()` is the single startup entry
+`xla_memory`, `jax_support`). `initialize_communicator_stack()` is the single startup entry
 point: env before `import jax`, failfast excepthook, CPU-collectives transport,
 `jax.distributed`, GPU-or-CPU, the run's mesh with every communicator already
 created, the compile cache, and a rank-0 report of every choice where more than
@@ -142,7 +146,11 @@ hand).
 bodies from `ffi.mklfft`.
 
 **jax glue and instrumentation** — `common/{jax_compile_cache, jax_profile,
-timing, progress, gpu_utils, async_io, sanity}.py`.
+timing, progress, gpu_utils, async_io, sanity}.py`, plus the two **version
+shims**: `common/shard_map.py` (which symbol, which kwarg spelling) and
+`common/vma.py` (which spelling marks a loop carry device-varying). They are
+listed together on purpose — `vma` was left out of this paragraph and out of
+the map when it landed, and the default put it at L1; see [§4.11](#4-the-ten-calls-that-were-genuinely-ambiguous).
 
 **Native libraries** — all of `ffi/`: location, probing, gating, dispatch.
 `ffi/gate.py` owns four things that used to be four drifting copies —
@@ -212,7 +220,20 @@ A level assignment nobody argued is a level assignment nobody will keep.
     like L2 mathematics. It exists **only** because a mesh axis has to divide
     an extent; delete the mesh and the module has no reason to exist. Level
     follows the reason, not the body.
-11. **`common/minimax.py` vs `gw/minimax_config.py` vs
+11. **`common/vma.py` — L3, not L2, and the choice is the tighter one.** It
+    would have passed L2's own test ("could this lift into another physics
+    code unchanged?") — but so would `common/shard_map.py`, which is L3, and
+    that test does not discriminate here. The one that does is *L3 knows
+    nothing mathematical*: `mark_varying` contains no arithmetic at all. Its
+    subject is **mesh axes** and whether a value may differ **per device**,
+    which is L3's declared vocabulary word for word, and its body is a probe
+    of the installed jax. Filing it L2 would also have been the *looser*
+    reading — L2 may import L3, L3 may import nothing above itself — so L3 is
+    the assignment that constrains it more, which is the right way to resolve
+    a genuine tie. Its consumers are `common/cholesky_2d.py` (L2) and
+    `bse/bse_ring_comm.py` (L1); both are downhill either way, and neither
+    was the reason for the choice.
+12. **`common/minimax.py` vs `gw/minimax_config.py` vs
     `gw/minimax_screening.py` — L2, L1, L1.** Same word, three levels. The
     solver for the minimax quadrature problem is physics-free (L2); the
     dataclass that picks a target error for a *screening* integral and the
@@ -356,3 +377,68 @@ excused `STERN_DEBUG` read deleted while its exception stayed; a lazy
 
 Production `Mesh(` construction sites: **21 (2026-07-30 16:47) → 8 (17:08) →
 4**, in three modules, all sanctioned.
+
+---
+
+## 8. Landed 2026-08-06 — the two inherited upward edges
+
+`agent/jax-070-land` brought two new modules and no map entries for them, so
+the default in §0 of the gate ("everything not named is L1") filed a **jax
+version shim** and a **startup version gate** as *physics*. Nothing under them
+could then import them, and the gate said so:
+
+```
+L2->L1 common.cholesky_2d:52 imports common.vma
+L3->L1 runtime:1467 (lazy) imports common.jax_support
+```
+
+Neither was excused. **No entry was added to `_L2_UPWARD_EXCEPTIONS` or
+`_L3_UPWARD_EXCEPTIONS`; both lists are byte-identical to before**, and the
+two that remain (R2, R3) are still asserted still-needed.
+
+* **`common/vma.py` is L3**, in the jax-glue paragraph of §3 next to the twin
+  its own docstring names, `common/shard_map.py`. The argument, and why the
+  tie between L2 and L3 breaks toward L3, is [§4.11](#4-the-ten-calls-that-were-genuinely-ambiguous).
+  No code moved: `cholesky_2d`'s import was never the defect — the *level* was
+  — and the comment above that import already records the measured reason the
+  helper is shared rather than re-inlined (a per-file `try: lax.pcast /
+  except: identity` that installed a no-op on exactly the jax generation that
+  enforces the marking).
+* **`common/jax_support.py` → `runtime/jax_support.py`.** This one *was* a
+  code fix, because a reclassification alone would have left the same shape
+  request R9 already ruled on: `runtime` reaching outside itself for a startup
+  fact, through a function-local import. Its only consumer in `src/` is
+  `runtime.initialize_communicator_stack` (step 5b). As a sibling the import
+  is now at **module scope** — the laziness is gone, not relocated — and that
+  is only possible because of a package fact worth writing down: `common/
+  __init__.py` imports `.wfn_transforms` and `.cholesky_2d`, both of which
+  import jax, so *any* `from common.jax_support import …` drags jax in
+  through the package `__init__`, and `runtime` is the one module that must be
+  importable before jax reads its environment. `runtime/jax_support.py`
+  imports only the standard library at module scope. Callers updated:
+  `tests/test_jax_support.py`, `tests/test_compile_cache_jax_compat.py`,
+  `pyproject.toml`'s window comment, and the prose references in
+  `common/jax_compile_cache.py`, `common/vma.py` and the two docs pages. **No
+  re-export shim was left in `common/`** — unlike R9's `gw.gw_config`, which
+  had five consumers; this had two, both tests.
+
+* **The gate now sees package-relative imports.** Found while checking the
+  first two fixes, and it is the reason `runtime/__init__.py` can use the
+  relative spelling honestly. `_absolute_target` treated every module as a
+  non-package, so `from .x import y` inside `pkg/__init__.py` resolved to a
+  bare `x`, which matches no module and was therefore **skipped**: 34 imports
+  across the 24 package `__init__.py` files under `src/` were exempt from rule
+  3 by accident of file shape, `runtime`'s own `.xla_memory` and `.jax_support`
+  among them. Fixed, with a red twin
+  (`test_the_upward_edge_scan_sees_package_relative_imports`) seeded on the
+  shape that actually occurs — an unmapped `runtime/<new>.py`, which defaults
+  to L1. **Nothing was hiding in the 34**: `upward_edges()` returns the same
+  two excused pairs before and after the resolver change, measured both ways.
+  Rule 1's plumbing scan is unchanged on every module, also measured.
+
+Measured after, by the gate's own map: **143 L1, 18 L2, 60 L3** over 221
+modules, and `upward_edges()` returns exactly the two excused pairs
+(`solvers.sternheimer_solve → psp.dft_operators`,
+`centroid.kmeans_isdf → centroid.orbit_syms`) and nothing else.
+`tests/test_layering.py` goes 67 passed / 1 failed → **69 passed / 0 failed**;
+the extra test over the previous 68 is the red twin above.

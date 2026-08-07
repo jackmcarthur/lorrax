@@ -92,6 +92,35 @@ MEASURED on both containers before wiring: on jax 0.7.0
 EMPTY and :func:`enforce` is clean; on jax 0.5.3 it refuses honestly, naming
 the version below the floor, the two wrong arities, and the absent
 ``backend_compile_and_load``.
+
+WHY IT LIVES IN ``runtime/`` — moved from ``common/`` 2026-08-06
+----------------------------------------------------------------
+This module is a **startup fact collector**, and its only caller in ``src/``
+is ``runtime.initialize_communicator_stack`` (step 5b, above).  It landed in
+``common/`` on ``agent/jax-070-land``, where the layer map's default put it at
+**L1 — physics** — the most permissive level in the tree — and ``runtime``
+(L3) then had to reach *up* into it.  That import was written
+function-locally, which made the direction invisible in the file header
+without making it legal: ``tests/test_layering.py`` reports lazy edges too.
+
+The fix is the one this tree already made for the same shape, and recorded as
+numbered request **R9** (``docs/architecture/layers.md`` §7, and the LAYERING
+NOTE at ``runtime/__init__.py``'s allocator corroboration): the startup facts
+``runtime`` needs become a **sibling module inside** ``runtime/``, so the
+direction is right by construction rather than by exception.  ``runtime.
+xla_memory`` moved out of ``gw/gw_config.py`` for exactly this reason.
+
+The move also removes the *reason* the import had to be lazy, which is worth
+stating because it is a property of the packages, not a style preference:
+``src/common/__init__.py`` imports ``.wfn_transforms`` and ``.cholesky_2d`` at
+package scope, and both import ``jax``.  So ``from common.jax_support import
+enforce`` — at ANY point in a file — pulls jax in through
+``common/__init__.py``, and ``runtime`` is the one module in the tree that
+must be importable *before* jax reads its environment.  This module itself
+imports only the standard library at module scope (jax is imported inside
+:func:`describe` and ``importlib`` inside the two private probes), so as
+``runtime.jax_support`` it can be — and now is — imported at ``runtime``'s
+module scope with no jax anywhere in the chain.
 """
 from __future__ import annotations
 

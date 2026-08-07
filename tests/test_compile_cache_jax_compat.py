@@ -109,7 +109,7 @@ def test_invariant_key_hook_refuses_the_0_5_3_call_shape(monkeypatch):
     ended in ``*_compat_tail`` and swallowed that third positional silently.
     With the shim gone the call must FAIL — a silently accepted argument on an
     unsupported jax is exactly the class of quiet accommodation the owner's
-    ruling removes.  ``common.jax_support`` catches this at startup instead,
+    ruling removes.  ``runtime.jax_support`` catches this at startup instead,
     by name, before anything compiles.
     """
     mod, _calls = _fake_cache_key(2)
@@ -163,7 +163,7 @@ def test_agreement_hook_forwards_whatever_jax_hands_it(monkeypatch, n_params):
     precisely to pin "untouched" — 4 is the shape both supported jaxes have,
     3 is present here only as the negative case that proves the forwarding
     interprets nothing.  Supporting a 3-parameter jax is a separate question
-    and the answer is no; ``common.jax_support`` refuses it at startup.
+    and the answer is no; ``runtime.jax_support`` refuses it at startup.
     """
     mod, seen = _fake_compilation_cache(n_params, verification=True)
     monkeypatch.setattr(jax_src, "compilation_cache", mod, raising=False)
@@ -367,7 +367,7 @@ def test_peer_rebind_degradation_is_removed():
     ``get_executable_and_time`` has no ``executable_devices``.  Both supported
     jaxes have it, so the branch was unreachable and was deleted rather than
     left as a permanent compatibility layer.  Its detection duty moved to
-    ``common.jax_support``, which requires that hook to take 4 parameters.
+    ``runtime.jax_support``, which requires that hook to take 4 parameters.
 
     Asserting on the module's own surface is deliberate: the branch cannot be
     exercised through :func:`ensure_jax_compile_cache` without a real P>1
@@ -377,7 +377,7 @@ def test_peer_rebind_degradation_is_removed():
     assert not hasattr(jcc, "_peer_rebind_supported")
     assert not hasattr(jcc, "_PEER_REBIND")
 
-    from common import jax_support
+    from runtime import jax_support
     assert jax_support.REQUIRED_PRIVATE_ARITY[
         ("jax._src.compilation_cache", "get_executable_and_time")] == 4
 

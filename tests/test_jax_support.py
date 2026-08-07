@@ -21,7 +21,24 @@ import pytest
 
 sys.path.insert(0, __file__.rsplit("/tests/", 1)[0] + "/src")
 
-from common import jax_support as js  # noqa: E402
+# IMPORT jax HERE, AT COLLECTION, AND ON PURPOSE.
+#
+# Two tests below stub ``importlib.import_module`` to inject a wrong-arity /
+# missing-symbol fake into the private-API probes.  jax's own package init
+# ALSO calls ``importlib.import_module`` (plugin discovery, with a second
+# positional argument the stub does not take), so if this file's stub is what
+# first triggers ``import jax``, jax comes out half-initialised and every
+# later test that touches it dies on "partially initialized module 'jax' has
+# no attribute 'version'".
+#
+# Until 2026-08-06 this happened not to bite, for a reason nobody chose: the
+# module under test was ``common.jax_support``, and importing it ran
+# ``common/__init__.py``, which imports jax.  The gate moved to
+# ``runtime.jax_support`` — a package that must stay jax-free at import — so
+# the accident is gone.  Stating the dependency is the fix; relying on
+# another package's import side effect was never one.
+import jax  # noqa: E402,F401
+from runtime import jax_support as js  # noqa: E402
 
 
 # ---------------------------------------------------------------- version leg
@@ -201,7 +218,7 @@ def test_the_declared_window_matches_pyproject():
     assert specs, "no jax specifier found in pyproject.toml"
     for spec in specs:
         assert spec == f">={want_lo},<{want_hi}", (
-            "pyproject.toml pins jax %r but common/jax_support.py declares "
+            "pyproject.toml pins jax %r but runtime/jax_support.py declares "
             "the window [%s, %s)" % (spec, want_lo, want_hi))
 
 

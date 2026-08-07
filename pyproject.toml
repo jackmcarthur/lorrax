@@ -12,7 +12,7 @@ dependencies = [
     # See [project.optional-dependencies] below for the support matrix.
     #
     # THE WINDOW, NOT JUST A FLOOR, and it is enforced at startup by
-    # src/common/jax_support.py (SUPPORTED_MIN / SUPPORTED_MAX_EXCLUSIVE).
+    # src/runtime/jax_support.py (SUPPORTED_MIN / SUPPORTED_MAX_EXCLUSIVE).
     # Those two must agree with these specifiers; a floor nothing checks is
     # how the Perlmutter GPU leg came to run four minors below it unnoticed.
     #
@@ -119,7 +119,7 @@ dev = [
 jax = [
     # CPU/base only — see [project.optional-dependencies] cuda12 / cuda13 for
     # the per-site GPU variant.  Do not re-pin a CUDA major here.
-    # Same window as [project.dependencies] and src/common/jax_support.py.
+    # Same window as [project.dependencies] and src/runtime/jax_support.py.
     "jax>=0.7.0,<0.10.0",
     "jaxlib>=0.7.0,<0.10.0",
 ]

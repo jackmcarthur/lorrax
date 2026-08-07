@@ -205,7 +205,7 @@ a different worktree, which the path makes obvious and nothing else would.
 >
 > **Frontera's venv is jax 0.9.1. Perlmutter's GPU container
 > (`ghcr.io/nvidia/jax:jax-2025-07-21`) is jax 0.7.0.** `pyproject.toml`
-> declares `jax>=0.7.0,<0.10.0`, `common/jax_support.py` declares the same
+> declares `jax>=0.7.0,<0.10.0`, `runtime/jax_support.py` declares the same
 > window in `SUPPORTED_MIN`/`SUPPORTED_MAX_EXCLUSIVE`, a test fails if the two
 > drift apart, and **it is enforced at startup** — `jax_support.enforce()` at
 > step 5b of `runtime.initialize_communicator_stack`, after the backend exists

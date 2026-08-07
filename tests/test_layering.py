@@ -65,8 +65,14 @@ SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
 #: L3 by module.  Whole packages are in ``_L3_PACKAGES``.
 _L3_MODULES = frozenset({
     # process bootstrap, and the shape arithmetic that exists only because a
-    # mesh has to divide
+    # mesh has to divide.  ``runtime.jax_support`` is the startup version /
+    # jax._src-arity gate; it moved here from ``common/`` on 2026-08-06 for
+    # the reason ``runtime.xla_memory`` did on 2026-07-31 (numbered request
+    # R9) -- ``runtime`` was reaching UP into it through a function-local
+    # import, and a startup fact that only ``runtime`` consumes is a sibling
+    # of ``runtime``, not something above it.
     "runtime", "runtime.aot_memory", "runtime.padding", "runtime.xla_memory",
+    "runtime.jax_support",
     # the cross-process service and its one policy client
     "common.collectives", "centroid.distribution",
     # movement primitives.  Named, owned patterns — NOT generic ``shard_map``
@@ -77,7 +83,19 @@ _L3_MODULES = frozenset({
     # and a kwarg spelling and forwards in_specs/out_specs untouched; see its
     # docstring.  It is L3 because L3 kernels (fft_helpers, ffi.*, file_io)
     # import it.
-    "common.shard_map",
+    #
+    # ``common.vma`` is its twin and was left unclassified when it landed
+    # (``agent/vma-pvary-marking``), so the default put a jax version shim at
+    # **L1 -- physics**, the most permissive level there is.  Its own
+    # docstring names the relation: ``common.shard_map`` "owns the
+    # symbol-and-kwarg decision the way this module owns the marking
+    # decision".  Its whole subject is MESH AXES and per-device variation --
+    # L3's declared vocabulary -- and it contains no mathematics at all,
+    # which is what separates L3 from L2.  Naming it here is a TIGHTENING:
+    # at L1 it could import anything in the tree; at L3 it may import
+    # nothing above the substrate, and today it imports nothing from
+    # ``src/`` at all.
+    "common.shard_map", "common.vma",
     "common.jax_compile_cache", "common.jax_profile", "common.timing",
     "common.progress", "common.gpu_utils", "common.async_io", "common.sanity",
     # FFT kernels
@@ -171,11 +189,36 @@ def all_modules():
     return out
 
 
-def _absolute_target(node: ast.ImportFrom, mod: str) -> str:
-    """Resolve a possibly-relative ``from ... import`` to an absolute name."""
+def packages_in(sources):
+    """The module names in ``sources`` that are packages (an ``__init__.py``).
+
+    ``all_modules`` maps ``runtime/__init__.py`` to ``"runtime"``, so a name is
+    a package exactly when some other name is under it.  Needed by
+    :func:`_absolute_target`; see the note there.
+    """
+    return {m for m in sources if any(k.startswith(m + ".") for k in sources)}
+
+
+def _absolute_target(node: ast.ImportFrom, mod: str, is_pkg: bool = False) -> str:
+    """Resolve a possibly-relative ``from ... import`` to an absolute name.
+
+    ``is_pkg`` says whether ``mod`` is a package (i.e. came from an
+    ``__init__.py``), and it is not a detail: for a plain module ``pkg.m``,
+    ``from .x import y`` means ``pkg.x``, so one component is dropped — but for
+    a PACKAGE ``pkg`` it means ``pkg.x``, and dropping a component yields a
+    bare ``x`` that matches no module in the tree, so the edge is silently
+    SKIPPED.  There are 24 package ``__init__.py`` files under ``src/`` and 34
+    such imports among them, ``runtime/__init__.py``'s two startup siblings
+    included; every one of them was exempt from rule 3.  Nothing was hiding
+    there when this was fixed (2026-08-06) — the scan reports the same two
+    excused edges before and after — but "the rule did not apply to a whole
+    file shape" is the kind of hole that only stays empty by luck, and the
+    default level is L1, so an unmapped ``runtime/<new>.py`` reached by
+    ``from .<new> import …`` was invisible by construction.
+    """
     if node.level == 0:
         return node.module or ""
-    base = mod.split(".")[:-1]
+    base = mod.split(".") if is_pkg else mod.split(".")[:-1]
     for _ in range(node.level - 1):
         base = base[:-1]
     if node.module:
@@ -183,7 +226,7 @@ def _absolute_target(node: ast.ImportFrom, mod: str) -> str:
     return ".".join(base)
 
 
-def scan_plumbing_imports(source: str, mod: str = "m"):
+def scan_plumbing_imports(source: str, mod: str = "m", is_pkg: bool = False):
     """Every import of a jax distribution/plumbing module. ``[(spelling, line)]``.
 
     Walks the WHOLE tree, so a lazy import inside a function is caught too —
@@ -197,7 +240,7 @@ def scan_plumbing_imports(source: str, mod: str = "m"):
                 if a.name.startswith(_PLUMBING_MODULES):
                     hits.append((a.name, node.lineno))
         elif isinstance(node, ast.ImportFrom):
-            tgt = _absolute_target(node, mod)
+            tgt = _absolute_target(node, mod, is_pkg)
             if tgt.startswith(_PLUMBING_MODULES):
                 hits.append((tgt, node.lineno))
             elif tgt in ("jax", "jax.experimental"):
@@ -207,7 +250,7 @@ def scan_plumbing_imports(source: str, mod: str = "m"):
     return sorted(hits, key=lambda h: h[1])
 
 
-def scan_imports(source: str, mod: str):
+def scan_imports(source: str, mod: str, is_pkg: bool = False):
     """Every imported dotted name. ``[(target, line, is_lazy)]``."""
     hits = []
 
@@ -228,7 +271,7 @@ def scan_imports(source: str, mod: str):
             self.generic_visit(node)
 
         def visit_ImportFrom(self, node):
-            tgt = _absolute_target(node, mod)
+            tgt = _absolute_target(node, mod, is_pkg)
             for a in node.names:
                 hits.append(((tgt + "." + a.name) if tgt else a.name,
                              node.lineno, self.depth > 0))
@@ -762,12 +805,13 @@ _L2_UPWARD_EXCEPTIONS = {
 def upward_edges(sources):
     """Every import that goes UP a level. ``[(from_layer, to_layer, mod, target, line, lazy)]``."""
     mods = set(sources)
+    pkgs = packages_in(sources)
     out = []
     for mod, src in sources.items():
         here = layer_of(mod)
         if here == "X":
             continue
-        for target, line, lazy in scan_imports(src, mod):
+        for target, line, lazy in scan_imports(src, mod, mod in pkgs):
             parts = target.split(".")
             resolved = None
             for i in range(len(parts), 0, -1):
@@ -832,6 +876,34 @@ def test_the_upward_edge_scan_can_fail(sources):
     assert ("common.collectives", "gw.gw_config") in edges, (
         f"the upward-edge scan does not see an L3 module importing an L1 "
         f"one from inside a function: {edges}")
+
+
+def test_the_upward_edge_scan_sees_package_relative_imports(sources):
+    """RED TWIN for :func:`_absolute_target`'s package case.
+
+    ``from .x import y`` inside a package ``__init__.py`` means ``pkg.x``.  A
+    resolver that drops a component instead yields a bare ``x``, which matches
+    no module in the tree, so :func:`upward_edges` skips the edge ENTIRELY.
+    That was true here until 2026-08-06 for all 34 such imports in the 24
+    package ``__init__.py`` files under ``src/`` — ``runtime/__init__.py``'s
+    two startup siblings among them.
+
+    The seed is the shape that actually happens, not a fiction: a new file
+    under ``runtime/`` that nobody added to the map DEFAULTS TO L1 (§0), and
+    ``runtime`` reaches its siblings relatively.  Both of the upward edges
+    fixed on 2026-08-06 arose exactly this way.
+    """
+    assert layer_of("runtime") == "L3"
+    assert layer_of("runtime.deck_reader") == "L1", (
+        "an unmapped runtime submodule must default to L1, or this twin is "
+        "asserting nothing")
+    fake = dict(sources)
+    fake["runtime"] = "from .deck_reader import read_deck\n"
+    fake["runtime.deck_reader"] = "read_deck = None\n"
+    edges = [(m, t) for _, _, m, t, _, _ in upward_edges(fake)]
+    assert ("runtime", "runtime.deck_reader") in edges, (
+        f"a package-relative import inside an __init__.py is invisible to "
+        f"rule 3: {edges}")
 
 
 def test_the_upward_edge_scan_ignores_downhill_imports(sources):

@@ -43,7 +43,7 @@ identity **only** on a jax that genuinely does not track VMA — where the
 identity is not merely safe but the only possible behaviour.  A jax that DOES
 track VMA and has neither spelling is a case nobody has seen; this module
 **refuses at import** rather than silently degrading, per the same contract as
-``ffi.gate`` and ``common.jax_support``: an operation that cannot be honoured
+``ffi.gate`` and ``runtime.jax_support``: an operation that cannot be honoured
 says so and names the fix.
 
 Two rules for CALLERS, both measured

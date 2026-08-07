@@ -43,7 +43,7 @@ Only the pure-JAX path works with **zero native libs**. Everything distributed n
     all arrive, and where every `jax._src` private this tree patches reaches the
     shape it has on 0.9.
 
-    **It is now enforced.** `common.jax_support.enforce()` runs at step 5b of
+    **It is now enforced.** `runtime.jax_support.enforce()` runs at step 5b of
     `runtime.initialize_communicator_stack` — after the backend exists, before the
     first `jit` — and refuses a JAX outside the window or with an unexpected
     `jax._src` shape, naming the fix. `LORRAX_JAX_UNSUPPORTED_OK=1` is the one

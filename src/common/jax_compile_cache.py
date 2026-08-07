@@ -211,7 +211,7 @@ the table in the ``jax._src surface this file patches`` block below.
 Until 2026-08-06 the GPU container was ``nvcr.io/nvidia/jax:25.04-py3`` (jax
 0.5.3), which differed on four of them, and this file carried five named
 compatibility shims for that.  Four are DELETED with the 0.5.3 support: the
-detection duty they served now belongs to ``common.jax_support``, which
+detection duty they served now belongs to ``runtime.jax_support``, which
 asserts those arities and symbols once at startup and refuses by name.  The
 FIFTH survives and is not a version shim at all — ``VerificationCache`` and
 ``compilation_cache_check_contents`` are absent from every NVIDIA container at
@@ -327,7 +327,7 @@ def _say(msg: str) -> None:
 # arity), 2 (lookup arity), 4 (compile entry point) and 5 (the P>1 degradation
 # for a jax that cannot rebind a cached executable to the reading process's
 # devices) had nothing left to bridge and were deleted.  Their detection duty
-# did not vanish with them: ``common.jax_support`` asserts exactly these
+# did not vanish with them: ``runtime.jax_support`` asserts exactly these
 # arities and symbols at startup and REFUSES by name, which is a better
 # instrument than an in-line branch — it fires once, before anything compiles,
 # instead of shaping every call site forever.
@@ -720,7 +720,7 @@ def _install_invariant_key_patch() -> None:
     # tree supports (0.7.0 container and 0.9.1 wheel, both MEASURED).  It used
     # to end in ``*_compat_tail`` to swallow the third positional jax 0.5.3
     # passed (``backend``, never read); that shim is gone with 0.5.3, and
-    # ``common.jax_support`` asserts the arity at startup instead, so a jax
+    # ``runtime.jax_support`` asserts the arity at startup instead, so a jax
     # that reintroduces a third argument is a named refusal rather than a
     # silently discarded one.
     def _canonical_accelerator(hash_obj, accelerators):
@@ -749,7 +749,7 @@ def _install_agreement_patch() -> None:
     # ``get_executable_and_time`` is ``(cache_key, compile_options, backend,
     # executable_devices)`` on both supported jaxes (0.7.0 container, 0.9.1
     # wheel — MEASURED).  The arity PROBE and its announcement, which existed
-    # to report jax 0.5.3's 3-parameter form, are gone; ``common.jax_support``
+    # to report jax 0.5.3's 3-parameter form, are gone; ``runtime.jax_support``
     # asserts the 4 at startup.
     #
     # ``*passthrough`` is NOT a leftover compatibility branch and is kept
@@ -1131,7 +1131,7 @@ def ensure_jax_compile_cache() -> None:
     # parameters with ``executable_devices`` named, same as the 0.9.1 wheel),
     # so the branch was unreachable and is deleted rather than left as a
     # permanent compatibility layer for a version being abandoned.  The
-    # condition itself is not unguarded: ``common.jax_support`` requires
+    # condition itself is not unguarded: ``runtime.jax_support`` requires
     # ``compilation_cache.get_executable_and_time`` to take 4 parameters and
     # refuses at startup, by name, on a jax that does not.
 
