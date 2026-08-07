@@ -1,46 +1,28 @@
-"""Distributed dense linear algebra over a JAX device mesh — the facade.
+"""Re-export shim — the distributed-linalg facade moved to ``distrib_la``.
 
-One interface from JAX-side calls to the choice of library, depending on
-what is compiled, what the input file / CLI requested, and whether the
-mesh is GPU or CPU.  Full docs: ``docs/dev/linalg_ffi.md``.
+``services/distrib_la/`` is the standalone service now (charter wave 0);
+this package only re-exports its public names so lorrax stays green while
+the call sites migrate.  New code imports ``distrib_la`` directly.
 
-Four layers:
+DELETING THIS PACKAGE IS THE REPLUMB-COMPLETE GATE.  Its last import
+disappearing from ``src/`` is what "the replumb landed" means, and that is
+checkable: ``tests/test_layering.py``'s service-door rule counts the edges.
 
-* **resolve** (``resolve_backend``, ``list_backends``) — turns a
-  requested backend name (``auto|off|distributed|cusolvermp|slate|
-  scalapack``, per op) into a concrete, guaranteed-callable backend,
-  applying every guard (platform, known-broken combinations,
-  compiled-capability probe, process coverage, mesh geometry,
-  divisibility) in one place at RESOLVE time.
-* **plan** (``plan`` → :class:`LinalgPlan`) — THE call-site interface.
-  Resolves once and carries the answer together with the layout
-  contract, so a call site is ``plan(A)`` / ``plan.batched(A)`` with the
-  FFI-adjacent resharding, the batch loop and the per-backend output
-  conventions all inside.
-* **dispatch** (``dispatch_eigh``) — the older single-call entry point,
-  now a thin shim over a plan.  New code should take a plan.
-* **backends** — ``ffi.cusolvermp`` (CUDA), ``ffi.slate`` (CUDA + host),
-  ``ffi.scalapack`` (host), reached only through ``backend_module``; and
-  the in-tree ``native`` implementations (pure JAX — ``jnp.linalg.eigh``,
-  the replicated/sharded Cholesky and per-q LU in ``isdf/core``), which
-  are first-class backends available everywhere.
-
-Typical use::
-
-    from ffi import linalg
-
-    p = linalg.plan("eigh", mesh, backend=requested, n=n)   # once
-    log(p.describe())
-    if p.is_native:
-        lam, R = jnp.linalg.eigh(A_batch)   # caller owns the fused fast path
-    else:
-        lam, R = p.batched(A_stack)         # one call, any backend
-
-    print(linalg.list_backends("cholesky", mesh))  # what CAN run here?
+The submodules (``plan``, ``resolve``, ``dispatch``, ``_slate``,
+``_scalapack``) are re-exported through the same package-relative imports
+the original used, so ``sys.modules['ffi.linalg.plan']`` and
+``from ffi.linalg._slate import _mesh_key`` keep resolving exactly as they
+did.  Each names its reachers, so the replumb knows what it is removing.
 """
-from .dispatch import dispatch_batched_eigh, dispatch_eigh
-from .plan import LinalgPlan, ensure_sharding, plan
-from .resolve import (
+from __future__ import annotations
+
+from ffi import _services
+
+_services.ensure_on_path()
+
+from .dispatch import dispatch_batched_eigh                    # noqa: E402
+from .plan import LinalgPlan, Plan, ensure_sharding, plan      # noqa: E402
+from .resolve import (                                         # noqa: E402
     BACKEND_CHOICES,
     CHOLESKY_BACKENDS,
     EIGH_BACKENDS,
@@ -62,9 +44,9 @@ __all__ = [
     "LinalgPlan",
     "NATIVE",
     "OPS",
+    "Plan",
     "backend_module",
     "dispatch_batched_eigh",
-    "dispatch_eigh",
     "ensure_sharding",
     "list_backends",
     "mesh_is_cpu",

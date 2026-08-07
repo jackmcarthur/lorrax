@@ -1123,8 +1123,21 @@ class _FakeCudaMesh:
 
 
 def _mock_cuda_capabilities(monkeypatch, nproc):
-    from ffi.linalg import resolve as R
-    from ffi.common import ffi_loader as FL
+    """Patch the modules the resolver ACTUALLY reads.
+
+    These cells mock the capability probe and the process count on purpose,
+    so the guard-5 contract is asserted on any dev box with no GPU and no
+    ``.so``.  A monkeypatch has to land on the module whose globals the
+    resolver looks up, and since the facade moved to ``services/distrib_la``
+    that is ``distrib_la.resolve`` / ``distrib_la.loader`` — patching
+    ``ffi.linalg.resolve`` (a re-export shim) or ``ffi.common.ffi_loader``
+    (which still owns fft/gemm/phdf5 and no longer answers for linalg)
+    would set attributes nothing reads, and these cells would quietly start
+    measuring the machine instead of the contract.
+    """
+    import ffi.linalg  # noqa: F401  (puts services/*/src on sys.path)
+    from distrib_la import loader as FL
+    from distrib_la import resolve as R
     monkeypatch.setattr(FL, "probe_target", lambda t, p: (True, "ok"))
     monkeypatch.setattr(FL, "has_target", lambda t, p: True)
     monkeypatch.setattr(R, "_process_count", lambda: nproc)

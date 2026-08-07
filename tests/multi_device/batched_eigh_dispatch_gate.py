@@ -145,11 +145,15 @@ def main():
        f"{'PASS' if ok4 else 'FAIL'}")
 
     # ---- 5. ONE resolve for the whole serial stack ----------------------
-    # ``import ffi.linalg.plan`` gives back the FUNCTION, not the module:
-    # ``ffi/linalg/__init__.py`` re-exports ``plan`` and that binding
-    # shadows the submodule of the same name on the package.  Take the
-    # module out of sys.modules instead.
-    _planmod = sys.modules["ffi.linalg.plan"]
+    # Patch the module whose globals ``plan()`` actually looks ``resolve_
+    # backend`` up in.  That is ``distrib_la.plan`` since the facade moved
+    # to services/distrib_la/; ``ffi.linalg.plan`` is a re-export shim, so
+    # rebinding its attribute would count ZERO calls and this check would
+    # pass while measuring nothing.  (``import ffi.linalg.plan`` also gives
+    # back the FUNCTION, not the module — the package re-exports ``plan``
+    # and that binding shadows the submodule of the same name — which is
+    # why this goes through sys.modules either way.)
+    _planmod = sys.modules["distrib_la.plan"]
     seen = []
     _orig = _planmod.resolve_backend
 
