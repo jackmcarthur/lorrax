@@ -16,6 +16,7 @@ import argparse
 import configparser
 import re
 import glob
+import warnings
 from pathlib import Path
 from common.fft_helpers import local_fftn3, local_ifftn3
 
@@ -237,6 +238,153 @@ def valence_density_from_kpoint(
         nocc=None if nocc is None else int(nocc))
 
 
+# ===========================================================================
+# ρ(r) → THE POINT-GROUP-SYMMETRIC ρ(r)
+# ===========================================================================
+# ρ of a crystal obeys ρ({S|τ}r) = ρ(r) for every operation of its space
+# group.  Nothing in the quadrature above enforces that:
+#
+#   * a sum over the FULL BZ is symmetric only to the accuracy of the ψ(Sk)
+#     unfold that produced its summands, so it inherits that unfold's
+#     residual;
+#   * a WEIGHTED sum over the IBZ is not symmetric at all — it is the
+#     density of the representatives, and only the star average of it is
+#     the density of the crystal.
+#
+# Both are cured by the same projection, ρ → (1/N_op) Σ_op ρ({S|τ}r), which
+# is the projector onto the invariant subspace and is therefore idempotent:
+# applying it to an already-symmetric ρ returns ρ.  Two properties make it
+# safe to apply unconditionally, and both matter:
+#
+#   * ∫ρ d³r is EXACTLY preserved — each term is a permutation of the grid
+#     points, so every term has the same grid sum as ρ itself;
+#   * the change it makes is bounded by the asymmetry it removes, so on a
+#     ρ that is already symmetric to 1e-9 it cannot alter the physics by
+#     more than 1e-9.  It is a projection, not a smoothing.
+#
+# Why V_H is where this is load-bearing.  T, V_loc and V_NL are built from
+# the atomic positions and commute with the space group exactly; V_H is
+# built from ρ and inherits ρ's residual instead.  With ρ merely NEARLY
+# symmetric, ⟨m,Sk|V_H|n,Sk⟩ is merely nearly equal to ⟨m,k|V_H|n,k⟩ across
+# a star, so a consumer that computes on the irreducible k-set and
+# broadcasts over the star disagrees with a full-BZ sweep at the level of
+# that residual, while every other term agrees to round-off.
+#
+# The permutation table and the star average are BOTH taken from the
+# existing implementations (``centroid.orbit_syms.compute_rgrid_sym_perm``,
+# ``gw.qsgw_density.symmetrise_density``, already used by the QSGW density
+# loop and by ζ's full-BZ unfold) so there is one grid-rotation convention
+# in the code base, not two.
+
+#: (fft_grid, sym block) → ``(n_op, nx*ny*nz)`` int32 gather table.  The
+#: build is O(n_op·N_r) on the host; a QSGW loop rebuilds ρ every iteration
+#: and must not pay for it more than once.  Small: 2.6 MB for 48 ops on a
+#: 24³ grid.
+_RHO_SYM_PERM_CACHE: dict[tuple, "np.ndarray | None"] = {}
+
+#: ‖ρ_sym − ρ‖∞/‖ρ‖∞ above which the projection is announced as a warning.
+#: A full-BZ ρ that moves this much is not a nearly-symmetric density being
+#: cleaned up — either the k-set was reduced (legitimate, and the
+#: projection is then mandatory rather than cosmetic) or the file's
+#: symmetry block does not describe these wavefunctions (not legitimate,
+#: and ``common.density_symmetry_check`` will have said so at load time).
+RHO_SYM_WARN = 1.0e-3
+
+
+def density_symmetrisation_enabled() -> bool:
+    """``LORRAX_RHO_SYMMETRISE``: ``0``/``off``/``no`` turns it off.
+
+    An escape hatch for A/B measurement and for a deck whose symmetry
+    block is under suspicion; on by default, because an unsymmetrised ρ is
+    wrong for every reduced k-set and imprecise for every other one.
+    """
+    raw = os.environ.get("LORRAX_RHO_SYMMETRISE", "1").strip().lower()
+    return raw not in ("0", "off", "false", "no")
+
+
+def _rho_sym_perm(wfn, fft_grid: tuple[int, int, int]):
+    """The space group's FFT-grid permutation table, or None.
+
+    None means "do not symmetrise": either the handle carries no symmetry
+    block (a stub, a ``nosym`` file), or ``ntran <= 1`` and the projection
+    is the identity, or some ``τ`` is not commensurate with this grid so
+    the operation is not representable as a grid permutation at all.  The
+    last case is reported, never rounded away: averaging over a subset of
+    the group is not a projector, so a partial table is refused.
+    """
+    ntran = int(getattr(wfn, "ntran", 0) or 0)
+    mats = getattr(wfn, "sym_matrices", None)
+    taus = getattr(wfn, "translations", None)
+    if ntran <= 1 or mats is None or taus is None:
+        return None
+    mats = np.asarray(mats)[:ntran].astype(np.int64)
+    taus = np.asarray(taus, dtype=np.float64)[:ntran]
+    key = (tuple(int(s) for s in fft_grid), mats.tobytes(), taus.tobytes())
+    if key in _RHO_SYM_PERM_CACHE:
+        return _RHO_SYM_PERM_CACHE[key]
+
+    from centroid.orbit_syms import compute_rgrid_sym_perm
+    try:
+        perm = compute_rgrid_sym_perm(mats, taus, fft_grid, validate=True)
+    except Exception as exc:
+        warnings.warn(
+            f"rho symmetrisation is UNAVAILABLE on the {tuple(fft_grid)} "
+            f"grid: {exc!r}.  The density is left as accumulated, so V_H "
+            f"keeps whatever symmetry residual it carries and is only as "
+            f"star-invariant as the density that generated it.",
+            RuntimeWarning)
+        perm = None
+    _RHO_SYM_PERM_CACHE[key] = perm
+    return perm
+
+
+def symmetrize_valence_density(rho_r, wfn, *, print_fn=None):
+    """ρ(r) → (1/N_op) Σ_op ρ({S|τ}r) over the WFN file's space group.
+
+    The projector onto the point-group-invariant subspace; see the block
+    comment above for why it is applied and why it is safe.  Idempotent, so
+    a caller that has already symmetrised pays one gather and gets its own
+    array back to round-off.  ∫ρ d³r is preserved exactly.
+
+    ``wfn`` is any handle carrying ``ntran`` / ``sym_matrices`` /
+    ``translations`` (a :class:`file_io.wfn_loader.WfnLoader` everywhere in
+    production); one that does not is left alone.
+    """
+    if not density_symmetrisation_enabled():
+        if print_fn is not None:
+            print_fn("    rho symmetrisation: OFF "
+                     "(LORRAX_RHO_SYMMETRISE); rho used as accumulated")
+        return rho_r
+    grid = tuple(int(s) for s in np.shape(rho_r))
+    perm = _rho_sym_perm(wfn, grid)
+    if perm is None:
+        return rho_r
+
+    from gw.qsgw_density import symmetrise_density
+    rho_j = jnp.asarray(rho_r, dtype=jnp.float64)
+    rho_sym = symmetrise_density(rho_j, perm)
+    # How far ρ moved is the one number that says whether this was a
+    # round-off cleanup or a change of physics, so it is always computed —
+    # printed when there is somewhere to print it, escalated when it is
+    # large enough to mean something other than accumulation error.
+    scale = float(jnp.max(jnp.abs(rho_j))) or 1.0
+    moved = float(jnp.max(jnp.abs(rho_sym - rho_j))) / scale
+    if print_fn is not None:
+        print_fn(f"    rho symmetrisation: {int(perm.shape[0])} space-group "
+                 f"operations, max|Δρ|/max|ρ| = {moved:.3e}")
+    if moved > RHO_SYM_WARN:
+        warnings.warn(
+            f"the density moved by {moved:.3e} (relative) under the "
+            f"space-group average, far more than an accumulation residual. "
+            f"Expected when rho was built from a REDUCED k-set (the "
+            f"projection is then what makes it the crystal's density at "
+            f"all); otherwise the file's symmetry block does not describe "
+            f"these wavefunctions, and common.density_symmetry_check will "
+            f"have said so at load time.",
+            RuntimeWarning)
+    return rho_sym
+
+
 def build_hartree_potential(
     rho_r: jnp.ndarray,
     wfn,
@@ -256,10 +404,23 @@ def build_hartree_potential(
     into H₀, where it cannot be told apart from a basis-convergence
     problem.
 
+    ρ IS SYMMETRISED FIRST.  This is the funnel every exact-V_H consumer
+    passes through, and V_H is the one term of H₀ that does not commute
+    with the space group by construction — it inherits whatever symmetry
+    residual its ρ carries (see the block comment above
+    :func:`symmetrize_valence_density`).  Doing the projection here rather
+    than at each accumulator means there is one place where ρ becomes the
+    crystal's density, and the ``∫ρ`` check below then guards the
+    projected array rather than its precursor.  The projection is
+    idempotent, so a caller that already symmetrised loses nothing.
+
     The ``∫ρ d³r`` check is the cheap guard against a silent factor-2
     (spin degeneracy) or grid-normalisation slip: both would rescale a
-    ~500 eV term.
+    ~500 eV term.  Because it now runs on the projected ρ, it is also the
+    guard on the projection: a star average cannot change ∫ρ, so anything
+    that did would surface here rather than downstream in V_H.
     """
+    rho_r = symmetrize_valence_density(rho_r, wfn, print_fn=print_fn)
     volume = float(wfn.cell_volume)
     ngrid = int(np.prod(rho_r.shape))
     charge = float(jnp.sum(rho_r)) * volume / ngrid
@@ -296,6 +457,12 @@ def build_hartree_potential(
 def compute_valence_density(wfn_k, sym, wfn):
     """
     Compute valence charge density rho_v(r) from occupied valence wavefunctions.
+
+    The accumulated sum is projected onto the crystal's point group before
+    it is returned (:func:`symmetrize_valence_density`).  That is required,
+    not cosmetic, for the irreducible-mesh branch below — a k-weighted sum
+    over the IBZ is the density of the representatives, not of the crystal
+    — and it removes the unfold's residual from the full-mesh branch.
 
     Returns:
         Valence charge density rho_v(r) on an ecutrho-based FFT grid if available
@@ -364,7 +531,7 @@ def compute_valence_density(wfn_k, sym, wfn):
     
     # With proper k-point weights included above, no division needed
     # (weights sum to 1 for irreducible mesh, or 1/nk_tot each for full mesh)
-    rho_v = rho_val_local
+    rho_v = symmetrize_valence_density(rho_val_local, wfn)
 
     # Caller reports integrated charge if needed
     return rho_v
