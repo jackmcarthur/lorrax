@@ -107,11 +107,15 @@ answer does not arise here, and this section is short because of it.
 
 The mesh-touching paths (`unfold_v_q`, `slice_q_full_to_ibz`, the star
 helpers on device operands) go through the package's PRIVATE `_shard_map`,
-a ruling-3 copy of `common/shard_map.py` that dispatches on the jax version
-— verified live on both stacks this branch runs (jax 0.9.1 in the WSL venv,
-jax 0.7.0 in the Perlmutter container, which takes the
-`jax.experimental.shard_map` arm). Consolidation into `lxkit.jax_compat`
-retires this copy and `distrib_la`'s together, post-wave.
+a ruling-3 copy of `common/shard_map.py`. It PROBES for the two spellings
+(`jax.shard_map`, `jax.experimental.shard_map`), announces which one it
+took, and REFUSES rather than degrades when a jax has neither — every
+distributed kernel in the tree is written in `shard_map`, so there is no
+meaningful fallback to fall back to. Exercised on both stacks this branch
+runs: jax 0.9.1 in the WSL venv and jax 0.7.0 in the Perlmutter container,
+which announces `using jax.shard_map (jax 0.7.0)` on every rank of the
+four-process legs. Consolidation into `lxkit.jax_compat` retires this copy
+and `distrib_la`'s together, post-wave.
 
 Operand placement is the real dispatch: host operands take numpy fast paths
 (`_take_rows`, `_broadcast_rows`), device operands get cached jits with
@@ -182,11 +186,11 @@ Everything below is measured and is quoted, not re-run.
 
 The one skip is the WSL-kernel row in skip-honesty, correctly refusing to
 assert about a machine it is not on; the xfail is the sharded-NaN
-reduction (see `tests/KNOWN_FAILURES.md`). The two legs differ by one cell
-and by a factor of two in wall time, which is the container's import cost,
-not the package's. The same Perlmutter leg read 39.83 s one commit earlier
-(`1e90726`) on identical cell counts — quote the run-to-run band, not a
-single second.
+reduction (see `tests/KNOWN_FAILURES.md`). The two legs differ by one cell and by
+2.3× in wall time; where that time goes has not been measured and this page
+does not guess. The same Perlmutter leg read 39.83 s one commit earlier
+(`1e90726`) on identical cell counts, so quote the band, not a single
+second.
 
 **`SymMaps(wfn)` construction**, before/after the dead parent-map drop
 (`1e90726`; 9 runs per deck, best-of, one process per arm, uncontended,
