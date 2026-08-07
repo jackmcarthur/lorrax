@@ -156,8 +156,10 @@ def write_qp_wfn_h5(
     # mesh-less WfnLoader (eager backend) here so the rank-0 write does
     # not need the other ranks at all — qp_wfn is a one-shot
     # end-of-run dump and the re-slurp cost is paid once.
-    from .wfn_loader import WfnLoader
-    loader = WfnLoader(wfn._filename)
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
+    loader = WfnLoader(wfn.path)
     psi_all = np.asarray(loader.load(
         bands=(0, int(wfn.nbands)), k="ibz", sharding=None))   # (nk, nb, ns, ngkmax)
     gvecs_full = loader.gvecs(k="ibz")                          # (nk, ngkmax, 3)

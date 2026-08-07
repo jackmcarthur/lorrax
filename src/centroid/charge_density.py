@@ -46,7 +46,12 @@ from pathlib import Path
 import numpy as np
 import jax.numpy as jnp
 
-from file_io import WfnLoader as WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from common import symmetry_maps
 
 
@@ -86,7 +91,7 @@ def rho_from_qe_save(save_dir: str | os.PathLike) -> np.ndarray:
 # Source 2: IBZ wavefunction sum (no full-BZ unfold)
 # ═══════════════════════════════════════════════════════════════════════
 
-def _load_wfn_k_fftbox_ibz(wfn: WFNReader, n_val: int) -> jnp.ndarray:
+def _load_wfn_k_fftbox_ibz(wfn: WfnLoader, n_val: int) -> jnp.ndarray:
     """Load IBZ wavefunctions into the FFT box, shape (nk_irr, n_val, nspinor, Nx, Ny, Nz).
 
     Raw IBZ coefficients scattered onto the QE FFT grid — no fractional-
@@ -111,7 +116,7 @@ def _load_wfn_k_fftbox_ibz(wfn: WFNReader, n_val: int) -> jnp.ndarray:
     7879492 / 7879495, all frames identical).  Rank 0 sailed through, which
     is why the logs showed exactly one rank's worth of progress banners.
     """
-    from file_io.wfn_loader import WfnLoader
+    from wfn_loader import WfnLoader
     from common.wfn_transforms import to_box
 
     # single_device_mesh IS the process-local mesh: wfn_transforms.
@@ -119,14 +124,14 @@ def _load_wfn_k_fftbox_ibz(wfn: WFNReader, n_val: int) -> jnp.ndarray:
     # process, owned by common.collectives).  Import it from its owner.
     from common.collectives import single_device_mesh
 
-    with WfnLoader(wfn._filename) as loader:
+    with WfnLoader(wfn.path) as loader:
         psi = loader.load_process_local(bands=(0, n_val), k="ibz")
         return to_box(psi, loader.box_index(k="ibz"), loader.fft_grid,
                       mesh=single_device_mesh())
 
 
 def rho_from_wfn_ibz(
-    wfn: WFNReader,
+    wfn: WfnLoader,
     sym: symmetry_maps.SymMaps,
     n_val: int | None = None,
 ) -> np.ndarray:
@@ -197,7 +202,7 @@ def symmetrize_on_grid(field: np.ndarray, sym_ops: np.ndarray) -> np.ndarray:
 
 
 def rho_from_band_range(
-    wfn: WFNReader,
+    wfn: WfnLoader,
     band_range: tuple[int, int],
     *,
     sym_ops: np.ndarray | None = None,
@@ -273,7 +278,7 @@ def rho_from_band_range(
     (Nx, Ny, Nz) float64 real-space weight on the WFN FFT grid.
     """
     import jax
-    from file_io.wfn_loader import WfnLoader
+    from wfn_loader import WfnLoader
     from common.wfn_transforms import to_rbox
 
     from common.collectives import (single_device_mesh, process_count,
@@ -283,7 +288,7 @@ def rho_from_band_range(
     if b_hi <= b_lo:
         raise ValueError(f"empty band range: {band_range}")
 
-    with WfnLoader(wfn._filename) as loader:
+    with WfnLoader(wfn.path) as loader:
         nb_file = int(loader.nbands)
         if b_hi > nb_file:
             raise ValueError(
@@ -429,7 +434,7 @@ def _autodetect_save_dir(start: str | os.PathLike = ".") -> Path | None:
 
 
 def get_charge_density(
-    wfn: WFNReader | None = None,
+    wfn: WfnLoader | None = None,
     sym: symmetry_maps.SymMaps | None = None,
     *,
     source: str = "auto",
