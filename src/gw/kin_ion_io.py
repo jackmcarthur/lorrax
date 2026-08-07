@@ -110,8 +110,12 @@ _services.ensure_on_path()
 # ``broadcast_ibz_to_full_bz`` calls ``symmetry_maps.star_broadcast(...)``
 # and ``tests/test_kin_ion_star_broadcast.py::
 # test_the_call_site_passes_ibz_slab_as_a_literal`` finds that call by AST
-# on ``func.attr == "star_broadcast"``.  A bare-name import would make the
-# I8 wiring check silently find zero calls instead of one.
+# on ``func.attr == "star_broadcast"``.  A bare-name import would make that
+# search find zero calls -- and the cell asserts ``len(calls) == 1``, so it
+# FAILS LOUDLY with the count in the message rather than passing on an
+# empty search.  The module binding is kept so the gate goes on measuring
+# the ``"ibz_slab"`` literal at the REAL call site; changing it does not
+# weaken the gate, it breaks it, which is the point.
 import symmetry_maps                                            # noqa: E402
 
 
