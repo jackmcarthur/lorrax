@@ -506,15 +506,25 @@ def write_freq_debug(
     # mode (Σ_c, Z) were already computed above for the
     # ``sig_c(Edft)`` column; in static modes the combined Σ_SX +
     # Σ_COH plays the role of Σ_c(E_DFT) and Z = 1 so eqp1 == eqp0.
+    # MODE-CORRECT split, and it must match compute_eqp_diag's contract:
+    # that helper forms sigma_x_diag_ev + sigma_c_at_dft_diag_ev.  Under
+    # static COHSEX, Sigma = Sigma_SX + Sigma_COH and there is NO separate
+    # bare-exchange term -- so handing it x_bare as sigma_x while sigma_c
+    # ALREADY contains sig_sx counts exchange TWICE.  MEASURED at Gamma
+    # n=1: this column read -25.316578 eV against the correct -8.184804 eV,
+    # a ~17 eV error.  Same defect class as the eqp{0,1}.dat writer (fixed
+    # in 2987003); this is the second site, and it is why the two disagreed.
+    _sig_x_for_eqp = _sig_x_diag_ev          # PPM: bare X is correct
     if not use_ppm_c:
         _sigma_c_at_dft_for_eqp = np.real(np.diagonal(
-            np.asarray(results.sig_sx + results.sig_coh),
-            axis1=1, axis2=2)) * RYD_TO_EV
+            np.asarray(results.sig_coh), axis1=1, axis2=2)) * RYD_TO_EV
+        _sig_x_for_eqp = np.real(np.diagonal(
+            np.asarray(results.sig_sx), axis1=1, axis2=2)) * RYD_TO_EV
         _z_factor = None
     _eqp0_ev, _eqp1_ev = compute_eqp_diag(
         kin_ion_diag_ev=_kin_diag_ev,
         hartree_diag_ev=_v_h_diag_ev,
-        sigma_x_diag_ev=_sig_x_diag_ev,
+        sigma_x_diag_ev=_sig_x_for_eqp,
         sigma_c_at_dft_diag_ev=np.asarray(
             _sigma_c_at_dft_for_eqp, dtype=np.complex128),
         e_dft_ev=_e_dft_ev_full,

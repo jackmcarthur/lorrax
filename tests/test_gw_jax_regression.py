@@ -47,8 +47,15 @@ from harness import (          # noqa: E402
 _CASES = [
     ("cohsex", REG / "cohsex_debug", "cohsex_test.in", "eqp_test.dat",
      "eqp_ref.dat", ("sigSX", "sigCOH", "sigTOT"), 1e-6),
+    # atol 1e-5, not 1e-3: the old value was 2x LOOSER than the 0.48 meV
+    # BerkeleyGW envelope it claimed to stand for, and it silently absorbed a
+    # zeta_rcond default drift. The deck now pins zeta_rcond and
+    # mc_average_vcoul_body, and two independent runs reproduce this
+    # reference bit-identically, so 1e-5 (the floor the .dat 6-decimal format
+    # allows) has ample headroom. Reference re-frozen 2026-08-06 and checked
+    # EXTERNALLY: sigTOT 0.433 meV MAE / 1.253 max vs BGW noavg.
     ("si_cohsex_3d", REG / "si_cohsex_debug", "cohsex_si_test.in",
-     "eqp_si_test.dat", "eqp_si_ref.dat", ("sigSX", "sigCOH", "sigTOT"), 1e-3),
+     "eqp_si_test.dat", "eqp_si_ref.dat", ("sigSX", "sigCOH", "sigTOT"), 1e-5),
 ]
 
 

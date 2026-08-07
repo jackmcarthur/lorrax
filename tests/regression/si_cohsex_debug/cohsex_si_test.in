@@ -50,3 +50,15 @@ wfn_file = WFN.h5
 output_file = eqp_si_test.dat
 sigma_diag_file = eqp_si_test.dat
 sigma_omega_h5_file = sigma_mnk.h5
+
+# --- BGW matching convention, pinned 2026-08-06 ------------------------
+# This fixture is anchored to D_bgw_cohsex_noavg, i.e. BGW run with
+# cell_average_cutoff 1d-12, which averages ONLY the literal q+G=0 element
+# (vcoul_generator.f90:101-103) and uses the point 8*pi/|q+G|^2 elsewhere.
+# LORRAX default TRUE averages at EVERY q!=0 -- one shell too many.
+# MEASURED cost of leaving it unset: sigTOT 141.65 meV MAE vs BGW; with it
+# false, 0.43 meV. Pair with BGW default (avgcut=1e12) <-> true.
+mc_average_vcoul_body = false
+# zeta_rcond default moved 1e-10 -> 1e-6 -> 1e-8 after this anchor was first
+# frozen; pin it so the gate cannot drift with a default.
+zeta_rcond = 1e-10
