@@ -1334,6 +1334,73 @@ def test_cusolvermp_wrapper_refuses_compute_evecs_false_without_a_gpu():
     assert "status=7" in str(exc.value) and "L-3" in str(exc.value)
 
 
+# ---------------------------------------------------------------------------
+# Guard 2d — bug L-4: SLATE CUDA eigh SIGSEGVs at n >= 4096 on a multi-rank
+# mesh.  The CUDA sibling of L-2, and the reason the guard is SIZE-scoped.
+# ---------------------------------------------------------------------------
+
+def test_resolve_slate_cuda_eigh_refuses_at_4096(monkeypatch):
+    R = _mock_cuda_capabilities(monkeypatch, nproc=4)
+    mesh = _FakeCudaMesh(2, 2)
+    with pytest.raises(RuntimeError) as exc:
+        R.resolve_backend("eigh", "slate", mesh, n=4096)
+    msg = str(exc.value)
+    assert "SIGSEGV" in msg and "56457930" in msg
+    assert "gpu_slate4096_segv.log" in msg
+    # Larger still refuses.
+    with pytest.raises(RuntimeError, match="SIGSEGV"):
+        R.resolve_backend("eigh", "slate", mesh, n=8192)
+
+
+def test_resolve_slate_cuda_eigh_still_resolves_at_2048(monkeypatch):
+    """RED TWIN: the guard is size-scoped, and must stay that way.
+
+    SLATE eigh RETURNS on the same mesh at n <= 2048 (0.401/0.546/1.387/
+    5.444 s at 64/256/1024/2048, jobid 56447670).  A guard that refused
+    the whole backend would delete a working route on the strength of one
+    crash at one size — and the crash is the reason ROCm's `distributed`
+    eigh maps to slate at all, so "just remove slate" is not available.
+
+    Also pinned: the guard does NOT reach a 1x1 CUDA mesh (that case is
+    UNMEASURED, and this package refuses only what someone has watched
+    fail), does not reach a CPU mesh at n=4096 (guard 2b gets there first
+    and says something different and correct), and does not fire when
+    ``n`` is unknown.
+    """
+    R = _mock_cuda_capabilities(monkeypatch, nproc=4)
+    mesh = _FakeCudaMesh(2, 2)
+    assert R.resolve_backend("eigh", "slate", mesh, n=2048) == "slate"
+    assert R.resolve_backend("eigh", "slate", mesh, n=1024) == "slate"
+    assert R.resolve_backend("eigh", "slate", mesh) == "slate"
+    # 1x1 CUDA: unmeasured at 4096, so NOT refused by 2d.
+    R1 = _mock_cuda_capabilities(monkeypatch, nproc=1)
+    assert R1.resolve_backend("eigh", "slate", _FakeCudaMesh(1, 1),
+                              n=4096) == "slate"
+
+
+def test_resolve_slate_cpu_eigh_at_4096_still_says_the_L2_thing(monkeypatch):
+    """Guard 2b owns the CPU mesh; 2d must not steal its message.
+
+    Both refuse, and a reader who gets the wrong one is sent to the wrong
+    bug: L-2 is "SLATE host heev always, down to 1x1", L-4 is "SLATE CUDA
+    at n >= 4096".  The refusal that fires must name the platform it
+    actually saw.
+    """
+    R = _mock_cuda_capabilities(monkeypatch, nproc=1)
+    from types import SimpleNamespace
+
+    class _FakeCpuMesh:
+        shape = {"x": 1, "y": 1}
+        devices = SimpleNamespace(flat=[SimpleNamespace(platform="cpu")],
+                                  size=1)
+
+    with pytest.raises(RuntimeError) as exc:
+        R.resolve_backend("eigh", "slate", _FakeCpuMesh(), n=4096)
+    msg = str(exc.value)
+    assert "L-2" in msg and "CPU meshes" in msg
+    assert "56457930" not in msg
+
+
 @needs_host_ffi
 def test_plan_batched_matches_the_backend_call_cpu():
     """``plan.batched`` on the CPU distributed eigh == the raw wrapper.

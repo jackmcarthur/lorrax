@@ -14,6 +14,8 @@ lives here, applied in ONE fixed order — SEVEN steps, all at resolve time:
     2b. known-broken— slate eigh on a CPU mesh (bug L-2: SIGSEGV)
     2c. known-broken— cusolvermp eigh with ``compute_evecs=False``
                       (bug L-3: cusolverMpSyevd status=7 at every n)
+    2d. known-broken— slate eigh at n >= 4096 on a multi-rank CUDA mesh
+                      (bug L-4: SIGSEGV, the CUDA sibling of L-2)
     3. capability   — is the backend's FFI handler actually usable?
                       (``loader.probe_target``, which separates "the
                       library would not load" from "the library has no
@@ -651,6 +653,45 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
             "defect, not a LORRAX one.  Use compute_evecs=True (the "
             "default, and what LORRAX wants everywhere) and ignore the "
             "eigenvectors, or 'off'/'auto' for jnp.linalg.eigvalsh.")
+
+    # 2d. KNOWN-BROKEN combination (bug L-4, found by the step-6 eigh
+    # investigation).  SLATE's eigh on a MULTI-RANK CUDA mesh SIGSEGVs at
+    # n >= 4096 — deterministic, and it takes the whole 4-process job down
+    # (srun rc=139, "nid001088: task 0: Segmentation fault", the other
+    # three ranks then aborted by the coordination service).  This is the
+    # CUDA sibling of bug L-2 above: same library, same routine family,
+    # same failure mode, different platform and a size threshold instead
+    # of "always".
+    #
+    # AUTHORITATIVE ARTIFACT: _reports/gpu_slate4096_segv.log, jobid
+    # 56457930 — a leg run for no other purpose than to produce this
+    # evidence, because the size sweep SKIPS the cell (a crash there would
+    # take the other 20 rows with it).
+    #
+    # WHY n >= 4096 AND NOT ALL n: SLATE eigh RAN on the same mesh and the
+    # same job class at n = 64/256/1024/2048 (0.401 / 0.546 / 1.387 /
+    # 5.444 s, jobid 56447670) — it is slow and scales badly, but it
+    # returns.  Refusing it everywhere would delete a working backend.
+    #
+    # WHY multi-rank AND NOT 1x1: the crash was only ever produced on the
+    # 2x2.  A single-device CUDA mesh at n >= 4096 is UNMEASURED, and this
+    # package does not refuse things nobody has seen fail.
+    #
+    # 4096 IS THE SMALLEST SIZE MEASURED TO CRASH, not a fitted boundary:
+    # nothing between 2048 and 4096 was tried, so the true threshold is
+    # somewhere in (2048, 4096].  Erring toward refusal is right when the
+    # failure mode is a SIGSEGV with no Python traceback.
+    if (op == "eigh" and requested == "slate" and platform == "CUDA"
+            and px * py > 1 and n is not None and int(n) >= 4096):
+        raise RuntimeError(
+            f"eigh backend 'slate' is REJECTED at n={int(n)} on the "
+            f"multi-rank CUDA mesh {px}x{py}: SLATE's CUDA eigh SIGSEGVs "
+            f"deterministically at n >= 4096 and kills every rank of the "
+            f"job (bug L-4; srun rc=139 on a 4-process 2x2, jobid "
+            f"56457930, _reports/gpu_slate4096_segv.log).  It RUNS at "
+            f"n <= 2048 on the same mesh, so this refusal is size-scoped, "
+            f"not a removal.  Use 'distributed' (= cuSOLVERMp on CUDA) or "
+            f"'off'/'auto' for the replicated jnp.linalg.eigh.")
 
     # 3. compiled capability
     #

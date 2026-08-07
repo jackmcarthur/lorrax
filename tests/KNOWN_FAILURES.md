@@ -314,6 +314,34 @@ both, because `Plan.__call__` forwards `**kwargs` straight to the wrapper
 A caller who wants eigenvalues only should pass `compute_evecs=True` and
 ignore `Q`, or use `jnp.linalg.eigvalsh`.
 
+### **L-4 — SLATE `eigh` SIGSEGVs at n ≥ 4096 on a multi-rank CUDA mesh** (library defect, now REFUSED at resolve time)
+
+| | |
+|---|---|
+| tests | none go red: the combination is refused before it can run.  Contract cells `test_resolve_slate_cuda_eigh_refuses_at_4096`, `test_resolve_slate_cuda_eigh_still_resolves_at_2048`, `test_resolve_slate_cpu_eigh_at_4096_still_says_the_L2_thing` |
+| class | (e) third-party library defect — the **CUDA sibling of L-2** (SLATE host `heev`), same library, same routine family |
+| evidence | `srun: error: nid001088: task 0: Segmentation fault` → step exit **139**, all four ranks down.  jobid **56457930**, `/pscratch/sd/j/jackm/svc_distrib_la_perf/_reports/gpu_slate4096_segv.log` — a leg run for the sole purpose of producing this artifact |
+| covering leg | the step-6 `gpu_slate4096` leg.  **NOT** `gpu_cross_size.log:51`, which the brief flagged as overwritten: that file now shows the *skip* line, not the crash |
+
+The size sweep **skips** this cell (`gpu_cross_size.log:35`, "slate nq=0
+n=4096 -> SKIPPED (known SIGSEGV at n>=4096)") because a crash there takes
+the other 20 rows down with it.  The dedicated leg exists so the skip is
+backed by an artifact rather than by a memory.
+
+**SIZE-SCOPED, not a removal.**  SLATE eigh RETURNS on the same 2×2 CUDA
+mesh at every smaller size measured — 0.401 / 0.546 / 1.387 / 5.444 s at
+n = 64 / 256 / 1024 / 2048 (jobid 56447670).  Refusing the whole backend
+would delete a working route, and `distributed` eigh on **ROCm** maps to
+slate, so "delete slate" is not on the table either.  Nothing between 2048
+and 4096 was tried, so the true threshold is somewhere in (2048, 4096];
+4096 is the smallest size measured to crash, and erring toward refusal is
+correct when the failure mode is a SIGSEGV with no Python traceback.
+
+**A 1×1 CUDA mesh at n ≥ 4096 is UNMEASURED and is NOT refused.**  The
+crash was only ever produced multi-rank.  Guard 2d says so, and a contract
+cell pins it — this package refuses what someone has watched fail, not
+what seems likely.
+
 ### **L1 — the two platform `.so`s cross-wire their phdf5 through RTLD_GLOBAL** (latent, registered by B1's fix)
 
 | | |
