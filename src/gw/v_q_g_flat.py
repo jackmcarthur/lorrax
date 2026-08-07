@@ -40,8 +40,13 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from .gw_config import env_bool
 
-if TYPE_CHECKING:
-    from file_io.zeta_loader import ZetaLoader
+if TYPE_CHECKING:                       # pragma: no cover — typing only
+    # The DOOR, top-level name only.  No ``ensure_on_path()`` bootstrap is
+    # needed here and none is added: this import never executes (the
+    # module has ``from __future__ import annotations``, so the annotation
+    # it feeds is a string), and a runtime path edit smuggled into a
+    # typing-only block is how a "type-checking import" stops being one.
+    from zeta_loader import ZetaLoader
 
 
 # ---------------------------------------------------------------------------

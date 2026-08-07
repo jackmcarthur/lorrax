@@ -41,6 +41,33 @@ from .gw_config import (
 	resolve_xla_gpu_memory_env,
 )
 
+# ── The ζ file's DOOR ────────────────────────────────────────────────────
+# ``zeta_q.h5`` (and its bispinor siblings) has exactly one owner, the
+# ``zeta_loader`` service package under ``services/``.  This module reaches
+# it through the TOP-LEVEL package only: ``zeta_loader.format`` /
+# ``zeta_loader.loader`` are past-the-door edges and
+# ``tests/test_layering.py`` fails on them.
+#
+# ``ffi._services.ensure_on_path()`` is why the import below resolves in a
+# bare launch — nothing in the launch chain knows ``services/`` exists
+# (``lx`` rewrites the container PYTHONPATH to exactly ``<checkout>/src``).
+# Transitional plumbing with an owner decision behind it; see
+# ``src/ffi/_services.py``.
+#
+# THREE NAMES, THREE FORMER RAW-h5py SITES.  ``probe_zeta_file`` replaced
+# the two hand-written copies of the dataset-name/μ-axis dispatch below
+# (``_check_zeta_h5_matches_basis`` and ``_zeta_reuse_ok``) — that tuple is
+# spelled ONCE now, in the service, and this comment deliberately does not
+# spell it a fourth time; ``ZetaLoader`` replaced the raw ``n_rmu_T`` shape
+# read; ``write_g0_mu`` replaced the raw ``del``+``create_dataset`` append.
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                               # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from zeta_loader import (                                        # noqa: E402
+	ZetaLoader, probe_zeta_file, write_g0_mu)
+
 
 def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print,
                                  *, fft_grid=None):
@@ -65,7 +92,11 @@ def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print,
 	   *legacy r-space* dataset name.  Every production run since the G-flat
 	   migration writes ``zeta_q_G`` instead, so ``f.get('zeta_q')`` returned
 	   ``None`` and the guard silently passed on exactly the files it was
-	   written to protect.  Both names are probed now.
+	   written to protect.  Both names are probed now, and the probe is
+	   :func:`zeta_loader.probe_zeta_file` rather than a copy of the dispatch
+	   written out here: that copy, and its twin in :func:`_zeta_reuse_ok`,
+	   are how one truth came to be spelled three times and two of the three
+	   were wrong for months.
 	2. **``zeta_is_done``.**  The writer stamps this ``False`` up front and
 	   flips it via ``mark_zeta_done`` only after the last chunk lands.  It
 	   was written but never read by anybody, so a ζ from a job that died
@@ -76,30 +107,21 @@ def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print,
 	"""
 	if not os.path.exists(zeta_h5_path):
 		return
-	existing = None
-	zeta_done = None
-	header_grid = None
-	try:
-		with h5py.File(zeta_h5_path, 'r') as f:
-			# G-flat (production): (n_q, n_rmu, ngkmax).
-			# r-space (legacy):    (n_q, n_rtot, n_rmu).
-			for _name, _mu_axis in (('zeta_q_G', 1), ('zeta_q', 2)):
-				dset = f.get(_name)
-				if dset is not None and dset.ndim == 3:
-					existing = int(dset.shape[_mu_axis])
-					break
-			hdr = f.get('isdf_header')
-			if hdr is not None:
-				if 'zeta_is_done' in hdr:
-					zeta_done = bool(np.asarray(hdr['zeta_is_done'])[()])
-				cent = hdr.get('centroids/r_mu_fft_idx')
-				if cent is not None:
-					header_grid = np.asarray(cent, dtype=np.int64)
-	except Exception as exc:
+	# ONE open, one pass, and it NEVER RAISES — which is the whole reason
+	# this guard can run before the fit that is about to overwrite the
+	# file.  ``probe.error`` is the ``f"{type(exc).__name__}: {exc}"`` this
+	# site used to format itself, so the print below is unchanged.
+	probe = probe_zeta_file(zeta_h5_path)
+	if not probe.readable:
 		# Unreadable/partial file: say so, then let the writer deal with it.
+		# ``readable=False`` with the file present means exactly what the
+		# ``except Exception`` here used to catch.
 		print_fn(f"  [zeta guard] could not read {zeta_h5_path} "
-		         f"({type(exc).__name__}: {exc}); continuing.")
+		         f"({probe.error}); continuing.")
 		return
+	existing = probe.mu_extent          # μ off the ζ BLOCK (dispatch: door)
+	zeta_done = probe.zeta_done         # isdf_header/zeta_is_done
+	header_grid = probe.r_mu_fft_idx    # isdf_header/centroids/r_mu_fft_idx
 	if existing is not None and existing != int(n_rmu):
 		raise ValueError(
 			f"{zeta_h5_path} holds a ζ for n_mu={existing}, but this run has "
@@ -492,20 +514,17 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		# can pass every check above and still hold a ζ of the wrong
 		# shape — e.g. a run killed after the header write, or a
 		# transverse ζ left over from a different centroids_file_current.
-		_ext = None
-		try:
-			with h5py.File(zeta_h5_path, 'r') as f:
-				# G-flat (production): (n_q, n_rmu, ngkmax).
-				# r-space (legacy):    (n_q, n_rtot, n_rmu).
-				for _name, _mu_axis in (('zeta_q_G', 1), ('zeta_q', 2)):
-					_d = f.get(_name)
-					if _d is not None and _d.ndim == 3:
-						_ext = int(_d.shape[_mu_axis])
-						break
-		except Exception as exc:
+		# Same door, same never-raising contract as
+		# :func:`_check_zeta_h5_matches_basis` — this site and that one
+		# were the two hand-written copies of the layout dispatch, and the
+		# probe is the one copy now.  ``probe.error`` is the
+		# ``f"{type(exc).__name__}: {exc}"`` this site used to format.
+		_probe = probe_zeta_file(zeta_h5_path)
+		if not _probe.readable:
 			print_fn(f"    [zeta reuse] {zeta_h5_path}: ζ dataset unreadable "
-			         f"({type(exc).__name__}: {exc}) — refitting.")
+			         f"({_probe.error}) — refitting.")
 			return False
+		_ext = _probe.mu_extent
 		if _ext is None:
 			print_fn(f"    [zeta reuse] {zeta_h5_path} has an isdf_header but "
 			         f"NO ζ dataset (neither zeta_q_G nor zeta_q) — "
@@ -1197,8 +1216,17 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# files.
 		# n_rmu_T from the transverse ζ dataset shape on disk
 		# (fit_zeta_to_h5 writes all ζ files in G-flat layout).
-		with h5py.File(zeta_T_paths[0], 'r') as f:
-			n_rmu_T = int(f['zeta_q_G'].shape[1])
+		# HEADER-ONLY (``mesh=None``): no SlabIO handle, no phdf5 FFI, no
+		# collective — the same one serial-h5py open the raw
+		# ``f['zeta_q_G'].shape[1]`` here did, through the reader that owns
+		# the layout.  ``n_rmu_disk`` IS axis 1 in G-flat and axis 2 in
+		# r-space, which is the dispatch this line used to assume.  The
+		# loader's open-time refusals (zeta_is_done, header-vs-dataset μ,
+		# header-vs-dataset ngkmax) come along, and they are a strict
+		# SUBSET of what the ``ZetaLoader(zeta_T_paths[0], mesh=mesh_xy)``
+		# fifteen lines below already applies to this very file.
+		with ZetaLoader(zeta_T_paths[0]) as _z_T0:
+			n_rmu_T = int(_z_T0.n_rmu_disk)
 		n_rmu_C = int(meta.n_rmu)
 
 		with timing.section("gw_jax.V_q_compute"), \
@@ -1208,7 +1236,6 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			# μ × ν tiling / in-V_q FFT — see
 			# gw.v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5.
 			from .v_q_bispinor import compute_V_q_bispinor_g_flat_to_h5
-			from file_io.zeta_loader import ZetaLoader
 			with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
 			                ) as zc, \
 			     ZetaLoader(zeta_T_paths[0], mesh=mesh_xy,
@@ -1263,7 +1290,6 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# routes to ``v_q_g_flat.compute_all_V_q_g_flat``; any other
 		# layout raises.  ``ZetaLoader`` is the V_q reader of record —
 		# it serves the writer's per-q WFN.h5-style G-sphere directly.
-		from file_io.zeta_loader import ZetaLoader
 		with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 			with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
 			                ) as zeta_io:
@@ -1299,15 +1325,22 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	from common.collectives import gather_to_host as _gather_to_host
 	G0_gathered = _gather_to_host(G0_all)
 	if jax.process_index() == 0:
-		with h5py.File(zeta_h5_path, 'a') as f:
-			if 'g0_mu' in f:
-				del f['g0_mu']
-			# Clip the μ axis to the LOGICAL extent: files on disk store
-			# logical extents so they re-read identically on any process
-			# count (G0_all is at the in-memory padded extent, pad
-			# entries exact zeros).
-			_g0_np = np.asarray(G0_gathered)[..., :int(meta.n_rmu)]
-			f.create_dataset('g0_mu', data=_g0_np)
+		# Clip the μ axis to the LOGICAL extent: files on disk store
+		# logical extents so they re-read identically on any process
+		# count (G0_all is at the in-memory padded extent, pad
+		# entries exact zeros).  THE CLIP STAYS HERE, at the call site,
+		# because only this caller knows which of its axes is μ; the door
+		# takes ``n_rmu_expected`` and turns "the caller clipped
+		# correctly" from a convention into a check.
+		_g0_np = np.asarray(G0_gathered)[..., :int(meta.n_rmu)]
+		# THE ONE sanctioned post-close serial append into a ζ file.  The
+		# rank-0 gate and the barrier below are the CALLER's on purpose
+		# (``write_g0_mu``'s docstring: putting the gate inside would make
+		# it look safe to call anywhere, and the failure that hides is
+		# silent concurrent-writer corruption).  Ordering is unchanged:
+		# after ``gather_to_host``, after every collective handle has
+		# closed, rank-0 only, barrier'd.
+		write_g0_mu(zeta_h5_path, _g0_np, n_rmu_expected=int(meta.n_rmu))
 	barrier("g0_write")
 
 	# Scalar V_qmunu is just (nq, μ, μ).  The (1, npol, npol) leading
