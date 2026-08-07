@@ -66,7 +66,8 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la.resolve import NATIVE, OPS, backend_module, resolve_backend
+from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
+                                resolve_backend)
 
 __all__ = ["Plan", "plan", "ensure_sharding"]
 
@@ -160,9 +161,14 @@ _IMPL: dict[tuple[str, str], dict[str, Any]] = {
     ("solve_lu", "scalapack"):  dict(one=None,
                                      many="batched_distributed_solve_lu",
                                      post=None),
+    # native2d is pure JAX, but it routes through the same table: its
+    # kernel is a single lax.map over the whole q axis, so it has a
+    # stacked entry and no single-tile one, exactly like cuSOLVERMp's
+    # batched potrf.  Nothing about calling it is special-cased.
+    ("cholesky", NATIVE2D):     dict(one=None, many="cholesky", post=None),
 }
 
-#: Ops whose NATIVE path is a single JAX call the plan can run itself.
+#: Ops whose ``native`` path is a single JAX call the plan can run itself.
 #: ``cholesky``/``solve_lu`` are not: their native routes are the
 #: replicated dense factor / per-q ridged solve chosen by a channel policy
 #: this module has no business duplicating.
@@ -237,7 +243,8 @@ class Plan:
     def native_fn(self) -> Callable:
         """A PURE, TRACE-SAFE closure for this plan's math.
 
-        Available on native plans only, and that restriction is the point:
+        Available on the pure-JAX backends only, and that restriction is
+        the point:
         the FFI wrappers must call ``jax.process_count()`` and dlopen a
         library, so they cannot live inside somebody else's trace.  This
         closure contains none of those, so it can be built once at plan
@@ -249,16 +256,20 @@ class Plan:
         vendor dependency are not a quarantine violation, and splitting one
         of them once cost 10.1 GiB/device and killed a 16×A100 run.
         """
-        fn = _NATIVE_CALLABLE.get(self.op) if self.is_native else None
-        if fn is None:
-            raise NotImplementedError(
-                f"native_fn is defined for native plans of "
-                f"{sorted(_NATIVE_CALLABLE)} only; this plan is "
-                f"{self.op}/{self.backend}.  An FFI backend's wrapper is "
-                f"eager by construction (it dlopens a library and reads "
-                f"jax.process_count()), so there is no trace-safe closure "
-                f"to hand out — call the plan itself.")
-        return fn
+        if self.is_native:
+            fn = _NATIVE_CALLABLE.get(self.op)
+            if fn is not None:
+                return fn
+        elif self.backend == NATIVE2D:
+            impl = getattr(self.module, _IMPL[(self.op, self.backend)]["many"])
+            mesh = self.mesh
+            return lambda A, **kw: impl(A, mesh=mesh, **kw)
+        raise NotImplementedError(
+            f"native_fn is defined for the pure-JAX backends only; this "
+            f"plan is {self.op}/{self.backend}.  An FFI backend's wrapper "
+            f"is eager by construction (it dlopens a library and reads "
+            f"jax.process_count()), so there is no trace-safe closure to "
+            f"hand out — call the plan itself.")
 
     def describe(self) -> str:
         """One line for a run banner: what resolved, and to what geometry."""

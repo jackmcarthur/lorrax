@@ -1,7 +1,7 @@
 """Backend resolution — the ONE guard ladder.
 
-A requested backend name (``auto | off | distributed | cusolvermp |
-slate | scalapack``, per op) becomes a concrete,
+A requested backend name (``auto | off | distributed | native2d |
+cusolvermp | slate | scalapack``, per op) becomes a concrete,
 *guaranteed-callable* backend, or a clear resolve-time error.  Every guard
 lives here, applied in ONE fixed order — SEVEN steps, all at resolve time:
 
@@ -59,6 +59,7 @@ from distrib_la import loader
 __all__ = [
     "OPS",
     "NATIVE",
+    "NATIVE2D",
     "BACKEND_CHOICES",
     "EIGH_BACKENDS",
     "CHOLESKY_BACKENDS",
@@ -79,6 +80,15 @@ OPS = ("eigh", "cholesky", "solve_lu")
 #: measured default for every op at production tile sizes.
 NATIVE = "native"
 
+#: The 2-D block-distributed tiled Cholesky (:mod:`distrib_la._native2d`).
+#: Also pure JAX and also available on every platform, but a DIFFERENT
+#: algorithm with a different memory profile, which is why it is a backend
+#: and not a mode of ``native``: at n=10k on P=128 the replicated-reshard
+#: route costs 1.6 GB/device and this one 5 MB/device.  ``auto`` never
+#: picks it -- choosing an algorithm whose cost model differs by three
+#: orders of magnitude in BOTH directions is the caller's decision.
+NATIVE2D = "native2d"
+
 #: Per-op user vocabulary (requested names).  ``auto``/``off`` resolve to
 #: ``native``; the rest name a concrete implementation.  ``distributed``
 #: is the PLATFORM-DEFAULT distributed backend (:data:`_DISTRIBUTED_DEFAULT`);
@@ -90,7 +100,7 @@ NATIVE = "native"
 BACKEND_CHOICES = {
     "eigh":     ("auto", "off", "distributed", "cusolvermp", "slate",
                  "scalapack"),
-    "cholesky": ("auto", "off", "cusolvermp", "slate"),
+    "cholesky": ("auto", "off", "native2d", "cusolvermp", "slate"),
     "solve_lu": ("auto", "off", "distributed", "cusolvermp", "scalapack"),
 }
 EIGH_BACKENDS = BACKEND_CHOICES["eigh"]
@@ -349,8 +359,9 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
                     n: int | None = None) -> str:
     """Resolve a requested backend name for ``op`` on ``mesh_xy``.
 
-    Returns the concrete backend to run: ``"native"`` or one of the FFI
-    backend names (``"cusolvermp" | "slate" | "scalapack"``).  A returned FFI name is a *promise*: its handler is compiled into the
+    Returns the concrete backend to run: ``"native"``, ``"native2d"``, or
+    one of the FFI backend names (``"cusolvermp" | "slate" | "scalapack"``).
+    A returned FFI name is a *promise*: its handler is compiled into the
     loaded library and every mesh guard passed — the subsequent call cannot
     fail for an availability/geometry reason.
 
@@ -373,7 +384,8 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
         a caller that will pad to ``n`` can ask about ``n`` before it has
         built anything (``gw.sc_iteration`` does exactly that).  When
         given, the FFI backends additionally require ``n`` divisible by
-        both mesh axes (guard 6).
+        both mesh axes (guard 6) and ``native2d`` a legal tile
+        decomposition.
 
     Notes
     -----
@@ -408,6 +420,19 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
         return NATIVE
 
     px, py = _mesh_shape(mesh_xy)
+
+    if requested == NATIVE2D:
+        # Pure JAX: no library to probe, no one-process-per-device rule,
+        # every platform.  Its one real constraint is that the matrix must
+        # decompose into tiles the mesh divides, and that is checked HERE
+        # rather than at call time for the same reason every other guard is
+        # (bug L-1: a rule enforced only at call time turns a returned
+        # backend name into a broken promise).
+        if n is not None:
+            from distrib_la._native2d import block_size_for
+            block_size_for(int(n), px, py)          # raises with the reason
+        return NATIVE2D
+
     requested_spelling = requested   # keep the user's spelling for messages
     if requested == "distributed":
         # "Spread ONE tile over the whole mesh, with whatever library this
@@ -535,8 +560,8 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
 
 def _available(op: str, mesh_xy) -> list[str]:
     """Names of the backends that would pass guards 2–4 for ``op`` on this
-    mesh (native always qualifies)."""
-    out = [NATIVE]
+    mesh (the pure-JAX ones always qualify)."""
+    out = [NATIVE] + ([NATIVE2D] if NATIVE2D in BACKEND_CHOICES[op] else [])
     platform = mesh_platform(mesh_xy)
     for (o, b), (target, platforms) in _SPEC.items():
         if o != op or platform not in platforms:
@@ -572,7 +597,7 @@ def list_backends(op: str, mesh_xy) -> dict[str, str]:
 
 
 def backend_module(backend: str):
-    """THE import seam for the FFI backend modules.
+    """THE import seam for the backend implementation modules.
 
     Everything that needs a backend implementation goes through here (after
     :func:`resolve_backend` said it is usable), so one place knows the
@@ -581,9 +606,14 @@ def backend_module(backend: str):
         mod = backend_module("cusolvermp")
         L = mod.batched_distributed_cholesky(C_q, mesh=mesh)
 
-    Raises ``ValueError`` for names that are not FFI backends — ``native``
-    is pure JAX and has no vendor module.
+    ``native`` is the one backend with NO module: it is ``jnp.linalg.eigh``
+    plus the caller's own channel-policy routes, which is exactly what
+    "native" means.  Everything else — including the pure-JAX ``native2d``
+    — has an implementation module, and this is where its name lives.
     """
+    if backend == NATIVE2D:
+        from distrib_la import _native2d
+        return _native2d
     if backend == "cusolvermp":
         from distrib_la import _cusolvermp
         return _cusolvermp
@@ -595,4 +625,5 @@ def backend_module(backend: str):
         return _scalapack
     raise ValueError(
         f"no FFI backend module named {backend!r} "
-        f"(known: cusolvermp, slate, scalapack; 'native' is pure JAX).")
+        f"(known: cusolvermp, slate, scalapack, native2d; 'native' is "
+        f"jnp + the caller's own routes and has no module).")
