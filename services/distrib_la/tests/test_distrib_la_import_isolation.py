@@ -46,13 +46,16 @@ _LXKIT_SRC = os.path.join(_SERVICES, "lxkit", "src")
 _REPO = os.path.dirname(_SERVICES)
 _LORRAX_SRC = os.path.join(_REPO, "src")
 
-#: distrib_la's declared runtime dependency, plus what jax itself needs to
-#: import.  The child gets these back BY NAME through ``deps=`` — naming
-#: them is the claim, and anything not named must be unreachable.
-#: :func:`lxkit.testing.dep_dirs` resolves each to where it ACTUALLY lives,
-#: which is not ``purelib`` inside the Perlmutter Shifter image; that
-#: measurement now lives in lxkit, with the rest of the harness policy.
-_DEPS = ("jax", "jaxlib", "numpy", "scipy", "ml_dtypes", "opt_einsum")
+#: distrib_la's declared runtime dependencies, handed to the child BY NAME
+#: through ``deps=``.  Naming them is the claim, and anything not named —
+#: nor in a named package's own declared requirements, which
+#: :func:`lxkit.testing.dep_dirs` follows transitively — must stay
+#: unreachable.  dep_dirs resolves each to where it ACTUALLY lives, which
+#: is not ``purelib`` inside the Perlmutter Shifter image (jax there is a
+#: source checkout at /opt/jax behind an editable finder hook that
+#: ``python -S`` skips); that measurement lives in lxkit with the rest of
+#: the harness policy.
+_DEPS = ("jax",)
 
 #: What distrib_la must not touch.  Derived from the monorepo when it is
 #: there, so a new top-level lorrax package is covered the day it lands.

@@ -262,7 +262,33 @@ class IsolationRun(NamedTuple):
     reachable: tuple[tuple[str, str], ...]   #: (root, sys.path entry) pairs
 
 
-def dep_dirs(names: Iterable[str]) -> list[str]:
+def _declared_requirements(name: str) -> tuple[str, ...]:
+    """What ``name``'s installed distribution says it needs.
+
+    From the METADATA the installer wrote, via stdlib
+    ``importlib.metadata`` — no third-party resolver, and no hand-kept
+    list.  Environment markers are DROPPED rather than evaluated: a
+    requirement that does not apply here simply will not resolve, and
+    :func:`dep_dirs` already drops what it cannot find, so evaluating
+    markers would add a parser to save nothing.
+    """
+    try:
+        from importlib.metadata import requires as _requires
+        reqs = _requires(name) or []
+    except Exception:                                          # noqa: BLE001
+        return ()
+    out = []
+    for req in reqs:
+        head = req.split(";")[0].strip()
+        for sep in ("<", ">", "=", "!", "~", "[", "(", " "):
+            head = head.split(sep)[0]
+        head = head.strip().replace("-", "_")
+        if head:
+            out.append(head)
+    return tuple(out)
+
+
+def dep_dirs(names: Iterable[str], *, closure: bool = True) -> list[str]:
     """The directories THIS interpreter resolved ``names`` from.
 
     NOT ``sysconfig.get_paths()['purelib']``, which is the obvious answer
@@ -292,6 +318,27 @@ def dep_dirs(names: Iterable[str]) -> list[str]:
     naming a dependency is the claim, and anything unnamed must stay
     unreachable, which is what the isolation check measures.
 
+    ``closure=True`` follows each name's DECLARED requirements
+    (:func:`_declared_requirements`) transitively.  Also measured, also on
+    Perlmutter: naming ``pytest`` is not enough to import pytest.  The
+    child got the directory ``_pytest`` lives in and died anyway ---
+
+        File ".../_pytest/_io/terminalwriter.py", line 13, in <module>
+          import pygments
+        ModuleNotFoundError: No module named 'pygments'
+
+    --- because ``pygments`` is installed somewhere else on that machine.
+    Hand-maintaining a package's transitive closure in a test file is a
+    losing game with a quiet failure mode, and the installer already
+    wrote the answer down.  Set ``closure=False`` to hand over exactly the
+    names given, which is what a cell asserting something about a
+    SPECIFIC dependency wants.
+
+    Naming a dependency stays the claim either way: the closure of a
+    declared dependency is a declared dependency, and the forbidden roots
+    are asserted unreachable regardless of how many legitimate library
+    directories arrive.
+
     A name this interpreter cannot resolve is silently dropped: the child
     would not have been able to import it either, and a hard error here
     would turn "scipy is not installed" into a test failure about
@@ -299,7 +346,16 @@ def dep_dirs(names: Iterable[str]) -> list[str]:
     directory to hand over.
     """
     out: list[str] = []
-    for name in names:
+    seen: set[str] = set()
+    queue = list(names)
+    while queue:
+        name = queue.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        if closure:
+            queue.extend(r for r in _declared_requirements(name)
+                         if r not in seen)
         try:
             spec = importlib.util.find_spec(name)
         except Exception:                                      # noqa: BLE001

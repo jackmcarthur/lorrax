@@ -83,6 +83,43 @@ if "jax" not in sys.modules:
 # does this for the monorepo suite; a service-only run has no tests/conftest.
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 
+# ---------------------------------------------------------------------------
+# ONE GPU PER PROCESS.  Not a preference — the FFI backends refuse otherwise.
+# ---------------------------------------------------------------------------
+# MEASURED, Perlmutter 2026-08-07, `lx test -- services/lxkit/tests
+# services/distrib_la/tests` (one task, all four GPUs, no tests/conftest.py
+# in the load path because the arguments are service directories):
+#
+#   FAILED_PRECONDITION: slate.potrf: blas::get_device_count()=4 but JAX
+#   one-process-per-GPU model requires exactly 1.
+#
+# EIGHT contract cells (slate potrf / batched_potrf / eigh, and the
+# bse_setup wiring cell on top of them) died on it.  The .so was fine, the
+# pins were right, the mesh was 1x1 — the process could simply SEE four
+# GPUs, which SLATE reads through blas::get_device_count() and refuses.
+#
+# tests/conftest.py already does this for the monorepo suite, per pytest-
+# xdist worker (gw0 -> GPU 0, ...), and that is why the full-suite leg
+# never hit it.  The service suite is run BY PATH, which never loads that
+# conftest, so the pinning has to live here too.  Same mapping through the
+# existing CUDA_VISIBLE_DEVICES list, so SLURM's selection is respected;
+# without a worker id the process takes the FIRST device, because these
+# cells are single-process 1x1 by construction (`_ffi_state` refuses
+# anything else and points at the CLI mode) and a 1x1 mesh over one of four
+# visible GPUs is the same computation with three idle devices and a
+# refusing library.
+#
+# Guarded on `"jax" not in sys.modules` for the same reason as XLA_FLAGS:
+# CUDA_VISIBLE_DEVICES is read once, at backend init.  In a full-suite run
+# tests/conftest.py has already pinned correctly and this is a no-op.
+_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+if "jax" not in sys.modules and _cvd:
+    _devs = [d for d in _cvd.split(",") if d != ""]
+    if len(_devs) > 1:
+        _wid = os.environ.get("PYTEST_XDIST_WORKER", "")
+        _i = int(_wid[2:]) % len(_devs) if _wid.startswith("gw") else 0
+        os.environ["CUDA_VISIBLE_DEVICES"] = _devs[_i]
+
 from lxkit.testing import (                        # noqa: E402,F401
     AllowedSkip, arm_skip_honesty, gate_state,     # gate_state is autouse
     machine_profile, pytest_runtest_logreport, pytest_sessionfinish,

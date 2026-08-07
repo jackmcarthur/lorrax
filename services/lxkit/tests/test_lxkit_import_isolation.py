@@ -46,10 +46,18 @@ _LXKIT_SRC = os.path.join(os.path.dirname(_TESTS), "src")
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(_TESTS)))
 _LORRAX_SRC = os.path.join(_REPO, "src")
 #: What a child needs back to import the module under test at all.  Handed
-#: over BY NAME (see the module docstring); anything not named here must be
-#: unreachable in the child, which is what the isolation check measures.
-_PYTEST_DEPS = ("pytest", "pluggy", "iniconfig", "packaging")
-_JAX_DEPS = ("jax", "jaxlib", "numpy", "scipy", "ml_dtypes", "opt_einsum")
+#: over BY NAME (see the module docstring); anything not named here — and
+#: not in a named package's own DECLARED requirements, which
+#: :func:`lxkit.testing.dep_dirs` follows — must be unreachable in the
+#: child, which is what the isolation check measures.
+#:
+#: ONE NAME EACH, on purpose.  A hand-kept transitive list is a losing game
+#: with a quiet failure mode: this pair used to spell out pluggy/iniconfig/
+#: packaging and STILL died inside the Perlmutter image on `import
+#: pygments`, three frames deep in pytest's terminal writer.  The installer
+#: wrote the closure down; dep_dirs reads it.
+_PYTEST_DEPS = ("pytest",)
+_JAX_DEPS = ("jax",)
 
 #: Roots a standalone lxkit must not touch.  Derived from the monorepo when
 #: it is there (so a new top-level package is covered the day it lands),
