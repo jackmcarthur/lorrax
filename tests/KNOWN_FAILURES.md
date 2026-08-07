@@ -636,6 +636,19 @@ cells all green.**  The 30 are the two-armed load-order cells and the two
 capability tables (B1) and the controller cells (B2); the xdist twin skips
 on WSL for want of the plugin and runs on Perlmutter.
 
+Re-measured again across the step-6 follow-up, `b425291` → `d880e67`:
+**1471 → 1480 collected, 95 → 95 red, 185 → 185 skipped, 0 removed,
+0 newly red, 0 newly green, +9 new cells ALL GREEN.**  The 9 are the
+cost-notice trio, the L-3 trio and the L-4 trio, all resolve-level and all
+runnable with no GPU and no `.so`.  `64 failed + 31 errors = 95` in
+2348 s.
+
+> **Diff against `wsl_fix/wsl_fix_pre.xml` (1471), NOT `wsl/wsl_efdbf9a.xml`
+> (1441)**, or the +30 cells from the B1/B2 fixes are re-counted as new.
+> `b425291` is `f7c1b17` plus one `.md`-only commit, so the `f7c1b17`
+> artifact is the right baseline for anything measured after it.  This
+> trap cost nothing only because it was noticed before the diff was run.
+
 ---
 ---
 
