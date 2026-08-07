@@ -577,8 +577,10 @@ def _orbit_distance_sq(positions, rep, metric, offsets, Rinv, tau):
 
 def _canonicalize_rep(rep, Rinv, tau):
     """Lex-smallest member of rep's orbit. Thin wrapper around
-    ``orbit_syms.canonicalize_orbit`` for the single-rep case."""
-    from .orbit_syms import canonicalize_orbit
+    ``symmetry_maps.canonicalize_orbit`` for the single-rep case."""
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import canonicalize_orbit
     return canonicalize_orbit(rep[None, :], Rinv, tau)[0]
 
 

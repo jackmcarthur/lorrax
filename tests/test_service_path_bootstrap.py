@@ -37,9 +37,11 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 _SRC = str(_REPO / "src")
 
-#: Consumers that import the door at MODULE scope.  The lazy sites (seven
-#: of them, all ``ensure_on_path()`` inside the function) cannot fail at
-#: import time and are covered by the end-to-end run instead.
+#: Consumers that import the door at MODULE scope.  The lazy sites (eight
+#: of them since the symmetry_maps extraction added
+#: ``centroid/kmeans_isdf.py``'s, all ``ensure_on_path()`` inside the
+#: function) cannot fail at import time and are covered by the end-to-end
+#: run instead.
 #:
 #: ``bandstructure.bse_setup`` is the third module-scope consumer and is
 #: deliberately NOT here: it runs ``initialize_communicator_stack()`` at
@@ -130,4 +132,8 @@ def test_the_bootstrap_is_idempotent_and_appends():
         "assert once[:len(before)] == before, 'it PREPENDED; must append'\n"
         "print('ADDED', len(added))\n")
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
-    assert "ADDED 2" in r.stdout, r.stdout      # lxkit + distrib_la
+    # lxkit + distrib_la + symmetry_maps.  A COUNT, not a floor: the number
+    # is `service_roots()`'s answer, so a service that lands without a
+    # `src/` directory — or a stale one that leaves an empty shell behind —
+    # shows up here rather than in whatever imports it first.
+    assert "ADDED 3" in r.stdout, r.stdout
