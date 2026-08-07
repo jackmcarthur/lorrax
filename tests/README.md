@@ -16,13 +16,16 @@ lxrun python3 -m pytest -q tests -p xdist -n 4      # conftest pins worker→GPU
 
 ## Architecture — three tiers
 
-**Tier 1 — frozen e2e pins** (`test_gw_jax_regression.py`): four fresh
+**Tier 1 — frozen e2e pins** (`test_gw_jax_regression.py`): five fresh
 `gw.gw_jax` runs covering whole pipelines transitively (ζ-fit → V_q → χ₀ →
-W → PPM fit → 4-branch Σ → head → QP extraction → writers):
+W → PPM fit → 4-branch Σ → head → QP extraction → writers).  Four are frozen
+against LORRAX's own past output; **one is checked against BerkeleyGW**, and it
+is the only place in the suite where an external code enters the loop:
 
 | gate | fixture | unique coverage |
 |------|---------|-----------------|
-| `si_cohsex_3d` | `regression/si_cohsex_debug` | **BGW anchor** (0.12 meV), sys_dim=3 Coulomb + analytic head. Do not shrink/re-freeze. |
+| `si_cohsex_3d` (production) | `regression/si_cohsex_debug`, `cohsex_si_test.in` | **The BerkeleyGW anchor.** sys_dim=3 Coulomb + analytic head. Two gates on one run: bit-identity vs `eqp_si_ref.dat`, AND `test_si_production_matches_berkeleygw` vs literal BGW columns in `bgw_sigma_hp_noavg.dat` (MEASURED sigTOT 0.644 meV MAE, full BZ). **Do not shrink/re-freeze** — use the fast deck instead. |
+| `si_cohsex_fast` | `regression/si_cohsex_debug`, `cohsex_si_fast.in` | Same crystal, 20 bands / 144 centroids, ~12 s. A PURE SELF-FREEZE — MEASURED 2109 meV from BGW (the band cut, not the centroid count). Gates code changes fast; says nothing about BGW. |
 | `cohsex` | `regression/cohsex_debug` | only IBZ-stored WFN → ψ k-unfold e2e; 12-op group; nspinor=2 static SX/COH; K_POINTS path |
 | `gnppm` | `regression/gnppm_debug` | dynamic GN-PPM workhorse; IBZ cascade active (log-asserted); session state for Tier 2 |
 | `bispinor` | `regression/bispinor_debug` | bispinor GN-PPM: Σ^B + 4 ζ channels + 7 V_q tiles + transverse γ̃ |

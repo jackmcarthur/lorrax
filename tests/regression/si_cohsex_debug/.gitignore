@@ -1,5 +1,10 @@
 eqp_si_test.dat
+eqp_si_fast.dat
 sigma_mnk.h5
+sigma_mnk_fast.h5
 qp_wfn_rotations.h5
+sigma_freq_debug.dat
+eqp0.dat
+eqp1.dat
 gw.out
 tmp/

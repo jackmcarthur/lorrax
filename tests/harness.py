@@ -289,3 +289,137 @@ def mutate_input(path: Path, replacements: dict[str, str], append: str = ""):
     if append:
         text += "\n" + append + "\n"
     path.write_text(text)
+
+
+# ---------------------------------------------------------------------------
+# BerkeleyGW anchor comparison (the ONE external check in the suite).
+#
+# Every other gate in this repo compares LORRAX against LORRAX's own frozen
+# output.  That catches "the code changed" but is structurally blind to "the
+# code drifted away from BerkeleyGW", because BGW never enters the loop.  The
+# helpers below put it back in: they read a fixture of literal BGW sigma_hp.log
+# columns and line it up with a LORRAX sigma_diag .dat.
+#
+# COLUMN CONVENTION.  BGW's 14-column sigma_hp.log block
+# (Sigma/write_result_hp.f90:88-100) writes
+#     CH  = ach + achcor      Sig  = asig + achcor
+#     CH` = ach               Sig` = asig
+# where ``achcor`` is the STATIC REMAINDER.  LORRAX computes no static
+# remainder, so the comparable columns are the PRIMED ones, and the mapping
+# below applies NO offset to either side:
+#     LORRAX sigSX  == X + SXmX      LORRAX sigCOH == CHp      sigTOT == Sigp
+# Comparing against the UNPRIMED CH instead would show a spurious ~367 meV.
+# ---------------------------------------------------------------------------
+
+BGW_HP_COLS = ("Emf", "Eo", "X", "SXmX", "CH", "Sig", "KIH", "Eqp0", "Eqp1",
+               "CHp", "Sigp", "Eqp0p", "Eqp1p", "Znk")
+
+
+def parse_bgw_hp_fixture(path: Path):
+    """Read a bgw_sigma_hp_*.dat fixture.
+
+    Returns ``(kfrac (nk,3), bands (nb,), {col: (nk, nb)})``.  Rows are
+    ``ik kx ky kz n <14 columns>``; ``#`` lines are commentary.
+    """
+    rows = [ln.split() for ln in Path(path).read_text().splitlines()
+            if ln.strip() and not ln.lstrip().startswith("#")]
+    if not rows:
+        raise ValueError(f"no data rows in BGW fixture {path}")
+    nk = max(int(r[0]) for r in rows)
+    bands = sorted({int(r[4]) for r in rows})
+    bpos = {b: j for j, b in enumerate(bands)}
+    kfrac = np.zeros((nk, 3))
+    data = {c: np.full((nk, len(bands)), np.nan) for c in BGW_HP_COLS}
+    for r in rows:
+        ik = int(r[0]) - 1
+        kfrac[ik] = [float(r[1]), float(r[2]), float(r[3])]
+        j = bpos[int(r[4])]
+        for c, v in zip(BGW_HP_COLS, r[5:]):
+            data[c][ik, j] = float(v)
+    for c, arr in data.items():
+        if np.isnan(arr).any():
+            raise ValueError(f"BGW fixture {path}: column {c} has holes")
+    # The fixture must be internally consistent or the parse is wrong.
+    resid = np.abs(data["X"] + data["SXmX"] + data["CHp"] - data["Sigp"]).max()
+    if resid > 1e-6:
+        raise ValueError(
+            f"BGW fixture {path} is not self-consistent: "
+            f"max|X + SXmX + CHp - Sigp| = {resid:.3e} eV (expected ~1e-9). "
+            f"Column order is wrong or the file was edited by hand.")
+    return kfrac, np.asarray(bands), data
+
+
+def compare_to_bgw(output_file: Path, fixture: Path, labels=(
+        "sigSX", "sigCOH", "sigTOT")):
+    """Deviation of a LORRAX sigma_diag .dat from the BGW anchor, in meV.
+
+    Returns ``{column: (mae, max_abs)}`` plus ``"_star_spread"`` and
+    ``"_nstar"``.
+
+    Every LORRAX k-point is used, not one representative per IBZ k.  The
+    fixture holds BGW's 8 IBZ k-points; LORRAX writes the full 64-point BZ.
+    Each LORRAX k is assigned to the IBZ k whose mean-field energies it
+    reproduces (matching on the whole ``Eo`` vector, not on k coordinates,
+    because the two codes do not order k the same way).  Symmetry-equivalent
+    k MUST carry identical Sigma, so comparing all of them is both the honest
+    average and a symmetry check — ``_star_spread`` is the worst per-band
+    disagreement between members of one star, which an IBZ-representative
+    comparison cannot see.
+    """
+    kfrac, bands, bgw = parse_bgw_hp_fixture(fixture)
+    nb = bands.size
+    rows = parse_eqp_rows(output_file, labels)
+    lx = {}
+    for r in rows:
+        lx.setdefault(int(r[0]), []).append(r)
+    lx = {k: np.asarray(v) for k, v in lx.items()}
+    # parse_eqp_rows gives [kpt, band, A, B, C, VH_re, VH_im]; the driver also
+    # writes an Eo column, which parse_eqp_rows drops — re-read it here since
+    # the k-matching needs it.
+    eo = _parse_eo_column(output_file)
+
+    ref = {labels[0]: bgw["X"] + bgw["SXmX"],
+           labels[1]: bgw["CHp"],
+           labels[2]: bgw["Sigp"]}
+    acc = {c: [] for c in labels}
+    star_spread, nstar_total = 0.0, 0
+    for ik in range(kfrac.shape[0]):
+        emf = bgw["Emf"][ik, :nb]
+        hits = [k for k, v in lx.items()
+                if v.shape[0] >= nb and k in eo
+                and np.max(np.abs(np.asarray(eo[k][:nb]) - emf)) < 2e-3]
+        if not hits:
+            raise AssertionError(
+                f"BGW anchor: no LORRAX k-point reproduces the mean-field "
+                f"energies of BGW IBZ k{ik+1} = {kfrac[ik]}.  Either the run "
+                f"used a different WFN or the band ordering changed.")
+        nstar_total += len(hits)
+        for j, c in enumerate(labels):
+            for k in hits:
+                acc[c].append(lx[k][:nb, 2 + j] - ref[c][ik])
+        if len(hits) > 1:
+            block = np.stack([lx[k][:nb, 4] for k in hits])   # sigTOT
+            star_spread = max(star_spread,
+                              float((block.max(0) - block.min(0)).max()))
+    out = {}
+    for c in labels:
+        d = np.concatenate(acc[c]) * 1e3
+        out[c] = (float(np.abs(d).mean()), float(np.abs(d).max()))
+    out["_star_spread"] = star_spread * 1e3
+    out["_nstar"] = nstar_total
+    return out
+
+
+def _parse_eo_column(path: Path) -> dict:
+    """{kpt: [Eo per band]} from a sigma_diag .dat (the ``Eo=`` field)."""
+    out, ik = {}, -1
+    for ln in Path(path).read_text().splitlines():
+        m = re.search(r"k-point\s+(\d+)\s*:", ln)
+        if m:
+            ik = int(m.group(1))
+            out[ik] = []
+            continue
+        m = re.search(r"\bEo=\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", ln)
+        if m and ik >= 0:
+            out[ik].append(float(m.group(1)))
+    return {k: v for k, v in out.items() if v}

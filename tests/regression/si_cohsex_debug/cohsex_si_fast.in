@@ -1,0 +1,91 @@
+# =====================================================================
+# LORRAX Si 4x4x4 COHSEX — *** FAST TEST DECK ***  (SELF-FREEZE, NOT AN ANCHOR)
+# =====================================================================
+# WHAT THIS IS.  The quick sibling of `cohsex_si_test.in`.  Same crystal, same
+# WFN.h5, same 4x4x4 k-grid, all 48 symmetries — but 20 bands instead of 60 and
+# 144 centroids instead of 960.  Its job is to run the whole sys_dim=3 pipeline
+# (zeta-fit -> V_q -> chi0 -> W -> Sigma -> QP -> writers) in ~12 s so a code
+# regression surfaces fast.
+#
+# WHAT THIS IS *NOT*.  It is NOT a BerkeleyGW anchor and must never be described
+# as one.  MEASURED against the BGW reference columns in
+# `bgw_sigma_hp_noavg.dat` (8 IBZ k x 16 bands):
+#
+#                        sigSX MAE      sigCOH MAE     sigTOT MAE
+#   this deck (20 band)   386.4 meV      2495.6 meV     2109.2 meV
+#   production (60 band)    0.151 meV       0.351 meV      0.433 meV
+#
+# The gap is FOUR ORDERS OF MAGNITUDE and it is the band cut, not the centroid
+# count.  Single-variable A/B, this deck's 20 bands with the PRODUCTION 960
+# centroids: sigTOT MAE 2037.1 meV — i.e. restoring 6.7x the centroids recovers
+# 72 meV of a 2100 meV deficit.  The Coulomb-hole sum runs over all `nband`
+# states, so truncating 60 -> 20 removes 40 bands from Sigma_COH and shifts it
+# by ~+2.46 eV.  That is a different physical approximation, not a numerical
+# error, and no centroid count can repair it.
+#
+# THEREFORE: this deck is frozen against LORRAX's own output.  It gates
+# "did the code change?", not "does LORRAX still agree with BerkeleyGW?".
+# The BGW question is gated ONLY by `cohsex_si_test.in` +
+# `bgw_sigma_hp_noavg.dat`.  If you shrink the production deck to make it
+# faster, you delete the project's only external check — see README.md.
+#
+# ZETA_RCOND IS DELIBERATELY UNSET, and here that is MEASURED-safe rather than
+# hopeful.  Full sweep on this exact configuration, max|d| vs the 1e-10 arm:
+#
+#   rcond     1e-10   1e-9   1e-8   default   1e-7    1e-6    1e-5     1e-4
+#   sigTOT    0.000   0.000  0.000   0.000    2.094  19.931  43.645  237.539  meV
+#
+# 1e-10 / 1e-9 / 1e-8 / key-omitted are BYTE-IDENTICAL to each other (not just
+# within tolerance), which also confirms the shipping default is 1e-8.  So this
+# deck exercises the SHIPPING code path and spends zero gate margin doing it.
+# Contrast the production anchor, whose 960-centroid charge CCT spectrum *does*
+# reach below the cut and which therefore pins the value explicitly.
+# A future default move to 1e-7 would shift this deck by 2.094 meV and the gate
+# would go red — which is the correct alarm, not a false one.
+# =====================================================================
+[cohsex]
+
+restart = false
+centroids_file = centroids_frac_144.txt
+
+# 20 is a CLEAN band cut: bands 20 and 21 are non-degenerate at all 8 IBZ
+# k-points (min gap 228.3 meV, at k0).  Cutting inside a multiplet would make
+# the frozen numbers depend on eigenvector mixing within the degenerate block.
+# The other clean cuts in this WFN are 8 (= nval), 16 and 28; 10/12/14/18/22/
+# 24/26 all split a multiplet somewhere.  20 also keeps the 4-fold at 14.01 eV.
+nval = 8
+ncond = 12
+nband = 20
+sys_dim = 3
+bare_coulomb_cutoff = 25.0
+
+do_screened = true
+bispinor = false
+qp_solver = one_shot_dft
+
+use_ppm_sigma = false
+screening_method = minimax
+
+# Carried over verbatim from the production deck.  NOTE: these are BerkeleyGW
+# q->0 head scalars measured on a 60-BAND screening calculation, injected here
+# into a 20-band one.  That is inconsistent as physics — but this deck is a
+# self-freeze, the value is a fixed input constant, and holding it equal to the
+# production deck keeps the two runs differing in exactly two knobs (nband and
+# centroid count) so an A/B between them stays interpretable.
+vhead = 3303.748102
+whead_0freq = 150.395600
+
+memory_per_device_gb = 28
+
+sigma_freq_debug_output = true
+fermi_reference = midgap
+
+wfn_file = WFN.h5
+output_file = eqp_si_fast.dat
+sigma_diag_file = eqp_si_fast.dat
+sigma_omega_h5_file = sigma_mnk_fast.h5
+
+# Must match the production deck: BGW `cell_average_cutoff 1d-12` <-> false.
+# Kept here even though this deck is not BGW-anchored, so that an A/B against
+# the production deck is a clean two-variable comparison.
+mc_average_vcoul_body = false

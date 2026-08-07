@@ -172,3 +172,35 @@ def bse_dense_state(gnppm_session, tmp_path_factory):
     restart = bse_io._find_restart_file(input_path)
     return bse_io._load_ring_subset(
         restart, n_val=2, n_cond=2, px=1, py=1, input_file=input_path)
+
+
+# ---------------------------------------------------------------------------
+# Si 4×4×4 sessions.  The production deck is run ONCE and consumed by two
+# gates — the self-freeze (``eqp_si_ref.dat``) and the BerkeleyGW anchor
+# (``bgw_sigma_hp_noavg.dat``).  Running it twice would double the suite's
+# most expensive Si cost for no extra coverage.
+#
+# Both decks live in the SAME fixture directory and share WFN.h5 / kin_ion.h5 /
+# dipole.h5 (26 MB); only the deck, the centroid file and the reference differ.
+# That is deliberate — a second directory would duplicate the binaries.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def si_session(tmp_path_factory):
+    """Fresh run of the Si production deck (the BerkeleyGW-anchored one)."""
+    return _run_session_case(
+        tmp_path_factory, "si_cohsex_debug", "cohsex_si_test.in",
+        "eqp_si_test.dat")
+
+
+@pytest.fixture(scope="session")
+def si_fast_session(tmp_path_factory):
+    """Fresh run of the Si fast deck (20 bands, 144 centroids, ~12 s).
+
+    A separate run dir rather than a restart from ``si_session``: the two decks
+    have different band counts and different centroid sets, so they share no
+    ISDF state.
+    """
+    return _run_session_case(
+        tmp_path_factory, "si_cohsex_debug", "cohsex_si_fast.in",
+        "eqp_si_fast.dat")
