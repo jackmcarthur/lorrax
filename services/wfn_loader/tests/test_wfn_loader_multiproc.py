@@ -291,16 +291,37 @@ def check_band_pad_clamp_parity(mesh, deck, *, bands=DEFAULT_BANDS,
         # This rank's real-vs-pad row split, measured off the DATA.
         import jax
         r = int(jax.process_index()) if jax.process_count() > 1 else 0
+        bpr = int(ref.shape[1])
         want_real = counts[r] if r < len(counts) else 0
-        nonzero = [b for b in range(ref.shape[1]) if ref[:, b].any()]
+        nonzero = [b for b in range(bpr) if ref[:, b].any()]
         assert nonzero == list(range(want_real)), (
             f"rank {r}: real band rows are {nonzero}, but the counts table "
             f"says this rank owns {want_real} real rows ({counts}).  Either "
             f"the clamp is wrong or a real band read as zero.")
-        assert ref.shape[1] > want_real, (
-            f"rank {r}: block of {ref.shape[1]} rows is entirely real, so "
-            f"the pad-zero assertion below is vacuous on this rank")
+
+        # NON-VACUITY IS A GLOBAL CLAIM, not a per-rank one.  MEASURED on
+        # the first CPU 2x2 leg (JID 56457295 step 10), where an earlier
+        # per-rank spelling of this assertion failed on rank 0: at
+        # bands=(0,10) on four ranks the counts are [3, 3, 3, 1], so ranks
+        # 0-2 own a FULL block and only the TAIL rank carries pad rows.
+        # That is the geometry working exactly as designed — demanding pad
+        # on every rank would demand a window nothing produces.  What must
+        # hold is that SOME rank's block is clipped (else the clamp is
+        # inert everywhere and the pad-zero checks below are vacuous
+        # session-wide), and that is a property of the table, so every rank
+        # can assert it.
+        clipped = [i for i, c in enumerate(counts) if c < bpr]
+        assert clipped, (
+            f"no rank's block is clipped at bands={bands} world={world} "
+            f"(counts={counts}, bands_per_rank={bpr}): the tail clamp is "
+            f"inert at this geometry and the pad-zero assertions below "
+            f"check an empty slice on every rank")
+        assert clipped[-1] == world - 1, (
+            f"the clipped ranks are {clipped}; the clamp must bite on the "
+            f"TAIL rank {world - 1}, not in the middle of the split")
         out["rank_real_rows"] = want_real
+        out["clipped_ranks"] = clipped
+        out["rank_pad_rows"] = bpr - want_real
 
         for name, (arr, idx) in shards.items():
             assert arr.shape == ref.shape, f"{name}: {arr.shape} vs {ref.shape}"
