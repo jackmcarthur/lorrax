@@ -47,7 +47,7 @@ passes. **This page is the other half of the same material — what a
 | service | the call a caller actually makes | guarantee | varies underneath | caller picks the backend? | gate |
 |---|---|---|---|---|---|
 | **`file_io.slab_io`** | `SlabIO(path, mode=, mesh=)` → `create_dataset` / `write_slab` / `read_slab` | no object larger than one rank's tile is materialised | Lustre striping, ROMIO collective buffering, the phdf5 handler, the MPI it was built against | **no — by design** (see [below](#choice)) | GATE 1, GATE 7 (`ffi_layout` §3); `tests/test_slab_io_routing.py` |
-| **`ffi.linalg`** | `plan(op, mesh_xy, backend=…)` → `plan(A_tile)` / `plan.batched(A_stack)` | a resolved backend name is a *promise*: handler compiled in and every geometry guard passed, so the call cannot fail for an availability reason | ScaLAPACK / SLATE / cuSOLVERMp / native, per op, machine and mesh geometry | **yes — by design**, via three deck keys (see [below](#choice)) | **none at build time**; `tests/test_ffi_linalg_contract.py` at run time |
+| **`distrib_la`** (wave-0 service; was `ffi.linalg`) | `plan(op, mesh_xy, backend=…)` → `plan(A_tile)` / `plan.batched(A_stack)`, plus `factor`/`solve` | a resolved backend name is a *promise*: handler compiled in and every geometry guard passed, so the call cannot fail for an availability reason | ScaLAPACK / SLATE / cuSOLVERMp / native, per op, machine and mesh geometry | **yes — by design**, via three deck keys (see [below](#choice)) | **none at build time**; `pytest -m distrib_la` at run time.  Reference: [docs/services/distrib_la.md](../services/distrib_la.md) |
 | **`ffi.fft`** (entered through `common.fft_helpers`) | `make_flat_k_fft(mesh, kgrid, spec, kind=…)` | one flat-k batched 3-D FFT under the same jax.ffi target names on cpu and CUDA | cuFFT / MKL-DFTI / an FFTW3-ABI `dlopen` ladder | no — capability only (`LORRAX_FFT_FFI` is on/off, and off *refuses*) | GATE 5b (load time only). **Which engine answered is not gated** — GATE 8 exists on `fix/host-ffi-fftw-container-stage-2026-08-06`, unmerged |
 | **`ffi.gemm`** | `gemm_batch(a3, b3)`, inside the caller's own `shard_map` | batched host GEMM at vendor-BLAS rate, or an announced XLA fallback | Cray LibSci / MKL / netlib / AOCL / OpenBLAS CBLAS; batched entry point present or not | no — capability only | GATE 2 (one LibSci flavour). Which *entry point* was chosen is announced, not gated |
 | **`ffi.io`** — parallel HDF5 | `open_file(path, mesh=, mode=)` → `write_sharded_slab` / `read_sharded_slab` | collective MPI-IO straight to a hyperslab; no rank-0 gather | cray-hdf5-parallel + Cray MPICH / phdf5 + Intel MPI; CUDA vs host `.so` | no — the platform comes from the mesh's devices | GATE 1, GATE 7 |
@@ -59,9 +59,11 @@ passes. **This page is the other half of the same material — what a
 
 **The vendor packages are backends, not services.** `ffi.cusolvermp`,
 `ffi.slate` and `ffi.scalapack` have **zero** direct-import consumers in
-`src/`; every call site goes through `ffi.linalg.resolve.backend_module()`.
-Listing them here as peers of `ffi.linalg` would invite someone to import
-one. (`ffi.cublasmp` has no consumer at all — it is bench- and test-only.)
+`src/` — since the wave-0 replumb they are not even importable from there,
+because they are `distrib_la._cusolvermp` / `._slate` / `._scalapack` and
+reaching past the door fails `tests/test_layering.py`.  Every call site goes
+through `distrib_la.backend_module()`.  Listing them here as peers of
+`distrib_la` would invite someone to import one. (`ffi.cublasmp` has no consumer at all — it is bench- and test-only.)
 
 **Not services, kept nearby because callers reach for them from the same
 place:** `common.timing` (pure instrumentation — nothing varies);
@@ -131,7 +133,9 @@ The exposure is disciplined in two ways worth copying. An **explicit**
 request never demotes: only `auto` demotes, and only with a rank-0
 announcement naming whether the cause was geometry or capability. And
 `eigh_backend`'s accepted vocabulary is *imported from the resolver*
-(`eigh_backend_choices()` reads `ffi.linalg.resolve.BACKEND_CHOICES`), so
+(`eigh_backend_choices()` reads `distrib_la.BACKEND_CHOICES`, and records in
+`gw_config.EIGH_CHOICES_SOURCE` which branch answered so the pinning test can
+see its own fallback), so
 the deck parser cannot drift from the thing it configures. **The other two
 keys hardcode their vocabularies** and can drift; that is a defect in
 them, not a second design.
@@ -673,13 +677,18 @@ refusal — no MKL present means slower-and-loud, never broken).
 
 ---
 
-## ffi.linalg {#ffilinalg}
+## ffi.linalg → distrib_la {#ffilinalg}
+
+> Wave-0 moved this to `services/distrib_la/`.  The live reference is
+> [docs/services/distrib_la.md](../services/distrib_la.md); the section below
+> is kept for the design reasoning, with `ffi.linalg` read as `distrib_la`.
 
 **Purpose.** Distributed dense linalg (`eigh`, `cholesky`, `solve_lu`)
 over the `('x','y')` mesh: resolve a backend once, get a plan that owns
 the layout contract and the call.
 
-**Public API** (`src/ffi/linalg/{plan,resolve,dispatch}.py`):
+**Public API** (`services/distrib_la/src/distrib_la/{plan,resolve,dispatch}.py`,
+re-exported at the package top level — the package IS the door):
 
 ```python
 def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",

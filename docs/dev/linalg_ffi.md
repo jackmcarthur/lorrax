@@ -1,5 +1,29 @@
 # Distributed dense linear algebra over a JAX device mesh (`ffi.linalg`)
 
+> **RENAME MAP (2026-08-07). This page is history below "Adding a
+> backend"; the live reference is [`docs/services/distrib_la.md`](../services/distrib_la.md).**
+> The stack moved into `services/distrib_la/` and the four packages this
+> page is written against were **deleted** (commit `b3f3675`, 17 files).
+> Everywhere below, read:
+>
+> | this page says | it is now |
+> |---|---|
+> | `ffi.linalg` / `from ffi import linalg` | `distrib_la` (the package IS the door) |
+> | `ffi/linalg/plan.py` (`plan`, `Plan`, `_IMPL`, `ensure_sharding`) | `distrib_la.plan` |
+> | `ffi/linalg/resolve.py` (`resolve_backend`, `list_backends`, `backend_module`, `BACKEND_CHOICES`, `_SPEC`) | `distrib_la.resolve` |
+> | `ffi/linalg/dispatch.py` (`dispatch_batched_eigh`) | `distrib_la.dispatch` |
+> | `ffi/linalg/_slate.py` / `_scalapack.py` | `distrib_la._slate` / `._scalapack` |
+> | `ffi/linalg/_slate._mesh_key` | `distrib_la.mesh_key` — **public now**, and there is one of it |
+> | `ffi.slate` / `ffi.scalapack` (the wrapper packages) | `distrib_la._slate` / `._scalapack`; the README is `services/distrib_la/docs/slate_backend.md` |
+> | `common.cholesky_2d` (`cholesky_2d_batched`, `dense_to_tiles`, `tiles_to_dense`) | `distrib_la._native2d`, reached as `plan('cholesky', mesh, backend='native2d')` |
+> | `ffi/common/ffi_loader.py`'s linalg half | `distrib_la.loader` (lorrax's loader keeps the FFT/GEMM/phdf5 half) |
+> | `tests/test_ffi_linalg_contract.py` | `services/distrib_la/tests/test_distrib_la_contract.py`, marker `distrib_la` |
+>
+> Prose and campaign history below has NOT been rewritten path-by-path —
+> rewriting 500 lines of recorded reasoning to change a module name loses
+> more than it fixes. This table is the translation. Anything that
+> **instructs** you to do something has been rewritten in place.
+
 *A guide to LORRAX's distributed-linalg stack, written for a JAX power
 user — the facade is deliberately small and self-contained enough to
 lift into another SPMD JAX codebase.*
@@ -450,23 +474,51 @@ What can run here?
 
 ## Adding a backend
 
-1. Write the wrapper package `src/ffi/<name>/` (copy
-   `ffi/cusolvermp/eigh.py` — it is written flat as the template; the
-   three per-routine decisions are called out in its docstring).
-2. Register the C++ handler symbol in `ffi/common/ffi_loader.py`
+**Everything in this section is inside `services/distrib_la/`.** No step
+touches `src/`. The three files the previous version of this section told
+you to edit (`src/ffi/<name>/`, `ffi/linalg/resolve.py`,
+`ffi/linalg/plan.py`) no longer exist.
+
+1. Write the wrapper module
+   `services/distrib_la/src/distrib_la/_<name>.py`. Copy
+   `distrib_la/_cusolvermp.py` — it is written flat as the template and
+   its docstring calls out the three per-routine decisions (donation,
+   handle-vs-array return, output normalisation).
+2. Register the C++ handler symbol in `distrib_la/loader.py`
    (`_CUDA_TARGET_SYMBOLS` / `_HOST_TARGET_SYMBOLS`). That makes
-   `has_target()` — and therefore the capability guard — work for free.
-3. Add the backend to `ffi/linalg/resolve.py`: one entry per op in
+   `probe_target()` / `has_target()` — and therefore the capability guard
+   — work for free, with the ABSENT-vs-BROKEN split already correct. If
+   the same handler is also reachable from lorrax's own loader
+   (`src/ffi/common/ffi_loader.py` keeps the FFT/GEMM/phdf5 half), add the
+   row there too: both loaders open the same `.so`.
+3. Add the backend to `distrib_la/resolve.py`: one entry per op in
    `BACKEND_CHOICES`, one `(op, backend) → (target, platforms)` row in
-   `_SPEC`, any geometry rule in `_check_geometry`, and a branch in
-   `backend_module`.
-4. Add ONE row to `ffi/linalg/plan.py`'s `_IMPL`: the single-tile entry
+   `_SPEC`, any geometry rule in `_check_geometry`, a `_DISTRIBUTED_DEFAULT`
+   row per platform if it is a platform's `distributed` answer, and a
+   branch in `backend_module`. A declared-untested tier still gets its
+   rows — that is what makes the routing question have an answer.
+4. Add ONE row to `distrib_la/plan.py`'s `_IMPL`: the single-tile entry
    point, the stacked one (either may be `None` — the plan fills the
-   missing side in), and an output normaliser if the library's
-   convention differs.  Every migrated call site picks the backend up
-   from that row; do NOT normalize conventions at call sites.
-5. Extend the config vocabulary (`gw_config.py` validation + the key
-   comment) and this page's table.
+   missing side in), and an output normaliser if the library's convention
+   differs. Every call site picks the backend up from that row; do NOT
+   normalize conventions at call sites. Declare donation in `DONATES` if
+   the op's is different.
+5. If it returns an opaque factor, add its branch to `distrib_la/factor.py`
+   so it arrives as a `FactorToken` and leaves through `solve()`. Do not
+   hand a raw handle across a `jit` boundary — the token is deliberately
+   not a pytree.
+6. Extend the deck vocabulary: `gw_config.py`'s validation reads
+   `eigh_backend_choices()`, which reads `distrib_la.BACKEND_CHOICES`, so
+   for `eigh` there is nothing to do but check the key comment. The
+   `distributed_cholesky` / `distributed_lu` / `w_dyson_solver` lists in
+   `gw_config` are separate deck vocabularies and are edited by hand.
+7. Write the tests **first or with it, never after**: an L-a algebra cell,
+   an L-b emulated-mesh cell, an L-c body in `_CLI_CELLS`, a contract cell
+   for each refusal it can emit, and — for every one of them — the case
+   where the check returns FALSE. Add a machine-profile row if the backend
+   is expected present somewhere, so an unexpected skip is a failure.
+8. Update `docs/services/distrib_la.md` (the Backends table) and, if it
+   moves numbers, record a baseline row rather than a slow test.
 
 ### Call sites: migrated, and not
 

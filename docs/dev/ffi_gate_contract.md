@@ -200,7 +200,7 @@ job pins this with a call counter (`wk_REL/gatecheck.py` cell C(4)).
 
 ## 4. What this does NOT absorb, and why
 
-**`ffi/linalg/resolve.py` stays separate.**  Its guards 4 (one JAX process
+**`distrib_la.resolve` stays separate.**  Its guards 4 (one JAX process
 per device, `resolve.py:399-407`) and 5 (mesh geometry, `:410-430`) exist
 because those backends hold an MPI/BLACS/NCCL communicator.  FFT and GEMM
 are rank-local handlers *inside* a `shard_map` with no communicator: both

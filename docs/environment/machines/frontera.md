@@ -93,7 +93,7 @@ pip `nvidia-*-cu12` wheels (`stage_ffi_deps.sh`). Set
 `srun -n 4 apptainer exec --nv …`.
 
 The permanent CPU distributed eigh is ScaLAPACK `pzheevd` in the host
-`.so`, behind the `ffi/linalg` facade
+`.so`, behind the `distrib_la` door
 ([services](../../architecture/services.md#ffilinalg)).
 
 ## 5. NOT yet vendored {#not-yet-vendored}

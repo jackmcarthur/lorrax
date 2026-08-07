@@ -27,7 +27,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/gw/kin_ion_io.py` | Kinetic + ionic Hamiltonian I/O | `kin_ion.h5` issues |
 | `src/isdf/core.py` + `src/gw/isdf_fitting.py` | CCT/ZCT, pair-density kernels, zeta solve / stage orchestration | Zeta fitting, pair density |
 | `src/common/wfn_transforms.py` | Wavefunction loading + band-chunked FFT | WFN load path |
-| `src/common/cholesky_2d.py` | 2D-blocked Cholesky for sharded CCT | Cholesky issues |
+| `services/distrib_la/` | **The distributed dense-linalg service**: one door for `eigh` / `cholesky` / `solve_lu` over scalapack, slate, cusolvermp and native (incl. the 2D-blocked `native2d` Cholesky that was `src/common/cholesky_2d.py`). Read `docs/services/distrib_la.md` first | Cholesky / eigh / LU on a mesh; backend refusals; `.so` pins |
 | `src/common/fft_helpers.py` | Flat-k FFT helpers | FFT plumbing |
 | `src/common/gvec_fft_box.py` | Sphere ↔ FFT-box gather | V_q G-space build |
 | `src/common/symmetry_maps.py` | `SymMaps`: IBZ→full BZ unfolding, spinor rotations | Symmetry / k-point unfolding |
@@ -37,7 +37,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/common/gpu_utils.py` | Host-side GPU memory detection | Chunk auto-sizing |
 | `src/file_io/slab_io.py` | `SlabIO`: phdf5 writer wrapper for zeta_q / V_qmunu | Big HDF5 writes |
 | `src/file_io/sigma_output.py` | Σ output (eqp.dat, sigma.h5) | Output formats |
-| `src/ffi/` | XLA FFI bridge: `cusolvermp`, `cublasmp`, `phdf5`, `slate` | Native-library entry points |
+| `src/ffi/` | XLA FFI bridge, lorrax's half: `phdf5`, `fft`/`mklfft`, `gemm`, `cusolvermp` context + `cublasmp`, and the C++ tree `cpp/` (which still builds the slate / scalapack / cusolvermp handlers). The distributed-linalg python side moved to `services/distrib_la` | Native-library entry points |
 | `src/solvers/` | Davidson, Lanczos, Chebyshev, pseudobands | Iterative eigensolvers |
 | `src/centroid/kmeans_cli.py` / `src/centroid/kmeans_isdf.py` | ISDF centroid generation — `kmeans_cli` is the CLI (`python -m centroid.kmeans_cli`); `kmeans_isdf` is the algorithm library, no `__main__` | Centroid count / quality |
 | `src/psp/` | Pseudopotentials, dipole / kin+ion generators | `dipole.h5` or `kin_ion.h5` issues |

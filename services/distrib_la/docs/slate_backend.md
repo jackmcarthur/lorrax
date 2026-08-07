@@ -30,7 +30,9 @@ for trsm, which used to abort the whole job.  `1×q` meshes are rejected
 
 ```python
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from ffi.slate import distributed_cholesky, distributed_trsm
+from distrib_la import plan, factor, solve
+# ...or, for the raw handle API this page documents:
+from distrib_la._slate import distributed_cholesky, distributed_trsm
 
 mesh = Mesh(np.asarray(jax.devices()).reshape(p, q), ('x', 'y'))
 A    = jax.device_put(A_np, NamedSharding(mesh, P('x', 'y')))   # Hermitian PD
@@ -263,12 +265,13 @@ a GPU-backend process.  Input-file selection: `distributed_cholesky =
 slate` now passes through on the CPU backend (still never auto-picked;
 still fails loudly with build pointers when the library is absent).
 
-Tests: `tests/test_ffi_linalg_contract.py::test_slate_*_cpu` (1×1 CPU
+Tests: `services/distrib_la/tests/test_distrib_la_contract.py::test_slate_*_cpu` (1×1 CPU
 mesh, skipif-clean without the host lib) + the CLI matrix under
 `JAX_PLATFORMS=cpu` for multi-rank CPU meshes.  The first additional
 host backend landed the same way: `ffi.scalapack` (Cray LibSci
 pXgetrf+pXgetrs, `distributed_lu = scalapack`) compiles into the same
-library and registration table — see `src/ffi/scalapack/`.
+library and registration table — see `distrib_la._scalapack` (the C++ is
+still `src/ffi/cpp/scalapack/`).
 
 Dual-lib caveat (GPU nodes): both SLATE builds install `libslate.so.2`,
 so when the CUDA FFI library loads first its `libslate` satisfies the
@@ -280,8 +283,35 @@ validated where it actually deploys — CPU nodes, where only the host
 library loads (bare-metal Milan runs: 7/7 pytest, 2×2 + 4×1 CLI clean,
 2026-07-10).
 
-Tests under `src/common/slate_*_test.py` and `slate_*_bench.py`; run
-via `lxrun` (inside an `lxalloc`-created allocation).
+**THE OTHER ORDER IS NOT SUPPORTED, and it is not benign (2026-08-07).**
+`libblaspp.so.2` collides the same way, and the two builds are NOT
+interchangeable in that direction: the host build is `gpu_backend=none`,
+so its `blas::get_device_count()` is a compiled-in 0.  Open the HOST
+library first and every CUDA SLATE handler in the process refuses —
+
+    FAILED_PRECONDITION: slate.potrf: blas::get_device_count()=0 but JAX
+    one-process-per-GPU model requires exactly 1.
+
+— with exactly one visible GPU, because the count came from a library
+compiled without CUDA at all.  Measured with `dladdr` in both legs of the
+distrib_la suite (`_reports_step4/discrim_{marker,svc}.txt`): the failing
+leg resolved `blas::get_device_count` into
+`slate_builds/cpu/install/lib64/libblaspp.so.2` and read 0; the green leg
+resolved it into `slate/install/lib64/libblaspp.so.2` and read 1.  What
+lost the race was a MODULE-SCOPE `probe_target(..., "cpu")` at pytest
+collection, so this is a production hazard too: any GPU run whose first
+FFI touch is a host target gets a device-less SLATE.
+
+Both loaders therefore open **CUDA before cpu**
+(`distrib_la.loader._open_cuda_before_host`, and the same rule in
+`src/ffi/common/ffi_loader.py`).  `test_so_acceptance.py::test_check_5_*`
+is the ratchet on the premise: it fails the day the two stacks stop
+sharing a SONAME, which is the day to delete the rule.
+
+Tests: `services/distrib_la/tests/test_distrib_la_contract.py` (the
+`slate_*` cells, and the SONAME-race section) and
+`test_distrib_la_multiproc.py --mesh 2x2`; run via `lx run` / `lx test`
+inside an allocation.  The benches are `services/distrib_la/bench/`.
 
 ### Batched variant — `batched.py`, `batched_{potrf,trsm}_ffi.cc`
 

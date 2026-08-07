@@ -19,6 +19,16 @@ an instrument error (see "Instrument notes"), kept only as evidence.
 | C2: nonsquare refusal | `...device_count=2`, `-k nonsquare` | 1 passed |
 | D: extra tier | `-m extra`, 4 devices | 0 failed / 21 passed / 5 skipped |
 
+> **The A2/B2 invocations above are RECORDED AS RUN (job 7885154) and are no
+> longer runnable as written.** `tests/test_ffi_linalg_contract.py` moved to
+> `services/distrib_la/tests/test_distrib_la_contract.py` and carries the
+> `distrib_la` marker, so naming a path is no longer the way to include or
+> exclude it. Today the same two legs are
+> `pytest tests/ --no-services` and `srun --mpi=pmi2 -n1` +
+> `config/frontera/mpi_transport_env.sh` + `pytest -m distrib_la`.
+> `tests/conftest.py` owns those hooks and `tests/test_service_selection.py`
+> measures that they select what they claim.
+
 Every leg-A2 failure below is triaged; after the fixes in this commit
 the only remaining red is the ring-vma class.
 
@@ -27,7 +37,7 @@ the only remaining red is the ring-vma class.
 | tests | class | evidence | status |
 |---|---|---|---|
 | 10 ring-transport tests: `test_bse_dense_reference` `{w_positive_control,full_H,DV}[ring]` + `test_nontda_matvec_matches_dense_shao` + `test_nontda_solver_reproduces_dense`, `test_bse_stack_matvec::test_stack_memory_flat_in_n_trials`, `test_bse_w0_resolvent` (2), `test_bse_w_omega_chain` (2) | (b) pre-existing — the old handoff's "bse_ring_comm vma", verified present at HEAD and now precisely diagnosed | `TypeError: scan body ... carry ... {V:(x,y)} varying manual axes` at `src/bse/bse_ring_comm.py:382` (`_apply_V_ring_only` fori_loop carry `A0` unannotated; jax's error prescribes `lax.pvary` on the initial carry). junitA2_7885154. Serial + simple matvec arms PASS, so the dense-reference physics is still covered; only the ring transport arm is dark | OPEN — register row in sandbox `KNOWN_LORRAX_ISSUES.md` (bse section); fix needs an iterate-run cycle (audit every fori/scan carry in the ring path incl. the W arm) |
-| `test_ffi_linalg_contract` under a BARE (no-srun) launch with the host .so loadable: silent interpreter death at import | (d) environment — MPI init without PMI2 glue | CLAIMS 30; reproduced 7885125 step1 (srun WITHOUT transport env also dies). **Upgrade this census adds: with `mpi_transport_env.sh` sourced under `srun --mpi=pmi2 -n1` the pytest form is fully GREEN (leg B2, 27 passed)** — the CLI matrix is no longer the only instrument | Not a code bug; invocation contract. Bare pytest must `--ignore` this file; the srun+transport leg covers it |
+| `test_ffi_linalg_contract` under a BARE (no-srun) launch with the host .so loadable: silent interpreter death at import | (d) environment — MPI init without PMI2 glue | CLAIMS 30; reproduced 7885125 step1 (srun WITHOUT transport env also dies). **Upgrade this census adds: with `mpi_transport_env.sh` sourced under `srun --mpi=pmi2 -n1` the pytest form is fully GREEN (leg B2, 27 passed)** — the CLI matrix is no longer the only instrument | Not a code bug; invocation contract. The bare leg must deselect the service (`--no-services`); the srun+transport leg (`-m distrib_la`) covers it |
 | `test_centroid_distribution::test_orbit_path_with_trivial_group_matches_plain_path` | (d) environment — reproduces ONLY on an UNSUPPORTED jax. Corrected 2026-08-05: an earlier revision of this row claimed the defect was version-independent; direct measurement disproved that, see evidence | `jax.errors.UnexpectedTracerError`: an `int64[]` tracer whose creating frame is `src/centroid/orbit_syms.py:241` at **`<module>` scope** escapes the jit of `kmeans_pp_init` (`src/centroid/kmeans_isdf.py:585`) and is raised out of the Lloyd loop at `src/centroid/kmeans_isdf.py:738`. Only the orbit-on (`R=`/`Rinv=`/`tau=`) branch trips. **Seen only under the Shifter image's bundled jax 0.5.3** (Perlmutter GPU census, jobid 56385965, `pytest_gpu.log`: 7 failed / 920 passed). Under the SUPPORTED jax 0.9.1 venv the same test **passes** — 0 occurrences in `pytest_gpu_venv.log` (jobid 56387442, 16 failed / 911 passed) | NOT ship-listed on the supported stack, and not a fix target. Kept as a **tripwire**: `pyproject.toml` requires `jax>=0.9.0`, so if this reappears the GPU leg is running on the image's jax instead of a venv — the same misconfiguration that makes `jax_compile_cache._canonical_accelerator` arity-mismatch and kill every P>1 run |
 
 ## Environment-limited (skips, each with its covering leg)
@@ -69,10 +79,13 @@ the only remaining red is the ring-vma class.
    refuses (`libhdf5.so.310` unresolvable) — that single mistake produced
    68 failed + 29 errors in job 7885150.  Pattern: job script
    `/scratch2/08271/jackmc/pytest_p11/run_pytest2.sbatch`.
-2. `tests/test_ffi_linalg_contract.py` must be `--ignore`d in the bare
-   leg (import-time death without PMI2 glue) and run under
-   `srun --mpi=pmi2 -n1` with `config/frontera/mpi_transport_env.sh`
-   sourced — green there.
+2. The `distrib_la` service suite must be DESELECTED in the bare leg
+   (`pytest tests/ --no-services`; import-time death without PMI2 glue)
+   and run under `srun --mpi=pmi2 -n1` with
+   `config/frontera/mpi_transport_env.sh` sourced (`pytest -m distrib_la`)
+   — green there.  Deselect through the hook, never through a second
+   `-m`: `pyproject` sets `addopts = "-m 'not extra'"` and an explicit
+   `-m` REPLACES it, silently re-enabling the whole `extra` tier.
 3. Per-test timeout: `pytest-timeout` staged on `PYTHONPATH`
    (`--timeout=2400 --timeout-method=signal`); do NOT also pass
    `-p pytest_timeout` (double registration).

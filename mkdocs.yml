@@ -80,4 +80,6 @@ nav:
       - The FFI layer: architecture/ffi_layout.md
       - SlabIO (sharded-slab HDF5): architecture/slab_io.md
       - Memory model: architecture/memory-model.md
+  - Services:
+      - distrib_la (distributed dense linalg): services/distrib_la.md
   - Contributing: contributing.md

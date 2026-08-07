@@ -117,7 +117,7 @@ plus the launch env of `config/frontera/templates/gw_dev.sbatch`
   class.
 * **Fixture gates** — 2×2/4×4 distributed-vs-replicated eqp max|Δ| =
   0.00e+00 at print precision; 2×4 refused at resolve time
-  (`tests/test_zeta_mesh_invariance.py`, `tests/test_ffi_linalg_contract.py`).
+  (`tests/test_zeta_mesh_invariance.py`, `pytest -m distrib_la`).
 
 ## Auto-thresholds and their calibration
 
