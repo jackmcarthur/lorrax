@@ -8,6 +8,8 @@ preserved through every output rank.
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 
 import h5py
 import jax
@@ -23,7 +25,24 @@ from common.wfn_transforms import (
     gflat_to_rmu)
 from file_io.wfn_loader import WfnLoader
 
-from tests.test_wfn_loader_eager import _synth_wfn, _MOS2_WFN
+# The synthetic-WFN builder moved WITH the loader (charter wave 1): it
+# writes a ``WFN.h5``, so it belongs to the service that reads one, and the
+# service suite has to own it to run from a standalone install.  This is a
+# lorrax test of a lorrax module (``common.wfn_transforms`` is registered
+# OUT of the service — it is a CONSUMER of the loader, survey Q3), so it
+# reaches across for the builder rather than keeping a second copy of a
+# 60-line HDF5 layout that would drift the first time the format moved.
+#
+# The path is inserted HERE rather than relied on from pytest: pytest does
+# put a non-package test directory on ``sys.path``, but only once it has
+# started collecting that directory, which makes the import order-dependent
+# — green when the service suite is collected first and an ImportError when
+# it is not.
+_SVC_TESTS = str(Path(__file__).resolve().parents[1]
+                 / "services" / "wfn_loader" / "tests")
+if _SVC_TESTS not in sys.path:
+    sys.path.insert(0, _SVC_TESTS)
+from test_wfn_loader_contract import _synth_wfn, _MOS2_WFN   # noqa: E402
 
 
 # Every public transform in this module takes a ``mesh`` kwarg.  For
