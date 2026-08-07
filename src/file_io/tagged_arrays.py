@@ -50,19 +50,34 @@ def _restart_write_log_on() -> bool:
 
 
 def _log_restart_write(name, shape, dtype, dt) -> None:
-    """One ``[restart_write]`` line for a completed dataset write.
+    """One ``[restart_write]`` line for a dataset handed to the writer.
 
     Single implementation on purpose: the AF.4c line format is
     load-bearing for log diagnosis, and this module used to carry four
     hand-synced copies of it (audit 2026-07-28; QUALITY_PATTERNS #3).
     Gated by :func:`_restart_write_log_on`.
+
+    ``dt`` is the CALLER's elapsed time, and SlabIO's write path returns
+    as soon as the tile is queued on its writer thread — so ``dt`` is the
+    enqueue, not the transfer, and this line must not present it as one.
+    It used to print ``nb/dt`` as a bandwidth, which reports thousands of
+    MB/s for a dispatch that has moved nothing.  Worse, the flush it hid
+    did not vanish: ``create_dataset`` drains the writer before H5Dcreate
+    (the MPI datatype-cache interleave), so each dataset's ``dt`` is
+    mostly the PREVIOUS dataset's transfer, and a multi-GB tensor's write
+    surfaced against the scalar or header array logged after it, at an
+    apparent 0 MB/s.  Both halves of that read as a writer pathology and
+    neither is one.  So the size and the rate come from the
+    ``SlabIO.close`` drain line, which is the first moment any of the
+    bytes are on disk, and ``dt`` is reported here named for what it is.
     """
     if not _restart_write_log_on():
         return
     nb = int(np.prod(shape)) * int(np.dtype(dtype).itemsize)
     print(f"  [restart_write] {name} {tuple(int(v) for v in shape)}"
-          f" {nb / 1e9:.2f} GB in {dt:.1f} s"
-          f" ({nb / 1e6 / max(dt, 1e-9):.0f} MB/s)", flush=True)
+          f" {nb / 1e9:.2f} GB QUEUED in {dt:.1f} s"
+          f" (transfer time and rate: see the SlabIO.close drain line)",
+          flush=True)
 
 
 def write_restart_state_to_h5(
@@ -146,9 +161,11 @@ def write_restart_state_to_h5(
         if mode == "w":
             io.write_attr("n_rmu_logical", np.int64(int(n_rmu_logical)))
 
-        # PER-DATASET LIVENESS (scorecard AF.4c): every completed write
-        # below emits one [restart_write] line — rationale and the
-        # LORRAX_RESTART_WRITE_LOG gate live at
+        # PER-DATASET LIVENESS (scorecard AF.4c): every dataset below
+        # emits one [restart_write] line naming its size as it is handed
+        # to the writer thread.  The transfer itself is asynchronous and
+        # is timed where it completes, on the SlabIO.close drain line —
+        # rationale and the LORRAX_RESTART_WRITE_LOG gate live at
         # :func:`_restart_write_log_on` / :func:`_log_restart_write`.
 
         def _write(name, arr, mu_axes=(), n_logical=None):

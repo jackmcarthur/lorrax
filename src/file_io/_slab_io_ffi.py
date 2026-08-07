@@ -1483,6 +1483,11 @@ class _FfiBackend(_DatasetGeometry):
         from common.async_io import AsyncDispatcher
         self._dispatcher = AsyncDispatcher(
             name=f"phdf5-dispatch-{path}", maxsize=2)
+        # Bytes handed to the writer thread that are not on disk yet.
+        # write_slab returns as soon as the task is queued, so the
+        # only place that can put a denominator under the flush is the
+        # drain — see close().
+        self._queued_bytes: int = 0
 
     # ------------------------------------------------------------------
     def create_dataset(
@@ -1500,7 +1505,23 @@ class _FfiBackend(_DatasetGeometry):
         # in flight, MPI's datatype-cache state on the file handle
         # interleaves and the next H5Dwrite trips ``MPI_File_set_view:
         # Invalid datatype``.  Drain first.
-        self._drain_pending()
+        #
+        # This drain is where a multi-dataset file spends most of its
+        # write time — the previous dataset's H5Dwrite completes HERE,
+        # not in close() — and it used to be silent, which is why the
+        # caller-side per-dataset timing in file_io.tagged_arrays
+        # attributed one tensor's transfer to the next dataset in the
+        # file.  Report it where it happens.
+        import time as _time
+        _t0 = _time.perf_counter()
+        _flushed = self._drain_pending()
+        _dt = _time.perf_counter() - _t0
+        if (_flushed and jax.process_index() == 0
+                and os.environ.get("LORRAX_PHDF5_CLOSE_VERBOSE", "1") != "0"):
+            print(f"  [SlabIO.flush] {os.path.basename(self.path)}: "
+                  f"{_flushed / 1e9:.2f} GB written in {_dt:.1f} s "
+                  f"({_flushed / 1e6 / max(_dt, 1e-9):.0f} MB/s) before "
+                  f"creating {name!r}", flush=True)
         # ``phdf5_ensure_dataset`` REFUSES (on every rank — it is
         # collective and its inputs are replicated) when the dataset
         # exists at a different shape or dtype, and reuses it when they
@@ -1535,9 +1556,15 @@ class _FfiBackend(_DatasetGeometry):
         self._deferred_attrs.append((name, value))
 
     # ------------------------------------------------------------------
-    def _drain_pending(self) -> None:
-        """Block main thread until all queued write tasks finish."""
+    def _drain_pending(self) -> int:
+        """Block until all queued write tasks finish; return their bytes.
+
+        The byte count is what the drain actually moved, which is the
+        numerator the caller needs to turn a duration into a rate.
+        """
         self._dispatcher.drain()
+        nbytes, self._queued_bytes = self._queued_bytes, 0
+        return nbytes
 
     # ------------------------------------------------------------------
     def _introspect_dataset(self, name: str) -> tuple[tuple[int, ...], "np.dtype"]:
@@ -1707,6 +1734,7 @@ class _FfiBackend(_DatasetGeometry):
             tok = sm(A, offset_arr, valid_shape_arr)
             tok.block_until_ready()
 
+        self._queued_bytes += int(A.nbytes)
         self._dispatcher.submit(_task)
 
     # ------------------------------------------------------------------
@@ -1852,15 +1880,24 @@ class _FfiBackend(_DatasetGeometry):
         # downstream would re-raise it either.  Record it, complete the
         # teardown every rank is inside, then raise at the end.
         _worker_error: BaseException | None = None
+        _drained_bytes = 0
         _t0 = _time.perf_counter()
         try:
-            self._drain_pending()
+            _drained_bytes = self._drain_pending()
         except BaseException as exc:                          # noqa: BLE001
             _worker_error = exc
         _t_drain = _time.perf_counter() - _t0
         if _verbose:
+            # The size and the rate belong HERE and only here.  A caller
+            # timing its own write_slab() is timing the enqueue, so the
+            # rate it can compute is a fiction of the queue depth; this
+            # is the first point at which the bytes are on disk.
+            _moved = (f"{_drained_bytes / 1e9:.2f} GB at "
+                      f"{_drained_bytes / 1e6 / max(_t_drain, 1e-9):.0f} MB/s"
+                      if _drained_bytes else "no queued data")
             print(f"  [SlabIO.close] Python dispatch drained in "
-                  f"{_t_drain:.1f} s; joining writer thread", flush=True)
+                  f"{_t_drain:.1f} s ({_moved}); joining writer thread",
+                  flush=True)
         _t0 = _time.perf_counter()
         try:
             self._dispatcher.close()            # drain + poison pill + join
