@@ -244,6 +244,35 @@ class WfnLoader:
         self.trs_holds = True
         self._run_density_symmetry_check()
 
+    # ------------------------------------------------------------------
+    # Public identity (DESIGN DECISION 3)
+    # ------------------------------------------------------------------
+    @property
+    def path(self) -> str:
+        """The WFN.h5 this loader was constructed on.
+
+        Consumers that re-open a SECOND loader/reader off the same file
+        (``file_io/qp_wfn.py``, ``centroid/{charge,current}_density.py``,
+        ``psp/dft_operators.py``) were reaching into ``_filename``; this is
+        the same string under a public name.  ``_filename`` stays as a
+        compat attribute — it costs one assignment in ``__init__`` and the
+        legacy ``WFNReader`` spelling is still exported by the shim for
+        the sibling wave-1 branches.
+        """
+        return self._path
+
+    @property
+    def kpt_starts(self) -> np.ndarray:
+        """Exclusive prefix sum of ``ngk`` — the per-k offset into the
+        flat ``wfns/coeffs`` / ``wfns/gvecs`` G axis.
+
+        Public for the ``common/density_symmetry_check.py`` seam, which
+        reads this to slice the raw datasets itself (survey §2.1).  That
+        file belongs to the symmetry_maps orchestrator; the PROPERTY is
+        this door's half of the seam.
+        """
+        return self._kpt_starts
+
     def _run_density_symmetry_check(self) -> None:
         """Measure TRS + the spatial symmetry table from ψ (see above)."""
         from common.density_symmetry_check import cached_density_symmetry_check
@@ -449,11 +478,22 @@ class WfnLoader:
     # ------------------------------------------------------------------
     # k-set resolution
     # ------------------------------------------------------------------
-    def _ensure_sym(self):
+    def symmetry(self):
+        """The loader's ``SymMaps``, built on first use and cached.
+
+        Public accessor (DESIGN DECISION 3).  Idempotent: every call after
+        the first returns the SAME object, which is what the two external
+        consumers (``common/wfn_transforms.py``, ``common/psi_G_store.py``)
+        rely on — they hand it straight to kernels keyed on its identity.
+        """
         from common.symmetry_maps import SymMaps
         if self._sym is None:
             self._sym = SymMaps(self._sym_wfn_stub())
         return self._sym
+
+    #: Compat alias.  Internal call sites and the sibling wave-1 branches
+    #: still spell ``_ensure_sym``; one line keeps them working.
+    _ensure_sym = symmetry
 
     def _sym_wfn_stub(self):
         """Minimal namespace SymMaps's __init__ reads; lets us construct

@@ -262,6 +262,107 @@ def test_auto_backend_resolves_to_eager_on_single_process(synth_wfn_path):
 
 
 # ===========================================================================
+#  The three publics DESIGN DECISION 3 promoted (step 3, the replumb's door).
+#
+#  Each of ``path`` / ``symmetry()`` / ``kpt_starts`` replaced a PRIVATE that
+#  consumers outside this service were already reading (survey §2.2: nine
+#  load-bearing privates).  A promotion with no cell is a rename nobody has
+#  watched work, so each cell below states the claim in a form that FAILS if
+#  the promotion is deleted, mis-wired, or made to return a placeholder.
+# ===========================================================================
+
+def test_path_property_is_the_constructor_argument(tmp_path, synth_wfn_path):
+    """``path`` == what was passed in, normalised to ``str``.
+
+    Falsifiable three ways: against the literal argument, against a
+    ``pathlib.Path`` argument (the property must not leak a Path object —
+    ``qp_wfn``/``centroid`` feed it straight back to ``h5py.File`` and to
+    ``WfnLoader`` itself), and against the ``_filename`` compat attribute,
+    which the sibling wave-1 branches still read and which must therefore
+    stay the SAME string.
+    """
+    from pathlib import Path
+
+    with WfnLoader(synth_wfn_path) as loader:
+        assert loader.path == synth_wfn_path
+        assert isinstance(loader.path, str)
+        # Compat attribute survives and does not drift from the property.
+        assert loader._filename == loader.path
+
+    # A Path argument is normalised, not passed through.
+    with WfnLoader(Path(synth_wfn_path)) as loader:
+        assert loader.path == str(synth_wfn_path)
+        assert type(loader.path) is str
+
+    # Read-only: the consumers that re-open off this string must not be
+    # able to retarget a live loader's identity behind its own file handle.
+    with WfnLoader(synth_wfn_path) as loader:
+        with pytest.raises(AttributeError):
+            loader.path = str(tmp_path / "somewhere_else.h5")
+        assert loader.path == synth_wfn_path
+
+
+def test_symmetry_is_lazy_idempotent_and_the_ensure_sym_alias(synth_wfn_path):
+    """``symmetry()`` builds once and returns the SAME object thereafter.
+
+    The two external consumers (``common/wfn_transforms.py``,
+    ``common/psi_G_store.py``) hand the result to kernels keyed on its
+    identity, so "equal" is not the claim — ``is`` is.
+
+    Anti-tautology: the cache is asserted EMPTY before the first call, so a
+    property that returned a fresh object every time, or one that had been
+    pre-populated in ``__init__`` (which would change construction cost for
+    every consumer in the tree), both fail here rather than pass silently.
+    """
+    with WfnLoader(synth_wfn_path) as loader:
+        assert loader._sym is None, (
+            "symmetry() must stay LAZY: building SymMaps in __init__ puts "
+            "the symmetry cost on every consumer that only wanted headers")
+        first = loader.symmetry()
+        assert first is not None
+        assert loader._sym is first          # the call is what populated it
+        assert loader.symmetry() is first    # idempotent
+        # ``_ensure_sym`` is an alias, not a second implementation.
+        assert loader._ensure_sym() is first
+        assert WfnLoader._ensure_sym is WfnLoader.symmetry
+
+
+def test_kpt_starts_property_matches_the_mf_header_prefix_sum(synth_wfn_path):
+    """``kpt_starts`` == exclusive prefix sum of ``ngk``.
+
+    Checked against ``mf_header.kpt_starts`` (the function the loader calls
+    — the seam ``common/density_symmetry_check.py`` depends on) AND against
+    an independently written cumsum, because agreeing with the very
+    function under test is close to a tautology on its own.
+
+    Non-vacuity: the synthetic deck is asserted RAGGED (ngk differs across
+    k), so an implementation returning zeros, ``arange``, or the inclusive
+    prefix sum all fail.
+    """
+    from file_io.mf_header import kpt_starts as mf_kpt_starts
+
+    with WfnLoader(synth_wfn_path) as loader:
+        ngk = np.asarray(loader.ngk)
+        assert ngk.size >= 2 and len(set(ngk.tolist())) > 1, (
+            "the deck must be ragged or this cell cannot see the "
+            "difference between a prefix sum and a constant")
+
+        got = loader.kpt_starts
+        np.testing.assert_array_equal(got, mf_kpt_starts(ngk))
+        # Independent statement of the same arithmetic.
+        expected = np.concatenate(([0], np.cumsum(ngk)[:-1]))
+        np.testing.assert_array_equal(np.asarray(got), expected)
+        assert int(got[0]) == 0
+        assert int(got[-1]) + int(ngk[-1]) == int(ngk.sum())
+        # Same object the private carried — density_symmetry_check reads
+        # one of the two and must not get a copy that drifts.
+        assert got is loader._kpt_starts
+
+        with pytest.raises(AttributeError):
+            loader.kpt_starts = np.zeros_like(got)
+
+
+# ===========================================================================
 #  The phdf5 collective read's on-device unfold tail, vs eager.
 #
 #  ``_phdf5_unfold_and_shard`` is the only part of the phdf5 backend that
