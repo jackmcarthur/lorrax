@@ -141,9 +141,10 @@ measures that the marks arrived).
   Deselect: `--no-services` / `--only-service=NAME`, never a second `-m`
   (`pyproject` sets `addopts = "-m 'not extra'"` and an explicit `-m`
   REPLACES it, silently re-enabling 26 deselected suites).
-* Perlmutter floor, 2026-08-07, HEAD `32e61fe`, BUILD_NOTES pins: full-suite
-  `-m distrib_la` **130 cells / 0 failed / 22 skipped**; service-only by
-  path **250 / 0 / 3**.
+* Perlmutter floor, 2026-08-07, HEAD `eeece71`, BUILD_NOTES pins: full-suite
+  `-m distrib_la` **130 cells / 0 failed / 22 skipped** (was 124 / 8 failed
+  before the SONAME fix); service-only by path **250 / 0 / 3**, of which
+  lxkit is 120 and unchanged.
 
 ## Performance
 
