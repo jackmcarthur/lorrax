@@ -108,6 +108,7 @@ class CrystalData:
     nelec: float
     nspin: int
     nspinor: int
+    spinorbit: bool                 # QE lspinorb — NOT implied by nspinor==2
     ecutwfc: float                  # [Ry]
     ecutrho: float                  # [Ry]
     fft_grid: tuple[int, int, int]
@@ -181,6 +182,16 @@ class CrystalData:
         lsda = _text(root, "lsda") == "true"
         nspinor = 2 if noncolin else 1
         nspin = 2 if (lsda and not noncolin) else 1
+        # ── <spinorbit> ── QE's lspinorb, and the ONLY authoritative record
+        # of it that survives the DFT run.  It is NOT implied by ``noncolin``:
+        # ``noncolin=.true., lspinorb=.false.`` writes 2-component spinors
+        # whose eigenvalues carry no spin-orbit at all, because QE ran
+        # ``average_pp`` and collapsed the fully-relativistic pseudopotential's
+        # j = ℓ±1/2 channels first.  A consumer that reads only ``nspinor``
+        # cannot tell the two runs apart — and if it then builds j-resolved
+        # projectors it silently produces an operator the wavefunctions never
+        # saw.  ``psp.vnl_ops.resolve_soc_mode`` consumes this field.
+        spinorbit = _text(root, "spinorbit") == "true"
 
         ecutwfc = 2.0 * float(_text(root, "ecutwfc"))
         ecutrho = 2.0 * float(_text(root, "ecutrho"))
@@ -209,7 +220,7 @@ class CrystalData:
             atom_crys=atom_crys, atom_types=atom_types,
             ntran=ntran, sym_matrices=sym_matrices, translations=translations,
             sym_time_rev=sym_time_rev,
-            nelec=nelec, nspin=nspin, nspinor=nspinor,
+            nelec=nelec, nspin=nspin, nspinor=nspinor, spinorbit=spinorbit,
             ecutwfc=ecutwfc, ecutrho=ecutrho, fft_grid=fft_grid,
             nbands=nbands, nkpts=0, kgrid=kgrid,
             assume_isolated=assume_isolated, _save_dir=save_dir,

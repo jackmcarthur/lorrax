@@ -22,7 +22,9 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from psp.radial.build_projectors_qe import build_E_blocks_full
+from psp.radial.build_projectors_qe import (
+    build_E_blocks_full, pseudo_has_j_channels, pseudo_soc_strength_ry,
+)
 from psp.radial.radial_jax import differentiate_uniform_table
 from psp.radial.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
 from psp.radial_tables import projector_deriv_table as _projector_deriv_table
@@ -66,6 +68,11 @@ class VNLSetup:
     nspinor: int
     E_super: jax.Array | None = None  # (nspinor, nspinor, total_R, total_R)
     l_max: int = 0
+    # WHICH PROJECTORS THESE ARE.  True = j-resolved (spin-orbit in V_NL);
+    # False = j-averaged scalar-relativistic (QE average_pp).  Resolved by
+    # ``resolve_soc_mode`` and carried so a consumer can stamp it into an
+    # artifact's provenance instead of guessing from ``nspinor``.
+    soc: bool = True
     # ── Pre-flattened per-row metadata for vectorized Z assembly ──
     # Each row r of Z(total_R, nG) is: c_il * G[beta_idx[r], q] * S[l[r], m[r], G] * phase[tau[r], G]
     row_beta_idx: jax.Array | None = None  # (total_R,) int — which G_table row
@@ -95,11 +102,113 @@ class VNLKData:
 # Setup builder
 # ---------------------------------------------------------------------------
 
+SOC_BANNER = "=" * 78
+
+
+def resolve_soc_mode(pseudos, wfn=None, *, soc=None, nspinor=1,
+                     caller: str = "", print_fn=print) -> bool:
+    """Decide j-RESOLVED vs j-AVERAGED projectors, and SAY SO.
+
+    ``noncolin`` (nspinor=2) is NOT ``lspinorb``.  Nothing in a BerkeleyGW
+    ``WFN.h5`` records which one the DFT run used — ``mf_header`` carries
+    ``nspinor`` and nothing else — so for that input the question is not
+    answerable from the file and the honest outcome is an ANNOUNCED
+    assumption, never a silent one.
+
+    Signals consulted, in order of authority:
+
+    1. ``soc=`` passed by the caller (a deck key or CLI flag).  AUTHORITATIVE.
+    2. ``wfn.spinorbit`` — QE's ``<spinorbit>`` from ``data-file-schema.xml``,
+       present when the structure came from a QE ``.save`` (see
+       ``file_io.qe_save_reader``).  AUTHORITATIVE.
+    3. Nothing.  UNDETERMINED → keep the historical j-resolved default and
+       print the banner below.
+
+    Returns the resolved ``soc`` bool to hand to ``build_E_blocks_full``.
+
+    WHEN THIS RETURNS QUIETLY (the FALSE branch, i.e. no announcement):
+      * no pseudo resolves j (scalar-relativistic UPF, or ℓ=0 only) — there is
+        no choice to make, both paths build the same operator;
+      * nspinor == 1 and no pseudo resolves j — same;
+      * an authoritative signal exists and it agrees with what will be built.
+    Those are real cases that occur in this repo's own fixtures, so the check
+    is not vacuously loud.
+    """
+    tag = f"[{caller}] " if caller else ""
+    j_pseudos = {el: p for el, p in (pseudos or {}).items()
+                 if pseudo_has_j_channels(p)}
+
+    # ── nothing resolves j: the question does not arise ──
+    if not j_pseudos:
+        if soc:
+            print_fn(f"{tag}soc=True requested but no pseudopotential resolves "
+                     f"j = ℓ±1/2; V_NL is spin-scalar either way.")
+        return False
+
+    declared = soc
+    source = "caller"
+    if declared is None:
+        declared = getattr(wfn, "spinorbit", None)
+        source = "QE <spinorbit>"
+
+    strengths = {el: pseudo_soc_strength_ry(p) for el, p in j_pseudos.items()}
+    worst_ry = max(strengths.values(), default=0.0)
+    worst_ev = worst_ry * 13.605693122994
+
+    if declared is None:
+        # ── UNDETERMINED.  Announce; do not decide silently. ──
+        print_fn(f"\n{SOC_BANNER}")
+        print_fn(f"{tag}SPIN-ORBIT MODE UNDETERMINED — assuming lspinorb=.TRUE.")
+        print_fn(SOC_BANNER)
+        print_fn(f"  Fully-relativistic pseudopotentials: {sorted(j_pseudos)}")
+        print_fn(f"  Wavefunctions: nspinor={nspinor} "
+                 f"(noncollinear — which does NOT imply spin-orbit)")
+        print_fn(f"  max |D(ℓ,j=ℓ+1/2) − D(ℓ,j=ℓ−1/2)| = {worst_ry:.6f} Ry "
+                 f"= {worst_ev:.4f} eV")
+        print_fn("")
+        print_fn("  V_NL will be built j-RESOLVED, i.e. WITH spin-orbit.  If the")
+        print_fn("  DFT run that produced these wavefunctions used")
+        print_fn("  noncolin=.true., lspinorb=.false., then QE ran average_pp")
+        print_fn("  and its eigenvalues carry NO spin-orbit — this operator will")
+        print_fn("  split degeneracies the wavefunctions do not have.")
+        print_fn("")
+        print_fn("  Nothing in a BerkeleyGW WFN.h5 records lspinorb.  Resolve it:")
+        print_fn("    * pass soc=True/False explicitly, or")
+        print_fn("    * build from a QE .save so <spinorbit> can be read.")
+        print_fn(SOC_BANNER + "\n")
+        return True
+
+    declared = bool(declared)
+    if declared:
+        print_fn(f"{tag}V_NL: j-RESOLVED (spin-orbit ON), from {source}.  "
+                 f"FR pseudos {sorted(j_pseudos)}, "
+                 f"ΔD = {worst_ry:.6f} Ry = {worst_ev:.4f} eV.")
+        if nspinor == 1:
+            print_fn(f"\n{SOC_BANNER}")
+            print_fn(f"{tag}MISMATCH: spin-orbit requested with nspinor=1.")
+            print_fn(SOC_BANNER)
+            print_fn("  A j-resolved V_NL has no representation on one-component")
+            print_fn("  wavefunctions: only the E^{↑↑} block is retained, which is")
+            print_fn("  m-dependent and is NOT the scalar-relativistic operator.")
+            print_fn("  Pass soc=False for a scalar-relativistic run.")
+            print_fn(SOC_BANNER + "\n")
+        return True
+
+    # declared False, and the pseudos DO resolve j → the averaged path
+    print_fn(f"{tag}V_NL: j-AVERAGED (scalar-relativistic, QE average_pp), "
+             f"from {source}.  FR pseudos {sorted(j_pseudos)}, "
+             f"discarding ΔD = {worst_ry:.6f} Ry = {worst_ev:.4f} eV of "
+             f"spin-orbit.")
+    return False
+
+
 def build_vnl_setup(
     wfn, sym=None, meta=None, pseudos=None,
     n_q: int = 4000,
     nspinor: int | None = None,
     q_max: float | None = None,
+    soc: bool | None = None,
+    print_fn=print,
 ) -> VNLSetup:
     """Build k-independent VNL data: radial tables, channel metadata.
 
@@ -110,12 +219,21 @@ def build_vnl_setup(
     meta : Meta, optional — used with sym for q_max scan.
     pseudos : dict — element → UPF
     q_max : float, optional — if provided, skip the k-point scan for q_max.
+    soc : bool, optional — j-RESOLVED (True) vs j-AVERAGED (False) projectors.
+        ``None`` (default) means "not declared": ``resolve_soc_mode`` looks for
+        a QE ``<spinorbit>`` flag and, failing that, keeps the historical
+        j-resolved behaviour and ANNOUNCES the assumption.  See
+        ``psp.radial.build_projectors_qe`` for why noncolin ≠ lspinorb.
     """
     from psp.species import extract_species, build_atom_species_map
     from psp.radial_tables import build_all_tables
 
     if nspinor is None:
         nspinor = int(meta.nspinor) if meta is not None else int(wfn.nspinor)
+
+    soc_resolved = resolve_soc_mode(
+        pseudos, wfn, soc=soc, nspinor=int(nspinor),
+        caller="build_vnl_setup", print_fn=print_fn)
 
     B = float(wfn.blat) * np.asarray(wfn.bvec, dtype=float)
     cell_volume = float(wfn.cell_volume)
@@ -162,7 +280,7 @@ def build_vnl_setup(
             continue
         tau = species_tau[isp, :natoms]
 
-        E_blocks = build_E_blocks_full(pseudos[sp.element])
+        E_blocks = build_E_blocks_full(pseudos[sp.element], soc=soc_resolved)
 
         # Group projectors by l
         per_l: dict[int, list[int]] = {}
@@ -256,7 +374,7 @@ def build_vnl_setup(
         prefactor=prefactor,
         B=B, cell_volume=cell_volume,
         total_R=total_R, nspinor=nspinor,
-        E_super=E_super_j, l_max=l_max,
+        E_super=E_super_j, l_max=l_max, soc=bool(soc_resolved),
         row_beta_idx=row_beta_idx_j,
         row_l=row_l_j, row_m=row_m_j, row_tau=row_tau_j,
     )

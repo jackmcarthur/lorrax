@@ -707,8 +707,179 @@ def real_harmonic_slot(l: int, m_label: int) -> int:
 # Removed: per_type_beta_m_slots (unused)
 
 
-def build_E_blocks_full(pseudo) -> Dict[int, np.ndarray]:
-    """Assemble full E^{σσ'} blocks per ℓ retaining all radial projectors."""
+# ---------------------------------------------------------------------------
+# j-RESOLVED vs j-AVERAGED — WHICH PROJECTORS GET BUILT
+# ---------------------------------------------------------------------------
+#
+# A fully-relativistic (FR) UPF carries a SEPARATE radial β for each
+# j = ℓ ± 1/2, with a SEPARATE D coefficient.  Two DIFFERENT operators can be
+# built from it, and they are not small perturbations of each other:
+#
+#   j-RESOLVED (``soc=True``)  —  V_NL = Σ_{ℓ j} D_{ℓj} |β_{ℓj}⟩ f^{σσ'}_{ℓj} ⟨β_{ℓj}|
+#       Carries spin-orbit.  This is what QE builds when ``lspinorb=.true.``.
+#
+#   j-AVERAGED (``soc=False``) —  the two j channels of each (ℓ, radial index)
+#       are collapsed into ONE scalar-relativistic channel, spin-diagonal, and
+#       V_NL becomes  V^scalar ⊗ 1_{2×2}.  Carries NO spin-orbit.  This is what
+#       QE builds when ``noncolin=.true., lspinorb=.false.`` — see
+#       ``PW/src/average_pp.f90``, which this function reproduces exactly.
+#
+# ``noncolin`` (⇒ nspinor=2) DOES NOT IMPLY ``lspinorb``.  A QE run with
+# ``noncolin=.true., lspinorb=.false.`` writes 2-component spinor wavefunctions
+# whose eigenvalues carry NO spin-orbit splitting, because ``average_pp`` ran
+# first.  Feeding those wavefunctions a j-resolved V_NL produces an operator
+# that splits degeneracies the wavefunctions' own Hamiltonian did not have.
+#
+# MEASURED, si_cohsex_debug fixture (WFN.h5 ≡ QE run 06_si_4x4x4_nosoc,
+# ``<spinorbit>false</spinorbit>``, ``el`` matches to max|Δ| = 0.0 eV over all
+# 496 (k,band)):  at Γ the Γ25' manifold is 6-fold degenerate in ``el`` to
+# 1e-9 eV AND in QE's own ``kih.dat`` to 0.0000 meV, while LORRAX's
+# ``kin_ion`` splits it 2+4 by 47.91 meV — silicon's Δ₀.  That is the
+# j-resolved operator acting on j-averaged wavefunctions.
+#
+# THE ALGEBRA OF THE AVERAGE.  QE's ``average_pp`` collapses the pair
+# (β_-, β_+) ≡ (β_{ℓ,ℓ-1/2}, β_{ℓ,ℓ+1/2}) into a single β_avg:
+#
+#     D_avg  = [ (ℓ+1)·D_+ + ℓ·D_- ] / (2ℓ+1)
+#     β_avg  = [ (ℓ+1)·√(D_+/D_avg)·β_+ + ℓ·√(D_-/D_avg)·β_- ] / (2ℓ+1)
+#
+# so the operator it builds is  |β_avg⟩ D_avg ⟨β_avg| ⊗ 1_spin.  We do NOT
+# rebuild the radial tables to form β_avg: keeping BOTH β_± in the basis and
+# replacing the (2×2) D sub-block by the RANK-1 matrix
+#
+#     D'_{rc} = D_avg · u_r u_c ,   u_- = ℓ·√(D_-/D_avg)/(2ℓ+1)
+#                                   u_+ = (ℓ+1)·√(D_+/D_avg)/(2ℓ+1)
+#
+# reproduces  |β_avg⟩ D_avg ⟨β_avg|  IDENTICALLY, because β_avg is by
+# construction the linear combination u_-β_- + u_+β_+ scaled by 1.  Nothing
+# downstream changes: same radial tables, same projector rows, same
+# contraction.  ONLY the E block differs — which is the point: the choice of
+# projectors is upstream of the contraction and does not touch it.
+#
+# ℓ=0 has a single j=1/2 channel and ``f_blocks_lj(0, 0.5)`` is ALREADY the
+# spin identity, so the two paths agree there exactly (verified numerically:
+# max|E^{↑↓}| = 0 and max|E^{↑↑}−E^{↓↓}| = 0 for ℓ=0 either way).
+
+def pseudo_has_j_channels(pseudo) -> bool:
+    """True when this UPF actually resolves j = ℓ±1/2 (fully relativistic).
+
+    Reads the file, not a caller's belief.  Positive only when a β with ℓ>0
+    carries an explicit ``jjj`` — that is the ONLY thing that makes a
+    j-resolved operator constructible.  ``has_so`` / ``relativistic="full"``
+    in PP_HEADER are cross-checked but not trusted alone: the ℓ>0 ``jjj``
+    values are what ``build_E_blocks_full`` consumes, so they are what decides.
+
+    Returns FALSE for: a scalar-relativistic UPF, a non-relativistic UPF, and
+    an FR UPF with only ℓ=0 projectors (where j resolution is vacuous — the
+    j=1/2 block is already the spin identity).
+    """
+    ppnl = getattr(pseudo, 'pp_nonlocal', None)
+    if ppnl is None:
+        return False
+    for beta in getattr(ppnl, 'pp_beta', []) or []:
+        l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
+        if l > 0 and getattr(beta, 'jjj', None) is not None:
+            return True
+    return False
+
+
+def pseudo_soc_strength_ry(pseudo) -> float:
+    """max over ℓ>0 of |D(ℓ, j=ℓ+1/2) − D(ℓ, j=ℓ−1/2)| in Ry.
+
+    The spin-orbit strength the FR pseudopotential would inject if built
+    j-resolved.  Zero means the two j channels are degenerate and the
+    j-resolved and j-averaged operators coincide, so the choice cannot matter;
+    non-zero is the amount at stake.  Used only for reporting.
+    """
+    ppnl = getattr(pseudo, 'pp_nonlocal', None)
+    if ppnl is None:
+        return 0.0
+    betas = list(getattr(ppnl, 'pp_beta', []) or [])
+    if not betas:
+        return 0.0
+    try:
+        nproj = int(getattr(pseudo.pp_header, 'number_of_proj', len(betas)))
+        D = np.asarray(ppnl.pp_dij.value, dtype=np.float64).reshape(nproj, nproj)
+    except Exception:
+        return 0.0
+    groups: Dict[tuple, List[int]] = {}
+    for i, beta in enumerate(betas):
+        l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
+        j = getattr(beta, 'jjj', None)
+        if l > 0 and j is not None:
+            groups.setdefault((l, float(j)), []).append(i)
+    worst = 0.0
+    for (l, j), idx in groups.items():
+        partner = groups.get((l, 2 * l - j))  # j ↔ 2ℓ − j maps ℓ±1/2 to ℓ∓1/2
+        if partner is None or len(partner) != len(idx):
+            continue
+        for a, b in zip(idx, partner):
+            worst = max(worst, abs(float(D[a, a]) - float(D[b, b])))
+    return worst
+
+
+def _spin_identity(msize: int) -> np.ndarray:
+    """δ_{σσ'} ⊗ 1_{msize}, shaped (2, 2, msize, msize)."""
+    ident = np.zeros((2, 2, msize, msize), dtype=np.complex128)
+    ident[0, 0] = np.eye(msize)
+    ident[1, 1] = np.eye(msize)
+    return ident
+
+
+def _pair_j_channels(l: int, entries: List[tuple[int, object]]) -> List[tuple]:
+    """Pair the β of an ℓ>0 shell into (idx_minus, idx_plus) j = ℓ∓1/2 pairs.
+
+    Mirrors ``average_pp.f90``'s consecutive-index walk, including its two
+    ``errore('average_pp','wrong beta functions')`` refusals: an FR UPF must
+    present the two j channels of each radial index adjacently.  Raises rather
+    than guessing — a UPF that does not pair is one whose scalar-relativistic
+    reduction we cannot define, and silently picking one is the failure mode
+    this whole module exists to remove.
+    """
+    pairs: List[tuple] = []
+    i = 0
+    n = len(entries)
+    while i < n:
+        gi, bi = entries[i]
+        ji = float(getattr(bi, 'jjj', l + 0.5))
+        if i + 1 >= n:
+            raise RuntimeError(
+                f"j-average: ℓ={l} has an ODD number of β functions "
+                f"({n}); a fully-relativistic UPF must supply both "
+                f"j = ℓ±1/2 for every radial index.")
+        gj, bj = entries[i + 1]
+        jj = float(getattr(bj, 'jjj', l + 0.5))
+        if abs(ji - (l - 0.5)) < 1e-7 and abs(jj - (l + 0.5)) < 1e-7:
+            pairs.append((gi, gj))
+        elif abs(ji - (l + 0.5)) < 1e-7 and abs(jj - (l - 0.5)) < 1e-7:
+            pairs.append((gj, gi))
+        else:
+            raise RuntimeError(
+                f"j-average: β pair ({i}, {i+1}) of ℓ={l} has "
+                f"j = ({ji}, {jj}); expected {{{l-0.5}, {l+0.5}}}.  "
+                f"This is average_pp.f90's 'wrong beta functions'.")
+        i += 2
+    return pairs
+
+
+def build_E_blocks_full(pseudo, *, soc: bool = True) -> Dict[int, np.ndarray]:
+    """Assemble full E^{σσ'} blocks per ℓ retaining all radial projectors.
+
+    Parameters
+    ----------
+    pseudo : parsed UPF object.
+    soc : bool, default True
+        ``True``  — j-RESOLVED projectors: the operator carries spin-orbit.
+                    Use for wavefunctions from ``lspinorb=.true.``.
+        ``False`` — j-AVERAGED projectors: scalar-relativistic V_NL ⊗ 1_spin,
+                    reproducing QE ``average_pp``.  Use for wavefunctions from
+                    ``noncolin=.true., lspinorb=.false.``.
+
+        The default preserves the historical behaviour EXACTLY for FR UPFs.
+        It is a default, not a detection: the caller
+        (``vnl_ops.build_vnl_setup``) is responsible for establishing which
+        one the wavefunctions actually want and for announcing when it cannot.
+    """
     ppnl = getattr(pseudo, 'pp_nonlocal', None)
     if ppnl is None:
         return {}
@@ -722,6 +893,8 @@ def build_E_blocks_full(pseudo) -> Dict[int, np.ndarray]:
         D_mat = D_mat.reshape(nproj, nproj)
     except Exception as exc:  # pragma: no cover - propagate meaningful error
         raise RuntimeError("Pseudopotential missing PP_DIJ matrix") from exc
+
+    has_j = pseudo_has_j_channels(pseudo)
 
     per_l: Dict[int, List[tuple[int, object]]] = {}
     for idx, beta in enumerate(betas, start=1):
@@ -738,6 +911,66 @@ def build_E_blocks_full(pseudo) -> Dict[int, np.ndarray]:
         E = np.zeros((2, 2, size, size), dtype=np.complex128)
 
         order_map = {global_idx: pos for pos, (global_idx, _) in enumerate(entries)}
+
+        # ── NO j information in the UPF (scalar-relativistic pseudo) ──
+        # The historical code fell through to ``getattr(beta,'jjj', l+0.5)``,
+        # i.e. it built a PURE j=ℓ+1/2 channel: spin-mixing, m-dependent, and
+        # carrying only (2j+1)/(2(2ℓ+1)) of the channel's trace for ℓ>0.  The
+        # correct operator for a pseudo with no j resolution is the spin
+        # identity, and that is what is built here regardless of ``soc`` —
+        # there are no j channels to resolve.
+        if not has_j:
+            ident = _spin_identity(msize)
+            for g_r in (g for g, _ in entries):
+                pos_r = order_map[g_r]
+                slice_r = slice(pos_r * msize, (pos_r + 1) * msize)
+                for g_c in (g for g, _ in entries):
+                    pos_c = order_map[g_c]
+                    slice_c = slice(pos_c * msize, (pos_c + 1) * msize)
+                    E[:, :, slice_r, slice_c] += D_mat[g_r, g_c] * ident
+            result[l] = E
+            continue
+
+        # ── j-AVERAGED: QE average_pp, expressed as a rank-1 D sub-block ──
+        if not soc:
+            ident = _spin_identity(msize)
+            if l == 0:
+                # single j=1/2 channel; f_blocks_lj(0, 0.5) IS the identity,
+                # so nothing to average — keep D as it stands.
+                for g_r in (g for g, _ in entries):
+                    pos_r = order_map[g_r]
+                    slice_r = slice(pos_r * msize, (pos_r + 1) * msize)
+                    for g_c in (g for g, _ in entries):
+                        pos_c = order_map[g_c]
+                        slice_c = slice(pos_c * msize, (pos_c + 1) * msize)
+                        E[:, :, slice_r, slice_c] += D_mat[g_r, g_c] * ident
+            else:
+                for g_minus, g_plus in _pair_j_channels(l, entries):
+                    d_m = complex(D_mat[g_minus, g_minus]).real
+                    d_p = complex(D_mat[g_plus, g_plus]).real
+                    d_avg = ((l + 1.0) * d_p + l * d_m) / (2.0 * l + 1.0)
+                    if d_avg == 0.0:
+                        raise RuntimeError(
+                            f"j-average: ℓ={l} channel has D_avg = 0; "
+                            f"average_pp's √(D/D_avg) is undefined.")
+                    # QE's √(D_j / D_avg): the RATIO is positive whenever both
+                    # j channels have D of the same sign as their weighted
+                    # mean, which is what makes this well-defined for the
+                    # negative-D ℓ=2 channels of an ONCV FR pseudo.
+                    u = {g_minus: l * np.sqrt(d_m / d_avg) / (2.0 * l + 1.0),
+                         g_plus: (l + 1.0) * np.sqrt(d_p / d_avg) / (2.0 * l + 1.0)}
+                    for g_r in (g_minus, g_plus):
+                        pos_r = order_map[g_r]
+                        slice_r = slice(pos_r * msize, (pos_r + 1) * msize)
+                        for g_c in (g_minus, g_plus):
+                            pos_c = order_map[g_c]
+                            slice_c = slice(pos_c * msize, (pos_c + 1) * msize)
+                            E[:, :, slice_r, slice_c] += (
+                                d_avg * u[g_r] * u[g_c]) * ident
+            result[l] = E
+            continue
+
+        # ── j-RESOLVED (historical default, bit-identical) ──
         j_groups: Dict[float, List[int]] = {}
         for global_idx, beta in entries:
             j_val = float(getattr(beta, 'jjj', l + 0.5))
@@ -907,6 +1140,8 @@ __all__ = [
     "qe_real_sph_harmonics_with_grad",
     "real_harmonic_slot",
     "build_E_blocks_full",
+    "pseudo_has_j_channels",
+    "pseudo_soc_strength_ry",
     "compute_type_projectors_real",
     "precompute_projector_tables",
     "precompute_projector_splines",

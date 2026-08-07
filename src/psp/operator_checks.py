@@ -112,3 +112,148 @@ def validate_operator_inputs(
         sys_dim=sys_dim,
         pseudos=pseudos,
     )
+
+
+# ---------------------------------------------------------------------------
+# Degeneracy consistency: does the operator have the symmetry of the states?
+# ---------------------------------------------------------------------------
+
+def check_degeneracy_consistency(
+    H, energies, *, el_tol_ry: float = 1e-9, split_tol_ry: float = 1e-5,
+    max_report: int = 8, label: str = "kin_ion", print_fn=print,
+) -> dict:
+    """Flag operator blocks that split a manifold the eigenvalues do not.
+
+    THE ARGUMENT.  A set of bands degenerate in ``el`` spans an invariant
+    subspace of the Hamiltonian that produced them.  ``H`` here is a PIECE of
+    that Hamiltonian (T + V_loc + V_NL).  If ``H`` restricted to such a
+    manifold is NOT a multiple of the identity, then ``H`` distinguishes
+    states the full Hamiltonian did not — it has strictly lower symmetry than
+    the operator the wavefunctions diagonalise.  For a fully-relativistic
+    pseudopotential the usual cause is that V_NL was built j-RESOLVED while
+    the wavefunctions came from a j-AVERAGED (``lspinorb=.false.``) run: the
+    j-resolved V_NL carries spin-orbit, so it splits exactly the manifolds
+    spin-orbit is allowed to split, in exactly the pattern it would produce.
+
+    This needs NO metadata — not ``<spinorbit>``, not a deck key, not the UPF.
+    It compares the operator against the wavefunctions it is being applied to,
+    which is the only comparison that is always available.
+
+    Eigenvalues of the restricted block are used, not diagonal entries: within
+    a degenerate manifold the band basis is an arbitrary unitary, so only the
+    block SPECTRUM is gauge-invariant.  A diagonal-only test reports scatter
+    where there is a clean split and misses the structure entirely.
+
+    WHEN THIS RETURNS CLEAN (constructed, not assumed):
+      * scalar (nspinor=1) runs — V_NL is spin-scalar, cannot split;
+      * genuine ``lspinorb=.true.`` runs — ``el`` is ALREADY split into the
+        double-group multiplets, so each manifold is a single irrep and the
+        j-resolved V_NL is a multiple of the identity on it;
+      * FR pseudo + j-AVERAGED V_NL — spin-scalar by construction.
+    Verified against this repo's fixtures: the Si ``lspinorb=.true.`` archive
+    run is clean at Γ, the ``lspinorb=.false.`` one is not.
+
+    KNOWN FALSE-POSITIVE CHANNEL, stated so it is not mistaken for proof: a
+    manifold that is an ACCIDENTAL degeneracy of two distinct irreps may be
+    split by a perfectly correct operator.  A split here means "this operator
+    has lower symmetry than ``el``", which is a fact worth surfacing; it is
+    evidence of a mode mismatch, not a proof of one.
+
+    Parameters
+    ----------
+    H : (nk, nb, nb) — operator matrix in the band basis, Ry.
+    energies : (nk, nb) — the eigenvalues those bands carry, Ry.
+    el_tol_ry : bands closer than this are treated as one manifold.
+    split_tol_ry : a block spectrum spread above this is reported.
+
+    Returns
+    -------
+    dict with ``n_manifolds``, ``n_split``, ``max_split_ry``, ``worst`` and
+    ``clean``.
+    """
+    import numpy as np
+
+    H = np.asarray(H)
+    en = np.asarray(energies, dtype=np.float64)
+    nk = min(H.shape[0], en.shape[0])
+    nb = min(H.shape[1], en.shape[1])
+
+    n_manifolds = 0
+    findings = []
+    max_split = 0.0
+
+    for ik in range(nk):
+        e = en[ik, :nb]
+        i = 0
+        while i < nb:
+            j = i
+            while j + 1 < nb and abs(e[j + 1] - e[i]) <= el_tol_ry:
+                j += 1
+            deg = j - i + 1
+            if deg > 1:
+                n_manifolds += 1
+                blk = np.asarray(H[ik, i:j + 1, i:j + 1])
+                w = np.linalg.eigvalsh((blk + blk.conj().T) / 2.0).real
+                spread = float(w.max() - w.min())
+                max_split = max(max_split, spread)
+                if spread > split_tol_ry:
+                    dev = w - w.mean()
+                    # degeneracy pattern of the SPLIT spectrum: a 2+4 here is
+                    # the Γ8/Γ7 signature, a scatter is something else.
+                    pat, run = [], 1
+                    srt = np.sort(dev)
+                    for q in range(1, deg):
+                        if abs(srt[q] - srt[q - 1]) <= max(split_tol_ry * 0.1,
+                                                           1e-12):
+                            run += 1
+                        else:
+                            pat.append(run)
+                            run = 1
+                    pat.append(run)
+                    findings.append(dict(ik=ik, band0=i, deg=deg, el=float(e[i]),
+                                         spread_ry=spread, pattern=pat,
+                                         dev_ry=dev.tolist()))
+            i = j + 1
+
+    findings.sort(key=lambda d: -d["spread_ry"])
+    clean = not findings
+    RY2MEV = 13605.693122994
+
+    if not clean:
+        bar = "=" * 78
+        print_fn(f"\n{bar}")
+        print_fn(f"DEGENERACY MISMATCH: {label} splits manifolds that "
+                 f"'el' does not.")
+        print_fn(bar)
+        print_fn(f"  {len(findings)} of {n_manifolds} degenerate manifolds "
+                 f"(|Δel| ≤ {el_tol_ry:.1e} Ry) are split by more than "
+                 f"{split_tol_ry * RY2MEV:.3f} meV.")
+        print_fn(f"  worst split = {max_split * RY2MEV:.4f} meV")
+        print_fn("")
+        print_fn(f"  {'k':>5} {'band0':>6} {'deg':>4} {'el (Ry)':>14} "
+                 f"{'split (meV)':>13}  pattern")
+        for d in findings[:max_report]:
+            print_fn(f"  {d['ik']:5d} {d['band0']:6d} {d['deg']:4d} "
+                     f"{d['el']:14.9f} {d['spread_ry'] * RY2MEV:13.4f}  "
+                     f"{d['pattern']}")
+        if len(findings) > max_report:
+            print_fn(f"  ... {len(findings) - max_report} more")
+        print_fn("")
+        print_fn("  This operator distinguishes states the wavefunctions'")
+        print_fn("  Hamiltonian did not.  With a fully-relativistic")
+        print_fn("  pseudopotential the usual cause is a j-RESOLVED V_NL built")
+        print_fn("  against wavefunctions from noncolin=.true.,")
+        print_fn("  lspinorb=.false. (QE ran average_pp; its eigenvalues carry")
+        print_fn("  no spin-orbit).  A 2+4 pattern on a 6-fold at Γ is the")
+        print_fn("  Γ8/Γ7 spin-orbit signature.  Pass soc=False to build the")
+        print_fn("  j-averaged (scalar-relativistic) V_NL instead.")
+        print_fn(bar + "\n")
+    else:
+        print_fn(f"  {label}: degeneracy-consistent — "
+                 f"{n_manifolds} degenerate manifolds, "
+                 f"max split {max_split * RY2MEV:.4f} meV "
+                 f"(≤ {split_tol_ry * RY2MEV:.3f} meV).")
+
+    return dict(n_manifolds=n_manifolds, n_split=len(findings),
+                max_split_ry=max_split, worst=findings[:max_report],
+                clean=clean)
