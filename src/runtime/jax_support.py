@@ -112,11 +112,17 @@ xla_memory`` moved out of ``gw/gw_config.py`` for exactly this reason.
 
 The move also removes the *reason* the import had to be lazy, which is worth
 stating because it is a property of the packages, not a style preference:
-``src/common/__init__.py`` imports ``.wfn_transforms`` and ``.cholesky_2d`` at
-package scope, and both import ``jax``.  So ``from common.jax_support import
-enforce`` — at ANY point in a file — pulls jax in through
+``src/common/__init__.py`` re-exports from ``.meta`` and ``.wfn_transforms``
+at package scope, and both import ``jax``.  So ``from common.jax_support
+import enforce`` — at ANY point in a file — pulls jax in through
 ``common/__init__.py``, and ``runtime`` is the one module in the tree that
-must be importable *before* jax reads its environment.  This module itself
+must be importable *before* jax reads its environment.
+
+(The third package-scope importer used to be ``.cholesky_2d``; the
+distrib_la replumb deleted it and its re-export block, and the conclusion
+above is unchanged because it never rested on that one module — ``import
+common`` still imports jax, and ``tests/test_layering.py`` is what keeps
+that from being a claim nobody re-checks.)  This module itself
 imports only the standard library at module scope (jax is imported inside
 :func:`describe` and ``importlib`` inside the two private probes), so as
 ``runtime.jax_support`` it can be — and now is — imported at ``runtime``'s

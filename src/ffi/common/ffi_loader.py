@@ -119,7 +119,9 @@ _CUDA_TARGET_SYMBOLS = {
 
 # Host variants of the slate targets (src/ffi/cpp/slate/host_ffi.cc) —
 # same target names as the CUDA table, registered under platform="cpu" —
-# plus the host-only ScaLAPACK targets (src/ffi/scalapack/, MKL/LibSci),
+# plus the host-only ScaLAPACK targets (src/ffi/cpp/scalapack/, MKL/LibSci;
+# their python side is services/distrib_la now, but the SYMBOLS are in both
+# loaders' tables because both loaders open the same .so),
 # plus the phdf5 read AND write handlers (src/ffi/cpp/phdf5/{read,write}_ffi.cc
 # compiled with -DLORRAX_FFI_NO_CUDA).  The phdf5 target STRINGS are identical
 # to the CUDA table so the ffi.phdf5.{read,write} ffi_call sites resolve by

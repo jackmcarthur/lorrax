@@ -18,7 +18,14 @@ is one of: ``pip install -e services/*`` in the image build, a
 ``[tool.uv.workspace]`` member list — all three touch SHARED resources
 (the modulefile is owner-scoped; ~9 worktrees share the image), so the
 choice is not this task's to make.  When it is made, delete this module
-and the three imports of it.
+and every call site::
+
+    grep -rn 'ensure_on_path()' src/ tests/
+
+A count belongs in that command's output and not in this sentence: it said
+"the three imports" while there were eleven in ``src/`` alone, because the
+distrib_la replumb moved nine consumers onto the door and nobody was going
+to come back and re-count a number in a docstring.
 """
 
 from __future__ import annotations

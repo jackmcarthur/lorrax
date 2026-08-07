@@ -335,7 +335,7 @@ def _diagonalize_and_get_efermi(
 #
 # which is the band the owner ruling names — robustness at 1e4+ bands
 # over speed at 1e3, where the native batch solves ndev matrices at once
-# and wins by roughly ndev (``ffi/linalg/resolve.py``, eigh ``auto``
+# and wins by roughly ndev (``distrib_la.resolve``, eigh ``auto``
 # policy).  3% was the first choice and was wrong on the CPU arm: the
 # CPU budget is the whole node's RAM divided by the JAX device count, so
 # with several ranks per node it over-counts, and 3% of 169 GB puts the

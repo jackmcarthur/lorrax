@@ -35,8 +35,12 @@ Two facts this module exists to encode:
    needs this" is wrong over the whole 0.7-0.8 range.
 2. **0.7.x has no ``lax.pcast`` at all.**  So ``try: lax.pcast / except
    AttributeError: identity`` installs a NO-OP on exactly the versions that
-   enforce the rule.  That defect was live in ``common/cholesky_2d.py`` and is
-   the reason this module is a shared helper rather than a per-file shim.
+   enforce the rule.  That defect WAS live in ``common/cholesky_2d.py`` — the
+   module the distrib_la replumb deleted, whose kernel is now
+   ``distrib_la._native2d`` — and it is the reason this module is a shared
+   helper rather than a per-file shim.  Past tense on purpose: the file is
+   gone, the lesson is not, and a reader who greps for it should find out
+   which of the two is true.
 
 So: probe for the CAPABILITY, newest spelling first, and fall back to the
 identity **only** on a jax that genuinely does not track VMA — where the

@@ -679,7 +679,8 @@ _DEFAULTS = {
     #       whole mesh via the distributed-linalg FFI — the wide-band-window
     #       regime where a single matrix no longer fits on one device (square
     #       mesh + one process per device required; all guards fire at
-    #       resolve time — see ffi/linalg + docs/dev/linalg_ffi.md).
+    #       resolve time — see services/distrib_la +
+    #       docs/services/distrib_la.md).
     #       ``distributed`` = the PLATFORM's distributed library (ScaLAPACK
     #       pzheevd on a host mesh, cuSOLVERMp on CUDA) and is the spelling
     #       that ports; the vocabulary is distrib_la's own, checked
