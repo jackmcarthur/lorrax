@@ -22,12 +22,19 @@ coeffs into the consumer's shared sphere via the components table.
 
 ``sys_dim`` matters only for the 0-D box case (no sphere reduction
 there); 2-D slab and 3-D bulk share the same construction.
+
+The PADDED LAYOUT itself is not defined here — it is a property of the
+FFT box, shared with ψ, and lives in :mod:`common.gvec_fft_box`
+(:func:`~common.gvec_fft_box.fft_box_pad_sentinel`,
+:func:`~common.gvec_fft_box.pad_gvecs_to_sentinel`).  This module only
+decides WHICH G are in each sphere; the sphere→padded-table step is the
+same call ``WfnLoader.gvecs`` makes.
 """
 from __future__ import annotations
 
-import itertools
-
 import numpy as np
+
+from common.gvec_fft_box import pad_gvecs_to_sentinel
 
 
 def compute_per_q_bare_coulomb_components(
@@ -71,12 +78,15 @@ def compute_per_q_bare_coulomb_components(
 
     ``sphere_idx_padded`` : ``(n_q_ibz, ngkmax)`` int32
         Flat-FFT indices into ``[0, nx·ny·nz)`` (fftfreq order).
-        Padded with ``sentinel_flat_idx``.  Used by the writer to
-        gather coeffs from ``FFT(ζ_q)`` after the chunk FFT.
+        Padded with the pad sentinel's flat slot.  Used by the writer to
+        gather coeffs from ``FFT(ζ_q)`` after the chunk FFT.  Derived
+        FROM ``gvec_components_padded`` (one wrap-and-flatten), so the
+        two tables cannot describe different G.
     ``gvec_components_padded`` : ``(n_q_ibz, 3, ngkmax)`` int32
         Miller indices for each q's G-list.  Layout mirrors WFN.h5's
         ``mf_header/gspace/components`` (3, ng) with an added leading
-        q axis.  Padded with ``(nx/2, ny/2, nz/2)``.
+        q axis.  Padded with the shared FFT-box pad sentinel
+        (:func:`common.gvec_fft_box.fft_box_pad_sentinel`).
     ``ngk_per_q`` : ``(n_q_ibz,)`` int32
         Per-q logical sphere size — pad slots start at index ``ngk[q]``
         along the trailing axis of both arrays above.
@@ -120,36 +130,38 @@ def compute_per_q_bare_coulomb_components(
     ngk_per_q = mask.sum(axis=1).astype(np.int32)               # (n_q,)
     ngkmax = int(ngk_per_q.max())
 
-    # Sentinel flat-FFT index for pad slots: Miller (nx/2, ny/2, nz/2)
-    # is a valid in-bounds flat index in fftfreq order — every axis's
-    # mid-point lives at flat position ``N//2`` (for even N; for odd N
-    # it's ``(N-1)//2``, still in-bounds).
-    sentinel_mx, sentinel_my, sentinel_mz = (nx // 2, ny // 2, nz // 2)
-    sentinel_flat = sentinel_mx * ny * nz + sentinel_my * nz + sentinel_mz
-    # Miller components of the sentinel (taken from the fftfreq tables
-    # so a downstream reader that recomputes ``G_frac[sentinel_flat]``
-    # gets the same triple).
-    sentinel_components = np.array(
-        [G_int[sentinel_flat, 0], G_int[sentinel_flat, 1],
-         G_int[sentinel_flat, 2]], dtype=np.int32)
+    # Per-q G-lists, ascending in flat-FFT index.  Ascending order is why
+    # ``sphere_idx_padded[q, 0] == 0`` (G=(0,0,0) is flat index 0 and is
+    # always inside, checked above) — the only ordering property any
+    # downstream consumer relies on.  ``np.nonzero`` already returns
+    # ascending indices, so no sort is needed.
+    idx_per_q = [np.nonzero(mask[q])[0].astype(np.int32)
+                 for q in range(n_q_ibz)]
 
-    sphere_idx_padded = np.full((n_q_ibz, ngkmax), sentinel_flat,
-                                  dtype=np.int32)
-    gvec_components_padded = np.broadcast_to(
-        sentinel_components[None, :, None],
-        (n_q_ibz, 3, ngkmax)).copy()                            # int32 fill
+    # THE shared padded-layout step — identical call to the one
+    # ``WfnLoader.gvecs`` makes on the ragged on-disk ψ G-lists.  It fills
+    # pad slots with the FFT-box pad sentinel and REFUSES if any sphere
+    # reaches the box's Nyquist corner (which would make "sentinel row"
+    # stop meaning "pad row" for every consumer of this table).
+    gvecs_padded, ngk_per_q = pad_gvecs_to_sentinel(
+        [G_int[i] for i in idx_per_q], (nx, ny, nz), ngkmax=ngkmax)
 
-    for q in range(n_q_ibz):
-        idx_q = np.nonzero(mask[q])[0].astype(np.int32)         # (ngk[q],)
-        # Sort ascending so the (q=0, identity) row matches the
-        # natural FFT ordering — downstream consumers don't depend on
-        # this beyond "sphere_idx_padded[q, 0] == 0", which holds
-        # because G=(0,0,0) is always the smallest index and is inside.
-        idx_q.sort()
-        nk = int(ngk_per_q[q])
-        sphere_idx_padded[q, :nk] = idx_q
-        # Components: scatter Miller triples into (3, ngkmax) for this q.
-        gvec_components_padded[q, :, :nk] = G_int[idx_q].T       # (3, ngk[q])
+    # On-disk components layout is (n_q, 3, ngkmax) — WFN.h5's
+    # ``(3, ng)`` with a leading q axis.
+    gvec_components_padded = np.ascontiguousarray(
+        gvecs_padded.transpose(0, 2, 1))
+
+    # Flat-FFT indices DERIVED from the components table rather than
+    # accumulated alongside it.  ``G_int[r]`` wraps back to flat index
+    # ``r`` by construction (fftfreq order + C-order meshgrid), and the
+    # sentinel row wraps to the sentinel slot — so this reproduces the
+    # per-q sphere indices exactly while making it impossible for the
+    # two on-disk tables to describe different G.
+    _wrapped = gvecs_padded.astype(np.int64) % np.asarray(
+        (nx, ny, nz), dtype=np.int64)[None, None, :]
+    sphere_idx_padded = (
+        _wrapped[..., 0] * (ny * nz) + _wrapped[..., 1] * nz
+        + _wrapped[..., 2]).astype(np.int32)                    # (n_q, ngkmax)
 
     return {
         "sphere_idx_padded": sphere_idx_padded,

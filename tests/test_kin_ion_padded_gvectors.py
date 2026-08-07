@@ -11,13 +11,37 @@ makes the k loop uniform enough to pipeline behind a single readback.
 WHAT EACH TEST PROVES, and how it can fail
 ------------------------------------------
 Every agreement assertion here is paired with a NEGATIVE CONTROL that
-runs the same code with the mask removed and asserts the answer is
-WRONG by a wide margin.  That is deliberate: the pad rows of
-``WfnLoader.gvecs()`` hold the G-vector ``(0, 0, 0)`` — a *valid* FFT-box
-index that aliases Γ — so a masking bug does not raise, it silently
-double-counts ψ(G=0).  A green "padded == ragged" on its own would
-therefore also be green if both sides were equally wrong; the RED control
-is what rules that out.
+runs the same code with the mask removed.  That is deliberate: a pad row
+is a *valid* FFT-box index (it has to be — a gather at a pad slot must
+not run off the box), so a masking bug does not raise, it silently adds
+``ngkmax − ngk`` extra copies of one component.  A green
+"padded == ragged" on its own would also be green if both sides were
+equally wrong; the RED control is what rules that out.
+
+**The pad value changed on 2026-08-08 and this file was re-derived, not
+re-run.**  ``WfnLoader.gvecs()`` used to pad with ``(0, 0, 0)`` — Miller
+Γ, a physical component of every G-sphere, which is what made the leak
+invisible.  It now pads with the FFT-box **pad sentinel**
+(``common.gvec_fft_box.fft_box_pad_sentinel``): the Nyquist corner
+``(-nx/2, -ny/2, -nz/2)``, a cell no physical G may occupy — an invariant
+``pad_gvecs_to_sentinel`` ENFORCES rather than assumes.  Three
+consequences, each pinned below:
+
+* The controls are no longer "wrong by a wide margin" assertions with a
+  hand-picked threshold.  Both kernels contract per-G after building
+  their G-independent factor, so the leak has a CLOSED FORM: it is
+  exactly ``npad ×`` the same kernel evaluated on the one-row G-list
+  ``[sentinel]``.  The controls assert that identity to ``RTOL_D10``.
+  A leak of any other size — a different pad value, a pad row landing
+  somewhere else, a mask silently applied — falsifies it.
+* The leak got LOUDER, which is the point of the corner: the sentinel
+  carries the largest ``|k+G|²`` in the box.  MEASURED on this fixture,
+  the unmasked kinetic block moves by 3.157e-01 of its own scale, versus
+  7.762e-04 under the old Γ pad — 407× more visible.  ``V_loc`` moves by
+  1.796e+00 vs 1.454e+00.
+* ``gw.kin_ion_io`` can now REFUSE an unmasked padded list on the pad
+  marker itself, catching even a single pad row; the old guard needed
+  ``> 1`` all-zero row.
 
 ``kin_ion`` matrix elements sit inside H₀'s ~500 eV cancellation
 (⟨T+V_ion+V_NL⟩ ≈ −502 eV, ⟨V_H⟩ ≈ +461 eV, sum ≈ −42 eV), so the
@@ -33,6 +57,7 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
+from common.gvec_fft_box import fft_box_pad_sentinel
 from psp.dft_operators import (
     PaddedGVectors,
     gather_psi_G_from_crys,
@@ -47,23 +72,38 @@ from psp.get_DFT_mtxels import compute_kinetic_k, compute_local_V_k
 # same nonzero terms differently.
 RTOL_D10 = 1e-12
 
+_GRID = (6, 6, 8)
+# (-3, -3, -4) on this grid; box cell (3, 3, 4).
+_SENTINEL, _SENTINEL_FLAT = fft_box_pad_sentinel(_GRID)
+
 
 # ---------------------------------------------------------------------------
 # Fixtures: a small but non-degenerate plane-wave problem
 # ---------------------------------------------------------------------------
 
-def _fixture(nb=4, nspinor=2, grid=(6, 6, 8), ngk=37, ngkmax=48, seed=7):
+def _fixture(nb=4, nspinor=2, grid=_GRID, ngk=37, ngkmax=48, seed=7):
     """(ψ box, ragged G, padded G, mask, k, bdot, V_r, cell_volume).
 
     The G list is drawn WITHOUT replacement from the box's index set and
-    deliberately includes ``(0,0,0)`` at a non-zero position, so a missing
-    mask collides with a physical component rather than an empty slot —
-    the exact failure mode the pad contract has to survive.
+    deliberately includes ``(0,0,0)`` at a non-zero position: Γ is the
+    row the OLD pad aliased, so keeping it here means the ragged
+    reference still exercises the component the previous contract got
+    wrong.
+
+    The sentinel's flat slot is EXCLUDED from the draw.  That is not
+    fixture convenience — it is the invariant
+    ``common.gvec_fft_box.pad_gvecs_to_sentinel`` enforces on every real
+    table ("no physical G in the pad sentinel's box cell"), and the
+    refusal in ``gw.kin_ion_io`` is only sound because of it.  A fixture
+    that drew the corner anyway would be testing a table the loader
+    refuses to build.
     """
     rng = np.random.default_rng(seed)
     nx, ny, nz = grid
 
-    flat = rng.choice(nx * ny * nz, size=ngk, replace=False)
+    pool = np.setdiff1d(np.arange(nx * ny * nz),
+                        np.asarray([_SENTINEL_FLAT]))
+    flat = rng.choice(pool, size=ngk, replace=False)
     G = np.stack(np.unravel_index(flat, (nx, ny, nz)), axis=-1).astype(np.int32)
     G[3] = np.zeros(3, dtype=np.int32)                    # force a Γ row
     # De-duplicate against the forced Γ row so the ragged list stays a set.
@@ -75,10 +115,14 @@ def _fixture(nb=4, nspinor=2, grid=(6, 6, 8), ngk=37, ngkmax=48, seed=7):
         seen.add(t)
     G = G[np.asarray(keep, dtype=bool)]
     ngk = int(G.shape[0])
+    assert not np.any(np.all(G % np.asarray(grid) == np.asarray(
+        [nx // 2, ny // 2, nz // 2]), axis=1)), \
+        "fixture drew a physical G on the sentinel cell"
 
     pad = ngkmax - ngk
     assert pad > 0, "fixture must actually pad"
-    G_pad = np.concatenate([G, np.zeros((pad, 3), dtype=np.int32)], axis=0)
+    G_pad = np.concatenate(
+        [G, np.broadcast_to(_SENTINEL, (pad, 3)).astype(np.int32)], axis=0)
     mask = np.concatenate([np.ones(ngk), np.zeros(pad)]).astype(np.float64)
 
     psi = (rng.standard_normal((nb, nspinor, nx, ny, nz))
@@ -100,12 +144,18 @@ def _scale(a) -> float:
     return float(np.max(np.abs(np.asarray(a))))
 
 
+def _one_sentinel_row() -> np.ndarray:
+    """The one-row G-list ``[sentinel]`` — the unit of the pad leak."""
+    return np.asarray(_SENTINEL, dtype=np.int32)[None, :]
+
+
 # ---------------------------------------------------------------------------
 # 1. The kernels: padded+masked == ragged, and the mask is load-bearing
 # ---------------------------------------------------------------------------
 
 def test_kinetic_padded_matches_ragged_and_mask_is_load_bearing():
     psi, G, G_pad, mask, kvec, bdot, _V, _vol = _fixture()
+    npad = int(G_pad.shape[0] - G.shape[0])
 
     ragged = compute_kinetic_k(psi, G, kvec, bdot)
     padded = compute_kinetic_k(psi, G_pad, kvec, bdot, g_mask=mask)
@@ -115,13 +165,24 @@ def test_kinetic_padded_matches_ragged_and_mask_is_load_bearing():
     assert scale > 1.0, "fixture produced a degenerate T"
     assert _dev(padded, ragged) <= RTOL_D10 * scale
 
-    # RED: without the mask the pad rows re-add |k|²·|ψ(Γ)|² eleven times
-    # over.  If this ever passes, the agreement above proves nothing.
-    assert _dev(unmasked, ragged) > 1e-6 * scale
+    # RED, and red for a DERIVED reason.  ``_compute_kinetic_k_jit``
+    # builds T_G from the G-list, gathers ψ at each G's box cell and
+    # contracts ``einsum('msg,nsg->mn')`` — a sum over independent g.  So
+    # dropping the mask adds exactly ``npad`` copies of the same kernel
+    # run on the single-row list ``[sentinel]``.  Asserting THAT (rather
+    # than "moved by more than 1e-6") is what makes this control
+    # falsifiable: change the pad value, or let a mask leak in, and the
+    # predicted leak stops matching.
+    leak = np.asarray(compute_kinetic_k(psi, _one_sentinel_row(), kvec, bdot))
+    assert _dev(unmasked, np.asarray(ragged) + npad * leak) <= RTOL_D10 * scale
+    # …and the leak is not a rounding-scale nuisance: the sentinel sits at
+    # the box corner, the largest |k+G|² there is.  MEASURED 3.157e-01.
+    assert _scale(npad * leak) > 0.1 * scale
 
 
 def test_local_V_padded_matches_ragged_and_mask_is_load_bearing():
     psi, G, G_pad, mask, _k, _bdot, V_r, vol = _fixture()
+    npad = int(G_pad.shape[0] - G.shape[0])
 
     ragged = compute_local_V_k(psi, G, V_r, vol)
     padded = compute_local_V_k(psi, G_pad, V_r, vol, g_mask=mask)
@@ -130,7 +191,14 @@ def test_local_V_padded_matches_ragged_and_mask_is_load_bearing():
     scale = _scale(ragged)
     assert scale > 0.0
     assert _dev(padded, ragged) <= RTOL_D10 * scale
-    assert _dev(unmasked, ragged) > 1e-6 * scale
+
+    # Same closed form.  ``_compute_local_V_k_jit`` builds φ_G from the
+    # WHOLE box (the G-list plays no part) and only then contracts
+    # ``einsum('bsg,nsg->bn')``, so the per-pad-row contribution is again
+    # the one-row kernel.  MEASURED leak 1.796e+00 of scale.
+    leak = np.asarray(compute_local_V_k(psi, _one_sentinel_row(), V_r, vol))
+    assert _dev(unmasked, np.asarray(ragged) + npad * leak) <= RTOL_D10 * scale
+    assert _scale(npad * leak) > 0.1 * scale
 
 
 def test_gather_psi_G_padded_zeroes_pad_columns():
@@ -149,9 +217,16 @@ def test_gather_psi_G_padded_zeroes_pad_columns():
     assert np.array_equal(padded[..., :ngk], ragged)
     assert np.all(padded[..., ngk:] == 0)
 
-    # NEGATIVE CONTROL: unmasked pad columns carry the physical Γ
-    # coefficient, not zero.
+    # NEGATIVE CONTROL, stated as the MECHANISM rather than "nonzero":
+    # an unmasked pad column is ψ read at the sentinel's box cell.  Under
+    # the old Γ pad this was ψ(0,0,0) — a physical coefficient of the
+    # list, which is precisely why the leak was invisible.
+    cell = tuple(int(v) % int(n) for v, n in zip(_SENTINEL, _GRID))
     unmasked = np.asarray(gather_psi_G_from_crys(psi, G_pad))
+    expected = np.asarray(psi)[..., cell[0], cell[1], cell[2]]
+    assert np.array_equal(
+        unmasked[..., ngk:],
+        np.broadcast_to(expected[..., None], unmasked[..., ngk:].shape))
     assert np.max(np.abs(unmasked[..., ngk:])) > 0.0
 
 
@@ -176,37 +251,130 @@ def test_summed_operator_block_agrees_at_1e12():
     assert _dev(padded, ragged) <= RTOL_D10 * scale
 
 
+def _wfn_stub(bdot, fft_grid=None):
+    """Minimal ``wfn`` for ``get_kin_ion_k`` — bdot / cell_volume / grid.
+
+    ``fft_grid`` is optional on purpose: it is what selects which arm of
+    the guard is available, and both arms are exercised below.
+    """
+    class _W:
+        cell_volume = 137.5
+    w = _W()
+    w.bdot = bdot
+    if fft_grid is not None:
+        w.fft_grid = tuple(int(v) for v in fft_grid)
+    return w
+
+
 def test_get_kin_ion_k_refuses_a_padded_list_without_its_mask():
     """The mask contract is ENFORCED, not merely documented.
 
-    Pad rows are ``(0,0,0)`` — a valid box index — so an unmasked padded
-    list returns a plausible-looking matrix that is wrong by
-    ``(ngkmax - ngk)`` extra copies of the Γ component.  A physical
-    G-sphere has ``(0,0,0)`` at most once, so >1 all-zero row is a
-    sufficient signature.
+    A pad row is a valid box index, so an unmasked padded list returns a
+    plausible-looking matrix that is wrong by ``ngkmax − ngk`` extra
+    copies of the sentinel-cell component.  ``_refuse_padded_gvecs_
+    without_mask`` has TWO arms and this exercises both, plus the case
+    each one fails to see.
+
+    Arm (b), the pad-value-agnostic backstop: a physical G-sphere is a
+    SET (and the full-BZ unfold ``G ↦ S·G − G_umklapp`` is injective, so
+    it stays one), therefore ANY duplicate row means padding.  Available
+    with no ``fft_grid``.
     """
     import pytest
     from gw.kin_ion_io import get_kin_ion_k
 
     psi, G, G_pad, mask, kvec, bdot, V_r, vol = _fixture()
+    w = _wfn_stub(bdot)                              # NO fft_grid → arm (b)
 
-    class _W:                                     # only bdot/cell_volume used
-        bdot = None
-        cell_volume = 137.5
-
-    w = _W()
-    w.bdot = bdot
-
-    with pytest.raises(ValueError, match="ngkmax-padded"):
+    with pytest.raises(ValueError, match="duplicate row"):
         get_kin_ion_k(psi, G_pad, kvec, V_r, None, w)
 
-    # The RAGGED list (exactly one Γ row) must still be accepted without a
-    # mask — otherwise the guard is just breaking the old path.
+    # The RAGGED list must still be accepted without a mask — otherwise
+    # the guard is just breaking the old path.  It is a set (the fixture
+    # de-duplicates) and carries no sentinel row.
     out = get_kin_ion_k(psi, G, kvec, V_r, None, w)
     assert np.isfinite(np.asarray(out)).all()
     # ...and the padded list WITH its mask agrees with it at 1e-12.
     out_pad = get_kin_ion_k(psi, G_pad, kvec, V_r, None, w, g_mask=mask)
     assert _dev(out_pad, out) <= RTOL_D10 * _scale(out)
+
+
+def test_the_duplicate_arm_is_blind_to_a_single_pad_row():
+    """Construct the case where arm (b) returns FALSE.
+
+    One pad row is not a duplicate of anything, so the set test cannot
+    see it — exactly the blind spot the pre-2026-08 ``> 1 all-zero row``
+    guard also had.  This is the gap arm (a) exists to close.  Asserting
+    the blindness HERE is what stops the next test from being a check
+    that passes for the wrong reason, and the numeric half shows the
+    blind spot is not harmless: the one leaked row moves the T+V block
+    by 2.9e-2 of its own scale (MEASURED).
+
+    Tested on ``refuse_padded_gvecs_without_mask`` directly rather than
+    through ``get_kin_ion_k``: importing ``gw.kin_ion_io`` runs
+    ``initialize_communicator_stack``, which refuses without a built FFI
+    ``.so``.  The integration path is covered by
+    ``test_get_kin_ion_k_refuses_a_padded_list_without_its_mask`` above.
+    """
+    from common.gvec_fft_box import refuse_padded_gvecs_without_mask
+
+    psi, G, _Gp, _m, kvec, bdot, V_r, vol = _fixture()
+    G_pad1 = np.concatenate(
+        [G, np.asarray(_SENTINEL, dtype=np.int32)[None, :]], axis=0)
+
+    # FALSE: no fft_grid, one pad row, nothing duplicated → accepted.
+    refuse_padded_gvecs_without_mask(G_pad1, None)
+
+    # …and it really would have been wrong, by exactly the one-row leak.
+    one = _one_sentinel_row()
+    ragged = (np.asarray(compute_kinetic_k(psi, G, kvec, bdot))
+              + np.asarray(compute_local_V_k(psi, G, V_r, vol)))
+    leaked = (np.asarray(compute_kinetic_k(psi, G_pad1, kvec, bdot))
+              + np.asarray(compute_local_V_k(psi, G_pad1, V_r, vol)))
+    leak = (np.asarray(compute_kinetic_k(psi, one, kvec, bdot))
+            + np.asarray(compute_local_V_k(psi, one, V_r, vol)))
+    scale = _scale(ragged)
+    assert _dev(leaked, ragged + leak) <= RTOL_D10 * scale
+    assert _dev(leaked, ragged) > 1e-3 * scale
+
+
+def test_the_sentinel_arm_catches_a_single_pad_row():
+    """Arm (a): with ``fft_grid`` known, ONE pad row is enough.
+
+    Sound in the direction that matters — every pad row IS the sentinel,
+    so a padded list always fires.  The other direction (a ragged list
+    that legitimately holds the corner would be REFUSED) is a real false
+    positive, not excluded by construction; it is excluded by
+    MEASUREMENT: no WFN available — the five fixtures under ``tests/``,
+    nor the production MoS₂ decks (36×36×135 / 80 Ry, 24×24×80) — has a
+    physical G on the corner cell in any k, margin ``(9,9,32)`` vs
+    ``(18,18,67)``.  The fixture's exclusion of the corner from its draw
+    mirrors that measured fact rather than assuming it away.
+    """
+    import pytest
+    from common.gvec_fft_box import refuse_padded_gvecs_without_mask
+
+    _psi, G, _Gp, _m, *_ = _fixture()
+    G_pad1 = np.concatenate(
+        [G, np.asarray(_SENTINEL, dtype=np.int32)[None, :]], axis=0)
+
+    with pytest.raises(ValueError, match="pad sentinel cell"):
+        refuse_padded_gvecs_without_mask(G_pad1, _GRID)
+
+    # Ragged still accepted with the grid present — the guard must not
+    # simply be refusing everything.
+    refuse_padded_gvecs_without_mask(G, _GRID)
+
+    # A row at ``+nx/2`` is a DIFFERENT Miller index but the SAME box
+    # cell, and must still be refused: the box cell is what the ψ gather
+    # reads, so an unmasked pad there is indistinguishable from the
+    # sentinel.  Miller-triple equality would MISS this.
+    nx, ny, nz = _GRID
+    aliased = np.concatenate(
+        [G, np.asarray([[nx // 2, ny // 2, nz // 2]], dtype=np.int32)], axis=0)
+    assert not np.array_equal(aliased[-1], np.asarray(_SENTINEL))
+    with pytest.raises(ValueError, match="pad sentinel cell"):
+        refuse_padded_gvecs_without_mask(aliased, _GRID)
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +408,7 @@ def test_padded_gvectors_mask_matches_ngk_valid(monkeypatch):
     rng = np.random.default_rng(1)
     g = rng.integers(0, 5, size=(nk, ngkmax, 3)).astype(np.int32)
     for j in range(nk):
-        g[j, int(ngk[j]):] = 0                            # loader's pad rows
+        g[j, int(ngk[j]):] = _SENTINEL                    # loader's pad rows
 
     fake = _FakeLoader(g, ngk)
     monkeypatch.setattr(dop, "_as_loader", lambda w: fake)
@@ -253,8 +421,14 @@ def test_padded_gvectors_mask_matches_ngk_valid(monkeypatch):
         G_j, m_j = tab.at(j)
         assert np.array_equal(m_j[: int(ngk[j])], np.ones(int(ngk[j])))
         assert np.all(m_j[int(ngk[j]):] == 0.0)
-        # Pad rows are (0,0,0): a VALID box index, hence the mask.
-        assert np.all(G_j[int(ngk[j]):] == 0)
+        # Pad rows carry the sentinel — still a VALID box index (which is
+        # why the mask is load-bearing), just a detectable one.  The mask
+        # comes from ``ngk_valid`` and never from the pad value: that is
+        # what this asserts, by handing over a table whose pad rows the
+        # fake loader chose.
+        assert np.array_equal(
+            G_j[int(ngk[j]):],
+            np.broadcast_to(_SENTINEL, (ngkmax - int(ngk[j]), 3)))
 
 
 # ---------------------------------------------------------------------------

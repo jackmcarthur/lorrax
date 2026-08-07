@@ -193,8 +193,8 @@ class PaddedGVectors:
     """Every k's G-list at ONE fixed shape ``(n_k, ngkmax, 3)`` + its mask.
 
     This is the *native* layout of ``WfnLoader.gvecs()``: the loader
-    stores the G table zero-padded to the file's ``ngkmax`` and reports
-    the logical extent separately through ``ngk_valid()``.
+    stores the G table padded to the file's ``ngkmax`` and reports the
+    logical extent separately through ``ngk_valid()``.
     :func:`generate_gvectors_k` throws that away by slicing back to
     ``ngk[ik]``; this class hands it over intact, plus the 1/0 mask that
     makes the pad columns inert.
@@ -210,14 +210,28 @@ class PaddedGVectors:
 
     Pad-column contract
     -------------------
-    Pad rows hold the G-vector ``(0, 0, 0)``, which is a *valid* FFT-box
-    index that aliases the physical Γ component — so a consumer that
-    forgets the mask silently double-counts ψ(G=0), it does not crash.
-    Every consumer must therefore multiply one factor of each contraction
-    over G by :attr:`mask`.  The kernels that take a ``g_mask`` argument
+    Pad rows hold the FFT-box **pad sentinel**
+    (:func:`common.gvec_fft_box.fft_box_pad_sentinel` — the Nyquist
+    corner cell ``(nx//2, ny//2, nz//2)``, whose Miller index is
+    ``(-nx/2, -ny/2, -nz/2)`` on the even grids BGW writes), which is
+    still a *valid* FFT-box
+    index: a consumer that forgets the mask does not crash, it silently
+    adds ``ngkmax − ngk`` extra copies of ψ at that corner cell.  Every
+    consumer must therefore multiply one factor of each contraction over
+    G by :attr:`mask`.  The kernels that take a ``g_mask`` argument
     (``psp.get_DFT_mtxels.compute_kinetic_k`` /
     ``compute_local_V_k``, ``dft_operators.gather_psi_G``) already do
     exactly that.
+
+    What the sentinel buys over the pre-2026-08 zero pad: zero rows are
+    Miller ``(0,0,0)``, a component every physical G-sphere contains, so
+    a forgotten mask was *indistinguishable* from a ragged list.  The
+    sentinel cell is one no physical G occupies — enforced, not assumed,
+    by :func:`common.gvec_fft_box.pad_gvecs_to_sentinel` — so
+    ``gw.kin_ion_io`` can refuse the unmasked call outright.  It also
+    makes the error LOUDER if it ever slips through: the corner carries
+    the largest ``|k+G|²`` in the box, so a leaked pad row perturbs T by
+    the maximum the grid allows instead of by ``|k|²``.
 
     On the arithmetic: appending exact zeros does not change a sum
     (``x + 0.0 == x`` in IEEE-754).  What a shape change does move is
@@ -227,7 +241,7 @@ class PaddedGVectors:
     is what is checked (owner decision D10, gate 1e-12).
     """
 
-    gvecs: np.ndarray        # (n_k, ngkmax, 3) int32, zero-padded
+    gvecs: np.ndarray        # (n_k, ngkmax, 3) int32, sentinel-padded
     mask: np.ndarray         # (n_k, ngkmax) float64, 1 valid / 0 pad
     ngk: np.ndarray          # (n_k,) int32 — logical extent per k
 
@@ -259,11 +273,13 @@ def padded_gvectors(wfn, *, k="full_bz") -> PaddedGVectors:
     explicit index list), so a rank can build the table for exactly the
     k it owns.
     """
+    from common.gvec_fft_box import pad_mask as _pad_mask
     loader = _as_loader(wfn)
     gvecs = np.asarray(loader.gvecs(k=k), dtype=np.int32)
     ngk = np.asarray(loader.ngk_valid(k=k), dtype=np.int32)
-    cols = np.arange(int(gvecs.shape[1]), dtype=np.int32)[None, :]
-    mask = (cols < ngk[:, None]).astype(np.float64)
+    # ``pad_mask`` is the same "which slots are real" expression the
+    # loader's box_index and the ζ writer use — one definition.
+    mask = _pad_mask(ngk, int(gvecs.shape[1])).astype(np.float64)
     return PaddedGVectors(gvecs=gvecs, mask=mask, ngk=ngk)
 
 

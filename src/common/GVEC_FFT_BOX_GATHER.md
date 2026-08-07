@@ -50,7 +50,7 @@ because the sentinel row is zero.
 
 ```python
 def build_g_index_for_fft_box(
-    gvecs_per_k, fft_grid, ngkmax,
+    gvecs_per_k, fft_grid, ngkmax, *, ngk_valid=None,
 ) -> np.ndarray:
     """g_index[k, nx, ny, nz] = position of this box cell's coefficient
     within k's coefficient slab, or ngkmax (sentinel) if empty."""
@@ -60,6 +60,17 @@ def make_fft_box_kernel(mesh, nk, ngkmax, nb_padded, nspinor, fft_grid):
     that fills a sharded FFT box from a re/im-packed coefficient slab
     in one gather (no scatter, no per-k loop)."""
 ```
+
+Note the two DIFFERENT sentinels this file talks about:
+
+* the **empty-cell sentinel** `ngkmax`, a value in `g_index`, which the
+  runtime kernel turns into a zero by appending one zero coefficient
+  slot.  That is the subject of everything above.
+* the **pad sentinel**, a G-VECTOR (`fft_box_pad_sentinel`) that fills
+  the `[ngk[k], ngkmax)` rows of the padded G table.  See the module
+  docstring of `gvec_fft_box.py`.
+
+They are unrelated; the shared word is historical.
 
 Both are already used by `PhdfWfnReader` in
 `common/phdf5_wfn_reader.py`; available to any caller that holds
@@ -101,9 +112,16 @@ Leave alone (host-numpy scatter is already fast):
 - The sentinel scheme (`ngkmax` as "empty") only works if `cnk_padded`
   always has a zero at that slot — the utility should either own the
   padding or document the contract loudly.
-- For variable-ngk (nosym/irreducible-wedge): zero-pad per k to
-  `ngkmax` before the sentinel slot; the gather covers the shape
-  uniformly.  No per-k dynamic logic at runtime.
+- For variable-ngk (nosym/irreducible-wedge): the COEFFICIENTS are
+  zero-padded per k to `ngkmax`, so the gather covers the shape
+  uniformly with no per-k dynamic logic at runtime.  The G-VECTORS are
+  padded with the pad sentinel instead, and the index build masks them
+  off using `ngk_valid`.  Do NOT "pad then scatter everything": pad rows
+  have higher `g`, so in a last-writer-wins scatter they would take the
+  sentinel's box cell away from any real G sitting there.  (No real G
+  may sit there — `pad_gvecs_to_sentinel` refuses tables where one does
+  — but the masked build does not have to rely on that, and relying on
+  invariants you can avoid relying on is how they rot.)
 - Memory: `inv` is `nk × nx × ny × nz × 4` bytes.  At Si 10×10×10
   (nk=1000, fft=24³): ~55 MB per rank, replicated — still fine.  If
   that ever bites, shard `inv` on the k axis and build the gather

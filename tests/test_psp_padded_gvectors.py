@@ -15,8 +15,23 @@ on top of them:
 * the ``dipole.h5`` provenance guard, which must be able to REFUSE.
 
 As in the kin_ion file, every agreement assertion is paired with a
-negative control that must be WRONG by a wide margin.  Pad rows hold
-``(0,0,0)``, a valid FFT-box index, so a masking bug is silent.
+negative control that must be WRONG by a wide margin: a pad row is a
+valid FFT-box index, so a masking bug is silent rather than fatal.
+
+On the pad VALUE, after the 2026-08-08 change
+--------------------------------------------
+``WfnLoader.gvecs`` now pads with the FFT-box pad sentinel, not with
+``(0,0,0)``; ``tests/test_kin_ion_padded_gvectors.py`` was re-derived
+against that.  The fixtures HERE deliberately keep the legacy zero pad,
+because the hazard this file exists to demonstrate is not "the pad
+aliases Γ" — it is that **after an umklapp shift a pad row resolves to a
+different, real bra G**.  That mechanism is a property of the shift, not
+of the pad value: ``sentinel + G0`` lands on some other box cell just as
+``0 + G0`` does, and a bra sphere containing it makes the lookup return a
+spurious cross term either way.  Zero is simply the sharpest witness,
+because the extra assertion below ("the last ``(0,0,0)`` row of a padded
+bra list must win the dict") pins the collision to a row the reader can
+name.  Nothing in this file reads a loader-produced table.
 """
 from __future__ import annotations
 

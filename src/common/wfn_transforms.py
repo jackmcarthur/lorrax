@@ -107,6 +107,19 @@ def _cached_jit(name: str, key: tuple, build):
 # (full_bz vs ibz) get distinct buffers but identical numpy bytes share.
 _GINDEX_DEV_CACHE: dict = {}
 
+# Identity fast path in FRONT of the content hash.  ``hash(a.tobytes())``
+# copies and digests the whole table: MEASURED 152 ms for the 0.16 GB
+# int32 g_index of a production full-BZ load (0.062 GB / 54 ms at MoS2
+# 3x3 scale), paid on EVERY call.  In practice the caller hands back the
+# very same object each time — ``WfnLoader.box_index`` memoises it — so
+# an ``id()`` probe answers first.  ``id()`` alone is unsafe (a freed
+# array's address gets recycled), hence the weakref: if the array we
+# recorded has died, the entry is stale and we fall through to the hash.
+# Values are (weakref-to-numpy, device buffer); we deliberately do NOT
+# hold a strong reference to the numpy array — that would keep a
+# 0.16 GB host table alive past its loader.
+_GINDEX_DEV_BY_ID: dict = {}
+
 
 def _cached_gindex_dev(g_arr) -> "jax.Array":
     """Cache the ``jnp.asarray(g_arr, dtype=jnp.int32)`` REPLICATED
@@ -135,13 +148,32 @@ def _cached_gindex_dev(g_arr) -> "jax.Array":
         if g_arr.dtype == jnp.int32:
             return g_arr
         return jnp.asarray(g_arr, dtype=jnp.int32)
+    # Identity probe first — see ``_GINDEX_DEV_BY_ID``.  A hit means this
+    # is literally the object we hashed before, so the content cannot
+    # have changed identity underneath us; a miss (or a dead weakref)
+    # costs one dict lookup and falls through to the content hash, which
+    # still deduplicates distinct objects with identical bytes.
+    import weakref
+    ident = id(g_arr)
+    seen = _GINDEX_DEV_BY_ID.get(ident)
+    if seen is not None:
+        ref, dev = seen
+        if ref() is g_arr:
+            return dev
+        del _GINDEX_DEV_BY_ID[ident]          # address recycled — stale
+
     key = ('g_index_dev', hash(g_arr.tobytes()),
            tuple(int(s) for s in g_arr.shape))
     hit = _GINDEX_DEV_CACHE.get(key)
     if hit is not None:
-        return hit
-    dev = jnp.asarray(g_arr, dtype=jnp.int32)
-    _GINDEX_DEV_CACHE[key] = dev
+        dev = hit
+    else:
+        dev = jnp.asarray(g_arr, dtype=jnp.int32)
+        _GINDEX_DEV_CACHE[key] = dev
+    try:
+        _GINDEX_DEV_BY_ID[ident] = (weakref.ref(g_arr), dev)
+    except TypeError:                          # not weak-referenceable
+        pass
     return dev
 
 

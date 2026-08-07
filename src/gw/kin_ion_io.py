@@ -80,6 +80,7 @@ import jax.numpy as jnp
 import h5py
 
 from common import symmetry_maps, Meta
+from common.gvec_fft_box import refuse_padded_gvecs_without_mask
 from common.collectives import (barrier, device_count,
                                 local_share, process_rank_world,
                                 psum_replicate, resolve_mesh)
@@ -115,9 +116,12 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
     wfn_k : (nb, nspinor, nx, ny, nz) — wavefunctions in FFT box
     Gk_crys : (nG, 3) int — G-vector indices for this k.  May be the
         k's own ``ngk`` rows or the ``ngkmax``-padded table, in which
-        case ``g_mask`` is REQUIRED (pad rows hold ``(0,0,0)``, a valid
-        box index that aliases Γ, so an absent mask double-counts ψ(G=0)
-        rather than crashing).
+        case ``g_mask`` is REQUIRED (pad rows are the FFT-box pad
+        sentinel — a valid box index, so an absent mask double-counts
+        that component rather than crashing).  Enforced by
+        :func:`common.gvec_fft_box.refuse_padded_gvecs_without_mask`,
+        which lives beside the routine that BUILDS the pad so the
+        detector and the producer share one invariant.
     kvec : (3,) float — k-point in crystal coords
     V_loc_r : (nx, ny, nz) — local ionic potential on FFT grid
     vnl_setup : VNLSetup from vnl_ops.build_vnl_setup (or None to skip V_NL)
@@ -129,20 +133,10 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
         one exact routine instead of across two numerical schemes.
     """
     Gk_np = np.asarray(Gk_crys, dtype=int)
-    if g_mask is None and int(np.count_nonzero(~Gk_np.any(axis=1))) > 1:
-        # A physical G-sphere contains (0,0,0) at most ONCE, and
-        # ``WfnLoader.gvecs()`` pads with exactly that row — so more than
-        # one all-zero row means a padded list arrived without its mask.
-        # Refuse instead of returning a plausible number: the pad rows are
-        # a VALID FFT-box index, so the unmasked answer is silently wrong
-        # by (ngkmax - ngk) extra copies of the Γ component, inside a
-        # ~500 eV cancellation.  Cheap: one host reduction over (nG, 3)
-        # int per k.
-        raise ValueError(
-            f"get_kin_ion_k: Gk_crys has "
-            f"{int(np.count_nonzero(~Gk_np.any(axis=1)))} all-zero rows, so "
-            f"it is ngkmax-padded, but g_mask is None.  Pass the mask from "
-            f"psp.dft_operators.padded_gvectors(...).at(ik).")
+    if g_mask is None:
+        refuse_padded_gvecs_without_mask(
+            Gk_np, getattr(wfn, "fft_grid", None),
+            where="get_kin_ion_k: Gk_crys")
     bdot_np = np.asarray(wfn.bdot, dtype=float)
     T_k = compute_kinetic_k(wfn_k, Gk_crys, kvec, bdot_np, g_mask=g_mask)
     V_loc_k = compute_local_V_k(

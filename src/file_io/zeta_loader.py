@@ -60,6 +60,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.gvec_fft_box import fft_box_pad_sentinel, pad_gvecs_to_sentinel
+
 from .mf_header import bind_mf_attrs, read_mf_header_from_file
 from .isdf_header import bind_isdf_attrs, read_isdf_header_from_file
 from .slab_io import SlabIO
@@ -214,6 +216,81 @@ class ZetaLoader:
                     f"SlabIO tile path.")
             raise RuntimeError("ZetaLoader: file already closed")
         return self._slab_io
+
+    # ------------------------------------------------------------------
+    # G-vector accessors — the SAME surface WfnLoader exposes
+    # ------------------------------------------------------------------
+    def gvecs(self, *, q: QSpec = 'ibz') -> np.ndarray:
+        """Return ``(n_q, ngkmax, 3)`` int32 — the per-q G-list, padded.
+
+        Deliberately shaped, named and padded exactly like
+        :meth:`file_io.wfn_loader.WfnLoader.gvecs`.  The two files store
+        the G-axis differently — WFN.h5 flattens a RAGGED axis and needs
+        ``kpt_starts``, ``zeta_q.h5`` is already ``ngkmax``-rectangular —
+        but that difference belongs to the READ, not to what a consumer
+        holds afterwards.  Both end here, in one representation built by
+        :func:`common.gvec_fft_box.pad_gvecs_to_sentinel`.
+
+        On-disk, ``isdf_header/gvec_components`` is ``(n_q, 3, ngkmax)``
+        (the WFN.h5 ``(3, ng)`` component order with a leading q axis);
+        this transposes it and re-runs the shared validation, so a
+        corrupt or hand-edited components table — one whose pad rows are
+        not the sentinel, or whose sphere reaches the FFT box corner —
+        is caught at READ time rather than trusted.
+
+        Raises for ``zeta_layout == 'r_space'``: those files carry no
+        per-q sphere, the consumer applies an FFT + shared-sphere gather
+        instead (see :meth:`load`).
+        """
+        if self.gvec_components is None:
+            raise ValueError(
+                f"{self._path} has zeta_layout={self.zeta_layout!r} and no "
+                f"isdf_header/gvec_components, so there is no per-q G-list "
+                f"to return.  r-space ζ is consumed via load(layout='G_flat', "
+                f"qvec_frac=..., sphere_idx=...), which builds the sphere "
+                f"from the CONSUMER's cutoff instead.")
+        rows, _unfold = self._resolve_q(q)
+        comps = np.asarray(self.gvec_components, dtype=np.int32)[rows]
+        grid = tuple(int(s) for s in self.fft_grid)
+        ngk = self.ngk_valid(q=q)
+        src = np.ascontiguousarray(comps.transpose(0, 2, 1))
+
+        # The components table means nothing without the grid it was
+        # built on, and that grid is stored SEPARATELY (mf_header/gspace/
+        # FFTgrid).  Nothing has ever checked they agree.  They do agree
+        # iff the on-disk pad rows are THIS grid's sentinel, so check
+        # exactly that — otherwise ``pad_gvecs_to_sentinel`` would
+        # silently rewrite the pad rows and hide the disagreement.
+        sentinel, _ = fft_box_pad_sentinel(grid)
+        for j in range(src.shape[0]):
+            n = int(ngk[j])
+            if n >= src.shape[1]:
+                continue
+            if not np.array_equal(
+                    src[j, n:], np.broadcast_to(sentinel, (src.shape[1] - n, 3))):
+                raise ValueError(
+                    f"{self._path}: isdf_header/gvec_components row q={j} has "
+                    f"pad slots [{n}:{src.shape[1]}] that are not the pad "
+                    f"sentinel {tuple(int(v) for v in sentinel)} for "
+                    f"mf_header FFTgrid {grid}.  The components table and the "
+                    f"header's FFT grid disagree, so every G in this file is "
+                    f"being read on the wrong grid.  Refit the ζ, or fix the "
+                    f"writer that produced them.")
+
+        gvecs, _ = pad_gvecs_to_sentinel(src, grid, ngk_valid=ngk)
+        return gvecs
+
+    def ngk_valid(self, *, q: QSpec = 'ibz') -> np.ndarray:
+        """Per-q logical sphere size (without pad).  Host numpy int32.
+
+        Twin of :meth:`file_io.wfn_loader.WfnLoader.ngk_valid`.
+        """
+        if self.ngk_per_q is None:
+            raise ValueError(
+                f"{self._path} has zeta_layout={self.zeta_layout!r} and no "
+                f"isdf_header/ngk, so it has no per-q logical extent.")
+        rows, _unfold = self._resolve_q(q)
+        return np.asarray(self.ngk_per_q, dtype=np.int32)[rows]
 
     # ------------------------------------------------------------------
     # Slab API (production V_q reader of record)

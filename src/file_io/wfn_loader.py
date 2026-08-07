@@ -80,6 +80,7 @@ from common.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
+from common.gvec_fft_box import pad_gvecs_to_sentinel
 
 from ._slab_io_ffi import _derive_valid_shape
 from .mf_header import bind_mf_attrs, kpt_starts, read_mf_header_from_file
@@ -582,23 +583,42 @@ class WfnLoader:
     # G-vector and ngk_valid accessors
     # ------------------------------------------------------------------
     def gvecs(self, *, k: KSpec = "full_bz") -> np.ndarray:
-        """Return ``(n_k, ngkmax, 3)`` int32 — G-vector list per k, zero-padded
-        beyond logical ngk.  Cached per k-set."""
+        """Return ``(n_k, ngkmax, 3)`` int32 — G-vector list per k, padded
+        beyond logical ``ngk`` with the FFT-box **pad sentinel**.
+
+        The pad rows are ``common.gvec_fft_box.fft_box_pad_sentinel(
+        self.fft_grid)`` — the Nyquist-corner Miller index — NOT zeros.
+        Zeros are the Miller index of Γ, a physical component of every
+        G-sphere, so a consumer that dropped the ``ngk_valid`` mask used
+        to add ``ngkmax − ngk`` extra copies of ψ(Γ) without any symptom.
+        The sentinel is a cell no physical G occupies (enforced by
+        :func:`~common.gvec_fft_box.pad_gvecs_to_sentinel`, which refuses
+        the table otherwise), so the same mistake is now *detectable* —
+        see ``gw.kin_ion_io.get_kin_ion_k``'s refusal.
+
+        This is the SAME padded representation ``zeta_q.h5`` stores in
+        ``isdf_header/gvec_components``, built by the same routine; the
+        two on-disk layouts (ragged ψ, ngkmax-rectangular ζ) differ only
+        in how they are read, not in what they become.
+
+        Cached per k-set.
+        """
         key = self._k_cache_key(k)
         if key in self._gvecs_cache:
             return self._gvecs_cache[key]
 
         k_idxs, unfold = self._resolve_k(k)
-        out = np.zeros((len(k_idxs), int(self.ngkmax), 3), dtype=np.int32)
 
         if not unfold:
-            for j, ik in enumerate(k_idxs):
+            rows = []
+            for ik in k_idxs:
                 start = int(self._kpt_starts[int(ik)])
                 end = start + int(self.ngk[int(ik)])
-                out[j, : end - start] = self._gvecs_raw[start:end]
+                rows.append(self._gvecs_raw[start:end])
         else:
             sym = self._ensure_sym()
-            for j, nk in enumerate(k_idxs):
+            rows = []
+            for nk in k_idxs:
                 # Inlines the former ``sym.get_gvecs_kfull`` body — see
                 # the unfold derivation in ``test_wfn_loader_eager.py``
                 # ``test_gvecs_full_bz_matches_legacy``.  Each full-BZ k
@@ -614,8 +634,14 @@ class WfnLoader:
                 k_gvecs = self._gvecs_raw[start:end]
                 Gkk = sym.get_umklapp_vector(
                     self, nk_int, sym_idx, kbar, sym_krep)
-                g_rot = np.einsum('ij,kj->ki', sym_krep, k_gvecs) - Gkk
-                out[j, : g_rot.shape[0]] = g_rot
+                rows.append(np.einsum('ij,kj->ki', sym_krep, k_gvecs) - Gkk)
+
+        # ``ngkmax=self.ngkmax`` (the FILE's max), not max(len(rows)):
+        # an explicit k-subset may not contain the widest k, but every
+        # ψ buffer in this loader is cut to the file's ngkmax.
+        out, _ = pad_gvecs_to_sentinel(
+            rows, tuple(int(s) for s in self.fft_grid),
+            ngkmax=int(self.ngkmax))
         self._gvecs_cache[key] = out
         return out
 
@@ -657,25 +683,25 @@ class WfnLoader:
 
         Cached per (k-set, ``self.fft_grid``).  Reuses
         :func:`common.gvec_fft_box.build_g_index_for_fft_box` so the
-        algorithm lives in one place.
+        algorithm lives in one place — and hands it the loader's OWN
+        rectangular ``(n_k, ngkmax, 3)`` table plus ``ngk_valid``, so the
+        builder does a masked scatter with no ragged Python k-loop
+        between the two.
         """
-        cache_key = ("box_index", *self._k_cache_key(k))
+        # ``fft_grid`` is in the key because the g_index is a function of
+        # (k-set, fft_grid) and the docstring above has always said so —
+        # it just wasn't true.  A loader's ``fft_grid`` is read-only in
+        # practice, so this has never fired; it costs one tuple.
+        cache_key = ("box_index", *self._k_cache_key(k),
+                     tuple(int(s) for s in self.fft_grid))
         if cache_key in self._gvecs_cache:
             return self._gvecs_cache[cache_key]
 
         from common.gvec_fft_box import build_g_index_for_fft_box
 
-        gvecs = self.gvecs(k=k)                                # (n_k, ngkmax, 3)
-        ngk_v = self.ngk_valid(k=k)                            # (n_k,)
-        # Strip pad rows back to per-k logical extent so the index
-        # builder doesn't see zero-padded gvecs (which would map to
-        # (0,0,0) and clobber the real Γ slot).
-        gvecs_per_k = [
-            gvecs[j, : int(ngk_v[j])] for j in range(int(gvecs.shape[0]))
-        ]
         g_index = build_g_index_for_fft_box(
-            gvecs_per_k, tuple(int(s) for s in self.fft_grid),
-            int(self.ngkmax))
+            self.gvecs(k=k), tuple(int(s) for s in self.fft_grid),
+            int(self.ngkmax), ngk_valid=self.ngk_valid(k=k))
         self._gvecs_cache[cache_key] = g_index
         return g_index
 
@@ -726,7 +752,8 @@ class WfnLoader:
         # Build the cache key.  ``id(mesh)`` is fine because the mesh
         # outlives the loader in every production driver (the mesh is
         # built once at top-of-main and threaded through every kernel).
-        cache_key = ("box_index_dev", *self._k_cache_key(k), id(mesh))
+        cache_key = ("box_index_dev", *self._k_cache_key(k),
+                     tuple(int(s) for s in self.fft_grid), id(mesh))
         if cache_key in self._gvecs_dev_cache:
             return self._gvecs_dev_cache[cache_key]
         # Resolve the requested sharding (default = replicated 4-axis).
@@ -1142,8 +1169,12 @@ class WfnLoader:
         Padding contract:
         * Band axis pad rows are zero-filled.
         * G axis pad rows are zero-filled; the matching ``gvecs(k=...)``
-          rows beyond ``ngk_valid(k=...)`` are zero (used as no-op
-          scatter indices).
+          rows beyond ``ngk_valid(k=...)`` hold the FFT-box pad sentinel
+          (:func:`common.gvec_fft_box.fft_box_pad_sentinel`).  Zero
+          COEFFICIENT + sentinel G-VECTOR is the whole contract: the
+          coefficient makes the slot inert in any contraction, the
+          sentinel makes an unmasked slot detectable rather than
+          silently aliased onto Γ.
         * For ``k='full_bz'`` (or explicit list): symmetry unfold +
           τ-phase + TR conjugation applied internally.
         * For ``k='ibz'``: raw WFN-file IBZ slab; no unfold.
