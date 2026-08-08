@@ -42,7 +42,12 @@ coordinate, K = q+G Cartesian in bohr⁻¹, v = slab-truncated Coulomb):
             v_LR(K) = v(K) e^{−K²/4α²},   v_SR = v·(−expm1(−K²/4α²))
             V_SRc(q_j) = conj(S) [V_ref − V_LR] conj(S)
         LR confined to the FIXED Miller superset 𝒢(α) =
-        {G : min_{q∈BZ, q_z=0} |q+G|² ≤ 4α² ln(1/ε_LR)}.
+        {G : min_{q∈BZ, q_z=0} |q+G|² ≤ 4α² ln(1/ε_LR)}, intersected
+        with the G_z channels the b26p model fits (``DEG_B26P``) —
+        the rest are model-zero and contribute exact 0.0 (``lr_gset``).
+    (c) phase-factored LR form-factor samples on 𝒢(α):
+            F_μ(q_j;G) = e^{+2πi (q_j+G)·s_μ} (S_q ζ̃)_μ(q_j+G)
+        (centroid winding phase carried analytically — the g0-winding cure).
     (c) phase-factored LR form-factor samples on 𝒢(α):
             F_μ(q_j;G) = e^{+2πi (q_j+G)·s_μ} (S_q ζ̃)_μ(q_j+G)
         (centroid winding phase carried analytically — the g0-winding cure).
@@ -808,10 +813,60 @@ def run_gates(zx, C_q):
 # ===========================================================================
 # STAGE 1 — offline preparation at the coarse grid points
 # ===========================================================================
-def lr_gset(zx, alpha=ALPHA):
+def lr_gset(zx, alpha=ALPHA, degrees=None):
     """Fixed global Miller superset of the LR channel: all G with
     min_{q∈BZ, q_z=0} |q+G|² ≤ 4α² ln(1/ε_LR), minimised over a 13×13
-    in-plane q sample (reference ``lr_gset``, verbatim)."""
+    in-plane q sample (reference ``lr_gset``, verbatim), then RESTRICTED to
+    the G_z channels the b26p model actually fits.
+
+    THE G_z TRIM.  The cutoff above is ISOTROPIC in K, but the model is not.
+    :func:`lr_design_blocks` fits only the channels named in ``degrees``
+    (``DEG_B26P`` — |G_z| ≤ 3) and :func:`make_eval_vq` leaves every other
+    column of ``M`` at its ``jnp.zeros`` initialisation, so those columns
+    carry ``zt = 0``, ``A = 0``, and contribute EXACTLY ``0.0`` to
+    ``conj(A) A^T``.  Measured: ``max|A[:, dead]| = 0.000e+00`` over 8 target
+    Q on the MoS2 3×3 slab deck — an exact zero, not a small number.
+
+    Carrying them is not free, and how much it costs depends on the CELL.
+    ``|G_z|`` runs to ``Kmax/|b3|``, and ``|b3| = 2π/c`` shrinks as the slab's
+    vacuum padding grows, so the dead fraction rises with cell height while
+    the modelled window ``3·|b3|`` shrinks:
+
+      * Si bulk (a₃ = 7.26 bohr, |b3| = 1.061):  nG = 123, |G_z| ≤ 2,
+        **0 dead** — the trim is a no-op, the cutoff already stops inside
+        the fitted channels.
+      * MoS2 slab (a₃ = 22.68 bohr, |b3| = 0.277): nG = 337, |G_z| ≤ 9,
+        **176 dead (52.2%)**.
+
+    52% of the ``(nq, n_μ, nG)`` host ``Fch`` block, 52% of the ``(n_μ, nG)``
+    ``A`` matrix and of both of its resharding constraints, and 52% of the
+    K-dimension of the LR outer product — all of it multiplying exact zeros.
+
+    THE TRIM IS OFF BY DEFAULT, AND THE NUMBER THAT REFUSED IT IS
+    ``5.793e-03``.  The dead columns are dead in ``eval_vq`` — that part is
+    proven — but they are NOT dead in :func:`run_nulls`, whose
+    ``F_own_rebuild_vs_cleaned_LR_tile_max`` null rebuilds the LR tile from
+    the SAMPLED form factors ``Fch`` on the superset and compares it against
+    ``Sc·V_LR·Sc`` built from the FULL stored sphere.  That null certifies
+    SET COVERAGE, not model fidelity, so dropping columns from the set
+    breaks it: 5.793e-03 against a 1e-6 tolerance on the MoS2 3×3 deck.
+
+    Read the two facts together and they say something the tree did not
+    record: stage 1 subtracts the FULL-sphere ``V_LR`` and stage 3 adds back
+    only the FITTED channels, so the |G_z| > 3 weight is already lost on the
+    production path — and ``run_nulls`` cannot see that, because it tests
+    ``Fch`` rather than the fitted model.  Trimming does not create the gap;
+    it moves the gap into the one instrument that was reporting on it.
+    Closing it is a MODEL question (widen ``DEG_B26P``), not a set question,
+    and it is owner-ruled work — see FIX_vq_interp.md.
+
+    ``LORRAX_VQ_LR_GZ_TRIM=1`` opts in: bit-identical in ``eval_vq`` to ~2
+    ulp, worth 1.69x on the LR outer product at n_μ = 2412 and half the host
+    ``Fch`` block, at the price of that null.  The trim is keyed on
+    ``degrees`` rather than on the literal ``DEG_B26P`` so the superset and
+    the fit cannot drift apart silently; :func:`lr_design_blocks` REFUSES a
+    ``degrees`` wider than the one the superset was built with.
+    """
     K2max = 4.0 * alpha ** 2 * np.log(1.0 / EPS_LR)
     Kmax = np.sqrt(K2max)
     nmax = [int(np.ceil(Kmax / np.linalg.norm(zx["bvec"][i]))) + 1
@@ -826,7 +881,12 @@ def lr_gset(zx, alpha=ALPHA):
             qf = np.array([tx, ty, 0.0])
             K = zx["bvec"].T @ (qf[:, None] + Gall.astype(np.float64))
             m = np.minimum(m, np.sum(K * K, axis=0))
-    return np.ascontiguousarray(Gall[:, m <= K2max])
+    keep = m <= K2max
+    if os.environ.get("LORRAX_VQ_LR_GZ_TRIM", "0") == "1":
+        deg = DEG_B26P if degrees is None else degrees
+        keep = keep & np.isin(np.abs(Gall[2]),
+                              np.asarray(sorted({abs(int(g)) for g in deg})))
+    return np.ascontiguousarray(Gall[:, keep])
 
 
 def _sphere_slot(zx, q, GS):
@@ -863,7 +923,7 @@ def _to_host(x):
 
 def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
                    eigh_backend: str = "auto", q_chunk: int = 48,
-                   keep_host_mirrors: bool = True):
+                   keep_host_mirrors: bool = True, degrees=None):
     """STAGE 1.  Returns the coarse-side bundle ``prep``:
       S        (nq, n_μ, n_μ)  Tikhonov cleaning operators S_q (host copy,
                                nulls only) — ``None`` without host mirrors
@@ -871,7 +931,8 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
                                sharded ``P(None,'x','y')`` (the stencil data)
       V_SRc_np (nq, n_μ, n_μ)  host copy (LOO ladders / metrics) — ``None``
                                without host mirrors
-      GS       (3, nG)         fixed LR Miller superset 𝒢(α)
+      GS       (3, nG)         fixed LR Miller superset 𝒢(α), G_z-trimmed
+                               to the fitted channels (:func:`lr_gset`)
       Fch      (nq, n_μ, nG)   phase-factored cleaned LR form factors (host —
                                fit input only, droppable after stage 2)
       W        (nq, nG)        LSQ weights v_LR(q+G) (head slot → 0)
@@ -920,7 +981,10 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     q_chunk = int(min(q_chunk, nq,
                       max(ndev, ndev * (5e9 // (n_mu * ngkmax * 16 * ndev)))))
     assert np.max(np.abs(zx["qfr"][:, 2])) < 1e-12, "slab pipeline needs q_z=0"
-    GS = lr_gset(zx, alpha)
+    # ``degrees`` reaches the superset builder as well as the fit, so the two
+    # cannot disagree about which G_z channels exist (see lr_gset's G_z trim).
+    degrees = DEG_B26P if degrees is None else degrees
+    GS = lr_gset(zx, alpha, degrees=degrees)
     nG = GS.shape[1]
     # q-batched layout: every device owns whole matrices for its own q.  That
     # needs nq_chunk % ndev == 0, which a deck with fewer BZ q-points than
@@ -1080,6 +1144,10 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     del V_dev_chunks
     return {"alpha": alpha, "eps_tik": eps_tik, "GS": GS, "S": S_np,
             "V_SRc": V_SRc_dev, "V_SRc_np": V_SRc_np, "Fch": Fch, "W": W,
+            # the degrees the SUPERSET was built with — lr_design_blocks
+            # refuses a wider request against it (silent-narrowing guard)
+            "lr_gz_degrees": (degrees if os.environ.get(
+                "LORRAX_VQ_LR_GZ_TRIM", "0") == "1" else None),
             "gz_cols": {int(g): np.where(GS[2] == g)[0]
                         for g in np.unique(GS[2])}}
 
@@ -1109,7 +1177,25 @@ def lr_design_blocks(zx, prep, degrees=None):
     ``degrees`` are model-zero (dropped).  Per-q blocks make LOO refits
     honest (target's samples excluded) at O(nb²) cost."""
     if degrees is None:
-        degrees = DEG_B26P
+        degrees = prep.get("lr_gz_degrees") or DEG_B26P
+    # SILENT-NARROWING GUARD.  When ``prepare_coarse`` trimmed the superset to
+    # a degrees dict, asking here for a WIDER one would not raise anywhere: the
+    # loop below iterates ``prep['gz_cols']``, so a channel the superset no
+    # longer carries is simply never visited and the model quietly loses it.
+    # That is the "config key parsed and quietly ignored" failure mode
+    # src/bse/STATUS.md:167-170 records as having cost this project days.
+    _trim = prep.get("lr_gz_degrees")
+    if _trim is not None:
+        extra = sorted({abs(int(g)) for g in degrees}
+                       - {abs(int(g)) for g in _trim})
+        if extra:
+            raise ValueError(
+                f"lr_design_blocks asked for |G_z| channels {extra}, but "
+                f"prepare_coarse built the LR superset trimmed to "
+                f"{sorted({abs(int(g)) for g in _trim})} (lr_gset's G_z trim). "
+                f"Those channels have no columns in prep['GS'] and would be "
+                f"silently dropped from the fit.  Rebuild prepare_coarse with "
+                f"the same `degrees`, or set LORRAX_VQ_LR_GZ_TRIM=0.")
     nq = zx["nq"]
     des = {"specs": {}, "AtA": {}, "AtY": {}, "alpha": prep["alpha"]}
     for g, cols in prep["gz_cols"].items():
@@ -1243,6 +1329,22 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     K = bvec.T @ (Qf[:, None] + GS)                        # (3, nG) cartesian Q+G
     K2 = np.sum(K * K, axis=0)
     gstar = int(np.argmin(K2))
+    # The head magnitude is injected onto the LR column ``gstar`` by
+    # ``eval_vq`` (``v = where(arange(nG)==gstar, head_val, v)``), and that
+    # column's form factor is ``M[:, gstar]`` — which the b26p model leaves at
+    # ZERO for any |G_z| it does not fit.  Landing the head on such a column
+    # would multiply the cell-averaged magnitude by an identically-zero form
+    # factor and drop it silently.  For a q_z=0 slab the argmin is always a
+    # G_z=0 slot, so this cannot fire in scope; it fires if the caller leaves
+    # that scope.  (Nothing checked this before.)
+    if int(abs(GS[2, gstar])) not in DEG_B26P:
+        raise ValueError(
+            f"mini-BZ head slot G*={GS[:, gstar].astype(int).tolist()} is in "
+            f"the |G_z|={int(abs(GS[2, gstar]))} channel, which the b26p model "
+            f"does not fit (DEG_B26P={sorted(DEG_B26P)}).  Its form factor is "
+            f"model-zero, so the head magnitude would be silently dropped.  "
+            f"Target Q={Qf.tolist()} is outside the slab pipeline's q_z=0 "
+            f"scope.")
     shift_cart = K[:, gstar]                               # cartesian Q+G*
     len_shift2 = float(shift_cart @ shift_cart)
     q0sph2 = minibz_inscribed_sphere_r2(bvec, kgrid, is_2d=True)
