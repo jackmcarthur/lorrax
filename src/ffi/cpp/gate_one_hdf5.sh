@@ -170,6 +170,27 @@ if [[ -n "$STAGE" ]]; then
 fi
 
 # --- what actually gets MAPPED --------------------------------------------
+#
+# THIS HALF IS ENVIRONMENT-DEPENDENT and the two above are not.  The request
+# and stage halves read SONAMEs out of ELF headers and out of a directory; this
+# one asks the dynamic loader to resolve a closure, and the answer belongs to
+# the machine it is asked on.  A DEVICE library examined from a login node has
+# libnccl / libnvshmem_host / libucc 'not found' while being perfectly correct,
+# and so does a peer artifact from the other leg.
+#
+# LORRAX_GATE_ONE_HDF5_CLOSURE=off runs the environment-independent halves and
+# SAYS SO — it does not print an unqualified PASS, because a gate that skipped
+# a half must not report the whole property.  scripts/verify_ffi_build.sh sets
+# it exactly when it knows this is the wrong environment, and counts the
+# unchecked half as COULD NOT RUN.
+if [[ "${LORRAX_GATE_ONE_HDF5_CLOSURE:-on}" == "off" ]]; then
+    echo "[$TAG] GATE 7 request+stage halves PASSED: ${REQ[*]}"
+    echo "[$TAG]   closure half NOT CHECKED here (LORRAX_GATE_ONE_HDF5_CLOSURE=off):"
+    echo "[$TAG]   whether two distinct HDF5 objects would be MAPPED into one"
+    echo "[$TAG]   process is a property of the environment the library runs in,"
+    echo "[$TAG]   not of this one."
+    exit 0
+fi
 if command -v ldd >/dev/null 2>&1; then
     ALL_LDD=""
     for so in "$@"; do

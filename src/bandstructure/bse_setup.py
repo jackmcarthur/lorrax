@@ -38,7 +38,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-from distrib_la import plan as linalg_plan                          # noqa: E402
+from distrib_la import plan as linalg_plan, mesh_key as _mesh_key   # noqa: E402
 # Every extent this module shards is an input datum: n_μ is a k-means centroid
 # count, nb_fi is the caller's band window, and the q-batch is batch_size — so
 # each of them divides the mesh axis only by luck.  ``bse_io`` pads its own μ
@@ -93,6 +93,59 @@ def resolve_reshard_route(explicit=None, *, log_fn=None) -> str:
         f"known route.  Accepted: {'/'.join(_RESHARD_ROUTES)}; unset = "
         f"{_RESHARD_ROUTE_DEFAULT}.  The knob is NOT in force. ***")
     return _RESHARD_ROUTE_DEFAULT
+
+
+#: ``compute_wfns_fi``'s jits, keyed per SIGNATURE and held for the process.
+#:
+#: They used to be five ``jax.jit`` CLOSURES rebuilt on every call, and JAX
+#: keys its tracing cache on callable identity — so a fresh closure is a
+#: fresh cache line and every invocation re-traced all five from scratch.
+#: What that costs is TRACING and lowering, not XLA compilation: the
+#: executable cache underneath ``pjit`` is keyed on the jaxpr/avals/shardings
+#: rather than on the function object, so the retraced program hashed to the
+#: same executable and ``jax_compile_cache``'s ``compiles`` counter stayed
+#: flat.  That is why this was invisible to the obvious instrument and why
+#: the numbers in the commit message are WALL numbers on repeat calls.
+#:
+#: It bites wherever ``compute_wfns_fi`` is called more than once per
+#: process, which is the ``bse.exciton_bands`` refit loop (``:889``, 5 Q via
+#: ``vq_interp.refit_vq``) — every one of those five calls passes the SAME
+#: shapes, so four of them were paying a full retrace for nothing.
+#:
+#: THE KEY MUST COVER EVERY CLOSED-OVER VALUE, not just the arguments.  The
+#: arguments take care of themselves (jit keys its own cache on avals and
+#: static args); what a stale entry would silently reuse is the CONSTANTS
+#: baked into the trace — ``R_grid`` (a pure function of ``kgrid_co``), the
+#: mesh, ``rank``, the batch width, the band window's derived extents, the
+#: staged-reshard route, and ``newton_inv``'s (a, n, shift).  Every one of
+#: them is in a key below.  ``distrib_la.mesh_key`` rather than ``id(mesh)``
+#: because these entries do NOT retain the mesh, and the failure mode of an
+#: id-keyed cache that does not retain its object is a stale HIT.
+#:
+#: NOT retained here: the ``_stage_q`` reshard closure.  It is still built on
+#: every call, exactly as before, because its factory issues a collective
+#: (``warm_mesh_cliques``) that must run on every rank in the same order —
+#: caching it would move a collective, which is not a change to make for a
+#: warm-up.  A cached ``_q_batch`` therefore holds the FIRST call's
+#: ``_stage_q``; that is safe because ``face_to_batch_reshard`` is a pure
+#: function of (mesh, axes, route) and all three are in the key.
+_WFNS_FI_KERNELS: dict = {}
+
+
+def _cached_kernel(key, build):
+    """The jit for ``key``, built once per process.
+
+    Deliberately a plain dict and not ``functools.lru_cache``: the key is
+    assembled by the caller from things an argument-keyed decorator cannot
+    see (closed-over constants), and an eviction policy would silently
+    reintroduce the retrace this exists to remove.  The tree's own prior art
+    is ``htransform._accum_G_cache`` / ``vq_interp._REFIT_KERNELS`` /
+    ``distrib_la.plan._SCAN_CACHE``; this is the same shape.
+    """
+    fn = _WFNS_FI_KERNELS.get(key)
+    if fn is None:
+        fn = _WFNS_FI_KERNELS[key] = build()
+    return fn
 
 
 def _parse_kgrid_fi(spec) -> tuple[int, int, int]:
@@ -171,8 +224,16 @@ def compute_wfns_fi(
                    Treated as a FLOOR, not an exact width: it is rounded UP
                    to a multiple of the device count so the ``P(('x','y'),…)``
                    q-axis sharding is legal (see the ``bs`` block below).
-                   Ignored by the FFI backends, which decompose one q at a
-                   time by construction (their effective chunk is 1).
+                   The FFI backends read the SAME key but do NOT pad it —
+                   their stack carries an unsharded batch axis, so a pad
+                   would buy no sharding and cost real distributed solves on
+                   rows that are then discarded — and their DEFAULT is 1,
+                   which is the width that reproduces the historical per-q
+                   path bit for bit.  Asking for more collapses the per-q
+                   dispatches (measured 4.8x at C=8) and, on a library with
+                   a stacked entry point, the descriptor/workspace too, at a
+                   measured ~1-ULP move in the eigenvalues.  See the
+                   ``bs_ffi`` block at the FFI loop for the measurement.
         q_list:    optional (nq, 3) fractional q — evaluate at exactly these
                    points instead of a uniform grid.  Wrapped to (−0.5, 0.5]
                    internally (fH_q is exactly BZ-periodic, so wrapping is a
@@ -269,9 +330,11 @@ def compute_wfns_fi(
             f"build_fH_R's ifft-reshape both read this extent.")
     if batch_size is None or int(batch_size) <= 0:
         batch_size = nk_co
+        _bs_explicit = False
         _bs_origin = f"default N_q_co={nk_co}"
     else:
         batch_size = int(batch_size)
+        _bs_explicit = True
         _bs_origin = f"wfn_fi_q_chunk={batch_size}"
 
     # ── Which of the TWO eigenvalue paths ────────────────────────────────
@@ -449,6 +512,20 @@ def compute_wfns_fi(
             f"replicate-then-repartition ({bs * rank * rank * 16 / 1024**2:.0f}"
             f" MB/device/batch).  See common/staged_reshard.py.")
 
+    # ── The per-signature key for the jit cache ──────────────────────────
+    # Every value the kernels below CLOSE OVER, in one tuple: the mesh (by
+    # ``distrib_la.mesh_key``, which carries device identity and not just
+    # extents), ``kgrid_co`` (which is all ``R_grid`` is), the matrix extent,
+    # the three output extents that ``_qbatch_out_shardings`` and the bundle
+    # shardings are built from, and the reshard route plus whether the staged
+    # primitive accepted this shape.  Arguments are deliberately ABSENT — jit
+    # keys its own cache on avals and static args, so putting shapes here
+    # would only split entries that are already correctly split.
+    _mesh_id = _mesh_key(mesh_xy)
+    _sig = (_mesh_id, tuple(int(v) for v in kgrid_co), int(rank),
+            int(nb_fi), int(nspinor), int(n_mu), _route,
+            _stage_q is not None, bool(native))
+
     # The two stages either side of the eigh are plain traceable functions,
     # shared verbatim by both backends; only the JIT BOUNDARIES differ.  The
     # native path keeps eigh + projection inside ONE jit — split apart, the
@@ -598,58 +675,199 @@ def compute_wfns_fi(
                 _fit(mesh_xy, P(('x', 'y'), None), (bs, rank),
                      "bse_setup.lam_all"))
 
-    @partial(jax.jit, static_argnames=('b_min', 'b_max'),
-             out_shardings=_qbatch_out_shardings(bs))
-    def _q_batch(q_batch, fH_R, B, b_min, b_max):
-        """Native: Fourier sum → batched eigh → projection, ONE fused jit."""
-        lam, U = jnp.linalg.eigh(_fourier(q_batch, fH_R, True))
-        return _project(lam, U, B, b_min, b_max)
-
-    @jax.jit
-    def _fH_q_one(q, fH_R):
-        return _fourier(q, fH_R, False)
-
-    @partial(jax.jit, static_argnames=('b_min', 'b_max'))
-    def _project_one(lam, U, B, b_min, b_max):
-        return _project(lam, U, B, b_min, b_max)
-
-    # Backend choice = parallel-over-q vs parallel-within-matrix.  The native
-    # path eigh-es ``bs/ndev`` WHOLE (rank, rank) matrices per device
-    # concurrently; the FFI path spreads ONE matrix over the whole mesh and
-    # walks q serially.  At rank 4716 that is 356 MB/matrix on one device vs
-    # 22 MB/device on 16 GPUs — so the FFI backends are what make a window too
-    # wide for the batched path runnable at all, at the cost of nq sequential
-    # distributed solves.  Native stays the default.
-    if not native:
-        # Mesh/geometry guards already passed when the plan was built.
-        log(f"  fH_q eigh: {eigh_plan.describe()}, {nq} q serially"
-            + ("  [use_low_mem_eigh]" if use_low_mem_eigh else ""))
+    def _q_batch_kernel(bs_):
+        def _build():
+            @partial(jax.jit, static_argnames=('b_min', 'b_max'),
+                     out_shardings=_qbatch_out_shardings(bs_))
+            def _q_batch(q_batch, fH_R, B, b_min, b_max):
+                """Native: Fourier sum → batched eigh → projection, ONE fused
+                jit."""
+                lam, U = jnp.linalg.eigh(_fourier(q_batch, fH_R, True))
+                return _project(lam, U, B, b_min, b_max)
+            return _q_batch
+        return _cached_kernel(("q_batch", _sig, int(bs_)), _build)
 
     lam_chunks, psi_chunks, c_chunks, lam_all_chunks = [], [], [], []
 
     def _emit(lam_s, psi_s, c_s, lam_all_s):
-        lam_chunks.append(lam_s if lam_s.ndim == 2 else lam_s[None])
-        psi_chunks.append(psi_s if psi_s.ndim == 4 else psi_s[None])
-        lam_all_chunks.append(lam_all_s if lam_all_s.ndim == 2
-                              else lam_all_s[None])
+        """Stash one CHUNK's four outputs.  Both arms emit a leading chunk
+        axis now — the native q-batch, and the FFI arm's ``lax.map``'d chunk
+        — so the per-item ``[None]`` rank-expansions this used to carry
+        (four eager ``broadcast_in_dim``s per q on the FFI arm) are gone,
+        and so is the ``block_until_ready`` that stood on its last line.
+        That sync fired once per q on the FFI arm (1456 host round trips on
+        the reference deck).  Each loop now owns its own sync POLICY, at its
+        own cadence, where the reason for it can be written down."""
+        lam_chunks.append(lam_s)
+        psi_chunks.append(psi_s)
+        lam_all_chunks.append(lam_all_s)
         if return_coeffs:
-            c_chunks.append(c_s if c_s.ndim == 3 else c_s[None])
-        jax.block_until_ready(psi_chunks[-1])
+            c_chunks.append(c_s)
 
+    # Backend choice = parallel-over-q vs parallel-within-matrix.  The native
+    # path eigh-es ``bs/ndev`` WHOLE (rank, rank) matrices per device
+    # concurrently; the FFI path spreads ONE matrix over the whole mesh and
+    # walks q in chunks.  At rank 4716 that is 356 MB/matrix on one device vs
+    # 22 MB/device on 16 GPUs — so the FFI backends are what make a window too
+    # wide for the batched path runnable at all, at the cost of nq sequential
+    # distributed solves.  Native stays the default.
     if native:
+        _q_batch = _q_batch_kernel(bs)
         for i in range(0, q_pad.shape[0], bs):
             _emit(*_q_batch(q_pad[i:i + bs], fH_R, B_rep, b_min, b_max))
+            # RETAINED, per chunk, and it is not an oversight.  ``_q_batch``
+            # materialises a (bs, rank, rank) fH_q batch INSIDE its own
+            # executable, and this file records two separate OOMs caused by
+            # exactly that array (the face constraint at ``_fourier``, and
+            # the 10.1 GiB/device split that killed a 16 x A100-80GB run).
+            # Without a sync, N chunks can be in flight at once and each one
+            # holds its own copy of that temp buffer, so deleting this trades
+            # 23-46 host round trips — second-order, by this campaign's own
+            # ranking — for an N-fold transient the module has been OOM-killed
+            # by twice.  It belongs to the native-glue item (survey R3) and
+            # wants a VmHWM measurement, not an assertion.
+            jax.block_until_ready(psi_chunks[-1])
     else:
+        # ── The FFI arm's q-CHUNK ────────────────────────────────────────
+        # A DIFFERENT extent from ``bs`` above, deliberately.  ``bs`` is a
+        # PLACEMENT width, padded to a multiple of ndev because the native
+        # path shards its q axis over ``P(('x','y'),…)``.  The FFI stack does
+        # not shard its q axis at all — ``Plan.batch_in_sharding`` is
+        # ``P(None,'x','y')``: the batch axis is whole and each MATRIX is
+        # spread over the mesh — so padding it to ndev would buy no sharding
+        # and cost real distributed solves on rows that are then discarded.
+        # Hence no padding here, and a ragged last chunk instead: two
+        # signatures, two compiles, and ``distrib_la.plan._SCAN_CACHE`` holds
+        # both.
+        #
+        # THE DEFAULT IS 1, AND IT IS 1 FOR A VALUES REASON, NOT A MEMORY ONE.
+        # MEASURED, this worktree, 2x2 A100 mesh, 4 ranks, cuSOLVERMp eigh,
+        # rank 64, nk_co 4, 16 q, against the per-q loop this replaces:
+        #     C = 1   every bundle field BIT-IDENTICAL (np.array_equal)
+        #     C = 8   lam_fi / lam_all_fi / enk_full  max|d| 3.33e-16 Ry
+        #             coeffs_fi 4.48e-15, psi 4.71e-14
+        # The re-framing here is NOT the source: with the eigh taken out of
+        # the picture, this file's Fourier body and projection body are
+        # bit-identical as a per-q loop and as a ``lax.map`` at widths 1, 2
+        # and 8 (probe: ``bsesetup_probe/fourier_frame_probe.py``, host mesh,
+        # array_equal, with its own planted-ULP red twin).  What moves is
+        # inside the FFI eigh: ``Plan.batched``'s ROUTE_SCAN hands
+        # cuSOLVERMp a slice of a stack where ``Plan.__call__`` handed it a
+        # standalone tile, and cusolverMpSyevd does not return the same last
+        # bit for the two.  That is a distrib_la fact, not a bse_setup one.
+        #
+        # A width-derived default would therefore make the ANSWER a function
+        # of how much memory the run had — and on this deck the cross-P pin
+        # (0.740 meV, and a .dat that is byte-identical at both P) is a
+        # headline artifact.  So the default reproduces the historical path
+        # exactly, and C > 1 is something a deck ASKS for, in writing, with
+        # the trade announced on the banner below.
+        #
+        # What C > 1 buys, same measurement: XLA dispatches per call
+        # 53 -> 11 at C = 8 (4.8x), because each chunk is one Fourier program,
+        # one batched-eigh call and one projection program instead of three
+        # per q.  What it costs on a library WITHOUT a stacked entry point
+        # (cuSOLVERMp, SLATE) is only that dispatch saving — the per-matrix
+        # collective floor is untouched — plus the ULP above.  On ScaLAPACK,
+        # which HAS one, ``Plan.batched_route`` becomes ROUTE_BACKEND_BATCHED
+        # and the chunk additionally collapses to one descriptor and one
+        # workspace in C++.  Residency, for a deck sizing the key: C
+        # face-sharded matrices cost C·rank²·16/ndev per rank for the operand
+        # and the same again for the eigenvector stack, so C ≥ ndev is a
+        # whole matrix per device — which is the thing ``use_low_mem_eigh``
+        # says is unaffordable.
+        bs_ffi = (max(1, min(int(batch_size), nq)) if _bs_explicit else 1)
+        if bs_ffi > 1:
+            log(f"  *** LORRAX SANITY: wfn_fi_q_chunk={bs_ffi} on the FFI "
+                f"eigh arm batches {bs_ffi} q per distributed solve.  The "
+                f"per-q values move by ~1 ULP against the C=1 path (measured "
+                f"3.3e-16 Ry on the eigenvalues, 4.7e-14 on psi, inside this "
+                f"module's own chunk-width tolerance but NOT bit-identical), "
+                f"so a byte-identical .dat against a C=1 run is not expected. "
+                f"Unset the key for the bit-identical path. ***")
+        n_chunks = -(-nq // bs_ffi)
+        # Mesh/geometry guards already passed when the plan was built.
+        log(f"  fH_q eigh: {eigh_plan.describe()}, {nq} q in {n_chunks} "
+            f"chunk(s) of {bs_ffi} "
+            f"[{'wfn_fi_q_chunk' if _bs_explicit else 'default ndev//2'}], "
+            f"Plan.batched route={eigh_plan.batched_route}"
+            + ("  [use_low_mem_eigh]" if use_low_mem_eigh else ""))
+
+        # ── The FFI arm's TWO jits, CHUNK-shaped ─────────────────────────
+        # Each is a ``lax.map`` — a scan with an empty carry, which is the
+        # claim that the q axis is independent — over EXACTLY the single-q
+        # body the Python loop used to call per item.  Two properties follow
+        # from that spelling and both are why it is a map and not a vmap:
+        #
+        #  * THE ARITHMETIC PER q IS UNCHANGED, so this conversion is
+        #    bit-identical by construction rather than by tolerance.  The
+        #    obvious alternative — batching the Fourier einsum to
+        #    ``'qk,kij->qij'`` the way ``_fourier(..., batched=True)`` does
+        #    for the native arm — is a different XLA kernel with different
+        #    reduction blocking, and this module's own chunk-width cell
+        #    already measures that changing an eigh BATCH SIZE moves the
+        #    answer by one ULP (``tests/test_bse_setup_qchunk.py``,
+        #    ``CHUNK_TOL_RY``).  A loop that is only a loop must not move a
+        #    value.  Both bodies are gated as exact at widths 1/2/8 by
+        #    ``bsesetup_probe/fourier_frame_probe.py``; what does move at
+        #    C > 1 is the FFI eigh, and the ``bs_ffi`` block above is where
+        #    that is measured and defaulted around.
+        #  * The chunk is ONE XLA program instead of C, and it hands
+        #    ``Plan.batched`` a real STACK — which is the only place the
+        #    batched surface's route decision can live
+        #    (``distrib_la.Plan.batched_route``).  ScaLAPACK takes
+        #    ROUTE_BACKEND_BATCHED: one descriptor and one workspace in C++
+        #    for the whole chunk, a saving that lives in the library and no
+        #    Python loop can reach.  cuSOLVERMp and SLATE take the cached
+        #    ROUTE_SCAN, which is the same per-matrix FFI call this loop
+        #    already made, minus C−1 dispatches.
+        #
+        # ``out_shardings`` is the plan's OWN declared operand contract, so
+        # ``Plan.batched``'s ``ensure_sharding`` finds the stack already in
+        # place and emits nothing (it compares (mesh, spec), not sharding
+        # objects, for exactly this case — distrib_la.plan.ensure_sharding).
+        def _build_fH_q_chunk():
+            @partial(jax.jit, out_shardings=eigh_plan.batch_in_sharding)
+            def _fH_q_chunk(q_chunk, fH_R):
+                return jax.lax.map(lambda q: _fourier(q, fH_R, False),
+                                   q_chunk)
+            return _fH_q_chunk
+
+        def _build_project_chunk():
+            @partial(jax.jit, static_argnames=('b_min', 'b_max'))
+            def _project_chunk(lam, U, B, b_min, b_max):
+                return jax.lax.map(
+                    lambda lu: _project(lu[0], lu[1], B, b_min, b_max),
+                    (lam, U))
+            return _project_chunk
+
+        _fH_q_chunk = _cached_kernel(
+            ("fH_q_chunk", _sig, eigh_plan.backend), _build_fH_q_chunk)
+        _project_chunk = _cached_kernel(
+            ("project_chunk", _sig), _build_project_chunk)
+
         t_eigh = time.time()
-        for i in range(nq):        # no batch padding: one q, one solve
-            lam_q, U_q = eigh_plan(_fH_q_one(q_pad[i], fH_R))
-            _emit(*_project_one(lam_q, U_q, B_rep, b_min, b_max))
+        _logged = 0
+        for i in range(0, nq, bs_ffi):
+            lam_c, U_c = eigh_plan.batched(
+                _fH_q_chunk(q_all[i:i + bs_ffi], fH_R))
+            _emit(*_project_chunk(lam_c, U_c, B_rep, b_min, b_max))
             # nq SERIAL distributed solves is a long, silent stretch — log the
-            # rate so a stall is distinguishable from slow progress.
-            if (i + 1) % 32 == 0 or i + 1 == nq:
+            # rate so a stall is distinguishable from slow progress.  THE ONE
+            # SYNC LEFT ON THIS ARM lives here, at the LOG cadence and not per
+            # item, and it does two jobs.  It keeps the rate honest (without
+            # it the number is a DISPATCH rate, which reads as "instant, then
+            # a long pause in the concatenate" and hides exactly the stall the
+            # line exists to expose), and it bounds the in-flight transient to
+            # ~32 q of chunks — strictly less than one native chunk's worth,
+            # and 1/32 of the round trips the per-q sync made.
+            done = min(i + bs_ffi, nq)
+            if done - _logged >= 32 or done == nq:
+                jax.block_until_ready(psi_chunks[-1])
+                _logged = done
                 dt = time.time() - t_eigh
-                log(f"    fH_q eigh {i + 1}/{nq} q  {dt:.0f}s  "
-                    f"{1e3 * dt / (i + 1):.0f} ms/q")
+                log(f"    fH_q eigh {done}/{nq} q  {dt:.0f}s  "
+                    f"{1e3 * dt / done:.0f} ms/q")
     lam_fi = jnp.concatenate(lam_chunks, axis=0)[:nq]
     psi_fi = jnp.concatenate(psi_chunks, axis=0)[:nq]
     lam_all_fi = jnp.concatenate(lam_all_chunks, axis=0)[:nq]
@@ -657,10 +875,20 @@ def compute_wfns_fi(
                  if return_coeffs else None)
 
     # ── Newton-invert lam_fi → DFT-equivalent energies ───────────────────
-    @jax.jit
-    def _inv(lam):
-        return jax.vmap(lambda row: newton_inv(a_f, n_f, shift, row.real))(lam)
-    energies_fi = _inv(lam_fi)
+    # (a_f, n_f, shift) are TRACE CONSTANTS here, not arguments, so they are
+    # in the key: two decks that differ only in their f-transform parameters
+    # must not share this executable.  They are the three floats
+    # ``f_transform_eigs`` returns, so the key is exact, not a fingerprint.
+    def _build_inv():
+        @jax.jit
+        def _inv(lam):
+            return jax.vmap(
+                lambda row: newton_inv(a_f, n_f, shift, row.real))(lam)
+        return _inv
+
+    energies_fi = _cached_kernel(
+        ("inv", _mesh_id, float(a_f), float(n_f), float(shift)),
+        _build_inv)(lam_fi)
 
     # ── Reshard into the canonical (Y, X) wfn-bundle layout ──────────────
     # Matches ``common.wfn_transforms.load_centroids_band_chunked``:
@@ -673,14 +901,20 @@ def compute_wfns_fi(
     out_X = _fit(mesh_xy, P(None, 'x', None, None), (nq, n_mu, nb_fi, nspinor),
                  "bse_setup.psi_rmuT_X")
 
-    @partial(jax.jit, out_shardings=(out_Y, out_X))
-    def _make_bundle(psi):
-        psi_Y = jax.lax.with_sharding_constraint(psi, out_Y)
-        psi_X = jax.lax.with_sharding_constraint(
-            jnp.transpose(psi, (0, 3, 1, 2)), out_X)
-        return psi_Y, psi_X
+    def _build_bundle():
+        @partial(jax.jit, out_shardings=(out_Y, out_X))
+        def _make_bundle(psi):
+            psi_Y = jax.lax.with_sharding_constraint(psi, out_Y)
+            psi_X = jax.lax.with_sharding_constraint(
+                jnp.transpose(psi, (0, 3, 1, 2)), out_X)
+            return psi_Y, psi_X
+        return _make_bundle
 
-    psi_rmu_Y, psi_rmuT_X = _make_bundle(psi_fi)
+    # ``nq`` joins the key here and nowhere else: it is the only kernel whose
+    # closed-over shardings (out_Y / out_X) carry the fine-grid q count.
+    psi_rmu_Y, psi_rmuT_X = _cached_kernel(
+        ("make_bundle", _mesh_id, int(nq), int(nb_fi), int(nspinor),
+         int(n_mu)), _build_bundle)(psi_fi)
     log(f"  bundle: psi_rmu_Y={psi_rmu_Y.shape}, psi_rmuT_X={psi_rmuT_X.shape}")
     out = SimpleNamespace(
         psi_rmu_Y=psi_rmu_Y,

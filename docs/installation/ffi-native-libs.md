@@ -1,5 +1,11 @@
 # FFI native libraries
 
+!!! tip "Read [Building the FFI libraries](../building_ffi.md) first"
+    That page covers *why* the two libraries exist, the build contract every
+    build path now runs (`scripts/verify_ffi_build.sh`), the handler-ABI
+    pairing rule, and a per-lever trap table for porting to a new site. This
+    page is the per-dependency acquisition detail underneath it.
+
 The distributed code paths (cuSolverMp `eigh`, sharded parallel-HDF5 I/O, SLATE Cholesky /
 trsm / heev) call into three native libraries through `src/ffi/`. A single
 `liblorrax_ffi.so` exposes all of them. None of these are declared in `pyproject.toml`; you

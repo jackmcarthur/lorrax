@@ -16,12 +16,29 @@
 // @-substituted by CMake; do not edit the generated copy.
 #pragma once
 
+// Generated for BOTH legs since 2026-08-08.  Each leg substitutes the keys
+// that mean something for it and leaves the others at 0; common/build_config.cc
+// emits only its own leg's keys, so a 0 here is never printed as a capability
+// the leg was supposed to have.  Two legs, one template, so a port that adds a
+// capability adds it in one place.
+
+// ---- host leg -------------------------------------------------------------
 // Whether a standalone FFTW3 was LINKED.  Which engine actually binds is a
 // RUNTIME dlsym fact by design (ffi_layout.md §7) -- on an MKL site this is
-// 0 and the FFTW3 C interface still resolves, out of libmkl_intel_lp64.
+// 0 and the FFTW3 C interface still resolves, out of libmkl_intel_lp64.  It is
+// therefore REPORTED and never asserted on: scripts/verify_ffi_build.sh prints
+// it and gates on the FFT HANDLER SYMBOLS instead.
 #define LORRAX_CFG_LINKED_FFTW3   @LORRAX_CFG_FFTW3@
 #define LORRAX_CFG_HAVE_SCALAPACK @LORRAX_CFG_SCALAPACK@
 #define LORRAX_CFG_HAVE_GEMM      @LORRAX_CFG_GEMM@
+#define LORRAX_CFG_MATH_LINK    "@LORRAX_CFG_MATH_LINK@"
+
+// ---- device leg -----------------------------------------------------------
+#define LORRAX_CFG_HAVE_CUSOLVERMP @LORRAX_CFG_CUSOLVERMP@
+#define LORRAX_CFG_HAVE_CUBLASMP   @LORRAX_CFG_CUBLASMP@
+#define LORRAX_CFG_HAVE_CUFFT      @LORRAX_CFG_CUFFT@
+#define LORRAX_CFG_HAVE_CAL        @LORRAX_CFG_CAL@
+
+// ---- both legs ------------------------------------------------------------
 #define LORRAX_CFG_HAVE_SLATE     @LORRAX_CFG_SLATE@
 #define LORRAX_CFG_HAVE_PHDF5     @LORRAX_CFG_PHDF5@
-#define LORRAX_CFG_MATH_LINK    "@LORRAX_CFG_MATH_LINK@"
