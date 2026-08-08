@@ -161,12 +161,40 @@ def test_g2_branch_window_tiles_are_frozen():
     # NO CROSS-MACHINE TOLERANCE HERE, and the 2026-08-07 owner ruling
     # ("the micro-eV level is fine for comparisons between machines") does
     # NOT reach this gate.  The Perlmutter/Frontera disagreement in this
-    # cell is the crossing-core node ladder: 100 nodes here, 98 in the
-    # frozen array (KNOWN_FAILURES P1).  That is an INTEGER count of
+    # cell is the crossing-core node ladder, and that is an INTEGER count of
     # quadrature nodes riding in a float64 `meta` row, not a rounding
     # difference and not a quantity in eV — an atol would hide a real
     # change in how many τ points the window integrates over.  Whatever
     # this cell's answer is, it is not "loosen the comparison".
+    #
+    # THE REFERENCE FOLLOWS THE PERLMUTTER GRID.  Owner ruling P1b, taken at
+    # the 2026-08-08 service-phase landing, and this file was re-frozen from
+    # a Perlmutter run at the integration head to match it.  Perlmutter is
+    # the blessed machine for this reference.
+    #
+    # THE FRONTERA DIFFERENCE IS STRUCTURAL, NOT NUMERICAL, and that is why
+    # it cannot be absorbed by any tolerance.  Measured at the landing, 40
+    # tile keys, Frontera-frozen array vs a Perlmutter build:
+    #
+    #   32 keys bit-identical
+    #    4 keys SHAPE-mismatched — the crossing-core `t` and `alpha` ladders
+    #      of BOTH crossing branches (ω≥E_F cond, ω<E_F val):
+    #      Frontera (98,) vs Perlmutter (100,)
+    #    2 `meta` rows differ by exactly 2.0 — the same node count, riding
+    #      in the float64 meta row, which is what made this look like a
+    #      micro-eV row and got it mis-filed under P1
+    #    2 `meta` rows compare unequal with max|Δ| == 0.0: NaN-vs-NaN in the
+    #      mask_B_threshold slot, identical in content
+    #
+    # The τ-node POSITIONS disagree from the first element (Perlmutter
+    # [2.666561, 6.499882, ...] vs Frontera [5.442279e-09, 7.894766, ...]),
+    # so these are two different quadratures, not one quadrature sampled
+    # twice.  A machine running the Frontera minimax tables will therefore
+    # fail this cell LOUDLY and by shape, which is the correct outcome: it
+    # says "this build integrates over a different number of τ points",
+    # which is exactly the fact the gate exists to surface.  Do not add a
+    # tolerance and do not re-freeze on Frontera to make it green — bring
+    # the question back to the owner, because only one grid is blessed.
     assert G2_REF.exists(), (
         f"missing G2 reference {G2_REF}; regenerate with "
         f"tests.test_sigma_ppm_gates._regenerate_g2_reference()")
