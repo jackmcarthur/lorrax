@@ -11,6 +11,55 @@ claim carries the arm in which it comes out FALSE.
 
 ---
 
+# AMENDMENT — BSE EXCHANGE-CONJUGATION LANDING, on `main` (2026-08-08, owner-approved)
+
+**Physics moved by design in this landing, and this amendment is the list of
+what honestly went red because of it.**  The exchange term of the BSE
+Hamiltonian carried the wrong complex conjugation relative to the direct/W
+term at ten sites (see the landing merge's message); fixing it restores the
+exciton multiplet degeneracies to the ISDF floor (Si dense: triplet spread
+1318.5 → 36.2 µeV against BerkeleyGW's 32.4; lowest-20 MAE 3.1610 → 3.1529
+meV; control arm reproduces the pre-fix baseline to 0.000000 meV over all
+1024 states) and moves eigenvalues up to 144.17 meV across the dense
+spectrum.  Frozen references that pin the OLD spectrum are therefore wrong,
+not the code.  Full prose manifest:
+`~/lorrax_service_phase/NOTE_bse_exchange_fix_refreeze_manifest.md`.
+
+## Newly RED at this landing, by design — awaiting the re-cut wave
+
+| gate | measured | status |
+|---|---|---|
+| `tests/test_bse_bgw_regression.py::test_bse_matches_frozen_and_bgw` (si_bse_debug frozen arm) | MAE 3.8203 meV / max 9.9236 meV against a 1e-6 eV pin; its BGW *band* arm IMPROVES | red until the re-cut; re-cut owned by the perf lane |
+| w-omega `CHAIN_REL_TOL` gate (`tests/test_bse_w_omega_chain_scan.py`) | frozen-reference based; W-chain quantities move with the fix | expected red; re-cut owned by the perf lane |
+| exciton-bands warm-cache eigenvalue check | frozen-reference based | expected red; re-cut owned by the perf lane |
+
+Expected to HOLD (structural, not frozen-spectrum): `test_bse_vq_interp`
+thresholds and the non-TDA SHAO gates.
+
+**The re-cut prescription is three pins, all mandatory** (evidence:
+`~/lorrax_bse_perf_2026-08-08/CONVERGENCE_CENSUS.md`): cut at the gate's own
+geometry (1 GPU, px=py=2 — the current reference was cut at P=4 and has
+never been seen green by its own gate, a 4.4887 meV provenance artifact);
+cut with THIS fix underneath (or the re-cut freezes the wrong spectrum a
+second time); and cut at a 400-iteration or rtol-converged Lanczos budget —
+the shipped 200 is unconverged on the record deck (4.27 meV off its exact
+1024-dim dense reference and MISSING 3 of the true lowest-20 states; 400
+sits at 3.9 µeV with zero misses).
+
+## Registered defects (found by the perf lane's convergence census, in passing)
+
+- `davidson --write-eigs` dies at P>1 (`device_get` on non-addressable
+  arrays in `write_eigenvectors_stream`).  Flag-path; the suite never
+  exercises it, which is how it stayed hidden.
+- `bse_feast --feast-ritz` cannot run multi-process at all
+  (`_get_feast_runner` closes over non-addressable arrays).  Same class.
+- `bse_w_exact.py:634`'s `max_gmres` column is a LOGGING defect, not a
+  solver defect: the column is filled with a residual while `:248` discards
+  the real iteration count — a two-line driver fix.  It is why the census
+  had to lift the cap to measure convergence at all.
+
+Evidence for all three: `~/lorrax_bse_perf_2026-08-08/CONVERGENCE_CENSUS.md`.
+
 # AMENDMENT — BSE-PERF MERGE, `integration/bse-perf-merge-2026-08-08` @ `e69a867f` (2026-08-08)
 
 **This supersedes the merge-checkpoint amendment below for the counts at THIS
