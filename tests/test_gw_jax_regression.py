@@ -497,5 +497,28 @@ def test_bispinor_gnppm_matches_reference(bispinor_session):
         ("sigX", "sigC", "sigXC"), _XMACHINE_ATOL_EV, "bispinor")
     # Fixture properties (see its README): charge tiles full-BZ-direct,
     # transverse tiles through the IBZ cascade.
-    assert "charge-centroid orbit closure failed" in bispinor_session.stdout
-    assert "V_qmunu_TT_11" in bispinor_session.stdout
+    #
+    # THE STRING MOVED, THE PROPERTY DID NOT.  This used to look for
+    # "charge-centroid orbit closure failed", which was the wording of the
+    # per-call-site fallback notice that `53908088` ("q-grid closure: one
+    # resolution point, and the fallback stops being silent") replaced with
+    # a single announcement composed by the service.  The property being
+    # asserted is unchanged and still true — the bispinor deck's 256-centroid
+    # CHARGE set is not orbit-closed (1 of 2 ops violating, worst residual
+    # 1.436e-01, carried in
+    # `test_symmetry_maps_qgrid_resolution.py::test_a_non_closed_set_...`),
+    # so its tiles fall back to the full BZ and say so, while the closed
+    # 209-centroid transverse set goes through the IBZ cascade silently.
+    #
+    # Asserted on the parts that carry meaning rather than on one long
+    # literal: that a fallback was announced, that it named the charge
+    # centroids specifically (the transverse set must NOT produce one — the
+    # announcement dedupes on the centroid SET, which is what makes these two
+    # distinct lines rather than one line printed twice), and that it gave
+    # the reason.  A cell that pinned the whole sentence would break on every
+    # rewording and teach the next worker to delete it.
+    out = bispinor_session.stdout
+    assert "q-grid symmetry: FALLBACK" in out
+    assert "bispinor g-flat, charge centroids" in out
+    assert "not orbit-closed" in out
+    assert "V_qmunu_TT_11" in out
