@@ -801,9 +801,18 @@ def make_eqp_bgw(
 	efermi_ev = 0.5 * (vbm_ev + cbm_ev)
 	e_dft_rel_ev = e_dft_ev - efermi_ev
 
-	# kin_ion (Ry → eV), pulled on the IBZ wedge directly
-	with h5py.File(kin_ion_path, "r") as kih:
-		kin_full = np.asarray(kih["kin_ion"])
+	# kin_ion (Ry → eV), pulled on the IBZ wedge directly.
+	#
+	# THROUGH ``read_full_bz_dataset``, not a raw h5py read: the file
+	# stores the IBZ slab and unfolds on read, so a bare
+	# ``kih["kin_ion"]`` here would hand ``kirr_to_kfull`` — full-BZ
+	# indices — an ``(nrk, nb, nb)`` array.  Imported lazily (as
+	# ``gw.sigma_dispatch`` does) so this module stays importable without
+	# pulling in the jax-dependent file_io stack; the V_H seam below takes
+	# the same import for the same reason and they are one statement.
+	from file_io.kin_ion import (HARTREE_DATASET, kin_ion_hartree_source,
+	                             read_full_bz_dataset)
+	kin_full = read_full_bz_dataset(kin_ion_path, "kin_ion")
 	if kin_full.ndim != 3:
 		raise ValueError(f"kin_ion dataset must be (nk, nb, nb); got {kin_full.shape}")
 	kin_irr = kin_full[kirr_to_kfull, band_start:band_stop, band_start:band_stop]
@@ -841,14 +850,13 @@ def make_eqp_bgw(
 	#
 	# Reading the attribute is the only supported discriminator — never
 	# infer it from magnitudes (``file_io.kin_ion`` module docstring).
-	# Imported lazily (as ``gw.sigma_dispatch`` does) so this module stays
-	# importable without pulling in the jax-dependent file_io stack.
-	from file_io.kin_ion import kin_ion_hartree_source, HARTREE_DATASET
+	# ``kin_ion_hartree_source`` / ``HARTREE_DATASET`` came in with the
+	# kin_ion read above, which is the same lazy import for the same
+	# reason.
 	_src = kin_ion_hartree_source(kin_ion_path)
 	vh_exact = None
 	if _src == "stored":
-		with h5py.File(kin_ion_path, "r") as kf:
-			vh_full = np.asarray(kf[HARTREE_DATASET])
+		vh_full = read_full_bz_dataset(kin_ion_path, HARTREE_DATASET)
 		if vh_full.shape[1] < band_stop:
 			raise ValueError(
 				f"{HARTREE_DATASET} covers {vh_full.shape[1]} bands but the "
