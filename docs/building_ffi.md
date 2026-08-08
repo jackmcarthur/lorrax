@@ -41,11 +41,14 @@ only fed the comparison, never the link. The result requested SOVERSION 310
 beside a device library requesting 200, which resolves to `not found` and takes
 the entire library down at load.
 
-And twice in two days, **96a6399** and the kchunk branch, an FFI handler
-signature changed. A library built before the change and Python from after it
-link, load, register every target and pass every probe — then fail at the first
-call that crosses the changed signature with `INVALID_ARGUMENT: Wrong number of
-arguments: expected 3 but got 4`, which names no library, no version and no fix.
+And twice in two days — **96a6399**, then the kchunk conversion merged as
+**a16a241c** — an FFI handler signature changed. A library built before the
+change and Python from after it link, load, register every target and pass every
+probe, then fail at the first call that crosses the changed signature with
+`INVALID_ARGUMENT: Wrong number of arguments: expected 3 but got 4`, which names
+no library, no version and no fix. In between, the pairing was carried by a
+hand-maintained table in a notes file whose own warning was the problem: a
+mispaired run stays green until something calls `read_slabs`.
 
 The common shape: **a build that quietly delivers less than you asked for, and
 a check that cannot fail.** Everything below is the structural answer.
@@ -78,7 +81,7 @@ way for the suite and the build to disagree about what a good library is.
 scripts/verify_ffi_build.sh --leg host build_host/liblorrax_ffi_host.so
 ```
 
-The nine gates, and the property each one guards:
+The ten gates, and the property each one guards:
 
 | gate | property |
 |---|---|
@@ -130,7 +133,7 @@ LORRAX_SLATE_HOST_INSTALL_DIR=$WORK/slate_builds/cpu/install \
   config/frontera/build_ffi_host.sh --fresh
 ```
 
-Same nine gates, different vendors: MKL supplies ScaLAPACK, CBLAS and DFTI;
+Same ten gates, different vendors: MKL supplies ScaLAPACK, CBLAS and DFTI;
 `libmkl_blacs_intelmpi_lp64` must match the MPI, because the wrong BLACS links
 perfectly and only fails inside the first `blacs_gridinit`. Without
 `LORRAX_SLATE_HOST_INSTALL_DIR` this recipe builds the phdf5-only library, and

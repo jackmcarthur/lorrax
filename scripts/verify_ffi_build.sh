@@ -695,7 +695,13 @@ fi
 # value here is that it fires at BUILD time, in the build's own output, rather
 # than at the first read_slabs of a run that has already queued, allocated and
 # started.  See src/ffi/cpp/common/lorrax_ffi_abi.h for the rule and for the
-# two bumps in two days that motivated it.
+# three bumps in two days that motivated it.
+#
+# READ FROM THE STAMP STRING, not by calling the symbol: this tier is
+# artifact-level and never dlopens anything (the loaders do the calling half,
+# at dlopen, where a wrong answer can still be acted on).  Both come out of the
+# same translation unit, so a disagreement between them is itself a defect and
+# is reported as one rather than folded into a mismatch.
 # ===========================================================================
 say "--- GATE 9 (handler-signature ABI) ---"
 _abi_sym="lorrax_ffi_${LEG}_abi_version"
@@ -717,6 +723,13 @@ if ! printf '%s\n' "$DEFINED" | grep -qx "$_abi_sym"; then
       pass and not a defect.  The loaders announce the same fact at dlopen;
       LORRAX_FFI_ABI_STRICT=1 there and LORRAX_FFI_VERIFY_STRICT=1 here both
       turn it into a refusal.  Rebuild from this tree to make it checkable."
+elif [[ -z "$_stamp_abi" ]]; then
+    fail 9c "$SO exports $_abi_sym but carries no readable 'abi=<N>' in its
+      build stamp.  Those two come out of the same translation unit
+      (common/build_config.cc), so they cannot disagree in a library this
+      build system produced.  Something has edited the artifact, or the stamp
+      string has been split across the binary — either way the version cannot
+      be trusted at the artifact level.  Rebuild with --fresh."
 elif [[ -z "$EXPECT_ABI" ]]; then
     notrun 9 "the artifact exports $_abi_sym (stamp says abi=${_stamp_abi:-?})
       but no expected version is available: this tree has no

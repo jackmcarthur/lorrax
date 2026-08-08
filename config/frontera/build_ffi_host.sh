@@ -298,7 +298,7 @@ fi
 # that used to exist only in config/perlmutter/build_ffi_host.sh.  Frontera had
 # NONE of them: no one-MPI check, no one-BLAS-flavour check, no fftw-in-
 # DT_NEEDED check, no HDF5 pairing check, no ABI stamp.  It had the CUDA-free
-# check and the exported-handler list above, and those are two of nine.
+# check and the exported-handler list above, and those are two of ten.
 #
 # THE HANDLER LIST ABOVE IS NOW REDUNDANT and is left in place only because
 # this branch could not run a Frontera build to prove its replacement green

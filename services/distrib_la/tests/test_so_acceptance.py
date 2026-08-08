@@ -310,13 +310,13 @@ def test_check_5_the_two_libraries_still_share_their_slate_soname():
 # ---------------------------------------------------------------------------
 # THE FULL GATE SET, as one cell — scripts/verify_ffi_build.sh
 # ---------------------------------------------------------------------------
-# The four checks above are four of nine.  The other five (one MPI runtime,
+# The four checks above are four of ten.  The other six (one MPI runtime,
 # one BLAS threading flavour, OpenMP-is-OpenMP, HDF5 pairing, handler ABI)
 # lived only in config/perlmutter/build_ffi_host.sh, which means they ran
 # exactly once, at build time, on one machine, and never again — not on the
 # artifact somebody pinned three days later, and not at all on the device leg
 # or on Frontera.  scripts/verify_ffi_build.sh is the machine-agnostic form of
-# all nine, and this cell is how a user VALIDATES A BUILD BY RUNNING PYTEST.
+# all ten, and this cell is how a user VALIDATES A BUILD BY RUNNING PYTEST.
 #
 # It is the same file the build scripts call, so there is no possibility of the
 # suite certifying something the build would have rejected, or the reverse.
