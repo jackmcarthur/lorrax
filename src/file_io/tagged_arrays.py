@@ -643,9 +643,12 @@ def _refuse_a_q_wedge(f, filename):
         f"  Re-run the GW leg with restart_q_storage=full (the DEFAULT; the "
         f"wedge is opt-in per deck), or read this file through the serial "
         f"h5py path in bse_io, which unfolds.\n"
-        f"  Teaching the restart readers to gather-then-unfold is registered "
-        f"design work; until it lands, a wedge restart file is for runs that "
-        f"discard the artifact, not for runs that read it back here.")
+        f"  This refusal is TRANSITIONAL scaffolding (owner ruling "
+        f"2026-08-08): restart_q_storage is scheduled for retirement, after "
+        f"which storage follows the WFN's own symmetry and both readers "
+        f"always unfold, so there will be no wedge file to refuse.  Until "
+        f"then, a wedge restart file is for runs that discard the artifact, "
+        f"not for runs that read it back here.")
 
 
 def read_restart_state_from_h5(filename, mesh_xy):
