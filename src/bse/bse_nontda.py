@@ -78,7 +78,21 @@ def _full_matvec_and_args(data, mesh_xy, sh, *, include_W):
     if include_W:
         W_ifft = make_sharded_ifftn_3d(
             mesh_xy, sh.W.spec, sh.W.spec, axes=(2, 3, 4), norm="ortho")
-        W_R = W_ifft(data["W_q"])
+        # W_q is DONATED and the caller-side reference dropped, copied from
+        # ``bse_lanczos``'s W_R build.  Same shape in and out at a real
+        # top-level boundary, so XLA grants the alias and W_R becomes W_q's
+        # buffer instead of a second live tile for the whole non-TDA solve
+        # (56.25 MiB/rank on the Si 4x4x4 deck; 404 MB/rank at mu=10015 /
+        # P=64).  In-jit peak is unchanged — the win is entirely caller-side
+        # (FFT_DONATION_AUDIT.md 2.3).  Value-identical.
+        #
+        # NOTE FOR CALLERS: this CONSUMES ``data["W_q"]``.  That is safe for
+        # every caller today — ``_full_matvec_and_args`` is called exactly
+        # once per solve, and ``bse_lanczos``'s non-TDA dispatch returns
+        # immediately afterwards — but a caller that wants W_q back must pass
+        # its own copy.
+        W_R = jax.jit(W_ifft, donate_argnums=(0,))(data["W_q"])
+        data["W_q"] = None      # release the caller-side reference
     else:
         W_R = data["W_q"]
     args = (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],

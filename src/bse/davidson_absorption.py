@@ -116,7 +116,21 @@ def main(argv=None):
     matvec_simple = build_bse_simple_matvec(mesh_xy, nkx, nky, nkz, include_W=True)
     _W_ifftn = make_sharded_ifftn_3d(
         mesh_xy, sh.W.spec, sh.W.spec, axes=(2, 3, 4), norm="ortho")
-    W_R = jax.jit(_W_ifftn, in_shardings=sh.W, out_shardings=sh.W)(data["W_q"])
+    # W_q is DONATED, and the caller-side reference dropped — copied verbatim
+    # from ``bse_lanczos``'s W_R build, which is the same transform at the same
+    # kind of top-level boundary.  Same shape in and out, so XLA grants the
+    # alias and W_R simply *becomes* W_q's buffer; without it both tiles stay
+    # resident for the whole absorption run.  In-jit peak is identical either
+    # way (measured, FFT_DONATION_AUDIT.md 2.3: 112.50 MiB/rank donated and
+    # not) — the whole win is caller-side, one W tile instead of two:
+    # 56.25 MiB/rank on the Si 4x4x4 deck, 404 MB/rank at mu=10015 / P=64,
+    # 4.1 GB/rank at mu=32k.  Value-identical: same helper, same axes, same
+    # norm, same operand.  Dropping the reference is REQUIRED — donation alone
+    # leaves a deleted-buffer array in the dict, which is a worse failure than
+    # the leak.
+    W_R = jax.jit(_W_ifftn, in_shardings=sh.W, out_shardings=sh.W,
+                  donate_argnums=(0,))(data["W_q"])
+    data["W_q"] = None          # release the caller-side reference
     jax.block_until_ready(W_R)
 
     psi_c_X, psi_c_Y = data["psi_c_X"], data["psi_c_Y"]

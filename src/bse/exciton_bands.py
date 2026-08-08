@@ -968,14 +968,29 @@ def main(argv=None):
     sh = make_bse_shardings(mesh_xy)
     _ifftn = make_sharded_ifftn_3d(mesh_xy, sh.W.spec, sh.W.spec,
                                    axes=(2, 3, 4), norm="ortho")
+    # W_q is DONATED on the two SAME-SHAPE paths, and the caller-side
+    # reference dropped, copied from ``bse_lanczos``'s W_R build.  XLA grants
+    # the alias only when the output shape matches the input, so W_R becomes
+    # W_q's buffer rather than a second live tile for the whole band scan:
+    # 56.25 MiB/rank on the Si 4x4x4 deck, 404 MB/rank at mu=10015 / P=64,
+    # 4.1 GB/rank at mu=32k.  In-jit peak is unchanged; the win is entirely
+    # caller-side (FFT_DONATION_AUDIT.md 2.3).  Value-identical.
+    # The ``--w-coarse-grid`` path below is DELIBERATELY not donated: it
+    # sub-samples W_q to a coarse sub-grid first, so the densifier's operand
+    # is a different array of a different shape and donation is declined
+    # anyway.  It also still needs ``data["W_q"]`` to build that sub-grid,
+    # which is why the reference is dropped per-branch and not once up here.
+    _ifftn_donated = jax.jit(_ifftn, donate_argnums=(0,))
     if args.w_coarse_grid is None:
-        W_R = _ifftn(data["W_q"])                 # fast path: native fine W (byte-identical)
+        W_R = _ifftn_donated(data["W_q"])         # fast path: native fine W (byte-identical)
+        data["W_q"] = None                        # release the caller-side reference
     else:
         cg = tuple(int(s) for s in args.w_coarse_grid.split(","))
         if len(cg) != 3:
             raise ValueError("--w-coarse-grid expects NX,NY,NZ")
         if cg == (nkx, nky, nkz):
-            W_R = _ifftn(data["W_q"])             # equal grids → no-op, byte-identical
+            W_R = _ifftn_donated(data["W_q"])     # equal grids → no-op, byte-identical
+            data["W_q"] = None                    # release the caller-side reference
         else:
             # Coarse-W → fine direct term.  Sub-sample the fine W_q onto the
             # coarse BZ sub-grid (same ISDF μ-basis; q=0 head-tile preserved),
