@@ -149,89 +149,20 @@ PROFILE = machine_profile()
 _EXTRA_ALLOWED = _allowed_for(PROFILE)
 
 # ---------------------------------------------------------------------------
-# THE SINGLE-SLOT GATE, and why this file does not just call arm_skip_honesty
+# ONE GATE PER SERVICE, armed under THIS directory
 # ---------------------------------------------------------------------------
-# ``lxkit.testing`` keeps ONE module-level ``_ARMED`` dict and ONE
-# ``pytest_sessionfinish`` that reads it.  ``services/distrib_la/tests/
-# conftest.py`` already arms it, and in a full-suite run BOTH conftests load —
-# so an unconditional ``arm_skip_honesty`` here would OVERWRITE distrib_la's
-# scope and allowlist and silently disarm a gate that is currently doing its
-# job.  (That is not a hypothesis: it is what the C1 stub of this file
-# predicted, in writing, as the reason it left the gate unarmed.)
-#
-# Fixing it properly means making ``_ARMED`` a LIST, which is an edit to
-# lxkit — READ-ONLY on this branch.  So the gate is built here instead, on
-# top of the PURE half of lxkit's harness:
-#
-#   * nothing else armed  -> arm through ``arm_skip_honesty`` verbatim and
-#     let lxkit's own ``pytest_sessionfinish`` run it.  This is the
-#     standalone ``pytest services/zeta_loader/tests`` leg, which is also
-#     the leg where the L-b tier actually runs.
-#   * something already armed -> DO NOT TOUCH ``_ARMED``.  Run the SAME
-#     ``assert_skips_match_profile`` over THIS directory's skips from a
-#     local ``pytest_sessionfinish``, so neither gate disarms the other.
-#
-# Both branches call one function with one profile and one allowlist, so
-# there is no second policy — only a second place the same policy is invoked
-# from.  ``test_zeta_loader_skip_honesty.py`` asserts the no-clobber property
-# directly, and REGISTERED as a consolidation wish: lxkit should hold a list
-# of armed scopes so services stop having to know about each other.
-_PREARMED_SCOPE = str(_lxt._ARMED.get("scope") or "")
-_WE_ARMED_IT = _lxt._ARMED.get("profile") is None
+# This used to be a careful dance around a single-slot ``lxkit.testing._ARMED``:
+# arm it only when free, and otherwise re-implement lxkit's
+# ``pytest_sessionfinish`` locally so that neither service disarmed the other.
+# The registered consolidation wish ("``_ARMED`` should be a LIST of armed
+# scopes") landed, so the dance is gone: ``arm_skip_honesty`` registers a row
+# under THIS directory and cannot touch anyone else's.
+# ``test_zeta_loader_skip_honesty`` asserts that property directly.
+from lxkit.testing import (                                    # noqa: E402,F401
+    pytest_configure, pytest_runtest_logreport, pytest_sessionfinish,
+)
 
-if _WE_ARMED_IT:
-    # lxkit's recording hooks + its sessionfinish, imported into THIS
-    # conftest's namespace so pytest registers them.  Only in this branch:
-    # when distrib_la's conftest is also loaded it has already registered
-    # the very same function objects, and re-exporting them here would
-    # record every skip in the session TWICE.
-    from lxkit.testing import (                                # noqa: E402,F401
-        pytest_configure, pytest_runtest_logreport, pytest_sessionfinish,
-    )
-    arm_skip_honesty(PROFILE, scope=_TESTS, extra_allowed=_EXTRA_ALLOWED)
-else:
-    def pytest_sessionfinish(session, exitstatus):
-        """This service's half of the gate, when lxkit's slot is taken.
-
-        A transcription of ``lxkit.testing.pytest_sessionfinish``'s scoping
-        with the profile and allowlist bound to THIS suite.  The two
-        branches it keeps are the ones that were measured into the
-        original: the pytest-xdist CONTROLLER has an EMPTY ``session.items``
-        (the workers collected), so an items-only scope makes the gate
-        silently inert under ``-n 4`` — which is how ``lx test`` runs every
-        suite on Perlmutter; and a session that DELIBERATELY deselected this
-        suite (``--no-services``, ``-m`` something else, ``-k``) collected
-        other things and must not trip the minimum-collected floor.
-        """
-        root = os.path.realpath(_TESTS) + os.sep
-        total = int(getattr(session, "testscollected", 0) or 0)
-        items = getattr(session, "items", None) or []
-        if items:
-            mine = {str(getattr(it, "nodeid", "")) for it in items
-                    if os.path.realpath(
-                        str(getattr(it, "path", None)
-                            or getattr(it, "fspath", ""))).startswith(root)}
-            skips = [s for s in observed_skips() if s.nodeid in mine]
-            in_scope = len(mine)
-        else:
-            skips = [s for s in observed_skips() if s.path.startswith(root)]
-            in_scope = len(skips)
-        if in_scope == 0 and total > 0:
-            return
-        try:
-            assert_skips_match_profile(skips, PROFILE, collected=in_scope,
-                                       extra_allowed=_EXTRA_ALLOWED)
-        except AssertionError as exc:                          # noqa: BLE001
-            try:
-                tw = session.config.get_terminal_writer()
-                tw.line("")
-                tw.line("SKIP-HONESTY GATE FAILED (zeta_loader)",
-                        red=True, bold=True)
-                for line in str(exc).splitlines():
-                    tw.line(line, red=True)
-            except Exception:                                  # noqa: BLE001
-                print(f"SKIP-HONESTY GATE FAILED (zeta_loader)\n{exc}")
-            session.exitstatus = 1
+arm_skip_honesty(PROFILE, scope=_TESTS, extra_allowed=_EXTRA_ALLOWED)
 
 
 def pytest_collection_modifyitems(config, items):

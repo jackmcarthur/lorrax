@@ -383,3 +383,60 @@ def si_fast_session(tmp_path_factory):
     return _run_session_case(
         tmp_path_factory, "si_cohsex_debug", "cohsex_si_fast.in",
         "eqp_si_fast.dat")
+
+
+# ---------------------------------------------------------------------------
+# hBN 3×3×2 — the NON-CUBIC COHSEX fixture.  TWO fresh runs, not one.
+#
+# ``hbn_session`` is the frozen-reference run.  ``hbn_mcavg_false_session`` is
+# the NEGATIVE CONTROL: the same deck with the single key
+# ``mc_average_vcoul_body`` flipped to false, which must move Σ.
+#
+# THE SECOND RUN CANNOT BE A RESTART VARIANT, and that is the whole reason it
+# costs a second fresh run instead of riding the Tier-2 pattern.  Every Tier-2
+# invariance variant re-runs with ``restart = true`` from a copy of the session
+# state — which reloads the ALREADY-BUILT V_q, the exact tensor the knob acts
+# on.  A from-restart arm would therefore compare the head table against
+# itself and measure 0.000 meV: a control that cannot fail, which is the one
+# kind of test this tree deletes on sight (charter, falsification doctrine).
+#
+# Cost: ~33 s each on one A100, measured at the freeze.  That is the price of
+# the fixture having a live control at all, and it is the same order as the Si
+# production deck's 34.6 s.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def hbn_session(tmp_path_factory):
+    """Fresh run of the hBN deck — the frozen-reference run."""
+    return _run_session_case(
+        tmp_path_factory, "hbn_cohsex_debug", "cohsex_hbn_test.in",
+        "eqp_hbn_test.dat")
+
+
+@pytest.fixture(scope="session")
+def hbn_mcavg_false_session(tmp_path_factory):
+    """The hBN deck with ``mc_average_vcoul_body = false`` — the control arm.
+
+    Fresh (``restart = false``, as the deck already is), so the mini-BZ head
+    average is genuinely rebuilt under the flipped convention.
+    """
+    import pytest as _pytest
+    harness.skip_unless_gpu(_pytest)
+    run_dir = harness.copy_fixture(
+        harness.REG / "hbn_cohsex_debug",
+        tmp_path_factory.mktemp("hbn_mcavg_false") / "hbn_cohsex_debug")
+    # ``mutate_input`` asserts the old string is present, so a deck edit that
+    # renamed or dropped this key fails here loudly instead of silently
+    # producing a second copy of the reference run.
+    harness.mutate_input(run_dir / "cohsex_hbn_test.in", {
+        "mc_average_vcoul_body = true": "mc_average_vcoul_body = false",
+    })
+    res = harness.run_gw_jax(run_dir, "cohsex_hbn_test.in")
+    if res.returncode != 0:
+        pytest.fail(
+            f"hBN mc_average_vcoul_body=false arm failed.\n"
+            f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+    out = run_dir / "eqp_hbn_test.dat"
+    assert out.exists(), f"control arm wrote no {out}"
+    return _NS(run_dir=run_dir, input_name="cohsex_hbn_test.in",
+               output_name="eqp_hbn_test.dat", stdout=res.stdout)

@@ -202,6 +202,49 @@ def _locate_so(platform: str) -> Path:
         "Paths searched:\n  " + hints)
 
 
+# ---------------------------------------------------------------------------
+# THE C ABI IS PER-LIBRARY; THE PYTHON NAME IS NOT.
+# ---------------------------------------------------------------------------
+# ``cpp/slate/context.cc`` is pure MPI and compiles into BOTH platform
+# libraries, so until 2026-08-08 both .so files defined these four
+# ``extern "C"`` names (and five more from ``cpp/phdf5/api.cc``, which this
+# package does not call).  Both are dlopened RTLD_GLOBAL, one name with two
+# definitions behind it -- the C half of the cross-.so ODR violation
+# lorrax's tests/KNOWN_FAILURES.md registered as L1.  ``cpp/common/c_abi.h``
+# appends ``_host`` on the host leg; binding it under the plain name here
+# keeps every call site below leg-agnostic.  Mirrors
+# ``ffi.common.ffi_loader._bind_c_abi`` -- the two loaders open the SAME
+# FILES, so both have to know the same naming rule.
+_SLATE_C_ENTRY_POINTS = (
+    "lrx_slate_context_create",
+    "lrx_slate_subrow_context_create",
+    "lrx_slate_context_destroy",
+    "lrx_slate_init_mpi",
+)
+
+#: platform -> the suffix ``LRX_C_ENTRY`` appends on that leg.
+_C_ABI_SUFFIX = {"CUDA": "", "cpu": "_host"}
+
+
+def _bind_c_abi(lib: ctypes.CDLL, platform: str) -> None:
+    """Bind this leg's suffixed C entry points under their plain names.
+
+    A no-op on a pre-2026-08-08 library, on purpose: the unsuffixed symbol
+    is still there and ``ctypes.CDLL.__getattr__`` still finds it.  The
+    ratchet is on the artifact, in ``tests/test_so_acceptance.py``'s
+    check 6, not here -- see ``ffi_loader._bind_c_abi`` for the argument.
+    """
+    suffix = _C_ABI_SUFFIX.get(platform, "")
+    if not suffix:
+        return
+    for base in _SLATE_C_ENTRY_POINTS:
+        try:
+            fn = getattr(lib, base + suffix)
+        except AttributeError:
+            continue
+        setattr(lib, base, fn)
+
+
 def _declare_cusolvermp(lib: ctypes.CDLL) -> None:
     """NCCL + cuSOLVERMp context lifecycle — ``liblorrax_ffi.so`` only.
 
@@ -365,30 +408,65 @@ def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
 # environment untouched, and is tried once.
 #
 # ---------------------------------------------------------------------------
-# INTERPOSITION -- THE LATENT DEFECT UNDERNEATH, registered not chased
+# INTERPOSITION -- THE DEFECT UNDERNEATH.  FIXED 2026-08-08; this block is
+# the record of what it was and of what the load-order rule above does NOT
+# cover.
 # ---------------------------------------------------------------------------
-# ``libslate``/``libblaspp`` are not the only SONAME-scale collision between
-# the two files.  MEASURED 2026-08-07, ``nm -D --defined-only`` on the two
-# pinned builds: SIXTEEN symbol names are DEFINED BY BOTH -- the nine
-# C-linkage ``lrx_phdf5_*`` / ``lrx_slate_*`` entry points and seven mangled
-# ``lorrax_ffi::phdf5::{open_ctx,close_ctx,ensure_dataset,ensure_read_buf,
-# ensure_pinned,ensure_mpi_initialized,open_dataset_ro}``.  Both files are
-# dlopened RTLD_GLOBAL, so once both are open the FIRST answers those names
-# for BOTH, including for the other library's own internal calls.
+# ``libslate``/``libblaspp`` were not the only collision between the two
+# files.  MEASURED 2026-08-07, ``nm -D --defined-only`` on the two pinned
+# builds (deployed device lib; build_host_h200, md5 4c4422b8...): 259 symbol
+# names DEFINED BY BOTH, **25 of them LORRAX's own** -- the nine C-linkage
+# ``lrx_phdf5_*`` / ``lrx_slate_*`` entry points and sixteen mangled
+# ``lorrax_ffi::phdf5::*`` (``open_ctx``, ``close_ctx``, ``ensure_dataset``,
+# ``open_dataset_ro``, ``ensure_pinned``, ``ensure_read_buf``,
+# ``ensure_mpi_initialized``, ``env_flag``, ``~PhdfCtx``, the ``dt::`` HDF5
+# type singletons and their guards).  Both are dlopened RTLD_GLOBAL, so once
+# both were open the FIRST one answered those names for BOTH -- including for
+# the other library's own internal calls.
 #
-# And they are not the same functions: lorrax's ``cpp/phdf5/ctx.h`` compiles
-# ``PhdfCtx`` with CUDA stream / event / pinned-buffer members under
-# ``#ifndef LORRAX_FFI_NO_CUDA`` and the host build defines that macro and
-# drops them.  One C++ type name, two struct layouts, both exporting
-# ``open_ctx(...) -> PhdfCtx*`` -- a cross-.so ODR violation, and reading one
-# build's ``PhdfCtx`` at the other's offsets is what the garbage
-# ``offset_base`` above looks like.
+# And they were not the same functions.  ``cpp/phdf5/ctx.h`` compiles
+# ``PhdfCtx`` with the CUDA stream / event / pinned-buffer members under
+# ``#ifndef LORRAX_FFI_NO_CUDA``; the host build defines that macro and drops
+# them.  One C++ type name, two struct layouts, both exporting
+# ``open_ctx(...) -> PhdfCtx*`` -- a cross-.so ODR violation.  A handler from
+# one build handed a ``PhdfCtx*`` minted by the other read its fields at the
+# wrong offsets, which is what the float64-as-int64 ``offset_base`` above and
+# the ``phdf5 read: ctx_handle is null`` in the xdist arm both are.
 #
-# NOT FIXED HERE and not chased: the fix is in C++ (distinct symbol
-# namespaces per build, or a hidden-visibility phdf5 core), it is not this
-# branch's regression, and the gate above keeps it latent by never putting a
-# host-only process into the mixed state.  Registered in
-# tests/KNOWN_FAILURES.md as L1.
+# FIXED, IN C++, THREE WAYS (branch fix/ffi-odr-2026-08-08):
+#   * ``src/ffi/cpp/exports_{cuda,host}.map`` -- linker version scripts that
+#     make every ``lorrax_ffi``-namespaced definition LOCAL to the library
+#     that compiled it.  Third-party vague-linkage symbols are deliberately
+#     left global; localising those was measured to segfault the SLATE host
+#     handlers, and the map carries that five-arm table.
+#   * ``cpp/common/c_abi.h`` -- the nine ``lrx_*`` entry points cannot be
+#     hidden (the loaders dlsym them), so the HOST leg's carry a ``_host``
+#     suffix.  ``_bind_c_abi`` above binds them under the plain Python name.
+#   * ``cpp/phdf5/ctx.h`` -- ``PhdfCtx``'s struct TAG is now per-leg
+#     (``PhdfCtxCudaV1`` / ``PhdfCtxHostV1``), so the cross-layout aliasing
+#     is unconstructible even without the version scripts.
+#
+# MEASURED AFTER, same two commands: 234 shared names, **0 of them LORRAX's
+# own and 0 with C linkage**.  And the mixed state is now survivable --
+# ``tests/test_file_io.py`` on a CPU-platform leg with the capability gate
+# below DISABLED (i.e. 32e61fe's unconditional pre-open, the configuration
+# that aborted):
+#
+#     pre-fix pair, gate off   Fatal Python error: Aborted, no junitxml
+#     rebuilt pair, gate off   46 passed / 1 skipped, 0 abort signatures
+#
+# ``services/distrib_la/tests/test_so_acceptance.py`` check 6 is the ratchet.
+#
+# THE GATE ABOVE STAYS ANYWAY, and this is why: it was written for the
+# ``libslate``/``libblaspp`` SONAME race, and that is a DIFFERENT defect --
+# about which BUILD of a third-party library answers, not about which of our
+# own definitions does.  ~234 third-party names are still shared (they have
+# to be: they are ODR-correct weak COMDAT copies the C++ ABI merges on
+# purpose), and there is still ONE ``libblaspp.so.2`` per process whose
+# ``blas::get_device_count()`` is a compiled-in 0 in the host build.  Nothing
+# in the ODR fix touches that.  Retiring the pre-open would re-open the eight
+# ``FAILED_PRECONDITION: slate.potrf: blas::get_device_count()=0`` cells.
+# ``test_so_acceptance.py``'s check 5 is what will say when it CAN go.
 _CUDA_FIRST_TRIED = False
 
 
@@ -520,6 +598,7 @@ def get_lib(platform: str) -> ctypes.CDLL:
             f"LD_LIBRARY_PATH and, in a container, that every RPATH "
             f"directory is actually bind-mounted "
             f"(ldd {path} | grep 'not found').") from exc
+    _bind_c_abi(lib, platform)
     _declare_cusolvermp(lib)
     _declare_slate(lib)
     _register_ffi_targets(lib, platform)

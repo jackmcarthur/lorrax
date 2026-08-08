@@ -20,6 +20,7 @@
 #include <mpi.h>
 
 #include "ctx.h"
+#include "../common/c_abi.h"
 #include "../common/mpi_thread_guard.h"
 
 namespace lorrax_ffi::slate {
@@ -80,7 +81,7 @@ extern "C" {
 // Create a SLATE context for the given (p, q) grid.  Returns an opaque
 // handle (pointer cast to int64_t).  All ranks must call this
 // collectively; the dup'd MPI comm participates.
-int64_t lrx_slate_context_create(
+int64_t LRX_C_ENTRY(lrx_slate_context_create)(
     int rank, int world_size, int p, int q,
     char* err_buf, int err_buf_len)
 {
@@ -150,7 +151,7 @@ int64_t lrx_slate_context_create(
 // X-row sub-comm of size Py.  Since the sub-grid is (1, Py), SLATE's
 // GridOrder::Col tile (0, j) → rank j already matches JAX's shard (0, j)
 // → rank j — no further remap needed.
-int64_t lrx_slate_subrow_context_create(
+int64_t LRX_C_ENTRY(lrx_slate_subrow_context_create)(
     int rank, int world_size, int Px, int Py,
     char* err_buf, int err_buf_len)
 {
@@ -196,7 +197,7 @@ int64_t lrx_slate_subrow_context_create(
     }
 }
 
-void lrx_slate_context_destroy(int64_t handle) {
+void LRX_C_ENTRY(lrx_slate_context_destroy)(int64_t handle) {
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(handle);
     if (ctx == nullptr) return;
     if (ctx->owns_comm && ctx->comm != MPI_COMM_NULL) {
@@ -211,7 +212,7 @@ void lrx_slate_context_destroy(int64_t handle) {
 
 // Early init hook — caller can invoke this before any jit/compile to hoist
 // the MPI_Init_thread cost out of the hot path.  Idempotent.
-void lrx_slate_init_mpi() {
+void LRX_C_ENTRY(lrx_slate_init_mpi)() {
     lorrax_ffi::slate::ensure_mpi_initialized();
 }
 

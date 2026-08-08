@@ -11,6 +11,149 @@ claim carries the arm in which it comes out FALSE.
 
 ---
 
+# AMENDMENT — MERGE CHECKPOINT, `integration/merge-checkpoint-2026-08-08` @ `6a4f73da` (2026-08-08)
+
+**This supersedes the hBN amendment below for the counts, and nothing else.**
+The checkpoint merges `feat/batched-canonical-2026-08-08`,
+`fix/ffi-odr-2026-08-08`, and `chore/post-wave-cleanup-2026-08-08` onto
+`main` @ `a16a241c`, with both `.so` legs rebuilt from the merged tree
+(the ODR fix changed symbol visibility and the phdf5 type tags while the
+kchunk conversion, already in `main`, changed the read-dispatch signatures —
+no pre-merge pair is valid for this head).
+
+| | |
+|---|---|
+| machine | Perlmutter, 4-node lx pool (JID 56485516), 4×A100 per node, Shifter, `lx test` |
+| module | `LX_BASE_MODULE=lorrax_J070`, jax 0.7.0 |
+| trees | `/pscratch/sd/j/jackm/merge_ckpt_2026-08-08/lorrax` (`047f2929`; the one-cell layering fix `6a4f73da` re-verified on its own file, 78/78) and `/pscratch/sd/j/jackm/wt_main_pristine` (`a16a241c`) |
+| `.so` pins | the MERGED pair, built from this tree: device md5 `c680c229…`, host md5 `91f330c3…` (`merge_ckpt_2026-08-08/build_{dev,host}/`); baseline leg ran the kchunk_conv pair `main` requires. Neither leg pinned `LORRAX_FFTW3_SO`, so the FFT-engine block is red on BOTH sides and invisible to the set-diff |
+| artifacts | `bwrun/suite_base.xml` — **1935 testcases**; `bwrun/suite_merged.xml` — **1966 testcases**; set-diff by `bwrun/setdiff_mc.py` |
+| runs | one `lx test` each: baseline 304 s, merged head 572 s |
+
+## The census at this head
+
+| leg | pass | fail | skip | error | total |
+|---|---|---|---|---|---|
+| `tests/` (lorrax monorepo) | 1178 | 36 | 61 | 0 | 1275 |
+| `services/distrib_la` | 136 | 1 | 32 | 0 | 169 |
+| `services/lxkit` | 120 | 0 | 0 | 0 | 120 |
+| `services/symmetry_maps` | 150 | 1 | 14 | 0 | 165 |
+| `services/vcoul` | 33 | 1 | 0 | 0 | 34 |
+| `services/wfn_loader` | 77 | 0 | 15 | 0 | 92 |
+| `services/zeta_loader` | 110 | 0 | 1 | 0 | 111 |
+| **ALL** | **1804** | **39** | **123** | **0** | **1966** |
+
+## SET-DIFF vs `main` @ `a16a241c`
+
+| direction | result |
+|---|---|
+| newly RED | **1 at `047f2929`, 0 at this tip** — `tests.test_layering::test_only_the_substrate_constructs_a_mesh` flagged the new GATE 10 file building its own cpu Mesh inside a CUDA process; sanctioned as a mesh owner at `6a4f73da` (the one construction `single_device_mesh`/`resolve_mesh` cannot express), file re-run green 78/78 |
+| newly GREEN | **9** — the `services.symmetry_maps` import-isolation cells, red at `a16a241c` in full-suite order only; the per-scope skip-honesty fix (`9455e1d8`, "services stop disarming each other") is the mechanism |
+| newly SKIPPED / no longer skipped | **0 / 0** |
+| collection delta | **+32 new cells, all green** (17 distrib_la batched-scan + shape-algebra, 3 so_acceptance ODR-surface, 2 wfn_loader per-scope skip-honesty, 3 compile-cache agreement, 2 env registry, 5 sigma_output columns); **1 renamed away** — `test_this_gate_did_not_disarm_distrib_las` (red at base) became the two per-scope cells |
+| carried red | **38**, identical by name on both sides |
+
+The mixed-process ODR proof was re-run at the merged head against the merged
+pair: gate-off arm B 46 P / 1 skip in 12 s; the deployed-pair falsification
+arm C died (hung to its 900 s timeout after the cells preceding the kchunk
+read path — the arity mismatch BUILD_NOTES predicts), and the kchunk probe
+passes on the merged pair while its deployed-pair twin fails.  GATE 10 ALL
+PASS; acceptance tier 12/12 (`merge_ckpt_2026-08-08/_reports/`).
+
+**A trap this census recorded on the way** (it cost one invalid leg): a
+census suite launched with a stale `LORRAX_CHECKOUT` ran an unrelated
+worktree and produced a plausible-looking false red on the BSE anchor —
+the eigenvalues matched that worktree's expanded band window exactly.  The
+`[lx] source tree:` line in the log names the tree that actually ran;
+READ IT before believing any leg.
+
+# AMENDMENT — hBN FIXTURE FREEZE, on `main` @ `6feaa713` (2026-08-07)
+
+**This supersedes the merged-head census below for the counts, and nothing
+else.**  The owner authorized freezing the hBN non-cubic COHSEX reference
+(2026-08-07); `tests/regression/hbn_cohsex_debug/eqp_hbn_ref.dat` is live and
+two new cells gate it.  Every other row of the census below is unchanged, and
+that is measured, not assumed — both sides were run in the same session, on
+the same node class, with the same pins.
+
+| | |
+|---|---|
+| machine | Perlmutter, 1 node, 4×A100-SXM4-40GB, Shifter, `lx test` |
+| module | `LX_BASE_MODULE=lorrax_J070`, python 3.12 |
+| trees | `/pscratch/sd/j/jackm/hbn_freeze/lorrax` (this head) and `.../main_lorrax` (`21d68e06`); source-tree line read on both legs |
+| `.so` pins | BUILD_NOTES 2026-08-07, unchanged |
+| artifacts | `_reports/hbn_head.xml` — 460979 B, **1935 testcases**; `_reports/main.xml` — 477280 B, **1931 testcases** (neither a 38-byte stub) |
+| runs | one `lx test` invocation each: this head 278 s, `main` 334 s |
+
+## The census at this head
+
+| leg | pass | fail | skip | error | total |
+|---|---|---|---|---|---|
+| `tests/` (lorrax monorepo) | 1202 | 2 | 61 | 0 | 1265 |
+| `services/distrib_la` | 127 | 0 | 22 | 0 | 149 |
+| `services/lxkit` | 120 | 0 | 0 | 0 | 120 |
+| `services/symmetry_maps` | 141 | 10 | 14 | 0 | 165 |
+| `services/vcoul` | 34 | 0 | 0 | 0 | 34 |
+| `services/wfn_loader` | 75 | 1 | 15 | 0 | 91 |
+| `services/zeta_loader` | 110 | 0 | 1 | 0 | 111 |
+| **ALL** | **1809** | **13** | **113** | **0** | **1935** |
+
+## SET-DIFF vs `main` @ `21d68e06`
+
+| direction | result |
+|---|---|
+| newly RED | **0** — none |
+| newly SKIPPED | **0** — none |
+| no longer skipped | **0** — none |
+| newly GREEN | **1** — `services.vcoul.tests.test_vcoul_import_isolation::test_vcoul_imports_and_computes_with_no_scipy` |
+| collection delta | **+4, named below**; nothing lost |
+
+The red set at this head is 13 ids, every one of them also red at `main`
+(14).  **Nothing went red.**  Nothing changed status from run to skip or
+skip to run, so the `skipif` the two new
+cells carry never fires — which is the point: the hBN fixture binaries are
+tracked, so the guard is a partial-checkout tripwire, not an optional gate.
+
+THE ONE RED THAT WENT GREEN is not a fix and must not be read as one:
+`services.vcoul.tests.test_vcoul_import_isolation::test_vcoul_imports_and_computes_with_no_scipy` is a **documented pre-existing flake** of the
+cross-service conftest-collision class already characterized below ("services'
+conftests fighting over process-global jax/test state"), A/B'd red at the
+vcoul branch tip `23f83780` where nothing of this branch exists.  This head
+touches no `services/` file at all.  The mechanism is visible in the numbers:
+adding 4 collected ids reshuffles the xdist worker assignment, and this cell's
+verdict depends on which sibling service's conftest ran first in its worker.
+Expect it to flip back.
+
+COLLECTION DELTA, all four PASS:
+
+| new id | why |
+|---|---|
+| `test_hbn_matches_frozen_reference` | authored — the freeze |
+| `test_hbn_mc_average_vcoul_body_moves_sigma` | authored — the liveness control |
+| `test_gvec_padded_layout::test_no_fixture_has_a_physical_G_on_the_sentinel_cell[hbn_cohsex_debug]` | **not authored.** `test_gvec_padded_layout` globs `tests/regression/*/WFN*.h5`, so a new fixture WFN enrols itself in the pad-sentinel gates. Free coverage: the hBN ψ table now carries the band-pad sentinel checks too |
+| `test_gvec_padded_layout::test_wfn_loader_pads_with_the_shared_sentinel[hbn_cohsex_debug]` | same |
+
+## The two new headline gates
+
+| gate | result | what it means |
+|---|---|---|
+| `test_hbn_matches_frozen_reference` | **PASS** | **NEWLY LIVE.**  The tree's only NON-CUBIC 3D e2e deck.  `atol = 1e-5 eV`; measured `max \|Δ\| = 0.000e+00` over all 8640 compared cells, 0.0% of budget.  THREE independent runs agree byte for byte on the data lines (2×2/4-process ×2 at generation, 1×1/1-process at the freeze — the mesh the pytest harness actually pins) |
+| `test_hbn_mc_average_vcoul_body_moves_sigma` | **PASS** | **NEWLY LIVE, and it is not a freeze.**  A LIVENESS control: flip `mc_average_vcoul_body` and Σ must MOVE.  Measured sigTOT MAE **13.995 meV** / max 49.732 against a floor of 5.0 and an MC seed width of 0.396 meV.  This is the cell that makes the fixture guard the mini-BZ transpose-bug class — Si FCC is structurally blind to it (`bvec.T = P·bvec`, z = 3.0 = noise; hBN z = 293.7) |
+
+RED TWIN, both directions constructed:
+
+* the freeze gate — the reference was perturbed by exactly `2e-5` eV (2× the
+  atol) on one `sigTOT` entry and the gate FAILED, reporting `max |Δ| =
+  2.000e-05 vs atol 1e-05 (200.0% of budget, 1 cells over, 1 of 8640 cells
+  differ at all)`; the reference was then restored from git and its md5
+  re-verified at `14035d12ca40a45e392b54528ee3c76c`.
+* the control gate — its predicate was run on the real artifacts both ways:
+  reference vs the `mc_average_vcoul_body=false` arm gives 13.9948 meV MAE
+  (PASS), reference vs itself — the dead-knob case the cell exists to catch —
+  gives 0.0000 (FAIL).  It is not a test that cannot fail.
+
+---
+
 # MERGED-HEAD CENSUS — `integration/2026-08-08-services` @ `029da82` (2026-08-07)
 
 **This is the authoritative census for the tree that lands on main.**  All
@@ -278,8 +421,10 @@ constructing every input of the capability gate.  The CPU-platform arm's
 red twin is the load-bearing one: without it that cell stays green on any
 machine with no CUDA library to find, which is every WSL leg.
 
-**The ABORT itself is a SECOND defect and it is registered, not fixed —
-see L1.**
+**The ABORT itself was a SECOND defect.  It is now FIXED — see L1, and
+note that the mixed state it feared is now survivable: the CPU-platform
+leg is green with this capability gate DISABLED, against an abort with
+the pre-fix `.so` pair.**
 
 ### **B2 — FIXED by `f7c1b17`: the xdist CONTROLLER narrowed the workers' preset**
 
@@ -439,46 +584,131 @@ crash was only ever produced multi-rank.  Guard 2d says so, and a contract
 cell pins it — this package refuses what someone has watched fail, not
 what seems likely.
 
-### **L1 — the two platform `.so`s cross-wire their phdf5 through RTLD_GLOBAL** (latent, registered by B1's fix)
+### **L1 — FIXED by `fix/ffi-odr-2026-08-08`: the two platform `.so`s cross-wired their phdf5 through RTLD_GLOBAL**
 
 | | |
 |---|---|
-| tests | none can reach it today; it is what B1's ABORT *was* |
+| tests | `services/distrib_la/tests/test_so_acceptance.py` check 6 + `test_each_library_exports_only_its_sanctioned_surface` + `test_the_shared_symbol_check_can_fail` (red twin), and `src/ffi/cpp/gate_one_odr.py` (GATE 10, a live CUDA process doing host phdf5 work) |
 | class | (b) pre-existing, structural — a cross-`.so` ODR violation in the C++ |
-| covering leg | none.  The B1 fix keeps it LATENT for host-only processes by never putting one into the mixed state; it is NOT latent for a CUDA-capable process that also does host phdf5 work |
+| covering leg | THREE, all on Perlmutter, artifacts under `/pscratch/sd/j/jackm/svc_ffi_odr/_reports/`: the acceptance tier (12/12), the four-arm `tests/test_file_io.py` mixed-process A/B, and GATE 10 |
 
-`liblorrax_ffi.so` and `liblorrax_ffi_host.so` collide on far more than
-`libslate`/`libblaspp`.  MEASURED 2026-08-07, `nm -D --defined-only` on the
-two BUILD_NOTES-pinned builds (deployed device lib; `build_host_h200`,
-md5 `4c4422b8…`): **sixteen symbol names are DEFINED BY BOTH** — the nine
-C-linkage `lrx_phdf5_*` / `lrx_slate_*` entry points and seven mangled
-`lorrax_ffi::phdf5::{open_ctx,close_ctx,ensure_dataset,ensure_read_buf,
-ensure_pinned,ensure_mpi_initialized,open_dataset_ro}`.  Both files are
-dlopened `RTLD_GLOBAL`, so once both are open the FIRST one answers those
-names for BOTH — including for the other library's own internal calls.
+**WHAT IT WAS.**  Both libraries are dlopened `RTLD_GLOBAL`, and ld.so
+answers a name from the FIRST object that defined it — for the whole
+process, INCLUDING for the second library's own internal calls.  MEASURED
+2026-08-07, `nm -D --defined-only` on the two BUILD_NOTES-pinned builds
+(deployed device lib; `build_host_h200`, md5 `4c4422b8…`): **259 names
+defined by both, 25 of them LORRAX's own** — the nine C-linkage
+`lrx_phdf5_*` / `lrx_slate_*` entry points and SIXTEEN mangled
+`lorrax_ffi::phdf5::*`.  The row as originally written said seven mangled;
+the measurement says sixteen — `open_ctx`, `close_ctx`, `ensure_dataset`,
+`open_dataset_ro`, `ensure_pinned`, `ensure_read_buf`,
+`ensure_mpi_initialized`, plus `env_flag`, **`~PhdfCtx` (D1 and D2)** and
+the `dt::` HDF5-type singletons with their guard variables.  The destructor
+being on that list is the worst of them: it is a `std::thread` join and a
+`std::mutex` destruction at whichever build's field offsets answered.
 
-And they are not the same functions.  `src/ffi/cpp/phdf5/ctx.h` compiles
-`PhdfCtx` with the CUDA stream / event / pinned-buffer members under
-`#ifndef LORRAX_FFI_NO_CUDA`; the host build defines that macro and drops
-them.  **One C++ type name, two struct layouts, both exporting
-`open_ctx(...) -> PhdfCtx*`.**  A handler from one build handed a
-`PhdfCtx*` minted by the other reads its fields at the wrong offsets, which
-is exactly what B1's
+`src/ffi/cpp/phdf5/ctx.h` compiles `PhdfCtx` with the CUDA stream / event /
+pinned-buffer members under `#ifndef LORRAX_FFI_NO_CUDA`.  One C++ type
+name, two struct layouts, both libraries exporting one
+`open_ctx(...) -> PhdfCtx*`.
 
-    offset_base=[0,0,0,4596944070643295330]
+**THE FIX — three mechanisms, because the defect had three vectors.**
 
-(a float64 read as int64) and the xdist arm's `phdf5 read: ctx_handle is
-null` look like.
+1. **Linker version scripts**, `src/ffi/cpp/exports_{cuda,host}.map`, wired
+   in `CMakeLists.txt` with `LINK_DEPENDS`: `local: *lorrax_ffi*` makes
+   every definition LORRAX compiled private to the library that compiled it,
+   so an intra-library call binds at static-link time and can neither
+   interpose nor be interposed.
+2. **A per-leg C ABI**, `src/ffi/cpp/common/c_abi.h`.  The nine `lrx_*`
+   entry points cannot be hidden — Python `dlsym`s them — so the host leg's
+   carry a `_host` suffix, the same per-library renaming the `*HostFfi`
+   handlers already used.  `ffi_loader._bind_c_abi` (and distrib_la's) binds
+   the suffixed symbol under the plain Python name at load, so no call site
+   changed and a pre-fix `.so` still works.
+3. **Split type identity**: `PhdfCtx`'s struct TAG is now `PhdfCtxCudaV1` /
+   `PhdfCtxHostV1` with `using PhdfCtx = …` keeping every call site as
+   written, so `open_ctx` and friends mangle differently per leg and the
+   cross-layout aliasing is unconstructible even without (1).
 
-**NOT CHASED, deliberately.**  The fix is in C++ — distinct symbol
-namespaces per build, or a hidden-visibility phdf5 core, or `RTLD_LOCAL`
-with an explicit re-export set — and it is not this branch's regression:
-the two libraries have always shared these names.  What this branch changed
-was how many processes get put into the mixed state, and B1's fix takes
-CPU-platform processes back out of it.  `test_so_acceptance`'s check 5 is
-the ratchet on the premise for the SLATE half; there is no equivalent
-ratchet on the phdf5 half yet, and that is the first thing to add if
-anyone picks this up.
+**NOT `-fvisibility=hidden`, and NOT `local: *`.**  Both were tried.  Hidden
+visibility additionally makes gcc mark a type's typeinfo NAME private with a
+leading `*`, after which libstdc++ compares typeinfo by POINTER only —
+and libslate.so throws `slate::Exception` ACROSS the `.so` boundary into our
+handlers, where it matches today by strcmp on that name.  `local: *` was
+built and MEASURED: it gives a 26-symbol host table and a zero intersection,
+and it **segfaults five SLATE host cells**, because it also unmerges the weak
+COMDAT copies of SLATE's template code that the C++ ABI intends the dynamic
+linker to merge with libslate.so's.  Five arms, same tree, same command, only
+the version script moving (`-k "slate and cpu"`):
+
+| version script | slate host cells |
+|---|---|
+| none at all | 8 P / 2 skip |
+| `local: *lorrax_ffi*` (shipped) | 8 P / 2 skip |
+| `local: *`, typeinfo/vtables global | 3 P / **5 CRASH** |
+| `local: *`, slate/blas/std templates global | 8 P / 2 skip |
+| `local: *` | 3 P / **5 CRASH** |
+
+**EVIDENCE, before and after** (`nm -D --defined-only`, both pairs built
+against the HDF5-200 stage; `nm_evidence.log`):
+
+| | shared names | LORRAX's own | C-linkage |
+|---|---|---|---|
+| pre-fix pair (`96a6399`) | 259 | **25** | 9 |
+| rebuilt pair (`b61e028a`) | 234 | **0** | **0** |
+| rebuilt device + pre-fix host | 243 | 9 | 9 |
+| pre-fix device + rebuilt host | 234 | **0** | **0** |
+
+The third row is the one to read before pinning: a MIXED pin does not get
+the fix — an old host lib still exports the unsuffixed `lrx_*`.  The fourth
+says the host rebuild alone is sufficient, so the deployed device `.so` does
+not have to move.
+
+**THE MIXED-PROCESS PROOF.**  `tests/test_file_io.py`, CPU platform, four
+emulated devices, four arms, same tree, same launcher — the probe DISABLES
+B1's capability gate, i.e. restores `32e61fe`'s unconditional pre-open, so
+the process is put back INTO the mixed state on purpose:
+
+| arm | pins | gate | result |
+|---|---|---|---|
+| A | rebuilt | on | 46 passed / 1 skipped |
+| D | pre-fix | on | 46 passed / 1 skipped |
+| B | rebuilt | **off** | **46 passed / 1 skipped**, 0 abort signatures |
+| C | pre-fix | **off** | **`Fatal Python error: Aborted`**, srun exit 134, no junitxml |
+
+Arm C is what makes arm B evidence.  The gate edit was local, reverted with
+`git checkout`, and `git status --porcelain` printed empty afterwards.
+
+And GATE 10 (`src/ffi/cpp/gate_one_odr.py`), a real CUDA process
+(`jax.default_backend() == 'gpu'`, `loaded_platforms_in_order() ==
+['CUDA','cpu']`) doing a host phdf5 write + full read + offset-slab read on
+a CPU mesh: **every check PASS on the rebuilt pair**; on the deployed Aug-7
+pair the process dies at
+
+    [SlabIO.close] draining 1 pending writes for gate_one_odr.h5 …
+    Fatal glibc error: tpp.c:83 (__pthread_tpp_change_priority): assertion failed
+
+— `close_ctx` joining a thread and destroying a mutex at the other build's
+offsets.  Note that this is, line for line, the death **B2** recorded for
+the xdist arm; L1 was a mechanism behind that symptom too.
+
+**WHAT IS NOT FIXED, and where it lives.**  234 third-party vague-linkage
+names (`slate::`, `blas::`, `xla::ffi::`, libstdc++ internals) are still
+defined by both files and the first loaded still answers them for both.
+They are ODR-CORRECT duplicates — same headers, same source — and
+localising them is the measured crash above.  Their sharing is the SAME
+defect as `libslate.so.2` / `libblaspp.so.2` resolving out of two different
+builds under one SONAME.  **`_open_cuda_before_host` therefore STAYS** in
+both loaders: it was written for that race, the ODR fix does not touch it,
+and retiring it would re-open the eight `blas::get_device_count()=0` cells.
+`test_so_acceptance.py`'s check 5 remains the ratchet that will say when it
+can go; its docstring is rescoped to say it covers only that.
+
+**BUILD-TIME RATCHETS.**  `config/perlmutter/build_ffi_host.sh` GATE 9
+refuses a host `.so` that exports any `lorrax_ffi` internal or any
+unsuffixed `lrx_*`; `src/ffi/cpp/build.sh` GATE 9 is the device twin.  Both
+passed on the rebuilt pair; `config/frontera/build_ffi_host.sh`'s WANT list
+now names the suffixed symbols, so a pre-fix host library fails it by name.
 
 ### **P1 — three Tier-1 pins are Frontera-frozen and cannot be green on both machines**
 

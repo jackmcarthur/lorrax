@@ -253,7 +253,16 @@ if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
     # SLATE group.
     WANT="$WANT SlateEighHostFfi SlatePotrfHostFfi SlateTrsmHostFfi \
 SlateBatchedPotrfHostFfi SlateBatchedTrsmHostFfi \
-lrx_slate_init_mpi lrx_slate_context_create"
+lrx_slate_init_mpi_host lrx_slate_context_create_host"
+    # The ``_host`` suffix is not cosmetic and it is not optional.
+    # cpp/slate/context.cc is CUDA-free and compiles into BOTH platform
+    # libraries; until 2026-08-08 both exported these names unsuffixed, and
+    # since both are dlopened RTLD_GLOBAL the first one loaded answered them
+    # for the other library's internal calls too (lorrax
+    # tests/KNOWN_FAILURES.md, L1).  cpp/common/c_abi.h's LRX_C_ENTRY
+    # appends the leg; src/ffi/cpp/exports_host.map is what keeps everything
+    # else off the dynamic table.  A host .so that still exports
+    # ``lrx_slate_init_mpi`` predates the fix — this gate says so by name.
     # ScaLAPACK group (+ the handlers that share its link line).  Requested
     # here whenever this script was given an MKL root or an explicit link
     # line; the two are independent of the SLATE group in the CMakeLists,

@@ -1,0 +1,101 @@
+# =====================================================================
+# hbn_cohsex_3d — bulk hexagonal BN 3x3x2, sys_dim=3, COHSEX.
+# FROZEN 2026-08-07 (owner-authorized).  Reference: eqp_hbn_ref.dat.
+# Gates: test_hbn_matches_frozen_reference (the self-freeze) and
+#        test_hbn_mc_average_vcoul_body_moves_sigma (the negative
+#        control this fixture exists for).  See README.md.
+#
+# WHY THIS FIXTURE EXISTS.  Every 3D gate deck is Si FCC, whose bvec
+# satisfies bvec.T = P·bvec (P cyclic) — structurally BLIND to the
+# mini-BZ draw-convention bug class fixed in 358bb0b (a3ae01d9 rebased).
+# hBN's hexagonal bvec admits no such P, so on this cell the body-head
+# table is bias-SENSITIVE: the pre-fix draw would sit hundreds of
+# standard errors off (synthetic-cell measurement: ~6.5 % mean / 16 %
+# max of the head, z=376).  This deck turns the synthetic z-test guard
+# (tests/test_vcoul_minibz_head_draw.py) into end-to-end coverage.
+#
+# TWO DELIBERATE DIFFERENCES from cohsex_si_test.in:
+#   mc_average_vcoul_body = true   -- the whole point: the head table
+#       (vcoul.build_v_head_miniBZ_avg_3d) must be LIVE.  The Si deck
+#       pins false to match its BGW noavg anchor; here the fixture's
+#       subject IS the average.
+#   vhead / whead_0freq UNSET      -- no BGW head scalars exist for this
+#       system yet, so the native q->0 ladder (wcoul0_source s_tensor ->
+#       gw.vcoul.compute_q0_averages -> vcoul kernels) runs END TO END.
+#       No pinned deck in the tree reaches that path today (survey
+#       w1_vcoul.md §6.4.4); this deck closes that gap too.  When a BGW
+#       anchor phase happens, a vhead-pinned VARIANT deck can be added
+#       beside this one — do not convert this one.
+#
+# BAND COUNTS ARE SPINOR COUNTS (execution-worker edit, 2026-08-07).
+# The committed draft assumed a SCALAR mean field (nspinor=1: 16 valence
+# electrons -> 8 doubly-occupied bands, nband 40).  LORRAX cannot read an
+# nspinor=1 WFN.h5: WfnLoader._eager_build's full-BZ unfold path calls
+# symmetry_maps.unfold_psi, whose spinor rotation U_eff is ALWAYS 2x2,
+# so a (nb,1,ngk) block comes back (nb,2,ngk) and the write into the
+# (nb,1,ngkmax) slab raises
+#   ValueError: could not broadcast input array from shape (8,2,1457)
+#               into shape (8,1,1457)
+# Every fixture WFN in the tree (si_cohsex_debug, si_bse_debug,
+# gnppm_debug) is nspinor=2, produced by QE with
+# `noncolin=.true., lspinorb=.false., no_t_rev=.true.` — a 2-spinor
+# representation of a NON-relativistic calculation.  The hBN mean field
+# was regenerated the same way, so every band count here doubles:
+#   16 valence electrons -> 16 occupied SPINOR bands; 80 in the WFN.
+# The physics under test (hexagonal bvec, sys_dim=3, the live head
+# table, the unpinned q->0 ladder) is untouched by this.
+# =====================================================================
+[cohsex]
+
+restart = false
+# ORBIT-CLOSED SET, 330 NOT 320 (execution-worker edit, 2026-08-07).  The
+# plan asked for 320 centroids AND an orbit-closed set; those two cannot
+# both hold exactly.  centroid.kmeans_cli recovered a 12-op symmorphic
+# point group from the charge density (the WFN stores 1 op, nosym), and
+# pivoted Cholesky selects whole ORBITS: 28 orbits unfold to 330 closed
+# centroids, rank gate 28/28 PASS.  Forcing exactly 320 would require
+# --no-orbit, i.e. reproducing the Si-960 non-closure defect the plan
+# names as the thing not to replicate.  Closure wins; the filename
+# records the true count.
+centroids_file = centroids_frac_330.txt
+
+# 16 valence electrons -> 16 occupied spinor bands; 80 bands in the WFN.
+nval = 16
+ncond = 64
+nband = 80
+sys_dim = 3
+bare_coulomb_cutoff = 25.0
+
+do_screened = true
+bispinor = false
+qp_solver = one_shot_dft
+
+use_ppm_sigma = false
+screening_method = minimax
+
+memory_per_device_gb = 28
+
+sigma_freq_debug_output = true
+fermi_reference = midgap
+
+wfn_file = WFN.h5
+# NO `output_file` KEY.  It is retired: the deck AS RUN at generation
+# still carried it and every run printed
+#   read_lorrax_input: 1 retired deck key(s) ... output_file: IGNORED
+#   -- the LORRAX-native eqp0 filename is now 'sigma_diag_file'
+# so dropping it cannot move a digit of the frozen reference, and the
+# gate run of THIS file is the check that it did not.
+sigma_diag_file = eqp_hbn_test.dat
+sigma_omega_h5_file = sigma_mnk.h5
+
+# THE KNOB UNDER TEST — see the header.  The perturbation arm of the
+# reference-generation plan runs this deck twice (true/false) and the
+# two sigmas MUST differ well beyond run-to-run noise; on Si that
+# difference is the 141.65 meV MAE knob, and on this cell the average
+# itself is what the 358bb0b fix corrected.
+mc_average_vcoul_body = true
+
+# Pinned exactly as the Si fixture pins it (2026-08-06 ruling: fixtures
+# pin every drift-prone knob; the deck-level default question is the
+# owner's, not a fixture's).
+zeta_rcond = 1e-10

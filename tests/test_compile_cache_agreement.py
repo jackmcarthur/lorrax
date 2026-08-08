@@ -207,3 +207,100 @@ def test_bitmask_helpers_roundtrip():
     for i in (0, 7, 8, 18):
         jcc._set_bit(m, i)
     assert [i for i in range(19) if jcc._bit(m, i)] == [0, 7, 8, 18]
+
+
+# ---------------------------------------------------------------------------
+# THE CACHE OBJECT MUST FOLLOW THE DIRECTORY WE CHOOSE
+# ---------------------------------------------------------------------------
+# MEASURED, Perlmutter 2026-08-07, centroid deck at P=4: the run reported
+# `cache_probes=149 hits=0 vetoed=149 agreed=622/622` and never warmed up on
+# consecutive runs.  `jax._src.compilation_cache._cache` is bound ONCE, at the
+# first compile, from `jax_compilation_cache_dir` as it read then; the
+# `lorrax_J070` modulefile exports `JAX_COMPILATION_CACHE_DIR=$SCRATCH/
+# .jax_cache` into the container, and the mesh warm-up compiles before
+# `ensure_jax_compile_cache` runs.  A later `config.update` does NOT rebind it,
+# so the agreement listed one directory while JAX used another: every probe
+# vetoed, every write a no-op on an already-present key, `enabled=True`.
+#
+# These two cells are the pair.  The first is the property; the second is the
+# case where it comes out FALSE — without the rebind the cache object keeps the
+# directory it was bound to, which is the defect verbatim.
+
+class _FakeCache:
+    """Stands in for jax's LRUCache: all `bound_cache_dir` reads is `.path`."""
+
+    def __init__(self, path):
+        self.path = path
+        self._path = path
+
+
+def _fake_cc(monkeypatch, bound_to):
+    """Bind jax's REAL compilation_cache module to ``bound_to``.
+
+    The real module, not a stand-in in ``sys.modules``: ``bound_cache_dir``
+    reaches it with ``from jax._src import compilation_cache``, which resolves
+    the ATTRIBUTE on the already-imported parent package, so a sys.modules
+    substitution would not be seen and the cell would test nothing.
+    """
+    cc = pytest.importorskip("jax._src.compilation_cache")
+    monkeypatch.setattr(
+        cc, "_cache", _FakeCache(bound_to) if bound_to is not None else None,
+        raising=False)
+    return cc
+
+
+def test_bound_cache_dir_reports_the_directory_jax_actually_uses(
+        monkeypatch, tmp_path):
+    """The reported binding is READ OFF the live cache object, not inferred.
+
+    `_STATE.dir` is what this module ASKED for.  They are different questions
+    and the whole defect lived in the gap between them.
+    """
+    _fake_cc(monkeypatch, str(tmp_path / "elsewhere"))
+    assert jcc.bound_cache_dir() == str(tmp_path / "elsewhere")
+
+    # ...and an unbound cache reports "" rather than guessing.
+    _fake_cc(monkeypatch, None)
+    assert jcc.bound_cache_dir() == ""
+
+
+def test_an_inherited_binding_is_dropped_so_the_next_compile_rebinds(
+        monkeypatch, tmp_path):
+    """THE FIX, and its RED TWIN in the same cell.
+
+    `reset_cache()` is the only thing that makes JAX rebuild its cache object
+    against the directory we chose.  The twin is the `reset_cache` that is
+    never called: the binding survives, which is exactly the measured defect.
+    """
+    inherited = str(tmp_path / ".jax_cache")
+    ours = str(tmp_path / "lorrax_jax_cache" / "np4")
+
+    # RED TWIN FIRST: no rebind -> the stale binding survives, and it does NOT
+    # agree with the directory the agreement is about.  If this assertion ever
+    # fails, the cell below has stopped proving anything.
+    cc = _fake_cc(monkeypatch, inherited)
+    assert jcc.bound_cache_dir() == inherited != ours
+
+    # THE FIX: reset, and the binding is gone so the next `_get_cache` rebuilds
+    # it from `jax_compilation_cache_dir` (which ensure_jax_compile_cache has
+    # already pointed at `ours`).  `reset_cache` is jax's own API and is what
+    # ensure_jax_compile_cache calls; a jax without it is a refusal, not a
+    # silent no-op, which is why this cell names it directly.
+    cc.reset_cache()
+    assert jcc.bound_cache_dir() == ""
+
+
+def test_the_summary_line_names_a_disagreeing_binding(monkeypatch, tmp_path,
+                                                      capsys):
+    """A silent disagreement is the failure mode; the report must say it."""
+    monkeypatch.setattr(jcc._STATE, "dir", str(tmp_path / "ours"),
+                        raising=False)
+    _fake_cc(monkeypatch, str(tmp_path / "elsewhere"))
+    jcc._report_impl()
+    assert "BOUND-ELSEWHERE" in capsys.readouterr().out
+
+    # RED TWIN: when they AGREE the line must stay quiet, or the marker is
+    # noise and stops meaning anything.
+    _fake_cc(monkeypatch, str(tmp_path / "ours"))
+    jcc._report_impl()
+    assert "BOUND-ELSEWHERE" not in capsys.readouterr().out

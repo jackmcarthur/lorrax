@@ -1,11 +1,19 @@
-"""The C++ tier, v1: the four build acceptance checks, as pytest cells.
+"""The C++ tier: the build acceptance checks, as pytest cells.
+
+Checks 1-4 are BUILD_NOTES.md's four post-build commands.  Check 5 ratchets
+the ``libslate``/``libblaspp`` SONAME collision the dlopen-order rule was
+written for.  Check 6 and its two companions (2026-08-08) are the
+artifact-level ratchet on KNOWN_FAILURES **L1**: the two platform libraries
+are dlopened RTLD_GLOBAL into one process, so no name LORRAX'S OWN SOURCE
+defines may be defined by both.  Twenty-five were, before the fix.
+
 
 There are NO C++-level tests anywhere in LORRAX (survey 1, S8: ``find
 src/ffi/cpp -iname '*test*'`` is empty).  The nearest thing is a block of
 shell in ``config/perlmutter/build_ffi_host.sh``'s seven gates plus the
 four post-build commands ``BUILD_NOTES.md`` writes out, which are run by
 hand after a rebuild and by nobody afterwards.  This file makes them a
-suite: same four assertions, against the .so a run is actually PINNED to,
+suite: the same assertions, against the .so a run is actually PINNED to,
 so a defective library is caught by the test suite rather than by
 nineteen contract cells failing in a way that needs a person to diagnose.
 
@@ -49,6 +57,71 @@ from distrib_la.loader import _HOST_TARGET_SYMBOLS, _PLATFORMS
 #: the count and fails here.
 _SCALAPACK_SYMBOLS = tuple(sorted(
     sym for sym in _HOST_TARGET_SYMBOLS.values() if "Scalapack" in sym))
+
+# ---------------------------------------------------------------------------
+# WHAT LORRAX ITSELF DEFINES — the set that must not be shared.
+# ---------------------------------------------------------------------------
+# ``src/ffi/cpp/exports_{cuda,host}.map`` localise everything LORRAX itself
+# compiles, and ``cpp/common/c_abi.h`` gives the host leg's ctypes entry
+# points a ``_host`` suffix, so the set below is what the two libraries are
+# allowed to still put in ``.dynsym`` — and by construction the two legs'
+# versions of it are DISJOINT.
+#
+# The third-party names both files also define (``slate::``, ``blas::``,
+# ``xla::ffi::``, libstdc++ internals — ~234 of them) are deliberately NOT
+# localised.  They are ODR-CORRECT duplicates: same headers, same source,
+# weak COMDAT copies the C++ ABI intends the dynamic linker to merge.
+# Localising them was measured, on 2026-08-08, to segfault five SLATE host
+# cells (exports_cuda.map carries the five-arm table).  Their sharing is the
+# SAME defect as ``libslate.so.2`` / ``libblaspp.so.2`` resolving out of two
+# different builds under one SONAME — check 5's territory, and what
+# ``_open_cuda_before_host`` exists for.  Not L1, and not claimed here.
+
+
+def _is_lorrax_owned(sym: str) -> bool:
+    """Did LORRAX's own source define this name?
+
+    Three families, and they are all of them:
+      * anything mentioning ``lorrax`` — the mangled ``namespace lorrax_ffi``
+        internals, ``std::`` templates instantiated on our types, our
+        function-local statics and their guard variables, the extern "C"
+        CUDA kernel launchers, and the host build-config stamp;
+      * the ``lrx_*`` ctypes lifecycle ABI;
+      * the ``*Ffi`` XLA handler registration symbols.
+    Everything else in either table came out of a third-party header.
+    """
+    return ("lorrax" in sym) or sym.startswith("lrx_") or sym.endswith("Ffi")
+
+
+def _sanctioned_cuda(sym: str) -> bool:
+    """liblorrax_ffi.so: bare ``*Ffi`` handlers, unsuffixed ``lrx_*``."""
+    if sym.endswith("Ffi"):
+        return not sym.endswith("HostFfi")
+    if sym.startswith("lrx_"):
+        return not sym.endswith("_host")
+    return False
+
+
+def _sanctioned_host(sym: str) -> bool:
+    """liblorrax_ffi_host.so: ``*HostFfi``, ``lrx_*_host``, the stamp."""
+    if sym.endswith("Ffi"):
+        return sym.endswith("HostFfi")
+    if sym.startswith("lrx_"):
+        return sym.endswith("_host")
+    return sym == "lorrax_ffi_host_build_config"
+
+
+_SANCTIONED_EXPORTS = {
+    "CUDA": (
+        _sanctioned_cuda,
+        "the *Ffi XLA handler registration symbols and the lrx_* ctypes ABI",
+    ),
+    "cpu": (
+        _sanctioned_host,
+        "the *HostFfi XLA handler registration symbols, the lrx_*_host "
+        "ctypes ABI, and the build-config stamp",
+    ),
+}
 
 
 def _pinned(platform: str) -> str:
@@ -274,8 +347,185 @@ def test_a_pin_that_does_not_exist_is_a_failure_not_a_skip(monkeypatch):
 # The SONAME collision, at the artifact level
 # ---------------------------------------------------------------------------
 
+def _shared_defined(so_a: str, so_b: str) -> list[str]:
+    """Defined symbol names exported by BOTH ELF files, sorted.
+
+    One function so check 6 and its red twin cannot use different readers —
+    the whole failure mode being guarded against here is a check that
+    reports "nothing shared" because the reader returned nothing.
+    """
+    return sorted(_defined_symbols(so_a) & _defined_symbols(so_b))
+
+
+def test_check_6_the_two_libraries_share_no_defined_symbol_of_ours():
+    """THE L1 RATCHET: nothing LORRAX defines is defined by both .so files.
+
+    ``ffi_loader`` and ``distrib_la.loader`` both dlopen their .so
+    ``RTLD_GLOBAL``, and a CUDA-capable process legitimately has BOTH open —
+    CUDA handlers on the device, host phdf5 reads on the CPU backend.  ld.so
+    answers a name from the FIRST object that defined it, for the whole
+    process, INCLUDING for the second library's own internal calls.  So any
+    name both files define is a name one library can be made to execute the
+    other's code for.
+
+    MEASURED on the pre-fix pair (deployed device .so + ``build_host_h200``,
+    both at ``96a6399``): 259 shared defined names, **25 of them LORRAX's
+    own** — the nine ``lrx_*`` entry points and sixteen mangled
+    ``lorrax_ffi::phdf5::*``, among them ``open_ctx``, ``close_ctx``,
+    ``ensure_dataset``, ``ensure_read_buf``, ``ensure_pinned`` and
+    ``~PhdfCtx``.  And they were not the same functions: ``PhdfCtx`` carries
+    the CUDA stream/event/pinned members under ``#ifndef
+    LORRAX_FFI_NO_CUDA``, so ONE type name had TWO layouts and both
+    libraries exported one ``open_ctx(...) -> PhdfCtx*``.  A handler handed
+    the other build's ctx read its fields at the wrong offsets, which is
+    what KNOWN_FAILURES B1's ``offset_base=[0,0,0,4596944070643295330]``
+    (a float64 decoded as an int64) and the xdist arm's ``phdf5 read:
+    ctx_handle is null`` both are.
+
+    ZERO, not "few".  The sanctioned surfaces are disjoint BY CONSTRUCTION
+    (``*Ffi`` vs ``*HostFfi``, ``lrx_*`` vs ``lrx_*_host``) and everything
+    else of ours is localised by ``exports_{cuda,host}.map``.  One shared
+    name means one of those two mechanisms stopped working.
+
+    SECOND ASSERTION, and it is the sharper one: no shared name may have C
+    LINKAGE.  A mangled name that both files define is a weak COMDAT copy of
+    somebody's inline or template — the C++ ABI merges those on purpose, and
+    that is what the ~234 remaining shared names are.  An UNMANGLED shared
+    name is one a human deliberately exported, and there is no legitimate
+    reason for two libraries in one process to both export one.
+
+    THIS CELL SUPERSEDES check 5 AS THE STATEMENT OF THE PROBLEM.  Check 5
+    ratchets the ``libslate``/``libblaspp`` SONAME collision, which is a
+    DIFFERENT and still-live defect about which BUILD of a third-party
+    library answers; this one is about which of OUR OWN definitions answers.
+    Fixing the second did not fix the first, and the load-order rule still
+    exists for the first.
+    """
+    shared = _shared_defined(_pinned("cpu"), _pinned("CUDA"))
+
+    ours = [s for s in shared if _is_lorrax_owned(s)]
+    assert not ours, (
+        f"the two platform libraries both define {len(ours)} symbol(s) that "
+        f"LORRAX's own source produced: {ours[:40]}"
+        f"{' ...' if len(ours) > 40 else ''}.\n"
+        f"Both are dlopened RTLD_GLOBAL, so the first one loaded answers "
+        f"every one of these for BOTH — including for the other library's "
+        f"internal calls.  That is KNOWN_FAILURES L1.  Usual causes, in "
+        f"order of likelihood:\n"
+        f"  1. one of the two .so files predates 2026-08-08 (a mixed pin: "
+        f"an old host lib still exports the UNSUFFIXED lrx_* names, which "
+        f"is exactly a 9-symbol intersection).  Rebuild BOTH.\n"
+        f"  2. -Wl,--version-script=src/ffi/cpp/exports_*.map fell off a "
+        f"link line — check CMakeCache.txt.\n"
+        f"  3. a new exported name was added to one leg and, by the same "
+        f"spelling, to the other.")
+
+    c_linkage = [s for s in shared if not s.startswith("_Z")]
+    assert not c_linkage, (
+        f"the two platform libraries both define {len(c_linkage)} "
+        f"C-LINKAGE symbol(s): {c_linkage[:40]}.  Mangled shared names are "
+        f"weak COMDAT copies the C++ ABI merges on purpose; an unmangled "
+        f"one was deliberately exported by somebody, and two libraries in "
+        f"one RTLD_GLOBAL process must not both export the same one.")
+
+
+def test_each_library_exports_only_its_sanctioned_surface():
+    """No LORRAX internal leaks out of either .so — the other half of L1.
+
+    Check 6 measures the INTERSECTION, which two libraries can keep empty
+    while both still export their entire innards (they would just have to
+    disagree about every name).  This cell measures what each one exports on
+    its own.  Scope is LORRAX's own symbols, for the reason given at
+    ``_is_lorrax_owned``: the third-party names are ODR-correct duplicates
+    that the C++ ABI wants merged, and localising them was measured to
+    segfault SLATE.
+
+    The strongest single line of it is that NO MANGLED name of ours
+    survives — a ``_ZN10lorrax_ffi...`` in either table means a
+    ``namespace lorrax_ffi`` internal is back on the dynamic table, which is
+    the exact shape of L1.
+    """
+    for platform in ("cpu", "CUDA"):
+        so = _pinned(platform)
+        sanctioned, described = _SANCTIONED_EXPORTS[platform]
+        ours = {s for s in _defined_symbols(so) if _is_lorrax_owned(s)}
+        stray = sorted(s for s in ours if not sanctioned(s))
+        assert not stray, (
+            f"{so} exports {len(stray)} LORRAX-owned symbol(s) outside its "
+            f"sanctioned surface ({described}): {stray[:40]}"
+            f"{' ...' if len(stray) > 40 else ''}.\n"
+            f"src/ffi/cpp/exports_"
+            f"{'host' if platform == 'cpu' else 'cuda'}.map localises "
+            f"everything LORRAX defines; anything of ours still on the "
+            f"dynamic table is a name the OTHER platform library can answer "
+            f"for under RTLD_GLOBAL.")
+        assert not [s for s in ours if s.startswith("_Z")], (
+            f"{so} still exports mangled LORRAX C++ symbols — the "
+            f"`namespace lorrax_ffi` internals are on the dynamic table "
+            f"again, which is the shape of KNOWN_FAILURES L1.")
+
+
+def test_the_shared_symbol_check_can_fail():
+    """RED TWIN for check 6 and the surface check.
+
+    Check 6 asserts an EMPTY intersection, which is what a broken
+    ``_defined_symbols`` returning ``set()`` would also produce — the
+    tautology this project post-mortems.  Three constructions, all using the
+    real readers on real ELF files, no compiler and no synthetic data:
+
+    1. INTERSECT THE HOST LIBRARY WITH ITSELF.  Every symbol it has must
+       come back shared.  If ``nm -D --defined-only`` ever stopped returning
+       names, this is the cell that says so.
+    2. THE THIRD-PARTY OVERLAP IS STILL THERE.  Check 6 is scoped to
+       LORRAX's own symbols, and that scope is only honest if the reader can
+       see the names outside it — the two libraries DO still share ~234
+       mangled third-party names, and a check-6 that passed because the
+       intersection was empty for the wrong reason would show up here.
+    3. THE TWO SANCTIONED SURFACES DO NOT OVERLAP, in both directions.  That
+       disjointness (``lrx_*`` vs ``lrx_*_host``, ``*Ffi`` vs ``*HostFfi``)
+       is what makes an empty intersection possible at all, so a predicate
+       loose enough to accept both legs would silently void check 6.
+    """
+    host = _pinned("cpu")
+    self_shared = _shared_defined(host, host)
+    assert self_shared, (
+        "the host library intersected with ITSELF came back empty — "
+        "_defined_symbols is not reading the symbol table, so check 6's "
+        "empty intersection means nothing.")
+    assert len(self_shared) == len(_defined_symbols(host))
+
+    shared = _shared_defined(host, _pinned("CUDA"))
+    assert shared, (
+        "the two libraries share NO defined symbol at all, not even a "
+        "third-party template instantiation.  Either one of them was not "
+        "read, or somebody localised the weak COMDAT copies the C++ ABI "
+        "merges on purpose — which is measured (2026-08-08) to segfault "
+        "the SLATE host handlers.  See src/ffi/cpp/exports_cuda.map.")
+    assert all(s.startswith("_Z") for s in shared)
+
+    host_syms = _defined_symbols(host)
+    cuda_syms = _defined_symbols(_pinned("CUDA"))
+    sanctioned_cuda, _ = _SANCTIONED_EXPORTS["CUDA"]
+    accepted = sorted(s for s in host_syms if sanctioned_cuda(s))
+    assert not accepted, (
+        f"the CUDA sanctioned-surface predicate accepts host symbols "
+        f"{accepted} — the two surfaces overlap, so 'each library exports "
+        f"only its own surface' no longer implies they cannot collide.")
+    sanctioned_host, _ = _SANCTIONED_EXPORTS["cpu"]
+    accepted = sorted(s for s in cuda_syms if sanctioned_host(s))
+    assert not accepted, (
+        f"the host sanctioned-surface predicate accepts CUDA symbols "
+        f"{accepted} — same overlap, other direction.")
+
+
 def test_check_5_the_two_libraries_still_share_their_slate_soname():
     """A RATCHET on the reason ``_open_cuda_before_host`` exists.
+
+    SCOPE, since 2026-08-08: this cell is about the SONAME of a THIRD-PARTY
+    library, and nothing else.  The separate question — whether the two
+    files share any of their OWN defined symbols — was a real defect
+    (KNOWN_FAILURES L1), it is fixed, and check 6 above is its ratchet.
+    Do not read this cell as covering it.
 
     Both platform libraries carry ``NEEDED libslate.so.2`` and ``NEEDED
     libblaspp.so.2``, resolved out of different builds (the host lib's

@@ -25,6 +25,7 @@
 
 #include <hdf5.h>
 
+#include "../common/c_abi.h"
 #include "ctx.h"
 
 namespace lorrax_ffi::phdf5 {
@@ -43,7 +44,7 @@ extern "C" {
 // Open (or create) a parallel-HDF5 file collectively.
 // mode_flag: 0 = 'w' truncate, 1 = 'a' append-or-create, 2 = 'r' read-only
 // Returns 0 on success; sets err_out and returns 1 on failure.
-int lrx_phdf5_open(
+int LRX_C_ENTRY(lrx_phdf5_open)(
     const char* path,
     int p, int q, int rank, int world_size,
     int mode_flag,
@@ -63,7 +64,7 @@ int lrx_phdf5_open(
     }
 }
 
-void lrx_phdf5_close(int64_t ctx_handle) {
+void LRX_C_ENTRY(lrx_phdf5_close)(int64_t ctx_handle) {
     lorrax_ffi::phdf5::close_ctx(
         reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle));
 }
@@ -71,7 +72,7 @@ void lrx_phdf5_close(int64_t ctx_handle) {
 // Eager MPI init.  Safe to call multiple times.  Use at program
 // startup to move the ~400 ms MPI_Init_thread(THREAD_MULTIPLE) cost
 // off the first-open critical path.
-void lrx_phdf5_init_mpi(void) {
+void LRX_C_ENTRY(lrx_phdf5_init_mpi)(void) {
     lorrax_ffi::phdf5::ensure_mpi_initialized();
 }
 
@@ -80,7 +81,7 @@ void lrx_phdf5_init_mpi(void) {
 // 2=F64 3=S32 4=S64 5=C64 6=C128 (matches xla::ffi::DataType).
 // Returns 0 on success and writes the hid_t to *ds_id_out; sets err_out
 // and returns 1 on failure.
-int lrx_phdf5_ensure_dataset(
+int LRX_C_ENTRY(lrx_phdf5_ensure_dataset)(
     int64_t ctx_handle,
     const char* ds_name,
     const int64_t* shape, int ndim,
@@ -103,7 +104,7 @@ int lrx_phdf5_ensure_dataset(
 // Collective H5Dopen (read-only semantics; no create).  All ranks must
 // call concurrently.  Returns 0 on success and writes the hid_t to
 // *ds_id_out; sets err_out and returns 1 on failure.
-int lrx_phdf5_open_dataset_ro(
+int LRX_C_ENTRY(lrx_phdf5_open_dataset_ro)(
     int64_t ctx_handle,
     const char* ds_name,
     int64_t* ds_id_out,
