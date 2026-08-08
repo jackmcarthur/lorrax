@@ -635,16 +635,41 @@ static ffi::Error ReadKchunkImpl(
 
 static ffi::Error ReadKchunkDispatch(
     LRX_STREAM_PARAM
+    ffi::Buffer<ffi::DataType::S64> handle_buf,   // shape (2,) {ctx_handle, ds_id}
     ffi::Buffer<ffi::DataType::S64> offset_buf,   // shape (n_kchunk, N_file)
     ffi::Result<ffi::AnyBuffer> A_out,             // shape (n_kchunk, per-rank file dims...)
-    int64_t ctx_handle,
-    int64_t ds_id,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,   // length N_file
     ffi::Span<const int64_t> axis_flat,
     int64_t n_kchunk_attr)
 {
-    auto* ctx = reinterpret_cast<PhdfCtx*>(ctx_handle);
+    // ``ctx_handle``/``ds_id`` arrive as a RUNTIME buffer, not as FFI Attrs —
+    // see the long note above ReadDispatch.  Same argument, same fix: as an
+    // Attr the heap address forked a module per process, so the persistent
+    // compile cache could never hit one.  MEASURED for this handler
+    // 2026-08-07: +2 entries per distinct ctx address, attributed by
+    // xla_dump to the two union modules.
+    if (handle_buf.dimensions().size() != 1 ||
+        handle_buf.dimensions()[0] != 2) {
+        return ffi::Error(
+            ffi::ErrorCode::kInvalidArgument,
+            "phdf5 read_kchunk: handle_buf must have shape (2,) == "
+            "{ctx_handle, ds_id}");
+    }
+    int64_t handle_host[2] = {0, 0};
+    {
+        // No ctx yet, so there is nothing to announce through: return
+        // plainly.  A failure here hits every rank identically.
+        std::string herr;
+        if (!copy_index_to_host(handle_host, handle_buf.untyped_data(),
+                                2 * sizeof(int64_t), &herr)) {
+            return ffi::Error(
+                ffi::ErrorCode::kInternal,
+                "phdf5 read_kchunk: copy(handle) failed: " + herr);
+        }
+    }
+    auto* ctx = reinterpret_cast<PhdfCtx*>(handle_host[0]);
+    const hid_t ds_id = (hid_t)handle_host[1];
 
     auto fail = [ctx](ffi::ErrorCode code, const std::string& msg) {
         announce_error(ctx, msg);
@@ -1068,18 +1093,49 @@ static void async_read_kchunk_union_worker(
 
 static ffi::Future ReadKchunkUnionDispatch(
     LRX_STREAM_PARAM
+    ffi::Buffer<ffi::DataType::S64> handle_buf,   // (2,) {ctx_handle, ds_id}
     ffi::Buffer<ffi::DataType::S64> offset_buf,   // (n_kchunk, N_file)
     ffi::Buffer<ffi::DataType::S64> count_buf,    // (n_kchunk, N_file)
     ffi::Result<ffi::AnyBuffer> A_out,
-    int64_t ctx_handle,
-    int64_t ds_id,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
     ffi::Span<const int64_t> axis_flat,
     int64_t n_kchunk_attr,
     int64_t kchunk_axis_attr)  // position of the n_kchunk axis in A_out
 {
-    auto* ctx = reinterpret_cast<PhdfCtx*>(ctx_handle);
+    // ``ctx_handle``/``ds_id`` as a RUNTIME buffer — see ReadDispatch.  This
+    // handler is the one xla_dump attributed the measured +2-entries-per-
+    // ctx-address growth to.
+    //
+    // NOTE: this dispatch returns ffi::Future, so a failure BEFORE ``ctx`` is
+    // known cannot return a bare ffi::Error — it must still hand back a
+    // Future carrying the error.  ``fail`` below needs ctx (it announces), so
+    // the two pre-ctx failures build their own Promise/Future pair.
+    auto fail_early = [](ffi::ErrorCode code, const std::string& msg) {
+        ffi::Promise p;
+        ffi::Future f(p);
+        p.SetError(ffi::Error(code, msg));
+        return f;
+    };
+    if (handle_buf.dimensions().size() != 1 ||
+        handle_buf.dimensions()[0] != 2) {
+        return fail_early(
+            ffi::ErrorCode::kInvalidArgument,
+            "phdf5 read_kchunk_union: handle_buf must have shape (2,) == "
+            "{ctx_handle, ds_id}");
+    }
+    int64_t handle_host[2] = {0, 0};
+    {
+        std::string herr;
+        if (!copy_index_to_host(handle_host, handle_buf.untyped_data(),
+                                2 * sizeof(int64_t), &herr)) {
+            return fail_early(
+                ffi::ErrorCode::kInternal,
+                "phdf5 read_kchunk_union: copy(handle) failed: " + herr);
+        }
+    }
+    auto* ctx = reinterpret_cast<PhdfCtx*>(handle_host[0]);
+    const hid_t ds_id = (hid_t)handle_host[1];
 
     auto fail = [ctx](ffi::ErrorCode code, const std::string& msg) {
         announce_error(ctx, msg);
@@ -1237,7 +1293,7 @@ static ffi::Future ReadKchunkUnionDispatch(
     ffi::Promise promise;
     ffi::Future future(promise);
     auto task = [ctx,
-                 ds_id = (hid_t)ds_id,
+                 ds_id,
                  native_type,
                  d_dst = A_out->untyped_data(),
                  element_size,
@@ -1294,10 +1350,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     LRX_PHDF_HANDLER(PhdfReadKchunk), lorrax_ffi::phdf5::ReadKchunkDispatch,
     xla::ffi::Ffi::Bind()
         LRX_PHDF_STREAM_CTX
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // handle {ctx, ds}
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_buf (n_kchunk, N_file)
         .Ret<xla::ffi::AnyBuffer>()
-        .Attr<int64_t>("ctx_handle")
-        .Attr<int64_t>("ds_id")
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
         .Attr<xla::ffi::Span<const int64_t>>("axis_flat")
@@ -1308,11 +1363,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     lorrax_ffi::phdf5::ReadKchunkUnionDispatch,
     xla::ffi::Ffi::Bind()
         LRX_PHDF_STREAM_CTX
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // handle {ctx, ds}
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_buf (n_kchunk, N_file)
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // count_buf  (n_kchunk, N_file)
         .Ret<xla::ffi::AnyBuffer>()
-        .Attr<int64_t>("ctx_handle")
-        .Attr<int64_t>("ds_id")
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
         .Attr<xla::ffi::Span<const int64_t>>("axis_flat")
