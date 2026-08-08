@@ -377,8 +377,13 @@ if __name__ == "__main__":
              "= full reorth (= max_lanczos_iter); essential for highly "
              "degenerate spectra (e.g. spinor BSE) so Ritz vectors stay "
              "orthogonal across the full Krylov basis. Smaller windows "
-             "(e.g. 10) are faster but give ghost eigenvalues that "
-             "destroy per-state oscillator strengths.",
+             "(e.g. 10) give ghost eigenvalues that destroy per-state "
+             "oscillator strengths, and since 2026-08-08 they are no "
+             "longer even faster: the default batched reorth route "
+             "(solvers.lanczos, LORRAX_LANCZOS_REORTH) costs "
+             "2*max_iter collectives whatever the window, where the "
+             "legacy per-vector sweep cost O(window*max_iter). There "
+             "is no longer a speed reason to narrow this.",
     )
     parser.add_argument(
         "--matvec-kind",
