@@ -23,6 +23,18 @@ REGISTERED, NOT TAKEN: ``BGWVcoulTable.find_q_index``'s April fix never
 landed and the ``use_bgw_vcoul`` surface is data-dead in-tree.  The
 repair-or-delete decision is the OWNER's (DESIGN_vcoul.md owner row 3);
 the extraction moved this code verbatim and fixed nothing.
+
+DELETION GATE: the owner's repair-or-delete ruling on ``use_bgw_vcoul``
+(DESIGN_vcoul.md owner row 3) — NOT the phase-wide cleanup commit, which
+deleted the five wave-1 shims that carried that marker (029da82) and
+deliberately left this one.  This file is not in that class: it still has
+a LIVE consumer (``gw/compute_vcoul.py:228`` imports it by name),
+``file_io/__init__`` re-exports its three names, and
+``tests/test_vcoul_shim_identity.py`` asserts the forwarding is identity.
+Deleting it before the owner rules would remove a working code path to
+tidy a docstring.  When the ruling lands: delete this module, drop the
+three names from ``file_io/__init__``, and repoint
+``gw/compute_vcoul.py`` at ``vcoul``'s door.
 """
 from __future__ import annotations
 
