@@ -221,12 +221,19 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # IBZ cascade plumbing.  When ``use_ibz=True`` the bispinor ζ̃ files
     # were written IBZ-only (see ``gw_init.fit_zeta`` and
     # ``isdf_fitting.fit_zeta_to_h5``); the per-tile kernel iterates the
-    # parent IBZ q-list and unfolds post-loop via ``unfold_v_q``.  Two
-    # centroid sets ⇒ two orbit-closure checks (CC ↔ charge, TT ↔
+    # parent IBZ q-list and unfolds post-loop via ``unfold_isdf_operator``.
+    # Two centroid sets ⇒ two orbit-closure checks (CC ↔ charge, TT ↔
     # transverse); they may diverge in principle but in practice are
     # generated together by the user's ``kmeans_cli --orbit-aware`` run.
-    # If either set's closure check fails, fall back to full-BZ for the
-    # corresponding tiles and log loudly.  See derivation §A5.
+    # If either set's closure check fails, the corresponding tiles fall
+    # back to full-BZ.  See derivation §A5.
+    #
+    # THE FALLBACK IS ANNOUNCED IN ONE PLACE, and it is not here.  This
+    # block used to print its own second wording of the same fact, behind
+    # ``verbose`` — so a bispinor production run with verbose off degraded
+    # both channels silently.  ``gw.qgrid_symmetry`` now speaks once per
+    # centroid SET, which is what makes the charge and transverse cases
+    # two distinct lines instead of one line printed twice.
     # ------------------------------------------------------------------
     from .v_q_g_flat import _resolve_ibz_q_list
 
@@ -235,13 +242,9 @@ def compute_V_q_bispinor_g_flat_to_h5(
             return None, False
         tables = _resolve_ibz_q_list(
             sym=sym, centroid_indices=np.asarray(centroid_idx, dtype=np.int32),
-            kgrid=kgrid, fft_grid=fft_grid, verbose=False)
+            kgrid=kgrid, fft_grid=fft_grid,
+            context=f"bispinor g-flat, {label} centroids")
         (_, _, _, _, _sym_perm, _L_table, _ok) = tables
-        if not _ok and verbose and jax.process_index() == 0:
-            print_fn(f"  [bispinor g-flat] {label}-centroid orbit closure "
-                     f"failed — falling back to full-BZ for {label} tiles.  "
-                     f"Regenerate centroids with ``kmeans_cli --orbit-aware`` "
-                     f"to enable the IBZ cascade.")
         return tables, _ok
 
     _ibz_C, _use_ibz_C = _ibz_tables_for(centroid_C_idx, 'charge')
@@ -357,7 +360,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     if _use_ibz_T and sym is not None and tt_buffer:
         from ffi import _services
         _services.ensure_on_path()
-        from symmetry_maps import unfold_v_q_bispinor_lorentz
+        from symmetry_maps import mix_channels_by_proper_rotation
 
         # Synthesise the 3 Hermitian-redundant tiles (j, i) for i < j from
         # the stored upper-triangle.  These are needed as INPUTS to the
@@ -367,7 +370,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
             tt_full_in[(j, i)] = jnp.conj(
                 jnp.swapaxes(tt_buffer[(i_src, j_src)], -1, -2))
 
-        tt_mixed = unfold_v_q_bispinor_lorentz(
+        tt_mixed = mix_channels_by_proper_rotation(
             tt_full_in,
             sym_idx=np.asarray(sym.sym_idx_q, dtype=np.int32),
             R_proper_table=np.asarray(sym.R_proper, dtype=np.float64),

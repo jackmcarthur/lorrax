@@ -21,7 +21,7 @@ Two convention notes (both documented inside SymMaps.__init__):
      correct from ``T σ^i T⁻¹ = -σ^i`` on i=1,2,3); the LIVE code
      stores ``R_proper_TRS = +R_proper_spatial`` because the σ-flip on
      (μ_L, ν_L) ∈ {1,2,3}² UNIQUE_TILES factorises as (−1)·(−1) = +1
-     and is absorbed by the existing ``unfold_v_q`` conj-wrap
+     and is absorbed by the existing ``unfold_isdf_operator`` conj-wrap
      (derivation §A4).  This test compares the spatial halves only.
 """
 from __future__ import annotations

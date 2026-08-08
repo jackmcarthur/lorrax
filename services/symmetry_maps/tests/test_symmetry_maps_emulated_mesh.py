@@ -1,22 +1,22 @@
 """Layer L-b: the sharded q-axis unfolds on an EMULATED four-device mesh.
 
-``unfold_v_q`` is a ``shard_map`` over an ``('x','y')`` mesh with a 1x
-single-tile memory contract: at no point may a rank hold a full μ or ν
-axis, so the μ-permute and the ν-permute each go through
+``unfold_isdf_operator`` is a ``shard_map`` over an ``('x','y')`` mesh
+with a 1x single-tile memory contract: at no point may a rank hold a
+full μ or ν axis, so the μ-permute and the ν-permute each go through
 ``lax.all_to_all`` to redistribute the OTHER spatial axis.  That machinery
 is invisible at 1x1 — both ``all_to_all`` branches are skipped — so every
 claim about it has to come from a mesh with Px > 1 and Py > 1.
 
 WHAT THE SURVEY RANKED HIGH AND NOTHING COVERED (§7.2):
 
-* **G10** — "No hostile geometry anywhere for ``unfold_v_q``'s
+* **G10** — "No hostile geometry anywhere for ``unfold_isdf_operator``'s
   ``all_to_all`` path.  Its own guard requires ``n_rmu_padded % (Px·Py) ==
   0`` and raises otherwise — but nothing constructs the failing case, and
   nothing exercises the ``Px>1, Py>1`` redistribution at a non-trivial
   extent."  HIGH, and the CHARTER's mandatory band-pad class for a
   mesh-touching service.  Both halves are here: the refusal AND the red
   twin showing the divisible case going through the same code path.
-* **G6** — ``unfold_v_q_bispinor_lorentz`` has no direct test anywhere.
+* **G6** — ``mix_channels_by_proper_rotation`` has no direct test anywhere.
 
 HOW THE FOUR DEVICES GET HERE.  ``conftest.py`` sets
 ``XLA_FLAGS=--xla_force_host_platform_device_count=4`` before the first jax
@@ -42,9 +42,10 @@ import numpy as np
 import pytest
 
 from lxkit.testing import require_devices
-from symmetry_maps import (KStarMap, compute_centroid_sym_perm, star_broadcast,
-                           star_select, star_spread, unfold_v_q,
-                           unfold_v_q_bispinor_lorentz)
+from symmetry_maps import (KStarMap, centroid_source_map_and_wrap,
+                           mix_channels_by_proper_rotation, star_broadcast,
+                           star_select, star_spread,
+                           unfold_isdf_operator)
 
 #: {I, σ_y} on a 12x12x1 FFT grid — the smallest thing with a non-trivial
 #: permutation, a real umklapp wrap, and a TRS half.
@@ -63,7 +64,7 @@ _NTRAN = 2
 #
 # 2. A LATTICE WRAP THAT VARIES ACROSS μ.  The image of (x, y) with y > 0
 #    folds back with L_y = −1; a seed on y = 0 folds with L_y = 0.  The
-#    umklapp phase in ``unfold_v_q`` is ``exp(2πi q·(L_μ − L_ν))``, a
+#    umklapp phase in ``unfold_isdf_operator`` is ``exp(2πi q·(L_μ − L_ν))``, a
 #    DIFFERENCE — so a set whose centroids all share one L makes the phase
 #    identically 1 no matter how large L is, and the whole term goes
 #    untested while looking exercised.  MEASURED writing this file: the
@@ -90,7 +91,7 @@ def _geometry(seeds):
     imgs = {tuple(((rinv[s] @ r) % _FFT).tolist())
             for r in pts for s in range(_SYMS.shape[0])}
     cent = np.array(sorted(imgs), dtype=np.int32)
-    perm, L = compute_centroid_sym_perm(
+    perm, L = centroid_source_map_and_wrap(
         cent, _SYMS, np.zeros((2, 3)), _FFT, validate=True, extend_trs=True)
     return perm, L, int(cent.shape[0])
 
@@ -138,7 +139,7 @@ def _hand_unfold(V_ibz, *, perm, L, n_rmu):
 
     Same expression as ``tests/test_symmetry_unfold.py``'s
     ``_hand_unfold_v_q`` — the ONE formula, written out where a reader can
-    check it against ``unfold_v_q``'s docstring::
+    check it against ``unfold_isdf_operator``'s docstring::
 
         V_full[q, μ, ν] = exp(2πi q_irr·(L_{s,μ} − L_{s,ν}))
                           · V_ibz[i(q), α_s(μ), α_s(ν)]
@@ -188,9 +189,9 @@ def test_the_unfold_matches_the_hand_reference_on_every_mesh(px, py):
     perm, L, n_rmu = _divisible_geometry()
     V = _hermitian_ibz(n_rmu)
     ref = _hand_unfold(V, perm=perm, L=L, n_rmu=n_rmu)
-    got = np.asarray(unfold_v_q(jnp.asarray(V), irr_idx=_IRR, sym_idx=_SYM,
-                                sym_perm=perm, L_table=L, q_irr_frac=_Q_IRR,
-                                mesh_xy=mesh, n_sym_spatial=_NTRAN))
+    got = np.asarray(unfold_isdf_operator(
+        jnp.asarray(V), irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm, L_table=L,
+        q_irr_frac=_Q_IRR, mesh_xy=mesh, n_sym_spatial=_NTRAN))
     assert got.shape == (len(_IRR), n_rmu, n_rmu)
     rel = float(np.abs(got - ref).max() / np.abs(ref).max())
     assert rel < 1e-13, f"{px}x{py}: unfold differs from the reference: {rel:.3e}"
@@ -209,9 +210,9 @@ def test_the_hand_reference_is_not_a_reimplementation():
     mesh = _mesh(1, 1)
     perm, L, n_rmu = _divisible_geometry()
     V = _hermitian_ibz(n_rmu)
-    got = np.asarray(unfold_v_q(jnp.asarray(V), irr_idx=_IRR, sym_idx=_SYM,
-                                sym_perm=perm, L_table=L, q_irr_frac=_Q_IRR,
-                                mesh_xy=mesh, n_sym_spatial=_NTRAN))
+    got = np.asarray(unfold_isdf_operator(
+        jnp.asarray(V), irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm, L_table=L,
+        q_irr_frac=_Q_IRR, mesh_xy=mesh, n_sym_spatial=_NTRAN))
     nophase = _hand_unfold(V, perm=perm, L=np.zeros_like(L), n_rmu=n_rmu)
     rel = float(np.abs(got - nophase).max() / np.abs(got).max())
     assert rel > 1e-3, (
@@ -227,15 +228,16 @@ def test_the_conj_wrap_on_trs_rows_is_live():
     Compare the kernel's TRS rows against the reference computed WITHOUT
     the conjugation.  A large disagreement is what says
     ``V_full[TRS-q] = conj(V_ibz[parent])`` is actually applied — the rule
-    whose absence is the whole ``unfold_v_q`` half of the TRS bug class.
+    whose absence is the whole ``unfold_isdf_operator`` half of the TRS bug
+    class.
     """
     import jax.numpy as jnp
     mesh = _mesh(1, 1)
     perm, L, n_rmu = _divisible_geometry()
     V = _hermitian_ibz(n_rmu)
-    got = np.asarray(unfold_v_q(jnp.asarray(V), irr_idx=_IRR, sym_idx=_SYM,
-                                sym_perm=perm, L_table=L, q_irr_frac=_Q_IRR,
-                                mesh_xy=mesh, n_sym_spatial=_NTRAN))
+    got = np.asarray(unfold_isdf_operator(
+        jnp.asarray(V), irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm, L_table=L,
+        q_irr_frac=_Q_IRR, mesh_xy=mesh, n_sym_spatial=_NTRAN))
     ref = _hand_unfold(V, perm=perm, L=L, n_rmu=n_rmu)
     trs_rows = np.where(_SYM >= _NTRAN)[0]
     assert trs_rows.size >= 2, "PRECONDITION: this map must use TRS rows"
@@ -261,10 +263,10 @@ def test_the_trivial_map_short_circuits_to_its_input():
     mesh = _mesh(2, 2)
     perm, L, n_rmu = _divisible_geometry()
     V = jnp.asarray(_hermitian_ibz(n_rmu, n_q=5))
-    out = unfold_v_q(V, irr_idx=np.arange(5, dtype=np.int32),
-                     sym_idx=np.zeros(5, dtype=np.int32), sym_perm=perm,
-                     L_table=L, q_irr_frac=np.zeros((5, 3)), mesh_xy=mesh,
-                     n_sym_spatial=_NTRAN)
+    out = unfold_isdf_operator(
+        V, irr_idx=np.arange(5, dtype=np.int32),
+        sym_idx=np.zeros(5, dtype=np.int32), sym_perm=perm, L_table=L,
+        q_irr_frac=np.zeros((5, 3)), mesh_xy=mesh, n_sym_spatial=_NTRAN)
     assert out is V
 
 
@@ -293,8 +295,9 @@ def test_a_non_dividing_centroid_extent_refuses_on_a_2x2():
         f"this cell is asserting a refusal that cannot happen")
     V = jnp.asarray(_hermitian_ibz(n_rmu))
     with pytest.raises(ValueError) as ei:
-        unfold_v_q(V, irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm, L_table=L,
-                   q_irr_frac=_Q_IRR, mesh_xy=mesh, n_sym_spatial=_NTRAN)
+        unfold_isdf_operator(
+            V, irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm, L_table=L,
+            q_irr_frac=_Q_IRR, mesh_xy=mesh, n_sym_spatial=_NTRAN)
     msg = str(ei.value)
     assert f"n_rmu_padded={n_rmu}" in msg and "Px*Py=4" in msg, msg
     assert "all_to_all" in msg and "n_rmu_padded" in msg
@@ -311,9 +314,9 @@ def test_the_same_hostile_extent_goes_through_at_1x1():
     mesh = _mesh(1, 1)
     perm, L, n_rmu = _hostile_geometry()
     V = _hermitian_ibz(n_rmu)
-    got = np.asarray(unfold_v_q(jnp.asarray(V), irr_idx=_IRR, sym_idx=_SYM,
-                                sym_perm=perm, L_table=L, q_irr_frac=_Q_IRR,
-                                mesh_xy=mesh, n_sym_spatial=_NTRAN))
+    got = np.asarray(unfold_isdf_operator(
+        jnp.asarray(V), irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm, L_table=L,
+        q_irr_frac=_Q_IRR, mesh_xy=mesh, n_sym_spatial=_NTRAN))
     ref = _hand_unfold(V, perm=perm, L=L, n_rmu=n_rmu)
     assert float(np.abs(got - ref).max() / np.abs(ref).max()) < 1e-13
 
@@ -329,10 +332,10 @@ def test_a_divisible_extent_passes_the_same_2x2_code_path():
     mesh = _mesh(2, 2)
     perm, L, n_rmu = _divisible_geometry()
     assert n_rmu % 4 == 0
-    got = np.asarray(unfold_v_q(jnp.asarray(_hermitian_ibz(n_rmu)),
-                                irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm,
-                                L_table=L, q_irr_frac=_Q_IRR, mesh_xy=mesh,
-                                n_sym_spatial=_NTRAN))
+    got = np.asarray(unfold_isdf_operator(
+        jnp.asarray(_hermitian_ibz(n_rmu)), irr_idx=_IRR, sym_idx=_SYM,
+        sym_perm=perm, L_table=L, q_irr_frac=_Q_IRR, mesh_xy=mesh,
+        n_sym_spatial=_NTRAN))
     assert got.shape == (len(_IRR), n_rmu, n_rmu)
 
 
@@ -349,13 +352,13 @@ def test_a_sym_table_that_does_not_cover_the_trs_half_refuses():
     perm, L, n_rmu = _divisible_geometry()
     V = jnp.asarray(_hermitian_ibz(n_rmu))
     with pytest.raises(ValueError, match="only 2 rows"):
-        unfold_v_q(V, irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm[:2],
-                   L_table=L[:2], q_irr_frac=_Q_IRR, mesh_xy=mesh,
-                   n_sym_spatial=_NTRAN)
+        unfold_isdf_operator(V, irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm[:2],
+                             L_table=L[:2], q_irr_frac=_Q_IRR, mesh_xy=mesh,
+                             n_sym_spatial=_NTRAN)
     with pytest.raises(ValueError, match="2·n_sym_spatial"):
-        unfold_v_q(V, irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm,
-                   L_table=L, q_irr_frac=_Q_IRR, mesh_xy=mesh,
-                   n_sym_spatial=3)
+        unfold_isdf_operator(V, irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm,
+                             L_table=L, q_irr_frac=_Q_IRR, mesh_xy=mesh,
+                             n_sym_spatial=3)
 
 
 def test_a_mu_extent_mismatch_refuses_in_both_tables():
@@ -371,18 +374,19 @@ def test_a_mu_extent_mismatch_refuses_in_both_tables():
     perm, L, n_rmu = _divisible_geometry()
     short = jnp.asarray(_hermitian_ibz(n_rmu)[:, :-2, :-2])
     with pytest.raises(ValueError, match="sym_perm extent"):
-        unfold_v_q(short, irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm,
-                   L_table=L, q_irr_frac=_Q_IRR, mesh_xy=mesh,
-                   n_sym_spatial=_NTRAN)
+        unfold_isdf_operator(short, irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm,
+                             L_table=L, q_irr_frac=_Q_IRR, mesh_xy=mesh,
+                             n_sym_spatial=_NTRAN)
     V = jnp.asarray(_hermitian_ibz(n_rmu))
     with pytest.raises(ValueError, match="L_table μ-extent"):
-        unfold_v_q(V, irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm,
-                   L_table=np.asarray(L)[:, :-2, :], q_irr_frac=_Q_IRR,
-                   mesh_xy=mesh, n_sym_spatial=_NTRAN)
+        unfold_isdf_operator(
+            V, irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm,
+            L_table=np.asarray(L)[:, :-2, :], q_irr_frac=_Q_IRR, mesh_xy=mesh,
+            n_sym_spatial=_NTRAN)
 
 
 # ---------------------------------------------------------------------------
-# G6 — unfold_v_q_bispinor_lorentz
+# G6 — mix_channels_by_proper_rotation
 # ---------------------------------------------------------------------------
 
 def _r_proper(rng, n_rows):
@@ -403,7 +407,7 @@ def _r_proper(rng, n_rows):
 def test_the_lorentz_mixing_matches_a_dense_numpy_reference(px, py):
     """G6.  The §A5 3-vector mixing, against an explicit double sum.
 
-    ``unfold_v_q_bispinor_lorentz`` applies, per full-BZ q::
+    ``mix_channels_by_proper_rotation`` applies, per full-BZ q::
 
         V^{i,j}_mixed = Σ_{α,β} R^{α,i}(q) · R^{β,j}(q) · V^{α,β}
 
@@ -430,7 +434,7 @@ def test_the_lorentz_mixing_matches_a_dense_numpy_reference(px, py):
             a = (rng.standard_normal((n_q, n_mu, n_mu))
                  + 1j * rng.standard_normal((n_q, n_mu, n_mu)))
             tiles[(i, j)] = a
-    out = unfold_v_q_bispinor_lorentz(
+    out = mix_channels_by_proper_rotation(
         {k: jnp.asarray(v) for k, v in tiles.items()},
         sym_idx=_SYM, R_proper_table=R, mesh_xy=mesh)
 
@@ -501,11 +505,11 @@ def test_the_lorentz_mix_refuses_a_missing_tile_and_a_bad_table():
              for i in (1, 2, 3) for j in (1, 2, 3)}
     partial = {k: v for k, v in tiles.items() if k != (2, 3)}
     with pytest.raises(ValueError, match=r"missing TT tile"):
-        unfold_v_q_bispinor_lorentz(partial, sym_idx=_SYM,
-                                    R_proper_table=R, mesh_xy=mesh)
+        mix_channels_by_proper_rotation(partial, sym_idx=_SYM,
+                                        R_proper_table=R, mesh_xy=mesh)
     with pytest.raises(ValueError, match=r"\(2·n_sym_spatial, 3, 3\)"):
-        unfold_v_q_bispinor_lorentz(tiles, sym_idx=_SYM,
-                                    R_proper_table=R[:, :2, :], mesh_xy=mesh)
+        mix_channels_by_proper_rotation(
+            tiles, sym_idx=_SYM, R_proper_table=R[:, :2, :], mesh_xy=mesh)
 
 
 # ---------------------------------------------------------------------------

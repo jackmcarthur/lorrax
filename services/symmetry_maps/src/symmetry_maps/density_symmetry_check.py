@@ -507,7 +507,7 @@ def _grid_permutation(mtrx: np.ndarray, tau_2pi: np.ndarray,
     of grid point ``n``.  ``None`` when ``τ`` is not commensurate with
     the FFT grid (the op cannot be represented as a grid permutation).
 
-    Convention source: ``symmetry_maps.compute_centroid_sym_perm``
+    Convention source: ``symmetry_maps.centroid_source_map_and_wrap``
     and ``SymMaps.validate_atomic_symmetries`` — both use
     ``Rinv = inv(mtrx)`` and ``τ_frac = tnp / 2π``.
     """

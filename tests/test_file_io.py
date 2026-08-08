@@ -644,7 +644,7 @@ def test_zeta_layout_rejects_garbage(tmp_path):
 # NOT here any more is ``test_load_q_full_bz_unfold_path_exists``: the
 # ζ(r) IBZ→full-BZ unfold it reached is deleted, and the cell asserted
 # only that the path was *reached* (it accepted a clean answer OR
-# LinAlgError OR NotImplementedError OR a compute_rgrid_sym_perm
+# LinAlgError OR NotImplementedError OR a fft_grid_pullback_perm
 # RuntimeError, because the fake WFN's mtrx is singular).  Its successor
 # is the refusal cell, which asserts something.
 # ---------------------------------------------------------------------------
@@ -704,6 +704,15 @@ def test_load_q_full_bz_on_an_ibz_file_refuses_and_names_the_post_v_q_unfold(
         tmp_path, n_q_disk=6, n_rmu=4, n_G_sph=5)     # 6 < 24 ⇒ IBZ on disk
     ld = ZetaLoader(out)
     assert ld.q_layout == 'ibz'
+    # HAND-TRACKED THROUGH THE 2026-08-08 RENAME SWEEP — DELIBERATELY THE
+    # OLD SPELLING.  The message being matched is raised by ZetaLoader
+    # (``services/zeta_loader``), which this branch may not touch, and it
+    # names the route as ``common.symmetry_maps.unfold_v_q``.  Rewriting
+    # the pattern to ``unfold_isdf_operator`` here would make this cell
+    # red against an unchanged producer; rewriting the producer is out of
+    # bounds.  The old name still resolves through the compat alias, so
+    # the advice the message gives is still correct.  Both move together
+    # at the documentation pass, which is when the aliases retire.
     with pytest.raises(NotImplementedError, match=r"unfold_v_q"):
         ld.load(q='full_bz')
 

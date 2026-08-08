@@ -418,6 +418,14 @@ def test_the_module_scope_census_can_fail(tmp_path):
     Three files in a throwaway tree, because the green cell above passes
     on a tree that happens to be tidy and would pass just as green if
     ``_scan_module_scope`` returned the empty set for every input.
+
+    Visited by the 2026-08-08 rename sweep and deliberately unchanged.
+    The two ``KStarMap`` spellings below are SOURCE TEXT written into a
+    throwaway tree and parsed there, so no rename tool sees them — but
+    ``KStarMap`` is a KEEP name and, more to the point, what this cell
+    measures is the IMPORT FORM, not the name: any exported name would
+    do.  If a future sweep ever renames a class used here, this cell
+    fails only if the name stops parsing, which it will not.
     """
     for rel, body in (
             ("src/gw/listed_thing.py", "import symmetry_maps\n"),

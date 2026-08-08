@@ -271,8 +271,42 @@ def print_system_summary(
 
 
 # ---------------------------------------------------------------------------
-# Restart persistence — W0 + q→0 head scalars
+# Restart persistence — the deck's write/skip decision, W0 + q→0 head scalars
 # ---------------------------------------------------------------------------
+
+def restart_tensor_writes_enabled(config, tensors_filename: str) -> bool:
+    """``write_restart_tensors``: may this run persist the ISDF tensors?
+
+    ONE decision point for a key that gates FOUR writes — the V_q / G0 /
+    E_nk flush with its W0 placeholder, the ψ append, the centroid-hash
+    stamp (all in ``gw_init.prepare_isdf_and_wavefunctions``) and the W0 +
+    head-scalar write here.  Asking ``config.write_restart_tensors`` at
+    four sites would be four chances for one of them to keep writing, and
+    a restart file containing three of its five datasets is worse than no
+    file at all: the ``W0_ready`` and window guards would pass on it.
+
+    ANNOUNCED, ONCE, ON RANK 0.  Skipping the artifact is a policy the deck
+    chose and it is invisible in every other way — the run simply gets
+    faster and ``tmp/`` stays empty — so it says so.  Deduped on the
+    filename through ``ffi.gate.announce_once``, which is also what keeps
+    the four call sites to one line.
+
+    Returns ``True`` when the writes should happen (the default, and
+    today's behaviour unchanged).
+    """
+    if getattr(config, "write_restart_tensors", True):
+        return True
+    from ffi.gate import announce_once
+    announce_once(
+        ("write_restart_tensors", "off", tensors_filename),
+        f"  [restart_write] write_restart_tensors = false — SKIPPING "
+        f"{os.path.basename(tensors_filename)} entirely (V_qmunu, G0_mu_nu, "
+        f"enk_full, psi_full_y, W0_qmunu, head scalars).  Nothing in the GW "
+        f"driver reads these back; a BSE run against this directory will "
+        f"refuse on the missing file.",
+        scope="rank0")
+    return False
+
 
 def persist_w0_and_head(
     W_q,
@@ -282,9 +316,19 @@ def persist_w0_and_head(
     config,
     meta,
     mesh_xy,
+    sym=None,
+    centroid_indices=None,
     print_fn=print,
 ):
     """Persist W0_qmunu + q=0 head scalars to the ISDF restart file.
+
+    ``sym`` / ``centroid_indices`` are the run's symmetry tables and
+    centroid set, and they are here for ONE reason: the q-storage decision.
+    V's writer resolves it in ``gw_init``; this writer must reach the SAME
+    answer, and the only honest way to reach it is to ask the same
+    resolution point about the same centroid set.  Omitting them resolves
+    ``full`` — today's bytes — which is the right answer for a caller that
+    cannot say which centroid set its W was computed against.
 
     Downstream consumers (BSE, future Σ-builders) reload these and apply
     the rank-1 head update via ``head_correction.apply_q0_head_rank1``.
@@ -293,11 +337,19 @@ def persist_w0_and_head(
     flow through automatically because ``HeadResolver`` consults the
     config's override fields first before falling back to s_tensor/epshead.
 
-    No-op unless ``config.do_screened`` and the restart file exists.
+    No-op unless ``config.do_screened``, the deck asked for restart tensor
+    writes (``write_restart_tensors``), and the restart file exists.  The
+    file-exists arm is not redundant with the key: a ``restart = true`` run
+    reuses tensors it did not write, and would otherwise re-stamp a W0 into
+    a file the deck said to leave alone.
     """
     from .gw_config import ComputeMode
 
-    if not (config.do_screened and os.path.exists(tensors_filename)):
+    if not config.do_screened:
+        return
+    if not restart_tensor_writes_enabled(config, tensors_filename):
+        return
+    if not os.path.exists(tensors_filename):
         return
     from file_io import write_w0_qmunu_to_h5, write_head_scalars_to_h5
     # W_q is already flat-q (nq, μ, μ).  The W0_qmunu placeholder
@@ -307,9 +359,30 @@ def persist_w0_and_head(
     # ``phdf5 async write: dataset rank mismatch ds=/W0_qmunu
     # file_rank=3 write_rank=8``.  Downstream (BSE) consumers
     # of W0_qmunu were already updated to flat-q in commit a052a1c.
+    # THE SAME DECISION V TOOK, taken the same way, on W's OWN capture.
+    # ``sym``/``centroid_indices`` reach here through the resolver rather
+    # than through this function's signature because the head/W0 persist
+    # path has never carried them; passing the RUN's config and the
+    # producer's tables is what keeps the two writers on one answer.
+    # ``take_pre_unfold`` REMOVES, so a second persist in a
+    # self-consistency loop cannot re-store the first iteration's W.
+    from .restart_q_storage import (resolve_restart_q_storage_for_run,
+                                    take_pre_unfold)
+    _qirr = resolve_restart_q_storage_for_run(
+        config, sym=sym, centroid_indices=centroid_indices,
+        # ``getattr``, not ``meta.fft_grid``: the grid is read ONLY when
+        # ``sym``/``centroid_indices`` are both present (the resolver
+        # short-circuits to ``full`` otherwise), and this function is
+        # reachable with a minimal meta that carries neither.  Evaluating
+        # it unconditionally would make a caller that asked for nothing
+        # new fail on an attribute it never needed.
+        fft_grid=getattr(meta, "fft_grid", None), print_fn=print_fn,
+        context="W0 restart tensor")
     write_w0_qmunu_to_h5(tensors_filename, W_q,
                          n_rmu_logical=int(meta.n_rmu),
-                         mesh=mesh_xy)
+                         mesh=mesh_xy,
+                         qirr=_qirr.with_capture(
+                             take_pre_unfold("W0_qmunu")))
     head_static = head_resolver.at(0.0 + 0.0j)
     if config.compute_mode.is_dynamic:
         # GN-PPM: probe at iωp on the imaginary axis.

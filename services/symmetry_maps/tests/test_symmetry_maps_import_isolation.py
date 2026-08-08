@@ -21,7 +21,8 @@ have — and the second is what makes the first evidence about the package
 rather than about this machine.
 
 WHAT IS HANDED TO THE CHILD, AND WHY.  ``pyproject.toml`` declares
-``lxkit``, ``jax`` and ``numpy``.  jax is not a concession: ``unfold_v_q``
+``lxkit``, ``jax`` and ``numpy``.  jax is not a concession:
+``unfold_isdf_operator``
 is a ``shard_map`` over an ``('x','y')`` mesh and ``maps.py`` imports it at
 module scope.  Anything NOT declared — ``h5py`` above all, which this
 suite's own deck tier needs and the PACKAGE does not — must stay

@@ -164,8 +164,11 @@ def compute_static_w(
     + TRS conj under sym).  Explicit-full-BZ debug bypass
     (``LORRAX_FORCE_FULL_BZ=1``) matches the V_q gate and is ANNOUNCED
     when it flips this decision; IBZ activation otherwise depends only on
-    orbit-closure of the centroid set (checked downstream in
-    ``_resolve_ibz_q_list``).
+    orbit-closure of the centroid set, resolved and ANNOUNCED once per run
+    in ``gw.qgrid_symmetry`` (reached through ``_resolve_ibz_q_list``).
+    Until 2026-08-08 this site passed ``verbose=False`` into that helper
+    and a non-closed centroid set dropped the Dyson solve from
+    ``n_q_ibz`` blocks to ``n_q_full`` in total silence.
 
     Parameters
     ----------
@@ -259,7 +262,7 @@ def compute_static_w(
             sym=sym, centroid_indices=centroid_indices,
             kgrid=tuple(meta.kgrid),
             fft_grid=tuple(meta.fft_grid),
-            verbose=False)
+            context=f"W[{role}] Dyson solve q-grid reduction")
     else:
         use_ibz_w = False
 
@@ -374,14 +377,28 @@ def compute_static_w(
             if use_ibz_w:
                 from ffi import _services
                 _services.ensure_on_path()
-                from symmetry_maps import unfold_v_q
+                from symmetry_maps import unfold_isdf_operator
                 with timing.section(
                         "W.unfold_to_full_bz", announce=True,
                         label=f"{_w} IBZ -> full-BZ unfold "
                               f"({nq_solve} q -> {int(meta.nk_tot)} q)"):
                     n_sym_spatial = int(
                         np.asarray(sym_perm).shape[0]) // 2
-                    W_q = unfold_v_q(
+                    # W's PRE-UNFOLD BLOCK, offered to whoever is writing
+                    # the restart — same contract, same reason, same
+                    # no-op-outside-a-scope as the V site in v_q_g_flat.
+                    # This is the array ``persist_w0_and_head`` stores when
+                    # the resolution says wedge; slicing the unfolded W
+                    # instead would be a different array whose equality to
+                    # this one depends on the op-selection policy.
+                    from .restart_q_storage import deposit_pre_unfold
+                    deposit_pre_unfold(
+                        "W0_qmunu", W_q_solve,
+                        n_rmu_logical=int(meta.n_rmu),
+                        q_irr_frac=q_irr_frac, irr_idx_q=full_to_irr_idx,
+                        sym_idx_q=full_to_irr_sym, sym_perm=sym_perm,
+                        L_table=L_table, n_sym_spatial=n_sym_spatial)
+                    W_q = unfold_isdf_operator(
                         W_q_solve,
                         irr_idx=full_to_irr_idx,
                         sym_idx=full_to_irr_sym,
