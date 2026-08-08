@@ -131,7 +131,10 @@ One corollary fell out of that same run and belongs with the reference rather
 than with this script: `tests/test_bse_bgw_regression.py::test_bse_matches_frozen_and_bgw`
 fails on Perlmutter at max |Δ| = 4.4887 meV, 12 of 20 cells over its 1e-6 eV
 pin — and fails **identically** with `restart_q_storage = full` pinned in the
-deck, so it is neither the wedge nor anything else on this branch. `conftest.py`
+deck. Run at the gate's own configuration (one GPU, px=py=2) the two arms are
+not merely equally wrong but `array_equal`: max |Δ| = 0.000000 meV between them,
+both 4.4887 meV from the reference. So it is neither the wedge nor anything
+else on this branch. `conftest.py`
 pins the pytest process to one GPU, while `fb046e0c` cut the reference from two
 4-process script runs and recorded, as its own honest limit, that it could not
 run the gate; the reference has never been seen by the gate that pins it. The

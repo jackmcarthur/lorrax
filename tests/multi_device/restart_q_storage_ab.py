@@ -115,7 +115,10 @@ AND THE COROLLARY THAT FELL OUT OF IT, recorded here because it is about the
 reference rather than about this script: `tests/test_bse_bgw_regression.py::
 test_bse_matches_frozen_and_bgw` fails on Perlmutter at exactly that
 4.4887 meV / 12-of-20, and fails IDENTICALLY with `restart_q_storage = full`
-pinned in the deck — so it is not the wedge and not this branch.  `conftest.py`
+pinned in the deck.  Re-run at the gate's own configuration (one GPU, px=py=2)
+the two arms are not merely equally wrong but `array_equal` — max |Delta| =
+0.000000 meV between them, both 4.4887 meV from the reference — so it is not
+the wedge and not this branch.  `conftest.py`
 pins the pytest process to ONE GPU, while `fb046e0c` cut the reference from two
 4-process script runs and recorded, as its own honest limit, that it could not
 run the gate.  The reference has therefore never been seen by the gate that
