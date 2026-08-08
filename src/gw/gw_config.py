@@ -633,6 +633,27 @@ _DEFAULTS = {
     # Suppressing the write makes the file ABSENT, which is the loudest of
     # the states those guards distinguish.
     "write_restart_tensors": True,
+    # ``restart_q_storage``: on WHICH q-set are V_qmunu / W0_qmunu stored?
+    # DEFAULT auto — and auto is a default that MOVES BYTES, which is why it
+    # is spelled out here rather than left to the module docstring.
+    #   auto — store the pre-unfold IBZ wedge when the deck's centroid set is
+    #          orbit-closed AND this run's q path actually reduced; the full
+    #          BZ otherwise.  On a non-closed set (today's Si production
+    #          960-centroid deck: 47 of 48 ops violating) this is byte-for-byte
+    #          today's file.  On a CLOSED set it is ~8x smaller, and the load
+    #          path unfolds it back through the same
+    #          ``symmetry_maps.unfold_isdf_operator`` the run itself used —
+    #          which is the continuous exercise of the fold/unfold machinery
+    #          the owner asked for.
+    #   full — preserve today's bytes exactly, unconditionally.  Does not ask
+    #          the closure question, so it is the control arm of any A/B.
+    #   ibz  — REFUSE on a set that is not storable, naming which of the two
+    #          conditions failed.  For a deck that believes it is closed and
+    #          wants to be told the day it stops being.
+    # See gw/restart_q_storage.py for the resolution and the seam, and
+    # DESIGN_symmetry_restart_followup.md for the pre-unfold-persistence
+    # decision this key selects.
+    "restart_q_storage": "auto",
     # ``compute_mode`` is the single axis describing the self-energy ansatz.
     # ``"auto"`` infers from the legacy ``do_screened`` / ``use_ppm_sigma`` /
     # ``ppm_model`` flags so existing input files keep working unchanged.
@@ -1067,6 +1088,11 @@ _NORMALIZE_STR = {
     "ppm_invalid_mode",
     "ppm_model",
     "ppm_probe_chi_reuse",
+    # ``restart_q_storage`` normalises here and is VALIDATED at parse time
+    # against RESTART_Q_STORAGE, the same shape ``hartree_source`` uses: a
+    # key whose wrong value would otherwise surface as a refusal deep in the
+    # restart write, after the compute.
+    "restart_q_storage",
     # distributed-linalg backend axes (consumed both via LorraxConfig and
     # directly from the params dict by htransform / exciton_bands).
     "eigh_backend",
@@ -1741,6 +1767,11 @@ class LorraxConfig:
     #: behaviour; see ``_DEFAULTS["write_restart_tensors"]`` for why this is
     #: a COMPLEMENT to q_irr storage and not an alternative to it.
     write_restart_tensors: bool
+    #: RAW ``restart_q_storage`` request — "auto" | "full" | "ibz".  Validated
+    #: at parse time, resolved LATE (``gw.restart_q_storage``): ``auto``'s
+    #: answer depends on the run's centroid set, which does not exist yet
+    #: here.  Same ``_raw`` convention as ``compute_mode_raw``.
+    restart_q_storage_raw: str
     compute_mode_raw: str         # "auto" | one of ComputeMode.value strings
     qp_solver_raw: str            # "auto" | one of QPSolver.value strings
     do_screened: bool
@@ -2245,6 +2276,24 @@ class LorraxConfig:
                 f"hartree_source={_hartree_source!r} is not one of "
                 f"{HARTREE_SOURCES}.  H0 = kin_ion + V_H is a ~500 eV "
                 "cancellation; this key is not guessed.")
+        # Same treatment, same reason, for the restart q-set.  Validated
+        # here and NOT resolved here: ``auto`` resolves against the closure
+        # answer, which needs the run's centroid set and its symmetry
+        # tables, so the field below is the RAW request and
+        # ``gw.restart_q_storage.resolve_restart_q_storage`` turns it into a
+        # mode once those exist.  (``hartree_source`` can be stored resolved
+        # because its ``auto`` resolves against a file already on disk; this
+        # one cannot, and the ``_raw`` suffix says which kind it is — the
+        # same convention ``compute_mode_raw`` / ``qp_solver_raw`` use.)
+        from gw.restart_q_storage import RESTART_Q_STORAGE
+        _restart_q_storage = str(
+            _g("restart_q_storage") or "auto").strip().lower()
+        if _restart_q_storage not in RESTART_Q_STORAGE:
+            raise ValueError(
+                f"restart_q_storage={_restart_q_storage!r} is not one of "
+                f"{RESTART_Q_STORAGE}.  This key selects the q-set the "
+                "restart tensors are STORED on; a value nobody recognises "
+                "is not silently read as the default.")
 
         debug = DebugConfig(
             sigma_freq_debug_output=bool(_g("sigma_freq_debug_output")),
@@ -2274,6 +2323,7 @@ class LorraxConfig:
             hartree_source=_hartree_source,
             restart=bool(_g("restart")),
             write_restart_tensors=bool(_g("write_restart_tensors")),
+            restart_q_storage_raw=_restart_q_storage,
             compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
             qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
             do_screened=bool(_g("do_screened")),
