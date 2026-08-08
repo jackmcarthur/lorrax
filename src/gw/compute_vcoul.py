@@ -11,9 +11,9 @@ what the live G-flat V_q path needs:
   dimensionality in :mod:`gw.coulomb`, shared with that package's
   ``CoulombKernel.v_qG``.  There is no second implementation to keep in
   step any more.
-* :func:`build_v_head_miniBZ_avg_3d` — the 3D mini-BZ-averaged
-  ``<v(q, G=0)>`` head table injected into ``compute_v_q_per_G`` for
-  bulk systems.
+* :func:`build_v_head_miniBZ_fn_3d` — the 3D mini-BZ-averaged Coulomb
+  head ``<v(K + δq)>_miniBZ`` as a function of the Cartesian ``K = q+G``,
+  injected into ``compute_v_q_per_G`` for bulk systems.
 * :func:`compute_all_V_q` — the thin dispatcher: for a G-flat on-disk ζ
   it hands off to :func:`gw.v_q_g_flat.compute_all_V_q_g_flat`; any
   other layout raises ``NotImplementedError``.
@@ -34,53 +34,101 @@ from jax.sharding import Mesh
 from file_io.paths import resolve_input_path
 
 
-def build_v_head_miniBZ_avg_3d(
+def build_miniBZ_dq_cart(
+    kgrid: tuple[int, int, int],
+    bvec: np.ndarray,
+    *,
+    nmc: int = 2**18,
+    seed: int = 42,
+) -> np.ndarray:
+    """CENTROSYMMETRIC Monte-Carlo sample of the mini-BZ, Cartesian.
+
+    Returns ``(2 * nmc, 3)`` offsets δq filling the Voronoi cell of the
+    mini-BZ, as the union of an ``nmc``-point draw with its own negation.
+
+    The centrosymmetry is LOAD-BEARING, not cosmetic.  The head injected
+    at a slot is ``⟨v(K + δq)⟩``, and ``V_q = conj(V_{−q})`` requires the
+    injected value to satisfy ``f(K) = f(−K)``.  Since
+    ``⟨v(−K + δq)⟩ = ⟨v(K − δq)⟩``, that identity holds EXACTLY iff the
+    finite sample set obeys ``{δq} = {−δq}``.  The historical one-sided
+    draw (``rng.uniform(0, 1, ...)`` then Voronoi-wrapped) is symmetric
+    only in the ``nmc → ∞`` limit, so it left an MC-noise-sized residual
+    in reciprocity even once the slot selection was right.
+    """
+    from .vcoul import wrap_points_to_voronoi
+    kgrid_arr = np.array([int(s) for s in kgrid], dtype=np.float64)
+    bvec = np.asarray(bvec, dtype=np.float64)
+    bvec_j = jnp.asarray(bvec, dtype=jnp.float64)
+    rng = np.random.RandomState(seed)
+    randvals = rng.uniform(0, 1, (int(nmc), 3))
+    # ``u @ bvec``, i.e. bvec ROWS are the lattice vectors — the convention
+    # of ``randlims`` below and of ``q_frac @ bvec`` elsewhere in this
+    # module, and identical to the sanctioned sampler
+    # ``gw.coulomb.base.minibz_voronoi_batches`` (``(bvec.T @ u.T).T``).  The
+    # pre-2026-08-08 line here was ``randvals @ bvec.T`` — the transpose,
+    # i.e. bvec COLUMNS.  That is a fundamental domain of the row lattice
+    # only for special cells.  MEASURED, folded-fractional coords of 200k
+    # points (uniform on the Voronoi cell => mean 0.5, var 1/12 = 0.08333):
+    #   fcc Si   old mean [.5002 .5005 .4998] var [.08338 .08312 .08323]
+    #            new mean [.4998 .5002 .5005] var [.08323 .08338 .08312]
+    #            -> both uniform, same distribution up to an axis permutation
+    #   hexagonal old mean [.4994 .5427 .5005] var [.08342 .06334 .08312]
+    #            -> NOT uniform: off-centre on b2, variance off by ~24%
+    # Corrected here because this restructuring stands on the line; the
+    # defect was latent (no 3D non-cubic fixture exists — every hexagonal
+    # fixture is sys_dim=2, where this table is not built) and this is the
+    # only behaviour change in this function beyond centrosymmetrisation.
+    # On Si the head it produces shifts by ~1.5e-4 relative, which MEASURED
+    # sits inside the seed-to-seed spread of the sampler itself.
+    randcart = randvals @ bvec
+    wrapped = np.asarray(wrap_points_to_voronoi(
+        jnp.asarray(randcart), bvec_j, nmax=1))
+    randlims = bvec.T @ (np.diag(1.0 / kgrid_arr) @ np.linalg.inv(bvec.T))
+    dq = (randlims @ wrapped.T).T          # (nmc, 3) mini-BZ offsets, Cartesian
+    return np.concatenate([dq, -dq], axis=0)
+
+
+def build_v_head_miniBZ_fn_3d(
     kgrid: tuple[int, int, int],
     bvec: np.ndarray,
     cell_volume: float,
     *,
     nmc: int = 2**18,
     seed: int = 42,
-) -> np.ndarray:
-    """Mini-BZ-averaged bare Coulomb head ``<v(q+δq, G=0)>_miniBZ`` per q.
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Mini-BZ-averaged bare Coulomb head as a function of Cartesian ``q+G``.
 
-    3D bulk only.  Returns ``(nkx, nky, nkz)`` real array of head values
-    in Rydberg / cell-volume units.  q=0 returns 0 (the actual head is
-    injected separately via a rank-1 correction in the Σ_X path).
+    3D bulk only.  Returns ``head_fn(K_cart) -> (m,) float64``, where
+    ``K_cart`` is ``(m, 3)`` Cartesian ``q+G`` and the value is
+    ``⟨8π/|K + δq|²⟩_miniBZ / Ω_cell`` in Rydberg.  This is the
+    ``v_head_fn`` argument of :func:`compute_v_q_per_G` /
+    :func:`gw.coulomb.base.v_qG_table`, which evaluates it at every slot
+    attaining ``argmin |q+G|²`` — see that function's HEAD SLOT note for
+    why the selection is by argmin and why ALL of the argmin.
 
-    The MC integration draws ``nmc`` (default 2¹⁸) points uniformly on
-    the Voronoi cell of the mini-BZ and averages ``8π/|q+δq|²``.  The
-    G-flat path (:func:`compute_v_q_per_G`, called from
-    :func:`gw.v_q_g_flat.compute_all_V_q_g_flat`) consumes this table
-    as the ``v_head_miniBZ`` argument.
+    This REPLACES the pre-2026-08-08 ``build_v_head_miniBZ_avg_3d``, which
+    returned a ``(nkx, nky, nkz)`` table indexed by the BGW-wrapped q
+    index.  That shape was unfixable: a per-q value is attached to
+    ``q_frac @ bvec``, which is NOT the argmin ``q+G`` on 12 of Si's 64 q,
+    and it carries no per-slot resolution — the caller must evaluate the
+    head at each tied slot's own K before it can average over the tied set.
+
+    ``f(K) = f(−K)`` holds to machine precision here because
+    :func:`build_miniBZ_dq_cart` is centrosymmetric; Γ is not special-cased
+    (the caller skips it — the q→0 head is the separate rank-1 Σ_X term).
     """
-    from .vcoul import wrap_points_to_voronoi
-    nkx, nky, nkz = (int(s) for s in kgrid)
-    bvec_j = jnp.asarray(bvec, dtype=jnp.float64)
-    rng = np.random.RandomState(seed)
-    randvals = rng.uniform(0, 1, (nmc, 3))
-    randcart = (randvals @ bvec.T)
-    wrapped = np.asarray(wrap_points_to_voronoi(
-        jnp.asarray(randcart), bvec_j, nmax=1))
-    kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
-    randlims = bvec.T @ (np.diag(1.0 / kgrid_arr) @ np.linalg.inv(bvec.T))
-    dq_cart = (randlims @ wrapped.T).T  # (nmc, 3) mini-BZ offsets in Cartesian
+    dq_cart = build_miniBZ_dq_cart(kgrid, bvec, nmc=nmc, seed=seed)
+    fact = 1.0 / float(cell_volume)
 
-    v_head_avg = np.zeros((nkx, nky, nkz), dtype=np.float64)
-    for qx in range(nkx):
-        for qy in range(nky):
-            for qz in range(nkz):
-                qw = np.array([qx, qy, qz], dtype=np.float64)
-                qw = np.where(qw > kgrid_arr / 2, qw - kgrid_arr, qw)
-                q_frac = qw / kgrid_arr
-                q_cart = q_frac @ bvec
-                if np.dot(q_cart, q_cart) < 1e-12:
-                    v_head_avg[qx, qy, qz] = 0.0  # q=0 head handled separately
-                else:
-                    shifted = q_cart[None, :] + dq_cart  # (nmc, 3)
-                    denom = np.sum(shifted**2, axis=1)
-                    v_head_avg[qx, qy, qz] = np.mean(8.0 * np.pi / denom)
-    return v_head_avg * (1.0 / float(cell_volume))
+    def head_fn(K_cart: np.ndarray) -> np.ndarray:
+        K = np.asarray(K_cart, dtype=np.float64).reshape(-1, 3)
+        out = np.empty(K.shape[0], dtype=np.float64)
+        for i in range(K.shape[0]):
+            shifted = K[i][None, :] + dq_cart          # (2*nmc, 3)
+            out[i] = np.mean(8.0 * np.pi / np.sum(shifted * shifted, axis=1))
+        return out * fact
+
+    return head_fn
 
 
 def compute_v_q_per_G(
@@ -93,7 +141,7 @@ def compute_v_q_per_G(
     vcoul_cutoff_ry: float | None = None,
     bdot: np.ndarray | None = None,
     fft_grid: np.ndarray | None = None,
-    v_head_miniBZ: np.ndarray | None = None,
+    v_head_fn: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> np.ndarray:
     """Compute ``v(q+G)`` at the per-q WFN.h5-style G-list.
 
@@ -157,7 +205,7 @@ def compute_v_q_per_G(
         get_kernel(sys_dim), q_irr_frac, gvec_components,
         bvec=bvec, cell_volume=cell_volume,
         vcoul_cutoff_ry=vcoul_cutoff_ry,
-        v_head_miniBZ=v_head_miniBZ,
+        v_head_fn=v_head_fn,
         bdot=bdot, fft_grid=fft_grid,
     )
 
