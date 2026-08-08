@@ -25,6 +25,7 @@ from solvers.lanczos import (
 )
 from .bse_serial import apply_bse_hamiltonian_single_device
 from .bse_ring_comm import make_bse_shardings
+import common.timing as timing
 
 
 def solve_bse(
@@ -168,9 +169,10 @@ def solve_bse_sharded(
     # The legacy ``matvec_kind`` selector is retired here; see the retirement
     # note in bse_stack_matvec (ring/gather/simple + selector deletion pending).
     from .bse_stack_matvec import build_bse_stack_matvec
-    matvec_ring = build_bse_stack_matvec(
-        mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
-    )
+    with timing.section("bse.solve.matvec_build"):
+        matvec_ring = build_bse_stack_matvec(
+            mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
+        )
 
     # W_R = ifft_q(W_q) computed ONCE inside the outer jit. Use the
     # gw_jax custom-partitioned IFFT helper — plain ``jnp.fft.ifftn`` on
@@ -201,9 +203,11 @@ def solve_bse_sharded(
     # drop the Python reference, so only ONE copy survives into the solve.
     # Value-identical: same helper, same axes, same norm, same operand.
     if include_W:
-        _W_ifft_donated = jax.jit(_W_local_ifftn, donate_argnums=(0,))
-        W_R = _W_ifft_donated(data["W_q"])
-        data["W_q"] = None          # release the caller-side reference
+        with timing.section("bse.solve.W_ifft") as _sec_wifft:
+            _W_ifft_donated = jax.jit(_W_local_ifftn, donate_argnums=(0,))
+            W_R = _W_ifft_donated(data["W_q"])
+            data["W_q"] = None          # release the caller-side reference
+            _sec_wifft.watch(W_R)
     else:
         W_R = data["W_q"]
 
@@ -350,12 +354,22 @@ def solve_bse_sharded(
                 )
                 return evs, evecs, jnp.int32(max_iter)
 
-    eigenvalues, eigenvectors, n_iter_done = _full_run(
+    # ONE program: trace + XLA compile + the entire Krylov loop's execution.
+    # Split compile from execution by lowering/compiling first, so the two
+    # costs the campaign A/Bs are separately visible instead of fused into
+    # ``bse.eigensolve``.  Value-identical: the same jit, the same operands.
+    _args = (
         data["psi_c_X"], data["psi_c_Y"],
         data["psi_v_X"], data["psi_v_Y"],
         data["eps_c"], data["eps_v"],
         W_R, data["V_q0"],
         data["M_X"], data["M_Y"],
     )
+    with timing.section("bse.solve.krylov_compile"):
+        _full_run_c = _full_run.lower(*_args).compile()
+    with timing.section("bse.solve.krylov_run") as _sec_kr:
+        eigenvalues, eigenvectors, n_iter_done = _full_run_c(*_args)
+        _sec_kr.watch(eigenvalues)
+        _sec_kr.watch(eigenvectors)
     eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
     return eigenvalues, eigenvectors, n_iter_done
