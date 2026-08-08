@@ -54,9 +54,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from vcoul import compute_vcoul_box
 from gw.gw_init import read_cohsex_input
 from gw.vcoul import compute_q0_averages
+# AFTER the gw imports on purpose: importing any gw module runs the
+# service path bootstrap that puts services/*/src on sys.path; the door
+# import placed first died with ModuleNotFoundError under the documented
+# PYTHONPATH=src environment (measured by the blind audit arm).
+from vcoul import compute_vcoul_box
 from file_io import EPSReader, WFNReader, resolve_input_paths
 
 RYD2EV = 13.6056980659

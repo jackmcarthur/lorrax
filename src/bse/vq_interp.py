@@ -1176,12 +1176,13 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     scalar supplies the magnitude only.
 
     ONE source of truth for the PHYSICS: the bare LR-slab kernel is
-    :func:`gw.coulomb.base._minibz_kernel_bare` (the same
+    :func:`vcoul._minibz_kernel_bare` (the same
     ``8π·f2d·e^{−K²/4α²}/|K|²`` GW's Coulomb head uses), the mini-BZ affine
-    wrap is :func:`gw.vcoul.wrap_points_to_voronoi` + the same
-    ``randlims`` map as :func:`gw.coulomb.base.minibz_voronoi_batches`, and
+    wrap is :func:`vcoul.wrap_points_to_voronoi` + the same
+    ``randlims`` map as :func:`vcoul.minibz_voronoi_batches` (all through
+    the service door since the 2026-08-07 replumb), and
     the inscribed-sphere / adaptive-``n_q`` rule matches
-    :func:`gw.coulomb.base.minibz_average` (``minibzaverage.f90:63-75``).
+    :func:`vcoul.minibz_average` (``minibzaverage.f90:63-75``).
 
     RANK-PARALLELISM (this routine used to run the FULL serial host Sobol QMC
     redundantly on every process): the estimator is the mean of the bare
