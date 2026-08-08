@@ -51,7 +51,10 @@ from common.mtxel_sweep import (SweepGeometry, band_sphere_spec,  # noqa: E402
                                 kinetic_operator,
                                 sweep_matrix_elements,
                                 blocks_to_host)
-from file_io.wfn_loader import WfnLoader                       # noqa: E402
+from ffi import _services      # noqa: F401,E402  (path bootstrap; dies
+                                 # with the owner's workspace fix)
+_services.ensure_on_path()
+from wfn_loader import WfnLoader                               # noqa: E402
 from psp.dft_operators import padded_gvectors                  # noqa: E402
 
 DECK = os.environ.get("STAR_DECK", "").strip()

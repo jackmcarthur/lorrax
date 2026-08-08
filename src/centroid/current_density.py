@@ -141,8 +141,10 @@ def build_current_density(wfn, sym, n_occ: int, *,
     # WfnLoader covers per-k unfold (U_spinor + τ-phase + TRS-conj) +
     # G-vector rotation in one place; the per-ik loop stays so the
     # full ψ_all × full-BZ-k slab never has to fit in host RAM.
-    from file_io.wfn_loader import WfnLoader
-    with WfnLoader(wfn._filename) as loader:
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
+    with WfnLoader(wfn.path) as loader:
         gvecs_full = loader.gvecs(k="full_bz")        # (nk_full, ngkmax, 3)
         ngk_valid = loader.ngk_valid(k="full_bz")     # (nk_full,)
         for ik in range(nk_full):

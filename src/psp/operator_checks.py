@@ -24,7 +24,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from file_io import WfnLoader as WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -38,7 +43,7 @@ class OperatorContext:
 
 def validate_operator_inputs(
     pseudos: dict,
-    wfn: WFNReader,
+    wfn: WfnLoader,
     sys_dim: int = 3,
     *,
     caller: str = "",

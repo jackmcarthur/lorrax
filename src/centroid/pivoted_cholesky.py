@@ -51,7 +51,12 @@ from common.shard_map import shard_map
 from jax.experimental import multihost_utils as _mh
 from functools import partial
 
-from file_io import WfnLoader as WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from common import symmetry_maps, timing
 from common.collectives import device_put_process_local
 
@@ -156,7 +161,7 @@ def pivoted_cholesky_select(
 
 
 def prune_candidates_by_pivoted_cholesky(
-    wfn: WFNReader,
+    wfn: WfnLoader,
     sym: symmetry_maps.SymMaps,
     cand_idx: np.ndarray,
     n_keep: int,
@@ -614,7 +619,7 @@ def make_sharded_pivoted_cholesky_select(
 
 
 def build_gram_q0_via_loadwfns(
-    wfn: WFNReader,
+    wfn: WfnLoader,
     sym: symmetry_maps.SymMaps,
     cand_idx: jnp.ndarray,
     n_val: int | None = None,

@@ -37,7 +37,12 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
 sys.path.insert(0, os.path.join(project_root, "src"))
 
-from file_io import WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from common.symmetry_maps import SymMaps
 
 
@@ -150,7 +155,7 @@ def compute_current_density(wfn_file, output_h5=None, plot_slices=True, plot_dir
         j_r: Current density array (3, nx, ny, nz) in atomic units
     """
     print(f"Loading wavefunction file: {wfn_file}")
-    wfn = WFNReader(wfn_file)
+    wfn = WfnLoader(wfn_file)
     sym = SymMaps(wfn)
     
     # System info

@@ -132,7 +132,8 @@ any of them ([Perlmutter §1](environment/machines/perlmutter.md#1-entry-point-l
     the chain today, not the fix.
 
     **Step 1 ignores `wfn_file` and reads `WFN.h5`.** The filename is hardcoded
-    (`centroid/kmeans_cli.py:422`, `WFNReader("WFN.h5")`) and there is no CLI flag to
+    (`centroid/kmeans_cli.py:427`, `WfnLoader("WFN.h5")` — the spelling changed with
+    the 2026-08-07 service extraction, the defect did not) and there is no CLI flag to
     override it — the parser has no `--wfn`. If your wavefunction is named anything else,
     including the fixture's own `WFNsmall.h5`, you get a naked traceback ending in
     `FileNotFoundError: … name = 'WFN.h5'` from inside h5py, with none of the

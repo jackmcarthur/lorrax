@@ -53,7 +53,7 @@ passes. **This page is the other half of the same material — what a
 | **`ffi.io`** — parallel HDF5 | `open_file(path, mesh=, mode=)` → `write_sharded_slab` / `read_sharded_slab` | collective MPI-IO straight to a hyperslab; no rank-0 gather | cray-hdf5-parallel + Cray MPICH / phdf5 + Intel MPI; CUDA vs host `.so` | no — the platform comes from the mesh's devices | GATE 1, GATE 7 |
 | **`ffi.common.ffi_loader`** — the meta-service | `get_lib(platform)`, `probe_target(target, platform)` | a three-way reason for every failure: unknown target / library would not load / library loaded but exports no such handler | `liblorrax_ffi.so` vs `liblorrax_ffi_host.so`; per-site RPATH | no; `LORRAX_FFI_SO` / `_HOST_SO` pin a path, and since 2026-08-06 a **set-but-missing pin refuses** rather than falling through | every other service's refusal quotes it |
 | **`common.collectives`** | `prepare_mesh()`, `gather_k_blocks()` | the run's mesh with every communicator it will need already created | NCCL on CUDA; MPI — **not gloo** — on CPU ([transports](../environment/transports.md)) | no — `JAX_CPU_COLLECTIVES_IMPLEMENTATION` is a deployment fact, not a call-site choice | run-time, not build-time: `psum_scatter_checked` returns a Freivalds residual, because gloo's `reduce_scatter` is measured to return **wrong values** |
-| **`file_io.wfn_loader`** | `WfnLoader(...).load(...)` | ψ(G) in the G-flat layout, byte-identical between backends | `eager` (h5py + numpy) vs `phdf5` (collective FFI + on-device unfold) | **escape hatch only** — `LORRAX_WFN_BACKEND`; the parity contract is what makes the choice safe to expose | `tests/bench/wfn_loader_backend_parity_test.py` (byte-identical) |
+| **`wfn_loader`** (wave-1 service; `file_io.wfn_loader` is now a transitional shim) | `WfnLoader(...).load(...)` | ψ(G) in the G-flat layout, byte-identical between backends | `eager` (h5py + numpy) vs `phdf5` (**`SlabIO.read_slabs`** — one collective MPI-IO read over the k-window union, on-device unfold) | **escape hatch only** — `LORRAX_WFN_BACKEND`; the parity contract is what makes the choice safe to expose | `pytest -m wfn_loader`; `tests/bench/wfn_loader_backend_parity_test.py` (byte-identical, atol 0.0).  Reference: [docs/services/wfn_loader.md](../services/wfn_loader.md) |
 | **`common.jax_compile_cache`** | `ensure_jax_compile_cache()`, once, right after `runtime.bootstrap()` | a persistent compile cache that is safe across processes | filesystem (Lustre `$SCRATCH` vs `~/.cache`), world size, jaxlib generation | no | `tests/test_compile_cache_agreement.py`, with a `LORRAX_JAX_CACHE_FORCE_DIVERGE` positive control |
 | **`runtime`** | `initialize_communicator_stack()` | one ordered bootstrap; every choice with more than one possible outcome is printed on rank 0 | allocator, plugin discovery, CPU-vs-GPU backend, glibc malloc | no | `tests/test_runtime_startup_report.py` — a dial absent from the report fails |
 
@@ -140,7 +140,7 @@ the deck parser cannot drift from the thing it configures. **The other two
 keys hardcode their vocabularies** and can drift; that is a defect in
 them, not a second design.
 
-**A third position: `file_io.wfn_loader`** exposes `LORRAX_WFN_BACKEND`
+**A third position: `wfn_loader`** exposes `LORRAX_WFN_BACKEND`
 (`eager` vs `phdf5`) as an *escape hatch*, not a tuning dial. That is only
 defensible because the two backends are held **byte-identical** by a
 parity test — the choice cannot change an answer, only how it was
@@ -756,9 +756,17 @@ consumed by `isdf/core`, `gw/w_isdf`, `bandstructure/bse_setup`,
 
 **Purpose.** The MPI-IO handlers themselves: each process reads and writes
 its own hyperslab of a shared HDF5 file, with no gather through rank 0.
-`file_io.slab_io` is the physics-facing service over this one; **`ffi.io`
-has a second, independent consumer in `file_io.wfn_loader`**, which is why
-it is listed separately rather than folded into SlabIO.
+`file_io.slab_io` is the physics-facing service over this one.  It USED
+to have a second, independent consumer in `file_io.wfn_loader`, and that
+was the reason it is listed separately rather than folded into SlabIO.
+**No longer true since the wave-1 wfn_loader extraction (2026-08-07):**
+the union read was promoted into the `slab_io` door as `read_slabs`, and
+the loader now carries no FFI target name, no ctx handle and no phdf5
+spelling — `grep -rn "ffi\.phdf5\|read_kchunk\|lorrax_phdf5"
+services/wfn_loader/src/` is empty, and `tests/test_layering.py` fails if
+it stops being.  SlabIO is now the ONLY consumer, so the separate listing
+is history rather than structure.  See
+[docs/services/wfn_loader.md](../services/wfn_loader.md).
 
 **Public API** (`src/ffi/io.py`):
 
@@ -784,11 +792,16 @@ different mode**. No `Gate`, no env dial.
 
 **Migration note.** `ffi.phdf5` is four re-export shims over this module,
 and their own docstring says deleting the shim is the gate that the
-migration is complete. **That gate is not met, and no production module
-has migrated**: every importer under `src/` still reaches `ffi.phdf5` —
-`file_io/_slab_io_ffi.py` (4 sites) and `file_io/wfn_loader.py` (3) —
-and `src/` contains **zero** direct imports of `ffi.io`. Only tests import
-the new name.
+migration is complete. **The gate is still not met, but it moved on
+2026-08-07**: `ffi.phdf5` references outside `src/ffi/` are down from 10 to
+**5, all of them in `file_io/_slab_io_ffi.py`** (3 imports + 2 in prose).
+`file_io/wfn_loader.py` no longer has any — the wave-1 extraction moved the
+union read behind `SlabIO.read_slabs`, so the loader reaches phdf5 through
+the door or not at all. `src/` now also contains its FIRST direct import of
+the new name (`_slab_io_ffi.py:2087`, `from ffi.io import
+read_kchunk_union_sharded`), so the remaining work is one file. Re-derive
+with `grep -rn "ffi\.phdf5" src/ services/*/src/ --include=*.py | grep -v
+'^src/ffi/'`.
 
 ---
 

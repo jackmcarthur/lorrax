@@ -52,7 +52,12 @@ _SRC = Path(__file__).resolve().parents[1]
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from file_io import WfnLoader as WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from common import symmetry_maps, Meta
 from common.wfn_transforms import load_kpoint_fftbox
 from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
@@ -477,7 +482,7 @@ def main(argv=None):
 
     wfn_path = Path(args.wfn).resolve()
     print(f"\n[orbmag] WFN: {wfn_path}")
-    wfn = WFNReader(str(wfn_path))
+    wfn = WfnLoader(str(wfn_path))
     sym = symmetry_maps.SymMaps(wfn)
 
     nspinor = int(wfn.nspinor)

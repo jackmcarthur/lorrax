@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import argparse
 
-from file_io import WfnLoader as WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from common.symmetry_maps import SymMaps
 
 
@@ -15,7 +20,7 @@ def _status_line(label: str, passed: bool, detail: str) -> str:
 
 def run_symmetry_test(wfn_path: str, tol: float = 1e-6) -> int:
     """Run symmetry audits and print a compact PASS/FAIL report."""
-    wfn = WFNReader(wfn_path)
+    wfn = WfnLoader(wfn_path)
     sym = SymMaps(wfn)
 
     atom_failures = sym.validate_atomic_symmetries(wfn, tol=tol)

@@ -254,11 +254,11 @@ cnk   = einsum('jk,nkl->njl', U_eff, cnk)
 
 For non-SOC (`ns = 1`, `nspinor = 1`) the spinor rotation is a 1×1 identity and the TRS branch reduces to plain conjugation. The bispinor branch (`ns = 2`) is the load-bearing one; CrI3 6×6 SOC, MoS2 3×3 SOC, and Si 4×4×4 SOC all exercise it.
 
-`unfold_psi` returns the rotated coefficients indexed by the **IBZ** G-axis: `cnk_full[b, σ, g]` corresponds to the rotated G-vector $S \cdot g_{\bar k}[g]$. The caller (`WfnLoader.gvecs`, `src/file_io/wfn_loader.py`) rebuilds the full-k G-list including the umklapp $\mathbf{k}_{g_0}$. This separation keeps the helper pure and avoids the recurring "re-sorted G list but forgot to re-sort the phase" bug class.
+`unfold_psi` returns the rotated coefficients indexed by the **IBZ** G-axis: `cnk_full[b, σ, g]` corresponds to the rotated G-vector $S \cdot g_{\bar k}[g]$. The caller (`WfnLoader.gvecs`, `services/wfn_loader/src/wfn_loader/loader.py`) rebuilds the full-k G-list including the umklapp $\mathbf{k}_{g_0}$. This separation keeps the helper pure and avoids the recurring "re-sorted G list but forgot to re-sort the phase" bug class.
 
 ### 3.4 What Lives Where
 
-After PR5 the public unfold helpers (`get_gvecs_kfull`, `get_cnk_fullzone[_batch]`) moved into `file_io.wfn_loader.WfnLoader`. Both the eager and phdf5 backends call `unfold_psi` for the spinor + phase, and each handles the G-rebuild + umklapp internally. `SymMaps` retains the sym table itself (`sym_matrices`, `sym_mats_k`, `translations`, `R_cart`, `U_spinor`) and the IBZ k/q maps.
+After PR5 the public unfold helpers (`get_gvecs_kfull`, `get_cnk_fullzone[_batch]`) moved into `WfnLoader`, which since 2026-08-07 lives in `services/wfn_loader/` (`file_io.wfn_loader` is a shim). Both the eager and phdf5 backends call `unfold_psi` for the spinor + phase, and each handles the G-rebuild + umklapp internally. `SymMaps` retains the sym table itself (`sym_matrices`, `sym_mats_k`, `translations`, `R_cart`, `U_spinor`) and the IBZ k/q maps.
 
 ---
 

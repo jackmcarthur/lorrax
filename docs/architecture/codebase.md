@@ -83,7 +83,7 @@ src/
 │   └── phdf5_*                phdf5 benchmarks + plumbing tests
 │
 ├── file_io/              # Canonical file-format I/O (used by gw_jax)
-│   ├── wfn_loader.py          WfnLoader (gw_jax's canonical reader; WFNReader alias)
+│   ├── wfn_loader.py          SHIM -> services/wfn_loader/ (WFNReader alias lives here)
 │   ├── wfn_writer.py          BGW-compatible WFN.h5 writer
 │   ├── epsreader.py           EPSReader (eps0mat / epsmat)
 │   ├── qe_save_reader.py      CrystalData from QE .save
@@ -199,9 +199,11 @@ Built via `build_wavefunctions(psi_l_yr, psi_r_yr, ...)` or `build_wavefunctions
 
 Accessors: `wfns.xn(s.val)`, `wfns.xr(s.sigma)`, etc.
 
-### 2.4 `WfnLoader` — `src/file_io/wfn_loader.py`
+### 2.4 `WfnLoader` — `services/wfn_loader/src/wfn_loader/loader.py`
 
-Reads BerkeleyGW `WFN.h5`. Per-k raw reads return IBZ data without unfolding — all symmetry unfolding lives in `SymMaps`. `backend='auto'` (default) picks the eager or phdf5 (parallel HDF5) path. The legacy `WFNReader` / `PhdfWfnReader` readers (formerly in both `common/` and `file_io/`) were consolidated into this single class; `WFNReader` remains as a back-compat alias (`from file_io import WfnLoader as WFNReader`) used by the GW driver, BSE, and benchmarks.
+**Moved 2026-08-07** (wave-1 service extraction). `src/file_io/wfn_loader.py` is now a transitional SHIM that re-exports the same objects, and it dies in the phase-wide cleanup after all four wave-1 branches land — do not edit it, and do not add code there. Full page: [docs/services/wfn_loader.md](../services/wfn_loader.md).
+
+Reads BerkeleyGW `WFN.h5`. `backend='auto'` (default) picks `eager` (h5py + numpy) or `phdf5` (one collective read through `SlabIO.read_slabs` + on-device unfold), and the two are held **byte-identical**. Symmetry unfolding is the loader's: `SymMaps.get_gvecs_kfull` / `get_cnk_fullzone[_batch]` moved into it, and `SymMaps` keeps the sym tables and the IBZ k/q maps. The legacy `WFNReader` / `PhdfWfnReader` readers (formerly in both `common/` and `file_io/`) were consolidated into this single class; `PhdfWfnReader` is gone and `WFNReader` remains as a back-compat alias (`from file_io import WfnLoader as WFNReader`) used by the GW driver, BSE, and benchmarks.
 
 ### 2.5 `SymMaps` — `src/common/symmetry_maps.py`
 
@@ -608,7 +610,7 @@ main                                       [gw/gw_jax.py]
 | **Minimax / sigma quad config** | `gw/minimax_config.py : MinimaxConfig`, `SigmaQuadratureConfig` |
 | **Build `Meta`** | `common/meta.py : Meta.from_system` |
 | **Build wavefunction bundle** | `gw/wavefunction_bundle.py : build_wavefunctions_from_full` |
-| **Load WFN.h5** | `file_io/wfn_loader.py : WfnLoader`; band-chunked FFT `common/load_wfns.py : load_centroids_band_chunked` |
+| **Load WFN.h5** | `services/wfn_loader/ : WfnLoader` (`import wfn_loader`, after `ffi._services.ensure_on_path()`); band-chunked FFT `common/wfn_transforms.py` |
 | **Symmetry unfolding** | `common/symmetry_maps.py : SymMaps.get_cnk_fullzone[_batch]` |
 | **Flat-k FFT helpers** | `common/fft_helpers.py : make_flat_k_fftn`, `make_flat_k_ifftn` |
 | **Pair density (spin-traced)** | `common/isdf_fitting.py : compute_pair_density_spin_traced` |

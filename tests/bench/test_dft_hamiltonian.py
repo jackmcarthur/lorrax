@@ -32,7 +32,12 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
-from file_io import WfnLoader as WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from common import symmetry_maps, Meta
 from common.wfn_transforms import read_Gvecs_to_devices
 from file_io.qe_save_reader import CrystalData
@@ -65,7 +70,7 @@ def main():
 
     # ── Load crystal structure from QE save ──
     crystal = CrystalData.from_qe_save(args.save)
-    wfn = WFNReader(args.wfn)
+    wfn = WfnLoader(args.wfn)
     crystal.validate_against_wfn(wfn)
     pseudos = load_pseudopotentials(args.pseudo_dir)
     assert pseudos, f"No .upf files found in {args.pseudo_dir}"

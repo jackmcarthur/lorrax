@@ -56,7 +56,10 @@ from common.mtxel_sweep import (SweepGeometry, band_sphere_spec,  # noqa: E402
                                 local_potential_operator, sum_operators,
                                 sweep_matrix_elements, vnl_operator)
 from common.wfn_transforms import load_kpoint_fftbox_local     # noqa: E402
-from file_io import WfnLoader                                  # noqa: E402
+from ffi import _services      # noqa: F401,E402  (path bootstrap; dies
+                                 # with the owner's workspace fix)
+_services.ensure_on_path()
+from wfn_loader import WfnLoader                               # noqa: E402
 from gw.gw_config import read_lorrax_input                     # noqa: E402
 from gw.kin_ion_io import (build_valence_density_distributed,   # noqa: E402
                            compute_hartree_matrix, get_kin_ion_k)

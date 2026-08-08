@@ -189,7 +189,9 @@ def main():
     import argparse
     import sys
     sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent.parent))
-    from file_io import WfnLoader as WFNReader
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
 
     parser = argparse.ArgumentParser(allow_abbrev=False,
         description="Compute cell-box-truncated Coulomb potential and compare with BGW vcoul"
@@ -198,7 +200,7 @@ def main():
     parser.add_argument("--vcoul", default="vcoul", help="BGW vcoul text file for comparison")
     args = parser.parse_args()
 
-    wfn = WFNReader(args.wfn)
+    wfn = WfnLoader(args.wfn)
 
     # bdot: reciprocal metric in Bohr^-2, stored directly in the WFN file.
     # This is bdot[i,j] = b_i · b_j where b_i are in 2π/alat units,

@@ -152,7 +152,9 @@ def _as_loader(wfn):
     ``WFNReader`` fallback exists only for tests that still hold the old
     reader object.
     """
-    from file_io.wfn_loader import WfnLoader as _WFNLoader
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader as _WFNLoader
     if isinstance(wfn, _WFNLoader):
         return wfn
     return _WFNLoader(wfn._filename)

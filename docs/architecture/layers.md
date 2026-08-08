@@ -160,8 +160,14 @@ grammar, platform, probe, announce-or-refuse.
 paths}.py` (`_slab_io_allgather` and `_slab_io_mpi_host` were deleted
 2026-08-06). Note the split inside
 `file_io/`: the *transport* is L3, the *format readers* above it
-(`wfn_loader`, `zeta_loader`, `epsreader`, `mf_header`, `sigma_output`,
+(`zeta_loader`, `epsreader`, `mf_header`, `sigma_output`,
 `tagged_arrays`, …) are L1, because they know what a band and a ζ are.
+`wfn_loader` was one of them and is now an independently installable
+SERVICE at `services/wfn_loader/` (`src/file_io/wfn_loader.py` is a
+transitional shim). It is still L1 by this rule, and it is a CLIENT of
+the L3 transport through the `slab_io` door — which is the layering
+`tests/test_layering.py` enforces: reaching past the door (`from
+wfn_loader.loader import …`) is a failure, with a red twin.
 
 ---
 

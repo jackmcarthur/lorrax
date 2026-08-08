@@ -46,7 +46,12 @@ import jax.numpy as jnp
 
 from common import Meta, symmetry_maps
 from common.wfn_transforms import load_kpoint_fftbox
-from file_io import WfnLoader as WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from psp.dft_operators import setup_H_k_from_kvec
 from psp.pseudos import load_pseudopotentials
 from psp.run_sternheimer import (
@@ -70,7 +75,7 @@ def _build_fixture(wfn_path: str, pseudo_dir: str, truncation_2d: bool,
                    n_extra: int = 20):
     """Build test fixture.  ``n_extra`` = # extra conduction bands loaded for
     the Schur warm-start tests (0 = plain-CG-only)."""
-    wfn = WFNReader(wfn_path)
+    wfn = WfnLoader(wfn_path)
     sym = symmetry_maps.SymMaps(wfn)
     n_occ = int(wfn.nelec)
     n_band = n_occ + max(0, int(n_extra))

@@ -34,7 +34,12 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from file_io import WfnLoader as WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from common import symmetry_maps
 from common import timing
 from common.collectives import barrier, gather_k_blocks
@@ -704,7 +709,7 @@ def main(argv=None):
 	# pick the collective phdf5 read at P>1 instead of the per-rank eager
 	# h5py read (scorecard BD.2).  The per-k sweep below stays on the
 	# process-local read path either way.
-	wfn = WFNReader(str(wfn_path))
+	wfn = WfnLoader(str(wfn_path))
 	wfn.adopt_mesh(RUNTIME.mesh)
 	sym = symmetry_maps.SymMaps(wfn)
 

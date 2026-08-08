@@ -29,7 +29,12 @@ import os
 
 import numpy as np
 
-from file_io import WfnLoader as WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from common import symmetry_maps, timing
 from common.collectives import process_rank
 
@@ -419,7 +424,7 @@ def main():
         print(f"Using N_c = {N_c} clusters (no pivoted-Cholesky pruning)")
 
     with timing.section("setup.wfn_io"):
-        wfn = WFNReader("WFN.h5")
+        wfn = WfnLoader("WFN.h5")
         sym = symmetry_maps.SymMaps(wfn)
 
         n_rtot = int(np.prod(wfn.fft_grid))

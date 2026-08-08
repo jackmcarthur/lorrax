@@ -3,7 +3,12 @@ import os
 import numpy as np
 import h5py as h5
 from common.gpu_utils import cp
-from file_io import WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from centroid.kmeans_isdf import weighted_kmeans_jax
 from misc.test_scripts.kmeans_old import weighted_kmeans_cupy
 
@@ -12,7 +17,7 @@ def test_kmeans_agreement(tmp_path):
     cp.random.seed(0)
     with h5.File('examples/cohsex_test/charge_density.h5', 'r') as f:
         rho = f['charge_density'][...]
-    wfn = WFNReader('examples/cohsex_test/WFNsmall.h5')
+    wfn = WfnLoader('examples/cohsex_test/WFNsmall.h5')
     avec = wfn.avec
 
     rho_cp = cp.asarray(rho, dtype=cp.float32)

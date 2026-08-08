@@ -771,6 +771,40 @@ def probe_availability(platform: str | None = None) -> tuple[bool, str, str]:
     return _AVAILABILITY
 
 
+def probe_read_availability(platform: str | None = None) -> tuple[bool, str]:
+    """``(ok, reason)`` — can ``platform``'s library serve a slab READ?
+
+    Probes the multi-window read target (``lorrax_phdf5_read_kchunk_union``,
+    the one :meth:`_FfiBackend.read_slabs` dispatches) through
+    :func:`ffi_loader.probe_target`, whose three-state reason separates
+    "not a target of this library" from "the library could not be loaded"
+    from "loaded but does not export the symbol" — three different fixes,
+    which is why the reason comes back verbatim instead of a bool.
+
+    NOT cached, and deliberately NOT sharing :func:`probe_availability`'s
+    ``_AVAILABILITY``.  That one memoises a single verdict with no platform
+    key, which is fine for the write door (it asks once, about here) and
+    wrong for this one: the only way a caller uses this is a
+    ("CUDA", "cpu") ladder, and a platform-blind cache would hand the FIRST
+    platform's answer back for the second — reporting a host library that
+    exports the handler on a node where only the CUDA one does.  The probe
+    is a symbol lookup on an already-loaded library, so there is nothing to
+    memoise anyway; ``probe_availability``'s cache is there for the MPI
+    bootstrap subprocess, which this door does not run.
+
+    Never raises: a broken ``ffi_loader`` import is a reason, not a crash,
+    because the caller is choosing between transports.
+    """
+    if platform is None:
+        platform = "cpu" if jax.default_backend() == "cpu" else "CUDA"
+    try:
+        from ffi.common.ffi_loader import probe_target
+        return probe_target("lorrax_phdf5_read_kchunk_union", platform)
+    except Exception as exc:                          # pragma: no cover
+        return False, (f"ffi.common.ffi_loader is unavailable "
+                       f"({type(exc).__name__}: {exc})")
+
+
 def assert_available(platform: str | None = None) -> None:
     """Refuse, naming the failed probe, if the tile path cannot run here.
 
@@ -1177,6 +1211,151 @@ def _normalize_valid_shape(
 
 
 # ---------------------------------------------------------------------------
+# The same clip, once per (rank, window) — the multi-window read's table
+# ---------------------------------------------------------------------------
+#
+# :meth:`_FfiBackend.read_slabs` asks the C++ union handler for n windows of
+# ONE common slab shape in ONE H5Dread, and the handler shifts each rank onto
+# its own block of every window before it selects.  So each rank needs its OWN
+# count row per window, and that row is exactly :func:`_derive_valid_shape` of
+# (the rank's block shape, the rank's offset INSIDE the window, the window's
+# valid extent) — the same clip the one-rectangle path applies, evaluated
+# world x n_windows times.
+#
+# THE TABLE USED TO LIVE IN THE PSI LOADER (``file_io/wfn_loader.py``'s
+# ``_build_phdf5_clamped_counts``), one import away from the clip it was
+# applying, and the two DIVERGED on the band axis: the loader's copy clipped
+# to ``mnband`` (the FILE extent) while its own serial reader clipped to
+# ``b_hi`` (the LOGICAL window) and zeroed the rest.  A load refuses
+# ``b_hi > mnband``, so the file clip is never the tighter of the two — it
+# fires only past EOF and NOT on the pad rows between ``b_hi`` and
+# ``b_lo + nb_padded``.  Those rows came back holding real file bands on the
+# collective path and zeros on the serial one, on every request whose band
+# count did not divide the world size; the parity harness's own geometry
+# happened to divide, which is why it went unseen (22049c3, fixed 2026-08-06).
+# Layout and clip now live in THIS file, three definitions apart, and the
+# caller states LOGICAL extents only — which is the rule ``valid_shape``
+# already follows for one rectangle.  That is the whole reason the table
+# moved: the divergence class dies structurally rather than by a test.
+
+
+def _normalize_window_tables(
+    *, name: str, offsets, valid_shapes, ndim: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The two per-window tables as ``(n, ndim)`` int64 — or a REFUSAL.
+
+    ``read_slabs`` reads n windows of ONE slab shape, so the tables describe
+    the same n windows and must agree with each other on n and with the slab
+    on ndim.  Checked HERE, by name and with both shapes, because neither
+    mismatch has a symptom downstream: the tables are dispatched into a
+    compiled ``shard_map`` whose complaint would name a traced buffer, and a
+    table at the wrong ndim is read row-major by the C++ handler as a
+    different set of windows entirely — a wrong hyperslab that returns
+    rc=0 data.  Rank-invariant: every rank builds these from the same
+    request.
+    """
+    off = np.asarray(offsets, dtype=np.int64)
+    val = np.asarray(valid_shapes, dtype=np.int64)
+    for what, tbl in (("offsets", off), ("valid_shapes", val)):
+        if tbl.ndim != 2:
+            raise ValueError(
+                f"read_slabs {name!r}: {what} must be a 2-D (n_windows, "
+                f"ndim) table; got shape {tuple(tbl.shape)}")
+    if off.shape[0] != val.shape[0]:
+        raise ValueError(
+            f"read_slabs {name!r}: offsets and valid_shapes describe "
+            f"different window counts ({off.shape[0]} vs {val.shape[0]}); "
+            f"they are two columns of ONE table of windows.")
+    if off.shape[1] != ndim or val.shape[1] != ndim:
+        raise ValueError(
+            f"read_slabs {name!r}: window tables have ndim "
+            f"{off.shape[1]}/{val.shape[1]} but the slab shape has {ndim} "
+            f"dimensions; every window is a slab of that one shape, so all "
+            f"three ranks must agree.")
+    if (off < 0).any() or (val < 0).any():
+        raise ValueError(
+            f"read_slabs {name!r}: negative entry in the window tables "
+            f"(offsets min {int(off.min())}, valid_shapes min "
+            f"{int(val.min())})")
+    return off, val
+
+
+def _rank_block_offsets(
+    *,
+    per_rank_shape: Sequence[int],
+    axis_count_per_dim: Sequence[int],
+    axis_flat: Sequence[int],
+    mesh_shape: Sequence[int],
+) -> np.ndarray:
+    """``(world, ndim)`` — where each rank's block starts INSIDE a window.
+
+    Transcribes the handler's own arithmetic (``read_ffi.cc``, "per-rank
+    coord shift on sharded dims"): un-ravel the rank through ``mesh_shape``
+    row-major, then for a dim sharded by several mesh axes combine their
+    coordinates leftmost-is-slowest — JAX's order, which is what
+    ``axis_flat`` records.  A replicated dim contributes 0, so every rank
+    starts that dim at the window origin.
+
+    Built for EVERY rank rather than read off this process's shard index:
+    the count table is assembled whole and then sharded, so rank r's row
+    has to be computable on rank 0.  Pure arithmetic over replicated
+    quantities, so every rank builds the same table.
+    """
+    ndim = len(tuple(per_rank_shape))
+    dims = tuple(int(m) for m in mesh_shape)
+    world = 1
+    for m in dims:
+        world *= m
+    out = np.zeros((world, ndim), dtype=np.int64)
+    for r in range(world):
+        coord = np.unravel_index(r, dims)
+        flat = 0
+        for d in range(ndim):
+            na = int(axis_count_per_dim[d])
+            block, stride = 0, 1
+            for k in range(na - 1, -1, -1):
+                ax = int(axis_flat[flat + k])
+                block += int(coord[ax]) * stride
+                stride *= dims[ax]
+            flat += na
+            out[r, d] = block * int(per_rank_shape[d])
+    return out
+
+
+def _derive_window_counts(
+    *,
+    per_rank_shape: Sequence[int],
+    rank_offsets: np.ndarray,
+    valid_shapes: np.ndarray,
+) -> np.ndarray:
+    """``(world * n_windows, ndim)`` per-rank hyperslab counts.
+
+    One :func:`_derive_valid_shape` per (rank, window): the rank's block
+    shape, clipped to what is left of that window's VALID extent past the
+    rank's own offset into it.  A rank whose block starts past the valid
+    extent on a dim gets 0 there — it selects nothing, and the handler's
+    pre-zeroed staging buffer makes its tile read as exactly zero, which is
+    the pad-row semantics the one-rectangle read has everywhere else.
+    Equivalently ``sum_r count[r, w, d] == valid_shapes[w][d]`` on a dim
+    the world shards, which is the invariant the regression cells assert.
+
+    Row layout is the handler's: rank-major, window-minor, flattened so the
+    leading axis can be sharded across the mesh — each rank's shard_map-local
+    view is then exactly its own ``(n_windows, ndim)`` slice, and no rank
+    ever sends a row.
+    """
+    world = int(rank_offsets.shape[0])
+    n_win = int(valid_shapes.shape[0])
+    ndim = len(tuple(per_rank_shape))
+    counts = np.zeros((world, n_win, ndim), dtype=np.int64)
+    for r in range(world):
+        for w in range(n_win):
+            counts[r, w] = _derive_valid_shape(
+                per_rank_shape, rank_offsets[r], valid_shapes[w])
+    return counts.reshape(world * n_win, ndim)
+
+
+# ---------------------------------------------------------------------------
 # Dataset geometry — the replicated record that makes the derivation legal
 # ---------------------------------------------------------------------------
 class _DatasetGeometry:
@@ -1437,6 +1616,27 @@ class _FfiBackend(_DatasetGeometry):
                   f"stripe_unit={_su} B (policy; "
                   f"LORRAX_PHDF5_STRIPE_COUNT/_SIZE_FS override)",
                   flush=True)
+        elif mode == "r" and _rank0() and _env_flag("LORRAX_PHDF5_LOG", True):
+            # The read side names its own dominant term, and it is a
+            # DIFFERENT number: a Lustre layout is fixed at inode create, so
+            # on a file LORRAX did not write (every WFN.h5 — pw2bgw creates
+            # it) the policy above is inert and the file's own layout governs
+            # the read.  stripe_count=1 pins cb_nodes=1, i.e. ONE aggregator
+            # at any rank count.  This announcement was hand-rolled in
+            # WfnLoader._ensure_phdf5_ctx, which was the read side's way of
+            # reaching around SlabIO; it belongs where the read handle is
+            # opened.  See file_stripe_layout for the measurement.
+            _lay = file_stripe_layout(path)
+            if _lay is not None:
+                _c, _s = _lay
+                _warn = ("  <-- ONE STRIPE: cb_nodes=1, single-aggregator "
+                         "read at any rank count; `lfs setstripe -c 16 -S 4M`"
+                         " on the deck dir before the file is created, or "
+                         "`lfs migrate` this file" if _c == 1 else "")
+                print(f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} "
+                      f"mode={mode} file stripe_count={_c} stripe_size={_s} B "
+                      f"(the file's own inode, not the policy){_warn}",
+                      flush=True)
         self.fh: int = self._open_file(path, mesh=mesh, mode=mode)
         # ``open_file`` has now brought MPI up (context.cc::
         # ensure_mpi_initialized).  Ask it how big the world REALLY is
@@ -1866,6 +2066,91 @@ class _FfiBackend(_DatasetGeometry):
         result = sm(handle_arr, offset_arr, valid_shape_arr)
         result.block_until_ready()
         return result
+
+    # ------------------------------------------------------------------
+    # n windows, ONE H5Dread.  Same padding contract as read_slab, one
+    # valid extent per window; see SlabIO.read_slabs for the measurement
+    # that put this behind the door instead of folding it into n read_slab
+    # calls.
+    def read_slabs(
+        self,
+        name: str,
+        *,
+        shape: Sequence[int],
+        offsets,
+        valid_shapes,
+        partition_spec: P,
+        window_axis: int,
+        dtype=None,
+        mesh: Mesh | None = None,
+    ) -> jax.Array:
+        from ffi.io import read_kchunk_union_sharded
+
+        mesh = mesh or self.mesh
+        # Same unconditional drain, for the same three hazards, as
+        # :meth:`read_slab` — read-after-write ordering, the shared
+        # ``ctx->pinned_buf``, and two threads inside HDF5/MPI-IO on one
+        # file handle.  A multi-window read is one collective like any
+        # other, so none of them get weaker.
+        self._drain_pending()
+        ds_shape, ds_dtype = self._dataset_geom(name)
+        slab_shape = tuple(int(s) for s in shape)
+        if dtype is None:
+            dtype = ds_dtype
+        offsets_t, valid_t = _normalize_window_tables(
+            name=name, offsets=offsets, valid_shapes=valid_shapes,
+            ndim=len(slab_shape))
+
+        sharding = NamedSharding(mesh, partition_spec)
+        axis_count_per_dim, axis_flat = _sharding_to_axis_info(
+            sharding, len(slab_shape))
+        mesh_shape = tuple(int(mesh.shape[ax]) for ax in mesh.axis_names)
+        _validate_block_divisible(
+            op="read_slabs", name=name, shape=slab_shape,
+            axis_count_per_dim=axis_count_per_dim,
+            axis_flat=axis_flat, mesh_shape=mesh_shape)
+        divs = _shard_divisors(
+            axis_count_per_dim=axis_count_per_dim, axis_flat=axis_flat,
+            mesh_shape=mesh_shape, ndim=len(slab_shape))
+        per_rank_shape = tuple(s // d for s, d in zip(slab_shape, divs))
+        counts = _derive_window_counts(
+            per_rank_shape=per_rank_shape,
+            rank_offsets=_rank_block_offsets(
+                per_rank_shape=per_rank_shape,
+                axis_count_per_dim=axis_count_per_dim,
+                axis_flat=axis_flat, mesh_shape=mesh_shape),
+            valid_shapes=valid_t)
+
+        # BOTH tables staged PROCESS-LOCALLY.  ``jax.device_put`` of host
+        # numpy onto a multi-process sharding runs JAX's hidden
+        # ``assert_equal`` all-gather (scorecard AA.1/Y.3) — a blocking
+        # collective per call on buffers that are identical (offsets) or
+        # exactly this rank's own rows (counts) by construction.  The counts
+        # table is the expensive one to assert: P x (world x n_windows) x
+        # ndim x 8 B is O(P^2), 18.9 MB at P=64 and 95.5 MB at P=144.
+        # ``LORRAX_CHECK_REPLICA=1`` re-arms the assertion.
+        counts_spec = P(tuple(mesh.axis_names), None)
+        offsets_dev = device_put_process_local(
+            offsets_t, NamedSharding(mesh, P(None, None)))
+        counts_dev = device_put_process_local(
+            counts, NamedSharding(mesh, counts_spec))
+
+        reader = read_kchunk_union_sharded(
+            self.fh, name,
+            n_kchunk=int(offsets_t.shape[0]),
+            kchunk_axis=int(window_axis),
+            file_global_shape=ds_shape,
+            per_rank_file_shape=per_rank_shape,
+            dtype=dtype,
+            mesh=mesh,
+            file_partition_spec=partition_spec,
+            count_partition_spec=counts_spec,
+        )
+        # No ``block_until_ready`` here, unlike read_slab: the union handler
+        # returns an async ``ffi::Future`` and the caller's next op is what
+        # sequences it (measured ~1% end-to-end, read_ffi.cc:819-829).
+        # Blocking would be a behaviour change dressed as symmetry.
+        return reader(offsets_dev, counts_dev)
 
     # ------------------------------------------------------------------
     def close(self) -> None:

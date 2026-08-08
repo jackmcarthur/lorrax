@@ -24,7 +24,12 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from file_io import WfnLoader as WFNReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
 from common import symmetry_maps, Meta
 from common.wfn_transforms import load_kpoint_fftbox
 from psp.radial_jax import (
@@ -35,7 +40,7 @@ from psp.radial_jax import (
 
 
 def build_density_from_ibz(
-    wfn: WFNReader,
+    wfn: WfnLoader,
     sym: symmetry_maps.SymMaps,
     meta: Meta,
     n_occ: int,

@@ -146,7 +146,9 @@ def test_wfn_loader_has_no_phdf5_host_tier_either():
     decisions.md 2026-08-01 forbids demoting to.  Deleted 2026-08-06.
     """
     import inspect
-    from file_io.wfn_loader import WfnLoader
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
     assert not hasattr(WfnLoader, "_phdf5_host_build")
     ann = inspect.signature(WfnLoader.__init__).parameters["backend"]
     assert "phdf5_host" not in str(ann.annotation), ann.annotation

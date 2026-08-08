@@ -72,10 +72,10 @@ import numpy as np
 import jax
 
 from ._slab_io_ffi import (_FfiBackend, assert_available, mesh_divisible_shape,
-                           probe_availability)
+                           probe_availability, probe_read_availability)
 
 __all__ = ["SlabIO", "assert_available", "mesh_divisible_shape",
-           "probe_availability"]
+           "probe_availability", "probe_read_availability"]
 
 
 class SlabIO:
@@ -238,3 +238,60 @@ class SlabIO:
         if as_numpy and not isinstance(arr, np.ndarray):
             arr = np.asarray(jax.device_get(arr))
         return arr
+
+    # ------------------------------------------------------------------
+    def read_slabs(
+        self,
+        name: str,
+        *,
+        shape: Sequence[int],
+        offsets,
+        valid_shapes,
+        partition_spec,
+        window_axis: int,
+        dtype=None,
+        mesh=None,
+    ) -> jax.Array:
+        """Read n windows of ONE slab ``shape`` in ONE collective H5Dread.
+
+        The windows share a shape and differ only in where they start and
+        how much of that shape is real:
+
+        * ``shape`` — the common (mesh-padded, global) slab shape, exactly
+          as :meth:`read_slab` takes it;
+        * ``offsets`` — ``(n, ndim)``, each window's origin in the dataset;
+        * ``valid_shapes`` — ``(n, ndim)``, each window's LOGICAL extent
+          from its own origin.  Same meaning as :meth:`read_slab`'s
+          ``valid_shape`` and the same consequence: past it the output is
+          zero, per window, with no caller-side arithmetic.  It is not
+          optional here because a per-window extent is not derivable from
+          the dataset — the raggedness is the request.
+
+        The result is a ``jax.Array`` of ``shape`` with an n-long window
+        axis inserted at ``window_axis``, sharded by ``partition_spec``
+        with ``None`` inserted at the same position.  ``window_axis`` must
+        sit immediately before the dim that VARIES across windows, so the
+        packed output iterates in the file's own order.
+
+        PRECONDITION the caller owns: the windows must be pairwise
+        DISJOINT in the file and sorted ascending in row-major file order.
+        They are selected into one ``H5S_SELECT_OR`` compound hyperslab, so
+        an overlap is a double-selection and a wrong order permutes the
+        packing.  A caller whose windows are not sorted argsorts the tables
+        and permutes the window axis back — both cheap.
+
+        WHY THIS IS A DOOR PRIMITIVE and not n :meth:`read_slab` calls
+        (MEASURED 2026-08-07, CPU milan, 2x2 mesh, both arms through the
+        same handle; artifacts ``_measure_fold/``).  The fold-down loses on
+        every deck measured: warm-min ratios 3.58x / 3.22x / 1.44x against
+        this call, and at the production deck (144 windows, 15.6 GB) it
+        costs +2.1 s per read, of which ~1.4 s is per-call collective
+        H5Dread overhead and ~0.6 s an extra stack this path never needs.
+        The cost axis is n — the number of windows — which is exactly what
+        grows with the deck.  So n windows is a REQUEST SlabIO serves, not
+        a loop a caller writes.
+        """
+        return self._backend.read_slabs(
+            name, shape=shape, offsets=offsets, valid_shapes=valid_shapes,
+            partition_spec=partition_spec, window_axis=window_axis,
+            dtype=dtype, mesh=mesh or self.mesh)

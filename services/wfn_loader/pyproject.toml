@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wfn_loader"
+version = "0.1.0"
+description = "ψ(G) loading from a BerkeleyGW WFN.h5: symmetry unfold, τ-phase, bispinor lift and padding, over a JAX device mesh — one door over the host h5py read and the collective phdf5 read"
+requires-python = ">=3.12"
+
+# THE QUARANTINE, DECLARED.  phdf5 and the LORRAX FFI layer appear nowhere
+# in this list because nothing here links them: the collective MPI-IO read
+# is reached ONLY through the slab_io door, and an installed wfn_loader on
+# a machine with no `.so` imports fine, constructs, reads its header and
+# serves every eager-backend call — `backend='phdf5'` is the one thing it
+# then refuses, by name, at startup rather than by demoting.
+#
+# h5py IS declared, and that is not the same claim: the SERIAL read is
+# this package's own (`h5.File(path, 'r')` + per-rank hyperslabs), so h5py
+# is a first-class runtime dependency while parallel HDF5 is somebody
+# else's transport.
+#
+# lxkit is the shared foundation (Gate/probe vocabulary/jax-version shims).
+# jax is the substrate this package is written in; unlike lxkit,
+# `import wfn_loader` DOES import jax, and that is correct: `load` returns
+# a `jax.Array` and takes a `jax.sharding.PartitionSpec`.
+dependencies = ["lxkit", "jax", "numpy", "h5py"]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0.0", "numpy"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `bench/` holds claims-style baseline drivers, not a pytest suite.
+norecursedirs = ["bench"]
+# The SAME two markers the monorepo registers.  Declared in both places on
+# purpose: `pytest services/wfn_loader/tests` from the monorepo root picks
+# THIS file as its rootdir config (it is the nearest pyproject.toml above
+# the argument), so a service that only registered them upstairs emits
+# PytestUnknownMarkWarning on exactly the invocation the charter calls its
+# standalone one.
+markers = [
+    "services: a standalone service's own suite, staged into the main one",
+    "wfn_loader: the wfn_loader service suite",
+]

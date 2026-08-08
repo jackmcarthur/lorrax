@@ -45,6 +45,7 @@ os.environ.setdefault("XLA_FLAGS",
                       "--xla_force_host_platform_device_count=4")
 
 import h5py                                          # noqa: E402
+import pytest                                         # noqa: E402
 import jax                                           # noqa: E402
 import jax.numpy as jnp                              # noqa: E402
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
@@ -848,8 +849,19 @@ def test_rotated_density_load_reduces_to_the_plain_load_at_U_identity():
     """
     wfn_path = os.path.join(_FIXTURE, "WFNsmall.h5")
     if not os.path.exists(wfn_path):
-        return
-    from file_io import WfnLoader
+        # A bare ``return`` here until 2026-08-07: pytest reports PASS for a
+        # cell that ran nothing, which is worse than a skip because nothing
+        # in the summary line says the coverage went away.  The fixture is
+        # CHECKED IN (tests/regression/cohsex_debug/WFNsmall.h5, chmod a-w
+        # by tests/conftest.py), so this never fires in the monorepo -- and
+        # that is exactly why the silent form could sit here unnoticed.
+        pytest.skip(f"checked-in deck absent: {wfn_path} is not in this "
+                    f"tree, so the QSGW density seam has no operands -- "
+                    f"covered by the monorepo run, where the fixture is "
+                    f"committed")
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
     from common import symmetry_maps, Meta
     from common.wfn_transforms import load_kpoint_fftbox_local
     from gw.kin_ion_io import _load_rotated_occ_fftbox
@@ -881,8 +893,19 @@ def test_process_local_load_matches_the_legacy_wrapper():
     on it."""
     wfn_path = os.path.join(_FIXTURE, "WFNsmall.h5")
     if not os.path.exists(wfn_path):
-        return
-    from file_io import WfnLoader
+        # A bare ``return`` here until 2026-08-07: pytest reports PASS for a
+        # cell that ran nothing, which is worse than a skip because nothing
+        # in the summary line says the coverage went away.  The fixture is
+        # CHECKED IN (tests/regression/cohsex_debug/WFNsmall.h5, chmod a-w
+        # by tests/conftest.py), so this never fires in the monorepo -- and
+        # that is exactly why the silent form could sit here unnoticed.
+        pytest.skip(f"checked-in deck absent: {wfn_path} is not in this "
+                    f"tree, so the QSGW density seam has no operands -- "
+                    f"covered by the monorepo run, where the fixture is "
+                    f"committed")
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
     from common import symmetry_maps, Meta
     from common.wfn_transforms import (load_kpoint_fftbox,
                                        load_kpoint_fftbox_local)

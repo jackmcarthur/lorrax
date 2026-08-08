@@ -209,6 +209,12 @@ of the array, per §1.
 
 **Does not take the branch — guarded or structurally excluded:**
 
+> Line numbers below are at the head this audit ran on. `wfn_loader.py`
+> has since moved to `services/wfn_loader/src/wfn_loader/loader.py`
+> (2026-08-07; `src/file_io/wfn_loader.py` is a shim) — the guard and the
+> verdict are unchanged, the line numbers are not.
+> See [docs/services/wfn_loader.md](../services/wfn_loader.md).
+
 | file:line | verdict |
 |---|---|
 | `src/file_io/wfn_loader.py:1259` | **Largest operand in the tree** — the whole numpy ψ window, `nk·nb·ns·ngkmax·16`. Unreachable at `P>1`: the guard at `wfn_loader.py:1243` routes multi-process to `_eager_build_process_local`. Benign **only because of that guard**; it is the one line where the guard is all that stands between the tree and a worst-case gather. |
