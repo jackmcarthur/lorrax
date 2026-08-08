@@ -238,9 +238,14 @@ should have to read the paragraph above first.  Belt and braces, and the
 braces are the ones with the argument written on them.
 
 This is the conservative and reversible half of a decision that has a real
-fix on the other side of it — teaching both restart readers to gather before
-they unfold, which is registered in `tests/KNOWN_FAILURES.md`.  Delete this
-one deck line the day that lands.
+fix on the other side of it, and the fix is now larger than this deck.  By
+the owner's ruling of 2026-08-08 ~13:20, `restart_q_storage` is TRANSITIONAL
+and scheduled for deletion: symmetry should not need a mode switch, because
+the WFN file already says whether the deck has symmetries, so restart storage
+will simply follow the file and both readers will always unfold.  That work
+— the GW+BSE restart consolidation registered in `tests/KNOWN_FAILURES.md` —
+retires the knob entirely, and this deck line goes with it.  Delete the line
+when the key is deleted, not before.
 
 ### Reference provenance (the vcoul adoption pattern)
 

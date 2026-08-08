@@ -659,8 +659,19 @@ _DEFAULTS = {
     # process count, not only P>1), and the GW restart reader refuses it too
     # since the same landing — see ``file_io.tagged_arrays``.  The wedge is
     # therefore usable today by runs that DISCARD the restart artifact or read
-    # it back through the serial h5py path, and teaching both readers to
-    # gather-then-unfold is registered design work that retires this caveat.
+    # it back through the serial h5py path.
+    #
+    # ⚠ THIS WHOLE KEY IS TRANSITIONAL — OWNER RULING 2026-08-08 ~13:20.
+    # `full` is where it rests until the key is DELETED, not a permanent
+    # setting to tune.  The owner's ruling is that symmetry should never have
+    # needed a mode switch at all: "symmetries should not need an auto mode —
+    # if symmetries are not to be used, the wavefunction file should've been
+    # generated with no symmetries."  The WFN file already answers the
+    # question this key asks, so the end state is storage that FOLLOWS the
+    # file — the wedge whenever the deck carries symmetries, readers that
+    # always unfold — with `restart_q_storage` retired entirely rather than
+    # defaulted differently.  That work is the GW+BSE restart consolidation
+    # registered in tests/KNOWN_FAILURES.md; do not build on this key.
     # See gw/restart_q_storage.py for the resolution and the seam, and
     # DESIGN_symmetry_restart_followup.md for the pre-unfold-persistence
     # decision this key selects.
