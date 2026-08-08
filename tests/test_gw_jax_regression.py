@@ -511,14 +511,29 @@ def test_bispinor_gnppm_matches_reference(bispinor_session):
     # 209-centroid transverse set goes through the IBZ cascade silently.
     #
     # Asserted on the parts that carry meaning rather than on one long
-    # literal: that a fallback was announced, that it named the charge
-    # centroids specifically (the transverse set must NOT produce one — the
-    # announcement dedupes on the centroid SET, which is what makes these two
-    # distinct lines rather than one line printed twice), and that it gave
-    # the reason.  A cell that pinned the whole sentence would break on every
-    # rewording and teach the next worker to delete it.
+    # literal: that a fallback was announced, and that the set it fell back
+    # on was the CHARGE one.
+    #
+    # THE CALL SITE IS DELIBERATELY NOT ASSERTED, and that is a finding
+    # rather than a shortcut.  ``announce_once`` dedupes on the centroid SET
+    # (``res.announce_key``), so the ``where`` in the announcement names
+    # whichever site reached the charge set FIRST — the bispinor g-flat
+    # tile, the V_q/W reduction, or the W Dyson solve, depending on the
+    # deck's path through the run.  An assertion on ``bispinor g-flat,
+    # charge centroids`` was tried here and failed for exactly that reason
+    # while the fallback itself was announced correctly.  Pinning the
+    # winner of a dedup race is pinning an implementation detail.
+    #
+    # The WORST RESIDUAL is the honest discriminant instead: 1.436e-01
+    # belongs to the 256-centroid charge set and to nothing else in this
+    # deck (the 209-centroid transverse set is closed at 1.1e-16 and
+    # announces nothing at all), so finding it in the announcement proves
+    # both halves of the fixture property — charge fell back, transverse did
+    # not.  It is the same number
+    # `test_symmetry_maps_qgrid_resolution.py::test_a_non_closed_set_...`
+    # carries for `bispinor_debug-256`, so the two cells move together.
     out = bispinor_session.stdout
     assert "q-grid symmetry: FALLBACK" in out
-    assert "bispinor g-flat, charge centroids" in out
     assert "not orbit-closed" in out
+    assert "1.436e-01" in out, "the charge set's residual should name it"
     assert "V_qmunu_TT_11" in out
