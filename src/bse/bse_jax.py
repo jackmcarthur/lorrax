@@ -122,6 +122,12 @@ def _preview_lanczos(
     matvec_kind: str = "ring",
     n_reorth: int = -1,
     solver_kind: str = "lanczos",
+    davidson_m_max: int | None = None,
+    davidson_precond: str = "bare",
+    davidson_olsen: bool = False,
+    davidson_eps_shift: float | None = None,
+    trlan_m_max: int | None = None,
+    trlan_n_keep: int | None = None,
     tda: bool = True,
 ) -> None:
     # ---- Stage timing --------------------------------------------------
@@ -207,6 +213,12 @@ def _preview_lanczos(
                 include_W=include_W, block_size=block_size,
                 rtol=rtol, check_every=check_every, n_reorth=n_reorth_eff,
                 solver_kind=solver_kind, tda=tda,
+                davidson_m_max=davidson_m_max,
+                davidson_eps_shift_Ry=(davidson_eps_shift
+                    if davidson_eps_shift else 1e-3),
+                davidson_precond=davidson_precond,
+                davidson_olsen=davidson_olsen,
+                trlan_m_max=trlan_m_max, trlan_n_keep=trlan_n_keep,
             )
             _sec.watch(eigenvalues, eigenvectors)
         # Fixed-iteration routes return N_ITER_NOT_MEASURED; only the
@@ -405,13 +417,53 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--solver",
-        choices=("lanczos", "davidson"),
+        choices=("lanczos", "davidson", "trlan"),
         default="lanczos",
         help="Eigensolver. ``lanczos`` (default) for fast spectrum-shape "
              "convergence (ε₂(ω)). ``davidson`` for tight per-state "
              "eigenvector convergence using diagonal (E_c−E_v) "
              "preconditioner — better for individual-state oscillator "
-             "strengths in densely-packed band-edge spectra.",
+             "strengths in densely-packed band-edge spectra. ``trlan`` for "
+             "thick-restart Lanczos: the same Krylov convergence as "
+             "``lanczos`` from a basis capped at --trlan-m-max slots instead "
+             "of --max-lanczos-iter slots, which is what makes the solve fit "
+             "at production bse_dim. Costs extra matvecs for the cap.",
+    )
+    parser.add_argument(
+        "--davidson-precond", choices=("bare", "exact"), default="bare",
+        help="Davidson preconditioner diagonal. ``bare`` (default) divides by "
+             "the transition energy dE = E_c - E_v. ``exact`` divides by the "
+             "assembled diag(H) = dE + (V_x - W_d)/nk, which is what "
+             "BerkeleyGW hands PRIMME. Assembled once per solve for under a "
+             "third of one matvec; the per-iteration cost is identical.",
+    )
+    parser.add_argument(
+        "--davidson-olsen", action="store_true",
+        help="Davidson: Olsen-correct the preconditioned direction (project "
+             "out its component along the current Ritz vector). Two batched "
+             "inner products per iteration. This is what makes a SMALL "
+             "--davidson-eps-shift safe.",
+    )
+    parser.add_argument(
+        "--davidson-eps-shift", type=float, default=None,
+        help="Davidson: preconditioner regularisation in Ry. Default 1e-3 "
+             "(= 13.6 meV).",
+    )
+    parser.add_argument(
+        "--davidson-m-max", type=int, default=None,
+        help="Davidson: max subspace dimension before restart. Default "
+             "10*n_eig (measured knee). Memory is 2*m_max trial vectors, "
+             "because Davidson stores V and HV.",
+    )
+    parser.add_argument(
+        "--trlan-m-max", type=int, default=None,
+        help="Thick-restart Lanczos: basis slots (the memory cap). "
+             "Default max(3*n_eig, 60). The useful range is 3-5x n_eig.",
+    )
+    parser.add_argument(
+        "--trlan-n-keep", type=int, default=None,
+        help="Thick-restart Lanczos: Ritz vectors retained across a restart. "
+             "Default n_eig+10. Must satisfy n_eig <= n_keep < m_max.",
     )
     parser.add_argument("--kpm-dos", action="store_true", help="Run KPM Chebyshev DOS and exit.")
     parser.add_argument("--kpm-n-moments", type=int, default=100, help="Chebyshev moments M for KPM.")
@@ -578,6 +630,12 @@ if __name__ == "__main__":
         matvec_kind=("gather" if args.gather_t else args.matvec_kind),
         n_reorth=args.n_reorth,
         solver_kind=args.solver,
+        davidson_m_max=args.davidson_m_max,
+        davidson_precond=args.davidson_precond,
+        davidson_olsen=args.davidson_olsen,
+        davidson_eps_shift=args.davidson_eps_shift,
+        trlan_m_max=args.trlan_m_max,
+        trlan_n_keep=args.trlan_n_keep,
         tda=use_tda,
     )
     raise SystemExit(0)

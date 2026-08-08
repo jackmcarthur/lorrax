@@ -182,6 +182,91 @@ def init_bse_subspace(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  The EXACT transition-space diagonal of H_BSE
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_bse_exact_diagonal(
+    eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y, V_q0, nk: int,
+    *, sharding=None,
+):
+    """``diag(H_BSE)[c, v, k]`` — assembled exactly, once per solve.
+
+    WHAT THIS IS FOR
+    ----------------
+    LORRAX's Davidson preconditions with the **bare** transition energy
+    ``ΔE = E_c − E_v``.  BerkeleyGW hands PRIMME the **exact assembled
+    diagonal** of the BSE Hamiltonian (``Common/primme_interface.f90``), and
+    quantum-chemistry TDDFT calls the same object the standard preconditioner,
+    of which ``ΔE`` is the acknowledged cheap approximation.  This closes that
+    gap: it is what the reference implementation uses.
+
+    THE FORM, AND HOW ITS NORMALISATION WAS ESTABLISHED
+    ---------------------------------------------------
+    The diagonal element of a term is what the matvec returns for a unit
+    trial vector, so each term below is its own contraction read off the
+    matvec (``bse_stack_matvec``):
+
+        V_x[c,v,k] = Σ_MN  M_X[k,c,v,M] · V_q0[M,N] · conj(M_Y[k,c,v,N])
+        W_d[c,v,k] = Σ_MN  a[k,c,M] · W_q0[M,N] · b[k,v,N]
+            with a[k,c,M] = Σ_spinor |psi_c_X[k,c,·,M]|²
+                 b[k,v,N] = Σ_spinor |psi_v_Y[k,v,·,N]|²
+
+        diag(H) = ΔE + (V_x − W_d) / nk
+
+    **The ``1/nk`` and the coefficient on ``V_x`` are MEASURED, not assumed.**
+    Fitting ``diag(H_dense) − ΔE = α·V_x + β·W_d`` by least squares against the
+    dense materialisation of this very operator returns
+    ``α = +0.015625 = +1/64``, ``β = −0.015625 = −1/64`` on a deck with
+    ``nk = 64``, with a fit residual of **1.5e-15 eV** against a 0.123 eV
+    signal.  Note α = +1/nk and NOT +2/nk: the spin-singlet factor of two does
+    not appear on this noncolinear/spin-orbit deck, and assuming it would have
+    put the exchange term in at twice its weight.
+
+    COST
+    ----
+    Two fixed-shape einsums, once per solve: ~0.30 GFLOP against a matvec's
+    0.948 GFLOP and a solve's ~265 matvecs — **under a third of one matvec,
+    ~0.1% of the solve**.
+
+    SHARDING
+    --------
+    The BUILD contracts over μ (on ``x``) and ν (on ``y``) and therefore emits
+    collectives — once, here.  The APPLICATION
+    (:func:`bse_diagonal_precond`) is elementwise on the ``(c, v, k)`` shards
+    and emits **none**.  No ``shard_map`` is opened by either.
+
+    Parameters
+    ----------
+    W_q0 : (nmu, nnu) — the ``q = 0`` slice of ``W_q``.  Take it BEFORE the
+        driver's donated ifft consumes ``W_q``; reading it from ``W_R``
+        instead would make the answer depend on that ifft's norm convention.
+
+    Returns
+    -------
+    diag : (nc_pad, nv_pad, nk) real — same layout as ``ΔE``.
+    """
+    @jax.jit
+    def _build(eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y, V_q0):
+        dE = eps_c.T[:, None, :] - eps_v.T[None, :, :]          # (c, v, k)
+
+        a = jnp.sum(jnp.abs(psi_c_X) ** 2, axis=2)              # (k, c, mu)
+        b = jnp.sum(jnp.abs(psi_v_Y) ** 2, axis=2)              # (k, v, nu)
+        Y = jnp.einsum('kcM,MN->kcN', a.astype(W_q0.dtype), W_q0)
+        W_d = jnp.real(jnp.einsum('kcN,kvN->cvk', Y,
+                                  b.astype(W_q0.dtype)))
+
+        S = jnp.einsum('kcvM,MN->kcvN', M_X, V_q0)
+        V_x = jnp.real(jnp.einsum('kcvN,kcvN->cvk', S, jnp.conj(M_Y)))
+
+        out = dE + (V_x - W_d) / nk
+        if sharding is not None:
+            out = jax.lax.with_sharding_constraint(out, sharding)
+        return out
+
+    return _build(eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y, V_q0)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Diagonal preconditioner: 1 / (ΔE − λ + ε)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -191,6 +276,8 @@ def bse_diagonal_precond(
     *,
     epsilon_shift: float = 1e-3,
     sharding: Optional[NamedSharding] = None,
+    diag_H=None,
+    olsen: bool = False,
 ):
     """Build a diagonal preconditioner ``precond_fn(R, Lambda) → P``.
 
@@ -222,27 +309,53 @@ def bse_diagonal_precond(
         R, P shape (m, nc, nv, nk); Lambda shape (m,).
     """
     @jax.jit
-    def _impl(R, Lambda, eps_c_in, eps_v_in):
-        # ΔE[c, v, k] = E_c[k] − E_v[k]; same convention as bse_simple's D term.
-        delta_E = eps_c_in.T[:, None, :] - eps_v_in.T[None, :, :]
+    def _impl(R, Lambda, eps_c_in, eps_v_in, diag_in, X):
+        if diag_in is None:
+            # ΔE[c, v, k] = E_c[k] − E_v[k]; same convention as bse_simple's
+            # D term.  The BARE route: correct, cheap, and an approximation.
+            D = eps_c_in.T[:, None, :] - eps_v_in.T[None, :, :]
+        else:
+            # The EXACT assembled diagonal, built once per solve.  Same shape,
+            # same sharding, same elementwise application — the route change
+            # costs nothing per iteration.
+            D = diag_in
         if sharding is not None:
-            delta_E = jax.lax.with_sharding_constraint(delta_E, sharding)
-        # Broadcast: R is (m, c, v, k), Lambda is (m,), delta_E is (c, v, k).
-        denom = (delta_E[None, :, :, :]
+            D = jax.lax.with_sharding_constraint(D, sharding)
+        # Broadcast: R is (m, c, v, k), Lambda is (m,), D is (c, v, k).
+        denom = (D[None, :, :, :]
                  - Lambda[:, None, None, None]
-                 + jnp.asarray(epsilon_shift, dtype=delta_E.dtype))
+                 + jnp.asarray(epsilon_shift, dtype=D.dtype))
         denom_safe = jnp.where(jnp.abs(denom) < 1e-12,
                                jnp.asarray(1e-12, dtype=denom.dtype),
                                denom)
         P_out = R / denom_safe
+        if olsen and X is not None:
+            # OLSEN correction.  Plain Jacobi returns a direction with a
+            # component along the current Ritz vector, which the subspace
+            # already contains; Olsen projects it out:
+            #     P = (D−λ)^-1 R  −  α (D−λ)^-1 X ,
+            #     α = <X, (D−λ)^-1 R> / <X, (D−λ)^-1 X>
+            # Two BATCHED inner products, contracted as 'm...,m...->m', i.e.
+            # two (m,) all-reduces rather than 2m scalar ones — the lesson
+            # REORTH_EXPERIMENT §1.4 paid for.  This is what makes a SMALL
+            # epsilon_shift safe: without it, shrinking the shift makes the
+            # denominator near the band edge small and the Jacobi direction
+            # collapses onto X.
+            DX = X / denom_safe
+            num = jnp.einsum('m...,m...->m', jnp.conj(X), P_out)
+            den = jnp.einsum('m...,m...->m', jnp.conj(X), DX)
+            alpha = num / jnp.where(jnp.abs(den) < 1e-30,
+                                    jnp.asarray(1e-30, dtype=den.dtype), den)
+            P_out = P_out - alpha[:, None, None, None] * DX
         norms = jnp.sqrt(jnp.sum(jnp.abs(P_out) ** 2, axis=(1, 2, 3),
                                  keepdims=True))
         return P_out / jnp.maximum(norms, 1e-30)
 
-    def precond_fn(R, Lambda):
-        return _impl(R, Lambda, eps_c, eps_v)
+    def precond_fn(R, Lambda, X=None):
+        return _impl(R, Lambda, eps_c, eps_v, diag_H, X)
 
     return precond_fn
 
 
-__all__ = ["init_bse_subspace", "bse_diagonal_precond"]
+__all__ = ["init_bse_subspace", "bse_diagonal_precond",
+           "build_bse_exact_diagonal"]

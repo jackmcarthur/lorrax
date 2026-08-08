@@ -42,6 +42,74 @@ import jax.numpy as jnp
 import numpy as np
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  Instrumentation (BSE perf campaign, 2026-08-08)
+# ═══════════════════════════════════════════════════════════════════════
+#  These counters are incremented INSIDE jit bodies.  A jit body runs on
+#  host exactly once per TRACE, so one increment == one trace of that
+#  program at that shape signature.  That is the instrument a fixed-shape
+#  claim has to be proven against: ``compile_cache_stats()['compiles']``
+#  reads 0 on any run whose persistent cache is warm, no matter how many
+#  distinct programs the loop dispatches, so it can only ever prove the
+#  cache works -- never that the shapes are fixed.
+TRACE_COUNTS: dict = {}
+MATVEC_APPLICATIONS = [0]      # count of VECTORS H has been applied to
+LAST_RUN: dict = {}            # per-iteration history of the last davidson()
+
+
+def _tally(name, *shapes) -> None:
+    key = (name,) + tuple(str(t) for t in shapes)
+    TRACE_COUNTS[key] = TRACE_COUNTS.get(key, 0) + 1
+
+
+def reset_instrumentation() -> None:
+    TRACE_COUNTS.clear()
+    MATVEC_APPLICATIONS[0] = 0
+    LAST_RUN.clear()
+
+
+def instrumentation_summary() -> str:
+    lines = [f"[dav-instr] matvec applications (vectors): "
+             f"{MATVEC_APPLICATIONS[0]}",
+             f"[dav-instr] distinct traced programs: {len(TRACE_COUNTS)}"]
+    for k in sorted(TRACE_COUNTS, key=str):
+        lines.append(f"[dav-instr]   {k} -> {TRACE_COUNTS[k]} trace(s)")
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Subspace cap
+# ═══════════════════════════════════════════════════════════════════════
+#: ``m_max = DEFAULT_M_MAX_FACTOR * n_eig`` is the restart cap.
+#:
+#: This was 4 and 4 is a defect-shaped default, not merely a conservative one.
+#: On the Si 4x4x4 record deck (post exchange-conjugation, band-edge cluster
+#: 0.0177 meV inside a 7.8 eV spectrum) the shipped 4*n_eig **cannot reach
+#: 10 ueV at any budget**: it stalled at 30.8 ueV after 2420 matvec
+#: applications, where unrestarted Lanczos reaches 2.9 ueV in 265.  The cause
+#: is structural -- with m_max = 4*n_eig the subspace runs 20, 40, 60, 80 and
+#: then hard-restarts to 20, so a restart fires every FOUR iterations and
+#: discards all accumulated Krylov information.  The subspace never exceeds 80
+#: on a problem needing ~265 dimensions to resolve its band edge.
+#:
+#: Measured applications to target (0 missed), block = n_eig, eps = 1e-3:
+#:
+#:     m_max      1 meV    10 ueV   floor      vectors stored (V + HV)
+#:     4n           560      2360   6.54 ueV       160
+#:     6n           360      1320   0.24 ueV       240
+#:     8n           200       480   0.00 ueV       320
+#:     10n          180       240   0.01 ueV       400   <- knee
+#:     12n          180       240   0.01 ueV       480
+#:     16n          180       240   0.00 ueV       640
+#:
+#: 10 is the knee: 12n/16n/20n are identical on every column and cost more
+#: memory.  Davidson stores BOTH ``V`` and ``HV``, so the memory is
+#: ``2 * m_max`` vectors -- 20*n_eig, which at n_eig = 20 is 400 copies of one
+#: trial vector.  That is cheap at bse_dim = 1024 and is NOT cheap at
+#: production bse_dim; DAVIDSON_COMPETITIVE.md prices the crossover.
+DEFAULT_M_MAX_FACTOR = 10
+
+
 def _to_host(arr) -> np.ndarray:
     """Bring a (possibly multi-process) jax.Array to host as numpy.
 
@@ -204,6 +272,7 @@ def _ritz_and_residuals(V, HV, n_eig):
 
     Returns (eigenvalues, X, HX, R, res_norms).
     """
+    _tally('ritz_and_residuals', V.shape, n_eig)
     # (m, m) projections — ellipsis sums all trailing axes
     Hc = jnp.einsum('m...,n...->mn', jnp.conj(V), HV, optimize=True)
     Sc = jnp.einsum('m...,n...->mn', jnp.conj(V), V, optimize=True)
@@ -274,6 +343,7 @@ def _orthonormalise_batch(P):
     against-V projection — used to clean up the initial subspace V0.
     Returns ``(P_w, rank)``; see :func:`_whiten_rank_revealing`.
     """
+    _tally('orthonormalise_batch', P.shape)
     S_P = jnp.einsum('m...,n...->mn', jnp.conj(P), P, optimize=True)
     S_P = 0.5 * (S_P + S_P.conj().T)
     return _whiten_rank_revealing(S_P, P)
@@ -299,6 +369,7 @@ def _ortho_expand(V, P):
     absolute ``1e-12·I`` Cholesky floor did) is the divergence mechanism
     documented in the conditioning-policy block at the top of this module.
     """
+    _tally('ortho_expand', V.shape, P.shape)
     # Iterated classical Gram-Schmidt against V (twice for full numerical
     # orthogonality at the cost of one extra projection).
     for _ in range(2):
@@ -375,7 +446,7 @@ def warmup_davidson_jit(
     because fewer restarts means fewer near-converged expansions.
     """
     if m_max is None:
-        m_max = 10 * n_eig
+        m_max = DEFAULT_M_MAX_FACTOR * n_eig
     for m in range(n_eig, m_max + n_eig, n_eig):
         m_eff = min(m, m_max)
         shape = (m_eff,) + tuple(trailing_shape)
@@ -426,13 +497,15 @@ def davidson(
     X0 : (n_eig, *trailing)
         Explicit initial vectors (alternative to init_fn).
     m_max : int, optional
-        Max subspace dimension before restart. Default 10 × n_eig.
+        Max subspace dimension before restart. Default **10 x n_eig**.
 
-        MEASURED on the stored dense Si BSE matrix (n=1024, 20 roots, to
-        1 meV / 1e-3 meV on the lowest 20): ``4·n_eig`` needs 279 matvecs,
-        ``10·n_eig`` needs ~140 / ~160, and ``20·n_eig`` buys nothing over
-        ``10·n_eig``.  The old default was ``4·n_eig``, which restarts often
-        enough to throw away most of the subspace it just paid for.
+        MEASURED, not guessed (see the module note below), on the stored dense
+        Si BSE matrix (n=1024, 20 roots, to 1 meV / 1e-3 meV on the lowest 20):
+        ``4*n_eig`` needs 279 matvecs, ``10*n_eig`` needs ~140 / ~160, and
+        ``20*n_eig`` buys nothing over ``10*n_eig``.  The former ``4*n_eig``
+        default caps the subspace below what a clustered band edge needs and
+        restarts often enough to throw away most of the subspace it just paid
+        for; ``10*n_eig`` is the knee, and larger is pure memory.
     max_iter : int, optional
         Iteration cap. Default 100.
     tol : float, optional
@@ -476,11 +549,29 @@ def davidson(
     the absolute Cholesky floor never enter V.  See the conditioning-policy
     block at the top of this module for the measurement.
     """
+    import time as _time
+
     if precond_fn is None:
         precond_fn = _default_precond
     if m_max is None:
-        m_max = 10 * n_eig
+        m_max = DEFAULT_M_MAX_FACTOR * n_eig
+    # Floor clamp kept from main: a caller-supplied m_max below
+    # 2*n_eig cannot restart, so it is raised rather than obeyed.
     m_max = max(int(m_max), 2 * n_eig)
+
+    # Instrumentation: count the vectors H is applied to.  This is the
+    # campaign's comparison currency -- the matvec is bandwidth-bound at 84%
+    # of HBM peak (KERNEL_DEEPDIVE.md), so matvec count tracks time.
+    _apply_H_raw = apply_H
+
+    def apply_H(_V, _f=_apply_H_raw):
+        MATVEC_APPLICATIONS[0] += int(_V.shape[0])
+        return _f(_V)
+
+    LAST_RUN.clear()
+    LAST_RUN.update({'iter': [], 'mv': [], 'm': [], 'eig': [], 'res': [],
+                     't': []})
+    _t0 = _time.perf_counter()
 
     # ── initial subspace ──
     if X0 is not None:
@@ -523,7 +614,14 @@ def davidson(
         Lambda, X, HX, R, res = _ritz_and_residuals(V, HV, n_eig)
 
         # ── precondition (caller-provided, possibly JIT'd) ──
-        P = precond_fn(R, Lambda)
+        # An Olsen-corrected preconditioner needs the current Ritz vectors to
+        # project against; a plain Jacobi one does not.  Offer X and fall back,
+        # so both signatures work and neither caller has to know about the
+        # other.
+        try:
+            P = precond_fn(R, Lambda, X)
+        except TypeError:
+            P = precond_fn(R, Lambda)
 
         # ── convergence check (CPU) ──
         res_np = _to_host(res)
@@ -542,6 +640,12 @@ def davidson(
         n_conv = _count_converged(conv, n_eig)
 
         eigenvalues = Lambda_np
+        LAST_RUN['iter'].append(it)
+        LAST_RUN['mv'].append(MATVEC_APPLICATIONS[0])
+        LAST_RUN['m'].append(int(V.shape[0]))
+        LAST_RUN['eig'].append(np.asarray(Lambda_np, dtype=np.float64).copy())
+        LAST_RUN['res'].append(np.asarray(res_np, dtype=np.float64).copy())
+        LAST_RUN['t'].append(_time.perf_counter() - _t0)
         if verbose and (it <= 5 or it % 5 == 0 or n_conv == n_eig):
             print(f"  iter {it:3d}: m={V.shape[0]:3d}  mv={n_matvec:5d}  "
                   f"eig[0]={float(Lambda[0]):12.6f}  "

@@ -177,6 +177,11 @@ def solve_bse_sharded(
     atol: float = 1e-8,
     check_every: int = 4,
     solver_kind: str = "lanczos",
+    davidson_m_max: int | None = None,
+    davidson_precond: str = "bare",
+    davidson_olsen: bool = False,
+    trlan_m_max: int | None = None,
+    trlan_n_keep: int | None = None,
     davidson_n_random_init: int = 5,
     davidson_eps_shift_Ry: float = 1e-3,
     tda: bool = True,
@@ -271,6 +276,15 @@ def solve_bse_sharded(
     # donated jit lets XLA alias W_R onto W_q's buffer and lets the caller
     # drop the Python reference, so only ONE copy survives into the solve.
     # Value-identical: same helper, same axes, same norm, same operand.
+    # The q=0 slice of W_q, kept for the exact-diagonal preconditioner.  It
+    # must be taken HERE, before the donated ifft below consumes W_q: deriving
+    # it from W_R instead would make the answer depend on that ifft's norm
+    # convention, and it is a (mu, nu) slice of a (mu, nu, 4, 4, 4) tensor, so
+    # keeping it costs 1/64 of one W_q.
+    _W_q0 = data["W_q"][:, :, 0, 0, 0] if (
+        include_W and solver_kind == "davidson"
+        and davidson_precond == "exact") else None
+
     if include_W:
         with timing.section("bse.solve.W_ifft") as _sec_wifft:
             _W_ifft_donated = jax.jit(_W_local_ifftn, donate_argnums=(0,))
@@ -303,20 +317,79 @@ def solve_bse_sharded(
                                eps_c, eps_v, W_R, V_q0, M_X, M_Y)
 
         bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
+        # ── preconditioner route ──────────────────────────────────────
+        # "bare"  : 1/(dE - lam + eps)          -- what LORRAX has always done
+        # "exact" : 1/(diag(H) - lam + eps)     -- what BerkeleyGW hands PRIMME
+        # The exact diagonal is assembled ONCE here (two einsums, ~0.3 GFLOP,
+        # under a third of one matvec).  The per-iteration application is
+        # elementwise on the (c, v, k) shards either way: same shape, same
+        # sharding, ZERO collectives, no new shard_map, no retrace.
+        _diag_H = None
+        if davidson_precond == "exact":
+            if _W_q0 is None:
+                raise ValueError(
+                    "--davidson-precond exact needs the W term; this run has "
+                    "include_W=False, so diag(H) is just dE and the bare "
+                    "route is already exact.")
+            from .bse_davidson_helpers import build_bse_exact_diagonal
+            with timing.section("bse.solve.exact_diag"):
+                _diag_H = build_bse_exact_diagonal(
+                    eps_c, eps_v, psi_c_X, psi_v_Y, _W_q0, M_X, M_Y, V_q0,
+                    nk, sharding=NamedSharding(mesh_xy, P("x", "y", None)))
+                _diag_H.block_until_ready()
+            print(f"Davidson preconditioner: EXACT diag(H) "
+                  f"(dE + (V_x - W_d)/nk), assembled once", flush=True)
+        else:
+            print("Davidson preconditioner: bare dE", flush=True)
+        if davidson_olsen:
+            print("Davidson preconditioner: Olsen correction ON", flush=True)
+
         precond_fn = bse_diagonal_precond(
             eps_c, eps_v, sharding=NamedSharding(mesh_xy, P("x", "y", None)),
-            epsilon_shift=davidson_eps_shift_Ry)
+            epsilon_shift=davidson_eps_shift_Ry,
+            diag_H=_diag_H, olsen=davidson_olsen)
         X0 = init_bse_subspace(
             eps_c, eps_v, n_eig=n_eig,
             n_cond=int(data["n_cond"]), n_val=int(data["n_val"]),
             n_random=davidson_n_random_init,
             mesh=mesh_xy, sharding=bse_sharding)
 
+
+        # ── perf-campaign probe hooks (env-gated, no effect when unset) ──
+        # LORRAX_DAV_MVSCAN=w1,w2,...  time apply_H at each block width, so
+        #   the matvec-count currency can be converted to seconds honestly:
+        #   a width-20 block matvec is NOT 20 independent width-1 matvecs.
+        # LORRAX_DAV_TRACE=<path.npz>  dump the per-iteration history.
+        import os as _os
+        _mvscan = _os.environ.get("LORRAX_DAV_MVSCAN", "")
+        if _mvscan:
+            import time as _t
+            print("[mvscan] block-width scaling of the BSE matvec", flush=True)
+            print("[mvscan] width  wall_s     s/vector   rel_to_w1", flush=True)
+            _per1 = None
+            for _w in [int(x) for x in _mvscan.split(",") if x.strip()]:
+                _Vw = jnp.repeat(X0[:1], _w, axis=0) if _w > n_eig else X0[:_w]
+                _Vw = jax.lax.with_sharding_constraint(_Vw, sh.X)
+                _ = apply_H(_Vw); _.block_until_ready()          # warm
+                _reps = 5
+                _t0 = _t.perf_counter()
+                for _ in range(_reps):
+                    _o = apply_H(_Vw)
+                _o.block_until_ready()
+                _dt = (_t.perf_counter() - _t0) / _reps
+                if _per1 is None:
+                    _per1 = _dt / _w
+                print(f"[mvscan] {_w:5d}  {_dt:9.5f}  {_dt/_w:9.6f}  "
+                      f"{(_dt/_w)/_per1:8.3f}", flush=True)
+                del _Vw, _o
+
         # Pre-compile _ritz_and_residuals at every subspace size m ∈ {n_eig,
         # 2·n_eig, …, m_max} so the Davidson loop does not pay 4 separate
         # XLA compiles as the subspace grows between restarts. Compiles
         # ~2 s otherwise; with warmup this is a one-time up-front cost.
-        m_max_warm = 4 * n_eig
+        from solvers.davidson import DEFAULT_M_MAX_FACTOR
+        m_max_warm = (int(davidson_m_max) if davidson_m_max
+                      else DEFAULT_M_MAX_FACTOR * n_eig)
         warmup_davidson_jit(
             n_eig=n_eig,
             trailing_shape=tuple(X0.shape[1:]),
@@ -325,11 +398,39 @@ def solve_bse_sharded(
             sharding=bse_sharding,
         )
 
+        print(f"Davidson: m_max={m_max_warm} ({m_max_warm // n_eig}x n_eig), "
+              f"storing 2*m_max = {2 * m_max_warm} trial vectors", flush=True)
         eigenvalues, eigenvectors = davidson(
             apply_H, n_eig=n_eig, precond_fn=precond_fn, X0=X0,
+            m_max=m_max_warm,
             max_iter=max_iter, tol=atol if atol > 0 else 1e-8,
             verbose=True,
         )
+
+        # ── perf-campaign probe: trace + history dump (env-gated) ──
+        from solvers.davidson import (
+            TRACE_COUNTS as _DAV_TRACES,
+            MATVEC_APPLICATIONS as _DAV_MV,
+            LAST_RUN as _DAV_HIST,
+            instrumentation_summary as _dav_summary,
+        )
+        print(_dav_summary(), flush=True)
+        _trace_path = _os.environ.get("LORRAX_DAV_TRACE", "")
+        if _trace_path and jax.process_index() == 0:
+            import numpy as _np
+            _np.savez(
+                _trace_path,
+                iter=_np.asarray(_DAV_HIST.get('iter', [])),
+                mv=_np.asarray(_DAV_HIST.get('mv', [])),
+                m=_np.asarray(_DAV_HIST.get('m', [])),
+                eig=_np.asarray(_DAV_HIST.get('eig', [])),
+                res=_np.asarray(_DAV_HIST.get('res', [])),
+                t=_np.asarray(_DAV_HIST.get('t', [])),
+                n_distinct_programs=_np.asarray(len(_DAV_TRACES)),
+                total_matvec_applications=_np.asarray(_DAV_MV[0]),
+            )
+            print(f"[dav-instr] history -> {_trace_path}", flush=True)
+
         # ── RETURN CONVENTION ────────────────────────────────────────────────
         # Match the Lanczos return CONVENTION, not merely its shape.  The
         # Lanczos routes below pin ``out_shardings=(rep_eig, …)`` with
@@ -368,6 +469,81 @@ def solve_bse_sharded(
         # the sentinel (``bse_lanczos.py:49``, read at ``bse_jax.py:212``), so
         # the deferral is satisfied here and the honest value is kept.
         return eigenvalues, eigenvectors, jnp.int32(N_ITER_NOT_MEASURED)
+
+
+    # ── Thick-restart Lanczos: fixed-shape, memory-capped Krylov ──────────
+    # Same Krylov convergence as the unrestarted path, from a basis of
+    # ``m_max + 1`` slots instead of ``max_iter + 1``.  On a 1024-dim deck
+    # that trade is a loss (the unrestarted solve already fits); it exists
+    # for production ``bse_dim``, where a 400-vector basis does not.
+    #
+    # Everything is preallocated and every trip count is a compile-time
+    # constant, so the iteration traces at exactly one shape.  It opens NO
+    # shard_map of its own: the subspace algebra is ellipsis einsums whose
+    # batch axis is replicated and whose trailing axes carry ``sh.X``, which
+    # GSPMD lowers to the two CGS2 collectives per step; the only shard_map
+    # in the solve is the one ``matvec_ring`` already owns.
+    if solver_kind == "trlan":
+        from solvers.thick_restart_lanczos import thick_restart_lanczos_eig
+
+        psi_c_X = data["psi_c_X"]; psi_c_Y = data["psi_c_Y"]
+        psi_v_X = data["psi_v_X"]; psi_v_Y = data["psi_v_Y"]
+        eps_c   = data["eps_c"];   eps_v   = data["eps_v"]
+        V_q0    = data["V_q0"]
+        M_X     = data["M_X"];     M_Y     = data["M_Y"]
+
+        m_max = int(trlan_m_max) if trlan_m_max else max(3 * n_eig, 60)
+        n_keep = int(trlan_n_keep) if trlan_n_keep else n_eig + 10
+        # ``--max-lanczos-iter`` is read as a budget of matvec APPLICATIONS,
+        # so the A/B against the unrestarted path is like-for-like: both
+        # spend the same number of H applications.
+        per_cycle = m_max - n_keep
+        n_restarts = max(0, -(-(int(max_iter) - m_max) // per_cycle))
+        apps = m_max + n_restarts * per_cycle
+        bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
+        rep_tr = NamedSharding(mesh_xy, P())
+
+        print(f"Thick-restart Lanczos: n_eig={n_eig} m_max={m_max} "
+              f"n_keep={n_keep} restarts={n_restarts} -> {apps} matvec "
+              f"applications, basis {m_max + 1} slots "
+              f"({(m_max + 1) / (int(max_iter) + 1):.2f}x the unrestarted "
+              f"basis at the same budget)", flush=True)
+
+        # ONE jit, tensors as ARGUMENTS.  They span every process, so closing
+        # over them inside the traced loop body would carry them as constants
+        # -- the shape of mistake bse_feast's cached runner makes; inside a
+        # fori_loop it does not raise, it just builds a program that does not
+        # finish compiling.  Measured: 13 min without this, and counting.
+        @partial(
+            jax.jit,
+            in_shardings=(
+                sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
+                sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y,
+            ),
+            # Replicated out, matching the Lanczos path's contract, so
+            # --write-eigs is addressable at P>1 for this solver.
+            out_shardings=(rep_tr, rep_tr, rep_tr),
+        )
+        def _trlan_run(pcx, pcy, pvx, pvy, ec, ev, WR, Vq0, MX, MY):
+            def apply_H(V):
+                V = jax.lax.with_sharding_constraint(V, sh.X)
+                return matvec_ring(V, pcx, pcy, pvx, pvy, ec, ev, WR, Vq0,
+                                   MX, MY)
+            return thick_restart_lanczos_eig(
+                apply_H, (nc_pad, nv_pad, nk),
+                n_eig=n_eig, m_max=m_max, n_keep=n_keep,
+                n_restarts=n_restarts, sharding=bse_sharding,
+            )
+
+        eigenvalues, eigenvectors, alpha_im = _trlan_run(
+            psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
+            M_X, M_Y)
+        print(f"Thick-restart Lanczos: max |Im <q,Hq>| = "
+              f"{float(alpha_im):.3e} Ry", flush=True)
+        eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
+        # An HONEST third slot: the matvec applications actually spent, not
+        # an echo of the budget (CONVERGENCE_CENSUS recommendation 2).
+        return eigenvalues, eigenvectors, jnp.int32(apps)
 
     rep_eig = NamedSharding(mesh_xy, P())  # eigenvalues / eigenvectors come back replicated.
     # ``krep``: the Krylov basis sharding, or None to leave it to GSPMD (the
