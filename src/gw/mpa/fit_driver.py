@@ -156,10 +156,12 @@ def fit_one_block(
     returns ``cond_pade`` and no backward error — the backward error
     lives in ``diagnostics.solve_conditioning``, which re-solves the
     system AND re-runs the whole fit internally to report its forward
-    residual.  So one logical block costs two vmapped dispatches and
-    three Pade solves per element.  The cost report states all three
-    counts separately rather than quoting the flattering one; see
-    :func:`format_cost_report`.
+    residual.  So one logical block costs TWO complete fits per element
+    and THREE solves of the Pade-in-z^2 system: one in the fit, one
+    standalone in ``solve_conditioning``, and one more inside the fit
+    that function runs for itself.  The cost report states the
+    dispatches, the fits and the Pade solves separately rather than
+    quoting whichever is smallest; see :func:`format_cost_report`.
     """
     n = int(n_p)
     t_read = time.perf_counter()
@@ -226,7 +228,8 @@ def fit_one_block(
         "bytes_read": int(block.size) * mpa_store.COMPLEX128_BYTES,
         "fit_dispatches": 1,
         "diagnostic_dispatches": 1,
-        "kernel_solves": 3 * int(n_mu * n_cols),
+        "full_fits": 2 * int(n_mu * n_cols),
+        "pade_solves": 3 * int(n_mu * n_cols),
         "seconds_read": t_read,
         "seconds_fit": t_fit,
         "seconds_write": t_write,
@@ -308,7 +311,8 @@ def run_fit_driver(
         "peak_block_bytes": 0,
         "fit_dispatches": 0,
         "diagnostic_dispatches": 0,
-        "kernel_solves": 0,
+        "full_fits": 0,
+        "pade_solves": 0,
         "seconds": {"read": 0.0, "fit": 0.0, "write": 0.0,
                     "finalize": 0.0, "total": 0.0},
     }
@@ -329,7 +333,8 @@ def run_fit_driver(
                                          stats["bytes_read"])
         report["fit_dispatches"] += stats["fit_dispatches"]
         report["diagnostic_dispatches"] += stats["diagnostic_dispatches"]
-        report["kernel_solves"] += stats["kernel_solves"]
+        report["full_fits"] += stats["full_fits"]
+        report["pade_solves"] += stats["pade_solves"]
         report["seconds"]["read"] += stats["seconds_read"]
         report["seconds"]["fit"] += stats["seconds_fit"]
         report["seconds"]["write"] += stats["seconds_write"]
@@ -362,14 +367,22 @@ def format_cost_report(report):
     merely because it is one dispatch, and the two numbers are printed
     beside each other so nobody has to infer the second from the first.
 
-    ``kernel_solves`` is the honest count and it is three per element,
-    not one: the fit itself, plus the two inside
-    ``diagnostics.solve_conditioning`` — its own equilibrated solve and
-    the complete refit it runs to report a forward residual.  The store
-    requires a backward error and the fit kernel does not return one, so
-    that factor of three is a property of the seam between the two
-    modules rather than of this driver.  It is recorded here because the
-    design review is where it can be removed.
+    SO THREE COUNTS ARE PRINTED, NOT ONE.  ``dispatches`` is what the
+    scheduler sees: two vmapped launches per block.  ``full fits`` is
+    what the elements see: TWO per element, because the store requires
+    a backward error, ``pade_fit.fit_mpa_poles`` does not return one,
+    and the only supplier — ``diagnostics.solve_conditioning`` — runs a
+    complete fit of its own to report a forward residual beside it.
+    ``Pade solves`` is what the linear algebra sees: THREE per element,
+    the two fits' plus the standalone equilibrated solve
+    ``solve_conditioning`` does before them.
+
+    None of that factor is this driver's doing; it is a property of the
+    seam between the fit kernel and the staged store, and it is printed
+    rather than absorbed because the design review is where it can be
+    removed — a ``backward_error`` returned from ``fit_mpa_poles``
+    beside the ``cond_pade`` it already computes would collapse all
+    three counts to one dispatch, one fit and one solve.
     """
     r = report
     sec = r["seconds"]
@@ -390,9 +403,12 @@ def format_cost_report(report):
         f"(= 2*n_p per element: n_p Omega + n_p B)",
         f"  dispatches      {r['fit_dispatches']} fit + "
         f"{r['diagnostic_dispatches']} diagnostic, vmapped",
-        f"  kernel solves   {r['kernel_solves']} "
-        f"(3 per element: the fit, and the two inside "
-        f"solve_conditioning)",
+        f"  full fits       {r['full_fits']} "
+        f"(2 per element: the fit, and the one solve_conditioning "
+        f"runs to report a forward residual)",
+        f"  Pade solves     {r['pade_solves']} "
+        f"(3 per element: the two fits', plus solve_conditioning's own "
+        f"equilibrated solve)",
         f"  bytes read      {r['bytes_read']} B "
         f"({r['bytes_read'] / mib:.2f} MiB) against a budget of "
         f"{r['bytes_budget_total']} B "

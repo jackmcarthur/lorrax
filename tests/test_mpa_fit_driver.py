@@ -531,10 +531,13 @@ def test_cost_report_is_arithmetically_consistent(planted, fitted):
     assert r["bytes_budget_total"] == r["blocks_walked"] * r["tile_bytes"]
 
     # One vmapped dispatch per block for the fit, one for the
-    # diagnostics — and three Pade solves per element behind them.
+    # diagnostics — and behind them two complete fits and three Pade
+    # solves per element, because the store requires a backward error
+    # the fit kernel does not return.
     assert r["fit_dispatches"] == r["blocks_walked"]
     assert r["diagnostic_dispatches"] == r["blocks_walked"]
-    assert r["kernel_solves"] == 3 * r["elements_fitted"]
+    assert r["full_fits"] == 2 * r["elements_fitted"]
+    assert r["pade_solves"] == 3 * r["elements_fitted"]
 
     sec = r["seconds"]
     parts = sec["read"] + sec["fit"] + sec["write"] + sec["finalize"]
@@ -546,8 +549,8 @@ def test_cost_report_is_arithmetically_consistent(planted, fitted):
 def test_cost_report_text_states_what_the_plan_demands(fitted, capsys):
     """Printed once at finalize, and it says the load-bearing numbers."""
     text = fitted["text"]
-    for token in ("logical outputs", "dispatches", "kernel solves",
-                  "bytes read", "peak block", "seconds",
+    for token in ("logical outputs", "dispatches", "full fits",
+                  "Pade solves", "bytes read", "peak block", "seconds",
                   "columns read", "elements fitted"):
         assert token in text, f"cost report omits {token!r}"
     assert str(fitted["report"]["logical_outputs"]) in text
