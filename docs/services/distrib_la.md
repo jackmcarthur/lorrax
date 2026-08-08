@@ -362,12 +362,23 @@ subsequent calls.
 eigh legs and X for the cholesky legs, `np.array_equal` true, on cpu and
 on gpu. This is an interior restructure and the arrays say so.
 
-The eigh/cuSOLVERMp row is the only one where the branch is not faster,
-and it is not slower either: 12.70 s against 12.52 s is 1.59 s per matrix
-against 1.56 s, inside the run-to-run spread of a **flat ~1.55 s
-per-matrix collective charge** that § "The crossover" measures at
-1.56/1.60/1.76/1.59 across four shapes. Nothing in that leg is ours to
-move.
+The eigh/cuSOLVERMp row is the only one where the branch is not faster on
+a single run, and repeating it says it is not slower either. Warm seconds
+over three alternating runs on the same allocation:
+
+| run | `main` | branch |
+|---|---|---|
+| 1 | 12.518 | 12.702 |
+| 2 | 12.613 | 12.459 |
+| 3 | 12.537 | 12.503 |
+| mean | **12.556** | **12.555** |
+
+The ordering lands on the wrong side of the difference as often as the
+right one. That is what a **flat per-matrix collective charge** looks
+like: § "The crossover" measures cuSOLVERMp at 1.56/1.60/1.76/1.59 s per
+matrix across four shapes with **99.998% of it inside
+`cusolverMpSyevd`**. Nothing in that leg is ours to move, and the scan
+did not move it.
 
 **The compile count is the result to read.** The old serial route compiled
 per iteration on any wrapper without a jit cache; the scan compiles once,
