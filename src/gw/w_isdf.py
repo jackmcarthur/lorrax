@@ -320,7 +320,7 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
     # ≈ 4.4 k, re-paid every SC iteration).  Nothing wanted it: every
     # consumer either is layout-agnostic (sigma_dispatch, sc_iteration,
     # gw_jax) or immediately re-imposes exactly this layout —
-    # ``symmetry_maps.unfold_v_q`` (P(None,'x','y') in and out),
+    # ``symmetry_maps.unfold_isdf_operator`` (P(None,'x','y') in and out),
     # ``cohsex_sigma._convolve``'s 5-D V_FFT5D_SPEC = P(None,None,None,
     # 'x','y'), ``ppm_sigma.fit_ppm``'s q_shard, and
     # ``head_wing_schur`` which literally undid the replication by hand.

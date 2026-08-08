@@ -257,7 +257,7 @@ def main():
     # square is the identity.  Idempotence of the star average holds iff
     # the table is a GROUP -- {identity, roll-by-1} is not one (its square
     # is roll-by-2, absent from the table) and correctly fails this.
-    # compute_rgrid_sym_perm emits a group; an ad-hoc table need not.
+    # fft_grid_pullback_perm emits a group; an ad-hoc table need not.
     rolled = np.roll(np.arange(ngrid, dtype=np.int32).reshape(GRID),
                      nx // 2, axis=0).ravel()
     tab = np.stack([np.arange(ngrid, dtype=np.int32), rolled])

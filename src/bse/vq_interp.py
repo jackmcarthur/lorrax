@@ -333,6 +333,10 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
     runs, byte-identical.  It is optional so the host-only diagnostics and
     the fixture tests keep working on a bare checkout.
     """
+    # LAZY, and matching ``bse_io``'s own lazy ``from . import vq_interp``:
+    # the two modules reference each other and neither may be the one that
+    # forces the other at import time.
+    from . import bse_io
     zx = {"restart_file": restart_file, "zeta_file": zeta_file}
     # NOT a context manager: the handles outlive this call so the lazy
     # reads below stay serviceable.  ``zx`` owns them; drop them with
@@ -341,9 +345,37 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
     zx["_h5_restart"] = fr
     zx["psi"] = fr["psi_full_y"][()]          # (nk, nb, ns, n_mu) u at centroids
     zx["kgrid"] = fr["kgrid"][()].astype(int)
-    zx["Vqmunu"] = fr["V_qmunu"]              # LAZY — disk tiles (gate reference)
-    if "W0_qmunu" in fr:
-        zx["W0"] = fr["W0_qmunu"]             # LAZY — screened tiles (Hdir)
+    # LAZY — disk tiles (gate reference) — UNLESS the file stores the q
+    # wedge, in which case the tiles do not exist on disk and the unfold
+    # runs once, here, through ``bse_io.restart_munu_full_bz`` (the one
+    # seam; see its docstring for why all-at-once is the design and not a
+    # shortcut).  On every legacy and full-BZ file this binds the h5py
+    # handle exactly as it always did, so the lazy read path is unchanged
+    # for every restart file that exists today.
+    zx["Vqmunu"] = (bse_io.restart_munu_full_bz(fr["V_qmunu"], "V_qmunu",
+                                                restart_file)
+                    if bse_io.is_q_wedge(fr["V_qmunu"]) else fr["V_qmunu"])
+    # PRESENCE IS NOT PERSISTENCE.  ``gw_init`` allocates a full-size ZERO
+    # ``W0_qmunu`` unconditionally (``tagged_arrays.write_restart_state_to_h5``
+    # with ``init_W0=True``), so ``"W0_qmunu" in fr`` is true on a run whose
+    # ``persist_w0`` never fired and the tiles handed to ``build_hdir`` are
+    # zeros of exactly the right shape.  That is the April all-zero-screening
+    # mechanism: a plausible excitonic spectrum out of a W that was never
+    # written, with every shape check green.  ``tagged_arrays`` already stamps
+    # ``W0_ready`` (False for the placeholder, True when real data lands) and
+    # ``bse_io`` already gates on it in both of its readers; this path asks
+    # the same question instead of asking whether the dataset exists.
+    if "W0_qmunu" in fr and bool(fr["W0_qmunu"].attrs.get("W0_ready", False)):
+        # Same wedge question as V above, and the GUARD IS UNTOUCHED on
+        # purpose: ``test_bse_w0_ready_gate``'s ratchet requires every
+        # ``if`` binding ``zx["W0"]`` to test the persisted flag, so the
+        # q-storage branch goes on the right-hand side (a conditional
+        # EXPRESSION, not a nested ``if``) where it cannot teach that
+        # matcher an exception it would then carry forever.
+        zx["W0"] = (bse_io.restart_munu_full_bz(fr["W0_qmunu"], "W0_qmunu",
+                                                restart_file)
+                    if bse_io.is_q_wedge(fr["W0_qmunu"])
+                    else fr["W0_qmunu"])   # LAZY — screened tiles (Hdir)
     zx["enk"] = fr["enk_full"][()]            # (nk, nb) Ry
     _mesh_for_loader, _distributed = _zeta_mesh_for_loader(mesh, log_fn=log_fn)
     zl = ZetaLoader(zeta_file, mesh=_mesh_for_loader)
@@ -1578,7 +1610,48 @@ def run_nulls(zx, prep, des, coeffs):
 # block B is swapped between truth and prediction)
 # ===========================================================================
 def build_hdir(zx, q0, nvw=3, ncw=3):
+    # ABSENT means the restart file's W0 was never persisted — the loader
+    # binds this key only when ``W0_ready`` says so.  Say that, rather than
+    # letting a bare KeyError stand in for a diagnosis the loader already
+    # made.
+    if "W0" not in zx:
+        raise KeyError(
+            "build_hdir needs a persisted W0_qmunu, and the restart file "
+            "does not have one: the dataset is missing, or it is the "
+            "full-size ZERO placeholder gw_init allocates (W0_ready=False). "
+            "The direct term would be identically zero and the exciton "
+            "binding would be entirely absent — re-run GW screening before "
+            "trusting this diagnostic.")
     kg = zx["kgrid"]
+    # THE Q AXIS MUST BE THE FULL BZ, AND THIS IS THE ONLY PLACE THAT SAYS SO.
+    # ``qkk`` below is built from ``k_lookup`` and therefore holds FULL-BZ q
+    # indices, and ``W0[qkk[k]]`` fancy-indexes by them.  A W0 whose q axis
+    # is anything else — a q_irr wedge, a truncated write, a reshaped
+    # artifact — does not raise there.  It returns rows belonging to
+    # DIFFERENT q's, and this diagnostic then reports a plausible, wrong
+    # exciton spectrum: numbers that survive every downstream check because
+    # nothing downstream checks this.  The sharded readers in ``bse_io``
+    # (``_MunuSlabPlan``, ``_resolve_munu_reader``) already refuse exactly
+    # this disagreement; this site was the hole in that set.  Asked of the
+    # lazy handle, before any work, so the refusal costs nothing.
+    #
+    # The extents are read into locals BEFORE the test on purpose: the
+    # W0_ready ratchet in ``tests/test_bse_w0_ready_gate.py`` requires
+    # every ``if`` whose body names ``zx["W0"]`` to be testing the
+    # persisted flag, and it is right to.  This refusal is a different
+    # question about the same object, so it keeps the subscript out of
+    # the guarded body rather than teaching that matcher an exception.
+    _nq_expected = int(np.prod(np.asarray(kg, dtype=np.int64)))
+    _nq_w0 = int(zx["W0"].shape[0])
+    if _nq_w0 != _nq_expected:
+        raise ValueError(
+            f"build_hdir: W0_qmunu has {_nq_w0} q rows but the deck's "
+            f"k-grid {tuple(int(v) for v in np.asarray(kg))} needs "
+            f"{_nq_expected}.  The q lookup below indexes W0 by FULL-BZ "
+            f"q, so any other length silently returns the wrong rows "
+            f"instead of failing.  A q_irr wedge must be unfolded on read "
+            f"(symmetry_maps.qirr_store.read_tensor) before it reaches "
+            f"here.")
     cs = list(range(zx["nv"], zx["nv"] + ncw))
     vs = list(range(zx["nv"] - nvw, zx["nv"]))
     npair = zx["nk"] * ncw * nvw

@@ -105,6 +105,7 @@ Longer discussions of the load-bearing keys are in [drivers.md](drivers.md).
 | `eqp1_file` | `"eqp1.dat"` | BGW-format Z-linearized QP energies output (Z=1 in static COHSEX). |
 | `sigma_omega_h5_file` | `"sigma_mnk.h5"` | Sigma_c(omega,k,m,n) HDF5 output. |
 | `restart` | true | Reuse tmp/isdf_tensors_{n_rmu}.h5 (skip zeta-fit/V_q); guarded by band-window attrs + centroid-table md5 stamps. |
+| `write_restart_tensors` | true | Persist tmp/isdf_tensors_{n_rmu}.h5 at all. false skips every dataset (V_qmunu, G0_mu_nu, enk_full, psi_full_y, W0_qmunu, head scalars) with one rank-0 line. A COMPLEMENT to q_irr storage, not an alternative: this is for runs that DISCARD the artifact (nothing in gw_jax reads it back — measured 4.5 s of a ~21 s Si warm wall and 2.01 GB), while q_irr is for runs that KEEP it and want it 8x smaller. A BSE run against a directory written this way refuses on the missing file. |
 | `gspace_mode` | `"host_cache"` | psi(G) host lifecycle: host_cache (resident, default) | file_reread (rebuild per r-chunk; zero persistent residency). |
 | `write_wfn_h5` | true | End-of-run WFN_qp.h5 write (BGW format, psi rotated by the final U, E_QP energies). |
 | `strict_keys` | false | Unknown deck keys refuse (ValueError naming every one) instead of the default aggregated warning. |

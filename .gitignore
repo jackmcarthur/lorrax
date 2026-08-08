@@ -78,6 +78,7 @@ src/ffi/**/CMakeFiles/
 src/ffi/**/cmake_install.cmake
 site/
 .tier2_cross_p/
+.restart_q_storage_ab/
 .padprobe/
 # Stray compiler default-output scrap. Do NOT blanket-ignore *.out:
 # tracked reference files match it (src/psp/psp_dataclass.out,

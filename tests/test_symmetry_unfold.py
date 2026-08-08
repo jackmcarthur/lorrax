@@ -39,7 +39,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from symmetry_maps import (                                     # noqa: E402
-    SymMaps, compute_centroid_sym_perm, find_irreducible_bz_points,
+    SymMaps, centroid_source_map_and_wrap, find_irreducible_bz_points,
 )
 
 
@@ -154,7 +154,7 @@ def test_full_bz_lookup_is_bijective_per_orbit():
 
 
 # ---------------------------------------------------------------------------
-# compute_centroid_sym_perm
+# centroid_source_map_and_wrap
 # ---------------------------------------------------------------------------
 
 def _orbit_close_centroids(fft_grid, sym_matrices):
@@ -186,7 +186,7 @@ def test_centroid_sym_perm_identity_only_is_identity():
     """One-element sym group → π_0 = identity permutation."""
     fft_grid = (8, 8, 8)
     r_mu = np.array([[1, 2, 3], [4, 5, 6], [0, 0, 0]], dtype=np.int32)
-    perm, L = compute_centroid_sym_perm(
+    perm, L = centroid_source_map_and_wrap(
         r_mu, sym_matrices=np.eye(3, dtype=int)[None],
         translations=np.zeros((1, 3)),
         fft_grid=fft_grid,
@@ -201,7 +201,7 @@ def test_centroid_sym_perm_under_inversion_closed_set():
     sym = np.stack([np.eye(3, dtype=int),
                     -np.eye(3, dtype=int)], axis=0)
     r_mu = _orbit_close_centroids(fft_grid, sym).astype(np.int32)
-    perm, _L = compute_centroid_sym_perm(
+    perm, _L = centroid_source_map_and_wrap(
         r_mu, sym_matrices=sym,
         translations=np.zeros((2, 3)),
         fft_grid=fft_grid,
@@ -225,7 +225,7 @@ def test_centroid_sym_perm_raises_on_open_orbit():
     # Pick a centroid whose inversion partner is missing.
     r_mu = np.array([[1, 2, 3]], dtype=np.int32)
     with pytest.raises(RuntimeError, match="orbit closure failed"):
-        compute_centroid_sym_perm(
+        centroid_source_map_and_wrap(
             r_mu, sym_matrices=sym,
             translations=np.zeros((2, 3)),
             fft_grid=fft_grid,
@@ -258,7 +258,7 @@ def test_centroid_sym_perm_with_nonsymmorphic_tau():
     r_mu = np.vstack(images).astype(np.int32)
     _, uidx = np.unique(r_mu, axis=0, return_index=True)
     r_mu = r_mu[np.sort(uidx)]
-    perm, _L = compute_centroid_sym_perm(
+    perm, _L = centroid_source_map_and_wrap(
         r_mu, sym_matrices=sym, translations=tau, fft_grid=fft_grid,
     )
     np.testing.assert_array_equal(perm[0], np.arange(r_mu.shape[0]))
@@ -285,7 +285,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 # The service path bootstrap ran with this module's FIRST import block, at
 # the top of the file; it is idempotent and once is enough.
 from symmetry_maps import (                                     # noqa: E402
-    compute_centroid_sym_perm, unfold_v_q,
+    centroid_source_map_and_wrap, unfold_isdf_operator,
 )
 
 
@@ -318,15 +318,15 @@ def _build_geometry_vq():
 # Test 1: extend_trs=True returns the right shape and content.
 # ===========================================================================
 
-def test_compute_centroid_sym_perm_extend_trs_shape_and_content():
+def test_centroid_source_map_and_wrap_extend_trs_shape_and_content():
     fft_grid, sym_matrices, translations, cent_idx = _build_geometry_vq()
     n_sym = sym_matrices.shape[0]
     n_rmu = cent_idx.shape[0]
 
-    sp_default, L_default = compute_centroid_sym_perm(
+    sp_default, L_default = centroid_source_map_and_wrap(
         cent_idx, sym_matrices, 2.0 * np.pi * translations, fft_grid,
         validate=True)
-    sp_trs, L_trs = compute_centroid_sym_perm(
+    sp_trs, L_trs = centroid_source_map_and_wrap(
         cent_idx, sym_matrices, 2.0 * np.pi * translations, fft_grid,
         validate=True, extend_trs=True)
 
@@ -343,11 +343,11 @@ def test_compute_centroid_sym_perm_extend_trs_shape_and_content():
     np.testing.assert_array_equal(L_trs[n_sym:], L_default)
 
 
-def test_compute_centroid_sym_perm_extend_trs_each_row_is_permutation():
+def test_centroid_source_map_and_wrap_extend_trs_each_row_is_permutation():
     """Sanity: each row (including TRS half) is a permutation of [0, n_rmu)."""
     fft_grid, sym_matrices, translations, cent_idx = _build_geometry_vq()
     n_rmu = cent_idx.shape[0]
-    sp, _L = compute_centroid_sym_perm(
+    sp, _L = centroid_source_map_and_wrap(
         cent_idx, sym_matrices, 2.0 * np.pi * translations, fft_grid,
         validate=True, extend_trs=True)
     for s in range(sp.shape[0]):
@@ -356,7 +356,7 @@ def test_compute_centroid_sym_perm_extend_trs_each_row_is_permutation():
 
 
 # ===========================================================================
-# Test 2: _unfold_v_q_ibz_to_full applied to a synthetic Hermitian V_ibz
+# Test 2: the IBZ→full-BZ unfold applied to a synthetic Hermitian V_ibz
 # with mixed spatial-and-TRS folding.
 # ===========================================================================
 
@@ -365,8 +365,8 @@ def _make_mesh():
     return Mesh(devs, ('x', 'y'))
 
 
-def _hand_unfold_v_q(V_ibz, *, irr_idx, sym_idx,
-                     sym_perm, L_table, q_irr_frac, ntran):
+def _hand_unfold_isdf_operator(V_ibz, *, irr_idx, sym_idx,
+                               sym_perm, L_table, q_irr_frac, ntran):
     """Reference: pure numpy unfold with TRS conj + L umklapp phase.
 
     For spatial s < ntran:
@@ -392,7 +392,7 @@ def _hand_unfold_v_q(V_ibz, *, irr_idx, sym_idx,
     return V_full
 
 
-def test_unfold_v_q_ibz_to_full_handles_trs_rows():
+def test_unfold_isdf_operator_ibz_to_full_handles_trs_rows():
     """Hand-build a synthetic Hermitian V_ibz and full→IBZ map with at
     least one TRS-only-reachable q, run the codebase unfold, compare
     to the per-element reference.
@@ -401,7 +401,7 @@ def test_unfold_v_q_ibz_to_full_handles_trs_rows():
     ntran = sym_matrices.shape[0]
     n_rmu = cent_idx.shape[0]
 
-    sym_perm, L_table = compute_centroid_sym_perm(
+    sym_perm, L_table = centroid_source_map_and_wrap(
         cent_idx, sym_matrices, 2.0 * np.pi * translations, fft_grid,
         validate=True, extend_trs=True)
 
@@ -432,7 +432,7 @@ def test_unfold_v_q_ibz_to_full_handles_trs_rows():
                           dtype=np.float64)
 
     # Reference unfold.
-    V_ref = _hand_unfold_v_q(
+    V_ref = _hand_unfold_isdf_operator(
         V_ibz, irr_idx=full_to_irr_idx,
         sym_idx=full_to_irr_sym, sym_perm=sym_perm,
         L_table=L_table, q_irr_frac=q_irr_frac, ntran=ntran)
@@ -443,7 +443,7 @@ def test_unfold_v_q_ibz_to_full_handles_trs_rows():
     V_sh = NamedSharding(mesh, P(None, 'x', 'y'))
     V_ibz_j = jax.device_put(V_ibz.astype(np.complex128), V_sh)
     V_full = np.asarray(jax.device_get(
-        unfold_v_q(
+        unfold_isdf_operator(
             V_ibz_j,
             irr_idx=full_to_irr_idx,
             sym_idx=full_to_irr_sym,
@@ -461,14 +461,14 @@ def test_unfold_v_q_ibz_to_full_handles_trs_rows():
         f"{np.max(np.abs(V_full - V_ref).reshape(V_full.shape[0], -1), axis=-1)}")
 
 
-def test_unfold_v_q_ibz_to_full_hard_fails_without_extend_trs():
+def test_unfold_isdf_operator_ibz_to_full_hard_fails_without_extend_trs():
     """If caller forgets ``extend_trs=True`` AND any full-q needs TRS,
     the unfold must raise a clear error instead of silently clipping.
     """
     fft_grid, sym_matrices, translations, cent_idx = _build_geometry_vq()
     ntran = sym_matrices.shape[0]
 
-    sym_perm_legacy, L_legacy = compute_centroid_sym_perm(
+    sym_perm_legacy, L_legacy = centroid_source_map_and_wrap(
         cent_idx, sym_matrices, 2.0 * np.pi * translations, fft_grid,
         validate=True, extend_trs=False)         # length ntran rows!
 
@@ -487,7 +487,7 @@ def test_unfold_v_q_ibz_to_full_hard_fails_without_extend_trs():
     # rows), so the consistency check raises before the OOB check.
     # Either error message is acceptable — they both flag the bug.
     with pytest.raises(ValueError, match=r"(TRS-augmented|inconsistent)"):
-        unfold_v_q(
+        unfold_isdf_operator(
             V_ibz_j,
             irr_idx=full_to_irr_idx,
             sym_idx=full_to_irr_sym,
@@ -499,14 +499,16 @@ def test_unfold_v_q_ibz_to_full_hard_fails_without_extend_trs():
 
 
 if __name__ == "__main__":
-    test_compute_centroid_sym_perm_extend_trs_shape_and_content()
-    print("test_compute_centroid_sym_perm_extend_trs_shape_and_content OK")
-    test_compute_centroid_sym_perm_extend_trs_each_row_is_permutation()
-    print("test_compute_centroid_sym_perm_extend_trs_each_row_is_permutation OK")
-    test_unfold_v_q_ibz_to_full_handles_trs_rows()
-    print("test_unfold_v_q_ibz_to_full_handles_trs_rows OK")
-    test_unfold_v_q_ibz_to_full_hard_fails_without_extend_trs()
-    print("test_unfold_v_q_ibz_to_full_hard_fails_without_extend_trs OK")
+    test_centroid_source_map_and_wrap_extend_trs_shape_and_content()
+    print("test_centroid_source_map_and_wrap_extend_trs_shape_and_content OK")
+    test_centroid_source_map_and_wrap_extend_trs_each_row_is_permutation()
+    print("test_centroid_source_map_and_wrap_extend_trs"
+          "_each_row_is_permutation OK")
+    test_unfold_isdf_operator_ibz_to_full_handles_trs_rows()
+    print("test_unfold_isdf_operator_ibz_to_full_handles_trs_rows OK")
+    test_unfold_isdf_operator_ibz_to_full_hard_fails_without_extend_trs()
+    print("test_unfold_isdf_operator_ibz_to_full"
+          "_hard_fails_without_extend_trs OK")
 
 
 # ===========================================================================

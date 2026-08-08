@@ -264,8 +264,8 @@ def _resolve_symmetry(args, wfn, sym, charge_density):
         return None, None, None, 1, False
     from ffi import _services
     _services.ensure_on_path()
-    from symmetry_maps import build_real_space_syms
-    R, Rinv, tau = build_real_space_syms(
+    from symmetry_maps import real_space_action_tables
+    R, Rinv, tau = real_space_action_tables(
         wfn, sym, charge_density=charge_density)
     n_sym = int(R.shape[0])
     if args.orbit or n_sym > 1:
@@ -329,7 +329,7 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
         _, reps_snapped, _ = snap_centroids_to_grid(
             centroids_frac, fft_grid, deduplicate=False)
         # Unfold with Rinv = inv(mtrx): the BGW r-action is r' = Rinv·r + τ,
-        # matching compute_centroid_sym_perm and validate_atomic_symmetries.
+        # matching centroid_source_map_and_wrap and validate_atomic_symmetries.
         # A no-op vs forward S on symmorphic systems (CrI3, MoS2); critical
         # for Si Fd-3m.
         from ffi import _services

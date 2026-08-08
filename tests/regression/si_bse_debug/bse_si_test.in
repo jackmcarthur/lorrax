@@ -2,7 +2,7 @@
 [cohsex]
 
 restart = false
-centroids_file = centroids_frac_480.txt
+centroids_file = centroids_frac_480_orbitclosed.txt
 
 nval = 8
 ncond = 52

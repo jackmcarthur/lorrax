@@ -67,4 +67,9 @@ with `-m extra`): tooling/experimental/out-of-repo-fixture suites —
 ## multi_device/
 
 Cross-P invariance scripts (different GPU counts) — driven by
-`multi_device/run_tier2.sh` under SLURM, not collected by pytest.
+`multi_device/run_tier2.sh` under SLURM, not collected by pytest.  The same
+directory now also holds the arms that need a real `.so` pair rather than a
+second GPU count: `multi_device/restart_q_storage_ab.sh` is the full-BZ vs
+IBZ-wedge restart A/B, which cannot be a pytest cell because SlabIO needs the
+phdf5 FFI and every restart-writer cell in the tree is red without it.  See
+`multi_device/README.md` for the roster and the measured record of each.
