@@ -1534,18 +1534,60 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     log_fn(f"  fH eig last 5:  {np.asarray(_e_tail)}")
     timing.record("ht.diagnostics", _perf() - _t0)         # instrument:
 
-    # S Cholesky (rank × rank, replicated, small) — bundle the symmetrise +
-    # ridge + cholesky into one jit so each line isn't a separate compile.
     _t0 = _perf()                                          # instrument:
-    @jax.jit
-    def _build_S_chol(S):
-        S_sym = (S + S.conj().T) * 0.5
-        S_sym += 1e-10 * jnp.mean(jnp.real(jnp.diag(S_sym))) * jnp.eye(rank, dtype=S_sym.dtype)
-        return jnp.linalg.cholesky(S_sym)
-    S_chol = _build_S_chol(S)
+    # ── THE METRIC ROUTE — S is the identity, and the code already knows it ──
+    #
+    # ``_kpath_batch`` below reduces a GENERALIZED eigenproblem fH_q c = λ S c
+    # by two triangular solves against chol(S) per q.  But S has exactly ONE
+    # producer — ``streaming_galerkin_solve`` returns
+    #     S = jax.jit(lambda: jnp.eye(rank, dtype=jnp.complex128), …)()
+    # (see its closing lines) — because the α basis is Cholesky-orthogonalised
+    # upstream, which is the whole point of ``_finalize``'s ``coeffs @ L``.  The
+    # other consumer of the identical math, ``bse_setup._q_batch``, already
+    # takes S = I for granted: it calls ``jnp.linalg.eigh(fH_q)`` with no
+    # metric at all.  The two solves here are vestigial.
+    #
+    # WHAT THEY COST.  Each ``solve_triangular`` of a (rank, rank) triangular
+    # factor against a (rank, rank) right-hand side is rank³/2 complex MACs, so
+    # the pair is ~8·rank³ real flops per q against the ~5.3·rank³ of the
+    # eigenvalues-only Hermitian eigensolve they feed.  They are the LARGER
+    # half of the arithmetic in the batch — and the Fourier sum this whole
+    # workstream is about is 8·N_k·rank², a further factor rank/N_k below both.
+    #
+    # WHAT THEY CHANGE.  With S = I the ridge makes S_sym = (1+1e-10)·I, so
+    # chol(S) = sqrt(1+1e-10)·I and the pair divides every eigenvalue by
+    # (1+1e-10) — a systematic -1e-10 RELATIVE shift of λ, applied for no
+    # reason.  Skipping them is therefore not bit-identical; it is analytically
+    # exact and removes a small bias rather than adding one.  The measured
+    # energy delta on the reference deck is in HTRANSFORM_FFT.md §6.
+    #
+    # The route is decided ONCE, from the data, and announced.  A caller that
+    # ever hands this driver a non-identity S keeps the Cholesky path
+    # unchanged — the branch is on a measured deviation, not on an assumption.
+    @partial(jax.jit, out_shardings=rep)
+    def _s_dev_from_eye(S_in):
+        return jnp.max(jnp.abs(S_in - jnp.eye(rank, dtype=S_in.dtype)))
+
+    _s_dev = float(_s_dev_from_eye(S))
+    metric_route = "identity" if _s_dev == 0.0 else "cholesky"
+    log_fn(f"  [route] fH_q metric: {metric_route}  (max|S - I| = {_s_dev:.3e}; "
+           f"'identity' skips 2 triangular solves of {rank}³/2 complex MACs per q)")
+
+    S_chol = None
+    if metric_route == "cholesky":
+        # Built ONLY on the path that uses it — on the identity route this
+        # compile (one XLA program, 0.34 s cache-cold) is not paid at all,
+        # which is what keeps the route program-count-neutral.
+        @jax.jit
+        def _build_S_chol(S):
+            S_sym = (S + S.conj().T) * 0.5
+            S_sym += 1e-10 * jnp.mean(jnp.real(jnp.diag(S_sym))) * jnp.eye(rank, dtype=S_sym.dtype)
+            return jnp.linalg.cholesky(S_sym)
+        S_chol = _build_S_chol(S)
 
     R_grid = jnp.asarray(build_R_grid_np(kgrid))
-    jax.block_until_ready((S_chol, R_grid))                # instrument:
+    jax.block_until_ready(                                 # instrument:
+        (R_grid,) if S_chol is None else (S_chol, R_grid)) # instrument:
     timing.record("ht.S_chol", _perf() - _t0)              # instrument:
 
     # ── Kpath-batch processing ───────────────────────────────────────────
@@ -1585,6 +1627,12 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         # order costs a second all-to-all for ``swapaxes``.
         mat = jax.lax.with_sharding_constraint(mat, batch_mat_shard)
         mat = mat + jnp.swapaxes(mat, 1, 2).conj()
+
+        if S_chol is None:
+            # S = I (see the metric-route block above).  ``mat`` was hermitized
+            # two lines up and ``eigvalsh`` reads one triangle, so the dropped
+            # ``(z + zᴴ)/2`` cannot move an eigenvalue either.
+            return jax.vmap(jnp.linalg.eigvalsh)(mat)
 
         def _solve_one(m):
             y = jsp_linalg.solve_triangular(S_chol, m, lower=True)

@@ -1,6 +1,6 @@
 """``h_transform``'s kpath gates: the P>1 output fetch, the route, the metric.
 
-Cells for three separate claims from HTRANSFORM_FFT.md, all reached by
+Three cells, three separate claims from HTRANSFORM_FFT.md, all reached by
 driving the real ``h_transform`` on a synthetic-but-legal Galerkin triple:
 
 * ``test_post_kpath_outputs_are_replicated`` — the RED TWIN for the crash that
@@ -116,3 +116,34 @@ def test_kpath_route_line_says_scan_for_a_band_path():
     banner = " ".join(lines)
     assert "[route] kpath fH_q: scan" in banner, banner
     assert "[route] fH_q metric: identity" in banner, banner
+
+
+def test_identity_metric_route_matches_the_cholesky_route():
+    """The S = I fast path drops two triangular solves per q.  It is NOT
+    bit-identical — the shipped path divides every eigenvalue by (1+1e-10)
+    through the ridge on chol(S) — so this cell pins the size of that
+    difference rather than asserting an equality that is not true."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from bandstructure.htransform import h_transform
+    mesh = _mesh(1)
+    meta, ct, enk, wfn, kpath_data = _kpath_inputs()
+    rank = ct.shape[2]
+    S_eye = jnp.eye(rank, dtype=jnp.complex128)
+    # A metric that is the identity to the LAST BIT except for one entry
+    # perturbed far above the route's ``== 0.0`` test: same physics, but it
+    # forces the Cholesky route so the two can be compared at all.
+    S_near = S_eye.at[0, 0].add(1e-13)
+    outs = []
+    for S in (S_eye, S_near):
+        lines = []
+        with mesh:
+            outs.append(h_transform(meta, S, jnp.asarray(ct), jnp.asarray(enk),
+                                    wfn, kpath_data, lines.append, mesh,
+                                    diagnostics=False))
+        banner = " ".join(lines)
+        outs[-1] = (outs[-1], "identity" in banner.split("metric: ")[1][:10])
+    (a, a_id), (b, b_id) = outs
+    assert a_id and not b_id, (a_id, b_id)
+    d = float(np.max(np.abs(a["energies_sorted"] - b["energies_sorted"])))
+    assert d < 1e-6, f"identity route moved an energy by {d:.3e} Ry"
