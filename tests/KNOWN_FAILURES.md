@@ -51,8 +51,21 @@ not the code.  Full prose manifest:
 | w-omega `CHAIN_REL_TOL` gate (`tests/test_bse_w_omega_chain_scan.py`) | frozen-reference based; W-chain quantities move with the fix | expected red; re-cut owned by the perf lane |
 | exciton-bands warm-cache eigenvalue check | frozen-reference based | expected red; re-cut owned by the perf lane |
 
-Expected to HOLD (structural, not frozen-spectrum): `test_bse_vq_interp`
-thresholds and the non-TDA SHAO gates.
+Expected to HOLD (structural, not frozen-spectrum): the non-TDA SHAO gates.
+
+**CORRECTION (same day, found by the perf lane's htransform worker and
+A/B-attributed here):** `tests/test_bse_vq_interp.py::
+test_loo_accuracy_vs_reference_thresholds` was listed above as expected to
+hold and is in fact RED — green at `22d99b5e`, red at `724e5bcb`, B-block
+LOO median 0.0796 against a 0.022 threshold (both arms re-measured on one
+worktree, one pin set).  The cell skips on WSL, which is how "expected to
+hold" went unverified.  Mechanism: the landing flipped `vq_interp`'s
+b_block conjugation, so the B tensor changed BY DESIGN and the thresholds
+were tuned empirically against the old, wrong object.  The re-cut wave
+re-derives them on the fixed tree; if the re-derived floor lands far above
+the old one, that is a finding about the correct B block's
+interpolability, not a tuning artifact — the re-derivation itself
+adjudicates.  Evidence: `~/lorrax_bse_perf_2026-08-08/HTRANSFORM_FFT.md`.
 
 **The re-cut prescription is three pins, all mandatory** (evidence:
 `~/lorrax_bse_perf_2026-08-08/CONVERGENCE_CENSUS.md`): cut at the gate's own
