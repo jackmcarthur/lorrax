@@ -1268,6 +1268,7 @@ def initialize_kpath(wfn, params):
 
 def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 a_band_index: int | None = None):
+    from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
     rank = ctilde.shape[2]
@@ -1275,9 +1276,12 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
 
     rep = NamedSharding(mesh_xy, P())  # fully replicated, used for diagnostics
 
+    _t0 = _perf()                                          # instrument:
     coeffs = ctilde.reshape(nk, states, rank)
     fH_k, fH_R, (a_f, n_f, shift), f_eps = build_fH_R(
         coeffs, enk_sigma, kgrid, mesh_xy, a_band_index=a_band_index, log_fn=log_fn)
+    jax.block_until_ready((fH_k, fH_R, f_eps))             # instrument:
+    timing.record("ht.build_fH_R", _perf() - _t0)          # instrument:
 
     # Diagnostics. Split into two small jits:
     #   _diag_stats_fast  — sharding-respecting reductions on the full fH_k
@@ -1305,6 +1309,7 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         return (eig_err, f_exp0[:5], eigs0[:5], f_exp0[-5:],
                 eigs0[states - 5:states])
 
+    _t0 = _perf()                                          # instrument:
     re_min, re_max, im_max = _diag_stats_fast(fH_k)
     log_fn("fH_k real range: [{:.3e}, {:.3e}], |imag|max={:.3e}".format(
         float(re_min), float(re_max), float(im_max)))
@@ -1317,9 +1322,11 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     log_fn(f"  fH eig first 5: {np.asarray(_e_head)}")
     log_fn(f"  f(eps) last 5:  {np.asarray(_f_tail)}")
     log_fn(f"  fH eig last 5:  {np.asarray(_e_tail)}")
+    timing.record("ht.diagnostics", _perf() - _t0)         # instrument:
 
     # S Cholesky (rank × rank, replicated, small) — bundle the symmetrise +
     # ridge + cholesky into one jit so each line isn't a separate compile.
+    _t0 = _perf()                                          # instrument:
     @jax.jit
     def _build_S_chol(S):
         S_sym = (S + S.conj().T) * 0.5
@@ -1328,6 +1335,8 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     S_chol = _build_S_chol(S)
 
     R_grid = jnp.asarray(build_R_grid_np(kgrid))
+    jax.block_until_ready((S_chol, R_grid))                # instrument:
+    timing.record("ht.S_chol", _perf() - _t0)              # instrument:
 
     # ── Kpath-batch processing ───────────────────────────────────────────
     # fH_R stays SHARDED P(None, 'x', 'y'): the (rank, rank) face is split
@@ -1395,7 +1404,9 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         m = jax.lax.with_sharding_constraint(m, face_one_shard)
         return jnp.min(jnp.max(jnp.abs(fH_k - m), axis=(1, 2)))
 
+    _t0 = _perf()                                          # instrument:
     rt_err = float(_gamma_rt(fH_R, fH_k))
+    timing.record("ht.gamma_roundtrip", _perf() - _t0)     # instrument:
     log_fn(f"FFT Γ round-trip max error: {rt_err:.3e}")
 
     fermi_energy = float(wfn.efermi)
@@ -1438,16 +1449,22 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         # the extra q are zero rows already appended here and already dropped
         # by the ``[:nq]`` slice in ``_post_kpath``, so this changes how many
         # q are evaluated and where, never a value.
+        _t0 = _perf()                                      # instrument:
         batch_size = _pad_to(mesh_xy, ('x', 'y'), 32)
         nq = int(kpath_frac.shape[0])
         n_pad = (-nq) % batch_size
         wrapped_k = _prep_kpath(kpath_frac, int(n_pad))
         nq_padded = wrapped_k.shape[0]
+        jax.block_until_ready(wrapped_k)                   # instrument:
+        timing.record("ht.kpath_prep", _perf() - _t0)      # instrument:
+        _t0 = _perf()                                      # instrument:
         lambda_q_list = []
         for i in range(0, nq_padded, batch_size):
             batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R, S_chol)
             lambda_q_list.append(batch_eigs)
             jax.block_until_ready(batch_eigs)
+        timing.record("ht.kpath_loop", _perf() - _t0,      # instrument:
+                      count=len(lambda_q_list))            # instrument:
 
         # Bundle concat + slice + vmap(newton_inv) + sort into ONE jit so the
         # post-loop processing emits one compile rather than 4 (concatenate,
@@ -1459,9 +1476,12 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
             energies_sorted = jnp.sort(energies, axis=1)[:, :nb_keep]
             return energies, energies_sorted
 
+        _t0 = _perf()                                      # instrument:
         energies_on_path, energies_sorted_jax = _post_kpath(
             tuple(lambda_q_list), int(nq), int(nb_keep))
         energies_sorted = np.asarray(energies_sorted_jax)
+        timing.record("ht.post_kpath", _perf() - _t0)      # instrument:
+        _t0 = _perf()                                      # instrument:
         # Determine Fermi energy as the maximum along path of the wfn.nelec-th band (1-based -> 0-based)
         fermi_band_idx = int(wfn.nelec) - 1
         if 0 <= fermi_band_idx < energies_sorted.shape[1]:
@@ -1489,6 +1509,7 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         log_fn("Γ Δε (mRy): " + ", ".join(f"{d:+.2f}" for d in delta[:6]))
         # After shifting, the Fermi level indicator is at 0
         fermi_energy = 0.0
+        timing.record("ht.kpath_host_tail", _perf() - _t0)  # instrument:
 
     return {
         "nk_total": nk,

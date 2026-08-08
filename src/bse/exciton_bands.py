@@ -417,6 +417,9 @@ def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data,
 # ===========================================================================
 # driver
 # ===========================================================================
+_PROBE_TICK = None      # instrument: set by an out-of-tree profiling probe
+
+
 def main(argv=None):
     import argparse
     # ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE
@@ -536,6 +539,8 @@ def main(argv=None):
 
     def tick(name, t0):
         timers[name] = timers.get(name, 0.0) + (time.time() - t0)
+        if _PROBE_TICK is not None:                       # instrument:
+            _PROBE_TICK(name, timers[name])               # instrument:
 
     # Work done BEFORE main(): this module's ``initialize_communicator_stack()`` and every import
     # under it.  75.0 s to first output on a cold Frontera node vs 2.1 s warm
