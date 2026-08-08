@@ -185,6 +185,16 @@ Regression detection = diffing baseline files across branches.
 > came from. Every row in all four baseline files carries `"jobid":
 > "56447670"`, which is the number now printed here.
 
+> **The eight `cholesky`/`slate` rows in the baseline files are now
+> PESSIMISTIC and have not been regenerated.** They were measured against
+> the per-q Python loops in `factor`/`solve`, which re-compiled SLATE's
+> kernel once per matrix; those loops are scans as of
+> `feat/batched-canonical-2026-08-08` and § "The batched surface is a
+> scan" measures the same route 35× faster on gpu 2×2. Regenerating the
+> sweep is a perf leg on a shared GPU pool and is deliberately NOT folded
+> into that change — read the A/B table for this route, not
+> `baselines/*.json`, until a regeneration leg lands.
+
 **`auto` resolves to `native` everywhere, and the numbers say why.**
 
 | op | backend | mesh | shape (nq, n) | s |
