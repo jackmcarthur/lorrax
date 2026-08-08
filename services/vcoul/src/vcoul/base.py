@@ -62,8 +62,9 @@ class CoulombKernel(Protocol):
     A kernel implements exactly ONE arithmetic method,
     :meth:`_v_bare_per_q` — the dimension's bare formula at one q.
     Everything dimension-independent (the q loop, the ``vcoul_cutoff_ry``
-    mask, the G=0 head-slot injection, dtype and shape validation) lives
-    once in :func:`v_qG_table` and is shared by all three.  ``v_qG`` and
+    mask, the ``argmin |q+G|`` head-slot injection, dtype and shape
+    validation) lives once in :func:`v_qG_table` and is shared by all
+    three.  ``v_qG`` and
     the production entry point ``gw.compute_vcoul.compute_v_q_per_G``
     are both thin wrappers over that one driver, so there is a single
     implementation of ``v(q+G)`` per dimensionality.
@@ -156,7 +157,8 @@ def v_qG_table(
     *,
     geometry: CoulombGeometry,
     vcoul_cutoff_ry: float | None = None,
-    v_head_miniBZ=None,
+    v_head_fn=None,
+    head_tie_rtol: float = 1e-9,
 ) -> np.ndarray:
     """``v(q+G)`` at the writer's per-q WFN.h5-style G-sphere, for every q.
 
@@ -168,12 +170,13 @@ def v_qG_table(
     slot is injected BEFORE the cutoff mask, so a head slot outside the
     bare-Coulomb cutoff is zeroed like any other G):
 
-    1. **``v_head_miniBZ``** — G=0 head-slot injection.  When given, the
-       ``(nkx, nky, nkz)`` table replaces ``v`` at the Miller-``(0,0,0)``
-       slot of each q with that q's mini-BZ-averaged head.  The slot is
-       selected by ``all(G == 0)``, not by ``argmin |q+G|`` — see the
-       note below.  q=0 keeps ``v=0`` by construction of the table (its
-       head is the separate rank-1 Σ_X term).
+    1. **``v_head_fn``** — mini-BZ head-slot injection.  When given, a
+       callable ``K_cart (m, 3) -> (m,) float64`` that returns the
+       mini-BZ-averaged Coulomb head at each Cartesian ``q+G``.  It is
+       evaluated at every slot attaining ``argmin |q+G|²`` (see HEAD SLOT
+       below) and those slots' ``v`` are replaced.  q with
+       ``min |q+G|² < 1e-12`` (i.e. Γ) are SKIPPED — that head is the
+       separate rank-1 Σ_X term, and ``_v_bare_per_q`` already zeroes it.
     2. **``vcoul_cutoff_ry``** — zero ``v`` wherever ``|q+G|² >`` cutoff.
        This is V_q's bare-Coulomb cutoff, which may be *smaller* than the
        ζ-sphere cutoff that built ``gvec_components``.
@@ -182,14 +185,86 @@ def v_qG_table(
        position — callers need not zero them because the V_q contract
        carries ζ̃ = 0 there.
 
-    HEAD SLOT.  ``all(G == 0)`` and ``argmin |q+G|²`` disagree on 12 of 64
-    q for Si and 1 of 4 for MoS2: for a q whose smallest ``|q+G|`` is at a
-    nonzero umklapp G*, the Miller-(0,0,0) rule injects the head at
-    G=(0,0,0) while an argmin rule would inject it at G*.  Which is
-    correct is a physics question about what
-    :func:`~vcoul.minibz.build_v_head_miniBZ_avg_3d` averages, and it is
-    deliberately NOT settled here — this preserves the shipped
-    Miller-(0,0,0) behaviour exactly.
+    HEAD SLOT — why ``argmin |q+G|²``, and why ALL of the argmin.
+
+    The rule that shipped before 2026-08-08 selected the slot whose Miller
+    index is literally ``(0,0,0)``.  That label is NOT equivariant under
+    q → −q.  The BGW wrap sends a boundary component to ``+1/2``, never
+    ``−1/2``, so the G-list pairing between +q and −q is
+    ``G ↦ −G − s`` with ``s = round(q_frac[−q] + q_frac[q])``; for
+    ``s ≠ 0`` the Miller-(0,0,0) slot at +q pairs with (0,0,−1) /
+    (−1,−1,0) / (−1,−1,−1) at −q, which carries the BARE value.  MEASURED
+    consequence on Si 4×4×4: ``max |v(+q, i) − v(−q, pair(i))|`` sat at
+    1.293e−2 with the label rule and is EXACTLY 0.0 with this one, and
+    ``||V_q − conj(V_{−q})||`` sat at 6.0e−3 against an arithmetic floor
+    of 1.16e−7.
+
+    ``argmin |q+G|²`` fixes that for free, because the pairing above is
+    exactly ``K ↦ −K`` in Cartesian (MEASURED: ``max |K_i(+q) +
+    K_pair(i)(−q)| = 0.000e+00`` over all 64 q), and ``|K|`` is invariant
+    under it.  So the argmin SET at +q maps onto the argmin SET at −q.
+
+    But the argmin is often DEGENERATE, and then "one slot" is not well
+    defined.  MEASURED over all 64 q of the Si fcc 4×4×4 fixture, stable
+    to an identical histogram across rel tolerances 1e−14 … 1e−6:
+
+        multiplicity 1 → 51 q,  multiplicity 2 → 7 q,  multiplicity 4 → 6 q
+
+    and the smallest relative gap to the next distinct ``|q+G|²`` among
+    the non-degenerate q is 7.3e−1 — these are exact symmetry
+    degeneracies, not knife-edges.  Worse, 7 of those 64 q are
+    SELF-PAIRED (``−q ≡ q`` as a grid index, e.g. ``q=(0,0,1/2)`` whose
+    tied slots are ``G=(0,0,0)`` and ``G=(0,0,−1)``) and the pairing
+    SWAPS the two tied slots.  At such a q, injecting at one slot and not
+    its partner makes ``V_q ≠ conj(V_q)`` by construction: **no
+    single-slot rule can be equivariant there**, whatever the tie-break.
+    Every even-numbered k-grid tested (fcc/sc/bcc/hex/triclinic) has
+    exactly the same 7 self-paired q; odd grids have none.
+
+    Hence: inject at ALL slots attaining the argmin, each valued from its
+    OWN Cartesian ``q+G``.  ``head_tie_rtol`` (default 1e−9) is the
+    relative window on ``|q+G|²`` defining "attaining"; it sits ~5 decades
+    above float64 noise on the dot product and ~6 below the smallest real
+    gap measured above, and the tie count is flat across that whole range.
+
+    Equivariance then needs one more thing from the CALLER: ``v_head_fn``
+    must satisfy ``f(K) = f(−K)``.  For a Monte-Carlo mini-BZ average
+    that means a CENTROSYMMETRIC δq sample set — the mini-BZ is the
+    k-grid parallelepiped, not a sphere, so ``⟨v(K+δq)⟩`` and
+    ``⟨v(−K+δq)⟩`` agree only when ``{δq} = {−δq}``.
+    :func:`~vcoul.minibz.build_v_head_miniBZ_fn_3d` guarantees it.
+
+    TIED-SET VALUE.  When the argmin ties, every tied slot is given the
+    MEAN of ``v_head_fn`` over the tied set, not its own value.  For the
+    51 q with a unique argmin the set has one member and this is a no-op.
+
+    Two DIFFERENT symmetries have to hold at once, and only the mean
+    satisfies both:
+
+    * ``q → −q`` (the pairing, ``K ↦ −K``) — needed by the direct
+      full-BZ arm.  Per-slot values already satisfy this, because
+      ``f(K) = f(−K)`` and the tied set at −q is the negation of the
+      tied set at +q.
+    * ``K → R K`` for R in the little group — needed by the IBZ arm,
+      where ``unfold_v_q`` builds ``V_{−q}`` from ``V_q`` by a point-group
+      operation that PERMUTES the tied slots among themselves.  Per-slot
+      values do NOT satisfy this: the tied slots have equal ``|K|`` but
+      ``⟨v⟩_miniBZ`` distinguishes them, because the mini-BZ is a
+      parallelepiped whose symmetry is lower than the crystal's.  A
+      spherical mini-BZ would give them all the same number; the spread
+      is a sampling-cell artifact, and averaging over the tied orbit is
+      what removes it.
+
+    MEASURED on armB (orbit-closed IBZ + unfold, Si 4×4×4), per-q
+    ``||V_q − conj(V_{−q})||_F / ||V_q||_F``, floor 1.27e−7:
+
+        shipped Miller-(0,0,0) label   9 q above 1e−5, worst 7.459e−3
+        argmin, per-slot value         6 q above 1e−5, worst 7.709e−5
+        argmin, tied-set MEAN          0 q above 1e−5, worst 2.647e−7
+
+    The middle row is why this is a mean and not a per-slot value: it
+    fixes the 7 self-paired q outright but leaves — and on four q newly
+    creates — a ~1e−5 point-group asymmetry on the six multiplicity-4 q.
     """
     q_irr_frac = np.asarray(q_irr_frac, dtype=np.float64).reshape(-1, 3)
     gvec = np.asarray(gvec_components, dtype=np.float64)   # (n_q, 3, ngkmax)
@@ -202,14 +277,19 @@ def v_qG_table(
     bdot = geometry.bdot
     fft_grid = geometry.fft_grid
 
-    head_arr = None
-    if v_head_miniBZ is not None:
-        head_arr = np.asarray(v_head_miniBZ, dtype=np.float64)
-        if head_arr.ndim != 3:
-            raise ValueError(
-                f"v_head_miniBZ must be (nkx, nky, nkz); got shape "
-                f"{head_arr.shape}")
-        head_kgrid = np.array(head_arr.shape, dtype=np.float64)
+    if v_head_fn is not None and not callable(v_head_fn):
+        # The pre-2026-08-08 spelling passed a (nkx, nky, nkz) TABLE indexed
+        # by the BGW-wrapped q index.  That object cannot express the fix:
+        # its value belongs to q_frac @ bvec, which is not the argmin q+G on
+        # 12 of Si's 64 q, and it carries no per-slot resolution at all.
+        # Refuse loudly rather than silently reinstate the label rule.
+        raise TypeError(
+            "v_head_fn must be a callable K_cart (m, 3) -> (m,) float64. "
+            "A per-q (nkx, nky, nkz) head TABLE is not accepted: the head "
+            "is injected at every argmin |q+G| slot and each slot must be "
+            "valued from its own Cartesian q+G. Use "
+            "vcoul.build_v_head_miniBZ_fn_3d.")
+    tie_rtol = float(head_tie_rtol)
 
     out = np.zeros((n_q, ngkmax), dtype=np.float64)
     for qi in range(n_q):
@@ -217,14 +297,21 @@ def v_qG_table(
         v, denom = kernel._v_bare_per_q(
             qf, gvec[qi], bvec_f=bvec_f, fact=fact,
             bdot=bdot, fft_grid=fft_grid)
-        if head_arr is not None:
-            # Per-q grid index: round (q_frac * kgrid) and wrap modulo
-            # kgrid — ``v_head_miniBZ`` is indexed by integer (qx, qy, qz).
-            qx_i = int(np.round(qf[0] * head_kgrid[0])) % int(head_kgrid[0])
-            qy_i = int(np.round(qf[1] * head_kgrid[1])) % int(head_kgrid[1])
-            qz_i = int(np.round(qf[2] * head_kgrid[2])) % int(head_kgrid[2])
-            g0_mask = np.all(gvec[qi] == 0.0, axis=0)          # (ngkmax,)
-            v = np.where(g0_mask, head_arr[qx_i, qy_i, qz_i], v)
+        if v_head_fn is not None:
+            # ``denom`` is the kernel's own |q+G|^2 — the SAME operand the
+            # cutoff mask below compares against, so slot selection and
+            # truncation can never disagree about the geometry.
+            d2min = float(np.min(denom))
+            if d2min > 1e-12:      # Γ: head is the separate rank-1 Σ_X term
+                sel = np.nonzero(
+                    np.asarray(denom) <= d2min * (1.0 + tie_rtol))[0]
+                # Value each selected slot from its OWN Cartesian q+G, then
+                # give the whole tied set their MEAN.  Both halves are
+                # load-bearing; see TIED-SET VALUE in the docstring.
+                K_sel = (qf[:, None] + gvec[qi][:, sel]).T @ bvec_f  # (m, 3)
+                h = np.asarray(v_head_fn(K_sel), dtype=np.float64)
+                v = np.array(v, dtype=np.float64, copy=True)
+                v[sel] = float(h.mean()) if h.size > 1 else h
         if vcoul_cutoff_ry is not None:
             v = np.where(denom > float(vcoul_cutoff_ry), 0.0, v)
         out[qi] = v

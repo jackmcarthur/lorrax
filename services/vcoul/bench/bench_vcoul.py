@@ -55,10 +55,26 @@ def main():
                      **_time(lambda k=k: vcoul.v_qG_table(
                          k, qf, gvec, geometry=geom))})
 
-    rows.append({"op": "build_v_head_miniBZ_avg_3d",
+    # The body head is a function of K now, so the honest unit of work is
+    # "build the draw, then value the 64 argmin slots" — which is what a
+    # 4x4x4 production run actually does, and what the retired per-q table
+    # builder used to do in one call.
+    def _body_head():
+        fn = vcoul.build_v_head_miniBZ_fn_3d((4, 4, 4), bvec, celvol)
+        kg = np.asarray((4, 4, 4), dtype=np.float64)
+        K = []
+        for qx in range(4):
+            for qy in range(4):
+                for qz in range(4):
+                    qw = np.array([qx, qy, qz], dtype=np.float64)
+                    qw = np.where(qw > kg / 2, qw - kg, qw)
+                    q_cart = (qw / kg) @ bvec
+                    if float(q_cart @ q_cart) >= 1e-12:
+                        K.append(q_cart)
+        fn(np.asarray(K))
+    rows.append({"op": "build_v_head_miniBZ_fn_3d + 63 slots",
                  "shape": [4, 4, 4], "nmc": 2 ** 18,
-                 **_time(lambda: vcoul.build_v_head_miniBZ_avg_3d(
-                     (4, 4, 4), bvec, celvol), reps=3)})
+                 **_time(_body_head, reps=3)})
 
     def _q0():
         b = vcoul.minibz_voronoi_batches(bvec, (4, 4, 4), nsamples=2 ** 18,

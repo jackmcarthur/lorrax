@@ -122,7 +122,7 @@ def test_the_whole_public_surface_answers_with_no_lorrax():
         preamble=(
             "import numpy as np\n"
             "import vcoul as V\n"
-            "assert len(V.__all__) == 29, V.__all__\n"
+            "assert len(V.__all__) == 30, V.__all__\n"
             "for _n in V.__all__:\n"
             "    assert hasattr(V, _n), _n\n"
             "class W:\n"
@@ -134,7 +134,21 @@ def test_the_whole_public_surface_answers_with_no_lorrax():
             "t = V.v_qG_table(V.get_kernel(3), np.array([[0.25, 0.0, 0.0]]),\n"
             "                 np.zeros((1, 3, 4)), geometry=g)\n"
             "assert t.shape == (1, 4) and t.dtype == np.float64\n"
-            "assert float(t[0, 0]) > 0.0\n"))
+            "assert float(t[0, 0]) > 0.0\n"
+            # The head path too, standalone: the mini-BZ draw and the
+            # argmin injection are the service's one physics-moving
+            # surface, and a lorrax-free child is where "pure math" is
+            # measured rather than claimed.
+            "h = V.build_v_head_miniBZ_fn_3d((2, 2, 2), g.bvec,\n"
+            "                                g.cell_volume, nmc=32)\n"
+            "K = np.array([[0.5, 0.0, 0.0]])\n"
+            "assert float(h(K)[0]) > 0.0\n"
+            "assert float(h(K)[0]) == float(h(-K)[0])\n"
+            "t2 = V.v_qG_table(V.get_kernel(3),\n"
+            "                  np.array([[0.25, 0.0, 0.0]]),\n"
+            "                  np.zeros((1, 3, 4)), geometry=g,\n"
+            "                  v_head_fn=h)\n"
+            "assert float(t2[0, 0]) != float(t[0, 0])\n"))
     assert run.loaded == ()
 
 

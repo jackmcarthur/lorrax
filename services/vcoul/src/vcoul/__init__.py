@@ -23,9 +23,9 @@ WHO CALLS WHAT
     The dimension dispatch.  Each kernel implements exactly one
     arithmetic method, ``_v_bare_per_q``; everything
     dimension-INDEPENDENT (the per-q loop, the ``vcoul_cutoff_ry`` mask,
-    the G=0 head-slot injection, the ``(n_q, ngkmax)`` float64 contract)
-    lives once in ``v_qG_table``.  So there is exactly one ``v(q+G)``
-    formula per dimensionality in the tree.
+    the ``argmin |q+G|`` head-slot injection, the ``(n_q, ngkmax)``
+    float64 contract) lives once in ``v_qG_table``.  So there is exactly
+    one ``v(q+G)`` formula per dimensionality in the tree.
 ``v_qG_table(kernel, q_irr_frac, gvec_components, *, geometry, ...)``
     THE production ``v(q+G)`` driver.  ``gw.compute_vcoul.compute_v_q_per_G``
     is a thin dispatcher over it (reached from
@@ -43,10 +43,19 @@ WHO CALLS WHAT
     The BGW ``Common/minibzaverage.f90`` port.  Used by the 3D and 2D
     ``q0_average`` above, and directly by ``bse.vq_interp.minibz_head_vlr``
     for the 2D slab per-Q exchange head.
-``build_v_head_miniBZ_avg_3d(kgrid, bvec, cell_volume, ...)``
-    The per-q 3D body-head table, injected at the Miller-(0,0,0) slot by
-    ``v_qG_table``.  One live call site, double-gated on
-    ``mc_average_vcoul_body and sys_dim == 3``.
+``build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume, ...)``
+    The 3D body head as a FUNCTION of the Cartesian ``K = q+G``, which
+    ``v_qG_table`` evaluates at every ``argmin |q+G|`` slot (all of them
+    when the argmin ties, and they all get the tied set's mean).  One
+    live call site, double-gated on ``mc_average_vcoul_body and
+    sys_dim == 3``.  It replaced the per-q ``(nkx, nky, nkz)`` table
+    ``build_v_head_miniBZ_avg_3d`` on 2026-08-08: a per-q scalar is
+    attached to ``q_frac @ bvec``, which is not the argmin ``q+G`` on 12
+    of Si's 64 q, so that shape could not express the fix.
+``build_miniBZ_dq_cart(kgrid, bvec, ...)``
+    The centrosymmetric ``{δq} = {−δq}`` mini-BZ draw the head above
+    averages over — on the door because the closure is a correctness
+    requirement of the injection, not an implementation detail.
 ``bare_coulomb_sphere_indices`` / ``bare_coulomb_sphere_mask``
     "Which G are in q's sphere".  ``common.coulomb_sphere`` pads the
     answer into the WFN.h5 sentinel layout; the padding is the FFT box's
@@ -79,7 +88,8 @@ from vcoul.box_fft import (
 from vcoul.bulk_3d import Bulk3D
 from vcoul.geometry import CoulombGeometry
 from vcoul.minibz import (
-    build_v_head_miniBZ_avg_3d,
+    build_miniBZ_dq_cart,
+    build_v_head_miniBZ_fn_3d,
     minibz_average,
     minibz_cell_affine,
     minibz_frac_to_cart,
@@ -111,7 +121,8 @@ __all__ = [
     # mini-BZ sampling / averaging
     "wrap_points_to_voronoi", "minibz_voronoi_batches",
     "sample_minibz_qpoints", "minibz_inscribed_sphere_r2",
-    "minibz_average", "_minibz_kernel_bare", "build_v_head_miniBZ_avg_3d",
+    "minibz_average", "_minibz_kernel_bare",
+    "build_miniBZ_dq_cart", "build_v_head_miniBZ_fn_3d",
     "minibz_frac_to_cart", "minibz_cell_affine",
     # the sphere predicate
     "fft_box_miller", "bare_coulomb_sphere_mask",

@@ -33,7 +33,8 @@ def test_function_reexports_are_the_door_objects():
     # the submodule attribute of the same name — go through importlib.
     frb = importlib.import_module("file_io.read_bgw_vcoul")
 
-    assert gcv.build_v_head_miniBZ_avg_3d is vcoul.build_v_head_miniBZ_avg_3d
+    assert gcv.build_v_head_miniBZ_fn_3d is vcoul.build_v_head_miniBZ_fn_3d
+    assert gcv.build_miniBZ_dq_cart is vcoul.build_miniBZ_dq_cart
     assert gv.wrap_points_to_voronoi is vcoul.wrap_points_to_voronoi
     assert gcb.minibz_voronoi_batches is vcoul.minibz_voronoi_batches
     assert gcb.minibz_inscribed_sphere_r2 is vcoul.minibz_inscribed_sphere_r2
@@ -66,4 +67,4 @@ def test_identity_pin_can_fail():
     so the identity assertions above are falsifiable, not tautological."""
     def imposter(*a, **k):
         raise AssertionError("unreachable")
-    assert imposter is not vcoul.build_v_head_miniBZ_avg_3d
+    assert imposter is not vcoul.build_v_head_miniBZ_fn_3d

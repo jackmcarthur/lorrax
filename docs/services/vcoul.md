@@ -13,8 +13,8 @@ schemes (3D bulk `8π/|q+G|²`, the Ismail-Beigi 2D slab, the Wigner-Seitz
 0-D box), the per-q evaluation driver that serves them through one code
 path, and the mini-BZ machinery — Voronoi-cell sampling, the BGW-ported
 cell average with its Baldereschi-Tosatti analytic-sphere branch, and the
-3D body-head table that the G-flat V_q path injects at the Miller-(0,0,0)
-slot. The BGW `vcoul` text-table reader rides along as `vcoul.bgw_parity`
+3D body head that the G-flat V_q path injects at the `argmin |q+G|`
+slots. The BGW `vcoul` text-table reader rides along as `vcoul.bgw_parity`
 because it is this family's external comparison surface, even though that
 surface is currently dark (see the owner ledger).
 
@@ -26,7 +26,7 @@ loaders and `Meta` stay on the LORRAX side of the door; the service speaks
 ## API
 
 The door is the top-level package; LORRAX imports `vcoul` public names and
-never a submodule. The surface is 29 names; the ones that carry the
+never a submodule. The surface is 30 names; the ones that carry the
 architecture are these.
 
 `CoulombGeometry` is a frozen dataclass of the four things every kernel
@@ -45,10 +45,18 @@ the `vcoul_cutoff_ry` mask, the head-slot injection, and their order (head
 before cutoff, deliberately, so a head slot outside the bare-Coulomb
 cutoff is zeroed like any other G).
 
-`build_v_head_miniBZ_avg_3d(kgrid, bvec, cell_volume, *, nmc, seed)` is
-the 3D body-head table. Its defaults (`nmc=2**18`, `seed=42`) are pins the
-frozen BSE reference depends on, which is why it takes raw arrays rather
-than a geometry: the signature itself is part of the frozen contract.
+`build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume, *, nmc, seed)` is the
+3D body head. It returns a *function* of the Cartesian `K = q+G` rather
+than a per-q table, because the head is injected at every slot attaining
+`argmin |q+G|²` and each of those slots has to be valued from its own `K`;
+a per-q scalar is attached to `q_frac @ bvec`, which is not the argmin on
+12 of Si's 64 q, so the old `(nkx, nky, nkz)` shape could not express the
+rule. Its defaults (`nmc=2**18`, `seed=42`) are pins the frozen BSE
+reference depends on, which is why it takes raw arrays rather than a
+geometry: the signature itself is part of the frozen contract.
+`build_miniBZ_dq_cart` is the draw underneath it, and it is on the door
+because its centrosymmetry is a correctness requirement rather than an
+implementation detail — see the Contract section.
 
 `minibz_frac_to_cart(U, bvec)` and `minibz_cell_affine(bvec, kgrid)` own
 the two pieces of mini-BZ geometry that used to exist as copies. The draw
@@ -90,11 +98,54 @@ Explicit requests refuse; only `auto` demotes, and it announces once.
 performed without telling anyone. With scipy present — every production
 machine — `"sobol"` is bit-identical to the pre-extraction code.
 
-The head slot is Miller-(0,0,0), not `argmin |q+G|²`. The two disagree on
-12 of 64 Si q-points, BGW's own criterion is the argmin-like `ekinx <
-avgcut`, and the choice moves numbers — so the shipped rule is preserved
-exactly and the question is on the owner ledger, pinned by a test either
-way.
+The head slot is `argmin |q+G|²`, all of it, and every tied slot gets the
+tied set's mean. This was settled on 2026-08-08 and it is the one place
+in this service where a physics choice is made rather than preserved.
+
+The rule that shipped before then picked the slot whose Miller index was
+literally `(0,0,0)`. That label is not equivariant under `q → −q`: the BGW
+wrap sends a boundary component to `+1/2` and never to `−1/2`, so at 12 of
+Si's 64 q the Miller-(0,0,0) slot at `+q` pairs with a slot at `−q` that
+carries the bare value instead of the head. Measured on the Si fixture's
+own G-lists, `max |v(+q, i) − v(−q, pair(i))|` was 1.293e-2 under the
+label rule and is exactly 0.0 under this one; in production `V_qmunu` the
+per-q reciprocity went from 63 of 64 q failing at a median 4.286e-3 to 0
+of 64, worst 1.356e-15.
+
+One slot per q is provably impossible on an even k-grid, which is why the
+rule injects at all of the argmin rather than tie-breaking. The argmin is
+degenerate on 13 of Si's 64 q (multiplicities 1:51, 2:7, 4:6, identical
+across tie tolerances from 1e-14 to 1e-6 — these are exact symmetry
+degeneracies, and the smallest relative gap among the non-degenerate q is
+0.73), and 7 of those q are self-paired (`−q ≡ q` as a grid index) with
+the pairing *swapping* their tied slots. At such a q, injecting at one
+tied slot and not its partner makes `V_q ≠ conj(V_q)` by construction, no
+matter which one you pick. Every even grid tested (fcc, sc, bcc,
+hexagonal, triclinic) has exactly those 7; every odd grid has none.
+
+The tied slots share their mean rather than keeping their own values
+because two symmetries have to hold at once. `q → −q` is satisfied by
+per-slot values already; `K → RK` for R in the little group is not, since
+the mini-BZ is a parallelepiped whose symmetry is lower than the crystal's
+and `⟨v⟩` therefore distinguishes slots that the point group exchanges.
+The IBZ-plus-unfold arm needs both: measured there, the label rule left 9
+q bad (worst 7.459e-3), per-slot argmin values left 6 (worst 7.709e-5, and
+they newly broke 4 q that had been fine), and the tied-set mean left none
+(worst 2.647e-7, which is the arithmetic floor).
+
+`head_tie_rtol` (default 1e-9) is the relative window on `|q+G|²` that
+defines "attaining the argmin". It sits about five decades above float64
+noise on the dot product and six below the smallest real gap, and the tie
+count is flat across that whole range, so its value is a non-decision.
+
+The caller owes one thing in return: `v_head_fn` must satisfy
+`f(K) = f(−K)`. For a Monte-Carlo mini-BZ average that means a
+centrosymmetric δq sample set, which `build_miniBZ_dq_cart` guarantees by
+unioning its draw with its own negation — an ordinary one-sided draw is
+even only in the `nmc → ∞` limit and leaves an MC-sized residual in
+reciprocity even once the slot selection is right. A caller that still
+holds the retired `(nkx, nky, nkz)` head table gets a `TypeError` naming
+the replacement, never a silent fallback to the label rule.
 
 ## Backends
 
@@ -114,11 +165,26 @@ with `--no-services`). Import isolation runs the whole public surface in a
 `python -S` subprocess with only the service on the path — including the
 no-scipy refusal arm — with a red twin, so "standalone" is a measured
 property. The door smoke tests exercise every kernel, both refusal
-classes, the head-slot rule, and the head-before-cutoff order on synthetic
-arrays, cubic and hexagonal both. The consolidation pins hold golden
-body-head values (bit-equality, captured pre-consolidation) plus a
-composition test that rebuilds the head from the exported pieces and a red
-twin that shows the composition pin can fail.
+classes, the head-slot rule (argmin selection at a q where it disagrees
+with the label, the tied-set mean, the Γ skip, and the refusal of a per-q
+head table), and the head-before-cutoff order on synthetic arrays, cubic
+and hexagonal both. The consolidation pins hold golden body-head values
+plus a composition test that rebuilds the head from the exported pieces
+and a red twin that shows the composition pin can fail, and they pin the
+δq set's closure under negation with a red twin on the one-sided draw.
+
+`test_vcoul_head_slot_reciprocity.py` is the gate for the head-slot rule
+itself, and it is service-local because everything it needs is service
+arithmetic: it rebuilds the Si per-q G-lists from
+`bare_coulomb_sphere_mask` (the same predicate the ζ writer uses), shows
+the +q/−q slot pairing is exactly `K ↦ −K`, reproduces the multiplicity
+histogram and the seven self-paired-with-swap q, and then measures
+`max |v(+q, i) − v(−q, pair(i))| == 0.0`. Two red twins keep it honest:
+the Miller-(0,0,0) label rule reinstated locally, which must fail by
+~1e-2, and a one-sided δq draw with the right slots, which must also
+fail. There is a third, quieter arm — the bare kernel with no head at all
+is already reciprocal — so nothing the twins measure can be attributed to
+the Coulomb formula rather than the head.
 
 The physics guard for the 358bb0b draw fix is
 `tests/test_vcoul_minibz_head_draw.py` in the main suite: the
@@ -136,12 +202,16 @@ artifacts under `/pscratch/sd/j/jackm/svc_vcoul/_gates_{before,after}/`.
 ## Performance
 
 The service is a one-shot setup cost, not a hot loop: `v_qG_table` runs
-once per consumer setup and the head table once per run. Baselines
+once per consumer setup and the head draw once per run. Baselines
 (claims-style, machine/op/shape/seconds) live in
 `services/vcoul/bench/baselines/` and were recorded on the WSL dev box —
-the numbers that matter operationally are the head table at production
+the numbers that matter operationally are the head at production
 `nmc=2**18` (seconds-scale) and `v_qG_table` at Si-fixture shapes
-(milliseconds-scale). Nothing here touches the GPU steady state.
+(milliseconds-scale). The 2026-08-08 rule doubled the δq sample count
+(centrosymmetrisation) and moved the head from 64 table entries to the
+~76 argmin slots the 64 q select, so the head's cost roughly doubled from
+a seconds-scale base; it is still a one-shot setup cost and still off the
+GPU steady state.
 
 ## Antipatterns
 
