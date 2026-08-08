@@ -469,6 +469,70 @@ def refuse_unless_select_certified(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# R2 — rank at POINT granularity
+# ═══════════════════════════════════════════════════════════════════════
+
+#: Above this many delivered points the point-granularity rank is reported
+#: as "not measured" rather than measured: the check is a dense
+#: ``eigvalsh`` on the kept sub-Gram, O(n³), and at the MoS₂-class point
+#: (n ≈ 13 000) that is minutes and gigabytes.  Raise it deliberately via
+#: ``LORRAX_CENTROID_POINT_RANK_CAP`` when the answer is worth the wait.
+#: 4096 covers every deck in the project's fixtures and the whole frontier
+#: ladder (whose largest set is 1908).
+POINT_RANK_CAP_DEFAULT = 4096
+
+
+def point_granularity_rank(G, keep_mask, *, tol_rel=None, cap=None):
+    """Independent directions in the DELIVERED POINT SET, not in the orbits.
+
+    THE CONFUSION THIS REMOVES.  In orbit mode the greedy select deflates
+    the Schur complement by ONE direction per orbit while removing all
+    ``n_sym`` members from contention, so the rank it reports counts
+    ORBITS.  D3's gate passed at "42 of 42 directions certified" and the
+    file it blessed contained 1908 POINTS; the ζ back-solve then truncated
+    to 1440-1455 modes per q (23.7-24.5 %, logged eight times per leg and
+    read by nobody) because the 60-band pair-product space on a 24³ grid
+    saturates around 1450 numerical directions.  Asking for 1908 centroids
+    does not raise that ceiling — it hands the pseudo-inverse a
+    rank-deficient Gram.
+
+    Nothing in the centroid pipeline ever checked the delivered set at
+    point granularity, and in orbit mode it structurally cannot: the number
+    the rank gate reads is not comparable to the point count.  This is that
+    number, measured directly, so the log can say "42 orbits, 1908 points,
+    N independent directions" and an operator can see the ζ truncation
+    coming before spending a 7 GiB restart file on it.
+
+    Returns ``(rank, n_points, reason)``.  ``rank`` is ``None`` when the
+    measurement was skipped and ``reason`` says why — never a silent
+    absence, because "no number" and "the number is fine" must not look
+    alike in a log.
+    """
+    keep_mask = np.asarray(keep_mask, dtype=bool)
+    n_pts = int(keep_mask.sum())
+    if cap is None:
+        env = os.environ.get("LORRAX_CENTROID_POINT_RANK_CAP")
+        cap = int(env) if env else POINT_RANK_CAP_DEFAULT
+    if n_pts == 0:
+        return None, 0, "empty point set"
+    if n_pts > int(cap):
+        return (None, n_pts,
+                f"skipped: {n_pts} points exceeds the O(n^3) cap {int(cap)} "
+                f"(raise LORRAX_CENTROID_POINT_RANK_CAP to measure anyway)")
+    try:
+        sub = np.asarray(jax.device_get(G))[np.ix_(keep_mask, keep_mask)]
+    except Exception as exc:                                  # noqa: BLE001
+        return None, n_pts, f"skipped: could not gather the Gram ({exc})"
+    d0max = float(np.real(np.diag(sub)).max())
+    tol = (float(np.sqrt(np.finfo(np.float64).eps)) if tol_rel is None
+           else float(tol_rel))
+    # The SAME relative floor the select stops on, so the two numbers in
+    # the log line are measured against one policy and can be compared.
+    ev = np.linalg.eigvalsh(0.5 * (sub + sub.conj().T))
+    return int((ev > tol * d0max).sum()), n_pts, ""
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Step 4 — end-to-end wrapper
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -719,6 +783,27 @@ def prune_candidates_by_pivoted_cholesky(
         if verbose:
             print(f"[pivoted_cholesky] orbit-aware: {len(piv_np)} orbits picked "
                   f"→ {len(keep_idx)} unfolded centroids (orbit-closed)")
+        # R2 — certify at POINT granularity, which is the granularity of the
+        # FILE being written.  Orbit mode only: in point mode ``rank`` is
+        # already the point count and there is nothing to reconcile.
+        pt_rank, n_pts, why = point_granularity_rank(
+            G, in_kept, tol_rel=tol_rel)
+        if verbose:
+            if pt_rank is None:
+                print(f"  [point rank] {rank_i} orbits, {n_pts} points, "
+                      f"independent directions NOT MEASURED — {why}")
+            else:
+                print(f"  [point rank] {rank_i} orbits, {n_pts} points, "
+                      f"{pt_rank} independent directions "
+                      f"({100.0 * pt_rank / max(1, n_pts):.1f}% of the "
+                      f"points)")
+                if pt_rank < n_pts:
+                    print(f"  [point rank] NOTE: {n_pts - pt_rank} of the "
+                          f"{n_pts} delivered points add no independent "
+                          f"direction at tol*max(diag G).  The zeta "
+                          f"back-solve will truncate about that many modes "
+                          f"per q; D3 shipped a 7 GiB restart file to learn "
+                          f"the same thing downstream.")
     d_final_np = np.asarray(_mh.process_allgather(d_final, tiled=True))[:M]
     if n_pad:
         G = G[:M, :M]        # hand back the LOGICAL Gram, not the padded one

@@ -597,3 +597,71 @@ def test_sharded_select_on_four_real_shards():
     assert out.returncode == 0, (
         f"stdout:\n{out.stdout}\nstderr:\n{out.stderr}")
     assert "R4_MULTISHARD_OK" in out.stdout, out.stdout
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 5. R2 — rank reported at POINT granularity, not orbit granularity
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_point_granularity_rank_separates_orbits_from_points():
+    """The number that would have caught D3 before it spent 7 GiB.
+
+    In orbit mode the select deflates the Schur complement by ONE direction
+    per orbit while removing all n_sym members from contention, so the rank
+    it reports counts ORBITS.  D3's gate passed at "42 of 42 directions
+    certified" and blessed a file of 1908 POINTS whose ζ Gram then
+    truncated to 1440-1455 modes per q — 23.7-24.5 %, logged eight times a
+    leg and read by nobody.  The two numbers were never comparable, and
+    nothing in the pipeline computed the second one.
+
+    Constructed here so the gap is exact and known in advance: 12 orbits of
+    8 built from 12 independent feature rows, so the delivered 96-point set
+    has exactly 12 independent directions.  A gate reading the orbit rank
+    sees 12/12 and passes; the point-granularity number says 12 of 96.
+    """
+    from src.centroid.pivoted_cholesky import (pivoted_cholesky_select,
+                                               point_granularity_rank)
+
+    n_orb, orb_size = 12, 8
+    oid = np.repeat(np.arange(n_orb, dtype=np.int32), orb_size)
+    rng = np.random.default_rng(5)
+    B = (rng.standard_normal((n_orb, 40))
+         + 1j * rng.standard_normal((n_orb, 40)))
+    A = B[oid]
+    G = jnp.asarray(A @ A.conj().T, dtype=jnp.complex128)
+    G = 0.5 * (G + G.conj().T)
+
+    piv, _, rank, *_ = pivoted_cholesky_select(G, n_orb, jnp.asarray(oid))
+    keep = np.isin(oid, oid[np.asarray(piv)[np.asarray(piv) >= 0]])
+    assert int(rank) == n_orb, "orbit-granularity rank"
+    assert keep.sum() == n_orb * orb_size, "all orbits unfolded"
+
+    pt_rank, n_pts, why = point_granularity_rank(G, keep)
+    assert why == "", why
+    assert n_pts == n_orb * orb_size
+    assert pt_rank == n_orb, (
+        f"the delivered {n_pts}-point set was built from {n_orb} "
+        f"independent features, so its point-granularity rank must be "
+        f"{n_orb}; got {pt_rank}")
+    # THE POINT: the orbit rank and the point count are not comparable, and
+    # that gap is what a passing gate used to hide.
+    assert int(rank) == pt_rank < n_pts
+
+    # CONSTRUCTIBLE-FALSE TWIN: a genuinely full-rank point set must report
+    # its rank EQUAL to its point count, or the number above is measuring
+    # something other than independence.
+    n = 48
+    rng2 = np.random.default_rng(6)
+    A2 = (rng2.standard_normal((n, 96)) + 1j * rng2.standard_normal((n, 96)))
+    G2 = jnp.asarray(A2 @ A2.conj().T, dtype=jnp.complex128)
+    G2 = 0.5 * (G2 + G2.conj().T)
+    full_rank, n2, why2 = point_granularity_rank(G2, np.ones(n, dtype=bool))
+    assert why2 == "", why2
+    assert full_rank == n2 == n, (
+        f"a full-rank {n}-point Gram reported {full_rank} independent "
+        f"directions; the twin does not discriminate")
+
+    # The cap REPORTS rather than silently skipping: "no number" and "the
+    # number is fine" must not look alike in a log.
+    capped, n3, why3 = point_granularity_rank(G, keep, cap=8)
+    assert capped is None and n3 == n_pts and "exceeds the O(n^3) cap" in why3
