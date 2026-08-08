@@ -156,34 +156,42 @@ def test_the_default_and_an_explicit_full_window_agree(capsys):
 # --------------------------------------------------------------------------
 
 def test_the_default_beats_a_short_window():
-    """RED TWIN for the flip: a short window must be VISIBLY worse.
+    """RED TWIN for the flip: a short window must VISIBLY lose orthogonality.
+
+    Keyed on ``max|V^H V - I|`` over the whole rotated basis, not on eigenvalue
+    error.  Eigenvalue error is the WRONG observable for this: whether a lost
+    direction has yet been re-discovered as a ghost depends on reduction order,
+    so the same synthetic gave a 8.7e-02 window error on CPU and 1.6e-15 on GPU
+    and the cell was green on one backend and red on the other.  Orthogonality
+    is what the reorthogonalisation actually controls, and it separates by
+    fourteen orders on every shape and spectrum measured (flat, clustered and
+    exactly degenerate; n = 96...256).
 
     If this cell ever goes green because the window got good rather than
     because the default got full, the flip has stopped being justified and
     somebody should say so out loud.
-
-    Deliberately a NON-degenerate spectrum.  On a degenerate one, a
-    single-vector Lanczos run deep into the space legitimately re-discovers a
-    degenerate root as a second copy even under full reorth — the Krylov space
-    meets each eigenspace once only in exact arithmetic — and that is a
-    different phenomenon from the one the flip is about.  Measuring the flip on
-    a degenerate synthetic would blame the window for something the window does
-    not cause.
     """
-    n, max_iter = 128, 96
-    H, lam = _hermitian(n)
+    n, max_iter = 128, 120
+    H, _ = _hermitian(n)
     mv = lambda v: H @ v
-    ev_default, _ = LZ.lanczos_eig_jit(mv, n, n_eig=6, max_iter=max_iter, seed=3)
-    ev_window, _ = LZ.lanczos_eig_jit(
-        mv, n, n_eig=6, max_iter=max_iter, n_reorth=2, seed=3)
 
-    err_d = float(np.max(np.abs(np.asarray(ev_default)[:3] - lam[:3])))
-    err_w = float(np.max(np.abs(np.asarray(ev_window)[:3] - lam[:3])))
-    assert err_d < 1e-10, f"the DEFAULT is not converging: {err_d:.3e}"
-    assert err_w > 1e3 * max(err_d, 1e-14), (
-        f"RED TWIN DID NOT GO RED: n_reorth=2 error {err_w:.3e} vs default "
-        f"{err_d:.3e} -- the short window is no longer worse, so the flip's "
-        f"justification needs re-measuring")
+    def _orth(n_reorth):
+        kw = {} if n_reorth is None else {"n_reorth": n_reorth}
+        _, V = LZ.lanczos_eig_jit(mv, n, n_eig=max_iter, max_iter=max_iter,
+                                  seed=3, **kw)
+        V = np.asarray(V)
+        G = V.conj() @ V.T
+        return float(np.max(np.abs(G - np.eye(G.shape[0]))))
+
+    o_default = _orth(None)            # NO n_reorth argument -- the default
+    o_window = _orth(2)
+
+    assert o_default < 1e-12, (
+        f"the DEFAULT is not holding orthogonality: {o_default:.3e}")
+    assert o_window > 1e-3, (
+        f"RED TWIN DID NOT GO RED: n_reorth=2 orthogonality {o_window:.3e} vs "
+        f"default {o_default:.3e} -- the short window is no longer losing the "
+        f"basis, so the flip's justification needs re-measuring")
 
 
 # --------------------------------------------------------------------------
