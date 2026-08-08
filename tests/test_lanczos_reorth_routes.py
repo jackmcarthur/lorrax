@@ -44,6 +44,7 @@ import jax
 import jax.numpy as jnp
 
 from solvers import lanczos as LZ
+from bse import bse_lanczos as BL
 
 try:                                    # jax >= 0.6 public home
     from jax.extend.core import ClosedJaxpr, Jaxpr
@@ -55,21 +56,55 @@ except ImportError:                     # pragma: no cover - older jax
 # the dial
 # --------------------------------------------------------------------------
 
-def test_default_route_is_batched(monkeypatch):
-    """The DEFAULT is the batched route.  Unset and empty both mean cgs2."""
-    monkeypatch.delenv(LZ._REORTH_ENV, raising=False)
+def test_default_route_is_batched():
+    """The DEFAULT is the batched route.  None and empty both mean cgs2."""
     assert LZ.reorth_kind() == "cgs2"
-    monkeypatch.setenv(LZ._REORTH_ENV, "")
-    assert LZ.reorth_kind() == "cgs2"
+    assert LZ.reorth_kind(None) == "cgs2"
+    assert LZ.reorth_kind("") == "cgs2"
     assert LZ._REORTH_DEFAULT == "cgs2"
 
 
-def test_env_selects_route_and_override_wins(monkeypatch):
-    monkeypatch.setenv(LZ._REORTH_ENV, "mgs")
-    assert LZ.reorth_kind() == "mgs"               # legacy fallback reachable
-    assert LZ.reorth_kind("cgs2") == "cgs2"        # explicit kwarg wins
-    monkeypatch.setenv(LZ._REORTH_ENV, "  MGS ")   # tolerant of case/space
-    assert LZ.reorth_kind() == "mgs"
+def test_env_selects_route_and_token_wins(monkeypatch):
+    """The env var is read by the BSE layer; the solver takes a token."""
+    monkeypatch.setenv(BL.REORTH_ENV, "mgs")
+    assert BL.reorth_route() == "mgs"              # legacy fallback reachable
+    monkeypatch.setenv(BL.REORTH_ENV, "  MGS ")    # tolerant of case/space
+    assert BL.reorth_route() == "mgs"
+    monkeypatch.delenv(BL.REORTH_ENV, raising=False)
+    assert BL.reorth_route() == "cgs2"             # unset -> default
+    assert LZ.reorth_kind("mgs") == "mgs"          # explicit token honoured
+
+
+def test_solvers_lanczos_reads_no_environment():
+    """RED TWIN for the LAYERING rule that caught this feature's first draft.
+
+    ``solvers`` is L2 -- physics-agnostic mathematics that must be a function
+    of its arguments (tests/test_layering.py). The first version of this route
+    resolved LORRAX_LANCZOS_REORTH inside solvers/lanczos.py and the layering
+    census went red with ``{'solvers.lanczos': ['<dynamic>']}``.  The dial now
+    lives in ``bse.bse_lanczos``; the solver takes a token.
+
+    This cell is deliberately NOT a duplicate of the layering gate: it names
+    THIS module, so a future edit that reaches for os.environ here fails in the
+    file that owns the feature, next to the explanation, instead of only in a
+    census someone runs later.
+    """
+    import ast
+    import inspect
+    src = inspect.getsource(LZ)
+    tree = ast.parse(src)
+    bad = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "environ":
+            bad.append("os.environ")
+        if isinstance(node, ast.Name) and node.id in ("getenv",):
+            bad.append("getenv")
+        if isinstance(node, ast.Attribute) and node.attr in ("getenv",):
+            bad.append("os.getenv")
+    assert not bad, f"solvers.lanczos reads the environment: {sorted(set(bad))}"
+    assert not hasattr(LZ, "_REORTH_ENV"), (
+        "the env-var name moved to bse.bse_lanczos.REORTH_ENV; a copy left "
+        "here invites the read to come back with it")
 
 
 def test_unknown_route_refuses(monkeypatch):
@@ -78,9 +113,9 @@ def test_unknown_route_refuses(monkeypatch):
     Now that ``cgs2`` is the default the refusal matters in BOTH directions: a
     typo must not silently hand back the 20 100-collective sweep either.
     """
-    monkeypatch.setenv(LZ._REORTH_ENV, "cgs")      # plausible near-miss
+    monkeypatch.setenv(BL.REORTH_ENV, "cgs")       # plausible near-miss
     with pytest.raises(ValueError, match="unknown reorthogonalisation route"):
-        LZ.reorth_kind()
+        BL.reorth_route()
     for bad in ("classical", "mgs2", "gs", "CGS-2"):
         with pytest.raises(ValueError):
             LZ.reorth_kind(bad)
@@ -116,9 +151,9 @@ def test_record_deck_collective_counts_are_pinned(monkeypatch):
     200 Lanczos iterations at full reorth on the Si record deck: the shipped
     sweep issued the triangular number 20 100; the default now issues 400.
     """
-    monkeypatch.delenv(LZ._REORTH_ENV, raising=False)
-    assert LZ.reorth_kind() == "cgs2"
-    assert LZ.reorth_collective_count(LZ.reorth_kind(), 200, 200) == 400
+    monkeypatch.delenv(BL.REORTH_ENV, raising=False)
+    assert BL.reorth_route() == "cgs2"
+    assert LZ.reorth_collective_count(BL.reorth_route(), 200, 200) == 400
     # the legacy route's number, for the record and for the fallback cell below
     assert LZ.mgs_trip_count(200, 200) == 200 * 201 // 2 == 20100
     assert LZ.reorth_collective_count("mgs", 200, 200) == 20100
@@ -189,7 +224,7 @@ def test_the_default_really_is_batched(monkeypatch):
     flip actually reached production callers, not just the ``reorth=`` kwarg.
     Fails if the default ever regresses to ``mgs``.
     """
-    monkeypatch.delenv(LZ._REORTH_ENV, raising=False)
+    monkeypatch.delenv(BL.REORTH_ENV, raising=False)
     n, it = 32, 8
     mv = _diag_matvec(np.arange(1, n + 1, dtype=float))
     jx = jax.make_jaxpr(
@@ -243,12 +278,16 @@ def test_mgs_fallback_is_reachable_from_the_env(monkeypatch):
     Exercises the env path, not the kwarg, because that is the path a bisect or
     an archived-run reproduction uses.  Fails if the fallback is amputated.
     """
-    monkeypatch.setenv(LZ._REORTH_ENV, "mgs")
+    monkeypatch.setenv(BL.REORTH_ENV, "mgs")
+    # the real production path: the BSE layer reads the env, the solver takes
+    # the token.  Asserting on the jaxpr proves BOTH halves are wired.
+    route = BL.reorth_route()
+    assert route == "mgs"
     n, it = 32, 8
     mv = _diag_matvec(np.arange(1, n + 1, dtype=float))
     jx = jax.make_jaxpr(
         lambda: LZ.lanczos_eig_jit(mv, n, n_eig=4, max_iter=it,
-                                   n_reorth=it))().jaxpr
+                                   n_reorth=it, reorth=route))().jaxpr
     assert _count_prim(jx, "while") >= 1, (
         "LORRAX_LANCZOS_REORTH=mgs did not restore the per-vector sweep")
 

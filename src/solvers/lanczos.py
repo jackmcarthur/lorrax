@@ -16,7 +16,8 @@ The three JIT-able variants reorthogonalise by **batched classical
 Gram-Schmidt, applied twice** (``cgs2``) — every overlap of a sweep in one
 matrix product, so two collectives per iteration instead of ``j+1``.
 ``LORRAX_LANCZOS_REORTH=mgs`` restores the legacy per-vector sweep for bisects
-and for reproducing pre-2026-08-08 runs.  The route changes the collective
+and for reproducing pre-2026-08-08 runs (the variable is read one layer up,
+by ``bse.bse_lanczos.reorth_route`` — this module is L2 and takes the token).  The route changes the collective
 COUNT, never the basis window ``--n-reorth`` selects — see the route section
 below ``_block_alpha_stats``.
 
@@ -35,7 +36,6 @@ Usage
 from __future__ import annotations
 
 import contextlib
-import os
 from typing import Callable
 
 import jax
@@ -497,31 +497,50 @@ def _block_alpha_stats(alpha_all):
 # misspelled into a silent no-op makes every A/B built on it void.  Note the
 # direction that matters now that ``cgs2`` is the default — a misspelling must
 # not silently hand you the SLOW route either.
+#
+# WHERE THE DIAL IS READ — and why NOT here
+# -----------------------------------------
+# ``solvers`` is **L2**: physics-agnostic mathematics, which
+# ``tests/test_layering.py::test_no_l2_module_reads_the_environment`` requires
+# to be a function of its ARGUMENTS.  An earlier draft of this route resolved
+# ``LORRAX_LANCZOS_REORTH`` right here and that gate caught it —
+# ``{'solvers.lanczos': ['<dynamic>']}`` — with the fix in its own message:
+# "Pass the dial in."  So the split is:
+#
+#   * THIS module validates and defaults a route TOKEN.  No environment, no
+#     import of ``os``.  A caller that passes nothing gets ``cgs2``.
+#   * ``bse.bse_lanczos.reorth_route`` reads the environment variable and
+#     hands the token down, exactly as ``bse.bse_stack_matvec.matvec_opts``
+#     reads ``LORRAX_BSE_MATVEC_OPT`` one layer up from the kernels it steers.
+#
+# The dial's NAME appears below only inside a message string, which is text,
+# not a read — and it is worth the words, because the exception this raises is
+# most often triggered by someone who typed the variable.
 _REORTH_KINDS = ("cgs2", "mgs")
 _REORTH_DEFAULT = "cgs2"
 _REORTH_LEGACY = "mgs"
-_REORTH_ENV = "LORRAX_LANCZOS_REORTH"
 
 
-def reorth_kind(override: str | None = None) -> str:
-    """Resolve the reorthogonalisation route.  Default = batched ``cgs2``.
+def reorth_kind(route: str | None = None) -> str:
+    """Validate + default a reorthogonalisation route token.  PURE.
 
-    ``override`` (a solver keyword) wins over the environment so tests can
-    drive both routes in one process.  An unrecognised value raises.
+    ``None`` or empty selects ``cgs2``.  An unrecognised value raises.  This
+    function reads no environment — see the layering note above; the caller
+    (``bse.bse_lanczos.reorth_route``) owns ``LORRAX_LANCZOS_REORTH``.
     """
-    raw = os.environ.get(_REORTH_ENV, "") if override is None else override
-    tok = str(raw).strip().lower()
+    tok = str("" if route is None else route).strip().lower()
     if not tok:
         return _REORTH_DEFAULT
     if tok not in _REORTH_KINDS:
         raise ValueError(
-            f"{_REORTH_ENV}={raw!r}: unknown reorthogonalisation route.  "
-            f"Valid values are {list(_REORTH_KINDS)}, and unset/empty selects "
+            f"{route!r}: unknown reorthogonalisation route.  Valid values are "
+            f"{list(_REORTH_KINDS)}, and unset/empty selects "
             f"{_REORTH_DEFAULT!r} (batched classical Gram-Schmidt, twice — "
             f"2*max_iter collectives).  {_REORTH_LEGACY!r} is the legacy "
             f"per-vector sweep, kept for bisects and for reproducing archived "
             f"runs, at max_iter(max_iter+1)/2 collectives.  Refusing rather "
-            f"than silently running one route under the other's label.")
+            f"than silently running one route under the other's label.  "
+            f"(Spelled via LORRAX_LANCZOS_REORTH on the BSE path.)")
     return tok
 
 
