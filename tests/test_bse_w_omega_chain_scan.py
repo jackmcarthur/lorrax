@@ -552,74 +552,59 @@ def test_the_block_qr_eigendecomposition_stays_on_host():
 # against the broken code.  A source check is the only non-vacuous thing this
 # file can assert about it; the runtime evidence is a P=4 driver leg, recorded
 # in FIX_womega.md.
-_P1_UNSAFE_SCOPES = ("run_w_omega_chain_compare", "build_finite_q_data")
-
-
-def _bare_device_get_lines(src: str, scope_names, if_attr=None):
-    """Lines calling ``jax.device_get`` inside the named defs (and optionally
-    inside ``main``'s ``if args.<if_attr>:`` block)."""
+# The scope is now the WHOLE module, not a list of arms.  It started as three
+# named scopes and every one of the remaining arms turned out to carry the same
+# bug, so "bse_w_exact fetches to host through gather_to_host, always" is both
+# the simpler rule and the one that cannot be defeated by adding an arm.
+# Routing a genuinely replicated array through the helper costs nothing — it
+# takes the plain device_get arm.
+def _bare_device_get_lines(src: str):
+    """Source lines calling ``jax.device_get`` anywhere in ``src``."""
     import ast
 
     tree = ast.parse(src)
-    spans = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name in scope_names:
-            spans.append((node.lineno, node.end_lineno))
-        if if_attr is not None and isinstance(node, ast.If):
-            t = node.test
-            if (isinstance(t, ast.Attribute) and t.attr == if_attr
-                    and isinstance(t.value, ast.Name) and t.value.id == "args"):
-                spans.append((node.lineno, node.end_lineno))
-    hits = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        if ast.unparse(node.func) != "jax.device_get":
-            continue
-        if any(lo <= node.lineno <= hi for lo, hi in spans):
-            hits.append(node.lineno)
-    return sorted(hits), spans
+    return sorted(node.lineno for node in ast.walk(tree)
+                  if isinstance(node, ast.Call)
+                  and ast.unparse(node.func) == "jax.device_get")
 
 
-def test_w_omega_chain_driver_path_is_p_gt_1_safe():
+def test_bse_w_exact_is_p_gt_1_safe():
     import inspect
     from bse import bse_w_exact
 
     src = inspect.getsource(bse_w_exact)
-    hits, spans = _bare_device_get_lines(
-        src, _P1_UNSAFE_SCOPES, if_attr="w_omega_chain")
-    assert spans, "found none of the scopes to check — the guard is vacuous"
+    hits = _bare_device_get_lines(src)
     assert not hits, (
-        f"bare jax.device_get on the --w-omega-chain driver path at source "
-        f"line(s) {hits} (offsets within bse_w_exact). Those tiles are "
-        f"mesh-sharded, so this raises at P>1. Use "
+        f"bare jax.device_get in bse_w_exact at source line(s) {hits} "
+        f"(offsets within the module). The tiles this driver fetches are "
+        f"mesh-sharded, so this raises at P>1 on every rank. Use "
         f"common.collectives.gather_to_host — see this cell's comment block.")
     assert "gather_to_host" in src, (
-        "bse_w_exact no longer imports gather_to_host at all, so the scopes "
-        "above are clean only because the fetches went somewhere else")
+        "bse_w_exact no longer references gather_to_host at all, so it is "
+        "clean only because the host fetches moved somewhere unexamined")
 
 
 def test_red_twin_the_p_gt_1_guard_actually_fires():
     """The FALSE case: the guard must flag the pattern it exists to catch.
 
-    Without this, a refactor that renamed ``run_w_omega_chain_compare`` would
-    leave the cell above asserting nothing at all, silently and forever.
+    Without this the cell above would keep passing against a module that had
+    simply stopped being parsed the way it assumes — silently, and forever.
     """
     bad = (
         "import jax\n"
-        "def run_w_omega_chain_compare(x):\n"
+        "def f(x):\n"
         "    return jax.device_get(x)\n"
-        "def build_finite_q_data(y):\n"
+        "def g(y):\n"
         "    return jax.device_get(y)\n"
     )
-    hits, spans = _bare_device_get_lines(bad, _P1_UNSAFE_SCOPES)
-    assert len(spans) == 2, f"the scope finder missed a def: {spans}"
-    assert hits == [3, 5], f"the guard did not flag the bad pattern: {hits}"
+    assert _bare_device_get_lines(bad) == [3, 5], (
+        f"the guard did not flag the bad pattern: {_bare_device_get_lines(bad)}")
 
     good = (
         "from common.collectives import gather_to_host\n"
-        "def run_w_omega_chain_compare(x):\n"
+        "def f(x):\n"
         "    return gather_to_host(x)\n"
     )
-    hits_ok, _ = _bare_device_get_lines(good, _P1_UNSAFE_SCOPES)
-    assert hits_ok == [], f"the guard fires on the FIXED pattern too: {hits_ok}"
+    assert _bare_device_get_lines(good) == [], (
+        f"the guard fires on the FIXED pattern too: "
+        f"{_bare_device_get_lines(good)}")

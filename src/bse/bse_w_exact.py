@@ -661,8 +661,8 @@ def main(argv=None) -> None:
                 ensure_W_R(dq, include_W=False, mesh_xy=mesh_xy)
                 diag_hq = build_preconditioner_diagonal_sharded(
                     dq, mesh_xy, include_W=False, use_tda=False)
-                W0 = np.asarray(jax.device_get(data["W_q"][:, :, qx, qy, qz]))
-                Vq = np.asarray(jax.device_get(data["V_q_full"][:, :, qx, qy, qz]))
+                W0 = gather_to_host(data["W_q"][:, :, qx, qy, qz])
+                Vq = gather_to_host(data["V_q_full"][:, :, qx, qy, qz])
                 T = W0 - Vq
                 cols, _ = _select_compare_cols(T, nlog, args.n_cols, args.seed)
                 jax.block_until_ready(diag_hq)
@@ -677,8 +677,8 @@ def main(argv=None) -> None:
             t_solve = time.perf_counter() - t_s0
             # COMPARE: host-side rel_err vs the own (W0-V)[q_flat] tile.
             with timing.section("w_exact.wq_compare"):
-                wc = np.asarray(jax.device_get(W_tile))
-                rr = np.asarray(jax.device_get(resids))[:len(cols)]
+                wc = gather_to_host(W_tile)
+                rr = gather_to_host(resids)[:len(cols)]
                 rels = np.asarray([
                     float(np.linalg.norm(wc[:nlog, i] - T[:nlog, int(nu0)])
                           / np.linalg.norm(T[:nlog, int(nu0)]))
@@ -750,8 +750,8 @@ def main(argv=None) -> None:
 
     if args.compare_w0:
         # Head-less target: (W0_qmunu - V_qmunu) q=0 tile from the loaded bodies.
-        W0 = np.asarray(jax.device_get(data["W_q"][:, :, 0, 0, 0]))
-        V0 = np.asarray(jax.device_get(data["V_q0"]))
+        W0 = gather_to_host(data["W_q"][:, :, 0, 0, 0])
+        V0 = gather_to_host(data["V_q0"])
         T = W0 - V0
         if args.cols:
             cols = _parse_cols(args.cols, nlog, None, args.seed)
@@ -766,8 +766,8 @@ def main(argv=None) -> None:
                 cols, z, data, matvec, diag_h, gen, snapshot, sh,
                 max_iter=args.gmres_max_iter, tol=args.gmres_tol)
         # W_tile is the device (mu_X, nu_Y) tile; column i = probe cols[i].
-        wc = np.asarray(jax.device_get(W_tile))          # (n_rmu, n_pad)
-        resids = np.asarray(jax.device_get(resids))      # (n_pad,)
+        wc = gather_to_host(W_tile)                      # (n_rmu, n_pad)
+        resids = gather_to_host(resids)                  # (n_pad,)
 
         hdr = f"{'nu':>5} {'||(W0-V)_col||':>15} {'rel_err':>11} {'max|Delta|':>12} {'gmres_resid':>12}"
         print(hdr)
@@ -799,8 +799,8 @@ def main(argv=None) -> None:
                 cols, z, data, matvec, diag_h, gen, snapshot, sh,
                 max_iter=args.gmres_max_iter, tol=args.gmres_tol)
         # Persist columns-first (n_cols, n_rmu), dropping the py zero-pad columns.
-        wc = np.asarray(jax.device_get(W_tile))[:, :len(cols)].T  # (n_cols, n_rmu)
-        resids = np.asarray(jax.device_get(resids))[:len(cols)]
+        wc = gather_to_host(W_tile)[:, :len(cols)].T     # (n_cols, n_rmu)
+        resids = gather_to_host(resids)[:len(cols)]
         with h5py.File(args.out, "w") as h5:
             h5.attrs["omega_ev"] = float(args.omega_ev)
             h5.attrs["eta_ev"] = float(args.eta_ev)
