@@ -291,7 +291,7 @@ def _case():
 
 
 def _build(mu_L, nu_L):
-    from src.gw.v_q_bispinor import _make_per_q_v_builder_for_tile
+    from gw.v_q_bispinor import _make_per_q_v_builder_for_tile
     bvec, q, G = _case()
     b = _make_per_q_v_builder_for_tile(
         mu_L=mu_L, nu_L=nu_L, bvec=bvec, cell_volume=1.0,
@@ -329,7 +329,7 @@ def test_tt_offdiagonal_applies_minus_khat_ij():
 
 
 def test_invalid_tt_indices_raise():
-    from src.gw.v_q_bispinor import _make_per_q_v_builder_for_tile
+    from gw.v_q_bispinor import _make_per_q_v_builder_for_tile
     with pytest.raises(ValueError):
         _make_per_q_v_builder_for_tile(
             mu_L=4, nu_L=1, bvec=np.eye(3), cell_volume=1.0,

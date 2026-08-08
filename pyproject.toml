@@ -126,6 +126,7 @@ markers = [
     "wfn_loader: the wfn_loader service suite (services/wfn_loader/tests)",
     "zeta_loader: the zeta_loader service suite (services/zeta_loader/tests)",
     "symmetry_maps: the symmetry_maps service suite (services/symmetry_maps/tests)",
+    "vcoul: the vcoul service suite (services/vcoul/tests)",
 ]
 
 [dependency-groups]

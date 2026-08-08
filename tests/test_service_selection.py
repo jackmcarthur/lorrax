@@ -72,6 +72,7 @@ def test_the_default_run_stages_the_service_suites_in(baseline):
     assert svc, "no services/ tests in the default collection"
     assert any("distrib_la" in n for n in svc)
     assert any("lxkit" in n for n in svc)
+    assert any("vcoul" in n for n in svc)
     # ...and lorrax's own tests are still there, which is the half a
     # "services are collected" assertion alone cannot see.
     assert {n for n in baseline if not _is_service(n)}
@@ -127,17 +128,34 @@ def test_only_service_with_an_unknown_name_selects_nothing_loudly():
             or "below the floor" in proc.stdout), proc.stdout[-2000:]
 
 
-def test_the_marker_selects_the_same_set_as_the_path_predicate(baseline):
-    """``-m distrib_la`` and ``--only-service=distrib_la`` must agree.
+@pytest.mark.parametrize("service", ["distrib_la", "vcoul"])
+def test_the_marker_selects_the_same_set_as_the_path_predicate(baseline, service):
+    """``-m <svc>`` and ``--only-service=<svc>`` must agree.
 
     They are two independent mechanisms — a marker applied by the
     service's own conftest, and a path predicate in tests/conftest.py —
     and the ONE thing that would make the marker route useless is the two
     drifting apart.  Leg A2's ``--ignore`` became ``-m``; this is the cell
     that says the ``-m`` means what the path meant.
+
+    Parameterized over every service that registers a marker, so a new
+    service whose conftest forgot ``pytest_collection_modifyitems`` fails
+    here instead of quietly making ``-m`` select nothing.
     """
-    assert _collect("-m", "distrib_la") == _collect(
-        "--only-service=distrib_la")
+    assert _collect("-m", service) == _collect(f"--only-service={service}")
+
+
+def test_only_service_keeps_exactly_vcoul(baseline):
+    """The path predicate on the newest service, on its own.
+
+    Separate from the distrib_la cell rather than parameterized with it:
+    the assertion that the OTHER services are absent is what makes this a
+    measurement of the filter, and "other" differs per service.
+    """
+    got = _collect("--only-service=vcoul")
+    expected = {n for n in baseline if n.startswith("services/vcoul/")}
+    assert got == expected
+    assert not any("distrib_la" in n or "lxkit" in n for n in got)
 
 
 def test_a_second_dash_m_would_reenable_the_extra_tier(baseline):

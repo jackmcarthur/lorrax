@@ -1,7 +1,17 @@
-"""Shared helper to build bare-Coulomb G-sphere flat-FFT indices.
+"""Bare-Coulomb G-sphere in the WFN.h5 PADDED layout.
 
-One source of truth for the radius condition
-``|q + G|² ≤ bare_coulomb_cutoff``:
+The radius condition ``|q + G|² ≤ bare_coulomb_cutoff`` moved to the
+``vcoul`` service on 2026-08-07 (:func:`vcoul.bare_coulomb_sphere_mask`).
+What stays here is the LAYOUT, and the split is the point:
+
+* the PREDICATE — which G are in q's sphere — is Coulomb arithmetic
+  through the same ``bvec`` every kernel uses.  It belongs to vcoul, and
+  three other callers there want it without any padding at all.
+* the PADDED SENTINEL LAYOUT — ``ngkmax``, the Miller-``(nx/2, ny/2,
+  nz/2)`` pad row, the flat-FFT index arithmetic — is a property of the
+  FFT box, shared with ψ, and lives in :mod:`common.gvec_fft_box`.  A
+  service that knew about it would be a service that knew about our
+  on-disk format.
 
 * :func:`compute_per_q_bare_coulomb_components` — a per-q sphere
   ``{G : |q + G|² ≤ cutoff}`` for every IBZ q, padded uniformly to
@@ -22,19 +32,18 @@ coeffs into the consumer's shared sphere via the components table.
 
 ``sys_dim`` matters only for the 0-D box case (no sphere reduction
 there); 2-D slab and 3-D bulk share the same construction.
-
-The PADDED LAYOUT itself is not defined here — it is a property of the
-FFT box, shared with ψ, and lives in :mod:`common.gvec_fft_box`
-(:func:`~common.gvec_fft_box.fft_box_pad_sentinel`,
-:func:`~common.gvec_fft_box.pad_gvecs_to_sentinel`).  This module only
-decides WHICH G are in each sphere; the sphere→padded-table step is the
-same call ``WfnLoader.gvecs`` makes.
 """
 from __future__ import annotations
 
 import numpy as np
 
 from common.gvec_fft_box import pad_gvecs_to_sentinel
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                               # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from vcoul import bare_coulomb_sphere_mask                  # noqa: E402
 
 
 def compute_per_q_bare_coulomb_components(
@@ -72,6 +81,15 @@ def compute_per_q_bare_coulomb_components(
         sphere reduction for box truncation) — caller falls back to the
         full FFT axis.
 
+        NEVER READ, and kept anyway: this parameter has no effect on the
+        returned tables and never did (the docstring above describes a
+        0-D contract the body does not implement).  The service-side
+        predicate :func:`vcoul.bare_coulomb_sphere_mask` does NOT have
+        it — a parameter that changes nothing forces every caller to
+        decide what to pass.  It survives HERE because two in-tree call
+        sites pass it by keyword and this is a compatibility surface,
+        not a new one; deleting it is the replumb's business.
+
     Returns
     -------
     dict with keys:
@@ -95,27 +113,15 @@ def compute_per_q_bare_coulomb_components(
     ``vcoul_cutoff_ry`` : float
         Echoed cutoff (for the writer to stash in the on-disk header).
     """
+    del sys_dim                       # never read; see the parameter note
     nx, ny, nz = (int(s) for s in fft_grid)
-    n_rtot = nx * ny * nz
-    bvec_f = np.asarray(bvec, dtype=np.float64)
-    q_irr_frac = np.asarray(q_irr_frac, dtype=np.float64).reshape(-1, 3)
-    n_q_ibz = int(q_irr_frac.shape[0])
 
-    # Miller indices on the FFT grid (fftfreq order), in floats for the
-    # |q+G|² calculation, then int32 for the components table.
-    gx_f = (np.fft.fftfreq(nx) * nx).astype(np.float64)
-    gy_f = (np.fft.fftfreq(ny) * ny).astype(np.float64)
-    gz_f = (np.fft.fftfreq(nz) * nz).astype(np.float64)
-    G_frac = np.stack(np.meshgrid(gx_f, gy_f, gz_f, indexing="ij"),
-                       axis=-1).reshape(-1, 3)               # (n_rtot, 3)
-    G_int = np.rint(G_frac).astype(np.int32)                   # Miller ints
-
-    # Per-q |q + G|² in Cartesian.  Broadcast over the n_rtot G's.
-    # qG_cart[q, r, :] = (q + G[r]) @ bvec_f
-    qG_frac = q_irr_frac[:, None, :] + G_frac[None, :, :]      # (n_q, n_rtot, 3)
-    qG_cart = qG_frac @ bvec_f                                  # (n_q, n_rtot, 3)
-    qG_norm2 = np.sum(qG_cart * qG_cart, axis=-1)               # (n_q, n_rtot)
-    mask = qG_norm2 <= float(vcoul_cutoff_ry)                   # (n_q, n_rtot)
+    # THE PREDICATE, from the service.  ``mask[q, r]`` is
+    # ``|q + G_r|² ≤ vcoul_cutoff_ry``; ``G_int[r]`` is the Miller index at
+    # flat-FFT index ``r`` (fftfreq order, C-order meshgrid).
+    mask, G_int = bare_coulomb_sphere_mask(
+        (nx, ny, nz), bvec, q_irr_frac, vcoul_cutoff_ry)
+    n_q_ibz = int(mask.shape[0])
 
     # G=(0,0,0) is flat-index 0 and is always inside: |q+0|² = |q|² ≤ |q_max|²
     # which is ≤ vcoul_cutoff_ry for any sane cutoff (≥ ecutwfc ≫ |q_max|²).

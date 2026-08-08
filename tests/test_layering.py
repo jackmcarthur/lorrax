@@ -153,6 +153,14 @@ _L3_MODULES = frozenset({
 #: ``ffi`` stays only while ``src/ffi`` does;
 #: :func:`test_every_package_in_the_map_exists` is what forces its removal
 #: at the right moment instead of leaving a dead no-op entry.
+#:
+#: ``vcoul`` IS A SERVICE AND IS DELIBERATELY NOT HERE.  Being extracted is
+#: not a level: the level is decided by what a module may KNOW ABOUT, and
+#: vcoul's whole subject is q-points, reciprocal lattices and the Coulomb
+#: interaction — physics, so L1 by the default, which is a decision and not
+#: an oversight.  It owns no ``.so``, probes no device and counts no
+#: processes; there is nothing at L3 for it to be.  It gets the §8 door rule
+#: (``_SERVICE_DOORS``) like every service, and no level entry.
 _L3_PACKAGES = ("ffi", "lxkit", "distrib_la")
 
 #: L2 by module.  Whole packages are in ``_L2_PACKAGES``.
@@ -1269,9 +1277,19 @@ def test_every_package_in_the_map_exists(sources):
 #: package, which is the door, so it is not a past-the-door edge and
 #: ``test_the_service_door_exceptions_are_all_still_needed`` would fail on
 #: an entry claiming otherwise.
+#:
+#: ``vcoul`` joined 2026-08-07.  Its shims — ``gw.compute_vcoul``,
+#: ``gw.coulomb.*``, ``gw.vcoul``, ``gw.compute_vcoul_0d``,
+#: ``file_io.read_bgw_vcoul``, ``common.coulomb_sphere`` — all say ``import
+#: vcoul`` / ``from vcoul import <public name>`` and none reaches a
+#: submodule, so vcoul needs NO row in ``_SERVICE_DOOR_EXCEPTIONS`` below.
+#: That is the point of putting ``_minibz_kernel_bare`` and
+#: ``_round_up_fft_size`` on the door despite the underscore: they have real
+#: cross-package consumers, and a shim reaching ``vcoul.minibz`` for one of
+#: them would have been this rule's first new violation since the replumb.
 _SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
                   "wfn_loader": "wfn_loader", "zeta_loader": "zeta_loader",
-                  "symmetry_maps": "symmetry_maps"}
+                  "symmetry_maps": "symmetry_maps", "vcoul": "vcoul"}
 
 #: ``src/`` module -> how many past-the-door edges it is allowed.  These are
 #: the transitional re-export shims.

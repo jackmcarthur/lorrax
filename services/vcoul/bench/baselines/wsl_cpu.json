@@ -1,0 +1,60 @@
+{
+  "hostname": "GPUtop",
+  "jax_version": "0.9.1",
+  "machine": "wsl_cpu",
+  "numpy_version": "2.4.3",
+  "recorded": "2026-08-07T16:51:11.981228-07:00",
+  "rows": [
+    {
+      "op": "v_qG_table",
+      "reps": 3,
+      "seconds": 0.0013885879998269957,
+      "seconds_max": 0.002171117997932015,
+      "seconds_min": 0.0013809240008413326,
+      "shape": [
+        64,
+        3000
+      ],
+      "sys_dim": 3
+    },
+    {
+      "op": "v_qG_table",
+      "reps": 3,
+      "seconds": 0.004081644001416862,
+      "seconds_max": 0.004320136999012902,
+      "seconds_min": 0.003956331998779206,
+      "shape": [
+        64,
+        3000
+      ],
+      "sys_dim": 2
+    },
+    {
+      "nmc": 262144,
+      "op": "build_v_head_miniBZ_avg_3d",
+      "reps": 3,
+      "seconds": 0.13569298299989896,
+      "seconds_max": 2.9148203219992865,
+      "seconds_min": 0.13072927300163428,
+      "shape": [
+        4,
+        4,
+        4
+      ]
+    },
+    {
+      "nsamples": 262144,
+      "op": "q0_sobol_analytic_head",
+      "qmc_reps": 10,
+      "reps": 3,
+      "seconds": 0.4179489630005264,
+      "seconds_max": 0.8278732569997374,
+      "seconds_min": 0.3890989259998605,
+      "shape": [
+        4,
+        4,
+        4
+      ]
+    }
+  ]
+}

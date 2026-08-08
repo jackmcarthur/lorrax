@@ -54,16 +54,24 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from gw.compute_vcoul_0d import compute_vcoul_box
 from gw.gw_init import read_cohsex_input
 from gw.vcoul import compute_q0_averages
 from file_io import EPSReader, resolve_input_paths
+# The vcoul branch reached its door with a bare ``from vcoul import ...``
+# placed after the ``gw`` imports on purpose, because importing any ``gw``
+# module runs the bootstrap as a SIDE EFFECT and the door import placed
+# first died with ModuleNotFoundError under PYTHONPATH=src (measured by
+# that branch's blind-audit arm).  The landing merge keeps the measurement
+# and drops the dependence on it: the explicit bootstrap below puts
+# services/*/src on sys.path regardless of what any ``gw`` import happens
+# to do, so neither door import is ordered against a side effect any more.
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
 _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
+from vcoul import compute_vcoul_box                                 # noqa: E402
 
 RYD2EV = 13.6056980659
 

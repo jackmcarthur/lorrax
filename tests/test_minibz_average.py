@@ -1,4 +1,4 @@
-"""Committed guard for the mini-BZ Coulomb-head cell average (gw.coulomb.base).
+"""Committed guard for the mini-BZ Coulomb-head cell average (vcoul.minibz).
 
 The subtle piece is the q->0 head: BGW splits the 3D 1/q^2 singularity into an
 analytic Baldereschi-Tosatti sphere term + MC of the smooth remainder outside
@@ -12,7 +12,9 @@ bit-identity, exciton flag on/off) lives at
 reports/minibz_head_averaging_2026-07-20/validate_minibz.py (needs the 6x6 fixture).
 """
 import numpy as np
-from gw.coulomb import base as cb
+from ffi import _services  # bootstrap BEFORE the door (audit rule D1/D2)
+_services.ensure_on_path()
+import vcoul as cb  # noqa: E402  — raw-array service names, no translation
 
 # synthetic cubic reciprocal cell: bvec rows = 2pi * e_i  =>  real cell vol = 1
 BVEC = 2.0 * np.pi * np.eye(3)

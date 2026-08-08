@@ -1,48 +1,29 @@
-"""Coulomb q=0 mini-BZ averaging + Voronoi-cell point wrapping.
+"""COMPAT SHIM — Coulomb q=0 mini-BZ averaging + Voronoi-cell point wrapping.
 
-Two small helpers kept after the legacy per-q ``V(q,G)`` builder and the unused
-``compute_vcoul_comps_for_q`` / ``compute_wcoul0_with_S`` routines were removed
-(the dimension-aware ``CoulombKernel`` in :mod:`gw.coulomb` now owns that logic):
+Both names moved to the ``vcoul`` service (2026-08-07):
 
-  * :func:`wrap_points_to_voronoi` — mini-BZ QMC sample wrapping (used by
-    :mod:`gw.compute_vcoul`).
-  * :func:`compute_q0_averages`    — q=0 ``(vc0, wcoul0)`` average, a thin wrapper
-    over ``gw.coulomb.get_kernel(sys_dim).q0_average`` (used by
-    :mod:`gw.head_correction`).
+  * :func:`wrap_points_to_voronoi` → :func:`vcoul.wrap_points_to_voronoi`,
+    re-exported here verbatim (same jitted function object) because
+    :mod:`bse.vq_interp` and :mod:`gw.compute_vcoul` still import it from
+    this path.
+  * :func:`compute_q0_averages` → the ``q0_average`` method on any
+    :func:`vcoul.get_kernel` kernel.  What stays here is the DECK-FACING
+    translation: ``wfn`` + ``common.Meta`` in, ``(vc0, wcoul0)`` out.
+    ``gw.head_correction``'s HeadResolver is the caller, in both the
+    epshead and the anisotropic-S(ω) flavour.
 """
 
-import functools
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                               # owner's workspace fix -- see _services.py)
 
-import jax
-import jax.numpy as jnp
+_services.ensure_on_path()
 
-from common import Meta
+import jax.numpy as jnp                                     # noqa: E402
 
+from common import Meta                                     # noqa: E402
+from vcoul import wrap_points_to_voronoi                    # noqa: E402,F401
 
-@functools.partial(jax.jit, static_argnames=('nmax',))
-def wrap_points_to_voronoi(randcart, bvec, nmax: int = 1):
-	"""
-	Helper function to get test q-points for mini-BZ average with correct Voronoi cell.
-	Rewritten to use JAX arrays.
-
-	Wrapped in ``@jax.jit`` (with ``nmax`` static) so all the per-line
-	primitives (meshgrid, stack, reshape, matmul, broadcast subtract,
-	norm, argmin, gather, subtract) collapse into a single XLA module
-	cached on (input shape × nmax).  Without the jit each call site
-	emitted ~10 eager-pjit cache misses.
-	"""
-	randcart_j = jnp.asarray(randcart, dtype=jnp.float64)
-	bvec_j = jnp.asarray(bvec, dtype=jnp.float64)
-
-	grid = jnp.arange(-nmax, nmax + 1)
-	shifts = jnp.stack(jnp.meshgrid(grid, grid, grid, indexing="ij"), axis=-1).reshape(-1, 3)
-	candidate_shifts = shifts @ bvec_j  # (M, 3)
-
-	diff = randcart_j[:, None, :] - candidate_shifts[None, :, :]  # (N, M, 3)
-	dists = jnp.linalg.norm(diff, axis=2)  # (N, M)
-	best_idx = jnp.argmin(dists, axis=1)  # (N,)
-	wrapped = randcart_j - candidate_shifts[best_idx]
-	return wrapped
+__all__ = ["wrap_points_to_voronoi", "compute_q0_averages"]
 
 
 def compute_q0_averages(
@@ -51,18 +32,27 @@ def compute_q0_averages(
 	meta: Meta,
 	S_cart: jnp.ndarray | None = None,
 	nsamples: int = 2**18,
-	method: str = "sobol",
+	method: str = "auto",
 	qmc_reps: int = 10,
 	analytic_sphere: bool = False,
 ):
 	"""Compute q=0 averages (vc0_mean, wcoul0) for the system's dimensionality.
 
 	Thin compatibility wrapper around the dimension-aware ``CoulombKernel``
-	in :mod:`gw.coulomb`.  The branching logic that used to live here is
-	now distributed across the per-dim kernel modules.  ``analytic_sphere``
+	in :mod:`gw.coulomb`, which adapts :mod:`vcoul`'s.  ``analytic_sphere``
 	(``head_minibz_average``) adds the Baldereschi-Tosatti analytic sphere
 	term (3D) / widens the Voronoi fold (both dims) to the q→0 head; default
 	False keeps the historical pure-Sobol average bit-identical.
+
+	``method`` DEFAULTS TO ``"auto"`` since the extraction (it was
+	``"sobol"``).  With scipy present — which is every production machine,
+	and the ``sobol`` extra declares it — ``auto`` resolves to exactly the
+	same scrambled-Sobol draw, so every number here is unchanged.  What
+	changes is the machine WITHOUT scipy: it used to fall back to a uniform
+	draw with ``nsamples`` silently raised to 2.5e6, and now it does the
+	same thing while SAYING so once (``vcoul.minibz``'s announce-or-refuse
+	gate).  A caller that wants the old silence back should not have it; a
+	caller that wants a refusal instead passes ``method="sobol"``.
 	"""
 	from .coulomb import get_kernel
 	return get_kernel(getattr(meta, 'sys_dim', None)).q0_average(
