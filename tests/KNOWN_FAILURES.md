@@ -11,6 +11,155 @@ claim carries the arm in which it comes out FALSE.
 
 ---
 
+# AMENDMENT — SYMMETRY LANDING, `integration/symmetry-landing-2026-08-08` @ `aadac51f` (2026-08-08) — **THE LANDING STOPPED**
+
+**This branch did NOT land, and this amendment is why.**  Three verified
+symmetry branches were merged onto `main` @ `995f9e9d` — the q_irr restart
+machinery, the generator-contract/pstrf work, and kin_ion store-compressed —
+plus one ruling commit pinning `si_bse_debug`'s deck to
+`restart_q_storage = full`.  All three merges are clean and all 222 of the
+branches' own new cells collect GREEN.  The amortized census then found
+**nine newly red cells that no branch predicted**, all one mechanism, and the
+rule is that a landing with an unexplained red does not go to `main`.  The
+mechanism IS now explained — it is a real defect in the q_irr work, not a
+census artifact — which is what this row is for.
+
+| | |
+|---|---|
+| machine | Perlmutter, lx pool (JID 56501040), 1 node, 4×A100, Shifter, `lx test` (default xdist geometry) |
+| module | `LX_BASE_MODULE=lorrax_J070`, jax `0.7.0.dev20260808` |
+| trees | `/pscratch/sd/j/jackm/symland_0808/wt_merged` (`aadac51f`) and `.../wt_base` (`995f9e9d`).  The `[lx] source tree:` line was READ on both legs and named the intended worktree on both |
+| `.so` pins | the merge_ckpt pair, unchanged: device md5 `c680c229…`, host md5 `91f330c3…`.  Both legs announced the ABI-stamp NOTE (a pre-2026-08-08 build, not a refusal at `LORRAX_FFI_ABI_STRICT` unset) |
+| `LORRAX_FFTW3_SO` | PINNED on both legs (`lorrax_fftw_cray/.../libfftw3.so.mpi31.3.6.10`) |
+| artifacts | `_reports/suite_merged.xml` — **2271 testcases**, 796429 B; `_reports/suite_base.xml` — **2053 testcases**, 574384 B; set-diff by `bwrun/setdiff_mc.py`, saved at `_reports/setdiff.txt` |
+| runs | one `lx test` each: merged head 702.88 s, base 539.53 s |
+
+## The census at the merged head
+
+| leg | pass | fail | skip | error | total |
+|---|---|---|---|---|---|
+| `tests/` | 1373 | 16 | 61 | 4 | 1454 |
+| `services/distrib_la` | 138 | 5 | 33 | 0 | 176 |
+| `services/lxkit` | 120 | 0 | 0 | 0 | 120 |
+| `services/symmetry_maps` | 231 | 10 | 19 | 0 | 260 |
+| `services/vcoul` | 56 | 2 | 0 | 0 | 58 |
+| `services/wfn_loader` | 77 | 0 | 15 | 0 | 92 |
+| `services/zeta_loader` | 110 | 0 | 1 | 0 | 111 |
+| **ALL** | **2105** | **33** | **129** | **4** | **2271** |
+
+## The census at the base, `main` @ `995f9e9d`
+
+| leg | pass | fail | skip | error | total |
+|---|---|---|---|---|---|
+| `tests/` | 1259 | 11 | 61 | 0 | 1331 |
+| `services/distrib_la` | 138 | 5 | 33 | 0 | 176 |
+| `services/lxkit` | 120 | 0 | 0 | 0 | 120 |
+| `services/symmetry_maps` | 141 | 10 | 14 | 0 | 165 |
+| `services/vcoul` | 56 | 2 | 0 | 0 | 58 |
+| `services/wfn_loader` | 77 | 0 | 15 | 0 | 92 |
+| `services/zeta_loader` | 110 | 0 | 1 | 0 | 111 |
+| **ALL** | **1901** | **28** | **124** | **0** | **2053** |
+
+## SET-DIFF vs `main` @ `995f9e9d`
+
+| direction | result |
+|---|---|
+| **newly RED** | **9 — THE BLOCKER.**  Named below, one mechanism, all of it this landing's |
+| newly GREEN | **0** |
+| newly SKIPPED / no longer skipped | **0 / 0** |
+| collection delta | **+222 cells, ALL GREEN, zero red among them** — the three branches' own gate campaigns, attributed by file below |
+| lost from collection | **4**, all rename twins with a matching new cell (below) |
+| carried red | **28**, identical by name on both sides — every one of them listed in this file already |
+
+### The +222, by file
+
+| cells | file | branch |
+|---|---|---|
+| 32 | `services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py` | followup |
+| 28 | `tests/test_restart_q_storage_key.py` | followup |
+| 27 | `services/symmetry_maps/tests/test_symmetry_maps_rename_compat.py` | followup |
+| 20 | `tests/test_write_restart_tensors_key.py` | followup |
+| 18 | `tests/test_kin_ion_star_broadcast.py` | task4 |
+| 18 | `services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py` | followup |
+| 15 | `tests/test_restart_qirr_producer.py` | followup |
+| 14 | `tests/test_restart_qirr_consumers.py` | followup |
+| 14 | `tests/test_bse_w0_ready_gate.py` | followup |
+| 14 | `services/symmetry_maps/tests/test_symmetry_maps_closure.py` | followup |
+| 7 | `tests/test_qgrid_symmetry_resolution.py` | followup |
+| 7 | `tests/test_centroid_distribution.py` | stamp |
+| 4 | `tests/test_symmetry_unfold.py` | followup (the rename twins) |
+| 4 | `services/symmetry_maps/tests/test_symmetry_maps_multiproc.py` | followup |
+
+### The 4 lost from collection — renames, one-for-one
+
+`compute_centroid_sym_perm` → `centroid_source_map_and_wrap` (2 cells) and
+`unfold_v_q` → `unfold_isdf_operator` (2 cells), all in
+`tests/test_symmetry_unfold.py`, each with its identically-bodied twin in the
++222 above.  Nothing lost coverage.
+
+## THE NINE NEWLY RED — one mechanism
+
+| cell | how it dies |
+|---|---|
+| `tests/test_invariance_gates.py::test_ibz_equals_full_bz` | `TypeError: sub got incompatible shapes for broadcasting: (9, 399, 399), (5, 399, 399)` at `gw/cohsex_sigma.py:144` |
+| `tests/test_invariance_gates.py::test_restart_equals_fresh` | ERROR at setup — the `gnppm_restart_baseline` fixture runs `restart = true` and dies the same way |
+| `tests/test_invariance_gates.py::test_mu_pad_flip_invariance_gnppm` | " |
+| `tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot` | " |
+| `tests/test_invariance_gates.py::test_fixed_point_frozen_qp_rotations` | " |
+| `tests/test_gw_jax_regression.py::test_bispinor_gnppm_matches_reference` | same restart path, same deck |
+| `tests/test_bse_w0_resolvent.py::test_w0_resolvent_matches_restart` | `bse_io._MunuSlabPlan` refuses `ds_shape=(5, 399, 399)` against `kgrid=(3, 3, 1)` — **at P=1, on a 1×1 mesh** |
+| `tests/test_bse_w_omega_chain.py::test_w_omega_chain_matches_oracle_q0` | " |
+| `tests/test_bse_w_omega_chain.py::test_w_omega_chain_matches_oracle_finite_q` | " |
+
+**The mechanism, in one line:** `gnppm_debug`'s 399-centroid set is
+orbit-closed, so `restart_q_storage = auto` resolves to `ibz` and every
+gnppm restart file in the suite is now written on the 5-q wedge instead of
+the 9-q full BZ — and two restart CONSUMERS cannot read it.
+
+This landing's own new cell
+`test_a_closed_set_resolves_to_ibz_with_bit_identical_tables[gnppm_debug-399]`
+asserts that resolution and passes.  The resolution is right.  What is
+missing is the other half.
+
+**Consumer 1 — the GW restart path, which asks no question at all.**
+`file_io/tagged_arrays.py::read_restart_state_from_h5` reads `V_qmunu` at
+whatever q extent is on disk; `gw/gw_init.py`'s restart branch (the `else:`
+from ~1686) contains ZERO occurrences of `unfold`, `wedge`, `q_storage` or
+`qirr`.  So a wedge `V_q` flows to `gw/cohsex_sigma.py:144`, meets a `W_q`
+that screening DID unfold to the full BZ, and `W_q - V_q` raises.  The crash
+is loud, which is luck: it is loud only because the two shapes disagree.
+
+**Consumer 2 — the sharded BSE reader, at ONE process.**
+`bse_io._MunuSlabPlan` refuses the wedge by design and says so well.  What
+the followup branch's Perlmutter arm registered was that this bites
+"a production GW+BSE pipeline launched as multiple processes"; the census
+says otherwise.  `load_bse_data_from_restart_sharded` is reached on a 1×1
+mesh, so the refusal fires at P=1 too, and the registered decision row
+UNDERSTATED its own blast radius.
+
+**Why the branch's campaign did not see it.**  All fourteen cells of
+`tests/test_restart_qirr_consumers.py` target the `bse_io` seam — the tile
+shim, the SlabIO plan's refusal, the two-channel resolution, the placeholder
+guard.  Not one exercises `file_io.tagged_arrays.read_restart_state_from_h5`,
+which is the GW-side reader and the one that asks nothing.  The gates were
+thorough about the consumer they knew about.
+
+**What this does to the registered decision row.**  The row offered (a) pin
+the deck, (b) change the default, (c) teach the reader to unfold.  The
+ruling commit `aadac51f` on this branch takes (a) for `si_bse_debug`, and
+that commit is still correct as far as it goes — none of the nine are on
+that deck.  But the census shows the row was scoped to one deck and one
+transport when the true scope is *every orbit-closed deck, at every process
+count, on both the GW and the BSE restart paths*.  Pinning decks one at a
+time is now visibly whack-a-mole, and it would leave the production defect
+standing.  **This is an owner call and is not taken here.**
+
+**Not a mispairing, not a stale checkout.**  Both legs read their
+`[lx] source tree:` line and both named the intended worktree; both ran the
+same `.so` pair, the same `LORRAX_FFTW3_SO`, the same module, on the same
+node class, minutes apart.  The 28 carried reds are identical by name on
+both sides, which is the control that says the two legs are comparable.
+
 # AMENDMENT — VCOUL HEAD-SLOT LANDING, on `main` (2026-08-08, owner-approved after the hBN anchor)
 
 The mini-BZ head injection moved to argmin|q+G| with tied-slot mean (the
