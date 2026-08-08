@@ -23,16 +23,43 @@
 #       w1_vcoul.md §6.4.4); this deck closes that gap too.  When a BGW
 #       anchor phase happens, a vhead-pinned VARIANT deck can be added
 #       beside this one — do not convert this one.
+#
+# BAND COUNTS ARE SPINOR COUNTS (execution-worker edit, 2026-08-07).
+# The committed draft assumed a SCALAR mean field (nspinor=1: 16 valence
+# electrons -> 8 doubly-occupied bands, nband 40).  LORRAX cannot read an
+# nspinor=1 WFN.h5: WfnLoader._eager_build's full-BZ unfold path calls
+# symmetry_maps.unfold_psi, whose spinor rotation U_eff is ALWAYS 2x2,
+# so a (nb,1,ngk) block comes back (nb,2,ngk) and the write into the
+# (nb,1,ngkmax) slab raises
+#   ValueError: could not broadcast input array from shape (8,2,1457)
+#               into shape (8,1,1457)
+# Every fixture WFN in the tree (si_cohsex_debug, si_bse_debug,
+# gnppm_debug) is nspinor=2, produced by QE with
+# `noncolin=.true., lspinorb=.false., no_t_rev=.true.` — a 2-spinor
+# representation of a NON-relativistic calculation.  The hBN mean field
+# was regenerated the same way, so every band count here doubles:
+#   16 valence electrons -> 16 occupied SPINOR bands; 80 in the WFN.
+# The physics under test (hexagonal bvec, sys_dim=3, the live head
+# table, the unpinned q->0 ladder) is untouched by this.
 # =====================================================================
 [cohsex]
 
 restart = false
-centroids_file = centroids_frac_320.txt
+# ORBIT-CLOSED SET, 330 NOT 320 (execution-worker edit, 2026-08-07).  The
+# plan asked for 320 centroids AND an orbit-closed set; those two cannot
+# both hold exactly.  centroid.kmeans_cli recovered a 12-op symmorphic
+# point group from the charge density (the WFN stores 1 op, nosym), and
+# pivoted Cholesky selects whole ORBITS: 28 orbits unfold to 330 closed
+# centroids, rank gate 28/28 PASS.  Forcing exactly 320 would require
+# --no-orbit, i.e. reproducing the Si-960 non-closure defect the plan
+# names as the thing not to replicate.  Closure wins; the filename
+# records the true count.
+centroids_file = centroids_frac_330.txt
 
-# 16 valence electrons -> 8 occupied bands; 40 bands in the WFN.
-nval = 8
-ncond = 32
-nband = 40
+# 16 valence electrons -> 16 occupied spinor bands; 80 bands in the WFN.
+nval = 16
+ncond = 64
+nband = 80
 sys_dim = 3
 bare_coulomb_cutoff = 25.0
 
@@ -49,7 +76,6 @@ sigma_freq_debug_output = true
 fermi_reference = midgap
 
 wfn_file = WFN.h5
-output_file = eqp_hbn_test.dat
 sigma_diag_file = eqp_hbn_test.dat
 sigma_omega_h5_file = sigma_mnk.h5
 
