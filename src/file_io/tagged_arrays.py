@@ -219,6 +219,20 @@ def write_restart_state_to_h5(
         elif init_W0:
             if V_qmunu is None:
                 raise ValueError("init_W0=True requires V_qmunu to size the placeholder")
+            # THE PLACEHOLDER'S SHAPE IS V'S SHAPE.  W0 is allocated here
+            # from ``V_qmunu.shape``, so V's storage decision silently
+            # becomes W0's — including its q extent.  That coupling is
+            # fine and deliberate while both tensors are full-BZ, and it
+            # is a TRAP the moment they need not be: a run that stored V
+            # on the q wedge and W0 on the full BZ (or the reverse) would
+            # get a placeholder of the wrong length here, and
+            # ``write_w0_qmunu_to_h5`` re-creates the dataset later, so
+            # the mismatch would surface as a shape error deep in the W
+            # write rather than as a decision anyone took.
+            # THE RULE: V and W0 resolve their q storage ONCE, together.
+            # Whoever teaches this writer about wedge storage must pass
+            # the resolved mode in rather than let it be inherited from
+            # an argument's shape.
             v_shape = _mu_logical_shape(V_qmunu.shape, (-2, -1), n_rmu_logical)
             v_dtype = V_qmunu.dtype
             _t0 = time.time()
@@ -239,9 +253,25 @@ def write_restart_state_to_h5(
     # bse_io.py reads W0_ready as an HDF5 attr on the W0_qmunu dataset.
     # Set it rank-0-only after SlabIO has released the file, to stay
     # compatible with that reader.
-    if w0_touched and jax.process_index() == 0:
+    #
+    # ``V_ready`` IS THE SAME PROMISE FOR V, AND IT IS NEW.  W0 has carried
+    # a persisted flag since the April all-zero-screening incident, and
+    # every W0 consumer gates on it; V_qmunu carried nothing, and
+    # ``bse_io._load_ring_subset`` read it unconditionally on the same line
+    # that gated W0.  Today that asymmetry is harmless — V is never
+    # allocated as a placeholder, so present implies written — but "the
+    # invariant happens to hold" and "the file says so" are different
+    # states, and only the second survives a writer that grows a
+    # placeholder path.  Stamped True here because reaching this line means
+    # the data went in; readers treat ABSENT as True so every restart file
+    # written before this attr existed keeps loading byte-for-byte.
+    v_touched = V_qmunu is not None
+    if (w0_touched or v_touched) and jax.process_index() == 0:
         with h5py.File(filename, "a") as f:
-            f["W0_qmunu"].attrs["W0_ready"] = w0_ready
+            if w0_touched:
+                f["W0_qmunu"].attrs["W0_ready"] = w0_ready
+            if v_touched:
+                f["V_qmunu"].attrs["V_ready"] = True
     barrier("restart_W0_ready_flag")
 
 

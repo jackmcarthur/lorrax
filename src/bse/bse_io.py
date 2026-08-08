@@ -120,6 +120,39 @@ _BARE_V_FALLBACK_WARNING = (
 )
 
 
+def _refuse_unpersisted(dset, name: str, restart_file: str) -> None:
+    """Refuse a restart tensor whose file says its data was never written.
+
+    THE ASYMMETRY THIS CLOSES.  ``W0_qmunu`` has carried a ``W0_ready``
+    attr since the April all-zero-screening incident — a full-size zero
+    placeholder that reached the solver and produced a plausible exciton
+    spectrum — and every W0 consumer in the tree gates on it.
+    ``V_qmunu`` carried no such flag, and the full-file reader read it
+    unconditionally on the line immediately above the one that gated W0.
+
+    That was safe by accident rather than by construction: V is never
+    allocated as a placeholder today, so present implied written.  The
+    writer now stamps ``V_ready`` (``file_io.tagged_arrays``) and this
+    refuses when the file says False.
+
+    ABSENT MEANS READY, and that is the whole backward-compatibility
+    story: every restart file written before the attr existed carries
+    nothing here and loads byte-for-byte as it always did.  Only a file
+    that positively claims "not persisted" is refused — which is the one
+    state that cannot be distinguished from good data by looking at the
+    numbers.
+    """
+    if dset.attrs.get("V_ready", True):
+        return
+    raise ValueError(
+        f"{restart_file}: {name} is present and correctly shaped but its "
+        f"V_ready attr is False — the file says this tensor's data was "
+        f"never persisted.  Reading it would hand the BSE a tensor of "
+        f"zeros that passes every shape check, which is exactly the "
+        f"mechanism behind the all-zero-screening incident.  Re-run the "
+        f"GW leg that writes it.")
+
+
 def _generate_kpts_grid(nkx: int, nky: int, nkz: int) -> np.ndarray:
     """Monkhorst-Pack style k-point grid in crystal coords [0, 1), C-order.
 
@@ -1307,6 +1340,7 @@ def load_bse_data_from_restart_sharded(
         if use_nohead and vq_key == "V_qmunu":
             print("Warning: requested --nohead but V_qmunu_nohead not found; using V_qmunu.")
         vq_dset = f[vq_key]
+        _refuse_unpersisted(vq_dset, vq_key, restart_file)
         wq_key = None
         if use_nohead and "W0_qmunu_nohead" in f and bool(f["W0_qmunu_nohead"].attrs.get("W0_ready", False)):
             wq_key = "W0_qmunu_nohead"
@@ -1919,6 +1953,7 @@ def _load_ring_subset(
             "load_bse_data_from_restart_sharded (sharded hyperslab reads) "
             "as the P>1 preview/ring paths already do.")
     with h5py.File(restart_file, "r") as f:
+        _refuse_unpersisted(f["V_qmunu"], "V_qmunu", restart_file)
         V_qmunu = jnp.asarray(f["V_qmunu"][:])
         if "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
             W0_qmunu = jnp.asarray(f["W0_qmunu"][:])

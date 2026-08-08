@@ -329,3 +329,142 @@ def test_the_qirr_reader_makes_the_same_refusal():
     assert "PLACEHOLDER, not" in src, (
         "the qirr reader's placeholder refusal has moved or been reworded; "
         "check it still refuses rather than warning")
+
+
+# ---------------------------------------------------------------------------
+# The two holes the phase-3 map found in this same gate family
+# ---------------------------------------------------------------------------
+# Both are the SAME defect shape as the April incident — a reader that
+# accepts something it cannot distinguish from good data — and neither was
+# reachable from the W0 flag, which is why they survived the fix above.
+
+def test_v_qmunu_carries_a_persisted_flag_too(tmp_path):
+    """W0 has said "I was written" since April.  V now says it as well.
+
+    The asymmetry was real and it was on ONE LINE: the full-file reader
+    gated W0 on ``W0_ready`` and read ``V_qmunu`` unconditionally,
+    immediately above it.  It was safe by accident — V has no placeholder
+    path, so present implied written — and "the invariant happens to
+    hold" is a different state from "the file says so".  Only the second
+    survives a writer that grows one, which the q_irr work is about to.
+    """
+    path = tmp_path / "restart.h5"
+    _placeholder_restart_or_skip(path)
+    import h5py
+    with h5py.File(path, "r") as f:
+        assert bool(f["V_qmunu"].attrs["V_ready"]) is True
+        # ...and the W0 placeholder beside it still says the opposite,
+        # which is what makes this a flag and not a constant.
+        assert bool(f["W0_qmunu"].attrs["W0_ready"]) is False
+
+
+def test_the_writer_stamps_v_ready_where_it_stamps_w0_ready():
+    """SOURCE cell — runs on a box with no FFI, like its W0 twin.
+
+    ``_placeholder_restart_or_skip`` skips without the built SlabIO, so
+    the behavioural cell above cannot be the only evidence.  Both stamps
+    must live in the same rank-0 block, after SlabIO releases the file:
+    stamping V from a different place would reintroduce the interleave
+    the W0 comment warns about.
+    """
+    import file_io.tagged_arrays as ta
+
+    src = pathlib.Path(inspect.getsourcefile(
+        ta.write_restart_state_to_h5)).read_text()
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "write_restart_state_to_h5")
+    stamped = {
+        n.slice.value for n in ast.walk(fn)
+        if isinstance(n, ast.Subscript)
+        and isinstance(n.slice, ast.Constant)
+        and isinstance(n.value, ast.Attribute)
+        and n.value.attr == "attrs"
+    }
+    assert {"W0_ready", "V_ready"} <= stamped, (
+        f"write_restart_state_to_h5 stamps {sorted(stamped)}; both "
+        f"persisted flags must be set here, in one rank-0 block")
+
+
+def test_a_file_that_says_v_was_never_persisted_is_refused(tmp_path):
+    """The refusal, and the legacy path beside it.
+
+    Three states, and the middle one is the whole backward-compatibility
+    story: ABSENT means ready, because every restart file written before
+    the attr existed carries nothing and must keep loading byte-for-byte.
+    """
+    import h5py
+    from bse.bse_io import _refuse_unpersisted
+
+    path = tmp_path / "v.h5"
+    with h5py.File(path, "w") as f:
+        legacy = f.create_dataset("legacy", shape=(NQ, N_MU, N_MU),
+                                  dtype=np.complex128)
+        ready = f.create_dataset("ready", shape=(NQ, N_MU, N_MU),
+                                 dtype=np.complex128)
+        ready.attrs["V_ready"] = True
+        never = f.create_dataset("never", shape=(NQ, N_MU, N_MU),
+                                 dtype=np.complex128)
+        never.attrs["V_ready"] = False
+
+        _refuse_unpersisted(legacy, "legacy", str(path))     # absent -> ok
+        _refuse_unpersisted(ready, "ready", str(path))       # True   -> ok
+        with pytest.raises(ValueError, match="never persisted"):
+            _refuse_unpersisted(never, "never", str(path))
+
+
+def test_both_readers_ask_before_reading_v():
+    """SOURCE cell: the gate is at BOTH V reads, not just the one named.
+
+    ``_load_ring_subset`` is the reader the map found; the sharded loader
+    reads V too, and a gate on one of two readers is a gate a caller can
+    route around by choosing a path.
+    """
+    src = _BSE_IO.read_text()
+    tree = ast.parse(src)
+    guarded = {
+        n.name for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef)
+        and any(isinstance(c, ast.Call)
+                and getattr(c.func, "id", None) == "_refuse_unpersisted"
+                for c in ast.walk(n))
+    }
+    assert {"_load_ring_subset",
+            "load_bse_data_from_restart_sharded"} <= guarded, (
+        f"only {sorted(guarded)} refuse an unpersisted V")
+
+
+def test_build_hdir_refuses_a_w0_whose_q_axis_is_not_the_full_bz():
+    """The SILENT site, made loud.
+
+    ``build_hdir`` indexes W0 by FULL-BZ q (``qkk`` comes from
+    ``k_lookup``).  Hand it a q_irr wedge and every index is in range —
+    it returns rows belonging to other q's and reports a plausible,
+    wrong exciton spectrum.  Nothing downstream can tell.  This is the
+    April failure SHAPE with a different cause, and the guard is asked
+    of the lazy handle before any work happens.
+    """
+    from bse import vq_interp as vqi
+
+    kg = np.array([2, 2, 2])            # 8 full-BZ q
+    wedge = np.zeros((2, N_MU, N_MU), dtype=np.complex128)   # an IBZ wedge
+    with pytest.raises(ValueError, match=r"2 q rows.*needs 8"):
+        vqi.build_hdir({"W0": wedge, "kgrid": kg}, 0)
+
+
+def test_the_full_bz_w0_gets_past_that_guard():
+    """RED TWIN for the cell above: the guard is not simply always-raise.
+
+    It must reject the wedge and pass the full-BZ tensor.  A correctly
+    sized W0 gets through this check and fails LATER, on the deck data
+    this synthetic ``zx`` does not carry — which is the proof that the q
+    extent is what the previous cell measured and not an accident of the
+    stub being incomplete.
+    """
+    from bse import vq_interp as vqi
+
+    kg = np.array([2, 2, 2])
+    full = np.zeros((8, N_MU, N_MU), dtype=np.complex128)
+    with pytest.raises((KeyError, TypeError, IndexError, AttributeError)):
+        vqi.build_hdir({"W0": full, "kgrid": kg}, 0)

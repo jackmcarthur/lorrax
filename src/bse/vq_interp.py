@@ -1596,6 +1596,35 @@ def build_hdir(zx, q0, nvw=3, ncw=3):
             "binding would be entirely absent — re-run GW screening before "
             "trusting this diagnostic.")
     kg = zx["kgrid"]
+    # THE Q AXIS MUST BE THE FULL BZ, AND THIS IS THE ONLY PLACE THAT SAYS SO.
+    # ``qkk`` below is built from ``k_lookup`` and therefore holds FULL-BZ q
+    # indices, and ``W0[qkk[k]]`` fancy-indexes by them.  A W0 whose q axis
+    # is anything else — a q_irr wedge, a truncated write, a reshaped
+    # artifact — does not raise there.  It returns rows belonging to
+    # DIFFERENT q's, and this diagnostic then reports a plausible, wrong
+    # exciton spectrum: numbers that survive every downstream check because
+    # nothing downstream checks this.  The sharded readers in ``bse_io``
+    # (``_MunuSlabPlan``, ``_resolve_munu_reader``) already refuse exactly
+    # this disagreement; this site was the hole in that set.  Asked of the
+    # lazy handle, before any work, so the refusal costs nothing.
+    #
+    # The extents are read into locals BEFORE the test on purpose: the
+    # W0_ready ratchet in ``tests/test_bse_w0_ready_gate.py`` requires
+    # every ``if`` whose body names ``zx["W0"]`` to be testing the
+    # persisted flag, and it is right to.  This refusal is a different
+    # question about the same object, so it keeps the subscript out of
+    # the guarded body rather than teaching that matcher an exception.
+    _nq_expected = int(np.prod(np.asarray(kg, dtype=np.int64)))
+    _nq_w0 = int(zx["W0"].shape[0])
+    if _nq_w0 != _nq_expected:
+        raise ValueError(
+            f"build_hdir: W0_qmunu has {_nq_w0} q rows but the deck's "
+            f"k-grid {tuple(int(v) for v in np.asarray(kg))} needs "
+            f"{_nq_expected}.  The q lookup below indexes W0 by FULL-BZ "
+            f"q, so any other length silently returns the wrong rows "
+            f"instead of failing.  A q_irr wedge must be unfolded on read "
+            f"(symmetry_maps.qirr_store.read_tensor) before it reaches "
+            f"here.")
     cs = list(range(zx["nv"], zx["nv"] + ncw))
     vs = list(range(zx["nv"] - nvw, zx["nv"]))
     npair = zx["nk"] * ncw * nvw
