@@ -2,12 +2,20 @@
 // FFI library was actually built against, and which handler-signature ABI it
 // speaks.
 //
-// Consumed by ffi_loader (dlsym'd, optional — an older .so simply does not
-// have it, and the caller can say so rather than guess) and surfaced in the
-// runtime startup report.  Deliberately plain C linkage and a plain string:
-// the point is that it is trivially readable from Python, from `nm`, and
-// from `strings` on a .so someone found in a scratch directory with no
-// memory of how it was configured.
+// WHO ACTUALLY READS THIS (stated, because the comment here used to claim a
+// consumer that did not exist — ffi_loader reports the PROVENANCE file beside
+// the .so, not this string):
+//
+//   the STRING   scripts/verify_ffi_build.sh GATE 0 and GATE 9, and
+//                services/distrib_la/tests/test_so_acceptance.py, both of
+//                which read it out of the file's bytes without loading it —
+//                and a person running `strings` on a .so found in a scratch
+//                directory with no memory of how it was configured.
+//   the INTEGER  both Python loaders, dlsym'd at dlopen, before anything else
+//                touches the library.  Optional there: an older .so simply
+//                does not export it, and the loader says so rather than guess.
+//
+// Deliberately plain C linkage and a plain string, so all three of those work.
 //
 // Everything here is a compile-time constant, so the string is baked into
 // .rodata and costs nothing at run time.

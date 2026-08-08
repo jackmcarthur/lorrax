@@ -364,7 +364,7 @@ tree at `b61c1df` does not have the first four at all.
 `LORRAX_CUDA_CHECK` and `LORRAX_LIB_CHECK` are **C macros**, not env
 vars — the earlier grep-based counts were misleading.  So are
 `LORRAX_CFG_STR` / `LORRAX_CFG_STR2`
-(`cpp/common/build_config.cc:16-17`, the two-level stringification macro
+(`cpp/common/build_config.cc`, the two-level stringification macro
 pair) and the whole `LORRAX_CFG_*` family, which are CMake vars configured
 into `lorrax_config.h` rather than anything the environment can set; and so
 are `LORRAX_CUSOLVERMP_CHECK` (`cpp/cusolvermp` error-check macro) and
