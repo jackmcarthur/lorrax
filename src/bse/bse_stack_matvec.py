@@ -132,7 +132,35 @@ from .bse_ring_comm import make_bse_shardings
 #
 # None of the three changes the number of live (nk, mu_loc, nu_loc, ns^2)-class
 # intermediates, which stays at the one ``T_b`` family documented below.
-_MATVEC_OPTS = ("yhoist", "krep")   # densek REMOVED 2026-07-31, owner directive
+#   zfold   Fold XLA's IFFT ``1/N`` OUT of the FFT thunk and onto the tiny
+#           decode output.  DEFAULT OFF, needs an owner ruling.
+#           XLA's GPU FFT thunk runs ``cufftExecZ2Z`` and then applies the
+#           IFFT's ``1/N`` with a separate cuBLAS ``zscal`` over the WHOLE
+#           output tensor.  That scale lives inside the thunk, not in the
+#           HLO graph, so no fusion pass can see it and it cannot be folded
+#           into the very next instruction -- a full extra HBM round trip of
+#           the T-tensor per matvec, measured at 359 us of a 3683 us W-term
+#           seam on the production shard (225 MiB T), i.e. 9.6%.
+#           The identity ``ifft_raw(x) == conj(fft_raw(conj(x)))`` replaces
+#           the IFFT with a second FORWARD transform, which XLA emits with NO
+#           zscal; the two ``conj``s fuse into the neighbouring transpose and
+#           multiply fusions at zero added traffic (measured: transposes
+#           354/356 us and multiply 430/433 us, unchanged).  The ``1/N`` then
+#           rides on ``WXcv``, the (c_loc, v, nk) decode output -- 1.88 MiB
+#           against T's 225 MiB, a tensor 120x smaller that is being written
+#           anyway.
+#           MEASURED (fftdon probe v3, median GPU kernel duration, 1 A100):
+#           production shard 3683.0 -> 3330.8 us (-9.6%) and BIT-IDENTICAL;
+#           12x12x1 nk=144 6582.6 -> 5806.8 us (-11.8%), max rel 1.05e-14;
+#           480/12x12x1 "400b class" 26284.6 -> 23149.5 us (-11.9%), max rel
+#           1.02e-14.  Bit-identity at the production shape is not luck: nk
+#           = 64 makes every folded factor an exact power of two.  At nk =
+#           144 it is a reassociation of the same products and drifts at the
+#           1e-14 level, so a NON-bit-exact gate is required off powers of
+#           two -- hence default OFF pending the owner's tolerance ruling.
+#           This is the deep-dive's S4, now measured on the replacement code
+#           rather than modelled.
+_MATVEC_OPTS = ("yhoist", "krep", "zfold")   # densek REMOVED 2026-07-31, owner directive
 
 
 def matvec_opts() -> frozenset[str]:
@@ -175,6 +203,7 @@ def build_bse_stack_matvec(
     nk = nkx * nky * nkz
     opts = matvec_opts()
     use_yhoist = "yhoist" in opts
+    use_zfold = "zfold" in opts
 
     # ── W term: one shard_map over ('x','y'); body = scan over the trial axis ──
     def _w_stack(X, psi_c_X, psi_v_Y, W_R):
@@ -214,10 +243,20 @@ def build_bse_stack_matvec(
             # is a better FFT (batching, an FFI handler, fewer dispatches),
             # never a denser algorithm.
             T_k = T_b.reshape(mu_loc, nu_loc, ns, ns, nkx, nky, nkz)
-            T_R = local_ifftn3(T_k, axes=(4, 5, 6), norm="ortho")
-            U_R = W_R[:, :, None, None, :, :, :] * T_R
-            U_b = local_fftn3(U_R, axes=(4, 5, 6), norm="ortho").reshape(
-                mu_loc, nu_loc, ns, ns, nk)
+            if use_zfold:
+                # Both transforms FORWARD and UNNORMALISED, so XLA emits no
+                # cuBLAS zscal at all; the accumulated 1/nk is applied to the
+                # decode output below.  ifft_raw(x) = conj(fft_raw(conj(x))).
+                T_R = jnp.conj(
+                    local_fftn3(jnp.conj(T_k), axes=(4, 5, 6), norm=None))
+                U_R = W_R[:, :, None, None, :, :, :] * T_R
+                U_b = local_fftn3(U_R, axes=(4, 5, 6), norm=None).reshape(
+                    mu_loc, nu_loc, ns, ns, nk)
+            else:
+                T_R = local_ifftn3(T_k, axes=(4, 5, 6), norm="ortho")
+                U_R = W_R[:, :, None, None, :, :, :] * T_R
+                U_b = local_fftn3(U_R, axes=(4, 5, 6), norm="ortho").reshape(
+                    mu_loc, nu_loc, ns, ns, nk)
 
             # decode: (WX)_b = (1/√Nk) Σ_{μ,ν,t,s} conj(ψ_c) ψ_v U_b.  psum_scatter
             # completes the μ-sum while scattering c→x, then the ν-sum while
@@ -229,7 +268,11 @@ def build_bse_stack_matvec(
             if not use_yhoist:
                 WXcv = lax.psum_scatter(
                     WXcv, "y", scatter_dimension=1, tiled=True)     # (c_loc, v_loc, nk)
-            return carry, WXcv / sqrt_nk
+            # ``zfold`` carries the two transforms' missing 1/nk here, on a
+            # (c_loc, v, nk) tensor 120x smaller than T and already being
+            # written -- the whole point of the route.
+            return carry, (WXcv / (sqrt_nk * nk) if use_zfold
+                           else WXcv / sqrt_nk)
 
         if use_yhoist:
             # ONE 'y' all-gather for the whole block instead of n_trials of
