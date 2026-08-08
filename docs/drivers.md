@@ -196,7 +196,7 @@ Invoke: `python -u -m bse.bse_jax -i cohsex.in --lanczos ...` in the GW run dire
 | `--write-eigs [N]` | off | write `eigenvectors.h5` (rank-0 single-writer; non-TDA adds `eigenvectors_coupling` Y) |
 | `--eqp FILE` | none | full-BZ `eqp1.dat` (LORRAX GW format): re-slice bands on QP energies (n_occ re-resolved) |
 | `bse_k_grid` (input key) | `""` | "NX NY NZ" fine grid; each axis a multiple of the coarse grid; empty = coarse bundle byte-identical |
-| `LORRAX_BSE_MATVEC_OPT` (env) | unset | comma list of `yhoist`,`gspmd`; unknown token REFUSES (no silent baseline under an optimised label).  `gspmd` is a default-off audit route that drops the manual `shard_map`, and refuses together with `yhoist`.  `krep` was **removed 2026-08-08** — measured at 0.05% of the eigensolve and never honoured on the default `--lanczos` route; setting it now refuses |
+| `LORRAX_BSE_MATVEC_OPT` (env) | unset | only token is `gspmd`, a default-off audit route that drops the manual `shard_map`; unknown tokens REFUSE.  `yhoist` was made **permanent** and `krep` **removed** on 2026-08-08 — setting either now refuses |
 
 Failure modes: a loud banner "W0_qmunu not ready — falling back to BARE COULOMB V" means GW screening never ran — the spectrum has no excitonic screening; `FileNotFoundError: isdf_tensors_*.h5` means you are not in (or did not point `-i` at) a GW run dir; multiple restarts are resolved newest-mtime; forgetting `--bse` silently gives RPA.
 Not in the fastloop chain: the fastest smoke is this driver on a mini GW run dir (e.g. a fastloop `check.<jobid>/<leg>` dir) single-process with `XLA_FLAGS=--xla_force_host_platform_device_count=4` — a real 2×2 mesh, no MPI.

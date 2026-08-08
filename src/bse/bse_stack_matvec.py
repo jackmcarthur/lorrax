@@ -95,24 +95,17 @@ from .bse_ring_comm import make_bse_shardings
 #           dispatches) -- 331 ns per four-point transform is dispatch
 #           overhead, not arithmetic.
 #
-#   yhoist  Lift the two 'y'-axis collectives OUT of the per-trial scan.
-#           ``all_gather(X_b,'y')`` and the final ``psum_scatter(...,'y')``
-#           are the two SMALL collectives (the operand is (c_loc, v, nk) --
-#           2 KB per trial at P=64, vs 426 KB for the 'x' pair), so batching
-#           them over the trial axis costs 16 KB per rank in total and
-#           removes 2 of the 4 collectives per trial.  The 'x' pair is
-#           deliberately NOT hoisted: batching those needs an
-#           (n_trials, c, nk, ns, nu_loc) staging buffer -- 3.4 MB per rank,
-#           an n_trials-fold replication of a T-adjacent intermediate, which
-#           is exactly the memory-for-comm trade the owner has vetoed.  The
-#           accounting is per-rank bytes, and it is the whole argument for
-#           why one half of this is allowed and the other is not.
-#           MEASURED (job 7883166): ALONE it is 1.007x on a full production Q
-#           -- inside the 3.42% run-to-run spread the same job measured by
-#           running its baseline cell twice, i.e. NOTHING.  Combined with
-#           the removed dense-k lever it measured 2.319x, because once the
-#           FFT is gone the collectives are a much larger share of what is
-#           left.  Report it that way: it is not a lever on its own.
+# The 'y'-axis collective hoist is PERMANENT (was ``yhoist``, made
+# unconditional 2026-08-08).  ``all_gather(X_b,'y')`` and the final
+# ``psum_scatter(...,'y')`` are the two SMALL collectives -- the operand is
+# (c_loc, v, nk), 2 KB per trial at P=64 against 426 KB for the 'x' pair -- so
+# batching them over the trial axis costs 16 KB per rank in total and removes
+# 2 of the 4 collectives per trial.  The 'x' pair is deliberately NOT hoisted:
+# batching those needs an (n_trials, c, nk, ns, nu_loc) staging buffer, 3.4 MB
+# per rank, an n_trials-fold replication of a T-adjacent intermediate -- the
+# memory-for-comm trade the owner has vetoed.  The accounting is per-rank
+# bytes, and it is the whole argument for why one half of this is allowed and
+# the other is not.
 #
 #   gspmd   AUDIT ROUTE, default OFF.  Build the W term with NO ``shard_map``:
 #           the same einsum chain and the same ``lax.scan`` over trials, but
@@ -131,14 +124,9 @@ from .bse_ring_comm import make_bse_shardings
 #           only one from which the flat-k FFT FFI is structurally reachable
 #           (FFT_DONATION_AUDIT §3.1: shard_map cannot nest).
 #
-# Note for readers arriving from a report that says "the dial is inert on the
-# bs == 1 path": that was always too broad.  ``yhoist`` lives in THIS module,
-# inside ``_w_stack``, which the ``bs == 1`` route executes on every matvec —
-# so it is honoured there.  The token that route really did ignore was
-# ``krep``, and ``krep`` was REMOVED on 2026-08-08 (see ``_MATVEC_OPTS``).
-#
-# ``yhoist`` does not change the number of live (nk, mu_loc, nu_loc, ns^2)-class
-# intermediates, which stays at the one ``T_b`` family documented below.
+# The permanent hoist does not change the number of live
+# (nk, mu_loc, nu_loc, ns^2)-class intermediates, which stays at the one
+# ``T_b`` family documented below.
 # ``krep`` REMOVED 2026-08-08 (owner ruling, measured): it uniquely removed 3
 # in-loop collectives per block iteration that CGS2 does not, but they are a
 # 128 B and two 13 KB all-reduces -- ~1.35 ms against a ~2700 ms eigensolve,
@@ -146,7 +134,15 @@ from .bse_ring_comm import make_bse_shardings
 # 30% intra-arm spread (FEAST_KPM_PASS.md §1).  It was never honoured on the
 # shipped bs == 1 route, which is why it also carried an honesty banner and
 # eight gate cells -- maintenance surface for a lever worth 0.05%.
-_MATVEC_OPTS = ("yhoist", "gspmd")   # densek REMOVED 2026-07-31, owner directive
+# ``yhoist`` REMOVED 2026-08-08 -- not withdrawn, made PERMANENT.  It met the
+# owner's standing knob policy exactly (improves performance, no drawback,
+# arch-safe, so remove the knob and keep the winning behaviour): measured
+# 1.007x alone -- inside the 3.42% run-to-run spread the same job measured by
+# running its baseline cell twice -- at a cost of 16 KB/rank, with no scale
+# cliff and no numerics (the gate asserted BIT-identity, not a tolerance).
+# A lever that is free, harmless and too small to see is not a dial, it is a
+# default.  ENV_KNOB_CENSUS.md §6.3, FIX_smallwins.md §3.5.
+_MATVEC_OPTS = ("gspmd",)   # densek REMOVED 2026-07-31, owner directive
 
 
 def matvec_opts() -> frozenset[str]:
@@ -188,19 +184,7 @@ def build_bse_stack_matvec(
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
     opts = matvec_opts()
-    use_yhoist = "yhoist" in opts
     use_gspmd = "gspmd" in opts
-    if use_gspmd and use_yhoist:
-        # ``yhoist`` names a transformation of the manual body's collective
-        # schedule; the gspmd route has no manual schedule to hoist out of.
-        # REFUSE rather than accept-and-ignore: a knob that is parsed and
-        # silently dropped voids every A/B built on it (STATUS.md:167-170).
-        raise ValueError(
-            "LORRAX_BSE_MATVEC_OPT: 'gspmd' and 'yhoist' are mutually "
-            "exclusive.  'yhoist' lifts two collectives out of the manual "
-            "shard_map body's per-trial scan; the 'gspmd' route issues no "
-            "manual collectives at all, so there is nothing for it to hoist. "
-            "Pick one.")
 
     # ── W term: one shard_map over ('x','y'); body = scan over the trial axis ──
     def _w_stack(X, psi_c_X, psi_v_Y, W_R):
@@ -216,11 +200,10 @@ def build_bse_stack_matvec(
 
         def _body(carry, X_b):                       # X_b: (c_loc, v_loc, nk)
             # encode: T_b[μ,ν,t,s,k] = Σ_c ψ_c[k,c,t,μ] Σ_v conj(ψ_v[k,v,s,ν]) X_b
-            # With ``yhoist`` the 'y' all-gather already happened OUTSIDE the
-            # scan, so X_b arrives as (c_loc, v_full, nk) — the same operand
-            # ``Xv`` is below, one collective per BLOCK instead of per trial.
-            Xv = (X_b if use_yhoist
-                  else lax.all_gather(X_b, "y", axis=1, tiled=True))  # (c_loc, v_full, nk)
+            # The 'y' all-gather already happened OUTSIDE the scan, so X_b
+            # arrives as (c_loc, v_full, nk) — one collective per BLOCK
+            # instead of one per trial.
+            Xv = X_b                                                 # (c_loc, v_full, nk)
             R = jnp.einsum("kvsN,cvk->cksN", jnp.conj(psi_v_Y), Xv)  # (c_loc, nk, ns, ν_loc)
             Rc = lax.all_gather(R, "x", axis=0, tiled=True)          # (c_full, nk, ns, ν_loc)
             T_b = jnp.einsum("kctM,cksN->MNtsk", psi_c_X, Rc)        # (μ_loc, ν_loc, ns, ns, nk)
@@ -258,23 +241,20 @@ def build_bse_stack_matvec(
                 jnp.einsum("kctM,MNtsk->cNsk", jnp.conj(psi_c_X), U_b),
                 "x", scatter_dimension=0, tiled=True)               # (c_loc, ν_loc, ns, nk)
             WXcv = jnp.einsum("kvsN,cNsk->cvk", psi_v_Y, A)         # (c_loc, v_full, nk)
-            if not use_yhoist:
-                WXcv = lax.psum_scatter(
-                    WXcv, "y", scatter_dimension=1, tiled=True)     # (c_loc, v_loc, nk)
+            # NB no per-trial psum_scatter on 'y' here: it is hoisted to one
+            # scatter for the whole block, after the scan.
             # Carries the two unnormalised transforms' 1/nk, on a
             # (c_loc, v, nk) tensor ~120x smaller than T that is being written
             # anyway -- that is the whole reason it is folded to here.
             return carry, WXcv / (sqrt_nk * nk)
 
-        if use_yhoist:
-            # ONE 'y' all-gather for the whole block instead of n_trials of
-            # them.  Operand (n_trials, c_loc, v_loc, nk) -> (…, v_full, …):
-            # 16 KB per rank at P=64, against the 11.08 MB T_b the scan body
-            # already holds.  The scan carries no extra T-class buffer.
-            X = lax.all_gather(X, "y", axis=2, tiled=True)
+        # ONE 'y' all-gather for the whole block instead of n_trials of them.
+        # Operand (n_trials, c_loc, v_loc, nk) -> (…, v_full, …): 16 KB per
+        # rank at P=64, against the 11.08 MB T_b the scan body already holds.
+        # The scan carries no extra T-class buffer.
+        X = lax.all_gather(X, "y", axis=2, tiled=True)
         _, WX = lax.scan(_body, None, X)             # WX: (n_trials, c_loc, v_*, nk)
-        if use_yhoist:
-            WX = lax.psum_scatter(WX, "y", scatter_dimension=2, tiled=True)
+        WX = lax.psum_scatter(WX, "y", scatter_dimension=2, tiled=True)
         return WX
 
     # ── W term, GSPMD twin: same math, same scan, NO shard_map ────────────────

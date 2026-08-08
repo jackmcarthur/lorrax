@@ -5,7 +5,7 @@ The BSE stack matvec carries two optional rewrites (``bse.bse_stack_matvec``):
   ``densek``  the k-space convolution's ``ifftn -> *W_R -> fftn`` replaced by
               an explicit dense (nk x nk) DFT contraction.  Same linear map,
               different floating-point order.
-  ``yhoist``  the two 'y'-axis collectives lifted out of the per-trial scan.
+  ``gspmd``   the default-off GSPMD twin of the W term (audit route).
               Reassociates nothing.
 
 Three things have to hold, and each one is worthless without the others:
@@ -22,7 +22,7 @@ Three things have to hold, and each one is worthless without the others:
 
 2.  **The rewrites do not move the operator.**  Every dial setting is applied
     to the same production matvec on the shared dense fixture and compared
-    against the dense reference H.  ``yhoist`` must be bit-identical;
+    against the dense reference H.
     ``densek`` must agree to fp64 round-off but is NOT required to be
     bit-identical, and asserting that it is would be asserting something
     false.
@@ -56,8 +56,8 @@ from bse import bse_stack_matvec as SM  # noqa: E402
 @pytest.mark.parametrize("raw,expect", [
     ("", frozenset()),
     ("   ", frozenset()),
-    ("yhoist", frozenset({"yhoist"})),
-    ("  YHOIST ", frozenset({"yhoist"})),
+    ("gspmd", frozenset({"gspmd"})),
+    ("  GSPMD ", frozenset({"gspmd"})),
 ])
 def test_matvec_opt_grammar_accepts(monkeypatch, raw, expect):
     monkeypatch.setenv("LORRAX_BSE_MATVEC_OPT", raw)
@@ -72,7 +72,13 @@ def test_matvec_opt_grammar_accepts(monkeypatch, raw, expect):
                                  # exactly like any other, so a stale launcher
                                  # that still sets it FAILS LOUDLY instead of
                                  # running the baseline under the old label.
-                                 "krep", "yhoist,krep", "KREP"])
+                                 "krep", "yhoist,krep", "KREP",
+                                 # RED TWIN for the 2026-08-08 permanence: the
+                                 # hoist is now unconditional, so `yhoist` is
+                                 # an unknown token.  A launcher still setting
+                                 # it must FAIL rather than imply the tree has
+                                 # an un-hoisted arm left to select.
+                                 "yhoist", "YHOIST"])
 def test_matvec_opt_grammar_refuses(monkeypatch, raw):
     """A token that is not an option must RAISE, never degrade to baseline."""
     monkeypatch.setenv("LORRAX_BSE_MATVEC_OPT", raw)
@@ -95,8 +101,7 @@ def _mesh():
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("opt,tol,label", [
-    ("", 1e-9, "baseline"),
-    ("yhoist", 0.0, "yhoist (must be BIT-identical)"),
+    ("", 1e-9, "shipped (permanent 'y' hoist)"),
 ])
 def test_dial_preserves_the_operator(bse_dense_state, monkeypatch, opt, tol,
                                      label):
@@ -127,18 +132,8 @@ def test_dial_preserves_the_operator(bse_dense_state, monkeypatch, opt, tol,
         err = _relerr(HXs[t].reshape(-1), ref)
         assert err < 1e-9, f"{label} trial {t}: relerr {err:.3e} vs dense H"
 
-    if tol == 0.0:
-        # yhoist only re-orders WHICH collective moves the bytes; the
-        # arithmetic and its association are untouched, so anything but a bit
-        # match means it changed the computation.
-        monkeypatch.setenv("LORRAX_BSE_MATVEC_OPT", "")
-        with mesh:
-            base_mv = SM.build_bse_stack_matvec(mesh, nkx, nky, nkz,
-                                                kernel="bse")
-            base = np.asarray(base_mv(
-                jax.lax.with_sharding_constraint(X, sh.X),
-                arr["psi_c_X"], arr["psi_c_Y"], arr["psi_v_X"], arr["psi_v_Y"],
-                data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"],
-                arr["M_X"], arr["M_Y"]))
-        assert np.array_equal(base, HXs), \
-            "yhoist changed a bit — it is supposed to move only collectives"
+    # NB the old bit-identity arm compared the hoisted body against an
+    # un-hoisted one.  The hoist is permanent as of 2026-08-08 and the
+    # un-hoisted arm no longer exists, so there is nothing left to compare
+    # to; what survives, and is the property that actually mattered, is the
+    # check against the dense reference H above.
