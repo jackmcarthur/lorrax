@@ -537,24 +537,29 @@ def compute_all_V_q_g_flat(
             f"(0-D box per-q v(G) not wired); got {sys_dim}.")
     # compute_v_q_per_G is gw's wfn-facing translation over the vcoul door
     # (old bvec/cell_volume/sys_dim signature) and correctly stays a gw
-    # import; build_v_head_miniBZ_avg_3d is a pure service symbol, so its
+    # import; build_v_head_miniBZ_fn_3d is a pure service symbol, so its
     # true dependency is the door (replumbed 2026-08-07).  ORDER IS
     # LOAD-BEARING: .compute_vcoul runs the service path bootstrap at its
     # module scope, so it must be imported BEFORE the door — the blind
     # audit arm measured the swapped order dying with ModuleNotFoundError
     # in a stripped process where nothing else had bootstrapped yet.
     from .compute_vcoul import compute_v_q_per_G
-    from vcoul import build_v_head_miniBZ_avg_3d
+    from vcoul import build_v_head_miniBZ_fn_3d
 
-    # 3D bulk: precompute the mini-BZ-averaged v(q, G=0) table once.
+    # 3D bulk: build the mini-BZ-averaged head ⟨v(K+δq)⟩ ONCE, as a
+    # function of the Cartesian K = q+G.  ``v_qG_table`` evaluates it at
+    # every slot attaining argmin |q+G| — see its HEAD SLOT note; the old
+    # per-q table keyed on the Miller-(0,0,0) label was not equivariant
+    # under q → −q and cost V_q 6.0e−3 of reciprocity against a 1.16e−7
+    # floor.
     # The IBZ → full-BZ V_q unfold is bilinear in ζ and inherits this
     # head value through ``unfold_v_q``'s centroid-permute + L-phase, so
     # injecting at every IBZ q is sufficient — no separate full-BZ pass.
     # 2D ``f2d → 0`` regularizes v at G=0 already; the MC flag is a 3D-
     # only refinement and is silently no-op'd for sys_dim=2.
-    _v_head_table = None
+    _v_head_fn = None
     if mc_average_vcoul_body and sys_dim == 3:
-        _v_head_table = build_v_head_miniBZ_avg_3d(
+        _v_head_fn = build_v_head_miniBZ_fn_3d(
             kgrid, bvec, cell_volume)
 
     def _bare_v_per_G(q_irr_frac, gvec_components):
@@ -563,7 +568,7 @@ def compute_all_V_q_g_flat(
             bvec=bvec, cell_volume=cell_volume,
             sys_dim=sys_dim, vcoul_cutoff_ry=bare_coulomb_cutoff_ry,
             bdot=bdot,
-            v_head_miniBZ=_v_head_table,
+            v_head_fn=_v_head_fn,
         )                                                   # (n_q_ibz, ngkmax) f64
         # Optional BGW vcoul overlay — host-side scatter from BGW's
         # full-FFT-grid v into the per-q WFN.h5 sphere positions.

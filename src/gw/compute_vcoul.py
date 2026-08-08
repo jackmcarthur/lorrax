@@ -11,13 +11,13 @@ what the live G-flat V_q path needs:
   dimensionality in :mod:`gw.coulomb`, shared with that package's
   ``CoulombKernel.v_qG``.  There is no second implementation to keep in
   step any more.
-* :func:`build_v_head_miniBZ_avg_3d` — the 3D mini-BZ-averaged
-  ``<v(q, G=0)>`` head table injected into ``compute_v_q_per_G`` for
-  bulk systems.  Since 2026-08-07 it LIVES in ``vcoul.minibz`` and is
-  re-exported here; the name and signature at this path are unchanged
-  (production ``gw.v_q_g_flat`` imports it from the door since the
-  2026-08-07 replumb; this path remains for the head-draw guard and
-  sibling branches).
+* :func:`build_v_head_miniBZ_fn_3d` — the 3D mini-BZ-averaged Coulomb
+  head ``<v(K + δq)>_miniBZ`` as a function of the Cartesian ``K = q+G``,
+  injected into ``compute_v_q_per_G`` for bulk systems.  It LIVES in
+  ``vcoul.minibz`` and is re-exported here (production
+  ``gw.v_q_g_flat`` imports it from the door since the 2026-08-07
+  replumb; this path remains for the head-draw guard and sibling
+  branches).
 * :func:`compute_all_V_q` — the thin dispatcher: for a G-flat on-disk ζ
   it hands off to :func:`gw.v_q_g_flat.compute_all_V_q_g_flat`; any
   other layout raises ``NotImplementedError``.
@@ -40,14 +40,16 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-#: The 3D mini-BZ body-head table.  Moved to :func:`vcoul.minibz` on
-#: 2026-08-07 and re-exported here VERBATIM — including the seed=42 /
-#: nmc=2**18 defaults, which the ``si_bse_debug`` frozen reference pins,
-#: and the row-convention comment block that records what the transposed
-#: draw cost.  ``tests/test_vcoul_minibz_head_draw.py`` imports it from
-#: THIS path (the head-draw guard doubles as shim coverage);
-#: ``gw.v_q_g_flat`` imports the door since the 2026-08-07 replumb.
-from vcoul import build_v_head_miniBZ_avg_3d                # noqa: E402,F401
+#: The 3D mini-BZ body head.  Lives in :func:`vcoul.minibz` since
+#: 2026-08-07 and is re-exported here VERBATIM — including the seed=42 /
+#: nmc=2**18 defaults, which the ``si_bse_debug`` frozen reference pins.
+#: ``tests/test_vcoul_minibz_head_draw.py`` imports it from THIS path
+#: (the head-draw guard doubles as shim coverage); ``gw.v_q_g_flat``
+#: imports the door since the 2026-08-07 replumb.
+from vcoul import (                                         # noqa: E402,F401
+    build_miniBZ_dq_cart,
+    build_v_head_miniBZ_fn_3d,
+)
 
 
 def compute_v_q_per_G(
@@ -60,7 +62,7 @@ def compute_v_q_per_G(
     vcoul_cutoff_ry: float | None = None,
     bdot: np.ndarray | None = None,
     fft_grid: np.ndarray | None = None,
-    v_head_miniBZ: np.ndarray | None = None,
+    v_head_fn: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> np.ndarray:
     """Compute ``v(q+G)`` at the per-q WFN.h5-style G-list.
 
@@ -106,9 +108,9 @@ def compute_v_q_per_G(
     straight to :func:`vcoul.v_qG_table`; the arithmetic lives once per
     dimensionality in ``vcoul.{bulk_3d,slab_2d,box_0d}`` and is
     shared with :meth:`CoulombKernel.v_qG`.  The
-    dimension-independent capabilities (``vcoul_cutoff_ry`` masking, G=0
-    head-slot injection, the ``(n_q, ngkmax)`` float64 contract) are
-    implemented once in that driver.  ``sys_dim=0`` is now SERVED rather
+    dimension-independent capabilities (``vcoul_cutoff_ry`` masking, the
+    ``argmin |q+G|`` head-slot injection, the ``(n_q, ngkmax)`` float64
+    contract) are implemented once in that driver.  ``sys_dim=0`` is now SERVED rather
     than refused — ``Box0D`` supplies the WS-box formula at q=0 — but the
     G-flat V_q pipeline still cannot reach it, because
     ``gw.isdf_fitting`` builds no per-q sphere for ``sys_dim == 0``
@@ -129,7 +131,7 @@ def compute_v_q_per_G(
         geometry=CoulombGeometry(bvec=bvec, cell_volume=cell_volume,
                                  bdot=bdot, fft_grid=fft_grid),
         vcoul_cutoff_ry=vcoul_cutoff_ry,
-        v_head_miniBZ=v_head_miniBZ,
+        v_head_fn=v_head_fn,
     )
 
 

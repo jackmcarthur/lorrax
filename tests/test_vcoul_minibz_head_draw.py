@@ -1,8 +1,9 @@
 """Committed guard for the 3D mini-BZ body-head DRAW (gw.compute_vcoul).
 
-``build_v_head_miniBZ_avg_3d`` draws nmc points "uniformly on the Voronoi
+``build_v_head_miniBZ_fn_3d`` draws nmc points "uniformly on the Voronoi
 cell of the mini-BZ" by sampling U ~ U[0,1)^3 in fractional coordinates,
-mapping to Cartesian, and wrapping to the Voronoi cell.  The map has exactly
+mapping to Cartesian, wrapping to the Voronoi cell, and (since 2026-08-08)
+closing the sample set under negation.  The map has exactly
 one correct spelling: ``U @ bvec`` (the parallelepiped spanned by the ROWS
 b1,b2,b3 — a fundamental domain of the reciprocal lattice, so the wrap is a
 measure-preserving bijection).  The transposed spelling ``U @ bvec.T`` spans
@@ -12,6 +13,16 @@ at all, with the same total volume (det is transpose-invariant), so no
 volume or normalisation check can see it.  ``compute_vcoul.py:62`` shipped
 the transposed spelling from its birth (2b8c1d9, 2026-05-16) until the
 2026-08-07 fix this file rides with.
+
+THE HEAD IS A FUNCTION OF K NOW, not an (nkx, nky, nkz) table: the
+2026-08-08 head-slot fix injects at every ``argmin |q+G|`` slot, each
+valued from its own Cartesian K, so a per-q scalar cannot carry the
+answer.  ``_prod_head_table`` below rebuilds the old table SHAPE by
+evaluating the production function at each grid q's Cartesian point, which
+is exactly what the retired builder returned, so every arm below still
+compares the same quantities it always did.  The mirrors centrosymmetrise
+their draws to match production; the transpose remains the only variable
+this file changes.
 
 WHY SILICON CANNOT TEST THIS (and this file can): for the Si FCC fixture,
 ``bvec.T == P @ bvec`` with P a cyclic permutation matrix, so
@@ -49,7 +60,28 @@ import itertools
 import numpy as np
 import pytest
 
-from gw.compute_vcoul import build_v_head_miniBZ_avg_3d
+from gw.compute_vcoul import build_v_head_miniBZ_fn_3d
+
+
+def _prod_head_table(kgrid, bvec, cell_volume, *, nmc, seed):
+    """The production head, evaluated on the grid q's — the (nkx, nky, nkz)
+    shape the pre-2026-08-08 builder returned, so the arms below keep their
+    shape.  q=0 stays 0 (the head there is the separate rank-1 Sigma_X
+    term and the driver skips Gamma)."""
+    fn = build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume,
+                                   nmc=nmc, seed=seed)
+    kg = np.asarray(kgrid, dtype=np.float64)
+    out = np.zeros(tuple(int(s) for s in kgrid), dtype=np.float64)
+    for qx in range(int(kgrid[0])):
+        for qy in range(int(kgrid[1])):
+            for qz in range(int(kgrid[2])):
+                qw = np.array([qx, qy, qz], dtype=np.float64)
+                qw = np.where(qw > kg / 2, qw - kg, qw)
+                q_cart = (qw / kg) @ bvec
+                if np.dot(q_cart, q_cart) < 1e-12:
+                    continue
+                out[qx, qy, qz] = float(fn(q_cart.reshape(1, 3))[0])
+    return out
 
 # ---------------------------------------------------------------------------
 # Lattices.
@@ -95,7 +127,7 @@ def _np_wrap_to_voronoi(randcart, bvec, nmax=1):
 
 
 def _head_from_offsets(dq_cart, kgrid, bvec, cell_volume):
-    """The q-loop of build_v_head_miniBZ_avg_3d, verbatim, in numpy."""
+    """The q-loop of the production head, verbatim, in numpy."""
     nkx, nky, nkz = (int(s) for s in kgrid)
     kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
     out = np.zeros((nkx, nky, nkz), dtype=np.float64)
@@ -120,7 +152,11 @@ def _mirror_head(bvec, kgrid, *, nmc, seed, transpose):
     wrapped = _np_wrap_to_voronoi(randcart, bvec, nmax=1)
     kgrid_arr = np.asarray(kgrid, dtype=np.float64)
     randlims = bvec.T @ (np.diag(1.0 / kgrid_arr) @ np.linalg.inv(bvec.T))
-    dq_cart = (randlims @ wrapped.T).T
+    half = (randlims @ wrapped.T).T
+    # Centrosymmetrise, as production does (2026-08-08): {dq} = {-dq} is
+    # what makes the injected head an exactly even function of K.  Both
+    # mirrors get it, so ``transpose`` stays the single variable.
+    dq_cart = np.concatenate([half, -half], axis=0)
     return _head_from_offsets(dq_cart, kgrid, bvec, _celvol(bvec))
 
 
@@ -192,7 +228,7 @@ def test_si_literal_matches_fixture():
 
 def test_production_head_uses_the_row_convention_on_noncubic():
     nmc, seed = 16384, 42
-    prod = build_v_head_miniBZ_avg_3d(
+    prod = _prod_head_table(
         HEX_KGRID, HEX_BVEC, _celvol(HEX_BVEC), nmc=nmc, seed=seed)
     correct = _mirror_head(HEX_BVEC, HEX_KGRID, nmc=nmc, seed=seed,
                            transpose=False)
@@ -210,7 +246,7 @@ def test_production_head_uses_the_row_convention_on_noncubic():
     np.testing.assert_allclose(prod[nz], correct[nz], rtol=1e-10)
     # ... and NOT the shipped (transposed) rule.
     assert _rel(prod, shipped, nz).mean() > 1e-2, (
-        "build_v_head_miniBZ_avg_3d matches the TRANSPOSED draw "
+        "build_v_head_miniBZ_fn_3d matches the TRANSPOSED draw "
         "(randvals @ bvec.T) — the 2026-05-16 bug is back.  See this "
         "file's docstring; Si gates CANNOT catch this, only this test can.")
 
@@ -226,8 +262,7 @@ def _seed_band_z(bvec, kgrid, *, nmc, seeds):
     a bias shifts the mean of the differences, a reseed only widens them."""
     nz = _nonzero_mask(kgrid)
     prod = np.stack([
-        build_v_head_miniBZ_avg_3d(kgrid, bvec, _celvol(bvec),
-                                   nmc=nmc, seed=s)
+        _prod_head_table(kgrid, bvec, _celvol(bvec), nmc=nmc, seed=s)
         for s in seeds])
     ship = np.stack([
         _mirror_head(bvec, kgrid, nmc=nmc, seed=s, transpose=True)
@@ -289,11 +324,15 @@ def test_production_head_matches_rejection_ground_truth_on_hexagonal():
     voronoi_pts = np.concatenate(kept, axis=0)[:nmc]
     kgrid_arr = np.asarray(kgrid, dtype=np.float64)
     randlims = bvec.T @ (np.diag(1.0 / kgrid_arr) @ np.linalg.inv(bvec.T))
-    truth = _head_from_offsets((randlims @ voronoi_pts.T).T, kgrid, bvec,
-                               _celvol(bvec))
+    half = (randlims @ voronoi_pts.T).T
+    # The Voronoi cell is centrosymmetric as a SET, so -p is uniform on it
+    # whenever p is; matching production's closure here keeps the
+    # comparison to one variable (the draw rule) rather than two.
+    truth = _head_from_offsets(np.concatenate([half, -half], axis=0),
+                               kgrid, bvec, _celvol(bvec))
 
-    prod = build_v_head_miniBZ_avg_3d(kgrid, bvec, _celvol(bvec),
-                                      nmc=nmc, seed=seed)
+    prod = _prod_head_table(kgrid, bvec, _celvol(bvec),
+                            nmc=nmc, seed=seed)
     shipped = _mirror_head(bvec, kgrid, nmc=nmc, seed=seed, transpose=True)
     nz = _nonzero_mask(kgrid)
     d_prod = _rel(prod, truth, nz).mean()
