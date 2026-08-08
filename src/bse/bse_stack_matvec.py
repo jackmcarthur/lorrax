@@ -56,6 +56,7 @@ are superseded.  Consumers repointed here: ``bse_lanczos.solve_bse_sharded``
 from __future__ import annotations
 
 import os
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -129,8 +130,38 @@ from .bse_ring_comm import make_bse_shardings
 #           bytes on EVERY rank -- 5.4 MB at n_flat=1024, but 525 MB at
 #           n_flat=1e5.  It is right for a small pair space and wrong for a
 #           large one, so it is a dial and not a default.
+#           IT IS NOT HONOURED ON EVERY ROUTE, and that is now ANNOUNCED
+#           rather than silently tolerated.  ``bse_lanczos.solve_bse_sharded``
+#           applies the constraint only in its ``block_size > 1`` branch; the
+#           default ``--lanczos`` route is ``bs == 1``, builds its own
+#           single-vector matvec, and never constrains the flat Krylov axis.
+#           So on the SHIPPED route the token is spelled correctly, accepted
+#           by the grammar above, resolved by the bridge -- and then does
+#           nothing.  That is this dial's own refusal doctrine defeated one
+#           level up: a leg labelled "krep" whose program is the baseline,
+#           which makes every A/B taken from it void, which is the exact
+#           failure the refusal above exists to prevent.
+#           MEASURED (KERNEL_DEEPDIVE.md 5.7): ``krep`` at ``bs = 1`` gives
+#           ``krylov_run`` = 1.967 s against a 1.882 s baseline -- i.e.
+#           nothing -- and the 20 100 reorth all-reduces are still in the
+#           trace.  Any bridge that resolves the token and then declines to
+#           apply it MUST call ``warn_if_krep_inert``; see that function for
+#           why this reports rather than refuses.
+#           WIRING IT TO ``bs == 1`` IS NOT IN SCOPE FOR THE ANNOUNCEMENT and
+#           is not the two-line rename it looks like: a replicated Krylov
+#           basis turns every reorthogonalisation dot product from a sharded
+#           psum into a local sum, which changes the summation order and
+#           therefore the last bits of every eigenvalue, and it buys that with
+#           the residency stated above.  It is an owner decision with an
+#           accuracy A/B attached, not a wiring fix.
 #
-# None of the three changes the number of live (nk, mu_loc, nu_loc, ns^2)-class
+# Note for readers arriving from a report that says "the dial is inert on the
+# bs == 1 path": that is too broad and always was.  ``yhoist`` lives in THIS
+# module, inside ``_w_stack``, which the ``bs == 1`` route executes on every
+# matvec — so it is honoured there.  ``krep`` is the one token the bs == 1
+# route ignores, and it is the only token this announcement is about.
+#
+# None of the tokens changes the number of live (nk, mu_loc, nu_loc, ns^2)-class
 # intermediates, which stays at the one ``T_b`` family documented below.
 _MATVEC_OPTS = ("yhoist", "krep")   # densek REMOVED 2026-07-31, owner directive
 
@@ -148,6 +179,72 @@ def matvec_opts() -> frozenset[str]:
             f"unset/empty selects none.  Refusing rather than silently "
             f"running the baseline under an optimised label.")
     return frozenset(toks)
+
+
+def warn_if_krep_inert(honoured: bool, where: str, detail: str) -> str | None:
+    """Announce, loudly, that ``krep`` was asked for on a route that ignores it.
+
+    Returns the message it emitted, or ``None`` when there was nothing to say
+    (the token was not requested, or the caller did honour it).
+
+    WHY THIS EXISTS.  :func:`matvec_opts` refuses a token it does not
+    recognise, on the stated grounds that a dial which degrades to the
+    baseline under a typo makes every A/B built on it void.  ``krep`` had the
+    same hole one level up, where the grammar cannot see it: the token is
+    spelled correctly, accepted, and resolved by
+    ``bse_lanczos.solve_bse_sharded`` -- which then applies it only in the
+    ``block_size > 1`` branch.  On the shipped ``--lanczos`` route
+    (``bs == 1``) it does nothing at all, so a leg launched with ``krep``
+    there IS the baseline, wearing an optimised label.  That is the failure
+    the refusal grammar was written to make impossible, arriving through the
+    back door, and it has already cost one measurement: KERNEL_DEEPDIVE.md
+    5.7 reports ``krep`` at ``bs = 1`` as ``krylov_run`` = 1.967 s against a
+    1.882 s baseline, with all 20 100 reorth all-reduces still in the trace.
+
+    WHY A WARNING AND NOT A REFUSAL.  ``matvec_opts`` refuses at PARSE time,
+    where the token alone is wrong and nothing else can be meant.  Here the
+    token is legal and the ROUTE is the variable, so refusing would
+    (a) break the legitimate combination ``yhoist,krep`` on a ``bs == 1``
+    run, where ``yhoist`` is honoured and only ``krep`` is not, and
+    (b) reject the very measurement that established the token was inert.
+    So this reports instead -- but through BOTH ``warnings.warn`` (so
+    ``-W error`` and ``pytest.warns`` can gate it, and so it is machine-
+    visible) and a process-0 ``print`` (so it is legible in a job log nobody
+    is watching live).  If the owner would rather have a hard refusal, it is
+    one ``raise`` in this function and no other change.
+
+    Parameters
+    ----------
+    honoured : bool
+        Did the caller actually apply the sharding constraint?
+    where : str
+        The call site, named in the message.
+    detail : str
+        Why this route ignores it, in the caller's own terms.
+    """
+    if honoured or "krep" not in matvec_opts():
+        return None
+    msg = (
+        f"LORRAX_BSE_MATVEC_OPT=krep is IGNORED by {where}: {detail}.  "
+        f"This run therefore uses the BASELINE Krylov sharding, not the "
+        f"replicated one -- do NOT label its numbers 'krep'.  The token is "
+        f"honoured only where the flat (block, n_flat) Krylov axis is "
+        f"actually constrained: the block_size > 1 branch of "
+        f"bse_lanczos.solve_bse_sharded, and exciton_bands.build_path_solver. "
+        f"Wiring it to this route is not a free rename -- a replicated basis "
+        f"turns every reorthogonalisation dot product from a sharded psum "
+        f"into a local sum, which changes the summation order and so the "
+        f"last bits of every eigenvalue, and it costs "
+        f"(max_iter+1)*n_flat*block*16 bytes on EVERY rank.  See the krep "
+        f"block in bse.bse_stack_matvec.")
+    warnings.warn(msg, RuntimeWarning, stacklevel=2)
+    try:
+        first = jax.process_index() == 0
+    except Exception:                                    # pragma: no cover
+        first = True
+    if first:
+        print(f"  *** {msg} ***", flush=True)
+    return msg
 
 
 
