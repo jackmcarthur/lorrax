@@ -1469,7 +1469,31 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         # Bundle concat + slice + vmap(newton_inv) + sort into ONE jit so the
         # post-loop processing emits one compile rather than 4 (concatenate,
         # sort, gather, vmap-newton).
-        @partial(jax.jit, static_argnames=('nq', 'nb_keep'))
+        # ``out_shardings=(rep, rep)`` is a CORRECTNESS requirement at P>1, not
+        # a placement preference.  ``batches`` arrive q-sharded
+        # (``batch_eig_shard = P(('x','y'), None)``); left to inference the
+        # concatenate propagates that sharding onto the outputs, and whether
+        # the SPMD partitioner then replicates them or leaves them split is
+        # decided by whether ``nq`` divides the device count.  When it does,
+        # the ``np.asarray`` on the next line raises
+        #     RuntimeError: Fetching value for `jax.Array` that spans
+        #     non-addressable (non process local) devices is not possible.
+        # — the whole kpath solve completes and the run dies on the final host
+        # fetch.  Measured on the survey's own reference path lengths at P=4
+        # (2x2 mesh): nq=13 OK, nq=40 DIED, nq=139 OK, i.e. TWO OF THE FOUR
+        # reference decks could not run multi-process at all
+        # (PROFILE_htransform_exciton §1.5).
+        #
+        # Replication is the right answer and not merely the safe one: BOTH
+        # outputs are consumed on the host by every process immediately below
+        # (``np.asarray``, ``np.max``, the writer gate), and they are small —
+        # ``energies`` is (nq, rank) f64 and ``energies_sorted`` (nq, nb_keep),
+        # 854 KB and 13 KB at nq=139 / rank 768, against the (nk, rank, rank)
+        # 576 MiB arrays this driver already holds.  Values are untouched:
+        # ``out_shardings`` moves data, it does not compute.
+        # Gate: ``tests/test_htransform_post_kpath_sharding.py``.
+        @partial(jax.jit, static_argnames=('nq', 'nb_keep'),
+                 out_shardings=(rep, rep))
         def _post_kpath(batches, nq, nb_keep):
             lambda_q = jnp.concatenate(batches, axis=0)[:nq]
             energies = jax.vmap(lambda row: newton_inv(a_f, n_f, shift, row.real))(lambda_q)
@@ -1479,6 +1503,16 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         _t0 = _perf()                                      # instrument:
         energies_on_path, energies_sorted_jax = _post_kpath(
             tuple(lambda_q_list), int(nq), int(nb_keep))
+        # Report the sharding that was ACTUALLY produced, not the one asked
+        # for.  Anything other than ``P()`` here is the non-addressable-fetch
+        # crash of PROFILE_htransform_exciton §1.5 waiting for a P>1 run with
+        # nq divisible by the device count — and the fetch is the very next
+        # statement, so the log line and the failure would arrive together
+        # with no way to tell which array was wrong.  Gated by
+        # ``tests/test_htransform_fft_route.py::test_post_kpath_outputs_are_replicated``.
+        log_fn(f"  [gate] _post_kpath out spec: "
+               f"{energies_sorted_jax.sharding.spec} "
+               f"(must be P() — a q-sharded fetch dies at P>1)")
         energies_sorted = np.asarray(energies_sorted_jax)
         timing.record("ht.post_kpath", _perf() - _t0)      # instrument:
         _t0 = _perf()                                      # instrument:
