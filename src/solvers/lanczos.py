@@ -26,6 +26,7 @@ Usage
 """
 from __future__ import annotations
 
+import contextlib
 from typing import Callable
 
 import jax
@@ -134,10 +135,43 @@ import numpy as np
 # which bypasses the ``LORRAX_SANITY`` *cost* escape hatch while still honouring
 # ``strict``.
 #
-# The residual leaves the traced region through ONE ``jax.debug.callback`` per
-# solve (unordered, three float64 scalars).  It cannot be a return value: these
-# solvers run inside ``bse_lanczos._full_run``'s outer jit with fixed
-# ``out_shardings``, and you cannot raise from inside a ``fori_loop``.
+# HOW THE RESIDUAL LEAVES THE TRACED REGION — and why there are two ways
+# ----------------------------------------------------------------------
+# The default is ONE ``jax.debug.callback`` per solve (unordered, three
+# float64 scalars), which is right for the eager and small-jit callers.
+#
+# It is WRONG for a solve that sits inside a big, expensive jit, and this file
+# used to say the callback was the only option ("it cannot be a return value:
+# these solvers run inside ``bse_lanczos._full_run``'s outer jit with fixed
+# ``out_shardings``").  That reasoning cost the BSE driver a 2.1 s XLA compile
+# on EVERY warm run.  ``jax/_src/compiler.py::_cache_write`` refuses outright::
+#
+#     if host_callbacks:
+#       logger.log(log_priority,
+#                  "Not writing persistent cache entry for '%s' because it "
+#                  "uses host callbacks (e.g. from jax.debug.print or "
+#                  "breakpoint)", module_name)
+#       return
+#
+# — a host callback is baked into the HLO module and cannot be rebound in a
+# later process, so JAX will not persist ANY module that carries one.  One
+# unordered three-scalar callback therefore made ``jit__full_run``, the single
+# program holding the whole 200-iteration Krylov loop, permanently
+# uncacheable: MEASURED on the Si 4x4x4 P=4 reference deck as
+# ``cache_probes=37 hits=36 vetoed=1`` on every warm run, 2.1 s of the 17.9 s
+# wall (perf/bse-warm-cache-2026-08-08).
+#
+# So the second way exists: :func:`alpha_herm_sink` collects the same three
+# scalars as TRACED VALUES instead of emitting them, the enclosing jit returns
+# them alongside its real outputs, and :func:`report_alpha_herm` runs the
+# identical host-side check after the call.  Same numbers, same message, same
+# ``strict`` behaviour — and the module is cacheable.  The "you cannot raise
+# from inside a ``fori_loop``" half of the old note is still true and is
+# exactly why the check is a post-loop reduction either way.
+#
+# The invariant is not weakened by the choice: a caller that opens the sink
+# MUST replay it (that is what the two helpers are for), and a caller that
+# does not open one still gets the callback.
 
 ALPHA_HERM_RTOL = 1e-9
 
@@ -164,7 +198,11 @@ _ALPHA_CAUSE = (
 
 
 def _report_alpha_herm(name: str, form: str, dev, scale, worst) -> bool:
-    """Host-side half of the α-Hermiticity gate (called from a debug callback).
+    """Host-side half of the α-Hermiticity gate.
+
+    Reached either from the in-jit ``jax.debug.callback`` (the default) or
+    from :func:`report_alpha_herm` after an enclosing jit returned the same
+    three scalars — see the header block.
 
     ``dev = max_j|Im α_j|`` (or ``max_j max|α_j − α_jᴴ|`` for the block
     variants), ``scale = max_j|α_j|``, ``worst`` = the iteration index where
@@ -195,6 +233,67 @@ def _report_alpha_herm(name: str, form: str, dev, scale, worst) -> bool:
     return ok
 
 
+# The open sink, or None.  Module-level rather than threaded through every
+# solver signature because the solvers are TRACED inside the caller's jit —
+# the sink is a property of the trace, not of the call.  Not thread-local:
+# JAX tracing is single-threaded per process here, and a thread-local would
+# silently give a second thread the callback path (i.e. an uncacheable module)
+# with no way to notice.
+_ALPHA_SINK: list | None = None
+
+
+@contextlib.contextmanager
+def alpha_herm_sink():
+    """Collect the α-Hermiticity reports instead of emitting them in-jit.
+
+    Wrap the TRACE of a jit whose module must stay persistable::
+
+        with alpha_herm_sink() as sink:
+            evs, evecs = lanczos_eig_jit(matvec, n, ...)
+        labels, payload = split_alpha_sink(sink)
+        return evs, evecs, payload          # payload joins the jit's outputs
+
+    and then, on the host, after the jit has run::
+
+        report_alpha_herm(labels, payload)
+
+    ``labels`` is the static half (solver name + α form) and is known at trace
+    time; ``payload`` is the traced half (three scalars per solve) and must
+    travel out as a jit output.  Splitting them is what lets the static half
+    be captured once at trace time while the numbers come back per call.
+
+    Yields the raw sink list.  Nests and restores, so a caller inside another
+    caller's sink does not steal its reports.
+    """
+    global _ALPHA_SINK
+    prev = _ALPHA_SINK
+    _ALPHA_SINK = sink = []
+    try:
+        yield sink
+    finally:
+        _ALPHA_SINK = prev
+
+
+def split_alpha_sink(sink):
+    """Split a sink into its static ``labels`` and traced ``payload`` halves."""
+    labels = tuple((name, form) for name, form, _d, _s, _w in sink)
+    payload = tuple((dev, scale, worst) for _n, _f, dev, scale, worst in sink)
+    return labels, payload
+
+
+def report_alpha_herm(labels, payload) -> bool:
+    """Run the α-Hermiticity gate on scalars a jit already returned.
+
+    The host-side counterpart of :func:`alpha_herm_sink`; identical check,
+    identical message, identical ``strict`` behaviour to the in-jit callback
+    path.  Returns True only if every collected solve passed.
+    """
+    ok = True
+    for (name, form), (dev, scale, worst) in zip(labels, payload):
+        ok = _report_alpha_herm(name, form, dev, scale, worst) and ok
+    return ok
+
+
 def _emit_alpha_herm(name: str, alpha_im, alpha_re,
                      form: str = "vec") -> None:
     """Reduce the per-iteration α residual to 3 scalars and ship them out.
@@ -203,10 +302,17 @@ def _emit_alpha_herm(name: str, alpha_im, alpha_re,
     ``max|α_j − α_jᴴ|`` (block variants).  ``alpha_re`` : (n_iter,) real —
     |α_j| (or ``max|α_j|``).  Traced-safe: pure reductions plus one unordered
     ``jax.debug.callback``, no collectives, no device sync.
+
+    With a sink open (see the header block) the three scalars are handed to
+    the sink instead and NO callback is traced — which is what keeps the
+    enclosing module persistable in JAX's compilation cache.
     """
     dev = jnp.max(alpha_im)
     scale = jnp.max(alpha_re)
     worst = jnp.argmax(alpha_im)
+    if _ALPHA_SINK is not None:
+        _ALPHA_SINK.append((name, form, dev, scale, worst))
+        return
     jax.debug.callback(
         lambda d, s, w: _report_alpha_herm(name, form, d, s, w),
         dev, scale, worst)

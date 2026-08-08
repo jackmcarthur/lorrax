@@ -215,7 +215,8 @@ Invoke: `python -u -m bse.exciton_bands -i cohsex.in --n-val 4 --n-cond 4 --n-ei
 | `--eigh-backend` | input key (`auto`) | both distributed-eigh sites (vq_interp C_q, bse_setup fH_q): `auto`/`off` = q-batched native; `cusolvermp`/`slate` = one-tile-at-a-time distributed FFI |
 | `head_minibz_average` (input key) | `False` | finite-Q exchange head = mini-BZ cell average instead of point value (4-13% near-Γ error); CLI `--head-minibz-average` overrides |
 | `--w-coarse-grid NX,NY,NZ` | unset | sample W on a coarse BZ sub-grid, zero-pad W_R to fine (exact trig interp); subsumed by the general `bse_k_grid` key |
-| `--skip-rerun-check` | off | skip the diagnostic warm re-solve of the whole scan (38% of wall at P=64/91Q, job 7882533) |
+| `--rerun-check` | **off** | RUN the diagnostic warm re-solve of the whole scan (reproducibility assert + per-Q dispatch timing). Off by default since 2026-08-08: measured 37.7% of wall at P=4/41Q and 38.1% at P=64/91Q (job 7882533) |
+| `--skip-rerun-check` | off | pre-flip spelling of the same thing. Now a no-op naming the default, kept so existing harnesses keep parsing; wins over `--rerun-check` if both are given |
 | `--a-band` | none | window-relative band whose bandwidth sets the f-transform width (only if default `a` collapses off-grid ε_c) |
 | `nband`/`nval`/`ncond` (input keys) | 100/5/5 | htransform fH window; BSE conduction window [nval, nval+n_cond) must sit interior with ~4-16 guard bands — TWO-SIDED: too few guards rings off-grid 100-1000 meV, too many (nband=80/640c) corrupts on-grid ε_c by ~955 meV |
 

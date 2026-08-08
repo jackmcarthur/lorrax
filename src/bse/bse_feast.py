@@ -49,7 +49,10 @@ ELLIPSE_GAMMA_FIXED = 0.2
 # matvec objects and so get distinct entries.  Value is (matvec, solver): the matvec
 # reference pins its id() so it cannot be reused by a later object while live.
 _GMRES_SOLVER_CACHE: dict[tuple, tuple] = {}
-_FEAST_RUNNER_CACHE: dict[tuple[int, int, int, float, float, str], Callable] = {}
+# Cache compiled FEAST runners per (operator id, operand ids, knobs), per-process.
+# Key and value shape mirror _GMRES_SOLVER_CACHE above, and for the same reason
+# (see _get_feast_runner): the value pins every object whose id() is in the key.
+_FEAST_RUNNER_CACHE: dict[tuple, tuple] = {}
 
 
 @dataclass(frozen=True)
@@ -328,14 +331,40 @@ def _get_feast_runner(
     dtype: jnp.dtype,
     use_conjugate_symmetry: bool = True,
 ) -> Callable:
-    """Return a cached JIT FEAST runner for this (n_quad, n_ritz, max_iter, tol)."""
-    key = (n_quad, n_ritz, max_iter, float(tol), float(ry_to_ev), str(dtype), bool(use_conjugate_symmetry))
-    if key in _FEAST_RUNNER_CACHE:
-        return _FEAST_RUNNER_CACHE[key]
+    """Return a cached JIT FEAST runner for this operator + operands + knobs.
+
+    The key carries ``id(matvec)`` and the ids of the ten
+    :func:`matvec_operands` arrays because the ``_run`` closure below BAKES BOTH
+    IN.  Unlike the shifted-GMRES engine — whose operands are RUNTIME arguments,
+    which is what lets one executable serve every q / omega — these are CLOSED
+    OVER, so they are compile-time constants of the returned executable and a
+    runner computes one operator's answer on one operand set forever.
+
+    Keying on the scalar knobs alone was a silent-wrong-answer hazard.  This
+    cache is module-global and shared by two drivers that each build their own
+    operator and their own operand set (:func:`run_feast_ritz` here, and
+    ``bse_pseudopoles._feast_filter``), so with matching scalars the second
+    caller in a process got back the FIRST caller's runner and ran to completion
+    with wrong numbers — the same failure family as the recorded -161 eV silent
+    route change in ``docs/services/distrib_la.md``.
+
+    Value is ``(matvec, operands, runner)``: those references pin the ids so a
+    later object cannot recycle them while the entry is live.  Same contract,
+    and same reason, as :func:`_get_gmres_solver`.  Gated by
+    ``tests/test_bse_feast_runner_cache.py``.
+    """
+    # Built ONCE, here, and both keyed and closed over below, so what the key
+    # measures is exactly what the compiled program bakes in.
+    operands = matvec_operands(data)
+    key = (id(matvec), tuple(id(a) for a in operands),
+           n_quad, n_ritz, max_iter, float(tol), float(ry_to_ev), str(dtype),
+           bool(use_conjugate_symmetry))
+    hit = _FEAST_RUNNER_CACHE.get(key)
+    if hit is not None:
+        return hit[2]
 
     def _run(X_batch, z_nodes, w_weights, diag_h):
         # X_batch: (n_ritz, 1, nc, nv, nk)
-        operands = matvec_operands(data)  # runtime args threaded to the shifted solve
         filtered = jnp.zeros_like(X_batch, dtype=X_batch.dtype)
         iters = jnp.zeros((n_ritz, n_quad), dtype=jnp.int32)
         scale = jnp.asarray(ry_to_ev, dtype=z_nodes.dtype)
@@ -370,7 +399,7 @@ def _get_feast_runner(
         return filtered, iters
 
     runner = jax.jit(_run)
-    _FEAST_RUNNER_CACHE[key] = runner
+    _FEAST_RUNNER_CACHE[key] = (matvec, operands, runner)
     return runner
 
 
