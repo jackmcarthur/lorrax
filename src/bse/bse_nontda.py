@@ -61,6 +61,7 @@ import jax
 import jax.numpy as jnp
 
 from common.fft_helpers import make_sharded_ifftn_3d
+from common.gpu_utils import get_device_memory_info
 from .bse_ring_comm import build_bse_ring_matvec_full, make_bse_shardings
 
 jax.config.update("jax_enable_x64", True)
@@ -68,6 +69,74 @@ jax.config.update("jax_enable_x64", True)
 # Dense materialisation is O(N^2) memory + O(1) batched matvecs; guard so a
 # fine-grid request fails loudly instead of OOM-ing.  N = nc_pad * nv_pad * nk.
 _DENSE_N_MAX = 4096
+
+# --- the dense build's trial width ------------------------------------------
+# The peak is NOT set by the BSE window.  The ring kernel's T tensor is
+# ``(b, mu_local, nu_local, ns, ns, nk)`` -- c and v are contracted away at
+# encode time -- so narrowing the window does not make the build cheaper.
+# MEASURED (Si 4x4x4, 480 centroids, P=1): an identical 56.47 GiB XLA estimate
+# at N=1024 (4c x 4v) AND at N=64 (1c x 1v), the latter dying outright with
+# ``RESOURCE_EXHAUSTED: Failed to allocate request for 42.19GiB`` on a 40 GB
+# A100.  One trial column of T is 900 MiB on that deck, and the old hard-coded
+# ``col_chunk = 8`` -- blind to (mu, nu, ns, nk) -- asked for eight of them.
+#
+# The compiled peak is linear in the width and ~5.3x the T footprint itself
+# (memory_analysis on the production matvec, same deck):
+#
+#     b        T total      compiled peak     peak/T
+#     1      0.879 GiB        4.643 GiB        5.28
+#     2      1.758 GiB        9.042 GiB        5.14
+#     4      3.516 GiB       17.867 GiB        5.08
+#     8      7.031 GiB       35.402 GiB        5.04
+#
+# so the width is derived from the footprint and the device budget instead.
+_DENSE_T_PEAK_FACTOR = 5.3    # compiled peak / T footprint (measured, above)
+_DENSE_T_BUDGET_FRAC = 0.4    # of TOTAL per-device memory
+
+# The budget is taken from TOTAL device memory, never from free memory.  Free
+# memory is ambient -- it depends on what else is resident when this runs -- and
+# a width derived from it is not reproducible: the same leg on the same deck
+# picked col_chunk=2 and col_chunk=5 twenty minutes apart on this pool, purely
+# from GPU occupancy.  A trial width that moves run-to-run silently changes the
+# XLA batch width of every column, which is exactly the kind of thing a
+# bit-identity A/B must not inherit from the weather.
+
+
+def dense_col_chunk(args, mesh_xy, N, *, log=None):
+    """Trial-batch width for the dense build, sized from the ring T footprint.
+
+    Returns the largest ``b`` whose compiled peak fits ``_DENSE_T_BUDGET_FRAC``
+    of the per-device budget, clamped to ``[1, N]``.  When even ``b = 1`` does
+    not fit it WARNS with the arithmetic and proceeds at 1 rather than refusing:
+    1 is the narrowest this build has, the budget is itself an estimate, and a
+    warning that explains the OOM about to happen is strictly more useful than
+    a refusal that pre-empts a run which might have fitted.
+    """
+    psi_c_X, W_R = args[0], args[6]
+    px, py = mesh_xy.devices.shape
+    mu_local = -(-int(W_R.shape[0]) // px)
+    nu_local = -(-int(W_R.shape[1]) // py)
+    nspinor = int(psi_c_X.shape[2])
+    nk = int(np.prod(np.asarray(W_R.shape[2:5])))
+    per_col = mu_local * nu_local * nspinor * nspinor * nk * 16
+    peak_per_col = per_col * _DENSE_T_PEAK_FACTOR
+    budget = (float(get_device_memory_info().get("total_gb") or 8.0)
+              * 1e9 * _DENSE_T_BUDGET_FRAC)
+    chunk = int(min(int(N), max(1, int(budget // peak_per_col))))
+    shape = (f"mu_l={mu_local} x nu_l={nu_local} x ns^2={nspinor ** 2} x "
+             f"nk={nk}")
+    if log is not None:
+        log(f"  [nontda] dense build: ring T = {per_col / 2 ** 20:.1f} "
+            f"MiB/column ({shape}); compiled peak ~"
+            f"{peak_per_col / 2 ** 30:.2f} GiB/column -> col_chunk={chunk} "
+            f"against a {budget / 2 ** 30:.1f} GiB budget")
+        if peak_per_col > budget:
+            log(f"  [nontda] WARNING: even ONE trial column wants ~"
+                f"{peak_per_col / 2 ** 30:.1f} GiB, over the "
+                f"{budget / 2 ** 30:.1f} GiB budget. Proceeding at "
+                f"col_chunk=1; if this OOMs, shard wider (raise px*py) or use "
+                f"the matrix-free route (make_ab_appliers).")
+    return chunk
 
 
 def _full_matvec_and_args(data, mesh_xy, sh, *, include_W):
@@ -101,17 +170,23 @@ def make_ab_appliers(matvec_full, args, sh):
     return (lambda U: _apply(U, 1.0)), (lambda U: _apply(U, -1.0))
 
 
-def _materialize_A_B(matvec_full, args, sh, nc, nv, nk, *, col_chunk=8):
+def _materialize_A_B(matvec_full, args, sh, nc, nv, nk, *, col_chunk=None,
+                     mesh_xy=None, log=None):
     """Dense A, B (N x N, N = nc*nv*nk) from the full matvec, one identity slice
     at a time.  Columns are processed in chunks of ``col_chunk`` so the W-term
     T-tensor (linear in the trial-batch width) stays bounded — the gate runs on
-    any 1 GPU, not only 80 GB HBM."""
+    any 1 GPU, not only 80 GB HBM.
+
+    ``col_chunk=None`` (the default) DERIVES that width from the T footprint and
+    the device budget via ``dense_col_chunk``; pass an int only to pin it."""
     N = nc * nv * nk
     if N > _DENSE_N_MAX:
         raise ValueError(
             f"non-TDA dense window N={N} exceeds _DENSE_N_MAX={_DENSE_N_MAX}; "
             "the dense definite-pencil solver targets the BGW-parity (small) "
             "regime — fine-grid non-TDA needs matrix-free FEAST-on-K (follow-on).")
+    if col_chunk is None:
+        col_chunk = dense_col_chunk(args, mesh_xy, N, log=log)
     eye = np.eye(N, dtype=np.complex128).reshape(N, nc, nv, nk)
 
     def _cols(resonant):
@@ -199,12 +274,14 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True, **_ignor
     n_iter)`` matching the TDA ``solve_bse_sharded`` tuple; the pair axis carries
     (X, Y) with ``X^H X - Y^H Y = +1``."""
     sh = make_bse_shardings(mesh_xy)
+    _log0 = print if jax.process_index() == 0 else (lambda *_a, **_k: None)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     nk = nkx * nky * nkz
     nc = int(data["n_cond_pad"]); nv = int(data["n_val_pad"])
     matvec, args = _full_matvec_and_args(data, mesh_xy, sh, include_W=include_W)
     with mesh_xy:
-        A, B = _materialize_A_B(matvec, args, sh, nc, nv, nk)
+        A, B = _materialize_A_B(matvec, args, sh, nc, nv, nk,
+                                mesh_xy=mesh_xy, log=_log0)
     b_herm = np.linalg.norm(B - B.conj().T) / max(np.linalg.norm(B), 1e-300)
     if b_herm < 1e-6:
         omega, Z = solve_nontda_product(A, B, n_eig)           # real / RPA
