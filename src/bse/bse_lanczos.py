@@ -18,6 +18,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import make_sharded_ifftn_3d
 
 from solvers.lanczos import (
+    FULL_REORTH,
     reorth_kind,
     alpha_herm_sink,
     block_lanczos_eig,
@@ -74,7 +75,7 @@ def solve_bse(
     use_block: bool = False,
     block_size: int = 4,
     use_jit_lanczos: bool = True,
-    n_reorth: int = 10,
+    n_reorth: int = FULL_REORTH,
     include_W: bool = True,
 ) -> Tuple[jax.Array, jax.Array]:
     """Solve BSE for lowest exciton eigenvalues."""
@@ -137,7 +138,7 @@ def solve_bse_sharded(
     *,
     n_eig: int = 20,
     max_iter: int = 200,
-    n_reorth: int = 10,
+    n_reorth: int = FULL_REORTH,
     include_W: bool = True,
     block_size: int = 1,
     rtol: float = 0.0,

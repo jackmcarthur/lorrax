@@ -998,7 +998,7 @@ def lanczos_eig_jit(
     n_eig: int = 20,
     max_iter: int = 100,
     seed: int = 42,
-    n_reorth: int = 2,
+    n_reorth: int = FULL_REORTH,
     reorth: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """JIT-compiled Lanczos using lax.fori_loop.
@@ -1020,6 +1020,12 @@ def lanczos_eig_jit(
         PREVIOUS basis vectors.  The current vector ``q_j`` is always
         projected out as well, at no collective cost — see the route
         section, "THE WINDOW INCLUDES THE CURRENT VECTOR q_j".
+        Default ``FULL_REORTH`` (-1) = the whole basis; a finite window is a
+        deliberate memory/time trade, not something you should get by not
+        choosing.  See "Reorthogonalisation WINDOW" above for the measurement.
+        Default ``FULL_REORTH`` (-1) = the whole basis; a finite window is a
+        deliberate memory/time trade, not something you should get by not
+        choosing.  See "Reorthogonalisation WINDOW" above for the measurement.
     reorth : {'cgs2', 'mgs'} or None
         Reorthogonalisation route; ``None`` reads ``LORRAX_LANCZOS_REORTH``
         and defaults to ``'cgs2'``.  See the route section above — ``'cgs2'``
@@ -1146,7 +1152,7 @@ def block_lanczos_eig_jit(
     block_size: int = 4,
     max_iter: int = 50,
     seed: int = 42,
-    n_reorth: int = 2,
+    n_reorth: int = FULL_REORTH,
     reorth: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """JIT-compiled block Lanczos using ``lax.fori_loop``.
@@ -1187,6 +1193,8 @@ def block_lanczos_eig_jit(
         ``n_reorth`` PREVIOUS basis blocks.  The current block ``Q_j`` is
         always projected out as well, at no collective cost -- see the route
         section, "THE WINDOW INCLUDES THE CURRENT VECTOR q_j".
+        Default ``FULL_REORTH`` (-1) = the whole basis.
+        Default ``FULL_REORTH`` (-1) = the whole basis.
 
     Krylov-exhaustion clamp: the Krylov space cannot exceed the vector
     space, so ``max_iter`` is clamped to ``floor(n / block_size)``.
@@ -1290,7 +1298,7 @@ def block_lanczos_eig_jit_converged(
     check_every: int = 4,
     min_iter: int | None = None,
     seed: int = 42,
-    n_reorth: int = 2,
+    n_reorth: int = FULL_REORTH,
     reorth: str | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Convergence-driven block Lanczos via ``lax.while_loop``.
