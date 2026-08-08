@@ -250,25 +250,31 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype):
 
         def _solve_col(carry, rhs_col):
             rhs_i = rhs_col[:, None]        # (2, 1, c, v, k) — keep the matvec batch axis
-            x, _ = _gmres_solve_core(matvec, rhs_i, diag_h, z, operands,
-                                     max_iter, tol)
+            # ``k_used`` is the while_loop's real exit index, not the budget:
+            # ``_gmres_solve_core`` runs ``while k < max_iter and rel > tol``.
+            # It used to be dropped on the floor here, which is why this — the
+            # campaign's most-run shifted solve — was the one solver whose
+            # iteration count no log could ever show.  Carried out for LOGGING.
+            x, k_used = _gmres_solve_core(matvec, rhs_i, diag_h, z, operands,
+                                          max_iter, tol)
             r_true = rhs_i - _apply_shifted_matvec(matvec, x, z, operands)
             nrhs = jnp.linalg.norm(rhs_i)
             resid = jnp.where(nrhs == 0.0, jnp.asarray(0.0, dtype=nrhs.dtype),
                               jnp.linalg.norm(r_true) / nrhs)
             s = jax.lax.with_sharding_constraint(x[0] + x[1], sh.X)  # (1, c, v, k)
-            return carry, (s[0], resid)
+            return carry, (s[0], resid, k_used)
 
-        _, (s_all, resids) = jax.lax.scan(_solve_col, None, rhs_scan)
+        _, (s_all, resids, iters) = jax.lax.scan(_solve_col, None, rhs_scan)
         s_all = jax.lax.with_sharding_constraint(s_all, sh.X)        # (nu, c, v, k)
-        return s_all, resids
+        return s_all, resids, iters
 
     _BLOCK_GMRES_CACHE[key] = (matvec, _block)
     return _block
 
 
 def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
-                                    snapshot, sh, *, max_iter, tol):
+                                    snapshot, sh, *, max_iter, tol,
+                                    return_iters: bool = False):
     """Screened-Coulomb resolvent on a block of probe columns — the ONE engine.
 
     Computes ``W(omega) - v`` tiles from the non-TDA RPA density-response
@@ -334,6 +340,12 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
     resids : jax.Array (n_probe,) float64
         Per-column relative GMRES residual of the shifted system (0 for zero-pad
         columns), so quadrature noise vs solver tolerance stay distinguishable.
+    iters : jax.Array (n_probe,) int32 — ONLY when ``return_iters=True``
+        Per-column GMRES iteration count actually taken: the ``lax.while_loop``
+        exit index, so ``iters.max() == max_iter`` is the signal that columns
+        were TRUNCATED at the cap rather than converged.  Opt-in because three
+        in-tree gates and two other driver arms unpack the 2-tuple; a
+        ``return_iters=False`` caller sees exactly the contract it always had.
     """
     px, py = sh.X.mesh.devices.shape
     n_probe = int(G_zeta.shape[0])
@@ -364,16 +376,19 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
     # q / omega is dispatch-only.  z is passed as a device scalar (not a Python
     # complex) so a different omega stays a runtime arg, never a baked constant.
     solver = _get_block_gmres_solver(matvec, sh, max_iter, tol, rhs.dtype)
-    s_all, resids = solver(rhs, diag_h, jnp.asarray(z, dtype=jnp.complex128),
-                           matvec_operands(data))
+    s_all, resids, iters = solver(rhs, diag_h,
+                                  jnp.asarray(z, dtype=jnp.complex128),
+                                  matvec_operands(data))
 
     # --- Stage 3: PROJECT (pair -> zeta), reduce-scatter to W(mu_X, nu_Y). ---
     W_tile = snapshot(s_all, data["psi_c_Y"], data["psi_v_Y"], data["V_q0"])
+    if return_iters:
+        return W_tile, resids, iters
     return W_tile, resids
 
 
 def _resolve_wc_columns(cols, z, data, matvec, diag_h, gen, snapshot, sh,
-                        *, max_iter, tol):
+                        *, max_iter, tol, return_iters: bool = False):
     """Resolve the ``W(omega) - v`` columns listed in ``cols`` (head-less q=0
     tile, padded centroid space) via :func:`apply_screening_resolvent_block`.
 
@@ -383,7 +398,9 @@ def _resolve_wc_columns(cols, z, data, matvec, diag_h, gen, snapshot, sh,
     Returns ``(W_tile[n_rmu, n_pad] sh.V, resids[n_pad])``, where column ``i`` of
     ``W_tile`` (``W_tile[:, i]``) is ``W - v`` for probe ``cols[i]``; the final
     ``n_pad - len(cols)`` columns are zero pad.  ``W_tile.sharding.spec`` is
-    ``P('x', 'y')`` = ``(mu_X, nu_Y)``.
+    ``P('x', 'y')`` = ``(mu_X, nu_Y)``.  With ``return_iters=True`` the tuple
+    gains the per-column GMRES iteration count — see
+    :func:`apply_screening_resolvent_block` for why that is opt-in.
     """
     px, py = sh.X.mesh.devices.shape
     n_rmu = int(data["V_q0"].shape[0])
@@ -393,7 +410,8 @@ def _resolve_wc_columns(cols, z, data, matvec, diag_h, gen, snapshot, sh,
     for i, nu0 in enumerate(cols):
         G[i, int(nu0)] = 1.0
     return apply_screening_resolvent_block(
-        G, z, data, matvec, diag_h, gen, snapshot, sh, max_iter=max_iter, tol=tol)
+        G, z, data, matvec, diag_h, gen, snapshot, sh, max_iter=max_iter, tol=tol,
+        return_iters=return_iters)
 
 
 def _select_compare_cols(T, nlog, n_cols, seed):
@@ -646,8 +664,14 @@ def main(argv=None) -> None:
               f"q-points (IBZ), one at a time; each vs its own (W0-V)[q_flat] tile")
         print("shared resolvent engine (matvec/gen/snapshot) built once; per-q "
               "operands (rolled psi_c/eps_c, V_q tile, diag_h) are runtime args\n")
+        # ``max_resid`` was headed ``max_gmres`` while being filled with
+        # ``rr.max()`` — the max relative RESIDUAL, not an iteration count.
+        # Anyone reading it as iterations was misled by the header.  The header
+        # now says what the column holds, and ``max_it`` is the iteration count
+        # itself, newly available because the engine stopped discarding it.
         hdr = (f"{'iq':>3} {'q (kgrid)':>11} {'q_flat':>6} {'max_rel_err':>12} "
-               f"{'median':>11} {'max_gmres':>11} {'build[s]':>9} {'solve[s]':>9}")
+               f"{'median':>11} {'max_resid':>11} {'max_it':>7} "
+               f"{'build[s]':>9} {'solve[s]':>9}")
         print(hdr)
         print("-" * len(hdr))
         rel_by_q = []
@@ -670,21 +694,24 @@ def main(argv=None) -> None:
             # SOLVE (trace+compile on the FIRST q, dispatch-only afterwards).
             t_s0 = time.perf_counter()
             with timing.section("w_exact.resolve_q"):
-                W_tile, resids = _resolve_wc_columns(
+                W_tile, resids, gm_iters = _resolve_wc_columns(
                     cols, z, dq, matvec, diag_hq, gen, snapshot, sh,
-                    max_iter=args.gmres_max_iter, tol=args.gmres_tol)
-                jax.block_until_ready((W_tile, resids))
+                    max_iter=args.gmres_max_iter, tol=args.gmres_tol,
+                    return_iters=True)
+                jax.block_until_ready((W_tile, resids, gm_iters))
             t_solve = time.perf_counter() - t_s0
             # COMPARE: host-side rel_err vs the own (W0-V)[q_flat] tile.
             with timing.section("w_exact.wq_compare"):
                 wc = gather_to_host(W_tile)
                 rr = gather_to_host(resids)[:len(cols)]
+                gi = gather_to_host(gm_iters)[:len(cols)]
                 rels = np.asarray([
                     float(np.linalg.norm(wc[:nlog, i] - T[:nlog, int(nu0)])
                           / np.linalg.norm(T[:nlog, int(nu0)]))
                     for i, nu0 in enumerate(cols)])
             print(f"{iq:3d} {str((qx, qy, qz)):>11} {q_flat:6d} {rels.max():12.3e} "
-                  f"{np.median(rels):11.3e} {rr.max():11.3e} {t_build:9.3f} {t_solve:9.3f}")
+                  f"{np.median(rels):11.3e} {rr.max():11.3e} {int(gi.max()):7d} "
+                  f"{t_build:9.3f} {t_solve:9.3f}")
             rel_by_q.append(rels.max())
         print("-" * len(hdr))
         rel_by_q = np.asarray(rel_by_q)
@@ -762,14 +789,17 @@ def main(argv=None) -> None:
               f"(largest-|W0-V| + random)\n")
 
         with timing.section("w_exact.resolve"):
-            W_tile, resids = _resolve_wc_columns(
+            W_tile, resids, gm_iters = _resolve_wc_columns(
                 cols, z, data, matvec, diag_h, gen, snapshot, sh,
-                max_iter=args.gmres_max_iter, tol=args.gmres_tol)
+                max_iter=args.gmres_max_iter, tol=args.gmres_tol,
+                return_iters=True)
         # W_tile is the device (mu_X, nu_Y) tile; column i = probe cols[i].
         wc = gather_to_host(W_tile)                      # (n_rmu, n_pad)
         resids = gather_to_host(resids)                  # (n_pad,)
+        gm_iters = gather_to_host(gm_iters)              # (n_pad,)
 
-        hdr = f"{'nu':>5} {'||(W0-V)_col||':>15} {'rel_err':>11} {'max|Delta|':>12} {'gmres_resid':>12}"
+        hdr = (f"{'nu':>5} {'||(W0-V)_col||':>15} {'rel_err':>11} "
+               f"{'max|Delta|':>12} {'gmres_resid':>12} {'gmres_it':>9}")
         print(hdr)
         print("-" * len(hdr))
         rel_all = []
@@ -780,12 +810,18 @@ def main(argv=None) -> None:
             mx = float(np.max(np.abs(dcol)))
             rel_all.append(rel)
             print(f"{int(nu0):5d} {col_norm[int(nu0)]:15.4e} {rel:11.3e} "
-                  f"{mx:12.3e} {resids[i]:12.3e}")
+                  f"{mx:12.3e} {resids[i]:12.3e} {int(gm_iters[i]):9d}")
         rel_all = np.asarray(rel_all)
         resids = resids[:len(cols)]
+        gm_iters = gm_iters[:len(cols)]
         print("-" * len(hdr))
         print(f"max rel_err = {rel_all.max():.3e}   median = {np.median(rel_all):.3e}   "
               f"max gmres_resid = {resids.max():.3e}")
+        # An iteration count EQUAL to the cap means truncation, not convergence.
+        print(f"gmres iters: mean = {gm_iters.mean():.1f}, max = {int(gm_iters.max())} "
+              f"(cap {args.gmres_max_iter}"
+              + (" — TRUNCATED at the cap on at least one column"
+                 if int(gm_iters.max()) >= args.gmres_max_iter else "") + ")")
         print("\nInterpretation: W0_qmunu on disk is the RPA static screened "
               "Coulomb W(0) from chi0 = chi0(iw) minimax-quadratured to w=0; the "
               "resolvent uses the EXACT 1/(e_c-e_v) static denominator, so rel_err "
@@ -795,12 +831,14 @@ def main(argv=None) -> None:
         cols = _parse_cols(args.cols, nlog, args.n_cols, args.seed)
         print(f"\nComputing {len(cols)} W_c(omega) column(s) of N_mu={nlog}")
         with timing.section("w_exact.resolve"):
-            W_tile, resids = _resolve_wc_columns(
+            W_tile, resids, gm_iters = _resolve_wc_columns(
                 cols, z, data, matvec, diag_h, gen, snapshot, sh,
-                max_iter=args.gmres_max_iter, tol=args.gmres_tol)
+                max_iter=args.gmres_max_iter, tol=args.gmres_tol,
+                return_iters=True)
         # Persist columns-first (n_cols, n_rmu), dropping the py zero-pad columns.
         wc = gather_to_host(W_tile)[:, :len(cols)].T     # (n_cols, n_rmu)
         resids = gather_to_host(resids)[:len(cols)]
+        gm_iters = gather_to_host(gm_iters)[:len(cols)]
         with h5py.File(args.out, "w") as h5:
             h5.attrs["omega_ev"] = float(args.omega_ev)
             h5.attrs["eta_ev"] = float(args.eta_ev)
@@ -810,8 +848,10 @@ def main(argv=None) -> None:
             h5.attrs["kernel"] = "rpa_screening_nonTDA"
             h5.create_dataset("columns", data=cols.astype(np.int32))
             h5.create_dataset("gmres_resid", data=resids)
+            h5.create_dataset("gmres_iters", data=gm_iters.astype(np.int32))
             h5.create_dataset("Wc", data=wc)
-        print(f"Wrote {len(cols)} Wc columns (max gmres_resid={resids.max():.2e}) "
+        print(f"Wrote {len(cols)} Wc columns (max gmres_resid={resids.max():.2e}, "
+              f"max gmres_it={int(gm_iters.max())}/{args.gmres_max_iter}) "
               f"to {args.out}")
 
     timing.report(print_fn=print, title="--- Timing ---")

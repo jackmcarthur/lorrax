@@ -12,9 +12,11 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import replicate_to_mesh
 from common.fft_helpers import make_sharded_ifftn_3d
 
 from solvers.lanczos import (
@@ -282,7 +284,8 @@ def solve_bse_sharded(
     # iteration + on-the-fly Ritz solve), so build matvec + W_R outside and
     # delegate to the shape-agnostic ``solvers.davidson.davidson``.  Returns
     # the same `(eigenvalues, eigenvectors, n_iter_done)` tuple as the
-    # Lanczos path so callers don't branch.
+    # Lanczos path so callers don't branch — see the RETURN CONVENTION note at
+    # the bottom of this branch for what "the same tuple" has to mean.
     if solver_kind == "davidson":
         from solvers.davidson import davidson, warmup_davidson_jit
         from .bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
@@ -327,9 +330,43 @@ def solve_bse_sharded(
             max_iter=max_iter, tol=atol if atol > 0 else 1e-8,
             verbose=True,
         )
-        # Match Lanczos return shape: (n_eig, bs=1, nc_pad, nv_pad, nk).
-        eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
-        # Davidson runs its budget; it does not measure a convergence point.
+        # ── RETURN CONVENTION ────────────────────────────────────────────────
+        # Match the Lanczos return CONVENTION, not merely its shape.  The
+        # Lanczos routes below pin ``out_shardings=(rep_eig, …)`` with
+        # ``rep_eig = NamedSharding(mesh_xy, P())``, i.e. eigenvalues and
+        # eigenvectors come back REPLICATED.  Davidson's ``X`` inherits the
+        # SOLVE sharding ``P(None,"x","y",None)`` instead (it is
+        # ``jnp.einsum('mn,m...->n...', x, V)`` over a sharded ``V``), and the
+        # reshape below does not change that.  Two solvers reachable from one
+        # ``--solver`` flag were therefore returning different layouts under one
+        # documented tuple, and every consumer that believed the docstring was
+        # holding a live grenade: ``--solver davidson --write-eigs`` died on
+        # EVERY rank at P>1 in ``bse_io.write_eigenvectors_stream``'s
+        # ``device_get`` ("Fetching value for `jax.Array` that spans
+        # non-addressable (non process local) devices").
+        #
+        # ``bse_io`` now fetches through ``gather_to_host`` and so survives any
+        # layout — but that is the WRITER being defensive, and it does not make
+        # the tuple honest for the next consumer.  This is the other half: the
+        # convention is declared here and enforced here, so "the same tuple as
+        # the Lanczos path" is true of the sharding as well as the shape.
+        # Cost: the same replicated eigenvector set the Lanczos path has always
+        # returned (n_eig × nc_pad × nv_pad × nk complex128 per rank).
+        rep_eig_dav = NamedSharding(mesh_xy, P())
+        eigenvectors = jax.jit(lambda a: a, out_shardings=rep_eig_dav)(
+            eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk))
+        # ``davidson`` returns eigenvalues as a HOST numpy array (it needs them
+        # on the host for its own convergence test), where Lanczos returns a
+        # replicated device array.  ``replicate_to_mesh`` declares the identical
+        # per-rank copy as the replica with NO collective; its precondition —
+        # bit-identical on every rank — holds because every rank ran the same
+        # deterministic reduction to get it.
+        eigenvalues = replicate_to_mesh(np.asarray(eigenvalues), mesh_xy)
+        # ``N_ITER_NOT_MEASURED``, not ``max_iter``: the branch this merge
+        # carries was written when this route still returned its budget, and
+        # registered that as its deferred item 4.  ``main`` has since landed
+        # the sentinel (``bse_lanczos.py:49``, read at ``bse_jax.py:212``), so
+        # the deferral is satisfied here and the honest value is kept.
         return eigenvalues, eigenvectors, jnp.int32(N_ITER_NOT_MEASURED)
 
     rep_eig = NamedSharding(mesh_xy, P())  # eigenvalues / eigenvectors come back replicated.

@@ -13,6 +13,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from runtime.padding import padded_mu_extent
+from common.collectives import gather_to_host
 from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
 
 from .bse_serial import compute_pair_amplitude
@@ -263,7 +264,11 @@ def write_eigenvectors_stream(
     # write path).  Our solvers return Ry — convert here so a downstream
     # consumer using BGW conventions reads the right number.
     RYD2EV = 13.6056980659
-    eigenvalues = np.asarray(jax.device_get(eigenvalues[:n_write])) * RYD2EV
+    # ``gather_to_host``, not ``device_get``: see the ONE-writer note below for
+    # why this writer must not assume any particular solver's sharding.  On the
+    # replicated Lanczos arrays and on Davidson's already-host eigenvalues the
+    # helper degrades to the plain ``device_get`` that was here before.
+    eigenvalues = gather_to_host(eigenvalues[:n_write]) * RYD2EV
     kpts = _generate_kpts_grid(nkx, nky, nkz)
     nk = kpts.shape[0]
     ns = 1
@@ -285,17 +290,34 @@ def write_eigenvectors_stream(
     #     OSError: ... (truncated file: eof = 96, ..., stored_eof = 2048)
     # leaving an eigenvectors.h5 written by whichever rank won.  That is
     # QUALITY_PATTERNS #7 ("P ranks overwrote one output file") in production.
-    # ``solve_bse_sharded`` pins ``out_shardings=(rep_eig, rep_eig, rep_eig)``
-    # with ``rep_eig = NamedSharding(mesh, P())``, so eigenvalues/eigenvectors
-    # are REPLICATED and rank 0's file is byte-for-byte the file any rank
-    # would have written.
-    # The ``jax.device_get`` calls stay UNGATED on both branches on purpose:
-    # ``eigenvectors[i]`` slices a GLOBAL array, which dispatches an XLA
-    # computation every process must enter — a rank-0-only body would hang the
-    # multi-process client rather than fix anything.
+    #
+    # WHY ``gather_to_host`` AND NOT ``jax.device_get``.  This comment used to
+    # read "``solve_bse_sharded`` pins ``out_shardings=(rep_eig, rep_eig,
+    # rep_eig)`` … so eigenvalues/eigenvectors are REPLICATED", and took that as
+    # licence to fetch with a bare ``device_get``.  That is true of the Lanczos
+    # routes and FALSE of the ``--solver davidson`` route, which returns ``X``
+    # on the solve sharding ``P(None,"x","y",None)``; ``--solver davidson
+    # --write-eigs`` therefore died on every rank at P>1 with "Fetching value
+    # for `jax.Array` that spans non-addressable (non process local) devices".
+    # ``bse_lanczos`` now pins the Davidson branch to the same replicated
+    # convention (that is the root-cause half of the fix), but a WRITER must not
+    # depend on a solver's layout to be correct: any future solver, or any
+    # caller that hands this function a solve-sharded array directly, would
+    # resurrect the same crash.  ``common.collectives.gather_to_host`` answers
+    # "does this process hold all of it?" instead of assuming, and its arms
+    # degrade to exactly the ``device_get`` that was here before whenever the
+    # array is replicated or single-process — so the 1-GPU path is unchanged.
+    #
+    # The fetches stay UNGATED on both branches on purpose: ``eigenvectors[i]``
+    # slices a GLOBAL array, which dispatches an XLA computation every process
+    # must enter, and ``gather_to_host``'s collective arm is chosen on
+    # ``is_fully_addressable``/``is_fully_replicated``, both GLOBAL properties —
+    # so every rank takes the same arm and the ranks stay in lockstep.  A
+    # rank-0-only body would hang the multi-process client rather than fix
+    # anything.
     if jax.process_index() != 0:
         for i in range(n_write):
-            jax.device_get(eigenvectors[i])
+            gather_to_host(eigenvectors[i])
         return
 
     with h5py.File(output_file, "w") as f:
@@ -346,7 +368,7 @@ def write_eigenvectors_stream(
             return c.real, c.imag
 
         for i in range(n_write):
-            vec = jax.device_get(eigenvectors[i])
+            vec = gather_to_host(eigenvectors[i])
             if use_tda:
                 # (1, nc, nv, nk) sharded or (nc, nv, nk) unsharded -> resonant X.
                 Xc = vec[0] if vec.ndim == 4 else vec

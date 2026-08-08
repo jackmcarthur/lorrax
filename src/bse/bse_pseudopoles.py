@@ -35,6 +35,7 @@ from .bse_ring_comm import (
     make_bse_shardings,
 )
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
+from common.collectives import gather_to_host
 import common.timing as timing
 
 jax.config.update("jax_enable_x64", True)
@@ -155,7 +156,13 @@ def _compute_density_snapshots(
         else:
             s_full = jax.lax.with_sharding_constraint(v, sh.X_full)
             w_mu = readout_full(s_full, psi_c_Y, psi_v_Y, V_q0)
-        cols.append(np.asarray(jax.device_get(w_mu[0])))
+        # ``gather_to_host``: the density snapshot comes back on
+        # ``sh.d_mu = P(None, 'x')`` (bse_ring_comm.py), i.e. TILED over mesh
+        # axis x -- and ``create_mesh_xy`` refuses non-square meshes, so every
+        # P>1 run has px>=2 and this column spans processes.  A bare
+        # ``device_get`` raised there.  This is the live ``run_pseudopoles`` ->
+        # ``_compute_density_snapshots`` path, not a debug one.
+        cols.append(gather_to_host(w_mu[0]))
     return np.stack(cols, axis=1)
 
 
