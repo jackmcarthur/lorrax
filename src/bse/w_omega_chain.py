@@ -210,31 +210,38 @@ def _seed_block(cols, data: dict, gen, sh):
 # scan that matters is the one INSIDE the step: the DGKS reorthogonalization,
 # which is where 2112 of the old form's 2306 dispatches were.
 #
-# WHY THE OPTIMIZATION BARRIERS (``_ob`` below) ARE LOAD-BEARING.  Collapsing
-# N programs into one hands XLA a fusion opportunity the eager form never had,
-# and fusing a subtract into the dot that consumes it changes that dot's
-# reduction order.  MEASURED on the MoS2 6x6 deck (N_mu=1496, nk=36, p=6): with
-# no barriers the converted chain agreed with the eager one to 1 ulp per DGKS
-# sweep (max_rel 1.37e-16 = 2^-53), which 32 block-Lanczos steps amplified to
-# max_rel 1.2e-10 in ``V_stack`` and 6.4e-11 in ``beta``.  That is small, but it
-# is drift in a physics quantity introduced by a performance refactor, which
-# this tree does not do.  A barrier at EVERY point where the eager form had an
-# XLA program boundary pins the arithmetic exactly, and the A/B then comes back
-# BIT-IDENTICAL (``np.array_equal``) on ``alpha``, ``beta``, ``R0``, ``V_stack``
-# and ``D_half``.  The barriers cost only fusion, and fusion is not what this
-# conversion was buying: the win class here is dispatch count and host syncs
-# (2306 -> 34 and 65 -> 33), not per-item math.  MEASURED individually, the
-# combine, the combine-then-scale, the INLINED matvec and a bare Gram are each
-# bit-identical without a barrier; only a dot fed by a subtract is not.  The
-# barriers are placed uniformly anyway, because "wherever the eager form had a
-# program boundary" is a rule a later reader can check, and "wherever we
-# measured drift on this deck at this shape" is not.
+# WHY THIS IS NOT BIT-IDENTICAL TO THE EAGER FORM, AND WHY THAT IS ALLOWED.
+# Collapsing N programs into one hands XLA a fusion opportunity the eager form
+# never had.  Where a subtract feeds a dot, the fused kernel computes that
+# reduction itself instead of handing a materialized buffer to a library GEMM
+# with a fixed accumulation order, and it is free to contract multiply+add into
+# FMA; either changes the last bit, and this file does not separate them
+# because the observable is the same.  MEASURED on the MoS2 6x6 deck
+# (N_mu=1496, nk=36, p=6): ONE DGKS sweep differs by exactly 1 ulp (max_rel
+# 1.368e-16 = 2^-53), which 32 block-Lanczos steps amplify to max_rel 1.2e-10
+# in ``V_stack`` and 6.4e-11 in ``beta``.  Measured individually, the combine,
+# the combine-then-scale, the INLINED matvec and a bare Gram are each
+# bit-identical; only a dot fed by a subtract is not.  A trace-time-UNROLLED
+# loop drifts identically to the ``lax.fori_loop``, so the loop construct is
+# innocent -- it is fusion, not iteration.
+#
+# An earlier revision pinned the arithmetic exactly with a
+# ``lax.optimization_barrier`` at every point the eager form had an XLA program
+# boundary.  It worked: the A/B came back bit-identical on every array.  It also
+# cost 1.52x of the achievable speed, because those barriers block the same
+# fusion that makes the DGKS sweep cheap -- MEASURED, MoS2 6x6 at P=4, warm
+# chain build: 1.756 s barriered against 1.142 s not.  The owner ruled on
+# 2026-08-08 that 1.2e-10 is tolerable here, so the pins are gone and the gate
+# moved with them: ``tests/test_bse_w_omega_chain_scan.py`` now compares against
+# the eager reference at ``rel <= 1e-9`` (roughly 8x headroom over the measured
+# drift) instead of ``np.array_equal``, so a real regression is still caught.
+#
+# What did NOT change is the ``p x p`` eigendecomposition, which stays on HOST
+# (:func:`_host_qr_factors`).  That is a different question from fusion
+# reassociation -- a different LAPACK-vs-cuSOLVER algorithm applied to the
+# eigenvectors that feed every later chain block -- and it has not been ruled
+# on.
 _CHAIN_STEP_CACHE: dict[tuple, tuple] = {}
-
-#: One XLA program boundary, preserved.  See the block comment above: this is
-#: what makes the converted chain bit-identical to the loop it replaced, and it
-#: is not decoration.  Removing any one of these calls is a numerical change.
-_ob = jax.lax.optimization_barrier
 
 
 def _chain_step_key(matvec, sh, m, p, reorth_passes, x_shape, x_dtype) -> tuple:
@@ -291,35 +298,30 @@ def _get_chain_step(matvec, sh, *, m, p, reorth_passes, x_shape, x_dtype):
         """Initial ``(V, W_prev, Q_prev)`` carry, in the step's own shardings."""
         V = jax.lax.with_sharding_constraint(
             jnp.zeros((m,) + B0.shape, dtype=B0.dtype), sh.X_full)
-        W_prev = _ob(jax.lax.with_sharding_constraint(B0, sh.X))
-        Q_prev = _ob(jax.lax.with_sharding_constraint(
-            jnp.zeros_like(B0), sh.X))
+        W_prev = jax.lax.with_sharding_constraint(B0, sh.X)
+        Q_prev = jax.lax.with_sharding_constraint(jnp.zeros_like(B0), sh.X)
         return V, W_prev, Q_prev
 
     @jax.jit
     def _step(V, W_prev, Tr_prev, Q_prev, beta_prev, j, D_half, args):
-        # Every ``_ob`` below sits where the eager chain had an XLA program
-        # boundary; that is what keeps this bit-identical (see block comment).
-        #
         # (1) finish the previous block-QR on device: Q_j = W_prev Tr_prev.
-        Qj = _ob(jax.lax.with_sharding_constraint(
-            _block_combine(W_prev, Tr_prev), sh.X))
+        Qj = jax.lax.with_sharding_constraint(
+            _block_combine(W_prev, Tr_prev), sh.X)
         # (2) park Q_j in the chain buffer.  DGKS below reads V[0..j], which is
         #     exactly the stored basis Q_0 .. Q_j the growing Python list held.
         V = jax.lax.with_sharding_constraint(
             jax.lax.dynamic_update_index_in_dim(V, Qj, j, 0), sh.X_full)
         # (3) Wb = S Q_j, through the production matvec VERBATIM:
         #     H_RPA [u;u] = [(A+B)u; -(A+B)u], so (A+B)u is the X-block.
-        u = _ob(jax.lax.with_sharding_constraint(D_half * Qj, sh.X))
-        uu = _ob(jax.lax.with_sharding_constraint(
-            jnp.stack([u, u], axis=0).astype(jnp.complex128), sh.X_full))
-        w = _ob(matvec(uu, *args)[0])
-        Wb = _ob(jax.lax.with_sharding_constraint(D_half * w, sh.X))
-        # (4) the three-term recurrence.  The two subtractions are separate
-        #     statements for the same reason they were separate programs.
-        alpha = _ob(_block_gram(Qj, Wb))                        # (p,p) Hermitian
-        Wb = _ob(Wb - _ob(_block_combine(Qj, alpha)))
-        Wb = _ob(Wb - _ob(_block_combine(Q_prev, _ob(beta_prev.conj().T))))
+        u = jax.lax.with_sharding_constraint(D_half * Qj, sh.X)
+        uu = jax.lax.with_sharding_constraint(
+            jnp.stack([u, u], axis=0).astype(jnp.complex128), sh.X_full)
+        w = matvec(uu, *args)[0]
+        Wb = jax.lax.with_sharding_constraint(D_half * w, sh.X)
+        # (4) the three-term recurrence, spelled exactly as the eager form did.
+        alpha = _block_gram(Qj, Wb)                             # (p,p) Hermitian
+        Wb = Wb - _block_combine(Qj, alpha) - _block_combine(
+            Q_prev, beta_prev.conj().T)
 
         # (5) full (DGKS) reorthogonalization against all stored blocks.  The
         #     unfilled slots of V are exactly zero, so the loop could run to m
@@ -328,13 +330,11 @@ def _get_chain_step(matvec, sh, *, m, p, reorth_passes, x_shape, x_dtype):
         def _dgks(i, W_cur):
             Qi = jax.lax.with_sharding_constraint(
                 jax.lax.dynamic_index_in_dim(V, i, axis=0, keepdims=False), sh.X)
-            g = _ob(_block_gram(Qi, W_cur))
-            c = _ob(_block_combine(Qi, g))
-            return _ob(W_cur - c)
+            return W_cur - _block_combine(Qi, _block_gram(Qi, W_cur))
 
         for _ in range(int(reorth_passes)):
             Wb = jax.lax.fori_loop(0, j + 1, _dgks, Wb)
-        Wb = _ob(jax.lax.with_sharding_constraint(Wb, sh.X))
+        Wb = jax.lax.with_sharding_constraint(Wb, sh.X)
         # (6) device half of the NEXT block-QR — returned with alpha so the
         #     caller takes ONE host sync per step instead of two.
         G = _block_gram(Wb, Wb)
@@ -373,11 +373,12 @@ def build_w_omega_chain(data, matvec, gen, sh, cols, chain_len,
     basis lives in a preallocated ``(m,p,c,v,k)`` buffer that the step writes
     with ``dynamic_update_index_in_dim`` instead of a growing Python list, and
     the DGKS double loop is a ``lax.fori_loop`` over that buffer inside the
-    program.  This form is BIT-IDENTICAL to the eager one it replaced — the
-    ``p x p`` eigendecomposition stays on host in :func:`_host_qr_factors`
-    precisely so that it is — and it is the reason the buffer is preallocated
-    rather than stacked at the end: the old form held ``m+1`` separate blocks AND
-    their stack alive at once, so this is a lower peak, not a new one."""
+    program.  It agrees with the eager form it replaced to ``rel <= 1.2e-10``
+    (measured; the block comment above :data:`_CHAIN_STEP_CACHE` says where that
+    comes from and what was traded for it), and the buffer is preallocated
+    rather than stacked at the end because the old form held ``m+1`` separate
+    blocks AND their stack alive at once, so this is a lower peak, not a new
+    one."""
     cols = np.asarray(cols, dtype=int)
     p = len(cols)
     m = int(chain_len)

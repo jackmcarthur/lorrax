@@ -9,11 +9,12 @@ host syncs for a 32-step chain, measured on the MoS2 6x6 deck
 This file is the verification floor for that conversion, and every cell here
 ships the case in which it returns FALSE:
 
-  * :func:`_eager_reference_chain` is the OLD implementation, verbatim.  The
-    bit-identity cell compares against it with ``np.array_equal`` — not
-    ``allclose`` — because preserving the arithmetic exactly is the whole
-    reason the ``p x p`` eigendecomposition stayed on host and the reason the
-    ``lax.optimization_barrier`` calls in the step exist.
+  * :func:`_eager_reference_chain` is the OLD implementation, verbatim, and it
+    is the frozen reference the converted chain is held to.  The gate is a
+    CHARACTERIZED TOLERANCE (``rel <= CHAIN_REL_TOL``), not ``np.array_equal``:
+    see that constant for the measured drift, where it comes from and who
+    signed it off.  ``R0`` and ``D_half`` are still checked EXACTLY, because
+    they are computed outside the fused region and have no licence to move.
   * The trace-once cell has a red twin that bakes the chain index into the
     program (the shape the conversion had to avoid) and asserts it traces once
     PER STEP instead of once.
@@ -21,9 +22,10 @@ ships the case in which it returns FALSE:
     the second build then has to build a new program — the cache boundary the
     pattern note records as load-bearing (an uncached scan measured 3.4x SLOWER
     than the loop it replaced).
-  * The barrier cell has a red twin that neuters ``_ob`` to the identity and
-    asserts the chain then STOPS being bit-identical, so nobody deletes a
-    barrier believing it is decoration.
+  * The tolerance cell has a red twin that perturbs a result by just over the
+    threshold and asserts the comparison FAILS, and by well under it and
+    asserts it passes — so the gate is known to discriminate rather than to
+    wave everything through.
 
 The operator here is synthetic (a Hermitian (c,c) contraction plus the
 transition diagonal) so the cell is fast and needs no GW fixture; the physics
@@ -45,6 +47,29 @@ from bse import w_omega_chain as woc
 # about XLA's fusion of those dots, and it has nothing to bite on at toy size.
 NC, NV, NK, NMU, P_BLK = 48, 24, 16, 32, 4
 CHAIN_M = 6
+
+#: Relative tolerance of the converted chain against the eager reference.
+#:
+#: WHERE THE NUMBER COMES FROM.  The conversion collapses ~2300 XLA programs
+#: into one program per chain step, which lets XLA fuse a subtract into the dot
+#: that consumes it; the fused kernel accumulates in its own order and may
+#: contract multiply+add into FMA, so the last bit moves.  MEASURED on the MoS2
+#: 6x6 deck (N_mu=1496, nk=36, p=6, chain_len=32, 2x2 mesh): 1 ulp per DGKS
+#: sweep (1.368e-16 = 2^-53), amplified by 32 block-Lanczos steps to
+#: **max_rel 1.2e-10 in V_stack** and 6.4e-11 in beta.
+#:
+#: An earlier revision pinned this to zero with lax.optimization_barrier and
+#: paid 1.52x of the achievable speed for it (warm chain build 1.756 s pinned
+#: vs 1.142 s not, MoS2 6x6 at P=4).  The owner ruled on 2026-08-08 that the
+#: 1.2e-10 is tolerable for this site, so the pins came out.
+#:
+#: The gate sits ~8x above the measured drift: loose enough not to be a
+#: tripwire for the fusion the ruling allowed, tight enough that a real
+#: regression — which is orders of magnitude larger, not a factor of two —
+#: still fails.  The red twin below proves it discriminates.  If this number
+#: ever has to be RAISED, that is a new measurement and a new ruling, not a
+#: maintenance edit.
+CHAIN_REL_TOL = 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +210,17 @@ def chain_fixture():
     return data, matvec, gen, sh, np.arange(P_BLK, dtype=int)
 
 
+def _max_rel(got, ref):
+    """max|got-ref| / max|ref| — the scale the gate is stated in."""
+    got = np.asarray(got)
+    ref = np.asarray(ref)
+    assert got.shape == ref.shape and got.dtype == ref.dtype, (
+        f"shape/dtype drift: {got.shape}{got.dtype} vs {ref.shape}{ref.dtype}")
+    scale = float(np.abs(ref).max())
+    d = float(np.abs(got - ref).max())
+    return d / scale if scale > 0.0 else d
+
+
 def _local(x):
     """Process-local bytes of a jax.Array (P>1-safe)."""
     shards = getattr(x, "addressable_shards", None)
@@ -208,67 +244,84 @@ def _cache_size(fn):
 
 
 # ---------------------------------------------------------------------------
-# 1. BIT-IDENTITY vs the eager form.  np.array_equal, not allclose.
+# 1. AGREEMENT with the eager form, at a CHARACTERIZED tolerance.
 # ---------------------------------------------------------------------------
-def test_chain_is_bit_identical_to_the_eager_reference(chain_fixture):
+def test_chain_matches_the_eager_reference_within_tolerance(chain_fixture):
+    """The converted chain vs the frozen eager reference at CHAIN_REL_TOL.
+
+    ``R0`` and ``D_half`` are held EXACTLY: they are computed before the fused
+    chain step runs (the seed Gram is still its own dispatch, D_half is plain
+    eager arithmetic), so fusion has no way to touch them and a drift there
+    would mean something other than the ruled-on effect changed.
+    """
     data, matvec, gen, sh, cols = chain_fixture
     new = woc.build_w_omega_chain(data, matvec, gen, sh, cols, CHAIN_M)
     ref = _eager_reference_chain(data, matvec, gen, sh, cols, CHAIN_M)
 
-    for name in ("alpha", "beta", "R0"):
-        assert np.array_equal(new[name], ref[name]), (
-            f"{name} is not bit-identical to the eager reference: "
-            f"max|d|={np.abs(new[name] - ref[name]).max():.3e}")
-    a, b = _local(new["V_stack"]), _local(ref["V_stack"])
-    assert np.array_equal(a, b), (
-        f"V_stack is not bit-identical to the eager reference: "
-        f"max|d|={np.abs(a - b).max():.3e}")
+    for name in ("R0", "D_half"):
+        a = _local(new[name]) if name == "D_half" else new[name]
+        b = _local(ref[name]) if name == "D_half" else ref[name]
+        assert np.array_equal(a, b), (
+            f"{name} moved, and it sits OUTSIDE the fused region — this is not "
+            f"the ruled-on fusion drift.  max_rel={_max_rel(a, b):.3e}")
+
+    rels = {name: _max_rel(new[name], ref[name]) for name in ("alpha", "beta")}
+    rels["V_stack"] = _max_rel(_local(new["V_stack"]), _local(ref["V_stack"]))
+    worst = max(rels.values())
+    assert worst <= CHAIN_REL_TOL, (
+        f"the chain drifted past the characterized tolerance: "
+        f"{ {k: f'{v:.3e}' for k, v in rels.items()} } vs "
+        f"CHAIN_REL_TOL={CHAIN_REL_TOL:.0e}.  See that constant: the allowed "
+        f"drift is XLA fusion reassociation, measured at 1.2e-10 on a "
+        f"production deck.  A number far above this is a real regression.")
+
     assert new["V_stack"].sharding.is_equivalent_to(
         ref["V_stack"].sharding, new["V_stack"].ndim), (
         f"V_stack sharding drifted: {new['V_stack'].sharding.spec} vs "
         f"{ref['V_stack'].sharding.spec}")
-    # Non-vacuous: a chain of zeros would satisfy every equality above.
+    # Non-vacuous: a chain of zeros would satisfy every bound above.
     assert np.abs(new["alpha"]).max() > 1e-6
     assert np.abs(_local(new["V_stack"])).max() > 1e-6
 
 
 # ---------------------------------------------------------------------------
-# 2. THE BARRIER RED TWIN.  Neuter _ob and bit-identity must BREAK.
+# 2. THE TOLERANCE RED TWIN.  The gate must discriminate, not wave through.
 # ---------------------------------------------------------------------------
-def test_removing_the_optimization_barriers_breaks_bit_identity(
-        chain_fixture, monkeypatch):
-    """The barriers are load-bearing, and this is the cell that proves it.
+def test_red_twin_the_tolerance_gate_catches_a_perturbation(chain_fixture):
+    """The FALSE case for cell 1.
 
-    If this ever passes — i.e. the chain stays bit-identical with the barriers
-    gone — then XLA stopped fusing the dot that a subtract feeds, and the
-    barriers could be dropped for a real speedup (MEASURED on the MoS2 6x6
-    deck at 1 GPU: 5.34 s with barriers, 3.83 s without).  That is a decision
-    to take deliberately with a fresh A/B, not a line to delete.
+    A gate stated as an inequality is worthless until someone shows it can
+    fail.  Perturb a real chain result by just OVER CHAIN_REL_TOL and the
+    comparison must reject it; perturb it by well under and it must accept.
+    Both directions, because a gate that rejects everything is as useless as
+    one that accepts everything.
     """
     data, matvec, gen, sh, cols = chain_fixture
     ref = _eager_reference_chain(data, matvec, gen, sh, cols, CHAIN_M)
+    base = ref["alpha"]
 
-    monkeypatch.setattr(woc, "_ob", lambda x: x)
-    monkeypatch.setattr(woc, "_CHAIN_STEP_CACHE", {})   # force a fresh trace
-    unbarriered = woc.build_w_omega_chain(data, matvec, gen, sh, cols, CHAIN_M)
+    # Just over the threshold, injected on the largest element so the
+    # perturbation is exactly the relative size we claim.
+    idx = np.unravel_index(np.argmax(np.abs(base)), base.shape)
+    over = base.copy()
+    over[idx] = over[idx] * (1.0 + 10.0 * CHAIN_REL_TOL)
+    r_over = _max_rel(over, base)
+    assert r_over > CHAIN_REL_TOL, (
+        f"a {10 * CHAIN_REL_TOL:.0e} relative perturbation measured "
+        f"{r_over:.3e}, which does NOT exceed CHAIN_REL_TOL — the gate cannot "
+        f"catch what it is there to catch")
 
-    same = (np.array_equal(unbarriered["alpha"], ref["alpha"])
-            and np.array_equal(unbarriered["beta"], ref["beta"])
-            and np.array_equal(_local(unbarriered["V_stack"]),
-                               _local(ref["V_stack"])))
-    assert not same, (
-        "the chain is bit-identical to the eager form even with the "
-        "optimization barriers removed — see this test's docstring: that is a "
-        "genuine change in XLA's behaviour, not a licence to delete them "
-        "silently.  Re-run the A/B on a production deck and record it.")
-    # ...and the damage is ulp-scale, not a broken algorithm: this is what
-    # makes it a PHYSICS-ADJACENT drift rather than a bug.
-    d = np.abs(unbarriered["alpha"] - ref["alpha"]).max()
-    scale = np.abs(ref["alpha"]).max()
-    assert d / scale < 1e-6, (
-        f"unbarriered chain differs from the eager form by {d/scale:.3e} "
-        f"relative — that is far more than fusion reassociation and means "
-        f"something other than the barriers changed")
+    under = base.copy()
+    under[idx] = under[idx] * (1.0 + 0.01 * CHAIN_REL_TOL)
+    r_under = _max_rel(under, base)
+    assert r_under <= CHAIN_REL_TOL, (
+        f"a {0.01 * CHAIN_REL_TOL:.0e} relative perturbation measured "
+        f"{r_under:.3e} and would FAIL the gate — the threshold is a tripwire, "
+        f"not a tolerance")
+
+    # And the helper is not silently comparing something else: identical input
+    # must read exactly zero.
+    assert _max_rel(base, base) == 0.0
 
 
 # ---------------------------------------------------------------------------
