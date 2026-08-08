@@ -63,12 +63,20 @@ def make_bse_h_tilde(matvec, data, e_center, half_width):
     e_center_jnp = jnp.asarray(e_center, dtype=dtype_real)
     inv_hw = jnp.asarray(1.0 / half_width, dtype=dtype_real)
 
+    # The ten operands are RETURNED for the caller to pass as runtime arguments
+    # rather than captured here (registered R1).  They are mesh-sharded, so a
+    # jit that closes over them is refused at trace time at P>1 with "Closing
+    # over jax.Array that spans non-addressable devices" -- which is how KPM
+    # died at P>1 before any downstream device_get could be reached.
     @jax.jit
-    def apply_h_tilde(x):
+    def apply_h_tilde(x, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                      eps_c, eps_v, W_R, V_q0, M_X, M_Y):
         hx = matvec(x, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
         return (hx - e_center_jnp * x) * inv_hw
 
-    return apply_h_tilde
+    operands = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
+                M_X, M_Y)
+    return apply_h_tilde, operands
 
 
 def make_bse_random_vector(data, use_tda):
@@ -211,7 +219,8 @@ def run_kpm_dos(
     print(f"  Half-width = {half_width:.6f} Ry = {half_width * ry_to_ev:.3f} eV")
 
     # --- Build BSE-specific callables ---
-    apply_h_tilde = make_bse_h_tilde(matvec, data_fp32, e_center, half_width)
+    apply_h_tilde, h_tilde_operands = make_bse_h_tilde(
+        matvec, data_fp32, e_center, half_width)
     random_vector_fn = make_bse_random_vector(data_fp32, use_tda)
 
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
@@ -233,6 +242,7 @@ def run_kpm_dos(
             seed=seed,
             dtype_real=data_fp32["eps_c"].dtype,
             make_random_vector=random_vector_fn,
+            operands=h_tilde_operands,
         )
 
     print(f"\n  mu_0 = {mu[0]:.6f}  (should be ~1.0)")
