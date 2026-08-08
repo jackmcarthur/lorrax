@@ -162,16 +162,55 @@ import symmetry_maps                                            # noqa: E402
 # override is a parameter on all three entry points and, at the driver
 # seam, the ``LORRAX_CENTROID_PC_TOL`` environment variable.
 #
-# ROOM FOR A BLOCKED VARIANT, LEFT ON PURPOSE.  The per-iteration state is
-# deliberately minimal — ``(d, L, piv, active, d_taken, trR, d_min_raw,
-# d_min_at, d_min_j)``, of which only the first four participate in the
-# recurrence — and the collectives stay explicit and adjacent at the top of
-# the body rather than hidden behind helpers.  A blocked variant (choose a
-# panel of ``b`` pivots per round, then one level-3 trailing update) would
-# cut the 3·k_keep collective round trips by roughly ``b`` and slots into
-# this shape without restructuring the carry.  It is NOT implemented here:
-# the select is 0.165 s at production M, 3-4 % of the driver's wall, and
-# robustness was the deliverable.
+# LAPACK PANEL BLOCKING DOES NOT TRANSFER HERE, AND IT WAS MEASURED.
+# ``?pstrf`` blocks because it factors the FULL matrix: k = n = M, so the
+# trailing update's O(M·b·M) per panel and the left-looking O(M·k) per step
+# are the same cost.  This kernel SELECTS ``k_keep`` columns out of M
+# candidates with k_keep << M — 42 of 2580 at the Si-class point, 900 of
+# 13872 at the MoS₂-class one.  The trailing update refreshes ALL M columns
+# of a working Gram; the algorithm only ever READS column p, at k of the M
+# columns, chosen adaptively.  So blocking pays M/k times the arithmetic:
+#
+#   shape                left-looking   panel-blocked   ratio
+#   D3 (M=2580, k=42)      4.55e+06       2.87e+08       63x
+#   MoS₂ (M=13872, k=900)  1.12e+10       1.74e+11       15x
+#
+# A prototype confirmed it (``blocked_proto.py``): the panel form reproduces
+# the pivot sequence EXACTLY at every shape tested — the blocking is correct
+# — and runs 3.5x to 16.7x SLOWER, worst at the D3 shape where M/k is worst.
+#
+# And it does not buy the round trips it was reached for.  Pivot selection
+# is inherently sequential: each pivot needs its own ``pmax`` on the value
+# and its own ``pmax`` on the tie-break index, whatever the panel width.
+# Blocking shrinks the ``L[p, :]`` psum from k_keep to b and adds one
+# all-gather per panel; the per-iteration COUNT is unchanged.
+#
+# The reduction that IS available needed no blocking at all, and is what
+# this kernel does.  MEASURED in the lowered HLO, per iteration of the
+# while body, on a real 2×2:
+#
+#   point mode, k_keep=20
+#     before  f64[], s32[], c128[20], f64[]          = 4
+#     after   f64[], s32[], c128[20]                 = 3
+#   orbit mode, k_keep=12
+#     before  f64[], s32[], c128[12], s32[], f64[]   = 5
+#     after   f64[], s32[], c128[13]                 = 3
+#
+# Two changes, neither touching the arithmetic: the trace-ratio psum is a
+# pure diagnostic and moves OUT of the loop (local partials, one psum at the
+# end), and the orbit-id broadcast RIDES the ``L[p, :]`` psum instead of
+# taking its own trip — visible above as c128[12]+s32[] becoming c128[13].
+# 1.33x fewer round trips in point mode, 1.67x in orbit mode, zero extra
+# flops, results bit-identical.  ``tests/test_centroid_distribution.py``
+# gates the count in the HLO, because NCCL latency is not measurable on an
+# emulated-device box and the count is the honest proxy.
+#
+# REGISTERED, NOT BUILT: block-greedy selection (take the top-b entries of
+# one snapshot of d per round) WOULD batch the pivot pmax and get the round
+# trips down by ~b.  It also CHANGES WHICH PIVOTS ARE CHOSEN on
+# well-separated Grams, not just on ties, so it needs its own owner ruling
+# and a regeneration story for every existing centroid file.  Not a
+# refactor; a different algorithm.
 #
 # The refusal DISCIPLINE — a named condition, the measured evidence, and
 # what to do instead — is borrowed from ``distrib_la``.  Its DISPATCH is
@@ -924,7 +963,10 @@ def make_sharded_pivoted_cholesky_select(
                 -jnp.ones((k_keep,), dtype=jnp.int32),                   # piv
                 active0,                                                 # active
                 jnp.zeros((k_keep,), dtype=real_dtype),                  # d_taken
-                jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(1.0),
+                # trR partials, LOCAL: slot 0 holds this shard's share of
+                # trG so the post-loop psum makes trR_over_trG[0] exactly 1.
+                jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(
+                    jnp.sum(local_diag)),
                 # d_min_raw / at_row / at_step — the pstrf INFO triple.
                 jnp.minimum(local_diag_raw[at0_loc],
                             jnp.zeros((), dtype=real_dtype)),
@@ -963,7 +1005,25 @@ def make_sharded_pivoted_cholesky_select(
                 local_Lp = jnp.where(
                     my_has_p, L[safe_idx, :], jnp.zeros_like(L[safe_idx, :]),
                 )
-                L_p = lax.psum(local_Lp, mesh_axis)
+                if orbit_id_slab is None:
+                    L_p = lax.psum(local_Lp, mesh_axis)
+                else:
+                    # ONE psum, not two.  The orbit id of the picked pivot
+                    # rides the SAME masked broadcast as L[p, :] — it is the
+                    # same idiom, from the same owner, at the same point in
+                    # the iteration, and it was a second round trip purely
+                    # because it was written a few lines further down.  Orbit
+                    # ids are small integers and complex128 carries them
+                    # exactly, so packing costs nothing in precision.
+                    _oid_term = jnp.where(
+                        my_has_p, orbit_id_slab[safe_idx], jnp.int32(0),
+                    ).astype(G_slab.dtype)
+                    _fused = lax.psum(
+                        jnp.concatenate([local_Lp, _oid_term[None]]),
+                        mesh_axis)
+                    L_p = _fused[:k_keep]
+                    orbit_id_p = jnp.round(
+                        jnp.real(_fused[k_keep])).astype(jnp.int32)
 
                 # New column.
                 prev_mask = (col_ids_k < j).astype(G_slab.dtype)
@@ -992,19 +1052,16 @@ def make_sharded_pivoted_cholesky_select(
                 d_min_j = jnp.where(beats, j.astype(jnp.int32), d_min_j)
                 d_min_raw = jnp.where(beats, step_min, d_min_raw)
                 d_new = jnp.maximum(jnp.where(take, d_raw, d), 0.0)
-                trR_over_trG = trR_over_trG.at[j + 1].set(
-                    lax.psum(jnp.sum(d_new), axis_name=mesh_axis) / trG,
-                )
+                # LOCAL partial only.  The psum that turns these into the
+                # global trace ratio runs ONCE, after the loop, on the whole
+                # (k_keep+1,) vector — it is a pure DIAGNOSTIC and paying a
+                # collective round trip per iteration for a number nobody
+                # reads until the end was the cheapest 25% on the hot path.
+                trR_over_trG = trR_over_trG.at[j + 1].set(jnp.sum(d_new))
                 if orbit_id_slab is None:
                     kill_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
                 else:
-                    # Broadcast orbit_id of the picked pivot via psum-with-mask
-                    # (same idiom as the L[p, :] broadcast above), then mark
-                    # all local orbit-mates inactive.
-                    local_op_val = jnp.where(
-                        my_has_p, orbit_id_slab[safe_idx], jnp.int32(0),
-                    )
-                    orbit_id_p = lax.psum(local_op_val, mesh_axis)
+                    # ``orbit_id_p`` came back on the FUSED psum above.
                     kill_mask = orbit_id_slab == orbit_id_p
                 kill_mask = kill_mask & take
                 active = active & ~kill_mask
@@ -1018,6 +1075,8 @@ def make_sharded_pivoted_cholesky_select(
              d_min_raw, d_min_at, d_min_j) = lax.fori_loop(
                 0, k_keep, body, init)
             d_final = jnp.where(jnp.isfinite(d_final), d_final, 0.0)
+            # The one psum the per-iteration diagnostic was costing.
+            trR_over_trG = lax.psum(trR_over_trG, axis_name=mesh_axis) / trG
             rank = jnp.sum(d_taken > floor).astype(jnp.int32)
             # THREE reductions, ONCE, after the loop — not per iteration:
             # the global minimum, then the row and step that attained it,

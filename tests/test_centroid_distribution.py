@@ -444,7 +444,8 @@ def test_orbit_path_with_trivial_group_matches_plain_path():
 # ─────────────────────────────────────────────────────────────────────────
 #
 # THE HOLE THIS CLOSES.  The
-# ``test_sharded_select_matches_single_device_reference`` cell above builds its mesh with ``dist.build_mesh(10**6, shard=False)``, which
+# ``test_sharded_select_matches_single_device_reference`` cell above builds
+# its mesh with ``dist.build_mesh(10**6, shard=False)``, which
 # returns a 1x1 mesh.  Both sides of that comparison therefore run with one
 # shard, ``M_slab == M``, and EVERY collective in
 # ``make_sharded_pivoted_cholesky_select`` is satisfied vacuously: the
@@ -566,6 +567,34 @@ assert not np.array_equal(piv_lo, piv_hi), (
     f"NEGATIVE CONTROL DID NOT FIRE: flipping the tie-break left the pivots "
     f"at {piv_lo} — the multi-shard comparison is still vacuous")
 print(f"  OK negative control: lowest-index {piv_lo} vs highest {piv_hi}")
+
+# ---- collectives PER ITERATION, counted in the lowered HLO ----------------
+# NCCL latency is unmeasurable here (emulated CPU devices), so the count is
+# the gate.  XLA's metadata op_name carries `while/body` for exactly the ops
+# that run once per iteration, which is the number that matters: the select
+# is latency-bound (assessment 4.2 -- 900 iterations x 3 collectives is 2700
+# round trips at 20-40 us each, "most of the 0.129 s").
+import re as _re
+def per_iter_collectives(M_, k_, oid_):
+    step_ = make_sharded_pivoted_cholesky_select(mesh, M_, k_, mesh_axis=AX)
+    G_ = gram(M_, M_, 3)
+    txt = (step_.lower(G_).compile().as_text() if oid_ is None
+           else step_.lower(G_, jnp.asarray(oid_)).compile().as_text())
+    return [l for l in txt.split("\n")
+            if ("all-reduce(" in l or "all-gather(" in l)
+            and "while/body" in l]
+
+pt = per_iter_collectives(64, 20, None)
+ob = per_iter_collectives(64, 12, np.repeat(np.arange(16, dtype=np.int32), 4))
+print(f"  per-iteration collectives: point {len(pt)}, orbit {len(ob)}")
+assert len(pt) == 3, f"point mode: {len(pt)} per-iteration collectives {pt}"
+assert len(ob) == 3, f"orbit mode: {len(ob)} per-iteration collectives {ob}"
+# The orbit-id broadcast must RIDE the L[p,:] psum, not be a fourth trip:
+# at k_keep=12 the fused psum is c128[13], not c128[12] plus an s32[].
+assert any("c128[13]" in l for l in ob), (
+    f"the orbit-id broadcast is not fused into the L[p,:] psum: {ob}")
+assert not any("s32[] all-reduce" in l for l in ob if "pmax" not in l), (
+    f"a separate integer all-reduce survived in orbit mode: {ob}")
 print("R4_MULTISHARD_OK")
 '''
 
