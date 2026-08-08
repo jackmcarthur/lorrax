@@ -34,6 +34,15 @@ Each cell below is paired with the failure it exists to catch:
   changes the answer visibly at ``n_reorth = 3`` while being invisible at full
   reorth.
 * ``test_cgs2_orthogonality`` -- the property the reorth exists to deliver.
+* ``test_window_includes_the_current_vector`` +
+  ``test_routes_select_the_same_window`` +
+  ``test_current_vector_projection_holds_orthogonality`` -- the 2026-08-08
+  widening of the window from ``i < j`` to ``i <= j``.  The first pins the set
+  from both sides AND pins that the collective counts did not move (the whole
+  argument for the change being free); the second pins that the sweep's scalar
+  predicate and the batched route's mask select the identical slots, so the two
+  routes cannot drift apart; the third is the RED TWIN the owner asked for --
+  reverting to ``i < j`` in-process must turn the orthogonality gate red.
 """
 from __future__ import annotations
 
@@ -235,41 +244,75 @@ def test_the_default_really_is_batched(monkeypatch):
     assert _count_prim(jx, "scan") >= 1, "outer Lanczos loop vanished"
 
 
-def test_window_semantics_are_frozen():
-    """RED TWIN: the projected set is `{i : max(0,j-n_reorth) <= i < j}`. FROZEN.
+def test_window_includes_the_current_vector():
+    """The projected set is ``{i : max(0,j-n_reorth) <= i <= j}``.  FROZEN.
 
-    Two things a future tidy-up will be tempted to "fix", and must not:
+    Until 2026-08-08 this window stopped at ``i < j``, leaving the current
+    vector ``q_j`` unprojected.  That is the one direction no route removed, so
+    the un-subtracted ``i*Im<q_j, z>`` the recurrence leaves behind survived
+    into ``q_{j+1} = z/beta_j`` and put a route-independent ``4.2009e-06`` floor
+    under the Ritz-vector orthogonality of the Si record deck -- identical under
+    MGS and CGS2 to five significant figures, which is what proved it was not a
+    Gram-Schmidt property.  ``RITZ_ORTHO_PROBE.md`` measured the widening
+    collapsing that floor to ~1e-15, and the owner ruled it in.
 
-    1. The sweep runs ``fori_loop(max(0, j-n_reorth), j + 1)`` with ``i < j``
-       inside, so its LAST trip computes a dot product and multiplies it by
-       zero -- 200 of the record deck's 20 100 collectives are that no-op.
-       Deleting it (``fori_loop(start, j, ...)``) is a real perf win on the
-       legacy route and is STILL NOT ALLOWED here: the trip count is what
-       ``mgs_trip_count`` pins and what every archived measurement was taken
-       with, and the fallback exists precisely to reproduce those.
-    2. Widening ``i < j`` to ``i <= j`` -- projecting out the CURRENT vector,
-       whose un-subtracted ``Im<q_j, z>`` is the best explanation for the
-       4.2e-06 Ritz-orthogonality floor this deck shows. The Ritz probe
-       measured that widening collapses that floor to 1e-15 at zero collective
-       cost, but it MOVES PHYSICS (4.22e-10 eV on the current operator) and is
-       its own owner decision. It must not ride in on a perf landing.
+    Two things a future tidy-up will be tempted to do, and must not:
 
-    This cell pins the boundary from both sides so either change goes red here
-    rather than silently in a production eigenvalue.
+    1. Narrow it back to ``i < j``.  That reopens the floor;
+       ``test_current_vector_projection_holds_orthogonality`` is the red twin.
+    2. "Optimise" the sweep to ``fori_loop(start, j, ...)``.  That was a real
+       win when the last trip was a discarded no-op.  It no longer is -- the
+       ``i == j`` trip is now the one doing the work this change exists for,
+       and deleting it silently restores the defect.
+
+    This cell pins the set from both sides, and pins that the collective counts
+    did NOT move -- which is the whole argument for the change being free.
     """
-    # the mask the batched route applies == the set the sweep visits
     for j in (0, 1, 5, 17):
         for n_reorth in (0, 3, 200):
             sel = np.asarray(LZ._reorth_window(j, 24, n_reorth))
-            expect = np.array([max(0, j - n_reorth) <= i < j for i in range(24)])
+            expect = np.array(
+                [max(0, j - n_reorth) <= i <= j for i in range(24)])
             assert np.array_equal(sel, expect), (j, n_reorth)
-            # the current vector j is NEVER projected out (not widened to i<=j)
-            if j < 24:
-                assert not sel[j], f"window widened to i<=j at j={j}"
-    # the sweep still pays for its i==j no-op trip: j+1 trips, not j
+            # the current vector IS projected out, at every window size
+            assert sel[j], f"window still stops at i<j (j={j}, k={n_reorth})"
+            # ... and nothing past it is: slots > j must stay unselected
+            assert not sel[j + 1:].any(), (j, n_reorth)
+            # ... and the k previous vectors are exactly the k it always was
+            assert int(sel.sum()) == min(j, n_reorth) + 1, (j, n_reorth)
+
+    # ZERO NEW COLLECTIVES -- the loop bounds are untouched, so the sweep makes
+    # the same number of trips it always did; the i == j trip stopped being
+    # discarded, that is all.  And the batched route masks an h it already
+    # computed in full.
     assert LZ.mgs_trip_count(1, 200) == 1
-    assert LZ.mgs_trip_count(200, 200) == 20100        # == sum_{j} (j+1)
-    assert LZ.mgs_trip_count(200, 200) != sum(range(200))   # == sum_{j} j
+    assert LZ.mgs_trip_count(200, 200) == 20100        # == sum_j (j+1)
+    assert LZ.mgs_trip_count(200, 200) != sum(range(200))   # != sum_j j
+    assert LZ.reorth_collective_count("mgs", 200, 200) == 20100
+    assert LZ.reorth_collective_count("cgs2", 200, 200) == 400
+    assert LZ.reorth_collective_count("cgs2", 200, 5) == 400
+
+
+def test_routes_select_the_same_window():
+    """RED TWIN for route drift: both routes must project the IDENTICAL slots.
+
+    The batched route applies ``_reorth_window`` as a mask.  The sweep uses the
+    scalar form of the same predicate inside ``fori_loop(max(0,j-n_reorth),
+    j+1)``.  Nothing in the type system ties those together, so this cell
+    re-derives the sweep's set from its own bounds and predicate and demands
+    equality.  If someone widens one route and not the other -- the exact
+    failure mode the owner flagged when this landed -- it goes red here.
+    """
+    n_slots = 24
+    for j in range(0, 20):
+        for n_reorth in (0, 1, 3, 7, 200):
+            mask = np.asarray(LZ._reorth_window(j, n_slots, n_reorth))
+            # the sweep: trips i in [max(0, j-n_reorth), j+1), predicate i<=j
+            swept = np.zeros(n_slots, dtype=bool)
+            for i in range(max(0, j - n_reorth), j + 1):
+                if i <= j:                      # the body's own predicate
+                    swept[i] = True
+            assert np.array_equal(mask, swept), (j, n_reorth, mask, swept)
 
 
 def test_mgs_fallback_is_reachable_from_the_env(monkeypatch):
@@ -378,3 +421,74 @@ def test_block_routes_agree():
         n_reorth=max_iter, reorth="cgs2", seed=5)
     delta = float(np.max(np.abs(np.asarray(ev_m) - np.asarray(ev_c))))
     assert delta < 1e-9, f"block routes disagree by {delta:.3e}"
+
+
+# --------------------------------------------------------------------------
+# the property the widening exists to deliver, and its red twin
+# --------------------------------------------------------------------------
+
+def _almost_hermitian(n, eps, seed=11):
+    """A Hermitian H perturbed by an ANTI-Hermitian ``i*eps*D``, D real diag.
+
+    ``<q, (H + i eps D) q> = <q,Hq> + i eps <q,Dq>`` with ``<q,Dq>`` real, so
+    ``Im alpha_j ~ eps`` -- a controlled stand-in for the operator defect the
+    Si record deck had (``Im alpha / max|alpha| = 1.088e-06`` from the mini-BZ
+    Coulomb head).  This is the only regime in which the widening does anything
+    at all: for an exactly Hermitian operator the ``i == j`` projection is a
+    no-op, which is precisely why the change is safe.
+    """
+    H, lam = _degenerate_hermitian(n, seed)
+    D = np.linspace(0.5, 1.5, n)
+    return H + 1j * float(eps) * jnp.asarray(np.diag(D), dtype=jnp.complex128), lam
+
+
+def _ritz_ortho(H, n, max_iter, kind):
+    _, V = _run(H, n, max_iter, max_iter, max_iter, kind)
+    V = np.asarray(V)
+    G = V.conj() @ V.T
+    return float(np.max(np.abs(G - np.eye(G.shape[0]))))
+
+
+@pytest.mark.parametrize("kind", ["cgs2", "mgs"])
+def test_current_vector_projection_holds_orthogonality(monkeypatch, kind):
+    """RED TWIN: revert the window to ``i < j`` and this gate must go red.
+
+    On an operator with ``Im alpha != 0``, the un-subtracted ``i*Im<q_j,z>``
+    lands on the Krylov basis' first superdiagonal at ``|Im alpha_j| / beta_j``
+    and the Ritz vectors inherit it.  With ``q_j`` in the window it is removed
+    and orthogonality is at round-off; with the pre-2026-08-08 window it is not.
+
+    Run on BOTH routes, because the defect was route-independent -- a fix that
+    reached only one route would leave the other exactly as broken as before.
+    """
+    n, max_iter, eps = 96, 48, 1e-6
+    H, _ = _almost_hermitian(n, eps)
+
+    good = _ritz_ortho(H, n, max_iter, kind)
+    assert good < 1e-11, (
+        f"{kind}: q_j is in the window but orthogonality is {good:.3e}")
+
+    monkeypatch.setattr(LZ, "_REORTH_INCLUDE_CURRENT", False)
+    bad = _ritz_ortho(H, n, max_iter, kind)
+    assert bad > 1e-9, (
+        f"RED TWIN DID NOT GO RED: {kind} with the i<j window still holds "
+        f"orthogonality at {bad:.3e} -- the gate is no longer testing anything")
+    assert bad > 1e3 * good, (
+        f"RED TWIN TOO WEAK: {kind} i<j {bad:.3e} vs i<=j {good:.3e}")
+
+
+def test_widening_is_a_no_op_on_a_hermitian_operator(monkeypatch):
+    """The safety half: with Im alpha == 0 the extra projection changes nothing.
+
+    This is what makes the widening a stabilisation rather than a physics
+    change -- the component it removes is zero on paper, and its cost on a real
+    operator is proportional to that operator's own non-Hermiticity.
+    """
+    n, max_iter = 96, 48
+    H, _ = _degenerate_hermitian(n)          # exactly Hermitian
+    ev_new, _ = _run(H, n, 8, max_iter, max_iter, "cgs2")
+    monkeypatch.setattr(LZ, "_REORTH_INCLUDE_CURRENT", False)
+    ev_old, _ = _run(H, n, 8, max_iter, max_iter, "cgs2")
+    delta = float(np.max(np.abs(np.asarray(ev_new) - np.asarray(ev_old))))
+    assert delta < 1e-9, (
+        f"widening moved a HERMITIAN operator's eigenvalues by {delta:.3e}")

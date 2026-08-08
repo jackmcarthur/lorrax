@@ -476,14 +476,20 @@ def _block_alpha_stats(alpha_all):
 # quadratic — and buys that with a panel-size dial nobody wants to tune.  CGS2
 # is linear in ``max_iter`` and has no dial.
 #
-# WINDOW SEMANTICS ARE PRESERVED EXACTLY.  The shipped loop runs
-# ``fori_loop(max(0, j - n_reorth), j + 1)`` with an ``i < j`` predicate inside
+# THE TWO ROUTES PROJECT THE IDENTICAL SET.  The sweep runs
+# ``fori_loop(max(0, j - n_reorth), j + 1)`` with an ``i <= j`` predicate inside
 # the body, so the set of basis vectors actually projected out is
-# ``{i : max(0, j - n_reorth) <= i < j}`` — the final trip is a no-op that still
-# fires its collective (200 of the 20 100 are that no-op).  The batched route
-# reproduces that set exactly, via a boolean mask on ``h``.  Nothing else about
-# ``--n-reorth`` changes, and columns past ``j`` need no mask because the
-# pre-allocated basis is exactly zero there.
+# ``{i : max(0, j - n_reorth) <= i <= j}``.  The batched route reproduces that
+# set exactly, via a boolean mask on ``h`` built by the SAME ``_reorth_window``.
+# Columns past ``j`` need no mask because the pre-allocated basis is exactly
+# zero there.
+#
+# That window gained its last slot on 2026-08-08: it used to stop at ``i < j``,
+# which left the current vector ``q_j`` unprojected and put a 4.2e-06 floor
+# under the Ritz-vector orthogonality of every route.  See "THE WINDOW INCLUDES
+# THE CURRENT VECTOR q_j" below ``_announce_reorth`` — including why it costs no
+# collective on either route.  ``--n-reorth k`` therefore projects ``k + 1``
+# slots: the same ``k`` previous vectors it always did, plus ``q_j``.
 #
 # WHY ``mgs`` IS KEPT AT ALL, since ``cgs2`` is better on every axis measured:
 # it is the route every number in this codebase before 2026-08-08 was taken
@@ -578,16 +584,77 @@ def _announce_reorth(name: str, kind: str, max_iter: int,
               flush=True)
 
 
-def _reorth_window(j, n_slots: int, n_reorth: int):
-    """Boolean ``(n_slots,)`` selector for the slots the MGS sweep visits.
+# ---------------------------------------------------------------------------
+# THE WINDOW INCLUDES THE CURRENT VECTOR q_j — and why that is not optional
+# ---------------------------------------------------------------------------
+# The recurrence subtracts only the REAL part of the current projection:
+#
+#     alpha_c = <q_j, z>            # complex
+#     alpha_j = alpha_c.real        # only this drives the recurrence
+#     z      -= alpha_j * q_j       # ... so i*Im(alpha_c) is LEFT IN z
+#
+# ``alpha`` has to stay real — it is the diagonal of a real symmetric
+# tridiagonal ``T`` — and ``Im alpha_c`` is exactly what the alpha-Hermiticity
+# invariant above reports.  But leaving that component in ``z`` means
+# ``<q_j, z> = i*Im(alpha_c)`` exactly, and ``q_{j+1} = z / beta_j``, so the
+# Krylov basis acquires
+#
+#     |<q_j, q_{j+1}>|  ~=  |Im alpha_j| / beta_j
+#
+# on its first superdiagonal.  Until 2026-08-08 the reorth window stopped at
+# ``i < j``, so ``q_j`` was THE ONE DIRECTION NO ROUTE REMOVED — which is why
+# the defect was route-independent, and why swapping MGS for CGS2 changed the
+# Ritz-vector orthogonality on the Si record deck by not one digit
+# (``max|V^H V - I| = 4.2009e-06`` on both).
+#
+# Widening the window to ``i <= j`` closes it.  Measured on that deck (P=4,
+# 200 iterations, full reorth; ``RITZ_ORTHO_PROBE.md``):
+#
+#     max|V^H V - I|   4.2009e-06  ->  ~1e-15    (machine precision)
+#
+# THE COST IS ZERO, on both routes, and this is the load-bearing part:
+#
+#   * ``mgs`` already runs ``fori_loop(start, j + 1)``, so the ``i == j`` trip
+#     ALREADY FIRES — it computes a ``vdot``, hence a 16-byte all-reduce, and
+#     then ``jnp.where`` multiplies the result by zero.  200 of the 20 100
+#     collectives on a 200-iteration solve were that discarded trip.  Flipping
+#     the predicate consumes a value already paid for: no new collective, no
+#     new kernel, no change to ``mgs_trip_count``.
+#   * ``cgs2`` computes ``h = Q^H z`` over ALL slots in one all-reduce and then
+#     masks.  Selecting one more entry of an already-computed ``h`` costs
+#     nothing at all.
+#
+# IN EXACT ARITHMETIC THIS CHANGES NOTHING.  For a Hermitian ``H``,
+# ``Im alpha_c == 0`` and the ``i == j`` projection is a no-op — it is
+# reorthogonalisation in the ordinary sense, removing a component that is zero
+# on paper and nonzero in floating point.  What it costs on a NON-Hermitian
+# operator is proportional to that operator's defect: on the Si record deck it
+# moved the twenty excitons by 4.2e-10 eV while the mini-BZ Coulomb head bug
+# was live, and by 2.1e-14 eV once that bug was fixed.
+#
+# ``_REORTH_INCLUDE_CURRENT`` exists ONLY so the gate that pins this can drive
+# the pre-2026-08-08 window in-process and prove it goes red
+# (``tests/test_lanczos_reorth_routes.py``).  Production never changes it, and
+# both routes read the same flag so they cannot drift apart.
+_REORTH_INCLUDE_CURRENT = True
 
-    ``{i : max(0, j - n_reorth) <= i < j}``.  ``j`` is traced; ``n_slots`` and
-    ``n_reorth`` are static.  ``i < j`` is the shipped body's own predicate and
-    must be kept: slot ``j`` holds the CURRENT basis vector and is non-zero, so
-    unlike the slots past ``j`` it is not masked for free by the zero fill.
+
+def _reorth_window(j, n_slots: int, n_reorth: int):
+    """Boolean ``(n_slots,)`` selector for the slots the reorth sweep visits.
+
+    ``{i : max(0, j - n_reorth) <= i <= j}`` — the ``n_reorth`` previous basis
+    vectors AND the current one, ``q_j``.  ``j`` is traced; ``n_slots`` and
+    ``n_reorth`` are static.  Slots past ``j`` need no mask: the pre-allocated
+    basis is exactly zero there.  Slot ``j`` is the one the pre-2026-08-08
+    window dropped — see the block above for why it must be in.
+
+    This is the SINGLE definition of the window.  ``cgs2`` applies it as a mask
+    on ``h``; ``mgs``'s inner predicate is the scalar form of the same set, and
+    ``test_routes_select_the_same_window`` pins them equal slot by slot.
     """
     idx = jnp.arange(int(n_slots))
-    return jnp.logical_and(idx < j, idx >= j - int(n_reorth))
+    upper = idx <= j if _REORTH_INCLUDE_CURRENT else idx < j
+    return jnp.logical_and(upper, idx >= j - int(n_reorth))
 
 
 def _cgs2_vec(Q, z, sel):
@@ -855,7 +922,10 @@ def lanczos_eig_jit(
     seed : int
         Random seed for initial vector.
     n_reorth : int
-        Window size for partial reorthogonalization.
+        Window size for partial reorthogonalization: the ``n_reorth``
+        PREVIOUS basis vectors.  The current vector ``q_j`` is always
+        projected out as well, at no collective cost — see the route
+        section, "THE WINDOW INCLUDES THE CURRENT VECTOR q_j".
     reorth : {'cgs2', 'mgs'} or None
         Reorthogonalisation route; ``None`` reads ``LORRAX_LANCZOS_REORTH``
         and defaults to ``'cgs2'``.  See the route section above — ``'cgs2'``
@@ -907,7 +977,7 @@ def lanczos_eig_jit(
             z = _cgs2_vec(Q, z, _reorth_window(j, max_iter + 1, n_reorth))
         else:
             def reorth_body(i, z_acc):
-                valid = i < j
+                valid = i <= j if _REORTH_INCLUDE_CURRENT else i < j
                 q_i = Q[:, i]
                 proj = jnp.where(valid, jnp.vdot(q_i, z_acc), 0.0 + 0j)
                 return z_acc - proj * q_i
@@ -1015,7 +1085,10 @@ def block_lanczos_eig_jit(
     seed : int
         Random seed for initial block.
     n_reorth : int
-        Window size (in *blocks*) for partial reorthogonalisation.
+        Window size (in *blocks*) for partial reorthogonalisation: the
+        ``n_reorth`` PREVIOUS basis blocks.  The current block ``Q_j`` is
+        always projected out as well, at no collective cost -- see the route
+        section, "THE WINDOW INCLUDES THE CURRENT VECTOR q_j".
 
     Krylov-exhaustion clamp: the Krylov space cannot exceed the vector
     space, so ``max_iter`` is clamped to ``floor(n / block_size)``.
@@ -1070,7 +1143,7 @@ def block_lanczos_eig_jit(
                 Q_all, Z, _reorth_window(j, int(max_iter) + 1, n_reorth))
         else:
             def reorth_body(i, Z_acc):
-                valid = i < j
+                valid = i <= j if _REORTH_INCLUDE_CURRENT else i < j
                 Q_i = Q_all[i]
                 proj = jnp.where(valid, jnp.conj(Q_i).T @ Z_acc, jnp.zeros((bs, bs), dtype=Z_acc.dtype))
                 return Z_acc - Q_i @ proj
@@ -1180,7 +1253,7 @@ def block_lanczos_eig_jit_converged(
             Z = _cgs2_block(Q_all, Z, _reorth_window(j, M + 1, n_reorth))
         else:
             def reorth_body(i, Z_acc):
-                valid = i < j
+                valid = i <= j if _REORTH_INCLUDE_CURRENT else i < j
                 Q_i = Q_all[i]
                 proj = jnp.where(
                     valid, jnp.conj(Q_i).T @ Z_acc,
