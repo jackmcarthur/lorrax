@@ -164,8 +164,11 @@ def compute_static_w(
     + TRS conj under sym).  Explicit-full-BZ debug bypass
     (``LORRAX_FORCE_FULL_BZ=1``) matches the V_q gate and is ANNOUNCED
     when it flips this decision; IBZ activation otherwise depends only on
-    orbit-closure of the centroid set (checked downstream in
-    ``_resolve_ibz_q_list``).
+    orbit-closure of the centroid set, resolved and ANNOUNCED once per run
+    in ``gw.qgrid_symmetry`` (reached through ``_resolve_ibz_q_list``).
+    Until 2026-08-08 this site passed ``verbose=False`` into that helper
+    and a non-closed centroid set dropped the Dyson solve from
+    ``n_q_ibz`` blocks to ``n_q_full`` in total silence.
 
     Parameters
     ----------
@@ -259,7 +262,7 @@ def compute_static_w(
             sym=sym, centroid_indices=centroid_indices,
             kgrid=tuple(meta.kgrid),
             fft_grid=tuple(meta.fft_grid),
-            verbose=False)
+            context=f"W[{role}] Dyson solve q-grid reduction")
     else:
         use_ibz_w = False
 

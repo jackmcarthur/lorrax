@@ -346,41 +346,41 @@ def fit_zeta_to_h5(
     # while Z_q stayed full-BZ → the ``B.shape[0]=nq_full != Nq=nq_ibz``
     # distributed-potrs crash.)  Transverse channels can't fall back (the
     # V_q orchestrator assumes IBZ ζ̃_T), so they loud-fail with a hint.
+    #
+    # ONE RESOLUTION POINT.  This used to call ``compute_centroid_sym_perm``
+    # for its side effect — build the whole table, throw it away, and read
+    # the answer off whether an exception came back — which is both the
+    # third spelling of the closure question in ``gw/`` and an
+    # exception used as a boolean.  It now asks
+    # ``gw.qgrid_symmetry`` the same question every other site asks, and
+    # branches on the mode.  The charge channel's fallback line is the
+    # SHARED announcement (deduped on the centroid set, so a run that also
+    # falls back in V_q says it once, not twice); the transverse channel
+    # suppresses it because its consequence is a refusal, not a fallback.
     if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
-        try:
-            from ffi import _services
-            _services.ensure_on_path()
-            from symmetry_maps import (
-                compute_centroid_sym_perm as _check_perm,
-            )
-            _cent_idx_for_check = np.asarray(
-                jax.device_get(centroid_indices), dtype=np.int32)
-            _ntran_check = int(np.asarray(sym.sym_matrices).shape[0])
-            # ``sym.sym_matrices`` holds the spatial ops; the fractional
-            # translations live on WFNReader (BGW WFN.h5 layout).
-            _check_perm(
-                _cent_idx_for_check,
-                sym_matrices=np.asarray(sym.sym_matrices[:_ntran_check]),
-                translations=np.asarray(wfn.translations[:_ntran_check]),
-                fft_grid=np.asarray(meta.fft_grid, dtype=np.int32),
-            )
-        except RuntimeError as _exc:
-            _first = (_exc.args[0].splitlines()[0]
-                      if _exc.args else str(_exc))
-            if int(vertex_mu_L) != 0:
+        from .qgrid_symmetry import resolve_qgrid_symmetry_tables
+        _is_transverse = int(vertex_mu_L) != 0
+        # ``sym.sym_matrices`` holds the spatial ops; the fractional
+        # translations live on WFNReader (BGW WFN.h5 layout).
+        _res = resolve_qgrid_symmetry_tables(
+            sym=sym, centroid_indices=centroid_indices,
+            fft_grid=meta.fft_grid, translations=wfn.translations,
+            context=("bispinor transverse ζ̃_T IBZ write"
+                     if _is_transverse else "ζ̃ IBZ write"),
+            announce_fallback=not _is_transverse,
+        )
+        if not _res.use_ibz:
+            if _is_transverse:
                 raise RuntimeError(
                     f"Bispinor transverse zeta_T (mu_L={int(vertex_mu_L)}) "
                     f"IBZ-write requested, but the transverse centroid set "
                     f"fails the orbit-closure check under the WFN sym group: "
-                    f"{_first}.  Regenerate the transverse centroid file with "
-                    f"``centroid.kmeans_cli --density-mode current`` "
-                    f"(orbit-aware by default for ntran>1) so the set is "
-                    f"closed under the spatial sym group, or bypass the "
-                    f"bispinor IBZ cascade with ``LORRAX_FORCE_FULL_BZ=1``."
-                ) from _exc
-            if jax.process_index() == 0:
-                print(f"  q-IBZ reduction: centroid orbit closure failed "
-                      f"— falling back to full-BZ on disk.  Reason: {_first}")
+                    f"{_res.reason}.  Regenerate the transverse centroid "
+                    f"file with ``centroid.kmeans_cli --density-mode "
+                    f"current`` (orbit-aware by default for ntran>1) so the "
+                    f"set is closed under the spatial sym group, or bypass "
+                    f"the bispinor IBZ cascade with "
+                    f"``LORRAX_FORCE_FULL_BZ=1``.")
             write_ibz_only = False
 
     with timing.section("zeta_fit.CCT"):

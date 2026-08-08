@@ -225,8 +225,15 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # centroid sets ⇒ two orbit-closure checks (CC ↔ charge, TT ↔
     # transverse); they may diverge in principle but in practice are
     # generated together by the user's ``kmeans_cli --orbit-aware`` run.
-    # If either set's closure check fails, fall back to full-BZ for the
-    # corresponding tiles and log loudly.  See derivation §A5.
+    # If either set's closure check fails, the corresponding tiles fall
+    # back to full-BZ.  See derivation §A5.
+    #
+    # THE FALLBACK IS ANNOUNCED IN ONE PLACE, and it is not here.  This
+    # block used to print its own second wording of the same fact, behind
+    # ``verbose`` — so a bispinor production run with verbose off degraded
+    # both channels silently.  ``gw.qgrid_symmetry`` now speaks once per
+    # centroid SET, which is what makes the charge and transverse cases
+    # two distinct lines instead of one line printed twice.
     # ------------------------------------------------------------------
     from .v_q_g_flat import _resolve_ibz_q_list
 
@@ -235,13 +242,9 @@ def compute_V_q_bispinor_g_flat_to_h5(
             return None, False
         tables = _resolve_ibz_q_list(
             sym=sym, centroid_indices=np.asarray(centroid_idx, dtype=np.int32),
-            kgrid=kgrid, fft_grid=fft_grid, verbose=False)
+            kgrid=kgrid, fft_grid=fft_grid,
+            context=f"bispinor g-flat, {label} centroids")
         (_, _, _, _, _sym_perm, _L_table, _ok) = tables
-        if not _ok and verbose and jax.process_index() == 0:
-            print_fn(f"  [bispinor g-flat] {label}-centroid orbit closure "
-                     f"failed — falling back to full-BZ for {label} tiles.  "
-                     f"Regenerate centroids with ``kmeans_cli --orbit-aware`` "
-                     f"to enable the IBZ cascade.")
         return tables, _ok
 
     _ibz_C, _use_ibz_C = _ibz_tables_for(centroid_C_idx, 'charge')

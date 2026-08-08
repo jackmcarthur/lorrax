@@ -80,6 +80,15 @@ The surface
     service where ``tnp = 2π·τ`` is divided**, and it has no positional
     slot for the translations precisely so that no caller can pass the
     wrong convention silently.
+``resolve_qgrid_symmetry`` / ``QgridSymmetryResolution``
+    The DECISION, taken once: verdict → mode (``"ibz"`` | ``"full_bz"``)
+    → tables → reason, in one object.  Consumers of the q-axis unfold
+    used to each wrap the table builder in their own
+    ``except RuntimeError`` and silently drop the whole run to the full
+    BZ; they now read ``use_ibz`` and announce the fallback exactly once.
+    The resolution COMPOSES the announcement and does not print it —
+    rank and once-per-run memory belong to the process running the deck,
+    not to a table library.
 ``DensitySymmetryReport`` / ``check_density_symmetries`` /
 ``cached_density_symmetry_check`` / ``trs_check_mode``
     The measurement, its cached front door, and the ``LORRAX_TRS_CHECK``
@@ -135,13 +144,16 @@ from symmetry_maps.qirr_store import (
 )
 from symmetry_maps.orbit_syms import (
     CLOSURE_TOL_DEFAULT,
+    FULL_BZ_CONSEQUENCE,
     CentroidClosureVerdict,
+    QgridSymmetryResolution,
     build_real_space_syms,
     canonicalize_orbit,
     compute_centroid_sym_perm,
     compute_rgrid_sym_perm,
     orbit_images,
     recover_symmorphic_density_point_group,
+    resolve_qgrid_symmetry,
     unfold_orbit_unique_with_id,
     verify_centroid_orbit_closure,
 )
@@ -162,6 +174,9 @@ __all__ = [
     # orbit closure: the measurement, its verdict, its tolerance
     "verify_centroid_orbit_closure", "CentroidClosureVerdict",
     "CLOSURE_TOL_DEFAULT",
+    # orbit closure: the RESOLUTION the consumers branch on
+    "resolve_qgrid_symmetry", "QgridSymmetryResolution",
+    "FULL_BZ_CONSEQUENCE",
     # q_irr restart tensors: the wedge on disk, the unfold on read
     "write_qirr_tensor", "read_tensor", "read_tables",
     "allocate_qirr_placeholder", "QirrTables", "QirrHeader",

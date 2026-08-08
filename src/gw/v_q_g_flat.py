@@ -156,7 +156,8 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
 # tile loop in gw.v_q_bispinor)
 # ---------------------------------------------------------------------------
 
-def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
+def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
+                        context="V_q / W q-grid reduction"):
     """Pick IBZ q's via centroid orbit closure, fall back to full BZ.
 
     Returns ``(q_irr_kgrid_int, q_irr_frac, q_full_to_irr_idx,
@@ -167,6 +168,18 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
     ``L_table`` is the per-(sym, μ) integer real-space lattice wrap
     captured by ``compute_centroid_sym_perm``; ``unfold_v_q`` uses it
     to build the umklapp phase ``exp(2π i q · (L_μ − L_ν))``.
+
+    THE CLOSURE DECISION IS NOT TAKEN HERE.  It is taken once, in
+    ``symmetry_maps.resolve_qgrid_symmetry``, and announced once by
+    ``gw.qgrid_symmetry.resolve_qgrid_symmetry_tables``; this function
+    consumes the resolution and shapes it into the seven-tuple its three
+    callers already read.
+
+    THE ``verbose`` ARGUMENT IS GONE.  It gated exactly one thing — the
+    line that said the fallback had happened — and ``gw/screening.py``
+    passed ``verbose=False``, which is why the W Dyson solve could drop
+    from ``n_q_ibz`` blocks to ``n_q_full`` without a word.  A knob whose
+    only effect is to hide a degradation is not a verbosity knob.
     """
     nkx, nky, nkz = kgrid
     use_ibz = False
@@ -184,34 +197,20 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
     # ``bool(int(os.environ.get(...)))`` took decimal digits only, so
     # ``=true``/``=on``/``=yes`` raised a bare ``invalid literal for int()``
     # from deep inside the V_q cascade rather than doing what they say.
+    #
+    # This bypass is NOT the closure fallback and is not announced as one:
+    # it is a deliberate operator choice, announced at its own decision
+    # site in ``gw/screening.py``.  Conflating "you asked for the full BZ"
+    # with "your centroids cannot give you the IBZ" would put the loud
+    # closure line on a run that has no closure problem.
     _force_full_bz = env_bool('LORRAX_FORCE_FULL_BZ', False)
     if sym is not None and centroid_indices is not None and not _force_full_bz:
-        from ffi import _services
-        _services.ensure_on_path()
-        from symmetry_maps import compute_centroid_sym_perm
-        n_tran = int(np.asarray(sym.sym_matrices).shape[0])
-        cent_idx = np.asarray(centroid_indices, dtype=np.int32)
-        try:
-            # ``extend_trs=True`` so ``sym_perm`` has shape
-            # ``(2·n_tran, n_rmu)`` — the second half duplicates the
-            # spatial rows and is indexed by the TRS-augmented sym
-            # values returned by ``sym.irr_idx_q/sym_idx_q``.  See
-            # ``compute_centroid_sym_perm`` docstring and the audit
-            # report (``reports/trs_sym_audit_2026-05-14``).
-            sym_perm, L_table = compute_centroid_sym_perm(
-                cent_idx,
-                sym_matrices=np.asarray(sym.sym_matrices[:n_tran]),
-                translations=np.asarray(sym.translations[:n_tran]),
-                fft_grid=np.asarray(fft_grid, dtype=np.int32),
-                extend_trs=True,
-            )
-        except RuntimeError as exc:
-            if verbose and jax.process_index() == 0:
-                print(f"  V_q g-flat: centroid orbit closure failed — "
-                      f"full-BZ iteration.  Reason: "
-                      f"{exc.args[0].splitlines()[0] if exc.args else exc}")
-            sym_perm = None
-            L_table = None
+        from .qgrid_symmetry import resolve_qgrid_symmetry_tables
+        res = resolve_qgrid_symmetry_tables(
+            sym=sym, centroid_indices=centroid_indices, fft_grid=fft_grid,
+            context=context)
+        if res.use_ibz:
+            sym_perm, L_table = res.tables()
         if sym_perm is not None:
             # Bake the μ pad into the tables ONCE at construction:
             # identity tail on the permutation (pad centroids map to
@@ -339,7 +338,8 @@ def _compute_V_q_g_flat_one_tile(
      full_to_irr_idx, full_to_irr_sym,
      sym_perm, L_table, use_ibz) = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_indices,
-        kgrid=kgrid, fft_grid=fft_grid, verbose=verbose)
+        kgrid=kgrid, fft_grid=fft_grid,
+        context=f"V_q g-flat tile [{timing_label}]")
     n_q_ibz = int(q_irr_frac.shape[0])
 
     gvec_components = np.asarray(

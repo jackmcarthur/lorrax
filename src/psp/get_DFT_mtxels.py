@@ -329,6 +329,20 @@ def _rho_sym_perm(wfn, fft_grid: tuple[int, int, int]):
     the operation is not representable as a grid permutation at all.  The
     last case is reported, never rounded away: averaging over a subset of
     the group is not a projector, so a partial table is refused.
+
+    NOT CONSOLIDATED ONTO THE CLOSURE VERDICT, deliberately (fan-out audit
+    2026-08-08).  ``gw.qgrid_symmetry`` resolves whether the CENTROID SET
+    is closed under the group, and hands back the ``(α, L)`` tables that
+    permute the μ index of an ISDF operator.  This site asks a different
+    question of a different table: ``compute_rgrid_sym_perm`` permutes the
+    FULL FFT grid, which is closed under the group by construction, so the
+    only way it fails is a ``τ`` that is not commensurate with the grid.
+    ``CentroidClosureVerdict`` has nothing to say about that — routing this
+    through the q-grid resolution would answer a question about centroids
+    to justify a decision about ρ, and would announce "solving on the full
+    BZ" for a fallback that is about the Hartree potential and not about q
+    at all.  The two share a convention, not a decision.  The warning below
+    IS this site's announcement; it names the same consequence shape.
     """
     ntran = int(getattr(wfn, "ntran", 0) or 0)
     mats = getattr(wfn, "sym_matrices", None)

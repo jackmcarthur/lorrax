@@ -947,6 +947,275 @@ def verify_centroid_orbit_closure(
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# The ONE resolution point — verdict, mode, tables, reason, in one object
+# ─────────────────────────────────────────────────────────────────────────
+
+#: The consequence sentence, written once.  Every announcement of a
+#: fallback carries this exact clause so that a log grep for it finds
+#: every degraded run, whatever site resolved it.
+FULL_BZ_CONSEQUENCE = (
+    "q-grid symmetry reduction disabled; solving on the full BZ — "
+    "restart tensors stay full-BZ; see verify_centroid_orbit_closure")
+
+
+@dataclasses.dataclass(frozen=True)
+class QgridSymmetryResolution:
+    """What the q-grid reduction RESOLVED to, and why — one object.
+
+    Before this existed, every consumer of the centroid permutation
+    tables called :func:`compute_centroid_sym_perm` inside its own
+    ``try``/``except RuntimeError`` and, on the refusal, set its own
+    private flag back to full-BZ.  Four sites, four spellings, and the
+    only trace of the decision on a production run was a line one of them
+    printed when ``verbose`` happened to be true — which at the W solve it
+    is not.  That is the silent degradation the owner named: the run is
+    ~8× slower and its restart tensors are 8× larger than the design
+    intends, and nothing says so.
+
+    This record replaces the exception-as-control-flow with an answer.
+    :func:`resolve_qgrid_symmetry` takes the closure verdict ONCE, decides
+    the mode from it, builds the tables when the mode allows them, and
+    hands back everything a caller could want to know — including the
+    sentence it should print.  Callers branch on :attr:`use_ibz`; nobody
+    catches anything.
+
+    Attributes
+    ----------
+    mode
+        ``"ibz"`` or ``"full_bz"``.  The resolved mode, not a request.
+    verdict
+        The :class:`CentroidClosureVerdict` the decision was made on —
+        always present, including on the ``"ibz"`` path, because the
+        numbers are what a stamp or a report wants and recomputing them
+        is how two answers to one question get born.
+    sym_perm, L_table
+        The tables, or ``None`` when ``mode == "full_bz"``.  Shapes are
+        exactly what :func:`compute_centroid_sym_perm` returns for the
+        ``extend_trs`` that was asked for.
+    reason
+        Empty on the ``"ibz"`` path.  On ``"full_bz"``, one line naming
+        WHY — either the closure verdict's own summary or the table
+        builder's refusal (see :func:`resolve_qgrid_symmetry` for the
+        second, rarer arm).
+    n_sym_spatial
+        The spatial op count the tables were built over, so a consumer
+        that must interpret a TRS-augmented row index does not have to
+        re-derive it from a shape.
+    context
+        Free text naming the call site, e.g. ``"V_q / W q-grid
+        reduction"``.  It appears in the announcement, because "the
+        centroid set is not closed" is a different operational fact
+        depending on which centroid set is meant.
+    """
+
+    mode: str
+    verdict: CentroidClosureVerdict
+    sym_perm: np.ndarray | None
+    L_table: np.ndarray | None
+    reason: str
+    n_sym_spatial: int
+    context: str = ""
+
+    @property
+    def use_ibz(self) -> bool:
+        """The one predicate callers branch on."""
+        return self.mode == "ibz"
+
+    @property
+    def announce_key(self) -> tuple:
+        """Dedup key for a once-per-run announcement.
+
+        Keyed on the centroid set, not on the call site: the V_q pass,
+        the W Dyson solve and every SC iteration resolve the SAME set and
+        must speak once between them.  A bispinor deck carries two
+        genuinely different sets (charge and transverse) whose closure
+        can differ, and those are two different facts, so they get two
+        keys and two lines.
+        """
+        return ("qgrid_symmetry_fallback", self.verdict.centroid_hash)
+
+    def tables(self) -> tuple[np.ndarray, np.ndarray]:
+        """``(sym_perm, L_table)``, or a refusal naming the mode.
+
+        The accessor exists so that a caller which has already branched
+        wrong gets an error that says which decision it ignored, instead
+        of a ``TypeError`` on ``None`` several frames downstream.
+        """
+        if not self.use_ibz:
+            raise RuntimeError(
+                f"QgridSymmetryResolution.tables(): mode is "
+                f"{self.mode!r}, so there are no unfold tables — the "
+                f"centroid set does not admit them.  {self.reason}")
+        return self.sym_perm, self.L_table
+
+    def announcement(self) -> str | None:
+        """The loud line, or ``None`` when nothing degraded.
+
+        Returns the text; it does NOT print.  The service has no rank and
+        no once-per-run memory — both belong to the process that runs the
+        deck — so the announcement is composed here (where the numbers
+        are) and emitted there (where rank 0 is).  The monorepo side of
+        that seam is ``gw.qgrid_symmetry.resolve_qgrid_symmetry_tables``,
+        which hands this string to ``ffi.gate.announce_once`` under
+        :attr:`announce_key`.
+        """
+        if self.use_ibz:
+            return None
+        where = self.context or "q-grid symmetry reduction"
+        return (
+            f"\n  *** LORRAX q-grid symmetry: FALLBACK at {where} — the "
+            f"centroid set is not orbit-closed.\n"
+            f"      why:         {self.reason}\n"
+            f"      consequence: {FULL_BZ_CONSEQUENCE}.\n"
+            f"      fix:         regenerate the centroid set with the "
+            f"orbit-aware k-means mode (centroid.kmeans_cli); the "
+            f"per-op\n"
+            f"                   residuals are on the verdict this "
+            f"line was taken from. ***\n")
+
+    def __str__(self) -> str:                      # pragma: no cover - repr
+        tail = "" if self.use_ibz else f" — {self.reason}"
+        return (f"q-grid symmetry: mode={self.mode} "
+                f"(n_sym_spatial={self.n_sym_spatial}){tail}")
+
+
+def resolve_qgrid_symmetry(
+    r_mu_fft_idx,
+    sym_matrices,
+    *,
+    tnp=None,
+    tau=None,
+    fft_grid,
+    extend_trs: bool = True,
+    tol: float = CLOSURE_TOL_DEFAULT,
+    context: str = "",
+) -> QgridSymmetryResolution:
+    """Resolve the q-grid reduction ONCE: verdict → mode → tables.
+
+    THE DEFECT THIS CLOSES.  ``compute_centroid_sym_perm`` refuses on a
+    non-closed centroid set, correctly — but a refusal is only as loud as
+    the ``except`` that receives it, and in this tree the receivers each
+    degraded the whole run to the full BZ and said nothing a production
+    log would show.  The q_irr work makes that fallback expensive
+    (restart tensors stay 8× larger) and the Σ star spread makes it
+    inaccurate (16.9 meV against 0.7 on a closed set), so it stops being
+    a quiet default and becomes an announced, single-sited decision.
+
+    Callers do not catch anything.  They call this, read
+    :attr:`~QgridSymmetryResolution.use_ibz`, and — if they are the
+    process that owns rank 0 — emit
+    :meth:`~QgridSymmetryResolution.announcement` once.
+
+    TWO WAYS TO LAND ON ``full_bz``, and they are different diagnoses:
+
+    1. The verdict says the set is not closed.  This is the production
+       case on the 960- and 480-centroid decks (47 of 48 ops violating),
+       and the reason carries the worst op and its residual.
+    2. The verdict says CLOSED and ``compute_centroid_sym_perm`` still
+       refuses.  The closure measurement scores the minimum-image
+       distance in fractional coordinates; the table builder additionally
+       needs the image to land on THIS FFT grid and needs each row to be
+       a bijection.  A τ that is not commensurate with the grid, or two
+       centroids that collide under rounding, fail the second without
+       failing the first.  That refusal is caught HERE — the one place in
+       the tree that catches it — and reported as its own reason, because
+       "your centroids are not closed" would be a wrong diagnosis for it.
+
+    Anything else raises: a bad shape or a mis-keyed translation is a
+    programming error, and resolving it to a slower-but-running mode is
+    how a convention bug survives to production.
+
+    Parameters
+    ----------
+    r_mu_fft_idx
+        ``(n_rmu, 3)`` int — centroid positions as integer FFT-grid
+        indices, exactly what :func:`compute_centroid_sym_perm` takes.
+    sym_matrices
+        ``(n_sym, 3, 3)`` int — BGW ``mtrx``, spatial ops only.
+    tnp, tau
+        The translations, under :func:`verify_centroid_orbit_closure`'s
+        exclusive-keyword contract: ``tnp`` is BGW's stored ``2π·τ``,
+        ``tau`` is the fractional translation.  Exactly one, named.  This
+        function does no dividing of its own — it forwards, so the 2π
+        still lives in exactly one place.
+    fft_grid
+        ``(3,)`` int — the grid ``r_mu_fft_idx`` indexes.  Required: the
+        centroids are integers against it and their fractional
+        coordinates cannot be recovered without it.
+    extend_trs
+        Forwarded to :func:`compute_centroid_sym_perm`.  Default ``True``
+        — every q-axis consumer in this tree indexes the tables with the
+        TRS-augmented ``sym_idx_q``, and the one historical bug from
+        getting this wrong was a silent clipped gather.
+    tol
+        Closure tolerance; see :data:`CLOSURE_TOL_DEFAULT`.
+    context
+        Names the call site for the announcement.
+
+    Returns
+    -------
+    QgridSymmetryResolution
+    """
+    idx = np.asarray(r_mu_fft_idx)
+    if idx.ndim != 2 or idx.shape[1] != 3:
+        raise ValueError(
+            f"resolve_qgrid_symmetry: r_mu_fft_idx must be (n_rmu, 3); "
+            f"got {idx.shape}")
+    grid = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+    if np.any(grid <= 0):
+        raise ValueError(
+            f"resolve_qgrid_symmetry: fft_grid must be positive; got "
+            f"{grid.tolist()}")
+
+    S = np.asarray(sym_matrices)
+    n_sym_spatial = int(np.asarray(S).shape[0])
+
+    # The verdict, taken in PURE FRACTIONAL coordinates.  ``fft_grid`` is
+    # deliberately not forwarded: its only effects there are the
+    # integer-index hash and a commensurability REFUSAL, and a refusal at
+    # this point would convert a deck that has always degraded quietly
+    # into a deck that raises.  The residual metric is identical with and
+    # without it (the function says so), and the grid question is asked —
+    # and answered with a message about the grid — by the table builder
+    # below, which is the code that actually needs commensurability.
+    cent_frac = idx.astype(np.float64) / grid[None, :].astype(np.float64)
+    verdict = verify_centroid_orbit_closure(
+        cent_frac, S, tnp=tnp, tau=tau, tol=tol)
+
+    if not verdict.closed:
+        head = verdict.describe().splitlines()[0]
+        return QgridSymmetryResolution(
+            mode="full_bz", verdict=verdict, sym_perm=None, L_table=None,
+            reason=head, n_sym_spatial=n_sym_spatial, context=context)
+
+    # Closed.  Build the tables.  ``validate=True`` is not redundant with
+    # the verdict — see arm 2 in the docstring.
+    try:
+        sym_perm, L_table = compute_centroid_sym_perm(
+            idx.astype(np.int32),
+            sym_matrices=S,
+            translations=(np.asarray(tnp) if tnp is not None
+                          else np.asarray(tau) * (2.0 * np.pi)),
+            fft_grid=grid.astype(np.int32),
+            validate=True,
+            extend_trs=extend_trs,
+        )
+    except RuntimeError as exc:
+        first = (str(exc.args[0]).splitlines()[0] if exc.args else str(exc))
+        return QgridSymmetryResolution(
+            mode="full_bz", verdict=verdict, sym_perm=None, L_table=None,
+            reason=(f"closure measured CLOSED (worst "
+                    f"{verdict.worst_residual:.3e} on op "
+                    f"{verdict.worst_op}) but the permutation table "
+                    f"refused on this FFT grid: {first}"),
+            n_sym_spatial=n_sym_spatial, context=context)
+
+    return QgridSymmetryResolution(
+        mode="ibz", verdict=verdict, sym_perm=sym_perm, L_table=L_table,
+        reason="", n_sym_spatial=n_sym_spatial, context=context)
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Full FFT-grid orbit permutation — used by ZetaLoader's q='full_bz' unfold.
 # ─────────────────────────────────────────────────────────────────────────
 
