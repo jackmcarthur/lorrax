@@ -105,27 +105,60 @@ def _closed_but_unreduced():
 # 1. The key
 # ---------------------------------------------------------------------------
 
-def test_the_key_defaults_to_auto():
-    """AUTO IS THE DESIGNED DEFAULT AND IT MOVES BYTES.
+def test_the_key_defaults_to_full():
+    """FULL IS THE DESIGNED DEFAULT AND THE WEDGE IS OPT-IN PER DECK.
 
-    Named in the design doc (phase-3 deliverable 1: "Default auto") and
-    owner-visible, because on a deck whose centroid set is orbit-closed —
-    ``si_bse_debug`` since fb046e0c — this default changes the on-disk
-    restart FORMAT.  A cell here is what makes a silent flip of that default
-    impossible.
+    ``DESIGN_symmetry_restart_followup.md`` rules it in as many words —
+    "the deck key keeps full-BZ storage as the default until the owner rules
+    on centroid regeneration, and the q_irr path is opt-in per deck" — and
+    ``SPEC_qirr_restart_tensors.md`` agrees ("defaulting to whatever
+    preserves today's" bytes).
+
+    THIS CELL USED TO ASSERT ``auto``, citing a design-doc line that does not
+    exist in the design doc.  The 2026-08-08 landing census priced the
+    difference: with ``auto`` in ``_DEFAULTS``, both in-tree decks whose
+    centroid sets are orbit-closed silently began writing the q wedge, and
+    nine cells went red across the GW and BSE restart paths because neither
+    reader unfolds.  A default that changes the on-disk restart FORMAT is
+    exactly the kind that has to be asked for, which is what this cell now
+    holds.
     """
     from gw.gw_config import _DEFAULTS
 
-    assert _DEFAULTS["restart_q_storage"] == "auto"
+    assert _DEFAULTS["restart_q_storage"] == "full"
 
 
-def test_a_deck_that_never_heard_of_the_key_gets_auto(tmp_path):
-    """Every archived deck keeps parsing; the key lives in ``_DEFAULTS``."""
+def test_a_deck_that_never_heard_of_the_key_gets_full(tmp_path):
+    """Every archived deck keeps parsing AND keeps its bytes.
+
+    The second half is the point: a deck written before this key existed
+    must not change on-disk format by standing still.
+    """
     from gw.gw_config import read_lorrax_input
 
     deck = tmp_path / "cohsex.in"
     deck.write_text("[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n")
-    assert read_lorrax_input(str(deck))["restart_q_storage"] == "auto"
+    assert read_lorrax_input(str(deck))["restart_q_storage"] == "full"
+
+
+def test_the_hand_built_params_fallback_agrees_with_the_registered_default(
+        tmp_path, monkeypatch):
+    """The ``or`` in the parse site is a SECOND spelling of the default.
+
+    ``LorraxConfig`` resolves ``_g("restart_q_storage") or <fallback>``, and
+    that fallback is reached by any caller that assembles the params dict
+    itself and omits the key.  Two spellings of one default is how they
+    drift, and a drift here is a caller silently storing a different q-set,
+    so the two are asserted equal rather than eyeballed.
+    """
+    monkeypatch.chdir(tmp_path)
+    from gw.gw_config import LorraxConfig, _DEFAULTS
+
+    deck = tmp_path / "cohsex.in"
+    deck.write_text("[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n")
+    cfg = LorraxConfig.from_input_file(str(deck),
+                                       print_fn=lambda *a, **k: None)
+    assert cfg.restart_q_storage_raw == _DEFAULTS["restart_q_storage"]
 
 
 @pytest.mark.parametrize("spelling", ["ibz", "IBZ", "  Ibz  ", "FULL",

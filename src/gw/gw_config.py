@@ -634,26 +634,37 @@ _DEFAULTS = {
     # the states those guards distinguish.
     "write_restart_tensors": True,
     # ``restart_q_storage``: on WHICH q-set are V_qmunu / W0_qmunu stored?
-    # DEFAULT auto — and auto is a default that MOVES BYTES, which is why it
-    # is spelled out here rather than left to the module docstring.
+    # DEFAULT full — the q_irr wedge is OPT-IN PER DECK, which is what
+    # DESIGN_symmetry_restart_followup.md ruled and what this key was built
+    # to obey: "the deck key keeps full-BZ storage as the default until the
+    # owner rules on centroid regeneration, and the q_irr path is opt-in per
+    # deck."  It shipped briefly defaulting to ``auto`` and the 2026-08-08
+    # landing census measured what that cost — nine red cells across the GW
+    # and BSE restart paths on the two decks whose centroid sets are already
+    # orbit-closed.  A default that moves bytes is a default that has to be
+    # asked for.
+    #   full — the DEFAULT.  Preserve today's bytes exactly, unconditionally.
+    #          Does not ask the closure question, so it is also the control
+    #          arm of any A/B.
     #   auto — store the pre-unfold IBZ wedge when the deck's centroid set is
     #          orbit-closed AND this run's q path actually reduced; the full
     #          BZ otherwise.  On a non-closed set (today's Si production
     #          960-centroid deck: 47 of 48 ops violating) this is byte-for-byte
-    #          today's file.  On a CLOSED set it is ~8x smaller, and the load
-    #          path unfolds it back through the same
-    #          ``symmetry_maps.unfold_isdf_operator`` the run itself used —
-    #          which is the continuous exercise of the fold/unfold machinery
-    #          the owner asked for.
-    #   full — preserve today's bytes exactly, unconditionally.  Does not ask
-    #          the closure question, so it is the control arm of any A/B.
+    #          today's file.  On a CLOSED set it is ~8x smaller.
     #   ibz  — REFUSE on a set that is not storable, naming which of the two
     #          conditions failed.  For a deck that believes it is closed and
     #          wants to be told the day it stops being.
+    # BEFORE YOU SET auto OR ibz ON A CLOSED-SET DECK: the readers do not
+    # unfold yet.  ``bse_io._MunuSlabPlan`` refuses a wedge outright (at every
+    # process count, not only P>1), and the GW restart reader refuses it too
+    # since the same landing — see ``file_io.tagged_arrays``.  The wedge is
+    # therefore usable today by runs that DISCARD the restart artifact or read
+    # it back through the serial h5py path, and teaching both readers to
+    # gather-then-unfold is registered design work that retires this caveat.
     # See gw/restart_q_storage.py for the resolution and the seam, and
     # DESIGN_symmetry_restart_followup.md for the pre-unfold-persistence
     # decision this key selects.
-    "restart_q_storage": "auto",
+    "restart_q_storage": "full",
     # ``compute_mode`` is the single axis describing the self-energy ansatz.
     # ``"auto"`` infers from the legacy ``do_screened`` / ``use_ppm_sigma`` /
     # ``ppm_model`` flags so existing input files keep working unchanged.
@@ -1767,10 +1778,13 @@ class LorraxConfig:
     #: behaviour; see ``_DEFAULTS["write_restart_tensors"]`` for why this is
     #: a COMPLEMENT to q_irr storage and not an alternative to it.
     write_restart_tensors: bool
-    #: RAW ``restart_q_storage`` request — "auto" | "full" | "ibz".  Validated
-    #: at parse time, resolved LATE (``gw.restart_q_storage``): ``auto``'s
-    #: answer depends on the run's centroid set, which does not exist yet
-    #: here.  Same ``_raw`` convention as ``compute_mode_raw``.
+    #: RAW ``restart_q_storage`` request — "full" (the default) | "auto" |
+    #: "ibz".  Validated at parse time, resolved LATE
+    #: (``gw.restart_q_storage``): ``auto``'s answer depends on the run's
+    #: centroid set, which does not exist yet here.  ``full`` needs no
+    #: resolution but still goes through the same seam, so there is one
+    #: resolution point rather than a fast path beside it.  Same ``_raw``
+    #: convention as ``compute_mode_raw``.
     restart_q_storage_raw: str
     compute_mode_raw: str         # "auto" | one of ComputeMode.value strings
     qp_solver_raw: str            # "auto" | one of QPSolver.value strings
@@ -2286,8 +2300,12 @@ class LorraxConfig:
         # one cannot, and the ``_raw`` suffix says which kind it is — the
         # same convention ``compute_mode_raw`` / ``qp_solver_raw`` use.)
         from gw.restart_q_storage import RESTART_Q_STORAGE
+        # The ``or`` fallback must agree with ``_DEFAULTS`` — it is reached
+        # only by a caller that built the params dict by hand and left the
+        # key out, and a fallback that disagreed with the registered default
+        # would make THAT caller silently take a different storage decision.
         _restart_q_storage = str(
-            _g("restart_q_storage") or "auto").strip().lower()
+            _g("restart_q_storage") or "full").strip().lower()
         if _restart_q_storage not in RESTART_Q_STORAGE:
             raise ValueError(
                 f"restart_q_storage={_restart_q_storage!r} is not one of "
