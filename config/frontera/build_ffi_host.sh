@@ -291,6 +291,39 @@ if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
              exit 1; }
 fi
 
+# ===========================================================================
+# THE BUILD CONTRACT.  Unconditional, and a failure here fails the build.
+#
+# scripts/verify_ffi_build.sh is the machine-agnostic form of the seven gates
+# that used to exist only in config/perlmutter/build_ffi_host.sh.  Frontera had
+# NONE of them: no one-MPI check, no one-BLAS-flavour check, no fftw-in-
+# DT_NEEDED check, no HDF5 pairing check, no ABI stamp.  It had the CUDA-free
+# check and the exported-handler list above, and those are two of nine.
+#
+# THE HANDLER LIST ABOVE IS NOW REDUNDANT and is left in place only because
+# this branch could not run a Frontera build to prove its replacement green
+# (TACC login needs interactive MFA).  GATE 0 checks the same property by
+# pattern, and services/distrib_la/tests/test_so_acceptance.py checks the exact
+# names out of the loader's own table — which is better, because that list is a
+# THIRD copy of a table that already exists twice.  Delete `WANT` and its loop
+# the first time somebody can run this script end to end.
+#
+# The declaration follows this script's own documented default: phdf5 only,
+# unless a gpu_backend=none SLATE was named, in which case the full set.
+# ===========================================================================
+if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
+    _expect_backends="scalapack,gemm,slate,phdf5,fft"
+else
+    _expect_backends="phdf5"
+fi
+echo "[build_host] --- build contract (scripts/verify_ffi_build.sh) ---"
+LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-$_expect_backends}" \
+    bash "$LORRAX_ROOT/scripts/verify_ffi_build.sh" --leg host "$SO" || {
+        echo "[build_host] FAILED: the library does not meet the build" >&2
+        echo "[build_host] contract.  It must not be deployed or pinned." >&2
+        exit 1
+    }
+
 # ---------------------------------------------------------------------------
 # Stamp the build's identity NEXT TO the .so.
 #

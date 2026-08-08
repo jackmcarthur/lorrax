@@ -51,7 +51,100 @@ from lxkit.probe import (AVAILABLE, LibraryNotBuilt, LibraryUnusable,
                          unknown_target)
 
 __all__ = ["get_lib", "has_target", "probe_target", "loaded_lib_path",
-           "loaded_platforms_in_order", "LibraryNotBuilt", "LibraryUnusable"]
+           "loaded_platforms_in_order", "LibraryNotBuilt", "LibraryUnusable",
+           "LORRAX_FFI_ABI_VERSION", "AbiMismatch"]
+
+#: The handler-signature ABI this package speaks.
+#:
+#: A MIRROR of ``src/ffi/cpp/common/lorrax_ffi_abi.h`` in the LORRAX repo,
+#: which is the definition and carries the bump rule.  This package is
+#: independently installable and must not reach into that tree at import time,
+#: so the number is copied — and ``tests/test_so_acceptance.py`` parses the
+#: header whenever the monorepo is reachable and FAILS if the two disagree.
+#: That is the whole mechanism keeping a copy honest: a copy nothing compares
+#: is how the ten dispatch sites drifted.
+LORRAX_FFI_ABI_VERSION = 2
+
+#: platform -> the C entry point reporting the library's ABI.  Per leg,
+#: because both libraries are dlopened RTLD_GLOBAL and already share sixteen
+#: symbol names; a shared spelling would let the first-loaded library answer
+#: for the second, which is the exact failure being detected.
+_ABI_SYMBOLS = {"cpu": "lorrax_ffi_host_abi_version",
+                "CUDA": "lorrax_ffi_cuda_abi_version"}
+
+_ABI_UNSTAMPED_ANNOUNCED: set = set()
+
+
+class AbiMismatch(LibraryUnusable):
+    """The library loaded fine and speaks a DIFFERENT handler ABI.
+
+    A subclass of :class:`~lxkit.probe.LibraryUnusable` because it is the same
+    kind of fact — present, and not usable — so every existing handler stays
+    correct; a distinct class because the fix is different (pair it, do not
+    debug it).
+    """
+
+
+def _check_abi(lib: ctypes.CDLL, platform: str, path: str) -> None:
+    """Refuse a library whose handler signatures are not this package's.
+
+    Called IMMEDIATELY after ``CDLL`` and before any declaration or target
+    registration.  The ordering is the requirement: a mispaired library that
+    has already had its argtypes declared behaves normally until the first
+    call that crosses a changed signature.
+
+    Stamped-and-different REFUSES.  Unstamped ANNOUNCES once and proceeds — a
+    pre-2026-08-08 library is not known to be wrong, and refusing every one of
+    them would break the worktrees that pin them today to fix nothing.
+    ``LORRAX_FFI_ABI_STRICT=1`` closes the ratchet.
+
+    :func:`probe_target` still never raises: it converts this into a
+    ``ProbeResult(False, <this whole message>)``, so an auto-policy sees the
+    backend as unavailable and any refusal printed to a human quotes the text
+    below verbatim.
+    """
+    sym = _ABI_SYMBOLS[platform]
+    fn = getattr(lib, sym, None)
+    if fn is None:
+        if os.environ.get("LORRAX_FFI_ABI_STRICT", "") == "1":
+            raise AbiMismatch(
+                f"{path} carries no handler-ABI stamp ({sym} is not exported) "
+                f"and LORRAX_FFI_ABI_STRICT=1 refuses an unstamped library.  "
+                f"Built before 2026-08-08; whether its signatures match this "
+                f"package's (abi={LORRAX_FFI_ABI_VERSION}) cannot be read from "
+                f"the artifact.  Rebuild: {_PLATFORMS[platform]['build_hint']}")
+        if platform not in _ABI_UNSTAMPED_ANNOUNCED:
+            _ABI_UNSTAMPED_ANNOUNCED.add(platform)
+            print(
+                f"[distrib_la] NOTE: {path} carries no handler-ABI stamp, so "
+                f"it cannot be checked against this package "
+                f"(abi={LORRAX_FFI_ABI_VERSION}).  Pre-2026-08-08 build.  If a "
+                f"call later fails with 'Wrong number of arguments', this is "
+                f"why; rebuild with {_PLATFORMS[platform]['build_hint']}.  "
+                f"LORRAX_FFI_ABI_STRICT=1 makes this a refusal.",
+                file=sys.stderr)
+        return
+    fn.restype = ctypes.c_int
+    fn.argtypes = []
+    found = int(fn())
+    if found != LORRAX_FFI_ABI_VERSION:
+        raise AbiMismatch(
+            f"HANDLER ABI MISMATCH.\n"
+            f"  library  {path}\n"
+            f"           speaks abi={found}\n"
+            f"  this tree speaks abi={LORRAX_FFI_ABI_VERSION}\n"
+            f"These cannot be paired.  Mixing them is not a degraded run: it "
+            f"is an FFI arity or layout mismatch that surfaces as "
+            f"'INVALID_ARGUMENT: Wrong number of arguments' at the first call "
+            f"crossing a changed signature, and everything off that path stays "
+            f"green until then.\n"
+            f"  fix  rebuild this leg from this tree:\n"
+            f"         {_PLATFORMS[platform]['build_hint']}\n"
+            f"       or pin the .so this tree was built for "
+            f"({_PLATFORMS[platform]['env']}=<path>).\n"
+            f"  why  src/ffi/cpp/common/lorrax_ffi_abi.h records what changed "
+            f"at each version.")
+
 
 _LIBS: Dict[str, ctypes.CDLL] = {}
 #: platform -> the .so path actually loaded (for diagnostics).
@@ -520,6 +613,8 @@ def get_lib(platform: str) -> ctypes.CDLL:
             f"LD_LIBRARY_PATH and, in a container, that every RPATH "
             f"directory is actually bind-mounted "
             f"(ldd {path} | grep 'not found').") from exc
+    # FIRST, before any declaration reads a symbol out of it.  See _check_abi.
+    _check_abi(lib, platform, str(path))
     _declare_cusolvermp(lib)
     _declare_slate(lib)
     _register_ffi_targets(lib, platform)

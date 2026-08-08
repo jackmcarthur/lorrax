@@ -94,7 +94,8 @@
 # dlopen for the library that defines them — so an absent FFTW3 costs the FFT
 # handlers and nothing else, and LORRAX_FFT_FFI refuses at startup naming both
 # the unresolved symbol and every candidate it tried.  It is NOT a link-time
-# dependency; GATE 5 below enforces that, and the note at LORRAX_PM_FFTW
+# dependency; GATE 5 (scripts/verify_ffi_build.sh) enforces that, and the
+# note at LORRAX_PM_FFTW
 # explains what it cost when it was one.
 # ============================================================================
 
@@ -116,7 +117,8 @@ LORRAX_PM_HDF5="${LORRAX_PM_HDF5:-cray-hdf5-parallel/1.14.3.7}"
 # library that defines them is brought in by a RUNTIME dlopen ladder
 # (src/ffi/cpp/mklfft/fft_flat_k_ffi.cc).  This module therefore exists only
 # to tell the build WHERE that engine lives, so CMake can record it as the
-# dlopen hint.  NOTHING FROM IT REACHES THE LINK LINE -- see GATE 5 below.
+# dlopen hint.  NOTHING FROM IT REACHES THE LINK LINE -- see GATE 5 in
+# scripts/verify_ffi_build.sh.
 #
 # WHAT THIS USED TO SAY, AND WHY IT WAS WRONG (corrected 2026-08-06)
 # ------------------------------------------------------------------
@@ -136,7 +138,8 @@ LORRAX_PM_HDF5="${LORRAX_PM_HDF5:-cray-hdf5-parallel/1.14.3.7}"
 # naming the unresolved symbol and every non-FFT handler still works.
 LORRAX_PM_FFTW="${LORRAX_PM_FFTW:-cray-fftw}"
 LORRAX_PM_CMAKE="${LORRAX_PM_CMAKE:-cmake}"
-# The CONTAINER stage this bare-metal .so has to agree with — GATE 7.
+# The CONTAINER stage this bare-metal .so has to agree with — GATE 7 in
+# scripts/verify_ffi_build.sh.
 #
 # This leg is built on the login node against the cray-hdf5-parallel
 # MODULE; the device leg is built inside Shifter against whatever is
@@ -328,158 +331,33 @@ SO_FILE="$BUILD/liblorrax_ffi_host.so"
 [[ -f "$SO_FILE" ]] || { echo "[build_ffi_host] FAILED: no .so produced." >&2; exit 1; }
 
 # ===========================================================================
-# POST-LINK GATES.  All three are HARD FAILURES, not warnings — each one
-# guards a defect that links cleanly and only shows up as a hang or a wrong
-# number much later.
+# POST-LINK GATES — DELEGATED.
+#
+# Every gate that used to be written out here now lives in
+# scripts/verify_ffi_build.sh, and so does every argument for why each
+# measurement is the right one: the ldd-not-readelf reasoning, the
+# dedupe-by-realpath reasoning, the "nm -D | grep -c fftw_ read 0 while the
+# library was unloadable" history, the FindOpenMP misdetection, the
+# two-HDF5s-in-one-process explanation.  They were the crown jewels of this
+# script and they are not diminished by moving — they are now enforced on
+# FIVE build paths instead of one, which is the whole point.  Nothing was
+# dropped; read that file for the full text.
+#
+# WHAT STAYS HERE IS WHAT IS PERLMUTTER'S: the EXPECTATIONS.  A gate that
+# infers its own expectation from the artifact cannot fail, so the site states
+# them and the machine-agnostic gates check them.
 # ===========================================================================
 echo
-echo "[build_ffi_host] --- post-link gates ---"
+echo "[build_ffi_host] --- post-link gates (scripts/verify_ffi_build.sh) ---"
 readelf -d "$SO_FILE" | grep NEEDED
 
-# GATE 1 (hazard S3): EXACTLY ONE cray-mpich ABI variant, and it must be the
-# one LibSci and SLATE carry.  Perlmutter keeps several side by side:
-# libmpi_gnu_91 is cray-mpich 8.1.25 (2023) and libmpi_gnu_123 is 9.0.1.  Two
-# libmpi in one process means MPI_COMM_WORLD and the MPI_Comm handle passed
-# to Csys2blacs_handle mean different things in different frames.  It links
-# fine and corrupts or hangs at the first collective.
-# NOTE 2026-08-05: this gate USED to test `readelf -d` (DIRECT DT_NEEDED
-# only) and therefore passed binaries that pulled a second libmpi in
-# transitively through libhdf5_parallel_gnu_123.  It now resolves the FULL
-# closure with ldd and dedupes by the resolved FILE, not the name string.
-# See src/ffi/cpp/gate_one_mpi.sh for why both changes are load-bearing.
-GATE_TAG=build_ffi_host "$SRC/gate_one_mpi.sh" "$SO_FILE" libmpi_gnu_123 || exit 1
-
-# GATE 2 (hazard S8): ONE LibSci threading flavour.  Mixing libsci_gnu_mpi
-# with libsci_gnu_mpi_mp puts a sequential and an OpenMP BLAS/ScaLAPACK in the
-# same process and lets ELF load order pick.  Deterministic, but nobody
-# re-derives the order after a link-line edit.
-sci_seq=$(readelf -d "$SO_FILE" | grep NEEDED | grep -cE 'libsci_gnu(_mpi)?\.so' || true)
-sci_mp=$(readelf -d "$SO_FILE"  | grep NEEDED | grep -cE 'libsci_gnu(_mpi)?_mp\.so' || true)
-if [[ "$sci_seq" -gt 0 && "$sci_mp" -gt 0 ]]; then
-    echo "[build_ffi_host] GATE FAILED (S8): BOTH LibSci flavours linked" >&2
-    echo "[build_ffi_host]   (sequential=$sci_seq threaded=$sci_mp).  The Cray runtime" >&2
-    echo "[build_ffi_host]   reports this as [CRAYBLAS_WARNING] Application linked" >&2
-    echo "[build_ffi_host]   against multiple cray-libsci libraries.  Usually means the" >&2
-    echo "[build_ffi_host]   cray-libsci module was still loaded at configure time and" >&2
-    echo "[build_ffi_host]   the CC wrapper auto-injected the sequential libsci." >&2
-    exit 1
-fi
-if [[ "$F" == "_mp" && "$sci_mp" -eq 0 ]]; then
-    echo "[build_ffi_host] GATE FAILED (S8): asked for threaded LibSci, none linked." >&2
-    exit 1
-fi
-echo "[build_ffi_host] GATE 2 (S8, one LibSci flavour '$F') PASSED: sequential=$sci_seq threaded=$sci_mp"
-
-# GATE 3: CUDA-free by construction.
-if readelf -d "$SO_FILE" | grep NEEDED | grep -qiE 'cuda|nccl|nvshmem|cal\.so'; then
-    echo "[build_ffi_host] GATE FAILED: host lib links a CUDA-stack library." >&2
-    exit 1
-fi
-echo "[build_ffi_host] GATE 3 (CUDA-free) PASSED"
-
-# GATE 5: THE RUN-TIME-RESOLVED FFT ENGINE IS NOT A LOAD-TIME DEPENDENCY.
-#
-# This gate exists because its absence cost a test suite.  The FFT backend is
-# documented as resolved at RUN time, and the structural proof recorded for
-# that (CLAIMS 55) was
-#     nm -D --undefined-only liblorrax_ffi_host.so | grep -c fftw_   ->  0
-# which was TRUE on 2026-08-05 and TRUE on 2026-08-06 and detected nothing,
-# because it is the wrong measurement.  It counts undefined SYMBOL references,
-# and dlsym'ing every entry point drives that to zero BY CONSTRUCTION — it is
-# what you would measure to confirm the dlsym rewrite compiled, not to confirm
-# the library is unbound.  Meanwhile the build was passing -lfftw3 (plus two
-# more fftw libraries via a FindOpenMP misdetection), so the .so carried
-#     NEEDED libfftw3.so.mpi31.3
-#     NEEDED libfftw3f_omp.so.mpi31.3
-#     NEEDED libfftw3_omp.so.mpi31.3
-# and DT_NEEDED is resolved by the dynamic linker BEFORE any of this library's
-# code runs.  Result, measured in-container 2026-08-06: dlopen of the host
-# library failed outright and 19 ScaLAPACK/SLATE/GEMM contract tests that
-# never call an FFT reported as SKIPPED, with the suite green at 0 failures.
-#
-# So: keep the symbol check (it is still the right proof that the CALLS are
-# dlsym'd), and add the check that actually guards loadability.  Both, because
-# neither implies the other.
-echo "[build_ffi_host] GATE 5 (FFT engine is not a load-time dependency)"
-fftw_undef=$(nm -D --undefined-only "$SO_FILE" 2>/dev/null | grep -c 'fftw_' || true)
-if [[ "$fftw_undef" -ne 0 ]]; then
-    echo "[build_ffi_host] GATE FAILED (5a): $fftw_undef undefined fftw_ symbols." >&2
-    echo "[build_ffi_host]   The flat-k TU must resolve every FFTW3 entry point" >&2
-    echo "[build_ffi_host]   through mklpin::resolve_sym, never by direct call." >&2
-    exit 1
-fi
-fftw_needed=$(readelf -d "$SO_FILE" | grep NEEDED | grep -c 'fftw' || true)
-if [[ "$fftw_needed" -ne 0 ]]; then
-    echo "[build_ffi_host] GATE FAILED (5b): $fftw_needed fftw entries in DT_NEEDED:" >&2
-    readelf -d "$SO_FILE" | grep NEEDED | grep 'fftw' >&2
-    echo "[build_ffi_host]   An FFT engine resolved at RUN time must not be a" >&2
-    echo "[build_ffi_host]   LOAD-time dependency.  Any fftw in DT_NEEDED makes" >&2
-    echo "[build_ffi_host]   the WHOLE library — ScaLAPACK, SLATE, GEMM, phdf5" >&2
-    echo "[build_ffi_host]   handlers included — unloadable wherever that exact" >&2
-    echo "[build_ffi_host]   SONAME is absent, e.g. inside the Shifter container," >&2
-    echo "[build_ffi_host]   which does not bind-mount /opt/cray/pe/fftw." >&2
-    echo "[build_ffi_host]   Two known causes:" >&2
-    echo "[build_ffi_host]     1. an -lfftw3 on the link line (the CMakeLists" >&2
-    echo "[build_ffi_host]        records the path as a dlopen hint instead);" >&2
-    echo "[build_ffi_host]     2. FindOpenMP adopting cray-fftw's libfftw3*_omp" >&2
-    echo "[build_ffi_host]        as the OpenMP runtime — check that this script" >&2
-    echo "[build_ffi_host]        unloaded cray-fftw before invoking cmake, and" >&2
-    echo "[build_ffi_host]        check OpenMP_CXX_LIB_NAMES in CMakeCache.txt." >&2
-    exit 1
-fi
-echo "[build_ffi_host] GATE 5 PASSED: undefined fftw_ symbols=0, fftw in DT_NEEDED=0"
-# GATE 5 IS HALF THE PROPERTY, AND THIS SCRIPT CANNOT CHECK THE OTHER HALF.
-# Zero fftw in DT_NEEDED means nothing binds at LOAD time.  It says nothing
-# about which engine — or how many — the process ends up with, because after
-# GATE 5 the engine arrives by dlopen at first use, and no static tool can see
-# it: `ldd` on this artifact reports nothing about FFTW3 at all.  Measured
-# 2026-08-06, this exact .so, one build: the bare host maps cray-fftw and the
-# container maps NOTHING (the image ships no FFTW3) — a difference GATE 5
-# cannot express, and both pass it.
-#
-# src/ffi/cpp/gate_one_fftw.sh (GATE 8) closes it by driving one real flat-k
-# FFT and reading /proc/self/maps in that process.  It is NOT called from here
-# on purpose: this script runs bare-metal on a login node, where the dynamic
-# leg cannot import jax and would refuse every build.  Run it where the
-# process lives:
-#
-#   in-container:  LORRAX_FFTW3_STAGE=/lorrax_fftw \
-#                    src/ffi/cpp/gate_one_fftw.sh <host.so> [<device.so>]
-#   bare host:     LORRAX_GATE_FFTW_PY=<venv>/bin/python \
-#                    src/ffi/cpp/gate_one_fftw.sh <host.so>
-echo "[build_ffi_host] GATE 5 covers LOAD time only — run GATE 8"
-echo "[build_ffi_host]   (src/ffi/cpp/gate_one_fftw.sh) where the process"
-echo "[build_ffi_host]   runs, or the engine identity is unchecked."
-
-# GATE 6: and more generally, the OpenMP runtime is an OpenMP runtime.  The
-# misdetection above was invisible because nothing ever looked.  gomp (GNU) or
-# iomp5/omp (LLVM/Intel) are the legitimate answers; anything else means
-# FindOpenMP matched on the substring "omp" in a library that is not one.
-omp_needed=$(readelf -d "$SO_FILE" | grep NEEDED \
-             | grep -oE 'lib[a-z0-9_]*omp[a-z0-9_]*\.so[^]]*' || true)
-bad_omp=$(grep -vE '^lib(gomp|iomp5|omp)\.so' <<<"$omp_needed" || true)
-if [[ -n "${bad_omp//[[:space:]]/}" ]]; then
-    echo "[build_ffi_host] GATE FAILED (6): non-OpenMP library adopted as the" >&2
-    echo "[build_ffi_host]   OpenMP runtime:" >&2
-    echo "$bad_omp" >&2
-    echo "[build_ffi_host]   Check OpenMP_CXX_LIB_NAMES in $BUILD/CMakeCache.txt." >&2
-    exit 1
-fi
-echo "[build_ffi_host] GATE 6 (OpenMP runtime is really OpenMP) PASSED"
-
-# GATE 7: ONE HDF5, and the container stage provides it.
-#
-# GATE 5 removed the fftw SONAME from DT_NEEDED and left the host leg with
-# exactly one remaining in-container `not found`: libhdf5_parallel_gnu.so.310,
-# because this script loads cray-hdf5-parallel/1.14.3.7 (SOVERSION 310) and
-# the stage bind-mounted at /lorrax_phdf5 held HDF5 1.12 (SOVERSION 200).
-# Same shape as GATE 5 one library over: a dependency this leg cannot see is
-# missing, because it is only ever missing somewhere this leg does not run.
-# So the check has to be made HERE, against the OTHER population.
-#
-# It is deliberately not just "does the SONAME resolve".  See
-# src/ffi/cpp/gate_one_hdf5.sh for why the two-HDF5s-in-one-process repair
-# is worse than the failure it fixes.
+# GATE 7 needs a phdf5 stage to compare against, and on this machine there is
+# no honest way to run without one.  The host leg is built bare-metal against
+# the cray-hdf5-parallel MODULE; the device leg is built in-container against
+# whatever is bind-mounted at /lorrax_phdf5.  Two populations, two HDF5s, and
+# until 2026-08-06 nothing compared them: the module moved to 1.14.3.7 while
+# the stage stayed on 1.12, so this .so carried a SONAME the container did not
+# have and would not dlopen there at all (CLAIMS 89).
 if [[ -z "$LORRAX_PM_PHDF5_STAGE" ]]; then
     echo "[build_ffi_host] GATE 7 CANNOT RUN: no phdf5 stage named." >&2
     echo "[build_ffi_host]   Neither LORRAX_FFI_PHDF5_DIR nor" >&2
@@ -489,20 +367,62 @@ if [[ -z "$LORRAX_PM_PHDF5_STAGE" ]]; then
     echo "[build_ffi_host]   provide.  That comparison is the whole gate." >&2
     exit 1
 fi
-GATE_TAG=build_ffi_host LORRAX_PHDF5_STAGE="$LORRAX_PM_PHDF5_STAGE" \
-    "$SRC/gate_one_hdf5.sh" "$SO_FILE" || exit 1
 
-# GATE 4: nothing left unresolved at load time.  -Wl,--no-undefined already
-# fails the LINK on a missing link-time symbol; this catches the other half —
-# a NEEDED library that cannot itself be found at run time.
-if command -v ldd >/dev/null 2>&1; then
-    LD_LIBRARY_PATH="$LORRAX_SLATE_HOST_INSTALL_DIR/lib64:${LD_LIBRARY_PATH:-}" \
-        ldd -r "$SO_FILE" 2>&1 | grep -iE 'undefined|not found' && {
-            echo "[build_ffi_host] GATE FAILED: unresolved symbols at load time." >&2
-            exit 1
-        }
-    echo "[build_ffi_host] GATE 4 (load-time resolution) PASSED"
+# THE SOVERSION THE RUNTIME WILL MOUNT, read from the stage that will mount it.
+#
+# THIS IS THE TRAP THAT COST THE KCHUNK BRANCH A BUILD, stated as a gate.
+# LORRAX_FFI_PHDF5_DIR does NOT choose the HDF5 this leg links — the Cray
+# compiler wrappers do, via the module named in LORRAX_PM_HDF5.  Set only the
+# former and you get a .so.310 library that agrees with nothing, links
+# cleanly, and is structurally unloadable beside a .so.200 device library.
+# Deriving the expectation from the STAGE and comparing it against what the
+# MODULE produced is what makes that disagreement fail here instead of at
+# somebody's first read_slabs.
+_stage_sov=""
+for _f in "$LORRAX_PM_PHDF5_STAGE"/lib/libhdf5*.so*; do
+    [[ -e "$_f" && ! -L "$_f" ]] || continue
+    _s="$(readelf -d "$_f" 2>/dev/null | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')"
+    _s="${_s##*.}"
+    [[ -n "$_s" ]] && _stage_sov="$_s"
+done
+if [[ -n "$_stage_sov" ]]; then
+    echo "[build_ffi_host] phdf5 stage provides HDF5 SOVERSION $_stage_sov"
+else
+    echo "[build_ffi_host] NOTE: could not read a SOVERSION out of" >&2
+    echo "[build_ffi_host]   $LORRAX_PM_PHDF5_STAGE/lib — GATE 7 falls back to" >&2
+    echo "[build_ffi_host]   the stage-provides comparison alone." >&2
 fi
+
+# The Perlmutter host recipe builds ALL FIVE host backends.  Declaring it is
+# what turns "ScaLAPACK/BLACS not found" from a CMake WARNING into a build
+# failure — the Aug-7 deployed library shipped with scalapack=0 because
+# nothing anywhere said what it was supposed to contain.
+LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-scalapack,gemm,slate,phdf5,fft}" \
+LORRAX_FFI_EXPECT_MPI="${LORRAX_FFI_EXPECT_MPI:-libmpi_gnu_123}" \
+LORRAX_FFI_EXPECT_HDF5_SOVERSION="${LORRAX_FFI_EXPECT_HDF5_SOVERSION:-$_stage_sov}" \
+LORRAX_PHDF5_STAGE="$LORRAX_PM_PHDF5_STAGE" \
+LD_LIBRARY_PATH="$LORRAX_SLATE_HOST_INSTALL_DIR/lib64:${LD_LIBRARY_PATH:-}" \
+GATE_TAG=build_ffi_host \
+    bash "$LORRAX_ROOT/scripts/verify_ffi_build.sh" --leg host "$SO_FILE" || {
+        echo "[build_ffi_host] FAILED: the library does not meet the build" >&2
+        echo "[build_ffi_host] contract.  The .so is left on disk so it can be" >&2
+        echo "[build_ffi_host] inspected, but it must not be deployed or" >&2
+        echo "[build_ffi_host] pinned.  Every failure above names its own fix." >&2
+        exit 1
+    }
+
+# GATE 8 (FFT engine identity) is reported as NOT RUN by the verifier on a
+# login node, and that is honest rather than a gap: it drives a real flat-k
+# FFT and reads /proc/self/maps, and shifter cannot bind-mount $HOME on a
+# login node.  Run it inside an allocation, where the process lives:
+#
+#   in-container:  LORRAX_FFTW3_STAGE=/lorrax_fftw \
+#                    src/ffi/cpp/gate_one_fftw.sh <host.so> [<device.so>]
+#   bare host:     LORRAX_GATE_FFTW_PY=<venv>/bin/python \
+#                    src/ffi/cpp/gate_one_fftw.sh <host.so>
+#
+# or re-run this verifier there with LORRAX_GATE_FFTW_PY set, which is what
+# the acceptance pytest tier does.
 
 # Build provenance beside the artifact — see the note in src/ffi/cpp/build.sh.
 "$LORRAX_ROOT/src/ffi/cpp/stage/stamp_provenance.sh" "$SO_FILE" \

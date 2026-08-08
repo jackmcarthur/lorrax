@@ -520,6 +520,50 @@ if(LORRAX_HAVE_SLATE)
     )
 endif()
 
+# ---------------------------------------------------------------------------
+#  GENERATED CAPABILITY HEADER + BUILD STAMP — the device leg, since 2026-08-08.
+#
+#  The host leg has recorded what it resolved since 2026-08-05.  This leg
+#  recorded NOTHING: `strings liblorrax_ffi.so | grep -E 'scalapack=|cufft='`
+#  on the deployed device library returns empty, so the only artifact-level
+#  question anyone could ask of a device .so was "which symbols does it
+#  export".  That is enough to catch a missing handler and useless for the two
+#  questions that actually cost time here — which cuSOLVERMp comm path it was
+#  compiled for (CAL vs NCCL; src/ffi/cpp/build.sh refuses without an answer
+#  precisely because every stage exports the same SONAME), and which handler
+#  ABI it speaks.
+# ---------------------------------------------------------------------------
+set(LORRAX_CFG_CUSOLVERMP 1)   # base sources; this leg does not exist without it
+if(LORRAX_FFI_HAVE_CUBLASMP)
+    set(LORRAX_CFG_CUBLASMP 1)
+else()
+    set(LORRAX_CFG_CUBLASMP 0)
+endif()
+set(LORRAX_CFG_CUFFT ${LORRAX_CUFFT_ON})
+if(LORRAX_FFI_HAVE_CAL)
+    set(LORRAX_CFG_CAL 1)
+else()
+    set(LORRAX_CFG_CAL 0)
+endif()
+if(LORRAX_HAVE_SLATE)
+    set(LORRAX_CFG_SLATE 1)
+else()
+    set(LORRAX_CFG_SLATE 0)
+endif()
+if(LORRAX_FFI_HAVE_PHDF5)
+    set(LORRAX_CFG_PHDF5 1)
+else()
+    set(LORRAX_CFG_PHDF5 0)
+endif()
+# Host-leg keys: present in the shared template, never emitted on this leg.
+set(LORRAX_CFG_FFTW3 0)
+set(LORRAX_CFG_SCALAPACK 0)
+set(LORRAX_CFG_GEMM 0)
+set(LORRAX_CFG_MATH_LINK "")
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/common/lorrax_config.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/lorrax_config.h" @ONLY)
+list(APPEND LORRAX_FFI_SOURCES common/build_config.cc)
+
 add_library(lorrax_ffi SHARED ${LORRAX_FFI_SOURCES})
 
 set_target_properties(lorrax_ffi PROPERTIES
@@ -546,6 +590,7 @@ target_include_directories(lorrax_ffi SYSTEM PRIVATE
 target_include_directories(lorrax_ffi PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/common"
+    "${CMAKE_CURRENT_BINARY_DIR}"     # generated lorrax_config.h
 )
 
 find_package(Threads REQUIRED)
@@ -1366,6 +1411,13 @@ else()
     set(LORRAX_CFG_PHDF5 0)
 endif()
 string(REPLACE ";" " " LORRAX_CFG_MATH_LINK "${_host_math_link}")
+# The device-leg keys exist in the template so ONE template serves both legs;
+# build_config.cc never emits them on this leg, so these zeros are not a claim
+# about anything.
+set(LORRAX_CFG_CUSOLVERMP 0)
+set(LORRAX_CFG_CUBLASMP 0)
+set(LORRAX_CFG_CUFFT 0)
+set(LORRAX_CFG_CAL 0)
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/common/lorrax_config.h.in"
                "${CMAKE_CURRENT_BINARY_DIR}/lorrax_config.h" @ONLY)
 

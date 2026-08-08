@@ -32,6 +32,53 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LORRAX_ROOT="${LORRAX_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
+
+# ===========================================================================
+# ON A MACHINE THAT HAS A SITE RECIPE, USE THE SITE RECIPE.
+#
+# THIS IS THE FIX FOR THE ACCIDENT THAT MOTIVATED THE WHOLE BUILD CONTRACT.
+# The library deployed on 2026-08-07 was produced by running THIS script on
+# Perlmutter.  It configures no ScaLAPACK — CMake's built-in probe searches for
+# an MKL layout, which does not describe Cray LibSci — so "ScaLAPACK/BLACS not
+# found" printed as a WARNING, the link succeeded, and the library shipped with
+# `scalapack=0` and zero Scalapack* handlers.  It also left cray-libsci loaded
+# at configure time, so the CC wrapper auto-injected the sequential LibSci
+# beside the threaded pair the SLATE install needs.  Two defects, one command,
+# no failure.
+#
+# The verifier at the bottom of this file would now catch both.  Catching them
+# is worse than not producing them: config/perlmutter/build_ffi_host.sh already
+# knows every one of those answers, and a person who ran the obvious command
+# should get the right library, not a lecture.  So the obvious command hands
+# over.
+#
+# The escape is explicit and announced, per the gate contract in
+# src/ffi/gate.py — an opt-out is a stated decision, never an inference:
+#   LORRAX_FFI_GENERIC_BUILD=1   build here anyway, on this machine, with
+#                                whatever this script alone can resolve.
+# ===========================================================================
+_site=""
+case "${NERSC_HOST:-}${TACC_SYSTEM:-}" in
+    perlmutter) _site=perlmutter ;;
+    frontera)   _site=frontera ;;
+esac
+if [[ -n "$_site" && -f "${LORRAX_ROOT}/config/${_site}/build_ffi_host.sh" \
+      && "${LORRAX_FFI_GENERIC_BUILD:-0}" != "1" ]]; then
+    echo "[build_host] this is ${_site}, and it has a site recipe."
+    echo "[build_host] handing over to config/${_site}/build_ffi_host.sh, which"
+    echo "[build_host] knows this machine's ScaLAPACK link line, its LibSci"
+    echo "[build_host] threading flavour, its HDF5 module and its phdf5 stage."
+    echo "[build_host] (LORRAX_FFI_GENERIC_BUILD=1 builds here instead.)"
+    exec bash "${LORRAX_ROOT}/config/${_site}/build_ffi_host.sh" "$@"
+fi
+if [[ -n "$_site" ]]; then
+    echo "[build_host] NOTE: LORRAX_FFI_GENERIC_BUILD=1 on ${_site} — building" >&2
+    echo "[build_host]   with the generic recipe, which resolves less than the" >&2
+    echo "[build_host]   site one.  The verifier at the end will name whatever" >&2
+    echo "[build_host]   this build does not contain." >&2
+fi
+
 BUILD_DIR="${LORRAX_FFI_HOST_BUILD_DIR:-${SCRIPT_DIR}/build_host}"
 SLATE_DIR="${LORRAX_SLATE_HOST_INSTALL_DIR:-$HOME/software/slate_builds/cpu/install}"
 # Keep in step with LORRAX_IMAGE in config/perlmutter/site_config.sh, which
@@ -114,16 +161,29 @@ if [[ ! -f "${SO_FILE}" ]]; then
     exit 1
 fi
 
+# ===========================================================================
+# THE BUILD CONTRACT.  Unconditional, and a failure here fails the build.
+#
+# This replaces the single inline CUDA-free check that used to live here — one
+# of the seven properties an FFI library has to have, checked in one of the
+# five places a library can be produced.  scripts/verify_ffi_build.sh is the
+# single source for all of them; see its header for the gate list and for why
+# it is a script rather than a CMake POST_BUILD rule.
+#
+# On a site with no ScaLAPACK/GEMM this build legitimately contains fewer
+# backends than the default expectation.  SAY SO — the declaration is the
+# gate:
+#     LORRAX_FFI_EXPECT_BACKENDS=slate,phdf5,fft bash src/ffi/cpp/build_host.sh
+# ===========================================================================
 echo
-echo "[build_host] --- CUDA-free proof: libraries this .so loads at run time ---"
-readelf -d "${SO_FILE}" | grep NEEDED
-if readelf -d "${SO_FILE}" | grep NEEDED | grep -qiE 'cuda|nccl|nvshmem|cal\.so'; then
-    echo "[build_host] FAILED: ${SO_FILE} links a CUDA-stack library — the" >&2
-    echo "[build_host] host lib must be CUDA-free.  Check that cudatoolkit /" >&2
-    echo "[build_host] craype-accel-nvidia80 are unloaded and the SLATE" >&2
-    echo "[build_host] install really is the gpu_backend=none variant." >&2
+echo "[build_host] --- build contract (scripts/verify_ffi_build.sh) ---"
+bash "${LORRAX_ROOT}/scripts/verify_ffi_build.sh" --leg host "${SO_FILE}" || {
+    echo "[build_host] FAILED: the library does not meet the build contract." >&2
+    echo "[build_host] The .so is left on disk so it can be inspected, but it" >&2
+    echo "[build_host] must not be deployed or pinned.  Read the gate output" >&2
+    echo "[build_host] above; every failure names its own fix." >&2
     exit 1
-fi
+}
 
 echo
 echo "[build_host] done.  .so at: ${SO_FILE}"

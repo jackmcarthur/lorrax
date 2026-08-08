@@ -83,7 +83,8 @@ import jax
 import jax.ffi
 
 __all__ = ["get_lib", "has_target", "probe_target", "has_phdf5_read",
-           "has_phdf5_write", "loaded_lib_path"]
+           "has_phdf5_write", "loaded_lib_path",
+           "LORRAX_FFI_ABI_VERSION", "FfiAbiMismatch"]
 
 _LIBS: Dict[str, ctypes.CDLL] = {}
 #: platform -> the .so path actually loaded (for diagnostics).
@@ -241,6 +242,29 @@ class FfiLibraryNotBuilt(FileNotFoundError):
     """
 
 
+#: The handler-signature ABI this Python tree speaks.
+#:
+#: A MIRROR.  The definition is ``src/ffi/cpp/common/lorrax_ffi_abi.h``, which
+#: also carries the bump rule and the history of the two bumps in two days that
+#: motivated the mechanism.  A C++ macro cannot be imported, so a mirror across
+#: this boundary is unavoidable; what IS avoidable is the mirror drifting
+#: silently, and ``tests/test_ffi_abi_stamp.py`` parses the header and fails if
+#: these two numbers disagree.
+LORRAX_FFI_ABI_VERSION = 2
+
+#: platform -> the C entry point that reports the library's ABI.  Per leg on
+#: purpose: both libraries are dlopened RTLD_GLOBAL in a GPU process and
+#: already share sixteen symbol names (KNOWN_FAILURES L1), so a shared spelling
+#: here would let the first-loaded library answer for the second — and this is
+#: the one question where being answered by the wrong library is the exact
+#: failure being detected.
+_ABI_SYMBOLS = {"cpu": "lorrax_ffi_host_abi_version",
+                "CUDA": "lorrax_ffi_cuda_abi_version"}
+
+#: platforms whose "no ABI stamp" announcement has already been made.
+_ABI_UNSTAMPED_ANNOUNCED: set = set()
+
+
 class FfiLibraryUnusable(OSError):
     """An FFI .so WAS located but cannot be used.
 
@@ -254,6 +278,88 @@ class FfiLibraryUnusable(OSError):
     is not bind-mounted, so all three libfftw3*.so.mpi31.3 RPATH deps are
     "not found" and 19 Tier-1 cells reported themselves as skipped.
     """
+
+
+class FfiAbiMismatch(FfiLibraryUnusable):
+    """The library loaded fine and speaks a DIFFERENT handler ABI.
+
+    A subclass of :class:`FfiLibraryUnusable` because it is the same kind of
+    fact — the file is present and cannot be used — and every existing
+    handler of that exception stays correct.  A distinct class because this
+    one has a distinct fix (rebuild the .so from this tree, or pin the .so
+    this tree was built for) and because a caller that wants to say
+    "mispaired" rather than "broken" now can.
+    """
+
+
+def _check_abi(lib: ctypes.CDLL, platform: str, path: str) -> None:
+    """Refuse a library whose handler signatures are not this tree's.
+
+    CALLED IMMEDIATELY AFTER ``CDLL`` AND BEFORE ANYTHING ELSE TOUCHES THE
+    LIBRARY.  Order is the requirement, not an optimisation: registering
+    targets or setting argtypes on a mispaired library is exactly the state
+    whose only symptom is a runtime ``INVALID_ARGUMENT`` several minutes into
+    an allocated run.
+
+    THE TWO OUTCOMES ARE DELIBERATELY DIFFERENT.
+
+    *Stamped and different* is a REFUSAL.  The two sides disagree about what
+    crosses the boundary; nothing good happens next.  What used to happen
+    instead was::
+
+        INVALID_ARGUMENT: Wrong number of arguments: expected 3 but got 4
+
+    which names neither library, neither version, nor what to do.
+
+    *Not stamped at all* is an ANNOUNCEMENT, once, and the load proceeds.  A
+    library built before 2026-08-08 carries no stamp, and "unstamped" is not
+    evidence of "wrong" — roughly nine worktrees pin such libraries today and
+    refusing them wholesale would break every one of them to fix none.  A site
+    that wants the ratchet closed sets ``LORRAX_FFI_ABI_STRICT=1``.
+    """
+    sym = _ABI_SYMBOLS[platform]
+    fn = getattr(lib, sym, None)
+    if fn is None:
+        if os.environ.get("LORRAX_FFI_ABI_STRICT", "") == "1":
+            raise FfiAbiMismatch(
+                f"{path} carries no handler-ABI stamp ({sym} is not exported) "
+                f"and LORRAX_FFI_ABI_STRICT=1 refuses an unstamped library.  "
+                f"It was built before 2026-08-08, so whether its handler "
+                f"signatures match this tree's (abi={LORRAX_FFI_ABI_VERSION}) "
+                f"cannot be determined from the artifact.  Rebuild it: "
+                f"{_PLATFORMS[platform]['build_hint']}")
+        if platform not in _ABI_UNSTAMPED_ANNOUNCED:
+            _ABI_UNSTAMPED_ANNOUNCED.add(platform)
+            print(
+                f"[lorrax_ffi] NOTE: {path} carries no handler-ABI stamp, so "
+                f"it cannot be checked against this tree "
+                f"(abi={LORRAX_FFI_ABI_VERSION}).  Pre-2026-08-08 build.  If a "
+                f"call later fails with 'Wrong number of arguments', this is "
+                f"why; rebuild with "
+                f"{_PLATFORMS[platform]['build_hint']}.  "
+                f"LORRAX_FFI_ABI_STRICT=1 makes this a refusal.",
+                file=sys.stderr)
+        return
+    fn.restype = ctypes.c_int
+    fn.argtypes = []
+    found = int(fn())
+    if found != LORRAX_FFI_ABI_VERSION:
+        raise FfiAbiMismatch(
+            f"HANDLER ABI MISMATCH.\n"
+            f"  library  {path}\n"
+            f"           speaks abi={found}\n"
+            f"  this tree speaks abi={LORRAX_FFI_ABI_VERSION}\n"
+            f"These cannot be paired.  Mixing them is not a degraded run: it "
+            f"is an FFI arity or layout mismatch that surfaces as "
+            f"'INVALID_ARGUMENT: Wrong number of arguments' at the first call "
+            f"crossing a changed signature, and everything off that path stays "
+            f"green until then.\n"
+            f"  fix  rebuild this leg from this tree:\n"
+            f"         {_PLATFORMS[platform]['build_hint']}\n"
+            f"       or pin the .so this tree was built for "
+            f"({_PLATFORMS[platform]['env']}=<path>).\n"
+            f"  why  src/ffi/cpp/common/lorrax_ffi_abi.h records what changed "
+            f"at each version.")
 
 
 def _locate_so(platform: str) -> Path:
@@ -767,6 +873,8 @@ def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
             f"directory is actually bind-mounted "
             f"(ldd {path} | grep 'not found')."
         ) from exc
+    # FIRST, before anything reads a symbol out of it.  See _check_abi.
+    _check_abi(lib, platform, str(path))
     _set_argtypes(lib, platform)
     _register_ffi_targets(lib, platform)
     _LIBS[platform] = lib

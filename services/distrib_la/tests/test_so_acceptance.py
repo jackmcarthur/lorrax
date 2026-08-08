@@ -305,3 +305,243 @@ def test_check_5_the_two_libraries_still_share_their_slate_soname():
         "src/ffi/common/ffi_loader.py) together with the cells under "
         "'THE SONAME RACE' in test_distrib_la_contract.py and the "
         "loader cells in tests/test_gpu_pinning.py.")
+
+
+# ---------------------------------------------------------------------------
+# THE FULL GATE SET, as one cell — scripts/verify_ffi_build.sh
+# ---------------------------------------------------------------------------
+# The four checks above are four of nine.  The other five (one MPI runtime,
+# one BLAS threading flavour, OpenMP-is-OpenMP, HDF5 pairing, handler ABI)
+# lived only in config/perlmutter/build_ffi_host.sh, which means they ran
+# exactly once, at build time, on one machine, and never again — not on the
+# artifact somebody pinned three days later, and not at all on the device leg
+# or on Frontera.  scripts/verify_ffi_build.sh is the machine-agnostic form of
+# all nine, and this cell is how a user VALIDATES A BUILD BY RUNNING PYTEST.
+#
+# It is the same file the build scripts call, so there is no possibility of the
+# suite certifying something the build would have rejected, or the reverse.
+# ---------------------------------------------------------------------------
+
+def _repo_root():
+    """The monorepo root, or SKIP.
+
+    This package is independently installable; a standalone install has no
+    ``scripts/`` and no ``src/ffi/cpp``, and the verifier reads both.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.abspath(os.path.join(here, "..", "..", ".."))
+    if not os.path.exists(os.path.join(root, "scripts", "verify_ffi_build.sh")):
+        pytest.skip(
+            "monorepo wiring: scripts/verify_ffi_build.sh is not reachable "
+            f"from {here} (standalone install of this service).  The verifier "
+            "is the LORRAX repo's file; covered by any monorepo run.")
+    return root
+
+
+def _run_verifier(so: str, leg: str, extra_env: dict | None = None):
+    root = _repo_root()
+    env = dict(os.environ)
+    env.setdefault("LORRAX_ROOT", root)
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        ["bash", os.path.join(root, "scripts", "verify_ffi_build.sh"),
+         "--leg", leg, so],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        timeout=600, env=env)
+
+
+def test_the_host_library_passes_every_gate():
+    """The whole contract, on the .so this run is pinned to.
+
+    Expectations are stated, not inferred — that is the entire lesson of the
+    Aug-7 library, which passed everything anybody ran on it because nothing
+    anywhere recorded what it was supposed to contain.  The host leg of a
+    LORRAX build has five backends; a site that builds fewer says so through
+    ``LORRAX_FFI_EXPECT_BACKENDS``, and this cell honours that lever rather
+    than hardcoding the full set, so it is correct on a phdf5-only Frontera
+    build too.
+    """
+    so = _pinned("cpu")
+    out = _run_verifier(so, "host")
+    assert out.returncode == 0, (
+        f"scripts/verify_ffi_build.sh REFUSED the pinned host library.\n"
+        f"  LORRAX_FFI_HOST_SO={so}\n"
+        f"Every gate names its own fix; the output follows.\n\n{out.stdout}")
+
+
+def test_the_device_library_passes_every_gate():
+    """Same contract, device leg.
+
+    This leg had NO artifact-level acceptance of any kind before 2026-08-08 —
+    not even a build stamp, so `strings liblorrax_ffi.so | grep abi=` on the
+    deployed library returns nothing at all.
+    """
+    so = _pinned("CUDA")
+    out = _run_verifier(so, "cuda")
+    assert out.returncode == 0, (
+        f"scripts/verify_ffi_build.sh REFUSED the pinned device library.\n"
+        f"  LORRAX_FFI_SO={so}\n\n{out.stdout}")
+
+
+def test_the_two_pinned_libraries_agree_about_hdf5():
+    """GATE 7 ACROSS THE PAIR — the check no single-artifact gate can make.
+
+    THE FAILURE THIS IS FOR IS THE DEPLOYED PAIR ITSELF.  Measured 2026-08-08:
+    ``~/software/lorrax_ffi_2026-08-07/liblorrax_ffi_host.so`` links
+    ``libhdf5_parallel_gnu.so.310`` and its own deployed partner
+    ``liblorrax_ffi.so`` links ``libhdf5_parallel_gnu_123.so.200``.  Each is
+    self-consistent; together they are two HDF5 majors, and whichever the
+    container does not mount takes its WHOLE library down at dlopen —
+    ScaLAPACK, SLATE, GEMM and phdf5 handlers alike, none of which touch HDF5.
+    That is the 19-fails-with-'cannot open ...so.310' arm in BUILD_NOTES.md.
+
+    The gate is on the PAIR because neither artifact alone is wrong.
+    """
+    host = _pinned("cpu")
+    cuda = _pinned("CUDA")
+    out = _run_verifier(host, "host",
+                        {"LORRAX_FFI_EXPECT_PEER_SO": cuda})
+    assert out.returncode == 0, (
+        f"the two pinned libraries do not form a loadable pair.\n"
+        f"  LORRAX_FFI_HOST_SO={host}\n"
+        f"  LORRAX_FFI_SO     ={cuda}\n\n{out.stdout}")
+
+
+def test_the_verifier_refuses_something(tmp_path):
+    """RED TWIN for the tier above.
+
+    Three green cells against three good libraries demonstrate nothing about
+    whether the verifier can say no.  Point it at a file that is not a LORRAX
+    library and it must refuse — and specifically it must refuse rather than
+    crash, because a non-zero exit from a traceback would make every cell
+    above pass for the wrong reason.
+    """
+    _repo_root()
+    not_a_lib = str(tmp_path / "not_a_library.so")
+    with open(not_a_lib, "wb") as fh:
+        fh.write(b"\x7fELF" + b"not really\n" * 64)
+    out = _run_verifier(not_a_lib, "host")
+    assert out.returncode == 1, (
+        f"the verifier did not refuse a non-library (rc={out.returncode}):\n"
+        f"{out.stdout}")
+    assert "GATE FAILED" in out.stdout, (
+        f"the verifier refused without naming a gate:\n{out.stdout}")
+
+
+# ---------------------------------------------------------------------------
+# THE HANDLER-SIGNATURE ABI
+# ---------------------------------------------------------------------------
+
+def _header_abi_version():
+    """The number in the C++ header, or SKIP."""
+    root = _repo_root()
+    hdr = os.path.join(root, "src", "ffi", "cpp", "common", "lorrax_ffi_abi.h")
+    if not os.path.exists(hdr):
+        pytest.skip(f"monorepo wiring: {hdr} not reachable.")
+    with open(hdr) as fh:
+        m = re.search(r"^#define\s+LORRAX_FFI_ABI_VERSION\s+(\d+)",
+                      fh.read(), re.M)
+    assert m, f"{hdr} does not define LORRAX_FFI_ABI_VERSION"
+    return int(m.group(1))
+
+
+def test_the_python_mirror_matches_the_cpp_definition():
+    """THE DRIFT DETECTOR for a number that has to exist twice.
+
+    A C++ macro cannot be imported, so the version is defined in
+    ``src/ffi/cpp/common/lorrax_ffi_abi.h`` and mirrored in
+    ``distrib_la.loader``.  A copy nothing compares is exactly how the ten
+    eigh-dispatch ladders drifted; this cell is the comparison.
+    """
+    from distrib_la.loader import LORRAX_FFI_ABI_VERSION
+    assert LORRAX_FFI_ABI_VERSION == _header_abi_version(), (
+        f"distrib_la.loader.LORRAX_FFI_ABI_VERSION="
+        f"{LORRAX_FFI_ABI_VERSION} but "
+        f"src/ffi/cpp/common/lorrax_ffi_abi.h says {_header_abi_version()}.  "
+        f"The header is the definition; move the mirror, in the same commit "
+        f"as the signature change that caused the bump.")
+
+
+def test_the_pinned_host_library_speaks_this_packages_abi():
+    """The stamp on the artifact, against the mirror.
+
+    Skips honestly rather than failing on a PRE-STAMP library: those exist in
+    numbers on Perlmutter today (the whole deployed pair is unstamped) and
+    "built before the mechanism" is not "built wrong".  What it refuses is a
+    STAMPED library carrying a different number.
+    """
+    so = _pinned("cpu")
+    from distrib_la.loader import LORRAX_FFI_ABI_VERSION
+    syms = _defined_symbols(so)
+    if "lorrax_ffi_host_abi_version" not in syms:
+        pytest.skip(
+            f"{so} carries no handler-ABI stamp (pre-2026-08-08 build), so "
+            f"there is nothing to compare.  Covered by any leg pinned to a "
+            f"library built from this tree; the loader announces the same "
+            f"fact at dlopen and LORRAX_FFI_ABI_STRICT=1 turns it into a "
+            f"refusal.")
+    with open(so, "rb") as fh:
+        blob = fh.read()
+    found = sorted({m.decode() for m in re.findall(rb"abi=[0-9]+", blob)})
+    assert found == [f"abi={LORRAX_FFI_ABI_VERSION}"], (
+        f"{so} stamps {found}; this package speaks "
+        f"abi={LORRAX_FFI_ABI_VERSION}.  These cannot be paired — the "
+        f"mismatch is invisible until the first call crossing a changed "
+        f"signature, which is why the number exists.")
+
+
+def test_a_stamped_old_library_produces_the_named_refusal(tmp_path):
+    """RED TWIN for the ABI mechanism, end to end through the loader.
+
+    THE POINT IS THE SUBSTITUTION.  Every other cell here reads an ELF; this
+    one builds a real shared object that exports a real
+    ``lorrax_ffi_host_abi_version`` returning a STALE number, hands it to the
+    loader's own dlopen path, and requires the refusal to name both versions
+    and the rebuild command — not the ``INVALID_ARGUMENT: Wrong number of
+    arguments`` that a mispaired library produced before this branch, and not
+    a generic "could not load".
+
+    A twenty-line .so rather than monkeypatching the check, because the thing
+    under test is whether the check RUNS on a library the loader actually
+    opened, in the right ORDER: before argtypes are declared and before any
+    target is registered.  A monkeypatched twin would pass with the call site
+    in the wrong place.
+    """
+    import ctypes
+    from distrib_la.loader import (AbiMismatch, LORRAX_FFI_ABI_VERSION,
+                                   _check_abi)
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no C compiler on PATH to build the stale-ABI twin; "
+                    "covered by any leg with a toolchain (every build node).")
+    stale = LORRAX_FFI_ABI_VERSION - 1
+    src = tmp_path / "stale_abi.c"
+    src.write_text(
+        "int lorrax_ffi_host_abi_version(void) { return %d; }\n" % stale)
+    lib_path = tmp_path / "libstale_abi.so"
+    build = subprocess.run([cc, "-shared", "-fPIC", "-o", str(lib_path),
+                            str(src)],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=180)
+    assert build.returncode == 0, f"could not build the twin:\n{build.stdout}"
+
+    lib = ctypes.CDLL(str(lib_path))
+    with pytest.raises(AbiMismatch) as excinfo:
+        _check_abi(lib, "cpu", str(lib_path))
+    msg = str(excinfo.value)
+    assert f"speaks abi={stale}" in msg, msg
+    assert f"this tree speaks abi={LORRAX_FFI_ABI_VERSION}" in msg, msg
+    assert "build_ffi_host.sh" in msg, (
+        "the refusal must name the rebuild command, or it is the same "
+        f"dead end as the runtime error it replaces:\n{msg}")
+    # ...and the OTHER direction: a library stamping the current version is
+    # accepted, so this cell is not passing because _check_abi refuses
+    # everything.
+    ok_src = tmp_path / "ok_abi.c"
+    ok_src.write_text("int lorrax_ffi_host_abi_version(void) { return %d; }\n"
+                      % LORRAX_FFI_ABI_VERSION)
+    ok_path = tmp_path / "libok_abi.so"
+    assert subprocess.run([cc, "-shared", "-fPIC", "-o", str(ok_path),
+                           str(ok_src)], timeout=180).returncode == 0
+    _check_abi(ctypes.CDLL(str(ok_path)), "cpu", str(ok_path))
