@@ -1380,6 +1380,21 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	sanity.check_finite("V_q", V_qmunu, print_fn=print_fn)
 	sanity.check_positive("V_q[q=0] trace", _vq0_trace, print_fn=print_fn)
 	sanity.check_hermitian("V_q[q=0]", V_q_raw[0], print_fn=print_fn)
+	# Per-q hermiticity above is a NEIGHBOURING property, not the one the
+	# BSE kernel rests on.  That one is q↔−q conjugate reciprocity,
+	# V_q = conj(V_{−q}) (equivalently: ifft_q(V_q) is REAL), and it is
+	# independent of hermiticity in both directions.  V_q passes the
+	# hermiticity gate at 3.0e-16 on every fixture measured while failing
+	# the reciprocity at 5.7e-3 (armA_base480, 2026-08-07) -- and a q=0
+	# check could not have seen it either way, because -0 == 0 makes the
+	# condition collapse to "V[0] is real", which holds at 3.7e-16.
+	# Tolerance: ζ, V's only input, satisfies the same relation at 4.7e-16
+	# across all 64 q (measured), and the assembly on top of it is
+	# analytic -- no quadrature -- so the honest floor here is round-off.
+	# 1e-8 is seven orders above that and five below the present break.
+	sanity.check_q_conjugate_reciprocity(
+		"V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-8,
+		print_fn=print_fn)
 	sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
 	return V_qmunu, G0
 
