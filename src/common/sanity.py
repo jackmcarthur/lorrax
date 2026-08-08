@@ -72,6 +72,9 @@ __all__ = [
     "check_finite",
     "check_hermitian",
     "report_hermitian_residual",
+    "neg_q_index",
+    "check_q_conjugate_reciprocity",
+    "report_q_conjugate_residual",
     "check_positive",
     "check_in_range",
     "check_sign",
@@ -335,6 +338,7 @@ def report_hermitian_residual(
     verbose: bool = False,
     detail: str = "",
     always: bool = False,
+    cause: str | None = None,
 ) -> bool:
     """Verdict + message for a Hermiticity residual already reduced to scalars.
 
@@ -352,6 +356,17 @@ def report_hermitian_residual(
     hatch; a caller whose residual was already computed by the algorithm it is
     checking has no cost to escape, and an invariant that a stray environment
     variable can silence is not an invariant.  ``strict`` still raises.
+
+    ``cause`` replaces the default one-line diagnosis ("an index/shard mixing
+    bug, not a numerical one").  That default is right for a tile checked at
+    its CONSTRUCTION site, where hermiticity is exact by algebra and any
+    deviation is an indexing fault.  It is wrong for a residual measured
+    DOWNSTREAM of a long operator chain, where the caller may already know
+    what the deviation is and what it costs — see ``solvers/lanczos.py``'s
+    α gate, whose asymmetry is a measured, deterministic, size-independent
+    property of the screened-Coulomb tile W.  A caller that has done that
+    work should be able to say so in the message instead of pointing every
+    future reader at a collective bug that was ruled out.
     """
     if not (always or sanity_enabled()):
         return True
@@ -367,11 +382,13 @@ def report_hermitian_residual(
         print_fn(f"  sanity[{name}]: hermiticity residual = {rel:.3e} "
                  f"(abs {dev:.3e}, scale {scale:.3e})")
     if rel > float(rtol):
+        why = cause if cause is not None else (
+            "A Hermitian-by-construction tile losing hermiticity means an "
+            "index/shard mixing bug, not a numerical one.")
         warn(
             f"{name} is NOT Hermitian: max|A-Aᴴ|/max|A| = {rel:.3e} > "
             f"{float(rtol):.1e} (abs {dev:.3e} on scale {scale:.3e}).  "
-            f"A Hermitian-by-construction tile losing hermiticity means an "
-            f"index/shard mixing bug, not a numerical one.{suffix}",
+            f"{why}{suffix}",
             print_fn=print_fn,
         )
         return False
@@ -427,6 +444,151 @@ def check_hermitian(
         scale = float(np.max(np.abs(a)))
     return report_hermitian_residual(
         name, dev, scale, print_fn=print_fn, rtol=rtol, verbose=verbose)
+
+
+_NEGQ_STATS_CACHE: dict = {}
+
+
+def neg_q_index(kgrid) -> np.ndarray:
+    """Flat-q permutation ``q -> -q`` on a row-major ``(qx, qy, qz)`` grid.
+
+    The flat leading axis of ``V_qmunu`` / ``W0_qmunu`` is row-major over
+    ``kgrid`` — that is the layout ``bse_io._resolve_munu_reader`` reshapes
+    with (``.reshape(nkx, nky, nkz, mu, nu)``), so this permutation and the
+    BSE's own k-transform agree by construction.
+    """
+    nx, ny, nz = (int(v) for v in kgrid)
+    idx = np.arange(nx * ny * nz).reshape(nx, ny, nz)
+    return idx[
+        (-np.arange(nx)) % nx, :, :][:, (-np.arange(ny)) % ny, :][
+        :, :, (-np.arange(nz)) % nz].reshape(-1)
+
+
+def _negq_stats(a, neg):
+    """``[max|A_q − conj(A_{−q})|, max|A|]`` — ONE compiled module.
+
+    Cached on shape/dtype/sharding for the same reason :func:`_herm_stats`
+    is: ``jax.jit`` keys on function identity, so a fresh ``jit`` per gate
+    call recompiles every time.  The gather is along the flat-q axis, which
+    is replicated in every layout this gate is called from (``P(None, 'x',
+    'y')``), so it is a rank-local reshuffle and moves no μ-tile bytes.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    sharding = getattr(a, "sharding", None)
+    key = ("fn", a.shape, str(a.dtype), sharding, neg.tobytes())
+    fn = _NEGQ_STATS_CACHE.get(key)
+    if fn is None:
+        negj = jnp.asarray(neg)
+
+        @jax.jit
+        def fn(m):
+            mirror = jnp.conj(jnp.take(m, negj, axis=0))
+            if sharding is not None:
+                mirror = jax.lax.with_sharding_constraint(mirror, sharding)
+            return jnp.stack([
+                jnp.max(jnp.abs(m - mirror)).astype(jnp.float64),
+                jnp.max(jnp.abs(m)).astype(jnp.float64),
+            ])
+
+        _NEGQ_STATS_CACHE[key] = fn
+    return fn(a)
+
+
+def check_q_conjugate_reciprocity(
+    name: str,
+    tensor: Any,
+    kgrid,
+    *,
+    print_fn: Callable[..., Any] = print,
+    rtol: float = 1e-8,
+    verbose: bool = False,
+) -> bool:
+    """``A_q == conj(A_{−q})`` on a flat-q ``(nq, μ, μ)`` tile.
+
+    THE PROPERTY THE BSE KERNEL ACTUALLY DEPENDS ON, and it is *not*
+    per-q hermiticity.  In ``bse_stack_matvec._w_stack`` the index μ
+    attaches to the conduction pair and ν to the valence pair on BOTH the
+    encode and the decode side, so no μ↔ν transpose survives the
+    Hermitian conjugate of the assembled kernel::
+
+        H[(cvk),(c'v'k')] ∝ Σ_{μν} conj(ψ_c^{kμ}) ψ_{c'}^{k'μ}
+                                   ψ_v^{kν} conj(ψ_{v'}^{k'ν}) W(μ,ν; k−k')
+
+    and ``H = Hᴴ`` reduces to ``W_q = conj(W_{−q})`` alone.  Equivalently:
+    ``W_R = ifft_q(W_q)`` is REAL.  Per-q hermiticity is NEITHER NECESSARY
+    NOR SUFFICIENT for it — both directions are demonstrable — so
+    :func:`check_hermitian` on ``W[q=0]`` is a *neighbouring* property, and
+    a tile can pass it at 1e-15 while failing this one by ten orders.
+
+    Checking this at ``q=0`` ALONE is worthless: ``−0 == 0``, so the
+    condition degenerates to "``A[0]`` is real", which the analytic
+    assembly satisfies at machine epsilon whatever the other q's do.  The
+    gate is therefore over the WHOLE flat-q axis, which is also the only
+    cost that matters (one reduction, no μ-tile movement).
+
+    Residual is measured relative to the tensor's own scale:
+    ``max|A_q − conj(A_{−q})| / max|A|``.
+    """
+    if not sanity_enabled():
+        return True
+    a = tensor
+    nq = int(np.prod([int(v) for v in kgrid]))
+    if getattr(a, "ndim", 0) < 3 or int(a.shape[0]) != nq:
+        # Not a flat-q tile on this grid — nothing this gate can say.
+        return True
+    neg = neg_q_index(kgrid)
+    if _is_jax(a):
+        import jax
+
+        dev, scale = (
+            float(v) for v in np.asarray(jax.device_get(_negq_stats(a, neg))))
+    else:
+        arr = np.asarray(a)
+        dev = float(np.max(np.abs(arr - np.conj(arr[neg]))))
+        scale = float(np.max(np.abs(arr)))
+    return report_q_conjugate_residual(
+        name, dev, scale, print_fn=print_fn, rtol=rtol, verbose=verbose)
+
+
+def report_q_conjugate_residual(
+    name: str,
+    dev: float,
+    scale: float,
+    *,
+    print_fn: Callable[..., Any] = print,
+    rtol: float = 1e-8,
+    verbose: bool = False,
+    detail: str = "",
+) -> bool:
+    """Verdict + message for an already-reduced ``A_q vs conj(A_{−q})`` pair."""
+    if not sanity_enabled():
+        return True
+    dev = float(dev)
+    scale = float(scale)
+    suffix = f"  {detail}" if detail else ""
+    if not np.isfinite(dev) or not np.isfinite(scale):
+        warn(f"{name} q↔−q conjugate residual is not finite "
+             f"(max|A_q-conj(A_-q)|={dev}, max|A|={scale}).{suffix}",
+             print_fn=print_fn)
+        return False
+    rel = dev / scale if scale > 0.0 else dev
+    if verbose:
+        print_fn(f"  sanity[{name}]: q↔−q conjugate residual = {rel:.3e} "
+                 f"(abs {dev:.3e}, scale {scale:.3e})")
+    if rel > float(rtol):
+        warn(
+            f"{name} violates q↔−q conjugate reciprocity: "
+            f"max|A_q - conj(A_-q)|/max|A| = {rel:.3e} > {float(rtol):.1e} "
+            f"(abs {dev:.3e} on scale {scale:.3e}).  Equivalently ifft_q(A) "
+            f"is NOT real.  This is the property the BSE kernel's "
+            f"hermiticity rests on; per-q hermiticity does NOT imply it and "
+            f"a q=0-only check cannot see it.{suffix}",
+            print_fn=print_fn,
+        )
+        return False
+    return True
 
 
 def check_positive(

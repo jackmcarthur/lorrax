@@ -519,7 +519,8 @@ def compute_screening(
                     role=req.role)
             with timing.section("W.gate", announce=True,
                                 label=f"{_w} finiteness + hermiticity gate"):
-                _gate_w(W_static, req, print_fn=print_fn)
+                _gate_w(W_static, req, print_fn=print_fn,
+                        kgrid=tuple(meta.kgrid))
             W_by_role[req.role] = W_static
             bar.step()
             continue
@@ -545,7 +546,7 @@ def compute_screening(
             chi0_probe_reused = None   # donated into solve_w — dead ref
             with timing.section("W.gate", announce=True,
                                 label=f"{_w} finiteness + hermiticity gate"):
-                _gate_w(W, req, print_fn=print_fn)
+                _gate_w(W, req, print_fn=print_fn, kgrid=tuple(meta.kgrid))
             W_by_role[req.role] = W
             bar.step()
             continue
@@ -585,7 +586,8 @@ def compute_screening(
     return W_by_role
 
 
-def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print) -> None:
+def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
+            kgrid=None) -> None:
     """Stage gate on one solved W — the Dyson solve is the fragile seam.
 
     ``W = (1 − Vχ₀)⁻¹V`` is the only place in the GW flow where a matrix
@@ -600,6 +602,18 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print) -> None:
     ω = iω_p, both on axes where χ₀ is Hermitian); the real-axis HL probe
     is *not* Hermitian in general, so hermiticity is only asserted on the
     imaginary/zero-frequency branch.
+
+    THE HERMITICITY CHECK IS NOT THE ONE THE BSE NEEDS, and on its own it
+    is how this seam stayed green while broken.  ``W[q=0]`` passes
+    :func:`check_hermitian` at 1e-15 on every fixture measured while
+    ``W_q = conj(W_{−q})`` — the condition the BSE kernel's own hermiticity
+    reduces to, equivalently "``W_R`` is real" — fails at 9.1e-4
+    (armA_base480, 2026-08-07).  The two are independent: per-q hermiticity
+    is neither necessary nor sufficient for the reciprocity.  Worse, the
+    old gate's ``q=0`` restriction makes the *right* property untestable
+    too, since ``−0 == 0`` collapses it to "``W[0]`` is real", which holds
+    at 1.9e-11 regardless.  Both are now checked, and the reciprocity one
+    is checked over the whole flat-q axis.
     """
     from common import sanity
 
@@ -610,6 +624,17 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print) -> None:
         # rtol is generous — this catches structural mixing, not roundoff.
         sanity.check_hermitian(f"{label}[q=0]", W[0], rtol=1e-6,
                                print_fn=print_fn)
+        # The load-bearing property, over ALL q.  Tolerance: W is exact
+        # here by construction — ζ satisfies the same reciprocity at
+        # 4.7e-16 (measured, all 64 q) and the only arithmetic between ζ
+        # and W is the analytic V assembly plus one Dyson solve, whose own
+        # round-off shows up as the 1.9e-11 residual at the self-conjugate
+        # q=0 slab.  1e-8 sits three orders above that floor and four
+        # orders below the 9.1e-4 break present today, so it cannot fire on
+        # round-off and cannot miss a structural break.
+        if kgrid is not None:
+            sanity.check_q_conjugate_reciprocity(
+                f"{label}[all q]", W, kgrid, rtol=1e-8, print_fn=print_fn)
 
 
 __all__ = [
