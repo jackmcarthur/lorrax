@@ -5,6 +5,13 @@ MPICH, and the Shifter container runtime. The site-specific paths, SLURM default
 literal NERSC values (`m2651`, `interactive` QOS, `/opt/udiImage`, …) live here, kept out of
 the generic [Installation](index.md) tracks.
 
+!!! warning "`lx`, `lxpre`, `lxrun` are installed, not checked in"
+    Every command below that starts with `lx` comes from the Lmod module that
+    `config/perlmutter/install.sh` writes. None of them is in this repository,
+    so `git grep lxrun` finds nothing and that is correct. The underlying
+    python modules (`centroid.kmeans_cli`, `psp.get_dipole_mtxels`,
+    `gw.kin_ion_io`, `gw.gw_jax`) *are* in the tree and can be run directly.
+
 !!! note "Authoritative sources"
     This page is a short orientation. The authoritative, maintained references are
     [`config/README.md`](../../config/README.md) (module, `lxalloc`/`lxrun`/`lxpre`,

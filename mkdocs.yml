@@ -81,6 +81,14 @@ nav:
       - SlabIO (sharded-slab HDF5): architecture/slab_io.md
       - Memory model: architecture/memory-model.md
   - Services:
-      - distrib_la (distributed dense linalg): services/distrib_la.md
-      - symmetry_maps (k-grid reduction, stars, unfolds): services/symmetry_maps.md
+      - Overview — why services exist: services_overview.md
+      - Distributed linear algebra: distributed_linalg.md
+      - Wavefunction and zeta I/O: wavefunction_io.md
+      - Symmetry: symmetry.md
+      - The Coulomb interaction: coulomb.md
+      - 'API reference: distrib_la': services/distrib_la.md
+      - 'API reference: wfn_loader': services/wfn_loader.md
+      - 'API reference: zeta_loader': services/zeta_loader.md
+      - 'API reference: symmetry_maps': services/symmetry_maps.md
+      - 'API reference: vcoul': services/vcoul.md
   - Contributing: contributing.md

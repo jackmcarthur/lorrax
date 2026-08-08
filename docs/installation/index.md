@@ -14,12 +14,16 @@ from the matrix below; the pure-JAX core works with zero native libraries.
 
 | Config | OS | CUDA | JAX | MPI | parallel HDF5 | Runtime | FFI features | Tested |
 |---|---|---|---|---|---|---|---|---|
-| **Pure-JAX (no FFI)** | any | 13 or none | ≥0.7,<0.10 | — | — | bare venv | none (serial only) | CI / CPU |
+| **Pure-JAX (no FFI)** | any | 13 or none | ≥0.7,<0.10 | — | — | bare venv | none (single-process only — see the note below) | CI / CPU |
 | **NERSC Perlmutter (reference)** | SLES 15 | 12.9 (staged native libs) | **0.7.0** (container `ghcr.io/nvidia/jax:jax-2025-07-21`; inside the declared window — see below) | Cray MPICH | cray-hdf5-parallel | Shifter | all | 1–4 nodes × 4 A100 |
 | **Generic Cray EX** | — | 12.x/13.x | ≥0.7,<0.10 | Cray MPICH | cray-hdf5-parallel | Apptainer | all | untested |
 | **Generic SLURM + OpenMPI** | Linux x86_64 | 12.x/13.x | ≥0.7,<0.10 | OpenMPI 4/5 + UCX | conda-forge `hdf5=*mpi_openmpi*` | Apptainer / bare venv | all | untested |
 
-Only the pure-JAX path works with **zero native libs**. Everything distributed needs the
+Only the pure-JAX path works with **zero native libs**, and only for a
+single-process run: **since the 2026-08-01 ruling the FFI layer is REQUIRED**,
+enforced at startup step 6b (`runtime.__init__._enforce_required_ffi` →
+`ffi.gate.enforce`), so a distributed or CPU-mesh run without a loadable `.so`
+refuses rather than falling back. Everything distributed needs the
 [FFI native-library stack](ffi-native-libs.md).
 
 !!! note "The reference platform's JAX version — resolved 2026-08-06"
@@ -67,7 +71,9 @@ Only the pure-JAX path works with **zero native libs**. Everything distributed n
     A fresh `git clone` has **no** `liblorrax_ffi.so` (it is a gitignored build artifact).
     The pure-JAX path never touches it (all FFI imports are lazy), but the first time you
     run a distributed / FFI-I/O code path you will hit
-    `FileNotFoundError … Build with: bash src/ffi/cpp/build.sh`.
+    a `FileNotFoundError` naming the platform's build recipe
+    (`src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh` for CUDA,
+    `bash src/ffi/cpp/build_host.sh` for the host library).
     Build the native library per [FFI native libraries](ffi-native-libs.md) before
     using those features.
 

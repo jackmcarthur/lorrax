@@ -50,10 +50,10 @@ src/
 │   ├── greens_function_kernel.py  build_G (single entry point)
 │   ├── head_correction.py     q→0 head sample + exact static head terms
 │   ├── wavefunction_bundle.py BandSlices + Wavefunctions (4 sharded ψ copies); project, project_ri (band-space contractions)
-│   ├── coulomb/               dimension-aware Coulomb kernels behind get_kernel():
-│   │                            base.py (SysDim, dispatcher, mini-BZ sampler),
+│   ├── coulomb/               wfn/Meta-facing translation onto the vcoul door:
+│   │                            base.py (dispatcher, mini-BZ sampler),
 │   │                            bulk_3d.py, slab_2d.py, box_0d.py
-│   ├── vcoul.py               MC q=0 averages, Voronoi wrap helpers
+│   ├── vcoul.py               q=0 average + Voronoi wrap translation, and a CLI
 │   ├── compute_vcoul.py       V_qμν from ζ (μ-chunked FFT + H5 prefetch); compute_v_q_per_G
 │   ├── compute_vcoul_0d.py    box-truncated Coulomb driver (molecules)
 │   ├── qsgw_utils.py          diagonal fixed-point + QSGW from sigma_mnk.h5
@@ -62,10 +62,6 @@ src/
 │
 ├── common/               # Shared kernels + utilities
 │   ├── meta.py                Meta dataclass (system params, band edges)
-│   ├── symmetry_maps.py       forwarding shim → services/symmetry_maps
-│   ├── load_wfns.py           WFN.h5 reads, per-k FFT, kchunk helpers
-│   ├── isdf_fitting.py        CCT/ZCT kernels, Cholesky, zeta solve, full pipeline
-│   ├── cholesky_2d.py         2D blocked Cholesky (sharded)
 │   ├── fft_helpers.py         flat-k ↔ 3D k FFT helpers via custom_partitioning
 │   ├── gvec_fft_box.py        sphere ↔ FFT-box gather (G-space layouts)
 │   ├── chi_from_dipole.py     S(ω) tensor from dipole matrix elements
@@ -83,7 +79,7 @@ src/
 │   └── phdf5_*                phdf5 benchmarks + plumbing tests
 │
 ├── file_io/              # Canonical file-format I/O (used by gw_jax)
-│   ├── wfn_loader.py          SHIM -> services/wfn_loader/ (WFNReader alias lives here)
+│   ├── __init__.py            re-exports WfnLoader from the service; WFNReader alias
 │   ├── wfn_writer.py          BGW-compatible WFN.h5 writer
 │   ├── epsreader.py           EPSReader (eps0mat / epsmat)
 │   ├── qe_save_reader.py      CrystalData from QE .save
@@ -94,9 +90,8 @@ src/
 │   ├── centroids.py           centroid file loader
 │   ├── paths.py               path resolution helpers
 │   ├── read_bgw_vcoul.py      BGW vcoul table reader (diagnostic override)
-│   └── slab_io.py             SlabIO: MPI-IO-like phdf5 writer (+ allgather fallback)
-│       _slab_io_ffi.py          phdf5 FFI backend
-│       _slab_io_allgather.py    plain-h5py rank-0 backend
+│   └── slab_io.py             SlabIO: collective MPI-IO phdf5 transport
+│       _slab_io_ffi.py          the one transport (phdf5 FFI)
 │
 ├── ffi/                  # XLA FFI bridge to native libraries
 │   ├── common/                ffi_loader (ctypes) + cpp (CMake) → liblorrax_ffi.so
@@ -201,7 +196,7 @@ Accessors: `wfns.xn(s.val)`, `wfns.xr(s.sigma)`, etc.
 
 ### 2.4 `WfnLoader` — `services/wfn_loader/src/wfn_loader/loader.py`
 
-**Moved 2026-08-07** (wave-1 service extraction). `src/file_io/wfn_loader.py` is now a transitional SHIM that re-exports the same objects, and it dies in the phase-wide cleanup after all four wave-1 branches land — do not edit it, and do not add code there. Full page: [docs/services/wfn_loader.md](../services/wfn_loader.md).
+**Moved 2026-08-07** (wave-1 service extraction); the transitional shim at `src/file_io/wfn_loader.py` was deleted in `029da824`, so `from file_io.wfn_loader import …` now raises. Import the door: `import wfn_loader`. Narrative: [docs/wavefunction_io.md](../wavefunction_io.md); contract: [docs/services/wfn_loader.md](../services/wfn_loader.md).
 
 Reads BerkeleyGW `WFN.h5`. `backend='auto'` (default) picks `eager` (h5py + numpy) or `phdf5` (one collective read through `SlabIO.read_slabs` + on-device unfold), and the two are held **byte-identical**. Symmetry unfolding is the loader's: `SymMaps.get_gvecs_kfull` / `get_cnk_fullzone[_batch]` moved into it, and `SymMaps` keeps the sym tables and the IBZ k/q maps. The legacy `WFNReader` / `PhdfWfnReader` readers (formerly in both `common/` and `file_io/`) were consolidated into this single class; `PhdfWfnReader` is gone and `WFNReader` remains as a back-compat alias (`from file_io import WfnLoader as WFNReader`) used by the GW driver, BSE, and benchmarks.
 
@@ -216,9 +211,10 @@ IBZ → full BZ unfolding. Builds the full mesh, k→q maps, spinor SU(2) rotati
 Since 2026-08-07 this class, the k-star index map, the sharded q-axis
 unfolds, the real-space orbit machinery and the TRS measurement live in
 `services/symmetry_maps/` and are reached by `import symmetry_maps` —
-never through a submodule path. `src/common/symmetry_maps.py`,
-`src/centroid/orbit_syms.py` and `src/common/density_symmetry_check.py`
-are forwarding shims that the phase-wide cleanup commit deletes. Read
+never through a submodule path. The forwarding shims at
+`src/common/symmetry_maps.py`, `src/centroid/orbit_syms.py` and
+`src/common/density_symmetry_check.py` were deleted in `029da824`. Read
+[`docs/symmetry.md`](../symmetry.md) for the story and
 [`docs/services/symmetry_maps.md`](../services/symmetry_maps.md) for the
 contract — in particular which conjugation predicate goes with which
 operand flavour, which is a 183.61 eV question.
@@ -229,13 +225,20 @@ Reads `eps0mat.h5` / `epsmat.h5`. Used only by the `epshead` head source (`head_
 
 ### 2.7 `SlabIO` — `src/file_io/slab_io.py`
 
-Sharded HDF5 writer with three backends (selected by `SlabIOBackend` enum; the deprecated `use_ffi_io: bool` kwarg/input-key is still coerced for back-compat):
+Sharded HDF5 writer with **one transport and no selector**. The three
+backend tiers, the `SlabIOBackend` enum, the capability router, the
+`slab_io` deck key and the deprecated `use_ffi_io` key were all deleted on
+2026-08-06; `slab_io` is now a warn-and-ignore legacy key. The constructor
+is `SlabIO(path, *, mode="w", mesh)`.
 
-- `PHDF5_FFI` → `_slab_io_ffi.py` (parallel HDF5 via the phdf5 FFI). Each rank writes its own hyperslab; collective MPI-IO writes are the default (`LORRAX_PHDF5_COLLECTIVE_WRITES=0` reverts to independent — same knob, same default as the Python host writer since 2026-07-27), with rank-local replica dedup (`LORRAX_PHDF5_DEDUP_REPLICAS=0` disables). Available on BOTH backends: the C++ core compiles into the CUDA lib and, under `LORRAX_FFI_NO_CUDA`, into the CUDA-free host lib, where the D2H staging collapses to an in-place read of the XLA host buffer (workstream AE).
-- `PHDF5_HOST` → `_slab_io_mpi_host.py` (parallel HDF5 via mpi4py + h5py(parallel)). Same per-rank parallel-write semantics, driven from Python. Second CPU tier — for a host lib built without the write handler; needs the mpi4py overlay that the FFI path does not.
-- `H5PY_ALLGATHER` → `_slab_io_allgather.py` (all-gather to rank 0 then serial h5py). Last-resort fallback for systems without parallel HDF5; slow at scale, and the gather is the dominant collective in a large run.
-
-The `LorraxConfig.from_input_file` builder routes `slab_io = auto` (the default) UNCONDITIONALLY through a capability-probed router — no other input key gates it. On CPU, `_route_cpu_slab_io` probes `ffi_loader.probe_target('lorrax_phdf5_write', 'cpu')` and picks PHDF5_FFI → PHDF5_HOST (the tier-2 probe really runs `MPI_Init_thread`, so a PMI-mismatched harness demotes instead of dying) → H5PY_ALLGATHER. On GPU, `_route_gpu_slab_io` applies the same two conditions — the CUDA lib exports the write handler, and `_probe_mpi_bootstrap_ffi('CUDA')` says MPI can bootstrap — else PHDF5_HOST/H5PY_ALLGATHER. **Node count is not a condition.** It was until 2026-08-05, when the router declined PHDF5_FFI unconditionally at `SLURM_JOB_NUM_NODES > 1` without probing; that arm generalised an Intel-MPI-on-Frontera launcher misconfiguration to the Cray-MPICH/Shifter GPU path, and was deleted after 16 ranks on 4 Perlmutter nodes wrote and read bit-exactly through PHDF5_FFI with `MPI_Comm_size` asserted (see `docs/architecture/slab_io.md`). Every decision is logged with the tier and, on a demotion, the probe's reason. The deprecated `use_ffi_io` input key: `false` forces H5PY_ALLGATHER (warned), `true` is a no-op, and it is ignored when `slab_io` is explicit.
+The transport is `_slab_io_ffi.py` — parallel HDF5 via the phdf5 FFI. Each
+rank writes its own hyperslab; collective MPI-IO writes are the default
+(`LORRAX_PHDF5_COLLECTIVE_WRITES=0` reverts to independent), with rank-local
+replica dedup (`LORRAX_PHDF5_DEDUP_REPLICAS=0` disables). The C++ core
+compiles into the CUDA lib and, under `LORRAX_FFI_NO_CUDA`, into the
+CUDA-free host lib, where the D2H staging collapses to an in-place read of
+the XLA host buffer. Why the tiers went, and what they were:
+[slab_io.md](slab_io.md#slab-io-one-transport).
 
 Used for `zeta_q.h5` and `V_qmunu.h5` (big files), and for `sigma_mnk.h5` via `write_sigma_omega_h5`.
 
@@ -293,7 +296,7 @@ Centroid-space (μ_X, ν_Y) is the dominant sharding. Flat-k / flat-q arrays are
 
 - **Σ^c(ω) project** (`ppm_sigma._make_project_ri_reduce_scatter`): replaces the naive `project_ri(ψ* σ ψ)` with a `shard_map` that uses two `psum_scatter` operations — one over `'x'` scattering the `m` index, one over `'y'` scattering `n`. Same NCCL byte volume as two psums, but output arrives `(m_X, n_Y)`-sharded, so every downstream `coeff·σ` multiply stays local.
 
-- **Cholesky** (`cholesky_2d.cholesky_2d_batched`): operates on tile layout `P(None, 'x', 'y', None, None)`. Panel broadcasts + triangular updates use `lax.psum` over axis `'x'`. Falls back to dense `jnp.linalg.cholesky` when `mesh.size == 1`.
+- **Cholesky** (`distrib_la`, backend `native2d`): operates on tile layout `P(None, 'x', 'y', None, None)`. Panel broadcasts + triangular updates use `lax.psum` over axis `'x'`. Falls back to dense `jnp.linalg.cholesky` when `mesh.size == 1`. Reached as `plan('cholesky', mesh, backend='native2d')`; `auto` never selects it, deliberately — see [docs/distributed_linalg.md](../distributed_linalg.md).
 
 - **Triangular solve** (`isdf_fitting.solve_zeta_from_L_q`): loops over q-batches of size `q_chunk_size` (default 1); gathers `L_q[q0:q1]` to replicated, runs vmapped `solve_triangular` inside a `shard_map` over `('x','y')` flattened as a single scatter axis for the column dimension. Python loop with `donate_argnums` forces sequential GPU execution (fori_loop SPMD-replicates the carry; scan unrolled OOMs).
 
@@ -328,8 +331,7 @@ WFN.h5 + WFNq.h5 + centroids_frac.h5 + (eps0mat.h5, dipole.h5 optional)
     │  WFNReader, SymMaps, load_centroids
     │  Meta.from_system, BandSlices.from_band_edges
     │  mesh_xy = _build_mesh()
-    │  if slab_io is PHDF5_FFI: phdf5_init_mpi() (eager MPI_THREAD_MULTIPLE init;
-    │                            PHDF5_HOST warms mpi4py the same way)
+    │  phdf5_init_mpi() (eager MPI_THREAD_MULTIPLE init)
     │  ensure_jax_compile_cache()
     ▼
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -527,22 +529,22 @@ lxrun python3 -m common.phdf5_write_test
 
 ```
 prepare_isdf_and_wavefunctions          [gw/gw_init.py]
- ├─ fit_zeta_chunked_to_h5               [common/isdf_fitting.py]
- │   ├─ load_centroids_band_chunked       [common/load_wfns.py]
- │   │   └─ read_Gvecs_to_devices           [common/load_wfns.py]
- │   ├─ compute_pair_density_spin_{traced,matrix}  [common/isdf_fitting.py]
- │   ├─ compute_CCT_from_left_right[_spin_matrix]  [common/isdf_fitting.py]
+ ├─ fit_zeta_to_h5                       [gw/isdf_fitting.py]
+ │   ├─ load_centroids_band_chunked       [common/wfn_transforms.py]
+ │   │   └─ read_Gvecs_to_devices           [common/wfn_transforms.py]
+ │   ├─ pair_density                       [isdf/core.py]
+ │   ├─ c_q_from_psi_sm                    [isdf/core.py]
  │   │   └─ make_flat_k_{fftn,ifftn}        [common/fft_helpers.py]
- │   ├─ compute_L_q_from_CCT               [common/isdf_fitting.py]
- │   │   └─ cholesky_2d_batched            [common/cholesky_2d.py]
+ │   ├─ factor_c_q                         [isdf/core.py]
+ │   │   └─ plan('cholesky'|'solve_lu', …)  [distrib_la — the door]
  │   └─ z-chunk loop:
- │       ├─ compute_ZCT_from_left_right_zchunk    [common/isdf_fitting.py]
- │       ├─ solve_zeta_from_L_q             [common/isdf_fitting.py]
- │       └─ SlabIO.write_slab               [file_io/slab_io.py]
+ │       ├─ z_q_from_psi_sm                [isdf/core.py]
+ │       ├─ solve_zeta                     [isdf/core.py]
+ │       └─ SlabIO.write_slab              [file_io/slab_io.py]
  └─ compute_all_V_q  (dispatcher)        [gw/compute_vcoul.py]
      └─ compute_all_V_q_g_flat            [gw/v_q_g_flat.py]
-         ├─ compute_v_q_per_G             [gw/compute_vcoul.py]
-         └─ ZetaReader.read_slab          [file_io/zeta_reader.py]
+         ├─ compute_v_q_per_G             [gw/compute_vcoul.py → vcoul door]
+         └─ ZetaLoader.read_zeta_G_slab   [zeta_loader — the door]
 ```
 
 ### 8.2 Screening + static Σ
@@ -623,15 +625,15 @@ main                                       [gw/gw_jax.py]
 | **Load WFN.h5** | `services/wfn_loader/ : WfnLoader` (`import wfn_loader`, after `ffi._services.ensure_on_path()`); band-chunked FFT `common/wfn_transforms.py` |
 | **Symmetry unfolding** | `symmetry_maps : SymMaps.get_cnk_fullzone[_batch]` (service door) |
 | **Flat-k FFT helpers** | `common/fft_helpers.py : make_flat_k_fftn`, `make_flat_k_ifftn` |
-| **Pair density (spin-traced)** | `common/isdf_fitting.py : compute_pair_density_spin_traced` |
-| **CCT matrix** | `common/isdf_fitting.py : compute_CCT_from_left_right[_spin_matrix]` |
-| **Cholesky factorization** | `common/isdf_fitting.py : compute_L_q_from_CCT` → `common/cholesky_2d.py : cholesky_2d_batched` |
-| **ZCT matrix (z-chunk)** | `common/isdf_fitting.py : compute_ZCT_from_left_right_zchunk` |
-| **ζ solve** | `common/isdf_fitting.py : solve_zeta_from_L_q` |
-| **Full ζ pipeline** | `common/isdf_fitting.py : fit_zeta_chunked_to_h5` |
+| **Pair density** | `isdf/core.py : pair_density` |
+| **C_q matrix** | `isdf/core.py : c_q_from_psi_sm` |
+| **Cholesky / LU factorization** | `isdf/core.py : factor_c_q` → the `distrib_la` door ([docs/distributed_linalg.md](../distributed_linalg.md)) |
+| **Z_q matrix (z-chunk)** | `isdf/core.py : z_q_from_psi_sm` |
+| **ζ solve** | `isdf/core.py : solve_zeta` |
+| **Full ζ pipeline** | `gw/isdf_fitting.py : fit_zeta_to_h5` |
 | **Compute V_q** | `gw/compute_vcoul.py : compute_all_V_q` → `gw/v_q_g_flat.py : compute_all_V_q_g_flat` (charge) / `gw/v_q_bispinor.py : compute_V_q_bispinor_g_flat_to_h5` (bispinor) |
-| **Voronoi MC for q=0** | `gw/vcoul.py : compute_q0_averages`, or `gw/coulomb/base.py : sample_minibz_qpoints` + each kernel's `q0_average` |
-| **Coulomb kernel + truncation** | `gw/coulomb/` — `get_kernel(meta.sys_dim)` → `Bulk3D` (3) \| `Slab2D` (2) \| `Box0D` (0). Production `v(q+G)` enters at `gw/compute_vcoul.py : compute_v_q_per_G`. *(This row named `gw/vcoul.py : compute_V_qfullG_for_q` until 2026-08-06; that function does not exist anywhere in `src/`.)* **On `feat/vcoul-consolidation-2026-08-06` (unmerged)** `compute_v_q_per_G` becomes a thin dispatcher over one `coulomb/base.py : v_qG_table` driver: each kernel contributes only `_v_bare_per_q` (the dimension's bare formula at one q), and the per-q loop, the `vcoul_cutoff_ry` mask, the G=0 head-slot injection and the `(n_q, ngkmax)` float64 contract live once — so the cutoff, head injection and batching that used to exist only in `compute_vcoul` become available in every dimension, and `Box0D` refuses q≠0 rather than returning a wrong number. |
+| **Voronoi MC for q=0** | `gw/vcoul.py : compute_q0_averages` / `gw/coulomb/base.py : sample_minibz_qpoints` translate onto the `vcoul` mini-BZ machinery. Why the average exists at all, and the draw-convention trap: [docs/coulomb.md](../coulomb.md) |
+| **Coulomb kernel + truncation** | The `vcoul` service owns the physics — `get_kernel(sys_dim)` → `Bulk3D` (3) \| `Slab2D` (2) \| `Box0D` (0), and one `v_qG_table` driver for all three. `gw/coulomb/`, `gw/vcoul.py` and `gw/compute_vcoul.py` are the wfn/`Meta`-facing translation layer over that door. Narrative: [docs/coulomb.md](../coulomb.md); contract: [docs/services/vcoul.md](../services/vcoul.md). |
 | **χ₀ minimax kernel** | `gw/w_isdf.py : _get_chi_minimax_kernel`, `compute_chi0_minimax` |
 | **W Dyson solve** | `gw/w_isdf.py : solve_w`, `_get_w_solve_fn` |
 | **Static minimax lookup** | `gw/minimax_screening.py : build_static_minimax_window_pair` |
@@ -651,13 +653,13 @@ main                                       [gw/gw_jax.py]
 | **Anderson mixing (SC)** | `mixing/acceleration.py : rcrop_nojit`, `hermitian_to_upper_flat` |
 | **Write sigma_mnk.h5** | `file_io/sigma_output.py : write_sigma_omega_h5` |
 | **Write eqp.dat / eqp1.dat** | `file_io/sigma_output.py : write_eqp_g0w0`, `write_eqp1` |
-| **SlabIO (phdf5 writer)** | `file_io/slab_io.py : SlabIO` (backends in `_slab_io_ffi.py` / `_slab_io_allgather.py`) |
+| **SlabIO (phdf5 writer)** | `file_io/slab_io.py : SlabIO` (the one transport is `_slab_io_ffi.py`) |
 | **Centroid selection** | `centroid/kmeans_cli.py : main` (algorithm: `centroid/kmeans_isdf.py`) |
 | **Dipole generation** | `psp/get_dipole_mtxels.py : main` |
 | **kin_ion generation** | `gw/kin_ion_io.py : main` |
 | **FFI loader** | `ffi/common/ffi_loader.py : phdf5_init_mpi`, `register_handlers` |
 | **cuSOLVERMp eigh** | `ffi/cusolvermp/eigh.py`, smoke test `tests/bench/cusolvermp_eigh_test.py` |
-| **SLATE eigh / Cholesky / trsm** | `ffi/slate/` , tests `tests/bench/slate_*_test.py` |
+| **SLATE eigh / Cholesky / trsm** | `distrib_la._slate` (C++ handlers in `src/ffi/cpp/slate/`), tests `tests/bench/slate_*_test.py` |
 | **phdf5 R/W** | `ffi/phdf5/` , benchmarks `common/phdf5_*.py` |
 
 ---

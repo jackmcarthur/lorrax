@@ -30,7 +30,7 @@ Five, outermost first. Each one can refuse; none silently substitutes.
 | # | Layer | Lives in | Job |
 |---|---|---|---|
 | 1 | **Consumer** | `src/gw/`, `src/file_io/`, `src/bse/`, … | states *logical* intent — shapes, not strides |
-| 2 | **Service facade** (Python) | `src/ffi/io.py`, `fft.py`, `gemm.py`, `linalg/` | owns the gate grammar, builds the descriptor, picks a backend |
+| 2 | **Service facade** (Python) | `src/ffi/io.py`, `fft.py`, `gemm.py`; and `distrib_la` for the linalg half | owns the gate grammar, builds the descriptor, picks a backend |
 | 3 | **Gate** | `src/ffi/gate.py` | announce-or-refuse; an explicit request that cannot be honoured **refuses**, never downgrades |
 | 4 | **XLA FFI custom call** | `src/ffi/common/ffi_loader.py` | resolves handler symbols out of the built `.so` |
 | 5 | **C++ handler + vendor library** | `src/ffi/cpp/<vendor>/` | the actual MPI-IO / BLAS / FFT / solver call |
@@ -46,16 +46,19 @@ are how the required layer remains buildable everywhere.
 ### Python-side module map
 
 `src/ffi/io.py` (the parallel-HDF5 service), `fft.py` (flat-k FFT),
-`gemm.py` (batched vendor GEMM), `gate.py`, and the `linalg/` facade are the
-real modules. `phdf5/`, `slate/`, `scalapack/`, `mklfft/`, `mklblas/`,
-`cufft/` survive as **re-export shims** — `src/ffi/phdf5/` is 40 lines
-across four files.
+`gemm.py` (batched vendor GEMM) and `gate.py` are the real modules; the
+linalg facade left for `services/distrib_la/`. `phdf5/`, `mklfft/`,
+`mklblas/`, `cufft/` survive as **re-export shims** — `src/ffi/phdf5/` is 40
+lines across four files. `slate/` and `scalapack/` are **gone**: their
+Python halves moved to `distrib_la._slate` / `._scalapack` and the old
+packages were deleted in `b3f3675`. The C++ handlers under
+`src/ffi/cpp/slate/` and `src/ffi/cpp/scalapack/` did not move.
 
 Deleting a shim is gated on its consumers moving, and **one has now moved
 in part**: outside `src/ffi/` there are **5** `ffi.phdf5` references left
-(down from 10), all in `file_io/_slab_io_ffi.py` — `file_io/wfn_loader.py`
-had 3 and has none since the wave-1 wfn_loader extraction promoted the
-union read into `SlabIO.read_slabs` (2026-08-07,
+(down from 10, re-counted at this head), all in `file_io/_slab_io_ffi.py` —
+the wavefunction loader had 3 and has none since the wave-1 extraction
+promoted the union read into `SlabIO.read_slabs` (2026-08-07,
 [docs/services/wfn_loader.md](../services/wfn_loader.md)). Also 6 `ffi.mklblas`
 (`common/contract_bands.py`), and 4 `ffi.mklfft` (`common/fft_helpers.py`,
 `gw/ppm_tau_kernel.py`) — counted at `886139f` and **re-counted unchanged at
@@ -160,9 +163,10 @@ Four gaps, worst first.
    nothing *binds* at load time; after that the engine arrives by `dlopen`
    and no static tool can see it. The gate written for this — **GATE 8**,
    `src/ffi/cpp/gate_one_fftw.sh`, which drives one real flat-k FFT and
-   reads `/proc/self/maps` — **exists, is certified, and is not on this
-   branch.** It is four commits (707 insertions) on
-   `fix/host-ffi-fftw-container-stage-2026-08-06`, unmerged:
+   reads `/proc/self/maps` — **exists, is certified, and has LANDED**
+   (verified with `git merge-base --is-ancestor` against `origin/main`).
+   It is four commits (707 insertions) from
+   `fix/host-ffi-fftw-container-stage-2026-08-06`:
 
    ```
    c973968 docs(env_vars): register the five deployment variables the FFTW3 stage adds
@@ -456,18 +460,13 @@ is a refusal above one process, not a fallback** (owner ruling 2026-08-05,
 implemented `0d8e50c`). It is not a tier the system may choose; it is a tier
 the system refuses to choose.
 
-> **A gap in that refusal, found 2026-08-06.** The rule is enforced in
-> `gw/gw_config.py` — `_refuse_explicit_h5py_allgather` and
-> `_refuse_slab_io_no_parallel_writer`, both of which always raise, and both
-> placed after the whole precedence chain so no deck branch escapes them.
-> **But it is deck-level only.** The library entry point
-> `file_io/slab_io.py:88-90` still returns `SlabIOBackend.H5PY_ALLGATHER`
-> when `use_ffi_io is None`, at any process count, and `:97-98` maps
-> `use_ffi_io=False` the same way. A caller who constructs `SlabIO` directly
-> instead of going through a parsed deck still reaches the tier at P>1.
-> Anywhere you read "both routes raise at parse time" — including on this
-> page before today — that is a statement about the deck router, which is
-> the only place it is true.
+> **That gap is CLOSED.** It was real on 2026-08-06: the deck router raised,
+> but the library entry point still returned `SlabIOBackend.H5PY_ALLGATHER`
+> when `use_ffi_io is None`, so a caller constructing `SlabIO` directly
+> reached the tier at P>1. The one-transport collapse removed the tier
+> itself — there is no enum, no `use_ffi_io`, no router, and
+> `_slab_io_allgather.py` does not exist — so the statement is now true at
+> both levels because there is nothing left to select.
 
 ---
 
@@ -498,7 +497,7 @@ does not depend on.
 
 **Boolean grammar.** All the flags parse through `env_flag`
 (`context.cc`), which mirrors Python's
-`file_io/_slab_io_mpi_host._env_flag` exactly: unset or exactly-empty →
+`file_io/_slab_io_ffi`'s boolean parse exactly: unset or exactly-empty →
 the default; otherwise trimmed, lowercased, and **true only for
 `1` / `true` / `yes` / `on`**. Everything else is false — including `off`,
 `no`, and any typo. There is no "unrecognised value" diagnostic, so
@@ -662,16 +661,20 @@ substituted default is a wrong answer with a long fuse.**
 
 ## 9. Deletion candidates and open work
 
-* **cusolvermp** (~2800 LOC): 11 import sites outside `src/ffi` at
-  `886139f`. The distributed CPU story is ScaLAPACK; the GPU story is
-  SLATE. Deletion removes the `auto|cusolvermp` spelling from the linalg
-  backend grammar — an input-deck surface, so it needs the deprecation
-  window plus a GPU run proving SLATE covers the eigh/LU tiers cusolvermp
-  served.
+* **cusolvermp — NO LONGER A DELETION CANDIDATE (2026-08-07).** The
+  premise was that SLATE covers the GPU tiers. Measured, it does not:
+  SLATE's CUDA eigh SIGSEGVs at n ≥ 4096 on a multi-rank mesh (bug L-4),
+  which is exactly where a distributed eigensolver becomes necessary, and
+  its asymptotics are already 2.8× worse than cuSOLVERMp at n = 2048.
+  cuSOLVERMp is the CUDA `distributed` resolution for both `eigh` and
+  `solve_lu`. See [docs/distributed_linalg.md](../distributed_linalg.md)
+  for the table and [docs/services/distrib_la.md](../services/distrib_la.md)
+  § Backends for the guards. ELPA is the registered candidate for the
+  regime neither library serves well.
 * **cublasmp** (~1450 LOC): 4 import sites (`bse/vq_interp.py`,
   `bandstructure/htransform.py`, tests). The fused W-solve path has no
   measured replacement, so this leg stays until a GPU gate exists.
-* **Shim deletion**: blocked on consumer migration (§1).
+* **Shim deletion**: the five wave-1 service shims were deleted in `029da824` and are ratcheted shut by `tests/test_service_path_bootstrap.py`. The `src/ffi/` re-export shims (§1) remain, still gated on consumer migration.
 * **FFT, remaining items**: `fftw_init_threads` / `plan_with_nthreads` on
   non-MKL engines under the existing `LORRAX_FFT_FFI_THREADS` grammar; the
   `fftwf_` twin table if BSE adoption wants c64; and only then gating the

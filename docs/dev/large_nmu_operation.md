@@ -8,7 +8,7 @@ one rank.  Every solve family carries exactly TWO plans:
   scheduled over devices at P>1.  Default wherever it fits, because its
   output is bit-identical across process grids and device counts.
 * a **DISTRIBUTED** plan — 2-D block-cyclic factorization over the whole
-  mesh (ScaLAPACK on a host mesh, cuSOLVERMp on CUDA, via the `ffi.linalg`
+  mesh (ScaLAPACK on a host mesh, cuSOLVERMp on CUDA, via the `distrib_la`
   facade).  The only plan whose factorization work AND memory divide by P.
   Explicit opt-in, because a block-cyclic factorization is a different
   (equally valid) numerical gauge — agreement with the local plan is
@@ -30,7 +30,7 @@ count, `r` = r-chunk size, `nq` = IBZ q count, all buffers complex128
 | zeta transverse factor (bispinor mu_L=1,2,3; HOISTED 2026-08-01, once per channel) | `transverse_zeta_solve = ridge` (default) + `distributed_lu = auto` → per-q pivoted LU of the ridged LOGICAL tile via `lax.linalg.lu`, q-parallel at P>1 under the charge fold's policy; `(LU, piv)` stored, back-solve = `lu_solve` per r-chunk through the same replicated/per_q gather tiers — BIT-IDENTICAL to the old fused per-r-chunk `jnp.linalg.solve`.  `transverse_zeta_solve = rank_truncate` → per-q eigh pseudo-inverse with an \|λ\| cut (τ = `transverse_zeta_rcond`), explicit C⁺ stored, ONE GEMM per r-chunk; same replicated scaffolding (q-parallel fold, any count on any mesh) | ridge family: `distributed_lu = scalapack` (host) → `pXgetrf` ONCE at the logical extent (needs mu_T %% both mesh axes == 0), factors kept 2-D block-cyclic + per-rank ipiv threaded; `pXgetrs` per r-chunk (split FFI handlers).  `cusolvermp` (CUDA) still runs the FUSED per-r-chunk pair (hoist port pending).  rank_truncate family: `distributed_zeta_solve = distributed` → `pzheevd` at the PADDED extent (divisible by construction; pad modes zeroed = exactly inert, truncated at every τ), C⁺ kept 2-D-sharded — NO transverse divisibility constraint |
 | zeta Z_q build (`z_q_from_psi_sm`) | none (always sharded) | streaming band-chunk scan inside one shard_map; carries `(nk, ns, r/Py, mu/Px, ns)` → `/P`; per-iter FFT box `nk·(band_chunk/P)·ns·n_rtot` | same path |
 | zeta h5 write (G-flat accumulator + SlabIO) | `slab_io = auto` | accumulator `(nq_disk, mu/P, ngkmax)` → `/P`; `auto` → parallel-HDF5 FFI collective hyperslab write (no gather). **`h5py_allgather` is no longer a fallback: since `0d8e50c` (2026-08-06) it is reachable at exactly one process and REFUSES above P=1.** It would gather the FULL `(nq_disk, mu, ngkmax)` tensor on rank 0, which at this tier's scale is an OOM rather than a slow path (owner ruling 2026-08-05, repo `decisions.md`). There is no longer a "demoted writer" to avoid running with — the demotion raises at parse time | same |
-| W Dyson solve (`gw/w_isdf`) | `w_dyson_solver = auto` = `local`: q-parallel per-q dense LU, `ceil(nq/P)` whole `(mu,mu)` tiles per rank — a mu² tile per rank exists | `w_dyson_solver = distributed`: 2-D block-cyclic backsolve via `ffi.linalg` `solve_lu`, `nq·mu²/P`; refuses loudly, never downgrades |
+| W Dyson solve (`gw/w_isdf`) | `w_dyson_solver = auto` = `local`: q-parallel per-q dense LU, `ceil(nq/P)` whole `(mu,mu)` tiles per rank — a mu² tile per rank exists | `w_dyson_solver = distributed`: 2-D block-cyclic backsolve via `distrib_la` `solve_lu`, `nq·mu²/P`; refuses loudly, never downgrades |
 | band-interpolation / BSE eigh (htransform fH_q, vq_interp C_q) | `eigh_backend = auto` = q-batched native eigh, one whole `(rank,rank)` matrix per device | `eigh_backend = distributed` (or `use_low_mem_eigh = true`): one tile spread over the mesh (`pzheevd` on host); square or 1-D mesh, `n` divisible by both axes |
 | **BSE restart-bundle load** (`bse/bse_io`) | NOT a deck key — selected by DEVICE COUNT at `bse/bse_jax.py:143` (`use_sharded = n_devices > 1 or not tda`). LOCAL = `_load_ring_subset`: whole-file `V_qmunu` + `W0_qmunu` + `psi_full_y`, `2·nq·mu²·16` B of host staging and `nq·mu²·16` B on the one device. **It REFUSES above one process** (`bse_io.py:1466-1472`), so it cannot silently become the P>1 path | `load_bse_data_from_restart_sharded`: per-rank `(mu,nu)` h5py hyperslabs, **no allgather anywhere**. `W_q` at `P('x','y',None,None,None)` = `nk·mu²/P`; `V_q0` at `P('x','y')` = `mu²/P`; `V_q_full` (opt-in `load_v_full`) a SECOND `nk·mu²/P`. Largest host staging buffer is exactly one rank's tile. ψ/`M` are single-axis (`1/px`, `1/py`) — see the honest list item 2 |
 | **BSE matvec** (`bse_ring_comm` / `bse_stack_matvec` / `bse_simple`) | `--matvec-kind` CLI flag, not a deck key. LOCAL = `bse_serial.apply_bse_hamiltonian_single_device`: the `T` tensor `(b, mu, mu, ns, ns, nk)` whole on one device — the 1-device reference path only | `ring` (default) / `simple` / `stack`: `shard_map` with a `ppermute` ring and `psum_scatter`, `T`/`U` at `P(None,'x','y',None,None,None)` = `b·nk·ns²·mu²/P`. Every collective is over pair-space `(c,v,k)` or one mu axis — **no collective carries a `mu²` payload**. `stack` keeps one trial live inside a `lax.scan` |
@@ -40,7 +40,7 @@ count, `r` = r-chunk size, `nq` = IBZ q count, all buffers complex128
 | transport | `config/frontera/mpi_transport_env.sh`: `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi` | required at distributed tiers (gloo banned there) | same |
 
 Constraints common to every distributed backend (checked at RESOLVE time
-by `ffi.linalg.resolve`, before any collective): host platform for
+by `distrib_la.resolve`, before any collective): host platform for
 ScaLAPACK / CUDA for cuSOLVERMp, compiled handler present in
 `LORRAX_FFI_HOST_SO`, one process per device covering the mesh, SQUARE or
 1-D mesh (block-cyclic descriptors need `MB == NB`), and `mu_pad`
@@ -137,7 +137,7 @@ until fixed.  File:line references as of this page's commit.
 
 1. ~~htransform SVD family~~ — CLOSED 2026-08-01: the replicated
    `A = psi@centroids` gather + per-rank dense SVD is now a Gram-eigh of
-   `A Aᴴ` (`nk·nb` square, N_mu-free) through the `ffi.linalg` eigh plan
+   `A Aᴴ` (`nk·nb` square, N_mu-free) through the `distrib_la` eigh plan
    (deck key `eigh_backend`, same family as the fH_q eigh; `auto` = native
    replicated — the tile is N_mu-free and small — `distributed` = pzheevd),
    with `Vᴴ` and `B_at_mu` mu-sharded on `'y'` (`B_at_mu` fitted at the

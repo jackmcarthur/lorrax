@@ -26,10 +26,10 @@ promotion measured bit-identical and 0.7% faster on the production deck.
 
 The package is the door. `import wfn_loader` and use top-level names;
 `from wfn_loader.loader import …` from lorrax is a layering failure
-(`tests/test_layering.py`, with a red twin). In-tree consumers may still
-spell `from file_io.wfn_loader import WfnLoader` — that is a transitional
-shim whose deletion gate is the phase-wide cleanup after all four wave-1
-branches land, and it re-exports the SAME objects.
+(`tests/test_layering.py`, with a red twin). The transitional shim at
+`src/file_io/wfn_loader.py` was DELETED in `029da824`, so
+`from file_io.wfn_loader import …` now raises; `src/file_io/__init__.py`
+still re-exports `WfnLoader` and the `WFNReader` alias.
 
 ## API
 
@@ -238,5 +238,6 @@ large-deck CUDA leg. Both registered for post-wave.
 * **Reading `._filename` / `._ensure_sym()`.** Public spellings exist
   (`path`, `symmetry()`); the privates survive for compat, not for new
   code.
-* **Editing `src/file_io/wfn_loader.py`.** It is a shim; the module lives
-  in `services/wfn_loader/`. The shim dies in the phase-wide cleanup.
+* **Re-creating `src/file_io/wfn_loader.py`.** It was deleted in
+  `029da824` and `tests/test_service_path_bootstrap.py` ratchets it shut.
+  The module lives in `services/wfn_loader/`.

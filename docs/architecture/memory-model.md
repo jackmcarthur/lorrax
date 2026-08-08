@@ -198,7 +198,7 @@ The key invariant: every transient inside the scan body **aliases to a
 single slot** across iterations.  This requires `lax.scan(..., unroll=1)`
 and the scan to live INSIDE the `shard_map`, NOT outside (the SPMD
 partitioner cannot prove aliasing across a global-sharded carry — see
-the `solve_zeta` 88 GB OOM in `isdf_fitting.py:1119-1141`).
+the `solve_zeta` 88 GB OOM in `isdf/core.py`).
 
 ### Per-bc streaming scan invariants
 
@@ -841,14 +841,16 @@ The all-to-all then removed the `p_y` factor outright: 5.2× on this slope at th
 
 ### 3. Stage F — the restart-tensor write takes the LARGER of two tensors
 
-On the `H5PY_ALLGATHER` SlabIO backend (the CPU default whenever the venv lacks
-mpi4py + h5py-parallel, which is the case on Frontera today)
-`_slab_io_allgather._to_host` process_allgathers the WHOLE tensor onto EVERY
-rank and then copies it to host numpy — each written tensor lands UNSHARDED,
-**twice** (gathered device buffer + host numpy copy). Nothing in stages A–E
-models an I/O-seam replication, which is why the planner once reported a
-6.70 GB HWM for a run that died past ζ-fit. `slab_io_replicates=False`
-(`PHDF5_FFI` / `PHDF5_HOST`, per-rank hyperslabs) drops it to the sharded cost.
+**HISTORICAL, and the reason the `slab_io_replicates` term exists.** The
+deleted `H5PY_ALLGATHER` tier (once the CPU default whenever the venv lacked
+mpi4py + h5py-parallel) process_allgathered the WHOLE tensor onto EVERY rank
+and then copied it to host numpy — each written tensor landing UNSHARDED,
+**twice**. Nothing in stages A–E models an I/O-seam replication, which is why
+the planner once reported a 6.70 GB HWM for a run that died past ζ-fit. That
+tier was deleted on 2026-08-06, so `slab_io_replicates=False` — per-rank
+hyperslabs, the sharded cost — is the only behaviour the one remaining
+transport has. The term is kept because the *model* still needs it if any
+future writer replicates.
 
 TWO tensors cross this seam and the model must take the larger:
 
@@ -905,7 +907,7 @@ production 16-GPU CrI3 80 Ry SOC bispinor:
 
 4. **`device.memory_stats()` returns `None` on the Perlmutter JAX 0.8 /
    CUDA 12.9 stack.**  `peak_bytes_in_use` is unavailable; `_mem_probe`
-   in `common/isdf_fitting.py` (commit `6ba1fad`) falls back to
+   in `gw/isdf_fitting.py` (commit `6ba1fad`) falls back to
    `nvidia-smi` for the local GPU and tracks a running peak.  This is
    the only per-rank OOM-faithful metric on this stack.
 
@@ -940,22 +942,22 @@ bispinor on 16 GPUs (4×4 mesh, ``p_xy=16``, ``nk=36``, ``ns=2``,
 
 | live_arrays signature | meta-var formula | per-rank GB | allocation site | sharded? | planner term | smoking gun |
 |---|---|---|---|---|---|---|
-| ``c128 (nk, mu, nb, ns)`` ×4 buffers per channel (rmuT_X + transposed Y form, for both ψ_l and ψ_r) | ``4 × nk × ns × mu × nb_total × 16 / p_xy`` | 0.066 | ``common/load_wfns.py:474`` (``gflat_to_rmu`` fills psi_rmu_Y/X); transpose copy created at ``common/isdf_fitting.py: fit_zeta_to_h5`` step 1 (slice/divide-by-norms doubles each into a Y-form view) | μ-sharded on ``('x','y')`` | ``{B,C,D}.centroids_persist`` (and ``E.psi_centroids_persistent``) | Agent F probe 1B + Agent G §6 row #1: pre-refit counted ×2, runtime shows ×4 |
-| ``c128 (nq, mu, mu)`` | ``nq × mu × mu × 16 / p_xy`` | 0.083 | ``common/isdf_fitting.py: factor_c_q`` (step 3 of ``fit_zeta_to_h5``) | μ-sharded | ``{B,C,D}.L_q`` | Agent F probe 1A row 2: 1.33 GB global / 0.083 GB/rank |
-| ``c128 (nq_disk, mu, ngkmax)`` | ``nq_disk × mu × ngkmax × 16 / p_xy`` | 3.283 | ``common/isdf_fitting.py:2443`` (``jnp.zeros`` jit just before r-chunk loop) | μ-sharded | ``C.gflat_acc`` AND ``D.gflat_acc`` (Round-10 / agent_q: resident across the r-chunk loop, fit_one_rchunk and accumulate are separate jits with isolated transient slots so charging both Peak C and Peak D persistent bases is correct, not double-counting) | Agent F probe 1A row 1: 52.52 GB global / 3.28 GB/rank; Round-9b agent_o live_arrays census re-confirmed on Y3_95 |
+| ``c128 (nk, mu, nb, ns)`` ×4 buffers per channel (rmuT_X + transposed Y form, for both ψ_l and ψ_r) | ``4 × nk × ns × mu × nb_total × 16 / p_xy`` | 0.066 | ``common/wfn_transforms.py: gflat_to_rmu`` (fills psi_rmu_Y/X); transpose copy created at ``gw/isdf_fitting.py: fit_zeta_to_h5`` step 1 (slice/divide-by-norms doubles each into a Y-form view) | μ-sharded on ``('x','y')`` | ``{B,C,D}.centroids_persist`` (and ``E.psi_centroids_persistent``) | Agent F probe 1B + Agent G §6 row #1: pre-refit counted ×2, runtime shows ×4 |
+| ``c128 (nq, mu, mu)`` | ``nq × mu × mu × 16 / p_xy`` | 0.083 | ``isdf/core.py: factor_c_q`` (step 3 of ``fit_zeta_to_h5``) | μ-sharded | ``{B,C,D}.L_q`` | Agent F probe 1A row 2: 1.33 GB global / 0.083 GB/rank |
+| ``c128 (nq_disk, mu, ngkmax)`` | ``nq_disk × mu × ngkmax × 16 / p_xy`` | 3.283 | ``gw/isdf_fitting.py`` (the ``jnp.zeros`` jit just before the r-chunk loop) | μ-sharded | ``C.gflat_acc`` AND ``D.gflat_acc`` (Round-10 / agent_q: resident across the r-chunk loop, fit_one_rchunk and accumulate are separate jits with isolated transient slots so charging both Peak C and Peak D persistent bases is correct, not double-counting) | Agent F probe 1A row 1: 52.52 GB global / 3.28 GB/rank; Round-9b agent_o live_arrays census re-confirmed on Y3_95 |
 | ``int32 (nk, nx, ny, nz)`` ×N (post-Round-6: N=1 for both bispinor and charge; post-Round-4 / pre-Round-6: N=3 — three content-distinct numpy sources produced 3 device buffers with identical content but distinct sharding; pre-Round-4: N=8 bispinor, N=3 charge) | ``N × nq × fft_grid_x × fft_grid_y × fft_grid_z × 4`` | 0.162 post-fix (was 1.296 pre-Round-4, 0.486 between Round-4 and Round-6) (REPLICATED) | ``common/gvec_fft_box.py:55`` (``g_index = np.full((nk, nx, ny, nz), ngkmax, dtype=np.int32)``); pre-Round-4 each fresh ``psi_G_store._populate_from_loader`` + each fresh ``gflat_to_rmu`` ``build()`` closure created a new device buffer per channel; **Round-4** (commits d1fcd20 + 94542c2) added per-source caches (``WfnLoader.box_index_dev`` + ``_cached_gindex_dev``) — bounded growth WITHIN each source but loader-side and wfn_transforms-side buffers stayed unbridged (NamedSharding vs SingleDeviceSharding); **Round-6** (commit 9afa11e) routes ``gflat_to_rmu`` through ``WfnLoader.box_index_dev`` via ``shard_map`` in_specs (Manual-mode-compatible), collapsing all three pre-Round-6 sources to one canonical allocation | **REPLICATED — not /p_xy** | ``{A,B,C,D,E}.sphere_idx_replicated`` | Agent H §3 Finding 3 (pre-fix): 2→3→6→7→8 buffers; Round-4 verdict (agent_l_round5_liveverify §2): 3 buffers; **Round-6 verdict (agent_m_round6): 1 buffer** |
 
 ### B. fit_one_rchunk transient (alive only after fit returns, freed when accumulate consumes)
 
 | live_arrays signature | meta-var formula | per-rank GB | allocation site | sharded? | planner term | smoking gun |
 |---|---|---|---|---|---|---|
-| ``c128 (nq_disk, mu, r_chunk)`` | ``nq_disk × mu × r_chunk × 16 / p_xy`` | 1.16 (at r=21232) | ``common/isdf_fitting.py: fit_one_rchunk`` return | μ-sharded | ``D.zeta_chunk`` (transient) | Agent F probe 1B (+18.59 GB vs 1A); freed at probe 1C via ``donate_argnums=(1,)`` |
+| ``c128 (nq_disk, mu, r_chunk)`` | ``nq_disk × mu × r_chunk × 16 / p_xy`` | 1.16 (at r=21232) | ``isdf/core.py: fit_one_rchunk`` return | μ-sharded | ``D.zeta_chunk`` (transient) | Agent F probe 1B (+18.59 GB vs 1A); freed at probe 1C via ``donate_argnums=(1,)`` |
 
 ### C. fit_one_rchunk inside-jit (XLA preallocated-temp; invisible to live_arrays)
 
 | live_arrays signature | meta-var formula | per-rank GB | allocation site | sharded? | planner term | smoking gun |
 |---|---|---|---|---|---|---|
-| ``c128 (nk, ns, ns, mu_local, r_loc)`` ×3 slots (aliased to P_l_R_conj / P_r_R / FFT box) | ``3 × nk × ns² × mu × r_chunk × 16 / p_xy`` | 14-20 (at r=21232-24576) | ``common/isdf_fitting.py:625-627`` (P_l_acc/P_r_acc) + ``isdf_fitting.py:713-720`` (P_l_R_conj reshape) | μ × r sharded | ``C.P_pair_concurrent_slots`` | Agent D M1: 3 distinct preallocated-temp slots × 20.04 GiB each in module_0438 |
+| ``c128 (nk, ns, ns, mu_local, r_loc)`` ×3 slots (aliased to P_l_R_conj / P_r_R / FFT box) | ``3 × nk × ns² × mu × r_chunk × 16 / p_xy`` | 14-20 (at r=21232-24576) | ``isdf/core.py`` (P_l_acc/P_r_acc, and the P_l_R_conj reshape) | μ × r sharded | ``C.P_pair_concurrent_slots`` | Agent D M1: 3 distinct preallocated-temp slots × 20.04 GiB each in module_0438 |
 
 ### D. accumulate_rchunk_to_gflat inside-jit
 

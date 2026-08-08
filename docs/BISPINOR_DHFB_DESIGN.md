@@ -134,8 +134,8 @@ For the MoS2 smoke the $N_l N_r$ band-pair factor is ~128 (8 valence × 16 condu
 | File | Phase-1 change |
 |---|---|
 | [`src/common/bispinor_init.py`](../src/common/bispinor_init.py) | Lift takes `alat`, multiplies by 2π/alat for Bohr⁻¹ momenta. |
-| [`src/common/load_wfns.py`](../src/common/load_wfns.py) | `read_Gvecs_to_devices` passes `wfn.alat` into the lift. |
-| [`src/common/isdf_fitting.py`](../src/common/isdf_fitting.py) | Adds `compute_pair_density_with_vertex` and `compute_pair_density_lorentz` (γ̃-vertex generalization of the existing scalar helper). |
+| `src/common/wfn_transforms.py` *(was `common/load_wfns.py`)* | `read_Gvecs_to_devices` passes `wfn.alat` into the lift. |
+| `src/isdf/core.py` + `src/gw/isdf_fitting.py` *(was `common/isdf_fitting.py`)* | Adds the vertex and Lorentz pair-density generalizations of the existing scalar helper. |
 | [`services/symmetry_maps/`](services/symmetry_maps.md) (`import symmetry_maps`) | 4×4 spinor rotations (extending the 2×2 Pauli ones). **Not yet implemented**; required at M1 for symmetry-aware unfolding. The 3-vector Lorentz mixing that DOES exist is `unfold_v_q_bispinor_lorentz` — read its `R_proper_table` convention note before feeding it a rotation table. |
 | **[`src/centroid/current_density.py`](../src/centroid/current_density.py)** *(new)* | Builds $W_{\rm curr}(r)$ via Gordon-decomposed Pauli current. |
 | **[`src/centroid/centroid_io.py`](../src/centroid/centroid_io.py)** *(new)* | `read_centroids(path)` parses the `density:` header line; downstream consumers dispatch on it. |

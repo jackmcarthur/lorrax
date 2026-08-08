@@ -412,7 +412,7 @@ identical eigenvalues.
 
 `_dft_psi_sphere` read `wfn.load(bands=(0, kin_ion_dft.shape[1]))`.
 `WfnLoader.load` indexes the FILE's bands, `[0, wfn.nbands)`
-(`wfn_loader.py:1158-1165`), while `kin_ion_dft.shape[1]` is
+(`services/wfn_loader/src/wfn_loader/loader.py`), while `kin_ion_dft.shape[1]` is
 `nb_sigma = b3 − b0`, a WIDTH. The read was therefore the right number of
 the WRONG BANDS on any deck with `b0 != 0` — `[0, nb_sigma)` instead of
 `[b0, b3)` — and both decks in use have `b0 = nelec − nval = 0`, so it

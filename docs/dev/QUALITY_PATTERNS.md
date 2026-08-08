@@ -112,9 +112,9 @@ isdf_tensors, zeta_q and kin_ion; dipole.h5 remains the known gap.
 
 **Addendum (self-caught, 07-26): the observable must discriminate.** The
 orchestrator killed a healthy 2406c run after reading a 16.7 MB zeta_q.h5 as
-"wedged" — but under PHDF5_HOST the file is eagerly allocated to full size
-before chunk 1, and under the allgather writer it sits at header-size for the
-entire healthy fit: file size discriminates NOTHING in either direction. The
+"wedged" — but on the writers of the day the file was either eagerly
+allocated to full size before chunk 1, or sat at header-size for the entire
+healthy fit: file size discriminates NOTHING in either direction. The
 discriminating liveness signal is the LoopProgress cadence (whose absence,
 structurally, means chunk 1 never completed). Before acting on any health
 signal, ask: what would this observable look like in BOTH the healthy and the

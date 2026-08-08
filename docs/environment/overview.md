@@ -17,9 +17,13 @@ This section replaces the old `ENVIRONMENT_COMPREHENSIVE.md`. The pages:
 Three references deliberately stay **outside** this section — see the
 [register](../index.md#register) for the full ownership map:
 
-* **`docs/dev/env_vars.md`** — the environment-variable **registry**, every
-  `LORRAX_*` read machine-enforced by `tests/test_env_registry.py` +
-  `tools/env_audit.py`. Rows are never copied into prose here; the registry
+* **`docs/dev/env_vars.md`** — the environment-variable **registry**. Every
+  `LORRAX_*` read **under `src/`** is machine-enforced by
+  `tests/test_env_registry.py` + `tools/env_audit.py`; note that the gate
+  walks `src/` only, so the six service-owned reads (`LORRAX_WFN_BACKEND`,
+  `LORRAX_ALLOW_PARTIAL_ZETA`, and the four `LORRAX_TRS_*`) live in
+  `services/` and are **registered but not gated** — a real hole, not a
+  documentation error. Rows are never copied into prose here; the registry
   is the single source for spellings, defaults, classes and parse grammar.
 * **`docs/architecture/ffi_layout.md`** — everything about *how* a native
   library is reached: the build legs, which nvhpc stage selects which
@@ -269,7 +273,7 @@ a different worktree, which the path makes obvious and nothing else would.
 >    0.7–0.8 range. Worse, `lax.pcast` does not exist on 0.7.x at all, so the
 >    obvious `try: lax.pcast / except AttributeError: identity` shim installs
 >    a **no-op on exactly the versions that enforce the rule**; that defect
->    was live in `common/cholesky_2d.py`.
+>    was live in the blocked Cholesky, now `distrib_la._native2d`.
 >
 > **The blast radius of (2) is small and was counted, not estimated.** An AST
 > census over `src/` — `shard_map` entry points → within-module call-graph
@@ -283,7 +287,7 @@ a different worktree, which the path makes obvious and nothing else would.
 > 
 > **Divergence (1) is now two symbols, and it is not a version difference at all.**  `compilation_cache.VerificationCache` and `config.compilation_cache_check_contents` are absent from **every NVIDIA JAX container at every tag** — ten probed, 0.5.3 through 0.9.1 — and present only in the released wheel.  Every other `jax._src` private this tree patches has the *same shape* on 0.7.0 and 0.9.1: `_hash_accelerator_config` 2 params, `_hash_serialized_compile_options` 3, `get_executable_and_time` 4, `is_executable_in_cache` 2, `backend_compile_and_load` present.  That is why `common/jax_compile_cache.py` carries **one** narrow guard where it used to carry five, and why the other four were deleted rather than kept as a permanent compatibility layer for an abandoned version.
 > 
-> **Status.**  Both halves are **merged** into `integration/2026-08-07` (2026-08-06): `agent/vma-pvary-marking-2026-08-06` @ `8e6e083` (`src/common/vma.py` owns the version decision once and refuses at import on a jax that tracks VMA but offers neither spelling), then `agent/jax-070-land-2026-08-06` @ `ace2d51` (container moves to jax 0.7.0 / CUDA 12.9, `common/jax_support.py` gates the window at `[0.7.0, 0.10.0)`, four of the five compile-cache shims deleted), then `agent/shard-map-modern-2026-08-06` @ `9a4a8d5` (all 94 `shard_map` sites routed through `common/shard_map.py`).  **Not yet an ancestor of `origin/main`** — check with `git merge-base --is-ancestor` before citing it as landed.  The startup version gate was already in (`agent/jax-version-gate-2026-08-06`).
+> **Status: LANDED.**  All three parts are ancestors of `origin/main` (verified with `git merge-base --is-ancestor`; the branches themselves have since been deleted): `8e6e083` (`src/common/vma.py` owns the version decision once and refuses at import on a jax that tracks VMA but offers neither spelling), `ace2d51` (container moves to jax 0.7.0 / CUDA 12.9, `runtime/jax_support.py` gates the window at `[0.7.0, 0.10.0)`, four of the five compile-cache shims deleted), and `9a4a8d5` (the `shard_map` sites routed through `common/shard_map.py` — 34 at this head).  The startup version gate was already in.
 >
 > **The FFI headers move but the ABI does not.** `XLA_FFI_API_MAJOR`/`MINOR`
 > are `0`/`1` on both images; the three `xla/ffi/api/*.h` differ only by
@@ -311,8 +315,7 @@ a different worktree, which the path makes obvious and nothing else would.
 > `ghcr.io/nvidia/jax:jax-2025-07-21` ships jax 0.7.0 on CUDA 12.9 and is the
 > **last CUDA-12 image**. It clears the VMA divergence above and lets the
 > supported window be `[0.7.0, 0.10.0)` — a window both machines can meet —
-> without touching the CUDA-12 stage. Taken on
-> `agent/jax-070-land-2026-08-06`, unmerged.
+> without touching the CUDA-12 stage. That move has landed.
 >
 > **A version string read from a container is not evidence.** Every container
 > JAX is a dev build that restamps its display string to the *run* date: all
@@ -329,9 +332,9 @@ a different worktree, which the path makes obvious and nothing else would.
 > version and it is not the PJRT plugin. Adding the Perlmutter modulefile's
 > allocator environment is what turns it to `None`.
 >
-> `config/modulefiles/lorrax/0.1.0.lua:130` sets
-> `XLA_PYTHON_CLIENT_ALLOCATOR=platform` on the host and `:175` passes the
-> same value into the container. **§2.1 below already says what `platform`
+> `config/modulefiles/lorrax/0.1.0.lua` sets
+> `XLA_PYTHON_CLIENT_ALLOCATOR=platform` on the host (`setenv`) and passes the
+> same value into the container (`--env=`). **§2.1 below already says what `platform`
 > costs** — it is plain `cudaMalloc`, so `bytes_limit` and
 > `peak_bytes_in_use` both read 0 — and `config/README.md:66` already says
 > the value should be `cuda_async`, "**not** `platform`". The modulefile sets
@@ -484,7 +487,7 @@ the CUDA plugin cold load hiding inside the first `jax.devices()`.
 | symptom | cause / fix |
 |---|---|
 | `No GPU/TPU found, falling back to CPU` | `nvidia-smi`; `CUDA_VISIBLE_DEVICES`; jaxlib must be the CUDA build |
-| `RESOURCE_EXHAUSTED: Out of memory` | check `memory_per_device_gb` in the deck; reduce `chunk_bands`/`chunk_q` or let `gw_init.compute_optimal_chunks` auto-size; per-stage formulas in [memory-model](../architecture/memory-model.md) |
+| `RESOURCE_EXHAUSTED: Out of memory` | check `memory_per_device_gb` in the deck; reduce `chunk_bands`/`chunk_q`; per-stage formulas in [memory-model](../architecture/memory-model.md) |
 | `cusolverMpSyevd: status=7` + NCCL error 1 | XLA pre-allocated the pool — confirm `XLA_PYTHON_CLIENT_PREALLOCATE=false` and no user `MEM_FRACTION` override (§2.1) |
 | every run exits rc=1 **after** succeeding (CPU/MPI) | the overlay `sitecustomize` + `LORRAX_MPI_FINALIZE_FIX=skip_atexit` are not on the path ([transports](transports.md)) |
 | HDF5 "file is already open" on Lustre | `HDF5_USE_FILE_LOCKING=FALSE` |

@@ -601,10 +601,12 @@ at 1. 8-wide has the best write at 1 node and a poor read at 4. Only
 elegance here means one layout that does not have to be tuned per job,
 not the maximum of any single cell.
 
-Changed in three places that must agree: `src/ffi/cpp/phdf5/context.cc`
-(the C++ writer's `striping_unit`), `src/file_io/_slab_io_mpi_host.py`
-(the Python writer's, so one environment means one layout in every
-writer), and `lxrun`'s `lfs setstripe` pre-stripe in the modulefile.
+Changed in two places that must agree: `src/ffi/cpp/phdf5/context.cc`
+(the C++ writer's `stripe_policy_unit()`) and
+`src/file_io/_slab_io_ffi.py::_stripe_policy` (the Python side, which owns
+the measurements and which the C++ transcribes), plus `lxrun`'s
+`lfs setstripe` pre-stripe in the modulefile. It was three until the
+`_slab_io_mpi_host` writer was deleted with the host tier on 2026-08-06.
 
 ---
 

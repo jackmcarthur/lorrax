@@ -85,8 +85,11 @@ Full measurement record, instruments and falsification protocol:
 
 cuSOLVERMp from pip (`nvidia-cusolvermp-cu12` 0.9, NCCL-native, no CAL)
 bootstraps via JAX's KV-store + NCCL — no MPI/IB needed. Build flags:
-`-DLORRAX_FFI_HAVE_CAL=OFF -DLORRAX_FFI_HAVE_PHDF5=OFF`
-`-DCMAKE_CUDA_ARCHITECTURES=75`; CUDA toolkit assembled from the venv's
+`-DLORRAX_FFI_HAVE_CAL=OFF -DLORRAX_FFI_HAVE_PHDF5=OFF`.  **Note the
+architecture:** `config/frontera/build_ffi.sh` passes no
+`-DCMAKE_CUDA_ARCHITECTURES`, so the build takes the CMake default, which
+`src/ffi/cpp/CMakeLists.txt` sets to `80` (A100, for Perlmutter) — not the
+`75` these rtx nodes want.  CUDA toolkit assembled from the venv's
 pip `nvidia-*-cu12` wheels (`stage_ffi_deps.sh`). Set
 `CUSOLVERMP_FORCE_NCCL=1` (`gpu_env.sh` does). Sanity run:
 `tests/bench/cusolvermp_eigh_test.py --grid 2 2` under

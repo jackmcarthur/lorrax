@@ -30,6 +30,14 @@ has not been exercised recently.*
 `sbatch`. It allocates if nothing is live, attaches if something is, and
 calling it twice never double-allocates.
 
+> **`lx` is not in this repository.** It, and the `lxrun` / `lxalloc` /
+> `lxpre` / `lxshell` / `lxkill` family, are installed artifacts produced by
+> `config/perlmutter/install.sh` and the Lmod modulefile — nothing under
+> `git ls-files` defines them, so do not go looking. The same applies to
+> `LX_BASE_MODULE`, which the module reads and no source file does.
+> (Unrelated: `services/lxkit` is the services' capability-gate library, not
+> part of this family.)
+
 ```bash
 lx run python3 -u -m gw.gw_jax -i cohsex.in   # one step on a compute node
 lx test                                       # the suite, on a compute node, in cwd
@@ -63,8 +71,8 @@ actually inherit.
 > * every run's [startup block](../overview.md#startup-block) prints the path
 >   of the `.so` it loaded, which is inside that same tree.
 >
-> Point it somewhere else with `LX_BASE_MODULE=lorrax_A|_B|_C …`, or
-> `LORRAX_DEFAULT_BASE` for the default. `lx test` is the exception that does
+> Point it somewhere else with `LX_BASE_MODULE=lorrax_A|_B|_C …`.
+> `lx test` is the exception that does
 > use `cwd`: it runs pytest in the current directory, and only falls back to
 > `$LORRAX_ROOT/tests` when `cwd` has no `tests/`.
 
@@ -194,16 +202,17 @@ srun --jobid=$SLURM_JOBID -N 1 -n 4 -c 8 --cpu-bind=cores \
      $LORRAX_VENV/bin/python -u -m gw.gw_jax -i cohsex.in
 ```
 
-What auto-routes on CPU: `slab_io=auto` → the capability router
-(FFI write handler → `PHDF5_HOST` → allgather); `distributed_cholesky
-= auto` passes THROUGH (on CPU it carries the replicated
-rank-truncation route — an earlier revision of this page said it
-demotes to `off`, which is exactly the rewrite behind the −161 eV bug
-in [linalg_ffi.md](../../dev/linalg_ffi.md) "Sharp edges");
-`distributed_lu` `auto` → `off`, announced; `pair_density_slots`
-3 → 4. The CPU
-path writes synchronously — the FFI's threaded design deadlocks at
-`H5Fclose` under Cray MPICH's default `MPI_THREAD_SINGLE`
-(`file_io/_slab_io_mpi_host.py` docstring). Note this pre-dates the
-`impl=mpi` migration; a modern multi-process CPU run on Perlmutter
-should expect the [transports](../transports.md) bring-up work first.
+What auto-routes on CPU: `distributed_cholesky = auto` passes THROUGH (on
+CPU it carries the replicated rank-truncation route — an earlier revision of
+this page said it demotes to `off`, which is exactly the rewrite behind the
+−161 eV bug described in
+[distributed_linalg.md](../../distributed_linalg.md)); `distributed_lu`
+`auto` → `off`, announced. **There is no `slab_io` routing left to
+describe**: the three tiers, their router and the deck key were deleted on
+2026-08-06, `slab_io` is a warn-and-ignore legacy key, and SlabIO has one
+transport ([slab_io.md](../../architecture/slab_io.md)). The CPU path writes
+synchronously — the FFI's threaded design deadlocks at `H5Fclose` under Cray
+MPICH's default `MPI_THREAD_SINGLE` (`src/ffi/phdf5/ARCHITECTURE.md`). Note
+this pre-dates the `impl=mpi` migration; a modern multi-process CPU run on
+Perlmutter should expect the [transports](../transports.md) bring-up work
+first.

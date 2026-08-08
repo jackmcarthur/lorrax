@@ -1082,7 +1082,7 @@ per rank at `chunk_size=64`.
 | `gw/v_q_g_flat.py:56-146` | `_make_per_q_kernel` | compile-once per-q G-chunked GEMM kernel |
 | `gw/v_q_g_flat.py:154-223` | `_resolve_ibz_q_list` | IBZ cascade gate + centroid orbit closure |
 | `gw/v_q_g_flat.py:226-231` | `_pick_g_chunk` | largest divisor of `ngkmax` ≤ `target=4096` |
-| `gw/v_q_g_flat.py:234-287` | `_make_read_q` | ZetaReader / ZetaLoader, batched `read_all_ibz` |
+| `gw/v_q_g_flat.py` | `_make_read_all_ibz` | `ZetaLoader.read_zeta_G_slab`, batched over the IBZ q-set |
 | `gw/v_q_g_flat.py:294-492` | `_compute_V_q_g_flat_one_tile` | per-tile end-to-end (read + q-loop + unfold) |
 | `gw/v_q_g_flat.py:499-569` | `compute_all_V_q_g_flat` | charge-channel public entry point |
 | `gw/v_q_bispinor.py:57-174` | `UNIQUE_TILES`, `_make_v_per_G_for_tile` | 7-tile enumeration + per-tile weight |
@@ -1092,7 +1092,7 @@ per rank at `chunk_size=64`.
 | `symmetry_maps` (service door) | `unfold_v_q` | IBZ → full BZ centroid double-permute + L-phase + TRS conj; shard_map + paired `all_to_all` for 1×-tile peak per rank |
 | `symmetry_maps` (service door) | `SymMaps` | sym tables, IBZ index helpers |
 | `gw/gw_jax.py` | chi0/W block | W_q = (1-V_qχ_q)⁻¹V_q solved at IBZ via `slice_q_full_to_ibz` + Cholesky/LU, unfolded with `unfold_v_q` |
-| `file_io/zeta_reader.py` | `ZetaReader` | G-flat per-q HDF5 slab reader |
+| `services/zeta_loader/` | `ZetaLoader` | G-flat per-q HDF5 slab reader — the door ([wavefunction_io](../wavefunction_io.md)) |
 | `file_io/slab_io.py` | `SlabIO` | phdf5 writer with `valid_shape=` μ-pad clip |
 
 ### 11.10.2 Cross-references

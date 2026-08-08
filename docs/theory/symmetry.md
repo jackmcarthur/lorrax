@@ -109,7 +109,7 @@ Note the asymmetry — only $\tau_b$ gets rotated. On Si Fd-3m's 48 ops this clo
 
 `symmetry_maps.SymMaps` is the LORRAX-side handle on all of the above. It is constructed from a `WFNReader` and exposes the tables the GW driver consumes.
 
-> **Where the code lives, and how this page cites it (2026-08-07).** The three modules this document describes moved into the `symmetry_maps` SERVICE — `services/symmetry_maps/src/symmetry_maps/{maps,orbit_syms,density_symmetry_check}.py`, reached by `import symmetry_maps` and never through a submodule path. `src/common/symmetry_maps.py`, `src/centroid/orbit_syms.py` and `src/common/density_symmetry_check.py` are forwarding shims until the phase-wide cleanup deletes them. Citations below name SYMBOLS, not line numbers: the `file.py:NNN` form this page used had already drifted off the code it pointed at, and a stale line number reads as authoritative in a way a symbol name does not. For the service's CONTRACT — the conjugation predicate, the `R_cart` inverse, the refusals — see [`docs/services/symmetry_maps.md`](../services/symmetry_maps.md).
+> **Where the code lives, and how this page cites it (2026-08-07).** The three modules this document describes moved into the `symmetry_maps` SERVICE — `services/symmetry_maps/src/symmetry_maps/{maps,orbit_syms,density_symmetry_check}.py`, reached by `import symmetry_maps` and never through a submodule path. `src/common/symmetry_maps.py`, `src/centroid/orbit_syms.py` and `src/common/density_symmetry_check.py` were deleted in `029da824`. Citations below name SYMBOLS, not line numbers: the `file.py:NNN` form this page used had already drifted off the code it pointed at, and a stale line number reads as authoritative in a way a symbol name does not. For the service's CONTRACT — the conjugation predicate, the `R_cart` inverse, the refusals — see [`docs/services/symmetry_maps.md`](../services/symmetry_maps.md).
 
 ### 2.1 Constructed Arrays
 
@@ -260,7 +260,7 @@ For non-SOC (`ns = 1`, `nspinor = 1`) the spinor rotation is a 1×1 identity and
 
 ### 3.4 What Lives Where
 
-After PR5 the public unfold helpers (`get_gvecs_kfull`, `get_cnk_fullzone[_batch]`) moved into `WfnLoader`, which since 2026-08-07 lives in `services/wfn_loader/` (`file_io.wfn_loader` is a shim). Both the eager and phdf5 backends call `unfold_psi` for the spinor + phase, and each handles the G-rebuild + umklapp internally. `SymMaps` retains the sym table itself (`sym_matrices`, `sym_mats_k`, `translations`, `R_cart`, `U_spinor`) and the IBZ k/q maps.
+After PR5 the public unfold helpers (`get_gvecs_kfull`, `get_cnk_fullzone[_batch]`) moved into `WfnLoader`, which since 2026-08-07 lives in `services/wfn_loader/` and is reached by `import wfn_loader`. Both the eager and phdf5 backends call `unfold_psi` for the spinor + phase, and each handles the G-rebuild + umklapp internally. `SymMaps` retains the sym table itself (`sym_matrices`, `sym_mats_k`, `translations`, `R_cart`, `U_spinor`) and the IBZ k/q maps.
 
 ---
 

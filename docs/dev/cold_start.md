@@ -11,6 +11,6 @@ This page was reorganized on 2026-07-31 (environment-docs restructure):
   [`docs/dev/archive/cold_start_2026-07.md`](archive/cold_start_2026-07.md)
   — preserved verbatim as a point-in-time record.
 
-This stub exists because tracked scripts
-(`config/frontera/templates/gw_dev.sbatch`, `config/frontera/README.md`)
-reference this path in comments.
+This stub exists because a tracked script —
+`config/frontera/templates/gw_dev.sbatch`, at two places — references this
+path in comments.

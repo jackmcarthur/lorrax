@@ -72,8 +72,8 @@ and in its negation, which is the one that gets said in review:
 `psi_G_store`, `kq_mapping`, `coulomb_sphere`, `meta`, `units`,
 `gamma_matrices`, `bispinor_init`, `chi_from_dipole`).  `symmetry_maps`
 and `density_symmetry_check` left `common/` for `services/symmetry_maps/`
-on 2026-08-07 and are reached through the service door; the modules at
-their old paths are forwarding shims.
+on 2026-08-07 and are reached through the service door; the forwarding
+shims at their old paths were deleted in `029da824`.
 
 **The acceptance test for a driver** is the one the owner stated: *it should
 appear to contain only physics on inspection*. Concretely — no `jax.sharding`,
@@ -102,7 +102,7 @@ it without editing the table, so a budget cannot quietly become a licence.
 `solvers/` (Davidson, Lanczos, Chebyshev, MINRES, contour quadrature, KPM DOS,
 pseudobands, subspace projectors, Sternheimer preconditioner) · `mixing/`
 (Anderson, CROP, rCROP) · `common/minimax.py` (minimax quadrature) ·
-`common/cholesky_2d.py` (blocked Cholesky) · `common/rank_criterion.py` (the
+`common/rank_criterion.py` (the
 pseudo-inverse truncation criterion) · `centroid/kmeans_isdf.py` (the
 density-weighted Lloyd loop).
 
@@ -166,8 +166,8 @@ paths}.py` (`_slab_io_allgather` and `_slab_io_mpi_host` were deleted
 (`zeta_loader`, `epsreader`, `mf_header`, `sigma_output`,
 `tagged_arrays`, …) are L1, because they know what a band and a ζ are.
 `wfn_loader` was one of them and is now an independently installable
-SERVICE at `services/wfn_loader/` (`src/file_io/wfn_loader.py` is a
-transitional shim). It is still L1 by this rule, and it is a CLIENT of
+SERVICE at `services/wfn_loader/`; the shim at `src/file_io/wfn_loader.py`
+was deleted in `029da824`. It is still L1 by this rule, and it is a CLIENT of
 the L3 transport through the `slab_io` door — which is the layering
 `tests/test_layering.py` enforces: reaching past the door (`from
 wfn_loader.loader import …`) is a failure, with a red twin.
@@ -210,9 +210,12 @@ A level assignment nobody argued is a level assignment nobody will keep.
    physics-agnostic. Left at L2 with the violation named rather than silently
    reclassified to L1, because the reclassification would hide the fact that
    there is a clean L2 CG core inside it.
-5. **`common/cholesky_2d.py` — L2, even though it is distributed.** Being
+5. **The blocked Cholesky was L2, even though it is distributed.** Being
    sharded does not make something substrate. It factorises an arbitrary SPD
-   matrix; the mesh is an argument. Contrast `common/contract_bands.py`, whose
+   matrix; the mesh is an argument. (It now lives in `distrib_la` as the
+   `native2d` backend — the ruling is kept because the reasoning still
+   applies to anything sharded that is not substrate.) Contrast
+   `common/contract_bands.py`, whose
    *subject* is the movement.
 6. **`common/sanity.py` — L3, though it reads as physics.** Its checks are
    named for physics stages, but every one is a cheap array reduction plus one
@@ -247,8 +250,9 @@ A level assignment nobody argued is a level assignment nobody will keep.
     of the installed jax. Filing it L2 would also have been the *looser*
     reading — L2 may import L3, L3 may import nothing above itself — so L3 is
     the assignment that constrains it more, which is the right way to resolve
-    a genuine tie. Its consumers are `common/cholesky_2d.py` (L2) and
-    `bse/bse_ring_comm.py` (L1); both are downhill either way, and neither
+    a genuine tie. Its consumers were the blocked Cholesky (L2, now
+    `distrib_la._native2d`) and `bse/bse_ring_comm.py` (L1); both are
+    downhill either way, and neither
     was the reason for the choice.
 12. **`common/minimax.py` vs `gw/minimax_config.py` vs
     `gw/minimax_screening.py` — L2, L1, L1.** Same word, three levels. The
@@ -449,8 +453,8 @@ section are the 2026-08-06 measurement and are left as measured.)
   `runtime.initialize_communicator_stack` (step 5b). As a sibling the import
   is now at **module scope** — the laziness is gone, not relocated — and that
   is only possible because of a package fact worth writing down: `common/
-  __init__.py` imports `.wfn_transforms` and `.cholesky_2d`, both of which
-  import jax, so *any* `from common.jax_support import …` drags jax in
+  __init__.py` imports `.wfn_transforms`, which imports jax, so *any*
+  `from common.jax_support import …` drags jax in
   through the package `__init__`, and `runtime` is the one module that must be
   importable before jax reads its environment. `runtime/jax_support.py`
   imports only the standard library at module scope. Callers updated:
@@ -484,5 +488,5 @@ the extra test over the previous 68 is the red twin above.
 Superseded on 2026-08-07 by the `symmetry_maps` extraction, which closed the
 second of those two pairs (§5, R3): `upward_edges()` now returns
 `solvers.sternheimer_solve → psp.dft_operators` and nothing else. The `src/`
-module count is unchanged at 221 — the three moved modules leave forwarding
-shims at their old paths until the phase-wide cleanup commit.
+module count fell to 200 when `029da824` deleted the five forwarding shims
+the extractions had left at their old paths.

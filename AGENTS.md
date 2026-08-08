@@ -33,7 +33,10 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `services/symmetry_maps/` | **The crystal-symmetry service**: one door for `SymMaps` (IBZ→full BZ tables, spinor rotations), the k-star index map, the sharded q-axis unfolds, the real-space orbit machinery and the time-reversal MEASUREMENT (was `src/common/symmetry_maps.py`, `src/centroid/orbit_syms.py`, `src/common/density_symmetry_check.py`). Read `docs/services/symmetry_maps.md` first | Symmetry / k-point unfolding; star conjugation; TRS verdicts |
 | `src/common/minimax.py` | Minimax quadrature solvers | Quadrature node/weight issues |
 | `src/common/meta.py` | `Meta` system-parameters dataclass | k/q-grid, band ranges |
-| `src/file_io/wfn_loader.py` | `WfnLoader`: canonical WFN.h5 reader; `backend='auto'` picks the phdf5 (parallel HDF5) async path | Wavefunction loading, async H5 reads |
+| `services/wfn_loader/` | **The wavefunction-loading service**: `WfnLoader`, the canonical `WFN.h5` reader (header surface, G-vector and FFT-box tables, ψ(G) band-sharded / process-local / chunked); `backend='auto'` picks the collective phdf5 path via `SlabIO.read_slabs`. Read `docs/wavefunction_io.md`, then `docs/services/wfn_loader.md` | Wavefunction loading, collective H5 reads |
+| `services/zeta_loader/` | **The ζ-file service**: the `zeta_q.h5` format contract, its collective and local read plans, the never-raising probe and the one sanctioned post-close append. Read `docs/wavefunction_io.md`, then `docs/services/zeta_loader.md` | `zeta_q.h5` layout, ζ reads, fit reuse |
+| `services/vcoul/` | **The Coulomb service**: `v(q+G)` — the 3D/2D-slab/0D-box truncation kernels, the one `v_qG_table` driver, the mini-BZ average machinery and the BGW parity reader. Read `docs/coulomb.md`, then `docs/services/vcoul.md` | Truncation, head averaging, mini-BZ draws |
+| `services/lxkit/` | **The service foundation**: capability gates, the ABSENT/BROKEN probe vocabulary, jax-version compatibility, and the shared pytest harness. Stdlib-only at import | Skip honesty, gate grammar, probe reasons |
 | `src/common/gpu_utils.py` | Host-side GPU memory detection | Chunk auto-sizing |
 | `src/file_io/slab_io.py` | `SlabIO`: phdf5 writer wrapper for zeta_q / V_qmunu | Big HDF5 writes |
 | `src/file_io/sigma_output.py` | Σ output (eqp.dat, sigma.h5) | Output formats |
@@ -48,6 +51,11 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 
 | Doc | What it covers |
 |-----|---------------|
+| `docs/services_overview.md` | **Start here for `services/`**: why the six service packages exist, what a door is, how the test tiers work |
+| `docs/distributed_linalg.md` | Why JAX cannot do sharded dense factorizations, what `distrib_la` routes to, and what the measurements say |
+| `docs/wavefunction_io.md` | The slab transport, `read_slabs`, the pad-sentinel contract, ζ restart |
+| `docs/symmetry.md` | IBZ / stars / TRS, the single conjugation rule, the `R_cart` inverse convention |
+| `docs/coulomb.md` | `v(q+G)`: mini-BZ averaging, the three truncation schemes, the head-slot convention |
 | `docs/theory/physics.md` | ISDF theory, GW equations, COHSEX, CTSP formalism |
 | `docs/architecture/codebase.md` | Module map, data flow, key classes, sharding patterns |
 | `docs/architecture/memory-model.md` | Per-stage memory formulas, chunk sizing, bottleneck arrays |

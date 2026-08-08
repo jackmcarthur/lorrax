@@ -1,5 +1,17 @@
 # Plan: zeta_q → G-flat on-disk format + IBZ solve + ρ-cutoff support
 
+> **COMPLETED PLAN — HISTORICAL. Do not follow the paths below.**
+> The migration shipped: `zeta_q_G` is the only layout the tree writes
+> (`gw/isdf_fitting.py`) and the only one `zeta_loader` reads — the r-space
+> read paths were deleted at the service extraction on 2026-08-07. The file
+> references throughout this document predate both the ISDF reorganisation
+> and the service extractions, so `common/isdf_fitting.py`,
+> `file_io/zeta_loader.py`, `file_io/zeta_reader.py` and `gw/v_q_tile.py` do
+> not exist. Current spellings: `gw/isdf_fitting.py` + `isdf/core.py`,
+> `services/zeta_loader/`, `gw/v_q_g_flat.py`. This page is kept for the
+> design reasoning, not as an instruction sheet — see
+> [`docs/wavefunction_io.md`](../../wavefunction_io.md) for what shipped.
+
 Working doc for the rchunk ↔ G_flat migration the user signed off on after
 the orbit-aware kmeans test cleared.  Captures every code reference and
 design rule from the planning conversation so the agent can resume after

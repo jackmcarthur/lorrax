@@ -1,4 +1,13 @@
-# Distributed dense linear algebra over a JAX device mesh (`ffi.linalg`)
+# Distributed dense linear algebra — internals reference (historical `ffi.linalg`)
+
+> **START SOMEWHERE ELSE.** If you are reading about distributed linalg for
+> the first time, read
+> [`docs/distributed_linalg.md`](../distributed_linalg.md) — why JAX cannot
+> do these operations, what the layer is, how backends are chosen, and what
+> the measurements say. The contract is
+> [`docs/services/distrib_la.md`](../services/distrib_la.md). **This page is
+> the internals reference and the recorded campaign reasoning**, kept for the
+> C++ side and the design history.
 
 > **RENAME MAP (2026-08-07). This page is history below "Adding a
 > backend"; the live reference is [`docs/services/distrib_la.md`](../services/distrib_la.md).**

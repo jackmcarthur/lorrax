@@ -235,7 +235,7 @@ $$L_q(\mu_X, \nu_Y) = \text{cholesky\_2d\_batched}(C_q)$$
 
 **Sharding**: $L_q(\mu_X, \nu_Y)$ — 2D tiles `P(None, 'x', 'y', None, None)` internally; dense form `P(None, 'x', 'y')` on return.
 
-**Implementation**: `factor_c_q()` in `isdf/core.py`, which calls `cholesky_2d_batched()` in `common/cholesky_2d.py`. On a 1×1 mesh (single GPU), falls back to dense `jnp.linalg.cholesky` with a small trace-proportional ridge to regularize the rank-deficient pair-density matrix.
+**Implementation**: `factor_c_q()` in `isdf/core.py`, which reaches the 2-D blocked Cholesky through the `distrib_la` door as `plan('cholesky', mesh, backend='native2d')` (see [distributed_linalg](../distributed_linalg.md)). On a 1×1 mesh (single GPU), falls back to dense `jnp.linalg.cholesky` with a small trace-proportional ridge to regularize the rank-deficient pair-density matrix.
 
 ### 4.5 Stage 4: ZCT and Triangular Solve (Z-Chunked)
 
@@ -734,7 +734,7 @@ Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` — the square 
 | P_k (spin-traced) | `P(None, 'x', 'y')` | `(nk, μ_X, ν_Y)` | `compute_pair_density_spin_traced` |
 | P_k (spin-matrix) | `P(None, None, None, 'x', 'y')` | `(nk, s, s', μ_X, ν_Y)` | spin-matrix Frobenius mode |
 | C_q | `P(None, 'x', 'y')` | `(nq, μ_X, ν_Y)` | CCT, flat-q |
-| L_q (tiles) | `P(None, 'x', 'y', None, None)` | `(nq, J_X, J_Y, b, b)` | internal to `cholesky_2d_batched` |
+| L_q (tiles) | `P(None, 'x', 'y', None, None)` | `(nq, J_X, J_Y, b, b)` | internal to `distrib_la`'s `native2d` Cholesky |
 | L_q (dense) | `P(None, 'x', 'y')` | `(nq, μ_X, ν_Y)` | on return |
 | Z_q (ZCT) | `P(None, 'x', 'y')` | `(nq, μ_X, r_Y)` | z-chunked build |
 | ζ_q (solve out) | `P(None, None, ('x','y'))` | `(nq, μ, r_{XY})` | r-columns distributed |
@@ -772,7 +772,7 @@ Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` — the square 
 - **χ₀ kernel**: `Gv` and `Gc` use *swapped* μ/ν ↔ 'x'/'y' so that `einsum('Rambn,Rbnam->Rmn')` contracts over the two local axes and leaves output naturally sharded `P(None,'y','x')`. The explicit `with_sharding_constraint(…, _chi_R_spec)` prevents XLA from materializing a replicated 23 GB buffer at Si 4×4×4 60 Ry μ=2400.
 - **Dyson W solve**: `shard_map` over `'x'` and `'y'` flattened into a q-parallel axis `P(('x','y'), None, None)`; per-q `fori_loop` with `lu_factor/lu_solve`. Replicated on return.
 - **Σ projection** (frequency-dependent path): `shard_map` with **two `psum_scatter`** calls — one over `'x'` scattering `m`, one over `'y'` scattering `n`. Same NCCL byte volume as two plain `psum`s but outputs arrive `(m_X, n_Y)`-sharded so `coeff·σ` in `_project_tau_onto_omega` stays device-local.
-- **Cholesky**: `cholesky_2d_batched` operates on tile layout `P(None,'x','y',None,None)`; panel broadcasts + triangular updates via `lax.psum` over axis `'x'`. Falls back to dense `jnp.linalg.cholesky` on 1×1 meshes.
+- **Cholesky**: `distrib_la`'s `native2d` backend operates on tile layout `P(None,'x','y',None,None)`; panel broadcasts + triangular updates via `lax.psum` over axis `'x'`. Falls back to dense `jnp.linalg.cholesky` on 1×1 meshes.
 - **Triangular ζ solve**: per-q batch gathered to replicated inside a `shard_map` over `'x'`/`'y'` flattened on the r-column axis; `vmap(solve_triangular × 2)` for L⁻¹ and L⁻H. Python outer loop with `donate_argnums` for sequential GPU execution.
 
 ---
@@ -798,7 +798,7 @@ Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` — the square 
 | `gw/scissor.py` | Valence/conduction scissor extrapolation |
 | `gw/wavefunction_bundle.py` | `BandSlices`, `Wavefunctions` (4 sharded ψ copies); `project`, `project_ri` band-basis contractions |
 | `isdf/core.py` + `gw/isdf_fitting.py` | CCT/ZCT kernels, factorization, ζ solve / stage orchestration |
-| `common/cholesky_2d.py` | 2D blocked Cholesky |
+| `services/distrib_la/` | 2D blocked Cholesky (`native2d`), and the eigh / LU doors |
 | `common/fft_helpers.py` | Flat-k ↔ 3-D FFT helpers (custom_partitioning) |
 | `common/meta.py` | `Meta` system dataclass |
 | `services/symmetry_maps/` (`import symmetry_maps`) | IBZ → full BZ unfolding, spinor rotations (TRS-augmented `SymMaps`; see [`SYMMETRY_COMPREHENSIVE.md`](symmetry.md) for the BGW `mtrx` / τ convention and the `unfold_psi` / `unfold_v_q` / `compute_centroid_sym_perm` procedures, and [the service page](../services/symmetry_maps.md) for the contract) |

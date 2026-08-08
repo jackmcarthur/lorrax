@@ -218,9 +218,10 @@ commit range and with the FFI/sharded feature set on.
 - **`Sigma(omega)` requests a 10.25 GiB HDF5 chunk at `nb=1024`** —
   `n_omega * min(16, nk) * nb^2 * 16`, against HDF5's hard 4 GiB
   `H5Pset_chunk` limit. Runs survive only because the FFI slab backend
-  **no-ops** `chunks`; `_slab_io_mpi_host` and `_slab_io_allgather` honour it.
-  **The same run at the same shape succeeds under PHDF5_FFI and refuses under
-  PHDF5_HOST.** Binds at `nb=1024` for `n_omega >= 16` and `nb=2048` for
+  **no-ops** `chunks`.  (Until 2026-08-06 the two other tiers honoured it, so
+  the same run at the same shape succeeded on one tier and refused on
+  another; those tiers are now deleted, leaving one transport, so this is a
+  latent trap rather than an active portability split.) Binds at `nb=1024` for `n_omega >= 16` and `nb=2048` for
   `n_omega >= 4`. A portability trap, not a size limit.
 - **The chunk planner does not model the sigma omega cube.**
   `gflat_memory_model.py` covers only the ISDF chunk plan, so replicated and

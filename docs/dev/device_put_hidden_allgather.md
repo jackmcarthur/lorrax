@@ -211,7 +211,7 @@ of the array, per §1.
 
 > Line numbers below are at the head this audit ran on. `wfn_loader.py`
 > has since moved to `services/wfn_loader/src/wfn_loader/loader.py`
-> (2026-08-07; `src/file_io/wfn_loader.py` is a shim) — the guard and the
+> (2026-08-07; the `src/file_io/wfn_loader.py` shim was deleted in `029da824`) — the guard and the
 > verdict are unchanged, the line numbers are not.
 > See [docs/services/wfn_loader.md](../services/wfn_loader.md).
 

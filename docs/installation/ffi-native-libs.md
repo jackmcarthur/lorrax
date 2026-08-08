@@ -8,7 +8,9 @@ obtain them separately, then build the `.so` against them.
 !!! warning "Fresh clone has no `liblorrax_ffi.so`"
     It is a gitignored build artifact. The pure-JAX path never needs it; the first
     distributed / FFI-I/O call without it fails with
-    `FileNotFoundError … Build with: bash src/ffi/cpp/build.sh`.
+    a `FileNotFoundError` naming the platform's build recipe:
+    `src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh` for the CUDA
+    library, `bash src/ffi/cpp/build_host.sh` for the host one.
 
 !!! note "TODO"
     These recipes are assembled from the portability and dependency-architecture reviews.
@@ -82,7 +84,7 @@ CMake directly with explicit `-D` overrides — the CMake config already support
 arbitrary install locations:
 
 ```bash
-cd src/ffi/cpp/common
+cd src/ffi/cpp        # the tree's ONE CMakeLists.txt lives here
 cmake -B build -S . \
     -DCUSOLVERMP_INCLUDE_DIR=<cusolvermp-include> \
     -DCUSOLVERMP_LIB_DIR=<cusolvermp-lib> \
@@ -91,8 +93,11 @@ cmake -B build -S . \
     -DLORRAX_MPI_INCLUDE_DIR=<mpi-include> \
     -DLORRAX_MPICH_LIB_DIR=<mpi-lib>
 cmake --build build -j
-# -> build/liblorrax_ffi.so ; the loader (ffi_loader.py) searches cpp/build/,
-#    $LORRAX_FFI_SO, and sys.path.
+# -> build/liblorrax_ffi.so ; the loader (ffi_loader.py) reads $LORRAX_FFI_SO
+#    FIRST, then falls back to the in-tree cpp/build/ (cpp/build_host/ for the
+#    host library).  A set-but-missing pin REFUSES rather than falling through.
+#    services/distrib_la opens the same two .so files through its own loader —
+#    see docs/distributed_linalg.md.
 ```
 
 For an OpenMPI / non-Cray build, `build.sh` accepts `LORRAX_FFI_ALLOW_DEFAULT_MPI=1` so it

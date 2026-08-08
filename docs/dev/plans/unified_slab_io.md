@@ -1,5 +1,15 @@
 # Plan — unified sharded-slab I/O for `gw_jax` sigma writes
 
+> **COMPLETED PLAN — HISTORICAL. Do not follow the module layout below.**
+> SlabIO shipped and then collapsed to **one transport** on 2026-08-06: the
+> three tiers, the `SlabIOBackend` enum, the capability router and the two
+> deck keys were deleted, and `_slab_io_allgather.py` / `_slab_io_mpi_host.py`
+> do not exist. The only transport is `src/file_io/_slab_io_ffi.py`. Read
+> [`docs/architecture/slab_io.md`](../../architecture/slab_io.md) for what
+> shipped and why the tiers went. This page is kept for the design reasoning.
+> Absolute `/pscratch/...` paths in the citations below are machine-local and
+> do not resolve.
+>
 > **2026-07-31 note:** every reference to `_accumulate_kij_stream` /
 > `kij_stream` below is moot — the streamed accumulation mode was removed
 > (owner-approved deprecation sweep); only the `write_sigma_omega_h5`
