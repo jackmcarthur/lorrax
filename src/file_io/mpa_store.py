@@ -149,11 +149,15 @@ _SAMPLING_REQUIRED = ("varpi", "n_p", "alpha", "omega_max")
 #: Everything the ω-grid digest covers, in a fixed order.
 _SAMPLING_ORDER = ("protocol", "varpi", "n_p", "alpha", "omega_max")
 
-#: Attrs this format owns on top of the q_irr set.  Used by the
-#: partial-stamp refusal, which is inherited: "no attrs at all" is a
-#: legacy full-BZ file and reads unchanged, but a HALF stamp is refused,
-#: because the missing half is exactly what would say whether the shape
-#: means what it looks like.
+#: The attrs version 2 adds on top of the version-1 q_irr set — the
+#: EXACT difference between the two stamps, which is what makes the
+#: removability claim checkable: set these aside and the version number,
+#: and a v2 file's attrs must equal a v1 file's attr for attr.  Written
+#: out as a list rather than matched by an ``mpa_`` prefix so that an
+#: attr added later to one format and not the other fails the comparison
+#: instead of being swallowed by a ``startswith``.  (``mpa_writer`` is
+#: deliberately absent: it says BY WHAT, not WHAT, and belongs with the
+#: timestamps the comparison already exempts.)
 _MPA_OWNED_ATTRS = (
     _FREQ_ATTR, "mpa_n_omega", "mpa_omega_units", "mpa_protocol",
     "mpa_varpi", "mpa_n_p", "mpa_alpha", "mpa_omega_max", "mpa_grid_hash",
