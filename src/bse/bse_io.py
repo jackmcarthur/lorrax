@@ -1942,6 +1942,26 @@ def apply_eqp_corrections(
                     if not np.isnan(e_qp_ibz[best_ibz, ib]):
                         enk_qp[ik_full, ib] = e_qp_ibz[best_ibz, ib] / ry_to_ev
 
+        # ``matched`` used to be written and never read: a k-point whose DFT
+        # energies did not match any IBZ block within ``tol_ev`` simply kept
+        # its DFT energies, and the run continued as if it were a QP
+        # calculation.  That is a silent mean-field/quasiparticle mix -- the
+        # exact class of error that makes a cross-code comparison stop being
+        # apples-to-apples without anything in the log saying so.  On Si the
+        # DFT->QP shift is ~0.6 eV, so a single unmatched k-point moves the
+        # excitons it carries by hundreds of meV.  Fail instead.
+        if not matched.all():
+            bad = np.flatnonzero(~matched)
+            raise ValueError(
+                f"apply_eqp_corrections: {bad.size} of {nk_full} k-points "
+                f"could not be matched to an IBZ block of {eqp_file!r} by "
+                f"mean-field energy (tol {tol_ev} eV); first few: "
+                f"{bad[:8].tolist()}. Those k-points would silently keep DFT "
+                f"energies inside a quasiparticle calculation. Pass "
+                f"input_file= so the mapping comes from the symmetry maps "
+                f"instead of an energy heuristic, or check that the eqp file "
+                f"belongs to this wavefunction.")
+
     return enk_qp
 
 

@@ -540,7 +540,8 @@ def compute_screening(
                     role=req.role)
             with timing.section("W.gate", announce=True,
                                 label=f"{_w} finiteness + hermiticity gate"):
-                _gate_w(W_static, req, print_fn=print_fn)
+                _gate_w(W_static, req, print_fn=print_fn,
+                        kgrid=tuple(meta.kgrid))
             W_by_role[req.role] = W_static
             bar.step()
             continue
@@ -566,7 +567,7 @@ def compute_screening(
             chi0_probe_reused = None   # donated into solve_w — dead ref
             with timing.section("W.gate", announce=True,
                                 label=f"{_w} finiteness + hermiticity gate"):
-                _gate_w(W, req, print_fn=print_fn)
+                _gate_w(W, req, print_fn=print_fn, kgrid=tuple(meta.kgrid))
             W_by_role[req.role] = W
             bar.step()
             continue
@@ -606,7 +607,8 @@ def compute_screening(
     return W_by_role
 
 
-def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print) -> None:
+def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
+            kgrid=None) -> None:
     """Stage gate on one solved W — the Dyson solve is the fragile seam.
 
     ``W = (1 − Vχ₀)⁻¹V`` is the only place in the GW flow where a matrix
@@ -621,6 +623,18 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print) -> None:
     ω = iω_p, both on axes where χ₀ is Hermitian); the real-axis HL probe
     is *not* Hermitian in general, so hermiticity is only asserted on the
     imaginary/zero-frequency branch.
+
+    THE HERMITICITY CHECK IS NOT THE ONE THE BSE NEEDS, and on its own it
+    is how this seam stayed green while broken.  ``W[q=0]`` passes
+    :func:`check_hermitian` at 1e-15 on every fixture measured while
+    ``W_q = conj(W_{−q})`` — the condition the BSE kernel's own hermiticity
+    reduces to, equivalently "``W_R`` is real" — fails at 9.1e-4
+    (armA_base480, 2026-08-07).  The two are independent: per-q hermiticity
+    is neither necessary nor sufficient for the reciprocity.  Worse, the
+    old gate's ``q=0`` restriction makes the *right* property untestable
+    too, since ``−0 == 0`` collapses it to "``W[0]`` is real", which holds
+    at 1.9e-11 regardless.  Both are now checked, and the reciprocity one
+    is checked over the whole flat-q axis.
     """
     from common import sanity
 
@@ -631,6 +645,32 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print) -> None:
         # rtol is generous — this catches structural mixing, not roundoff.
         sanity.check_hermitian(f"{label}[q=0]", W[0], rtol=1e-6,
                                print_fn=print_fn)
+        # The load-bearing property, over ALL q.
+        #
+        # SCOPE.  This sits inside the ω-real == 0 branch deliberately.  On
+        # the imaginary axis (ω = 0 and ω = iω_p) χ₀ — and hence W — is real
+        # in R-space for a time-reversal-symmetric system, so reciprocity is
+        # a true property there.  It is NOT true of the real-axis HL probe:
+        # a dynamical W obeys Kramers-Kronig, carries a genuine W'' , and
+        # legitimately violates W_q = conj(W_{−q}).  Gating that branch
+        # would be checking something false by construction.
+        #
+        # TOLERANCE, derived from the MEASURED floor rather than from eps.
+        # These tiles span |A| ∈ [1.4, 3.8e6] (dyn. range ~50x on the median,
+        # max/min ~2.7e6), so an ‖·‖-relative floor is NOT eps: the residual
+        # is set by cancellation among large intermediates.  The empirical
+        # floor is the orbit-closed IBZ arm, where the unfold builds W_{−q}
+        # from W_q by symmetry and reciprocity therefore holds BY
+        # CONSTRUCTION — whatever residual it shows is pure arithmetic.
+        # MEASURED there (armB_orbit504, 2026-08-07): 1.13e-7 on this exact
+        # statistic.  Its magnitude signature confirms round-off — the
+        # per-element relative residual FALLS with |A| (4.9e-7 at <p10 to
+        # 3.1e-8 at >p99) while the absolute residual rises.
+        # 1e-5 is ~90x above that floor and ~400x below the smallest real
+        # break measured (7.8e-4), so it can neither cry wolf nor miss one.
+        if kgrid is not None:
+            sanity.check_q_conjugate_reciprocity(
+                f"{label}[all q]", W, kgrid, rtol=1e-5, print_fn=print_fn)
 
 
 __all__ = [
