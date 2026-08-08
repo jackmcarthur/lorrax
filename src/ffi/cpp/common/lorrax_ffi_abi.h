@@ -33,16 +33,20 @@
 //                message had to spell out, in prose, which two files on which
 //                filesystem to pin — because there was no mechanism.
 //
-//   ABI 2 -> 3   0d7e401b, branch fix/kchunk-cache-identity-2026-08-08.
+//   ABI 2 -> 3   5bdc345e, merged to main as a16a241c (2026-08-08).
 //                PhdfReadKchunk / PhdfReadKchunkUnion lost their ctx_handle and
 //                ds_id Attrs and gained a leading (2,) S64 handle Arg.  The
 //                branch's own note says it best: "a mispaired run is green
 //                until something calls read_slabs".
 //
-// NUMBER 3 IS RESERVED FOR THAT BRANCH.  It has not landed here; this tree is
-// ABI 2.  When it lands it bumps the constant below to 3 in the same commit as
-// the signature change, and the pairing table it currently maintains by hand in
-// BUILD_NOTES.md stops being something anyone has to maintain.
+// THE THIRD BUMP IS ALSO THE MECHANISM'S FIRST REAL TEST, and it happened in
+// the same day.  This file was written on a branch based on 0fe41a76, which
+// PREDATES the kchunk change, and it RESERVED number 3 for it.  That branch
+// merged to main hours later.  Under the old arrangement, the pairing this
+// created was tracked by a hand-maintained table in BUILD_NOTES.md whose own
+// warning was that everything off the kchunk path stays green; under this one
+// the number moved with the merge and every library built before it is refused
+// by name.  The table stops being something anyone has to maintain.
 //
 // ---------------------------------------------------------------------------
 // THE RULE
@@ -68,4 +72,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 2
+#define LORRAX_FFI_ABI_VERSION 3
