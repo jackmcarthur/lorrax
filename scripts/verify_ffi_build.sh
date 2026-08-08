@@ -193,6 +193,34 @@ NOTRUN=0
 fail()  { warn "GATE FAILED ($1): ${*:2}"; FAILED=$((FAILED + 1)); }
 notrun() { warn "GATE COULD NOT RUN ($1): ${*:2}"; NOTRUN=$((NOTRUN + 1)); }
 
+# ---------------------------------------------------------------------------
+# IS THIS A PLACE WHERE THIS LEG'S CLOSURE IS SUPPOSED TO RESOLVE?
+#
+# Three gates (1, 4, and GATE 7's mapped-objects half) resolve the dependency
+# closure with ldd, and their answer is a property of the ENVIRONMENT as much
+# as of the artifact.  For the host leg that is fine: it is built bare-metal
+# and runs bare-metal, so the build node is a runtime environment for it and an
+# unresolved dependency there is a real defect.
+#
+# For the device leg it is not.  That library is built and run INSIDE the
+# Shifter container, against libraries bind-mounted there; on a login node
+# `ldd` reports libnccl.so.2, libnvshmem_host.so.3 and libucc.so.1 as `not
+# found` for a PERFECTLY CORRECT device library.  Reporting that as a failure
+# would teach everyone that the verifier's red means "you ran it in the wrong
+# place", which is precisely how the fftw gate got ignored for a day.
+#
+# So: out of environment, those three gates report COULD NOT RUN and say why.
+# src/ffi/cpp/build.sh calls this verifier from INSIDE the container, where
+# they are live; LORRAX_FFI_VERIFY_ENV=runtime forces them on anywhere.
+# ---------------------------------------------------------------------------
+RUNTIME_ENV=1
+if [[ "$LEG" == cuda ]]; then
+    RUNTIME_ENV=0
+    [[ -d /lorrax_phdf5 || -d /lorrax_nvhpc ]] && RUNTIME_ENV=1
+fi
+[[ "${LORRAX_FFI_VERIFY_ENV:-}" == runtime ]] && RUNTIME_ENV=1
+[[ "${LORRAX_FFI_VERIFY_ENV:-}" == build   ]] && RUNTIME_ENV=0
+
 say "======================================================================"
 say "artifact  $SO"
 say "leg       $LEG"
@@ -346,11 +374,19 @@ fi
 # owns the argument for why it resolves with ldd and dedupes by realpath.
 # ===========================================================================
 say "--- GATE 1 (one MPI runtime) ---"
-if [[ -x "$CPP_DIR/gate_one_mpi.sh" ]]; then
+if [[ ! -x "$CPP_DIR/gate_one_mpi.sh" ]]; then
+    notrun 1 "$CPP_DIR/gate_one_mpi.sh not found (LORRAX_ROOT=$LORRAX_ROOT)."
+elif [[ "$RUNTIME_ENV" -eq 0 ]]; then
+    notrun 1 "this is not a runtime environment for the '$LEG' leg, so the
+      dependency closure cannot be resolved here and the one-MPI invariant
+      cannot be checked.  The device library binds its MPI, NCCL and HDF5
+      inside the Shifter container; on a login node ldd reports several of
+      them 'not found' for a perfectly correct artifact.
+      Run it where the library runs — src/ffi/cpp/build.sh does, because it
+      builds in-container — or force it with LORRAX_FFI_VERIFY_ENV=runtime."
+else
     GATE_TAG="$TAG" "$CPP_DIR/gate_one_mpi.sh" "$SO" "${LORRAX_FFI_EXPECT_MPI:-}" \
         || fail 1 "see gate_one_mpi.sh output above."
-else
-    notrun 1 "$CPP_DIR/gate_one_mpi.sh not found (LORRAX_ROOT=$LORRAX_ROOT)."
 fi
 
 # ===========================================================================
@@ -541,8 +577,30 @@ else
       never a fall-through."
             fi
         fi
-        GATE_TAG="$TAG" "$CPP_DIR/gate_one_hdf5.sh" "$SO" "${_peer[@]}" \
+        # The request/stage halves of GATE 7 are environment-independent — they
+        # read SONAMEs out of ELF headers and out of the stage tree — and they
+        # are the halves that carry the cross-leg invariant.  The mapped-objects
+        # half needs a resolvable closure, which a peer from the OTHER leg does
+        # not have here.  Run what can be run and say what was not.
+        _closure=on
+        if [[ "$RUNTIME_ENV" -eq 0 ]]; then
+            _closure=off
+        elif [[ ${#_peer[@]} -gt 0 ]]; then
+            # The peer is the other leg by construction, so its closure belongs
+            # to the other environment.
+            _closure=off
+            say "GATE 7: closure half OFF for this invocation — the peer leg's"
+            say "  dependencies resolve in the other environment.  The"
+            say "  SOVERSION comparison across the pair, which is the point of"
+            say "  naming a peer, is unaffected."
+        fi
+        GATE_TAG="$TAG" LORRAX_GATE_ONE_HDF5_CLOSURE="$_closure" \
+            "$CPP_DIR/gate_one_hdf5.sh" "$SO" "${_peer[@]}" \
             || fail 7 "see gate_one_hdf5.sh output above."
+        [[ "$_closure" == off ]] && notrun 7e "the mapped-objects half of GATE 7
+      (are two distinct HDF5 objects reachable at once) was not checked in
+      this environment.  Run the verifier where the library runs, or
+      LORRAX_FFI_VERIFY_ENV=runtime."
     else
         notrun 7 "$CPP_DIR/gate_one_hdf5.sh not found."
     fi
@@ -560,7 +618,14 @@ fi
 # speaks.
 # ===========================================================================
 say "--- GATE 4 (load-time resolution) ---"
-if command -v ldd >/dev/null 2>&1; then
+if [[ "$RUNTIME_ENV" -eq 0 ]]; then
+    notrun 4 "this is not a runtime environment for the '$LEG' leg.  ldd here
+      reports the container-mounted libraries (NCCL, NVSHMEM, UCC, the staged
+      HDF5) as 'not found' for a correct artifact, so a failure would mean
+      'wrong place', not 'wrong library'.  src/ffi/cpp/build.sh runs this
+      verifier in-container, where the gate is live; force it anywhere with
+      LORRAX_FFI_VERIFY_ENV=runtime."
+elif command -v ldd >/dev/null 2>&1; then
     _ldd="$(ldd -r "$SO" 2>&1)"
     _bad="$(printf '%s\n' "$_ldd" | grep -iE 'not found|undefined symbol' || true)"
     if [[ -n "$_bad" ]]; then
@@ -627,12 +692,22 @@ say "--- GATE 9 (handler-signature ABI) ---"
 _abi_sym="lorrax_ffi_${LEG}_abi_version"
 _stamp_abi="$(printf '%s\n' "$STAMP" | grep -oE 'abi=[0-9]+' | cut -d= -f2 | head -1)"
 if ! printf '%s\n' "$DEFINED" | grep -qx "$_abi_sym"; then
-    fail 9a "$SO does not export $_abi_sym, so its handler-signature ABI
-      cannot be read.  It was built before the stamp existed (2026-08-08).
-      The Python loaders treat such a library as UNSTAMPED and announce
-      rather than refuse — a pre-stamp .so is not known to be wrong — but it
-      cannot be CERTIFIED, because the whole point of the number is that the
-      mismatch it detects is invisible until the first call.  Rebuild."
+    # COULD NOT RUN, not FAILED, and the distinction is the same one the
+    # Python loaders make.  An UNSTAMPED library was built before 2026-08-08;
+    # that is not evidence it is wrong, and the deployed pair plus every
+    # library the nine pinning worktrees use is unstamped today.  Calling
+    # those FAILED would make the verifier's own red mean "old" far more often
+    # than "broken", which is how a gate gets disarmed.
+    #
+    # It is equally not a PASS: the gate scanned and found nothing to compare.
+    # Any library built from this tree stamps, so LORRAX_FFI_VERIFY_STRICT=1
+    # — which every certification run should set — still refuses an unstamped
+    # artifact, and a fresh build still passes under it.
+    notrun 9 "$SO does not export $_abi_sym, so its handler-signature ABI
+      cannot be read: built before the stamp existed (2026-08-08).  Not a
+      pass and not a defect.  The loaders announce the same fact at dlopen;
+      LORRAX_FFI_ABI_STRICT=1 there and LORRAX_FFI_VERIFY_STRICT=1 here both
+      turn it into a refusal.  Rebuild from this tree to make it checkable."
 elif [[ -z "$EXPECT_ABI" ]]; then
     notrun 9 "the artifact exports $_abi_sym (stamp says abi=${_stamp_abi:-?})
       but no expected version is available: this tree has no
