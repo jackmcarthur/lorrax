@@ -58,7 +58,8 @@ from typing import Any
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la.plan import BATCHED_SCAN_UNROLL, ensure_sharding
+from distrib_la.plan import (BATCHED_SCAN_UNROLL, cached_scan, ensure_sharding,
+                             scan_signature)
 from distrib_la.resolve import NATIVE, backend_module, resolve_backend
 
 __all__ = ["FactorToken", "factor", "solve"]
@@ -176,19 +177,33 @@ def _slate_potrf_stack(mod, A, mesh_xy: Mesh) -> tuple:
     layout, never materialised as a row-major L and never replicated.
     ``nb`` is the tile size SLATE chose, carried out of the trace because
     it is the one piece of the handle that is not the buffer and
-    :func:`solve` has to hand it back.
+    :func:`solve` has to hand it back — so the cache stores the dict the
+    body writes it into ALONGSIDE the compiled scan, because a cache HIT
+    never re-enters the body to read it again.
     """
-    tile: dict[str, int] = {}
+    def _build():
+        tile: dict[str, int] = {}
 
-    def _potrf(carry, A_q):
-        L = mod.distributed_cholesky(A_q, mesh=mesh_xy)
-        # Trace-time constant: the tile size is a function of n and the
-        # mesh, so every iteration writes the same value.  Reading it out
-        # of the body is how the handle's non-buffer half survives a scan.
-        tile["nb"] = int(L.nb)
-        return carry, L.raw
+        def _potrf(carry, A_q):
+            L = mod.distributed_cholesky(A_q, mesh=mesh_xy)
+            # Trace-time constant: the tile size is a function of n and the
+            # mesh, so every iteration writes the same value.  Reading it
+            # out of the body is how the handle's non-buffer half survives
+            # a scan.
+            tile["nb"] = int(L.nb)
+            return carry, L.raw
 
-    _, raw = jax.lax.scan(_potrf, None, A, unroll=BATCHED_SCAN_UNROLL)
+        def _scanned(A_):
+            _, raw_ = jax.lax.scan(_potrf, None, A_,
+                                   unroll=BATCHED_SCAN_UNROLL)
+            return raw_
+
+        return jax.jit(_scanned), tile
+
+    key = scan_signature("cholesky", "slate", mesh_xy, (A,), {},
+                         extra="slate.potrf")
+    fn, tile = cached_scan(key, _build)
+    raw = fn(A)                     # traces (and fills ``tile``) on a MISS
     return raw, tile["nb"]
 
 
@@ -240,12 +255,21 @@ def solve(token: FactorToken, B) -> jax.Array:
     raw, nb = token._factor
     n, SlateLowerL = token.n, mod.SlateLowerL
 
-    def _two_trsms(carry, xs):
-        raw_q, B_q = xs
-        L = SlateLowerL(raw=raw_q, mesh=mesh, n=n, nb=nb)
-        y = mod.distributed_trsm(L, B_q, mesh=mesh, op="N")
-        return carry, mod.distributed_trsm(L, y, mesh=mesh, op="C")
+    def _build():
+        def _two_trsms(carry, xs):
+            raw_q, B_q = xs
+            L = SlateLowerL(raw=raw_q, mesh=mesh, n=n, nb=nb)
+            y = mod.distributed_trsm(L, B_q, mesh=mesh, op="N")
+            return carry, mod.distributed_trsm(L, y, mesh=mesh, op="C")
 
-    _, X = jax.lax.scan(_two_trsms, None, (raw, B),
-                        unroll=BATCHED_SCAN_UNROLL)
+        def _scanned(raw_, B_):
+            _, X_ = jax.lax.scan(_two_trsms, None, (raw_, B_),
+                                 unroll=BATCHED_SCAN_UNROLL)
+            return X_
+
+        return jax.jit(_scanned)
+
+    key = scan_signature("cholesky", "slate", mesh, (raw, B), {},
+                         extra=("slate.trsm", n, nb))
+    X = cached_scan(key, _build)(raw, B)
     return ensure_sharding(X, NamedSharding(mesh, P(None, "x", "y")))

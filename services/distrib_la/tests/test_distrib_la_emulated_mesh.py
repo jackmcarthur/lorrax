@@ -392,9 +392,19 @@ def _planmod():
 
 
 def _stand_in_plan(monkeypatch, op, backend, mesh, module):
-    """A ``Plan`` for ``(op, backend)`` whose backend module is ``module``."""
+    """A ``Plan`` for ``(op, backend)`` whose backend module is ``module``.
+
+    Empties ``plan._SCAN_CACHE`` first.  That cache is keyed on ``(op,
+    backend, mesh, signature)`` and NOT on the module object, which is
+    right in production — ``backend_module(name)`` is a singleton, so the
+    name determines the function — and wrong here, where every cell puts a
+    different stand-in behind the same name.  Without the reset, a cell
+    that counts traces would silently be reading the PREVIOUS cell's
+    compiled scan and counting zero.
+    """
     from jax.sharding import NamedSharding, PartitionSpec as P
     pm = _planmod()
+    pm._SCAN_CACHE.clear()
     monkeypatch.setattr(pm, "backend_module", lambda b: module)
     return pm.Plan(op=op, requested=backend, backend=backend, mesh=mesh,
                    n=None,
@@ -482,6 +492,38 @@ def test_the_scan_body_is_traced_once_however_long_the_batch(monkeypatch, nq):
         f"{nq}-matrix batch; a scan at unroll={D.BATCHED_SCAN_UNROLL} "
         f"traces it exactly that many times regardless of nq")
     assert calls[0] == (8, 8)
+
+
+def test_a_repeated_batched_call_reuses_the_compiled_scan(monkeypatch):
+    """Calling ``batched()`` again with the same signature does NOT retrace.
+
+    MEASURED, and the reason the cache exists rather than being tidiness:
+    Perlmutter CPU 2x2, nq=8 n=64, an UNCACHED eager scan cost 0.080 s warm
+    against 0.011 s for the same scan as a compiled executable — ~69 ms of
+    pure per-call retrace-and-relower, which made the scan SLOWER than the
+    Python loop it replaced (0.024 s warm, which paid nothing per call
+    because every backend call hit the wrapper's own jit cache).
+
+    The trace count is the cheap proxy for that wall clock, and it is the
+    thing that actually regresses if somebody drops the cache.
+    """
+    import jax.numpy as jnp
+    mesh = _mesh(2, 2)
+    rng = np.random.default_rng(4047)
+    A = jnp.asarray(_hpd(rng, 4, 8, "complex128"))
+    calls = []
+    p = _stand_in_plan(monkeypatch, "eigh", "slate", mesh,
+                       _eigh_stand_in(calls))
+    first = p.batched(A)
+    for _ in range(3):
+        again = p.batched(A)
+    assert len(calls) == D.BATCHED_SCAN_UNROLL, (
+        f"four batched calls of one signature traced the body "
+        f"{len(calls)} times; the compiled scan is cached per signature, "
+        f"so it must be traced once")
+    # ...and reuse must not have changed the answer.
+    assert np.array_equal(np.asarray(first[0]), np.asarray(again[0]))
+    assert np.array_equal(np.asarray(first[1]), np.asarray(again[1]))
 
 
 def test_the_scan_route_applies_the_per_backend_normaliser(monkeypatch):

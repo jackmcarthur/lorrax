@@ -83,7 +83,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
-                                resolve_backend)
+                                mesh_key, resolve_backend)
 
 __all__ = ["Plan", "plan", "ensure_sharding", "BATCHED_SCAN_UNROLL",
            "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
@@ -117,6 +117,54 @@ ROUTE_BATCH_RESHARD = "batch_reshard"
 #: importable with no jax and no ``.so``, so a test can enumerate the routes
 #: without a mesh.
 BATCHED_ROUTES = (ROUTE_SCAN, ROUTE_BACKEND_BATCHED, ROUTE_BATCH_RESHARD)
+
+#: ``jit``-compiled batched scans, one per (op, backend, mesh, signature).
+#:
+#: NOT an optimization to taste — a MEASURED requirement, and the same one
+#: every FFI wrapper in this package already answers with a ``_JIT_CACHE``.
+#: An eager ``shard_map`` re-traces on every call, and an eager ``lax.scan``
+#: around one re-traces AND re-lowers the whole loop on every call.  Without
+#: this cache the scan is CORRECT and SLOWER: Perlmutter CPU 2x2, nq=8 n=64,
+#: the serial eigh route measured cold 0.106 s / warm 0.080 s eager against
+#: the same scan as a compiled executable at 0.011 s, i.e. ~69 ms of pure
+#: per-call retrace — worse than the Python loop it replaced (warm 0.024 s),
+#: which paid nothing per call because each backend call hit the wrapper's
+#: own cache.
+#:
+#: Keyed on :func:`distrib_la.mesh_key`, which is STRICTLY finer than the
+#: ``(Px, Py)`` the backends key their MPI/NCCL contexts on, so this cache
+#: cannot hold an executable whose baked-in context handle has moved on.
+#: Finer than necessary can only cost an extra compile; coarser is the one
+#: failure mode a cache key must not have.
+_SCAN_CACHE: dict = {}
+
+
+def scan_signature(op: str, backend: str, mesh: Mesh, ops, kwargs,
+                   extra=()) -> int | None:
+    """A hashable identity for a compiled batched scan, or ``None``.
+
+    ``None`` means "this call cannot be keyed" — an unhashable keyword — and
+    the caller then builds the scan without caching it.  Refusing to cache
+    is always safe; guessing a key is not.
+    """
+    try:
+        return hash((
+            op, backend, mesh_key(mesh), BATCHED_SCAN_UNROLL, extra,
+            tuple((tuple(x.shape), str(x.dtype)) for x in ops),
+            tuple(sorted((k, repr(v)) for k, v in kwargs.items()))))
+    except TypeError:
+        return None
+
+
+def cached_scan(key, build):
+    """The compiled scan for ``key``, built once.  ``key=None`` skips the
+    cache entirely and builds every time."""
+    if key is None:
+        return build()
+    fn = _SCAN_CACHE.get(key)
+    if fn is None:
+        fn = _SCAN_CACHE[key] = build()
+    return fn
 
 
 def ensure_sharding(x, sharding: NamedSharding):
@@ -492,6 +540,10 @@ class Plan:
         stacks the per-matrix outputs itself, preserving whatever pytree
         the single-matrix call returns (a bare array, or eigh's
         ``(W, Z)``).
+
+        The scan is ``jax.jit``-ed and cached per signature.  That is not
+        decoration: see :data:`_SCAN_CACHE` for the measurement that says
+        an uncached eager scan is slower than the Python loop it replaces.
         """
         spec = _IMPL[(self.op, self.backend)]
         one, post = self._entry("one")
@@ -511,16 +563,25 @@ class Plan:
 
         mesh, backend, tile = self.mesh, self.backend, self.in_sharding
 
-        def _one_matrix(carry, tiles):
-            out = one(*(ensure_sharding(t, tile) for t in tiles),
-                      mesh=mesh, **kwargs)
-            return carry, (post(backend, *out) if post is not None else out)
+        def _build():
+            def _one_matrix(carry, tiles):
+                out = one(*(ensure_sharding(t, tile) for t in tiles),
+                          mesh=mesh, **kwargs)
+                return carry, (post(backend, *out) if post is not None
+                               else out)
 
-        # An EMPTY carry: nothing crosses from matrix q to matrix q+1, and
-        # writing that down is the claim that the batch axis is independent.
-        _, stacked = jax.lax.scan(_one_matrix, None, ops,
-                                  unroll=BATCHED_SCAN_UNROLL)
-        return stacked
+            def _scanned(*stacks):
+                # An EMPTY carry: nothing crosses from matrix q to matrix
+                # q+1, and writing that down is the claim that the batch
+                # axis is independent.
+                _, stacked = jax.lax.scan(_one_matrix, None, stacks,
+                                          unroll=BATCHED_SCAN_UNROLL)
+                return stacked
+
+            return jax.jit(_scanned)
+
+        key = scan_signature(self.op, self.backend, mesh, ops, kwargs)
+        return cached_scan(key, _build)(*ops)
 
 
 def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
