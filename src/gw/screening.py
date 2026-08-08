@@ -624,17 +624,32 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
         # rtol is generous — this catches structural mixing, not roundoff.
         sanity.check_hermitian(f"{label}[q=0]", W[0], rtol=1e-6,
                                print_fn=print_fn)
-        # The load-bearing property, over ALL q.  Tolerance: W is exact
-        # here by construction — ζ satisfies the same reciprocity at
-        # 4.7e-16 (measured, all 64 q) and the only arithmetic between ζ
-        # and W is the analytic V assembly plus one Dyson solve, whose own
-        # round-off shows up as the 1.9e-11 residual at the self-conjugate
-        # q=0 slab.  1e-8 sits three orders above that floor and four
-        # orders below the 9.1e-4 break present today, so it cannot fire on
-        # round-off and cannot miss a structural break.
+        # The load-bearing property, over ALL q.
+        #
+        # SCOPE.  This sits inside the ω-real == 0 branch deliberately.  On
+        # the imaginary axis (ω = 0 and ω = iω_p) χ₀ — and hence W — is real
+        # in R-space for a time-reversal-symmetric system, so reciprocity is
+        # a true property there.  It is NOT true of the real-axis HL probe:
+        # a dynamical W obeys Kramers-Kronig, carries a genuine W'' , and
+        # legitimately violates W_q = conj(W_{−q}).  Gating that branch
+        # would be checking something false by construction.
+        #
+        # TOLERANCE, derived from the MEASURED floor rather than from eps.
+        # These tiles span |A| ∈ [1.4, 3.8e6] (dyn. range ~50x on the median,
+        # max/min ~2.7e6), so an ‖·‖-relative floor is NOT eps: the residual
+        # is set by cancellation among large intermediates.  The empirical
+        # floor is the orbit-closed IBZ arm, where the unfold builds W_{−q}
+        # from W_q by symmetry and reciprocity therefore holds BY
+        # CONSTRUCTION — whatever residual it shows is pure arithmetic.
+        # MEASURED there (armB_orbit504, 2026-08-07): 1.13e-7 on this exact
+        # statistic.  Its magnitude signature confirms round-off — the
+        # per-element relative residual FALLS with |A| (4.9e-7 at <p10 to
+        # 3.1e-8 at >p99) while the absolute residual rises.
+        # 1e-5 is ~90x above that floor and ~400x below the smallest real
+        # break measured (7.8e-4), so it can neither cry wolf nor miss one.
         if kgrid is not None:
             sanity.check_q_conjugate_reciprocity(
-                f"{label}[all q]", W, kgrid, rtol=1e-8, print_fn=print_fn)
+                f"{label}[all q]", W, kgrid, rtol=1e-5, print_fn=print_fn)
 
 
 __all__ = [
