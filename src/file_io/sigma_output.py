@@ -5,6 +5,45 @@ import h5py
 
 from common.provenance import provenance_header
 
+# THE STAMP CONTRACT IS ``kin_ion``'s, IMPORTED RATHER THAN RESTATED.
+# ``sigma_mnk.h5`` and ``kin_ion.h5`` now both store a k axis that may be
+# the irreducible wedge, and they must mean the SAME thing by that or a
+# reader will eventually apply one file's rule to the other.  So the attr
+# names, the version integer, the two table names and the
+# "no attr means full" default all come from one module, and
+# :func:`kin_ion.read_star_map` is the one implementation that reads them.
+from .kin_ion import (                                      # noqa: F401
+	IRR_IDX_DATASET,
+	K_STORAGE_ATTR,
+	K_STORAGE_FULL,
+	K_STORAGE_IBZ,
+	K_STORAGE_VERSION,
+	K_STORAGE_VERSION_ATTR,
+	N_SYM_SPATIAL_ATTR,
+	SYM_IDX_DATASET,
+	read_star_map,
+)
+
+#: Attr prefix under which the pre-extraction star-spread measurement is
+#: stamped.  Four numbers per dataset — see :func:`sigma_star_spread_stats`
+#: for what each one is and why four rather than one.
+SPREAD_ATTR_PREFIX = "star_spread_"
+
+#: Which datasets of ``sigma_mnk.h5`` carry a k axis, and where it is.
+#: The dynamic cubes are ``(n_omega, nk, nb, nb)``; everything else is
+#: ``(nk, …)``.  A dataset absent from this table has no k axis at all
+#: (``omega_ev``) and is written verbatim.
+SIGMA_K_AXIS = {
+	"sigma_total_kij_ev": 1,
+	"sigma_c_kij_ev": 1,
+	"sigma_sx_kij_ev": 0,
+	"hartree_kij_ev": 0,
+	"sigma_xc_qsgw_kij_ev": 0,
+	"qp_diag_self_consistent_ev": 0,
+	"qp_omega0_ev": 0,
+	"qp_static_cohsex_ev": 0,
+}
+
 
 def write_sigma_to_file(
 	sigma_sx_kij_eV,
@@ -312,58 +351,326 @@ def write_chunked_complex_dataset_h5(
 
 
 # ===========================================================================
-# WHY sigma_mnk.h5 IS NOT STORED ON THE IBZ — measured 2026-08-08, REFUSED
+# HOW sigma_mnk.h5 STORES ITS k AXIS — the SELECTION, and what it is not
 # ===========================================================================
-# The Σ cubes look like the ideal candidate for the store-on-IBZ /
-# broadcast-on-read treatment ``kin_ion.h5`` now gets: pure output, one
-# host-side consumer (``gw.eqp_bgw``), no convolution downstream, and half
-# the payload sitting in two ``(n_omega, nk, nb, nb)`` tensors.  They are
-# not, and the reason belongs here rather than being rediscovered.
+# This file can store its k axis on the irreducible wedge, and the way it
+# does so is a SELECTION of rows that were already accumulated: the Σ sweep
+# runs at every full-BZ k exactly as before, the cube is completed, the
+# kernel exits, and only then does the writer keep one row per star and drop
+# the rest.  Nothing is reconstructed, nothing is substituted, and the rows
+# that survive are bit-for-bit the rows the full-BZ file held.
 #
-# kin_ion IS computed on the IBZ, so its broadcast was write-time padding
-# and moving it to the reader changes nothing.  Σ IS NOT.
-# ``gw.sc_iteration`` says it in one line: "H/E/U on the IBZ, Σ on the full
-# BZ".  Every full-BZ k in these cubes is an INDEPENDENT evaluation, so the
-# k axis carries nk measurements — not nrk measurements and nk−nrk copies.
-# Storing the wedge and rebuilding the rest replaces the other nk−nrk with
-# reconstructions.
+# THAT IS NOT THE THING THIS FILE REFUSED, and the distinction is the whole
+# design.  What was refused — and stays refused — is storing the wedge and
+# REBUILDING the other nk−nrk rows from it on read.  ``gw.sc_iteration``
+# says why in one line: "H/E/U on the IBZ, Σ on the full BZ".  Every full-BZ
+# k is an INDEPENDENT evaluation, so an unfold would replace nk−nrk
+# measurements with reconstructions, and on a deck whose quadrature is not
+# orbit-closed those reconstructions are wrong by the amounts below.  No
+# reader in this module unfolds; a consumer that wants full-BZ Σ rows must
+# get them from a run, not from this file.
 #
-# MEASURED on ``tests/regression/cohsex_debug/sigma_mnk.h5`` (11.029 MB,
-# nk 9, nrk 3 — a 3.00x reduction on this deck, not the 8x a Si 4³/48-op
-# deck would suggest), residual of ``unfold(select(A))`` against ``A``:
+# The reason a selection is nevertheless sound is that nothing downstream
+# consumes the dropped rows.  EQP consumption (kin_ion + v_hartree + Σ^xc)
+# is already k_irr-side, and the static Hermitianization now happens on the
+# selected rows only, so the extraction removes payload that had no reader.
 #
-#     dataset                rel Frobenius   worst element
-#     hartree_kij_ev            3.0344e-01      113.08 eV
-#     sigma_c_kij_ev            6.3020e-01        2.20 eV
-#     sigma_sx_kij_ev           3.4971e-01        8.89 eV
-#     sigma_total_kij_ev        3.0649e-01      105.27 eV
-#     sigma_xc_qsgw_kij_ev      1.5653e-01        7.28 eV
+# WHAT THE DROPPED ROWS USED TO LET YOU MEASURE, and where it went.  Because
+# the star relation is the metric the whole orbit-closure program is priced
+# in (SPEC_qirr_restart_tensors §2a: Σ star spread 16.884 → 0.743 meV, a 23x
+# gain, against +4.4 meV on BSE at fixed rank), an artifact that no longer
+# carries the star members cannot be measured for it afterwards.  So the
+# measurement moved to WRITE time: :func:`sigma_star_spread_stats` runs on
+# the complete full-BZ cube before a single row is dropped, and its four
+# numbers are logged and stamped onto every extracted dataset.  The metric
+# survives the extraction; only the ability to recompute it from the file
+# does not.
 #
-# Those are not round-off.  The star relation is a PROPERTY a run has when
-# its ISDF quadrature is orbit-closed, and cohsex_debug's 60-centroid set is
-# not: ``tests/test_star_offdiag_gate.py`` measures the spatial pairs broken
-# at 1.8e-01 … 4.0e-01 and the pure-TRS pairs holding only to
-# 7.5e-07 … 7.0e-04.  The tree ALREADY refuses to select IBZ rows on numbers
-# like these — ``sc_iteration._KSTAR_SPREAD_TOL`` is 1e-6 on Σ+V_H, five
-# decades below what this fixture measures, and its refusal message is the
-# argument in full: "members of a star must carry the same Σ up to
-# round-off; they do not, so the full-BZ Σ and the IBZ carry are in
-# different gauges and selecting the star representatives would silently
-# keep the wrong one."
+# THE NUMBERS, and what they turned out to be.  Measured on
+# ``tests/regression/cohsex_debug/sigma_mnk.h5`` (nk 9, nrk 3 — a 3.00x
+# reduction on this deck, not the 8x a Si 4³/48-op deck would suggest),
+# residual of ``unfold(select(A))`` against ``A``:
 #
-# And the spread is not noise to be squeezed out.  It is the METRIC the
-# whole orbit-closure program is priced in (SPEC_qirr_restart_tensors §2a:
-# Σ star spread 16.884 → 0.743 meV, a 23x gain, against +4.4 meV on BSE at
-# fixed rank).  A format that reconstructs the star members deletes that
-# measurement by construction, on every deck, closed or not.
+#     dataset                worst element   Re-diag spread   after degen-avg
+#     hartree_kij_ev            113.08 eV         61.51 eV         56.76 eV
+#     sigma_total_kij_ev        105.27 eV         59.53 eV         54.75 eV
+#     sigma_sx_kij_ev             8.89 eV          1.21 eV          1.16 eV
+#     sigma_xc_qsgw_kij_ev        7.28 eV          4.30 eV          4.20 eV
+#     sigma_c_kij_ev              1.43 eV          0.98 eV          0.97 eV
 #
-# REGISTERED WHILE MEASURING, not claimed: ``sigma_total_kij_ev`` is 48.2 %
-# of the payload and is the sum of the other three.  It reproduces
-# ``c + sx[None] + h[None]`` to max|Δ| 4.351e-05 eV (4.440e-08 relative) but
-# is NOT bit-identical under either association order, so dropping it today
-# is a ~1.9x win that would move the file's numbers.  Pinning the writer's
-# own association first would make it exact — a separate change with a
-# separate gate, and the one actually worth doing on this file.
+# The 113.08 eV was investigated before the extraction was written, on the
+# owner's instruction, because a number that large usually means the Σ
+# procedure did something wrong.  It did not, and the answer is in two
+# halves (``tools/sigma_star_spread_decompose.py``, and the prose in
+# ``NOTE_sigma_star_spread.md``).
+#
+# HALF ONE: the raw metric can read enormous from gauge alone.  ⟨mk|O|nk⟩
+# is not a physical quantity when m and n are degenerate — the diagonaliser
+# picks a basis inside each manifold independently at every k.  ``kin_ion``,
+# built on the exact FFT grid with no ISDF quadrature anywhere in its path,
+# is the control: it reads 2.861e-01 relative and 7.78 Ry on its worst
+# element under this metric, and 6.4e-13 under one the gauge cannot move.
+# The 113.08 eV element itself sits at (k, m, n) = (8, 0, 6), OFF-DIAGONAL,
+# stored −52.7533+20.3097i against an unfold of +52.7210−20.4598i: the
+# magnitudes are 56.5278 and 56.5518, agreeing to 4 parts in 10⁴, with the
+# phase inverted, and band 0 lies in a manifold of multiplicity 2.  A 56 eV
+# element reports 113 eV the moment the sign convention differs.
+#
+# HALF TWO: what is left after the gauge is removed is real, and it is this
+# fixture's quadrature.  Degeneracy-averaging the Hartree diagonal takes its
+# star spread only from 61.51 eV to 56.76 eV — 7.7 % was gauge.
+# ``verify_centroid_orbit_closure`` on this deck's own
+# ``centroids_frac_60.txt`` returns the identity op at exactly 0.0000 and
+# all eleven genuine rotations at 0.166 … 0.276, and the Σ spread has the
+# same signature: relations needing a rotation break at 8e-02 … 3e-01
+# gauge-blind, relations needing none hold at 1.1e-04 (hartree) and 2.6e-04
+# (sigma_sx).  Cause and effect line up op by op.
+#
+# NONE OF WHICH THE SELECTION TOUCHES.  A run whose quadrature is not
+# orbit-closed has a Σ that differs across a star, and that was true of the
+# full-BZ file too; the extraction neither creates the disagreement nor
+# hides it, because the stamped stats report it on every run.  What the
+# extraction does mean is that the file no longer offers a CHOICE of which
+# star member to believe — it keeps the first, which is the row every
+# k_irr-side consumer was already reading.
+#
+# CORRECTED WHILE MEASURING.  ``sigma_total_kij_ev`` reproduces
+# ``c + sx[None] + h[None]`` on that fixture to max|Δ| 4.3511e-05 eV, and
+# this block used to attribute the gap to an unpinned association order.  It
+# is not that.  All three association orders give BIT-IDENTICALLY the same
+# 4.3511e-05 eV, so reassociation is not what moves it; every one of the four
+# arrays is exactly a float32 value widened into a complex128 container, and
+# 4.3511e-05 against a peak of 384.51 eV is 1.13e-07 relative, which is
+# float32 epsilon.  The fixture is a single-precision artifact.  Pinning the
+# association would not have made it exact — and the writer's two paths
+# already share one association order by construction, ``(c + sx) + h``, in
+# both the replicated derivation below and ``gw.ppm_pipeline``'s sharded
+# one.  What was missing was a gate saying so, and
+# ``tests/test_sigma_kirr_extraction.py`` is now it.
+
+
+def compact_star_tables(irr_idx_k):
+	"""``(rows_to_keep, compacted_irr_idx_k)`` for a star selection.
+
+	``rows_to_keep`` are the FIRST-OCCURRENCE full-BZ rows of each star,
+	in that order, which is ``star_select``'s own convention and therefore
+	the ordering ``star_broadcast`` expects to be handed back.
+
+	THE COMPACTION IS NOT COSMETIC.  ``SymMaps.irr_idx_k`` labels each
+	full-BZ k with a row of the WFN's wedge, and that wedge can have more
+	rows than the mesh has stars — ``cohsex_debug`` is exactly that case,
+	with ``irr_idx_k`` taking the values ``{0, 2, 3}`` out of a 4-row
+	wedge for 3 stars.  Written verbatim, such a table claims 4 stored
+	rows for a slab that has 3, which is precisely the inconsistency
+	:func:`kin_ion.read_star_map` refuses on.  So the stored table is
+	renumbered to index the STORED rows, and the file is self-consistent
+	by construction rather than by the caller's luck.
+	"""
+	irr = np.asarray(irr_idx_k)
+	if irr.ndim != 1:
+		raise ValueError(
+			f"irr_idx_k must be (nk_full,); got shape {irr.shape}")
+	seen: dict[int, int] = {}
+	rows: list[int] = []
+	compact = np.empty(irr.size, dtype=np.int32)
+	for i, lab in enumerate(int(v) for v in irr):
+		if lab not in seen:
+			seen[lab] = len(rows)
+			rows.append(i)
+		compact[i] = seen[lab]
+	return np.asarray(rows, dtype=np.int64), compact
+
+
+def star_select_k_irr(values, rows_to_keep, *, k_axis=0):
+	"""Keep ``rows_to_keep`` along ``k_axis``.  Pure selection, no arithmetic.
+
+	This is the whole extraction.  It is spelled as its own function so the
+	gate can assert what it is: a take of rows that already existed, which
+	makes bit-identity against the full-BZ array trivially true rather
+	than something to be measured to a tolerance.
+
+	A DEVICE ARRAY STAYS ON ITS DEVICE.  ``jax.Array`` carries ``.take``,
+	so the sharded write path drops its rows without a host round trip of
+	the cube — the k axis is never the sharded one here (the sharded
+	layout tiles bands, ``qsgw_utils.is_band_sharded_sigma_omega``), so
+	this is a local gather on every rank.
+	"""
+	rows = np.asarray(rows_to_keep)
+	take = getattr(values, "take", None)
+	if take is not None:
+		return take(rows, axis=k_axis)
+	return np.take(np.asarray(values), rows, axis=k_axis)
+
+
+def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
+                            n_sym_spatial, *, k_axis=0, omega_index=None):
+	"""How far this array is from its own star relation.  FOUR numbers.
+
+	Computed on the COMPLETE full-BZ array, before any row is dropped —
+	that is the only moment it can be computed at all once the artifact
+	stops carrying the star members.
+
+	Four rather than one, because one cannot be read.  A raw-element
+	residual on a Σ matrix mixes a physical disagreement together with the
+	degenerate-manifold basis choice, and the second can dominate the
+	first by thirteen orders (see the block above).  So the raw number is
+	reported for continuity with the published one, and beside it two
+	quantities the gauge cannot move at all:
+
+	``raw_ev``
+	    ``max |A − unfold(select(A))|``.  THE published metric, the one
+	    that reads 113.08 eV on ``cohsex_debug``'s Hartree array.  Read it
+	    as an upper bound, never as an error.
+	``diag_ev``
+	    Worst per-band ``max − min`` of the REAL diagonal within a star —
+	    ``harness.compare_to_bgw``'s ``_star_spread`` and the quantity
+	    ``sc_iteration._KSTAR_SPREAD_TOL`` is set against, so the stamped
+	    number is comparable to both.  Gauge-free except inside degenerate
+	    manifolds.
+	``frobenius_ev``, ``trace_ev``
+	    Worst ``max − min`` of ``‖A[k]‖_F`` and of ``|Tr A[k]|`` within a
+	    star.  Both are invariant under ``A → U†AU`` for ANY unitary U,
+	    which is a superset of the diagonaliser's freedom, so a nonzero
+	    value here is proof that the operators genuinely differ and not an
+	    artifact of anybody's basis.  They are also free: no eigen- or
+	    singular-value decomposition, two reductions over an array already
+	    in memory.  On the control they collapse 7.78 → 0.003; on the Σ
+	    cubes they do not collapse, which is how one reads that the
+	    fixture's residual spread is real.
+
+	A 4-D cube is measured at ``omega_index`` alone (the ω nearest zero,
+	chosen by the writer), because the star relation is a per-ω statement
+	and measuring all of them would cost a second cube of memory for no
+	extra verdict.  The index is stamped alongside so the number is never
+	read as an all-ω claim.
+	"""
+	from ffi import _services
+	_services.ensure_on_path()
+	import symmetry_maps
+
+	# ONE ω SLICE, TAKEN BEFORE THE HOST TRANSFER.  ``np.asarray`` on the
+	# cube itself would pull all (n_omega, nk, nb, nb) of it back from the
+	# devices to measure one slice of it — 1.3 GB on the mos2_4x4 deck for
+	# a 33 MB answer.  Slicing first keeps the transfer to the slice.
+	ndim = len(np.shape(values))
+	if ndim == 4:
+		if omega_index is None:
+			omega_index = np.shape(values)[0] // 2
+		M = np.asarray(values[int(omega_index)])
+	else:
+		M = np.asarray(values)
+		omega_index = -1
+	if k_axis != 0:
+		M = np.moveaxis(M, k_axis - (1 if ndim == 4 else 0), 0)
+
+	sel = M[np.asarray(rows_to_keep)]
+	unfolded = np.asarray(symmetry_maps.star_broadcast(
+		sel, np.asarray(compact_irr), np.asarray(sym_idx_k),
+		int(n_sym_spatial),
+		irr_labels=np.arange(len(rows_to_keep), dtype=np.int32)))
+	raw = float(np.abs(M - unfolded).max()) if M.size else 0.0
+
+	diag = frob = trace = 0.0
+	compact = np.asarray(compact_irr)
+	for lab in range(len(rows_to_keep)):
+		mem = np.flatnonzero(compact == lab)
+		if mem.size < 2:
+			continue
+		blk = M[mem]
+		if blk.ndim == 3:
+			d = np.real(np.diagonal(blk, axis1=1, axis2=2))
+			diag = max(diag, float((d.max(0) - d.min(0)).max()))
+			t = np.abs(np.trace(blk, axis1=1, axis2=2))
+			trace = max(trace, float(t.max() - t.min()))
+		else:
+			d = np.real(blk)
+			diag = max(diag, float((d.max(0) - d.min(0)).max()))
+		f = np.linalg.norm(blk.reshape(mem.size, -1), axis=1)
+		frob = max(frob, float(f.max() - f.min()))
+
+	return {
+		"raw_ev": raw,
+		"diag_ev": diag,
+		"frobenius_ev": frob,
+		"trace_ev": trace,
+		"omega_index": int(omega_index),
+	}
+
+
+def derive_sigma_total(sigma_c, sigma_sx, hartree):
+	"""``(c + sx[None]) + h[None]`` — THE association, in one place.
+
+	Both write paths need this sum and they must produce bit-identical
+	bytes, so they call one function rather than each spelling their own
+	parenthesisation: the replicated derivation in
+	:func:`write_sigma_omega_h5` and the sharded one inside
+	``gw.ppm_pipeline._write_sigma_omega_h5``'s jitted ``_ev_tensors``.
+	Works on host and device arrays alike — it is three adds.
+
+	WHY THIS IS A NAMED FUNCTION AND NOT AN EXPRESSION.  A float64
+	reassociation of a three-term sum moves the result at 1e-16 relative,
+	which no physics gate would ever catch, and the two paths sat in
+	different files with no gate between them.
+	``tests/test_sigma_kirr_extraction.py`` pins the association here,
+	where pinning it costs one cell instead of a parallel run.
+
+	(The 4.35e-05 eV that ``cohsex_debug``'s committed cube shows against
+	this sum is NOT a reassociation — all three orders reproduce it
+	bit-identically, and every array in that file is a widened float32.
+	See the block above.)
+	"""
+	total = sigma_c
+	if sigma_sx is not None:
+		total = total + sigma_sx[None, ...]
+	if hartree is not None:
+		total = total + hartree[None, ...]
+	return total
+
+
+def k_irr_rows_for(full_bz_indices, compact_irr, *, what="caller"):
+	"""Full-BZ row indices → STORED row indices, or a refusal.
+
+	The one adapter a k_irr-side consumer needs, and the reason it refuses
+	rather than remapping blindly.  A consumer that already held full-BZ
+	indices naming the wedge rows it wants — ``eqp_bgw``'s
+	``kirr_to_kfull`` is the live example — can keep those indices and
+	come through here; ``compact_irr[i]`` is the stored row holding k *i*.
+
+	THE REFUSAL IS THE WHOLE POINT.  ``compact_irr[i]`` is defined for
+	EVERY full-BZ *i*, including ones whose data is not on disk, and for
+	those it returns the star's FIRST member instead.  That substitution —
+	handing back a different member of the same star — is exactly the
+	operation this file refuses, and on a deck whose quadrature is not
+	orbit-closed the two differ by up to the 113 eV in the block above.
+	So a request for a row that is not itself a stored row raises, and the
+	caller learns which k it asked for instead of receiving a plausible
+	wrong matrix.
+
+	In practice the check passes because the rows kept are the
+	first-occurrence members and ``kirr_to_kfull`` names first occurrences
+	too, but "in practice" is not a contract and this is the twin.
+	"""
+	compact = np.asarray(compact_irr)
+	idx = np.asarray(full_bz_indices, dtype=np.int64)
+	if idx.size and (idx.min() < 0 or idx.max() >= compact.size):
+		raise ValueError(
+			f"{what}: full-BZ index out of range for a {compact.size}-k "
+			f"mesh (got min {int(idx.min())}, max {int(idx.max())}).")
+	# The stored rows are the first occurrences, recovered from the table
+	# itself so this function needs no second source of truth.
+	_, first = np.unique(compact, return_index=True)
+	stored_rows = set(int(v) for v in first)
+	bad = sorted({int(i) for i in idx.ravel()} - stored_rows)
+	if bad:
+		raise ValueError(
+			f"{what}: full-BZ k {bad} are not stored rows of this file.  "
+			f"The file keeps one member per star ({len(stored_rows)} of "
+			f"{compact.size}), and returning a DIFFERENT member of the same "
+			f"star in their place is the substitution this format refuses — "
+			f"on a deck whose ISDF quadrature is not orbit-closed those "
+			f"members disagree by eV, not by round-off.  Regenerate "
+			f"sigma_mnk.h5 from a run whose k_irr set matches this consumer.")
+	return compact[idx]
 
 
 def write_sigma_omega_h5(
@@ -376,6 +683,8 @@ def write_sigma_omega_h5(
 	hartree_kij_ev=None,
 	k_chunk_size: int = 16,
 	mesh=None,
+	star=None,
+	print_fn=None,
 ):
 	"""Write frequency-dependent Sigma_mnk(omega) arrays to HDF5.
 
@@ -388,6 +697,22 @@ def write_sigma_omega_h5(
 
 	All large writes go through :mod:`file_io.slab_io`, which has one
 	transport (per-rank collective MPI-IO) and no selector.
+
+	``star``
+	    ``(irr_idx_k, sym_idx_k, n_sym_spatial)`` — the same triple
+	    ``gw.kin_ion_io.star_tables`` returns.  Given it, the k axis of
+	    every array above is EXTRACTED to one row per star before it is
+	    written, the two unfold tables are filed beside the arrays, and
+	    each dataset is stamped so a reader knows what it is holding.
+	    Omitted, the full BZ is written exactly as before and no attr
+	    appears — which is the back-compat direction that matters, since
+	    a dataset with no stamp is read as full-BZ.
+
+	    THE ORDER IS THE RULING, and it is visible in the code below: the
+	    arrays arrive complete, the star-spread statistic is measured on
+	    the COMPLETE arrays, and only then are rows dropped.  Measuring
+	    after the drop would measure nothing — there would be one member
+	    per star left to compare.
 	"""
 	from .slab_io import SlabIO
 
@@ -405,36 +730,124 @@ def write_sigma_omega_h5(
 	if nb != nb2:
 		raise ValueError("dynamic sigma tensors must be square in band indices.")
 
+	# sigma_total_kij_ev is derived when not passed: total = c + sx + h.
+	#
+	# THE ASSOCIATION IS ``(c + sx) + h``, and it is the same one
+	# ``gw.ppm_pipeline``'s sharded branch spells out for itself, so the
+	# two write paths agree bit-for-bit rather than to a tolerance.
+	# ``tests/test_sigma_kirr_extraction.py`` pins it.  (The 4.35e-05 eV
+	# the cohsex_debug fixture shows against this sum is NOT reassociation
+	# — every array in that file is a widened float32 — see the block
+	# above.)  This runs BEFORE the extraction so the derived total is the
+	# sum of the full-BZ operands and the extraction of the total equals
+	# the total of the extraction.
+	total = sigma_total_kij_ev
+	if total is None:
+		total = derive_sigma_total(
+			sigma_c_kij_ev, sigma_sx_kij_ev, hartree_kij_ev)
+
+	payload = {
+		"sigma_total_kij_ev": (total, 1),
+		"sigma_c_kij_ev": (sigma_c_kij_ev, 1),
+		"sigma_sx_kij_ev": (sigma_sx_kij_ev, 0),
+		"hartree_kij_ev": (hartree_kij_ev, 0),
+	}
+
+	stamps: dict[str, dict] = {}
+	rows_to_keep = compact_irr = sym_idx_k = None
+	n_sym_spatial = 0
+	if star is not None:
+		irr_idx_k, sym_idx_k, n_sym_spatial = star
+		irr_idx_k = np.asarray(irr_idx_k)
+		sym_idx_k = np.asarray(sym_idx_k, dtype=np.int32)
+		if irr_idx_k.size != nk:
+			raise ValueError(
+				f"star tables describe {irr_idx_k.size} full-BZ k but the "
+				f"Σ cube has nk={nk}; the sweep and the tables are not from "
+				f"the same run.")
+		rows_to_keep, compact_irr = compact_star_tables(irr_idx_k)
+
+		# MEASURED ON THE COMPLETE CUBE, BEFORE ANY ROW IS DROPPED.
+		omega_index = int(np.argmin(np.abs(np.asarray(omega_ev))))
+		for name, (arr, k_axis) in payload.items():
+			if arr is None:
+				continue
+			stats = sigma_star_spread_stats(
+				arr, rows_to_keep, compact_irr, sym_idx_k, n_sym_spatial,
+				k_axis=k_axis, omega_index=omega_index)
+			stamps[name] = stats
+			if print_fn is not None:
+				print_fn(
+					f"  Σ star spread [{name}]: raw {stats['raw_ev']:.4f} eV, "
+					f"diag {stats['diag_ev']:.4f} eV, gauge-blind "
+					f"‖·‖_F {stats['frobenius_ev']:.4f} / "
+					f"|Tr| {stats['trace_ev']:.4f} eV")
+		if print_fn is not None:
+			print_fn(
+				f"  Σ k axis EXTRACTED to k_irr: {nk} -> "
+				f"{len(rows_to_keep)} rows (selection, not reconstruction).")
+
+		# ...and only now are they dropped.
+		for name, (arr, k_axis) in list(payload.items()):
+			if arr is not None:
+				payload[name] = (
+					star_select_k_irr(arr, rows_to_keep, k_axis=k_axis),
+					k_axis)
+		nk = len(rows_to_keep)
+		shape_ref = (n_omega, nk, nb, nb2)
+
 	k_chunk = max(1, int(k_chunk_size))
 	om_chunks  = (n_omega, min(k_chunk, nk), nb, nb2)
 	kij_chunks = (min(k_chunk, nk), nb, nb2)
 
-	# sigma_total_kij_ev is derived when not passed: total = c + sx + h
-	total = sigma_total_kij_ev
-	if total is None:
-		total = sigma_c_kij_ev
-		if sigma_sx_kij_ev is not None:
-			total = total + sigma_sx_kij_ev[None, ...]
-		if hartree_kij_ev is not None:
-			total = total + hartree_kij_ev[None, ...]
+	def _attrs(name):
+		if star is None:
+			return None
+		out = {
+			K_STORAGE_ATTR: K_STORAGE_IBZ,
+			K_STORAGE_VERSION_ATTR: K_STORAGE_VERSION,
+			N_SYM_SPATIAL_ATTR: int(n_sym_spatial),
+			"nk_full": int(np.asarray(compact_irr).size),
+		}
+		for key, val in stamps.get(name, {}).items():
+			out[SPREAD_ATTR_PREFIX + key] = val
+		return out
+
+	total = payload["sigma_total_kij_ev"][0]
+	sigma_c_kij_ev = payload["sigma_c_kij_ev"][0]
+	sigma_sx_kij_ev = payload["sigma_sx_kij_ev"][0]
+	hartree_kij_ev = payload["hartree_kij_ev"][0]
 
 	with SlabIO(abs_path, mode="w", mesh=mesh) as io:
 		io.write_attr("omega_ev", np.asarray(omega_ev, dtype=np.float64))
+		if star is not None:
+			# The tables live in the same file as the arrays they describe.
+			# A table that lives elsewhere is a table that silently decays
+			# when anything upstream is regenerated — kin_ion's words, and
+			# the same reasoning put them beside the slab there.
+			io.write_attr(IRR_IDX_DATASET,
+				np.asarray(compact_irr, dtype=np.int32))
+			io.write_attr(SYM_IDX_DATASET,
+				np.asarray(sym_idx_k, dtype=np.int32))
 		io.create_dataset("sigma_total_kij_ev",
-			shape=shape_ref, dtype=np.complex128, chunks=om_chunks)
+			shape=shape_ref, dtype=np.complex128, chunks=om_chunks,
+			attrs=_attrs("sigma_total_kij_ev"))
 		io.write_slab("sigma_total_kij_ev", total)
 		if sigma_c_kij_ev is not None:
 			io.create_dataset("sigma_c_kij_ev",
-				shape=shape_ref, dtype=np.complex128, chunks=om_chunks)
+				shape=shape_ref, dtype=np.complex128, chunks=om_chunks,
+				attrs=_attrs("sigma_c_kij_ev"))
 			io.write_slab("sigma_c_kij_ev", sigma_c_kij_ev)
 		if sigma_sx_kij_ev is not None:
 			io.create_dataset("sigma_sx_kij_ev",
 				shape=tuple(sigma_sx_kij_ev.shape),
-				dtype=np.complex128, chunks=kij_chunks)
+				dtype=np.complex128, chunks=kij_chunks,
+				attrs=_attrs("sigma_sx_kij_ev"))
 			io.write_slab("sigma_sx_kij_ev", sigma_sx_kij_ev)
 		if hartree_kij_ev is not None:
 			io.create_dataset("hartree_kij_ev",
 				shape=tuple(hartree_kij_ev.shape),
-				dtype=np.complex128, chunks=kij_chunks)
+				dtype=np.complex128, chunks=kij_chunks,
+				attrs=_attrs("hartree_kij_ev"))
 			io.write_slab("hartree_kij_ev", hartree_kij_ev)
 	return abs_path

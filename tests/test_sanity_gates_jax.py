@@ -573,7 +573,9 @@ def _assemble_from_run_dir_via_in_memory(d, out0, out1):
     """
     from common.units import RYD_TO_EV
     from gw.eqp_bgw import write_eqp_bgw_in_memory
-    from file_io.kin_ion import kin_ion_hartree_source, HARTREE_DATASET
+    from file_io.kin_ion import (kin_ion_hartree_source, HARTREE_DATASET,
+                                 read_star_map)
+    from file_io.sigma_output import k_irr_rows_for
 
     with h5py.File(os.path.join(d, "WFN.h5"), "r") as w:
         kpts = np.asarray(w["mf_header/kpoints/rk"])
@@ -590,11 +592,20 @@ def _assemble_from_run_dir_via_in_memory(d, out0, out1):
     with h5py.File(kip, "r") as k:
         kin = np.asarray(k["kin_ion"])[kmap, b0:b1, b0:b1]
     kin_diag = np.real(np.diagonal(kin, axis1=1, axis2=2)) * RYD_TO_EV
-    with h5py.File(os.path.join(d, "sigma_mnk.h5"), "r") as s:
+    # The same k-row resolution ``gw.eqp_bgw`` does, for the same reason:
+    # since the k_irr extraction ``sigma_mnk.h5`` may store one row per
+    # star, and the row this gate wants is then at ``irr_idx_k[kmap]``
+    # rather than at ``kmap``.  An unstamped file is full-BZ and takes the
+    # first branch, which is what every fixture and older run does.
+    smp = os.path.join(d, "sigma_mnk.h5")
+    sig_star = read_star_map(smp, "sigma_c_kij_ev", k_axis=1)
+    krows = kmap if sig_star is None else k_irr_rows_for(
+        kmap, sig_star[0], what="sigma_mnk.h5 (sanity gate)")
+    with h5py.File(smp, "r") as s:
         om = np.asarray(s["omega_ev"], dtype=np.float64)
-        sx = np.asarray(s["sigma_sx_kij_ev"])[kmap][:, b0:b1, b0:b1]
-        vh = np.asarray(s["hartree_kij_ev"])[kmap][:, b0:b1, b0:b1]
-        sc = np.asarray(s["sigma_c_kij_ev"])[:, kmap][:, :, b0:b1, b0:b1]
+        sx = np.asarray(s["sigma_sx_kij_ev"])[krows][:, b0:b1, b0:b1]
+        vh = np.asarray(s["hartree_kij_ev"])[krows][:, b0:b1, b0:b1]
+        sc = np.asarray(s["sigma_c_kij_ev"])[:, krows][:, :, b0:b1, b0:b1]
     src = kin_ion_hartree_source(kip)
     vh_exact = None
     if src == "stored":

@@ -819,15 +819,42 @@ def make_eqp_bgw(
 	kin_ion_diag_ev = np.real(np.diagonal(kin_irr, axis1=1, axis2=2)) * RYD_TO_EV
 
 	# sigma_mnk.h5: σ_x, σ_c(ω), V_H, ω axis (all already in eV, ω relative to E_F)
+	#
+	# THE k AXIS OF THIS FILE MAY BE THE WEDGE, AND THE ROWS ARE READ
+	# VERBATIM EITHER WAY.  Since the k_irr extraction the writer keeps one
+	# row per star and stamps ``k_storage``; a file without that stamp is
+	# full-BZ, which is every file written before it.  What changes here is
+	# only WHICH INDEX names the row this function already wanted:
+	#
+	#   full-BZ file — ``kirr_to_kfull`` names it directly, as before.
+	#   wedge file   — the same k is at row ``irr_idx_k[kirr_to_kfull]``,
+	#                  a pure index remap through the table filed with the
+	#                  arrays.  ``k_irr_rows_for`` does that remap and
+	#                  REFUSES if the requested k is not itself a stored
+	#                  row, because substituting another member of its star
+	#                  is the operation ``file_io.sigma_output`` refuses.
+	#
+	# Nothing is unfolded on either branch — the values this function gets
+	# are bit-identical to the ones the full-BZ file gave it, because the
+	# rows kept ARE the rows it was selecting.
+	from file_io.kin_ion import read_star_map
+	from file_io.sigma_output import k_irr_rows_for
+	star = read_star_map(sigma_mnk_path, "sigma_c_kij_ev", k_axis=1)
+	if star is None:
+		k_rows = kirr_to_kfull
+	else:
+		k_rows = k_irr_rows_for(
+			kirr_to_kfull, star[0],
+			what=f"{os.path.basename(sigma_mnk_path)} (eqp_bgw)")
 	with h5py.File(sigma_mnk_path, "r") as sf:
 		omega_rel_ev = np.asarray(sf["omega_ev"], dtype=np.float64)
 		sigma_x_full = np.asarray(sf["sigma_sx_kij_ev"])
 		hartree_full = np.asarray(sf["hartree_kij_ev"])
 		sigma_c_full = np.asarray(sf["sigma_c_kij_ev"])
 	# Subset to IBZ wedge × sigma-window bands
-	sigma_x_irr = sigma_x_full[kirr_to_kfull][:, band_start:band_stop, band_start:band_stop]
-	hartree_irr = hartree_full[kirr_to_kfull][:, band_start:band_stop, band_start:band_stop]
-	sigma_c_irr = sigma_c_full[:, kirr_to_kfull][:, :, band_start:band_stop, band_start:band_stop]
+	sigma_x_irr = sigma_x_full[k_rows][:, band_start:band_stop, band_start:band_stop]
+	hartree_irr = hartree_full[k_rows][:, band_start:band_stop, band_start:band_stop]
+	sigma_c_irr = sigma_c_full[:, k_rows][:, :, band_start:band_stop, band_start:band_stop]
 
 	sigma_x_diag = np.diagonal(sigma_x_irr, axis1=1, axis2=2)
 	hartree_diag = np.diagonal(hartree_irr, axis1=1, axis2=2)

@@ -254,14 +254,33 @@ def _write_sigma_omega_h5(
     input_dir: str,
     meta,
     mesh_xy,
+    sym=None,
+    print_fn=None,
 ) -> str:
-    """Write the canonical sigma_mnk.h5 file (one writer, two backends)."""
+    """Write the canonical sigma_mnk.h5 file (one writer, two backends).
+
+    ``sym`` THREADS THE STAR TABLES IN, and with them the k_irr
+    extraction: given it, the writer measures the star spread on the
+    complete full-BZ cube and then keeps one row per star.  Passing it is
+    the ONLY thing that turns the extraction on, so a caller that has no
+    symmetry object still writes the full BZ and still writes a file with
+    no ``k_storage`` attr, which every existing reader treats as full.
+    """
     import os
     from file_io import write_sigma_omega_h5
 
     out_path = config.paths.sigma_omega_h5_file
     if not os.path.isabs(out_path):
         out_path = os.path.join(input_dir, out_path)
+
+    # ``gw.kin_ion_io.star_tables`` is the ONE derivation of this triple
+    # in the tree (it takes n_sym_spatial from ``sym.sym_mats_k`` rather
+    # than the WFN header, so producer and consumer of the conjugation
+    # convention cannot drift); reuse it rather than re-deriving here.
+    star = None
+    if sym is not None:
+        from .kin_ion_io import star_tables
+        star = star_tables(sym)
 
     from .qsgw_utils import is_band_sharded_sigma_omega
     if is_band_sharded_sigma_omega(sigma_c_omega):
@@ -279,9 +298,15 @@ def _write_sigma_omega_h5(
         shd = sigma_c_omega.sharding
 
         def _ev_tensors(c_ry, x_ry, h_ry):
+            # THE ASSOCIATION COMES FROM ``file_io.sigma_output``, not from
+            # a second copy of the expression here.  The two write paths
+            # must produce bit-identical bytes and a float64
+            # reassociation moves them at 1e-16, which no physics gate
+            # would catch -- so there is one function and one gate on it.
+            from file_io.sigma_output import derive_sigma_total
             c_ev = RYD_TO_EV * c_ry
-            total = (c_ev + (RYD_TO_EV * x_ry)[None, ...]) \
-                + (RYD_TO_EV * h_ry)[None, ...]
+            total = derive_sigma_total(
+                c_ev, RYD_TO_EV * x_ry, RYD_TO_EV * h_ry)
             return total, c_ev
 
         total_ev, sigma_c_ev = jax.jit(
@@ -292,7 +317,7 @@ def _write_sigma_omega_h5(
             sigma_c_kij_ev=sigma_c_ev,
             sigma_sx_kij_ev=RYD_TO_EV * sig_x,
             hartree_kij_ev=RYD_TO_EV * sig_h,
-            mesh=mesh_xy,
+            mesh=mesh_xy, star=star, print_fn=print_fn,
         )
         return out_path
     # SlabIO handles rank-0 dispatch internally; both backends need
@@ -302,7 +327,7 @@ def _write_sigma_omega_h5(
         sigma_c_kij_ev=RYD_TO_EV * sigma_c_omega,
         sigma_sx_kij_ev=RYD_TO_EV * sig_x,
         hartree_kij_ev=RYD_TO_EV * sig_h,
-        mesh=mesh_xy,
+        mesh=mesh_xy, star=star, print_fn=print_fn,
     )
     return out_path
 
@@ -421,6 +446,7 @@ def compute_ppm_sigma_pipeline(
                 sig_x=sig_x, sig_h=sig_h,
                 config=config, input_dir=input_dir,
                 meta=meta, mesh_xy=mesh_xy,
+                sym=sym, print_fn=print_fn,
             )
         else:
             import os
