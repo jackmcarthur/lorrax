@@ -390,50 +390,45 @@ def test_every_allowed_row_names_a_covering_leg():
 # ---------------------------------------------------------------------------
 
 def test_arming_this_gate_did_not_disarm_another_services():
-    """``lxkit.testing._ARMED`` is ONE dict, and both suites want it.
+    """Arming is per SCOPE, so two services can both hold a live gate.
 
-    ``services/distrib_la/tests/conftest.py`` calls ``arm_skip_honesty``
-    unconditionally.  In a full-suite run both conftests load, so a second
-    unconditional call here would OVERWRITE distrib_la's scope and allowlist
-    and silently disarm a gate that is currently doing its job — which is
-    precisely what the C1 stub of this file's conftest predicted, in
-    writing, as its reason for leaving the gate unarmed.
+    ``lxkit.testing._ARMED`` used to be ONE dict that ``arm_skip_honesty``
+    overwrote, so this conftest could not simply call it: whoever loaded last
+    replaced the earlier service's scope and allowlist, and the loser's gate
+    went silently inert.  This file's conftest carried a whole conditional
+    branch and a forked ``pytest_sessionfinish`` because of it, and both said
+    in writing that the fix was to make ``_ARMED`` a list of scopes.
 
-    This suite therefore arms lxkit's slot only when it is FREE and runs the
-    same assertion from its own ``pytest_sessionfinish`` otherwise.  The
-    invariant either way: the armed scope is a real directory, and if it is
-    not ours then we brought our own hook.  REGISTERED as a consolidation
-    wish — ``_ARMED`` should be a LIST of armed scopes, which is a change to
-    lxkit and lxkit is READ-ONLY on this branch.
+    That landed.  So the assertion is now the direct one: THIS suite's
+    directory is armed, and arming it took nothing else down.
     """
     import lxkit.testing as lxt
-    cf = _conftest_module()
-    armed_scope = str(lxt._ARMED.get("scope") or "")
-    assert lxt._ARMED.get("profile") is not None, (
-        "nobody armed the skip-honesty gate at all")
-    assert os.path.isdir(armed_scope), (
-        f"the armed scope {armed_scope!r} is not a directory; a scope that "
-        f"matches no path makes the gate report 'not selected, inert' and "
-        f"assert zero")
-    if os.path.realpath(armed_scope) != os.path.realpath(_TESTS):
-        # Another suite holds the slot: ours must have brought its own hook,
-        # or this service has no gate at all in the full-suite run.
-        assert hasattr(cf, "pytest_sessionfinish"), (
-            f"lxkit's slot is held by {armed_scope!r} and this suite's "
-            f"conftest defines no pytest_sessionfinish, so zeta_loader's "
-            f"skip-honesty gate is INERT in this session")
-        assert cf._WE_ARMED_IT is False, (
-            f"THIS suite armed lxkit's slot and then something else took it "
-            f"({armed_scope!r}).  That happens when the conftests load in "
-            f"the order `pytest services/zeta_loader/tests "
-            f"services/distrib_la/tests` — distrib_la arms UNCONDITIONALLY, "
-            f"so it clobbers whoever went first, and the loser's gate is "
-            f"silently inert (its own sessionfinish was never installed, "
-            f"because at import time the slot was free).  Run the two "
-            f"suites in separate processes, or land the lxkit change that "
-            f"makes _ARMED a list of scopes.")
-    else:
-        assert cf._WE_ARMED_IT is True
+
+    rows = {r.scope: r for r in lxt.armed_scopes()}
+    ours = os.path.realpath(_TESTS)
+    assert ours in rows, (
+        f"zeta_loader's skip-honesty gate is NOT armed ({sorted(rows)!r}); "
+        f"in a full-suite run that means this service's skips are ruled on "
+        f"by nobody")
+    assert os.path.isdir(rows[ours].scope), (
+        f"the armed scope {rows[ours].scope!r} is not a directory; a scope "
+        f"that matches no path makes the gate report 'not selected, inert' "
+        f"and assert zero")
+
+    # RED TWIN, constructed: arming a SECOND scope must leave ours untouched.
+    # Under the old single-slot dict this is exactly what failed.
+    mine = rows[ours]
+    other = os.path.join(_TESTS, "_arming_probe_dir")
+    key = os.path.realpath(other)
+    lxt.arm_skip_honesty(lxt.machine_profile("a-laptop"), scope=other)
+    try:
+        again = {r.scope: r for r in lxt.armed_scopes()}
+        assert again.get(ours) == mine, (
+            f"arming {other!r} changed zeta_loader's row "
+            f"({mine} -> {again.get(ours)}) — services are disarming each "
+            f"other again")
+    finally:
+        lxt._ARMED.pop(key, None)
 
 
 def test_the_marker_hook_actually_applied(request):

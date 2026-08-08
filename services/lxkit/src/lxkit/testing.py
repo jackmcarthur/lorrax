@@ -36,6 +36,7 @@ __all__ = [
     "detect_machine", "machine_profile", "must_rows_for",
     "assert_must_probe", "assert_skips_match_profile",
     "arm_skip_honesty", "observed_skips",
+    "ArmedScope", "armed_scopes", "check_armed_scope",
 ]
 
 
@@ -798,18 +799,73 @@ def assert_skips_match_profile(skips: Sequence[ObservedSkip],
 # people's suites, which is how a good gate gets deleted.
 
 _OBSERVED: list = []
-_ARMED: dict = {}
 _ROOTDIR: dict = {}
-#: nodeids seen in ANY phase whose file is under the armed scope.  Needed
+
+
+class ArmedScope(NamedTuple):
+    """One service's armed gate.  See :data:`_ARMED`."""
+
+    scope: str                      #: realpath of the directory, "" = unscoped
+    profile: MachineProfile
+    extra_allowed: tuple
+    min_collected: int | None
+
+
+# ---------------------------------------------------------------------------
+# ONE ROW PER SCOPE, NOT ONE SLOT.  This is the cross-service process-state
+# discipline (POST_WAVE_CLEANUP item 2).
+# ---------------------------------------------------------------------------
+# ``_ARMED`` used to be a single dict that ``arm_skip_honesty`` overwrote, so
+# a second calling service did not add a second gate — it REPLACED the first
+# one's scope and allowlist.  MEASURED at the merged head, full ``services/``
+# run on WSL: distrib_la, symmetry_maps and vcoul all arm unconditionally and
+# conftests load in directory order, so the surviving scope was VCOUL's and
+# BOTH of the other two gates were silently inert.  wfn_loader's
+# ``test_this_gate_did_not_disarm_distrib_las`` is the cell that says so out
+# loud, and it was RED.
+#
+# Two services then paid for the single slot in their own source: zeta_loader
+# arms only when the slot is free and otherwise re-implements lxkit's
+# ``pytest_sessionfinish`` locally, and wfn_loader gave up on lxkit's gate
+# entirely and hand-rolled a service-local collector.  Both wrote down that
+# the real fix is a LIST of scopes and that lxkit was frozen that wave.  This
+# is that fix: services register under their OWN directory and can no more
+# see each other's rows than they can see each other's fixtures.
+#
+# Keyed by realpath, so re-arming the SAME scope (symmetry_maps does this from
+# ``pytest_collection_modifyitems`` once the invocation is known) updates one
+# row instead of appending a stale duplicate.
+_ARMED: dict = {}
+
+#: Per scope: nodeids seen in ANY phase whose file is under it.  Needed
 #: because the pytest-xdist CONTROLLER has an empty ``session.items`` (the
 #: workers did the collecting) while every report still passes through its
 #: ``pytest_runtest_logreport`` — see :func:`pytest_sessionfinish`.
-_SEEN_IN_SCOPE: set = set()
+_SEEN_IN_SCOPE: dict = {}
+
+#: ``(nodeid, when)`` pairs already recorded.  THE HOOKS ARE REGISTERED ONCE
+#: PER CONFTEST THAT IMPORTS THEM, and several do; pytest registers hook
+#: implementations per plugin MODULE, so the same function object arriving
+#: through three conftests is called three times for every report.  That used
+#: to double- and triple-count every skip, which is why the old docstrings
+#: told services NOT to import the hooks — a rule that cannot be enforced and
+#: was the reason two suites forked the sessionfinish body.  Deduping here
+#: makes N registrations exactly equivalent to one, so importing the hooks is
+#: safe and the rule can go.
+_RECORDED: set = set()
+
+#: Sessions whose sessionfinish has already run, same reason.
+_FINISHED: set = set()
 
 
 def observed_skips() -> tuple:
     """Every skip this pytest session has emitted so far."""
     return tuple(_OBSERVED)
+
+
+def armed_scopes() -> tuple:
+    """Every :class:`ArmedScope` armed in this session, in arming order."""
+    return tuple(_ARMED.values())
 
 
 def arm_skip_honesty(profile: MachineProfile | None = None, *,
@@ -818,7 +874,11 @@ def arm_skip_honesty(profile: MachineProfile | None = None, *,
                      min_collected: int | None = None) -> MachineProfile:
     """Turn the negative half on for THIS session.  Call from a conftest.
 
-    One call per service suite — the charter's "one gate per service".
+    One call per service suite — the charter's "one gate per service" — and
+    services do NOT disarm each other: each registers a row under its own
+    ``scope`` (see :data:`_ARMED`), and :func:`pytest_sessionfinish` runs
+    every row.  Calling it twice for the same scope re-arms that row only.
+
     Returns the profile in force so the caller can report it.
 
     ``scope`` is a DIRECTORY, and passing it is close to mandatory in a
@@ -843,8 +903,8 @@ def arm_skip_honesty(profile: MachineProfile | None = None, *,
     paths are absolute.
     """
     prof = profile or machine_profile()
-    _ARMED.update(profile=prof, scope=scope, extra_allowed=tuple(extra_allowed),
-                  min_collected=min_collected)
+    key = os.path.realpath(scope) if scope else ""
+    _ARMED[key] = ArmedScope(key, prof, tuple(extra_allowed), min_collected)
     return prof
 
 
@@ -877,6 +937,11 @@ def pytest_runtest_logreport(report):
     ``item.own_markers`` instead would miss every in-body ``pytest.skip``,
     and in-body is where this tree's device-count and library skips live.
     """
+    # IDEMPOTENT across registrations — see :data:`_RECORDED`.
+    stamp = (report.nodeid, getattr(report, "when", ""))
+    if stamp in _RECORDED:
+        return
+    _RECORDED.add(stamp)
     if report.skipped:
         longrepr = getattr(report, "longrepr", None)
         reason = ""
@@ -888,27 +953,24 @@ def pytest_runtest_logreport(report):
             reason = reason[len("Skipped: "):]
         _OBSERVED.append(ObservedSkip(report.nodeid, reason,
                                       _report_path(report)))
-    scope = _ARMED.get("scope")
-    if scope:
-        path = _report_path(report)
-        if path and path.startswith(os.path.realpath(scope) + os.sep):
-            _SEEN_IN_SCOPE.add(report.nodeid)
-
-
-def pytest_sessionfinish(session, exitstatus):
-    """Run the negative half, if this session armed it.
-
-    A violation is reported to the terminal AND turns the session red.
-    Both: the exit status is what CI reads, the text is what a human acts
-    on, and this tree's standing rule is to judge by the artifact.
-    """
-    armed = _ARMED.get("profile")
-    if armed is None:
+    path = _report_path(report)
+    if not path:
         return
-    scope = _ARMED.get("scope") or ""
+    for key in _ARMED:
+        if key and path.startswith(key + os.sep):
+            _SEEN_IN_SCOPE.setdefault(key, set()).add(report.nodeid)
+
+
+def check_armed_scope(row: "ArmedScope", session) -> str:
+    """Run ONE armed row against this session.  ``""`` when it is satisfied.
+
+    Split out of :func:`pytest_sessionfinish` so the per-row decision is a
+    plain function: it is what makes "several services armed at once" a loop
+    instead of a second policy, and it is directly callable from a test.
+    """
     total = int(getattr(session, "testscollected", 0) or 0)
-    if scope:
-        root = os.path.realpath(scope) + os.sep
+    if row.scope:
+        root = row.scope + os.sep
         items = getattr(session, "items", None) or []
         if items:
             mine = {str(getattr(it, "nodeid", "")) for it in items
@@ -928,7 +990,7 @@ def pytest_sessionfinish(session, exitstatus):
             # allowlist that did not contain it.  Every report still
             # reaches this process, so scope by the report's own path.
             skips = [s for s in observed_skips() if s.path.startswith(root)]
-            in_scope = len(_SEEN_IN_SCOPE)
+            in_scope = len(_SEEN_IN_SCOPE.get(row.scope, ()))
     else:
         skips, in_scope = list(observed_skips()), total
 
@@ -940,19 +1002,49 @@ def pytest_sessionfinish(session, exitstatus):
     # collected NOTHING AT ALL still trips the floor, which is the case
     # the floor is actually about.
     if in_scope == 0 and total > 0:
-        return
+        return ""
     try:
         assert_skips_match_profile(
-            skips, armed, collected=in_scope,
-            extra_allowed=_ARMED.get("extra_allowed", ()),
-            min_collected=_ARMED.get("min_collected"))
+            skips, row.profile, collected=in_scope,
+            extra_allowed=row.extra_allowed,
+            min_collected=row.min_collected)
     except AssertionError as exc:                              # noqa: BLE001
+        return str(exc)
+    return ""
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Run the negative half for EVERY armed scope.
+
+    A violation is reported to the terminal AND turns the session red.
+    Both: the exit status is what CI reads, the text is what a human acts
+    on, and this tree's standing rule is to judge by the artifact.
+
+    Every row runs even when an earlier one failed: the rows belong to
+    different services, and reporting only the first would make the second
+    service's defect invisible until the first was fixed.
+
+    Idempotent across registrations (:data:`_RECORDED`): several conftests
+    import this function, pytest registers each conftest as its own plugin,
+    and without the guard the gate would run once per importer and print
+    every violation that many times.
+    """
+    stamp = id(session)
+    if stamp in _FINISHED:
+        return
+    _FINISHED.add(stamp)
+    failures = [(row, msg) for row in _ARMED.values()
+                if (msg := check_armed_scope(row, session))]
+    if not failures:
+        return
+    for row, msg in failures:
+        title = f"SKIP-HONESTY GATE FAILED ({row.scope or 'unscoped'})"
         try:
             tw = session.config.get_terminal_writer()
             tw.line("")
-            tw.line("SKIP-HONESTY GATE FAILED", red=True, bold=True)
-            for line in str(exc).splitlines():
+            tw.line(title, red=True, bold=True)
+            for line in msg.splitlines():
                 tw.line(line, red=True)
         except Exception:                                      # noqa: BLE001
-            print(f"SKIP-HONESTY GATE FAILED\n{exc}")
-        session.exitstatus = 1
+            print(f"{title}\n{msg}")
+    session.exitstatus = 1

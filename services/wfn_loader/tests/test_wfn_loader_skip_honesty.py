@@ -488,28 +488,62 @@ def test_the_negative_half_can_fail(no_deck_reason):
             perl, collected=50, extra_allowed=_allowed_for(perl))
 
 
-def test_this_gate_did_not_disarm_distrib_las():
-    """STRUCTURAL, for adjudication (ii): lxkit's ``_ARMED`` is not ours.
+def test_arming_is_per_scope_and_cannot_disarm_another_service():
+    """STRUCTURAL, for adjudication (ii): arming is per SCOPE, not one slot.
 
-    The whole reason this file exists instead of an ``arm_skip_honesty``
-    call is that ``_ARMED`` is a process-global a second caller would
-    clobber.  A future edit that "simplified" this file by calling it
-    anyway would pass every cell above and silently retarget distrib_la's
-    gate at this directory — so the claim is asserted rather than
-    documented: whatever scope is armed, it is not this one.
+    ``lxkit.testing._ARMED`` used to be a single dict that
+    ``arm_skip_honesty`` overwrote, so a second calling service did not add a
+    second gate — it replaced the first one's scope and allowlist.  MEASURED
+    at the merged head on a full ``services/`` run: three services arm
+    unconditionally, conftests load in directory order, and the surviving
+    scope was VCOUL's, with distrib_la's and symmetry_maps' gates silently
+    inert.  That is why this file has a service-local collector at all.
+
+    The registry is now keyed by directory, so this cell asserts the property
+    CONSTRUCTIVELY rather than observing whoever happens to hold a slot: arm
+    a scope of our own and require that every row already present survives.
+    The red twin is the single-slot behaviour itself — under it ``before`` is
+    not a subset of ``after``, because arming replaced the dict.
     """
     from lxkit import testing as lxt
-    scope = str(lxt._ARMED.get("scope") or "")
-    assert os.path.realpath(_TESTS) != os.path.realpath(scope or os.sep), (
-        f"lxkit's process-global skip-honesty gate is armed on THIS "
-        f"service's directory ({scope!r}).  Something in this suite called "
-        f"arm_skip_honesty; in a full-suite run that REPLACES distrib_la's "
-        f"scope and takes its gate down.  Use this file's local collector.")
-    if scope:
-        # If anything armed it, it is the service that owns it.
-        assert "distrib_la" in scope, (
-            f"lxkit's gate is armed on {scope!r}, which is neither "
-            f"distrib_la's directory nor unset — a third caller appeared")
+
+    before = {r.scope: r for r in lxt.armed_scopes()}
+    probe = os.path.join(_TESTS, "_arming_probe_dir")
+    key = os.path.realpath(probe)
+    assert key not in before, "the probe scope must start unarmed"
+    lxt.arm_skip_honesty(machine_profile("a-laptop"), scope=probe)
+    try:
+        after = {r.scope: r for r in lxt.armed_scopes()}
+        assert key in after, (
+            "arm_skip_honesty did not register the scope it was given")
+        missing = set(before) - set(after)
+        assert not missing, (
+            f"arming {probe!r} REMOVED {sorted(missing)} from the registry. "
+            f"That is the single-slot defect: a second service's arm call "
+            f"takes the first service's gate down, and nothing turns red.")
+        for scope, row in before.items():
+            assert after[scope] == row, (
+                f"arming {probe!r} MUTATED the row for {scope!r} "
+                f"({before[scope]} -> {after[scope]})")
+    finally:
+        lxt._ARMED.pop(key, None)
+
+
+def test_this_suites_local_collector_is_still_the_one_ruling_on_it():
+    """This file's gate is service-local (DESIGN.md DECISION 4) and stays so.
+
+    Per-scope arming makes lxkit's gate safe to use, but this suite's gate
+    rules on OUTCOMES (what every cell in this directory actually did), not
+    only on skips, so it keeps its own collector.  What must remain true is
+    that this suite did not quietly arm lxkit's registry under its own
+    directory as well, which would judge the same skips twice.
+    """
+    from lxkit import testing as lxt
+    ours = os.path.realpath(_TESTS)
+    assert ours not in {r.scope for r in lxt.armed_scopes()}, (
+        f"something in this suite armed lxkit's skip-honesty gate on "
+        f"{_TESTS!r}; this service is ruled on by its own outcome collector "
+        f"and a second gate over the same directory double-judges it")
 
 
 def test_the_profile_names_the_machine_it_is_talking_about():
