@@ -522,7 +522,104 @@ def test_the_shipped_entry_beats_the_runtime_solve_on_amplification():
 
 
 # ---------------------------------------------------------------------------
-# 6. The generator is deterministic
+# 6. The fit stage's accuracy floor, with a table in the imaginary cell
+# ---------------------------------------------------------------------------
+
+def test_the_fit_stage_floor_is_no_longer_a_quadrature():
+    """R1's hole was the MPA fit stage's accuracy floor.  It is not now.
+
+    Build note V measured evaluate->fit recovery at 5.3e-08 against a
+    synthesis baseline of 3.8e-09 and named
+    ``exponential_sum_imag``'s runtime solve as the cause.  Separating
+    the cells sharpens that: the worst SAMPLE error at build note V's
+    setting belongs to the static ``z = 0`` cell (1.46e-10, against the
+    imaginary cell's 5.34e-11), but the RECOVERY is imag-limited
+    anyway, because the Pade fit weights its sample points very
+    unevenly.  Holding every other cell at 1e-12 and moving only the
+    imaginary cell:
+
+        runtime  @1e-10 -> recovery 4.71e-08
+        runtime  @1e-12 -> recovery 4.85e-09
+        table    @1e-12 -> recovery 2.22e-09   <- below the baseline
+        table    @1e-14 -> recovery 4.82e-09   <- bouncing on the floor
+
+    This cell asserts the third row.  What it is really asserting is
+    that the recovery has reached the fit's own conditioning (~6.6e8
+    here) and stopped being a statement about quadrature at all --
+    which is why the assertion is against ``worst_synth`` and not
+    against an absolute number that would drift with the fixture.
+    """
+
+    from gw.mpa import evaluator, pade_fit, sample_plan   # noqa: PLC0415
+
+    n_p, tol = 8, 1.0e-12
+    rng = np.random.default_rng(3)
+    delta = np.linspace(0.6, 7.0, n_p)
+    weight = 0.2 + 0.6 * rng.random((n_p, 3))
+    plan = sample_plan.mpa_plan(n_p, float(delta.max()), energy_unit="Ry")
+    z = sample_plan.plan_z(plan)
+    original = evaluator.existing_kernel_rule
+    built = {}
+
+    def from_table(point, *, delta_min, delta_max, target_error,
+                   max_nodes=64, use_shipped_tables=True):
+        if point["family"] != "exponential_sum_imag":
+            return original(point, delta_min=delta_min,
+                            delta_max=delta_max,
+                            target_error=target_error,
+                            max_nodes=max_nodes,
+                            use_shipped_tables=use_shipped_tables)
+        R = float(delta_max) / float(delta_min)
+        beta = float(point["varpi"]) / float(delta_min)
+        t, w, _info = gen.composite_rule(R, beta, tol)
+        cert = gen.certify(t, w, R, beta, tol)
+        assert cert["passes"], cert["failures"]
+        built.update(R=R, beta=beta, n=len(t), kappa0=cert["kappa0"])
+        return {"t": t / delta_min, "h": np.real(w) / delta_min,
+                "n_nodes": len(t), "family": point["family"],
+                "max_error": cert["real_part_max_error"] / delta_min,
+                "delta_min": float(delta_min),
+                "delta_max": float(delta_max), "target_error": tol}
+
+    evaluator.existing_kernel_rule = from_table
+    try:
+        values, cost = evaluator.evaluate_samples(
+            plan, delta, weight, rel_tol=tol, kernel_target_error=tol)
+    finally:
+        evaluator.existing_kernel_rule = original
+
+    values = np.asarray(values)
+    k = evaluator.damped_kernel(np.asarray(z)[:, None], delta)
+    exact = np.tensordot(k, weight, axes=(1, 0))
+    sample_error = float(np.max(np.abs(values - exact)))
+
+    worst_eval = worst_synth = cond = 0.0
+    for ch in range(weight.shape[1]):
+        om_e, b_e, diag = pade_fit.fit_mpa_poles(values[:, ch], z, n_p)
+        om_s, b_s, _ = pade_fit.fit_mpa_poles(exact[:, ch], z, n_p)
+        worst_eval = max(worst_eval,
+                         float(np.max(np.abs(np.asarray(om_e) - delta))),
+                         float(np.max(np.abs(np.asarray(b_e)
+                                             - weight[:, ch]))))
+        worst_synth = max(worst_synth,
+                          float(np.max(np.abs(np.asarray(om_s) - delta))),
+                          float(np.max(np.abs(np.asarray(b_s)
+                                              - weight[:, ch]))))
+        cond = max(cond, float(diag["cond_pade"]))
+
+    print(f"[imag tables] fit floor: imag cell served by a composite "
+          f"table (R={built['R']:.3f}, beta={built['beta']:.3f}, "
+          f"N={built['n']}, kappa0={built['kappa0']:.4f}); sample error "
+          f"{sample_error:.3e}, recovery {worst_eval:.3e} against a "
+          f"synthesis baseline of {worst_synth:.3e} at Pade condition "
+          f"{cond:.2e}; {cost['kernel_nodes']} kernel nodes")
+    assert sample_error < 1.0e-11
+    assert worst_eval < 1.0e-8
+    assert worst_eval < 2.0 * worst_synth
+
+
+# ---------------------------------------------------------------------------
+# 7. The generator is deterministic
 # ---------------------------------------------------------------------------
 
 def test_the_composite_route_regenerates_byte_identically():
