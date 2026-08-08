@@ -528,7 +528,7 @@ from symmetry_maps import unfold_psi                            # noqa: E402
 # ``symmetry_maps.maps``.  The phase-wide shim-deletion commit (WAVE1_BRIEF
 # ruling 2) decides this cell's home — likely into the service's own suite,
 # which may import the private directly.
-from common.symmetry_maps import _I_SIGMA_Y                     # noqa: E402
+from symmetry_maps.maps import _I_SIGMA_Y                       # noqa: E402
 
 
 # ---------------------------------------------------------------------------

@@ -43,7 +43,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
-from common.symmetry_maps import SymMaps
+from symmetry_maps import SymMaps
 
 
 def get_psi_and_grad_psi_realspace(wfn, sym, ib, ik_full, fft_grid):

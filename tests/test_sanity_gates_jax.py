@@ -269,7 +269,7 @@ def test_zeta_basis_guard_warns_on_incomplete():
 
 def test_zeta_loader_refuses_incomplete_file():
     """A ζ from a crashed fit must not open for reading."""
-    from file_io.zeta_loader import ZetaLoader
+    from zeta_loader import ZetaLoader
     with tempfile.TemporaryDirectory() as d:
         p = _make_zeta_h5(os.path.join(d, "zeta_q.h5"), n_rmu=16, done=False)
         try:
@@ -282,7 +282,7 @@ def test_zeta_loader_refuses_incomplete_file():
 
 
 def test_zeta_loader_override_env():
-    from file_io.zeta_loader import ZetaLoader
+    from zeta_loader import ZetaLoader
     prev = os.environ.get("LORRAX_ALLOW_PARTIAL_ZETA")
     os.environ["LORRAX_ALLOW_PARTIAL_ZETA"] = "1"
     try:
@@ -298,7 +298,7 @@ def test_zeta_loader_override_env():
 
 
 def test_zeta_loader_accepts_complete_file():
-    from file_io.zeta_loader import ZetaLoader
+    from zeta_loader import ZetaLoader
     with tempfile.TemporaryDirectory() as d:
         p = _make_zeta_h5(os.path.join(d, "zeta_q.h5"), n_rmu=16, done=True)
         with ZetaLoader(p, mesh=_mesh()) as z:

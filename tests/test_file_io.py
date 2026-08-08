@@ -291,7 +291,12 @@ from jax.sharding import Mesh
 
 from file_io.mf_header import copy_mf_header
 from file_io.isdf_header import IsdfHeader, write_isdf_header
-from file_io.zeta_loader import ZetaLoader as ZetaReader
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from zeta_loader import ZetaLoader as ZetaReader  # noqa: E402
 
 # Reuse the synthetic-WFN helper from the header tests.
 
@@ -525,7 +530,7 @@ from jax.sharding import PartitionSpec as P  # noqa: F401
 from file_io.isdf_header import (
     mark_zeta_done, read_isdf_header,
 )
-from file_io.zeta_loader import ZetaLoader
+from zeta_loader import ZetaLoader
 
 
 def _build_zeta_h5_rspace(tmp_path, n_q_disk: int, *, n_rtot: int = 8,

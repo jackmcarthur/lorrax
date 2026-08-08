@@ -11,13 +11,30 @@ This module contains:
 - kin_ion: Kinetic + ionic Hamiltonian I/O
 """
 
-from .wfn_loader import WfnLoader
-from .zeta_loader import ZetaLoader
+# THE TWO LOADERS ARE SERVICES NOW, and this package reaches their doors
+# like any other consumer.  ``file_io/wfn_loader.py`` and
+# ``file_io/zeta_loader.py`` were transitional re-export shims and were
+# deleted by the phase-wide cleanup commit (wave-1 ruling 2); these two
+# lines used to be relative imports of them.
+#
+# THE RE-EXPORTS STAY, and they are not a new shim.  ``from file_io import
+# EPSReader, resolve_input_paths`` is how this package has always been
+# spelled, and a caller wanting a loader alongside those is asking
+# ``file_io`` for a name it can legitimately provide.  What changed is
+# where the object comes from: the door, once, with no second module
+# object in between.
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                               # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                            # noqa: E402
+from zeta_loader import ZetaLoader                          # noqa: E402
+
 # Back-compat alias: every active caller uses ``WFNReader(path)`` as a
 # pure-metadata accessor today.  ``WfnLoader`` covers that surface 1:1
 # (mf_header attributes mirrored verbatim; ``_filename`` exposed for
-# callers that thread it).  This shim lets the existing import sites
-# stay; a follow-up commit will sweep them to ``WfnLoader`` directly.
+# callers that thread it).
 WFNReader = WfnLoader
 from .qe_save_reader import CrystalData
 from .wfn_writer import WFNWriter

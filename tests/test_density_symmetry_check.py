@@ -22,7 +22,7 @@ import h5py
 import numpy as np
 import pytest
 
-from file_io.wfn_loader import WfnLoader
+from wfn_loader import WfnLoader
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
@@ -197,7 +197,7 @@ def test_T1_isigma_y_matches_symmetry_maps_and_is_kramers():
     # module-private in ``symmetry_maps.maps``.  The phase-wide shim-deletion
     # commit (WAVE1_BRIEF ruling 2) decides this cell's home — likely into
     # the service's own suite, which may import the private directly.
-    from common.symmetry_maps import _I_SIGMA_Y
+    from symmetry_maps.maps import _I_SIGMA_Y
 
     assert np.allclose(_ISY, 1j * _SY)
     assert np.allclose(np.asarray(_I_SIGMA_Y, dtype=complex), _ISY)
@@ -340,7 +340,7 @@ def test_raw_read_matches_the_loader_ibz_path():
     # ``_raw_ibz_psi_k`` is module-private.  The phase-wide shim-deletion
     # commit (WAVE1_BRIEF ruling 2) decides this cell's home — likely into
     # the service's own suite, which may import the private directly.
-    from common.density_symmetry_check import _raw_ibz_psi_k
+    from symmetry_maps.density_symmetry_check import _raw_ibz_psi_k
 
     loader = WfnLoader(_FIXTURE)
     nb = 6

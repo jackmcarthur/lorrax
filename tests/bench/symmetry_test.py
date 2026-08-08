@@ -10,7 +10,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
-from common.symmetry_maps import SymMaps
+from symmetry_maps import SymMaps
 
 
 def _status_line(label: str, passed: bool, detail: str) -> str:

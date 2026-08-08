@@ -284,7 +284,7 @@ class WfnLoader:
 
     def _run_density_symmetry_check(self) -> None:
         """Measure TRS + the spatial symmetry table from ψ (see above)."""
-        from common.density_symmetry_check import cached_density_symmetry_check
+        from symmetry_maps import cached_density_symmetry_check
         report = cached_density_symmetry_check(self)
         if report is None:
             return
@@ -488,7 +488,7 @@ class WfnLoader:
         consumers (``common/wfn_transforms.py``, ``common/psi_G_store.py``)
         rely on — they hand it straight to kernels keyed on its identity.
         """
-        from common.symmetry_maps import SymMaps
+        from symmetry_maps import SymMaps
         if self._sym is None:
             self._sym = SymMaps(self._sym_wfn_stub())
         return self._sym
@@ -890,7 +890,7 @@ class WfnLoader:
         # See ``common.symmetry_maps.{unfold_psi,trs_augment_U}`` and
         # ``reports/trs_sym_audit_2026-05-14`` Sites #5–#7.  ``sym.U_spinor``
         # is length ``ntran`` (PR3); the TRS half is built inside the helper.
-        from common.symmetry_maps import trs_augment_U
+        from symmetry_maps import trs_augment_U
         U_per = trs_augment_U(
             sym.U_spinor, sym_idx_per_full, n_tran)                      # (nk_full, 2, 2)
 
@@ -905,7 +905,7 @@ class WfnLoader:
         # is reproduced. Pre-PR3 the TRS rows were set to 1 (skipped the
         # phase entirely) — that bug fired on non-symmorphic non-inversion
         # bispinor systems.
-        from common.symmetry_maps import tau_phase_row
+        from symmetry_maps import tau_phase_row
         phase = np.ones((nk_full, ngkmax), dtype=np.complex128)
         for nk in range(nk_full):
             s = int(sym_idx_per_full[nk])
@@ -1449,7 +1449,7 @@ class WfnLoader:
             return out
 
         # Full-BZ unfold path.
-        from common.symmetry_maps import unfold_psi
+        from symmetry_maps import unfold_psi
         sym = self._ensure_sym()
         ntran = int(sym.sym_matrices.shape[0])
         for j, nk in enumerate(k_idxs):

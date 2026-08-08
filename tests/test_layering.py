@@ -1324,13 +1324,20 @@ _SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
 #: commit after the owner merges all four.  Until then these three budgets
 #: are 1 apiece and cannot grow: a shim's job is to forward, not to
 #: acquire reasons to exist.
+#: THE THREE symmetry_maps ROWS ARE GONE, and their absence is the record
+#: that the phase-wide shim deletion actually happened.  ``common.symmetry_maps``,
+#: ``common.density_symmetry_check`` and ``centroid.orbit_syms`` were
+#: ``__getattr__``-forwarding shims that reached past the door to keep the
+#: service's private names resolving at the old paths; all three were
+#: deleted at the 2026-08-08 landing and this ratchet is what noticed --
+#: it failed with "these modules no longer reach past a service door --
+#: delete the exception, and probably the module" the moment they went.
+#: An exception table that outlives its shims is how a replumb gets
+#: declared finished while the old paths are still there.
 _SERVICE_DOOR_EXCEPTIONS = {
     "ffi.cusolvermp.batched": 5,
     "ffi.cusolvermp.eigh":    1,
     "ffi.cusolvermp.context": 1,
-    "common.symmetry_maps":         1,
-    "common.density_symmetry_check": 1,
-    "centroid.orbit_syms":          1,
 }
 
 

@@ -201,7 +201,7 @@ def test_zeta_loader_and_wfn_loader_expose_the_same_G_surface(tmp_path):
     nothing before now read the components THROUGH the header's grid.
     """
     from tests.test_compute_all_V_q_g_flat import _build_g_flat_zeta_file
-    from file_io.zeta_loader import ZetaLoader
+    from zeta_loader import ZetaLoader
 
     grid = (16, 16, 16)                    # == the fake WFN's mf_header
     path, _z, _q, comps, ngk_per_q, ngkmax = _build_g_flat_zeta_file(

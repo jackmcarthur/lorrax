@@ -60,7 +60,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P    # noqa: E402
 from common.collectives import (device_put_process_local,      # noqa: E402
                                 process_count, process_rank,
                                 resolve_mesh)
-from common.symmetry_maps import (SymMaps, star_select,        # noqa: E402
+from symmetry_maps import (SymMaps, star_select,               # noqa: E402
                                   star_broadcast, star_spread)
 from common.mtxel_sweep import (SweepGeometry, band_sphere_spec,  # noqa: E402
                                 kinetic_operator,

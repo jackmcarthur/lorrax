@@ -106,10 +106,16 @@ _SRC = str(_REPO / "src")
 #: in the same file.  A pair that stops bare-launching moves to
 #: ``_FFI_BLOCKED_CONSUMERS`` with the measurement written down, never
 #: silently deleted.
+#: ``file_io.wfn_loader`` WAS the first pair here and it is gone: it was the
+#: transitional shim, and the phase-wide deletion removed it.  ``file_io``
+#: (the package ``__init__``) takes its place and is the better cell anyway
+#: -- the shim could not fail the way a real consumer can, because the shim
+#: WAS the bootstrap's own module, whereas ``file_io/__init__.py`` now
+#: reaches the door through ``ffi._services`` like everybody else.
 _MODULE_SCOPE_CONSUMERS = (
     ("isdf.core", "distrib_la"),
     ("bse.vq_interp", "distrib_la"),
-    ("file_io.wfn_loader", "wfn_loader"),
+    ("file_io", "wfn_loader"),
     ("psp.operator_checks", "wfn_loader"),
     ("centroid.charge_density", "symmetry_maps"),
     ("centroid.pivoted_cholesky", "symmetry_maps"),
@@ -149,7 +155,7 @@ _ALL_MODULE_SCOPE_DOOR_CONSUMERS = frozenset({
     "centroid.charge_density",
     "centroid.kmeans_cli",
     "centroid.pivoted_cholesky",
-    "file_io.wfn_loader",
+    "file_io",
     "gw.gw_jax",
     "gw.kin_ion_io",
     "psp.get_DFT_mtxels",
@@ -200,11 +206,14 @@ _FFI_BLOCKED_CONSUMERS = (
 #: bind theirs.  Listed rather than pattern-matched so a FOURTH shim cannot
 #: land silently either; they die with the phase-wide shim deletion, and on
 #: that day this tuple empties and the census still balances.
-_SHIM_CONSUMERS = (
-    "centroid.orbit_syms",
-    "common.density_symmetry_check",
-    "common.symmetry_maps",
-)
+#:
+#: THAT DAY WAS 2026-08-08 and the tuple is empty, exactly as written.  It
+#: is kept rather than deleted because it is the bucket a NEW shim would
+#: have to be put in: an empty list that the census still balances against
+#: is a live claim ("there are no re-export shims reaching this door"),
+#: whereas a deleted list is no claim at all.  ``_RETIRED_SHIM_PATHS``
+#: below carries the ratchet that keeps it empty.
+_SHIM_CONSUMERS = ()
 
 #: Not importable modules, so ``_bare_run`` cannot parametrize over them —
 #: they are entry points, covered the same way the FFI-blocked consumers are.
@@ -516,31 +525,168 @@ def test_a_module_scope_consumer_reaches_the_door_in_a_bare_launch(
         f"tree's service — the bootstrap found somebody else's copy")
 
 
-def test_the_wfn_loader_shim_is_the_same_object_as_the_door_in_a_bare_launch():
-    """The SHIM's promise, in the cluster's environment.
+# ===========================================================================
+#  O2 — the RETIRED PATHS, and that src/ has stopped reaching for them
+# ===========================================================================
+#  This block replaces `test_the_wfn_loader_shim_is_the_same_object_as_the
+#  _door_in_a_bare_launch`, which asserted that the wave-1 shims FORWARDED
+#  correctly.  That cell did its job and then died with its subject: the
+#  phase-wide cleanup commit deleted all five wave-1 shims, so there is no
+#  longer a shim whose forwarding could be checked.
+#
+#  WHAT REPLACES IT IS THE COMPLETION CRITERION, not a smaller version of
+#  the same claim.  A shim deletion is only finished if nothing reaches for
+#  the old path again, and "nothing does today" is not a property a commit
+#  can have -- it is a property a ratchet has to hold.  Without this, the
+#  next module to write `from common.symmetry_maps import SymMaps` gets a
+#  clean ModuleNotFoundError on the cluster and a green suite here, which
+#  is this file's founding defect class arriving through the door the
+#  cleanup itself opened.
+# ===========================================================================
 
-    ``src/file_io/wfn_loader.py`` exists so the in-tree spelling ``from
-    file_io.wfn_loader import WfnLoader`` keeps working across the
-    extraction, and its docstring claims every name it binds is the SAME
-    OBJECT the door exports — no second class, no second copy of the
-    arithmetic.  That claim is only interesting where the bootstrap is
-    load-bearing, so it is asserted HERE rather than in the service suite:
-    with PYTHONPATH=<repo>/src and nothing else, ``ensure_on_path`` has to
-    have run for the two names to be comparable at all.
+#: The wave-1 shim paths, deleted 2026-08-08 by the phase-wide cleanup.
+#: dotted module -> the door that replaced it.  A path listed here must not
+#: appear in any ``src/`` import again, and must not exist as a file.
+_RETIRED_SHIM_PATHS = {
+    "file_io.wfn_loader":           "wfn_loader",
+    "file_io.zeta_loader":          "zeta_loader",
+    "common.symmetry_maps":         "symmetry_maps",
+    "centroid.orbit_syms":          "symmetry_maps",
+    "common.density_symmetry_check": "symmetry_maps",
+}
+
+
+def _scan_retired(root: Path) -> list:
+    """``[(dotted, lineno, spelling, retired path)]`` over every .py in root.
+
+    ANY scope, not just module scope -- unlike the bootstrap census above,
+    which is deliberately module-scope-only because a lazy import cannot
+    fail at import time.  Here the opposite is true: a lazy
+    ``from common.symmetry_maps import ...`` inside a function is exactly
+    as dead as a module-scope one, it just dies later and further from the
+    cause.  Both are the defect.
     """
-    r = _bare_run(
-        "import file_io.wfn_loader as shim\n"
-        "import wfn_loader as door\n"
-        "assert shim.WfnLoader is door.WfnLoader, 'two classes'\n"
-        "assert shim.KSpec is door.KSpec\n"
-        "assert shim._phdf5_unfold_kernel is door._phdf5_unfold_kernel\n"
-        "print('SAME', door.__file__)\n")
-    assert r.returncode == 0, (
-        f"the wfn_loader shim does not resolve to the door in a bare "
-        f"launch.\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}")
-    assert "SAME" in r.stdout, r.stdout
-    resolved = r.stdout.split("SAME", 1)[1].strip()
-    assert resolved.startswith(str(_REPO / "services" / "wfn_loader"))
+    hits = []
+    for path in sorted(root.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        dotted = path.relative_to(root).with_suffix("").as_posix().replace(
+            "/", ".")
+        if dotted.endswith(".__init__"):
+            dotted = dotted[: -len(".__init__")]
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.level:          # relative: cannot name a retired path
+                    continue
+                targets = [node.module or ""]
+            elif isinstance(node, ast.Import):
+                targets = [a.name for a in node.names]
+            else:
+                continue
+            for t in targets:
+                for dead in _RETIRED_SHIM_PATHS:
+                    if t == dead or t.startswith(dead + "."):
+                        hits.append((dotted, node.lineno,
+                                     ast.unparse(node)[:90], dead))
+    return hits
+
+
+def test_the_retired_shim_files_are_gone():
+    """The five wave-1 shims do not exist.  Re-adding one is a RED cell.
+
+    A shim acquires a second life exactly this way: somebody hits the old
+    import path, re-creates the file to make their branch green, and the
+    deletion silently un-happens.
+    """
+    present = [rel for rel in (
+        "src/file_io/wfn_loader.py",
+        "src/file_io/zeta_loader.py",
+        "src/common/symmetry_maps.py",
+        "src/centroid/orbit_syms.py",
+        "src/common/density_symmetry_check.py",
+    ) if (_REPO / rel).exists()]
+    assert not present, (
+        f"wave-1 transitional shims are back: {present}.  These were deleted "
+        f"by the phase-wide cleanup commit (wave-1 ruling 2) and the door is "
+        f"the only supported path now.  If something needs the old spelling, "
+        f"migrate the caller -- re-adding the shim restarts the extraction.")
+
+
+def test_src_no_longer_imports_any_retired_shim_path():
+    """THE O2 COMPLETION CRITERION: nothing shipped reaches the shims.
+
+    This is what makes the deletion finished rather than merely done. It
+    scans EVERY scope (see ``_scan_retired``) because a lazy import of a
+    deleted module is just a later ImportError, not a lesser one.
+
+    IT SCANS ``services/`` TOO, AND THAT IS NOT SYMMETRY-FOR-ITS-OWN-SAKE.
+    A src/-only version of this cell was written first and went green while
+    ``services/wfn_loader/src/wfn_loader/loader.py`` still carried FIVE lazy
+    ``from common.symmetry_maps import ...`` imports — the shim had been
+    deleted underneath a service that was still reaching for it, in the one
+    tree the ratchet was not looking at.  Every one of the five was on a
+    real call path (the unfold, the τ-phase row, the TRS augmentation, the
+    density check), so the cell that was supposed to certify the deletion
+    would have certified a broken loader.  The scan follows the deletion,
+    not the directory layout.
+    """
+    hits = (_scan_retired(_REPO / "src")
+            + _scan_retired(_REPO / "services"))
+    assert not hits, (
+        "a shipped tree still imports a RETIRED wave-1 shim path.  These "
+        "modules were deleted; every one of these lines is an ImportError "
+        "waiting for the code path that reaches it:\n"
+        + "\n".join(
+            f"  {mod} :{ln} — reaches {dead!r}, use "
+            f"{_RETIRED_SHIM_PATHS[dead]!r}\n      {spell}"
+            for mod, ln, spell, dead in hits))
+
+
+def test_the_retired_path_scan_can_fail(tmp_path):
+    """RED TWIN for the two cells above, on a tree built to be wrong.
+
+    ``_scan_retired`` returning nothing is equally consistent with "src/ is
+    clean" and "the scanner matches nothing any more" -- and the second is
+    what a typo in ``_RETIRED_SHIM_PATHS`` produces, silently, on a tree
+    where the first is also true.  Four synthetic modules:
+
+    * ``deadmod``   — module-scope import of a retired path.  CAUGHT.
+    * ``deadlazy``  — the same import inside a function.  ALSO CAUGHT; this
+      is the cell that separates this scan from the bootstrap census above,
+      which deliberately ignores function scope.
+    * ``deadsub``   — a submodule of a retired path.  CAUGHT.
+    * ``relative``  — ``from .symmetry_maps import ...``, level 1.  NOT a
+      retired-path edge: it names a sibling in its own package, and a
+      scanner that read ``node.module`` without ``node.level`` would flag
+      every package that happens to contain a like-named module.
+    * ``innocent``  — imports the DOOR.  Must not be flagged, or the
+      ratchet would fail the very migration it exists to enforce.
+    """
+    (tmp_path / "deadmod.py").write_text(
+        "from common.symmetry_maps import SymMaps\n")
+    (tmp_path / "deadlazy.py").write_text(
+        "def build():\n"
+        "    from file_io.zeta_loader import ZetaLoader\n"
+        "    return ZetaLoader\n")
+    (tmp_path / "deadsub.py").write_text(
+        "import centroid.orbit_syms.helpers\n")
+    (tmp_path / "relative.py").write_text(
+        "from .symmetry_maps import SymMaps\n")
+    (tmp_path / "innocent.py").write_text(
+        "import symmetry_maps\n"
+        "from wfn_loader import WfnLoader\n")
+
+    flagged = {mod for mod, _ln, _sp, _dead in _scan_retired(tmp_path)}
+    assert flagged == {"deadmod", "deadlazy", "deadsub"}, (
+        f"the retired-path scanner flagged {sorted(flagged)}.  It must catch "
+        f"the module-scope, the LAZY and the submodule spellings, and must "
+        f"NOT catch the level-1 relative import (a sibling in its own "
+        f"package) or a module that correctly imports the door -- flagging "
+        f"'innocent' would make the ratchet fail the migration it enforces.")
 
 
 def test_the_bootstrap_is_idempotent_and_appends():

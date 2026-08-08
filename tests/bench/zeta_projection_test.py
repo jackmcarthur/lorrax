@@ -751,7 +751,7 @@ def cell_real(mesh, args) -> int:
     real large basis** — no real W exists on disk (V_q/W are in-memory
     in this pipeline) — and that is stated rather than blurred.
     """
-    from file_io.zeta_loader import ZetaLoader
+    from zeta_loader import ZetaLoader
     from common.zeta_projection import assert_zeta_bases_compatible
 
     p_x, p_y = int(mesh.shape["x"]), int(mesh.shape["y"])
