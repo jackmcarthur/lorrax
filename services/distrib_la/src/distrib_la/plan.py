@@ -27,6 +27,22 @@ down instead of re-derived; ``p(A)`` puts ``A`` there before calling;
 ``p.batched(A)`` is the SAME call for every backend whether or not the
 library underneath happens to have a batched entry point.
 
+What "batched" MEANS here
+-------------------------
+The batched surface is a ``lax.scan`` over this package's own single-matrix
+operation.  That is the definition, not an implementation detail that
+happens to be true today: ``p.batched`` is ``p`` under a scan, and a
+backend that owns a stacked FFI entry point gets to substitute it
+*underneath* that definition (:attr:`Plan.batched_route`), never beside it.
+There is exactly one public batched surface and there will not be a second.
+
+The reason to insist on it is that a scan is a place where a decision can
+live.  A Python loop over ``nb`` matrices is ``nb`` separate calls the
+compiler never sees together, and there is nowhere in it to put "run this
+batch some other way".  A scan is one node, so the choice of HOW a batch
+executes collapses to :attr:`Plan.batched_route` — today two routes, with a
+third reserved and named there.
+
 TWO PHASES, and they stay two
 -----------------------------
 :func:`plan` is EAGER: it dlopens the library and calls
@@ -67,9 +83,88 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
-                                resolve_backend)
+                                mesh_key, resolve_backend)
 
-__all__ = ["Plan", "plan", "ensure_sharding"]
+__all__ = ["Plan", "plan", "ensure_sharding", "BATCHED_SCAN_UNROLL",
+           "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
+           "ROUTE_BATCH_RESHARD"]
+
+
+#: ``unroll=`` for the batched scan — route ``ROUTE_SCAN`` below.
+#:
+#: ONE means the compiled module holds exactly ONE copy of the single-matrix
+#: op and the XLA while loop runs it ``nb`` times.  That is the point of
+#: making the batched surface a scan: a Python loop hands the compiler
+#: ``nb`` separate calls (and, on a wrapper that builds its ``shard_map``
+#: eagerly with no ``jax.jit`` around it, ``nb`` traces), while the scan
+#: compiles once whatever ``nb`` is.
+#:
+#: It is a named constant and not a literal because raising it is the
+#: obvious first thing to try if a backend's per-matrix launch latency ever
+#: dominates its arithmetic: ``unroll=k`` buys ``nb/k`` loop trips for ``k``
+#: copies of the op in the module.  Nobody has measured a shape where that
+#: wins, so it stays 1 — changing it is a measurement, not a preference.
+BATCHED_SCAN_UNROLL = 1
+
+#: (a) ``lax.scan`` over this package's own single-matrix op.  The default.
+ROUTE_SCAN = "scan"
+#: (b) the backend's own stacked FFI entry point, where the library has one.
+ROUTE_BACKEND_BATCHED = "backend_batched"
+#: (c) RESERVED, not implemented — see :attr:`Plan.batched_route`.
+ROUTE_BATCH_RESHARD = "batch_reshard"
+
+#: Every route the toggle can name.  A vocabulary, like the backend names:
+#: importable with no jax and no ``.so``, so a test can enumerate the routes
+#: without a mesh.
+BATCHED_ROUTES = (ROUTE_SCAN, ROUTE_BACKEND_BATCHED, ROUTE_BATCH_RESHARD)
+
+#: ``jit``-compiled batched scans, one per (op, backend, mesh, signature).
+#:
+#: NOT an optimization to taste — a MEASURED requirement, and the same one
+#: every FFI wrapper in this package already answers with a ``_JIT_CACHE``.
+#: An eager ``shard_map`` re-traces on every call, and an eager ``lax.scan``
+#: around one re-traces AND re-lowers the whole loop on every call.  Without
+#: this cache the scan is CORRECT and SLOWER: Perlmutter CPU 2x2, nq=8 n=64,
+#: the serial eigh route measured cold 0.106 s / warm 0.080 s eager against
+#: the same scan as a compiled executable at 0.011 s, i.e. ~69 ms of pure
+#: per-call retrace — worse than the Python loop it replaced (warm 0.024 s),
+#: which paid nothing per call because each backend call hit the wrapper's
+#: own cache.
+#:
+#: Keyed on :func:`distrib_la.mesh_key`, which is STRICTLY finer than the
+#: ``(Px, Py)`` the backends key their MPI/NCCL contexts on, so this cache
+#: cannot hold an executable whose baked-in context handle has moved on.
+#: Finer than necessary can only cost an extra compile; coarser is the one
+#: failure mode a cache key must not have.
+_SCAN_CACHE: dict = {}
+
+
+def scan_signature(op: str, backend: str, mesh: Mesh, ops, kwargs,
+                   extra=()) -> int | None:
+    """A hashable identity for a compiled batched scan, or ``None``.
+
+    ``None`` means "this call cannot be keyed" — an unhashable keyword — and
+    the caller then builds the scan without caching it.  Refusing to cache
+    is always safe; guessing a key is not.
+    """
+    try:
+        return hash((
+            op, backend, mesh_key(mesh), BATCHED_SCAN_UNROLL, extra,
+            tuple((tuple(x.shape), str(x.dtype)) for x in ops),
+            tuple(sorted((k, repr(v)) for k, v in kwargs.items()))))
+    except TypeError:
+        return None
+
+
+def cached_scan(key, build):
+    """The compiled scan for ``key``, built once.  ``key=None`` skips the
+    cache entirely and builds every time."""
+    if key is None:
+        return build()
+    fn = _SCAN_CACHE.get(key)
+    if fn is None:
+        fn = _SCAN_CACHE[key] = build()
+    return fn
 
 
 def ensure_sharding(x, sharding: NamedSharding):
@@ -118,11 +213,13 @@ def _eigh_columns(backend: str, lam, Q):
 
     RANK-AGNOSTIC: the transpose is on the LAST TWO axes, so one normaliser
     serves an ``(n, n)`` tile and a ``(nq, n, n)`` stack alike.  It has to
-    be, because :func:`dispatch_batched_eigh` probes for a backend's
-    stacked entry with ``getattr`` rather than a name table — the day
-    cuSOLVERMp grows a ``batched_distributed_eigh`` this function starts
-    receiving stacks with no other edit, and the old ``.T`` (reverse ALL
-    axes) would have silently returned ``(n, n, nq)``.
+    be, because the SAME normaliser is the ``post`` of both routes in
+    :attr:`Plan.batched_route`: the scan hands it one tile per iteration
+    and a stacked entry hands it the whole stack.  The day cuSOLVERMp
+    grows a ``batched_distributed_eigh``, one ``_IMPL`` row flips this
+    function's operand from ``(n, n)`` to ``(nq, n, n)`` with no other
+    edit, and the old ``.T`` (reverse ALL axes) would have silently
+    returned ``(n, n, nq)``.
     """
     if backend == "cusolvermp":
         return lam, jnp.conj(jnp.swapaxes(Q, -1, -2))
@@ -131,17 +228,33 @@ def _eigh_columns(backend: str, lam, Q):
 
 #: (op, backend) → how to call it.
 #:
-#:   one    attribute implementing the SINGLE-tile form, or None
-#:   many   attribute implementing the STACKED form, or None
-#:   post   result normaliser, applied to both forms
+#:   one         attribute implementing the SINGLE-tile form, or None
+#:   many        attribute implementing the STACKED form, or None
+#:   post        result normaliser, applied to both forms
+#:   one_handle  ``one`` returns a library HANDLE rather than arrays
+#:               (absent means it returns arrays)
 #:
-#: A ``None`` on either side is filled in by looping/slicing the other —
-#: that is the whole point of :meth:`Plan.batched`.  ``cholesky`` is
-#: asymmetric on purpose: cuSOLVERMp's batched potrf returns a HANDLE
-#: object carrying the block-cyclic geometry, while SLATE's per-tile potrf
-#: returns a conventional row-major L.  The plan does not flatten that
-#: difference away — :func:`distrib_la.factor` is where it is handled — it
-#: just stops every caller from re-deriving which is which.
+#: A missing ``many`` is filled in by scanning ``one`` — that is what
+#: :meth:`Plan.batched` IS.  A missing ``one`` means the library only ever
+#: factors a whole stack (one descriptor, one workspace), so there is no
+#: single-tile call to scan and the stacked entry is the only route.
+#:
+#: ``cholesky`` is asymmetric on purpose: cuSOLVERMp's batched potrf returns
+#: a HANDLE object carrying the block-cyclic geometry, while SLATE's
+#: per-tile potrf returns a ``SlateLowerL`` handle of its own.  The plan
+#: does not flatten that difference away — :func:`distrib_la.factor` is
+#: where it is handled — it just stops every caller from re-deriving which
+#: is which.
+#:
+#: ``one_handle`` is DECLARED and not discovered, and the difference is the
+#: point.  The old loop-and-stack path found out by calling ``one`` once and
+#: looking at what came back; a scan cannot, because a handle is not a
+#: pytree and the failure would arrive from inside ``lax.scan`` as a type
+#: error naming neither the op nor the backend.  Declaring it lets
+#: :meth:`Plan.batched` refuse BEFORE it runs anything, with the sentence
+#: that says what to call instead.  ``tests/test_distrib_la_shape_algebra``
+#: cross-checks the flag against each wrapper's own return annotation, so
+#: the declaration cannot quietly disagree with the code.
 _IMPL: dict[tuple[str, str], dict[str, Any]] = {
     ("eigh", "cusolvermp"):     dict(one="distributed_eigh",
                                      many=None, post=_eigh_columns),
@@ -154,7 +267,8 @@ _IMPL: dict[tuple[str, str], dict[str, Any]] = {
                                      many="batched_distributed_cholesky",
                                      post=None),
     ("cholesky", "slate"):      dict(one="distributed_cholesky",
-                                     many=None, post=None),
+                                     many=None, post=None,
+                                     one_handle=True),
     ("solve_lu", "cusolvermp"): dict(one=None,
                                      many="batched_distributed_solve_lu",
                                      post=None),
@@ -240,6 +354,57 @@ class Plan:
         return backend_module(self.backend)
 
     @property
+    def batched_route(self) -> str:
+        """HOW :meth:`batched` will execute a stack.  THE toggle.
+
+        This property is the one place in the package that decides how a
+        batch runs, and the only place a new way of running one may be
+        added.  Everything else — :meth:`batched`, the dispatchers, every
+        caller — reads the answer or ignores it; nothing re-derives it.
+
+        (a) ``ROUTE_SCAN`` — ``lax.scan`` (:data:`BATCHED_SCAN_UNROLL`) over
+            this plan's own single-matrix op.  The default, and the
+            definition of the batched surface.
+
+        (b) ``ROUTE_BACKEND_BATCHED`` — the backend's own stacked FFI entry
+            point, taken whenever the library has one.  ScaLAPACK's eigh
+            loops ``q`` in C++ around ONE descriptor and ONE workspace, so
+            an ``Nq``-matrix stack costs one collective-serialisation round
+            instead of ``Nq``; cuSOLVERMp's potrf and both solve_lu entries
+            are the same bargain.  That saving lives in C++ and no scan can
+            recover it, which is why the route exists — but it is a
+            backend-internal optimization BEHIND this interface, never a
+            second surface a caller can see or has to know about.
+
+        (c) ``ROUTE_BATCH_RESHARD`` — **RESERVED.  Not implemented; asking
+            for it raises.**  Move the batch axis onto the mesh
+            (``common.staged_reshard.face_to_batch_reshard``:
+            ``P(None,'x','y') → P(('x','y'),None,None)``, two single-mesh-
+            axis ``all_to_all``s, because the one-step move is not a tile
+            permutation and GSPMD silently degrades it to
+            replicate-then-partition) and run the LOCAL jax kernel on each
+            rank's own matrices, then move back.  The movement primitive
+            already exists and is documented there; wiring it is the work.
+
+            The reason it is worth a reserved name: for every matrix that
+            fits on one device, the distributed libraries' cost IS their
+            fixed per-call charge — cuSOLVERMp eigh is a flat ~1.55 s per
+            matrix from n=64 to n=1024, where native replicated is 1.5 ms
+            to 27 ms (§ Performance in ``docs/services/distrib_la.md``).
+            Route (c) serves that whole regime with no distributed-library
+            call at all, and it is how small-system linalg happens without
+            a second, parallel API.
+
+        Choosing between them is deliberately NOT a caller-facing dial.
+        ``batched()`` takes a private ``_route`` override that the
+        batched-vs-serial bit-identity gate uses to run both routes on the
+        same operands; production code passes nothing and gets this.
+        """
+        if _IMPL[(self.op, self.backend)]["many"] is not None:
+            return ROUTE_BACKEND_BATCHED
+        return ROUTE_SCAN
+
+    @property
     def native_fn(self) -> Callable:
         """A PURE, TRACE-SAFE closure for this plan's math.
 
@@ -318,57 +483,105 @@ class Plan:
         out = one(*ops, mesh=self.mesh, **kwargs)
         return post(self.backend, *out) if post is not None else out
 
-    def batched(self, A, *args, **kwargs):
+    def batched(self, A, *args, _route: str | None = None, **kwargs):
         """Run the op on a STACK ``(nb, n, n)`` — uniform across backends.
 
-        Uses the backend's own batched entry point when it has one (one FFI
-        call, one descriptor, one workspace for the whole stack) and
-        otherwise loops the leading axis and stacks, which is what every
-        call site used to write out by hand.  Operands are moved to
-        :attr:`batch_in_sharding` first.
+        The same call for every backend, whatever the library underneath
+        can and cannot do with a stack.  Operands are moved to
+        :attr:`batch_in_sharding` first; :attr:`batched_route` decides how
+        the batch executes and is the only thing that decides.
 
         The native ``eigh`` plan just forwards to ``jnp.linalg.eigh``,
         which is natively batched (and is why ``auto`` picks it).
+
+        ``_route`` is a PRIVATE override, for the batched-vs-serial gate
+        that has to run two routes over one set of operands and compare
+        them.  Production code passes nothing.  It is private because a
+        caller that picks a route has taken back the decision this whole
+        module exists to make once — the same reason there is no
+        ``backend=`` on a call and only on :func:`plan`.
         """
         if self.is_native:
             return self(A, *args, **kwargs)
-        ops = [ensure_sharding(x, self.batch_in_sharding) for x in (A, *args)]
-        many, post = self._entry("many")
-        if many is not None:
+        ops = tuple(ensure_sharding(x, self.batch_in_sharding)
+                    for x in (A, *args))
+
+        route = self.batched_route if _route is None else _route
+        if route == ROUTE_BACKEND_BATCHED:
+            many, post = self._entry("many")
+            if many is None:
+                raise NotImplementedError(
+                    f"{self.op} backend {self.backend!r} has no stacked FFI "
+                    f"entry point, so route {ROUTE_BACKEND_BATCHED!r} does "
+                    f"not exist for it.  Its batched route is "
+                    f"{self.batched_route!r}.")
             out = many(*ops, mesh=self.mesh, **kwargs)
             return post(self.backend, *out) if post is not None else out
-        one, _ = self._entry("one")
-        nb = int(A.shape[0])
-        rows = [one(*[x[i] for x in ops], mesh=self.mesh, **kwargs)
-                for i in range(nb)]
-        rows = [post(self.backend, *r) if post is not None else r
-                for r in rows]
-        return _stack_results(rows, self.op, self.backend)
+        if route == ROUTE_SCAN:
+            return self._scan_over_single(ops, kwargs)
+        if route == ROUTE_BATCH_RESHARD:
+            raise NotImplementedError(
+                f"route {ROUTE_BATCH_RESHARD!r} is RESERVED and not built: "
+                f"it would move the batch axis onto the mesh with "
+                f"common.staged_reshard.face_to_batch_reshard and run the "
+                f"local jax kernel per matrix.  See Plan.batched_route for "
+                f"what it is for and why the name exists before the code.")
+        raise ValueError(
+            f"unknown batched route {route!r} "
+            f"(known: {'|'.join(BATCHED_ROUTES)})")
 
+    def _scan_over_single(self, ops: tuple, kwargs: dict):
+        """Route (a): ``lax.scan`` over this plan's own single-matrix call.
 
-def _stack_results(rows, op: str, backend: str):
-    """``[r0, r1, …]`` → stacked, tuple-shape-preserving.
+        The body is exactly what :meth:`__call__` does to one tile —
+        :func:`ensure_sharding` onto :attr:`in_sharding`, the backend's
+        single-matrix entry, then the per-backend result normaliser — so
+        the two surfaces cannot drift apart by construction.  ``lax.scan``
+        stacks the per-matrix outputs itself, preserving whatever pytree
+        the single-matrix call returns (a bare array, or eigh's
+        ``(W, Z)``).
 
-    Refuses non-array results explicitly.  SLATE's per-tile ``potrf``
-    returns a ``SlateLowerL`` HANDLE, not an array, so a loop-and-stack
-    batched cholesky would need a per-row ``.to_jax_lower()`` and a
-    sharding constraint on the stack.  Say so rather than raise a
-    ``TypeError`` from inside ``jnp.stack`` — and note that
-    :func:`distrib_la.factor` is the surface that DOES carry handles.
-    """
-    def _stackable(x):
-        return hasattr(x, "shape") and hasattr(x, "dtype")
-    flat = rows[0] if isinstance(rows[0], tuple) else (rows[0],)
-    if not all(_stackable(y) for y in flat):
-        raise NotImplementedError(
-            f"{op} backend {backend!r} has no batched entry point and its "
-            f"single-tile result is not an array, so plan.batched() cannot "
-            f"stack it.  Use distrib_la.factor()/solve(), which carries the "
-            f"handle in an opaque token instead of flattening it.")
-    if isinstance(rows[0], tuple):
-        return tuple(jnp.stack([r[j] for r in rows])
-                     for j in range(len(rows[0])))
-    return jnp.stack(rows)
+        The scan is ``jax.jit``-ed and cached per signature.  That is not
+        decoration: see :data:`_SCAN_CACHE` for the measurement that says
+        an uncached eager scan is slower than the Python loop it replaces.
+        """
+        spec = _IMPL[(self.op, self.backend)]
+        one, post = self._entry("one")
+        if one is None:
+            raise NotImplementedError(
+                f"{self.op} backend {self.backend!r} has neither a stacked "
+                f"FFI entry point nor a single-tile one to scan, which "
+                f"should be unreachable: every row of the impl table has at "
+                f"least one of them.")
+        if spec.get("one_handle"):
+            raise NotImplementedError(
+                f"{self.op} backend {self.backend!r} has no batched entry "
+                f"point and its single-tile entry returns a library HANDLE "
+                f"rather than an array, so there is no stack for a scan to "
+                f"build.  Use distrib_la.factor()/solve(), which carries "
+                f"the handle in an opaque token instead of flattening it.")
+
+        mesh, backend, tile = self.mesh, self.backend, self.in_sharding
+
+        def _build():
+            def _one_matrix(carry, tiles):
+                out = one(*(ensure_sharding(t, tile) for t in tiles),
+                          mesh=mesh, **kwargs)
+                return carry, (post(backend, *out) if post is not None
+                               else out)
+
+            def _scanned(*stacks):
+                # An EMPTY carry: nothing crosses from matrix q to matrix
+                # q+1, and writing that down is the claim that the batch
+                # axis is independent.
+                _, stacked = jax.lax.scan(_one_matrix, None, stacks,
+                                          unroll=BATCHED_SCAN_UNROLL)
+                return stacked
+
+            return jax.jit(_scanned)
+
+        key = scan_signature(self.op, self.backend, mesh, ops, kwargs)
+        return cached_scan(key, _build)(*ops)
 
 
 def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",

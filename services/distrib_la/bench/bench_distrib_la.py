@@ -197,10 +197,12 @@ def run(mesh, *, dtype="complex128", warmup=2, reps=5, only=""):
                             _put(_B, mesh, (None, "x", "y")))
                 fn, args = D.plan(op, mesh, backend=backend, n=n).batched, build()
             elif op == "cholesky" and resolved in ("slate", "cusolvermp"):
-                # MEASURED (cpu1x1 baseline, 2026-08-07): plan.batched
-                # REFUSES these -- their factor is a library HANDLE, not an
-                # array, and plan._stack_results declines to stack handles
-                # on purpose.  Timing the refusal would have left the two
+                # MEASURED (cpu1x1 baseline, 2026-08-07): plan.batched does
+                # not give these a timeable array -- their factor is a
+                # library HANDLE.  SLATE's single-tile potrf is declared
+                # ``one_handle`` in plan._IMPL and plan.batched REFUSES it
+                # by name; cuSOLVERMp's stacked potrf returns a handle of
+                # its own.  Timing the refusal would have left the two
                 # distributed cholesky backends with no row at all, which
                 # is the shape of a baseline table that quietly measures
                 # only the easy half.  factor()+solve() is the route those
