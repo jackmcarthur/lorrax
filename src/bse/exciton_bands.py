@@ -380,14 +380,26 @@ def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data,
     d_eps_idx = float(_local(d_idx_dev))
     G = _local(G_dev)
     smin = 1.0
+    k_worst = -1
+    sv_worst = None
     for k in range(G.shape[0]):
         sv = np.linalg.svd(G[k], compute_uv=False)
-        smin = min(smin, float(sv.min()))
+        if float(sv.min()) < smin:
+            smin, k_worst, sv_worst = float(sv.min()), k, sv
     d_meV = d_eps * RY2EV * 1e3
     d_meV_idx = d_eps_idx * RY2EV * 1e3
     log(f"  [gate] htransform@Γ vs stored: max|Δε_c| = {d_meV:.6f} meV "
         f"(order-matched; this is the accuracy number), "
         f"conduction-subspace overlap min-sval = {smin:.4f}")
+    if sv_worst is not None:
+        # The WHOLE spectrum at the worst k, because the min alone is not
+        # diagnostic: svals all ≈ s < 1 is a normalisation/weight error, while
+        # svals ≈ (1, …, 1, s) is one genuinely missing subspace direction —
+        # the window boundary cutting a degenerate multiplet.  Different bugs,
+        # different fixes, and the gate used to print a number that could be
+        # either.
+        log(f"  [gate] overlap svals at the worst k (k={k_worst}): "
+            f"{np.array2string(np.asarray(sv_worst), precision=4)}")
     log(f"  [gate] band-index-wise |Δε_c| = {d_meV_idx:.3f} meV — this is "
         f"NOT an accuracy figure.  htransform returns energies ascending and "
         f"the restart stores them in DFT-band order, so QP band reordering "
