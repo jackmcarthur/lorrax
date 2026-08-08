@@ -387,11 +387,7 @@ def solve_bse_sharded(
         n_restarts = max(0, -(-(int(max_iter) - m_max) // per_cycle))
         apps = m_max + n_restarts * per_cycle
         bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
-
-        def apply_H(V):
-            V = jax.lax.with_sharding_constraint(V, sh.X)
-            return matvec_ring(V, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                               eps_c, eps_v, W_R, V_q0, M_X, M_Y)
+        rep_tr = NamedSharding(mesh_xy, P())
 
         print(f"Thick-restart Lanczos: n_eig={n_eig} m_max={m_max} "
               f"n_keep={n_keep} restarts={n_restarts} -> {apps} matvec "
@@ -399,11 +395,35 @@ def solve_bse_sharded(
               f"({(m_max + 1) / (int(max_iter) + 1):.2f}x the unrestarted "
               f"basis at the same budget)", flush=True)
 
-        eigenvalues, eigenvectors, alpha_im = thick_restart_lanczos_eig(
-            apply_H, (nc_pad, nv_pad, nk),
-            n_eig=n_eig, m_max=m_max, n_keep=n_keep,
-            n_restarts=n_restarts, sharding=bse_sharding,
+        # ONE jit, tensors as ARGUMENTS.  They span every process, so closing
+        # over them inside the traced loop body would carry them as constants
+        # -- the shape of mistake bse_feast's cached runner makes; inside a
+        # fori_loop it does not raise, it just builds a program that does not
+        # finish compiling.  Measured: 13 min without this, and counting.
+        @partial(
+            jax.jit,
+            in_shardings=(
+                sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
+                sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y,
+            ),
+            # Replicated out, matching the Lanczos path's contract, so
+            # --write-eigs is addressable at P>1 for this solver.
+            out_shardings=(rep_tr, rep_tr, rep_tr),
         )
+        def _trlan_run(pcx, pcy, pvx, pvy, ec, ev, WR, Vq0, MX, MY):
+            def apply_H(V):
+                V = jax.lax.with_sharding_constraint(V, sh.X)
+                return matvec_ring(V, pcx, pcy, pvx, pvy, ec, ev, WR, Vq0,
+                                   MX, MY)
+            return thick_restart_lanczos_eig(
+                apply_H, (nc_pad, nv_pad, nk),
+                n_eig=n_eig, m_max=m_max, n_keep=n_keep,
+                n_restarts=n_restarts, sharding=bse_sharding,
+            )
+
+        eigenvalues, eigenvectors, alpha_im = _trlan_run(
+            psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
+            M_X, M_Y)
         print(f"Thick-restart Lanczos: max |Im <q,Hq>| = "
               f"{float(alpha_im):.3e} Ry", flush=True)
         eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
