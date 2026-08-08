@@ -1,26 +1,33 @@
-"""Gates for the Lanczos reorthogonalisation route dial (LORRAX_LANCZOS_REORTH).
+"""Gates for the Lanczos reorthogonalisation route (LORRAX_LANCZOS_REORTH).
 
-The shipped route (``mgs``) reorthogonalises one basis vector per ``fori_loop``
-trip, so on a sharded Krylov axis it issues ``max_iter (max_iter + 1) / 2``
-separate all-reduces of a single complex scalar -- 20 100 of them for the
-200-iteration Si BSE record deck, and the largest single GPU-time item in that
-run.  The ``cgs2`` route computes every overlap as one matrix product and
-issues ``2 * max_iter``.
+The DEFAULT is ``cgs2``: every overlap of a sweep computed as one matrix
+product, ``2 * max_iter`` all-reduces of an ``(m,)`` vector.  The legacy
+``mgs`` route reorthogonalises one basis vector per ``fori_loop`` trip, so on a
+sharded Krylov axis it issues ``max_iter (max_iter + 1) / 2`` separate
+all-reduces of a single complex SCALAR -- 20 100 of them for the 200-iteration
+Si BSE record deck, where it was the largest single GPU-time item in the run.
+``mgs`` is kept reachable for bisects and for reproducing pre-2026-08-08 runs.
 
 Each cell below is paired with the failure it exists to catch:
 
-* ``test_unknown_route_refuses`` -- RED TWIN for the dial itself.  If a
-  misspelled token fell back to the default, an "optimised" A/B leg could
-  silently be the baseline and every number taken from it would be void.
-  (Same doctrine as ``bse.bse_stack_matvec.matvec_opts``.)
-* ``test_mgs_trip_count_matches_the_shipped_loop`` -- RED TWIN for the
-  *arithmetic* behind the 20 100.  The counting helper is re-derived here from
-  the shipped loop's own bounds; if either drifts, the number this campaign
-  quotes stops being the number the code executes.
-* ``test_cgs2_removes_the_inner_sweep`` -- RED TWIN for the optimisation being
-  real.  Structural, at jaxpr level, so it does not depend on an XLA version:
-  ``mgs`` nests a ``while`` inside the Lanczos ``while``; ``cgs2`` must not.
-  Fails if ``cgs2`` ever silently routes back to the sweep.
+* ``test_default_route_is_batched`` + ``test_the_default_really_is_batched`` --
+  RED TWINS for the LANDING.  The first pins the resolver, the second pins the
+  jaxpr a production caller actually gets with nothing set.  Fails if the
+  default ever regresses to the sweep.
+* ``test_mgs_fallback_is_reachable_from_the_env`` -- RED TWIN for the other
+  direction: the legacy route must stay one env var away, via the env path a
+  bisect would use.  Fails if the fallback is amputated.
+* ``test_unknown_route_refuses`` -- RED TWIN for the dial itself.  A misspelled
+  token must refuse, not silently pick a route -- which now matters in BOTH
+  directions, since a typo must not hand back the 20 100-collective sweep
+  either.  (Same doctrine as ``bse.bse_stack_matvec.matvec_opts``.)
+* ``test_mgs_trip_count_matches_the_shipped_loop`` +
+  ``test_record_deck_collective_counts_are_pinned`` -- RED TWINS for the
+  *arithmetic* behind 20 100 and 400.  The counting helper is re-derived from
+  the legacy loop's own bounds; if either drifts, the numbers this landing
+  quotes stop being the numbers the code executes.
+* ``test_cgs2_removes_the_inner_sweep`` -- structural, at jaxpr level, so it
+  does not depend on an XLA version.
 * ``test_routes_agree_full_reorth`` / ``test_routes_agree_partial_window`` --
   the accuracy gates.  The partial-window cell is the one with teeth for the
   mask: a wrong window (off-by-one, or "whole basis" instead of the window)
@@ -48,28 +55,35 @@ except ImportError:                     # pragma: no cover - older jax
 # the dial
 # --------------------------------------------------------------------------
 
-def test_default_route_is_the_shipped_sweep(monkeypatch):
+def test_default_route_is_batched(monkeypatch):
+    """The DEFAULT is the batched route.  Unset and empty both mean cgs2."""
     monkeypatch.delenv(LZ._REORTH_ENV, raising=False)
-    assert LZ.reorth_kind() == "mgs"
+    assert LZ.reorth_kind() == "cgs2"
     monkeypatch.setenv(LZ._REORTH_ENV, "")
-    assert LZ.reorth_kind() == "mgs"
+    assert LZ.reorth_kind() == "cgs2"
+    assert LZ._REORTH_DEFAULT == "cgs2"
 
 
 def test_env_selects_route_and_override_wins(monkeypatch):
-    monkeypatch.setenv(LZ._REORTH_ENV, "cgs2")
-    assert LZ.reorth_kind() == "cgs2"
-    assert LZ.reorth_kind("mgs") == "mgs"          # explicit kwarg wins
-    monkeypatch.setenv(LZ._REORTH_ENV, "  CGS2 ")  # tolerant of case/space
-    assert LZ.reorth_kind() == "cgs2"
+    monkeypatch.setenv(LZ._REORTH_ENV, "mgs")
+    assert LZ.reorth_kind() == "mgs"               # legacy fallback reachable
+    assert LZ.reorth_kind("cgs2") == "cgs2"        # explicit kwarg wins
+    monkeypatch.setenv(LZ._REORTH_ENV, "  MGS ")   # tolerant of case/space
+    assert LZ.reorth_kind() == "mgs"
 
 
 def test_unknown_route_refuses(monkeypatch):
-    """RED TWIN: a misspelled dial must REFUSE, never silently run baseline."""
+    """RED TWIN: a misspelled dial must REFUSE, never silently pick a route.
+
+    Now that ``cgs2`` is the default the refusal matters in BOTH directions: a
+    typo must not silently hand back the 20 100-collective sweep either.
+    """
     monkeypatch.setenv(LZ._REORTH_ENV, "cgs")      # plausible near-miss
     with pytest.raises(ValueError, match="unknown reorthogonalisation route"):
         LZ.reorth_kind()
-    with pytest.raises(ValueError):
-        LZ.reorth_kind("classical")
+    for bad in ("classical", "mgs2", "gs", "CGS-2"):
+        with pytest.raises(ValueError):
+            LZ.reorth_kind(bad)
 
 
 # --------------------------------------------------------------------------
@@ -96,10 +110,21 @@ def test_mgs_trip_count_matches_the_shipped_loop(max_iter, n_reorth):
     assert LZ.reorth_collective_count("cgs2", max_iter, n_reorth) == 2 * max_iter
 
 
-def test_full_reorth_is_the_triangular_number():
-    """The campaign's headline: 200 iterations of full reorth = 20 100."""
+def test_record_deck_collective_counts_are_pinned(monkeypatch):
+    """The two numbers this landing is built on, pinned at the DEFAULT route.
+
+    200 Lanczos iterations at full reorth on the Si record deck: the shipped
+    sweep issued the triangular number 20 100; the default now issues 400.
+    """
+    monkeypatch.delenv(LZ._REORTH_ENV, raising=False)
+    assert LZ.reorth_kind() == "cgs2"
+    assert LZ.reorth_collective_count(LZ.reorth_kind(), 200, 200) == 400
+    # the legacy route's number, for the record and for the fallback cell below
     assert LZ.mgs_trip_count(200, 200) == 200 * 201 // 2 == 20100
-    assert LZ.reorth_collective_count("cgs2", 200, 200) == 400
+    assert LZ.reorth_collective_count("mgs", 200, 200) == 20100
+    # the window does not change the batched count; it does change the sweep's
+    assert LZ.reorth_collective_count("cgs2", 200, 5) == 400
+    assert LZ.reorth_collective_count("mgs", 200, 5) == 1185
 
 
 # --------------------------------------------------------------------------
@@ -150,10 +175,82 @@ def test_cgs2_removes_the_inner_sweep():
     w_mgs = _count_prim(jx["mgs"], "while")
     w_cgs = _count_prim(jx["cgs2"], "while")
     assert _count_prim(jx["mgs"], "scan") >= 1, "outer Lanczos loop vanished"
-    assert w_mgs >= 1, f"shipped route lost its per-vector sweep ({w_mgs} while)"
+    assert w_mgs >= 1, f"legacy route lost its per-vector sweep ({w_mgs} while)"
     assert w_cgs == 0, (
         f"cgs2 still carries a per-vector reorth loop "
         f"({w_cgs} while, mgs has {w_mgs})")
+
+
+def test_the_default_really_is_batched(monkeypatch):
+    """RED TWIN for the LANDING: with nothing set, the sweep must be gone.
+
+    ``test_cgs2_removes_the_inner_sweep`` proves the batched route is batched
+    when explicitly asked for.  This proves the DEFAULT gets it — i.e. that the
+    flip actually reached production callers, not just the ``reorth=`` kwarg.
+    Fails if the default ever regresses to ``mgs``.
+    """
+    monkeypatch.delenv(LZ._REORTH_ENV, raising=False)
+    n, it = 32, 8
+    mv = _diag_matvec(np.arange(1, n + 1, dtype=float))
+    jx = jax.make_jaxpr(
+        lambda: LZ.lanczos_eig_jit(mv, n, n_eig=4, max_iter=it,
+                                   n_reorth=it))().jaxpr
+    assert _count_prim(jx, "while") == 0, (
+        "the DEFAULT route still carries a per-vector reorth loop")
+    assert _count_prim(jx, "scan") >= 1, "outer Lanczos loop vanished"
+
+
+def test_window_semantics_are_frozen():
+    """RED TWIN: the projected set is `{i : max(0,j-n_reorth) <= i < j}`. FROZEN.
+
+    Two things a future tidy-up will be tempted to "fix", and must not:
+
+    1. The sweep runs ``fori_loop(max(0, j-n_reorth), j + 1)`` with ``i < j``
+       inside, so its LAST trip computes a dot product and multiplies it by
+       zero -- 200 of the record deck's 20 100 collectives are that no-op.
+       Deleting it (``fori_loop(start, j, ...)``) is a real perf win on the
+       legacy route and is STILL NOT ALLOWED here: the trip count is what
+       ``mgs_trip_count`` pins and what every archived measurement was taken
+       with, and the fallback exists precisely to reproduce those.
+    2. Widening ``i < j`` to ``i <= j`` -- projecting out the CURRENT vector,
+       whose un-subtracted ``Im<q_j, z>`` is the best explanation for the
+       4.2e-06 Ritz-orthogonality floor this deck shows. The Ritz probe
+       measured that widening collapses that floor to 1e-15 at zero collective
+       cost, but it MOVES PHYSICS (4.22e-10 eV on the current operator) and is
+       its own owner decision. It must not ride in on a perf landing.
+
+    This cell pins the boundary from both sides so either change goes red here
+    rather than silently in a production eigenvalue.
+    """
+    # the mask the batched route applies == the set the sweep visits
+    for j in (0, 1, 5, 17):
+        for n_reorth in (0, 3, 200):
+            sel = np.asarray(LZ._reorth_window(j, 24, n_reorth))
+            expect = np.array([max(0, j - n_reorth) <= i < j for i in range(24)])
+            assert np.array_equal(sel, expect), (j, n_reorth)
+            # the current vector j is NEVER projected out (not widened to i<=j)
+            if j < 24:
+                assert not sel[j], f"window widened to i<=j at j={j}"
+    # the sweep still pays for its i==j no-op trip: j+1 trips, not j
+    assert LZ.mgs_trip_count(1, 200) == 1
+    assert LZ.mgs_trip_count(200, 200) == 20100        # == sum_{j} (j+1)
+    assert LZ.mgs_trip_count(200, 200) != sum(range(200))   # == sum_{j} j
+
+
+def test_mgs_fallback_is_reachable_from_the_env(monkeypatch):
+    """RED TWIN for the FALLBACK: the legacy sweep must still be one var away.
+
+    Exercises the env path, not the kwarg, because that is the path a bisect or
+    an archived-run reproduction uses.  Fails if the fallback is amputated.
+    """
+    monkeypatch.setenv(LZ._REORTH_ENV, "mgs")
+    n, it = 32, 8
+    mv = _diag_matvec(np.arange(1, n + 1, dtype=float))
+    jx = jax.make_jaxpr(
+        lambda: LZ.lanczos_eig_jit(mv, n, n_eig=4, max_iter=it,
+                                   n_reorth=it))().jaxpr
+    assert _count_prim(jx, "while") >= 1, (
+        "LORRAX_LANCZOS_REORTH=mgs did not restore the per-vector sweep")
 
 
 # --------------------------------------------------------------------------

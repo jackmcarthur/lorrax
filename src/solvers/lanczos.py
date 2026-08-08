@@ -12,11 +12,13 @@ Five variants:
   - block_lanczos_eig_jit:           Block Lanczos in lax.fori_loop
   - block_lanczos_eig_jit_converged: as above, Ritz-stability exit
 
-The three JIT-able variants share one **reorthogonalisation route** dial,
-``LORRAX_LANCZOS_REORTH`` (``mgs`` = shipped per-vector modified Gram-Schmidt,
-``cgs2`` = batched classical Gram-Schmidt applied twice).  The route changes
-the collective COUNT, not the basis window ``--n-reorth`` selects — see the
-route section below ``_block_alpha_stats``.
+The three JIT-able variants reorthogonalise by **batched classical
+Gram-Schmidt, applied twice** (``cgs2``) — every overlap of a sweep in one
+matrix product, so two collectives per iteration instead of ``j+1``.
+``LORRAX_LANCZOS_REORTH=mgs`` restores the legacy per-vector sweep for bisects
+and for reproducing pre-2026-08-08 runs.  The route changes the collective
+COUNT, never the basis window ``--n-reorth`` selects — see the route section
+below ``_block_alpha_stats``.
 
 Every one of them carries the **α-Hermiticity invariant** — see the section
 below ``import numpy as np``.  ``⟨q, Hq⟩`` is real for a Hermitian H, so the
@@ -393,11 +395,12 @@ def _block_alpha_stats(alpha_all):
 # Reorthogonalisation route — LORRAX_LANCZOS_REORTH
 # ===========================================================================
 #
-# WHY THIS DIAL EXISTS
-# --------------------
+# THE DEFAULT IS ``cgs2`` — BATCHED.  ``mgs`` IS THE LEGACY FALLBACK.
+# --------------------------------------------------------------------
 # Every solver below reorthogonalises the new Krylov direction against the
-# stored basis.  The shipped route (``mgs``) is a modified Gram-Schmidt sweep
-# written as a ``lax.fori_loop`` over ONE basis vector per trip:
+# stored basis.  Until 2026-08-08 the only route was ``mgs``: a modified
+# Gram-Schmidt sweep written as a ``lax.fori_loop`` over ONE basis vector per
+# trip:
 #
 #     for i in [max(0, j - n_reorth), j):
 #         z -= <q_i, z> q_i               # one dot + one axpy, per i
@@ -408,18 +411,24 @@ def _block_alpha_stats(alpha_all):
 # ``sum_{j=1..max_iter} j = max_iter(max_iter+1)/2``, i.e. **20 100 collectives
 # for a 200-iteration solve**, each moving 16 bytes.
 #
-# Measured on the Si 4x4x4 record deck at P=4 (2x2 mesh, xprof, 2026-08-08):
-# 20 100 ``all-reduce-start`` of ``c128[]`` at **0 % occupancy**, 212.83 ms of
-# GPU time — the largest single GPU-time item in the whole run — plus the local
-# machinery that wraps each one: 85.97 ms of ``input_reduce_fusion`` (the local
-# dot), 47.01 ms of ``loop_subtract_fusion`` (the axpy), 33.03 ms of
-# ``loop_add_fusion`` and 32.26 ms of ``wrapped_compare`` (the fori_loop's own
-# counter and predicate).  ~411 ms of GPU time to move 322 KiB and do ~41
-# MFLOP of arithmetic.  The flops really are free — 2 kFLOP per trip against
-# ~20.5 us of wall per trip is ~1e-8 of an A100's fp64 peak.  The cost is the
-# per-collective and per-kernel LATENCY, multiplied 20 100 times.
+# THE COST WAS NEVER THE FLOPS, WHICH IS THE WHOLE POINT.  Measured on the Si
+# 4x4x4 record deck at P=4 (2x2 mesh, xprof, 2026-08-08), per one of those
+# 20 100 trips: the local dot is 512 complex128 elements = 8 192 flops = **0.845
+# ns** of A100 fp64 arithmetic, and it is wrapped in **18.11 us** —
 #
-# THE BATCHED ROUTE (``cgs2``)
+#     all-reduce of a ``c128[]`` SCALAR (16 bytes)   8.82 us   0 % occupancy
+#     the local reduce kernel                        4.24 us
+#     the axpy kernel                                1.86 us
+#     the fori_loop's own counter + predicate        3.16 us
+#
+# — a factor of **21 000**, and the code asked for it 20 100 times: **364 ms of
+# GPU kernel time** plus 20 369 D2H staging copies (35.7 ms, fully exposed), to
+# do 165 MFLOP.  That is 0.005 % of peak.  It is pure LATENCY, not bandwidth:
+# 16 B in 8.82 us is 0.0018 GB/s, against 45.5 GB/s achieved by the matvec's own
+# 2.81 MiB all-gather in the SAME module — a 25 000x gap that no interconnect
+# tuning can close, because the message is 16 bytes.
+#
+# THE DEFAULT ROUTE (``cgs2``)
 # ----------------------------
 # Classical Gram-Schmidt applied TWICE ("twice is enough" — Giraud, Langou &
 # Rozloznik, Computing 74:85, 2005; the observation is Kahan's, via Parlett).
@@ -434,6 +443,23 @@ def _block_alpha_stats(alpha_all):
 # 16-byte scalar to an ``(max_iter+1,)`` complex128 vector (3 216 B at
 # max_iter=200) — still four orders of magnitude inside the latency floor of
 # any interconnect, so the wall is governed by the collective COUNT alone.
+#
+# MEASURED A/B on the record deck, P=4, 200 iters, full reorth (five interleaved
+# warm repeats per arm; the paired traces are cache-cold):
+#
+#     reorth all-reduces      20 100  ->    400     (50x)
+#     GPU events in the run  152 300  -> 13 000     (11.7x)
+#     D2H copies              20 369  ->     69     (295x)
+#     bse.eigensolve          4.209 s -> 3.431 s    (-18.5 %, zero overlap
+#                                                    across all ten legs)
+#     of which Krylov exec      ~2.0 s -> ~1.23 s   (-39 %)
+#     max |dlambda|, 20 excitons        9.77e-15 eV (owner gate 1e-9)
+#     max|V^H V - I|          4.2009e-06 on BOTH routes (identical: a
+#                             pre-existing property of this deck's output, NOT
+#                             of the route — reorth off gives 1.2478e-01)
+#
+# It does **4x the arithmetic and moves 4x the bytes** and is ~15x faster.  Both
+# costs were free; the call count never was.
 #
 # WHY CGS2 AND NOT ONE CLASSICAL PASS: a single classical pass loses
 # orthogonality like ``O(u * kappa(Q))`` and is unusable in Lanczos.  Two passes
@@ -459,15 +485,26 @@ def _block_alpha_stats(alpha_all):
 # ``--n-reorth`` changes, and columns past ``j`` need no mask because the
 # pre-allocated basis is exactly zero there.
 #
+# WHY ``mgs`` IS KEPT AT ALL, since ``cgs2`` is better on every axis measured:
+# it is the route every number in this codebase before 2026-08-08 was taken
+# with.  Keeping it one env var away means a bisect, a bit-reproduction of an
+# archived run, or a "did the reorth do this?" question costs one variable
+# instead of a revert.  It is a FALLBACK, not a tuning knob — there is no deck
+# on which it is the right choice.
+#
 # An UNKNOWN token REFUSES rather than falling back, for the reason
 # ``bse.bse_stack_matvec.matvec_opts`` gives at length: a perf dial that can be
-# misspelled into a silent no-op makes every A/B built on it void.
-_REORTH_KINDS = ("mgs", "cgs2")
+# misspelled into a silent no-op makes every A/B built on it void.  Note the
+# direction that matters now that ``cgs2`` is the default — a misspelling must
+# not silently hand you the SLOW route either.
+_REORTH_KINDS = ("cgs2", "mgs")
+_REORTH_DEFAULT = "cgs2"
+_REORTH_LEGACY = "mgs"
 _REORTH_ENV = "LORRAX_LANCZOS_REORTH"
 
 
 def reorth_kind(override: str | None = None) -> str:
-    """Resolve the reorthogonalisation route.  Default = the shipped ``mgs``.
+    """Resolve the reorthogonalisation route.  Default = batched ``cgs2``.
 
     ``override`` (a solver keyword) wins over the environment so tests can
     drive both routes in one process.  An unrecognised value raises.
@@ -475,14 +512,16 @@ def reorth_kind(override: str | None = None) -> str:
     raw = os.environ.get(_REORTH_ENV, "") if override is None else override
     tok = str(raw).strip().lower()
     if not tok:
-        return _REORTH_KINDS[0]
+        return _REORTH_DEFAULT
     if tok not in _REORTH_KINDS:
         raise ValueError(
             f"{_REORTH_ENV}={raw!r}: unknown reorthogonalisation route.  "
             f"Valid values are {list(_REORTH_KINDS)}, and unset/empty selects "
-            f"{_REORTH_KINDS[0]!r} (the shipped modified-Gram-Schmidt sweep).  "
-            f"Refusing rather than silently running the baseline under an "
-            f"optimised label.")
+            f"{_REORTH_DEFAULT!r} (batched classical Gram-Schmidt, twice — "
+            f"2*max_iter collectives).  {_REORTH_LEGACY!r} is the legacy "
+            f"per-vector sweep, kept for bisects and for reproducing archived "
+            f"runs, at max_iter(max_iter+1)/2 collectives.  Refusing rather "
+            f"than silently running one route under the other's label.")
     return tok
 
 
@@ -798,10 +837,10 @@ def lanczos_eig_jit(
         Random seed for initial vector.
     n_reorth : int
         Window size for partial reorthogonalization.
-    reorth : {'mgs', 'cgs2'} or None
+    reorth : {'cgs2', 'mgs'} or None
         Reorthogonalisation route; ``None`` reads ``LORRAX_LANCZOS_REORTH``
-        and falls back to the shipped ``'mgs'``.  See the route section above
-        — ``'cgs2'`` issues ``2 * max_iter`` collectives where ``'mgs'``
+        and defaults to ``'cgs2'``.  See the route section above — ``'cgs2'``
+        issues ``2 * max_iter`` collectives where the legacy ``'mgs'`` sweep
         issues ``max_iter (max_iter + 1) / 2``, over the SAME basis window.
 
     Returns
