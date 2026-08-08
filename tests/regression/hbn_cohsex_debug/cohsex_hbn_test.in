@@ -1,6 +1,9 @@
 # =====================================================================
 # hbn_cohsex_3d — bulk hexagonal BN 3x3x2, sys_dim=3, COHSEX.
-# DRAFT deck (fixture groundwork, 2026-08-07) — no reference frozen yet.
+# FROZEN 2026-08-07 (owner-authorized).  Reference: eqp_hbn_ref.dat.
+# Gates: test_hbn_matches_frozen_reference (the self-freeze) and
+#        test_hbn_mc_average_vcoul_body_moves_sigma (the negative
+#        control this fixture exists for).  See README.md.
 #
 # WHY THIS FIXTURE EXISTS.  Every 3D gate deck is Si FCC, whose bvec
 # satisfies bvec.T = P·bvec (P cyclic) — structurally BLIND to the
@@ -76,6 +79,12 @@ sigma_freq_debug_output = true
 fermi_reference = midgap
 
 wfn_file = WFN.h5
+# NO `output_file` KEY.  It is retired: the deck AS RUN at generation
+# still carried it and every run printed
+#   read_lorrax_input: 1 retired deck key(s) ... output_file: IGNORED
+#   -- the LORRAX-native eqp0 filename is now 'sigma_diag_file'
+# so dropping it cannot move a digit of the frozen reference, and the
+# gate run of THIS file is the check that it did not.
 sigma_diag_file = eqp_hbn_test.dat
 sigma_omega_h5_file = sigma_mnk.h5
 

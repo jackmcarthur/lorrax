@@ -7,7 +7,7 @@
    vxc_flag = .true.
    vxc_file = 'vxc.dat'
    vxc_diag_nmin = 1
-   vxc_diag_nmax = 40
+   vxc_diag_nmax = 80
    kih_flag = .true.
    kih_file = 'kih.dat'
    vscg_flag = .false.

@@ -18,6 +18,18 @@ reference.  What each pin uniquely covers:
   ~12 s.  A PURE SELF-FREEZE: measured 2109 meV MAE from BerkeleyGW
   (the band cut, not the centroid count — see the deck header).  It
   gates code changes fast; it says nothing about BGW agreement.
+* ``hbn_cohsex_3d`` — bulk hexagonal BN 3×3×2, the tree's only NON-CUBIC
+  3D deck.  Two gates, two fresh runs:
+    - ``test_hbn_matches_frozen_reference`` — the self-freeze;
+    - ``test_hbn_mc_average_vcoul_body_moves_sigma`` — the NEGATIVE
+      CONTROL, and the reason the fixture exists.  Si FCC satisfies
+      ``bvec.T = P·bvec`` for a cyclic signed permutation, so the
+      mini-BZ draw-convention bug class (358bb0b) is a pure RESEED
+      there and no Si gate can ever see it.  hBN's hexagonal ``bvec``
+      admits no such P: the same defect is a bias at z = 293.7.  This
+      deck also pins no ``vhead``, so it is the only pinned deck that
+      runs the native q→0 head ladder end to end.
+  NOT a BerkeleyGW anchor — no BGW run exists on this WFN.
 * ``cohsex`` — 2D static COHSEX on WFNsmall: the only IBZ-STORED WFN
   fixture (kgrid 3×3, nrk=4, ntran=12), so the ψ k-unfold and the
   12-op symmetry group run e2e ONLY here; also nspinor=2 static
@@ -298,6 +310,159 @@ def test_si_fast_matches_frozen_reference(si_fast_session):
     _assert_matches_reference(
         si_fast_session.run_dir / si_fast_session.output_name,
         _SI_FAST_REF, ("sigSX", "sigCOH", "sigTOT"), 1e-5, "si_cohsex_fast")
+
+
+# ---------------------------------------------------------------------------
+# hBN 3×3×2 — the NON-CUBIC deck.  Two gates, TWO runs (the second one is the
+# point).
+# ---------------------------------------------------------------------------
+
+HBN_DIR = REG / "hbn_cohsex_debug"
+_HBN_WFN = HBN_DIR / "WFN.h5"
+_HBN_REF = HBN_DIR / "eqp_hbn_ref.dat"
+
+#: Freeze tolerance for the hBN deck, in eV.  Same constant as the two Si
+#: freezes, chosen for the same documented reason.
+#:
+#: WHAT JUSTIFIES A TIGHT PIN HERE.  THREE independent runs of this deck agree
+#: BYTE FOR BYTE on the data lines (md5 `d4a7e4502a277e4aa203303042e792ec`):
+#: the two 2×2-mesh / 4-process runs that produced the reference, and a
+#: 1×1-mesh / 1-process reproduction made at the freeze — which is the mesh
+#: THIS gate runs on, because tests/conftest.py pins one GPU per process.
+#: `delta_run2_vs_run1.txt` records every column MAE, max|Δ| and rms at
+#: exactly 0.000000 meV over all 1440 rows.
+#:
+#: WHY NOT 1e-6.  Because that is the exact magnitude of the cross-machine ULP
+#: that forced the `_XMACHINE_ATOL_EV` ruling above: a 6-decimal `.dat` at
+#: atol=1e-6 has no room for one unit in the last printed digit.  Pinning
+#: there would re-open a ping-pong this tree closed on 2026-08-07.
+#:
+#: WHY IT IS STILL TIGHT WHERE IT MATTERS.  1e-5 eV = 0.01 meV is **40×
+#: below this deck's own Monte-Carlo seed width** (head-draw seed 42→43 moves
+#: sigTOT by 0.396 meV MAE / 1.127 meV max) and **1400× below the knob this
+#: fixture exists to watch** (13.995 meV MAE).  Nothing the fixture was built
+#: to see can hide under it — and byte-identity, not this number, is the
+#: primary check: `_assert_matches_reference` returns early on an exact text
+#: match and says so.
+_HBN_ATOL_EV = 1e-5
+
+_HBN_SKIP_REASON = (
+    f"hBN fixture inputs are missing ({_HBN_WFN} not found).  They are "
+    f"TRACKED in git like every other regression fixture's binaries, so on a "
+    f"full checkout this never fires — a skip here means a partial or "
+    f"sparse checkout, not an optional gate.")
+
+
+@pytest.mark.regression
+@pytest.mark.skipif(not _HBN_WFN.exists(), reason=_HBN_SKIP_REASON)
+def test_hbn_matches_frozen_reference(hbn_session):
+    """hBN non-cubic deck vs its own frozen output.  NOT a BerkeleyGW anchor.
+
+    The tree's only end-to-end deck on a cell where the mini-BZ head-draw
+    convention is BIAS-sensitive.  Si FCC satisfies ``bvec.T = P·bvec`` for a
+    cyclic signed permutation, so on Si the pre-358bb0b transposed draw is a
+    pure reseed (measured z = 3.0, consistent with noise); hBN's hexagonal
+    ``bvec`` admits no such P and the same defect is a bias at z = 293.7,
+    55.8% of the whole mc-average correction.  This deck also pins no
+    ``vhead``/``whead_0freq``, so it is the only pinned deck that runs the
+    native q→0 head ladder end to end.
+
+    A SELF-FREEZE.  No BerkeleyGW run exists on this WFN; see README.md.
+    """
+    _assert_matches_reference(
+        hbn_session.run_dir / hbn_session.output_name,
+        _HBN_REF, ("sigSX", "sigCOH", "sigTOT"), _HBN_ATOL_EV, "hbn_cohsex_3d")
+
+
+# Liveness floor for the mc_average_vcoul_body control, in meV of sigTOT MAE.
+#
+# MEASURED at the freeze, single-variable A/B on this exact deck
+# (delta_armA_mcavg_false.txt):
+#
+#     column     MAE       max|Δ|     signed mean      rms
+#     sigSX      7.836     41.797       -5.616       15.294
+#     sigCOH    17.217     50.333        9.932       20.304
+#     sigTOT    13.995     49.732        4.316       17.422
+#     VH         0.000      0.000        0.000        0.000
+#     Eo         0.000      0.000        0.000        0.000
+#
+# and the MC seed width of the same column (head-draw seed 42→43) is 0.396 meV
+# MAE / 1.127 meV max.  5.0 sits 12.6× above the seed noise, so seed or
+# default drift can never flake this cell, and 2.8× below the measured effect,
+# so the knob going dead cannot sneak past.  It is a LIVENESS pin, not a value
+# pin — the value is what the frozen reference is for.  DO NOT tighten it
+# toward 13.995: that would make this cell a second freeze and it would start
+# failing for reasons that have nothing to do with the head table being live.
+_HBN_MCAVG_MIN_MAE_MEV = 5.0
+
+
+@pytest.mark.regression
+@pytest.mark.skipif(not _HBN_WFN.exists(), reason=_HBN_SKIP_REASON)
+def test_hbn_mc_average_vcoul_body_moves_sigma(hbn_session,
+                                               hbn_mcavg_false_session):
+    """THE NEGATIVE CONTROL — the cell this whole fixture exists for.
+
+    A frozen-reference gate says "the numbers did not change".  It does NOT
+    say "the mini-BZ head average is still LIVE and still reachable on a cell
+    whose lattice can see it".  If ``build_v_head_miniBZ_avg_3d`` were
+    silently disconnected — the transpose-bug class, or any future edit that
+    routes around it — a re-freeze would pin the wrong numbers and stay green
+    forever, exactly as Si has been structurally unable to notice for the
+    whole life of this suite.
+
+    So this cell constructs the case where the check comes out FALSE: run the
+    same deck with ``mc_average_vcoul_body`` flipped and require Σ to MOVE.
+    Both arms are live runs of the same code on the same machine at the same
+    moment, differing in one deck key — the single-variable A/B, not a
+    comparison against a file frozen at some other time.
+    """
+    ref_rows = parse_eqp_rows(
+        hbn_session.run_dir / hbn_session.output_name,
+        ("sigSX", "sigCOH", "sigTOT"))
+    arm_rows = parse_eqp_rows(
+        hbn_mcavg_false_session.run_dir / hbn_mcavg_false_session.output_name,
+        ("sigSX", "sigCOH", "sigTOT"))
+    assert arm_rows.shape == ref_rows.shape, (
+        f"control arm row count {arm_rows.shape} != reference run "
+        f"{ref_rows.shape} — the two arms are not the same calculation")
+    # Guard the comparison itself: rows must be the same (k, band) in the same
+    # order, or every MAE below is measuring a permutation instead of a knob.
+    np.testing.assert_array_equal(
+        arm_rows[:, :2], ref_rows[:, :2],
+        err_msg="control arm k/band grid differs from the reference run")
+    assert ref_rows.shape[0] == 1440, (
+        f"expected 18 k × 80 bands = 1440 rows, parsed {ref_rows.shape[0]} — "
+        f"a truncated parse would make the MAE below vacuous")
+
+    d_mev = np.abs(arm_rows[:, 2:5] - ref_rows[:, 2:5]) * 1e3
+    mae = d_mev.mean(axis=0)
+    mx = d_mev.max(axis=0)
+    _report_headroom(
+        "hbn_mcavg_control",
+        "mc_average_vcoul_body true->false moved "
+        f"sigSX {mae[0]:.3f}/{mx[0]:.3f}, sigCOH {mae[1]:.3f}/{mx[1]:.3f}, "
+        f"sigTOT {mae[2]:.3f}/{mx[2]:.3f} meV (MAE/max); freeze measured "
+        f"13.995/49.732 on sigTOT, floor {_HBN_MCAVG_MIN_MAE_MEV}")
+
+    assert mae[2] > _HBN_MCAVG_MIN_MAE_MEV, (
+        f"mc_average_vcoul_body = false moved sigTOT by only {mae[2]:.4f} meV "
+        f"MAE (max {mx[2]:.4f}), under the {_HBN_MCAVG_MIN_MAE_MEV} meV "
+        f"floor.  The mini-BZ head average is NOT reaching Sigma on a cell "
+        f"that can see it.  Measured 13.995 meV MAE / 49.732 meV max when "
+        f"this fixture was frozen (2026-08-07), against a Monte-Carlo seed "
+        f"width of 0.396 meV MAE.  Do NOT lower this floor to make the cell "
+        f"green — find what disconnected the head table.")
+
+    # The knob acts through the Coulomb head table and NOWHERE ELSE.  VH is a
+    # mean-field column; it measured EXACTLY 0.000000 across the arm at the
+    # freeze, so a moving VH means the flip perturbed something it has no
+    # business touching and the MAE above is not measuring what it claims.
+    vh = float(np.abs(arm_rows[:, 5] - ref_rows[:, 5]).max())
+    assert vh <= _HBN_ATOL_EV, (
+        f"mc_average_vcoul_body moved VH by {vh:.3e} eV (measured exactly "
+        f"0.000000 at the freeze).  This knob touches the Coulomb head table, "
+        f"not the mean field — the Sigma delta above is not a clean "
+        f"single-variable measurement.")
 
 
 @pytest.mark.regression

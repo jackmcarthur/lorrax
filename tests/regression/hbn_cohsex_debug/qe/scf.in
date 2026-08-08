@@ -8,7 +8,10 @@
    ibrav = 0
    nat = 4
    ntyp = 2
-   nbnd = 12
+   noncolin = .true.
+   lspinorb = .false.
+   no_t_rev = .true.
+   nbnd = 24
 /
 &electrons
    electron_maxstep = 100
