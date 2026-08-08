@@ -1139,3 +1139,191 @@ def test_a_wedge_that_is_the_whole_bz_is_labelled_full():
         assert np.array_equal(np.asarray(got), X)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Arm 8 — the μ PAD does not reach disk (SHARDING_RULES §2)
+# ---------------------------------------------------------------------------
+# THE RULE, AND WHY IT BINDS THIS FORMAT.  The producer bakes the μ pad into
+# ``sym_perm``/``L_table`` once at construction — identity tail on the
+# permutation, zero tail on the wrap — and the pad width is
+# ``padded_mu_extent(n_rmu, device_count())``.  It is DEVICE-COUNT-DEPENDENT,
+# and SHARDING_RULES §2 forbids those in a restart artifact for the reason a
+# restart artifact exists: a file written on four ranks must read on eight.
+# Every tensor in the restart format already obeys that rule
+# (``tagged_arrays._mu_logical_shape`` clips each one on the way out).  The
+# unfold tables are new, and they must obey it too.
+#
+# So: the WRITER strips, having first asserted the tail really is a pad, and
+# the READER re-applies its OWN.  The three refusals below are the assertion,
+# and they are the point — a "pad" that is not one is real structure, and
+# stripping it would produce a file this format could not invert.
+
+
+def _pad(arm, n_pad):
+    """``arm``'s tables and wedge, re-padded to ``n_pad`` the way a producer
+    would: identity tail on the permutation, zero tail on the wrap and on
+    the tensor."""
+    n_log = arm.n_mu
+    tail = np.broadcast_to(np.arange(n_log, n_pad, dtype=np.int32),
+                           (arm.tables.sym_perm.shape[0], n_pad - n_log))
+    perm = np.concatenate([np.asarray(arm.tables.sym_perm, np.int32), tail],
+                          axis=1)
+    L = np.asarray(arm.tables.L_table)
+    Lp = np.concatenate(
+        [L, np.zeros((L.shape[0], n_pad - n_log, 3), dtype=L.dtype)], axis=1)
+    tables = QS.QirrTables(arm.tables.irr_idx_q, arm.tables.sym_idx_q,
+                           arm.tables.q_irr_frac, perm, Lp,
+                           arm.tables.n_sym_spatial)
+    X = np.zeros((arm.X_ibz.shape[0], n_pad, n_pad), dtype=arm.X_ibz.dtype)
+    X[:, :n_log, :n_log] = arm.X_ibz
+    return tables, X
+
+
+def test_the_pad_is_stripped_on_write_and_the_file_states_the_logical_extent():
+    """The file must not be able to say how many devices wrote it."""
+    arm = trs_arm("gnppm_debug")
+    n_pad = arm.n_mu + 4
+    tables, X = _pad(arm, n_pad)
+    d, path = _tmp_h5("padstrip")
+    try:
+        hdr = QS.write_qirr_tensor(path, "V_qmunu", X, tables=tables,
+                                   closure_verdict=arm.verdict,
+                                   n_rmu_logical=arm.n_mu, mode="w")
+        assert hdr.n_rmu_logical == arm.n_mu
+        import h5py
+        with h5py.File(path, "r") as f:
+            assert f["V_qmunu"].shape[-1] == arm.n_mu, (
+                f"the pad reached disk: dataset μ extent "
+                f"{f['V_qmunu'].shape[-1]} against logical {arm.n_mu}")
+            assert int(f["V_qmunu"].attrs["qirr_n_rmu_logical"]) == arm.n_mu
+            g = f["V_qmunu__qirr"]
+            assert g["sym_perm"].shape[-1] == arm.n_mu
+            assert g["L_table"].shape[1] == arm.n_mu
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_padded_write_reads_back_bit_identical_at_a_DIFFERENT_pad():
+    """THE CLAIM THIS ARM EXISTS FOR: write at one device count, read at
+    another, and the unfold is still the identity it is on the unpadded
+    path.
+
+    Written with a pad of +4 and read with a pad of +8 — two different
+    device counts, one file.  The read-back is compared against
+    ``unfold_isdf_operator`` on the +8-padded wedge, element-wise, which is
+    exactly what the uncompressed path would have held in memory on the
+    reading side.  If the pad were stored rather than reconstructed, this
+    is the cell that would fail.
+    """
+    import jax
+    import jax.numpy as jnp
+    mesh = _mesh_here()
+    arm = trs_arm("gnppm_debug")
+    tables_w, X_w = _pad(arm, arm.n_mu + 4)
+    tables_r, X_r = _pad(arm, arm.n_mu + 8)
+    d, path = _tmp_h5("padcross")
+    try:
+        QS.write_qirr_tensor(path, "V_qmunu", X_w, tables=tables_w,
+                             closure_verdict=arm.verdict,
+                             n_rmu_logical=arm.n_mu, mode="w")
+        got, hdr = QS.read_tensor(path, "V_qmunu", mesh_xy=mesh,
+                                  n_mu_padded=arm.n_mu + 8)
+        assert hdr.q_storage == "ibz" and hdr.was_unfolded
+        assert got.shape[-1] == arm.n_mu + 8
+        ref = unfold_isdf_operator(
+            jnp.asarray(X_r), irr_idx=tables_r.irr_idx_q,
+            sym_idx=tables_r.sym_idx_q, sym_perm=tables_r.sym_perm,
+            L_table=tables_r.L_table, q_irr_frac=tables_r.q_irr_frac,
+            mesh_xy=mesh, n_sym_spatial=int(tables_r.n_sym_spatial))
+        d_max = _shard_max_abs_diff(got, ref)
+        assert d_max == 0.0, (
+            f"read-back at pad +8 differs from the unfold at pad +8 by "
+            f"{d_max:.3e}; the round trip is supposed to be an IDENTITY "
+            f"across device counts, which is the whole reason the pad is "
+            f"reconstructed rather than stored")
+        assert_offdiag_elementwise(got, ref, "cross-pad identity")
+        # And the pad rows really are pad: exactly zero, on both axes.
+        n = arm.n_mu
+        blk = np.asarray(jax.device_get(got))
+        assert not np.any(blk[:, n:, :]) and not np.any(blk[:, :, n:])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_permutation_tail_that_is_not_the_identity_refuses():
+    """RED TWIN 1.  A non-identity tail is not a pad — it is a table that
+    addresses real centroids past the declared logical extent, and
+    stripping it would discard a permutation this format then could not
+    invert."""
+    arm = trs_arm("gnppm_debug")
+    tables, X = _pad(arm, arm.n_mu + 4)
+    perm = np.array(tables.sym_perm)
+    perm[0, arm.n_mu] = 0                       # tail no longer identity
+    bad = QS.QirrTables(tables.irr_idx_q, tables.sym_idx_q,
+                        tables.q_irr_frac, perm, tables.L_table,
+                        tables.n_sym_spatial)
+    d, path = _tmp_h5("badperm")
+    try:
+        with pytest.raises(ValueError, match="not the identity pad"):
+            QS.write_qirr_tensor(path, "V_qmunu", X, tables=bad,
+                                 closure_verdict=arm.verdict,
+                                 n_rmu_logical=arm.n_mu, mode="w")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_nonzero_wrap_tail_refuses():
+    """RED TWIN 2.  A non-zero ``L_table`` tail carries umklapp phase that
+    stripping would drop — silently, and only on the q's that wrap."""
+    arm = trs_arm("gnppm_debug")
+    tables, X = _pad(arm, arm.n_mu + 4)
+    L = np.array(tables.L_table)
+    L[0, arm.n_mu, 0] = 1
+    bad = QS.QirrTables(tables.irr_idx_q, tables.sym_idx_q,
+                        tables.q_irr_frac, tables.sym_perm, L,
+                        tables.n_sym_spatial)
+    d, path = _tmp_h5("badL")
+    try:
+        with pytest.raises(ValueError, match=r"L_table's μ tail"):
+            QS.write_qirr_tensor(path, "V_qmunu", X, tables=bad,
+                                 closure_verdict=arm.verdict,
+                                 n_rmu_logical=arm.n_mu, mode="w")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_tensor_whose_pad_rows_are_not_zero_refuses():
+    """RED TWIN 3.  Pad rows are zeros BY CONSTRUCTION; anything else in
+    them is real data, and stripping would delete it.  This is the arm
+    that makes the strip safe rather than merely convenient."""
+    arm = trs_arm("gnppm_debug")
+    tables, X = _pad(arm, arm.n_mu + 4)
+    X[0, arm.n_mu, 0] = 1e-30                   # far below any tolerance
+    d, path = _tmp_h5("badtail")
+    try:
+        with pytest.raises(ValueError, match="NOT exactly zero"):
+            QS.write_qirr_tensor(path, "V_qmunu", X, tables=tables,
+                                 closure_verdict=arm.verdict,
+                                 n_rmu_logical=arm.n_mu, mode="w")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_an_unpadded_write_is_byte_identical_to_before_this_arm_existed():
+    """The default path did not move.  ``n_rmu_logical=None`` is what every
+    caller wrote before the pad question existed, and it must still produce
+    the same file — the stamped logical extent then simply equals the
+    stored one."""
+    mesh = _mesh_here()
+    arm = trs_arm("gnppm_debug")
+    d, path = _tmp_h5("nopad")
+    try:
+        hdr = QS.write_qirr_tensor(path, "V_qmunu", arm.X_ibz,
+                                   tables=arm.tables,
+                                   closure_verdict=arm.verdict, mode="w")
+        assert hdr.n_rmu_logical == arm.n_mu == hdr.n_mu
+        got, _ = QS.read_tensor(path, "V_qmunu", mesh_xy=mesh)
+        assert _shard_max_abs_diff(got, arm.kernel(mesh)) == 0.0
+    finally:
+        shutil.rmtree(d, ignore_errors=True)

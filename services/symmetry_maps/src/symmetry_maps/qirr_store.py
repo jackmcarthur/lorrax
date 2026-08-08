@@ -43,6 +43,21 @@ the failure a cross-check exists to catch.  A file carrying NO q_irr attrs
 at all is read as ``q_storage="full"`` and returned unchanged, so every
 restart file written before this format keeps working.
 
+THE μ PAD NEVER REACHES DISK (SHARDING_RULES §2).  The producer bakes a
+μ pad into ``sym_perm``/``L_table`` once at construction — identity tail
+on the permutation, zero tail on the wrap — and its width is
+``padded_mu_extent(n_rmu, device_count())``.  That is a
+DEVICE-COUNT-DEPENDENT quantity, and a restart artifact may not carry
+one, for the reason restart artifacts exist: a file written on four ranks
+must read on eight.  Every tensor in the restart format already obeys
+that rule; the unfold tables are new and obey it here.  ``write_qirr_tensor``
+takes ``n_rmu_logical``, ASSERTS the tail really is a pad — identity
+permutation, zero wrap, zero tensor rows, each refusing separately —
+strips it, and stamps the logical extent.  ``read_tensor`` takes
+``n_mu_padded`` and re-applies the READER's own.  The pad is
+reconstructed, never stored, which is what makes the round trip an
+identity ACROSS device counts and not merely within one.
+
 WHAT THIS MODULE IS NOT.  It is file format only.  It does not know where
 ``W0_qmunu`` is produced or consumed and it touches no gw/bse call site;
 wiring it into the producers is a separate change.  Everything here is
@@ -94,6 +109,7 @@ _OWNED_ATTRS = (
     _VERSION_ATTR, "q_storage", "qirr_table_hash", "qirr_centroid_hash",
     "qirr_closure_verdict", "qirr_closure_worst_residual",
     "qirr_closure_tol", "qirr_n_q_full", "qirr_data_ready",
+    "qirr_n_rmu_logical",
 )
 
 #: Table name -> the dtype it is canonicalised to on write AND hashed as.
@@ -164,6 +180,102 @@ class QirrTables:
             n_sym_spatial=int(self.n_sym_spatial),
         )
 
+    def logical(self, n_rmu_logical: int) -> "QirrTables":
+        """Strip the μ PAD, asserting first that the tail really is one.
+
+        WHY THE PAD MUST NOT REACH DISK.  The producer bakes the μ pad
+        into ``sym_perm``/``L_table`` once at construction — an identity
+        tail on the permutation, a zero tail on the wrap — and the pad
+        width is ``padded_mu_extent(n_rmu, device_count())``.  It is a
+        DEVICE-COUNT-DEPENDENT quantity, and SHARDING_RULES §2 forbids
+        those in a restart artifact for the obvious reason: a file
+        written on four ranks must read on eight.  Everything else in the
+        restart format already obeys that rule (``_mu_logical_shape``
+        clips every tensor on the way out); the unfold tables are new and
+        must obey it too.
+
+        THE ASSERTION IS FREE CORRUPTION DETECTION, which is why it is
+        here and not left to the caller.  Three things must hold, and
+        each fails differently:
+
+        * the permutation tail is the identity — if it is not, this is
+          not a pad, it is a table that genuinely addresses more
+          centroids than the caller claims, and stripping it would throw
+          away real structure;
+        * the wrap tail is zero — same argument for ``L_table``;
+        * the logical block maps into ITSELF.  This follows from the
+          first point for a bijection, and is asserted anyway because it
+          is the property that makes stripping meaning-preserving, and a
+          property nobody states is a property nobody notices losing.
+        """
+        n_log = int(n_rmu_logical)
+        perm = np.asarray(self.sym_perm)
+        L = np.asarray(self.L_table)
+        n_pad = int(perm.shape[-1])
+        if n_log > n_pad:
+            raise ValueError(
+                f"qirr_store: n_rmu_logical={n_log} exceeds the table "
+                f"extent {n_pad}; the logical set cannot be larger than "
+                f"the padded one.")
+        if n_log == n_pad:
+            return self
+        tail = perm[:, n_log:]
+        want = np.broadcast_to(np.arange(n_log, n_pad, dtype=tail.dtype),
+                               tail.shape)
+        if not np.array_equal(tail, want):
+            bad = int(np.argmax(np.any(tail != want, axis=0)))
+            raise ValueError(
+                f"qirr_store: sym_perm's μ tail is not the identity pad — "
+                f"column {n_log + bad} of the padded extent {n_pad} reads "
+                f"{tail[:, bad].tolist()[:4]}..., expected all "
+                f"{n_log + bad}.  Either n_rmu_logical={n_log} is wrong or "
+                f"these tables address real centroids past it; stripping "
+                f"would silently discard a permutation this format then "
+                f"could not invert.")
+        if L.shape[1] > n_log and np.any(L[:, n_log:] != 0):
+            raise ValueError(
+                f"qirr_store: L_table's μ tail past {n_log} is not zero, so "
+                f"it is not the pad the identity tail claimed it was.  The "
+                f"umklapp phase those wraps carry would be dropped.")
+        head = perm[:, :n_log]
+        if head.size and int(head.max()) >= n_log:
+            raise ValueError(
+                f"qirr_store: sym_perm maps a logical centroid to index "
+                f"{int(head.max())}, outside the logical block [0, "
+                f"{n_log}).  The logical set is not closed under its own "
+                f"permutation, so it cannot be stored without the pad.")
+        return dataclasses.replace(
+            self, sym_perm=head, L_table=L[:, :n_log])
+
+    def padded(self, n_rmu_padded: int) -> "QirrTables":
+        """Re-apply a μ pad of the READER's width — the inverse of above.
+
+        The reader's device count is not the writer's, so the pad it
+        needs is its own: identity tail on the permutation, zero tail on
+        the wrap, exactly the shape the producer bakes in.  Reconstructed
+        rather than stored, because a stored pad is the device-dependent
+        thing :meth:`logical` exists to keep off disk.
+        """
+        n_pad = int(n_rmu_padded)
+        perm = np.asarray(self.sym_perm)
+        n_log = int(perm.shape[-1])
+        if n_pad == n_log:
+            return self
+        if n_pad < n_log:
+            raise ValueError(
+                f"qirr_store: cannot pad tables of extent {n_log} down to "
+                f"{n_pad}.")
+        L = np.asarray(self.L_table)
+        tail = np.broadcast_to(
+            np.arange(n_log, n_pad, dtype=perm.dtype),
+            (perm.shape[0], n_pad - n_log))
+        return dataclasses.replace(
+            self,
+            sym_perm=np.concatenate([perm, tail], axis=1),
+            L_table=np.concatenate(
+                [L, np.zeros((L.shape[0], n_pad - n_log, L.shape[2]),
+                             dtype=L.dtype)], axis=1))
+
     def digest(self) -> str:
         """``'sha256:<hex>'`` over the canonicalised tables, in a fixed order.
 
@@ -207,6 +319,11 @@ class QirrHeader:
     n_q_on_disk: int
     n_q_full: int | None
     n_mu: int | None
+    #: The LOGICAL μ extent stated on disk.  Equal to ``n_mu`` for a file
+    #: written without a pad; smaller than the producer's in-memory extent
+    #: whenever it padded for its device count.  ``None`` on a legacy
+    #: file, which had no tables and therefore no pad question.
+    n_rmu_logical: int | None
     centroid_hash: str | None
     table_hash: str | None
     closure_verdict: str | None
@@ -423,6 +540,7 @@ def write_qirr_tensor(
     tau=None,
     fft_grid=None,
     tol: float = CLOSURE_TOL_DEFAULT,
+    n_rmu_logical: int | None = None,
     provenance: dict | None = None,
     data_ready: bool = True,
     mode: str = "a",
@@ -457,6 +575,16 @@ def write_qirr_tensor(
         ``centroids_frac`` is given.  ``tnp``/``tau`` keep that function's
         exclusive-keyword contract, so the 2π cannot be applied twice or
         not at all on this path either.
+    n_rmu_logical
+        The LOGICAL centroid count, when ``X_ibz`` and ``tables`` carry
+        the producer's μ pad.  The pad width is
+        ``padded_mu_extent(n_rmu, device_count())`` — a
+        DEVICE-COUNT-DEPENDENT quantity, which SHARDING_RULES §2 forbids
+        in a restart artifact because a file written on four ranks must
+        read on eight.  Given this, the writer ASSERTS the tail really is
+        a pad (identity on the permutation, zero on the wrap, zero on the
+        tensor) and then strips it, stamping the logical extent so a
+        reader can re-apply its OWN.  Omit it when nothing is padded.
     provenance
         Extra attrs to stamp, kin_ion.h5 style (the WFN checksum, the deck
         name, whatever the caller can prove).  Keys are prefixed
@@ -510,6 +638,32 @@ def write_qirr_tensor(
         raise ValueError(
             f"qirr_store: expected a (n_q_ibz, n_mu, n_mu) tensor; got "
             f"{X.shape}")
+    # THE μ PAD COMES OFF HERE, TENSOR AND TABLES TOGETHER.  Stripping one
+    # and not the other is the failure this ordering forbids: the two
+    # extents are cross-checked by ``_validate`` two statements down, so a
+    # half-strip REFUSES rather than writing a file whose tables address
+    # more centroids than its tensor has.
+    if n_rmu_logical is not None:
+        n_log = int(n_rmu_logical)
+        n_pad = int(X.shape[-1])
+        if n_log > n_pad:
+            raise ValueError(
+                f"qirr_store: n_rmu_logical={n_log} exceeds the tensor's "
+                f"μ extent {n_pad}.")
+        if n_log < n_pad:
+            worst = max(
+                float(np.abs(X[:, n_log:, :]).max(initial=0.0)),
+                float(np.abs(X[:, :, n_log:]).max(initial=0.0)))
+            if worst != 0.0:
+                raise ValueError(
+                    f"qirr_store: the tensor's μ rows/columns past "
+                    f"{n_log} are NOT exactly zero (worst |value| "
+                    f"{worst:.3e}), so they are not the pad they were "
+                    f"declared to be.  Pad rows are zeros by "
+                    f"construction; anything else here is real data that "
+                    f"stripping would delete.")
+            X = np.ascontiguousarray(X[:, :n_log, :n_log])
+        tables = tables.logical(n_log)
     can = tables.canonical()
     q_storage = _validate(can, int(X.shape[0]), int(X.shape[1]))
     table_hash = can.digest()
@@ -530,6 +684,7 @@ def write_qirr_tensor(
         ds.attrs[_VERSION_ATTR] = np.int64(QIRR_FORMAT_VERSION)
         ds.attrs["q_storage"] = q_storage
         ds.attrs["qirr_n_q_full"] = np.int64(can.n_q_full)
+        ds.attrs["qirr_n_rmu_logical"] = np.int64(can.n_mu)
         ds.attrs["qirr_table_hash"] = table_hash
         ds.attrs["qirr_centroid_hash"] = closure_verdict.centroid_hash
         ds.attrs["qirr_closure_verdict"] = closure_verdict.as_attr()
@@ -592,6 +747,8 @@ def _header_from(ds, tgrp, tables):
         n_q_on_disk=int(ds.shape[0]),
         n_q_full=int(ds.attrs["qirr_n_q_full"]),
         n_mu=int(ds.shape[-1]),
+        n_rmu_logical=int(ds.attrs.get("qirr_n_rmu_logical",
+                                       int(ds.shape[-1]))),
         centroid_hash=_attr_str(ds, "qirr_centroid_hash"),
         table_hash=_attr_str(ds, "qirr_table_hash"),
         closure_verdict=_attr_str(ds, "qirr_closure_verdict"),
@@ -640,6 +797,7 @@ def read_tensor(
     *,
     mesh_xy=None,
     unfold: bool = True,
+    n_mu_padded: int | None = None,
     require_persisted: bool = True,
     expect_centroid_hash: str | None = None,
     expect_table_hash: str | None = None,
@@ -672,6 +830,15 @@ def read_tensor(
     unfold
         ``False`` returns the stored wedge itself, with the same header.
         For a caller that wants to hold the small array.
+    n_mu_padded
+        Re-apply a μ pad of THIS width — the reader's own, from
+        ``padded_mu_extent(n_rmu, device_count())`` — before unfolding.
+        The file stores the LOGICAL extent (SHARDING_RULES §2: a restart
+        artifact may not carry a device-count-dependent quantity), so a
+        consumer that wants the padded in-memory layout asks for it here
+        rather than finding the writer's pad and hoping it matches.  The
+        pad is reconstructed, never stored: identity tail on the
+        permutation, zero tail on the wrap and on the tensor.
     require_persisted
         Refuse when ``qirr_data_ready`` is False.  Default True: a
         zero-filled placeholder must never read as data.  Legacy files
@@ -701,6 +868,7 @@ def read_tensor(
                 q_storage="full", format_version=None,
                 n_q_on_disk=int(ds.shape[0]), n_q_full=None,
                 n_mu=int(ds.shape[-1]) if ds.ndim >= 1 else None,
+                n_rmu_logical=None,
                 centroid_hash=None, table_hash=None, closure_verdict=None,
                 closure_worst_residual=None, closure_tol=None,
                 data_ready=None, provenance={})
@@ -772,6 +940,17 @@ def read_tensor(
 
     if not unfold or shape_says == "full":
         return raw, header
+
+    if n_mu_padded is not None and int(n_mu_padded) != int(can.n_mu):
+        pad = int(n_mu_padded) - int(can.n_mu)
+        if pad < 0:
+            raise ValueError(
+                f"qirr_store: {name!r} stores {can.n_mu} logical centroids "
+                f"and the caller asked to pad DOWN to {n_mu_padded}.  The "
+                f"pad only ever grows the extent; a smaller request means "
+                f"the caller and the file disagree about the centroid set.")
+        raw = np.pad(np.asarray(raw), ((0, 0), (0, pad), (0, pad)))
+        can = can.padded(int(n_mu_padded))
 
     if mesh_xy is None:
         raise ValueError(
