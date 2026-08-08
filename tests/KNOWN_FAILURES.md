@@ -365,8 +365,10 @@ constructing every input of the capability gate.  The CPU-platform arm's
 red twin is the load-bearing one: without it that cell stays green on any
 machine with no CUDA library to find, which is every WSL leg.
 
-**The ABORT itself is a SECOND defect and it is registered, not fixed —
-see L1.**
+**The ABORT itself was a SECOND defect.  It is now FIXED — see L1, and
+note that the mixed state it feared is now survivable: the CPU-platform
+leg is green with this capability gate DISABLED, against an abort with
+the pre-fix `.so` pair.**
 
 ### **B2 — FIXED by `f7c1b17`: the xdist CONTROLLER narrowed the workers' preset**
 
@@ -526,46 +528,131 @@ crash was only ever produced multi-rank.  Guard 2d says so, and a contract
 cell pins it — this package refuses what someone has watched fail, not
 what seems likely.
 
-### **L1 — the two platform `.so`s cross-wire their phdf5 through RTLD_GLOBAL** (latent, registered by B1's fix)
+### **L1 — FIXED by `fix/ffi-odr-2026-08-08`: the two platform `.so`s cross-wired their phdf5 through RTLD_GLOBAL**
 
 | | |
 |---|---|
-| tests | none can reach it today; it is what B1's ABORT *was* |
+| tests | `services/distrib_la/tests/test_so_acceptance.py` check 6 + `test_each_library_exports_only_its_sanctioned_surface` + `test_the_shared_symbol_check_can_fail` (red twin), and `src/ffi/cpp/gate_one_odr.py` (GATE 10, a live CUDA process doing host phdf5 work) |
 | class | (b) pre-existing, structural — a cross-`.so` ODR violation in the C++ |
-| covering leg | none.  The B1 fix keeps it LATENT for host-only processes by never putting one into the mixed state; it is NOT latent for a CUDA-capable process that also does host phdf5 work |
+| covering leg | THREE, all on Perlmutter, artifacts under `/pscratch/sd/j/jackm/svc_ffi_odr/_reports/`: the acceptance tier (12/12), the four-arm `tests/test_file_io.py` mixed-process A/B, and GATE 10 |
 
-`liblorrax_ffi.so` and `liblorrax_ffi_host.so` collide on far more than
-`libslate`/`libblaspp`.  MEASURED 2026-08-07, `nm -D --defined-only` on the
-two BUILD_NOTES-pinned builds (deployed device lib; `build_host_h200`,
-md5 `4c4422b8…`): **sixteen symbol names are DEFINED BY BOTH** — the nine
-C-linkage `lrx_phdf5_*` / `lrx_slate_*` entry points and seven mangled
-`lorrax_ffi::phdf5::{open_ctx,close_ctx,ensure_dataset,ensure_read_buf,
-ensure_pinned,ensure_mpi_initialized,open_dataset_ro}`.  Both files are
-dlopened `RTLD_GLOBAL`, so once both are open the FIRST one answers those
-names for BOTH — including for the other library's own internal calls.
+**WHAT IT WAS.**  Both libraries are dlopened `RTLD_GLOBAL`, and ld.so
+answers a name from the FIRST object that defined it — for the whole
+process, INCLUDING for the second library's own internal calls.  MEASURED
+2026-08-07, `nm -D --defined-only` on the two BUILD_NOTES-pinned builds
+(deployed device lib; `build_host_h200`, md5 `4c4422b8…`): **259 names
+defined by both, 25 of them LORRAX's own** — the nine C-linkage
+`lrx_phdf5_*` / `lrx_slate_*` entry points and SIXTEEN mangled
+`lorrax_ffi::phdf5::*`.  The row as originally written said seven mangled;
+the measurement says sixteen — `open_ctx`, `close_ctx`, `ensure_dataset`,
+`open_dataset_ro`, `ensure_pinned`, `ensure_read_buf`,
+`ensure_mpi_initialized`, plus `env_flag`, **`~PhdfCtx` (D1 and D2)** and
+the `dt::` HDF5-type singletons with their guard variables.  The destructor
+being on that list is the worst of them: it is a `std::thread` join and a
+`std::mutex` destruction at whichever build's field offsets answered.
 
-And they are not the same functions.  `src/ffi/cpp/phdf5/ctx.h` compiles
-`PhdfCtx` with the CUDA stream / event / pinned-buffer members under
-`#ifndef LORRAX_FFI_NO_CUDA`; the host build defines that macro and drops
-them.  **One C++ type name, two struct layouts, both exporting
-`open_ctx(...) -> PhdfCtx*`.**  A handler from one build handed a
-`PhdfCtx*` minted by the other reads its fields at the wrong offsets, which
-is exactly what B1's
+`src/ffi/cpp/phdf5/ctx.h` compiles `PhdfCtx` with the CUDA stream / event /
+pinned-buffer members under `#ifndef LORRAX_FFI_NO_CUDA`.  One C++ type
+name, two struct layouts, both libraries exporting one
+`open_ctx(...) -> PhdfCtx*`.
 
-    offset_base=[0,0,0,4596944070643295330]
+**THE FIX — three mechanisms, because the defect had three vectors.**
 
-(a float64 read as int64) and the xdist arm's `phdf5 read: ctx_handle is
-null` look like.
+1. **Linker version scripts**, `src/ffi/cpp/exports_{cuda,host}.map`, wired
+   in `CMakeLists.txt` with `LINK_DEPENDS`: `local: *lorrax_ffi*` makes
+   every definition LORRAX compiled private to the library that compiled it,
+   so an intra-library call binds at static-link time and can neither
+   interpose nor be interposed.
+2. **A per-leg C ABI**, `src/ffi/cpp/common/c_abi.h`.  The nine `lrx_*`
+   entry points cannot be hidden — Python `dlsym`s them — so the host leg's
+   carry a `_host` suffix, the same per-library renaming the `*HostFfi`
+   handlers already used.  `ffi_loader._bind_c_abi` (and distrib_la's) binds
+   the suffixed symbol under the plain Python name at load, so no call site
+   changed and a pre-fix `.so` still works.
+3. **Split type identity**: `PhdfCtx`'s struct TAG is now `PhdfCtxCudaV1` /
+   `PhdfCtxHostV1` with `using PhdfCtx = …` keeping every call site as
+   written, so `open_ctx` and friends mangle differently per leg and the
+   cross-layout aliasing is unconstructible even without (1).
 
-**NOT CHASED, deliberately.**  The fix is in C++ — distinct symbol
-namespaces per build, or a hidden-visibility phdf5 core, or `RTLD_LOCAL`
-with an explicit re-export set — and it is not this branch's regression:
-the two libraries have always shared these names.  What this branch changed
-was how many processes get put into the mixed state, and B1's fix takes
-CPU-platform processes back out of it.  `test_so_acceptance`'s check 5 is
-the ratchet on the premise for the SLATE half; there is no equivalent
-ratchet on the phdf5 half yet, and that is the first thing to add if
-anyone picks this up.
+**NOT `-fvisibility=hidden`, and NOT `local: *`.**  Both were tried.  Hidden
+visibility additionally makes gcc mark a type's typeinfo NAME private with a
+leading `*`, after which libstdc++ compares typeinfo by POINTER only —
+and libslate.so throws `slate::Exception` ACROSS the `.so` boundary into our
+handlers, where it matches today by strcmp on that name.  `local: *` was
+built and MEASURED: it gives a 26-symbol host table and a zero intersection,
+and it **segfaults five SLATE host cells**, because it also unmerges the weak
+COMDAT copies of SLATE's template code that the C++ ABI intends the dynamic
+linker to merge with libslate.so's.  Five arms, same tree, same command, only
+the version script moving (`-k "slate and cpu"`):
+
+| version script | slate host cells |
+|---|---|
+| none at all | 8 P / 2 skip |
+| `local: *lorrax_ffi*` (shipped) | 8 P / 2 skip |
+| `local: *`, typeinfo/vtables global | 3 P / **5 CRASH** |
+| `local: *`, slate/blas/std templates global | 8 P / 2 skip |
+| `local: *` | 3 P / **5 CRASH** |
+
+**EVIDENCE, before and after** (`nm -D --defined-only`, both pairs built
+against the HDF5-200 stage; `nm_evidence.log`):
+
+| | shared names | LORRAX's own | C-linkage |
+|---|---|---|---|
+| pre-fix pair (`96a6399`) | 259 | **25** | 9 |
+| rebuilt pair (`b61e028a`) | 234 | **0** | **0** |
+| rebuilt device + pre-fix host | 243 | 9 | 9 |
+| pre-fix device + rebuilt host | 234 | **0** | **0** |
+
+The third row is the one to read before pinning: a MIXED pin does not get
+the fix — an old host lib still exports the unsuffixed `lrx_*`.  The fourth
+says the host rebuild alone is sufficient, so the deployed device `.so` does
+not have to move.
+
+**THE MIXED-PROCESS PROOF.**  `tests/test_file_io.py`, CPU platform, four
+emulated devices, four arms, same tree, same launcher — the probe DISABLES
+B1's capability gate, i.e. restores `32e61fe`'s unconditional pre-open, so
+the process is put back INTO the mixed state on purpose:
+
+| arm | pins | gate | result |
+|---|---|---|---|
+| A | rebuilt | on | 46 passed / 1 skipped |
+| D | pre-fix | on | 46 passed / 1 skipped |
+| B | rebuilt | **off** | **46 passed / 1 skipped**, 0 abort signatures |
+| C | pre-fix | **off** | **`Fatal Python error: Aborted`**, srun exit 134, no junitxml |
+
+Arm C is what makes arm B evidence.  The gate edit was local, reverted with
+`git checkout`, and `git status --porcelain` printed empty afterwards.
+
+And GATE 10 (`src/ffi/cpp/gate_one_odr.py`), a real CUDA process
+(`jax.default_backend() == 'gpu'`, `loaded_platforms_in_order() ==
+['CUDA','cpu']`) doing a host phdf5 write + full read + offset-slab read on
+a CPU mesh: **every check PASS on the rebuilt pair**; on the deployed Aug-7
+pair the process dies at
+
+    [SlabIO.close] draining 1 pending writes for gate_one_odr.h5 …
+    Fatal glibc error: tpp.c:83 (__pthread_tpp_change_priority): assertion failed
+
+— `close_ctx` joining a thread and destroying a mutex at the other build's
+offsets.  Note that this is, line for line, the death **B2** recorded for
+the xdist arm; L1 was a mechanism behind that symptom too.
+
+**WHAT IS NOT FIXED, and where it lives.**  234 third-party vague-linkage
+names (`slate::`, `blas::`, `xla::ffi::`, libstdc++ internals) are still
+defined by both files and the first loaded still answers them for both.
+They are ODR-CORRECT duplicates — same headers, same source — and
+localising them is the measured crash above.  Their sharing is the SAME
+defect as `libslate.so.2` / `libblaspp.so.2` resolving out of two different
+builds under one SONAME.  **`_open_cuda_before_host` therefore STAYS** in
+both loaders: it was written for that race, the ODR fix does not touch it,
+and retiring it would re-open the eight `blas::get_device_count()=0` cells.
+`test_so_acceptance.py`'s check 5 remains the ratchet that will say when it
+can go; its docstring is rescoped to say it covers only that.
+
+**BUILD-TIME RATCHETS.**  `config/perlmutter/build_ffi_host.sh` GATE 9
+refuses a host `.so` that exports any `lorrax_ffi` internal or any
+unsuffixed `lrx_*`; `src/ffi/cpp/build.sh` GATE 9 is the device twin.  Both
+passed on the rebuilt pair; `config/frontera/build_ffi_host.sh`'s WANT list
+now names the suffixed symbols, so a pre-fix host library fails it by name.
 
 ### **P1 — three Tier-1 pins are Frontera-frozen and cannot be green on both machines**
 
