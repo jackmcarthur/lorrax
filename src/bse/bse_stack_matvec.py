@@ -61,11 +61,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.shard_map import shard_map as _shard_map_fn
 
-from common.fft_helpers import local_fftn3, local_ifftn3
+from common.fft_helpers import (
+    local_fftn3,
+    local_ifftn3,
+    make_sharded_fftn_3d,
+    make_sharded_ifftn_3d,
+)
 from .bse_ring_comm import make_bse_shardings
 
 
@@ -130,9 +135,26 @@ from .bse_ring_comm import make_bse_shardings
 #           n_flat=1e5.  It is right for a small pair space and wrong for a
 #           large one, so it is a dial and not a default.
 #
-# None of the three changes the number of live (nk, mu_loc, nu_loc, ns^2)-class
+#   gspmd   AUDIT ROUTE, default OFF.  Build the W term with NO ``shard_map``:
+#           the same einsum chain and the same ``lax.scan`` over trials, but
+#           expressed on GLOBAL arrays with ``with_sharding_constraint`` hints
+#           at each of the four points where the manual body issues a
+#           collective, letting XLA's SPMD partitioner choose the collective.
+#           Built for the 2026-08-08 shard_map audit to answer whether the
+#           manual all_gather/psum_scatter schedule is EARNED or HABIT.
+#           It is an A/B instrument, not a proposed default: it changes which
+#           collectives the program issues, so every claim about it must be
+#           backed by an HLO diff and a timing pair.  See SHARDMAP_AUDIT.md.
+#           NOTE the structural consequence, which is the reason it exists:
+#           with no enclosing shard_map the W-term FFTs go through
+#           ``make_sharded_*fftn_3d`` (which wraps its OWN shard_map) instead
+#           of the interior ``local_*fftn3`` aliases -- i.e. this route is the
+#           only one from which the flat-k FFT FFI is structurally reachable
+#           (FFT_DONATION_AUDIT §3.1: shard_map cannot nest).
+#
+# None of the first three changes the number of live (nk, mu_loc, nu_loc, ns^2)-class
 # intermediates, which stays at the one ``T_b`` family documented below.
-_MATVEC_OPTS = ("yhoist", "krep")   # densek REMOVED 2026-07-31, owner directive
+_MATVEC_OPTS = ("yhoist", "krep", "gspmd")   # densek REMOVED 2026-07-31, owner directive
 
 
 def matvec_opts() -> frozenset[str]:
@@ -175,6 +197,18 @@ def build_bse_stack_matvec(
     nk = nkx * nky * nkz
     opts = matvec_opts()
     use_yhoist = "yhoist" in opts
+    use_gspmd = "gspmd" in opts
+    if use_gspmd and use_yhoist:
+        # ``yhoist`` names a transformation of the manual body's collective
+        # schedule; the gspmd route has no manual schedule to hoist out of.
+        # REFUSE rather than accept-and-ignore: a knob that is parsed and
+        # silently dropped voids every A/B built on it (STATUS.md:167-170).
+        raise ValueError(
+            "LORRAX_BSE_MATVEC_OPT: 'gspmd' and 'yhoist' are mutually "
+            "exclusive.  'yhoist' lifts two collectives out of the manual "
+            "shard_map body's per-trial scan; the 'gspmd' route issues no "
+            "manual collectives at all, so there is nothing for it to hoist. "
+            "Pick one.")
 
     # ── W term: one shard_map over ('x','y'); body = scan over the trial axis ──
     def _w_stack(X, psi_c_X, psi_v_Y, W_R):
@@ -242,6 +276,65 @@ def build_bse_stack_matvec(
             WX = lax.psum_scatter(WX, "y", scatter_dimension=2, tiled=True)
         return WX
 
+    # ── W term, GSPMD twin: same math, same scan, NO shard_map ────────────────
+    # Audit route (``LORRAX_BSE_MATVEC_OPT=gspmd``).  Line-for-line the same
+    # chain as ``_w_stack`` above, but on GLOBAL arrays.  Each of the four
+    # ``with_sharding_constraint`` calls below sits at exactly the point where
+    # the manual body issues a collective, and requests the SAME data layout the
+    # manual collective produces -- so if the partitioner is any good it should
+    # emit the same four collectives.  Whether it does is the experiment.
+    #
+    #   manual                                    | gspmd hint
+    #   all_gather(X_b, 'y', axis=1)              | wsc(X_b,  P('x', None, None))
+    #   all_gather(R,   'x', axis=0)              | wsc(R,    P(None, None, None, 'y'))
+    #   psum_scatter(..., 'x', scatter_dim=0)     | wsc(A,    P('x', 'y', None, None))
+    #   psum_scatter(..., 'y', scatter_dim=1)     | wsc(WXcv, P('x', 'y', None))
+    #
+    # The FFTs necessarily change door: with no enclosing shard_map the interior
+    # ``local_*fftn3`` aliases would gather the (μ,ν)-sharded operand onto every
+    # rank (fft_helpers:221-226 forbids exactly that), so this route uses the
+    # ``make_sharded_*fftn_3d`` factories, which wrap the identical local kernel
+    # in their own shard_map.  That shard_map is NOT nested here -- which is the
+    # structural point this route exists to demonstrate.
+    _ns = lambda spec: NamedSharding(mesh_xy, spec)
+    _T7_spec = P("x", "y", None, None, None, None, None)
+    _g_ifftn = make_sharded_ifftn_3d(
+        mesh_xy, _T7_spec, _T7_spec, axes=(4, 5, 6), norm="ortho")
+    _g_fftn = make_sharded_fftn_3d(
+        mesh_xy, _T7_spec, _T7_spec, axes=(4, 5, 6), norm="ortho")
+
+    def _w_gspmd(X, psi_c_X, psi_v_Y, W_R):
+        # Global shapes: X (n_trials, c, v, nk); psi_c_X (nk, c, ns, μ);
+        # psi_v_Y (nk, v, ns, ν); W_R (μ, ν, kx, ky, kz).
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
+
+        def _body(carry, X_b):                       # X_b: (c, v, nk) global
+            # 'y' gather: make v replicated so the ν-contraction below is local.
+            Xv = lax.with_sharding_constraint(X_b, _ns(P("x", None, None)))
+            R = jnp.einsum("kvsN,cvk->cksN", jnp.conj(psi_v_Y), Xv)
+            # 'x' gather: make c replicated so the μ-encode below is local.
+            R = lax.with_sharding_constraint(R, _ns(P(None, None, None, "y")))
+            T_b = jnp.einsum("kctM,cksN->MNtsk", psi_c_X, R)
+            T_b = lax.with_sharding_constraint(
+                T_b, _ns(P("x", "y", None, None, None)))
+            mu, nu, ns = T_b.shape[0], T_b.shape[1], T_b.shape[2]
+
+            T_k = T_b.reshape(mu, nu, ns, ns, nkx, nky, nkz)
+            T_R = _g_ifftn(T_k)
+            U_R = W_R[:, :, None, None, :, :, :] * T_R
+            U_b = _g_fftn(U_R).reshape(mu, nu, ns, ns, nk)
+
+            # μ-sum with c landing on 'x' -- the psum_scatter('x') ask.
+            A = jnp.einsum("kctM,MNtsk->cNsk", jnp.conj(psi_c_X), U_b)
+            A = lax.with_sharding_constraint(A, _ns(P("x", "y", None, None)))
+            # ν-sum with v landing on 'y' -- the psum_scatter('y') ask.
+            WXcv = jnp.einsum("kvsN,cNsk->cvk", psi_v_Y, A)
+            WXcv = lax.with_sharding_constraint(WXcv, _ns(P("x", "y", None)))
+            return carry, WXcv / sqrt_nk
+
+        _, WX = lax.scan(_body, None, X)
+        return lax.with_sharding_constraint(WX, sh.X)
+
     w_stack = _shard_map_fn(
         _w_stack,
         mesh=mesh_xy,
@@ -249,6 +342,8 @@ def build_bse_stack_matvec(
                   P(None, None, None, "y"), P("x", "y", None, None, None)),
         out_specs=P(None, "x", "y", None),
     )
+    if use_gspmd:
+        w_stack = _w_gspmd
 
     def _matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
                 M_X, M_Y):
