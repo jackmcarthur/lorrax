@@ -405,7 +405,18 @@ def _nontda_data_from_subset(data):
             "psi_v_X": jax.lax.with_sharding_constraint(data["psi_v"], sh.psi_x),
             "psi_v_Y": jax.lax.with_sharding_constraint(data["psi_v"], sh.psi_y),
             "eps_c": jnp.asarray(data["eps_c"]), "eps_v": jnp.asarray(data["eps_v"]),
-            "W_q": jax.lax.with_sharding_constraint(data["W_q"], sh.W),
+            # COPY, and it must be a real one.  ``solve_bse_nontda_sharded``
+            # DONATES W_q (``bse_nontda.py``, ``donate_argnums=(0,)``, landed
+            # 2026-08-08), and on this 1x1 mesh ``with_sharding_constraint`` is
+            # a no-op that hands straight back the SESSION-scoped
+            # ``bse_dense_state`` buffer -- so the donation deleted W_q for
+            # every later consumer of that fixture, and the suite went red in
+            # whatever order xdist happened to pick.  The fixture's own
+            # docstring promises the session state is never mutated; this keeps
+            # the promise here, where the borrow happens, instead of giving up
+            # a measured production win to defend against a test.
+            "W_q": jax.lax.with_sharding_constraint(
+                jnp.array(data["W_q"]), sh.W),
             "V_q0": jax.lax.with_sharding_constraint(data["V_q0"], sh.V),
             "nkx": int(data["nkx"]), "nky": int(data["nky"]), "nkz": int(data["nkz"]),
             "n_cond_pad": nc, "n_val_pad": nv,
