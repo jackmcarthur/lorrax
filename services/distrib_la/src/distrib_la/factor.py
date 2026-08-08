@@ -27,6 +27,28 @@ The four handle paths this replaces (all measured in LORRAX at 96a6399)::
 
 ``factor`` collapses the SLATE loop into the token and removes the
 rebuild: the token IS the handle.
+
+The batch axis is a ``lax.scan``, here as in :mod:`distrib_la.plan`
+--------------------------------------------------------------------
+The SLATE route factors one matrix per call and back-solves one matrix per
+call, so both ends of it used to be a Python loop over ``nbatch``.  They
+are now ``lax.scan``\\ s at :data:`distrib_la.plan.BATCHED_SCAN_UNROLL`,
+for the same reason and with the same consequence as the batched surface
+in that module: one traced body, one compiled loop, whatever ``nbatch`` is.
+
+It matters more here than anywhere else in the package.
+``_slate.distributed_cholesky`` and ``_slate.distributed_trsm`` build their
+``shard_map`` at eager top level with no ``jax.jit`` around it and no
+per-signature cache — the shape every OTHER wrapper here has and these two
+do not — so an ``nbatch``-long Python loop re-traced and re-compiled the
+kernel ``nbatch`` times.  A scan traces it once.
+
+What the token holds for SLATE is therefore a STACKED raw factor
+``(nbatch, n, n)`` at ``P(None,'y','x')`` plus the tile size, not a tuple
+of ``nbatch`` handles.  That is invisible from outside — ``_factor`` is
+private and always has been — and :func:`solve` rebuilds the per-``q``
+``SlateLowerL`` inside its own scan body from a slice, which is the same
+object the loop used to pass.
 """
 from __future__ import annotations
 
@@ -36,7 +58,7 @@ from typing import Any
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la.plan import ensure_sharding
+from distrib_la.plan import BATCHED_SCAN_UNROLL, ensure_sharding
 from distrib_la.resolve import NATIVE, backend_module, resolve_backend
 
 __all__ = ["FactorToken", "factor", "solve"]
@@ -132,18 +154,42 @@ def factor(op: str, A, mesh_xy: Mesh, *, backend: str = "auto",
     elif resolved == "cusolvermp":
         held = mod.batched_distributed_cholesky(A, mesh=mesh_xy)
     else:                                                       # slate
-        # The per-q loop that lived at isdf/core.py:3199, moved inside.
-        # SLATE's batched potrf distributes the BATCH over mesh 'x', which
-        # does not match this call site's replicated-q layout; a per-q loop
-        # over nq <~ tens of matrices is the correct shape here.  The
-        # handles are kept as handles — that is the whole point of the
-        # token, and it is what lets solve() use slate::trsm instead of
+        # The per-q loop that lived at isdf/core.py:3199, moved inside and
+        # then made a scan.  SLATE's own batched potrf distributes the
+        # BATCH over mesh 'x', which does not match this call site's
+        # replicated-q layout, so factoring one matrix at a time is the
+        # correct shape here — but "one at a time" is a loop the COMPILER
+        # walks, not one Python walks.  The factor is kept in SLATE's own
+        # layout, which is what lets solve() use slate::trsm instead of
         # materialising a row-major L and solving it replicated.
-        held = tuple(mod.distributed_cholesky(A[i], mesh=mesh_xy)
-                     for i in range(nb))
+        held = _slate_potrf_stack(mod, A, mesh_xy)
 
     return FactorToken(op=op, backend=resolved, mesh=mesh_xy,
                        n=extent, nbatch=nb, _factor=held)
+
+
+def _slate_potrf_stack(mod, A, mesh_xy: Mesh) -> tuple:
+    """Scan ``slate::potrf`` down the batch axis; return ``(raw, nb)``.
+
+    ``raw`` is ``(nbatch, n, n)`` at ``P(None,'y','x')`` — the per-matrix
+    ``SlateLowerL.raw`` buffers stacked, still in SLATE's col-major tile
+    layout, never materialised as a row-major L and never replicated.
+    ``nb`` is the tile size SLATE chose, carried out of the trace because
+    it is the one piece of the handle that is not the buffer and
+    :func:`solve` has to hand it back.
+    """
+    tile: dict[str, int] = {}
+
+    def _potrf(carry, A_q):
+        L = mod.distributed_cholesky(A_q, mesh=mesh_xy)
+        # Trace-time constant: the tile size is a function of n and the
+        # mesh, so every iteration writes the same value.  Reading it out
+        # of the body is how the handle's non-buffer half survives a scan.
+        tile["nb"] = int(L.nb)
+        return carry, L.raw
+
+    _, raw = jax.lax.scan(_potrf, None, A, unroll=BATCHED_SCAN_UNROLL)
+    return raw, tile["nb"]
 
 
 def solve(token: FactorToken, B) -> jax.Array:
@@ -175,22 +221,31 @@ def solve(token: FactorToken, B) -> jax.Array:
     if token.backend == "cusolvermp":
         return mod.batched_distributed_potrs(token._factor, B, mesh=mesh)
 
-    # SLATE cholesky: two triangular solves per q against the handle.
-    # ``distributed_trsm`` feeds the SlateLowerL buffer straight back to
-    # SLATE (op='N' forward, op='C' adjoint), so the col-major factor is
-    # never materialised into a row-major L and never replicated.
+    # SLATE cholesky: two triangular solves per q against the handle,
+    # scanned down the batch axis.  ``distributed_trsm`` feeds the
+    # SlateLowerL buffer straight back to SLATE (op='N' forward, op='C'
+    # adjoint), so the col-major factor is never materialised into a
+    # row-major L and never replicated.  The handle is rebuilt per
+    # iteration from a slice of the stacked raw plus the tile size the
+    # factor recorded — the same object the Python loop passed, assembled
+    # inside the trace instead of outside it.
     #
-    # UNMEASURED ON A REAL MESH as of this commit: LORRAX's slate cholesky
-    # consumer went through ``to_jax_lower()`` and a replicated triangular
-    # solve, with "wiring slate::trsm for the back-solve is a perf
-    # follow-up" written next to it.  This is that wiring; its first
-    # execution is the service suite's real-4-process leg.  The shape
-    # algebra and the refusals below are what is checked today.
-    import jax.numpy as jnp
-    rows = []
-    for i in range(token.nbatch):
-        L = token._factor[i]
-        y = mod.distributed_trsm(L, B[i], mesh=mesh, op="N")
-        rows.append(mod.distributed_trsm(L, y, mesh=mesh, op="C"))
-    return ensure_sharding(jnp.stack(rows),
-                           NamedSharding(mesh, P(None, "x", "y")))
+    # FIRST EXECUTED at step 2 on a real 4-process mesh, and that is what
+    # this route is: LORRAX's slate cholesky consumer went through
+    # ``to_jax_lower()`` and a replicated triangular solve, with "wiring
+    # slate::trsm for the back-solve is a perf follow-up" written next to
+    # it.  Residuals against the native reference, rtol 1e-12 NOT relaxed:
+    # 3.8e-16 / 4.5e-16 CPU c128 per-q, 1.0e-15 / 6.9e-16 GPU c128 per-q,
+    # 4.3e-16 / 4.4e-16 for the CPU / GPU 2x2 token round trips.
+    raw, nb = token._factor
+    n, SlateLowerL = token.n, mod.SlateLowerL
+
+    def _two_trsms(carry, xs):
+        raw_q, B_q = xs
+        L = SlateLowerL(raw=raw_q, mesh=mesh, n=n, nb=nb)
+        y = mod.distributed_trsm(L, B_q, mesh=mesh, op="N")
+        return carry, mod.distributed_trsm(L, y, mesh=mesh, op="C")
+
+    _, X = jax.lax.scan(_two_trsms, None, (raw, B),
+                        unroll=BATCHED_SCAN_UNROLL)
+    return ensure_sharding(X, NamedSharding(mesh, P(None, "x", "y")))
