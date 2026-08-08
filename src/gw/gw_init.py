@@ -1426,6 +1426,9 @@ def prepare_isdf_and_wavefunctions(
 	"""
 	from file_io import write_restart_state_to_h5
 	from common.wfn_transforms import load_centroids_band_chunked
+	# The deck's write/skip decision for tmp/isdf_tensors_*.h5, taken and
+	# announced in ONE place (``write_restart_tensors``).
+	from .gw_output import restart_tensor_writes_enabled
 
 	if not cfg.restart:
 		from common.wfn_transforms import get_enk_bandrange
@@ -1560,17 +1563,37 @@ def prepare_isdf_and_wavefunctions(
 			# Flush V_q / G0 / enk + W0 placeholder immediately.  Pass
 			# kgrid so BSE downstream can recover the (nkx, nky, nkz)
 			# split from flat-q V_qmunu without re-reading the WFN.
-			write_restart_state_to_h5(
-				tensors_filename,
-				n_rmu_logical=int(meta.n_rmu),
-				V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
-				init_W0=True, mesh=mesh_xy,
-				mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
-				# Stamp the band window + n_rmu so a later restart
-				# under a CHANGED window fails loudly instead of
-				# silently misindexing Sigma (job 7874375).
-				band_slices=band_slices,
-			)
+			#
+			# ``write_restart_tensors = false`` skips this and the ψ
+			# append and the centroid stamp TOGETHER — one decision,
+			# taken once and announced once by
+			# ``gw_output.restart_tensor_writes_enabled``.  Writing
+			# some of the datasets and not the others would produce a
+			# file the band-window and W0_ready guards accept and the
+			# BSE loader then trips over one dataset later.
+			#
+			# THE GUARDED BLOCK CONTAINS COLLECTIVES (the SlabIO writes
+			# and ``barrier("restart_centroid_stamp")``), so the
+			# predicate MUST be rank-invariant or the skipping ranks
+			# hang the writing ones.  It is: a deck key, parsed from a
+			# file every rank reads, with no env override and no
+			# probe.  ``restart_tensor_writes_enabled``'s announcement
+			# is rank-0-only but prints rather than communicating, so
+			# it adds no collective of its own.
+			_write_restart = restart_tensor_writes_enabled(
+				cfg, tensors_filename)
+			if _write_restart:
+				write_restart_state_to_h5(
+					tensors_filename,
+					n_rmu_logical=int(meta.n_rmu),
+					V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
+					init_W0=True, mesh=mesh_xy,
+					mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
+					# Stamp the band window + n_rmu so a later restart
+					# under a CHANGED window fails loudly instead of
+					# silently misindexing Sigma (job 7874375).
+					band_slices=band_slices,
+				)
 
 			with timing.section("gw_jax.wavefunction_setup"):
 				wfns = build_wavefunction_bundle(
@@ -1600,38 +1623,40 @@ def prepare_isdf_and_wavefunctions(
 			# bispinor restart round-trip (the loader re-pads and
 			# ``prepare_isdf_and_wavefunctions`` rebuilds the second
 			# bundle from it; without it Σ^B would be silently dropped).
-			write_restart_state_to_h5(
-				tensors_filename,
-				n_rmu_logical=int(meta.n_rmu),
-				psi_full_y=wfns.psi_yr, mesh=mesh_xy,
-				mode="a",
-				psi_full_y_transverse=(
-					wfns_transverse.psi_yr
-					if wfns_transverse is not None else None),
-				n_rmu_transverse_logical=(
-					int(transverse_wfn_data['meta'].n_rmu)
-					if transverse_wfn_data is not None else None),
-			)
-			# Stamp the centroid tables' CONTENT hashes so a restart can
-			# verify the quadrature points, not just their counts (see
-			# ``_centroid_table_md5``; audit fix/zq 2026-07-28).  Rank 0
-			# only, after the collective writer released the file; a
-			# failed stamp is non-fatal — the restart-side guard then
-			# warns about the missing attr instead of verifying.
-			if jax.process_index() == 0:
-				try:
-					with h5py.File(tensors_filename, 'a') as _f:
-						_f.attrs['centroids_charge_md5'] = (
-							_centroid_table_md5(centroid_indices))
-						if transverse_wfn_data is not None:
-							_f.attrs['centroids_transverse_md5'] = (
-								_centroid_table_md5(
-									transverse_wfn_data['centroid_indices']))
-				except Exception as exc:
-					print0(f"    [restart stamp] centroid content hashes "
-					       f"not stamped ({exc}); a restart will warn "
-					       f"instead of verifying the centroid tables.")
-			barrier("restart_centroid_stamp")
+			if _write_restart:
+				write_restart_state_to_h5(
+					tensors_filename,
+					n_rmu_logical=int(meta.n_rmu),
+					psi_full_y=wfns.psi_yr, mesh=mesh_xy,
+					mode="a",
+					psi_full_y_transverse=(
+						wfns_transverse.psi_yr
+						if wfns_transverse is not None else None),
+					n_rmu_transverse_logical=(
+						int(transverse_wfn_data['meta'].n_rmu)
+						if transverse_wfn_data is not None else None),
+				)
+				# Stamp the centroid tables' CONTENT hashes so a restart
+				# can verify the quadrature points, not just their counts
+				# (see ``_centroid_table_md5``; audit fix/zq 2026-07-28).
+				# Rank 0 only, after the collective writer released the
+				# file; a failed stamp is non-fatal — the restart-side
+				# guard then warns about the missing attr instead of
+				# verifying.
+				if jax.process_index() == 0:
+					try:
+						with h5py.File(tensors_filename, 'a') as _f:
+							_f.attrs['centroids_charge_md5'] = (
+								_centroid_table_md5(centroid_indices))
+							if transverse_wfn_data is not None:
+								_f.attrs['centroids_transverse_md5'] = (
+									_centroid_table_md5(
+										transverse_wfn_data['centroid_indices']))
+					except Exception as exc:
+						print0(f"    [restart stamp] centroid content hashes "
+						       f"not stamped ({exc}); a restart will warn "
+						       f"instead of verifying the centroid tables.")
+				barrier("restart_centroid_stamp")
 		V_qmunu.block_until_ready()
 		print0("  Chunked ISDF path complete")
 	else:

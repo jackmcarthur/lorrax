@@ -602,6 +602,37 @@ _DEFAULTS = {
     "sigma_omega_h5_file": "sigma_mnk.h5",
     # Core flags
     "restart": True,
+    # ``write_restart_tensors``: does this run PERSIST tmp/isdf_tensors_*.h5
+    # at all?  DEFAULT true — today's behaviour, unchanged, until the owner
+    # rules otherwise (SPEC_qirr_restart_tensors.md §7 and
+    # DESIGN_symmetry_restart_followup.md, "Owner decisions carried").
+    #
+    # A COMPLEMENT, NEVER AN ALTERNATIVE, TO q_irr STORAGE.  The two answer
+    # different questions and the second does not retire the first:
+    #   * this key is for a run that DISCARDS the artifact.  Nothing in
+    #     ``gw_jax`` reads ``W0_qmunu``/``V_qmunu`` back, so a GW run with no
+    #     BSE downstream spends its restart-write time (MEASURED on the Si
+    #     production deck: 4.5 s of a 19.4-22.6 s warm wall, ~21%, and 2.01
+    #     GB of disk) on bytes nobody opens.  Setting this false buys all of
+    #     that back and buys nothing else.
+    #   * q_irr storage is for a run that KEEPS the artifact and wants it 8x
+    #     smaller and 8x faster to write, WITH the fold/unfold machinery
+    #     exercised on every production restart load.  A run that feeds BSE
+    #     needs the file; this key cannot help it, and the format work is
+    #     what does.
+    # Reading this as "we can skip the write instead of doing the format
+    # work" would be the wrong trade: it optimises the runs that do not need
+    # the tensor and leaves the runs that do exactly where they were.
+    #
+    # WHAT GUARDS THE DOWNSTREAM.  Nothing new.  A BSE run pointed at a
+    # directory whose GW leg was told not to write refuses on the paths that
+    # already existed: ``bse_io._find_restart_file`` raises FileNotFoundError
+    # naming ``isdf_tensors_*.h5``, and every W0 consumer gates on the
+    # ``W0_ready`` attr rather than on the dataset's presence (the April
+    # all-zero-screening mechanism; see tests/test_bse_w0_ready_gate.py).
+    # Suppressing the write makes the file ABSENT, which is the loudest of
+    # the states those guards distinguish.
+    "write_restart_tensors": True,
     # ``compute_mode`` is the single axis describing the self-energy ansatz.
     # ``"auto"`` infers from the legacy ``do_screened`` / ``use_ppm_sigma`` /
     # ``ppm_model`` flags so existing input files keep working unchanged.
@@ -1706,6 +1737,10 @@ class LorraxConfig:
 
     # --- Core mode flags (top-level; hot path) ---
     restart: bool
+    #: Persist ``tmp/isdf_tensors_*.h5`` at all.  True preserves today's
+    #: behaviour; see ``_DEFAULTS["write_restart_tensors"]`` for why this is
+    #: a COMPLEMENT to q_irr storage and not an alternative to it.
+    write_restart_tensors: bool
     compute_mode_raw: str         # "auto" | one of ComputeMode.value strings
     qp_solver_raw: str            # "auto" | one of QPSolver.value strings
     do_screened: bool
@@ -2238,6 +2273,7 @@ class LorraxConfig:
             sc_on_ibz=bool(_g("sc_on_ibz")),
             hartree_source=_hartree_source,
             restart=bool(_g("restart")),
+            write_restart_tensors=bool(_g("write_restart_tensors")),
             compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
             qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
             do_screened=bool(_g("do_screened")),

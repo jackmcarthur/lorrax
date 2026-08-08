@@ -271,8 +271,42 @@ def print_system_summary(
 
 
 # ---------------------------------------------------------------------------
-# Restart persistence — W0 + q→0 head scalars
+# Restart persistence — the deck's write/skip decision, W0 + q→0 head scalars
 # ---------------------------------------------------------------------------
+
+def restart_tensor_writes_enabled(config, tensors_filename: str) -> bool:
+    """``write_restart_tensors``: may this run persist the ISDF tensors?
+
+    ONE decision point for a key that gates FOUR writes — the V_q / G0 /
+    E_nk flush with its W0 placeholder, the ψ append, the centroid-hash
+    stamp (all in ``gw_init.prepare_isdf_and_wavefunctions``) and the W0 +
+    head-scalar write here.  Asking ``config.write_restart_tensors`` at
+    four sites would be four chances for one of them to keep writing, and
+    a restart file containing three of its five datasets is worse than no
+    file at all: the ``W0_ready`` and window guards would pass on it.
+
+    ANNOUNCED, ONCE, ON RANK 0.  Skipping the artifact is a policy the deck
+    chose and it is invisible in every other way — the run simply gets
+    faster and ``tmp/`` stays empty — so it says so.  Deduped on the
+    filename through ``ffi.gate.announce_once``, which is also what keeps
+    the four call sites to one line.
+
+    Returns ``True`` when the writes should happen (the default, and
+    today's behaviour unchanged).
+    """
+    if getattr(config, "write_restart_tensors", True):
+        return True
+    from ffi.gate import announce_once
+    announce_once(
+        ("write_restart_tensors", "off", tensors_filename),
+        f"  [restart_write] write_restart_tensors = false — SKIPPING "
+        f"{os.path.basename(tensors_filename)} entirely (V_qmunu, G0_mu_nu, "
+        f"enk_full, psi_full_y, W0_qmunu, head scalars).  Nothing in the GW "
+        f"driver reads these back; a BSE run against this directory will "
+        f"refuse on the missing file.",
+        scope="rank0")
+    return False
+
 
 def persist_w0_and_head(
     W_q,
@@ -293,11 +327,19 @@ def persist_w0_and_head(
     flow through automatically because ``HeadResolver`` consults the
     config's override fields first before falling back to s_tensor/epshead.
 
-    No-op unless ``config.do_screened`` and the restart file exists.
+    No-op unless ``config.do_screened``, the deck asked for restart tensor
+    writes (``write_restart_tensors``), and the restart file exists.  The
+    file-exists arm is not redundant with the key: a ``restart = true`` run
+    reuses tensors it did not write, and would otherwise re-stamp a W0 into
+    a file the deck said to leave alone.
     """
     from .gw_config import ComputeMode
 
-    if not (config.do_screened and os.path.exists(tensors_filename)):
+    if not config.do_screened:
+        return
+    if not restart_tensor_writes_enabled(config, tensors_filename):
+        return
+    if not os.path.exists(tensors_filename):
         return
     from file_io import write_w0_qmunu_to_h5, write_head_scalars_to_h5
     # W_q is already flat-q (nq, μ, μ).  The W0_qmunu placeholder
