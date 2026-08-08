@@ -780,6 +780,51 @@ def main(argv=None):
 	# built for every k on every rank instead of riding the k partition and
 	# paying a second gather.  Arithmetic is verbatim what the fused loop
 	# did, which is why the pinned ``deltaE`` parity is EXACTLY 0.
+	#
+	# ΔE IS PROVABLY REDUNDANT AND IS STILL NOT WORTH COMPRESSING — measured
+	# 2026-08-08 on all four committed dipole.h5 fixtures, and written down
+	# because the redundancy is obvious enough that it will keep being
+	# proposed and the numbers settle it in either direction.
+	#
+	# THE REDUNDANCY IS TOTAL.  ``deltaE[k]`` is bit-identical — max|Δ|
+	# exactly 0.000e+00, not "agrees to round-off" — to the outer difference
+	# of a single WFN eigenvalue row, at every k of every fixture.  The whole
+	# (nk, nb, nb) f64 array therefore carries at most (nrk, nb) numbers, and
+	# those numbers are already in WFN.h5:
+	#
+	#     deck               deltaE      as (nrk, nb)   on the dataset
+	#     cohsex_debug       0.87 MB        2 640 B         330x
+	#     gnppm_debug        0.46 MB        3 200 B         144x
+	#     hbn_cohsex_debug   0.92 MB       11 520 B          80x
+	#     si_cohsex_debug    1.84 MB        3 840 B         480x
+	#
+	# THE FILE BARELY MOVES.  ``deltaE`` is 14.3 % of dipole.h5 on all four,
+	# and that fraction is structural rather than incidental: ``dipole_cart``
+	# is three complex128 planes against one f64 plane, exactly 6:1.  So
+	# deleting ΔE outright takes dipole.h5 to 85.8 % of its size — 1.17x —
+	# and the remaining 85.7 % is the half carrying a Cartesian index, which
+	# needs the proper-rotation treatment and is exactly why the dipole was
+	# REGISTERED rather than claimed.  The redundancy is total in the half
+	# that was never the problem.
+	#
+	# NOT IMPLEMENTED, deliberately.  It would touch three sites — this
+	# writer, ``bse.absorption_common.load_dipole_h5`` and
+	# ``common.chi_from_dipole.read_dipole_h5``, none of which has a consumer
+	# cell in the tree today — to buy 1.17x.  FOR THE OWNER: if
+	# ``dipole_cart``'s rotation work is ever done, take the ΔE half in the
+	# SAME change.  Its correctness is free — store the ``e_b`` vector this
+	# loop already holds and rebuild with this same expression, bit-identical
+	# by construction rather than by measurement — and it is 14.2 % of the
+	# file on top of whatever ``dipole_cart`` buys.
+	#
+	# ONE FIXTURE ANOMALY, recorded rather than chased.  On cohsex_debug, 3
+	# of 9 k reproduce ``el[0, 1]`` where today's ``SymMaps`` gives
+	# ``irr_idx_k[k] = 2``.  Both rows reproduce the committed ΔE
+	# bit-identically through the row that matches, and the two rows differ
+	# from each other by 1.066e-14 Ry — so that fixture's k→IBZ map and this
+	# tree's are physically equivalent and not the same map.  It says nothing
+	# about the redundancy, which holds on that deck too, and everything
+	# about the age of the fixture.
 	energies = np.asarray(wfn.energies)
 	deltaE = np.zeros((nk, nb, nb), dtype=np.float64)
 	for i in range(nk):
