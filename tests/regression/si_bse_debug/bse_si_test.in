@@ -4,6 +4,17 @@
 restart = false
 centroids_file = centroids_frac_480_orbitclosed.txt
 
+# PINNED, NOT DEFAULTED — see the commit that added this line.  This deck's
+# centroid set is orbit-closed, so `restart_q_storage = auto` resolves to
+# `ibz` and writes the restart tensors on the q wedge; the sharded BSE
+# reader (`bse_io._MunuSlabPlan`) refuses a wedge BY DESIGN, so a GW+BSE
+# pipeline launched at P>1 on this deck breaks under the default.  The
+# scripted A/B measured auto and full at 0.000000 meV with bit-identical
+# tensors on the serial path, so the pin costs this deck nothing.  It is
+# the conservative, reversible mitigation; the real fix — teaching the
+# sharded reader to gather before it unfolds — is registered.
+restart_q_storage = full
+
 nval = 8
 ncond = 52
 nband = 60

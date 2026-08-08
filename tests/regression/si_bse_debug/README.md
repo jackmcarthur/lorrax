@@ -206,6 +206,32 @@ about 4 cells of the 24³ grid, nowhere near a centroid.  The entire
 difference is the point set.  `services/symmetry_maps/tests/test_symmetry_maps_closure.py`
 carries both rows.
 
+### What closure cost this deck: `restart_q_storage = full` is PINNED
+
+Being orbit-closed is what the wedge format wants, and it is also why this
+deck cannot take the default.  `restart_q_storage = auto` asks the closure
+question, gets `yes` here, and stores `V_qmunu` and `W0_qmunu` on the eight
+irreducible q's instead of all sixty-four.  The sharded BSE reader then
+refuses the file — by design, and loudly: `bse_io._MunuSlabPlan` describes a
+per-rank (μ, ν) hyperslab read, the unfold is a double gather across exactly
+the μ and ν axes it shards on, and there is no offset it could ask SlabIO
+for that would reconstruct a full-BZ q.  So the deck's Tier-1 gate stays
+green (conftest pins one GPU, which puts it on the serial h5py reader, which
+unfolds) while any real GW+BSE pipeline launched as several processes on
+this deck breaks at the first `read_slabs`.
+
+The deck therefore carries `restart_q_storage = full` explicitly.  It costs
+this deck nothing measurable: the scripted A/B
+(`tests/multi_device/restart_q_storage_ab.sh`) ran the two arms against each
+other and got 0.000000 meV with bit-identical tensors on the serial path.
+What it costs is the 4.155× on the file that the wedge would have bought
+here, which is a size, not an answer.
+
+This is the conservative and reversible half of a decision that has a real
+fix on the other side of it — teaching the sharded reader to gather before
+it unfolds, which is registered in `tests/KNOWN_FAILURES.md`.  Delete this
+one deck line the day that lands.
+
 ### Reference provenance (the vcoul adoption pattern)
 
 `bse_eigenvalues_ref.dat` is REPLACED, in place, by the candidate the
