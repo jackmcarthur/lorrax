@@ -65,7 +65,7 @@ from jax.sharding import Mesh, PartitionSpec as P
 
 from common.shard_map import shard_map as _shard_map_fn
 
-from common.fft_helpers import local_fftn3, local_ifftn3
+from common.fft_helpers import local_fftn3
 from .bse_ring_comm import make_bse_shardings
 
 
@@ -200,7 +200,7 @@ def build_bse_stack_matvec(
             T_b = jnp.einsum("kctM,cksN->MNtsk", psi_c_X, Rc)        # (μ_loc, ν_loc, ns, ns, nk)
             mu_loc, nu_loc, ns = T_b.shape[0], T_b.shape[1], T_b.shape[2]
 
-            # conv: U_b = (1/√Nk) Σ_q W_q T_b[..., k−q]  (ortho ifft_k · W_R · fft_k)
+            # conv: U_b = (1/√Nk) Σ_q W_q T_b[..., k−q]  (ifft_k · W_R · fft_k)
             #
             # THIS IS AN FFT AND IT STAYS AN FFT.  A dense (nk x nk) DFT
             # contraction gives the same numbers and measured 2.3x faster on
@@ -213,10 +213,16 @@ def build_bse_stack_matvec(
             # any measurement.  If the k-transform is a bottleneck the answer
             # is a better FFT (batching, an FFI handler, fewer dispatches),
             # never a denser algorithm.
+            # The inverse transform is spelled conj(fft(conj(x))) so that BOTH
+            # transforms are forward and UNNORMALISED.  An ``ifft`` here would
+            # put the 1/nk inside XLA's FFT thunk, where it runs as a separate
+            # cuBLAS zscal over the whole T-tensor that no fusion pass can see
+            # -- a full extra HBM round trip per matvec.  The 1/nk is folded
+            # onto the decode output below instead.
             T_k = T_b.reshape(mu_loc, nu_loc, ns, ns, nkx, nky, nkz)
-            T_R = local_ifftn3(T_k, axes=(4, 5, 6), norm="ortho")
+            T_R = jnp.conj(local_fftn3(jnp.conj(T_k), axes=(4, 5, 6), norm=None))
             U_R = W_R[:, :, None, None, :, :, :] * T_R
-            U_b = local_fftn3(U_R, axes=(4, 5, 6), norm="ortho").reshape(
+            U_b = local_fftn3(U_R, axes=(4, 5, 6), norm=None).reshape(
                 mu_loc, nu_loc, ns, ns, nk)
 
             # decode: (WX)_b = (1/√Nk) Σ_{μ,ν,t,s} conj(ψ_c) ψ_v U_b.  psum_scatter
@@ -229,7 +235,10 @@ def build_bse_stack_matvec(
             if not use_yhoist:
                 WXcv = lax.psum_scatter(
                     WXcv, "y", scatter_dimension=1, tiled=True)     # (c_loc, v_loc, nk)
-            return carry, WXcv / sqrt_nk
+            # Carries the two unnormalised transforms' 1/nk, on a
+            # (c_loc, v, nk) tensor ~120x smaller than T that is being written
+            # anyway -- that is the whole reason it is folded to here.
+            return carry, WXcv / (sqrt_nk * nk)
 
         if use_yhoist:
             # ONE 'y' all-gather for the whole block instead of n_trials of
