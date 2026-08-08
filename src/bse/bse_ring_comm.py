@@ -406,8 +406,10 @@ def apply_V_ring(
         psi_v_slice = lax.dynamic_slice(
             psi_v_Y, (z, v_start, z, z), (nk_local, v_chunk, nspinor, nu_local)
         )
-        R_v = jnp.einsum("kvsN,bcvk->bcksN", psi_v_slice, buf)
-        A = A + jnp.einsum("kcsN,bcksN->bcNk", jnp.conj(psi_c_slice), R_v)
+        # Forward (encode) leg carries the CONJUGATED vertex conj(M) =
+        # ψ_c·conj(ψ_v) — see the K^x = M V M† note at the back-contract below.
+        R_v = jnp.einsum("kvsN,bcvk->bcksN", jnp.conj(psi_v_slice), buf)
+        A = A + jnp.einsum("kcsN,bcksN->bcNk", psi_c_slice, R_v)
         buf = lax.ppermute(buf, axis_name="y", perm=perm_y)
         return buf, A
 
@@ -441,7 +443,12 @@ def apply_V_ring(
     M_X_slice = lax.dynamic_slice(
         M_X, (z, z, v_start_local, z), (nk_local, nc_full, v_chunk, mu_local)
     )
-    VX_partial = jnp.einsum("kcvM,bM->bcvk", jnp.conj(M_X_slice), U)  # broadcast over k
+    # Back-contract carries the BARE vertex: K^x = M V M†, fixed by the
+    # transition density <0|ρ̂|Ψ> = Σ A_cvk ψ_ck ψ*_vk.  (The reverse assignment
+    # builds conj(K^x), which cannot be covariant alongside the correct W term.)
+    # This also sets the non-TDA B block: apply_V_ring_B conjugates ψ^Y on the
+    # way in, so its forward leg is the bare M and it assembles B = M V M^T.
+    VX_partial = jnp.einsum("kcvM,bM->bcvk", M_X_slice, U)  # broadcast over k
     VX = lax.psum_scatter(VX_partial, axis_name="x", scatter_dimension=1, tiled=True)
 
     return VX / sqrt_nk
@@ -1001,7 +1008,10 @@ def build_realspace_random_transition_generator(
         )
 
         M_X = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_X), psi_v_slice)  # (k,c_full,v,mu_x)
-        VX_partial = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M_X), U)          # local-mu, c full
+        # Decode leg of K^x = M V M† carries the BARE vertex (the conjugate
+        # belongs on the encode leg — see build_density_snapshot_operator, the
+        # partner half of the v(ω−H)⁻¹v form these two assemble together).
+        VX_partial = jnp.einsum("kcvM,bMk->bcvk", M_X, U)                    # local-mu, c full
         # psum over x completes the mu sum across x-slices AND scatters the
         # conduction index onto x -> (b, c_chunk_x, v_chunk_y, k).
         X_local = lax.psum_scatter(
@@ -1102,8 +1112,11 @@ def build_density_snapshot_operator(
             psi_v_slice = lax.dynamic_slice(
                 psi_v_Y, (z, v_start, z, z), (nk_local, v_chunk, nspinor, nu_local)
             )
-            R_v = jnp.einsum("kvsN,bcvk->bcksN", psi_v_slice, buf)
-            A = A + jnp.einsum("kcsN,bcksN->bcNk", jnp.conj(psi_c_slice), R_v)
+            # Encode leg carries the CONJUGATED vertex conj(M) = ψ_c·conj(ψ_v),
+            # matching K^x = M V M† (the decode half lives in
+            # build_realspace_random_transition_generator).
+            R_v = jnp.einsum("kvsN,bcvk->bcksN", jnp.conj(psi_v_slice), buf)
+            A = A + jnp.einsum("kcsN,bcksN->bcNk", psi_c_slice, R_v)
             buf = lax.ppermute(buf, axis_name="y", perm=perm_y)
             return buf, A
 
@@ -1308,9 +1321,9 @@ def ring_matvec_correctness_check(
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
         M = compute_pair_amplitude(psi_c, psi_v)
         D_ref = apply_D(X, eps_c, eps_v)
-        S_V = jnp.einsum("kcvN,bcvk->bNk", M, X) / sqrt_nk
+        S_V = jnp.einsum("kcvN,bcvk->bNk", jnp.conj(M), X) / sqrt_nk
         U_V = jnp.einsum("MN,bNk->bMk", V_q0, S_V)
-        V_ref = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M), U_V) / sqrt_nk
+        V_ref = jnp.einsum("kcvM,bMk->bcvk", M, U_V) / sqrt_nk
 
         R = jnp.einsum("kvsN,bcvk->bcksN", jnp.conj(psi_v), X)
         T = jnp.einsum("kctM,bcksN->bMNtsk", psi_c, R)

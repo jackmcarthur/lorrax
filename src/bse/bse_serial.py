@@ -50,9 +50,15 @@ def apply_bse_hamiltonian_single_device(
     # k-free transition-Hartree density S[b,nu] = (1/sqrt_Nk) sum_{k'c'v'} M X,
     # one V_q0 solve, then the decode broadcasts back at every k.  The two
     # 1/sqrt_Nk compose to the 1/Nk the dense formula requires.
-    S_V = jnp.einsum("kcvN,bcvk->bN", M, X) / sqrt_nk
+    #
+    # Conjugation: the transition density <0|rho|Psi> = sum A_cvk psi_c psi_v*
+    # puts the CONJUGATED vertex on the forward (encode) leg and the bare vertex
+    # on the back-contract, i.e. K^x = M V M^dagger with M = compute_pair_amplitude.
+    # The reverse assignment builds conj(M) V M^T = conj(K^x), which no symmetry
+    # operator can commute with alongside the (correct) W term.
+    S_V = jnp.einsum("kcvN,bcvk->bN", jnp.conj(M), X) / sqrt_nk
     U_V = jnp.einsum("MN,bN->bM", V_q0, S_V)
-    V_term = jnp.einsum("kcvM,bM->bcvk", jnp.conj(M), U_V) / sqrt_nk
+    V_term = jnp.einsum("kcvM,bM->bcvk", M, U_V) / sqrt_nk
 
     if not include_W:
         return D_term + V_term

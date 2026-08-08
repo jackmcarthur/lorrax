@@ -96,16 +96,18 @@ def build_bse_simple_matvec(
 
         # Exchange (q=0) is DENSE in (k,k') — k is SUMMED in the encode, one
         # V_q0 solve, then broadcast back at every k in the decode (VERDICT.md).
-        # S[b, ν] = Σ_{k,c,v} M_Y[k,c,v,ν] · X[b,c,v,k] / sqrt_nk.
-        # Original forward (apply_V_ring) is conj(ψ_c)·ψ_v·X — i.e. M_Y
-        # itself, not conj(M_Y).  The hermitian-conjugate counterpart on
-        # the back-contract uses conj(M_X) instead.
+        # S[b, ν] = Σ_{k,c,v} conj(M_Y[k,c,v,ν]) · X[b,c,v,k] / sqrt_nk.
+        # The transition density <0|ρ̂|Ψ> = Σ A_cvk ψ_ck ψ*_vk puts the
+        # CONJUGATED vertex on the forward (encode) leg and the bare vertex on
+        # the back-contract: K^x = M V M†.  The reverse assignment builds
+        # conj(M) V M^T = conj(K^x), which no symmetry operator can commute
+        # with alongside the (correct, untouched) W term.
         # Contraction over k (replicated), c (x-sharded in X), v (y-sharded).
         # M has c, v replicated and ν on y. XLA picks the partitioning;
         # we tag the output P(None, "y").
         S = jnp.einsum(
             'kcvN,bcvk->bN',
-            M_Y, X, optimize=True,
+            jnp.conj(M_Y), X, optimize=True,
         )
         S = lax.with_sharding_constraint(S, sh.S_k0)
         S = S / sqrt_nk
@@ -119,13 +121,14 @@ def build_bse_simple_matvec(
         )
         U_mu = lax.with_sharding_constraint(U_mu, sh.d_mu)
 
-        # M_X[k, c, v, μ] (μ on x) is the hoisted back-contract vertex.
-        # HX_V[b, c, v, k] = Σ_μ M_X*[k,c,v,μ] · U_mu[b,μ] / sqrt_nk (broadcast k).
+        # M_X[k, c, v, μ] (μ on x) is the hoisted back-contract vertex — BARE,
+        # the conjugate having been spent on the forward leg above.
+        # HX_V[b, c, v, k] = Σ_μ M_X[k,c,v,μ] · U_mu[b,μ] / sqrt_nk (broadcast k).
         # M_X has c, v replicated, μ on x. U_mu has μ on x. Locally μ-aligned;
         # output b, c on x (need to scatter c to x), v rep, k rep.
         HX_V = jnp.einsum(
             'kcvM,bM->bcvk',
-            jnp.conj(M_X), U_mu, optimize=True,
+            M_X, U_mu, optimize=True,
         )
         HX_V = lax.with_sharding_constraint(HX_V, sh.X)
         HX_V = HX_V / sqrt_nk

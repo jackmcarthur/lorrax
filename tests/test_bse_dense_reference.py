@@ -7,7 +7,7 @@ checks each live matvec against it.
 The settled physics (reports/bse_refactor_map_2026-07-15/archive/adjudication/
 VERDICT.md): the Q=0 exchange is DENSE in (k,k′) —
 
-    ⟨cvk|K^x|c'v'k'⟩ = (1/Nk) Σ_{μν} conj(M_cvk(μ)) V_q0(μν) M_c'v'k'(ν)
+    ⟨cvk|K^x|c'v'k'⟩ = (1/Nk) Σ_{μν} M_cvk(μ) V_q0(μν) conj(M_c'v'k'(ν))
 
 with no δ_kk′.  The B1 fix k-SUMS the exchange encode (``S[b,ν]``, k-free) and
 broadcasts the decode back at every k, so the full-H / D+V / spectrum checks
@@ -68,9 +68,11 @@ def _build_dense_H(data):
     # D — diagonal (correct as coded): ε_c(k) − ε_v(k), layout (c,v,k).
     D = np.transpose(eps_c[:, :, None] - eps_v[:, None, :], (1, 2, 0))
 
-    # Exchange — DENSE in (k,k′).  Kx[c,v,k, c',v',k'].
-    lhs = np.einsum("kcvM,MN->kcvN", np.conj(M), V_q0)   # conj(M)·V
-    Kx = np.einsum("kcvN,KCVN->cvkCVK", lhs, M) / nk
+    # Exchange — DENSE in (k,k′).  Kx[c,v,k, c',v',k'] = M V M†: the bra carries
+    # the bare vertex, the ket the conjugate (transition density
+    # <0|ρ̂|Ψ> = Σ A_cvk ψ_ck ψ*_vk).
+    lhs = np.einsum("kcvM,MN->kcvN", M, V_q0)            # M·V
+    Kx = np.einsum("kcvN,KCVN->cvkCVK", lhs, np.conj(M)) / nk
 
     # Direct — screened W_{μν}(k−k′), 1/Nk, q = k − k′ (ortho fft convolution).
     Wflat = W_q.reshape(nmu, nmu, nk)   # (μ,ν,qflat) C-order
@@ -97,7 +99,8 @@ def _build_dense_nontda(data):
 
     Extends ``_build_dense_H``: A = diag(D)+Kx−Kd (resonant, Hermitian); the
     coupling block B = Kx_B − Kd_B is the FIRST value-validation of the B-blocks
-    WITH screened W.  Kx_B conjugates the ket pair density (Henneke 2-20); Kd_B
+    WITH screened W.  Kx_B un-conjugates the ket pair density relative to A, so
+    A = M V M† while B = M V M^T (Henneke 2-20); Kd_B
     swaps c'↔v' in the k' pair densities (the anti-resonant coupling).  The
     physical operator is the para-Hermitian SHAO ``H = [[A, B], [-B*, -A*]]``
     (A Hermitian, B complex-symmetric) — real spectrum, ±ω pairs."""
@@ -109,8 +112,8 @@ def _build_dense_nontda(data):
     H_A, _, _, _ = _build_dense_H(data)                     # A block = resonant H
     A = H_A
     M = np.einsum("kcsm,kvsm->kcvm", np.conj(psi_c), psi_v)
-    lhs = np.einsum("kcvM,MN->kcvN", np.conj(M), V_q0)
-    Kx_B = np.einsum("kcvN,KCVN->cvkCVK", lhs, np.conj(M)) / nk    # conj ket
+    lhs = np.einsum("kcvM,MN->kcvN", M, V_q0)
+    Kx_B = np.einsum("kcvN,KCVN->cvkCVK", lhs, M) / nk             # bare ket
     Wflat = W_q.reshape(nmu, nmu, nk)
     Kd_B = np.zeros((nc, nv, nk, nc, nv, nk), dtype=np.complex128)
     for k in range(nk):
