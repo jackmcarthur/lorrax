@@ -532,20 +532,22 @@ set_target_properties(lorrax_ffi PROPERTIES
 )
 
 # ----------------------------------------------------------------------------
-#  EXPORTED SURFACE — the fix for KNOWN_FAILURES L1 (cross-.so ODR).
+#  PRIVATE SYMBOLS — the fix for KNOWN_FAILURES L1 (cross-.so ODR).
 #
 #  The two platform libraries are dlopened RTLD_GLOBAL into ONE process, so
 #  every default-visibility symbol they both define is one name with two
-#  definitions behind it and the first-loaded answers for both.  Measured
-#  2026-08-07 on the BUILD_NOTES-pinned pair: 259 shared names, 25 of them
-#  LORRAX's own phdf5 core and lrx_* entry points -- which is how a PhdfCtx*
-#  minted under one build's layout came to be read under the other's.
+#  definitions behind it and the first-loaded answers for both -- including
+#  for the other library's own internal calls.  Measured 2026-08-07 on the
+#  BUILD_NOTES-pinned pair: 259 shared names, 25 of them LORRAX's own phdf5
+#  core and lrx_* entry points, which is how a PhdfCtx* minted under one
+#  build's layout came to be read under the other's.
 #
-#  exports_cuda.map names the whole intended surface and localises the rest.
-#  Read that file for why a version script and not -fvisibility=hidden (short
-#  version: hidden visibility also flips gcc's typeinfo-name marking, which
-#  would break `catch (slate::Exception&)` on exceptions thrown by
-#  libslate.so).  LINK_DEPENDS so editing the map relinks.
+#  exports_cuda.map localises everything LORRAX itself defines.  READ IT
+#  before widening the pattern: the `local: *` form was tried first and
+#  segfaults five SLATE host cells, because it also unmerges the weak COMDAT
+#  copies of SLATE's template code that the C++ ABI intends the dynamic
+#  linker to merge with libslate.so's.  The file carries the five-arm
+#  measurement.  LINK_DEPENDS so editing the map relinks.
 # ----------------------------------------------------------------------------
 target_link_options(lorrax_ffi PRIVATE
     "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports_cuda.map")
@@ -1451,10 +1453,11 @@ target_compile_options(lorrax_ffi_host PRIVATE -Wall -Wextra)
 target_link_options(lorrax_ffi_host PRIVATE "-Wl,--no-undefined")
 
 # ----------------------------------------------------------------------------
-#  EXPORTED SURFACE — the host half of the KNOWN_FAILURES L1 fix.  See the
+#  PRIVATE SYMBOLS — the host half of the KNOWN_FAILURES L1 fix.  See the
 #  matching block on the CUDA target above and the header of
-#  exports_host.map; the two maps are written so the libraries' `nm -D
-#  --defined-only` sets intersect in NOTHING, which is what
+#  exports_host.map.  Together with the per-leg C-ABI rename in
+#  cpp/common/c_abi.h, this makes the set of symbols BOTH libraries define
+#  and LORRAX owns empty -- which is what
 #  services/distrib_la/tests/test_so_acceptance.py's check 6 asserts.
 # ----------------------------------------------------------------------------
 target_link_options(lorrax_ffi_host PRIVATE

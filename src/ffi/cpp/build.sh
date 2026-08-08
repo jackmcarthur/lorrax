@@ -209,37 +209,31 @@ GATE_TAG=build "${SCRIPT_DIR}/gate_one_mpi.sh" "${SO_FILE}" || exit 1
 GATE_TAG=build LORRAX_PHDF5_STAGE="${LORRAX_PHDF5_MOUNT:-/lorrax_phdf5}" \
     "${SCRIPT_DIR}/gate_one_hdf5.sh" "${SO_FILE}" || exit 1
 
-# GATE 9: THE EXPORTED SURFACE IS THE SANCTIONED ONE, AND NOTHING ELSE.
+# GATE 9: NO LORRAX-OWNED INTERNAL IS ON THE DYNAMIC TABLE.
 #
-# The device half of the KNOWN_FAILURES L1 fix; config/perlmutter/
-# build_ffi_host.sh carries the host half and the same argument.  Both
-# platform .so's are dlopened RTLD_GLOBAL into one process and ld.so answers
-# a name from the FIRST object that defined it -- for the whole process,
-# including for the OTHER library's internal calls.  Measured 2026-08-07 on
-# the pinned pair: 259 defined names in common, 25 of them LORRAX's own,
-# among them `lorrax_ffi::phdf5::open_ctx` -- whose `PhdfCtx` return type has
-# a DIFFERENT LAYOUT in the two builds.
-#
-# src/ffi/cpp/exports_cuda.map localises everything except the two sanctioned
-# patterns.  This gate notices the day the version script falls off the link
-# line; the symptom otherwise is a wrong number in a mixed process.
-echo "[build] GATE 9 (exported surface is the sanctioned one)"
-_stray=$(nm -D --defined-only "${SO_FILE}" 2>/dev/null | awk '{print $NF}' \
-         | grep -vE 'Ffi$|^lrx_[A-Za-z0-9_]+$' || true)
-if [ -n "$(printf %s "${_stray}" | tr -d '[:space:]')" ]; then
-    echo "[build] GATE FAILED (9): the device library exports symbols" >&2
-    echo "[build]   outside its sanctioned surface (*Ffi handlers and the" >&2
-    echo "[build]   lrx_* ctypes entry points).  Anything else can be" >&2
-    echo "[build]   answered by -- or can answer for -- liblorrax_ffi_host.so" >&2
-    echo "[build]   in a process that has both open.  Offenders:" >&2
-    printf '%s\n' "${_stray}" | sed 's/^/    /' >&2
-    echo "[build]   Usual cause: -Wl,--version-script=exports_cuda.map is" >&2
-    echo "[build]   not on the link line (check CMakeCache.txt).  If a NEW" >&2
-    echo "[build]   symbol genuinely has to be exported, add it to that map" >&2
-    echo "[build]   deliberately -- that file is the whole surface." >&2
+# The device twin of the gate in config/perlmutter/build_ffi_host.sh, which
+# carries the full argument.  Both platform .so's are dlopened RTLD_GLOBAL
+# into one process and ld.so answers a name from the FIRST object that
+# defined it -- including for the OTHER library's internal calls.  Measured
+# 2026-08-07 on the pinned pair: 259 defined names in common, 25 of them
+# LORRAX's own, among them `lorrax_ffi::phdf5::open_ctx` -- whose `PhdfCtx`
+# return type has a different LAYOUT in the two builds.  That is
+# KNOWN_FAILURES L1.  src/ffi/cpp/exports_cuda.map localises them; this gate
+# notices the day it falls off the link line.
+echo "[build] GATE 9 (no LORRAX internal on the dynamic table)"
+_leaked=$(nm -D --defined-only "${SO_FILE}" 2>/dev/null | awk '{print $NF}' \
+          | grep -E 'lorrax_ffi' || true)
+if [ -n "$(printf %s "${_leaked}" | tr -d '[:space:]')" ]; then
+    echo "[build] GATE FAILED (9): LORRAX-owned internals are on the" >&2
+    echo "[build]   dynamic table.  liblorrax_ffi_host.so defines these" >&2
+    echo "[build]   names too, and in a process with both open the first" >&2
+    echo "[build]   one loaded answers them for BOTH." >&2
+    printf '%s\n' "${_leaked}" | head -20 | sed 's/^/    /' >&2
+    echo "[build]   Cause: -Wl,--version-script=exports_cuda.map is not on" >&2
+    echo "[build]   the link line (check CMakeCache.txt)." >&2
     exit 1
 fi
-echo "[build] GATE 9 PASSED: $(nm -D --defined-only "${SO_FILE}" | wc -l) exported symbols, all sanctioned"
+echo "[build] GATE 9 PASSED: 0 lorrax_ffi internals exported"
 
 # Build provenance beside the artifact.  ffi_loader.build_provenance()
 # prints it in every run's startup report; without it the loader can only say

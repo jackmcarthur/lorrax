@@ -1,50 +1,35 @@
-/* exports_host.map — the ENTIRE dynamic surface of liblorrax_ffi_host.so.
+/* exports_host.map — what liblorrax_ffi_host.so keeps PRIVATE.
  *
- * The host twin of exports_cuda.map; read that file first, it carries the
- * argument.  This one differs in exactly the three patterns below, and the
- * difference is the point: the two libraries' `nm -D --defined-only` sets
- * must intersect in NOTHING, so that neither can answer a name on the
- * other's behalf under RTLD_GLOBAL.
+ * The host twin of exports_cuda.map.  READ THAT FILE FIRST: it carries the
+ * argument, the measurement table behind the `*lorrax_ffi*` denylist (and
+ * why `local: *` crashes five SLATE host cells), and the note on what stays
+ * shared and where it is tracked.  The same rule applies here --
+ * **LORRAX's own definitions are private to the library that compiled them**
+ * -- with one exception, spelled out below.
  *
- *   *HostFfi                      the XLA FFI handler registration symbols
- *                                 of this leg.  FROZEN (invariant 1).  The
- *                                 `Host` infix predates this work -- it is
- *                                 how the two legs already registered the
- *                                 SAME jax.ffi target strings under
- *                                 different C++ symbols -- so the handler
- *                                 surface was never part of L1.  Matching
- *                                 `*HostFfi` rather than `*Ffi` means a
- *                                 handler that forgot the infix does not
- *                                 quietly get exported here and re-open the
- *                                 collision.
- *
- *   lrx_*_host                    the ctypes lifecycle API.  cpp/phdf5/api.cc
- *                                 and cpp/slate/context.cc are CUDA-free and
- *                                 compile into BOTH libraries, so their nine
- *                                 `extern "C"` entry points used to be
- *                                 defined twice under one name.
- *                                 cpp/common/c_abi.h's LRX_C_ENTRY appends
- *                                 `_host` on this leg; ffi_loader.py binds
- *                                 the suffixed symbol under the unsuffixed
- *                                 Python name at load time, so no call site
- *                                 changed.
- *
- *   lorrax_ffi_host_build_config  host-only by construction
- *                                 (cpp/common/build_config.cc is in
- *                                 LORRAX_FFI_HOST_SOURCES and nowhere else),
- *                                 so it collides with nothing.  Kept
- *                                 exported because it is declared as an API:
- *                                 today its `scalapack=<0|1>` stamp is read
- *                                 out of .rodata by test_so_acceptance.py's
- *                                 check 1, and hiding the symbol would make
- *                                 the function permanently unreachable for
- *                                 the runtime report it was written for.
+ * The other half of the L1 fix is not in this file, because it cannot be:
+ * the nine `lrx_*` ctypes entry points that cpp/phdf5/api.cc and
+ * cpp/slate/context.cc compile into BOTH libraries have to stay in `.dynsym`
+ * for Python to bind them, so hiding is not available.  They are
+ * disambiguated by RENAMING instead -- cpp/common/c_abi.h's LRX_C_ENTRY
+ * appends `_host` on this leg, the same per-library renaming the `*HostFfi`
+ * handlers already used -- and `ffi_loader._bind_c_abi` binds the suffixed
+ * symbol under the plain Python name at load, so no call site changed.
  */
 {
   global:
-    *HostFfi;
-    lrx_*_host;
+    /* EXCEPTION to the pattern below, and the reason this file has a
+       `global:` clause at all: the build-config stamp is host-only by
+       construction (cpp/common/build_config.cc is in
+       LORRAX_FFI_HOST_SOURCES and nowhere else), so it collides with
+       nothing -- but its NAME contains `lorrax_ffi`, so the denylist would
+       take it.  An exact name beats a wildcard in a version script.
+       Exported because it is declared as an API: today its
+       `scalapack=<0|1>` stamp is read out of .rodata by
+       test_so_acceptance.py's check 1, and hiding the symbol would make the
+       function permanently unreachable for the runtime report it exists
+       for. */
     lorrax_ffi_host_build_config;
   local:
-    *;
+    *lorrax_ffi*;
 };

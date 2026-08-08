@@ -492,47 +492,62 @@ fi
 GATE_TAG=build_ffi_host LORRAX_PHDF5_STAGE="$LORRAX_PM_PHDF5_STAGE" \
     "$SRC/gate_one_hdf5.sh" "$SO_FILE" || exit 1
 
-# GATE 9: THE EXPORTED SURFACE IS THE SANCTIONED ONE, AND NOTHING ELSE.
+# GATE 9: NO LORRAX-OWNED INTERNAL IS ON THE DYNAMIC TABLE.
 #
-# This gate is the build-time half of the KNOWN_FAILURES L1 fix (the test-time
-# half is services/distrib_la/tests/test_so_acceptance.py check 6, which
-# INTERSECTS the two libraries; a build script only ever sees one of them, so
-# it checks the property that makes the intersection empty instead).
+# The build-time half of the KNOWN_FAILURES L1 fix.  The test-time half is
+# services/distrib_la/tests/test_so_acceptance.py check 6, which INTERSECTS
+# the two libraries; a build script only ever sees one of them, so it checks
+# the property that makes the LORRAX part of that intersection empty.
 #
 # WHAT WENT WRONG.  Both platform .so's are dlopened RTLD_GLOBAL into one
-# process, and ld.so answers a name from the FIRST object that defined it —
-# for the whole process, including for the OTHER library's own internal calls.
-# Measured 2026-08-07 on the pinned pair: 259 defined names in common, 25 of
-# them LORRAX's own.  Among them `lorrax_ffi::phdf5::open_ctx`, whose return
-# type `PhdfCtx` has a DIFFERENT LAYOUT in the two builds (the CUDA
-# stream/event/pinned members compile out here).  One library's handler read
-# the other's struct at the wrong offsets:
+# process, and ld.so answers a name from the FIRST object that defined it --
+# for the whole process, including for the OTHER library's own internal
+# calls.  Measured 2026-08-07 on the pinned pair: 259 defined names in
+# common, 25 of them LORRAX's own.  Among them `lorrax_ffi::phdf5::open_ctx`,
+# whose `PhdfCtx` return type has a DIFFERENT LAYOUT in the two builds (the
+# CUDA stream/event/pinned members compile out here).  One library's handler
+# read the other's struct at the wrong offsets:
 #     offset_base=[0,0,0,4596944070643295330]     <- a float64 read as int64
 #
-# src/ffi/cpp/exports_host.map now localises everything except the three
-# sanctioned patterns.  This gate is what notices the day someone drops the
-# version script from the link line — the symptom otherwise is a wrong number
-# in a mixed process, weeks later.
-echo "[build_ffi_host] GATE 9 (exported surface is the sanctioned one)"
-stray=$(nm -D --defined-only "$SO_FILE" 2>/dev/null | awk '{print $NF}' \
-        | grep -vE 'HostFfi$|^lrx_[a-z0-9_]+_host$|^lorrax_ffi_host_build_config$' \
-        || true)
-if [[ -n "${stray//[[:space:]]/}" ]]; then
-    echo "[build_ffi_host] GATE FAILED (9): the host library exports symbols" >&2
-    echo "[build_ffi_host]   outside its sanctioned surface (*HostFfi handlers," >&2
-    echo "[build_ffi_host]   lrx_*_host ctypes entry points, and the build-config" >&2
-    echo "[build_ffi_host]   stamp).  Anything else can be answered by — or can" >&2
-    echo "[build_ffi_host]   answer for — liblorrax_ffi.so in a process that has" >&2
-    echo "[build_ffi_host]   both open.  Offenders:" >&2
-    printf '%s\n' "$stray" | sed 's/^/    /' >&2
-    echo "[build_ffi_host]   Usual cause: -Wl,--version-script=exports_host.map" >&2
-    echo "[build_ffi_host]   is not on the link line (check CMakeCache.txt and" >&2
-    echo "[build_ffi_host]   src/ffi/cpp/CMakeLists.txt).  If a NEW symbol"       >&2
-    echo "[build_ffi_host]   genuinely has to be exported, add it to that map"    >&2
-    echo "[build_ffi_host]   deliberately — that file is the whole surface."      >&2
+# TWO THINGS ARE CHECKED, because the fix has two halves:
+#   (a) nothing `lorrax_ffi`-namespaced is exported -- src/ffi/cpp/
+#       exports_host.map localises it (the build-config stamp is the one
+#       deliberate exception and is named here as such);
+#   (b) every exported `lrx_*` ctypes entry point carries the `_host` leg
+#       suffix -- cpp/common/c_abi.h's LRX_C_ENTRY.  Those nine cannot be
+#       hidden (Python dlsyms them), so renaming is what stops them
+#       colliding.
+#
+# This gate is what notices the day the version script falls off the link
+# line or LRX_C_ENTRY stops being applied.  The symptom otherwise is a wrong
+# number in a mixed process, weeks later.
+echo "[build_ffi_host] GATE 9 (no LORRAX internal on the dynamic table)"
+_dynsyms=$(nm -D --defined-only "$SO_FILE" 2>/dev/null | awk '{print $NF}')
+leaked=$(grep -E 'lorrax_ffi' <<<"$_dynsyms" \
+         | grep -vE '^lorrax_ffi_host_build_config$' || true)
+if [[ -n "${leaked//[[:space:]]/}" ]]; then
+    echo "[build_ffi_host] GATE FAILED (9a): LORRAX-owned internals are on" >&2
+    echo "[build_ffi_host]   the dynamic table.  liblorrax_ffi.so defines" >&2
+    echo "[build_ffi_host]   these names too, and in a process with both" >&2
+    echo "[build_ffi_host]   open the first one loaded answers them for" >&2
+    echo "[build_ffi_host]   BOTH -- including for this library's own calls." >&2
+    printf '%s\n' "$leaked" | head -20 | sed 's/^/    /' >&2
+    echo "[build_ffi_host]   Cause: -Wl,--version-script=exports_host.map is" >&2
+    echo "[build_ffi_host]   not on the link line (check CMakeCache.txt)." >&2
     exit 1
 fi
-echo "[build_ffi_host] GATE 9 PASSED: $(nm -D --defined-only "$SO_FILE" | wc -l) exported symbols, all sanctioned"
+bare_lrx=$(grep -E '^lrx_' <<<"$_dynsyms" | grep -vE '_host$' || true)
+if [[ -n "${bare_lrx//[[:space:]]/}" ]]; then
+    echo "[build_ffi_host] GATE FAILED (9b): unsuffixed lrx_* entry points" >&2
+    printf '%s\n' "$bare_lrx" | sed 's/^/    /' >&2
+    echo "[build_ffi_host]   cpp/phdf5/api.cc and cpp/slate/context.cc"    >&2
+    echo "[build_ffi_host]   compile into BOTH libraries; their entry"      >&2
+    echo "[build_ffi_host]   points must go through cpp/common/c_abi.h's"   >&2
+    echo "[build_ffi_host]   LRX_C_ENTRY so this leg's carry '_host'."      >&2
+    exit 1
+fi
+echo "[build_ffi_host] GATE 9 PASSED: 0 lorrax_ffi internals exported, all $(grep -cE '^lrx_' <<<"$_dynsyms") lrx_* entry points leg-suffixed"
+unset _dynsyms
 
 # GATE 4: nothing left unresolved at load time.  -Wl,--no-undefined already
 # fails the LINK on a missing link-time symbol; this catches the other half —
