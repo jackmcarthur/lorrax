@@ -39,6 +39,7 @@ from .bse_lanczos import (
     lanczos_eig_jit,
     simple_lanczos_eig,
     solve_bse,
+    iters_reported,
 )
 from .bse_io import write_eigenvectors_stream
 
@@ -208,7 +209,10 @@ def _preview_lanczos(
                 solver_kind=solver_kind, tda=tda,
             )
             _sec.watch(eigenvalues, eigenvectors)
-        n_done = int(n_iter_done)
+        # Fixed-iteration routes return N_ITER_NOT_MEASURED; only the
+        # convergence-driven route (rtol > 0) reports a real count.  Going
+        # through the helper is what keeps the sentinel out of arithmetic.
+        n_done = iters_reported(n_iter_done, block_max_iter)
         if rtol > 0:
             tag = "Block Lanczos" if block_size > 1 else "Lanczos"
             print(f"{tag} exited at iter {n_done}/{block_max_iter} "
