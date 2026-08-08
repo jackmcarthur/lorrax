@@ -144,6 +144,9 @@ def solve_bse_sharded(
     atol: float = 1e-8,
     check_every: int = 4,
     solver_kind: str = "lanczos",
+    davidson_m_max: int | None = None,
+    davidson_precond: str = "bare",
+    davidson_olsen: bool = False,
     trlan_m_max: int | None = None,
     trlan_n_keep: int | None = None,
     davidson_n_random_init: int = 5,
@@ -240,6 +243,15 @@ def solve_bse_sharded(
     # donated jit lets XLA alias W_R onto W_q's buffer and lets the caller
     # drop the Python reference, so only ONE copy survives into the solve.
     # Value-identical: same helper, same axes, same norm, same operand.
+    # The q=0 slice of W_q, kept for the exact-diagonal preconditioner.  It
+    # must be taken HERE, before the donated ifft below consumes W_q: deriving
+    # it from W_R instead would make the answer depend on that ifft's norm
+    # convention, and it is a (mu, nu) slice of a (mu, nu, 4, 4, 4) tensor, so
+    # keeping it costs 1/64 of one W_q.
+    _W_q0 = data["W_q"][:, :, 0, 0, 0] if (
+        include_W and solver_kind == "davidson"
+        and davidson_precond == "exact") else None
+
     if include_W:
         with timing.section("bse.solve.W_ifft") as _sec_wifft:
             _W_ifft_donated = jax.jit(_W_local_ifftn, donate_argnums=(0,))
@@ -271,9 +283,37 @@ def solve_bse_sharded(
                                eps_c, eps_v, W_R, V_q0, M_X, M_Y)
 
         bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
+        # ── preconditioner route ──────────────────────────────────────
+        # "bare"  : 1/(dE - lam + eps)          -- what LORRAX has always done
+        # "exact" : 1/(diag(H) - lam + eps)     -- what BerkeleyGW hands PRIMME
+        # The exact diagonal is assembled ONCE here (two einsums, ~0.3 GFLOP,
+        # under a third of one matvec).  The per-iteration application is
+        # elementwise on the (c, v, k) shards either way: same shape, same
+        # sharding, ZERO collectives, no new shard_map, no retrace.
+        _diag_H = None
+        if davidson_precond == "exact":
+            if _W_q0 is None:
+                raise ValueError(
+                    "--davidson-precond exact needs the W term; this run has "
+                    "include_W=False, so diag(H) is just dE and the bare "
+                    "route is already exact.")
+            from .bse_davidson_helpers import build_bse_exact_diagonal
+            with timing.section("bse.solve.exact_diag"):
+                _diag_H = build_bse_exact_diagonal(
+                    eps_c, eps_v, psi_c_X, psi_v_Y, _W_q0, M_X, M_Y, V_q0,
+                    nk, sharding=NamedSharding(mesh_xy, P("x", "y", None)))
+                _diag_H.block_until_ready()
+            print(f"Davidson preconditioner: EXACT diag(H) "
+                  f"(dE + (V_x - W_d)/nk), assembled once", flush=True)
+        else:
+            print("Davidson preconditioner: bare dE", flush=True)
+        if davidson_olsen:
+            print("Davidson preconditioner: Olsen correction ON", flush=True)
+
         precond_fn = bse_diagonal_precond(
             eps_c, eps_v, sharding=NamedSharding(mesh_xy, P("x", "y", None)),
-            epsilon_shift=davidson_eps_shift_Ry)
+            epsilon_shift=davidson_eps_shift_Ry,
+            diag_H=_diag_H, olsen=davidson_olsen)
         X0 = init_bse_subspace(
             eps_c, eps_v, n_eig=n_eig,
             n_cond=int(data["n_cond"]), n_val=int(data["n_val"]),
@@ -313,7 +353,9 @@ def solve_bse_sharded(
         # 2·n_eig, …, m_max} so the Davidson loop does not pay 4 separate
         # XLA compiles as the subspace grows between restarts. Compiles
         # ~2 s otherwise; with warmup this is a one-time up-front cost.
-        m_max_warm = 4 * n_eig
+        from solvers.davidson import DEFAULT_M_MAX_FACTOR
+        m_max_warm = (int(davidson_m_max) if davidson_m_max
+                      else DEFAULT_M_MAX_FACTOR * n_eig)
         warmup_davidson_jit(
             n_eig=n_eig,
             trailing_shape=tuple(X0.shape[1:]),
@@ -322,8 +364,11 @@ def solve_bse_sharded(
             sharding=bse_sharding,
         )
 
+        print(f"Davidson: m_max={m_max_warm} ({m_max_warm // n_eig}x n_eig), "
+              f"storing 2*m_max = {2 * m_max_warm} trial vectors", flush=True)
         eigenvalues, eigenvectors = davidson(
             apply_H, n_eig=n_eig, precond_fn=precond_fn, X0=X0,
+            m_max=m_max_warm,
             max_iter=max_iter, tol=atol if atol > 0 else 1e-8,
             verbose=True,
         )

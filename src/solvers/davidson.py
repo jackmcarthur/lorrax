@@ -77,6 +77,39 @@ def instrumentation_summary() -> str:
     return "\n".join(lines)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  Subspace cap
+# ═══════════════════════════════════════════════════════════════════════
+#: ``m_max = DEFAULT_M_MAX_FACTOR * n_eig`` is the restart cap.
+#:
+#: This was 4 and 4 is a defect-shaped default, not merely a conservative one.
+#: On the Si 4x4x4 record deck (post exchange-conjugation, band-edge cluster
+#: 0.0177 meV inside a 7.8 eV spectrum) the shipped 4*n_eig **cannot reach
+#: 10 ueV at any budget**: it stalled at 30.8 ueV after 2420 matvec
+#: applications, where unrestarted Lanczos reaches 2.9 ueV in 265.  The cause
+#: is structural -- with m_max = 4*n_eig the subspace runs 20, 40, 60, 80 and
+#: then hard-restarts to 20, so a restart fires every FOUR iterations and
+#: discards all accumulated Krylov information.  The subspace never exceeds 80
+#: on a problem needing ~265 dimensions to resolve its band edge.
+#:
+#: Measured applications to target (0 missed), block = n_eig, eps = 1e-3:
+#:
+#:     m_max      1 meV    10 ueV   floor      vectors stored (V + HV)
+#:     4n           560      2360   6.54 ueV       160
+#:     6n           360      1320   0.24 ueV       240
+#:     8n           200       480   0.00 ueV       320
+#:     10n          180       240   0.01 ueV       400   <- knee
+#:     12n          180       240   0.01 ueV       480
+#:     16n          180       240   0.00 ueV       640
+#:
+#: 10 is the knee: 12n/16n/20n are identical on every column and cost more
+#: memory.  Davidson stores BOTH ``V`` and ``HV``, so the memory is
+#: ``2 * m_max`` vectors -- 20*n_eig, which at n_eig = 20 is 400 copies of one
+#: trial vector.  That is cheap at bse_dim = 1024 and is NOT cheap at
+#: production bse_dim; DAVIDSON_COMPETITIVE.md prices the crossover.
+DEFAULT_M_MAX_FACTOR = 10
+
+
 def _to_host(arr) -> np.ndarray:
     """Bring a (possibly multi-process) jax.Array to host as numpy.
 
@@ -265,7 +298,7 @@ def warmup_davidson_jit(
     ``np.ascontiguousarray(arr[idx])`` realises only this rank's shard.
     """
     if m_max is None:
-        m_max = 4 * n_eig
+        m_max = DEFAULT_M_MAX_FACTOR * n_eig
     for m in range(n_eig, m_max + n_eig, n_eig):
         m_eff = min(m, m_max)
         shape = (m_eff,) + tuple(trailing_shape)
@@ -315,7 +348,11 @@ def davidson(
     X0 : (n_eig, *trailing)
         Explicit initial vectors (alternative to init_fn).
     m_max : int, optional
-        Max subspace dimension before restart. Default 4 × n_eig.
+        Max subspace dimension before restart. Default **10 × n_eig**.
+
+        MEASURED, not guessed (see the module note below). The former 4·n_eig
+        caps the subspace below what a clustered band edge needs and costs an
+        order of magnitude; 10·n_eig is the knee, and larger is pure memory.
     max_iter : int, optional
         Iteration cap. Default 100.
     tol : float, optional
@@ -335,7 +372,7 @@ def davidson(
     if precond_fn is None:
         precond_fn = _default_precond
     if m_max is None:
-        m_max = 4 * n_eig
+        m_max = DEFAULT_M_MAX_FACTOR * n_eig
 
     # Instrumentation: count the vectors H is applied to.  This is the
     # campaign's comparison currency -- the matvec is bandwidth-bound at 84%
@@ -379,7 +416,14 @@ def davidson(
         Lambda, X, HX, R, res = _ritz_and_residuals(V, HV, n_eig)
 
         # ── precondition (caller-provided, possibly JIT'd) ──
-        P = precond_fn(R, Lambda)
+        # An Olsen-corrected preconditioner needs the current Ritz vectors to
+        # project against; a plain Jacobi one does not.  Offer X and fall back,
+        # so both signatures work and neither caller has to know about the
+        # other.
+        try:
+            P = precond_fn(R, Lambda, X)
+        except TypeError:
+            P = precond_fn(R, Lambda)
 
         # ── convergence check (CPU) ──
         res_np = _to_host(res)
