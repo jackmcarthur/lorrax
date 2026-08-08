@@ -400,6 +400,39 @@ def test_route_is_announced_on_both_arms():
         assert "[route] fH_q Fourier: " + token in banner, (route, banner)
 
 
+def test_the_DEFAULT_route_is_the_scan_and_says_why():
+    """The default is a MEASUREMENT, so it gets a gate.
+
+    Both routes are exact and agree to round-off, but the FFT one is slower at
+    this code shapes (0.975-0.985x at P=4, rank 768) because the scan is one
+    batched GEMM and the FFT is memory-bound.  With the knob unset the route
+    must therefore be the SCAN, and the log must name the knob rather than
+    leaving the choice to be rediscovered.
+    """
+    pytest.importorskip("jax")
+    import os
+    prev = os.environ.pop("LORRAX_HTQ_FOURIER_ROUTE", None)
+    try:
+        lines = []
+        mesh = _mesh(1)
+        ct, enk, B, kgrid_co = _synthetic()
+        import jax.numpy as jnp
+        from bandstructure.bse_setup import compute_wfns_fi, resolve_fourier_route
+        assert resolve_fourier_route() == "scan"
+        with mesh:
+            compute_wfns_fi(
+                ctilde=jnp.asarray(ct), B_at_mu=jnp.asarray(B),
+                enk_sigma=jnp.asarray(enk), kgrid_co=kgrid_co,
+                kgrid_fi=(4, 4, 1), band_window_fi=(1, 3), mesh_xy=mesh,
+                log_fn=lines.append)
+        banner = " ".join(lines)
+        assert "[route] fH_q Fourier: SCAN" in banner, banner
+        assert "LORRAX_HTQ_FOURIER_ROUTE=scan" in banner, banner
+    finally:
+        if prev is not None:
+            os.environ["LORRAX_HTQ_FOURIER_ROUTE"] = prev
+
+
 def test_route_env_refuses_garbage_and_refuses_to_demote():
     pytest.importorskip("jax")
     mesh = _mesh(1)

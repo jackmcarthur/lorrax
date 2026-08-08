@@ -152,16 +152,32 @@ def _cached_kernel(key, build):
 
 
 def resolve_fourier_route(log_fn=None) -> str:
-    """``LORRAX_HTQ_FOURIER_ROUTE`` — ``auto`` (default) | ``scan`` | ``fft``.
+    """``LORRAX_HTQ_FOURIER_ROUTE`` — ``scan`` (DEFAULT) | ``auto`` | ``fft``.
 
     Which way ``fH_q = Σ_R e^{-2πi q·R} fH_R`` is evaluated:
 
+    * ``scan``  the historical q-by-q Fourier sum.  **THE DEFAULT, and the
+                default is a MEASUREMENT** — see below.
     * ``auto``  take the FFT route when the target q-set is a rigid shift of a
                 Γ-centred uniform grid AND one block fits the residency cap;
-                otherwise the historical q-by-q scan.
-    * ``scan``  pin the scan.  This is what makes an A/B a ONE-variable change.
+                otherwise the scan.
     * ``fft``   REQUIRE the FFT route; refuse if it is unavailable, so a leg
                 that asked for it cannot quote a number taken on the other one.
+
+    WHY THE DEFAULT IS ``scan`` EVEN THOUGH THE FFT ROUTE IS EXACT.  The two
+    are the same sum in two evaluation orders and agree to round-off (the
+    equivalence and its exact conditions are in the R→q block comment in
+    ``htransform``).  But the FFT route is MEASURABLY SLOWER here: at P=4,
+    rank 768, it runs at 0.981x on the equal grid, 0.985x on an 8x-denser
+    grid, and 0.975x on the 41-shift exciton q-list.  That is not a flop
+    question.  The "q-by-q scan" is not a scan — it is ONE BATCHED GEMM whose
+    arithmetic intensity is ~n_q — and the FFT replaces it with a MEMORY-BOUND
+    transform of intensity log2(M_k) ≈ 6.  Trading 10x the flops for ~400x the
+    arithmetic intensity loses whenever ``rank >> N_k``, and this code
+    guarantees ``rank ≈ nk·nb ≥ N_k`` by construction.  The route is kept,
+    proven and one env var away, because it is the right shape in the opposite
+    regime (many k-points, small rank) and because it makes the q-chunk width
+    EXACTLY irrelevant — but it is not the default.  HTRANSFORM_FFT.md §7.2.
 
     Garbage REFUSES by name rather than falling back — a knob that silently
     does nothing is how an A/B measures the same arm twice.  The read lives
@@ -170,15 +186,16 @@ def resolve_fourier_route(log_fn=None) -> str:
     ``exciton_bands`` -> ``compute_wfns_fi``, which is the same file-ownership
     situation ``resolve_reshard_route`` above exists for.
     """
-    raw = (os.environ.get("LORRAX_HTQ_FOURIER_ROUTE") or "auto").strip().lower()
+    raw = (os.environ.get("LORRAX_HTQ_FOURIER_ROUTE") or "scan").strip().lower()
     if raw not in ("auto", "scan", "fft"):
         raise ValueError(
-            f"LORRAX_HTQ_FOURIER_ROUTE={raw!r} is not one of auto|scan|fft.  "
-            f"auto = take the FFT route when the target q-set is a shifted "
-            f"uniform grid and its block fits; scan = pin the q-by-q Fourier "
-            f"scan; fft = require the FFT route and refuse if unavailable.")
-    if raw != "auto" and log_fn is not None:
-        log_fn(f"  [env] LORRAX_HTQ_FOURIER_ROUTE={raw} (default auto)")
+            f"LORRAX_HTQ_FOURIER_ROUTE={raw!r} is not one of scan|auto|fft.  "
+            f"scan (the DEFAULT) = the q-by-q Fourier sum; auto = take the FFT "
+            f"route when the target q-set is a shifted uniform grid and its "
+            f"block fits; fft = require the FFT route and refuse if it is "
+            f"unavailable.")
+    if raw != "scan" and log_fn is not None:
+        log_fn(f"  [env] LORRAX_HTQ_FOURIER_ROUTE={raw} (default scan)")
     return raw
 
 
@@ -860,7 +877,8 @@ def compute_wfns_fi(
         fft_route = False
     if _route_req == "scan":
         fft_route = False
-        _plan_why = "pinned by LORRAX_HTQ_FOURIER_ROUTE=scan"
+        _plan_why = ("LORRAX_HTQ_FOURIER_ROUTE=scan, the DEFAULT: the FFT "
+                     "route is exact but measured 0.975-0.985x here")
     elif _route_req == "fft" and not fft_route:
         raise RuntimeError(
             f"LORRAX_HTQ_FOURIER_ROUTE=fft was requested but the FFT route is "
