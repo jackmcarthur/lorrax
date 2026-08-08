@@ -29,6 +29,7 @@ failure that `tests/test_layering.py` fails on (with a red twin).
 | `plan(op, mesh, *, backend='auto', n=None) -> Plan` | Resolve once, then call. **Eager** — dlopens, probes, reads `jax.process_count()`. |
 | `Plan(A)` / `Plan.batched(A_stack)` | One tile at `P('x','y')` / a stack at `P(None,'x','y')`. **Trace-safe** — no dlopen, no `device_put`, no process count inside. |
 | `Plan.is_native`, `.backend`, `.describe()` | The resolved fact, readable; never something a caller must branch on to be correct. |
+| `Plan.batched_route`, `BATCHED_ROUTES`, `BATCHED_SCAN_UNROLL` | HOW a stack runs: a `lax.scan` over the single-matrix op, or the backend's own stacked entry where the library has one, with a batch-axis-reshard route reserved. **The one place that decides.** Introspection — a caller reads it, never branches on it. |
 | `Plan.native_fn` | A pure closure for a fusion-critical site that needs the math inside its own `jit`. Native backends only. |
 | `factor(op, A, mesh, *, backend, ...) -> FactorToken` | Factor once. |
 | `solve(token, B) -> jax.Array` | Back-solve many. The token carries the handle (ScaLAPACK `ipiv`, cuSOLVERMp raw buffer, SLATE `SlateLowerL`). |
@@ -284,34 +285,45 @@ explicit requests are never demoted.
    (jobid 56446562) and no perf leg.
 6. **Non-square 1-D meshes.** ScaLAPACK accepts them (square *blocks*, not
    a square grid) and nothing has been timed on one.
-7. **Batched vs serial, split by backend.** The batched entry exists only
-   on ScaLAPACK; the cuSOLVERMp/SLATE serial fallback's per-q cost is in
-   the batch rows but has never been isolated against a hypothetical
-   stacked entry.
+7. **Batched vs serial, split by backend.** ~~Never isolated.~~ Partly
+   closed by the A/B in § "The batched surface is a scan": on cpu 2×2 at
+   nq=8/n=64 the scan route costs 0.0115 s against the ScaLAPACK stacked
+   entry's 0.01125 s — 2% for a route with no C++ batching at all — so the
+   stacked entry's advantage at THIS shape is small. What stays open is
+   whether that holds at large `nq`, where one descriptor and one
+   workspace should start to tell.
 8. **The (2048, 4096] window for bug L-4.** SLATE CUDA eigh's true crash
    threshold is somewhere in there; 4096 is just the smallest size anyone
    watched it die at.
 
-### Planned work (design recorded; NOT built here)
+### The batched surface is a scan, and the route toggle is one place
 
-**The batched surface is, by design, `lax.scan` loops over the API's own
-single-matrix operations** — default `unroll=1`, deliberately changeable
-later. Backend-native batched entry points (cuSOLVERMp `batched_potrf` /
-`batched_solve_lu`, ScaLAPACK's eigh `many`) stay as backend-internal
-optimizations **behind that same interface**, never as a second public
-surface.
+**BUILT.** `Plan.batched` is a `lax.scan` over this package's own
+single-matrix operation, at `BATCHED_SCAN_UNROLL = 1` — a named constant,
+deliberately changeable, changed only with a measurement behind it.
+Backend-native stacked entry points (ScaLAPACK's eigh `many`, cuSOLVERMp's
+`batched_potrf`, both `batched_solve_lu`) are backend-internal
+optimizations **behind that same interface**, never a second public
+surface. `dispatch_batched_eigh` used to be that second surface — it
+carried its own `getattr` capability probe and its own serial loop — and
+is now `plan(...).batched(A)`.
 
-The point of the canonical scan-over-single-matrix structure is that it
-is **the one place a toggle can live**. The same interface can route to:
+The point is not the loop. A Python loop over `nb` matrices is `nb`
+separate calls the compiler never sees together, and there is nowhere in
+it to put "run this batch some other way". A scan is one node, so the
+choice collapses to **`Plan.batched_route`, the one place that decides**:
 
-* **(a)** a scan of the *distributed* single-matrix op — today's default;
-* **(b)** the backend's *native batched* entry where one exists;
-* **(c)** a **batch-axis-reshard fallback**: reshard
-  `(q, μ_x, ν_y) → (q_xy, μ, ν)`, run the op locally with the native jax
-  kernel per matrix, reshard back. This serves the very-large-`N_μ`
-  doctrine right up to single-matrix capacity **without paying any
-  distributed-library fixed cost** — which the table above shows is the
-  entire cost below n ≈ 10⁴.
+* **(a)** `ROUTE_SCAN` — a scan of the *distributed* single-matrix op.
+  The default, and the definition of the surface.
+* **(b)** `ROUTE_BACKEND_BATCHED` — the backend's stacked entry where the
+  library has one. Its saving is in C++, around ONE descriptor and ONE
+  workspace, and no scan can recover it.
+* **(c)** `ROUTE_BATCH_RESHARD` — **RESERVED. Not built; asking for it
+  raises and says so.** Reshard `(q, μ_x, ν_y) → (q_xy, μ, ν)`, run the op
+  locally with the native jax kernel per matrix, reshard back. This serves
+  the very-large-`N_μ` doctrine right up to single-matrix capacity
+  **without paying any distributed-library fixed cost** — which the tables
+  above show is the entire cost below n ≈ 10⁴.
 
 (a)/(b)/(c) behind one toggle point is how small-system, non-distributed
 linalg happens **without a parallel API**.
@@ -322,9 +334,68 @@ that exchange: `P(None,'x','y') → P(('x','y'),None,None)` as two
 single-mesh-axis `all_to_all`s, because the one-step move is not a tile
 permutation and GSPMD silently degrades it to replicate-then-partition
 (measured 64× per-rank residency blow-up, job 7882974). Divisibility
-rules and both schedules are documented in that module. The future work
-is **wiring distrib_la's batched ops to it as an opt-in route, not
-inventing movement.**
+rules and both schedules are documented in that module. The remaining work
+is **wiring distrib_la's batched ops to it, not inventing movement.**
+
+#### What the restructure cost and bought
+
+A/B on the same nodes with the BUILD_NOTES pins, `origin/main` (`21d68e0`)
+against `feat/batched-canonical-2026-08-08`, real 4-process 2×2 meshes,
+nq=8, n=64, complex128. `compiles` is XLA compilations on the cold call,
+counted off jax's own compile log; `warm` is the median of three
+subsequent calls.
+
+| leg | case | route | compiles | cold s | warm s |
+|---|---|---|---|---|---|
+| cpu 2×2 | eigh, `main` | Python loop | 12 | 0.307 | 0.0237 |
+| cpu 2×2 | eigh, branch | **(a) scan** | **1** | 0.109 | **0.0115** |
+| cpu 2×2 | eigh, `main` | (b) stacked | 1 | 0.063 | 0.01130 |
+| cpu 2×2 | eigh, branch | (b) stacked | 1 | 0.063 | 0.01125 |
+| cpu 2×2 | SLATE cholesky factor+solve, `main` | 2 Python loops | 165 | 3.370 | 3.2578 |
+| cpu 2×2 | SLATE cholesky factor+solve, branch | **2 scans** | **3** | 0.177 | **0.0087** |
+| gpu 2×2 | eigh/cuSOLVERMp, `main` | Python loop | 11 | 14.250 | 12.518 |
+| gpu 2×2 | eigh/cuSOLVERMp, branch | **(a) scan** | **1** | 14.177 | 12.702 |
+| gpu 2×2 | SLATE cholesky factor+solve, `main` | 2 Python loops | 165 | 6.234 | 5.887 |
+| gpu 2×2 | SLATE cholesky factor+solve, branch | **2 scans** | **3** | 0.841 | **0.166** |
+
+**Every result is BIT-IDENTICAL across the two trees** — W and Z for both
+eigh legs and X for the cholesky legs, `np.array_equal` true, on cpu and
+on gpu. This is an interior restructure and the arrays say so.
+
+The eigh/cuSOLVERMp row is the only one where the branch is not faster,
+and it is not slower either: 12.70 s against 12.52 s is 1.59 s per matrix
+against 1.56 s, inside the run-to-run spread of a **flat ~1.55 s
+per-matrix collective charge** that § "The crossover" measures at
+1.56/1.60/1.76/1.59 across four shapes. Nothing in that leg is ours to
+move.
+
+**The compile count is the result to read.** The old serial route compiled
+per iteration on any wrapper without a jit cache; the scan compiles once,
+whatever `nq` is. SLATE is where that mattered most —
+`_slate.distributed_cholesky` and `_slate.distributed_trsm` build their
+`shard_map` at eager top level with no `jax.jit` around it and no
+per-signature cache, the shape every other wrapper here has and those two
+do not, so an `nbatch`-long Python loop re-traced and re-compiled the
+kernel `nbatch` times. 165 compiles → 3, and 5.9 s → 0.17 s of GPU wall.
+
+**An eager scan is not enough, and the first measurement said so.**
+Without a `jax.jit` cache per signature the scan is correct and *slower*:
+the cpu eigh row came out at 0.080 s warm against 0.024 s for the Python
+loop, because `lax.scan` called eagerly re-traces and re-lowers the whole
+loop every call while the Python loop's `nq` backend calls each landed in
+the wrapper's own `_JIT_CACHE`. The same scan as a pre-compiled executable
+timed 0.0114 s, so ~69 ms of that 80 was pure retrace. `plan._SCAN_CACHE`
+is the fix and it is keyed on `mesh_key`, which is strictly finer than the
+`(Px, Py)` the backends key their MPI/NCCL contexts on — a cache that
+cannot hand back an executable whose baked-in context handle has moved on.
+
+**`lax.scan` over a distributed FFI call is viable on BOTH platforms, and
+CUDA was the open question.** The host answer was already recorded (job
+7889132, ScaLAPACK, P=4). The route that actually *ships* is cuSOLVERMp
+and SLATE over NCCL + `cal_comm`, whose failure mode is a HANG with no
+traceback, and no CUDA mesh had ever been pointed at it. It traces,
+compiles and runs: `eigh/cusolvermp` above is that route, on a real
+4-process 2×2 A100 mesh, residual 2.296e-15.
 
 *Experiment note, not a plan:* a possible **fourth** route, for the
 capacity regime only (matrices too large for one device **and**
@@ -337,10 +408,15 @@ slot; off-limits on the host leg (Cray MPICH's default
 anyway. ELPA targets the same slice properly.
 
 **Any such restructuring must keep the batched-vs-serial bit-identity
-gate green** (`tests/multi_device/batched_eigh_dispatch_gate.py`: the two
-paths agree to **0 ulp** in both W and Z, job 7889132). That gate is the
-guard on this whole design, and it is why the toggle is safe to add
-later: it can prove a new route did not change an answer.
+gate green** (`tests/multi_device/batched_eigh_dispatch_gate.py`, and its
+adopted twin `check_batched_eigh_dispatch` in the L-c suite: the two
+routes agree to **0 ulp** in both W and Z — job 7889132 at nq=6/n=32, and
+again at nq=8/n=64 with the scan on both sides of the comparison). That
+gate is the guard on this whole design, and it is why route (c) is safe
+to add later: it can prove a new route did not change an answer. Its
+`_force_serial` argument is `Plan.batched`'s private `_route` override —
+the toggle is what makes the gate able to run two routes over one set of
+operands at all.
 
 **SLATE `factor`+`solve` (potrf + two trsm passes), the route H3 moved
 onto**, cpu 2×2: 0.727–2.945 s; gpu 2×2: 1.397–7.237 s. Its
@@ -367,6 +443,22 @@ evidence — the SLATE trsm back-solve had never run before step 2:
   `plan._IMPL`. `docs/dev/linalg_ffi.md` § "Adding a backend" is the
   procedure; the C++ under `src/ffi/cpp/` did not move and its target
   strings are frozen.
+* **Writing a Python loop over the batch axis.** That is what
+  `Plan.batched` is for, and looping outside it hands the compiler `nb`
+  separate calls, re-traces any wrapper that builds its `shard_map`
+  eagerly, and — the real cost — puts the batch somewhere no route toggle
+  can reach. Measured on the two SLATE wrappers that have no jit cache:
+  165 compiles and 5.9 s of GPU wall for an 8-matrix factor+solve, against
+  3 compiles and 0.17 s through the scan.
+* **Adding a second batched entry point for a backend that has one.** A
+  stacked FFI entry is one `plan._IMPL` row and it is then taken
+  automatically; exposing it as its own public function recreates the
+  `dispatch_batched_eigh` split, where two places decided the same thing
+  and one of them forgot the eigenvector normaliser.
+* **Calling `lax.scan` over an FFI wrapper eagerly, uncached.** It is
+  correct and it is slower than the loop: ~69 ms per call of retrace and
+  relower at nq=8/n=64 on cpu 2×2. Route it through `Plan.batched`, which
+  owns `plan._SCAN_CACHE`.
 * **Selecting a backend from the environment.** There is no env var that
   does it and adding one is the antipattern. Deck keys choose
   (`eigh_backend`, `distributed_cholesky`, `distributed_lu`,
