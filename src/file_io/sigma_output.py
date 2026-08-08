@@ -35,6 +35,63 @@ def write_sigma_to_file(
 	"""
 	nk, nbands, _ = sigma_sx_kij_eV.shape
 
+	# ------------------------------------------------------------------
+	# REAL-VS-COMPLEX IS ONE DECISION PER COLUMN, TAKEN OVER THE WHOLE ARRAY
+	# ------------------------------------------------------------------
+	# This used to be decided PER SCALAR: each row asked whether its own
+	# imaginary part exceeded 1e-10 and appended either "+x.xxxxxxi" or a
+	# 12-space filler.  A run where one band's Sigma carries a numerically
+	# significant imaginary part and its neighbours do not therefore emits
+	# rows of two different SHAPES in one column — which is the malformed
+	# dump seen in the frontier artifacts.  Two ways it bites: a
+	# whitespace-splitting parser reads the next column's value into this
+	# one, and the `VH` branch below had no filler at all, so the trailing
+	# `Eo=` column moved horizontally depending on the row.
+	#
+	# A file format is a property of the FILE.  So the question is asked
+	# once per component, over every element that will be written (the
+	# diagonal of every k-point), and every row of that column then has the
+	# same width whatever its own value happens to be.  A column that is
+	# complex ANYWHERE is written complex EVERYWHERE, which is also the
+	# honest report: "this quantity is complex in this run".
+	#
+	# Threshold unchanged (1e-10) and still absolute — this is a formatting
+	# decision about eV-scale numbers, not a convergence test.
+	_IM_TOL = 1e-10
+
+	def _diag(a):
+		"""The (nk, nbands) diagonal actually written, or None."""
+		if a is None:
+			return None
+		return np.asarray(a)[:, np.arange(nbands), np.arange(nbands)]
+
+	sx_diag = _diag(sigma_sx_kij_eV)
+	coh_diag = _diag(sigma_coh_kij_eV)
+	hv_diag = _diag(hartree_kij_eV)
+	tot_diag = None if coh_diag is None else sx_diag + coh_diag
+
+	def _is_complex(d):
+		return d is not None and bool(np.any(np.abs(np.imag(d)) > _IM_TOL))
+
+	sx_cplx = _is_complex(sx_diag)
+	coh_cplx = _is_complex(coh_diag)
+	tot_cplx = _is_complex(tot_diag)
+	hv_cplx = _is_complex(hv_diag)
+
+	#: Width of the omitted "+x.xxxxxxi" field, so a real column occupies
+	#: exactly as many characters as a complex one would.
+	_IM_PAD = " " * 12
+
+	def _im(value, complex_column):
+		"""The imaginary field for a column, or the exact-width filler.
+
+		One function for both branches so the widths cannot drift apart:
+		``+`` + 10 + ``i`` is 12 characters, and so is :data:`_IM_PAD`.
+		"""
+		if not complex_column:
+			return _IM_PAD
+		return f"+{float(value):>10.6f}i"
+
 	# Resolve to absolute path, ensure directory exists
 	abs_path = os.path.abspath(filename)
 	dirname = os.path.dirname(abs_path)
@@ -50,37 +107,29 @@ def write_sigma_to_file(
 			f.write(f"\nk-point {k}:\n")
 			f.write("-" * 100 + "\n")
 			for n in range(nbands):
-				sx_re = float(sigma_sx_kij_eV[k, n, n].real)
-				sx_im = float(sigma_sx_kij_eV[k, n, n].imag)
+				sx_re = float(np.real(sx_diag[k, n]))
+				sx_im = float(np.imag(sx_diag[k, n]))
 				line = f"n={n:<3} {sx_label}={sx_re:>12.6f}"
-				if abs(sx_im) > 1e-10:
-					line += f"+{sx_im:>10.6f}i"
-				else:
-					line += "            "
-				
-				if sigma_coh_kij_eV is not None:
-					coh_re = float(np.real(sigma_coh_kij_eV[k, n, n]))
-					coh_im = float(np.imag(sigma_coh_kij_eV[k, n, n]))
+				line += _im(sx_im, sx_cplx)
+
+				if coh_diag is not None:
+					coh_re = float(np.real(coh_diag[k, n]))
+					coh_im = float(np.imag(coh_diag[k, n]))
 					line += f"  {corr_label}={coh_re:>12.6f}"
-					if abs(coh_im) > 1e-10:
-						line += f"+{coh_im:>10.6f}i"
-					else:
-						line += "            "
+					line += _im(coh_im, coh_cplx)
 					# Total COHSEX
 					total_re = sx_re + coh_re
 					total_im = sx_im + coh_im
 					line += f"  {total_label}={total_re:>12.6f}"
-					if abs(total_im) > 1e-10:
-						line += f"+{total_im:>10.6f}i"
-					else:
-						line += "            "
-				
-				if hartree_kij_eV is not None:
-					hv_re = float(np.real(hartree_kij_eV[k, n, n]))
-					hv_im = float(np.imag(hartree_kij_eV[k, n, n]))
+					line += _im(total_im, tot_cplx)
+
+				if hv_diag is not None:
+					hv_re = float(np.real(hv_diag[k, n]))
+					hv_im = float(np.imag(hv_diag[k, n]))
 					line += f"  VH={hv_re:>12.6f}"
-					if abs(hv_im) > 1e-10:
-						line += f"+{hv_im:>10.6f}i"
+					# Padded on the real branch too — it was NOT before, so
+					# the trailing Eo= column moved row to row.
+					line += _im(hv_im, hv_cplx)
 
 				# Trailing Eo= column (mean-field energy) — appended last so
 				# existing sigSX/sigCOH/sigTOT/VH parsers are unaffected.
