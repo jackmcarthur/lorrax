@@ -122,6 +122,31 @@ def _ritz_and_residuals(V, HV, n_eig):
     return Lambda, X, HX, R, res_norms
 
 
+def _count_converged(conv, n_eig: int) -> int:
+    """How many of the ``n_eig`` requested states meet the residual test.
+
+    A TOTAL count, and it used to be a PREFIX count: an inline loop that walked
+    from state 0 and stopped at the first unconverged one.  So a solve with
+    state 0 still moving and states 1..n-1 all converged reported ``0/n`` and
+    was indistinguishable in the log from a solve where nothing had converged
+    at all.  The convergence census read exactly that line — ``WARNING: did not
+    converge in 200 iterations. Best: 0/20`` — on a run whose eigenvalues were
+    already within 1.4 ueV of the exact dense reference.  The number was not
+    wrong about any single state; it was answering a different question than
+    its own label asked.
+
+    THE CONTROL FLOW IS UNCHANGED BY THIS, and that is checkable rather than
+    hoped for.  ``n_conv`` has exactly two uses in :func:`davidson`, the early
+    return and the print cadence, and both test ``n_conv == n_eig``.  A prefix
+    count reaches ``n_eig`` precisely when every one of the requested states is
+    converged — which is precisely when the total count reaches it too.  The
+    two rules agree on that test and differ only on the number printed, so the
+    iteration at which this solver stops is bit-for-bit what it was.  Gated,
+    both directions, by ``tests/test_davidson_convergence_report.py``.
+    """
+    return int(sum(1 for i in range(n_eig) if conv[i]))
+
+
 def _default_precond(R, eigenvalues):
     """Identity preconditioner (no-op): returns R / ‖R‖ per state."""
     trailing_axes = tuple(range(1, R.ndim))
@@ -332,12 +357,7 @@ def davidson(
         Lambda_np = _to_host(Lambda)
         rel_tol = tol * np.maximum(1.0, np.abs(Lambda_np))
         conv = res_np < rel_tol
-        n_conv = 0
-        for i in range(n_eig):
-            if conv[i]:
-                n_conv = i + 1
-            else:
-                break
+        n_conv = _count_converged(conv, n_eig)
 
         eigenvalues = Lambda_np
         if verbose and (it <= 5 or it % 5 == 0 or n_conv == n_eig):
