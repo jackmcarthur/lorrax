@@ -392,6 +392,93 @@ def _block_alpha_stats(alpha_all):
 
 
 # ===========================================================================
+# Reorthogonalisation WINDOW: why the sentinel exists, and what it resolves to
+# ===========================================================================
+#
+# The window (``n_reorth``) and the route (``LORRAX_LANCZOS_REORTH``, next
+# section) are independent axes and are easy to confuse.  The ROUTE decides how
+# the overlaps are computed — one collective per basis vector (``mgs``) or two
+# per iteration (``cgs2``).  The WINDOW decides WHICH basis vectors are in the
+# set at all.  A wrong route costs wall time; a wrong window costs eigenvalues.
+#
+# MEASURED (stored dense Si BSE matrix, n=1024, single-vector Lanczos; error on
+# the lowest 20 eigenvalues against the dense spectrum):
+#
+#     window     k=200    k=400    k=600    k=800    k=1000
+#     2          4.3 meV  86       94       134      142
+#     10         4.3      86       94       134      142
+#     30         4.3      86       94       134      142
+#     full       4.3      1.2      0.037    8.1e-4   4e-4
+#
+# Windows of 2, 10 and 30 are INDISTINGUISHABLE: the basis has already lost
+# orthogonality by the time the window falls off the end, so widening it
+# changes nothing.  All of them plateau at 4.3 meV and then get monotonically
+# WORSE with more iterations — at k=1000, ``||Q^H Q - I|| = 0.35`` and there are
+# 91 Ritz values below lambda_20 where there should be exactly 20.  That is the
+# ghost-eigenvalue mechanism: a lost direction is re-discovered as a duplicate
+# copy of an already-converged root.  At n=4096 the best a windowed run
+# achieves is 21.3 meV.
+#
+# "More iterations makes it worse" is what makes a partial window unsafe as a
+# DEFAULT: a caller who asks for more work and gets a worse answer has no way
+# to notice from the outside.  The window is kept as an OPTION — it is a
+# legitimate memory/time trade for a caller who has measured their own spectrum
+# — it just must not be what you get by not choosing.
+#
+# Since 2026-08-08 the cost argument for a window is gone as well: under the
+# default ``cgs2`` route full reorth costs TWO collectives per iteration
+# regardless of window width, so ``n_reorth`` no longer buys wall time at all
+# (``reorth_collective_count("cgs2", 200, 5) == reorth_collective_count("cgs2",
+# 200, 200) == 400``).  It only buys arithmetic and memory traffic, which on
+# every shape measured here are far inside the latency floor.
+#
+# THE SENTINEL, AND THE TRAP IT SETS
+# ----------------------------------
+# ``FULL_REORTH`` (-1) means "the whole basis", the same convention
+# ``bse/bse_jax.py --n-reorth`` and ``bse/exciton_bands.py`` already used.  It
+# is a SENTINEL, not a width, and two consumers below read ``n_reorth`` as a
+# width without checking:
+#
+#   * ``_reorth_window`` builds ``idx >= j - n_reorth``.  Fed -1 that becomes
+#     ``idx >= j + 1``, which intersected with ``idx <= j`` is EMPTY — full
+#     reorth would silently become NO reorth.
+#   * ``_announce_reorth`` calls ``mgs_trip_count(max_iter, n_reorth)``, which
+#     at -1 sums ``j + 1 - max(0, j + 1) == 0`` and announces ZERO collectives.
+#
+# Neither raises.  Both are silent, and the second one lies in the log that a
+# reader would use to check the first.  So ``resolve_n_reorth`` MUST run before
+# both, on every path, and ``test_sentinel_is_resolved_before_both_consumers``
+# is the red twin that feeds -1 through both routes and checks the announced
+# count and the mask width against the resolved value.
+
+#: Sentinel: reorthogonalise against the ENTIRE basis built so far.
+#: Same convention as ``bse/bse_jax.py --n-reorth`` and
+#: ``bse/exciton_bands.py``, so one value means one thing everywhere.
+FULL_REORTH = -1
+
+
+def resolve_n_reorth(n_reorth: int | None, depth: int) -> int:
+    """Resolve the reorth window against the basis depth it will run to.
+
+    ``FULL_REORTH`` (-1) and ``None`` both mean "the whole basis", expressed as
+    ``depth`` — the number of iterations (single-vector) or blocks (block
+    variants) the loop can reach.  Any other value passes through as a window
+    width.  Centralised so the sentinel cannot mean -1 iterations in one
+    variant and full reorth in another.
+
+    Idempotent on already-resolved values, which is what lets
+    ``bse/bse_jax.py`` keep its own pre-resolution without double-counting.
+
+    MUST be called before ``_reorth_window`` and ``_announce_reorth``, and
+    AFTER any Krylov-exhaustion clamp on ``max_iter`` — the depth it resolves
+    against is the CLAMPED depth, not the requested one.
+    """
+    if n_reorth is None or int(n_reorth) < 0:
+        return int(depth)
+    return int(n_reorth)
+
+
+# ===========================================================================
 # Reorthogonalisation route — LORRAX_LANCZOS_REORTH
 # ===========================================================================
 #
@@ -841,7 +928,14 @@ def simple_lanczos_eig(
     -------
     eigenvalues : (n_eig,)
     eigenvectors : (n_eig, n)
+
+    Krylov-exhaustion clamp: the Krylov space cannot exceed the vector space,
+    so ``max_iter`` is clamped to ``n``.  Running past exhaustion is not
+    benign — the residual collapses, the normalisation divides by ~0, and the
+    manufactured alpha/beta put Ritz values ANYWHERE, including BELOW the true
+    spectrum.
     """
+    max_iter = max(1, min(int(max_iter), int(n)))
     key = jax.random.PRNGKey(seed)
     k1, k2 = jax.random.split(key)
 
@@ -937,6 +1031,10 @@ def lanczos_eig_jit(
     eigenvalues : (n_eig,)
     eigenvectors : (n_eig, n)
     """
+    # Krylov-exhaustion clamp, then the sentinel — in that order, because the
+    # window resolves against the depth the loop can actually reach.
+    max_iter = max(1, min(int(max_iter), int(n)))
+    n_reorth = resolve_n_reorth(n_reorth, max_iter)
     kind = reorth_kind(reorth)
     _announce_reorth("lanczos_eig_jit", kind, max_iter, n_reorth)
     key = jax.random.PRNGKey(seed)
@@ -1102,6 +1200,7 @@ def block_lanczos_eig_jit(
     """
     bs = int(block_size)
     max_iter = max(1, min(int(max_iter), int(n) // bs))
+    n_reorth = resolve_n_reorth(n_reorth, int(max_iter))
     T_size = bs * int(max_iter)
     kind = reorth_kind(reorth)
     _announce_reorth("block_lanczos_eig_jit", kind, int(max_iter), n_reorth)
@@ -1220,6 +1319,7 @@ def block_lanczos_eig_jit_converged(
     # junk directions with arbitrary (even sub-spectrum) Ritz values.
     M = max(1, min(int(max_iter), int(n) // bs))
     T_size = bs * M
+    n_reorth = resolve_n_reorth(n_reorth, M)
     kind = reorth_kind(reorth)
     _announce_reorth("block_lanczos_eig_jit_converged", kind, M, n_reorth)
     if min_iter is None:
