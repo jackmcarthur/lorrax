@@ -304,7 +304,20 @@ def solve_bse_sharded(
     # ``krep``: the Krylov basis sharding, or None to leave it to GSPMD (the
     # shipped behaviour).  Resolved ONCE here, not per matvec call.
     from .bse_stack_matvec import matvec_opts as _mv_opts
+    from .bse_stack_matvec import warn_if_krep_inert as _warn_krep
     krylov_rep = rep_eig if "krep" in _mv_opts() else None
+    # ...and honoured ONLY in the ``bs != 1`` branch of ``_full_run`` below.
+    # The default ``--lanczos`` route is ``bs == 1``: it builds its own
+    # single-vector ``matvec`` and never constrains the flat Krylov axis, so
+    # the token is accepted, resolved, and then quietly does nothing.  Say so.
+    # A leg whose log claims ``krep`` and whose program is the baseline is
+    # exactly the failure the dial's refusal grammar exists to prevent, and it
+    # has already produced one published measurement (KERNEL_DEEPDIVE.md 5.7).
+    _warn_krep(
+        bs != 1, "bse_lanczos.solve_bse_sharded",
+        f"block_size={bs}, so the solve takes the single-vector route "
+        f"(lanczos_eig_jit, or block_lanczos_eig_jit_converged at bs=1), "
+        f"which applies no sharding constraint to the flat Krylov axis")
 
     # The static half of the α-Hermiticity reports the Krylov solve collects
     # (solver name + α form).  Filled at TRACE time by ``_full_run`` below and
