@@ -350,10 +350,9 @@ def ffi_read_call(
 
 def ffi_read_kchunk_call(
     out_struct: jax.ShapeDtypeStruct,
+    handle: jax.Array,               # (2,) == [ctx_handle, ds_id]
     offset_base: jax.Array,          # (n_kchunk, ndim_file) int64
     *,
-    ctx_handle: int,
-    ds_id: int,
     mesh_shape: Sequence[int],
     axis_count_per_dim: Sequence[int],
     axis_flat: Sequence[int],
@@ -370,9 +369,8 @@ def ffi_read_kchunk_call(
     WITH the handler, which is registered to the owner.
     """
     return jax.ffi.ffi_call(_TARGET_READ_KCHUNK, out_struct)(
+        handle,
         offset_base,
-        ctx_handle=int(ctx_handle),
-        ds_id=int(ds_id),
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
         axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
         axis_flat=np.asarray(axis_flat, dtype=np.int64),
@@ -382,11 +380,10 @@ def ffi_read_kchunk_call(
 
 def ffi_read_kchunk_union_call(
     out_struct: jax.ShapeDtypeStruct,
+    handle: jax.Array,               # (2,) == [ctx_handle, ds_id]
     offset_base: jax.Array,          # (n_kchunk, ndim_file) int64
     count_base: jax.Array,           # (n_kchunk, ndim_file) int64
     *,
-    ctx_handle: int,
-    ds_id: int,
     mesh_shape: Sequence[int],
     axis_count_per_dim: Sequence[int],
     axis_flat: Sequence[int],
@@ -401,10 +398,9 @@ def ffi_read_kchunk_union_call(
     ``read_kchunk_union_sharded`` docstring).
     """
     return jax.ffi.ffi_call(_TARGET_READ_KCHUNK_UNION, out_struct)(
+        handle,
         offset_base,
         count_base,
-        ctx_handle=int(ctx_handle),
-        ds_id=int(ds_id),
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
         axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
         axis_flat=np.asarray(axis_flat, dtype=np.int64),
@@ -487,8 +483,16 @@ def read_kchunk_union_sharded(
     """
     if count_partition_spec is None:
         count_partition_spec = P()
-    return _read_kchunk_union_sharded_cached(
-        int(fh), str(ds_name),
+    # ``fh``/``ds_name`` resolve to the runtime handle HERE, outside the
+    # compiled-closure cache.  That is the whole fix: the jitted closure
+    # below is keyed on GEOMETRY only, so two files, two datasets, or two
+    # processes with different heap addresses now share one compiled
+    # module instead of forking one each.  The dataset open stays memoised
+    # on ``(fh, ds_name)`` so the collective H5Dopen count does not change
+    # (this wrapper runs on every ``read_slabs`` call).
+    ds_id = _open_dataset_memo(int(fh), str(ds_name), mesh)
+    handle = handle_vector(int(fh), ds_id, mesh)
+    inner = _read_kchunk_union_sharded_cached(
         n_kchunk=int(n_kchunk), kchunk_axis=int(kchunk_axis),
         file_global_shape=tuple(int(s) for s in file_global_shape),
         per_rank_file_shape=tuple(int(s) for s in per_rank_file_shape),
@@ -497,11 +501,31 @@ def read_kchunk_union_sharded(
         count_partition_spec=count_partition_spec,
     )
 
+    # The handle is HIDDEN: callers keep the two-argument
+    # ``reader(offset_base, count_base)`` shape they already have.
+    def _reader(offset_base: jax.Array, count_base: jax.Array) -> jax.Array:
+        return inner(handle, offset_base, count_base)
+
+    return _reader
+
+
+@functools.lru_cache(maxsize=None)
+def _open_dataset_memo(fh: int, ds_name: str, mesh: Mesh) -> int:
+    """Memoised collective ``H5Dopen``.
+
+    Split out of :func:`_read_kchunk_union_sharded_cached` when
+    ``fh``/``ds_name`` left that function's key.  It is kept as its own
+    cache — and NOT folded into the compiled-closure cache — because the
+    two have genuinely different keys: a dataset id depends on the file
+    and the dataset, a compiled module depends on the geometry.  Keeping
+    it here holds the collective H5Dopen count at exactly one per
+    ``(fh, ds_name, mesh)``, which is what the un-split code did.
+    """
+    return _register_and_open_dataset(fh, ds_name, mesh)
+
 
 @functools.lru_cache(maxsize=None)
 def _read_kchunk_union_sharded_cached(
-    fh: int,
-    ds_name: str,
     *,
     n_kchunk: int,
     kchunk_axis: int,
@@ -512,7 +536,7 @@ def _read_kchunk_union_sharded_cached(
     file_partition_spec: P,
     count_partition_spec: P = P(),
 ) -> Callable[[jax.Array, jax.Array], jax.Array]:
-    """Build a jitted ``f(offset_base, count_base) → array`` callable
+    """Build a jitted ``f(handle, offset_base, count_base) → array`` callable
     that issues **ONE** ``H5Dread`` for ``n_kchunk`` per-k windows via
     ``H5S_SELECT_OR``.  Correctness preconditions — see below.
 
@@ -526,10 +550,6 @@ def _read_kchunk_union_sharded_cached(
 
     Parameters
     ----------
-    fh : int
-        Context handle from :func:`open_file`.
-    ds_name : str
-        HDF5 dataset path (e.g. ``"wfns/coeffs"``).
     n_kchunk : int
         Number of windows (compile-time).
     kchunk_axis : int
@@ -553,7 +573,11 @@ def _read_kchunk_union_sharded_cached(
     Returns
     -------
     callable
-        ``f(offset_base, count_base)`` both ``(n_kchunk, ndim_file) int64``.
+        ``f(handle, offset_base, count_base)``; ``handle`` is the ``(2,)``
+        ``[ctx_handle, ds_id]`` vector (replicated, ``P()``) and the other
+        two are ``(n_kchunk, ndim_file) int64``.  Callers should reach this
+        through :func:`read_kchunk_union_sharded`, which supplies the
+        handle and preserves the two-argument call shape.
         Output shape is ``per_rank_file_shape`` with ``n_kchunk`` inserted
         at ``kchunk_axis``; partition spec gets ``None`` inserted at the
         same position.
@@ -571,7 +595,6 @@ def _read_kchunk_union_sharded_cached(
 
     axis_count_per_dim, axis_flat = _encode_sharding_axes(
         mesh, file_partition_spec, ndim_file)
-    ds_id = _register_and_open_dataset(fh, ds_name, mesh)
 
     out_local_shape = _insert_at(
         [int(s) for s in per_rank_file_shape], kchunk_axis, n_kchunk)
@@ -579,11 +602,11 @@ def _read_kchunk_union_sharded_cached(
     out_partition_spec = P(*_insert_at(
         list(file_partition_spec), kchunk_axis, None))
 
-    def _per_rank(offset_base_local, count_base_local):
+    def _per_rank(handle_local, offset_base_local, count_base_local):
         return ffi_read_kchunk_union_call(
             out_struct,
+            handle_local,
             offset_base_local, count_base_local,
-            ctx_handle=int(fh), ds_id=int(ds_id),
             mesh_shape=(p, q),
             axis_count_per_dim=axis_count_per_dim,
             axis_flat=axis_flat,
@@ -593,7 +616,7 @@ def _read_kchunk_union_sharded_cached(
 
     return jax.jit(shard_map(
         _per_rank, mesh=mesh,
-        in_specs=(P(), count_partition_spec),
+        in_specs=(P(), P(), count_partition_spec),
         out_specs=out_partition_spec,
         check_vma=False,
     ))

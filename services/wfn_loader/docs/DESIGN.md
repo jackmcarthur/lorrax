@@ -111,6 +111,36 @@ window) permits; otherwise REGISTERED with this measurement, the HLO quotes,
 and the recipe attached — the leak exists in production today and the door
 promotion neither worsens nor masks it.
 
+**EXECUTED 2026-08-08** on `fix/kchunk-cache-identity-2026-08-08` (owner
+approval "kchunk conv yes"), survey §5.2 edit table applied verbatim with two
+drift corrections: the table's `read_kchunk_sharded` row was already dead (the
+wrapper had been deleted), and the union dispatch needed a SECOND failure
+lambda, not one — `fail` announces through `ctx`, which does not exist yet at
+the handle-copy, so the two pre-ctx failures use a `fail_early` that builds
+its own Promise/Future pair.  One design addition the table did not carry: the
+collective `H5Dopen` moved to its own `_open_dataset_memo` lru_cache, because
+`read_kchunk_union_sharded` runs on EVERY `read_slabs` call — resolving `ds_id`
+outside the old cache without re-memoising it would have added a collective and
+leaked a `hid_t` per read.
+
+The measurement was re-run as a CONTROLLABLE experiment rather than waiting on
+ASLR: `ffi.io.open_file` caches contexts per PATH, so two paths to the same
+bytes (a symlink) give two different ctx addresses on demand, at identical
+geometry.  Same probe, same 4-process 2×2 CPU mesh, same private cache dir,
+both arms:
+
+| arm | tree + .so | 2nd-ctx lru miss | 2nd-ctx persistent Δ | union modules in xla_dump / carrying `ctx_handle` |
+|---|---|---|---|---|
+| PRE | `origin/main` 21d68e06 + deployed pair | 1 | **+1** | 4 / **4** (3 distinct addresses baked in) |
+| POST | this branch + its own pair | 0 | **0** | 2 / **0** |
+
+The PRE arm is the red twin: it shows the probe CAN see the growth, so POST's
+zero means something.  ψ is bitwise identical through both contexts on all 4
+ranks in both arms.  PRE's Δ is +1 rather than the +2 of the table above
+because this probe loads ONE k-plan per context (`k="ibz"`); the original
+loaded `ibz` + `full_bz`, i.e. two union geometries.  Per-geometry the number
+is the same.
+
 ## DECISION 2 — service boundary
 
 - IN: `src/file_io/wfn_loader.py` (the class + module kernels), nothing else.
