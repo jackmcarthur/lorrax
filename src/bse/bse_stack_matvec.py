@@ -262,11 +262,15 @@ def build_bse_stack_matvec(
         D_term = lax.with_sharding_constraint(delta_E * X, sh.X)
 
         # ── V term: B1 dense exchange, k-summed encode + broadcast decode ──────
-        S = jnp.einsum("kcvN,bcvk->bN", M_Y, X)                   # k SUMMED → (b, ν_loc)
+        # K^x = M V M†: conjugated vertex on the encode leg, bare vertex on the
+        # decode.  Fixed by the transition density <0|ρ̂|Ψ> = Σ A_cvk ψ_ck ψ*_vk;
+        # the reverse assignment builds conj(K^x), which cannot be covariant
+        # alongside the (correct, untouched) W term.
+        S = jnp.einsum("kcvN,bcvk->bN", jnp.conj(M_Y), X)         # k SUMMED → (b, ν_loc)
         S = lax.with_sharding_constraint(S, sh.S_k0) / sqrt_nk
         U = jnp.einsum("MN,bN->bM", V_q0, S)                      # (b, μ_loc)
         U = lax.with_sharding_constraint(U, sh.d_mu)
-        VX = jnp.einsum("kcvM,bM->bcvk", jnp.conj(M_X), U)       # broadcast over k
+        VX = jnp.einsum("kcvM,bM->bcvk", M_X, U)                 # broadcast over k
         VX = lax.with_sharding_constraint(VX, sh.X) / sqrt_nk
 
         if not include_W:

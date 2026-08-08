@@ -96,7 +96,8 @@ def v_qG_table(
     bvec,
     cell_volume: float,
     vcoul_cutoff_ry: float | None = None,
-    v_head_miniBZ=None,
+    v_head_fn=None,
+    head_tie_rtol: float = 1e-9,
     bdot=None,
     fft_grid=None,
 ) -> np.ndarray:
@@ -106,16 +107,17 @@ def v_qG_table(
     ``cell_volume``, ``bdot`` and ``fft_grid`` are exactly the four fields
     of a :class:`vcoul.CoulombGeometry`, which this builds and forwards.
     Head-slot injection happens BEFORE the cutoff mask (the order is
-    load-bearing); the head slot is chosen by ``all(G == 0)``, not by
-    ``argmin |q+G|``.  Both rules and the reason the choice is not settled
-    here are documented on the service function.
+    load-bearing); the head slots are every slot attaining
+    ``argmin |q+G|²`` within ``head_tie_rtol``, and a tied set shares its
+    mean.  The whole argument — why not the Miller-(0,0,0) label, and why
+    all of the argmin rather than one of it — is on the service function.
     """
     return vcoul.v_qG_table(
         kernel, q_irr_frac, gvec_components,
         geometry=CoulombGeometry(bvec=bvec, cell_volume=cell_volume,
                                  bdot=bdot, fft_grid=fft_grid),
         vcoul_cutoff_ry=vcoul_cutoff_ry,
-        v_head_miniBZ=v_head_miniBZ,
+        v_head_fn=v_head_fn, head_tie_rtol=head_tie_rtol,
     )
 
 

@@ -1141,7 +1141,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	# V_q — bit-identically for every sandbox bispinor system, which is
 	# sys_dim=2: there the G=0 body is regularised by the 2D truncation
 	# (f2d→0) and the mini-BZ head-average is a no-op, so the CC builder's
-	# omission of ``v_head_miniBZ`` costs nothing.  In 3D with
+	# omission of ``v_head_fn`` costs nothing.  In 3D with
 	# ``mc_average_vcoul_body`` enabled the two DO diverge, in the G=0 slot
 	# of every q≠0; that path is reachable, so a 3D bispinor deck must not
 	# assume the CC tile and the scalar V_q agree.  See the v_q_bispinor

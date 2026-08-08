@@ -718,7 +718,7 @@ def gap_window_pairs(zx, q, nvw=3, ncw=3):
     """Spin-traced BSE exchange rows M_cvk(μ) = Σ_s conj(u_{c,k−q,s})
     u_{v,k,s} at the centroids; top-nvw valence × bottom-ncw conduction ×
     all k → (npair, n_μ).  These contract the tile into the physical
-    gap-window block B = M^H V M — the campaign verdict variable."""
+    gap-window block B = M V M^H — the campaign verdict variable."""
     nv = zx["nv"]
     cs = list(range(nv, nv + ncw))
     vs = list(range(nv - nvw, nv))
@@ -731,8 +731,13 @@ def gap_window_pairs(zx, q, nvw=3, ncw=3):
 
 
 def b_block(x, V):
-    """B[p,p'] = Σ_{μν} conj(x[p,μ]) V[μν] x[p',ν]."""
-    return np.conj(x) @ V @ x.T
+    """B[p,p'] = Σ_{μν} x[p,μ] V[μν] conj(x[p',ν]).
+
+    K^x = M V M†: the bra (output) index carries the bare vertex and the ket
+    (the index a trial vector contracts) carries the conjugate, as the
+    transition density <0|ρ̂|Ψ> = Σ A_cvk ψ_ck ψ*_vk requires.
+    """
+    return x @ V @ np.conj(x).T
 
 
 # ===========================================================================

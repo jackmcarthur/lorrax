@@ -404,7 +404,7 @@ def test_hbn_mc_average_vcoul_body_moves_sigma(hbn_session,
 
     A frozen-reference gate says "the numbers did not change".  It does NOT
     say "the mini-BZ head average is still LIVE and still reachable on a cell
-    whose lattice can see it".  If ``build_v_head_miniBZ_avg_3d`` were
+    whose lattice can see it".  If ``build_v_head_miniBZ_fn_3d`` were
     silently disconnected — the transpose-bug class, or any future edit that
     routes around it — a re-freeze would pin the wrong numbers and stay green
     forever, exactly as Si has been structurally unable to notice for the

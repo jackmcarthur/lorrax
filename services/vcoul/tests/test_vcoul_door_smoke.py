@@ -16,7 +16,9 @@ What IS pinned here, because it is what the extraction claims:
 * ``get_kernel`` dispatches on all three dimensionalities and refuses a
   fourth BY NAME;
 * the ``v_qG_table`` driver runs on synthetic arrays through the door,
-  with the head-slot injection and the cutoff mask both live;
+  with the head-slot injection and the cutoff mask both live — including
+  the 2026-08-08 ``argmin |q+G|`` slot rule, its tied-set mean, its Γ
+  skip and its refusal of the retired per-q head table;
 * ``CoulombGeometry.from_wfn`` takes a duck-typed stand-in — the whole
   reason the service can accept a lorrax loader without importing one.
 """
@@ -141,20 +143,100 @@ def test_q_plus_G_equals_zero_is_zeroed_not_infinite():
     assert np.all(v[0, 1:] > 0.0)
 
 
-def test_the_head_slot_injection_lands_at_miller_zero():
-    """``v_head_miniBZ`` replaces the Miller-(0,0,0) slot and only it."""
+def _const_head(value):
+    """A ``v_head_fn`` that answers ``value`` at every K it is asked about,
+    and records the K's it was asked about."""
+    seen = []
+
+    def fn(K_cart):
+        K = np.asarray(K_cart, dtype=np.float64).reshape(-1, 3)
+        seen.append(K)
+        return np.full(K.shape[0], float(value), dtype=np.float64)
+    fn.seen = seen
+    return fn
+
+
+def test_the_head_slot_injection_lands_at_the_argmin_not_at_miller_zero():
+    """The 2026-08-08 rule, on a q where the two rules DISAGREE.
+
+    On the cubic cell at q = (0.9, 0, 0) the smallest |q+G| is at the
+    umklapp G = (-1, 0, 0), not at G = (0,0,0).  The label rule would
+    inject at slot 0; the argmin rule injects at the umklapp slot and
+    leaves slot 0 bare.  If this cell ever reads the other way round the
+    Miller-(0,0,0) label is back and V_q's q → −q reciprocity is gone
+    with it.
+    """
     geom = _geom(CUBIC)
     gvec = _gvecs()
-    q = np.array([[0.25, 0.0, 0.0]])
-    kgrid = (4, 4, 4)
-    head = np.zeros(kgrid, dtype=np.float64)
-    head[1, 0, 0] = 12345.0                      # q_frac (0.25,0,0) -> (1,0,0)
+    q = np.array([[0.9, 0.0, 0.0]])
+    g_umklapp = [i for i in range(gvec.shape[2])
+                 if tuple(gvec[0, :, i]) == (-1.0, 0.0, 0.0)][0]
 
     plain = V.v_qG_table(V.get_kernel(3), q, gvec, geometry=geom)
     with_head = V.v_qG_table(V.get_kernel(3), q, gvec, geometry=geom,
-                             v_head_miniBZ=head)
-    assert with_head[0, 0] == 12345.0
-    np.testing.assert_array_equal(with_head[0, 1:], plain[0, 1:])
+                             v_head_fn=_const_head(12345.0))
+    assert with_head[0, g_umklapp] == 12345.0, (
+        "the head did not land at argmin |q+G| — slot selection regressed "
+        "to the Miller-(0,0,0) label")
+    assert with_head[0, 0] == plain[0, 0], (
+        "the head landed at the Miller-(0,0,0) slot, which is NOT the "
+        "argmin at this q")
+    others = [i for i in range(gvec.shape[2]) if i != g_umklapp]
+    np.testing.assert_array_equal(with_head[0, others], plain[0, others])
+
+
+def test_the_head_fn_is_asked_at_the_slots_own_cartesian_K():
+    """Each selected slot is valued from its OWN q+G, not from q alone —
+    the property a per-q head TABLE structurally cannot have."""
+    geom = _geom(CUBIC)
+    gvec = _gvecs()
+    q = np.array([[0.9, 0.0, 0.0]])
+    fn = _const_head(1.0)
+    V.v_qG_table(V.get_kernel(3), q, gvec, geometry=geom, v_head_fn=fn)
+    assert len(fn.seen) == 1
+    K = fn.seen[0]
+    expect = (np.array([-0.1, 0.0, 0.0]) @ CUBIC).reshape(1, 3)
+    np.testing.assert_allclose(K, expect, rtol=0.0, atol=1e-12)
+
+
+def test_a_tied_argmin_gives_every_tied_slot_the_SET_MEAN():
+    """Degenerate argmin: all tied slots are injected, all get the mean.
+
+    q = (0.5, 0, 0) on the cubic cell ties G = (0,0,0) with G = (-1,0,0)
+    exactly.  A head_fn that answers differently at the two K's must show
+    up as the SAME number in both slots — their mean — because only the
+    tied-set mean is invariant under the point-group operation that
+    permutes them (see v_qG_table's TIED-SET VALUE note).
+    """
+    geom = _geom(CUBIC)
+    gvec = _gvecs()
+    q = np.array([[0.5, 0.0, 0.0]])
+    i0 = 0                                                # G = (0,0,0)
+    i1 = [i for i in range(gvec.shape[2])
+          if tuple(gvec[0, :, i]) == (-1.0, 0.0, 0.0)][0]
+
+    def fn(K_cart):
+        K = np.asarray(K_cart, dtype=np.float64).reshape(-1, 3)
+        # 10.0 on the +x side, 20.0 on the -x side: a per-slot-distinct
+        # answer, so a per-slot injection would be visible as a difference.
+        return np.where(K[:, 0] > 0.0, 10.0, 20.0)
+
+    v = V.v_qG_table(V.get_kernel(3), q, gvec, geometry=geom, v_head_fn=fn)
+    assert v[0, i0] == 15.0 and v[0, i1] == 15.0, (
+        f"tied slots got {v[0, i0]} / {v[0, i1]}, not their mean 15.0 — "
+        f"the per-slot value is back and the IBZ unfold arm will show a "
+        f"~1e-5 point-group asymmetry on the multiplicity-4 q")
+
+
+def test_gamma_is_skipped_by_the_head_injection():
+    """q = 0 keeps v = 0 at G = 0: that head is the rank-1 Σ_X term, and
+    the injection must not overwrite it."""
+    geom = _geom(CUBIC)
+    fn = _const_head(12345.0)
+    v = V.v_qG_table(V.get_kernel(3), np.zeros((1, 3)), _gvecs(),
+                     geometry=geom, v_head_fn=fn)
+    assert v[0, 0] == 0.0
+    assert not fn.seen, "v_head_fn was called at Γ, which must be skipped"
 
 
 def test_the_cutoff_mask_zeroes_past_the_radius_and_the_head_with_it():
@@ -163,17 +245,17 @@ def test_the_cutoff_mask_zeroes_past_the_radius_and_the_head_with_it():
     geom = _geom(CUBIC)
     gvec = _gvecs()
     q = np.array([[0.25, 0.0, 0.0]])
-    head = np.zeros((4, 4, 4), dtype=np.float64)
-    head[1, 0, 0] = 12345.0
 
-    # |q+G|^2 at G=0, q=(0.25,0,0) on the cubic cell is (0.25*2pi)^2 ~ 2.47.
+    # |q+G|^2 at G=0, q=(0.25,0,0) on the cubic cell is (0.25*2pi)^2 ~ 2.47,
+    # and that slot IS the argmin here.
     cut = V.v_qG_table(V.get_kernel(3), q, gvec, geometry=geom,
-                       v_head_miniBZ=head, vcoul_cutoff_ry=1.0)
+                       v_head_fn=_const_head(12345.0), vcoul_cutoff_ry=1.0)
     assert cut[0, 0] == 0.0, (
         "the head slot survived a cutoff it sits outside of — the "
         "injection must happen before the mask")
     loose = V.v_qG_table(V.get_kernel(3), q, gvec, geometry=geom,
-                         v_head_miniBZ=head, vcoul_cutoff_ry=1.0e6)
+                         v_head_fn=_const_head(12345.0),
+                         vcoul_cutoff_ry=1.0e6)
     assert loose[0, 0] == 12345.0
 
 
@@ -183,10 +265,17 @@ def test_v_qG_table_refuses_a_malformed_components_table():
                      geometry=_geom(CUBIC))
 
 
-def test_v_qG_table_refuses_a_malformed_head_table():
-    with pytest.raises(ValueError, match=r"must be \(nkx, nky, nkz\)"):
+def test_v_qG_table_refuses_a_per_q_head_TABLE():
+    """RED TWIN for the rule itself: the old ``(nkx, nky, nkz)`` object is
+    refused BY NAME rather than silently reinstating the label rule.
+
+    A stale caller still holding one gets a TypeError that says what to
+    build instead — never a run that quietly injects at Miller-(0,0,0).
+    """
+    with pytest.raises(TypeError, match="must be a callable"):
         V.v_qG_table(V.get_kernel(3), np.zeros((1, 3)), _gvecs(),
-                     geometry=_geom(CUBIC), v_head_miniBZ=np.zeros((4, 4)))
+                     geometry=_geom(CUBIC),
+                     v_head_fn=np.zeros((4, 4, 4)))
 
 
 # ---------------------------------------------------------------------------
