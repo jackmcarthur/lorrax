@@ -1,10 +1,18 @@
-"""``h_transform``'s kpath gates.
+"""``h_transform``'s kpath gates: the P>1 output fetch, the route, the metric.
 
-``test_post_kpath_outputs_are_replicated`` is the RED TWIN for the crash that
-killed two of the four reference decks at P=4 (PROFILE_htransform_exciton
-§1.5): ``_post_kpath`` carried no ``out_shardings``, so its outputs inherited
-the q-sharding of the batches it concatenates and the host fetch on the next
-line died whenever ``nq`` divided the device count.
+Cells for three separate claims from HTRANSFORM_FFT.md, all reached by
+driving the real ``h_transform`` on a synthetic-but-legal Galerkin triple:
+
+* ``test_post_kpath_outputs_are_replicated`` — the RED TWIN for the crash that
+  killed two of the four reference decks at P=4 (PROFILE_htransform_exciton
+  §1.5).
+* ``test_kpath_route_line_says_scan_for_a_band_path`` — the CLI's own kpath is
+  never a shifted uniform grid, so it always takes the q-by-q scan, and the log
+  says so instead of leaving it to be rederived.
+* ``test_identity_metric_route_matches_the_cholesky_route`` — S is the identity
+  from its one producer, so the two triangular solves per q are vestigial;
+  removing them is analytic, not bitwise, and this pins the size of the
+  difference.
 """
 from __future__ import annotations
 
@@ -89,3 +97,22 @@ def test_post_kpath_outputs_are_replicated(ndev):
     assert isinstance(res["energies_sorted"], np.ndarray)
     assert res["energies_sorted"].shape[0] == 8
     _ = jax.devices()          # keep the jax import meaningful to linters
+
+
+def test_kpath_route_line_says_scan_for_a_band_path():
+    """The owner's proposal, answered where it applies: the CLI's kpath is
+    never a uniform grid, so this driver's own hot loop always takes the scan
+    — and the log says so on every run instead of leaving it to be rederived."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from bandstructure.htransform import h_transform
+    mesh = _mesh(1)
+    meta, ct, enk, wfn, kpath_data = _kpath_inputs()
+    S = jnp.eye(ct.shape[2], dtype=jnp.complex128)
+    lines = []
+    with mesh:
+        h_transform(meta, S, jnp.asarray(ct), jnp.asarray(enk), wfn,
+                    kpath_data, lines.append, mesh, diagnostics=False)
+    banner = " ".join(lines)
+    assert "[route] kpath fH_q: scan" in banner, banner
+    assert "[route] fH_q metric: identity" in banner, banner

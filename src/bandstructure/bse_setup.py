@@ -57,7 +57,10 @@ from common.staged_reshard import (
     DEFAULT_ROUTE as _RESHARD_ROUTE_DEFAULT,
 )
 
-from .htransform import build_fH_R, build_R_grid_np, newton_inv
+from .htransform import (build_fH_R, build_R_grid_np, newton_inv,
+                         UniformQPlan, detect_uniform_q, verify_uniform_q,
+                         make_fH_q_fft, uniform_grid_frac_np,
+                         _UNIFORM_Q_ATOL)
 
 
 def resolve_reshard_route(explicit=None, *, log_fn=None) -> str:
@@ -148,6 +151,60 @@ def _cached_kernel(key, build):
     return fn
 
 
+def resolve_fourier_route(log_fn=None) -> str:
+    """``LORRAX_HTQ_FOURIER_ROUTE`` — ``auto`` (default) | ``scan`` | ``fft``.
+
+    Which way ``fH_q = Σ_R e^{-2πi q·R} fH_R`` is evaluated:
+
+    * ``auto``  take the FFT route when the target q-set is a rigid shift of a
+                Γ-centred uniform grid AND one block fits the residency cap;
+                otherwise the historical q-by-q scan.
+    * ``scan``  pin the scan.  This is what makes an A/B a ONE-variable change.
+    * ``fft``   REQUIRE the FFT route; refuse if it is unavailable, so a leg
+                that asked for it cannot quote a number taken on the other one.
+
+    Garbage REFUSES by name rather than falling back — a knob that silently
+    does nothing is how an A/B measures the same arm twice.  The read lives
+    here, in a named resolver, because an L1 library dial is a parameter
+    (layers.md); the entry layer has no argument to plumb through
+    ``exciton_bands`` -> ``compute_wfns_fi``, which is the same file-ownership
+    situation ``resolve_reshard_route`` above exists for.
+    """
+    raw = (os.environ.get("LORRAX_HTQ_FOURIER_ROUTE") or "auto").strip().lower()
+    if raw not in ("auto", "scan", "fft"):
+        raise ValueError(
+            f"LORRAX_HTQ_FOURIER_ROUTE={raw!r} is not one of auto|scan|fft.  "
+            f"auto = take the FFT route when the target q-set is a shifted "
+            f"uniform grid and its block fits; scan = pin the q-by-q Fourier "
+            f"scan; fft = require the FFT route and refuse if unavailable.")
+    if raw != "auto" and log_fn is not None:
+        log_fn(f"  [env] LORRAX_HTQ_FOURIER_ROUTE={raw} (default auto)")
+    return raw
+
+
+def resolve_fft_block_ratio() -> float:
+    """``LORRAX_HTQ_FFT_BLOCK_RATIO`` (default 4.0) — the FFT route's ceiling.
+
+    An FFT cannot be chunked in its own output, so one whole block of
+    ``prod(M)`` q is the FFT route's residency unit instead of the q-chunk
+    ``bs``.  This is the multiple of fH_R's own per-device bytes
+    (``nk_co · rank² · 16 / ndev``) that one block may cost before the route
+    DEMOTES to the scan and says so.  4.0 covers a 2x-per-axis densification
+    of a 2-D grid, or any 4x fine/coarse ratio.  Non-positive refuses: a
+    zero-byte budget is never what anyone meant, and it would read as "never
+    use the FFT" rather than as the error it is.
+    """
+    from gw.gw_config import env_float
+    ratio = env_float("LORRAX_HTQ_FFT_BLOCK_RATIO", 4.0, refuse=True)
+    if ratio <= 0.0:
+        raise ValueError(
+            f"LORRAX_HTQ_FFT_BLOCK_RATIO={ratio!r} must be > 0 (multiple of "
+            f"fH_R's own residency that ONE FFT block may cost; unset/blank "
+            f"= 4).  To disable the FFT route say "
+            f"LORRAX_HTQ_FOURIER_ROUTE=scan, which is what that knob is for.")
+    return ratio
+
+
 def _parse_kgrid_fi(spec) -> tuple[int, int, int]:
     """Accept '8 8 1', '8,8,1', or a tuple/list."""
     if isinstance(spec, (tuple, list)):
@@ -181,6 +238,7 @@ def compute_wfns_fi(
     a_band_index: int | None = None,
     batch_size: int | None = None,
     q_list=None,
+    q_structure=None,
     return_coeffs: bool = False,
     eigh_backend: str = "auto",
     use_low_mem_eigh: bool = False,
@@ -238,6 +296,19 @@ def compute_wfns_fi(
                    points instead of a uniform grid.  Wrapped to (−0.5, 0.5]
                    internally (fH_q is exactly BZ-periodic, so wrapping is a
                    no-op on values; it keeps phases well-conditioned).
+        q_structure: optional ``(grid, shifts)`` DECLARING that ``q_list`` is
+                   ``len(shifts)`` rigid shifts of the Γ-centred uniform grid
+                   ``grid`` — i.e. ``q_list[b*prod(grid) + m] == shifts[b] +
+                   (j/grid)[m]``.  That structure turns the per-q Fourier scan
+                   into one FFT per shift (see the R→q block comment in
+                   ``htransform``); ``q_list`` alone cannot be recognised as
+                   multi-block because a block boundary is not visible as a
+                   coordinate wrap, so the caller that built it says so.
+                   A declaration is NOT trusted: it is verified against the
+                   actual ``q_list`` on the host before any route is taken, and
+                   a miss falls back to the scan with an announcement.  Single
+                   uniform grids (``kgrid_fi``, or a ``q_list`` that is one
+                   shifted grid) are detected without a declaration.
         return_coeffs: also return the rank-α eigenvector coefficients
                    ``.coeffs_fi`` (nk_fi, rank, nb_fi), sharded
                    ``P(('x','y'))`` on the q axis like every ``_q_batch``
@@ -423,7 +494,8 @@ def compute_wfns_fi(
     # device count (gw_converged_12x12_80ry_2026-07-21 §5, next-step #2).
     rep = NamedSharding(mesh_xy, P())
     B_rep = jax.device_put(B_at_mu, rep)
-    R_grid = jnp.asarray(build_R_grid_np(kgrid_co))
+    R_grid_np = build_R_grid_np(kgrid_co)
+    R_grid = jnp.asarray(R_grid_np)
 
     # ── q-points (uniform fine grid or explicit list), padded to batch ───
     if q_list is None:
@@ -626,8 +698,16 @@ def compute_wfns_fi(
         #   Next lever if this stage ever matters again: ONE all_to_all over
         #   ('x','y') plus a rank-local (px, py) tile untranspose, trading a
         #   collective for a local (rank, rank) shuffle -- unmeasured.
-        if _stage_q is not None:
-            fH_q = _stage_q(fH_q)
+        return _reshard_herm(fH_q, bs, _stage_q)
+
+    def _reshard_herm(fH_q, bs, stage):
+        """(i,j)-face batch → q-batch, then hermitize.  EXTRACTED VERBATIM
+        from ``_fourier``'s tail so the FFT route below reaches the identical
+        collective and the identical ½(F + Fᴴ).  Movement and arithmetic
+        unchanged; the extraction exists so there is ONE hermitization, not
+        two that can drift."""
+        if stage is not None:
+            fH_q = stage(fH_q)
         else:
             fH_q = jax.lax.with_sharding_constraint(
                 fH_q, _fit(mesh_xy, P(('x', 'y'), None, None),
@@ -687,6 +767,134 @@ def compute_wfns_fi(
             return _q_batch
         return _cached_kernel(("q_batch", _sig, int(bs_)), _build)
 
+    # ══ THE UNIFORM-TARGET ROUTE ═════════════════════════════════════════
+    # Everything from here to ``fft_route`` decides ONE boolean and prints it.
+    # The arithmetic it selects between is proved equivalent in the R→q block
+    # comment in ``htransform``; what is decided here is only whether this
+    # deck's q-set HAS the structure, and whether the FFT's chunk fits.
+    _q_plan = None
+    _plan_resid = None
+    _plan_why = ""
+    # ``LORRAX_HTQ_FOURIER_ROUTE`` — auto (default) | scan | fft.  ``scan``
+    # pins the historical path, which is what makes the two routes an A/B on
+    # one variable; ``fft`` refuses rather than demotes, so a leg that means to
+    # measure the FFT cannot silently measure the scan.  Garbage refuses by
+    # name (the env-resolver contract), it does not fall back.
+    _route_req = resolve_fourier_route(log_fn=log)
+    if q_list is None:
+        # By construction: ``_uniform_kgrid_frac(kgrid_fi)`` IS the Γ-centred
+        # grid, unshifted, in the same C order ``uniform_grid_frac_np`` builds.
+        _q_plan = UniformQPlan(grid=tuple(int(x) for x in kgrid_fi),
+                               shifts=np.zeros((1, 3), dtype=np.float64),
+                               block=nq, origin="kgrid_fi (uniform, δ=0)")
+    elif q_structure is not None:
+        _g, _s = q_structure
+        _g = tuple(int(x) for x in _g)
+        _s = np.asarray(_s, dtype=np.float64).reshape(-1, 3)
+        _q_plan = UniformQPlan(grid=_g, shifts=_s,
+                               block=_g[0] * _g[1] * _g[2],
+                               origin=f"declared {_g[0]}x{_g[1]}x{_g[2]} "
+                                      f"x {_s.shape[0]} shift(s)")
+    else:
+        _q_plan = detect_uniform_q(np.asarray(jax.device_get(q_all)))
+
+    if _q_plan is not None:
+        # THE GATE.  A declaration or a detection is a proposal; this is the
+        # proof.  q is compared mod 1 because ``q_all`` is wrapped into
+        # (−0.5, 0.5] above and fH_q is exactly BZ-periodic, so a wrap is not
+        # a mismatch.  O(n_q) on the host, once.
+        _plan_resid = verify_uniform_q(np.asarray(jax.device_get(q_all)),
+                                       _q_plan)
+        if not (_plan_resid <= _UNIFORM_Q_ATOL):
+            _plan_why = (f"declared/detected structure does NOT hold "
+                         f"(max|q − (δ+j/M)| mod 1 = {_plan_resid:.3e} > "
+                         f"{_UNIFORM_Q_ATOL:.0e})")
+            _q_plan = None
+
+    # THE RESIDENCY CEILING, and it is inherent rather than an implementation
+    # choice.  The FFT emits ONE WHOLE BLOCK of prod(M) q at once — an FFT
+    # cannot be chunked in its own output — so the block, not ``bs``, is this
+    # stage's residency unit: prod(M) · rank² · 16 / ndev.  The owner's ``bs``
+    # rule ties a chunk to fH_R's own bytes (nk_co · rank² · 16 / ndev), and a
+    # target grid m-times denser per axis makes the block ∏m_i times that.
+    # Refusing is better than trading a few percent of the Fourier sum for an
+    # OOM, so a block above the cap DEMOTES to the scan and says so.
+    # ``LORRAX_HTQ_FFT_BLOCK_RATIO`` (default 4.0, i.e. up to a 2x-per-axis
+    # densification of a 2-D grid or a 4x fine/coarse ratio) is the multiple of
+    # fH_R's residency one block may cost.
+    #
+    # The ceiling is removable and the removal is designed but NOT built here:
+    # a commensurate M = m∘N target is exactly ∏m_i RIGID SHIFTS of the N-grid
+    # (decimation in frequency — output index j' ≡ a mod m selects the shift
+    # a/M), so the same multi-shift loop below would evaluate it in ∏m_i
+    # transforms each costing exactly fH_R's residency.  What stops it being a
+    # two-line change is ORDER: that decomposition emits q in (a, j'') order
+    # and the bundle must come out in C order over M, which is a permutation of
+    # the q axis of every returned array.  See HTRANSFORM_FFT.md §7.
+    _fft_bsf = None
+    if _q_plan is not None:
+        _ratio_cap = resolve_fft_block_ratio()
+        _ratio = _q_plan.block / float(nk_co)
+        if _ratio > _ratio_cap:
+            _plan_why = (f"block prod(M)={_q_plan.block} is {_ratio:.2f}x "
+                         f"fH_R's own R extent {nk_co} (cap {_ratio_cap:.2f}; "
+                         f"raise LORRAX_HTQ_FFT_BLOCK_RATIO to allow)")
+            _q_plan = None
+        else:
+            # The eigh chunk must divide the block (so chunks never straddle a
+            # shift) AND be a multiple of ndev (so the P(('x','y'),…) q axis
+            # splits — the 8x replication trap the ``bs`` block above records).
+            _cands = [d for d in range(_ndev, _q_plan.block + 1, _ndev)
+                      if _q_plan.block % d == 0]
+            if not _cands:
+                _plan_why = (f"no eigh chunk divides prod(M)={_q_plan.block} "
+                             f"and ndev={_ndev} together")
+                _q_plan = None
+            else:
+                _fft_bsf = min(_cands, key=lambda d: (abs(d - bs), d))
+
+    fft_route = _q_plan is not None and native
+    if _q_plan is not None and not native:
+        _plan_why = ("distributed eigh backend walks q one at a time; the FFT "
+                     "route batches a whole block")
+        fft_route = False
+    if _route_req == "scan":
+        fft_route = False
+        _plan_why = "pinned by LORRAX_HTQ_FOURIER_ROUTE=scan"
+    elif _route_req == "fft" and not fft_route:
+        raise RuntimeError(
+            f"LORRAX_HTQ_FOURIER_ROUTE=fft was requested but the FFT route is "
+            f"not available here: {_plan_why or 'target q-set is not a shifted uniform grid'}."
+            f"  No demotion — a leg that asked for this route must not quote a "
+            f"number taken on the other one.")
+    # THE ROUTE LINE.  One line, always printed, naming the route taken and —
+    # when it is the scan — why.  A silent route is not reviewable.
+    log("  [route] fH_q Fourier: " + ("FFT " if fft_route else "SCAN ")
+        + (f"({_q_plan.origin}; {_q_plan.nblocks} shift(s) x "
+           f"{_q_plan.block} q; eigh chunk {_fft_bsf}; "
+           f"verify {_plan_resid:.1e})" if fft_route
+           else f"(q-by-q; {_plan_why or 'target q-set is not a shifted uniform grid'})"))
+
+    @jax.jit
+    def _fH_q_one(q, fH_R):
+        return _fourier(q, fH_R, False)
+
+    @partial(jax.jit, static_argnames=('b_min', 'b_max'))
+    def _project_one(lam, U, B, b_min, b_max):
+        return _project(lam, U, B, b_min, b_max)
+
+    # Backend choice = parallel-over-q vs parallel-within-matrix.  The native
+    # path eigh-es ``bs/ndev`` WHOLE (rank, rank) matrices per device
+    # concurrently; the FFI path spreads ONE matrix over the whole mesh and
+    # walks q serially.  At rank 4716 that is 356 MB/matrix on one device vs
+    # 22 MB/device on 16 GPUs — so the FFI backends are what make a window too
+    # wide for the batched path runnable at all, at the cost of nq sequential
+    # distributed solves.  Native stays the default.
+    if not native:
+        # Mesh/geometry guards already passed when the plan was built.
+        log(f"  fH_q eigh: {eigh_plan.describe()}, {nq} q serially"
+            + ("  [use_low_mem_eigh]" if use_low_mem_eigh else ""))
+
     lam_chunks, psi_chunks, c_chunks, lam_all_chunks = [], [], [], []
 
     def _emit(lam_s, psi_s, c_s, lam_all_s):
@@ -711,7 +919,65 @@ def compute_wfns_fi(
     # 22 MB/device on 16 GPUs — so the FFI backends are what make a window too
     # wide for the batched path runnable at all, at the cost of nq sequential
     # distributed solves.  Native stays the default.
-    if native:
+    if fft_route:
+        # ONE FFT per rigid shift, then the SAME reshard / eigh / projection
+        # the scan route uses.  ``_fH_q_fft`` returns F(δ_b + j/M) still on
+        # the (i, j) face — identical layout, identical meaning, and NOT yet
+        # hermitized — which is exactly what ``_fourier`` hands over at the
+        # same point, so nothing downstream can tell the routes apart except
+        # by round-off.
+        #
+        # Slicing the block into eigh chunks is FREE: the block carries
+        # P(None,'x','y'), i.e. the q axis is replicated and the (i, j) face
+        # is what is split, so ``face[i:i+bsf]`` is a local slice on every
+        # device and not a collective.  ``_fft_bsf`` divides the block, so a
+        # chunk never straddles two shifts and the emitted q order is exactly
+        # ``q_all``'s.
+        #
+        # BOTH kernels go through ``_cached_kernel``.  Built inline they
+        # would be fresh closures per call, i.e. exactly the per-call retrace
+        # commit 7d6e5568 removed — and ``vq_interp.refit_vq`` calls
+        # ``compute_wfns_fi`` five times per run, which is the site that
+        # commit was measured on.
+        if _fft_bsf == bs and _stage_q is not None:
+            # Reuse the scan route's staged reshard when the widths agree —
+            # the common case, since ``_fft_bsf`` is chosen NEAREST to ``bs``.
+            # The factory issues a ``warm_mesh_cliques`` collective, so a
+            # second identical one is a real per-call cost.
+            _fft_stage = _stage_q
+        elif _face_to_batch_supported(mesh_xy, (_fft_bsf, rank, rank),
+                                      axes=('x', 'y'), route=_route):
+            _fft_stage = _face_to_batch_reshard(
+                mesh_xy, axes=('x', 'y'), route=_route, log_fn=None,
+                divisibility_hint="bse_setup FFT route")
+        else:
+            _fft_stage = None
+
+        def _build_q_eig_face():
+            @partial(jax.jit, static_argnames=('b_min', 'b_max'),
+                     out_shardings=_qbatch_out_shardings(_fft_bsf))
+            def _q_eig_face(fH_q_face, B, b_min, b_max):
+                lam, U = jnp.linalg.eigh(
+                    _reshard_herm(fH_q_face, _fft_bsf, _fft_stage))
+                return _project(lam, U, B, b_min, b_max)
+            return _q_eig_face
+
+        _q_eig_face = _cached_kernel(
+            ("q_eig_face", _sig, int(_fft_bsf), _fft_stage is not None),
+            _build_q_eig_face)
+        _fft_eval = _cached_kernel(
+            ("fH_q_fft", _sig, tuple(int(v) for v in _q_plan.grid)),
+            lambda: make_fH_q_fft(mesh_xy, _q_plan.grid, R_grid_np,
+                                  P(None, 'x', 'y'), rank=rank))
+        _shifts_dev = jnp.asarray(_q_plan.shifts)
+        for _b in range(_q_plan.nblocks):
+            face = _fft_eval(fH_R, _shifts_dev[_b])
+            for i in range(0, _q_plan.block, _fft_bsf):
+                chunk = (face if _fft_bsf == _q_plan.block
+                         else face[i:i + _fft_bsf])
+                _emit(*_q_eig_face(chunk, B_rep, b_min, b_max))
+            del face
+    elif native:
         _q_batch = _q_batch_kernel(bs)
         for i in range(0, q_pad.shape[0], bs):
             _emit(*_q_batch(q_pad[i:i + bs], fH_R, B_rep, b_min, b_max))

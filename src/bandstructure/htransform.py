@@ -3,6 +3,7 @@ import re
 import math
 import argparse
 import numpy as np
+from typing import NamedTuple
 
 # THE startup call (runtime module docstring): env defaults, fail-fast
 # hook, jax.distributed, CPU fallback, the run's clique-warmed ('x','y')
@@ -40,7 +41,7 @@ from isdf import factor_c_q
 # this driver reads a raw params dict rather than a LorraxConfig, which is
 # exactly the case that function exists for.
 from gw.gw_config import eigh_backend_choices, resolve_eigh_backend
-from common.fft_helpers import make_flat_k_ifftn
+from common.fft_helpers import make_flat_k_ifftn, make_flat_k_fftn
 # Q's r axis is split over the ('x','y') PRODUCT and its extent is an FFT-box
 # size, so it divides that product only by luck.  Raw, that is a refusal, not a
 # degradation — see the fitted ``sharding_y`` in streaming_galerkin_solve.
@@ -851,6 +852,215 @@ def build_R_grid_np(kgrid: tuple[int, int, int]) -> np.ndarray:
         axis=-1).reshape(-1, 3)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# THE R → q EVALUATION, AND WHEN IT IS AN FFT
+# ══════════════════════════════════════════════════════════════════════════
+# Both consumers of ``fH_R`` — this file's ``_kpath_batch`` and
+# ``bse_setup._fourier`` — evaluate the SAME sum,
+#
+#     F(q) = Σ_{R∈𝓡} e^{-2πi q·R} fH_R[R],      fH_q = ½(F(q) + F(q)ᴴ)   (1)
+#
+# where 𝓡 is ``build_R_grid_np(N)``: the N₁N₂N₃ signed fftfreq labels
+# R_i ∈ {-⌊N_i/2⌋ … ⌈N_i/2⌉-1}, and fH_R is ``ifftn(fH_k, norm='backward')``
+# over the three k axes, i.e.
+#
+#     fH_R[R] = (1/N_k) Σ_j fH_k[j] e^{+2πi j·R/N}.                       (2)
+#
+# (The sign pair is (2) POSITIVE / (1) NEGATIVE.  ``build_fH_R``'s docstring
+# writes both as e^{-2πi k·R}, which is the same interpolant under R → -R but
+# is NOT what ``build_R_grid_np`` labels; verified by the on-grid identity
+# F(k_j) = fH_k[j] to 5e-16 relative.)
+#
+# WHAT (1) IS.  Substituting (2), F(q) = (1/N_k) Σ_j fH_k[j] ∏_i D_{N_i}(k_j-q)
+# with D_N the Dirichlet kernel of the signed label set — i.e. (1) is
+# band-limited trigonometric interpolation, exact on the coarse grid and
+# approximate off it, and the approximation is the SAME for every route below.
+# Nothing here makes the interpolation better or worse; it only makes it
+# cheaper on target grids that have structure.
+#
+# THE STRUCTURE THAT MAKES IT AN FFT.  If the target q-set is a rigid shift of
+# a Γ-centred uniform grid,
+#
+#     q(j') = δ + j'/M,     j' ∈ Z_{M₁} × Z_{M₂} × Z_{M₃},
+#
+# then, exactly and with no extra assumption,
+#
+#     F(δ + j'/M) = Σ_{R} e^{-2πi δ·R} e^{-2πi j'·R/M} fH_R[R]
+#                 = DFT_M[ Ã ](j'),   Ã[m] = Σ_{R ≡ m (mod M)} e^{-2πi δ·R} fH_R[R]
+#
+# — an UNNORMALIZED FORWARD DFT of shape M (``norm='backward'`` on ``fftn``)
+# of the R array after two host-cheap operations:
+#
+#   PHASE  multiply fH_R[R] by e^{-2πi δ·R}, with R the SIGNED label.  This is
+#          the shift theorem in this code's conventions.  It must use the
+#          signed label and not the raw ifft index: e^{-2πi δ·R} is periodic
+#          in R with period N only when δ·N is an integer, so the choice of
+#          representative IS the interpolant for a non-commensurate shift.
+#
+#   FOLD   place Ã[R mod M] += (phased fH_R[R]).  For M_i ≥ N_i (a denser or
+#          equal target) every R lands in its own slot and the fold degenerates
+#          to ZERO-PADDING.  For M_i < N_i (a COARSER target) two R alias onto
+#          one m and the fold ADDS them — which is exact.  TRUNCATING the
+#          out-of-box modes instead is NOT exact and is not a small error:
+#          measured 3.4 RELATIVE against (1) on an 8³ → 4³ case.  Fold, never
+#          truncate.
+#
+# Verified against (1) at 1e-15 relative over commensurate-denser,
+# INcommensurate-denser, equal, coarser, and shifted targets, at even, odd and
+# mixed N — see HTRANSFORM_FFT.md §2 for the table.
+#
+# THE NYQUIST BIN.  For even N_i the label set carries -N_i/2 and not +N_i/2,
+# so F(q) alone is not Hermitian.  The ½(F + Fᴴ) in (1) is not cosmetic: using
+# fH_R[-R] = fH_R[R]ᴴ (exact, from fH_k being Hermitian at every k) it moves
+# half of the -N_i/2 weight onto +N_i/2, which is the split-Nyquist convention
+# (verified exactly in one even axis).  Every route below applies the SAME
+# hermitization to the SAME F, so this convention is inherited, not chosen
+# again — which is why the routes agree to round-off even on even grids.
+#
+# WHAT THIS BUYS, HONESTLY.  Route (1) costs n_q·N_k·rank² complex MACs;
+# the FFT route costs M_k log₂M_k·rank².  But ``rank`` is ≥ N_k by
+# construction in this code (rank ≤ nk·nb from the Galerkin solve, and the
+# ortho gate needs nk·nb ≤ rank), while the eigendecomposition that consumes
+# fH_q costs ~c·rank³ with c ≈ 5-20.  So the Fourier sum's share of the stage
+# is ≈ N_k/(c·rank) ≤ 1/c, and it SHRINKS as decks converge.  The route below
+# is exact and cheaper, and its ceiling is a few percent of the stage.  Do not
+# expect more from it; the measured numbers are in HTRANSFORM_FFT.md §5.
+
+
+_UNIFORM_Q_ATOL = 1e-9
+
+
+class UniformQPlan(NamedTuple):
+    """A q-list that is ``nblocks`` rigid shifts of one Γ-centred grid.
+
+    ``q_all[b*block + m] == shifts[b] + grid_frac(M)[m]``  (mod 1), where
+    ``block = prod(M)``.  ``origin`` records how the plan was obtained, and
+    reaches the driver log — the route is never silent.
+    """
+    grid: tuple            # M = (M1, M2, M3), the target grid
+    shifts: np.ndarray     # (nblocks, 3) float64, δ_b
+    block: int             # prod(M)
+    origin: str
+
+    @property
+    def nblocks(self) -> int:
+        return int(self.shifts.shape[0])
+
+
+def uniform_grid_frac_np(M) -> np.ndarray:
+    """``(prod(M), 3)`` Γ-centred uniform grid j/M in C order — the exact
+    ordering ``bse_setup._uniform_kgrid_frac`` and ``exciton_bands``' own
+    ``k_frac`` build, before any wrap."""
+    M = tuple(int(x) for x in M)
+    return np.stack(np.meshgrid(np.arange(M[0]) / M[0],
+                                np.arange(M[1]) / M[1],
+                                np.arange(M[2]) / M[2],
+                                indexing='ij'), axis=-1).reshape(-1, 3)
+
+
+def verify_uniform_q(q_all: np.ndarray, plan: UniformQPlan,
+                     atol: float = _UNIFORM_Q_ATOL) -> float:
+    """Max |q_all - (δ_b + j/M)| reduced mod 1, over every point.
+
+    THE GATE, not a hint.  A declared ``q_structure`` that does not hold would
+    silently permute or corrupt every band on the fine grid, so no route is
+    taken on a declaration alone: this runs first, on the host, in O(n_q), and
+    a miss falls back to the scan path with an announcement.  Returns the
+    residual so the caller can print it.
+    """
+    q = np.asarray(q_all, dtype=np.float64).reshape(-1, 3)
+    nb_, blk = plan.nblocks, plan.block
+    if q.shape[0] != nb_ * blk:
+        return float('inf')
+    g = uniform_grid_frac_np(plan.grid)                      # (blk, 3)
+    want = plan.shifts[:, None, :] + g[None, :, :]           # (nb_, blk, 3)
+    d = q.reshape(nb_, blk, 3) - want
+    d = d - np.round(d)                                      # mod 1, signed
+    return float(np.max(np.abs(d))) if d.size else 0.0
+
+
+def detect_uniform_q(q_all, *, atol: float = _UNIFORM_Q_ATOL):
+    """Single-block detector: is ``q_all`` ONE Γ-centred uniform grid, shifted?
+
+    Deliberately narrow.  It proposes M from the wrap points of the C-order
+    flattening (the last axis varies fastest) and then hands the proposal to
+    :func:`verify_uniform_q`, so a wrong proposal costs one O(n_q) host pass
+    and returns ``None``.  Multi-block lists (``{Q + k}`` from
+    ``exciton_bands``) are NOT detected here — their block boundary is not
+    visible as a coordinate wrap — those callers DECLARE their structure.
+    """
+    q = np.asarray(q_all, dtype=np.float64).reshape(-1, 3)
+    nq = q.shape[0]
+    if nq == 0:
+        return None
+    d = q - q[0][None, :]
+    d = d - np.round(d)
+
+    def _first_wrap(col, stride, limit):
+        t = 1
+        while t * stride < limit:
+            if abs(d[t * stride, col] - round(d[t * stride, col])) <= atol:
+                return t
+            t += 1
+        return None
+
+    m3 = _first_wrap(2, 1, nq) or nq
+    if nq % m3:
+        return None
+    t2 = _first_wrap(1, m3, nq)
+    m2 = t2 if t2 is not None else nq // m3
+    if (nq % (m2 * m3)) or m2 < 1:
+        return None
+    m1 = nq // (m2 * m3)
+    plan = UniformQPlan(grid=(m1, m2, m3), shifts=q[0][None, :].copy(),
+                        block=nq, origin=f"detected {m1}x{m2}x{m3}")
+    return plan if verify_uniform_q(q, plan, atol) <= atol else None
+
+
+def fold_indices_np(R_grid: np.ndarray, M) -> np.ndarray:
+    """Flat C-order destination ``R mod M`` for every signed label R.
+
+    Zero-padding when M_i ≥ N_i (indices unique), aliasing-fold when
+    M_i < N_i (indices collide and the scatter ADDS).  Both exact — see the
+    block comment above.
+    """
+    M = tuple(int(x) for x in M)
+    idx = np.asarray(R_grid).astype(np.int64) % np.asarray(M, dtype=np.int64)
+    return ((idx[:, 0] * M[1]) + idx[:, 1]) * M[2] + idx[:, 2]
+
+
+def make_fH_q_fft(mesh_xy: Mesh, M, R_grid_np: np.ndarray, face_spec: P,
+                  *, rank: int):
+    """``fn(fH_R, delta) -> (prod(M), rank, rank)`` == F(δ + j/M) of eq. (1).
+
+    Output carries ``face_spec`` — the SAME (i, j)-face layout the scan route
+    hands to the reshard, so everything downstream (hermitize, staged reshard,
+    eigh, projection) is untouched and shared.  NOT hermitized here, for the
+    same reason: the caller owns that step in both routes.
+    """
+    M = tuple(int(x) for x in M)
+    mk = M[0] * M[1] * M[2]
+    fold = jnp.asarray(fold_indices_np(R_grid_np, M))
+    Rg = jnp.asarray(np.asarray(R_grid_np, dtype=np.float64))
+    face = NamedSharding(mesh_xy, face_spec)
+    # 'backward' on a FORWARD transform = no scaling, which is what eq. (1)
+    # asks for.  Same FFI door, same spec vocabulary as ``build_fH_R``'s ifft.
+    fftn = make_flat_k_fftn(mesh_xy, M, P(None, None, None, 'x', 'y'),
+                            norm='backward')
+
+    @partial(jax.jit, out_shardings=face)
+    def _fH_q_fft(fH_R, delta):
+        ph = jnp.exp(-2j * jnp.pi * (Rg @ delta))              # (N_k,)
+        A = fH_R * ph[:, None, None]
+        A = jax.lax.with_sharding_constraint(A, face)
+        box = jnp.zeros((mk, rank, rank), dtype=A.dtype)
+        box = box.at[fold].add(A)
+        box = jax.lax.with_sharding_constraint(box, face)
+        return fftn(box)
+
+    return _fH_q_fft
+
+
 def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
                kgrid_co: tuple[int, int, int], mesh_xy: Mesh,
                *, a_band_index: int | None = None,
@@ -1454,6 +1664,23 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         nq = int(kpath_frac.shape[0])
         n_pad = (-nq) % batch_size
         wrapped_k = _prep_kpath(kpath_frac, int(n_pad))
+        # ── THE KPATH ROUTE, stated rather than assumed ───────────────────
+        # The FFT route (``make_fH_q_fft``) needs the target q-set to be a
+        # rigid shift of a Γ-centred uniform grid.  A BANDSTRUCTURE PATH never
+        # is: ``generate_kpath_from_qe_segments`` walks the ``K_POINTS
+        # crystal_b`` segments with a per-segment point count, so consecutive
+        # q are collinear inside a segment and turn a corner at every node.
+        # The detector is run anyway — on the host, O(n_q), once — so this is
+        # a MEASURED refusal on every deck rather than a claim in a comment,
+        # and a deck that did hand this driver a uniform grid would say so.
+        _kpath_plan = detect_uniform_q(np.asarray(jax.device_get(wrapped_k))[:nq])
+        kpath_route = "scan" if _kpath_plan is None else "fft"
+        log_fn(f"  [route] kpath fH_q: {kpath_route}  ({nq} q in "
+               f"{(nq + batch_size - 1) // batch_size} batch(es) of "
+               f"{batch_size}"
+               + ("; not a shifted uniform grid — a K_POINTS crystal_b path "
+                  "never is)" if _kpath_plan is None
+                  else f"; {_kpath_plan.origin})"))
         nq_padded = wrapped_k.shape[0]
         jax.block_until_ready(wrapped_k)                   # instrument:
         timing.record("ht.kpath_prep", _perf() - _t0)      # instrument:

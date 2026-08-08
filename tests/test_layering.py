@@ -741,8 +741,16 @@ _L1_LIBRARY_ENV_READS = {
     # resolve_reshard_route — explicit kwarg wins, env is the A/B path the
     # production exciton_bands driver cannot plumb an argument to (file
     # ownership); unknown tokens announce, never silently.
+    # resolve_fourier_route / resolve_fft_block_ratio — same situation: the
+    # fH_q evaluation route and its residency ceiling have to be A/B'd through
+    # the production exciton_bands driver, which cannot plumb an argument to
+    # compute_wfns_fi (file ownership).  Both refuse on garbage rather than
+    # falling back, because a route knob that silently does nothing is how an
+    # A/B measures the same arm twice.
     "bandstructure.bse_setup": {
         "LORRAX_FACE_TO_BATCH_ROUTE",
+        "LORRAX_HTQ_FOURIER_ROUTE",
+        "LORRAX_HTQ_FFT_BLOCK_RATIO",
     },
 }
 

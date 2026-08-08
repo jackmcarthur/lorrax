@@ -821,6 +821,15 @@ def main(argv=None):
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=kgrid_co_ct, band_window_fi=(b_min, b_max),
         mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
+        # ``q_list`` is nQ RIGID SHIFTS of one Γ-centred grid — the line that
+        # builds it two statements up says so, and nothing downstream can
+        # rediscover it (a block boundary is not a coordinate wrap).  Declaring
+        # it lets ``compute_wfns_fi`` evaluate fH_q as one FFT per Q instead of
+        # nQ·nk Fourier scans.  The declaration is VERIFIED against ``q_list``
+        # there before any route changes, so a future edit to ``Qpath`` or
+        # ``k_frac`` that breaks the structure demotes to the scan and says so
+        # rather than returning wrong bands.
+        q_structure=((nkx, nky, nkz), Qpath),
         eigh_backend=args.eigh_backend,
         use_low_mem_eigh=_use_low_mem_eigh, log_fn=log)
     psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
