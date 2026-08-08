@@ -144,6 +144,8 @@ def solve_bse_sharded(
     atol: float = 1e-8,
     check_every: int = 4,
     solver_kind: str = "lanczos",
+    trlan_m_max: int | None = None,
+    trlan_n_keep: int | None = None,
     davidson_n_random_init: int = 5,
     davidson_eps_shift_Ry: float = 1e-3,
     tda: bool = True,
@@ -353,6 +355,61 @@ def solve_bse_sharded(
         # Match Lanczos return shape: (n_eig, bs=1, nc_pad, nv_pad, nk).
         eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
         return eigenvalues, eigenvectors, jnp.int32(max_iter)
+
+
+    # ── Thick-restart Lanczos: fixed-shape, memory-capped Krylov ──────────
+    # Same Krylov convergence as the unrestarted path, from a basis of
+    # ``m_max + 1`` slots instead of ``max_iter + 1``.  On a 1024-dim deck
+    # that trade is a loss (the unrestarted solve already fits); it exists
+    # for production ``bse_dim``, where a 400-vector basis does not.
+    #
+    # Everything is preallocated and every trip count is a compile-time
+    # constant, so the iteration traces at exactly one shape.  It opens NO
+    # shard_map of its own: the subspace algebra is ellipsis einsums whose
+    # batch axis is replicated and whose trailing axes carry ``sh.X``, which
+    # GSPMD lowers to the two CGS2 collectives per step; the only shard_map
+    # in the solve is the one ``matvec_ring`` already owns.
+    if solver_kind == "trlan":
+        from solvers.thick_restart_lanczos import thick_restart_lanczos_eig
+
+        psi_c_X = data["psi_c_X"]; psi_c_Y = data["psi_c_Y"]
+        psi_v_X = data["psi_v_X"]; psi_v_Y = data["psi_v_Y"]
+        eps_c   = data["eps_c"];   eps_v   = data["eps_v"]
+        V_q0    = data["V_q0"]
+        M_X     = data["M_X"];     M_Y     = data["M_Y"]
+
+        m_max = int(trlan_m_max) if trlan_m_max else max(3 * n_eig, 60)
+        n_keep = int(trlan_n_keep) if trlan_n_keep else n_eig + 10
+        # ``--max-lanczos-iter`` is read as a budget of matvec APPLICATIONS,
+        # so the A/B against the unrestarted path is like-for-like: both
+        # spend the same number of H applications.
+        per_cycle = m_max - n_keep
+        n_restarts = max(0, -(-(int(max_iter) - m_max) // per_cycle))
+        apps = m_max + n_restarts * per_cycle
+        bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
+
+        def apply_H(V):
+            V = jax.lax.with_sharding_constraint(V, sh.X)
+            return matvec_ring(V, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                               eps_c, eps_v, W_R, V_q0, M_X, M_Y)
+
+        print(f"Thick-restart Lanczos: n_eig={n_eig} m_max={m_max} "
+              f"n_keep={n_keep} restarts={n_restarts} -> {apps} matvec "
+              f"applications, basis {m_max + 1} slots "
+              f"({(m_max + 1) / (int(max_iter) + 1):.2f}x the unrestarted "
+              f"basis at the same budget)", flush=True)
+
+        eigenvalues, eigenvectors, alpha_im = thick_restart_lanczos_eig(
+            apply_H, (nc_pad, nv_pad, nk),
+            n_eig=n_eig, m_max=m_max, n_keep=n_keep,
+            n_restarts=n_restarts, sharding=bse_sharding,
+        )
+        print(f"Thick-restart Lanczos: max |Im <q,Hq>| = "
+              f"{float(alpha_im):.3e} Ry", flush=True)
+        eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
+        # An HONEST third slot: the matvec applications actually spent, not
+        # an echo of the budget (CONVERGENCE_CENSUS recommendation 2).
+        return eigenvalues, eigenvectors, jnp.int32(apps)
 
     rep_eig = NamedSharding(mesh_xy, P())  # eigenvalues / eigenvectors come back replicated.
     # ``krep``: the Krylov basis sharding, or None to leave it to GSPMD (the
