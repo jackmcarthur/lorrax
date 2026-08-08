@@ -20,7 +20,7 @@ requires-python = ">=3.12"
 # lxkit is the shared foundation (Gate/probe vocabulary/jax-version shims);
 # this package reaches it through its test tier today and depends on it the
 # same way distrib_la does.  jax is the substrate the unfolds are written
-# in — `unfold_v_q` is a `shard_map` over an ('x','y') mesh — and numpy is
+# in — `unfold_isdf_operator` is a `shard_map` over an ('x','y') mesh — and numpy is
 # the substrate the tables are: `SymMaps` builds them eagerly on the host.
 dependencies = ["lxkit", "jax", "numpy"]
 

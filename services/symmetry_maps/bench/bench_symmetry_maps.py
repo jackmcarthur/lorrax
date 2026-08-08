@@ -98,7 +98,8 @@ THREE GROUPS, AND WHICH MESH EACH BELONGS TO.
     caller had), so a 2x2 row would measure the caller's sharding choice
     and attribute it to this service.
 
-``unfold`` — ``unfold_v_q`` at whatever ``--mesh`` says.  This is the one
+``unfold`` — ``unfold_isdf_operator`` at whatever ``--mesh`` says.  This
+    is the one
     group that is genuinely mesh-shaped: 1x1 takes neither ``all_to_all``
     branch and 2x2 takes both.  Runs on every leg.
 
@@ -185,7 +186,8 @@ if __name__ == "__main__":
 import _deck_stub                                              # noqa: E402
 import test_symmetry_maps_emulated_mesh as _lb                 # noqa: E402
 from symmetry_maps import (KStarMap, SymMaps, star_broadcast,  # noqa: E402
-                           star_select, star_spread, unfold_v_q)
+                           star_select, star_spread,
+                           unfold_isdf_operator)
 
 #: The band-index operand every star row is measured on: ``(nk, nb, nb)``
 #: complex128.  nk is ``si_cohsex_debug``'s full BZ and is therefore not a
@@ -344,7 +346,8 @@ def run_star(rows, *, warmup, reps):
 
 
 def run_unfold(rows, mesh, mesh_str, *, warmup, reps, emulated):
-    """``unfold_v_q`` on the L-b geometry (n_rmu=12) and its 120 twin."""
+    """``unfold_isdf_operator`` on the L-b geometry (n_rmu=12) and its
+    120 twin."""
     import jax.numpy as jnp
     for name, geom in (("lb12", _lb._divisible_geometry),
                        ("orbit120", _geometry_120)):
@@ -352,12 +355,21 @@ def run_unfold(rows, mesh, mesh_str, *, warmup, reps, emulated):
         V = jnp.asarray(_lb._hermitian_ibz(n_rmu))
 
         def _fn(V=V, perm=perm, L=L):
-            return unfold_v_q(V, irr_idx=_lb._IRR, sym_idx=_lb._SYM,
-                              sym_perm=perm, L_table=L,
-                              q_irr_frac=_lb._Q_IRR, mesh_xy=mesh,
-                              n_sym_spatial=_lb._NTRAN)
+            return unfold_isdf_operator(
+                V, irr_idx=_lb._IRR, sym_idx=_lb._SYM,
+                sym_perm=perm, L_table=L,
+                q_irr_frac=_lb._Q_IRR, mesh_xy=mesh,
+                n_sym_spatial=_lb._NTRAN)
         compile_s, ts = _time_one(_fn, warmup=warmup, reps=reps)
         out_sh = (len(_lb._IRR), n_rmu, n_rmu)
+        # HAND-TRACKED THROUGH THE 2026-08-08 RENAME SWEEP — the ``op``
+        # field is a BENCHMARK IDENTITY, not a symbol reference.  It is
+        # the key every committed row in ``baselines/*.json`` is matched
+        # on, and the whole value of those files is that a number from
+        # today can be compared with a number from before the rename.
+        # Renaming the key would not rename the history; it would only
+        # make the history unmatchable.  The CALL above moved to the new
+        # name; this string stays until a baseline re-cut retires it.
         _row(rows, "unfold_v_q", "jax", V.shape, mesh_str, compile_s, ts,
              geometry=name, n_q_ibz=int(V.shape[0]),
              operand_mib=_mib(V.shape), out_shape=list(out_sh),

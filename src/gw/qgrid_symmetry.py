@@ -5,7 +5,7 @@ WHAT THIS MODULE IS.  One function.  It asks
 admits the IBZ q reduction, and — when it does not — emits ONE rank-0
 announcement per run naming the failed closure and its consequence.  Every
 producer of the q-axis tables in ``gw/`` goes through here; nothing else
-in the monorepo calls ``compute_centroid_sym_perm``, and
+in the monorepo calls ``centroid_source_map_and_wrap``, and
 ``tests/test_qgrid_symmetry_resolution.py`` is the ratchet that says so.
 
 WHY IT EXISTS.  Before the consolidation, the closure question was asked

@@ -1035,6 +1035,12 @@ def test_the_service_door_carve_out_is_narrow(sources):
     live = [(m, t) for _, _, m, t, _, _ in upward_edges(sources)]
     assert ("centroid.kmeans_isdf", "symmetry_maps") not in live
 
+    # Visited by the 2026-08-08 rename sweep and deliberately unchanged:
+    # ``canonicalize_orbit`` is one of the thirteen names the survey ruled
+    # KEEP (pure mathematics, correctly named), so the literal below still
+    # names a live export.  It is recorded here because the name appears
+    # as SOURCE TEXT the ratchet parses, where a rename tool would not
+    # have seen it — the next sweep should re-check it rather than assume.
     past = scan_service_door(
         "def f():\n    from symmetry_maps.orbit_syms import "
         "canonicalize_orbit\n",

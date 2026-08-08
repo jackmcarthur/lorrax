@@ -65,7 +65,7 @@ import pytest
 
 import _deck_stub
 from lxkit.testing import require_devices
-from symmetry_maps import (compute_centroid_sym_perm, unfold_v_q,
+from symmetry_maps import (centroid_source_map_and_wrap, unfold_isdf_operator,
                            verify_centroid_orbit_closure)
 from symmetry_maps import qirr_store as QS
 
@@ -109,9 +109,10 @@ TRS_DECKS = ("gnppm_debug", "bispinor_debug")
 _ABLATION_WEIGHT = 1.0
 
 #: Bar for "the kernel agrees with the hand reference": RELATIVE, matching
-#: the L-c harness.  The identity claim — read-back against ``unfold_v_q``
-#: on the same tables — is held to BIT equality instead, because it is the
-#: same function on the same inputs and nothing may differ.
+#: the L-c harness.  The identity claim — read-back against
+#: ``unfold_isdf_operator`` on the same tables — is held to BIT equality
+#: instead, because it is the same function on the same inputs and nothing may
+#: differ.
 RTOL = 1e-13
 
 
@@ -124,7 +125,7 @@ def star_tables(deck):
 
     The committed table stores ``irr_idx_k`` as FULL-BZ LABELS (gnppm's are
     the non-monotone ``[0, 2, 6, 8, 7]``), which is what the band-index
-    star helpers want.  ``unfold_v_q`` wants a COMPACT index into the
+    star helpers want.  ``unfold_isdf_operator`` wants a COMPACT index into the
     stored wedge's leading axis, so the labels are mapped to their
     first-occurrence position here.  Doing that conversion in one place is
     the point: a q-axis table that indexed by label would gather rows that
@@ -154,7 +155,7 @@ def closed_centroid_set(sym_matrices, tnp, fft_grid, seeds):
 
     The union of the seeds' orbits under the BGW r-action
     ``r' = mtrx⁻¹·r + τ``.  A union of orbits is closed under the group by
-    definition, so ``compute_centroid_sym_perm(validate=True)`` passes and
+    definition, so ``centroid_source_map_and_wrap(validate=True)`` passes and
     the closure is a property of this function rather than of a file that
     somebody might regenerate.
     """
@@ -218,7 +219,7 @@ class _Arm:
         self.verdict = verify_centroid_orbit_closure(
             self.centroid_frac, self.sym_matrices, tnp=self.tnp,
             fft_grid=self.fft_grid)
-        perm, L = compute_centroid_sym_perm(
+        perm, L = centroid_source_map_and_wrap(
             centroid_idx, self.sym_matrices, self.tnp, self.fft_grid,
             validate=True, extend_trs=True)
         self.n_mu = int(centroid_idx.shape[0])
@@ -231,13 +232,14 @@ class _Arm:
         return hand_unfold(self.X_ibz, self.tables, **kw)
 
     def kernel(self, mesh):
-        """``unfold_v_q`` on the wedge — what the uncompressed path used."""
+        """``unfold_isdf_operator`` on the wedge — what the uncompressed path
+        used."""
         import jax.numpy as jnp
         t = self.tables
-        return unfold_v_q(jnp.asarray(self.X_ibz), irr_idx=t.irr_idx_q,
-                          sym_idx=t.sym_idx_q, sym_perm=t.sym_perm,
-                          L_table=t.L_table, q_irr_frac=t.q_irr_frac,
-                          mesh_xy=mesh, n_sym_spatial=int(t.n_sym_spatial))
+        return unfold_isdf_operator(
+            jnp.asarray(self.X_ibz), irr_idx=t.irr_idx_q, sym_idx=t.sym_idx_q,
+            sym_perm=t.sym_perm, L_table=t.L_table, q_irr_frac=t.q_irr_frac,
+            mesh_xy=mesh, n_sym_spatial=int(t.n_sym_spatial))
 
 
 def trs_arm(deck):
@@ -310,7 +312,7 @@ def local_blocks(got, ref):
     ν) block it holds, which is also how PLACEMENT gets checked — an
     allgather would erase it.
 
-    The reference may be sharded too (``unfold_v_q``'s output is), so
+    The reference may be sharded too (``unfold_isdf_operator``'s output is), so
     blocks are paired by their index rather than by position.  MEASURED
     writing this: the first draft indexed a host array unconditionally and
     the emulated 2x2 could not see it — the real four-process leg failed
@@ -409,9 +411,9 @@ def _shard_max_abs_diff(out, ref):
 def check_qirr_round_trip_on_a_trs_deck(mesh, deck="gnppm_debug"):
     """Write the wedge, read it back, compare ELEMENT-WISE off-diagonal.
 
-    The read-back is compared against ``unfold_v_q`` on the same wedge and
-    the same tables — the array the uncompressed path actually used — and
-    the bar is BIT equality, not a tolerance.  That is the design's central
+    The read-back is compared against ``unfold_isdf_operator`` on the same
+    wedge and the same tables — the array the uncompressed path actually used —
+    and the bar is BIT equality, not a tolerance.  That is the design's central
     claim: because the format persists the PRE-UNFOLD block, reader and
     uncompressed path evaluate the same function on the same inputs, so
     they agree by construction on every element rather than by a property
@@ -431,8 +433,9 @@ def check_qirr_round_trip_on_a_trs_deck(mesh, deck="gnppm_debug"):
         kern = arm.kernel(mesh)
         d = _shard_max_abs_diff(got, kern)
         assert d == 0.0, (
-            f"{deck}: read-back differs from unfold_v_q on the same wedge "
-            f"by {d:.3e}; the round trip is supposed to be an IDENTITY")
+            f"{deck}: read-back differs from unfold_isdf_operator on the "
+            f"same wedge by {d:.3e}; the round trip is supposed to be "
+            f"an IDENTITY")
         n_off, _, _, _ = assert_offdiag_elementwise(
             got, kern, f"{deck} identity")
         assert_offdiag_elementwise(got, arm.reference(),
@@ -467,7 +470,8 @@ def check_qirr_umklapp_phase_survives_the_store(mesh):
         got, _ = QS.read_tensor(path, "V_qmunu", mesh_xy=mesh)
         d_true = _shard_max_abs_diff(got, arm.kernel(mesh))
         assert d_true == 0.0, (
-            f"stored/read path differs from unfold_v_q by {d_true:.3e}")
+            f"stored/read path differs from unfold_isdf_operator by "
+            f"{d_true:.3e}")
         d_nophase = _shard_max_abs_diff(got, nophase)
         assert d_nophase > 0.0, (
             "the read path agrees with the PHASELESS reference; the stored "
@@ -898,7 +902,7 @@ def test_the_table_digest_moves_when_any_table_moves():
 
     A digest that ignored ``L_table`` would let the umklapp phase decay
     silently; one that depended on the caller's dtype would refuse a
-    perfectly good file because ``compute_centroid_sym_perm`` returns
+    perfectly good file because ``centroid_source_map_and_wrap`` returns
     ``L`` as int8.  Both are checked here.
     """
     arm = trs_arm("gnppm_debug")

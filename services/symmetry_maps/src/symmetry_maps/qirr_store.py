@@ -5,8 +5,9 @@ WHAT IS STORED, AND WHY IT IS THE PRE-UNFOLD BLOCK.  A GW restart tensor
 GB each at the Si production shape — and on a deck whose centroid set is
 orbit-closed every full-BZ row is a symmetry image of an IBZ row.  The
 producer HOLDS the IBZ-shaped array one statement before it unfolds it
-(``screening.py`` and ``v_q_g_flat.py`` both call ``unfold_v_q`` on an
-``(n_q_ibz, N_μ, N_μ)`` array they already have).  This module persists
+(``screening.py`` and ``v_q_g_flat.py`` both call
+``unfold_isdf_operator`` on an ``(n_q_ibz, N_μ, N_μ)`` array they
+already have).  This module persists
 THAT array.  The round trip ``unfold(stored) == what the run used`` is then
 an IDENTITY — the same function on the same inputs — rather than a property
 that depends on the bit-frozen op-selection policy.  Slicing the unfolded
@@ -64,7 +65,7 @@ import os
 
 import numpy as np
 
-from symmetry_maps.maps import unfold_v_q
+from symmetry_maps.maps import unfold_isdf_operator
 from symmetry_maps.orbit_syms import (CLOSURE_TOL_DEFAULT,
                                       CentroidClosureVerdict,
                                       verify_centroid_orbit_closure)
@@ -97,7 +98,7 @@ _OWNED_ATTRS = (
 
 #: Table name -> the dtype it is canonicalised to on write AND hashed as.
 #: Fixing these is what makes the digest reproducible from a read-back:
-#: ``L_table`` arrives int8 from ``compute_centroid_sym_perm`` and would
+#: ``L_table`` arrives int8 from ``centroid_source_map_and_wrap`` and would
 #: hash differently if a caller ever handed int64.
 _TABLE_DTYPES = {
     "irr_idx_q": np.int32,
@@ -121,10 +122,11 @@ _COMMIT_CACHE: list = []
 class QirrTables:
     """Everything needed to unfold a stored wedge back to the full BZ.
 
-    The same five arrays and one scalar :func:`symmetry_maps.unfold_v_q`
-    takes, bundled so that a writer cannot supply four of them.  Built from
-    ``SymMaps.irr_idx_q`` / ``sym_idx_q`` / ``q_irr_frac`` and
-    ``compute_centroid_sym_perm(..., extend_trs=True)``.
+    The same five arrays and one scalar
+    :func:`symmetry_maps.unfold_isdf_operator` takes, bundled so that a writer
+    cannot supply four of them.  Built from ``SymMaps.irr_idx_q`` /
+    ``sym_idx_q`` / ``q_irr_frac`` and
+    ``centroid_source_map_and_wrap(..., extend_trs=True)``.
     """
 
     irr_idx_q: np.ndarray
@@ -385,7 +387,7 @@ def _validate(tables: QirrTables, n_q_on_disk: int, n_mu: int) -> str:
         raise ValueError(
             f"qirr_store: sym_idx_q reaches row {max_sym} but sym_perm has "
             f"only {n_sym_rows}.  Build sym_perm via "
-            f"``compute_centroid_sym_perm(..., extend_trs=True)`` so it "
+            f"``centroid_source_map_and_wrap(..., extend_trs=True)`` so it "
             f"covers the TRS-augmented half.")
     n_spatial = int(t.n_sym_spatial)
     if n_spatial <= 0:
@@ -442,8 +444,8 @@ def write_qirr_tensor(
         group ``name + "__qirr"``.
     X_ibz
         ``(n_q_ibz, n_mu, n_mu)`` — the PRE-UNFOLD block, the array the
-        producer holds one statement before it calls ``unfold_v_q``.  Any
-        array with ``__array__``; it is materialised on the host here.
+        producer holds one statement before it calls ``unfold_isdf_operator``.
+        Any array with ``__array__``; it is materialised on the host here.
     tables
         :class:`QirrTables`.  Written into the file, hashed, and re-checked
         on read.
@@ -777,7 +779,7 @@ def read_tensor(
             f"({n_q_on_disk} of {can.n_q_full} q) and unfolding it needs a "
             f"mesh; pass mesh_xy= or unfold=False to take the wedge.")
     import jax.numpy as jnp
-    full = unfold_v_q(
+    full = unfold_isdf_operator(
         jnp.asarray(raw),
         irr_idx=can.irr_idx_q,
         sym_idx=can.sym_idx_q,

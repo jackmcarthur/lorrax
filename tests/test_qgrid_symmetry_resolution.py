@@ -1,6 +1,6 @@
 """The q-grid closure fallback is LOUD, and it is announced in one place.
 
-WHAT WENT WRONG, AND WHERE.  ``compute_centroid_sym_perm`` refuses on a
+WHAT WENT WRONG, AND WHERE.  ``centroid_source_map_and_wrap`` refuses on a
 centroid set that is not orbit-closed — correctly.  But a refusal is only
 as loud as the ``except`` that receives it, and this tree had three of them:
 
@@ -27,7 +27,7 @@ come back:
    self-consistency iteration).  A per-call line is a line nobody reads.
 2. On a closed deck it does NOT fire.  An announcement that is always
    present carries no information.
-3. No module under ``src/`` reaches ``compute_centroid_sym_perm`` behind
+3. No module under ``src/`` reaches ``centroid_source_map_and_wrap`` behind
    the resolution point's back.  That is the ratchet: the consolidation is
    only worth anything for as long as it is the only door.
 
@@ -220,11 +220,22 @@ def test_the_transverse_refusal_path_does_not_announce_a_fallback(
 # ---------------------------------------------------------------------------
 
 #: The only module under ``src/`` that may name
-#: ``compute_centroid_sym_perm``.
+#: the table builder.
 #: It is the wave-1 re-export shim (``symmetry_maps.orbit_syms`` moved into
 #: the service); it forwards the name and never calls it.  The shim is
 #: deleted by the phase-wide cleanup commit, at which point this set empties.
 _PERM_NAME_ALLOWED = {os.path.join("centroid", "orbit_syms.py")}
+
+#: BOTH SPELLINGS OF THE TABLE BUILDER, and this set is why the ratchet
+#: survived the 2026-08-08 rename sweep.  The name is matched here as a
+#: STRING — in the source-text prefilter and against the AST's identifier
+#: set — so an AST-aware rename tool updates every call site in the tree
+#: and leaves this gate matching a name nobody uses any more.  It would
+#: then pass, forever, while a new ``src/`` module called the new name
+#: straight past the resolution point.  The old spelling stays until the
+#: compat aliases are retired (``symmetry_maps._compat``): as long as the
+#: alias resolves, calling it is exactly the bypass this cell forbids.
+_PERM_NAMES = {"centroid_source_map_and_wrap", "compute_centroid_sym_perm"}
 
 #: The only module under ``src/`` allowed to reach the service's resolution
 #: door.  Everything in ``gw/`` goes through this one adapter, which is what
@@ -258,7 +269,7 @@ def _src_modules():
 def _names_used(tree):
     """Every identifier the module NAMES — imported, called or referenced.
 
-    Attribute access counts (``orbit_syms.compute_centroid_sym_perm``) and
+    Attribute access counts (``orbit_syms.centroid_source_map_and_wrap``) and
     so does an aliased import (``... as _check_perm``, which is how one of
     the three call sites spelled it), because a ratchet that only matched
     the bare name would have missed the site it was written for.
@@ -281,7 +292,7 @@ def _names_used(tree):
 def test_no_module_bypasses_the_resolution_point():
     """The ratchet.  One door to the table builder, one door to the service.
 
-    Both halves are needed.  Pinning only ``compute_centroid_sym_perm``
+    Both halves are needed.  Pinning only the table builder
     would let a new site call ``resolve_qgrid_symmetry`` directly and skip
     the announcement; pinning only the service door would let one call the
     table builder and go back to catching exceptions.
@@ -290,18 +301,17 @@ def test_no_module_bypasses_the_resolution_point():
     for rel, path in _src_modules():
         with open(path, encoding="utf-8") as fh:
             src = fh.read()
-        if "compute_centroid_sym_perm" not in src \
+        if not any(n in src for n in _PERM_NAMES) \
                 and "resolve_qgrid_symmetry" not in src:
             continue
         names = _names_used(ast.parse(src, filename=path))
-        if "compute_centroid_sym_perm" in names \
-                and rel not in _PERM_NAME_ALLOWED:
+        if (names & _PERM_NAMES) and rel not in _PERM_NAME_ALLOWED:
             offenders_perm.append(rel)
         if "resolve_qgrid_symmetry" in names and rel not in _RESOLVE_ALLOWED:
             offenders_resolve.append(rel)
 
     assert not offenders_perm, (
-        f"{offenders_perm} reach ``compute_centroid_sym_perm`` directly.  "
+        f"{offenders_perm} reach the centroid table builder directly.  "
         f"The closure decision is taken once, in "
         f"``symmetry_maps.resolve_qgrid_symmetry``, and announced once by "
         f"``gw.qgrid_symmetry.resolve_qgrid_symmetry_tables``; a site that "

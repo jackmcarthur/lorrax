@@ -473,6 +473,14 @@ def test_the_call_site_passes_ibz_slab_as_a_literal():
     appearing anywhere in a docstring, and both of those are exactly the
     shapes this needs to reject.
     """
+    # Visited by the 2026-08-08 rename sweep and deliberately unchanged:
+    # ``star_broadcast`` is a KEEP name (already mathematical).  The
+    # matcher below compares an AST attribute against the STRING
+    # "star_broadcast", so a rename tool would have moved the call site
+    # in kin_ion_io.py and left this matcher looking for a name that no
+    # longer occurs — the assert would then find zero calls and this cell
+    # would fail loudly rather than pass vacuously, which is the right
+    # failure mode but only because the count is asserted to be exactly 1.
     src = pathlib.Path(_KIN_ION_IO).read_text()
     tree = ast.parse(src)
     fn = next(n for n in ast.walk(tree)

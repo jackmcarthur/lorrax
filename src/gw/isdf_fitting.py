@@ -347,7 +347,7 @@ def fit_zeta_to_h5(
     # distributed-potrs crash.)  Transverse channels can't fall back (the
     # V_q orchestrator assumes IBZ ζ̃_T), so they loud-fail with a hint.
     #
-    # ONE RESOLUTION POINT.  This used to call ``compute_centroid_sym_perm``
+    # ONE RESOLUTION POINT.  This used to call ``centroid_source_map_and_wrap``
     # for its side effect — build the whole table, throw it away, and read
     # the answer off whether an exception came back — which is both the
     # third spelling of the closure question in ``gw/`` and an
@@ -425,7 +425,7 @@ def fit_zeta_to_h5(
         # shape as V_q, and Cholesky is per-q independent — slice-then-
         # factor gives bit-equal L_q rows as factor-then-slice.  The
         # downstream solve still produces ζ_q at IBZ, and V_q unfolds via
-        # ``symmetry_maps.unfold_v_q`` from IBZ → full BZ.  Same
+        # ``symmetry_maps.unfold_isdf_operator`` from IBZ → full BZ.  Same
         # slice helper applies to χ_q for the W_q = (1 − v_q χ_q)^{-1} v_q
         # path once that lands.
         if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:

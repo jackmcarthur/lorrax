@@ -1,7 +1,7 @@
 """``resolve_qgrid_symmetry`` — the decision, taken once, said out loud.
 
 WHAT THIS PINS.  The service used to answer "may I reduce the q axis?" only
-by raising: a caller called ``compute_centroid_sym_perm`` and read the
+by raising: a caller called ``centroid_source_map_and_wrap`` and read the
 answer off whether an exception came back.  Three call sites in ``gw/`` did
 exactly that, each with its own ``except``, its own private flag, and its
 own wording — two of them behind a ``verbose`` argument that production
@@ -12,7 +12,7 @@ is ~8× wider in the q axis than the design intends and never says so.
 answer.  The cells below are the two halves that answer has to satisfy:
 
 * ON A CLOSED SET NOTHING MOVES.  The tables it returns are BIT-IDENTICAL
-  to what ``compute_centroid_sym_perm(..., extend_trs=True)`` returned
+  to what ``centroid_source_map_and_wrap(..., extend_trs=True)`` returned
   before the consolidation, on all three orbit-closed sets in the tree,
   including both TRS-active decks.  This is the "no behavior change on the
   closed path" claim, measured rather than asserted in prose.
@@ -49,7 +49,8 @@ import pytest
 import _deck_stub
 from symmetry_maps import (FULL_BZ_CONSEQUENCE, CentroidClosureVerdict,
                            QgridSymmetryResolution,
-                           compute_centroid_sym_perm, resolve_qgrid_symmetry)
+                           centroid_source_map_and_wrap,
+                           resolve_qgrid_symmetry)
 
 #: ``(deck, centroid file, n_sym, closed)`` — the measured table above.
 _CLOSED = [
@@ -132,7 +133,7 @@ def test_a_closed_set_resolves_to_ibz_with_bit_identical_tables(
     """NO BEHAVIOR CHANGE ON THE CLOSED PATH — measured to the byte.
 
     The consolidation is only safe if the resolution hands back exactly
-    what the old ``try: compute_centroid_sym_perm(...)`` handed back.  Not
+    what the old ``try: centroid_source_map_and_wrap(...)`` handed back.  Not
     "equal to tolerance" — the tables are integer gather indices and an
     integer lattice wrap, so anything but bit-equality is a different
     table and a different unfold.
@@ -147,7 +148,7 @@ def test_a_closed_set_resolves_to_ibz_with_bit_identical_tables(
     assert isinstance(res.verdict, CentroidClosureVerdict)
     assert res.verdict.closed, res.verdict.describe()
 
-    want_perm, want_L = compute_centroid_sym_perm(
+    want_perm, want_L = centroid_source_map_and_wrap(
         idx, sym_matrices=S, translations=tnp, fft_grid=fft,
         extend_trs=True)
     got_perm, got_L = res.tables()
@@ -288,7 +289,7 @@ def test_the_table_builders_own_refusal_is_caught_here_and_named_apart():
     and the operator would go looking in the wrong place.
 
     This is also the one place in the tree that catches
-    ``compute_centroid_sym_perm``'s ``RuntimeError``.  If it stopped
+    ``centroid_source_map_and_wrap``'s ``RuntimeError``.  If it stopped
     catching, this cell turns from a resolution into a traceback.
     """
     deck, name = "si_cohsex_debug", "centroids_frac_960.txt"

@@ -377,14 +377,14 @@ def compute_static_w(
             if use_ibz_w:
                 from ffi import _services
                 _services.ensure_on_path()
-                from symmetry_maps import unfold_v_q
+                from symmetry_maps import unfold_isdf_operator
                 with timing.section(
                         "W.unfold_to_full_bz", announce=True,
                         label=f"{_w} IBZ -> full-BZ unfold "
                               f"({nq_solve} q -> {int(meta.nk_tot)} q)"):
                     n_sym_spatial = int(
                         np.asarray(sym_perm).shape[0]) // 2
-                    W_q = unfold_v_q(
+                    W_q = unfold_isdf_operator(
                         W_q_solve,
                         irr_idx=full_to_irr_idx,
                         sym_idx=full_to_irr_sym,

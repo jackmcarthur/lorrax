@@ -679,7 +679,7 @@ def weighted_kmeans_jax(
     centroids become orbit *representatives* and each point's
     contribution is folded back to the rep frame through the minimising
     symmetry image, so the final set is closed under the point group.
-    Pass the table from ``orbit_syms.build_real_space_syms(wfn, sym)``.
+    Pass the table from ``orbit_syms.real_space_action_tables(wfn, sym)``.
 
     Returns:
         labels  : (P,) cluster assignment for each grid point.

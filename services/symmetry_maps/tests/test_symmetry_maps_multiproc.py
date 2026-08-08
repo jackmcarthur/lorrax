@@ -11,7 +11,7 @@ Duplicating the logic across the two would mean the multi-rank leg tests
 something slightly different from the thing the suite pins, which is how a
 matrix leg drifts out of agreement with its own reference.
 
-WHAT FOUR PROCESSES ADD OVER FOUR EMULATED DEVICES.  ``unfold_v_q``'s
+WHAT FOUR PROCESSES ADD OVER FOUR EMULATED DEVICES.  ``unfold_isdf_operator``'s
 ``lax.all_to_all`` redistribution is a COLLECTIVE.  On an emulated mesh all
 four "devices" are threads in one address space and the collective is a
 local shuffle; on four ranks it is a real exchange, the operand is
@@ -65,7 +65,7 @@ import test_symmetry_maps_emulated_mesh as L_b                # noqa: E402
 import test_symmetry_maps_qirr_store as QIRR                  # noqa: E402
 from lxkit.testing import require_devices                     # noqa: E402
 from symmetry_maps import (KStarMap, star_broadcast,          # noqa: E402
-                           star_select, star_spread, unfold_v_q)
+                           star_select, star_spread, unfold_isdf_operator)
 
 #: The engine-parity bar for a redistributed kernel: RELATIVE, never
 #: bit-exact.  The sharded path computes the umklapp phase per rank from a
@@ -78,7 +78,7 @@ RTOL = 1e-13
 # ---------------------------------------------------------------------------
 
 def check_unfold_matches_the_hand_reference(mesh):
-    """``unfold_v_q`` against the pure-numpy per-element reference.
+    """``unfold_isdf_operator`` against the pure-numpy per-element reference.
 
     The reference lives in the L-b module and is imported, not copied: two
     references would be two chances to be wrong about the same formula.
@@ -88,10 +88,10 @@ def check_unfold_matches_the_hand_reference(mesh):
     perm, L, n_rmu = L_b._divisible_geometry()
     V = L_b._hermitian_ibz(n_rmu)
     ref = L_b._hand_unfold(V, perm=perm, L=L, n_rmu=n_rmu)
-    out = unfold_v_q(jnp.asarray(V), irr_idx=L_b._IRR,
-                     sym_idx=L_b._SYM, sym_perm=perm, L_table=L,
-                     q_irr_frac=L_b._Q_IRR, mesh_xy=mesh,
-                     n_sym_spatial=L_b._NTRAN)
+    out = unfold_isdf_operator(jnp.asarray(V), irr_idx=L_b._IRR,
+                               sym_idx=L_b._SYM, sym_perm=perm, L_table=L,
+                               q_irr_frac=L_b._Q_IRR, mesh_xy=mesh,
+                               n_sym_spatial=L_b._NTRAN)
     # The output is P(None,'x','y')-sharded: at P>1 no rank holds the
     # global array, and ``np.asarray`` on it raises "spans non-addressable
     # devices" (measured on the real 4-rank leg, 2026-08-07).  Compare each
@@ -105,7 +105,8 @@ def check_unfold_matches_the_hand_reference(mesh):
             blk = ref[shard.index]
             num = max(num, float(np.abs(np.asarray(shard.data) - blk).max()))
     rel = num / float(np.abs(ref).max())
-    assert rel < RTOL, f"unfold_v_q differs from the reference: {rel:.3e}"
+    assert rel < RTOL, (
+        f"unfold_isdf_operator differs from the reference: {rel:.3e}")
     return f"rel {rel:.2e} n_rmu {n_rmu}"
 
 
@@ -124,16 +125,17 @@ def check_hostile_extent_refuses(mesh):
     if n_rmu % (px * py) == 0:
         return f"inapplicable: n_rmu={n_rmu} divides {px}x{py}"
     try:
-        unfold_v_q(V, irr_idx=L_b._IRR, sym_idx=L_b._SYM, sym_perm=perm,
-                   L_table=L, q_irr_frac=L_b._Q_IRR, mesh_xy=mesh,
-                   n_sym_spatial=L_b._NTRAN)
+        unfold_isdf_operator(
+            V, irr_idx=L_b._IRR, sym_idx=L_b._SYM, sym_perm=perm, L_table=L,
+            q_irr_frac=L_b._Q_IRR, mesh_xy=mesh, n_sym_spatial=L_b._NTRAN)
     except ValueError as exc:
         assert f"n_rmu_padded={n_rmu}" in str(exc), str(exc)
         assert f"Px*Py={px * py}" in str(exc), str(exc)
         return f"refused n_rmu={n_rmu} on {px}x{py}"
     raise AssertionError(
-        f"n_rmu={n_rmu} does not divide {px}x{py}={px * py} and unfold_v_q "
-        f"accepted it; a promise_in_bounds gather clips SILENTLY")
+        f"n_rmu={n_rmu} does not divide {px}x{py}={px * py} and "
+        f"unfold_isdf_operator accepted it; a promise_in_bounds gather "
+        f"clips SILENTLY")
 
 
 def check_star_helpers_keep_the_sharding(mesh):
@@ -273,19 +275,20 @@ def check_spread_rel_is_one_replicated_scalar(mesh):
 def check_qirr_round_trip_through_the_sharded_unfold(mesh):
     """The q_irr restart round trip, on REAL ranks, through the all_to_all.
 
-    ``read_tensor`` unfolds with ``unfold_v_q``, so a q_irr restart load is
-    a ``lax.all_to_all`` redistribution every time — the redistribution is
-    the whole memory story of the format and the place a sharded unfold
+    ``read_tensor`` unfolds with ``unfold_isdf_operator``, so a q_irr restart
+    load is a ``lax.all_to_all`` redistribution every time — the redistribution
+    is the whole memory story of the format and the place a sharded unfold
     would fail.  Single-process coverage proved twice in this campaign that
     it cannot see multi-process failure modes, so the round trip rides this
     harness rather than only the collected 1x1 and the emulated 2x2.
 
     The DECK IS TRS-ACTIVE (gnppm: four of its five stars begin on a
     time-reversal row) so the antiunitary branch runs at P>1 too, and the
-    comparison is against ``unfold_v_q`` on the same wedge — the array the
-    uncompressed path would have used — at BIT equality, per addressable
-    shard.  Each rank writes its own temporary file: this is a format test,
-    not a phdf5 test, and a shared path would be testing the filesystem.
+    comparison is against ``unfold_isdf_operator`` on the same wedge — the
+    array the uncompressed path would have used — at BIT equality, per
+    addressable shard.  Each rank writes its own temporary file: this is a
+    format test, not a phdf5 test, and a shared path would be testing the
+    filesystem.
     """
     return QIRR.check_qirr_round_trip_on_a_trs_deck(mesh, "gnppm_debug")
 

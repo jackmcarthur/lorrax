@@ -28,7 +28,8 @@ row                          what evaporates when it is missing
                              with a TRS-first star) AND lorrax's own four
                              ``test_density_symmetry_check`` fixture cells
 ``module:h5py``              every deck cell at once, as an importorskip
-``devices:4-forceable``      the L-b emulated-mesh tier: ``unfold_v_q``'s
+``devices:4-forceable``      the L-b emulated-mesh tier:
+``unfold_isdf_operator``'s
                              two ``all_to_all`` branches are unreachable at
                              1x1, so G10 and G6 have nowhere else to run
 ===========================  ================================================

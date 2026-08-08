@@ -221,8 +221,8 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # IBZ cascade plumbing.  When ``use_ibz=True`` the bispinor ζ̃ files
     # were written IBZ-only (see ``gw_init.fit_zeta`` and
     # ``isdf_fitting.fit_zeta_to_h5``); the per-tile kernel iterates the
-    # parent IBZ q-list and unfolds post-loop via ``unfold_v_q``.  Two
-    # centroid sets ⇒ two orbit-closure checks (CC ↔ charge, TT ↔
+    # parent IBZ q-list and unfolds post-loop via ``unfold_isdf_operator``.
+    # Two centroid sets ⇒ two orbit-closure checks (CC ↔ charge, TT ↔
     # transverse); they may diverge in principle but in practice are
     # generated together by the user's ``kmeans_cli --orbit-aware`` run.
     # If either set's closure check fails, the corresponding tiles fall
@@ -360,7 +360,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     if _use_ibz_T and sym is not None and tt_buffer:
         from ffi import _services
         _services.ensure_on_path()
-        from symmetry_maps import unfold_v_q_bispinor_lorentz
+        from symmetry_maps import mix_channels_by_proper_rotation
 
         # Synthesise the 3 Hermitian-redundant tiles (j, i) for i < j from
         # the stored upper-triangle.  These are needed as INPUTS to the
@@ -370,7 +370,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
             tt_full_in[(j, i)] = jnp.conj(
                 jnp.swapaxes(tt_buffer[(i_src, j_src)], -1, -2))
 
-        tt_mixed = unfold_v_q_bispinor_lorentz(
+        tt_mixed = mix_channels_by_proper_rotation(
             tt_full_in,
             sym_idx=np.asarray(sym.sym_idx_q, dtype=np.int32),
             R_proper_table=np.asarray(sym.R_proper, dtype=np.float64),

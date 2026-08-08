@@ -28,6 +28,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from ._compat import deprecated_alias
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Charge-density point group (recovery of symmetry a reduced WFN dropped)
@@ -89,7 +91,7 @@ def recover_symmorphic_density_point_group(
        grid to itself because it is integer).  Non-symmorphic ops (τ≠0)
        fail this τ=0 test and are conservatively omitted — safe, because a
        WFN that genuinely carries non-symmorphic ops already exposes them
-       (see :func:`build_real_space_syms`, which keeps the larger group).
+       (see :func:`real_space_action_tables`, which keeps the larger group).
 
     Parameters
     ----------
@@ -153,8 +155,8 @@ def recover_symmorphic_density_point_group(
 # Build sym table (host)
 # ─────────────────────────────────────────────────────────────────────────
 
-def build_real_space_syms(wfn, sym, validate: bool = True, *,
-                          charge_density=None):
+def real_space_action_tables(wfn, sym, validate: bool = True, *,
+                             charge_density=None):
     """Spatial-only sym data for r-space orbit construction.
 
     Parameters
@@ -291,7 +293,7 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
 
     Pass ``Rinv = inv(wfn.sym_matrices) = sym.Rinv_grid``.  BGW's
     r-action is ``r' = Rinv · r + τ``; this matches the direction used
-    by ``orbit_images``, ``compute_centroid_sym_perm``, and
+    by ``orbit_images``, ``centroid_source_map_and_wrap``, and
     ``validate_atomic_symmetries``.
 
     orbit_id is the integer encoding of each candidate's canonical
@@ -333,7 +335,7 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
 # Centroid orbit permutation π_s : r_{π_s(μ)} = S_s r_μ + τ_s  (mod 1)
 # ─────────────────────────────────────────────────────────────────────────
 
-def compute_centroid_sym_perm(
+def centroid_source_map_and_wrap(
     r_mu_fft_idx: np.ndarray,
     sym_matrices: np.ndarray,
     translations: np.ndarray,
@@ -362,8 +364,9 @@ def compute_centroid_sym_perm(
         V_full[q1, μ', ν'] = exp(2π i q · (L_{μ'} − L_{ν'}))
                              · V_ibz[parent, α(μ'), α(ν')]
 
-    where q = IBZ parent q in fractional reciprocal coords.  ``unfold_v_q``
-    consumes ``sym_perm = α`` and ``L_table = L`` directly (no argsort).
+    where q = IBZ parent q in fractional reciprocal coords.
+    ``unfold_isdf_operator`` consumes ``sym_perm = α`` and
+    ``L_table = L`` directly (no argsort).
     For symmorphic systems (τ=0), both α and its inverse give the same
     orbit set (group closed under inversion), so the choice of "α" vs
     "π" direction is irrelevant; for non-symmorphic systems (Si Fd-3m
@@ -417,14 +420,14 @@ def compute_centroid_sym_perm(
         conjugation under TRS — for V_q bilinear in ζ this becomes
         ``V_{TRS-q, μ, ν} = conj(V_{q, μ, ν}) = V_{q, ν, μ}`` (last
         equality by V_q Hermiticity) — is applied at the V_q-unfold
-        level (see ``symmetry_maps.unfold_v_q``), NOT in
+        level (see ``symmetry_maps.unfold_isdf_operator``), NOT in
         ``sym_perm`` itself.
     L_table
         ``(n_sym, n_rmu, 3)`` int8 by default; ``(2·n_sym, n_rmu, 3)``
         when ``extend_trs=True``.  ``L_table[s, μ] = floor(S r_μ + τ)``
         — the integer real-space lattice vector by which the image
         exits the unit cell.  TRS rows duplicate spatial rows (r is
-        fixed under TRS).  Used by ``unfold_v_q`` to build the
+        fixed under TRS).  Used by ``unfold_isdf_operator`` to build the
         umklapp phase ``exp(2π i q · (L_μ − L_ν))``.
 
     Raises
@@ -471,7 +474,7 @@ def compute_centroid_sym_perm(
     # floating-point noise.  Naive ``np.floor`` flips an L component
     # from 0 → -1 whenever the true integer part is 0 but a tiny
     # negative noise hits np.floor's discontinuity — which produces a
-    # spurious exp(±iπ/2) phase in unfold_v_q.  Snapping fixes this
+    # spurious exp(±iπ/2) phase in unfold_isdf_operator.  Snapping fixes this
     # cleanly; verified at ISDF noise floor on Si Fd-3m (24³ FFT,
     # non-symmorphic τ) where the previous code gave 14/64 q's with
     # rel err ~0.8 due to this exact off-by-one.
@@ -508,7 +511,7 @@ def compute_centroid_sym_perm(
             ex_s, ex_mu = int(bad_s[0]), int(bad_mu[0])
             ex_idx = img_idx[ex_s, ex_mu].tolist()
             raise RuntimeError(
-                f"compute_centroid_sym_perm: centroid orbit closure "
+                f"centroid_source_map_and_wrap: centroid orbit closure "
                 f"failed.  sym {ex_s} maps centroid μ={ex_mu} "
                 f"(at fft_idx {idx[ex_mu].tolist()}) to fft_idx "
                 f"{ex_idx}, which is NOT in the centroid table.  "
@@ -520,7 +523,7 @@ def compute_centroid_sym_perm(
         for s in range(n_sym):
             if np.unique(sym_perm[s]).size != n_rmu:
                 raise RuntimeError(
-                    f"compute_centroid_sym_perm: sym_perm[{s}] is not a "
+                    f"centroid_source_map_and_wrap: sym_perm[{s}] is not a "
                     f"permutation — two distinct centroids map to the "
                     f"same image under sym {s}.  Likely cause: τ × "
                     f"fft_grid is not integer, so the rounded image "
@@ -774,9 +777,9 @@ def verify_centroid_orbit_closure(
 
         y_μ = mtrx_s · (x_μ − τ_s)   (mod 1)
 
-    — the same source-map decomposition :func:`compute_centroid_sym_perm`
+    — the same source-map decomposition :func:`centroid_source_map_and_wrap`
     builds α from — and reports how far ``y_μ`` lands from the nearest
-    member of the set.  :func:`compute_centroid_sym_perm` REFUSES on the
+    member of the set.  :func:`centroid_source_map_and_wrap` REFUSES on the
     same condition; this function is the form you can hold, compare and
     stamp into a file without catching an exception to learn the answer.
 
@@ -808,7 +811,7 @@ def verify_centroid_orbit_closure(
         never modified.
     sym_matrices
         ``(n_sym, 3, 3)`` int — BGW ``mtrx``, the same array
-        :func:`compute_centroid_sym_perm` takes.  Only the first
+        :func:`centroid_source_map_and_wrap` takes.  Only the first
         ``n_sym`` rows that ``tnp``/``tau`` covers are used, so a
         TRS-augmented ``sym_mats_k`` may be passed as long as the
         translations match it row for row.
@@ -923,7 +926,7 @@ def verify_centroid_orbit_closure(
                     f"coordinates.")
 
     # y_μ = mtrx · (x_μ − τ)  (mod 1) — the SOURCE map, matching
-    # compute_centroid_sym_perm's decomposition y_μ = x_{α(μ)} + L_μ.
+    # centroid_source_map_and_wrap's decomposition y_μ = x_{α(μ)} + L_μ.
     residual_by_op = np.zeros(n_sym, dtype=np.float64)
     for s in range(n_sym):
         shifted = cent - tau_frac[s][None, :]
@@ -963,7 +966,7 @@ class QgridSymmetryResolution:
     """What the q-grid reduction RESOLVED to, and why — one object.
 
     Before this existed, every consumer of the centroid permutation
-    tables called :func:`compute_centroid_sym_perm` inside its own
+    tables called :func:`centroid_source_map_and_wrap` inside its own
     ``try``/``except RuntimeError`` and, on the refusal, set its own
     private flag back to full-BZ.  Four sites, four spellings, and the
     only trace of the decision on a production run was a line one of them
@@ -990,7 +993,7 @@ class QgridSymmetryResolution:
         is how two answers to one question get born.
     sym_perm, L_table
         The tables, or ``None`` when ``mode == "full_bz"``.  Shapes are
-        exactly what :func:`compute_centroid_sym_perm` returns for the
+        exactly what :func:`centroid_source_map_and_wrap` returns for the
         ``extend_trs`` that was asked for.
     reason
         Empty on the ``"ibz"`` path.  On ``"full_bz"``, one line naming
@@ -1092,7 +1095,7 @@ def resolve_qgrid_symmetry(
 ) -> QgridSymmetryResolution:
     """Resolve the q-grid reduction ONCE: verdict → mode → tables.
 
-    THE DEFECT THIS CLOSES.  ``compute_centroid_sym_perm`` refuses on a
+    THE DEFECT THIS CLOSES.  ``centroid_source_map_and_wrap`` refuses on a
     non-closed centroid set, correctly — but a refusal is only as loud as
     the ``except`` that receives it, and in this tree the receivers each
     degraded the whole run to the full BZ and said nothing a production
@@ -1111,7 +1114,7 @@ def resolve_qgrid_symmetry(
     1. The verdict says the set is not closed.  This is the production
        case on the 960- and 480-centroid decks (47 of 48 ops violating),
        and the reason carries the worst op and its residual.
-    2. The verdict says CLOSED and ``compute_centroid_sym_perm`` still
+    2. The verdict says CLOSED and ``centroid_source_map_and_wrap`` still
        refuses.  The closure measurement scores the minimum-image
        distance in fractional coordinates; the table builder additionally
        needs the image to land on THIS FFT grid and needs each row to be
@@ -1129,7 +1132,7 @@ def resolve_qgrid_symmetry(
     ----------
     r_mu_fft_idx
         ``(n_rmu, 3)`` int — centroid positions as integer FFT-grid
-        indices, exactly what :func:`compute_centroid_sym_perm` takes.
+        indices, exactly what :func:`centroid_source_map_and_wrap` takes.
     sym_matrices
         ``(n_sym, 3, 3)`` int — BGW ``mtrx``, spatial ops only.
     tnp, tau
@@ -1143,7 +1146,7 @@ def resolve_qgrid_symmetry(
         centroids are integers against it and their fractional
         coordinates cannot be recovered without it.
     extend_trs
-        Forwarded to :func:`compute_centroid_sym_perm`.  Default ``True``
+        Forwarded to :func:`centroid_source_map_and_wrap`.  Default ``True``
         — every q-axis consumer in this tree indexes the tables with the
         TRS-augmented ``sym_idx_q``, and the one historical bug from
         getting this wrong was a silent clipped gather.
@@ -1191,7 +1194,7 @@ def resolve_qgrid_symmetry(
     # Closed.  Build the tables.  ``validate=True`` is not redundant with
     # the verdict — see arm 2 in the docstring.
     try:
-        sym_perm, L_table = compute_centroid_sym_perm(
+        sym_perm, L_table = centroid_source_map_and_wrap(
             idx.astype(np.int32),
             sym_matrices=S,
             translations=(np.asarray(tnp) if tnp is not None
@@ -1219,7 +1222,7 @@ def resolve_qgrid_symmetry(
 # Full FFT-grid orbit permutation — used by ZetaLoader's q='full_bz' unfold.
 # ─────────────────────────────────────────────────────────────────────────
 
-def compute_rgrid_sym_perm(
+def fft_grid_pullback_perm(
     sym_matrices: np.ndarray,
     translations: np.ndarray,
     fft_grid: np.ndarray | tuple[int, int, int],
@@ -1238,7 +1241,7 @@ def compute_rgrid_sym_perm(
 
     Math
     ----
-    Same convention as :func:`compute_centroid_sym_perm`: BGW's
+    Same convention as :func:`centroid_source_map_and_wrap`: BGW's
     ``mtrx`` acts on G-vectors; real-space r transforms by
     ``Rinv = inv(S)``.  We compute the forward image
     ``r' = Rinv · r + τ`` for every grid point, snap back to the FFT
@@ -1258,7 +1261,7 @@ def compute_rgrid_sym_perm(
     Parameters
     ----------
     sym_matrices, translations, fft_grid
-        Same meaning as :func:`compute_centroid_sym_perm`.  ``translations``
+        Same meaning as :func:`centroid_source_map_and_wrap`.  ``translations``
         is BGW's ``tnp`` (``τ_frac = tnp / (2π)``).
     validate
         If True, asserts every row of the result is a permutation of
@@ -1317,7 +1320,7 @@ def compute_rgrid_sym_perm(
         for s in range(n_sym):
             if np.unique(sym_perm[s]).size != n_rtot:
                 raise RuntimeError(
-                    f"compute_rgrid_sym_perm: sym_perm[{s}] is not a "
+                    f"fft_grid_pullback_perm: sym_perm[{s}] is not a "
                     f"permutation of [0, n_rtot={n_rtot}).  Likely cause: "
                     f"τ × fft_grid is not integer for sym {s} "
                     f"(τ_frac={tau_frac[s].tolist()}, "
@@ -1329,3 +1332,20 @@ def compute_rgrid_sym_perm(
     return sym_perm.astype(np.int32)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Pre-sweep spellings — MODULE-LEVEL half of the compat layer
+# ─────────────────────────────────────────────────────────────────────────
+# See the twin block at the foot of :mod:`symmetry_maps.maps` and the
+# retirement gate in :mod:`symmetry_maps._compat`.  The pair below is the
+# one the sweep existed for: identical names, opposite directions, a
+# recorded 4 eV silent failure for confusing them.
+
+#: DEPRECATED — :func:`centroid_source_map_and_wrap` (SOURCE map + wrap).
+compute_centroid_sym_perm = deprecated_alias(
+    centroid_source_map_and_wrap, "compute_centroid_sym_perm")
+#: DEPRECATED — :func:`fft_grid_pullback_perm` (PULL-BACK permutation).
+compute_rgrid_sym_perm = deprecated_alias(
+    fft_grid_pullback_perm, "compute_rgrid_sym_perm")
+#: DEPRECATED — :func:`real_space_action_tables`.
+build_real_space_syms = deprecated_alias(
+    real_space_action_tables, "build_real_space_syms")

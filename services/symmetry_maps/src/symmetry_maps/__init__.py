@@ -3,11 +3,12 @@
 Everything LORRAX knows about the space group of a deck, in one package:
 the k-grid reduction and the IBZ⇄full-BZ tables (:class:`SymMaps`), the
 band-index k-star map (:class:`KStarMap` and the ``star_*`` helpers), the
-sharded q-axis unfolds (:func:`unfold_v_q`,
-:func:`unfold_v_q_bispinor_lorentz`), the ψ-unfold antiunitary rule
-(:func:`unfold_psi`, :func:`trs_augment_U`, :func:`tau_phase_row`), the
-real-space orbit machinery the ISDF quadrature is built on
-(:func:`build_real_space_syms`, :func:`compute_centroid_sym_perm`, …), and
+sharded q-axis unfolds (:func:`unfold_isdf_operator`,
+:func:`mix_channels_by_proper_rotation`), the ψ-unfold antiunitary rule
+(:func:`unfold_psi`, :func:`spinor_rotation_for_sym_row`,
+:func:`tau_phase_row`), the real-space orbit machinery the ISDF
+quadrature is built on (:func:`real_space_action_tables`,
+:func:`centroid_source_map_and_wrap`, …), and
 the TRS *measurement* (:func:`check_density_symmetries`) that decides
 whether the flags in the file may be believed at all.
 
@@ -18,11 +19,24 @@ monorepo's ``tests/test_layering.py`` fails on.  The private names
 (``_I_SIGMA_Y``, the ``_star_*`` helpers) are deliberately NOT re-exported:
 they are the service's own tests' business.
 
+SIX NAMES WERE RENAMED ON 2026-08-08 and every old spelling still
+resolves.  Operations are named for what they mathematically DO, not for
+what they are applied to — ``unfold_v_q`` unfolded any ISDF-basis
+operator and V was merely its most frequent customer, so it is
+:func:`unfold_isdf_operator` now.  The pre-sweep spellings are bound as
+call-through aliases here AND on their defining modules; the map, the
+reason and the retirement gate are in :mod:`symmetry_maps._compat` and
+in :data:`RENAMES`.  The pair that mattered most is
+:func:`centroid_source_map_and_wrap` (a SOURCE map plus a lattice wrap)
+against :func:`fft_grid_pullback_perm` (a PULL-BACK permutation): they
+used to share a name shape and return opposite directions, which is the
+recorded mechanism of a silent 4 eV gap on hex systems.
+
 TWO THINGS THAT LOOK ALIKE AND ARE NOT.  :func:`star_broadcast` moves a
 BAND-INDEX object (a self-energy, an eigenvector matrix) from the IBZ to
 the full BZ, and that is pure indexing plus a conjugation on
-time-reversed rows.  :func:`unfold_v_q` moves a CENTROID-indexed object
-and needs the double gather, the umklapp phase and the TRS conjugation,
+time-reversed rows.  :func:`unfold_isdf_operator` moves a CENTROID-indexed
+object and needs the double gather, the umklapp phase and the TRS conjugation,
 because a symmetry moves r and does not move bands.  The two are not
 variants of each other; the argument is written out above
 :func:`star_select` in :mod:`symmetry_maps.maps`.
@@ -47,18 +61,19 @@ The surface
 ``KStarMap`` / ``star_select`` / ``star_broadcast`` / ``star_spread``
     IBZ⇄full-BZ for band-index objects, and the residual that checks the
     premise.
-``unfold_v_q`` / ``unfold_v_q_bispinor_lorentz`` / ``slice_q_full_to_ibz``
+``unfold_isdf_operator`` / ``mix_channels_by_proper_rotation`` /
+``slice_q_full_to_ibz``
     The sharded q-axis unfolds, ``shard_map`` over an ``('x','y')`` mesh
     with a 1× single-tile memory contract.
-``unfold_psi`` / ``trs_augment_U`` / ``tau_phase_row``
+``unfold_psi`` / ``spinor_rotation_for_sym_row`` / ``tau_phase_row``
     The ψ-unfold rule, and the single sources of the spinor TRS
     augmentation and the τ phase.
 ``kgrid_shift_map`` / ``find_irreducible_bz_points``
     Pure integer k-grid algebra: the C-order fold with its umklapp G, and
     the IBZ reduction (derive-IBZ and anchored-IBZ branches).
-``build_real_space_syms`` / ``orbit_images`` / ``canonicalize_orbit`` /
-``unfold_orbit_unique_with_id`` / ``compute_centroid_sym_perm`` /
-``compute_rgrid_sym_perm`` / ``recover_symmorphic_density_point_group``
+``real_space_action_tables`` / ``orbit_images`` / ``canonicalize_orbit`` /
+``unfold_orbit_unique_with_id`` / ``centroid_source_map_and_wrap`` /
+``fft_grid_pullback_perm`` / ``recover_symmorphic_density_point_group``
     Real space: the FFT-grid permutation tables the ISDF centroids and
     the ρ symmetrisation ride on, and the holohedry recovery for decks
     whose header symmetry list is a subset of the true point group.
@@ -75,7 +90,7 @@ The surface
     nothing but jax and numpy.
 ``verify_centroid_orbit_closure`` / ``CentroidClosureVerdict``
     Orbit closure as a MEASUREMENT rather than an exception:
-    ``compute_centroid_sym_perm`` refuses on a non-closed set, this says
+    ``centroid_source_map_and_wrap`` refuses on a non-closed set, this says
     by how much and on which ops.  It is also **the one place in the
     service where ``tnp = 2π·τ`` is divided**, and it has no positional
     slot for the translations precisely so that no caller can pass the
@@ -128,8 +143,15 @@ from symmetry_maps.maps import (
     star_select,
     star_spread,
     tau_phase_row,
-    trs_augment_U,
+    spinor_rotation_for_sym_row,
     unfold_psi,
+    unfold_isdf_operator,
+    mix_channels_by_proper_rotation,
+)
+# Pre-sweep spellings.  Imported from the modules that define them, so
+# the door and the module bind the SAME object and cannot drift apart.
+from symmetry_maps.maps import (              # noqa: F401  (compat surface)
+    trs_augment_U,
     unfold_v_q,
     unfold_v_q_bispinor_lorentz,
 )
@@ -147,16 +169,22 @@ from symmetry_maps.orbit_syms import (
     FULL_BZ_CONSEQUENCE,
     CentroidClosureVerdict,
     QgridSymmetryResolution,
-    build_real_space_syms,
+    real_space_action_tables,
     canonicalize_orbit,
-    compute_centroid_sym_perm,
-    compute_rgrid_sym_perm,
+    centroid_source_map_and_wrap,
+    fft_grid_pullback_perm,
     orbit_images,
     recover_symmorphic_density_point_group,
     resolve_qgrid_symmetry,
     unfold_orbit_unique_with_id,
     verify_centroid_orbit_closure,
 )
+from symmetry_maps.orbit_syms import (        # noqa: F401  (compat surface)
+    build_real_space_syms,
+    compute_centroid_sym_perm,
+    compute_rgrid_sym_perm,
+)
+from symmetry_maps._compat import RENAMES, RETIREMENT_GATE  # noqa: F401
 
 __all__ = [
     # tables
@@ -164,13 +192,14 @@ __all__ = [
     # k-stars (band-index IBZ<->full BZ)
     "KStarMap", "star_select", "star_broadcast", "star_spread",
     # sharded q-axis unfolds
-    "slice_q_full_to_ibz", "unfold_v_q", "unfold_v_q_bispinor_lorentz",
+    "slice_q_full_to_ibz", "unfold_isdf_operator",
+    "mix_channels_by_proper_rotation",
     # psi unfold / antiunitary rule
-    "unfold_psi", "trs_augment_U", "tau_phase_row",
+    "unfold_psi", "spinor_rotation_for_sym_row", "tau_phase_row",
     # real-space orbits
-    "build_real_space_syms", "orbit_images", "canonicalize_orbit",
-    "unfold_orbit_unique_with_id", "compute_centroid_sym_perm",
-    "compute_rgrid_sym_perm", "recover_symmorphic_density_point_group",
+    "real_space_action_tables", "orbit_images", "canonicalize_orbit",
+    "unfold_orbit_unique_with_id", "centroid_source_map_and_wrap",
+    "fft_grid_pullback_perm", "recover_symmorphic_density_point_group",
     # orbit closure: the measurement, its verdict, its tolerance
     "verify_centroid_orbit_closure", "CentroidClosureVerdict",
     "CLOSURE_TOL_DEFAULT",
@@ -184,4 +213,15 @@ __all__ = [
     # the TRS measurement
     "DensitySymmetryReport", "check_density_symmetries",
     "cached_density_symmetry_check", "trs_check_mode",
+    # ---------------------------------------------------------------
+    # PRE-SWEEP SPELLINGS.  Aliases, not definitions — see
+    # ``symmetry_maps._compat`` for the map and the retirement gate
+    # (the documentation pass).  They are in ``__all__`` because a name
+    # that ``from symmetry_maps import *`` drops is a name a consumer
+    # discovers is missing at run time rather than at import time, and
+    # the whole point of the alias is that nothing discovers anything.
+    "unfold_v_q", "unfold_v_q_bispinor_lorentz", "trs_augment_U",
+    "compute_centroid_sym_perm", "compute_rgrid_sym_perm",
+    "build_real_space_syms",
+    "RENAMES", "RETIREMENT_GATE",
 ]
