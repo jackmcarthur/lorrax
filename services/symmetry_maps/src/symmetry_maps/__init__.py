@@ -62,6 +62,13 @@ The surface
     Real space: the FFT-grid permutation tables the ISDF centroids and
     the ρ symmetrisation ride on, and the holohedry recovery for decks
     whose header symmetry list is a subset of the true point group.
+``verify_centroid_orbit_closure`` / ``CentroidClosureVerdict``
+    Orbit closure as a MEASUREMENT rather than an exception:
+    ``compute_centroid_sym_perm`` refuses on a non-closed set, this says
+    by how much and on which ops.  It is also **the one place in the
+    service where ``tnp = 2π·τ`` is divided**, and it has no positional
+    slot for the translations precisely so that no caller can pass the
+    wrong convention silently.
 ``DensitySymmetryReport`` / ``check_density_symmetries`` /
 ``cached_density_symmetry_check`` / ``trs_check_mode``
     The measurement, its cached front door, and the ``LORRAX_TRS_CHECK``
@@ -107,6 +114,8 @@ from symmetry_maps.maps import (
     unfold_v_q_bispinor_lorentz,
 )
 from symmetry_maps.orbit_syms import (
+    CLOSURE_TOL_DEFAULT,
+    CentroidClosureVerdict,
     build_real_space_syms,
     canonicalize_orbit,
     compute_centroid_sym_perm,
@@ -114,6 +123,7 @@ from symmetry_maps.orbit_syms import (
     orbit_images,
     recover_symmorphic_density_point_group,
     unfold_orbit_unique_with_id,
+    verify_centroid_orbit_closure,
 )
 
 __all__ = [
@@ -129,6 +139,9 @@ __all__ = [
     "build_real_space_syms", "orbit_images", "canonicalize_orbit",
     "unfold_orbit_unique_with_id", "compute_centroid_sym_perm",
     "compute_rgrid_sym_perm", "recover_symmorphic_density_point_group",
+    # orbit closure: the measurement, its verdict, its tolerance
+    "verify_centroid_orbit_closure", "CentroidClosureVerdict",
+    "CLOSURE_TOL_DEFAULT",
     # the TRS measurement
     "DensitySymmetryReport", "check_density_symmetries",
     "cached_density_symmetry_check", "trs_check_mode",

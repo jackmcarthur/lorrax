@@ -21,6 +21,9 @@ for the canonical example.
 """
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -539,6 +542,408 @@ def compute_centroid_sym_perm(
         sym_perm = np.concatenate([sym_perm, sym_perm.copy()], axis=0)
         L_wrap = np.concatenate([L_wrap, L_wrap.copy()], axis=0)
     return sym_perm, L_wrap
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Orbit closure, as a MEASUREMENT you can hold — the public door diagnostic
+# ─────────────────────────────────────────────────────────────────────────
+
+#: Closure tolerance, in fractional coordinates, and why this number.
+#:
+#: The committed centroid files are written to SIX DECIMALS, so a set that
+#: is exactly closed still measures a residual of ~1e-6 — that is the text
+#: file's rounding floor, not a defect (MEASURED on
+#: ``si_cohsex_debug/centroids_frac_144.txt``: worst 1.000e-06 over all 48
+#: ops).  A set that is genuinely NOT closed misses by a fraction of a
+#: cell: 1.318e-01 on the 960 set and 1.718e-01 on the 480 set, which on
+#: the 24³ grid those centroids live on is ~3-4 grid steps.  1e-5 sits an
+#: order of magnitude above the rounding floor and four orders below the
+#: real failures, so no plausible file lands in the gap.
+CLOSURE_TOL_DEFAULT = 1.0e-5
+
+#: Decimals used to build the exact-match lookup key.  Matches the
+#: precision the centroid files are written at; images that hit a key are
+#: scored against that one centroid instead of against all of them.
+_CLOSURE_KEY_DECIMALS = 6
+
+#: Image rows scored per pairwise block.  Bounds the temporary at
+#: ``_CLOSURE_BLOCK · n_centroids · 3 · 8`` bytes (~70 MB at 3000
+#: centroids) instead of letting the (n_sym, n_mu, n_mu, 3) tensor exist.
+_CLOSURE_BLOCK = 1024
+
+#: How far off a grid point a coordinate may sit, IN GRID STEPS, before
+#: ``fft_grid`` is called a mismatch rather than rounding.  The committed
+#: centroid files carry six decimals, so ``0.083333 × 24 = 1.999992`` —
+#: MEASURED 8.000e-06 of a step on ``centroids_frac_960.txt``, which is the
+#: file's own precision and not a defect.  A genuine grid mismatch (τ on
+#: the wrong denominator, centroids from another FFT box) misses by an
+#: appreciable fraction of a step, and anything past 0.5 collides with a
+#: different grid point under ``np.rint``.  1e-2 is three orders above the
+#: rounding and fifty times below the collision.
+_GRID_COMMENSURATE_TOL = 1.0e-2
+
+
+@dataclasses.dataclass(frozen=True)
+class CentroidClosureVerdict:
+    """What :func:`verify_centroid_orbit_closure` measured, and its verdict.
+
+    A record, not a wrapper: it carries numbers a caller would otherwise
+    recompute, in the same spirit as :class:`DensitySymmetryReport` — the
+    service's other measurement-with-a-verdict.  The point of holding the
+    per-op residual vector rather than a single bool is that the failure
+    mode this guards against is *partial*: 47 of 48 ops violating with the
+    identity clean is a completely different diagnosis from one op
+    violating, and a bool cannot tell them apart.
+
+    Attributes
+    ----------
+    closed
+        ``True`` iff every image of every centroid under every op lands on
+        a centroid within ``tol``.  THE PREREQUISITE for IBZ storage: if
+        this is False the permutation α does not exist and the tensor
+        cannot be unfolded at all (spec §2).
+    tol
+        The fractional-coordinate tolerance the verdict was taken at.
+    n_sym, n_centroids
+        Table extents the measurement ran over.
+    worst_residual
+        Largest per-image residual over all (op, centroid) pairs, in
+        fractional coordinates, under :attr:`metric`.
+    worst_op
+        The op index attaining :attr:`worst_residual`.
+    violating_ops
+        EVERY op index whose worst residual exceeds ``tol``, ascending.
+    residual_by_op
+        ``(n_sym,)`` float64 — each op's worst residual.  Read-only.
+    centroid_hash
+        Strong hash of the centroid set, prefixed ``g:`` when it was taken
+        over integer FFT-grid indices and ``f:`` when over fractional
+        coordinates.  The prefix exists so a hash taken under one rule can
+        never compare equal to one taken under the other.
+    metric
+        Names the residual: the minimum-image Euclidean distance in
+        fractional coordinates.  Recorded on the verdict because it is the
+        thing a future reader would otherwise have to guess when comparing
+        a stored number against a fresh one.
+    """
+
+    closed: bool
+    tol: float
+    n_sym: int
+    n_centroids: int
+    worst_residual: float
+    worst_op: int
+    violating_ops: tuple[int, ...]
+    residual_by_op: np.ndarray
+    centroid_hash: str
+    metric: str = "min_image_euclidean_frac"
+
+    @property
+    def n_violating(self) -> int:
+        return len(self.violating_ops)
+
+    def describe(self) -> str:
+        """The loud form: every violating op index with its residual.
+
+        Spec §6 gate 1 asks the refusal to name "the offending op index and
+        residual" — plural, because the production failure is 47 ops, and a
+        message that named only the first would read as a single bad op.
+        """
+        head = (
+            f"centroid orbit closure: "
+            f"{'CLOSED' if self.closed else 'NOT CLOSED'} — "
+            f"{self.n_violating}/{self.n_sym} ops violating at tol="
+            f"{self.tol:.1e}, worst {self.worst_residual:.3e} on op "
+            f"{self.worst_op} ({self.n_centroids} centroids, metric "
+            f"{self.metric}, centroids {self.centroid_hash})")
+        if self.closed:
+            return head
+        rows, cur = [], []
+        for s in self.violating_ops:
+            cur.append(f"s={s}:{float(self.residual_by_op[s]):.3e}")
+            if len(cur) == 6:
+                rows.append("  " + "  ".join(cur))
+                cur = []
+        if cur:
+            rows.append("  " + "  ".join(cur))
+        return "\n".join([head, "  offending ops (index:worst residual):"]
+                         + rows)
+
+    def as_attr(self) -> str:
+        """One line, for an HDF5 attr.  Stable enough to compare on."""
+        return (f"{'closed' if self.closed else 'not_closed'} "
+                f"tol={self.tol:.3e} worst={self.worst_residual:.6e} "
+                f"worst_op={self.worst_op} "
+                f"violating={self.n_violating}/{self.n_sym} "
+                f"metric={self.metric}")
+
+    def raise_if_not_closed(self, context: str = "") -> None:
+        """REFUSE on a non-closed set.  Never warn and continue.
+
+        A q_irr file written against a non-closed centroid set is silently
+        unrecoverable — there is no α to invert with — so this is the one
+        place the branch is taken, and it raises.
+        """
+        if self.closed:
+            return
+        where = f"{context}: " if context else ""
+        raise RuntimeError(where + self.describe())
+
+    def __str__(self) -> str:                      # pragma: no cover - repr
+        return self.describe()
+
+
+def _centroid_hash(frac: np.ndarray, fft_grid: np.ndarray | None) -> str:
+    """sha256 of the centroid set, canonicalised so it is reproducible.
+
+    On the grid when a grid is given (integers — exactly reproducible from
+    any float representation that snaps to the same points), on the wrapped
+    fractional coordinates rounded to :data:`_CLOSURE_KEY_DECIMALS`
+    otherwise.  The two rules produce differently-PREFIXED digests on
+    purpose: a ``g:`` hash and an ``f:`` hash of the same point set are not
+    interchangeable and must never silently compare equal.
+    """
+    h = hashlib.sha256()
+    if fft_grid is not None:
+        grid = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+        idx = np.rint(np.asarray(frac, dtype=np.float64) * grid[None, :])
+        idx = (idx.astype(np.int64) % grid[None, :])
+        h.update(np.ascontiguousarray(idx, dtype=np.int64).tobytes())
+        h.update(np.ascontiguousarray(grid, dtype=np.int64).tobytes())
+        return "g:" + h.hexdigest()
+    can = np.round(np.asarray(frac, dtype=np.float64) % 1.0,
+                   _CLOSURE_KEY_DECIMALS) % 1.0
+    h.update(np.ascontiguousarray(can, dtype=np.float64).tobytes())
+    return "f:" + h.hexdigest()
+
+
+def _min_image_residual(images: np.ndarray, cent: np.ndarray) -> np.ndarray:
+    """Per-image distance to the NEAREST centroid, minimum-image, in frac.
+
+    Exact-key fast path first (a closed set hits every key and never pays
+    for a distance matrix), chunked pairwise for the misses only.
+    """
+    n_img = int(images.shape[0])
+    out = np.zeros(n_img, dtype=np.float64)
+    if n_img == 0:
+        return out
+
+    def _key(a):
+        k = np.rint((np.asarray(a) % 1.0) * 10 ** _CLOSURE_KEY_DECIMALS)
+        return k.astype(np.int64) % (10 ** _CLOSURE_KEY_DECIMALS)
+
+    ckey = _key(cent)
+    lut = {}
+    for i in range(int(cent.shape[0])):
+        lut.setdefault(tuple(ckey[i].tolist()), i)
+    ikey = _key(images)
+    hit_to = np.full(n_img, -1, dtype=np.int64)
+    for i in range(n_img):
+        j = lut.get(tuple(ikey[i].tolist()), -1)
+        hit_to[i] = j
+    hit = hit_to >= 0
+    if hit.any():
+        d = images[hit] - cent[hit_to[hit]]
+        d -= np.rint(d)
+        out[hit] = np.sqrt((d * d).sum(axis=-1))
+    miss = np.flatnonzero(~hit)
+    for beg in range(0, miss.size, _CLOSURE_BLOCK):
+        blk = miss[beg:beg + _CLOSURE_BLOCK]
+        d = images[blk][:, None, :] - cent[None, :, :]
+        d -= np.rint(d)
+        out[blk] = np.sqrt((d * d).sum(axis=-1)).min(axis=1)
+    return out
+
+
+def verify_centroid_orbit_closure(
+    centroids_frac,
+    sym_matrices,
+    *,
+    tnp=None,
+    tau=None,
+    fft_grid=None,
+    tol: float = CLOSURE_TOL_DEFAULT,
+) -> CentroidClosureVerdict:
+    """Is the centroid set closed under the space group?  MEASURE and say.
+
+    Reconstructing ``W(Sq)`` from ``W(q)`` in the ISDF basis is a
+    permutation of the (μ, ν) indices, and that permutation exists only if
+    every symmetry maps the centroid set into itself.  This is the door
+    diagnostic for that prerequisite: it asks, for every op ``s`` and every
+    centroid ``x_μ``,
+
+        y_μ = mtrx_s · (x_μ − τ_s)   (mod 1)
+
+    — the same source-map decomposition :func:`compute_centroid_sym_perm`
+    builds α from — and reports how far ``y_μ`` lands from the nearest
+    member of the set.  :func:`compute_centroid_sym_perm` REFUSES on the
+    same condition; this function is the form you can hold, compare and
+    stamp into a file without catching an exception to learn the answer.
+
+    THE 2π.  ``tnp`` in the WFN is ``2π·τ``.  Dividing by 2π is the whole
+    difference between "every set looks unclosed, including the ones that
+    are fine" and the truth, and it cost the author of
+    ``SPEC_qirr_restart_tensors.md`` an hour and a wrong first answer.
+    **This function is the one place in the service where that division
+    lives**, and the reason it cannot go wrong here is that there is no
+    positional slot for the translations at all: you must name which
+    convention you are holding, ``tnp=`` (BGW's stored ``2π·τ``, which is
+    what ``wfn.translations`` and ``mf_header/symmetry/tnp`` are) or
+    ``tau=`` (already divided).  Exactly one, and passing neither or both
+    is a ``ValueError``.  A caller who guesses gets a refusal, never a
+    plausible wrong verdict.
+
+    There is one extra guard, and it is asymmetric because only one
+    direction is detectable: fractional translations are in [0, 1), so a
+    ``tau=`` whose components exceed 1 is a ``tnp`` wearing the wrong
+    keyword and is refused by name.  The reverse — a ``tnp=`` that is
+    really a τ — cannot be detected, because a symmorphic deck has
+    ``tnp = 0 = τ`` and every value in between is legal.
+
+    Parameters
+    ----------
+    centroids_frac
+        ``(n_mu, 3)`` float — centroid positions in fractional
+        coordinates.  Wrapped to [0, 1) internally; the caller's array is
+        never modified.
+    sym_matrices
+        ``(n_sym, 3, 3)`` int — BGW ``mtrx``, the same array
+        :func:`compute_centroid_sym_perm` takes.  Only the first
+        ``n_sym`` rows that ``tnp``/``tau`` covers are used, so a
+        TRS-augmented ``sym_mats_k`` may be passed as long as the
+        translations match it row for row.
+    tnp
+        ``(n_sym, 3)`` float — BGW's stored ``2π·τ``.  Mutually exclusive
+        with ``tau``.
+    tau
+        ``(n_sym, 3)`` float — fractional translations, already divided by
+        2π.  Mutually exclusive with ``tnp``.
+    fft_grid
+        ``(3,)`` int, optional.  Does NOT change the residual: the metric
+        stays the minimum-image Euclidean distance in fractional
+        coordinates so the number is comparable with or without a grid.
+        What it changes is (a) the centroid hash, which becomes the exact
+        integer-index digest, and (b) an extra commensurability refusal —
+        centroids that do not sit on the grid, or a τ that does not, are
+        the mechanism by which a set "fails closure" for a reason that has
+        nothing to do with the group.
+    tol
+        Fractional-coordinate tolerance; see :data:`CLOSURE_TOL_DEFAULT`
+        for why the default is 1e-5 and not something tighter.
+
+    Returns
+    -------
+    CentroidClosureVerdict
+        Carries the verdict, every violating op index, the per-op worst
+        residual and the centroid hash.  It does not raise on a non-closed
+        set — call :meth:`CentroidClosureVerdict.raise_if_not_closed` for
+        that, which is what the q_irr writer does.
+
+    Examples
+    --------
+    MEASURED 2026-08-07 on the committed fixtures (24³ FFT grid, 48 ops)::
+
+        si_cohsex_debug/centroids_frac_960.txt  worst 1.318e-01  47/48
+        si_cohsex_debug/centroids_frac_144.txt  worst 1.000e-06   0/48
+        si_bse_debug/centroids_frac_480.txt     worst 1.718e-01  47/48
+
+    reproducing the table in ``SPEC_qirr_restart_tensors.md`` §2 exactly.
+    """
+    if (tnp is None) == (tau is None):
+        raise ValueError(
+            "verify_centroid_orbit_closure: pass exactly one of tnp= or "
+            "tau=.  ``tnp`` is BGW's stored 2π·τ (mf_header/symmetry/tnp, "
+            "wfn.translations); ``tau`` is the fractional translation "
+            "itself.  There is no positional slot for either, on purpose: "
+            "dividing by 2π at the wrong moment makes every centroid set "
+            "look unclosed, including the ones that are fine.")
+    if tnp is not None:
+        tau_frac = np.asarray(tnp, dtype=np.float64) / (2.0 * np.pi)
+    else:
+        tau_frac = np.asarray(tau, dtype=np.float64)
+        if tau_frac.size and float(np.abs(tau_frac).max()) > 1.0 + 1e-9:
+            raise ValueError(
+                f"verify_centroid_orbit_closure: tau= has a component of "
+                f"magnitude {float(np.abs(tau_frac).max()):.6f}, but a "
+                f"fractional translation lives in [0, 1).  These look like "
+                f"BGW ``tnp`` = 2π·τ — pass them as tnp= and let this "
+                f"function do the division.")
+    if tau_frac.ndim != 2 or tau_frac.shape[1] != 3:
+        raise ValueError(
+            f"verify_centroid_orbit_closure: translations must be "
+            f"(n_sym, 3); got {tau_frac.shape}")
+
+    cent = np.asarray(centroids_frac, dtype=np.float64)
+    if cent.ndim != 2 or cent.shape[1] != 3:
+        raise ValueError(
+            f"verify_centroid_orbit_closure: centroids_frac must be "
+            f"(n_mu, 3); got {cent.shape}")
+    cent = cent % 1.0
+    n_mu = int(cent.shape[0])
+    if n_mu == 0:
+        raise ValueError(
+            "verify_centroid_orbit_closure: empty centroid set; there is "
+            "nothing for the group to act on.")
+
+    S = np.asarray(sym_matrices, dtype=np.float64)
+    if S.ndim != 3 or S.shape[1:] != (3, 3):
+        raise ValueError(
+            f"verify_centroid_orbit_closure: sym_matrices must be "
+            f"(n_sym, 3, 3); got {S.shape}")
+    n_sym = int(tau_frac.shape[0])
+    if int(S.shape[0]) < n_sym:
+        raise ValueError(
+            f"verify_centroid_orbit_closure: {int(S.shape[0])} sym "
+            f"matrices but {n_sym} translation rows; they index the same "
+            f"op list and must agree.")
+    S = S[:n_sym]
+
+    grid = None
+    if fft_grid is not None:
+        grid = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+        if np.any(grid <= 0):
+            raise ValueError(
+                f"verify_centroid_orbit_closure: fft_grid must be "
+                f"positive; got {grid.tolist()}")
+        # Commensurability.  A centroid or a τ that is off-grid produces a
+        # closure failure that says nothing about the GROUP — the rounded
+        # image simply cannot land on a grid point.  Separate the two
+        # diagnoses here rather than letting the residual carry both.
+        for label, arr in (("centroids_frac", cent),
+                           ("tau (= tnp/2π)", tau_frac % 1.0)):
+            scaled = arr * grid[None, :]
+            off = float(np.abs(scaled - np.rint(scaled)).max())
+            if off > _GRID_COMMENSURATE_TOL:
+                raise ValueError(
+                    f"verify_centroid_orbit_closure: {label} is not "
+                    f"commensurate with fft_grid {grid.tolist()} — worst "
+                    f"off-grid offset {off:.3e} of a grid step.  That is a "
+                    f"grid mismatch, not a closure verdict; fix the grid "
+                    f"or omit fft_grid to score in pure fractional "
+                    f"coordinates.")
+
+    # y_μ = mtrx · (x_μ − τ)  (mod 1) — the SOURCE map, matching
+    # compute_centroid_sym_perm's decomposition y_μ = x_{α(μ)} + L_μ.
+    residual_by_op = np.zeros(n_sym, dtype=np.float64)
+    for s in range(n_sym):
+        shifted = cent - tau_frac[s][None, :]
+        images = (shifted @ S[s].T) % 1.0
+        residual_by_op[s] = float(_min_image_residual(images, cent).max())
+
+    residual_by_op.setflags(write=False)
+    violating = tuple(int(s) for s in np.flatnonzero(residual_by_op > tol))
+    worst_op = int(np.argmax(residual_by_op))
+    return CentroidClosureVerdict(
+        closed=(len(violating) == 0),
+        tol=float(tol),
+        n_sym=n_sym,
+        n_centroids=n_mu,
+        worst_residual=float(residual_by_op[worst_op]),
+        worst_op=worst_op,
+        violating_ops=violating,
+        residual_by_op=residual_by_op,
+        centroid_hash=_centroid_hash(cent, grid),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────
