@@ -496,10 +496,10 @@ def test_a_wedge_that_is_the_whole_bz_is_demoted_to_full():
     ``use_ibz``.  Nothing there is wrong; there is simply no wedge.
 
     Storing "the wedge" anyway would write the full BZ under a q_irr stamp
-    and a table group, and ``qirr_store._validate`` would label that file
-    ``"full"`` from its SHAPE — so the writer and the reader would describe
-    one file two ways.  The demotion applies the READER's own test at the
-    writer, which is what makes them agree by construction.
+    and a table group, and the format's own table validation would label
+    that file ``"full"`` from its SHAPE — so the writer and the reader
+    would describe one file two ways.  The demotion applies the READER's
+    own test at the writer, which is what makes them agree by construction.
     """
     from gw.restart_q_storage import resolve_restart_q_storage
 

@@ -100,10 +100,11 @@ class RestartQStorage:
 
         Storing "the wedge" there would write the full BZ under a q_irr stamp
         and a table group, which is bytes and metadata for a reduction that
-        did not happen — and ``qirr_store._validate`` would label the file
-        ``"full"`` from its SHAPE anyway, so the writer and the reader would
-        be describing the same file two different ways.  Demoting here makes
-        them agree BY CONSTRUCTION: the writer applies the reader's own test.
+        did not happen — and the format's own table validation would label
+        the file ``"full"`` from its SHAPE anyway, so the writer and the
+        reader would be describing the same file two different ways.
+        Demoting here makes them agree BY CONSTRUCTION: the writer applies
+        the reader's own test.
         A no-symmetry deck's restart file is then byte-for-byte the file it
         has always been, with no attrs and no table group, which is what
         makes its red twin an equality rather than a tolerance.
