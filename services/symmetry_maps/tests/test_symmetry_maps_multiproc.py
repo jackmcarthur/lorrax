@@ -62,6 +62,7 @@ if __name__ == "__main__":
         jax.distributed.initialize()
 
 import test_symmetry_maps_emulated_mesh as L_b                # noqa: E402
+import test_symmetry_maps_qirr_store as QIRR                  # noqa: E402
 from lxkit.testing import require_devices                     # noqa: E402
 from symmetry_maps import (KStarMap, star_broadcast,          # noqa: E402
                            star_select, star_spread, unfold_v_q)
@@ -269,6 +270,39 @@ def check_spread_rel_is_one_replicated_scalar(mesh):
             f"sharded-NaN -> {sharded!r}")
 
 
+def check_qirr_round_trip_through_the_sharded_unfold(mesh):
+    """The q_irr restart round trip, on REAL ranks, through the all_to_all.
+
+    ``read_tensor`` unfolds with ``unfold_v_q``, so a q_irr restart load is
+    a ``lax.all_to_all`` redistribution every time — the redistribution is
+    the whole memory story of the format and the place a sharded unfold
+    would fail.  Single-process coverage proved twice in this campaign that
+    it cannot see multi-process failure modes, so the round trip rides this
+    harness rather than only the collected 1x1 and the emulated 2x2.
+
+    The DECK IS TRS-ACTIVE (gnppm: four of its five stars begin on a
+    time-reversal row) so the antiunitary branch runs at P>1 too, and the
+    comparison is against ``unfold_v_q`` on the same wedge — the array the
+    uncompressed path would have used — at BIT equality, per addressable
+    shard.  Each rank writes its own temporary file: this is a format test,
+    not a phdf5 test, and a shared path would be testing the filesystem.
+    """
+    return QIRR.check_qirr_round_trip_on_a_trs_deck(mesh, "gnppm_debug")
+
+
+def check_qirr_umklapp_phase_survives_the_sharded_unfold(mesh):
+    """The umklapp phase, through the same redistribution.
+
+    The sharded kernel computes ``exp(2πi q·(L_μ − L_ν))`` per rank from a
+    dynamic slice, and the μ and ν legs of that difference live on
+    DIFFERENT mesh axes — so a redistribution that lost the correspondence
+    between them would produce a phase built from mismatched centroids.
+    The body's own ablation says what the phase is worth (order unity)
+    before asserting the stored path keeps it.
+    """
+    return QIRR.check_qirr_umklapp_phase_survives_the_store(mesh)
+
+
 # ---------------------------------------------------------------------------
 # The pytest cells — the same bodies, on whatever mesh this process has
 # ---------------------------------------------------------------------------
@@ -286,6 +320,8 @@ def _mesh_here(px=1, py=1):
     check_hostile_extent_refuses,
     check_star_helpers_keep_the_sharding,
     check_spread_rel_is_one_replicated_scalar,
+    check_qirr_round_trip_through_the_sharded_unfold,
+    check_qirr_umklapp_phase_survives_the_sharded_unfold,
 ], ids=lambda f: f.__name__[len("check_"):])
 def test_the_check_body_passes_on_this_processs_mesh(body):
     """Every L-c body, run at 1x1 (or whatever this process can build).
@@ -302,6 +338,8 @@ def test_the_check_body_passes_on_this_processs_mesh(body):
     check_hostile_extent_refuses,
     check_star_helpers_keep_the_sharding,
     check_spread_rel_is_one_replicated_scalar,
+    check_qirr_round_trip_through_the_sharded_unfold,
+    check_qirr_umklapp_phase_survives_the_sharded_unfold,
 ], ids=lambda f: f.__name__[len("check_"):])
 def test_the_check_body_passes_on_an_emulated_2x2(body):
     """The same bodies on four emulated devices, when the flag took.
@@ -436,6 +474,10 @@ _CLI_CELLS = [
     ("star_sharding", lambda mesh: check_star_helpers_keep_the_sharding(mesh)),
     ("spread_rel_scalar",
      lambda mesh: check_spread_rel_is_one_replicated_scalar(mesh)),
+    ("qirr_round_trip",
+     lambda mesh: check_qirr_round_trip_through_the_sharded_unfold(mesh)),
+    ("qirr_umklapp",
+     lambda mesh: check_qirr_umklapp_phase_survives_the_sharded_unfold(mesh)),
 ]
 
 
