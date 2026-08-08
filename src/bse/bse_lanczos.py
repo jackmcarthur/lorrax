@@ -17,14 +17,18 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import make_sharded_ifftn_3d
 
 from solvers.lanczos import (
+    alpha_herm_sink,
     block_lanczos_eig,
     block_lanczos_eig_jit,
     block_lanczos_eig_jit_converged,
+    report_alpha_herm,
     simple_lanczos_eig,
+    split_alpha_sink,
     lanczos_eig_jit,
 )
 from .bse_serial import apply_bse_hamiltonian_single_device
 from .bse_ring_comm import make_bse_shardings
+import common.timing as timing
 
 
 def solve_bse(
@@ -168,9 +172,10 @@ def solve_bse_sharded(
     # The legacy ``matvec_kind`` selector is retired here; see the retirement
     # note in bse_stack_matvec (ring/gather/simple + selector deletion pending).
     from .bse_stack_matvec import build_bse_stack_matvec
-    matvec_ring = build_bse_stack_matvec(
-        mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
-    )
+    with timing.section("bse.solve.matvec_build"):
+        matvec_ring = build_bse_stack_matvec(
+            mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
+        )
 
     # W_R = ifft_q(W_q) computed ONCE inside the outer jit. Use the
     # gw_jax custom-partitioned IFFT helper — plain ``jnp.fft.ifftn`` on
@@ -201,9 +206,11 @@ def solve_bse_sharded(
     # drop the Python reference, so only ONE copy survives into the solve.
     # Value-identical: same helper, same axes, same norm, same operand.
     if include_W:
-        _W_ifft_donated = jax.jit(_W_local_ifftn, donate_argnums=(0,))
-        W_R = _W_ifft_donated(data["W_q"])
-        data["W_q"] = None          # release the caller-side reference
+        with timing.section("bse.solve.W_ifft") as _sec_wifft:
+            _W_ifft_donated = jax.jit(_W_local_ifftn, donate_argnums=(0,))
+            W_R = _W_ifft_donated(data["W_q"])
+            data["W_q"] = None          # release the caller-side reference
+            _sec_wifft.watch(W_R)
     else:
         W_R = data["W_q"]
 
@@ -266,6 +273,16 @@ def solve_bse_sharded(
     from .bse_stack_matvec import matvec_opts as _mv_opts
     krylov_rep = rep_eig if "krep" in _mv_opts() else None
 
+    # The static half of the α-Hermiticity reports the Krylov solve collects
+    # (solver name + α form).  Filled at TRACE time by ``_full_run`` below and
+    # read back on the host after the call; the numbers themselves come back
+    # as ``_full_run``'s fourth output.  See ``solvers.lanczos``'s header for
+    # why the report may not be a ``jax.debug.callback`` here: a host callback
+    # makes this module — the single program holding the whole Krylov loop —
+    # unpersistable in JAX's compilation cache, so the 2.1 s XLA compile was
+    # paid on every warm run.
+    _alpha_labels: list = []
+
     # End-to-end jit with explicit in/out shardings + donate the bulky
     # buffers we won't need post-Lanczos.
     @partial(
@@ -274,7 +291,9 @@ def solve_bse_sharded(
             sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
             sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y,
         ),
-        out_shardings=(rep_eig, rep_eig, rep_eig),
+        # Fourth entry covers the α-Hermiticity payload: a pytree prefix, so
+        # ``rep_eig`` applies to each of its (replicated, scalar) leaves.
+        out_shardings=(rep_eig, rep_eig, rep_eig, rep_eig),
         # NB: arg 6 is now W_R (already ifft'd, DONATED at its own top-level
         # boundary above) rather than W_q.  Donating it HERE is still declined
         # — there is no aliasable same-shape output of a Lanczos solve — which
@@ -282,6 +301,16 @@ def solve_bse_sharded(
         # transform out, not to donate the eigensolve's inputs.
     )
     def _full_run(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y):
+        with alpha_herm_sink() as _sink:
+            evs, evecs, n_it = _krylov(
+                psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
+                W_R, V_q0, M_X, M_Y,
+            )
+        labels, payload = split_alpha_sink(_sink)
+        _alpha_labels[:] = labels
+        return evs, evecs, n_it, payload
+
+    def _krylov(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y):
         if bs == 1:
             # Single-vector matvec — accept (n_flat,) and reshape to (1, c, v, k).
             def matvec(v_flat):
@@ -350,12 +379,27 @@ def solve_bse_sharded(
                 )
                 return evs, evecs, jnp.int32(max_iter)
 
-    eigenvalues, eigenvectors, n_iter_done = _full_run(
+    # ONE program: trace + XLA compile + the entire Krylov loop's execution.
+    # Split compile from execution by lowering/compiling first, so the two
+    # costs the campaign A/Bs are separately visible instead of fused into
+    # ``bse.eigensolve``.  Value-identical: the same jit, the same operands.
+    _args = (
         data["psi_c_X"], data["psi_c_Y"],
         data["psi_v_X"], data["psi_v_Y"],
         data["eps_c"], data["eps_v"],
         W_R, data["V_q0"],
         data["M_X"], data["M_Y"],
     )
+    with timing.section("bse.solve.krylov_compile"):
+        _full_run_c = _full_run.lower(*_args).compile()
+    with timing.section("bse.solve.krylov_run") as _sec_kr:
+        eigenvalues, eigenvectors, n_iter_done, _alpha = _full_run_c(*_args)
+        _sec_kr.watch(eigenvalues)
+        _sec_kr.watch(eigenvectors)
+    # The α-Hermiticity gate, run on the host on the scalars the jit just
+    # returned.  Identical check to the in-jit callback it replaces; it is
+    # OUT here so that ``jit__full_run`` carries no host callback and JAX will
+    # persist it (a cached module is ~2.1 s of XLA compile per warm run).
+    report_alpha_herm(_alpha_labels, _alpha)
     eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
     return eigenvalues, eigenvectors, n_iter_done
