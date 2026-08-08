@@ -38,6 +38,25 @@ Si is the NEGATIVE CONTROL: it has zero time-reversed rows, so all four
 columns are the same number and no conjugation happens anywhere.  Its
 5.130e-04 is the committed file's own independent computation, not an
 unfold error — see :func:`test_si_wants_no_conjugation_at_all`.
+
+AND SINCE THE BROADCAST MOVED TO READ TIME, the second half of this file
+gates the FORMAT that move created (``§ THE STORED FORMAT`` below): a file
+written on the IBZ reads back bit-identical to the full write it replaces,
+a file that lies about being one refuses, and — the assertion that protects
+every fixture above — a file with no ``k_storage`` attr is still read
+verbatim.  That last one is not politeness.  Four of the six committed
+``kin_ion.h5`` were computed independently at every full-BZ k and their
+rows do NOT satisfy the star relation (measured ``unfold(select(A))``
+against ``A``: 3.557e-14, 2.001e-03, 1.726e-01 and 7.782e+00 Ry on
+gnppm / si_cohsex / bispinor / cohsex).  Reinterpreting one of those as
+compressible would move physics by up to 7.8 Ry, and the only thing
+standing between the reader and that is a default.
+
+MEASURED on the two fixtures this generator actually wrote —
+``si_bse_debug`` (nk 64, nrk 8) and ``hbn_cohsex_debug`` (nk 18, nrk 18) —
+``unfold(select(A))`` is bit-identical to the committed array on BOTH
+``kin_ion`` and ``v_hartree``, max|Δ| exactly 0.000e+00, and si_bse_debug's
+payload goes 7.3728 MB → 0.9216 MB, 8.00×.
 """
 
 from __future__ import annotations
@@ -62,6 +81,12 @@ h5py = pytest.importorskip("h5py")
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _REG = os.path.join(_REPO, "tests", "regression")
 _KIN_ION_IO = os.path.join(_REPO, "src", "gw", "kin_ion_io.py")
+#: Where the adapter — and therefore the predicate — lives NOW.  It moved
+#: out of ``src/gw/kin_ion_io.py`` when the broadcast moved from write time
+#: to read time; :func:`test_the_call_site_passes_ibz_slab_as_a_literal`
+#: followed it, and gained a second arm asserting the writer has no
+#: ``star_broadcast`` call left.
+_FILE_IO_KIN_ION = os.path.join(_REPO, "src", "file_io", "kin_ion.py")
 
 
 def _adapter_or_skip():
@@ -472,8 +497,20 @@ def test_the_call_site_passes_ibz_slab_as_a_literal():
     ``trs_reference=("ibz_slab" if x else "star_row")`` and on the string
     appearing anywhere in a docstring, and both of those are exactly the
     shapes this needs to reject.
+
+    THE PIN MOVED, DELIBERATELY, AND GOT STRONGER.  It used to parse
+    ``src/gw/kin_ion_io.py``, because that is where the broadcast ran while
+    it happened at WRITE time.  Storing kin_ion on the IBZ moved the
+    broadcast to the read boundary, so the adapter — and the only
+    ``star_broadcast`` call for this predicate — is now in
+    ``src/file_io/kin_ion.py``.  A pin that had been *mechanically* updated
+    would just follow the file; this one keeps the old location as a second
+    assertion instead, because the failure it guards against is precisely
+    somebody re-adding a broadcast at the writer with the default
+    predicate, which would put the file back on the full BZ AND put
+    27cc885 back with it.
     """
-    src = pathlib.Path(_KIN_ION_IO).read_text()
+    src = pathlib.Path(_FILE_IO_KIN_ION).read_text()
     tree = ast.parse(src)
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef)
@@ -483,7 +520,7 @@ def test_the_call_site_passes_ibz_slab_as_a_literal():
              and getattr(c.func, "attr", None) == "star_broadcast"]
     assert len(calls) == 1, (
         f"expected exactly one star_broadcast call in "
-        f"broadcast_ibz_to_full_bz; found {len(calls)}")
+        f"file_io.kin_ion.broadcast_ibz_to_full_bz; found {len(calls)}")
     kw = {k.arg: k.value for k in calls[0].keywords}
     assert "trs_reference" in kw, (
         "broadcast_ibz_to_full_bz no longer passes trs_reference "
@@ -494,3 +531,311 @@ def test_the_call_site_passes_ibz_slab_as_a_literal():
         f"trs_reference must be the LITERAL 'ibz_slab' at this call site, "
         f"not {ast.dump(node)} — a conditional or a name is a runtime "
         f"question and this is not a runtime property")
+
+
+def test_the_writer_holds_no_star_broadcast_of_its_own():
+    """The other half of I8: the broadcast did not come BACK to the writer.
+
+    ``gw.kin_ion_io`` still owns a ``broadcast_ibz_to_full_bz``, but it is
+    a wrapper that unpacks a live ``SymMaps`` and forwards; the rule has
+    ONE implementation and one call.  A second ``star_broadcast`` appearing
+    in the writer is either a duplicated predicate (two places to get
+    ``trs_reference`` wrong) or a re-instated write-time unfold that
+    silently undoes the compression — so it is asserted absent rather than
+    left to review.
+    """
+    tree = ast.parse(pathlib.Path(_KIN_ION_IO).read_text())
+    calls = [c for c in ast.walk(tree)
+             if isinstance(c, ast.Call)
+             and getattr(c.func, "attr", None) == "star_broadcast"]
+    assert calls == [], (
+        f"src/gw/kin_ion_io.py has {len(calls)} star_broadcast call(s) at "
+        f"line(s) {[c.lineno for c in calls]}; the adapter lives in "
+        f"src/file_io/kin_ion.py and the writer forwards to it")
+
+
+# ===========================================================================
+# § THE STORED FORMAT — the broadcast moved to read time, and what gates it
+# ===========================================================================
+# ``gw.kin_ion_io`` used to broadcast one statement after the sweep and write
+# the full-BZ table; it now writes the PRE-broadcast block and
+# ``file_io.kin_ion`` unfolds on read.  That is a pure storage change and the
+# cells below are what make "pure" checkable:
+#
+#   * the compressed file reads back BIT-IDENTICAL to the full write it
+#     replaces, on both datasets, on the two decks the generator wrote;
+#   * a file that CLAIMS IBZ storage and cannot back the claim refuses, in
+#     each of the six ways it can fail to back it;
+#   * a file with no attr is read verbatim, which is what keeps the four
+#     older fixtures — whose rows do NOT satisfy the star relation — meaning
+#     what they have always meant.
+#
+# None of this needs the FFI: the writer is h5py and the reader under test is
+# the pure-host ``read_full_bz_dataset``, so unlike the adapter cells above
+# these run on any machine.  ``SlabIO``'s collective path is the same unfold
+# behind the same predicate and is covered by any leg with the library.
+
+from file_io.kin_ion import (                                   # noqa: E402
+    IRR_IDX_DATASET, K_STORAGE_ATTR, K_STORAGE_FULL, K_STORAGE_IBZ,
+    K_STORAGE_VERSION, K_STORAGE_VERSION_ATTR, N_SYM_SPATIAL_ATTR,
+    SYM_IDX_DATASET, read_full_bz_dataset, read_kin_ion_provenance,
+    read_star_map, validate_kin_ion_against_run,
+)
+from file_io.kin_ion import (                                   # noqa: E402
+    broadcast_ibz_to_full_bz as _read_side_adapter,
+)
+
+#: The decks whose committed ``kin_ion.h5`` THIS generator wrote — they are
+#: the ones stamped ``k_set_computed='ibz'``, and the only ones whose
+#: full-BZ rows are the star broadcast of their own IBZ slab.  The round
+#: trip is asserted bit-identical on these and on no others, deliberately.
+_GENERATOR_WRITTEN = ("si_bse_debug", "hbn_cohsex_debug")
+
+
+def _slab_of(A_full, irr, sidx, nss):
+    """Invert the broadcast: the IBZ slab ``A_full`` was unfolded from.
+
+    One row per IBZ index, un-conjugated — ``conj`` is its own inverse, so
+    this is exact whichever row of the star is picked.  It reconstructs what
+    the generator HELD; the generator itself never inverts anything, it just
+    stops broadcasting.
+    """
+    nrk = int(np.asarray(irr).max()) + 1
+    out = np.empty((nrk,) + A_full.shape[1:], dtype=A_full.dtype)
+    seen = set()
+    for k in range(len(irr)):
+        j = int(irr[k])
+        if j in seen:
+            continue
+        seen.add(j)
+        out[j] = np.conj(A_full[k]) if sidx[k] >= nss else A_full[k]
+    return out
+
+
+def _write_kin_ion(path, arrays, *, irr, sidx, nss, storage=K_STORAGE_IBZ,
+                   version=K_STORAGE_VERSION, tables=True,
+                   stamp_nss=True):
+    """A ``kin_ion.h5`` written the way the generator writes one.
+
+    Every knob exists because a red twin turns it: ``storage`` to mislabel,
+    ``version`` to age, ``tables``/``stamp_nss`` to omit.  The arrays are
+    passed in already sliced so a twin can truncate one.
+    """
+    with h5py.File(path, "w") as f:
+        if tables:
+            f.create_dataset(IRR_IDX_DATASET, data=np.asarray(irr, np.int32))
+            f.create_dataset(SYM_IDX_DATASET, data=np.asarray(sidx, np.int32))
+        for name, arr in arrays.items():
+            ds = f.create_dataset(name, data=arr, dtype=np.complex128)
+            ds.attrs[K_STORAGE_ATTR] = storage
+            if storage == K_STORAGE_IBZ:
+                ds.attrs[K_STORAGE_VERSION_ATTR] = int(version)
+                if stamp_nss:
+                    ds.attrs[N_SYM_SPATIAL_ATTR] = int(nss)
+    return path
+
+
+def _generator_deck(deck):
+    """``(committed arrays, irr, sidx, nss)`` for a generator-written deck."""
+    wfn = os.path.join(_REG, deck, "WFN.h5")
+    kin = os.path.join(_REG, deck, "kin_ion.h5")
+    for p in (wfn, kin):
+        if not os.path.isfile(p):
+            pytest.skip(f"no {os.path.relpath(p, _REPO)} in this checkout "
+                        f"(fixture blobs absent)")
+    sym = SymMaps(_Header(wfn))
+    irr = np.asarray(sym.irr_idx_k)
+    sidx = np.asarray(sym.sym_idx_k)
+    nss = int(np.asarray(sym.sym_mats_k).shape[0]) // 2
+    with h5py.File(kin, "r") as f:
+        assert f["kin_ion"].attrs.get("k_set_computed") == "ibz", (
+            f"PRECONDITION: {deck}'s kin_ion.h5 must be one THIS generator "
+            f"wrote, or its full-BZ rows are not the broadcast of anything")
+        arrays = {n: f[n][:] for n in f
+                  if f[n].ndim == 3 and f[n].shape[0] == len(irr)}
+    assert arrays, f"{deck}: no full-BZ 3-D dataset in kin_ion.h5"
+    return arrays, irr, sidx, nss
+
+
+@pytest.mark.parametrize("deck", _GENERATOR_WRITTEN)
+def test_a_compressed_file_reads_back_the_old_full_write_bit_for_bit(
+        deck, tmp_path):
+    """THE gate.  Store the slab, read it back, compare to the full write.
+
+    Not "agrees to a tolerance" — ``np.array_equal`` on complex128, on
+    every dataset the file carries, because the claim being made is that
+    this is a storage change and a storage change that moves a bit is not
+    one.  It holds by construction (the reader unfolds exactly what the
+    writer stopped broadcasting), and the point of measuring it is that
+    "by construction" has been wrong twice in this area, both times
+    diagonal-preserving.
+
+    MEASURED: max|Δ| exactly 0.000e+00 on ``kin_ion`` AND ``v_hartree``,
+    both decks; si_bse_debug 7.3728 MB → 0.9216 MB payload (8.00×),
+    hbn_cohsex_debug 1.00× (nrk == nk — the honest answer on a deck where
+    every k is its own star, and the reason the size claim is asserted as
+    the star ratio rather than as a constant).
+    """
+    arrays, irr, sidx, nss = _generator_deck(deck)
+    nrk = int(irr.max()) + 1
+    slabs = {n: _slab_of(a, irr, sidx, nss) for n, a in arrays.items()}
+    path = _write_kin_ion(tmp_path / "kin_ion.h5", slabs,
+                          irr=irr, sidx=sidx, nss=nss)
+
+    for name, ref in arrays.items():
+        got = read_full_bz_dataset(str(path), name)
+        assert got.shape == ref.shape, (deck, name, got.shape, ref.shape)
+        assert np.array_equal(got, ref), (
+            f"{deck}/{name}: compressed read differs from the full write by "
+            f"max|d|={float(np.abs(got - ref).max()):.3e}; a storage change "
+            f"must move nothing")
+
+    stored = sum(a.nbytes for a in slabs.values())
+    full = sum(a.nbytes for a in arrays.values())
+    assert stored * len(irr) == full * nrk, (
+        f"{deck}: stored payload {stored} B against {full} B is not the "
+        f"star ratio {len(irr)}/{nrk}")
+
+
+@pytest.mark.parametrize(
+    "deck", ["gnppm_debug", "bispinor_debug", "si_cohsex_debug",
+             "cohsex_debug", "si_bse_debug", "hbn_cohsex_debug"])
+def test_a_file_with_no_attr_is_read_verbatim(deck):
+    """NO-ATTR-MEANS-FULL, asserted on every committed fixture.
+
+    The default is what keeps the four older files meaning what they mean.
+    They were computed independently at every full-BZ k, so their rows do
+    NOT satisfy the star relation — MEASURED ``unfold(select(A))`` against
+    ``A``: 3.557e-14 (gnppm), 2.001e-03 (si_cohsex), 1.726e-01 (bispinor)
+    and 7.782e+00 Ry (cohsex).  If the reader ever inferred compressibility
+    from shape, or from the ``k_set_computed`` attr, or from the presence
+    of the tables, cohsex_debug would move by 7.8 Ry and every diagonal
+    observable would survive it.  So the discriminator is an attribute the
+    old writer never wrote, and this cell is the proof it stays that way.
+    """
+    kin = os.path.join(_REG, deck, "kin_ion.h5")
+    if not os.path.isfile(kin):
+        pytest.skip(f"no {os.path.relpath(kin, _REPO)} in this checkout")
+    assert read_star_map(kin, "kin_ion") is None, (
+        f"{deck}: a committed fixture must read as full-BZ storage")
+    with h5py.File(kin, "r") as f:
+        ref = f["kin_ion"][:]
+    assert np.array_equal(read_full_bz_dataset(kin, "kin_ion"), ref)
+
+
+def _twin(kind, arrays, irr, sidx, nss, tmp_path):
+    """One way to write a file that lies, and the message it must raise."""
+    slabs = {n: _slab_of(a, irr, sidx, nss) for n, a in arrays.items()}
+    p = tmp_path / "kin_ion.h5"
+    if kind == "truncated":
+        # The slab lost a star.  This is the corruption that CANNOT be seen
+        # by looking at the array — every row is a valid matrix.
+        return (_write_kin_ion(p, {n: a[:-1] for n, a in slabs.items()},
+                               irr=irr, sidx=sidx, nss=nss),
+                "do not describe the same calculation")
+    if kind == "mislabelled_full":
+        # A full-BZ array stamped as an IBZ slab: the shape and the tables
+        # disagree, which the spec makes a refusal rather than a preference.
+        return (_write_kin_ion(p, arrays, irr=irr, sidx=sidx, nss=nss),
+                "do not describe the same calculation")
+    if kind == "no_tables":
+        return (_write_kin_ion(p, slabs, irr=irr, sidx=sidx, nss=nss,
+                               tables=False),
+                "cannot be unfolded at all")
+    if kind == "wrong_version":
+        return (_write_kin_ion(p, slabs, irr=irr, sidx=sidx, nss=nss,
+                               version=K_STORAGE_VERSION + 1),
+                "format version")
+    if kind == "no_n_sym_spatial":
+        return (_write_kin_ion(p, slabs, irr=irr, sidx=sidx, nss=nss,
+                               stamp_nss=False),
+                "no threshold to test against")
+    if kind == "illegal_storage":
+        return (_write_kin_ion(p, slabs, irr=irr, sidx=sidx, nss=nss,
+                               storage="wedge"),
+                "which is neither")
+    raise AssertionError(kind)
+
+
+@pytest.mark.parametrize("kind", ["truncated", "mislabelled_full",
+                                  "no_tables", "wrong_version",
+                                  "no_n_sym_spatial", "illegal_storage"])
+def test_a_file_that_lies_about_ibz_storage_refuses(kind, tmp_path):
+    """RED TWINS.  Six ways to claim IBZ storage without backing it.
+
+    Each is a file that is perfectly well-formed HDF5 and perfectly
+    plausible to a reader that only looked at shapes.  ``truncated`` and
+    ``mislabelled_full`` are the two that matter most and they are the same
+    check from opposite sides: the stored k extent must equal the number of
+    stars the tables describe, so a slab short by one star and a full-BZ
+    array wearing the IBZ stamp both fail it.  Neither is visible in the
+    values — every row of both is a valid Hermitian block.
+    """
+    arrays, irr, sidx, nss = _generator_deck("si_bse_debug")
+    path, message = _twin(kind, arrays, irr, sidx, nss, tmp_path)
+    with pytest.raises(ValueError, match=message):
+        read_full_bz_dataset(str(path), "kin_ion")
+
+
+def test_the_read_side_adapter_is_the_star_algebra_itself():
+    """``file_io.kin_ion.broadcast_ibz_to_full_bz`` IS ``star_broadcast``.
+
+    The behavioural arm the FFI-gated adapter cells above cannot run on a
+    machine with no library: this adapter lives under ``file_io``, imports
+    the service lazily and needs no ``.so``, so the identity is asserted
+    bit-for-bit here on all three star decks.  Both sides are one gather.
+    """
+    for deck in _DECKS:
+        A_full, sym, irr, sidx, nss, labels, reps = _tables(deck)
+        got = np.asarray(_read_side_adapter(A_full, irr, sidx, nss))
+        ref = np.asarray(symmetry_maps.star_broadcast(
+            A_full, irr, sidx, nss,
+            irr_labels=np.arange(A_full.shape[0], dtype=np.int32),
+            trs_reference="ibz_slab"))
+        assert np.array_equal(got, ref), deck
+    assert _read_side_adapter(None, irr, sidx, nss) is None
+    with pytest.raises(ValueError, match="did not run on the IBZ k-set"):
+        _read_side_adapter(A_full[:2], irr, sidx, nss)
+
+
+def test_provenance_reports_the_logical_k_count_not_the_stored_one(tmp_path):
+    """``_nk_logical`` is what a run means by nk; ``_shape`` is the disk.
+
+    ``validate_kin_ion_against_run`` compares the file's nk against the
+    run's, and it is the ONE check standing between a run and a kin_ion.h5
+    from a different k-grid.  Reading the stored extent there would refuse
+    every compressed file on any deck with symmetry — and the natural
+    "fix", dropping the check, would let a genuinely wrong file through.
+    So the two counts are separate keys and the check names which it uses.
+    """
+    arrays, irr, sidx, nss = _generator_deck("si_bse_debug")
+    nrk = int(irr.max()) + 1
+    assert nrk < len(irr), "PRECONDITION: si_bse_debug must actually reduce"
+    slabs = {n: _slab_of(a, irr, sidx, nss) for n, a in arrays.items()}
+    path = str(_write_kin_ion(tmp_path / "kin_ion.h5", slabs,
+                              irr=irr, sidx=sidx, nss=nss))
+
+    attrs = read_kin_ion_provenance(path)
+    assert attrs["_k_storage"] == K_STORAGE_IBZ
+    assert attrs["_shape"][0] == nrk
+    assert attrs["_nk_logical"] == len(irr)
+
+    validate_kin_ion_against_run(path, nk=len(irr), print_fn=lambda *a: None)
+    with pytest.raises(ValueError, match="but the run has nk"):
+        validate_kin_ion_against_run(path, nk=nrk, print_fn=lambda *a: None)
+
+
+def test_the_full_storage_stamp_round_trips_too(tmp_path):
+    """``k_storage="full"`` written explicitly must read as full.
+
+    The generator stamps it under ``--fold-hartree``, whose whole job is
+    reproducing the legacy layout, so "absent" and "``full``" have to be
+    the same answer and not merely both non-``ibz``.
+    """
+    arrays, irr, sidx, nss = _generator_deck("si_bse_debug")
+    path = str(_write_kin_ion(tmp_path / "kin_ion.h5", arrays,
+                              irr=irr, sidx=sidx, nss=nss,
+                              storage=K_STORAGE_FULL))
+    assert read_star_map(path, "kin_ion") is None
+    assert np.array_equal(read_full_bz_dataset(path, "kin_ion"),
+                          arrays["kin_ion"])

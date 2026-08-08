@@ -92,7 +92,12 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
-from file_io.kin_ion import HARTREE_DATASET
+from file_io.kin_ion import (
+    HARTREE_DATASET, IRR_IDX_DATASET, K_STORAGE_ATTR, K_STORAGE_FULL,
+    K_STORAGE_IBZ, K_STORAGE_VERSION, K_STORAGE_VERSION_ATTR,
+    N_SYM_SPATIAL_ATTR, SYM_IDX_DATASET,
+    broadcast_ibz_to_full_bz as _broadcast_ibz_slab,
+)
 from gw.gw_config import read_lorrax_input as read_cohsex_input
 from psp.pseudos import load_pseudopotentials, build_atom_pp_assignments
 from psp.dft_operators import padded_gvectors, vnl_matrix_from_kdata
@@ -111,16 +116,6 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-# THE MODULE BINDING, not ``from symmetry_maps import star_broadcast``.
-# ``broadcast_ibz_to_full_bz`` calls ``symmetry_maps.star_broadcast(...)``
-# and ``tests/test_kin_ion_star_broadcast.py::
-# test_the_call_site_passes_ibz_slab_as_a_literal`` finds that call by AST
-# on ``func.attr == "star_broadcast"``.  A bare-name import would make that
-# search find zero calls -- and the cell asserts ``len(calls) == 1``, so it
-# FAILS LOUDLY with the count in the message rather than passing on an
-# empty search.  The module binding is kept so the gate goes on measuring
-# the ``"ibz_slab"`` literal at the REAL call site; changing it does not
-# weaken the gate, it breaks it, which is the point.
 import symmetry_maps                                            # noqa: E402
 
 
@@ -165,26 +160,28 @@ def _resolve_against(path: str, base_dir: str) -> str:
 #   being Hermitian only to round-off.)
 #
 # Hence the unfold is a gather PLUS a conjugation on the time-reversed
-# rows, which is exactly what ``symmetry_maps.star_broadcast``
-# does; this module calls it rather than re-deriving the rule.
+# rows, which is exactly what ``symmetry_maps.star_broadcast`` does; this
+# module calls it rather than re-deriving the rule.
 #
-# THE PREDICATE, AND WHY IT IS PASSED EXPLICITLY.  The rule below is
-# ``sym_idx_k >= ntran``, i.e. "is this row time-reversed", because the
-# reference is the file's own IBZ slab, read verbatim with no symmetry
-# operation applied at all — the representative is untransformed by
-# construction.  ``star_broadcast``'s DEFAULT predicate is a different
-# one (the XOR against the first FULL-BZ row of the star), correct for
-# the ``star_select`` output it is normally handed and wrong here.
+# WHERE THE UNFOLD NOW HAPPENS, AND WHY IT MOVED.  It used to run HERE, one
+# statement after the sweep, so the file on disk was the full-BZ table and
+# ``nk - nrk`` of its rows were exact copies of other rows.  The block that
+# is persisted is now the PRE-BROADCAST one and the unfold runs at the READ
+# boundary (``file_io.kin_ion``), which is a pure storage change: what the
+# reader hands back is ``unfold(stored)``, and ``stored`` is the very array
+# the broadcast used to consume, so the round trip is an identity by
+# construction rather than a property that has to hold.  MEASURED on the two
+# committed fixtures this generator actually wrote —
+# ``tests/regression/si_bse_debug`` (nk 64, nrk 8) and ``hbn_cohsex_debug``
+# (nk 18, nrk 18) — ``unfold(select(A))`` is bit-identical to the committed
+# array on BOTH datasets, max|Δ| exactly 0.000e+00, and si_bse_debug's
+# payload goes 7.3728 MB -> 0.9216 MB, 8.00x.
 #
-# The two stopped coinciding.  On ``tests/regression/cohsex_debug`` the
-# shipping op-selection policy gives star label 2 a first full-BZ row
-# with sym_idx 12 = ntran (a pure time reversal), so the XOR inverts the
-# conjugation on 6 of the 9 k-points: MEASURED 183.61 eV of error in
-# ⟨m|V_H|n⟩ against a V_H computed independently at every full-BZ k,
-# entirely in the OFF-DIAGONALS (the diagonal, and therefore every
-# diagonal observable and the eqp.dat VH column, is exactly unchanged —
-# which is why nothing caught it).  Hence ``trs_reference="ibz_slab"``
-# is passed explicitly rather than relying on the default.
+# THE PREDICATE, AND WHY IT IS PASSED EXPLICITLY, now lives with the call —
+# see the block above :func:`file_io.kin_ion.broadcast_ibz_to_full_bz`,
+# which carries the 183.61 eV that a wrong ``trs_reference`` costs and is
+# what the AST gate parses.  The adapter below forwards to it so there is
+# still exactly ONE ``star_broadcast`` call for this predicate in the tree.
 #
 # AND A WARNING ABOUT VALIDATING THIS.  A cell with inversion symmetry
 # needs no time-reversal rows to cover its mesh, so its ``sym_idx_k``
@@ -220,18 +217,8 @@ def _resolve_against(path: str, base_dir: str) -> str:
 # full-BZ k-points.
 
 
-def broadcast_ibz_to_full_bz(A_irr, sym):
-    """``(nrk, …) → (nk_tot, …)`` through the star map, conjugating on TRS.
-
-    Thin adapter over :func:`symmetry_maps.star_broadcast` so the
-    time-reversal rule has ONE implementation in the tree.  ``star_broadcast``
-    orders ``A_irr`` by ``star_select``'s first-occurrence rows; the sweeps
-    here run on ``k='ibz'``, whose rows are raw IBZ indices, so the labels
-    passed are the identity — which makes its gather ``A[irr_idx_k]``, the
-    parent map, with ``conj`` applied on the time-reversed rows.
-    ``trs_reference="ibz_slab"`` selects that conjugation predicate; see
-    the block above for the 183.61 eV this costs when it is left to
-    ``star_broadcast``'s default.
+def star_tables(sym):
+    """``(irr_idx_k, sym_idx_k, n_sym_spatial)`` — what an unfold needs.
 
     ``n_sym_spatial`` is derived from ``sym.sym_mats_k`` (always
     ``2·ntran`` long, both SymMaps branches) rather than from the WFN
@@ -240,23 +227,31 @@ def broadcast_ibz_to_full_bz(A_irr, sym):
     from the header instead would let the producer and the consumer of
     that convention drift apart.
 
+    Called twice: once to unfold in memory (the gspace V_H route below)
+    and once to write the tables into ``kin_ion.h5`` beside the slab they
+    unfold, so the file and the run cannot disagree about them.
+    """
+    return (np.asarray(sym.irr_idx_k, dtype=np.int32),
+            np.asarray(sym.sym_idx_k, dtype=np.int32),
+            int(np.asarray(sym.sym_mats_k).shape[0]) // 2)
+
+
+def broadcast_ibz_to_full_bz(A_irr, sym):
+    """``(nrk, …) → (nk_tot, …)`` through the star map, conjugating on TRS.
+
+    The writer-side spelling of :func:`file_io.kin_ion.
+    broadcast_ibz_to_full_bz`, which is THE adapter: this one only unpacks
+    the three tables out of a live ``SymMaps`` so an in-memory consumer
+    does not have to.  There is no second implementation of the rule, and
+    no second ``star_broadcast`` call — the AST gate now asserts that, in
+    both directions.
+
     ``None`` in, ``None`` out: the callers below gather with
     ``owner_only=True``, so the peers hold no table to broadcast.
     """
     if A_irr is None:
         return None
-    A = np.asarray(A_irr)
-    parent = np.asarray(sym.irr_idx_k, dtype=int)
-    if int(parent.max(initial=-1)) >= A.shape[0]:
-        raise ValueError(
-            f"broadcast_ibz_to_full_bz: irr_idx_k reaches IBZ row "
-            f"{int(parent.max())} but the computed table has only "
-            f"{A.shape[0]} — the sweep did not run on the IBZ k-set.")
-    n_sym_spatial = int(np.asarray(sym.sym_mats_k).shape[0]) // 2
-    return symmetry_maps.star_broadcast(
-        A, sym.irr_idx_k, sym.sym_idx_k, n_sym_spatial,
-        irr_labels=np.arange(A.shape[0], dtype=np.int32),
-        trs_reference="ibz_slab")
+    return _broadcast_ibz_slab(np.asarray(A_irr), *star_tables(sym))
 
 
 # ---- artifact provenance ---------------------------------------------------
@@ -605,7 +600,8 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                            nb: int, mesh=None,
                            psi_rotation=None,
                            print_fn=print,
-                           owner_only: bool = False):
+                           owner_only: bool = False,
+                           k_set: str = "full"):
     """The exact FFT-grid ⟨mk|V_H|nk⟩ for all k — **(nk, nb, nb) Ry**.
 
     SINGLE SOURCE for every exact-V_H consumer: the CLI in this module
@@ -644,7 +640,23 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     rank-0 h5 write) assembles on rank 0 alone and returns ``None`` on
     every other rank — see :func:`common.mtxel_sweep.blocks_to_host`.
     Replicated consumers (gspace route) keep the default.
+
+    ``k_set`` names which k-set the RESULT is on, and the two consumers
+    now answer differently — which is why it is a parameter rather than a
+    decision baked into the return.  ``"full"`` (default, and what the
+    driver's ``hartree_source=gspace`` route needs) returns the
+    ``(nk_tot, nb, nb)`` star broadcast, exactly as before.  ``"ibz"``
+    returns the ``(nrk, nb, nb)`` block the sweep produced, un-broadcast,
+    for the CLI to persist: its consumer reads V_H back out of
+    ``kin_ion.h5``, and ``file_io.kin_ion`` unfolds it there.  Nothing
+    else about the computation changes, so the two answers are related by
+    exactly one gather and the default path is bit-for-bit what it was.
     """
+    if k_set not in ("full", "ibz"):
+        raise ValueError(
+            f"compute_hartree_matrix: k_set must be 'full' (the replicated "
+            f"full-BZ table the gspace route consumes) or 'ibz' (the "
+            f"pre-broadcast block the CLI persists); got {k_set!r}")
     mesh = resolve_mesh(mesh)
     _, world = process_rank_world()
     nocc = int(wfn.nelec)
@@ -765,19 +777,24 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
             # is the file's own — the pairing is self-consistent by
             # definition, whatever wrapping convention the unfold uses.
             kvecs=np.asarray(wfn.kpoints, dtype=np.float64))
-        # THE BOUNDARY, stated rather than implied.  Both consumers of this
-        # function want a host ``(nk_tot, nb, nb)`` — the FULL BZ, which is
-        # why the star broadcast happens here and not at either call site:
-        # the CLI writes it with serial h5py on rank 0
-        # (``owner_only=True``), and ``sigma_dispatch``'s gspace route
-        # hands it to ``replicate_to_mesh`` as a replicated global operand.
-        # Neither can take a sharded block or an IBZ-shaped one, so both
-        # the sharding and the k-set are undone HERE and named.  The QSGW
-        # consumer that CAN stay sharded
-        # (``sc_iteration.rebuild_hartree_dft_basis``) calls
-        # ``sweep_matrix_elements`` directly and never reaches this line.
-        return broadcast_ibz_to_full_bz(
-            blocks_to_host(H_vh, nb=nb, owner_only=owner_only), sym)
+        # THE BOUNDARY, stated rather than implied.  Both consumers want a
+        # HOST array — the CLI writes it with serial h5py on rank 0
+        # (``owner_only=True``), and ``sigma_dispatch``'s gspace route hands
+        # it to ``replicate_to_mesh`` as a replicated global operand — so
+        # the sharding is undone HERE for both, and named.  (The QSGW
+        # consumer that CAN stay sharded,
+        # ``sc_iteration.rebuild_hartree_dft_basis``, calls
+        # ``sweep_matrix_elements`` directly and never reaches this line.)
+        #
+        # THE k-SET IS WHERE THEY PART.  gspace needs the full BZ in memory
+        # and gets it, unchanged.  The CLI's consumer is a FILE, and the
+        # file now stores the IBZ block and unfolds on read, so handing the
+        # CLI a broadcast it would immediately re-compress is the work this
+        # change exists to delete.
+        H_host = blocks_to_host(H_vh, nb=nb, owner_only=owner_only)
+        if k_set == "ibz":
+            return H_host
+        return broadcast_ibz_to_full_bz(H_host, sym)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -1043,12 +1060,20 @@ def main(argv=None):
     # write and the rank-0 diagnostic print, so no peer needs the
     # replicated (nk, nb, nb) table (BD.4).  The driver's gspace route
     # (``sigma_dispatch``) keeps the replicated default.
+    #
+    # ``k_set``: IBZ for the normal path, because that is what gets stored.
+    # ``--fold-hartree`` is the one exception and it is not an optimisation
+    # question — that flag exists ONLY to reproduce pre-``v_hartree``
+    # artifacts bit-for-bit, so it takes the full-BZ V_H and the whole file
+    # stays in the legacy layout (see ``store_ibz`` below).
+    store_ibz = not bool(args.fold_hartree and args.hartree)
     v_h_all = None
     if args.hartree:
         with timing.section("build_V_H"):
             v_h_all = compute_hartree_matrix(
                 wfn, sym, meta, truncation_2d=ctx.truncation_2d, nb=nb_eff,
-                mesh=mesh_xy, print_fn=print0, owner_only=True)
+                mesh=mesh_xy, print_fn=print0, owner_only=True,
+                k_set=("ibz" if store_ibz else "full"))
 
     # ---- compute kin+ion: ONE k-scan, bands sharded over every rank -----
     # ``kin_ion`` stays PRISTINE (T + V_loc + V_NL) unless --fold-hartree
@@ -1076,14 +1101,14 @@ def main(argv=None):
                                     local_potential_operator, sum_operators,
                                     sweep_matrix_elements, vnl_operator)
     #
-    # THE k-SET IS THE IBZ, and the written table is the star broadcast of
-    # it — see "THE IRREDUCIBLE k-SET" at the head of this module for the
-    # derivation, including the conjugation the time-reversed rows need.
-    # T, V_loc and V_NL are built from the lattice and the atomic
-    # positions, so they are exactly symmetric by construction and this is
-    # the sweep the argument fits most cleanly.  The FILE is unchanged:
-    # still (nk_tot, nb, nb), still in full-BZ order, so no consumer of
-    # ``kin_ion.h5`` sees the k-set at all.
+    # THE k-SET IS THE IBZ, and so is the WRITTEN table — see "THE
+    # IRREDUCIBLE k-SET" at the head of this module for the derivation,
+    # including the conjugation the time-reversed rows need.  T, V_loc and
+    # V_NL are built from the lattice and the atomic positions, so they are
+    # exactly symmetric by construction and this is the sweep the argument
+    # fits most cleanly.  No CONSUMER of ``kin_ion.h5`` sees the k-set
+    # either: ``file_io.kin_ion`` unfolds on read and still hands back
+    # ``(nk_tot, nb, nb)`` in full-BZ order.
     nk_irr = int(wfn.nkpts)
     gtab = padded_gvectors(wfn, k="ibz")
     psi_G = wfn.load(bands=(0, nb_eff), k="ibz",
@@ -1113,11 +1138,12 @@ def main(argv=None):
         # THE BOUNDARY: the sink is a serial h5py write on rank 0, which
         # cannot take a sharded operand, so the block is gathered to the
         # owner here and nowhere else.  ``owner_only`` keeps the peers'
-        # transient at one chunk instead of the whole (nrk, nb, nb).  The
-        # star broadcast follows immediately, so what leaves this block is
-        # the full-BZ table the writer has always been handed.
+        # transient at one chunk instead of the whole (nrk, nb, nb).  What
+        # leaves this block is the IBZ slab itself — the star broadcast
+        # used to follow immediately and now happens at the reader.
         kin_ion_irr = blocks_to_host(H_kin_ion, nb=nb_eff, owner_only=True)
-        kin_ion_all = broadcast_ibz_to_full_bz(kin_ion_irr, sym)
+        kin_ion_all = (kin_ion_irr if store_ibz
+                       else broadcast_ibz_to_full_bz(kin_ion_irr, sym))
     del H_kin_ion, psi_G
 
     # ---- DOES THIS OPERATOR HAVE THE SYMMETRY OF THESE WAVEFUNCTIONS? ----
@@ -1160,9 +1186,36 @@ def main(argv=None):
             if folded else "T + V_loc + V_NL matrix elements")
     with timing.section("write_h5"):
         if rank == 0:
+            irr_idx_k, sym_idx_k, n_sym_spatial = star_tables(sym)
             with h5py.File(out_path, "w") as f:
+                # ---- the unfold tables, beside the slabs they unfold -----
+                # Written whatever the storage, because they cost nk int32
+                # (256 B on the Si 4³ deck) and because a reader that has
+                # them can CHECK a full-BZ file's star relation instead of
+                # taking it on faith.  ``k_storage`` is what decides how a
+                # dataset is read; these are the raw material.
+                f.create_dataset(IRR_IDX_DATASET, data=irr_idx_k)
+                f.create_dataset(SYM_IDX_DATASET, data=sym_idx_k)
+
+                def _stamp_k_storage(dset):
+                    """Say which k-set THIS dataset is on.  Per dataset,
+                    because the two need not agree — ``--fold-hartree``
+                    puts the whole file back on the full BZ, and a future
+                    array might land either way.  Absent means full, so
+                    this stamp is what makes a compressed file readable
+                    and its absence is what keeps every older one safe."""
+                    dset.attrs[K_STORAGE_ATTR] = (
+                        K_STORAGE_IBZ if store_ibz else K_STORAGE_FULL)
+                    if store_ibz:
+                        dset.attrs[K_STORAGE_VERSION_ATTR] = K_STORAGE_VERSION
+                        dset.attrs[N_SYM_SPATIAL_ATTR] = int(n_sym_spatial)
+
                 ds = f.create_dataset("kin_ion", data=kin_ion_all, dtype=np.complex128)
+                _stamp_k_storage(ds)
                 ds.attrs["description"] = desc
+                # The LOGICAL k count, which is what every consumer means by
+                # nk.  On an IBZ-stored file it is deliberately NOT the
+                # dataset's own first extent; ``nrk`` below is.
                 ds.attrs["nk"] = sym.nk_tot
                 ds.attrs["nb"] = nb_eff
                 ds.attrs["sys_dim"] = sys_dim
@@ -1210,14 +1263,22 @@ def main(argv=None):
                 ds.attrs["wfn_checksum"] = _wfn_checksum(wfn_path)
                 ds.attrs["wfn_checksum_scope"] = _WFN_CHECKSUM_SCOPE
                 ds.attrs["generator_commit"] = _generator_commit()
-                # The k-set actually COMPUTED.  The dataset is and remains
-                # full-BZ ``(nk, nb, nb)``; these say that ``nk - nrk`` of
-                # those rows are symmetry copies, not independent evaluations.
+                # The k-set actually COMPUTED — always the IBZ, and now
+                # always the one stored too except under --fold-hartree.
+                # ``nrk`` and ``k_set_computed`` predate the storage change
+                # and keep their meaning: ``nk - nrk`` full-BZ rows are
+                # symmetry copies, not independent evaluations.
                 ds.attrs["nrk"] = int(wfn.nkpts)
                 ds.attrs["k_set_computed"] = "ibz"
                 if v_h_all is not None and not folded:
                     vh = f.create_dataset(HARTREE_DATASET, data=v_h_all,
                                           dtype=np.complex128)
+                    # V_H rides the same k-set as kin_ion, and says so
+                    # itself rather than inheriting: the two arrays are
+                    # added together to make H₀, and a reader that took
+                    # one dataset's storage claim as the other's would
+                    # sum a full-BZ table into an IBZ one.
+                    _stamp_k_storage(vh)
                     vh.attrs["description"] = (
                         "<mk|V_H|nk> (Ry), exact FFT-grid mean-field Hartree; "
                         "NOT included in the 'kin_ion' dataset")
@@ -1232,8 +1293,12 @@ def main(argv=None):
             (f"stored as '{HARTREE_DATASET}'" if args.hartree
              else "absent (ISDF route required)"))
     if rank == 0:
+        _store = (f"IBZ slab, unfolded to {sym.nk_tot} k on read "
+                  f"({sym.nk_tot / max(int(wfn.nkpts), 1):.2f}x)"
+                  if store_ibz else "full BZ (legacy fold-in layout)")
         print0(f"Wrote {os.path.basename(out_path)}: kin_ion "
-               f"{kin_ion_all.shape}, sys_dim={sys_dim}, V_H {_src}")
+               f"{kin_ion_all.shape} stored on the {_store}, "
+               f"sys_dim={sys_dim}, V_H {_src}")
         if v_h_all is not None:
             d0 = np.real(np.diagonal(kin_ion_all[0])) * 13.605693122994
             v0 = np.real(np.diagonal(v_h_all[0])) * 13.605693122994
