@@ -62,6 +62,17 @@ The surface
     Real space: the FFT-grid permutation tables the ISDF centroids and
     the ρ symmetrisation ride on, and the holohedry recovery for decks
     whose header symmetry list is a subset of the true point group.
+``write_qirr_tensor`` / ``read_tensor`` / ``read_tables`` /
+``allocate_qirr_placeholder`` / ``QirrTables`` / ``QirrHeader``
+    q_irr restart tensors: the PRE-UNFOLD wedge on disk with the tables
+    that unfold it in the same file, unfolded on read.  The writer
+    REFUSES against a non-closed centroid set; the reader takes the
+    SHAPE as the primary discriminant and the ``q_storage`` attr as its
+    cross-check, refuses on version / hash / table drift, and refuses a
+    placeholder whose data was never persisted.  A file with no attrs is
+    read as full-BZ, unchanged.  h5py is imported lazily inside the two
+    functions that open a file, so ``import symmetry_maps`` still needs
+    nothing but jax and numpy.
 ``verify_centroid_orbit_closure`` / ``CentroidClosureVerdict``
     Orbit closure as a MEASUREMENT rather than an exception:
     ``compute_centroid_sym_perm`` refuses on a non-closed set, this says
@@ -113,6 +124,15 @@ from symmetry_maps.maps import (
     unfold_v_q,
     unfold_v_q_bispinor_lorentz,
 )
+from symmetry_maps.qirr_store import (
+    QIRR_FORMAT_VERSION,
+    QirrHeader,
+    QirrTables,
+    allocate_qirr_placeholder,
+    read_tables,
+    read_tensor,
+    write_qirr_tensor,
+)
 from symmetry_maps.orbit_syms import (
     CLOSURE_TOL_DEFAULT,
     CentroidClosureVerdict,
@@ -142,6 +162,10 @@ __all__ = [
     # orbit closure: the measurement, its verdict, its tolerance
     "verify_centroid_orbit_closure", "CentroidClosureVerdict",
     "CLOSURE_TOL_DEFAULT",
+    # q_irr restart tensors: the wedge on disk, the unfold on read
+    "write_qirr_tensor", "read_tensor", "read_tables",
+    "allocate_qirr_placeholder", "QirrTables", "QirrHeader",
+    "QIRR_FORMAT_VERSION",
     # the TRS measurement
     "DensitySymmetryReport", "check_density_symmetries",
     "cached_density_symmetry_check", "trs_check_mode",

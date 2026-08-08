@@ -26,6 +26,15 @@ dependencies = ["lxkit", "jax", "numpy"]
 
 [project.optional-dependencies]
 test = ["pytest>=8.0.0", "numpy"]
+# `qirr_store` is the ONE module here that opens a file, and h5py is
+# declared as an EXTRA rather than a runtime dependency so that the
+# statement above stays true: an installed symmetry_maps still imports on
+# a machine with no h5py and still answers every table question from
+# arrays.  The module imports h5py lazily, inside the functions that open
+# the file, and `test_symmetry_maps_import_isolation.py` measures that
+# `import symmetry_maps` leaves h5py out of `sys.modules` even with the
+# store on the door.
+store = ["h5py"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
