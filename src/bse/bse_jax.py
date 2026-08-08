@@ -476,6 +476,14 @@ if __name__ == "__main__":
     parser.add_argument("--n-occ", type=int, default=None, help="Number of occupied bands.")
     parser.add_argument("--ring-test", action="store_true")
     parser.add_argument("--ring-check", action="store_true")
+    # INERT, and deliberately still accepted.  Its only consumer was the
+    # ``timed=True`` arm of ``bse_ring_comm.build_bse_ring_matvec*``, which was
+    # dead code (no caller ever passed it) and was deleted 2026-08-08; the dest
+    # was already never read even before that.  It is kept parseable so that an
+    # archived launch script still starts instead of dying in argparse on a
+    # batch node, which reads as a crashed run rather than a renamed flag.
+    # If per-term ring timings are wanted again, use common.timing sections on
+    # the jitted matvec -- not an unjitted arm that re-traces on every call.
     parser.add_argument("--ring-timing", action="store_true")
     parser.add_argument("--components", action="store_true")
     parser.add_argument("--debug-parallelism", action="store_true")

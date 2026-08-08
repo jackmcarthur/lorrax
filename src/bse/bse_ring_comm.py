@@ -12,7 +12,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.shard_map import shard_map as _shard_map_fn
 
-import common.timing as timing
 from common.collectives import gather_to_host, prepare_mesh, resolve_mesh
 from common.contract_bands import contract_bands_block_reshard
 from common.fft_helpers import (
@@ -459,7 +458,6 @@ def build_bse_ring_matvec(
     nkx: int,
     nky: int,
     nkz: int,
-    timed: bool = False,
     low_mem: bool = True,
     include_W: bool = True,
 ):
@@ -600,25 +598,6 @@ def build_bse_ring_matvec(
         W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
         return D_term + V_term - W_term
 
-    if timed:
-        def _matvec_timed(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
-                          M_X, M_Y):
-            with timing.section("bse_jax.D_term"):
-                D_term = apply_D_term(X, eps_c, eps_v)
-                D_term.block_until_ready()
-            with timing.section("bse_jax.V_term"):
-                V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
-                V_term.block_until_ready()
-            if not include_W:
-                return D_term + V_term
-            with timing.section("bse_jax.W_term"):
-                T = encode_T_ring(X, psi_c_X, psi_v_Y) if low_mem else encode_T_gather(X, psi_c_X, psi_v_Y)
-                W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
-                W_term.block_until_ready()
-            return D_term + V_term - W_term
-
-        return _matvec_timed
-
     return jax.jit(
         _matvec_impl,
         in_shardings=(
@@ -643,7 +622,6 @@ def build_bse_ring_matvec_full(
     nkx: int,
     nky: int,
     nkz: int,
-    timed: bool = False,
     low_mem: bool = True,
     include_W: bool = True,
     screening: bool = False,
@@ -915,36 +893,6 @@ def build_bse_ring_matvec_full(
         Y_out = _antiresonant_row(X, Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                                   eps_c, eps_v, W_R, V_q0, M_X)
         return jnp.stack([X_out, Y_out], axis=0)
-
-    if timed:
-        def _matvec_timed(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
-                          M_X, M_Y):
-            X = X_full[0]
-            Y = X_full[1]
-            with timing.section("bse_jax.D_term"):
-                D_term = apply_D_term(X, eps_c, eps_v)
-                D_term.block_until_ready()
-            with timing.section("bse_jax.V_term"):
-                V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
-                V_term.block_until_ready()
-            if not include_W:
-                AX = D_term + V_term
-            else:
-                with timing.section("bse_jax.W_term"):
-                    T = encode_T_ring(X, psi_c_X, psi_v_Y) if low_mem else encode_T_gather(X, psi_c_X, psi_v_Y)
-                    W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
-                    W_term.block_until_ready()
-                AX = D_term + V_term - W_term
-            with timing.section("bse_jax.B_term"):
-                BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X)
-                BY.block_until_ready()
-            X_out = AX + BY
-
-            Y_out = _antiresonant_row(X, Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                                      eps_c, eps_v, W_R, V_q0, M_X)
-            return jnp.stack([X_out, Y_out], axis=0)
-
-        return _matvec_timed
 
     return jax.jit(
         _matvec_impl,

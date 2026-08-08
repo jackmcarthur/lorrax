@@ -20,13 +20,34 @@ feed only the W-term's ``psi_c_X``/``psi_v_Y``; the V-term reads the hoisted M's
 Why a stack matvec.  The four legacy TDA matvecs (ring/gather/simple/serial)
 carry the trial axis ``b`` on the direct-term tensor ``T[b, μ, ν, t, s, k]`` —
 per device ``n_trials · μ_loc · ν_loc · ns² · nk`` complex128, LINEAR in
-``n_trials`` (the memory hog).  Here the W-term is ONE ``shard_map`` whose body
-is a ``lax.scan`` over the trial axis, so XLA reuses the body's scratch across
-iterations: exactly ONE ``T``-family is alive regardless of ``n_trials``.  A
-Python-unrolled or ``fori_loop``-over-trials-inside-``jit`` would pile up
-``n_trials`` live ``T`` slots (the known slot-pile-up failure mode,
-``feedback_path_d_scaffolding_pattern``); the scan avoids it.  Collectives run
-per trial inside the scan body — the memory-for-comm trade the design chose.
+``n_trials`` (the memory hog).  Here the W-term body is a ``lax.scan`` over the
+trial axis, so XLA reuses the body's scratch across iterations: exactly ONE
+``T``-family is alive regardless of ``n_trials``.  A Python-unrolled or
+``fori_loop``-over-trials-inside-``jit`` would pile up ``n_trials`` live ``T``
+slots (the known slot-pile-up failure mode,
+``feedback_path_d_scaffolding_pattern``); the scan avoids it.
+
+THE ``lax.scan`` IS WHAT BOUNDS ``T``, NOT THE ``shard_map`` — this paragraph
+used to credit the wrong one.  Measured 2026-08-08 (SHARDMAP_AUDIT.md §4.4,
+§6.1): the GSPMD twin below runs the same scan with NO ``shard_map`` at all and
+holds 450.01 MiB at ``n_trials=1`` against 450.10 MiB at ``n_trials=8`` — flat
+in the trial axis, exactly like the manual route.  Dropping the ``shard_map``
+does not bring the memory hog back.
+
+Why the manual ``shard_map`` is kept anyway, which is the justification that
+actually survives measurement:
+
+  1. BACKEND PORTABILITY of the decode collectives.  On a CPU mesh the SPMD
+     partitioner emits ``all-reduce`` where the manual body issues
+     ``psum_scatter`` — 2x the wire bytes on BOTH decode legs, with no flag in
+     this build that fixes it.
+  2. A GUARANTEE RATHER THAN A COINCIDENCE.  On GPU today the partitioner
+     reproduces the manual plan exactly (same 6 collectives, same bytes), but
+     that is a property of this XLA build, not a contract it owes us.  The
+     manual spelling cannot silently regress.
+
+A site that outlives its stated reason is how habit becomes doctrine, so the
+stated reason is now the one the measurement supports.
 
 Exchange (V) is the B1 dense form (VERDICT.md): DENSE in (k,k'), encode k-SUMMED
 into a k-free ζ-space density, decode broadcast at every k.  ``S,U`` are k-free
