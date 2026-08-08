@@ -161,6 +161,26 @@ _ALLOWED = (
                 "makes and this row does not weaken"),
     AllowedSkip("", "monorepo wiring",
                 "the monorepo run; a standalone install has no lorrax"),
+    # The handler-ABI stamp landed 2026-08-08.  Every library built before it
+    # is unstamped, and there is genuinely nothing to compare — which is a
+    # different fact from "not checked": the LOADER announces the same thing at
+    # dlopen on every run that pins one, and LORRAX_FFI_ABI_STRICT=1 turns that
+    # announcement into a refusal.  UNSCOPED (where="") on purpose, so
+    # _allowed_for does not strip it on Perlmutter: the pins BUILD_NOTES.md
+    # names there are pre-stamp libraries, and a machine-wide gate failure for
+    # "your pinned .so predates the mechanism" would fire on every worktree
+    # while fixing none of them.  It stops skipping the moment a leg pins a
+    # library built from this tree.
+    AllowedSkip("", "carries no handler-ABI stamp",
+                "any leg pinned to a library built from this tree (the fresh "
+                "host build does stamp); the loader announces the same fact "
+                "at dlopen and LORRAX_FFI_ABI_STRICT=1 refuses on it"),
+    # The stale-ABI red twin COMPILES a .so, which is the only way to prove the
+    # check runs on a library the loader actually opened rather than on a
+    # monkeypatch.  Every build node has a compiler; a bare analysis node may
+    # not.
+    AllowedSkip("", "no C compiler on PATH",
+                "any leg with a toolchain — every build node, and the WSL box"),
     # MEASURED on Perlmutter 2026-08-07: `lx test` gives ONE process a
     # 1x1 mesh, and cuSOLVERMp's block-cyclic layout degenerates there
     # (guard 5 refuses px<2 or py<2).  The covering leg is real and was

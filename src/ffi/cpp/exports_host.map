@@ -30,6 +30,14 @@
        function permanently unreachable for the runtime report it exists
        for. */
     lorrax_ffi_host_build_config;
+    /* The handler-signature ABI, same exception for the same reason: it is
+       declared as an API and both loaders dlsym it at dlopen, before any
+       handler is declared, so that a stale pairing is refused by name instead
+       of arriving as `Wrong number of arguments` at the first read_slabs.
+       Hiding it does not fail the build — it disarms the check silently,
+       which is the one failure mode this whole mechanism exists to remove.
+       See cpp/common/lorrax_ffi_abi.h. */
+    lorrax_ffi_host_abi_version;
   local:
     *lorrax_ffi*;
 };

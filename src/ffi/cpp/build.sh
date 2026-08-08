@@ -187,27 +187,39 @@ echo
 echo "[build] --- ldd check ---"
 ldd "${SO_FILE}" | grep -Ei 'cusolver|nccl|cuda|cal' || true
 
-# GATE (hazard S3): exactly ONE cray-mpich runtime object in the closure.
-# The CUDA/container leg was previously UNGATED -- only the bare-metal host
-# leg checked this, and it checked with 'readelf -d', which sees direct
-# DT_NEEDED only and so cannot see an MPI pulled in transitively through
-# libhdf5_parallel_gnu_123.  gate_one_mpi.sh resolves the full ldd closure
-# and dedupes by resolved file.  No expected-variant is pinned here: inside
-# the Shifter container the ONLY cray-mpich available is shifter's
-# --module=mpich bind-mount (8.1.25 / libmpi_gnu_91); the phdf5 stage
-# deliberately aliases libmpi_gnu_123.so.12 onto it so HDF5 and the FFI
-# share ONE runtime.  What must hold is one mapped object, not a version.
-GATE_TAG=build "${SCRIPT_DIR}/gate_one_mpi.sh" "${SO_FILE}" || exit 1
-
-# GATE 7: ONE HDF5.  On this leg the stage is what we built against, so the
-# want/have half is near-tautological -- what it really catches here is a
-# STALE build dir (a CMakeCache pinned to a stage that has since been
-# re-populated from a different module) and a stage that carries two HDF5
-# majors at once.  The cross-leg half of the invariant is enforced on the
-# host side, in config/perlmutter/build_ffi_host.sh, where the two
-# populations can actually be compared.
-GATE_TAG=build LORRAX_PHDF5_STAGE="${LORRAX_PHDF5_MOUNT:-/lorrax_phdf5}" \
-    "${SCRIPT_DIR}/gate_one_hdf5.sh" "${SO_FILE}" || exit 1
+# ===========================================================================
+# THE BUILD CONTRACT.  Unconditional, and a failure here fails the build.
+#
+# This leg used to call gate_one_mpi.sh and gate_one_hdf5.sh directly and
+# nothing else; scripts/verify_ffi_build.sh runs those two plus the backend
+# declaration, the load-resolution probe and the ABI stamp, and is the same
+# file the host leg and the pytest tier use.  See its header for why one
+# script rather than five copies.
+#
+# No expected MPI variant is pinned: inside the Shifter container the ONLY
+# cray-mpich available is shifter's --module=mpich bind-mount (8.1.25 /
+# libmpi_gnu_91), and the phdf5 stage deliberately aliases
+# libmpi_gnu_123.so.12 onto it so HDF5 and the FFI share ONE runtime.  What
+# must hold is one mapped object, not a version.
+#
+# On this leg the phdf5 stage is what we built against, so GATE 7's want/have
+# half is near-tautological here — what it catches is a STALE build dir (a
+# CMakeCache pinned to a stage since re-populated from a different module) and
+# a stage carrying two HDF5 majors at once.  The CROSS-LEG half is enforced on
+# the host side, where the two populations can actually be compared; point
+# LORRAX_FFI_EXPECT_PEER_SO at the host .so to run it from here too.
+# ===========================================================================
+echo
+echo "[build] --- build contract (scripts/verify_ffi_build.sh) ---"
+LORRAX_ROOT="${LORRAX_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
+LORRAX_PHDF5_STAGE="${LORRAX_PHDF5_STAGE:-${LORRAX_PHDF5_MOUNT:-/lorrax_phdf5}}" \
+    bash "${LORRAX_ROOT}/scripts/verify_ffi_build.sh" --leg cuda "${SO_FILE}" || {
+        echo "[build] FAILED: the library does not meet the build contract." >&2
+        echo "[build] The .so is left on disk so it can be inspected, but it" >&2
+        echo "[build] must not be deployed or pinned.  Read the gate output" >&2
+        echo "[build] above; every failure names its own fix." >&2
+        exit 1
+    }
 
 # GATE 9: NO LORRAX-OWNED INTERNAL IS ON THE DYNAMIC TABLE.
 #
@@ -220,9 +232,16 @@ GATE_TAG=build LORRAX_PHDF5_STAGE="${LORRAX_PHDF5_MOUNT:-/lorrax_phdf5}" \
 # return type has a different LAYOUT in the two builds.  That is
 # KNOWN_FAILURES L1.  src/ffi/cpp/exports_cuda.map localises them; this gate
 # notices the day it falls off the link line.
+#
+# TWO NAMES ARE EXEMPT, and exports_cuda.map's `global:` clause is where the
+# reason is written: common/build_config.cc joined this leg's sources on
+# 2026-08-08 and its two entry points are `lorrax_ffi_cuda_*`, so the pattern
+# below would take them.  They are declared APIs read from outside the
+# library, and their host twins carry `_host`, so nothing collides.
 echo "[build] GATE 9 (no LORRAX internal on the dynamic table)"
 _leaked=$(nm -D --defined-only "${SO_FILE}" 2>/dev/null | awk '{print $NF}' \
-          | grep -E 'lorrax_ffi' || true)
+          | grep -E 'lorrax_ffi' \
+          | grep -vE '^lorrax_ffi_cuda_(build_config|abi_version)$' || true)
 if [ -n "$(printf %s "${_leaked}" | tr -d '[:space:]')" ]; then
     echo "[build] GATE FAILED (9): LORRAX-owned internals are on the" >&2
     echo "[build]   dynamic table.  liblorrax_ffi_host.so defines these" >&2
