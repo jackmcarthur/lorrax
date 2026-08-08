@@ -481,3 +481,92 @@ def test_the_block_qr_eigendecomposition_stays_on_host():
         f"docstring")
     assert "np.linalg.eigh" in called, (
         "the host eigendecomposition disappeared from w_omega_chain")
+
+
+# ---------------------------------------------------------------------------
+# 7. The driver path that reaches this chain must stay P>1-safe.
+# ---------------------------------------------------------------------------
+# This conversion can only be validated end-to-end through
+# ``bse_w_exact --w-omega-chain``, and that driver could not run at P>1 at all:
+# every tile it pulled to host is mesh-sharded (``sh.V`` = P('x','y') for the W
+# tiles, ``sh.W`` for the stored W_q, ``sh.psi_x`` for psi_c_X), and
+# ``jax.device_get`` RAISES on an array whose shards live on other processes.
+# The fix routes them through ``common.collectives.gather_to_host``.
+#
+# The guard is a SOURCE check on purpose.  Every in-tree gate builds a 1x1
+# mesh, where all of these arrays are fully addressable and the bug is
+# perfectly invisible -- so a runtime cell here would pass just as happily
+# against the broken code.  A source check is the only non-vacuous thing this
+# file can assert about it; the runtime evidence is a P=4 driver leg, recorded
+# in FIX_womega.md.
+_P1_UNSAFE_SCOPES = ("run_w_omega_chain_compare", "build_finite_q_data")
+
+
+def _bare_device_get_lines(src: str, scope_names, if_attr=None):
+    """Lines calling ``jax.device_get`` inside the named defs (and optionally
+    inside ``main``'s ``if args.<if_attr>:`` block)."""
+    import ast
+
+    tree = ast.parse(src)
+    spans = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in scope_names:
+            spans.append((node.lineno, node.end_lineno))
+        if if_attr is not None and isinstance(node, ast.If):
+            t = node.test
+            if (isinstance(t, ast.Attribute) and t.attr == if_attr
+                    and isinstance(t.value, ast.Name) and t.value.id == "args"):
+                spans.append((node.lineno, node.end_lineno))
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if ast.unparse(node.func) != "jax.device_get":
+            continue
+        if any(lo <= node.lineno <= hi for lo, hi in spans):
+            hits.append(node.lineno)
+    return sorted(hits), spans
+
+
+def test_w_omega_chain_driver_path_is_p_gt_1_safe():
+    import inspect
+    from bse import bse_w_exact
+
+    src = inspect.getsource(bse_w_exact)
+    hits, spans = _bare_device_get_lines(
+        src, _P1_UNSAFE_SCOPES, if_attr="w_omega_chain")
+    assert spans, "found none of the scopes to check — the guard is vacuous"
+    assert not hits, (
+        f"bare jax.device_get on the --w-omega-chain driver path at source "
+        f"line(s) {hits} (offsets within bse_w_exact). Those tiles are "
+        f"mesh-sharded, so this raises at P>1. Use "
+        f"common.collectives.gather_to_host — see this cell's comment block.")
+    assert "gather_to_host" in src, (
+        "bse_w_exact no longer imports gather_to_host at all, so the scopes "
+        "above are clean only because the fetches went somewhere else")
+
+
+def test_red_twin_the_p_gt_1_guard_actually_fires():
+    """The FALSE case: the guard must flag the pattern it exists to catch.
+
+    Without this, a refactor that renamed ``run_w_omega_chain_compare`` would
+    leave the cell above asserting nothing at all, silently and forever.
+    """
+    bad = (
+        "import jax\n"
+        "def run_w_omega_chain_compare(x):\n"
+        "    return jax.device_get(x)\n"
+        "def build_finite_q_data(y):\n"
+        "    return jax.device_get(y)\n"
+    )
+    hits, spans = _bare_device_get_lines(bad, _P1_UNSAFE_SCOPES)
+    assert len(spans) == 2, f"the scope finder missed a def: {spans}"
+    assert hits == [3, 5], f"the guard did not flag the bad pattern: {hits}"
+
+    good = (
+        "from common.collectives import gather_to_host\n"
+        "def run_w_omega_chain_compare(x):\n"
+        "    return gather_to_host(x)\n"
+    )
+    hits_ok, _ = _bare_device_get_lines(good, _P1_UNSAFE_SCOPES)
+    assert hits_ok == [], f"the guard fires on the FIXED pattern too: {hits_ok}"

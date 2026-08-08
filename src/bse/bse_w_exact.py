@@ -67,7 +67,7 @@ from .bse_ring_comm import (
     make_bse_shardings,
 )
 from .bse_serial import compute_pair_amplitude
-from common.collectives import device_put_process_local
+from common.collectives import device_put_process_local, gather_to_host
 import common.timing as timing
 
 jax.config.update("jax_enable_x64", True)
@@ -186,12 +186,17 @@ def build_finite_q_data(data, q, mesh_xy):
     # host data onto a multi-process sharding fires JAX's hidden
     # ``assert_equal`` all-gather — P × nbytes per call, three calls per
     # finite-q point (scorecard AA.1).  LORRAX_CHECK_REPLICA=1 re-arms it.
+    # gather_to_host, not device_get: psi_c_X is sh.psi_x = P(None,None,None,'x')
+    # -- sharded on its LAST axis -- and eps_c is replicated but NOT fully
+    # addressable at P>1, so both raise under device_get.  The helper's three
+    # arms cover each case (allgather / local shard 0 / plain device_get) and
+    # leave the 1-GPU path exactly as it was.
     psi_c_q = _roll_k_axis_host(
-        np.asarray(jax.device_get(data["psi_c_X"])), (qx, qy, qz), nkx, nky, nkz)
+        gather_to_host(data["psi_c_X"]), (qx, qy, qz), nkx, nky, nkz)
     dq["psi_c_X"] = device_put_process_local(psi_c_q, sh.psi_x)
     dq["psi_c_Y"] = device_put_process_local(psi_c_q, sh.psi_y)
     dq["eps_c"] = device_put_process_local(_roll_k_axis_host(
-        np.asarray(jax.device_get(data["eps_c"])), (qx, qy, qz), nkx, nky, nkz), sh.eps)
+        gather_to_host(data["eps_c"]), (qx, qy, qz), nkx, nky, nkz), sh.eps)
     # M_X/M_Y are hoisted V-term pair amplitudes (audit P3) and are pure functions
     # of psi_c — the finite-q roll shifted psi_c, so recompute them from the ROLLED
     # conduction states.  The q=0 M's shallow-copied from `data` would be stale and
@@ -450,8 +455,11 @@ def run_w_omega_chain_compare(
         W_tile, resids = _resolve_wc_columns(
             cols, z, data, matvec, diag_h, gen, snapshot, sh,
             max_iter=gmres_max_iter, tol=gmres_tol)
-        return (np.asarray(jax.device_get(W_tile)),
-                np.asarray(jax.device_get(resids))[:p])
+        # gather_to_host, not device_get: W_tile is sh.V = P('x','y'), so at
+        # P>1 its shards live on other processes and device_get RAISES.  The
+        # helper's three arms cover the 1-GPU case with the same plain
+        # device_get, so this costs nothing there.
+        return (gather_to_host(W_tile), gather_to_host(resids)[:p])
 
     def _chain_eval(z, m_use=None):
         (W_tile,) = woc.eval_w_omega_chain(chain, data, snapshot, sh, z, m_use=m_use)
@@ -459,7 +467,15 @@ def run_w_omega_chain_compare(
         return W_tile
 
     # ---- build the chain ONCE (timed, warm) ----
-    woc.build_w_omega_chain(data, matvec, gen, sh, cols, min(2, chain_len))  # warm compile
+    # Warm at the SAME chain_len that is about to be timed.  This used to warm
+    # at min(2, chain_len), which was enough when every compiled thing in the
+    # chain was an m-independent leaf; the chain step is now one program whose
+    # (m,p,c,v,k) buffer makes m part of its signature, so a 2-step warm-up
+    # compiles a DIFFERENT program and the timed build below would carry a
+    # compile it claims not to.  MEASURED (Si 4x4x4, P=4, chain_len=32): 1.370 s
+    # with the 2-step warm-up against 0.349 s genuinely warm.  The extra full
+    # build is discarded work by design -- that is what a warm-up is.
+    woc.build_w_omega_chain(data, matvec, gen, sh, cols, chain_len)  # warm compile
     t0 = time.perf_counter()
     chain = woc.build_w_omega_chain(data, matvec, gen, sh, cols, chain_len)
     jax.block_until_ready(chain["V_stack"])
@@ -498,7 +514,7 @@ def run_w_omega_chain_compare(
         is_static = abs(w_ev) < 1e-12
         flabel = f"{w_ev.real:+.3f}{w_ev.imag:+.3f}i"
         for m in sweep:
-            wc = np.asarray(jax.device_get(_chain_eval(z, m_use=m)))
+            wc = gather_to_host(_chain_eval(z, m_use=m))
             rel_o = float(max(
                 np.linalg.norm(wc[:nlog, i] - w_oracle[:nlog, i])
                 / max(np.linalg.norm(w_oracle[:nlog, i]), 1e-300)
@@ -694,8 +710,10 @@ def main(argv=None) -> None:
         else:
             sweep = [4, 8, 12, 16, args.chain_len]
 
-        W0 = np.asarray(jax.device_get(data["W_q"][:, :, 0, 0, 0]))
-        V0 = np.asarray(jax.device_get(data["V_q0"]))
+        # Both are mesh-sharded (sh.W / sh.V), so this is gather_to_host and
+        # not device_get -- see the note in run_w_omega_chain_compare.
+        W0 = gather_to_host(data["W_q"][:, :, 0, 0, 0])
+        V0 = gather_to_host(data["V_q0"])
         T0 = W0 - V0
         cols0, _ = _select_compare_cols(T0, nlog, args.n_cols, args.seed)
         with timing.section("w_exact.chain_q0"):
@@ -715,8 +733,8 @@ def main(argv=None) -> None:
         if q is not None and tuple(q) != (0, 0, 0):
             qx, qy, qz = int(q[0]), int(q[1]), int(q[2])
             dq = build_finite_q_data(data, (qx, qy, qz), mesh_xy)
-            W0q = np.asarray(jax.device_get(data["W_q"][:, :, qx, qy, qz]))
-            Vq = np.asarray(jax.device_get(data["V_q_full"][:, :, qx, qy, qz]))
+            W0q = gather_to_host(data["W_q"][:, :, qx, qy, qz])
+            Vq = gather_to_host(data["V_q_full"][:, :, qx, qy, qz])
             Tq = W0q - Vq
             colsq, _ = _select_compare_cols(Tq, nlog, args.n_cols, args.seed)
             with timing.section("w_exact.chain_qfinite"):
