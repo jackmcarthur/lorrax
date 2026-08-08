@@ -1268,7 +1268,7 @@ def initialize_kpath(wfn, params):
 
 
 def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
-                a_band_index: int | None = None):
+                a_band_index: int | None = None, diagnostics: bool = True):
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
@@ -1311,32 +1311,96 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
                 eigs0[states - 5:states])
 
     _t0 = _perf()                                          # instrument:
-    re_min, re_max, im_max = _diag_stats_fast(fH_k)
-    log_fn("fH_k real range: [{:.3e}, {:.3e}], |imag|max={:.3e}".format(
-        float(re_min), float(re_max), float(im_max)))
-    fH_k0_rep = jax.device_put(fH_k[0], rep)  # (rank, rank) replicated, ~7 MB
-    _eig_err, _f_head, _e_head, _f_tail, _e_tail = jax.device_get(
-        _diag_eig_at_gamma(fH_k0_rep, f_eps, int(states)))
-    fH_eig_err = float(_eig_err)
-    log_fn(f"fH(k=0) eigenvalue error vs f(eps): {fH_eig_err:.6f} Ry = {fH_eig_err * 13.6057:.3f} eV")
-    log_fn(f"  f(eps) first 5: {np.asarray(_f_head)}")
-    log_fn(f"  fH eig first 5: {np.asarray(_e_head)}")
-    log_fn(f"  f(eps) last 5:  {np.asarray(_f_tail)}")
-    log_fn(f"  fH eig last 5:  {np.asarray(_e_tail)}")
+    # ── THE DIAGNOSTICS GATE ──────────────────────────────────────────────
+    # This block plus ``_gamma_rt`` below is 1.442 s of the 4.327 s cache-cold
+    # ``h_transform`` stage — 33 %, 7 XLA programs — and 0.120 s warm
+    # (PROFILE_htransform_exciton §1.2).  Every value it computes reaches a
+    # ``log_fn`` line and nothing else; none of them reaches
+    # ``bandstructure.dat``.  And ``log_fn`` is ``print if verbose else a
+    # no-op`` (``_make_logger``), so WITHOUT ``--verbose`` the driver was
+    # spending a third of the stage computing numbers it then discarded.
+    #
+    # ``fH_k`` exists ONLY for this block: the kpath solve consumes ``fH_R``
+    # alone.  At the reference shape it is (64, 768, 768) complex128 = 576 MiB
+    # global, held alive across the whole solve for four log lines.  Dropping
+    # the reference right after the block frees it before the kpath batches
+    # allocate their own (bs, rank, rank) temporaries — the two peaks stop
+    # overlapping.  (The buffer is still PRODUCED, because it is an output of
+    # ``build_fH_R``'s single jit and ``fH_R`` is its ifft; only its residency
+    # is at stake here, which is the 576 MiB the profile prices.)
+    if diagnostics:
+        re_min, re_max, im_max = _diag_stats_fast(fH_k)
+        log_fn("fH_k real range: [{:.3e}, {:.3e}], |imag|max={:.3e}".format(
+            float(re_min), float(re_max), float(im_max)))
+        fH_k0_rep = jax.device_put(fH_k[0], rep)  # (rank, rank) replicated, ~7 MB
+        _eig_err, _f_head, _e_head, _f_tail, _e_tail = jax.device_get(
+            _diag_eig_at_gamma(fH_k0_rep, f_eps, int(states)))
+        fH_eig_err = float(_eig_err)
+        log_fn(f"fH(k=0) eigenvalue error vs f(eps): {fH_eig_err:.6f} Ry = {fH_eig_err * 13.6057:.3f} eV")
+        log_fn(f"  f(eps) first 5: {np.asarray(_f_head)}")
+        log_fn(f"  fH eig first 5: {np.asarray(_e_head)}")
+        log_fn(f"  f(eps) last 5:  {np.asarray(_f_tail)}")
+        log_fn(f"  fH eig last 5:  {np.asarray(_e_tail)}")
+    else:
+        log_fn("  [route] fH diagnostics: OFF (fH_k stats, Γ eigen-check and "
+               "the Γ round-trip are not computed; --fh-diagnostics=on "
+               "restores them)")
     timing.record("ht.diagnostics", _perf() - _t0)         # instrument:
 
-    # S Cholesky (rank × rank, replicated, small) — bundle the symmetrise +
-    # ridge + cholesky into one jit so each line isn't a separate compile.
     _t0 = _perf()                                          # instrument:
-    @jax.jit
-    def _build_S_chol(S):
-        S_sym = (S + S.conj().T) * 0.5
-        S_sym += 1e-10 * jnp.mean(jnp.real(jnp.diag(S_sym))) * jnp.eye(rank, dtype=S_sym.dtype)
-        return jnp.linalg.cholesky(S_sym)
-    S_chol = _build_S_chol(S)
+    # ── THE METRIC ROUTE — S is the identity, and the code already knows it ──
+    #
+    # ``_kpath_batch`` below reduces a GENERALIZED eigenproblem fH_q c = λ S c
+    # by two triangular solves against chol(S) per q.  But S has exactly ONE
+    # producer — ``streaming_galerkin_solve`` returns
+    #     S = jax.jit(lambda: jnp.eye(rank, dtype=jnp.complex128), …)()
+    # (see its closing lines) — because the α basis is Cholesky-orthogonalised
+    # upstream, which is the whole point of ``_finalize``'s ``coeffs @ L``.  The
+    # other consumer of the identical math, ``bse_setup._q_batch``, already
+    # takes S = I for granted: it calls ``jnp.linalg.eigh(fH_q)`` with no
+    # metric at all.  The two solves here are vestigial.
+    #
+    # WHAT THEY COST.  Each ``solve_triangular`` of a (rank, rank) triangular
+    # factor against a (rank, rank) right-hand side is rank³/2 complex MACs, so
+    # the pair is ~8·rank³ real flops per q against the ~5.3·rank³ of the
+    # eigenvalues-only Hermitian eigensolve they feed.  They are the LARGER
+    # half of the arithmetic in the batch — and the Fourier sum this whole
+    # workstream is about is 8·N_k·rank², a further factor rank/N_k below both.
+    #
+    # WHAT THEY CHANGE.  With S = I the ridge makes S_sym = (1+1e-10)·I, so
+    # chol(S) = sqrt(1+1e-10)·I and the pair divides every eigenvalue by
+    # (1+1e-10) — a systematic -1e-10 RELATIVE shift of λ, applied for no
+    # reason.  Skipping them is therefore not bit-identical; it is analytically
+    # exact and removes a small bias rather than adding one.  The measured
+    # energy delta on the reference deck is in HTRANSFORM_FFT.md §6.
+    #
+    # The route is decided ONCE, from the data, and announced.  A caller that
+    # ever hands this driver a non-identity S keeps the Cholesky path
+    # unchanged — the branch is on a measured deviation, not on an assumption.
+    @partial(jax.jit, out_shardings=rep)
+    def _s_dev_from_eye(S_in):
+        return jnp.max(jnp.abs(S_in - jnp.eye(rank, dtype=S_in.dtype)))
+
+    _s_dev = float(_s_dev_from_eye(S))
+    metric_route = "identity" if _s_dev == 0.0 else "cholesky"
+    log_fn(f"  [route] fH_q metric: {metric_route}  (max|S - I| = {_s_dev:.3e}; "
+           f"'identity' skips 2 triangular solves of {rank}³/2 complex MACs per q)")
+
+    S_chol = None
+    if metric_route == "cholesky":
+        # Built ONLY on the path that uses it — on the identity route this
+        # compile (one XLA program, 0.34 s cache-cold) is not paid at all,
+        # which is what keeps the route program-count-neutral.
+        @jax.jit
+        def _build_S_chol(S):
+            S_sym = (S + S.conj().T) * 0.5
+            S_sym += 1e-10 * jnp.mean(jnp.real(jnp.diag(S_sym))) * jnp.eye(rank, dtype=S_sym.dtype)
+            return jnp.linalg.cholesky(S_sym)
+        S_chol = _build_S_chol(S)
 
     R_grid = jnp.asarray(build_R_grid_np(kgrid))
-    jax.block_until_ready((S_chol, R_grid))                # instrument:
+    jax.block_until_ready(                                 # instrument:
+        (R_grid,) if S_chol is None else (S_chol, R_grid)) # instrument:
     timing.record("ht.S_chol", _perf() - _t0)              # instrument:
 
     # ── Kpath-batch processing ───────────────────────────────────────────
@@ -1377,6 +1441,12 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         mat = jax.lax.with_sharding_constraint(mat, batch_mat_shard)
         mat = mat + jnp.swapaxes(mat, 1, 2).conj()
 
+        if S_chol is None:
+            # S = I (see the metric-route block above).  ``mat`` was hermitized
+            # two lines up and ``eigvalsh`` reads one triangle, so the dropped
+            # ``(z + zᴴ)/2`` cannot move an eigenvalue either.
+            return jax.vmap(jnp.linalg.eigvalsh)(mat)
+
         def _solve_one(m):
             y = jsp_linalg.solve_triangular(S_chol, m, lower=True)
             z = jsp_linalg.solve_triangular(S_chol, y, lower=True, trans=2)
@@ -1406,9 +1476,12 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         return jnp.min(jnp.max(jnp.abs(fH_k - m), axis=(1, 2)))
 
     _t0 = _perf()                                          # instrument:
-    rt_err = float(_gamma_rt(fH_R, fH_k))
+    if diagnostics:
+        rt_err = float(_gamma_rt(fH_R, fH_k))
+        log_fn(f"FFT Γ round-trip max error: {rt_err:.3e}")
     timing.record("ht.gamma_roundtrip", _perf() - _t0)     # instrument:
-    log_fn(f"FFT Γ round-trip max error: {rt_err:.3e}")
+    # Last reader of ``fH_k``; see the diagnostics-gate block above.
+    del fH_k
 
     fermi_energy = float(wfn.efermi)
     nb_keep = int(f_eps.shape[0])
@@ -1470,7 +1543,31 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         # Bundle concat + slice + vmap(newton_inv) + sort into ONE jit so the
         # post-loop processing emits one compile rather than 4 (concatenate,
         # sort, gather, vmap-newton).
-        @partial(jax.jit, static_argnames=('nq', 'nb_keep'))
+        # ``out_shardings=(rep, rep)`` is a CORRECTNESS requirement at P>1, not
+        # a placement preference.  ``batches`` arrive q-sharded
+        # (``batch_eig_shard = P(('x','y'), None)``); left to inference the
+        # concatenate propagates that sharding onto the outputs, and whether
+        # the SPMD partitioner then replicates them or leaves them split is
+        # decided by whether ``nq`` divides the device count.  When it does,
+        # the ``np.asarray`` on the next line raises
+        #     RuntimeError: Fetching value for `jax.Array` that spans
+        #     non-addressable (non process local) devices is not possible.
+        # — the whole kpath solve completes and the run dies on the final host
+        # fetch.  Measured on the survey's own reference path lengths at P=4
+        # (2x2 mesh): nq=13 OK, nq=40 DIED, nq=139 OK, i.e. TWO OF THE FOUR
+        # reference decks could not run multi-process at all
+        # (PROFILE_htransform_exciton §1.5).
+        #
+        # Replication is the right answer and not merely the safe one: BOTH
+        # outputs are consumed on the host by every process immediately below
+        # (``np.asarray``, ``np.max``, the writer gate), and they are small —
+        # ``energies`` is (nq, rank) f64 and ``energies_sorted`` (nq, nb_keep),
+        # 854 KB and 13 KB at nq=139 / rank 768, against the (nk, rank, rank)
+        # 576 MiB arrays this driver already holds.  Values are untouched:
+        # ``out_shardings`` moves data, it does not compute.
+        # Gate: ``tests/test_htransform_post_kpath_sharding.py``.
+        @partial(jax.jit, static_argnames=('nq', 'nb_keep'),
+                 out_shardings=(rep, rep))
         def _post_kpath(batches, nq, nb_keep):
             lambda_q = jnp.concatenate(batches, axis=0)[:nq]
             energies = jax.vmap(lambda row: newton_inv(a_f, n_f, shift, row.real))(lambda_q)
@@ -1480,11 +1577,23 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         _t0 = _perf()                                      # instrument:
         energies_on_path, energies_sorted_jax = _post_kpath(
             tuple(lambda_q_list), int(nq), int(nb_keep))
-        # ``gather_to_host``: ``_post_kpath`` pins no ``out_shardings`` and its
-        # input batches carry P(('x','y'), None) from ``_kpath_batch``, so the
-        # q axis is tiled over the flattened mesh and nothing here de-shards it.
-        # ``np.asarray`` goes through the same ``_value`` path ``device_get``
-        # does and raises identically at P>1.
+        # Report the sharding that was ACTUALLY produced, not the one asked
+        # for.  Anything other than ``P()`` here is the non-addressable-fetch
+        # crash of PROFILE_htransform_exciton §1.5 waiting for a P>1 run with
+        # nq divisible by the device count.  ``_post_kpath`` now pins
+        # ``out_shardings=(rep, rep)``, so this line should always read ``P()``;
+        # it earns its keep by reporting the spec that came back rather than
+        # the one that was requested.  Gated by
+        # ``tests/test_htransform_kpath_gates.py::test_post_kpath_outputs_are_replicated``.
+        log_fn(f"  [gate] _post_kpath out spec: "
+               f"{energies_sorted_jax.sharding.spec} "
+               f"(must be P() — a q-sharded fetch dies at P>1)")
+        # ``gather_to_host``, not ``np.asarray``: the line above DECLARES the
+        # convention, this one SURVIVES its violation.  ``np.asarray`` goes
+        # through the same ``_value`` path ``device_get`` does and raises
+        # identically at P>1, so a future edit that drops the ``out_shardings``
+        # pin would turn the gate line into a crash on the very next statement
+        # instead of a report.  Both halves are kept deliberately.
         energies_sorted = gather_to_host(energies_sorted_jax)
         timing.record("ht.post_kpath", _perf() - _t0)      # instrument:
         _t0 = _perf()                                      # instrument:
@@ -1591,7 +1700,32 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path):
 
 def main(argv=None):
     import time as _time
+    # ── The honesty row, and why these three lines exist ──────────────────
+    # ``timing.report(wall=…)`` closes the table with
+    #     (untimed) = wall - Σ(top-level rows)
+    # and PROFILING_TOOLS calls that the honesty row.  On this driver it read
+    # -2.414 s (-60.5 %) warm and -1.283 s (-11.3 %) cache-cold at P=4
+    # (PROFILE_htransform_exciton §1.6) — a NEGATIVE honesty row, which cannot
+    # be read at all.
+    #
+    # The cause is an attribution boundary, not a mis-measurement.
+    # ``initialize_communicator_stack()`` runs in this module's BODY, above
+    # every import, and ``prepare_mesh`` records a ``collective_warmup``
+    # section (~2.4 s at P=4) into the global collector while doing it.  That
+    # is before ``_t_main``, so the row was inside Σ(rows) but outside the wall
+    # it is subtracted from, and the difference came out negative — the table
+    # was reporting more seconds than the clock it divides by.
+    #
+    # The fix is the idiom ``gw_jax`` already uses at its own ``_t_main``
+    # (gw_jax.py:180-200) and ``exciton_bands`` uses via ``process_elapsed_s``:
+    # RESET the collector here so the pre-main section is not double-counted,
+    # read the true process start from /proc, and DECOMPOSE that pre-main span
+    # into rows at report time rather than adding rows to it.  The table then
+    # closes against the process wall, ``(untimed)`` is non-negative by
+    # construction, and the 2.4 s that used to be unreadable appears by name.
     _t_main = _time.perf_counter()
+    timing.reset()
+    _pre_main = timing.process_elapsed_s()
     parser = argparse.ArgumentParser(allow_abbrev=False, description="Hamiltonian interpolation driver")
     parser.add_argument("-i", "--input", default="cohsex_test.in", help="Input file")
     parser.add_argument("-wfn", "--wfn-file", default=None, help="Override WFN file (e.g. WFN_qp.h5)")
@@ -1601,6 +1735,17 @@ def main(argv=None):
     parser.add_argument("--a-band", type=int, default=None,
                         help="Band index (0-based) whose bandwidth sets 'a'. "
                              "E.g. nval+ncond_keep-1. Default: top band.")
+    parser.add_argument("--fh-diagnostics", default="auto",
+                        choices=("auto", "on", "off"),
+                        help="fH_k range stats, the Γ eigenvalue check against "
+                             "f(eps) and the Γ round-trip.  They are 33%% of "
+                             "the cache-cold h_transform stage (1.442 s, 7 XLA "
+                             "programs) and hold fH_k — 576 MiB at the "
+                             "reference shape — alive across the whole solve, "
+                             "for four log lines that never reach "
+                             "bandstructure.dat.  auto (default) = follow "
+                             "--verbose, i.e. compute them only if anything "
+                             "will print them; on = always; off = never.")
     parser.add_argument("--eigh-backend", default=None,
                         choices=eigh_backend_choices(),
                         help="Eigensolver for the fH_q eigendecomposition of "
@@ -1681,9 +1826,11 @@ def main(argv=None):
             0.0, 20.0, unit="Ry", print_fn=log)
 
     kpath_data = initialize_kpath(wfn, params)
+    _diag_on = (args.verbose if args.fh_diagnostics == "auto"
+                else args.fh_diagnostics == "on")
     with mesh_xy, timing.section("h_transform"):
         result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
-                             a_band_index=args.a_band)
+                             a_band_index=args.a_band, diagnostics=_diag_on)
 
     # Optional BSE interpolation handoff: fine-k wfns at coarse centroids.
     # Driven by ``get_centroids_fi`` + ``kgrid_fi`` + ``wfn_fi_{min,max}``;
@@ -1735,8 +1882,29 @@ def main(argv=None):
     if result['path_range'] is not None:
         summary += f", path range [{result['path_range'][0]:.6f}, {result['path_range'][1]:.6f}] Ry"
     print(summary)
-    timing.report(title="--- Timing (seconds) ---",
-                  wall=_time.perf_counter() - _t_main)
+    # Close the table against the PROCESS wall, not against ``main()``'s.
+    # ``_pre_main`` is everything above this function: the module body's
+    # ``initialize_communicator_stack()`` (env, jax.distributed, backend init,
+    # mesh + clique warm-up) and the import storm under it.  It is decomposed
+    # into rows from the numbers the startup call measured for itself, with
+    # the remainder attributed to imports — the same shape as
+    # ``gw_jax.py``'s epilogue, and for the same reason: recording the phases
+    # AND the whole span would double-count and break the
+    # "rows + (untimed) == wall" property that makes the table readable.
+    _wall = _time.perf_counter() - _t_main
+    if _pre_main is not None:
+        _phases = {}
+        try:
+            _phases = dict(RUNTIME.facts.get("elapsed", {}) or {})
+        except Exception:      # noqa: BLE001 — observability never kills a run
+            _phases = {}
+        for _phase, _secs in sorted(_phases.items()):
+            if _phase != "total":
+                timing.record(f"htransform.runtime_stack.{_phase}", float(_secs))
+        timing.record("htransform.imports",
+                      max(_pre_main - float(_phases.get("total", 0.0)), 0.0))
+        _wall = _pre_main + _wall
+    timing.report(title="--- Timing (seconds) ---", wall=_wall)
     return 0
 
 
