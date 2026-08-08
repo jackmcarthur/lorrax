@@ -63,6 +63,108 @@ def _to_host(arr) -> np.ndarray:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Conditioning policy — why every threshold below is RELATIVE
+# ═══════════════════════════════════════════════════════════════════════
+#
+# This solver used to regularise every Cholesky with an ABSOLUTE ``1e-12 * I``
+# and then invert the factor with ``jnp.linalg.inv``.  That pair is the reason
+# Davidson diverged above n_eig ≈ 50.  The mechanism, instrumented end to end:
+#
+#   1. Some roots converge.  Their residuals fall to ~1e-9, so the
+#      preconditioned corrections ``P = R / (ΔE − λ + ε)`` are near-zero.
+#   2. CGS2 against V removes what little signal is left; those columns of P
+#      are pure round-off, ‖p‖ ~ 1e-16·‖R‖.
+#   3. ``S_P = Pᴴ P`` for those columns is ~1e-30, so the ABSOLUTE 1e-12
+#      regularisation DOMINATES S_P.  The Cholesky factor of (noise + 1e-12·I)
+#      is ~1e-6·I on those directions, and ``L⁻¹`` therefore rescales the noise
+#      UP to unit norm instead of rejecting it.  A regularisation meant as a
+#      floor became an amplifier.
+#   4. Those unit-norm noise columns are appended to V.  V is no longer
+#      orthonormal in any useful sense: measured ``min eig(Sc)`` collapses
+#      1.0 → 1.17e-11 → 2.5e-15 over ~50 iterations.
+#   5. In ``_generalized_eigh`` the same absolute floor now sits *below*
+#      Sc's smallest eigenvalue, ``inv(L)`` amplifies by ~1e6, and
+#      ``C = L⁻¹ H L⁻ᴴ`` by ~1e12.  The Ritz values explode.
+#      MEASURED offline against the stored dense Si BSE matrix:
+#      n_eig=100 → e₁ = −1.66e7 eV; n_eig=200 → −1.83e10 eV.  n_eig=20 self-
+#      destructs by iteration 56 too — it only looks clean because it
+#      converges and exits first.
+#
+# NOT the cause, and the falsifier was built and run: clamping the
+# preconditioner denominator (``|ΔE − λ + ε| ≥ 0.05 Ry``) alone STILL diverges
+# (e₁ = −1.35e9 eV).  Fixing the denominator is not a fix.
+#
+# The policy here is therefore:
+#   * every Cholesky floor scales with the matrix it regularises
+#     (``_chol_floor``: 1e-12 · tr(S)/m, the mean diagonal),
+#   * the subspace expansion is RANK-REVEALING (``_whiten_rank_revealing``):
+#     directions whose Gram eigenvalue is below 1e-10 · λ_max are *dropped*,
+#     not rescaled, so noise never enters V at all,
+#   * no Cholesky factor is inverted with the general ``jnp.linalg.inv``;
+#     the small (m, m) reductions use triangular solves.
+#
+# MEASURED, n_eig=100, 60 iterations, stored dense Si BSE matrix:
+#     as shipped                          diverges
+#     relative Cholesky floor alone       converges, 2.48e-9 meV
+#     rank-revealing drop                 converges, 2.49e-9 meV, fewest matvecs
+# ═══════════════════════════════════════════════════════════════════════
+
+#: Cholesky floor as a fraction of the matrix's own mean diagonal.
+_CHOL_REL_EPS = 1e-12
+#: Gram eigenvalues below this fraction of λ_max are not real directions.
+_RANK_DROP_RTOL = 1e-10
+#: Absolute underflow guard — only ever used to keep a divide finite.
+_TINY = 1e-300
+
+
+def _chol_floor(S):
+    """Scale-aware Cholesky regularisation for a Hermitian PSD Gram matrix.
+
+    ``1e-12 · tr(S)/m`` — a fraction of the matrix's own mean diagonal, never
+    an absolute constant.  See the conditioning-policy block above for what
+    the absolute version did.  Clamped at ``_TINY`` so an all-zero S still
+    yields a positive floor rather than a Cholesky of a singular matrix.
+    """
+    m = S.shape[0]
+    scale = jnp.real(jnp.trace(S)) / m
+    return _CHOL_REL_EPS * jnp.maximum(scale, _TINY)
+
+
+def _whiten_rank_revealing(S, P):
+    """Whiten P by its Gram matrix S, dropping numerically null directions.
+
+    Returns ``(P_w, rank)``.
+
+    ``S`` is ``(m, m)`` Hermitian PSD with ``S[i,j] = Σ conj(P[i])·P[j]``.
+    We need ``M`` with ``conj(M) S Mᵀ = I``; writing ``S = U diag(e) Uᴴ``
+    the solution is ``M[m,i] = e_m^(-1/2) U[i,m]``, i.e. the einsum below.
+    Eigenvalues are returned in DESCENDING order so the surviving directions
+    occupy the leading rows and the caller can drop the tail with one slice.
+
+    ``rank`` counts the directions with ``e > 1e-10 · e_max``.  Everything
+    below that threshold is round-off, not a search direction: its column is
+    zeroed rather than divided by ``sqrt(e)``, which is what turned noise
+    into unit-norm basis vectors before.  The caller MUST slice to ``rank``
+    — appending an exact-zero column to V puts a zero row/column into ``Sc``
+    and ``Hc``, and the resulting Ritz value is exactly 0 (Ry), i.e. a
+    spurious state below the entire physical spectrum.
+
+    Shape-agnostic: P is ``(m, *trailing)`` and only the batch axis is
+    contracted, so trailing sharding is untouched.
+    """
+    e, U = jnp.linalg.eigh(S)                 # ascending, e real
+    e = e[::-1]
+    U = U[:, ::-1]                            # descending
+    thresh = _RANK_DROP_RTOL * jnp.maximum(e[0], 0.0)
+    keep = e > thresh
+    rank = jnp.sum(keep.astype(jnp.int32))
+    inv_sqrt = jnp.where(keep, 1.0 / jnp.sqrt(jnp.maximum(e, _TINY)), 0.0)
+    M = U * inv_sqrt[None, :].astype(U.dtype)     # M[i, m] = U[i,m]·e_m^-1/2
+    P_w = jnp.einsum('im,i...->m...', M, P, optimize=True)
+    return P_w, rank
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  JIT'd subspace projection kernel (shape-agnostic via ellipsis einsum)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -70,15 +172,24 @@ def _generalized_eigh(A, B):
     """Solve A v = λ B v via Cholesky reduction.  JIT-compatible.
 
     Operates on small (m, m) replicated matrices — fine to keep replicated.
+
+    The floor on B is relative (``_chol_floor``) and the factor is never
+    inverted: ``C = L⁻¹ A L⁻ᴴ`` is two triangular solves and the back
+    transform is a third.  ``jnp.linalg.inv(L)`` did a general LU of a matrix
+    it already knew to be triangular, and it was the amplifier in step 5 of
+    the conditioning-policy note above.
     """
     m = B.shape[0]
-    B_reg = B + 1e-12 * jnp.eye(m, dtype=B.dtype)
+    B_reg = B + _chol_floor(B) * jnp.eye(m, dtype=B.dtype)
     L = jnp.linalg.cholesky(B_reg)
-    L_inv = jnp.linalg.inv(L)
-    C = L_inv @ A @ L_inv.conj().T
+    # Y = L⁻¹ A ; then C = Y L⁻ᴴ, obtained as (L⁻¹ Yᴴ)ᴴ.
+    Y = jax.scipy.linalg.solve_triangular(L, A, lower=True)
+    C = jax.scipy.linalg.solve_triangular(
+        L, Y.conj().T, lower=True).conj().T
     C = 0.5 * (C + C.conj().T)
     eigenvalues, V = jnp.linalg.eigh(C)
-    eigenvectors = jnp.linalg.solve(L.conj().T, V)
+    eigenvectors = jax.scipy.linalg.solve_triangular(
+        L.conj().T, V, lower=False)
     return eigenvalues, eigenvectors
 
 
@@ -132,17 +243,15 @@ def _default_precond(R, eigenvalues):
 
 @jax.jit
 def _orthonormalise_batch(P):
-    """Self-orthonormalise the batch axis of P via Cholesky of P^H P.
+    """Self-orthonormalise the batch axis of P, dropping null directions.
 
     Same self-orthonormalisation step as ``_ortho_expand`` without the
     against-V projection — used to clean up the initial subspace V0.
+    Returns ``(P_w, rank)``; see :func:`_whiten_rank_revealing`.
     """
     S_P = jnp.einsum('m...,n...->mn', jnp.conj(P), P, optimize=True)
     S_P = 0.5 * (S_P + S_P.conj().T)
-    n = S_P.shape[0]
-    L_P = jnp.linalg.cholesky(S_P + 1e-12 * jnp.eye(n, dtype=S_P.dtype))
-    L_P_inv = jnp.linalg.inv(L_P)
-    return jnp.einsum('mi,i...->m...', jnp.conj(L_P_inv), P, optimize=True)
+    return _whiten_rank_revealing(S_P, P)
 
 
 @jax.jit
@@ -157,8 +266,13 @@ def _ortho_expand(V, P):
     V    : (m_V, *trailing) — assumed already orthonormal in batch axis.
     P    : (n_eig, *trailing) — preconditioned residuals.
 
-    Returns P with V^H P ≈ 0 and P^H P ≈ I (in the (m, n) Gram metric
-    summing over all trailing axes).
+    Returns ``(P_w, rank)``.  ``P_w`` has P's batch width, ordered by
+    decreasing Gram eigenvalue; only ``P_w[:rank]`` is a set of genuine,
+    orthonormal search directions and only that prefix may be appended to V.
+    The rows past ``rank`` are exactly zero — they are the CGS2 round-off of
+    already-converged roots, and rescaling them to unit norm (what the old
+    absolute ``1e-12·I`` Cholesky floor did) is the divergence mechanism
+    documented in the conditioning-policy block at the top of this module.
     """
     # Iterated classical Gram-Schmidt against V (twice for full numerical
     # orthogonality at the cost of one extra projection).
@@ -166,14 +280,10 @@ def _ortho_expand(V, P):
         overlap = jnp.einsum('m...,n...->mn', jnp.conj(V), P, optimize=True)
         P = P - jnp.einsum('mn,m...->n...', overlap, V, optimize=True)
 
-    # Self-orthonormalisation of P via Cholesky factorisation of P^H P.
+    # Rank-revealing self-orthonormalisation of P (eigh of Pᴴ P).
     S_P = jnp.einsum('m...,n...->mn', jnp.conj(P), P, optimize=True)
     S_P = 0.5 * (S_P + S_P.conj().T)
-    n = S_P.shape[0]
-    L_P = jnp.linalg.cholesky(S_P + 1e-12 * jnp.eye(n, dtype=S_P.dtype))
-    L_P_inv = jnp.linalg.inv(L_P)
-    P = jnp.einsum('mi,i...->m...', jnp.conj(L_P_inv), P, optimize=True)
-    return P
+    return _whiten_rank_revealing(S_P, P)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -198,7 +308,8 @@ def warmup_davidson_jit(
         Shape of *one* state vector (everything after the batch axis 0).
         Examples: ``(n_channels, dim)``, ``(nc, nv, nk)``, ``(dim,)``.
     m_max : int, optional
-        Largest subspace dimension that will be reached. Default 4·n_eig.
+        Largest subspace dimension that will be reached. Default 10·n_eig,
+        matching :func:`davidson`.
     dtype : jnp dtype, optional
         Subspace-vector dtype. Default complex128.
     sharding : jax.sharding.Sharding, optional
@@ -225,9 +336,21 @@ def warmup_davidson_jit(
     trick AO.1 used for ``bse_w_exact``'s probe seed), so no rank ever
     materialises the global buffer on the host either — the helper's
     ``np.ascontiguousarray(arr[idx])`` realises only this rank's shard.
+
+    COVERAGE IS PARTIAL, and knowing which part matters.  This warms the
+    subspace sizes ``{n_eig, 2·n_eig, …, m_max}`` — exactly the sizes the
+    loop visits while every expansion block is full rank, i.e. the early
+    iterations.  Once roots start converging the rank-revealing expansion
+    (see :func:`_whiten_rank_revealing`) appends fewer than ``n_eig``
+    columns, ``m`` stops landing on multiples of ``n_eig``, and the
+    remaining sizes compile lazily.  MEASURED on the dense Si BSE matrix at
+    the production setting (20 roots, ``m_max = 10·n_eig``): 23 expansions
+    over 8 distinct block widths, so the lazy tail is bounded and small.
+    Widening ``m_max`` REDUCES it further (3 distinct widths at 20·n_eig)
+    because fewer restarts means fewer near-converged expansions.
     """
     if m_max is None:
-        m_max = 4 * n_eig
+        m_max = 10 * n_eig
     for m in range(n_eig, m_max + n_eig, n_eig):
         m_eff = min(m, m_max)
         shape = (m_eff,) + tuple(trailing_shape)
@@ -255,6 +378,7 @@ def davidson(
     m_max: int | None = None,
     max_iter: int = 100,
     tol: float = 1e-8,
+    stall_patience: int = 20,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Block Davidson iterative eigensolver — shape-agnostic.
@@ -277,11 +401,36 @@ def davidson(
     X0 : (n_eig, *trailing)
         Explicit initial vectors (alternative to init_fn).
     m_max : int, optional
-        Max subspace dimension before restart. Default 4 × n_eig.
+        Max subspace dimension before restart. Default 10 × n_eig.
+
+        MEASURED on the stored dense Si BSE matrix (n=1024, 20 roots, to
+        1 meV / 1e-3 meV on the lowest 20): ``4·n_eig`` needs 279 matvecs,
+        ``10·n_eig`` needs ~140 / ~160, and ``20·n_eig`` buys nothing over
+        ``10·n_eig``.  The old default was ``4·n_eig``, which restarts often
+        enough to throw away most of the subspace it just paid for.
     max_iter : int, optional
         Iteration cap. Default 100.
     tol : float, optional
         Convergence tolerance; per-state ‖R‖ < tol·max(1,|λ|). Default 1e-8.
+    stall_patience : int, optional
+        Stop after this many consecutive iterations in which the largest
+        residual did not improve by at least 1 %.  Default 20; set to 0 to
+        disable and always run to ``max_iter``.
+
+        WHY THIS EXISTS.  ``tol`` is only reachable if the operator is
+        Hermitian to better than ``tol``.  It is not, on the decks this
+        stack runs: the BSE ``H`` carries ``max|H − Hᴴ| = 8.08e-06`` from an
+        asymmetry in W (see the α-Hermiticity gate in ``solvers/lanczos.py``
+        for the full calibration), and a Ritz pair extracted from the
+        SYMMETRISED projection cannot have a residual below the size of the
+        antihermitian part.  MEASURED, production Si 4v4c BSE, 20 roots:
+        the eigenvalues reach their final values — matching the dense
+        spectrum to 8 significant figures — at **200 matvecs**, at which
+        point ‖R‖ ∈ [1.7e-6, 3.3e-6]; ``tol=1e-8`` can then never be met,
+        and the solver spent **3820 further matvecs** re-deriving the same
+        answer, ending at ‖R‖ ∈ [4.3e-6, 5.7e-6] — slightly WORSE.  With no
+        stall guard, "did not converge" is the guaranteed outcome of every
+        Davidson BSE run, which trains the reader to ignore it.
     verbose : bool, optional
         Print per-iteration progress. Default True.
 
@@ -291,11 +440,22 @@ def davidson(
     eigenvectors : jax.Array, shape (n_eig, *trailing)
         Returned as a JAX array so callers can keep its sharding; cast
         with ``np.asarray`` if you want host memory.
+
+    Notes
+    -----
+    The expansion block is RANK-REVEALING: directions whose Gram eigenvalue
+    is below ``_RANK_DROP_RTOL·λ_max`` are dropped rather than rescaled, so
+    the block width shrinks as roots converge and ``apply_H`` is called on
+    fewer vectors.  Each distinct width costs one XLA compile of the caller's
+    matvec; in exchange the noise directions that used to be manufactured by
+    the absolute Cholesky floor never enter V.  See the conditioning-policy
+    block at the top of this module for the measurement.
     """
     if precond_fn is None:
         precond_fn = _default_precond
     if m_max is None:
-        m_max = 4 * n_eig
+        m_max = 10 * n_eig
+    m_max = max(int(m_max), 2 * n_eig)
 
     # ── initial subspace ──
     if X0 is not None:
@@ -311,14 +471,27 @@ def davidson(
     # indicator vectors (mostly orthogonal) with a random Gaussian tail —
     # close to orthonormal but not exactly, and CGS2 in ``_ortho_expand``
     # below assumes V is orthonormal when projecting subsequent residuals.
-    V = _orthonormalise_batch(V)
+    V, rank0 = _orthonormalise_batch(V)
+    n_keep0 = int(rank0)
+    if n_keep0 < V.shape[0]:
+        # A rank-deficient START is a caller bug (duplicate indicator vectors,
+        # or n_eig larger than the physical block), not round-off — say so
+        # rather than silently solving a smaller problem than was asked for.
+        raise ValueError(
+            f"davidson: initial subspace has rank {n_keep0} < n_eig="
+            f"{V.shape[0]}; the {V.shape[0] - n_keep0} dependent trial "
+            f"vector(s) cannot seed distinct roots.  Check init_fn / X0.")
     HV = apply_H(V)
+    n_matvec = V.shape[0]
 
     if verbose:
         print(f"Davidson: n_eig={n_eig}, trailing={V.shape[1:]}, m_max={m_max}")
 
     eigenvalues = None
     X = V  # in case the loop never runs
+    n_conv = 0
+    best_res = np.inf
+    n_stalled = 0
 
     for it in range(1, max_iter + 1):
         # ── GPU: project + solve + Ritz + residual (one JIT) ──
@@ -332,16 +505,17 @@ def davidson(
         Lambda_np = _to_host(Lambda)
         rel_tol = tol * np.maximum(1.0, np.abs(Lambda_np))
         conv = res_np < rel_tol
-        n_conv = 0
-        for i in range(n_eig):
-            if conv[i]:
-                n_conv = i + 1
-            else:
-                break
+        # Count EVERY converged root, not the leading run of them.  The old
+        # prefix count (break on the first unconverged root) meant one lagging
+        # LOW root held the exit closed while every other root was already at
+        # 1e-12 — so the solver kept expanding a subspace whose corrections
+        # were pure round-off and iterated straight into its own instability.
+        # It also mis-reported progress: "conv=1/100" with 99 roots converged.
+        n_conv = int(np.count_nonzero(conv))
 
         eigenvalues = Lambda_np
         if verbose and (it <= 5 or it % 5 == 0 or n_conv == n_eig):
-            print(f"  iter {it:3d}: m={V.shape[0]:3d}  "
+            print(f"  iter {it:3d}: m={V.shape[0]:3d}  mv={n_matvec:5d}  "
                   f"eig[0]={float(Lambda[0]):12.6f}  "
                   f"eig[{n_eig-1}]={float(Lambda[n_eig-1]):12.6f}  "
                   f"res=[{res_np.min():.1e},{res_np.max():.1e}]  "
@@ -349,16 +523,61 @@ def davidson(
 
         if n_conv == n_eig:
             if verbose:
-                print(f"  Converged all {n_eig} in {it} iterations.")
+                print(f"  Converged all {n_eig} in {it} iterations, "
+                      f"{n_matvec} matvecs.")
             return eigenvalues, X
+
+        # ── stall detector ──
+        # Not "converged", but "this is as good as this operator gets".
+        # The distinction matters: the residual floor is a property of the
+        # OPERATOR's Hermiticity, not of the iteration, so more iterations
+        # cannot help and the caller needs to be told which of the two
+        # happened.  See the ``stall_patience`` docstring for the numbers.
+        res_max = float(res_np.max())
+        if res_max < 0.99 * best_res:
+            best_res = res_max
+            n_stalled = 0
+        else:
+            n_stalled += 1
+            if stall_patience > 0 and n_stalled >= stall_patience:
+                if verbose:
+                    print(f"  STALLED: largest residual has not improved by "
+                          f"1% in {n_stalled} iterations (best {best_res:.2e}, "
+                          f"now {res_max:.2e}); {n_conv}/{n_eig} met "
+                          f"tol={tol:.1e} after {n_matvec} matvecs.  A "
+                          f"residual floor is the size of the operator's "
+                          f"ANTIHERMITIAN part — check the alpha-Hermiticity "
+                          f"gate; if that reports ~{res_max:.0e}, the "
+                          f"eigenvalues are converged and the tolerance is "
+                          f"simply unreachable on this operator.")
+                break
 
         # ── expand subspace ──
         # Re-orthonormalise P against V before computing HP. This keeps V's
         # batch-axis Gram matrix close to the identity across iterations;
         # otherwise the Cholesky-based generalized eigh in
         # ``_ritz_and_residuals`` blows up at large m.
-        P = _ortho_expand(V, P)
+        #
+        # ``_ortho_expand`` returns the block ordered by decreasing Gram
+        # eigenvalue plus the numerical rank; only the leading ``n_keep`` rows
+        # are real search directions and the rest are exactly zero.  The slice
+        # is a leading-axis (replicated) slice, so it inserts no collective and
+        # does not touch the sharded trailing axes.
+        P, rank = _ortho_expand(V, P)
+        n_keep = int(rank)
+        if n_keep == 0:
+            # Every correction was round-off: the subspace cannot grow.  This
+            # is not convergence — report what was reached and stop rather
+            # than append noise (which is what the old code did, and it is
+            # the divergence mechanism).
+            if verbose:
+                print(f"  iter {it}: expansion block has rank 0 — subspace "
+                      f"cannot grow; stopping at {n_conv}/{n_eig} converged, "
+                      f"{n_matvec} matvecs.")
+            break
+        P = P[:n_keep]
         HP = apply_H(P)
+        n_matvec += n_keep
         V = jnp.concatenate([V, P], axis=0)
         HV = jnp.concatenate([HV, HP], axis=0)
 
@@ -368,7 +587,8 @@ def davidson(
                 print(f"  iter {it}: restart (m={V.shape[0]} > m_max={m_max})")
             V, HV = X, HX
 
-    if verbose:
+    if verbose and n_conv != n_eig and n_stalled < max(stall_patience, 1):
         print(f"  WARNING: did not converge in {max_iter} iterations. "
-              f"Best: {n_conv}/{n_eig}")
+              f"Best: {n_conv}/{n_eig} after {n_matvec} matvecs "
+              f"(smallest max-residual reached: {best_res:.2e}).")
     return eigenvalues, X
