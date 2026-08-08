@@ -53,6 +53,7 @@ _SVC_TESTS = _ROOT / "services" / "symmetry_maps" / "tests"
 _STAR_TABLES = _SVC_TESTS / "data" / "star_tables_e9340d1.json"
 _BSE_IO = _ROOT / "src" / "bse" / "bse_io.py"
 _VQ_INTERP = _ROOT / "src" / "bse" / "vq_interp.py"
+_TAGGED_ARRAYS = _ROOT / "src" / "file_io" / "tagged_arrays.py"
 
 _FFT = np.array([12, 12, 12], dtype=np.int64)
 _SEEDS_12 = ((0, 0, 0), (4, 5, 0), (2, 2, 6), (9, 7, 6),
@@ -531,24 +532,90 @@ def test_the_w0_ready_guard_shape_is_untouched():
         f"of them test W0_ready")
 
 
-def test_the_probe_has_one_implementation():
-    """``is_q_wedge`` is the only place the tree asks the q-storage question.
+def test_the_probe_has_exactly_two_named_callers():
+    """The q-storage question is asked in TWO places, and both are named.
 
-    Two implementations of "is this a q_irr file" is how a reader ends up
-    disagreeing with the format about what it is holding — and the
-    disagreement would be silent, because both answers are the string
-    ``"full"`` most of the time.
+    There is one PROBE — ``symmetry_maps.dataset_q_storage`` — and there are
+    two readers that must ask it, in two layers that cannot import each
+    other: the BSE reader (inside ``bse_io.is_q_wedge``) and the GW restart
+    reader (inside ``file_io.tagged_arrays._refuse_a_q_wedge``).  ``file_io``
+    calls the service door directly because importing ``bse`` from
+    ``file_io`` is uphill and the layering ratchet forbids it.
+
+    THIS CELL USED TO REQUIRE EXACTLY ONE CALLER, and it was right to until
+    2026-08-08: two implementations of "is this a q_irr file" is how a reader
+    ends up disagreeing with the format about what it is holding, silently,
+    because both answers are ``"full"`` most of the time.  What the landing
+    census showed is that the danger is not a second CALLER — it is a second
+    ANSWER.  The GW reader asking nothing at all was the worse failure: it
+    took a wedge, said nothing, and died 200 lines later in jax's ufunc
+    machinery on a shape mismatch that named neither the file nor the deck
+    key.  So the rule becomes an allowlist rather than a count: these two
+    call it, a third must justify itself here first.
     """
-    calls = []
-    for path in (_BSE_IO, _VQ_INTERP):
+    _EXPECTED = {_BSE_IO.name: "is_q_wedge",
+                 _TAGGED_ARRAYS.name: "_refuse_a_q_wedge"}
+    calls = {}
+    for path in (_BSE_IO, _VQ_INTERP, _TAGGED_ARRAYS):
         for node in ast.walk(ast.parse(path.read_text())):
             if (isinstance(node, ast.Call)
                     and getattr(node.func, "id", None) == "dataset_q_storage"):
-                calls.append(path.name)
-    assert calls == [_BSE_IO.name], (
-        f"dataset_q_storage must be called exactly once in the whole BSE "
-        f"reader surface (inside is_q_wedge); found {calls}")
-    fn = next(n for n in ast.walk(ast.parse(_BSE_IO.read_text()))
-              if isinstance(n, ast.FunctionDef) and n.name == "is_q_wedge")
-    assert "dataset_q_storage" in ast.unparse(fn), (
-        "the one call moved out of is_q_wedge")
+                calls.setdefault(path.name, 0)
+                calls[path.name] += 1
+    assert calls == {k: 1 for k in _EXPECTED}, (
+        f"dataset_q_storage must be called exactly once in each of "
+        f"{sorted(_EXPECTED)} and nowhere else on this surface; found "
+        f"{calls}")
+    for path, owner in ((_BSE_IO, _EXPECTED[_BSE_IO.name]),
+                        (_TAGGED_ARRAYS, _EXPECTED[_TAGGED_ARRAYS.name])):
+        fn = next(n for n in ast.walk(ast.parse(path.read_text()))
+                  if isinstance(n, ast.FunctionDef) and n.name == owner)
+        assert "dataset_q_storage" in ast.unparse(fn), (
+            f"the one call in {path.name} moved out of {owner}")
+
+
+def test_the_gw_restart_reader_refuses_a_wedge_and_names_the_way_out(
+        trs_arm, tmp_path):
+    """RED TWIN of the hardening: the GW reader must REFUSE, not compute.
+
+    The failure this replaces was `TypeError: sub got incompatible shapes
+    for broadcasting: (9, 399, 399), (5, 399, 399)` raised inside jax's
+    ufunc dispatch from ``gw/cohsex_sigma.py``'s ``W_q - V_q`` — a
+    traceback that names a subtraction and no part of the actual problem.
+    Worse, it appeared only because the two extents disagreed; the wedge was
+    never actually detected.
+
+    So the assertion is on the MESSAGE, not merely on the raising: it must
+    say wedge, and it must carry both ways out (the deck key and the serial
+    path), because an operator who hits this is holding a file they cannot
+    otherwise account for.
+    """
+    from file_io.tagged_arrays import _refuse_a_q_wedge
+
+    path = str(tmp_path / "wedge.h5")
+    trs_arm.write_wedge(path)
+    with h5py.File(path, "r") as f:
+        with pytest.raises(ValueError) as exc:
+            _refuse_a_q_wedge(f, path)
+    msg = str(exc.value)
+    assert "wedge" in msg.lower()
+    assert "restart_q_storage=full" in msg
+    assert "serial" in msg.lower() or "bse_io" in msg
+    assert "W0_qmunu" in msg or "V_qmunu" in msg
+
+
+def test_the_gw_restart_reader_is_silent_on_every_file_that_exists_today(
+        trs_arm, tmp_path):
+    """The other half: a full-BZ or legacy no-attr file passes untouched.
+
+    ``_refuse_a_q_wedge`` runs on EVERY restart read, so a false positive
+    here would refuse every archived run in the tree.  A file with no
+    q-storage attrs at all — which is what every restart written before this
+    format existed looks like — must read as ``full`` and say nothing.
+    """
+    from file_io.tagged_arrays import _refuse_a_q_wedge
+
+    path = str(tmp_path / "legacy.h5")
+    trs_arm.write_legacy_full(path)
+    with h5py.File(path, "r") as f:
+        _refuse_a_q_wedge(f, path)          # must not raise

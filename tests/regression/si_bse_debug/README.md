@@ -227,9 +227,19 @@ other and got 0.000000 meV with bit-identical tensors on the serial path.
 What it costs is the 4.155× on the file that the wedge would have bought
 here, which is a size, not an answer.
 
+**THE DEFAULT NOW PROTECTS THIS DECK TOO, and the pin stays anyway.**  The
+landing census found the same hazard on `gnppm_debug` and in the GW restart
+path as well as the BSE one, so `restart_q_storage` was restored to its
+designed default of `full` and the wedge became opt-in per deck — which
+means this deck would keep full-BZ storage now even with the line deleted.
+The line stays because it records this deck's INTENT rather than its luck: a
+future operator who sets `auto` here, or a future default that moves again,
+should have to read the paragraph above first.  Belt and braces, and the
+braces are the ones with the argument written on them.
+
 This is the conservative and reversible half of a decision that has a real
-fix on the other side of it — teaching the sharded reader to gather before
-it unfolds, which is registered in `tests/KNOWN_FAILURES.md`.  Delete this
+fix on the other side of it — teaching both restart readers to gather before
+they unfold, which is registered in `tests/KNOWN_FAILURES.md`.  Delete this
 one deck line the day that lands.
 
 ### Reference provenance (the vcoul adoption pattern)

@@ -599,6 +599,55 @@ def _check_nspinor(nspinor: int, where: str) -> int:
     return ns
 
 
+def _refuse_a_q_wedge(f, filename):
+    """REFUSE a restart file whose V/W sit on the IBZ q wedge, BY NAME.
+
+    THE GW RESTART PATH DOES NOT UNFOLD, and until 2026-08-08 it did not say
+    so either — it did not ask the question at all.  A wedge file read here
+    came back with a q axis of ``n_q_ibz`` instead of ``n_q_full``, flowed
+    through ``gw_init``'s restart branch untouched, and met a ``W_q`` that
+    screening HAD unfolded at ``gw/cohsex_sigma.py``'s ``W_q - V_q``, where
+    it died as ``TypeError: sub got incompatible shapes for broadcasting:
+    (9, 399, 399), (5, 399, 399)``.  That traceback names jax's ufunc
+    machinery and a subtraction; it does not name the restart file, the deck
+    key that chose the format, or the way out.  And it only appeared at all
+    because the two shapes happened to disagree — a deck whose IBZ wedge
+    happened to have as many q's as the full BZ would have subtracted the
+    wrong blocks in silence.
+
+    So this asks, once, before any bytes move, and refuses with the fix in
+    the message.  It is deliberately NOT an unfold: teaching this reader to
+    gather-then-unfold is registered design work (the sharded reader has the
+    same gap, and ``bse_io._MunuSlabPlan``'s comment explains why a per-rank
+    hyperslab structurally cannot do it), and a refusal that names the
+    remedy is the honest state until that lands.
+
+    THE PROBE IS ``symmetry_maps.dataset_q_storage`` — the same one
+    ``bse_io.is_q_wedge`` wraps, called directly here because ``file_io``
+    must not import ``bse`` (that is uphill, and the layering ratchet says
+    so).  Two callers now, in two layers, and
+    ``test_restart_qirr_consumers.py::test_the_probe_has_one_implementation``
+    names both rather than letting a third appear unnoticed.
+    """
+    from symmetry_maps import dataset_q_storage
+    wedged = [name for name in ("V_qmunu", "W0_qmunu")
+              if name in f and dataset_q_storage(f[name]) == "ibz"]
+    if not wedged:
+        return
+    raise ValueError(
+        f"Restart file {filename}: {', '.join(wedged)} "
+        f"{'is' if len(wedged) == 1 else 'are'} stored on the IBZ q WEDGE "
+        f"(restart_q_storage=auto or =ibz wrote it), and the GW restart "
+        f"reader does not unfold — it would hand a wedge-shaped V_q to a "
+        f"full-BZ W_q and subtract mismatched q blocks.\n"
+        f"  Re-run the GW leg with restart_q_storage=full (the DEFAULT; the "
+        f"wedge is opt-in per deck), or read this file through the serial "
+        f"h5py path in bse_io, which unfolds.\n"
+        f"  Teaching the restart readers to gather-then-unfold is registered "
+        f"design work; until it lands, a wedge restart file is for runs that "
+        f"discard the artifact, not for runs that read it back here.")
+
+
 def read_restart_state_from_h5(filename, mesh_xy):
     """Read canonical restart state as PER-RANK TILES (restart format v2).
 
@@ -663,6 +712,10 @@ def read_restart_state_from_h5(filename, mesh_xy):
             raise ValueError(
                 f"Restart file {filename} is missing canonical psi_full_y "
                 "dataset. Regenerate restart tensors with current gw_jax.")
+        # BEFORE ANY BYTES MOVE.  A wedge file is refused here rather than
+        # ~200 lines and one SlabIO collective later at a shape mismatch
+        # nobody can attribute to a deck key.
+        _refuse_a_q_wedge(f, filename)
         shapes = {k: tuple(int(s) for s in f[k].shape)
                   for k in ("V_qmunu", "S_qmunu", "V0_noG0_munu",
                             "psi_full_y", "psi_full_y_transverse")
