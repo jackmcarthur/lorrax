@@ -1,0 +1,80 @@
+{
+  "backend": "cpu",
+  "cpu_count": 6,
+  "devices": 4,
+  "emulated": true,
+  "groups": [
+    "unfold"
+  ],
+  "jax_version": "0.9.1",
+  "jobid": null,
+  "load_average": [
+    2.98,
+    4.42,
+    5.45
+  ],
+  "machine": "wsl",
+  "mesh": "2x2",
+  "nodes": 1,
+  "numpy_version": "2.4.3",
+  "processes": 1,
+  "recorded": "2026-08-07T12:13:14-0700",
+  "reps": 25,
+  "rows": [
+    {
+      "backend": "jax",
+      "compile_seconds": 0.0008732089991099201,
+      "dtype": "complex128",
+      "emulated": true,
+      "geometry": "lb12",
+      "mesh": "2x2",
+      "n_q_ibz": 3,
+      "op": "unfold_v_q",
+      "operand_mib": 0.006591796875,
+      "out_mib": 0.010986328125,
+      "out_shape": [
+        5,
+        12,
+        12
+      ],
+      "reps": 25,
+      "seconds": 0.00036052199902769644,
+      "seconds_max": 0.0008624000001873355,
+      "seconds_min": 0.00028861499959020875,
+      "shape": [
+        3,
+        12,
+        12
+      ]
+    },
+    {
+      "backend": "jax",
+      "compile_seconds": 0.01651173099890002,
+      "dtype": "complex128",
+      "emulated": true,
+      "geometry": "orbit120",
+      "mesh": "2x2",
+      "n_q_ibz": 3,
+      "op": "unfold_v_q",
+      "operand_mib": 0.6591796875,
+      "out_mib": 1.0986328125,
+      "out_shape": [
+        5,
+        120,
+        120
+      ],
+      "reps": 25,
+      "seconds": 0.0008530119994247798,
+      "seconds_max": 0.006432934000258683,
+      "seconds_min": 0.0005905230009375373,
+      "shape": [
+        3,
+        120,
+        120
+      ]
+    }
+  ],
+  "tag": "wsl2x2",
+  "warmup": 5,
+  "xla_flags": "--xla_force_host_platform_device_count=4"
+}

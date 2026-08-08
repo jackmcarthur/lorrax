@@ -80,7 +80,6 @@ try:
     from .normalize import normalize_dataclass
     from .load_upf import load_upf
     from ..io import WFNReader
-    from ..common import symmetry_maps
     from ..common.wfn_transforms import read_Gvecs_to_devices
     from ..common import Meta
 except ImportError:
@@ -94,7 +93,6 @@ except ImportError:
                                      # with the owner's workspace fix)
     _services.ensure_on_path()
     from wfn_loader import WfnLoader
-    from common import symmetry_maps
     from common.wfn_transforms import read_Gvecs_to_devices
     from common import Meta
 from psp.radial.build_projectors_qe import (
@@ -107,6 +105,20 @@ import h5py
 import psp.vnl_ops as vnl_ops
 
 import common.timing as timing
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+# ONE spelling.  This module used to import ``symmetry_maps`` TWICE — once
+# as ``from ..common import`` in the try arm above, once as ``from common
+# import`` in its fallback — a relative/absolute pair for "``python -m``
+# or direct script".  The relative arm never ran: ``from ..io import
+# WFNReader`` on the line above it names a package that does not exist, so
+# the try arm raises on every interpreter and the fallback is the only
+# live code.  The service door is reached by ONE absolute import, and a
+# dual spelling of it would be two module objects waiting to happen.
+import symmetry_maps                                            # noqa: E402
 
 
 def report_devices(print_fn=print) -> None:
@@ -276,7 +288,7 @@ def valence_density_from_kpoint(
 # that residual, while every other term agrees to round-off.
 #
 # The permutation table and the star average are BOTH taken from the
-# existing implementations (``centroid.orbit_syms.compute_rgrid_sym_perm``,
+# existing implementations (``symmetry_maps.compute_rgrid_sym_perm``,
 # ``gw.qsgw_density.symmetrise_density``, already used by the QSGW density
 # loop and by ζ's full-BZ unfold) so there is one grid-rotation convention
 # in the code base, not two.
@@ -292,7 +304,8 @@ _RHO_SYM_PERM_CACHE: dict[tuple, "np.ndarray | None"] = {}
 #: cleaned up — either the k-set was reduced (legitimate, and the
 #: projection is then mandatory rather than cosmetic) or the file's
 #: symmetry block does not describe these wavefunctions (not legitimate,
-#: and ``common.density_symmetry_check`` will have said so at load time).
+#: and ``symmetry_maps.check_density_symmetries`` will have said so at
+#: load time).
 RHO_SYM_WARN = 1.0e-3
 
 
@@ -328,7 +341,9 @@ def _rho_sym_perm(wfn, fft_grid: tuple[int, int, int]):
     if key in _RHO_SYM_PERM_CACHE:
         return _RHO_SYM_PERM_CACHE[key]
 
-    from centroid.orbit_syms import compute_rgrid_sym_perm
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import compute_rgrid_sym_perm
     try:
         perm = compute_rgrid_sym_perm(mats, taus, fft_grid, validate=True)
     except Exception as exc:
@@ -384,8 +399,9 @@ def symmetrize_valence_density(rho_r, wfn, *, print_fn=None):
             f"Expected when rho was built from a REDUCED k-set (the "
             f"projection is then what makes it the crystal's density at "
             f"all); otherwise the file's symmetry block does not describe "
-            f"these wavefunctions, and common.density_symmetry_check will "
-            f"have said so at load time.",
+            f"these wavefunctions, and "
+            f"symmetry_maps.check_density_symmetries will have said so at "
+            f"load time.",
             RuntimeWarning)
     return rho_sym
 

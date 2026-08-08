@@ -29,6 +29,21 @@ they are index takes plus a conj, so any difference means one of them is
 doing arithmetic the other is not.
 
 Env: STAR_NB, STAR_DECK (an input dir containing WFN.h5 + deck.in).
+
+SUPERSEDED 2026-08-07.  All four checks were ported to
+``services/symmetry_maps/tests`` — checks 1-3 to
+``test_symmetry_maps_star_contract.py`` (on hand-typed
+production-confirmed tables, with the anti-tautology assertion this file
+never had) and check 4 to ``check_star_helpers_keep_the_sharding`` /
+``check_spread_rel_is_one_replicated_scalar`` in
+``test_symmetry_maps_multiproc.py``, which run both emulated (2x2) and
+under real ``srun -n 4``.  Nothing here is collected by pytest
+(``tests/multi_device/`` is srun-driven), so this file is now a second
+copy with no gate behind it.  It is left in place ONLY because deletion
+is on the phase-wide cleanup checklist that retires the three
+``common``/``centroid`` forwarding shims it still imports through
+(``from common.symmetry_maps import ...``, :48) — the file retires with
+them, in the owner's commit, not in this branch.
 """
 import os
 import sys

@@ -883,17 +883,53 @@ _L2_UPWARD_EXCEPTIONS = {
     # Either split ``SternheimerOp``'s operator out, or move the file to
     # ``psp/``.  Physics decision.  Numbered request.
     ("solvers.sternheimer_solve", "psp.dft_operators"): 1,
-    # ``from .orbit_syms import ...``, lazy, inside the orbit-aware branch.
-    # k-means itself is pure clustering under a metric tensor — genuinely L2
-    # — but the orbit-aware variant folds a real-space point group into the
-    # assignment step, and THAT is physics.  Injecting the orbit map as a
-    # parameter is the fix and it is a signature change.  Numbered request.
-    ("centroid.kmeans_isdf", "centroid.orbit_syms"): 1,
 }
+# R3 -- ``centroid.kmeans_isdf`` -> ``centroid.orbit_syms``, 1 lazy site --
+# was the second entry.  DELETED, not moved: ``centroid/orbit_syms.py`` left
+# ``src/`` for ``services/symmetry_maps/``, and ``kmeans_isdf.py:583`` now
+# takes ``canonicalize_orbit`` from the ``symmetry_maps`` DOOR, where §8's
+# rule 6 governs it.  See :func:`upward_edges` for why an edge into a
+# service door is not ranked, and ``docs/architecture/layers.md`` §5.
+# The prescribed fix (inject the orbit map; a signature change) is
+# unaffected and stays registered -- extraction changed the module's
+# address, not its argument list.
 
 
 def upward_edges(sources):
-    """Every import that goes UP a level. ``[(from_layer, to_layer, mod, target, line, lazy)]``."""
+    """Every import that goes UP a level. ``[(from_layer, to_layer, mod, target, line, lazy)]``.
+
+    A SERVICE DOOR IS NOT RANKED, and that carve-out is measured, not
+    assumed.  Levels order modules within ONE distribution unit; a service
+    under ``services/`` is a separate installable package reached through a
+    declared door, and §8's rule 6 is what governs an edge into it.
+    Ranking one anyway forces a false choice, which ``symmetry_maps`` is
+    the first service to expose because it is the first that is not
+    substrate.  MEASURED at the extraction commit, both ways::
+
+        symmetry_maps at the L1 default (honest: it is crystal physics)
+            L2->L1 centroid.kmeans_isdf:583 (lazy) imports symmetry_maps
+
+        symmetry_maps forced into _L3_PACKAGES (the distrib_la shape)
+            L3->L1 symmetry_maps.density_symmetry_check:658 (lazy)
+                   imports psp.get_DFT_mtxels
+            L3->L1 symmetry_maps.density_symmetry_check:749 (lazy)
+                   imports psp.get_DFT_mtxels
+
+    Two exceptions to choose between, both describing the same fact from
+    opposite ends -- and the second one buys its green by calling a
+    package full of Brillouin zones "substrate".  The package stays at the
+    L1 default, which is what it is, and the edge INTO it stops being a
+    level question.
+
+    NOTHING IS LEFT UNWATCHED BY THIS.  Reaching past a door still counts
+    (rule 6, and the shims' budgets below are the checklist).  A service
+    reaching back into ``src/`` still ranks -- the psp edges above are
+    real, they are ``symmetry_maps``'s one remaining lorrax dependency,
+    and the instrument that owns them is the mandatory import-isolation
+    test (import the service with lorrax off ``sys.path``) plus the
+    ``dependencies`` list in its ``pyproject.toml``, neither of which a
+    level assignment could have replaced.
+    """
     mods = set(sources)
     pkgs = packages_in(sources)
     out = []
@@ -911,6 +947,8 @@ def upward_edges(sources):
                     break
             if resolved is None or resolved == mod:
                 continue
+            if resolved in _SERVICE_DOORS and mod.split(".")[0] != resolved:
+                continue                      # rule 6's business; see above
             there = layer_of(resolved)
             if there == "X" or _RANK[there] < _RANK[here]:
                 out.append((here, there, mod, resolved, line, lazy))
@@ -966,6 +1004,42 @@ def test_the_upward_edge_scan_can_fail(sources):
     assert ("common.collectives", "gw.gw_config") in edges, (
         f"the upward-edge scan does not see an L3 module importing an L1 "
         f"one from inside a function: {edges}")
+
+
+def test_the_service_door_carve_out_is_narrow(sources):
+    """RED TWIN for the carve-out in :func:`upward_edges`.
+
+    A skip is a hole until something proves where its edges are.  Three
+    facts, on the REAL modules the extraction created:
+
+    1. ``centroid.kmeans_isdf`` (L2) importing the ``symmetry_maps`` DOOR
+       (L1 by the default, and correctly so) is not an upward edge.
+    2. The SUBMODULE spelling of the same import IS still seen — by rule 6,
+       which is the rule that owns it.  So the carve-out forgives reaching
+       the door, never reaching past it.
+    3. An in-tree L2->L1 edge in the same file is still flagged, so the
+       carve-out is a service-door exemption and not a kmeans_isdf one.
+    """
+    assert layer_of("symmetry_maps") == "L1"       # physics, not substrate
+    assert layer_of("centroid.kmeans_isdf") == "L2"
+    assert "symmetry_maps" in _SERVICE_DOORS
+
+    live = [(m, t) for _, _, m, t, _, _ in upward_edges(sources)]
+    assert ("centroid.kmeans_isdf", "symmetry_maps") not in live
+
+    past = scan_service_door(
+        "def f():\n    from symmetry_maps.orbit_syms import "
+        "canonicalize_orbit\n",
+        "centroid.kmeans_isdf", "symmetry_maps",
+        service_submodules(sources, "symmetry_maps"),
+        door_names(sources, "symmetry_maps"))
+    assert past == [("symmetry_maps.orbit_syms", 2)], past
+
+    fake = dict(sources)
+    fake["centroid.kmeans_isdf"] = (
+        "def f():\n    from psp.dft_operators import apply_H_k_from_G\n")
+    edges = [(m, t) for _, _, m, t, _, _ in upward_edges(fake)]
+    assert ("centroid.kmeans_isdf", "psp.dft_operators") in edges, edges
 
 
 def test_the_upward_edge_scan_sees_package_relative_imports(sources):
@@ -1196,7 +1270,8 @@ def test_every_package_in_the_map_exists(sources):
 #: ``test_the_service_door_exceptions_are_all_still_needed`` would fail on
 #: an entry claiming otherwise.
 _SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
-                  "wfn_loader": "wfn_loader", "zeta_loader": "zeta_loader"}
+                  "wfn_loader": "wfn_loader", "zeta_loader": "zeta_loader",
+                  "symmetry_maps": "symmetry_maps"}
 
 #: ``src/`` module -> how many past-the-door edges it is allowed.  These are
 #: the transitional re-export shims.
@@ -1215,10 +1290,29 @@ _SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
 #: would mean lorrax importing ``distrib_la._cusolvermp`` directly, i.e.
 #: trading three counted exceptions for one uncounted violation.  It goes
 #: when gemm is extracted; until then the number is 7 and it is honest.
+#:
+#: 7 -> 10 AT THE symmetry_maps EXTRACTION.  Three forwarding shims, one
+#: past-the-door edge each: ``from symmetry_maps import <submodule> as
+#: _impl``, which is what makes their PEP 562 ``__getattr__`` able to
+#: forward the PRIVATE names (``_I_SIGMA_Y``, ``_star_conj_flags``,
+#: ``TOL_TRS``, ``_CACHE``, …) that tests, ``misc/`` and uncollected gates
+#: still take from the old paths.  Their public re-exports come through the
+#: door and are not counted, because they are not violations.
+#:
+#: THE GATE, NAMED: all three are deleted by the phase-wide cleanup commit
+#: after all four wave-1 branches land (WAVE1_BRIEF ruling 2).  Unlike
+#: distrib_la, whose own replumb deleted its shims, wave-1 services are
+#: cross-consumed by files on sibling branches, so the deletion is one
+#: commit after the owner merges all four.  Until then these three budgets
+#: are 1 apiece and cannot grow: a shim's job is to forward, not to
+#: acquire reasons to exist.
 _SERVICE_DOOR_EXCEPTIONS = {
     "ffi.cusolvermp.batched": 5,
     "ffi.cusolvermp.eigh":    1,
     "ffi.cusolvermp.context": 1,
+    "common.symmetry_maps":         1,
+    "common.density_symmetry_check": 1,
+    "centroid.orbit_syms":          1,
 }
 
 

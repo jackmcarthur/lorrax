@@ -63,7 +63,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
-from common import Meta, RYD_TO_EV, symmetry_maps
+from common import Meta, RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import ComputeMode, LorraxConfig, QPSolver
@@ -93,6 +93,12 @@ from .gw_output import (
 	write_qp_wfn_oneshot,
 	write_results,
 )
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+import symmetry_maps                                            # noqa: E402
 
 
 def _setup_runtime(config, mesh_xy, *, print_fn=print) -> None:

@@ -48,7 +48,7 @@ ENV_HELPERS = frozenset({
     "_env_bool",                          # isdf.core (historical; alias now)
     "_env_falsy",                         # runtime.__init__ (two-valued)
     "_env_flag",                          # file_io._slab_io_mpi_host
-    "_env_int",                           # common.density_symmetry_check
+    "_env_int",                          # symmetry_maps.density_symmetry_check
     "_env_override_raw",                  # isdf.core (deprecated env twins)
     "_deprecated_env_float",              # isdf.core (deprecated env twins)
 })

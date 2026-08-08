@@ -1,0 +1,370 @@
+{
+  "backend": "cpu",
+  "cpu_count": 6,
+  "devices": 4,
+  "emulated": false,
+  "groups": [
+    "construct",
+    "star",
+    "unfold"
+  ],
+  "jax_version": "0.9.1",
+  "jobid": null,
+  "load_average": [
+    2.98,
+    4.42,
+    5.45
+  ],
+  "machine": "wsl",
+  "mesh": "1x1",
+  "nodes": 1,
+  "numpy_version": "2.4.3",
+  "processes": 1,
+  "recorded": "2026-08-07T12:13:12-0700",
+  "reps": 25,
+  "rows": [
+    {
+      "backend": "numpy",
+      "compile_seconds": 0.001720818998364848,
+      "deck": "bispinor_debug",
+      "dtype": "int32/float64",
+      "mesh": "1x1",
+      "op": "SymMaps.__init__",
+      "reps": 25,
+      "seconds": 0.0015268850002030376,
+      "seconds_max": 0.0023675169995840406,
+      "seconds_min": 0.001387394000630593,
+      "shape": [
+        9,
+        9,
+        2
+      ],
+      "shape_names": [
+        "nk_full",
+        "nk_irr",
+        "ntran"
+      ]
+    },
+    {
+      "backend": "numpy",
+      "compile_seconds": 0.002089265000904561,
+      "deck": "cohsex_debug",
+      "dtype": "int32/float64",
+      "mesh": "1x1",
+      "op": "SymMaps.__init__",
+      "reps": 25,
+      "seconds": 0.001652549999562325,
+      "seconds_max": 0.0022098020017438103,
+      "seconds_min": 0.0014986870010034181,
+      "shape": [
+        9,
+        4,
+        12
+      ],
+      "shape_names": [
+        "nk_full",
+        "nk_irr",
+        "ntran"
+      ]
+    },
+    {
+      "backend": "numpy",
+      "compile_seconds": 0.001468459999159677,
+      "deck": "gnppm_debug",
+      "dtype": "int32/float64",
+      "mesh": "1x1",
+      "op": "SymMaps.__init__",
+      "reps": 25,
+      "seconds": 0.0014461139999184525,
+      "seconds_max": 0.0018306380006833933,
+      "seconds_min": 0.001367181001114659,
+      "shape": [
+        9,
+        9,
+        2
+      ],
+      "shape_names": [
+        "nk_full",
+        "nk_irr",
+        "ntran"
+      ]
+    },
+    {
+      "backend": "numpy",
+      "compile_seconds": 0.05247183100073016,
+      "deck": "si_cohsex_debug",
+      "dtype": "int32/float64",
+      "mesh": "1x1",
+      "op": "SymMaps.__init__",
+      "reps": 25,
+      "seconds": 0.050619953999557765,
+      "seconds_max": 0.058128971000769525,
+      "seconds_min": 0.04772235400014324,
+      "shape": [
+        64,
+        8,
+        48
+      ],
+      "shape_names": [
+        "nk_full",
+        "nk_irr",
+        "ntran"
+      ]
+    },
+    {
+      "backend": "numpy",
+      "compile_seconds": 0.0002477709986123955,
+      "deck": "si_cohsex_debug",
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "n_sym_spatial": 48,
+      "nk_full": 64,
+      "nk_irr": 8,
+      "op": "star_select",
+      "operand_mib": 3.515625,
+      "out_mib": 0.439453125,
+      "out_shape": [
+        8,
+        60,
+        60
+      ],
+      "reps": 25,
+      "seconds": 1.3683998986380175e-05,
+      "seconds_max": 0.000226968999413657,
+      "seconds_min": 1.2196998795843683e-05,
+      "shape": [
+        64,
+        60,
+        60
+      ]
+    },
+    {
+      "backend": "numpy",
+      "compile_seconds": 0.0033403380002710037,
+      "deck": "si_cohsex_debug",
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "n_sym_spatial": 48,
+      "nk_full": 64,
+      "nk_irr": 8,
+      "op": "star_broadcast",
+      "operand_mib": 0.439453125,
+      "out_mib": 3.515625,
+      "out_shape": [
+        64,
+        60,
+        60
+      ],
+      "reps": 25,
+      "seconds": 0.00012822700045944657,
+      "seconds_max": 0.03434765000019979,
+      "seconds_min": 0.00010821999967447482,
+      "shape": [
+        8,
+        60,
+        60
+      ]
+    },
+    {
+      "backend": "numpy",
+      "compile_seconds": 0.005965153999568429,
+      "deck": "si_cohsex_debug",
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "n_sym_spatial": 48,
+      "nk_full": 64,
+      "nk_irr": 8,
+      "op": "star_spread",
+      "operand_mib": 3.515625,
+      "out_mib": 1.52587890625e-05,
+      "out_shape": [],
+      "reps": 25,
+      "seconds": 0.0055692810001346515,
+      "seconds_max": 0.022404339000786422,
+      "seconds_min": 0.004998661001081928,
+      "shape": [
+        64,
+        60,
+        60
+      ]
+    },
+    {
+      "backend": "numpy",
+      "compile_seconds": 0.005029441999795381,
+      "deck": "si_cohsex_debug",
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "n_sym_spatial": 48,
+      "nk_full": 64,
+      "nk_irr": 8,
+      "op": "KStarMap.spread_rel",
+      "operand_mib": 3.515625,
+      "out_mib": 1.52587890625e-05,
+      "out_shape": [],
+      "reps": 25,
+      "seconds": 0.0050552949996927055,
+      "seconds_max": 0.02048029899924586,
+      "seconds_min": 0.004364803999123978,
+      "shape": [
+        64,
+        60,
+        60
+      ]
+    },
+    {
+      "backend": "jax",
+      "compile_seconds": 0.0031998859994928353,
+      "deck": "si_cohsex_debug",
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "n_sym_spatial": 48,
+      "nk_full": 64,
+      "nk_irr": 8,
+      "op": "star_select",
+      "operand_mib": 3.515625,
+      "out_mib": 0.439453125,
+      "out_shape": [
+        8,
+        60,
+        60
+      ],
+      "reps": 25,
+      "seconds": 4.8462999984622e-05,
+      "seconds_max": 0.003258118998928694,
+      "seconds_min": 2.7050999051425606e-05,
+      "shape": [
+        64,
+        60,
+        60
+      ]
+    },
+    {
+      "backend": "jax",
+      "compile_seconds": 0.013546135000069626,
+      "deck": "si_cohsex_debug",
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "n_sym_spatial": 48,
+      "nk_full": 64,
+      "nk_irr": 8,
+      "op": "star_broadcast",
+      "operand_mib": 0.439453125,
+      "out_mib": 3.515625,
+      "out_shape": [
+        64,
+        60,
+        60
+      ],
+      "reps": 25,
+      "seconds": 0.000602299998718081,
+      "seconds_max": 0.009085876999961329,
+      "seconds_min": 0.00014816399925621226,
+      "shape": [
+        8,
+        60,
+        60
+      ]
+    },
+    {
+      "backend": "jax",
+      "compile_seconds": 0.014259215000492986,
+      "deck": "si_cohsex_debug",
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "n_sym_spatial": 48,
+      "nk_full": 64,
+      "nk_irr": 8,
+      "op": "star_spread",
+      "operand_mib": 3.515625,
+      "out_mib": 1.52587890625e-05,
+      "out_shape": [],
+      "reps": 25,
+      "seconds": 0.0008247890000347979,
+      "seconds_max": 0.0012326339983701473,
+      "seconds_min": 0.0007220049992611166,
+      "shape": [
+        64,
+        60,
+        60
+      ]
+    },
+    {
+      "backend": "jax",
+      "compile_seconds": 0.0007201040007203119,
+      "deck": "si_cohsex_debug",
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "n_sym_spatial": 48,
+      "nk_full": 64,
+      "nk_irr": 8,
+      "op": "KStarMap.spread_rel",
+      "operand_mib": 3.515625,
+      "out_mib": 1.52587890625e-05,
+      "out_shape": [],
+      "reps": 25,
+      "seconds": 0.0008367899990844307,
+      "seconds_max": 0.001286613998672692,
+      "seconds_min": 0.0007145680010580691,
+      "shape": [
+        64,
+        60,
+        60
+      ]
+    },
+    {
+      "backend": "jax",
+      "compile_seconds": 0.00015620100020896643,
+      "dtype": "complex128",
+      "emulated": false,
+      "geometry": "lb12",
+      "mesh": "1x1",
+      "n_q_ibz": 3,
+      "op": "unfold_v_q",
+      "operand_mib": 0.006591796875,
+      "out_mib": 0.010986328125,
+      "out_shape": [
+        5,
+        12,
+        12
+      ],
+      "reps": 25,
+      "seconds": 1.065900141838938e-05,
+      "seconds_max": 1.302499913435895e-05,
+      "seconds_min": 1.0073001249111257e-05,
+      "shape": [
+        3,
+        12,
+        12
+      ]
+    },
+    {
+      "backend": "jax",
+      "compile_seconds": 0.00029846200050087646,
+      "dtype": "complex128",
+      "emulated": false,
+      "geometry": "orbit120",
+      "mesh": "1x1",
+      "n_q_ibz": 3,
+      "op": "unfold_v_q",
+      "operand_mib": 0.6591796875,
+      "out_mib": 1.0986328125,
+      "out_shape": [
+        5,
+        120,
+        120
+      ],
+      "reps": 25,
+      "seconds": 0.000187047999133938,
+      "seconds_max": 0.00026650400104699656,
+      "seconds_min": 0.000161137999384664,
+      "shape": [
+        3,
+        120,
+        120
+      ]
+    }
+  ],
+  "tag": "wsl1x1",
+  "warmup": 5,
+  "xla_flags": "--xla_force_host_platform_device_count=4"
+}

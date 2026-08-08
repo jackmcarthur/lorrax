@@ -1761,7 +1761,7 @@ def apply_eqp_corrections(
         from ffi import _services
         _services.ensure_on_path()
         from wfn_loader import WfnLoader
-        from common.symmetry_maps import SymMaps
+        from symmetry_maps import SymMaps
 
         wfn_path = _parse_wfn_path(input_file)
         wfn = WfnLoader(wfn_path)

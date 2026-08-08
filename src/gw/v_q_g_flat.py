@@ -24,7 +24,7 @@ Math:
     V_q[μ, ν] = Σ_G  conj(ζ̃_{q,μ}(G)) · v(q+G) · ζ̃_{q,ν}(G)
     g0_μ(q)   = ζ̃_{q,μ}(G=0)               # = ζ̃[μ, 0] by sphere convention
 
-IBZ unfold runs post-loop via ``common.symmetry_maps.unfold_v_q`` (V_q)
+IBZ unfold runs post-loop via ``symmetry_maps.unfold_v_q`` (V_q)
 and the local :func:`_unfold_g0_ibz_to_full` (g0); the V_q output
 sharding ``P(None, 'x', 'y')`` matches.
 """
@@ -186,7 +186,9 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
     # from deep inside the V_q cascade rather than doing what they say.
     _force_full_bz = env_bool('LORRAX_FORCE_FULL_BZ', False)
     if sym is not None and centroid_indices is not None and not _force_full_bz:
-        from centroid.orbit_syms import compute_centroid_sym_perm
+        from ffi import _services
+        _services.ensure_on_path()
+        from symmetry_maps import compute_centroid_sym_perm
         n_tran = int(np.asarray(sym.sym_matrices).shape[0])
         cent_idx = np.asarray(centroid_indices, dtype=np.int32)
         try:
@@ -328,7 +330,9 @@ def _compute_V_q_g_flat_one_tile(
             f"_compute_V_q_g_flat_one_tile[{timing_label}]: zeta_R "
             "layout must be 'G_flat'.")
 
-    from common.symmetry_maps import unfold_v_q
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import unfold_v_q
 
     # ---- IBZ list + per-tile v(q+G) -----------------------------------
     (_q_int, q_irr_frac,

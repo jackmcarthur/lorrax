@@ -862,7 +862,8 @@ def test_rotated_density_load_reduces_to_the_plain_load_at_U_identity():
     from ffi import _services
     _services.ensure_on_path()
     from wfn_loader import WfnLoader
-    from common import symmetry_maps, Meta
+    from common import Meta
+    import symmetry_maps
     from common.wfn_transforms import load_kpoint_fftbox_local
     from gw.kin_ion_io import _load_rotated_occ_fftbox
     wfn = WfnLoader(wfn_path)
@@ -906,7 +907,8 @@ def test_process_local_load_matches_the_legacy_wrapper():
     from ffi import _services
     _services.ensure_on_path()
     from wfn_loader import WfnLoader
-    from common import symmetry_maps, Meta
+    from common import Meta
+    import symmetry_maps
     from common.wfn_transforms import (load_kpoint_fftbox,
                                        load_kpoint_fftbox_local)
     wfn = WfnLoader(wfn_path)

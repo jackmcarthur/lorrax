@@ -448,6 +448,28 @@ def compare_to_bgw(output_file: Path, fixture: Path, labels=(
     average and a symmetry check — ``_star_spread`` is the worst per-band
     disagreement between members of one star, which an IBZ-representative
     comparison cannot see.
+
+    ``_star_spread`` IS NOT A SYMMETRY GATE, and must not be read as one.
+    It is a max-minus-min over the REAL DIAGONAL ``sigTOT`` values of a
+    star's members, so it is structurally blind to the entire time-reversal
+    CONJUGATION class: conjugating a Hermitian block leaves its real
+    diagonal EXACTLY intact.  That is not a theoretical gap.  27cc885
+    measured the wrong ``trs_reference`` at **183.61 eV** against an
+    independently computed V_H with "the DIAGONAL left exactly intact", so
+    the electron count, hermiticity, the spectrum, the eqp.dat V_H column
+    and every diagonal observable were unchanged — which is why nothing
+    caught it for a month.  REPRODUCED LIVE on the committed
+    ``cohsex_debug/sigma_mnk.h5``: conjugating one time-reversed star member
+    moves this metric by **EXACTLY 0.0** (1.2130460739135742 before and
+    after, on ``sigma_sx_kij_ev``) while the conjugation relation it broke
+    jumps five orders, 6.980e-04 -> 3.992e-01.
+
+    The metric STAYS — it is the right check for what it checks, agreement
+    with the BerkeleyGW anchor on the diagonal Sigma each code reports —
+    but the off-diagonal question is asked somewhere else, on the full
+    matrices where it is answerable: ``tests/test_star_offdiag_gate.py``,
+    which gates the TRS conj-pair relation on ``sigma_mnk.h5`` and carries
+    the corruption twin that pins the blindness stated here.
     """
     kfrac, bands, bgw = parse_bgw_hp_fixture(fixture)
     nb = bands.size

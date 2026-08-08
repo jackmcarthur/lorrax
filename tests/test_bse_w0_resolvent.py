@@ -18,7 +18,12 @@ from bse.bse_w_exact import (
     _build_rpa_resolvent, _resolve_wc_columns, _select_compare_cols,
     build_finite_q_data, _symmetry_reduced_q_list,
 )
-from common.symmetry_maps import kgrid_shift_map
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from symmetry_maps import kgrid_shift_map                        # noqa: E402
 
 
 @pytest.mark.gpu

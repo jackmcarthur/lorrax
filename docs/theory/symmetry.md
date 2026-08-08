@@ -1,6 +1,6 @@
 # LORRAX Symmetry Conventions and Procedures
 
-**Consolidates**: `reports/trs_sym_audit_2026-05-14/SYMMETRY_CONVENTIONS.md`, `reports/trs_sym_audit_2026-05-14/pr3_design.md`, the agent-scope notes under `reports/trs_sym_audit_2026-05-14/`, and the inline docstrings in `src/common/symmetry_maps.py`, `src/centroid/orbit_syms.py`, `src/file_io/mf_header.py`, `src/gw/v_q_g_flat.py`.
+**Consolidates**: `reports/trs_sym_audit_2026-05-14/SYMMETRY_CONVENTIONS.md`, `reports/trs_sym_audit_2026-05-14/pr3_design.md`, the agent-scope notes under `reports/trs_sym_audit_2026-05-14/`, and the inline docstrings in `services/symmetry_maps/src/symmetry_maps/` (`maps.py`, `orbit_syms.py`, `density_symmetry_check.py`), `src/file_io/mf_header.py`, `src/gw/v_q_g_flat.py`.
 
 **Status**: describes the convention that the current driver (`gw.gw_jax`) and the V_q g-flat path (`gw.v_q_g_flat`) actually use, as of 2026-05-15. The BGW r-action convention $r' = \mathrm{mtrx}^{-1} \cdot r + \tau$ is load-bearing; everything else in this document flows from it. Verified end-to-end against BGW reference Σ_X on the three production gates: MoS2 3×3 SOC (0.090 meV), CrI3 6×6 30 Ry SOC (0.076 meV), Si 4×4×4 SOC (0.002 meV — the canonical non-symmorphic gate). Reading order: §1 (BGW convention), §2 (`SymMaps` and the TRS-augmented table), §3 (ψ unfold), §4 (centroid permutation and L-wrap), §5 (V_q unfold), §6 (symmorphic failure modes), §7 (sym-vs-nosym recipe), §8 (verified gates), §9–§11 (file index, quick reference, reference tests).
 
@@ -45,7 +45,7 @@ where `ft` is QE's fractional translation. The BGW reader recovers $\tau_\text{f
 ftrans(:) = syms%tnp(:, isym) / 2.0d0 / PI_D
 ```
 
-LORRAX divides by $2\pi$ at every consumer: `SymMaps.validate_atomic_symmetries` (`symmetry_maps.py:788`), `compute_centroid_sym_perm` (`orbit_syms.py:344`), `build_real_space_syms` (`orbit_syms.py:57`). The `MfHeader.translations` field stores the raw BGW form; helpers that need $\tau_\text{frac}$ must apply the `/(2π)` themselves. `unfold_psi` is the one exception — see §3.1.
+LORRAX divides by $2\pi$ at every consumer: `SymMaps.validate_atomic_symmetries`, `compute_centroid_sym_perm` and `build_real_space_syms`. The `MfHeader.translations` field stores the raw BGW form; helpers that need $\tau_\text{frac}$ must apply the `/(2π)` themselves. `unfold_psi` is the one exception — see §3.1.
 
 ### 1.2 The Four Actions of `mtrx`
 
@@ -58,11 +58,11 @@ Let $S = \mathrm{mtrx}_s$ (= `sym_matrices[s]`) and $\boldsymbol{\tau} = \mathrm
 | Reciprocal forward (k, q, G) | $\mathbf q' = S \cdot \mathbf q$ | BGW's `matmul(syms%mtrx, k)`; LORRAX's `unfold_psi` G-rotation; reconstruction check on `irr_idx_q / sym_idx_q` (§2.3) |
 | Reciprocal inverse | $\mathbf q' = S^{-1} \cdot \mathbf q$ | Not used directly |
 
-The row-form equivalent (numpy's natural layout) is `r' = r @ U.T + τ` for U = $S^{-1}$. `orbit_images` (`src/centroid/orbit_syms.py:73-92`) uses this convention with $\mathtt{Rinv}$ pre-computed.
+The row-form equivalent (numpy's natural layout) is `r' = r @ U.T + τ` for U = $S^{-1}$. `orbit_images` (`symmetry_maps/orbit_syms.py`) uses this convention with $\mathtt{Rinv}$ pre-computed.
 
 ### 1.3 The Sign of τ in Forward vs Inverse
 
-Group theory pedantry that bit us repeatedly: in column form, the **forward** direct-space sym op acts on a real-space point as $g_s \cdot \mathbf r = S_s^{-1} \mathbf r + \boldsymbol{\tau}_s$, while the **inverse** op acts as $g_s^{-1} \cdot \mathbf r = S_s (\mathbf r - \boldsymbol{\tau}_s) = S_s \mathbf r - S_s \boldsymbol{\tau}_s$. Both are useful: `validate_atomic_symmetries` (`symmetry_maps.py:780`) uses the forward action with `rot = inv(mtrx)`; `compute_centroid_sym_perm` (`orbit_syms.py:351`) uses the inverse action `S·(r-τ)` because the user-spec V_q unfold formula (§5) is most naturally expressed via the source map under the inverse op.
+Group theory pedantry that bit us repeatedly: in column form, the **forward** direct-space sym op acts on a real-space point as $g_s \cdot \mathbf r = S_s^{-1} \mathbf r + \boldsymbol{\tau}_s$, while the **inverse** op acts as $g_s^{-1} \cdot \mathbf r = S_s (\mathbf r - \boldsymbol{\tau}_s) = S_s \mathbf r - S_s \boldsymbol{\tau}_s$. Both are useful: `validate_atomic_symmetries` uses the forward action with `rot = inv(mtrx)`; `compute_centroid_sym_perm` uses the inverse action `S·(r-τ)` because the user-spec V_q unfold formula (§5) is most naturally expressed via the source map under the inverse op.
 
 ### 1.4 How We Know This Is the Right Convention
 
@@ -72,13 +72,13 @@ Three independent pieces of evidence pin $r' = \mathrm{mtrx}^{-1} \cdot r + \tau
 
 2. **BGW Σ reader** (`sympert_utils.f90:748-755`): explicitly recovers the real-space rotation by transposing and inverting the stored `mtrx`, and reads $\tau$ as `tnp/(2π)`.
 
-3. **Si Fd-3m empirical test**: `SymMaps.validate_atomic_symmetries` (`symmetry_maps.py:780-811`) loops over all 48 spatial sym ops of Si and applies `rot @ pos + τ` with `rot = inv(mtrx)`. Result: 96/96 atom mappings close mod-1. Using `rot = mtrx` instead gives 48/96, because the diamond glide partners cross-cancel under the wrong direction.
+3. **Si Fd-3m empirical test**: `SymMaps.validate_atomic_symmetries` loops over all 48 spatial sym ops of Si and applies `rot @ pos + τ` with `rot = inv(mtrx)`. Result: 96/96 atom mappings close mod-1. Using `rot = mtrx` instead gives 48/96, because the diamond glide partners cross-cancel under the wrong direction.
 
 For symmorphic systems ($\tau = 0$), $S$ and $S^{-1}$ give the same orbit on any point because the space group is closed under inversion. CrI3 P-3 and MoS2 P-6m2 both fall in this category. The bug therefore did not surface until Si Fd-3m, with its 24 glide ops at $\tau = (1/4, 1/4, 1/4)$ and friends, was exercised. The earlier-confusing CrI3 empirical match (`wfn.sym_matrices[1]` numerically equals $U_{C3}$ in hex coords) reconciles as follows: for an *abelian* group, $\{U_s\}$ and $\{U_s^{-1}\}$ generate the same orbit, so the matrix-direction choice has no observable consequence.
 
 ### 1.5 The Reciprocal-Action Matrix and `sym_mats_k`
 
-`SymMaps.__init__` (`symmetry_maps.py:529-543`) builds:
+`SymMaps.__init__` builds:
 
 ```python
 self.sym_matrices = wfn.sym_matrices[:wfn.ntran]                # mtrx, (ntran, 3, 3)
@@ -107,7 +107,9 @@ Note the asymmetry — only $\tau_b$ gets rotated. On Si Fd-3m's 48 ops this clo
 
 ## 2. LORRAX's `SymMaps` Class
 
-`src/common/symmetry_maps.py:416-1143` is the LORRAX-side handle on all of the above. It is constructed from a `WFNReader` and exposes the tables the GW driver consumes.
+`symmetry_maps.SymMaps` is the LORRAX-side handle on all of the above. It is constructed from a `WFNReader` and exposes the tables the GW driver consumes.
+
+> **Where the code lives, and how this page cites it (2026-08-07).** The three modules this document describes moved into the `symmetry_maps` SERVICE — `services/symmetry_maps/src/symmetry_maps/{maps,orbit_syms,density_symmetry_check}.py`, reached by `import symmetry_maps` and never through a submodule path. `src/common/symmetry_maps.py`, `src/centroid/orbit_syms.py` and `src/common/density_symmetry_check.py` are forwarding shims until the phase-wide cleanup deletes them. Citations below name SYMBOLS, not line numbers: the `file.py:NNN` form this page used had already drifted off the code it pointed at, and a stale line number reads as authoritative in a way a symbol name does not. For the service's CONTRACT — the conjugation predicate, the `R_cart` inverse, the refusals — see [`docs/services/symmetry_maps.md`](../services/symmetry_maps.md).
 
 ### 2.1 Constructed Arrays
 
@@ -121,7 +123,7 @@ R_cart             : (2·ntran, 3, 3) float  = avec.T @ mtrx @ inv(avec.T), with
 U_spinor           : (ntran, 2, 2) complex  = Markley-quaternion(R_cart[:ntran])
 ```
 
-`U_spinor` is restricted to the SPATIAL half. The TRS-row spinor is constructed lazily inside `unfold_psi` as $i\sigma_y \cdot \overline{U_s}$; see §3.2. Before PR3 the TRS half was generated by feeding $-R$ into the SU(2) algorithm, which combined with the `det<0 ⇒ -R` flip on improper rotations produced a wrong-by-sign $U_\text{spinor}$ and a multi-eV Σ_X failure on TRS-folded k-points. The restriction-to-spatial-only fix lives at `src/common/symmetry_maps.py:584-593`.
+`U_spinor` is restricted to the SPATIAL half. The TRS-row spinor is constructed lazily inside `unfold_psi` as $i\sigma_y \cdot \overline{U_s}$; see §3.2. Before PR3 the TRS half was generated by feeding $-R$ into the SU(2) algorithm, which combined with the `det<0 ⇒ -R` flip on improper rotations produced a wrong-by-sign $U_\text{spinor}$ and a multi-eV Σ_X failure on TRS-folded k-points. The restriction-to-spatial-only fix lives in `SymMaps.__init__`, which slices `R_cart[:ntran]` before calling `get_spinor_rotations`.
 
 ### 2.2 Full-BZ ↔ IBZ Maps
 
@@ -148,7 +150,7 @@ Both pairs are built by `find_irreducible_bz_points` (§2.3). The k-side anchors
 
 ### 2.3 `find_irreducible_bz_points`
 
-`src/common/symmetry_maps.py:18-107`. Two branches:
+`symmetry_maps.find_irreducible_bz_points`. Two branches:
 
 **Branch A** (`irr_kgrid_int=None`, q-side): derive the IBZ as lex-min orbit representatives.
 
@@ -190,13 +192,13 @@ The TRS-row spinor factor is $i\sigma_y$, the standard SOC time-reversal operato
 
 $$i\sigma_y = \begin{pmatrix} 0 & 1 \\ -1 & 0 \end{pmatrix}$$
 
-hard-coded as `_I_SIGMA_Y` at `symmetry_maps.py:303`.
+hard-coded as `_I_SIGMA_Y` in `symmetry_maps/maps.py` (module-private; the tests that need it import it through the shim on purpose).
 
 ---
 
 ## 3. Wavefunction Unfold (`unfold_psi`)
 
-`src/common/symmetry_maps.py:306-413`. Rotates the IBZ wavefunction $\psi_{\bar k}$ to a full-BZ k-point. Spinor + phase + TRS in one place.
+`symmetry_maps.unfold_psi`. Rotates the IBZ wavefunction $\psi_{\bar k}$ to a full-BZ k-point. Spinor + phase + TRS in one place.
 
 ### 3.1 Spatial Case ($s < n_\text{tran}$)
 
@@ -206,7 +208,7 @@ $$\psi_{k, b}(\mathbf G_\text{rot}) \;=\; U_\text{spinor}(S) \;\cdot\; e^{-i\, (
 
 where $\mathbf G_\text{rot} = S \cdot \mathbf G_{\bar k} + \mathbf{k}_{g_0}$ is the G-vector at the full-BZ k. The umklapp $\mathbf{k}_{g_0}$ is rebuilt by the `WfnLoader`'s `gvecs`; `unfold_psi` only computes the spinor + phase factors.
 
-The τ-phase implementation (`symmetry_maps.py:387-412`):
+The τ-phase implementation (`unfold_psi`, via `tau_phase_row`):
 
 ```python
 S_full   = sym_mats_k[sym_idx]               # (3,3) int — for spatial rows == sym_mats_k[s]
@@ -246,7 +248,7 @@ U_eff = _I_SIGMA_Y @ np.conj(U_spinor[s_spatial])
 cnk   = einsum('jk,nkl->njl', U_eff, cnk)
 ```
 
-**The conj order matters**: apply `conj(cnk)` first, then multiply by `phase`. Applying the phase first and then conj inverts the phase sign. The comment in the source spells this out at `symmetry_maps.py:396-400`.
+**The conj order matters**: apply `conj(cnk)` first, then multiply by `phase`. Applying the phase first and then conj inverts the phase sign. The comment in `unfold_psi`'s TRS branch spells this out.
 
 > **Note (2026-05-14, PR3).** Before PR3, `U_spinor[ntran:]` was computed by Markley's quaternion algorithm on `-R_spatial`, which mis-signed half the TRS spinors. PR3 fixed it by (a) restricting `self.U_spinor` to length `ntran` (the TRS-row spinor is constructed inside `unfold_psi` via $i\sigma_y \cdot \overline{U_s}$, making the bug unreachable) and (b) carrying the $\pm S$ sign on `sym_mats_k` instead of on the spinor. The sym table's structural symmetry means there is now exactly one place where TRS algebra lives: this function.
 
@@ -264,7 +266,7 @@ After PR5 the public unfold helpers (`get_gvecs_kfull`, `get_cnk_fullzone[_batch
 
 ## 4. Centroid Permutation and Lattice-Wrap Table
 
-`src/centroid/orbit_syms.py:229-437`. Given a centroid set $\{\mathbf x_\mu\}_{\mu=1}^{n_\text{rmu}}$ on the FFT grid and the BGW sym data, returns:
+`symmetry_maps.compute_centroid_sym_perm`. Given a centroid set $\{\mathbf x_\mu\}_{\mu=1}^{n_\text{rmu}}$ on the FFT grid and the BGW sym data, returns:
 
 ```python
 sym_perm[s, μ]    = α                            # (n_sym, n_rmu) int32 or (2 n_sym, ...) if extend_trs
@@ -289,7 +291,7 @@ For symmorphic systems ($\tau = 0$) the inverse and forward directions produce t
 
 ### 4.2 The Implementation
 
-Inside `compute_centroid_sym_perm` at `orbit_syms.py:347-381`:
+Inside `compute_centroid_sym_perm`:
 
 ```python
 tau_frac    = translations / (2π)                                       # (n_sym, 3)
@@ -306,7 +308,7 @@ sym_perm[s, μ] = flat_to_mu[radix_encode(images_int_mod[s, μ])]
 
 ### 4.3 The FFT-Grid Integer-Snap Fix (the Si Fix)
 
-`src/centroid/orbit_syms.py:361-371` is load-bearing for Si Fd-3m. Centroids live at multiples of $1/\text{FFT}_a$; `mtrx` and $\tau$ are commensurate with the FFT grid (BGW guarantee), so `images_raw * fft_grid` is mathematically integer. The naive
+The FFT-snap in `compute_centroid_sym_perm` is load-bearing for Si Fd-3m. Centroids live at multiples of $1/\text{FFT}_a$; `mtrx` and $\tau$ are commensurate with the FFT grid (BGW guarantee), so `images_raw * fft_grid` is mathematically integer. The naive
 
 ```python
 L = np.floor(images_raw).astype(int)
@@ -314,7 +316,7 @@ L = np.floor(images_raw).astype(int)
 
 flips `L` from 0 to −1 whenever the true integer part is 0 but tiny negative fp noise (~$10^{-17}$) hits `np.floor`'s discontinuity at integer values. This injects a spurious $e^{\pm 2\pi i q}$ phase factor into $V_q$ at every glide op of Si.
 
-The fix (commit `6666a41`, `orbit_syms.py:308-318` / `:361-371`) snaps `images_raw * fft_grid` to integers first via `np.rint`, then does integer floor-division. Verified at ISDF noise floor on Si Fd-3m (24³ FFT, non-symmorphic τ): the previous code gave 14/64 q's with relative error ~0.8; after the snap, every q closes. **This is the single change that takes Si from 791 meV residual to 0.002 meV** at the Σ_X gate.
+The fix (commit `6666a41`, in `compute_centroid_sym_perm` and its `_snap` helper) snaps `images_raw * fft_grid` to integers first via `np.rint`, then does integer floor-division. Verified at ISDF noise floor on Si Fd-3m (24³ FFT, non-symmorphic τ): the previous code gave 14/64 q's with relative error ~0.8; after the snap, every q closes. **This is the single change that takes Si from 791 meV residual to 0.002 meV** at the Σ_X gate.
 
 ### 4.4 The `extend_trs=True` Augmentation
 
@@ -348,7 +350,7 @@ a spinor rotation the `mtrx` format can't carry), even though the charge density
 is fully symmetric. Closing centroids under the stored `{E, σ_h}` leaves V_H
 C3-broken.
 
-`centroid/orbit_syms.py:recover_symmorphic_density_point_group` recovers the
+`symmetry_maps.recover_symmorphic_density_point_group` recovers the
 symmorphic point group that leaves the **charge density** invariant (holohedry ∩
 ρ-invariance on the FFT grid). Testing ρ(r) — not bare atom positions — is the
 safe criterion: non-magnetic crystals recover the full crystal group; magnetically
@@ -363,13 +365,13 @@ here (§4–5) still runs on the WFN's stored group — a D3h-closed set is triv
 
 ### 4.6 `compute_rgrid_sym_perm` (Full-Grid Variant)
 
-`src/centroid/orbit_syms.py:444-551`. Same construction, but applied to every point of the FFT grid (not just the centroid subset). Returns `sym_perm[s, r_new] = r_old` — a pull-back gather. Used by the ζ-loader for the IBZ → full-BZ unfold on the r-axis (when ζ is stored only at IBZ q's and the consumer needs the full BZ). Requires $\tau \times \text{FFT\_grid}$ to be integer; the validator refuses loudly otherwise.
+`symmetry_maps.compute_rgrid_sym_perm`. Same construction, but applied to every point of the FFT grid (not just the centroid subset). Returns `sym_perm[s, r_new] = r_old` — a pull-back gather. Used by the ζ-loader for the IBZ → full-BZ unfold on the r-axis (when ζ is stored only at IBZ q's and the consumer needs the full BZ). Requires $\tau \times \text{FFT\_grid}$ to be integer; the validator refuses loudly otherwise.
 
 ---
 
 ## 5. V_q Unfold (`unfold_v_q`)
 
-`src/common/symmetry_maps.py:110-299`. Expands the IBZ V_q tensor to the full BZ. JAX-jit'd, sharded `P(None, 'x', 'y')` on the centroid axes.
+`symmetry_maps.unfold_v_q`. Expands the IBZ V_q tensor to the full BZ. JAX-jit'd, sharded `P(None, 'x', 'y')` on the centroid axes.
 
 ### 5.1 The Formula
 
@@ -397,7 +399,7 @@ Then $V_{Sq}[\mu, \nu] = \iint \overline{\zeta_{Sq,\mu}(\mathbf r)} v(\mathbf r 
 
 $$V_{Sq}[\mu, \nu] = e^{-2\pi i q \cdot \mathbf L_\mu} e^{+2\pi i q \cdot \mathbf L_\nu} \cdot V_q[\alpha(\mu), \alpha(\nu)] = e^{2\pi i \bar q \cdot (\mathbf L_\nu - \mathbf L_\mu)} V_q[\alpha(\mu), \alpha(\nu)].$$
 
-> **Note (2026-05-14).** The derivation gives the sign as $(\mathbf L_\nu - \mathbf L_\mu)$. The user-spec writes $(\mathbf L_\mu - \mathbf L_\nu)$. Both are sign-equivalent residuals on the V_q dump because V is Hermitian and the indices μ, ν are bookkeeping — `phase[:, None] * V * conj(phase)[None, :]` and `conj(phase)[:, None] * V * phase[None, :]` both close at ISDF floor. The implementation follows the user-spec sign with `phase[:, None] * V * conj(phase)[None, :]` (`symmetry_maps.py:290`).
+> **Note (2026-05-14).** The derivation gives the sign as $(\mathbf L_\nu - \mathbf L_\mu)$. The user-spec writes $(\mathbf L_\mu - \mathbf L_\nu)$. Both are sign-equivalent residuals on the V_q dump because V is Hermitian and the indices μ, ν are bookkeeping — `phase[:, None] * V * conj(phase)[None, :]` and `conj(phase)[:, None] * V * phase[None, :]` both close at ISDF floor. The implementation follows the user-spec sign with `phase[:, None] * V * conj(phase)[None, :]` (inside `unfold_v_q`'s `shard_map` body).
 
 ### 5.3 The TRS Half
 
@@ -409,7 +411,7 @@ $$V_\text{full}[Tq, \mu, \nu] = \overline{V_q[\mu, \nu]} = V_q[\nu, \mu]$$
 
 ### 5.4 The JIT Body
 
-`src/common/symmetry_maps.py:267-299`. Key shapes (sharded on the `('x', 'y')` mesh):
+`unfold_v_q`'s jit body. Key shapes (sharded on the `('x', 'y')` mesh):
 
 ```text
 V_q_ibz       : (n_q_ibz, n_rmu, n_rmu) c128, sharded P(None, 'x', 'y')
@@ -443,9 +445,9 @@ Three implementation details:
 
 1. **`mode='promise_in_bounds'`** avoids an XLA HLO-verifier dtype mismatch (s32 vs s64) inside `shard_map + x64`. The OOB-fill branch silently mints s64; the promise keeps the gather in s32 throughout. Bounds are guaranteed by construction — every entry of `perm_q` is a valid centroid index, which is what `compute_centroid_sym_perm`'s validation establishes — so `promise_in_bounds` is correct, not a hack.
 
-2. **Identity short-circuit** (`symmetry_maps.py:194-201`): when `ntran=1` (nosym), `irr_idx` is identity and `sym_idx` is all zeros. The `take_along_axis` codegens an s64-broadcast the verifier rejects on 2×2 meshes. The code detects this case host-side and returns `V_q_ibz` unchanged.
+2. **Identity short-circuit** (`unfold_v_q`): when `ntran=1` (nosym), `irr_idx` is identity and `sym_idx` is all zeros. The `take_along_axis` codegens an s64-broadcast the verifier rejects on 2×2 meshes. The code detects this case host-side and returns `V_q_ibz` unchanged.
 
-3. **Centroid padding** (`symmetry_maps.py:228-261`): when `n_rmu_logical` is not divisible by the mesh's y-axis, `sym_perm` is identity-padded `[n_rmu, n_rmu+1, …]` and `L_table` is zero-padded. Padded slots carry no umklapp wrap.
+3. **Centroid padding** (`unfold_v_q`): when `n_rmu_logical` is not divisible by the mesh's y-axis, `sym_perm` is identity-padded `[n_rmu, n_rmu+1, …]` and `L_table` is zero-padded. Padded slots carry no umklapp wrap.
 
 ### 5.5 Caller Wiring (the IBZ Cascade)
 
@@ -471,7 +473,7 @@ When `compute_centroid_sym_perm` succeeds, the cascade activates: $V_q$ is compu
 
 The IBZ cascade landed on 2026-05-11 (`project_lorrax_ibz_cascade.md`): generate centroids with orbit closure on, and V_q work collapses from $n_q^\text{full}$ to $n_q^\text{ibz}$ (~$n_\text{tran}$× reduction). CrI3 6×6: 36 → 8. MoS2 3×3: 9 → 2. Si 4×4×4: 64 → 8.
 
-**Caller 4 — Bispinor V_q (g-flat path).** Activates under the same conditions as the 2-comp IBZ path: sym is present, `LORRAX_FORCE_FULL_BZ` is not set, and the relevant centroid set (charge or transverse) passes orbit closure under `_resolve_ibz_q_list` — no separate config flag. `gw/v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5` iterates the seven UNIQUE_TILES through `_compute_V_q_g_flat_one_tile` with the appropriate centroid set (charge for CC, transverse for the six TT tiles) and `sym`, so each tile factors / contracts on IBZ q's and unfolds via `unfold_v_q`. After the loop, the six unique TT tiles pass through `unfold_v_q_bispinor_lorentz` (`common/symmetry_maps.py`), which contracts the per-q proper Cartesian rotation `R_proper[s(q)]` against the 3-vector pair indices: $V^{i,j}_\text{mixed}[q] = R_\text{proper}^{i\alpha}(s) \cdot R_\text{proper}^{j\beta}(s) \cdot V^{\alpha,\beta}_\text{unfolded}[q]$. The TRS σ-sign on the 3-vector is absorbed for free by the existing `unfold_v_q` conj-wrap because every UNIQUE_TILE has both legs in $\{0\}$ or both in $\{1,2,3\}$ — the product of two $-1$'s is $+1$. See `reports/bispinor_ibz_2026-05-16/derivation.md` §A4–A5 for the per-element math. Implementation choice: the CC tile streams straight to disk per-tile (no mixing); the six unique TT tiles buffer in memory through the loop and are written post-mix — peak memory is six TT tiles vs. one for the 2-comp path, sharded `P(None,'x','y')`. The `R_proper` table on `SymMaps` is the same Cartesian rotation that drives `U_spinor` (= `R_cart` with the proper-flip from `get_spinor_rotations`), NOT the derivation-text form `O = A · mtrx⁻¹ · A⁻¹` (which is its transpose); the §A5 mixing formula then absorbs the transpose into its index ordering.
+**Caller 4 — Bispinor V_q (g-flat path).** Activates under the same conditions as the 2-comp IBZ path: sym is present, `LORRAX_FORCE_FULL_BZ` is not set, and the relevant centroid set (charge or transverse) passes orbit closure under `_resolve_ibz_q_list` — no separate config flag. `gw/v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5` iterates the seven UNIQUE_TILES through `_compute_V_q_g_flat_one_tile` with the appropriate centroid set (charge for CC, transverse for the six TT tiles) and `sym`, so each tile factors / contracts on IBZ q's and unfolds via `unfold_v_q`. After the loop, the six unique TT tiles pass through `symmetry_maps.unfold_v_q_bispinor_lorentz`, which contracts the per-q proper Cartesian rotation `R_proper[s(q)]` against the 3-vector pair indices: $V^{i,j}_\text{mixed}[q] = R_\text{proper}^{i\alpha}(s) \cdot R_\text{proper}^{j\beta}(s) \cdot V^{\alpha,\beta}_\text{unfolded}[q]$. The TRS σ-sign on the 3-vector is absorbed for free by the existing `unfold_v_q` conj-wrap because every UNIQUE_TILE has both legs in $\{0\}$ or both in $\{1,2,3\}$ — the product of two $-1$'s is $+1$. See `reports/bispinor_ibz_2026-05-16/derivation.md` §A4–A5 for the per-element math. Implementation choice: the CC tile streams straight to disk per-tile (no mixing); the six unique TT tiles buffer in memory through the loop and are written post-mix — peak memory is six TT tiles vs. one for the 2-comp path, sharded `P(None,'x','y')`. The `R_proper` table on `SymMaps` is the same Cartesian rotation that drives `U_spinor` (= `R_cart` with the proper-flip from `get_spinor_rotations`), NOT the derivation-text form `O = A · mtrx⁻¹ · A⁻¹` (which is its transpose); the §A5 mixing formula then absorbs the transpose into its index ordering.
 
 ---
 
@@ -579,26 +581,29 @@ The Si result is the load-bearing one. Until 2026-05-13 Si carried a 160 eV gap;
 |---|---|---|
 | `MfHeader` | `src/file_io/mf_header.py:30-83` | WFN.h5 header dataclass; reads `mtrx`, `tnp`, `ntran`. |
 | `_read_group` | `src/file_io/mf_header.py:89-132` | h5py reader populating `MfHeader`. |
-| `SymMaps` | `src/common/symmetry_maps.py:416-1143` | Top-level sym table holder. Builds k/q-IBZ maps, R_cart, U_spinor. |
-| `SymMaps.sym_matrices` | `src/common/symmetry_maps.py:529` | Spatial-only `mtrx[:ntran]`. The BGW stored matrix. |
-| `SymMaps.sym_mats_k` | `src/common/symmetry_maps.py:530-543` | TRS-augmented `mtrx.T` (length $2 \cdot n_\text{tran}$). The k-action matrix for numpy-row-vector consumption (§1.5). |
-| `SymMaps.translations` | `src/common/symmetry_maps.py:536-537` | Raw `tnp[:ntran]` (= $2\pi \tau_\text{frac}$). |
-| `SymMaps.U_spinor` | `src/common/symmetry_maps.py:593` | Spatial-only SU(2) spinor rotations (length $n_\text{tran}$). TRS rows built inside `unfold_psi`. |
-| `SymMaps.R_cart` | `src/common/symmetry_maps.py:592` | Cartesian-frame rotations (length $2 \cdot n_\text{tran}$) for Markley's quaternion input. |
-| `SymMaps.irr_idx_q, sym_idx_q` | `src/common/symmetry_maps.py:625-629` | Full-BZ q → IBZ parent + sym row. |
-| `SymMaps.q_irr_kgrid_int` | `src/common/symmetry_maps.py:630` | IBZ q list as kgrid integers. |
-| `SymMaps.validate_atomic_symmetries` | `src/common/symmetry_maps.py:780-811` | Checks `inv(mtrx) · atom + τ` closes. Smoke test for convention. |
-| `SymMaps.syms_crystal_to_cartesian` | `src/common/symmetry_maps.py:844-906` | $R_\text{cart} = A_T \cdot \mathrm{mtrx} \cdot A_T^{-1}$. |
-| `find_irreducible_bz_points` | `src/common/symmetry_maps.py:18-107` | Full-BZ → IBZ index + sym row builder (q-side and k-side). |
-| `unfold_psi` | `src/common/symmetry_maps.py:306-413` | ψ at full-BZ k from IBZ ψ. Spinor + phase + TRS in one place. |
-| `unfold_v_q` | `src/common/symmetry_maps.py:110-299` | V_q at full BZ from IBZ. jit'd, sharded `P(None,'x','y')`. |
-| `_I_SIGMA_Y` | `src/common/symmetry_maps.py:303` | $i\sigma_y$, the SOC time-reversal spinor factor. |
-| `get_spinor_rotations` | `src/common/symmetry_maps.py:908-992` | Markley quaternion SU(2) from `R_cart`. |
-| `compute_centroid_sym_perm` | `src/centroid/orbit_syms.py:229-437` | $(\alpha, L)$ from inverse-source decomposition. `extend_trs=True` doubles for TRS. |
-| `compute_rgrid_sym_perm` | `src/centroid/orbit_syms.py:444-551` | Full-FFT-grid pull-back permutation for ζ r-axis unfold. |
-| `orbit_images` | `src/centroid/orbit_syms.py:73-92` | Row-form BGW action `r' = r · Rinv.T + τ` on a rep set. |
-| `unfold_orbit_unique_with_id` | `src/centroid/orbit_syms.py:170-216` | Orbit-aware kmeans backend; emits orbit IDs. |
-| `build_real_space_syms` | `src/centroid/orbit_syms.py:33-59` | Pre-divides `wfn.translations / 2π` and gathers $R$, $R^{-1}$. |
+| `SymMaps` | `symmetry_maps` / `maps.py` | Top-level sym table holder. Builds k/q-IBZ maps, R_cart, U_spinor. |
+| `SymMaps.sym_matrices` | `symmetry_maps` / `maps.py` | Spatial-only `mtrx[:ntran]`. The BGW stored matrix. |
+| `SymMaps.sym_mats_k` | `symmetry_maps` / `maps.py` | TRS-augmented `mtrx.T` (length $2 \cdot n_\text{tran}$). The k-action matrix for numpy-row-vector consumption (§1.5). |
+| `SymMaps.translations` | `symmetry_maps` / `maps.py` | Raw `tnp[:ntran]` (= $2\pi \tau_\text{frac}$). |
+| `SymMaps.U_spinor` | `symmetry_maps` / `maps.py` | Spatial-only SU(2) spinor rotations (length $n_\text{tran}$). TRS rows built inside `unfold_psi`. |
+| `SymMaps.R_cart` | `symmetry_maps` / `maps.py` | Cartesian-frame rotations (length $2 \cdot n_\text{tran}$) for Markley's quaternion input. |
+| `SymMaps.irr_idx_q, sym_idx_q` | `symmetry_maps` / `maps.py` | Full-BZ q → IBZ parent + sym row. |
+| `SymMaps.q_irr_kgrid_int` | `symmetry_maps` / `maps.py` | IBZ q list as kgrid integers. |
+| `SymMaps.validate_atomic_symmetries` | `symmetry_maps` / `maps.py` | Checks `inv(mtrx) · atom + τ` closes. Smoke test for convention. |
+| `SymMaps.syms_crystal_to_cartesian` | `symmetry_maps` / `maps.py` | $R_\text{cart} = A_T \cdot \mathrm{mtrx} \cdot A_T^{-1}$. |
+| `find_irreducible_bz_points` | `symmetry_maps` / `maps.py` | Full-BZ → IBZ index + sym row builder (q-side and k-side). |
+| `unfold_psi` | `symmetry_maps` / `maps.py` | ψ at full-BZ k from IBZ ψ. Spinor + phase + TRS in one place. |
+| `unfold_v_q` | `symmetry_maps` / `maps.py` | V_q at full BZ from IBZ. jit'd, sharded `P(None,'x','y')`. |
+| `_I_SIGMA_Y` | `symmetry_maps` / `maps.py` | $i\sigma_y$, the SOC time-reversal spinor factor. |
+| `get_spinor_rotations` | `symmetry_maps` / `maps.py` | Markley quaternion SU(2) from `R_cart`. |
+| `SymMaps.R_cart_forward` | `symmetry_maps` / `maps.py` | The TRANSPOSE of `R_cart`, per op — the FORWARD Cartesian rotation. Use it for anything rotating a rank ≥ 1 Cartesian index; `R_cart` is the inverse (§1.4). |
+| `KStarMap`, `star_select`, `star_broadcast`, `star_spread` | `symmetry_maps` / `maps.py` | Band-index IBZ ⇄ full BZ. Conjugation is `trs(member) XOR trs(reference row)` from one private predicate; `star_broadcast`'s `trs_reference` names which operand flavour it was handed. |
+| `check_density_symmetries` | `symmetry_maps` / `density_symmetry_check.py` | The TRS MEASUREMENT: builds ρ from the raw IBZ ψ and tests $m_{-k}(r) = -m_k(r)$. Verdict lands on the loader as `trs_holds` and gates `SymMaps`' TRS augmentation. |
+| `compute_centroid_sym_perm` | `symmetry_maps` / `orbit_syms.py` | $(\alpha, L)$ from inverse-source decomposition. `extend_trs=True` doubles for TRS. |
+| `compute_rgrid_sym_perm` | `symmetry_maps` / `orbit_syms.py` | Full-FFT-grid pull-back permutation for ζ r-axis unfold. |
+| `orbit_images` | `symmetry_maps` / `orbit_syms.py` | Row-form BGW action `r' = r · Rinv.T + τ` on a rep set. |
+| `unfold_orbit_unique_with_id` | `symmetry_maps` / `orbit_syms.py` | Orbit-aware kmeans backend; emits orbit IDs. |
+| `build_real_space_syms` | `symmetry_maps` / `orbit_syms.py` | Pre-divides `wfn.translations / 2π` and gathers $R$, $R^{-1}$. |
 | `_resolve_ibz_q_list` | `src/gw/v_q_g_flat.py:154-223` | Builds `sym_perm`, `L_table`, `q_irr_frac` for V_q driver; falls back to full-BZ on `RuntimeError`. |
 
 ### External (BGW)

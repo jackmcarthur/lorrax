@@ -71,7 +71,7 @@ def test_R_proper_cri3_matches_fixture():
     from ffi import _services
     _services.ensure_on_path()
     from wfn_loader import WfnLoader
-    from common.symmetry_maps import SymMaps
+    from symmetry_maps import SymMaps
 
     npz = np.load(_FIXTURE_PATH, allow_pickle=True)
     R_proper_fixture = np.asarray(npz['R_proper'], dtype=np.float64)

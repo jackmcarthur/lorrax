@@ -27,7 +27,6 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
-from common import symmetry_maps
 from common import Meta
 from common import rank_criterion
 from common import timing
@@ -47,6 +46,12 @@ from common.fft_helpers import make_flat_k_ifftn
 # degradation — see the fitted ``sharding_y`` in streaming_galerkin_solve.
 from common.sharding_fit import fit_sharding as _fit
 from common.sharding_fit import padded_extent as _pad_to
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+import symmetry_maps                                            # noqa: E402
 
 
 def _build_mesh_xy() -> Mesh:

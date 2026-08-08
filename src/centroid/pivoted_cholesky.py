@@ -57,10 +57,16 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
-from common import symmetry_maps, timing
+from common import timing
 from common.collectives import device_put_process_local
 
 from . import distribution as dist
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+import symmetry_maps                                            # noqa: E402
 
 
 # ═══════════════════════════════════════════════════════════════════════

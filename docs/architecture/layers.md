@@ -19,9 +19,10 @@ Today: **143 L1, 18 L2, 60 L3** over the 221 modules under `src/` — re-counted
 2026-08-06 from the map itself, because the previous figure (140/18/56) summed
 to 214 and the tree had grown past it. Zero exempt bench drivers — the 26 that
 used to live under `src/` moved to `tests/bench/` on 2026-07-31 (see
-[below](#the-26-exempt-bench-drivers)). **Two** upward edges survive, both
-named in [§5](#5-the-sanctioned-exceptions) (R2 and R3; R1 closed by deletion,
-and the two that arrived with `agent/jax-070-land` were closed on 2026-08-06 —
+[below](#the-26-exempt-bench-drivers)). **One** upward edge survives, named in
+[§5](#5-the-sanctioned-exceptions) (R2; R1 closed by deletion, R3 closed on
+2026-08-07 by the `symmetry_maps` extraction, and the two that arrived with
+`agent/jax-070-land` were closed on 2026-08-06 —
 [§8](#8-landed-2026-08-06--the-two-inherited-upward-edges)).
 
 ---
@@ -67,10 +68,12 @@ and in its negation, which is the one that gets said in review:
 **The physics kernels** — everything in `gw/`, `bse/`, `psp/`, `isdf/`,
 `bandstructure/`, most of `centroid/`, the format readers and writers in
 `file_io/`, and the physics-aware modules in `common/`
-(`zeta_projection`, `wfn_transforms`, `symmetry_maps`, `gvec_fft_box`,
+(`zeta_projection`, `wfn_transforms`, `gvec_fft_box`,
 `psi_G_store`, `kq_mapping`, `coulomb_sphere`, `meta`, `units`,
-`gamma_matrices`, `bispinor_init`, `chi_from_dipole`,
-`density_symmetry_check`).
+`gamma_matrices`, `bispinor_init`, `chi_from_dipole`).  `symmetry_maps`
+and `density_symmetry_check` left `common/` for `services/symmetry_maps/`
+on 2026-08-07 and are reached through the service door; the modules at
+their old paths are forwarding shims.
 
 **The acceptance test for a driver** is the one the owner stated: *it should
 appear to contain only physics on inspection*. Concretely — no `jax.sharding`,
@@ -181,18 +184,26 @@ A level assignment nobody argued is a level assignment nobody will keep.
    divisibility refusal, which GEMM backend answered. `contract_bands` reads no
    environment and consumes a typed `Gate`. That is L3 behaviour with an L1
    noun in the name; the noun loses.
-2. **`centroid/kmeans_isdf.py` — L2, with a named exception.** Lloyd's
-   algorithm under a metric tensor is textbook clustering and would lift into
-   any code unchanged. Its one lazy import of `centroid.orbit_syms` folds a
-   real-space point group into the assignment step, and *that* is physics. The
-   fix is to inject the orbit map as a parameter; that is a signature change,
-   so it is a request, not a landing.
+2. **`centroid/kmeans_isdf.py` — L2, and the exception it needed is gone.**
+   Lloyd's algorithm under a metric tensor is textbook clustering and would
+   lift into any code unchanged. Its one lazy import folded a real-space point
+   group into the assignment step, and *that* is physics — sanctioned as **R3**
+   until 2026-08-07, when `centroid/orbit_syms.py` left `src/` for
+   `services/symmetry_maps/` and the site became
+   `from symmetry_maps import canonicalize_orbit`: an edge into a service
+   **door**, which [§5](#5-the-sanctioned-exceptions) explains is rule 6's
+   business rather than rule 3's. The prescribed fix is unchanged and still
+   registered — inject the orbit map as a parameter; that is a signature
+   change, so it is a request, not a landing. What extraction moved is the
+   module's address, not its argument list.
 3. **`centroid/pivoted_cholesky.py` — L1, not L2.** Tempting as "pivoted
-   Cholesky, a numerical routine", but it imports `file_io`,
-   `common.symmetry_maps`, `common.meta`, `common.wfn_transforms` and `isdf`.
-   It prunes ISDF *candidate points* using ψ. The algorithm inside is L2; the
-   module is not, and pretending otherwise would have put five upward edges
-   under an exception list.
+   Cholesky, a numerical routine", but it imports `file_io`, `symmetry_maps`,
+   `common.meta`, `common.wfn_transforms` and `isdf`. It prunes ISDF
+   *candidate points* using ψ. The algorithm inside is L2; the module is not,
+   and pretending otherwise would have put five upward edges under an
+   exception list. (One of the five has since become a service-door edge and
+   would no longer be counted; the other four are unmoved, and the verdict
+   never rested on the count alone.)
 4. **`solvers/sternheimer_solve.py` — filed L2, and it fails its own test.**
    `from psp.dft_operators import apply_H_k_from_G` at module scope, used in
    the matvec. A solver that applies a *specific* Hamiltonian is not
@@ -249,15 +260,34 @@ A level assignment nobody argued is a level assignment nobody will keep.
 
 ## 5. The sanctioned exceptions
 
-Four upward edges and four environment touches survive. Each is in
+Three upward edges and four environment touches survive. Each is in
 `tests/test_layering.py` with its reason, and each is **asserted to be still
 needed** — an exception that outlives its violation fails the suite.
+
+**A service door is not ranked.** Since 2026-08-07 `upward_edges()` skips an
+edge whose target is a service's top-level package: levels order modules
+within one distribution unit, and an import of `lxkit`, `distrib_la` or
+`symmetry_maps` is governed by rule 6 (lorrax reaches a service through its
+door and nowhere else) instead. `symmetry_maps` is the service that forced the
+distinction, because it is the first one that is not substrate — and the two
+alternatives were measured rather than argued. Left at the L1 default, which
+is what a package full of Brillouin zones is, it produces
+`L2->L1 centroid.kmeans_isdf:583 (lazy) imports symmetry_maps`; forced into
+`_L3_PACKAGES` the way `distrib_la` sits there, it produces two
+`L3->L1 symmetry_maps.density_symmetry_check -> psp.get_DFT_mtxels` edges
+instead. One exception either way, describing the same fact from opposite
+ends, and the second buys its green by relabelling physics as substrate.
+Nothing goes unwatched: reaching *past* a door still counts (rule 6), and a
+service reaching back into `src/` — those `psp` edges are real, and are
+`symmetry_maps`'s one remaining lorrax dependency — is owned by the mandatory
+import-isolation test and the service's declared `dependencies`, which is a
+stronger instrument than a level ever was.
 
 | # | violation | why it is still here |
 |---|---|---|
 | **R1** | ~~`file_io.slab_io` → `gw.gw_config` (2 lazy sites)~~ — **CLOSED 2026-08-06 by deletion.** `SlabIOBackend` typed the file-IO service's own `backend` parameter and was defined in the GW driver's deck parser. The request asked where the enum should live, given that `file_io` imports jax and h5py at package scope while `gw_config` is nearly jax-free. The answer was nowhere: with one transport there is no enum, no `backend` parameter, and no uphill import. | — |
 | **R2** | `solvers.sternheimer_solve` → `psp.dft_operators`, plus `STERN_DEBUG` read at module scope as `bool(int(...))` — so a word spelling raises `ValueError` on **import**. | Both are the same question: is this an L2 CG solve or an L1 Sternheimer kernel? Split `SternheimerOp`'s operator out, or move the file to `psp/`. Physics decision. |
-| **R3** | `centroid.kmeans_isdf` → `centroid.orbit_syms` (lazy) | See §4.2. Inject the orbit map; signature change. |
+| **R3** | ~~`centroid.kmeans_isdf` → `centroid.orbit_syms` (lazy)~~ — **CLOSED 2026-08-07 by the `symmetry_maps` extraction.** `centroid/orbit_syms.py` left `src/` for `services/symmetry_maps/`; the call site is `from symmetry_maps import canonicalize_orbit`, an edge into a service door, and the `_L2_UPWARD_EXCEPTIONS` entry was deleted in the same commit that moved the module — which is what makes this dissolved rather than relabelled. The prescribed fix (inject the orbit map; signature change) is unaffected and stays registered. | — |
 | **R4** | `mixing.acceleration` sets `JAX_ENABLE_X64` at module scope — a library mutating global jax configuration for whoever imports it. Same class as `centroid/kmeans_isdf.py`'s `config.update`, removed 2026-07-30. | Not free: the only consumer (`gw/sc_iteration.py:577`) is lazy and always post-`bootstrap()`, but a bare `import mixing.acceleration` in a fresh process would then run Anderson/CROP in **f32, silently**. Physics decision. |
 | — | `gw/__init__.py` sets `JAX_ENABLE_X64` | Argued in place, and shown inert for both GW drivers (they call `bootstrap()` then `jax.config.update` explicitly). Kept for import paths with no bootstrap. |
 | — | `centroid/kmeans_plot.py` sets `MPLBACKEND=Agg` | Not a compute knob. A plotting helper choosing a headless renderer is the correct owner of that choice. |
@@ -400,7 +430,9 @@ L3->L1 runtime:1467 (lazy) imports common.jax_support
 
 Neither was excused. **No entry was added to `_L2_UPWARD_EXCEPTIONS` or
 `_L3_UPWARD_EXCEPTIONS`; both lists are byte-identical to before**, and the
-two that remain (R2, R3) are still asserted still-needed.
+two that remained (R2, R3) were still asserted still-needed. (R3 was closed
+the next day by the `symmetry_maps` extraction — §5. The numbers in this
+section are the 2026-08-06 measurement and are left as measured.)
 
 * **`common/vma.py` is L3**, in the jax-glue paragraph of §3 next to the twin
   its own docstring names, `common/shard_map.py`. The argument, and why the
@@ -448,3 +480,9 @@ modules, and `upward_edges()` returns exactly the two excused pairs
 `centroid.kmeans_isdf → centroid.orbit_syms`) and nothing else.
 `tests/test_layering.py` goes 67 passed / 1 failed → **69 passed / 0 failed**;
 the extra test over the previous 68 is the red twin above.
+
+Superseded on 2026-08-07 by the `symmetry_maps` extraction, which closed the
+second of those two pairs (§5, R3): `upward_edges()` now returns
+`solvers.sternheimer_solve → psp.dft_operators` and nothing else. The `src/`
+module count is unchanged at 221 — the three moved modules leave forwarding
+shims at their old paths until the phase-wide cleanup commit.

@@ -52,7 +52,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
-from common import symmetry_maps
+import symmetry_maps                                            # noqa: E402
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -182,7 +182,7 @@ def symmetrize_on_grid(field: np.ndarray, sym_ops: np.ndarray) -> np.ndarray:
 
     ``sym_ops`` are the r-action matrices ``M`` (BGW ``Rinv``, τ=0) of a
     group that maps the FFT grid to itself, e.g. the output of
-    :func:`centroid.orbit_syms.recover_symmorphic_density_point_group`.
+    :func:`symmetry_maps.recover_symmorphic_density_point_group`.
     Returns ``(1/|G|) Σ_M field[(M·n) mod N]`` — invariant because the
     group is closed.
     """
@@ -231,7 +231,7 @@ def rho_from_band_range(
     summed density afterwards instead — the dual operation, since averaging
     the un-rotated IBZ sum over G reproduces the star sum.  Avoiding the
     unfold is deliberate: it keeps the weight independent of the machinery
-    that ``common.density_symmetry_check`` exists to test.
+    that ``symmetry_maps.check_density_symmetries`` exists to test.
 
     WHY THIS FEATURE EXISTS: the occupied-only ρ(r) is entirely inside the
     slab, so a ρ-weighted k-means puts ZERO centroids in the vacuum and the

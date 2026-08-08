@@ -616,7 +616,7 @@ full-BZ unfold (§11.6.3).
 
 The IBZ cascade activates **only if** the centroid set is closed
 under the WFN sym group `{S | τ}`. The closure check is
-`centroid.orbit_syms.compute_centroid_sym_perm` at three sites:
+`symmetry_maps.compute_centroid_sym_perm` at three sites:
 
 1. **In `fit_zeta_to_h5`** (`isdf_fitting.py:2040-2063`): pre-flight
    check. Fail → set `write_ibz_only = False`, fall back to full-BZ
@@ -682,7 +682,7 @@ gains IBZ support (`isdf_fitting.py:1775`).
 
 ### 11.6.3 `unfold_v_q` (post-loop, full-BZ recovery)
 
-Source: `common/symmetry_maps.py:110-299`.
+Source: `symmetry_maps.unfold_v_q` (`services/symmetry_maps/src/symmetry_maps/maps.py`).
 
 The bilinearity argument in ζ kills the τ-phase: V_q is bilinear in
 ζ̃, and ζ̃ transforms as
@@ -707,7 +707,7 @@ ISDF-noise-floor V_q dump and a ~unity-relative-error wrong V_q.
 See `reports/trs_sym_audit_2026-05-14/SYMMETRY_CONVENTIONS.md` for
 the empirical validation.
 
-**Implementation** (`symmetry_maps.py`): a `@shard_map` body inside a
+**Implementation** (`symmetry_maps/maps.py`): a `@shard_map` body inside a
 content-hashed `@jax.jit` with `in_specs = out_specs = P(None,'x','y')`.
 The naive `take_along_axis` on a sharded μ (or ν) axis silently
 forces XLA to all-gather that axis (Px× or Py× single-tile peak per
@@ -835,9 +835,9 @@ for the ζ-fit kernel.
 | V_q ζ_L reshard (XY → 'x') | `v_q_g_flat.py:101` | `all_to_all` and an `all_reduce` (see §11.7.5) | ~50 MB / q (MoS2) → ~840 MB / q (CrI3 80 Ry) |
 | V_q ζ_R reshard (XY → 'y') | `v_q_g_flat.py:102` | `all_to_all` (skipped when `same_zeta=True`) | same |
 | V_q G-chunk inner GEMM | `v_q_g_flat.py:123` | **none** — local cuBLAS GEMM | n/a |
-| `unfold_v_q` μ-permute on 'x' | `symmetry_maps.py` (shard_map body) | 2× `all_to_all(tiled=True)` on `'x'` | (P_x−1)/P_x × tile per rank, peak 1× tile |
-| `unfold_v_q` ν-permute on 'y' | `symmetry_maps.py` (shard_map body) | 2× `all_to_all(tiled=True)` on `'y'` | (P_y−1)/P_y × tile per rank, peak 1× tile |
-| `slice_q_full_to_ibz` | `symmetry_maps.py` | local gather on q axis; no collective | n/a (q axis is replicated) |
+| `unfold_v_q` μ-permute on 'x' | `symmetry_maps/maps.py` (shard_map body) | 2× `all_to_all(tiled=True)` on `'x'` | (P_x−1)/P_x × tile per rank, peak 1× tile |
+| `unfold_v_q` ν-permute on 'y' | `symmetry_maps/maps.py` (shard_map body) | 2× `all_to_all(tiled=True)` on `'y'` | (P_y−1)/P_y × tile per rank, peak 1× tile |
+| `slice_q_full_to_ibz` | `symmetry_maps/maps.py` | local gather on q axis; no collective | n/a (q axis is replicated) |
 | W_q IBZ slice + unfold (gw_jax) | `gw/gw_jax.py` | same as `unfold_v_q` + `slice_q_full_to_ibz` above | identical to V_q's unfold |
 
 The ζ-fit band gather is the single biggest collective per-call: it
@@ -909,7 +909,7 @@ production kernels:
   `all_to_all(tiled=True)` redistributions that keep per-rank peak
   at 1× tile and scale to arbitrary `Px·Py`, including the regime
   `Px·Py > n_q^\text{full}`. See §11.6.3 for the design and
-  `symmetry_maps.py` for the body.
+  `symmetry_maps/maps.py` for the body.
 
 The clean count is the **direct payoff** of the scan-INSIDE-shard_map
 discipline: every collective is a deliberate site (band gather, IBZ
@@ -1078,7 +1078,7 @@ per rank at `chunk_size=64`.
 | `isdf_fitting.py:1751-2567` | `fit_zeta_to_h5` | top-level driver, r-chunk loop, IBZ resolver |
 | `wfn_transforms.py:439-626` | `accumulate_rchunk_to_gflat` | r-chunk → G-sphere FFT-and-accumulate |
 | `psi_G_store.py` | `PsiGStore`, `build_psi_G_store` | host-resident ψ(G) cache + slicer |
-| `centroid/orbit_syms.py` | `compute_centroid_sym_perm` | centroid sym closure + L-table |
+| `symmetry_maps` (service door) | `compute_centroid_sym_perm` | centroid sym closure + L-table |
 | `gw/v_q_g_flat.py:56-146` | `_make_per_q_kernel` | compile-once per-q G-chunked GEMM kernel |
 | `gw/v_q_g_flat.py:154-223` | `_resolve_ibz_q_list` | IBZ cascade gate + centroid orbit closure |
 | `gw/v_q_g_flat.py:226-231` | `_pick_g_chunk` | largest divisor of `ngkmax` ≤ `target=4096` |
@@ -1087,10 +1087,10 @@ per rank at `chunk_size=64`.
 | `gw/v_q_g_flat.py:499-569` | `compute_all_V_q_g_flat` | charge-channel public entry point |
 | `gw/v_q_bispinor.py:57-174` | `UNIQUE_TILES`, `_make_v_per_G_for_tile` | 7-tile enumeration + per-tile weight |
 | `gw/v_q_bispinor.py:482-…` | `compute_V_q_bispinor_g_flat_to_h5` | bispinor orchestrator |
-| `symmetry_maps.py` | `find_irreducible_bz_points` | IBZ k/q resolver |
-| `symmetry_maps.py` | `slice_q_full_to_ibz` | full-BZ → IBZ q-axis gather (sharding-preserving, jit-cached) |
-| `symmetry_maps.py` | `unfold_v_q` | IBZ → full BZ centroid double-permute + L-phase + TRS conj; shard_map + paired `all_to_all` for 1×-tile peak per rank |
-| `symmetry_maps.py` | `SymMaps` | sym tables, IBZ index helpers |
+| `symmetry_maps` (service door) | `find_irreducible_bz_points` | IBZ k/q resolver |
+| `symmetry_maps` (service door) | `slice_q_full_to_ibz` | full-BZ → IBZ q-axis gather (sharding-preserving, jit-cached) |
+| `symmetry_maps` (service door) | `unfold_v_q` | IBZ → full BZ centroid double-permute + L-phase + TRS conj; shard_map + paired `all_to_all` for 1×-tile peak per rank |
+| `symmetry_maps` (service door) | `SymMaps` | sym tables, IBZ index helpers |
 | `gw/gw_jax.py` | chi0/W block | W_q = (1-V_qχ_q)⁻¹V_q solved at IBZ via `slice_q_full_to_ibz` + Cholesky/LU, unfolded with `unfold_v_q` |
 | `file_io/zeta_reader.py` | `ZetaReader` | G-flat per-q HDF5 slab reader |
 | `file_io/slab_io.py` | `SlabIO` | phdf5 writer with `valid_shape=` μ-pad clip |

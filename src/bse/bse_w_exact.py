@@ -210,7 +210,7 @@ def _symmetry_reduced_q_list(input_file: str) -> np.ndarray:
     from ffi import _services
     _services.ensure_on_path()
     from wfn_loader import WfnLoader
-    from common.symmetry_maps import SymMaps
+    from symmetry_maps import SymMaps
     from .bse_io import _parse_wfn_path
     wfn = WfnLoader(_parse_wfn_path(input_file))
     sym = SymMaps(wfn)

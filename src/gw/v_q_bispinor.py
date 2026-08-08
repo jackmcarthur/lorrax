@@ -355,7 +355,9 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # because the per-q sym op is identity there.  See derivation §A5.
     # ------------------------------------------------------------------
     if _use_ibz_T and sym is not None and tt_buffer:
-        from common.symmetry_maps import unfold_v_q_bispinor_lorentz
+        from ffi import _services
+        _services.ensure_on_path()
+        from symmetry_maps import unfold_v_q_bispinor_lorentz
 
         # Synthesise the 3 Hermitian-redundant tiles (j, i) for i < j from
         # the stored upper-triangle.  These are needed as INPUTS to the

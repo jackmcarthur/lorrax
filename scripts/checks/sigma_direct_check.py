@@ -63,7 +63,6 @@ import jax.numpy as jnp
 import numpy as np
 
 from common import Meta
-from common import symmetry_maps
 from common.chi_from_dipole import compute_S_omega, read_dipole_h5
 from gw.gw_init import read_cohsex_input
 from gw.minimax_screening import extract_gn_ppm_parameters_from_Wc
@@ -75,6 +74,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
+import symmetry_maps                                            # noqa: E402
 
 RYD2EV = 13.6056980659
 

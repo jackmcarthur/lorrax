@@ -801,7 +801,7 @@ Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` — the square 
 | `common/cholesky_2d.py` | 2D blocked Cholesky |
 | `common/fft_helpers.py` | Flat-k ↔ 3-D FFT helpers (custom_partitioning) |
 | `common/meta.py` | `Meta` system dataclass |
-| `common/symmetry_maps.py` | IBZ → full BZ unfolding, spinor rotations (TRS-augmented `SymMaps`; see [`SYMMETRY_COMPREHENSIVE.md`](symmetry.md) for the BGW `mtrx` / τ convention and the `unfold_psi` / `unfold_v_q` / `compute_centroid_sym_perm` procedures) |
+| `services/symmetry_maps/` (`import symmetry_maps`) | IBZ → full BZ unfolding, spinor rotations (TRS-augmented `SymMaps`; see [`SYMMETRY_COMPREHENSIVE.md`](symmetry.md) for the BGW `mtrx` / τ convention and the `unfold_psi` / `unfold_v_q` / `compute_centroid_sym_perm` procedures, and [the service page](../services/symmetry_maps.md) for the contract) |
 | `common/minimax.py`, `common/minimax_assets/` | Quadrature solvers + shipped tables |
 | `common/chi_from_dipole.py` | $S_{\alpha\beta}(\omega)$ from dipole mtxels |
 | `file_io/slab_io.py` | `SlabIO` — phdf5 writer (FFI + allgather backends) |

@@ -604,7 +604,9 @@ def _kstar(inputs):
     ``gw_iteration_map`` be written ONCE: ``select``/``broadcast`` are
     no-ops on it, so the full-BZ path is the same code, not a branch.
     """
-    from common.symmetry_maps import KStarMap
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import KStarMap
     ks = getattr(inputs, "kstar", None)
     if ks is not None:
         return ks
@@ -1008,9 +1010,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # k-grid and needs the whole grid.  ``broadcast`` is an index gather
     # plus a conjugation on time-reversed members -- a band index is
     # symmetry-inert, so no umklapp phase or centroid permutation enters
-    # (see common.symmetry_maps, above star_select).
+    # (see symmetry_maps.maps, above star_select).
     # The broadcast is a device gather and keeps the operand's sharding
-    # (``common.symmetry_maps``, ``_row_out_sharding``), so U_full arrives
+    # (``symmetry_maps``, ``_row_out_sharding``), so U_full arrives
     # at ``band_rotation_spec`` — what ``rotate_bands`` and
     # ``rotate_wavefunctions`` want — and U never crosses to the host.  It
     # needs no ``_place`` first, unlike the host-numpy form it replaces.
@@ -1769,7 +1771,9 @@ def run_sc_driver(
     #     (nk=10, nb_active=128)".
     #
     # Construction is two numpy index arrays plus a ``np.unique``.
-    from common.symmetry_maps import KStarMap
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import KStarMap
     kstar_io = KStarMap.from_sym(sym, int(wfn.ntran))
     kstar = None
     if bool(getattr(config, "sc_on_ibz", False)):

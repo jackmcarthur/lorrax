@@ -35,7 +35,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
-from common import symmetry_maps, timing
+from common import timing
 from common.collectives import process_rank
 
 from . import distribution as dist
@@ -48,6 +48,12 @@ from .kmeans_isdf import (
     snap_centroids_to_grid,
     ensure_unique_centroids,
 )
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+import symmetry_maps                                            # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -256,7 +262,9 @@ def _resolve_symmetry(args, wfn, sym, charge_density):
     """
     if args.no_orbit:
         return None, None, None, 1, False
-    from .orbit_syms import build_real_space_syms
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import build_real_space_syms
     R, Rinv, tau = build_real_space_syms(
         wfn, sym, charge_density=charge_density)
     n_sym = int(R.shape[0])
@@ -324,7 +332,9 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
         # matching compute_centroid_sym_perm and validate_atomic_symmetries.
         # A no-op vs forward S on symmorphic systems (CrI3, MoS2); critical
         # for Si Fd-3m.
-        from .orbit_syms import unfold_orbit_unique_with_id
+        from ffi import _services
+        _services.ensure_on_path()
+        from symmetry_maps import unfold_orbit_unique_with_id
         unfolded, orbit_id = unfold_orbit_unique_with_id(
             reps_snapped, np.asarray(Rinv), np.asarray(tau))
         print(f"\nUnfolded {centroids_frac.shape[0]} reps → "

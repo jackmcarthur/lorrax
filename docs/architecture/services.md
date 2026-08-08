@@ -222,6 +222,9 @@ sanctioned upward edges (tests/test_layering.py, argued in layers.md §5):
       — closed by deletion on feat/slabio-one-backend-2026-08-06
  !R2  solvers.sternheimer_solve ──▶ psp.dft_operators
  !R3  centroid.kmeans_isdf ──▶ centroid.orbit_syms   (lazy)
+      — CLOSED 2026-08-07: orbit_syms moved to services/symmetry_maps/,
+        the site is `from symmetry_maps import canonicalize_orbit`, and a
+        service door is not ranked (layers.md §5)
  !R4  mixing.acceleration writes JAX_ENABLE_X64 at import (env touch)
 ```
 

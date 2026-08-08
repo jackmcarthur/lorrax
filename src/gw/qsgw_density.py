@@ -270,7 +270,7 @@ def rotate_band_matrix(A, U, *, mesh: Mesh, to_qp: bool):
 def symmetrise_density(rho_r, sym_perm):
     """ρ_sym[r] = (1/n_sym) Σ_s ρ[sym_perm[s, r]] — the star average.
 
-    ``sym_perm`` is ``centroid.orbit_syms.compute_rgrid_sym_perm``'s table,
+    ``sym_perm`` is ``symmetry_maps.compute_rgrid_sym_perm``'s table,
     ``sym_perm[s, r_new] = r_old`` with ``r_{r_new} ≡ S_s·r_{r_old} + τ_s``
     on the FFT grid, so the fractional translations are already handled and
     this is a pure gather.
@@ -347,7 +347,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     build rather than one materialised ψ̃ per k.
 
     SYMMETRISATION IS ENFORCED, NOT DOCUMENTED.  ``sym_perm`` (from
-    ``centroid.orbit_syms.compute_rgrid_sym_perm``) makes the result the
+    ``symmetry_maps.compute_rgrid_sym_perm``) makes the result the
     star average; see :func:`symmetrise_density`.  A k-set with
     NON-UNIFORM weights is by construction reduced, and this routine
     REFUSES it without ``sym_perm`` rather than returning the
@@ -401,7 +401,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
             f"is the density of the representatives, not of the crystal, and "
             f"it still integrates to the exact electron count — so no other "
             f"check here would catch it.  Pass "
-            f"centroid.orbit_syms.compute_rgrid_sym_perm(...).")
+            f"symmetry_maps.compute_rgrid_sym_perm(...).")
     w_j = jnp.asarray(kweights, dtype=jnp.float64)
     bidx_j = jnp.asarray(box_index, dtype=jnp.int32)
 

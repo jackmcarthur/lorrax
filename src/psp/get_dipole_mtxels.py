@@ -40,7 +40,6 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
-from common import symmetry_maps
 from common import timing
 from common.collectives import barrier, gather_k_blocks
 from common.mtxel_sweep import (SweepGeometry, band_sphere_spec,
@@ -54,6 +53,12 @@ from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
                                momentum_matrix_k)
 import psp.vnl_ops as vnl_ops
 import h5py
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+import symmetry_maps                                            # noqa: E402
 # --------------------------
 # K+G helpers
 # --------------------------
