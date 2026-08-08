@@ -46,6 +46,27 @@ Notes / Limitations
   enk_full.  They do not provide precomputed W(i*omega_p) heads; those are
   either computed from auxiliary files (eps0mat/dipole + WFN metadata) or
   provided via overrides.
+
+Status
+------
+NOTHING IMPORTS THIS AND NOTHING RUNS IT, which is how it came to sit
+broken for a month: `1fb160c` (2026-07-08) deleted
+`extract_gn_ppm_parameters_from_Wc` under a "grep-verified zero callers"
+claim whose grep covered `src/` and not `scripts/`, and the resulting
+`ImportError` surfaced only when a survey went looking on 2026-08-08.
+The call was repointed at the surviving `fit_gn_ppm_from_wc_pair` (see
+the note at the call site) because the deleted function was pure
+shape-adaptation over it -- no physics was lost and none had to be
+restored.
+
+The durable fix is not in this file.  A debug driver with no importer is
+invisible to exactly the kind of deletion sweep that broke it, so either
+`scripts/` gets a collection gate that at least imports every module
+under it, or a driver that has outlived its question gets deleted rather
+than left to rot.  This one has not outlived its question -- the GN-PPM
+branch signs and the static-fallback policy it checks are both live, and
+it is the only place they are checked against a transparent
+sum-over-states reference -- so the recommendation is the gate.
 """
 
 from __future__ import annotations
@@ -65,13 +86,24 @@ import numpy as np
 from common import Meta
 from common.chi_from_dipole import compute_S_omega, read_dipole_h5
 from gw.gw_init import read_cohsex_input
-from gw.minimax_screening import extract_gn_ppm_parameters_from_Wc
+from gw.minimax_screening import fit_gn_ppm_from_wc_pair
 from gw.vcoul import compute_q0_averages
 from file_io import EPSReader, resolve_input_paths
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
 _services.ensure_on_path()
+
+# x64, EXPLICITLY, because this script has no ``runtime.bootstrap()`` and
+# ``import jax`` above already resolved the flag — so the
+# ``os.environ.setdefault("JAX_ENABLE_X64", "1")`` backstop in
+# ``src/gw/__init__.py`` fires too late to matter here.  It has to happen
+# before the ``symmetry_maps`` import below, whose module scope evaluates
+# ``jnp.int64(10**12)`` and raises OverflowError under x32; the quieter
+# consequence is that every ``jnp.complex128`` in this file would
+# otherwise have been complex64.  Same call ``gw.gw_jax`` makes after its
+# own bootstrap.
+jax.config.update("jax_enable_x64", True)
 
 from wfn_loader import WfnLoader                                    # noqa: E402
 import symmetry_maps                                            # noqa: E402
@@ -503,22 +535,40 @@ def run(cfg_path: str) -> int:
     print(f"  ||W(i*omega_p)||_F = {np.linalg.norm(wi_headed, ord='fro'):.10e}")
 
     # GN-PPM fit from head-corrected W^c.
+    #
+    # THE WRAPPER THIS USED TO CALL IS GONE.  1fb160c (2026-07-08) deleted
+    # ``extract_gn_ppm_parameters_from_Wc`` and the ``GodbyNeedsPPM``
+    # dataclass it returned, on a zero-callers claim that grepped ``src/``
+    # and not ``scripts/``.  Nothing physical went with them: the wrapper
+    # only reshaped a 7D (nkx,nky,nkz,1,mu,1,mu) block down to (q,mu,nu),
+    # forwarded to ``fit_gn_ppm_from_wc_pair``, and packed the four
+    # returns into a dataclass.  So this calls the fit directly on the
+    # flat-q form, and the 7D dressing is dropped rather than rebuilt.
+    #
+    # ``n_mu_logical`` is what 1fb160c made REQUIRED, and it is the point
+    # of the whole commit: pad modes are born DEAD (Omega = 0, B = 0,
+    # valid = False) so no consumer needs a census mask.  This driver's
+    # restart tensors are unpadded and single-q, so the logical centroid
+    # count is ``nrmu`` and the mask is all-true -- but passing it
+    # explicitly is what keeps that true if the restart file ever carries
+    # a padded mu extent.
+    if float(cfg.omega_p_ry) <= 0.0:
+        raise ValueError("omega_p must be > 0 for GN-PPM extraction.")
     wc0 = w0_headed - v_headed
     wci = wi_headed - v_headed
-    wc0_q = wc0[None, None, None, None, :, None, :]
-    wci_q = wci[None, None, None, None, :, None, :]
-    ppm = extract_gn_ppm_parameters_from_Wc(
-        jnp.asarray(wc0_q, dtype=jnp.complex128),
-        jnp.asarray(wci_q, dtype=jnp.complex128),
-        omega_p=float(cfg.omega_p_ry),
+    omega_munu, b_munu, valid, unfulfilled = fit_gn_ppm_from_wc_pair(
+        jnp.asarray(wc0[None], dtype=jnp.complex128),
+        jnp.asarray(wci[None], dtype=jnp.complex128),
+        1j * float(cfg.omega_p_ry),
         fallback_omega=float(params.get("ppm_fallback_omega", 2.0)),
+        n_mu_logical=int(nrmu),
     )
-    b_munu = np.asarray(ppm.b_qmunu[0, 0, 0], dtype=np.complex128)
-    omega_munu = np.asarray(ppm.omega_qmunu[0, 0, 0], dtype=np.float64)
-    valid = np.asarray(ppm.valid_qmunu[0, 0, 0], dtype=bool)
+    b_munu = np.asarray(b_munu[0], dtype=np.complex128)
+    omega_munu = np.asarray(omega_munu[0], dtype=np.float64)
+    valid = np.asarray(valid[0], dtype=bool)
     print(
         f"  GN-PPM fit: omega_p={cfg.omega_p_ry:.6f} Ry, "
-        f"unfulfilled={100.0 * float(ppm.unfulfilled_fraction):.2f}%"
+        f"unfulfilled={100.0 * float(unfulfilled):.2f}%"
     )
 
     # Direct diagonal sigma terms for solve bands.

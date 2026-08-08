@@ -39,7 +39,7 @@ import jax
 import jax.numpy as jnp
 
 from common.collectives import all_gather_processes, barrier
-from file_io import CrystalData, WFNWriter
+from file_io import CrystalData, WFNReader, WFNWriter
 from psp.pseudos import load_pseudopotentials
 from psp.h_dft import setup_H_k_from_kvec, make_apply_H
 from psp.dft_precond import make_dft_preconditioner, make_pw_init
@@ -107,6 +107,102 @@ def _make_flat_matvec(apply_H_batched, nspinor, ngkmax):
     def apply_H_flat(x):
         return apply_H_batched(x.reshape(1, nspinor, ngkmax)).reshape(-1)
     return apply_H_flat
+
+
+def _load_deterministic_bands(wfn_path, crystal, kgrid, nosym, nspinor,
+                              verbose=True):
+    """Read deterministic bands + ψ(G) from an existing WFN.h5.
+
+    THE READ BELONGS TO THE SERVICE, and this used to be a hand-rolled
+    ``h5py`` block that got the on-disk layout wrong.  ``wfns/coeffs`` is
+    ``(nbands, nspinor, Σ_k ngk[k], 2)`` — the G axis is CONCATENATED over
+    k, not a per-k ``ngkmax`` rectangle (``file_io.wfn_writer.WFNWriter``
+    allocates ``ngktot = ngk.sum()`` and ``write_k`` writes the slice
+    ``[:, :, off:off+ngk[ik], :]``).  Slicing one band out of that and
+    calling it k-point 0 is only ever right at nk=1; for nk>1 it is a
+    ``ValueError`` on the assignment, because Σ_k ngk[k] always exceeds
+    the ``ngkmax`` buffer it was being poured into.  ``WFNReader`` (the
+    ``wfn_loader`` door) carries the per-k offsets, so it is what reads.
+
+    Two details of that adoption are load-bearing:
+
+    * **``load_process_local``, not ``load``.**  ``load`` returns a
+      *global* array whose band axis is padded up to mesh divisibility;
+      at P>1 that padding would arrive here as extra all-zero bands and
+      go straight into ``Phi_dav_0``.  ``load_process_local`` returns
+      exactly ``bands[1] - bands[0]`` bands, addressable by this process
+      alone — which is what this driver wants, since every rank reads the
+      same file and needs the same ψ.
+    * **``ngk_valid`` travels with ψ.**  Mask detectable ≠ mask optional
+      (``docs/services/wfn_loader.md``): the loader's ψ is padded to the
+      FILE's ``ngkmax``, and the columns past ``ngk[ik]`` are not
+      physical.  They are also how the two ``ngkmax`` definitions are
+      reconciled — the file's (``max_k ngk``) against the one
+      :func:`_setup_kgrid` recomputes from the crystal, which is the one
+      the Hamiltonian and ``dim_flat`` are built on.
+
+    Returns ``(nbnd, nk, kpoints, weights, ngkmax, gvecs_per_k,
+    eigenvalues, all_evecs)``.  ``all_evecs`` is
+    ``(nk, nbnd, nspinor, ngkmax)`` c128 on the GRID's ``ngkmax``.
+
+    NOTE (not fixed here, pre-existing): the ψ this returns is in the
+    file's QE G-order, while ``make_apply_H`` works in the Davidson
+    |k+G|²-sorted order — ``reorder_to_qe`` is the map between them and
+    has no inverse applied on the way back in.  That is a separate defect
+    on the same path and wants its own gate.
+    """
+    w = WFNReader(wfn_path)
+    nk_file = int(w.nkpts)
+    nbnd_file = int(w.nbands)
+    if int(w.nspinor) != int(nspinor):
+        raise ValueError(
+            f"{wfn_path} has nspinor={int(w.nspinor)} but the crystal has "
+            f"nspinor={int(nspinor)}; the two must agree.")
+
+    n_occ = int(crystal.nelec) // 2 if nspinor == 1 else int(crystal.nelec)
+    if nbnd_file <= n_occ:
+        raise ValueError(
+            f"WFN.h5 has {nbnd_file} bands but system has {n_occ} "
+            f"occupied states. Need bands > n_occupied for pseudobands.")
+
+    eigenvalues = np.asarray(w.energies[0], dtype=np.float64)   # (nk, nbnd)
+    kpoints, weights, ngkmax, gvecs_per_k = _setup_kgrid(
+        crystal, kgrid, nosym,
+        np.asarray(w.kpoints, dtype=np.float64),
+        np.asarray(w.kweights, dtype=np.float64), verbose)
+
+    # ── Reconcile the two ngkmax sources ────────────────────────────
+    # The per-k G-lists are the strong statement: ψ's G axis is indexed
+    # against the file's ``wfns/gvecs``, and every downstream consumer
+    # (H_k, the pseudobands writer) indexes against ``gvecs_per_k``.  If
+    # those disagree the coefficients are being read against the wrong
+    # sphere, which is silent rather than fatal — so refuse.
+    ngk_file = np.asarray(w.ngk_valid(k="ibz"), dtype=np.int64)
+    ngk_grid = np.array([g.shape[0] for g in gvecs_per_k], dtype=np.int64)
+    if not np.array_equal(ngk_file, ngk_grid):
+        bad = int(np.argmax(ngk_file != ngk_grid))
+        raise ValueError(
+            f"{wfn_path} disagrees with the NSCF G-sphere: at k={bad} the "
+            f"file has ngk={int(ngk_file[bad])} and this run's ecutwfc/FFT "
+            f"grid gives {int(ngk_grid[bad])}.  ψ(G) can only be read "
+            f"against the G-list it was written with.")
+    if int(w.ngkmax) > int(ngkmax):
+        raise ValueError(
+            f"{wfn_path} has ngkmax={int(w.ngkmax)}, larger than the "
+            f"ngkmax={int(ngkmax)} this run's k-grid gives; ψ would not fit "
+            f"the Hamiltonian's G buffer.")
+
+    # ψ for THIS process: no mesh-divisibility band padding (see docstring).
+    psi = np.asarray(
+        w.load_process_local(bands=(0, nbnd_file), k="ibz"))
+    all_evecs = np.zeros((nk_file, nbnd_file, nspinor, int(ngkmax)),
+                         dtype=np.complex128)
+    for ik in range(nk_file):
+        ng_k = int(ngk_file[ik])
+        all_evecs[ik, :, :, :ng_k] = psi[ik, :, :, :ng_k]
+
+    return (nbnd_file, nk_file, kpoints, weights, int(ngkmax), gvecs_per_k,
+            eigenvalues, all_evecs)
 
 
 def _write_pb_k(writer, ik, pb_result, H_k, gvecs_qe, nspinor, ngkmax):
@@ -291,8 +387,6 @@ def run_nscf(
     # ══════════════════════════════════════════════════════════════
 
     if not do_davidson and do_pseudobands:
-        import h5py
-
         wfn_path = pb_wfn_input
         if wfn_path is None:
             raise ValueError(
@@ -304,36 +398,14 @@ def run_nscf(
         if verbose:
             print(f"\n── Loading deterministic bands from {wfn_path} ──")
 
-        with h5py.File(wfn_path, "r") as f:
-            nk_file = int(f["mf_header/kpoints/nrk"][()])
-            nbnd_file = int(f["mf_header/kpoints/mnband"][()])
-            eigenvalues = f["mf_header/kpoints/el"][0]  # (nk, nbnd)
-            kpoints_file = f["mf_header/kpoints/rk"][:]
-            weights_file = f["mf_header/kpoints/w"][:]
-
-            # Validate
-            n_occ = int(crystal.nelec) // 2 if nspinor == 1 else int(crystal.nelec)
-            if nbnd_file <= n_occ:
-                raise ValueError(
-                    f"WFN.h5 has {nbnd_file} bands but system has {n_occ} "
-                    f"occupied states. Need bands > n_occupied for pseudobands.")
-
-            # Read wavefunction coefficients
-            coeffs = f["wfns/coeffs"]  # (nbnd, nspinor, ngk_max, 2)
-            all_evecs = np.zeros((nk_file, nbnd_file, nspinor, ngkmax), dtype=np.complex128)
-            for ib in range(nbnd_file):
-                c = coeffs[ib]  # (nspinor, ngk, 2)
-                c_complex = c[:, :, 0] + 1j * c[:, :, 1]
-                # Pad to ngkmax if needed
-                ngk_file = c_complex.shape[1]
-                all_evecs[0, ib, :, :ngk_file] = c_complex
-
-        nbnd = nbnd_file
-        kpoints = kpoints_file
-        weights = weights_file
-        nk = nk_file
-        kpoints, weights, ngkmax, gvecs_per_k = _setup_kgrid(
-            crystal, kgrid, nosym, kpoints, weights, verbose)
+        # ``ngkmax``/``gvecs_per_k`` are re-derived here from the FILE's
+        # k-points, and the ψ buffer is sized on that re-derived ngkmax —
+        # the old block allocated on the pre-read one and only then called
+        # ``_setup_kgrid`` again, so the buffer could be the wrong width
+        # for the ``dim_flat`` the pseudobands stage builds below.
+        (nbnd, nk, kpoints, weights, ngkmax, gvecs_per_k,
+         eigenvalues, all_evecs) = _load_deterministic_bands(
+            wfn_path, crystal, kgrid, nosym, nspinor, verbose)
 
         if verbose:
             print(f"  Loaded {nbnd} bands, {nk} k-points from {wfn_path}")
