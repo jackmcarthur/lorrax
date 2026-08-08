@@ -116,9 +116,18 @@ import numpy as np
 # budget of the largest shape we run (and ~10⁶× above what a small deck
 # actually measures), while the corruption it exists to catch is a RELATIVE
 # perturbation of order 1e-2…1e-1 of the matvec output — 7 to 8 orders of
-# magnitude above the threshold.  There is no tuning freedom in that gap: any
-# tolerance in [1e-11, 1e-4] gives the same verdict on every case we have.  It
+# magnitude above the threshold.  There is no tuning freedom in that gap.  It
 # is not chosen to make a test pass; it is the round-off bound rounded up.
+#
+# CORRECTION (2026-08-08).  This paragraph used to end "any tolerance in
+# [1e-11, 1e-4] gives the same verdict on every case we have".  A case now
+# exists that the window does NOT classify uniformly: si_bse_debug, on the
+# Miller-(0,0,0) head-slot rule, measures rel ~1.2e-06 -- squarely inside it.
+# The claim was too strong and is retired rather than re-asserted.  The
+# CONSTANT is untouched and stays untouched: with the head-slot defect fixed
+# (see ``_ALPHA_CAUSE``) the same deck measures 3.165e-14 against the same
+# 1e-9, i.e. 4.5 orders of headroom, so the tolerance has now been validated
+# end to end rather than merely derived.
 #
 # COST — why this is always-on and not behind LORRAX_SANITY
 # ---------------------------------------------------------
@@ -150,16 +159,59 @@ _ALPHA_FORMS = {
               "Q_j, so a nonzero antihermitian part"),
 }
 
+# WHY THIS TEXT WAS REWRITTEN (2026-08-08, alongside the head-slot fix on
+# this branch).  It used to name the gloo ``psum_scatter`` corruption as
+# "the known cause on this stack" and instruct the reader to re-run under
+# ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` before believing any
+# eigenvalue.  That text predates the diagnosis and is falsified three ways
+# on the only deck that has ever fired this gate: the residual is
+# bit-identical across fourteen P=4 runs (the corruption is
+# non-deterministic, ~5% of executions), it is present at P=1 where there is
+# no collective at all (9.365e-07), and it reproduced bit-identically on a
+# single-process login-node dense probe with no reduce-scatter anywhere.
+# Sending every reader to the collective is a large part of why this line
+# went unread on a gate that was telling the truth.
+#
+# The full evidence -- the stage-by-stage reciprocity walk, the dense
+# control that pins the whole non-Hermiticity on the W term, the tolerance
+# derivation above, and the one-commit A/B that takes 1.155e-06 to
+# 3.165e-14 -- is written up in (agent workspace, not in-tree):
+#     ~/lorrax_bse_perf_2026-08-08/HERMITICITY_INVESTIGATION.md
+# with the A/B logs at
+#     /pscratch/sd/j/jackm/vcoul_head_0808/_reports/bse4p_{control,fixed}_400.log
+# and the two frozen references the fix moves catalogued in
+#     ~/lorrax_service_phase/NOTE_vcoul_head_refreeze.md
 _ALPHA_CAUSE = (
-    " means the matvec did not return H*q -- the "
-    "operator, not the algorithm, is wrong.  Known cause on this stack: a "
-    "silent reduce-scatter corruption (jax.lax.psum_scatter under "
-    "JAX_CPU_COLLECTIVES_IMPLEMENTATION=gloo returns wrong data in ~5% of "
-    "executions, always output segment 0; see "
-    "wk_REL/UPSTREAM_gloo_psum_scatter_corruption.md).  Re-run under "
-    "JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi (clean in 584/584) before "
-    "believing any eigenvalue from this solve.  Other candidates: a "
-    "non-Hermitian W/V tile fed to the matvec, or a mis-transposed shard."
+    " means the matvec did not return H*q -- the operator, not the "
+    "algorithm, is wrong.  WHAT WAS MEASURED: dev = max_j|Im alpha_j| "
+    "(block forms: max_j max|alpha_j - alpha_j^H|) over the Krylov vectors "
+    "this solve actually visited, divided by scale = max_j|alpha_j|; both "
+    "are printed above, so the ratio is already normalised by the "
+    "operator's own magnitude and cannot be explained away by the dynamic "
+    "range of the tiles.  alpha_j is real (Hermitian) for ANY Hermitian H "
+    "and ANY q_j, so the recurrence, the reorthogonalisation and the "
+    "iteration count cannot manufacture this number.  KNOWN CAUSE on this "
+    "stack, and the first thing to check: the mini-BZ Coulomb head used to "
+    "be injected at the slot labelled Miller (0,0,0), and that label is "
+    "NOT equivariant under q -> -q -- the BGW wrap sends a zone-boundary "
+    "component to +1/2 rather than -1/2, so slot (0,0,0) at +q pairs with "
+    "a slot carrying the BARE value at -q.  V_q therefore carried a "
+    "q <-> -q reciprocity break, W inherited it, and the matvec transports "
+    "it faithfully into alpha.  Measured on si_bse_debug: rel 1.155e-06 "
+    "under the label rule, 3.165e-14 once the head is injected at "
+    "argmin|q+G|^2 over the tied set.  If this tree's vcoul.v_qG_table "
+    "still takes a per-q ``v_head_miniBZ`` table rather than "
+    "``v_head_fn`` + ``head_tie_rtol``, it predates that fix and this is "
+    "what you are looking at.  Other candidates, in order: any other "
+    "non-Hermitian W/V tile fed to the matvec; a mis-transposed shard; "
+    "and -- ONLY if the residual does not reproduce bit-for-bit at fixed "
+    "process count -- the gloo reduce-scatter corruption "
+    "(jax.lax.psum_scatter under JAX_CPU_COLLECTIVES_IMPLEMENTATION=gloo "
+    "returns wrong data in ~5% of executions, always output segment 0; "
+    "see wk_REL/UPSTREAM_gloo_psum_scatter_corruption.md), which re-runs "
+    "clean under ...=mpi.  DETERMINISM IS THE DISCRIMINATOR: an operator "
+    "defect is bit-stable at fixed configuration and survives P=1; the "
+    "corruption is neither."
 )
 
 
