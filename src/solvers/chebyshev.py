@@ -55,8 +55,9 @@ def jackson_coefficients(M: int) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════════
 
 def make_chebyshev_recurrence(
-    apply_h_tilde: Callable[[jax.Array], jax.Array],
+    apply_h_tilde: Callable[..., jax.Array],
     n_moments: int,
+    operands: tuple = (),
 ) -> Callable[[jax.Array], jax.Array]:
     """Return a JIT'd function that computes all Chebyshev moments for one vector.
 
@@ -76,10 +77,25 @@ def make_chebyshev_recurrence(
     recurrence : (x_rand,) -> mu
         JIT'd function mapping a random vector to (n_moments + 1,) raw moments.
     """
+    # WHY THE OPERANDS ARE ARGUMENTS AND NOT A CLOSURE (registered R1).
+    #
+    # This used to be a single ``@jax.jit def recurrence(x_rand)`` closing over
+    # ``apply_h_tilde``.  Closing over a *callable* is legal.  The problem is
+    # what the callable closes over: on the BSE path
+    # (``bse.bse_kpm.make_bse_h_tilde``) it is itself jitted and captures the
+    # ten MESH-SHARDED operands ``psi_c_X … M_Y``.  Tracing inlines those, and
+    # at P>1 jax refuses -- "Closing over jax.Array that spans non-addressable
+    # devices" -- at TRACE time, before any of the P>1 ``device_get`` fixes
+    # downstream can matter.  Same family as ``bse_feast._get_feast_runner``.
+    #
+    # So the jitted body takes them as ARGUMENTS, and a plain-Python wrapper
+    # holds them and forwards them at call time.  That wrapper is not traced,
+    # so its closure is legal at any P.  This is the pattern
+    # ``bse.bse_davidson_helpers.bse_diagonal_precond`` already documents.
     @jax.jit
-    def recurrence(x_rand):
+    def _recurrence(x_rand, *ops):
         t_prev = x_rand
-        t_curr = apply_h_tilde(x_rand)
+        t_curr = apply_h_tilde(x_rand, *ops)
 
         mu_init = jnp.zeros(n_moments + 1, dtype=jnp.float64)
         mu_init = mu_init.at[0].set(jnp.vdot(x_rand, t_prev).real)
@@ -87,12 +103,15 @@ def make_chebyshev_recurrence(
 
         def body(p, carry):
             mu, t_prev, t_curr = carry
-            t_new = 2.0 * apply_h_tilde(t_curr) - t_prev
+            t_new = 2.0 * apply_h_tilde(t_curr, *ops) - t_prev
             mu = mu.at[p].set(jnp.vdot(x_rand, t_new).real)
             return mu, t_curr, t_new
 
         mu, _, _ = jax.lax.fori_loop(2, n_moments + 1, body, (mu_init, t_prev, t_curr))
         return mu
+
+    def recurrence(x_rand):
+        return _recurrence(x_rand, *operands)
 
     return recurrence
 
@@ -110,6 +129,7 @@ def chebyshev_moments(
     seed: int = 0,
     dtype_real: jnp.dtype = jnp.float64,
     make_random_vector: Callable | None = None,
+    operands: tuple = (),
     verbose: bool = True,
 ) -> np.ndarray:
     """Compute Chebyshev moments mu_0, ..., mu_M via stochastic trace estimation.
@@ -136,6 +156,13 @@ def chebyshev_moments(
         (key) -> x_random.  Custom random vector generator (e.g. for masking
         padded dimensions).  If None, generates flat Rademacher +/-1 vectors
         of shape (dim,).
+    operands : tuple, optional
+        Extra arrays forwarded to ``apply_h_tilde`` as RUNTIME ARGUMENTS of the
+        jitted recurrence, rather than captured in its closure.  Pass the
+        mesh-sharded operands here: closing over an array that spans
+        non-addressable devices is refused at trace time at P>1 (registered
+        R1).  Default ``()`` -- ``apply_h_tilde`` is then the one-argument
+        ``x -> H_tilde x`` every existing caller already passes.
     verbose : bool
         Print per-vector progress.
 
@@ -155,7 +182,7 @@ def chebyshev_moments(
     if make_random_vector is None:
         make_random_vector = _default_random_vector
 
-    recurrence = make_chebyshev_recurrence(apply_h_tilde, n_moments)
+    recurrence = make_chebyshev_recurrence(apply_h_tilde, n_moments, operands)
 
     key = jax.random.PRNGKey(seed)
     mu = np.zeros(n_moments + 1)
