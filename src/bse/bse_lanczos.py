@@ -6,6 +6,7 @@ builds the matvec from BSE physics arrays.
 """
 from __future__ import annotations
 
+import os
 from functools import partial
 from typing import Tuple
 
@@ -17,6 +18,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import make_sharded_ifftn_3d
 
 from solvers.lanczos import (
+    reorth_kind,
     alpha_herm_sink,
     block_lanczos_eig,
     block_lanczos_eig_jit,
@@ -29,6 +31,32 @@ from solvers.lanczos import (
 from .bse_serial import apply_bse_hamiltonian_single_device
 from .bse_ring_comm import make_bse_shardings
 import common.timing as timing
+
+
+REORTH_ENV = "LORRAX_LANCZOS_REORTH"
+
+
+def reorth_route() -> str:
+    """Read the Lanczos reorthogonalisation dial and validate it.
+
+    THE ENVIRONMENT IS READ HERE, not in ``solvers.lanczos``.  ``solvers`` is
+    L2 -- physics-agnostic mathematics that
+    ``tests/test_layering.py::test_no_l2_module_reads_the_environment``
+    requires to be a function of its arguments -- so the solver takes a route
+    TOKEN and this module owns the variable, exactly as
+    ``bse_stack_matvec.matvec_opts`` owns ``LORRAX_BSE_MATVEC_OPT`` one layer
+    above the kernels it steers.
+
+    Unset/empty selects the default (batched ``cgs2``: ``2*max_iter``
+    collectives).  ``mgs`` is the legacy per-vector sweep --
+    ``max_iter(max_iter+1)/2`` collectives, 20 100 of them on the Si record
+    deck at 200 iterations -- kept reachable for bisects and for reproducing
+    pre-2026-08-08 runs.  An unknown token REFUSES: a perf dial that can be
+    misspelled into a silent no-op makes every A/B built on it void, and now
+    that ``cgs2`` is the default a typo must not hand back the slow route
+    either.  ``reorth_kind`` raises; the message names this variable.
+    """
+    return reorth_kind(os.environ.get(REORTH_ENV, ""))
 
 
 def solve_bse(
@@ -50,6 +78,7 @@ def solve_bse(
     include_W: bool = True,
 ) -> Tuple[jax.Array, jax.Array]:
     """Solve BSE for lowest exciton eigenvalues."""
+    _reorth = reorth_route()
     nk, nc, _, _ = psi_c.shape
     nv = psi_v.shape[1]
     shape = (nc, nv, nk)
@@ -89,7 +118,8 @@ def solve_bse(
         )
     elif use_jit_lanczos:
         eigenvalues, eigenvectors = lanczos_eig_jit(
-            matvec_flat, n_flat, n_eig=n_eig, max_iter=max_iter, n_reorth=n_reorth
+            matvec_flat, n_flat, n_eig=n_eig, max_iter=max_iter,
+            n_reorth=n_reorth, reorth=_reorth,
         )
         eigenvectors = eigenvectors.reshape(n_eig, *shape)
     else:
@@ -152,6 +182,9 @@ def solve_bse_sharded(
         return solve_bse_nontda_sharded(
             data, mesh_xy, n_eig=n_eig, include_W=include_W)
 
+    # Resolve the reorth dial ONCE here (L1 reads the env; the L2 solver
+    # takes the token) -- same shape as ``krylov_rep`` below.
+    _reorth = reorth_route()
     sh = make_bse_shardings(mesh_xy)
     nc_pad = int(data["n_cond_pad"])
     nv_pad = int(data["n_val_pad"])
@@ -331,10 +364,11 @@ def solve_bse_sharded(
                     matvec_block, n_flat, n_eig=n_eig,
                     block_size=1, max_iter=max_iter,
                     rtol=rtol, atol=atol, check_every=check_every,
-                    n_reorth=n_reorth,
+                    n_reorth=n_reorth, reorth=_reorth,
                 )
             evs, evecs = lanczos_eig_jit(
-                matvec, n_flat, n_eig=n_eig, max_iter=max_iter, n_reorth=n_reorth,
+                matvec, n_flat, n_eig=n_eig, max_iter=max_iter,
+                n_reorth=n_reorth, reorth=_reorth,
             )
             return evs, evecs, jnp.int32(max_iter)
         else:
@@ -370,12 +404,13 @@ def solve_bse_sharded(
                     matvec_block, n_flat, n_eig=n_eig,
                     block_size=bs, max_iter=max_iter,
                     rtol=rtol, atol=atol, check_every=check_every,
-                    n_reorth=n_reorth,
+                    n_reorth=n_reorth, reorth=_reorth,
                 )
             else:
                 evs, evecs = block_lanczos_eig_jit(
                     matvec_block, n_flat, n_eig=n_eig,
                     block_size=bs, max_iter=max_iter, n_reorth=n_reorth,
+                    reorth=_reorth,
                 )
                 return evs, evecs, jnp.int32(max_iter)
 
