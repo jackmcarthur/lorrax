@@ -264,3 +264,137 @@ def test_the_hostile_table_reproduces_the_measured_4x4_row():
     for g in hostile_extents((4, 4)):
         assert g.padded[0] % 4 == 0 and g.padded[1] % 4 == 0
         assert g.padded[0] >= g.logical[0] and g.padded[1] >= g.logical[1]
+
+
+# ---------------------------------------------------------------------------
+# The batched route toggle — vocabulary and the declaration it rests on
+# ---------------------------------------------------------------------------
+#
+# ``Plan.batched`` is a ``lax.scan`` over the single-matrix op unless the
+# backend owns a stacked FFI entry, and ONE thing decides which:
+# ``Plan.batched_route``.  Executing either route needs a mesh and belongs
+# to L-b; what belongs here is the part that must never need a machine —
+# the route vocabulary, and the one declaration the scan route cannot
+# discover for itself.
+#
+# That declaration is ``_IMPL[...]['one_handle']``.  The loop-and-stack path
+# this replaced found out whether a single-matrix result was stackable by
+# CALLING it and looking; a scan cannot, because a library handle is not a
+# pytree and the failure arrives from inside ``lax.scan`` naming neither the
+# op nor the backend.  So the table declares it — and a declaration that
+# nothing checks is a comment, which is what the two cells below are for.
+
+def _return_annotation(module_name: str, func_name: str) -> str:
+    """The source-level return annotation of ``func_name``, by AST.
+
+    Reads the wrapper's own ``.py`` and never imports it: this tier does
+    not get to depend on jax being installed, let alone on a ``.so``.
+    """
+    import ast
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "src" / "distrib_la" / f"{module_name}.py")
+    tree = ast.parse(src.read_text(), filename=str(src))
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            assert node.returns is not None, (
+                f"{module_name}.{func_name} has no return annotation, so "
+                f"there is nothing here to cross-check the _IMPL "
+                f"declaration against.  Annotate it.")
+            return ast.unparse(node.returns)
+    raise AssertionError(
+        f"_IMPL names {func_name!r} in {module_name}.py and that module "
+        f"has no such top-level function")
+
+
+def _declares_arrays(annotation: str) -> bool:
+    """Does this return annotation promise jax arrays rather than a handle?"""
+    return "jax.Array" in annotation
+
+
+#: (op, backend) -> (module, single-matrix entry) for every row of ``_IMPL``
+#: that HAS a single-matrix entry.  Derived from the table, so a new row is
+#: covered the day it is added rather than the day somebody remembers.
+def _rows_with_a_single_matrix_entry():
+    from distrib_la.plan import _IMPL
+    module_of = {"scalapack": "_scalapack", "slate": "_slate",
+                 "cusolvermp": "_cusolvermp", "native2d": "_native2d"}
+    out = []
+    for (op, backend), spec in _IMPL.items():
+        if spec["one"] is not None:
+            out.append((op, backend, module_of[backend], spec["one"],
+                        bool(spec.get("one_handle"))))
+    return out
+
+
+@pytest.mark.parametrize(
+    "op,backend,module,entry,declared_handle",
+    _rows_with_a_single_matrix_entry(),
+    ids=lambda v: str(v))
+def test_one_handle_matches_the_wrappers_own_return_annotation(
+        op, backend, module, entry, declared_handle):
+    """The ``one_handle`` declaration must agree with the wrapper's code.
+
+    ``one_handle=True`` says "this single-matrix entry returns a library
+    HANDLE, so there is no array stack for a scan to build".  The wrapper
+    itself already says the same thing in its return annotation
+    (``-> SlateLowerL`` versus ``-> Tuple[jax.Array, jax.Array]``).  Two
+    statements of one fact drift; this cell is what stops them.
+
+    It fails if somebody sets the flag on an array-returning entry, clears
+    it on a handle-returning one, or changes what a wrapper returns without
+    revisiting the table — which is the case that would otherwise surface
+    as a type error thrown from inside ``lax.scan``.
+    """
+    ann = _return_annotation(module, entry)
+    assert _declares_arrays(ann) is not declared_handle, (
+        f"_IMPL[({op!r}, {backend!r})] declares one_handle="
+        f"{declared_handle}, but {module}.{entry} is annotated "
+        f"-> {ann}")
+
+
+def test_the_annotation_cross_check_can_fail():
+    """RED TWIN for the cell above: it must reject both mismatches.
+
+    Without this, ``_declares_arrays`` returning a constant would pass
+    every row of the table and the cross-check would assert nothing.
+    """
+    assert _declares_arrays("Tuple[jax.Array, jax.Array]") is True
+    assert _declares_arrays("jax.Array") is True
+    assert _declares_arrays("SlateLowerL") is False
+    assert _declares_arrays("CusolverMpBatchedLowerL") is False
+    # ...and the reader really reads the file, so a name that is not there
+    # is an error rather than a quiet default.
+    with pytest.raises(AssertionError):
+        _return_annotation("_slate", "no_such_entry_point")
+
+
+def test_the_route_vocabulary_is_importable_and_closed():
+    """The three routes are a vocabulary, like the backend names.
+
+    Importable with no jax initialised and no ``.so`` anywhere, because a
+    test (or a future deck key) must be able to name a route without
+    building a mesh first.  Closed, because ``Plan.batched`` refuses an
+    unknown route by listing these — a vocabulary with a hole in it would
+    turn a typo into a silent different execution.
+    """
+    from distrib_la import (BATCHED_ROUTES, ROUTE_BACKEND_BATCHED,
+                            ROUTE_BATCH_RESHARD, ROUTE_SCAN)
+    assert BATCHED_ROUTES == (ROUTE_SCAN, ROUTE_BACKEND_BATCHED,
+                              ROUTE_BATCH_RESHARD)
+    assert len(set(BATCHED_ROUTES)) == 3
+    assert all(isinstance(r, str) and r for r in BATCHED_ROUTES)
+
+
+def test_the_scan_unroll_is_one_and_is_a_named_constant():
+    """``unroll=1`` is the DEFAULT, deliberately, and deliberately named.
+
+    One copy of the op in the compiled module and ``nb`` loop trips is what
+    makes the batched surface compile once instead of per matrix.  Raising
+    it trades module size for loop trips and nobody has measured a shape
+    where that wins; the constant exists so that day is an edit in one
+    place with a number behind it.
+    """
+    from distrib_la import BATCHED_SCAN_UNROLL
+    assert BATCHED_SCAN_UNROLL == 1
+    assert isinstance(BATCHED_SCAN_UNROLL, int)

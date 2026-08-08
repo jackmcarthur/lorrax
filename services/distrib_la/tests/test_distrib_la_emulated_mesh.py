@@ -355,3 +355,253 @@ def test_an_ffi_backend_refuses_an_emulated_multi_device_mesh():
     # is what makes the loop above about guard 4 and not about the mesh.
     assert D.resolve_backend("cholesky", "native2d", mesh, n=16) == "native2d"
     assert D.resolve_backend("eigh", "off", mesh) == "native"
+
+
+# ---------------------------------------------------------------------------
+# The batched surface IS a scan over the single-matrix op
+# ---------------------------------------------------------------------------
+#
+# Guard 4 keeps every real FFI backend off an emulated mesh, so these cells
+# put a STAND-IN backend module behind the plan: a module with the right
+# entry-point names whose maths is ``jnp``.  That is not a weaker test of
+# the thing under test — the thing under test is the batching structure
+# (one traced body, the per-backend normaliser applied per matrix, the
+# stack that comes out, the refusals), and none of it is library-specific.
+# The libraries themselves are L-c, on four real ranks, and the
+# batched-vs-serial bit-identity gate is where the two routes are compared
+# on the real ones.
+#
+# The plans here are built by CONSTRUCTING ``Plan`` rather than calling
+# ``plan()``, which the class docstring says never to do — correctly, for
+# production code, because the constructor runs no guards.  Here that is
+# the point: there is no ``.so`` to resolve against and the guards are
+# somebody else's cells.
+
+def _planmod():
+    """The ``distrib_la.plan`` MODULE.
+
+    Not ``from distrib_la import plan``: the door re-exports the
+    ``plan()`` function under that name and the binding shadows the
+    submodule, so the obvious spelling hands back a function.  Going
+    through ``sys.modules`` is the only spelling that cannot be quietly
+    wrong (the batched-eigh gate learned this the same way).
+    """
+    import distrib_la                                          # noqa: F401
+    import sys
+    return sys.modules["distrib_la.plan"]
+
+
+def _stand_in_plan(monkeypatch, op, backend, mesh, module):
+    """A ``Plan`` for ``(op, backend)`` whose backend module is ``module``."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    pm = _planmod()
+    monkeypatch.setattr(pm, "backend_module", lambda b: module)
+    return pm.Plan(op=op, requested=backend, backend=backend, mesh=mesh,
+                   n=None,
+                   in_sharding=NamedSharding(mesh, P("x", "y")),
+                   batch_in_sharding=NamedSharding(mesh, P(None, "x", "y")))
+
+
+def _eigh_stand_in(calls, raw_layout=False):
+    """A module exposing ``distributed_eigh`` on ONE tile.
+
+    ``raw_layout`` mimics cuSOLVERMp, whose wrapper returns the conjugate
+    transpose of the eigenvector matrix rather than the columns — the
+    convention ``plan._eigh_columns`` exists to normalise.
+    """
+    import types
+    import jax.numpy as jnp
+
+    def distributed_eigh(A, *, mesh):
+        assert A.ndim == 2 and A.shape[0] == A.shape[1], (
+            f"the scan must hand the single-matrix entry ONE tile; "
+            f"got {A.shape}")
+        calls.append(tuple(A.shape))
+        w, Q = jnp.linalg.eigh(A)
+        return (w, jnp.conj(jnp.swapaxes(Q, -1, -2))) if raw_layout else (w, Q)
+
+    return types.SimpleNamespace(distributed_eigh=distributed_eigh)
+
+
+@pytest.mark.parametrize("nq", [1, 2, 8])
+def test_the_scan_route_reproduces_the_single_matrix_calls(monkeypatch, nq):
+    """``p.batched(A)`` == stacking ``p(A[q])``, to the bit.
+
+    This is the definition of the batched surface written as a check: the
+    scan is the single-matrix op under a loop the compiler owns, so it may
+    not change an answer.  Bit-equality is the right bar because both sides
+    run the SAME kernel on the SAME operands — a relative bar would pass on
+    a scan that quietly reassociated something.
+    """
+    import jax.numpy as jnp
+    mesh = _mesh(2, 2)
+    rng = np.random.default_rng(4041)
+    A = jnp.asarray(_hpd(rng, nq, 8, "complex128"))
+
+    calls_loop = []
+    p_loop = _stand_in_plan(monkeypatch, "eigh", "slate", mesh,
+                            _eigh_stand_in(calls_loop))
+    W_ref, Z_ref = zip(*(p_loop(A[q]) for q in range(nq)))
+    W_ref, Z_ref = jnp.stack(W_ref), jnp.stack(Z_ref)
+
+    calls_scan = []
+    p_scan = _stand_in_plan(monkeypatch, "eigh", "slate", mesh,
+                            _eigh_stand_in(calls_scan))
+    W, Z = p_scan.batched(A)
+
+    assert p_scan.batched_route == D.ROUTE_SCAN
+    assert (W.shape, Z.shape) == ((nq, 8), (nq, 8, 8))
+    assert np.array_equal(np.asarray(W), np.asarray(W_ref))
+    assert np.array_equal(np.asarray(Z), np.asarray(Z_ref))
+
+
+@pytest.mark.parametrize("nq", [2, 8])
+def test_the_scan_body_is_traced_once_however_long_the_batch(monkeypatch, nq):
+    """ONE trace of the single-matrix entry, whatever ``nq`` is.
+
+    This is the whole reason the batched surface is a scan and not a Python
+    loop, reduced to something a laptop can falsify: the Python loop called
+    the wrapper ``nq`` times and handed the compiler ``nq`` separate calls,
+    and on the wrappers that build their ``shard_map`` eagerly that was
+    ``nq`` traces and ``nq`` compiles.  The scan traces the body once at
+    ``unroll=1`` and the count must not move with ``nq``.
+
+    It fails the moment the scan is replaced by a loop again, which is
+    exactly the regression worth a cell.
+    """
+    import jax.numpy as jnp
+    mesh = _mesh(2, 2)
+    rng = np.random.default_rng(4042)
+    A = jnp.asarray(_hpd(rng, nq, 8, "complex128"))
+    calls = []
+    p = _stand_in_plan(monkeypatch, "eigh", "slate", mesh,
+                       _eigh_stand_in(calls))
+    p.batched(A)
+    assert len(calls) == D.BATCHED_SCAN_UNROLL, (
+        f"the single-matrix entry was traced {len(calls)} times for a "
+        f"{nq}-matrix batch; a scan at unroll={D.BATCHED_SCAN_UNROLL} "
+        f"traces it exactly that many times regardless of nq")
+    assert calls[0] == (8, 8)
+
+
+def test_the_scan_route_applies_the_per_backend_normaliser(monkeypatch):
+    """Eigenvectors come back as COLUMNS on the raw-layout backend too.
+
+    cuSOLVERMp's wrapper returns the conjugate transpose of the
+    eigenvector matrix, and the serial path once returned it unnormalised
+    — ROWS, on the only platform that took that path.  The scan applies
+    ``_eigh_columns`` per matrix for the same reason the loop body did, and
+    the transposed residual is the negative control: without the
+    normaliser the column check passes anyway on a Hermitian operand only
+    if you do not look, which is how the original defect survived.
+    """
+    import jax.numpy as jnp
+    mesh = _mesh(2, 2)
+    rng = np.random.default_rng(4043)
+    A = jnp.asarray(_hpd(rng, 3, 8, "complex128"))
+    p = _stand_in_plan(monkeypatch, "eigh", "cusolvermp", mesh,
+                       _eigh_stand_in([], raw_layout=True))
+    W, Z = p.batched(A)
+
+    def _resid(Z_):
+        lhs = jnp.einsum("qmn,qnp->qmp", A, Z_)
+        rhs = Z_ * W[:, None, :].astype(Z_.dtype)
+        return float(jnp.max(jnp.abs(lhs - rhs))) / float(jnp.max(jnp.abs(A)))
+
+    assert _resid(Z) < 1e-12, "A Z != Z diag(W): the scan returned ROWS"
+    assert _resid(jnp.conj(jnp.swapaxes(Z, -1, -2))) > 1e-6, (
+        "the transposed control also passes, so the check above is "
+        "vacuous on this operand and proves nothing about the layout")
+
+
+def test_a_handle_returning_backend_refuses_the_scan_BEFORE_it_runs(
+        monkeypatch):
+    """SLATE cholesky refuses ``batched()`` without calling the library.
+
+    Its single-matrix ``potrf`` returns a ``SlateLowerL``, so there is no
+    array stack for a scan to build.  ``_IMPL`` DECLARES that, which is why
+    the refusal can name the op, the backend and the surface to use instead
+    — and why nothing runs first.  ``calls == []`` is the half of this that
+    a discovered-by-calling check could not make.
+    """
+    import types
+    import jax.numpy as jnp
+    mesh = _mesh(2, 2)
+    calls = []
+
+    def distributed_cholesky(A, *, mesh):
+        calls.append(tuple(A.shape))
+        return object()                       # a handle, as SLATE's is
+
+    p = _stand_in_plan(monkeypatch, "cholesky", "slate", mesh,
+                       types.SimpleNamespace(
+                           distributed_cholesky=distributed_cholesky))
+    rng = np.random.default_rng(4044)
+    A = jnp.asarray(_hpd(rng, 3, 8, "complex128"))
+    with pytest.raises(NotImplementedError) as ei:
+        p.batched(A)
+    msg = str(ei.value)
+    assert "slate" in msg and "HANDLE" in msg and "factor()" in msg
+    assert calls == [], (
+        f"the refusal ran the library first ({len(calls)} calls); it is a "
+        f"declared property of the row, not something to discover by "
+        f"calling")
+
+
+def test_without_the_declaration_the_handle_case_fails_unreadably(
+        monkeypatch):
+    """RED TWIN for the cell above — why ``one_handle`` is DECLARED.
+
+    Clear the flag and the same call still fails, but from inside
+    ``lax.scan``, with a message that names neither the op nor the backend
+    nor what to do instead.  That is the failure the declaration buys out,
+    and this cell is the evidence that it is a real one rather than a
+    stylistic preference.
+    """
+    import types
+    import jax.numpy as jnp
+    pm = _planmod()
+    mesh = _mesh(2, 2)
+    calls = []
+
+    def distributed_cholesky(A, *, mesh):
+        calls.append(tuple(A.shape))
+        return object()
+
+    row = dict(pm._IMPL[("cholesky", "slate")])
+    row.pop("one_handle")
+    monkeypatch.setitem(pm._IMPL, ("cholesky", "slate"), row)
+
+    p = _stand_in_plan(monkeypatch, "cholesky", "slate", mesh,
+                       types.SimpleNamespace(
+                           distributed_cholesky=distributed_cholesky))
+    rng = np.random.default_rng(4045)
+    A = jnp.asarray(_hpd(rng, 3, 8, "complex128"))
+    with pytest.raises(Exception) as ei:
+        p.batched(A)
+    assert not isinstance(ei.value, NotImplementedError), (
+        "clearing one_handle still produced the readable refusal, so the "
+        "declaration is not what produces it and this twin is not red")
+    assert calls, "the library was never reached, so nothing was learned"
+
+
+def test_the_reserved_batch_reshard_route_refuses_by_name(monkeypatch):
+    """Route (c) is a NAME with no code, and asking for it says so.
+
+    The reserved slot exists so that adding the batch-axis reshard is an
+    edit in the one place that already decides, rather than a new surface.
+    A reserved name that silently did something else — fell back to the
+    scan, say — would defeat the whole point of reserving it.
+    """
+    import jax.numpy as jnp
+    mesh = _mesh(2, 2)
+    p = _stand_in_plan(monkeypatch, "eigh", "slate", mesh,
+                       _eigh_stand_in([]))
+    rng = np.random.default_rng(4046)
+    A = jnp.asarray(_hpd(rng, 2, 8, "complex128"))
+    with pytest.raises(NotImplementedError) as ei:
+        p.batched(A, _route=D.ROUTE_BATCH_RESHARD)
+    assert "face_to_batch_reshard" in str(ei.value)
+    with pytest.raises(ValueError) as ei2:
+        p.batched(A, _route="whatever")
+    assert D.ROUTE_SCAN in str(ei2.value)
