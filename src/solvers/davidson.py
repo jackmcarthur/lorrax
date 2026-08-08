@@ -42,6 +42,41 @@ import jax.numpy as jnp
 import numpy as np
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  Instrumentation (BSE perf campaign, 2026-08-08)
+# ═══════════════════════════════════════════════════════════════════════
+#  These counters are incremented INSIDE jit bodies.  A jit body runs on
+#  host exactly once per TRACE, so one increment == one trace of that
+#  program at that shape signature.  That is the instrument a fixed-shape
+#  claim has to be proven against: ``compile_cache_stats()['compiles']``
+#  reads 0 on any run whose persistent cache is warm, no matter how many
+#  distinct programs the loop dispatches, so it can only ever prove the
+#  cache works -- never that the shapes are fixed.
+TRACE_COUNTS: dict = {}
+MATVEC_APPLICATIONS = [0]      # count of VECTORS H has been applied to
+LAST_RUN: dict = {}            # per-iteration history of the last davidson()
+
+
+def _tally(name, *shapes) -> None:
+    key = (name,) + tuple(str(t) for t in shapes)
+    TRACE_COUNTS[key] = TRACE_COUNTS.get(key, 0) + 1
+
+
+def reset_instrumentation() -> None:
+    TRACE_COUNTS.clear()
+    MATVEC_APPLICATIONS[0] = 0
+    LAST_RUN.clear()
+
+
+def instrumentation_summary() -> str:
+    lines = [f"[dav-instr] matvec applications (vectors): "
+             f"{MATVEC_APPLICATIONS[0]}",
+             f"[dav-instr] distinct traced programs: {len(TRACE_COUNTS)}"]
+    for k in sorted(TRACE_COUNTS, key=str):
+        lines.append(f"[dav-instr]   {k} -> {TRACE_COUNTS[k]} trace(s)")
+    return "\n".join(lines)
+
+
 def _to_host(arr) -> np.ndarray:
     """Bring a (possibly multi-process) jax.Array to host as numpy.
 
@@ -93,6 +128,7 @@ def _ritz_and_residuals(V, HV, n_eig):
 
     Returns (eigenvalues, X, HX, R, res_norms).
     """
+    _tally('ritz_and_residuals', V.shape, n_eig)
     # (m, m) projections — ellipsis sums all trailing axes
     Hc = jnp.einsum('m...,n...->mn', jnp.conj(V), HV, optimize=True)
     Sc = jnp.einsum('m...,n...->mn', jnp.conj(V), V, optimize=True)
@@ -137,6 +173,7 @@ def _orthonormalise_batch(P):
     Same self-orthonormalisation step as ``_ortho_expand`` without the
     against-V projection — used to clean up the initial subspace V0.
     """
+    _tally('orthonormalise_batch', P.shape)
     S_P = jnp.einsum('m...,n...->mn', jnp.conj(P), P, optimize=True)
     S_P = 0.5 * (S_P + S_P.conj().T)
     n = S_P.shape[0]
@@ -160,6 +197,7 @@ def _ortho_expand(V, P):
     Returns P with V^H P ≈ 0 and P^H P ≈ I (in the (m, n) Gram metric
     summing over all trailing axes).
     """
+    _tally('ortho_expand', V.shape, P.shape)
     # Iterated classical Gram-Schmidt against V (twice for full numerical
     # orthogonality at the cost of one extra projection).
     for _ in range(2):
@@ -292,10 +330,26 @@ def davidson(
         Returned as a JAX array so callers can keep its sharding; cast
         with ``np.asarray`` if you want host memory.
     """
+    import time as _time
+
     if precond_fn is None:
         precond_fn = _default_precond
     if m_max is None:
         m_max = 4 * n_eig
+
+    # Instrumentation: count the vectors H is applied to.  This is the
+    # campaign's comparison currency -- the matvec is bandwidth-bound at 84%
+    # of HBM peak (KERNEL_DEEPDIVE.md), so matvec count tracks time.
+    _apply_H_raw = apply_H
+
+    def apply_H(_V, _f=_apply_H_raw):
+        MATVEC_APPLICATIONS[0] += int(_V.shape[0])
+        return _f(_V)
+
+    LAST_RUN.clear()
+    LAST_RUN.update({'iter': [], 'mv': [], 'm': [], 'eig': [], 'res': [],
+                     't': []})
+    _t0 = _time.perf_counter()
 
     # ── initial subspace ──
     if X0 is not None:
@@ -340,6 +394,12 @@ def davidson(
                 break
 
         eigenvalues = Lambda_np
+        LAST_RUN['iter'].append(it)
+        LAST_RUN['mv'].append(MATVEC_APPLICATIONS[0])
+        LAST_RUN['m'].append(int(V.shape[0]))
+        LAST_RUN['eig'].append(np.asarray(Lambda_np, dtype=np.float64).copy())
+        LAST_RUN['res'].append(np.asarray(res_np, dtype=np.float64).copy())
+        LAST_RUN['t'].append(_time.perf_counter() - _t0)
         if verbose and (it <= 5 or it % 5 == 0 or n_conv == n_eig):
             print(f"  iter {it:3d}: m={V.shape[0]:3d}  "
                   f"eig[0]={float(Lambda[0]):12.6f}  "
