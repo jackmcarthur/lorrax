@@ -345,7 +345,10 @@ def report_hermitian_residual(
     construction-site gates.  One implementation of "is this Hermitian and what
     do I tell the human", not two — see ``solvers/lanczos.py``, which reduces
     ``α − αᴴ`` inside the Lanczos ``fori_loop`` (it cannot ``device_get`` there)
-    and hands the two scalars back out through a debug callback.
+    and hands the two scalars back out either through a debug callback or, when
+    the enclosing jit must stay persistable in JAX's compilation cache, as extra
+    jit OUTPUTS (``solvers.lanczos.alpha_herm_sink``) — a host callback makes a
+    module unpersistable, and this check sat inside the BSE Krylov program.
 
     ``always=True`` evaluates and reports **regardless of ``LORRAX_SANITY``**.
     The off-switch documented at the top of this module is a *cost* escape
