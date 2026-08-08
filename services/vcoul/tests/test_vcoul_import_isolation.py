@@ -120,6 +120,12 @@ def test_the_whole_public_surface_answers_with_no_lorrax():
         "vcoul", _lorrax_roots(), src_dir=_SVC_SRC, deps=_DEPS,
         check_path=True,
         preamble=(
+            # The child is spawned with a scrubbed path but an INHERITED env;
+            # on hosts where jax lives beside no CUDA plugin (Perlmutter's
+            # /opt/jax split), the inherited platform request kills the first
+            # jax-touching statement.  Pin cpu before anything imports jax --
+            # the cell tests import isolation, not device selection.
+            "import os; os.environ.setdefault('JAX_PLATFORMS', 'cpu')\n"
             "import numpy as np\n"
             "import vcoul as V\n"
             "assert len(V.__all__) == 30, V.__all__\n"
@@ -166,6 +172,8 @@ def test_vcoul_imports_and_computes_with_no_scipy():
         "vcoul", _lorrax_roots(), src_dir=_SVC_SRC, deps=_DEPS,
         check_path=True,
         preamble=(
+            # Same cpu pin as above, same reason.
+            "import os; os.environ.setdefault('JAX_PLATFORMS', 'cpu')\n"
             "import sys\n"
             "assert 'scipy' not in sys.modules\n"
             "import numpy as np, vcoul as V\n"
