@@ -58,19 +58,45 @@ from distrib_la.loader import _HOST_TARGET_SYMBOLS, _PLATFORMS
 _SCALAPACK_SYMBOLS = tuple(sorted(
     sym for sym in _HOST_TARGET_SYMBOLS.values() if "Scalapack" in sym))
 
-#: THE SANCTIONED EXPORTED SURFACE, per platform — everything the two
-#: libraries are allowed to put in ``.dynsym``, as the patterns
-#: ``src/ffi/cpp/exports_{cuda,host}.map`` hand the linker.  Anything else
-#: is an internal that leaked, and an internal that leaks is a name two
-#: RTLD_GLOBAL libraries can answer for each other (see check 6).
+# ---------------------------------------------------------------------------
+# THE SANCTIONED EXPORTED SURFACE, per platform.
+# ---------------------------------------------------------------------------
+# Everything the two libraries are allowed to put in ``.dynsym``, spelled the
+# way ``src/ffi/cpp/exports_{cuda,host}.map`` spells it for the linker.
+# Anything else is an internal that leaked, and an internal that leaks is a
+# name two RTLD_GLOBAL libraries can answer for each other (check 6).
+#
+# PREDICATES, NOT REGEXES, because the property that matters is that the two
+# are DISJOINT and that has to be readable: every `Ffi` name on one side ends
+# `HostFfi` and on the other does not; every `lrx_` name on one side ends
+# `_host` and on the other does not.  The red twin checks the disjointness
+# rather than trusting the reading.
+
+def _sanctioned_cuda(sym: str) -> bool:
+    """liblorrax_ffi.so: bare ``*Ffi`` handlers, unsuffixed ``lrx_*``."""
+    if sym.endswith("Ffi"):
+        return not sym.endswith("HostFfi")
+    if sym.startswith("lrx_"):
+        return not sym.endswith("_host")
+    return False
+
+
+def _sanctioned_host(sym: str) -> bool:
+    """liblorrax_ffi_host.so: ``*HostFfi``, ``lrx_*_host``, the stamp."""
+    if sym.endswith("Ffi"):
+        return sym.endswith("HostFfi")
+    if sym.startswith("lrx_"):
+        return sym.endswith("_host")
+    return sym == "lorrax_ffi_host_build_config"
+
+
 _SANCTIONED_EXPORTS = {
     "CUDA": (
-        re.compile(r"(?:Ffi$)|(?:^lrx_[A-Za-z0-9_]+$)"),
+        _sanctioned_cuda,
         "the *Ffi XLA handler registration symbols and the lrx_* ctypes ABI",
     ),
     "cpu": (
-        re.compile(r"(?:HostFfi$)|(?:^lrx_[a-z0-9_]+_host$)"
-                   r"|(?:^lorrax_ffi_host_build_config$)"),
+        _sanctioned_host,
         "the *HostFfi XLA handler registration symbols, the lrx_*_host "
         "ctypes ABI, and the build-config stamp",
     ),
@@ -381,8 +407,8 @@ def test_each_library_exports_only_its_sanctioned_surface():
     """
     for platform in ("cpu", "CUDA"):
         so = _pinned(platform)
-        pattern, described = _SANCTIONED_EXPORTS[platform]
-        stray = sorted(s for s in _defined_symbols(so) if not pattern.match(s))
+        sanctioned, described = _SANCTIONED_EXPORTS[platform]
+        stray = sorted(s for s in _defined_symbols(so) if not sanctioned(s))
         assert not stray, (
             f"{so} exports {len(stray)} symbol(s) outside its sanctioned "
             f"surface ({described}): {stray[:40]}"
@@ -424,12 +450,19 @@ def test_the_shared_symbol_check_can_fail(monkeypatch):
     assert len(self_shared) == len(_defined_symbols(host))
 
     host_syms = _defined_symbols(host)
-    cuda_pattern, _ = _SANCTIONED_EXPORTS["CUDA"]
-    accepted = sorted(s for s in host_syms if cuda_pattern.match(s))
+    sanctioned_cuda, _ = _SANCTIONED_EXPORTS["CUDA"]
+    accepted = sorted(s for s in host_syms if sanctioned_cuda(s))
     assert not accepted, (
-        f"the CUDA sanctioned-surface pattern accepts host symbols "
-        f"{accepted} — the two patterns overlap, so 'each library exports "
+        f"the CUDA sanctioned-surface predicate accepts host symbols "
+        f"{accepted} — the two surfaces overlap, so 'each library exports "
         f"only its own surface' no longer implies they cannot collide.")
+
+    sanctioned_host, _ = _SANCTIONED_EXPORTS["cpu"]
+    cuda_syms = _defined_symbols(_pinned("CUDA"))
+    accepted = sorted(s for s in cuda_syms if sanctioned_host(s))
+    assert not accepted, (
+        f"the host sanctioned-surface predicate accepts CUDA symbols "
+        f"{accepted} — same overlap, other direction.")
 
 
 def test_check_5_the_two_libraries_still_share_their_slate_soname():
