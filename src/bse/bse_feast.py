@@ -146,8 +146,11 @@ def build_preconditioner_diagonal_sharded(
     M_Y = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_Y), psi_v_Y)
 
     V_q0 = data["V_q0"]
-    S_v = jnp.einsum("MN,kcvN->kcvM", V_q0, M_Y)
-    V_diag_kcv = jnp.einsum("kcvM,kcvM->kcv", jnp.conj(M_X), S_v) / nk
+    # Diagonal of K^x = M V M†: conjugated vertex on the forward (encode) leg,
+    # bare vertex on the back-contract.  Not a no-op even on the diagonal — the
+    # two orders differ by 4·xᵀ Im(V) y whenever V_q0 carries an imaginary part.
+    S_v = jnp.einsum("MN,kcvN->kcvM", V_q0, jnp.conj(M_Y))
+    V_diag_kcv = jnp.einsum("kcvM,kcvM->kcv", M_X, S_v) / nk
 
     if include_W:
         W_q0 = data["W_q"][:, :, 0, 0, 0]
