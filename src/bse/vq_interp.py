@@ -342,7 +342,17 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
     zx["psi"] = fr["psi_full_y"][()]          # (nk, nb, ns, n_mu) u at centroids
     zx["kgrid"] = fr["kgrid"][()].astype(int)
     zx["Vqmunu"] = fr["V_qmunu"]              # LAZY — disk tiles (gate reference)
-    if "W0_qmunu" in fr:
+    # PRESENCE IS NOT PERSISTENCE.  ``gw_init`` allocates a full-size ZERO
+    # ``W0_qmunu`` unconditionally (``tagged_arrays.write_restart_state_to_h5``
+    # with ``init_W0=True``), so ``"W0_qmunu" in fr`` is true on a run whose
+    # ``persist_w0`` never fired and the tiles handed to ``build_hdir`` are
+    # zeros of exactly the right shape.  That is the April all-zero-screening
+    # mechanism: a plausible excitonic spectrum out of a W that was never
+    # written, with every shape check green.  ``tagged_arrays`` already stamps
+    # ``W0_ready`` (False for the placeholder, True when real data lands) and
+    # ``bse_io`` already gates on it in both of its readers; this path asks
+    # the same question instead of asking whether the dataset exists.
+    if "W0_qmunu" in fr and bool(fr["W0_qmunu"].attrs.get("W0_ready", False)):
         zx["W0"] = fr["W0_qmunu"]             # LAZY — screened tiles (Hdir)
     zx["enk"] = fr["enk_full"][()]            # (nk, nb) Ry
     _mesh_for_loader, _distributed = _zeta_mesh_for_loader(mesh, log_fn=log_fn)
@@ -1573,6 +1583,18 @@ def run_nulls(zx, prep, des, coeffs):
 # block B is swapped between truth and prediction)
 # ===========================================================================
 def build_hdir(zx, q0, nvw=3, ncw=3):
+    # ABSENT means the restart file's W0 was never persisted — the loader
+    # binds this key only when ``W0_ready`` says so.  Say that, rather than
+    # letting a bare KeyError stand in for a diagnosis the loader already
+    # made.
+    if "W0" not in zx:
+        raise KeyError(
+            "build_hdir needs a persisted W0_qmunu, and the restart file "
+            "does not have one: the dataset is missing, or it is the "
+            "full-size ZERO placeholder gw_init allocates (W0_ready=False). "
+            "The direct term would be identically zero and the exciton "
+            "binding would be entirely absent — re-run GW screening before "
+            "trusting this diagnostic.")
     kg = zx["kgrid"]
     cs = list(range(zx["nv"], zx["nv"] + ncw))
     vs = list(range(zx["nv"] - nvw, zx["nv"]))
