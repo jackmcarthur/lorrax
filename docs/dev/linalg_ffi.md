@@ -13,7 +13,7 @@
 > | `ffi/linalg/resolve.py` (`resolve_backend`, `list_backends`, `backend_module`, `BACKEND_CHOICES`, `_SPEC`) | `distrib_la.resolve` |
 > | `ffi/linalg/dispatch.py` (`dispatch_batched_eigh`) | `distrib_la.dispatch` |
 > | `ffi/linalg/_slate.py` / `_scalapack.py` | `distrib_la._slate` / `._scalapack` |
-> | `ffi/linalg/_slate._mesh_key` | `distrib_la.mesh_key` — **public now**, and there is one of it |
+> | `ffi/linalg/_slate._mesh_key` | `distrib_la.mesh_key` — **public now**, and every backend in the service calls it. One private copy survives outside the service, at `src/ffi/cublasmp/batched.py:47`; it is shape-only (no device identity), and it is bench-only code scheduled for the owner's deletion pass, so it is a leftover rather than a second implementation to keep in sync |
 > | `ffi.slate` / `ffi.scalapack` (the wrapper packages) | `distrib_la._slate` / `._scalapack`; the README is `services/distrib_la/docs/slate_backend.md` |
 > | `common.cholesky_2d` (`cholesky_2d_batched`, `dense_to_tiles`, `tiles_to_dense`) | `distrib_la._native2d`, reached as `plan('cholesky', mesh, backend='native2d')` |
 > | `ffi/common/ffi_loader.py`'s linalg half | `distrib_la.loader` (lorrax's loader keeps the FFT/GEMM/phdf5 half) |
@@ -498,11 +498,20 @@ you to edit (`src/ffi/<name>/`, `ffi/linalg/resolve.py`,
    branch in `backend_module`. A declared-untested tier still gets its
    rows — that is what makes the routing question have an answer.
 4. Add ONE row to `distrib_la/plan.py`'s `_IMPL`: the single-tile entry
-   point, the stacked one (either may be `None` — the plan fills the
-   missing side in), and an output normaliser if the library's convention
-   differs. Every call site picks the backend up from that row; do NOT
-   normalize conventions at call sites. Declare donation in `DONATES` if
-   the op's is different.
+   point, the stacked one, and an output normaliser if the library's
+   convention differs. Either entry may be `None`. A missing `many` is
+   filled in by `lax.scan`ning `one` — that is what `Plan.batched` IS —
+   and a missing `one` means the library only ever factors a whole stack,
+   so the stacked entry is the only route. **That row is also the
+   capability test**: `Plan.batched_route` reads it, and there is no
+   `getattr` probe on the module anywhere, so a stacked entry that is not
+   declared here is a stacked entry nothing will ever call. If the
+   single-tile entry returns a library HANDLE rather than arrays, say
+   `one_handle=True` — the scan cannot discover that by calling (a handle
+   is not a pytree) and an L-a cell cross-checks the flag against your
+   wrapper's own return annotation. Every call site picks the backend up
+   from that row; do NOT normalize conventions at call sites. Declare
+   donation in `DONATES` if the op's is different.
 5. If it returns an opaque factor, add its branch to `distrib_la/factor.py`
    so it arrives as a `FactorToken` and leaves through `solve()`. Do not
    hand a raw handle across a `jit` boundary — the token is deliberately

@@ -277,7 +277,7 @@ fi
 if [[ -n "$STAMP" ]]; then
     say "build stamp: $STAMP"
 else
-    # COULD NOT RUN for the same reason GATE 9 does it: the device leg had no
+    # COULD NOT RUN for the same reason GATE 11 does it: the device leg had no
     # stamp of ANY kind before 2026-08-08, so every device library in service
     # today is unstamped, and calling them all FAILED would train everyone to
     # ignore this gate.
@@ -689,7 +689,16 @@ else
 fi
 
 # ===========================================================================
-# GATE 9 — THE HANDLER-SIGNATURE ABI.
+# GATE 11 — THE HANDLER-SIGNATURE ABI.
+#
+# WHY 11 AND NOT 9.  This gate was written as GATE 9 on a tree that predated
+# the ODR fix; that fix landed first and took 9 (the export-table ratchet in
+# config/perlmutter/build_ffi_host.sh and src/ffi/cpp/build.sh) and 10
+# (src/ffi/cpp/gate_one_odr.py, a live CUDA process doing host phdf5 work).
+# Gate numbers are how a build log, a KNOWN_FAILURES row and a person talking
+# to another person refer to the same check, so they are not renumbered to
+# close a hole — this one moved to the next free number instead.  The family
+# now runs 0..11; this file owns ten of them, 0-8 and 11.
 #
 # The artifact-level half of the check the Python loaders make at dlopen.  Its
 # value here is that it fires at BUILD time, in the build's own output, rather
@@ -703,7 +712,7 @@ fi
 # same translation unit, so a disagreement between them is itself a defect and
 # is reported as one rather than folded into a mismatch.
 # ===========================================================================
-say "--- GATE 9 (handler-signature ABI) ---"
+say "--- GATE 11 (handler-signature ABI) ---"
 _abi_sym="lorrax_ffi_${LEG}_abi_version"
 _stamp_abi="$(printf '%s\n' "$STAMP" | grep -oE 'abi=[0-9]+' | cut -d= -f2 | head -1)"
 if ! printf '%s\n' "$DEFINED" | grep -qx "$_abi_sym"; then
@@ -718,24 +727,24 @@ if ! printf '%s\n' "$DEFINED" | grep -qx "$_abi_sym"; then
     # Any library built from this tree stamps, so LORRAX_FFI_VERIFY_STRICT=1
     # — which every certification run should set — still refuses an unstamped
     # artifact, and a fresh build still passes under it.
-    notrun 9 "$SO does not export $_abi_sym, so its handler-signature ABI
+    notrun 11 "$SO does not export $_abi_sym, so its handler-signature ABI
       cannot be read: built before the stamp existed (2026-08-08).  Not a
       pass and not a defect.  The loaders announce the same fact at dlopen;
       LORRAX_FFI_ABI_STRICT=1 there and LORRAX_FFI_VERIFY_STRICT=1 here both
       turn it into a refusal.  Rebuild from this tree to make it checkable."
 elif [[ -z "$_stamp_abi" ]]; then
-    fail 9c "$SO exports $_abi_sym but carries no readable 'abi=<N>' in its
+    fail 11c "$SO exports $_abi_sym but carries no readable 'abi=<N>' in its
       build stamp.  Those two come out of the same translation unit
       (common/build_config.cc), so they cannot disagree in a library this
       build system produced.  Something has edited the artifact, or the stamp
       string has been split across the binary — either way the version cannot
       be trusted at the artifact level.  Rebuild with --fresh."
 elif [[ -z "$EXPECT_ABI" ]]; then
-    notrun 9 "the artifact exports $_abi_sym (stamp says abi=${_stamp_abi:-?})
+    notrun 11 "the artifact exports $_abi_sym (stamp says abi=${_stamp_abi:-?})
       but no expected version is available: this tree has no
       src/ffi/cpp/common/lorrax_ffi_abi.h and LORRAX_FFI_EXPECT_ABI is unset."
 elif [[ "$_stamp_abi" != "$EXPECT_ABI" ]]; then
-    fail 9b "ABI MISMATCH: this library speaks abi=${_stamp_abi:-<unreadable>},
+    fail 11b "ABI MISMATCH: this library speaks abi=${_stamp_abi:-<unreadable>},
       the source tree speaks abi=${EXPECT_ABI}.
       These two cannot be paired.  Mixing them is not a degraded run: it is an
       FFI arity mismatch that surfaces as
@@ -746,7 +755,7 @@ elif [[ "$_stamp_abi" != "$EXPECT_ABI" ]]; then
         host:  bash config/perlmutter/build_ffi_host.sh --fresh
         cuda:  src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh --fresh"
 else
-    say "GATE 9 PASSED: abi=$_stamp_abi matches this source tree"
+    say "GATE 11 PASSED: abi=$_stamp_abi matches this source tree"
 fi
 
 # ---------------------------------------------------------------------------

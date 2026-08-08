@@ -1,0 +1,129 @@
+/* exports_cuda.map — what liblorrax_ffi.so keeps PRIVATE.
+ *
+ * A linker version script (ld --version-script).  Everything matched by
+ * `local:` is demoted to a local symbol and disappears from `.dynsym`;
+ * references to it from inside this library bind at static-link time, so it
+ * can be neither interposed by, nor interpose on, anything else in the
+ * process.  Everything not matched keeps default visibility.
+ *
+ * WHAT THIS CLOSES — KNOWN_FAILURES L1, the cross-.so one-definition-rule
+ * violation.  liblorrax_ffi.so and liblorrax_ffi_host.so are both dlopened
+ * RTLD_GLOBAL into one process (a CUDA-capable process legitimately does
+ * both: CUDA handlers on the device, host phdf5 reads on the CPU backend),
+ * and ld.so resolves a name to the FIRST object that defined it -- for the
+ * whole process, INCLUDING for the later library's own internal calls.
+ *
+ * MEASURED 2026-08-07 on the BUILD_NOTES-pinned pair, `nm -D --defined-only`:
+ * 259 names in common, of which 25 are LORRAX's own -- the nine `lrx_*`
+ * ctypes entry points plus sixteen mangled `lorrax_ffi::phdf5::*`
+ * (`open_ctx`, `close_ctx`, `ensure_dataset`, `open_dataset_ro`,
+ * `ensure_pinned`, `ensure_read_buf`, `ensure_mpi_initialized`, `env_flag`,
+ * `~PhdfCtx` x2, the `dt::` HDF5 type singletons and their guards).  Those 25
+ * are the defect: `PhdfCtx` has a DIFFERENT LAYOUT in the two builds, so one
+ * library's handler read the other's struct at the wrong offsets, which is
+ * B1's `offset_base=[0,0,0,4596944070643295330]` -- a float64 as an int64.
+ *
+ * ============================================================================
+ * WHY THIS HIDES `*lorrax_ffi*` AND NOT `*`.  A DENYLIST, DELIBERATELY.
+ * ============================================================================
+ * The obvious version of this file is `local: *;` with the handler surface
+ * and the ctypes ABI listed under `global:` -- "export only the sanctioned
+ * surface".  IT WAS WRITTEN THAT WAY FIRST AND IT CRASHES, and the crash is
+ * the reason this file has the shape it has.
+ *
+ * MEASURED, Perlmutter 2026-08-08, same tree, same commands, only the host
+ * .so's version script moving (`services/distrib_la/tests/
+ * test_distrib_la_contract.py -k "slate and cpu"`, artifacts under
+ * /pscratch/sd/j/jackm/svc_ffi_odr/_reports/slate_*.xml):
+ *
+ *   version script            slate host cells   what stayed global
+ *   ------------------------  -----------------  --------------------------
+ *   none at all                8 P / 2 skip      everything
+ *   this one (*lorrax_ffi*)    8 P / 2 skip      all third-party
+ *   `local: *` + _ZT* global   3 P / 5 CRASH     typeinfo/typeinfo-name/vtable
+ *   `local: *` + slate/blas/
+ *      std templates global    8 P / 2 skip      third-party TEMPLATES
+ *   `local: *`                 3 P / 5 CRASH     nothing
+ *
+ * The two crashing arms are exactly the two that localise the SLATE / blaspp
+ * / libstdc++ TEMPLATE INSTANTIATIONS our own translation units emit;
+ * localising the typeinfo and vtables is harmless, and localising the
+ * templates is fatal on its own.  `SlatePotrfHostFfi` segfaults inside the
+ * handler (`Fatal Python error: Segmentation fault`, top frame
+ * `distrib_la/_slate.py:344 _potrf`), five cells:
+ * slate_cholesky_trsm_cpu[float64,complex128],
+ * slate_trsm_rectangular_rhs_cpu[16,48], slate_batched_cholesky_trsm_cpu.
+ *
+ * That is the vague-linkage contract, and it is not ours to break.  Our TUs
+ * emit weak COMDAT copies of SLATE's inline and template code; the dynamic
+ * linker is SUPPOSED to merge them with libslate.so's, so that one
+ * definition -- and one copy of any static inside it -- serves the process.
+ * `local: *` unmerges them and our compilation of a SLATE inline then runs
+ * against libslate's data structures.  Those duplicates are ODR-CORRECT
+ * (same headers, same source); LORRAX's own were not.
+ *
+ * So the rule this file states is the rule the defect actually needs:
+ * **LORRAX's own definitions are private to the library that compiled them.**
+ * Everything else keeps the linkage the C++ ABI intends.
+ *
+ * A DENYLIST STILL FAILS SAFE, which is the other half of the choice.  A new
+ * LORRAX symbol lands in `namespace lorrax_ffi` and is hidden automatically;
+ * a new third-party dependency is left alone automatically.  The allowlist
+ * form has the opposite failure mode -- forgetting a third-party namespace
+ * does not fail the build, it segfaults at runtime, which is what the table
+ * above is a record of.
+ *
+ * WHAT REMAINS SHARED, AND WHERE IT IS TRACKED.  ~234 third-party
+ * vague-linkage names (slate::, blas::, xla::ffi::, libstdc++ internals) are
+ * still defined by both files, and the FIRST library loaded still answers
+ * them for both.  That is the SAME defect `libslate.so.2` / `libblaspp.so.2`
+ * sharing one SONAME already is, it is what `_open_cuda_before_host` in both
+ * loaders exists for, and `test_so_acceptance.py`'s check 5 ratchets it.
+ * It is NOT L1 and this file does not claim to fix it.
+ *
+ * NOT -fvisibility=hidden, for a second and independent reason: gcc marks a
+ * non-default-visibility type's typeinfo NAME private with a leading '*',
+ * after which libstdc++'s `type_info::operator==` compares POINTERS ONLY
+ * (typeinfo's `__name[0] != '*'` guard).  libslate.so throws
+ * `slate::Exception` / `slate::MpiException` / `blas::Error` ACROSS the .so
+ * boundary into our handlers, where they match today by strcmp on that name.
+ * A version script relocalises symbols at LINK time without touching what
+ * the compiler emitted, so the exception path is bit-for-bit unchanged.
+ *
+ * The FROZEN `*Ffi` handler symbols (invariant 1) and the `lrx_*` ctypes ABI
+ * are not mentioned here at all: they are not `lorrax_ffi`-namespaced, so
+ * they keep default visibility by not matching.  The nine `lrx_*` entry
+ * points the HOST leg also compiles are disambiguated by RENAMING rather
+ * than by hiding -- Python has to dlsym them -- see cpp/common/c_abi.h.
+ */
+{
+  global:
+    /* THE TWO EXCEPTIONS, and the reason this file grew a `global:` clause.
+       Until 2026-08-08 the device leg carried no build stamp at all, so
+       cpp/common/build_config.cc was host-only and nothing it defined could
+       match the denylist below.  It is now in LORRAX_FFI_SOURCES too, and its
+       two entry points are named `lorrax_ffi_cuda_*` — which the denylist
+       would take.  An exact name beats a wildcard in a version script.
+
+       Both are declared as APIs and both are read from OUTSIDE this library:
+       the stamp by `strings`/the acceptance tier, the ABI by both Python
+       loaders, at dlopen, before a single handler is declared.  They collide
+       with nothing: the host leg's twins carry `_host`, not `_cuda`, so the
+       two sanctioned surfaces stay disjoint and check 6's intersection stays
+       empty.  Hiding them would not fail anything — it would silently disarm
+       the pairing refusal, which is the failure mode
+       cpp/common/lorrax_ffi_abi.h exists to remove. */
+    lorrax_ffi_cuda_build_config;
+    lorrax_ffi_cuda_abi_version;
+  local:
+    /* every C++ entity in `namespace lorrax_ffi`, including std:: templates
+       instantiated on our types, our function-local statics (`_ZZ...`) and
+       their guard variables (`_ZGVZ...`). */
+    *lorrax_ffi*;
+    /* the extern "C" CUDA kernel launchers in cublasmp/w_solve_kernels.cu.
+       Cross-TU WITHIN this library (batched_w_solve_ffi.cc calls them) and
+       reachable from nowhere else, so C linkage is an implementation detail
+       here, not an interface. */
+    lorrax_zero_upper_tri_*;
+    lorrax_identity_minus_T_*;
+};

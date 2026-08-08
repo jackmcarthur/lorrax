@@ -935,13 +935,45 @@ def _report() -> None:
         pass
 
 
+def bound_cache_dir() -> str:
+    """The directory JAX's cache object is ACTUALLY bound to, or ``""``.
+
+    NOT the same question as :attr:`_CacheState.dir`, which records the
+    directory this module ASKED for.  ``jax._src.compilation_cache._cache``
+    is built once, lazily, at the first compile that consults the cache,
+    from ``jax_compilation_cache_dir`` AS IT READ THEN — and a later
+    ``config.update`` does not rebind it.  So the two can disagree, and
+    when they do every symptom is silent: the agreement lists the
+    directory we asked for while JAX reads and writes another one, so
+    every probe is vetoed, every write lands on a key that already exists
+    somewhere else, and the summary line reports a healthy-looking
+    ``enabled=True`` with a directory nothing used.  Reporting the bound
+    directory is what makes that state visible instead of inferable.
+    """
+    try:
+        from jax._src import compilation_cache as _cc
+        cache = getattr(_cc, "_cache", None)
+        if cache is None:
+            return ""
+        path = getattr(cache, "path", None) or getattr(cache, "_path", None)
+        return str(path) if path is not None else ""
+    except Exception:                                          # noqa: BLE001
+        return ""
+
+
 def _report_impl() -> None:
     s = _STATE
+    bound = bound_cache_dir()
+    # Only spelled out when it DISAGREES with what we asked for: the
+    # agreement, the veto and the writes all key off the asked-for
+    # directory, so a disagreement means the cache is inert in a way no
+    # other number on this line shows.
+    where = "" if (not bound or bound == s.dir) else f" BOUND-ELSEWHERE={bound}"
     _say(f"rank {s.proc_idx}/{s.n_proc} summary: xla_compiles={s.compiles} "
          f"({s.compile_secs:.2f}s)  cache_probes={s.probes} hits={s.hits} "
          f"({s.read_secs:.2f}s) vetoed={s.blocked}  "
          f"agreed={s.n_agreed}/{s.n_seen} prefetch={s.prefetch_secs:.2f}s  "
-         f"enabled={s.enabled}")
+         f"enabled={s.enabled}{where}")
 
 
 def compile_cache_stats() -> dict:
@@ -953,6 +985,7 @@ def compile_cache_stats() -> dict:
         "probes": s.probes, "hits": s.hits, "vetoed": s.blocked,
         "compiles": s.compiles, "compile_secs": s.compile_secs,
         "read_secs": s.read_secs, "prefetch_secs": s.prefetch_secs,
+        "bound_dir": bound_cache_dir(),
     }
 
 
@@ -1111,6 +1144,61 @@ def ensure_jax_compile_cache() -> None:
         return
 
     _install_atomic_put_patch()
+
+    # ---- make JAX's cache OBJECT follow the directory we just chose -------
+    # MEASURED, Perlmutter 2026-08-07, the centroid deck at P=4: without this
+    # the run reports `cache_probes=149 hits=0 vetoed=149 agreed=622/622` and
+    # never warms up, on consecutive runs, forever.
+    #
+    # `jax._src.compilation_cache._cache` is built ONCE, lazily, at the first
+    # compile that consults the cache, from `jax_compilation_cache_dir` AS IT
+    # READ THEN — and `reset_cache()` is the only way to rebind it; a later
+    # `config.update` does not.  The `lorrax_J070` modulefile exports
+    # `JAX_COMPILATION_CACHE_DIR=$SCRATCH/.jax_cache` and passes it into the
+    # Shifter container (`0.1.0.lua:312` and the `--env=` at `:252`), JAX picks
+    # that up at import, and the mesh warm-up in
+    # `runtime.initialize_communicator_stack` compiles before this function is
+    # reached.  So by the time we get here the cache is already bound to
+    # `.jax_cache` (19950 entries, actively written) while everything in THIS
+    # file — the directory listing, the agreement, the veto — is about
+    # `{base}/np{P}`.
+    #
+    # The two failure modes that produces are both silent:
+    #   * every probe is vetoed, because `_STATE.agreed` was built by listing
+    #     a directory JAX is not reading;
+    #   * every write lands in `.jax_cache` on a key that is usually already
+    #     there, so `LRUCache.put`'s `if cache_path.exists(): return` makes it
+    #     a no-op and NOTHING appears to be written anywhere.
+    # and the summary line still says `enabled=True`.  At P == 1 there is no
+    # agreement patch, so JAX reads `.jax_cache` unimpeded and HITS — which is
+    # exactly why the 1-rank leg warms up (12.5 s -> 6.0 s) and the 4-rank leg
+    # does not.  The asymmetry read like a P>1 cache policy and was not one.
+    #
+    # Rebinding rather than adopting the inherited directory: `{base}/np{P}`
+    # is per-world-size BY DESIGN (the whole agreement rests on every rank
+    # seeing the same set), and `.jax_cache` is one flat directory shared by
+    # every world size, so adopting it would put P=1 and P=16 entries in one
+    # namespace and hand the agreement a set that changes under it.
+    _prev_bound = bound_cache_dir()
+    if _prev_bound and (os.path.realpath(_prev_bound)
+                        != os.path.realpath(str(cache_path))):
+        try:
+            from jax._src import compilation_cache as _cc_rebind
+            _cc_rebind.reset_cache()
+        except Exception as exc:                               # noqa: BLE001
+            if proc_idx == 0:
+                _say(f"could not rebind JAX's compile cache off "
+                     f"{_prev_bound} ({type(exc).__name__}: {exc}); it will "
+                     f"keep reading and writing there while this module's "
+                     f"agreement is about {cache_path}.  Expect hits=0 at "
+                     f"P>1.  Unset JAX_COMPILATION_CACHE_DIR to avoid it.")
+        else:
+            if proc_idx == 0:
+                _say(f"rebound JAX's compile cache from {_prev_bound} "
+                     f"(inherited, usually JAX_COMPILATION_CACHE_DIR from the "
+                     f"module) to {cache_path}.  The inherited directory is "
+                     f"not per-world-size, so the P>1 agreement cannot be "
+                     f"taken over it.")
 
     if n_proc == 1:
         _STATE.enabled = True

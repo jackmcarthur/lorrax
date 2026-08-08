@@ -36,7 +36,7 @@ Lifecycle modes are unchanged:
                              r-chunks.
 
 The reader adapters (legacy h5py vs phdf5) collapse to a single
-:class:`file_io.wfn_loader.WfnLoader` whose ``backend='auto'`` picks the
+:class:`wfn_loader.WfnLoader` whose ``backend='auto'`` picks the
 right path.
 """
 from __future__ import annotations
@@ -420,7 +420,7 @@ def build_psi_G_store(
 ) -> PsiGStore:
     """Construct the ψ(G-flat) store matching ``mode``.
 
-    Single backend choice: :class:`file_io.wfn_loader.WfnLoader`.
+    Single backend choice: :class:`wfn_loader.WfnLoader`.
     ``backend='auto'`` picks the FFI phdf5 path when multi-rank GPU +
     mesh + .so present; falls back to eager h5py otherwise.  CPU and
     single-process tests get the eager path automatically.

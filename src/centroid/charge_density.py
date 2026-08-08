@@ -98,7 +98,7 @@ def _load_wfn_k_fftbox_ibz(wfn: WfnLoader, n_val: int) -> jnp.ndarray:
     translation phase is applied because we only want |ψ|² downstream and
     phases drop out of the modulus.
 
-    Uses :class:`file_io.wfn_loader.WfnLoader` (eager backend) plus
+    Uses :class:`wfn_loader.WfnLoader` (eager backend) plus
     :func:`common.wfn_transforms.to_box`.  P5 will switch the caller to
     pass a ``WfnLoader`` directly so this transient construction goes
     away.

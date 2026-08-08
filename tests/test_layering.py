@@ -1112,6 +1112,16 @@ _MESH_OWNERS = {
     # ``prepare_mesh`` is the open warm-up-contract decision, and doing it by
     # deleting the call site is how the refusals come back.
     "bse.bse_ring_comm",
+    # GATE 10 must build a 1x1 mesh over ``jax.devices("cpu")`` INSIDE a
+    # process whose default backend is CUDA — that inversion is the thing the
+    # gate exists to probe (a CUDA process doing host phdf5 IO).  Both
+    # sanctioned constructors resolve the DEFAULT backend, so each would hand
+    # this process its GPU: ``single_device_mesh()`` is
+    # ``jax.local_devices()[:1]`` and ``resolve_mesh`` squares over
+    # ``jax.devices()``.  A build gate is also not runtime code — it runs
+    # single-process under ``verify_ffi_build``, so the one-object-per-process
+    # jit-cache contract those helpers protect is not in play.
+    "ffi.cpp.gate_one_odr",
 }
 
 

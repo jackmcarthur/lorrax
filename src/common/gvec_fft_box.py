@@ -17,7 +17,7 @@ This module owns TWO things that must not drift apart:
    ζ produces the table from a cutoff sphere
    (:func:`common.coulomb_sphere.compute_per_q_bare_coulomb_components`);
    ψ produces it from the ragged on-disk ``wfns/gvecs``
-   (:meth:`file_io.wfn_loader.WfnLoader.gvecs`).  Both call the routines
+   (:meth:`wfn_loader.WfnLoader.gvecs`).  Both call the routines
    here, so the two on-disk layouts converge on ONE in-memory form.
 
    *Why a sentinel and not zero.*  Zero pad rows are the Miller index
@@ -215,7 +215,7 @@ def pad_gvecs_to_sentinel(
 
     THE single producer of the padded representation.  ζ calls it from
     ``common.coulomb_sphere`` on per-q cutoff spheres; ψ calls it from
-    ``file_io.wfn_loader.WfnLoader.gvecs`` on the ragged on-disk
+    ``wfn_loader.WfnLoader.gvecs`` on the ragged on-disk
     ``wfns/gvecs``.  Both get the same in-memory object, so everything
     downstream (``build_g_index_for_fft_box``, ``pad_mask``,
     ``psp.dft_operators.padded_gvectors``) is written once.

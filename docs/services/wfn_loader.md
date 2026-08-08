@@ -26,10 +26,30 @@ promotion measured bit-identical and 0.7% faster on the production deck.
 
 The package is the door. `import wfn_loader` and use top-level names;
 `from wfn_loader.loader import …` from lorrax is a layering failure
-(`tests/test_layering.py`, with a red twin). In-tree consumers may still
-spell `from file_io.wfn_loader import WfnLoader` — that is a transitional
-shim whose deletion gate is the phase-wide cleanup after all four wave-1
-branches land, and it re-exports the SAME objects.
+(`tests/test_layering.py`, with a red twin).
+
+The transitional shim that used to sit at `src/file_io/wfn_loader.py` is
+gone: the phase-wide cleanup commit deleted it along with the other four
+wave-1 shims, and nothing aliases it back, so `from file_io.wfn_loader
+import WfnLoader` now raises `ModuleNotFoundError` rather than resolving
+anywhere. Two spellings are supported and there is no third. The first is
+`import wfn_loader` and then top-level names, which works in any process
+where `ffi._services.ensure_on_path()` has already put the service roots
+on `sys.path`; importing `file_io` performs that bootstrap on the way in,
+and so does every other module that reaches a service door (`grep -rn
+'ensure_on_path()' src/`), but a bare `import wfn_loader` in a process
+that has done neither still fails, and that is the one sharp edge worth
+remembering. The second is `from file_io import
+WfnLoader` — or `WFNReader`, the back-compat alias bound to the same
+class — which is the spelling most in-tree consumers already use.
+
+That second spelling is not a new shim wearing a different hat, and
+`src/file_io/__init__.py` says so in its own words: "THE RE-EXPORTS
+STAY, and they are not a new shim … What changed is where the object
+comes from: the door, once, with no second module object in between."
+`file_io` asks the service door for the class and re-exports the object
+it gets; there is no intermediate module for a future reader to mistake
+for the real one, which is exactly what the deleted shim was.
 
 ## API
 
@@ -238,5 +258,13 @@ large-deck CUDA leg. Both registered for post-wave.
 * **Reading `._filename` / `._ensure_sym()`.** Public spellings exist
   (`path`, `symmetry()`); the privates survive for compat, not for new
   code.
-* **Editing `src/file_io/wfn_loader.py`.** It is a shim; the module lives
-  in `services/wfn_loader/`. The shim dies in the phase-wide cleanup.
+* **Re-creating `src/file_io/wfn_loader.py`.** The file was deleted by
+  the phase-wide cleanup and its absence is ratcheted, because a shim
+  acquires a second life exactly one way: somebody hits the old import
+  path, re-creates the file to green their branch, and the deletion
+  silently un-happens. Putting it back turns
+  `tests/test_service_path_bootstrap.py::test_the_retired_shim_files_are_gone`
+  red with "wave-1 transitional shims are back". If something still
+  reaches for the old spelling, migrate the caller to one of the two
+  supported spellings above; the module itself lives in
+  `services/wfn_loader/` and is edited there.

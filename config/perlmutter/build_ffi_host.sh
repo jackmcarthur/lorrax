@@ -346,6 +346,13 @@ SO_FILE="$BUILD/liblorrax_ffi_host.so"
 # WHAT STAYS HERE IS WHAT IS PERLMUTTER'S: the EXPECTATIONS.  A gate that
 # infers its own expectation from the artifact cannot fail, so the site states
 # them and the machine-agnostic gates check them.
+#
+# ONE GATE ALSO STAYS HERE IN FULL — GATE 9, the export-table ratchet, below.
+# It is not Perlmutter's, but tests/KNOWN_FAILURES.md's L1 closure names this
+# file and src/ffi/cpp/build.sh as its two build-time ratchets, and a ratchet
+# that has moved out from under its own record is not a ratchet.  The
+# artifact-level enforcement is the acceptance tier (check 6 and the
+# sanctioned-surface cell), which sees BOTH libraries at once.
 # ===========================================================================
 echo
 echo "[build_ffi_host] --- post-link gates (scripts/verify_ffi_build.sh) ---"
@@ -392,6 +399,74 @@ else
     echo "[build_ffi_host]   $LORRAX_PM_PHDF5_STAGE/lib — GATE 7 falls back to" >&2
     echo "[build_ffi_host]   the stage-provides comparison alone." >&2
 fi
+
+# GATE 9 STAYS HERE, and it is the one exception to the delegation above.
+# tests/KNOWN_FAILURES.md's L1 closure names THIS FILE and src/ffi/cpp/build.sh
+# as the two build-time ratchets of the ODR fix, so the ratchet lives where the
+# record says it lives.  The artifact-level twin is the acceptance tier's
+# check 6, which INTERSECTS the two libraries; a build script only ever sees
+# one of them, so it checks the property that keeps that intersection empty.
+#
+# GATE 9: NO LORRAX-OWNED INTERNAL IS ON THE DYNAMIC TABLE.
+#
+# The build-time half of the KNOWN_FAILURES L1 fix.  The test-time half is
+# services/distrib_la/tests/test_so_acceptance.py check 6, which INTERSECTS
+# the two libraries; a build script only ever sees one of them, so it checks
+# the property that makes the LORRAX part of that intersection empty.
+#
+# WHAT WENT WRONG.  Both platform .so's are dlopened RTLD_GLOBAL into one
+# process, and ld.so answers a name from the FIRST object that defined it --
+# for the whole process, including for the OTHER library's own internal
+# calls.  Measured 2026-08-07 on the pinned pair: 259 defined names in
+# common, 25 of them LORRAX's own.  Among them `lorrax_ffi::phdf5::open_ctx`,
+# whose `PhdfCtx` return type has a DIFFERENT LAYOUT in the two builds (the
+# CUDA stream/event/pinned members compile out here).  One library's handler
+# read the other's struct at the wrong offsets:
+#     offset_base=[0,0,0,4596944070643295330]     <- a float64 read as int64
+#
+# TWO THINGS ARE CHECKED, because the fix has two halves:
+#   (a) nothing `lorrax_ffi`-namespaced is exported -- src/ffi/cpp/
+#       exports_host.map localises it (the build-config stamp is the one
+#       deliberate exception and is named here as such);
+#   (b) every exported `lrx_*` ctypes entry point carries the `_host` leg
+#       suffix -- cpp/common/c_abi.h's LRX_C_ENTRY.  Those nine cannot be
+#       hidden (Python dlsyms them), so renaming is what stops them
+#       colliding.
+#
+# This gate is what notices the day the version script falls off the link
+# line or LRX_C_ENTRY stops being applied.  The symptom otherwise is a wrong
+# number in a mixed process, weeks later.
+echo "[build_ffi_host] GATE 9 (no LORRAX internal on the dynamic table)"
+_dynsyms=$(nm -D --defined-only "$SO_FILE" 2>/dev/null | awk '{print $NF}')
+leaked=$(grep -E 'lorrax_ffi' <<<"$_dynsyms" \
+         | grep -vE '^lorrax_ffi_host_(build_config|abi_version)$' || true)
+if [[ -n "${leaked//[[:space:]]/}" ]]; then
+    echo "[build_ffi_host] GATE FAILED (9a): LORRAX-owned internals are on" >&2
+    echo "[build_ffi_host]   the dynamic table.  liblorrax_ffi.so defines" >&2
+    echo "[build_ffi_host]   these names too, and in a process with both" >&2
+    echo "[build_ffi_host]   open the first one loaded answers them for" >&2
+    echo "[build_ffi_host]   BOTH -- including for this library's own calls." >&2
+    printf '%s\n' "$leaked" | head -20 | sed 's/^/    /' >&2
+    echo "[build_ffi_host]   Cause: -Wl,--version-script=exports_host.map is" >&2
+    echo "[build_ffi_host]   not on the link line (check CMakeCache.txt)." >&2
+    exit 1
+fi
+bare_lrx=$(grep -E '^lrx_' <<<"$_dynsyms" | grep -vE '_host$' || true)
+if [[ -n "${bare_lrx//[[:space:]]/}" ]]; then
+    echo "[build_ffi_host] GATE FAILED (9b): unsuffixed lrx_* entry points" >&2
+    printf '%s\n' "$bare_lrx" | sed 's/^/    /' >&2
+    echo "[build_ffi_host]   cpp/phdf5/api.cc and cpp/slate/context.cc"    >&2
+    echo "[build_ffi_host]   compile into BOTH libraries; their entry"      >&2
+    echo "[build_ffi_host]   points must go through cpp/common/c_abi.h's"   >&2
+    echo "[build_ffi_host]   LRX_C_ENTRY so this leg's carry '_host'."      >&2
+    exit 1
+fi
+echo "[build_ffi_host] GATE 9 PASSED: 0 lorrax_ffi internals exported, all $(grep -cE '^lrx_' <<<"$_dynsyms") lrx_* entry points leg-suffixed"
+unset _dynsyms
+
+# GATE 4 (load-time resolution) used to be written out here; it is one of the
+# gates that moved into scripts/verify_ffi_build.sh, which runs it below with
+# the same SLATE LD_LIBRARY_PATH this script would have used.
 
 # The Perlmutter host recipe builds ALL FIVE host backends.  Declaring it is
 # what turns "ScaLAPACK/BLACS not found" from a CMake WARNING into a build

@@ -6,7 +6,7 @@
 // consumer that did not exist — ffi_loader reports the PROVENANCE file beside
 // the .so, not this string):
 //
-//   the STRING   scripts/verify_ffi_build.sh GATE 0 and GATE 9, and
+//   the STRING   scripts/verify_ffi_build.sh GATE 0 and GATE 11, and
 //                services/distrib_la/tests/test_so_acceptance.py, both of
 //                which read it out of the file's bytes without loading it —
 //                and a person running `strings` on a .so found in a scratch

@@ -221,6 +221,39 @@ LORRAX_PHDF5_STAGE="${LORRAX_PHDF5_STAGE:-${LORRAX_PHDF5_MOUNT:-/lorrax_phdf5}}"
         exit 1
     }
 
+# GATE 9: NO LORRAX-OWNED INTERNAL IS ON THE DYNAMIC TABLE.
+#
+# The device twin of the gate in config/perlmutter/build_ffi_host.sh, which
+# carries the full argument.  Both platform .so's are dlopened RTLD_GLOBAL
+# into one process and ld.so answers a name from the FIRST object that
+# defined it -- including for the OTHER library's internal calls.  Measured
+# 2026-08-07 on the pinned pair: 259 defined names in common, 25 of them
+# LORRAX's own, among them `lorrax_ffi::phdf5::open_ctx` -- whose `PhdfCtx`
+# return type has a different LAYOUT in the two builds.  That is
+# KNOWN_FAILURES L1.  src/ffi/cpp/exports_cuda.map localises them; this gate
+# notices the day it falls off the link line.
+#
+# TWO NAMES ARE EXEMPT, and exports_cuda.map's `global:` clause is where the
+# reason is written: common/build_config.cc joined this leg's sources on
+# 2026-08-08 and its two entry points are `lorrax_ffi_cuda_*`, so the pattern
+# below would take them.  They are declared APIs read from outside the
+# library, and their host twins carry `_host`, so nothing collides.
+echo "[build] GATE 9 (no LORRAX internal on the dynamic table)"
+_leaked=$(nm -D --defined-only "${SO_FILE}" 2>/dev/null | awk '{print $NF}' \
+          | grep -E 'lorrax_ffi' \
+          | grep -vE '^lorrax_ffi_cuda_(build_config|abi_version)$' || true)
+if [ -n "$(printf %s "${_leaked}" | tr -d '[:space:]')" ]; then
+    echo "[build] GATE FAILED (9): LORRAX-owned internals are on the" >&2
+    echo "[build]   dynamic table.  liblorrax_ffi_host.so defines these" >&2
+    echo "[build]   names too, and in a process with both open the first" >&2
+    echo "[build]   one loaded answers them for BOTH." >&2
+    printf '%s\n' "${_leaked}" | head -20 | sed 's/^/    /' >&2
+    echo "[build]   Cause: -Wl,--version-script=exports_cuda.map is not on" >&2
+    echo "[build]   the link line (check CMakeCache.txt)." >&2
+    exit 1
+fi
+echo "[build] GATE 9 PASSED: 0 lorrax_ffi internals exported"
+
 # Build provenance beside the artifact.  ffi_loader.build_provenance()
 # prints it in every run's startup report; without it the loader can only say
 # "NO PROVENANCE FILE (pre-stamp build)".  On 2026-08-05 a 4-node GPU log was

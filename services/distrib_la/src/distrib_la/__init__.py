@@ -23,6 +23,14 @@ The surface
     Resolve once, then call.  ``Plan(A)`` for one tile at ``P('x','y')``,
     ``Plan.batched(A_stack)`` for ``P(None,'x','y')``.  Eigenvalues come
     back replicated, eigenvectors as COLUMNS, on every backend.
+``Plan.batched_route`` / ``BATCHED_ROUTES`` / ``BATCHED_SCAN_UNROLL``
+    The batched surface is a ``lax.scan`` over the single-matrix op, and
+    ``batched_route`` is the ONE place that says how a given stack will
+    actually run: the scan, or the backend's own stacked entry where the
+    library has one (a backend-internal optimization behind the same
+    interface, never a second surface).  A third route — move the batch
+    axis onto the mesh and run the local kernel — is reserved and named
+    there.  Introspection: a caller reads it, never branches on it.
 ``Plan.native_fn``
     A pure, trace-safe closure — native backends only — for a call site
     that needs the math INSIDE its own ``jit``.
@@ -67,7 +75,17 @@ from __future__ import annotations
 from distrib_la.dispatch import dispatch_batched_eigh
 from distrib_la.factor import FactorToken, factor, solve
 from distrib_la.loader import dial_key, has_target, probe_target
-from distrib_la.plan import DONATES, Plan, ensure_sharding, plan
+from distrib_la.plan import (
+    BATCHED_ROUTES,
+    BATCHED_SCAN_UNROLL,
+    DONATES,
+    ROUTE_BACKEND_BATCHED,
+    ROUTE_BATCH_RESHARD,
+    ROUTE_SCAN,
+    Plan,
+    ensure_sharding,
+    plan,
+)
 from distrib_la.resolve import (
     BACKEND_CHOICES,
     CHOLESKY_BACKENDS,
@@ -86,6 +104,9 @@ from distrib_la.resolve import (
 __all__ = [
     # plan
     "Plan", "plan", "ensure_sharding", "DONATES",
+    # the batched route toggle and its dial
+    "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
+    "ROUTE_BATCH_RESHARD", "BATCHED_SCAN_UNROLL",
     # factor / solve
     "FactorToken", "factor", "solve",
     # resolution

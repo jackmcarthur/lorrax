@@ -712,7 +712,7 @@ def fit_zeta_to_h5(
 
     # ``zeta_q.h5`` carries the BGW-style ``mf_header`` verbatim from
     # the source WFN so any downstream consumer (the new
-    # :class:`file_io.zeta_loader.ZetaLoader`, or anything else that
+    # :class:`zeta_loader.ZetaLoader`, or anything else that
     # speaks the WFN.h5 header) sees the same crystal / k-grid / G-grid
     # / symmetry view.  ``isdf_header`` holds ζ-specific metadata only
     # — centroids in FFT-grid + fractional coords, density label,

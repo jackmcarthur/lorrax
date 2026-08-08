@@ -72,8 +72,9 @@ and in its negation, which is the one that gets said in review:
 `psi_G_store`, `kq_mapping`, `coulomb_sphere`, `meta`, `units`,
 `gamma_matrices`, `bispinor_init`, `chi_from_dipole`).  `symmetry_maps`
 and `density_symmetry_check` left `common/` for `services/symmetry_maps/`
-on 2026-08-07 and are reached through the service door; the modules at
-their old paths are forwarding shims.
+on 2026-08-07 and are reached through the service door; the forwarding
+shims left at their old paths were deleted the same day, so those
+modules no longer exist under `common/` in any form.
 
 **The acceptance test for a driver** is the one the owner stated: *it should
 appear to contain only physics on inspection*. Concretely — no `jax.sharding`,
@@ -163,11 +164,13 @@ grammar, platform, probe, announce-or-refuse.
 paths}.py` (`_slab_io_allgather` and `_slab_io_mpi_host` were deleted
 2026-08-06). Note the split inside
 `file_io/`: the *transport* is L3, the *format readers* above it
-(`zeta_loader`, `epsreader`, `mf_header`, `sigma_output`,
-`tagged_arrays`, …) are L1, because they know what a band and a ζ are.
-`wfn_loader` was one of them and is now an independently installable
-SERVICE at `services/wfn_loader/` (`src/file_io/wfn_loader.py` is a
-transitional shim). It is still L1 by this rule, and it is a CLIENT of
+(`epsreader`, `mf_header`, `sigma_output`, `tagged_arrays`, …) are L1,
+because they know what a band and a ζ are.  `wfn_loader` and
+`zeta_loader` were two of them and are now independently installable
+SERVICES at `services/wfn_loader/` and `services/zeta_loader/`; the
+transitional shims at their old `src/file_io/` paths were deleted on
+2026-08-07, so the door is the only way in. Both are still L1 by this
+rule, and `wfn_loader` is a CLIENT of
 the L3 transport through the `slab_io` door — which is the layering
 `tests/test_layering.py` enforces: reaching past the door (`from
 wfn_loader.loader import …`) is a failure, with a red twin.

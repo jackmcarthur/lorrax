@@ -81,7 +81,7 @@ way for the suite and the build to disagree about what a good library is.
 scripts/verify_ffi_build.sh --leg host build_host/liblorrax_ffi_host.so
 ```
 
-The ten gates, and the property each one guards:
+The ten gates it runs, and the property each one guards:
 
 | gate | property |
 |---|---|
@@ -94,7 +94,16 @@ The ten gates, and the property each one guards:
 | 6 | the OpenMP runtime is really an OpenMP runtime |
 | 7 | one HDF5, and it is the one the runtime will mount |
 | 8 | the FFT engine that actually binds is the intended one (needs a live process) |
-| 9 | the handler-signature ABI matches this source tree |
+| 11 | the handler-signature ABI matches this source tree |
+
+The two numbers missing from that list are the gates of the cross-`.so` ODR
+fix, and they are not in this file because neither one is a property of a
+single artifact inspected on its own:
+
+| gate | property | where it lives |
+|---|---|---|
+| 9 | nothing LORRAX-owned is on the dynamic table, and every shared `lrx_*` entry point carries its leg's suffix | `config/perlmutter/build_ffi_host.sh` and `src/ffi/cpp/build.sh`, at link time; `test_so_acceptance.py` check 6 intersects the two libraries |
+| 10 | a CUDA-capable process really can do host phdf5 work with both libraries open | `src/ffi/cpp/gate_one_odr.py`, inside a real GPU allocation |
 
 Two rules make these hard to fool. **A gate that cannot run is not a gate that
 passed**: GATE 8 needs a real process and cannot run on a login node, so it
@@ -133,7 +142,7 @@ LORRAX_SLATE_HOST_INSTALL_DIR=$WORK/slate_builds/cpu/install \
   config/frontera/build_ffi_host.sh --fresh
 ```
 
-Same ten gates, different vendors: MKL supplies ScaLAPACK, CBLAS and DFTI;
+Same gates, different vendors: MKL supplies ScaLAPACK, CBLAS and DFTI;
 `libmkl_blacs_intelmpi_lp64` must match the MPI, because the wrong BLACS links
 perfectly and only fails inside the first `blacs_gridinit`. Without
 `LORRAX_SLATE_HOST_INSTALL_DIR` this recipe builds the phdf5-only library, and

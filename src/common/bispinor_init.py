@@ -57,7 +57,7 @@ def lift_to_4spinor(psi_2, gvecs, kvecs, bvec):
     here — the caller wraps it; see ``WfnLoader._get_bispinor_lift_jit``).
 
     This is the single home of the k-batched lift, imported by
-    ``file_io.wfn_loader``; do not re-copy the constant + σ·p block there.
+    ``wfn_loader``; do not re-copy the constant + σ·p block there.
 
     Parameters
     ----------

@@ -149,13 +149,47 @@ def _registry_text():
 # The two scans
 # ---------------------------------------------------------------------------
 
+#: Every source root in this monorepo: ``src/`` plus each ``services/*/src``.
+#: DISCOVERED, not listed — a service added next week is scanned the day it
+#: lands, which is the only way an allowlist-free rule stays true.  Same
+#: construction as ``tests/test_layering.py``'s ``_roots()``, deliberately:
+#: this gate had exactly the defect that one already fixed.
+_SERVICES = os.path.join(_REPO, "services")
+
+
+def source_roots():
+    """``[src/, services/*/src/, ...]`` — every root the registry rules on."""
+    out = [_SRC]
+    if os.path.isdir(_SERVICES):
+        out += [os.path.join(_SERVICES, n, "src")
+                for n in sorted(os.listdir(_SERVICES))
+                if os.path.isdir(os.path.join(_SERVICES, n, "src"))]
+    return out
+
+
+ROOTS = source_roots()
+
+
 def python_read_sites():
-    """``{name: [(file, line, default)]}`` for every env read under src/.
+    """``{name: [(file, line, default)]}`` for every env read under ROOTS.
 
     Delegates to ``tools.env_audit.collect`` — ONE visitor for the tool
     and the gate.
+
+    MULTI-ROOT SINCE THE SERVICE PHASE, and it is a fix rather than a
+    generalisation: this scanned ``src/`` alone, so every env var read by a
+    service was invisible to the registry.  MEASURED at the merged head, the
+    ``LORRAX_TRS_*`` reads in
+    ``services/symmetry_maps/src/symmetry_maps/density_symmetry_check.py``
+    were ungated — the registry reported a clean tree while a whole
+    extracted package's environment surface was unscanned.  Extraction moved
+    the code; it did not move it out of scope.
     """
-    return env_audit.collect(_SRC)
+    hits = {}
+    for root in ROOTS:
+        for name, sites in env_audit.collect(root).items():
+            hits.setdefault(name, []).extend(sites)
+    return hits
 
 
 _CPP_EXTS = (".cc", ".cpp", ".cxx", ".cu", ".cuh", ".h", ".hh", ".hpp")
@@ -374,3 +408,58 @@ def _main():
 
 if __name__ == "__main__":
     raise SystemExit(_main())
+
+
+# ===========================================================================
+# THE ROOTS THEMSELVES — the ratchet under the multi-root scan
+# ===========================================================================
+# A scanner that quietly went back to one root would make this whole file a
+# no-op over every service, and nothing else here would notice: the registry
+# would simply report fewer names and still be "clean".  That is the
+# false-clean shape this file exists to prevent, so the roots are asserted
+# rather than trusted — the package-exists ratchet of tests/test_layering.py
+# applied to the scan surface instead of to a level map.
+
+def test_the_scan_covers_every_service_source_root():
+    """Every ``services/*/src`` on disk is scanned, and ``src/`` is too.
+
+    A CLAIM ABOUT DISK, not about a list: the roots are discovered, so the
+    assertion is that discovery found what is actually there.
+    """
+    roots = set(os.path.realpath(r) for r in ROOTS)
+    assert os.path.realpath(_SRC) in roots, "src/ fell out of the scan"
+    on_disk = {
+        os.path.realpath(os.path.join(_SERVICES, n, "src"))
+        for n in os.listdir(_SERVICES)
+        if os.path.isdir(os.path.join(_SERVICES, n, "src"))}
+    assert on_disk, (
+        "no services/*/src found at all — either the tree moved or this "
+        "gate is measuring nothing")
+    missing = sorted(on_disk - roots)
+    assert not missing, (
+        f"these service source roots are NOT scanned by the env registry: "
+        f"{missing}.  Every env var they read is ungated, and the registry "
+        f"reports a clean tree while saying nothing about them.")
+
+
+def test_a_service_env_read_is_actually_visible_to_the_registry():
+    """THE RED TWIN of the multi-root scan, and it is a measurement.
+
+    The single-root scanner passed every cell in this file while
+    ``LORRAX_TRS_*`` — read by symmetry_maps, a service — was invisible to
+    it.  So the twin is not "scan a temp dir": it is the concrete name that
+    was missing.  Scanning ``src/`` ALONE must NOT find it; scanning every
+    root MUST.  If symmetry_maps ever stops reading it, this cell fails and
+    names a different var to pin instead of silently proving nothing.
+    """
+    sites = python_read_sites()
+    trs = sorted(n for n in sites if n.startswith("LORRAX_TRS"))
+    assert trs, (
+        "no LORRAX_TRS* read found in ANY source root.  This cell pins the "
+        "measured example of the single-root hole; if symmetry_maps stopped "
+        "reading it, pin another service-owned env var here rather than "
+        "deleting the cell")
+    src_only = env_audit.collect(_SRC)
+    assert not [n for n in src_only if n.startswith("LORRAX_TRS")], (
+        f"{trs} is now read from src/ as well, so it no longer demonstrates "
+        f"the services-only hole; pin a var that only a service reads")

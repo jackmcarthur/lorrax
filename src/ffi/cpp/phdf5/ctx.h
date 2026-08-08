@@ -60,7 +60,43 @@ inline bool env_flag(const char* name, bool default_value) {
     return s == "1" || s == "true" || s == "yes" || s == "on";
 }
 
-struct PhdfCtx {
+// ONE STRUCT BODY, TWO ABI IDENTITIES — and the second is not optional.
+//
+// The members under `#ifndef LORRAX_FFI_NO_CUDA` below mean the CUDA build
+// and the host build lay this struct out DIFFERENTLY.  Until 2026-08-08 both
+// layouts were called `lorrax_ffi::phdf5::PhdfCtx`, so both libraries also
+// exported one mangled `open_ctx(...) -> PhdfCtx*`, `close_ctx(PhdfCtx*)`,
+// `ensure_dataset(PhdfCtx*, ...)`, ... — one name, two incompatible meanings,
+// in one RTLD_GLOBAL namespace.  Whichever library was dlopened first answered
+// for both, INCLUDING for the other one's own internal calls, so a handler
+// could be handed a ctx minted under the other layout and read its fields at
+// the wrong offsets.  That is what KNOWN_FAILURES L1's
+//
+//     offset_base=[0,0,0,4596944070643295330]
+//
+// is: an IEEE-754 float64 (~0.19) decoded as an int64, because the reader and
+// the writer disagreed about where the field was.
+//
+// Naming the two layouts differently makes that CATEGORY of failure
+// unconstructible rather than merely unlikely: `open_ctx` mangles to
+// `...PhdfCtxCudaV1...` in one library and `...PhdfCtxHostV1...` in the other,
+// so the two symbols cannot collide even if some future build drops the
+// visibility control in `exports_{cuda,host}.map`.  Belt AND braces, in that
+// order — the version scripts are the belt, this is the braces.
+//
+// `using PhdfCtx = ...` below keeps every call site, every forward
+// declaration and every `reinterpret_cast` in the four phdf5 TUs written the
+// way they already were.  The alias is the source-level name; the struct tag
+// is the ABI name.  Bump the V1 only if a layout changes in a way that a
+// stale .so could be handed — the version is an ABI generation, not a
+// release number.
+#ifdef LORRAX_FFI_NO_CUDA
+#  define LORRAX_PHDF_CTX_TYPE PhdfCtxHostV1
+#else
+#  define LORRAX_PHDF_CTX_TYPE PhdfCtxCudaV1
+#endif
+
+struct LORRAX_PHDF_CTX_TYPE {
     // Identity / process grid
     int rank = -1;
     int world_size = 0;
@@ -187,6 +223,10 @@ struct PhdfCtx {
     size_t align_threshold   = 1 << 20;          // 1 MiB
     size_t align_length      = 1 << 20;
 };
+
+// The source-level name.  Everything below, and every phdf5 TU, says
+// `PhdfCtx`; only the emitted symbols carry the leg.
+using PhdfCtx = LORRAX_PHDF_CTX_TYPE;
 
 // Grow ctx->pinned_buf (WRITER-THREAD staging) to at least `need_bytes`.
 // Idempotent; returns false on allocation failure or on an overflowing

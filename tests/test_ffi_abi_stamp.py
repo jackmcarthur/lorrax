@@ -74,7 +74,7 @@ def test_the_build_stamp_carries_the_version():
     ``common/build_config.cc`` is what puts ``abi=<N>`` into the .so's
     .rodata and exports ``lorrax_ffi_{host,cuda}_abi_version``.  If it stopped
     including the header, every artifact-level ABI gate would go quietly
-    vacuous: GATE 9 would report "no stamp" for every fresh build and the
+    vacuous: GATE 11 would report "no stamp" for every fresh build and the
     loaders would take the announce-and-proceed branch forever.
     """
     cc = (_REPO / "src" / "ffi" / "cpp" / "common" / "build_config.cc").read_text()
@@ -82,6 +82,45 @@ def test_the_build_stamp_carries_the_version():
     assert "LORRAX_FFI_ABI_VERSION" in cc
     for sym in ("lorrax_ffi_host_abi_version", "lorrax_ffi_cuda_abi_version"):
         assert sym in cc, f"build_config.cc no longer exports {sym}"
+
+
+@pytest.mark.parametrize("mapfile,leg", [
+    ("src/ffi/cpp/exports_host.map", "host"),
+    ("src/ffi/cpp/exports_cuda.map", "cuda"),
+])
+def test_the_version_script_still_exports_the_stamp(mapfile, leg):
+    """THE OTHER WAY THIS MECHANISM GOES VACUOUS, and it did.
+
+    The ODR fix links a version script into each leg whose ``local:`` clause
+    is the denylist ``*lorrax_ffi*`` — which matches
+    ``lorrax_ffi_<leg>_abi_version`` and ``lorrax_ffi_<leg>_build_config``
+    exactly as it matches a mangled internal.  Localising them does not fail
+    the link, does not fail any build gate, and does not fail a run: the
+    library stops exporting the symbol, the loaders take the "built before the
+    stamp existed" branch, and GATE 11 reports COULD NOT RUN.  Every artifact
+    then looks like a legitimate pre-2026-08-08 library and every pairing is
+    accepted.
+
+    That is precisely how this mechanism disarms without anybody noticing, so
+    the exception is asserted here rather than left to be re-discovered by the
+    first mispaired run.  Text, not ELF, so it runs on any machine and fails
+    in the same commit that removes the line.
+    """
+    text = (_REPO / mapfile).read_text()
+    # The `global:` clause is everything between the two clause keywords where
+    # they appear as keywords -- alone on their own line.  Both files discuss
+    # `local: *` in prose above, so a plain substring split lands in a comment.
+    m = re.search(r"^\s*global:\s*$(.*?)^\s*local:\s*$", text, re.M | re.S)
+    assert m, f"{mapfile} has no `global:` clause at all"
+    head = m.group(1)
+    for sym in (f"lorrax_ffi_{leg}_abi_version",
+                f"lorrax_ffi_{leg}_build_config"):
+        assert re.search(rf"^\s*{sym};", head, re.M), (
+            f"{mapfile} no longer names {sym} in its `global:` clause, so the "
+            f"`local: *lorrax_ffi*` denylist below will hide it.  The symbol "
+            f"is an API: both loaders dlsym the ABI accessor at dlopen and "
+            f"the acceptance tier reads the stamp.  Hiding it disarms the "
+            f"pairing refusal silently.")
 
 
 def test_the_two_legs_do_not_share_a_stamp_symbol():
