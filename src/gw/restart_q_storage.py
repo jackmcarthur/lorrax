@@ -148,8 +148,9 @@ def resolve_restart_q_storage(requested, resolution, *, context: str):
     Closure says the μ permutation α EXISTS.  ``use_ibz`` says the run
     ACTUALLY computed on a wedge — a deck whose q-grid the group does not
     reduce (ntran=1, or a Γ-only grid) has a closed centroid set and no
-    wedge to store, and ``qirr_store._validate`` would label that file
-    ``"full"`` from its shape anyway.  Storing "the wedge" there would be
+    wedge to store, and ``symmetry_maps.validate_qirr_tables`` would label
+    that file ``"full"`` from its shape anyway.  Storing "the wedge" there
+    would be
     storing the full BZ under a different attr, which is the
     shape-versus-attr disagreement the format refuses on read.  So both are
     required, and the ``ibz`` refusal distinguishes them by name.

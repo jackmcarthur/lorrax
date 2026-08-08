@@ -157,13 +157,20 @@ from symmetry_maps.maps import (              # noqa: F401  (compat surface)
 )
 from symmetry_maps.qirr_store import (
     QIRR_FORMAT_VERSION,
+    QIRR_RANK_BY_VERSION,
+    QIRR_TABLE_SUFFIX,
+    QIRR_VERSION_ATTR,
+    QirrDest,
     QirrHeader,
     QirrTables,
     allocate_qirr_placeholder,
     dataset_q_storage,
+    qirr_attr_str,
+    qirr_generator_commit,
     read_tables,
     read_tensor,
     stamp_qirr_tensor,
+    validate_qirr_tables,
     write_qirr_tensor,
 )
 from symmetry_maps.orbit_syms import (
@@ -212,7 +219,19 @@ __all__ = [
     "write_qirr_tensor", "read_tensor", "read_tables",
     "dataset_q_storage", "stamp_qirr_tensor",
     "allocate_qirr_placeholder", "QirrTables", "QirrHeader",
-    "QIRR_FORMAT_VERSION",
+    "QIRR_FORMAT_VERSION", "QIRR_RANK_BY_VERSION",
+    # ...and the format's own PLUMBING, on the door rather than reached
+    # for through ``symmetry_maps.qirr_store``.  A second store writing
+    # this layout — the frequency-resolved W — opens the same handles,
+    # reads the same attrs, stamps the same provenance and owes the
+    # tables the same validation; underscoring these would not keep it
+    # out, it would only make it copy them, and a copied validator is a
+    # second answer to "do these tables describe this tensor".  Same
+    # reason ``vcoul`` puts ``_minibz_kernel_bare`` on its door: a
+    # consumer reaching the submodule for one of these is a
+    # past-the-door edge and ``tests/test_layering.py`` rule 6 counts it.
+    "QIRR_VERSION_ATTR", "QIRR_TABLE_SUFFIX", "QirrDest", "qirr_attr_str",
+    "qirr_generator_commit", "validate_qirr_tables",
     # the TRS measurement
     "DensitySymmetryReport", "check_density_symmetries",
     "cached_density_symmetry_check", "trs_check_mode",

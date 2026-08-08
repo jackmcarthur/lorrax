@@ -14,9 +14,14 @@ machinery hard.  Five arms:
    ``kin_ion`` unfold bug survived.
 2. **The refusal suite**, each refusal beside its constructible twin: a
    non-closed set at write (the real production 960-centroid vector), a
-   table-hash mismatch at read, a version mismatch, a shape-versus-attr
-   disagreement, a partial stamp, and the no-attr legacy path read
-   byte-for-byte.
+   table-hash mismatch at read, a version mismatch, a RANK that
+   contradicts the stamped version, a shape-versus-attr disagreement, a
+   partial stamp, and the no-attr legacy path read byte-for-byte.  The
+   rank cell is the one whose red half had to be built rather than
+   flipped: a rank-4 tensor stamped version 1 passes every OTHER check
+   in this file whenever its leading extent equals the wedge extent, so
+   the cell asserts those four still pass before asserting the refusal —
+   otherwise it would be green against a reader that has no rank guard.
 3. **The persisted flag.**  A zero placeholder of exactly the right shape
    must not read as data.
 4. **The umklapp arm.**  A synthetic non-symmorphic glide where dropping
@@ -777,6 +782,118 @@ def test_a_version_mismatch_refuses():
             QS.read_tensor(path, "W0_qmunu", mesh_xy=mesh)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_a_rank_4_tensor_stamped_version_1_refuses_by_name():
+    """REFUSAL 3b: THE HAZARD, CONSTRUCTED — and refused on the RANK.
+
+    The version check above catches a file that SAYS it is another
+    layout.  This catches the one that lies about it, which is the case
+    the version number cannot reach: a writer that gained an axis
+    without bumping, or a hand-edited attr.  A reader that trusts the
+    stamp has no second opinion; the rank is one, because it is a
+    property of the bytes.
+
+    THE MALICIOUS FILE IS BUILT TO BE MAXIMALLY QUIET.  The leading
+    extent is chosen EQUAL to the wedge extent, so ``shape[0]`` is the
+    number a version-1 reader expects, ``shape[-1]`` is genuinely N_μ,
+    and everything downstream of the guard agrees: the tables validate
+    against both extents, the shape verdict is still ``"ibz"``, the
+    stamped digest still matches the tables on disk, ``q_storage`` still
+    cross-checks and the readiness flag is still set.  Those four are
+    ASSERTED below rather than assumed — without them the cell would be
+    refusing something for a reason that has nothing to do with the
+    rank, and would pass on a reader that had no rank guard at all.
+
+    That coincidence is one deck away, not a hypothetical: Si 4³ reduces
+    64 q to 8 and an n_p = 4 multipole fit samples 8 frequencies.  Left
+    unrefused, the caller gets 4-D bytes back with the frequency axis
+    relabelled q and a header that says so.
+
+    TWIN: the same tables and the same wedge at rank 3 — the honest
+    version-1 file — read and unfold.
+    """
+    import h5py
+
+    arm = trs_arm("gnppm_debug")
+    tmpdir, path = _tmp_h5("rank")
+    mesh = _mesh_here()
+    try:
+        QS.write_qirr_tensor(path, "W0_qmunu", arm.X_ibz, tables=arm.tables,
+                             closure_verdict=arm.verdict)
+        _, hdr = QS.read_tensor(path, "W0_qmunu", mesh_xy=mesh)   # TWIN
+        assert hdr.format_version == QS.QIRR_FORMAT_VERSION
+        assert hdr.n_q_on_disk == arm.tables.n_q_ibz
+
+        # THE COINCIDENCE, on purpose: n_omega EQUAL to the wedge extent.
+        n_omega = arm.tables.n_q_ibz
+        W = np.stack([arm.X_ibz * (1.0 + i) for i in range(n_omega)])
+        assert W.ndim == 4 and W.shape[0] == W.shape[1], (
+            "this cell is only a test of the rank guard while the leading "
+            "extent matches the wedge extent; otherwise an extent check "
+            "would catch it first and the guard would go unexercised")
+
+        with h5py.File(path, "a") as f:
+            attrs = dict(f["W0_qmunu"].attrs)
+            del f["W0_qmunu"]
+            f.create_dataset("W0_qmunu", data=W)
+            for key, val in attrs.items():
+                f["W0_qmunu"].attrs[key] = val
+
+        # NOT VACUOUS: every version-1 check the guard precedes still
+        # passes on these bytes.  The table validation reads the leading
+        # extent as the q extent and calls the file a wedge; the digest,
+        # the attr and the readiness flag are the writer's own.
+        assert QS.validate_qirr_tables(
+            arm.tables, int(W.shape[0]), arm.n_mu) == "ibz"
+        assert attrs["qirr_table_hash"] == arm.tables.canonical().digest()
+        assert attrs["q_storage"] == "ibz"
+        assert bool(attrs["qirr_data_ready"]) is True
+        assert int(attrs["qirr_format_version"]) == QS.QIRR_FORMAT_VERSION
+
+        # THE REFUSAL.  Rank first, and it names BOTH numbers.
+        for kw in ({"unfold": False}, {"mesh_xy": mesh}):
+            with pytest.raises(ValueError) as exc:
+                QS.read_tensor(path, "W0_qmunu", **kw)
+            msg = str(exc.value)
+            assert "qirr_format_version=1" in msg, msg
+            assert "rank 3" in msg and "rank 4" in msg, msg
+            assert str(tuple(int(s) for s in W.shape)) in msg, msg
+            assert "RANK IS THE DISCRIMINANT" in msg, msg
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_the_format_plumbing_is_reachable_through_the_door():
+    """The promotion, pinned where it has to hold: on the PACKAGE.
+
+    A second store writing this layout needs the same handle opener, the
+    same attr decoder, the same provenance stamp, the same table
+    validation and the same version-attr spelling.  Reaching
+    ``symmetry_maps.qirr_store`` for them is a past-the-door edge that
+    ``tests/test_layering.py`` rule 6 counts, so they are on the door —
+    and a name that resolves but is absent from ``__all__`` is one a
+    consumer discovers is missing at run time rather than at import
+    time.  Both are asserted, for the same reason the rename-compat
+    suite asserts both.
+    """
+    import symmetry_maps
+
+    for name in ("QIRR_VERSION_ATTR", "QIRR_RANK_BY_VERSION",
+                 "QIRR_TABLE_SUFFIX", "QirrDest", "qirr_attr_str",
+                 "qirr_generator_commit", "validate_qirr_tables"):
+        assert hasattr(symmetry_maps, name), (
+            f"``from symmetry_maps import {name}`` does not resolve; a "
+            f"consumer would have to reach the qirr_store submodule for "
+            f"it, which is the layering violation the promotion removed")
+        assert name in symmetry_maps.__all__, (
+            f"{name} resolves but is not in __all__, so ``import *`` "
+            f"drops it")
+        assert getattr(symmetry_maps, name) is getattr(QS, name), (
+            f"the door's {name} is not the module's; two bindings are two "
+            f"answers the day one of them moves")
+    assert symmetry_maps.QIRR_RANK_BY_VERSION == {QS.QIRR_FORMAT_VERSION: 3}
+    assert symmetry_maps.QIRR_VERSION_ATTR == "qirr_format_version"
 
 
 def test_shape_and_attr_must_agree_and_the_shape_wins_the_argument():
