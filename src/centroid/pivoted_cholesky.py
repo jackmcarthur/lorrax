@@ -79,14 +79,137 @@ import symmetry_maps                                            # noqa: E402
 # kernel against.  Keep the two in step.
 
 
-@partial(jax.jit, static_argnames=('k_keep',))
+# THE STOPPING RULE, AND WHY IT IS A CONTRACT AND NOT A DIAGNOSTIC
+# ─────────────────────────────────────────────────────────────────────────
+# Both kernels below compute ``floor = sqrt(eps) · max(diag G)`` — relative
+# to the largest initial diagonal, which is the scale-invariant choice, and
+# in the sharded kernel it is a ``pmax`` so it agrees across shard counts.
+# Until 2026-08-07 that number was computed and then used for NOTHING but
+# reporting ``rank``: the recurrence ran all ``k_keep`` iterations whatever
+# the residual did.  MEASURED consequence, on this box, reproducing
+# ``CENTROID_GEN_ASSESSMENT.md`` §4.1-§4.3 (probe ``pc_repro.py``):
+#
+#   * Gram of true rank 10, k_keep=40.  ``pivot_val`` clamps to ``eps``, so
+#     ``denom = sqrt(eps) ≈ 1.5e-8`` and each column is the previous one
+#     SQUARED over 1.5e-8 — a geometric blow-up.  Column norms past the
+#     cliff went 3.2e-07 … 5.2e+04, 2.2e+16, 1.1e+39, 1.4e+85, inf, nan;
+#     the first non-finite column was j = 22, twelve iterations past a true
+#     rank of 10.  ``argmax`` over NaN returns the FIRST NaN index, so the
+#     pivots past the rank came back ``0 1 3 4 5 7 8 9 10 11 13 …`` — the
+#     first unpicked indices, chosen by array position and not by any
+#     residual criterion.  Those are real candidate indices, so the pad
+#     guard below did not fire and the caller got what looked like a normal
+#     pivot list.  ``d_taken`` is masked to clean zeros past ``rank``, so
+#     the three numbers the wrapper prints never showed it; only
+#     ``trR_over_trG`` came back NaN.
+#   * Orbit mode, M=96 in 12 orbits of 8, k_keep=20.  Once every orbit is
+#     inactive ``masked_d`` is uniformly −inf, ``pivot_val`` clamps to
+#     ``eps`` rather than NaN and ``argmax`` over a uniform array returns 0:
+#     pivots came back ``[54 40 30 86 72 6 32 62 22 88 8 64 0 0 0 0 0 0 0 0]``
+#     — twelve genuine pivots, then index 0 repeated eight times, finite
+#     arithmetic and a nonsense answer.
+#   * Indefinite Gram (λ_min = −4.95e-01 against λ_max = 4.95e+02).  Reported
+#     rank 23 of 24, all 24 pivots distinct, ``L`` entirely finite,
+#     ``min(d_final)`` exactly 0.0 — NO signal anywhere in the return tuple
+#     that the input was not positive semidefinite, because the
+#     ``jnp.maximum(…, 0.0)`` on the Schur update destroys the classic PSD
+#     detector before it can be observed.  LAPACK's ``pstrf`` returns
+#     ``INFO > 0`` for exactly this case.
+#
+# The fix is three lines of arithmetic and no new machinery:
+#
+#   1. ``denom`` clamps at ``floor`` instead of at ``eps``.  On a healthy
+#      input ``pivot_val > floor`` so ``max(pivot_val, floor) == pivot_val``
+#      and every number is BIT-IDENTICAL to before; past the cliff the
+#      divisor can no longer be 1.5e-8 and the blow-up has no fuel.
+#   2. ``take = pivot_val > floor`` gates the writes.  Past the stop ``L``
+#      takes exact zeros, ``piv`` keeps the −1 sentinel it was initialised
+#      with, ``d`` and ``trR_over_trG`` freeze.  ``rank`` is then exactly
+#      the number of pivots taken — a HARD CONTRACT, not a diagnostic —
+#      and the caller's sentinel guard fires naturally.  This is deliberately
+#      NOT a ``lax.cond``: the predicate is a ``pmax`` result and therefore
+#      identical on every shard, but putting the sharded kernel's
+#      collectives inside a conditional region is a hazard for no gain,
+#      since the halted branch costs the same as a taken one either way.
+#   3. The Schur update keeps a clamp for the recurrence's own safety but
+#      the PSD detector now reads the value BEFORE it — ``d_min_raw``, the
+#      most negative pre-clamp residual diagonal seen over active rows.
+#      The clamp no longer destroys the detector; it just no longer feeds
+#      it.  The wrapper refuses when ``d_min_raw < −floor``, which is the
+#      ``pstrf`` INFO in the one form a jitted kernel can return it.
+#
+# WHAT DID NOT CHANGE, DELIBERATELY.  The PIVOT RULE.  Greedy
+# max-residual-diagonal IS LAPACK ``?pstrf``'s rule, and this work adopts
+# ``pstrf``'s SEMANTICS around it — terminate on a scale-relative
+# tolerance, report the achieved rank, signal indefiniteness INFO-style —
+# without touching the selection itself.  Every healthy-input result is
+# bit-identical to the pre-2026-08-07 kernel; that is checked, not asserted
+# (``pc_ab.py``, five cases including orbit mode, ``piv``/``L``/``rank``/
+# ``d_final``/``d_taken``/``trR`` all byte-equal).
+#
+# THE TOLERANCE POLICY, AND WHY IT IS A KNOB.  The floor is
+# ``tol_rel · max(diag G)`` with ``tol_rel`` defaulting to ``sqrt(eps)``
+# (~1.49e-08 in float64).  Relative to the largest INITIAL diagonal is the
+# scale-invariant choice and is what makes the answer independent of how G
+# is normalised; the sharded kernel takes that maximum through a ``pmax``
+# so the floor is identical at every shard count.  LAPACK's ``?pstrf``
+# defaults to ``n·eps·max(diag)`` instead, which at the production
+# M = 2580 is 5.7e-13 — some four orders LOOSER than the default here.
+# ``sqrt(eps)`` is kept as the default because it is the number this kernel
+# has always computed for its ``rank`` report, so adopting it as the
+# stopping rule leaves every existing deck's reported rank unmoved; a
+# caller that wants LAPACK's own policy passes ``tol_rel=n*eps``.  The
+# override is a parameter on all three entry points and, at the driver
+# seam, the ``LORRAX_CENTROID_PC_TOL`` environment variable.
+#
+# ROOM FOR A BLOCKED VARIANT, LEFT ON PURPOSE.  The per-iteration state is
+# deliberately minimal — ``(d, L, piv, active, d_taken, trR, d_min_raw,
+# d_min_at, d_min_j)``, of which only the first four participate in the
+# recurrence — and the collectives stay explicit and adjacent at the top of
+# the body rather than hidden behind helpers.  A blocked variant (choose a
+# panel of ``b`` pivots per round, then one level-3 trailing update) would
+# cut the 3·k_keep collective round trips by roughly ``b`` and slots into
+# this shape without restructuring the carry.  It is NOT implemented here:
+# the select is 0.165 s at production M, 3-4 % of the driver's wall, and
+# robustness was the deliverable.
+#
+# The refusal DISCIPLINE — a named condition, the measured evidence, and
+# what to do instead — is borrowed from ``distrib_la``.  Its DISPATCH is
+# not: this kernel stays local (assessment R7 — it is a selection and not a
+# factorisation, the orbit-kill rule is crystallography rather than linear
+# algebra, no backend has a masked-active-set ``pstrf`` to dispatch to, and
+# at 0.165 s on a production Gram it is 3-4 % of the driver's wall).
+
+
+@partial(jax.jit, static_argnames=('k_keep', 'tol_rel'))
 def pivoted_cholesky_select(
     G: jnp.ndarray,
     k_keep: int,
     orbit_id: jnp.ndarray | None = None,
+    *,
+    tol_rel: float | None = None,
 ):
-    """Greedy pivoted Cholesky on an Hermitian PSD ``G``. Always runs k_keep
-    iterations. Returns ``(piv, L, rank, d_final, d_taken, trR_over_trG)``.
+    """Greedy pivoted Cholesky on an Hermitian PSD ``G``. STOPS at the
+    numerical-rank floor. Returns ``(piv, L, rank, d_final, d_taken,
+    trR_over_trG, psd_info)``.
+
+    ``rank`` is the number of pivots actually taken and is a CONTRACT:
+    ``piv[rank:] == -1``, ``L[:, rank:] == 0``, ``d_taken[rank:] == 0``.
+    ``rank < k_keep`` means the kernel could not certify what was asked for
+    and the returned pivot list is deliberately incomplete rather than
+    padded with noise — see the block comment above for what the old
+    always-run-k_keep behaviour did instead.
+
+    ``psd_info`` is ``(d_min_raw, at_row, at_step)`` — the most negative
+    pre-clamp residual diagonal observed, the candidate row that attained
+    it, and the iteration it happened on.  ``d_min_raw < -tol_rel·max(diag
+    G)`` says the input was not positive semidefinite, and the two indices
+    are what lets the refusal NAME the pivot rather than merely assert the
+    condition, which is the ``pstrf`` ``INFO`` contract.
+
+    ``tol_rel`` overrides the stopping tolerance, relative to the largest
+    initial diagonal; ``None`` means ``sqrt(eps)``.  See the block comment
+    above for why that, and not LAPACK's ``n·eps``, is the default.
 
     When ``orbit_id`` is given (shape ``(M,)`` int), each pivot iteration
     marks the **whole orbit** of the picked point as inactive — i.e. one
@@ -95,7 +218,8 @@ def pivoted_cholesky_select(
     residual diagonal and the column update on any one of them is, by
     symmetry, the optimal full-orbit removal. The caller unfolds picked
     pivots through their orbits at output time to recover the full
-    centroid set.
+    centroid set.  Asking for more orbits than exist now STOPS at the last
+    real orbit instead of repeating index 0.
     """
     M = G.shape[0]
     real_dtype = G.real.dtype
@@ -104,9 +228,19 @@ def pivoted_cholesky_select(
     if orbit_id is None:
         orbit_id = jnp.arange(M, dtype=jnp.int32)         # each point its own orbit
 
-    diag0 = jnp.maximum(jnp.real(jnp.diag(G)), 0.0)
+    diag_raw = jnp.real(jnp.diag(G))
+    # The floor moves ABOVE the loop: it is the stopping rule now, not a
+    # post-hoc label on a number the loop already ruined.
+    tol = jnp.sqrt(eps) if tol_rel is None else jnp.asarray(tol_rel,
+                                                            real_dtype)
+    floor = tol * jnp.max(diag_raw)
+    diag0 = jnp.maximum(diag_raw, 0.0)
     trG = jnp.sum(diag0)
 
+    # The initial diagonal is itself a PSD statement: a negative entry on
+    # the diagonal of a PSD matrix is impossible, and step -1 names it.
+    at0 = jnp.argmin(diag_raw).astype(jnp.int32)
+    neg0 = diag_raw[at0] < 0.0
     init = (
         diag0,                                                       # d
         jnp.zeros((M, k_keep), dtype=G.dtype),                       # L
@@ -114,15 +248,23 @@ def pivoted_cholesky_select(
         jnp.ones((M,), dtype=bool),                                  # active
         jnp.zeros((k_keep,), dtype=real_dtype),                      # d_taken
         jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(1.0),   # trR/trG
+        jnp.minimum(diag_raw[at0], jnp.zeros((), dtype=real_dtype)),  # d_min
+        jnp.where(neg0, at0, jnp.int32(-1)),                         # at_row
+        jnp.where(neg0, jnp.int32(-1), jnp.int32(-1)),               # at_step
     )
     col_ids = jnp.arange(k_keep)
 
     def body(j, carry):
-        d, L, piv, active, d_taken, trR_over_trG = carry
+        (d, L, piv, active, d_taken, trR_over_trG,
+         d_min_raw, d_min_at, d_min_j) = carry
 
         masked_d = jnp.where(active, d, minus_inf)
         p = jnp.argmax(masked_d)
-        pivot_val = jnp.maximum(masked_d[p], eps)         # eps for div-safety
+        # THE STOP.  ``pivot_val`` clamps at ``floor`` (not ``eps``), so on a
+        # healthy input this is bit-for-bit the old arithmetic and past the
+        # rank the divisor can no longer manufacture a blow-up.
+        take = masked_d[p] > floor
+        pivot_val = jnp.maximum(masked_d[p], floor)
 
         # L[:, j] = (G[:, p] - Σ_{i<j} L[:, i] · conj(L[p, i])) / sqrt(d[p])
         prev_mask = (col_ids < j).astype(G.dtype)
@@ -131,34 +273,199 @@ def pivoted_cholesky_select(
         newcol = (G[:, p] - corr) / denom
         # Pivot entry exactly sqrt(d[p]) — kills rounding drift.
         newcol = newcol.at[p].set(denom.astype(G.dtype))
+        newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
 
         L = L.at[:, j].set(newcol)
-        piv = piv.at[j].set(p.astype(jnp.int32))
-        d_taken = d_taken.at[j].set(pivot_val.astype(real_dtype))
+        piv = piv.at[j].set(jnp.where(take, p, -1).astype(jnp.int32))
+        d_taken = d_taken.at[j].set(
+            jnp.where(take, pivot_val, 0.0).astype(real_dtype))
 
-        # Schur-complement update; d_new[p] ≈ 0 by the cleanup above.
-        d_new = jnp.maximum(d - jnp.abs(newcol) ** 2, 0.0)
+        # Schur-complement update; d_new[p] ≈ 0 by the cleanup above.  The
+        # PSD detector reads d_raw BEFORE the clamp, over ACTIVE rows only
+        # (inactive rows carry −inf and would swamp the minimum).
+        d_raw = d - jnp.abs(newcol) ** 2
+        masked_raw = jnp.where(active, d_raw, jnp.inf)
+        step_at = jnp.argmin(masked_raw).astype(jnp.int32)
+        step_min = masked_raw[step_at]
+        # Keep the row and the step alongside the value, so the refusal can
+        # NAME the pivot the way pstrf's INFO does instead of only asserting
+        # that indefiniteness happened somewhere.
+        beats = take & (step_min < d_min_raw)
+        d_min_at = jnp.where(beats, step_at, d_min_at)
+        d_min_j = jnp.where(beats, j.astype(jnp.int32), d_min_j)
+        d_min_raw = jnp.where(beats, step_min, d_min_raw)
+        # ``d_new`` past the stop is just the frozen residual with the −inf
+        # kill markers clipped away, so the trace ratio holds its last real
+        # value instead of going −inf/NaN.
+        d_new = jnp.maximum(jnp.where(take, d_raw, d), 0.0)
         trR_over_trG = trR_over_trG.at[j + 1].set(jnp.sum(d_new) / trG)
         # Mark p (or its whole orbit, if orbit_id was provided) inactive.
-        kill_mask = orbit_id == orbit_id[p]
-        d = jnp.where(kill_mask, minus_inf, d_new)
+        kill_mask = (orbit_id == orbit_id[p]) & take
+        d = jnp.where(kill_mask, minus_inf, jnp.where(take, d_new, d))
         active = active & ~kill_mask
 
-        return d, L, piv, active, d_taken, trR_over_trG
+        return (d, L, piv, active, d_taken, trR_over_trG,
+                d_min_raw, d_min_at, d_min_j)
 
-    d, L, piv, _, d_taken, trR_over_trG = lax.fori_loop(0, k_keep, body, init)
+    (d, L, piv, _, d_taken, trR_over_trG,
+     d_min_raw, d_min_at, d_min_j) = lax.fori_loop(0, k_keep, body, init)
     d_final = jnp.where(jnp.isfinite(d), d, 0.0)
-    # Effective rank = #pivots above a fp-noise floor relative to ‖G‖.
-    # The algorithm always runs k_keep iterations (residual decay is smooth
-    # in the production use case); rank is only reported so callers can
-    # detect rank-deficient synthetic inputs.
-    floor = jnp.sqrt(eps) * jnp.max(jnp.real(jnp.diag(G)))
+    # Effective rank = #pivots taken.  With the stopping rule above this is
+    # exactly the loop's trip count: ``d_taken[j] > floor`` for every taken
+    # pivot by construction and 0 for every untaken one, so the count is a
+    # contract rather than the §4.4 assumption that ``d_taken`` happens to
+    # be monotone past the numerical rank (it is not, when it is noise).
     rank = jnp.sum(d_taken > floor).astype(jnp.int32)
-    # Zero out post-rank entries so callers can rely on d_taken[rank:] == 0.
-    d_taken = jnp.where(jnp.arange(k_keep) < rank, d_taken, 0.0)
-    return piv, L, rank, d_final, d_taken, trR_over_trG
+    return (piv, L, rank, d_final, d_taken, trR_over_trG,
+            (d_min_raw, d_min_at, d_min_j))
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# The kernel's INFO, read on the host
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def refuse_unless_select_certified(
+    piv,
+    rank: int,
+    psd_info,
+    *,
+    n_keep: int,
+    M: int,
+    M_pad: int | None = None,
+    orbit_id=None,
+    d0max: float,
+    tol_rel: float | None = None,
+) -> None:
+    """Raise unless the select delivered ``n_keep`` certified pivots.
+
+    A jitted kernel cannot raise, so it REPORTS and this REFUSES — the same
+    division of labour LAPACK's ``pstrf`` makes with its ``INFO`` code, and
+    the reason assessment R7 says to borrow ``distrib_la``'s refusal
+    discipline rather than its dispatch.  Three conditions, each of which
+    used to be a silent wrong answer that passed every downstream shape
+    check; the measured before-behaviour of all three is in the block
+    comment above :func:`pivoted_cholesky_select`.
+
+    It is a free function, and public, for one reason: every one of these
+    refusals needs a constructible-FALSE twin, and building one through
+    :func:`prune_candidates_by_pivoted_cholesky` would mean standing up a
+    WFN and a symmetry table to test an arithmetic contract.  The tests
+    hand it real kernel output.
+
+    Parameters
+    ----------
+    piv, rank, psd_info
+        Straight off the kernel — the pivot list, its hard-contract rank
+        and the ``(d_min_raw, at_row, at_step)`` triple.  A bare float is
+        also accepted for ``psd_info``, in which case the refusal cannot
+        name the pivot.
+    n_keep
+        What was asked for.  Orbits in orbit mode, points otherwise.
+    M, M_pad
+        Logical candidate count and the zero-padded extent the sharded
+        select actually ran on.  ``M_pad=None`` means "unpadded".
+    orbit_id
+        ``(M,)`` int or ``None``.  Read only to count available orbits and
+        to name the unit in the message.
+    d0max
+        ``max(diag G)`` — the scale the noise floor is relative to.
+    tol_rel
+        The stopping tolerance the kernel ran with; ``None`` means
+        ``sqrt(eps)``.  Must match, or the floor quoted in the refusal
+        would not be the one the kernel stopped on.
+    """
+    piv_np = np.asarray(piv)
+    M_pad = int(M if M_pad is None else M_pad)
+    tol = (float(np.sqrt(np.finfo(np.float64).eps)) if tol_rel is None
+           else float(tol_rel))
+    floor = tol * float(d0max)
+    rank_i = int(rank)
+    if isinstance(psd_info, (tuple, list)):
+        d_min = float(psd_info[0])
+        at_row, at_step = int(psd_info[1]), int(psd_info[2])
+    else:
+        d_min, at_row, at_step = float(psd_info), -1, -1
+
+    # (1) NOT POSITIVE SEMIDEFINITE.  The Schur update keeps a clamp for the
+    # recurrence's own safety, but the detector now reads the value BEFORE
+    # it, so the clamp no longer destroys the signal.  ``pstrf`` reports
+    # this as INFO = the order of the leading minor that failed; the
+    # equivalent here is the STEP it failed on and the candidate ROW that
+    # carried it, and both are named rather than left to be re-derived.
+    if d_min < -floor:
+        where = (f"candidate row {at_row} at step "
+                 f"{'the initial diagonal' if at_step < 0 else at_step}"
+                 if at_row >= 0 else "an unrecorded row")
+        raise RuntimeError(
+            f"pivoted-Cholesky REFUSES: the Gram is not positive "
+            f"semidefinite.  The residual Schur diagonal reached "
+            f"{d_min:.6e} on {where} — past the noise floor -{floor:.6e} "
+            f"(= -{tol:.3e}·max diag G = -{tol:.3e}·{float(d0max):.6e}), "
+            f"i.e. by {abs(d_min) / max(floor, 1e-300):.3g}x the floor.  A "
+            f"PSD matrix cannot do that in any arithmetic.  Until "
+            f"2026-08-07 a ``jnp.maximum(..., 0.0)`` on the update absorbed "
+            f"exactly this signal and the kernel reported a clean rank with "
+            f"every pivot distinct, L entirely finite and min(d_final) "
+            f"exactly 0.0 — measured on a Gram indefinite by one part in a "
+            f"thousand.  The q=0 Gram is a sum of outer products and should "
+            f"be PSD by construction, so this says the ASSEMBLY is wrong (a "
+            f"conjugation, a k-weight, a band window), not that the "
+            f"selection needs loosening.")
+
+    # (2) THE RECURRENCE STOPPED.  ``rank`` is a contract now: short means
+    # ``piv`` carries -1 sentinels and there is no set of the requested size
+    # to deliver.  The two causes get different text because the fixes are
+    # different — one is "the pool is too small", the other is "the pool is
+    # numerically flat", and the second is the one that has cost eV.
+    if rank_i < int(n_keep):
+        unit = "orbits" if orbit_id is not None else "points"
+        n_avail = (int(np.unique(np.asarray(orbit_id)).size)
+                   if orbit_id is not None else int(M))
+        if n_avail <= rank_i:
+            cause = (f"the candidate pool CONTAINS only {n_avail} {unit}, "
+                     f"so there was nothing left to pick.  Raise "
+                     f"--oversample for a richer pool, or lower N.")
+        else:
+            cause = (f"{n_avail} {unit} were available, but the residual "
+                     f"Schur diagonal fell to the noise floor {floor:.3e} "
+                     f"after {rank_i} of them — the pool is numerically "
+                     f"RANK-DEFICIENT, not short.  Widen the prune window "
+                     f"(--prune-n-cond, or --prune-window vc_x_vc) so the "
+                     f"Gram sees the pair densities Sigma actually "
+                     f"consumes, or lower N.")
+        raise RuntimeError(
+            f"pivoted-Cholesky REFUSES: asked for {int(n_keep)} {unit}, "
+            f"certified {rank_i}.\n"
+            f"  cause : {cause}\n"
+            f"  effect: piv[{rank_i}:] is the -1 sentinel, so there is no "
+            f"set of {int(n_keep)} {unit} to return.\n"
+            f"Before 2026-08-07 this ran to k_keep regardless.  Past the "
+            f"numerical rank the divisor clamped to sqrt(eps) and the "
+            f"factor blew up geometrically to Inf and then NaN (MEASURED: "
+            f"first non-finite column twelve iterations past a true rank of "
+            f"10), after which argmax over NaN handed back the first "
+            f"unpicked indices IN ARRAY ORDER — real candidate indices, so "
+            f"the pad guard did not fire and nothing downstream noticed.  "
+            f"In orbit mode the same exhaustion stayed finite and returned "
+            f"index 0 repeated once per missing orbit.")
+
+    # (3) PAD ROWS AND SENTINELS.  HARD GUARD, not a comment: an
+    # out-of-range index would silently index past the candidate list (or
+    # wrap from the end) and the centroid set would be quietly wrong — the
+    # rc=0-with-garbage class.  UNCONDITIONAL since 2026-08-07; it used to
+    # run only under ``if n_pad``, which is exactly the branch that cannot
+    # see a -1 sentinel on an unpadded problem.
+    bad = piv_np[(piv_np >= int(M)) | (piv_np < 0)]
+    if bad.size:
+        raise RuntimeError(
+            f"pivoted-Cholesky REFUSES: {bad.size} pivot(s) {bad[:8]} lie "
+            f"outside the candidate range [0,{int(M)}) (M_pad={M_pad}).  "
+            f"Either the active mask that makes pad rows unpickable did not "
+            f"hold, or a stopping sentinel survived the rank contract "
+            f"above.  Refusing to emit a centroid set built from either.")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -183,6 +490,7 @@ def prune_candidates_by_pivoted_cholesky(
     bispinor: bool = False,
     orbit_id: np.ndarray | None = None,
     use_phdf5: bool = False,
+    tol_rel: float | None = None,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
 
@@ -198,11 +506,31 @@ def prune_candidates_by_pivoted_cholesky(
     mode ``n_keep`` counts ORBITS (final unfolded centroid count is
     ``Σ orbit_size`` for picked orbits).
 
-    Returns ``(keep_idx, rank, G, d_final, d_taken, trR_over_trG)``.
+    Returns ``(keep_idx, rank, G, d_final, d_taken, trR_over_trG,
+    psd_info)``.
+
+    ``tol_rel`` overrides the select's stopping tolerance (relative to the
+    largest initial Gram diagonal).  ``None`` reads
+    ``LORRAX_CENTROID_PC_TOL`` from the environment and falls back to
+    ``sqrt(eps)`` — the number this kernel has always computed for its rank
+    report, kept as the default so no existing deck's reported rank moves.
+    LAPACK ``?pstrf``'s own policy is ``n·eps``; pass it explicitly to get
+    it.
+
+    REFUSES, rather than returning a plausible-looking set, when the kernel
+    could not do what was asked: a non-PSD Gram, a pool that runs out of
+    orbits, a pool that is numerically rank-deficient, or a pivot outside
+    the candidate range.  ``rank == n_keep`` on every path that returns.
+    Those refusals are the assessment's R1 and they are stated in full
+    beside the kernel; the short version is that each one used to be a
+    silent wrong answer that passed every downstream shape check.
     """
     M = int(cand_idx.shape[0])
     n_tot = int(wfn.nbands)
     asymmetric = (band_range_left is not None and band_range_right is not None)
+    if tol_rel is None:
+        _env_tol = os.environ.get("LORRAX_CENTROID_PC_TOL")
+        tol_rel = float(_env_tol) if _env_tol else None
 
     if not asymmetric:
         # Legacy (n_val, n_cond) path — left = (0, n_val), right = (n_val, n_val + n_cond).
@@ -324,7 +652,7 @@ def prune_candidates_by_pivoted_cholesky(
     # via psum-with-mask, same idiom as the L[p, :] broadcast).
     with timing.section("prune.select"):
         select_step = make_sharded_pivoted_cholesky_select(
-            mesh, M_pad, n_keep, mesh_axis=select_axis,
+            mesh, M_pad, n_keep, mesh_axis=select_axis, tol_rel=tol_rel,
         )
         # Pad mask: real candidates active, pads inactive.  None when n_pad==0
         # so the P=1 / already-divisible paths take the byte-identical old
@@ -337,8 +665,8 @@ def prune_candidates_by_pivoted_cholesky(
                 _act, NamedSharding(mesh, PartitionSpec(select_axis)),
             )
         if orbit_id is None:
-            piv, L, rank, d_final, d_taken, trR_over_trG = select_step(
-                G, None, active_init)
+            (piv, L, rank, d_final, d_taken, trR_over_trG,
+             psd_info) = select_step(G, None, active_init)
         else:
             # Process-local placement, NOT plain ``jax.device_put``: the
             # latter fires JAX's hidden ``assert_equal`` all-gather
@@ -356,8 +684,8 @@ def prune_candidates_by_pivoted_cholesky(
             orbit_id_jax = device_put_process_local(
                 _oid, NamedSharding(mesh, PartitionSpec(select_axis)),
             )
-            piv, L, rank, d_final, d_taken, trR_over_trG = select_step(
-                G, orbit_id_jax, active_init)
+            (piv, L, rank, d_final, d_taken, trR_over_trG,
+             psd_info) = select_step(G, orbit_id_jax, active_init)
         piv.block_until_ready()
     del L
 
@@ -372,17 +700,14 @@ def prune_candidates_by_pivoted_cholesky(
               f"last={float(trR_over_trG[n_keep]):.3e}")
 
     piv_np = np.asarray(piv)
-    if n_pad:
-        # HARD GUARD, not a comment: if the active mask ever failed, a pad
-        # index would silently index past the candidate list (or wrap) and the
-        # centroid set would be quietly wrong — the rc=0-with-garbage class.
-        bad = piv_np[(piv_np >= M) | (piv_np < 0)]
-        if bad.size:
-            raise RuntimeError(
-                f"pivoted-Cholesky picked {bad.size} PAD row(s) {bad[:8]} "
-                f"(valid candidate range is [0,{M}); M_pad={M_pad}). The "
-                f"active-mask that makes pad rows unpickable did not hold — "
-                f"refusing to emit a centroid set built from padding.")
+    diag_host = np.real(np.asarray(jnp.diag(G)))
+    psd_host = (float(np.asarray(psd_info[0])), int(np.asarray(psd_info[1])),
+                int(np.asarray(psd_info[2])))
+    rank_i = int(rank)
+    refuse_unless_select_certified(
+        piv_np, rank_i, psd_host, n_keep=n_keep, M=M, M_pad=M_pad,
+        orbit_id=orbit_id, d0max=float(diag_host.max()), tol_rel=tol_rel)
+
     if orbit_id is None:
         keep_idx = np.asarray(cand_idx)[piv_np]
     else:
@@ -397,7 +722,8 @@ def prune_candidates_by_pivoted_cholesky(
     d_final_np = np.asarray(_mh.process_allgather(d_final, tiled=True))[:M]
     if n_pad:
         G = G[:M, :M]        # hand back the LOGICAL Gram, not the padded one
-    return keep_idx, int(rank), G, d_final_np, np.asarray(d_taken), np.asarray(trR_over_trG)
+    return (keep_idx, rank_i, G, d_final_np, np.asarray(d_taken),
+            np.asarray(trR_over_trG), psd_host)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -431,12 +757,20 @@ def make_sharded_pivoted_cholesky_select(
     k_keep: int,
     *,
     mesh_axis: str | tuple[str, ...] = 'x',
+    tol_rel: float | None = None,
 ):
-    """Sharded pivoted-Cholesky select on a row-sharded Gram. Always runs
-    k_keep iterations (no tolerance early-stop). Returns the same tuple as
-    ``pivoted_cholesky_select``: ``(piv, L, rank, d_final, d_taken,
-    trR_over_trG)`` with shardings (replicated, row-sharded, replicated,
-    row-sharded-1d, replicated, replicated)."""
+    """Sharded pivoted-Cholesky select on a row-sharded Gram.  STOPS at the
+    numerical-rank floor, exactly as ``pivoted_cholesky_select`` does, and
+    returns the same 7-tuple: ``(piv, L, rank, d_final, d_taken,
+    trR_over_trG, psd_info)`` with shardings (replicated, row-sharded,
+    replicated, row-sharded-1d, replicated, replicated, replicated).
+
+    The stopping predicate is ``global_pv > floor``, and BOTH sides of it
+    are ``pmax`` results — so every shard computes the same bool and the
+    two kernels agree on where to stop at any shard count.  That is the
+    property ``tests/test_centroid_distribution.py`` gates at >1 shard on an
+    emulated mesh; before 2026-08-07 that gate ran both sides at 1×1 and
+    every collective in here was satisfied vacuously."""
     dist.require_axes(mesh, mesh_axis, "make_sharded_pivoted_cholesky_select")
     n_dev = dist.n_shards(mesh, mesh_axis)
     if M % n_dev != 0:
@@ -455,7 +789,8 @@ def make_sharded_pivoted_cholesky_select(
     # M up to a multiple of the mesh size instead of being refused.
     in_specs_no_orbit = (row_shard,)
     in_specs_orbit    = (row_shard, row_shard_1d)
-    out_specs = (rep, row_shard, rep, row_shard_1d, rep, rep)
+    out_specs = (rep, row_shard, rep, row_shard_1d, rep, rep,
+                 (rep, rep, rep))
 
     @jax.jit
     def step(G, orbit_id=None, active_init=None):
@@ -468,11 +803,26 @@ def make_sharded_pivoted_cholesky_select(
             # Local diagonal of G: each device owns rows [my_idx*M_slab,
             # (my_idx+1)*M_slab); the diag entry sits at col == row.
             col_ids_local = my_idx * M_slab + jnp.arange(M_slab)
-            local_diag = jnp.maximum(
-                jnp.real(G_slab[jnp.arange(M_slab), col_ids_local]), 0.0,
-            )
+            local_diag_raw = jnp.real(
+                G_slab[jnp.arange(M_slab), col_ids_local])
+            local_diag = jnp.maximum(local_diag_raw, 0.0)
             trG = lax.psum(jnp.sum(local_diag), axis_name=mesh_axis)
             col_ids_k = jnp.arange(k_keep)
+            # The floor moves ABOVE the loop, same as the reference kernel:
+            # it is the stopping rule, and ``pmax`` makes it identical on
+            # every shard so the two kernels stop at the same iteration.
+            d0max_global = lax.pmax(jnp.max(local_diag_raw),
+                                    axis_name=mesh_axis)
+            tol = (jnp.sqrt(eps) if tol_rel is None
+                   else jnp.asarray(tol_rel, real_dtype))
+            floor = tol * d0max_global
+
+            # A negative entry on the INITIAL diagonal is already a PSD
+            # statement; step -1 names it.  Row indices are kept GLOBAL so
+            # the refusal names a candidate, not a slab offset.
+            at0_loc = jnp.argmin(local_diag_raw).astype(jnp.int32)
+            at0_glob = (my_idx * M_slab + at0_loc).astype(jnp.int32)
+            neg0 = local_diag_raw[at0_loc] < 0.0
 
             # Pad rows enter with d = 0 (their G row/col is exactly zero), so
             # they contribute nothing to trG, to d0max, or to the Schur update.
@@ -490,10 +840,16 @@ def make_sharded_pivoted_cholesky_select(
                 active0,                                                 # active
                 jnp.zeros((k_keep,), dtype=real_dtype),                  # d_taken
                 jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(1.0),
+                # d_min_raw / at_row / at_step — the pstrf INFO triple.
+                jnp.minimum(local_diag_raw[at0_loc],
+                            jnp.zeros((), dtype=real_dtype)),
+                jnp.where(neg0, at0_glob, jnp.int32(-1)),
+                jnp.int32(-1),
             )
 
             def body(j, carry):
-                d, L, piv, active, d_taken, trR_over_trG = carry
+                (d, L, piv, active, d_taken, trR_over_trG,
+                 d_min_raw, d_min_at, d_min_j) = carry
 
                 # Pick global pivot: per-device argmax then pmax + tie-break
                 # to lowest global index.
@@ -506,7 +862,11 @@ def make_sharded_pivoted_cholesky_select(
                     local_pv >= global_pv, local_global_p, jnp.int32(2**30),
                 )
                 global_p = -lax.pmax(-winner_p, mesh_axis)
-                pivot_val = jnp.maximum(global_pv, eps)
+                # THE STOP.  Both operands are pmax results, so this bool is
+                # identical on every shard — no shard can run an iteration
+                # another one skipped, and no collective goes unmatched.
+                take = global_pv > floor
+                pivot_val = jnp.maximum(global_pv, floor)
 
                 # Column p of G (no collective: G is row-sharded).
                 gcol_slab = G_slab[:, global_p]
@@ -528,13 +888,25 @@ def make_sharded_pivoted_cholesky_select(
                 # Pivot-row entry exactly sqrt(d[p]), only on the owner.
                 fix_row_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
                 newcol = jnp.where(fix_row_mask, denom.astype(G_slab.dtype), newcol)
+                newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
 
                 L = L.at[:, j].set(newcol)
-                piv = piv.at[j].set(global_p)
-                d_taken = d_taken.at[j].set(pivot_val)
+                piv = piv.at[j].set(jnp.where(take, global_p, jnp.int32(-1)))
+                d_taken = d_taken.at[j].set(jnp.where(take, pivot_val, 0.0))
 
-                # Schur update; mark p (or its whole orbit) inactive.
-                d_new = jnp.maximum(d - jnp.abs(newcol) ** 2, 0.0)
+                # Schur update; the PSD detector reads the residual BEFORE
+                # the clamp, over this shard's ACTIVE rows only.
+                d_raw = d - jnp.abs(newcol) ** 2
+                masked_raw = jnp.where(active, d_raw, jnp.inf)
+                step_at = jnp.argmin(masked_raw).astype(jnp.int32)
+                step_min = masked_raw[step_at]
+                beats = take & (step_min < d_min_raw)
+                d_min_at = jnp.where(
+                    beats, (my_idx * M_slab + step_at).astype(jnp.int32),
+                    d_min_at)
+                d_min_j = jnp.where(beats, j.astype(jnp.int32), d_min_j)
+                d_min_raw = jnp.where(beats, step_min, d_min_raw)
+                d_new = jnp.maximum(jnp.where(take, d_raw, d), 0.0)
                 trR_over_trG = trR_over_trG.at[j + 1].set(
                     lax.psum(jnp.sum(d_new), axis_name=mesh_axis) / trG,
                 )
@@ -549,20 +921,33 @@ def make_sharded_pivoted_cholesky_select(
                     )
                     orbit_id_p = lax.psum(local_op_val, mesh_axis)
                     kill_mask = orbit_id_slab == orbit_id_p
+                kill_mask = kill_mask & take
                 active = active & ~kill_mask
-                d = jnp.where(kill_mask, minus_inf, d_new)
+                d = jnp.where(kill_mask, minus_inf,
+                              jnp.where(take, d_new, d))
 
-                return d, L, piv, active, d_taken, trR_over_trG
+                return (d, L, piv, active, d_taken, trR_over_trG,
+                        d_min_raw, d_min_at, d_min_j)
 
-            d_final, L_out, piv_out, _, d_taken, trR_over_trG = lax.fori_loop(
-                0, k_keep, body, init,
-            )
+            (d_final, L_out, piv_out, _, d_taken, trR_over_trG,
+             d_min_raw, d_min_at, d_min_j) = lax.fori_loop(
+                0, k_keep, body, init)
             d_final = jnp.where(jnp.isfinite(d_final), d_final, 0.0)
-            d0max_global = lax.pmax(jnp.max(local_diag), axis_name=mesh_axis)
-            floor = jnp.sqrt(eps) * d0max_global
             rank = jnp.sum(d_taken > floor).astype(jnp.int32)
-            d_taken = jnp.where(jnp.arange(k_keep) < rank, d_taken, 0.0)
-            return piv_out, L_out, rank, d_final, d_taken, trR_over_trG
+            # THREE reductions, ONCE, after the loop — not per iteration:
+            # the global minimum, then the row and step that attained it,
+            # tie-broken to the lowest global row exactly as the pivot rule
+            # is.  Putting these on the hot path would be a third collective
+            # per iteration for a number only the refusal reads.
+            g_min = -lax.pmax(-d_min_raw, axis_name=mesh_axis)
+            mine = d_min_raw == g_min
+            far = jnp.int32(2 ** 30)
+            g_at = -lax.pmax(-jnp.where(mine, d_min_at, far),
+                             axis_name=mesh_axis)
+            g_j = -lax.pmax(-jnp.where(mine, d_min_j, far),
+                            axis_name=mesh_axis)
+            return (piv_out, L_out, rank, d_final, d_taken, trR_over_trG,
+                    (g_min, g_at, g_j))
 
         specs = [row_shard]
         args = [G]
