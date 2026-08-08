@@ -18,6 +18,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import make_sharded_ifftn_3d
 
 from solvers.lanczos import (
+    FULL_REORTH,
     reorth_kind,
     alpha_herm_sink,
     block_lanczos_eig,
@@ -29,6 +30,36 @@ from solvers.lanczos import (
     lanczos_eig_jit,
 )
 from .bse_serial import apply_bse_hamiltonian_single_device
+
+#: Third element of ``solve_bse_sharded``'s return tuple when the route ran a
+#: FIXED number of iterations and therefore never measured a convergence point.
+#:
+#: Three of the four routes here (``lanczos_eig_jit``, ``block_lanczos_eig_jit``
+#: and ``davidson``) run their full iteration budget unconditionally.  They used
+#: to return ``jnp.int32(max_iter)``, which is the BUDGET wearing a
+#: MEASUREMENT's name: a caller reading ``n_iter_done`` cannot tell "converged
+#: after 200" from "was told to do 200".  Only
+#: ``block_lanczos_eig_jit_converged`` (``rtol > 0``) returns a real count.
+#:
+#: The honest form is a sentinel that cannot be mistaken for a count.  Callers
+#: that want the budget ask for the budget, through ``iters_reported`` below --
+#: which is the only place the two meanings are allowed to meet.
+N_ITER_NOT_MEASURED = -1
+
+
+def iters_reported(n_iter_done, budget: int) -> int:
+    """Map ``n_iter_done`` onto something safe to print or compare.
+
+    Returns the measured count when the route measured one, and the iteration
+    ``budget`` when it did not.  Centralised so "how many iterations did it
+    run" has ONE answer and the sentinel can never leak into arithmetic as
+    ``-1`` (which is what a bare ``int(n_iter_done)`` would hand a caller
+    computing e.g. ``n_done * block_size``).
+    """
+    n = int(n_iter_done)
+    return int(budget) if n < 0 else n
+
+
 from .bse_ring_comm import make_bse_shardings
 import common.timing as timing
 
@@ -74,7 +105,7 @@ def solve_bse(
     use_block: bool = False,
     block_size: int = 4,
     use_jit_lanczos: bool = True,
-    n_reorth: int = 10,
+    n_reorth: int = FULL_REORTH,
     include_W: bool = True,
 ) -> Tuple[jax.Array, jax.Array]:
     """Solve BSE for lowest exciton eigenvalues."""
@@ -137,7 +168,7 @@ def solve_bse_sharded(
     *,
     n_eig: int = 20,
     max_iter: int = 200,
-    n_reorth: int = 10,
+    n_reorth: int = FULL_REORTH,
     include_W: bool = True,
     block_size: int = 1,
     rtol: float = 0.0,
@@ -298,7 +329,8 @@ def solve_bse_sharded(
         )
         # Match Lanczos return shape: (n_eig, bs=1, nc_pad, nv_pad, nk).
         eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
-        return eigenvalues, eigenvectors, jnp.int32(max_iter)
+        # Davidson runs its budget; it does not measure a convergence point.
+        return eigenvalues, eigenvectors, jnp.int32(N_ITER_NOT_MEASURED)
 
     rep_eig = NamedSharding(mesh_xy, P())  # eigenvalues / eigenvectors come back replicated.
     # ``krep``: the Krylov basis sharding, or None to leave it to GSPMD (the
@@ -370,7 +402,7 @@ def solve_bse_sharded(
                 matvec, n_flat, n_eig=n_eig, max_iter=max_iter,
                 n_reorth=n_reorth, reorth=_reorth,
             )
-            return evs, evecs, jnp.int32(max_iter)
+            return evs, evecs, jnp.int32(N_ITER_NOT_MEASURED)
         else:
             # Block matvec — accept (block_size, n_flat) and reshape to
             # (block_size, c, v, k). Each call processes ``block_size``
@@ -412,7 +444,7 @@ def solve_bse_sharded(
                     block_size=bs, max_iter=max_iter, n_reorth=n_reorth,
                     reorth=_reorth,
                 )
-                return evs, evecs, jnp.int32(max_iter)
+                return evs, evecs, jnp.int32(N_ITER_NOT_MEASURED)
 
     # ONE program: trace + XLA compile + the entire Krylov loop's execution.
     # Split compile from execution by lowering/compiling first, so the two
