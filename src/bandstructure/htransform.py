@@ -1616,7 +1616,32 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path):
 
 def main(argv=None):
     import time as _time
+    # ── The honesty row, and why these three lines exist ──────────────────
+    # ``timing.report(wall=…)`` closes the table with
+    #     (untimed) = wall - Σ(top-level rows)
+    # and PROFILING_TOOLS calls that the honesty row.  On this driver it read
+    # -2.414 s (-60.5 %) warm and -1.283 s (-11.3 %) cache-cold at P=4
+    # (PROFILE_htransform_exciton §1.6) — a NEGATIVE honesty row, which cannot
+    # be read at all.
+    #
+    # The cause is an attribution boundary, not a mis-measurement.
+    # ``initialize_communicator_stack()`` runs in this module's BODY, above
+    # every import, and ``prepare_mesh`` records a ``collective_warmup``
+    # section (~2.4 s at P=4) into the global collector while doing it.  That
+    # is before ``_t_main``, so the row was inside Σ(rows) but outside the wall
+    # it is subtracted from, and the difference came out negative — the table
+    # was reporting more seconds than the clock it divides by.
+    #
+    # The fix is the idiom ``gw_jax`` already uses at its own ``_t_main``
+    # (gw_jax.py:180-200) and ``exciton_bands`` uses via ``process_elapsed_s``:
+    # RESET the collector here so the pre-main section is not double-counted,
+    # read the true process start from /proc, and DECOMPOSE that pre-main span
+    # into rows at report time rather than adding rows to it.  The table then
+    # closes against the process wall, ``(untimed)`` is non-negative by
+    # construction, and the 2.4 s that used to be unreadable appears by name.
     _t_main = _time.perf_counter()
+    timing.reset()
+    _pre_main = timing.process_elapsed_s()
     parser = argparse.ArgumentParser(allow_abbrev=False, description="Hamiltonian interpolation driver")
     parser.add_argument("-i", "--input", default="cohsex_test.in", help="Input file")
     parser.add_argument("-wfn", "--wfn-file", default=None, help="Override WFN file (e.g. WFN_qp.h5)")
@@ -1760,8 +1785,29 @@ def main(argv=None):
     if result['path_range'] is not None:
         summary += f", path range [{result['path_range'][0]:.6f}, {result['path_range'][1]:.6f}] Ry"
     print(summary)
-    timing.report(title="--- Timing (seconds) ---",
-                  wall=_time.perf_counter() - _t_main)
+    # Close the table against the PROCESS wall, not against ``main()``'s.
+    # ``_pre_main`` is everything above this function: the module body's
+    # ``initialize_communicator_stack()`` (env, jax.distributed, backend init,
+    # mesh + clique warm-up) and the import storm under it.  It is decomposed
+    # into rows from the numbers the startup call measured for itself, with
+    # the remainder attributed to imports — the same shape as
+    # ``gw_jax.py``'s epilogue, and for the same reason: recording the phases
+    # AND the whole span would double-count and break the
+    # "rows + (untimed) == wall" property that makes the table readable.
+    _wall = _time.perf_counter() - _t_main
+    if _pre_main is not None:
+        _phases = {}
+        try:
+            _phases = dict(RUNTIME.facts.get("elapsed", {}) or {})
+        except Exception:      # noqa: BLE001 — observability never kills a run
+            _phases = {}
+        for _phase, _secs in sorted(_phases.items()):
+            if _phase != "total":
+                timing.record(f"htransform.runtime_stack.{_phase}", float(_secs))
+        timing.record("htransform.imports",
+                      max(_pre_main - float(_phases.get("total", 0.0)), 0.0))
+        _wall = _pre_main + _wall
+    timing.report(title="--- Timing (seconds) ---", wall=_wall)
     return 0
 
 
