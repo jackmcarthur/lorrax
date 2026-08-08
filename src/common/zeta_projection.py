@@ -206,7 +206,7 @@ def assert_zeta_bases_compatible(loader_S, loader_L, *, print_fn=print) -> dict:
     index.  On the G-flat format that index is a **per-q WFN.h5-style
     sphere** whose positions vary with q
     (``isdf_header/gvec_components``, shape ``(n_q, 3, ngkmax)``;
-    ``file_io.zeta_loader`` says so explicitly and refuses to narrow it
+    ``zeta_loader`` says so explicitly and refuses to narrow it
     with a single shared ``sphere_idx``).  Two files can therefore agree
     on ``ngkmax``, ``ngk``, ``FFTgrid`` and ``n_q`` and STILL be summing
     different G's at the same array position — in which case the overlap

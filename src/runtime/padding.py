@@ -239,7 +239,7 @@ def spec_divisor(mesh, spec, axis: int) -> int:
     Single-sourced because two subsystems derive it and must agree, or
     ψ produced by one is refused by the other:
 
-    * ``file_io.wfn_loader._default_sharding`` — allocates ψ at
+    * ``wfn_loader.WfnLoader._default_sharding`` — allocates ψ at
       ``(n_k, round_up(nb, p_band), nspinor, ngkmax)`` so the array is
       born divisible.
     * ``common.mtxel_sweep.SweepGeometry`` — consumes that ψ.

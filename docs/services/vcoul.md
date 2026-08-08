@@ -32,10 +32,17 @@ architecture are these.
 `CoulombGeometry` is a frozen dataclass of the four things every kernel
 needs: the Cartesian reciprocal rows with `blat` already folded in, the
 cell volume, and (for the 0-D box only) `bdot` and `fft_grid`.
-`CoulombGeometry.from_wfn(wfn)` is the only place in the tree where
-`wfn.blat * wfn.bvec` is written; before the extraction that product was
-hand-multiplied at five call sites, which is the kind of repetition that
-eventually ships a transpose.
+`CoulombGeometry.from_wfn(wfn)` is the only place *in this service* where
+`wfn.blat * wfn.bvec` is written, and it is also the only place left in
+`src/gw/coulomb/`, where the product used to be hand-multiplied at five
+call sites — the kind of repetition that eventually ships a transpose.
+Read that as the scoped claim it is: the product still appears elsewhere
+in LORRAX, at
+`src/gw/gw_init.py:1106` and `src/gw/isdf_fitting.py:693-694` on the live
+GW path (both of which should move to `CoulombGeometry.from_wfn(wfn).bvec`
+and are registered for it), and in archived material under `misc/`. Nothing
+gates the exclusivity, so it is a design intent to uphold rather than a fact
+you can rely on when reading unfamiliar code.
 
 `get_kernel(sys_dim)` returns the `Bulk3D`, `Slab2D` or `Box0D` kernel;
 `v_qG_table(kernel, q_frac, gvec_components, *, geometry, ...)` is the one

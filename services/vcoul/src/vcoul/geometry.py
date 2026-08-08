@@ -13,7 +13,10 @@ by the lattice constant with no shape error to say so.
 
 :class:`CoulombGeometry` takes the PRODUCT, never the pair.
 :meth:`CoulombGeometry.from_wfn` is the one place ``blat * bvec`` is
-written, and it is duck-typed — anything with ``blat``, ``bvec`` and
+written IN THIS SERVICE and in ``gw/coulomb/`` — a package-scoped claim,
+not a tree-wide one: ``gw/gw_init.py`` and ``gw/isdf_fitting.py`` still
+take the product by hand on the live GW path, and nothing gates that.
+``from_wfn`` is duck-typed — anything with ``blat``, ``bvec`` and
 ``cell_volume`` attributes works, so the service never imports a lorrax
 loader class to accept a lorrax loader object.
 
@@ -92,7 +95,11 @@ class CoulombGeometry:
         need to.  ``bdot`` and ``fft_grid`` are taken when present (the
         0-D box kernel needs them; nothing else does).
 
-        This is the ONE place ``blat * bvec`` is written.
+        This is the ONE place ``blat * bvec`` is written in this service
+        (and in ``gw/coulomb/``).  It is NOT the only place in LORRAX —
+        ``gw/gw_init.py`` and ``gw/isdf_fitting.py`` still hand-multiply,
+        and no test pins the difference — so treat the exclusivity as the
+        intent to route new call sites here, not as a checked invariant.
         """
         bdot = getattr(wfn, "bdot", None)
         fft_grid = getattr(wfn, "fft_grid", None)

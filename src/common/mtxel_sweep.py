@@ -303,7 +303,7 @@ __all__ = [
 def band_sphere_spec() -> P:
     """THE ψ layout: ``(n_k, nb, nspinor, ngkmax)``, bands over the mesh.
 
-    One definition, three consumers — ``file_io.wfn_loader`` defaults to
+    One definition, three consumers — ``wfn_loader`` defaults to
     it, this sweep contracts in it, and ``gw.qsgw_density`` builds ρ from
     it.  A second literal of the same PartitionSpec would not raise if it
     drifted; it would silently insert a reshard between them, which is the
@@ -338,7 +338,7 @@ class SweepGeometry:
 
         # ``nb`` is the LOGICAL band count.  The divisor is derived FROM THE
         # SPEC by the shared ``spec_divisor``, not assumed to be ∏ p_a — the
-        # same call ``file_io.wfn_loader._default_sharding`` makes for its own
+        # same call ``wfn_loader.WfnLoader._default_sharding`` makes for its own
         # ``p_band``.  Both default to ``P(None, ('x','y'), None, None)``, so
         # both get px·py and ψ FROM THE LOADER IS ALREADY BAND-PADDED FOR
         # THIS SWEEP: the pad below is a no-op on the production path and

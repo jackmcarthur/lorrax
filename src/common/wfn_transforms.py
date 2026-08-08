@@ -1,6 +1,6 @@
 """Transforms from G-flat ψ to FFT-box / r-space / centroid / r-chunk.
 
-Composes with :class:`file_io.wfn_loader.WfnLoader`.  The loader returns
+Composes with :class:`wfn_loader.WfnLoader`.  The loader returns
 ``psi`` in G-flat layout ``(n_k, nb_padded, nspinor, ngkmax)`` c128 and a
 ``g_index`` from :meth:`WfnLoader.box_index`; this module turns either
 pair into the downstream product the consumer actually needs (FFT box,
@@ -1522,7 +1522,7 @@ def apply_bloch_phase_on_slice(
 # ===========================================================================
 # ψ(G)-loading helpers (relocated from the former common/load_wfns.py).
 #
-# Each takes a :class:`file_io.wfn_loader.WfnLoader` as ``wfn`` and composes
+# Each takes a :class:`wfn_loader.WfnLoader` as ``wfn`` and composes
 # ``wfn.load(...)`` with the transforms above.  The legacy ``sym`` argument
 # is unused (WfnLoader builds its own SymMaps) but kept for caller-API
 # back-compat.  Bodies are byte-for-byte the load_wfns originals; only the
@@ -1593,7 +1593,7 @@ def load_kpoint_fftbox_local(wfn, meta, k_idx, nb, *, b_lo: int = 0,
 
     Returns ``(nb - b_lo, nspinor, nx, ny, nz)`` c128 on
     ``jax.local_devices()[0]`` — see
-    :meth:`file_io.wfn_loader.WfnLoader.load_process_local` for the
+    :meth:`wfn_loader.WfnLoader.load_process_local` for the
     single-device contract and why the k-parallel kernels need it.
 
     ``b_lo`` selects a band sub-window ``[b_lo, nb)``; the default
@@ -1722,7 +1722,7 @@ def read_Gvecs_to_devices(
     has shape ``(nk, nb_padded, nspinor, nx, ny, nz)`` sharded
     ``P(None, ('x','y'), None, None, None, None)``.
 
-    The body is thin: :class:`file_io.wfn_loader.WfnLoader`
+    The body is thin: :class:`wfn_loader.WfnLoader`
     + :func:`to_box`.  Symmetry unfold, τ-phase, TR conjugation, spinor
     rotation, band-axis padding/sharding, and the bispinor lift all happen
     inside ``WfnLoader.load``.  ``sym`` is unused (the loader builds its own
@@ -1898,7 +1898,7 @@ def iter_psi_rchunk_bandwise(
     internal band round-up, so consumers must keep masking ``[bc, w)``.
     Full-BZ path only (``k_chunk_size`` must stay 0).
 
-    Uses :class:`file_io.wfn_loader.WfnLoader` + ``to_rchunk``.  ``sym``
+    Uses :class:`wfn_loader.WfnLoader` + ``to_rchunk``.  ``sym``
     is unused (loader builds its own SymMaps).
     """
     del sym
