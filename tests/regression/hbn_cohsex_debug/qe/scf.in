@@ -1,0 +1,40 @@
+&control
+   prefix = 'hbn'
+   pseudo_dir = './'
+   calculation = 'scf'
+/
+&system
+   ecutwfc = 50.0
+   ibrav = 0
+   nat = 4
+   ntyp = 2
+   nbnd = 12
+/
+&electrons
+   electron_maxstep = 100
+   conv_thr = 1e-10
+   mixing_mode = 'plain'
+   mixing_beta = 0.7
+   mixing_ndim = 8
+   diagonalization = 'david'
+   diago_david_ndim = 4
+   diago_full_acc = .true.
+/
+
+ATOMIC_SPECIES
+   B 10.811 'B_ONCV_PBE-1.2.upf'
+   N 14.007 'N_ONCV_PBE-1.2.upf'
+
+CELL_PARAMETERS angstrom
+   2.504000  0.000000  0.000000
+  -1.252000  2.168528  0.000000
+   0.000000  0.000000  6.661000
+
+ATOMIC_POSITIONS crystal
+   B  0.333333333333  0.666666666667  0.250000000000
+   N  0.666666666667  0.333333333333  0.250000000000
+   B  0.666666666667  0.333333333333  0.750000000000
+   N  0.333333333333  0.666666666667  0.750000000000
+
+K_POINTS automatic
+   6 6 4 0 0 0

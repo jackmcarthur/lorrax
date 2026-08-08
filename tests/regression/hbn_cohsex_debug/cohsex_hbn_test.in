@@ -1,0 +1,66 @@
+# =====================================================================
+# hbn_cohsex_3d — bulk hexagonal BN 3x3x2, sys_dim=3, COHSEX.
+# DRAFT deck (fixture groundwork, 2026-08-07) — no reference frozen yet.
+#
+# WHY THIS FIXTURE EXISTS.  Every 3D gate deck is Si FCC, whose bvec
+# satisfies bvec.T = P·bvec (P cyclic) — structurally BLIND to the
+# mini-BZ draw-convention bug class fixed in 358bb0b (a3ae01d9 rebased).
+# hBN's hexagonal bvec admits no such P, so on this cell the body-head
+# table is bias-SENSITIVE: the pre-fix draw would sit hundreds of
+# standard errors off (synthetic-cell measurement: ~6.5 % mean / 16 %
+# max of the head, z=376).  This deck turns the synthetic z-test guard
+# (tests/test_vcoul_minibz_head_draw.py) into end-to-end coverage.
+#
+# TWO DELIBERATE DIFFERENCES from cohsex_si_test.in:
+#   mc_average_vcoul_body = true   -- the whole point: the head table
+#       (vcoul.build_v_head_miniBZ_avg_3d) must be LIVE.  The Si deck
+#       pins false to match its BGW noavg anchor; here the fixture's
+#       subject IS the average.
+#   vhead / whead_0freq UNSET      -- no BGW head scalars exist for this
+#       system yet, so the native q->0 ladder (wcoul0_source s_tensor ->
+#       gw.vcoul.compute_q0_averages -> vcoul kernels) runs END TO END.
+#       No pinned deck in the tree reaches that path today (survey
+#       w1_vcoul.md §6.4.4); this deck closes that gap too.  When a BGW
+#       anchor phase happens, a vhead-pinned VARIANT deck can be added
+#       beside this one — do not convert this one.
+# =====================================================================
+[cohsex]
+
+restart = false
+centroids_file = centroids_frac_320.txt
+
+# 16 valence electrons -> 8 occupied bands; 40 bands in the WFN.
+nval = 8
+ncond = 32
+nband = 40
+sys_dim = 3
+bare_coulomb_cutoff = 25.0
+
+do_screened = true
+bispinor = false
+qp_solver = one_shot_dft
+
+use_ppm_sigma = false
+screening_method = minimax
+
+memory_per_device_gb = 28
+
+sigma_freq_debug_output = true
+fermi_reference = midgap
+
+wfn_file = WFN.h5
+output_file = eqp_hbn_test.dat
+sigma_diag_file = eqp_hbn_test.dat
+sigma_omega_h5_file = sigma_mnk.h5
+
+# THE KNOB UNDER TEST — see the header.  The perturbation arm of the
+# reference-generation plan runs this deck twice (true/false) and the
+# two sigmas MUST differ well beyond run-to-run noise; on Si that
+# difference is the 141.65 meV MAE knob, and on this cell the average
+# itself is what the 358bb0b fix corrected.
+mc_average_vcoul_body = true
+
+# Pinned exactly as the Si fixture pins it (2026-08-06 ruling: fixtures
+# pin every drift-prone knob; the deck-level default question is the
+# owner's, not a fixture's).
+zeta_rcond = 1e-10

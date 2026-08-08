@@ -1,5 +1,18 @@
 """COMPAT SHIM — parser for BerkeleyGW's ``vcoul`` file.
 
+DELETION GATE: the next phase-wide cleanup commit.  This module is a pure
+re-export with no translation and no local code — unlike the surviving
+``gw.coulomb``/``gw.vcoul`` family, which is the deliberate (wfn, Meta)
+translation layer, this one earns nothing by existing.  Its executioner
+must also migrate the two consumers: ``file_io/__init__.py`` (re-exports
+the three names; repoint to ``from vcoul import ...``) and
+``gw/compute_vcoul.py``'s ``from file_io import read_bgw_vcoul,
+fill_v_grid_for_q`` inside ``build_bgw_v_grid_fn`` (repoint to the door —
+the facade import was audit disagreement 4, declined-and-registered at
+23f83780; deleting this file resolves it).  Marker added 2026-08-07 as
+the landing agent's registered one-line follow-up (029da824's
+"REGISTERED, NOT DELETED" paragraph).
+
 The parser moved to :mod:`vcoul.bgw_parity` (2026-08-07) — it was already
 numpy-only, and "read BGW's MC-averaged v(q+G) and lay it on our FFT grid"
 is Coulomb arithmetic, not a lorrax file format.  ``file_io/__init__.py``
