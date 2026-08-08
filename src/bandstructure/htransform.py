@@ -1477,7 +1477,7 @@ def initialize_kpath(wfn, params):
 
 
 def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
-                a_band_index: int | None = None):
+                a_band_index: int | None = None, diagnostics: bool = True):
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
@@ -1520,18 +1520,40 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
                 eigs0[states - 5:states])
 
     _t0 = _perf()                                          # instrument:
-    re_min, re_max, im_max = _diag_stats_fast(fH_k)
-    log_fn("fH_k real range: [{:.3e}, {:.3e}], |imag|max={:.3e}".format(
-        float(re_min), float(re_max), float(im_max)))
-    fH_k0_rep = jax.device_put(fH_k[0], rep)  # (rank, rank) replicated, ~7 MB
-    _eig_err, _f_head, _e_head, _f_tail, _e_tail = jax.device_get(
-        _diag_eig_at_gamma(fH_k0_rep, f_eps, int(states)))
-    fH_eig_err = float(_eig_err)
-    log_fn(f"fH(k=0) eigenvalue error vs f(eps): {fH_eig_err:.6f} Ry = {fH_eig_err * 13.6057:.3f} eV")
-    log_fn(f"  f(eps) first 5: {np.asarray(_f_head)}")
-    log_fn(f"  fH eig first 5: {np.asarray(_e_head)}")
-    log_fn(f"  f(eps) last 5:  {np.asarray(_f_tail)}")
-    log_fn(f"  fH eig last 5:  {np.asarray(_e_tail)}")
+    # ── THE DIAGNOSTICS GATE ──────────────────────────────────────────────
+    # This block plus ``_gamma_rt`` below is 1.442 s of the 4.327 s cache-cold
+    # ``h_transform`` stage — 33 %, 7 XLA programs — and 0.120 s warm
+    # (PROFILE_htransform_exciton §1.2).  Every value it computes reaches a
+    # ``log_fn`` line and nothing else; none of them reaches
+    # ``bandstructure.dat``.  And ``log_fn`` is ``print if verbose else a
+    # no-op`` (``_make_logger``), so WITHOUT ``--verbose`` the driver was
+    # spending a third of the stage computing numbers it then discarded.
+    #
+    # ``fH_k`` exists ONLY for this block: the kpath solve consumes ``fH_R``
+    # alone.  At the reference shape it is (64, 768, 768) complex128 = 576 MiB
+    # global, held alive across the whole solve for four log lines.  Dropping
+    # the reference right after the block frees it before the kpath batches
+    # allocate their own (bs, rank, rank) temporaries — the two peaks stop
+    # overlapping.  (The buffer is still PRODUCED, because it is an output of
+    # ``build_fH_R``'s single jit and ``fH_R`` is its ifft; only its residency
+    # is at stake here, which is the 576 MiB the profile prices.)
+    if diagnostics:
+        re_min, re_max, im_max = _diag_stats_fast(fH_k)
+        log_fn("fH_k real range: [{:.3e}, {:.3e}], |imag|max={:.3e}".format(
+            float(re_min), float(re_max), float(im_max)))
+        fH_k0_rep = jax.device_put(fH_k[0], rep)  # (rank, rank) replicated, ~7 MB
+        _eig_err, _f_head, _e_head, _f_tail, _e_tail = jax.device_get(
+            _diag_eig_at_gamma(fH_k0_rep, f_eps, int(states)))
+        fH_eig_err = float(_eig_err)
+        log_fn(f"fH(k=0) eigenvalue error vs f(eps): {fH_eig_err:.6f} Ry = {fH_eig_err * 13.6057:.3f} eV")
+        log_fn(f"  f(eps) first 5: {np.asarray(_f_head)}")
+        log_fn(f"  fH eig first 5: {np.asarray(_e_head)}")
+        log_fn(f"  f(eps) last 5:  {np.asarray(_f_tail)}")
+        log_fn(f"  fH eig last 5:  {np.asarray(_e_tail)}")
+    else:
+        log_fn("  [route] fH diagnostics: OFF (fH_k stats, Γ eigen-check and "
+               "the Γ round-trip are not computed; --fh-diagnostics=on "
+               "restores them)")
     timing.record("ht.diagnostics", _perf() - _t0)         # instrument:
 
     _t0 = _perf()                                          # instrument:
@@ -1663,9 +1685,12 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         return jnp.min(jnp.max(jnp.abs(fH_k - m), axis=(1, 2)))
 
     _t0 = _perf()                                          # instrument:
-    rt_err = float(_gamma_rt(fH_R, fH_k))
+    if diagnostics:
+        rt_err = float(_gamma_rt(fH_R, fH_k))
+        log_fn(f"FFT Γ round-trip max error: {rt_err:.3e}")
     timing.record("ht.gamma_roundtrip", _perf() - _t0)     # instrument:
-    log_fn(f"FFT Γ round-trip max error: {rt_err:.3e}")
+    # Last reader of ``fH_k``; see the diagnostics-gate block above.
+    del fH_k
 
     fermi_energy = float(wfn.efermi)
     nb_keep = int(f_eps.shape[0])
@@ -1926,6 +1951,17 @@ def main(argv=None):
     parser.add_argument("--a-band", type=int, default=None,
                         help="Band index (0-based) whose bandwidth sets 'a'. "
                              "E.g. nval+ncond_keep-1. Default: top band.")
+    parser.add_argument("--fh-diagnostics", default="auto",
+                        choices=("auto", "on", "off"),
+                        help="fH_k range stats, the Γ eigenvalue check against "
+                             "f(eps) and the Γ round-trip.  They are 33%% of "
+                             "the cache-cold h_transform stage (1.442 s, 7 XLA "
+                             "programs) and hold fH_k — 576 MiB at the "
+                             "reference shape — alive across the whole solve, "
+                             "for four log lines that never reach "
+                             "bandstructure.dat.  auto (default) = follow "
+                             "--verbose, i.e. compute them only if anything "
+                             "will print them; on = always; off = never.")
     parser.add_argument("--eigh-backend", default=None,
                         choices=eigh_backend_choices(),
                         help="Eigensolver for the fH_q eigendecomposition of "
@@ -2006,9 +2042,11 @@ def main(argv=None):
             0.0, 20.0, unit="Ry", print_fn=log)
 
     kpath_data = initialize_kpath(wfn, params)
+    _diag_on = (args.verbose if args.fh_diagnostics == "auto"
+                else args.fh_diagnostics == "on")
     with mesh_xy, timing.section("h_transform"):
         result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
-                             a_band_index=args.a_band)
+                             a_band_index=args.a_band, diagnostics=_diag_on)
 
     # Optional BSE interpolation handoff: fine-k wfns at coarse centroids.
     # Driven by ``get_centroids_fi`` + ``kgrid_fi`` + ``wfn_fi_{min,max}``;
