@@ -1,4 +1,26 @@
 [cohsex]
+# ZETA_RCOND IS DELIBERATELY UNSET, and here that is MEASURED-safe rather
+# than hopeful.  Full sweep on this exact configuration (60-centroid charge
+# CCT, kappa ~ 2.5e4 -- the best-conditioned of the fixture set), max|d| vs
+# the 1e-10 arm on sigSX/sigCOH/sigTOT:
+#
+#   rcond      1e-10   1e-9   1e-8(default)   1e-7   1e-6     1e-4
+#   n_keep       540     540       540         540    540      522
+#   dropped        0       0         0           0      0       18
+#   max|d|     (base)  0.000     0.000       0.000  0.000   68.522  meV
+#
+# 1e-10 / 1e-9 / 1e-8 / 1e-7 / 1e-6 and the key omitted are all BYTE-
+# IDENTICAL to each other, not merely within tolerance.  The bite threshold
+# (min_q lam_min/lam_max) is 3.983e-05, a margin of ~3983x over the default
+# -- the default would still cost nothing if it moved two more notches.
+#
+# LEAVING IT UNSET IS THE POINT, and it is why this deck is not pinned the
+# way gnppm/cohsex_ibz/bispinor now are: an unset key means the suite still
+# exercises the SHIPPING default end to end, and here that costs zero gate
+# margin.  An unpinned deck with a measured header is a documented decision;
+# an unpinned deck without one is an undocumented bet.
+# Measured 2026-08-07, ZETA_RCOND_SWEEP.md; ruled by the owner at the
+# service-phase landing.  ZETA_RCOND_DEFAULT itself is unchanged.
 restart = false
 do_screened = true
 bispinor = false

@@ -23,6 +23,27 @@
 # ``eqp_ctsp_compare.dat``; it is not asserted against by anything.
 # Wire this deck to a gate or delete it -- but do not read its name as
 # evidence that two screening methods are being compared.
+#
+# ZETA_RCOND IS DELIBERATELY UNSET, measured-safe.  This deck RESTARTS, so
+# it performs no zeta-fit of its own -- the run logs contain zero
+# [zeta rank_truncate] blocks -- and zeta_rcond can only reach it through
+# the state it inherits.  It was therefore swept as matched PAIRS: the
+# prerequisite cohsex_test.in run first in the same directory at the same
+# rcond.  Measured that way it mirrors its sibling exactly (same 60-centroid
+# zeta basis, same 3.983e-05 bite threshold, ~3983x margin):
+#
+#   rcond      1e-10   1e-9   1e-8(default)   1e-7   1e-6     1e-4
+#   dropped        0       0         0           0      0       18
+#   max|d|     (base)  0.000     0.000       0.000  0.000   68.522  meV
+#
+# AND A SEPARATE FACT THE SWEEP CONFIRMED, which is not about this knob:
+# the ~1226 meV MAE against eqp_minimax_selfcheck.dat is CONSTANT across
+# every arm including 1e-10.  That is not sensitivity, it is a stale file
+# -- exactly as the note above predicts.  Pinning this deck would change no
+# gate outcome, because it is ungated; the decision its header asks for is
+# still the real one.
+# Measured 2026-08-07, ZETA_RCOND_SWEEP.md; ruled by the owner at the
+# service-phase landing.  ZETA_RCOND_DEFAULT itself is unchanged.
 restart = true
 do_screened = true
 bispinor = false

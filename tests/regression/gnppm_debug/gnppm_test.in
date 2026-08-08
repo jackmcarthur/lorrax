@@ -1,5 +1,26 @@
 [cohsex]
 # GN-PPM regression gate seed on a fresh full WFN (MoS2 3x3, nspinor=2)
+#
+# ZETA_RCOND IS PINNED, and the pin is FREE: this deck is byte-identical
+# between 1e-10 and the shipping default (1e-8), so writing the pin
+# preserves sigma_diag_gnppm_ref.dat bit for bit and changes no gate
+# outcome today.  What it buys is margin.  Full sweep, 399-centroid charge
+# CCT, max|d| vs the 1e-10 arm on sigX/sigC/sigXC:
+#
+#   rcond      1e-10   1e-9   1e-8(default)   1e-7    1e-6     1e-4
+#   n_keep      1995    1995      1995         1945    1434      731
+#   dropped        0       0         0           50     561     1264
+#   max|d|     (base)  0.000     0.000       58.315  177.393  1006.704  meV
+#
+# The bite threshold (min_q lam_min/lam_max) is 5.187e-08 -- a margin of
+# only 5.2x over the default, on a gate whose tolerance is 1e-6 eV and
+# whose response to ONE notch of drift is 58 meV, i.e. 58000x that
+# tolerance.  zeta_rcond walked 1e-10 -> 1e-6 -> 1e-8 inside a single day
+# (2026-07-21), so 5.2x is a thin thing to leave a frozen reference
+# standing on.  Same precedent as si_cohsex_debug/README.md.
+# Measured 2026-08-07, ZETA_RCOND_SWEEP.md; pinned by owner ruling at the
+# service-phase landing.  ZETA_RCOND_DEFAULT itself is unchanged.
+zeta_rcond = 1e-10
 compute_mode = gn_ppm
 restart = false
 centroids_file = centroids_frac_399.txt

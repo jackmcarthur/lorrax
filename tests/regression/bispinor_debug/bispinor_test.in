@@ -7,6 +7,28 @@
 # IBZ cascade) — same properties as the original 640/668 fixture.
 # ω-grid is deliberately small (9 points).  See README.md for the
 # 2026-07-09 shrink + mode change (COHSEX → GN-PPM) and its validation.
+#
+# ZETA_RCOND IS PINNED, and this is the deck the pin was decided on.  The
+# pin is free -- byte-identical between 1e-10 and the shipping default
+# (1e-8), so sigma_diag_bispinor_ref.dat is preserved bit for bit -- but
+# the margin here is the thinnest in the fixture set.  Full sweep, on the
+# 256-centroid charge CCT, max|d| vs the 1e-10 arm:
+#
+#   rcond      1e-10   1e-9   1e-8(default)   1e-7    1e-6     1e-4
+#   n_keep      2304    2304      2304         2108    1679      944
+#   dropped        0       0         0          196     625     1360
+#   max|d|     (base)  0.000     0.000       42.803  112.649  759.948  meV
+#
+# The bite threshold is 2.046e-08 against a 1e-8 default: a factor of TWO,
+# not a decade.  kappa ~ 4.9e7, the worst-conditioned of the five swept
+# decks.  "Safe by 2.05x" is a different sentence from "safe", and what
+# erases it is not a change to zeta_rcond at all -- it is any change to
+# this fixture that stretches its spectrum slightly.  Note the transverse
+# channel is NOT governed by this knob (transverse_zeta_solve defaults to
+# `ridge`, not `rank_truncate`); the pin governs the charge channel.
+# Measured 2026-08-07, ZETA_RCOND_SWEEP.md; pinned by owner ruling at the
+# service-phase landing.  ZETA_RCOND_DEFAULT itself is unchanged.
+zeta_rcond = 1e-10
 wfn_file = WFN.h5
 nval = 4
 ncond = 4

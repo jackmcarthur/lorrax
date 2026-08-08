@@ -1,4 +1,20 @@
 [cohsex]
+# ZETA_RCOND IS PINNED, free of charge: byte-identical between 1e-10 and
+# the shipping default (1e-8).  This deck shares WFN.h5 and the 399-centroid
+# set with gnppm_test.in, so it has the same zeta spectrum, the same
+# truncation counts and the same 5.187e-08 bite threshold -- a 5.2x margin
+# over the default.  Its Sigma columns drift the same way: 0.000 meV at
+# 1e-8, 6.963 meV at 1e-7, 160.244 meV at 1e-6 (max|d| vs the 1e-10 arm).
+#
+# THIS DECK HAS NO FROZEN REFERENCE -- its gate is the IBZ-cascade versus
+# full-BZ-direct A/B invariance, which PASSES at 0.0000 meV on every swept
+# arm including 1e-6.  That is worth stating plainly: truncation does not
+# break the symmetry unfold, so the invariance gate would NOT have caught a
+# default drift.  It is exactly the deck whose real observable is blind to
+# this knob, which is why the pin is on the deck rather than on the gate.
+# Measured 2026-08-07, ZETA_RCOND_SWEEP.md; pinned by owner ruling at the
+# service-phase landing.  ZETA_RCOND_DEFAULT itself is unchanged.
+zeta_rcond = 1e-10
 restart = false
 centroids_file = centroids_frac_399.txt
 nval = 26
