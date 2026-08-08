@@ -22,7 +22,7 @@ from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
 # isdf.core imports too — plus an announcement for anything outside it).
 # See gw/gw_config.py's module comment and tests/test_env_grammar.py for
 # the drift gate.
-from .gw_config import active_zeta_truncating_knobs, env_bool
+from .gw_config import ZETA_RCOND_DEFAULT, active_zeta_truncating_knobs, env_bool
 
 from isdf.core import (
     c_q_from_psi_sm,
@@ -165,7 +165,7 @@ def fit_zeta_to_h5(
     zeta_ridge: float = 0.0,
     charge_zeta_solve: str = "cholesky",
     distributed_zeta_solve: str = "auto",
-    zeta_rcond: float = 1e-8,
+    zeta_rcond: float = ZETA_RCOND_DEFAULT,
     transverse_zeta_solve: str = "ridge",
     transverse_zeta_rcond: float = 1e-10,
     gflat_chunk_size: int = 0,
@@ -662,9 +662,12 @@ def fit_zeta_to_h5(
     # a cutoff the writer falls back to the full flat-FFT axis
     # (n_G_sph = n_rtot) — slow disk path, kept for sanity checks.
     if q_irr_frac is None:
-        # Full-BZ q-vectors with BGW wrap, then / kgrid — same convention
-        # the V_q consumer's disk→G path (``zeta_loader._do_disk_to_G``)
-        # expects, via the local ``_bgw_wrap_q``.
+        # Full-BZ q-vectors with BGW wrap, then / kgrid — the convention
+        # the per-q sphere below is built in, via the local
+        # ``_bgw_wrap_q``.  (It used to be stated as "what the V_q
+        # consumer's disk→G path expects"; that path,
+        # ``zeta_loader._do_disk_to_G``, was deleted on 2026-08-07 — this
+        # writer bakes the phase in and the reader does no FFT at all.)
         _kgrid_arr_for_qfrac = np.asarray(meta.kgrid, dtype=np.float64)
         q_irr_frac = (_bgw_wrap_q(sym.kvecs_asints)
                        / _kgrid_arr_for_qfrac[None, :])

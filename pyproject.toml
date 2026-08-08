@@ -124,6 +124,7 @@ markers = [
     "services: a standalone service's own suite, staged into this one",
     "distrib_la: the distrib_la service suite (services/distrib_la/tests)",
     "wfn_loader: the wfn_loader service suite (services/wfn_loader/tests)",
+    "zeta_loader: the zeta_loader service suite (services/zeta_loader/tests)",
 ]
 
 [dependency-groups]

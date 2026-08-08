@@ -145,7 +145,9 @@ def test_planner_fft_term_flows_through_aot_kernel_peak_bytes(monkeypatch):
 def test_probe_compiles_the_helper_production_uses(monkeypatch):
     """The probe must compile ``make_sharded_fftn_3d`` — the same factory
     every production FFT box goes through (``wfn_transforms._local_box_fft``,
-    ``zeta_loader._do_disk_to_G``, the flat-k helpers).
+    the ζ writer's r→G FFT in ``gw.isdf_fitting``, the flat-k helpers;
+    ``zeta_loader._do_disk_to_G`` was the reader-side twin until it was
+    deleted on 2026-08-07).
 
     Modelling a different FFT form sizes cuFFT plans nothing ever builds;
     that is precisely what the per-axis ``custom_partitioning`` probe did.

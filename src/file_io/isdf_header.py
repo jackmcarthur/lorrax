@@ -72,10 +72,12 @@ class IsdfHeader:
                                  # synthetic test headers don't need to set it.
     zeta_layout: str = 'r_space'  # 'r_space' | 'G_flat'.
                                  # 'r_space' (legacy default): on-disk dataset
-                                 # is ``zeta_q`` shape (n_q_disk, n_rtot, n_rmu),
-                                 # consumer applies forward FFT + sphere gather
-                                 # via ``ZetaLoader.load(layout='G_flat',
-                                 # qvec_frac=, sphere_idx=)``.
+                                 # is ``zeta_q`` shape (n_q_disk, n_rtot, n_rmu).
+                                 # NO READER SINCE 2026-08-07 — the consumer's
+                                 # forward FFT + sphere gather was deleted with
+                                 # the zeta_loader extraction (no writer here
+                                 # emits it).  ``ZetaLoader`` still reads the
+                                 # HEADER of such a file; its ζ block refuses.
                                  # 'G_flat' (Phase C of zeta migration): on-disk
                                  # dataset is ``zeta_q_G`` shape (n_q_disk,
                                  # n_rmu, ngkmax), already FFT'd + sphere-

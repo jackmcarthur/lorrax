@@ -114,7 +114,10 @@ def relF(a, b):
 from common.sharding_fit import fit_sharding as _ns              # noqa: E402
 from common.sharding_fit import legal_spec as _legal_spec        # noqa: E402
 
-from file_io.zeta_loader import ZetaLoader                       # noqa: E402
+# The ζ file's DOOR.  TOP-LEVEL name only: ``zeta_loader.loader`` would be
+# a past-the-door edge and ``tests/test_layering.py`` fails on those.  The
+# ``ensure_on_path()`` above is what makes it resolvable in a bare launch.
+from zeta_loader import ZetaLoader                               # noqa: E402
 
 
 # ===========================================================================
@@ -170,74 +173,75 @@ class _ZetaGTiles:
       into host numpy on EVERY rank and then threw away all but its own
       shard: at nq=144 / n_μ=2412 / ngkmax=8603 a 48-q chunk is 15.9 GB,
       per rank.
-    * ``__getitem__`` — the LOCAL plan, unchanged: same h5py hyperslab,
-      same host numpy, same bytes.  It is ALSO the only plan when the
-      SlabIO probe declines.
+    * ``__getitem__`` — the LOCAL plan, unchanged in what it returns:
+      ``ZetaLoader.read_zeta_G_local(key)`` is the same h5py hyperslab,
+      the same host numpy, the same bytes.  It is ALSO the only plan when
+      the SlabIO probe declines.
 
     The layout CONTRACT is read once, from the loader
     (``gvec_components``/``ngk``/``ngkmax``, the sentinel Miller pad,
     ``zeta_q_G[q, :, ngk[q]:] == 0``); this module no longer re-derives
-    any of it from raw datasets.  Both handles — the loader's SlabIO and
-    the local h5py — are OWNED by this object and released by
-    :meth:`close`, instead of being kept alive by the convention that
-    nobody drops ``zx``.  Holding a serial h5py handle open on a file
-    whose phdf5 ctx is also open is what ``_slab_io_ffi``'s own
-    ``_introspect_dataset`` already does on every read; both are
-    read-only here.
+    any of it from raw datasets.  BOTH HANDLES BELONG TO THE LOADER now —
+    the collective SlabIO one and the local plan's serial h5py one — and
+    :meth:`close` ends them by closing it, instead of this object holding
+    a second ``h5py.File`` of its own and the convention that nobody
+    drops ``zx`` keeping the rest alive.
 
-    WHY ``__getitem__`` IS NOT A SlabIO READ.  A SlabIO read is
-    COLLECTIVE over the mesh and returns a ``jax.Array`` whose requested
-    shape must be mesh-divisible under its ``partition_spec``: a
-    single-q ``(1, n_mu, ngkmax)`` read cannot be q-sharded at all, a
-    replicated one materialises the same bytes on every rank plus a
-    device round-trip, and putting a collective behind ``ds[q]`` would
-    turn any future rank-0-only diagnostic into a hang instead of an
-    error.  Every ``__getitem__`` caller here is a replicated host
-    diagnostic (``recon``, ``run_gates``, ``run_nulls``); those are the
-    mirrors ledger row 64 is about, and replacing them with on-device
-    reductions is a diagnostics rewrite, not a transport change.
+    WHY ``__getitem__`` IS NOT A SlabIO READ, AND WHERE THAT NOW LIVES.
+    A SlabIO read is COLLECTIVE over the mesh and returns a ``jax.Array``
+    whose requested shape must be mesh-divisible under its
+    ``partition_spec``: a single-q ``(1, n_mu, ngkmax)`` read cannot be
+    q-sharded at all, a replicated one materialises the same bytes on
+    every rank plus a device round-trip, and putting a collective behind
+    ``ds[q]`` would turn any future rank-0-only diagnostic into a hang
+    instead of an error.  That argument is no longer this module's to
+    make: it is the documented contract of
+    :meth:`zeta_loader.ZetaLoader.read_zeta_G_local` — *local by design,
+    per-rank independent, do not make this collective* — because the plan
+    it describes moved INTO the door, where the one owner of the file can
+    hold it to that promise.  What stays here is the consequence: every
+    ``__getitem__`` caller in this module is a replicated host diagnostic
+    (``recon``, ``run_gates``, ``run_nulls``); those are the mirrors
+    ledger row 64 is about, and replacing them with on-device reductions
+    is a diagnostics rewrite, not a transport change.
     """
 
     def __init__(self, loader: ZetaLoader, *, path: str, distributed: bool):
         self._loader = loader
         self._distributed = bool(distributed)
-        self._h5 = None
-        self._ds = None
         if loader.zeta_layout != 'G_flat':
             raise ValueError(
                 f"vq_interp needs a G-flat ζ ('zeta_q_G'); {path} has "
                 f"zeta_layout={loader.zeta_layout!r}.  Refit with the "
-                f"G-flat writer (gw.isdf_fitting), or consume it through "
-                f"ZetaLoader.load(layout='G_flat', qvec_frac=…, "
-                f"sphere_idx=…) which does the FFT + sphere gather.")
+                f"G-flat writer (gw.isdf_fitting).  There is no longer a "
+                f"read path for r-space ζ at all: ZetaLoader's disk→G FFT "
+                f"+ sphere gather was deleted on 2026-08-07 because no "
+                f"writer in the tree emits that layout.")
         self.shape = (int(loader.n_q_on_disk), int(loader.n_rmu_disk),
                       int(loader.n_G_sph_disk))
         self.dtype = np.complex128
-        # The distributed plan reads ``ngkmax`` from the HEADER
-        # (``_read_g_flat_disk`` uses ``self.ngkmax_zeta``, i.e.
-        # ``gvec_components.shape[-1]``) while the local plan and every
-        # consumer here read it from the DATASET axis.  The writer sets
-        # both from one value (isdf_fitting ``_gflat_ngkmax``), so they
-        # agree on any file it produced — but if they ever did not, the
-        # two plans would silently read different extents.  Check once.
-        _ngk_hdr = loader.ngkmax_zeta
-        if _ngk_hdr is not None and int(_ngk_hdr) != self.shape[2]:
-            raise ValueError(
-                f"{path}: isdf_header/gvec_components has ngkmax="
-                f"{int(_ngk_hdr)} but zeta_q_G's G axis is {self.shape[2]}. "
-                f"The header and the ζ block disagree about the padded "
-                f"sphere size; the file is corrupt.")
-        self._h5 = h5py.File(path, "r")
-        self._ds = self._h5["zeta_q_G"]
+        # The header-vs-dataset ngkmax agreement check that used to stand
+        # here is GONE, not dropped: ``ZetaLoader.__init__`` has enforced
+        # it at OPEN since the door absorbed the local plan, and it has to
+        # live there — the two plans that could disagree (the collective
+        # one sizes ngkmax from the header, the local one from the dataset
+        # G axis) are both the loader's now, so only the loader can be
+        # sure neither is reachable without the check.  Here it protected
+        # exactly the consumers that happened to build tiles.
 
     # -- local plan (host numpy, h5py hyperslab; unchanged semantics) ---
     def __getitem__(self, key):
-        if self._ds is None:
-            raise RuntimeError(
-                "vq_interp ζ tiles: this bundle has been closed "
-                "(close_zeta_coarse); the lazy ζ reads are no longer "
-                "serviceable.")
-        return self._ds[key]
+        """``zeta_q_G[key]`` as host numpy — the loader's serial handle.
+
+        Delegation, not a re-implementation: ``read_zeta_G_local`` returns
+        exactly what ``dataset[key]`` returns for any h5py key, and the
+        service pins that byte-for-byte against a raw handle.  The
+        post-close refusal is the LOADER's now (this used to be a local
+        ``self._ds is None`` test with its own message), which is what
+        makes "closed" one fact about one owner instead of two objects
+        each with a private opinion.
+        """
+        return self._loader.read_zeta_G_local(key)
 
     # -- distributed plan (per-rank hyperslab straight into `sharding`) -
     def read_q_slab(self, q_offset: int, q_count: int, *, sharding):
@@ -250,18 +254,29 @@ class _ZetaGTiles:
         """
         q_offset, q_count = int(q_offset), int(q_count)
         if self._distributed:
+            # No ``layout=`` since 2026-08-07: ZetaLoader.load reads G-flat
+            # and nothing else, so the kwarg had one legal value and the
+            # signature stopped carrying it (zeta_loader design D3).  This
+            # bundle already refuses a non-G-flat file in __init__.
             return self._loader.load(
                 q=np.arange(q_offset, q_offset + q_count, dtype=np.int32),
-                layout="G_flat", sharding=sharding.spec)
+                sharding=sharding.spec)
         return device_put_process_local(
             self[q_offset:q_offset + q_count], sharding)
 
     # -- ownership -----------------------------------------------------
     def close(self) -> None:
-        if self._h5 is not None:
-            self._h5.close()
-            self._h5 = None
-            self._ds = None
+        """Release the ζ handles.  Idempotent; post-close reads REFUSE.
+
+        Both handles are the loader's, so closing it is what ends them —
+        and the refusal a later ``ZG[q]`` gets is
+        ``ZetaLoader.read_zeta_G_local``'s ("…is closed; its local ζ reads
+        are no longer serviceable"), not this class's old private message.
+        ``close_zeta_coarse`` still calls ``loader.close()`` right after
+        this; ``ZetaLoader.close`` is idempotent, so the second call is a
+        no-op and the ownership statement stays true from either end.
+        """
+        self._loader.close()
 
 
 # ===========================================================================
@@ -295,10 +310,12 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
     caches are pulled per slice, never carried.
 
     READERS AND OWNERSHIP.  ``zeta_q.h5`` is read by exactly ONE object,
-    :class:`file_io.zeta_loader.ZetaLoader` — every header/metadata value
-    below is one of its attributes, and the ζ tiles come through
-    :class:`_ZetaGTiles`, which wraps that same loader.  This module used
-    to open ``zeta_q.h5`` itself and re-derive the G-flat layout contract
+    :class:`zeta_loader.ZetaLoader` — every header/metadata value
+    below is one of its attributes, the ζ tiles come through
+    :class:`_ZetaGTiles`, which wraps that same loader, and since the V4
+    replumb the tiles' serial h5py handle is the loader's too — so this
+    module does not open ``zeta_q.h5`` at all any more.  It used to open
+    it itself and re-derive the G-flat layout contract
     (per-q ``gvec_components`` padded with the sentinel Miller index,
     ``ngk``, ``ngkmax``, the ``zeta_q_G[q, :, ngk[q]:] == 0``
     guarantee) from raw datasets, which made it a SECOND independent

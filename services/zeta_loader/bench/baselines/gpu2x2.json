@@ -1,0 +1,244 @@
+{
+  "backend": "gpu",
+  "devices": 4,
+  "ffi_host_so": "/pscratch/sd/j/jackm/svc_distrib_la/build_host_h200/liblorrax_ffi_host.so",
+  "ffi_so": "/global/homes/j/jackm/software/lorrax_ffi_2026-08-07/liblorrax_ffi.so",
+  "jax_version": "0.7.0.dev20260807",
+  "jobid": "56457930",
+  "machine": "perlmutter",
+  "mesh": "2x2",
+  "nodes": 1,
+  "processes": 4,
+  "recorded": "2026-08-07T11:46:19-0700",
+  "reference_band_mb_s": {
+    "dd": 725,
+    "serial_h5py": 967,
+    "slabio_open_close": [
+      410,
+      580
+    ],
+    "slabio_same_handle": [
+      953,
+      961
+    ]
+  },
+  "rows": [
+    {
+      "bytes": 4194304,
+      "compile_seconds": 0.03846229799091816,
+      "dtype": "complex128",
+      "mb_per_s": 1527.9267201285268,
+      "mesh": "2x2",
+      "mu_count": 64,
+      "op": "read_zeta_G_slab.held_open",
+      "reps": 5,
+      "seconds": 0.0027450950001366436,
+      "seconds_max": 0.002754083019681275,
+      "seconds_min": 0.0027063710149377584,
+      "shape": [
+        8,
+        64,
+        512
+      ]
+    },
+    {
+      "bytes": 4194304,
+      "compile_seconds": 0.01753688504686579,
+      "dtype": "complex128",
+      "mb_per_s": 263.6204226979916,
+      "mesh": "2x2",
+      "mu_count": 64,
+      "op": "read_zeta_G_slab.open_close",
+      "reps": 5,
+      "seconds": 0.015910390997305512,
+      "seconds_max": 0.016080458997748792,
+      "seconds_min": 0.015769049001391977,
+      "shape": [
+        8,
+        64,
+        512
+      ]
+    },
+    {
+      "bytes": 4194304,
+      "compile_seconds": 0.0014223790494725108,
+      "dtype": "complex128",
+      "mb_per_s": 10390.169821061047,
+      "mesh": "2x2",
+      "mu_count": 64,
+      "op": "read_zeta_G_local",
+      "reps": 5,
+      "seconds": 0.00040368002373725176,
+      "seconds_max": 0.0004224969889037311,
+      "seconds_min": 0.00038649700582027435,
+      "shape": [
+        8,
+        64,
+        512
+      ]
+    },
+    {
+      "bytes": 33554432,
+      "compile_seconds": 0.04185984504874796,
+      "dtype": "complex128",
+      "mb_per_s": 2396.7882875272862,
+      "mesh": "2x2",
+      "mu_count": 256,
+      "op": "read_zeta_G_slab.held_open",
+      "reps": 5,
+      "seconds": 0.013999747985508293,
+      "seconds_max": 0.014939234009943902,
+      "seconds_min": 0.013917369011323899,
+      "shape": [
+        8,
+        256,
+        1024
+      ]
+    },
+    {
+      "bytes": 33554432,
+      "compile_seconds": 0.03279298002598807,
+      "dtype": "complex128",
+      "mb_per_s": 1054.5235475223856,
+      "mesh": "2x2",
+      "mu_count": 256,
+      "op": "read_zeta_G_slab.open_close",
+      "reps": 5,
+      "seconds": 0.031819518946576864,
+      "seconds_max": 0.0322532569989562,
+      "seconds_min": 0.03143374400679022,
+      "shape": [
+        8,
+        256,
+        1024
+      ]
+    },
+    {
+      "bytes": 33554432,
+      "compile_seconds": 0.009053517947904766,
+      "dtype": "complex128",
+      "mb_per_s": 4207.635346060246,
+      "mesh": "2x2",
+      "mu_count": 256,
+      "op": "read_zeta_G_local",
+      "reps": 5,
+      "seconds": 0.007974653039127588,
+      "seconds_max": 0.008320882974658161,
+      "seconds_min": 0.005865876970347017,
+      "shape": [
+        8,
+        256,
+        1024
+      ]
+    },
+    {
+      "bytes": 134217728,
+      "compile_seconds": 0.08053881098749116,
+      "dtype": "complex128",
+      "mb_per_s": 3229.8912723478716,
+      "mesh": "2x2",
+      "mu_count": 256,
+      "op": "read_zeta_G_slab.held_open",
+      "reps": 5,
+      "seconds": 0.041554874973371625,
+      "seconds_max": 0.04265613399911672,
+      "seconds_min": 0.040355567005462945,
+      "shape": [
+        32,
+        256,
+        1024
+      ]
+    },
+    {
+      "bytes": 134217728,
+      "compile_seconds": 0.08928019599989057,
+      "dtype": "complex128",
+      "mb_per_s": 1757.2178037957237,
+      "mesh": "2x2",
+      "mu_count": 256,
+      "op": "read_zeta_G_slab.open_close",
+      "reps": 5,
+      "seconds": 0.07638081500772387,
+      "seconds_max": 0.08328096097102389,
+      "seconds_min": 0.07504739804426208,
+      "shape": [
+        32,
+        256,
+        1024
+      ]
+    },
+    {
+      "bytes": 134217728,
+      "compile_seconds": 0.029729910020250827,
+      "dtype": "complex128",
+      "mb_per_s": 5398.293067161075,
+      "mesh": "2x2",
+      "mu_count": 256,
+      "op": "read_zeta_G_local",
+      "reps": 5,
+      "seconds": 0.024862993974238634,
+      "seconds_max": 0.02522789902286604,
+      "seconds_min": 0.020587881037499756,
+      "shape": [
+        32,
+        256,
+        1024
+      ]
+    },
+    {
+      "bytes": 134217728,
+      "compile_seconds": 0.08701639098580927,
+      "dtype": "complex128",
+      "mb_per_s": 3240.5956776849116,
+      "mesh": "2x2",
+      "mu_count": 512,
+      "op": "read_zeta_G_slab.held_open",
+      "reps": 5,
+      "seconds": 0.04141761001665145,
+      "seconds_max": 0.041731728008016944,
+      "seconds_min": 0.04090871603693813,
+      "shape": [
+        8,
+        512,
+        2048
+      ]
+    },
+    {
+      "bytes": 134217728,
+      "compile_seconds": 0.08090900600655004,
+      "dtype": "complex128",
+      "mb_per_s": 1708.8126772126,
+      "mesh": "2x2",
+      "mu_count": 512,
+      "op": "read_zeta_G_slab.open_close",
+      "reps": 5,
+      "seconds": 0.07854443602263927,
+      "seconds_max": 0.08278226701077074,
+      "seconds_min": 0.07804150501033291,
+      "shape": [
+        8,
+        512,
+        2048
+      ]
+    },
+    {
+      "bytes": 134217728,
+      "compile_seconds": 0.028564308013301343,
+      "dtype": "complex128",
+      "mb_per_s": 5551.157923543425,
+      "mesh": "2x2",
+      "mu_count": 512,
+      "op": "read_zeta_G_local",
+      "reps": 5,
+      "seconds": 0.02417832997161895,
+      "seconds_max": 0.02420630503911525,
+      "seconds_min": 0.01911478501278907,
+      "shape": [
+        8,
+        512,
+        2048
+      ]
+    }
+  ],
+  "tag": "gpu2x2"
+}

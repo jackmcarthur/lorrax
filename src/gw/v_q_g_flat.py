@@ -40,8 +40,13 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from .gw_config import env_bool
 
-if TYPE_CHECKING:
-    from file_io.zeta_loader import ZetaLoader
+if TYPE_CHECKING:                       # pragma: no cover — typing only
+    # The DOOR, top-level name only.  No ``ensure_on_path()`` bootstrap is
+    # needed here and none is added: this import never executes (the
+    # module has ``from __future__ import annotations``, so the annotation
+    # it feeds is a string), and a runtime path edit smuggled into a
+    # typing-only block is how a "type-checking import" stops being one.
+    from zeta_loader import ZetaLoader
 
 
 # ---------------------------------------------------------------------------
@@ -274,8 +279,6 @@ def _make_read_all_ibz(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
         return zeta_loader.read_zeta_G_slab(
             q_offset=0, q_count=int(n_q_ibz),
             mu_offset=0, mu_count=int(n_rmu_padded),
-            qvec_batch_frac=jnp.zeros((int(n_q_ibz), 3), dtype=jnp.float64),
-            sphere_idx=None,
             mesh=mesh_xy,
         )
 
