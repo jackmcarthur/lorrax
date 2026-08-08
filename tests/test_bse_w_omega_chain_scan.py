@@ -3,7 +3,7 @@
 ``w_omega_chain.build_w_omega_chain`` used to be a Python loop over chain steps
 with a growing DGKS double loop inside it — 2306 XLA dispatches and 65 blocking
 host syncs for a 32-step chain, measured on the MoS2 6x6 deck
-(BSE_CODE_SURVEY R1).  It is now one cached program per step: 33 dispatches and
+(BSE_CODE_SURVEY R1).  It is now one cached program per step: 34 dispatches and
 33 syncs at the same chain length.
 
 This file is the verification floor for that conversion, and every cell here

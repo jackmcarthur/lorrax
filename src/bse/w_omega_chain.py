@@ -223,7 +223,7 @@ def _seed_block(cols, data: dict, gen, sh):
 # BIT-IDENTICAL (``np.array_equal``) on ``alpha``, ``beta``, ``R0``, ``V_stack``
 # and ``D_half``.  The barriers cost only fusion, and fusion is not what this
 # conversion was buying: the win class here is dispatch count and host syncs
-# (2306 -> 33 and 65 -> 33), not per-item math.  MEASURED individually, the
+# (2306 -> 34 and 65 -> 33), not per-item math.  MEASURED individually, the
 # combine, the combine-then-scale, the INLINED matvec and a bare Gram are each
 # bit-identical without a barrier; only a dot fed by a subtract is not.  The
 # barriers are placed uniformly anyway, because "wherever the eager form had a
