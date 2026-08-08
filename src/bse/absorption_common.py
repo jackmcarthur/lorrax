@@ -76,6 +76,16 @@ def load_dipole_h5(path: str | Path):
     deltaE      : (nk, nb, nb) float64       — E_b - E_b' (Ry).
     attrs       : dict with ``nbands, nk``.
     """
+    if not Path(path).is_file():
+        raise FileNotFoundError(
+            f"dipole file {path!s} not found.  This is a PRODUCED input, not a "
+            f"deck file that ships with the system: build it from the deck's "
+            f"WFN with\n"
+            f"    python3 -u -m psp.get_dipole_mtxels -i <deck>.in --skip-vnl "
+            f"--out {Path(path).name}\n"
+            f"``--skip-vnl`` writes the momentum operator only, which is the "
+            f"arm that matches BerkeleyGW's ``use_momentum``; drop it to get "
+            f"the full p + i[r, V_NL].")
     with h5py.File(str(path), "r") as f:
         dipole_cart = np.asarray(f["dipole_cart"][:], dtype=np.complex128)
         deltaE = np.asarray(f["deltaE"][:], dtype=np.float64)
