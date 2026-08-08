@@ -13,7 +13,10 @@ DFT mean-field energies.
 Input and required data:
 - `bse_si_test.in`               (native 3D v(q) body + BGW q->0 head scalars)
 - `WFN.h5`                       (9 MB; 8 IBZ k-points, 62 bands, nspinor=2)
-- `centroids_frac_480.txt`
+- `centroids_frac_480_orbitclosed.txt`   the deck's set since 2026-08-08
+- `centroids_frac_480.txt`       the previous free set; KEPT, not deleted —
+  the closure tests measure it as their non-closed row (worst 1.718e-01,
+  47/48 ops) and it is the only in-tree example of a same-rank open set
 - `kin_ion.h5`
 
 References:
@@ -33,6 +36,11 @@ alongside it in the study directory.
 
 BGW anchor
 ----------
+SUPERSEDED BY THE 2026-08-08 CLOSURE ADOPTION at the foot of this file —
+the numbers in this section were measured on the FREE 480 set and are kept
+because they are the record that set left behind, not because they describe
+the deck as it stands. The current anchor is MAE 4.119 / max 11.445 meV.
+
 MEASURED 2026-08-07, lowest 20 eigenvalues, LORRAX vs BerkeleyGW:
 
     MAE  3.465 meV     max |delta|  8.877 meV     lowest state  -2.334 meV
@@ -116,3 +124,127 @@ BUILD_NOTES pins —
 jobid/steps and both delta tables) — as the new reference at the
 integration head.  ATOL_FROZEN_EV stays 1e-6: it is a bit-reproducibility
 pin, and loosening it instead of refreezing was considered and refused.
+
+## 2026-08-08 — per-deck closure adoption: this deck moves to a matched-rank orbit-closed set
+
+Owner-approved and authorized, including the reference re-freeze.
+
+`centroids_file` is now `centroids_frac_480_orbitclosed.txt`.  Same rank as
+the set it replaces — 480 against 480, one line of the deck different — so
+the size variable is eliminated outright rather than controlled for.  That
+is the whole reason this rung exists: the four-arm experiment compared a
+480 free set against a 504 closed set and used a 504 free set as the size
+control, which is a good control and still a control.  This is the
+elimination.
+
+### Why B0 and not another rung
+
+Justification recorded in `closure_candidates/FRONTIER_PLAN.md` §9, whose
+`si_bse_debug` table is the measured frontier over five closed rungs at one
+pinned head.  The operating point is the orchestrator's rung call:
+
+| | arm A (free 480) | **B0 (adopted)** | B1 (528) | B2 (696) | B3 (984) |
+|---|---|---|---|---|---|
+| BSE MAE vs BGW (meV) | 3.418 | **4.119** | 4.044 | 3.189 † | 3.431 |
+| Σ star spread (meV)  | 18.005 | **0.692** | 0.653 | 0.737 | 0.743 |
+| q-points screened    | 64 | **8** | 8 | 8 | 8 |
+| restart file         | 0.5042 GiB | **0.5042 GiB** | 0.6034 | 1.0133 | 1.9681 |
+
+† B2's sidecar records a non-converged Lloyd iteration at generation.  It
+is reported as measured and is the one rung an operating point should not
+be chosen on.
+
+The trade in one line: **+0.70 meV of BSE MAE buys a 26× collapse of the Σ
+star spread (18.005 → 0.692 meV), an 8× narrower screening stage, and an
+identical restart size.**  +0.70 meV sits under this deck's own ~5.5 meV
+resolution floor — the spec records Lanczos state-resolution jitter of
+~3 meV here, so differences of this size are not a trend to be read.  B3
+would buy back all but +0.013 meV of it and costs **3.9×** the restart
+file, against the owner's standing disk goal; that is the wrong side of
+the trade.  B0 also lands the state count on BGW's: 14 states below
+2.40 eV against BGW's 14, where the free set gave 15.
+
+### Generation convention — verbatim, and the backend field is load-bearing
+
+```
+generator        centroid.kmeans_cli, orbit-aware (the DEFAULT: the WFN
+                 carries 48 ops, so _resolve_symmetry enables it unasked)
+invocation       python3 -m centroid.kmeans_cli 440 --seed 42 \
+                     --prune-n-val 8 --prune-n-cond 52
+seed             42
+prune window     8 / 52   (deck-matched: nval 8, ncond 52 from bse_si_test.in)
+oversample       1.5      (generator default, left alone)
+backend          CPU-generated  (JAX_PLATFORMS=cpu, JAX_ENABLE_X64=1)
+achieved rank    480 centroids in 11 orbits — 9 orbits of 48, 2 of 24
+md5              253b498f7a959344361e889f2c0abe33
+```
+
+The request is **440, not 480**: in orbit mode the generator targets orbits
+and writes the count that survives unfolding and pruning, so achievable
+counts are quantised to sums of orbit sizes.  440 lands on 480 exactly; 480
+itself overshoots to 528.  The 24-point orbits are centroids on Fd-3m
+special positions, where the site symmetry halves the orbit.
+
+**The `backend` field is recorded permanently and is not decoration.**  A
+sibling worker measured and then WITHDREW the assessment's claim that
+centroid generation is backend-independent; CPU- and GPU-generated sets can
+differ.  A set whose backend is not recorded is a set nobody can regenerate.
+
+### Closure verdict
+
+**ORBIT-CLOSED.**  Worst residual over all 48 ops and all 480 centroids
+**1.000e-06** — the text file's six-decimal rounding floor — with **0/48**
+ops violating at tol 1e-5.  Verified on the deck's own `WFN.h5`, on a login
+node, BEFORE any node-hour was spent, and by two implementations that share
+no code: a from-scratch check written against the spec text and the tree's
+`symmetry_maps.verify_centroid_orbit_closure`.  They agree to every printed
+digit.  Both use τ = tnp/2π.
+
+For contrast at the same rank, same deck, same WFN: the free
+`centroids_frac_480.txt` measures **1.718e-01, 47 of 48 ops violating** —
+about 4 cells of the 24³ grid, nowhere near a centroid.  The entire
+difference is the point set.  `services/symmetry_maps/tests/test_symmetry_maps_closure.py`
+carries both rows.
+
+### Reference provenance (the vcoul adoption pattern)
+
+`bse_eigenvalues_ref.dat` is REPLACED, in place, by the candidate the
+adoption runs produced.  It was not regenerated here and nothing was
+deleted.
+
+```
+head             ad9326fe (both runs)
+runs             TWO independent full runs on Perlmutter — GW (warm
+                 discipline: tmp/ deleted before each leg, so neither leg
+                 could reuse zeta_q.h5 and skip the fit) then BSE
+agreement        lowest-20 BSE eigenvalues BIT-IDENTICAL between the runs
+candidate md5    0aafa622d6040da8a9fa3b7b4fb1c6d3
+format           unchanged — header + 4-wide index + 8-decimal eV
+lowest state     2.34886489 eV   (previous frozen ref: 2.34511118 eV)
+```
+
+The 3.75 meV shift in the lowest eigenvalue is the centroid-set change and
+is expected.  `ATOL_FROZEN_EV` stays **1e-6**: it is a bit-reproducibility
+pin — two independent runs agree exactly — and loosening it instead of
+refreezing was considered and refused when the same question came up at the
+mini-BZ head-draw fix.
+
+This adoption also DISCHARGES the staleness note above it.  That note
+records the owner authorizing the vcoul candidate generated at 358bb0b; the
+replacement never landed, and this candidate is generated at ad9326fe,
+which is downstream of 358bb0b.  One re-freeze, both causes.
+
+**Where the full record lives.**  The campaign artifacts are at
+`/pscratch/sd/j/jackm/frontier_0808/` and the tables they produced are
+`closure_candidates/FRONTIER_PLAN.md` §9 (§9a the thirteen-set closure
+precondition, §9b the warm-discipline trap, §9c this deck's table).  Cited
+here by path on purpose: the scratchpad those artifacts were staged through
+is not permanent, and a provenance chain that only exists in a scratch
+directory is a provenance chain with an expiry date.
+
+### `si_cohsex_debug` is NOT part of this
+
+That deck stays on its free set at its current pins.  Closure at matched
+rank measured RED on its BerkeleyGW anchor, and one deck's answer is not
+the other's — which is exactly why this adoption is per-deck.  See that
+deck's README and the frontier record.

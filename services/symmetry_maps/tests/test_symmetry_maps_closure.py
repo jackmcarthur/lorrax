@@ -16,17 +16,31 @@ centroid files and wrote the table down::
     si_cohsex_debug  centroids_frac_960.txt   worst 1.318e-01   47/48 ops
     si_cohsex_debug  centroids_frac_144.txt   worst 1.000e-06    0/48  CLOSED
 
-Those three rows are :func:`test_the_spec_table_reproduces` below, to three
+A fourth row joined them at the 2026-08-08 per-deck closure adoption, from
+the frontier campaign's §9a precondition table rather than from the spec::
+
+    si_bse_debug     centroids_frac_480_orbitclosed.txt
+                                              worst 1.000e-06    0/48  CLOSED
+
+That row is the one that earns its keep twice: it is the deck's LIVE set
+since the adoption, and it sits beside the free 480 set at the SAME RANK on
+the SAME deck, so the pair is the tree's only same-rank open/closed contrast
+and the entire difference between them is the point set.
+
+Those four rows are :func:`test_the_spec_table_reproduces` below, to three
 significant figures, and they are the reason this function can be believed
 about a file nobody has measured.  The 144-set's 1.000e-06 is the text
 file's six-decimal rounding floor and not a defect — which is exactly why
 the tolerance is 1e-5 and not 1e-9.
 
 THE FILES ARE READ, NEVER WRITTEN.  ``tests/regression/*`` is chmod'd
-read-only on purpose and no ``centroids_frac_*.txt`` is regenerated here or
-anywhere on this branch (survey §8(a): regenerating the production sets as
-orbit-closed is an owner decision and a measured accuracy trade, not a
-cleanup).  Every open below is ``'r'``.
+read-only on purpose and nothing here regenerates a centroid file.  Survey
+§8(a) called regenerating the production sets an owner decision and a
+measured accuracy trade rather than a cleanup; the owner has since taken
+that decision for ONE deck — ``si_bse_debug`` adopted a matched-rank
+orbit-closed set on 2026-08-08, generated on Perlmutter and COMMITTED, not
+made here — and explicitly not for ``si_cohsex_debug``, which stays on its
+free set.  Every open below is ``'r'``.
 """
 
 from __future__ import annotations
@@ -40,7 +54,9 @@ import _deck_stub
 from symmetry_maps import (CLOSURE_TOL_DEFAULT, CentroidClosureVerdict,
                            verify_centroid_orbit_closure)
 
-#: The spec's §2 table, verbatim: (deck, centroid file, worst, n_violating).
+#: The measured closure table: (deck, centroid file, worst, n_violating).
+#: Rows 1-3 are the spec's §2 table verbatim; row 4 is the set the
+#: 2026-08-08 adoption committed, from the frontier §9a precondition table.
 #: ``si_bse_debug`` is not one of ``_deck_stub.DECKS`` — that tuple is the
 #: star-table acceptance gate's parametrisation and pinning a fifth deck
 #: into it would break a different test — so its header is read here.
@@ -48,6 +64,7 @@ _SPEC_ROWS = [
     ("si_cohsex_debug", "centroids_frac_960.txt", 1.318e-01, 47),
     ("si_cohsex_debug", "centroids_frac_144.txt", 1.000e-06, 0),
     ("si_bse_debug", "centroids_frac_480.txt", 1.718e-01, 47),
+    ("si_bse_debug", "centroids_frac_480_orbitclosed.txt", 1.000e-06, 0),
 ]
 
 #: The FFT grid all three of these sets were snapped to, from their own
