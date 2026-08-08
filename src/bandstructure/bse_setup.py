@@ -38,7 +38,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-from distrib_la import plan as linalg_plan                          # noqa: E402
+from distrib_la import plan as linalg_plan, mesh_key as _mesh_key   # noqa: E402
 # Every extent this module shards is an input datum: n_μ is a k-means centroid
 # count, nb_fi is the caller's band window, and the q-batch is batch_size — so
 # each of them divides the mesh axis only by luck.  ``bse_io`` pads its own μ
@@ -93,6 +93,59 @@ def resolve_reshard_route(explicit=None, *, log_fn=None) -> str:
         f"known route.  Accepted: {'/'.join(_RESHARD_ROUTES)}; unset = "
         f"{_RESHARD_ROUTE_DEFAULT}.  The knob is NOT in force. ***")
     return _RESHARD_ROUTE_DEFAULT
+
+
+#: ``compute_wfns_fi``'s jits, keyed per SIGNATURE and held for the process.
+#:
+#: They used to be five ``jax.jit`` CLOSURES rebuilt on every call, and JAX
+#: keys its tracing cache on callable identity — so a fresh closure is a
+#: fresh cache line and every invocation re-traced all five from scratch.
+#: What that costs is TRACING and lowering, not XLA compilation: the
+#: executable cache underneath ``pjit`` is keyed on the jaxpr/avals/shardings
+#: rather than on the function object, so the retraced program hashed to the
+#: same executable and ``jax_compile_cache``'s ``compiles`` counter stayed
+#: flat.  That is why this was invisible to the obvious instrument and why
+#: the numbers in the commit message are WALL numbers on repeat calls.
+#:
+#: It bites wherever ``compute_wfns_fi`` is called more than once per
+#: process, which is the ``bse.exciton_bands`` refit loop (``:889``, 5 Q via
+#: ``vq_interp.refit_vq``) — every one of those five calls passes the SAME
+#: shapes, so four of them were paying a full retrace for nothing.
+#:
+#: THE KEY MUST COVER EVERY CLOSED-OVER VALUE, not just the arguments.  The
+#: arguments take care of themselves (jit keys its own cache on avals and
+#: static args); what a stale entry would silently reuse is the CONSTANTS
+#: baked into the trace — ``R_grid`` (a pure function of ``kgrid_co``), the
+#: mesh, ``rank``, the batch width, the band window's derived extents, the
+#: staged-reshard route, and ``newton_inv``'s (a, n, shift).  Every one of
+#: them is in a key below.  ``distrib_la.mesh_key`` rather than ``id(mesh)``
+#: because these entries do NOT retain the mesh, and the failure mode of an
+#: id-keyed cache that does not retain its object is a stale HIT.
+#:
+#: NOT retained here: the ``_stage_q`` reshard closure.  It is still built on
+#: every call, exactly as before, because its factory issues a collective
+#: (``warm_mesh_cliques``) that must run on every rank in the same order —
+#: caching it would move a collective, which is not a change to make for a
+#: warm-up.  A cached ``_q_batch`` therefore holds the FIRST call's
+#: ``_stage_q``; that is safe because ``face_to_batch_reshard`` is a pure
+#: function of (mesh, axes, route) and all three are in the key.
+_WFNS_FI_KERNELS: dict = {}
+
+
+def _cached_kernel(key, build):
+    """The jit for ``key``, built once per process.
+
+    Deliberately a plain dict and not ``functools.lru_cache``: the key is
+    assembled by the caller from things an argument-keyed decorator cannot
+    see (closed-over constants), and an eviction policy would silently
+    reintroduce the retrace this exists to remove.  The tree's own prior art
+    is ``htransform._accum_G_cache`` / ``vq_interp._REFIT_KERNELS`` /
+    ``distrib_la.plan._SCAN_CACHE``; this is the same shape.
+    """
+    fn = _WFNS_FI_KERNELS.get(key)
+    if fn is None:
+        fn = _WFNS_FI_KERNELS[key] = build()
+    return fn
 
 
 def _parse_kgrid_fi(spec) -> tuple[int, int, int]:
@@ -459,6 +512,20 @@ def compute_wfns_fi(
             f"replicate-then-repartition ({bs * rank * rank * 16 / 1024**2:.0f}"
             f" MB/device/batch).  See common/staged_reshard.py.")
 
+    # ── The per-signature key for the jit cache ──────────────────────────
+    # Every value the kernels below CLOSE OVER, in one tuple: the mesh (by
+    # ``distrib_la.mesh_key``, which carries device identity and not just
+    # extents), ``kgrid_co`` (which is all ``R_grid`` is), the matrix extent,
+    # the three output extents that ``_qbatch_out_shardings`` and the bundle
+    # shardings are built from, and the reshard route plus whether the staged
+    # primitive accepted this shape.  Arguments are deliberately ABSENT — jit
+    # keys its own cache on avals and static args, so putting shapes here
+    # would only split entries that are already correctly split.
+    _mesh_id = _mesh_key(mesh_xy)
+    _sig = (_mesh_id, tuple(int(v) for v in kgrid_co), int(rank),
+            int(nb_fi), int(nspinor), int(n_mu), _route,
+            _stage_q is not None, bool(native))
+
     # The two stages either side of the eigh are plain traceable functions,
     # shared verbatim by both backends; only the JIT BOUNDARIES differ.  The
     # native path keeps eigh + projection inside ONE jit — split apart, the
@@ -608,12 +675,17 @@ def compute_wfns_fi(
                 _fit(mesh_xy, P(('x', 'y'), None), (bs, rank),
                      "bse_setup.lam_all"))
 
-    @partial(jax.jit, static_argnames=('b_min', 'b_max'),
-             out_shardings=_qbatch_out_shardings(bs))
-    def _q_batch(q_batch, fH_R, B, b_min, b_max):
-        """Native: Fourier sum → batched eigh → projection, ONE fused jit."""
-        lam, U = jnp.linalg.eigh(_fourier(q_batch, fH_R, True))
-        return _project(lam, U, B, b_min, b_max)
+    def _q_batch_kernel(bs_):
+        def _build():
+            @partial(jax.jit, static_argnames=('b_min', 'b_max'),
+                     out_shardings=_qbatch_out_shardings(bs_))
+            def _q_batch(q_batch, fH_R, B, b_min, b_max):
+                """Native: Fourier sum → batched eigh → projection, ONE fused
+                jit."""
+                lam, U = jnp.linalg.eigh(_fourier(q_batch, fH_R, True))
+                return _project(lam, U, B, b_min, b_max)
+            return _q_batch
+        return _cached_kernel(("q_batch", _sig, int(bs_)), _build)
 
     lam_chunks, psi_chunks, c_chunks, lam_all_chunks = [], [], [], []
 
@@ -640,6 +712,7 @@ def compute_wfns_fi(
     # wide for the batched path runnable at all, at the cost of nq sequential
     # distributed solves.  Native stays the default.
     if native:
+        _q_batch = _q_batch_kernel(bs)
         for i in range(0, q_pad.shape[0], bs):
             _emit(*_q_batch(q_pad[i:i + bs], fH_R, B_rep, b_min, b_max))
             # RETAINED, per chunk, and it is not an oversight.  ``_q_batch``
@@ -753,14 +826,25 @@ def compute_wfns_fi(
         # ``Plan.batched``'s ``ensure_sharding`` finds the stack already in
         # place and emits nothing (it compares (mesh, spec), not sharding
         # objects, for exactly this case — distrib_la.plan.ensure_sharding).
-        @partial(jax.jit, out_shardings=eigh_plan.batch_in_sharding)
-        def _fH_q_chunk(q_chunk, fH_R):
-            return jax.lax.map(lambda q: _fourier(q, fH_R, False), q_chunk)
+        def _build_fH_q_chunk():
+            @partial(jax.jit, out_shardings=eigh_plan.batch_in_sharding)
+            def _fH_q_chunk(q_chunk, fH_R):
+                return jax.lax.map(lambda q: _fourier(q, fH_R, False),
+                                   q_chunk)
+            return _fH_q_chunk
 
-        @partial(jax.jit, static_argnames=('b_min', 'b_max'))
-        def _project_chunk(lam, U, B, b_min, b_max):
-            return jax.lax.map(
-                lambda lu: _project(lu[0], lu[1], B, b_min, b_max), (lam, U))
+        def _build_project_chunk():
+            @partial(jax.jit, static_argnames=('b_min', 'b_max'))
+            def _project_chunk(lam, U, B, b_min, b_max):
+                return jax.lax.map(
+                    lambda lu: _project(lu[0], lu[1], B, b_min, b_max),
+                    (lam, U))
+            return _project_chunk
+
+        _fH_q_chunk = _cached_kernel(
+            ("fH_q_chunk", _sig, eigh_plan.backend), _build_fH_q_chunk)
+        _project_chunk = _cached_kernel(
+            ("project_chunk", _sig), _build_project_chunk)
 
         t_eigh = time.time()
         _logged = 0
@@ -791,10 +875,20 @@ def compute_wfns_fi(
                  if return_coeffs else None)
 
     # ── Newton-invert lam_fi → DFT-equivalent energies ───────────────────
-    @jax.jit
-    def _inv(lam):
-        return jax.vmap(lambda row: newton_inv(a_f, n_f, shift, row.real))(lam)
-    energies_fi = _inv(lam_fi)
+    # (a_f, n_f, shift) are TRACE CONSTANTS here, not arguments, so they are
+    # in the key: two decks that differ only in their f-transform parameters
+    # must not share this executable.  They are the three floats
+    # ``f_transform_eigs`` returns, so the key is exact, not a fingerprint.
+    def _build_inv():
+        @jax.jit
+        def _inv(lam):
+            return jax.vmap(
+                lambda row: newton_inv(a_f, n_f, shift, row.real))(lam)
+        return _inv
+
+    energies_fi = _cached_kernel(
+        ("inv", _mesh_id, float(a_f), float(n_f), float(shift)),
+        _build_inv)(lam_fi)
 
     # ── Reshard into the canonical (Y, X) wfn-bundle layout ──────────────
     # Matches ``common.wfn_transforms.load_centroids_band_chunked``:
@@ -807,14 +901,20 @@ def compute_wfns_fi(
     out_X = _fit(mesh_xy, P(None, 'x', None, None), (nq, n_mu, nb_fi, nspinor),
                  "bse_setup.psi_rmuT_X")
 
-    @partial(jax.jit, out_shardings=(out_Y, out_X))
-    def _make_bundle(psi):
-        psi_Y = jax.lax.with_sharding_constraint(psi, out_Y)
-        psi_X = jax.lax.with_sharding_constraint(
-            jnp.transpose(psi, (0, 3, 1, 2)), out_X)
-        return psi_Y, psi_X
+    def _build_bundle():
+        @partial(jax.jit, out_shardings=(out_Y, out_X))
+        def _make_bundle(psi):
+            psi_Y = jax.lax.with_sharding_constraint(psi, out_Y)
+            psi_X = jax.lax.with_sharding_constraint(
+                jnp.transpose(psi, (0, 3, 1, 2)), out_X)
+            return psi_Y, psi_X
+        return _make_bundle
 
-    psi_rmu_Y, psi_rmuT_X = _make_bundle(psi_fi)
+    # ``nq`` joins the key here and nowhere else: it is the only kernel whose
+    # closed-over shardings (out_Y / out_X) carry the fine-grid q count.
+    psi_rmu_Y, psi_rmuT_X = _cached_kernel(
+        ("make_bundle", _mesh_id, int(nq), int(nb_fi), int(nspinor),
+         int(n_mu)), _build_bundle)(psi_fi)
     log(f"  bundle: psi_rmu_Y={psi_rmu_Y.shape}, psi_rmuT_X={psi_rmuT_X.shape}")
     out = SimpleNamespace(
         psi_rmu_Y=psi_rmu_Y,
