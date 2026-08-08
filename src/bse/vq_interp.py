@@ -48,9 +48,6 @@ coordinate, K = q+G Cartesian in bohr⁻¹, v = slab-truncated Coulomb):
     (c) phase-factored LR form-factor samples on 𝒢(α):
             F_μ(q_j;G) = e^{+2πi (q_j+G)·s_μ} (S_q ζ̃)_μ(q_j+G)
         (centroid winding phase carried analytically — the g0-winding cure).
-    (c) phase-factored LR form-factor samples on 𝒢(α):
-            F_μ(q_j;G) = e^{+2πi (q_j+G)·s_μ} (S_q ζ̃)_μ(q_j+G)
-        (centroid winding phase carried analytically — the g0-winding cure).
 
   stage 2  ``fit_lr_model`` — ONE weighted LSQ over all coarse samples:
         M_μ(K_∥, G_z) ≈ Σ_b c_b[μ,G_z] (K_x/2α)^p (K_y/2α)^r,
@@ -1264,6 +1261,81 @@ def pack_coeffs(des, coeffs):
     return tuple(jnp.asarray(coeffs[g]) for g in des["specs"])
 
 
+_MBZ_DQ_CACHE: dict = {}
+_MBZ_DQ_CACHE_MAX = 2
+
+
+@jax.jit
+def _mbz_draw_u(gidx, base_key):
+    """``(local, 3)`` uniforms, one per GLOBAL slot index.
+
+    The sharded sobol/threefry idiom: per-sample keys folded off one root
+    key, so the draw for a given global slot is the same no matter which
+    rank makes it.  MODULE-LEVEL and taking ``base_key`` as a runtime
+    argument — the closure this replaced was rebuilt inside
+    :func:`minibz_head_vlr` on every call, and JAX keys its trace cache on
+    callable identity, so every target Q paid a fresh trace.
+    """
+    def one(i):
+        return jax.random.uniform(jax.random.fold_in(base_key, i),
+                                  (3,), dtype=jnp.float64)
+    return jax.vmap(one)(gidx)
+
+
+def _mbz_dq(bvec, kgrid, *, n_q, nsamples, qmc_reps, seed_offset, lo, hi):
+    """This rank's mini-BZ offsets ``δq`` for slab ``[lo, hi)`` — MEMOISED.
+
+    NOTHING here depends on the target Q.  The draws are indexed by global
+    slot only; the Voronoi wrap and the ``randlims`` affine map are pure cell
+    geometry.  Only the final ``_minibz_kernel_bare(shift_cart, dq, …)`` in
+    :func:`minibz_head_vlr` sees Q at all.  Yet the whole construction used to
+    be rebuilt per target Q, and it is expensive in exactly the way a Q loop
+    cannot amortise: a ``(local, 3)`` threefry draw on device, a 63 MB
+    device→host pull, a 2.6M-point host matmul, a device round trip through
+    ``wrap_points_to_voronoi`` whose ``(N, 27, 3)`` candidate tensor is 1.7 GB
+    at the production sample count, and a second 63 MB pull — measured
+    **1.40 s per Q** at ``nsamples=2**18, qmc_reps=10`` on the MoS2 3×3 slab
+    deck, independent of ``n_μ``.
+
+    The key carries every input the arrays depend on, INCLUDING ``n_q`` and
+    the rank slab, so a hit returns the array today's code would have built
+    element for element and in the same order.  The reduction that consumes
+    it is therefore **bit-identical**, not merely close — which is why the
+    cache can be keyed rather than the samples re-derived by prefix slicing.
+
+    Bounded to ``_MBZ_DQ_CACHE_MAX`` entries: ``dq`` is ``(hi-lo, 3)`` f64,
+    63 MB per entry at the production sample count divided by the rank count.
+    ``n_q`` is BGW's adaptive per-batch count and clamps to ``nsamples`` for
+    every Q whose ``|Q+G*|`` is small enough (all 8 probed Q on the reference
+    slab deck), so a Q path normally lives in a single entry.
+    """
+    from vcoul import wrap_points_to_voronoi
+    key = (bvec.tobytes(), tuple(int(s) for s in kgrid), int(n_q),
+           int(nsamples), int(qmc_reps), int(seed_offset), int(lo), int(hi))
+    hit = _MBZ_DQ_CACHE.get(key)
+    if hit is not None:
+        return hit
+    base_key = jax.random.PRNGKey(int(seed_offset))
+    slots = jnp.arange(lo, hi, dtype=jnp.uint32)
+    rep = slots // np.uint32(n_q)                       # replicate batch
+    loc = slots % np.uint32(n_q)                        # in-batch draw
+    gidx = rep * np.uint32(int(nsamples)) + loc         # global draw index
+    U = np.asarray(_mbz_draw_u(gidx, base_key), dtype=np.float64)
+    # δq mapping — VERBATIM minibz_voronoi_batches geometry (single source
+    # for the wrap + mini-BZ affine map), nmax=3 = BGW ncell.
+    randcart = (bvec.T @ U.T).T
+    wrapped = np.asarray(wrap_points_to_voronoi(
+        jnp.asarray(randcart), jnp.asarray(bvec), nmax=3), dtype=np.float64)
+    randlims = bvec.T @ (np.diag(1.0 / np.asarray(kgrid, np.float64))
+                         @ np.linalg.inv(bvec.T))
+    dq = (randlims @ wrapped.T).T
+    dq[:, 2] = 0.0                                       # 2D slab: qz = 0
+    if len(_MBZ_DQ_CACHE) >= _MBZ_DQ_CACHE_MAX:
+        _MBZ_DQ_CACHE.pop(next(iter(_MBZ_DQ_CACHE)))
+    _MBZ_DQ_CACHE[key] = dq
+    return dq
+
+
 def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
                     qmc_reps=10, n_coarse=250_000, seed_offset=0, kgrid=None):
     """RANK-PARALLEL mini-BZ CELL AVERAGE of the LR-slab head at target Q.
@@ -1315,9 +1387,9 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     """
     # Replumbed 2026-08-07: these are pure service symbols; the door is
     # the true dependency (the gw.coulomb.base / gw.vcoul spellings are
-    # compat shims kept for sibling branches this phase).
-    from vcoul import (_minibz_kernel_bare, minibz_inscribed_sphere_r2,
-                       wrap_points_to_voronoi)
+    # compat shims kept for sibling branches this phase).  The Voronoi wrap
+    # moved into :func:`_mbz_dq` with the rest of the Q-independent geometry.
+    from vcoul import _minibz_kernel_bare, minibz_inscribed_sphere_r2
     if alpha is None:
         alpha = float(prep["alpha"])
     GS = np.asarray(prep["GS"], dtype=np.float64)          # (3, nG)
@@ -1364,30 +1436,12 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     hi = (rank + 1) * n_kept // nranks                      # = [0, n_kept)
 
     if hi > lo:
-        base_key = jax.random.PRNGKey(int(seed_offset))
-        slots = jnp.arange(lo, hi, dtype=jnp.uint32)
-        rep = slots // np.uint32(n_q)                       # replicate batch
-        loc = slots % np.uint32(n_q)                        # in-batch draw
-        gidx = rep * np.uint32(int(nsamples)) + loc         # global draw index
-
-        @jax.jit
-        def _draw(gidx):
-            def one(i):
-                return jax.random.uniform(jax.random.fold_in(base_key, i),
-                                          (3,), dtype=jnp.float64)
-            return jax.vmap(one)(gidx)
-
-        U = np.asarray(_draw(gidx), dtype=np.float64)       # (local, 3) ∈ [0,1)
-        # δq mapping — VERBATIM minibz_voronoi_batches geometry (single source
-        # for the wrap + mini-BZ affine map), nmax=3 = BGW ncell.
-        randcart = (bvec.T @ U.T).T
-        wrapped = np.asarray(wrap_points_to_voronoi(
-            jnp.asarray(randcart), jnp.asarray(bvec), nmax=3),
-            dtype=np.float64)
-        randlims = bvec.T @ (np.diag(1.0 / np.asarray(kgrid, np.float64))
-                             @ np.linalg.inv(bvec.T))
-        dq = (randlims @ wrapped.T).T
-        dq[:, 2] = 0.0                                       # 2D slab: qz = 0
+        # Q-INDEPENDENT and memoised: the draws, the Voronoi wrap and the
+        # mini-BZ affine map are pure cell geometry indexed by global slot.
+        # Only the kernel evaluation below sees Q.
+        dq = _mbz_dq(bvec, kgrid, n_q=n_q, nsamples=nsamples,
+                     qmc_reps=qmc_reps, seed_offset=seed_offset,
+                     lo=lo, hi=hi)
         v, _ = _minibz_kernel_bare(shift_cart, dq, kind="slab_lr",
                                    alpha=alpha, zc=float(np.pi / bvec[2, 2]))
         local_sum = float(np.sum(v))
