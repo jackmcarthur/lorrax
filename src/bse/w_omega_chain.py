@@ -116,23 +116,38 @@ def _block_combine(Qblk: jax.Array, Mmat: jax.Array) -> jax.Array:
     return jnp.einsum("acvk,ab->bcvk", Qblk, Mmat)
 
 
-def _block_orthonormalize(Wblk: jax.Array, sh) -> tuple[jax.Array, np.ndarray]:
-    """Robust block-QR ``Wblk = Q R`` with rank-deficiency deflation.
+def _host_qr_factors(G: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """HOST block-QR factors ``(R, Tr)`` from the ``(p,p)`` Gram ``G = W^dag W``.
 
-    Columns are the ``p`` block entries; the inner product is Euclidean over the
-    pair indices ``(c,v,k)``.  Uses the Gram / eigen route (``G = W^dag W`` is a
-    tiny ``p x p`` matrix, so its Hermitian eigendecomposition on host is cheaper
-    and more robust than a distributed tall-skinny QR):
+    This is the numerical heart of the block orthonormalization ``W = Q R``,
+    and it runs on the HOST in ``numpy`` deliberately.  Columns are the ``p``
+    block entries; the inner product is Euclidean over the pair indices
+    ``(c,v,k)``.  The Gram / eigen route is used because ``G`` is a tiny
+    ``p x p`` matrix, so its Hermitian eigendecomposition on host is cheaper and
+    more robust than a distributed tall-skinny QR:
 
         G = Z diag(lam) Z^dag,      (Hermitian, lam >= 0)
         R = diag(sqrt(lam)) Z^dag,  Q = W (Z diag(lam^{-1/2}))     [W = Q R]
 
     Near-zero ``lam`` (parallel / zero probe columns — degenerate centroids or
     zero pad columns) get a clamped inverse -> that ``Q`` column is set to 0 and
-    the matching ``R`` row to 0, so the deflated directions never enter the chain.
-    ``R`` is returned as host numpy (feeds the replicated reduced matrix); ``Q``
-    stays on device with the block sharding ``sh.X``."""
-    G = np.asarray(jax.device_get(_block_gram(Wblk, Wblk)))     # (p, p) Hermitian
+    the matching ``R`` row to 0, so the deflated directions never enter the
+    chain.
+
+    WHY THIS STAYS ON HOST.  ``np.linalg.eigh`` (LAPACK ``zheevd``) and
+    ``jnp.linalg.eigh`` (cuSOLVER on GPU) agree only to within rounding, and the
+    eigenvectors ``Z`` they return feed ``Q`` and hence every later block of the
+    chain.  Moving this decomposition onto the device is therefore a change to
+    the numerical path of a physics quantity, not a dispatch-hygiene change, and
+    it is deliberately NOT folded into the scan-canonicalization of the loop
+    around it: the conversion in :func:`build_w_omega_chain` keeps this call on
+    host so the converted chain is BIT-IDENTICAL to the loop it replaced.  The
+    ``p x p`` decomposition is microseconds; what the conversion removes is the
+    ~2100 XLA dispatches and 65 blocking host syncs around it.
+
+    Returns ``(R, Tr)`` as host ``numpy`` ``(p,p)`` complex128: ``R`` feeds the
+    replicated reduced matrix, ``Tr`` is the right factor that turns the block
+    into its orthonormal basis, ``Q = W Tr``."""
     G = 0.5 * (G + G.conj().T)
     lam, Z = np.linalg.eigh(G)
     lam = lam.real
@@ -141,33 +156,8 @@ def _block_orthonormalize(Wblk: jax.Array, sh) -> tuple[jax.Array, np.ndarray]:
     inv_sqrt = np.where(keep, 1.0 / np.sqrt(np.where(keep, lam, 1.0)), 0.0)
     sqrt_lam = np.where(keep, np.sqrt(np.where(keep, lam, 0.0)), 0.0)
     R = (np.diag(sqrt_lam) @ Z.conj().T).astype(np.complex128)      # (p, p)
-    Tr = (Z @ np.diag(inv_sqrt)).astype(np.complex128)             # (p, p) : Q = W Tr
-    Q = jax.lax.with_sharding_constraint(
-        _block_combine(Wblk, jnp.asarray(Tr)), sh.X)
-    return Q, R
-
-
-def _make_apply_S(matvec, data: dict, D_half: jax.Array, sh):
-    """Return ``U -> S U`` for ``S = D^{1/2}(A+B)D^{1/2}`` reusing the matvec.
-
-    ``(A+B) U`` is extracted from the production symplectic matvec VERBATIM:
-    ``H_RPA [U;U] = [(A+B)U; -(A+B)U]`` (X=Y=U), so ``(A+B)U`` is the X-block of
-    one matvec call.  ``D_half`` is the ``(1,c,v,k)`` diagonal ``sqrt(eps_c-eps_v)``
-    (clamped >=0; only unphysical/pad slots clamp, and their seed weight is 0)."""
-    args = (
-        data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
-        data["eps_c"], data["eps_v"], data["W_R"], data["V_q0"],
-        data["M_X"], data["M_Y"],
-    )
-
-    def apply_S(U: jax.Array) -> jax.Array:
-        u = jax.lax.with_sharding_constraint(D_half * U, sh.X)          # (p,c,v,k)
-        uu = jax.lax.with_sharding_constraint(
-            jnp.stack([u, u], axis=0).astype(jnp.complex128), sh.X_full)  # (2,p,c,v,k)
-        w = matvec(uu, *args)[0]                                        # (A+B)u
-        return jax.lax.with_sharding_constraint(D_half * w, sh.X)
-
-    return apply_S
+    Tr = (Z @ np.diag(inv_sqrt)).astype(np.complex128)              # (p, p) : Q = W Tr
+    return R, Tr
 
 
 def _seed_block(cols, data: dict, gen, sh):
@@ -194,6 +184,168 @@ def _seed_block(cols, data: dict, gen, sh):
     return f  # (p, c, v, k)
 
 
+# --- the compiled chain step, cached per operator signature -----------------
+#
+# ONE Python loop trip per chain step, ONE XLA program per trip, ONE host sync
+# per trip.  Everything that used to be eager glue between the jitted leaves —
+# the S application, the three-term recurrence, the whole DGKS double loop, and
+# the Gram of the next block-QR — lives inside :func:`_get_chain_step`'s single
+# ``jax.jit``.
+#
+# The cache is keyed on the operator STRUCTURE (``id(matvec)``, the mesh, the
+# chain geometry, the block shape/dtype) and NOT on the per-q data: ``D_half``
+# and the matvec operands are RUNTIME ARGUMENTS, so a whole finite-q sweep
+# reuses one executable and every q after the first is dispatch-only.  That is
+# the same contract, and the same reasoning, as
+# ``bse_w_exact._get_block_gmres_solver`` — see its docstring for the ~4.8 s
+# per-q recompile that a top-level (uncached) construct cost there.  The cache
+# boundary is load-bearing, not decoration: an uncached scan re-traces per call
+# and measured 3.4x SLOWER than the Python loop it replaced
+# (PATTERN_scan_canonicalization).
+#
+# The step is NOT a ``lax.scan`` over the 32 chain steps, and that is a
+# deliberate, documented stop.  A scan body must be pure JAX, which would force
+# the ``p x p`` Hermitian eigendecomposition in :func:`_host_qr_factors` onto
+# the device backend and change the numerical path of a physics quantity.  The
+# scan that matters is the one INSIDE the step: the DGKS reorthogonalization,
+# which is where 2112 of the old form's 2306 dispatches were.
+#
+# WHY THIS IS NOT BIT-IDENTICAL TO THE EAGER FORM, AND WHY THAT IS ALLOWED.
+# Collapsing N programs into one hands XLA a fusion opportunity the eager form
+# never had.  Where a subtract feeds a dot, the fused kernel computes that
+# reduction itself instead of handing a materialized buffer to a library GEMM
+# with a fixed accumulation order, and it is free to contract multiply+add into
+# FMA; either changes the last bit, and this file does not separate them
+# because the observable is the same.  MEASURED on the MoS2 6x6 deck
+# (N_mu=1496, nk=36, p=6): ONE DGKS sweep differs by exactly 1 ulp (max_rel
+# 1.368e-16 = 2^-53), which 32 block-Lanczos steps amplify to max_rel 1.2e-10
+# in ``V_stack`` and 6.4e-11 in ``beta``.  Measured individually, the combine,
+# the combine-then-scale, the INLINED matvec and a bare Gram are each
+# bit-identical; only a dot fed by a subtract is not.  A trace-time-UNROLLED
+# loop drifts identically to the ``lax.fori_loop``, so the loop construct is
+# innocent -- it is fusion, not iteration.
+#
+# An earlier revision pinned the arithmetic exactly with a
+# ``lax.optimization_barrier`` at every point the eager form had an XLA program
+# boundary.  It worked: the A/B came back bit-identical on every array.  It also
+# cost 1.52x of the achievable speed, because those barriers block the same
+# fusion that makes the DGKS sweep cheap -- MEASURED, MoS2 6x6 at P=4, warm
+# chain build: 1.756 s barriered against 1.142 s not.  The owner ruled on
+# 2026-08-08 that 1.2e-10 is tolerable here, so the pins are gone and the gate
+# moved with them: ``tests/test_bse_w_omega_chain_scan.py`` now compares against
+# the eager reference at ``rel <= 1e-9`` (roughly 8x headroom over the measured
+# drift) instead of ``np.array_equal``, so a real regression is still caught.
+#
+# What did NOT change is the ``p x p`` eigendecomposition, which stays on HOST
+# (:func:`_host_qr_factors`).  That is a different question from fusion
+# reassociation -- a different LAPACK-vs-cuSOLVER algorithm applied to the
+# eigenvectors that feed every later chain block -- and it has not been ruled
+# on.
+_CHAIN_STEP_CACHE: dict[tuple, tuple] = {}
+
+
+def _chain_step_key(matvec, sh, m, p, reorth_passes, x_shape, x_dtype) -> tuple:
+    """Hashable identity of a compiled chain step.
+
+    Mesh IDENTITY (axis names, extents, device ids), not just shape: two meshes
+    of the same geometry over different devices lower to different programs, and
+    a shape-only key would alias them into each other's executable.  ``sh`` and
+    ``matvec`` are retained alongside the entry (see :data:`_CHAIN_STEP_CACHE`
+    writes) so neither ``id()`` can be recycled onto a different object while a
+    cached step still names it."""
+    mesh = sh.X.mesh
+    return (id(matvec),
+            tuple(mesh.axis_names),
+            tuple(int(s) for s in mesh.shape.values()),
+            mesh.devices.flat[0].platform,
+            tuple(int(d.id) for d in mesh.devices.flat),
+            int(m), int(p), int(reorth_passes),
+            tuple(int(s) for s in x_shape), str(x_dtype))
+
+
+def _get_chain_step(matvec, sh, *, m, p, reorth_passes, x_shape, x_dtype):
+    """The compiled one-step block-Lanczos program for this signature.
+
+    Signature of the returned ``jax.jit``::
+
+        (V, W_prev, Tr_prev, Q_prev, beta_prev, j, D_half, args)
+            -> (V, Wb, alpha, G, Q_j)
+
+    ``V`` is the fixed-size ``(m,p,c,v,k)`` chain buffer (``sh.X_full``), zero in
+    every slot the chain has not reached yet; ``j`` is a RUNTIME scalar, so the
+    growing DGKS range is a ``lax.fori_loop`` bound rather than a new program per
+    step.  ``Q_j = W_prev Tr_prev`` is the device half of the PREVIOUS step's
+    block-QR, pulled into this program so a step costs one dispatch and not two.
+    ``G = Wb^dag Wb`` is the device half of the NEXT one, returned so the caller
+    can take a single host sync per step for ``(alpha, G)`` together.
+
+    Returns ``(init, step)``.  ``init`` is not cosmetic: ``jax.jit`` keys its
+    trace cache on argument SHARDING as well as shape, and an eagerly built
+    ``with_sharding_constraint`` normalizes its spec (a trailing ``None`` is
+    dropped) while a jit OUTPUT keeps the full-length one.  Seeding the loop
+    with eager arrays therefore gave step j=0 a different signature from steps
+    1..m-1 and the step program was traced TWICE per chain (MEASURED, and the
+    reason ``test_bse_w_omega_chain_scan`` asserts exactly one).  Building the
+    initial carry inside a jit of its own makes the first call's operands come
+    from the same place every later call's do."""
+    key = _chain_step_key(matvec, sh, m, p, reorth_passes, x_shape, x_dtype)
+    hit = _CHAIN_STEP_CACHE.get(key)
+    if hit is not None:
+        return hit[-2], hit[-1]
+
+    @jax.jit
+    def _init(B0):
+        """Initial ``(V, W_prev, Q_prev)`` carry, in the step's own shardings."""
+        V = jax.lax.with_sharding_constraint(
+            jnp.zeros((m,) + B0.shape, dtype=B0.dtype), sh.X_full)
+        W_prev = jax.lax.with_sharding_constraint(B0, sh.X)
+        Q_prev = jax.lax.with_sharding_constraint(jnp.zeros_like(B0), sh.X)
+        return V, W_prev, Q_prev
+
+    @jax.jit
+    def _step(V, W_prev, Tr_prev, Q_prev, beta_prev, j, D_half, args):
+        # (1) finish the previous block-QR on device: Q_j = W_prev Tr_prev.
+        Qj = jax.lax.with_sharding_constraint(
+            _block_combine(W_prev, Tr_prev), sh.X)
+        # (2) park Q_j in the chain buffer.  DGKS below reads V[0..j], which is
+        #     exactly the stored basis Q_0 .. Q_j the growing Python list held.
+        V = jax.lax.with_sharding_constraint(
+            jax.lax.dynamic_update_index_in_dim(V, Qj, j, 0), sh.X_full)
+        # (3) Wb = S Q_j, through the production matvec VERBATIM:
+        #     H_RPA [u;u] = [(A+B)u; -(A+B)u], so (A+B)u is the X-block.
+        u = jax.lax.with_sharding_constraint(D_half * Qj, sh.X)
+        uu = jax.lax.with_sharding_constraint(
+            jnp.stack([u, u], axis=0).astype(jnp.complex128), sh.X_full)
+        w = matvec(uu, *args)[0]
+        Wb = jax.lax.with_sharding_constraint(D_half * w, sh.X)
+        # (4) the three-term recurrence, spelled exactly as the eager form did.
+        alpha = _block_gram(Qj, Wb)                             # (p,p) Hermitian
+        Wb = Wb - _block_combine(Qj, alpha) - _block_combine(
+            Q_prev, beta_prev.conj().T)
+
+        # (5) full (DGKS) reorthogonalization against all stored blocks.  The
+        #     unfilled slots of V are exactly zero, so the loop could run to m
+        #     with the same VALUES; it runs to j+1 instead to keep the work
+        #     triangular, which is what the growing Python list did.
+        def _dgks(i, W_cur):
+            Qi = jax.lax.with_sharding_constraint(
+                jax.lax.dynamic_index_in_dim(V, i, axis=0, keepdims=False), sh.X)
+            return W_cur - _block_combine(Qi, _block_gram(Qi, W_cur))
+
+        for _ in range(int(reorth_passes)):
+            Wb = jax.lax.fori_loop(0, j + 1, _dgks, Wb)
+        Wb = jax.lax.with_sharding_constraint(Wb, sh.X)
+        # (6) device half of the NEXT block-QR — returned with alpha so the
+        #     caller takes ONE host sync per step instead of two.
+        G = _block_gram(Wb, Wb)
+        return V, Wb, alpha, G, Qj
+
+    # Retain matvec and sh: the key names them by id(), and an entry that did
+    # not hold them alive could be handed a recycled id (bse_w_exact:285-288).
+    _CHAIN_STEP_CACHE[key] = (matvec, sh, _init, _step)
+    return _init, _step
+
+
 def build_w_omega_chain(data, matvec, gen, sh, cols, chain_len,
                         *, reorth_passes=2):
     """Build ONE structure-preserving block-Lanczos chain for the probe ``cols``.
@@ -215,9 +367,21 @@ def build_w_omega_chain(data, matvec, gen, sh, cols, chain_len,
     The evaluator (:func:`eval_w_omega_chain`) may request any ``m_use <= m`` by
     slicing — build once at the largest length and read the convergence sweep off
     the truncations for free.
-    """
+
+    Shape of the loop (BSE_CODE_SURVEY R1).  Each chain step is ONE dispatch of
+    the cached program from :func:`_get_chain_step` and ONE host sync; the chain
+    basis lives in a preallocated ``(m,p,c,v,k)`` buffer that the step writes
+    with ``dynamic_update_index_in_dim`` instead of a growing Python list, and
+    the DGKS double loop is a ``lax.fori_loop`` over that buffer inside the
+    program.  It agrees with the eager form it replaced to ``rel <= 1.2e-10``
+    (measured; the block comment above :data:`_CHAIN_STEP_CACHE` says where that
+    comes from and what was traded for it), and the buffer is preallocated
+    rather than stacked at the end because the old form held ``m+1`` separate
+    blocks AND their stack alive at once, so this is a lower peak, not a new
+    one."""
     cols = np.asarray(cols, dtype=int)
     p = len(cols)
+    m = int(chain_len)
 
     eps_c = data["eps_c"]
     eps_v = data["eps_v"]
@@ -227,43 +391,54 @@ def build_w_omega_chain(data, matvec, gen, sh, cols, chain_len,
     D_half = jax.lax.with_sharding_constraint(
         jnp.sqrt(jnp.clip(delta_E.real, 0.0, None)).astype(jnp.complex128), sh.X)
 
-    apply_S = _make_apply_S(matvec, data, D_half, sh)
+    # The matvec operands ride as RUNTIME ARGUMENTS of the compiled step (not
+    # closed over), so the cached executable is reused across q and omega.
+    args = (
+        data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
+        data["eps_c"], data["eps_v"], data["W_R"], data["V_q0"],
+        data["M_X"], data["M_Y"],
+    )
 
     B0 = _seed_block(cols, data, gen, sh)                       # (p,c,v,k)
     B0 = jax.lax.with_sharding_constraint(D_half * B0, sh.X)
-    Q0, R0 = _block_orthonormalize(B0, sh)
 
-    Qs = [Q0]
+    init, step = _get_chain_step(matvec, sh, m=m, p=p,
+                                 reorth_passes=reorth_passes,
+                                 x_shape=B0.shape, x_dtype=B0.dtype)
+
+    # Seed block-QR.  Its device half (Q_0 = B0 Tr_0) is done by step j=0, so
+    # the prologue is one Gram and one host sync.
+    R0, Tr = _host_qr_factors(np.asarray(jax.device_get(_block_gram(B0, B0))))
+
+    V, W_prev, Q_prev = init(B0)
+    Tr_prev = jnp.asarray(Tr)
+    beta_prev = jnp.zeros((p, p), dtype=jnp.complex128)
     alphas: list[np.ndarray] = []
     betas: list[np.ndarray] = []
-    zero_pp = jnp.zeros((p, p), dtype=jnp.complex128)
-    Qprev = jax.lax.with_sharding_constraint(jnp.zeros_like(Q0), sh.X)
-    beta_prev = zero_pp
 
-    for j in range(chain_len):
-        Wb = apply_S(Qs[j])
-        alpha = _block_gram(Qs[j], Wb)                          # (p,p) Hermitian
-        Wb = Wb - _block_combine(Qs[j], alpha) - _block_combine(Qprev, beta_prev.conj().T)
-        # Full (DGKS) reorthogonalization against all stored blocks.
-        for _ in range(int(reorth_passes)):
-            for Qi in Qs:
-                Wb = Wb - _block_combine(Qi, _block_gram(Qi, Wb))
-        Wb = jax.lax.with_sharding_constraint(Wb, sh.X)
-        Qn, beta = _block_orthonormalize(Wb, sh)
-        alphas.append(np.asarray(jax.device_get(alpha)))
+    for j in range(m):
+        V, W_prev, alpha, G, Q_prev = step(
+            V, W_prev, Tr_prev, Q_prev, beta_prev,
+            np.int32(j), D_half, args)
+        # ONE blocking host sync per step (was two: alpha, then the Gram
+        # inside _block_orthonormalize).
+        alpha_h, G_h = jax.device_get((alpha, G))
+        beta, Tr = _host_qr_factors(np.asarray(G_h))
+        alphas.append(np.asarray(alpha_h))
         betas.append(beta)
+        Tr_prev = jnp.asarray(Tr)
         beta_prev = jnp.asarray(beta)
-        Qprev = Qs[j]
-        Qs.append(Qn)
 
-    m = chain_len
-    V_stack = jax.lax.with_sharding_constraint(
-        jnp.stack(Qs[:m], axis=0), sh.X_full)                   # (m,p,c,v,k)
+    # V already holds Q_0 .. Q_{m-1} with the sh.X_full spec; the terminal
+    # jnp.stack of the old form is gone with the list it stacked.  Q_m is never
+    # formed (the old form built it and then dropped it) — only its block-QR
+    # factor beta[m-1], the residual estimate, is kept, and that comes off the
+    # host factorization above without touching the device.
     return {
         "alpha": np.stack(alphas, axis=0),                      # (m,p,p)
         "beta": np.stack(betas, axis=0),                        # (m,p,p)
         "R0": np.asarray(R0),                                   # (p,p)
-        "V_stack": V_stack,
+        "V_stack": V,
         "D_half": D_half,
         "cols": cols,
         "m": m,
