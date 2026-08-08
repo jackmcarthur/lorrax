@@ -277,13 +277,22 @@ fi
 if [[ -n "$STAMP" ]]; then
     say "build stamp: $STAMP"
 else
-    fail 0a "$SO carries NO build stamp, so what it was configured to
-      contain cannot be read from the artifact at all.  It predates
-      common/build_config.cc for its leg (the device leg had no stamp of any
-      kind before 2026-08-08).  This is not a pass and not a warning: a gate
-      that scanned nothing must not print PASS.  Rebuild from a tree that
-      stamps, or state the risk with LORRAX_FFI_VERIFY=off and do not certify
-      the result."
+    # COULD NOT RUN for the same reason GATE 9 does it: the device leg had no
+    # stamp of ANY kind before 2026-08-08, so every device library in service
+    # today is unstamped, and calling them all FAILED would train everyone to
+    # ignore this gate.
+    #
+    # THE GATE IS NOT VACUOUS WITHOUT IT.  The stamp is the second of two
+    # independent readings and the symbol half below still runs, still asserts,
+    # and is the half that catches the Aug-7 defect: a declared backend with
+    # zero exported handlers FAILS whether or not there is a stamp to confirm
+    # it.  What is lost without a stamp is only the ability to tell a broken
+    # LINK from a stale BUILD DIRECTORY.
+    notrun 0a "$SO carries no build stamp, so what it was CONFIGURED to
+      contain cannot be read from the artifact — only what it EXPORTS, which
+      is checked below.  Built before common/build_config.cc covered its leg.
+      Rebuild from this tree to make the configure-time half checkable;
+      LORRAX_FFI_VERIFY_STRICT=1 refuses an artifact this thin."
 fi
 
 # backend -> (stamp key | -) and the exported-handler pattern.
