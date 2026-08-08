@@ -1388,12 +1388,21 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	# the reciprocity at 5.7e-3 (armA_base480, 2026-08-07) -- and a q=0
 	# check could not have seen it either way, because -0 == 0 makes the
 	# condition collapse to "V[0] is real", which holds at 3.7e-16.
-	# Tolerance: ζ, V's only input, satisfies the same relation at 4.7e-16
-	# across all 64 q (measured), and the assembly on top of it is
-	# analytic -- no quadrature -- so the honest floor here is round-off.
-	# 1e-8 is seven orders above that and five below the present break.
+	# V is the BARE Coulomb: static and analytic, no frequency dependence
+	# anywhere, so the dynamical/Kramers-Kronig caveat that applies to a
+	# real-axis W does not apply here at all.  Reciprocity is simply true.
+	# TOLERANCE from the MEASURED floor, not from eps: these tiles span
+	# |A| in [2.6, 4.7e6] and the residual is set by cancellation among
+	# large intermediates, not by eps*max|A| (= 1.0e-9 here).  The
+	# empirical floor is the orbit-closed IBZ arm, where the unfold
+	# builds V_{-q} from V_q by symmetry so reciprocity holds BY
+	# CONSTRUCTION: MEASURED 1.16e-7 (armB_orbit504, 2026-08-07), with
+	# the per-element relative residual falling as |A| rises, which is
+	# the round-off signature.  The DIRECT arm instead sits at 1.5e-3
+	# per-element relative and FLAT in |A| -- systematic, not round-off.
+	# 1e-5 is ~90x above the floor and ~400x below that break.
 	sanity.check_q_conjugate_reciprocity(
-		"V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-8,
+		"V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
 		print_fn=print_fn)
 	sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
 	return V_qmunu, G0
