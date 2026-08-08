@@ -16,8 +16,11 @@ refusal that keeps the walk 1-D sharded on the row axis.  The FIT is
 ``sampling`` + ``pade_fit`` + ``diagnostics``: the double-parallel
 sample grid, the normalised Padé-in-z² solve with its four ordered
 guards, and the conditioning/held-out/perturbation harness.  The
-DRIVER is ``fit_driver``: the loop that reads a block, fits it, writes
-it, and finalizes — the only module here that touches all of the above.
+SAMPLING OBJECT is ``sample_plan`` and the EVALUATOR that consumes it
+is ``evaluator``: where W is asked for, and how it is computed there.
+The DRIVER is ``fit_driver``: the loop that reads a block, fits it,
+writes it, and finalizes — the only module here that touches all of
+the above.
 
 Contents
 --------
@@ -25,6 +28,20 @@ Contents
     The double-parallel sample-grid constructor (two horizontal lines
     in the complex-frequency plane, semi-homogeneous powers-of-two real
     partition, nested in ``n_p``).
+``sample_plan``
+    The sampling object: the 2×2 table of analytic characters
+    (static / imaginary / real / strip) as data, the per-point route
+    that follows from it, and the plans — COHSEX, GN-PPM, MPA — that
+    are its instances.  Pure float algebra; no jax, no physics, no
+    bands, which is the property ``DESIGN_minimax.md`` R4 asks it to
+    have so it can move into the minimax service unchanged.
+``evaluator``
+    The complex-frequency W evaluator: the exact kernel
+    ``K_z(Δ) = −2∫₀^∞ dt e^{izt} sin(Δt)`` in closed form (the
+    oracle) and as a positive composite Gauss-Legendre rule (the
+    fallback correctness path that generalises to the damped-τ
+    sweep), plus the adapters onto the three shipped families and the
+    stage's cost report.
 ``pade_fit``
     The fit kernel itself: normalised Padé-in-z² linear solve with
     z_max scaling, companion-matrix roots, all-2·n_p-point complex
