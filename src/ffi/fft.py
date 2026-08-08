@@ -7,10 +7,16 @@ SAME target strings under different C++ symbols
 (``ffi_loader.py:99-107`` CUDA vs ``:140-142`` host — the phdf5
 same-target/different-symbol split):
 
-    cpu   liblorrax_ffi_host.so   MKL FFT via the DFTI *descriptor* API
+    cpu   liblorrax_ffi_host.so   the FFTW3 ABI (``fftw_plan_many_dft``, the
+                                  advanced-layout planner) in
                                   (``src/ffi/cpp/mklfft/fft_flat_k_ffi.cc``) —
                                   a genuine O(N log N) FFT at any k-count;
-                                  NOT a DFT-as-matmul (owner-vetoed).
+                                  NOT a DFT-as-matmul (owner-vetoed).  The
+                                  directory is still named ``mklfft`` for the
+                                  DFTI implementation it USED to hold; the
+                                  DFTI calls were deleted 2026-08-05 and the
+                                  library is now bound by ``dlsym`` over a
+                                  candidate ladder (``LORRAX_FFTW3_SO``).
     CUDA  liblorrax_ffi.so        cuFFT with the ADVANCED DATA LAYOUT
                                   (``src/ffi/cpp/cufft/fft_flat_k_cuda_ffi.cc``):
                                   ``cufftPlanMany64`` inembed/istride=T/idist=1,
@@ -111,18 +117,30 @@ GATE = Gate(
         "FFT path (the native-JAX duplicate inside "
         "common.fft_helpers.make_flat_k_fft) was DELETED under the "
         "FFI-required ruling (docs/architecture/decisions.md, 2026-08-01) — "
-        "the certified backend is the platform FFI handler (MKL DFTI on "
-        "cpu, cuFFT strided on CUDA).  Unset LORRAX_FFT_FFI, or recover the "
+        "the certified backend is the platform FFI handler (the FFTW3 ABI "
+        "on cpu, cuFFT strided on CUDA).  Unset LORRAX_FFT_FFI, or recover the "
         "XLA arm from git history for a debugging build.  BSE and the "
         "shard_map-interior local_*fftn3 aliases are unaffected (they never "
         "had an FFI route)."),
-    label={"cpu": "MKL FFT (DFTI API) host",
+    # NOTE the platform names below are ABIs, not products.  The host handler
+    # calls the FFTW3 ABI (`fftw_plan_many_dft` ×4 in
+    # cpp/mklfft/fft_flat_k_ffi.cc; zero `DftiCreateDescriptor` since
+    # 2026-08-05) and binds it by dlsym against whatever the process links —
+    # cray-fftw, a system FFTW3, or MKL's FFTW3 wrappers via `libmkl_rt.so`.
+    # These strings said "MKL FFT (DFTI API)" for the five days after the
+    # DFTI code was deleted, so every CPU startup block named an engine the
+    # translation unit no longer contained.  Name the ABI; let
+    # LORRAX_FFT_FFI_LOG name the library.
+    label={"cpu": "FFTW3-ABI host",
            "CUDA": "cuFFT strided CUDA"},
     resolved_msg={
-        "cpu": ("[fft_ffi] flat-k 3-D FFTs -> MKL FFT (DFTI API) host "
-                "FFI handler ({target}): O(N log N) FFT reading the "
-                "dot-layout tile in place via stride descriptors — no "
-                "XLA layout transposes."),
+        "cpu": ("[fft_ffi] flat-k 3-D FFTs -> FFTW3-ABI host FFI handler "
+                "({target}): O(N log N) FFT reading the dot-layout tile "
+                "in place via advanced-layout plans — no XLA layout "
+                "transposes.  WHICH library answers is resolved at run "
+                "time by dlsym over the candidate ladder (see "
+                "LORRAX_FFTW3_SO and docs/architecture/ffi_layout.md §3), "
+                "and is NOT stated by this line."),
         "CUDA": ("[fft_ffi] flat-k 3-D FFTs -> cuFFT strided CUDA FFI "
                  "handler ({target}): cufftPlanMany64 advanced layout "
                  "(istride=T, idist=1 — the stride-descriptor analog) "
@@ -132,7 +150,7 @@ GATE = Gate(
     refuse_platform_msg=(
         "LORRAX_FFT_FFI: the required FFI flat-k FFT backend cannot serve "
         "this mesh — its devices are '{platform}', and backends exist for "
-        "cpu (MKL FFT via the DFTI API) and CUDA (cuFFT strided) only."),
+        "cpu (the FFTW3 ABI) and CUDA (cuFFT strided) only."),
     refuse_probe_msg=(
         "The required {label} backend is unavailable: FFI target "
         "'{target}' is unusable on platform '{platform}': {reason}  The "
@@ -260,7 +278,7 @@ def make_flat_k_fft_ffi(
 ) -> Callable:
     """FFI-backed flat-k FFT: ``(nk, *trail) -> (nk, *trail)``, same contract
     as ``fft_helpers.make_flat_k_fft`` — one batched strided FFT per rank
-    over the local shard (MKL DFTI on cpu, cuFFT advanced layout on CUDA),
+    over the local shard (the FFTW3 ABI on cpu, cuFFT advanced layout on CUDA),
     k-major layout end to end (never reshaped to the 3-D k-minor form, which
     is the whole point).
 
@@ -330,8 +348,8 @@ def make_gw_conv_ffi(
     norm: str | None = 'ortho',
     mult: float = 1.0,
 ) -> Callable:
-    """FUSED flat-k convolution — the second FFI entry point (MKL DFTI on
-    cpu, cuFFT + fused multiply kernel on CUDA).
+    """FUSED flat-k convolution — the second FFI entry point (the FFTW3 ABI
+    on cpu, cuFFT + fused multiply kernel on CUDA).
 
     Returns ``fn(G_flat, W_flat) -> sigma_flat`` computing, value-identically
     to the decomposed helper sequence (~1e-15 rel; gated, not bit-exact)::
