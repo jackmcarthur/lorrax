@@ -41,11 +41,35 @@ from harness import (          # noqa: E402
 CASE_DIR = REG / "si_bse_debug"
 INPUT_NAME = "bse_si_test.in"
 
-# Solver settings are part of the pinned configuration: the Lanczos
-# spectrum is only converged over a window of iteration counts, so the
-# count is fixed here rather than left to a default.
+# Solver settings are part of the pinned configuration, and the iteration
+# count is pinned at 400 rather than at the 200 this gate shipped with.
+#
+# WHY 400, MEASURED (2026-08-08, the re-cut wave).  The deck's exact
+# 1024-dimension spectrum was regenerated on this tree by materialising the
+# production matvec column by column and diagonalising it, on the SAME
+# GW-regenerated payload and the SAME 1x1 mesh this gate runs.  Scored
+# against that ground truth:
+#
+#     budget   worst-level error   true lowest-20 levels MISSED
+#      200     1.629e-03 eV        2  (levels 2 and 20)
+#      400     4.816e-09 eV        0
+#
+# At 200 the returned twenty ARE NOT THE TRUE LOWEST TWENTY: two true levels
+# are absent and the list silently closes up behind them, which is why the
+# in-order elementwise disagreement at 200 is 66.1 meV.  At 400 every level
+# is present and the worst is 4.8 neV -- the Lanczos spectrum and the exact
+# spectrum agree to all eight decimals this fixture stores.
+#
+# This supersedes the fixture README's earlier claim that the count must not
+# be raised.  That claim was measured in the 8v8c quasiparticle
+# configuration, which this gate does not run; in the 4v4c DFT
+# configuration it is false, and the README now says so.
+#
+# The budget is cheap because CGS2 is the default reorthogonalisation route:
+# 400 iterations at full reorth costs 800 reorth collectives, where MGS
+# would have cost 80,200.
 N_VAL, N_COND, N_OCC = 4, 4, 8
-N_ITER, N_EIG = 200, 20
+N_ITER, N_EIG = 400, 20
 
 # Frozen-reference tolerance: the reference is bit-reproducible across
 # runs, so this only absorbs last-ULP GPU nondeterminism.
