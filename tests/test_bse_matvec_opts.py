@@ -34,7 +34,6 @@ Three things have to hold, and each one is worthless without the others:
 from __future__ import annotations
 
 import os
-import warnings
 
 import numpy as np
 import pytest
@@ -59,9 +58,6 @@ from bse import bse_stack_matvec as SM  # noqa: E402
     ("   ", frozenset()),
     ("yhoist", frozenset({"yhoist"})),
     ("  YHOIST ", frozenset({"yhoist"})),
-    ("krep", frozenset({"krep"})),
-    ("KREP,", frozenset({"krep"})),        # case + trailing comma tolerated
-    ("yhoist,krep", frozenset({"yhoist", "krep"})),
 ])
 def test_matvec_opt_grammar_accepts(monkeypatch, raw, expect):
     monkeypatch.setenv("LORRAX_BSE_MATVEC_OPT", raw)
@@ -70,7 +66,13 @@ def test_matvec_opt_grammar_accepts(monkeypatch, raw, expect):
 
 @pytest.mark.parametrize("raw", ["dense_k", "densek", "densek2", "yhoisted", "densek,fft",
                                  "true", "1", "on", "kreps", "k_rep", "krep krep",
-                                 "yhoist,krep,densek"])
+                                 "yhoist,krep,densek",
+                                 # RED TWIN for the 2026-08-08 removal: `krep`
+                                 # is now an unknown token and must be refused
+                                 # exactly like any other, so a stale launcher
+                                 # that still sets it FAILS LOUDLY instead of
+                                 # running the baseline under the old label.
+                                 "krep", "yhoist,krep", "KREP"])
 def test_matvec_opt_grammar_refuses(monkeypatch, raw):
     """A token that is not an option must RAISE, never degrade to baseline."""
     monkeypatch.setenv("LORRAX_BSE_MATVEC_OPT", raw)
@@ -140,82 +142,3 @@ def test_dial_preserves_the_operator(bse_dense_state, monkeypatch, opt, tol,
                 arr["M_X"], arr["M_Y"]))
         assert np.array_equal(base, HXs), \
             "yhoist changed a bit — it is supposed to move only collectives"
-
-
-# ---------------------------------------------------------------------------
-# 4. `krep` is HONEST about the routes that ignore it
-# ---------------------------------------------------------------------------
-#
-# The grammar above refuses a token it cannot parse, because a dial that
-# degrades to the baseline under a typo makes every A/B built on it void.
-# `krep` had that same hole one level up, where the grammar cannot see it: it
-# parses, it is resolved by `bse_lanczos.solve_bse_sharded` -- and then only
-# the `block_size > 1` branch applies it.  On the shipped `--lanczos` route
-# (`bs == 1`) the token does nothing, so a leg labelled `krep` there IS the
-# baseline.  It has already produced one published measurement that way
-# (KERNEL_DEEPDIVE.md 5.7: krylov_run 1.967 s vs a 1.882 s baseline, with all
-# 20 100 reorth all-reduces still in the trace).
-
-
-def test_krep_inert_route_warns(monkeypatch, capsys):
-    """RED TWIN: `krep` on a route that ignores it must SAY SO, both ways."""
-    monkeypatch.setenv("LORRAX_BSE_MATVEC_OPT", "krep")
-    with pytest.warns(RuntimeWarning, match="IGNORED"):
-        msg = SM.warn_if_krep_inert(False, "unit-test-caller",
-                                    "block_size=1 on this route")
-    assert msg and "krep" in msg
-    assert "unit-test-caller" in msg and "block_size=1" in msg
-    # ...and loudly enough to survive a job log nobody is watching live.
-    assert "IGNORED" in capsys.readouterr().out
-
-
-def test_krep_warns_when_combined_with_an_honoured_token(monkeypatch):
-    """`yhoist,krep` at bs=1 must warn about krep and NOT refuse the pair.
-
-    This is the case that rules out a hard refusal: `yhoist` is honoured on
-    this route and only `krep` is not, so refusing would reject a legitimate
-    run.
-    """
-    monkeypatch.setenv("LORRAX_BSE_MATVEC_OPT", "yhoist,krep")
-    assert SM.matvec_opts() == frozenset({"yhoist", "krep"})   # no refusal
-    with pytest.warns(RuntimeWarning, match="IGNORED"):
-        assert SM.warn_if_krep_inert(False, "caller", "bs=1") is not None
-
-
-def test_krep_honoured_route_is_silent(monkeypatch, capsys):
-    """The control: no noise on the route that DOES apply the constraint."""
-    monkeypatch.setenv("LORRAX_BSE_MATVEC_OPT", "krep")
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")            # any warning fails the cell
-        assert SM.warn_if_krep_inert(True, "caller", "bs>1") is None
-    assert capsys.readouterr().out == ""
-
-
-@pytest.mark.parametrize("raw", [None, "", "yhoist"])
-def test_krep_unset_is_silent_even_on_the_inert_route(monkeypatch, raw):
-    """Nobody who did not ask for `krep` should ever hear about it."""
-    if raw is None:
-        monkeypatch.delenv("LORRAX_BSE_MATVEC_OPT", raising=False)
-    else:
-        monkeypatch.setenv("LORRAX_BSE_MATVEC_OPT", raw)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        assert SM.warn_if_krep_inert(False, "caller", "bs=1") is None
-
-
-def test_the_bs1_route_actually_calls_the_announcement():
-    """RED TWIN for the SEAM: the helper is worthless if nobody calls it.
-
-    A source gate rather than a behavioural one, deliberately: driving
-    ``solve_bse_sharded`` needs a loaded restart and a mesh, which is a
-    regression-scale fixture for a one-line wiring question.  The end-to-end
-    proof is a record-deck leg whose log carries the banner — recorded in
-    FIX_smallwins.md.
-    """
-    import inspect
-    from bse import bse_lanczos as BL
-    src = inspect.getsource(BL.solve_bse_sharded)
-    assert "warn_if_krep_inert" in src, (
-        "solve_bse_sharded resolves `krep` but no longer imports the "
-        "announcement that its bs == 1 branch ignores it")
-    assert "_warn_krep(" in src, "the announcement was imported but not called"

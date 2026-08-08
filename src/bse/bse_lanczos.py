@@ -221,7 +221,7 @@ def solve_bse_sharded(
             data, mesh_xy, n_eig=n_eig, include_W=include_W)
 
     # Resolve the reorth dial ONCE here (L1 reads the env; the L2 solver
-    # takes the token) -- same shape as ``krylov_rep`` below.
+    # takes the token) -- resolved in ONE place, like every other dial.
     _reorth = reorth_route()
     sh = make_bse_shardings(mesh_xy)
     nc_pad = int(data["n_cond_pad"])
@@ -546,24 +546,6 @@ def solve_bse_sharded(
         return eigenvalues, eigenvectors, jnp.int32(apps)
 
     rep_eig = NamedSharding(mesh_xy, P())  # eigenvalues / eigenvectors come back replicated.
-    # ``krep``: the Krylov basis sharding, or None to leave it to GSPMD (the
-    # shipped behaviour).  Resolved ONCE here, not per matvec call.
-    from .bse_stack_matvec import matvec_opts as _mv_opts
-    from .bse_stack_matvec import warn_if_krep_inert as _warn_krep
-    krylov_rep = rep_eig if "krep" in _mv_opts() else None
-    # ...and honoured ONLY in the ``bs != 1`` branch of ``_full_run`` below.
-    # The default ``--lanczos`` route is ``bs == 1``: it builds its own
-    # single-vector ``matvec`` and never constrains the flat Krylov axis, so
-    # the token is accepted, resolved, and then quietly does nothing.  Say so.
-    # A leg whose log claims ``krep`` and whose program is the baseline is
-    # exactly the failure the dial's refusal grammar exists to prevent, and it
-    # has already produced one published measurement (KERNEL_DEEPDIVE.md 5.7).
-    _warn_krep(
-        bs != 1, "bse_lanczos.solve_bse_sharded",
-        f"block_size={bs}, so the solve takes the single-vector route "
-        f"(lanczos_eig_jit, or block_lanczos_eig_jit_converged at bs=1), "
-        f"which applies no sharding constraint to the flat Krylov axis")
-
     # The static half of the α-Hermiticity reports the Krylov solve collects
     # (solver name + α form).  Filled at TRACE time by ``_full_run`` below and
     # read back on the host after the call; the numbers themselves come back
@@ -635,16 +617,6 @@ def solve_bse_sharded(
             # vectors at once → ``block_size``-larger GEMMs (better GPU
             # occupancy) and ``block_size``-fewer host dispatches.
             def matvec_block(V_block):
-                # ``krep`` (LORRAX_BSE_MATVEC_OPT): pin the FLAT Krylov axis to
-                # replicated.  Unconstrained it inherits ``sh.X``'s tiling
-                # through the reshape, which puts every reorthogonalisation dot
-                # product, the QR and the Ritz eigh on a sharded axis and turns
-                # each into a collective.  Costs one replicated
-                # (max_iter+1, n_flat, bs) basis per rank — right for a small
-                # pair space, wrong for a large one; see the dial docs.
-                if krylov_rep is not None:
-                    V_block = jax.lax.with_sharding_constraint(V_block,
-                                                               krylov_rep)
                 X = V_block.reshape(shape)
                 X = jax.lax.with_sharding_constraint(X, sh.X)
                 HX = matvec_ring(
@@ -652,8 +624,6 @@ def solve_bse_sharded(
                     eps_c, eps_v, W_R, V_q0, M_X, M_Y,
                 )
                 HX = HX.reshape(bs, -1)
-                if krylov_rep is not None:
-                    HX = jax.lax.with_sharding_constraint(HX, krylov_rep)
                 return HX
             if rtol > 0.0:
                 # Convergence-driven: ``lax.while_loop`` exits when the

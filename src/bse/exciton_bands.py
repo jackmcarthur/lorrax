@@ -176,16 +176,6 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
     n_flat = nc_pad * nv_pad * nk
-    # ``krep`` (LORRAX_BSE_MATVEC_OPT): pin the FLAT Krylov vectors to
-    # replicated.  Without a constraint the (block, n_flat) axis inherits the
-    # tiling of ``sh.X`` through the reshape, so the Lanczos algebra — every
-    # reorthogonalisation dot product, the QR, the Ritz eigh — runs on a
-    # sharded 1024-long axis and each of those becomes a collective.  With it,
-    # exactly one all-gather per matvec and the rest is local.  See the dial's
-    # documentation in bse_stack_matvec for the residency it costs and why
-    # that makes it wrong at large pair dimension.
-    from .bse_stack_matvec import matvec_opts as _mv_opts
-    krylov_rep = (NamedSharding(mesh_xy, P()) if "krep" in _mv_opts() else None)
     if n_reorth is None:
         # FULL reorthogonalisation by default: exciton windows are small
         # (n_flat = nc·nv·nk ~ 10²-10⁴), the Krylov space often saturates
@@ -209,15 +199,11 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                 compute_pair_amplitude(psi_c_Y, psi_v_Y), sh.psi_y)
 
             def matvec_block(Vb):
-                if krylov_rep is not None:
-                    Vb = lax.with_sharding_constraint(Vb, krylov_rep)
                 X = Vb.reshape(block_size, nc_pad, nv_pad, nk)
                 X = lax.with_sharding_constraint(X, sh.X)
                 HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                             eps_c, eps_v, W_R, V, M_X, M_Y)
                 HX = HX.reshape(block_size, -1)
-                if krylov_rep is not None:
-                    HX = lax.with_sharding_constraint(HX, krylov_rep)
                 return HX
 
             evs, _ = block_lanczos_eig_jit(
