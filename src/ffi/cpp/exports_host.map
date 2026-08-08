@@ -1,0 +1,50 @@
+/* exports_host.map — the ENTIRE dynamic surface of liblorrax_ffi_host.so.
+ *
+ * The host twin of exports_cuda.map; read that file first, it carries the
+ * argument.  This one differs in exactly the three patterns below, and the
+ * difference is the point: the two libraries' `nm -D --defined-only` sets
+ * must intersect in NOTHING, so that neither can answer a name on the
+ * other's behalf under RTLD_GLOBAL.
+ *
+ *   *HostFfi                      the XLA FFI handler registration symbols
+ *                                 of this leg.  FROZEN (invariant 1).  The
+ *                                 `Host` infix predates this work -- it is
+ *                                 how the two legs already registered the
+ *                                 SAME jax.ffi target strings under
+ *                                 different C++ symbols -- so the handler
+ *                                 surface was never part of L1.  Matching
+ *                                 `*HostFfi` rather than `*Ffi` means a
+ *                                 handler that forgot the infix does not
+ *                                 quietly get exported here and re-open the
+ *                                 collision.
+ *
+ *   lrx_*_host                    the ctypes lifecycle API.  cpp/phdf5/api.cc
+ *                                 and cpp/slate/context.cc are CUDA-free and
+ *                                 compile into BOTH libraries, so their nine
+ *                                 `extern "C"` entry points used to be
+ *                                 defined twice under one name.
+ *                                 cpp/common/c_abi.h's LRX_C_ENTRY appends
+ *                                 `_host` on this leg; ffi_loader.py binds
+ *                                 the suffixed symbol under the unsuffixed
+ *                                 Python name at load time, so no call site
+ *                                 changed.
+ *
+ *   lorrax_ffi_host_build_config  host-only by construction
+ *                                 (cpp/common/build_config.cc is in
+ *                                 LORRAX_FFI_HOST_SOURCES and nowhere else),
+ *                                 so it collides with nothing.  Kept
+ *                                 exported because it is declared as an API:
+ *                                 today its `scalapack=<0|1>` stamp is read
+ *                                 out of .rodata by test_so_acceptance.py's
+ *                                 check 1, and hiding the symbol would make
+ *                                 the function permanently unreachable for
+ *                                 the runtime report it was written for.
+ */
+{
+  global:
+    *HostFfi;
+    lrx_*_host;
+    lorrax_ffi_host_build_config;
+  local:
+    *;
+};

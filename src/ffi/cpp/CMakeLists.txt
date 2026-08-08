@@ -531,6 +531,27 @@ set_target_properties(lorrax_ffi PROPERTIES
     INSTALL_RPATH "${CUSOLVERMP_LIBDIR};${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64;/lorrax_phdf5/lib;/lorrax_slate/lib;${LORRAX_SLATE_INSTALL_DIR}/lib64"
 )
 
+# ----------------------------------------------------------------------------
+#  EXPORTED SURFACE — the fix for KNOWN_FAILURES L1 (cross-.so ODR).
+#
+#  The two platform libraries are dlopened RTLD_GLOBAL into ONE process, so
+#  every default-visibility symbol they both define is one name with two
+#  definitions behind it and the first-loaded answers for both.  Measured
+#  2026-08-07 on the BUILD_NOTES-pinned pair: 259 shared names, 25 of them
+#  LORRAX's own phdf5 core and lrx_* entry points -- which is how a PhdfCtx*
+#  minted under one build's layout came to be read under the other's.
+#
+#  exports_cuda.map names the whole intended surface and localises the rest.
+#  Read that file for why a version script and not -fvisibility=hidden (short
+#  version: hidden visibility also flips gcc's typeinfo-name marking, which
+#  would break `catch (slate::Exception&)` on exceptions thrown by
+#  libslate.so).  LINK_DEPENDS so editing the map relinks.
+# ----------------------------------------------------------------------------
+target_link_options(lorrax_ffi PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports_cuda.map")
+set_property(TARGET lorrax_ffi APPEND PROPERTY
+    LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exports_cuda.map")
+
 # Third-party headers (XLA FFI + vendor toolkits) as SYSTEM — they are not
 # warning-clean under -Wall -Wextra and are not ours to fix; LORRAX's own
 # sources stay under the full warning set (no blanket -Wno-unused-*).
@@ -1428,6 +1449,18 @@ target_compile_options(lorrax_ffi_host PRIVATE -Wall -Wextra)
 # API) are dlsym'd and deliberately NOT link references, so this flag does
 # not constrain them.
 target_link_options(lorrax_ffi_host PRIVATE "-Wl,--no-undefined")
+
+# ----------------------------------------------------------------------------
+#  EXPORTED SURFACE — the host half of the KNOWN_FAILURES L1 fix.  See the
+#  matching block on the CUDA target above and the header of
+#  exports_host.map; the two maps are written so the libraries' `nm -D
+#  --defined-only` sets intersect in NOTHING, which is what
+#  services/distrib_la/tests/test_so_acceptance.py's check 6 asserts.
+# ----------------------------------------------------------------------------
+target_link_options(lorrax_ffi_host PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports_host.map")
+set_property(TARGET lorrax_ffi_host APPEND PROPERTY
+    LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exports_host.map")
 
 message(STATUS "lorrax_ffi_host will build sources:")
 foreach(_s ${LORRAX_FFI_HOST_SOURCES})

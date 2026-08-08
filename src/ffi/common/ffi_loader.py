@@ -290,8 +290,68 @@ def _locate_so(platform: str) -> Path:
     )
 
 
+# ---------------------------------------------------------------------------
+# THE C ABI IS PER-LIBRARY; THE PYTHON NAME IS NOT.
+# ---------------------------------------------------------------------------
+# ``cpp/phdf5/api.cc`` and ``cpp/slate/context.cc`` are CUDA-free and compile
+# into BOTH platform libraries, so until 2026-08-08 both .so files defined
+# these NINE ``extern "C"`` names.  Both are dlopened RTLD_GLOBAL, which puts
+# one name and two definitions into one process namespace -- the C half of
+# the cross-.so ODR violation KNOWN_FAILURES registered as L1.
+#
+# ``cpp/common/c_abi.h``'s ``LRX_C_ENTRY`` now appends ``_host`` on the host
+# leg, the same per-library renaming the ``*HostFfi`` handlers already used,
+# so ``nm -D --defined-only`` on the two libraries intersects in nothing.
+# Binding the suffixed symbol under the unsuffixed PYTHON name here, once,
+# keeps that a build-level fact: no call site in this module, in
+# ``distrib_la.loader``, in ``file_io._slab_io_ffi`` or in the bench scripts
+# has to know which leg it is talking to.
+_SHARED_C_ENTRY_POINTS = (
+    "lrx_phdf5_open",
+    "lrx_phdf5_close",
+    "lrx_phdf5_init_mpi",
+    "lrx_phdf5_ensure_dataset",
+    "lrx_phdf5_open_dataset_ro",
+    "lrx_slate_context_create",
+    "lrx_slate_subrow_context_create",
+    "lrx_slate_context_destroy",
+    "lrx_slate_init_mpi",
+)
+
+#: platform -> the suffix ``LRX_C_ENTRY`` appends on that leg.
+_C_ABI_SUFFIX = {"CUDA": "", "cpu": "_host"}
+
+
+def _bind_c_abi(lib: ctypes.CDLL, platform: str) -> None:
+    """Bind this leg's suffixed C entry points under their plain names.
+
+    A NO-OP ON A PRE-2026-08-08 LIBRARY, ON PURPOSE.  An older host .so
+    exports the unsuffixed names, ``getattr`` below raises, and every call
+    site then resolves the unsuffixed symbol through ``ctypes.CDLL``'s own
+    ``__getattr__`` exactly as it always did.  Refusing here instead would
+    strand every worktree pinned to the deployed Aug-7 pair over a defect
+    those libraries have had since they were built -- the ratchet belongs
+    on the ARTIFACT, and it is there:
+    ``services/distrib_la/tests/test_so_acceptance.py``'s check 6 fails on
+    any pinned pair that still shares a defined symbol.
+    """
+    suffix = _C_ABI_SUFFIX.get(platform, "")
+    if not suffix:
+        return
+    for base in _SHARED_C_ENTRY_POINTS:
+        try:
+            fn = getattr(lib, base + suffix)
+        except AttributeError:
+            continue
+        # ctypes.CDLL.__getattr__ only fires when normal lookup fails, so an
+        # instance attribute wins from here on -- including for the
+        # ``hasattr`` guards in _declare_phdf5 / _declare_slate below.
+        setattr(lib, base, fn)
+
+
 def _set_argtypes(lib: ctypes.CDLL, platform: str) -> None:
     """Declare argtypes/restype for the lrx_* entry points ``lib`` exports."""
+    _bind_c_abi(lib, platform)
     if platform == "CUDA":
         _declare_cuda_stack(lib)
     # phdf5 lifecycle (CUDA-free) + slate lifecycle (pure MPI) are exported by

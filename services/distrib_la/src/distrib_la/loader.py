@@ -202,6 +202,49 @@ def _locate_so(platform: str) -> Path:
         "Paths searched:\n  " + hints)
 
 
+# ---------------------------------------------------------------------------
+# THE C ABI IS PER-LIBRARY; THE PYTHON NAME IS NOT.
+# ---------------------------------------------------------------------------
+# ``cpp/slate/context.cc`` is pure MPI and compiles into BOTH platform
+# libraries, so until 2026-08-08 both .so files defined these four
+# ``extern "C"`` names (and five more from ``cpp/phdf5/api.cc``, which this
+# package does not call).  Both are dlopened RTLD_GLOBAL, one name with two
+# definitions behind it -- the C half of the cross-.so ODR violation
+# lorrax's tests/KNOWN_FAILURES.md registered as L1.  ``cpp/common/c_abi.h``
+# appends ``_host`` on the host leg; binding it under the plain name here
+# keeps every call site below leg-agnostic.  Mirrors
+# ``ffi.common.ffi_loader._bind_c_abi`` -- the two loaders open the SAME
+# FILES, so both have to know the same naming rule.
+_SLATE_C_ENTRY_POINTS = (
+    "lrx_slate_context_create",
+    "lrx_slate_subrow_context_create",
+    "lrx_slate_context_destroy",
+    "lrx_slate_init_mpi",
+)
+
+#: platform -> the suffix ``LRX_C_ENTRY`` appends on that leg.
+_C_ABI_SUFFIX = {"CUDA": "", "cpu": "_host"}
+
+
+def _bind_c_abi(lib: ctypes.CDLL, platform: str) -> None:
+    """Bind this leg's suffixed C entry points under their plain names.
+
+    A no-op on a pre-2026-08-08 library, on purpose: the unsuffixed symbol
+    is still there and ``ctypes.CDLL.__getattr__`` still finds it.  The
+    ratchet is on the artifact, in ``tests/test_so_acceptance.py``'s
+    check 6, not here -- see ``ffi_loader._bind_c_abi`` for the argument.
+    """
+    suffix = _C_ABI_SUFFIX.get(platform, "")
+    if not suffix:
+        return
+    for base in _SLATE_C_ENTRY_POINTS:
+        try:
+            fn = getattr(lib, base + suffix)
+        except AttributeError:
+            continue
+        setattr(lib, base, fn)
+
+
 def _declare_cusolvermp(lib: ctypes.CDLL) -> None:
     """NCCL + cuSOLVERMp context lifecycle — ``liblorrax_ffi.so`` only.
 
@@ -520,6 +563,7 @@ def get_lib(platform: str) -> ctypes.CDLL:
             f"LD_LIBRARY_PATH and, in a container, that every RPATH "
             f"directory is actually bind-mounted "
             f"(ldd {path} | grep 'not found').") from exc
+    _bind_c_abi(lib, platform)
     _declare_cusolvermp(lib)
     _declare_slate(lib)
     _register_ffi_targets(lib, platform)

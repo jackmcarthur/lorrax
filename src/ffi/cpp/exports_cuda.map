@@ -1,0 +1,68 @@
+/* exports_cuda.map — the ENTIRE dynamic surface of liblorrax_ffi.so.
+ *
+ * A linker version script (ld --version-script).  Everything matched by
+ * `global:` keeps default visibility and appears in `nm -D --defined-only`;
+ * `local: *` makes EVERYTHING ELSE a local symbol, absent from .dynsym.
+ *
+ * WHAT THIS CLOSES — KNOWN_FAILURES L1, the cross-.so one-definition-rule
+ * violation.  liblorrax_ffi.so and liblorrax_ffi_host.so are both dlopened
+ * RTLD_GLOBAL into one process (a CUDA-capable process legitimately does
+ * both: CUDA handlers on the device, host phdf5 reads on the CPU backend).
+ * Before 2026-08-08 they shared 259 defined symbol names, 25 of them
+ * LORRAX's own -- the phdf5 core (`open_ctx`, `close_ctx`, `ensure_dataset`,
+ * `open_dataset_ro`, `ensure_pinned`, `ensure_read_buf`,
+ * `ensure_mpi_initialized`, `PhdfCtx::~PhdfCtx`, the `dt::` HDF5 type
+ * singletons) and the nine `lrx_*` entry points.  ld.so resolves a name to
+ * the FIRST object that defined it, for the whole process, INCLUDING for the
+ * later library's own internal calls -- so a `PhdfCtx*` minted under one
+ * build's layout was read under the other's.
+ *
+ * WHY A VERSION SCRIPT AND NOT -fvisibility=hidden.  They produce the same
+ * .dynsym, but -fvisibility=hidden also changes C++ TYPEINFO semantics: gcc
+ * marks the typeinfo of a non-default-visibility type "private" by prefixing
+ * its name string with '*', and libstdc++'s `type_info::operator==` then
+ * compares POINTERS ONLY (typeinfo:~123, the `__name[0] != '*'` guard).
+ * Both libraries emit their own copies of `slate::Exception`,
+ * `slate::MpiException`, `blas::Error` and friends (measured: they are in
+ * the shared-symbol set), and libslate.so throws them ACROSS the .so
+ * boundary into our handlers.  Today those catches match by strcmp on the
+ * typeinfo name; under -fvisibility=hidden they would stop matching and an
+ * FFI error would become a std::terminate.  A version script relocalises
+ * the same symbols at LINK time without touching what the compiler emitted,
+ * so the exception path is bit-for-bit what it was.  Same dynamic surface,
+ * none of that hazard.
+ *
+ * TWO PATTERNS, AND WHY EACH IS THE WHOLE STORY:
+ *
+ *   *Ffi     the XLA FFI handler registration symbols.  These are FROZEN
+ *            (invariant 1) -- ffi_loader.py's target tables map every
+ *            jax.ffi target string onto one of these names and
+ *            jax.ffi.pycapsule() needs to dlsym it.  The CUDA leg's are
+ *            bare `*Ffi`; the host leg's all carry `Host` before the `Ffi`
+ *            (`exports_host.map` matches `*HostFfi`), which is why the two
+ *            libraries' handler surfaces were ALREADY disjoint and are not
+ *            part of L1.
+ *
+ *   lrx_*    the ctypes lifecycle API (cpp/common/api.cc, cpp/phdf5/api.cc,
+ *            cpp/slate/context.cc).  Python binds these by name through a
+ *            ctypes.CDLL handle, so they cannot be hidden.  The nine that
+ *            the host leg also compiles are renamed `lrx_*_host` there --
+ *            see cpp/common/c_abi.h -- so this pattern and the host one
+ *            still intersect in nothing.
+ *
+ * ANYTHING NEW THAT MUST BE EXPORTED GOES HERE, DELIBERATELY.  The failure
+ * mode of forgetting is loud and already diagnosed: probe_target() reports
+ * "loaded <so> but it does not export <symbol> -- this library was built
+ * WITHOUT the <target> handler", and
+ * services/distrib_la/tests/test_so_acceptance.py's
+ * test_every_host_handler_this_package_claims_is_actually_exported /
+ * test_the_device_library_exports_what_the_cuda_table_claims fail at the
+ * artifact level before anything is called.
+ */
+{
+  global:
+    *Ffi;
+    lrx_*;
+  local:
+    *;
+};

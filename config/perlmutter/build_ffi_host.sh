@@ -492,6 +492,48 @@ fi
 GATE_TAG=build_ffi_host LORRAX_PHDF5_STAGE="$LORRAX_PM_PHDF5_STAGE" \
     "$SRC/gate_one_hdf5.sh" "$SO_FILE" || exit 1
 
+# GATE 9: THE EXPORTED SURFACE IS THE SANCTIONED ONE, AND NOTHING ELSE.
+#
+# This gate is the build-time half of the KNOWN_FAILURES L1 fix (the test-time
+# half is services/distrib_la/tests/test_so_acceptance.py check 6, which
+# INTERSECTS the two libraries; a build script only ever sees one of them, so
+# it checks the property that makes the intersection empty instead).
+#
+# WHAT WENT WRONG.  Both platform .so's are dlopened RTLD_GLOBAL into one
+# process, and ld.so answers a name from the FIRST object that defined it —
+# for the whole process, including for the OTHER library's own internal calls.
+# Measured 2026-08-07 on the pinned pair: 259 defined names in common, 25 of
+# them LORRAX's own.  Among them `lorrax_ffi::phdf5::open_ctx`, whose return
+# type `PhdfCtx` has a DIFFERENT LAYOUT in the two builds (the CUDA
+# stream/event/pinned members compile out here).  One library's handler read
+# the other's struct at the wrong offsets:
+#     offset_base=[0,0,0,4596944070643295330]     <- a float64 read as int64
+#
+# src/ffi/cpp/exports_host.map now localises everything except the three
+# sanctioned patterns.  This gate is what notices the day someone drops the
+# version script from the link line — the symptom otherwise is a wrong number
+# in a mixed process, weeks later.
+echo "[build_ffi_host] GATE 9 (exported surface is the sanctioned one)"
+stray=$(nm -D --defined-only "$SO_FILE" 2>/dev/null | awk '{print $NF}' \
+        | grep -vE 'HostFfi$|^lrx_[a-z0-9_]+_host$|^lorrax_ffi_host_build_config$' \
+        || true)
+if [[ -n "${stray//[[:space:]]/}" ]]; then
+    echo "[build_ffi_host] GATE FAILED (9): the host library exports symbols" >&2
+    echo "[build_ffi_host]   outside its sanctioned surface (*HostFfi handlers," >&2
+    echo "[build_ffi_host]   lrx_*_host ctypes entry points, and the build-config" >&2
+    echo "[build_ffi_host]   stamp).  Anything else can be answered by — or can" >&2
+    echo "[build_ffi_host]   answer for — liblorrax_ffi.so in a process that has" >&2
+    echo "[build_ffi_host]   both open.  Offenders:" >&2
+    printf '%s\n' "$stray" | sed 's/^/    /' >&2
+    echo "[build_ffi_host]   Usual cause: -Wl,--version-script=exports_host.map" >&2
+    echo "[build_ffi_host]   is not on the link line (check CMakeCache.txt and" >&2
+    echo "[build_ffi_host]   src/ffi/cpp/CMakeLists.txt).  If a NEW symbol"       >&2
+    echo "[build_ffi_host]   genuinely has to be exported, add it to that map"    >&2
+    echo "[build_ffi_host]   deliberately — that file is the whole surface."      >&2
+    exit 1
+fi
+echo "[build_ffi_host] GATE 9 PASSED: $(nm -D --defined-only "$SO_FILE" | wc -l) exported symbols, all sanctioned"
+
 # GATE 4: nothing left unresolved at load time.  -Wl,--no-undefined already
 # fails the LINK on a missing link-time symbol; this catches the other half —
 # a NEEDED library that cannot itself be found at run time.

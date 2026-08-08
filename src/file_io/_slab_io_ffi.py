@@ -719,9 +719,23 @@ def _probe_mpi_bootstrap(platform: str) -> tuple[bool, str]:
     if not so:
         return False, (f"no loaded {platform} FFI library to probe MPI init "
                        f"with")
+    # The child is handed a PATH, not a platform, and opens the .so itself —
+    # so it cannot go through ffi_loader._bind_c_abi and has to know the
+    # naming rule.  cpp/common/c_abi.h suffixes the HOST leg's C ABI with
+    # ``_host`` so the two platform libraries share no dynamic symbol
+    # (KNOWN_FAILURES L1); a pre-2026-08-08 .so of either leg has only the
+    # unsuffixed name.  Ask for both, refuse if neither is there — a probe
+    # that silently found no entry point would report "MPI cannot bootstrap"
+    # for a build problem.
     child = ("import ctypes, sys\n"
              "lib = ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)\n"
-             "lib.lrx_phdf5_init_mpi()\n")
+             "for _n in ('lrx_phdf5_init_mpi_host', 'lrx_phdf5_init_mpi'):\n"
+             "    _f = getattr(lib, _n, None)\n"
+             "    if _f is not None:\n"
+             "        _f(); break\n"
+             "else:\n"
+             "    raise SystemExit('no lrx_phdf5_init_mpi entry point in '\n"
+             "                     + sys.argv[1])\n")
     return _mpi_singleton_probe(child, f"MPI_Init_thread ({platform} FFI)",
                                 argv_extra=(so,))
 
