@@ -97,6 +97,24 @@
  * than by hiding -- Python has to dlsym them -- see cpp/common/c_abi.h.
  */
 {
+  global:
+    /* THE TWO EXCEPTIONS, and the reason this file grew a `global:` clause.
+       Until 2026-08-08 the device leg carried no build stamp at all, so
+       cpp/common/build_config.cc was host-only and nothing it defined could
+       match the denylist below.  It is now in LORRAX_FFI_SOURCES too, and its
+       two entry points are named `lorrax_ffi_cuda_*` — which the denylist
+       would take.  An exact name beats a wildcard in a version script.
+
+       Both are declared as APIs and both are read from OUTSIDE this library:
+       the stamp by `strings`/the acceptance tier, the ABI by both Python
+       loaders, at dlopen, before a single handler is declared.  They collide
+       with nothing: the host leg's twins carry `_host`, not `_cuda`, so the
+       two sanctioned surfaces stay disjoint and check 6's intersection stays
+       empty.  Hiding them would not fail anything — it would silently disarm
+       the pairing refusal, which is the failure mode
+       cpp/common/lorrax_ffi_abi.h exists to remove. */
+    lorrax_ffi_cuda_build_config;
+    lorrax_ffi_cuda_abi_version;
   local:
     /* every C++ entity in `namespace lorrax_ffi`, including std:: templates
        instantiated on our types, our function-local statics (`_ZZ...`) and
