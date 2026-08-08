@@ -691,6 +691,23 @@ def test_the_shape_wins_the_argument_about_n_omega(tmpdir_path):
         MS.read_w_header(tmpdir_path, "W_qmunu_omega")
 
 
+def test_a_half_stamped_version_2_file_refuses(tmpdir_path):
+    """RED: the sampling record is half the stamp, and half is not read.
+
+    The rank check settles WHICH format a file is; this settles whether
+    that format's own record is whole.  The attr dropped here is the
+    partition α — the one parameter that differs between insulators and
+    metals while changing nothing about the shapes, so its absence is
+    invisible to every shape check there is.
+    """
+    _write_w(tmpdir_path, n_omega=4)
+    MS.read_w_header(tmpdir_path, "W_qmunu_omega")                 # TWIN
+    with h5py.File(tmpdir_path, "a") as f:
+        del f["W_qmunu_omega"].attrs["mpa_alpha"]
+    with pytest.raises(ValueError, match=r"missing \['mpa_alpha'\]"):
+        MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+
+
 def test_a_tampered_omega_grid_refuses(tmpdir_path):
     """RED: the abscissae are hashed WITH the protocol that made them.
 

@@ -639,6 +639,23 @@ def read_w_header(src, name, *, mode="r"):
                 f"qirr_store.read_tensor for a version-1 tensor, or "
                 f"read_qirr_tensor to dispatch on the version.")
 
+        # THE PARTIAL-STAMP REFUSAL, version 2's half.  The rank check
+        # above settles which format this is; this settles whether the
+        # format's own record is whole.  Named rather than left to a
+        # KeyError deep in the read, because "which attr is missing" is
+        # the question a half-written file raises and a traceback
+        # through ``ds.attrs[...]`` answers it one attr at a time.
+        absent = [a for a in _MPA_OWNED_ATTRS if a not in ds.attrs]
+        if absent:
+            raise ValueError(
+                f"mpa_store: {name!r} is a version "
+                f"{QIRR_FORMAT_VERSION_FREQ} tensor missing {absent}.  "
+                f"A half-stamped file is refused rather than read: the "
+                f"missing half is the sampling protocol, which is what "
+                f"says what the ω values MEAN, and a fit against "
+                f"abscissae nobody can characterise is a fit nobody can "
+                f"reproduce or extend.")
+
         n_omega = int(ds.shape[0])
         stamped_n = int(ds.attrs["mpa_n_omega"])
         if stamped_n != n_omega:
