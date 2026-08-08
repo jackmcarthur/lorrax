@@ -67,6 +67,10 @@ _services.ensure_on_path()
 
 from zeta_loader import (                                        # noqa: E402
 	ZetaLoader, probe_zeta_file, write_g0_mu)
+# The vcoul door, for the ONE thing this module needs from it: the
+# Cartesian reciprocal rows, taken as a geometry rather than written out as
+# ``blat * bvec`` at the V_q call site below.
+from vcoul import CoulombGeometry                                # noqa: E402
 
 
 def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print,
@@ -1103,7 +1107,24 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		os.sync()
 	barrier("zeta_flush")
 
-	bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
+	# The Cartesian reciprocal ROWS come off the vcoul door's geometry, not
+	# from a hand-written product.  ``docs/services/vcoul.md`` says it in as
+	# many words — "Do not multiply ``wfn.blat * wfn.bvec`` at a call site" —
+	# and the reason is the one ``CoulombGeometry``'s own docstring gives: a
+	# product every caller has to remember to take is a footgun, because the
+	# day one of them passes ``wfn.bvec`` alone every number downstream is
+	# off by the lattice constant with no shape error to say so.
+	# ``from_wfn`` is duck-typed on ``blat``/``bvec``/``cell_volume``, all
+	# three of which ``WfnLoader`` binds off the mf_header.
+	#
+	# ONLY ``.bvec`` IS TAKEN.  ``meta.cell_volume`` below stays where it is:
+	# Ω sets the 1/Ω factor on every v(q+G), so swapping its source is a
+	# physics edit, not a plumbing one.  It happens that the two agree
+	# exactly — ``Meta.from_system`` and ``CoulombGeometry.from_wfn`` both
+	# read ``float(wfn.cell_volume)`` off this same loader, measured
+	# bit-identical — but "they agree" is the licence for a later swap, not
+	# a reason to make it in a commit about ``bvec``.
+	bvec = CoulombGeometry.from_wfn(wfn).bvec
 
 	# V_q memory budget (per rank) — informational only.  The live
 	# G-flat V_q path bounds its working set with ``vq_g_chunk_size``
