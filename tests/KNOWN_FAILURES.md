@@ -11,6 +11,103 @@ claim carries the arm in which it comes out FALSE.
 
 ---
 
+# MERGED-HEAD CENSUS — `integration/2026-08-08-services` @ `029da82` (2026-08-07)
+
+**This is the authoritative census for the tree that lands on main.**  All
+five wave-1 service branches are merged, the four owner rulings of
+2026-08-07 are applied, and the wave-1 shims are deleted.  The
+`svc/distrib_la` census below it is kept because every row here is read
+against it.
+
+| | |
+|---|---|
+| machine | Perlmutter, 1 node, 4×A100-SXM4-40GB, Shifter, `lx test` |
+| module | `LX_BASE_MODULE=lorrax_J070`, python 3.12 |
+| tree | `/pscratch/sd/j/jackm/landing/lorrax`, source-tree line read on every leg |
+| `.so` pins | BUILD_NOTES 2026-08-07, unchanged: deployed device `.so`, h200 host `.so` (md5 `4c4422b8…`), `LORRAX_FFTW3_SO` |
+| artifact | `_landing_reports/full.xml` — 395 612 B, **1931 testcases** (not a 38-byte stub) |
+| run | one invocation, `lx test`, step `lx-Xg4-180142-150155-6026`, 242 s |
+
+## The census
+
+| leg | pass | fail | skip | error | total |
+|---|---|---|---|---|---|
+| `tests/` (lorrax monorepo) | 1198 | 2 | 61 | 0 | 1261 |
+| `services/distrib_la` | 127 | 0 | 22 | 0 | 149 |
+| `services/lxkit` | 120 | 0 | 0 | 0 | 120 |
+| `services/symmetry_maps` | 141 | 10 | 14 | 0 | 165 |
+| `services/vcoul` | 33 | 1 | 0 | 0 | 34 |
+| `services/wfn_loader` | 75 | 1 | 15 | 0 | 91 |
+| `services/zeta_loader` | 110 | 0 | 1 | 0 | 111 |
+| **ALL** | **1804** | **14** | **113** | **0** | **1931** |
+
+Each service leg was ALSO run standalone by marker (`lx test -- -m <svc>`)
+and returns the same numbers, so the markers select what they claim:
+distrib_la 149/0F/22S, wfn_loader 91/1F/15S, zeta_loader 111/0F/1S,
+symmetry_maps 165/10F/14S, vcoul 34/1F/0S.  distrib_la's **149** is the
+corrected count — the flagship's `:98` undercounted `-m distrib_la` by 9.
+
+## The headline gates, all GREEN at the merged head
+
+| gate | result | what it means here |
+|---|---|---|
+| `test_si_production_matches_frozen_reference` | **PASS** | the phase-wide blocking gate: Si COHSEX survived all five services |
+| `test_si_production_matches_berkeleygw` | **PASS** | the suite's ONLY external check, still inside |
+| `test_si_fast_matches_frozen_reference` | **PASS** | **NEWLY LIVE** — was a skip until the 2a freeze; it now runs |
+| `test_bse_matches_frozen_and_bgw` | **PASS** | the phase's one EXPECTED red, closed by the 2b adoption |
+| `test_g2_branch_window_tiles_are_frozen` | **PASS** | closed by the 2c Perlmutter re-freeze |
+| `test_gnppm_matches_reference` | **PASS** | on the 2d `zeta_rcond = 1e-10` pin |
+| `test_bispinor_gnppm_matches_reference` | **PASS** | on the 2d pin |
+| `test_ibz_equals_full_bz` | **PASS** | |
+| `test_restart_equals_fresh` | **PASS** | |
+
+## FIXED BY RULING (owner-authorized 2026-08-07, verified at this head)
+
+| was | ruling | verified |
+|---|---|---|
+| `test_bse_matches_frozen_and_bgw` frozen arm — max 7.067e-5 eV, 8/20 cells over the 1e-6 pin | **2b**: adopt the refreeze candidate (md5 `cab1dd48…`) as `bse_eigenvalues_ref.dat`. The vcoul fix 358bb0b reseeds the mini-BZ head MC; on Si the transposed draw is an exact column permutation, so this is a reseed, not a bias. BGW band unchanged within noise (MAE 3.4707 vs 3.4650 meV). `ATOL_FROZEN_EV` was NOT loosened — it is a bit-reproducibility pin | **PASS** in the census above |
+| `test_g2_branch_window_tiles_are_frozen` — shape mismatch, crossing-core ladder (100,) vs (98,) | **P1b/2c**: the reference follows the PERLMUTTER grid; re-frozen there. The Frontera difference is STRUCTURAL (4 shape-mismatched tiles, 2 meta rows differing by exactly 2.0 = the node count), τ-node positions disagree from the first element — two quadratures, not one sampled twice. No tolerance applied, deliberately | **PASS**; red-twin probe confirms the gate can still fail |
+| the five `zeta_rcond`-unpinned frozen decks | **2d**: pin `1e-10` on gnppm / cohsex_ibz / bispinor (byte-identical to the default today, margins 5.2× / 5.2× / **2.05×**); measured-sweep headers on cohsex + minimax_selfcheck (~3983× margin, left exercising the shipping default). `ZETA_RCOND_DEFAULT` unchanged | gnppm + bispinor gates **PASS** |
+| the 20-band fast gate, skipped since it was written | **2a**: freeze `eqp_si_fast_ref.dat` from the named candidate (md5 `d63cb322…`). A skip whose reason said "copy it in to enable this gate" | **PASS**, and it is a self-freeze, never a BGW anchor |
+| P1 cross-machine micro-eV pins | already policy-green at 1e-5 (2026-08-07 ruling); unchanged by this landing | in the 1804 |
+
+## The 14 reds, every one accounted for, NONE new
+
+| tests | class | evidence it is not this landing |
+|---|---|---|
+| `test_bse_setup_qchunk::test_values_are_invariant_to_the_chunk_width` + `::test_chunk_width_ulp_spread_is_reported` | (b) pre-existing, class **P2** below | already characterized and A/B'd at `5bb4368`; the second cell is the first one's instrument and goes red with it |
+| 9 × `services/symmetry_maps/tests/test_symmetry_maps_import_isolation.py` + 1–2 × `test_symmetry_maps_emulated_mesh::test_the_lorentz_mixing_matches_a_dense_numpy_reference` | (b) pre-existing, **cross-service conftest collision** | **A/B'd at the symmetry_maps branch tip `4b35c19`** (pre-merge, pre-shim-deletion, 3 services on disk): the SAME set fails there, `services/` tier, `-n 0`. Set-diff vs this head is EMPTY |
+| `services/vcoul/tests/test_vcoul_import_isolation::test_vcoul_imports_and_computes_with_no_scipy` | (b) pre-existing | **A/B'd at the vcoul branch tip `23f83780`**: fails there too, alone in its tier |
+| `services/wfn_loader/tests/test_wfn_loader_skip_honesty::test_this_gate_did_not_disarm_distrib_las` | (b) pre-existing, ALREADY REGISTERED | the `lxkit._ARMED` process-global collision — POST_WAVE_CLEANUP item 2 ("FIX `_ARMED` to a list — two services arming skip-honesty in one process currently disarm each other"). Also red on WSL at both sides of the shim deletion |
+
+**THE MECHANISM OF THE ISOLATION REDS, since "it is the environment" needs
+the arm where it comes out false.**  Run the file ALONE on the same node
+and all 9 cells PASS (step `lx-Xg4-180628-165870-4541`, 9 passed).  Run the
+`services/` tier and they fail, with or without xdist (`-n 0` reproduces
+it).  The subprocess `import_isolation` spawns dies on
+`RuntimeError: Unable to initialize backend 'cuda': Backend 'cuda' is not
+in the list of known backends: ['cpu', 'tpu']` — a sibling service's
+conftest has put CUDA-flavoured jax state in the process, and the stripped
+isolation subprocess inherits the request without the plugin.  It is the
+same class as the `_ARMED` row above: services' conftests fighting over
+process-global jax/test state.  It is NOT a defect in the isolation claim
+these cells make, and it is NOT caused by the merge — the A/B at
+`4b35c19` is the falsifying arm.
+
+## Shim deletion — the O2 completion criterion
+
+The five wave-1 shims are gone (`file_io/wfn_loader.py`,
+`file_io/zeta_loader.py`, `common/symmetry_maps.py`,
+`centroid/orbit_syms.py`, `common/density_symmetry_check.py`; 278 lines).
+`tests/test_service_path_bootstrap.py` now carries
+`test_the_retired_shim_files_are_gone`,
+`test_src_no_longer_imports_any_retired_shim_path` (scanning `src/` **and**
+`services/`, at every scope) and the red twin
+`test_the_retired_path_scan_can_fail`.  `_SERVICE_DOOR_EXCEPTIONS` lost its
+three symmetry_maps rows and `_SHIM_CONSUMERS` is now `()`.
+
+---
+
 # Perlmutter census — `svc/distrib_la-2026-08-07` @ `d5cac09` (2026-08-07)
 
 **First Perlmutter full-suite census in this tree.**  The Frontera census
@@ -468,7 +565,18 @@ difference between a verified ruling and a vacuous one.
 **Neither reference was re-frozen.**  Re-freezing is the move that created
 this row; the fix is the comparison, not the data.
 
-#### P1b — `test_g2_branch_window_tiles_are_frozen` is NOT a micro-eV row
+#### P1b — `test_g2_branch_window_tiles_are_frozen` is NOT a micro-eV row — **RULED**
+
+> **RULED AND CLOSED, 2026-08-07.**  The owner chose PERLMUTTER as the
+> blessed grid for this reference and it was re-frozen there at the
+> integration head; the gate is **GREEN** in the merged-head census at the
+> top of this file.  The analysis below stands unchanged and is why no
+> tolerance was applied — the disagreement is an integer count of
+> quadrature nodes, not a rounding difference.  What the landing added is
+> the measurement of HOW the two grids differ (4 shape-mismatched tiles,
+> 2 meta rows off by exactly 2.0) and a red-twin probe showing the
+> re-frozen gate can still fail.  A Frontera build will now fail this
+> cell loudly and BY SHAPE, which is the intended outcome.
 
 Filed under P1 by resemblance and it does not belong there.  The
 Perlmutter/Frontera disagreement in this cell is the **crossing-core node
@@ -868,7 +976,16 @@ side: `centroids_frac_960.txt` carries a 2.611 meV star spread at the BGW
 tests that need a non-closed set build one synthetically by dropping a
 centroid from a closed one.
 
-## vcoul physics fix 358bb0b — one EXPECTED red (2026-08-07)
+## vcoul physics fix 358bb0b — one EXPECTED red (2026-08-07) — **CLOSED**
+
+> **CLOSED AT THE LANDING, 2026-08-07.**  The status column below already
+> said RESOLVES AT MERGE, and it did: the owner-authorized refreeze
+> candidate was adopted as `tests/regression/si_bse_debug/bse_eigenvalues_ref.dat`
+> (md5 `09204d36…` → `cab1dd48…`) on `integration/2026-08-08-services`, and
+> `test_bse_matches_frozen_and_bgw` is **GREEN** in the merged-head census
+> at the top of this file.  The row is kept because it is the record of
+> what moved and why a refreeze was the right response rather than a
+> loosened tolerance.  See *FIXED BY RULING*.
 
 | tests | class | evidence | status |
 |---|---|---|---|
