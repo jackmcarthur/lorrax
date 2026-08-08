@@ -311,6 +311,61 @@ def write_chunked_complex_dataset_h5(
 	return abs_path
 
 
+# ===========================================================================
+# WHY sigma_mnk.h5 IS NOT STORED ON THE IBZ — measured 2026-08-08, REFUSED
+# ===========================================================================
+# The Σ cubes look like the ideal candidate for the store-on-IBZ /
+# broadcast-on-read treatment ``kin_ion.h5`` now gets: pure output, one
+# host-side consumer (``gw.eqp_bgw``), no convolution downstream, and half
+# the payload sitting in two ``(n_omega, nk, nb, nb)`` tensors.  They are
+# not, and the reason belongs here rather than being rediscovered.
+#
+# kin_ion IS computed on the IBZ, so its broadcast was write-time padding
+# and moving it to the reader changes nothing.  Σ IS NOT.
+# ``gw.sc_iteration`` says it in one line: "H/E/U on the IBZ, Σ on the full
+# BZ".  Every full-BZ k in these cubes is an INDEPENDENT evaluation, so the
+# k axis carries nk measurements — not nrk measurements and nk−nrk copies.
+# Storing the wedge and rebuilding the rest replaces the other nk−nrk with
+# reconstructions.
+#
+# MEASURED on ``tests/regression/cohsex_debug/sigma_mnk.h5`` (11.029 MB,
+# nk 9, nrk 3 — a 3.00x reduction on this deck, not the 8x a Si 4³/48-op
+# deck would suggest), residual of ``unfold(select(A))`` against ``A``:
+#
+#     dataset                rel Frobenius   worst element
+#     hartree_kij_ev            3.0344e-01      113.08 eV
+#     sigma_c_kij_ev            6.3020e-01        2.20 eV
+#     sigma_sx_kij_ev           3.4971e-01        8.89 eV
+#     sigma_total_kij_ev        3.0649e-01      105.27 eV
+#     sigma_xc_qsgw_kij_ev      1.5653e-01        7.28 eV
+#
+# Those are not round-off.  The star relation is a PROPERTY a run has when
+# its ISDF quadrature is orbit-closed, and cohsex_debug's 60-centroid set is
+# not: ``tests/test_star_offdiag_gate.py`` measures the spatial pairs broken
+# at 1.8e-01 … 4.0e-01 and the pure-TRS pairs holding only to
+# 7.5e-07 … 7.0e-04.  The tree ALREADY refuses to select IBZ rows on numbers
+# like these — ``sc_iteration._KSTAR_SPREAD_TOL`` is 1e-6 on Σ+V_H, five
+# decades below what this fixture measures, and its refusal message is the
+# argument in full: "members of a star must carry the same Σ up to
+# round-off; they do not, so the full-BZ Σ and the IBZ carry are in
+# different gauges and selecting the star representatives would silently
+# keep the wrong one."
+#
+# And the spread is not noise to be squeezed out.  It is the METRIC the
+# whole orbit-closure program is priced in (SPEC_qirr_restart_tensors §2a:
+# Σ star spread 16.884 → 0.743 meV, a 23x gain, against +4.4 meV on BSE at
+# fixed rank).  A format that reconstructs the star members deletes that
+# measurement by construction, on every deck, closed or not.
+#
+# REGISTERED WHILE MEASURING, not claimed: ``sigma_total_kij_ev`` is 48.2 %
+# of the payload and is the sum of the other three.  It reproduces
+# ``c + sx[None] + h[None]`` to max|Δ| 4.351e-05 eV (4.440e-08 relative) but
+# is NOT bit-identical under either association order, so dropping it today
+# is a ~1.9x win that would move the file's numbers.  Pinning the writer's
+# own association first would make it exact — a separate change with a
+# separate gate, and the one actually worth doing on this file.
+
+
 def write_sigma_omega_h5(
 	filepath,
 	omega_ev,

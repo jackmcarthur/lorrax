@@ -11,6 +11,7 @@ from functools import partial
 import numpy as np
 import jax
 import jax.numpy as jnp
+from ._compat import deprecated_alias
 from ._shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -159,7 +160,7 @@ def find_irreducible_bz_points(full_kgrid_int, sym_mats_k, *, irr_kgrid_int=None
 def slice_q_full_to_ibz(arr_full, q_irr_full_idx, *, out_sharding=None):
     """Slice a ``(n_q_full, ...)`` array to its IBZ rows.
 
-    The natural ``full BZ → IBZ`` companion to :func:`unfold_v_q`'s
+    The natural ``full BZ → IBZ`` companion to :func:`unfold_isdf_operator`'s
     ``IBZ → full BZ`` direction: this just picks the IBZ representative
     q-points out of a full-BZ tensor.  No centroid permute, no L-phase,
     no TRS conjugation — a pure row gather along axis 0.
@@ -171,10 +172,11 @@ def slice_q_full_to_ibz(arr_full, q_irr_full_idx, *, out_sharding=None):
 
     - ``isdf_fitting.fit_zeta_to_h5``: slice C_q before ``factor_c_q``
       so Cholesky / LU runs only on the IBZ q-block, then ζ_q is solved
-      and stored at IBZ; downstream V_q unfolds via :func:`unfold_v_q`.
+      and stored at IBZ; downstream V_q unfolds via
+      :func:`unfold_isdf_operator`.
     - W_q = ``(1 − v_q χ_q)^{-1} v_q``: slice the Hermitian object that
       needs per-q inversion to IBZ before solve, then unfold via
-      :func:`unfold_v_q` for the q-axis consumers.
+      :func:`unfold_isdf_operator` for the q-axis consumers.
 
     Sharding contract.  The gather along axis 0 leaves the trailing
     (μ, ν) axes untouched, so XLA preserves whatever ``arr_full``
@@ -206,7 +208,7 @@ def slice_q_full_to_ibz(arr_full, q_irr_full_idx, *, out_sharding=None):
     return out
 
 
-def unfold_v_q(
+def unfold_isdf_operator(
     V_q_ibz,
     *,
     irr_idx,
@@ -220,7 +222,7 @@ def unfold_v_q(
     """Expand ``V_q_ibz`` over the IBZ to the full BZ.
 
     The mapping is a centroid-axis double-gather (using the **source-map**
-    ``α(μ) = sym_perm[s, μ]`` returned by ``compute_centroid_sym_perm``)
+    ``α(μ) = sym_perm[s, μ]`` returned by ``centroid_source_map_and_wrap``)
     plus a per-centroid umklapp phase from the real-space lattice wrap:
 
         V_full[q, μ', ν'] = exp(2π i q_irr · (L_{s,μ'} − L_{s,ν'}))
@@ -253,7 +255,7 @@ def unfold_v_q(
     non-Hermitian channels).  The centroid permutation itself is
     unchanged under TRS (r is fixed); ``sym_perm`` rows ``[ntran:]``
     duplicate ``[:ntran]``.  Callers build ``sym_perm`` via
-    ``compute_centroid_sym_perm(..., extend_trs=True)`` and pass
+    ``centroid_source_map_and_wrap(..., extend_trs=True)`` and pass
     ``n_sym_spatial=ntran``.
 
     Parameters
@@ -272,7 +274,7 @@ def unfold_v_q(
     L_table
         ``(2·n_sym_spatial, n_rmu, 3)`` int — per-(sym, centroid)
         integer real-space lattice wrap, from
-        ``compute_centroid_sym_perm``.  Drives the umklapp phase.
+        ``centroid_source_map_and_wrap``.  Drives the umklapp phase.
     q_irr_frac
         ``(n_q_ibz, 3)`` float — IBZ q in fractional reciprocal
         coordinates (already BGW-wrapped to the (−0.5, 0.5] convention
@@ -306,17 +308,18 @@ def unfold_v_q(
     max_sym = int(sym_np.max()) if sym_np.size else -1
     if max_sym >= n_sym_perm:
         raise ValueError(
-            f"unfold_v_q: sym_idx contains value {max_sym} but sym_perm "
-            f"has only {n_sym_perm} rows.  Build sym_perm via "
-            f"``compute_centroid_sym_perm(..., extend_trs=True)`` so it "
+            f"unfold_isdf_operator: sym_idx contains value {max_sym} "
+            f"but sym_perm has only {n_sym_perm} rows.  Build it via "
+            f"``centroid_source_map_and_wrap(..., extend_trs=True)`` so it "
             f"covers the TRS-augmented half of ``sym_mats_k``.")
     trs_used = max_sym >= int(n_sym_spatial)
     if trs_used and int(n_sym_spatial) * 2 != n_sym_perm:
         raise ValueError(
-            f"unfold_v_q: sym_idx uses TRS-augmented rows (max={max_sym} ≥ "
-            f"n_sym_spatial={n_sym_spatial}) but sym_perm.shape[0]="
+            f"unfold_isdf_operator: sym_idx uses TRS-augmented rows "
+            f"(max={max_sym} ≥ n_sym_spatial={n_sym_spatial}) but "
+            f"sym_perm.shape[0]="
             f"{n_sym_perm} ≠ 2·n_sym_spatial.  Build sym_perm via "
-            f"``compute_centroid_sym_perm(..., extend_trs=True)``.")
+            f"``centroid_source_map_and_wrap(..., extend_trs=True)``.")
 
     # Forward permutation: gather V_ibz at indices sym_perm[s, μ'] — i.e.,
     # at the FORWARD image of each full-BZ centroid μ' under sym s.
@@ -337,8 +340,9 @@ def unfold_v_q(
     fwd_perm = np.asarray(sym_perm, dtype=np.int32)
     if int(V_q_ibz.shape[-1]) != int(fwd_perm.shape[-1]):
         raise ValueError(
-            f"unfold_v_q: V_q_ibz μ-extent {int(V_q_ibz.shape[-1])} != "
-            f"sym_perm extent {int(fwd_perm.shape[-1])}.  Tables carry "
+            f"unfold_isdf_operator: V_q_ibz μ-extent "
+            f"{int(V_q_ibz.shape[-1])} != sym_perm extent "
+            f"{int(fwd_perm.shape[-1])}.  Tables carry "
             f"the μ pad from construction (_resolve_ibz_q_list); pass V "
             f"at the same (padded) extent.")
     # Per-(q_full, μ) umklapp phase factor exp(2π i q_irr · L_μ).
@@ -350,7 +354,7 @@ def unfold_v_q(
     L_arr = np.asarray(L_table, dtype=np.float64)
     if int(L_arr.shape[1]) != int(V_q_ibz.shape[-1]):
         raise ValueError(
-            f"unfold_v_q: L_table μ-extent {int(L_arr.shape[1])} != "
+            f"unfold_isdf_operator: L_table μ-extent {int(L_arr.shape[1])} != "
             f"V_q_ibz μ-extent {int(V_q_ibz.shape[-1])}; tables and V "
             f"must share one (padded) extent.")
 
@@ -365,7 +369,7 @@ def unfold_v_q(
     sym_arr = np.asarray(sym_idx, dtype=np.int32)
     q_irr_arr = np.asarray(q_irr_frac, dtype=np.float64)
     trs_mask_arr = (sym_arr >= int(n_sym_spatial))
-    fn = _get_unfold_v_q_jit(
+    fn = _get_unfold_isdf_operator_jit(
         V_q_shape=tuple(int(s) for s in V_q_ibz.shape),
         fwd_perm_arr=fwd_perm,
         idx_arr=idx_arr,
@@ -378,10 +382,10 @@ def unfold_v_q(
     return fn(V_q_ibz)
 
 
-_UNFOLD_V_Q_JIT_CACHE: dict = {}
+_UNFOLD_ISDF_OPERATOR_JIT_CACHE: dict = {}
 
 
-def _get_unfold_v_q_jit(
+def _get_unfold_isdf_operator_jit(
     *, V_q_shape, fwd_perm_arr, idx_arr, sym_arr, L_arr, q_irr_arr,
     trs_mask_arr, n_sym_spatial, mesh_xy,
 ):
@@ -404,7 +408,7 @@ def _get_unfold_v_q_jit(
         int(n_sym_spatial),
         id(mesh_xy),
     )
-    hit = _UNFOLD_V_Q_JIT_CACHE.get(key)
+    hit = _UNFOLD_ISDF_OPERATOR_JIT_CACHE.get(key)
     if hit is not None:
         return hit
 
@@ -428,8 +432,9 @@ def _get_unfold_v_q_jit(
     Py = int(mesh_xy.shape['y'])
     if n_rmu_padded % (Px * Py) != 0:
         raise ValueError(
-            f"unfold_v_q: n_rmu_padded={n_rmu_padded} must be divisible "
-            f"by Px*Py={Px*Py} for the all_to_all redistribution.  The "
+            f"unfold_isdf_operator: n_rmu_padded={n_rmu_padded} must be "
+            f"divisible by Px*Py={Px*Py} for the all_to_all "
+            f"redistribution.  The "
             f"μ-padding in Meta should already enforce this — check "
             f"that meta.n_rmu_padded is mesh-divisible.")
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
@@ -514,11 +519,11 @@ def _get_unfold_v_q_jit(
 
         return _kernel(V_ibz)
 
-    _UNFOLD_V_Q_JIT_CACHE[key] = _do_unfold
+    _UNFOLD_ISDF_OPERATOR_JIT_CACHE[key] = _do_unfold
     return _do_unfold
 
 
-def unfold_v_q_bispinor_lorentz(
+def mix_channels_by_proper_rotation(
     V_tt_per_channel,
     *,
     sym_idx,
@@ -528,7 +533,7 @@ def unfold_v_q_bispinor_lorentz(
     """Apply the 3-vector Lorentz mixing on the bispinor TT-block tiles.
 
     Operates on the (μ_L, ν_L) ∈ {1,2,3}² block of bispinor V_q tiles that
-    have already been passed through :func:`unfold_v_q` (centroid
+    have already been passed through :func:`unfold_isdf_operator` (centroid
     double-permute + L-phase + TRS conj-wrap).  Implements the rule from
     ``reports/bispinor_ibz_2026-05-16/derivation.md`` §A5::
 
@@ -564,8 +569,8 @@ def unfold_v_q_bispinor_lorentz(
     TRS rows reuse the spatial
     ``R_proper``: the σ-flip TRS sigma-sign on (μ_L, ν_L) ∈ {1,2,3}²
     factorises as (−1)·(−1) = +1 on every stored UNIQUE_TILE and is
-    absorbed by the existing scalar ``unfold_v_q`` conj-wrap (derivation
-    §A4).
+    absorbed by the existing scalar ``unfold_isdf_operator`` conj-wrap
+    (derivation §A4).
 
     Parameters
     ----------
@@ -594,11 +599,11 @@ def unfold_v_q_bispinor_lorentz(
     R_arr = np.asarray(R_proper_table, dtype=np.float64)
     if R_arr.ndim != 3 or R_arr.shape[1:] != (3, 3):
         raise ValueError(
-            f"unfold_v_q_bispinor_lorentz: R_proper_table must have shape "
+            f"mix_channels_by_proper_rotation: R_proper_table must have shape "
             f"(2·n_sym_spatial, 3, 3); got {R_arr.shape}.")
     # Per-q 3×3 mixer baked into the jit closure as a constant — same
-    # caching pattern as ``unfold_v_q`` (small int + float table folded
-    # into HLO).  ``R_per_q[q]`` ∈ R^{3×3} is the spatial rotation that
+    # caching pattern as ``unfold_isdf_operator`` (small int + float table
+    # folded into HLO).  ``R_per_q[q]`` ∈ R^{3×3} is the spatial rotation that
     # mixes the (1,2,3) Lorentz indices for full-BZ q.
     R_per_q = R_arr[sym_arr]                                # (n_q_full, 3, 3)
 
@@ -608,7 +613,7 @@ def unfold_v_q_bispinor_lorentz(
     for k in keys_in:
         if k not in V_tt_per_channel:
             raise ValueError(
-                f"unfold_v_q_bispinor_lorentz: missing TT tile {k}; "
+                f"mix_channels_by_proper_rotation: missing TT tile {k}; "
                 f"caller must supply all 9 (i, j) ∈ {{1,2,3}}² "
                 f"(use ``conj(swapaxes(.., -1, -2))`` to synthesise the "
                 f"Hermitian-redundant entries).")
@@ -616,7 +621,7 @@ def unfold_v_q_bispinor_lorentz(
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     R_dev = jnp.asarray(R_per_q)                            # closure constant
 
-    fn = _get_unfold_v_q_lorentz_jit(
+    fn = _get_mix_channels_jit(
         V_shape=tuple(int(s) for s in sample.shape),
         R_per_q_arr=R_per_q,
         mesh_xy=mesh_xy,
@@ -635,23 +640,23 @@ def unfold_v_q_bispinor_lorentz(
     }
 
 
-_UNFOLD_V_Q_LORENTZ_JIT_CACHE: dict = {}
+_MIX_CHANNELS_JIT_CACHE: dict = {}
 
 
-def _get_unfold_v_q_lorentz_jit(*, V_shape, R_per_q_arr, mesh_xy):
+def _get_mix_channels_jit(*, V_shape, R_per_q_arr, mesh_xy):
     """Cache the inner Lorentz-mix jit by (shape, R-table content).
 
-    Same content-keyed caching strategy as :func:`_get_unfold_v_q_jit`:
-    the R table is baked into the jit closure as a constant so XLA can
-    fold it into the HLO.  The cache key is the bytes-hash of the
-    table plus the V shape plus the mesh identity.
+    Same content-keyed caching strategy as
+    :func:`_get_unfold_isdf_operator_jit`: the R table is baked into the jit
+    closure as a constant so XLA can fold it into the HLO.  The cache key is
+    the bytes-hash of the table plus the V shape plus the mesh identity.
     """
     key = (
         V_shape,
         R_per_q_arr.shape, R_per_q_arr.tobytes(),
         id(mesh_xy),
     )
-    hit = _UNFOLD_V_Q_LORENTZ_JIT_CACHE.get(key)
+    hit = _MIX_CHANNELS_JIT_CACHE.get(key)
     if hit is not None:
         return hit
 
@@ -676,7 +681,7 @@ def _get_unfold_v_q_lorentz_jit(*, V_shape, R_per_q_arr, mesh_xy):
             R_per_q_j, R_per_q_j, V_in,
         )
 
-    _UNFOLD_V_Q_LORENTZ_JIT_CACHE[key] = _do_mix
+    _MIX_CHANNELS_JIT_CACHE[key] = _do_mix
     return _do_mix
 
 
@@ -684,7 +689,7 @@ def _get_unfold_v_q_lorentz_jit(*, V_shape, R_per_q_arr, mesh_xy):
 _I_SIGMA_Y = np.array([[0.0, 1.0], [-1.0, 0.0]], dtype=np.complex128)
 
 
-def trs_augment_U(U_spinor_spatial, sym_idx, n_tran):
+def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran):
     """Per-op spinor rotation matrix with the TRS augmentation baked in.
 
     Single source of the ψ-unfold spinor rule (see :func:`unfold_psi`).
@@ -901,7 +906,8 @@ def unfold_psi(
         if phase is not None:
             cnk = cnk * phase[None, None, :]
     # Spinor rotation with the TRS augmentation single-sourced.
-    U_eff = trs_augment_U(U_spinor_spatial, sym_idx, n_sym_spatial)
+    U_eff = spinor_rotation_for_sym_row(
+        U_spinor_spatial, sym_idx, n_sym_spatial)
 
     # Spinor rotation. For ns=1 (non-SOC), U_eff is the 1×1 identity and
     # this einsum is a no-op (callers can still pass it without special-casing).
@@ -964,10 +970,10 @@ class SymMaps:
             self.sym_matrices = np.eye(3, dtype=np.int32)[None, :, :]
             # ``sym_mats_k`` MUST be TRS-augmented to length ``2·ntran``
             # exactly like the general branch below: every consumer
-            # (``unfold_psi``/``trs_augment_U`` derive ``n_sym_spatial =
-            # len(sym_mats_k)//2``, ``zeta_loader``'s q-IBZ TR mapping,
-            # ``compute_vcoul``'s q lookup) assumes the spatial half is
-            # followed by the ``-S`` time-reversal half.  Leaving it at
+            # (``unfold_psi``/``spinor_rotation_for_sym_row`` derive
+            # ``n_sym_spatial = len(sym_mats_k)//2``, ``zeta_loader``'s q-IBZ
+            # TR mapping, ``compute_vcoul``'s q lookup) assumes the spatial
+            # half is followed by the ``-S`` time-reversal half.  Leaving it at
             # length 1 made ``n_sym_spatial = 1//2 = 0``, so ``unfold_psi``
             # classified the *identity* row (sym_idx=0) as a TRS row and
             # returned ``iσ_y·conj(ψ)`` on an un-negated G-list — i.e. it
@@ -1064,7 +1070,7 @@ class SymMaps:
         # BGW convention: `mtrx` (= `sym_matrices` here) acts on G-vectors
         # in column form: `G' = mtrx @ G`. For real-space coords the
         # corresponding action uses `Rinv = inv(mtrx)`: `r' = Rinv @ r + τ`
-        # (see orbit_syms.compute_centroid_sym_perm,
+        # (see orbit_syms.centroid_source_map_and_wrap,
         # and BerkeleyGW/Common/symmetries.f90:189 which stores mtrx as
         # invert(mtrx_inv) where mtrx_inv is the real-space rotation).
         self.sym_matrices = wfn.sym_matrices[:wfn.ntran]
@@ -1105,7 +1111,7 @@ class SymMaps:
         #      a symmetry of these particular wavefunctions at all, from
         #      the magnetization density, using none of 1–3.  Its verdict
         #      arrives here as ``wfn.trs_holds`` and drives (2).
-        # ``orbit_syms.compute_centroid_sym_perm(extend_trs=True)``
+        # ``orbit_syms.centroid_source_map_and_wrap(extend_trs=True)``
         # is the real-space counterpart: TRS leaves r fixed, so its rows
         # duplicate the spatial rows rather than negating anything.
         time_reversal_syms = -self.sym_mats_k  # S @ k -> -S @ k
@@ -1208,7 +1214,7 @@ class SymMaps:
         # TRS half reuses the SPATIAL R_proper (NOT ``−R_spatial``): the
         # σ-flip TRS sigma-sign on the (μ_L, ν_L) ∈ {1,2,3}² block
         # factorises as (−1)·(−1) = +1 on every stored UNIQUE_TILE and
-        # is absorbed by the existing ``unfold_v_q`` conj-wrap.  See
+        # is absorbed by the existing ``unfold_isdf_operator`` conj-wrap.  See
         # derivation §A4.
         _R_spatial = np.asarray(self.R_cart[:wfn.ntran], dtype=np.float64)
         _R_proper_spatial = np.where(
@@ -1792,9 +1798,9 @@ class SymMaps:
 # of the star, ⟨m,Sk̄|O|n,Sk̄⟩ = ⟨m,k̄|O|n,k̄⟩, and so does its eigenvector
 # matrix.  Moving a BAND-INDEX object between the IBZ and the full BZ is
 # therefore pure indexing: no umklapp phase, no ``sym_perm`` gather, no
-# spinor rotation.  ``unfold_v_q`` needs all three because ``V_q[μ,ν]`` is
-# indexed by real-space centroids and a symmetry moves r; bands it does
-# not move.  The two routines are not variants of each other.
+# spinor rotation.  ``unfold_isdf_operator`` needs all three because
+# ``V_q[μ,ν]`` is indexed by real-space centroids and a symmetry moves r; bands
+# it does not move.  The two routines are not variants of each other.
 #
 # SPATIAL IS EQUALITY, TIME REVERSAL IS CONJUGATION.  Θ = iσ_y K is
 # ANTIunitary, so for O commuting with it,
@@ -1816,7 +1822,7 @@ class SymMaps:
 # helpers as using the member's own flag predate it.
 #
 # The member's own flag — ``sym_idx_k >= n_sym_spatial``, the convention
-# ``unfold_psi`` and ``unfold_v_q`` use — is the RIGHT predicate for
+# ``unfold_psi`` and ``unfold_isdf_operator`` use — is the RIGHT predicate for
 # exactly one flavour of operand: a raw IBZ slab, whose rows carry no
 # symmetry operation and so are TRS-false by construction.  That is
 # ``star_broadcast(trs_reference="ibz_slab")``, and the XOR reduces to it
@@ -1843,8 +1849,8 @@ class SymMaps:
 # keeps its sharding, a numpy array takes the numpy path unchanged
 # (``gw.scissor.k_star_weights`` and the star gate pass host arrays in).
 # The index tables are baked into the jit closure as constants, as
-# :func:`_get_unfold_v_q_jit` bakes the centroid tables (runtime-arg form
-# measured ~2× slower per call).
+# :func:`_get_unfold_isdf_operator_jit` bakes the centroid tables (runtime-arg
+# form measured ~2× slower per call).
 
 
 _STAR_JIT_CACHE: dict = {}
@@ -2276,3 +2282,22 @@ class KStarMap:
         return (f"KStarMap(nk_full={self.nk_full}, nk_irr={self.nk_irr}, "
                 f"reduction={self.reduction:.2f}x, "
                 f"n_sym_spatial={self.n_sym_spatial})")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Pre-sweep spellings — MODULE-LEVEL half of the compat layer
+# ─────────────────────────────────────────────────────────────────────────
+# The package door binds these too (``symmetry_maps/__init__.py``).  Both
+# levels are bound on purpose: a consumer that reaches this module
+# directly (the wave-1 shims did, and the sibling stamp branch still
+# calls the old names) must not care which door it came through.
+# Retirement: see :mod:`symmetry_maps._compat`.
+
+#: DEPRECATED — :func:`unfold_isdf_operator`.
+unfold_v_q = deprecated_alias(unfold_isdf_operator, "unfold_v_q")
+#: DEPRECATED — :func:`mix_channels_by_proper_rotation`.
+unfold_v_q_bispinor_lorentz = deprecated_alias(
+    mix_channels_by_proper_rotation, "unfold_v_q_bispinor_lorentz")
+#: DEPRECATED — :func:`spinor_rotation_for_sym_row`.
+trs_augment_U = deprecated_alias(
+    spinor_rotation_for_sym_row, "trs_augment_U")

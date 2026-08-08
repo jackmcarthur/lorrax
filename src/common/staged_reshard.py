@@ -120,7 +120,8 @@ and its second hands out B over the flattened axis in the same
 ``ax_x``-major order, so the two routes' outputs are element-identical.
 
 Evidence pointer for the pattern itself: ``symmetry_maps``'s
-``unfold_v_q`` has shipped the same ``shard_map`` + ``lax.all_to_all``
+``unfold_isdf_operator`` has shipped the same ``shard_map`` +
+``lax.all_to_all``
 volume-preserving redistribution (with the same explicit divisibility
 refusal) since the TRS/umklapp work.  This module is that idiom lifted
 out of one call site and given a contract.

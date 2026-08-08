@@ -24,7 +24,7 @@ Math:
     V_q[μ, ν] = Σ_G  conj(ζ̃_{q,μ}(G)) · v(q+G) · ζ̃_{q,ν}(G)
     g0_μ(q)   = ζ̃_{q,μ}(G=0)               # = ζ̃[μ, 0] by sphere convention
 
-IBZ unfold runs post-loop via ``symmetry_maps.unfold_v_q`` (V_q)
+IBZ unfold runs post-loop via ``symmetry_maps.unfold_isdf_operator`` (V_q)
 and the local :func:`_unfold_g0_ibz_to_full` (g0); the V_q output
 sharding ``P(None, 'x', 'y')`` matches.
 """
@@ -156,7 +156,8 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
 # tile loop in gw.v_q_bispinor)
 # ---------------------------------------------------------------------------
 
-def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
+def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
+                        context="V_q / W q-grid reduction"):
     """Pick IBZ q's via centroid orbit closure, fall back to full BZ.
 
     Returns ``(q_irr_kgrid_int, q_irr_frac, q_full_to_irr_idx,
@@ -165,8 +166,21 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
     are None; caller skips the post-loop unfold.
 
     ``L_table`` is the per-(sym, μ) integer real-space lattice wrap
-    captured by ``compute_centroid_sym_perm``; ``unfold_v_q`` uses it
+    captured by ``centroid_source_map_and_wrap``; ``unfold_isdf_operator`` uses
+    it
     to build the umklapp phase ``exp(2π i q · (L_μ − L_ν))``.
+
+    THE CLOSURE DECISION IS NOT TAKEN HERE.  It is taken once, in
+    ``symmetry_maps.resolve_qgrid_symmetry``, and announced once by
+    ``gw.qgrid_symmetry.resolve_qgrid_symmetry_tables``; this function
+    consumes the resolution and shapes it into the seven-tuple its three
+    callers already read.
+
+    THE ``verbose`` ARGUMENT IS GONE.  It gated exactly one thing — the
+    line that said the fallback had happened — and ``gw/screening.py``
+    passed ``verbose=False``, which is why the W Dyson solve could drop
+    from ``n_q_ibz`` blocks to ``n_q_full`` without a word.  A knob whose
+    only effect is to hide a degradation is not a verbosity knob.
     """
     nkx, nky, nkz = kgrid
     use_ibz = False
@@ -177,46 +191,33 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
     L_table = None
     # DEBUG: set LORRAX_FORCE_FULL_BZ=1 to bypass the IBZ cascade and
     # compute V_q at all full-BZ q's directly.  Useful for isolating
-    # whether residuals come from unfold_v_q vs the rest of the pipeline.
+    # whether residuals come from unfold_isdf_operator vs the rest of the
+    # pipeline.
     #
     # ONE grammar for this knob, shared with the four other sites that read
     # it (``gw/gw_init.py`` x3, ``gw/screening.py``).  The old
     # ``bool(int(os.environ.get(...)))`` took decimal digits only, so
     # ``=true``/``=on``/``=yes`` raised a bare ``invalid literal for int()``
     # from deep inside the V_q cascade rather than doing what they say.
+    #
+    # This bypass is NOT the closure fallback and is not announced as one:
+    # it is a deliberate operator choice, announced at its own decision
+    # site in ``gw/screening.py``.  Conflating "you asked for the full BZ"
+    # with "your centroids cannot give you the IBZ" would put the loud
+    # closure line on a run that has no closure problem.
     _force_full_bz = env_bool('LORRAX_FORCE_FULL_BZ', False)
     if sym is not None and centroid_indices is not None and not _force_full_bz:
-        from ffi import _services
-        _services.ensure_on_path()
-        from symmetry_maps import compute_centroid_sym_perm
-        n_tran = int(np.asarray(sym.sym_matrices).shape[0])
-        cent_idx = np.asarray(centroid_indices, dtype=np.int32)
-        try:
-            # ``extend_trs=True`` so ``sym_perm`` has shape
-            # ``(2·n_tran, n_rmu)`` — the second half duplicates the
-            # spatial rows and is indexed by the TRS-augmented sym
-            # values returned by ``sym.irr_idx_q/sym_idx_q``.  See
-            # ``compute_centroid_sym_perm`` docstring and the audit
-            # report (``reports/trs_sym_audit_2026-05-14``).
-            sym_perm, L_table = compute_centroid_sym_perm(
-                cent_idx,
-                sym_matrices=np.asarray(sym.sym_matrices[:n_tran]),
-                translations=np.asarray(sym.translations[:n_tran]),
-                fft_grid=np.asarray(fft_grid, dtype=np.int32),
-                extend_trs=True,
-            )
-        except RuntimeError as exc:
-            if verbose and jax.process_index() == 0:
-                print(f"  V_q g-flat: centroid orbit closure failed — "
-                      f"full-BZ iteration.  Reason: "
-                      f"{exc.args[0].splitlines()[0] if exc.args else exc}")
-            sym_perm = None
-            L_table = None
+        from .qgrid_symmetry import resolve_qgrid_symmetry_tables
+        res = resolve_qgrid_symmetry_tables(
+            sym=sym, centroid_indices=centroid_indices, fft_grid=fft_grid,
+            context=context)
+        if res.use_ibz:
+            sym_perm, L_table = res.tables()
         if sym_perm is not None:
             # Bake the μ pad into the tables ONCE at construction:
             # identity tail on the permutation (pad centroids map to
             # themselves), zero tail on the umklapp wrap (pad centroids
-            # never wrap).  Consumers (``unfold_v_q``,
+            # never wrap).  Consumers (``unfold_isdf_operator``,
             # ``_unfold_g0_ibz_to_full``, gw_jax's W unfold) then
             # REQUIRE an exact extent match instead of each re-padding
             # per site — the too-small/too-large guards there replace a
@@ -332,14 +333,15 @@ def _compute_V_q_g_flat_one_tile(
 
     from ffi import _services
     _services.ensure_on_path()
-    from symmetry_maps import unfold_v_q
+    from symmetry_maps import unfold_isdf_operator
 
     # ---- IBZ list + per-tile v(q+G) -----------------------------------
     (_q_int, q_irr_frac,
      full_to_irr_idx, full_to_irr_sym,
      sym_perm, L_table, use_ibz) = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_indices,
-        kgrid=kgrid, fft_grid=fft_grid, verbose=verbose)
+        kgrid=kgrid, fft_grid=fft_grid,
+        context=f"V_q g-flat tile [{timing_label}]")
     n_q_ibz = int(q_irr_frac.shape[0])
 
     gvec_components = np.asarray(
@@ -474,15 +476,35 @@ def _compute_V_q_g_flat_one_tile(
 
     # ---- IBZ → full-BZ unfold (centroid double-permute) -------------
     if use_ibz:
-        # ``sym_perm`` came from ``compute_centroid_sym_perm(..., extend_trs=True)``
-        # so its shape[0] is ``2·ntran``; the second half encodes the
-        # TRS-augmented rows (centroid permutation unchanged under TRS,
-        # but the unfold helper conjugates V_q at TRS-tagged q's).
+        # ``sym_perm`` came from ``centroid_source_map_and_wrap(...,
+        # extend_trs=True)`` so its shape[0] is ``2·ntran``; the second half
+        # encodes the TRS-augmented rows (centroid permutation unchanged under
+        # TRS, but the unfold helper conjugates V_q at TRS-tagged q's).
         # ``L_table`` is the per-(sym, μ) integer lattice wrap; the
         # umklapp phase ``exp(2π i q_irr · (L_μ − L_ν))`` is essential
         # for non-cubic / non-symmorphic systems.
         n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
-        V_acc = unfold_v_q(
+        # THE PRE-UNFOLD BLOCK, OFFERED TO WHOEVER IS WRITING THE RESTART.
+        # This is the array the q_irr format persists — the design's
+        # load-bearing decision, because ``unfold(stored)`` is then the
+        # SAME CALL on the SAME ARGUMENTS the line below makes, an identity
+        # rather than a property that depends on the op-selection policy.
+        # It exists for exactly one statement, which is why the offer is
+        # here and not at the writer.
+        #
+        # A NO-OP unless a driver has opened a capture scope, so the
+        # compute path takes no restart decision and this line costs a list
+        # check on every other run.  Only the CC tile is offered: the
+        # bispinor CT/TT tiles are not restart tensors.
+        if timing_label == "CC":
+            from .restart_q_storage import deposit_pre_unfold
+            deposit_pre_unfold(
+                "V_qmunu", V_acc,
+                n_rmu_logical=int(zeta_L_loader.n_rmu),
+                q_irr_frac=q_irr_frac, irr_idx_q=full_to_irr_idx,
+                sym_idx_q=full_to_irr_sym, sym_perm=sym_perm,
+                L_table=L_table, n_sym_spatial=n_sym_spatial)
+        V_acc = unfold_isdf_operator(
             V_acc, irr_idx=full_to_irr_idx, sym_idx=full_to_irr_sym,
             sym_perm=sym_perm, L_table=L_table, q_irr_frac=q_irr_frac,
             mesh_xy=mesh_xy, n_sym_spatial=n_sym_spatial)
@@ -553,8 +575,8 @@ def compute_all_V_q_g_flat(
     # under q → −q and cost V_q 6.0e−3 of reciprocity against a 1.16e−7
     # floor.
     # The IBZ → full-BZ V_q unfold is bilinear in ζ and inherits this
-    # head value through ``unfold_v_q``'s centroid-permute + L-phase, so
-    # injecting at every IBZ q is sufficient — no separate full-BZ pass.
+    # head value through ``unfold_isdf_operator``'s centroid-permute + L-phase,
+    # so injecting at every IBZ q is sufficient — no separate full-BZ pass.
     # 2D ``f2d → 0`` regularizes v at G=0 already; the MC flag is a 3D-
     # only refinement and is silently no-op'd for sys_dim=2.
     _v_head_fn = None
@@ -630,13 +652,13 @@ def _unfold_g0_ibz_to_full(
     TRS-augmented rows: g0 is a single ζ leg, so the TRS rule is a
     plain conjugation: ``g0_{full}^{TRS-q, π_s(μ)} = conj(g0_{ibz}^{i(q), μ})``.
     Pass ``n_sym_spatial=ntran`` along with a
-    ``compute_centroid_sym_perm(..., extend_trs=True)`` table to enable
+    ``centroid_source_map_and_wrap(..., extend_trs=True)`` table to enable
     the conj branch.  Without ``n_sym_spatial``, no TRS conj is
     applied; any TRS-augmented sym index in ``full_to_irr_sym`` then
     hits the hard-fail guard below.
     """
     # Trivial-IBZ short-circuit (ntran=1, no centroid permutation, no
-    # μ-pad).  See ``unfold_v_q`` for the rationale; we
+    # μ-pad).  See ``unfold_isdf_operator`` for the rationale; we
     # keep the same guard here so the no-op pass-through doesn't even
     # dispatch a jit.
     idx_np = np.asarray(full_to_irr_idx)
@@ -647,7 +669,7 @@ def _unfold_g0_ibz_to_full(
             and int(g0_ibz.shape[-1]) == int(np.asarray(sym_perm).shape[-1])):
         return g0_ibz
 
-    # TRS-aware bounds check, mirroring ``unfold_v_q``.
+    # TRS-aware bounds check, mirroring ``unfold_isdf_operator``.
     n_sym_perm = int(np.asarray(sym_perm).shape[0])
     max_sym = int(sym_np.max()) if sym_np.size else -1
     if max_sym >= n_sym_perm:
@@ -655,7 +677,7 @@ def _unfold_g0_ibz_to_full(
             f"_unfold_g0_ibz_to_full: full_to_irr_sym contains value "
             f"{max_sym} (TRS-augmented row index) but sym_perm has only "
             f"{n_sym_perm} rows.  Build sym_perm via "
-            f"``compute_centroid_sym_perm(..., extend_trs=True)`` to "
+            f"``centroid_source_map_and_wrap(..., extend_trs=True)`` to "
             f"cover the TRS-augmented half of ``sym_mats_k``, and pass "
             f"``n_sym_spatial=ntran`` here.")
     if n_sym_spatial is not None and int(n_sym_spatial) * 2 != n_sym_perm:
@@ -668,7 +690,7 @@ def _unfold_g0_ibz_to_full(
     # (``_resolve_ibz_q_list``); its identity tail argsorts to itself,
     # so ``inv_perm`` needs no per-site pad-extension.  REQUIRE an
     # exact extent match (both directions) — same rationale as
-    # ``unfold_v_q``: a mismatch would feed the ``promise_in_bounds``
+    # ``unfold_isdf_operator``: a mismatch would feed the ``promise_in_bounds``
     # gather below with out-of-range indices and clip silently.
     inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
     if int(g0_ibz.shape[-1]) != int(inv_perm.shape[-1]):
@@ -683,7 +705,7 @@ def _unfold_g0_ibz_to_full(
     idx_j = jnp.asarray(full_to_irr_idx)
     sym_j = jnp.asarray(full_to_irr_sym)
 
-    # TRS mask: same convention as ``unfold_v_q``.
+    # TRS mask: same convention as ``unfold_isdf_operator``.
     if n_sym_spatial is not None:
         trs_mask_np = (sym_np >= int(n_sym_spatial))
     else:
@@ -698,7 +720,7 @@ def _unfold_g0_ibz_to_full(
         g0_at_irr = g0[idx_j]                                       # (n_q_full, μ)
         # ``mode='promise_in_bounds'`` to skip the take_along_axis
         # OOB-fill helper that breaks under shard_map+x64; same fix
-        # as ``unfold_v_q``.
+        # as ``unfold_isdf_operator``.
         g0_full = jnp.take_along_axis(
             g0_at_irr, perm_q, axis=1, mode='promise_in_bounds')
         # TRS rows: ζ-leg conjugation (g0 is a single ζ leg, not

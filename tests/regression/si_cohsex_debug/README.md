@@ -251,3 +251,5 @@ python3 tools/bgw_sigma_hp_to_fixture.py compare \
 Copy, never symlink: the driver writes its outputs into the run directory, and
 a write through a stray symlink destroyed a checked-in fixture on 2026-07-25.
 That is why `harness.protect_fixtures` keeps everything here `a-w` at rest.
+
+CLOSURE (2026-08-08): this deck stays on its free set at current pins; closure at matched rank measured RED on the BGW anchor — see the frontier record.

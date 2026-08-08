@@ -1,16 +1,17 @@
 """Layer L-a: the pure-array surface — k-grid algebra, orbits, the ψ rule.
 
 These are the service's numpy functions of integer tables: ``kgrid_shift_map``,
-``find_irreducible_bz_points``, ``unfold_psi`` / ``trs_augment_U`` /
-``tau_phase_row``, ``compute_centroid_sym_perm``, ``compute_rgrid_sym_perm``
-and ``recover_symmorphic_density_point_group``.  No deck, no mesh, no HDF5
-except in the one metric-convention cell, which reads a header and nothing
-else.
+``find_irreducible_bz_points``, ``unfold_psi`` /
+``spinor_rotation_for_sym_row`` / ``tau_phase_row``,
+``centroid_source_map_and_wrap``, ``fft_grid_pullback_perm`` and
+``recover_symmorphic_density_point_group``.  No deck, no mesh, no HDF5 except
+in the one metric-convention cell, which reads a header and nothing else.
 
 DELIBERATE NON-OVERLAP with ``tests/test_symmetry_unfold.py``.  That file
 (750 lines, 17 cells) already covers ``find_irreducible_bz_points``'s five
-shapes, ``compute_centroid_sym_perm``'s ``extend_trs`` shape+content, the
-non-symmorphic τ path, the open-orbit refusal, ``unfold_v_q``'s TRS rows,
+shapes, ``centroid_source_map_and_wrap``'s ``extend_trs`` shape+content, the
+non-symmorphic τ path, the open-orbit refusal, ``unfold_isdf_operator``'s TRS
+rows,
 and ``unfold_psi``'s hand reference / identity no-op / Θ² = −1.  It stays
 in ``tests/`` until the replumb.  What is here is the GAPS the survey
 ranked (§7.2) and the contracts the service owes its callers:
@@ -22,7 +23,7 @@ ranked (§7.2) and the contracts the service owes its callers:
   only, and §Q's blast radius was V_NL collapse plus O(100 eV) in V_loc);
 * G9 ``recover_symmorphic_density_point_group`` — 19683 candidate matrices,
   no test anywhere;
-* S6 ``compute_centroid_sym_perm``'s orbit-closure refusal, BOTH halves,
+* S6 ``centroid_source_map_and_wrap``'s orbit-closure refusal, BOTH halves,
   driven by a SYNTHETIC dropped centroid (survey §8.2: no
   ``centroids_frac_*.txt`` is ever regenerated, and no deck's production
   set is ever re-run through kmeans);
@@ -40,11 +41,12 @@ import numpy as np
 import pytest
 
 from _deck_stub import deck_available, read_deck
-from symmetry_maps import (SymMaps, compute_centroid_sym_perm,
-                           compute_rgrid_sym_perm, find_irreducible_bz_points,
+from symmetry_maps import (SymMaps, centroid_source_map_and_wrap,
+                           fft_grid_pullback_perm, find_irreducible_bz_points,
                            kgrid_shift_map,
                            recover_symmorphic_density_point_group,
-                           tau_phase_row, trs_augment_U, unfold_psi)
+                           spinor_rotation_for_sym_row, tau_phase_row,
+                           unfold_psi)
 from symmetry_maps.maps import _I_SIGMA_Y
 
 
@@ -245,7 +247,7 @@ def test_the_trivial_branch_publishes_every_attribute_the_general_one_does():
 
 
 # ---------------------------------------------------------------------------
-# unfold_psi / trs_augment_U / tau_phase_row
+# unfold_psi / spinor_rotation_for_sym_row / tau_phase_row
 # ---------------------------------------------------------------------------
 
 def _su2(rng):
@@ -282,7 +284,7 @@ def test_the_trs_spinor_factor_squares_to_minus_one():
     """
     rng = np.random.default_rng(2)
     ident = np.eye(2, dtype=np.complex128)[None]
-    theta = trs_augment_U(ident, 1, 1)
+    theta = spinor_rotation_for_sym_row(ident, 1, 1)
     np.testing.assert_allclose(theta, _I_SIGMA_Y, atol=1e-15)
     v = rng.standard_normal(2) + 1j * rng.standard_normal(2)
     np.testing.assert_allclose(theta @ np.conj(theta @ np.conj(v)), -v,
@@ -290,7 +292,7 @@ def test_the_trs_spinor_factor_squares_to_minus_one():
 
     u = _su2(rng)
     np.testing.assert_allclose(np.linalg.det(u), 1.0, atol=1e-14)
-    theta_s = trs_augment_U(u[None], 1, 1)
+    theta_s = spinor_rotation_for_sym_row(u[None], 1, 1)
     np.testing.assert_allclose(theta_s, _I_SIGMA_Y @ np.conj(u), atol=1e-14)
     np.testing.assert_allclose(_I_SIGMA_Y @ np.conj(u), u @ _I_SIGMA_Y,
                                atol=1e-14)
@@ -318,8 +320,9 @@ def test_a_spatial_row_is_not_augmented():
     rng = np.random.default_rng(3)
     U = (rng.standard_normal((3, 2, 2)) + 1j * rng.standard_normal((3, 2, 2)))
     for s in range(3):
-        np.testing.assert_array_equal(trs_augment_U(U, s, 3), U[s])
-    np.testing.assert_allclose(trs_augment_U(U, 4, 3),
+        np.testing.assert_array_equal(
+            spinor_rotation_for_sym_row(U, s, 3), U[s])
+    np.testing.assert_allclose(spinor_rotation_for_sym_row(U, 4, 3),
                                _I_SIGMA_Y @ np.conj(U[1]), atol=1e-15)
 
 
@@ -333,10 +336,11 @@ def test_the_augmentation_vectorizes_over_a_row_of_sym_indices():
     rng = np.random.default_rng(4)
     U = (rng.standard_normal((3, 2, 2)) + 1j * rng.standard_normal((3, 2, 2)))
     idx = np.array([0, 1, 2, 3, 4, 5])
-    batch = trs_augment_U(U, idx, 3)
+    batch = spinor_rotation_for_sym_row(U, idx, 3)
     assert batch.shape == (6, 2, 2)
     for i, s in enumerate(idx):
-        np.testing.assert_array_equal(batch[i], trs_augment_U(U, int(s), 3))
+        np.testing.assert_array_equal(
+            batch[i], spinor_rotation_for_sym_row(U, int(s), 3))
 
 
 def test_tau_phase_row_is_none_at_tau_zero():
@@ -406,8 +410,8 @@ def _closed_centroids(fft=(8, 8, 1)):
 def test_an_orbit_closed_set_passes_validation():
     """The positive case: every row is a permutation and no image escapes."""
     fft, syms, tau, cent = _closed_centroids()
-    perm, L = compute_centroid_sym_perm(cent, syms, 2 * np.pi * tau, fft,
-                                        validate=True, extend_trs=True)
+    perm, L = centroid_source_map_and_wrap(cent, syms, 2 * np.pi * tau, fft,
+                                           validate=True, extend_trs=True)
     n = cent.shape[0]
     assert perm.shape == (4, n) and L.shape == (4, n, 3)
     np.testing.assert_array_equal(perm[2:], perm[:2])
@@ -429,8 +433,8 @@ def test_a_dropped_centroid_refuses_with_the_fix_named():
     for drop in range(cent.shape[0]):
         trial = np.delete(cent, drop, axis=0)
         try:
-            compute_centroid_sym_perm(trial, syms, 2 * np.pi * tau, fft,
-                                      validate=True)
+            centroid_source_map_and_wrap(trial, syms, 2 * np.pi * tau, fft,
+                                         validate=True)
         except RuntimeError as exc:
             victim, msg = drop, str(exc)
             break
@@ -455,8 +459,8 @@ def test_validation_off_returns_the_broken_table_instead_of_raising():
     fft, syms, tau, cent = _closed_centroids()
     for drop in range(cent.shape[0]):
         trial = np.delete(cent, drop, axis=0)
-        perm, _ = compute_centroid_sym_perm(trial, syms, 2 * np.pi * tau, fft,
-                                            validate=False)
+        perm, _ = centroid_source_map_and_wrap(
+            trial, syms, 2 * np.pi * tau, fft, validate=False)
         if (perm < 0).any():
             return
     pytest.fail("no dropped centroid produced an unmapped image; the set "
@@ -464,7 +468,7 @@ def test_validation_off_returns_the_broken_table_instead_of_raising():
 
 
 def test_the_rgrid_permutation_covers_the_whole_fft_grid():
-    """``compute_rgrid_sym_perm`` — the ζ-side twin of the centroid table.
+    """``fft_grid_pullback_perm`` — the ζ-side twin of the centroid table.
 
     Every row must be a permutation of the FULL grid (nothing escapes a
     grid that is closed by construction), and the identity row must be the
@@ -473,7 +477,7 @@ def test_the_rgrid_permutation_covers_the_whole_fft_grid():
     fft = np.array([4, 4, 2], dtype=np.int64)
     syms = np.stack([np.eye(3, dtype=np.int64),
                      np.diag([1, -1, 1]).astype(np.int64)])
-    perm = compute_rgrid_sym_perm(syms, np.zeros((2, 3)), fft, validate=True)
+    perm = fft_grid_pullback_perm(syms, np.zeros((2, 3)), fft, validate=True)
     n = int(np.prod(fft))
     assert perm.shape == (2, n)
     np.testing.assert_array_equal(perm[0], np.arange(n))

@@ -92,7 +92,59 @@ def _read_reference(path):
 
 
 def _read_bgw(path):
+    # Column 0 is the excitation energy in eV.  BerkeleyGW writes this file in
+    # BSE/absp_io.f90:120-123 -- under TDA, `write(14,'(4e16.8)') evals(ii),
+    # cs(ii,ipol), dipoles_r(ii,ipol)` -- with evals converted to eV one step
+    # earlier at BSE/diag.f90:766-767.  The four-column header this fixture
+    # carries is the CPLX+TDA branch (absp_io.f90:106-108); the non-TDA branch
+    # writes six.
+    #
+    # The rows are the algebraically LOWEST `neig` eigenvalues in ascending
+    # order, on both solver paths.  Serial: BSE/diagonalize.f90:112-118 picks
+    # range='I' whenever neig < nmat, and lines 261-262 set ilow=1, iup=neig.
+    # ScaLAPACK, which is what actually produced this fixture (the run log
+    # says "Using diagonalization routine: PZHEEVX"): BSE/diagonalize.f90:807
+    # calls diagonalize_scalapack, and Common/scalapack_hl.f90:369-373 sets
+    # range_char='I' for Neig/=N while the call at :445-451 passes il=1,
+    # iu=Neig.  So this column is directly comparable to LORRAX's lowest-N
+    # vector, with no offset and no reordering.
     return np.loadtxt(path, comments="#")[:, 0]
+
+
+def _assert_aligned(got, ref):
+    """Fail loudly when the two lists are not describing the same states.
+
+    Both eigenvalue lists are compared BY INDEX: state i of LORRAX against
+    state i of BerkeleyGW.  That is the right comparison only while both
+    codes resolve the same states in the same order.  LORRAX takes its
+    spectrum straight off the Lanczos tridiagonal -- `argsort(evals_T)[:n_eig]`
+    in src/solvers/lanczos.py, with no ghost filtering -- so one spurious
+    repeated Ritz value inserts an extra entry and shifts every state after
+    it by one.  Index matching then compares state i to state i-1 and the
+    result reads as a physics disagreement rather than as the bookkeeping
+    accident it is.
+
+    MEASURED on this fixture: injecting one duplicate Ritz value anywhere in
+    the lowest 16 raises max |delta| from 8.9 meV to 69.6 meV, which breaches
+    the band below and would otherwise be reported as "LORRAX disagrees with
+    BerkeleyGW".  Dropping the offending entry recovers a normal match, and
+    that asymmetry is the signature this check keys on.  It does not change
+    which runs pass -- it changes what a failure is called.
+    """
+    n = len(ref)
+    base = np.abs(got[:n] - ref)[:n - 1].mean()
+    drops = [np.abs(np.delete(got[:n], k) - ref[:n - 1]).mean()
+             for k in range(n)]
+    best_k = int(np.argmin(drops))
+    if drops[best_k] < 0.5 * base:
+        raise AssertionError(
+            "BSE eigenvalue lists are misaligned, not merely in disagreement: "
+            f"index matching gives MAE {base * 1e3:.3f} meV, but dropping "
+            f"LORRAX entry {best_k} (E = {got[best_k]:.6f} eV) gives "
+            f"{drops[best_k] * 1e3:.3f} meV.  That is the signature of a "
+            "spurious repeated Lanczos Ritz value shifting the list, not of "
+            "a kernel or screening error.  Check the Lanczos iteration count "
+            "before reading the delta below as physics.")
 
 
 @pytest.mark.regression
@@ -136,7 +188,11 @@ def test_bse_matches_frozen_and_bgw(tmp_path):
         err_msg="BSE eigenvalues drifted from the frozen LORRAX reference")
 
     # 2. External band against BerkeleyGW.  Reported on failure so a
-    #    drift shows how far outside the band it landed.
+    #    drift shows how far outside the band it landed.  The alignment
+    #    check runs first: an index-matching failure and a physics failure
+    #    look identical in the numbers below, and only one of them is about
+    #    the physics.
+    _assert_aligned(got, bgw)
     delta = np.abs(got - bgw)
     mae, worst = float(delta.mean()), float(delta.max())
     assert mae <= BGW_MAE_BAND_EV and worst <= BGW_MAX_BAND_EV, (

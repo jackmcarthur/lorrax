@@ -288,7 +288,7 @@ def valence_density_from_kpoint(
 # that residual, while every other term agrees to round-off.
 #
 # The permutation table and the star average are BOTH taken from the
-# existing implementations (``symmetry_maps.compute_rgrid_sym_perm``,
+# existing implementations (``symmetry_maps.fft_grid_pullback_perm``,
 # ``gw.qsgw_density.symmetrise_density``, already used by the QSGW density
 # loop and by ζ's full-BZ unfold) so there is one grid-rotation convention
 # in the code base, not two.
@@ -329,6 +329,20 @@ def _rho_sym_perm(wfn, fft_grid: tuple[int, int, int]):
     the operation is not representable as a grid permutation at all.  The
     last case is reported, never rounded away: averaging over a subset of
     the group is not a projector, so a partial table is refused.
+
+    NOT CONSOLIDATED ONTO THE CLOSURE VERDICT, deliberately (fan-out audit
+    2026-08-08).  ``gw.qgrid_symmetry`` resolves whether the CENTROID SET
+    is closed under the group, and hands back the ``(α, L)`` tables that
+    permute the μ index of an ISDF operator.  This site asks a different
+    question of a different table: ``fft_grid_pullback_perm`` permutes the
+    FULL FFT grid, which is closed under the group by construction, so the
+    only way it fails is a ``τ`` that is not commensurate with the grid.
+    ``CentroidClosureVerdict`` has nothing to say about that — routing this
+    through the q-grid resolution would answer a question about centroids
+    to justify a decision about ρ, and would announce "solving on the full
+    BZ" for a fallback that is about the Hartree potential and not about q
+    at all.  The two share a convention, not a decision.  The warning below
+    IS this site's announcement; it names the same consequence shape.
     """
     ntran = int(getattr(wfn, "ntran", 0) or 0)
     mats = getattr(wfn, "sym_matrices", None)
@@ -343,9 +357,9 @@ def _rho_sym_perm(wfn, fft_grid: tuple[int, int, int]):
 
     from ffi import _services
     _services.ensure_on_path()
-    from symmetry_maps import compute_rgrid_sym_perm
+    from symmetry_maps import fft_grid_pullback_perm
     try:
-        perm = compute_rgrid_sym_perm(mats, taus, fft_grid, validate=True)
+        perm = fft_grid_pullback_perm(mats, taus, fft_grid, validate=True)
     except Exception as exc:
         warnings.warn(
             f"rho symmetrisation is UNAVAILABLE on the {tuple(fft_grid)} "
