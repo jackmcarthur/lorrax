@@ -420,7 +420,39 @@ def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data,
 _PROBE_TICK = None      # instrument: set by an out-of-tree profiling probe
 
 
-def main(argv=None):
+def rerun_check_enabled(args) -> bool:
+    """Is the diagnostic warm re-run of the solve scan switched on?
+
+    The re-run is a pure reproducibility assert: it re-solves the ENTIRE Q
+    scan a second time and compares the two tables.  It buys no physics, and
+    it was measured at **37.7 % of driver wall** at P=4 / 41 Q (and 38.1 % at
+    P=64 / 91 Q, job 7882533) — the single largest row in the stage table.
+    That is why the default flipped OFF on 2026-08-08 and the check now has to
+    be asked for, with ``--rerun-check``.
+
+    ``--skip-rerun-check`` predates the flip and is still accepted, because
+    the campaign harnesses and the archived launch recipes pass it.  It now
+    *names* the default instead of changing it, and it still wins if both
+    flags are given: a flag whose name says "skip" must never switch the
+    re-run on.
+
+    This predicate is the ONE place the decision is taken — the driver calls
+    it rather than inlining the boolean, so that
+    ``tests/test_exciton_bands_rerun_default.py`` gates the expression the
+    driver actually evaluates rather than a copy of it.
+    """
+    if getattr(args, "skip_rerun_check", False):
+        return False
+    return bool(getattr(args, "rerun_check", False))
+
+
+def build_parser():
+    """The driver's argparse parser, built where a test can reach it.
+
+    This used to be inline in ``main``, which meant the only way to observe a
+    flag's default was to run a full solve.  It is a plain extraction: same
+    arguments, same order, same defaults.
+    """
     import argparse
     # ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE
     # resolver, and the CLI vocabulary is the resolver's own list rather
@@ -429,7 +461,7 @@ def main(argv=None):
     # and ``scalapack``, so the CPU distributed eigh was unreachable from
     # here).  Function-local because gw_config parses decks and this
     # module is imported by things that do not.
-    from gw.gw_config import eigh_backend_choices, resolve_eigh_backend
+    from gw.gw_config import eigh_backend_choices
 
     ap = argparse.ArgumentParser(allow_abbrev=False,
         description="Exciton bandstructure E_S(Q) along a K_POINTS crystal_b path")
@@ -494,10 +526,18 @@ def main(argv=None):
                          "process per device.")
     ap.add_argument("--px", type=int, default=1)
     ap.add_argument("--py", type=int, default=1)
+    ap.add_argument("--rerun-check", action="store_true",
+                    help="RUN the diagnostic warm re-run of the solve scan "
+                         "(reproducibility assert + dispatch-only per-Q "
+                         "timing).  OFF by default since 2026-08-08: the "
+                         "re-run is a full second solve pass and measured "
+                         "37.7%% of driver wall at P=4/41 Q.  Ask for it when "
+                         "a configuration is new or under suspicion.")
     ap.add_argument("--skip-rerun-check", action="store_true",
-                    help="skip the diagnostic warm re-run of the solve scan "
-                         "(reproducibility assert + dispatch-only timing); "
-                         "the re-run costs a full second solve pass")
+                    help="skip the diagnostic warm re-run.  This is now the "
+                         "DEFAULT and the flag is a no-op kept so existing "
+                         "harnesses and launch recipes keep parsing; it wins "
+                         "over --rerun-check if both are passed.")
     ap.add_argument("--extra-q", type=str, default=None,
                     help="';'-separated extra fractional Q (each 'x,y,z') "
                          "appended to the path and solved in the SAME scan "
@@ -517,6 +557,16 @@ def main(argv=None):
                          "interpolation) for the direct term.  Enables cheap "
                          "coarse-W + fine exciton sampling.  Default (unset) "
                          "keeps the native fine W byte-identical.")
+    return ap
+
+
+def main(argv=None):
+    # ``resolve_eigh_backend`` stays a function-local import for the reason
+    # given in ``build_parser``: gw_config parses decks, and this module is
+    # imported by things that do not.
+    from gw.gw_config import resolve_eigh_backend
+
+    ap = build_parser()
     args = ap.parse_args(argv)
 
     # ---- Stage timing -----------------------------------------------------
@@ -957,12 +1007,14 @@ def main(argv=None):
     evs_all = _gather_host(evs_dev)                   # (n_solve, n_eig) Ry
     t_first = time.time() - t_c0
     tick("solve_scan_cold", t_c0)
-    if not args.skip_rerun_check:
+    if rerun_check_enabled(args):
         # warm re-run: census-clean per-Q cost + reproducibility assert.
         # Pure diagnostic — it re-executes the ENTIRE Q scan a second time.
-        # Measured share of the wall when it is on (P=64, 91 Q, job 7882533):
-        # 1767.17 s of a 4633.36 s run = 38.1%, the single largest row in the
-        # table.  ``--skip-rerun-check`` removes exactly that and nothing else.
+        # Measured share of the wall when it is on: 1767.17 s of a 4633.36 s
+        # run = 38.1% at P=64/91 Q (job 7882533), 47.74 s of 126.46 s = 37.7%
+        # at P=4/41 Q — the single largest row in the table either way.  Which
+        # is why it is OFF unless ``--rerun-check`` asks for it; see
+        # ``rerun_check_enabled`` for the whole decision.
         t_w0 = time.time()
         evs2 = _gather_host(
             solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
@@ -976,10 +1028,11 @@ def main(argv=None):
         log(f"  [diagnostic cost] the warm re-run is a REPRODUCIBILITY CHECK, "
             f"not physics: it re-solves all {n_solve} Q and is "
             f"{100.0*t_warm/max(time.time()-t_wall, 1e-9):.0f}% of the wall so "
-            f"far.  Pass --skip-rerun-check once this configuration is trusted.")
+            f"far.  Drop --rerun-check once this configuration is trusted.")
     else:
         log(f"solve_path: cold {t_first:.2f}s (incl. ONE compile) over "
-            f"{n_solve} Q; warm re-run check SKIPPED")
+            f"{n_solve} Q; warm re-run check SKIPPED (the default since "
+            f"2026-08-08 — pass --rerun-check to run it)")
     t0 = time.time()
     mem = solver.lower(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                        data["psi_v_X"], data["psi_v_Y"], data["eps_v"],
