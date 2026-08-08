@@ -160,6 +160,7 @@ from symmetry_maps.qirr_store import (
     QirrHeader,
     QirrTables,
     allocate_qirr_placeholder,
+    dataset_q_storage,
     read_tables,
     read_tensor,
     write_qirr_tensor,
@@ -208,6 +209,7 @@ __all__ = [
     "FULL_BZ_CONSEQUENCE",
     # q_irr restart tensors: the wedge on disk, the unfold on read
     "write_qirr_tensor", "read_tensor", "read_tables",
+    "dataset_q_storage",
     "allocate_qirr_placeholder", "QirrTables", "QirrHeader",
     "QIRR_FORMAT_VERSION",
     # the TRS measurement

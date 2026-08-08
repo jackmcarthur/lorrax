@@ -760,6 +760,48 @@ def _header_from(ds, tgrp, tables):
     )
 
 
+def dataset_q_storage(ds) -> str:
+    """``"ibz"`` or ``"full"`` for an OPEN h5py dataset, reading no data.
+
+    THE PROBE A CONSUMER ASKS BEFORE IT DECIDES HOW TO READ.  Every restart
+    reader in the tree already holds an open dataset when it has to choose a
+    path, and the choice must cost attrs rather than a gigabyte: a consumer
+    that had to call :func:`read_tensor` to find out whether it wanted
+    :func:`read_tensor` would materialise the tensor to answer.
+
+    THE SAME THREE-WAY RULE AS :func:`read_tensor`, and it is here rather
+    than copied into each caller because a second implementation of "is this
+    a q_irr file" is how a reader ends up disagreeing with the format about
+    what it is holding:
+
+    * no ``qirr_*`` attrs at all -> ``"full"``.  Every restart file written
+      before this format existed, unchanged;
+    * a full stamp -> whatever ``q_storage`` says;
+    * a PARTIAL stamp -> refuse.  The missing half is exactly the half that
+      would say whether the shape means what it looks like.
+
+    This reads the ATTR and not the shape, deliberately and unlike
+    :func:`read_tensor`, which cross-checks the two.  The cross-check needs
+    the tables; this is the cheap question asked before the tables are
+    opened, and the expensive answer still refuses on a disagreement.
+    """
+    present = [a for a in _OWNED_ATTRS if a in ds.attrs]
+    if _VERSION_ATTR not in ds.attrs:
+        if present:
+            raise ValueError(
+                f"qirr_store: {ds.name!r} carries q_irr attrs {present} but "
+                f"no {_VERSION_ATTR!r}.  'No attrs' is read as "
+                f"q_storage='full' for backward compatibility; a PARTIAL "
+                f"stamp is not.")
+        return "full"
+    stamped = _attr_str(ds, "q_storage")
+    if stamped not in ("ibz", "full"):
+        raise ValueError(
+            f"qirr_store: {ds.name!r} stamps q_storage={stamped!r}, which is "
+            f"neither 'ibz' nor 'full'.")
+    return stamped
+
+
 def read_tables(src, name, *, mode="r") -> QirrTables:
     """The stored unfold tables for ``name``, as written.
 

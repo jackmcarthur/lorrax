@@ -153,6 +153,77 @@ def _refuse_unpersisted(dset, name: str, restart_file: str) -> None:
         f"GW leg that writes it.")
 
 
+def is_q_wedge(dset) -> bool:
+    """Is this restart tensor stored on the IBZ q wedge?  ATTRS ONLY.
+
+    The cheap question, asked before a reader commits to a path.  It is a
+    one-line wrapper because the ANSWER must have one implementation —
+    ``symmetry_maps.qirr_store.dataset_q_storage``, which also owns the
+    refusal on a partially-stamped file — and because the service-path
+    bootstrap belongs in one place rather than at every probe site.
+
+    ``False`` for every restart file written before the q_irr format and
+    for every file a ``restart_q_storage = full`` run writes, which is what
+    keeps those readers on the byte path they have always had.
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import dataset_q_storage
+    return dataset_q_storage(dset) == "ibz"
+
+
+def restart_munu_full_bz(dset, name: str, restart_file: str):
+    """THE ONE PLACE A RESTART V/W TENSOR BECOMES A FULL-BZ HOST ARRAY.
+
+    Returns a numpy ``(…, μ, ν)`` array on the FULL BZ, whatever q-set the
+    file stores it on.  Every h5py-side restart reader in this module and in
+    ``bse.vq_interp`` asks this instead of subscripting the dataset, so the
+    question "is this file a q wedge" is asked once and answered once.
+
+    THE LEGACY PATH IS THE SAME BYTES IT ALWAYS WAS.  A dataset with no
+    ``qirr_*`` attrs — which is every restart file written before the format
+    existed, and every file a ``restart_q_storage = full`` run writes today —
+    goes through ``dset[()]`` and nothing else happens.  That is not a
+    tolerance claim, it is the same expression the callers used before.
+
+    ON A WEDGE IT UNFOLDS ONCE, ALL AT ONCE, and that is the design rather
+    than a shortcut (followup_survey_symmetry_maps.md §5, carried into the
+    phase-3 brief: per-q reconstruction is unavailable and, per the owner,
+    memory was never the goal — disk size and write time were).  The unfold
+    is ``symmetry_maps.unfold_isdf_operator`` driven by the tables stored
+    IN THE FILE, so what comes back is the same function of the same inputs
+    the producing run itself used, not a re-derivation that could drift.
+
+    WHY THE MESH IS THIS MODULE'S BUSINESS AND NOT THE FORMAT'S.  The
+    unfold is a sharded double-gather and needs a mesh; the format layer
+    must not pick one, because "which devices" is a run-level decision.
+    Callers here are on the host single-device path, so
+    ``collectives.single_device_mesh()`` is what they get, named at the
+    site.  The genuinely sharded transport does not come through here — see
+    ``_MunuSlabPlan``, which refuses a wedge rather than reading one it
+    cannot redistribute.
+
+    THE μ PAD IS NOT RE-APPLIED HERE.  The file stores the LOGICAL extent
+    (652b731e / SHARDING_RULES §2) and every caller of this function pads on
+    its own axis afterwards — ``_read_psi_mu_sharded`` and friends take
+    ``n_rmu_pad`` and zero-fill.  Asking for the pad here would produce an
+    array padded to THIS process's device count, which is precisely the
+    device-count-dependent quantity the format exists to keep off disk.
+    """
+    if not is_q_wedge(dset):
+        return np.asarray(dset[()])
+    from symmetry_maps import read_tensor
+    from common.collectives import single_device_mesh
+    grp = dset.parent
+    full, header = read_tensor(grp, name, mesh_xy=single_device_mesh())
+    if not header.was_unfolded:                       # pragma: no cover
+        raise AssertionError(
+            f"{restart_file}: {name} probed as a q wedge and read back as "
+            f"{header.q_storage!r}; the attr and the shape disagree, which "
+            f"qirr_store.read_tensor should already have refused.")
+    return np.asarray(full)
+
+
 def _generate_kpts_grid(nkx: int, nky: int, nkz: int) -> np.ndarray:
     """Monkhorst-Pack style k-point grid in crystal coords [0, 1), C-order.
 
@@ -663,6 +734,18 @@ def _resolve_munu_reader(
     loader reads next.  Element-for-element the two routes select the same
     numbers; this one just does not read the other q's.
     """
+    # ---- THE q WEDGE, UNFOLDED ONCE, BEFORE ANY LAYOUT QUESTION --------
+    # A q_irr file's q axis is the IBZ, so every shape rule below — and
+    # every consumer's ``nkx*nky*nkz == nq`` arithmetic — is about a
+    # tensor that does not exist yet.  Unfold first, then the three
+    # layouts are the three layouts.  ``restart_munu_full_bz`` is the
+    # single seam and is a no-op on every legacy/full-BZ dataset, so the
+    # closures below still read the DATASET on those and nothing about
+    # the byte path changes.  The unfolded array is a host numpy array
+    # and slices identically, which is why the closures need no branch.
+    if is_q_wedge(dset):
+        dset = restart_munu_full_bz(dset, dset.name.lstrip("/"),
+                                    dset.file.filename)
     if dset.ndim == 8:
         n_rmu = int(dset.shape[6])
         n_rnu = int(dset.shape[7])
@@ -921,9 +1004,33 @@ class _MunuSlabPlan:
                 f"_MunuSlabPlan: unsupported V/W dataset rank {self.ndim} "
                 f"(shape {self.ds_shape}); expected 8-D, 6-D or 3-D flat-q.")
         if self.q_axes == 1 and int(self.q_extent[0]) != self.nq:
+            # THE q_irr WEDGE ARRIVES HERE, AND IS REFUSED — deliberately,
+            # and the message says so rather than leaving an operator to
+            # read "the q extent is wrong" and go looking for a truncated
+            # file.  This plan describes a per-rank (μ, ν) HYPERSLAB read
+            # through SlabIO, and the unfold is a double-gather ACROSS the
+            # μ and ν axes: a rank holding one (μ, ν) block does not hold
+            # the elements its own block's images come from, so there is
+            # nothing this plan could ask SlabIO for that would let it
+            # reconstruct a full-BZ q.  Unfolding needs the whole tensor
+            # and a mesh (``bse_io.restart_munu_full_bz`` does that on the
+            # host path), which is a different transport, not a different
+            # offset.  A wedge file therefore reads through the serial
+            # h5py readers or not at all; ``restart_q_storage = full``
+            # writes a file this transport can take.
+            _extra = ""
+            if int(self.q_extent[0]) < self.nq:
+                _extra = (
+                    "  If this file was written with restart_q_storage=auto "
+                    "or =ibz it is stored on the IBZ q WEDGE, and the SlabIO "
+                    "hyperslab transport cannot unfold it (the unfold gathers "
+                    "across the μ/ν axes this plan shards on).  Re-run the GW "
+                    "leg with restart_q_storage=full, or read through the "
+                    "serial h5py path.")
             raise ValueError(
                 f"_MunuSlabPlan: kgrid {self.kgrid} (nq={self.nq}) "
-                f"disagrees with the dataset q extent {self.q_extent[0]}")
+                f"disagrees with the dataset q extent "
+                f"{self.q_extent[0]}.{_extra}")
         self.n_rmu = int(self.ds_shape[-2])
         self.n_rnu = int(self.ds_shape[-1])
 
@@ -1954,9 +2061,16 @@ def _load_ring_subset(
             "as the P>1 preview/ring paths already do.")
     with h5py.File(restart_file, "r") as f:
         _refuse_unpersisted(f["V_qmunu"], "V_qmunu", restart_file)
-        V_qmunu = jnp.asarray(f["V_qmunu"][:])
+        # ``restart_munu_full_bz`` is ``dset[()]`` on every legacy and
+        # full-BZ file — the identical bytes this line read before — and
+        # unfolds the stored wedge on a q_irr file.  This reader is the
+        # FULL-FILE one by construction, so the all-at-once unfold is the
+        # shape it already had.
+        V_qmunu = jnp.asarray(
+            restart_munu_full_bz(f["V_qmunu"], "V_qmunu", restart_file))
         if "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
-            W0_qmunu = jnp.asarray(f["W0_qmunu"][:])
+            W0_qmunu = jnp.asarray(
+                restart_munu_full_bz(f["W0_qmunu"], "W0_qmunu", restart_file))
         else:
             W0_qmunu = None
         # G0_mu_nu = ζ(q=0, μ, G=0) — rank-1 head projector. Persisted by the
