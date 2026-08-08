@@ -13,7 +13,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.shard_map import shard_map as _shard_map_fn
 
 import common.timing as timing
-from common.collectives import prepare_mesh, resolve_mesh
+from common.collectives import gather_to_host, prepare_mesh, resolve_mesh
 from common.contract_bands import contract_bands_block_reshard
 from common.fft_helpers import (
     local_fftn3,
@@ -1313,7 +1313,11 @@ def ring_matvec_correctness_check(
         HX_ring = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
         HX_ring.block_until_ready()
 
-    HX_ring_host = jax.device_get(HX_ring)
+    # ``gather_to_host``: HX_ring carries ``out_shardings=sh.X`` =
+    # P(None,'x','y',None), tiled on BOTH mesh axes, so a bare ``device_get``
+    # raised at P>1 -- i.e. the ring-matvec correctness check could not be run
+    # on the geometry whose correctness it exists to check.
+    HX_ring_host = gather_to_host(HX_ring)
     diff = jnp.linalg.norm(HX_ring_host - HX_ref) / jnp.maximum(jnp.linalg.norm(HX_ref), 1e-12)
     print(f"Relative error ||HX_ring - HX_ref||/||HX_ref||: {float(diff):.3e}")
 

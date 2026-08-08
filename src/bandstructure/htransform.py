@@ -44,6 +44,7 @@ from common.fft_helpers import make_flat_k_ifftn
 # Q's r axis is split over the ('x','y') PRODUCT and its extent is an FFT-box
 # size, so it divides that product only by luck.  Raw, that is a refusal, not a
 # degradation — see the fitted ``sharding_y`` in streaming_galerkin_solve.
+from common.collectives import gather_to_host
 from common.sharding_fit import fit_sharding as _fit
 from common.sharding_fit import padded_extent as _pad_to
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
@@ -1479,7 +1480,12 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         _t0 = _perf()                                      # instrument:
         energies_on_path, energies_sorted_jax = _post_kpath(
             tuple(lambda_q_list), int(nq), int(nb_keep))
-        energies_sorted = np.asarray(energies_sorted_jax)
+        # ``gather_to_host``: ``_post_kpath`` pins no ``out_shardings`` and its
+        # input batches carry P(('x','y'), None) from ``_kpath_batch``, so the
+        # q axis is tiled over the flattened mesh and nothing here de-shards it.
+        # ``np.asarray`` goes through the same ``_value`` path ``device_get``
+        # does and raises identically at P>1.
+        energies_sorted = gather_to_host(energies_sorted_jax)
         timing.record("ht.post_kpath", _perf() - _t0)      # instrument:
         _t0 = _perf()                                      # instrument:
         # Determine Fermi energy as the maximum along path of the wfn.nelec-th band (1-based -> 0-based)
@@ -1569,8 +1575,11 @@ def plot_bands(result):
 def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path):
     if energies_on_path is None or kpath_frac is None or x_path is None:
         return
-    energies = np.asarray(energies_on_path)
-    kpoints = np.asarray(kpath_frac)
+    # Same family as ``bse_io.write_eigenvectors_stream``: a WRITER must not
+    # assume the layout of what it is handed.  ``energies_on_path`` comes
+    # straight out of ``_post_kpath`` with the q axis tiled over the mesh.
+    energies = gather_to_host(energies_on_path)
+    kpoints = gather_to_host(kpath_frac)
     with open(output_path, 'w', encoding='utf8') as fh:
         fh.write('# idx_k idx_b kx ky kz s energy\n')
         for ik in range(energies.shape[0]):

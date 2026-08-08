@@ -137,6 +137,96 @@ def test_bse_eigenvector_writer_has_no_bare_device_get():
         "only because the host fetches moved somewhere unexamined")
 
 
+def _params_fetched_bare(src: str, func_name: str):
+    """Params of ``func_name`` passed straight to ``np.asarray``/``device_get``.
+
+    Scoped rather than module-wide, because the modules this targets also make
+    plenty of host fetches that the sweep proved safe (reduce-on-device-then-
+    move-a-scalar is the CORRECT pattern and a module-wide rule would flag it).
+    What is not negotiable is narrower and checkable: a function that exists to
+    WRITE an array it was handed must not assume that array's layout.
+
+    ``np.asarray`` matters as much as ``jax.device_get`` here -- it goes through
+    the same ``Array._value`` path and raises the same way at P>1.
+    """
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name == func_name):
+            continue
+        params = {a.arg for a in node.args.args}
+        bad = []
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call) or not call.args:
+                continue
+            fn = ast.unparse(call.func)
+            if fn not in ("np.asarray", "numpy.asarray", "jax.device_get"):
+                continue
+            arg = call.args[0]
+            if isinstance(arg, ast.Name) and arg.id in params:
+                bad.append((call.lineno, fn, arg.id))
+        return sorted(bad)
+    raise AssertionError(f"{func_name} not found; the guard has gone stale")
+
+
+def test_nscf_band_writer_does_not_assume_its_arrays_are_addressable():
+    """The NSCF-side analogue of ``bse_io.write_eigenvectors_stream``.
+
+    ``htransform.write_bands_to_file`` is handed ``energies_on_path`` straight
+    out of ``_post_kpath``, which pins no ``out_shardings`` and whose input
+    batches carry ``P(('x','y'), None)`` from ``_kpath_batch`` -- so the q axis
+    is tiled over the flattened mesh and nothing between there and here
+    de-shards it.  Same family, same fix, different driver.
+    """
+    from bandstructure import htransform
+
+    src = inspect.getsource(htransform)
+    bad = _params_fetched_bare(src, "write_bands_to_file")
+    assert not bad, (
+        f"write_bands_to_file fetches its own parameters bare at {bad}. It is a "
+        f"WRITER: it must route them through gather_to_host rather than assume "
+        f"the caller handed it something addressable.")
+
+
+def test_red_twin_the_scoped_writer_guard_actually_fires():
+    """The FALSE case for the scoped guard, both directions."""
+    bad_src = (
+        "import numpy as np\n"
+        "def write_bands_to_file(path, energies, kpts):\n"
+        "    e = np.asarray(energies)\n"
+        "    k = np.asarray(kpts)\n"
+        "    return e, k\n"
+    )
+    assert _params_fetched_bare(bad_src, "write_bands_to_file") == [
+        (3, "np.asarray", "energies"), (4, "np.asarray", "kpts")], (
+        f"the scoped guard missed the bad pattern: "
+        f"{_params_fetched_bare(bad_src, 'write_bands_to_file')}")
+
+    good_src = (
+        "from common.collectives import gather_to_host\n"
+        "def write_bands_to_file(path, energies, kpts):\n"
+        "    e = gather_to_host(energies)\n"
+        "    k = gather_to_host(kpts)\n"
+        "    return e, k\n"
+    )
+    assert _params_fetched_bare(good_src, "write_bands_to_file") == [], (
+        "the scoped guard fires on the FIXED pattern too")
+
+    # A LOCAL that has already been gathered is not a parameter, and must not
+    # be flagged -- otherwise the guard forbids the normal host-side arithmetic
+    # every writer does after the fetch.
+    local_src = (
+        "import numpy as np\n"
+        "from common.collectives import gather_to_host\n"
+        "def write_bands_to_file(path, energies, kpts):\n"
+        "    e = gather_to_host(energies)\n"
+        "    shaped = np.asarray(e).reshape(-1)\n"
+        "    return shaped\n"
+    )
+    assert _params_fetched_bare(local_src, "write_bands_to_file") == [], (
+        "the scoped guard flags a fetch of an already-gathered LOCAL; it is "
+        "supposed to constrain only the function's own parameters")
+
+
 def test_red_twin_the_device_get_guard_actually_fires():
     """The FALSE case, both directions.
 
@@ -271,10 +361,12 @@ def test_feast_runner_core_closes_over_no_arrays():
         runner = BF._get_feast_runner(
             matvec, data, 1, 1, 2, 1e-10, 13.6056980659,
             jnp.complex128, use_conjugate_symmetry=True)
-        core = getattr(runner, "core", None)
-        assert core is not None, (
-            "the runner no longer exposes its jitted core; the guard cannot "
-            "see what is baked into the executable")
+        # Fall back to the runner ITSELF when there is no wrapper: on the
+        # unfixed tree ``_get_feast_runner`` returns the bare ``jax.jit(_run)``,
+        # and unwrapping that gives the very closure under test.  Without this
+        # fallback the cell would go red on a missing attribute instead of on
+        # the bug, which is a strictly weaker red twin.
+        core = getattr(runner, "core", runner)
         leaked = _closed_over_jax_arrays(_unwrap_jit(core))
         assert leaked == [], (
             f"the FEAST runner's jitted body closes over {len(leaked)} "
@@ -314,7 +406,8 @@ def test_feast_runner_core_takes_operands_as_an_argument():
         runner = BF._get_feast_runner(
             matvec, data, 1, 1, 2, 1e-10, 13.6056980659,
             jnp.complex128, use_conjugate_symmetry=True)
-        params = list(inspect.signature(_unwrap_jit(runner.core)).parameters)
+        params = list(inspect.signature(
+            _unwrap_jit(getattr(runner, "core", runner))).parameters)
         assert "operands" in params, (
             f"the FEAST runner's jitted core takes {params}; the ten operand "
             f"arrays must arrive as a runtime ARGUMENT, which is what makes "
