@@ -62,7 +62,7 @@ src/
 │
 ├── common/               # Shared kernels + utilities
 │   ├── meta.py                Meta dataclass (system params, band edges)
-│   ├── symmetry_maps.py       forwarding shim → services/symmetry_maps
+│   ├── (symmetry_maps.py, density_symmetry_check.py → services/symmetry_maps/, 2026-08-07)
 │   ├── load_wfns.py           WFN.h5 reads, per-k FFT, kchunk helpers
 │   ├── isdf_fitting.py        CCT/ZCT kernels, Cholesky, zeta solve, full pipeline
 │   ├── cholesky_2d.py         2D blocked Cholesky (sharded)
@@ -83,7 +83,8 @@ src/
 │   └── phdf5_*                phdf5 benchmarks + plumbing tests
 │
 ├── file_io/              # Canonical file-format I/O (used by gw_jax)
-│   ├── wfn_loader.py          SHIM -> services/wfn_loader/ (WFNReader alias lives here)
+│   ├── (wfn_loader.py, zeta_loader.py → services/, 2026-08-07; __init__.py re-exports
+│   │                          WfnLoader / WFNReader / ZetaLoader off the doors)
 │   ├── wfn_writer.py          BGW-compatible WFN.h5 writer
 │   ├── epsreader.py           EPSReader (eps0mat / epsmat)
 │   ├── qe_save_reader.py      CrystalData from QE .save
@@ -201,7 +202,7 @@ Accessors: `wfns.xn(s.val)`, `wfns.xr(s.sigma)`, etc.
 
 ### 2.4 `WfnLoader` — `services/wfn_loader/src/wfn_loader/loader.py`
 
-**Moved 2026-08-07** (wave-1 service extraction). `src/file_io/wfn_loader.py` is now a transitional SHIM that re-exports the same objects, and it dies in the phase-wide cleanup after all four wave-1 branches land — do not edit it, and do not add code there. Full page: [docs/services/wfn_loader.md](../services/wfn_loader.md).
+**Moved 2026-08-07** (wave-1 service extraction), and the transitional shim that briefly stood at `src/file_io/wfn_loader.py` was deleted by the phase-wide cleanup: that path no longer exists, `from file_io.wfn_loader import WfnLoader` raises, and re-creating the file to green a branch is a red cell at `tests/test_service_path_bootstrap.py::test_the_retired_shim_files_are_gone`. Reach the class as `import wfn_loader` (in a process where the service-path bootstrap has run) or as `from file_io import WfnLoader` / `WFNReader`. Full page: [docs/services/wfn_loader.md](../services/wfn_loader.md).
 
 Reads BerkeleyGW `WFN.h5`. `backend='auto'` (default) picks `eager` (h5py + numpy) or `phdf5` (one collective read through `SlabIO.read_slabs` + on-device unfold), and the two are held **byte-identical**. Symmetry unfolding is the loader's: `SymMaps.get_gvecs_kfull` / `get_cnk_fullzone[_batch]` moved into it, and `SymMaps` keeps the sym tables and the IBZ k/q maps. The legacy `WFNReader` / `PhdfWfnReader` readers (formerly in both `common/` and `file_io/`) were consolidated into this single class; `PhdfWfnReader` is gone and `WFNReader` remains as a back-compat alias (`from file_io import WfnLoader as WFNReader`) used by the GW driver, BSE, and benchmarks.
 
@@ -218,7 +219,10 @@ unfolds, the real-space orbit machinery and the TRS measurement live in
 `services/symmetry_maps/` and are reached by `import symmetry_maps` —
 never through a submodule path. `src/common/symmetry_maps.py`,
 `src/centroid/orbit_syms.py` and `src/common/density_symmetry_check.py`
-are forwarding shims that the phase-wide cleanup commit deletes. Read
+were forwarding shims only briefly, and the phase-wide cleanup deleted
+them the same day; those three paths are gone, their absence is pinned by
+`tests/test_service_path_bootstrap.py::test_the_retired_shim_files_are_gone`,
+and the old spellings now raise rather than forward. Read
 [`docs/services/symmetry_maps.md`](../services/symmetry_maps.md) for the
 contract — in particular which conjugation predicate goes with which
 operand flavour, which is a 183.61 eV question.

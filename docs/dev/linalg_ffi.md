@@ -13,7 +13,7 @@
 > | `ffi/linalg/resolve.py` (`resolve_backend`, `list_backends`, `backend_module`, `BACKEND_CHOICES`, `_SPEC`) | `distrib_la.resolve` |
 > | `ffi/linalg/dispatch.py` (`dispatch_batched_eigh`) | `distrib_la.dispatch` |
 > | `ffi/linalg/_slate.py` / `_scalapack.py` | `distrib_la._slate` / `._scalapack` |
-> | `ffi/linalg/_slate._mesh_key` | `distrib_la.mesh_key` — **public now**, and there is one of it |
+> | `ffi/linalg/_slate._mesh_key` | `distrib_la.mesh_key` — **public now**, and every backend in the service calls it. One private copy survives outside the service, at `src/ffi/cublasmp/batched.py:47`; it is shape-only (no device identity), and it is bench-only code scheduled for the owner's deletion pass, so it is a leftover rather than a second implementation to keep in sync |
 > | `ffi.slate` / `ffi.scalapack` (the wrapper packages) | `distrib_la._slate` / `._scalapack`; the README is `services/distrib_la/docs/slate_backend.md` |
 > | `common.cholesky_2d` (`cholesky_2d_batched`, `dense_to_tiles`, `tiles_to_dense`) | `distrib_la._native2d`, reached as `plan('cholesky', mesh, backend='native2d')` |
 > | `ffi/common/ffi_loader.py`'s linalg half | `distrib_la.loader` (lorrax's loader keeps the FFT/GEMM/phdf5 half) |

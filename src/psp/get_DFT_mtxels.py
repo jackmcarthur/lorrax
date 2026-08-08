@@ -51,7 +51,7 @@ from typing import NamedTuple
 
 # Full-BZ G-vectors for compute_valence_density (replaces
 # ``sym.get_gvecs_kfull`` per-k calls).  ``wfn`` is a
-# ``file_io.wfn_loader.WfnLoader`` everywhere in this repo, and the
+# ``wfn_loader.WfnLoader`` everywhere in this repo, and the
 # loader already memoises ``gvecs()`` / ``ngk_valid()`` internally — use
 # it directly.  The per-path fallback loader (kept for any legacy
 # WFNReader-shaped handle) opens a SECOND file handle and re-reads the
@@ -367,7 +367,7 @@ def symmetrize_valence_density(rho_r, wfn, *, print_fn=None):
     array back to round-off.  ∫ρ d³r is preserved exactly.
 
     ``wfn`` is any handle carrying ``ntran`` / ``sym_matrices`` /
-    ``translations`` (a :class:`file_io.wfn_loader.WfnLoader` everywhere in
+    ``translations`` (a :class:`wfn_loader.WfnLoader` everywhere in
     production); one that does not is left alone.
     """
     if not density_symmetrisation_enabled():

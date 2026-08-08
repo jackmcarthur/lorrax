@@ -33,7 +33,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `services/symmetry_maps/` | **The crystal-symmetry service**: one door for `SymMaps` (IBZ→full BZ tables, spinor rotations), the k-star index map, the sharded q-axis unfolds, the real-space orbit machinery and the time-reversal MEASUREMENT (was `src/common/symmetry_maps.py`, `src/centroid/orbit_syms.py`, `src/common/density_symmetry_check.py`). Read `docs/services/symmetry_maps.md` first | Symmetry / k-point unfolding; star conjugation; TRS verdicts |
 | `src/common/minimax.py` | Minimax quadrature solvers | Quadrature node/weight issues |
 | `src/common/meta.py` | `Meta` system-parameters dataclass | k/q-grid, band ranges |
-| `src/file_io/wfn_loader.py` | `WfnLoader`: canonical WFN.h5 reader; `backend='auto'` picks the phdf5 (parallel HDF5) async path | Wavefunction loading, async H5 reads |
+| `services/wfn_loader/` | **The ψ(G) loading service**: one door for `WfnLoader`, the canonical WFN.h5 reader, with `backend='auto'` picking the eager or the phdf5 (parallel HDF5) collective read and the two held byte-identical (was `src/file_io/wfn_loader.py`). Reach it as `import wfn_loader`, or as `from file_io import WfnLoader` / `WFNReader`; never a submodule path. Read `docs/services/wfn_loader.md` first | Wavefunction loading, H5 read backends |
 | `src/common/gpu_utils.py` | Host-side GPU memory detection | Chunk auto-sizing |
 | `src/file_io/slab_io.py` | `SlabIO`: phdf5 writer wrapper for zeta_q / V_qmunu | Big HDF5 writes |
 | `src/file_io/sigma_output.py` | Σ output (eqp.dat, sigma.h5) | Output formats |
