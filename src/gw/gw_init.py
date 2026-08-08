@@ -1189,9 +1189,12 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# cascade.  fit_zeta loaded them earlier but didn't surface them
 		# to compute_V_q's signature; reloading is cheap (a text file
 		# read) and keeps the bispinor IBZ wiring local to this branch.
-		# Orbit-closure of the C/T centroid sets is checked inside
+		# Orbit-closure of the C/T centroid sets is resolved inside
 		# ``_resolve_ibz_q_list`` (called per tile by the V_q
-		# orchestrator) and silently falls back to full-BZ on failure.
+		# orchestrator), which falls back to full-BZ on failure and
+		# ANNOUNCES it once per centroid set — the charge and the
+		# transverse set are separate facts and get separate lines.
+		# It used to fall back SILENTLY; see gw/qgrid_symmetry.py.
 		_use_ibz_bispinor = not env_bool(
 			'LORRAX_FORCE_FULL_BZ', False, print_fn=print_fn)
 		if _use_ibz_bispinor:
