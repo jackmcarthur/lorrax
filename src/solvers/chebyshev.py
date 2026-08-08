@@ -27,6 +27,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from common.collectives import gather_to_host
+
 
 def jackson_coefficients(M: int) -> np.ndarray:
     """Jackson damping coefficients sigma_p for p = 0, ..., M.
@@ -165,8 +167,15 @@ def chebyshev_moments(
         x_rand = make_random_vector(subkey)
 
         # One device round-trip per random vector (not per moment).
+        # ``gather_to_host``, not a bare ``device_get``: the moment vector is
+        # the output of reductions over a caller-supplied ``apply_h_tilde``, so
+        # this module cannot know whether the mesh left it replicated or tiled,
+        # and ``device_get`` raises on the tiled case at P>1.  The helper's
+        # replicated/1-GPU arms ARE the plain ``device_get`` that was here, so
+        # this costs nothing where it was already correct.  Gated module-wide by
+        # ``tests/test_solver_p_gt_1_safety.py``.
         mu_r = recurrence(x_rand)
-        mu += np.asarray(jax.device_get(mu_r))
+        mu += gather_to_host(mu_r)
 
     mu /= n_random * dim
     return mu
