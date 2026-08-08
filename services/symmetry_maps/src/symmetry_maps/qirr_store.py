@@ -664,17 +664,101 @@ def write_qirr_tensor(
                     f"stripping would delete.")
             X = np.ascontiguousarray(X[:, :n_log, :n_log])
         tables = tables.logical(n_log)
-    can = tables.canonical()
-    q_storage = _validate(can, int(X.shape[0]), int(X.shape[1]))
-    table_hash = can.digest()
 
+    # CREATE, THEN STAMP — and the stamp is :func:`stamp_qirr_tensor`, not a
+    # copy of it.  The producer writes its wedge through SlabIO and stamps
+    # separately; if that stamp and this one were two code paths they would
+    # be two claims about what the file says, differing on the day one of
+    # them gained an attr.  The tables are already logical here, so the
+    # ``n_rmu_logical=None`` below is not a lost check — the strip and its
+    # three invariants ran above, against the TENSOR that only this path
+    # holds.
     with _Dest(dest, mode) as grp:
         if name in grp:
             del grp[name]
+        grp.create_dataset(name, data=X)
+        return stamp_qirr_tensor(
+            grp, name, tables=tables, closure_verdict=closure_verdict,
+            provenance=provenance, data_ready=data_ready)
+
+
+def stamp_qirr_tensor(
+    dest,
+    name,
+    *,
+    tables: QirrTables,
+    closure_verdict: CentroidClosureVerdict,
+    n_rmu_logical: int | None = None,
+    provenance: dict | None = None,
+    data_ready: bool = True,
+    mode: str = "a",
+):
+    """Make an ALREADY-WRITTEN dataset a q_irr tensor: tables + attrs only.
+
+    WHY THIS EXISTS BESIDE :func:`write_qirr_tensor`.  The GW producer does
+    not write its restart tensors with h5py — it writes them through
+    ``file_io.slab_io.SlabIO``, where every rank contributes its own (μ, ν)
+    hyperslab and no rank ever holds the whole array.  A format function
+    that insists on creating the dataset itself would force that write back
+    through one process, which is a bigger regression than the file size it
+    was saving.  So the producer writes the wedge with the machinery it
+    already has, and this stamps it.
+
+    THE SPLIT IS EXACTLY ONE THING: who calls ``create_dataset``.
+    Everything else — the closure refusal, the μ-pad strip and its three
+    invariants, the table validation, the digest, the attrs, the provenance
+    — is this function, and :func:`write_qirr_tensor` calls it.  One
+    implementation of the stamp, because a second one is a second answer to
+    "what does this file claim".
+
+    THE TENSOR'S PAD IS ALREADY OFF, and that is the one asymmetry with
+    :func:`write_qirr_tensor`.  ``SlabIO`` clips the μ axes to the logical
+    extent on the way out (``tagged_arrays._mu_logical_shape``), so the
+    dataset on disk is logical before this runs and there is no tensor tail
+    left to check.  The TABLES still carry the producer's pad, so
+    ``n_rmu_logical`` strips them — with the identity-tail / zero-wrap
+    assertions intact, since those are the ones that would catch a table
+    that addresses real centroids past the declared extent.  The dataset's
+    own μ extent is asserted against ``n_rmu_logical`` instead: that is the
+    check that replaces the tensor-tail one, and it is what makes a
+    half-clipped write refuse rather than produce a file whose tables and
+    tensor describe different centroid sets.
+    """
+    if not isinstance(closure_verdict, CentroidClosureVerdict):
+        raise TypeError(
+            f"stamp_qirr_tensor: closure_verdict must be a "
+            f"CentroidClosureVerdict, got {type(closure_verdict).__name__}")
+    closure_verdict.raise_if_not_closed(
+        f"stamp_qirr_tensor({name!r}) refuses q_irr storage")
+    if n_rmu_logical is not None:
+        tables = tables.logical(int(n_rmu_logical))
+    can = tables.canonical()
+
+    with _Dest(dest, mode) as grp:
+        if name not in grp:
+            raise KeyError(
+                f"qirr_store: {name!r} is not in this file.  "
+                f"stamp_qirr_tensor stamps a dataset the caller has already "
+                f"written; use write_qirr_tensor to create one.")
+        ds = grp[name]
+        if ds.ndim != 3 or int(ds.shape[1]) != int(ds.shape[2]):
+            raise ValueError(
+                f"qirr_store: {name!r} is {ds.shape}; expected "
+                f"(n_q_ibz, n_mu, n_mu).")
+        n_mu_on_disk = int(ds.shape[-1])
+        if n_rmu_logical is not None and n_mu_on_disk != int(n_rmu_logical):
+            raise ValueError(
+                f"qirr_store: {name!r} has μ extent {n_mu_on_disk} on disk "
+                f"but n_rmu_logical={int(n_rmu_logical)}.  The tables are "
+                f"stripped to the logical extent and the tensor must "
+                f"already be at it; a disagreement here means the tensor "
+                f"and its tables would describe different centroid sets.")
+        q_storage = _validate(can, int(ds.shape[0]), n_mu_on_disk)
+        table_hash = can.digest()
+
         tgrp_name = name + QIRR_TABLE_SUFFIX
         if tgrp_name in grp:
             del grp[tgrp_name]
-        ds = grp.create_dataset(name, data=X)
         tgrp = grp.create_group(tgrp_name)
         for key in _TABLE_ORDER:
             tgrp.create_dataset(key, data=getattr(can, key))
@@ -692,7 +776,6 @@ def write_qirr_tensor(
             closure_verdict.worst_residual)
         ds.attrs["qirr_closure_tol"] = np.float64(closure_verdict.tol)
         ds.attrs["qirr_data_ready"] = bool(data_ready)
-        # Provenance, kin_ion.h5 style.
         ds.attrs["qirr_generator_commit"] = _generator_commit()
         ds.attrs["qirr_written_utc"] = datetime.datetime.now(
             datetime.timezone.utc).replace(microsecond=0).isoformat()

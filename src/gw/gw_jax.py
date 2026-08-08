@@ -411,11 +411,16 @@ def main(argv=None):
 	# NO row of the stage table.  Naming it is the precondition for
 	# anyone attributing that wall time (the write path itself is
 	# workstream AE/AF's; this is the instrument, not the fix).
+	# ``sym``/``centroid_indices`` below are for the q-storage resolution
+	# ONLY (see the callee): W0 must land on the same q-set V did, and the
+	# way to be sure of that is to ask the same resolution point about the
+	# same centroid set rather than to infer it from a shape.
 	with timing.section("gw_jax.persist_w0"):
 		persist_w0_and_head(
 			W_by_role.get("static", V_q),
 			tensors_filename=tensors_filename, head_resolver=head_resolver,
-			config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
+			config=config, meta=meta, mesh_xy=mesh_xy,
+			sym=sym, centroid_indices=centroid_indices, print_fn=print0)
 
 	# q→0 head correction.  The bare-X head is the same physical quantity in
 	# both COHSEX and PPM modes; gating this on ``not use_ppm_sigma`` was

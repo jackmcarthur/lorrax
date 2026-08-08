@@ -73,6 +73,17 @@ class RestartQStorage:
     requested: str
     resolution: object | None
     reason: str
+    #: The ``PreUnfoldCapture`` for the tensor this decision is about, bound
+    #: by :meth:`with_capture` at the writer.  ``None`` on the ``full`` arm
+    #: and until the writer takes it — a decision and the array it applies to
+    #: are two different things, and pairing them at the writer is what lets
+    #: the writer REFUSE the combination "ibz, and nothing captured" instead
+    #: of quietly slicing the unfolded tensor.
+    capture: object | None = None
+
+    def with_capture(self, capture) -> "RestartQStorage":
+        """This decision, bound to the pre-unfold block it describes."""
+        return dataclasses.replace(self, capture=capture)
 
     @property
     def store_wedge(self) -> bool:
@@ -217,5 +228,241 @@ def resolve_restart_q_storage(requested, resolution, *, context: str):
         mode="full", requested=req, resolution=None, reason=why)
 
 
+# ---------------------------------------------------------------------------
+# The producer capture
+# ---------------------------------------------------------------------------
+#
+# WHY THERE IS A CAPTURE AT ALL.  The design's load-bearing decision is that
+# the restart file holds the PRE-UNFOLD IBZ block, so that
+# ``unfold(stored) == what the run used`` is an IDENTITY — the same function
+# on the same inputs — rather than a property that happens to hold because
+# ``sym_idx_q[q_irr_full_idx] == 0`` under an op-selection policy nobody has
+# agreed to freeze for this purpose.  That array exists for exactly one
+# statement, inside ``v_q_g_flat._compute_V_q_g_flat_one_tile`` and inside
+# ``screening``'s W solve, and the writers are three and four call frames
+# away in a different module.
+#
+# WHY NOT THREAD IT THROUGH THE RETURN VALUES.  Both chains return a fixed
+# 2-tuple that a dozen call sites and several test suites unpack
+# positionally, and the V chain is three layers deep with a separate
+# bispinor entry point.  Widening those returns to carry an object that is
+# ``None`` on every non-restart run would touch far more code than the
+# feature, and every one of those edits is a chance to change the compute
+# path — which this feature must not do.
+#
+# WHAT KEEPS A HAND-OFF SLOT FROM BECOMING A STALE GLOBAL.  Three rules,
+# each with a gate:
+#
+#   * ``take`` REMOVES.  A capture read twice is a second writer silently
+#     storing the first one's wedge — the W0 writer storing V's block under
+#     W0's name, which reconstructs to plausible, wrong numbers at every q;
+#   * a deposit happens on the statement BEFORE the unfold it describes, so
+#     the slot never holds an older array than the run's latest compute;
+#   * THE WRITER CROSS-CHECKS.  It does not trust the pairing: the tables on
+#     the capture are compared against the tables the writer's own
+#     resolution holds, and a disagreement REFUSES.  That is what turns "the
+#     compute path and the write path agree" from an assumption into a
+#     measured fact, and it is the check that would catch a stale capture
+#     regardless of how it got there.
+#
+# :func:`capture_scope` exists on top of that for isolation — a test, or a
+# driver that wants a hard boundary, gets a fresh slot and its own teardown.
+
+_SINK: list = [{}]
+
+
+@dataclasses.dataclass(frozen=True)
+class PreUnfoldCapture:
+    """The IBZ block a producer held one statement before it unfolded it.
+
+    ``X_ibz`` is the array itself (device-resident, ``P(None,'x','y')``) and
+    the five table arrays are THE ONES THE UNFOLD ON THE NEXT LINE USED — not
+    a re-derivation, because a table that reconstructs the tensor must be the
+    table that deconstructed it.  ``n_rmu_logical`` is the unpadded centroid
+    count, the quantity the file stores instead of the device-count-dependent
+    padded one (652b731e / SHARDING_RULES §2).
+
+    NO CLOSURE VERDICT TRAVELS HERE.  The writer asks the resolution point
+    for it, through the seam, at the moment it decides — and the tables it
+    gets back are CROSS-CHECKED against the ones captured here, which turns
+    "the compute path and the write path agree" from an assumption into a
+    measured fact.  Carrying the verdict on the capture instead would make
+    the two agree by construction and check nothing.
+    """
+
+    name: str
+    X_ibz: object
+    n_rmu_logical: int
+    q_irr_frac: object
+    irr_idx_q: object
+    sym_idx_q: object
+    sym_perm: object
+    L_table: object
+    n_sym_spatial: int
+
+    def tables(self):
+        """A ``symmetry_maps.QirrTables`` for this capture.
+
+        THE PADDED TABLES, deliberately, and ``n_rmu_logical`` beside them.
+        ``QgridSymmetryResolution.tables()`` returns the UNPADDED pair; the
+        producer bakes the μ pad in afterwards and unfolds with the padded
+        form, so those are the tables that describe this tensor.  The
+        writer strips the pad from both together and asserts the tail
+        really was one (652b731e) — which is a free corruption check the
+        unpadded tables would have skipped.
+        """
+        from symmetry_maps import QirrTables
+        return QirrTables(
+            irr_idx_q=self.irr_idx_q, sym_idx_q=self.sym_idx_q,
+            q_irr_frac=self.q_irr_frac, sym_perm=self.sym_perm,
+            L_table=self.L_table, n_sym_spatial=int(self.n_sym_spatial))
+
+
+class _CaptureScope:
+    """Context manager: a FRESH hand-off slot, discarded on exit.
+
+    Not the thing that makes the hand-off safe — the cross-check at the
+    writer is — but the thing that keeps one test's wedge out of the next
+    one's slot, and available to a driver that wants a hard boundary
+    around a stage.
+    """
+
+    def __enter__(self):
+        _SINK.append({})
+        return self
+
+    def __exit__(self, *exc):
+        _SINK.pop()
+        return False
+
+
+def capture_scope():
+    """A fresh capture slot for the duration of a ``with`` block."""
+    return _CaptureScope()
+
+
+def deposit_pre_unfold(name, X_ibz, *, n_rmu_logical,
+                       q_irr_frac, irr_idx_q, sym_idx_q, sym_perm, L_table,
+                       n_sym_spatial):
+    """Offer the pre-unfold block for whoever is writing the restart file.
+
+    Called from the unfold sites, which do not know and MUST NOT know
+    whether this run persists anything.  Putting the question "am I being
+    captured?" inside the compute path is how the closure question ended up
+    being asked in three places with three different answers; the producer
+    offers, the writer decides.
+
+    Costs one dict store on a run that never writes a restart tensor.
+    """
+    _SINK[-1][str(name)] = PreUnfoldCapture(
+        name=str(name), X_ibz=X_ibz,
+        n_rmu_logical=int(n_rmu_logical), q_irr_frac=q_irr_frac,
+        irr_idx_q=irr_idx_q, sym_idx_q=sym_idx_q, sym_perm=sym_perm,
+        L_table=L_table, n_sym_spatial=int(n_sym_spatial))
+
+
+def take_pre_unfold(name):
+    """The capture for ``name``, REMOVED from the scope.  ``None`` if absent.
+
+    Removing is the point: two writers must not both believe they hold the
+    wedge, and a second read returning the same object is how the W0 writer
+    would end up storing V's block under W0's tables.
+    """
+    return _SINK[-1].pop(str(name), None)
+
+
+def peek_pre_unfold(name):
+    """Non-destructive read, for assertions and logs only."""
+    return _SINK[-1].get(str(name))
+
+
+def assert_capture_matches(capture, resolution, *, context: str) -> None:
+    """REFUSE unless the captured tables are the resolution's own.
+
+    THE CHECK THAT MAKES THE HAND-OFF TRUSTWORTHY.  The capture came out of
+    the compute path; the resolution was taken again at the writer.  If they
+    describe different centroid sets — a stale slot, a bispinor channel
+    crossed, a resolution taken against the wrong ``sym`` — then the file
+    would carry tables that do not reconstruct its tensor, and every q would
+    come back a permutation of the wrong centroids.  Nothing downstream can
+    see that: the shapes agree, the Hermiticity agrees, the spectrum is
+    plausible.  It is the same failure shape as the two conjugation bugs,
+    reached through the plumbing instead of through the algebra.
+
+    Compared on the UNPADDED tables, because that is the form both sides
+    can produce without agreeing about a device count first.
+    """
+    import numpy as np
+
+    perm_res, L_res = resolution.tables()
+    n_log = int(capture.n_rmu_logical)
+    perm_cap = np.asarray(capture.sym_perm)[:, :n_log]
+    L_cap = np.asarray(capture.L_table)[:, :n_log]
+    if not np.array_equal(perm_cap, np.asarray(perm_res)):
+        raise ValueError(
+            f"{context}: the captured pre-unfold block carries a centroid "
+            f"permutation the writer's own q-grid resolution does not "
+            f"produce.  The stored wedge and the tables stored beside it "
+            f"would describe different centroid sets, and every q would "
+            f"reconstruct as a permutation of the wrong centroids — "
+            f"silently, because the shapes agree.")
+    if not np.array_equal(L_cap, np.asarray(L_res)):
+        raise ValueError(
+            f"{context}: the captured umklapp wrap table disagrees with the "
+            f"writer's resolution.  Dropping or mismatching L is wrong only "
+            f"on the q's that wrap, which is the diagonal-preserving, "
+            f"off-diagonal-destroying failure shape this area has shipped "
+            f"twice.")
+    if int(resolution.n_sym_spatial) != int(capture.n_sym_spatial):
+        raise ValueError(
+            f"{context}: n_sym_spatial {capture.n_sym_spatial} on the "
+            f"capture against {resolution.n_sym_spatial} on the resolution; "
+            f"the TRS-augmented half would be read at the wrong offset.")
+
+
+def resolve_restart_q_storage_for_run(config, *, sym, centroid_indices,
+                                      fft_grid, print_fn=print,
+                                      context="V_q / W0 restart tensors"):
+    """The driver's one call: resolve the deck key against THIS run, announce.
+
+    Rank-invariant by construction — a deck key and a centroid file every
+    rank reads, with no env override and no probe — so it adds no collective
+    and cannot make ranks disagree about the file they are about to write
+    together.  That is the same property ``restart_tensor_writes_enabled``
+    relies on and it is stated here because a divergence would present as a
+    hang inside the collective writer rather than as an error.
+
+    THE RESOLUTION POINT IS ASKED AGAIN HERE, not cached from the compute.
+    ``resolve_qgrid_symmetry_tables`` is already called once per V_q pass,
+    once per W solve and once per self-consistency iteration — its
+    announcement is deduped on the centroid set precisely because the tree
+    re-resolves — so one more call is the tree's existing idiom and not a
+    new second opinion.  What it buys is that the writer's decision rests on
+    a resolution the WRITER took, which is what makes
+    :func:`assert_capture_matches` a real check rather than a tautology.
+    """
+    res = None
+    if sym is not None and centroid_indices is not None:
+        from .qgrid_symmetry import resolve_qgrid_symmetry_tables
+        res = resolve_qgrid_symmetry_tables(
+            sym=sym, centroid_indices=centroid_indices, fft_grid=fft_grid,
+            context=context)
+    decision = resolve_restart_q_storage(
+        getattr(config, "restart_q_storage_raw", "auto"), res,
+        context=context)
+    # ANNOUNCED, ONCE, ON RANK 0 — same discipline as the suppress key.
+    # A run whose restart file changed SHAPE and said nothing is a run
+    # nobody can tell from one whose centroid set quietly stopped closing.
+    import jax
+    if jax.process_index() == 0:
+        from ffi.gate import announce_once
+        announce_once(
+            ("restart_q_storage", decision.mode, decision.requested, context),
+            f"  [restart_write] {decision.describe()}",
+            scope="rank0")
+    return decision
+
+
 __all__ = ["RESTART_Q_STORAGE", "RestartQStorage", "closure_for_restart",
-           "resolve_restart_q_storage"]
+           "resolve_restart_q_storage", "PreUnfoldCapture", "capture_scope",
+           "deposit_pre_unfold", "take_pre_unfold", "peek_pre_unfold"]

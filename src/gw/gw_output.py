@@ -316,9 +316,19 @@ def persist_w0_and_head(
     config,
     meta,
     mesh_xy,
+    sym=None,
+    centroid_indices=None,
     print_fn=print,
 ):
     """Persist W0_qmunu + q=0 head scalars to the ISDF restart file.
+
+    ``sym`` / ``centroid_indices`` are the run's symmetry tables and
+    centroid set, and they are here for ONE reason: the q-storage decision.
+    V's writer resolves it in ``gw_init``; this writer must reach the SAME
+    answer, and the only honest way to reach it is to ask the same
+    resolution point about the same centroid set.  Omitting them resolves
+    ``full`` — today's bytes — which is the right answer for a caller that
+    cannot say which centroid set its W was computed against.
 
     Downstream consumers (BSE, future Σ-builders) reload these and apply
     the rank-1 head update via ``head_correction.apply_q0_head_rank1``.
@@ -349,9 +359,30 @@ def persist_w0_and_head(
     # ``phdf5 async write: dataset rank mismatch ds=/W0_qmunu
     # file_rank=3 write_rank=8``.  Downstream (BSE) consumers
     # of W0_qmunu were already updated to flat-q in commit a052a1c.
+    # THE SAME DECISION V TOOK, taken the same way, on W's OWN capture.
+    # ``sym``/``centroid_indices`` reach here through the resolver rather
+    # than through this function's signature because the head/W0 persist
+    # path has never carried them; passing the RUN's config and the
+    # producer's tables is what keeps the two writers on one answer.
+    # ``take_pre_unfold`` REMOVES, so a second persist in a
+    # self-consistency loop cannot re-store the first iteration's W.
+    from .restart_q_storage import (resolve_restart_q_storage_for_run,
+                                    take_pre_unfold)
+    _qirr = resolve_restart_q_storage_for_run(
+        config, sym=sym, centroid_indices=centroid_indices,
+        # ``getattr``, not ``meta.fft_grid``: the grid is read ONLY when
+        # ``sym``/``centroid_indices`` are both present (the resolver
+        # short-circuits to ``full`` otherwise), and this function is
+        # reachable with a minimal meta that carries neither.  Evaluating
+        # it unconditionally would make a caller that asked for nothing
+        # new fail on an attribute it never needed.
+        fft_grid=getattr(meta, "fft_grid", None), print_fn=print_fn,
+        context="W0 restart tensor")
     write_w0_qmunu_to_h5(tensors_filename, W_q,
                          n_rmu_logical=int(meta.n_rmu),
-                         mesh=mesh_xy)
+                         mesh=mesh_xy,
+                         qirr=_qirr.with_capture(
+                             take_pre_unfold("W0_qmunu")))
     head_static = head_resolver.at(0.0 + 0.0j)
     if config.compute_mode.is_dynamic:
         # GN-PPM: probe at iωp on the imaginary axis.

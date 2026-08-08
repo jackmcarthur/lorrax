@@ -384,6 +384,20 @@ def compute_static_w(
                               f"({nq_solve} q -> {int(meta.nk_tot)} q)"):
                     n_sym_spatial = int(
                         np.asarray(sym_perm).shape[0]) // 2
+                    # W's PRE-UNFOLD BLOCK, offered to whoever is writing
+                    # the restart — same contract, same reason, same
+                    # no-op-outside-a-scope as the V site in v_q_g_flat.
+                    # This is the array ``persist_w0_and_head`` stores when
+                    # the resolution says wedge; slicing the unfolded W
+                    # instead would be a different array whose equality to
+                    # this one depends on the op-selection policy.
+                    from .restart_q_storage import deposit_pre_unfold
+                    deposit_pre_unfold(
+                        "W0_qmunu", W_q_solve,
+                        n_rmu_logical=int(meta.n_rmu),
+                        q_irr_frac=q_irr_frac, irr_idx_q=full_to_irr_idx,
+                        sym_idx_q=full_to_irr_sym, sym_perm=sym_perm,
+                        L_table=L_table, n_sym_spatial=n_sym_spatial)
                     W_q = unfold_isdf_operator(
                         W_q_solve,
                         irr_idx=full_to_irr_idx,

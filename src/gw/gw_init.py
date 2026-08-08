@@ -1432,6 +1432,11 @@ def prepare_isdf_and_wavefunctions(
 	# The deck's write/skip decision for tmp/isdf_tensors_*.h5, taken and
 	# announced in ONE place (``write_restart_tensors``).
 	from .gw_output import restart_tensor_writes_enabled
+	# The q-storage decision + the hand-off slot the V_q producer deposits
+	# its pre-unfold block into.  Imported here rather than at module scope
+	# for the same reason the writer is: this function is the only caller.
+	from .restart_q_storage import (resolve_restart_q_storage_for_run,
+	                                take_pre_unfold)
 
 	if not cfg.restart:
 		from common.wfn_transforms import get_enk_bandrange
@@ -1585,6 +1590,17 @@ def prepare_isdf_and_wavefunctions(
 			# it adds no collective of its own.
 			_write_restart = restart_tensor_writes_enabled(
 				cfg, tensors_filename)
+			# THE q-STORAGE DECISION, TAKEN ONCE, FOR BOTH TENSORS.
+			# ``resolve_restart_q_storage`` is rank-invariant for the same
+			# reason ``restart_tensor_writes_enabled`` is — a deck key and
+			# a centroid file every rank reads — so it adds no collective
+			# and cannot make ranks disagree about whether to write.
+			# The decision is taken even when the writes are suppressed:
+			# it costs nothing and the announcement is the only place a
+			# log says which q-set the file would have been on.
+			_qirr = resolve_restart_q_storage_for_run(
+				cfg, sym=sym, centroid_indices=centroid_indices,
+				fft_grid=meta.fft_grid, print_fn=print0)
 			if _write_restart:
 				write_restart_state_to_h5(
 					tensors_filename,
@@ -1596,6 +1612,11 @@ def prepare_isdf_and_wavefunctions(
 					# under a CHANGED window fails loudly instead of
 					# silently misindexing Sigma (job 7874375).
 					band_slices=band_slices,
+					# ONE resolution, bound to the wedge the V_q producer
+					# offered.  ``take_pre_unfold`` REMOVES it, so the W0
+					# writer downstream cannot be handed V's block.
+					qirr=_qirr.with_capture(
+						take_pre_unfold("V_qmunu")),
 				)
 
 			with timing.section("gw_jax.wavefunction_setup"):

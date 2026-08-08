@@ -98,6 +98,7 @@ def write_restart_state_to_h5(
     mode: str = "w",
     kgrid: tuple[int, int, int] | None = None,
     band_slices=None,
+    qirr=None,
 ):
     """Write (subset of) canonical restart state via SlabIO.
 
@@ -132,8 +133,37 @@ def write_restart_state_to_h5(
     dataset's μ extent at load (torn/hand-edited-file guard); the
     loader itself re-pads from the dataset shape
     (``load_restart_state_from_h5`` → ``n_rmu_transverse_disk``).
+
+    ``qirr`` IS THE ONE RESOLUTION FOR BOTH TENSORS.  A
+    ``gw.restart_q_storage.RestartQStorage`` whose ``.store_wedge`` is True
+    means V is written on the IBZ q wedge (from ``qirr.capture.X_ibz``, the
+    PRE-UNFOLD block the producer held) and the W0 placeholder is sized from
+    THAT — which is the coupling this function's comment has been asking the
+    next writer to close since dbe3b4ec.  ``None`` (the default, and what
+    every existing caller passes) is today's behaviour exactly: full-BZ V,
+    full-BZ placeholder, no stamp, no table group.
     """
     from .slab_io import SlabIO
+
+    # ---- THE ONE RESOLUTION, APPLIED ONCE, BEFORE ANY WRITE -----------
+    # Both the tensor and the placeholder are decided here, together, from
+    # one object.  The old shape-inheritance is what made V's decision
+    # silently become W0's; the substitution below is the whole of the
+    # change, and the placeholder block further down reads ``V_on_disk``
+    # rather than ``V_qmunu`` for exactly that reason.
+    V_on_disk = V_qmunu
+    if qirr is not None and qirr.store_wedge and V_qmunu is not None:
+        if qirr.capture is None:
+            raise ValueError(
+                "write_restart_state_to_h5: restart_q_storage resolved to "
+                "'ibz' but no pre-unfold capture reached the writer.  The "
+                "wedge exists for one statement inside the V_q producer and "
+                "is offered to an open capture scope there; a resolution "
+                "that says 'ibz' with nothing captured would otherwise "
+                "SLICE the unfolded tensor, which is a different array whose "
+                "equality to the wedge depends on an op-selection policy "
+                "nobody froze for this purpose.")
+        V_on_disk = qirr.capture.X_ibz
 
     with SlabIO(filename, mode=mode, mesh=mesh,
 ) as io:
@@ -187,7 +217,7 @@ def write_restart_state_to_h5(
             io.write_slab(name, arr)
             _log_restart_write(name, shape, arr.dtype, time.time() - _t0)
 
-        _write("V_qmunu",      V_qmunu,      mu_axes=(-2, -1))
+        _write("V_qmunu",      V_on_disk,    mu_axes=(-2, -1))
         _write("S_qmunu",      S_qmunu,      mu_axes=(-2, -1))
         _write("V0_noG0_munu", V0_noG0_munu, mu_axes=(-2, -1))
         _write("G0_mu_nu",     G0_mu_nu,     mu_axes=(-1,))
@@ -233,8 +263,14 @@ def write_restart_state_to_h5(
             # Whoever teaches this writer about wedge storage must pass
             # the resolved mode in rather than let it be inherited from
             # an argument's shape.
-            v_shape = _mu_logical_shape(V_qmunu.shape, (-2, -1), n_rmu_logical)
-            v_dtype = V_qmunu.dtype
+            # ``V_on_disk``, NOT ``V_qmunu``: when the resolution says
+            # wedge the two differ on the q axis, and taking the
+            # placeholder from the in-memory full-BZ tensor is precisely
+            # the inheritance the rule above forbids.  ONE resolution
+            # decided both, which is what dbe3b4ec asked for.
+            v_shape = _mu_logical_shape(V_on_disk.shape, (-2, -1),
+                                        n_rmu_logical)
+            v_dtype = V_on_disk.dtype
             _t0 = time.time()
             io.create_dataset("W0_qmunu", shape=v_shape, dtype=v_dtype)
             if _restart_write_log_on():
@@ -272,18 +308,95 @@ def write_restart_state_to_h5(
                 f["W0_qmunu"].attrs["W0_ready"] = w0_ready
             if v_touched:
                 f["V_qmunu"].attrs["V_ready"] = True
+            # THE q_irr STAMP GOES IN THE SAME RANK-0 BLOCK, for the reason
+            # that block's own comment gives: stamping from anywhere else
+            # would reintroduce the SlabIO interleave it exists to avoid.
+            # It is metadata only — the tensors are already on disk, written
+            # by the collective writer above; this adds the table group and
+            # the attrs that say what q-set they are on.
+            #
+            # BOTH TENSORS ARE STAMPED FROM ONE RESOLUTION, and the W0
+            # PLACEHOLDER is stamped ``data_ready=False`` so a q_irr file
+            # inherits the persisted-flag gate rather than the hazard: the
+            # same all-zero-screening incident, eight times smaller and just
+            # as plausible.
+            if qirr is not None and qirr.store_wedge:
+                _stamp_qirr(f, qirr, n_rmu_logical,
+                            v_touched=v_touched,
+                            w0_placeholder=(w0_touched and not w0_ready),
+                            w0_data=(w0_touched and w0_ready))
     barrier("restart_W0_ready_flag")
 
 
+def _stamp_qirr(f, qirr, n_rmu_logical, *, v_touched, w0_placeholder,
+                w0_data):
+    """Stamp the q_irr tables/attrs onto datasets SlabIO has already written.
+
+    Rank-0 only, called from inside the one h5py block that owns the
+    persisted flags.  Never raises past the caller with a half-stamped
+    file: :func:`symmetry_maps.stamp_qirr_tensor` writes the table group
+    and the version attr together, and the reader's partial-stamp refusal
+    is what catches an interrupted write — a file with tables and no
+    version is refused rather than read as legacy.
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import stamp_qirr_tensor
+    from gw.restart_q_storage import assert_capture_matches
+
+    # THE CROSS-CHECK, BEFORE ANY ATTR IS WRITTEN.  The capture came out of
+    # the compute path and the resolution was taken again at the writer; if
+    # they describe different centroid sets the file would carry tables that
+    # do not reconstruct its own tensor, silently.
+    assert_capture_matches(qirr.capture, qirr.resolution,
+                           context="write_restart_state_to_h5")
+    tables = qirr.capture.tables()
+    verdict = qirr.resolution.verdict
+    n_log = int(qirr.capture.n_rmu_logical)
+    if n_log != int(n_rmu_logical):
+        raise ValueError(
+            f"write_restart_state_to_h5: the captured wedge declares "
+            f"n_rmu_logical={n_log} but the writer was told "
+            f"{int(n_rmu_logical)}.  The tables would be stripped to one "
+            f"extent and the tensor clipped to the other, and the file "
+            f"would describe two different centroid sets.")
+    if v_touched:
+        stamp_qirr_tensor(f, "V_qmunu", tables=tables,
+                          closure_verdict=verdict, n_rmu_logical=n_log,
+                          data_ready=True)
+    if w0_data or w0_placeholder:
+        stamp_qirr_tensor(f, "W0_qmunu", tables=tables,
+                          closure_verdict=verdict, n_rmu_logical=n_log,
+                          data_ready=bool(w0_data))
+
+
 def write_w0_qmunu_to_h5(
-    filename, W0_qmunu, *, n_rmu_logical: int, mesh=None,
+    filename, W0_qmunu, *, n_rmu_logical: int, mesh=None, qirr=None,
 ):
     """Overwrite or append the W0_qmunu dataset in an existing restart file.
 
     ``n_rmu_logical`` clips the trailing (μ, μ) axes to the logical
     on-disk extent — same contract as ``write_restart_state_to_h5``.
+
+    ``qirr`` IS THE SAME OBJECT V RESOLVED WITH, carrying W's OWN capture.
+    This writer re-creates the dataset the placeholder allocated, so it is
+    the second half of the coupling: a W0 written on the full BZ into a file
+    whose V is a wedge (or the reverse) would be a file no reader can make
+    sense of, and the two are kept together by passing one decision to both
+    rather than by hoping.  ``None`` is today's behaviour exactly.
     """
     from .slab_io import SlabIO
+
+    if qirr is not None and qirr.store_wedge:
+        if qirr.capture is None:
+            raise ValueError(
+                "write_w0_qmunu_to_h5: restart_q_storage resolved to 'ibz' "
+                "but no pre-unfold W capture reached the writer.  W's wedge "
+                "is the array the Dyson solve produced, one statement before "
+                "screening unfolds it; slicing the unfolded W instead would "
+                "make the stored block depend on an op-selection policy "
+                "nobody froze for this purpose.")
+        W0_qmunu = qirr.capture.X_ibz
 
     shape = _mu_logical_shape(W0_qmunu.shape, (-2, -1), n_rmu_logical)
     with SlabIO(filename, mode="a", mesh=mesh,
@@ -299,10 +412,16 @@ def write_w0_qmunu_to_h5(
         _log_restart_write("W0_qmunu", shape, W0_qmunu.dtype,
                            time.time() - _t0)
 
-    # W0_ready flag is a per-dataset attr read by bse_io.py.
+    # W0_ready flag is a per-dataset attr read by bse_io.py.  The q_irr
+    # stamp rides in the same rank-0 block, for the same reason as in
+    # ``write_restart_state_to_h5``: SlabIO has released the file and no
+    # other writer may open it between these two statements.
     if jax.process_index() == 0:
         with h5py.File(filename, "a") as f:
             f["W0_qmunu"].attrs["W0_ready"] = True
+            if qirr is not None and qirr.store_wedge:
+                _stamp_qirr(f, qirr, n_rmu_logical, v_touched=False,
+                            w0_placeholder=False, w0_data=True)
     barrier("restart_W0_ready_flag")
 
 
