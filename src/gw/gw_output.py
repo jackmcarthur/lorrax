@@ -413,18 +413,28 @@ def persist_w0_and_head(
             [head_static.wcoul0, head_imag.wcoul0], dtype=np.complex128)
         omega_grid = np.array([0.0, _omega_grid_entry], dtype=np.float64)
     elif config.compute_mode.is_dynamic:
-        # Dynamic, but not a two-point pole fit: MPA today.  There is no
-        # probe frequency to record, and inventing one would be worse than
-        # a refusal — this is the file the next run reads W's head back
-        # from.  Unreachable from the driver (the mode is refused at
-        # entry); it stands so that landing the MPA Σ stage has to answer
-        # this question rather than inherit an answer.
+        # Dynamic, but not a two-point pole fit: MPA today.  THE QUESTION
+        # THIS REFUSAL ASKED HAS BEEN ANSWERED, and the answer was that the
+        # MPA head does not belong in this file.  Its axis is 2·n_p sample
+        # points on the double-parallel grid plus the n_p poles fitted to
+        # them, all complex — where this writer's ``omega_grid`` is real
+        # because {0, iω_p} has one nonzero part per point.  Storing it
+        # here would mean rounding the strip's real part away, or widening
+        # a restart artifact every other mode reads.  So the head travels
+        # WITH the poles, in the fit store's own head axis
+        # (``file_io.mpa_store.allocate_head_axis`` / ``write_head_axis``,
+        # fit format version 2), and the Σ stage reads the two together or
+        # refuses.  The refusal stays here because THIS file still must not
+        # acquire a {0, probe} row that no W was evaluated at.
         raise NotImplementedError(
             f"persist_w0_and_head: compute_mode = "
             f"{config.compute_mode.value} builds Σ_c(ω) without a two-point "
             f"plasmon-pole probe, so the {{0, probe}} head grid this writer "
-            f"stores is not its sample set.  Give the mode its own head "
-            f"persistence when its Σ stage lands.")
+            f"stores is not its sample set — and its ω axis is real, which "
+            f"the double-parallel sample grid is not.  The MPA head lives on "
+            f"the fit store's own head axis instead (mpa_store."
+            f"allocate_head_axis / write_head_axis, 2·n_p complex samples + "
+            f"n_p poles); nothing about it should be written here.")
     else:
         whead_arr = np.array([head_static.wcoul0], dtype=np.complex128)
         omega_grid = np.array([0.0], dtype=np.float64)

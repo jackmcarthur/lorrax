@@ -458,11 +458,13 @@ def pole_pass_order(n_p):
 def _as_group(src, mode="r"):
     """An open h5py group, from either a path or an already-open one.
 
-    A three-line mirror of ``symmetry_maps.QirrDest``, and it should not
-    survive.  It exists only because :func:`read_pole_slice` is a read
-    ``mpa_store`` does not expose (see that function), so this module
-    has one file open the store cannot do for it.  When the pole-sliced
-    reader moves into ``mpa_store`` this goes with it.
+    A three-line mirror of ``symmetry_maps.QirrDest``, kept for ONE
+    remaining reason after the pole-sliced reader moved into
+    ``mpa_store``: :func:`accumulate_over_pole_passes` opens the store
+    once and reads ``n_p`` slabs through the same handle, so the pass
+    loop pays one open rather than fourteen.  ``mpa_store``'s readers all
+    accept an already-open group, which is what makes that possible; this
+    is the object that produces one.
     """
     if hasattr(src, "attrs"):
         yield src
@@ -473,47 +475,17 @@ def _as_group(src, mode="r"):
 
 
 def read_pole_slice(fit_src, p, *, allow_partial=False):
-    """``(Omega_p, B_p)`` for ONE pole — ``(n_q, N_mu, N_mu)`` each.
+    """``(Omega_p, B_p)`` for ONE pole -- ``(n_q, N_mu, N_mu)`` each.
 
-    STOPGAP, AND NAMED AS ONE.  The staged store's readers are
-    ``read_fit_block`` (all n_p poles, a few columns) and
-    ``read_fit_tensors`` (all poles, all columns).  Neither is the read
-    the Sigma accumulation actually performs: one pole, every q, every
-    element — which is exactly one contiguous slab of the ``(n_p, n_q,
-    N_mu, N_mu)`` dataset, because the pole axis was made leading on
-    disk FOR this access pattern.  The reader is one line and it is
-    missing, so it is written here rather than added to a branch this
-    one must not modify.  It belongs in ``mpa_store`` beside the other
-    two, and the design review is where that lands.
-
-    THE LEDGER REFUSAL IS NOT SKIPPED WITH IT.  Reading the slab
-    directly would bypass the store's "an unfitted column reads back as
-    zeros, and a zero pole is not an absent pole" refusal, so that
-    refusal is re-stated here against the public
-    ``fit_completion_ledger``.  ``allow_partial=True`` is the same
-    announced escape the store offers.
+    THE STOPGAP IS OVER: this is now
+    :func:`file_io.mpa_store.read_pole_slice`, which is where the
+    docstring this replaces said it belonged -- beside the other two
+    readers, sharing their ledger refusal instead of restating it.  The
+    name stays exported here because the pass loop below is its caller
+    and the design review named it at this address.
     """
-    with _as_group(fit_src) as grp:
-        ledger = mpa_store.fit_completion_ledger(grp)
-        if not ledger["complete"] and not allow_partial:
-            raise ValueError(
-                f"read_pole_slice(p={p}): this fit store is NOT "
-                f"FINALIZED — {ledger['n_done']} of "
-                f"{ledger['n_total']} (q, column) pairs are fitted.  An "
-                f"unfitted column reads back as zeros, and a zero pole "
-                f"is not an absent pole: B_p = 0 at Omega_p = 0 "
-                f"contributes nothing to W(tau) = sum_p B_p "
-                f"exp(-i Omega_p tau) and therefore looks exactly like "
-                f"a converged fit of a genuinely dark screening "
-                f"channel.  Pass allow_partial=True to read the staged "
-                f"state deliberately.")
-        ip = int(p)
-        n_p = ledger["n_p"]
-        if not 0 <= ip < n_p:
-            raise IndexError(
-                f"read_pole_slice: p={ip} is outside [0, {n_p})")
-        return (np.asarray(grp["Omega_p"][ip]),
-                np.asarray(grp["B_p"][ip]))
+    return mpa_store.read_pole_slice(
+        fit_src, p, allow_partial=allow_partial)
 
 
 def accumulate_over_pole_passes(

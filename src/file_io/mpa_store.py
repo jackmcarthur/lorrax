@@ -145,7 +145,29 @@ MPA_FIT_SUFFIX = "__mpafit"
 #: Bump when the fit store's layout changes.  Independent of the W
 #: format's version: the two files have separate lifetimes and a reader
 #: of one is not a reader of the other.
-MPA_FIT_FORMAT_VERSION = 1
+#:
+#: v2 ADDS THE q -> 0 HEAD AXIS and nothing else.  The head has always
+#: travelled beside W as a small object whose length is the number of
+#: frequencies the scheme needs -- 1 for COHSEX, 2 for the two-point PPM
+#: fits (``gw_output.persist_w0_and_head``) -- and MPA needs it at every
+#: one of its ``2*n_p`` samples, plus the ``n_p`` head POLES those samples
+#: are fitted to, because the Sigma stage consumes poles and not samples.
+#: A store written before this axis existed is not upgraded and is not
+#: guessed at: it reads back fine for everything that does not need the
+#: head, and :func:`read_head_poles` refuses the MPA Sigma path by name.
+#: That refusal is the point of the version, not a side effect of it --
+#: a Sigma built from a headless store is silently missing the q -> 0
+#: term at every frequency, which is a 200 meV error with no symptom.
+MPA_FIT_FORMAT_VERSION = 2
+
+#: Versions this reader accepts.  v1 stores predate the head axis; they
+#: are readable and their poles are unchanged, so refusing them outright
+#: would strand the first-light field for no gain.
+MPA_FIT_READABLE_VERSIONS = (1, 2)
+
+#: Sibling group holding the q -> 0 head: the ``2*n_p`` sampled values and
+#: the ``n_p`` poles fitted to them.
+MPA_HEAD_SUFFIX = "__mpahead"
 
 #: Attr marking the leading frequency axis.  Its presence is the ATTR
 #: half of the rank cross-check, and the string names what is removable.
@@ -1487,11 +1509,11 @@ def _open_fit(grp):
             f"have been fitted.  A staged store without its ledger is a "
             f"tensor of poles indistinguishable from a tensor of zeros.")
     version = int(grp.attrs.get("mpa_fit_format_version", -1))
-    if version != MPA_FIT_FORMAT_VERSION:
+    if version not in MPA_FIT_READABLE_VERSIONS:
         raise ValueError(
             f"mpa_store: fit store is format version {version}; this "
-            f"reader is version {MPA_FIT_FORMAT_VERSION}.  Refusing "
-            f"rather than guessing.")
+            f"reader accepts {list(MPA_FIT_READABLE_VERSIONS)} and writes "
+            f"{MPA_FIT_FORMAT_VERSION}.  Refusing rather than guessing.")
     return grp[MPA_FIT_SUFFIX]
 
 
@@ -1848,6 +1870,170 @@ def read_fit_block(src, q, mu_cols, *, allow_partial=False, mode="r"):
                 diag[str(key)[len("fit_"):]] = np.asarray(
                     grp[key][iq, :, sel])
         return Om, Bp, diag, ledger
+
+
+def read_pole_slice(src, p, *, allow_partial=False, mode="r"):
+    """``(Omega_p, B_p)`` for ONE pole -- ``(n_q, N_mu, N_mu)`` each.
+
+    THE READ THE SIGMA ACCUMULATION ACTUALLY PERFORMS, and the reason the
+    pole axis is leading on disk.  :func:`read_fit_block` is all ``n_p``
+    poles of a few columns (the fit driver's shape) and
+    :func:`read_fit_tensors` is everything at once (which is the object
+    the staged design exists to avoid holding).  One pole, every q, every
+    element is one contiguous slab, and it is what one pass of the
+    fourteen-pass self-energy needs resident.
+
+    THE LEDGER REFUSAL COMES WITH IT.  Slicing the dataset directly would
+    step around "an unfitted column reads back as zeros, and a zero pole
+    is not an absent pole", so the same refusal guards this read.  This
+    function was written in ``gw.mpa.fit_driver`` as a named stopgap; it
+    lives here now, beside the other two readers, and ``fit_driver``
+    re-exports it so no caller moved.
+    """
+    qs = _qs()
+    with qs.QirrDest(src, mode) as grp:
+        ledger = fit_completion_ledger(grp)
+        _refuse_unfinalized(grp, ledger, allow_partial,
+                            f"read_pole_slice(p={p})")
+        ip = int(p)
+        if not 0 <= ip < ledger["n_p"]:
+            raise IndexError(
+                f"read_pole_slice: p={ip} is outside [0, {ledger['n_p']}); "
+                f"the pass order is gw.mpa.fit_driver.pole_pass_order(n_p).")
+        Om = np.asarray(grp["Omega_p"][ip])
+        Bp = np.asarray(grp["B_p"][ip])
+        return Om, Bp
+
+
+def allocate_head_axis(dest, *, n_p, mode="a"):
+    """Create the q -> 0 head's ``2*n_p`` sample slots and ``n_p`` pole slots.
+
+    Separate from :func:`allocate_fit_store` on purpose: the head is a
+    different producer (the screening sweep's ``HeadResolver``, evaluated
+    on the strip) reaching the same file, and the body fit does not wait
+    for it.  Allocating it here means a store can be finalized for its
+    poles and still be missing the head, which is a state
+    :func:`read_head_poles` names rather than one it papers over.
+    """
+    qs = _qs()
+    n_p = int(n_p)
+    if n_p < 1:
+        raise ValueError(
+            f"allocate_head_axis: n_p={n_p} must be positive.")
+    with qs.QirrDest(dest, mode) as grp:
+        if MPA_HEAD_SUFFIX in grp:
+            del grp[MPA_HEAD_SUFFIX]
+        hd = grp.create_group(MPA_HEAD_SUFFIX)
+        # The 2*n_p SAMPLES: the double-parallel grid is complex, so the
+        # frequency axis is complex too.  ``persist_w0_and_head`` stores a
+        # float omega_grid because {0, i*omega_p} has one nonzero part per
+        # point; MPA's strip points have both, and rounding one away is how
+        # a restart artifact comes to describe a file it does not match.
+        hd.create_dataset("head_z", shape=(2 * n_p,), dtype=np.complex128)
+        hd.create_dataset("head_w", shape=(2 * n_p,), dtype=np.complex128)
+        # The n_p POLES fitted to them.  Sigma consumes poles, so a store
+        # that carried only samples would make every pass re-fit the head.
+        hd.create_dataset("head_Omega_p", shape=(n_p,), dtype=np.complex128)
+        hd.create_dataset("head_B_p", shape=(n_p,), dtype=np.complex128)
+        hd.attrs["mpa_head_n_p"] = np.int64(n_p)
+        hd.attrs["mpa_head_ready"] = False
+        grp.attrs["mpa_fit_format_version"] = np.int64(
+            MPA_FIT_FORMAT_VERSION)
+        return int(n_p)
+
+
+def write_head_axis(dest, head_z, head_w, head_Omega_p, head_B_p, *,
+                    vhead=None, mode="a"):
+    """Fill the head axis and mark it ready, in one call and only once.
+
+    ``head_z`` / ``head_w`` are the ``2*n_p`` sample points and the head of
+    ``W_c`` at them; ``head_Omega_p`` / ``head_B_p`` are the ``n_p`` poles
+    fitted to that pair.  Both go in together because a store holding
+    samples without poles, or poles without the samples they came from, is
+    a store whose head nobody can certify.
+    """
+    qs = _qs()
+    with qs.QirrDest(dest, mode) as grp:
+        if MPA_HEAD_SUFFIX not in grp:
+            raise ValueError(
+                "write_head_axis: no head axis is allocated on this store; "
+                "call allocate_head_axis(n_p=...) first.")
+        hd = grp[MPA_HEAD_SUFFIX]
+        n_p = int(hd.attrs["mpa_head_n_p"])
+        if bool(hd.attrs.get("mpa_head_ready", False)):
+            raise ValueError(
+                "write_head_axis: this head axis is already stamped ready.  "
+                "A second write would replace the head the poles beside it "
+                "were certified against.")
+        for name, arr, want in (("head_z", head_z, 2 * n_p),
+                                ("head_w", head_w, 2 * n_p),
+                                ("head_Omega_p", head_Omega_p, n_p),
+                                ("head_B_p", head_B_p, n_p)):
+            a = np.asarray(arr, dtype=np.complex128).reshape(-1)
+            if a.size != want:
+                raise ValueError(
+                    f"write_head_axis: {name} has {a.size} entries, expected "
+                    f"{want} at n_p={n_p}.  The sample axis is 2*n_p and the "
+                    f"pole axis is n_p; a length that is neither means the "
+                    f"head was built on a different grid from the body.")
+            hd[name][...] = a
+        bad = np.asarray(head_Omega_p, dtype=np.complex128).reshape(-1)
+        if np.any(np.imag(bad) > 0.0):
+            raise ValueError(
+                "write_head_axis: a head pole has Im Omega > 0, which enters "
+                "the tau stage as exp(+|Im Omega| tau) and grows.  The body "
+                "fit's guards put poles in the closed fourth quadrant; the "
+                "head's fit owes the same.")
+        if vhead is not None:
+            hd.attrs["mpa_head_vhead"] = complex(vhead)
+        hd.attrs["mpa_head_ready"] = True
+        hd.attrs["mpa_head_written_utc"] = _utc_now()
+        return int(n_p)
+
+
+def read_head_poles(src, *, mode="r"):
+    """The q -> 0 head's poles and samples, or a refusal that names the gap.
+
+    THE RED TWIN THIS EXISTS FOR.  A fit store written before the head
+    axis existed is a complete, finalized, readable file whose poles are
+    correct -- and a Sigma built from it is missing the q -> 0 head at
+    every frequency, which on silicon is the term the anchor deck cares
+    enough about to inject BerkeleyGW's own ``vhead`` / ``whead_0freq``
+    by hand.  There is no value to fall back to and no zero that means
+    "absent", so this refuses by name instead of returning anything.
+    """
+    qs = _qs()
+    with qs.QirrDest(src, mode) as grp:
+        version = int(grp.attrs.get("mpa_fit_format_version", -1))
+        if MPA_HEAD_SUFFIX not in grp:
+            raise ValueError(
+                f"read_head_poles: this fit store (format version {version}) "
+                f"carries no {MPA_HEAD_SUFFIX!r} group, so it has no q -> 0 "
+                f"head.  The MPA Sigma path REFUSES it by name rather than "
+                f"running head-less: the head is not a correction that can "
+                f"be omitted and noticed later -- Sigma_c would be missing "
+                f"it at every one of its frequencies and would come back "
+                f"finite, smooth and wrong.  Re-run the screening sweep's "
+                f"head leg against this store (allocate_head_axis + "
+                f"write_head_axis, format version {MPA_FIT_FORMAT_VERSION}), "
+                f"or use compute_mode = gn_ppm, whose head is analytic.")
+        hd = grp[MPA_HEAD_SUFFIX]
+        if not bool(hd.attrs.get("mpa_head_ready", False)):
+            raise ValueError(
+                "read_head_poles: the head axis is allocated but not stamped "
+                "ready, so its slots read back as zeros -- and a zero head "
+                "pole is not an absent one, it is a head that contributes "
+                "nothing, which is exactly the reading a converged dark "
+                "channel would give.  Finish the head leg or refuse the run.")
+        return {
+            "n_p": int(hd.attrs["mpa_head_n_p"]),
+            "z": np.asarray(hd["head_z"][()]),
+            "w": np.asarray(hd["head_w"][()]),
+            "Omega_p": np.asarray(hd["head_Omega_p"][()]),
+            "B_p": np.asarray(hd["head_B_p"][()]),
+            "vhead": hd.attrs.get("mpa_head_vhead", None),
+            "written_utc": qs.qirr_attr_str(hd, "mpa_head_written_utc"),
+        }
 
 
 def read_fit_tensors(src, *, allow_partial=False, mode="r"):
