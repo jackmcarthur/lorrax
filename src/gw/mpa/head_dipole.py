@@ -484,7 +484,11 @@ def head_channel_samples(head_tensor_z, geometry, kgrid, *,
         consumes is ``W_head - v_head``.
     """
 
-    from vcoul.bulk_3d import Bulk3D
+    # THROUGH THE SERVICE'S DOOR, not past it: the top-level package, never
+    # ``vcoul.bulk_3d``.  Reaching a submodule is what stops a service being
+    # replaceable, and ``tests/test_layering`` enforces it -- this module
+    # imported the submodule and the gate named it.
+    from vcoul import Bulk3D
 
     kernel = Bulk3D()
     A = np.asarray(jax.device_get(head_tensor_z))
