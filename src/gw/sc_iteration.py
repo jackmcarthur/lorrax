@@ -1840,7 +1840,7 @@ def run_sc_driver(
         )
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
         state_final, config=config, meta=meta, mesh_xy=mesh_xy,
-        input_dir=input_dir, print_fn=print_fn,
+        input_dir=input_dir, sym=sym, print_fn=print_fn,
     )
 
     # Rotate every QP-basis SigmaResult field back to the DFT basis.
@@ -1954,6 +1954,7 @@ def dump_sigma_omega_h5_final(
     meta,
     mesh_xy: Mesh,
     input_dir: str,
+    sym=None,
     print_fn: Callable = print,
 ) -> str | None:
     """Write the converged ``sigma_mnk.h5`` once after SC convergence.
@@ -1973,12 +1974,19 @@ def dump_sigma_omega_h5_final(
         return None
     from .ppm_pipeline import _write_sigma_omega_h5
 
+    # ``sym`` TURNS THE k_irr EXTRACTION ON, and the ordering it needs is
+    # already the ordering this function has: Sigma arrives on the full BZ
+    # (``H/E/U on the IBZ, Sigma on the full BZ``), the accumulation is
+    # complete and the kernel has exited by the time the SC loop reaches
+    # convergence, and only then is this called.  The writer measures the
+    # star spread on those complete rows before dropping any.
     path = _write_sigma_omega_h5(
         sigma_result.sigma_c_omega_kij_ry,
         sig_x=sigma_result.sigma_x_kij_ry,
         sig_h=sigma_result.v_h_kij_ry,
         config=config, input_dir=input_dir,
         meta=meta, mesh_xy=mesh_xy,
+        sym=sym, print_fn=print_fn,
     )
     print_fn(f"  Σ_c(ω) tensor: {path}")
     return path
