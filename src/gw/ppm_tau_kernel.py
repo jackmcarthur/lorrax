@@ -421,14 +421,34 @@ def _get_sigma_tau_kernel(
                                              merged_x=merged_x)
 
     @jax.jit
-    def _build_W_t_q(B_q, Omega_q, mask_B, E_ref_B, t_node):
-        """W(τ) = Σ_q B_q · exp(-i·(Ω_q - E_ref_B)·τ) · mask_B.
+    def _build_W_t_q(B_q, Omega_q, mask_B, Om_lo, Om_hi, E_ref_B, t_node):
+        """W(τ) = Σ_q B_q · exp(-i·(Ω_q - E_ref_B)·τ), windowed to (Om_lo, Om_hi].
 
         (A-side G now built inside sigma_kij_kernel via build_G_tau, so
         the tau-operand helper only shapes the PPM-pole-sum B-side.)
+
+        THE WINDOW IS NOT MATERIALISED.  ``Om_lo``/``Om_hi`` are two f64
+        SCALARS; the per-pole predicate is recomputed from ``Omega_q``
+        right here and ANDed into the select that already existed, so XLA
+        fuses it into that select's predicate and it never becomes a
+        buffer.  What they replace was a full ``(nq, μ_pad, μ_pad)`` bool
+        tile — ``base_mask_B & (Ω ≤ T)`` — built eagerly per window in
+        ``ppm_sigma`` and pinned as a kernel operand for every τ node of
+        the scan (~148 MiB/rank at μ_pad = 24,960 / P = 64, live through
+        the most memory-intensive stage of Σ).  See
+        ``ppm_windows.window_mask_B_bounds`` for the ``(lo, hi]``
+        convention and why it is NOT the ``[lo, hi)`` one that
+        ``windowed_exp_iEt`` uses on the A side.
+
+        ``mask_B`` stays an array: it is the fit-VALIDITY selector
+        (``|Ω| > 1e-14`` ∧ the GN-PPM ``good`` flag), which is a property
+        of each fitted pole and not an interval in Ω, so there are no two
+        numbers to ship.  It is also ONE tile for the whole Σ stage
+        rather than one per window.
         """
         phase_B = jnp.exp(-1j * (Omega_q - E_ref_B) * t_node)
-        W_t_q = jnp.where(mask_B, B_q * phase_B,
+        in_window = (Omega_q > Om_lo) & (Omega_q <= Om_hi)
+        W_t_q = jnp.where(mask_B & in_window, B_q * phase_B,
                           jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
         return jax.lax.with_sharding_constraint(W_t_q, q_mu_shard)
 
@@ -436,10 +456,11 @@ def _get_sigma_tau_kernel(
     def _tau_kernel(
         psi_coh_xn, psi_coh_yr,
         psi_proj_xr, psi_proj_yn,
-        E_A, mask_A, B_q, Omega_q, mask_B,
+        E_A, mask_A, B_q, Omega_q, mask_B, Om_lo, Om_hi,
         E_ref_A, E_ref_B, t_node,
     ):
-        W_t_q = _build_W_t_q(B_q, Omega_q, mask_B, E_ref_B, t_node)
+        W_t_q = _build_W_t_q(B_q, Omega_q, mask_B, Om_lo, Om_hi,
+                             E_ref_B, t_node)
         return sigma_kij_kernel(
             psi_coh_xn, psi_coh_yr,
             psi_proj_xr, psi_proj_yn,
@@ -456,11 +477,12 @@ def _get_sigma_tau_kernel(
         def _tau_kernel_staged(
             psi_coh_xn, psi_coh_yr,
             psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, B_q, Omega_q, mask_B,
+            E_A, mask_A, B_q, Omega_q, mask_B, Om_lo, Om_hi,
             E_ref_A, E_ref_B, t_node,
         ):
             with timing.section("sigma.tau.w_phase") as sec:
-                W_t_q = _build_W_t_q(B_q, Omega_q, mask_B, E_ref_B, t_node)
+                W_t_q = _build_W_t_q(B_q, Omega_q, mask_B, Om_lo, Om_hi,
+                                     E_ref_B, t_node)
                 sec.watch(W_t_q)
             return sigma_kij_kernel(
                 psi_coh_xn, psi_coh_yr,
@@ -545,6 +567,12 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
         np.zeros((int(meta.nk_tot), nb_full), dtype=np.float64), rep_2d)
     mask_A  = jnp.ones((int(meta.nk_tot), nb_full), dtype=bool)
     mask_B  = jnp.ones_like(ppm.Omega_q, dtype=bool)
+    # The Ω window is two SCALARS now, not a (nq, μ, μ) tile — see
+    # ``ppm_windows.window_mask_B_bounds``.  ±inf is the "all" window and
+    # matches the runtime dtype/uncommitted-ness of the ``jnp.asarray``
+    # the branch loop does, so the AOT signature still matches exactly.
+    Om_lo   = jnp.asarray(-np.inf, dtype=jnp.float64)
+    Om_hi   = jnp.asarray(np.inf, dtype=jnp.float64)
     E_ref_A = jnp.asarray(0.0, dtype=jnp.float64)
     E_ref_B = jnp.asarray(0.0, dtype=jnp.float64)
     t_node  = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128)
@@ -553,7 +581,7 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
         if hasattr(tau_kernel, "lower"):
             tau_kernel.lower(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B,
+                E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B, Om_lo, Om_hi,
                 E_ref_A, E_ref_B, t_node,
             ).compile()
         else:
@@ -568,7 +596,7 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
             # collective-safe.  Output is discarded.
             out = tau_kernel(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B,
+                E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B, Om_lo, Om_hi,
                 E_ref_A, E_ref_B, t_node,
             )
             jax.block_until_ready(out)

@@ -112,14 +112,23 @@ def make_bse_random_vector(data, use_tda):
             x = 2.0 * jax.random.bernoulli(key, shape=shape_1).astype(dtype_real) - 1.0
             return (x * mask).astype(dtype_cplx)
     else:
-        mask_full = jnp.stack([mask, mask], axis=0)
-
+        # NO SECOND COPY OF THE MASK.  This used to be
+        # ``mask_full = jnp.stack([mask, mask], axis=0)`` — a materialised
+        # (2, 1, nc_pad, nv_pad, nk) duplicate, captured in the closure and
+        # therefore resident for the whole KPM run alongside ``mask``
+        # itself, i.e. 3× one BSE vector of pad mask for a window that is
+        # the SAME on both stack halves.  ``mask`` is (1, nc_pad, nv_pad,
+        # nk) and ``x`` is (2, 1, nc_pad, nv_pad, nk); NumPy broadcasting
+        # aligns trailing axes, so ``x * mask`` expands the mask to
+        # (1, 1, nc_pad, nv_pad, nk) and applies it to both halves —
+        # elementwise-identical to the stacked form, bit for bit, with no
+        # buffer.  (Gated in tests/test_bse_kpm_pad_mask_broadcast.py.)
         def fn(key):
             k_x, k_y = jax.random.split(key)
             x0 = 2.0 * jax.random.bernoulli(k_x, shape=shape_1).astype(dtype_real) - 1.0
             x1 = 2.0 * jax.random.bernoulli(k_y, shape=shape_1).astype(dtype_real) - 1.0
             x = jnp.stack([x0, x1], axis=0)
-            return (x * mask_full).astype(dtype_cplx)
+            return (x * mask).astype(dtype_cplx)
 
     return fn
 
