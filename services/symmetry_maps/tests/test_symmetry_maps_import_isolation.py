@@ -33,6 +33,7 @@ is where that is pinned.
 from __future__ import annotations
 
 import os
+import shutil
 
 import pytest
 
@@ -298,3 +299,85 @@ def test_the_wrong_copy_of_the_package_is_a_failure():
                          src_dir=os.path.join(_REPO, "no_such_src"),
                          deps=_DEPS, extra_path=[_SVC_SRC, _LXKIT_SRC],
                          check_path=False)
+
+
+# ---------------------------------------------------------------------------
+# IMPORTABLE WITHOUT A DEVICE.  jax as a DEPENDENCY, not as a backend.
+# ---------------------------------------------------------------------------
+# The cells above hand the child jax and get a working default backend for
+# free, so none of them can tell "the package imports" apart from "the
+# package imports AND a device happened to be there".  On 2026-08-08 that
+# distinction cost the whole file: on Perlmutter the stripped child inherits
+# the session's ``JAX_PLATFORMS`` (which names ``cuda``) and cannot reach the
+# CUDA plugin from a ``python -S`` path, so the first device touch on the
+# import path raised ``Unable to initialize backend 'cuda'`` and all nine
+# cells above went red.  The touch was
+# ``orbit_syms._CANON_INV = jnp.int64(10**12)`` at module scope, reached from
+# the door through ``qirr_store``; it is a numpy scalar now.
+#
+# WHY A BACKEND NAME NOTHING PROVIDES, rather than ``cuda``.  ``cuda`` is a
+# statement about the machine: jax SKIPS it quietly on a host with no visible
+# NVIDIA GPU (``xla_bridge`` guards the registration on
+# ``has_visible_nvidia_gpu()``), so a WSL box cannot reproduce the Perlmutter
+# red with it and the cell would be green for the wrong reason — which is
+# exactly how the WSL census reported zero newly red while Perlmutter had
+# nine.  An unknown name is refused by EVERY jax on EVERY machine, at the
+# first device touch and never at ``import jax``, so it asks the one
+# portable question: does the import path touch a device at all?
+
+_NO_SUCH_BACKEND = "lorrax_no_such_backend"
+
+
+@pytest.fixture()
+def _no_usable_backend(monkeypatch):
+    """The child inherits ``os.environ``; this is how it gets the pin."""
+    monkeypatch.setenv("JAX_PLATFORMS", _NO_SUCH_BACKEND)
+    # x64 for the same reason production sets it: the canonicalisation keys
+    # are int64 and a child left in x32 would fail on the DTYPE instead,
+    # which is a different sentence and would mask this one.
+    monkeypatch.setenv("JAX_ENABLE_X64", "1")
+
+
+def test_importing_the_package_initialises_no_jax_backend(_no_usable_backend):
+    """The door is importable on a machine with no usable device.
+
+    A table library needs jax to COMPUTE and must not need it to LOAD.  The
+    whole public surface is bound here — the door, all three absorbed
+    modules and the shard-map helper — under a ``JAX_PLATFORMS`` no backend
+    can satisfy, so anything that materialises an array or asks for a
+    default device while a module body runs fails this cell by name.
+    """
+    _needs_jax()
+    run = import_isolation(
+        "symmetry_maps", _lorrax_roots(), src_dir=_SVC_SRC, deps=_DEPS,
+        extra_path=[_LXKIT_SRC], check_path=True,
+        preamble="import symmetry_maps.maps\n"
+                 "import symmetry_maps.orbit_syms\n"
+                 "import symmetry_maps.density_symmetry_check\n"
+                 "import symmetry_maps.qirr_store\n"
+                 "import symmetry_maps._shard_map\n")
+    assert run.loaded == ()
+
+
+def test_a_module_scope_device_array_would_be_caught(_no_usable_backend, tmp_path):
+    """RED TWIN for the cell above — the exact edge, put back.
+
+    A COPY of the service tree with one line appended to ``orbit_syms``:
+    ``jnp.int64(10**12)`` at module scope, which is what stood at
+    ``orbit_syms.py:246`` until this branch.  Nothing else differs, and the
+    copy is what ``src_dir`` points at, so a green cell above cannot be
+    green because the check stopped working.
+
+    The refusal is the harness's own ``produced no LXKIT_ISOLATION line``:
+    the child dies before it can print, which is the shape the Perlmutter
+    census recorded nine times.
+    """
+    _needs_jax()
+    twin_src = tmp_path / "twin_src"
+    shutil.copytree(_SVC_SRC, twin_src)
+    with open(twin_src / "symmetry_maps" / "orbit_syms.py", "a") as fh:
+        fh.write("\n\n_EAGER_TWIN = jnp.int64(10**12)\n")
+    with pytest.raises(AssertionError, match="produced no LXKIT_ISOLATION"):
+        import_isolation("symmetry_maps", _lorrax_roots(),
+                         src_dir=str(twin_src), deps=_DEPS,
+                         extra_path=[_LXKIT_SRC], check_path=True)
