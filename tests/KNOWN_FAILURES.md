@@ -2194,3 +2194,255 @@ them.  Perlmutter: `/pscratch/sd/j/jackm/fixmpa_0808/` (both worktrees, the
 pinned env, `census.sh`, and `_reports/leg_{head,base}.log` showing the image
 gateway failure and the correct `[lx] source tree:` lines), staged for the owed
 census.  In-tree: this amendment.
+
+
+## THE OWED PERLMUTTER CENSUS, RECONCILED — and the import edge it found (2026-08-08)
+
+The section above registered a full-suite Perlmutter census of the fixes+MPA
+head as OWED, because the shifter image gateway went down at ~17:36 PDT and
+both legs had to run on WSL CPU instead.  The gateway came back that evening
+and the census RAN — fired from the BSE-perf session, through the landing
+lane's own staged, read-only `/pscratch/sd/j/jackm/fixmpa_0808/census.sh`,
+their worktrees and their `_reports/`, unmodified.  It is FUNCTIONAL only and
+makes no timing claim.
+
+```
+head 12097f78 : 2593 tests, 31 failed, 0 errors, 133 skipped, 344 s
+base f23baab2 : 2363 tests, 18 failed, 0 errors, 132 skipped, 291 s
+```
+
+That is +230 collected and +13 failed, which resolves by node id into 15 newly
+red, 2 newly green.  This amendment closes all seventeen.  **The headline is
+that the WSL census's central claim does not survive contact with the cluster,
+and not in the way the +13 suggests**: nine of the fifteen are not a regression
+at all, and four of the remaining six were red on WSL too, on the very machine
+that reported them green.
+
+### The nine `symmetry_maps` isolation cells are NOT a regression
+
+The whole of
+`services/symmetry_maps/tests/test_symmetry_maps_import_isolation.py` — all
+nine cells — is red at the head and green at the base, which is what a
+set-diff calls a regression and is what the perf lane recorded, correctly, as
+"reproduces on head and not on base, so the landing changed something".  The
+landing changed nothing here.  What the cluster found is a defect that has
+been in the tree since the service was extracted on **2026-08-07**
+(`6238f471`), sitting behind an environment that had never asked it a
+question.
+
+**The edge, named.**  `import symmetry_maps` runs, at module scope:
+
+```
+symmetry_maps/__init__.py:158   from symmetry_maps.qirr_store import (...)
+symmetry_maps/qirr_store.py:117   from symmetry_maps.orbit_syms import (...)
+symmetry_maps/orbit_syms.py:246     _CANON_INV = jnp.int64(10**12)
+```
+
+`jnp.int64(...)` is not a constant.  It is `asarray` → `device_put` → "which
+device?", so that line **initialises a jax backend while the package is being
+imported**.  In `lxkit`'s isolation child — `python -S`, `PYTHONPATH` cut down
+to the service's `src` plus its declared deps — the session's `JAX_PLATFORMS`
+is inherited but the CUDA plugin is not reachable, and the line raises before
+the probe can print:
+
+```
+RuntimeError: Unable to initialize backend 'cuda': Backend 'cuda' is not in
+the list of known backends: ['cpu', 'tpu'].
+AssertionError: isolated import of 'symmetry_maps' produced no LXKIT_ISOLATION
+line (rc=1)
+```
+
+Every one of the nine dies there, which is why the file goes red as a block
+and why the three red-twin cells report a regex mismatch rather than their own
+sentence: the harness's missing-payload assertion fires before the assertion
+they were written to catch.
+
+**Why it is not the landing.**  `orbit_syms.py` is byte-identical between
+`f23baab2` and `12097f78` (`git log f23baab2..12097f78 -- orbit_syms.py` is
+empty), and the door has imported `qirr_store`, which has imported
+`orbit_syms`, since `3e9cea10`.  The rank-refusal branch added seven names to
+an import statement that was already there; it added no edge.  Two independent
+measurements say the same thing:
+
+* **The two newly GREEN cells are the same defect wearing the other hat.**
+  `services.vcoul…test_the_whole_public_surface_answers_with_no_lorrax` and
+  `…test_vcoul_imports_and_computes_with_no_scipy` are red on the BASE leg and
+  green on the head, with the identical `Unable to initialize backend 'cuda'`
+  raised in the identical `python -S` child — at `vcoul/minibz.py:465` and
+  `:234` instead, because those two cells' preambles COMPUTE.  `services/vcoul`
+  is byte-identical between the two legs (`git diff` over it is empty), so a
+  cell that flips red→green across trees that do not differ cannot be
+  measuring a tree.  It is measuring which xdist worker the cell landed on and
+  what that worker's `JAX_PLATFORMS` had become — and adding 230 tests
+  reshuffles that.  The nine and the two are one family of eleven, not a
+  regression and two bonus greens.
+* **A/B under a portable pin puts both trees on the same side.**  jax refuses
+  a platform named in `JAX_PLATFORMS` that it cannot initialise, and refuses
+  it at the first device touch rather than at `import jax`.  Pinning
+  `JAX_PLATFORMS` to a backend no machine provides therefore asks exactly the
+  question the Perlmutter child asks, on any box.  Under that pin, on WSL:
+  **9 failed at `f23baab2`, 9 failed at `ed11a955`** — the same nine, the same
+  sentence, on the base the census called clean.
+
+**The fix is the edge, not the symptom.**  `_CANON_INV` is a `np.int64`
+scalar now.  A numpy scalar and not a Python `int` because the two do not
+promote alike — a numpy scalar is strongly typed in jax's lattice exactly as
+the jax scalar was — so the keys `_orbit_lex_winner` builds keep their dtype
+and their bits: `canonicalize_orbit` and `_orbit_lex_winner` are
+**sha256-identical** before and after on a 48-op / 512-rep case.  Nothing was
+pinned to CPU and no cell was skipped.  The isolation cells exist to catch a
+package that cannot stand up on its own, they caught one, and what they caught
+is real: a table library must be IMPORTABLE without a device and needs one only
+to COMPUTE.
+
+Two cells are added beside the fix.
+`test_importing_the_package_initialises_no_jax_backend` binds the whole public
+surface under a `JAX_PLATFORMS` no backend can satisfy, so any module body
+that materialises an array fails it by name; and
+`test_a_module_scope_device_array_would_be_caught` is its red twin, running
+the harness against a temporary COPY of the service tree with
+`jnp.int64(10**12)` appended to `orbit_syms` — the exact line, put back — and
+asserting the refusal.  The pin is a backend name nothing provides rather than
+`cuda` **on purpose**: jax skips `cuda` quietly on a host with no visible
+NVIDIA GPU, so a `cuda` pin is green on WSL for the wrong reason, which is the
+whole trap this section is about.
+
+**Measured, both environments.**
+
+| leg | tree | result |
+|---|---|---|
+| WSL, no pin | branch | `test_symmetry_maps_import_isolation.py` **11 passed** |
+| WSL, unsatisfiable-backend pin | branch | **11 passed** |
+| WSL, no pin | branch with the eager line restored | **1 failed, 10 passed** — the new positive cell, alone, since it carries its own pin |
+| Perlmutter GPU node, `JAX_PLATFORMS=cuda,cpu` | `12097f78` + the new cells | **10 failed, 1 passed** (the census's nine, plus the new cell; the red twin green) |
+| Perlmutter GPU node, `JAX_PLATFORMS=cuda,cpu` | the same tree, one line changed | **11 passed in 16 s** |
+
+The two Perlmutter arms are copies of the census's own `wt_head` differing in
+exactly one line, run on the same node with the same pin.
+
+### THIS IS THE THIRD GPU-ONLY CELL INVALIDATED BY A WSL VERIFICATION TODAY
+
+The WSL census reported **zero newly red** and it was not lying about what it
+measured; it could not see any of this.  `jax` skips an unavailable `cuda`
+without complaint on a box with no NVIDIA device, so the exact condition that
+kills the isolation child — a `JAX_PLATFORMS` naming a platform the stripped
+child cannot reach — cannot arise there at all.  That is the third time on
+2026-08-08 that a verification run on WSL returned a green that a GPU node
+did not honour, and the pattern is worth stating as a rule rather than as
+three anecdotes: **a WSL leg is evidence about code, and it is not evidence
+about a cell whose premise is a device.**  When a census is forced onto WSL,
+the honest report is the set-diff PLUS the list of cell families it is
+structurally blind to — which the section above did state, and which is
+exactly the part that came due.
+
+### The six new cells shipping red, adjudicated
+
+Six of the fifteen are cells that do not exist at the base, so no set-diff
+could call them regressions; they shipped red.  They are two different
+stories and must not be quoted as one number.
+
+| # | cell | class | verdict |
+|---|---|---|---|
+| 1 | `test_mpa_fit_kernel::test_vmap_batch_equals_loop_bit_identical[5]` | runs everywhere | **the cell's claim is false** — owner row |
+| 2 | `test_mpa_fit_kernel::test_vmap_batch_equals_loop_bit_identical[32]` | runs everywhere | same, same row |
+| 3 | `test_mpa_fit_driver::test_end_to_end_at_the_si_pole_schedule` | runs everywhere | **bar not met, ~10×** — owner row |
+| 4 | `test_minimax_imag_tables::test_the_fit_stage_floor_is_no_longer_a_quadrature` | runs everywhere | **bar is below the cell's own baseline** — owner row |
+| 5 | `test_sigma_kirr_extraction::test_the_spread_stat_is_measured_before_the_drop` | WSL-SKIP / Perlmutter-RUN | **genuine production defect**, mechanism pinned below |
+| 6 | `test_sigma_kirr_extraction::test_the_stamps_are_kin_ions_and_the_tables_are_filed_with_them` | WSL-SKIP / Perlmutter-RUN | same defect, same row |
+
+**Rows 1–4 were red on WSL too, at the censused head.**  This is the second
+place the WSL census's arithmetic does not hold: it books 232 cells as
+"collected only at head, not red", and four of them were red on the machine it
+ran on.  Measured directly, in a targeted run on a worktree at `12097f78`
+itself: `4 failed, 1 passed`.  All four sources are byte-identical between
+`12097f78` and today's `main` except one docstring line in `fit_driver`
+(`e4e4aa3a`, zero executable lines), so this is the same code the census
+graded.  None of the four is a device story:
+
+* **`test_vmap_batch_equals_loop_bit_identical`** asserts
+  `np.testing.assert_array_equal` between `fit_mpa_poles_batched` under `vmap`
+  and the per-element loop.  The `[1]` parameter passes and `[5]` and `[32]`
+  fail, in BOTH environments — which is the signature, not a flake: a batch of
+  one lowers to the same kernel as the loop, and a batch of many lowers to a
+  batched linear-algebra kernel with a different reduction order.  The
+  magnitudes are 4.5e-11 to 7.7e-11 on WSL and 1.0e-11 on Perlmutter.  Whether
+  the right answer is to relax the claim to a tolerance or to make the batched
+  kernel genuinely reproduce the scalar one is a design question for the
+  MPA fit-kernel lane, and **it is theirs**: bit-identity may well have been a
+  deliberate contract, in which case the failing cell is reporting an
+  implementation that drifted from it, and quietly widening the tolerance
+  would delete the signal.  Registered, not silenced.
+* **`test_end_to_end_at_the_si_pole_schedule`** measures
+  `max|ΔΩ| = 9.98e-06` against a `1.0e-6` bar (WSL and Perlmutter agree to
+  three digits; the Perlmutter run reads `9.978e-06`) at a worst Padé
+  condition of `7.8e+09`.  A bar missed by one order of magnitude at a
+  condition number near 1e10 is a statement about the schedule, not about the
+  machine.
+* **`test_the_fit_stage_floor_is_no_longer_a_quadrature`** measures
+  `worst_eval = 9.98e-08` (WSL) / `9.14e-08` (Perlmutter) against a `1.0e-8`
+  bar — while the cell's OWN synthesis baseline, the same recovery run on
+  exact rather than sampled values, prints `8.65e-08`.  The assertion is
+  therefore unsatisfiable as written: it asks the sampled fit to beat, by
+  nearly an order of magnitude, a floor the exact fit does not reach.  The
+  sampling half of the same cell is fine (`sample_error = 2.1e-12` against a
+  `1e-11` bar).  This one is close to self-evident and still belongs to the
+  minimax lane, because choosing the bar means deciding what the fit stage is
+  promising.
+
+**Rows 5–6 are the ones the WSL census could not have caught, and they are a
+production defect, not a test defect.**  Both cells sit behind
+`_need_slab_io()`, which skips when there is no phdf5 write symbol; on WSL
+they skip ("no phdf5 write symbol on this platform; SlabIO has one transport
+and does not fall back") and on Perlmutter they run.  When they run they say
+the file carries no attributes at all — `dict(f["hartree_kij_ev"].attrs)` is
+`{}` and `ds.attrs["k_storage"]` is a `KeyError`.  The mechanism is exact and
+static:
+
+* `file_io/sigma_output.py:920-939` hands every k_irr stamp to SlabIO the only
+  way it can, as `io.create_dataset(name, ..., attrs=_attrs(name))`.
+* `file_io/_slab_io_ffi.py:1770-1774` — the FFI/phdf5 backend, which is the
+  ONLY transport SlabIO has — **discards `attrs=` and emits a
+  `warnings.warn`**: "FFI backend: chunks/attrs on create_dataset currently
+  no-op; pre-create with h5py if you need explicit chunking or attrs."
+
+So on the one platform where the writer can run at all, `k_storage`,
+`k_storage_version`, `n_sym_spatial`, `nk_full` and all five `star_spread_*`
+numbers are silently dropped.  **The consequence reaches past the two cells.**
+The star TABLES do reach the file, because they go through `write_attr`, which
+defers to a rank-0 h5py write at close and works — so a cluster-written wedge
+cube is a file with tables and no discriminant, which is precisely the
+partial-stamp state `qirr_store` refuses on by design.  And
+`file_io/kin_ion.py:219` reads `ds.attrs.get(K_STORAGE_ATTR, K_STORAGE_FULL)`,
+so `read_star_map` returns `None` — "stored on the full BZ, read verbatim" —
+for a file that is stored on the wedge.  Every k_irr-side consumer then takes
+the full-BZ branch: `gw.eqp_bgw`, and the sanity gate this very landing
+rewired at `tests/test_sanity_gates_jax.py:600`
+(`krows = kmap if sig_star is None else k_irr_rows_for(...)`), which will index
+`sigma_c_kij_ev[:, kmap]` into an array that only has the `nrk` wedge rows.
+That is wrong Σ rows or an `IndexError`, depending on the deck.
+
+This is NOT fixed here, deliberately.  The fix is in the collective write path
+— the shape of it is to defer dataset attributes to close and write them with
+rank-0 h5py, exactly as `write_attr` already does with `_deferred_attrs` — and
+that is the `file_io` owner's call, it cannot be verified anywhere but the
+cluster, and it does not belong on a branch named for a different fix.  What
+this amendment does is take it out of the "unadjudicated new red" bucket and
+put it in the open-row bucket with its mechanism, its file and line, and its
+production consequence written down.
+
+**OPEN ROWS this amendment leaves, all four with a named owner:** the MPA
+fit-kernel bit-identity contract (cells 1–2), the Si pole-schedule end-to-end
+bar (cell 3), the imaginary-axis fit-floor bar (cell 4), and the SlabIO FFI
+backend's dropped `create_dataset(attrs=)` (cells 5–6, and the wedge Σ files
+it mis-stamps).
+
+### Where the evidence lives
+
+Perlmutter: the census junitxmls the perf lane produced are
+`/pscratch/sd/j/jackm/fixmpa_0808/_reports/census_{head_12097f78,base_f23baab2}.xml`,
+and this amendment's own A/B is `/pscratch/sd/j/jackm/isoedge_0808/` —
+`wt_before` and `wt_after` (copies of the census's `wt_head` differing in one
+line), `leg.sh`, and `leg_{before,after}.log`.  The `fixmpa_0808/` tree was
+read only.  The `RUNS_INFLIGHT` row for the two arms is struck with its
+outcome.  In-tree: this amendment, and the two cells in
+`services/symmetry_maps/tests/test_symmetry_maps_import_isolation.py`.

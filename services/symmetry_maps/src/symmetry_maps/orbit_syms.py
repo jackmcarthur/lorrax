@@ -243,11 +243,34 @@ def orbit_images(reps: jnp.ndarray,
     return jax.vmap(lambda Ri, t: (reps @ Ri.T + t) % 1.0)(Rinv, tau)
 
 
-_CANON_INV = jnp.int64(10**12)
+_CANON_INV = np.int64(10**12)
 """Integer precision for canonicalisation lex keys: 12 digits → 1 ppm
 resolution on fractional coords ([0, 1)). Coarser than fp64 noise (1e-15)
 by ~3 orders of magnitude — enough to absorb single-op drift without
-collapsing distinct orbit members."""
+collapsing distinct orbit members.
+
+A NUMPY SCALAR, AND THE DTYPE IS THE REASON IT IS NOT A PYTHON ``int``.
+This used to be ``jnp.int64(10**12)``, which is a jax Array — and building
+one at module scope MEANS INITIALISING A BACKEND AT IMPORT TIME, because
+``jnp.int64`` goes through ``asarray`` → ``device_put`` → "which device?".
+So ``import symmetry_maps`` (the door re-exports from
+:mod:`symmetry_maps.qirr_store`, which imports this module) could not
+complete in any process that had no usable backend, whatever it was going
+to do with the package.  That is not hypothetical: it is what took the
+whole ``test_symmetry_maps_import_isolation`` file red on Perlmutter on
+2026-08-08, where ``lxkit``'s stripped ``python -S`` child inherits a
+``JAX_PLATFORMS`` naming ``cuda`` and cannot reach the CUDA plugin, and it
+would equally refuse an import under ``JAX_PLATFORMS=''`` on a node whose
+GPUs are all taken.  A table library must be IMPORTABLE without a device;
+it needs one to COMPUTE, and only then.
+
+``np.int64`` and not ``10**12`` because the two do not promote alike:
+a numpy scalar is STRONGLY typed in jax's lattice exactly as the jax
+scalar was, a Python ``int`` is weak and would let the multiply below take
+its dtype from ``images`` instead of pinning it.  Same bits out, no device
+in.  ``tests/test_symmetry_maps_orbit_syms_import_edge`` is the twin: put
+a ``jnp.`` call back at module scope and the isolation cells go red again.
+"""
 
 
 def _orbit_lex_winner(images: jnp.ndarray) -> jnp.ndarray:
