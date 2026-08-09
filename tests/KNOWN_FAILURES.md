@@ -2453,8 +2453,8 @@ stories and must not be quoted as one number.
 | 2 | `test_mpa_fit_kernel::test_vmap_batch_equals_loop_bit_identical[32]` | runs everywhere | same, same row |
 | 3 | `test_mpa_fit_driver::test_end_to_end_at_the_si_pole_schedule` | runs everywhere | **bar not met, ~10×** — owner row |
 | 4 | `test_minimax_imag_tables::test_the_fit_stage_floor_is_no_longer_a_quadrature` | runs everywhere | **bar is below the cell's own baseline** — owner row |
-| 5 | `test_sigma_kirr_extraction::test_the_spread_stat_is_measured_before_the_drop` | WSL-SKIP / Perlmutter-RUN | **genuine production defect**, mechanism pinned below |
-| 6 | `test_sigma_kirr_extraction::test_the_stamps_are_kin_ions_and_the_tables_are_filed_with_them` | WSL-SKIP / Perlmutter-RUN | same defect, same row |
+| ~~5~~ | `test_sigma_kirr_extraction::test_the_spread_stat_is_measured_before_the_drop` | WSL-SKIP / Perlmutter-RUN | ~~**genuine production defect**, mechanism pinned below~~ **CLOSED `96472c2e`** |
+| ~~6~~ | `test_sigma_kirr_extraction::test_the_stamps_are_kin_ions_and_the_tables_are_filed_with_them` | WSL-SKIP / Perlmutter-RUN | ~~same defect, same row~~ **CLOSED `96472c2e`** |
 
 **Rows 1–4 were red on WSL too, at the censused head.**  This is the second
 place the WSL census's arithmetic does not hold: it books 232 cells as
@@ -2496,7 +2496,11 @@ graded.  None of the four is a device story:
   promising.
 
 **Rows 5–6 are the ones the WSL census could not have caught, and they are a
-production defect, not a test defect.**  Both cells sit behind
+production defect, not a test defect.**  **CLOSED 2026-08-08 by `96472c2e`
+(`fix/slabio-attrs-2026-08-08`); the diagnosis below stands as written and the
+fix is the one it names.  Both cells run 10-passed green on a Perlmutter GPU
+node at the landed main.  Everything below is history — read it for the
+mechanism, not for the state of the tree.**  Both cells sit behind
 `_need_slab_io()`, which skips when there is no phdf5 write symbol; on WSL
 they skip ("no phdf5 write symbol on this platform; SlabIO has one transport
 and does not fall back") and on Perlmutter they run.  When they run they say
@@ -2536,11 +2540,24 @@ this amendment does is take it out of the "unadjudicated new red" bucket and
 put it in the open-row bucket with its mechanism, its file and line, and its
 production consequence written down.
 
-**OPEN ROWS this amendment leaves, all four with a named owner:** the MPA
+**And that is what closed it, the same day, in `96472c2e`** — the shape named
+above is the shape it took: `create_dataset` records the attrs and `close()`
+stamps them inside the rank-0 h5py reopen `write_attr` already owned, with the
+values passed to h5py untouched so the transport and the host-side writers put
+the same bytes in the file.  The `warnings.warn` is gone for `attrs`; `chunks`
+keeps one, once per file, because HDF5 fixes layout at H5Dcreate and nothing
+written later can move it.  Verified where it had to be: on one Perlmutter GPU
+node, two worktrees carrying the same tests and differing only in `src/`, cells
+5–6 plus five new transport cells go 9 failed / 1 passed at the base and 10
+passed at the head, and the same wedge Σ cube written on a compute node reads
+back through `read_star_map` as `None` ("full BZ") at the base and as a wedge
+with its unfold tables at the head.
+
+**OPEN ROWS this amendment leaves, all with a named owner:** the MPA
 fit-kernel bit-identity contract (cells 1–2), the Si pole-schedule end-to-end
-bar (cell 3), the imaginary-axis fit-floor bar (cell 4), and the SlabIO FFI
-backend's dropped `create_dataset(attrs=)` (cells 5–6, and the wedge Σ files
-it mis-stamps).
+bar (cell 3), and the imaginary-axis fit-floor bar (cell 4).  The fourth — the
+SlabIO FFI backend's dropped `create_dataset(attrs=)`, cells 5–6 and the wedge
+Σ files it mis-stamped — is CLOSED by `96472c2e`.
 
 ### Where the evidence lives
 
