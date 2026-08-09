@@ -276,14 +276,40 @@ def solve_bse_sharded(
     # donated jit lets XLA alias W_R onto W_q's buffer and lets the caller
     # drop the Python reference, so only ONE copy survives into the solve.
     # Value-identical: same helper, same axes, same norm, same operand.
+
+    # ``auto`` is resolved to one of the two real routes HERE, before anything
+    # else reads the flag, so every later branch sees only "bare" or "exact".
+    if davidson_precond == "auto":
+        from .bse_davidson_helpers import resolve_precond_route
+        _resolved = resolve_precond_route("auto", n_flat)
+        print(f"Davidson preconditioner: auto -> {_resolved} "
+              f"(bse_dim={n_flat})", flush=True)
+        davidson_precond = _resolved
+
     # The q=0 slice of W_q, kept for the exact-diagonal preconditioner.  It
     # must be taken HERE, before the donated ifft below consumes W_q: deriving
     # it from W_R instead would make the answer depend on that ifft's norm
     # convention, and it is a (mu, nu) slice of a (mu, nu, 4, 4, 4) tensor, so
     # keeping it costs 1/64 of one W_q.
-    _W_q0 = data["W_q"][:, :, 0, 0, 0] if (
-        include_W and solver_kind == "davidson"
-        and davidson_precond == "exact") else None
+    # STASHED ON THE PAYLOAD, not held in a local.  Two reasons, both
+    # measured on this branch (PRECOND_BUILD_FREE.md):
+    #  * the donated ifft below sets ``data["W_q"] = None``, so a SECOND
+    #    eigensolve over the same payload used to raise here — ``None`` is not
+    #    subscriptable.  The exact route was single-shot per payload;
+    #  * the exact-diagonal build memoises on operand IDENTITY, so a fresh
+    #    slice object every call would miss every time.  One stashed slice
+    #    makes the second and later builds free.
+    # It costs 1/64 of one W_q and is dropped with the payload.
+    _need_W_q0 = (include_W and solver_kind == "davidson"
+                  and davidson_precond == "exact")
+    if _need_W_q0 and data.get("_W_q0_for_precond") is None:
+        if data.get("W_q") is None:
+            raise ValueError(
+                "--davidson-precond exact needs the q=0 slice of W_q, but "
+                "this payload's W_q has already been consumed by the donated "
+                "ifft and no slice was stashed.  Reload the payload.")
+        data["_W_q0_for_precond"] = data["W_q"][:, :, 0, 0, 0]
+    _W_q0 = data.get("_W_q0_for_precond") if _need_W_q0 else None
 
     if include_W:
         with timing.section("bse.solve.W_ifft") as _sec_wifft:
@@ -332,13 +358,18 @@ def solve_bse_sharded(
                     "include_W=False, so diag(H) is just dE and the bare "
                     "route is already exact.")
             from .bse_davidson_helpers import build_bse_exact_diagonal
+            from .bse_davidson_helpers import exact_diagonal_memo_stats
+            _memo_before = exact_diagonal_memo_stats()["hits"]
             with timing.section("bse.solve.exact_diag"):
                 _diag_H = build_bse_exact_diagonal(
                     eps_c, eps_v, psi_c_X, psi_v_Y, _W_q0, M_X, M_Y, V_q0,
                     nk, sharding=NamedSharding(mesh_xy, P("x", "y", None)))
                 _diag_H.block_until_ready()
+            _memoised = exact_diagonal_memo_stats()["hits"] > _memo_before
             print(f"Davidson preconditioner: EXACT diag(H) "
-                  f"(dE + (V_x - W_d)/nk), assembled once", flush=True)
+                  f"(dE + (V_x - W_d)/nk), "
+                  f"{'from memo (same payload)' if _memoised else 'assembled'}",
+                  flush=True)
         else:
             print("Davidson preconditioner: bare dE", flush=True)
         if davidson_olsen:

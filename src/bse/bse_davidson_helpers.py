@@ -26,7 +26,9 @@ that span devices belonging to other processes. The helpers below therefore:
 """
 from __future__ import annotations
 
+from functools import partial
 from typing import Optional
+import weakref
 
 import jax
 import jax.numpy as jnp
@@ -185,9 +187,143 @@ def init_bse_subspace(
 #  The EXACT transition-space diagonal of H_BSE
 # ═══════════════════════════════════════════════════════════════════════
 
+#: The transition-space dimension at or above which ``--davidson-precond auto``
+#: turns the exact assembled diagonal on.
+#:
+#: THIS NUMBER IS A PLACEHOLDER, NOT A MEASUREMENT.  What is measured, and only
+#: on the 1024-dimension record deck, is that the exact diagonal is correct, is
+#: physics-neutral, costs one dispatch to apply, and saves no iterations there
+#: (``DAVIDSON_COMPETITIVE.md`` §14, ``PRECOND_BUILD_FREE.md``).  The reason to
+#: expect it to pay at large ``bse_dim`` is that the build is a fixed one-off
+#: whose cost grows like the ISDF rank while a matvec grows with the whole
+#: problem, so any iteration it saves is worth more as the deck grows.  Nobody
+#: has yet run a deck large enough to see that happen.  Until someone does, the
+#: value below is a guess placed an order of magnitude above the largest deck we
+#: have measured, and the run that would replace it with a number is written out
+#: in PRECOND_BUILD_FREE.md under "what would settle it".
+EXACT_PRECOND_AUTO_MIN_DIM = 100_000
+
+
+def resolve_precond_route(route: str, bse_dim: int) -> str:
+    """Turn ``bare`` / ``exact`` / ``auto`` into ``bare`` or ``exact``.
+
+    ``auto`` picks the exact diagonal at or above
+    :data:`EXACT_PRECOND_AUTO_MIN_DIM` and the bare transition energy below it.
+    Anything else is returned unchanged, so the two explicit routes always mean
+    exactly what they say.
+    """
+    if route != "auto":
+        return route
+    return "exact" if int(bse_dim) >= EXACT_PRECOND_AUTO_MIN_DIM else "bare"
+
+
+# ── the build kernel, at MODULE scope ─────────────────────────────────
+# This used to be an ``@jax.jit`` defined inside ``build_bse_exact_diagonal``.
+# A jit wrapper created in a function body is a NEW object every call, so its
+# trace / lower / compile-cache-probe cache is new every call too: the "build"
+# re-constructed its XLA program on every call.  Measured on the record deck at
+# P=4, that re-construction is ~26 ms per call and the program it rebuilds runs
+# in 1.26 ms — arithmetic and both cross-rank reductions included.  The
+# reductions are two tupled reduce-scatters carrying 4.7 MiB, so they were never
+# the cost either.  The body below is character-identical to the old one, so the
+# diagonal it returns is bit-identical (np.array_equal, gated in
+# tests/test_bse_exact_diagonal.py).
+@partial(jax.jit, static_argnames=("nk", "sharding"))
+def _exact_diagonal_kernel(eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y,
+                           V_q0, *, nk, sharding):
+    dE = eps_c.T[:, None, :] - eps_v.T[None, :, :]          # (c, v, k)
+
+    a = jnp.sum(jnp.abs(psi_c_X) ** 2, axis=2)              # (k, c, mu)
+    b = jnp.sum(jnp.abs(psi_v_Y) ** 2, axis=2)              # (k, v, nu)
+    Y = jnp.einsum('kcM,MN->kcN', a.astype(W_q0.dtype), W_q0)
+    W_d = jnp.real(jnp.einsum('kcN,kvN->cvk', Y,
+                              b.astype(W_q0.dtype)))
+
+    S = jnp.einsum('kcvM,MN->kcvN', M_X, V_q0)
+    V_x = jnp.real(jnp.einsum('kcvN,kcvN->cvk', S, jnp.conj(M_Y)))
+
+    out = dE + (V_x - W_d) / nk
+    if sharding is not None:
+        out = jax.lax.with_sharding_constraint(out, sharding)
+    return out
+
+
+class _DiagMemo:
+    """Single-slot identity memo for the assembled diagonal.
+
+    WHY IDENTITY AND NOT EQUALITY.  Comparing the operands by value would cost
+    a reduction over every one of them — more than the build it is trying to
+    skip.  Comparing by ``id`` alone is unsound: CPython recycles ids, so a
+    freed W and a newly allocated one can collide and hand back a stale
+    diagonal.  This holds a WEAK reference to each operand and requires
+    ``ref() is operand`` for all of them.  A live referent cannot have had its
+    id recycled, so a hit is exactly "the same arrays as last time" and a
+    changed W — a different object — always misses.  Weak, so the memo pins no
+    device buffer; the only strong reference it keeps is the diagonal itself,
+    which is one ``(nc, nv, nk)`` real array.
+
+    This is the same idiom, and for the same reason, as the ``g_index``
+    device-buffer cache in ``common/wfn_transforms`` (``_GINDEX_DEV_BY_ID``):
+    identity first because hashing the content costs more than the work being
+    saved, weak references because an ``id`` on its own is a recycled-address
+    hazard.
+    """
+
+    __slots__ = ("_refs", "_value", "_meta", "hits", "misses")
+
+    def __init__(self):
+        self._refs = None
+        self._value = None
+        self._meta = None
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, meta, operands):
+        if (self._value is None or self._refs is None
+                or self._meta != meta or len(self._refs) != len(operands)):
+            self.misses += 1
+            return None
+        for ref, op in zip(self._refs, operands):
+            if ref() is not op:          # dead ref -> None is not op -> miss
+                self.misses += 1
+                return None
+        self.hits += 1
+        return self._value
+
+    def put(self, meta, operands, value):
+        try:
+            refs = tuple(weakref.ref(op) for op in operands)
+        except TypeError:                # un-weakref-able backend array
+            self.clear()
+            return value
+        self._refs = refs
+        self._value = value
+        self._meta = meta
+        return value
+
+    def clear(self):
+        self._refs = None
+        self._value = None
+        self._meta = None
+
+
+_DIAG_MEMO = _DiagMemo()
+
+
+def clear_exact_diagonal_memo():
+    """Drop the memoised diagonal.  Call between decks in one process."""
+    _DIAG_MEMO.clear()
+
+
+def exact_diagonal_memo_stats():
+    """``{hits, misses, loaded}`` — what the memo has done in this process."""
+    return {"hits": _DIAG_MEMO.hits, "misses": _DIAG_MEMO.misses,
+            "loaded": _DIAG_MEMO._value is not None}
+
+
 def build_bse_exact_diagonal(
     eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y, V_q0, nk: int,
-    *, sharding=None,
+    *, sharding=None, memo: bool = True,
 ):
     """``diag(H_BSE)[c, v, k]`` — assembled exactly, once per solve.
 
@@ -222,11 +358,27 @@ def build_bse_exact_diagonal(
     not appear on this noncolinear/spin-orbit deck, and assuming it would have
     put the exchange term in at twice its weight.
 
-    COST
+    COST — AND WHAT IT IS NOT
+    -------------------------
+    The arithmetic is ~0.30 GFLOP, under a third of one matvec.  The wall cost
+    is not the arithmetic and it is not the collectives either.  Measured on the
+    record deck at P=4, the whole program — both cross-rank reduce-scatters
+    included — executes in **1.26 ms**; what used to cost ~0.4 s was **building
+    the XLA program**.  The jit wrapper lived INSIDE this function, so a fresh wrapper
+    object — and therefore a fresh trace/lower/compile-probe — was created on
+    every call.  It is now at module scope (:func:`_exact_diagonal_kernel`),
+    so a process pays program construction once and every later build is a
+    dispatch; and the memo below removes even that.  See
+    ``PRECOND_BUILD_FREE.md`` for the measured split.
+
+    MEMO
     ----
-    Two fixed-shape einsums, once per solve: ~0.30 GFLOP against a matvec's
-    0.948 GFLOP and a solve's ~265 matvecs — **under a third of one matvec,
-    ~0.1% of the solve**.
+    ``memo=True`` (default) returns the previously assembled diagonal when
+    called again with **the same operand objects**.  Identity, not equality:
+    a hit needs ``is`` on every operand, checked through weak references, so a
+    changed W is a different object, misses, and rebuilds.  Nothing is pinned.
+    :func:`clear_exact_diagonal_memo` drops the slot;
+    :func:`exact_diagonal_memo_stats` reports hits/misses.
 
     SHARDING
     --------
@@ -245,25 +397,16 @@ def build_bse_exact_diagonal(
     -------
     diag : (nc_pad, nv_pad, nk) real — same layout as ``ΔE``.
     """
-    @jax.jit
-    def _build(eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y, V_q0):
-        dE = eps_c.T[:, None, :] - eps_v.T[None, :, :]          # (c, v, k)
-
-        a = jnp.sum(jnp.abs(psi_c_X) ** 2, axis=2)              # (k, c, mu)
-        b = jnp.sum(jnp.abs(psi_v_Y) ** 2, axis=2)              # (k, v, nu)
-        Y = jnp.einsum('kcM,MN->kcN', a.astype(W_q0.dtype), W_q0)
-        W_d = jnp.real(jnp.einsum('kcN,kvN->cvk', Y,
-                                  b.astype(W_q0.dtype)))
-
-        S = jnp.einsum('kcvM,MN->kcvN', M_X, V_q0)
-        V_x = jnp.real(jnp.einsum('kcvN,kcvN->cvk', S, jnp.conj(M_Y)))
-
-        out = dE + (V_x - W_d) / nk
-        if sharding is not None:
-            out = jax.lax.with_sharding_constraint(out, sharding)
-        return out
-
-    return _build(eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y, V_q0)
+    operands = (eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y, V_q0)
+    meta = (int(nk), sharding)
+    if memo:
+        hit = _DIAG_MEMO.get(meta, operands)
+        if hit is not None:
+            return hit
+    out = _exact_diagonal_kernel(*operands, nk=int(nk), sharding=sharding)
+    if memo:
+        _DIAG_MEMO.put(meta, operands, out)
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -358,4 +501,6 @@ def bse_diagonal_precond(
 
 
 __all__ = ["init_bse_subspace", "bse_diagonal_precond",
-           "build_bse_exact_diagonal"]
+           "build_bse_exact_diagonal", "clear_exact_diagonal_memo",
+           "exact_diagonal_memo_stats", "resolve_precond_route",
+           "EXACT_PRECOND_AUTO_MIN_DIM"]

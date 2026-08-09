@@ -430,12 +430,17 @@ if __name__ == "__main__":
              "at production bse_dim. Costs extra matvecs for the cap.",
     )
     parser.add_argument(
-        "--davidson-precond", choices=("bare", "exact"), default="bare",
+        "--davidson-precond", choices=("bare", "exact", "auto"),
+        default="bare",
         help="Davidson preconditioner diagonal. ``bare`` (default) divides by "
              "the transition energy dE = E_c - E_v. ``exact`` divides by the "
              "assembled diag(H) = dE + (V_x - W_d)/nk, which is what "
-             "BerkeleyGW hands PRIMME. Assembled once per solve for under a "
-             "third of one matvec; the per-iteration cost is identical.",
+             "BerkeleyGW hands PRIMME; it is assembled once per payload and "
+             "the per-iteration cost is identical to the bare route. ``auto`` "
+             "chooses between them on the transition-space dimension, at the "
+             "crossover in bse_davidson_helpers.EXACT_PRECOND_AUTO_MIN_DIM -- "
+             "which is a placeholder awaiting a large-deck measurement, not a "
+             "measured value.",
     )
     parser.add_argument(
         "--davidson-olsen", action="store_true",
