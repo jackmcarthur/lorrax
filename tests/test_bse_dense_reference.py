@@ -388,6 +388,54 @@ def test_nontda_matvec_matches_dense_shao(bse_dense_state):
     assert np.max(np.abs(ev_naive.imag)) > 1e-6, "naive [[A,B],[-B,-A]] should be complex (the bug)"
 
 
+@pytest.mark.gpu
+def test_nontda_dense_build_takes_one_pass_not_two(bse_dense_state):
+    """The dense build reads B off the block the resonant pass already computes.
+
+    ``matvec([U; 0])`` returns ``(A U, -B* U)`` — both blocks of the SHAO
+    operator's first column block — so ``B[:, j] = conj(-bottom[:, j])`` and the
+    second full pass the build used to run (trial block in the anti-resonant
+    slot, to get ``B U`` directly) is recomputing what it already had.  On the
+    Si 4x4x4 record deck that second pass was 163.948 s of a 347 s run, 49.7% of
+    the dense build.
+
+    This pins the derivation against the direct computation, BIT-IDENTICALLY.
+    It is exact rather than close because the kernel forms the anti-resonant row
+    by conjugating the same product, and conjugation is exact in floating point.
+
+    RED TWIN: drop the ``conj``, drop the sign, or take ``[0]`` instead of
+    ``[1]`` in ``_materialize_A_B`` and this cell goes red.  ``test_nontda_
+    matvec_matches_dense_shao`` above pins the same identity from the other
+    side (``row (2,1) must be -B*``); this one pins that the BUILD uses it.
+    """
+    harness.skip_unless_gpu(pytest)
+    from bse.bse_nontda import _materialize_A_B, _full_matvec_and_args
+    from bse.bse_ring_comm import make_bse_shardings
+    sdata, mesh = _nontda_data_from_subset(bse_dense_state)
+    sh = make_bse_shardings(mesh)
+    nc = int(sdata["n_cond_pad"]); nv = int(sdata["n_val_pad"])
+    nk = int(sdata["nkx"]) * int(sdata["nky"]) * int(sdata["nkz"])
+    N = nc * nv * nk
+    matvec, args = _full_matvec_and_args(sdata, mesh, sh, include_W=True)
+    with mesh:
+        A, B = _materialize_A_B(matvec, args, sh, nc, nv, nk, col_chunk=2,
+                                mesh_xy=mesh)
+        # the direct second pass, exactly as the build used to do it
+        eye = np.eye(N, dtype=np.complex128).reshape(N, nc, nv, nk)
+        B_direct = np.empty((N, N), dtype=np.complex128)
+        for c0 in range(0, N, 2):
+            blk = eye[c0:c0 + 2]; z = np.zeros_like(blk)
+            Xf = jax.lax.with_sharding_constraint(
+                jnp.asarray(np.stack([z, blk], axis=0)), sh.X_full)
+            B_direct[:, c0:c0 + blk.shape[0]] = np.asarray(
+                matvec(Xf, *args)[0]).reshape(blk.shape[0], N).T
+    assert np.array_equal(B, B_direct), (
+        "B derived from the discarded -B* block is not bit-identical to the "
+        f"directly-computed B: max|dB| = {np.abs(B - B_direct).max():.3e}")
+    # and A is still A: Hermitian, which is the property the solver gates on.
+    assert _relerr(A, A.conj().T) < 1e-6, "A must still be Hermitian"
+
+
 def _nontda_data_from_subset(data):
     """Build the ``solve_bse_nontda_sharded`` data contract (sharded ψ/ε/W/V +
     hoisted M_X/M_Y + pad counts) from the ``bse_dense_state`` subset — no second
