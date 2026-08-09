@@ -23,6 +23,7 @@ from jax.experimental import multihost_utils as _mh
 import numpy as np
 
 from common import minimax as _minimax
+from common import minimax_beta_selector as _beta_selector
 from .minimax_config import MinimaxConfig
 
 
@@ -785,6 +786,16 @@ def solve_laplace_minimax_interval(
     )
 
 
+#: The most recent refusal from the ``complex_laplace`` selector, kept so
+#: that a caller (or a test, or the census shim) can read WHY a request
+#: fell through to the runtime solve without the door having to raise.
+#: Under R1 stage 2 this refusal becomes the error; today it is only the
+#: explanation, because arming the refusal is a separate, staged decision
+#: and this commit changes nothing about what the default path computes
+#: except where a certified table now answers.
+LAST_IMAG_TABLE_REFUSAL: _beta_selector.TableRefusal | None = None
+
+
 def solve_laplace_minimax_imag_interval(
     x_min: float,
     x_max: float,
@@ -792,12 +803,30 @@ def solve_laplace_minimax_imag_interval(
     *,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
+    use_shipped_tables: bool = True,
+    beta_clause: str = _beta_selector.HEIGHT,
+    print_fn=None,
 ) -> LaplaceMinimaxQuadrature:
     """Fit ``x/(x^2+omega_p^2) ≈ sum alpha_l exp(-tau_l x)`` on ``[x_min, x_max]``.
 
     Used for chi0(i*omega_p) where the resonant+antiresonant sum gives
     2*x/(x^2+omega_p^2) with x = E_c - E_v.
+
+    THE BETA AXIS.  On the scaled interval this is ``u/(u^2 + beta^2)``
+    with ``beta = omega_p / x_min``, which is the real part of the
+    ``complex_laplace`` catalog's ``1/(u - i beta)`` -- one payload, two
+    consumers, so ``alpha.real`` off a certified complex table is exactly
+    what this function has always solved for.  ``beta_clause`` defaults to
+    ``height`` because ``omega_p`` is a sampling line height over a band
+    gap and not a pole width; see ``common.minimax_beta_selector`` for why
+    that word has to be said rather than inferred.
+
+    When no certified table covers the request the selector refuses in
+    prose and this function does exactly what it did before: the same
+    uncertified runtime solve, through the same cache, with the same key.
     """
+
+    global LAST_IMAG_TABLE_REFUSAL
 
     x_min = max(float(x_min), _TINY)
     x_max = max(float(x_max), x_min * (1.0 + 1.0e-9))
@@ -809,12 +838,33 @@ def solve_laplace_minimax_imag_interval(
     omega_hat = omega_p / x_min
     logR_key = float(np.log(R))
 
-    tau_hat, w_hat, err_hat = _solve_noncrossing_imag_scaled_cached(
-        round(logR_key, 12),
-        round(omega_hat, 12),
-        round(target_error, 14),
-        max_nodes,
-    )
+    picked = None
+    if use_shipped_tables:
+        picked = _beta_selector.select(
+            range_value=R,
+            beta=omega_hat,
+            beta_clause=beta_clause,
+            target_error=target_error,
+            max_nodes=max_nodes,
+        )
+    if isinstance(picked, _beta_selector.TableSelection):
+        LAST_IMAG_TABLE_REFUSAL = None
+        _beta_selector.announce(picked, print_fn=print_fn)
+        # The catalog's own alias: Re 1/(u - i beta) = u/(u^2 + beta^2) is
+        # ``common.minimax._imag_target`` character for character, so this
+        # consumer takes the real part of the same certified payload the
+        # Sigma-side complex consumer takes whole.
+        tau_hat = np.asarray(picked.tau, dtype=np.float64)
+        w_hat = np.ascontiguousarray(np.real(picked.alpha), dtype=np.float64)
+        err_hat = float(picked.certified_error)
+    else:
+        LAST_IMAG_TABLE_REFUSAL = picked
+        tau_hat, w_hat, err_hat = _solve_noncrossing_imag_scaled_cached(
+            round(logR_key, 12),
+            round(omega_hat, 12),
+            round(target_error, 14),
+            max_nodes,
+        )
 
     tau = tau_hat / x_min
     alpha = w_hat / x_min
@@ -985,6 +1035,8 @@ def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None):
         quad.x_min, quad.x_max, float(omega_p),
         target_error=float(minimax_config.target_error),
         max_nodes=int(minimax_config.max_nodes),
+        use_shipped_tables=bool(minimax_config.use_shipped_tables),
+        print_fn=print_fn,
     )
     if print_fn is not None:
         R = quad_imag.x_max / quad_imag.x_min
