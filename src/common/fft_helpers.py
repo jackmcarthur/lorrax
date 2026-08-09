@@ -261,6 +261,73 @@ def make_sharded_ifftn_3d(
 
     return shard_map(_wrap, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
 
+# ---------------------------------------------------------------------------
+# The DONATED transform, memoised — one program per (mesh, spec, axes, norm)
+# ---------------------------------------------------------------------------
+# ``make_sharded_ifftn_3d`` is a FACTORY: it returns a fresh ``shard_map``
+# closure every call and carries no cache.  Wrapping that fresh closure in a
+# fresh ``jax.jit`` — which is what every donated-W call site did — hands jax a
+# wrapper object whose dispatch cache is empty, so a byte-identical program is
+# re-traced, re-lowered and re-probed against the persistent compile cache on
+# every call.  It is the same defect ``bse_davidson_helpers`` fixed for the
+# exact-diagonal build (PRECOND_BUILD_FREE.md §3.1, §7.2), and it is measured
+# at ~20-23 ms per call against ~1.0 ms of execution on the Si 4x4x4 record
+# deck at P=4 (FIX_construction_defects.md §1).
+#
+# The memo below keys on everything that determines the PROGRAM — the mesh, the
+# partition spec, the transformed axes and the norm convention.  It deliberately
+# does NOT key on shape or dtype: those are jax's own dispatch-cache business,
+# so one memo entry serves every payload shape a run puts through the same
+# transform.  ``Mesh`` and ``PartitionSpec`` are both hashable by value, so two
+# call sites that ask for the same transform share one program.
+#
+# WHY A SEPARATE ACCESSOR AND NOT A MEMO ON THE FACTORY.  Ten call sites in the
+# tree build sharded transforms through the factory, and several close the
+# returned callable into larger objects.  Memoising the factory itself would
+# change the OBJECT IDENTITY those call sites see, and identity is load-bearing
+# in this tree (``bse_feast._GMRES_SOLVER_CACHE`` keys on ``id(matvec)``).  A
+# new accessor changes nothing for anyone who does not call it.
+_DONATED_IFFTN_3D: dict[tuple, Callable] = {}
+
+
+def get_donated_ifftn_3d(
+    mesh: Mesh,
+    spec: P,
+    *,
+    axes: tuple[int, int, int] = (-3, -2, -1),
+    norm: str | None = None,
+) -> Callable:
+    """The sharded 3-D inverse FFT as a jitted, INPUT-DONATING program.
+
+    Returns the SAME jitted callable for the same ``(mesh, spec, axes, norm)``,
+    so the program is constructed once per process instead of once per call.
+
+    Donation is the point of the separate accessor.  The W-transform call sites
+    want XLA to alias ``W_R`` onto ``W_q``'s buffer — at production
+    ``mu = 10015 / P = 64`` the un-aliased form costs 2 x 404 MB per rank — and
+    donation only works from a top-level dispatch boundary, which is what this
+    is.  Callers must drop their own reference to the operand right after the
+    call; the returned array is the only live copy.
+
+    Parameters
+    ----------
+    mesh, spec : the device mesh and the operand's partition spec.  The
+        transformed ``axes`` must be REPLICATED in ``spec`` — the transform is
+        device-local inside a ``shard_map``.
+    axes, norm : forwarded to :func:`local_ifftn3`, and part of the memo key
+        because both change the emitted program.
+    """
+    key = (mesh, spec, tuple(axes), norm)
+    hit = _DONATED_IFFTN_3D.get(key)
+    if hit is None:
+        hit = jax.jit(
+            make_sharded_ifftn_3d(mesh, spec, spec, axes=tuple(axes),
+                                  norm=norm),
+            donate_argnums=(0,))
+        _DONATED_IFFTN_3D[key] = hit
+    return hit
+
+
 def make_sharded_fftn_3d(
 	mesh: Mesh,
 	in_spec: P,

@@ -225,24 +225,57 @@ def resolve_precond_route(route: str, bse_dim: int) -> str:
 # P=4, that re-construction is ~26 ms per call and the program it rebuilds runs
 # in 1.26 ms — arithmetic and both cross-rank reductions included.  The
 # reductions are two tupled reduce-scatters carrying 4.7 MiB, so they were never
-# the cost either.  The body below is character-identical to the old one, so the
-# diagonal it returns is bit-identical (np.array_equal, gated in
+# the cost either.  The body below was character-identical to the old one when
+# the jit moved; the FEAST consolidation then restructured it to carry two static
+# routes, and the REAL route's output is still bit-identical to what shipped
+# before either change (np.array_equal on the record deck, gated in
 # tests/test_bse_exact_diagonal.py).
-@partial(jax.jit, static_argnames=("nk", "sharding"))
+# TWO STATIC KNOBS, AND WHY EACH EXISTS.  This kernel is now the ONE
+# ``diag(H_BSE)`` in the tree: ``bse_feast.build_preconditioner_diagonal_sharded``
+# used to assemble the same object independently, and the two differed in exactly
+# two ways that are behaviour, not style (PRECOND_BUILD_FREE.md §7.1).  Both are
+# static, so each route traces its own program and neither can perturb the other.
+#
+# ``complex_out``.  Davidson divides a real residual by ``diag − lambda`` and takes
+# ``real()``; FEAST divides by ``z − diag`` at a COMPLEX quadrature node and wants
+# the operator's antihermitian residue kept.  On the record deck that residue is
+# ``max|Im| = 1.13e-14 Ry = 1.5e-13 eV`` against a 0.62 Ry signal — negligible in
+# size, but it is FEAST's to keep or drop, not this function's, so the flag
+# carries it rather than deciding it.
+#
+# ``W_q0=None``.  The RPA density-response and pseudopole routes solve with
+# ``include_W=False``, where the direct term is absent rather than zero-valued.
+# Passing ``None`` drops the term at TRACE time, so those routes compile a program
+# with no W contraction in it at all instead of multiplying by a zero tile.
+@partial(jax.jit, static_argnames=("nk", "sharding", "complex_out"))
 def _exact_diagonal_kernel(eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y,
-                           V_q0, *, nk, sharding):
+                           V_q0, *, nk, sharding, complex_out: bool = False):
     dE = eps_c.T[:, None, :] - eps_v.T[None, :, :]          # (c, v, k)
 
-    a = jnp.sum(jnp.abs(psi_c_X) ** 2, axis=2)              # (k, c, mu)
-    b = jnp.sum(jnp.abs(psi_v_Y) ** 2, axis=2)              # (k, v, nu)
-    Y = jnp.einsum('kcM,MN->kcN', a.astype(W_q0.dtype), W_q0)
-    W_d = jnp.real(jnp.einsum('kcN,kvN->cvk', Y,
-                              b.astype(W_q0.dtype)))
+    if W_q0 is None:
+        # include_W=False: no screened-direct term.  Not "W_d = 0" — the
+        # contraction is not emitted.
+        W_d_c = None
+    else:
+        a = jnp.sum(jnp.abs(psi_c_X) ** 2, axis=2)          # (k, c, mu)
+        b = jnp.sum(jnp.abs(psi_v_Y) ** 2, axis=2)          # (k, v, nu)
+        Y = jnp.einsum('kcM,MN->kcN', a.astype(W_q0.dtype), W_q0)
+        W_d_c = jnp.einsum('kcN,kvN->cvk', Y, b.astype(W_q0.dtype))
 
     S = jnp.einsum('kcvM,MN->kcvN', M_X, V_q0)
-    V_x = jnp.real(jnp.einsum('kcvN,kcvN->cvk', S, jnp.conj(M_Y)))
+    V_x_c = jnp.einsum('kcvN,kcvN->cvk', S, jnp.conj(M_Y))
 
-    out = dE + (V_x - W_d) / nk
+    if complex_out:
+        num = V_x_c if W_d_c is None else (V_x_c - W_d_c)
+        out = dE.astype(num.dtype) + num / nk
+    else:
+        # Character-identical to the pre-consolidation real form — ``real()`` is
+        # applied to each contraction before the subtraction, exactly as before —
+        # so the Davidson route's HLO and its output are bit-identical (gated in
+        # tests/test_bse_exact_diagonal.py).
+        V_x = jnp.real(V_x_c)
+        out = (dE + V_x / nk if W_d_c is None
+               else dE + (V_x - jnp.real(W_d_c)) / nk)
     if sharding is not None:
         out = jax.lax.with_sharding_constraint(out, sharding)
     return out
@@ -323,7 +356,7 @@ def exact_diagonal_memo_stats():
 
 def build_bse_exact_diagonal(
     eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y, V_q0, nk: int,
-    *, sharding=None, memo: bool = True,
+    *, sharding=None, memo: bool = True, complex_out: bool = False,
 ):
     """``diag(H_BSE)[c, v, k]`` — assembled exactly, once per solve.
 
@@ -392,18 +425,35 @@ def build_bse_exact_diagonal(
     W_q0 : (nmu, nnu) — the ``q = 0`` slice of ``W_q``.  Take it BEFORE the
         driver's donated ifft consumes ``W_q``; reading it from ``W_R``
         instead would make the answer depend on that ifft's norm convention.
+        ``None`` means ``include_W=False``: the screened-direct term is not
+        emitted at all (RPA density-response and pseudopole routes).
+    complex_out : keep the assembled diagonal COMPLEX instead of taking
+        ``real()``.  FEAST's shifted solves want it (they divide by
+        ``z − diag`` at a complex quadrature node); Davidson does not.  See
+        the note over :func:`_exact_diagonal_kernel`.
 
     Returns
     -------
-    diag : (nc_pad, nv_pad, nk) real — same layout as ``ΔE``.
+    diag : (nc_pad, nv_pad, nk) — real by default, complex under
+        ``complex_out``; same layout as ``ΔE`` either way.
     """
     operands = (eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y, V_q0)
-    meta = (int(nk), sharding)
+    # An operand that is ``None`` (``W_q0`` under include_W=False) has no weak
+    # reference, so the identity memo cannot express "the same arrays as last
+    # time" for it.  Skip the memo outright rather than lean on _DiagMemo.put's
+    # un-weakref-able bail-out, which would do the right thing silently.
+    if memo and any(op is None for op in operands):
+        memo = False
+    # ``complex_out`` is part of the memo key, not just the program key: the two
+    # routes return DIFFERENT objects for the same operands, and a memo that
+    # ignored the flag would hand FEAST Davidson's real diagonal.
+    meta = (int(nk), sharding, bool(complex_out))
     if memo:
         hit = _DIAG_MEMO.get(meta, operands)
         if hit is not None:
             return hit
-    out = _exact_diagonal_kernel(*operands, nk=int(nk), sharding=sharding)
+    out = _exact_diagonal_kernel(*operands, nk=int(nk), sharding=sharding,
+                                 complex_out=bool(complex_out))
     if memo:
         _DIAG_MEMO.put(meta, operands, out)
     return out

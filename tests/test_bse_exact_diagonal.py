@@ -90,12 +90,21 @@ def test_kernel_is_module_scope_and_traces_once_per_process():
     """
     assert hasattr(H, "_exact_diagonal_kernel")
     ops = _payload()
-    for _ in range(4):
-        H.build_bse_exact_diagonal(*ops, NK, memo=False).block_until_ready()
     size = getattr(H._exact_diagonal_kernel, "_cache_size", None)
     if size is None:
         pytest.skip("this jax exposes no _cache_size on jitted functions")
-    assert size() == 1, f"traced {size()} times for one shape signature"
+    # DELTA, not absolute.  Since the FEAST consolidation this one kernel serves
+    # several static signatures — real and complex output, with and without the
+    # W term — so a process that has exercised the other routes legitimately
+    # carries more than one entry.  What must still hold is that four builds at
+    # ONE signature add at most one.
+    before = size()
+    for _ in range(4):
+        H.build_bse_exact_diagonal(*ops, NK, memo=False).block_until_ready()
+    grew = size() - before
+    assert grew <= 1, (
+        f"four builds of one signature traced {grew} new programs; the kernel "
+        f"is being rebuilt per call again")
 
 
 def test_memo_on_and_off_are_bit_identical():
