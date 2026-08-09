@@ -239,8 +239,17 @@ BETA_CLAUSES: dict[str, BetaClause] = {
         # bisect a Laplace bucket in width until every leaf's beta fits
         # under 1, and the audited field answers that with 218 panes on a
         # typical non-crossing branch and 1312 on pole 7 -- a pane being
-        # a certified rule and a tau-node run of its own, which is the
-        # whole of the measured 226x cost against GN-PPM.
+        # a certified rule and a tau-node run of its own.
+        #
+        # THAT AUDITED FIELD IS A DEFECTIVE STORE.  fix/mpa-qaxis-2026-08-09
+        # @ 1e79e8fc found it fitted to the full screened W rather than to
+        # W_c = W - v (|v| is 104-119% of |W|), so its four-decade Gamma
+        # spread is the bare-Coulomb tail; on the W_c refit every pole
+        # narrows 80-90x.  Nothing here depends on that -- this clause's
+        # entries certify a supremum over a (u, beta) band and no pole
+        # field enters the certificate -- but the pane counts above are an
+        # UPPER BOUND on real demand, and whether the width clause already
+        # suffices on the narrowed field is an OPEN MEASUREMENT.
         beta_max=4.0,
         qualified_at=(2.0, 4.0),
         measured_range=(0.0, 4.0),

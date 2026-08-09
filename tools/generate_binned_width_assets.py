@@ -5,7 +5,27 @@ pass costs what it costs because a pane is a certified rule and a tau-node
 run of its own, and the shipped width clause demands 218 panes on a typical
 non-crossing branch and 1312 on pole 7 of the ``si_mpa_0808`` fit -- against
 GN-PPM's 24.1 s, a measured 5445 s per pole pass, node-weighted mean pane
-occupancy 1.68 %.  The pane count IS the cost, and the pane count is set by
+occupancy 1.68 %.
+
+READ THOSE PANE COUNTS AS AN UPPER BOUND, NOT AS PRODUCTION DEMAND.
+``fix/mpa-qaxis-2026-08-09`` @ ``1e79e8fc`` (the ``screening_content``
+declaration) found ``si_mpa_0808`` and every other production fit store
+fitted to the FULL screened ``W`` rather than to ``W_c = W - v``, and
+``|v|`` is 104-119 % of ``|W|``: that field's four-decade ``Gamma`` spread
+and its 26 keV ``Re Omega`` are the bare-Coulomb tail, not physics.  On the
+corrected ``W_c`` refit every pole narrows by 80-90x.
+
+NOTHING BELOW DEPENDS ON THAT, and the separation is worth stating exactly
+because it is what makes this campaign survive the defect: every number
+this tool certifies is a supremum of an error functional over a
+``(u, beta)`` rectangle, and NO POLE FIELD ENTERS IT.  The clause, its
+derivation, the 30 entries and their band sups are properties of the rule
+and the target alone.  What the defect DOES put in question is whether the
+shipped ``beta <= 1`` clause already suffices on the narrowed field -- i.e.
+whether this clause is a NECESSITY or a ROBUSTNESS ASSET -- and that is an
+open measurement on the ``W_c`` refit, not a property of anything here.
+
+The pane count IS the cost, and the pane count is set by
 one inequality:
 
     beta = Gamma_hi / x_min <= beta_max = 1        (the shipped WIDTH clause)

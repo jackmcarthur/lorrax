@@ -950,7 +950,10 @@ _DEFAULTS = {
     # each Laplace bucket in width until every leaf's beta fits under 1,
     # which on the audited field is 218 panes on a typical branch and
     # 1312 on pole 7 -- and a pane is a certified rule and a tau-node run
-    # of its own, which is where the measured 226x against GN-PPM lives.
+    # of its own.  (Those counts measure a store fitted to the full
+    # screened W rather than W_c = W - v, per fix/mpa-qaxis-2026-08-09 @
+    # 1e79e8fc, so they are an UPPER BOUND on real demand; the clause's
+    # certificate does not depend on any pole field.)
     # "2" or "4" bins the widths geometrically at that ratio instead and
     # serves each bin with one rule whose clause edge IS the ratio (see
     # gw.mpa.sigma_routing.BINNED_WIDTH_BETA_MAX for the derivation).

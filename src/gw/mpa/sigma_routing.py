@@ -181,7 +181,23 @@ SHIPPED_WIDTH_BETA_MAX = 1.0
 #: is why ``sigma_pass._clause_safe_width_split`` has to bisect a Laplace
 #: bucket in width until every leaf satisfies it, and why the audited field
 #: answers with 218 panes on a typical non-crossing branch and 1312 on pole
-#: 7.  Bin the widths at a fixed ratio ``r`` FIRST and the same two facts
+#: 7.
+#:
+#: THOSE PANE COUNTS MEASURE A DEFECTIVE STORE, and the number they size
+#: is an UPPER BOUND on real demand rather than a measurement of it.
+#: ``fix/mpa-qaxis-2026-08-09`` @ ``1e79e8fc`` (the ``screening_content``
+#: declaration) found every production fit store fitted to the full
+#: screened ``W`` rather than to ``W_c = W - v``, with ``|v|`` at 104-119 %
+#: of ``|W|``; that field's four-decade ``Gamma`` spread and its 26 keV
+#: ``Re Omega`` are the bare-Coulomb tail, not physics.  On the corrected
+#: ``W_c`` refit every pole narrows by 80-90x.  The CLAUSE and its
+#: certificate are untouched by this -- they are properties of the rule and
+#: the target, and no pole field enters either -- but WHETHER THE SHIPPED
+#: ``beta <= 1`` CLAUSE ALREADY SUFFICES on the narrowed field is an open
+#: measurement, and the binned clause may be a robustness asset rather than
+#: a necessity.  Do not quote the numbers above as production demand.
+#:
+#: Bin the widths at a fixed ratio ``r`` FIRST and the same two facts
 #: give a pane-level bound directly: ``pade_fit``'s fourth guard puts
 #: ``Gamma_p <= a_p`` on every pole, so the pane's shallowest ``a`` is at
 #: least its smallest ``Gamma``, so
