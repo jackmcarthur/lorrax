@@ -1,25 +1,31 @@
-"""``compute_mode = mpa`` — the mode that exists in order to refuse.
+"""``compute_mode = mpa`` — the mode that used to exist in order to refuse.
 
 WHAT IS BEING PINNED, AND WHY IT IS WORTH A FILE OF ITS OWN.  The MPA
-("FF") self-energy has no Σ stage yet.  What landed ahead of it is the
-safety skeleton: the value on the axis, a parser that accepts it, a
-refusal that names it, a row in the channel-availability table, and — the
-part that is actually load-bearing — an explicit branch at every site in
-the tree that dispatches on ``compute_mode``.
+("FF") self-energy landed in two halves.  First the safety skeleton: the
+value on the axis, a parser that accepts it, a refusal that named it, a
+row in the channel-availability table, and — the part that is actually
+load-bearing — an explicit branch at every site in the tree that
+dispatches on ``compute_mode``.  Then, on 2026-08-09, the driver seam:
+``gw.mpa_pipeline``, the q→0 head in ``gw.mpa.sigma_head``, a branch in
+``sigma_dispatch``, a screening plan, and the deck key ``mpa_fit_file``
+that says which staged pole store to read.
 
-The failure this forecloses is not "MPA runs badly".  It is "MPA runs as
-GN-PPM and nobody can tell".  The Σ dispatch reached its plasmon-pole
-pipeline by ELSE: anything that was neither X_ONLY nor COHSEX ran it.
-Under that shape a multipole run would have fitted a GN pole to two W
-samples, called the result Σ_c(ω), and produced a complete, finite,
-plausible set of QP energies for the wrong ansatz.  Every cell below
-either pins a refusal that stops that, or pins that the four modes which
-DO have Σ stages were not disturbed while it was installed.
+The failure this file forecloses is not "MPA runs badly".  It is "MPA
+runs as GN-PPM and nobody can tell".  The Σ dispatch reached its
+plasmon-pole pipeline by ELSE: anything that was neither X_ONLY nor
+COHSEX ran it.  Under that shape a multipole run would have fitted a GN
+pole to two W samples, called the result Σ_c(ω), and produced a
+complete, finite, plausible set of QP energies for the wrong ansatz.
 
-THE CELLS THAT WILL FAIL WHEN MPA LANDS are the ones reading
-``UNIMPLEMENTED_MODES``, and they are meant to: deleting that row is the
-gesture that turns the mode on, and it should not be possible to do it
-quietly.  Rewrite them to pin the new behaviour; do not delete them.
+THE CELLS THAT SAID "IT REFUSES" NOW SAY WHAT IT DOES INSTEAD, which is
+what the ``UNIMPLEMENTED_MODES`` comment asked of whoever removed the
+row: rewrite, do not delete.  The refusals did not go away — they MOVED,
+from an axis of modes to the two files a multipole run reads.  A store
+with no ``__mpahead`` head axis, a store on the symmetry wedge, and a
+deck naming no store at all are each still refused BY NAME, and the
+cells below now pin those instead.  They are exercised end-to-end in
+``tests/test_mpa_sigma_head.py``; what is pinned here is that the
+DISPATCH reaches them rather than reaching the plasmon-pole pipeline.
 """
 
 from __future__ import annotations
@@ -44,10 +50,18 @@ from gw.gw_config import (
 _REPO = pathlib.Path(__file__).resolve().parents[1]
 _GW = _REPO / "src" / "gw"
 
-#: The four modes whose Σ stage exists today.  Every "nothing moved"
-#: assertion below runs over exactly this set, so the day a fifth joins
-#: them the parametrisation grows by one line and the claims still hold.
+#: The modes whose Σ stage exists today — ALL FIVE, since the multipole
+#: seam landed.  Every "nothing moved" assertion below runs over exactly
+#: this set, so it grew by one line rather than by a rewrite, which is the
+#: property it was written for.
 _RUNNABLE = tuple(m for m in ComputeMode if m not in UNIMPLEMENTED_MODES)
+
+#: The four modes that were runnable BEFORE the multipole seam.  Kept
+#: separately from :data:`_RUNNABLE` because "MPA did not disturb the
+#: modes that already worked" is a claim about these four specifically,
+#: and folding MPA into the set that is supposed to be unmoved would make
+#: the claim about itself.
+_RUNNABLE_BEFORE_MPA = tuple(m for m in _RUNNABLE if m is not ComputeMode.MPA)
 
 
 # ---------------------------------------------------------------------------
@@ -106,10 +120,20 @@ def test_a_typo_gets_the_unknown_mode_error_not_the_refusal():
     assert not isinstance(exc.value, NotImplementedError)
 
 
-def test_auto_never_infers_the_unimplemented_mode():
-    """``compute_mode = auto`` reads legacy flags that predate every
-    unimplemented mode, so no combination of them can reach one.  This is
-    what makes the refusal safe to install: no existing deck acquires it.
+def test_auto_never_infers_mpa_from_a_legacy_deck():
+    """``compute_mode = auto`` reads legacy flags that all predate MPA, so
+    no combination of them may reach it.
+
+    THE REASON CHANGED WHEN THE MODE LANDED, and the cell is worth more
+    now than it was.  While ``mpa`` refused, an ``auto`` route to it would
+    have given an existing deck a refusal it never asked for — annoying,
+    and loud.  Now that it runs, the same route would hand an existing
+    deck a DIFFERENT SELF-ENERGY, silently, and then refuse only because
+    it happens to name no ``mpa_fit_file``.  A mode that reads its whole
+    screening off disk must be asked for by name.
+
+    Every unimplemented mode is checked the same way, so the day another
+    joins the axis this cell covers it without an edit.
     """
     source = (_GW / "gw_config.py").read_text()
     tree = ast.parse(source)
@@ -120,41 +144,84 @@ def test_auto_never_infers_the_unimplemented_mode():
         ast.unparse(node.value) for node in ast.walk(resolver)
         if isinstance(node, ast.Return) and node.value is not None
     }
-    for mode in UNIMPLEMENTED_MODES:
+    for mode in (ComputeMode.MPA,) + tuple(UNIMPLEMENTED_MODES):
         assert not any(f"ComputeMode.{mode.name}" in r for r in returned), (
-            f"the auto branch can return {mode.value}, which would give an "
-            f"existing deck a refusal it never asked for")
+            f"the auto branch can return {mode.value}, which no legacy deck "
+            f"asked for")
 
 
 # ---------------------------------------------------------------------------
-# 2. The refusal
+# 2. What the refusal became
 # ---------------------------------------------------------------------------
 
-def test_selecting_it_refuses_and_names_the_mode_and_the_next_step():
-    """The refusal an operator actually sees.
+def test_selecting_it_no_longer_refuses_on_the_mode_axis():
+    """THE LANDING GESTURE, PINNED.
 
-    THE REASON MOVED, AND THAT IS THE POINT OF PINNING IT.  This cell used
-    to require the words "MPA fit stage lands first".  The fit stage landed,
-    and so did the Sigma pass loop, so a refusal still saying that would be
-    telling an operator to wait for something that is already in the tree.
-    What blocks the mode now is two properties of the STORE the loop reads
-    -- a full-BZ pole axis and a head axis -- and those are what the message
-    has to name, because they are what the operator would have to go and
-    produce.
+    ``UNIMPLEMENTED_MODES``' own comment says removing a row is how a mode
+    is turned on, and that the suite pinning the refusal must fail loudly
+    until it is rewritten.  This is the rewrite: ``mpa`` is not on that
+    axis any more, and selecting it is no longer an error in itself.
+
+    The dict is checked EMPTY rather than only for the absence of ``mpa``,
+    because a mode quietly re-added to it would be a mode turned off
+    again, and the mechanism is worth a cell of its own even while unused.
     """
-    with pytest.raises(NotImplementedError) as exc:
-        refuse_unimplemented_compute_mode(ComputeMode.MPA,
-                                          context="the LORRAX GW driver")
+    assert ComputeMode.MPA not in UNIMPLEMENTED_MODES
+    assert UNIMPLEMENTED_MODES == {}
+    assert refuse_unimplemented_compute_mode(
+        ComputeMode.MPA) is ComputeMode.MPA
+
+
+def test_what_it_refuses_now_is_a_deck_that_names_no_fit_store():
+    """The refusal MOVED from the mode to the file, and this is where.
+
+    ``compute_mode = mpa`` reads its entire screening from a staged pole
+    store, and ``screening_requests_for(mpa)`` deliberately asks the
+    screening stage for nothing — so a deck that selects the mode and
+    names no store has requested a screened self-energy and supplied no
+    screening.  There is nothing to default to: falling back to the bare
+    Coulomb would return an unscreened Σ_c under the multipole name.
+
+    The two OTHER refusals the old message named — a wedge-shaped pole
+    axis and a headless store — are properties of the file rather than of
+    the deck, and are exercised through the pipeline in
+    ``tests/test_mpa_sigma_head.py``.
+    """
+    import types
+
+    from gw.gw_config import refuse_missing_mpa_fit_store
+
+    cfg = types.SimpleNamespace(
+        compute_mode=ComputeMode.MPA,
+        paths=types.SimpleNamespace(mpa_fit_file=None))
+    with pytest.raises(ValueError) as exc:
+        refuse_missing_mpa_fit_store(cfg, context="the LORRAX GW driver")
     msg = str(exc.value)
-    assert "mpa" in msg
+    assert "mpa_fit_file" in msg
     assert "the LORRAX GW driver" in msg
-    assert "full-BZ" in msg and "__mpahead" in msg
-    assert "gw.mpa.sigma_pass" in msg
-    assert "THEORY_mpa_implementation.md" in msg
+    assert "__mpahead" in msg and "full-BZ" in msg
+    # RED TWIN: with a store named, it returns the path and does not raise.
+    cfg.paths = types.SimpleNamespace(mpa_fit_file="/tmp/fit.h5")
+    assert refuse_missing_mpa_fit_store(cfg) == "/tmp/fit.h5"
 
 
-def test_the_document_the_refusal_points_at_is_in_the_tree():
-    """A refusal whose pointer dangles is half a refusal."""
+@pytest.mark.parametrize("mode", _RUNNABLE_BEFORE_MPA, ids=lambda m: m.value)
+def test_no_other_mode_acquired_the_new_refusal(mode):
+    """RED TWIN of the cell above: the new guard sits on the driver's fast
+    path beside the old one, so it must be invisible to every mode whose
+    screening comes from the screening stage."""
+    import types
+
+    from gw.gw_config import refuse_missing_mpa_fit_store
+
+    cfg = types.SimpleNamespace(
+        compute_mode=mode,
+        paths=types.SimpleNamespace(mpa_fit_file=None))
+    assert refuse_missing_mpa_fit_store(cfg) is None
+
+
+def test_the_document_the_landing_points_at_is_in_the_tree():
+    """A pointer that dangles is half a document."""
     doc = _REPO / "docs" / "theory" / "THEORY_mpa_implementation.md"
     assert doc.is_file()
     text = doc.read_text()
@@ -165,7 +232,7 @@ def test_the_document_the_refusal_points_at_is_in_the_tree():
 @pytest.mark.parametrize("mode", _RUNNABLE, ids=lambda m: m.value)
 def test_the_refusal_is_a_no_op_for_every_mode_that_has_a_sigma_stage(mode):
     """RED TWIN: the guard sits on the driver's fast path, so it must be
-    invisible to the four modes that work."""
+    invisible to the five modes that work — which is now all of them."""
     assert refuse_unimplemented_compute_mode(mode) is mode
 
 
@@ -186,17 +253,53 @@ def test_the_driver_refuses_at_entry_before_it_spends_anything():
 # 3. Exhaustive dispatch — no site inherits an else-branch
 # ---------------------------------------------------------------------------
 
-def test_the_screening_planner_refuses_it_rather_than_planning_two_points():
-    """MPA's W is sampled on the double-parallel grid, not at {0, probe}.
+def test_the_screening_planner_asks_for_nothing_and_that_is_the_answer():
+    """MPA's W is sampled on the double-parallel grid, not at {0, probe},
+    and it is sampled by the FIT DRIVER before the run rather than by this
+    stage during it.
 
-    Returning the PPM pair here would be a wrong answer no downstream
-    stage could detect — the shapes and roles would all be right.
+    So the plan is the empty list, and the two facts that make that a
+    decision rather than a hole are pinned here.  First, it is not a
+    fall-through: an unknown mode still raises, and the MPA branch is
+    reached by an explicit ``is`` test.  Second, the static channels do
+    not secretly need a W either — ``mpa`` builds ``{Σ_X, Σ_c(ω)}``, so
+    ``sigma_dispatch`` routes it to the V-only kernel
+    (``compute_v_h_sigma_x``), which touches W nowhere.  Returning the PPM
+    pair instead would be a wrong answer no downstream stage could detect,
+    because the shapes and roles would all be right.
     """
     from gw.screening import screening_requests_for
 
-    with pytest.raises(NotImplementedError) as exc:
-        screening_requests_for(ComputeMode.MPA, config=None)
-    assert "mpa" in str(exc.value)
+    assert screening_requests_for(ComputeMode.MPA, config=None) == []
+    # The static screened channels are what a `static` W would be FOR, and
+    # this mode builds neither of them.
+    assert not mode_builds_channels(
+        ComputeMode.MPA, SigmaChannel.SX, SigmaChannel.COH)
+    # RED TWIN: the empty list is this branch's answer, not the planner
+    # having no opinion — an unrecognised mode still raises.
+    with pytest.raises(ValueError, match="unknown compute mode"):
+        screening_requests_for("not-a-mode", config=None)
+
+
+def test_the_v_only_kernel_is_what_serves_mpas_static_channels():
+    """The claim above, read off the dispatch rather than asserted.
+
+    ``builds_static_screened`` is a lookup in ``MODE_SIGMA_CHANNELS``, and
+    the branch it drives is what decides whether the run touches a
+    screened kernel at all.  If a future edit gave MPA the SX/COH row, the
+    empty screening plan would become a ``KeyError`` on ``W_by_role`` at
+    the worst possible moment; this cell is what fails first instead.
+    """
+    source = (_GW / "sigma_dispatch.py").read_text()
+    tree = ast.parse(source)
+    fn = next(node for node in ast.walk(tree)
+              if isinstance(node, ast.FunctionDef)
+              and node.name == "compute_sigma_xc")
+    body = ast.unparse(fn)
+    assert "builds_static_screened = mode_builds_channels(" in body
+    assert "compute_v_h_sigma_x(" in body
+    assert sigma_channels_for(ComputeMode.MPA) == frozenset(
+        {SigmaChannel.X, SigmaChannel.C_OMEGA})
 
 
 def test_the_screening_planner_is_unmoved_for_the_modes_that_work():
@@ -248,6 +351,10 @@ def test_the_sigma_dispatch_no_longer_reaches_the_ppm_pipeline_by_else():
         "the pole-model guard must come BEFORE the PPM pipeline call, or "
         "it is not guarding it")
     assert "refuse_unimplemented_compute_mode(mode" in body
+    # AND MPA IS SERVED ABOVE THE GUARD, not by widening it.  The guard's
+    # job is to turn away a mode with no Σ kernel; a mode that HAS one is
+    # dispatched before it is asked.
+    assert body.index("compute_mpa_sigma_pipeline(") < guard
 
 
 def test_the_ppm_pipeline_turns_away_a_mode_with_no_pole_model():
@@ -297,7 +404,8 @@ def test_ppm_model_separates_the_two_questions_the_tree_was_conflating():
     assert ComputeMode.HL_PPM.ppm_model == "hl"
     assert ComputeMode.COHSEX.ppm_model is None
     assert ComputeMode.X_ONLY.ppm_model is None
-    assert [m.is_dynamic for m in _RUNNABLE] == [False, False, True, True]
+    assert [m.is_dynamic for m in _RUNNABLE_BEFORE_MPA] == [
+        False, False, True, True]
 
 
 def test_no_module_dispatches_on_the_mode_through_a_bare_else():
@@ -434,16 +542,28 @@ def test_the_qsgw_writers_cohsex_omission_now_goes_through_the_table():
     assert "results.use_ppm" not in body
 
 
-def test_the_advice_the_writers_print_never_names_a_mode_that_refuses():
-    """Telling an operator to "use mpa" would send them into the entry
-    refusal.  The advice is derived from the table minus the modes that
-    do not run, so it stays followable as the enum grows."""
+def test_the_advice_the_writers_print_picks_up_a_mode_when_it_lands():
+    """The advice is derived, so a landing changes it with no edit there.
+
+    While ``mpa`` refused, telling an operator to "use mpa" would have
+    sent them into the entry refusal, so the advice subtracted
+    ``UNIMPLEMENTED_MODES``.  It still does; the dict is simply empty now,
+    and the visible consequence is that ``mpa`` appears in the list of
+    modes that build Σ_c(ω) — which is the behaviour the derivation was
+    written for and is checked here rather than assumed.
+    """
     from gw.gw_output import _runnable_modes_building
 
     advice = _runnable_modes_building(SigmaChannel.C_OMEGA)
     assert "gn_ppm" in advice and "hl_ppm" in advice
-    for mode in UNIMPLEMENTED_MODES:
-        assert mode.value not in advice
+    assert "mpa" in advice
+    # RED TWIN: the subtraction is still wired, so a mode put back on the
+    # unimplemented axis drops straight back out of the advice.
+    UNIMPLEMENTED_MODES[ComputeMode.MPA] = "synthetic, for this cell only"
+    try:
+        assert "mpa" not in _runnable_modes_building(SigmaChannel.C_OMEGA)
+    finally:
+        del UNIMPLEMENTED_MODES[ComputeMode.MPA]
 
 
 # ---------------------------------------------------------------------------
@@ -461,10 +581,26 @@ def test_the_documented_set_in_the_config_lists_the_new_value():
 
 
 @pytest.mark.parametrize("doc", ["input_reference.md", "drivers.md"])
-def test_the_reference_docs_carry_the_mode_and_say_it_refuses(doc):
-    """A documented mode that silently does not run is worse than an
-    undocumented one."""
+def test_the_reference_docs_carry_the_mode_and_say_what_it_needs(doc):
+    """A documented mode whose entry still says "REFUSES" is worse than an
+    undocumented one, because it tells an operator not to try something
+    that works.
+
+    What the row has to say now is the PRECONDITION, since that is the
+    part an operator can get wrong: ``mpa`` runs, and it needs a fit
+    store named by ``mpa_fit_file``.
+    """
     text = (_REPO / "docs" / doc).read_text()
     row = next(ln for ln in text.splitlines() if "`compute_mode`" in ln)
     assert "mpa" in row
-    assert "REFUSES" in row.upper()
+    assert "REFUSES" not in row.upper()
+    assert "mpa_fit_file" in row
+
+
+@pytest.mark.parametrize("doc", ["input_reference.md", "drivers.md"])
+def test_the_new_deck_key_is_documented_where_a_deck_author_looks(doc):
+    """A key that is only findable by grepping the source is a key nobody
+    sets — and this one is the difference between a multipole run and a
+    refusal."""
+    text = (_REPO / "docs" / doc).read_text()
+    assert "`mpa_fit_file`" in text
