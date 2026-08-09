@@ -287,9 +287,29 @@ def run_fit_driver(
             "abscissae; re-deriving the grid and hoping it agrees is "
             "the failure that stamp exists to catch.")
 
+    # WHICH SCREENING OBJECT THIS IS, asked before a byte is allocated.
+    # The multipole method fits W_c = W - v and nothing else; a store
+    # filled from the Dyson solve holds W, its poles are dominated by the
+    # bare Coulomb interaction, and NOTHING downstream can tell — the fit
+    # reproduces whatever it is handed (this deck's backward error is
+    # 4e-16), the tensor stays Hermitian and the k-star relation survives,
+    # because v_q is symmetry-covariant.  The 2026-08-09 n_p = 1 bridge
+    # measured what that costs: Sigma_c = -130.651 eV against Godby-Needs
+    # +0.6754 eV, with |v| at 104-119 % of |W| at the probe frequency.
+    # So it is a declaration the producer makes and this driver refuses
+    # on, at the one seam that reads the W file and writes the pole file.
+    content = mpa_store.require_correlation_part(
+        header.get("screening_content"),
+        where="run_fit_driver", source=f"{w_src} :: {w_name}")
     plan = tiling.plan_column_walk(n_mu, n_omega, tile_bytes)
     mpa_store.allocate_fit_store(
         fit_dest, n_q=n_q, n_mu=n_mu, n_p=n,
+        # CARRIED, NOT RE-DERIVED.  The Sigma stage refuses a pole field
+        # that was fitted to the full W, and by the time it runs the W
+        # file may be gone; the fit store therefore says for itself what
+        # it was fitted to, and this driver is the only thing that can
+        # know.
+        screening_content=content,
         # THE POLE AXIS INHERITS THE ABSCISSAE'S UNIT.  The Pade solve
         # returns Omega_p in whatever unit the z samples were stated in
         # and B_p carries one power of it, and the z samples are the W
@@ -307,6 +327,7 @@ def run_fit_driver(
         provenance=provenance)
 
     report = {
+        "screening_content": content,
         "n_q": int(n_q),
         "n_mu": int(n_mu),
         "n_omega": int(n_omega),

@@ -1281,6 +1281,19 @@ def compute_mpa_sigma_c_omega_grid(
 
     ledger = mpa_store.fit_completion_ledger(fit_src)
     n_p = int(ledger["n_p"])
+    # WHAT THIS POLE FIELD IS A FIT TO, asked before any of it is read.
+    # W(z) = v + W_c(z) and only W_c has poles: v is frequency-
+    # independent, it is already counted in Sigma_x, and its tau
+    # transform is a delta at tau = 0, so a pole field carrying it feeds
+    # the bare Coulomb interaction into the G(tau) W(tau) convolution at
+    # every node.  The 2026-08-09 bridge gate is what that reads as --
+    # Sigma_c = -130.651 eV where Godby-Needs on the same two samples
+    # gives +0.6754 eV -- and no gate on this side of the seam can see
+    # it, which is why the answer is an attr the fit driver stamped and
+    # not something measured here.
+    mpa_store.require_correlation_part(
+        ledger.get("screening_content"),
+        where="compute_mpa_sigma_c_omega_grid", source=str(fit_src))
     refuse_wedge_pole_slab(int(ledger["n_q"]), int(meta.nk_tot))
 
     s = wfns.slices

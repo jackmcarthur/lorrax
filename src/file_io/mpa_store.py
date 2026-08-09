@@ -193,6 +193,140 @@ FIT_ENERGY_UNITS = {"Ry": 1.0, "Ha": 2.0}
 #: The attr carrying the declaration, on the fit store's root group.
 FIT_ENERGY_UNIT_ATTR = "mpa_fit_energy_unit"
 
+#: WHICH SCREENING OBJECT THE TENSOR IS, and why the store must declare
+#: it.  ``W(z) = v + W_c(z)`` (MPA_THEORY 1.1) and the multipole method
+#: fits the CORRELATION part ``W_c`` and nothing else (1.2): the pole
+#: expansion ``W_c(z) = sum_p 2 Omega_p B_p/(z^2 - Omega_p^2)`` vanishes
+#: as ``z -> infinity`` and its tau transform ``W_c(tau) = sum_p B_p
+#: exp(-i Omega_p tau)`` is what the Sigma kernel convolves against
+#: ``G(tau)``.  The bare ``v`` is frequency-INDEPENDENT: it belongs to
+#: ``Sigma_x``, it is already counted there, and it has no place in a
+#: pole field at all.
+#:
+#: THE DEFECT THIS RETIRES, measured on the 2026-08-09 production bridge.
+#: The n_p = 1 gate -- where the multipole scheme IS Godby-Needs by
+#: construction -- came back at ``Sigma_c = -130.651 eV`` against the
+#: window-matched GN arm's ``+0.6754 eV``, a systematic -120.1 eV per
+#: state.  The W(omega) store had been filled straight from the Dyson
+#: solve, i.e. with the FULL W, while the two sibling arms both subtract
+#: ``v`` by hand at their own seams -- ``ppm_sigma.fit_ppm``'s
+#: ``Wc0_q = W0_q - V_q`` and ``head_dipole``'s ``w_c = w_head -
+#: v_head`` -- and nothing anywhere said which object the body store
+#: held.  Measured on that store, ``|v|`` is 104-119 % of ``|W|`` at the
+#: probe frequency, so the pole field was overwhelmingly a fit to the
+#: bare Coulomb interaction.
+#:
+#: NO INTERNAL GATE CAN SEE IT, which is why it is an attr and not a
+#: check.  The fit reproduces whatever it was handed -- that store's
+#: backward error is 4.0e-16 -- the tensor is Hermitian either way, the
+#: k-star relation survives (``v_q`` is symmetry-covariant, and the
+#: full-BZ Sigma cube carries exactly the 8 distinct band-8 values this
+#: mesh admits, with the same partition as the GN arm), and the head is
+#: untouched.  The only symptom is the number, against an external
+#: oracle.  So the WRITER states which object it wrote and the READERS
+#: refuse anything that is not the correlation part.
+W_SCREENING_CONTENTS = ("W_c", "W")
+
+#: The attr carrying it, on the W(omega) dataset.
+W_SCREENING_CONTENT_ATTR = "mpa_w_screening_content"
+
+#: The fit store's copy, carried across by the fit driver so the Sigma
+#: stage can refuse a pole field WITHOUT re-opening the W file it came
+#: from -- which by then may not exist.
+FIT_SCREENING_CONTENT_ATTR = "mpa_fit_w_screening_content"
+
+
+def canonical_screening_content(content, *, where):
+    """Normalise a screening-content spelling to a known key, or refuse.
+
+    Case-insensitive on input, canonical on output, and an unrecognised
+    spelling refuses rather than defaulting -- a default here is the
+    130 eV the declaration exists to kill.
+    """
+    if content is None:
+        raise ValueError(
+            f"{where}: screening_content is required and there is no "
+            f"default.  The multipole method fits the CORRELATION part "
+            f"W_c = W - v (MPA_THEORY 1.1/1.2) and the pole field's tau "
+            f"transform is convolved with G as if it were; a store filled "
+            f"with the full W from the Dyson solve is the 2026-08-09 "
+            f"bridge defect, worth -120.1 eV per state and invisible to "
+            f"every internal gate.  Pass 'W_c' (the tensor has had v "
+            f"subtracted) or 'W' (it has not).")
+    raw = str(content).strip()
+    for known in W_SCREENING_CONTENTS:
+        if raw.lower() == known.lower():
+            return known
+    raise ValueError(
+        f"{where}: screening_content={content!r} is not one of "
+        f"{list(W_SCREENING_CONTENTS)}.  Refusing rather than guessing: "
+        f"an unrecognised spelling silently treated as the correlation "
+        f"part is the same defect as no declaration at all, wearing a "
+        f"declaration's clothes.")
+
+
+def _declared_screening_content(holder, attr):
+    """The stored declaration, or ``None`` for a legacy store."""
+    if attr not in holder.attrs:
+        return None
+    return canonical_screening_content(
+        _qs().qirr_attr_str(holder, attr),
+        where="mpa_store (stored declaration)")
+
+
+def require_correlation_part(content, *, where, source=None):
+    """Refuse anything that is not a declared ``W_c``.  THE reader gate.
+
+    ONE implementation, called by both consumer seams -- the fit driver
+    (which must not fit ``v``) and the MPA Sigma pass (which must not
+    integrate a pole field that was fitted to it).  Two copies of this
+    refusal would be two claims about which object the pipeline consumes,
+    differing on the day one of them is edited.
+
+    ``content`` is the declaration as read back: a canonical key, or
+    ``None`` for a store written before the attr existed.  ``None`` is
+    REFUSED and not assumed: the first-light production store holds the
+    full ``W`` and every synthetic fixture in the tree holds ``W_c``, so
+    neither guess is even usually right, and the wrong one costs 130 eV
+    with no other symptom.
+    """
+    tail = f"  Store: {source}." if source else ""
+    if content is None:
+        raise ValueError(
+            f"{where}: this store does not declare WHICH screening object "
+            f"it holds ({W_SCREENING_CONTENT_ATTR} / "
+            f"{FIT_SCREENING_CONTENT_ATTR} is unset), so it cannot be "
+            f"consumed.  The multipole pole field must be a fit to the "
+            f"CORRELATION part W_c = W - v: v is frequency-independent, "
+            f"it is already counted in Sigma_x, and a pole field carrying "
+            f"it puts the bare Coulomb interaction into the tau "
+            f"convolution.  On the 2026-08-09 production deck that was "
+            f"Sigma_c = -130.651 eV against a Godby-Needs +0.6754 eV at "
+            f"the n_p = 1 bridge, with |v| = 104-119 % of |W| at the "
+            f"probe frequency.  Fix: stamp the store once with "
+            f"mpa_store.declare_w_screening_content / "
+            f"declare_fit_screening_content, or re-produce it with the "
+            f"current writers, which require the declaration at birth."
+            f"{tail}")
+    if content != "W_c":
+        raise ValueError(
+            f"{where}: this store declares screening_content={content!r} "
+            f"-- the FULL screened interaction, with the bare Coulomb v "
+            f"still in it.  The multipole fit and the Sigma pass both "
+            f"require the correlation part W_c = W - v (MPA_THEORY "
+            f"1.1/1.2); fitting v gives poles whose residues are "
+            f"dominated by it and a Sigma_c wrong by two orders of "
+            f"magnitude, which is what the 2026-08-09 n_p = 1 bridge gate "
+            f"measured: Sigma_c = -130.651 eV against a Godby-Needs "
+            f"+0.6754 eV on the same two samples.  Fix: subtract V_q "
+            f"from every frequency slab -- "
+            f"the same subtraction ppm_sigma.fit_ppm performs at "
+            f"'Wc0_q = W0_q - V_q' and head_dipole at 'w_c = w_head - "
+            f"v_head' -- into a NEW store declared 'W_c'.  This one is "
+            f"not silently corrected, because a reader that repairs its "
+            f"input is a reader whose output nobody can attribute.{tail}")
+    return content
+
 #: The head-set sibling of the declaration, per labelled ``__mpahead*``
 #: group.  Separate attrs because the two axes have separate producers
 #: and separate lifetimes: the body is fitted by the fit driver against
@@ -278,6 +412,18 @@ _MPA_OWNED_ATTRS = (
     _FREQ_ATTR, "mpa_n_omega", "mpa_omega_units", "mpa_protocol",
     "mpa_varpi", "mpa_n_p", "mpa_alpha", "mpa_omega_max", "mpa_grid_hash",
 )
+
+#: Version-2 attrs that are OURS but are not REQUIRED — the difference
+#: matters at two seams and they pull in opposite directions.
+#: :func:`read_w_header` refuses a file missing anything in
+#: ``_MPA_OWNED_ATTRS`` (a half-stamped file), and putting the screening
+#: declaration there would make every store written before it existed
+#: unreadable — including by
+#: :func:`declare_w_screening_content`, whose whole job is to add it.
+#: The removability comparison, on the other hand, has to set it aside
+#: exactly as it sets the required ones aside, or a v2 file stops
+#: matching a v1 file attr for attr.  So it is listed, and listed here.
+_MPA_OPTIONAL_ATTRS = (W_SCREENING_CONTENT_ATTR,)
 
 #: Bytes per complex128 element.  Named because it appears in the budget
 #: arithmetic, and a budget whose constants are anonymous is a budget
@@ -469,6 +615,7 @@ def allocate_w_omega(
     sampling,
     omega_line=None,
     closure_verdict=None,
+    screening_content=None,
     dtype=None,
     provenance=None,
     mode="a",
@@ -512,6 +659,14 @@ def allocate_w_omega(
         ``CentroidClosureVerdict``.  Required, and it REFUSES on a
         non-closed centroid set: a wedge stored against a set with no
         permutation α is silently unrecoverable, per frequency.
+    screening_content
+        ``'W_c'`` or ``'W'`` — WHICH object these slabs hold.  Optional
+        HERE and refused at the consumer (:func:`require_correlation_part`,
+        called by the fit driver), because a producer that has not yet
+        decided may legitimately allocate first and
+        :func:`declare_w_screening_content` afterwards; what it may not
+        do is reach a fit undeclared.  See :data:`W_SCREENING_CONTENTS`
+        for the 130 eV this exists to catch.
     """
     qs = _qs()
     n_omega = int(n_omega)
@@ -545,6 +700,7 @@ def allocate_w_omega(
         return stamp_w_omega(
             grp, name, tables=tables, omega=omega, sampling=sampling,
             omega_line=omega_line, closure_verdict=closure_verdict,
+            screening_content=screening_content,
             data_ready=np.zeros(n_omega, dtype=bool),
             provenance=provenance)
 
@@ -558,6 +714,7 @@ def stamp_w_omega(
     sampling,
     omega_line=None,
     closure_verdict,
+    screening_content=None,
     data_ready=None,
     n_rmu_logical=None,
     provenance=None,
@@ -673,6 +830,9 @@ def stamp_w_omega(
         ds.attrs["mpa_omega_max"] = np.float64(san["omega_max"])
         ds.attrs["mpa_grid_hash"] = grid_hash
         ds.attrs["mpa_writer"] = "file_io.mpa_store"
+        if screening_content is not None:
+            ds.attrs[W_SCREENING_CONTENT_ATTR] = canonical_screening_content(
+                screening_content, where=f"stamp_w_omega({name!r})")
         for key, val in extra.items():
             ds.attrs["mpa_prov_" + str(key)] = val
 
@@ -877,6 +1037,8 @@ def read_w_header(src, name, *, mode="r"):
             "omega": omega,
             "omega_line": line,
             "omega_units": qs.qirr_attr_str(ds, "mpa_omega_units"),
+            "screening_content": _declared_screening_content(
+                ds, W_SCREENING_CONTENT_ATTR),
             "sampling": sampling,
             "grid_hash": recomputed,
             "data_ready": ready,
@@ -1177,6 +1339,42 @@ def read_w_slab(
         n_sym_spatial=int(can.n_sym_spatial),
     )
     return full, header
+
+
+def declare_w_screening_content(dest, name, content, *, mode="a"):
+    """Stamp a LEGACY W(ω) store's screening content — once, never twice.
+
+    The migration path for the stores written before the declaration
+    existed, and the way the 2026-08-09 production store is labelled for
+    what it is: it holds the full ``W``, so it is declared ``'W'`` and
+    the fit driver then refuses it BY NAME instead of by omission.  The
+    bytes are evidence and are not rewritten.
+
+    A re-declaration to a DIFFERENT value refuses, for the same reason
+    :func:`declare_fit_energy_unit` does: the bytes did not change, so at
+    most one of the two declarations is true.  Re-declaring the SAME
+    value is a no-op, so the call is safe to leave in a setup script.
+
+    Returns the canonical content stamped.
+    """
+    qs = _qs()
+    can = canonical_screening_content(
+        content, where="declare_w_screening_content")
+    with qs.QirrDest(dest, mode) as grp:
+        ds, _ = _open_w(grp, name)
+        declared = _declared_screening_content(ds, W_SCREENING_CONTENT_ATTR)
+        if declared is not None and declared != can:
+            raise ValueError(
+                f"declare_w_screening_content: {name!r} already declares "
+                f"{declared!r} and the caller asked for {can!r}.  The "
+                f"tensor did not change, so at most one of the two is "
+                f"true; refusing to replace a declaration is what keeps "
+                f"'which screening object is this' a question with one "
+                f"answer.  If the first declaration was WRONG, that is a "
+                f"corrupted store: rebuild it into a fresh file with the "
+                f"right declaration and say so in its provenance.")
+        ds.attrs[W_SCREENING_CONTENT_ATTR] = can
+        return can
 
 
 def read_w_tables(src, name, *, mode="r"):
@@ -1599,6 +1797,41 @@ def declare_fit_energy_unit(dest, unit, *, include_heads=True, mode="a"):
         return can
 
 
+def declare_fit_screening_content(dest, content, *, mode="a"):
+    """Stamp a LEGACY fit store's screening content — once, never twice.
+
+    Sibling of :func:`declare_fit_energy_unit`, and it exists for the
+    same population: the stores fitted before the declaration did.  It is
+    also how the 2026-08-09 production n_p = 1 and n_p = 8 fit stores get
+    labelled ``'W'`` — the truth about them — so that the Σ pass turns
+    them away by name, with the mechanism in the message, instead of
+    turning them away for having no attr.
+
+    A re-declaration to a DIFFERENT value refuses.  Returns the canonical
+    content stamped.
+    """
+    qs = _qs()
+    can = canonical_screening_content(
+        content, where="declare_fit_screening_content")
+    with qs.QirrDest(dest, mode) as grp:
+        _open_fit(grp)                     # a fit store, not any h5 file
+        declared = _declared_screening_content(
+            grp, FIT_SCREENING_CONTENT_ATTR)
+        if declared is not None and declared != can:
+            raise ValueError(
+                f"declare_fit_screening_content: this store already "
+                f"declares {declared!r} and the caller asked for {can!r}.  "
+                f"The poles did not change, so at most one of the two is "
+                f"true; refusing to replace a declaration is what keeps "
+                f"'which screening object was fitted' a question with one "
+                f"answer.  If the first declaration was WRONG, that is a "
+                f"corrupted store: re-fit it, or copy the tensors into a "
+                f"fresh store with the right declaration and say so in "
+                f"its provenance.")
+        grp.attrs[FIT_SCREENING_CONTENT_ATTR] = can
+        return can
+
+
 def allocate_fit_store(
     dest,
     *,
@@ -1606,6 +1839,7 @@ def allocate_fit_store(
     n_mu,
     n_p,
     energy_unit=None,
+    screening_content=None,
     grid_hash=None,
     table_hash=None,
     centroid_hash=None,
@@ -1642,6 +1876,15 @@ def allocate_fit_store(
         is no default.  The fit driver passes the W store's own
         ``mpa_omega_units`` stamp, because the poles come out in the
         unit of the abscissae the fit was solved against.
+    screening_content
+        REQUIRED, and for the same reason ``energy_unit`` is: WHICH
+        screening object these poles were fitted to.  The fit driver
+        passes the W store's own :data:`W_SCREENING_CONTENT_ATTR` stamp
+        after refusing anything that is not ``'W_c'``, so a fit store the
+        driver made can only ever say ``'W_c'``.  The slot accepts
+        ``'W'`` too, because a store may be assembled by hand out of
+        bytes whose provenance is exactly that, and the Sigma stage has
+        to be able to refuse it BY NAME rather than by omission.
     grid_hash, table_hash, centroid_hash
         The W(ω) file's stamps, carried here so the Σ stage can assert
         that these poles came from that screening on that centroid set.
@@ -1649,6 +1892,8 @@ def allocate_fit_store(
     """
     qs = _qs()
     unit = canonical_energy_unit(energy_unit, where="allocate_fit_store")
+    content = canonical_screening_content(
+        screening_content, where="allocate_fit_store")
     n_q = int(n_q)
     n_mu = int(n_mu)
     n_p = int(n_p)
@@ -1689,6 +1934,7 @@ def allocate_fit_store(
         grp.attrs["mpa_fit_format_version"] = np.int64(
             MPA_FIT_FORMAT_VERSION)
         grp.attrs[FIT_ENERGY_UNIT_ATTR] = unit
+        grp.attrs[FIT_SCREENING_CONTENT_ATTR] = content
         grp.attrs["mpa_fit_n_p"] = np.int64(n_p)
         grp.attrs["mpa_fit_n_q"] = np.int64(n_q)
         grp.attrs["mpa_fit_n_mu_logical"] = np.int64(n_mu)
@@ -1937,6 +2183,12 @@ def fit_completion_ledger(src, *, mode="r"):
             #: Informational here (the converting readers enforce it);
             #: carried so a driver can announce it without a second open.
             "energy_unit": _declared_fit_unit(grp),
+            #: WHICH screening object these poles were fitted to, or None
+            #: for a store written before the declaration existed.  The Σ
+            #: pass runs it through :func:`require_correlation_part`; it
+            #: is surfaced here so a driver can announce it in one open.
+            "screening_content": _declared_screening_content(
+                grp, FIT_SCREENING_CONTENT_ATTR),
             "n_p": int(grp.attrs["mpa_fit_n_p"]),
             "n_q": int(grp.attrs["mpa_fit_n_q"]),
             "n_mu": int(grp.attrs["mpa_fit_n_mu_logical"]),
