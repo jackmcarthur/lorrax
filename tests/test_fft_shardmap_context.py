@@ -65,6 +65,28 @@ _SANCTIONED_EAGER = {
     # run at sizes where a replicated W is intended and harmless.
     ("bse/bse_ring_comm.py", "ring_matvec_smoke_test"): 1,
     ("bse/bse_ring_comm.py", "ring_matvec_correctness_check"): 5,
+    # NOT eager, and NOT debt -- a limitation of the syntactic proxy, recorded
+    # here because the proxy has no other vocabulary.  2026-08-08's non-TDA
+    # port factored the stack matvec's shared conv+decode stages out of
+    # ``build_bse_stack_matvec._w_stack._body`` into module-level
+    # ``_conv_decode`` so the coupling block could reuse them (that reuse is
+    # what makes the SDY fusion exact).  ``_conv_decode`` is called ONLY from
+    # the scan bodies of ``build_bse_stack_matvec._w_stack`` and
+    # ``build_bse_stack_pair_matvec._w_pair``, both of which ARE built by
+    # ``_shard_map_fn``, so at run time the operand is always a local
+    # (mu_loc, nu_loc, ...) shard and no all-gather exists.  The rule keys on
+    # the LEXICAL enclosing chain, which after the factoring no longer reaches
+    # the shard_map-constructing function, so it reports a call the doctrine
+    # does not actually forbid.
+    # Evidence the semantics did not move with the code: on the tree that
+    # introduced the factoring, ``pair(X, s=0)`` scores rel 0.000e+00 --
+    # BIT-IDENTICAL -- against the pre-port shipped TDA stack matvec
+    # (SDY_SOLVER.md rung c1, reproduced at both 1x1 and 2x2), and
+    # ``test_stack_memory_flat_in_n_trials`` stays green.
+    # THE DURABLE FIX is to teach ``_references_shardmap`` the call graph (a
+    # helper reached only from shard_map bodies is interior) and then DELETE
+    # this entry; it is an owner call on this gate, not a consolidation's.
+    ("bse/bse_stack_matvec.py", "_conv_decode"): 2,
 }
 
 
