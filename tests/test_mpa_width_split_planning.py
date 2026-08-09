@@ -163,7 +163,7 @@ def test_planning_the_measured_geometry_is_bounded_on_every_branch(
     # summed twice, which no finiteness check would see).
     total = np.zeros(geo["live_mask"].shape, dtype=int)
     for grp in groups:
-        total += np.asarray(grp.mask_B, dtype=int)
+        total += np.asarray(grp.dense_mask_B(), dtype=int)
     assert np.array_equal(total, geo["live_mask"].astype(int))
 
 
@@ -184,7 +184,7 @@ def test_the_leaf_ceiling_refuses_by_name_on_a_field_outside_the_argument():
         a, g, live, e_lo=0.0, omega_max=0.0,
         beta_max=R.SHIPPED_WIDTH_BETA_MAX)
     with pytest.raises(RuntimeError) as exc:
-        sigma_pass._refuse_width_split_explosion(len(leaves), live, g)
+        sigma_pass._refuse_width_split_explosion(len(leaves), g)
     msg = str(exc.value)
     assert str(sigma_pass.MAX_WIDTH_SPLIT_LEAVES) in msg
     assert "out-of-memory" in msg
@@ -228,15 +228,15 @@ def test_the_crossing_branchs_windows_cannot_trip_the_width_clause():
     # crossing core's own A = f_max/Gamma_lo gate is a different (and
     # legitimate) refusal, served in production by legacy-routing every
     # Gamma < xi -- so this cell hands the bucket what the split would.
-    wide = geo["gamma_ry"] >= geo["xi_ry"]
+    wide = np.flatnonzero(geo["gamma_ry"] >= geo["xi_ry"])
     groups = sigma_pass._mpa_groups_for_bucket(
-        a_ry=geo["a_ry"], gamma_ry=geo["gamma_ry"],
-        bucket_mask=wide, E_A_host=geo["E_A_host"],
+        idx=wide, a_v=geo["a_ry"][wide], g_v=geo["gamma_ry"][wide],
+        E_A_host=geo["E_A_host"],
         base_mask_A_host=geo["base_mask_A_host"],
         omega_max=float(np.max(geo["omega_nonneg_ry"])),
         space="cond", neg_omega_half=False,
         edge_factor=geo["edge_factor"], rel_tol=1.0e-8,
         max_nodes=R.DEFAULT_MAX_CROSSING_NODES)
     assert groups, "the bucket must produce windows"
-    for _names, wins, _mask in groups:
+    for _names, wins, _idx in groups:
         assert wins
