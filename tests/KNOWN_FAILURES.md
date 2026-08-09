@@ -11,6 +11,50 @@ claim carries the arm in which it comes out FALSE.
 
 ---
 
+# AMENDMENT — THE CROSSING COMPLETION WAS ELEMENTWISE, AND TWO PPM FREEZES MUST MOVE (2026-08-09)
+
+`fix/ppm-crossing-operator-im-2026-08-09`, off `integration/mpa-table-2026-08-09`
+@ `3ed30c39`.  One physics change: the crossing (HGL, `project="imag"`)
+consumer in `gw.ppm_accumulators._project_tau_onto_omega_np` completed its
+one-sided τ grid with the ELEMENTWISE imaginary part where the sine sum
+needs the operator one, `Im_op[c·X] = (c·X − (c·X)†)/2i` — the missing
+exponential is the (μ,ν) PAIR adjoint (exact for Hermitian `B_q`, measured
+8.6e-10).  The two coincide only where σ^τ is complex-symmetric, i.e. only
+at k ≡ −k mod G.  On the Si 4×4×4 arm-b deck the elementwise form left Σ_c
+non-Hermitian by 8.8–30.3 eV at the five non-TRIM k (star spread 43.85 eV
+diag), which is registered task #16's eqp0 anomaly (`Emf` right everywhere,
+`eqp0` breaking exact degeneracies by up to 67.6 eV); §7.7.7's re-closure
+of that task as a file-reading error is thereby withdrawn a second time —
+the reading error was real, but a code defect sat underneath it.
+Pre-existing at `59fa874b`.  Gates: `tests/test_ppm_crossing_completion.py`
+(physics derivation, Hermiticity with the elementwise red twin, the TRIM
+reduction with the conjugate-crossed red twin `(c̄X − cX†)/2i` and the
+`−Im_op` sign twin, scalar-channel preservation, dispatch guards).
+
+**WHAT THIS TURNS RED, by design — two Tier-1 freezes are stale, not the
+code.**  `test_gnppm_matches_reference` and
+`test_bispinor_gnppm_matches_reference` pin `sigma_diag_gnppm_ref.dat` /
+`sigma_diag_bispinor_ref.dat` frozen FROM THE ELEMENTWISE FORM.  The MoS2
+3×3 deck's non-Γ k carry ~1e-3 eV of the defect (measured max|A−A†|
+0.0039–0.0078 eV at the four non-Γ k, exactly 4e-5-scale at Γ), so the
+fixed tree must disagree with those references at ~1e-3 eV against
+`_XMACHINE_ATOL_EV = 1e-5` — at the non-TRIM k only, Γ rows preserved.
+That is the fix landing, not a regression; the references need an
+adjudicated re-freeze (owner row).  Everything at nb=1 (the
+`test_mpa_sigma_pass` scalar τ-loop analogue) is preserved to fp roundoff
+— its channels are real, where Im_op degenerates to the elementwise Im —
+pinned by `test_scalar_channel_unchanged`.
+
+**Still open at this seam (pre-existing, separate row):** the completion
+is exact only up to the `Omega_q` hermiticity residual, measured at
+1.614e-02 on the arm-b deck (`LORRAX_PPM_HERM_DIAG=1`; the LU Dyson solve
+is production-gated Hermitian at q=0 only).  And the crossing dispatch
+could now ride the merged X kernel (`Im_op[c·X]` needs only X), which
+would retire the two-channel plan — an owner-scoped channel-plan change,
+deliberately not folded into the fix.
+
+---
+
 # AMENDMENT — THE CERTIFIED TABLES LINEAGE LANDS (2026-08-09)
 
 The three stacked table campaigns (damped-line global sets, full-precision
