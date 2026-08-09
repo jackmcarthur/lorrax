@@ -1581,6 +1581,83 @@ def _get_write_sm(mesh, in_specs, *,
 
 
 # ---------------------------------------------------------------------------
+# Dataset attributes
+# ---------------------------------------------------------------------------
+# ``create_dataset(attrs=...)`` used to be DISCARDED here, with a
+# ``warnings.warn`` where the write should have been.  That is the
+# defect fixed on 2026-08-08, and it was a production one rather than a
+# cosmetic one: ``file_io.sigma_output`` stamps ``k_storage="ibz"`` on
+# each Σ dataset through exactly this argument, and ``kin_ion``'s reader
+# is specified so that a dataset with NO ``k_storage`` attr means stored
+# on the full BZ (the back-compat rule that keeps every pre-format file
+# readable).  So a wedge cube written through this transport — the only
+# transport SlabIO has, and therefore every cluster-written cube — came
+# back claiming to be a full-BZ cube with nrk rows, and every k_irr
+# consumer indexed full-BZ rows into it.  The warning made that visible
+# to nobody: it goes to stderr in the middle of a run's write telemetry,
+# and the file it describes is wrong for the rest of its life.
+#
+# A transport does not get to drop the caller's data and call the
+# warning a mitigation.  These attrs are written, by the same rank-0
+# h5py machinery ``write_attr`` already defers its small datasets to,
+# and through the same ``ds.attrs[key] = value`` assignment that the
+# host-side writers (``gw.kin_ion_io``, ``sigma_output``'s QSGW
+# appender) use — so a stamp written by the FFI transport and the same
+# stamp written host-side are the same bytes in the file, not merely
+# the same intent.
+
+def _host_attr_value(value):
+    """The value h5py is handed, host-side, for one attribute.
+
+    Almost everything passes through UNTOUCHED, and that is the point:
+    ``ds.attrs["k_storage"] = "ibz"`` writes a variable-length UTF-8
+    string, while ``ds.attrs["k_storage"] = np.asarray("ibz")`` writes a
+    fixed-length byte string that reads back as ``b"ibz"`` — and
+    :func:`file_io.kin_ion.read_star_map` does ``str(...)`` on what it
+    reads, so the second spelling produces the literal ``"b'ibz'"`` and
+    refuses the file it just wrote.  A helpful coercion here would be a
+    second format.
+
+    Only a device array needs anything done to it, and what it needs is
+    the pull to host that ``write_attr``'s drain does for the same
+    reason: h5py cannot serialise a ``jax.Array``.
+    """
+    if isinstance(value, (str, bytes, bool, int, float,
+                          np.generic, np.ndarray)):
+        return value
+    return np.asarray(jax.device_get(value))
+
+
+def _apply_dataset_attrs(h5, pending) -> None:
+    """Stamp ``pending`` — ``[(dataset_name, attrs_dict), …]`` — onto ``h5``.
+
+    ``h5`` is an OPEN ``h5py.File`` in a writable mode; the caller owns
+    the open, because on the transport this runs inside the one rank-0
+    reopen that also lands the deferred small datasets.
+
+    A name that is not in the file RAISES.  The alternative — skip it,
+    the dataset is gone anyway — is the shape of the defect this
+    function exists to close: an attr silently not written is a file
+    that lies about what it holds, and the stamps that come through
+    here are the ones that say whether an array is a wedge or the full
+    BZ.  Every caller of ``create_dataset`` creates the dataset in the
+    same breath, so a miss here is a transport bug and should read as
+    one.
+    """
+    for name, attrs in pending:
+        if name not in h5:
+            raise KeyError(
+                f"SlabIO: {os.path.basename(h5.filename)} has no dataset "
+                f"{name!r} to stamp {sorted(attrs)} onto.  The attrs were "
+                f"handed to create_dataset({name!r}, ...), so the dataset "
+                f"should exist — refusing to drop them silently, which is "
+                f"the defect this path was written to close.")
+        ds = h5[name]
+        for key, value in attrs.items():
+            ds.attrs[key] = _host_attr_value(value)
+
+
+# ---------------------------------------------------------------------------
 # Backend
 # ---------------------------------------------------------------------------
 class _FfiBackend(_DatasetGeometry):
@@ -1666,6 +1743,15 @@ class _FfiBackend(_DatasetGeometry):
         # close() — concurrent h5py + MPI-IO on the same file would
         # corrupt HDF5 metadata.
         self._deferred_attrs: list[tuple[str, object]] = []
+        # ``create_dataset(attrs=...)`` rides the SAME deferral, for the
+        # same reason and into the same rank-0 reopen: an H5 attribute
+        # write is metadata on a file MPI-IO still holds open.  See
+        # :func:`_apply_dataset_attrs`.
+        self._deferred_ds_attrs: list[tuple[str, dict]] = []
+        # ``chunks=`` cannot be honoured by this transport at all and
+        # says so — once per file, not once per dataset.  See
+        # :meth:`create_dataset`.
+        self._chunks_warned: bool = False
         # Python-level async writer.  ``write_slab`` enqueues a callable
         # here; the ``AsyncDispatcher`` worker pops it and calls
         # ``jax.jit(shard_map(_per_rank))(A).block_until_ready()``.
@@ -1758,20 +1844,42 @@ class _FfiBackend(_DatasetGeometry):
         )
         self._ds_ids[name] = ds_id
         self._remember_geom(name, shape, jnp.dtype(dtype))
-        # chunks + attrs are runtime-set on the underlying H5 dataset.
-        # The FFI backend doesn't yet expose a collective "set chunks"
-        # after H5Dcreate (it would need a new ctypes entry and some
-        # care around MPI-IO dataset transfer property lists).  The
-        # caller's `chunks=` argument is a hint for the writer; when the
-        # dataset is created by the FFI path the H5 library picks
-        # contiguous layout + the FAPL-level alignment set in ctx
-        # init.  For v1 this matches the OpenMPI-stack perf ceiling;
-        # user can pre-create with h5py + chunks if needed.
-        if chunks is not None or attrs is not None:
+        # THE ATTRS ARE WRITTEN.  Queued here and landed by
+        # :func:`_apply_dataset_attrs` inside close()'s rank-0 reopen,
+        # because an H5 attribute write is metadata on a file collective
+        # MPI-IO is still holding — the same constraint that put
+        # ``write_attr`` on the same queue, and the same rendezvous
+        # pays for both.  The record is a COPY: the caller's dict is
+        # theirs to mutate between here and close().
+        if attrs:
+            self._deferred_ds_attrs.append((name, dict(attrs)))
+        # ``chunks``, by contrast, genuinely cannot be honoured after the
+        # fact by anyone: HDF5 fixes a dataset's layout at H5Dcreate, and
+        # neither ``lrx_phdf5_ensure_dataset`` (which takes name, shape
+        # and dtype, and nothing else) nor a later h5py reopen can change
+        # it.  So this stays a hint and stays said — it is the caller's
+        # only signal that the file will be contiguous, and dropping the
+        # signal as well as the layout is how the attrs defect happened.
+        # Honouring it means a chunk-dims argument on the C entry point,
+        # not a change here.
+        #
+        # ONCE PER FILE, though.  ``sigma_output`` passes chunks on all
+        # four of its datasets and every production Σ write was emitting
+        # four copies of this into the middle of the write telemetry,
+        # which is how a warning stops being read — the same reason the
+        # discard this replaces was invisible for four days.
+        if chunks is not None and not self._chunks_warned:
             import warnings
+            self._chunks_warned = True
+            _want = tuple(int(c) for c in chunks)
             warnings.warn(
-                "FFI backend: chunks/attrs on create_dataset currently no-op; "
-                "pre-create with h5py if you need explicit chunking or attrs.")
+                f"SlabIO FFI transport: chunks={_want} on "
+                f"create_dataset({name!r}) is not honoured, here or for any "
+                f"later dataset in {os.path.basename(self.path)} — HDF5 "
+                f"fixes layout at create time and the collective create "
+                f"takes no chunk dims, so the datasets are contiguous with "
+                f"the FAPL-level alignment set at ctx init.  Pre-create "
+                f"with h5py if the layout is load-bearing.")
 
     # ------------------------------------------------------------------
     def write_attr(self, name: str, value) -> None:
@@ -2238,23 +2346,27 @@ class _FfiBackend(_DatasetGeometry):
                 print(f"  [SlabIO.close] H5Fclose returned in "
                       f"{_t_close:.1f} s", flush=True)
         # Now that MPI-IO has released the file, rank 0 can safely
-        # reopen with h5py to tack on any deferred small-metadata
-        # datasets (omega_ev and friends).
+        # reopen with h5py to tack on the deferred small-metadata
+        # datasets (omega_ev and friends) and the deferred dataset
+        # attributes (``k_storage`` and friends).  ONE reopen for both:
+        # they are deferred for the same reason and land in the same
+        # place, and a second open would be a second thing to keep in
+        # step with the barrier below.
         #
-        # The rank-0 h5py block is gated on ``self._deferred_attrs``; the
-        # BARRIER is not, and must not be.  ``_deferred_attrs`` is a
-        # per-rank Python list, so gating a collective on it makes the
-        # number of barriers a rank executes depend on that rank's own
-        # control flow — the deadlock shape this audit is looking for.
-        # Today every ``write_attr`` call site is SPMD so the list is the
-        # same everywhere, but that is a property of the callers, not of
-        # this method, and it is not checkable here.  An unconditional
-        # barrier costs one rendezvous per file close and removes the
-        # question.
-        if (_worker_error is None and self._deferred_attrs
+        # The rank-0 h5py block is gated on the deferred lists; the
+        # BARRIER is not, and must not be.  Those lists are per-rank
+        # Python lists, so gating a collective on them makes the number
+        # of barriers a rank executes depend on that rank's own control
+        # flow — the deadlock shape this audit is looking for.  Today
+        # every ``write_attr`` / ``create_dataset`` call site is SPMD so
+        # the lists are the same everywhere, but that is a property of
+        # the callers, not of this method, and it is not checkable here.
+        # An unconditional barrier costs one rendezvous per file close
+        # and removes the question.
+        if (_worker_error is None
+                and (self._deferred_attrs or self._deferred_ds_attrs)
                 and jax.process_index() == 0):
             import h5py
-            import numpy as np
             with h5py.File(self.path, "a") as h5:
                 for name, value in self._deferred_attrs:
                     if name in h5:
@@ -2263,10 +2375,15 @@ class _FfiBackend(_DatasetGeometry):
                     if not isinstance(host, np.ndarray):
                         host = np.asarray(jax.device_get(host))
                     h5.create_dataset(name, data=host)
+                # AFTER the small datasets, because that loop
+                # delete-and-recreates by name and a recreated dataset
+                # would come back stripped of anything stamped first.
+                _apply_dataset_attrs(h5, self._deferred_ds_attrs)
         # Same reason as the write-ordering barriers above: rank 0 may
         # have just rewritten datasets in this file with serial h5py, and
         # no other rank may reopen it until that is durable.
         _barrier("slab_io_ffi_close_attrs")
         self._deferred_attrs = []
+        self._deferred_ds_attrs = []
         if _worker_error is not None:
             raise _worker_error
