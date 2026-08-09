@@ -259,6 +259,12 @@ class _DiagMemo:
     changed W — a different object — always misses.  Weak, so the memo pins no
     device buffer; the only strong reference it keeps is the diagonal itself,
     which is one ``(nc, nv, nk)`` real array.
+
+    This is the same idiom, and for the same reason, as the ``g_index``
+    device-buffer cache in ``common/wfn_transforms`` (``_GINDEX_DEV_BY_ID``):
+    identity first because hashing the content costs more than the work being
+    saved, weak references because an ``id`` on its own is a recycled-address
+    hazard.
     """
 
     __slots__ = ("_refs", "_value", "_meta", "hits", "misses")

@@ -152,9 +152,7 @@ def test_memo_misses_on_equal_but_distinct_W():
     out = np.asarray(H.build_bse_exact_diagonal(*clone, NK, memo=True))
 
     assert H.exact_diagonal_memo_stats()["hits"] == hits
-    assert np.array_equal(out, _reference_diagonal(tuple(clone), NK)
-                          .astype(out.dtype)) or np.max(
-        np.abs(out - _reference_diagonal(tuple(clone), NK))) < 1e-13
+    assert np.max(np.abs(out - _reference_diagonal(tuple(clone), NK))) < 1e-13
 
 
 def test_memo_misses_when_nk_changes():
@@ -184,7 +182,8 @@ def test_memo_pins_no_operand_buffer():
     ops = _payload()
     H.build_bse_exact_diagonal(*ops, NK, memo=True).block_until_ready()
     ref = weakref.ref(ops[4])
-    ops = None
+    del ops
+    gc.collect()
     gc.collect()
     assert ref() is None, "the memo kept a strong reference to W"
 
