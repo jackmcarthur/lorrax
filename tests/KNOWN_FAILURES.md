@@ -2162,7 +2162,7 @@ census.  In-tree: this amendment.
 ### OPEN ROW: the `damped_line` catalog is SHIPPED AND WIRED, and the fit
 ### stage is not yet calling it
 
-`src/common/minimax_assets/catalog_damped_line.json` and its 32
+`src/common/minimax_assets/catalog_damped_line.json` and its 29
 `damped_line/*.npz` tables land here together with the door that serves them,
 `src/common/minimax_damped_line_selector.py`.  Unlike the complex-Laplace row
 above, this catalog is **not inert**: the selector is complete, it reads the
@@ -2183,9 +2183,21 @@ stage is standing outside — is still there.
 
 **What IS true at this head**, so the row is not read as weaker than it is:
 
-- 32 of 32 entries certify, on a held-out `Delta` grid disjoint from every grid
-  the solver saw and four times finer, at every one of the 55-to-58 shipped
-  weight rows on **both** sampling lines.
+- 29 of 29 shipped entries certify, on a held-out `Delta` grid disjoint from
+  every grid the solver saw and four times finer, at every one of the 55-to-58
+  shipped weight rows on **both** sampling lines.  17 ship sparse (1.70-2.49x
+  against one composite rule per line) and 12 ship composite (1.11-1.19x, from
+  the sharing alone).
+- **`tests/test_damped_line_tables.py` is 120 passed, 1 failed at this head**,
+  and the one red is `test_the_catalog_covers_the_span_and_tier_ladder`.  It is
+  the test doing its job: the ladder declares eight spans and the sweep landed
+  seven of them plus one tier of the eighth, so three cells (`A = 200` at
+  1e-8, 1e-10 and 1e-12) are absent.  They are absent for COST, not
+  feasibility — the sparse attempt at the top of the ladder spends its whole
+  wall budget in the prune before falling back — and
+  `tools/generate_damped_line_assets.py --spans 200 --merge` fills them without
+  recomputing anything already here.  **This red closes when that command
+  runs**; nothing else in the suite depends on it.
 - Every entry's `kappa_0` is re-measured from its own shipped bytes and is at
   or under the `<= 2` shipping rule.  This family is the first where that cap
   BINDS: the uncapped selector produced live specimens at `kappa_0` of 406, 620
