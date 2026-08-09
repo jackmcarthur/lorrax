@@ -77,10 +77,18 @@ the TRIM rows move 7.4–19.7 eV.  TRIM invariance is therefore the
 discriminating gate, which is why it is pinned in the test file rather
 than any spread statistic.
 
-**Still open at this seam (pre-existing, separate row):** the completion
-is exact only up to the `Omega_q` hermiticity residual, measured at
-1.614e-02 on the arm-b deck (`LORRAX_PPM_HERM_DIAG=1`; the LU Dyson solve
-is production-gated Hermitian at q=0 only).  And the crossing dispatch
+**Still open at this seam (pre-existing, separate row) — RE-DESCRIBED
+2026-08-09:** the 1.6e-2 figure measured on the arm-b deck
+(`LORRAX_PPM_HERM_DIAG=1`) is a **χ₀ ratio IQR at q=0**, and it is already
+attributed: it comes from inverse-Dyson conditioning at the one q that has
+the G=0 component removed (`FIX_wq_resolvent.md:128,138`).  It was
+previously written up here as an `Omega_q` hermiticity seam at the LU Dyson
+solve; that description is wrong and is **corrected per
+`TRACE_vavg_consumers.md`**, which pins the attribution on file:line
+evidence.  The completion's exactness is not what this number bounds.  The
+tree's actual hermiticity seams, for anyone who comes looking for them, are
+`screening.py:666` (1e-6), `screening.py:691` (1e-5), `bse_nontda.py:190`
+(1e-6) and `ALPHA_HERM_RTOL` (1e-9).  And the crossing dispatch
 could now ride the merged X kernel (`Im_op[c·X]` needs only X), which
 would retire the two-channel plan — an owner-scoped channel-plan change,
 deliberately not folded into the fix.
