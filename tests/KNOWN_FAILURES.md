@@ -3246,3 +3246,87 @@ ran, and `setdiff.py`. Worktrees `wt_census_base` (a3368c5b), `wt_peerbase`
 (70c0472a) and `wt_mpabatch` (the landed head). In-tree: this amendment, the
 three bar-decision commits and their docstrings, which carry the derivations
 where the numbers are rather than in a commit message.
+
+## 2026-08-09 amendment — the cluster census ran, both legs, and it found one thing
+
+This census is the one three landings in a row owed: both legs on Perlmutter
+(JID 56532188, warm-attach only — the worker created no allocation), the
+restage-candidate FFI pair pinned, `LX_BASE_MODULE=lorrax_J070` exported, and
+the parser validated BEFORE any number arrived — replayed against the last
+registered census (`census2_581dc3cc.xml`) it reproduces that amendment to the
+cell, including booking the xfail out of the `<testsuite>` element's
+`skipped=133`, which is the one-cell disagreement that makes the summary line
+unusable as an instrument. It refuses any junitxml under 50 kB (the
+`$HOME`-full 38-byte shape).
+
+### The two legs
+
+BASE `origin/main` @ `e37c6a6e`: 3112 collected — 2946 passed / 33 failed /
+0 errors / 132 skipped / 1 xfailed; 2946+33+0+132+1 = 3112, exact. TIP
+`bf5604cd` (`integration/mpa-table-2026-08-09`): 3242 collected — 3075 / 34 /
+0 / 132 / 1; exact. Each leg ran in its own fresh worktree and the
+`[lx] source tree:` line was read in both logs before either was believed.
+
+### The verdict: one new red, and it is a stale test, not a behaviour change
+
+`tests/test_qsgw_dataset_writer.py::test_the_cube_is_written_at_both_seams_and_only_there`
+went red on the tip because the driver-seam refactor factored the tail of
+`compute_sigma_xc` into a private helper `_finish_dynamic_sigma`, taking the
+`write_qsgw_sigma_cube` call with it — and the cell's `_calls_of` proxy
+returns the ENCLOSING FunctionDef name, not the call graph. The invariant the
+cell guards is intact, proven four independent ways: the helper's sole callers
+are inside `compute_sigma_xc` (`sigma_dispatch.py:561`, `:613`); the sibling
+gate `test_the_one_shot_cube_write_is_behind_the_file_write_flag` is green on
+the tip; the other two seams are structurally identical on both trees; the
+file's other 37 cells are green. Red-twin A/B, single process, file alone,
+fresh worktree each: BASE 38 passed, TIP 1 failed / 37 passed — deterministic
+and geometry-independent. This is the SECOND instance of the lexical-proxy
+false-positive class (first: `test_no_eager_local_fft_outside_shardmap_context`
+at the second consolidation checkpoint). The fix — teach the cell the call
+graph, or assert the helper's sole caller — belongs to the integration branch
+and blocks its landing; this row retires when that one-line fix is measured
+green on the file-alone A/B.
+
+Beyond that one cell: zero reds went green unexplained, zero reds among the
+137 newly-collected cells (the bucket that once shipped four reds unnoticed —
+every member was graded by name), zero skip movement, and the 7 de-collected
+cells are exactly the ff-mode refusal cells retired by design, all green at
+base, replaced by 16 green cells on the tip.
+
+### What the base leg settles
+
+All 33 base reds reconcile against this register BY NAME — zero unlisted.
+On the device instrument, at the current head: the nine `symmetry_maps`
+import-isolation cells are GREEN (`fef002e9` confirmed where it was owed), the
+four MPA/minimax rows red at `581dc3cc` are green, and both registered flakes
+(`test_exact_recovery_metal_grid_alpha2`,
+`test_wq_resolvent_matches_restart_finite_q`) passed. The owed-census rows
+above asked whether the WSL-blind families hide unlisted reds; at head, on
+device, with the FFI pair pinned, the answer is measured: they do not. The
+historical base/head pairs those rows name were not re-run and stay as
+history.
+
+### The damped-line row becomes cell-checkable
+
+The register said "16 red and all 16 are `test_damped_line_tables`" but named
+only one cell, so a future census could check the count and the file but never
+WHICH sixteen. Measured at `e37c6a6e` on the device leg, they are:
+`test_the_catalog_covers_the_span_and_tier_ladder`, plus
+`test_shipped_entry_recertifies_from_its_own_bytes` at
+`[A100_eps1e-08_btv_minimax]`, `[A100_eps1e-12_positive_composite]`,
+`[A120_eps1e-08_btv_minimax]`, `[A120_eps1e-12_positive_composite]`,
+`[A160_eps1e-10_positive_composite]`, `[A20_eps1e-12_positive_composite]`,
+`[A40_eps1e-12_positive_composite]`, `[A60_eps1e-08_btv_minimax]`, plus
+`test_the_far_line_rides_the_same_node_set` at
+`[A100_eps1e-06_btv_minimax]`, `[A100_eps1e-08_btv_minimax]`,
+`[A120_eps1e-08_btv_minimax]`, `[A40_eps1e-10_btv_minimax]`,
+`[A60_eps1e-08_btv_minimax]`, `[A80_eps1e-06_btv_minimax]`,
+`[A80_eps1e-08_btv_minimax]`.
+
+### Where the evidence lives
+
+Perlmutter, read-only: `/pscratch/sd/j/jackm/mpa_census_0809/` —
+`_reports/suite_base.xml` (606,260 B), `_reports/suite_tip.xml` (624,556 B),
+`setdiff.txt`, `reds_base.txt`, `_verify/qsgw_{base,tip}.{xml,log}`, `_logs/`.
+The RUNS_INFLIGHT row was appended before first submission and struck with
+results.
