@@ -165,8 +165,12 @@ def build_finite_q_data(data, q, mesh_xy):
       * ``V_q0`` ← ``V_qmunu[q_flat]`` = ``data['V_q_full'][:,:,qx,qy,qz]`` — the
         finite-q exchange tile.  At q≠0 it KEEPS G=0 (``compute_vcoul`` zeroes
         G=0 only at q=0) and carries NO separate rank-1 head (heads are a
-        q=0-only piece).  ``q=(0,0,0)`` returns the unshifted q=0 data
-        (roll-by-0 is identity, ``V_q_full[...,0] == V_q0``).
+        q=0-only piece).
+      * **THE PAIR-DENSITY VERTEX IS CONJUGATED**, and that is the whole finite-q
+        correctness question — see the CONJUGATE VERTEX note on the body below.
+        ``q=(0,0,0)`` is therefore no longer byte-identical to the unshifted q=0
+        data (the roll is still the identity and ``V_q_full[...,0] == V_q0``, but
+        ψ comes back conjugated); it is VALUE-identical, because χ₀(0) is real.
 
     Requires ``data`` loaded with ``load_v_full=True``.
     """
@@ -191,16 +195,61 @@ def build_finite_q_data(data, q, mesh_xy):
     # addressable at P>1, so both raise under device_get.  The helper's three
     # arms cover each case (allgather / local shard 0 / plain device_get) and
     # leave the 1-GPU path exactly as it was.
-    psi_c_q = _roll_k_axis_host(
-        gather_to_host(data["psi_c_X"]), (qx, qy, qz), nkx, nky, nkz)
+    #
+    # ── THE CONJUGATE VERTEX ─────────────────────────────────────────────────
+    # ψ comes back CONJUGATED, on BOTH legs, and this is the finite-q fix.
+    #
+    # The resolvent's four pair-density vertices — the seed's decode
+    # (``build_realspace_random_transition_generator``), the ring kernel's encode
+    # and decode (``apply_V_ring`` / the hoisted ``M_X``), and the snapshot's
+    # encode (``build_density_snapshot_operator``) — all carry ONE fixed
+    # conjugation convention, ``K^x = M V M†`` with the conjugate on the ENCODE
+    # leg.  That convention is NOT ours to move: it is pinned by the optical BSE
+    # exchange term (``bse_serial.apply_bse_hamiltonian_single_device``, the
+    # "Conjugation:" block) and gated there.  Composed through the resolvent it
+    # assembles
+    #
+    #     X(μ,ν) = -(2/N_k) Σ_i conj(M_i(μ)) M_i(ν) / ΔE_i  =  conj(χ₀) = χ₀ᵀ ,
+    #
+    # whereas the GW producer's χ₀(q) — the object whose Dyson solve WROTE the
+    # ``W0_qmunu[q]`` tile this path is scored against — is the other one,
+    # ``χ₀(μ,ν) = -(2/N_k) Σ_i M_i(μ) conj(M_i(ν)) / ΔE_i``
+    # (``w_isdf._get_chi_minimax_kernel``: ``chi_R = Gc_R · conj(Gv_R)``).
+    #
+    # At q=0 the two are the SAME MATRIX and nothing is visible: the k-sum runs
+    # over ±k pairs whose pair densities are complex conjugates under TRS, so
+    # χ₀(0) is REAL (measured ‖χ₀−χ₀ᵀ‖/‖χ₀‖ = 4.7e-11 on the MoS2 gnppm fixture).
+    # At q≠0 the ±k pairing sends k→−k into the −q tile instead, χ₀(q) stays
+    # Hermitian but stops being symmetric (2.9e-01 on the same fixture at
+    # q=(0,1,0)), and the un-flipped chain resums χ₀(−q) against the +q Coulomb
+    # tile V(q) — a hybrid that is not any stored tile in any conjugation, which
+    # is exactly what the finite-q closure measured (rel_err 6.87e-01, and the
+    # dense two-line model reproduces that number to five digits).
+    #
+    # Conjugating ψ on both legs flips all four vertices at once (each is
+    # bilinear in (ψ_c, ψ_v) with exactly one conj), turning X into χ₀ itself.
+    # It is EXACT — no TRS assumption, unlike "roll by −q", which reaches the
+    # same place only through χ₀(−q) = conj(χ₀(q)) and would silently be wrong on
+    # a TRS-broken system.  It leaves the optical BSE convention untouched, and
+    # it is inert on the preconditioner diagonal (``diag(K)`` is real and
+    # conjugation-invariant because V_q is Hermitian).
+    psi_c_q = np.conj(_roll_k_axis_host(
+        gather_to_host(data["psi_c_X"]), (qx, qy, qz), nkx, nky, nkz))
     dq["psi_c_X"] = device_put_process_local(psi_c_q, sh.psi_x)
     dq["psi_c_Y"] = device_put_process_local(psi_c_q, sh.psi_y)
     dq["eps_c"] = device_put_process_local(_roll_k_axis_host(
         gather_to_host(data["eps_c"]), (qx, qy, qz), nkx, nky, nkz), sh.eps)
+    # ψ_v does not roll (the valence leg stays at k) but it DOES conjugate: a
+    # vertex flip applied to one leg only is not a flip, it is a different (and
+    # wrong) operator.  On device — no roll means no host round trip to reuse.
+    dq["psi_v_X"] = jax.lax.with_sharding_constraint(
+        jnp.conj(data["psi_v_X"]), sh.psi_x)
+    dq["psi_v_Y"] = jax.lax.with_sharding_constraint(
+        jnp.conj(data["psi_v_Y"]), sh.psi_y)
     # M_X/M_Y are hoisted V-term pair amplitudes (audit P3) and are pure functions
-    # of psi_c — the finite-q roll shifted psi_c, so recompute them from the ROLLED
-    # conduction states.  The q=0 M's shallow-copied from `data` would be stale and
-    # give the wrong finite-q screening operator (M^q_cvk(μ)=Σ_s conj(ψ_c[k−q]) ψ_v[k]).
+    # of ψ — the finite-q roll shifted psi_c and the vertex flip conjugated both,
+    # so recompute them from the ROLLED, CONJUGATED states.  The q=0 M's
+    # shallow-copied from `data` would be stale twice over.
     dq["M_X"] = jax.lax.with_sharding_constraint(
         compute_pair_amplitude(dq["psi_c_X"], dq["psi_v_X"]), sh.psi_x)
     dq["M_Y"] = jax.lax.with_sharding_constraint(
