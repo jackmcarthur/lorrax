@@ -791,9 +791,13 @@ def main(argv=None):
 	# ``max |D(l, j=l+1/2) - D(l, j=l-1/2)|`` is 0.148261 Ry = 2.017 eV,
 	# so this is not a rounding-scale choice.  Deck key ``soc``; omit it
 	# and the banner still fires, which is the pre-existing behaviour.
-	soc_param = params.get("soc", None)
-	if soc_param is not None and not isinstance(soc_param, bool):
-		soc_param = str(soc_param).strip().lower() in ("1", "true", "yes", "on")
+	soc_param = params.get("soc", "")
+	if isinstance(soc_param, str):
+		s = soc_param.strip().lower()
+		# "" is UNSET and must stay None -- the resolver's third tier.
+		soc_param = None if s == "" else (s in ("1", "true", "yes", "on"))
+	elif soc_param is not None:
+		soc_param = bool(soc_param)
 	vnl_setup = vnl_ops.build_vnl_setup(
 		wfn,
 		sym,

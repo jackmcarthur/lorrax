@@ -958,6 +958,18 @@ _DEFAULTS = {
     "qp_solver": "auto",
     "do_screened": True,
     "bispinor": False,
+    # j-RESOLVED (True) vs j-AVERAGED (False) nonlocal projectors, i.e.
+    # QE's ``lspinorb``.  ``None`` means "not declared", which is the
+    # historical state and keeps ``vnl_ops.resolve_soc_mode``'s announced
+    # j-resolved default and its banner.  It is a deck key because
+    # nothing in a BerkeleyGW WFN.h5 records lspinorb -- ``mf_header``
+    # carries ``nspinor``, and ``noncolin`` is not ``lspinorb`` -- so for
+    # a BGW-fed run the deck is the only place the answer can come from.
+    # A QE ``.save``-fed run reads ``<spinorbit>`` and does not need it.
+    # The default is the EMPTY STRING and not ``False``: the reader types
+    # each key from its default, so a bool default would make "unset" and
+    # "soc = false" the same request, and they are opposite ones.
+    "soc": "",
     "do_G0": True,
     # Deprecated (2026-07-08): ``self_consistent = true`` is honored as an
     # alias for ``qp_solver = self_consistent`` via auto-resolution.  SC is
