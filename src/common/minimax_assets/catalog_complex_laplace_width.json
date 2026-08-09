@@ -43,7 +43,7 @@
   },
   "provenance": {
     "tool": "tools/generate_imag_minimax_assets.py",
-    "tool_sha256": "b25d19402cbd28458a6ac4694bd3afd36f049a4cdb93f7522019cb8a6c2cb557",
+    "tool_sha256": "3e1d93212c32354cdcbde6bed49247ffd9b59d78dac44481f381a0ee20d4e9bd",
     "numpy": "2.4.3",
     "scipy": "1.17.1",
     "python": "3.12.3",

@@ -1253,6 +1253,13 @@ def recertify(output_root, verbose=True):
     doc["sweep"]["certified"] = sum(1 for e in doc["tables"]
                                     if e["certified"])
     doc["provenance"] = provenance()
+    # The clause block travels with the artifact, so a catalog written
+    # before the block existed picks it up here rather than staying the
+    # one catalog whose envelope has to be looked up elsewhere.
+    fresh = catalog_document([], [], 0.0)
+    doc["clause"] = fresh["clause"]
+    doc["target"] = fresh["target"]
+    doc["shipping_rule"] = fresh["shipping_rule"]
     (root / CATALOG_NAME).write_text(
         json.dumps(doc, indent=2, sort_keys=False) + "\n",
         encoding="utf-8")

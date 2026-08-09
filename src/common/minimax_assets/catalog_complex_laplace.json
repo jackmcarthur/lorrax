@@ -36,7 +36,7 @@
   },
   "provenance": {
     "tool": "tools/generate_imag_minimax_assets.py",
-    "tool_sha256": "44d2cc71b59a83b8cdc93efa7c233f4f4b4abe0179aa0a719ce540e57e1dd7f6",
+    "tool_sha256": "3e1d93212c32354cdcbde6bed49247ffd9b59d78dac44481f381a0ee20d4e9bd",
     "numpy": "2.4.3",
     "scipy": "1.17.1",
     "python": "3.12.3",
@@ -2839,5 +2839,12 @@
         "beta_min": 0.0
       }
     }
-  ]
+  ],
+  "clause": {
+    "name": "height",
+    "numerator": "varpi / x_min -- a sampling line height over a band gap (the chi0 probe and the MPA fit stage)",
+    "beta_max": 64.0,
+    "derivation": "the height clause's edge is an OBSERVATION: the protocol fixes varpi_1 = 0.2 Ry and varpi_2 = 1 Ha = 2 Ry, the in-tree decks' gaps run 0.0497 to 0.3427 Ry, and the resulting omega-hat runs 0.58 to 40.214 (MINIMAX_REQUEST_CENSUS.md sec 7.2). 64 is the next rung of a geometric ladder above the largest measured value.",
+    "note": "beta is ONE dimensionless number formed from two unrelated numerators, and the two ranges overlap near 0.6, so a request must say which clause it is asking under. common.minimax_beta_selector.CATALOG_CLAUSE stamps this catalog's target.version with the clause above and refuses a request from the other one by name."
+  }
 }
