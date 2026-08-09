@@ -71,8 +71,10 @@ from __future__ import annotations
 
 from vcoul.base import (
     CoulombKernel,
+    HeadSlotTable,
     SysDim,
     get_kernel,
+    head_slot_table,
     v_qG_single,
     v_qG_table,
 )
@@ -117,6 +119,7 @@ __all__ = [
     "CoulombGeometry",
     # dispatch + the v(q+G) driver
     "SysDim", "CoulombKernel", "get_kernel", "v_qG_table", "v_qG_single",
+    "HeadSlotTable", "head_slot_table",
     "Bulk3D", "Slab2D", "Box0D",
     # mini-BZ sampling / averaging
     "wrap_points_to_voronoi", "minibz_voronoi_batches",

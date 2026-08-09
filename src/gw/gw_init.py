@@ -1089,11 +1089,78 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	return zeta_h5_path, mem_est, transverse_wfn_data
 
 
+def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
+                        centroid_indices, vcoul_cutoff_ry, print_fn=print):
+	"""Build the q != 0 Coulomb head channel, or ``None`` on the default path.
+
+	``mc_average_placement = off`` returns ``None`` before anything is read,
+	so the shipped path costs one string comparison.  Any other mode reads
+	the ζ head-slot columns (``v_q_g_flat.compute_head_channel_zeta``), pairs
+	them with the head-slot ``v`` table, expands the per-IBZ-q scalars onto
+	the full BZ, and optionally re-sources the mini-BZ enhancement from a
+	BerkeleyGW ``vcoul`` dump.
+
+	``schur_avg`` is refused HERE rather than at the solve, so a deck that
+	asks for it fails in the first minute of the run instead of after χ₀.
+	"""
+	from .head_channel import (PLACEMENT_OFF, HeadChannel,
+	                           head_ratio_from_bgw_dump,
+	                           refuse_if_unimplemented)
+
+	mode = str(getattr(cfg.head, 'mc_average_placement', PLACEMENT_OFF))
+	if mode == PLACEMENT_OFF:
+		return None
+	refuse_if_unimplemented(mode)
+	if int(meta.sys_dim) != 3:
+		raise NotImplementedError(
+			f"mc_average_placement = {mode!r} is a 3D-bulk knob (it moves the "
+			f"mini-BZ average of 8*pi/|q+G|^2 onto W's head channel); this "
+			f"deck has sys_dim = {int(meta.sys_dim)}.  The 2D f2d->0 "
+			f"regularisation already removes the divergence at G=0, so there "
+			f"is no q != 0 head slot for the rescale to act on.")
+
+	from .v_q_g_flat import compute_head_channel_zeta
+	g_head, table, full_to_irr_idx = compute_head_channel_zeta(
+		zeta_io,
+		kgrid=meta.kgrid, fft_grid=meta.fft_grid,
+		bvec=bvec, cell_volume=meta.cell_volume,
+		mesh_xy=mesh_xy, sys_dim=meta.sys_dim,
+		bdot=(np.asarray(wfn.bdot, dtype=np.float64)
+		      if meta.sys_dim == 0 else None),
+		bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
+		mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
+		sym=sym, centroid_indices=centroid_indices,
+		verbose=(jax.process_index() == 0),
+	)
+	# IBZ -> full BZ for the per-q scalars.  |q+G| is a class function of
+	# the shell and the tied-set MEAN makes <v> one too, so the expansion is
+	# a gather, not an unfold: v(q) == v(S q) exactly.
+	idx = np.asarray(full_to_irr_idx, dtype=np.int64)
+	v_bare = np.asarray(table.v_bare)[idx]
+	v_avg = np.asarray(table.v_avg)[idx]
+	len2 = np.asarray(table.len2)[idx]
+	mult = np.asarray(table.mult)[idx]
+	# What V ACTUALLY carries in those slots — the same predicate
+	# ``v_q_g_flat`` gates ``v_head_fn`` on.
+	v_in_V = (v_avg if (cfg.head.mc_average_vcoul_body and meta.sys_dim == 3)
+	          else v_bare)
+	hc = HeadChannel(g_head=g_head, v_bare=v_bare, v_avg=v_avg,
+	                 v_in_V=v_in_V, mult=mult, len2=len2, mode=mode)
+	dump = getattr(cfg.head, 'mc_average_placement_vcoul', None)
+	if dump:
+		hc = head_ratio_from_bgw_dump(dump, hc, bvec=bvec)
+	print_fn(hc.summary())
+	return hc
+
+
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
 	"""Compute bare Coulomb V_qmunu from zeta HDF5 and write G0 back.
 
-	Returns (V_qmunu, G0) where V_qmunu has shape (nq, μ, μ) (flat-q)
-	and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  Downstream consumers that need
+	Returns (V_qmunu, G0, head_channel) where V_qmunu has shape (nq, μ, μ)
+	(flat-q) and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  ``head_channel`` is a
+	``gw.head_channel.HeadChannel`` when the deck sets
+	``mc_average_placement`` to something other than ``off``, and ``None``
+	otherwise — nothing is computed for it on the default path.  Downstream consumers that need
 	the 3-D-k form reshape inside ``common.fft_helpers.make_flat_k_fft``.
 
 	The legacy ``(1, npol, npol, …)`` leading axes are gone — bispinor
@@ -1308,6 +1375,22 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		if G0_all is not None and int(G0_all.shape[-1]) < int(meta.n_rmu_padded):
 			G0_all = jnp.pad(G0_all,
 			                 ((0, 0), (0, int(meta.n_rmu_padded) - int(G0_all.shape[-1]))))
+		# ``mc_average_placement`` is refused on the bispinor builder, not
+		# silently skipped.  ``v_q_bispinor`` does not pass ``v_head_fn`` at
+		# all, so with ``mc_average_vcoul_body`` on in 3D the bispinor CC tile
+		# and the scalar V_q ALREADY diverge in the G=0 slot of every q != 0
+		# (see the note at the head of this file).  Adding a second, quieter
+		# copy of that divergence is exactly what COULOMB_AVG_ARCHITECTURE.md
+		# section 4.6(b) says not to do.
+		head_channel = None
+		if str(getattr(cfg.head, 'mc_average_placement', 'off')) != 'off':
+			raise NotImplementedError(
+				"mc_average_placement is not implemented on the bispinor V_q "
+				"builder: v_q_bispinor.py passes no v_head_fn, so its CC tile "
+				"already carries a different G=0 slot from the scalar V_q at "
+				"every q != 0.  Deciding the placement for one builder and not "
+				"the other would make that divergence permanent.  Run with "
+				"bispinor = false, or land the bispinor v_head_fn first.")
 	else:
 		# Scalar (non-bispinor) path.  ``compute_all_V_q`` dispatches on
 		# the on-disk ζ layout: G-flat (the only thing fit_zeta writes)
@@ -1317,6 +1400,10 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 			with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
 			                ) as zeta_io:
+				_cent_idx_np = (
+					np.asarray(jax.device_get(centroid_indices),
+					           dtype=np.int32)
+					if centroid_indices is not None else None)
 				with mesh_xy:
 					V_q_raw, G0_all = compute_all_V_q(
 						zeta_io,
@@ -1330,12 +1417,21 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						bare_coulomb_cutoff=vcoul_cutoff_ry,
 						bgw_v_grid_fn=bgw_v_grid_fn,
 						sym=sym,
-						centroid_indices=(
-							np.asarray(jax.device_get(centroid_indices),
-							           dtype=np.int32)
-							if centroid_indices is not None else None),
+						centroid_indices=_cent_idx_np,
 						g_chunk_size=int(cfg.memory.vq_g_chunk_size),
 					)
+					# The q != 0 head channel, for ``mc_average_placement``.
+					# Gated on the mode so the default path neither reads ζ a
+					# second time nor compiles a single extra kernel.  It sits
+					# INSIDE the loader scope because that is the only place
+					# ζ is open, and before ``V_q_raw`` is padded so the μ
+					# extents agree by construction.
+					head_channel = _build_head_channel(
+						zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
+						mesh_xy=mesh_xy, sym=sym,
+						centroid_indices=_cent_idx_np,
+						vcoul_cutoff_ry=vcoul_cutoff_ry,
+						print_fn=print_fn)
 
 	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file via SlabIO's deferred
 	# attr path (small; rank-0-only after MPI-IO file is closed).
@@ -1429,7 +1525,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		"V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
 		print_fn=print_fn)
 	sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
-	return V_qmunu, G0
+	return V_qmunu, G0, head_channel
 
 
 def build_wavefunction_bundle(
@@ -1595,7 +1691,7 @@ def prepare_isdf_and_wavefunctions(
 			# (LORRAX_MEM_DEBUG=1).  Round-1 addition.
 			from gw.isdf_fitting import mem_probe as _mem_probe
 			_mem_probe("pre_v_q")
-			V_qmunu, G0 = compute_V_q(
+			V_qmunu, G0, head_channel = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,
 				mem_est=mem_est, print_fn=print0,
 				bgw_v_grid_fn=bgw_v_grid_fn,
@@ -1729,6 +1825,23 @@ def prepare_isdf_and_wavefunctions(
 		V_qmunu.block_until_ready()
 		print0("  Chunked ISDF path complete")
 	else:
+		# ``mc_average_placement`` needs the ζ head-slot columns, and a
+		# restart deliberately does NOT re-run ``compute_V_q``
+		# (gw_init.py's restart branch reuses ``V_qmunu`` verbatim), so
+		# there is nothing to build them from.  Refuse rather than run the
+		# default placement under a deck that asked for another one — that
+		# silent inheritance is the exact defect class the restart
+		# Coulomb-policy stamp exists to make loud.
+		head_channel = None
+		if str(getattr(cfg.head, 'mc_average_placement', 'off')) != 'off':
+			raise RuntimeError(
+				"mc_average_placement = "
+				f"{cfg.head.mc_average_placement!r} with restart = true: the "
+				"restart path reuses V_qmunu verbatim and never re-runs "
+				"compute_V_q, so the head-channel ζ columns the rescale needs "
+				"are not available.  Rerun with restart = false (the placement "
+				"changes W, so an inherited W0 would be the wrong object "
+				"anyway).")
 		from file_io import load_restart_state_from_h5
 		with timing.section("gw_jax.restart_load"):
 			rs = load_restart_state_from_h5(
@@ -1875,4 +1988,5 @@ def prepare_isdf_and_wavefunctions(
 		V_qmunu=V_qmunu,
 		wf_bundle=wfns,
 		wf_bundle_transverse=wfns_transverse,
+		head_channel=head_channel,
 	)

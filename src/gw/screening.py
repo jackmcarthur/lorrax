@@ -165,6 +165,7 @@ def compute_static_w(
     section: str = "chi0_W",
     fused_probe_chi=None,
     chi0_override: jax.Array | None = None,
+    head_channel=None,
 ):
     """W = (1 − Vχ₀)⁻¹V on the full BZ, solved on the IBZ wedge when legal.
 
@@ -380,17 +381,59 @@ def compute_static_w(
                                 label=f"{_w} Dyson compile"):
                 precompile_solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
                                    dyson_solver=config.backend.w_dyson_solver)
-            with timing.section(
-                    "W.exec", announce=True,
-                    label=f"{_w} Dyson solve ({nq_solve} q, mu={_mu}, "
-                          f"{'IBZ wedge' if use_ibz_w else 'full BZ'})"):
-                W_q_solve = solve_w(
-                    V_q_solve, chi0_q_solve, meta, mesh_xy,
-                    dyson_solver=config.backend.w_dyson_solver)
-                # χ₀ is donated inside solve_w — the reference is
-                # now invalid.  Do NOT touch ``chi0_q_solve`` after this.
-                del chi0_q_solve
-                W_q_solve.block_until_ready()
+            if head_channel is None:
+                with timing.section(
+                        "W.exec", announce=True,
+                        label=f"{_w} Dyson solve ({nq_solve} q, mu={_mu}, "
+                              f"{'IBZ wedge' if use_ibz_w else 'full BZ'})"):
+                    W_q_solve = solve_w(
+                        V_q_solve, chi0_q_solve, meta, mesh_xy,
+                        dyson_solver=config.backend.w_dyson_solver)
+                    # χ₀ is donated inside solve_w — the reference is
+                    # now invalid.  Do NOT touch ``chi0_q_solve`` after this.
+                    del chi0_q_solve
+                    W_q_solve.block_until_ready()
+            else:
+                # ── Head-channel Coulomb placement (mc_average_placement) ──
+                # TWO single-V Dyson solves, then ONE real scalar per q-cell.
+                # ``V_body`` has the q != 0 head channel removed; ``V_bare``
+                # has it at the UNAVERAGED v_c.  Their difference IS the head
+                # channel with wings (gw/head_channel.py derives the identity
+                # against head_wing_schur's Schur reduction), so
+                #     W = W_body0 + r (W_bare − W_body0),  r = <v>/v_c
+                # places the mini-BZ average on W's head scalar AFTER the
+                # solve — BerkeleyGW's placement — while every solve here is
+                # still single-V and therefore Hermitian by congruence.
+                # Γ is untouched: its head mask is identically zero, so both
+                # arms and the scalar are the production objects there.
+                from . import head_channel as _hc
+                q_idx = (np.asarray(jax.device_get(sym.q_irr_full_idx),
+                                    dtype=np.int64)
+                         if use_ibz_w else None)
+                V_body_solve, V_bare_solve = _hc.build_v_arms(
+                    V_q_solve, head_channel, mesh_xy, q_index=q_idx)
+                with timing.section(
+                        "W.exec", announce=True,
+                        label=f"{_w} Dyson solve x2 (head-channel placement "
+                              f"'{head_channel.mode}', {nq_solve} q, "
+                              f"mu={_mu}, "
+                              f"{'IBZ wedge' if use_ibz_w else 'full BZ'})"):
+                    # χ₀ is DONATED by solve_w, and we need it twice — so the
+                    # body arm gets a copy and the bare arm gets the original.
+                    # The copy is the price of the second solve; it is one
+                    # (nq, μ, μ) transient, live only across the first LU.
+                    W_body0 = solve_w(
+                        V_body_solve, chi0_q_solve.copy(), meta, mesh_xy,
+                        dyson_solver=config.backend.w_dyson_solver)
+                    del V_body_solve
+                    W_bare = solve_w(
+                        V_bare_solve, chi0_q_solve, meta, mesh_xy,
+                        dyson_solver=config.backend.w_dyson_solver)
+                    del chi0_q_solve, V_bare_solve
+                    W_q_solve = _hc.combine_head_channel(
+                        W_body0, W_bare, head_channel, q_index=q_idx)
+                    del W_body0, W_bare
+                    W_q_solve.block_until_ready()
             # IBZ → full-BZ unfold (centroid double-permute + L-phase
             # + TRS conj) — same helper V_q uses.  Σ_COH/SX still
             # iterate over the full BZ in the k-q sums.
@@ -452,6 +495,7 @@ def compute_screening(
     meta,
     mesh_xy,
     print_fn: Callable = print,
+    head_channel=None,
 ) -> dict[str, jax.Array]:
     """Evaluate W at each requested frequency.
 
@@ -551,13 +595,14 @@ def compute_screening(
                     wfns, V_q, quad, e_ref=e_ref,
                     sym=sym, centroid_indices=centroid_indices,
                     config=config, meta=meta, mesh_xy=mesh_xy,
-                    role=req.role, fused_probe_chi=fused_plan)
+                    role=req.role, fused_probe_chi=fused_plan,
+                    head_channel=head_channel)
             else:
                 W_static = compute_static_w(
                     wfns, V_q, quad, e_ref=e_ref,
                     sym=sym, centroid_indices=centroid_indices,
                     config=config, meta=meta, mesh_xy=mesh_xy,
-                    role=req.role)
+                    role=req.role, head_channel=head_channel)
             with timing.section("W.gate", announce=True,
                                 label=f"{_w} finiteness + hermiticity gate"):
                 _gate_w(W_static, req, print_fn=print_fn,
@@ -583,7 +628,8 @@ def compute_screening(
                 sym=sym, centroid_indices=centroid_indices,
                 config=config, meta=meta, mesh_xy=mesh_xy,
                 role=req.role, force_full_bz=True, section="chi0_W_probe",
-                chi0_override=chi0_probe_reused)
+                chi0_override=chi0_probe_reused,
+                head_channel=head_channel)
             chi0_probe_reused = None   # donated into solve_w — dead ref
             with timing.section("W.gate", announce=True,
                                 label=f"{_w} finiteness + hermiticity gate"):
@@ -616,7 +662,8 @@ def compute_screening(
             wfns, V_q, quad_used, e_ref=e_ref,
             sym=sym, centroid_indices=centroid_indices,
             config=config, meta=meta, mesh_xy=mesh_xy,
-            role=req.role, force_full_bz=True, section="chi0_W_probe")
+            role=req.role, force_full_bz=True, section="chi0_W_probe",
+            head_channel=head_channel)
         with timing.section("W.gate", announce=True,
                             label=f"{_w} finiteness + hermiticity gate"):
             _gate_w(W, req, print_fn=print_fn)

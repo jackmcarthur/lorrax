@@ -104,6 +104,11 @@ class SCInputs:
     wfns_dft: Wavefunctions
     V_q: jax.Array
     kin_ion_dft: jax.Array
+    # ``gw.head_channel.HeadChannel`` or None.  Carried per-iteration because
+    # every SC iteration re-solves W from the SAME V_q, so the Coulomb
+    # placement has to travel with it or iteration 2 would quietly revert to
+    # the default placement while iteration 1 used the deck's.
+    head_channel: object
     quad: object             # static minimax quadrature for χ₀
     e_ref: float
     static_head_terms: object | None
@@ -1053,6 +1058,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         sym=inputs.sym, centroid_indices=inputs.centroid_indices,
         config=inputs.config, meta=inputs.meta, mesh_xy=inputs.mesh_xy,
         print_fn=inputs.print_fn,
+        head_channel=getattr(inputs, 'head_channel', None),
     )
 
     # Σ_xc dispatch — mode-orthogonal.  ``write_sigma_omega_h5=False``
@@ -1658,6 +1664,7 @@ def run_sc_driver(
     V_q: jax.Array,
     kin_ion: jax.Array,
     *,
+    head_channel=None,
     quad,
     e_ref: float,
     static_head_terms,
@@ -1790,6 +1797,7 @@ def run_sc_driver(
 
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
+        head_channel=head_channel,
         quad=quad, e_ref=e_ref,
         static_head_terms=static_head_terms,
         head_resolver=head_resolver,

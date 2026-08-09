@@ -1179,6 +1179,32 @@ _DEFAULTS = {
     # (lu → local with a DeprecationWarning; lstsq was removed.)
     "w_dyson_solver": "auto",
     "mc_average_vcoul_body": True,
+    # WHERE the q != 0 mini-BZ Coulomb average is APPLIED.  Orthogonal to
+    # ``mc_average_vcoul_body``, which decides WHETHER an average is computed.
+    #   "off"  (default) -- today's placement: <v> is substituted into the
+    #          argmin |q+G| slots of the one production V tile, which is then
+    #          both the Dyson operator and the Dyson right-hand side.  Every
+    #          existing deck reproduces bit-identically here.
+    #   "bgw"  -- BerkeleyGW parity: the average is applied to W's HEAD
+    #          CHANNEL as a scalar per q-cell AFTER the Dyson solve, i.e.
+    #          W_head = eps_c^-1 <v> with eps_c built from the bare v.  This
+    #          is the placement BGW's Sigma and BSE both use
+    #          (mtxel_cor.f90:1659-1662, intkernel.f90:887) and it is the
+    #          EXACT cell average of the screened head under the f-sum-rule
+    #          scaling chi ~ q^2.  Gamma is untouched.
+    #   "schur_avg" -- the derivable target <W>_C = <v eps^-1>_C.  Wired and
+    #          REFUSED; it needs chi inside the cell, which is an open
+    #          question (COULOMB_AVG_ARCHITECTURE.md section 2.4).
+    # See gw/head_channel.py for the derivation and the seam analysis.
+    "mc_average_placement": "off",
+    # Optional BerkeleyGW ``write_vcoul`` dump to source the mini-BZ
+    # enhancement <v>/v_c from, instead of LORRAX's own estimator, when
+    # mc_average_placement = "bgw".  Same override pattern as ``vhead`` /
+    # ``whead_0freq``: it pins a cross-code comparison to BGW's byte values
+    # so the residual left over cannot be a difference of Monte-Carlo
+    # estimators.  Empty = use LORRAX's own <v> (which already agrees with
+    # BGW's to 7e-4 - 2e-3 relative on every shell).
+    "mc_average_placement_vcoul": "",
     # Per-Q mini-BZ Coulomb head cell-averaging (BGW minibzaverage_3d/2d).
     # False (default) = current behavior, BIT-IDENTICAL: the q→0 head is the
     # pure-Sobol mini-BZ mean and every finite-Q exchange head is the analytic
@@ -1745,6 +1771,21 @@ class FilePaths:
     sigma_omega_h5_file: str
 
 
+def _normalize_placement(value):
+    """Canonicalise ``mc_average_placement`` at deck-parse time.
+
+    Delegates to :func:`gw.head_channel.normalize_placement` so the deck
+    parser and the consumer cannot drift on what the mode names are, and so
+    a typo is a refusal at config time (with the valid list in the message)
+    rather than a silent ``off`` two stages later.  Imported lazily: this
+    module is imported by the CLI before jax is configured, and
+    ``head_channel`` keeps its jax imports function-local for the same
+    reason, so the cost is one numpy-only module.
+    """
+    from .head_channel import normalize_placement
+    return normalize_placement(value)
+
+
 @dataclass(frozen=True)
 class HeadConfig:
     """q→0 Coulomb-head sources, BGW vcoul override, bare-cutoff knobs.
@@ -1761,6 +1802,8 @@ class HeadConfig:
     whead_0freq: float | None     # explicit override W_h[ω=0]
     whead_imfreq: float | None    # explicit override W_h[iω_p]
     mc_average_vcoul_body: bool
+    mc_average_placement: str      # "off" (default) | "bgw" | "schur_avg"
+    mc_average_placement_vcoul: str | None   # BGW vcoul dump for byte-sourced <v>
     head_minibz_average: bool      # per-Q mini-BZ head cell-average (default off)
     bare_coulomb_cutoff: float | None
     zeta_cutoff: float | None
@@ -2367,6 +2410,10 @@ class LorraxConfig:
             whead_0freq=_g("whead_0freq"),
             whead_imfreq=_g("whead_imfreq"),
             mc_average_vcoul_body=bool(_g("mc_average_vcoul_body")),
+            mc_average_placement=_normalize_placement(
+                _g("mc_average_placement")),
+            mc_average_placement_vcoul=(
+                str(_g("mc_average_placement_vcoul") or "") or None),
             head_minibz_average=bool(_g("head_minibz_average")),
             bare_coulomb_cutoff=_g("bare_coulomb_cutoff"),
             zeta_cutoff=_g("zeta_cutoff"),
