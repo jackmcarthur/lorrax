@@ -206,6 +206,18 @@ def _run_worker(tag: str, timeout: int = 900):
     env["JAX_ENABLE_X64"] = "1"
     env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "")
                         + f" --xla_force_host_platform_device_count={_NDEV}").strip()
+    # THIS GATE'S OWN OPT-OUT (P19, 2026-08-09) -- the same declaration
+    # tests/test_bse_coupling_routes_mesh_invariance.py::_results makes, for
+    # the same reason.  The worker's call chain reaches
+    # contract_bands_block_reshard -> gate.require, which REFUSES on a box
+    # with no mklblas host handler unless the dial announces the debug
+    # opt-out.  This gate used to inherit that pin from a module-scope
+    # os.environ.setdefault that leaked out of tests/test_contract_bands.py
+    # at collection time, so it was green in the default census and red
+    # standalone on an FFI-less box.  Declaring it here makes the child's
+    # environment identical in every arrangement.  The subject of this gate
+    # is zeta sharding, not the GEMM plan; gate.require is untouched.
+    env["LORRAX_BANDS_GEMM_FFI"] = "0"
     res = subprocess.run([sys.executable, os.path.abspath(__file__), tag],
                          env=env, capture_output=True, text=True,
                          timeout=timeout)

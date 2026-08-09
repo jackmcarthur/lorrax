@@ -28,7 +28,10 @@ The XLA-plan pins (1-4) run with the dial pinned =0 (the announced debug
 opt-out): since the FFI-required ruling (decisions.md 2026-08-01) the
 dial defaults ON and a missing handler REFUSES at the factory instead of
 demoting, so an unpinned run of these pins would either take the GEMM
-plan or die, depending on whether the .so is reachable.
+plan or die, depending on whether the .so is reachable.  That pin lives in
+the autouse ``_xla_plan_dial`` FIXTURE, not at module scope: a module-scope
+pin runs at collection time and leaks to the whole session (P19; see the
+fixture's docstring for the gate it silently propped up).
 
 Run inside the container (login python has no jax), e.g.::
 
@@ -54,11 +57,13 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 os.environ.setdefault("XLA_FLAGS",
                       "--xla_force_host_platform_device_count=4")
-# The XLA-plan pins below assert the NATIVE lowering; the dial defaults ON
-# since the FFI-required ruling, so pin it to the announced debug opt-out.
-# The FFI-plan tests set =1 (and the default test unsets) explicitly.
-os.environ.setdefault("LORRAX_BANDS_GEMM_FFI", "0")
+# LORRAX_BANDS_GEMM_FFI is deliberately NOT set here — see the
+# `_xla_plan_dial` fixture below.  The three knobs above are read by
+# jax/XLA at IMPORT time and cannot be moved into a fixture; the GEMM dial
+# is read at FACTORY time (Gate.enabled does a live os.environ.get on every
+# call) and therefore can be, and must be.
 
+import pytest                                        # noqa: E402
 import jax                                           # noqa: E402
 import jax.numpy as jnp                              # noqa: E402
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
@@ -71,6 +76,33 @@ from common.contract_bands import (                  # noqa: E402
 NK, NS, MU, MN, E = 4, 2, 16, 8, 3
 PX = PY = 2
 TOL = 1e-14
+
+@pytest.fixture(autouse=True)
+def _xla_plan_dial(monkeypatch):
+    """Pin the GEMM dial to the announced debug opt-out, PER TEST.
+
+    This used to be a module-scope ``os.environ.setdefault`` (line 60 before
+    2026-08-09).  Module scope runs at COLLECTION time and never unwinds, so
+    it pinned the dial for the whole pytest session — every other test file
+    in the run inherited it, and any gate whose call chain reaches
+    ``contract_bands_block_reshard`` → ``gate.require`` silently changed
+    verdict depending on whether this file happened to be collected.
+    Measured consequence (COMPLETENESS_AUDIT.md, "a gate whose verdict
+    depends on collection scope"): on an FFI-less box
+    ``tests/test_bse_coupling_routes_mesh_invariance.py`` was 15 passed in
+    the default census and 13 failed / 2 passed standalone — a reading that
+    looks exactly like a K^d_B regression and is not one.
+
+    ``autouse`` keeps every test signature unchanged (this file is also a
+    plain script — see ``_main``), and ``monkeypatch`` unwinds the value
+    after each test, so nothing survives into another module's tests.  The
+    tests that drive the dial themselves (``test_required_default``,
+    ``test_single_precision_ffi``, ``test_ffi_gemm_plan``) still set and
+    restore it inside their own bodies; monkeypatch's teardown is what makes
+    their restore-to-"0" stop at this file's boundary.
+    """
+    monkeypatch.setenv("LORRAX_BANDS_GEMM_FFI", "0")
+
 
 _CONVERT_RE = re.compile(r"=\s+c128\[([\d,]*)\]\S*\s+convert\(f64\[")
 _RS_RE = re.compile(r"=\s+(\w+)\[([\d,]*)\]\S*\s+reduce-scatter\(")
@@ -522,6 +554,12 @@ def test_ffi_gemm_plan():
 # ---------------------------------------------------------------------------
 
 def _main():
+    # The pytest path gets this from the autouse `_xla_plan_dial` fixture,
+    # which does not run here because this branch calls the test functions
+    # directly.  Setting it inside _main keeps the documented standalone
+    # invocation working AND cannot leak into a pytest session: this runs
+    # only under __main__, i.e. in a process pytest did not start.
+    os.environ.setdefault("LORRAX_BANDS_GEMM_FFI", "0")
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]
     failed = []

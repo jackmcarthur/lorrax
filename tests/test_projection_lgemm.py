@@ -54,21 +54,38 @@ sys.path.insert(0, os.path.join(
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_ENABLE_X64", "1")
-# This file pins the DEFAULT XLA GEMM lowering of the projector (dot
-# classes, converts).  Since 2026-07-29 LORRAX_BANDS_GEMM_FFI defaults to
-# AUTO (ON when the host .so's GEMM handler resolves), which would replace
-# the pinned dots with mklblas custom-calls — pin the dial OFF here; the
-# FFI plan has its own pins in tests/test_contract_bands.py.
-os.environ.setdefault("LORRAX_BANDS_GEMM_FFI", "0")
+# LORRAX_BANDS_GEMM_FFI is deliberately NOT set here — see the
+# `_xla_plan_dial` fixture below (P19, the second instance of the same
+# collection-time leak).  The knobs set at module scope in this file are
+# only the ones jax/XLA read at IMPORT time.
+#
 # Four emulated host devices: the projector's shard_map/psum_scatter path
 # is identical to production; multi-process collectives are covered by the
 # restart-gated P=64 A/B (wk_REL/lgemm_ab.sbatch).
 os.environ.setdefault("XLA_FLAGS",
                       "--xla_force_host_platform_device_count=4")
 
+import pytest                                        # noqa: E402
 import jax                                           # noqa: E402
 import jax.numpy as jnp                              # noqa: E402
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _xla_plan_dial(monkeypatch):
+    """Pin the GEMM dial OFF, PER TEST (was a module-scope setdefault).
+
+    This file pins the DEFAULT XLA GEMM lowering of the projector (dot
+    classes, converts).  The dial defaults ON since the FFI-required ruling
+    (decisions.md 2026-08-01), which would replace the pinned dots with
+    mklblas custom-calls, so it has to be off while these pins run — but at
+    module scope that pin runs at COLLECTION time and never unwinds, so it
+    reconfigures every other test file in the session.  See
+    ``tests/test_contract_bands.py::_xla_plan_dial`` for the gate that was
+    measurably propped up by exactly this leak (P19).  The FFI plan has its
+    own pins in tests/test_contract_bands.py.
+    """
+    monkeypatch.setenv("LORRAX_BANDS_GEMM_FFI", "0")
 
 from gw.ppm_tau_kernel import _make_project_ri_reduce_scatter  # noqa: E402
 
@@ -228,6 +245,10 @@ def test_merged_hlo_and_parity():
 # ---------------------------------------------------------------------------
 
 def _main():
+    # The pytest path gets this from the autouse `_xla_plan_dial` fixture,
+    # which does not run here because this branch calls the test functions
+    # directly.  Safe under __main__: pytest did not start this process.
+    os.environ.setdefault("LORRAX_BANDS_GEMM_FFI", "0")
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]
     failed = []

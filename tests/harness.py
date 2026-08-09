@@ -69,6 +69,112 @@ def is_xdist_controller(worker_id: str, dist: str | None) -> bool:
     return not worker_id and str(dist or "no") != "no"
 
 
+#: Environment variables a test module is ALLOWED to set at import time.
+#:
+#: The distinction is not "ours vs theirs", it is WHEN THE VALUE IS READ.
+#: jax/XLA/CUDA latch these at ``import jax`` — the first import in the
+#: process wins, and pytest imports every collected module into ONE process
+#: — so a module that needs x64, a CPU platform, or four emulated devices
+#: has no choice but to set them before its own import block.  A fixture
+#: runs far too late to matter.
+#:
+#: Everything else — LORRAX_* dials above all — is read at CALL time
+#: (``ffi.gate.Gate.enabled`` does a live ``os.environ.get`` per call), so a
+#: fixture serves it exactly, and module scope does not: module scope runs
+#: at COLLECTION time and never unwinds, which silently reconfigures every
+#: other test in the session and makes their verdicts depend on collection
+#: order.  That is P19, measured: COMPLETENESS_AUDIT.md, "a gate whose
+#: verdict depends on collection scope".
+#:
+#: An entry here is a CLAIM that the variable cannot be fixtured, and
+#: somebody has to defend it — the same convention as
+#: ``test_bse_coupling_routes_mesh_invariance._WAIVED_ENCODES``.  The
+#: prefixes below were measured, not guessed: they are what a full
+#: collection of ``tests/`` actually moves (2026-08-09).
+IMPORT_TIME_ENV_PREFIXES = (
+    "JAX_",           # JAX_ENABLE_X64, JAX_PLATFORMS — latched at import
+    "XLA_",           # XLA_FLAGS — parsed once when the backend is built
+    "LIBTPU_",
+    "TPU_",           # TPU_SKIP_MDS_QUERY — set by jax itself on import
+    "CUDA_",          # CUDA_VISIBLE_DEVICES — the conftest GPU pin
+    "NVIDIA_",
+    "TF_",            # TF_CPP_MIN_LOG_LEVEL, set by absl/xla on import
+    "PYTEST_",        # pytest's own bookkeeping
+)
+
+#: Exact names allowed for a DIFFERENT reason than the prefixes above: not
+#: "read at import", but "guards something that cannot be undone".
+IRREVERSIBLE_ENV_SENTINELS = frozenset({
+    # runtime.__init__'s distributed guard, set by test_head_wing_schur's
+    # module-scope _init_distributed().  jax.distributed.initialize can be
+    # called ONCE per process and has no teardown, so the sentinel that
+    # makes a second call a no-op must outlive any fixture: unwinding it
+    # would re-arm the very hazard it exists to prevent.  It is an env var
+    # rather than a module global on purpose (it has to survive the
+    # `python -m gw.gw_jax` re-import path) — see src/runtime/__init__.py.
+    "_LORRAX_JAX_DISTRIBUTED_DONE",
+})
+
+
+def env_collection_offenders(before: dict, after: dict) -> list:
+    """Environment changes made during collection that a FIXTURE should own.
+
+    Pure function (so it is falsifiable without a pytest session — the same
+    reason ``pin_one_gpu`` lives here rather than inline in the conftest).
+    Returns a sorted list of ``(name, before_value, after_value)`` for every
+    variable that changed across collection and is not import-time-latched;
+    ``None`` marks "was not set".  An empty list means collection was inert.
+    """
+    out = []
+    for name in sorted(set(before) | set(after)):
+        if (name.startswith(IMPORT_TIME_ENV_PREFIXES)
+                or name in IRREVERSIBLE_ENV_SENTINELS):
+            continue
+        was, now = before.get(name), after.get(name)
+        if was != now:
+            out.append((name, was, now))
+    return out
+
+
+def format_env_leak_report(offenders: list) -> str:
+    """The refusal text for :func:`env_collection_offenders`, with the fix."""
+    lines = [
+        "TEST MODULE(S) MUTATED os.environ AT COLLECTION TIME.",
+        "",
+        "Collection imports every selected test module into ONE process "
+        "before ANY test runs, and a module-scope write never unwinds. So "
+        "each variable below is now set for the WHOLE session, and every "
+        "other test's verdict silently depends on whether the module that "
+        "set it was collected. That is not a style complaint: it is the "
+        "measured cause of P19 (COMPLETENESS_AUDIT.md), where a K^d_B "
+        "class gate read 15 passed in the census and 13 failed standalone "
+        "on the same tree and the same commit.",
+        "",
+        "Changed across collection:",
+    ]
+    for name, was, now in offenders:
+        lines.append(f"    {name}: {was!r} -> {now!r}")
+    lines += [
+        "",
+        "FIX: move the write into a fixture that unwinds --",
+        "",
+        "    @pytest.fixture(autouse=True)",
+        "    def _dial(monkeypatch):",
+        "        monkeypatch.setenv(NAME, VALUE)",
+        "",
+        "`autouse` keeps test signatures unchanged, and monkeypatch "
+        "restores the previous value after each test, so the pin stops at "
+        "this file's boundary. See tests/test_contract_bands.py::"
+        "_xla_plan_dial for the worked example.",
+        "",
+        "If the variable is genuinely latched at IMPORT time (jax/XLA read "
+        "it when the backend is built, so no fixture can be early enough), "
+        "add its prefix to harness.IMPORT_TIME_ENV_PREFIXES with the reason "
+        "-- that list is a claim someone has to defend, not a mute button.",
+    ]
+    return "\n".join(lines)
+
+
 def pin_one_gpu(preset: str | None, worker_id: str = "", probe=None,
                 *, controller: bool = False):
     """The ONE device this process should see, or ``None`` for "leave it".

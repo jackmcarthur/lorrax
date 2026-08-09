@@ -60,7 +60,12 @@ routes get behaviourally gated; it never decides whether code is correct.  It
 does not touch, extend, or depend on the fft gate's ratchet list.
 
 PORTABLE: synthetic payload on CPU host devices, no GPU, no deck, no restart
-file, no FFI requirement of its own.  Runs in the default census.
+file, no FFI requirement of its own.  Runs in the default census, and -- since
+P19 (2026-08-09) -- gives the SAME verdict standalone, because ``_results``
+now pins ``LORRAX_BANDS_GEMM_FFI=0`` in the worker environment it builds
+rather than inheriting that pin from whatever else the session collected.
+The gate makes no FFI requirement; what it CALLS does, and that is the
+distinction the inherited pin used to blur.
 
   CAVEAT, MEASURED 2026-08-09 (landing-completeness audit) — "no FFI
   requirement OF ITS OWN" is exact, and it is not the same as "runs anywhere".
@@ -488,6 +493,20 @@ def _results() -> dict:
     env["XLA_FLAGS"] = (
         env.get("XLA_FLAGS", "")
         + f" --xla_force_host_platform_device_count={_NDEV}").strip()
+    # THIS GATE'S OWN OPT-OUT (P19, 2026-08-09).  The gate makes no FFI
+    # requirement, but what it calls does: build_bse_ring_matvec_full ->
+    # contract_bands_block_reshard -> gate.require REFUSES on a box with no
+    # mklblas host handler unless the dial announces the debug opt-out.
+    # Until 2026-08-09 the child inherited a "0" that leaked out of
+    # tests/test_contract_bands.py's module scope, so this gate was 15
+    # passed in the default census and 13 failed / 2 passed standalone on
+    # an FFI-less box -- a verdict that depended on what else pytest
+    # collected, and that read exactly like a K^d_B regression.  Declaring
+    # it here makes the child's environment the SAME in every arrangement:
+    # the subject of this gate is mesh invariance, not the GEMM plan, and
+    # pinning the XLA lowering is what makes the number comparable across
+    # an FFI box and an FFI-less one.  gate.require itself is untouched.
+    env["LORRAX_BANDS_GEMM_FFI"] = "0"
     proc = subprocess.run([sys.executable, os.path.abspath(__file__), "worker"],
                           env=env, capture_output=True, text=True, timeout=1800)
     tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-40:])

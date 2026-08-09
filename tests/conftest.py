@@ -123,6 +123,43 @@ def pytest_configure(config):
 
 
 # ---------------------------------------------------------------------------
+# NO TEST MODULE RECONFIGURES THE SESSION AT COLLECTION TIME  (P19, 2026-08-09)
+# ---------------------------------------------------------------------------
+# Snapshot the environment around COLLECTION -- i.e. around the imports of
+# every selected test module, all of which happen before any test runs -- and
+# refuse the session if a module left anything behind that a fixture should
+# have owned.  The decision is a pure function in ``harness`` so it can be
+# unit-tested; the RED TWIN is ``tests/_env_leak_twin.py``, a module that
+# leaks on purpose (never auto-collected: it does not match ``test_*.py``),
+# driven by ``tests/test_env_leak_gate.py``.
+#
+# Why this is worth a hook rather than a code-review habit: the failure mode
+# is invisible in the run that causes it. The leaking file stays green, and
+# the cost lands on a DIFFERENT file, in a DIFFERENT arrangement, as a
+# verdict that reverses when someone reproduces it alone.
+# ---------------------------------------------------------------------------
+_ENV_BEFORE_COLLECTION = None
+
+
+def pytest_collection(session):
+    """Snapshot the env before collection. Returns None: the default
+    collection implementation still runs (this hook is firstresult, so a
+    non-None return would REPLACE collection rather than observe it)."""
+    global _ENV_BEFORE_COLLECTION
+    _ENV_BEFORE_COLLECTION = dict(os.environ)
+    return None
+
+
+def pytest_collection_finish(session):
+    if _ENV_BEFORE_COLLECTION is None:          # collection was replaced
+        return
+    offenders = harness.env_collection_offenders(
+        _ENV_BEFORE_COLLECTION, dict(os.environ))
+    if offenders:
+        raise pytest.UsageError(harness.format_env_leak_report(offenders))
+
+
+# ---------------------------------------------------------------------------
 # Session-scoped e2e states (the Tier-1 gates double as prepared state for
 # the Tier-2 invariance gates).
 #
