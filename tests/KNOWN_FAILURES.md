@@ -1876,3 +1876,104 @@ centroid from a closed one.
 | tests | class | evidence | status |
 |---|---|---|---|
 | `test_bse_bgw_regression.py::test_bse_matches_frozen_and_bgw` (frozen arm only) | (a) EXPECTED red from the flagged physics fix 358bb0b (mini-BZ body-head draw `randvals @ bvec.T` → `randvals @ bvec`) — `bse_si_test.in` pins `mc_average_vcoul_body=true`, so its head table reseeds. On Si the fix is EXACTLY a reseed (bvec.T = P·bvec, P cyclic) | MEASURED at 358bb0b on the BUILD_NOTES pins (`/pscratch/sd/j/jackm/svc_vcoul/_gates_after/`, siA/bseB junitxml + bse_after_analysis.txt): frozen arm fails at max 7.067e-5 eV / MAE 7.42e-6 eV against `ATOL_FROZEN_EV=1e-6` (70.7× the pin; 8/20 cells over; eigenvalues 8 (+7.07e-5) and 16 (−5.59e-5) carry it). The BGW band arm REMAINS GREEN: MAE 3.4707 / max 8.8728 meV vs band 10/25 (the frozen ref itself sits 3.4650/8.8774 — the move is noise-level). Both Si COHSEX gates BYTE-IDENTICAL before/after (eqp data md5 `139265eadb0fd1e96483e13d18e45fe8`); the BGW Σ stats identical at full float precision. NOTE: the Si evidence proves Si is BLIND to the draw bug (cyclic-permutation degeneracy), NOT that the bug is small — on non-cubic cells it is a bias worth ~50 % of the mc-average correction (z=376); the guard is `tests/test_vcoul_minibz_head_draw.py`, not any Si gate. Prediction honesty: the fix commit predicted this red in a 1e-4..1e-2 eV window; the measured 7.1e-5 eV is a decade below — the red, the byte-identity and the band survival were all predicted correctly, the magnitude estimate was conservative | RESOLVES AT MERGE — the owner has authorized adopting the refreeze candidate (`/pscratch/sd/j/jackm/svc_vcoul/_gates_after/bse_eigenvalues_candidate.dat`, md5 `cab1dd48…`, generated at 358bb0b on the BUILD_NOTES pins, sidecar README has jobids/deltas) as `tests/regression/si_bse_debug/bse_eigenvalues_ref.dat` at the integration head, turning this arm green there. Until that adoption lands, this is the suite's ONLY expected red from the vcoul fix. Loosening `ATOL_FROZEN_EV` was refused — it is a bit-reproducibility pin, not a physics band |
+
+
+## CONSOLIDATION CHECKPOINT — the BSE campaign's ten branches (2026-08-08)
+
+Final consolidation of the 2026-08-08 BSE performance campaign: ten branches
+merged onto `main` @ `09db2939`, plus five in-consolidation commits (remove
+`krep`; make `yhoist` permanent; delete two dead bare-`shard_map` sites and fix
+the R2 docstring; fix two reds this consolidation introduced; and this
+amendment).  Censused head **`e495fc45`**, one full suite in the default xdist
+geometry — the same geometry as the RE-CUT WAVE census above, so the two are
+directly comparable.
+
+```
+27 failed, 2204 passed, 131 skipped, 1 xfailed, 16465 warnings in 588.01s
+```
+
+**UNEXPLAINED NEW REDS: ZERO.**  Every non-passing cell was looked up by name
+(`/pscratch/sd/j/jackm/bse_consol_0808/setdiff.py`, artifact
+`_reports/census2_e495fc45.xml`).
+
+| n | cells | disposition |
+|---:|---|---|
+| 5 | `test_gpu_pinning` ×5 | Class B loader-order, listed |
+| 5 | `distrib_la::test_distrib_la_contract` ×5 | Class B loader-order, listed |
+| 1 | `vcoul::test_the_whole_public_surface_answers_with_no_lorrax` | Class B, listed |
+| 1 | `vcoul::test_vcoul_imports_and_computes_with_no_scipy` | listed xdist artifact |
+| 2 | `test_bse_setup_qchunk` ×2 | class P2, listed; `_maxdiff = 1.3743988419548263` and the `2.220446049250313e-15` first spread, both unmoved |
+| 1 | `symmetry_maps::test_the_lorentz_mixing_matches_a_dense_numpy_reference[1-1]` | listed cross-service conftest collision |
+| 1 | `test_bse_vq_interp::test_loo_accuracy_vs_reference_thresholds` | listed, left standing by the re-cut |
+| 1 | `test_gw_jax_regression::test_hbn_matches_frozen_reference` | listed, left standing by the re-cut |
+| 1 | `test_bse_w0_resolvent::test_wq_resolvent_matches_restart_finite_q` | listed by the re-cut; **fingerprint added below** |
+| 9 | `symmetry_maps::test_symmetry_maps_import_isolation` ×9 | **not in the re-cut's 20** — A/B-proven pre-existing, below |
+| **27** | | **0 unexplained** |
+
+Two of the re-cut's twenty are GREEN here and are NOT closed on that evidence:
+`test_the_lorentz_mixing…[2-2]` and
+`test_bse_w_omega_chain::test_w_omega_chain_matches_oracle_q0`.  The re-cut
+already A/B-attributed the latter as a full-suite collection artifact rather
+than a real red, so a geometry that does not trigger it proves nothing about
+the code.  Collection also differs (2363 cells here against 2311, and 131 skips
+against 66), because the ten merged branches add gates.
+
+### The nine `symmetry_maps` import-isolation reds are PRE-EXISTING
+
+They are not in the re-cut's twenty, so they were A/B'd rather than assumed —
+this consolidation contains **zero `services/` changes** (`git diff --stat
+09db2939..HEAD -- services/` is empty), but "I did not touch it" is an argument,
+not a measurement.
+
+| leg | result |
+|---|---|
+| base `09db2939`, the isolation file ALONE | **9 passed** |
+| head `e495fc45`, the isolation file ALONE | **9 passed** |
+| base `09db2939`, whole `services/symmetry_maps` | **11 failed, 247 passed** |
+| head `e495fc45`, whole `services/symmetry_maps` | **11 failed, 247 passed** |
+
+Identical on both sides, same eleven cells by name (the nine isolation cells
+plus both `lorentz_mixing` parametrisations).  The cells pass alone and fail
+once the rest of their own service has run in the process — the same
+collection-order family as the Class B reds above, with the failure spelled
+`isolated import of 'symmetry_maps' produced no LXKIT_ISOLATION line (rc=1)`.
+They are red at base, red at head, and nothing to do with this landing.  They
+were absent from the re-cut's twenty because that census's xdist distribution
+happened to give those cells different companions.
+
+### The `wq_resolvent` red now has a FINGERPRINT
+
+The RE-CUT WAVE amendment registered
+`test_bse_w0_resolvent::test_wq_resolvent_matches_restart_finite_q` as a real,
+unlisted, pre-existing red and deliberately did not diagnose it ("guessing at it
+would be worth less than naming it").  That was the right call, but it left a
+named red with no fingerprint — which is exactly what a future census cannot use
+to tell drift from stability.  One exists, from an independent lane:
+
+```
+AssertionError: q=(0, 1, 0) col 179: W_q resolvent closure rel_err=6.87e-01 (>1e-6)
+assert 0.6874207585174131 < 1e-06
+```
+
+`FIX_solver_robustness.md` §7 measured it at base **`013aad92`** and found it
+identical on both of that branch's arms — same q, same column, same number to
+all sixteen digits — and this census reproduces it again, digit for digit, at
+`e495fc45`.  So the cell is now A/B-proven pre-existing **three times, from
+three bases**, by lanes that did not coordinate:
+
+| lane | base | geometry | result |
+|---|---|---|---|
+| solver-robustness | `013aad92` | 1 proc | red on the before arm AND the after arm, `rel_err=6.87e-01` |
+| re-cut wave | `81a285af` | 1 proc **and** xdist | red on both, and on the re-cut head |
+| this checkpoint | `e495fc45` | xdist | red, same q, same column, same sixteen digits |
+
+It remains **undiagnosed** and is still nobody's in this campaign.  What is
+closed is the bookkeeping: it is not new, it is not geometry, and it is not any
+of the ten merged branches.
+
+**Why it was missed, restated because the trap is still live.**  The
+symmetry-landing amendment closes
+`test_bse_w0_resolvent::test_w0_resolvent_matches_restart` as GREEN.  That is a
+DIFFERENT CELL in the same file — `w0`/static against `wq`/finite-q — so a
+reader scanning for "w0_resolvent" finds a row saying it was fixed.  Anyone
+adding a row for either cell should spell the full node id.
