@@ -547,7 +547,32 @@ def route_pole(
             g, f_max, rel_tol=rel_tol, max_nodes=max_nodes)
         plans.append(WindowPlan(
             name="core", placement=CROSSING, t=t.astype(np.complex128),
-            alpha=alpha, omega_sign=+1, prefactor=float(1.0 * neg),
+            alpha=alpha, omega_sign=+1,
+            # THE SIGN THIS WINDOW SHIPPED WITH WAS ``+1.0 * neg``, AND IT
+            # WAS WRONG.  Every other window in the tree -- the two-point
+            # path's HGL core and its three Laplace windows, and this
+            # module's own ``single``, ``a_stripe`` and ``b_slab`` -- sums
+            # to MINUS the pole term: the quadrature's raw sum reproduces
+            # ``+1/(omega - S)`` and the prefactor turns it into
+            # ``-1/(omega - S)``, which is the sign convention
+            # ``ppm_tau_kernel``'s consumers are built on.  With ``+1`` the
+            # crossing core alone came back as ``+1/(omega - S)`` -- a
+            # finite, smooth, correctly-shaped self-energy with the
+            # crossing contribution entering with the wrong sign, which is
+            # the exact failure mode the red twins beside this module
+            # exist to catch and did not, because they score the
+            # quadrature identity (GATE 1 checks the sum against
+            # ``exact_resolvent`` with no prefactor at all) and the
+            # placement swap, never the sign RELATIVE to the other three
+            # windows.  Measured: the legacy core's sine sum reproduces
+            # ``G_hgl(u) -> +1/u`` (0.995242, 0.999783, 0.999987 times
+            # ``1/u`` at u = 5, 10, 20) and carries prefactor ``-1*neg``;
+            # this window's composite sum reproduces ``+1/(u + i*Gamma)``
+            # to machine precision, so it owes the same ``-1``.
+            # ``tests/test_mpa_sigma_pass.py`` pins all four windows
+            # against the analytic pole term at once, which is the gate
+            # that would have caught it.
+            prefactor=float(-1.0 * neg),
             # THE MERGED ONE-COMPLEX-CHAIN PROJECTION, not the HGL split.  The
             # crossing consumer here forms the full complex product coeff*X and
             # never weights Re and Im by two independent real vectors, which is
