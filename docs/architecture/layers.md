@@ -259,6 +259,14 @@ A level assignment nobody argued is a level assignment nobody will keep.
     dataclass that picks a target error for a *screening* integral and the
     module that extracts PPM poles are not.
 
+    **Settled by extraction, 2026-08-08.** The physics-free half is the
+    `minimax` service now (`services/minimax/`), so its level entry is
+    gone: like `vcoul`, it gets the door rule and no level entry, and the
+    boundary this row drew is a package boundary rather than a convention.
+    The other two modules are unchanged and still L1. `common.minimax` is
+    a retired path, ratcheted shut in
+    `tests/test_service_path_bootstrap.py`.
+
 ---
 
 ## 5. The sanctioned exceptions

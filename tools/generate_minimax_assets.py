@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """Generate shipped minimax quadrature tables and a machine-readable catalog.
 
-The generated catalog is consumed by ``gw.minimax_screening``. Tables are fit on
-scaled intervals so runtime lookup can safely round a requested range upward and
-reuse the nearest stricter shipped table.
+The generated catalog is consumed by the ``minimax`` service door.  Tables are
+fit on scaled intervals so runtime lookup can safely round a requested range
+upward and reuse the nearest stricter shipped table.
+
+REWRITTEN AGAINST THE DOOR (2026-08-08), not shimmed.  This tool used to be
+the only consumer of ``gw.minimax_screening``'s private ``lru_cache``d solve
+wrappers, and it is about to become the MPA generator campaign's sweep
+driver — so a coupling to another package's internals was the one thing it
+could not be allowed to inherit across the extraction.  It now calls
+``minimax.solve_uncertified``, which is the door's own name for "run the
+offline solver in-process and say so".  That announcement is correct here
+and not noise: a table is uncertified until this tool certifies it.
 """
 
 from __future__ import annotations
@@ -25,7 +34,14 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from gw import minimax_screening as ms  # noqa: E402
+_SERVICES = REPO_ROOT / "services"
+if _SERVICES.is_dir():
+    for _svc in sorted(_SERVICES.iterdir()):
+        _svc_src = _svc / "src"
+        if _svc_src.is_dir() and str(_svc_src) not in sys.path:
+            sys.path.append(str(_svc_src))
+
+from minimax import solve_uncertified  # noqa: E402
 
 
 DEFAULT_ERROR_BOUNDS = (1.0e-6, 2.0e-7)
@@ -33,7 +49,8 @@ DEFAULT_CROSSING_A_VALUES = tuple(float(v) for v in range(20, 201, 20))
 DEFAULT_NONCROSSING_R_VALUES = tuple(
     float(v) for v in np.logspace(1.0, 5.0, num=(5 - 1) * 3 + 1)
 )
-DEFAULT_OUTPUT_ROOT = REPO_ROOT / "src" / "common" / "minimax_assets"
+DEFAULT_OUTPUT_ROOT = (REPO_ROOT / "services" / "minimax" / "src" / "minimax"
+                       / "minimax_assets")
 DEFAULT_FAMILIES = ("crossing", "noncrossing")
 
 
@@ -298,13 +315,15 @@ def generate_assets(
                     tau, alpha, max_error = _read_table(table_path)
                     action = "reuse"
                 else:
-                    tau, alpha, max_error = ms._solve_crossing_scaled_cached(
-                        round(float(A_dim), 12),
-                        round(float(err), 14),
-                        500,
-                        round(float(crossing_eps_q), 12),
-                        str(crossing_target_kind),
+                    _q = solve_uncertified(
+                        family="crossing",
+                        target=str(crossing_target_kind),
+                        range_value=float(A_dim),
+                        error_bound=float(err),
+                        n_max=500,
+                        eps_q=float(crossing_eps_q),
                     )
+                    tau, alpha, max_error = _q.nodes, _q.weights, _q.max_error
                     _write_table(table_path, tau=tau, alpha=alpha, max_error=max_error)
                     action = "solve"
                 table_map[rel_path.as_posix()] = {
@@ -347,11 +366,14 @@ def generate_assets(
                     tau, alpha, max_error = _read_table(table_path)
                     action = "reuse"
                 else:
-                    tau, alpha, max_error = ms._solve_noncrossing_scaled_cached(
-                        round(float(math.log(R)), 12),
-                        round(float(err), 14),
-                        64,
+                    _q = solve_uncertified(
+                        family="noncrossing",
+                        target="inverse",
+                        range_value=float(R),
+                        error_bound=float(err),
+                        n_max=64,
                     )
+                    tau, alpha, max_error = _q.nodes, _q.weights, _q.max_error
                     _write_table(table_path, tau=tau, alpha=alpha, max_error=max_error)
                     action = "solve"
                 table_map[rel_path.as_posix()] = {

@@ -165,10 +165,24 @@ _L3_PACKAGES = ("ffi", "lxkit", "distrib_la")
 
 #: L2 by module.  Whole packages are in ``_L2_PACKAGES``.
 _L2_MODULES = frozenset({
-    "common.minimax",          # minimax quadrature: a Remez problem
     "common.rank_criterion",   # the pseudo-inverse truncation criterion
     "centroid.kmeans_isdf",    # density-weighted Lloyd loop under a metric
 })
+# ``common.minimax`` was here ("minimax quadrature: a Remez problem").  It is
+# the ``minimax`` SERVICE now — ``services/minimax/src/minimax/solver.py`` —
+# and the row had to go the moment the file did, because
+# ``test_every_module_in_the_map_exists`` refuses a map entry for a module
+# that is not there.  Same mechanism that deleted ``common.cholesky_2d``
+# below, and same reason: the level conflict dissolved by extraction rather
+# than by a ruling.
+#
+# NO SHIM AT THE OLD PATH, deliberately, and the ratchet is
+# ``tests/test_service_path_bootstrap.py::test_the_retired_shim_files_are_gone``.
+# The phase-wide cleanup (`029da824`) deleted the five wave-1 shims and
+# pinned them gone; re-creating ``src/common/minimax.py`` to green a branch
+# would be that decision silently un-happening.  The module had exactly ONE
+# production importer — ``gw.minimax_screening`` — and it is repointed at the
+# door in the same commit, so there was nothing for a shim to bridge.
 # ``common.cholesky_2d`` was here.  It is ``distrib_la``'s ``native2d``
 # backend now, so the L2-vs-L3 conflict layers.md:196-200 records
 # (blocked Cholesky is mathematics, but it is distributed mathematics)
@@ -1303,9 +1317,20 @@ def test_every_package_in_the_map_exists(sources):
 #: ``_round_up_fft_size`` on the door despite the underscore: they have real
 #: cross-package consumers, and a shim reaching ``vcoul.minibz`` for one of
 #: them would have been this rule's first new violation since the replumb.
+#: ``minimax`` joined 2026-08-08 with the sixth extraction, and it joined
+#: with NO shim and NO row below.  ``gw.minimax_screening`` — the module's
+#: one production importer, then and now — says ``import minimax as _mm``
+#: and reaches only ``serve`` / ``Quadrature`` / the refusal types, all of
+#: which are top-level names.  The offline solver half (``G_hgl``,
+#: ``noncrossing_grids``, …) is on the door too, behind a PEP-562 lazy
+#: ``__getattr__``, precisely so that the generator tool and the
+#: certification tier can have those names without anybody writing
+#: ``from minimax.solver import ...`` — which would have been this rule's
+#: first new violation since the replumb.
 _SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
                   "wfn_loader": "wfn_loader", "zeta_loader": "zeta_loader",
-                  "symmetry_maps": "symmetry_maps", "vcoul": "vcoul"}
+                  "symmetry_maps": "symmetry_maps", "vcoul": "vcoul",
+                  "minimax": "minimax"}
 
 #: ``src/`` module -> how many past-the-door edges it is allowed.  These are
 #: the transitional re-export shims.

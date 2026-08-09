@@ -76,8 +76,7 @@ src/
 │   ├── gpu_utils.py           device-memory budget probes
 │   ├── progress.py            LoopProgress (rank-0 progress bar)
 │   ├── timing.py              named sections, aggregate report
-│   ├── minimax.py             Laplace + imag-ω minimax solvers
-│   ├── minimax_assets/        shipped quadrature tables (npz + catalog.json)
+│   │   (minimax.py and minimax_assets/ left for services/minimax/ 2026-08-08)
 │   ├── (bench/smoke drivers → tests/bench/, 2026-07-31)
 │   │                          FFI smoke tests / benchmarks (run via lxrun)
 │   └── phdf5_*                phdf5 benchmarks + plumbing tests
