@@ -44,6 +44,31 @@ SIGMA_K_AXIS = {
 	"qp_static_cohsex_ev": 0,
 }
 
+#: The datasets :func:`write_sigma_omega_h5` creates the file with.  Every
+#: run that writes ``sigma_mnk.h5`` at all writes these, so the appender
+#: below can use any one of them that is present to learn the file's own k
+#: storage rather than being told it.
+SIGMA_CUBE_DATASETS = (
+	"sigma_total_kij_ev",
+	"sigma_c_kij_ev",
+	"sigma_sx_kij_ev",
+	"hartree_kij_ev",
+)
+
+#: The datasets the OPT-IN ``write_qsgw_datasets`` deck key adds, in the
+#: order a reader meets them.  They are the plotting payload: the static
+#: Hermitian Σ_xc the QSGW ansatz produces, and the QP energy ladders of
+#: the approximations one wants to see beside each other.  Names and
+#: shapes are the ones the pre-2026-04 driver wrote and the committed
+#: ``cohsex_debug`` fixture still holds, so a script written against that
+#: file keeps working against a new one.
+QSGW_PLOT_DATASETS = (
+	"sigma_xc_qsgw_kij_ev",
+	"qp_static_cohsex_ev",
+	"qp_omega0_ev",
+	"qp_diag_self_consistent_ev",
+)
+
 
 def write_sigma_to_file(
 	sigma_sx_kij_eV,
@@ -597,6 +622,117 @@ def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
 	}
 
 
+def extract_and_stamp_k_irr(payload, star, *, omega_ev=None, nk_full=None,
+                            print_fn=None):
+	"""THE RULED ORDERING, in one implementation.  Measure, then drop.
+
+	``payload`` maps dataset name → array (or ``None``, which passes
+	through).  The k axis of each name comes from :data:`SIGMA_K_AXIS`, so
+	a name that table does not carry is REFUSED rather than written on a
+	guessed axis — an array dropped along the wrong axis is still an array
+	of the right dtype and a plausible shape.
+
+	Returns ``(payload, attrs_for, compact_irr, sym_idx_k)``.  ``attrs_for``
+	is a callable ``name → dict | None`` carrying the storage stamp and
+	that dataset's own four spread numbers.
+
+	WHY THIS IS A FUNCTION AND NOT A BLOCK IN THE WRITER.  Two writers now
+	need the ordering: :func:`write_sigma_omega_h5`, which creates the
+	file, and :func:`append_qsgw_datasets_h5`, which adds the QSGW cube and
+	the QP ladders to a file that already exists.  The ordering is the
+	owner's ruling — the arrays arrive COMPLETE on the full BZ, the
+	star-spread statistic is measured on them, and only then are rows
+	dropped — and a second copy of it is a second place for the measure and
+	the drop to swap.  They must not: after the drop each star has exactly
+	one member left and every spread arm reads identically zero, which
+	``tests/test_sigma_kirr_extraction.py`` demonstrates rather than
+	asserts.
+
+	``star`` of ``None`` is the full-BZ write.  The payload comes back
+	untouched and ``attrs_for`` returns ``None`` for every name, which is
+	the no-attr-means-full back-compat direction: a file that carries no
+	stamp is read as full-BZ, so nothing written before this format can be
+	reinterpreted by it.
+	"""
+	unknown = sorted(n for n in payload if n not in SIGMA_K_AXIS)
+	if unknown:
+		raise ValueError(
+			f"extract_and_stamp_k_irr: {unknown} are not in SIGMA_K_AXIS, so "
+			f"this function does not know which of their axes is k.  Add the "
+			f"dataset there with its k axis; do not let it default to 0.")
+	if star is None:
+		return dict(payload), (lambda name: None), None, None
+
+	irr_idx_k, sym_idx_k, n_sym_spatial = star
+	irr_idx_k = np.asarray(irr_idx_k)
+	sym_idx_k = np.asarray(sym_idx_k, dtype=np.int32)
+	if nk_full is not None and irr_idx_k.size != int(nk_full):
+		raise ValueError(
+			f"star tables describe {irr_idx_k.size} full-BZ k but the "
+			f"Σ cube has nk={int(nk_full)}; the sweep and the tables are not "
+			f"from the same run.")
+	rows_to_keep, compact_irr = compact_star_tables(irr_idx_k)
+
+	# EVERY ARRAY MUST ARRIVE ON THE FULL BZ.  An already-extracted array
+	# handed in here would be measured against a star relation it no longer
+	# has the members for and then dropped a second time; the shapes make
+	# that statable, so it is stated.
+	for name, arr in payload.items():
+		if arr is None:
+			continue
+		k_axis = SIGMA_K_AXIS[name]
+		nk_seen = int(np.shape(arr)[k_axis])
+		if nk_seen != irr_idx_k.size:
+			raise ValueError(
+				f"{name}: axis {k_axis} has {nk_seen} rows but the star "
+				f"tables describe {irr_idx_k.size} full-BZ k.  This function "
+				f"takes COMPLETE full-BZ arrays — it is what makes the "
+				f"spread statistic measurable at all — and "
+				f"{len(rows_to_keep)} rows would be an already-extracted one.")
+
+	# MEASURED ON THE COMPLETE ARRAYS, BEFORE ANY ROW IS DROPPED.
+	omega_index = (int(np.argmin(np.abs(np.asarray(omega_ev))))
+	               if omega_ev is not None else None)
+	stamps: dict[str, dict] = {}
+	for name, arr in payload.items():
+		if arr is None:
+			continue
+		stats = sigma_star_spread_stats(
+			arr, rows_to_keep, compact_irr, sym_idx_k, n_sym_spatial,
+			k_axis=SIGMA_K_AXIS[name], omega_index=omega_index)
+		stamps[name] = stats
+		if print_fn is not None:
+			print_fn(
+				f"  Σ star spread [{name}]: raw {stats['raw_ev']:.4f} eV, "
+				f"diag {stats['diag_ev']:.4f} eV, gauge-blind "
+				f"‖·‖_F {stats['frobenius_ev']:.4f} / "
+				f"|Tr| {stats['trace_ev']:.4f} eV")
+	if print_fn is not None:
+		print_fn(
+			f"  Σ k axis EXTRACTED to k_irr: {irr_idx_k.size} -> "
+			f"{len(rows_to_keep)} rows (selection, not reconstruction).")
+
+	# ...and only now are they dropped.
+	out = {
+		name: (None if arr is None else star_select_k_irr(
+			arr, rows_to_keep, k_axis=SIGMA_K_AXIS[name]))
+		for name, arr in payload.items()
+	}
+
+	def attrs_for(name):
+		a = {
+			K_STORAGE_ATTR: K_STORAGE_IBZ,
+			K_STORAGE_VERSION_ATTR: K_STORAGE_VERSION,
+			N_SYM_SPATIAL_ATTR: int(n_sym_spatial),
+			"nk_full": int(compact_irr.size),
+		}
+		for key, val in stamps.get(name, {}).items():
+			a[SPREAD_ATTR_PREFIX + key] = val
+		return a
+
+	return out, attrs_for, compact_irr, sym_idx_k
+
+
 def derive_sigma_total(sigma_c, sigma_sx, hartree):
 	"""``(c + sx[None]) + h[None]`` — THE association, in one place.
 
@@ -747,76 +883,28 @@ def write_sigma_omega_h5(
 			sigma_c_kij_ev, sigma_sx_kij_ev, hartree_kij_ev)
 
 	payload = {
-		"sigma_total_kij_ev": (total, 1),
-		"sigma_c_kij_ev": (sigma_c_kij_ev, 1),
-		"sigma_sx_kij_ev": (sigma_sx_kij_ev, 0),
-		"hartree_kij_ev": (hartree_kij_ev, 0),
+		"sigma_total_kij_ev": total,
+		"sigma_c_kij_ev": sigma_c_kij_ev,
+		"sigma_sx_kij_ev": sigma_sx_kij_ev,
+		"hartree_kij_ev": hartree_kij_ev,
 	}
 
-	stamps: dict[str, dict] = {}
-	rows_to_keep = compact_irr = sym_idx_k = None
-	n_sym_spatial = 0
+	# The ordering is :func:`extract_and_stamp_k_irr`'s, shared with the
+	# QSGW appender rather than spelled twice.
+	payload, _attrs, compact_irr, sym_idx_k = extract_and_stamp_k_irr(
+		payload, star, omega_ev=omega_ev, nk_full=nk, print_fn=print_fn)
 	if star is not None:
-		irr_idx_k, sym_idx_k, n_sym_spatial = star
-		irr_idx_k = np.asarray(irr_idx_k)
-		sym_idx_k = np.asarray(sym_idx_k, dtype=np.int32)
-		if irr_idx_k.size != nk:
-			raise ValueError(
-				f"star tables describe {irr_idx_k.size} full-BZ k but the "
-				f"Σ cube has nk={nk}; the sweep and the tables are not from "
-				f"the same run.")
-		rows_to_keep, compact_irr = compact_star_tables(irr_idx_k)
-
-		# MEASURED ON THE COMPLETE CUBE, BEFORE ANY ROW IS DROPPED.
-		omega_index = int(np.argmin(np.abs(np.asarray(omega_ev))))
-		for name, (arr, k_axis) in payload.items():
-			if arr is None:
-				continue
-			stats = sigma_star_spread_stats(
-				arr, rows_to_keep, compact_irr, sym_idx_k, n_sym_spatial,
-				k_axis=k_axis, omega_index=omega_index)
-			stamps[name] = stats
-			if print_fn is not None:
-				print_fn(
-					f"  Σ star spread [{name}]: raw {stats['raw_ev']:.4f} eV, "
-					f"diag {stats['diag_ev']:.4f} eV, gauge-blind "
-					f"‖·‖_F {stats['frobenius_ev']:.4f} / "
-					f"|Tr| {stats['trace_ev']:.4f} eV")
-		if print_fn is not None:
-			print_fn(
-				f"  Σ k axis EXTRACTED to k_irr: {nk} -> "
-				f"{len(rows_to_keep)} rows (selection, not reconstruction).")
-
-		# ...and only now are they dropped.
-		for name, (arr, k_axis) in list(payload.items()):
-			if arr is not None:
-				payload[name] = (
-					star_select_k_irr(arr, rows_to_keep, k_axis=k_axis),
-					k_axis)
-		nk = len(rows_to_keep)
+		nk = int(np.shape(payload["sigma_total_kij_ev"])[1])
 		shape_ref = (n_omega, nk, nb, nb2)
 
 	k_chunk = max(1, int(k_chunk_size))
 	om_chunks  = (n_omega, min(k_chunk, nk), nb, nb2)
 	kij_chunks = (min(k_chunk, nk), nb, nb2)
 
-	def _attrs(name):
-		if star is None:
-			return None
-		out = {
-			K_STORAGE_ATTR: K_STORAGE_IBZ,
-			K_STORAGE_VERSION_ATTR: K_STORAGE_VERSION,
-			N_SYM_SPATIAL_ATTR: int(n_sym_spatial),
-			"nk_full": int(np.asarray(compact_irr).size),
-		}
-		for key, val in stamps.get(name, {}).items():
-			out[SPREAD_ATTR_PREFIX + key] = val
-		return out
-
-	total = payload["sigma_total_kij_ev"][0]
-	sigma_c_kij_ev = payload["sigma_c_kij_ev"][0]
-	sigma_sx_kij_ev = payload["sigma_sx_kij_ev"][0]
-	hartree_kij_ev = payload["hartree_kij_ev"][0]
+	total = payload["sigma_total_kij_ev"]
+	sigma_c_kij_ev = payload["sigma_c_kij_ev"]
+	sigma_sx_kij_ev = payload["sigma_sx_kij_ev"]
+	hartree_kij_ev = payload["hartree_kij_ev"]
 
 	with SlabIO(abs_path, mode="w", mesh=mesh) as io:
 		io.write_attr("omega_ev", np.asarray(omega_ev, dtype=np.float64))
@@ -851,3 +939,136 @@ def write_sigma_omega_h5(
 				attrs=_attrs("hartree_kij_ev"))
 			io.write_slab("hartree_kij_ev", hartree_kij_ev)
 	return abs_path
+
+
+# ===========================================================================
+# THE OPT-IN PLOTTING PAYLOAD — the QSGW Σ_xc cube and the QP ladders
+# ===========================================================================
+# These four datasets had NO PRODUCER between 2026-04-11 (``Rewrite
+# QP/output section``, which deleted the block that wrote them together
+# with a pile of genuinely dead code) and this commit; they survived only
+# in ``tests/regression/cohsex_debug/sigma_mnk.h5``, which is why the
+# k_irr landing found their names in :data:`SIGMA_K_AXIS` with nothing on
+# the other end.  The owner's ruling restores them: gated by the deck,
+# default off, "a lot of people will want to plot that".
+#
+# WHY AN APPEND AND NOT A LONGER ``write_sigma_omega_h5`` SIGNATURE.  On
+# the one-shot path the file is written INSIDE
+# ``gw.ppm_pipeline.compute_ppm_sigma_pipeline`` (its step 5), and the
+# QSGW cube does not exist yet at that moment — ``build_qsgw_sigma_xc``
+# runs after the pipeline returns, in ``gw.sigma_dispatch``.  The QP
+# ladders are later still: two of the three need ``kin_ion``, which the Σ
+# dispatch never sees.  Widening the writer's signature would mean
+# holding the whole ω-cube back until the last of its companions existed,
+# which is the opposite of what the single-write consolidation bought.
+# So each producer writes at its own seam, and they all come through here.
+#
+# THE FILE, NOT THE CALLER, DECIDES THE k SET.  This function reads its
+# own storage from the cube datasets already in it (via
+# ``kin_ion.read_star_map``) instead of taking a ``star`` argument.  That
+# is not tidiness: a caller-supplied triple that disagreed with the file
+# would produce a HETEROGENEOUS artifact — some datasets on the wedge and
+# some on the full BZ, all of them shaped plausibly — and no reader in the
+# tree checks across datasets.  Reading the file also means every refusal
+# ``read_star_map`` already owns (a truncated slab, tables of the wrong
+# length, an unknown version, a storage value that is neither legal one)
+# guards the append too, with no second copy of any of them here.
+
+
+def append_qsgw_datasets_h5(filepath, payload, *, print_fn=None):
+	"""Add the QSGW / QP-ladder datasets to an existing ``sigma_mnk.h5``.
+
+	Parameters
+	----------
+	filepath
+		An existing ``sigma_mnk.h5``.  This function never CREATES one:
+		the datasets describe a Σ that file already holds, and a file with
+		only the appendix in it would answer ``sigma_c_kij_ev`` with a
+		``KeyError`` where today's consumers get an honest
+		``FileNotFoundError``.
+	payload
+		``name → array`` for any subset of :data:`QSGW_PLOT_DATASETS`.
+		Arrays arrive on the FULL BZ whatever the file stores, because the
+		star-spread statistic is measured before the rows are dropped and
+		it cannot be measured any other way.  A ``None`` value is skipped,
+		which is how a mode that did not build a quantity says so.
+	print_fn
+		Rank-0 print.  Gets the spread lines and one summary naming every
+		dataset written.
+
+	Returns the list of dataset names actually written.
+
+	CALL THIS ON RANK 0 ONLY, with a barrier after — h5py is a
+	single-writer library and every array here is replicated (the QSGW
+	cube is forced replicated by ``qsgw_utils.build_qsgw_sigma_xc``'s
+	final ``with_sharding_constraint``; the ladders are host eigenvalues).
+	There is no sharded slab to write, so ``SlabIO``'s collective
+	transport would buy nothing and would make the write impossible on any
+	box without ``liblorrax_ffi``.
+	"""
+	abs_path = os.path.abspath(filepath)
+	if not os.path.isfile(abs_path):
+		raise FileNotFoundError(
+			f"append_qsgw_datasets_h5: {abs_path} does not exist.  These "
+			f"datasets are an APPENDIX to sigma_mnk.h5 and this function "
+			f"does not create one; a run whose compute mode writes no Σ_c(ω) "
+			f"cube has nowhere to put them.")
+
+	payload = {k: v for k, v in payload.items() if v is not None}
+	if not payload:
+		return []
+
+	# The file's OWN k storage, learned from a dataset it was created with.
+	with h5py.File(abs_path, "r") as h5:
+		present = [n for n in SIGMA_CUBE_DATASETS if n in h5]
+		omega_ev = (np.asarray(h5["omega_ev"][()])
+		            if "omega_ev" in h5 else None)
+		nk_stored = (int(h5[present[0]].shape[SIGMA_K_AXIS[present[0]]])
+		             if present else 0)
+	if not present:
+		raise ValueError(
+			f"append_qsgw_datasets_h5: {os.path.basename(abs_path)} holds "
+			f"none of {list(SIGMA_CUBE_DATASETS)}, so it is not a "
+			f"sigma_mnk.h5 and its k storage cannot be read off it.  "
+			f"Refusing to append rather than guessing the k axis.")
+	ref = present[0]
+	star = read_star_map(abs_path, ref, k_axis=SIGMA_K_AXIS[ref])
+	nk_full = int(np.asarray(star[0]).size) if star is not None else nk_stored
+
+	# Same ordering as the creating writer, same function: measure on the
+	# complete arrays, then drop.
+	payload, attrs_for, _, _ = extract_and_stamp_k_irr(
+		payload, star, omega_ev=omega_ev, nk_full=nk_full, print_fn=print_fn)
+	if star is None:
+		for name, arr in payload.items():
+			nk_seen = int(np.shape(arr)[SIGMA_K_AXIS[name]])
+			if nk_seen != nk_stored:
+				raise ValueError(
+					f"{name}: axis {SIGMA_K_AXIS[name]} has {nk_seen} rows "
+					f"but {os.path.basename(abs_path)} stores {nk_stored} on "
+					f"the full BZ ({ref}).  Appending a dataset on a "
+					f"different k set would make one file mean two things.")
+
+	written = []
+	with h5py.File(abs_path, "a") as h5:
+		for name in QSGW_PLOT_DATASETS:
+			if name not in payload:
+				continue
+			arr = np.asarray(payload[name])
+			arr = arr.astype(np.complex128 if np.iscomplexobj(arr)
+			                 else np.float64)
+			# Rewritten, not merged: a rerun in the same directory must
+			# leave the stamp and the values describing THIS run.
+			if name in h5:
+				del h5[name]
+			ds = h5.create_dataset(name, data=arr)
+			for key, val in (attrs_for(name) or {}).items():
+				ds.attrs[key] = val
+			written.append(name)
+	if print_fn is not None and written:
+		print_fn(
+			f"  QSGW plot datasets -> {os.path.basename(abs_path)}: "
+			+ ", ".join(written)
+			+ (f" (k_irr, {nk_full} -> {nk_stored} rows)" if star is not None
+			   else f" (full BZ, {nk_stored} rows)"))
+	return written

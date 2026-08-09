@@ -549,6 +549,19 @@ def compute_sigma_xc(
     print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
              f"({100*qsgw_diag['frac_clipped']:.1f}%)")
 
+    # THE OPT-IN QSGW CUBE, on the path that just wrote the file.  Gated
+    # on ``write_sigma_omega_h5`` and not only on the deck key, because
+    # that flag is exactly "did THIS call create sigma_mnk.h5": the SC
+    # iteration map passes False and the converged single write happens
+    # later, in ``sc_iteration.dump_sigma_omega_h5_final``, which appends
+    # there instead.  Without the flag this would append the iteration-i
+    # cube to whatever file the previous run left behind.
+    if write_sigma_omega_h5:
+        from .qsgw_utils import write_qsgw_sigma_cube
+        write_qsgw_sigma_cube(
+            ppm_outputs.sigma_omega_h5_path, sigma_xc_qsgw,
+            config=config, print_fn=print_fn)
+
     return SigmaResult(
         v_h_kij_ry=sig_h,
         sigma_x_kij_ry=sig_x,

@@ -633,6 +633,42 @@ _DEFAULTS = {
     # Suppressing the write makes the file ABSENT, which is the loudest of
     # the states those guards distinguish.
     "write_restart_tensors": True,
+    # ``write_qsgw_datasets``: does this run add the QSGW / QP-ladder
+    # appendix to sigma_mnk.h5?  DEFAULT false, and false is exactly
+    # today's file — these four datasets have had no producer since
+    # 2026-04-11, when the QP/output rewrite deleted the block that wrote
+    # them along with a pile of genuinely dead code beside it.  Turning it
+    # on restores them (owner ruling 2026-08-08: "gated by input file but
+    # exist; a lot of people will want to plot that").
+    #
+    # WHAT IT ADDS, and where each one comes from:
+    #   sigma_xc_qsgw_kij_ev       (nk, nb, nb) complex — the static
+    #       Hermitian Σ_xc the QSGW ansatz builds, written in the basis
+    #       the rest of the file's cubes are in (the QP basis under
+    #       self-consistency, the DFT basis one-shot).
+    #   qp_omega0_ev               (nk, nb) real — the QP ladder of
+    #       H₀ + Σ_x + Σ_c(ω≈0), one extra eigh of an (nk, nb, nb).
+    #   qp_diag_self_consistent_ev (nk, nb) real — the diagonal on-shell
+    #       fixed point E = h₀ + ReΣ(E), host-side, ~100 iterations of a
+    #       (nk, nb) map.
+    #   qp_static_cohsex_ev        (nk, nb) real — the static COHSEX
+    #       ladder, H₀ + Σ_SX + Σ_COH.  Written only by a run that BUILT
+    #       those two channels, which today means compute_mode = cohsex;
+    #       a PPM run says so in one line rather than putting a different
+    #       operator under that name.  See ``gw.gw_output``.
+    #
+    # NOT A DEBUG FLAG, which is why it is here and not in ``debug``.  The
+    # appendix is a supported output with a stable format: same k-set,
+    # same k_storage stamp and the same four star-spread numbers as every
+    # other cube in the file, so a plotting script reads it through the
+    # same reader path (``file_io.read_star_map`` → the landed unfold) it
+    # already uses for Σ_c.
+    #
+    # THE COST IS A WRITE AND TWO SMALL SOLVES, never a Σ kernel.  Nothing
+    # behind this key recomputes screening or self-energy; if a quantity
+    # was not built by the run's compute mode it is omitted and named,
+    # rather than manufactured to fill a dataset slot.
+    "write_qsgw_datasets": False,
     # ``restart_q_storage``: on WHICH q-set are V_qmunu / W0_qmunu stored?
     # DEFAULT full — the q_irr wedge is OPT-IN PER DECK, which is what
     # DESIGN_symmetry_restart_followup.md ruled and what this key was built
@@ -1810,6 +1846,11 @@ class LorraxConfig:
     #: behaviour; see ``_DEFAULTS["write_restart_tensors"]`` for why this is
     #: a COMPLEMENT to q_irr storage and not an alternative to it.
     write_restart_tensors: bool
+    #: Add the QSGW Σ_xc cube and the QP energy ladders to ``sigma_mnk.h5``.
+    #: False (the default) is byte-for-byte today's file; see
+    #: ``_DEFAULTS["write_qsgw_datasets"]`` for what each dataset is and
+    #: which compute mode produces it.
+    write_qsgw_datasets: bool
     #: RAW ``restart_q_storage`` request — "full" (the default) | "auto" |
     #: "ibz".  Validated at parse time, resolved LATE
     #: (``gw.restart_q_storage``): ``auto``'s answer depends on the run's
@@ -2380,6 +2421,7 @@ class LorraxConfig:
             hartree_source=_hartree_source,
             restart=bool(_g("restart")),
             write_restart_tensors=bool(_g("write_restart_tensors")),
+            write_qsgw_datasets=bool(_g("write_qsgw_datasets")),
             restart_q_storage_raw=_restart_q_storage,
             raw_input_keys=frozenset(params.get(_DECK_NAMED_KEYS, ())),
             compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
