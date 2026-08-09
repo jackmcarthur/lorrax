@@ -43,6 +43,39 @@ the failure a cross-check exists to catch.  A file carrying NO q_irr attrs
 at all is read as ``q_storage="full"`` and returned unchanged, so every
 restart file written before this format keeps working.
 
+BUT THE RANK IS CHECKED BEFORE THE SHAPE IS BELIEVED.  The q extent can
+only decide ibz-versus-full once the dataset is known to have the shape
+this version stores at all, and a version number alone does not
+establish that: the failure is a file stamped with the WRONG version — a
+writer that gained an axis without bumping, or a hand-edited attr — and
+a reader that trusts the stamp has no second opinion.  Hand this reader
+a rank-4 ``(n_omega, n_q_ibz, N_μ, N_μ)`` tensor stamped version 1 and
+EVERY check below passes whenever ``n_omega`` equals the wedge extent:
+``shape[0]`` reads as the q extent, ``shape[-1]`` is still N_μ, the
+tables validate against both, the ``q_storage`` cross-check agrees, the
+table digest matches and the readiness flag is set.  Nothing refuses,
+and the caller receives a 4-D array it believes is 3-D with the
+frequency axis relabelled as q.  Si 4³ reduces 64 q to 8 and an n_p = 4
+multipole fit samples 8 frequencies, so that coincidence is one deck
+away.  The RANK is the second opinion — a property of the bytes, which
+no attr can forge — so :func:`read_tensor` refuses on it and names both
+numbers.  See :data:`QIRR_RANK_BY_VERSION`.
+
+THE FILE-HANDLE PLUMBING IS PUBLIC, and that is a statement about what
+it is rather than an oversight.  :data:`QIRR_VERSION_ATTR`,
+:class:`QirrDest`, :func:`qirr_attr_str`, :func:`qirr_generator_commit`
+and :func:`validate_qirr_tables` are FORMAT SURFACE: any second store
+that writes this layout — the frequency-resolved W being the one being
+built — opens the same handles, reads the same attrs, stamps the same
+provenance and owes the tables the same validation.  Underscoring them
+would not keep that store out; it would only make it copy them, and a
+copied validator is a second answer to "do these tables describe this
+tensor", differing on the day one of them gains a check.  They are on
+the package door for the same reason ``vcoul`` puts
+``_minibz_kernel_bare`` on its: a consumer reaching
+``symmetry_maps.qirr_store`` for them is a past-the-door edge, and
+``tests/test_layering.py`` rule 6 counts those.
+
 THE μ PAD NEVER REACHES DISK (SHARDING_RULES §2).  The producer bakes a
 μ pad into ``sym_perm``/``L_table`` once at construction — identity tail
 on the permutation, zero tail on the wrap — and its width is
@@ -91,6 +124,20 @@ from symmetry_maps.orbit_syms import (CLOSURE_TOL_DEFAULT,
 #: a format that returns wrong numbers on the day it changes.
 QIRR_FORMAT_VERSION = 1
 
+#: The dataset RANK each format version stores.  Version 1 is
+#: ``(n_q, N_μ, N_μ)`` — rank 3 — and :func:`read_tensor` refuses any
+#: other rank under that stamp rather than reading ``shape[0]`` as the q
+#: extent; see the module docstring for the case where every other check
+#: passes while it does so.
+#:
+#: A MAPPING RATHER THAN A BARE 3, because the rank is the one thing that
+#: distinguishes this layout from a frequency-resolved one and the two
+#: facts belong in one table.  A second store extending the format adds
+#: its version here — ``{**QIRR_RANK_BY_VERSION, 2: 4}`` — rather than
+#: restating that version 1 is rank 3, which is the restatement that goes
+#: stale.
+QIRR_RANK_BY_VERSION = {QIRR_FORMAT_VERSION: 3}
+
 #: Suffix of the sibling group holding the unfold tables for ``<name>``.
 #: Per tensor, not per file: ``V_qmunu`` and ``W0_qmunu`` normally share
 #: one set of tables, and sharing them on disk would make each tensor
@@ -102,11 +149,11 @@ QIRR_TABLE_SUFFIX = "__qirr"
 #: what distinguishes a stamped file from a legacy one; see
 #: :func:`read_tensor` for why a partially-stamped file refuses instead of
 #: falling through to the legacy path.
-_VERSION_ATTR = "qirr_format_version"
+QIRR_VERSION_ATTR = "qirr_format_version"
 
 #: Every attr this format owns.  Used by the partial-stamp refusal.
 _OWNED_ATTRS = (
-    _VERSION_ATTR, "q_storage", "qirr_table_hash", "qirr_centroid_hash",
+    QIRR_VERSION_ATTR, "q_storage", "qirr_table_hash", "qirr_centroid_hash",
     "qirr_closure_verdict", "qirr_closure_worst_residual",
     "qirr_closure_tol", "qirr_n_q_full", "qirr_data_ready",
     "qirr_n_rmu_logical",
@@ -346,7 +393,7 @@ class QirrHeader:
 # Provenance, in the kin_ion.h5 style
 # ---------------------------------------------------------------------------
 
-def _generator_commit() -> str:
+def qirr_generator_commit() -> str:
     """Commit of the SOURCE TREE THIS MODULE RAN FROM — not the cwd's.
 
     Same rule and same fallback shape as ``kin_ion_io._generator_commit``:
@@ -404,7 +451,7 @@ def _require_h5py():
     return h5py
 
 
-class _Dest:
+class QirrDest:
     """Context manager over "an h5 group, or a path to open one"."""
 
     def __init__(self, target, mode):
@@ -429,7 +476,7 @@ class _Dest:
         return False
 
 
-def _attr_str(node, key):
+def qirr_attr_str(node, key):
     if key not in node.attrs:
         return None
     v = node.attrs[key]
@@ -442,7 +489,8 @@ def _attr_str(node, key):
 # Table validation — every way the tables can fail to describe the tensor
 # ---------------------------------------------------------------------------
 
-def _validate(tables: QirrTables, n_q_on_disk: int, n_mu: int) -> str:
+def validate_qirr_tables(tables: QirrTables, n_q_on_disk: int,
+                         n_mu: int) -> str:
     """Check the tables against the wedge, and return the shape verdict.
 
     Everything here is a way a stored tensor becomes unrecoverable while
@@ -640,9 +688,9 @@ def write_qirr_tensor(
             f"{X.shape}")
     # THE μ PAD COMES OFF HERE, TENSOR AND TABLES TOGETHER.  Stripping one
     # and not the other is the failure this ordering forbids: the two
-    # extents are cross-checked by ``_validate`` two statements down, so a
-    # half-strip REFUSES rather than writing a file whose tables address
-    # more centroids than its tensor has.
+    # extents are cross-checked by ``validate_qirr_tables`` two statements
+    # down, so a half-strip REFUSES rather than writing a file whose tables
+    # address more centroids than its tensor has.
     if n_rmu_logical is not None:
         n_log = int(n_rmu_logical)
         n_pad = int(X.shape[-1])
@@ -673,7 +721,7 @@ def write_qirr_tensor(
     # ``n_rmu_logical=None`` below is not a lost check — the strip and its
     # three invariants ran above, against the TENSOR that only this path
     # holds.
-    with _Dest(dest, mode) as grp:
+    with QirrDest(dest, mode) as grp:
         if name in grp:
             del grp[name]
         grp.create_dataset(name, data=X)
@@ -734,7 +782,7 @@ def stamp_qirr_tensor(
         tables = tables.logical(int(n_rmu_logical))
     can = tables.canonical()
 
-    with _Dest(dest, mode) as grp:
+    with QirrDest(dest, mode) as grp:
         if name not in grp:
             raise KeyError(
                 f"qirr_store: {name!r} is not in this file.  "
@@ -753,7 +801,7 @@ def stamp_qirr_tensor(
                 f"stripped to the logical extent and the tensor must "
                 f"already be at it; a disagreement here means the tensor "
                 f"and its tables would describe different centroid sets.")
-        q_storage = _validate(can, int(ds.shape[0]), n_mu_on_disk)
+        q_storage = validate_qirr_tables(can, int(ds.shape[0]), n_mu_on_disk)
         table_hash = can.digest()
 
         tgrp_name = name + QIRR_TABLE_SUFFIX
@@ -765,7 +813,7 @@ def stamp_qirr_tensor(
         tgrp.attrs["n_sym_spatial"] = np.int64(can.n_sym_spatial)
         tgrp.attrs["table_hash"] = table_hash
 
-        ds.attrs[_VERSION_ATTR] = np.int64(QIRR_FORMAT_VERSION)
+        ds.attrs[QIRR_VERSION_ATTR] = np.int64(QIRR_FORMAT_VERSION)
         ds.attrs["q_storage"] = q_storage
         ds.attrs["qirr_n_q_full"] = np.int64(can.n_q_full)
         ds.attrs["qirr_n_rmu_logical"] = np.int64(can.n_mu)
@@ -776,7 +824,7 @@ def stamp_qirr_tensor(
             closure_verdict.worst_residual)
         ds.attrs["qirr_closure_tol"] = np.float64(closure_verdict.tol)
         ds.attrs["qirr_data_ready"] = bool(data_ready)
-        ds.attrs["qirr_generator_commit"] = _generator_commit()
+        ds.attrs["qirr_generator_commit"] = qirr_generator_commit()
         ds.attrs["qirr_written_utc"] = datetime.datetime.now(
             datetime.timezone.utc).replace(microsecond=0).isoformat()
         ds.attrs["qirr_writer"] = "symmetry_maps.qirr_store"
@@ -822,19 +870,19 @@ def _header_from(ds, tgrp, tables):
             if str(k).startswith("prov_")}
     for k in ("qirr_generator_commit", "qirr_written_utc", "qirr_writer"):
         if k in ds.attrs:
-            prov[k] = _attr_str(ds, k)
+            prov[k] = qirr_attr_str(ds, k)
     ready = ds.attrs.get("qirr_data_ready", None)
     return QirrHeader(
-        q_storage=_attr_str(ds, "q_storage"),
-        format_version=int(ds.attrs[_VERSION_ATTR]),
+        q_storage=qirr_attr_str(ds, "q_storage"),
+        format_version=int(ds.attrs[QIRR_VERSION_ATTR]),
         n_q_on_disk=int(ds.shape[0]),
         n_q_full=int(ds.attrs["qirr_n_q_full"]),
         n_mu=int(ds.shape[-1]),
         n_rmu_logical=int(ds.attrs.get("qirr_n_rmu_logical",
                                        int(ds.shape[-1]))),
-        centroid_hash=_attr_str(ds, "qirr_centroid_hash"),
-        table_hash=_attr_str(ds, "qirr_table_hash"),
-        closure_verdict=_attr_str(ds, "qirr_closure_verdict"),
+        centroid_hash=qirr_attr_str(ds, "qirr_centroid_hash"),
+        table_hash=qirr_attr_str(ds, "qirr_table_hash"),
+        closure_verdict=qirr_attr_str(ds, "qirr_closure_verdict"),
         closure_worst_residual=float(
             ds.attrs["qirr_closure_worst_residual"]),
         closure_tol=float(ds.attrs["qirr_closure_tol"]),
@@ -869,15 +917,15 @@ def dataset_q_storage(ds) -> str:
     opened, and the expensive answer still refuses on a disagreement.
     """
     present = [a for a in _OWNED_ATTRS if a in ds.attrs]
-    if _VERSION_ATTR not in ds.attrs:
+    if QIRR_VERSION_ATTR not in ds.attrs:
         if present:
             raise ValueError(
                 f"qirr_store: {ds.name!r} carries q_irr attrs {present} but "
-                f"no {_VERSION_ATTR!r}.  'No attrs' is read as "
+                f"no {QIRR_VERSION_ATTR!r}.  'No attrs' is read as "
                 f"q_storage='full' for backward compatibility; a PARTIAL "
                 f"stamp is not.")
         return "full"
-    stamped = _attr_str(ds, "q_storage")
+    stamped = qirr_attr_str(ds, "q_storage")
     if stamped not in ("ibz", "full"):
         raise ValueError(
             f"qirr_store: {ds.name!r} stamps q_storage={stamped!r}, which is "
@@ -892,7 +940,7 @@ def read_tables(src, name, *, mode="r") -> QirrTables:
     compare two files' tables, or to unfold on its own schedule, should not
     have to materialise a gigabyte to do it.
     """
-    with _Dest(src, mode) as grp:
+    with QirrDest(src, mode) as grp:
         tgrp_name = name + QIRR_TABLE_SUFFIX
         if tgrp_name not in grp:
             raise ValueError(
@@ -935,11 +983,22 @@ def read_tensor(
     whether an unfold ran, and ``header.closure_verdict`` carries the
     write-time measurement the tensor's recoverability rests on.
 
-    THE DISCRIMINANT IS THE SHAPE.  The stored q extent is compared against
-    the ``n_q_full`` the tables carry; that decides ibz-versus-full.  The
-    ``q_storage`` attr is then asserted against that verdict and a
-    disagreement REFUSES, because a stamped-and-wrong attr is exactly what
-    a cross-check is for.
+    THE RANK IS CHECKED FIRST, and it refuses by name — both numbers, the
+    stamped version and the rank found — before the tables are opened or
+    any extent is read.  ``QIRR_RANK_BY_VERSION`` says version
+    :data:`QIRR_FORMAT_VERSION` is rank 3; a rank-4
+    ``(n_omega, n_q_ibz, N_μ, N_μ)`` tensor carrying that stamp would
+    otherwise pass every check below whenever ``n_omega`` equals the wedge
+    extent, and be handed back as 4-D bytes with the frequency axis
+    relabelled q.  The rank is a property of the BYTES, which is what makes
+    it the second opinion a wrong version attr cannot forge; the module
+    docstring works the case through.
+
+    THE DISCRIMINANT IS THEN THE SHAPE.  The stored q extent is compared
+    against the ``n_q_full`` the tables carry; that decides
+    ibz-versus-full.  The ``q_storage`` attr is then asserted against that
+    verdict and a disagreement REFUSES, because a stamped-and-wrong attr is
+    exactly what a cross-check is for.
 
     NO ATTRS AT ALL MEANS FULL.  A dataset carrying no ``qirr_*`` attrs is
     a restart file written before this format existed; it is returned
@@ -973,18 +1032,18 @@ def read_tensor(
         says "the centroid set I am about to build ζ from is the one this
         tensor was written against".
     """
-    with _Dest(src, mode) as grp:
+    with QirrDest(src, mode) as grp:
         if name not in grp:
             raise KeyError(f"qirr_store: {name!r} is not in this file")
         ds = grp[name]
         present = [a for a in _OWNED_ATTRS if a in ds.attrs]
 
         # ---- the backward-compatible path: no attrs means full BZ -------
-        if _VERSION_ATTR not in ds.attrs:
+        if QIRR_VERSION_ATTR not in ds.attrs:
             if present:
                 raise ValueError(
                     f"qirr_store: {name!r} carries q_irr attrs {present} "
-                    f"but no {_VERSION_ATTR!r}.  'No attrs' is read as "
+                    f"but no {QIRR_VERSION_ATTR!r}.  'No attrs' is read as "
                     f"q_storage='full' for backward compatibility; a "
                     f"PARTIAL stamp is not, because the missing half is "
                     f"exactly what would say whether the shape means what "
@@ -998,7 +1057,7 @@ def read_tensor(
                 closure_worst_residual=None, closure_tol=None,
                 data_ready=None, provenance={})
 
-        version = int(ds.attrs[_VERSION_ATTR])
+        version = int(ds.attrs[QIRR_VERSION_ATTR])
         if version != QIRR_FORMAT_VERSION:
             raise ValueError(
                 f"qirr_store: {name!r} is format version {version}; this "
@@ -1007,10 +1066,35 @@ def read_tensor(
                 f"version best-effort returns wrong numbers on the day the "
                 f"layout changes.")
 
+        # ---- THE RANK, BEFORE ANY EXTENT IS BELIEVED --------------------
+        # Placed above ``read_tables`` on purpose: everything from here on
+        # reads ``shape[0]`` as the q extent, and on a rank-4 dataset that
+        # expression still evaluates.  See the module docstring for the
+        # case where it evaluates to something every other check accepts.
+        want_rank = QIRR_RANK_BY_VERSION[version]
+        if int(ds.ndim) != want_rank:
+            raise ValueError(
+                f"qirr_store: {name!r} stamps "
+                f"{QIRR_VERSION_ATTR}={version}, which is rank "
+                f"{want_rank}, but the dataset is "
+                f"{tuple(int(s) for s in ds.shape)} — rank {int(ds.ndim)}.  "
+                f"RANK IS THE DISCRIMINANT and the version attr is its "
+                f"cross-check, in that order, because a rank-4 tensor "
+                f"stamped version {QIRR_FORMAT_VERSION} passes EVERY "
+                f"version-{QIRR_FORMAT_VERSION} check whenever its leading "
+                f"extent equals the wedge extent: shape[0] reads as the q "
+                f"extent, shape[-1] is still N_μ, the tables validate "
+                f"against both, the q_storage cross-check agrees, the "
+                f"table digest matches and the readiness flag is set — and "
+                f"the caller gets a 4-D array whose leading axis is "
+                f"frequency with nothing raised.  That is silent "
+                f"corruption, so it is refused here on a property of the "
+                f"bytes rather than of an attr.")
+
         tables = read_tables(grp, name)
         can = tables.canonical()
         recomputed = can.digest()
-        stamped = _attr_str(ds, "qirr_table_hash")
+        stamped = qirr_attr_str(ds, "qirr_table_hash")
         if stamped != recomputed:
             raise ValueError(
                 f"qirr_store: {name!r} table hash mismatch.  Stamped "
@@ -1022,7 +1106,7 @@ def read_tensor(
             raise ValueError(
                 f"qirr_store: {name!r} table hash {recomputed} does not "
                 f"match the expected {expect_table_hash}.")
-        cent = _attr_str(ds, "qirr_centroid_hash")
+        cent = qirr_attr_str(ds, "qirr_centroid_hash")
         if expect_centroid_hash is not None and expect_centroid_hash != cent:
             raise ValueError(
                 f"qirr_store: {name!r} was written against centroid set "
@@ -1032,8 +1116,8 @@ def read_tensor(
 
         n_q_on_disk = int(ds.shape[0])
         n_mu = int(ds.shape[-1])
-        shape_says = _validate(can, n_q_on_disk, n_mu)
-        attr_says = _attr_str(ds, "q_storage")
+        shape_says = validate_qirr_tables(can, n_q_on_disk, n_mu)
+        attr_says = qirr_attr_str(ds, "q_storage")
         if attr_says != shape_says:
             raise ValueError(
                 f"qirr_store: {name!r} shape says q_storage={shape_says!r} "
