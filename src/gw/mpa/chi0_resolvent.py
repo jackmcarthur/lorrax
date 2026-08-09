@@ -150,20 +150,33 @@ def _accumulate_block(M, delta, z_values):
     The weight is the ONLY z-dependent factor, which is the whole reason
     the transition axis is worth materialising: ``M`` is built once and
     every sample on both lines rides it.
+
+    THE SAMPLE AXIS IS SCANNED, NOT BROADCAST, and that is a memory
+    decision rather than a style one.  The natural
+    ``einsum('zt,tm,tn->zmn')`` invites XLA to form the ``(n_z, n_trans,
+    n_mu)`` weighted copy -- 3.4 GB at n_z=16, a 16-k block and 1128
+    centroids, which is most of a device for an intermediate.  Scanning
+    z holds one ``(n_trans, n_mu)`` weighted copy at a time and turns
+    the whole thing into n_z plain GEMMs, which is also the shape that
+    reaches the fp64 tensor cores.
     """
 
     n_mu = M.shape[-1]
     Mf = M.reshape((-1, n_mu))                       # (n_trans, n_mu)
     d = delta.reshape((-1,)).astype(jnp.float64)     # (n_trans,)
-    # K_z(Delta) = -2 Delta / (Delta**2 - z**2); ``damped_kernel``'s
-    # closed form, inlined here because that one is host numpy and this
-    # is the device path.  The factor is read from ``sample_plan`` so
-    # the two forms cannot drift apart.
-    zz = jnp.asarray(z_values, dtype=jnp.complex128)[:, None]
-    weight = (sample_plan.KERNEL_FACTOR * d[None, :]
-              / (d[None, :] ** 2 - zz ** 2))         # (n_z, n_trans)
-    return jnp.einsum("zt,tm,tn->zmn", weight, Mf, jnp.conj(Mf),
-                      optimize=True)
+    Mc = jnp.conj(Mf)
+
+    def _one(_, zj):
+        # K_z(Delta) = -2 Delta / (Delta**2 - z**2); ``damped_kernel``'s
+        # closed form, inlined because that one is host numpy and this is
+        # the device path.  The factor is read from ``sample_plan`` so the
+        # two forms cannot drift apart.
+        w = sample_plan.KERNEL_FACTOR * d / (d ** 2 - zj ** 2)
+        return None, jnp.matmul((Mf * w[:, None]).T, Mc)
+
+    _, out = jax.lax.scan(_one, None, jnp.asarray(z_values,
+                                                  dtype=jnp.complex128))
+    return out
 
 
 def chi0_resolvent(psi, enk, slices, z_values, q_int, kgrid, *,
