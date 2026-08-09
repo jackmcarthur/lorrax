@@ -625,6 +625,7 @@ def build_bse_ring_matvec_full(
     low_mem: bool = True,
     include_W: bool = True,
     screening: bool = False,
+    return_half_appliers: bool = False,
 ):
     """Build full (non-TDA) BSE matvec ``[X;Y] -> H[X;Y]``.
 
@@ -894,7 +895,7 @@ def build_bse_ring_matvec_full(
                                   eps_c, eps_v, W_R, V_q0, M_X)
         return jnp.stack([X_out, Y_out], axis=0)
 
-    return jax.jit(
+    matvec = jax.jit(
         _matvec_impl,
         in_shardings=(
             sh.X_full,
@@ -911,6 +912,30 @@ def build_bse_ring_matvec_full(
         ),
         out_shardings=sh.X_full,
     )
+    if not return_half_appliers:
+        return matvec
+
+    # The two HALF-operator appliers, EXPOSED rather than duplicated.  Until now
+    # they were reachable only through ``_matvec_impl``, which evaluates FOUR of
+    # them per call -- ``A X``, ``B Y``, ``conj(A conj(Y))``, ``conj(B conj(X))``
+    # -- so a caller that wants a single block (the dense build; any matrix-free
+    # route) paid for two applications against a ZERO block.  Same closures,
+    # same operator ingredients, same shardings as the corresponding terms
+    # inside the full matvec: nothing is re-derived and there is no second copy
+    # of the kernel to drift.
+    apply_A = jax.jit(
+        _apply_A,
+        in_shardings=(sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
+                      sh.eps, sh.eps, sh.W, sh.V, sh.psi_x),
+        out_shardings=sh.X,
+    )
+    apply_B = jax.jit(
+        _apply_B,
+        in_shardings=(sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
+                      sh.W, sh.V, sh.psi_x),
+        out_shardings=sh.X,
+    )
+    return matvec, apply_A, apply_B
 
 
 def build_realspace_random_transition_generator(

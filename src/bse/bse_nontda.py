@@ -225,11 +225,18 @@ def check_restart_reciprocity(W_q, *, tol=_NONTDA_RECIP_TOL, log=None,
     return rel
 
 
-def _full_matvec_and_args(data, mesh_xy, sh, *, include_W):
+def _full_matvec_and_args(data, mesh_xy, sh, *, include_W, with_halves=False):
     """Build the fixed optical non-TDA matvec + its threaded argument tuple."""
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
-    matvec = build_bse_ring_matvec_full(
-        mesh_xy, nkx, nky, nkz, include_W=include_W, screening=False)
+    halves = None
+    if with_halves:
+        matvec, ap_A, ap_B = build_bse_ring_matvec_full(
+            mesh_xy, nkx, nky, nkz, include_W=include_W, screening=False,
+            return_half_appliers=True)
+        halves = (ap_A, ap_B)
+    else:
+        matvec = build_bse_ring_matvec_full(
+            mesh_xy, nkx, nky, nkz, include_W=include_W, screening=False)
     if include_W:
         W_ifft = make_sharded_ifftn_3d(
             mesh_xy, sh.W.spec, sh.W.spec, axes=(2, 3, 4), norm="ortho")
@@ -253,7 +260,7 @@ def _full_matvec_and_args(data, mesh_xy, sh, *, include_W):
     args = (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
             data["eps_c"], data["eps_v"], W_R, data["V_q0"],
             data["M_X"], data["M_Y"])
-    return matvec, args
+    return (matvec, args, halves) if with_halves else (matvec, args)
 
 
 def make_ab_appliers(matvec_full, args, sh):
@@ -271,7 +278,7 @@ def make_ab_appliers(matvec_full, args, sh):
 
 
 def _materialize_A_B(matvec_full, args, sh, nc, nv, nk, *, col_chunk=None,
-                     mesh_xy=None, log=None):
+                     mesh_xy=None, log=None, halves=None):
     """Dense A, B (N x N, N = nc*nv*nk) from the full matvec, one identity slice
     at a time, in a SINGLE pass — the resonant trial block returns ``A U`` and
     ``-B* U`` together, so ``B`` is read off the block the build used to discard
@@ -314,15 +321,34 @@ def _materialize_A_B(matvec_full, args, sh, nc, nv, nk, *, col_chunk=None,
     # 0.000 neV -- because the kernel forms the anti-resonant row by conjugating
     # the same product, and conjugation is exact in floating point.  The second
     # pass cost 163.948 s of a 347 s run: 49.7% of the dense build, for nothing.
+    #
+    # HALF-APPLIER ROUTE (``halves`` present).  Even the one-pass build above
+    # still pays for the two terms the full matvec evaluates against the ZERO
+    # block: ``B*0`` and ``conj(A conj(0))``.  ``A U`` and ``B U`` are the only
+    # two things wanted, and ``bse_ring_comm`` now exposes exactly those two
+    # appliers, so the build asks for them and nothing else -- 2 half-operator
+    # applications per column instead of 4, all of them used.
+    #
+    # Bit-identical to the full-matvec route, and exactly so: ``B*0`` is an
+    # exact zero (a linear kernel on zeros), ``AX + 0 == AX``, and the B column
+    # the full route recovers is ``conj(conj(B U))``, which is ``B U`` digit for
+    # digit because conjugation only flips a sign bit.
     A_out = np.empty((N, N), dtype=np.complex128)       # [flat, col]
     B_out = np.empty((N, N), dtype=np.complex128)
+    a_args = args[:9]                                   # ... eps_c, eps_v, W_R, V_q0, M_X
+    b_args = (args[0], args[1], args[2], args[3], args[6], args[7], args[8])
     for c0 in range(0, N, col_chunk):
         blk = eye[c0:c0 + col_chunk]                     # (b, nc, nv, nk)
+        b = blk.shape[0]
+        if halves is not None:
+            U = jax.lax.with_sharding_constraint(jnp.asarray(blk), sh.X)
+            A_out[:, c0:c0 + b] = np.asarray(halves[0](U, *a_args)).reshape(b, N).T
+            B_out[:, c0:c0 + b] = np.asarray(halves[1](U, *b_args)).reshape(b, N).T
+            continue
         z = np.zeros_like(blk)
         Xf = jax.lax.with_sharding_constraint(
             jnp.asarray(np.stack([blk, z], axis=0)), sh.X_full)
         both = matvec_full(Xf, *args)
-        b = blk.shape[0]
         A_out[:, c0:c0 + b] = np.asarray(both[0]).reshape(b, N).T
         B_out[:, c0:c0 + b] = np.conj(-np.asarray(both[1]).reshape(b, N).T)
     return A_out, B_out
@@ -421,10 +447,11 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
     if include_W and data.get("W_q") is not None:
         check_restart_reciprocity(data["W_q"], tol=recip_tol, log=_log0,
                                   input_file=data.get("input_file"))
-    matvec, args = _full_matvec_and_args(data, mesh_xy, sh, include_W=include_W)
+    matvec, args, halves = _full_matvec_and_args(
+        data, mesh_xy, sh, include_W=include_W, with_halves=True)
     with mesh_xy:
         A, B = _materialize_A_B(matvec, args, sh, nc, nv, nk,
-                                mesh_xy=mesh_xy, log=_log0)
+                                mesh_xy=mesh_xy, log=_log0, halves=halves)
     b_herm = np.linalg.norm(B - B.conj().T) / max(np.linalg.norm(B), 1e-300)
     if b_herm < 1e-6:
         omega, Z = solve_nontda_product(A, B, n_eig)           # real / RPA

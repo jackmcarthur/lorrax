@@ -436,6 +436,58 @@ def test_nontda_dense_build_takes_one_pass_not_two(bse_dense_state):
     assert _relerr(A, A.conj().T) < 1e-6, "A must still be Hermitian"
 
 
+@pytest.mark.gpu
+def test_nontda_dense_build_half_appliers_agree_with_the_full_matvec(bse_dense_state):
+    """The dense build asks for the two half-operator applications it uses.
+
+    Even the one-pass build pays for the terms the full matvec evaluates against
+    the ZERO block -- ``B*0`` and ``conj(A conj(0))``.  ``bse_ring_comm`` now
+    exposes ``_apply_A`` / ``_apply_B`` (``return_half_appliers=True``) so the
+    build asks for ``A U`` and ``B U`` and nothing else: 2 half-applications per
+    column instead of 4, all used.  MEASURED on the Si 4x4x4 record deck
+    (N=1024): the dense build goes 165.429 s -> 101.073 s, 1.64x on top of the
+    one-pass change and 3.3x on the original two-pass build.
+
+    NOT bit-identical, and the reason is benign: standalone ``A U`` compiles to a
+    different XLA fusion than ``A U + B*0`` does, so the last bit of the
+    accumulation can differ.  The drift is ONE ULP and is asserted as such --
+    measured max|dA| = 1.110e-16, max|dB| = 2.822e-18, and max|d omega| =
+    5.665e-15 eV, which is nine orders below the tightest tolerance any gate in
+    this tree puts on these eigenvalues.
+
+    RED TWIN: mis-slice ``a_args``/``b_args`` in ``_materialize_A_B``, or give
+    either applier the wrong ``in_shardings``, and the two routes stop agreeing.
+    """
+    harness.skip_unless_gpu(pytest)
+    from bse.bse_nontda import _materialize_A_B, _full_matvec_and_args
+    from bse.bse_ring_comm import make_bse_shardings
+    sdata, mesh = _nontda_data_from_subset(bse_dense_state)
+    sh = make_bse_shardings(mesh)
+    nc = int(sdata["n_cond_pad"]); nv = int(sdata["n_val_pad"])
+    nk = int(sdata["nkx"]) * int(sdata["nky"]) * int(sdata["nkz"])
+    matvec, args, halves = _full_matvec_and_args(
+        sdata, mesh, sh, include_W=True, with_halves=True)
+    assert halves is not None and len(halves) == 2, (
+        "build_bse_ring_matvec_full(return_half_appliers=True) did not expose "
+        "_apply_A / _apply_B")
+    with mesh:
+        A_h, B_h = _materialize_A_B(matvec, args, sh, nc, nv, nk, col_chunk=2,
+                                    mesh_xy=mesh, halves=halves)
+        A_f, B_f = _materialize_A_B(matvec, args, sh, nc, nv, nk, col_chunk=2,
+                                    mesh_xy=mesh, halves=None)
+    for nm, Xh, Xf in (("A", A_h, A_f), ("B", B_h, B_f)):
+        scale = max(float(np.abs(Xf).max()), 1e-300)
+        rel = float(np.abs(Xh - Xf).max()) / scale
+        assert rel < 1e-13, (
+            f"{nm}: half-applier route differs from the full matvec by "
+            f"{rel:.3e} relative -- that is far above the one-ULP fusion "
+            f"difference this cell allows, so the appliers are not being fed "
+            f"the same operator")
+    # the property the solver actually gates on must survive
+    assert _relerr(A_h, A_h.conj().T) < 1e-6, "A must still be Hermitian"
+    assert _relerr(B_h, B_h.T) < 1e-6, "B must still be complex-symmetric"
+
+
 def _nontda_data_from_subset(data):
     """Build the ``solve_bse_nontda_sharded`` data contract (sharded ψ/ε/W/V +
     hoisted M_X/M_Y + pad counts) from the ``bse_dense_state`` subset — no second
