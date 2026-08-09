@@ -446,3 +446,66 @@ def test_the_pass_report_names_the_legacy_routed_count():
     text = SP.format_pass_report(recs, xi_ev=0.476)
     assert "legacy-routed modes: 3 of 100 (3.00 %)" in text
     assert "xi = 0.4760 eV" in text
+
+
+# ---------------------------------------------------------------------------
+#  The process axis _to_host_np prepends, and the pass loop that died on it
+# ---------------------------------------------------------------------------
+
+def test_the_gathered_mask_keeps_the_shape_it_was_gathered_from():
+    """A single-process gather must not change an array's rank.
+
+    THE MEASURED FAILURE.  ``ppm_windows._to_host_np(x, tiled=False)`` goes
+    through ``process_allgather``, which prepends a length-``process_count``
+    axis even when that count is one, so a ``(64, 1128, 1128)`` mask comes
+    back ``(1, 64, 1128, 1128)``.  The first consumer in the pass loop is
+    ``np.min(a_host, where=live, initial=np.inf)`` with ``a_host`` rank 3,
+    and numpy refuses a rank-4 ``where`` with "input operand has more
+    dimensions than allowed by the axis remapping".  The two-point path
+    never met this because its only consumer of a gathered array ends in
+    ``.reshape(-1)[0]``, to which a leading 1 is invisible.
+    """
+    src = np.zeros((3, 4, 5), dtype=bool)
+
+    def gather_with_process_axis(a, *, dtype, tiled):
+        assert tiled is False
+        return np.asarray(a, dtype=dtype)[None, ...]
+
+    out = SP._host_at_source_shape(src, bool, gather_with_process_axis)
+    assert out.shape == (3, 4, 5)
+    assert out.dtype == np.dtype(bool)
+    # and the reduction that died now runs
+    a = np.arange(60, dtype=np.float64).reshape(3, 4, 5)
+    live = np.ones_like(src, dtype=bool)
+    live_g = SP._host_at_source_shape(live, bool, gather_with_process_axis)
+    assert float(np.min(a, where=live_g, initial=np.inf)) == 0.0
+
+
+def test_a_gather_that_is_not_a_reshape_is_refused():
+    """The FALSE case: this strips a process axis, not any leading axis.
+
+    A gather that came back with a different ELEMENT COUNT is not the
+    process axis at all -- it is a different object, and reshaping it would
+    either raise somewhere unhelpful or, worse, succeed against a stale
+    buffer.  So the mismatch is named here.
+    """
+    src = np.zeros((3, 4, 5), dtype=bool)
+
+    def gather_wrong_count(a, *, dtype, tiled):
+        return np.zeros((2,) + np.shape(a), dtype=dtype)
+
+    with pytest.raises(ValueError) as exc:
+        SP._host_at_source_shape(src, bool, gather_wrong_count)
+    assert "not a reshape of it" in str(exc.value)
+
+
+def test_a_gather_that_already_has_the_right_shape_is_untouched():
+    """Multi-process arrays come back at global shape; identity, not a bug."""
+    src = np.arange(24, dtype=np.float64).reshape(2, 3, 4)
+
+    def gather_global(a, *, dtype, tiled):
+        return np.asarray(a, dtype=dtype)
+
+    out = SP._host_at_source_shape(src, np.float64, gather_global)
+    assert out.shape == src.shape
+    assert np.array_equal(out, src)

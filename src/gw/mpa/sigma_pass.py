@@ -249,6 +249,49 @@ def split_pass_by_width(gamma_ry, live_mask, xi_ry):
     return narrow, live & ~narrow
 
 
+def _host_at_source_shape(a, dtype, to_host):
+    """``_to_host_np`` without the process axis it prepends.
+
+    THE DEFECT THIS EXISTS FOR, measured end to end.  On a SINGLE-process
+    run ``ppm_windows._to_host_np(x, tiled=False)`` goes through
+    ``process_allgather``, which prepends a length-``process_count`` axis:
+    a ``(64, 1128, 1128)`` mask comes back ``(1, 64, 1128, 1128)``.  The
+    two-point path never noticed because its only scalar consumer,
+    ``_to_host_scalar``, ends in ``.reshape(-1)[0]`` and a leading 1 is
+    invisible to that.  The pass loop's consumers are not scalars, and the
+    first one to touch the array died:
+
+        np.min(a_host, where=live, initial=np.inf)
+        ValueError: input operand has more dimensions than allowed by the
+        axis remapping
+
+    with ``a_host`` rank 3 and ``live`` rank 4.  So the MPA pass loop could
+    not complete a single pole on a real store, which is why this never
+    showed up in its own suite -- every cell there hands the planner host
+    numpy arrays it built itself and never crosses this seam.
+
+    Reshaping to the SOURCE array's own shape is right in both regimes and
+    not only the one that was broken.  Multi-process arrays are not fully
+    addressable, so ``_to_host_np`` forces ``tiled=True`` and returns the
+    reconstructed GLOBAL array, whose shape already equals the source's;
+    the reshape is then the identity and asserts as much.  A genuine
+    element-count mismatch raises here rather than silently broadcasting
+    somewhere downstream.
+    """
+    out = np.asarray(to_host(a, dtype=dtype, tiled=False), dtype=dtype)
+    want = tuple(int(v) for v in np.shape(a))
+    if out.shape == want:
+        return out
+    n_want = int(np.prod(want)) if want else 1
+    if out.size != n_want:
+        raise ValueError(
+            f"mpa sigma: gathering an array of shape {want} returned "
+            f"{out.shape}, which is not a reshape of it ({out.size} "
+            f"elements against {n_want}).  That is not the "
+            f"process axis this strips; it is a different object.")
+    return out.reshape(want)
+
+
 def refuse_wedge_pole_slab(n_q_store, n_k_tot):
     """Refuse a wedge-shaped pole slab by name, and say what would fix it.
 
@@ -852,8 +895,7 @@ def compute_mpa_sigma_c_omega_grid(
             jnp.ones(a_host.shape, dtype=bool),
             jnp.asarray(str(ppm_cfg.fermi_reference) == "midgap", dtype=bool),
             jnp.asarray(True, dtype=bool))
-        live = np.asarray(_to_host_np(state.B_mask, dtype=bool, tiled=False),
-                          dtype=bool)
+        live = _host_at_source_shape(state.B_mask, bool, _to_host_np)
         rec = PassRecord(
             pole_index=int(p),
             re_omega_min_ev=float(np.min(a_host, where=live, initial=np.inf))
@@ -874,8 +916,9 @@ def compute_mpa_sigma_c_omega_grid(
                 idx_neg=idx_neg,
                 E_cond=state.E_cond, H_val=state.H_val,
                 cond_mask=state.cond_mask, val_mask=state.val_mask):
-            E_A_host = _to_host_np(br.E_A, dtype=np.float64, tiled=False)
-            mask_A_host = _to_host_np(br.base_mask_A, dtype=bool, tiled=False)
+            E_A_host = _host_at_source_shape(br.E_A, np.float64, _to_host_np)
+            mask_A_host = _host_at_source_shape(
+                br.base_mask_A, bool, _to_host_np)
             with timing.section("mpa.windows"):
                 groups, stats = plan_branch_groups(
                     a_ry=a_host, gamma_ry=g_host, live_mask=live,
