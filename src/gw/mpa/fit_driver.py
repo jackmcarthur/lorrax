@@ -458,7 +458,7 @@ def pole_pass_order(n_p):
 def _as_group(src, mode="r"):
     """An open h5py group, from either a path or an already-open one.
 
-    A three-line mirror of ``qirr_store._Dest``, and it should not
+    A three-line mirror of ``symmetry_maps.QirrDest``, and it should not
     survive.  It exists only because :func:`read_pole_slice` is a read
     ``mpa_store`` does not expose (see that function), so this module
     has one file open the store cannot do for it.  When the pole-sliced
