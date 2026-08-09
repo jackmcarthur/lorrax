@@ -328,13 +328,18 @@ def fit_zeta_to_h5(
     # uses an SVD pseudoinverse with rcond cutoff to drop those null
     # modes instead of inverting through them — the unique min-norm LSQ
     # solution.
-    # Force-eager-import gamma_matrices so its module-level
-    # ``gammas_sparse = [_to_sparse(g) for g in gammas]`` (which calls
-    # ``jnp.nonzero``) runs OUTSIDE any JIT trace; otherwise the first
-    # reference comes from inside the per-chunk kernel jit and trips
-    # a ConcretizationTypeError.
-    if int(vertex_mu_L) != 0:
-        from common import gamma_matrices as _gm  # noqa: F401  (warm import)
+    # (A ``vertex_mu_L != 0`` warm-import of ``common.gamma_matrices`` used to
+    # sit here.  Its stated reason was that module's
+    # ``gammas_sparse = [_to_sparse(g) for g in gammas]``, whose ``jnp.nonzero``
+    # has a data-dependent output shape and so raises ConcretizationTypeError
+    # if its first evaluation happens inside a jit trace.  ``gammas_sparse``
+    # was dead — defined and never read anywhere in the tree — and was deleted
+    # in the 2026-08-09 import audit, taking the hazard with it.  Nothing left
+    # in that module's body is trace-hostile: the remaining constants are
+    # ``jnp.asarray`` of numpy tables.  The line was also already inert here,
+    # because this file imports ``common.gamma_matrices`` at module scope
+    # (``_gamma_perm_phase_mu``, top of file), so the module was fully
+    # imported long before this function ran.)
 
     # ── Finalize write_ibz_only BEFORE any IBZ slicing (bug fix) ─────────
     # The IBZ cascade slices C_q/L_q to IBZ rows in STEP 2/3 below, and

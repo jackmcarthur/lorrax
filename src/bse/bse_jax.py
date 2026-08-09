@@ -146,7 +146,26 @@ def _preview_lanczos(
         # this function and so is invisible to any timer inside it.  Recorded
         # FIRST so it appears first: the table's row order is insertion order,
         # and a startup row printed last reads as an epilogue.
-        timing.record("bse.imports_and_runtime", _pre_main)
+        #
+        # DECOMPOSED, since 2026-08-09.  This used to be ONE row, and on the
+        # Si record deck at P=4 that one row was 11.190 s of a 14.051 s warm
+        # wall — 80.1 %, with nothing inside it to point at.  ``htransform``
+        # and ``gw_jax`` already split their equivalent using the phase
+        # timings the startup call measured for itself, and there was no
+        # reason for the BSE driver to be the one that did not; the same four
+        # sub-rows plus an ``imports`` remainder now appear here.  The rows
+        # are carved OUT of the total (the parent row keeps only what the
+        # startup call did not account for), so the table still sums.
+        _phases: dict = {}
+        try:
+            _phases = dict(RUNTIME.facts.get("elapsed", {}) or {})
+        except Exception:      # noqa: BLE001 — observability never kills a run
+            _phases = {}
+        for _phase, _secs in sorted(_phases.items()):
+            if _phase != "total":
+                timing.record(f"bse.runtime_stack.{_phase}", float(_secs))
+        timing.record("bse.imports",
+                      max(_pre_main - float(_phases.get("total", 0.0)), 0.0))
     restart_file = _find_restart_file(input_file)
     n_devices = jax.device_count()
     # Non-TDA has no 1-device (``solve_bse``) path — it runs through the sharded

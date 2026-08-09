@@ -1,51 +1,92 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as _np
 
 """Dirac gamma matrices represented as JAX arrays.
 
 The matrices are provided in the standard Dirac representation
 and stored as ``jax.numpy`` arrays.
+
+WHY THE LITERALS ARE BUILT THROUGH NUMPY.  Every constant below is a fixed
+4x4 (or 2x2) table, and this module is on the import path of every driver
+that touches ``isdf.core`` — ``bandstructure.htransform`` and the GW chain
+among them.  Spelling a constant ``jnp.array([[...]], dtype=complex128)``
+sends the Python list through jax's dtype-conversion path, which dispatches
+an eager XLA program per literal; spelling it ``jnp.asarray(np.array(...,
+dtype=np.complex128))`` is a plain host-to-device transfer of an array that
+already has the right dtype.  The two produce the same ``jax.Array`` with the
+same dtype and the same values.  MEASURED on an A100 with a warm backend
+(import/bring-up audit, 2026-08-09): eight literals cost **0.2295 s** the
+first way and **0.0059 s** the second, and the two ``jnp.stack`` calls at the
+bottom of the module cost **0.38 s** — one of them compiling an XLA program
+at import time (``xla_compiles=1``) — against **0.0001 s** for
+``jnp.asarray(np.stack(...))``.  The whole module body went from 0.437 s to
+0.006 s, on a warm htransform bring-up of ~12 s.
+
+So: build with numpy, hand to jax once.  Do not "simplify" these back into
+``jnp.array([[...]])`` — the shorter spelling costs a third of a second on
+every driver that imports this file.
 """
 
-# Pauli matrices
-sigma_x = jnp.array([[0, 1], [1, 0]], dtype=jnp.complex128)
-sigma_y = jnp.array([[0, -1j], [1j, 0]], dtype=jnp.complex128)
-sigma_z = jnp.array([[1, 0], [0, -1]], dtype=jnp.complex128)
+def _t128(rows):
+    """The HOST table.  Every constant in this module starts life here."""
+    return _np.array(rows, dtype=_np.complex128)
+
+
+# THE HOST TABLES ARE THE SOURCE OF TRUTH, and everything derived below is
+# derived from THEM rather than from the device copies.  That is not a style
+# choice: ``_to_perm_phase`` reads its argument on the host, so deriving it
+# from ``gamma0`` (a ``jax.Array``) puts a device-to-host conversion in the
+# module body, and a module body containing one cannot be evaluated inside a
+# jit trace — ``np.asarray`` of a tracer raises TracerArrayConversionError.
+# The module was in that state before the 2026-08-09 audit too (the
+# ``jnp.nonzero`` that ``gw.isdf_fitting`` worked around was the second such
+# line, not the only one).  Reading the tables makes the body trace-clean by
+# construction, which ``tests/test_import_time_gate.py`` executes rather than
+# asserts.
+_T_SIGMA_X = _t128([[0, 1], [1, 0]])
+_T_SIGMA_Y = _t128([[0, -1j], [1j, 0]])
+_T_SIGMA_Z = _t128([[1, 0], [0, -1]])
 
 # Standard Dirac gamma matrices (4x4)
 # JM: actually I replace gamma0-3 with gamma0*gamma0-3, so that I can use psidag = conj(psi) rather than psibar = conj(psi) gamma0
-
-gamma0 = jnp.array([[1, 0, 0, 0],
+_T_GAMMA0 = _t128([[1, 0, 0, 0],
                    [0, 1, 0, 0],
                    [0, 0, 1, 0],
-                   [0, 0, 0, 1]], dtype=jnp.complex128)
+                   [0, 0, 0, 1]])
 
-gamma1 = jnp.array([[0, 0, 0, 1],
+_T_GAMMA1 = _t128([[0, 0, 0, 1],
                    [0, 0, 1, 0],
                    [0, 1, 0, 0],
-                   [1, 0, 0, 0]], dtype=jnp.complex128)
+                   [1, 0, 0, 0]])
 
-gamma2 = jnp.array([[0, 0, 0, -1j],
+_T_GAMMA2 = _t128([[0, 0, 0, -1j],
                    [0, 0, 1j, 0],
                    [0, -1j, 0, 0],
-                   [1j, 0, 0, 0]], dtype=jnp.complex128)
+                   [1j, 0, 0, 0]])
 
-gamma3 = jnp.array([[0, 0, 1, 0],
+_T_GAMMA3 = _t128([[0, 0, 1, 0],
                    [0, 0, 0, -1],
                    [1, 0, 0, 0],
-                   [0, -1, 0, 0]], dtype=jnp.complex128)
+                   [0, -1, 0, 0]])
 
 # gamma^5 = i gamma^0 gamma^1 gamma^2 gamma^3
-gamma5 = jnp.array([[0, 0, 1, 0],
+_T_GAMMA5 = _t128([[0, 0, 1, 0],
                    [0, 0, 0, 1],
                    [1, 0, 0, 0],
-                   [0, 1, 0, 0]], dtype=jnp.complex128)
+                   [0, 1, 0, 0]])
 
-def _to_sparse(mat):
-    """Return row indices, column indices, and values of nonzero entries."""
-    r, c = jnp.nonzero(mat)
-    return r, c, mat[r, c]
+# Pauli matrices
+sigma_x = jnp.asarray(_T_SIGMA_X)
+sigma_y = jnp.asarray(_T_SIGMA_Y)
+sigma_z = jnp.asarray(_T_SIGMA_Z)
+
+gamma0 = jnp.asarray(_T_GAMMA0)
+gamma1 = jnp.asarray(_T_GAMMA1)
+gamma2 = jnp.asarray(_T_GAMMA2)
+gamma3 = jnp.asarray(_T_GAMMA3)
+gamma5 = jnp.asarray(_T_GAMMA5)
 
 
 def _to_perm_phase(mat):
@@ -57,8 +98,10 @@ def _to_perm_phase(mat):
     reduces to ``X[perm⁻¹[α']] · phase[perm⁻¹[α']]`` — a permuted
     gather + element-wise phase multiply.  Eliminates 4×4 matmul at
     every spin contraction site.
+
+    Returns HOST (numpy) arrays.  The device copies are made once, below, by
+    a single ``jnp.asarray`` on the stacked result — see the module docstring.
     """
-    import numpy as _np
     m = _np.asarray(mat)
     n = m.shape[0]
     perm = _np.zeros(n, dtype=_np.int32)
@@ -72,20 +115,25 @@ def _to_perm_phase(mat):
         c = int(cols[0])
         perm[a] = c
         phase[a] = m[a, c]
-    return jnp.asarray(perm), jnp.asarray(phase)
+    return perm, phase
 
 
 gammas = [gamma0, gamma1, gamma2, gamma3]
-gammas_sparse = [_to_sparse(g) for g in gammas]
+_gamma_tables = [_T_GAMMA0, _T_GAMMA1, _T_GAMMA2, _T_GAMMA3]
 
 # Per-row permutation + phase decomposition of each γ̃^μ.  Used by the
 # bispinor ζ-fit and Σ^B kernels to replace 4×4 matmuls on the spinor
 # axis with a gather + per-element phase mul.  ``gammas_perm[μ][α] =
 # perm[α]`` and ``gammas_phase[μ][α] = phase[α]`` such that
 # ``γ̃^μ_{αβ} = phase[α] · δ_{β, perm[α]}``.
-_perm_phase = [_to_perm_phase(g) for g in gammas]
-gammas_perm = jnp.stack([pp[0] for pp in _perm_phase])     # (4, 4) int32
-gammas_phase = jnp.stack([pp[1] for pp in _perm_phase])    # (4, 4) c128
+#
+# Stacked on the HOST and transferred once.  ``jnp.stack`` on a list of four
+# device arrays is a traced concatenate: it compiled an XLA program at import
+# time and cost 0.38 s (measured, 2026-08-09).  ``np.stack`` then one
+# ``jnp.asarray`` gives the identical array for 0.0001 s.
+_perm_phase = [_to_perm_phase(t) for t in _gamma_tables]
+gammas_perm = jnp.asarray(_np.stack([pp[0] for pp in _perm_phase]))    # (4, 4) int32
+gammas_phase = jnp.asarray(_np.stack([pp[1] for pp in _perm_phase]))   # (4, 4) c128
 
 
 def gamma_perm_phase(mu_lorentz: int) -> tuple[jax.Array, jax.Array]:

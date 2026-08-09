@@ -112,6 +112,40 @@ def _env_falsy(name: str, default: str = "1") -> bool:
         raw = default
     return raw.strip().lower() in _FALSY_TOKENS
 
+
+#: Seconds spent inside the process's FIRST ``import jax``, measured where it
+#: actually happens rather than guessed.
+#:
+#: WHY THIS EXISTS.  Until the 2026-08-09 import audit, every driver's startup
+#: table charged this to ``env_and_distributed`` — a row whose name says
+#: "jax.distributed and backend init" — so roughly two of that row's six
+#: seconds were the Python import storm wearing a distributed-init label, and
+#: an owner reading the table would have gone looking for a handshake problem
+#: that was not there.  MEASURED at P=4 on an A100 node: ``import jax`` +
+#: ``jax.numpy`` 2.165 s, ``jax.distributed.initialize()`` 1.023 s, first
+#: ``jax.devices()`` 3.782 s.  Splitting the row is the whole fix; nothing
+#: about the ORDER changes, which is why this is an accumulator read at the
+#: existing import sites rather than a new import placed somewhere tidier.
+_JAX_IMPORT_SECONDS = [0.0]
+
+
+def _import_jax():
+    """``import jax``, charging the first (uncached) one to a phase counter.
+
+    Every later call is a ``sys.modules`` hit and adds nothing, so the counter
+    holds the one-time cost no matter how many bring-up pieces call it.
+    """
+    import sys as _sys
+    if "jax" in _sys.modules:
+        import jax
+        return jax
+    import time as _time
+    _t0 = _time.perf_counter()
+    import jax
+    _JAX_IMPORT_SECONDS[0] += _time.perf_counter() - _t0
+    return jax
+
+
 __all__ = [
     "initialize_communicator_stack",
     "finalize_process",
@@ -878,7 +912,7 @@ def init_jax_distributed() -> None:
             "single-process run")
         return
 
-    import jax
+    jax = _import_jax()
 
     cv = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     n_local = len([x for x in cv.split(",") if x.strip()]) if cv else 0
@@ -1007,7 +1041,7 @@ def fallback_to_cpu_if_no_gpu_backend() -> None:
     # dlopen happens inside it.  A driver that calls only this piece (no
     # bootstrap, no init_jax_distributed) still gets the CPU-only skip.
     skip_gpu_plugin_discovery()
-    import jax
+    jax = _import_jax()
     caught = None
     try:
         jax.devices()
@@ -1304,8 +1338,14 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     _t_cache = time.perf_counter()
     # -- 8 ------------------------------------------------------------------
     facts = collect_startup_facts(mesh, cache_error=cache_error)
+    # ``jax_import`` is CARVED OUT of ``env_and_distributed``, not added
+    # beside it: the rows have to keep summing to ``total`` or every driver
+    # epilogue that re-records them (htransform, gw_jax, bse_jax) breaks its
+    # "rows + (untimed) == wall" property.  See ``_JAX_IMPORT_SECONDS``.
+    _jax_import = min(_JAX_IMPORT_SECONDS[0], _t_boot - _t0)
     facts["elapsed"] = {
-        "env_and_distributed": _t_boot - _t0,
+        "jax_import": _jax_import,
+        "env_and_distributed": (_t_boot - _t0) - _jax_import,
         "mesh_and_warmup": _t_mesh - _t_boot,
         "compile_cache": _t_cache - _t_mesh,
         "measurement": time.perf_counter() - _t_cache,
@@ -1777,7 +1817,14 @@ def format_startup_report(f: dict) -> list:
         f"warmed before the first physics jit.")
     el = f.get("elapsed")
     if el:
+        # ``jax_import`` is stated separately because it is the one piece of
+        # this block that is NOT distributed bring-up — it is the Python
+        # import storm, and it used to hide inside the next clause.  Optional
+        # so a probe that hand-builds ``elapsed`` still formats.
+        _ji = el.get("jax_import")
+        _ji_clause = (f"{_ji:.1f} s to import jax itself, " if _ji else "")
         add(f"  Bringing this stack up took {el['total']:.1f} s in total: "
+            f"{_ji_clause}"
             f"{el['env_and_distributed']:.1f} s for the environment, "
             f"jax.distributed and backend init, "
             f"{el['mesh_and_warmup']:.1f} s to build the mesh and warm its "
