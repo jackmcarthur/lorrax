@@ -130,10 +130,12 @@ __all__ = [
     "DEFAULT_LAPLACE_RATIO_MAX",
     "PassRecord",
     "WindowGroup",
+    "compute_mpa_sigma_c_omega_grid",
     "format_pass_report",
     "narrow_pole_threshold_ry",
     "plan_branch_groups",
     "refuse_wedge_pole_slab",
+    "run_pass_branch",
     "split_pass_by_width",
 ]
 
