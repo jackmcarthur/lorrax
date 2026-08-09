@@ -42,9 +42,10 @@ _services.ensure_on_path()
 from wfn_loader import WfnLoader                                    # noqa: E402
 from common import timing
 from common.collectives import barrier, gather_k_blocks
-from common.mtxel_sweep import (SweepGeometry, band_sphere_spec,
-                                blocks_to_host, dipole_operator,
-                                sweep_matrix_elements)
+from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
+                                VNL_VELOCITY_SIGN_SHIPPED, SweepGeometry,
+                                band_sphere_spec, blocks_to_host,
+                                dipole_operator, sweep_matrix_elements)
 from common.wfn_transforms import load_kpoint_fftbox_local
 from common import Meta
 from gw.gw_config import read_lorrax_input as read_cohsex_input
@@ -520,7 +521,55 @@ def compute_finite_q_mtxels(
 
 _PROV_ATTRS = ("prov_wfn_sha256", "prov_nval", "prov_ncond", "prov_nband",
                "prov_nb_written", "prov_bispinor", "prov_skip_vnl",
-               "prov_vnl_mode", "prov_wfn_file")
+               "prov_vnl_mode", "prov_wfn_file", "prov_vnl_velocity_sign")
+
+#: Word spellings of the two arms, so a deck can say which one it means
+#: rather than carrying a bare ``-1`` whose meaning is a source comment.
+_VNL_SIGN_WORDS = {"shipped": VNL_VELOCITY_SIGN_SHIPPED,
+                   "minus": VNL_VELOCITY_SIGN_SHIPPED,
+                   "flipped": VNL_VELOCITY_SIGN_FLIPPED,
+                   "plus": VNL_VELOCITY_SIGN_FLIPPED}
+
+
+def resolve_vnl_velocity_sign(cli_value, deck_value):
+    """Which sign the i[r, V_NL] term enters this run's velocity with.
+
+    Three tiers, in the order a reader would guess: an explicit
+    ``--vnl-velocity-sign`` beats the deck key ``vnl_velocity_sign``,
+    which beats the shipped default.  ``None`` and the empty string both
+    mean NOT DECLARED, so a deck that has never heard of the key and a
+    deck that omits it are the same run -- the same reading
+    ``resolve_soc_mode`` gives ``soc``.
+
+    The default is
+    :data:`common.mtxel_sweep.VNL_VELOCITY_SIGN_SHIPPED`, and it is read
+    from there rather than written here so that the producer and the
+    operator cannot disagree about what "as shipped" means.  The value
+    is stamped into ``dipole.h5`` by :func:`stamp_dipole_provenance`,
+    because the two arms differ by 31 % in eps00(0) on silicon and a
+    file that does not say which one built it is a file nobody can
+    attribute.
+    """
+    raw = cli_value if cli_value is not None else deck_value
+    if isinstance(raw, str):
+        raw = raw.strip().lower()
+        raw = _VNL_SIGN_WORDS.get(raw, raw)
+    if raw is None or raw == "":
+        return VNL_VELOCITY_SIGN_SHIPPED
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        val = None
+    if val not in (VNL_VELOCITY_SIGN_SHIPPED, VNL_VELOCITY_SIGN_FLIPPED):
+        raise ValueError(
+            f"GATE vnl_velocity_sign: {raw!r} resolves to no arm.  The only "
+            f"values are {VNL_VELOCITY_SIGN_SHIPPED} (shipped, the default) "
+            f"and {VNL_VELOCITY_SIGN_FLIPPED} (flipped); the words "
+            f"{sorted(_VNL_SIGN_WORDS)} spell the same two.  This is a "
+            f"SIGN, not a scale: an arbitrary multiplier would produce a "
+            f"velocity operator that is neither arm of the open question "
+            f"and that no comparison with BerkeleyGW characterises.")
+    return val
 
 
 def wfn_fingerprint(wfn) -> str:
@@ -543,7 +592,7 @@ def wfn_fingerprint(wfn) -> str:
 
 def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
                              nb_written, bispinor, skip_vnl, vnl_mode,
-                             soc=None) -> None:
+                             soc=None, vnl_velocity_sign=None) -> None:
     """Record what this ``dipole.h5`` was built from.
 
     ``soc`` is the RESOLVED j-resolved/j-averaged mode, not the request:
@@ -552,6 +601,16 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
     file built with ``soc = false`` carries a different one and must not
     be mistaken for either.  ``None`` means the field was not recorded,
     which is what every dipole.h5 written before the key existed says.
+
+    ``vnl_velocity_sign`` is the RESOLVED relative sign of the nonlocal
+    commutator term, on the same reading: ``None`` is a file written
+    before the knob existed, which is a file built with the shipped
+    ``-1`` but which cannot say so on its own authority.  It is stamped
+    unconditionally once resolved because the two arms differ by 31 % in
+    eps00(0) on silicon with the SHAPE of the frequency dependence still
+    right -- one global scale of 1.377 on (eps - 1) leaves a 0.3 %
+    residual -- so nothing downstream will notice which arm it was
+    handed.
     """
     h5.attrs["prov_wfn_sha256"] = wfn_fingerprint(wfn)
     h5.attrs["prov_wfn_file"] = str(wfn_path)
@@ -564,6 +623,8 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
     h5.attrs["prov_vnl_mode"] = str(vnl_mode)
     if soc is not None:
         h5.attrs["prov_soc"] = bool(soc)
+    if vnl_velocity_sign is not None:
+        h5.attrs["prov_vnl_velocity_sign"] = float(vnl_velocity_sign)
 
 
 def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
@@ -684,6 +745,18 @@ def main(argv=None):
 		     "absorption comparison.",
 	)
 	parser.add_argument(
+		"--vnl-velocity-sign",
+		type=float,
+		choices=[VNL_VELOCITY_SIGN_SHIPPED, VNL_VELOCITY_SIGN_FLIPPED],
+		default=None,
+		help="Relative sign of the i[r,V_NL] term in the assembled "
+		     "velocity: -1 is the shipped assembly and the default, +1 is "
+		     "the flipped arm.  Overrides the deck key `vnl_velocity_sign`; "
+		     "with neither given the shipped sign is used and every "
+		     "dipole.h5 in the tree is reproduced bit for bit.  The "
+		     "resolved value is stamped as `prov_vnl_velocity_sign`.",
+	)
+	parser.add_argument(
 		"--out",
 		type=str,
 		default="dipole.h5",
@@ -715,6 +788,25 @@ def main(argv=None):
 
 	input_path = Path(args.input).resolve()
 	params = read_cohsex_input(str(input_path))
+	# The relative sign of i[r, V_NL] in the assembled velocity, resolved
+	# ONCE here so that the two producer routes below -- the analytic
+	# ``dipole_operator`` sweep and the numeric finite-difference block --
+	# cannot take different arms in one run, and so that the value the
+	# file is stamped with is the value that was used rather than the
+	# value that was asked for.  See ``mtxel_sweep.dipole_operator``'s
+	# SIGN section for the measurement that makes this an open question.
+	vnl_velocity_sign = resolve_vnl_velocity_sign(
+		args.vnl_velocity_sign, params.get("vnl_velocity_sign", ""))
+	# The four-arm table names the arms by the SIGN OF i[r, V_NL] in the
+	# stored convention, which is the opposite of the sign this knob
+	# carries -- the internal assembly returns -(∂_q + ∂_q') V_NL and the
+	# knob multiplies that.  Both spellings are printed together so a log
+	# can be read against the table without doing the flip in one's head.
+	_arm = ("p + i[r, V_NL]  (as shipped)" if vnl_velocity_sign < 0.0
+	        else "p - i[r, V_NL]  (FLIPPED)")
+	if not args.skip_vnl:
+		print(f"  velocity assembly: {_arm}, "
+		      f"vnl_velocity_sign = {vnl_velocity_sign:+.1f}")
 	# Resolve WFN relative to input file directory as preferred
 	wfn_path = Path(params.get("wfn_file", "WFN.h5"))
 	if not wfn_path.is_absolute():
@@ -1000,8 +1092,19 @@ def main(argv=None):
 		# Sign convention note (Liu-2024 Eq. 17 / BGW k·p):
 		# Our internal assembly returns v^NL = -(∂_q + ∂_{q'}) V_NL, while BGW’s
 		# reported ⟨v⟩ uses the opposite sign convention. Flip here so users don’t
-		# need --vnl-scale=-1.0 when comparing to BGW outputs.
-		vNL_cart = -vNL_cart
+		# need to patch a source file when comparing to BGW outputs.
+		#
+		# THE SAME KNOB THE SWEEP PATH READS, and it has to be read here
+		# too: this branch is what ``--vnl-mode numeric`` runs, and a flag
+		# that is parsed, stamped and honoured on only one of two routes
+		# is a knob that lies about half the runs it labels.  Written as a
+		# branch and not as a multiply by ±1 so the shipped arm executes
+		# the SAME negation it always did: a complex array times a real
+		# ``-1.0`` goes through numpy's full complex product and turns a
+		# ``+0.0`` imaginary part into ``-0.0``, which is numerically
+		# nothing and is not bit-identity.
+		if vnl_velocity_sign < 0.0:
+			vNL_cart = -vNL_cart
 
 		# Optional debug: print 4x6 x-direction blocks for selected k index
 		if args.debug and int(i) == int(args.debug_kindex):
@@ -1038,7 +1141,8 @@ def main(argv=None):
 		                     cell_volume=float(wfn.cell_volume))
 		op = dipole_operator(
 			geom, bvec=wfn.bvec, blat=wfn.blat,
-			vnl_setup=None if args.skip_vnl else vnl_setup)
+			vnl_setup=None if args.skip_vnl else vnl_setup,
+			vnl_velocity_sign=vnl_velocity_sign)
 		with timing.section("dipole_sweep"):
 			H_v = sweep_matrix_elements(
 				psi_G, operator=op, geom=geom,
@@ -1085,7 +1189,8 @@ def main(argv=None):
 	out_path = Path(args.out).resolve()
 	note = ('dipole_cart[3,x,y] = p_i (V_NL skipped, --skip-vnl); '
 	        if args.skip_vnl
-	        else 'dipole_cart[3,x,y] = p_i + i[r_i, V_NL]; ')
+	        else f'dipole_cart[3,x,y] = {_arm} '
+	             f'[vnl_velocity_sign = {vnl_velocity_sign:+.1f}]; ')
 	note += 'deltaE[k,:,:] = E_b - E_b\''
 	# Rank-0 writes.  Every rank holds the same gathered host arrays, so a
 	# multi-process launch previously had all of them open the SAME path with
@@ -1108,7 +1213,8 @@ def main(argv=None):
 			h5, wfn=wfn, wfn_path=str(wfn_path), nval=nval, ncond=ncond,
 			nband=nband, nb_written=nb, bispinor=bispinor,
 			skip_vnl=bool(args.skip_vnl), vnl_mode=str(args.vnl_mode),
-			soc=(None if vnl_setup is None else bool(vnl_setup.soc)))
+			soc=(None if vnl_setup is None else bool(vnl_setup.soc)),
+			vnl_velocity_sign=vnl_velocity_sign)
 		if rho_cvkq is not None:
 			fq = h5.create_group('finite_q')
 			fq.create_dataset('rho_cvkq', data=rho_cvkq)         # (nc, nv, nk, nq)
