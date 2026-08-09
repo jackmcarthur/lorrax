@@ -247,9 +247,16 @@ BETA_CLAUSES: dict[str, BetaClause] = {
         # spread is the bare-Coulomb tail; on the W_c refit every pole
         # narrows 80-90x.  Nothing here depends on that -- this clause's
         # entries certify a supremum over a (u, beta) band and no pole
-        # field enters the certificate -- but the pane counts above are an
-        # UPPER BOUND on real demand, and whether the width clause already
-        # suffices on the narrowed field is an OPEN MEASUREMENT.
+        # field enters the certificate.
+        #
+        # RE-MEASURED ON THE W_c FIELD: the shipped width clause SUFFICES
+        # there.  mpa_fit_np8_wc.h5 needs 43 leaves on pole 7 and 40 on
+        # pole 0 against that clause's own 512 ceiling, where the
+        # defective store demanded 1312.  This clause is therefore a
+        # ROBUSTNESS ASSET rather than a necessity for Si -- it still buys
+        # ~6x in tau nodes and it is the headroom for wider-Gamma physics
+        # (metals) -- and adopting it is an economics decision, not a
+        # blocked-path one.
         beta_max=4.0,
         qualified_at=(2.0, 4.0),
         measured_range=(0.0, 4.0),

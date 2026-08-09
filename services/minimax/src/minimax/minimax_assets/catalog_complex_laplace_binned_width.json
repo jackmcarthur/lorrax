@@ -48,7 +48,7 @@
  },
  "provenance": {
   "tool": "tools/generate_binned_width_assets.py",
-  "tool_sha256": "68b20bd0edf05fc3d9a47ed57d11b8f8f9806ea13bd4eabf1377cd8471ba33d5",
+  "tool_sha256": "ec4a777263893d59fc358ffc4781e509f719eb4076b38dd95d5209b142bb2d10",
   "shares_with": "tools/generate_imag_minimax_assets.py",
   "numpy": "2.4.3",
   "scipy": "1.17.1",

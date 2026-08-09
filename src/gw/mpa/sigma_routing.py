@@ -192,10 +192,18 @@ SHIPPED_WIDTH_BETA_MAX = 1.0
 #: ``Re Omega`` are the bare-Coulomb tail, not physics.  On the corrected
 #: ``W_c`` refit every pole narrows by 80-90x.  The CLAUSE and its
 #: certificate are untouched by this -- they are properties of the rule and
-#: the target, and no pole field enters either -- but WHETHER THE SHIPPED
-#: ``beta <= 1`` CLAUSE ALREADY SUFFICES on the narrowed field is an open
-#: measurement, and the binned clause may be a robustness asset rather than
-#: a necessity.  Do not quote the numbers above as production demand.
+#: the target, and no pole field enters either.
+#:
+#: RE-MEASURED ON THE W_c FIELD, AND THE ANSWER IS THAT THE SHIPPED CLAUSE
+#: SUFFICES.  On ``mpa_fit_np8_wc.h5`` the width split returns **43 leaves
+#: on pole 7** and 40 on pole 0 (val/+omega branch), against the shipped
+#: clause's own ceiling of 512 -- an order of magnitude of headroom, where
+#: the defective store demanded 1312 and blew through it.  So this clause
+#: is a ROBUSTNESS ASSET AND NOT A NECESSITY for Si: it still buys a real
+#: ~6x in tau nodes (pole 0 5541 -> 885, pole 7 1393 -> 245 at r = 4), and
+#: it is the headroom for wider-Gamma physics -- metals, and any field the
+#: fitter can produce whose widths span more than the shipped clause can
+#: bisect -- but nothing on the Si path is blocked without it.
 #:
 #: Bin the widths at a fixed ratio ``r`` FIRST and the same two facts
 #: give a pane-level bound directly: ``pade_fit``'s fourth guard puts

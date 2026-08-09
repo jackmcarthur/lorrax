@@ -20,10 +20,14 @@ because it is what makes this campaign survive the defect: every number
 this tool certifies is a supremum of an error functional over a
 ``(u, beta)`` rectangle, and NO POLE FIELD ENTERS IT.  The clause, its
 derivation, the 30 entries and their band sups are properties of the rule
-and the target alone.  What the defect DOES put in question is whether the
-shipped ``beta <= 1`` clause already suffices on the narrowed field -- i.e.
-whether this clause is a NECESSITY or a ROBUSTNESS ASSET -- and that is an
-open measurement on the ``W_c`` refit, not a property of anything here.
+and the target alone.  What the defect DID put in question -- whether the
+shipped ``beta <= 1`` clause already suffices on the narrowed field -- has
+since been measured on ``mpa_fit_np8_wc.h5``, and it does: 43 leaves on
+pole 7 and 40 on pole 0 against that clause's own 512 ceiling.  So this
+campaign ships a ROBUSTNESS ASSET rather than a necessity for Si.  It still
+buys ~6x in tau nodes on the real field, and it is the headroom for
+wider-Gamma physics (metals, and any field whose widths outrun what
+bisection can separate); nothing on the Si path is blocked without it.
 
 The pane count IS the cost, and the pane count is set by
 one inequality:
