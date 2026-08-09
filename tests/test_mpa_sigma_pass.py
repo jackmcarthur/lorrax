@@ -73,7 +73,7 @@ def _integrate_group(group, omega_vec, *, E_A, mask_A, B):
         for i in range(t_host.size):
             sig = _sigma_tau_scalar(
                 t_host[i], E_A=E_A, mask_A=mask_A & win.mask_A,
-                omega_operand=group.omega_operand, B=B, mask_B=group.mask_B,
+                omega_operand=group.omega_operand, B=B, mask_B=group.dense_mask_B(),
                 e_ref_a=win.E_ref_A, e_ref_b=win.E_ref_B)
             if win.project_code == 0:
                 s_re, s_im = np.asarray([[[sig]]]), None
@@ -413,7 +413,7 @@ def test_the_laplace_buckets_bound_the_interval_ratio():
     """A four-decade pole field costs a handful of buckets, not one per octave."""
     a = np.array([0.2647, 2.6, 23.09, 1112.0, 6451.0]) / RYD
     buckets = SP._laplace_buckets(
-        a, np.ones(a.shape, dtype=bool), e_lo=0.3464 / RYD,
+        a, e_lo=0.3464 / RYD,
         e_hi=56.36 / RYD, omega_max=5.0 / RYD, r_max=100.0)
     assert 1 <= len(buckets) <= 5, buckets
     covered = np.zeros(a.shape, dtype=bool)

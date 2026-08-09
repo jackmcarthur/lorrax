@@ -104,6 +104,38 @@ the audited field's 0.26 eV -- 6.5 keV span that is three buckets, not
 fifteen: the bucket edge grows like ``r_max * x_min``, so each bucket is
 about two decades wide.
 
+HOW A PANE SAYS WHICH MODES IT HOLDS, AND WHAT THAT COST
+---------------------------------------------------------
+A pane's membership is an INDEX SET -- ascending flat indices into the
+``(n_q, N_mu, N_mu)`` pole field -- and not a boolean of that shape.  The
+difference is not stylistic.  The width clause partitions the
+non-crossing branch into ~218 panes on the audited field; at 81.4 MB per
+full-size boolean that is **17.8 GB of masks**, which the 2026-08-09
+memory row measured as the whole of a pass's excess over the two-point
+path (~24 GB resident to describe a 4.55 GB pole slab).  As index sets the
+same partition costs one index per LIVE mode across every pane together,
+because the panes partition the live set: 4 bytes x 79.2 million wide
+modes = 0.32 GB, and the planner's own arithmetic stops touching the
+81-million-element field once per pane and starts touching each pane's own
+values.
+
+What this change is NOT is a cost fix for the tau loop, and the
+measurement says so plainly.  The mask-dependent stage of a tau node --
+building ``W(tau) = B e^{-i(Omega - E_ref)tau}`` over the field -- is
+4.6 to 11.0 ms across runs at production shapes, against a node of 139 to
+175 ms measured on a SOLO A100 (nid001044, 2026-08-09); the rest is the
+``G(tau)`` formation, the k-axis transforms and the band projection, none
+of which know a mask exists.  The direct form of the same statement: the
+kernel measures the same wall at ``mask=all`` as at ``mask=1/218`` and at
+``mask=1/2000``.  A pane at 1/218 occupancy therefore costs what a full
+one costs; the node runs at 2.4 TFLOP/s fp64, a quarter of that card's
+non-tensor peak, so the "0.4 % utilization" of the three-way table is a
+fraction of MODES and not a fraction of the machine.  What stands between
+this path and the two-point floor is the PANE COUNT, and that is the
+owner's registered row (a slab-aware width clause).  Nothing here touches
+it: same panes, same membership, same nodes, same weights, bit-identical
+Sigma.
+
 WHAT THIS MODULE DOES NOT DO
 -----------------------------
 It does not unfold the store's q axis.  A fit store written on the symmetry
@@ -134,6 +166,7 @@ __all__ = [
     "WindowGroup",
     "combine_pass_partials",
     "compute_mpa_sigma_c_omega_grid",
+    "flat_index_dtype",
     "format_pass_report",
     "narrow_pole_threshold_ry",
     "plan_branch_groups",
@@ -167,7 +200,22 @@ class WindowGroup:
     window refine it by comparing ``Omega_q`` against a threshold.  That
     comparison is a real-number one and does not survive a complex pole
     field, so on this path the refinement is done here, on the host, and
-    each group ships an explicit mask with ``mask_B_mode='all'`` windows.
+    each group ships an explicit selection with ``mask_B_mode='all'``
+    windows.
+
+    THE SELECTION IS AN INDEX SET, NOT A MASK, AND THAT IS THE WHOLE
+    POINT OF THIS CLASS.  A pane's membership used to be a full-size
+    ``(n_q, N_mu, N_mu)`` boolean -- 81.4 MB on the production deck --
+    and the width clause demands ~218 panes on the non-crossing branch,
+    so the planner held **17.8 GB of masks** whose every byte but one in
+    218 was ``False``.  ``idx_B`` is the same membership written as
+    ascending flat indices into that field, so the planner's footprint is
+    ``sum(live) * itemsize`` -- one index per live mode across ALL panes
+    together, because the panes partition the live set -- rather than
+    ``panes * 81.4 MB``.  Nothing about WHICH modes are in a pane changes;
+    :meth:`dense_mask_B` reconstructs the identical boolean whenever a
+    consumer genuinely needs one, and exactly one such mask is alive at a
+    time.
 
     ``omega_operand`` is what the tau kernel gets in its ``Omega_q`` slot:
     the REAL ``Re Omega`` for a legacy-routed group (which is what makes
@@ -177,11 +225,24 @@ class WindowGroup:
 
     name: str
     windows: list
-    mask_B: np.ndarray
+    idx_B: np.ndarray
+    field_shape: tuple
     omega_operand: np.ndarray
     n_modes: int
     b_mass: float
     provenance: str
+
+    def dense_mask_B(self):
+        """The identical boolean this group used to carry, rebuilt on call.
+
+        Kept because two consumers still want a dense selector and both
+        are bounded: the device tau loop, which needs ONE selector
+        resident per group and never a second, and the planning tests,
+        whose fields are hundreds of modes rather than eighty million.
+        It is a method and not an attribute so that materializing 81.4 MB
+        is something a caller does on purpose.
+        """
+        return _dense_from_index(self.idx_B, self.field_shape)
 
 
 @dataclass
@@ -341,8 +402,13 @@ def refuse_wedge_pole_slab(n_q_store, n_k_tot):
         f"{int(n_k_tot)}).")
 
 
-def _laplace_buckets(a_ry, mask, *, e_lo, e_hi, omega_max, r_max):
+def _laplace_buckets(a_values, *, e_lo, e_hi, omega_max, r_max):
     """Geometric buckets in ``Re Omega`` with bounded Laplace ratio.
+
+    ``a_values`` is the ``Re Omega`` of the modes being bucketed -- the
+    gathered values of ONE selection, not the whole field beside a mask.
+    Only their min and max enter, which is why the index representation
+    costs this function nothing.
 
     Each bucket's sign-definite window will span ``x_min ~ e_lo + a_lo -
     omega_max`` to ``x_max ~ e_hi + a_hi + omega_max``; the bucket edge is
@@ -351,15 +417,14 @@ def _laplace_buckets(a_ry, mask, *, e_lo, e_hi, omega_max, r_max):
     a field spanning four decades of pole position needs a handful of
     buckets rather than one per octave.
 
-    Returns a list of ``(a_lo, a_hi)`` closed intervals covering the masked
-    values, or ``[]`` when the mask is empty.
+    Returns a list of ``(a_lo, a_hi)`` closed intervals covering the given
+    values, or ``[]`` when there are none.
     """
-    a = np.asarray(a_ry, dtype=np.float64)
-    m = np.asarray(mask, dtype=bool)
-    if not m.any():
+    a = np.asarray(a_values, dtype=np.float64)
+    if a.size == 0:
         return []
-    a_min = float(np.min(a, where=m, initial=np.inf))
-    a_max = float(np.max(a, where=m, initial=-np.inf))
+    a_min = float(np.min(a))
+    a_max = float(np.max(a))
     r_max = float(r_max)
     out = []
     lo = a_min
@@ -392,14 +457,33 @@ def _laplace_buckets(a_ry, mask, *, e_lo, e_hi, omega_max, r_max):
 #: beta_p = Gamma/(e_lo + a) < 1 per pole always, but a PANE of such
 #: poles spanning ratio r has beta ~ r, so clause-satisfying panes need
 #: r -> 1 and a continuum of near-45-degree widths partitions into
-#: O(100) panes.  Each leaf is a full-size (n_q, N_mu, N_mu) bool mask
-#: (81.4 MB on the production deck): 208 of them is ~17 GB, bounded and
-#: survivable, and each becomes one cheap single-window Laplace group.
-#: The ceiling exists for the DIVERGENT regime the 2026-08-09 profile
-#: measured -- the floored predicate demanding 2^16 leaves and killing
-#: a 230 GB node -- where the count grows without a clause being
-#: satisfiable at all.  512 = the measured demand with 2.5x headroom,
-#: ~42 GB of masks worst case, still a third of the node.
+#: O(100) panes.
+#:
+#: THE CEILING WAS RE-DERIVED WHEN THE PANES STOPPED BEING MASKS, and
+#: the old number was refusing real physics.  Each leaf USED TO BE a
+#: full-size (n_q, N_mu, N_mu) bool mask (81.4 MB on the production
+#: deck), so 512 of them was ~42 GB and the ceiling was a MEMORY guard
+#: sized against a 230 GB node.  A leaf now costs: its slice of the
+#: pass's ONE index array (4 bytes per live mode, and the leaves
+#: partition the live set, so that total does not grow with the leaf
+#: count at all), plus its plan -- one mask_A boolean per window over
+#: the A-side shape (nk x nb = 6.4 kB on the production deck), the
+#: window's nodes at 32 bytes each, and the group object.  That is
+#: ~8-10 kB per pane at production shapes, so 512 panes cost ~5 MB
+#: where they used to cost 42 GB, and memory has stopped being the
+#: reason for any number here.
+#:
+#: What the ceiling bounds NOW is the recursion, and through it the
+#: cost: a field that DEFEATS the termination argument bisects to the
+#: depth-16 cap, and each of those 2^16 leaves is a certified rule
+#: BUILT (a table lookup or a minimax solve) and a tau-node run at a
+#: measured 0.165 s per node that does not fall when the leaf is small.
+#: 8192 = 6.2x the largest demand a real field has produced (pole 7 of
+#: the si_mpa_0808 n_p = 8 fit: 1312 panes on one Laplace bucket
+#: spanning Gamma = [1.84e-2, 4.49e+2] Ry over 81 360 063 modes, which
+#: the 512 ceiling refused and which is not a pathology but the tail
+#: term's real width spread), 8x below the 2^16 the recursion can
+#: structurally reach, and ~74 MB of plan at production shapes.
 #:
 #: OWNER ROW, registered here because this constant is where the cost
 #: shows up: whether the slab width clause should stay the per-pole
@@ -407,11 +491,15 @@ def _laplace_buckets(a_ry, mask, *, e_lo, e_hi, omega_max, r_max):
 #: dispatch cost) or become slab-aware (beta <= r for a width-binned
 #: pane, derivation as above) is the routing design's call, not this
 #: guard's.
-MAX_WIDTH_SPLIT_LEAVES = 512
+MAX_WIDTH_SPLIT_LEAVES = 8192
 
 
-def _refuse_width_split_explosion(n_leaves, mask, gamma_ry):
+def _refuse_width_split_explosion(n_leaves, gamma_values):
     """Refuse a width split that is diverging, with the field statistics.
+
+    ``gamma_values`` is the bucket's OWN widths -- the gathered values of
+    the modes being split, which is what the index representation makes
+    cheap to hand around; the count in the message is their number.
 
     The FALSE case this guards was measured, not imagined: the first
     end-to-end MPA Sigma dispatch put the split's termination clause on
@@ -421,25 +509,36 @@ def _refuse_width_split_explosion(n_leaves, mask, gamma_ry):
     geometry terminate; this guard is for the field NOBODY has met yet,
     and it converts "the node died six minutes in" into a one-line
     refusal naming what to look at.
+
+    WHAT THE GUARD NOW BOUNDS.  With panes carried as index sets a
+    diverging split no longer runs a node out of memory -- 2^16 leaves
+    of an 81-million-mode field still cost one index per mode.  It runs
+    it out of TIME instead: each leaf is a certified rule of its own and
+    a tau-node run of its own, at a measured 0.165 s per node that does
+    not fall when the leaf is small.  Same ceiling, same value, a cost
+    that changed its units.
     """
     if int(n_leaves) <= MAX_WIDTH_SPLIT_LEAVES:
         return
-    g = np.asarray(gamma_ry, dtype=np.float64)
-    m = np.asarray(mask, dtype=bool)
-    g_lo, g_hi = _stats(g, m)
+    g = np.asarray(gamma_values, dtype=np.float64)
+    g_lo = float(np.min(g)) if g.size else np.inf
+    g_hi = float(np.max(g)) if g.size else -np.inf
+    n_modes = int(g.size)
     raise RuntimeError(
         f"MPA Sigma window planning: the width split of one Laplace "
         f"bucket returned {int(n_leaves)} leaves against a ceiling of "
-        f"{MAX_WIDTH_SPLIT_LEAVES}.  Each leaf holds a full-size "
-        f"(n_q, N_mu, N_mu) boolean mask, so a diverging split is an "
-        f"out-of-memory kill wearing a planning stage's clothes -- the "
-        f"2026-08-09 profile measured ~2 800 live masks at a 230 GB "
-        f"node's death.  This bucket spans Gamma = [{g_lo:.3e}, "
-        f"{g_hi:.3e}] Ry over {int(np.count_nonzero(m))} modes; a split "
+        f"{MAX_WIDTH_SPLIT_LEAVES}.  Each leaf is a certified rule and a "
+        f"tau-node run of its own, at a measured 0.165 s per node that "
+        f"does not fall when the leaf is small -- and when the leaves "
+        f"were dense masks instead of index sets this same divergence "
+        f"was an out-of-memory kill wearing a planning stage's clothes "
+        f"(the 2026-08-09 profile measured ~2 800 live masks at a 230 GB "
+        f"node's death).  This bucket spans Gamma = [{g_lo:.3e}, "
+        f"{g_hi:.3e}] Ry over {n_modes} modes; a split "
         f"this deep means the width clause cannot be satisfied by "
         f"splitting at all (the Laplace edge is pinned far below the "
         f"widths), which is a property of the pole field worth looking "
-        f"at, not one worth 2^16 masks.")
+        f"at, not one worth 2^16 panes.")
 
 
 #: Ceiling on ``Gamma_hi/Gamma_lo`` within one CROSSING pane.  The
@@ -457,6 +556,36 @@ def _refuse_width_split_explosion(n_leaves, mask, gamma_ry):
 CROSSING_WIDTH_RATIO_MAX = 4.0
 
 
+def _geometric_width_bins_sorted(g_sorted, idx_sorted, *,
+                                 r_max=CROSSING_WIDTH_RATIO_MAX):
+    """:func:`_geometric_width_bins` on a pane already sorted by width.
+
+    Same partition, same order, no full-field temporaries: with
+    ``g_sorted`` ascending, ``np.digitize``'s bins are contiguous runs
+    and ``searchsorted`` on the same edges names their boundaries.  The
+    bins come back as slices of ``idx_sorted``, so the whole partition
+    costs one index array, not one full-size boolean per bin.
+    """
+    if idx_sorted.size == 0:
+        return []
+    g_lo = float(g_sorted[0])
+    g_hi = float(g_sorted[-1])
+    if not (g_lo > 0.0) or g_hi <= g_lo * float(r_max):
+        return [idx_sorted]
+    n_bins = int(np.ceil(np.log(g_hi / g_lo) / np.log(float(r_max))))
+    edges = g_lo * float(r_max) ** np.arange(1, n_bins)
+    # digitize's bin b is [edges[b-1], edges[b]) -- left-closed -- which
+    # is exactly what side='left' names on an ascending array.
+    cuts = ([0] + [int(c) for c in np.searchsorted(g_sorted, edges, side="left")]
+            + [int(idx_sorted.size)])
+    out = []
+    for b in range(n_bins):
+        lo, hi = cuts[b], cuts[b + 1]
+        if hi > lo:
+            out.append(idx_sorted[lo:hi])
+    return out
+
+
 def _geometric_width_bins(gamma_ry, mask, *, r_max=CROSSING_WIDTH_RATIO_MAX):
     """Partition ``mask`` into width panes of bounded ratio -- directly.
 
@@ -466,23 +595,55 @@ def _geometric_width_bins(gamma_ry, mask, *, r_max=CROSSING_WIDTH_RATIO_MAX):
     clause-driven recursion did -- there is no predicate to satisfy,
     only a ratio to respect.  Single-width sets (and empty ones) come
     back whole.
+
+    THE BOOLEAN FACE OF :func:`_geometric_width_bins_sorted`, kept so the
+    partition property is testable on a mask the way it was written; the
+    planner calls the index-set core directly and never builds one of
+    these.
     """
     g = np.asarray(gamma_ry, dtype=np.float64)
     m = np.asarray(mask, dtype=bool)
     if not m.any():
         return []
-    g_lo, g_hi = _stats(g, m)
-    if not (g_lo > 0.0) or g_hi <= g_lo * float(r_max):
-        return [m]
-    n_bins = int(np.ceil(np.log(g_hi / g_lo) / np.log(float(r_max))))
-    edges = g_lo * float(r_max) ** np.arange(1, n_bins)
-    which = np.digitize(g, edges)
-    out = []
-    for b in range(n_bins):
-        sub = m & (which == b)
-        if sub.any():
-            out.append(sub)
-    return out
+    idx, g_v = _sorted_by_width(np.ravel(g), np.flatnonzero(np.ravel(m)))
+    return [_dense_from_index(p, m.shape)
+            for p in _geometric_width_bins_sorted(g_v, idx, r_max=r_max)]
+
+
+def _clause_safe_width_split_sorted(a_sorted, g_sorted, idx_sorted, *,
+                                    e_lo, omega_max, beta_max, depth=0):
+    """:func:`_clause_safe_width_split` on a pane already sorted by width.
+
+    THE SAME RECURSION, THE SAME PREDICATE, THE SAME LEAVES -- and none
+    of the full-size booleans.  The split is a threshold in ``Gamma``, so
+    on a width-sorted pane it is a CUT POINT: ``searchsorted`` names it,
+    the two halves are slices, and a leaf is a slice of one index array
+    rather than an 81.4 MB boolean of its own.  That is what turns the
+    planner's 218 panes from 17.8 GB into one index per live mode.
+
+    The predicate is character-for-character the one the boolean version
+    paid, including its two backstops (the depth cap and the equal-width
+    stop), because the leaves it names are the certified panes and this
+    change is a representation change.
+    """
+    if idx_sorted.size == 0:
+        return [idx_sorted]
+    a_lo = float(np.min(a_sorted))
+    g_lo = float(g_sorted[0])
+    g_hi = float(g_sorted[-1])
+    x_min = max(e_lo + a_lo - omega_max, _X_FLOOR_RY)
+    if g_hi <= float(beta_max) * x_min or depth >= 16 or g_hi <= g_lo:
+        return [idx_sorted]
+    cut = float(np.sqrt(g_lo * g_hi))
+    k = int(np.searchsorted(g_sorted, cut, side="right"))   # g <= cut
+    if k == 0 or k == idx_sorted.size:
+        return [idx_sorted]                 # one width; nothing to separate
+    return (_clause_safe_width_split_sorted(
+                a_sorted[:k], g_sorted[:k], idx_sorted[:k], e_lo=e_lo,
+                omega_max=omega_max, beta_max=beta_max, depth=depth + 1)
+            + _clause_safe_width_split_sorted(
+                a_sorted[k:], g_sorted[k:], idx_sorted[k:], e_lo=e_lo,
+                omega_max=omega_max, beta_max=beta_max, depth=depth + 1))
 
 
 def _clause_safe_width_split(a_ry, gamma_ry, mask, *, e_lo, omega_max,
@@ -519,25 +680,22 @@ def _clause_safe_width_split(a_ry, gamma_ry, mask, *, e_lo, omega_max,
     trip the clause.  The termination ARGUMENT (Gamma <= a) only holds
     with the aligned predicate; the depth cap and the leaf ceiling at
     the call site are the backstops for a field that defeats it.
+
+    THE BOOLEAN FACE OF :func:`_clause_safe_width_split_sorted`.  The
+    planner works in index sets and calls the core; this signature is
+    kept because it is the one the OOM fixture's cells were written
+    against, and those cells are the executable memory of a 230 GB node's
+    death -- they must keep testing the real predicate, not a paraphrase
+    of it.
     """
-    a = np.asarray(a_ry, dtype=np.float64)
-    g = np.asarray(gamma_ry, dtype=np.float64)
-    a_lo, _ = _stats(a, mask)
-    g_lo, g_hi = _stats(g, mask)
-    x_min = max(e_lo + a_lo - omega_max, _X_FLOOR_RY)
-    if g_hi <= float(beta_max) * x_min or depth >= 16 or g_hi <= g_lo:
-        return [mask]
-    cut = float(np.sqrt(g_lo * g_hi))
-    lower = mask & (g <= cut)
-    upper = mask & (g > cut)
-    if not lower.any() or not upper.any():
-        return [mask]                       # one width; nothing to separate
-    return (_clause_safe_width_split(a, g, lower, e_lo=e_lo,
-                                     omega_max=omega_max, beta_max=beta_max,
-                                     depth=depth + 1)
-            + _clause_safe_width_split(a, g, upper, e_lo=e_lo,
-                                       omega_max=omega_max,
-                                       beta_max=beta_max, depth=depth + 1))
+    a = np.ravel(np.asarray(a_ry, dtype=np.float64))
+    g = np.ravel(np.asarray(gamma_ry, dtype=np.float64))
+    m = np.asarray(mask, dtype=bool)
+    idx, g_v = _sorted_by_width(g, np.flatnonzero(np.ravel(m)))
+    parts = _clause_safe_width_split_sorted(
+        a[idx], g_v, idx, e_lo=e_lo, omega_max=omega_max,
+        beta_max=beta_max, depth=depth)
+    return [_dense_from_index(p, m.shape) for p in parts]
 
 
 def _stats(arr, mask):
@@ -545,6 +703,47 @@ def _stats(arr, mask):
     a = np.asarray(arr, dtype=np.float64)
     return (float(np.min(a, where=mask, initial=np.inf)),
             float(np.max(a, where=mask, initial=-np.inf)))
+
+
+# ---------------------------------------------------------------------------
+#  The compact pane index -- the representation this module's planner runs
+#  on, and the reason it no longer needs 17.8 GB to describe 218 panes.
+# ---------------------------------------------------------------------------
+
+def flat_index_dtype(n_flat):
+    """The narrowest integer that can address ``n_flat`` modes.
+
+    A pane index costs 4 bytes per live mode on any field with fewer than
+    2^31 modes, which the production deck (64 x 1128 x 1128 = 81 432 576)
+    is by a factor of 26.  Larger fields fall back to 8 bytes rather than
+    wrapping, because a silently wrapped index is a pane that quietly
+    contains the wrong modes -- the one failure class this whole module
+    refuses to leave to chance.
+    """
+    return np.int32 if int(n_flat) < (1 << 31) else np.int64
+
+
+def _sorted_by_width(g_flat, idx):
+    """``(idx, gamma)`` for one selection, sorted ascending in ``Gamma``.
+
+    Every splitter in this planner cuts on ``Gamma`` -- the clause-safe
+    recursion at a geometric mean, the crossing panes at fixed ratio
+    edges -- so sorting once turns every later split into a slice.  The
+    sort is stable, so equal widths keep their field order and the
+    partition is reproducible run to run.
+    """
+    ix = np.asarray(idx, dtype=np.int64)
+    g_v = np.asarray(g_flat, dtype=np.float64)[ix]
+    order = np.argsort(g_v, kind="stable")
+    return ix[order], g_v[order]
+
+
+def _dense_from_index(idx, shape):
+    """The boolean an index set stands for -- built on purpose, one at a time."""
+    shape = tuple(int(x) for x in shape)
+    m = np.zeros(int(np.prod(shape)) if shape else 0, dtype=bool)
+    m[np.asarray(idx, dtype=np.int64)] = True
+    return m.reshape(shape)
 
 
 def _sigma_window(*, name, plan_t, plan_alpha, mask_A, e_ref_a, e_ref_b,
@@ -576,10 +775,18 @@ def _sigma_window(*, name, plan_t, plan_alpha, mask_A, e_ref_a, e_ref_b,
 
 
 def _mpa_groups_for_bucket(
-    *, a_ry, gamma_ry, bucket_mask, E_A_host, base_mask_A_host,
+    *, idx, a_v, g_v, E_A_host, base_mask_A_host,
     omega_max, space, neg_omega_half, edge_factor, rel_tol, max_nodes,
 ):
-    """The up-to-three MPA windows serving one ``Re Omega`` bucket."""
+    """The up-to-three MPA windows serving one ``Re Omega`` bucket.
+
+    ``idx`` is the pane's flat index set and ``a_v``/``g_v`` its gathered
+    ``(Re Omega, Gamma)``; every rule below is built from the SET's
+    extreme values exactly as before, and the classifier that separates
+    the crossing core from the deep slab is the same ``a <= T`` predicate
+    -- evaluated on ``a_v``, whose length is the pane's, rather than on
+    the whole field beside a mask.
+    """
     from . import sigma_routing as R
 
     neg = -1.0 if neg_omega_half else 1.0
@@ -587,8 +794,8 @@ def _mpa_groups_for_bucket(
     groups = []
 
     if not R.denominator_can_cross(space, bool(neg_omega_half)):
-        a_lo, a_hi = _stats(a_ry, bucket_mask)
-        _, g_hi = _stats(gamma_ry, bucket_mask)
+        a_lo, a_hi = float(np.min(a_v)), float(np.max(a_v))
+        g_hi = float(np.max(g_v))
         x_min = max(e_lo + a_lo, _X_FLOOR_RY)
         x_max = max(e_hi + a_hi + omega_max, x_min * (1.0 + 1.0e-9))
         t, alpha, rule = R.sign_definite_rule(
@@ -603,7 +810,7 @@ def _mpa_groups_for_bucket(
             provenance=(f"MPA sign-definite composite, {rule['n_panels']} "
                         f"panels, R={x_max / x_min:.3g}, beta={beta:.4f}, "
                         f"kappa0={rule['kappa0']:.6f}"))
-        groups.append((("single",), [win], bucket_mask))
+        groups.append((("single",), [win], idx))
         return groups
 
     R.refuse_edge_factor_below_envelope(edge_factor)
@@ -613,16 +820,17 @@ def _mpa_groups_for_bucket(
     # core is safe (the crossing rule is exact at any offset) and only
     # costs nodes; under-including would put a crossing pole under a
     # sign-definite rule, which is a wrong number rather than a slow one.
-    _, g_hi_all = _stats(gamma_ry, bucket_mask)
+    g_hi_all = float(np.max(g_v))
     z_edge = float(edge_factor) * g_hi_all
     T = omega_max + z_edge
 
-    cross = bucket_mask & (np.asarray(a_ry) <= T)
-    slab = bucket_mask & ~cross
+    in_core = np.asarray(a_v) <= T
+    cross_idx, cross_a, cross_g = idx[in_core], a_v[in_core], g_v[in_core]
+    slab_idx, slab_a, slab_g = idx[~in_core], a_v[~in_core], g_v[~in_core]
 
-    if cross.any():
-        a_lo, a_hi = _stats(a_ry, cross)
-        g_lo, g_hi = _stats(gamma_ry, cross)
+    if cross_idx.size:
+        a_lo, a_hi = float(np.min(cross_a)), float(np.max(cross_a))
+        g_lo, g_hi = float(np.min(cross_g)), float(np.max(cross_g))
         core_A = base_mask_A_host & (np.asarray(E_A_host) <= T)
         wins = []
         if core_A.any():
@@ -666,11 +874,11 @@ def _mpa_groups_for_bucket(
                             f"R={x_max / x_min:.3g}, beta={beta:.4f}, "
                             f"kappa0={rule['kappa0']:.6f}")))
         if wins:
-            groups.append((tuple(w.name for w in wins), wins, cross))
+            groups.append((tuple(w.name for w in wins), wins, cross_idx))
 
-    if slab.any():
-        a_lo, a_hi = _stats(a_ry, slab)
-        _, g_hi = _stats(gamma_ry, slab)
+    if slab_idx.size:
+        a_lo, a_hi = float(np.min(slab_a)), float(np.max(slab_a))
+        g_hi = float(np.max(slab_g))
         x_min = max(e_lo + a_lo - omega_max, z_edge, _X_FLOOR_RY)
         x_max = max(e_hi + a_hi, x_min * (1.0 + 1.0e-9))
         t, alpha, rule = R.sign_definite_rule(
@@ -684,7 +892,7 @@ def _mpa_groups_for_bucket(
             max_error=rule["rel_tol"],
             provenance=(f"MPA sign-definite composite, {rule['n_panels']} "
                         f"panels, R={x_max / x_min:.3g}, beta={beta:.4f}, "
-                        f"kappa0={rule['kappa0']:.6f}"))], slab))
+                        f"kappa0={rule['kappa0']:.6f}"))], slab_idx))
     return groups
 
 
@@ -759,6 +967,11 @@ def plan_branch_groups(
 
     a = np.asarray(a_ry, dtype=np.float64)
     g = np.asarray(gamma_ry, dtype=np.float64)
+    field_shape = tuple(int(x) for x in np.shape(a))
+    n_flat = int(np.prod(field_shape)) if field_shape else 0
+    ix_dtype = flat_index_dtype(n_flat)
+    a_flat = np.ravel(a)
+    g_flat = np.ravel(g)
     omega_max = (float(np.max(np.asarray(omega_nonneg_ry, dtype=np.float64)))
                  if np.size(omega_nonneg_ry) else 0.0)
     max_nodes = (R.DEFAULT_MAX_CROSSING_NODES if max_nodes is None
@@ -766,9 +979,13 @@ def plan_branch_groups(
     narrow, wide = split_pass_by_width(g, live_mask, xi_ry)
     mass = (np.abs(np.asarray(b_abs, dtype=np.float64))
             if b_abs is not None else None)
+    mass_flat = None if mass is None else np.ravel(mass)
 
     def _mass(mask):
         return 0.0 if mass is None else float(np.sum(mass, where=mask))
+
+    def _mass_idx(idx):
+        return 0.0 if mass_flat is None else float(np.sum(mass_flat[idx]))
 
     groups = []
     if narrow.any():
@@ -789,7 +1006,9 @@ def plan_branch_groups(
             log_tag=f"{log_tag} legacy-routed", print_fn=print_fn)
         if wins:
             groups.append(WindowGroup(
-                name="legacy", windows=wins, mask_B=narrow,
+                name="legacy", windows=wins,
+                idx_B=np.flatnonzero(np.ravel(narrow)).astype(ix_dtype),
+                field_shape=field_shape,
                 omega_operand=a, n_modes=int(np.count_nonzero(narrow)),
                 b_mass=_mass(narrow),
                 provenance=("two-point crossing machinery at "
@@ -798,13 +1017,25 @@ def plan_branch_groups(
                             "not distinguishable from real ones")))
 
     omega_complex = a - 1j * g
+    # THE ONE GATHER THIS PLANNER PERFORMS.  Everything after it works on
+    # the wide set's own values and its own index array: the bucket edges,
+    # the width panes, the rule statistics and the group membership.  The
+    # dense field is never compared against a mask again, and no pane ever
+    # allocates a boolean of its own -- which is the 17.8 GB the 2026-08-09
+    # memory row measured, and the reason a pass held ~24 GB to describe a
+    # 4.55 GB pole slab.
+    wide_idx = np.flatnonzero(np.ravel(wide)).astype(ix_dtype)
+    wide_a = a_flat[wide_idx]
+    wide_g = g_flat[wide_idx]
     for a_lo, a_hi in _laplace_buckets(
-            a, wide, e_lo=_stats(E_A_host, base_mask_A_host)[0],
+            wide_a, e_lo=_stats(E_A_host, base_mask_A_host)[0],
             e_hi=_stats(E_A_host, base_mask_A_host)[1],
             omega_max=omega_max, r_max=float(laplace_ratio_max)):
-        bucket = wide & (a >= a_lo) & (a <= a_hi)
-        if not bucket.any():
+        in_bucket = (wide_a >= a_lo) & (wide_a <= a_hi)
+        if not in_bucket.any():
             continue
+        bucket_idx = wide_idx[in_bucket]
+        bucket_g = wide_g[in_bucket]
         e_lo_A = _stats(E_A_host, base_mask_A_host)[0]
         # THE SPLIT RUNS ONLY WHERE A WINDOW WILL PAY ITS CLAUSE, at the
         # x_min THAT WINDOW WILL PAY.  This loop OOM-killed a 230 GB
@@ -847,30 +1078,39 @@ def plan_branch_groups(
             # the two-point order; the binning is direct (digitize on
             # log Gamma), so it cannot diverge -- there is no clause to
             # chase, only a ratio to respect.
-            subs = _geometric_width_bins(g, bucket)
+            b_idx, b_g = _sorted_by_width(g_flat, bucket_idx)
+            subs = _geometric_width_bins_sorted(b_g, b_idx)
         else:
-            subs = _clause_safe_width_split(
-                a, g, bucket, e_lo=e_lo_A, omega_max=0.0,
+            b_idx, b_g = _sorted_by_width(g_flat, bucket_idx)
+            subs = _clause_safe_width_split_sorted(
+                a_flat[b_idx], b_g, b_idx, e_lo=e_lo_A, omega_max=0.0,
                 beta_max=R.SHIPPED_WIDTH_BETA_MAX)
-            _refuse_width_split_explosion(len(subs), bucket, g)
+            _refuse_width_split_explosion(len(subs), bucket_g)
         for sub in subs:
-            for names, wins, mask in _mpa_groups_for_bucket(
-                    a_ry=a, gamma_ry=g, bucket_mask=sub, E_A_host=E_A_host,
+            sub_a = a_flat[sub]
+            sub_g = g_flat[sub]
+            for names, wins, idx in _mpa_groups_for_bucket(
+                    idx=sub, a_v=sub_a, g_v=sub_g, E_A_host=E_A_host,
                     base_mask_A_host=base_mask_A_host, omega_max=omega_max,
                     space=space, neg_omega_half=neg_omega_half,
                     edge_factor=edge_factor, rel_tol=rel_tol,
                     max_nodes=max_nodes):
-                g_sub_lo, g_sub_hi = _stats(g, sub)
+                g_sub_lo, g_sub_hi = float(np.min(sub_g)), float(np.max(sub_g))
+                # Ascending flat order inside the group: it is the order a
+                # dense mask would have handed the kernel, so the selector
+                # this group stands for is the identical object however it
+                # is later materialized or gathered.
+                idx = np.sort(idx).astype(ix_dtype)
                 groups.append(WindowGroup(
                     name=(f"mpa[a={a_lo * RYD_TO_EV:.3g}"
                           f"-{a_hi * RYD_TO_EV:.3g}eV,"
                           f"G={g_sub_lo * RYD_TO_EV:.3g}"
                           f"-{g_sub_hi * RYD_TO_EV:.3g}eV]"
                           f"{'+'.join(names)}"),
-                    windows=wins, mask_B=mask,
+                    windows=wins, idx_B=idx, field_shape=field_shape,
                     omega_operand=omega_complex,
-                    n_modes=int(np.count_nonzero(mask)),
-                    b_mass=_mass(mask),
+                    n_modes=int(idx.size),
+                    b_mass=_mass_idx(idx),
                     provenance="; ".join(w.provenance for w in wins)))
 
     stats = {
@@ -970,10 +1210,15 @@ def run_pass_branch(
 
     tau_kernel, tau_kernel_x = tau_kernels
     for grp in groups:
+        # ONE selector resident, and only while its group is integrating.
+        # The group carries an index set; the tau loop wants the boolean
+        # that index set stands for, so it is built here and dropped when
+        # the loop returns -- 81.4 MB at a time on the production deck
+        # instead of 218 of them held for the whole branch.
         _integrate_tau_windows_for_branch(
             windows=grp.windows, accumulator=accumulator, E_A=E_A,
             B_q=B_p, Omega_q=jnp.asarray(grp.omega_operand),
-            base_mask_B=jnp.asarray(grp.mask_B, dtype=bool),
+            base_mask_B=jnp.asarray(grp.dense_mask_B(), dtype=bool),
             psi_coh_xn=psi_coh_xn, psi_coh_yr=psi_coh_yr,
             psi_proj_xr=psi_proj_xr, psi_proj_yn=psi_proj_yn,
             tau_kernel=tau_kernel, tau_kernel_x=tau_kernel_x,
