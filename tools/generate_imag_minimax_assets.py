@@ -112,6 +112,50 @@ CENSUS_R_BUCKETS = (21.544346900318832, 46.41588833612777, 100.0)
 CENSUS_OMEGA_HAT = (5.836, 14.122, 16.006, 16.372, 39.284, 40.214)
 DEFAULT_ERROR_BOUNDS = (1.0e-6,)
 
+#: The census's x_min column (sec 3.1), verbatim, keyed by deck.  It is
+#: the highest precision that document carries, and it is what the beta
+#: selector's deck sweep scores against.
+CENSUS_X_MIN_RY = {
+    "hbn": 0.342664,
+    "cohsex": 0.141617,
+    "gnppm": 0.124953,
+    "bispinor": 0.122161,
+    "si_fast": 0.050916,
+    "si_test": 0.050916,
+    "si_bse": 0.049734,
+}
+
+#: The GN probe frequency every in-tree deck sets, and -- by C sec 7.1 --
+#: also the MPA protocol's far sampling line varpi_2 = 1 Ha.  One number
+#: serving two stages is why the fit stage's imaginary request set is the
+#: same beta grid as production's rather than a second one.
+PROBE_OMEGA_P_RY = 2.0
+
+#: WHY THIS TABLE EXISTS AND THE ROUNDED ONE DOES NOT SUFFICE.  Gate 0
+#: sec 9 warned that the beta grid is a specification in the deck's own
+#: omega-hat and that three decimals is a display precision.  The beta
+#: selector made that executable and it bit: scored at
+#: ``2 Ry / x_min``, hbn misses its nearest certified band by 32 bands,
+#: cohsex by 4.2 and si_fast/si_test by 2.9 -- only gnppm, bispinor and
+#: si_bse land inside.  These are the same seven decks at the precision
+#: the arithmetic actually produces.
+DECK_OMEGA_HAT = {
+    name: PROBE_OMEGA_P_RY / x_min
+    for name, x_min in CENSUS_X_MIN_RY.items()
+}
+
+#: The six distinct values, sorted.  ``si_fast`` and ``si_test`` share an
+#: x_min and therefore a beta; they differ only in R.
+FULL_PRECISION_OMEGA_HAT = tuple(sorted(set(DECK_OMEGA_HAT.values())))
+
+#: The fit stage's tier.  Build note V measured the evaluate->fit
+#: recovery floor here, and the campaign measured that a table at this
+#: tier moves it from 5.3e-08 to 2.2e-09 -- below the fit's own
+#: synthesis baseline, which is how a floor announces itself.  Production
+#: has never asked for a tier other than 1e-6 (C sec 2.6); this one is
+#: the fit stage's and nothing else's.
+FIT_STAGE_ERROR_BOUND = 1.0e-12
+
 # Shipping rule, theory plan section E: kappa0 <= 2 ships normally,
 # 2 < kappa0 <= 4 ships as a versioned exception, kappa0 > 4 is rejected
 # regardless of training error.
@@ -327,7 +371,32 @@ def _lp_blocks(dictionary, x, kappa_max):
 
 
 def _lp_l1(dictionary, x, g, tol, node_weights, kappa_max):
-    """min sum_l c_l |w_l|  s.t.  |resid| <= tol, kappa0 <= kappa_max."""
+    """min sum_l c_l |w_l|  s.t.  |resid| <= tol, kappa0 <= kappa_max.
+
+    WHY THIS PROGRAM IS WRITTEN IN PHYSICAL UNITS AND STAYS THERE, AND
+    WHY THAT PUTS A FLOOR UNDER THE TIER IT CAN REACH.  HiGHS judges
+    primal feasibility on an absolute scale of about 1e-7.  At the 1e-6
+    tier the residual budget is 5.5e-7, five times that -- tight, and it
+    works.  At the fit stage's 1e-12 tier the budget is 5.5e-13, which
+    the solver cannot distinguish from zero, so every weight vector
+    would look feasible and the answer would mean nothing.
+
+    Dividing the residual rows by ``tol`` fixes that in principle and
+    was tried: it makes those rows carry coefficients of order 1e6 while
+    the amplification rows stay of order ``R``, and the resulting 1e6:1
+    row imbalance made the program report INFEASIBLE at (R = 46.4,
+    beta = 16.006) -- a request the unscaled formulation solves in ten
+    nodes.  Trading a tier this route cannot reach for the tier
+    production actually asks for is a bad trade, so the scaling was
+    reverted and the measurement kept.
+
+    The consequence is a real boundary and not a preference: the
+    ``btv_minimax`` route serves 1e-6, and the fit stage's 1e-12 tier is
+    the ``positive_composite`` route's by construction.  That happens to
+    be the right split anyway -- the fit stage evaluates 2n_p samples
+    once, so it does not pay for nodes, and what it gains instead is the
+    beta envelope that lets an off-grid request be served at all.
+    """
 
     n = len(dictionary)
     a_re, a_im, a_kap = _lp_blocks(dictionary, x, kappa_max)
@@ -347,8 +416,21 @@ def _lp_l1(dictionary, x, g, tol, node_weights, kappa_max):
     return (v[:n] - v[n:2 * n]) + 1j * (v[2 * n:3 * n] - v[3 * n:4 * n])
 
 
-def _lp_minimax(support, x, g, kappa_max):
-    """min max|resid| over the support, still under the kappa0 cap."""
+def _grid_error(nodes, w, x, g):
+    """Max complex-modulus residual on the solver's own grid."""
+
+    fit = np.exp(-np.outer(x, np.asarray(nodes, dtype=np.float64))) @ \
+        np.asarray(w, dtype=np.complex128)
+    return float(np.max(np.abs(g - fit)))
+
+
+def _lp_minimax(support, x, g, kappa_max, scale=1.0):
+    """min max|resid| over the support, still under the kappa0 cap.
+
+    ``scale`` is accepted and ignored: the residual rows stay in
+    physical units for the reason ``_lp_l1`` records.  The argument is
+    kept so the call sites read the same as the program they mirror.
+    """
 
     n = len(support)
     a_re, a_im, a_kap = _lp_blocks(support, x, kappa_max)
@@ -393,10 +475,39 @@ def btv_rule(R, beta, target_error, kappa_max=KAPPA_NORMAL,
 
     R = float(R)
     tol = float(target_error) * float(margin)
-    dictionary = np.exp(np.linspace(np.log(0.01 / R), np.log(60.0),
-                                    int(n_dict)))
     x = solve_grid(R, n_grid)
     g = target(x, beta)
+
+    # THE RETRY LADDER, AND WHY A CERTIFIED GENERATOR NEEDS ONE.  HiGHS
+    # reported this program INFEASIBLE at (R = 100, beta ~ 39.28) with
+    # n_dict = 500 and feasible -- same rule, same support size, same
+    # sum|w| -- at 400, 512 and 600.  It is a numerical artefact of one
+    # dictionary size and not a boundary of the problem, and the first
+    # sweep of this campaign believed it: that entry shipped as a
+    # 566-node positive composite when an 8-node minimax rule existed.
+    # A refusal that depends on a discretisation the caller never chose
+    # is not a refusal, so infeasibility is only believed after the
+    # ladder, and the ledger records which rung answered.
+    sizes = [int(n_dict)] + [int(n_dict) + d for d in (-100, 12, 100)]
+    best, used, retries = None, int(n_dict), 0
+    for attempt, size in enumerate(sizes):
+        dictionary = np.exp(np.linspace(np.log(0.01 / R), np.log(60.0),
+                                        size))
+        best = _btv_rounds(dictionary, x, g, tol, kappa_max, rounds)
+        if best is not None:
+            used, retries = size, attempt
+            break
+    if best is None:
+        return None
+    dictionary = np.exp(np.linspace(np.log(0.01 / R), np.log(60.0), used))
+
+    t_s, w_s = best
+    return _btv_finish(t_s, w_s, x, g, tol, kappa_max, prune_tries,
+                       dictionary, used, retries, n_grid, rounds)
+
+
+def _btv_rounds(dictionary, x, g, tol, kappa_max, rounds):
+    """Reweighted-L1 rounds; the smallest admissible support, or None."""
 
     node_weights = np.ones(len(dictionary))
     best = None
@@ -409,23 +520,38 @@ def btv_rule(R, beta, target_error, kappa_max=KAPPA_NORMAL,
         if peak <= 0.0:
             break
         support = dictionary[mag > 1.0e-6 * peak]
-        w_s, err = _lp_minimax(support, x, g, kappa_max)
-        if w_s is not None and err <= tol:
-            if best is None or len(support) < len(best[0]):
-                best = (support, w_s)
+        w_s, err = _lp_minimax(support, x, g, kappa_max, tol)
+        if w_s is None or err > tol:
+            # THE POLISH IS AN OPTIMISATION, NOT THE FEASIBILITY PROOF.
+            # The L1 program already carries |resid| <= tol and the
+            # amplification cap as constraints, so its own solution is
+            # admissible by construction; only the thresholding can lose
+            # that, and when it does the honest move is to keep the
+            # weights the feasible program returned rather than to
+            # report the whole request infeasible.  Without this the
+            # sweep refuses points its own first round had already
+            # solved -- which is what (R = 100, beta ~ 39.28) was.
+            keep = mag > 1.0e-6 * peak
+            support, w_s = dictionary[keep], w[keep]
+            err = _grid_error(support, w_s, x, g)
+        if err <= tol and (best is None or len(support) < len(best[0])):
+            best = (support, w_s)
         node_weights = 1.0 / (mag + max(1.0e-3 * peak, 1.0e-300))
-    if best is None:
-        return None
+    return best
 
-    # Greedy cardinality prune: drop the least-weighted node, keep the
-    # drop only if the exact minimax LP still fits under the tolerance.
-    t_s, w_s = best
+
+def _btv_finish(t_s, w_s, x, g, tol, kappa_max, prune_tries, dictionary,
+                used, retries, n_grid, rounds):
+    """Greedy cardinality prune, then the record of how it was solved."""
+
+    # Drop the least-weighted node, keep the drop only if the exact
+    # minimax LP still fits under the tolerance.
     dropping = True
     while dropping and len(t_s) > 2:
         dropping = False
         for i in np.argsort(np.abs(w_s))[:int(prune_tries)]:
             cand = np.delete(t_s, i)
-            w_c, err = _lp_minimax(cand, x, g, kappa_max)
+            w_c, err = _lp_minimax(cand, x, g, kappa_max, tol)
             if w_c is not None and err <= tol:
                 t_s, w_s, dropping = cand, w_c, True
                 break
@@ -433,7 +559,8 @@ def btv_rule(R, beta, target_error, kappa_max=KAPPA_NORMAL,
     info = {
         "rule": "btv_minimax",
         "kappa0_bound": float(kappa_max),
-        "dictionary_size": int(n_dict),
+        "dictionary_size": int(used),
+        "dictionary_retries": int(retries),
         "dictionary_range": (float(dictionary[0]), float(dictionary[-1])),
         "solve_grid": int(n_grid),
         "solve_tolerance": float(tol),
@@ -620,7 +747,20 @@ def _error_token(value):
 
 
 def entry_filename(R, beta, error_bound):
-    return (f"{FAMILY}_R_{_token(R)}_b_{_token(beta, 4)}"
+    """The staged table's name, and the twelve decimals it must carry.
+
+    Beta gets TWELVE decimals, not four, and the reason is the campaign
+    this file exists for.  At four decimals a deck's own omega-hat and
+    the census's displayed rounding of it collide -- 16.006 and
+    16.00601826286684 are one filename -- so the two entries overwrite
+    each other and the catalog ends up describing bytes that were
+    solved somewhere else.  The name is the only place a staged table
+    records which request it answers, which makes it the recovery path
+    for a sweep that died before its catalog was written; a name that
+    cannot tell two requests apart is not a record.
+    """
+
+    return (f"{FAMILY}_R_{_token(R)}_b_{_token(beta, 12)}"
             f"_eps_{_error_token(error_bound)}.npz")
 
 
@@ -726,7 +866,19 @@ def provenance():
 
 
 def sweep(output_root, r_values, beta_values, error_bounds, prefer="btv",
-          verbose=True):
+          verbose=True, checkpoint=None):
+    """Solve, certify and stage the grid, one cell at a time.
+
+    ``checkpoint(entries, ledger, wall)`` is called after EVERY entry,
+    and the catalog is what it writes.  THE REASON IS A MEASURED ONE
+    FROM THE NEIGHBOURING CAMPAIGN: an all-or-nothing driver on the
+    damped_line ladder lost an hour of already-certified cells to a
+    single interruption near the top, because the tables were on disk
+    but nothing had recorded that they were certified.  Solving is the
+    expensive half and certifying is the irreversible half; neither
+    should be hostage to the cell after it.
+    """
+
     out_dir = Path(output_root) / FAMILY
     entries, ledger = [], []
     total_wall = 0.0
@@ -738,41 +890,13 @@ def sweep(output_root, r_values, beta_values, error_bounds, prefer="btv",
                 total_wall += wall
                 name = entry_filename(R, beta, error_bound)
                 write_table(out_dir / name, t, w, cert)
-                entry = {
-                    "family": FAMILY,
-                    "rule": info["rule"],
-                    "range_param": "R",
-                    "range_max": float(R),
-                    "beta_param": "omega_hat",
-                    "beta": float(beta),
-                    "beta_min": float(info.get("beta_min", beta)),
-                    "error_bound": float(error_bound),
-                    "error_metric": "linf_abs_complex_modulus_scaled",
-                    "node_count": int(cert["node_count"]),
-                    "max_error": float(cert["held_out_max_error"]),
-                    "real_part_max_error":
-                        float(cert["real_part_max_error"]),
-                    "kappa0": float(cert["kappa0"]),
-                    "kappa0_bound": float(info["kappa0_bound"]),
-                    "kappa0_tier": cert["kappa0_tier"],
-                    "sum_abs_w": float(cert["sum_abs_w"]),
-                    "moment_residual": float(cert["moment_residual"]),
-                    "moment_ceiling": float(cert["moment_ceiling"]),
-                    "rescale_max_error_ratio":
-                        float(cert["rescale_max_error_ratio"]),
-                    "beta_tolerance": float(cert["beta_tolerance"]),
-                    "certified": bool(cert["passes"]),
-                    "payload_sha256": cert["payload_sha256"],
-                    "beta_axis": info["beta_axis"],
-                    "file": f"{FAMILY}/{name}",
-                    "generation": {k: v for k, v in info.items()
-                                   if k not in ("rule", "kappa0_bound",
-                                                "beta_axis")},
-                }
-                entries.append(entry)
+                entries.append(_entry_record(
+                    R, beta, error_bound, info, cert, name))
                 ledger.append({"range_max": float(R), "beta": float(beta),
                                "error_bound": float(error_bound),
                                "attempts": attempts})
+                if checkpoint is not None:
+                    checkpoint(entries, ledger, total_wall)
     return entries, ledger, total_wall
 
 
@@ -854,6 +978,146 @@ def catalog_document(entries, ledger, total_wall):
     }
 
 
+def _entry_record(R, beta, error_bound, info, cert, name):
+    """One catalog row.  The single place a row's shape is written.
+
+    Both the sweep and the disk-adoption path build rows here, so a
+    recovered catalog and a freshly swept one cannot differ in shape --
+    which is the only way "adopted from disk" can be a provenance note
+    rather than a second format.
+    """
+
+    return {
+        "family": FAMILY,
+        "rule": info["rule"],
+        "range_param": "R",
+        "range_max": float(R),
+        "beta_param": "omega_hat",
+        "beta": float(beta),
+        "beta_min": float(info.get("beta_min", beta)),
+        "error_bound": float(error_bound),
+        "error_metric": "linf_abs_complex_modulus_scaled",
+        "node_count": int(cert["node_count"]),
+        "max_error": float(cert["held_out_max_error"]),
+        "real_part_max_error": float(cert["real_part_max_error"]),
+        "kappa0": float(cert["kappa0"]),
+        "kappa0_bound": float(info["kappa0_bound"]),
+        "kappa0_tier": cert["kappa0_tier"],
+        "sum_abs_w": float(cert["sum_abs_w"]),
+        "moment_residual": float(cert["moment_residual"]),
+        "moment_ceiling": float(cert["moment_ceiling"]),
+        "rescale_max_error_ratio":
+            float(cert["rescale_max_error_ratio"]),
+        "beta_tolerance": float(cert["beta_tolerance"]),
+        "certified": bool(cert["passes"]),
+        "payload_sha256": cert["payload_sha256"],
+        "beta_axis": info["beta_axis"],
+        "file": f"{FAMILY}/{name}",
+        "generation": {k: v for k, v in info.items()
+                       if k not in ("rule", "kappa0_bound", "beta_axis")},
+    }
+
+
+def _parse_entry_filename(name):
+    """``(R, beta, error_bound)`` back out of a staged table's name.
+
+    The filename is the only place a staged ``.npz`` records which
+    request it answers, so an interrupted sweep's tables are readable
+    without the catalog that never got written.  Tokens are the
+    generator's own: ``p`` for the decimal point, ``m``/``p`` for the
+    exponent sign.
+    """
+
+    stem = Path(name).stem
+    if not stem.startswith(f"{FAMILY}_R_"):
+        return None
+    try:
+        rest = stem[len(f"{FAMILY}_R_"):]
+        r_tok, rest = rest.split("_b_", 1)
+        b_tok, e_tok = rest.split("_eps_", 1)
+        mant, expo = e_tok.split("e", 1)
+        return (float(r_tok.replace("p", ".", 1).replace("p", "")),
+                float(b_tok.replace("p", ".", 1).replace("p", "")),
+                float(mant.replace("p", ".").replace("m", "-")
+                      + "e" + expo.replace("m", "-").replace("p", "+")))
+    except (ValueError, IndexError):
+        return None
+
+
+def adopt_staged(output_root, verbose=True):
+    """Rebuild catalog rows from tables already on disk.  No re-solving.
+
+    THE RECOVERY PATH THE NEIGHBOURING CAMPAIGN PAID FOR.  Solving is
+    the expensive half; a sweep that dies before writing its catalog has
+    the bytes but no record that they were certified, and re-solving to
+    recover a record is the wrong trade.  This reads each staged table,
+    certifies it, and reconstructs its row -- including which ROUTE made
+    it, which is not stored in the payload and is not guessed either:
+    the composite rule for that cell is rebuilt (it costs milliseconds)
+    and the payload digests are compared.  An exact digest match is a
+    proof of provenance; anything else is the minimax route.
+    """
+
+    root = Path(output_root)
+    rows = []
+    for path in sorted((root / FAMILY).glob("*.npz")):
+        parsed = _parse_entry_filename(path.name)
+        if parsed is None:
+            continue
+        R, beta, bound = parsed
+        t, w, _err, _kap = read_table(path)
+        cert = certify(t, w, R, beta, bound, kappa_max=KAPPA_EXCEPTION)
+        comp_t, comp_w, comp_info = composite_rule(R, beta, bound,
+                                                   beta_min=0.0)
+        is_comp = (payload_digest(comp_t, comp_w)
+                   == cert["payload_sha256"])
+        info = comp_info if is_comp else {
+            "rule": "btv_minimax", "kappa0_bound": KAPPA_NORMAL,
+            "beta_axis": "exact_entry_only", "beta_min": beta,
+            "adopted_from_disk": True}
+        info = dict(info)
+        info["adopted_from_disk"] = True
+        rows.append(_entry_record(R, beta, bound, info, cert, path.name))
+        if verbose:
+            print(f"  adopted {path.name}  {info['rule']:19s} "
+                  f"N={cert['node_count']:4d} "
+                  f"-> {'PASS' if cert['passes'] else cert['failures']}",
+                  flush=True)
+    return rows
+
+
+def _entry_key(entry):
+    """The identity of a catalog row: (R, beta, tier), at solve precision.
+
+    Rounded at 12 digits because that is the precision the generator's
+    own cache keys and the runtime's ``round(..., 12)`` already use; two
+    rows agreeing to twelve digits are the same request and the newer
+    one replaces the older rather than sitting beside it.
+    """
+
+    return (round(float(entry["range_max"]), 12),
+            round(float(entry["beta"]), 12),
+            float(entry["error_bound"]))
+
+
+def merge_entries(existing, fresh):
+    """Append ``fresh`` to ``existing``, replacing rows of equal identity.
+
+    Sorted by (tier, R, beta) so the file's order is a property of its
+    contents and a diff between two sweeps is readable.
+    """
+
+    merged = {_entry_key(e): e for e in existing}
+    replaced = sum(1 for e in fresh if _entry_key(e) in merged)
+    for entry in fresh:
+        merged[_entry_key(entry)] = entry
+    ordered = sorted(merged.values(),
+                     key=lambda e: (-float(e["error_bound"]),
+                                    float(e["range_max"]),
+                                    float(e["beta"])))
+    return ordered, replaced
+
+
 def recertify(output_root, verbose=True):
     """Re-derive every catalog field from the STAGED BYTES, not the solve.
 
@@ -911,16 +1175,52 @@ def main(argv=None):
     parser.add_argument("--r-values", type=float, nargs="+",
                         default=list(CENSUS_R_BUCKETS))
     parser.add_argument("--beta-values", type=float, nargs="+",
-                        default=list(CENSUS_OMEGA_HAT))
+                        default=None)
+    parser.add_argument("--beta-set", choices=("census", "fullprec"),
+                        default="census",
+                        help="'census' is the displayed three-decimal "
+                             "grid; 'fullprec' is 2 Ry / x_min for each "
+                             "deck, which is what a request actually "
+                             "carries. Ignored when --beta-values is "
+                             "given, so a shell can never lose digits "
+                             "the generator needs.")
     parser.add_argument("--error-bounds", type=float, nargs="+",
                         default=list(DEFAULT_ERROR_BOUNDS))
     parser.add_argument("--prefer", choices=("btv", "composite"),
                         default="btv")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--append", action="store_true",
+                        help="merge into the existing catalog instead of "
+                             "replacing it; rows of equal (R, beta, tier) "
+                             "are replaced, everything else is kept")
+    parser.add_argument("--adopt", action="store_true",
+                        help="rebuild catalog rows from the tables "
+                             "already staged on disk, without re-solving "
+                             "anything; the recovery path for a sweep "
+                             "that died before writing its catalog")
     parser.add_argument("--recertify", action="store_true",
                         help="re-score the staged tables and rewrite the "
                              "catalog without re-solving anything")
     args = parser.parse_args(argv)
+    if args.beta_values is None:
+        args.beta_values = list(
+            FULL_PRECISION_OMEGA_HAT if args.beta_set == "fullprec"
+            else CENSUS_OMEGA_HAT)
+
+    if args.adopt:
+        rows = adopt_staged(args.output_root, verbose=not args.quiet)
+        path = Path(args.output_root) / CATALOG_NAME
+        ledger = []
+        if path.exists():
+            prior = json.loads(path.read_text(encoding="utf-8"))
+            rows, _replaced = merge_entries(prior.get("tables", []), rows)
+            ledger = list(prior.get("sweep", {}).get("ledger", []))
+        doc = catalog_document(rows, ledger, 0.0)
+        path.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n",
+                        encoding="utf-8")
+        print(f"\nadopted {len(rows)} staged tables "
+              f"({doc['sweep']['certified']} certified)")
+        return 0 if doc["sweep"]["certified"] == len(rows) else 1
 
     if args.recertify:
         doc = recertify(args.output_root, verbose=not args.quiet)
@@ -933,19 +1233,43 @@ def main(argv=None):
           f"{len(args.beta_values)} beta x {len(args.error_bounds)} tier "
           f"= {len(args.r_values) * len(args.beta_values) * len(args.error_bounds)}"
           " entries", flush=True)
+    path = Path(args.output_root) / CATALOG_NAME
+    prior_tables, prior_ledger = [], []
+    if args.append and path.exists():
+        prior = json.loads(path.read_text(encoding="utf-8"))
+        prior_tables = prior.get("tables", [])
+        prior_ledger = list(prior.get("sweep", {}).get("ledger", []))
+    state = {"fresh": 0, "replaced": 0, "total": len(prior_tables)}
+
+    def _checkpoint(entries, ledger, wall):
+        merged, replaced = merge_entries(prior_tables, entries)
+        doc = catalog_document(merged, prior_ledger + ledger, wall)
+        tmp = path.with_suffix(".json.partial")
+        tmp.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n",
+                       encoding="utf-8")
+        tmp.replace(path)
+        state.update(fresh=len(entries), replaced=replaced,
+                     total=len(merged),
+                     certified=doc["sweep"]["certified"],
+                     by_rule=doc["sweep"]["by_rule"])
+
     entries, ledger, wall = sweep(
         args.output_root, args.r_values, args.beta_values,
-        args.error_bounds, prefer=args.prefer, verbose=not args.quiet)
-    doc = catalog_document(entries, ledger, wall)
-    path = Path(args.output_root) / CATALOG_NAME
-    path.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n",
-                    encoding="utf-8")
-    print(f"\nwrote {len(entries)} entries "
-          f"({doc['sweep']['certified']} certified) and {path.name} "
-          f"in {wall:.1f} s of solver time")
+        args.error_bounds, prefer=args.prefer, verbose=not args.quiet,
+        checkpoint=_checkpoint)
+    if not entries:
+        print("no entries generated")
+        return 1
+    doc = {"sweep": {"certified": state.get("certified", 0),
+                     "by_rule": state.get("by_rule", {})}}
+    print(f"\nwrote {state['fresh']} fresh entries "
+          f"({state['replaced']} replacing rows of equal identity); "
+          f"catalog now holds {state['total']} "
+          f"({state.get('certified', 0)} certified) "
+          f"after {wall:.1f} s of solver time")
     for rule, count in doc["sweep"]["by_rule"].items():
         print(f"  {rule:20s} {count}")
-    return 0 if doc["sweep"]["certified"] == len(entries) else 1
+    return 0 if state.get("certified", 0) == state["total"] else 1
 
 
 if __name__ == "__main__":
