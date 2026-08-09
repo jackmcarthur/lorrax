@@ -128,6 +128,7 @@ from common.units import RYD_TO_EV
 
 __all__ = [
     "DEFAULT_LAPLACE_RATIO_MAX",
+    "MAX_WIDTH_SPLIT_LEAVES",
     "PassRecord",
     "WindowGroup",
     "compute_mpa_sigma_c_omega_grid",
@@ -378,6 +379,51 @@ def _laplace_buckets(a_ry, mask, *, e_lo, e_hi, omega_max, r_max):
     return out                              # pragma: no cover - 128 decades
 
 
+#: Ceiling on the number of leaves one bucket's width split may return.
+#: Not a tuning knob: with the predicate aligned to the builder's own
+#: x_min (see the call site) a real field terminates in a handful of
+#: leaves, and each leaf is a full-size ``(n_q, N_mu, N_mu)`` boolean
+#: mask -- 81.4 MB on the Si production deck -- held live in the
+#: returned list.  64 leaves is ~5 GB of masks, an order below any
+#: node's memory; a field that asks for more is a field whose width
+#: clause cannot be satisfied by splitting, and it should say so in one
+#: line rather than accumulate masks until the OOM killer says it in
+#: none.
+MAX_WIDTH_SPLIT_LEAVES = 64
+
+
+def _refuse_width_split_explosion(n_leaves, mask, gamma_ry):
+    """Refuse a width split that is diverging, with the field statistics.
+
+    The FALSE case this guards was measured, not imagined: the first
+    end-to-end MPA Sigma dispatch put the split's termination clause on
+    an unreachable floor and the recursion bisected toward its depth-16
+    cap -- 2^16 leaves x 81.4 MB of mask each, a 230 GB node dead at
+    ~2 800 of them.  The predicate fix at the call site makes that
+    geometry terminate; this guard is for the field NOBODY has met yet,
+    and it converts "the node died six minutes in" into a one-line
+    refusal naming what to look at.
+    """
+    if int(n_leaves) <= MAX_WIDTH_SPLIT_LEAVES:
+        return
+    g = np.asarray(gamma_ry, dtype=np.float64)
+    m = np.asarray(mask, dtype=bool)
+    g_lo, g_hi = _stats(g, m)
+    raise RuntimeError(
+        f"MPA Sigma window planning: the width split of one Laplace "
+        f"bucket returned {int(n_leaves)} leaves against a ceiling of "
+        f"{MAX_WIDTH_SPLIT_LEAVES}.  Each leaf holds a full-size "
+        f"(n_q, N_mu, N_mu) boolean mask, so a diverging split is an "
+        f"out-of-memory kill wearing a planning stage's clothes -- the "
+        f"2026-08-09 profile measured ~2 800 live masks at a 230 GB "
+        f"node's death.  This bucket spans Gamma = [{g_lo:.3e}, "
+        f"{g_hi:.3e}] Ry over {int(np.count_nonzero(m))} modes; a split "
+        f"this deep means the width clause cannot be satisfied by "
+        f"splitting at all (the Laplace edge is pinned far below the "
+        f"widths), which is a property of the pole field worth looking "
+        f"at, not one worth 2^16 masks.")
+
+
 def _clause_safe_width_split(a_ry, gamma_ry, mask, *, e_lo, omega_max,
                              beta_max, depth=0):
     """Split a mode set by width until every part's width clause is inside.
@@ -396,6 +442,22 @@ def _clause_safe_width_split(a_ry, gamma_ry, mask, *, e_lo, omega_max,
     range is the octave split the theory's width buckets describe, and the
     exact ``Gamma_p`` is never rounded by it -- the buckets select rules,
     nothing else.
+
+    THE PREDICATE MUST BE THE BUILDER'S OWN x_min, and ``omega_max`` is
+    the caller's way of saying which builder.  The termination test
+    below compares ``Gamma_hi`` against ``beta_max * x_min`` with
+    ``x_min = max(e_lo + a_lo - omega_max, floor)``; hand it an
+    ``omega_max`` the window builder will not actually subtract and the
+    predicate lands on the 1e-12 floor whenever ``e_lo + a_lo <
+    omega_max``, where NO amount of splitting can satisfy it and the
+    recursion runs to its depth cap accumulating one full-size mask per
+    leaf.  That is not a hypothetical: it OOM-killed eleven Sigma
+    attempts before the call site learned to pass the non-crossing
+    builder's own ``omega_max = 0`` and to skip the split entirely on
+    crossing branches, whose windows floor x_min at z_edge and cannot
+    trip the clause.  The termination ARGUMENT (Gamma <= a) only holds
+    with the aligned predicate; the depth cap and the leaf ceiling at
+    the call site are the backstops for a field that defeats it.
     """
     a = np.asarray(a_ry, dtype=np.float64)
     g = np.asarray(gamma_ry, dtype=np.float64)
@@ -683,9 +745,43 @@ def plan_branch_groups(
         if not bucket.any():
             continue
         e_lo_A = _stats(E_A_host, base_mask_A_host)[0]
-        for sub in _clause_safe_width_split(
-                a, g, bucket, e_lo=e_lo_A, omega_max=omega_max,
-                beta_max=R.SHIPPED_WIDTH_BETA_MAX):
+        # THE SPLIT RUNS ONLY WHERE A WINDOW WILL PAY ITS CLAUSE, at the
+        # x_min THAT WINDOW WILL PAY.  This loop OOM-killed a 230 GB
+        # Perlmutter node eleven times before either condition was
+        # checked (measured 2026-08-09, memwatch profile at
+        # /pscratch/sd/j/jackm/mpa_oom_0809/): the predicate below used
+        # x_min = e_lo + a_lo - omega_max, which on the Si production
+        # deck is NEGATIVE (0.0255 + ~0.02 - 0.147 Ry), so x_min sat on
+        # the 1e-12 floor, beta = Gamma/1e-12 exceeded every clause, and
+        # the recursion bisected to its depth-16 cap -- 2^16 leaf masks
+        # of (n_q, N_mu, N_mu) bool = 81.4 MB each, 5.3 TB demanded, the
+        # node dead at ~230 GB with ~2 800 leaves live, invariant under
+        # n_p, layout, batch and the Sigma window because none of those
+        # touch the mask shape or the floored predicate.
+        #
+        # The repair is alignment, not a new heuristic, and it has two
+        # halves.  On a branch that CAN cross, every Laplace window the
+        # bucket builds floors its x_min at z_edge = edge_factor *
+        # Gamma_hi (see _mpa_groups_for_bucket), so beta <= 1/edge_factor
+        # STRUCTURALLY -- refuse_edge_factor_below_envelope already
+        # guards edge_factor >= 1/beta_max at the build -- and a width
+        # split cannot tighten a clause that cannot fire: the bucket
+        # passes through whole.  On a branch that CANNOT cross, the
+        # single window's own x_min is e_lo + a_lo with NO omega_max
+        # subtraction (the denominators are sign-definite; omega only
+        # widens x_max), so the predicate uses that same number --
+        # omega_max=0.0 below is that alignment, and with it the floor
+        # is unreachable and the recursion terminates the way its
+        # docstring argues (Gamma <= a per pole, so a wide-width
+        # sub-bucket has a deep Laplace edge of its own).
+        if R.denominator_can_cross(space, bool(neg_omega_half)):
+            subs = [bucket]
+        else:
+            subs = _clause_safe_width_split(
+                a, g, bucket, e_lo=e_lo_A, omega_max=0.0,
+                beta_max=R.SHIPPED_WIDTH_BETA_MAX)
+            _refuse_width_split_explosion(len(subs), bucket, g)
+        for sub in subs:
             for names, wins, mask in _mpa_groups_for_bucket(
                     a_ry=a, gamma_ry=g, bucket_mask=sub, E_A_host=E_A_host,
                     base_mask_A_host=base_mask_A_host, omega_max=omega_max,
