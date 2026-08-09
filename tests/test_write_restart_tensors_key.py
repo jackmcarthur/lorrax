@@ -237,6 +237,7 @@ def _persist(tmp_path, monkeypatch, *, key, precreate):
     thing the key controls.
     """
     import file_io
+    from gw.gw_config import ComputeMode
     from gw.gw_output import persist_w0_and_head
 
     calls = []
@@ -247,9 +248,15 @@ def _persist(tmp_path, monkeypatch, *, key, precreate):
     path = tmp_path / "isdf_tensors_144.h5"
     if precreate:
         path.write_bytes(b"")
+    # THE REAL ENUM, not a stand-in carrying one attribute.  This function's
+    # own control arm (below) exists to catch a guard that returns early for
+    # an unrelated reason, and a stub config missing an attribute is the
+    # example it names — so the mode here is the actual COHSEX member, which
+    # answers ``is_dynamic``, ``ppm_model`` and everything else the writer
+    # asks it exactly as a run would.
     cfg = types.SimpleNamespace(
         do_screened=True, write_restart_tensors=key,
-        compute_mode=types.SimpleNamespace(is_dynamic=False))
+        compute_mode=ComputeMode.COHSEX)
     persist_w0_and_head(
         object(), tensors_filename=str(path), head_resolver=_Resolver(),
         config=cfg, meta=types.SimpleNamespace(n_rmu=4), mesh_xy=None,

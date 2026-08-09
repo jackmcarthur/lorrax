@@ -296,30 +296,253 @@ class ComputeMode(str, enum.Enum):
     - ``COHSEX`` — static screened-exchange + Coulomb-hole.
     - ``GN_PPM`` — dynamic Σ_c(ω) via GN plasmon-pole (probe at iω_p).
     - ``HL_PPM`` — dynamic Σ_c(ω) via HL plasmon-pole (probe at real Ω).
+    - ``MPA`` — dynamic Σ_c(ω) from an n-pole multipole fit of W on a
+      double-parallel sample grid in the complex-ω plane (complex poles
+      Ω_p, residues B_p).  **DECLARED, NOT YET RUNNABLE** — see
+      :data:`UNIMPLEMENTED_MODES` and
+      :func:`refuse_unimplemented_compute_mode` below.
+
+    WHY THE VALUE IS SPELLED ``mpa`` AND NOT ``full_freq``.  Every value
+    on this axis names the *ansatz* for W's frequency dependence, not the
+    numerical machinery that follows from it: ``cohsex`` is "W at ω = 0",
+    ``gn_ppm`` / ``hl_ppm`` are "one plasmon pole, fitted this way".  The
+    next member of that series is "n poles, fitted to a sampled W", whose
+    name in the literature is the multipole approximation, so ``mpa`` is
+    the spelling that keeps the axis reading as one list of ansätze.
+
+    ``full_freq`` was the rejected alternative, and it was rejected for
+    two reasons rather than taste.  First, it names a *family* — contour
+    deformation, real-axis quadrature and MPA are all "full frequency" —
+    so a deck that set it would still have to say which one, which is a
+    second axis, which is precisely the thing the "single axis" wording
+    at the top of this docstring exists to prevent.  Second, it would
+    spend the good name: a genuinely numerical full-frequency Σ (no pole
+    model at all) is a plausible future member of this enum, and it
+    should be able to be called ``full_freq`` when it arrives instead of
+    finding the name already taken by a pole method.  The owner-facing
+    shorthand for this work is still "FF"; the deck key is ``mpa``.
     """
 
     X_ONLY = "x_only"
     COHSEX = "cohsex"
     GN_PPM = "gn_ppm"
     HL_PPM = "hl_ppm"
+    MPA = "mpa"
 
     @property
     def needs_screening(self) -> bool:
-        """True for COHSEX / GN-PPM / HL-PPM; False for bare X."""
+        """True for COHSEX / GN-PPM / HL-PPM / MPA; False for bare X."""
         return self is not ComputeMode.X_ONLY
 
     @property
     def is_dynamic(self) -> bool:
-        """True for GN-PPM / HL-PPM; False for static modes."""
-        return self in (ComputeMode.GN_PPM, ComputeMode.HL_PPM)
+        """True when the mode builds a Σ_c(ω) grid: GN/HL-PPM and MPA.
+
+        The honest reading is "this run has an ω axis", which is what the
+        consumers of this property want to know (the σ-cube layout gate,
+        ``qp_solver = fixed_point``'s ω-grid requirement, ``GWResults.
+        use_ppm``).  It is deliberately NOT the same question as "is this
+        a plasmon-pole model" — that one is :attr:`ppm_model`, and the
+        two questions differ for exactly one member, ``MPA``.
+        """
+        return self in (ComputeMode.GN_PPM, ComputeMode.HL_PPM,
+                        ComputeMode.MPA)
 
     @property
     def ppm_model(self) -> str | None:
-        """``'gn'`` for GN-PPM, ``'hl'`` for HL-PPM, else None."""
+        """``'gn'`` for GN-PPM, ``'hl'`` for HL-PPM, else None.
+
+        None for MPA as well as for the static modes: MPA is dynamic but
+        is not a plasmon-pole model, so any site that means "which of the
+        two two-point PPM fits" must ask THIS and handle None, never
+        ``is_dynamic`` with an ``else`` that assumes GN.
+        """
         return {
             ComputeMode.GN_PPM: "gn",
             ComputeMode.HL_PPM: "hl",
         }.get(self)
+
+
+class SigmaChannel(str, enum.Enum):
+    """One term of Σ that a compute mode either builds or does not.
+
+    These are the channels the driver's outputs are written FROM — the
+    names on ``sigma_dispatch.SigmaResult`` and the operands of the QP
+    ladders in ``gw_output`` — not every intermediate a kernel touches.
+
+    - ``X`` — bare exchange Σ_x = −G·V.  Built by every mode; it needs no
+      screening and every output that reports a Σ decomposition wants it.
+    - ``SX`` — static screened exchange Σ_SX = −G·W(0).
+    - ``COH`` — the Coulomb hole Σ_COH.  SX and COH are one pair in
+      practice (a mode that builds one builds the other) but they are two
+      datasets and two columns, so they are two channels here.
+    - ``C_OMEGA`` — dynamic correlation Σ_c(ω) on an ω grid, whatever
+      analytic model produced it.
+    """
+
+    X = "x"
+    SX = "sx"
+    COH = "coh"
+    C_OMEGA = "c_omega"
+
+    @property
+    def label(self) -> str:
+        """How the channel is spelled in prose and in operator messages.
+
+        The enum VALUE stays a lowercase identifier because it is data —
+        it keys tables and appears in tests.  Messages an operator reads
+        want the physics spelling, and having both means neither has to
+        compromise.
+        """
+        return {
+            SigmaChannel.X: "Σ_X",
+            SigmaChannel.SX: "Σ_SX",
+            SigmaChannel.COH: "Σ_COH",
+            SigmaChannel.C_OMEGA: "Σ_c(ω)",
+        }[self]
+
+
+#: WHICH Σ CHANNELS EACH MODE ACTUALLY BUILDS — the table the writers ask
+#: instead of hand-checking mode strings.
+#:
+#: This formalises a rule the tree was already obeying by hand.  The QSGW
+#: plotting appendix (``gw_output.write_qsgw_qp_ladders``, landed
+#: 2026-08-08) omits ``qp_static_cohsex_ev`` on a run that did not build
+#: Σ_SX and Σ_COH and says so in one rank-0 line, because the alternative
+#: — putting a different operator under that dataset's name — is worse
+#: than the dataset's absence.  That judgement is right and it is not
+#: specific to that writer or to those two channels, so the fact it turns
+#: on lives here, once, and the writer reads it.
+#:
+#: THE RULE FOR ADDING A MODE: give it a row.  Every member of
+#: :class:`ComputeMode` must appear (``tests/test_ff_compute_mode.py``
+#: fails otherwise), and :func:`sigma_channels_for` refuses by name for a
+#: mode with no row rather than returning an empty set — an empty set
+#: would read as "this mode builds nothing", which is a legible answer,
+#: and a legible wrong answer is the failure this table exists to stop.
+#:
+#: MPA's row is what the fit stage WILL build: Σ_x as usual, plus Σ_c(ω)
+#: evaluated from the complex poles (Ω_p, B_p) instead of from a
+#: two-point plasmon-pole fit.  Same channels as the PPM modes, different
+#: producer — which is exactly why the table alone cannot be the safety
+#: net, and why the mode also refuses to run (below).
+MODE_SIGMA_CHANNELS: dict[ComputeMode, frozenset[SigmaChannel]] = {
+    ComputeMode.X_ONLY: frozenset({SigmaChannel.X}),
+    ComputeMode.COHSEX: frozenset({SigmaChannel.X, SigmaChannel.SX,
+                                   SigmaChannel.COH}),
+    ComputeMode.GN_PPM: frozenset({SigmaChannel.X, SigmaChannel.C_OMEGA}),
+    ComputeMode.HL_PPM: frozenset({SigmaChannel.X, SigmaChannel.C_OMEGA}),
+    ComputeMode.MPA: frozenset({SigmaChannel.X, SigmaChannel.C_OMEGA}),
+}
+
+
+def coerce_compute_mode(mode) -> ComputeMode:
+    """Accept a :class:`ComputeMode`, its ``.value``, or a bare string.
+
+    The writers reach this table holding whatever their caller handed
+    them — a resolved enum from ``config.compute_mode`` in the driver, a
+    plain string in a deck-echo path, an object carrying ``.value`` in a
+    unit test's stand-in config.  Normalising in ONE place is what lets
+    the table be the single answer rather than the third mode-string
+    hand-check in the tree.
+
+    An unrecognised spelling raises the same ValueError shape the config
+    parser raises, naming the legal set — a typo never resolves to a
+    default.
+    """
+    if isinstance(mode, ComputeMode):
+        return mode
+    raw = getattr(mode, "value", mode)
+    try:
+        return ComputeMode(str(raw).strip().lower())
+    except ValueError as exc:
+        raise ValueError(
+            f"compute_mode={raw!r} is not a known mode; expected one of: "
+            f"{', '.join(m.value for m in ComputeMode)}."
+        ) from exc
+
+
+def sigma_channels_for(mode) -> frozenset[SigmaChannel]:
+    """The Σ channels ``mode`` builds, per :data:`MODE_SIGMA_CHANNELS`."""
+    resolved = coerce_compute_mode(mode)
+    try:
+        return MODE_SIGMA_CHANNELS[resolved]
+    except KeyError as exc:
+        raise KeyError(
+            f"compute_mode={resolved.value!r} has no row in "
+            f"MODE_SIGMA_CHANNELS.  Every ComputeMode member needs one: "
+            f"add the row beside the enum in gw_config.py saying which of "
+            f"{', '.join(c.value for c in SigmaChannel)} this mode builds."
+        ) from exc
+
+
+def mode_builds_channels(mode, *channels: SigmaChannel) -> bool:
+    """True when ``mode`` builds ALL of ``channels``."""
+    built = sigma_channels_for(mode)
+    return all(c in built for c in channels)
+
+
+def explain_missing_channels(mode, *channels: SigmaChannel) -> str:
+    """The named-omission clause for channels ``mode`` does not build.
+
+    Phrased as a fragment so a writer can put it in parentheses after the
+    name of whatever it is declining to write, which is the shape the
+    QSGW appendix's line already had.
+    """
+    resolved = coerce_compute_mode(mode)
+    built = sigma_channels_for(resolved)
+    absent = [c for c in channels if c not in built]
+    if not absent:
+        return f"nothing missing: compute_mode = {resolved.value} builds them"
+    return (f"{'/'.join(c.label for c in absent)} "
+            f"{'are' if len(absent) > 1 else 'is'} not built by "
+            f"compute_mode = {resolved.value}")
+
+
+# ---------------------------------------------------------------------------
+#  Modes that are DECLARED but do not yet run
+# ---------------------------------------------------------------------------
+#
+# A mode lands on this axis before its Σ stage lands, deliberately: the
+# value, the parser, the channel row and every dispatch site are the part
+# that has to be right BEFORE any kernel exists, because that is the part
+# a half-finished mode silently falls through.  What this dict buys is the
+# guarantee that "declared" never means "quietly ran as something else".
+#
+# The driver calls ``refuse_unimplemented_compute_mode`` at entry, before
+# any heavy stage, so the operator learns in the first second of the run
+# rather than after the ζ fit.  Every mode-dispatch site downstream ALSO
+# refuses MPA by name rather than relying on that entry check — the entry
+# check is the courtesy, the site-level refusals are the safety.
+#
+# REMOVING A ROW IS THE LANDING GESTURE.  When the MPA fit stage lands,
+# its author deletes this entry and the suite that pins the refusal fails
+# loudly until it is rewritten to pin the new behaviour.
+UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {
+    ComputeMode.MPA: (
+        "the MPA fit stage lands first; see THEORY_mpa_implementation.md"
+    ),
+}
+
+
+def refuse_unimplemented_compute_mode(mode, *, context: str = "this run"):
+    """Refuse a declared-but-not-yet-built compute mode, by name.
+
+    No-op for every mode whose Σ stage exists, so the call is free to sit
+    on the driver's fast path.  Raises :class:`NotImplementedError` —
+    distinct from the ``ValueError`` a *typo* gets from the parser,
+    because the two are different operator mistakes and deserve different
+    words: ``compute_mode = mpaa`` is "no such mode", ``compute_mode =
+    mpa`` is "that mode, not yet".
+    """
+    resolved = coerce_compute_mode(mode)
+    reason = UNIMPLEMENTED_MODES.get(resolved)
+    if reason is None:
+        return resolved
+    raise NotImplementedError(
+        f"compute_mode = {resolved.value} is declared but not yet "
+        f"implemented, so {context} refuses rather than running a "
+        f"different self-energy ansatz under that name: {reason}")
 
 
 class QPSolver(str, enum.Enum):
@@ -716,7 +939,15 @@ _DEFAULTS = {
     # ``"auto"`` infers from the legacy ``do_screened`` / ``use_ppm_sigma`` /
     # ``ppm_model`` flags so existing input files keep working unchanged.
     # New input files should set ``compute_mode`` explicitly:
-    #   "x_only" | "cohsex" | "gn_ppm" | "hl_ppm".
+    #   "x_only" | "cohsex" | "gn_ppm" | "hl_ppm" | "mpa".
+    #
+    # ``mpa`` — the multipole-W ansatz, the owner's "FF" — PARSES TODAY AND
+    # REFUSES TO RUN TODAY.  Its Σ stage has not landed, so the driver
+    # stops at entry naming the mode rather than falling through to a
+    # plasmon-pole run; ``auto`` never infers it, and no legacy flag
+    # combination reaches it.  See ``UNIMPLEMENTED_MODES`` beside the enum
+    # for why the value ships ahead of the kernels, and the ``ComputeMode``
+    # docstring for why it is spelled ``mpa`` rather than ``full_freq``.
     "compute_mode": "auto",
     # ``qp_solver`` is the orthogonal axis describing how QP energies are
     # extracted from Σ (see the ``QPSolver`` enum).  ``"auto"`` resolves
@@ -1906,6 +2137,16 @@ class LorraxConfig:
         setting overrides them; the legacy fields are still parsed for
         back-compat but the enum is the load-bearing axis the driver
         pivots on.
+
+        RESOLVING IS NOT PERMITTING.  This property answers "which mode
+        did the deck ask for", and it answers it for every member of the
+        enum including the ones whose Σ stage has not landed — the
+        refusal for those is
+        :func:`refuse_unimplemented_compute_mode`, called at driver
+        entry, so that config-only consumers (the deck echo, the layering
+        tests, an operator reading a config back) can name the mode
+        without tripping over it.  ``auto`` never infers an unimplemented
+        mode: the legacy flags it reads predate all of them.
         """
         raw = (self.compute_mode_raw or "auto").strip().lower()
         if raw == "auto":
@@ -1973,9 +2214,16 @@ class LorraxConfig:
                 ) from exc
         mode = self.compute_mode
         if solver is QPSolver.FIXED_POINT and not mode.is_dynamic:
+            # The list of dynamic modes is read off the enum, not typed
+            # here: the day a mode joins them this message says so without
+            # anyone remembering to come back and edit it.  Modes that
+            # refuse to run are left out — advice has to be followable.
+            _dynamic = " / ".join(
+                m.value for m in ComputeMode
+                if m.is_dynamic and m not in UNIMPLEMENTED_MODES)
             raise ValueError(
                 f"qp_solver=fixed_point requires a dynamic compute_mode "
-                f"(gn_ppm / hl_ppm); static Σ ({mode.value}) has no ω-grid "
+                f"({_dynamic}); static Σ ({mode.value}) has no ω-grid "
                 f"to solve E = h0 + ReΣ(E) on.  Use one_shot_dft (identical "
                 f"physics for static Σ) or self_consistent.")
         return solver

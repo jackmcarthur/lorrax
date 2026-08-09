@@ -73,6 +73,7 @@ nav:
       - Minimax quadrature: theory/minimax-quadrature.md
       - Symmetry: theory/symmetry.md
       - HL-GPP derivation: theory/hl-gpp-derivation.md
+      - MPA compute mode (declared, not yet runnable): theory/THEORY_mpa_implementation.md
   - Architecture:
       - Design decisions: architecture/decisions.md
       - Layers: architecture/layers.md
