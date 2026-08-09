@@ -301,8 +301,26 @@ for.
 | tree | `/pscratch/sd/j/jackm/perf_bse_0808/wt_recut`, branch `chore/recut-wave-2026-08-08` off `main` @ `81a285af`.  The `[lx] source tree:` line was read on every leg |
 | `.so` pins | the restage candidate, unchanged: device md5 `c680c229…`, host md5 `91f330c3…` |
 | `LORRAX_FFTW3_SO` | PINNED on every leg |
-| artifacts | `/pscratch/sd/j/jackm/perf_bse_0808/recut/` — `_logs/` (gw, bse_400, bse_200, dense, gate_green, gate_red, census), `deck_cut/dense_eigs_ev_recut.npy`, `deck_cut/H_dense_recut.npy` |
+| artifacts | `/pscratch/sd/j/jackm/perf_bse_0808/recut/` — `_logs/` (gw, bse_400, bse_200, dense, gate_green, gate_red, census), `deck_cut/dense_eigs_ev_recut.npy` (**read the convention warning below before scoring anything against it**), `deck_cut/H_dense_recut.npy` |
 | prose record | `~/lorrax_bse_perf_2026-08-08/RECUT_WAVE.md` |
+
+**A warning about `dense_eigs_ev_recut.npy`, added 2026-08-09.**  That file was
+cut at the deck's DEFAULT `mc_average_vcoul_body = true`, and its filename says
+nothing about it.  It is therefore payload-matched only to cells that share
+that flag, and it is **not** a valid reference for the convention-matched cells
+that run `mc_average_vcoul_body = false`: scoring one against the other returns
+the mc-average difference, not a solver error, and nothing in the file or its
+name will tell you which of the two you just measured.
+
+A later lane walked straight into this.  Scoring a 480-centroid,
+`rcond = 1e-10`, convention-matched cell against this file it read 0.717041 meV
+MAE and 1.303 meV max — six orders above the 4.8 neV that the 400-iteration
+budget is certified to below — and on tracing the discrepancy found the number
+was not solver error at all but an independent six-digit reproduction of the
+attribution's separately measured 0.7170 meV flag difference.  Solver error
+proper stays certified exactly where this amendment puts it: 400 iterations sit
+mid-plateau, 4.8 neV from the exact dense spectrum **on a matched payload**.
+Recorded in `~/lorrax_bse_perf_2026-08-08/W_HEAD_ISDF_FLOOR.md` §3.5.
 
 ## What the geometry prescription actually names
 
