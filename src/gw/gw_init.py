@@ -1743,9 +1743,16 @@ def prepare_isdf_and_wavefunctions(
 				cfg, sym=sym, centroid_indices=centroid_indices,
 				fft_grid=meta.fft_grid, print_fn=print0)
 			if _write_restart:
+				from file_io import coulomb_policy_from_config
 				write_restart_state_to_h5(
 					tensors_filename,
 					n_rmu_logical=int(meta.n_rmu),
+					# THE COULOMB-KERNEL POLICY, stamped with the tensors it
+					# describes.  V_qmunu is reused verbatim by every later
+					# restart and compute_V_q never re-runs, so without this
+					# an averaging-policy change is inherited in silence with
+					# every other guard passing.
+					coulomb_policy=coulomb_policy_from_config(cfg, meta),
 					V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
 					init_W0=True, mesh=mesh_xy,
 					mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
@@ -1849,6 +1856,15 @@ def prepare_isdf_and_wavefunctions(
 				n_rmu_logical=int(meta.n_rmu))
 			V_qmunu = rs.V_qmunu
 			print0("  Loaded restart tensors from H5.")
+			# COULOMB-KERNEL POLICY DISCLOSURE.  Loud on a mismatch, one
+			# line on a match, and a NAMED "not stamped" on a legacy file —
+			# the three are different facts and the log says which.  A
+			# warning rather than a refusal: a policy change makes the
+			# stored V a legitimate tensor built under another convention,
+			# and which one the operator wants is not this seam's call.
+			# What is removed is the silence.
+			from file_io import describe_coulomb_policy_match
+			print0(describe_coulomb_policy_match(tensors_filename, cfg, meta))
 			# Restart is the seam where "rc=0 but garbage" was born (job
 			# 7874375: a changed band window silently reused tensors built
 			# under the old one).  The band-window attrs guard inside

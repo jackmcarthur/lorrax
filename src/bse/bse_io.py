@@ -1504,6 +1504,13 @@ def load_bse_data_from_restart_sharded(
             wq_key = "W0_qmunu_nohead"
         elif "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
             wq_key = "W0_qmunu"
+        # WHICH COULOMB CONVENTION THIS W WAS BUILT UNDER.  The BSE does not
+        # compute W — it reads it off the GW restart — so it has no Coulomb
+        # config of its own to check against and the honest disclosure is the
+        # stored policy itself.  Printed once per load, rank 0 only.
+        if jax.process_index() == 0:
+            from file_io import describe_coulomb_policy_stamp
+            print(describe_coulomb_policy_stamp(restart_file))
         if wq_key is not None:
             wq_dset = f[wq_key]
         else:
@@ -2185,6 +2192,8 @@ def _load_ring_subset(
         # shape it already had.
         V_qmunu = jnp.asarray(
             restart_munu_full_bz(f["V_qmunu"], "V_qmunu", restart_file))
+        from file_io import describe_coulomb_policy_stamp
+        print(describe_coulomb_policy_stamp(restart_file))
         if "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
             W0_qmunu = jnp.asarray(
                 restart_munu_full_bz(f["W0_qmunu"], "W0_qmunu", restart_file))

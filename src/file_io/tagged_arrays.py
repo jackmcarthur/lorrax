@@ -80,6 +80,201 @@ def _log_restart_write(name, shape, dtype, dt) -> None:
           flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Coulomb-kernel policy stamp
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT THIS CLOSES.  The restart file records ``V_ready``, the band
+# window, ``n_rmu``, the k-grid, the q-set symmetry tables and the centroid
+# md5s — and, until this stamp, NOTHING about the Coulomb kernel.  A
+# ``restart = true`` run reuses ``V_qmunu`` verbatim and never re-runs
+# ``compute_V_q`` (``gw_init.py``'s restart branch), so ANY change of
+# averaging policy — ``mc_average_vcoul_body``, the mini-BZ placement, the
+# bare-Coulomb cutoff, the BGW vcoul overlay — is inherited silently by
+# every existing restart, with every current guard passing.  This is the
+# same defect class as the band-window bug the file's own comments cite
+# (job 7874375: window-70 tensors reused at window 80 gave a QP gap of
+# -135 eV while every stage reported success).
+#
+# It is a WARNING, not a refusal, and the asymmetry is deliberate.  The
+# band window changes what the tensors are INDEXED by, so reusing them is
+# wrong with no way to be right.  A Coulomb-policy change makes the stored
+# V a legitimate tensor built under a different convention — sometimes
+# exactly what the operator wants (re-scoring an old restart against a new
+# Sigma path), sometimes a silent physics change.  The failure to remove is
+# the SILENCE, so the stamp is loud and the decision stays the operator's.
+#
+# Files written before the stamp read as legacy and get one line saying so,
+# because "no stamp" and "a stamp that matches" are different facts and a
+# reader that conflates them has re-created the original defect one level up.
+
+COULOMB_POLICY_DATASET = "coulomb_policy"
+COULOMB_POLICY_VERSION = 1
+
+#: The keys stamped, in order.  Anything that changes ``v(q+G)`` or where
+#: its mini-BZ average lands belongs here; anything that does not, does not.
+COULOMB_POLICY_KEYS = (
+    "mc_average_vcoul_body",
+    "mc_average_placement",
+    "mc_average_placement_vcoul",
+    "head_minibz_average",
+    "bare_coulomb_cutoff",
+    "use_bgw_vcoul",
+    "bgw_vcoul_file",
+    "sys_dim",
+)
+
+
+def coulomb_policy_from_config(cfg, meta=None) -> dict:
+    """The Coulomb-kernel policy of a running config, as a flat str dict.
+
+    Reads ``cfg.head`` (and ``meta.sys_dim``) rather than being handed the
+    values, so a key added to ``HeadConfig`` and to
+    :data:`COULOMB_POLICY_KEYS` is stamped without a third edit at every
+    call site.
+    """
+    head = getattr(cfg, "head", None)
+    out = {}
+    for k in COULOMB_POLICY_KEYS:
+        if k == "sys_dim":
+            v = getattr(meta, "sys_dim", None) if meta is not None else None
+        else:
+            v = getattr(head, k, None)
+        out[k] = _policy_scalar(v)
+    return out
+
+
+def _policy_scalar(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float):
+        return repr(float(v))
+    return str(v)
+
+
+def format_coulomb_policy(policy: dict) -> str:
+    """``v1;key=value;...`` — one line, sorted by :data:`COULOMB_POLICY_KEYS`.
+
+    Deliberately a readable string rather than JSON or a pickle: the whole
+    point of a provenance stamp is that ``h5dump`` answers the question
+    without LORRAX in the loop.
+    """
+    body = ";".join(
+        f"{k}={_policy_scalar(policy.get(k))}" for k in COULOMB_POLICY_KEYS)
+    return f"v{COULOMB_POLICY_VERSION};{body}"
+
+
+def parse_coulomb_policy(raw) -> dict | None:
+    """Inverse of :func:`format_coulomb_policy`; ``None`` for an unstamped file.
+
+    Tolerates unknown keys (a file written by a newer LORRAX) and missing
+    keys (an older one) — both come back in the dict as they are, and the
+    comparison below reports them as differences rather than crashing.  A
+    stamp is provenance; failing to READ one must never be worse than not
+    having it.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    elif isinstance(raw, np.ndarray):
+        raw = bytes(raw.tobytes()).decode("utf-8", "replace").rstrip("\x00")
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    parts = raw.split(";")
+    if parts and parts[0].startswith("v"):
+        parts = parts[1:]
+    out = {}
+    for p in parts:
+        if "=" not in p:
+            continue
+        k, _, v = p.partition("=")
+        out[k.strip()] = v.strip()
+    return out or None
+
+
+def compare_coulomb_policy(stamped: dict | None, running: dict) -> list:
+    """Return ``[(key, stamped, running), ...]`` for every disagreement.
+
+    Empty list means the file was built under this run's Coulomb policy.
+    ``stamped is None`` (legacy file) is NOT a disagreement — it is the
+    absence of evidence, and the caller says so in its own words.
+    """
+    if stamped is None:
+        return []
+    keys = list(dict.fromkeys(list(stamped.keys()) + list(running.keys())))
+    return [(k, stamped.get(k, "<absent>"), running.get(k, "<absent>"))
+            for k in keys if stamped.get(k, "<absent>") != running.get(k, "<absent>")]
+
+
+def read_coulomb_policy_from_h5(filename) -> dict | None:
+    """Read the stamp off a restart file with serial h5py; ``None`` if absent.
+
+    Scalar-class metadata, read the same way ``assert_restart_window_matches``
+    reads the band window — no SlabIO handle, no collective, safe to call on
+    any rank before the tensors move.
+    """
+    try:
+        with h5py.File(filename, "r") as f:
+            if COULOMB_POLICY_DATASET not in f:
+                return None
+            return parse_coulomb_policy(f[COULOMB_POLICY_DATASET][()])
+    except (OSError, KeyError):
+        return None
+
+
+def describe_coulomb_policy_stamp(filename) -> str:
+    """One line naming the Coulomb policy a restart file's tensors carry.
+
+    For readers that CONSUME W rather than rebuild V — the BSE, which by
+    its own note "does NOT compute W, it READS it off the GW restart".
+    They have no Coulomb config of their own to compare against, so the
+    honest disclosure is the stored policy itself, not a match verdict.
+    Without this line a BSE run's log has no record of which averaging
+    convention its screening was built under, which is exactly the gap
+    that made the cross-code residual arguable in the first place.
+    """
+    stamped = read_coulomb_policy_from_h5(filename)
+    if stamped is None:
+        return ("  [restart stamp] Coulomb-kernel policy: NOT STAMPED "
+                "(GW restart predates the stamp) - the screening in this "
+                "file was built under an unrecorded averaging convention.")
+    return ("  [restart stamp] screening built under Coulomb policy: "
+            + ";".join(f"{k}={v}" for k, v in stamped.items()))
+
+
+def describe_coulomb_policy_match(filename, cfg, meta=None) -> str:
+    """One line for a restart log: matched, mismatched, or legacy-unstamped.
+
+    Returns the text; the caller prints it, so this stays importable from
+    the BSE side (which reads the same file and owes the same disclosure)
+    without either side owning the other's print function.
+    """
+    running = coulomb_policy_from_config(cfg, meta)
+    stamped = read_coulomb_policy_from_h5(filename)
+    if stamped is None:
+        return ("  [restart stamp] Coulomb-kernel policy: NOT STAMPED "
+                "(file predates the stamp). Read as legacy — the stored V/W "
+                "were built under whatever averaging policy that run used, "
+                "and this run cannot tell which. Running policy is "
+                f"{format_coulomb_policy(running)}")
+    diffs = compare_coulomb_policy(stamped, running)
+    if not diffs:
+        return (f"  [restart stamp] Coulomb-kernel policy matches: "
+                f"{format_coulomb_policy(stamped)}")
+    detail = "; ".join(f"{k}: file={a!r} run={b!r}" for k, a, b in diffs)
+    return (
+        "  [restart stamp] WARNING - Coulomb-kernel policy MISMATCH between "
+        "this restart file and the running config. The restart reuses "
+        "V_qmunu verbatim and never re-runs compute_V_q, so the stored "
+        "tensors carry the FILE's policy and every other guard will pass. "
+        f"Differences -> {detail}. Rerun with restart = false if the "
+        "running policy is the one you meant.")
+
+
 def write_restart_state_to_h5(
     filename,
     *,
@@ -99,6 +294,7 @@ def write_restart_state_to_h5(
     kgrid: tuple[int, int, int] | None = None,
     band_slices=None,
     qirr=None,
+    coulomb_policy=None,
 ):
     """Write (subset of) canonical restart state via SlabIO.
 
@@ -190,6 +386,17 @@ def write_restart_state_to_h5(
                  int(band_slices.b4)], dtype=np.int64))
         if mode == "w":
             io.write_attr("n_rmu_logical", np.int64(int(n_rmu_logical)))
+        # COULOMB-KERNEL PROVENANCE.  Unconditional on the ``w`` pass: a
+        # restart written without it is exactly the file this stamp exists
+        # to stop producing, so there is no opt-in.  Callers that pass
+        # nothing get the stamp with empty values, which still records
+        # "this writer knew about the policy and was handed none" — a
+        # different and more useful fact than an absent dataset.
+        if mode == "w":
+            io.write_attr(
+                COULOMB_POLICY_DATASET,
+                np.asarray(format_coulomb_policy(coulomb_policy or {})
+                           .encode("utf-8"), dtype="S"))
 
         # PER-DATASET LIVENESS (scorecard AF.4c): every dataset below
         # emits one [restart_write] line naming its size as it is handed
