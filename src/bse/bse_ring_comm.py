@@ -291,54 +291,73 @@ def _ring_sum_conduction(
     return T_total
 
 
-def _ring_sum_conduction_first(
+# ---------------------------------------------------------------------------
+# WHY THE COUPLING (B) ENCODE CANNOT BE A TWO-STAGE RING LIKE THE A ENCODE
+# ---------------------------------------------------------------------------
+# A ring stage ``ppermute``s a buffer along one mesh axis and slices the
+# *stationary* psi at the origin rank's orbital block.  That is only sound if
+# the moving buffer carries NO axis that is sharded on the rotation axis other
+# than the orbital axis being consumed -- a ppermute moves every axis of the
+# buffer, including a zeta (interpolation-vector) axis, and the accumulator it
+# lands in belongs to the LOCAL zeta shard.
+#
+# The A encode satisfies that by construction.  Its stage 1 rings over 'y' to
+# consume v and produces nu from psi_v_Y, but nu is produced INTO the
+# accumulator, which never moves.  Its stage 2 rings over 'x' to consume c
+# while the moving buffer carries nu on 'y' -- orthogonal to the rotation, and
+# every rank in an 'x' row holds the same 'y' shard, so nu survives the trip.
+#
+# The B encode has Henneke's j_c <-> j_v swap on the encode side, so the zeta
+# index produced by contracting c (sharded on 'x') is nu (sharded on 'y') and
+# the one produced by contracting v (sharded on 'y') is mu (sharded on 'x').
+# The pairing is CROSSED, and no ordering of two ring stages avoids rotating an
+# intermediate along the very axis its zeta index lives on:
+#
+#     consume c first (ring 'x') -> R(v on 'y', nu on 'y'); ring 'y' next
+#         drags nu with v                                    <- the 2026-08-08 defect
+#     consume v first (ring 'y') -> R(c on 'x', mu on 'x'); ring 'x' next
+#         drags mu with c
+#
+# The defect version of the first line was silent at P=1 (one shard, ppermute
+# is the identity) and lost two thirds of the coupling correction at P=2x2:
+# every 'y' rank accumulated the SAME sum
+# ``sum_j sum_{v in block j} psi_v(mu) R(v, nu + j*nu_chunk)`` and stored it
+# against its own nu shard, so the nu tiles of T came out bit-identical and the
+# block lost its complex symmetry (0.69 vs 2.9e-11).
+#
+# THE FIX: move the communication onto the TRIAL VECTOR, which carries no zeta
+# axis at all.  X is gathered along c on 'x' (X is by far the smallest tensor
+# in this chain -- T carries two zeta axes) and then ring-rotated along 'y' to
+# bring the v blocks round, so mu and nu are both produced into stationary
+# accumulators and never travel.  Collective count stays O(px + py), matching
+# the A encode; the T-sized and R-sized tensors never go on the wire.
+def _ring_sum_B_encode(
     X: jax.Array,
     psi_c_Y: jax.Array,
-    c_chunk: int,
-    px: int,
-    nu_local: int,
-) -> jax.Array:
-    """Sum over conduction first: R(v,k,s,nu) = sum_c psi_c^*(nu) X(c,v,k)."""
-    axis_index_x = jnp.asarray(lax.axis_index("x"), dtype=jnp.int32)
-    nk, _, nspinor, _ = psi_c_Y.shape
-    v_chunk = X.shape[2]
-
-    R0 = mark_varying(
-        jnp.zeros((X.shape[0], v_chunk, nk, nspinor, nu_local), dtype=X.dtype),
-        ("x", "y"))
-    perm = _ring_perm(px)
-
-    def step(i, carry):
-        buf, R = carry
-        origin = (axis_index_x - jnp.asarray(i, dtype=jnp.int32)) % px
-        c_start = origin * jnp.asarray(c_chunk, dtype=jnp.int32)
-        z = jnp.int32(0)
-        psi_c_slice = lax.dynamic_slice(
-            psi_c_Y, (z, c_start, z, z), (nk, c_chunk, nspinor, nu_local)
-        )
-        R = R + jnp.einsum("kcsN,bcvk->bvksN", jnp.conj(psi_c_slice), buf)
-        buf = lax.ppermute(buf, axis_name="x", perm=perm)
-        return buf, R
-
-    _, R_total = lax.fori_loop(0, px, step, (X, R0))
-    return R_total
-
-
-def _ring_sum_valence_second(
-    R: jax.Array,
     psi_v_X: jax.Array,
     v_chunk: int,
+    px: int,
     py: int,
     mu_local: int,
+    nu_local: int,
 ) -> jax.Array:
-    """Finish sum over valence: T(mu,nu,t,s,k) = sum_v psi_v(mu) R(v,k,s,nu)."""
+    """Coupling-block encode ``T(mu,nu,t,s,k) = sum_{c,v} psi_v(mu) X(c,v,k)
+    conj(psi_c(nu))`` -- the c' <-> v' swapped partner of ``_encode_T``.
+
+    Only ``X`` moves: an all-gather over 'x' (the c axis) and a ``py``-step
+    ring over 'y' (the v axis).  ``mu`` and ``nu`` stay on their owning ranks.
+    """
     axis_index_y = jnp.asarray(lax.axis_index("y"), dtype=jnp.int32)
-    nk, _, nspinor, _ = psi_v_X.shape
-    nu_local = R.shape[4]
+    nk, _, nspinor, _ = psi_c_Y.shape
+    z = jnp.int32(0)
+
+    # c is contracted in full on every rank: gather the trial vector's
+    # conduction axis once, rather than rotating a partially-contracted R.
+    X_full_c = lax.all_gather(X, "x", axis=1, tiled=True)
 
     T0 = mark_varying(
-        jnp.zeros((R.shape[0], mu_local, nu_local, nspinor, nspinor, nk),
-                  dtype=R.dtype),
+        jnp.zeros((X.shape[0], mu_local, nu_local, nspinor, nspinor, nk),
+                  dtype=X.dtype),
         ("x", "y"))
     perm = _ring_perm(py)
 
@@ -346,15 +365,17 @@ def _ring_sum_valence_second(
         buf, T = carry
         origin = (axis_index_y - jnp.asarray(i, dtype=jnp.int32)) % py
         v_start = origin * jnp.asarray(v_chunk, dtype=jnp.int32)
-        z = jnp.int32(0)
+        # buf holds the origin rank's v block for EVERY c; nu is local and
+        # stationary, so conj(psi_c_Y) is this rank's nu shard throughout.
+        R = jnp.einsum("kcsN,bcvk->bvksN", jnp.conj(psi_c_Y), buf)
         psi_v_slice = lax.dynamic_slice(
             psi_v_X, (z, v_start, z, z), (nk, v_chunk, nspinor, mu_local)
         )
-        T = T + jnp.einsum("kvtM,bvksN->bMNtsk", psi_v_slice, buf)
+        T = T + jnp.einsum("kvtM,bvksN->bMNtsk", psi_v_slice, R)
         buf = lax.ppermute(buf, axis_name="y", perm=perm)
         return buf, T
 
-    _, T_total = lax.fori_loop(0, py, step, (R, T0))
+    _, T_total = lax.fori_loop(0, py, step, (X_full_c, T0))
     return T_total
 
 
@@ -689,13 +710,11 @@ def build_bse_ring_matvec_full(
     )
 
     def _encode_T_B(X, psi_c_Y, psi_v_X):
-        c_chunk = X.shape[1]
         v_chunk = X.shape[2]
         n_rmu_local_X = psi_v_X.shape[-1]
         n_rmu_local_Y = psi_c_Y.shape[-1]
-        R = _ring_sum_conduction_first(X, psi_c_Y, c_chunk, px, n_rmu_local_Y)
-        T = _ring_sum_valence_second(R, psi_v_X, v_chunk, py, n_rmu_local_X)
-        return T
+        return _ring_sum_B_encode(X, psi_c_Y, psi_v_X, v_chunk, px, py,
+                                  n_rmu_local_X, n_rmu_local_Y)
 
     encode_T_ring_B = _shard_map_fn(
         _encode_T_B,
@@ -705,10 +724,15 @@ def build_bse_ring_matvec_full(
     )
 
     def _encode_T_B_gather(X, psi_c_Y, psi_v_X):
+        # Gather the TRIAL VECTOR on both axes, never the partially-contracted
+        # R: R carries nu on 'y', and an all_gather of R along v concatenates
+        # tiles whose nu shards differ -- the same defect as the ring version
+        # (see _ring_sum_B_encode).  X carries no zeta axis, so gathering it is
+        # sound, and it is the smallest tensor in the chain.
         X_full_c = lax.all_gather(X, "x", axis=1, tiled=True)
-        R = jnp.einsum("kcsN,bcvk->bvksN", jnp.conj(psi_c_Y), X_full_c)
-        R_full_v = lax.all_gather(R, "y", axis=1, tiled=True)
-        T = jnp.einsum("kvtM,bvksN->bMNtsk", psi_v_X, R_full_v)
+        X_full = lax.all_gather(X_full_c, "y", axis=2, tiled=True)
+        R = jnp.einsum("kcsN,bcvk->bvksN", jnp.conj(psi_c_Y), X_full)
+        T = jnp.einsum("kvtM,bvksN->bMNtsk", psi_v_X, R)
         return T
 
     encode_T_gather_B = _shard_map_fn(
