@@ -335,10 +335,18 @@ def test_f4c_absence_of_an_optional_field_is_not_corruption():
 def test_f4_false_case_the_shipped_bundle_loads_and_every_entry_parses():
     """The FALSE case for all of F4: the real artifact is healthy.
 
-    31 entries in ``catalog.json``, 18 in the complex_laplace one, every
-    payload resolvable and every field typed.  If this cell ever goes red
-    the bundle is broken, which is exactly the event the four refusals
-    above exist to report instead of swallow.
+    31 entries in ``catalog.json``, 54 in the complex_laplace one and 29
+    in the damped_line one, every payload resolvable and every field
+    typed.  If this cell ever goes red the bundle is broken, which is
+    exactly the event the four refusals above exist to report instead of
+    swallow.
+
+    THE COMPLEX_LAPLACE COUNT MOVED 18 -> 54 AND THE PIN IS SUPPOSED TO
+    NOTICE.  The first campaign swept a beta grid taken from the request
+    census's three-decimal DISPLAY; the full-precision campaign regenerated
+    at the decks' own omega-hats and added the 1e-12 fit-stage tier, which
+    is 36 more entries.  A count pin that did not have to be touched for
+    that would not be pinning anything.
     """
     view = M.catalog()
     assert len(view) == 31
@@ -349,7 +357,7 @@ def test_f4_false_case_the_shipped_bundle_loads_and_every_entry_parses():
         assert np.isfinite(err) and err > 0.0
         assert h.startswith("sha256:")
     cl = _cl_view()
-    assert len(cl) == 18 and cl.schema_version == 2
+    assert len(cl) == 54 and cl.schema_version == 2
 
 
 # ---------------------------------------------------------------------------
