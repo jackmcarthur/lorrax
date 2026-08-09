@@ -106,6 +106,61 @@ def _resolve_fit_store(config: LorraxConfig, input_dir: str) -> str:
     return path
 
 
+def _parse_pole_subset(raw):
+    """``"0,3"`` -> ``(0, 3)``; ``""``/``None`` -> ``None`` (every pole).
+
+    A DECK KEY AND NOT A RANGE.  The poles are named individually because
+    the thing a caller gets wrong is coverage, and a list is checkable
+    against the store's pass order one element at a time
+    (``sigma_pass.resolve_pole_subset``) where a range silently clips.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    out = []
+    for tok in text.replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.append(int(tok))
+        except ValueError as exc:
+            raise ValueError(
+                f"mpa_pole_subset={raw!r}: {tok!r} is not an integer pole "
+                f"index.  This key names poles of the fit store's pinned "
+                f"pass order, comma separated (e.g. '0' or '0,3,5')."
+            ) from exc
+    return tuple(out) or None
+
+
+def _partial_paths_in(spec):
+    """Every partial-cube file named by ``mpa_pass_partial_in``.
+
+    A directory means every ``*.h5`` in it; a glob means its matches; a
+    plain path means itself.  An EMPTY result raises rather than
+    returning nothing to sum: a recombination that found no partials and
+    proceeded would build Σ_c = 0, which is finite, smooth, Hermitian and
+    indistinguishable from a converged dark channel — the same failure
+    ``compute_mpa_sigma_c_omega_grid`` refuses at its own end.
+    """
+    import glob as _glob
+
+    text = str(spec).strip()
+    if os.path.isdir(text):
+        hits = sorted(_glob.glob(os.path.join(text, "*.h5")))
+    elif any(ch in text for ch in "*?["):
+        hits = sorted(_glob.glob(text))
+    else:
+        hits = [text] if os.path.exists(text) else []
+    if not hits:
+        raise FileNotFoundError(
+            f"mpa_pass_partial_in={spec!r} matched no partial cube.  A "
+            f"recombination with nothing to combine would return Σ_c = 0 — "
+            f"finite, smooth, Hermitian, and indistinguishable from a "
+            f"converged dark channel — so it is refused here.")
+    return hits
+
+
 def _inject_mpa_head(
     sigma_c_omega, head, *,
     config: LorraxConfig,
@@ -280,7 +335,11 @@ def compute_mpa_sigma_pipeline(
     """
     from file_io import mpa_store
     from .gw_output import print_section
-    from .mpa.sigma_pass import compute_mpa_sigma_c_omega_grid
+    from .mpa.sigma_pass import (
+        combine_pass_partials,
+        compute_mpa_sigma_c_omega_grid,
+        write_pass_partial,
+    )
 
     if not config.do_screened:
         raise ValueError(
@@ -383,14 +442,65 @@ def compute_mpa_sigma_pipeline(
         # the same object step 2 of the two-point pipeline passes — NOT
         # the χ₀ minimax quadrature, which this scheme never builds
         # because it never solves a χ₀.
-        with timing.section("sigma.exec"):
-            sigma_c_omega, records = compute_mpa_sigma_c_omega_grid(
-                wfns, path, meta, mesh_xy,
-                ppm_cfg=config.ppm,
-                quad=config.sigma_quadrature_config,
-                omega_grid_ry=config.omega_grid_ry,
-                print_fn=print_fn,
-            )
+        #
+        # THE PASS LOOP IS THE ONLY EXPENSIVE STAGE, and on a production
+        # field it is expensive enough that spreading it over devices is
+        # the difference between a table and a week.  Two deck keys open
+        # that door and neither of them changes what is computed:
+        # ``mpa_pass_partial_out`` says "walk ``mpa_pole_subset`` and
+        # write the partial cube here", ``mpa_pass_partial_in`` says
+        # "walk nothing; read the partials from here and sum them in the
+        # pinned ascending order".  Steps 3–5 below are then reached by
+        # exactly the same object either way, which is the point: the
+        # recombination happens BEFORE the head, before the interpolation
+        # and before the writer, so nothing downstream can tell a split
+        # run from a whole one, and the pinned order is preserved through
+        # the split because it is what the combiner sums in.
+        partial_in = str(getattr(config, "mpa_pass_partial_in", "") or "")
+        partial_out = str(getattr(config, "mpa_pass_partial_out", "") or "")
+        if partial_in and partial_out:
+            raise ValueError(
+                "compute_mpa_sigma_pipeline: mpa_pass_partial_in and "
+                "mpa_pass_partial_out are both set.  One says to PRODUCE a "
+                "partial and the other to CONSUME a set of them; a run that "
+                "did both would write a partial of a total and there is no "
+                "reading of that which is a self-energy.")
+        if partial_in:
+            paths = _partial_paths_in(partial_in)
+            with timing.section("sigma.exec"):
+                total, _poles, audit = combine_pass_partials(
+                    paths, n_p=int(ledger["n_p"]),
+                    omega_grid_ry=config.omega_grid_ry, fit_src=path,
+                    print_fn=print_fn)
+            import jax.numpy as _jnp
+            sigma_c_omega = _jnp.asarray(total, dtype=_jnp.complex128)
+            records = []
+            del audit
+        else:
+            with timing.section("sigma.exec"):
+                sigma_c_omega, records = compute_mpa_sigma_c_omega_grid(
+                    wfns, path, meta, mesh_xy,
+                    ppm_cfg=config.ppm,
+                    quad=config.sigma_quadrature_config,
+                    omega_grid_ry=config.omega_grid_ry,
+                    pole_subset=_parse_pole_subset(
+                        getattr(config, "mpa_pole_subset", "")),
+                    print_fn=print_fn,
+                )
+            if partial_out:
+                write_pass_partial(
+                    partial_out, np.asarray(sigma_c_omega), records,
+                    n_p=int(ledger["n_p"]),
+                    poles=[int(r.pole_index) for r in records],
+                    omega_grid_ry=config.omega_grid_ry, fit_src=path,
+                    print_fn=print_fn)
+                print_fn(
+                    "  ⚠ THIS RUN IS A PARTIAL PASS.  Everything printed "
+                    "below — the head, the QP energies, eqp0/eqp1, "
+                    "sigma_mnk.h5 — is computed from a partial sum over the "
+                    "pole axis and is NOT a self-energy.  The number this "
+                    "run exists to produce is the partial cube named above; "
+                    "read nothing else from it.")
 
         # Step 3: q→0 head injection from the store's own pole axis.
         sigma_c_omega, head_sigma_diag_w_kn_ry = _inject_mpa_head(

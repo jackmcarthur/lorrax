@@ -920,6 +920,31 @@ _DEFAULTS = {
     # Σ head line: a head number that cannot be attributed to a convention
     # is precisely what this arrangement exists to prevent.
     "mpa_head_label": "as_shipped",
+    # SPREADING THE POLE PASSES OVER DEVICES.  The pass loop is a sum
+    # over the store's poles, one term per pass, and on a production
+    # field one term costs hours — so the three keys below let one
+    # process walk SOME of the poles and write its partial cube, and a
+    # later process sum the partials.  They change no physics and no
+    # quadrature: the recombination happens before the q→0 head, before
+    # the at-DFT interpolation and before the writer, so steps 3–5 are
+    # reached by the same object whether the run was split or whole.
+    #
+    # ``mpa_pole_subset`` — comma-separated pole indices this process
+    # integrates ("" = every pole, the single-process production route).
+    # The poles are walked in the store's PINNED ascending order however
+    # they are typed; the key names which, never in what order.
+    # ``mpa_pass_partial_out`` — where this process writes its partial
+    # Σ_c cube.  A run with this set announces, loudly, that its eqp
+    # numbers are computed from a partial sum and are not a self-energy.
+    # ``mpa_pass_partial_in`` — a file, glob or directory of partial
+    # cubes to SUM, in the pinned ascending order, instead of
+    # integrating anything.  The combiner refuses a stack that does not
+    # cover the store's pass order exactly once, because a missing or
+    # doubled pole returns a finite, smooth, plausible Σ that differs by
+    # tens of meV — the size of the effect these runs measure.
+    "mpa_pole_subset": "",
+    "mpa_pass_partial_out": "",
+    "mpa_pass_partial_in": "",
     # Where H0's mean-field Hartree term comes from.  H0 = kin_ion + V_H is
     # a ~500 eV cancellation, so this is an explicit, validated choice
     # rather than something inferred from what happens to be on disk.
@@ -2271,6 +2296,16 @@ class LorraxConfig:
     #: ``_DEFAULTS["mpa_head_label"]``; ``as_shipped`` is the bare
     #: ``__mpahead`` group and therefore also every pre-label store.
     mpa_head_label: str
+    #: Which poles this process integrates, comma separated; "" is every
+    #: pole.  See ``_DEFAULTS["mpa_pole_subset"]``.
+    mpa_pole_subset: str
+    #: Where this process writes its partial Σ_c cube (""= not a partial
+    #: run).  See ``_DEFAULTS["mpa_pass_partial_out"]``.
+    mpa_pass_partial_out: str
+    #: A file, glob or directory of partial Σ_c cubes to sum in the pinned
+    #: order instead of integrating ("" = integrate).  See
+    #: ``_DEFAULTS["mpa_pass_partial_in"]``.
+    mpa_pass_partial_in: str
 
     # --- Sub-dataclass groups (everything else) ---
     paths: FilePaths
@@ -2854,6 +2889,10 @@ class LorraxConfig:
             mpa_pole_energy_unit=coerce_pole_energy_unit(
                 _g("mpa_pole_energy_unit")),
             mpa_head_label=str(_g("mpa_head_label") or "").strip(),
+            mpa_pole_subset=str(_g("mpa_pole_subset") or "").strip(),
+            mpa_pass_partial_out=str(
+                _g("mpa_pass_partial_out") or "").strip(),
+            mpa_pass_partial_in=str(_g("mpa_pass_partial_in") or "").strip(),
             # Sub-dataclass groups
             paths=paths,
             head=head,

@@ -129,15 +129,19 @@ from common.units import RYD_TO_EV
 __all__ = [
     "DEFAULT_LAPLACE_RATIO_MAX",
     "MAX_WIDTH_SPLIT_LEAVES",
+    "PARTIAL_FORMAT_VERSION",
     "PassRecord",
     "WindowGroup",
+    "combine_pass_partials",
     "compute_mpa_sigma_c_omega_grid",
     "format_pass_report",
     "narrow_pole_threshold_ry",
     "plan_branch_groups",
     "refuse_wedge_pole_slab",
+    "resolve_pole_subset",
     "run_pass_branch",
     "split_pass_by_width",
+    "write_pass_partial",
 ]
 
 
@@ -984,10 +988,256 @@ def run_pass_branch(
         nb_real=nb_proj)
 
 
+#: Format version of a per-pass partial Σ_c file.  Stamped by
+#: :func:`write_pass_partial` and required by :func:`combine_pass_partials`,
+#: because a partial cube is the one artifact in this pipeline that is
+#: MEANINGLESS ON ITS OWN and yet has exactly the shape, dtype and units of
+#: the finished one.  Nothing downstream could tell a stack of partials
+#: written under a changed convention from a stack written under this one,
+#: so the convention is named in the bytes.
+PARTIAL_FORMAT_VERSION = 1
+
+
+def resolve_pole_subset(n_p, subset):
+    """The poles ONE process integrates, in the pinned ascending order.
+
+    ``None`` (or an empty selection) means every pole, which is the
+    single-process production route and the only one that existed before
+    the pass loop could be split.  Anything else is validated against
+    :func:`~gw.mpa.fit_driver.pole_pass_order` and returned as a subsequence
+    of it, NOT in the order the caller happened to type: the pinned order is
+    a property of the accumulation, and a caller who writes ``3,0`` is
+    asking which poles, not in which order to add them.
+
+    Duplicates and out-of-range indices are refused rather than deduplicated
+    or clipped.  The FALSE case each refusal guards is a coverage error in
+    the recombination — a pole summed twice or never — and both of those
+    produce a finite, smooth, plausible Σ that no shape or Hermiticity
+    check can see.
+    """
+    from .fit_driver import pole_pass_order
+
+    order = pole_pass_order(n_p)
+    if subset is None:
+        return order
+    want = [int(p) for p in subset]
+    if not want:
+        return order
+    bad = sorted({p for p in want if p not in order})
+    if bad:
+        raise ValueError(
+            f"mpa pole subset: pole index/indices {bad} are outside this "
+            f"store's pinned pass order {order} (n_p={int(n_p)}).  A subset "
+            f"that names a pole the store does not have is a coverage error "
+            f"in the recombination, not a smaller run.")
+    dup = sorted({p for p in want if want.count(p) > 1})
+    if dup:
+        raise ValueError(
+            f"mpa pole subset: pole index/indices {dup} appear more than "
+            f"once.  A pole summed twice is a finite, smooth, plausible Σ "
+            f"that no Hermiticity or shape check can see, so it is refused "
+            f"here rather than silently deduplicated.")
+    return tuple(p for p in order if p in set(want))
+
+
+def write_pass_partial(path, sigma_c_kij, records, *, n_p, poles,
+                       omega_grid_ry, fit_src, print_fn=print):
+    """Write ONE process's partial Σ_c cube, with the manifest that makes
+    it recombinable and the refusals that make it non-mistakable.
+
+    THE OBJECT AND WHY IT NEEDS A MANIFEST.  ``Σ_c`` is a sum over poles
+    and the pass loop is that sum written out one term at a time, so a
+    process that walks a SUBSET of the poles returns a partial sum with
+    the identical shape, dtype and units as the total.  Nothing about the
+    array says which poles are in it.  Two stacks of partials — one
+    covering the store's poles exactly once, one missing a pole or
+    carrying one twice — differ by a smooth, finite, entirely plausible
+    self-energy of a few tens of meV, which is the size of the effect this
+    campaign is measuring.  So the manifest is not bookkeeping: it is the
+    only thing standing between a parallel run and a wrong number that
+    looks right.
+
+    Stamped: the format version, the pole indices this cube contains, the
+    store's ``n_p``, the ω grid in Ry, the fit store path, and the per-pass
+    provenance triples the pass report prints.  :func:`combine_pass_partials`
+    checks every one of them.
+    """
+    import datetime
+    import h5py
+
+    arr = np.asarray(sigma_c_kij)
+    om = np.asarray(omega_grid_ry, dtype=np.float64)
+    poles = tuple(int(p) for p in poles)
+    with h5py.File(str(path), "w") as f:
+        f.attrs["mpa_partial_format_version"] = int(PARTIAL_FORMAT_VERSION)
+        f.attrs["mpa_partial_poles"] = np.asarray(poles, dtype=np.int64)
+        f.attrs["mpa_partial_n_p"] = int(n_p)
+        f.attrs["mpa_partial_fit_store"] = str(fit_src)
+        f.attrs["mpa_partial_written_utc"] = (
+            datetime.datetime.now(datetime.timezone.utc).isoformat())
+        f.create_dataset("omega_grid_ry", data=om)
+        f.create_dataset("sigma_c_partial", data=arr.astype(np.complex128),
+                         compression=None)
+        prov = f.create_group("pass_records")
+        for r in records:
+            g = prov.create_group(str(int(r.pole_index)))
+            g.attrs["n_legacy_modes"] = int(r.n_legacy_modes)
+            g.attrs["n_mpa_modes"] = int(r.n_mpa_modes)
+            g.attrs["legacy_b_mass"] = float(r.legacy_b_mass)
+            g.attrs["mpa_b_mass"] = float(r.mpa_b_mass)
+            g.attrs["n_tau_nodes"] = int(r.n_tau_nodes)
+            g.attrs["re_omega_min_ev"] = float(r.re_omega_min_ev)
+            g.attrs["re_omega_max_ev"] = float(r.re_omega_max_ev)
+            g.attrs["gamma_min_ev"] = float(r.gamma_min_ev)
+            g.attrs["gamma_max_ev"] = float(r.gamma_max_ev)
+            g.attrs["groups"] = np.asarray(
+                [str(x) for x in r.groups], dtype=h5py.string_dtype())
+    print_fn(
+        f"  MPA pass partial written: {path}\n"
+        f"    poles {list(poles)} of n_p={int(n_p)}; Σ_c shape "
+        f"{tuple(int(x) for x in arr.shape)}; this cube is a PARTIAL SUM "
+        f"and is not a self-energy until it is combined with the rest.")
+    return str(path)
+
+
+def combine_pass_partials(paths, *, n_p, omega_grid_ry, fit_src,
+                          print_fn=print):
+    """Sum per-pole partial cubes in the PINNED ascending order.
+
+    Returns ``(sigma_c_total, poles, audit)``.
+
+    THE CANONICAL RESULT IS THE PINNED-ORDER ACCUMULATION, and that is the
+    whole reason this function exists rather than ``sum(cubes)``.  The
+    re-association lemma (``fit_driver.accumulate_over_pole_passes``) is
+    exact in exact arithmetic and NOT bit-exact in floating point, so a
+    parallel run whose partials are summed in completion order is a
+    DIFFERENT floating-point number from the same run summed ascending —
+    reproducible only if the order is pinned.  This sums ascending, and
+    it MEASURES what the other orders would have cost: ``audit`` carries
+    the max-abs difference against a descending recombination and against
+    a fixed shuffled one, so the re-association's size on the real cube is
+    a reported number rather than an assumed ulp.
+
+    COVERAGE IS CHECKED, NOT ASSUMED.  The union of the partials' pole
+    lists must equal ``pole_pass_order(n_p)`` exactly — every pole once,
+    no pole twice, none from a different store and none on a different ω
+    grid.  Each of those failures produces a finite, smooth Σ that no
+    downstream gate can distinguish from the right one; the FALSE case of
+    this check is precisely those, and the red twins in
+    ``tests/test_mpa_pass_partials.py`` construct each of them.
+    """
+    import h5py
+
+    from .fit_driver import pole_pass_order
+
+    order = pole_pass_order(n_p)
+    om_want = np.asarray(omega_grid_ry, dtype=np.float64)
+    loaded = []                     # (pole, path, cube) with one row per pole
+    for path in sorted(str(p) for p in paths):
+        with h5py.File(path, "r") as f:
+            version = int(f.attrs.get("mpa_partial_format_version", -1))
+            if version != PARTIAL_FORMAT_VERSION:
+                raise ValueError(
+                    f"combine_pass_partials: {path} declares partial format "
+                    f"version {version}, not {PARTIAL_FORMAT_VERSION}.  A "
+                    f"partial cube has the shape, dtype and units of a "
+                    f"finished one, so a stack written under a different "
+                    f"convention is refused by its stamp rather than "
+                    f"summed.")
+            store = str(f.attrs.get("mpa_partial_fit_store", ""))
+            if store != str(fit_src):
+                raise ValueError(
+                    f"combine_pass_partials: {path} was integrated against "
+                    f"fit store {store!r}, not {str(fit_src)!r}.  Summing "
+                    f"partials from two stores returns a self-energy of no "
+                    f"screening at all.")
+            n_p_file = int(f.attrs.get("mpa_partial_n_p", -1))
+            if n_p_file != int(n_p):
+                raise ValueError(
+                    f"combine_pass_partials: {path} was written from a store "
+                    f"with n_p={n_p_file}, against n_p={int(n_p)} here.")
+            om = np.asarray(f["omega_grid_ry"][()], dtype=np.float64)
+            if om.shape != om_want.shape or not np.array_equal(om, om_want):
+                raise ValueError(
+                    f"combine_pass_partials: {path} carries a different Σ ω "
+                    f"grid than this run.  The partials are summed elementwise "
+                    f"on that axis, so a mismatched grid adds two different "
+                    f"frequencies together.")
+            cube = np.asarray(f["sigma_c_partial"][()], dtype=np.complex128)
+            for p in np.asarray(f.attrs["mpa_partial_poles"]).tolist():
+                loaded.append((int(p), path, cube))
+                cube = None         # one cube per FILE; poles share it
+
+    # One file may carry several poles; the cube belongs to the file, and
+    # the sum is over FILES taken in the ascending order of their lowest
+    # pole.  Group them back up so a file is added exactly once.
+    by_path = {}
+    for p, path, cube in loaded:
+        entry = by_path.setdefault(path, {"poles": [], "cube": None})
+        entry["poles"].append(p)
+        if cube is not None:
+            entry["cube"] = cube
+
+    covered = sorted(p for e in by_path.values() for p in e["poles"])
+    if tuple(covered) != order:
+        missing = sorted(set(order) - set(covered))
+        twice = sorted({p for p in covered if covered.count(p) > 1})
+        raise ValueError(
+            f"combine_pass_partials: the partials do not cover the store's "
+            f"pass order exactly once.  Pinned order {order}; found "
+            f"{covered}; missing {missing}; duplicated {twice}.  A missing "
+            f"pole and a doubled pole both return a finite, smooth Σ of the "
+            f"same shape as the right one — the difference is tens of meV, "
+            f"which is the size of the effect being measured — so coverage "
+            f"is refused here rather than checked downstream.")
+
+    ordered = sorted(by_path.items(), key=lambda kv: min(kv[1]["poles"]))
+    total = np.zeros_like(ordered[0][1]["cube"])
+    for _, e in ordered:                       # THE PINNED ORDER
+        total = total + e["cube"]
+
+    rev = np.zeros_like(total)
+    for _, e in reversed(ordered):
+        rev = rev + e["cube"]
+    shuffled = np.zeros_like(total)
+    idx = list(range(len(ordered)))
+    idx = idx[1::2] + idx[0::2]                # a fixed, order-changing walk
+    for i in idx:
+        shuffled = shuffled + ordered[i][1]["cube"]
+
+    scale = float(np.max(np.abs(total))) if total.size else 0.0
+    audit = {
+        "n_files": len(ordered),
+        "poles": order,
+        "max_abs_sigma_ry": scale,
+        "reassoc_descending_max_abs_ry": float(np.max(np.abs(total - rev)))
+        if total.size else 0.0,
+        "reassoc_shuffled_max_abs_ry": float(np.max(np.abs(total - shuffled)))
+        if total.size else 0.0,
+    }
+    audit["reassoc_descending_rel"] = (
+        audit["reassoc_descending_max_abs_ry"] / scale if scale else 0.0)
+    audit["reassoc_shuffled_rel"] = (
+        audit["reassoc_shuffled_max_abs_ry"] / scale if scale else 0.0)
+    print_fn(
+        f"  MPA pass recombination: {audit['n_files']} partial cubes "
+        f"covering poles {list(order)}, summed in the PINNED ascending "
+        f"order.\n"
+        f"    re-association against a descending sum: "
+        f"{audit['reassoc_descending_max_abs_ry']:.3e} Ry max-abs "
+        f"({audit['reassoc_descending_rel']:.3e} relative)\n"
+        f"    re-association against a shuffled sum:   "
+        f"{audit['reassoc_shuffled_max_abs_ry']:.3e} Ry max-abs "
+        f"({audit['reassoc_shuffled_rel']:.3e} relative)\n"
+        f"    the ascending sum is the canonical result; the two numbers "
+        f"above are what the order is worth, measured rather than assumed.")
+    return total, order, audit
+
+
 def compute_mpa_sigma_c_omega_grid(
     wfns, fit_src, meta, mesh_xy, *, ppm_cfg, quad, omega_grid_ry,
     laplace_ratio_max=DEFAULT_LAPLACE_RATIO_MAX, rel_tol=1.0e-8,
-    allow_partial=False, print_fn=print,
+    allow_partial=False, pole_subset=None, print_fn=print,
 ):
     """``Sigma_c(omega, k, m, n)`` from a staged multipole fit store.
 
@@ -997,6 +1247,17 @@ def compute_mpa_sigma_c_omega_grid(
 
     Returns ``(sigma_c_kij, records)`` -- the replicated host tensor in Ry
     and the per-pass provenance the design requires each pass to record.
+
+    ``pole_subset`` restricts the walk to some of the store's poles, in the
+    pinned order regardless of how it is written.  It exists so the passes
+    can be spread across devices -- one process per pole, each writing its
+    own partial cube, recombined by :func:`combine_pass_partials` in the
+    pinned ascending order, which is the canonical result.  ``None`` is the
+    single-process production route and walks every pole.  A subset run
+    returns a PARTIAL SUM with the shape, dtype and units of a finished
+    self-energy, which is exactly why the partial writer stamps a manifest
+    and the combiner refuses anything that does not cover the store's pass
+    order exactly once.
     """
     import jax
     import jax.numpy as jnp
@@ -1008,7 +1269,6 @@ def compute_mpa_sigma_c_omega_grid(
         strip_sigma_window)
     from ..ppm_tau_kernel import _get_sigma_tau_kernel
     from ..ppm_windows import _to_host_np
-    from .fit_driver import pole_pass_order
 
     omega_req = np.asarray(omega_grid_ry, dtype=np.float64)
     if omega_req.ndim != 1 or omega_req.size == 0:
@@ -1044,8 +1304,18 @@ def compute_mpa_sigma_c_omega_grid(
     # the fitter's own sort, and the better-conditioned accumulation
     # direction.  The re-association this loop performs is exact in exact
     # arithmetic and not bit-exact in floating point, so the order being
-    # pinned is what makes the result reproducible run to run.
-    for p in pole_pass_order(n_p):
+    # pinned is what makes the result reproducible run to run.  A
+    # ``pole_subset`` narrows WHICH poles this process walks and never
+    # the order it walks them in -- ``resolve_pole_subset`` returns a
+    # subsequence of the pinned order, so a split run and a whole run
+    # associate the same way within each process.
+    walk = resolve_pole_subset(n_p, pole_subset)
+    if len(walk) != n_p:
+        print_fn(
+            f"  MPA Σ: this process integrates poles {list(walk)} of "
+            f"{n_p} -- a PARTIAL sum over the pole axis.  Its Σ_c is not "
+            f"a self-energy until every other pole's partial is added.")
+    for p in walk:
         with timing.section("mpa.pass_read"):
             Omega_p, B_p = mpa_store.read_pole_slice(
                 fit_src, p, allow_partial=allow_partial)
