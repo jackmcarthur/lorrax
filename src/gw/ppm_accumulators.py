@@ -46,13 +46,28 @@ def _project_tau_onto_omega_np(
                          here, which is what licenses the merged single-chain
                          plan (the default and only Laplace path — owner
                          order 2026-07-28).
-        code=1 ("imag")  Crossing window — keep only Im[coeff·σ]
-                         = coeff_re·σ_im + coeff_im·σ_re (real, up-cast to
-                         c128): S_R and S_I are weighted by two INDEPENDENT
-                         real ω-vectors, so both channels must arrive
-                         separately (they cannot be recovered from X — see the
-                         channel-plan doc in
-                         ppm_tau_kernel._make_project_ri_reduce_scatter).
+        code=1 ("imag")  Crossing window — keep the OPERATOR imaginary part
+                         Im_op[coeff·X] = (coeff·X − (coeff·X)†)/2i with
+                         X = S_R + i·S_I and † the (i, j) band adjoint.
+                         This is the analytic completion of the one-sided τ
+                         grid: the sine sum stands in for sin(τ·u) at the
+                         COMPLEX pole argument u_μν = ω̃ − E ∓ Ω_μν, whose
+                         missing exponential is B_μν e^{+iτu_μν} = (Z†)_μν
+                         (exact given B Hermitian and Ω̄_μν = Ω_νμ) — i.e.
+                         the conjugate of the (μ, ν) PAIR, not of each
+                         scalar.  The elementwise form
+                         coeff_re·σ_im + coeff_im·σ_re equals Im_op only
+                         where σ^τ is complex-symmetric, which under TRS
+                         holds only at k ≡ −k: on the Si 4×4×4 arm-b deck
+                         the elementwise form left Σ_c exactly Hermitian at
+                         the three TRIM k and non-Hermitian by 8.8–30.3 eV
+                         at the five others (Σ_c star spread 43.85 eV diag;
+                         measured 2026-08-09,
+                         /pscratch/sd/j/jackm/sigc_star_0809/).  Im_op
+                         reduces to the elementwise form bit-for-bit at
+                         TRIM (S_R, S_I Hermitian ⇒ both give
+                         Re(c)·S_I + Im(c)·S_R), which is the invariance
+                         gate pinning this change.
 
     Channel carriers mirror the codes one-to-one.  Laplace (code=0): the
     merged kernel ships X = S_R + i·S_I as ONE complex tile —
@@ -99,10 +114,17 @@ def _project_tau_onto_omega_np(
             "(ppm_sigma window dispatch bug).")
     if project_code != 1:
         raise ValueError(f"Unknown project_code {project_code}")
-    coeff_re = np.real(coeff).reshape(-1, 1, 1, 1)
-    coeff_im = np.imag(coeff).reshape(-1, 1, 1, 1)
-    # Crossing window — keep Im[coeff·σ]
-    contrib = coeff_re * sigma_im[None, ...] + coeff_im * sigma_re[None, ...]
+    # Crossing window — keep the OPERATOR imaginary part
+    #     Im_op[coeff·X] = (coeff·X − (coeff·X)†)/2i,   X = S_R + i·S_I,
+    # NOT the elementwise Im (coeff_re·S_I + coeff_im·S_R).  The two agree
+    # exactly where σ^τ is complex-symmetric (⇔ S_R, S_I Hermitian), which
+    # under time reversal holds only at k ≡ −k mod G — the elementwise form
+    # broke the Σ star relation at every non-TRIM k (43.85 eV diag spread on
+    # the Si 4×4×4 arm-b deck) while leaving TRIM k exact.  See the
+    # project_code=1 docstring above for the derivation and the measurement.
+    X = sigma_re + 1j * sigma_im
+    T = coeff.reshape(-1, 1, 1, 1) * X[None, ...]
+    contrib = (T - np.conj(np.swapaxes(T, -1, -2))) / 2j
     return np.asarray(contrib, dtype=np.complex128)
 
 
