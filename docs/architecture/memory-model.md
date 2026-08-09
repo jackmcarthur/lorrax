@@ -681,7 +681,8 @@ which live across the γ̃ contract — `pair_density_slots` (3 on GPU XLA,
 4 on CPU XLA) captures this in the G-flat planner.
 
 Pre-Round-6 reference (legacy
-`profiles/xprof/cohsex_prod-20260303-112900/...`):
+`tests/profiles/xprof/cohsex_prod-20260303-112900/...` — the blobs are tracked
+under `tests/`, not at the repo root this line used to name):
 `jit__compute_ZCT_LR` `peakHeapMib ~= 1794`, `jit__solve_all_q`
 `~= 1485`, `jit__compute_P_traced` `~= 480-493`.
 

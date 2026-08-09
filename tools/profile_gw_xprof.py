@@ -61,7 +61,9 @@ def main() -> int:
     old_argv = sys.argv[:]
     try:
         os.chdir(workdir)
-        # Mirror CLI invocation: python -m gw_isdf.gw_jax -i <input>
+        # Mirror CLI invocation: python -m gw.gw_jax -i <input>
+        # (was `gw_isdf.gw_jax` — that package no longer exists; the import
+        # below has been `from gw import gw_jax` since the rename.)
         sys.argv = ["gw_jax", "-i", args.input]
         from gw import gw_jax
 

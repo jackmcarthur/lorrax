@@ -2701,8 +2701,18 @@ stage is standing outside — is still there.
   shipped weight rows on **both** sampling lines.  17 ship sparse (1.70-2.49x
   against one composite rule per line) and 12 ship composite (1.11-1.19x, from
   the sharing alone).
-- **`tests/test_damped_line_tables.py` is 120 passed, 1 failed at this head**,
-  and the one red is `test_the_catalog_covers_the_span_and_tier_ladder`.  It is
+- ~~**`tests/test_damped_line_tables.py` is 120 passed, 1 failed at this head**~~
+  **— SUPERSEDED, see "The far-line contradiction, settled" below.  This exact
+  120/1 count is the one that section records as NOT REPRODUCIBLE on these
+  bytes.  The measured figure is 16 failed / 105 passed** (re-measured again
+  2026-08-09 by the landing-completeness audit, in a clean worktree at
+  `bc37b4d3` with PYTHONPATH pinned: `16 failed, 105 passed` in 79.45 s, the
+  same sixteen cells by name).  The paragraph is kept unedited below because
+  this file strikes in place rather than deleting, but read it knowing that the
+  `--spans 200 --merge` command it names closes **one** of the sixteen, not the
+  whole red — the other fifteen are the far-line stamp defect, which is a
+  generator bug and not a coverage gap.
+  ~~and the one red is `test_the_catalog_covers_the_span_and_tier_ladder`.~~  It is
   the test doing its job: the ladder declares eight spans and the sweep landed
   seven of them plus one tier of the eighth, so three cells (`A = 200` at
   1e-8, 1e-10 and 1e-12) are absent.  They are absent for COST, not
