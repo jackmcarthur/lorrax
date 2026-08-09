@@ -435,7 +435,10 @@ def head_slot_table(
         else:
             K_sel = (qf[:, None] + gvec[qi][:, sel]).T @ bvec_f
             h = np.asarray(v_head_fn(K_sel), dtype=np.float64)
-            v_avg[qi] = float(h.mean()) if h.size > 1 else float(h)
+            # ``h`` is (m,) even at m == 1 — v_head_fn's contract is a
+            # 1-D return.  The mean over a one-element tied set is that
+            # element, so this is the tied-set rule with no branch.
+            v_avg[qi] = float(np.mean(h))
 
     k_meas = int(mult.max()) if n_q else 0
     k = int(k_max) if k_max else max(1, k_meas)
