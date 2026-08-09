@@ -1979,6 +1979,72 @@ reader scanning for "w0_resolvent" finds a row saying it was fixed.  Anyone
 adding a row for either cell should spell the full node id.
 
 
+### The `wq_resolvent` red is NOT the stale-artifact family — ELIMINATED
+
+`test_bse_w0_resolvent::test_wq_resolvent_matches_restart_finite_q` stays **red
+and undiagnosed**; this is not a strike.  What is closed is one branch of the
+search space, because the obvious hypothesis — "a W test scored against a
+pre-head-fix restart", i.e. the same defect `FIX_driver_blockers.md` §3 found
+under `bse_nontda` — is **impossible**, on two independent grounds.  Recorded so
+the next lane does not spend the hours confirming it.
+
+**1. The fixture regenerates its own restart, every run, on the tree under
+test.**  The cell takes `gnppm_session`, and `tests/conftest.py` defines it as a
+*fresh* run:
+
+```python
+@pytest.fixture(scope="session")
+def gnppm_session(tmp_path_factory):
+    """Fresh (restart=false) run of the gnppm fixture; Tier-1 state."""
+    return _run_session_case(tmp_path_factory, "gnppm_debug", "gnppm_test.in", ...)
+```
+
+`_run_session_case` copies the fixture into a fresh tmp dir and calls
+`harness.run_gw_jax` — a full GW run, `restart = false`, in the same process
+tree as the assertion.  The restart the cell reads is minted minutes earlier by
+the code being tested.  There is no artifact old enough to be stale, which is
+also why the red reproduces at three unrelated bases.
+
+**2. The quantity the hypothesis blames is 7.15e-12 on this deck, and always
+was.**  Measured off the raw `isdf_tensors_399.h5` datasets of three independent
+gnppm restarts (`agent_defects_0807/run_gnppm_{before,after2}`,
+`zeta_sweep/runs/gnppm/rc_1em8`), written on three different days by three
+unrelated lanes — **two of them before the head fix landed**:
+
+| tile | `max｜A(q) − conj(A(−q))｜ / max｜A｜` | `(μ,ν)`-Hermitian |
+|---|---:|---:|
+| `W0_qmunu` | **7.150631e-12** | 1.047778e-13 |
+| `V_qmunu` | **9.006628e-17** | 8.905173e-17 |
+
+Identical to seven digits across all three.  For contrast, the artifact that
+*did* carry the defect — `perf_bse_0808/deck_si444`, and an independent GW
+re-run of the same deck on the pre-fix tree — measures **8.635142e-04 /
+4.274267e-03**, and the same deck regenerated on `66d2a02c` measures
+**1.816708e-11 / 2.975721e-15**.  The mini-BZ head-slot defect is a property of
+the Si 4×4×4 deck's q=0 head slot; **the MoS2 3×3×1 fixture never carried it**.
+So even if this cell did reuse an old artifact, the old artifact would be clean.
+
+Instrument: `perf_bse_0808/nontda/probe_recip2.py` (login node, plain
+`h5py`/`numpy`, no container).  Evidence and the rest of the wave in
+`FIX_nontda_feature.md`.
+
+**Where a diagnosis should start instead.**  Two leads, neither measured, both
+recorded so they can be scored rather than retrofitted:
+
+* `bse_w_exact.build_finite_q_data`'s own docstring records that applying the
+  design-doc umklapp phase "breaks the match (**rel_err 0.6–3.2** vs 1e-8)".
+  The observed **6.87e-01** sits inside that band.
+* The cell's q comes from `_symmetry_reduced_q_list` →
+  `SymMaps.q_irr_kgrid_int`, and the one commit touching *both* this test file
+  and `bse_w_exact.py` is `e9e0acd3`, the symmetry_maps door replumb — whose
+  census was **WSL/CPU only**, a suite in which this `@pytest.mark.gpu` cell
+  does not run.  A labelling change behind that door would be invisible to it.
+
+`perf_bse_0808/nontda/probe_wq.py` decides between "the resolvent is right and
+is being scored against the wrong tile" and "the finite-q operator is wrong" in
+a single solve, by scanning the resolved columns against every tile in the grid.
+
+
 ## FIXES + MPA LANDING — four re-earned fixes and the MPA stack (2026-08-08)
 
 The 2026-08-08 fix queue and the multipole-W infrastructure, landed together
