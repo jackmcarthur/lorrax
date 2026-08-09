@@ -17,7 +17,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import replicate_to_mesh
-from common.fft_helpers import make_sharded_ifftn_3d
+from common.fft_helpers import get_donated_ifftn_3d
 
 from solvers.lanczos import (
     FULL_REORTH,
@@ -248,23 +248,12 @@ def solve_bse_sharded(
             mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
         )
 
-    # W_R = ifft_q(W_q) computed ONCE inside the outer jit. Use the
-    # gw_jax custom-partitioned IFFT helper — plain ``jnp.fft.ifftn`` on
-    # a sharded tensor inserts a 337-MiB all-gather around the FFT under
-    # current JAX even when the FFT axes are unsharded; the helper hides
-    # the FFT in an opaque primitive so XLA only sees a per-device local
-    # FFT (axes (2,3,4) of W_q are replicated; (μ,ν) stay on x,y).
-    if include_W:
-        # 3D cuFFT in one shot rather than 3 sequential 1D custom_partitioning
-        # calls (the older ``make_jittable_local_ifftn_3d``).  Same correctness
-        # constraint (FFT axes replicated); ~5–10× fewer transposes in the
-        # generated HLO.
-        _W_local_ifftn = make_sharded_ifftn_3d(
-            mesh_xy, sh.W.spec, sh.W.spec, axes=(2, 3, 4), norm='ortho')
-    else:
-        _W_local_ifftn = None
-
     # ── W_R = ifft_q(W_q) at a REAL top-level dispatch boundary, W_q DONATED ──
+    # Why the sharded helper and not ``jnp.fft.ifftn``: a plain ifftn on a
+    # sharded tensor inserts a 337-MiB all-gather around the FFT under current
+    # JAX even when the transformed axes are unsharded.  The helper hides the
+    # transform in an opaque per-device primitive, so XLA only ever sees a local
+    # FFT (axes (2,3,4) of W_q are replicated; μ, ν stay on x, y).
     # This used to run INSIDE ``_full_run`` (and inside the Davidson block).
     # There it can never free W_q: W_q is a jit PARAMETER, so its buffer is
     # owned by the caller for the whole call and XLA has no same-shape OUTPUT
@@ -313,7 +302,25 @@ def solve_bse_sharded(
 
     if include_W:
         with timing.section("bse.solve.W_ifft") as _sec_wifft:
-            _W_ifft_donated = jax.jit(_W_local_ifftn, donate_argnums=(0,))
+            # 3-D cuFFT in one shot rather than three sequential rank-1
+            # custom_partitioning calls (the older ``make_jittable_local_ifftn_3d``).
+            # Same correctness constraint (the transformed axes are replicated);
+            # ~5-10x fewer transposes in the generated HLO.
+            #
+            # The transform and its donating jit come from the MEMOISED accessor,
+            # not from a fresh ``make_sharded_ifftn_3d`` + ``jax.jit`` pair built
+            # here.  Built here, the wrapper object was new on every call, so jax's
+            # dispatch cache started empty and a byte-identical program was
+            # re-traced, re-lowered and re-probed against the persistent compile
+            # cache every time this function ran — ~20-23 ms against ~1.0 ms of
+            # execution on the record deck at P=4, and flat across calls, which is
+            # the construction signature (FIX_construction_defects.md §1; the same
+            # defect PRECOND_BUILD_FREE.md §3.1 fixed for the exact-diagonal build
+            # and named at §7.2).  Donation is unchanged: the accessor sets
+            # ``donate_argnums=(0,)`` and the alias is gated in
+            # tests/test_bse_w_ifft_hoist.py.
+            _W_ifft_donated = get_donated_ifftn_3d(
+                mesh_xy, sh.W.spec, axes=(2, 3, 4), norm='ortho')
             W_R = _W_ifft_donated(data["W_q"])
             data["W_q"] = None          # release the caller-side reference
             _sec_wifft.watch(W_R)
