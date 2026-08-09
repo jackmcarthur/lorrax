@@ -1205,3 +1205,281 @@ def test_zeta_q_inode_gets_striping_policy(tmp_path, single_device_mesh):
         f"striping hints — check that fit_zeta_to_h5 still creates it with "
         f"SlabIO(mode='w') BEFORE copy_mf_header(dst_mode='a')."
     )
+
+
+# ===========================================================================
+#  create_dataset(attrs=) — the transport WRITES them
+# ===========================================================================
+# Registered by the isolation-edge landing (`fef002e9`) as a production
+# defect and fixed on 2026-08-08.  The transport used to answer
+# ``create_dataset(..., attrs=...)`` with a ``warnings.warn`` and no
+# write, and it is SlabIO's only transport, so every cluster-written
+# ``sigma_mnk.h5`` lost the ``k_storage="ibz"`` stamp that says its k
+# axis is a wedge.  ``kin_ion.read_star_map`` is specified so that no
+# stamp means the full BZ — the back-compat rule that keeps every
+# pre-format file readable — so those files did not fail, they read back
+# as full-BZ and every k_irr consumer indexed full-BZ rows into an
+# nrk-row array.
+#
+# The two end-to-end cells for that live in
+# ``tests/test_sigma_kirr_extraction.py`` and need the transport, which
+# is why the defect survived: on a box with no phdf5 write symbol they
+# skip, and every WSL verification for four days was a skip reported as
+# a pass.  So the contract is pinned at BOTH altitudes here — the
+# transport's own attr writer, which needs nothing but h5py and runs
+# everywhere, and the full SlabIO round trip, which needs the library.
+
+def _attr_signature(ds) -> dict:
+    """What the FILE holds for each attr — value, shape AND storage type.
+
+    The dtype is in here because it is where the interesting way to get
+    this wrong lives: ``ds.attrs["k_storage"] = "ibz"`` stores a
+    variable-length UTF-8 string and reads back as ``str``, while the
+    same assignment through ``np.asarray`` stores a fixed-length byte
+    string that reads back as ``b"ibz"`` — and
+    :func:`file_io.kin_ion.read_star_map` calls ``str()`` on what it
+    reads, so the second spelling yields the literal ``"b'ibz'"`` and
+    refuses the file.  A comparison on values alone would call those two
+    files identical.
+    """
+    out = {}
+    for key in ds.attrs:
+        val = ds.attrs[key]
+        out[key] = (str(ds.attrs.get_id(key).dtype),
+                    np.shape(val),
+                    val.tolist() if isinstance(val, np.ndarray) else val)
+    return out
+
+
+def _k_irr_stamp():
+    """The real stamp, in the writer's own vocabulary — not a toy dict.
+
+    Mixed on purpose: a string (the one with the dtype trap), an int, a
+    numpy float and a plain float, because the transport hands all four
+    to h5py and the point of the cells below is that it hands them over
+    unchanged.
+    """
+    from file_io.kin_ion import (K_STORAGE_ATTR, K_STORAGE_IBZ,
+                                 K_STORAGE_VERSION,
+                                 K_STORAGE_VERSION_ATTR)
+    return {
+        K_STORAGE_ATTR: K_STORAGE_IBZ,
+        K_STORAGE_VERSION_ATTR: K_STORAGE_VERSION,
+        "n_sym_spatial": 12,
+        "nk_full": 9,
+        "sigma_star_spread_raw_ev": np.float64(113.08),
+        "sigma_star_spread_omega_index": 2.0,
+    }
+
+
+def test_the_attr_writer_writes_what_the_host_path_would_write(tmp_path):
+    """THE WSL TWIN, and it needs no transport: same bytes, both ways.
+
+    ``_apply_dataset_attrs`` is the function close() runs inside its
+    rank-0 reopen, so calling it on a file h5py made exercises exactly
+    the code the cluster runs — without the phdf5 write symbol the
+    round-trip cells need.  The reference is a plain
+    ``ds.attrs[key] = value``, which is what the host-side writers
+    (``gw.kin_ion_io``, ``sigma_output.append_qsgw_datasets_h5``) do, so
+    what this asserts is that a stamp written by the transport and the
+    same stamp written host-side are the same file, not merely the same
+    intention.
+    """
+    from file_io._slab_io_ffi import _apply_dataset_attrs
+
+    stamp = _k_irr_stamp()
+    payload = np.arange(6, dtype=np.complex128).reshape(2, 3)
+
+    transport = tmp_path / "transport.h5"
+    with h5py.File(str(transport), "w") as f:
+        f.create_dataset("sigma_c_kij_ev", data=payload)
+        _apply_dataset_attrs(f, [("sigma_c_kij_ev", stamp)])
+
+    host = tmp_path / "host.h5"
+    with h5py.File(str(host), "w") as f:
+        ds = f.create_dataset("sigma_c_kij_ev", data=payload)
+        for key, val in stamp.items():
+            ds.attrs[key] = val
+
+    with h5py.File(str(transport), "r") as f:
+        got = _attr_signature(f["sigma_c_kij_ev"])
+    with h5py.File(str(host), "r") as f:
+        want = _attr_signature(f["sigma_c_kij_ev"])
+    assert got == want, (
+        "the transport's attr writer and the host path disagree about "
+        "what to put in the file for the same stamp")
+    assert set(got) == set(stamp), "an attr did not reach the file at all"
+
+
+def test_the_writers_stamp_survives_its_own_reader(tmp_path):
+    """The consequence, end to end at the h5py altitude.
+
+    The cell above pins byte-identity; this one pins that the bytes are
+    the ones ``read_star_map`` accepts.  It is the assertion the dtype
+    trap would fail: a fixed-length ``k_storage`` reads back as
+    ``b"ibz"``, ``str()`` of which is neither ``"ibz"`` nor ``"full"``,
+    and the reader refuses.
+    """
+    from file_io._slab_io_ffi import _apply_dataset_attrs
+    from file_io.kin_ion import (IRR_IDX_DATASET, SYM_IDX_DATASET,
+                                 read_star_map)
+
+    irr = np.array([0, 1, 1, 0], dtype=np.int32)
+    sidx = np.array([0, 0, 3, 5], dtype=np.int32)
+    path = tmp_path / "wedge.h5"
+    with h5py.File(str(path), "w") as f:
+        f.create_dataset("sigma_c_kij_ev",
+                         data=np.zeros((4, 2, 3, 3), dtype=np.complex128))
+        f.create_dataset(IRR_IDX_DATASET, data=irr)
+        f.create_dataset(SYM_IDX_DATASET, data=sidx)
+        _apply_dataset_attrs(f, [("sigma_c_kij_ev", _k_irr_stamp())])
+
+    star = read_star_map(str(path), "sigma_c_kij_ev", k_axis=1)
+    assert star is not None, (
+        "the stamp did not survive the writer, so a two-row wedge reads "
+        "back as a two-k full-BZ cube")
+    np.testing.assert_array_equal(star[0], irr)
+    assert star[2] == 12
+
+
+def test_an_attr_for_a_missing_dataset_refuses(tmp_path):
+    """The regression twin for the SHAPE of the defect, not its instance.
+
+    Skipping a stamp whose dataset is not there is the same silent drop
+    wearing a plausible excuse, so it raises.  Every caller creates the
+    dataset in the same breath as the attrs, so this can only fire on a
+    transport bug and should read as one.
+    """
+    from file_io._slab_io_ffi import _apply_dataset_attrs
+
+    path = tmp_path / "empty.h5"
+    with h5py.File(str(path), "w") as f:
+        f.create_dataset("A", data=np.zeros(3))
+        with pytest.raises(KeyError, match="refusing to drop them silently"):
+            _apply_dataset_attrs(f, [("B", {"k_storage": "ibz"})])
+
+
+def test_slabio_create_dataset_attrs_reach_the_file(
+        tmp_path, single_device_mesh):
+    """THE RED TWIN, on the transport that had the defect.
+
+    This is the cell that was red before 2026-08-08 and could only ever
+    be red on a machine with the phdf5 write symbol.  Nothing here is
+    about Σ: it is the transport contract, that ``attrs=`` handed to
+    ``create_dataset`` is in the file when it closes.
+    """
+    _require_slabio()
+    stamp = _k_irr_stamp()
+    path = tmp_path / "attrs.h5"
+    with SlabIO(str(path), mode="w", mesh=single_device_mesh) as io:
+        io.create_dataset("A", shape=(3, 3), dtype=np.float64, attrs=stamp)
+        io.write_slab("A", np.ones((3, 3), dtype=np.float64))
+
+    with h5py.File(str(path), "r") as f:
+        got = _attr_signature(f["A"])
+        np.testing.assert_array_equal(np.asarray(f["A"]), np.ones((3, 3)))
+    missing = sorted(set(stamp) - set(got))
+    assert not missing, (
+        f"{missing} were handed to create_dataset(attrs=) and are not in "
+        f"the file — the transport is discarding the caller's metadata, "
+        f"which is how a wedge cube reads back as full-BZ")
+
+
+def test_slabio_and_h5py_write_attr_identical_files(
+        tmp_path, single_device_mesh):
+    """The two paths, the same call, the same file.
+
+    ``sigma_mnk.h5`` is written by BOTH — the Σ cubes through SlabIO and
+    the QSGW appendix through ``append_qsgw_datasets_h5``'s plain h5py —
+    so "the FFI transport writes attrs now" is not enough.  They have to
+    be the same attrs, stored the same way, or one file means two things
+    depending on which writer got to a dataset.
+    """
+    _require_slabio()
+    stamp = _k_irr_stamp()
+    a = np.arange(9, dtype=np.float64).reshape(3, 3)
+
+    through_slabio = tmp_path / "slabio.h5"
+    with SlabIO(str(through_slabio), mode="w", mesh=single_device_mesh) as io:
+        io.create_dataset("A", shape=(3, 3), dtype=np.float64, attrs=stamp)
+        io.write_slab("A", a)
+
+    through_h5py = tmp_path / "h5py.h5"
+    with h5py.File(str(through_h5py), "w") as f:
+        ds = f.create_dataset("A", data=a)
+        for key, val in stamp.items():
+            ds.attrs[key] = val
+
+    with h5py.File(str(through_slabio), "r") as f:
+        got, got_data = _attr_signature(f["A"]), np.asarray(f["A"])
+    with h5py.File(str(through_h5py), "r") as f:
+        want, want_data = _attr_signature(f["A"]), np.asarray(f["A"])
+    assert got == want
+    assert got_data.tobytes() == want_data.tobytes()
+
+
+def test_slabio_create_dataset_does_not_warn_about_attrs(
+        tmp_path, single_device_mesh):
+    """The discard's ghost.  A warning here means the drop came back.
+
+    ``chunks`` is deliberately NOT passed: that one still warns, because
+    HDF5 fixes layout at create time and no later write can change it,
+    and a hint that is silently dropped is the next instance of this
+    same defect.  ``attrs`` is data and must be neither dropped nor
+    warned about.
+    """
+    _require_slabio()
+    import warnings
+
+    path = tmp_path / "quiet.h5"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with SlabIO(str(path), mode="w", mesh=single_device_mesh) as io:
+            io.create_dataset("A", shape=(3, 3), dtype=np.float64,
+                              attrs=_k_irr_stamp())
+            io.write_slab("A", np.ones((3, 3), dtype=np.float64))
+    # Filtered rather than counted: this opens a real file on a real
+    # stack, and turning every unrelated jax/h5py DeprecationWarning into
+    # a failure of THIS claim would be a red that means nothing.
+    about_attrs = [str(w.message) for w in caught
+                   if "attrs" in str(w.message).lower()]
+    assert not about_attrs, (
+        f"create_dataset(attrs=) warned: {about_attrs}.  A transport that "
+        f"drops the caller's data with a warning is the defect; the attrs "
+        f"are written now and there is nothing to warn about")
+
+
+def test_slabio_says_chunks_are_dropped_once_per_file(
+        tmp_path, single_device_mesh):
+    """The other half of the same rule: say it, and say it once.
+
+    ``chunks`` genuinely cannot be honoured — HDF5 fixes layout at
+    H5Dcreate and the collective create takes no chunk dims — so unlike
+    ``attrs`` it stays a hint, and a hint that is dropped silently is
+    the next instance of this defect.  But ``sigma_output`` passes it on
+    all four of its datasets, and four copies in the middle of the write
+    telemetry is how a warning stops being read, which is how the attrs
+    discard survived four days of runs.  So: once per file, naming the
+    file, and covering the rest of it.
+    """
+    _require_slabio()
+    import warnings
+
+    path = tmp_path / "chunky.h5"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with SlabIO(str(path), mode="w", mesh=single_device_mesh) as io:
+            io.create_dataset("A", shape=(3, 3), dtype=np.float64,
+                              chunks=(1, 3))
+            io.create_dataset("B", shape=(3, 3), dtype=np.float64,
+                              chunks=(1, 3))
+            io.create_dataset("C", shape=(3, 3), dtype=np.float64)
+            io.write_slab("A", np.ones((3, 3), dtype=np.float64))
+    about_chunks = [str(w.message) for w in caught
+                    if "chunks" in str(w.message)]
+    assert len(about_chunks) == 1, (
+        f"expected exactly one chunks warning for this file, got "
+        f"{len(about_chunks)}: {about_chunks}")
+    assert "chunky.h5" in about_chunks[0], (
+        "the warning does not name the file it is about, so a caller "
+        "writing several files cannot tell which one is contiguous")

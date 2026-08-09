@@ -136,6 +136,21 @@ class SlabIO:
         every rank.  SlabIO never deletes-and-recreates (data loss) and
         never writes into the previous geometry (wrong extent, no
         symptom) — decisions.md 2026-08-04.
+
+        ``attrs`` ARE WRITTEN, as H5 attributes on this dataset, by rank
+        0 when the file closes — the transport cannot stamp them while
+        collective MPI-IO holds the file, so they land beside the
+        deferred :meth:`write_attr` metadata in the one reopen.  They are
+        therefore visible to a reader after ``close()`` and not before,
+        which is the only moment any reader has ever looked.  They used
+        to be DISCARDED with a warning, which is how a cluster-written
+        wedge Σ cube lost its ``k_storage`` stamp and read back as
+        full-BZ; see ``_slab_io_ffi._apply_dataset_attrs``.
+
+        ``chunks`` is a HINT and says so — once per file — when it
+        cannot be honoured: HDF5 fixes layout at create time and the
+        collective create takes no chunk dims, so a dataset this
+        transport creates is contiguous.
         """
         self._backend.create_dataset(
             name, shape=shape, dtype=dtype, chunks=chunks, attrs=attrs)
