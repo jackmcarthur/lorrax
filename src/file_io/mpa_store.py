@@ -5,11 +5,10 @@ MOVABLE.  It lives in ``src/file_io/`` because that is where the restart
 format layer lives today, but the multipole-W work is a staging area:
 when the MPA stage settles, both this module and ``gw/mpa/tiling.py``
 are expected to move as a pair (most likely into a ``mpa`` service
-alongside ``symmetry_maps``).  Nothing here imports from ``gw``, and
-:mod:`symmetry_maps.qirr_store` is imported LAZILY through :func:`_qs`,
-so the move costs an import line rather than a redesign.  It is also
-what lets this module sit in a tree where the q_irr checkpoint has not
-landed yet without breaking collection.
+alongside ``symmetry_maps``).  Nothing here imports from ``gw``, and the
+``symmetry_maps`` DOOR — not its submodules — is imported LAZILY through
+:func:`_qs`, so the move costs an import line rather than a redesign and
+importing ``file_io`` still costs no jax.
 
 WHAT THIS FORMAT IS.  The multipole-W fit needs W_c evaluated on the
 double-parallel sampling grid — ~2·n_p complex frequencies on two lines
@@ -115,9 +114,23 @@ QIRR_FORMAT_VERSION_FREQ = 2
 #: an axis, which is this day.
 QIRR_FORMAT_VERSIONS_READABLE = (1, 2)
 
-#: Rank of the stored dataset, per version.  This is the discriminant —
-#: not a consistency nicety.  See :func:`read_qirr_tensor`.
-_RANK_BY_VERSION = {1: 3, 2: 4}
+#: Rank of the stored dataset THIS format adds — version 2 is
+#: ``(n_omega, n_q, N_μ, N_μ)``.  The rank is the discriminant, not a
+#: consistency nicety; see :func:`read_qirr_tensor`.
+#:
+#: Version 1's rank is NOT restated here.  It is
+#: ``symmetry_maps.QIRR_RANK_BY_VERSION``'s to state and
+#: ``qirr_store.read_tensor``'s to enforce, and the format layer asks
+#: extenders in as many words to compose (``{**QIRR_RANK_BY_VERSION, 2:
+#: 4}``) rather than to restate — a second copy of "version 1 is rank 3"
+#: is a second thing to update on the day it is not.  Composed through
+#: :func:`_rank_by_version` because the door is imported lazily.
+_MPA_RANK = 4
+
+
+def _rank_by_version():
+    """Every version's rank: the format layer's table, plus ours."""
+    return {**_qs().QIRR_RANK_BY_VERSION, QIRR_FORMAT_VERSION_FREQ: _MPA_RANK}
 
 #: Sibling group holding the ω grid, its protocol provenance, and the
 #: per-frequency readiness ledger.  Beside the tensor and never
@@ -172,34 +185,51 @@ _QS_CACHE: list = []
 
 
 def _qs():
-    """The landed q_irr format layer, imported lazily and once.
+    """The ``symmetry_maps`` DOOR, imported lazily and once.
 
-    LAZY ON PURPOSE, twice over.  ``symmetry_maps.qirr_store`` is the
-    single source of truth for the table record, the digest, the
-    validation and the provenance idiom, and reimplementing any of that
-    here would be a second answer to "what does this file claim".  But
-    it is also a module that arrives with the symmetry checkpoint, and
-    this module is staged in a tree that may not have it yet — a
-    module-scope import would take the whole ``file_io`` package down
-    at collection on such a tree.  So the dependency is real, named,
-    and paid at first use.
+    THE DOOR, NOT THE SUBMODULE.  Everything this module needs from the
+    q_irr format layer — :class:`~symmetry_maps.QirrDest`,
+    :func:`~symmetry_maps.qirr_attr_str`,
+    :data:`~symmetry_maps.QIRR_VERSION_ATTR`,
+    :data:`~symmetry_maps.QIRR_TABLE_SUFFIX`,
+    :func:`~symmetry_maps.validate_qirr_tables`,
+    :func:`~symmetry_maps.qirr_generator_commit`,
+    :data:`~symmetry_maps.QIRR_RANK_BY_VERSION` and the read/stamp
+    entry points — is a TOP-LEVEL name on ``symmetry_maps``.  It was not
+    always: this module was written while the q_irr checkpoint was still
+    landing, when the format's plumbing was private to
+    ``symmetry_maps.qirr_store``, and it reached into that submodule for
+    thirty-four of them.  ``tests/test_layering.py``'s door rule counted
+    that reach, correctly — a consumer that imports a service's submodule
+    is a consumer that stops the service being replaceable — and the
+    checkpoint answered it by PUBLISHING the plumbing rather than by
+    letting a second store copy it.  The door's own docstring gives the
+    reason in the format layer's words.
+
+    STILL LAZY, for the reason that outlived the other one.
+    ``symmetry_maps`` is a jax-importing package and ``file_io`` is
+    imported by tools that want neither jax nor a device; paying the
+    dependency at first use rather than at collection is what keeps this
+    module dependency-light, which is half of what makes it MOVABLE (see
+    the module docstring).  The staging argument that it might sit in a
+    tree without the checkpoint is retired — the checkpoint is landed,
+    and this module now depends on names only it publishes.
     """
     if _QS_CACHE:
         return _QS_CACHE[0]
     try:
-        from symmetry_maps import qirr_store
+        import symmetry_maps
     except ImportError as exc:                              # pragma: no cover
         raise ImportError(
-            "file_io.mpa_store needs symmetry_maps.qirr_store — the "
-            "q_irr restart format layer that lands with the symmetry "
-            "checkpoint.  The frequency-resolved layout is that format "
-            "with a leading ω axis and it shares its table record, "
-            "digest, validation and provenance stamp rather than "
-            "restating them.  Install/branch onto a tree that carries "
-            "it."
+            "file_io.mpa_store needs the symmetry_maps service — the "
+            "q_irr restart format layer.  The frequency-resolved layout "
+            "is that format with a leading ω axis and it shares its "
+            "table record, digest, validation and provenance stamp "
+            "rather than restating them.  Install/branch onto a tree "
+            "that carries it."
         ) from exc
-    _QS_CACHE.append(qirr_store)
-    return qirr_store
+    _QS_CACHE.append(symmetry_maps)
+    return symmetry_maps
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +435,7 @@ def allocate_w_omega(
             "symmetry_maps.verify_centroid_orbit_closure.")
     closure_verdict.raise_if_not_closed(
         f"allocate_w_omega({name!r}) refuses q_irr storage")
-    with qs._Dest(dest, mode) as grp:
+    with qs.QirrDest(dest, mode) as grp:
         if name in grp:
             del grp[name]
         grp.create_dataset(name, shape=shape, dtype=dtype)
@@ -455,7 +485,7 @@ def stamp_w_omega(
     if n_rmu_logical is not None:
         can = can.logical(int(n_rmu_logical)).canonical()
 
-    with qs._Dest(dest, mode) as grp:
+    with qs.QirrDest(dest, mode) as grp:
         if name not in grp:
             raise KeyError(
                 f"mpa_store: {name!r} is not in this file.  "
@@ -529,7 +559,7 @@ def stamp_w_omega(
 
         # THE VERSION BUMP AND THE AXIS.  Written AFTER the v1 stamp so
         # it overwrites rather than races it.
-        ds.attrs[qs._VERSION_ATTR] = np.int64(QIRR_FORMAT_VERSION_FREQ)
+        ds.attrs[qs.QIRR_VERSION_ATTR] = np.int64(QIRR_FORMAT_VERSION_FREQ)
         ds.attrs[_FREQ_ATTR] = _FREQ_ATTR_VALUE
         ds.attrs["mpa_n_omega"] = np.int64(n_omega)
         ds.attrs["mpa_omega_units"] = "Ha"
@@ -573,7 +603,7 @@ def write_w_slab(dest, name, i_omega, W_q_munu, *, ready=True, mode="a"):
     """
     qs = _qs()
     X = np.asarray(W_q_munu)
-    with qs._Dest(dest, mode) as grp:
+    with qs.QirrDest(dest, mode) as grp:
         ds, mgrp = _open_w(grp, name)
         i = int(i_omega)
         n_omega = int(ds.shape[0])
@@ -628,7 +658,7 @@ def read_w_header(src, name, *, mode="r"):
     the format about what it is holding.
     """
     qs = _qs()
-    with qs._Dest(src, mode) as grp:
+    with qs.QirrDest(src, mode) as grp:
         ds, mgrp = _open_w(grp, name)
         version = _refuse_unless_rank_matches_version(ds, name)
         if version != QIRR_FORMAT_VERSION_FREQ:
@@ -680,14 +710,14 @@ def read_w_header(src, name, *, mode="r"):
                     f"not exist.")
 
         sampling = {
-            "protocol": qs._attr_str(ds, "mpa_protocol"),
+            "protocol": qs.qirr_attr_str(ds, "mpa_protocol"),
             "varpi": np.asarray(ds.attrs["mpa_varpi"], dtype=np.float64),
             "n_p": int(ds.attrs["mpa_n_p"]),
             "alpha": int(ds.attrs["mpa_alpha"]),
             "omega_max": float(ds.attrs["mpa_omega_max"]),
         }
         recomputed = omega_grid_digest(omega, line, sampling)
-        stamped_hash = qs._attr_str(ds, "mpa_grid_hash")
+        stamped_hash = qs.qirr_attr_str(ds, "mpa_grid_hash")
         if stamped_hash != recomputed:
             raise ValueError(
                 f"mpa_store: {name!r} ω-grid hash mismatch.  Stamped "
@@ -712,7 +742,7 @@ def read_w_header(src, name, *, mode="r"):
         # checks, run against the PER-FREQUENCY extents.
         tables = qs.read_tables(grp, name)
         can = tables.canonical()
-        if can.digest() != qs._attr_str(ds, "qirr_table_hash"):
+        if can.digest() != qs.qirr_attr_str(ds, "qirr_table_hash"):
             raise ValueError(
                 f"mpa_store: {name!r} table hash mismatch.  The unfold "
                 f"tables are not the ones this tensor was written "
@@ -720,8 +750,8 @@ def read_w_header(src, name, *, mode="r"):
                 f"would be a permutation of the wrong centroids.")
         n_q_on_disk = int(ds.shape[1])
         n_mu = int(ds.shape[3])
-        shape_says = qs._validate(can, n_q_on_disk, n_mu)
-        attr_says = qs._attr_str(ds, "q_storage")
+        shape_says = qs.validate_qirr_tables(can, n_q_on_disk, n_mu)
+        attr_says = qs.qirr_attr_str(ds, "q_storage")
         if attr_says != shape_says:
             raise ValueError(
                 f"mpa_store: {name!r} shape says q_storage="
@@ -736,14 +766,14 @@ def read_w_header(src, name, *, mode="r"):
         for key in ("qirr_generator_commit", "qirr_written_utc",
                     "qirr_writer", "mpa_writer"):
             if key in ds.attrs:
-                prov[key] = qs._attr_str(ds, key)
+                prov[key] = qs.qirr_attr_str(ds, key)
         return {
             "format_version": version,
-            "freq_axis": qs._attr_str(ds, _FREQ_ATTR),
+            "freq_axis": qs.qirr_attr_str(ds, _FREQ_ATTR),
             "n_omega": n_omega,
             "omega": omega,
             "omega_line": line,
-            "omega_units": qs._attr_str(ds, "mpa_omega_units"),
+            "omega_units": qs.qirr_attr_str(ds, "mpa_omega_units"),
             "sampling": sampling,
             "grid_hash": recomputed,
             "data_ready": ready,
@@ -753,21 +783,18 @@ def read_w_header(src, name, *, mode="r"):
             "n_q_full": can.n_q_full,
             "n_mu": n_mu,
             "n_rmu_logical": int(ds.attrs["qirr_n_rmu_logical"]),
-            "centroid_hash": qs._attr_str(ds, "qirr_centroid_hash"),
+            "centroid_hash": qs.qirr_attr_str(ds, "qirr_centroid_hash"),
             "table_hash": can.digest(),
-            "closure_verdict": qs._attr_str(ds, "qirr_closure_verdict"),
+            "closure_verdict": qs.qirr_attr_str(ds, "qirr_closure_verdict"),
             "provenance": prov,
         }
 
 
 def _refuse_unless_rank_matches_version(ds, name):
-    """THE DISCRIMINANT.  Rank and version must agree, or refuse.
+    """THE DISCRIMINANT, for the versions THIS module owns.
 
-    This is the check the version bump exists to make possible, and it
-    is worth being explicit about why a version number alone does not
-    close the hole.
-
-    A version-1 reader takes ``ds.shape[0]`` as the q extent and
+    Rank and version must agree or the file is refused, because a
+    version-1 reader takes ``ds.shape[0]`` as the q extent and
     ``ds.shape[-1]`` as the μ extent.  Hand it a
     ``(n_omega, n_q_ibz, N_μ, N_μ)`` dataset and both of those
     expressions still evaluate — ``shape[-1]`` is genuinely N_μ, and
@@ -779,41 +806,58 @@ def _refuse_unless_rank_matches_version(ds, name):
     axis relabelled as q.  Si 4³ reduces 64 q to 8 and an n_p = 4 fit
     samples 8 frequencies, so the coincidence is one deck away.
 
-    The version bump alone does not fix this, because the failure is a
-    file stamped with the WRONG version — a writer that gains the axis
-    without bumping, or a hand-edited attr — and a reader that trusts
-    the stamp has no second opinion.  The rank IS the second opinion:
-    it is a property of the bytes, not of an attr, and the two layouts
-    have different ranks by construction.
+    THE VERSION-1 HALF OF THAT CHECK IS NO LONGER HERE, and its removal
+    is the point rather than a simplification.  This function used to
+    enforce rank 3 under a version-1 stamp, and the docstring of
+    :func:`read_qirr_tensor` registered the reason as a follow-up in as
+    many words: a wrapper protects the callers who use it and nobody
+    else, and the hazard is worst precisely for a caller who does not
+    know the new layout exists.  ``qirr_store.read_tensor`` now runs that
+    refusal itself, above ``read_tables`` and before any extent is
+    believed, so a consumer that never heard of the frequency axis is
+    protected by the version-1 reader it was already calling.  Repeating
+    it here would be a second, weaker copy of a check that has found its
+    home — and the copy would be the one to go stale.
+
+    What stays is what only this module can know.  Version 2 is not a
+    version ``qirr_store`` has heard of, so its rank-4 requirement is
+    ours to state and ours to enforce; and the ``mpa_freq_axis`` attr is
+    ours in both directions, which is why the presence cross-check below
+    runs on a version-1 file too.  A v1 file carrying the frequency attr
+    is a half-stamp, and the missing half is exactly what would say
+    whether the shape means what it looks like.
     """
     qs = _qs()
-    if qs._VERSION_ATTR not in ds.attrs:
+    if qs.QIRR_VERSION_ATTR not in ds.attrs:
         raise ValueError(
-            f"mpa_store: {name!r} carries no {qs._VERSION_ATTR!r}.  "
+            f"mpa_store: {name!r} carries no {qs.QIRR_VERSION_ATTR!r}.  "
             f"'No attrs' is read as q_storage='full' for backward "
             f"compatibility by qirr_store.read_tensor, which is the "
             f"reader for that case; the frequency-resolved layout is "
             f"never legacy.")
-    version = int(ds.attrs[qs._VERSION_ATTR])
+    version = int(ds.attrs[qs.QIRR_VERSION_ATTR])
     if version not in QIRR_FORMAT_VERSIONS_READABLE:
         raise ValueError(
             f"mpa_store: {name!r} is format version {version}; this "
             f"reader knows {list(QIRR_FORMAT_VERSIONS_READABLE)}.  "
             f"Refusing rather than guessing.")
-    want = _RANK_BY_VERSION[version]
-    if int(ds.ndim) != want:
+    # THE RANK, FOR VERSION 2 ONLY.  Version 1's rank is
+    # ``qirr_store.read_tensor``'s refusal now — it runs it before it
+    # believes any extent, so the caller this module dispatches to has
+    # already made the check by the time it returns.  See the docstring.
+    want = _rank_by_version()[version]
+    if version == QIRR_FORMAT_VERSION_FREQ and int(ds.ndim) != want:
         raise ValueError(
             f"mpa_store: {name!r} stamps qirr_format_version={version}, "
             f"which is rank {want}, but the dataset is {ds.shape} — rank "
             f"{int(ds.ndim)}.  RANK IS THE DISCRIMINANT and the version "
-            f"attr is its cross-check, in that order, because a rank-4 "
-            f"tensor stamped version 1 passes EVERY version-1 check "
-            f"whenever n_omega equals the wedge extent: shape[0] reads "
-            f"as the q extent, shape[-1] is still N_μ, the tables "
-            f"validate against both, and the caller gets the frequency "
-            f"axis relabelled as q with nothing raised.  That is silent "
-            f"corruption, so it is refused here on a property of the "
-            f"bytes rather than of an attr.")
+            f"attr is its cross-check, in that order.  Version "
+            f"{QIRR_FORMAT_VERSION_FREQ} is the frequency-resolved layout "
+            f"and its leading axis is ω; a tensor stamped for it that is "
+            f"not rank {want} has either lost that axis or never had it, "
+            f"and reading it would hand the caller a q axis relabelled as "
+            f"frequency.  That is silent corruption, so it is refused on "
+            f"a property of the bytes rather than of an attr.")
     has_freq_attr = _FREQ_ATTR in ds.attrs
     if has_freq_attr != (version == QIRR_FORMAT_VERSION_FREQ):
         raise ValueError(
@@ -825,10 +869,10 @@ def _refuse_unless_rank_matches_version(ds, name):
             f"refused rather than read, because the missing half is "
             f"what would say whether the shape means what it looks "
             f"like.")
-    if has_freq_attr and qs._attr_str(ds, _FREQ_ATTR) != _FREQ_ATTR_VALUE:
+    if has_freq_attr and qs.qirr_attr_str(ds, _FREQ_ATTR) != _FREQ_ATTR_VALUE:
         raise ValueError(
             f"mpa_store: {name!r} stamps {_FREQ_ATTR}="
-            f"{qs._attr_str(ds, _FREQ_ATTR)!r}; this format's frequency "
+            f"{qs.qirr_attr_str(ds, _FREQ_ATTR)!r}; this format's frequency "
             f"axis is {_FREQ_ATTR_VALUE!r} — axis 0 — and nothing else "
             f"has been defined.")
     return version
@@ -837,19 +881,21 @@ def _refuse_unless_rank_matches_version(ds, name):
 def read_qirr_tensor(src, name, *, mode="r", **kw):
     """THE WIDENED READER: version 1 or 2, dispatched on the RANK.
 
-    ``qirr_store.read_tensor`` is the version-1 reader and refuses any
-    other version — correctly, and it stays that way.  What it does NOT
-    do is check the rank, and that is the hole the frequency axis opens:
-    see :func:`_refuse_unless_rank_matches_version` for the exact
-    mechanism and why a version stamp alone does not close it.
+    ``qirr_store.read_tensor`` is the version-1 reader, and it refuses
+    any other version AND any rank but 3 under its own stamp — the hole
+    the frequency axis opened is closed there, at the reader every
+    unsuspecting consumer already calls, rather than here.  See
+    :func:`_refuse_unless_rank_matches_version` for the mechanism and for
+    why a version stamp alone does not close it.
 
-    So this is the door a caller who may be handed either layout should
-    knock on.  It runs the rank/version cross-check FIRST, before the
-    tables are even opened, and only then dispatches:
+    So this is the reader a caller who may be handed EITHER layout should
+    ask, and what it adds is the dispatch plus version 2's own checks,
+    run before the tables are opened:
 
     * version 1, rank 3 -> ``qirr_store.read_tensor``, untouched.  Every
-      keyword goes straight through and the bytes that come back are the
-      bytes that came back before this module existed.
+      keyword goes straight through, that reader makes its own rank
+      refusal, and the bytes that come back are the bytes that came back
+      before this module existed.
     * version 2, rank 4 -> :func:`read_w_omega`, which returns the whole
       frequency-resolved tensor.  Callers that want one slab or a few
       columns should ask for those directly; this path exists so a
@@ -861,22 +907,23 @@ def read_qirr_tensor(src, name, *, mode="r", **kw):
     delegated to ``qirr_store.read_tensor`` unchanged, which is where
     the no-attr-means-full rule lives.
 
-    FOLLOW-UP, STATED IN THE CODE BECAUSE THAT IS WHERE IT WILL BE
-    NOTICED.  The rank check belongs INSIDE ``qirr_store.read_tensor``,
-    not in a wrapper — a wrapper protects the callers who use it and
-    nobody else, and the hazard is worst precisely for a caller who does
-    not know the new layout exists.  It is here because the symmetry
-    checkpoint carrying that reader was still landing when this was
-    written and this branch must not modify it.  When the checkpoint is
-    on main, move :func:`_refuse_unless_rank_matches_version` into
-    ``read_tensor`` and let this function become the dispatcher only.
+    THAT FOLLOW-UP IS DISCHARGED.  This docstring used to register one:
+    the version-1 rank check belonged INSIDE ``qirr_store.read_tensor``
+    rather than in a wrapper, because a wrapper protects the callers who
+    use it and nobody else, and it sat here only because the symmetry
+    checkpoint carrying that reader was still landing.  The checkpoint
+    landed with the refusal in ``read_tensor``, and this function is now
+    what the note asked it to become: the DISPATCHER, plus the two
+    checks that are genuinely this format's own — version 2's rank, and
+    the ``mpa_freq_axis`` cross-check in both directions.  See
+    :func:`_refuse_unless_rank_matches_version`.
     """
     qs = _qs()
-    with qs._Dest(src, mode) as grp:
+    with qs.QirrDest(src, mode) as grp:
         if name not in grp:
             raise KeyError(f"mpa_store: {name!r} is not in this file")
         ds = grp[name]
-        if qs._VERSION_ATTR not in ds.attrs:
+        if qs.QIRR_VERSION_ATTR not in ds.attrs:
             return qs.read_tensor(grp, name, **kw)
         version = _refuse_unless_rank_matches_version(ds, name)
         if version == QIRR_FORMAT_VERSION_FREQ:
@@ -967,7 +1014,7 @@ def read_w_slab(
             f"require_ready=False to inspect the placeholder "
             f"deliberately.")
 
-    with qs._Dest(src, mode) as grp:
+    with qs.QirrDest(src, mode) as grp:
         ds = grp[name]
         raw = ds[i] if q is None else ds[i, int(q)]
     raw = np.asarray(raw)
@@ -1302,7 +1349,7 @@ def read_w_columns(
     # which keeps the row axis whole — the axis the caller shards.
     lo, hi = int(cols[0]), int(cols[-1]) + 1
     contiguous = (hi - lo) == int(cols.size)
-    with qs._Dest(src, mode) as grp:
+    with qs.QirrDest(src, mode) as grp:
         ds = grp[name]
         if contiguous:
             block = ds[:, iq, :, lo:hi]
@@ -1379,7 +1426,7 @@ def allocate_fit_store(
             f"allocate_fit_store: extents must be positive; got n_q="
             f"{n_q}, n_mu={n_mu}, n_p={n_p}")
     dtype = np.complex128 if dtype is None else dtype
-    with qs._Dest(dest, mode) as grp:
+    with qs.QirrDest(dest, mode) as grp:
         # EVERY ``fit_*`` GOES, not just the two required ones.  A
         # re-allocation that left an earlier run's extra diagnostic
         # behind would leave a full-size array of ITS numbers indexed by
@@ -1415,7 +1462,7 @@ def allocate_fit_store(
         grp.attrs["mpa_fit_n_mu_logical"] = np.int64(n_mu)
         grp.attrs["mpa_fit_complete"] = False
         grp.attrs["mpa_fit_writer"] = "file_io.mpa_store"
-        grp.attrs["mpa_fit_generator_commit"] = qs._generator_commit()
+        grp.attrs["mpa_fit_generator_commit"] = qs.qirr_generator_commit()
         grp.attrs["mpa_fit_allocated_utc"] = _utc_now()
         for label, val in (("grid_hash", grid_hash),
                            ("table_hash", table_hash),
@@ -1495,7 +1542,7 @@ def write_fit_block(
     qs = _qs()
     Om = np.asarray(Omega_p_block)
     Bp = np.asarray(B_p_block)
-    with qs._Dest(dest, mode) as grp:
+    with qs.QirrDest(dest, mode) as grp:
         led = _open_fit(grp)
         n_p = int(grp.attrs["mpa_fit_n_p"])
         n_q = int(grp.attrs["mpa_fit_n_q"])
@@ -1530,7 +1577,7 @@ def write_fit_block(
         # number is a PERFECTLY conditioned solve, so the Σ stage's
         # certification would pass exactly the elements nobody measured.
         keys = ",".join(sorted(diag))
-        stamped = qs._attr_str(led, "diagnostic_keys")
+        stamped = qs.qirr_attr_str(led, "diagnostic_keys")
         if stamped is None:
             led.attrs["diagnostic_keys"] = keys
         elif stamped != keys:
@@ -1645,7 +1692,7 @@ def fit_completion_ledger(src, *, mode="r"):
     the Σ stage's certification needs the second.
     """
     qs = _qs()
-    with qs._Dest(src, mode) as grp:
+    with qs.QirrDest(src, mode) as grp:
         led = _open_fit(grp)
         done = np.asarray(led["blocks_done"][()], dtype=bool)
         journal = np.asarray(led["block_journal"][()], dtype=np.int64)
@@ -1666,7 +1713,7 @@ def fit_completion_ledger(src, *, mode="r"):
             "block_backward_error_max": berr,
             "condition_max": float(cond.max()) if cond.size else None,
             "backward_error_max": float(berr.max()) if berr.size else None,
-            "finalized_utc": qs._attr_str(grp, "mpa_fit_finalized_utc"),
+            "finalized_utc": qs.qirr_attr_str(grp, "mpa_fit_finalized_utc"),
         }
 
 
@@ -1686,12 +1733,12 @@ def finalize_fit_store(dest, *, certification=None, mode="a"):
     when nobody declared a threshold.
     """
     qs = _qs()
-    with qs._Dest(dest, mode) as grp:
+    with qs.QirrDest(dest, mode) as grp:
         led = _open_fit(grp)
         if bool(grp.attrs.get("mpa_fit_complete", False)):
             raise ValueError(
                 f"finalize_fit_store: this store was already finalized "
-                f"at {qs._attr_str(grp, 'mpa_fit_finalized_utc')}.  A "
+                f"at {qs.qirr_attr_str(grp, 'mpa_fit_finalized_utc')}.  A "
                 f"second finalize would stamp completeness against a "
                 f"state the first one did not measure; if blocks were "
                 f"written since, they were written to a file that "
@@ -1767,7 +1814,7 @@ def read_fit_block(src, q, mu_cols, *, allow_partial=False, mode="r"):
     needs the second one.
     """
     qs = _qs()
-    with qs._Dest(src, mode) as grp:
+    with qs.QirrDest(src, mode) as grp:
         ledger = fit_completion_ledger(grp)
         _refuse_unfinalized(grp, ledger, allow_partial,
                             f"read_fit_block(q={q})")
@@ -1810,7 +1857,7 @@ def read_fit_tensors(src, *, allow_partial=False, mode="r"):
     and for tests.  Same finalize refusal as :func:`read_fit_block`.
     """
     qs = _qs()
-    with qs._Dest(src, mode) as grp:
+    with qs.QirrDest(src, mode) as grp:
         ledger = fit_completion_ledger(grp)
         _refuse_unfinalized(grp, ledger, allow_partial,
                             "read_fit_tensors")

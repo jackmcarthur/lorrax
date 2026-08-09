@@ -294,7 +294,7 @@ def test_the_leading_axis_is_removable(tmpdir_path):
     assert np.array_equal(got, ref), (
         "the frequency slab is not the bytes a frequency-free file holds")
 
-    exempt = {QS._VERSION_ATTR, MS._FREQ_ATTR} | set(MS._MPA_OWNED_ATTRS)
+    exempt = {QS.QIRR_VERSION_ATTR, MS._FREQ_ATTR} | set(MS._MPA_OWNED_ATTRS)
     # Volatile by construction — a timestamp and a writer name, which say
     # WHEN and BY WHAT and not WHAT.
     exempt |= {"qirr_written_utc", "qirr_writer", "mpa_writer"}
@@ -556,28 +556,38 @@ def test_the_walk_covers_every_column_exactly_once():
 # Arm 6 — the version-2 discriminant.  THE RED TWIN THAT MOTIVATES IT.
 # ---------------------------------------------------------------------------
 
-def test_a_rank_4_tensor_stamped_version_1_is_silently_misread(
+def test_a_rank_4_tensor_stamped_version_1_is_refused_by_both_readers(
         tmpdir_path):
-    """THE HAZARD, CONSTRUCTED — and then refused by the widened reader.
+    """THE HAZARD, CONSTRUCTED — and now refused by BOTH readers.
 
     The malicious case is built to be maximally quiet: ``n_omega`` is
     chosen EQUAL to the wedge extent, so a version-1 reader's
     ``ds.shape[0]`` is the number it expects, ``ds.shape[-1]`` is
     genuinely N_μ, the tables validate against both, the q_storage
     cross-check agrees, the table digest matches and the readiness flag
-    is set.  Nothing in the version-1 path has anything to object to.
+    is set.  Nothing in the version-1 path has anything to object to —
+    except the rank, which is a property of the bytes.
 
-    Half of this test therefore asserts the DEFECT: the landed
-    ``qirr_store.read_tensor`` returns without raising and hands back an
-    array whose leading axis is FREQUENCY while its header calls that
-    axis q.  That is silent corruption, and stating it as an assertion
-    is what makes the widening a fix rather than a precaution — if a
-    later change makes the v1 reader refuse on its own, this line fails
-    and the follow-up below can be closed.
+    THIS TEST CHANGED SIDES AT THE LANDING, AS IT SAID IT WOULD.  It was
+    written while the rank refusal lived only in ``mpa_store``, and half
+    of it asserted the DEFECT: that ``qirr_store.read_tensor`` returned
+    these bytes without raising, handing back an array whose leading axis
+    is FREQUENCY while its header called that axis q.  The docstring
+    registered the trigger in as many words — "if a later change makes
+    the v1 reader refuse on its own, this line fails and the follow-up
+    below can be closed".  That change is the q_irr rank-refusal branch,
+    which put the check inside ``read_tensor`` above ``read_tables`` and
+    before any extent is believed.  So the assertion is inverted here
+    rather than deleted: the line that used to pin the corruption now
+    pins its absence, and the test keeps its job of being the red twin
+    that says which reader is protecting whom.
 
-    The other half is the widened reader on the same bytes: it refuses
-    on the RANK, which is a property of the bytes rather than of an
-    attr, and names both numbers.
+    Both refusals are asserted because they protect different people.
+    ``qirr_store.read_tensor`` protects the consumer who has never heard
+    of a frequency axis and is simply reading a restart file — that is
+    the one that matters, and it is the one that did not exist before.
+    ``mpa_store.read_qirr_tensor`` protects the consumer who knows both
+    layouts and asked the dispatcher.
     """
     tables, verdict, n_mu = _geometry()
     n_omega = _N_Q_IBZ            # THE COINCIDENCE, on purpose
@@ -592,26 +602,24 @@ def test_a_rank_4_tensor_stamped_version_1_is_silently_misread(
     # Forge the version attr back to 1 — a writer that gained the axis
     # without bumping, or a hand-edited file.
     with h5py.File(tmpdir_path, "a") as f:
-        f[name].attrs[QS._VERSION_ATTR] = np.int64(1)
+        f[name].attrs[QS.QIRR_VERSION_ATTR] = np.int64(1)
         del f[name].attrs[MS._FREQ_ATTR]
 
-    # THE DEFECT, ASSERTED.  No exception, and the header calls the
-    # frequency axis q.
-    got, hdr = QS.read_tensor(tmpdir_path, name, unfold=False)
-    assert hdr.format_version == 1
-    assert hdr.n_q_on_disk == n_omega, (
-        "the v1 reader was expected to read n_omega as the q extent")
-    assert np.asarray(got).ndim == 4, (
-        "the v1 reader was expected to hand back the 4-D bytes unchanged")
-    assert hdr.q_storage == "ibz" and hdr.data_ready is True
-
-    # THE FIX.  Rank first, attr second, and it names both.
+    # THE FIX, WHERE IT NOW LIVES.  The version-1 reader refuses these
+    # bytes on its own, naming both ranks — no wrapper required.
     with pytest.raises(ValueError) as exc:
-        MS.read_qirr_tensor(tmpdir_path, name, unfold=False)
+        QS.read_tensor(tmpdir_path, name, unfold=False)
     msg = str(exc.value)
     assert "qirr_format_version=1" in msg and "rank 3" in msg, msg
     assert "rank 4" in msg or str(tuple(W.shape)) in msg, msg
     assert "RANK IS THE DISCRIMINANT" in msg, msg
+
+    # AND THROUGH THE DISPATCHER, which reaches the same refusal by
+    # delegating rather than by keeping a second copy of it.
+    with pytest.raises(ValueError) as exc2:
+        MS.read_qirr_tensor(tmpdir_path, name, unfold=False)
+    msg2 = str(exc2.value)
+    assert "rank 3" in msg2 and "RANK IS THE DISCRIMINANT" in msg2, msg2
 
 
 def test_the_widened_reader_dispatches_both_versions(tmpdir_path):
@@ -651,7 +659,7 @@ def test_a_rank_3_dataset_stamped_version_2_refuses(tmpdir_path):
     QS.write_qirr_tensor(v1, "W0_qmunu", W[0], tables=tables,
                          closure_verdict=verdict)
     with h5py.File(v1, "a") as f:
-        f["W0_qmunu"].attrs[QS._VERSION_ATTR] = np.int64(2)
+        f["W0_qmunu"].attrs[QS.QIRR_VERSION_ATTR] = np.int64(2)
     with pytest.raises(ValueError, match="rank 4"):
         MS.read_qirr_tensor(v1, "W0_qmunu", unfold=False)
 
