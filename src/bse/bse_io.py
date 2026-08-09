@@ -1650,7 +1650,7 @@ def load_bse_data_from_restart_sharded(
     psi_c_Y = jax.lax.with_sharding_constraint(psi_c_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
 
     if g0_X is not None and inject_head:
-        vhead, whead, cell_volume = _resolve_head_params(
+        vhead, whead, cell_volume, head_src = _resolve_head_params(
             input_file, vhead_restart, whead_restart, cell_volume)
 
         if cell_volume is not None and (vhead is not None or whead is not None):
@@ -1658,12 +1658,13 @@ def load_bse_data_from_restart_sharded(
             V_q0, W_q = apply_q0_head_rank1_sharded(
                 V_q0, W_q, g0_X, g0_Y, vhead, whead, cell_volume,
                 omega_index=0)
-            v_str = (f"vhead={complex(vhead).real:.3f}"
+            v_str = (f"vhead={complex(vhead).real:.6f}"
                      if vhead is not None else "vhead=skipped")
-            w_str = (f"whead[0]={complex(whead[0]).real:.3f}"
+            w_str = (f"whead[0]={complex(whead[0]).real:.6f}"
                      if whead is not None else "whead=skipped")
             print(f"BSE-sharded: q=0 head injected (rank-1, dual-sharded G0, "
-                  f"V_cell={cell_volume:.2f}): {v_str}, {w_str}")
+                  f"V_cell={cell_volume:.2f}): {v_str}, {w_str} "
+                  f"[source: {head_src}]")
         else:
             # §16.5 latent-bug guard: G0_mu_nu is present and inject_head is
             # True, but the rank-1 head was NOT injected because vhead/whead
@@ -1880,28 +1881,58 @@ def _parse_head_overrides(input_file: Optional[str]):
     Returns ``(vhead, whead_0freq)`` where each is ``complex`` or ``None``
     if the key is absent / blank. These take precedence over any
     restart-file head values when assembling the q=0 rank-1 update.
+
+    These are the SAME two deck keys the GW side reads
+    (``gw_config.HeadConfig.vhead`` / ``.whead_0freq``), so this reader
+    holds itself to the GW reader's parsing contract.  Two rules follow
+    from that, and both are corrections made 2026-08-09:
+
+    * **Inline comments are stripped**, because ``gw_config`` builds its
+      ``ConfigParser`` with ``inline_comment_prefixes=('#',)`` (see the
+      note at ``gw_config.py``: "the latter silently voided flags — a
+      real footgun").  A deck line written ``vhead = 3303.748102  # BGW``
+      previously overrode the GW side and was silently dropped here: the
+      deck asked for BerkeleyGW's head, Σ got it, and the BSE quietly
+      used the restart's own value instead.  The two sides now agree on
+      any deck, or neither does.
+    * **A malformed value refuses** instead of falling back to the
+      restart.  A head override that silently does nothing is precisely
+      the failure mode this feature exists to rule out — it is a
+      validation knob, and a validation knob that no-ops without a word
+      is worse than no knob at all.
     """
     if input_file is None or not os.path.isfile(input_file):
         return None, None
     vhead = None
     whead0 = None
     with open(input_file) as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, 1):
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or "=" not in stripped:
                 continue
             key, _, val = stripped.partition("=")
             key = key.strip().lower()
-            val = val.strip()
+            if key not in ("vhead", "whead_0freq"):
+                continue
+            val = val.partition("#")[0].strip()   # GW-parity: inline comment
             if not val:
                 continue
             try:
-                if key == "vhead":
-                    vhead = complex(float(val))
-                elif key == "whead_0freq":
-                    whead0 = complex(float(val))
+                parsed = complex(float(val))
             except ValueError:
-                continue
+                raise ValueError(
+                    f"{input_file}:{lineno}: q=0 head override {key!r} has a "
+                    f"non-numeric value {val!r}.  This key pins the q=0 "
+                    f"Coulomb head to an externally supplied scalar (e.g. "
+                    f"BerkeleyGW's) and is read by BOTH the GW and the BSE "
+                    f"side; refusing rather than silently falling back to the "
+                    f"restart's own head, which would leave the two sides "
+                    f"screening with different q=0 heads."
+                ) from None
+            if key == "vhead":
+                vhead = parsed
+            else:
+                whead0 = parsed
     return vhead, whead0
 
 
@@ -1911,12 +1942,21 @@ def _resolve_head_params(
     whead_restart,
     cell_volume: Optional[float] = None,
 ):
-    """Resolve ``(vhead, whead, cell_volume)`` for q=0 head injection.
+    """Resolve ``(vhead, whead, cell_volume, source)`` for q=0 head injection.
 
     cohsex.in ``vhead``/``whead_0freq`` overrides take precedence over the
     restart-file head values; ``cell_volume`` (Bohr³) is pulled from the WFN
-    when not supplied.  Any of the three may return ``None`` (head skipped).
-    Single-sourced by both the sharded and single-device restart loaders.
+    when not supplied.  Any of the first three may return ``None`` (head
+    skipped).  Single-sourced by both the sharded and single-device restart
+    loaders.
+
+    ``source`` is a short human-readable provenance string ("deck" /
+    "restart" / "none" per channel).  It exists because the override is a
+    cross-code validation knob: the one question a reader of the log has
+    is whether the head that was actually injected is the deck's pinned
+    external value or the run's own computed one, and printing the value
+    alone does not answer it (the two agree to 8 digits on the anchor
+    deck by construction, which is exactly when confusing them is easy).
     """
     vhead_in, whead0_in = _parse_head_overrides(input_file)
     vhead = vhead_in if vhead_in is not None else vhead_restart
@@ -1924,6 +1964,12 @@ def _resolve_head_params(
         whead = jnp.asarray([whead0_in], dtype=jnp.complex128)
     else:
         whead = whead_restart
+    source = "v:{}, w:{}".format(
+        "deck" if vhead_in is not None else
+        ("restart" if vhead_restart is not None else "none"),
+        "deck" if whead0_in is not None else
+        ("restart" if whead_restart is not None else "none"),
+    )
     if cell_volume is None and input_file is not None:
         try:
             from ffi import _services
@@ -1933,7 +1979,7 @@ def _resolve_head_params(
         except Exception as exc:
             print(f"BSE head: cell_volume unresolved ({exc}); skipping head")
             cell_volume = None
-    return vhead, whead, cell_volume
+    return vhead, whead, cell_volume, source
 
 
 def apply_eqp_corrections(
@@ -2257,7 +2303,7 @@ def _load_ring_subset(
     # injected into W_q only when a real screened W0 is present (not the
     # bare-V fallback).  Source priority: cohsex.in overrides > restart-file.
     if G0_mu_nu is not None:
-        vhead, whead, cell_volume = _resolve_head_params(
+        vhead, whead, cell_volume, head_src = _resolve_head_params(
             input_file, vhead_restart, whead_restart)
         if cell_volume is None:
             print("BSE: head injection skipped — could not resolve cell_volume "
@@ -2271,12 +2317,12 @@ def _load_ring_subset(
                 vhead, whead, cell_volume, omega_index=0)
             if w0_ready:
                 W_q = W_head
-            v_str = (f"vhead={complex(vhead).real:.3f}"
+            v_str = (f"vhead={complex(vhead).real:.6f}"
                      if vhead is not None else "vhead=skipped")
-            w_str = (f"whead[0]={complex(whead[0]).real:.3f}"
+            w_str = (f"whead[0]={complex(whead[0]).real:.6f}"
                      if (whead is not None and w0_ready) else "whead=skipped")
             print(f"BSE: q=0 head injected (rank-1 in μν, V_cell={cell_volume:.2f}): "
-                  f"{v_str}, {w_str}")
+                  f"{v_str}, {w_str} [source: {head_src}]")
 
     key = jax.random.PRNGKey(0)
     X = jax.random.normal(key, (1, n_cond_pad, n_val_pad, nk)) + 1j * jax.random.normal(
