@@ -131,14 +131,25 @@ def test_auto_never_infers_the_unimplemented_mode():
 # ---------------------------------------------------------------------------
 
 def test_selecting_it_refuses_and_names_the_mode_and_the_next_step():
-    """The refusal an operator actually sees."""
+    """The refusal an operator actually sees.
+
+    THE REASON MOVED, AND THAT IS THE POINT OF PINNING IT.  This cell used
+    to require the words "MPA fit stage lands first".  The fit stage landed,
+    and so did the Sigma pass loop, so a refusal still saying that would be
+    telling an operator to wait for something that is already in the tree.
+    What blocks the mode now is two properties of the STORE the loop reads
+    -- a full-BZ pole axis and a head axis -- and those are what the message
+    has to name, because they are what the operator would have to go and
+    produce.
+    """
     with pytest.raises(NotImplementedError) as exc:
         refuse_unimplemented_compute_mode(ComputeMode.MPA,
                                           context="the LORRAX GW driver")
     msg = str(exc.value)
     assert "mpa" in msg
     assert "the LORRAX GW driver" in msg
-    assert "MPA fit stage lands first" in msg
+    assert "full-BZ" in msg and "__mpahead" in msg
+    assert "gw.mpa.sigma_pass" in msg
     assert "THEORY_mpa_implementation.md" in msg
 
 

@@ -97,9 +97,19 @@ SHARED_SIGMA_CORE = {
 #: be checked disjoint, which is the whole contract in one assertion.
 THIS_BRANCH_TOUCHES = (
     "src/gw/mpa/sigma_routing.py",
+    "src/gw/mpa/sigma_pass.py",
     "src/file_io/mpa_store.py",
     "src/gw/mpa/fit_driver.py",
     "src/gw/gw_output.py",
+    # ``gw_config`` is the one entry here the two-point path DOES import,
+    # so it is worth saying what moved in it and why that cannot reach a
+    # number: one string, the ``UNIMPLEMENTED_MODES`` reason for ``mpa``,
+    # which is read only by ``refuse_unimplemented_compute_mode`` on its
+    # way into an exception message.  No default, no dataclass field and no
+    # parse branch changed, so no gnppm run can observe it.  If a later
+    # commit touches this file for any other reason, that reason belongs in
+    # this comment or the entry should come out.
+    "src/gw/gw_config.py",
 )
 
 

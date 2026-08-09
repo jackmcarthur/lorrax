@@ -518,9 +518,25 @@ def explain_missing_channels(mode, *channels: SigmaChannel) -> str:
 # REMOVING A ROW IS THE LANDING GESTURE.  When the MPA fit stage lands,
 # its author deletes this entry and the suite that pins the refusal fails
 # loudly until it is rewritten to pin the new behaviour.
+# THE REASON IS NOW A LIST OF TWO, NOT A STAGE THAT DOES NOT EXIST.  The
+# fit stage landed, and so did the Σ pass loop
+# (``gw.mpa.sigma_pass.compute_mpa_sigma_c_omega_grid``, gated against the
+# fused all-pole closed form at 6.8e-11).  What is left is two properties
+# of the STORE the loop reads, and both refuse by name where they are met
+# rather than here: a fit store on the symmetry wedge cannot be summed by a
+# kernel whose k-q sums index the full zone (``sigma_pass.
+# refuse_wedge_pole_slab`` — unfolding a pole field is not the operation
+# that unfolds W, and the conjugation on the time-reversed members is
+# uncertified), and a store with no ``__mpahead`` axis has no q → 0 head
+# (``mpa_store.read_head_poles``), which is not a correction that can be
+# omitted and noticed later.  This row comes out when a store with both
+# exists and the driver seam that points at it lands with it.
 UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {
     ComputeMode.MPA: (
-        "the MPA fit stage lands first; see THEORY_mpa_implementation.md"
+        "the Σ pass loop is built (gw.mpa.sigma_pass) and gated, but no "
+        "fit store yet carries BOTH a full-BZ pole axis and a __mpahead "
+        "head axis, and the driver seam that reads one is not wired; see "
+        "THEORY_mpa_implementation.md sections 7.5 and 5.1"
     ),
 }
 
