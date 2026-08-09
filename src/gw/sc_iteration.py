@@ -2047,11 +2047,22 @@ def dump_qp_wfn_artifacts(
       order is ``wfn.kpoints`` order), ``sym_idx_k[kirr_fullids]`` is 0
       at all 10 (so no member is a rotated or time-reversed image),
       ``max|unfolded_kpts[kirr_fullids] − wfn.kpoints|`` = 5.6e-17, and
-      ``select(broadcast(A)) − A`` = 0 exactly.  Both properties follow
-      from the grid enumeration order, not from a construction that
-      enforces them, so a deck that violates either would silently give
-      this writer a conjugated or rotated U; re-measure with the probe
-      before trusting the artifact on a new symmetry group.
+      ``select(broadcast(A)) − A`` = 0 exactly.
+
+      ONE OF THOSE TWO PROPERTIES IS NOW ENFORCED AND THE OTHER STILL IS
+      NOT (fix/kirr-fullids-2026-08-08).  ``kirr_fullids`` no longer reads
+      the star labels; it matches ``wfn.kpoints`` against the full grid
+      directly and raises if a stored k is not on it, so
+      ``unfolded_kpts[kirr_fullids] == wfn.kpoints`` holds on every deck
+      by construction — and on three of the four in-tree decks it did NOT
+      hold before, which is what that change fixed.  The IDENTITY-operation
+      property is a separate fact and remains a property of the deck: it
+      holds on ``si_cohsex_debug`` and on mos2_4x4, and does not hold on
+      the 3x3x1 decks, where the register-don't-touch op-selection policy
+      assigns a rotation (on ``cohsex_debug``, a time-reversal row) to some
+      wedge rows whose k is nevertheless exactly right.  So this writer's
+      "U is the STORED ψ's rotation" claim still needs the probe on a new
+      symmetry group; what no longer needs it is the k itself.
     * ``write_qp_rotations_h5`` — the FULL BZ.  Its ``kpoints_crys``
       labels the rows of ``U_mnk``; the canonical writer of this same
       file passes ``sym.unfolded_kpts`` there (gw_output.py:865-875) and

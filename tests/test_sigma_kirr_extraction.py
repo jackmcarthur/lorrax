@@ -259,13 +259,28 @@ def test_a_dropped_row_is_refused_not_substituted():
         k_irr_rows_for([0, 99], compact)
 
 
-def test_the_live_wedge_map_of_the_fixture_deck_resolves():
-    """``kirr_to_kfull`` on the real deck must land on stored rows.
+def test_the_frozen_wedge_map_of_the_fixture_deck_resolves():
+    """The map stored in the fixture BLOB must land on stored rows.
 
     The anti-tautology arm of the cell above: the refusal is only useful
-    if the SUPPORTED case actually passes, and on ``cohsex_debug`` the
-    wedge map is ``[0, 1, 1, 4]`` over a 4-row WFN wedge that covers 3
-    stars — a redundancy that would break a naive remap.
+    if the SUPPORTED case actually passes, and the map in this file is
+    ``[0, 1, 1, 4]`` over a 4-row WFN wedge that covers 3 stars — a
+    redundancy that would break a naive remap.
+
+    READ "FROZEN", NOT "LIVE" (2026-08-08).  This cell used to be named
+    for the live class and it is not testing it.  ``[0, 1, 1, 4]`` is what
+    ``SymMaps.kirr_fullids`` produced on ``cohsex_debug`` on the day the
+    blob was written, and it was wrong: the star-label construction
+    orphaned IBZ k1's label and its identity fallback made row 2 a
+    duplicate of row 1.  ``fix/kirr-fullids-2026-08-08`` matches k
+    directly and the live value is now ``[0, 1, 2, 4]``, which this
+    file's k_irr store REFUSES — row 2 is not one of the three rows it
+    keeps — and that refusal is the correct outcome, not a regression:
+    the old map silently handed back k1's matrix under k2's label.  The
+    blob is registered as stale in ``tests/KNOWN_FAILURES.md`` and is
+    deliberately not re-frozen on a fix branch.  What this cell still
+    pins is ``k_irr_rows_for``'s behaviour on a redundant map, which is
+    worth pinning whatever the map came from.
     """
     p = os.path.join(_REPO, "tests", "regression", "cohsex_debug",
                      "qp_wfn_rotations.h5")
