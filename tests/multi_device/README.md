@@ -66,6 +66,23 @@ Run at TWO mesh sizes: at P=4 four tiles and one cube are the same byte count.
 Harness: `/scratch2/08271/jackmc/omegacube_ab/rotprobe.sbatch` (N=8, legs at
 P=4 and P=16, frozen tree). Green at job 7889790.
 
+Band-rotation collective probe: `rot_probe.py`, any square P. Answers one
+question — does the two-step constraint remove the global all-reduce in
+`gw.qsgw_density.rotate_bands`? — by printing every collective in the LOWERED
+HLO with its byte size, so the 3.36 GiB `c128[nk,nb,ns,ngkmax]` all-reduce is
+visible if it is still there. Shapes come from `RP_NK`/`RP_NB`/`RP_NS`/`RP_NGK`
+(defaults 16/640/2/11008); the arrays are zero-filled, so this is a compile-time
+instrument and costs no real work.
+
+    srun -n 4 python3 -m rot_probe        # RP_NK/NB/NS/NGK
+
+It is the DIAGNOSTIC counterpart to the gate below: the probe shows you which
+collectives a spelling emits, the gate pins that the spelling is correct. Added
+to this roster 2026-08-09 — it had been in the directory since `7887e61d`
+(2026-08-05) and was the one file here that no README row and no `run_tier2.sh`
+leg mentioned, which is the only reason a completeness audit found it rather
+than a reader. Its imports still resolve, so it is runnable as written.
+
 Band-rotation primitive gate: `band_rotate_gate.py`, any square P (1, 2×2 and
 4×4 are the standard legs). Certifies `gw.qsgw_density.rotate_band_axis` /
 `rotate_band_matrix` — the one rotation primitive, `U` kept at

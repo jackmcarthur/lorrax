@@ -3124,9 +3124,59 @@ omega-hats and adds the 1e-12 fit-stage tier. hBN stops being a refusal.
 source, so it is outside the census pair by construction. Run at this landing's
 head it is **13 failed / 2 passed** — and it is **13 failed / 2 passed at its
 own base `70c0472a`** in a clean worktree, identical. Pre-existing on this box
-(the gate wants a mesh this single-device machine cannot provide) and untouched
-by this batch. Not attributed here, and named so the next WSL census is not
-surprised by thirteen reds with no owner.
+and untouched by this batch. Not attributed here, and named so the next WSL
+census is not surprised by thirteen reds with no owner.
+
+> **AMENDED 2026-08-09 (landing-completeness audit) — the count is right and
+> the DIAGNOSIS was wrong.** ~~the gate wants a mesh this single-device machine
+> cannot provide~~ It is not the mesh. It is `LORRAX_BANDS_GEMM_FFI`. Measured
+> on this same single-device box, same tree, same commit:
+>
+>     pytest tests/test_bse_coupling_routes_mesh_invariance.py   ->  13 failed, 2 passed
+>     LORRAX_BANDS_GEMM_FFI=0 pytest <same file>                 ->  15 passed
+>
+> The gate makes no FFI requirement of its own; what it CALLS does —
+> `build_bse_ring_matvec_full` -> `contract_bands_block_reshard` ->
+> `gate.require` refuses with "MKL batched-GEMM host backend unavailable" unless
+> the dial announces the debug opt-out. The file is green in a DEFAULT census
+> only because collecting `tests/test_contract_bands.py` runs a module-scope
+> `os.environ.setdefault("LORRAX_BANDS_GEMM_FFI", "0")` that leaks to the whole
+> session — so this gate's verdict is **collection-scope dependent** on any
+> FFI-less box, and thirteen reds from running it ALONE are an artefact, not a
+> mesh-invariance failure and not evidence that either K^d_B fix regressed.
+> The caveat now lives in the gate's own module docstring (`db919ee3`); the
+> durable fix is to move that `setdefault` into a fixture, and it belongs to
+> `test_contract_bands.py`. Recorded because "wants a mesh" would send the next
+> census to buy hardware for a one-line env problem.
+
+### An unlisted red on the jax-0.9 leg: a tracing instrument, not a physics cell
+
+**REGISTERED 2026-08-09 by the landing-completeness audit.**
+`tests/test_bse_w_omega_chain_scan.py::test_chain_step_traces_once_for_the_whole_chain`
+is **RED on jax 0.9.1** (`assert 2 == 1` on the trace count; the file is
+1 failed / 11 passed). It has never been named here, and it should have been.
+
+**It is not a campaign regression, and the A/B says so.** It is red at its own
+BIRTH commit `ca1ca52a` — checked out via `git archive`, no git mutation — on
+CPU and GPU alike under jax 0.9.1, while the 12/12-green evidence behind it was
+taken on **jax 0.7.0 on Perlmutter**. So this is a version-leg red on an
+instrument that counts traces, the same class as the P4 remat row: an instrument
+written against one stack and read on another. Nothing about the chain's
+numbers is implicated — the other eleven cells, which are the physics, are green.
+
+**What it is NOT evidence of, checked explicitly.** `fix/kirr-fullids-2026-08-08`
+(`7a2ac1db`, merged `b50aa641`) corrects k-row mislabeling on affected decks, and
+this file's `CHAIN_REL_TOL` gate holds a frozen reference. Re-run on a tree that
+CONTAINS that fix: **11 passed, 1 deselected** — the frozen reference still
+holds, so the chain quantities do not traverse the corrected map and there is
+nothing to re-anchor here. Recorded so that nobody re-cuts this reference on the
+strength of the trace-count red sitting next to it.
+
+**The open question is real and should not be suppressed:** does jax 0.9
+legitimately trace that chain twice, or has the single-compile property this
+instrument exists to protect actually been lost? A green from pinning the
+counter to 2 would answer the wrong question. Owner call; the cell stays red and
+named until someone reads the traces.
 
 ### THE OWED PERLMUTTER CENSUS
 
