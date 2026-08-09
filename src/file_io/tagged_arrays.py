@@ -599,56 +599,93 @@ def _check_nspinor(nspinor: int, where: str) -> int:
     return ns
 
 
-def _refuse_a_q_wedge(f, filename):
-    """REFUSE a restart file whose V/W sit on the IBZ q wedge, BY NAME.
+def _qirr_wedge_tables(f):
+    """The unfold tables for each restart tensor stored on the IBZ q WEDGE.
 
-    THE GW RESTART PATH DOES NOT UNFOLD, and until 2026-08-08 it did not say
-    so either — it did not ask the question at all.  A wedge file read here
-    came back with a q axis of ``n_q_ibz`` instead of ``n_q_full``, flowed
-    through ``gw_init``'s restart branch untouched, and met a ``W_q`` that
-    screening HAD unfolded at ``gw/cohsex_sigma.py``'s ``W_q - V_q``, where
-    it died as ``TypeError: sub got incompatible shapes for broadcasting:
-    (9, 399, 399), (5, 399, 399)``.  That traceback names jax's ufunc
-    machinery and a subtraction; it does not name the restart file, the deck
-    key that chose the format, or the way out.  And it only appeared at all
-    because the two shapes happened to disagree — a deck whose IBZ wedge
-    happened to have as many q's as the full BZ would have subtracted the
-    wrong blocks in silence.
+    Returns ``{dataset_name: QirrTables}``, empty for every restart file that
+    stores its tensors on the full BZ — which is every file written before
+    the q_irr format existed and every file a full-BZ run writes today.  An
+    empty answer means the reader below does nothing at all, so the byte path
+    for those files is the one they have always had.
 
-    So this asks, once, before any bytes move, and refuses with the fix in
-    the message.  It is deliberately NOT an unfold: teaching this reader to
-    gather-then-unfold is registered design work (the sharded reader has the
-    same gap, and ``bse_io._MunuSlabPlan``'s comment explains why a per-rank
-    hyperslab structurally cannot do it), and a refusal that names the
-    remedy is the honest state until that lands.
+    THIS REPLACED A REFUSAL, and the refusal is worth remembering because it
+    is what the unfold has to be better than.  Until 2026-08-08 this reader
+    did not ask the question; a wedge file came back with a q axis of
+    ``n_q_ibz``, flowed through ``gw_init``'s restart branch untouched, and
+    met a ``W_q`` that screening HAD unfolded at ``gw/cohsex_sigma.py``'s
+    ``W_q - V_q``, dying as ``TypeError: sub got incompatible shapes for
+    broadcasting: (9, 399, 399), (5, 399, 399)``.  ``50db6299`` turned that
+    into a named refusal, deliberately NOT an unfold, because the sharded
+    reader was believed unable to redistribute.  Per the owner's ruling of
+    2026-08-08 ~13:20 the readers ALWAYS unfold, and the belief was measured
+    and found wrong — see :func:`_unfold_wedge`.
+
+    ASKED IN PASS 1, WHILE THE SERIAL HANDLE IS OPEN, and it costs kilobytes:
+    the tables are a permutation and a wrap table, not a tensor.  Doing it
+    here rather than inside the SlabIO block keeps the two handles from
+    overlapping, which is the same rule the geometry read above follows.
 
     THE PROBE IS ``symmetry_maps.dataset_q_storage`` — the same one
     ``bse_io.is_q_wedge`` wraps, called directly here because ``file_io``
     must not import ``bse`` (that is uphill, and the layering ratchet says
-    so).  Two callers now, in two layers, and
-    ``test_restart_qirr_consumers.py::test_the_probe_has_one_implementation``
+    so).  Two callers, in two layers, and
+    ``test_restart_qirr_consumers.py::test_the_probe_has_exactly_two_named_callers``
     names both rather than letting a third appear unnoticed.
     """
-    from symmetry_maps import dataset_q_storage
-    wedged = [name for name in ("V_qmunu", "W0_qmunu")
-              if name in f and dataset_q_storage(f[name]) == "ibz"]
-    if not wedged:
-        return
-    raise ValueError(
-        f"Restart file {filename}: {', '.join(wedged)} "
-        f"{'is' if len(wedged) == 1 else 'are'} stored on the IBZ q WEDGE "
-        f"(restart_q_storage=auto or =ibz wrote it), and the GW restart "
-        f"reader does not unfold — it would hand a wedge-shaped V_q to a "
-        f"full-BZ W_q and subtract mismatched q blocks.\n"
-        f"  Re-run the GW leg with restart_q_storage=full (the DEFAULT; the "
-        f"wedge is opt-in per deck), or read this file through the serial "
-        f"h5py path in bse_io, which unfolds.\n"
-        f"  This refusal is TRANSITIONAL scaffolding (owner ruling "
-        f"2026-08-08): restart_q_storage is scheduled for retirement, after "
-        f"which storage follows the WFN's own symmetry and both readers "
-        f"always unfold, so there will be no wedge file to refuse.  Until "
-        f"then, a wedge restart file is for runs that discard the artifact, "
-        f"not for runs that read it back here.")
+    from symmetry_maps import read_tables, dataset_q_storage
+    return {name: read_tables(f, name)
+            for name in ("V_qmunu", "S_qmunu", "V0_noG0_munu", "W0_qmunu")
+            if name in f and dataset_q_storage(f[name]) == "ibz"}
+
+
+def _unfold_wedge(A, tables, n_rmu_pad, mesh_xy):
+    """IBZ wedge -> full BZ, with the tables the FILE itself carries.
+
+    ``tables is None`` (the full-BZ and legacy case) returns ``A`` untouched,
+    so this is a no-op on every restart file that is not a wedge.
+
+    THE SAME CALL THE PRODUCER MADE, ON THE SAME TABLES.  The format stores
+    the PRE-UNFOLD block, so ``unfold(stored)`` is the identity — the same
+    function on the same inputs the producing run itself used — rather than a
+    property that depends on the bit-frozen op-selection policy.  That is why
+    the tables come out of the file rather than being re-derived from this
+    run's ``sym``: a table that reconstructs the tensor must be the table
+    that deconstructed it.
+
+    A SHARDED UNFOLD IS AVAILABLE, and this is the point the tree used to say
+    the other way.  ``bse_io._MunuSlabPlan``'s refusal argues that a per-rank
+    (μ, ν) hyperslab cannot unfold because the unfold gathers across the very
+    axes it shards on.  The premise is true of SlabIO and the conclusion does
+    not follow: ``unfold_isdf_operator`` is a ``shard_map`` over four
+    ``lax.all_to_all`` collectives that redistribute those axes
+    volume-preservingly, never exceeding one tile per rank, and it takes and
+    returns ``P(None,'x','y')`` — exactly the spec ``_munu_slab_request``
+    produces.  The producer runs it on the real distributed mesh twice per
+    run.  MEASURED bit-identical against the single-device unfold at 2x2, 4x1
+    and 1x4 (DESIGN_restart_consolidation.md §1, element-wise on the
+    off-diagonals).  What SlabIO cannot do is unfold as a hyperslab OFFSET,
+    and nothing here asks it to: it reads the wedge exactly as it reads a
+    full-BZ tensor, and the collective happens afterwards, in jax.
+
+    THE PAD IS THIS READER'S, NEVER THE WRITER'S.  The file stores the
+    LOGICAL μ extent (SHARDING_RULES §2), so the tables are re-padded against
+    THIS process's device count with ``QirrTables.padded`` — identity tail on
+    the permutation, zero tail on the wrap, the same pure function the writer
+    inverted.  That is what makes a file written on four ranks read on eight,
+    and it is why the tables move to the tensor's extent rather than the
+    tensor being clipped to theirs.  ``unfold_isdf_operator`` additionally
+    REFUSES a μ extent not divisible by Px·Py; ``n_rmu_pad`` came from
+    ``padded_mu_extent`` two frames up and already satisfies it, which is
+    stated here so nobody later optimises the pad away.
+    """
+    if tables is None:
+        return A
+    from symmetry_maps import unfold_isdf_operator
+    t = tables.padded(int(n_rmu_pad))
+    return unfold_isdf_operator(
+        A, irr_idx=t.irr_idx_q, sym_idx=t.sym_idx_q, sym_perm=t.sym_perm,
+        L_table=t.L_table, q_irr_frac=t.q_irr_frac, mesh_xy=mesh_xy,
+        n_sym_spatial=int(t.n_sym_spatial))
 
 
 def read_restart_state_from_h5(filename, mesh_xy):
@@ -696,6 +733,19 @@ def read_restart_state_from_h5(filename, mesh_xy):
     ``jnp.pad`` and no ``with_sharding_constraint`` applied to an
     already-resident global array.
 
+    THE q WEDGE IS UNFOLDED, ALWAYS, AND THE CALLER NEVER LEARNS OF IT.
+    A restart file whose V/W sit on the IBZ q wedge comes back on the FULL
+    BZ, at the same shape and the same sharding as a full-BZ file's, so
+    ``gw_init``'s restart branch reads ``rs.V_qmunu`` without asking which
+    q-set the bytes were on.  That is the owner's ruling of 2026-08-08
+    ~13:20 — storage follows the WFN's own symmetry and readers always
+    unfold — and it is what retires this reader's former refusal.  The
+    tables come out of the FILE (:func:`_qirr_wedge_tables`) and the unfold
+    is the producer's own call (:func:`_unfold_wedge`), so what comes back
+    is the same function of the same inputs the producing run used.  On
+    every full-BZ and legacy file nothing happens at all: the probe returns
+    an empty map and the read is the byte path it has always been.
+
     SPINOR AND BISPINOR.  ``nspinor`` is read from the ψ dataset and
     carried through as a replicated axis at its on-disk extent — 2 for a
     spinor restart, 4 for a bispinor one — and gated by
@@ -715,10 +765,10 @@ def read_restart_state_from_h5(filename, mesh_xy):
             raise ValueError(
                 f"Restart file {filename} is missing canonical psi_full_y "
                 "dataset. Regenerate restart tensors with current gw_jax.")
-        # BEFORE ANY BYTES MOVE.  A wedge file is refused here rather than
-        # ~200 lines and one SlabIO collective later at a shape mismatch
-        # nobody can attribute to a deck key.
-        _refuse_a_q_wedge(f, filename)
+        # THE UNFOLD TABLES, while this handle is open and before any tensor
+        # bytes move.  Empty on every full-BZ and legacy file, which is what
+        # keeps those reads on the byte path they have always had.
+        wedge_tables = _qirr_wedge_tables(f)
         shapes = {k: tuple(int(s) for s in f[k].shape)
                   for k in ("V_qmunu", "S_qmunu", "V0_noG0_munu",
                             "psi_full_y", "psi_full_y_transverse")
@@ -760,7 +810,12 @@ def read_restart_state_from_h5(filename, mesh_xy):
         off, shape, spec = _munu_slab_request(shapes[name], n_rmu_pad)
         arr = io.read_slab(name, shape=shape, dtype=dtypes[name],
                            offset=off, mesh=mesh_xy, partition_spec=spec)
-        return _collapse_leading(arr, shapes[name], mesh_xy)
+        arr = _collapse_leading(arr, shapes[name], mesh_xy)
+        # THE UNFOLD, AFTER THE READ AND BEFORE THE CALLER SEES IT.  The
+        # request above derives its q extent from the dataset shape, so a
+        # wedge simply arrives as (n_q_ibz, mu_pad, nu_pad) on the same spec
+        # the unfold takes and returns.  A no-op on every non-wedge file.
+        return _unfold_wedge(arr, wedge_tables.get(name), n_rmu_pad, mesh_xy)
 
     def _read_psi(io, name, n_mu_logical):
         if name not in shapes:

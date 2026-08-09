@@ -456,3 +456,211 @@ def test_the_legal_set_is_the_one_the_parser_validates_against():
     assert np.all(np.array([m == m.strip().lower()
                             for m in RESTART_Q_STORAGE])), (
         "the legal values must already be in normalised form")
+
+
+# ---------------------------------------------------------------------------
+# 5. THE WFN-DERIVED DECISION (owner ruling 2026-08-08 ~13:20)
+#
+# "if symmetries are not to be used, the wavefunction file should've been
+# generated with no symmetries."  The ruling's consequence for the writer is
+# that a WFN with no symmetry gets full storage AUTOMATICALLY — not because a
+# key says so, but because there is no wedge.
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class _FakeCapture:
+    """The three fields ``with_capture``'s demotion reads.
+
+    Deliberately not a ``PreUnfoldCapture``: the demotion must depend on the
+    q COUNTS and nothing else, and a fake that carried a tensor would let a
+    future implementation start reading one without this cell noticing.
+    """
+
+    irr_idx_q: np.ndarray
+    q_irr_frac: np.ndarray
+    X_ibz: object = None
+
+
+def _capture(n_q_ibz, n_q_full):
+    return _FakeCapture(irr_idx_q=np.zeros(n_q_full, dtype=np.int32),
+                        q_irr_frac=np.zeros((n_q_ibz, 3)))
+
+
+def test_a_wedge_that_is_the_whole_bz_is_demoted_to_full():
+    """THE NO-SYMMETRY CASE, AND IT IS ARITHMETIC RATHER THAN A FLAG.
+
+    A WFN with ``ntran = 1`` takes ``SymMaps``' trivial branch: ``irr_idx_q``
+    is the identity and the q axis does not reduce.  Such a deck's centroid
+    set is still orbit-closed — trivially, under the identity op — so the
+    closure question answers yes and the q-grid resolution reaches
+    ``use_ibz``.  Nothing there is wrong; there is simply no wedge.
+
+    Storing "the wedge" anyway would write the full BZ under a q_irr stamp
+    and a table group, and the format's own table validation would label
+    that file ``"full"`` from its SHAPE — so the writer and the reader
+    would describe one file two ways.  The demotion applies the READER's
+    own test at the writer, which is what makes them agree by construction.
+    """
+    from gw.restart_q_storage import resolve_restart_q_storage
+
+    d = resolve_restart_q_storage("auto", _closed_and_reduced(),
+                                  context="gate")
+    assert d.mode == "ibz" and d.store_wedge
+
+    # 5 of 9: a real wedge survives.
+    kept = d.with_capture(_capture(5, 9))
+    assert kept.mode == "ibz" and kept.store_wedge
+    assert kept.capture is not None
+
+    # 9 of 9: no reduction, so no wedge — demoted, and it says why.
+    flat = d.with_capture(_capture(9, 9))
+    assert not flat.store_wedge, (
+        "a q axis that does not reduce has no wedge to store; storing one "
+        "would stamp the full BZ as a q_irr file")
+    assert flat.mode == "full"
+    assert flat.capture is not None, (
+        "the capture stays bound — the demotion is about the SHAPE, not "
+        "about the hand-off having failed")
+    assert "does not reduce" in flat.reason
+    assert "9" in flat.reason, "the reason must name the counts it measured"
+
+
+def test_the_demotion_leaves_the_full_arm_and_the_empty_capture_alone():
+    """The two arms the demotion must NOT touch, for two different reasons.
+
+    A ``full`` decision has nothing to demote.  A missing capture is a
+    PLUMBING failure — the resolution said wedge and the producer deposited
+    nothing — and the writer refuses that by name; silently rewriting it to
+    ``full`` would turn a broken hand-off into a quietly larger file.
+    """
+    from gw.restart_q_storage import resolve_restart_q_storage
+
+    full = resolve_restart_q_storage("full", None, context="gate")
+    assert full.with_capture(_capture(9, 9)).mode == "full"
+    assert full.with_capture(None).capture is None
+
+    ibz = resolve_restart_q_storage("auto", _closed_and_reduced(),
+                                    context="gate")
+    none_bound = ibz.with_capture(None)
+    assert none_bound.store_wedge, (
+        "a missing capture must stay 'ibz' so the writer's named refusal "
+        "still fires; demoting here would hide a broken hand-off")
+    assert none_bound.capture is None
+
+
+def test_a_nosym_wfn_really_does_produce_an_unreduced_q_axis():
+    """THE FIXTURE BEHIND THE CASE ABOVE, measured rather than assumed.
+
+    ``hbn_cohsex_debug`` is a genuine ``nosym`` WFN (``ntran = 1``, from its
+    ``qe/nscf.in``), and it is the sharpest available test vector precisely
+    because its CENTROID set is orbit-closed anyway — ``centroid.kmeans_cli``
+    recovered a 12-op symmorphic point group from the charge density while
+    the WFN stores one op.  A design that keyed on closure would store a
+    wedge for this deck; a design that follows the WFN must not.  So the two
+    answers differ on a fixture already in the tree, and this cell is what
+    proves the premise is real: ntran is 1, and the q axis does not reduce.
+    """
+    import h5py
+    from ffi import _services
+    _services.ensure_on_path()
+    import symmetry_maps
+
+    deck = (pathlib.Path(__file__).resolve().parents[1]
+            / "tests" / "regression" / "hbn_cohsex_debug" / "WFN.h5")
+    if not deck.exists():                                # pragma: no cover
+        pytest.skip(f"nosym fixture absent: {deck}")
+    with h5py.File(deck, "r") as f:
+        ntran = int(f["mf_header"]["symmetry"]["ntran"][()])
+    assert ntran == 1, (
+        f"{deck} is the tree's no-symmetry fixture; it now reports "
+        f"ntran={ntran}, so this cell and the ruling's example need "
+        f"re-checking against a different deck")
+
+    from file_io.mf_header import read_mf_header
+    hdr = read_mf_header(str(deck))
+    sym = symmetry_maps.SymMaps(hdr)
+    n_q_full = int(np.asarray(sym.irr_idx_q).shape[0])
+    n_q_ibz = int(len(set(np.asarray(sym.irr_idx_q).tolist())))
+    assert n_q_ibz == n_q_full, (
+        f"a nosym WFN's q axis must not reduce; got {n_q_ibz} of "
+        f"{n_q_full}.  If this changed, the demotion in with_capture is no "
+        f"longer what makes a nosym deck store the full BZ.")
+
+
+# ---------------------------------------------------------------------------
+# 6. THE KEY IS DEPRECATED, AND SAYS SO TO THE DECKS THAT PIN IT
+# ---------------------------------------------------------------------------
+
+def test_the_parser_records_which_keys_the_deck_itself_named(tmp_path):
+    """A pinned key and an inherited default must be distinguishable.
+
+    They are not distinguishable from the resolved value: a deck pinning
+    ``full`` and a deck that never mentions the key both arrive as
+    ``"full"``.  The parser knows the difference — it reads ``None`` from the
+    section for an absent key — and now records it, because a deprecation
+    that cannot tell those apart must either shout at every deck in the tree
+    or at none of them.
+    """
+    from gw.gw_config import read_lorrax_input
+
+    bare = tmp_path / "bare.in"
+    bare.write_text("[LORRAX]\nnval = 4\nncond = 4\n")
+    pinned = tmp_path / "pinned.in"
+    pinned.write_text(
+        "[LORRAX]\nnval = 4\nncond = 4\nrestart_q_storage = full\n")
+
+    bare_keys = read_lorrax_input(str(bare))["_deck_named_keys"]
+    pin_keys = read_lorrax_input(str(pinned))["_deck_named_keys"]
+
+    assert "restart_q_storage" not in bare_keys
+    assert "restart_q_storage" in pin_keys
+    assert "nval" in bare_keys and "nval" in pin_keys, (
+        "the record must cover every named key, not only the deprecated one")
+    # It is not a deck key and must never be mistaken for one.
+    from gw.gw_config import _DEFAULTS
+    assert "_deck_named_keys" not in _DEFAULTS
+
+
+def test_the_deprecation_speaks_only_to_a_deck_that_named_the_key():
+    """OWNER RULING 2026-08-08 ~13:20: this key is deleted, not defaulted.
+
+    So a deck that pins it is building on something with an end date and is
+    told once; a deck that never mentions it hears nothing.  Warning on the
+    default path would print for every deck in the tree, which is how a
+    deprecation notice becomes noise nobody reads — and the DEFAULT is not
+    what is deprecated, the KEY is.
+    """
+    import types
+    from gw.restart_q_storage import _deck_named_the_key
+
+    assert _deck_named_the_key(
+        types.SimpleNamespace(raw_input_keys=frozenset({"restart_q_storage"})))
+    assert not _deck_named_the_key(
+        types.SimpleNamespace(raw_input_keys=frozenset({"nval"})))
+    # A config with no record at all — a hand-built params dict, or an older
+    # caller — must answer "did not ask" rather than raising or shouting.
+    assert not _deck_named_the_key(types.SimpleNamespace())
+    assert not _deck_named_the_key(
+        types.SimpleNamespace(raw_input_keys=None))
+
+
+def test_the_key_still_works_because_removal_is_the_owners_step():
+    """DEPRECATED-BUT-FUNCTIONAL.  A pinned deck's behaviour is untouched.
+
+    The ruling schedules the deletion; it does not ask this branch to take
+    it.  ``si_bse_debug`` pins ``full`` deliberately and its README schedules
+    that pin to be deleted WITH the key rather than before it, so the key
+    must keep resolving exactly as it did.
+    """
+    from gw.restart_q_storage import (RESTART_Q_STORAGE,
+                                      resolve_restart_q_storage)
+    from gw.gw_config import _DEFAULTS
+
+    assert RESTART_Q_STORAGE == ("auto", "full", "ibz"), (
+        "the key is still functional; its legal set does not shrink before "
+        "the owner-reviewed deletion")
+    assert _DEFAULTS["restart_q_storage"] == "full"
+    assert resolve_restart_q_storage(
+        "full", _closed_and_reduced(), context="gate").mode == "full"
+    assert resolve_restart_q_storage(
+        "auto", _closed_and_reduced(), context="gate").mode == "ibz"

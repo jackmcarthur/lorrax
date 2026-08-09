@@ -118,10 +118,29 @@ def _hermitian_ibz(n_q, n_mu, seed=7):
     return 0.5 * (a + np.swapaxes(a.conj(), -1, -2))
 
 
+def _q_irr_for(n_ibz):
+    """``n_ibz`` IBZ q's in fractional coords, generic enough to phase.
+
+    ``_Q_IRR`` is gnppm's real five; a deck with more stars (Si has eight)
+    needs more, and what the unfold cares about is only that the q's are
+    generic — the umklapp phase is ``exp(2πi q·(L_μ − L_ν))``, so a q whose
+    dot with every lattice wrap is an integer makes the phase the identity
+    and hides a dropped ``L_table``.  Thirds and twelfths are used for the
+    same reason the deck's own q's are: they are the fractions a real
+    Monkhorst-Pack grid produces, and they are not integers against L.
+    """
+    if n_ibz <= len(_Q_IRR):
+        return _Q_IRR[:n_ibz]
+    extra = np.array([[(3 + 2 * i) / 12.0, (1 + 5 * i) % 12 / 12.0,
+                       (7 + i) % 12 / 12.0]
+                      for i in range(n_ibz - len(_Q_IRR))])
+    return np.concatenate([_Q_IRR, extra], axis=0)
+
+
 class _Arm:
     """One deck's real stars + a closed set + a wedge + its own reference."""
 
-    def __init__(self, deck, seed=7):
+    def __init__(self, deck, seed=7, seeds=_SEEDS_12):
         _service_on_path()
         from symmetry_maps import (centroid_source_map_and_wrap,
                                    verify_centroid_orbit_closure)
@@ -129,7 +148,7 @@ class _Arm:
 
         S, tnp = _deck_syms(deck)
         irr, sym, n_spatial, n_ibz = _star_tables(deck)
-        cent = _closed_centroid_set(S, tnp, _FFT, _SEEDS_12)
+        cent = _closed_centroid_set(S, tnp, _FFT, seeds)
         self.deck = deck
         self.verdict = verify_centroid_orbit_closure(
             cent.astype(np.float64) / _FFT, S, tnp=tnp, fft_grid=_FFT)
@@ -137,11 +156,37 @@ class _Arm:
         perm, L = centroid_source_map_and_wrap(
             cent, S, tnp, _FFT, validate=True, extend_trs=True)
         self.n_mu = int(cent.shape[0])
-        self.tables = QS.QirrTables(irr, sym, _Q_IRR[:n_ibz], perm, L,
+        self.tables = QS.QirrTables(irr, sym, _q_irr_for(n_ibz), perm, L,
                                     n_spatial)
         self.X_ibz = _hermitian_ibz(n_ibz, self.n_mu, seed=seed)
         self.n_trs_rows = int((np.asarray(sym) >= n_spatial).sum())
         self.n_q_full = int(len(irr))
+
+    def exercises(self):
+        """What the unfold's machinery ACTUALLY does on this arm.
+
+        Returns ``(n_nonidentity_perm_q, n_phased_elements, n_trs_q)`` — the
+        three branches of ``unfold_isdf_operator`` that can silently be no-ops
+        depending on which sym rows this deck's q-stars happen to select.
+        A gate that does not check this is asserting an identity permutation
+        against itself and calling it a round trip; see
+        ``test_the_arms_between_them_exercise_every_unfold_branch``.
+        """
+        t = self.tables
+        perm = np.asarray(t.sym_perm)
+        L = np.asarray(t.L_table)
+        irr = np.asarray(t.irr_idx_q)
+        sym = np.asarray(t.sym_idx_q)
+        q_irr = np.asarray(t.q_irr_frac)
+        ident = np.arange(self.n_mu)
+        n_perm = sum(1 for q in range(len(irr))
+                     if not np.array_equal(perm[sym[q]], ident))
+        n_phase = 0
+        for q in range(len(irr)):
+            qL = q_irr[irr[q]] @ L[sym[q]].T
+            d = np.abs(qL[:, None] - qL[None, :])
+            n_phase += int((np.abs(d - np.rint(d)) > 1e-12).sum())
+        return n_perm, n_phase, int((sym >= t.n_sym_spatial).sum())
 
     def kernel(self):
         """``unfold_isdf_operator`` on the wedge — the uncompressed array."""
@@ -196,6 +241,26 @@ def _assert_offdiag_elementwise(got, ref, label):
 @pytest.fixture()
 def trs_arm():
     return _Arm("gnppm_debug")
+
+
+@pytest.fixture()
+def perm_arm():
+    """Si: 48 spatial ops, 64 q, and stars that reach NON-IDENTITY rows.
+
+    gnppm cannot carry the permutation half of the claim, and it took a
+    deliberate measurement to notice.  Its group has two spatial ops, and
+    every one of its nine q's folds to its IBZ parent through sym row 0 or
+    row 2 — the identity and time-reversal-times-the-identity — so its
+    centroid permutation is the identity at every q and its umklapp wraps are
+    zero at every q.  The TRS conjugation IS live there and that is what that
+    arm is for; the double gather and the phase are not, and a round trip
+    that never permutes is an identity asserted against itself.
+
+    Si's 64-point grid reaches sym rows 0-23, whose permutations are genuinely
+    non-trivial.  Four seeds rather than eight keep the orbit union (and so
+    the (64, μ, μ) reference) small enough to stay a unit test.
+    """
+    return _Arm("si_cohsex_debug", seeds=_SEEDS_12[:4])
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +603,7 @@ def test_the_probe_has_exactly_two_named_callers():
     There is one PROBE — ``symmetry_maps.dataset_q_storage`` — and there are
     two readers that must ask it, in two layers that cannot import each
     other: the BSE reader (inside ``bse_io.is_q_wedge``) and the GW restart
-    reader (inside ``file_io.tagged_arrays._refuse_a_q_wedge``).  ``file_io``
+    reader (inside ``file_io.tagged_arrays._qirr_wedge_tables``).  ``file_io``
     calls the service door directly because importing ``bse`` from
     ``file_io`` is uphill and the layering ratchet forbids it.
 
@@ -554,7 +619,7 @@ def test_the_probe_has_exactly_two_named_callers():
     call it, a third must justify itself here first.
     """
     _EXPECTED = {_BSE_IO.name: "is_q_wedge",
-                 _TAGGED_ARRAYS.name: "_refuse_a_q_wedge"}
+                 _TAGGED_ARRAYS.name: "_qirr_wedge_tables"}
     calls = {}
     for path in (_BSE_IO, _VQ_INTERP, _TAGGED_ARRAYS):
         for node in ast.walk(ast.parse(path.read_text())):
@@ -574,48 +639,256 @@ def test_the_probe_has_exactly_two_named_callers():
             f"the one call in {path.name} moved out of {owner}")
 
 
-def test_the_gw_restart_reader_refuses_a_wedge_and_names_the_way_out(
-        trs_arm, tmp_path):
-    """RED TWIN of the hardening: the GW reader must REFUSE, not compute.
+# ---------------------------------------------------------------------------
+# The GW restart reader: it ALWAYS UNFOLDS (owner ruling 2026-08-08 ~13:20)
+# ---------------------------------------------------------------------------
 
-    The failure this replaces was `TypeError: sub got incompatible shapes
-    for broadcasting: (9, 399, 399), (5, 399, 399)` raised inside jax's
-    ufunc dispatch from ``gw/cohsex_sigma.py``'s ``W_q - V_q`` — a
-    traceback that names a subtraction and no part of the actual problem.
-    Worse, it appeared only because the two extents disagreed; the wedge was
-    never actually detected.
+def _mesh_1x1():
+    import jax
+    from jax.sharding import Mesh
+    return Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
 
-    So the assertion is on the MESSAGE, not merely on the raising: it must
-    say wedge, and it must carry both ways out (the deck key and the serial
-    path), because an operator who hits this is holding a file they cannot
-    otherwise account for.
+
+def _write_gw_restart(path, arm, V_full_bz, *, wedge):
+    """A complete GW restart file carrying ``arm``'s numbers.
+
+    ``wedge=False`` writes ``V_full_bz`` the way every full-BZ run writes it.
+    ``wedge=True`` writes the SAME RUN's pre-unfold block plus the tables that
+    reconstruct it — the two files a reader must not be able to tell apart
+    once it has read them.  ψ / enk are along because the reader requires
+    ``psi_full_y`` and pads on its own axis.
     """
-    from file_io.tagged_arrays import _refuse_a_q_wedge
+    import jax.numpy as jnp
+    from file_io import write_restart_state_to_h5
+    n_mu = arm.n_mu
+    rng = np.random.default_rng(11)
+    psi = (rng.standard_normal((2, 3, 1, n_mu))
+           + 1j * rng.standard_normal((2, 3, 1, n_mu))).astype(np.complex128)
+    enk = rng.standard_normal((2, 3)).astype(np.float64)
+    write_restart_state_to_h5(
+        path, n_rmu_logical=n_mu, V_qmunu=jnp.asarray(V_full_bz),
+        enk_full=jnp.asarray(enk), mesh=_mesh_1x1(), mode="w",
+        kgrid=(arm.n_q_full, 1, 1))
+    write_restart_state_to_h5(
+        path, n_rmu_logical=n_mu, psi_full_y=jnp.asarray(psi),
+        mesh=_mesh_1x1(), mode="a")
+    if wedge:
+        # Replace V with the PRE-UNFOLD block and stamp it, which is what
+        # ``tagged_arrays._stamp_qirr`` does on the production writer path
+        # once SlabIO has released the file.
+        from symmetry_maps import write_qirr_tensor
+        with h5py.File(path, "a") as f:
+            del f["V_qmunu"]
+        write_qirr_tensor(path, "V_qmunu", arm.X_ibz, tables=arm.tables,
+                          closure_verdict=arm.verdict)
+        with h5py.File(path, "a") as f:
+            f["V_qmunu"].attrs["V_ready"] = True
+    return path
 
+
+def _require_slabio():
+    """Skip, naming the probe stage, when the phdf5 tile path is absent.
+
+    Same idiom and same reason as ``test_file_io._require_slabio``.  The
+    end-to-end cell below goes through ``load_restart_state_from_h5``, which
+    is a SlabIO collective; on a machine without the FFI (WSL) that is a
+    missing capability, not a result.  The gate that carries the CLAIM does
+    not go through SlabIO at all and runs everywhere — see
+    ``test_the_gw_reader_unfolds_a_wedge_bit_identically``.
+    """
+    from file_io.slab_io import probe_availability
+    ok, stage, reason = probe_availability()
+    if not ok:
+        pytest.skip(f"SlabIO unavailable (probe stage '{stage}'): {reason}")
+
+
+def test_the_arms_between_them_exercise_every_unfold_branch(
+        trs_arm, perm_arm):
+    """THE COVERAGE RATCHET: no branch of the unfold is a silent no-op.
+
+    ``unfold_isdf_operator`` has three things it can do — permute the centroid
+    axes, apply the umklapp phase, and conjugate on a TRS row — and each of
+    them is skipped entirely when a deck's q-stars happen not to select a sym
+    row that needs it.  MEASURED on the arms this file uses: gnppm's nine q's
+    all fold through sym row 0 or 2, both of which carry the IDENTITY
+    permutation and zero wraps, so on that arm the unfold permutes nothing
+    and phases nothing while still passing a bit-identity round trip.  That
+    is a real gap and it was invisible until it was measured: the deck is the
+    one the landing census used, and both of this campaign's conjugation bugs
+    lived in exactly this machinery.
+
+    So the arms are asserted to cover the branches BETWEEN them, here, once,
+    rather than each cell hoping its own fixture is rich enough.
+    """
+    g_perm, g_phase, g_trs = trs_arm.exercises()
+    s_perm, s_phase, s_trs = perm_arm.exercises()
+
+    assert g_trs > 0, "gnppm is the TRS arm; it must reach antiunitary rows"
+    assert (g_perm, g_phase) == (0, 0), (
+        "gnppm's stars used to fold through identity rows only.  If that has "
+        "changed the docstrings above and in the perm_arm fixture are now "
+        "wrong and must be re-measured, not merely re-run.")
+    assert s_perm > 0, (
+        "the Si arm exists to permute; if its stars stopped reaching "
+        "non-identity sym rows, the double gather is untested everywhere")
+    assert s_phase > 0, (
+        "the Si arm must carry nonzero umklapp phase, or a dropped L_table "
+        "would pass every cell in this file")
+
+
+@pytest.mark.parametrize("arm_name", ["trs_arm", "perm_arm"])
+@pytest.mark.parametrize("extra_pad", [0, 2])
+def test_the_gw_reader_unfolds_a_wedge_bit_identically(
+        request, tmp_path, extra_pad, arm_name):
+    """THE GATE: unfold(wedge file) == what the producing run held.
+
+    This is what replaced the refusal ``50db6299`` added.  That refusal was
+    correct for its day — the GW reader did not unfold, and a wedge reaching
+    it died 200 lines later in jax's ufunc machinery at ``W_q - V_q`` on
+    ``(9, 399, 399)`` against ``(5, 399, 399)``, a traceback naming a
+    subtraction and no part of the actual problem.  The owner's ruling of
+    2026-08-08 ~13:20 is that the reader unfolds instead, so the assertion
+    moves from "it refuses and says why" to "it returns what the run held".
+
+    NOT A TOLERANCE.  The format stores the PRE-UNFOLD block, so the reader's
+    unfold is the SAME FUNCTION ON THE SAME INPUTS the producer called.  The
+    comparison is element-wise on the off-diagonals, never a norm, because
+    both conjugation bugs this campaign shipped were diagonal-preserving.
+
+    IT DOES NOT GO THROUGH SlabIO, deliberately.  What the change consists of
+    is ``_qirr_wedge_tables`` (which tables does this file carry?) and
+    ``_unfold_wedge`` (apply them); the transport between them is untouched
+    by this branch and is unavailable on WSL.  So this cell hands
+    ``_unfold_wedge`` exactly what SlabIO hands it — the wedge at the PADDED
+    μ extent, zero-filled past the dataset, sharded ``P(None,'x','y')`` — and
+    the end-to-end cell below proves the wiring where the FFI exists.
+
+    THE PAD ARM (``extra_pad=2``) is the only place ``QirrTables.padded``
+    runs on the GW path: the file stores the LOGICAL extent and the reader
+    re-pads the TABLES to its own device count.  Its pad rows must come back
+    exactly zero — a pad that acquired structure would be a permutation
+    addressing centroids the file does not have.
+
+    TWO ARMS, because one deck cannot carry the claim: gnppm reaches the
+    antiunitary branch and permutes nothing, Si permutes and phases and never
+    conjugates.  ``test_the_arms_between_them_exercise_every_unfold_branch``
+    is what keeps that division honest.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from file_io.tagged_arrays import _qirr_wedge_tables, _unfold_wedge
+
+    trs_arm = request.getfixturevalue(arm_name)
     path = str(tmp_path / "wedge.h5")
-    trs_arm.write_wedge(path)
+    trs_arm.write_wedge(path, name="V_qmunu")
     with h5py.File(path, "r") as f:
-        with pytest.raises(ValueError) as exc:
-            _refuse_a_q_wedge(f, path)
-    msg = str(exc.value)
-    assert "wedge" in msg.lower()
-    assert "restart_q_storage=full" in msg
-    assert "serial" in msg.lower() or "bse_io" in msg
-    assert "W0_qmunu" in msg or "V_qmunu" in msg
+        tables = _qirr_wedge_tables(f)
+        assert set(tables) == {"V_qmunu"}, (
+            f"the probe must find exactly the wedge tensor; got {set(tables)}")
+        raw = np.asarray(f["V_qmunu"][()])
+
+    n_mu = trs_arm.n_mu
+    n_pad = n_mu + extra_pad
+    assert raw.shape == (trs_arm.X_ibz.shape[0], n_mu, n_mu), (
+        "the file must store the LOGICAL μ extent on the WEDGE q axis")
+
+    # Exactly what SlabIO returns: the padded shape, zero-filled past the
+    # dataset, on the spec ``_munu_slab_request`` builds.
+    mesh = _mesh_1x1()
+    padded = np.pad(raw, ((0, 0), (0, extra_pad), (0, extra_pad)))
+    arr = jax.device_put(jnp.asarray(padded),
+                         NamedSharding(mesh, P(None, "x", "y")))
+
+    got = np.asarray(_unfold_wedge(arr, tables["V_qmunu"], n_pad, mesh))
+    want = np.pad(trs_arm.kernel(), ((0, 0), (0, extra_pad), (0, extra_pad)))
+
+    assert got.shape == want.shape == (trs_arm.n_q_full, n_pad, n_pad)
+    assert trs_arm.n_q_full > raw.shape[0], (
+        "this deck must actually reduce, or the gate proves nothing")
+    n_off = _assert_offdiag_elementwise(got, want, "GW reader unfold")
+    assert n_off > 0
+    assert np.array_equal(got, want), (
+        "the unfolded wedge must be bit-identical to the array the "
+        "producing run held, diagonal included")
+    if extra_pad:
+        assert not got[:, n_mu:, :].any(), "μ pad rows must stay zero"
+        assert not got[:, :, n_mu:].any(), "ν pad cols must stay zero"
 
 
-def test_the_gw_restart_reader_is_silent_on_every_file_that_exists_today(
-        trs_arm, tmp_path):
-    """The other half: a full-BZ or legacy no-attr file passes untouched.
+@pytest.mark.parametrize("extra_pad", [0, 2])
+def test_the_gw_restart_reader_unfolds_a_wedge_end_to_end(
+        trs_arm, tmp_path, monkeypatch, extra_pad):
+    """The same claim through the REAL reader, wiring included.
 
-    ``_refuse_a_q_wedge`` runs on EVERY restart read, so a false positive
-    here would refuse every archived run in the tree.  A file with no
-    q-storage attrs at all — which is what every restart written before this
-    format existed looks like — must read as ``full`` and say nothing.
+    The cell above proves the unfold; this proves it is CONNECTED — that
+    ``read_restart_state_from_h5`` probes in pass 1, reads the wedge through
+    the transport unchanged, and unfolds before the caller sees it.  Two
+    restart files carrying the same run's numbers, one full-BZ and one on the
+    wedge, must be indistinguishable once read.
+
+    Skipped where the phdf5 FFI is absent (WSL), because the reader is a
+    SlabIO collective; the claim itself does not depend on this cell running.
     """
-    from file_io.tagged_arrays import _refuse_a_q_wedge
+    from file_io import load_restart_state_from_h5
 
+    _require_slabio()
+    if extra_pad:
+        monkeypatch.setenv("LORRAX_EXTRA_MU_PAD", str(extra_pad))
+    else:
+        monkeypatch.delenv("LORRAX_EXTRA_MU_PAD", raising=False)
+
+    ref_full_bz = trs_arm.kernel()
+    full_path = _write_gw_restart(str(tmp_path / "full.h5"), trs_arm,
+                                  ref_full_bz, wedge=False)
+    wedge_path = _write_gw_restart(str(tmp_path / "wedge.h5"), trs_arm,
+                                   ref_full_bz, wedge=True)
+
+    # The wedge really is smaller on disk, or this gate proves nothing.
+    with h5py.File(wedge_path, "r") as f:
+        assert f["V_qmunu"].shape[0] == trs_arm.X_ibz.shape[0]
+    with h5py.File(full_path, "r") as f:
+        assert f["V_qmunu"].shape[0] == trs_arm.n_q_full
+
+    mesh = _mesh_1x1()
+    got = np.asarray(load_restart_state_from_h5(wedge_path, mesh).V_qmunu)
+    want = np.asarray(load_restart_state_from_h5(full_path, mesh).V_qmunu)
+
+    assert got.shape == want.shape == (
+        trs_arm.n_q_full, trs_arm.n_mu + extra_pad,
+        trs_arm.n_mu + extra_pad)
+    n_off = _assert_offdiag_elementwise(got, want, "GW reader unfold")
+    assert n_off > 0
+    assert np.array_equal(got, want), (
+        "the unfolded wedge and the full-BZ file must be bit-identical, "
+        "diagonal included")
+    if extra_pad:
+        assert np.array_equal(got[:, trs_arm.n_mu:, :], np.zeros_like(
+            got[:, trs_arm.n_mu:, :])), "μ pad rows must re-read as zeros"
+        assert np.array_equal(got[:, :, trs_arm.n_mu:], np.zeros_like(
+            got[:, :, trs_arm.n_mu:])), "ν pad cols must re-read as zeros"
+
+
+def test_the_gw_restart_reader_is_byte_identical_on_every_file_today(
+        trs_arm, tmp_path, monkeypatch):
+    """The other half: a full-BZ or legacy no-attr file is untouched.
+
+    ``_qirr_wedge_tables`` runs on EVERY restart read, so a false positive
+    here would put an unfold in front of every archived run in the tree.  A
+    file with no q-storage attrs at all — what every restart written before
+    this format existed looks like — must probe as ``full``, return an empty
+    table map, and leave the read on the identical byte path.
+    """
+    from file_io.tagged_arrays import _qirr_wedge_tables, _unfold_wedge
+
+    monkeypatch.delenv("LORRAX_EXTRA_MU_PAD", raising=False)
     path = str(tmp_path / "legacy.h5")
-    trs_arm.write_legacy_full(path)
+    trs_arm.write_legacy_full(path, name="V_qmunu")
     with h5py.File(path, "r") as f:
-        _refuse_a_q_wedge(f, path)          # must not raise
+        assert _qirr_wedge_tables(f) == {}, (
+            "a legacy no-attr file must yield no unfold tables at all")
+
+    # ...and the no-op arm of the unfold returns the SAME OBJECT, so a
+    # full-BZ read cannot acquire a jit, a copy, or a resharding.
+    sentinel = object()
+    assert _unfold_wedge(sentinel, None, 8, _mesh_1x1()) is sentinel
