@@ -455,11 +455,12 @@ def _integrate_tau_windows_for_branch(
                 "sigma_window", step_num=win_idx,
                 detail=f"{branch_label}:{win.name}:n{win.n_tau}",
             ):
-                mask_A_j    = jnp.asarray(win.mask_A)
-                mask_B_j    = _materialize_window_mask_B(
-                    win, base_mask_B=base_mask_B, Omega_q=Omega_q)
-                E_ref_A_j   = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
-                E_ref_B_j   = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
+                with timing.section("sigma.window_operands"):
+                    mask_A_j    = jnp.asarray(win.mask_A)
+                    mask_B_j    = _materialize_window_mask_B(
+                        win, base_mask_B=base_mask_B, Omega_q=Omega_q)
+                    E_ref_A_j   = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
+                    E_ref_B_j   = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
 
                 # Laplace windows dispatch the merged X kernel; crossing
                 # windows the two-channel kernel (see docstring).
@@ -634,18 +635,19 @@ def _run_sigma_branch(
     if n_omega == 0:
         return None, []
 
-    windows = _build_windows_for_branch(
-        omega_nonneg_ry=omega_nonneg_ry,
-        E_A=E_A, base_mask_A=base_mask_A,
-        Omega_q=Omega_q, base_mask_B=base_mask_B,
-        space=space, neg_omega_half=neg_omega_half,
-        regularization_width_ry=regularization_width_ry,
-        edge_factor=edge_factor,
-        target_error=target_error, max_nodes=max_nodes,
-        crossing_eps_q=crossing_eps_q, crossing_max_nodes=crossing_max_nodes,
-        use_shipped_minimax_tables=use_shipped_minimax_tables,
-        log_tag=log_tag, print_fn=print_fn,
-    )
+    with timing.section("sigma.windows"):
+        windows = _build_windows_for_branch(
+            omega_nonneg_ry=omega_nonneg_ry,
+            E_A=E_A, base_mask_A=base_mask_A,
+            Omega_q=Omega_q, base_mask_B=base_mask_B,
+            space=space, neg_omega_half=neg_omega_half,
+            regularization_width_ry=regularization_width_ry,
+            edge_factor=edge_factor,
+            target_error=target_error, max_nodes=max_nodes,
+            crossing_eps_q=crossing_eps_q, crossing_max_nodes=crossing_max_nodes,
+            use_shipped_minimax_tables=use_shipped_minimax_tables,
+            log_tag=log_tag, print_fn=print_fn,
+        )
     if not windows:
         return None, []
 
@@ -878,11 +880,12 @@ def compute_sigma_c_ppm_omega_grid(
     # and drop out of B_mask_raw structurally — see _prepare_sigma_state.)
     if valid_mask_q is None:
         valid_mask_q = jnp.ones(Omega_q.shape, dtype=bool)
-    state = _prepare_sigma_state(
-        enk_full, occ_full, B_q, Omega_q, valid_mask_q,
-        jnp.asarray(fermi_reference == "midgap", dtype=bool),
-        jnp.asarray(keep_invalid, dtype=bool),
-    )
+    with timing.section("sigma.state"):
+        state = _prepare_sigma_state(
+            enk_full, occ_full, B_q, Omega_q, valid_mask_q,
+            jnp.asarray(fermi_reference == "midgap", dtype=bool),
+            jnp.asarray(keep_invalid, dtype=bool),
+        )
     efermi = state.efermi
     E_cond = state.E_cond
     H_val = state.H_val
@@ -1051,8 +1054,9 @@ def compute_sigma_c_ppm_omega_grid(
                     and branch_tiles.spatial_padded == tile_meta.spatial_padded), (
                 f"sigma branch tile layout drifted across branches: "
                 f"{branch_tiles.spatial_padded} vs {tile_meta.spatial_padded}")
-        for d, t in enumerate(branch_tiles.tiles):
-            tile_acc[d][idx] += t
+        with timing.section("sigma.branch_fold"):
+            for d, t in enumerate(branch_tiles.tiles):
+                tile_acc[d][idx] += t
 
     # Single end-of-stage gather: assemble the global padded Σ_c from the
     # per-rank host tiles and reconstruct it on every rank's host — ONCE,

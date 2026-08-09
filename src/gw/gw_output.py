@@ -371,7 +371,9 @@ def persist_w0_and_head(
     # self-consistency loop cannot re-store the first iteration's W.
     from .restart_q_storage import (resolve_restart_q_storage_for_run,
                                     take_pre_unfold)
-    _qirr = resolve_restart_q_storage_for_run(
+    from common import timing as _tmg
+    with _tmg.section("persist_w0.resolve"):
+        _qirr = resolve_restart_q_storage_for_run(
         config, sym=sym, centroid_indices=centroid_indices,
         # ``getattr``, not ``meta.fft_grid``: the grid is read ONLY when
         # ``sym``/``centroid_indices`` are both present (the resolver
@@ -379,14 +381,16 @@ def persist_w0_and_head(
         # reachable with a minimal meta that carries neither.  Evaluating
         # it unconditionally would make a caller that asked for nothing
         # new fail on an attribute it never needed.
-        fft_grid=getattr(meta, "fft_grid", None), print_fn=print_fn,
-        context="W0 restart tensor")
-    write_w0_qmunu_to_h5(tensors_filename, W_q,
-                         n_rmu_logical=int(meta.n_rmu),
-                         mesh=mesh_xy,
-                         qirr=_qirr.with_capture(
-                             take_pre_unfold("W0_qmunu")))
-    head_static = head_resolver.at(0.0 + 0.0j)
+            fft_grid=getattr(meta, "fft_grid", None), print_fn=print_fn,
+            context="W0 restart tensor")
+    with _tmg.section("persist_w0.write_w0"):
+        write_w0_qmunu_to_h5(tensors_filename, W_q,
+                             n_rmu_logical=int(meta.n_rmu),
+                             mesh=mesh_xy,
+                             qirr=_qirr.with_capture(
+                                 take_pre_unfold("W0_qmunu")))
+    with _tmg.section("persist_w0.head_static"):
+        head_static = head_resolver.at(0.0 + 0.0j)
     # THE STORED ω GRID IS THE PROBE SET, so it is the POLE MODEL that
     # decides it, not "is this run dynamic".  The two questions agreed for
     # as long as every dynamic mode was a two-point plasmon-pole fit; MPA
@@ -403,7 +407,8 @@ def persist_w0_and_head(
         else:
             omega_imp = 1j * float(config.ppm.omega_p)
             _omega_grid_entry = float(omega_imp.imag)
-        head_imag = head_resolver.at(omega_imp)
+        with _tmg.section("persist_w0.head_imag"):
+            head_imag = head_resolver.at(omega_imp)
         whead_arr = np.array(
             [head_static.wcoul0, head_imag.wcoul0], dtype=np.complex128)
         omega_grid = np.array([0.0, _omega_grid_entry], dtype=np.float64)
@@ -423,12 +428,13 @@ def persist_w0_and_head(
     else:
         whead_arr = np.array([head_static.wcoul0], dtype=np.complex128)
         omega_grid = np.array([0.0], dtype=np.float64)
-    write_head_scalars_to_h5(
-        tensors_filename,
-        vhead=complex(head_static.vc0),
-        whead=whead_arr,
-        omega_grid=omega_grid,
-    )
+    with _tmg.section("persist_w0.write_head"):
+        write_head_scalars_to_h5(
+            tensors_filename,
+            vhead=complex(head_static.vc0),
+            whead=whead_arr,
+            omega_grid=omega_grid,
+        )
     print_fn(
         f"  Persisted W0_qmunu + q=0 head scalars: "
         f"vhead={head_static.vc0.real:.3f} a.u.,  "

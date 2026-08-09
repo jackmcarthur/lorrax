@@ -301,38 +301,43 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
         from common.chi_from_dipole import read_dipole_h5, compute_S_omega
         from gw.vcoul import compute_q0_averages
 
-        dipole_cart, deltaE = read_dipole_h5(dipole_path)
+        from common import timing as _tmg
+        with _tmg.section("head.read_dipole"):
+            dipole_cart, deltaE = read_dipole_h5(dipole_path)
         nk_tot = int(sym.nk_tot)
         nb = int(dipole_cart.shape[2])
         nelec = int(wfn.nelec)
-        _check_dipole_coverage(
-            dipole_path, nb_file=nb, nk_file=int(dipole_cart.shape[1]),
-            nk_run=nk_tot, nb_run=int(getattr(meta, "nb_sigma", 0) or 0),
-            nelec=nelec, print_fn=print_fn)
-        _check_dipole_provenance(dipole_path, params=params, wfn=wfn,
-                                 print_fn=print_fn)
+        with _tmg.section("head.checks"):
+            _check_dipole_coverage(
+                dipole_path, nb_file=nb, nk_file=int(dipole_cart.shape[1]),
+                nk_run=nk_tot, nb_run=int(getattr(meta, "nb_sigma", 0) or 0),
+                nelec=nelec, print_fn=print_fn)
+            _check_dipole_provenance(dipole_path, params=params, wfn=wfn,
+                                     print_fn=print_fn)
         occ = np.zeros((nk_tot, nb), dtype=float)
         occ[:, :max(0, min(nelec, nb))] = 1.0
         f_nk = jnp.asarray(occ, dtype=jnp.float64)
         omega_grid = jnp.asarray([omega_val], dtype=jnp.complex128)
-        S_cart_omega = compute_S_omega(
-            dipole_cart,
-            deltaE,
-            f_nk,
-            float(wfn.cell_volume),
-            int(sym.nk_tot),
-            int(wfn.nspin),
-            int(wfn.nspinor),
-            omega_grid,
-            eta=eta,
-        )[0]
-        vc0_mean, wcoul0 = compute_q0_averages(
-            wfn,
-            jnp.asarray(0.0, dtype=jnp.float64),
-            meta,
-            S_cart=S_cart_omega,
-            analytic_sphere=bool(params.get("head_minibz_average", False)),
-        )
+        with _tmg.section("head.S_omega"):
+            S_cart_omega = compute_S_omega(
+                dipole_cart,
+                deltaE,
+                f_nk,
+                float(wfn.cell_volume),
+                int(sym.nk_tot),
+                int(wfn.nspin),
+                int(wfn.nspinor),
+                omega_grid,
+                eta=eta,
+            )[0]
+        with _tmg.section("head.q0_avg"):
+            vc0_mean, wcoul0 = compute_q0_averages(
+                wfn,
+                jnp.asarray(0.0, dtype=jnp.float64),
+                meta,
+                S_cart=S_cart_omega,
+                analytic_sphere=bool(params.get("head_minibz_average", False)),
+            )
         source = "s_tensor" if abs(omega_val) <= 1.0e-14 else f"s_tensor(omega={omega_val} Ry)"
         return HeadSample(
             vc0=complex(vc0_mean),
