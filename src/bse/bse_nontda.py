@@ -56,6 +56,8 @@ convention, stacked ``(n_eig, 2, nc, nv, nk)`` and wired to
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -137,6 +139,90 @@ def dense_col_chunk(args, mesh_xy, N, *, log=None):
                 f"col_chunk=1; if this OOMs, shard wider (raise px*py) or use "
                 f"the matrix-free route (make_ab_appliers).")
     return chunk
+
+
+# --- the restart's q <-> -q reciprocity -------------------------------------
+# The dense resonant block's direct term is
+#
+#   K_d[(cvk),(c'v'k')] = sum_{MN,ts} conj(psi_c[k]) W_MN(k-k') psi_c[k']
+#                                     psi_v[k] conj(psi_v[k'])
+#
+# so **A is Hermitian if and only if W_MN(q) = conj(W_MN(-q))** for every
+# (M, N, q) -- equivalently, if and only if the real-space W_R is REAL.  That
+# is a property of the tile the GW stage wrote and of nothing in this solver,
+# so it is measurable on the loaded array before any of the O(N^2) dense build
+# runs.
+#
+# It is worth measuring because the BSE stage does NOT compute W -- it READS it
+# off the GW restart (``tmp/isdf_tensors_*.h5``).  A restart written before the
+# mini-BZ Coulomb head-slot fix carries the pre-fix operator frozen into a file,
+# and repointing ``LORRAX_CHECKOUT`` at a fixed source tree changes nothing at
+# all for a BSE-stage run.  MEASURED on the Si 4x4x4 record deck's 2026-08-07
+# restart: ``W0_qmunu`` broke reciprocity at 8.635e-04 relative, the resulting A
+# missed Hermiticity by 3.05e-05, and the definite-pencil gate below refused --
+# correctly, but only after the whole dense build had been paid for.
+#
+# The refusal therefore moves to the input, where the defect is, and names the
+# GW re-run that repairs it.  It does not replace the A gate: that gate is
+# unchanged and still runs.
+_NONTDA_RECIP_TOL = 1e-6
+
+
+def w_q_reciprocity(W_q) -> float:
+    """``max|W(q) - conj(W(-q))| / max|W|`` for the loaded screening tile.
+
+    ``W_q`` is the ``(mu, nu, nkx, nky, nkz)`` array as the solver receives it.
+    The ``-q`` gather is ``index -> (-index) % n`` on each of the three k axes,
+    which is a flip followed by a roll of one; those axes are the REPLICATED
+    axes of ``sh.W`` (``P('x','y',None,None,None)``), so this adds no collective
+    and gathers nothing.  Measured post-load, on the array the solve will
+    actually use, so it is independent of whether the restart stored q on the
+    full grid or on a symmetry wedge that the reader unfolded."""
+    ax = (2, 3, 4)
+    W_mq = jnp.roll(jnp.flip(W_q, axis=ax), shift=(1, 1, 1), axis=ax)
+    scale = jnp.max(jnp.abs(W_q))
+    resid = jnp.max(jnp.abs(W_q - jnp.conj(W_mq)))
+    return float(resid / jnp.maximum(scale, 1e-300))
+
+
+def check_restart_reciprocity(W_q, *, tol=_NONTDA_RECIP_TOL, log=None,
+                              input_file=None) -> float:
+    """Preflight: refuse a restart whose W tile cannot make A Hermitian.
+
+    Returns the measured relative residual.  ``tol=None`` measures and reports
+    without refusing -- the escape hatch for a system that genuinely breaks the
+    conjugate-reciprocity relation (broken time reversal), where the non-TDA
+    definite-pencil reduction is questionable on its own terms anyway.
+
+    This is a PRODUCED-INPUT refusal in the sense of
+    ``absorption_common.load_dipole_h5``: the thing that is wrong is upstream of
+    this process, and the message carries the command that fixes it."""
+    rel = w_q_reciprocity(W_q)
+    if log is not None:
+        log(f"  [nontda] restart q<->-q reciprocity: "
+            f"max|W(q) - conj(W(-q))| / max|W| = {rel:.3e} "
+            f"(tol {'off' if tol is None else format(tol, '.1e')})")
+    if tol is not None and rel > tol:
+        deck = Path(input_file).name if input_file else "<deck>.in"
+        raise ValueError(
+            f"non-TDA refuses this restart: its screened-Coulomb tile is not "
+            f"conjugate-reciprocal in q "
+            f"(max|W(q) - conj(W(-q))| / max|W| = {rel:.3e}, tol {tol:.1e}).\n"
+            f"A = D + K^x - K^d is Hermitian IF AND ONLY IF "
+            f"W_MN(q) = conj(W_MN(-q)), so this restart CANNOT produce a "
+            f"Hermitian resonant block; the definite-pencil solve would refuse "
+            f"it anyway, but only after the O(N^2) dense build.\n"
+            f"This is a STALE ARTIFACT, not a solver bug. The BSE stage does "
+            f"not compute W, it reads it from the GW restart "
+            f"(tmp/isdf_tensors_*.h5), so a restart written before the mini-BZ "
+            f"Coulomb head-slot fix carries the pre-fix operator frozen into "
+            f"the file -- pointing LORRAX_CHECKOUT at a fixed source tree "
+            f"changes nothing for a BSE-stage run.  REGENERATE it by re-running "
+            f"the GW stage in the deck directory:\n"
+            f"    python3 -u -m gw.gw_jax -i {deck}\n"
+            f"and re-run this solve against the rewritten restart.\n"
+            f"To proceed without the check, pass recip_tol=None.")
+    return rel
 
 
 def _full_matvec_and_args(data, mesh_xy, sh, *, include_W):
@@ -233,7 +319,14 @@ def solve_nontda_definite_pencil(A, B, n_eig, *, pd_rtol=1e-10):
     A = np.asarray(A); B = np.asarray(B); N = A.shape[0]
     a_herm = np.linalg.norm(A - A.conj().T) / max(np.linalg.norm(A), 1e-300)
     if a_herm > 1e-6:
-        raise ValueError(f"non-TDA resonant block A is not Hermitian (rel {a_herm:.2e}).")
+        raise ValueError(
+            f"non-TDA resonant block A is not Hermitian (rel {a_herm:.2e}). "
+            f"A is Hermitian iff the restart's W obeys W_MN(q) = conj(W_MN(-q)); "
+            f"run bse_nontda.check_restart_reciprocity(data['W_q']) on the "
+            f"loaded tile to see whether the input is the cause, and if it is, "
+            f"regenerate the restart with `python3 -u -m gw.gw_jax -i <deck>.in`. "
+            f"The threshold is NOT the thing to move: it is a structural "
+            f"property of the operator, not a convergence tolerance.")
     K = np.block([[A, B], [B.conj(), A.conj()]])
     K = 0.5 * (K + K.conj().T)
     w, U = np.linalg.eigh(K)
@@ -281,17 +374,28 @@ def solve_nontda_product(A, B, n_eig):
     return omega[order], Z[:, order]
 
 
-def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True, **_ignored):
+def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
+                             recip_tol=_NONTDA_RECIP_TOL, **_ignored):
     """Non-TDA (full BSE) lowest-eigenvalue solve — one entry, dispatched on B.
 
     Returns ``(eigenvalues_Ry (n_eig,), eigenvectors (n_eig, 2, nc, nv, nk),
     n_iter)`` matching the TDA ``solve_bse_sharded`` tuple; the pair axis carries
-    (X, Y) with ``X^H X - Y^H Y = +1``."""
+    (X, Y) with ``X^H X - Y^H Y = +1``.
+
+    ``recip_tol`` is the restart preflight's threshold on
+    ``max|W(q) - conj(W(-q))| / max|W|`` (:func:`check_restart_reciprocity`);
+    ``None`` measures without refusing."""
     sh = make_bse_shardings(mesh_xy)
     _log0 = print if jax.process_index() == 0 else (lambda *_a, **_k: None)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     nk = nkx * nky * nkz
     nc = int(data["n_cond_pad"]); nv = int(data["n_val_pad"])
+    # Preflight BEFORE the dense build: the input decides whether A can be
+    # Hermitian at all, and the build is O(N^2) columns of a ring T tensor.
+    # Skipped when the W term is off (include_W=False has no W to check).
+    if include_W and data.get("W_q") is not None:
+        check_restart_reciprocity(data["W_q"], tol=recip_tol, log=_log0,
+                                  input_file=data.get("input_file"))
     matvec, args = _full_matvec_and_args(data, mesh_xy, sh, include_W=include_W)
     with mesh_xy:
         A, B = _materialize_A_B(matvec, args, sh, nc, nv, nk,
