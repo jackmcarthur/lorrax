@@ -95,6 +95,7 @@ __all__ = [
     "transition_dipoles",
     "head_prefactor",
     "head_channel_samples",
+    "build_head_axis",
     "plasma_frequency_ry",
     "fsum_residual",
     "head_fsum_from_transitions",
@@ -507,6 +508,67 @@ def head_channel_samples(head_tensor_z, geometry, kgrid, *,
                                      S_cart=jnp.asarray(A[i]), **common)
         w_out[i] = complex(w0) * ratio
     return complex(v_sphere), w_out
+
+
+def build_head_axis(head_tensor_z, z_samples, geometry, kgrid, n_p, *,
+                    guards=None, rcond=1.0e-13, analytic_sphere=True,
+                    nsamples=2 ** 18, method="auto", qmc_reps=10):
+    """The five values ``mpa_store.write_head_axis`` takes, in its order.
+
+    THE STORE FORMAT IS NOT DEFINED HERE.  It is
+    ``feat/mpa-sigma-2026-08-08``'s: fit-store format version 2 adds a
+    ``__mpahead`` sibling group carrying ``head_z`` and ``head_w`` on a
+    ``2*n_p`` axis, ``head_Omega_p`` and ``head_B_p`` on an ``n_p`` axis,
+    and ``mpa_head_vhead`` as an attribute.  That split is the right one
+    and this function adopts it rather than proposing another: the
+    samples travel WITH the poles because a store holding one without
+    the other has a head nobody can certify, and the sample axis is
+    complex because the double-parallel grid's strip points have both
+    parts nonzero.
+
+    THE CONVERGENCE POINT between the two lanes is exactly here: that
+    branch owns the store and its refusals -- an allocated-but-unstamped
+    head reads back as zeros, and a zero head pole is not an absent one,
+    so ``read_head_poles`` refuses it by name -- and this lane owns the
+    numbers that go in.  Neither writes the other's half.
+
+    Returns
+    -------
+    ``(head_z, head_w, head_Omega_p, head_B_p, vhead)``
+        ``head_w`` is ``W_c`` at the head, i.e. ``W_head - v_head`` and
+        not ``W_head``: the multipole model of (1) is ``v + sum_p ...``,
+        so the samples the fit consumes and the samples the store keeps
+        beside the poles must both be the CORRELATION part, or the
+        stored evidence does not reproduce the stored poles.
+    """
+
+    from gw.mpa import pade_fit
+
+    z = np.asarray(z_samples, dtype=np.complex128).reshape(-1)
+    n_p = int(n_p)
+    if z.size != 2 * n_p:
+        raise ValueError(
+            f"GATE head_sample_count: got {z.size} samples for n_p={n_p}; "
+            f"the double-parallel protocol supplies exactly 2*n_p = "
+            f"{2 * n_p}.  A head fitted on a different grid from the body "
+            f"cannot be certified against the body's stamps.")
+    v_head, w_head = head_channel_samples(
+        head_tensor_z, geometry, kgrid, analytic_sphere=analytic_sphere,
+        nsamples=nsamples, method=method, qmc_reps=qmc_reps)
+    w_c = np.asarray(w_head, dtype=np.complex128) - complex(v_head)
+    Om, B, _diag = pade_fit.fit_mpa_poles(
+        jnp.asarray(w_c), jnp.asarray(z), n_p, guards=guards, rcond=rcond)
+    Om = np.asarray(jax.device_get(Om), dtype=np.complex128)
+    B = np.asarray(jax.device_get(B), dtype=np.complex128)
+    if np.any(np.imag(Om) > 0.0):
+        raise ValueError(
+            "GATE head_time_order: a fitted head pole has Im Omega > 0, "
+            "which enters the tau stage as exp(+|Im Omega| tau) and "
+            "diverges.  The body fit's guards put poles in the closed "
+            "fourth quadrant and the head's fit owes the same; this is "
+            "the same refusal write_head_axis makes, raised here so the "
+            "store is never asked to hold it.")
+    return z, w_c, Om, B, complex(v_head)
 
 
 def plasma_frequency_ry(n_elec, cell_volume):

@@ -424,3 +424,51 @@ def test_head_channel_pole_is_the_plasmon():
         f"plasmon {deck_wp:.3f} eV (silicon's measured value is 16.7 eV; "
         f"this deck's saturation ratio is "
         f"{fsum['saturation_ratio']:.3f})")
+
+
+def test_head_axis_matches_the_store_contract():
+    """``build_head_axis`` returns exactly what ``write_head_axis`` takes.
+
+    The store half lives on ``feat/mpa-sigma-2026-08-08`` and is not
+    imported here -- this branch must not depend on an unmerged one --
+    so the contract is asserted against its shapes and its two refusals
+    rather than against its code: ``2*n_p`` samples, ``n_p`` poles,
+    complex128 throughout, and no pole in the upper half plane.  If that
+    branch's format moves, this cell is what says so.
+    """
+
+    deck = _deck("si_cohsex_debug")
+    n_p = 4
+    omega_m = float(np.max(deck["delta"])) * 1.05
+    z = np.asarray(sampling.double_parallel_grid(
+        n_p, omega_m, material_class="insulator", energy_unit="Ry"),
+        dtype=np.complex128)
+    A = _head(deck, z)
+    from vcoul.geometry import CoulombGeometry
+    geom = CoulombGeometry(bvec=deck["bvec"],
+                           cell_volume=deck["cell_volume"])
+    hz, hw, Om, B, vhead = head_dipole.build_head_axis(
+        A, z, geom, deck["kgrid"], n_p, nsamples=2 ** 14, qmc_reps=2)
+    assert hz.shape == (2 * n_p,) and hz.dtype == np.complex128
+    assert hw.shape == (2 * n_p,) and hw.dtype == np.complex128
+    assert Om.shape == (n_p,) and B.shape == (n_p,)
+    assert np.all(np.imag(Om) <= 0.0), Om
+    assert np.isfinite(vhead) and vhead.real > 0.0
+    # head_w is the CORRELATION part, W - v, and at z = 0 that is close
+    # to MINUS the whole bare head rather than close to zero: screening
+    # takes W down to v/eps, so W_c(0) = -v(1 - 1/eps) and the ratio
+    # |W_c(0)|/v IS 1 - 1/eps.  Asserting it is small would be asserting
+    # that silicon does not screen.  What must hold is the sign, the
+    # bound, and that adding v back gives a positive screened head with
+    # a physical dielectric constant.
+    assert hw[0].real < 0.0
+    assert abs(hw[0]) < abs(vhead)
+    w_screened = vhead + hw[0]
+    assert w_screened.real > 0.0
+    eps_eff = (vhead / w_screened).real
+    assert 2.0 < eps_eff < 200.0, eps_eff
+    # And the stored samples must reproduce the stored poles.
+    back = np.asarray(pade_fit.eval_mpa_model(jnp.asarray(Om),
+                                              jnp.asarray(B),
+                                              jnp.asarray(hz)))
+    assert np.max(np.abs(back - hw)) < 1.0e-3 * np.max(np.abs(hw))
