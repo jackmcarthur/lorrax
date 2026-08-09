@@ -509,6 +509,66 @@ def build_qsgw_sigma_xc(
 
 
 # ---------------------------------------------------------------------------
+# The opt-in QSGW cube write — one implementation, two seams
+# ---------------------------------------------------------------------------
+
+def write_qsgw_sigma_cube(
+    sigma_omega_h5_path,
+    sigma_xc_qsgw_kij_ry,
+    *,
+    config,
+    print_fn=print,
+) -> bool:
+    """Append ``sigma_xc_qsgw_kij_ev`` to a ``sigma_mnk.h5`` just written.
+
+    No-op unless the deck sets ``write_qsgw_datasets`` (see
+    ``gw_config._DEFAULTS`` for what the appendix is and why it is off by
+    default).  Returns whether anything was written.
+
+    THREE CALL SITES, AND THEY ARE NOT INTERCHANGEABLE.  Each hands over
+    a QSGW build — Σ_x + Σ_c^QSGW, already Hermitised by
+    :func:`build_qsgw_sigma_xc`'s closing ``½(M + M†)`` — at the one
+    moment its own path has the build that goes into H, in the basis the
+    file's other cubes are in:
+
+    * ``gw.sigma_dispatch.compute_sigma_xc``, immediately after the QSGW
+      build, on the one-shot path where ``compute_ppm_sigma_pipeline``
+      created the file a few statements earlier.  Gated there on the same
+      ``write_sigma_omega_h5`` flag that decided whether the file was
+      written at all, so it cannot fire during an SC iteration (which
+      passes False and writes nothing).
+    * :func:`solve_qp`'s ``fixed_point`` branch, which REBUILDS at the
+      solved on-shell energies and therefore supersedes the at-DFT cube
+      the dispatch just wrote.  The append replaces the dataset, so the
+      file ends up holding the Σ that actually built the Hamiltonian.
+    * ``gw.sc_iteration.dump_sigma_omega_h5_final``, right after the
+      converged single write, and BEFORE ``run_sc_driver`` rotates the
+      matrix back to the DFT basis.
+
+    The cube arrives replicated — ``build_qsgw_sigma_xc`` pins it so with
+    a ``with_sharding_constraint`` before it Hermitises — so the rank-0
+    h5py append below has a whole array to write on every process, and
+    the barrier lets the caller rely on the file being complete when this
+    returns.
+    """
+    if not bool(getattr(config, "write_qsgw_datasets", False)):
+        return False
+    if not sigma_omega_h5_path or sigma_xc_qsgw_kij_ry is None:
+        return False
+    from common.collectives import barrier
+    from file_io import append_qsgw_datasets_h5
+
+    if jax.process_index() == 0:
+        append_qsgw_datasets_h5(
+            sigma_omega_h5_path,
+            {"sigma_xc_qsgw_kij_ev":
+                RYD_TO_EV * np.asarray(sigma_xc_qsgw_kij_ry)},
+            print_fn=print_fn)
+    barrier("qsgw_sigma_cube_append")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # update_H — the qp_solver dispatch (one-shot / fixed-point)
 # ---------------------------------------------------------------------------
 
@@ -649,6 +709,17 @@ def solve_qp(
     )
     print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
         f"({100*qsgw_diag['frac_clipped']:.1f}%)")
+    # THE REBUILD SUPERSEDES THE AT-DFT CUBE IN THE FILE TOO.  The Σ
+    # dispatch already appended its own QSGW build — evaluated at E_DFT,
+    # which is what ``one_shot_dft`` keeps — and on this branch that build
+    # is not the one that goes into H: this one is, at the solved
+    # energies.  A file holding the superseded cube would disagree with
+    # ``eqp0.dat`` by the whole on-shell correction with nothing to say so,
+    # and the append replaces the dataset, so the last writer on the path
+    # is the one whose Σ built the Hamiltonian.
+    write_qsgw_sigma_cube(
+        sigma_result.sigma_omega_h5_path, sigma_xc_qsgw_kij_ry,
+        config=config, print_fn=print_fn)
     return sigma_xc_qsgw_kij_ry + sig_h
 
 
@@ -703,4 +774,5 @@ __all__ = [
     "interp_along_omega",
     "plot_qp_energy_comparison",
     "solve_diagonal_sigma_fixed_point",
+    "write_qsgw_sigma_cube",
 ]

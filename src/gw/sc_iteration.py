@@ -1973,6 +1973,7 @@ def dump_sigma_omega_h5_final(
     if sigma_result is None or sigma_result.sigma_c_omega_kij_ry is None:
         return None
     from .ppm_pipeline import _write_sigma_omega_h5
+    from .qsgw_utils import write_qsgw_sigma_cube
 
     # ``sym`` TURNS THE k_irr EXTRACTION ON, and the ordering it needs is
     # already the ordering this function has: Sigma arrives on the full BZ
@@ -1989,6 +1990,20 @@ def dump_sigma_omega_h5_final(
         sym=sym, print_fn=print_fn,
     )
     print_fn(f"  Σ_c(ω) tensor: {path}")
+    # THE QSGW CUBE, WRITTEN WHERE IT IS STILL IN ITS OWN BASIS.  Under
+    # self-consistency ``sigma_xc_kij_ry`` is Σ_x + Σ_c^QSGW built from
+    # ``wfns_qp``, i.e. the QP basis — the same basis the Σ_c(ω) cube
+    # above was written in (``sigma_dispatch.SIGMA_BASIS_FIELDS`` says
+    # why that one is never rotated).  ``run_sc_driver`` rotates
+    # ``sigma_xc_kij_ry`` back to the DFT basis a few frames below this
+    # call, and appending it AFTER that would put one DFT-basis matrix in
+    # a file of QP-basis ones with matching shape, dtype and stamp.
+    # Nothing downstream would notice; this seam is the reason it cannot
+    # happen.  Full BZ either way, so the k_irr extraction that ran on
+    # the cubes above runs on this one identically.
+    write_qsgw_sigma_cube(
+        path, sigma_result.sigma_xc_kij_ry,
+        config=config, print_fn=print_fn)
     return path
 
 

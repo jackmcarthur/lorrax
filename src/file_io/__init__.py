@@ -48,9 +48,13 @@ from .tagged_arrays import (
     load_restart_state_from_h5,
 )
 from .sigma_output import (
+    QSGW_PLOT_DATASETS,
+    SIGMA_CUBE_DATASETS,
     SIGMA_K_AXIS,
     SPREAD_ATTR_PREFIX,
+    append_qsgw_datasets_h5,
     compact_star_tables,
+    extract_and_stamp_k_irr,
     k_irr_rows_for,
     sigma_star_spread_stats,
     star_select_k_irr,

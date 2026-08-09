@@ -611,6 +611,189 @@ def write_freq_debug(
 
 
 # ---------------------------------------------------------------------------
+# The QP ladders of sigma_mnk.h5's plotting appendix
+# ---------------------------------------------------------------------------
+# THREE LADDERS OF ONE H₀, which is the whole reason they are worth
+# plotting together: ``kin_ion + V_H`` is common to all three and only
+# the Σ_xc added to it changes, so the vertical distance between two
+# curves IS the difference between two approximations at that (k, n) and
+# nothing else.  They are eigenvalues, so unlike the Σ cubes beside them
+# they are BASIS-FREE — ``eigvalsh(U†HU) == eigvalsh(H)`` — which is why
+# one seam serves the one-shot and the self-consistent paths alike even
+# though those two hand this function matrices in different bases.
+#
+# WHAT IS NOT HERE, and why it is not manufactured.  ``qp_static_cohsex_ev``
+# is H₀ + Σ_SX + Σ_COH, and those two channels are built only by
+# ``compute_mode = cohsex`` (``sigma_dispatch``: the dynamic branch calls
+# ``compute_v_h_sigma_x``, which touches W not at all).  A PPM run could
+# be made to produce SOMETHING for that name — its Σ_x + Σ_c(ω=0) is also
+# a static self-energy — but that is a different operator, it already has
+# a name here (``qp_omega0_ev``), and a plot that plots one quantity twice
+# under two labels is worse than a plot with one curve missing.  So a run
+# that did not build the channels omits the dataset and says so.
+
+def write_qsgw_qp_ladders(
+    results: "GWResults",
+    *,
+    config,
+    e_qp_ry,
+    sigma_c_omega_diag_ev,
+    omega_grid_ev,
+    sigma_c_omega=None,
+    print_fn=print,
+):
+    """Append the QP energy ladders to ``sigma_mnk.h5`` (rank-0 caller).
+
+    No-op unless the deck sets ``write_qsgw_datasets`` and this run wrote
+    a ``sigma_mnk.h5`` at all.  Returns the dataset names written.
+
+    ``e_qp_ry`` is the driver's own QP ladder (the eigh of
+    ``½(H + H†)``, ``H = kin_ion + Σ_xc + V_H``) — passed rather than
+    recomputed so the file cannot disagree with ``eqp0.dat`` about what
+    this run's QP energies were.  It is not itself one of the three; it
+    is the reference the three are read against.
+    """
+    if not bool(getattr(config, "write_qsgw_datasets", False)):
+        return []
+    path = results.sigma_omega_h5_path
+    if not path:
+        print_fn(
+            "  write_qsgw_datasets = true, but compute_mode "
+            f"{config.compute_mode.value} writes no sigma_mnk.h5 — the QP "
+            "ladders have no file to go in.  Use a dynamic mode (gn_ppm / "
+            "hl_ppm) for the appendix.")
+        return []
+    from file_io import append_qsgw_datasets_h5
+    from .qsgw_utils import (
+        is_band_sharded_sigma_omega, solve_diagonal_sigma_fixed_point)
+
+    kin_ion = np.asarray(results.kin_ion_ry)
+    sig_h = np.asarray(results.sig_h)
+    sig_x = np.asarray(results.sig_x)
+    efermi_ev = float(results.efermi_ev or 0.0)
+    payload: dict[str, np.ndarray] = {}
+    omitted: list[str] = []
+
+    # ---- qp_static_cohsex_ev: H₀ + Σ_SX + Σ_COH -----------------------
+    # ``use_ppm`` is the mode question spelled the way GWResults spells
+    # it; in a dynamic run sig_sx / sig_coh are the zeros ``gw_jax``
+    # substitutes for the Nones, and an eigh of kin_ion + V_H alone is
+    # not the static COHSEX ladder by any reading.
+    if results.use_ppm:
+        omitted.append(
+            f"qp_static_cohsex_ev (Σ_SX/Σ_COH are not built by compute_mode "
+            f"= {getattr(config.compute_mode, 'value', config.compute_mode)})")
+    else:
+        payload["qp_static_cohsex_ev"] = _eigen_ladder_ev(
+            kin_ion + sig_h + np.asarray(results.sig_sx)
+            + np.asarray(results.sig_coh))
+
+    # ---- qp_omega0_ev: H₀ + Σ_x + Σ_c(ω ≈ 0) --------------------------
+    # ω₀ is the grid point nearest zero, i.e. nearest E_F, since the Σ_c
+    # grid is Fermi-relative by construction (``ppm_pipeline``).  The ONE
+    # ω slice is taken before the host transfer for the same reason
+    # ``sigma_star_spread_stats`` takes one: the cube is (nω, nk, nb, nb)
+    # and pulling all of it back to read 1/nω of it is 1.3 GB on the
+    # mos2_4x4 deck for a 33 MB answer.
+    #
+    # AND IT IS SKIPPED ON THE BAND-SHARDED LAYOUT, because THIS caller is
+    # rank-0-only (it sits in ``gw_jax``'s rank-0 output block, beside
+    # ``write_freq_debug``).  A ``sigma_omega_layout = sharded`` cube is
+    # tiled across every process, so the host transfer of one ω slice from
+    # one rank is the "spans non-addressable devices" error, not a slow
+    # success.  Gathering it here would mean a collective inside a
+    # single-rank block; naming the layout costs the operator one line and
+    # one rerun.
+    if sigma_c_omega is None or omega_grid_ev is None:
+        omitted.append("qp_omega0_ev (no Σ_c(ω) cube in this run)")
+    elif is_band_sharded_sigma_omega(sigma_c_omega):
+        omitted.append(
+            "qp_omega0_ev (sigma_omega_layout = sharded; the ω slice cannot "
+            "be read from one rank)")
+    else:
+        i0 = int(np.argmin(np.abs(np.asarray(omega_grid_ev))))
+        sigma_c_0 = np.asarray(sigma_c_omega[i0])
+        payload["qp_omega0_ev"] = _eigen_ladder_ev(
+            kin_ion + sig_h + sig_x + sigma_c_0)
+
+    # ---- qp_diag_self_consistent_ev: E = h₀ + ReΣ_xc(E) ---------------
+    # The SAME solver and the same operands ``qsgw_utils.solve_qp``'s
+    # fixed_point branch uses, run here in eV on the diagonals ``gw_jax``
+    # already extracted — so this ladder is what ``qp_solver =
+    # fixed_point`` would have solved, whatever solver this run used.
+    # Bands whose E_DFT leaves the ω grid are CLAMPED TO E_DFT rather
+    # than to the grid edge: the solver's Σ_c is pinned at the boundary
+    # for those, and a pinned Σ makes a QP energy that says more about
+    # the grid than about the band.
+    if sigma_c_omega_diag_ev is not None and omega_grid_ev is not None:
+        omega_ev = np.asarray(omega_grid_ev, dtype=np.float64)
+        h0_diag_ev = np.real(np.diagonal(
+            kin_ion + sig_h, axis1=1, axis2=2)) * RYD_TO_EV
+        sig_x_diag_ev = np.real(np.diagonal(
+            sig_x, axis1=1, axis2=2)) * RYD_TO_EV
+        sigma_xc_diag_w_kn_ev = (np.real(np.asarray(sigma_c_omega_diag_ev))
+                                 + sig_x_diag_ev[None, :, :])
+        e_dft_rel_ev = (np.asarray(results.E_dft_ry, dtype=np.float64)
+                        * RYD_TO_EV - efermi_ev)
+        e_sc_rel_ev, _, n_iter = solve_diagonal_sigma_fixed_point(
+            h0_diag_ev - efermi_ev, sigma_xc_diag_w_kn_ev, omega_ev,
+            max_iter=120, tol_ev=1.0e-7, mixing=0.6,
+        )
+        in_grid = ((e_dft_rel_ev >= omega_ev[0])
+                   & (e_dft_rel_ev <= omega_ev[-1]))
+        e_sc_rel_ev = np.where(in_grid, e_sc_rel_ev, e_dft_rel_ev)
+        payload["qp_diag_self_consistent_ev"] = (
+            e_sc_rel_ev + efermi_ev).astype(np.float64)
+        print_fn(
+            f"  QP ladders: diagonal Σ(E) fixed point converged in "
+            f"{n_iter} iterations, {int(in_grid.sum())}/{in_grid.size} "
+            f"(k, n) inside the ω grid")
+    else:
+        omitted.append(
+            "qp_diag_self_consistent_ev (no Σ_c(ω) diagonal in this run)")
+
+    if omitted:
+        print_fn(
+            "  QP ladders: omitting " + "; ".join(sorted(omitted))
+            + " — those operands are not in this run, and putting a "
+            "different operator under one of those names would be worse "
+            "than its absence")
+    if not payload:
+        return []
+    # AGAINST THE RUN'S OWN LADDER, which is what makes the log line
+    # readable without opening the file: each approximation is reported by
+    # how far it sits from the E_qp this run actually used (the eigh of
+    # kin_ion + Σ_xc + V_H, the same array eqp0.dat is built from).  Both
+    # sides are per-k ascending eigenvalues, so the elementwise difference
+    # is band-for-band.  Taken BEFORE the append, on the full-BZ arrays,
+    # because after it the ladders are one row per star.
+    ref_ev = np.asarray(e_qp_ry, dtype=np.float64) * RYD_TO_EV
+    deltas = {
+        name: float(np.abs(arr - ref_ev).max())
+        for name, arr in payload.items() if arr.shape == ref_ev.shape
+    }
+    written = append_qsgw_datasets_h5(path, payload, print_fn=print_fn)
+    if deltas:
+        print_fn(
+            "  QP ladders vs this run's E_qp (max |Δ|, eV): "
+            + ", ".join(f"{n.removeprefix('qp_').removesuffix('_ev')} "
+                        f"{d:.3f}" for n, d in sorted(deltas.items())))
+    return written
+
+
+def _eigen_ladder_ev(h_kij_ry) -> np.ndarray:
+    """``eigvalsh`` of the Hermitian part, in eV.  ``(nk, nb)`` float64.
+
+    The Hermitisation is the one ``gw_jax``'s QP eigh does, spelled the
+    same way: these ladders exist to be compared against that one, so a
+    different symmetrisation here would be a difference nobody asked for.
+    """
+    h = np.asarray(h_kij_ry)
+    h = 0.5 * (h + np.conj(np.swapaxes(h, -1, -2)))
+    return (np.linalg.eigvalsh(h) * RYD_TO_EV).astype(np.float64)
+
+
+# ---------------------------------------------------------------------------
 # H₀ sanity gate  (mean-field side of eqp0/eqp1/eqp_g0w0)
 # ---------------------------------------------------------------------------
 

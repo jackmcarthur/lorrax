@@ -91,6 +91,7 @@ from .gw_output import (
 	print_system_summary,
 	write_freq_debug,
 	write_qp_wfn_oneshot,
+	write_qsgw_qp_ladders,
 	write_results,
 )
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
@@ -723,6 +724,23 @@ def main(argv=None):
 			omega_dft_rel_ev=omega_dft_rel_ev,
 			head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
 			omega_grid_ry=omega_grid_ry,
+			print_fn=print0,
+		)
+		# The QP-ladder half of sigma_mnk.h5's opt-in plotting appendix
+		# (no-op unless ``write_qsgw_datasets``).  HERE and not at the Σ
+		# seam because two of the three ladders need ``kin_ion``, which
+		# ``compute_sigma_xc`` never sees; the QSGW cube itself was
+		# already appended by whichever path wrote the file
+		# (``qsgw_utils.write_qsgw_sigma_cube``).  Rank-0 and barrier-free
+		# like every other writer in this block: eigenvalues are basis-
+		# free, so this one seam is correct for the one-shot and the
+		# self-consistent paths alike.
+		write_qsgw_qp_ladders(
+			results, config=config,
+			e_qp_ry=results.E_qp_ry,
+			sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
+			omega_grid_ev=omega_grid_ev,
+			sigma_c_omega=sigma_c_omega,
 			print_fn=print0,
 		)
 		# Degen averaging was applied once at the H-build seam upstream;
