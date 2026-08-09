@@ -771,13 +771,23 @@ def compute_head_channel_zeta(
     n_q_ibz = int(q_irr_frac.shape[0])
     gvec_components = np.asarray(zeta_loader.gvec_components, dtype=np.int32)
 
+    # THE SAME estimator object the V_q path builds — same seed, same draw
+    # count, same centrosymmetrisation.  Built here rather than shared
+    # because the two calls are in different stages and a deterministic pure
+    # function is cheaper to rebuild than to thread.
+    #
+    # NOT GATED ON ``mc_average_vcoul_body``.  That flag decides whether the
+    # average is substituted into V — i.e. what Sigma_X receives — and the
+    # placement mode decides where the average lands in W.  Gating the head
+    # function on the flag made ``mc_average_placement = bgw`` with the flag
+    # off a silent no-op (<v> == v_c => r == 1), which is precisely the
+    # "knob that quietly does nothing" failure this feature is supposed to
+    # be immune to.  The flag is honoured where it belongs: in ``v_in_V``,
+    # the value the production tile actually carries.
     v_head_fn = None
-    if mc_average_vcoul_body and sys_dim == 3:
-        # THE SAME estimator object the V_q path builds — same seed, same
-        # draw count, same centrosymmetrisation.  Built here rather than
-        # shared because the two calls are in different stages and a
-        # deterministic pure function is cheaper to rebuild than to thread.
+    if sys_dim == 3:
         v_head_fn = build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume)
+    del mc_average_vcoul_body
 
     table = head_slot_table(
         get_kernel(sys_dim), q_irr_frac, gvec_components,
@@ -823,11 +833,24 @@ def compute_head_channel_zeta(
     g_head = jax.lax.with_sharding_constraint(
         g_head, NamedSharding(mesh_xy, P(None, None, 'x')))
     if verbose and jax.process_index() == 0:
+        live = np.asarray(table.v_bare) > 0.0
+        eta = np.zeros_like(np.asarray(table.v_bare))
+        eta[live] = (np.asarray(table.v_avg)[live]
+                     / np.asarray(table.v_bare)[live] - 1.0)
         print(f"  head channel: {int((table.mult > 0).sum())}/{n_q_ibz} IBZ q "
               f"carry a head slot, k={int(table.sel.shape[1])}, "
               f"tie histogram="
               f"{dict(zip(*[c.tolist() for c in np.unique(table.mult, return_counts=True)]))}",
               flush=True)
+        # Per-shell eta, printed as data rather than summarised: it is the
+        # ONE input the whole rescale is a function of, it is directly
+        # comparable to BerkeleyGW's own vcoul dumps, and a run whose log
+        # carries it can be audited without re-running anything.
+        for qi in np.nonzero(live)[0]:
+            print(f"    head slot q[{qi}] |q+G|^2={float(table.len2[qi]):.6f} "
+                  f"mult={int(table.mult[qi])} v_c={float(table.v_bare[qi]):.6f} "
+                  f"<v>={float(table.v_avg[qi]):.6f} eta={eta[qi]:.6f}",
+                  flush=True)
     return g_head, table, full_to_irr_idx
 
 
