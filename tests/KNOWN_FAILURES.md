@@ -3330,3 +3330,105 @@ Perlmutter, read-only: `/pscratch/sd/j/jackm/mpa_census_0809/` —
 `setdiff.txt`, `reds_base.txt`, `_verify/qsgw_{base,tip}.{xml,log}`, `_logs/`.
 The RUNS_INFLIGHT row was appended before first submission and struck with
 results.
+
+## 2026-08-09 amendment — two runtime defects from the Σ scaling lane, neither of them a test red
+
+The sigma GN-PPM scaling lane (`perf/sigma-scaling-2026-08-09`, workspace
+`/pscratch/sd/j/jackm/sigma_scaling_0809/`, prose record
+`~/lorrax_bse_perf_2026-08-08/SIGMA_SCALING.md`) landed one instrumentation
+commit and, on the way to it, hit two defects that no cell in this suite
+currently catches.  Both are registered here rather than as reds, because
+neither turns a test red and both will silently waste an allocation for
+whoever meets them next.  The lane's instrument commit is included in the same
+landing as this amendment; the two defects below are **not** fixed by it.
+
+### 1. `distributed_eigh` hangs at a 3×3 mesh for every n ≥ 3072
+
+A 3×3 cuSOLVERMp `syevd` completes n = 2049 in 6.9 s and then never returns at
+n = 3072 or anything larger.  It does not fail — it hangs silently, with the
+cuSOLVERMp banner printed (`library 0.7.2, NCCL 2.27.3, comm path: NCCL,
+grid: 3x3 (col-major)`) and nothing after it, on a card reporting 36.4 GiB
+free at the moment of the call.  So this is neither memory starvation nor the
+`status=7` failure the older record remembers, and the break is bracketed
+between n = 2049 and n = 3072.
+
+| mesh | grid reported by cuSOLVERMp | n | allocator arm | result |
+|---|---|---|---|---|
+| 2×2 | 2x2 (col-major) | 8192 | recommended (`default`, MEM_FRACTION 0.85) | **PASS**, 9.347 s, max eigenvalue error 1.31e−10 |
+| 3×3 | 3x3 (col-major) | 2049 | recommended | **PASS**, 6.935 s, max eigenvalue error 1.50e−11 |
+| 3×3 | 3x3 (col-major) | 3072 | recommended | **HANG** — killed at 420 s |
+| 3×3 | 3x3 (col-major) | 4098 | recommended | **HANG** — killed at 420 s |
+| 3×3 | 3x3 (col-major) | 6144 | recommended | **HANG** — killed at 420 s |
+| 3×3 | 3x3 (col-major) | 8190 | recommended | **HANG** — killed at 900 s |
+| 3×3 | 3x3 (col-major) | 8190 | `platform` (fleet default) | **HANG** — killed at 420 s |
+
+**The allocator is exonerated and the defect is pre-existing.**  The last row
+is the load-bearing one: the hang reproduces identically under `platform`,
+which is what the fleet runs today, so whatever is wrong at 3×3 was wrong
+before the allocator question was ever asked and will still be wrong if the
+allocator recommendation is rejected.  This is a `distrib_la` solver defect,
+it belongs to whoever owns `distrib_la`, and until it is owned, **no LORRAX
+stage that calls `eigh` should be run at a 3×3 mesh on a large matrix** — which
+is what makes it a blocker for large decks rather than a curiosity.  The Σ
+deck the lane measured never calls `eigh` at that size, so none of the lane's
+timing conclusions depend on it.
+
+One lead, offered as a lead and not as a finding: cuSOLVERMp distributes 2-D
+block-cyclic, and at a 3×3 grid n = 2049 gives a local block of 683 — below
+the usual 1024 tile — while n = 3072 gives exactly 1024 per rank and therefore
+more than one block column per rank for the first time.  A hang appearing
+exactly where the block-cyclic distribution stops being trivial on a
+non-power-of-two grid is a plausible library-side story, but it was not
+confirmed.  The control that would separate "3×3 is odd" from "any grid past
+2×2" is a 4×4 leg at n = 8192; it never got a placement before the lane's
+window closed, and its log carries no cuSOLVERMp line at all, so its non-zero
+exit is a queue artifact and must not be read as a hang.
+
+Evidence: `/pscratch/sd/j/jackm/sigma_scaling_0809/_reports/` legs
+`la_p4_bfc85`, `la_p9_bfc85`, `la_p9_platform`, `la_p9_small_bfc85`,
+`la_p9_3072`, `la_p9_mid` (n = 4098) and `la_p9_6144`; the probe is
+`sigma_scaling_0809/probe_pressure_sq.py`, which is the allocator lane's
+`probe_pressure.py` with one change — its `build_mesh` picked `(n, 1)` for any
+device count other than 1 or 4, which would have measured a 9×1 cuSOLVERMp
+grid rather than the 3×3 grid LORRAX actually runs.  Prose:
+`SIGMA_SCALING.md` §8.  The `la_p16_8192` leg is the one that did not run.
+
+### 2. A profiler session live across the phdf5 collective close segfaults rank 0
+
+Setting `ISDF_JAX_PROFILE_DIR` opens a profiler session at *every*
+`trace_section` call site in a run, and the first of those is `zeta_fit`.  On
+a multi-node mesh that session is live across `zeta_q.h5`'s phdf5 collective
+close, and rank 0 segfaults there.  Reproduced three times at a 3×3 mesh over
+three nodes, always immediately after `[SlabIO.close] H5Fclose returned in
+0.0 s` and always about twenty seconds in; a 2×2 single-node mesh traces
+cleanly, so single-node tracing is unaffected.  What the geometry evidence
+strictly pins is "3×3 over three nodes segfaults, 2×2 on one node does not" —
+mesh size and node count were not separated by a control, and a lane that
+needs that distinction should measure it rather than quote this row.
+
+The practical consequence was total: the section anybody actually wants, the
+sigma tau kernel, is nine sections later and was never reached, so tracing the
+production GN-PPM Σ deck above a 2×2 mesh was not slow or noisy but
+**impossible**.
+
+**Worked around, not fixed.**  The instrument commit in this landing adds
+`ISDF_JAX_PROFILE_SECTIONS`, a comma-separated allowlist of substrings
+consulted by `_trace_path` alongside the directory, which makes the tau kernel
+reachable at P > 4 by not opening a session at `zeta_fit` at all.  Unset —
+which is what every existing caller passes — every section still traces, so no
+call site changes behaviour.  **The root cause is open**: why a profiler
+session interacting with the phdf5 FFI's collective close should segfault rank
+0 is unanswered, and the allowlist only routes around it.  Anyone who sets
+`ISDF_JAX_PROFILE_DIR` on a multi-node mesh without also setting
+`ISDF_JAX_PROFILE_SECTIONS` will still meet this.
+
+Evidence: `/pscratch/sd/j/jackm/sigma_scaling_0809/_reports/` — the red twin's
+gates `gate_allowlist.log` / `.xml` (branch, 6 passed) and
+`gate_allowlist_PRE.log` / `.xml` (pre-fix base `3e5e98ba`, 4 failed / 2
+passed).  The absence is evidence too: there is no `_traces/tr_p9` or
+`_traces/tr_p16` under that workspace, only `_traces/tr_p4/`, and the
+`tr_p16` / `tr_p9b` logs record `LX-POOLFULL` with no step rather than a
+misleading exit code.  Prose: `SIGMA_SCALING.md` §9.  The guarding cells are
+`tests/test_jax_profile_section_allowlist.py`, six of them; they pin the
+allowlist's behaviour, including that an empty or whitespace value means
+"unset" rather than "trace nothing", and they say nothing about the segfault.
