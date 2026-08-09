@@ -39,7 +39,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common import jax_profile
 import common.timing as timing
-from .gw_config import ComputeMode, env_bool
+from .gw_config import (
+    ComputeMode, env_bool, refuse_unimplemented_compute_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +102,16 @@ def screening_requests_for(
     Returns an empty list for unscreened schemes (``X_ONLY``); a single
     static request for COHSEX; static + probe for the PPM schemes.
 
+    EVERY MODE IS NAMED HERE, INCLUDING THE ONES THAT REFUSE.  This
+    function is the first place a compute mode turns into work, so a mode
+    reaching it without a branch of its own would get its screening plan
+    from whichever ``if`` happened to sit last — which is how a new ansatz
+    silently becomes a run of an old one.  The MPA branch below therefore
+    refuses by name rather than being absent: ``mpa``'s W is sampled on
+    the double-parallel grid (``gw.mpa.sample_plan.mpa_plan``), not at
+    {0, probe}, and returning the PPM pair for it would be wrong in a way
+    no downstream stage could detect.
+
     To add a new scheme, extend the dispatch here AND add a
     corresponding case to ``compute_sigma_xc`` that reads the W's by
     role label.
@@ -116,6 +127,15 @@ def screening_requests_for(
     if mode is ComputeMode.HL_PPM:
         return [static, ScreeningRequest(
             omega_ry=complex(float(config.ppm.omega_p), 0.0), role="probe")]
+    if mode is ComputeMode.MPA:
+        # The sample plan exists (``gw.mpa.sample_plan.mpa_plan``); the
+        # fit stage that consumes it does not, so there is no honest
+        # ScreeningRequest list to return yet.
+        refuse_unimplemented_compute_mode(
+            mode, context="screening_requests_for")
+        raise NotImplementedError(              # pragma: no cover
+            "screening_requests_for: compute_mode = mpa has no screening "
+            "plan until the MPA fit stage lands.")
     raise ValueError(
         f"screening_requests_for: unknown compute mode {mode!r}")
 

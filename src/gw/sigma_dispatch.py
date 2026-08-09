@@ -5,6 +5,10 @@ map calls regardless of compute mode (X_ONLY, COHSEX, GN_PPM, HL_PPM).
 The dispatch decides which Σ kernel runs internally; the iteration map
 sees one signature and one result type.
 
+The dispatch is EXHAUSTIVE over ``gw_config.ComputeMode``: a mode with
+no kernel here is refused by name, not absorbed by the last branch.  MPA
+is that case today.
+
 Returned :class:`SigmaResult` always contains ``v_h_kij_ry``,
 ``sigma_x_kij_ry``, and a single ``sigma_xc_kij_ry`` representing the
 total exchange-correlation contribution to ``H_QP = kin_ion + V_H +
@@ -36,7 +40,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
-from .gw_config import ComputeMode
+from .gw_config import (
+    ComputeMode, SigmaChannel, mode_builds_channels,
+    refuse_unimplemented_compute_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -364,8 +370,10 @@ def compute_sigma_xc(
 
         ``X_ONLY`` ignores ``W_by_role`` entirely.  Adding a new mode
         means picking the role labels it needs in
-        :func:`gw.screening.screening_requests_for` and reading them
-        here — no plumbing changes elsewhere.
+        :func:`gw.screening.screening_requests_for`, giving it a row in
+        ``gw_config.MODE_SIGMA_CHANNELS``, and reading the roles here —
+        no plumbing changes elsewhere.  Until it has a branch here it is
+        refused by name; it is never served by the PPM one.
     e_qp_ev
         Per-(k, n) QP energies (eV) used by the PPM QSGW build to evaluate
         Σ_c(E_m, E_n).  Required for PPM modes; ignored for static.
@@ -395,13 +403,29 @@ def compute_sigma_xc(
     from .ppm_pipeline import compute_ppm_sigma_pipeline
     from .qsgw_utils import build_qsgw_sigma_xc
 
+    # ── THE MODE IS CHECKED BEFORE ANY KERNEL RUNS ──────────────────────
+    # ``gw_jax.main`` already refused a declared-but-unbuilt mode at
+    # driver entry, and this is the same refusal at the seam that would
+    # otherwise absorb it.  Both exist on purpose: the entry check is what
+    # saves the operator's allocation, this one is what makes the SC loop,
+    # the tests and any future caller safe without having to remember the
+    # entry check.  It is a dict lookup on a resolved enum, so it costs
+    # nothing on the Σ path it guards.
+    refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
+
     # Static channels: sig_h (V_H) and sig_x (bare exchange) are needed
-    # by every mode; sig_sx / sig_coh use W(ω=0) and only matter for
-    # COHSEX.  Route to a separate top-level entry point for the
-    # V-only path so PPM / X_ONLY modes never invoke the W-touching
-    # kernels and the two paths each get their own jit-cached graph.
+    # by every mode; sig_sx / sig_coh use W(ω=0), and WHICH MODES BUILD
+    # THEM IS THE CHANNEL TABLE'S ANSWER (``gw_config.
+    # MODE_SIGMA_CHANNELS``), not this branch's opinion — that is the one
+    # fact the QSGW appendix writer and this dispatch have to agree on,
+    # and they now read it from the same row.  Route to a separate
+    # top-level entry point for the V-only path so the modes that build no
+    # static screened channels never invoke the W-touching kernels, and
+    # the two paths each get their own jit-cached graph.
     W_static = W_by_role.get("static", V_q)
-    if mode is ComputeMode.COHSEX:
+    builds_static_screened = mode_builds_channels(
+        mode, SigmaChannel.SX, SigmaChannel.COH)
+    if builds_static_screened:
         cohsex = compute_cohsex_sigma(
             wfns, V_q, W_static, meta, mesh_xy,
             Gij=Gij,
@@ -501,6 +525,28 @@ def compute_sigma_xc(
             sigma_sx_kij_ry=sig_sx,
             sigma_coh_kij_ry=sig_coh,
         )
+
+    # ── THE EXHAUSTIVENESS SEAM ─────────────────────────────────────────
+    # What follows is the two-point plasmon-pole pipeline, and until this
+    # guard it was reached by ELSE: anything that was not X_ONLY and not
+    # COHSEX ran it.  That is fine while the enum's only remaining members
+    # ARE the two PPM fits, and it silently mis-runs the first member that
+    # is not — a multipole run would have taken a GN fit of two W samples
+    # and reported it as Σ_c(ω) with no stage able to tell.  So the pole
+    # model is now asked for by name: ``ppm_model`` is 'gn' or 'hl' for
+    # exactly the two PPM modes and None for every other member, present
+    # or future.
+    if mode.ppm_model is None:
+        raise NotImplementedError(
+            f"compute_sigma_xc: compute_mode = "
+            f"{getattr(mode, 'value', mode)} reaches the Σ dispatch with no "
+            f"Σ kernel of its own.  The static channels are handled above "
+            f"(X_ONLY, COHSEX) and the dynamic branch below is the two-point "
+            f"plasmon-pole pipeline, which this mode is not; it is refused "
+            f"here rather than run under another ansatz's name.  A new mode "
+            f"needs its own branch here, a row in "
+            f"gw_config.MODE_SIGMA_CHANNELS, and a case in "
+            f"gw.screening.screening_requests_for.")
 
     # Dynamic PPM modes: need W_static + W_probe.
     if e_qp_ev is None:

@@ -26,7 +26,7 @@ from common.units import RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 
-from .gw_config import ComputeMode, LorraxConfig
+from .gw_config import LorraxConfig
 from common.jax_profile import profile_section
 from .head_correction import HeadResolver
 from .ppm_sigma import (
@@ -69,7 +69,12 @@ def _fit_head_correction(
 
     head_static = head_resolver.at(0.0 + 0.0j)
     omega_h_override = config.ppm.head_omega_h_ry
-    is_hl = config.compute_mode is ComputeMode.HL_PPM
+    # ``ppm_model``, not ``is HL_PPM``: the final arm of this chain is the
+    # GN two-point head fit, so reading the mode as a boolean "is it HL"
+    # hands GN's fit to every non-HL mode there will ever be.  The pipeline
+    # entry (``compute_ppm_sigma_pipeline``) has already refused a mode
+    # with no pole model, so 'gn' / 'hl' are the only two values here.
+    is_hl = config.compute_mode.ppm_model == "hl"
 
     if omega_h_override is not None:
         # User-supplied head pole Ω_h (e.g. BGW's analytic value).  Static
@@ -376,7 +381,24 @@ def compute_ppm_sigma_pipeline(
     if not config.do_screened:
         raise ValueError("PPM Σ^c pipeline requires do_screened=true.")
 
-    label = "HL-PPM" if config.compute_mode is ComputeMode.HL_PPM else "GN-PPM"
+    # THE POLE MODEL IS THE ENTRY CONDITION.  This module is the two-point
+    # plasmon-pole fit and everything below it — the probe frequency, the
+    # head fit, the printed label — reads the mode as "HL, or else GN".
+    # A mode with no pole model at all (MPA, and anything after it) must
+    # therefore be turned away HERE, at one seam, rather than collecting a
+    # refusal at each of those three reads.  ``sigma_dispatch`` refuses it
+    # before this call; this is the invariant restated where it is relied
+    # upon, for the benefit of any other caller.
+    ppm_model = config.compute_mode.ppm_model
+    if ppm_model is None:
+        raise NotImplementedError(
+            f"compute_ppm_sigma_pipeline: compute_mode = "
+            f"{config.compute_mode.value} is not a plasmon-pole model, so "
+            f"the two-point PPM Σ^c pipeline is not its Σ stage.  Running it "
+            f"anyway would fit two W samples with a GN pole and report the "
+            f"result as this mode's Σ_c(ω).")
+
+    label = "HL-PPM" if ppm_model == "hl" else "GN-PPM"
     from .gw_output import print_section
     print_section(f"{label} + FREQUENCY-INTEGRATED SIGMA", print_fn)
 
@@ -384,7 +406,7 @@ def compute_ppm_sigma_pipeline(
         # Probe frequency for the PPM fit — recovered from the configured
         # ω_p (real-axis Ω for HL, iω_p for GN).  The screening planner
         # used the same convention to pick W_probe_q's evaluation point.
-        is_hl = config.compute_mode is ComputeMode.HL_PPM
+        is_hl = ppm_model == "hl"
         probe_omega = (
             complex(float(config.ppm.omega_p), 0.0) if is_hl
             else 1j * float(config.ppm.omega_p)
